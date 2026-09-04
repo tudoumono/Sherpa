@@ -394,6 +394,26 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
     ES への反映（`.rag_sig` の無効化・再索引・確定）は呼び出し元（`worker.py`）が
     `changed_rels` を見て行う——本関数はファイル書込までの責務に留める。
 
+    **世代競合の是正**（2026-09-05・rv-oom-resume item5）: 本関数は LLM 呼び出しを含み長時間
+    （実測 1ファイル約38秒）かかりうるため `store.world_lock` を通し取りしない（ファイル書込ごとに
+    握る・docstring 下部参照）——その間に rebind/削除/register で world の世代（`last_sig`）が
+    変わると、パス開始時点で読んだ（古い世代の）本文から成形した結果を、既に別世代になった
+    `derived_rag_dir` へ書き戻してしまう穴があった。パス開始時点の `last_sig` を保存し、
+    **書込直前**に `store.world_lock` 内で現行 `last_sig` と再照合する——不一致ならその書込を
+    破棄し、以降の書込も同じ理由で無効になりうるためパス自体を打ち切る（キャッシュ剪定＝
+    `_save_cache` も呼ばない——`visited` が新世代に対して不完全なまま保存すると、まだ見ていない
+    新世代の record のキャッシュを誤って刈ってしまうため）。
+
+    **`.rag_sig` マーカーの是正**（同上）: 従来はこのパス自体が `.rag_sig` に一切触れず、
+    呼び出し元（`worker._reindex_after_rag_rewrite`）がパス**完了後**に初めて落とす／確定する
+    だけだった——パス実行中（ファイルを書き終えた後・`_reindex_after_rag_rewrite` に到達する前）に
+    プロセスが落ちると、ディスク上の rag.md は既に LLM 成形版になっているのに `.rag_sig` は
+    旧確定値のまま残り、`rag_sig_drift()` が偽（未変化）と誤判定して ES が永久に旧本文のまま
+    取り残される（自己修復の効かない穴）。本関数の書込開始**前**（1回だけ）に
+    `office_md.drop_rag_sig_marker` でマーカーを未確定へ落としておく——`.rag_sig` 自体は
+    `_reindex_after_rag_rewrite` が ES 反映成功後に確定する既存の保留方式（提案書の順序どおり）に
+    そのまま乗る（本関数はここでは確定し直さない＝反映の成否を確認できるのは呼び出し元だけ）。
+
     M1: `metering.acc_begin()`/`acc_end()` でこの1回のパス全体（world 内の全文書・全 record）を
     囲み、実行1回につき集約1行を `kind='rag_render'` で記録する（計測有効時のみ・
     「world 単位パス＝1回の意味のある呼び出し単位」の粒度）。
@@ -414,11 +434,17 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
     rag_dir = worlds.derived_rag_dir(world)
     if not rag_dir.exists():
         return result
-    from .. import metering
+    from .. import metering, store
+    from . import office_md
+    saved_sig = (store.get_world(world) or {}).get("last_sig")
+    # パス開始前に一度だけ落とす（ES 反映前の保留方式・失敗はベストエフォートで続行——
+    # 本関数自身は ES に触れないため、drop 失敗は「自己修復の安全網が今回だけ弱い」に留まる）。
+    office_md.drop_rag_sig_marker(worlds.derived_md_dir(world))
     metering.acc_begin()
     try:
         cache = _load_cache(world)
         visited: set[str] = set()
+        aborted = False
         for rag_path in sorted(rag_dir.rglob("*.rag.md")):
             try:
                 rel = rag_path.relative_to(rag_dir).as_posix()[: -len(".rag.md")]
@@ -433,17 +459,26 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
                 continue
             visited |= doc_result.visited_keys
             if doc_result.changed:
-                try:
-                    json_io.write_text_atomic(rag_path, doc_result.markdown)
-                    result.changed_rels.append(rel)
-                    result.docs_changed += 1
-                    result.llm_records += doc_result.llm_count
-                except OSError:
-                    _log.warning(
-                        "LLM 成形版 rag.md の書込に失敗しました（次回パスで再試行）: world=%s rel=%s",
-                        world, rel, exc_info=True)
-        pruned = {k: v for k, v in cache.items() if k in visited}
-        _save_cache(world, pruned)
+                with store.world_lock(world):
+                    cur_sig = (store.get_world(world) or {}).get("last_sig")
+                    if cur_sig != saved_sig:
+                        _log.warning(
+                            "LLM 成形の書込を破棄しパスを打ち切りました（世代が変わったため）: "
+                            "world=%s rel=%s", world, rel)
+                        aborted = True
+                        break
+                    try:
+                        json_io.write_text_atomic(rag_path, doc_result.markdown)
+                        result.changed_rels.append(rel)
+                        result.docs_changed += 1
+                        result.llm_records += doc_result.llm_count
+                    except OSError:
+                        _log.warning(
+                            "LLM 成形版 rag.md の書込に失敗しました（次回パスで再試行）: world=%s rel=%s",
+                            world, rel, exc_info=True)
+        if not aborted:
+            pruned = {k: v for k, v in cache.items() if k in visited}
+            _save_cache(world, pruned)
     finally:
         tokens, n = metering.acc_end()
         if n:

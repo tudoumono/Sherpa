@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import weakref
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -96,3 +97,31 @@ def test_extract_cell_metadata_skips_sheet_missing_from_either_workbook(tmp_path
     fixture = _build_fixture_xlsx(tmp_path / "fixture2.xlsx")
     metadata = excel_display.extract_cell_metadata(fixture, {"NoSuchSheet": {"A1"}})
     assert metadata == {}
+
+
+def test_extract_cell_metadata_frees_formula_workbook_before_second_pass(tmp_path, monkeypatch):
+    """RV是正#1: `wb_formula.close()` だけでは openpyxl 内部の循環参照ゆえセル木が即解放されない
+    前提のため、第2パス（`wb_values`）を開く**前**に第1パスのブックへの最後の参照を明示的に切り
+    （`del`）、GCを1回回す（`gc.collect()`）。tracemalloc 等のヒープ実測はプロセス全体の割当状況に
+    左右されflakyなため、より決定的な検証として「第2パスの `load_workbook` 呼び出し時点で第1パスの
+    ブックが既に GC 到達不能（weakref 死亡）になっている」ことを直接確認する——ピーク時に生きている
+    ブックが常に1冊であることの直接証拠になる。"""
+    fixture = _build_fixture_xlsx(tmp_path / "fixture3.xlsx")
+    orig_load_workbook = openpyxl.load_workbook
+    state = {"calls": 0, "formula_wb_ref": None}
+
+    def wrapped_load_workbook(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            # 第2パスをロードする直前＝第1パスの del+gc.collect() が既に実行されているはず。
+            assert state["formula_wb_ref"] is not None
+            assert state["formula_wb_ref"]() is None, "第1パスのwb_formulaが第2パス開始時点でまだ生存"
+        wb = orig_load_workbook(*args, **kwargs)
+        if state["calls"] == 1:
+            state["formula_wb_ref"] = weakref.ref(wb)
+        return wb
+
+    monkeypatch.setattr(openpyxl, "load_workbook", wrapped_load_workbook)
+    metadata = excel_display.extract_cell_metadata(fixture, {"Sheet1": {"A1"}})
+    assert state["calls"] == 2                       # 第1パス・第2パスの2回ロードされたことの確認
+    assert metadata[("Sheet1", "A1")]["raw_value"] == 42

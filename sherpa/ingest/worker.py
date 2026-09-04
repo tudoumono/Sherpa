@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .. import corpus_docs, es_index, scope_infer, store, webhooks, worlds
@@ -687,13 +688,20 @@ def diff_dir(wd, prev_manifest, prev_sig=None) -> dict:
 
 
 def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings: dict | None = None,
-                                       run_id: int | None = None) -> dict:
+                                       run_id: int | None = None,
+                                       progress: Callable[[int, int], None] | None = None) -> dict:
     """`es_index.index_world()` を「human_md の ES 反映ホールドバック」込みで呼ぶ共通ヘルパ。
 
     `run_id`（受付 run の内部・`sync` の unchanged 分岐専用）指定時、失敗しても新規
     `ingest_runs` 行は作らない——呼び出し元（`sync`）が戻り値（`available`/`error`）を見て
     その受付 run 自身の terminal 化に畳み込む（別 run が生まれると、受付側の run_id を
     ポーリングしているクライアントからは失敗が一切見えなくなる）。
+
+    `progress`（省略可・rv-oom-resume item6・2026-09-05）: そのまま `es_index.index_world()` へ
+    転送する（`(done_docs, total_docs)` を文書グループ flush ごとに受け取る）。呼び出し元が
+    `ingest_runs` への進捗記録を配線したい場合に使う（`_sync_impl` の unchanged 分岐の ES
+    自己修復は実環境で数時間かかりうる最長段になりえたが、従来ここは進捗が一切配線されて
+    いなかった）。
 
     `_refresh_derived_representations`（RAG_ES 有効時の holdback 分岐）・`sync`（legacy 自己修復
     分岐）・`ocr_worker.reindex_observations` の3経路が個別に持っていた確定/失敗記録のロジックを
@@ -733,7 +741,7 @@ def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings
         _record_es_index_failure(world, "human_md_es_sig_marker_drop_failed", run_id=run_id)
         return {"available": False, "error": "human_md_es_sig_marker_drop_failed"}
     try:
-        esr = es_index.index_world(world, content_sig=content_sig, settings=settings)
+        esr = es_index.index_world(world, content_sig=content_sig, settings=settings, progress=progress)
     except Exception as e:
         _log.warning(
             "ES 再索引で例外が発生しました（次回 sync で再試行）: world=%s", world, exc_info=True)
@@ -982,13 +990,39 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             _log.warning("Webhook 通知の起動に失敗しました（sync 自体は継続）: world=%s", world,
                         exc_info=True)
 
-    sig, manifest = world_state(world)
+    def _progress(stage, done=None, total=None):
+        # rv-oom-resume item6（2026-09-05）: `_run_locked` の同名クロージャ（上部）と同じ形——
+        # `sync()` の unchanged 分岐は `_run_locked` を経由しないため、進捗記録が一切配線されて
+        # いなかった（最初の world_state 走査・ES 自己修復とも「実環境で数時間動かないまま」に
+        # なりうる）。`run_id` が無い（CLI 直接呼び出し等）分岐は no-op。
+        if run_id is None:
+            return
+        try:
+            store.update_ingest_run_progress(run_id, {
+                "stage": stage, "stage_label": STAGE_LABELS.get(stage, stage),
+                "done": done, "total": total,
+                "updated_at": datetime.now(timezone.utc).isoformat()})
+        except Exception:
+            _log.warning(
+                "進捗の記録に失敗しました（sync 自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
+
+    _progress("scanning")
+    sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
     if sig is None:
         _finalize_if_unused("failed", ["world_unresolved"])
         return {"world": world, "changed": False, "status": "unavailable"}
     row = store.get_world(world)
     prev = row.get("last_sig") if row else None
     if not force and prev == sig and not _derived_stale(world):  # 無変化＝再ビルドしない（派生MD欠落時は除く・RV High#1）
+        # rv-oom-resume item4（2026-09-05）: unchanged 経路の ES 自己修復（`needs_reindex`→
+        # `index_world_with_human_md_holdback`）を含め、この分岐の**全て**を単一の
+        # `store.world_lock` 区間に収める（従来は `_refresh_derived_representations` 呼び出し
+        # 直後で `with` を閉じてしまい、バックフィル・ES 自己修復・マーカー確定が lock 外で
+        # 走っていた——その間に他プロセスの並行 sync/rebind/delete が割り込むと、ES 反映が
+        # 参照した派生物と実際の world 世代が食い違いうる）。バックフィル用の第2の
+        # `store.world_lock` 呼び出しは同一ロックの**再入**になり自己デッドロックしうるため
+        # 削除し、同じ lock 区間へ直接畳み込む（`store.world_lock` は session-level advisory
+        # lock＝別コネクションでの再入不可・`wipe_world` docstring 参照）。
         with store.world_lock(world):                    # derived への書込を同一worldの並行run/syncと直列化
             refresh_outcome = _refresh_derived_representations(world, sig)
             if refresh_outcome == "needs_full_run":
@@ -1006,26 +1040,27 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                         "（ES再索引の再試行契機を逃す可能性）: world=%s", world)
                 return {"world": world, "changed": True, "status": res["status"],
                         "ledger": res["ledger"], "flags": list(res.get("flags", []))}
-        # `refresh_outcome == "handled"`（軽量再生成を実行済み）でもここで早期 return しない: human_md
-        # の軽量再生成（`refresh_human_md`）は RAG_ES OFF の world で ES の索引元そのもの
-        # （legacy `{rel}.md` の40行チャンク）を書き換えるため、直後の needs_reindex 自己修復まで
-        # 同じ sync 呼び出し内で到達しないと、ES が古いままの世代が次回 sync まで残ってしまう。
-        # document_ir/evidence/rag 側の軽量再生成は `{rel}.md` 自体に触れないため、ここを通っても
-        # `needs_reindex` は通常 False のまま（無害な追加チェック1回で済む）。軽量再生成で失敗した
-        # rel が残っていても、それは次回 sync の drift 判定が再試行する＝ここで後続処理を止める
-        # 理由にはならない。
-        # `last_manifest` は JSONB 列＝内容が空の world（本文0件）なら正当な値として `{}` が
-        # 入りうる。「欠落」の判定は `is None` で行う（`not {}` は真になるため、空 dict を
-        # 「未設定」と取り違えて空 world を同期のたびに毎回バックフィル対象にしてしまう）。
-        needs_manifest_backfill = row is not None and row.get("last_manifest") is None
-        # last_doc_count 列の導入前に成功同期が確定していた既存 world は、内容が不変（unchanged
-        # 経路）のままだと二度と _run_locked を通らず、document_count が永久に null のままになる。
-        needs_doc_count_backfill = row is not None and row.get("last_doc_count") is None
-        # last_scan_report 列の導入前に成功同期が確定していた既存 world も同様:
-        # 内容不変のままだと `GET /worlds/{wid}/status` がずっと「未集計」を返し続ける。
-        needs_scan_report_backfill = row is not None and row.get("last_scan_report") is None
-        if needs_manifest_backfill or needs_doc_count_backfill or needs_scan_report_backfill:
-            with store.world_lock(world):                       # lock 内で再確認してから書く（HIGH-1: TOCTOU 対策）
+            # `refresh_outcome == "handled"`（軽量再生成を実行済み）でもここで早期 return しない: human_md
+            # の軽量再生成（`refresh_human_md`）は RAG_ES OFF の world で ES の索引元そのもの
+            # （legacy `{rel}.md` の40行チャンク）を書き換えるため、直後の needs_reindex 自己修復まで
+            # 同じ sync 呼び出し内で到達しないと、ES が古いままの世代が次回 sync まで残ってしまう。
+            # document_ir/evidence/rag 側の軽量再生成は `{rel}.md` 自体に触れないため、ここを通っても
+            # `needs_reindex` は通常 False のまま（無害な追加チェック1回で済む）。軽量再生成で失敗した
+            # rel が残っていても、それは次回 sync の drift 判定が再試行する＝ここで後続処理を止める
+            # 理由にはならない。
+            # `last_manifest` は JSONB 列＝内容が空の world（本文0件）なら正当な値として `{}` が
+            # 入りうる。「欠落」の判定は `is None` で行う（`not {}` は真になるため、空 dict を
+            # 「未設定」と取り違えて空 world を同期のたびに毎回バックフィル対象にしてしまう）。
+            needs_manifest_backfill = row is not None and row.get("last_manifest") is None
+            # last_doc_count 列の導入前に成功同期が確定していた既存 world は、内容が不変（unchanged
+            # 経路）のままだと二度と _run_locked を通らず、document_count が永久に null のままになる。
+            needs_doc_count_backfill = row is not None and row.get("last_doc_count") is None
+            # last_scan_report 列の導入前に成功同期が確定していた既存 world も同様:
+            # 内容不変のままだと `GET /worlds/{wid}/status` がずっと「未集計」を返し続ける。
+            needs_scan_report_backfill = row is not None and row.get("last_scan_report") is None
+            if needs_manifest_backfill or needs_doc_count_backfill or needs_scan_report_backfill:
+                # 既に本関数の外側 `with` で lock 保持中——ここで再度 `store.world_lock` は
+                # 呼ばない（呼べば同一 lock の再入＝別コネクションでの自己デッドロック）。
                 cur = store.get_world(world)                    # 他 writer が割り込んでいないか再読
                 if cur is not None and cur.get("last_sig") == sig:
                     if cur.get("last_manifest") is None and cur.get("last_doc_count") is None:
@@ -1059,24 +1094,27 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 # 呼び出し元へは（下の return で）status="unchanged" を返す＝バックフィルできなかった
                 # 今回の表示は保守的（実際には他プロセスが変更中/無効化した可能性がある）だが安全性の
                 # 問題は無い＝次回 sync が実際の状態を正しく判定して収束する（Codex LOW・2026-07-14）。
-        # ES 修復: 空/署名ズレ/埋め込みプロバイダ変更を検知して張り直す（管理UI不要）。失敗は
-        # 別 run を作らず受付 run（`run_id`）自身の終端へ畳み込む——`index_world_with_human_md_holdback`
-        # へ `run_id` を渡すことで内部の失敗記録を抑止し、ここで一度だけ terminal 化する。
-        es_repair_failure = None
-        try:
-            if es_index.needs_reindex(world, sig):
-                esr = index_world_with_human_md_holdback(world, content_sig=sig, run_id=run_id)
-                if not (esr.get("available") is True and not esr.get("error")):
-                    es_repair_failure = esr.get("error") or "unavailable"
-        except Exception as e:
-            _log.warning(
-                "ES 自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
-            es_repair_failure = e.__class__.__name__
-        if es_repair_failure is not None:
-            _finalize_if_unused("failed", [f"es_repair_failed:{es_repair_failure}"])
-        else:
-            _finalize_if_unused("auto_published")
-        return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
+            # ES 修復: 空/署名ズレ/埋め込みプロバイダ変更を検知して張り直す（管理UI不要）。失敗は
+            # 別 run を作らず受付 run（`run_id`）自身の終端へ畳み込む——`index_world_with_human_md_holdback`
+            # へ `run_id` を渡すことで内部の失敗記録を抑止し、ここで一度だけ terminal 化する。
+            es_repair_failure = None
+            try:
+                if es_index.needs_reindex(world, sig):
+                    _progress("es_index", done=0, total=None)
+                    esr = index_world_with_human_md_holdback(
+                        world, content_sig=sig, run_id=run_id,
+                        progress=lambda done, total: _progress("es_index", done=done, total=total))
+                    if not (esr.get("available") is True and not esr.get("error")):
+                        es_repair_failure = esr.get("error") or "unavailable"
+            except Exception as e:
+                _log.warning(
+                    "ES 自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
+                es_repair_failure = e.__class__.__name__
+            if es_repair_failure is not None:
+                _finalize_if_unused("failed", [f"es_repair_failed:{es_repair_failure}"])
+            else:
+                _finalize_if_unused("auto_published")
+            return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
     # RV是正#7: `op` を渡し忘れると `run()` の既定 "sync" に固定され、この呼び出し元が実際には
     # refresh/rerun 等でも Webhook payload の `op` が常に "sync" になってしまう——`op` を配線する。
     res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op)   # 署名の確定/無効化は run 内部（_run_locked）が lock 内で行う

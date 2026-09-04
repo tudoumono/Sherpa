@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 
 import pytest
@@ -15,6 +16,11 @@ from sherpa.ingest import graph_extract, llm_render
 from sherpa.store import usage_events as ue
 
 
+@contextlib.contextmanager
+def _noop_lock(world_id):
+    yield
+
+
 def _isolate(monkeypatch, tmp_path, world: str = "v1") -> str:
     monkeypatch.setenv("SHERPA_KB_DIR", str(tmp_path / "kb"))
     monkeypatch.setenv("SHERPA_DERIVED_DIR", str(tmp_path / "derived"))
@@ -22,6 +28,10 @@ def _isolate(monkeypatch, tmp_path, world: str = "v1") -> str:
     monkeypatch.setattr(store, "get_world", lambda world_id: None)
     # 既定 OFF（2026-09-05 裁定）のため、run_world_pass 系のテストはトグルを明示 ON にして実行する。
     monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"rag_llm_render": "on"})
+    # rv-oom-resume item5（2026-09-05）: run_world_pass は書込直前に世代を再照合するため
+    # store.world_lock を通す（`test_worker_sig_discipline.py` と同じ流儀で DB 非依存の no-op に
+    # 差し替える＝unit テストは外部サービス不要という契約を保つ）。
+    monkeypatch.setattr(store, "world_lock", _noop_lock)
     return world
 
 

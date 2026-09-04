@@ -133,11 +133,13 @@ def _xlsx_dimension_area(ref: str) -> int | None:
 
 def _xlsx_estimated_cell_count(rp: Path) -> int | None:
     """openpyxl でフルロードする前に、zip 内 `xl/worksheets/sheetN.xml` の `<dimension ref="..."/>`
-    だけをストリーミングで読み、全シートのセル数（面積）の和を見積もる（MEM-2）。
+    だけをストリーミングで読み、全シートのセル数（面積）の和を見積もる（MEM-2・「速い棄却」）。
 
-    シート XML 全体は読まない（先頭 `_XLSX_DIMENSION_SCAN_BYTES` バイトだけ）。dimension が
-    欠落/不正な原本が1つでもあれば全体を「見積不能」として None を返す＝fail-open（ガード不可・
-    通常の変換経路へそのまま流す）。壊れた zip も同様に None。
+    シート XML 全体は読まない（先頭 `_XLSX_DIMENSION_SCAN_BYTES` バイトだけ）。`<dimension>` は
+    書き手側の自己申告にすぎず、実際の `sheetData` のセル数と一致する保証は無い——ここで None
+    （dimension 欠落/不正）を返す場合は fail-open ではなく、呼び出し側が `_xlsx_actual_cell_count`
+    （`<c ` 実数カウント）へフォールバックする契約（自己申告を鵜呑みにして通す穴を塞ぐ・RV是正#2）。
+    壊れた zip/シート皆無だけは実カウント側でも同じ理由で None になる＝そこだけ真の fail-open。
     """
     try:
         with zipfile.ZipFile(rp) as zf:
@@ -156,6 +158,44 @@ def _xlsx_estimated_cell_count(rp: Path) -> int | None:
                 if area is None:
                     return None
                 total += area
+            return total
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+_XLSX_CELL_TAG_NEEDLE = b"<c "         # OOXML のセル要素は必ず `r="..."` 属性を伴うため空白まで含める
+_XLSX_CELL_COUNT_CHUNK_BYTES = 1 << 20  # 1MiB ずつ（シート全体を一度にメモリへ載せない）
+
+
+def _xlsx_actual_cell_count(rp: Path, cap: int) -> int | None:
+    """`<dimension>` が欠落/不正で見積不能な xlsx 向けに、シート XML の `<c ` 出現数を実際に
+    ストリーミングでカウントする（MEM-2 RV是正#2・`_xlsx_estimated_cell_count` の fail-open 置換）。
+
+    1MiB チャンクで逐次読み、チャンク境界をまたぐ `<c ` を取りこぼさないよう直前チャンク末尾
+    （needle 長-1 バイト）だけを次回へ持ち越す。`cap` を超えた時点で残りを読まずに即座に打ち切る
+    （超過の有無だけが要件・正確な総数は不要）。壊れた zip/シート皆無は None（真の fail-open——
+    その場合 openpyxl 自体もほぼ確実に読めずどのみち失敗する）。
+    """
+    try:
+        with zipfile.ZipFile(rp) as zf:
+            sheet_names = [n for n in zf.namelist()
+                           if n.startswith("xl/worksheets/") and n.lower().endswith(".xml")]
+            if not sheet_names:
+                return None
+            total = 0
+            carry_len = len(_XLSX_CELL_TAG_NEEDLE) - 1
+            for name in sheet_names:
+                with zf.open(name) as fh:
+                    carry = b""
+                    while True:
+                        chunk = fh.read(_XLSX_CELL_COUNT_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        buf = carry + chunk
+                        total += buf.count(_XLSX_CELL_TAG_NEEDLE)
+                        if total > cap:
+                            return total
+                        carry = buf[-carry_len:] if carry_len else b""
             return total
     except (OSError, zipfile.BadZipFile):
         return None
@@ -1325,6 +1365,11 @@ _CONV_CACHE_MAX_BYTES_ENV = "SHERPA_CONV_CACHE_MAX_BYTES"
 _CONV_CACHE_SIDECAR_SUFFIXES = (
     ".md", ".md.meta.json", ".evidence.json", ".document.json", ".rag.md", ".rag_chunks.jsonl",
 )
+# rep_delta のうち「MD自体は成功したが一部書込が失敗した」ことを示すカウンタ（RV是正#5）。
+# いずれかが非ゼロの結果はキャッシュへ保存しない・既存キャッシュも復元時に拒否する——書込失敗は
+# 大抵一時的（ディスク逼迫等）で、キャッシュに焼き付けると次回 sync も同じ失敗を再生し続け、
+# 一時要因が解消しても自然に再試行されなくなる（キャッシュミスなら毎回フル実変換で再試行が効く）。
+_CONV_CACHE_FAILED_DELTA_KEYS = ("document_ir_failed", "evidence_ir_failed", "rag_failed")
 
 
 def _conv_cache_root_for(derived_md_dir) -> Path:
@@ -1373,13 +1418,20 @@ def _conv_cache_slot(cache_root: Path, rel: str) -> tuple[Path, Path]:
 
 
 def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict, Path] | None:
-    """キャッシュヒットなら `(rep_delta, content_dir)` を返す。ミス/壊れ/鍵不一致は None。"""
+    """キャッシュヒットなら `(rep_delta, content_dir)` を返す。ミス/壊れ/鍵不一致は None。
+
+    `rep_delta` に失敗カウンタ（`_CONV_CACHE_FAILED_DELTA_KEYS`）が非ゼロで残っている実体は
+    ミス扱いする（RV是正#5・防御的二重チェック——本来 `_conv_cache_store_if_eligible` が保存時点で
+    弾くが、それ以前の版で保存された古いキャッシュ実体が残っていても復元しない）。
+    """
     meta_path, content_dir = _conv_cache_slot(cache_root, rel)
     meta = json_io.read_json(meta_path, default=None)
     if not isinstance(meta, dict) or meta.get("key") != want_key:
         return None
     rep_delta = meta.get("rep_delta")
     if not isinstance(rep_delta, dict) or not content_dir.is_dir():
+        return None
+    if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
         return None
     return rep_delta, content_dir
 
@@ -1816,10 +1868,19 @@ def _build_derived_into_staging(
         """直前に処理した rel（ループ変数 `rel`/`conv_cache_key`/`conv_cache_rep_before`/
         `human_md_sig_for_rel` を閉包で参照）を CONV-CACHE へ保存する。両方の成功終着点
         （raster／通常変換）から呼ぶ共通処理（DRY）——`conv_cache_key` が None（`ext not in conv`）
-        なら no-op。"""
+        なら no-op。
+
+        `converted` としてこの rel を計上した経路でも、Evidence/RAG/IR の一時書込（OSError）だけが
+        失敗して `*_failed` カウンタが増えている縁のケースがある（RV是正#5）。そのような「失敗を
+        含む成功」はキャッシュへ保存しない——保存すると次回 sync がキャッシュヒットで丸ごとスキップし、
+        一時的だったはずの書込失敗を無期限に再生し続けてしまう（原本が変わらない限り自然な再試行の
+        機会を失う）。キャッシュミスのままにしておけば毎回フル実変換が走り、書込が成功した回に
+        初めてキャッシュされる。"""
         if conv_cache_key is None or conv_cache_rep_before is None:
             return
         rep_delta = _conv_cache_rep_delta(conv_cache_rep_before)
+        if any(rep_delta.get(k) for k in _CONV_CACHE_FAILED_DELTA_KEYS):
+            return
         rep_delta["human_md_sig"] = human_md_sig_for_rel
         _conv_cache_store(conv_cache_root, rel, conv_cache_key, rep_delta, dr, dr_rag, dr_ir)
 
@@ -1878,23 +1939,11 @@ def _build_derived_into_staging(
                   f"（RSS {_rss0:.1f}G）" if _rss0 is not None else "")
         _done_label = "完了"                     # finally の完了行用（キャッシュ復元なら差し替え）
         try:
-            # CONV-CACHE（実変換対象＝`conv`）: 原本 mtime/size と変換パイプライン署名が前回成功時と
-            # 一致すれば、①アーム実行・Evidence 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み
-            # 派生一式をステージングへコピーするだけで済ませる。ミス（原本変化/署名変化/未キャッシュ）は
-            # 下の通常経路へそのまま流れる——キャッシュは最適化であり、正しさはここに依存しない。
-            if ext in conv:
-                conv_cache_key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
-            if conv_cache_key is not None:
-                hit = _conv_cache_lookup(conv_cache_root, rel, conv_cache_key)
-                if hit is not None:
-                    rep_delta, content_dir = hit
-                    if _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir):
-                        _conv_cache_apply_rep_delta(rep_delta)
-                        human_md_sig_for_rel = rep_delta.get("human_md_sig")
-                        converted += 1
-                        _done_label = "完了（キャッシュ復元）"
-                        continue
-                conv_cache_rep_before = _conv_cache_rep_snapshot()
+            # 入口ガード群（MEM-1 size_exceeded・MEM-2 cell_count_exceeded/uncompressed_size_exceeded）は
+            # CONV-CACHE のキャッシュ照合より**先**に評価する（RV是正#4）。旧キャッシュ（このガードが
+            # 存在しなかった版で成功済みの巨大ファイル）はパイプライン署名にガード自体を含まないため、
+            # 逆順だとキャッシュヒットで復元されるだけでガードが一切素通りしてしまう——原本が変わらない
+            # 限り毎回この穴を通り続けるのを防ぐ。キャッシュ照合はこの後の全ガード通過後にのみ行う。
             if ext not in conv:                              # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
                 if ext in LEGACY_OFFICE_EXT:
                     unavailable_evidence = legacy_provenance.build_unavailable_evidence(
@@ -1920,9 +1969,13 @@ def _build_derived_into_staging(
                 continue
             if ext == ".xlsx":
                 # 圧縮爆弾ガード（MEM-2）: st_size は圧縮後サイズのため小さい xlsx でも展開後に
-                # 巨大化しうる。openpyxl を一切開かず zip 内 dimension だけ見てセル数を見積もる。
-                # 見積不能（dimension欠落/壊れたzip等）は fail-open で通常の変換経路へ流す。
+                # 巨大化しうる。openpyxl を一切開かず zip 内 dimension だけ見てセル数を見積もる
+                # （速い棄却）。dimension は書き手の自己申告のため、欠落/不正な原本を fail-open で
+                # 素通りさせず `<c ` の実カウントへフォールバックする（RV是正#2・完全な fail-open
+                # を潰す）。壊れた zip 等の真に見積不能なケースだけ実カウント側も None＝fail-open。
                 estimated_cells = _xlsx_estimated_cell_count(rp)
+                if estimated_cells is None:
+                    estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
                 if estimated_cells is not None and estimated_cells > _XLSX_CELL_CAP:
                     _publish_failed_size_notice(
                         rp, rel, "cell_count_exceeded",
@@ -1937,6 +1990,23 @@ def _build_derived_into_staging(
                         rp, rel, "uncompressed_size_exceeded",
                         detail={"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
                     continue
+            # CONV-CACHE（`ext in conv` はここまでの `ext not in conv` 早期 continue で確定済み）:
+            # 原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば、①アーム実行・Evidence
+            # 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピー
+            # するだけで済ませる。ミス（原本変化/署名変化/未キャッシュ）は下の通常経路へそのまま流れる
+            # ——キャッシュは最適化であり、正しさはここに依存しない。
+            conv_cache_key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
+            if conv_cache_key is not None:
+                hit = _conv_cache_lookup(conv_cache_root, rel, conv_cache_key)
+                if hit is not None:
+                    rep_delta, content_dir = hit
+                    if _conv_cache_restore(content_dir, rel, dr, dr_rag, dr_ir):
+                        _conv_cache_apply_rep_delta(rep_delta)
+                        human_md_sig_for_rel = rep_delta.get("human_md_sig")
+                        converted += 1
+                        _done_label = "完了（キャッシュ復元）"
+                        continue
+                conv_cache_rep_before = _conv_cache_rep_snapshot()
             # 単体PNG/JPEGはVLM armへ渡さず、OCR非依存のEvidence/RAGを通常成果物として作る。
             if ext in RASTER_EVIDENCE_EXT:
                 raster_md = _generate_evidence(rp, rel)
@@ -2007,6 +2077,19 @@ def _build_derived_into_staging(
                         rp, rel, "uncompressed_size_exceeded",
                         detail={"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
                     continue
+                if conv_path.suffix.lower() == ".xlsx":
+                    # セル数ガード（RV是正#3）: 上のセル数ガード（`.xlsx` 原本向け）は旧形式
+                    # （.xls→.xlsx）の materialized 結果には適用されていなかった穴。原本 .xls 自体は
+                    # 圧縮率が高く小さくても、変換後の xlsx が巨大なセル数になりうるのは xlsx 原本と
+                    # 同じ理屈のため、同じガードをそのまま適用する。
+                    materialized_cells = _xlsx_estimated_cell_count(conv_path)
+                    if materialized_cells is None:
+                        materialized_cells = _xlsx_actual_cell_count(conv_path, _XLSX_CELL_CAP)
+                    if materialized_cells is not None and materialized_cells > _XLSX_CELL_CAP:
+                        _publish_failed_size_notice(
+                            rp, rel, "cell_count_exceeded",
+                            detail={"measured_cells": materialized_cells, "cap_cells": _XLSX_CELL_CAP})
+                        continue
             arm_name, result = _convert_with_arms(conv_path, enabled)  # A1＝最初に受理したアーム1本
             if result is None or result.md is None:
                 # fail-closed: docx/xlsx は document-ir 構築失敗が直接 md=None を招く

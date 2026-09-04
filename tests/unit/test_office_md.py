@@ -455,6 +455,168 @@ def test_build_derived_legacy_materialized_uncompressed_size_exceeded(monkeypatc
     assert "reason_code=uncompressed_size_exceeded" in meta["notes"]
 
 
+def test_xlsx_dimension_missing_falls_back_to_actual_cell_count_exceeded(monkeypatch):
+    """RV是正#2: `<dimension>` 欠落は「見積不能」であって「安全」ではない——dimension は書き手の
+    自己申告にすぎないため、欠落/不正な原本を fail-open で素通りさせず、シート XML の `<c ` 実数を
+    ストリーミングでカウントして cap 超過を検出する（`_xlsx_estimated_cell_count` 単体の fail-open
+    契約はそのまま・置換されるのは呼び出し側の「見積不能→素通り」という挙動）。"""
+    d = tempfile.mkdtemp()
+    src = pathlib.Path(d) / "src"; src.mkdir()
+    p = src / "no_dim_wide.xlsx"
+    cells = "".join(f'<c r="A{i + 1}" t="inlineStr"><is><t>v</t></is></c>' for i in range(50))
+    _zip(p, {
+        "xl/worksheets/sheet1.xml": (
+            '<?xml version="1.0"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f"<sheetData>{cells}</sheetData>"
+            "</worksheet>"
+        ),
+    })
+    assert office_md._xlsx_estimated_cell_count(p) is None      # 前提: dimension無し＝見積不能
+    der = pathlib.Path(d) / "derived"
+    monkeypatch.setattr(office_md, "_XLSX_CELL_CAP", 10)         # 実セル50 > 10 で確実に超過させる
+    rep = office_md.build_derived(src, der)
+    assert rep["failed"] == 1
+    assert {"doc": "no_dim_wide.xlsx", "reason": "cell_count_exceeded"} in rep["conversion_failures"]
+    meta = json_io.read_json(der / "no_dim_wide.xlsx.md.meta.json", default=None)
+    assert meta is not None and "reason_code=cell_count_exceeded" in meta["notes"]
+
+
+def test_xlsx_actual_cell_count_stops_early_past_cap():
+    """`_xlsx_actual_cell_count` は cap 超過が確定した時点で残りを読まずに打ち切る（正確な総数は
+    不要・超過の有無だけが要件）。ここでは cap を小さくし、返り値が実際のセル数（100）ではなく
+    cap 超過の事実だけを示す値（cap を上回っている）であることを確認する。"""
+    d = tempfile.mkdtemp()
+    p = pathlib.Path(d) / "many.xlsx"
+    cells = "".join(f'<c r="A{i + 1}" t="inlineStr"><is><t>v</t></is></c>' for i in range(100))
+    _zip(p, {
+        "xl/worksheets/sheet1.xml": (
+            '<?xml version="1.0"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f"<sheetData>{cells}</sheetData>"
+            "</worksheet>"
+        ),
+    })
+    result = office_md._xlsx_actual_cell_count(p, cap=5)
+    assert result is not None and result > 5
+
+
+def test_build_derived_legacy_materialized_cell_count_exceeded(monkeypatch):
+    """RV是正#3: 旧形式（.xls等）を①OOXMLへ前段変換した後の materialized ファイルには従来
+    非圧縮サイズガードしか適用されておらず、セル数ガードが欠けていた（原本 .xls 自体は小さくても
+    変換後の xlsx が巨大なセル数になりうるケースへの備え・MEM-2 の xlsx セル数ガードと同型を
+    materialized 側にも適用する）。"""
+    import openpyxl
+    from sherpa.ingest.arms import legacy_convert
+    d = tempfile.mkdtemp()
+    src = pathlib.Path(d) / "src"; src.mkdir()
+    p = src / "old.xls"
+    p.write_bytes(b"legacy-binary-not-a-real-xls")   # 中身は問わない（ensure_ooxml を直接 mock する）
+    materialized_dir = pathlib.Path(d) / "materialized"; materialized_dir.mkdir()
+    materialized = materialized_dir / "old.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "値"
+    ws["J20"] = "値"          # dimension は A1:J20（10列×20行=200セル）に確定する
+    wb.save(materialized)
+    monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".xls"})
+    monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (materialized, []))
+    der = pathlib.Path(d) / "derived"
+    monkeypatch.setattr(office_md, "_XLSX_CELL_CAP", 100)          # 200セル > 100 で確実に超過させる
+    rep = office_md.build_derived(src, der)
+    assert rep["failed"] == 1
+    assert {"doc": "old.xls", "reason": "cell_count_exceeded"} in rep["conversion_failures"]
+    md_path = der / "old.xls.md"
+    assert md_path.is_file()
+    meta = json_io.read_json(der / "old.xls.md.meta.json", default=None)
+    assert meta is not None and meta["arm"] == "evidence_notice"
+    assert "reason_code=cell_count_exceeded" in meta["notes"]
+
+
+def test_build_derived_conv_cache_hit_does_not_bypass_size_guard(monkeypatch):
+    """RV是正#4: 入口ガード群は CONV-CACHE のキャッシュ照合より前に評価する。原本 mtime/size・
+    変換パイプライン署名が不変のまま上限だけ引き下げられた（＝ガードが後から強化された）状況でも、
+    既存キャッシュのヒットでガードを迂回して復元されてはならない（毎回この原本を通すたび改めて
+    ガードにかかる）。"""
+    import openpyxl
+    d = tempfile.mkdtemp()
+    src = pathlib.Path(d) / "src"; src.mkdir()
+    p = src / "wide.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "値"
+    ws["J20"] = "値"          # dimension は A1:J20（200セル）
+    wb.save(p)
+    der = pathlib.Path(d) / "derived"
+    rep1 = office_md.build_derived(src, der)
+    assert rep1["converted"] == 1                                    # 1回目は上限内で普通に変換される
+    cache_root = office_md._conv_cache_root_for(der)
+    assert (cache_root / "wide.xlsx.key.json").is_file()             # キャッシュ済み
+
+    monkeypatch.setattr(office_md, "_XLSX_CELL_CAP", 100)             # 200セル > 100 に引き下げ（署名は不変）
+    rep2 = office_md.build_derived(src, der)
+    assert rep2["converted"] == 0                                     # キャッシュ復元で素通りしていない
+    assert rep2["failed"] == 1
+    assert {"doc": "wide.xlsx", "reason": "cell_count_exceeded"} in rep2["conversion_failures"]
+
+
+def test_conv_cache_skips_store_when_evidence_write_fails_then_recovers(monkeypatch):
+    """RV是正#5: `converted` 判定された rel でも Evidence の一時書込（OSError）で
+    `evidence_ir_failed` が増えた回はキャッシュへ保存しない。原本が変わらないまま書込要因が
+    解消した次回は（キャッシュミスのまま）フル実変換が再試行され正しく回復する——もし保存されて
+    いたら、2回目もキャッシュヒットで失敗delta（`evidence_ir_failed=1`）がそのまま再生され、
+    実際には直っているのに失敗が焼き付いたままになってしまう。"""
+    from sherpa.ingest import evidence_ir
+    import openpyxl
+    d = tempfile.mkdtemp()
+    src = pathlib.Path(d) / "src"; src.mkdir()
+    p = src / "a.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "x"
+    wb.save(p)
+    der = pathlib.Path(d) / "derived"
+
+    orig_write = evidence_ir.write_json_atomic
+    should_fail = {"v": True}
+
+    def flaky_write(path, data):
+        if should_fail["v"]:
+            raise OSError("simulated evidence.json write failure")
+        return orig_write(path, data)
+    monkeypatch.setattr(evidence_ir, "write_json_atomic", flaky_write)
+
+    rep1 = office_md.build_derived(src, der)
+    assert rep1["evidence_ir_failed"] == 1
+    assert rep1["converted"] == 1                          # md自体はEvidence書込失敗と独立に成功扱い
+    cache_root = office_md._conv_cache_root_for(der)
+    assert not (cache_root / "a.xlsx.key.json").exists()   # 失敗deltaを含む結果はキャッシュされない
+
+    should_fail["v"] = False                                # 一時要因（ディスク逼迫等）が解消したとする
+    rep2 = office_md.build_derived(src, der)
+    assert rep2["evidence_ir_failed"] == 0                  # キャッシュに焼き付いていたら1のまま再生される
+    assert rep2["converted"] == 1
+    assert (cache_root / "a.xlsx.key.json").is_file()       # 今回は成功のみ＝正しくキャッシュされる
+
+
+def test_conv_cache_lookup_rejects_entry_with_failed_delta(tmp_path):
+    """RV是正#5（防御的二重チェック）: rep_delta に失敗カウンタが残っている実体は、store側の
+    新チェックより前の版で書かれた古いキャッシュだったとしても復元しない。"""
+    cache_root = tmp_path / "_conv_cache"
+    content_dir = cache_root / "a.xlsx.d"
+    (content_dir / "md").mkdir(parents=True)
+    (content_dir / "md" / "a.xlsx.md").write_text("dummy", encoding="utf-8")
+    meta_path = cache_root / "a.xlsx.key.json"
+    json_io.write_json_atomic(meta_path, {
+        "key": "k1",
+        "rep_delta": {
+            "document_ir_generated": 1, "document_ir_failed": 0,
+            "evidence_ir_generated": 0, "evidence_ir_failed": 1,
+            "rag_generated": 0, "rag_failed": 0,
+        },
+    })
+    assert office_md._conv_cache_lookup(cache_root, "a.xlsx", "k1") is None
+
+
 def test_xlsx_extractor_version_bump_triggers_document_ir_and_human_md_drift(monkeypatch):
     """DOCX/XLSX の抽出規則（span/vMerge・列上限等）を変えて抽出器版を上げたら、
     `document_ir_sig_drift`（→ evidence/rag への連鎖）と `human_md_sig_drift`（→ `{rel}.md` の

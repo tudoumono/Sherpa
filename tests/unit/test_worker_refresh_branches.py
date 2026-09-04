@@ -63,7 +63,7 @@ def _stub(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite",
                         lambda world: calls["reflect_graph"].append(world))
 
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {}))
+    monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)

@@ -7,6 +7,7 @@ Microsoft Excelの表示エンジンを利用できないLinux基本経路向け
 """
 from __future__ import annotations
 
+import gc
 import json
 import posixpath
 import re
@@ -376,36 +377,52 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
     }
     raw = _raw_cells(source, normalized_targets)
 
-    # 第1パス（wb_formula）: シート/セルごとに必要な情報だけを中間dictへ抽出してから閉じる。
-    # シート欠落チェック（旧・両ブック存在チェック）は、ここに無ければ第2パスで自然にスキップされる
-    # 形で再現する。
-    intermediate: dict[tuple[str, str], dict[str, Any]] = {}
-    wb_formula = openpyxl.load_workbook(source, data_only=False, read_only=False, keep_links=False)
-    try:
-        for sheet_name in sorted(normalized_targets):
-            if sheet_name not in wb_formula.sheetnames:
-                continue
-            formula_sheet = wb_formula[sheet_name]
-            for coordinate in sorted(normalized_targets[sheet_name]):
-                formula_cell = formula_sheet[coordinate]
-                xml = raw.get((sheet_name, coordinate), {})
-                formula = xml.get("formula")
-                # shared formulaのfollowerはOOXML上``<f t="shared" si="…"/>``となり、
-                # XML直読だけでは式が単独の``=``になる。openpyxlがmasterから復元した式を
-                # 権威として補い、存在する数式を空式として保存しない。
-                if formula in {None, "="} and isinstance(formula_cell.value, str) and formula_cell.value.startswith("="):
-                    formula = formula_cell.value
-                has_cache = bool(xml.get("has_cache")) if formula else False
-                intermediate[(sheet_name, coordinate)] = {
-                    "raw_value": xml.get("raw_value", _json_scalar(formula_cell.value)),
-                    "formula": formula,
-                    "has_cache": has_cache,
-                    "style_id": int(formula_cell.style_id),
-                    "number_format": formula_cell.number_format or "General",
-                    "formula_cell_value": formula_cell.value,
-                }
-    finally:
-        wb_formula.close()
+    def _load_formula_pass() -> dict[tuple[str, str], dict[str, Any]]:
+        """第1パス（wb_formula）: シート/セルごとに必要な情報だけを中間dictへ抽出してから閉じる。
+        シート欠落チェック（旧・両ブック存在チェック）は、ここに無ければ第2パスで自然にスキップ
+        される形で再現する。
+
+        独立した関数スコープに閉じ込めるのが要点——`wb_formula`だけでなく、ループ内で束縛される
+        `formula_sheet`/`formula_cell`（Cellはparentツリー経由でWorkbook全体を参照する）もこの
+        関数が返った時点でフレームごと消える。呼び出し元のローカル変数として残さないことで、
+        `wb_formula.close()`（循環参照ゆえ即解放しない）に加えてGCが確実に回収できる状態を作る
+        （MEM-1のRV是正#1・close()だけでは不十分）。
+        """
+        intermediate: dict[tuple[str, str], dict[str, Any]] = {}
+        wb_formula = openpyxl.load_workbook(source, data_only=False, read_only=False, keep_links=False)
+        try:
+            for sheet_name in sorted(normalized_targets):
+                if sheet_name not in wb_formula.sheetnames:
+                    continue
+                formula_sheet = wb_formula[sheet_name]
+                for coordinate in sorted(normalized_targets[sheet_name]):
+                    formula_cell = formula_sheet[coordinate]
+                    xml = raw.get((sheet_name, coordinate), {})
+                    formula = xml.get("formula")
+                    # shared formulaのfollowerはOOXML上``<f t="shared" si="…"/>``となり、
+                    # XML直読だけでは式が単独の``=``になる。openpyxlがmasterから復元した式を
+                    # 権威として補い、存在する数式を空式として保存しない。
+                    if (formula in {None, "="} and isinstance(formula_cell.value, str)
+                            and formula_cell.value.startswith("=")):
+                        formula = formula_cell.value
+                    has_cache = bool(xml.get("has_cache")) if formula else False
+                    intermediate[(sheet_name, coordinate)] = {
+                        "raw_value": xml.get("raw_value", _json_scalar(formula_cell.value)),
+                        "formula": formula,
+                        "has_cache": has_cache,
+                        "style_id": int(formula_cell.style_id),
+                        "number_format": formula_cell.number_format or "General",
+                        "formula_cell_value": formula_cell.value,
+                    }
+        finally:
+            wb_formula.close()
+        return intermediate
+
+    intermediate = _load_formula_pass()
+    # 関数フレームが消えても、openpyxlのWorkbookは内部循環参照（cell⇄parent等）を持つため
+    # CPythonの参照カウント方式だけでは即解放されない（次の周期的GCまで生き残る）。第2パスを
+    # 開く前にGCを1回回し、ピーク時に生きているブックを常に1冊に保つ。
+    gc.collect()
 
     # 第2パス（wb_values）: formulaの場合のみ再計算値を要するため、第1パスの中間dictと合流する。
     out: dict[tuple[str, str], dict[str, Any]] = {}

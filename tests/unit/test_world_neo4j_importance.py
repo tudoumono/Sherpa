@@ -83,6 +83,48 @@ def test_attach_importance_single_value_repeated_is_not_mixed(monkeypatch):
     assert "importance_mixed" not in items[0]
 
 
+def test_attach_importance_unset_candidate_outranks_low_suppresses_display(monkeypatch):
+    """rv-oom-resume item7: 自身の path が未解決（中相当）で、evidence に `低` が1つ混じるだけの
+    item は、未設定（中=rank1）が `低`（rank0）を上回るため最高位に実 Resolution が無い＝
+    表示キー自体を一切付けない（誤って `低` を表示しない）。"""
+    monkeypatch.setattr(wn.worlds, "world_dir", lambda w: "/tmp/x")
+    monkeypatch.setattr(wn.importance, "resolve_for_world", lambda w, root=None: {"b.md": _res("低")})
+    items = [_item("A", path="a.md", evidence=[{"doc": "b.md"}])]   # a.md は未解決
+    wn._attach_importance(items, "w")
+    assert "importance" not in items[0]
+    assert "importance_reason" not in items[0]
+    assert "importance_mixed" not in items[0]
+
+
+def test_attach_importance_unset_candidate_does_not_block_explicit_winner(monkeypatch):
+    """未設定候補があっても、他の候補に最高位（`高`）の実 Resolution があればそちらが勝つ
+    （未設定を中相当に含めても、真に最高位の実解決を覆い隠さない）。"""
+    monkeypatch.setattr(wn.worlds, "world_dir", lambda w: "/tmp/x")
+    monkeypatch.setattr(wn.importance, "resolve_for_world", lambda w, root=None: {"b.md": _res("高", "契約書")})
+    items = [_item("A", path="a.md", evidence=[{"doc": "b.md"}])]   # a.md は未解決
+    wn._attach_importance(items, "w")
+    assert items[0]["importance"] == "高" and items[0]["importance_reason"] == "契約書"
+
+
+def test_attach_importance_unset_counts_as_naka_for_mixed(monkeypatch):
+    """未設定（中相当）も mixed 判定の実効値集合に含める: `高` と未設定が混在すれば mixed=True。"""
+    monkeypatch.setattr(wn.worlds, "world_dir", lambda w: "/tmp/x")
+    monkeypatch.setattr(wn.importance, "resolve_for_world", lambda w, root=None: {"a.md": _res("高")})
+    items = [_item("A", path="a.md", evidence=[{"doc": "unresolved.md"}])]
+    wn._attach_importance(items, "w")
+    assert items[0]["importance"] == "高"
+    assert items[0].get("importance_mixed") is True
+
+
+def test_attach_importance_explicit_naka_at_top_rank_still_displays(monkeypatch):
+    """最高位（中相当のrank）に実解決の `中` がタイであれば、未設定候補があっても表示は抑制しない。"""
+    monkeypatch.setattr(wn.worlds, "world_dir", lambda w: "/tmp/x")
+    monkeypatch.setattr(wn.importance, "resolve_for_world", lambda w, root=None: {"a.md": _res("中", "既定水準")})
+    items = [_item("A", path="a.md", evidence=[{"doc": "unresolved.md"}])]
+    wn._attach_importance(items, "w")
+    assert items[0]["importance"] == "中" and items[0]["importance_reason"] == "既定水準"
+
+
 def test_attach_importance_no_candidates_leaves_item_unchanged(monkeypatch):
     """path も evidence も無い item（候補ゼロ）は解決しようがない＝無改変。"""
     monkeypatch.setattr(wn.worlds, "world_dir", lambda w: "/tmp/x")

@@ -84,7 +84,7 @@ ES_MAPPING_VERSION = "7"                            # マッピング/チャン�
 # （L4c）が読む。文脈拡張として辿って連結する B2 は撤去済み＝2026-09-03・CLEAN-2 item f）。
 # v7（I2・2026-09-05・重要度の経路別反映）: `importance`（keyword）/`importance_reason`
 # （keyword・index:false＝表示専用で検索対象にしない）を追加。`_重要度.txt` の無い world の文書は
-# どちらも索引に持たない（`_doc_chunk_bundle` の meta 組み立てが条件付きで焼き込む）——
+# どちらも索引に持たない（`_iter_doc_chunk_records` の meta 組み立てが条件付きで焼き込む）——
 # 検索クエリ側の重要度ブースト（`search()`/`search_knn_only()`）はこのフィールドへの `term` filter
 # なので、フィールド自体が無い文書は一致せず boost が完全 no-op になる（受け入れ条件＝
 # 重要度制御ファイルの無い world でスコア完全不変）。
@@ -117,7 +117,7 @@ _ES_BULK_BATCH_MAX_BYTES = _env_int(
 # **即時フラッシュ**することで、①1回に保持するベクトル量を有界化し、②プロセスが OOM/kill で
 # 落ちてもフラッシュ済み分は次回 sync がキャッシュヒットで即スキップできる（＝再開性の本体・
 # `_embed_cached` docstring 参照）。**EMBED-3（doc単位ストリーミング化）で `index_world()` 自身の
-# doc グループ化バッチサイズにも兼用**する（`_doc_chunk_bundle`/`_flush_doc_group` 参照）——
+# doc グループ化バッチサイズにも兼用**する（`_iter_doc_chunk_records`/`_flush_doc_group` 参照）——
 # 「embed の HTTP バッチングは件数単位で有界」という既存契約と、「一度に保持するチャンク量」を
 # 同じ1つの env で揃え、チューニングつまみを増やさない。件数のみ（`_ES_BULK_BATCH_MAX_DOCS` と
 # 違いバイト数は見ない）＝チャンク本文の長さは埋め込み対象（自然文）でばらつきが小さく、
@@ -198,7 +198,16 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
     }
     if dim:
         props["embedding"] = {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"}
-    m = {"mappings": {"properties": props}}
+    # rv-oom-resume item3（2026-09-05）: `index_world()` はクリーン再索引（delete→create→bulk）
+    # のため、作成直後の新しい index は空——ES の既定 `refresh_interval`（"1s"）のままだと、
+    # bulk が中間バッチ（`refresh=false`）を送っている**最中**でも背景の周期リフレッシュにより
+    # 部分的に投入済みのチャンクだけが検索から見えてしまう（大規模 world では bulk が数時間かかる
+    # ため、この「途中経過」の窓が無視できない——利用者が「検索したのに一部しか出てこない」を
+    # 引く）。作成時点で背景リフレッシュを止め（`-1`）、`index_world()` が全バッチ成功後の
+    # 最終バッチ（`refresh=true`・`_StreamingBulkSender.finish()`）で一度だけ明示リフレッシュして
+    # 全件を一括可視化し、直後に通常値へ戻す（`_restore_refresh_interval` 参照）——「部分的に
+    # 増えていく」ではなく「見えない→完全に見える」の二値にする。
+    m = {"settings": {"index": {"refresh_interval": "-1"}}, "mappings": {"properties": props}}
     if emeta:
         m["mappings"]["_meta"] = emeta              # {embed_provider, embed_model, dim}（検索時の素性照合用）
     return m
@@ -459,6 +468,20 @@ def _confirm_content_sig(world: str, content_sig) -> None:
         _log.warning("es_index: content_sig の確定に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
 
 
+def _restore_refresh_interval(world: str) -> None:
+    """`_mapping()` が索引作成時に立てた `refresh_interval:-1`（rv-oom-resume item3）を、bulk
+    全件成功後にクラスタ既定（"1s"）へ戻す（PUT `_settings` へ `null` を渡すと既定に復帰する
+    ＝ES の仕様）。この復帰自体が失敗しても索引の完全性には影響しない——直前の最終バッチが
+    `refresh=true` で既に全件可視化を終えている（`_StreamingBulkSender.finish()`）。復帰できな
+    かった場合は次回 `index_world()`（クリーン再索引）が index を作り直す際に再び `-1` で
+    上書きされるだけ（悪化しない・best-effort）。
+    """
+    try:
+        _req("PUT", f"/{_index(world)}/_settings", {"index": {"refresh_interval": None}})
+    except Exception:
+        _log.warning("es_index: refresh_interval の復帰に失敗しました（次回 reindex で上書きされます）: world=%s", world)
+
+
 def _wipe_after_bulk_failure(world: str) -> None:
     """bulk 途中失敗時に world を空へ戻す（案a＝全部か無しか）。**wipe 自体が失敗しても
     次回 sync が必ず張り直せる状態にする**のが本関数の契約。
@@ -562,7 +585,10 @@ def _embed_cache_dir(world: str) -> Path:
         try:
             legacy.unlink()
         except OSError:
-            pass
+            # 掃除はベストエフォート（旧ファイルはどこからも読まれず機能影響ゼロ）——ただし
+            # 消せない事実自体は運用が気付けるよう警告ログに残す（2026-09-05・rv-oom-resume item2）。
+            _embed_log.warning("es_index: 旧単一embedキャッシュの削除に失敗（world=%s・%s）",
+                               world, legacy)
     return d
 
 
@@ -577,6 +603,14 @@ def _read_embed_cache_shard(world: str, shard_id: str) -> dict:
 
 
 def _write_embed_cache_shard(world: str, shard_id: str, vectors: dict) -> None:
+    """シャードへ書き込む。**新規ベクトルの書込失敗（OSError＝ENOSPC 等）は呼び出し元へ伝播する**
+    （2026-09-05・rv-oom-resume item2）——ここで握り潰すと、実際にはディスクへ永続化されなかった
+    バッチを「flush 成功」として扱ってしまい（`_embed_cached()` はこの後 in-memory の `filled` を
+    返すため、この呼び出し自体は成功したように見える）、後続の Pass2（別途ディスクから読み直す
+    `_embed_cache_lookup_batch`）がキャッシュ miss を起こして embedding 無しでチャンクを送る
+    黙認に繋がる（ENOSPC を「成功扱い」しない）。空シャードの削除（既存キーが無くなった、鏡として
+    ファイル自体を消す）は失敗してもデータ損失ではない（stale ファイルが残るだけ）ためベストエフォートのまま。
+    """
     p = _embed_cache_shard_path(world, shard_id)
     if not vectors:                                    # このシャードに現存キーが無い＝ファイル自体を消す（鏡）
         try:
@@ -584,10 +618,7 @@ def _write_embed_cache_shard(world: str, shard_id: str, vectors: dict) -> None:
         except OSError:
             pass
         return
-    try:
-        json_io.write_json_atomic(p, {"vectors": vectors})
-    except OSError:
-        pass
+    json_io.write_json_atomic(p, {"vectors": vectors})  # OSError は呼び出し元へ伝播（fail-loud）
 
 
 def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
@@ -710,7 +741,17 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
             for k, vec in zip(batch_keys, new):
                 filled[k] = vec
                 new_map[k] = vec
-            _embed_cache_write_batch(world, new_map)   # 成功したバッチだけ即座に永続化（シャード単位・アトミック）
+            try:
+                _embed_cache_write_batch(world, new_map)   # 成功したバッチだけ即座に永続化（シャード単位・アトミック）
+            except OSError:
+                # 2026-09-05・rv-oom-resume item2: シャード書込障害（ENOSPC 等）を「flush 成功」
+                # として扱わない——このバッチは実際にはディスクへ永続化されていない。embed API 呼び
+                # 出し自体の失敗と同じ扱い（呼び出し元は BM25 のみへ降格・既存キャッシュは壊さない）
+                # にして fail-loud にする。
+                _embed_log.warning(
+                    "es_index: embed キャッシュのシャード書込に失敗（world=%s・ENOSPC等）"
+                    "——このバッチを embed 失敗として扱う", world)
+                return None, 0, 0
             if bi == 0 or bi == n_batches - 1 or (bi + 1) % 10 == 0:   # 間引いて進捗を残す（無言の長時間実行を無くす）
                 _embed_log.info("es_index: embed 進捗 %d/%d チャンク（world=%s）",
                                  min(start + len(batch_keys), total), total, world)
@@ -870,9 +911,115 @@ def _chunk_context_meta(chunk: dict) -> dict:
     return out
 
 
+def _load_rag_md_anchors(md_path: Path | None) -> tuple:
+    """`{rel}.rag.md`（D1正本）を読み、アンカー辞書 `(anchors, reason)` を返す。`reason` が付けば
+    `anchors` は None（`_validate_rag_chunks` 冒頭の md 側ロジックを、jsonl 側の検証（軽量な
+    `_rag_chunks_validate`）と独立に再利用できるよう切り出したもの・2026-09-05・rv-oom-resume item1）。
+    """
+    if md_path is None:
+        return None, "rag_md_missing"
+    try:
+        if md_path.stat().st_size > _RAG_CHUNKS_FILE_CAP_BYTES:
+            return None, "rag_md_too_large"
+    except OSError:
+        return None, "rag_md_stat_failed"
+    try:
+        markdown = md_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None, "rag_md_invalid_utf8"
+    except OSError:
+        return None, "rag_md_read_failed"
+    anchors, anchor_reason = _parse_rag_md_chunks(markdown)
+    if anchor_reason is not None:
+        return None, anchor_reason
+    return anchors, None
+
+
+def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
+    """`{rel}.rag_chunks.jsonl` を検証**のみ**行う（本文/メタは一切保持しない・
+    2026-09-05・rv-oom-resume item1）。1文書のチャンク数が大きくても（`_RAG_CHUNKS_MAX_ROWS`
+    既定20万）保持するのは `chunk_id` 文字列の集合だけ——チャンク本文（`_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS`
+    既定2万文字/チャンク）を1件も溜めないため、検証だけならメモリは1文書のチャンク総数に
+    比例しない（旧 `_validate_rag_chunks` は検証と同時に ids/bodies/texts を全件蓄積していた
+    ため、1文書が20万チャンクの record 単位チャンクだとそれだけでベクトル込み~10GB級になり得た
+    ——実際の本文組み立ては検証後にもう一度ファイルを開き直す `_iter_rag_chunk_entries` へ切り出した）。
+
+    有効なら `(seen_chunk_ids, None)`（0件チャンクもありうる・空集合を返す）。無効なら
+    `(None, reason)`。`reason` の語彙は `_validate_rag_chunks` docstring 参照
+    （md側の理由＝`rag_md_*` はここには出ない・`_load_rag_md_anchors` が担当）。
+    """
+    try:
+        if rag_path.stat().st_size > _RAG_CHUNKS_FILE_CAP_BYTES:
+            return None, "file_too_large"
+    except OSError:
+        return None, "stat_failed"
+    seen_chunk_ids: set = set()
+    try:
+        with rag_path.open("r", encoding="utf-8", errors="strict") as f:
+            for lineno, raw_line in enumerate(f, start=1):
+                if lineno > _RAG_CHUNKS_MAX_ROWS:
+                    return None, "too_many_rows"
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    return None, "invalid_json"
+                if not isinstance(row, dict):
+                    return None, "row_not_object"
+                cid = row.get("chunk_id")
+                if not (isinstance(cid, str) and cid):
+                    return None, "missing_chunk_id"
+                if row.get("source_rel_path") != rel:
+                    return None, "source_rel_path_mismatch"
+                if cid in seen_chunk_ids:
+                    return None, "duplicate_chunk_id"
+                seen_chunk_ids.add(cid)
+                text = anchors.get(cid)
+                if not (isinstance(text, str) and text.strip()):
+                    return None, "rag_md_anchor_missing"
+                if len(text) > _RAG_CHUNK_SEARCH_TEXT_MAX_CHARS:
+                    return None, "search_text_too_long"
+    except UnicodeDecodeError:
+        return None, "invalid_utf8"
+    except OSError:
+        return None, "read_failed"
+    if set(anchors) - seen_chunk_ids:
+        return None, "rag_md_anchor_surplus"
+    return seen_chunk_ids, None
+
+
+def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
+    """**事前に `_rag_chunks_validate()` が `reason=None` を返した** `rag_path` をもう一度走査し、
+    `(id, body, text)` を1件ずつ yield する（2026-09-05・rv-oom-resume item1）。ファイルを2回
+    読む代わりに、1文書のチャンク総数（大きければ20万件級）に関係なく常に1件分だけをメモリに
+    持つ——呼び出し元（`index_world` の Pass1/Pass2）が `_EMBED_FLUSH_CHUNKS` 件ごとに
+    flush できる。検証は繰り返さない（呼び出し契約: 検証成功を確認済みの `rag_path`/`anchors`
+    でのみ呼ぶこと・呼び出し元は必ず `_rag_chunks_validate` の後に呼ぶ）。
+    """
+    with rag_path.open("r", encoding="utf-8", errors="strict") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            cid = row["chunk_id"]
+            text = anchors[cid]
+            body = {**base_meta, "chunk_id": cid, "text": text}
+            locator = _chunk_locator(row)
+            if locator is not None:
+                body["locator"] = locator
+            body.update(_chunk_context_meta(row))    # B1: 隣接キー（無ければ何も足さない）
+            yield _rag_chunk_es_id(rel, cid), body, text
+
+
 def _validate_rag_chunks(rag_path: Path, md_path: Path | None, rel: str, base_meta: dict) -> tuple:
     """`{rel}.rag_chunks.jsonl`（証跡サイドカー）＋`{rel}.rag.md`（D1のRAG正本）を突き合わせて検証し、
-    ES bulk 用の `(ids, bodies, texts, reason)` を返す。
+    ES bulk 用の `(ids, bodies, texts, reason)` を返す。**互換維持用の一括版**——世界規模の
+    `index_world()` Pass1/Pass2 はもう本関数を呼ばず、有界メモリ版（`_load_rag_md_anchors`／
+    `_rag_chunks_validate`／`_iter_rag_chunk_entries`）を直接使う（`_iter_doc_chunk_records`
+    参照）。本関数は既存の呼び出し規約（テスト・小規模用途）を保つための薄いラッパー。
 
     `reason` が None なら使ってよい（`ids` が空＝チャンク0件も正常系）。`reason` が付く＝**ファイル全体**を
     無効とみなし、呼び出し側は40行チャンクへ縮退する（1行だけ捨てて残りを使う部分採用はしない＝
@@ -909,70 +1056,17 @@ def _validate_rag_chunks(rag_path: Path, md_path: Path | None, rel: str, base_me
     読まない**）。`line` は立てない（rag チャンクは行番号を持たない。無ければキーを省く既存の流儀に
     合わせる）。
     """
-    if md_path is None:
-        return [], [], [], "rag_md_missing"
-    try:
-        if md_path.stat().st_size > _RAG_CHUNKS_FILE_CAP_BYTES:
-            return [], [], [], "rag_md_too_large"
-    except OSError:
-        return [], [], [], "rag_md_stat_failed"
-    try:
-        markdown = md_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return [], [], [], "rag_md_invalid_utf8"
-    except OSError:
-        return [], [], [], "rag_md_read_failed"
-    anchors, anchor_reason = _parse_rag_md_chunks(markdown)
-    if anchor_reason is not None:
-        return [], [], [], anchor_reason
-
-    ids, bodies, texts, seen_chunk_ids = [], [], [], set()
-    try:
-        if rag_path.stat().st_size > _RAG_CHUNKS_FILE_CAP_BYTES:
-            return [], [], [], "file_too_large"
-    except OSError:
-        return [], [], [], "stat_failed"
-    try:
-        with rag_path.open("r", encoding="utf-8", errors="strict") as f:
-            for lineno, raw_line in enumerate(f, start=1):
-                if lineno > _RAG_CHUNKS_MAX_ROWS:
-                    return [], [], [], "too_many_rows"
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    return [], [], [], "invalid_json"
-                if not isinstance(row, dict):
-                    return [], [], [], "row_not_object"
-                cid = row.get("chunk_id")
-                if not (isinstance(cid, str) and cid):
-                    return [], [], [], "missing_chunk_id"
-                if row.get("source_rel_path") != rel:
-                    return [], [], [], "source_rel_path_mismatch"
-                if cid in seen_chunk_ids:
-                    return [], [], [], "duplicate_chunk_id"
-                seen_chunk_ids.add(cid)
-                text = anchors.get(cid)
-                if not (isinstance(text, str) and text.strip()):
-                    return [], [], [], "rag_md_anchor_missing"
-                if len(text) > _RAG_CHUNK_SEARCH_TEXT_MAX_CHARS:
-                    return [], [], [], "search_text_too_long"
-                body = {**base_meta, "chunk_id": cid, "text": text}
-                locator = _chunk_locator(row)
-                if locator is not None:
-                    body["locator"] = locator
-                body.update(_chunk_context_meta(row))    # B1: 隣接キー（無ければ何も足さない）
-                ids.append(_rag_chunk_es_id(rel, cid))
-                bodies.append(body)
-                texts.append(text)
-    except UnicodeDecodeError:
-        return [], [], [], "invalid_utf8"
-    except OSError:
-        return [], [], [], "read_failed"
-    if set(anchors) - seen_chunk_ids:                  # 1:1検証: rag.md側の余剰アンカー
-        return [], [], [], "rag_md_anchor_surplus"
+    anchors, reason = _load_rag_md_anchors(md_path)
+    if reason is not None:
+        return [], [], [], reason
+    seen, reason = _rag_chunks_validate(rag_path, anchors, rel)
+    if reason is not None:
+        return [], [], [], reason
+    ids, bodies, texts = [], [], []
+    for cid_key, body, text in _iter_rag_chunk_entries(rag_path, rel, anchors, base_meta):
+        ids.append(cid_key)
+        bodies.append(body)
+        texts.append(text)
     return ids, bodies, texts, None
 
 
@@ -1009,26 +1103,41 @@ def _bulk_batches(ids: list, bodies: list, vec_by_idx: dict) -> list:
     return out
 
 
-def _doc_chunk_bundle(world: str, d: dict, derived: Path | None, rag_exts: frozenset,
-                      res_map: dict | None = None) -> tuple:
-    """1文書分のチャンク（rag優先→40行縮退）を組み立てる（2026-09-03・EMBED-3・doc単位ストリーミング化）。
+def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts: frozenset,
+                            res_map: dict | None = None) -> tuple:
+    """1文書分のチャンクを `(id, body, text, no_embed)` を1件ずつ返すジェネレータへ組み立てる
+    （2026-09-03・EMBED-3・doc単位ストリーミング化／2026-09-05・rv-oom-resume item1でさらに
+    チャンク単位へ細分）。
 
     `index_world()` の元の単一ループ本体（world 全体の ids/bodies/texts を一括蓄積していた箇所）を
-    doc 単位へ切り出したもの。呼び出し側はこれを Pass1（embed 対象テキストだけ）・Pass2（実際の
-    索引本文一式）で**2回**呼ぶ——2回目は disk I/O の再実行（`_validate_rag_chunks`/
-    `doc_text.read_world_doc_text` の再実行）を伴うが、途中のチャンクデータを world 規模で
-    メモリに保持しない設計とのトレードオフ（`index_world` docstring 参照）。
+    doc 単位へ切り出したのが EMBED-3 の `_doc_chunk_bundle()` だったが、**1文書自体が大量チャンク**
+    （rag_chunks 経路の record 単位チャンク・`_RAG_CHUNKS_MAX_ROWS` 既定20万まで許容）を持つ場合、
+    旧実装は1文書分の ids/bodies/texts を丸ごと1つのリストとして返していたため、呼び出し側の
+    flush 判定（`len(g_ids) >= _EMBED_FLUSH_CHUNKS`）が効く前に1文書ぶん（最大20万チャンク×
+    埋め込み込み）がまるごとメモリに乗ってしまっていた（実測: 20万チャンクでベクトルだけ約10GB）。
+    本関数はチャンクを1件ずつ yield するジェネレータにし、呼び出し元（`index_world` の Pass1/Pass2）が
+    1件ごとに flush 判定できるようにする——**doc 単位の原子性契約は維持**する: rag_chunks 経路は
+    yield を始める**前**に `_rag_chunks_validate()` で jsonl 全体を検証し終える（本文/メタは保持せず
+    `chunk_id` の集合だけを保持する軽量な検証専用パス）。検証が失敗すれば1件も yield せず legacy
+    40行チャンクへ縮退する——「一部だけ rag チャンクとして索引され、後続行の不整合が分かってから
+    取り消す」という中途半端な状態を作らない。検証成功後にもう一度ファイルを開き直して
+    （`_iter_rag_chunk_entries`）実際に yield する——ディスク I/O を2回払う代わりに、1文書の
+    チャンク総数に関係なく常に O(1)〜O(`_EMBED_FLUSH_CHUNKS`) のメモリで済む（world 全体を
+    2回走査する既存の Pass1/Pass2 設計と同じトレードオフ・`index_world` docstring 参照）。
 
     `res_map`（省略可・I2・2026-09-05）: `importance.resolve_for_world()` の結果（world 全体を
-    `index_world()` が1回だけ解決して渡す）。あれば `meta`（この文書の全チャンクへ passthrough）へ
+    `index_world()` が1回だけ解決して渡す）。あれば `body`（この文書の全チャンクへ passthrough）へ
     `importance`/`importance_reason` を条件付きで焼き込む（無ければキー自体を持たない・§2 truth
     table）。省略時（Pass1 の埋め込み専用パス等）は従来どおり付けない。
 
-    返値 `(bundle, degraded_entry)`。
-    - `bundle`＝None: この文書はスキップ（unreadable／軽量テキスト第2段／テキスト抽出失敗）。
-    - `bundle`＝{"ids": [...], "bodies": [...], "texts": [...], "no_embed": [...]}（0件チャンクもありうる）。
+    返値 `(chunk_iter, degraded_entry)`。
+    - `chunk_iter`＝None: この文書はスキップ（unreadable／軽量テキスト第2段／テキスト抽出失敗）。
+    - `chunk_iter`＝`(id, body, text, no_embed)` を yield するジェネレータ（0件チャンクもありうる——
+      "この文書は処理対象だった" ことと "チャンクが1件以上ある" ことは独立）。
     - `degraded_entry`＝None または {"doc": rel, "reason": ...}（rag_chunks はあるが使えなかった場合のみ・
-      `bundle` の有無とは独立——rag が壊れていても legacy 縮退が成功すれば bundle は None にならない）。
+      `chunk_iter` の有無とは独立——rag が壊れていても legacy 縮退が成功すれば `chunk_iter` は
+      None にならない）。**この決定は yield を始める前に確定させる**——呼び出し元が
+      `chunk_iter is None` を見るだけで（1件も消費せずに）判定できる。
     """
     if d.get("state") == "unreadable":              # 分類を唯一のゲートに——再読が成功しても索引しない
         return None, None
@@ -1055,7 +1164,6 @@ def _doc_chunk_bundle(world: str, d: dict, derived: Path | None, rag_exts: froze
     meta.update(_provenance_meta(d))                # 抽出来歴（extraction_method/confidence/has_conflicts）を搬送（無ければ省略）
     if res_map:                                      # I2: importance/importance_reason（無ければ省略）
         meta.update(importance.public_fields(res_map.get(rel)))
-    rag_result = None
     degraded_entry = None
     if derived is not None and meta["ext"] in rag_exts:
         rag_path, path_reason = _safe_rag_chunks_path(derived, rel)
@@ -1069,29 +1177,32 @@ def _doc_chunk_bundle(world: str, d: dict, derived: Path | None, rag_exts: froze
             elif md_path is None:
                 degraded_entry = {"doc": rel, "reason": "rag_md_missing"}
             else:
-                r_ids, r_bodies, r_texts, invalid_reason = _validate_rag_chunks(rag_path, md_path, rel, meta)
-                if invalid_reason is None and r_ids:
-                    rag_result = (r_ids, r_bodies, r_texts)
-                elif invalid_reason is not None:
-                    degraded_entry = {"doc": rel, "reason": invalid_reason}
-    if rag_result is not None:
-        c_ids, c_bodies, c_texts = rag_result
-        return {"ids": c_ids, "bodies": c_bodies, "texts": c_texts,
-                "no_embed": [no_embed] * len(c_ids)}, degraded_entry
+                anchors, reason = _load_rag_md_anchors(md_path)
+                seen = None
+                if reason is None:
+                    seen, reason = _rag_chunks_validate(rag_path, anchors, rel)
+                if reason is None and seen:      # 有効かつ1件以上（旧実装の `invalid_reason is None and r_ids` と同じ判定）
+                    def _rag_chunk_iter(rag_path=rag_path, anchors=anchors, meta=meta, no_embed=no_embed):
+                        for cid_key, body, text in _iter_rag_chunk_entries(rag_path, rel, anchors, meta):
+                            yield cid_key, body, text, no_embed
+                    return _rag_chunk_iter(), None
+                if reason is not None:
+                    degraded_entry = {"doc": rel, "reason": reason}
+                # reason is None かつ seen が空集合（0件チャンク）の場合は旧実装と同じく degraded に
+                # せず、そのまま legacy 縮退へ黙って続行する（rag_chunks が「正しく空」なケース）。
     text = doc_text.read_world_doc_text(world, d)   # ソース/テキスト、または rag_chunks の無い/無効な Office/PDF
     if text is None:
         return None, degraded_entry
-    ids, bodies, texts, no_embeds = [], [], [], []
-    rows = text.splitlines()
-    for s in range(0, max(1, len(rows)), _CHUNK_LINES):
-        chunk = "\n".join(rows[s:s + _CHUNK_LINES]).strip()
-        if not chunk:
-            continue
-        ids.append(f"{rel}#{s + 1}")
-        bodies.append({**meta, "line": s + 1, "text": chunk})
-        texts.append(chunk)
-        no_embeds.append(no_embed)
-    return {"ids": ids, "bodies": bodies, "texts": texts, "no_embed": no_embeds}, degraded_entry
+
+    def _legacy_chunk_iter(text=text, meta=meta, no_embed=no_embed):
+        rows = text.splitlines()
+        for s in range(0, max(1, len(rows)), _CHUNK_LINES):
+            chunk = "\n".join(rows[s:s + _CHUNK_LINES]).strip()
+            if not chunk:
+                continue
+            yield f"{rel}#{s + 1}", {**meta, "line": s + 1, "text": chunk}, chunk, no_embed
+
+    return _legacy_chunk_iter(), degraded_entry
 
 
 class _StreamingBulkSender:
@@ -1162,7 +1273,16 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
     """Pass2 の1グループ（doc数件・チャンク`_EMBED_FLUSH_CHUNKS`件程度に有界）を、必要なら
     埋め込みキャッシュから embedding を引いて bulk 送信する（`sender.send_group` へ委譲）。
     キャッシュ参照は `embed_feature_applies` が真の時だけ（Pass1 が全チャンクの embed を
-    完了させている前提——グループ内の対象チャンクだけを束ねて1回のシャード参照で引く）。"""
+    完了させている前提——グループ内の対象チャンクだけを束ねて1回のシャード参照で引く）。
+
+    **埋め込み対象キーの miss は fail-loud にする**（2026-09-05・rv-oom-resume item2）:
+    `embed_feature_applies` が真＝ Pass1 が world 全体の embed 対象キーを既にシャードへ flush
+    済みのはず（`_embed_cached` docstring 参照）。にもかかわらずここで miss が起きるのは、
+    シャード破損・並行削除・ディスク書込障害等の異常事態——miss したチャンクだけ embedding
+    無しで黙って送る（旧実装）と、同じ world 内で一部だけベクトル付き/無しが混在する非一様な
+    索引になる（`test_index_world_embed_partial_failure_degrades_uniformly_no_doc_mixing` が
+    守る不変条件の破れ）。miss を検知したら bulk 送信ごと中止する（`sender.failed` を立てる——
+    既存の「途中バッチ失敗＝ world を wipe」経路にそのまま乗る）。"""
     vec_by_idx: dict = {}
     if embed_feature_applies:
         embed_positions = [i for i, skip in enumerate(no_embed) if not skip]
@@ -1171,8 +1291,10 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
             hit = _embed_cache_lookup_batch(world, keys, ec["dim"])
             for i, k in zip(embed_positions, keys):
                 v = hit.get(k)
-                if v is not None:
-                    vec_by_idx[i] = v
+                if v is None:
+                    sender.failed, sender.error = True, "embed_cache_miss"
+                    return False
+                vec_by_idx[i] = v
     return sender.send_group(ids, bodies, vec_by_idx)
 
 
@@ -1214,15 +1336,26 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     フラッシュだけでは埋め込みキャッシュ dict 自体が world 規模のまま残っていた）。本関数は**2パス**
     構成にする（ユーザー裁定「doc単位パイプライン化」）:
 
-    - **Pass1（埋め込みのみ）**: `_doc_chunk_bundle()` で doc ごとにチャンクを組み立て、embed 対象
-      テキストだけを `_EMBED_FLUSH_CHUNKS` 件程度のバッファへ束ね、閾値に達するたび `_embed_cached()`
-      を呼ぶ（HTTP バッチングの単位は維持——doc 単位で1往復にはしない）。bodies/ids はこのパスでは
-      作らない（テキストと no_embed フラグだけ）。
-    - **Pass2（bulk 送信）**: 同じ `docs` リストをもう一度走査し、`_doc_chunk_bundle()` で実際の
-      ids/bodies/texts を組み立て直し（Pass1 との重複 I/O はメモリ有界化とのトレードオフ）、
-      `_EMBED_FLUSH_CHUNKS` 件程度のグループへ束ねる。埋め込みが有効なら、グループの対象チャンク
-      だけキャッシュから引いて（`_embed_cache_lookup_batch`）body へ付与し、`_StreamingBulkSender`
-      で ES へ流す。
+    - **Pass1（埋め込みのみ）**: `_iter_doc_chunk_records()` で doc ごとにチャンクを1件ずつ
+      受け取り、embed 対象テキストだけを `_EMBED_FLUSH_CHUNKS` 件程度のバッファへ束ね、閾値に
+      達するたび `_embed_cached()` を呼ぶ（HTTP バッチングの単位は維持——doc 単位で1往復には
+      しない）。bodies/ids はこのパスでは使わない（テキストと no_embed フラグだけ）。
+    - **Pass2（bulk 送信）**: 同じ `docs` リストをもう一度走査し、`_iter_doc_chunk_records()` で
+      実際の id/body/text を1件ずつ受け取り直し（Pass1 との重複 I/O はメモリ有界化との
+      トレードオフ）、`_EMBED_FLUSH_CHUNKS` 件程度のグループへ束ねる。埋め込みが有効なら、
+      グループの対象チャンクだけキャッシュから引いて（`_embed_cache_lookup_batch`）body へ付与し、
+      `_StreamingBulkSender` で ES へ流す。
+
+    **rv-oom-resume item1（2026-09-05）**: EMBED-3 は世界規模の doc リストをグループ単位
+    （`_EMBED_FLUSH_CHUNKS`）へ束ねたが、**1文書自体が大量チャンク**（rag_chunks 経路の record
+    単位チャンク・`_RAG_CHUNKS_MAX_ROWS` 既定20万まで許容）を持つと、flush 判定より前に1文書分
+    まるごとがメモリに乗ってしまっていた（旧 `_doc_chunk_bundle()` は1文書分の ids/bodies/texts
+    を丸ごと1つのリストとして返していたため）。`_iter_doc_chunk_records()` はチャンクを1件ずつ
+    yield するジェネレータにし、Pass1/Pass2 の両方が**チャンク単位**（doc 境界をまたいでも）で
+    flush 判定できるようにした——1文書の内部チャンク数に関係なく、常に高々
+    `_EMBED_FLUSH_CHUNKS` 件分のメモリで済む。doc 単位の原子性契約（rag_chunks が壊れている
+    文書は1件も yield されず legacy 縮退へ切り替わる）は維持する（`_iter_doc_chunk_records`
+    docstring 参照）。
 
     **「embed 一部失敗＝world 全体を BM25 縮退・doc ごとの混在を作らない」不変条件は2パス構成が
     自然に守る**: Pass1 が world 全体の embed 完了（成功/失敗）を確定させてから Pass2 が始まる
@@ -1239,7 +1372,12 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     ための追加走査はしない）。実環境（数時間かかる最長段）で最長時間 done/total が動かない
     まま止まって見える問題への対処（office_md 段の `_office_progress` と同じ役割）。呼び出し
     頻度の間引きは呼び出し元（`ingest/worker.py` の `_progress`）の責務——ここでは flush 単位
-    （`_EMBED_FLUSH_CHUNKS` チャンクごと）でそのまま呼ぶ。
+    （`_EMBED_FLUSH_CHUNKS` チャンクごと）でそのまま呼ぶ。**Pass1（埋め込み・rv-oom-resume
+    item6）も文書1件処理し終えるたび同じ `progress(done_docs, total_docs)` を呼ぶ**——冷キャッシュ
+    時は実 embed API 呼び出しを伴う Pass1 が最長段になりうるため。Pass1/Pass2 は同じ目盛り
+    （`docs` の長さ）を共有し別カウンタとしては合成しない——Pass2 開始時に done が一旦小さく
+    戻る（Pass1 完走時の値→Pass2 の0からの再カウント）が、「数時間 done/total が完全に動かない」
+    より許容できる（呼び出し元は単調増加を前提にしないこと）。
     """
     if not available():
         return {"available": False, "indexed": 0, "chunks": 0}
@@ -1259,7 +1397,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     docs = corpus_docs.world_documents(world, include_rag=True) if use_rag else corpus_docs.world_documents(world)
     total_docs = len(docs)                             # 進捗表示の total（既に materialize 済みの一覧の長さ・追加走査なし）
     # I2（2026-09-05）: 重要度は world 全体を1回だけ解決し（`res_map`）、各文書のチャンク組み立て
-    # （`_doc_chunk_bundle`）へ使い回す。`world_documents()` 呼び出しは既存テスト（`world_documents`
+    # （`_iter_doc_chunk_records`）へ使い回す。`world_documents()` 呼び出しは既存テスト（`world_documents`
     # を単一引数 `lambda w: docs` で差し替える広範な既存スタブ群）と互換な形（`root=` を渡さない）
     # のまま維持し、重要度解決だけ独立に `world_dir()` を呼ぶ（`doc_ledger.public_documents` ほど
     # 厳密な「同一 root 保証」ではないが、rebind は稀な運用イベントであり許容する・最小変更）。
@@ -1274,11 +1412,12 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     embedded_total = 0
     if ec is not None:
         buf: list = []
+        pass1_docs_done = 0
         for d in docs:
-            bundle, _degraded = _doc_chunk_bundle(world, d, derived, rag_exts)
-            if bundle is None:
+            chunk_iter, _degraded = _iter_doc_chunk_records(world, d, derived, rag_exts)
+            if chunk_iter is None:
                 continue
-            for t, skip in zip(bundle["texts"], bundle["no_embed"]):
+            for _cid, _body, t, skip in chunk_iter:
                 if skip:
                     continue
                 had_embed_eligible = True
@@ -1294,6 +1433,15 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                         break
             if not embed_ok:
                 break
+            pass1_docs_done += 1
+            if progress is not None:
+                # rv-oom-resume item6（2026-09-05）: 冷キャッシュ時は Pass1（実 embed API 呼び出し）が
+                # 最長段になりうるのに、従来は Pass2 が flush するまで progress が一切動かず「止まって
+                # 見える」空白があった。Pass1/Pass2 は同じ (done_docs, total_docs) 目盛りを共有する
+                # ため、Pass2 開始時に done が一旦小さく戻る（Pass1 は完走目盛り→Pass2 は0から再カウント）
+                # ——2つの目盛りを合成する複雑さより、「数時間 何も動かない」より「動くが一度戻る」を
+                # 選ぶ（docstring 参照）。
+                progress(pass1_docs_done, total_docs)
         if embed_ok and buf:
             vecs, reused, embedded = _embed_cached(world, buf, ec)
             reused_total += reused
@@ -1316,7 +1464,14 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     if ec is None:
         _delete_embed_cache(world)
     elif embed_ok:
-        _prune_embed_cache(world, valid_keys)
+        try:
+            _prune_embed_cache(world, valid_keys)
+        except OSError:
+            # 2026-09-05・rv-oom-resume item2: シャード書込障害（ENOSPC 等）を「成功扱い」せず
+            # delete_world() の前に打ち切る——既存索引（ベクトル付きかもしれない）はまだ残る。
+            _embed_log.warning("es_index: embed キャッシュ剪定の書込に失敗（world=%s）"
+                               "——索引の delete 前に中止する", world)
+            return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
 
     # `ec` が有効でも、対象チャンクが全て branch=="source"/軽量テキスト枠（`had_embed_eligible` が
     # 偽）の world では埋め込み対象自体が無いため embed は「この構成で最新（対象チャンクが無い
@@ -1357,8 +1512,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
 
-    # ---- Pass2: doc 単位でチャンクを組み立て、`_EMBED_FLUSH_CHUNKS` 件ごとにグループ化して
-    # bulk 送信する（world 全体を先に1本のリストへ溜めない・vec_by_idx もグループ内ローカル）----
+    # ---- Pass2: チャンク単位で1件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件ごとにグループ化して
+    # bulk 送信する（world 全体はもちろん、1文書分すら先に1本のリストへ溜めない・rv-oom-resume
+    # item1・vec_by_idx もグループ内ローカル）----
     n_docs = 0
     total_chunks = 0
     rag_degraded = 0
@@ -1369,24 +1525,27 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     g_texts: list = []
     g_no_embed: list = []
     for d in docs:
-        bundle, degraded_entry = _doc_chunk_bundle(world, d, derived, rag_exts, res_map)
+        chunk_iter, degraded_entry = _iter_doc_chunk_records(world, d, derived, rag_exts, res_map)
         if degraded_entry is not None:
             rag_degraded += 1
             rag_degraded_docs.append(degraded_entry)
-        if bundle is None:
+        if chunk_iter is None:
             continue
         n_docs += 1
-        g_ids.extend(bundle["ids"])
-        g_bodies.extend(bundle["bodies"])
-        g_texts.extend(bundle["texts"])
-        g_no_embed.extend(bundle["no_embed"])
-        total_chunks += len(bundle["ids"])
-        if len(g_ids) >= _EMBED_FLUSH_CHUNKS:
-            if not _flush_doc_group(sender, world, g_ids, g_bodies, g_texts, g_no_embed, ec, embed_feature_applies):
-                break
-            g_ids, g_bodies, g_texts, g_no_embed = [], [], [], []
-            if progress is not None:
-                progress(n_docs, total_docs)
+        for cid, body, text, skip in chunk_iter:
+            g_ids.append(cid)
+            g_bodies.append(body)
+            g_texts.append(text)
+            g_no_embed.append(skip)
+            total_chunks += 1
+            if len(g_ids) >= _EMBED_FLUSH_CHUNKS:
+                if not _flush_doc_group(sender, world, g_ids, g_bodies, g_texts, g_no_embed, ec, embed_feature_applies):
+                    break
+                g_ids, g_bodies, g_texts, g_no_embed = [], [], [], []
+                if progress is not None:
+                    progress(n_docs, total_docs)
+        if sender.failed:
+            break
     if not sender.failed and g_ids:
         _flush_doc_group(sender, world, g_ids, g_bodies, g_texts, g_no_embed, ec, embed_feature_applies)
     if progress is not None:
@@ -1406,6 +1565,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # 利用者から見て「検索したのに出てこない」というサイレントな取りこぼしになるため。
         _wipe_after_bulk_failure(world)
         return {"available": True, "indexed": 0, "chunks": 0, "error": sender.error, **rag_report}
+    _restore_refresh_interval(world)                   # item3: 全バッチ成功＝最終refreshで可視化済み・背景リフレッシュを通常へ戻す
     _confirm_content_sig(world, content_sig)           # 全バッチ成功後にだけ鮮度署名を確定する
     return {"available": True, "indexed": n_docs, "chunks": total_chunks,
             "vectors": bool(embed_feature_applies and had_embed_eligible),

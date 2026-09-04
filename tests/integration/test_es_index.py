@@ -95,7 +95,11 @@ def test_vector_hybrid_stubbed():
         assert r.get("vectors") is True and r["chunks"] > 0      # dense_vector 付きで索引（_meta も記録）
         hits, reason = es.search(V, "消費税", k=3, settings={})
         assert reason is None
-        assert hits and any("knn" in (b or {}) for b in bodies)  # _meta 一致で kNN 経路が実際に使われた
+        # RV-FIX-4（2026-09-05）: hybrid は top-level knn から bool.should 内の query-level knn ＋
+        # function_score 包みへ変更（重要度係数が合成全体へ1回だけ効く形）。knn 節がクエリ本体の
+        # どこかに含まれていれば kNN 経路が実際に使われた、と判定する。
+        import json as _json
+        assert hits and any('"knn"' in _json.dumps(b or {}) for b in bodies)
     finally:
         embeddings.cfg, embeddings.embed, es._req = oc, oe, orq
         es.index_world(V, settings={})                        # BM25 索引へ戻す（DISABLE_EMBED）

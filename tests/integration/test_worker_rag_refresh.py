@@ -87,7 +87,7 @@ def _apply_world_monkeypatches(monkeypatch, wd, dmd):
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
 
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {}))
+    monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
@@ -365,7 +365,7 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
 
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {}))
+    monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
@@ -406,7 +406,7 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
 
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {}))
+    monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)

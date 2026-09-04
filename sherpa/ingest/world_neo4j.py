@@ -547,12 +547,24 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
 
 
 def _attach_importance(items: list, world_id: str) -> None:
-    """items へ `importance`/`importance_reason`/`importance_mixed` を条件付きで付与する（I2・J3）。
+    """items へ `importance`/`importance_reason`/`importance_mixed` を条件付きで付与する（I2・J3・
+    rv-oom-resume item7・2026-09-05）。
 
-    候補＝各 item の `path`（自身の所属文書）∪ `evidence[].doc`（根拠の来歴文書）。この中で
-    **実際に `_重要度.txt` の解決が付いた**候補だけを見て最高位（`高`>`中`>`低`）の値・理由を
-    採る（`importance.RANK` 参照）。1件も解決が無ければキー自体を付けない（§2 truth table）。
-    2種以上の異なる値が候補に混在すれば `importance_mixed: True` も付ける。
+    候補＝各 item の `path`（自身の所属文書）∪ `evidence[].doc`（根拠の来歴文書）。**未設定
+    （`_重要度.txt` の解決が無い候補）は「中」と同格の順位**（`importance.RANK_UNSET`・
+    `importance.rank_of` 参照＝`grep_tool` のヒット優先順位と同じスケール）として最高位計算
+    （どの候補が勝つか）にも `importance_mixed` の判定にも含める——旧実装は未解決の候補を
+    候補集合から単純に除外していたため、「自身は無印（中相当）だが根拠の中にたまたま `低`
+    指定の文書が1つ混じっている」ような item が、無印候補の存在を無視して誤って `低` 表示に
+    なる/ならないが候補の順序に左右される穴があった。
+
+    ただし**最高位に達した候補の中に実際の `Resolution`（`_重要度.txt` で明示解決された候補）が
+    1つも無ければ、`importance`/`importance_reason`/`importance_mixed` のいずれも付けない**——
+    未設定候補が「たまたま」最高位を取っただけなら、表示できる実在の判定根拠が無いため
+    （§2 truth table＝「無ければ無い」を、集合全体の最高位でも守る）。最高位に複数の実 Resolution
+    が同着する場合は `path` 優先→`evidence` 出現順（候補の元の並び順）で先頭のものを採る
+    （同じ rank の Resolution は `value` が必然的に同一——`RANK` は値からの一対一写像——なので
+    表示値自体は候補の選び方に左右されない）。
 
     `_重要度.txt` の無い world（`resolve_for_world` が空 dict）は即座に戻り、items は無改変
     （受け入れ条件＝影響一覧の出力完全不変）。
@@ -563,14 +575,19 @@ def _attach_importance(items: list, world_id: str) -> None:
         return
     for it in items:
         candidates = [c for c in ([it.get("path")] + [e.get("doc") for e in (it.get("evidence") or [])]) if c]
-        resolved = [res_map[c] for c in candidates if c in res_map]
-        if not resolved:
+        if not candidates:
             continue
-        best = max(resolved, key=lambda r: importance.RANK.get(r.value, importance.RANK_UNSET))
+        pairs = [res_map.get(c) for c in candidates]              # None＝未解決（中相当）
+        best_rank = max(importance.rank_of(res) for res in pairs)
+        winners = [res for res in pairs if res is not None and importance.rank_of(res) == best_rank]
+        if not winners:
+            continue                                              # 最高位が全て未設定＝表示しない
+        best = winners[0]
         it["importance"] = best.value
         if best.reason:
             it["importance_reason"] = best.reason
-        if len({r.value for r in resolved}) > 1:
+        effective_values = {(res.value if res is not None else "中") for res in pairs}
+        if len(effective_values) > 1:
             it["importance_mixed"] = True
 
 
