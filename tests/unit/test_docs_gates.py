@@ -38,7 +38,10 @@ def _retired_vocab_targets() -> list[pathlib.Path]:
         if rel_parts and rel_parts[0] in ("archive", "proposals"):
             continue
         targets.append(path)
-    targets.append(ROOT / "CLAUDE.md")
+    # 公開 export（scripts/export_public.sh）には CLAUDE.md が含まれない＝存在するときだけ検査
+    # （内部リポでは常に存在＝検査は従来どおり効く）。
+    if (ROOT / "CLAUDE.md").exists():
+        targets.append(ROOT / "CLAUDE.md")
     return targets
 
 
@@ -96,7 +99,10 @@ _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico")
 def _relative_link_targets() -> list[pathlib.Path]:
     """docs/**/*.md（archive 含む全部）＋ CLAUDE.md／README.md／mockups/README.md。"""
     targets = sorted(DOCS.rglob("*.md"))
-    targets.append(ROOT / "CLAUDE.md")
+    # 公開 export（scripts/export_public.sh）には CLAUDE.md が含まれない＝存在するときだけ検査
+    # （内部リポでは常に存在＝検査は従来どおり効く）。
+    if (ROOT / "CLAUDE.md").exists():
+        targets.append(ROOT / "CLAUDE.md")
     targets.append(ROOT / "README.md")
     targets.append(ROOT / "mockups" / "README.md")
     return targets
