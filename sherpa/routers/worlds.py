@@ -818,6 +818,10 @@ def _notify_delete_terminal(wid: str, run_id: int, status: str) -> None:
     """PART-6: 削除 run の terminal 化を Webhook 通知する（`_run_delete_background` の post-event
     位置＝実処理の成否が分かる箇所からのみ呼ぶ・best-effort・削除自体の成否には影響させない）。
     `status` は `ingest_runs.status` と同じ語彙（"auto_published"|"failed"）。
+
+    RV是正#5: 呼び出し元は「run の terminal 化（`finish_ingest_run*`）が実際に成功した」場合
+    だけこれを呼ぶこと——terminal 化自体が失敗した（run 行が `status='extracting'` のまま）のに
+    通知だけ送ると、通知内容と DB の実際の状態が食い違う。
     """
     try:
         webhooks.notify_run_terminal(wid, run_id, "delete", status)
@@ -851,11 +855,17 @@ def _run_delete_background(wid: str, u: dict | None, run_id: int) -> None:
     try:
         world_admin_service.delete(wid, run_id=run_id)
     except world_admin_service.WorldAdminError as exc:   # グラフ削除失敗＝fail-closed（行は残す）
+        # RV是正#5: 通知は「terminal 更新（`finish_ingest_run`）が実際に成功した」ことだけを条件に
+        # する——`finish_ingest_run` 自体が例外で失敗した場合（下の except で best-effort ログの
+        # み）、run 行は `status='extracting'` のままなので `failed` を通知してはいけない
+        # （通知内容と DB の実際の状態が食い違う）。
+        finished = False
         try:
             store.finish_ingest_run(
                 run_id, status="failed",
                 extraction_snapshot={"flags": [{"doc": None, "action": "blocked",
                                                 "reason": f"delete_failed:{exc.__class__.__name__}"}]})
+            finished = True
         except Exception:
             _log.warning("削除失敗の記録自体に失敗しました（best-effort）: world=%s", wid, exc_info=True)
         try:
@@ -865,14 +875,17 @@ def _run_delete_background(wid: str, u: dict | None, run_id: int) -> None:
             pass
         _log.warning("背景削除がグラフ削除失敗で中止しました（fail-closed・行は保持）: world=%s",
                      wid, exc_info=True)
-        _notify_delete_terminal(wid, run_id, "failed")
+        if finished:
+            _notify_delete_terminal(wid, run_id, "failed")
         return
     except Exception as e:
+        finished = False
         try:
             store.finish_ingest_run(
                 run_id, status="failed",
                 extraction_snapshot={"flags": [{"doc": None, "action": "blocked",
                                                 "reason": f"unexpected_error:{e.__class__.__name__}"}]})
+            finished = True
         except Exception:
             _log.warning("削除失敗の記録自体に失敗しました（best-effort）: world=%s", wid, exc_info=True)
         try:
@@ -881,7 +894,8 @@ def _run_delete_background(wid: str, u: dict | None, run_id: int) -> None:
         except Exception:
             pass
         _log.warning("背景削除が想定外の例外で失敗しました: world=%s", wid, exc_info=True)
-        _notify_delete_terminal(wid, run_id, "failed")
+        if finished:
+            _notify_delete_terminal(wid, run_id, "failed")
         return
     # 成功: world 行の削除と run 完了は `world_admin_service.delete`（`worlds.delete` →
     # `store.finish_ingest_run_and_delete_world`）が同一トランザクションで既に確定済み。

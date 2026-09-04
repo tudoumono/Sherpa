@@ -3,24 +3,30 @@
 取り込み run の terminal 化（sync/refresh/rebind/rerun/delete の完了・失敗）を、
 `api_keys.webhook_url` を登録したキー宛てに署名付き POST で通知する（ポーリング排除）。
 
-配送保証は軽量型（W1・裁定 2026-09-05）: 即時送信＋失敗時リトライ3回（2/8/30秒バックオフ・
-プロセス内 daemon thread）＋監査記録。永続キューは持たない——プロセス終了で未送信の通知は
-消える（受信側は既存の `GET /worlds/{wid}/status` ポーリングで補完できる＝劣化しても現状に
-戻るだけ）。
+配送保証は軽量型（W1・裁定 2026-09-05）: 即時送信＋失敗時リトライ3回（2/8/30秒バックオフ）＋
+監査記録。実送信は**単一の daemon worker スレッド＋有界キュー**（RV是正#4・`_QUEUE_MAXSIZE`）
+が直列に行う——`notify_run_terminal` はキューへ積むだけで即座に返る（`ext_api._AuditWriter` と
+同じ「単一 writer＋bounded queue」型だが、lifespan 連携までは持たない軽量版＝プロセス終了で
+未処理分は消えてよい契約はそのまま）。キューが溢れたらその1件だけ捨てて `webhook.dropped` を
+監査記録する（他の配送・取り込み自体は継続＝fail-loud だが個別行の犠牲で全体を守る）。
+永続キューは持たない——プロセス終了で未送信の通知は消える（受信側は既存の
+`GET /worlds/{wid}/status` ポーリングで補完できる＝劣化しても現状に戻るだけ）。
 
 署名（W4）: `X-Sherpa-Signature: sha256=<hex(HMAC-SHA256(body_bytes, webhook_secret))>`。
 `webhook_secret` は登録時に生成し平文保管する（署名生成に平文が必須＝API キーのハッシュ保管
 方式は構造的に使えない。閉域 LAN・DB は管理境界内として受容）。
 
-宛先ポリシー（W3）: `llm._canonical_host_port` は「`base + path` 単純連結」契約
+宛先ポリシー（W3・RV是正#1）: `llm._canonical_host_port` は「`base + path` 単純連結」契約
 （`ollama_url()`）を守るため path（空/"/" 以外）・query・fragment 付き URL を解釈不能として
 拒否する——Webhook の宛先は利用者の受信エンドポイントそのもので path/query を伴うのが通常
 のため、この関数は流用せず `_webhook_host_port()` を別途新設する（host:port 抽出のみを行い
 path/query はそのまま許す）。userinfo 拒否・scheme 既定ポート補完・末尾ドット除去は
-`_canonical_host_port` と同じ規律。loopback は常時許可・それ以外は
-`system_settings.webhook_allowlist`（host:port の配列・`ollama_allowlist` と同じ形）所属の
-みを許可する。DB 不達は fail-closed（allowlist 空扱い＝loopback 以外は拒否・
-`llm._allowlisted_hosts` と同じ規律）。
+`_canonical_host_port` と同じ規律。**loopback を含め既定は全拒否**——
+`system_settings.webhook_allowlist`（host:port の配列・`ollama_allowlist` と同じ形）に明示
+登録された host:port のみを許可する（Ollama の loopback 常時許可とは意図的に違える: Webhook は
+自己発行キー利用者〔一般ユーザー〕が宛先を選べるため、loopback を暗黙許可すると認証なしの
+内蔵サービス〔例: ES:9200〕を SSRF 経由で叩けてしまう）。DB 不達は fail-closed（allowlist
+空扱い＝何も許可しない・`llm._allowlisted_hosts` と同じ規律）。
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ import hashlib
 import hmac
 import json
 import logging
+import queue
 import threading
 import time
 import urllib.request
@@ -45,7 +52,8 @@ _RETRY_DELAYS_SEC = (2, 8, 30)
 
 
 class WebhookUrlInvalid(ValueError):
-    """Webhook 宛先 URL が不正・または宛先ポリシー（loopback／admin allowlist）を満たさない。"""
+    """Webhook 宛先 URL が不正・または宛先ポリシー（admin allowlist・RV是正#1で loopback も対象）
+    を満たさない。"""
 
 
 def _webhook_host_port(url: str) -> tuple[str, int] | None:
@@ -63,7 +71,9 @@ def _webhook_host_port(url: str) -> tuple[str, int] | None:
         return None
     if p.scheme not in ("http", "https"):
         return None
-    if p.username or p.password:
+    # RV是正#8: 空文字の userinfo（`http://@host/`）は `p.username == ""`（falsy）で `or` 判定を
+    # すり抜ける——`is not None` で判定し、`user:` のような片方だけの空文字も含めて確実に拒否する。
+    if p.username is not None or p.password is not None:
         return None
     host = (p.hostname or "").rstrip(".")
     if not host:
@@ -78,8 +88,9 @@ def _webhook_host_port(url: str) -> tuple[str, int] | None:
 
 
 def _allowlisted_hosts(system_settings: dict | None = None) -> set[tuple[str, int]]:
-    """非 loopback 接続先の許可リスト（`system_settings.webhook_allowlist`）。
-    `llm._allowlisted_hosts()` と同型（唯一の真実源は admin 保存値・DB 不達は空集合＝fail-closed）。
+    """許可された接続先（`system_settings.webhook_allowlist`）。RV是正#1: loopback もこの集合に
+    含まれていなければ許可されない（`llm._allowlisted_hosts()` は非 loopback 専用だが、こちらは
+    唯一の許可判定源）。DB 不達は空集合＝fail-closed。
     """
     allowed: set[tuple[str, int]] = set()
     try:
@@ -98,16 +109,16 @@ def _allowlisted_hosts(system_settings: dict | None = None) -> set[tuple[str, in
 
 
 def assert_webhook_url_allowed(url: str, *, system_settings: dict | None = None) -> None:
-    """`url`（Webhook 宛先）が接続許可ポリシーを満たすか検証する（I/O なし・登録時＝送信直前の
-    両方で呼ぶ）。既定許可＝loopback のみ。非 loopback は `_allowlisted_hosts()` に host:port が
-    正規化一致するものだけ許可。不正 URL／不許可の宛先は `WebhookUrlInvalid` を送出する。
+    """`url`（Webhook 宛先）が接続許可ポリシーを満たすか検証する（I/O なし・登録時／送信直前
+    〔リトライ毎の再評価含む・RV是正#6〕の両方で呼ぶ）。RV是正#1: 既定許可なし——loopback も
+    例外にせず、`_allowlisted_hosts()` に host:port が正規化一致するものだけ許可する（自己発行
+    キー利用者が認証なしの内蔵サービスを宛先登録できてしまう穴を塞ぐ・モジュール docstring
+    参照）。不正 URL／不許可の宛先は `WebhookUrlInvalid` を送出する。
     """
     hp = _webhook_host_port(url)
     if hp is None:
         raise WebhookUrlInvalid("不正な Webhook URL です（http/https の URL を指定してください）")
     host, port = hp
-    if llm.is_loopback_host(host):
-        return
     if (host, port) not in _allowlisted_hosts(system_settings):
         raise WebhookUrlInvalid(f"許可されていない Webhook 宛先です: {host}:{port}（admin allowlist 未登録）")
 
@@ -121,6 +132,10 @@ def _sign(secret: str, body: bytes) -> str:
 def _send_once(url: str, secret: str, body: bytes, request_id: str, event: str) -> None:
     """1回分の送信（2xx 以外・接続エラー等は例外として呼び出し元へ伝播＝リトライ対象）。
     `llm.urlopen_no_redirect` を流用（redirect 非追跡・共有 opener・R2a と同じ安全側の既定）。
+
+    RV是正#3: 応答本体は読まない（`urlopen` は 2xx 以外を `HTTPError` として送出する契約＝
+    `with` を抜けた時点で 2xx 確定・本文を読む必要がない）。相手が無制限に本文を返すエンドポイント
+    でも、ここでメモリを消費しない——`with` を抜ける際のクローズだけで済ませる。
     """
     headers = {
         "Content-Type": "application/json",
@@ -129,8 +144,8 @@ def _send_once(url: str, secret: str, body: bytes, request_id: str, event: str) 
         "X-Sherpa-Signature": _sign(secret, body),
     }
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with llm.urlopen_no_redirect(req, timeout=_TIMEOUT_SEC) as r:
-        r.read()   # 応答本体は使わない（読み切ってコネクションを解放する）
+    with llm.urlopen_no_redirect(req, timeout=_TIMEOUT_SEC):
+        pass
 
 
 def _host_port_for_audit(url: str) -> str:
@@ -140,27 +155,20 @@ def _host_port_for_audit(url: str) -> str:
 
 
 def _deliver(key_id: int, url: str, secret: str, payload: dict) -> None:
-    """1キー分の配送（即時送信＋失敗時リトライ3回・W1）。daemon thread の中で実行される想定
-    （呼び出し元 `notify_run_terminal` が thread を起こす）。監査は最終結果（成功／全滅）のみ
-    1行記録する（試行ごとには記録しない・detail に secret／フル URL は含めない）。
+    """1キー分の配送（即時送信＋失敗時リトライ3回・W1）。単一 daemon worker（`_worker_loop`）の
+    中で他キーの配送と直列に実行される想定（RV是正#4・呼び出し元は `notify_run_terminal` が
+    積んだキューを worker が消費する）。監査は最終結果（成功／全滅）のみ1行記録する
+    （試行ごとには記録しない・detail に secret／フル URL は含めない）。
+
+    RV是正#6: 宛先ポリシー（`assert_webhook_url_allowed`）は**試行ごと**に再評価する（登録時
+    チェックとは別に、リトライ待機の間に admin が allowlist を変更した場合を即座に反映する）。
+    不許可は恒久的な失敗＝そこで打ち切る（残りの待機・試行はしない）。
     """
     from . import store              # 遅延 import（循環回避）
 
     host_port = _host_port_for_audit(url)
     detail_base = {"host_port": host_port, "world": payload.get("world"),
                    "run_id": payload.get("run_id"), "event": payload.get("event")}
-    try:
-        assert_webhook_url_allowed(url)
-    except WebhookUrlInvalid as e:
-        # 送信直前の再確認で不許可（登録後に admin が allowlist を外した等）＝リトライしても
-        # 変わらないため1回で打ち切る。
-        try:
-            store.audit("system", "webhook.failed", "webhook", str(key_id),
-                        detail={**detail_base, "attempts": 0}, outcome="failure",
-                        severity="warning", reason=e.__class__.__name__)
-        except Exception:
-            _log.warning("Webhook 送信不許可の監査記録に失敗しました（best-effort）", exc_info=True)
-        return
     body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
     request_id = uuid.uuid4().hex
     attempts = 0
@@ -169,6 +177,11 @@ def _deliver(key_id: int, url: str, secret: str, payload: dict) -> None:
     for delay in delays:
         if delay:
             time.sleep(delay)
+        try:
+            assert_webhook_url_allowed(url)
+        except WebhookUrlInvalid as e:
+            last_error = e
+            break
         attempts += 1
         try:
             _send_once(url, secret, body, request_id, payload.get("event", ""))
@@ -190,15 +203,86 @@ def _deliver(key_id: int, url: str, secret: str, payload: dict) -> None:
         _log.warning("Webhook 送信失敗の監査記録に失敗しました（best-effort）", exc_info=True)
 
 
+# RV是正#4: 「イベント×キーごとに Thread を無制限生成」をやめ、単一 daemon worker が有界キューを
+# 直列消費する型へ（`ext_api._AuditWriter` と同じ「単一 writer＋bounded queue」だが、lifespan
+# start/stop 連携までは持たない軽量版——プロセス終了で未処理分が消えてよい契約は変わらないため）。
+# 上限256＝1 world の同時 terminal 化がこれを超えて詰まることは通常考えにくい規模（監査での
+# 可視化と同時に、無制限生成による OOM/FD 枯渇を防ぐことを優先する）。
+_QUEUE_MAXSIZE = 256
+_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+_worker_thread: threading.Thread | None = None
+_worker_lock = threading.Lock()
+
+
+def _process_queue_item(item: tuple) -> None:
+    """キューから取り出した1件を処理する（`_worker_loop` の本体・単体テストが実スレッド/実
+    キューなしで直接呼べるよう分離）。`_deliver` 自身は例外を握るが、想定外の例外で worker
+    自体が落ちて以後の配送が止まらないよう、ここでも最外周として捕捉する。"""
+    try:
+        _deliver(*item)
+    except Exception:
+        _log.warning("Webhook 配送処理で未捕捉の例外が発生しました（worker は継続します）",
+                     exc_info=True)
+
+
+def _worker_loop() -> None:
+    """単一 daemon worker 本体。キューから1件ずつ取り出し `_process_queue_item` を直列実行し
+    続ける（プロセス生存中は戻らない想定・daemon thread なのでプロセス終了時に強制終了して
+    問題ない）。"""
+    while True:
+        item = _queue.get()
+        try:
+            _process_queue_item(item)
+        finally:
+            _queue.task_done()
+
+
+def _ensure_worker_started() -> None:
+    """worker が未起動なら起こす（lazy start・複数回呼んでも1本しか起動しない）。"""
+    global _worker_thread
+    if _worker_thread is not None and _worker_thread.is_alive():
+        return
+    with _worker_lock:
+        if _worker_thread is not None and _worker_thread.is_alive():
+            return
+        _worker_thread = threading.Thread(target=_worker_loop, daemon=True,
+                                          name="sherpa-webhook-worker")
+        _worker_thread.start()
+
+
+def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
+    """1キー分の配送をキューへ積む（`notify_run_terminal` から呼ぶ）。キューが飽和していれば
+    このキュー投入だけを待たず即座に諦め、`webhook.dropped` を監査記録する（RV是正#4・
+    他キーの配送・取り込み自体は継続する＝1件の犠牲で全体を守る）。
+    """
+    _ensure_worker_started()
+    try:
+        _queue.put_nowait((key_id, url, secret, payload))
+        return
+    except queue.Full:
+        pass
+    _log.warning("Webhook 配送キューが飽和したため1件破棄しました: key_id=%s world=%s",
+                key_id, payload.get("world"))
+    try:
+        from . import store          # 遅延 import（循環回避）
+        store.audit("system", "webhook.dropped", "webhook", str(key_id),
+                    detail={"host_port": _host_port_for_audit(url), "world": payload.get("world"),
+                           "run_id": payload.get("run_id"), "event": payload.get("event")},
+                    outcome="failure", severity="warning", reason="queue_full")
+    except Exception:
+        _log.warning("Webhook 破棄の監査記録に失敗しました（best-effort）", exc_info=True)
+
+
 def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
                         doc_count: int | None = None) -> None:
     """取り込み run の terminal 化を、`world` を許可する Webhook 登録済みキー全部へ通知する
     （イベント仕様は `docs/proposals/2026-09-05-Webhook通知.md` 参照）。
 
     best-effort・呼び出し元（`ingest.worker._record`／`worlds._finalize_pending_run`／
-    `routers/worlds._run_delete_background`）は例外を気にせず呼べる（内部で全て捕捉し、
-    取り込み自体の成否へは一切昇格させない）。実送信はキーごとに1本の daemon thread（W1 の
-    軽量配送）——ここでは対象キーの列挙とスケジューリングだけを行う。
+    `routers/worlds._run_delete_background`／`background.py` の最外周セーフティネット）は
+    例外を気にせず呼べる（内部で全て捕捉し、取り込み自体の成否へは一切昇格させない）。実送信は
+    単一 daemon worker が有界キューを直列消費する（RV是正#4）——ここでは対象キーの列挙と
+    キューへの投入だけを行う。
 
     `status` は `ingest_runs.status`（'extracting' はここへ渡らない前提＝terminal 化のみが
     呼ぶ）: auto_published/auto_published_with_flags→`ingest.completed`・failed→`ingest.failed`。
@@ -220,7 +304,4 @@ def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
                     "doc_count": doc_count, "at": at}
     for key in keys:
         payload = dict(payload_base)
-        threading.Thread(
-            target=_deliver, args=(key["id"], key["webhook_url"], key["webhook_secret"], payload),
-            daemon=True, name=f"sherpa-webhook-{key['id']}",
-        ).start()
+        _enqueue(key["id"], key["webhook_url"], key["webhook_secret"], payload)

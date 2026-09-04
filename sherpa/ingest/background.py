@@ -163,12 +163,22 @@ def start_or_join(world_id: str, op: str, fingerprint: str, create_run: Callable
             # （行がまだ status='extracting' のまま）場合だけ CAS で failed へ落とす。個々の
             # 操作が既に理由付きで terminal 化済みの行は上書きしない（CAS の WHERE 条件で保証）。
             try:
-                from .. import store
+                from .. import store, webhooks
                 if store.fail_close_if_extracting(
                         run_id, reason="background_worker_exited_without_terminal_status"):
                     _log.warning(
                         "背景実行が run を terminal 化せずに終了したため failed へ格下げしました: "
                         "world=%s op=%s run_id=%s", world_id, op, run_id)
+                    # RV是正#5: この CAS 自体が terminal 化の成功（`status='extracting'`→`'failed'`）
+                    # そのものなので、ここでも Webhook 通知する（個々の操作が理由付きで terminal
+                    # 化していればこの CAS は素通り＝二重通知しない・`fail_close_if_extracting` の
+                    # WHERE 条件が保証する）。
+                    try:
+                        webhooks.notify_run_terminal(world_id, run_id, op, "failed")
+                    except Exception:
+                        _log.warning(
+                            "Webhook 通知の起動に失敗しました（best-effort）: world=%s run_id=%s",
+                            world_id, run_id, exc_info=True)
             except Exception:
                 _log.warning("最外周の failed 格下げ自体に失敗しました（best-effort）: "
                             "world=%s run_id=%s", world_id, run_id, exc_info=True)

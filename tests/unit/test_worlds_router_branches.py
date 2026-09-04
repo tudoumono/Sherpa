@@ -133,6 +133,72 @@ def test_run_worker_or_503_records_when_not_already_recorded(monkeypatch):
     assert recorded and recorded[0]["status"] == "failed"
 
 
+@pytest.fixture
+def _stub_delete_background(monkeypatch):
+    """`_run_delete_background` を DB/Neo4j 無しで駆動する共通スタブ（各テストが
+    `world_admin_service.delete`/`store.finish_ingest_run` の成否だけ個別に差し替える）。"""
+    monkeypatch.setattr(worlds_routes.store, "update_ingest_run_progress", lambda run_id, progress: None)
+    audits = []
+    monkeypatch.setattr(worlds_routes.store, "audit",
+                        lambda *a, **kw: audits.append((a, kw)))
+    notified = []
+    monkeypatch.setattr(worlds_routes.webhooks, "notify_run_terminal",
+                        lambda world, run_id, op, status, **kw: notified.append(
+                            (world, run_id, op, status)))
+    return {"audits": audits, "notified": notified}
+
+
+@pytest.mark.parametrize("raised", [
+    worlds_routes.world_admin_service.WorldAdminError("グラフ削除失敗"),
+    RuntimeError("想定外の例外"),
+])
+def test_run_delete_background_notifies_failed_only_after_finish_ingest_run_succeeds(
+        monkeypatch, _stub_delete_background, raised):
+    """RV是正#5: 通知は「terminal 更新（`finish_ingest_run`）が実際に成功した」ことだけを条件に
+    する——`finish_ingest_run` 自体が成功すれば、WorldAdminError／想定外の例外のどちらの失敗
+    経路でも `failed` を通知する。"""
+    def _boom_delete(wid, run_id=None):
+        raise raised
+    monkeypatch.setattr(worlds_routes.world_admin_service, "delete", _boom_delete)
+    monkeypatch.setattr(worlds_routes.store, "finish_ingest_run", lambda run_id, **kw: {"id": run_id})
+
+    worlds_routes._run_delete_background("wdel1", {"uid": "admin1"}, 501)
+
+    assert _stub_delete_background["notified"] == [("wdel1", 501, "delete", "failed")]
+
+
+@pytest.mark.parametrize("raised", [
+    worlds_routes.world_admin_service.WorldAdminError("グラフ削除失敗"),
+    RuntimeError("想定外の例外"),
+])
+def test_run_delete_background_skips_notify_when_finish_ingest_run_itself_fails(
+        monkeypatch, _stub_delete_background, raised):
+    """RV是正#5: `finish_ingest_run` 自体が例外で失敗した（run 行が `status='extracting'` の
+    まま）場合は、terminal 化が成立していないため通知してはいけない（通知内容と DB の実際の
+    状態が食い違うことを防ぐ）。"""
+    def _boom_delete(wid, run_id=None):
+        raise raised
+    monkeypatch.setattr(worlds_routes.world_admin_service, "delete", _boom_delete)
+
+    def _boom_finish(run_id, **kw):
+        raise RuntimeError("DB down")
+    monkeypatch.setattr(worlds_routes.store, "finish_ingest_run", _boom_finish)
+
+    worlds_routes._run_delete_background("wdel2", {"uid": "admin1"}, 502)
+
+    assert _stub_delete_background["notified"] == []
+
+
+def test_run_delete_background_notifies_completed_on_success(monkeypatch, _stub_delete_background):
+    """成功時（`world_admin_service.delete` が例外なく戻る＝同一トランザクションで terminal
+    化済み）は無条件で `auto_published`（`ingest.completed`）を通知する（既存の挙動の回帰確認）。"""
+    monkeypatch.setattr(worlds_routes.world_admin_service, "delete", lambda wid, run_id=None: None)
+
+    worlds_routes._run_delete_background("wdel3", {"uid": "admin1"}, 503)
+
+    assert _stub_delete_background["notified"] == [("wdel3", 503, "delete", "auto_published")]
+
+
 def test_world_create_new_registration_arbitrated_by_fixed_key_not_provisional_wid(monkeypatch):
     """未登録 root への新規登録は暫定 wid 単位でなく固定キー
     （`worlds_routes._NEW_WORLD_REGISTRY_KEY`）で仲裁する——別フォルダへの競合登録要求は

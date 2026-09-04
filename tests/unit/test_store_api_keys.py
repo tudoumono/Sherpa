@@ -273,6 +273,75 @@ def test_owner_status_joined_for_self_issued_keys_only():
         store.upsert_user(uid, role="user", status="active")
 
 
+# ===== Webhook 通知（PART-6）: list_webhook_keys_for_world =====
+
+def test_list_webhook_keys_for_world_excludes_expired_and_inactive_owner():
+    """RV是正#2: `list_webhook_keys_for_world` は失効・`webhook_url` 無しに加えて、期限切れ
+    （`expires_at` が過去）・所有者が非 active（`owner_uid` 非 NULL かつ `users.status != 'active'`）
+    のキーも対象から除く。admin 発行キー（`owner_uid` NULL）は所有者チェックの対象外。"""
+    _try_init()
+    sfx = _sfx()
+    world = f"whworld-{sfx}"
+    uid = f"whowner-{sfx}"
+    from datetime import datetime, timedelta, timezone
+    from sherpa import auth
+    store.upsert_user(uid, email=f"{uid}@t.local", display_name=uid,
+                      password_hash=auth.hash_password("Passw0rd!"), role="user", status="active")
+    store.set_system_settings("admin", {"user_api_keys_allowed": True})
+    try:
+        admin_key = store.insert_api_key(
+            f"hash-whadm-{sfx}", f"pfxwha{sfx}"[:12], "whadm", "admin", allowed_worlds=[world],
+            webhook_url="https://wh-admin.example/hook", webhook_secret="s-admin")
+        active_self_key = store.insert_api_key(
+            f"hash-whact-{sfx}", f"pfxwhc{sfx}"[:12], "whact", uid, owner_uid=uid,
+            allowed_worlds=[world],
+            webhook_url="https://wh-active.example/hook", webhook_secret="s-active")
+        past = datetime.now(timezone.utc) - timedelta(days=1)
+        expired_key = store.insert_api_key(
+            f"hash-whexp-{sfx}", f"pfxwhe{sfx}"[:12], "whexp", "admin", allowed_worlds=[world],
+            expires_at=past,
+            webhook_url="https://wh-expired.example/hook", webhook_secret="s-expired")
+        no_webhook_key = store.insert_api_key(
+            f"hash-whnone-{sfx}", f"pfxwhn{sfx}"[:12], "whnone", "admin", allowed_worlds=[world])
+
+        got_ids = {row["id"] for row in store.list_webhook_keys_for_world(world)}
+        assert admin_key["id"] in got_ids
+        assert active_self_key["id"] in got_ids
+        assert expired_key["id"] not in got_ids       # 期限切れは除外
+        assert no_webhook_key["id"] not in got_ids     # webhook_url 未設定は除外
+
+        # 所有者を disabled にすると、以後は列挙対象から外れる（admin 発行キーは影響を受けない）。
+        store.upsert_user(uid, role="user", status="disabled")
+        got_ids_after_disable = {row["id"] for row in store.list_webhook_keys_for_world(world)}
+        assert active_self_key["id"] not in got_ids_after_disable
+        assert admin_key["id"] in got_ids_after_disable
+    finally:
+        store.set_system_settings("admin", {"user_api_keys_allowed": None})
+        store.upsert_user(uid, role="user", status="active")
+
+
+def test_list_webhook_keys_for_world_scopes_by_allowed_worlds():
+    """`allowed_worlds` が None（全 world 許可）または対象 world を含む場合のみ対象になる。"""
+    _try_init()
+    sfx = _sfx()
+    world = f"whscope-{sfx}"
+    other_world = f"whother-{sfx}"
+    unscoped = store.insert_api_key(
+        f"hash-whun-{sfx}", f"pfxwhu{sfx}"[:12], "whun", "admin",
+        webhook_url="https://wh-unscoped.example/hook", webhook_secret="s-un")
+    scoped_in = store.insert_api_key(
+        f"hash-whin-{sfx}", f"pfxwhi{sfx}"[:12], "whin", "admin", allowed_worlds=[world],
+        webhook_url="https://wh-in.example/hook", webhook_secret="s-in")
+    scoped_out = store.insert_api_key(
+        f"hash-whout-{sfx}", f"pfxwho{sfx}"[:12], "whout", "admin", allowed_worlds=[other_world],
+        webhook_url="https://wh-out.example/hook", webhook_secret="s-out")
+
+    got_ids = {row["id"] for row in store.list_webhook_keys_for_world(world)}
+    assert unscoped["id"] in got_ids
+    assert scoped_in["id"] in got_ids
+    assert scoped_out["id"] not in got_ids
+
+
 def test_apply_system_settings_and_revoke_if_disabled_is_atomic_and_covers_explicit_null():
     """OFF（明示 false・明示 null のいずれも）で保存すると、設定変更と一括失効が同一トランザクション
     で行われる。再度 ON にしても、OFF 時点で失効済みだったキーは復活しない。"""

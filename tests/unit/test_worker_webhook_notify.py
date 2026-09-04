@@ -98,6 +98,18 @@ def test_world_unresolved_notifies_failed_status(_stub_pipeline, monkeypatch):
     assert _stub_pipeline[0]["world"] == "w2"
 
 
+def test_sync_content_changed_notifies_with_explicit_op(_stub_pipeline, monkeypatch):
+    """RV是正#7: `_sync_impl` の「内容が変わった」経路（`prev != sig`・`_run_locked` の
+    sidecar欠落分岐を経由せず末尾で `run()` へ委譲する分岐）は `op` を渡し忘れていたため、
+    呼び出し元が refresh/rerun 等で `op` を指定していても Webhook payload の `op` が常に既定の
+    "sync" に固定されてしまっていた——再発防止。"""
+    monkeypatch.setattr(store, "get_world", lambda world: None)   # prev=None ≠ sig="sig"（内容変化扱い）
+    result = worker.sync("w5", op="refresh")
+    assert result["changed"] is True
+    assert len(_stub_pipeline) == 1
+    assert _stub_pipeline[0]["op"] == "refresh"
+
+
 def test_sync_unchanged_world_unresolved_notifies_via_finalize_if_unused(_stub_pipeline, monkeypatch):
     """`_sync_impl` の `_run_locked` を経由しない終了点（world 未解決）でも `run_id` があれば
     通知される（`_finalize_if_unused` 経由）。"""

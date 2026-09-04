@@ -58,7 +58,8 @@ def _logout() -> None:
     client.post("/auth/logout")
 
 
-def test_key_create_with_loopback_webhook_returns_secret_once():
+def test_key_create_with_unallowlisted_loopback_webhook_rejected():
+    """RV是正#1: loopback も admin allowlist への明示登録が必須（既定は全拒否）。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
@@ -66,18 +67,36 @@ def test_key_create_with_loopback_webhook_returns_secret_once():
     _login(adm_uid, adm_pw)
     r = client.post("/ext/v1/admin/keys",
                     json={"label": f"wh-{sfx}", "webhook_url": "http://127.0.0.1:9999/hook"})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["webhook_url"] == "http://127.0.0.1:9999/hook"
-    assert isinstance(body["webhook_secret"], str) and len(body["webhook_secret"]) > 10
-
-    listed = client.get("/ext/v1/admin/keys").json()["keys"]
-    row = next(x for x in listed if x["id"] == body["id"])
-    assert row["webhook"] is True
-    assert row["webhook_host"] == "127.0.0.1:9999"
-    assert "webhook_secret" not in row     # 一覧には絶対に平文 secret を出さない
-    assert "webhook_url" not in row        # フル URL（path/query 含む）も一覧には出さない契約
+    assert r.status_code == 422, r.text
     _logout()
+
+
+def test_key_create_with_allowlisted_loopback_webhook_returns_secret_once():
+    """RV是正#1: loopback でも `webhook_allowlist` に host:port を明示登録すれば許可される。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    try:
+        r = client.put("/admin/settings", json={"webhook_allowlist": ["127.0.0.1:9999"]})
+        assert r.status_code == 200, r.text
+        r = client.post("/ext/v1/admin/keys",
+                        json={"label": f"wh-{sfx}", "webhook_url": "http://127.0.0.1:9999/hook"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["webhook_url"] == "http://127.0.0.1:9999/hook"
+        assert isinstance(body["webhook_secret"], str) and len(body["webhook_secret"]) > 10
+
+        listed = client.get("/ext/v1/admin/keys").json()["keys"]
+        row = next(x for x in listed if x["id"] == body["id"])
+        assert row["webhook"] is True
+        assert row["webhook_host"] == "127.0.0.1:9999"
+        assert "webhook_secret" not in row     # 一覧には絶対に平文 secret を出さない
+        assert "webhook_url" not in row        # フル URL（path/query 含む）も一覧には出さない契約
+    finally:
+        client.put("/admin/settings", json={"webhook_allowlist": None})
+        _logout()
 
 
 def test_key_create_without_webhook_has_null_secret_and_false_flag():
@@ -173,13 +192,39 @@ def test_admin_settings_webhook_allowlist_rejects_junk():
     _logout()
 
 
-def test_self_key_create_with_loopback_webhook():
+def test_self_key_create_with_unallowlisted_loopback_webhook_rejected():
+    """RV是正#1: 自己発行キーも loopback を無条件では使えない（内蔵サービスへの SSRF 対策・
+    自己発行キー利用者〔一般ユーザー〕が任意の loopback ポートを宛先登録できてしまう穴を塞ぐ）。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
     _login(adm_uid, adm_pw)
     assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
+    _logout()
+    try:
+        uid, pw = _mk_user(sfx)
+        _login(uid, pw)
+        r = client.post("/ext/v1/keys",
+                        json={"label": f"selfwh-{sfx}", "webhook_url": "http://127.0.0.1:9999/hook"})
+        assert r.status_code == 422, r.text
+        _logout()
+    finally:
+        _login(adm_uid, adm_pw)
+        client.put("/admin/settings", json={"user_api_keys_allowed": None})
+        _logout()
+
+
+def test_self_key_create_with_allowlisted_loopback_webhook():
+    """admin が `webhook_allowlist` に登録済みの loopback host:port は、自己発行キーでも使える。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    assert client.put("/admin/settings", json={"user_api_keys_allowed": True}).status_code == 200
+    assert client.put("/admin/settings",
+                      json={"webhook_allowlist": ["127.0.0.1:9999"]}).status_code == 200
     _logout()
     try:
         uid, pw = _mk_user(sfx)
@@ -196,6 +241,7 @@ def test_self_key_create_with_loopback_webhook():
     finally:
         _login(adm_uid, adm_pw)
         client.put("/admin/settings", json={"user_api_keys_allowed": None})
+        client.put("/admin/settings", json={"webhook_allowlist": None})
         _logout()
 
 

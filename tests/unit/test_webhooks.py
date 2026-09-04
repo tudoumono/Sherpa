@@ -1,14 +1,17 @@
 """Webhook 通知（PART-6・sherpa/webhooks.py・docs/proposals/2026-09-05-Webhook通知.md）の unit テスト。
 
-対象: 宛先検証（loopback/allowlist/userinfo拒否/fail-closed・W3）・署名の既知ベクトル（W4）・
-リトライ回数とバックオフ（W1・`time.sleep` を monkeypatch）・監査記録の detail に secret/フル URL
-が含まれないこと。ネットワーク I/O は一切発生させない（`_send_once`/`llm.urlopen_no_redirect` を
-monkeypatch で差し替える）。
+対象: 宛先検証（allowlist必須〔loopback含む〕/userinfo拒否/fail-closed・W3・RV是正#1/#8）・
+署名の既知ベクトル（W4）・リトライ回数とバックオフ・試行毎の宛先再評価（W1・RV是正#6・
+`time.sleep` を monkeypatch）・配送キュー（単一 worker＋有界キュー・RV是正#4）・監査記録の
+detail に secret/フル URL が含まれないこと。ネットワーク I/O は一切発生させない
+（`_send_once`/`llm.urlopen_no_redirect` を monkeypatch で差し替える）。
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
+import queue
+import threading
 
 import pytest
 
@@ -32,6 +35,14 @@ def test_webhook_host_port_rejects_userinfo():
     assert webhooks._webhook_host_port("http://user:pass@evil.com/hook") is None
 
 
+def test_webhook_host_port_rejects_empty_userinfo():
+    """RV是正#8: 空文字の userinfo（`http://@host/`）は `p.username == ""`（falsy）で `or` 判定を
+    すり抜けていた旧実装のバグ再発防止。片方だけ空文字の場合も拒否する。"""
+    assert webhooks._webhook_host_port("http://@evil.com/hook") is None
+    assert webhooks._webhook_host_port("http://user:@evil.com/hook") is None
+    assert webhooks._webhook_host_port("http://:pass@evil.com/hook") is None
+
+
 def test_webhook_host_port_rejects_non_http_scheme():
     assert webhooks._webhook_host_port("ftp://example.com/hook") is None
     assert webhooks._webhook_host_port("javascript:alert(1)") is None
@@ -41,10 +52,20 @@ def test_webhook_host_port_strips_trailing_dot():
     assert webhooks._webhook_host_port("http://example.com./hook") == ("example.com", 80)
 
 
-def test_assert_webhook_url_allowed_loopback_always_allowed():
-    """loopback は allowlist が空でも常に許可される。"""
-    webhooks.assert_webhook_url_allowed("http://127.0.0.1:8080/hook", system_settings={})
-    webhooks.assert_webhook_url_allowed("http://localhost/hook", system_settings={})
+def test_assert_webhook_url_allowed_loopback_rejected_without_allowlist():
+    """RV是正#1: loopback も既定（allowlist 未設定）では拒否される——自己発行キー利用者が
+    認証なしの内蔵サービス（例: ES:9200）を宛先登録できてしまう穴を塞ぐ（Ollama の loopback
+    常時許可とは意図的に違える）。"""
+    with pytest.raises(webhooks.WebhookUrlInvalid):
+        webhooks.assert_webhook_url_allowed("http://127.0.0.1:8080/hook", system_settings={})
+    with pytest.raises(webhooks.WebhookUrlInvalid):
+        webhooks.assert_webhook_url_allowed("http://localhost/hook", system_settings={})
+
+
+def test_assert_webhook_url_allowed_loopback_allowed_when_allowlisted():
+    """loopback でも `webhook_allowlist` に host:port を明示登録すれば許可される。"""
+    settings = {"webhook_allowlist": ["127.0.0.1:8080"]}
+    webhooks.assert_webhook_url_allowed("http://127.0.0.1:8080/hook", system_settings=settings)
 
 
 def test_assert_webhook_url_allowed_fail_closed_without_allowlist():
@@ -208,35 +229,83 @@ def test_deliver_invalid_destination_skips_network_and_retries(monkeypatch):
     assert kwargs["detail"]["attempts"] == 0
 
 
-# ---- notify_run_terminal のイベント/対象キー解決 ----
+def test_deliver_reevaluates_allowlist_before_each_attempt(monkeypatch):
+    """RV是正#6: 宛先ポリシーは試行ごとに再評価する——3回目の直前で admin が allowlist を
+    変更した想定にすると、2回（送信失敗）した時点で打ち切り、3回目は `_send_once` へ到達しない。
+    """
+    from sherpa import store
 
-def test_notify_run_terminal_maps_status_to_event_and_schedules_per_key(monkeypatch):
+    check_calls = []
+
+    def _check(url, **kw):
+        check_calls.append(1)
+        if len(check_calls) >= 3:
+            raise webhooks.WebhookUrlInvalid("拒否（途中で allowlist が変わった想定）")
+
+    monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", _check)
+
+    send_calls = []
+
+    def _always_fail(*a, **kw):
+        send_calls.append(1)
+        raise ConnectionError("boom")
+
+    monkeypatch.setattr(webhooks, "_send_once", _always_fail)
+    audits = []
+    monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
+
+    webhooks._deliver(5, "https://example.com/hook", "sec", {
+        "event": "ingest.failed", "world": "test", "run_id": 6})
+
+    assert len(check_calls) == 3    # 1・2回目は許可・3回目の再評価で不許可
+    assert len(send_calls) == 2     # 3回目は _send_once へ到達しない
+    assert len(audits) == 1
+    args, kwargs = audits[0]
+    assert args[1] == "webhook.failed"
+    assert kwargs["detail"]["attempts"] == 2
+    assert kwargs["reason"] == "WebhookUrlInvalid"
+
+
+def test_send_once_does_not_read_response_body(monkeypatch):
+    """RV是正#3: 応答本体は読まない（`with` を抜けるだけで完了・2xx 以外は `urlopen` 自身が
+    `HTTPError` を送出する契約に乗る）。"""
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            raise AssertionError("_send_once は応答本体を読んではいけない")
+
+    monkeypatch.setattr(webhooks.llm, "urlopen_no_redirect",
+                        lambda req, timeout=None: _FakeResp())
+    webhooks._send_once("https://example.com/hook", "sec", b"{}", "req-1", "ingest.completed")
+
+
+# ---- notify_run_terminal のイベント/対象キー解決 ----
+# RV是正#4: 実送信は単一 daemon worker＋有界キューへ変わった（`threading.Thread` をキーごとに
+# 起こす旧実装ではない）ため、ここでは `_enqueue`（キュー投入の直前まで）を monkeypatch して
+# 検証する。`_enqueue` 自体・worker/キューの挙動は下の「配送キュー」節で別途検証する。
+
+def test_notify_run_terminal_maps_status_to_event_and_enqueues_per_key(monkeypatch):
     from sherpa import store
 
     monkeypatch.setattr(store, "list_webhook_keys_for_world", lambda world: [
         {"id": 1, "webhook_url": "https://a.example.com/hook", "webhook_secret": "sa"},
         {"id": 2, "webhook_url": "https://b.example.com/hook", "webhook_secret": "sb"},
     ])
-    started = []
-
-    class _FakeThread:
-        def __init__(self, target=None, args=(), daemon=None, name=None):
-            self._target = target
-            self._args = args
-
-        def start(self):
-            started.append(self._args)
-            self._target(*self._args)   # 同期実行（テストではスレッド化不要）
-
-    monkeypatch.setattr(webhooks.threading, "Thread", _FakeThread)
-    delivered = []
-    monkeypatch.setattr(webhooks, "_deliver", lambda *a: delivered.append(a))
+    enqueued = []
+    monkeypatch.setattr(webhooks, "_enqueue", lambda *a: enqueued.append(a))
 
     webhooks.notify_run_terminal("test", 42, "sync", "auto_published_with_flags", doc_count=5)
 
-    assert len(started) == 2
-    assert len(delivered) == 2
-    payload0 = delivered[0][3]
+    assert len(enqueued) == 2
+    key_id0, url0, secret0, payload0 = enqueued[0]
+    assert key_id0 == 1
+    assert url0 == "https://a.example.com/hook"
+    assert secret0 == "sa"
     assert payload0["event"] == "ingest.completed"
     assert payload0["world"] == "test"
     assert payload0["run_id"] == 42
@@ -249,30 +318,20 @@ def test_notify_run_terminal_failed_status_maps_to_ingest_failed(monkeypatch):
     from sherpa import store
     monkeypatch.setattr(store, "list_webhook_keys_for_world", lambda world: [
         {"id": 1, "webhook_url": "https://a.example.com/hook", "webhook_secret": "sa"}])
-    captured = {}
-
-    class _FakeThread:
-        def __init__(self, target=None, args=(), daemon=None, name=None):
-            captured["args"] = args
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr(webhooks.threading, "Thread", _FakeThread)
+    enqueued = []
+    monkeypatch.setattr(webhooks, "_enqueue", lambda *a: enqueued.append(a))
 
     webhooks.notify_run_terminal("test", 1, "delete", "failed")
 
-    assert captured["args"][3]["event"] == "ingest.failed"
+    assert enqueued[0][3]["event"] == "ingest.failed"
 
 
-def test_notify_run_terminal_no_keys_does_not_spawn_thread(monkeypatch):
+def test_notify_run_terminal_no_keys_does_not_enqueue(monkeypatch):
     from sherpa import store
     monkeypatch.setattr(store, "list_webhook_keys_for_world", lambda world: [])
-    spawned = []
-    monkeypatch.setattr(webhooks.threading, "Thread",
-                        lambda *a, **kw: spawned.append(1) or pytest.fail("should not spawn"))
+    monkeypatch.setattr(webhooks, "_enqueue",
+                        lambda *a, **kw: pytest.fail("should not enqueue"))
     webhooks.notify_run_terminal("test", 1, "sync", "auto_published")
-    assert spawned == []
 
 
 def test_notify_run_terminal_swallows_store_errors(monkeypatch):
@@ -284,3 +343,85 @@ def test_notify_run_terminal_swallows_store_errors(monkeypatch):
 
     monkeypatch.setattr(store, "list_webhook_keys_for_world", _boom)
     webhooks.notify_run_terminal("test", 1, "sync", "auto_published")   # 例外を投げなければ成功
+
+
+# ---- 配送キュー: 単一 worker＋有界キュー（W1・RV是正#4） ----
+
+@pytest.fixture
+def _isolated_queue(monkeypatch):
+    """モジュール共有のグローバル `_queue`/`_worker_thread` をテスト間で汚染しないよう、
+    各テストで専用のインスタンスに差し替える（本番は単一プロセス内で1つを使い回す設計のため、
+    モジュール変数を直接 monkeypatch する。実スレッドは起こさない——`_ensure_worker_started`
+    は各テストで個別に monkeypatch/検証する）。"""
+    fake_q: queue.Queue = queue.Queue(maxsize=2)
+    monkeypatch.setattr(webhooks, "_queue", fake_q)
+    monkeypatch.setattr(webhooks, "_worker_thread", None)
+    return fake_q
+
+
+def test_enqueue_starts_worker_and_puts_item(monkeypatch, _isolated_queue):
+    monkeypatch.setattr(webhooks, "_ensure_worker_started", lambda: None)
+    webhooks._enqueue(1, "https://example.com/hook", "sec", {"world": "test", "run_id": 1})
+    assert _isolated_queue.qsize() == 1
+    assert _isolated_queue.get_nowait() == (
+        1, "https://example.com/hook", "sec", {"world": "test", "run_id": 1})
+
+
+def test_enqueue_drops_and_audits_when_queue_full(monkeypatch, _isolated_queue):
+    """RV是正#4: キュー飽和時はその1件だけ捨てて `webhook.dropped` を監査記録する
+    （他キー・取り込み自体には影響させない）。"""
+    from sherpa import store
+    monkeypatch.setattr(webhooks, "_ensure_worker_started", lambda: None)
+    _isolated_queue.put_nowait((0, "u", "s", {}))   # maxsize=2 を先に埋める
+    _isolated_queue.put_nowait((0, "u", "s", {}))
+    audits = []
+    monkeypatch.setattr(store, "audit", lambda *a, **kw: audits.append((a, kw)))
+
+    webhooks._enqueue(9, "https://example.com/hook", "sec",
+                      {"world": "test", "run_id": 3, "event": "ingest.completed"})
+
+    assert _isolated_queue.qsize() == 2   # 溢れた分は積まれない
+    assert len(audits) == 1
+    args, kwargs = audits[0]
+    assert args[1] == "webhook.dropped"
+    assert args[3] == "9"
+    assert kwargs["reason"] == "queue_full"
+    assert kwargs["detail"]["world"] == "test"
+    assert kwargs["detail"]["run_id"] == 3
+
+
+def test_ensure_worker_started_starts_only_one_thread(monkeypatch, _isolated_queue):
+    """worker は lazy start・複数回呼んでも生存中なら1本しか起動しない。"""
+    starts = []
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self._alive = True
+
+        def start(self):
+            starts.append(1)
+
+        def is_alive(self):
+            return self._alive
+
+    monkeypatch.setattr(webhooks.threading, "Thread", _FakeThread)
+    webhooks._ensure_worker_started()
+    webhooks._ensure_worker_started()
+    assert len(starts) == 1
+
+
+def test_process_queue_item_calls_deliver(monkeypatch):
+    """`_worker_loop` の本体（1件分の処理）を実スレッド/実キューなしで直接検証する。"""
+    calls = []
+    monkeypatch.setattr(webhooks, "_deliver", lambda *a: calls.append(a))
+    webhooks._process_queue_item((1, "https://example.com/hook", "sec", {"a": 1}))
+    assert calls == [(1, "https://example.com/hook", "sec", {"a": 1})]
+
+
+def test_process_queue_item_swallows_deliver_exceptions(monkeypatch):
+    """`_deliver` が想定外の例外を投げても worker（呼び出し元のループ）を落とさない。"""
+    def _boom(*a):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(webhooks, "_deliver", _boom)
+    webhooks._process_queue_item((1, "https://example.com/hook", "sec", {}))   # 例外を投げなければ成功

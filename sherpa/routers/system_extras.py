@@ -109,9 +109,10 @@ class SystemSettingsReq(BaseModel):
     # R2a-S2（2026-07-13 横断レビュー対応）: Ollama 接続先の SSRF allowlist（host:port の配列）。
     # 既定（未設定=None）は loopback のみ許可（`llm.assert_ollama_url_allowed`）・null は未設定へ戻す。
     ollama_allowlist: list[str] | None = None
-    # PART-6（2026-09-05-Webhook通知.md W3）: Webhook 宛先の SSRF allowlist（host:port の配列・
-    # `ollama_allowlist` と同じ形）。既定（未設定=None）は loopback のみ許可
-    # （`webhooks.assert_webhook_url_allowed`）・null は未設定へ戻す。
+    # PART-6（2026-09-05-Webhook通知.md W3・RV是正#1）: Webhook 宛先の SSRF allowlist（host:port の
+    # 配列・`ollama_allowlist` と同じ形だが loopback を例外にしない点が異なる）。既定（未設定=None）は
+    # 全拒否——loopback（このサーバー自身）も明示登録が必須（`webhooks.assert_webhook_url_allowed`）・
+    # null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
     # R1b（2026-07-13 横断レビュー対応・Codex ネイティブ resume・決定5）: 会話ごとの Codex resume
     # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は 0＝無制限
@@ -789,8 +790,9 @@ def _admin_settings_view() -> dict:
             # `llm._allowlisted_hosts()` 参照）。値そのものに秘密情報は含まない（host:port のみ）。
             "effective": sorted(f"{h}:{p}" for h, p in llm._allowlisted_hosts(sysset)),
         },
-        # PART-6（W3）: Webhook 宛先の SSRF allowlist。`ollama_allowlist` と同型（loopback は
-        # allowlist の有無に関わらず常に暗黙許可される・`webhooks.assert_webhook_url_allowed` 参照）。
+        # PART-6（W3・RV是正#1）: Webhook 宛先の SSRF allowlist。`ollama_allowlist` と型は同じだが
+        # loopback を暗黙許可しない点が異なる——ここに出る host:port が許可先の全てで、それ以外
+        # （loopback 含む）は拒否される（`webhooks.assert_webhook_url_allowed` 参照）。
         "webhook_allowlist": {
             "configured": sysset.get("webhook_allowlist"),
             "effective": sorted(f"{h}:{p}" for h, p in webhooks._allowlisted_hosts(sysset)),
@@ -1042,7 +1044,7 @@ def _validate_webhook_allowlist(value):
     `_validate_ollama_allowlist` と同形式（各エントリは host:port のみ・scheme/userinfo/path/
     空白は拒否）——allowlist のエントリ自体は Webhook URL 本体と違い path/query を持たない
     （宛先の起点だけを登録する）ため、`llm._canonical_host_port` の path 拒否契約と衝突しない。
-    None/空リストは None（未設定＝loopback のみ許可へフォールバック）。
+    None/空リストは None（未設定＝**全拒否**へフォールバック・RV是正#1——loopback も例外にしない）。
     """
     if value is None:
         return None
@@ -1671,8 +1673,8 @@ def _validate_future_expiry(dt: datetime | None, field_label: str) -> None:
 
 
 def _validate_webhook_url_or_error(webhook_url: str | None) -> None:
-    """`webhook_url`（PART-6・キー発行時のオプトイン）が宛先ポリシー（loopback／admin
-    allowlist）を満たすか検証する。None（未指定）はそのまま許可（Webhook 無効のまま発行）。
+    """`webhook_url`（PART-6・キー発行時のオプトイン）が宛先ポリシー（admin allowlist・
+    RV是正#1で loopback も対象）を満たすか検証する。None（未指定）はそのまま許可（Webhook 無効のまま発行）。
     不許可は 422（`webhooks.assert_webhook_url_allowed` が `WebhookUrlInvalid` を送出）。"""
     if webhook_url is None:
         return
@@ -1741,8 +1743,8 @@ def _key_list_out(rows: list, call_counts: dict) -> dict:
                               422: ext_api._validation_error_response(
                                   "allowed_worlds に実在しない world_id が含まれる場合、"
                                   "有効期限が過去日時の場合、client_op_id が UUID 形式でない場合、"
-                                  "webhook_url が宛先ポリシー（loopback／admin allowlist）を"
-                                  "満たさない場合"),
+                                  "webhook_url が宛先ポリシー（admin allowlist・"
+                                  "loopback 含む）を満たさない場合"),
                               **_EXT_ADMIN_RESPONSES})
 def ext_key_create(req: ExtKeyCreateReq, request: Request,
                    x_request_id: str | None = ext_api._XRequestIdIn):
@@ -1914,7 +1916,7 @@ def _enforce_self_world_scope(uid: str, requested: list[str] | None) -> list[str
                                   "allowed_worlds に実在しない world_id が含まれる場合、"
                                   "有効期限が過去日時の場合、daily_quota が現在の上限を超える場合、"
                                   "client_op_id が UUID 形式でない場合、webhook_url が宛先ポリシー"
-                                  "（loopback／admin allowlist）を満たさない場合"),
+                                  "（admin allowlist・loopback 含む）を満たさない場合"),
                               401: {"description": "ログインが必要です（セッション Cookie）",
                                     "headers": dict(ext_api._REQUEST_ID_OPENAPI_HEADER)}})
 def ext_self_key_create(req: ExtSelfKeyCreateReq, request: Request,

@@ -806,8 +806,12 @@ def _finalize_pending_run(run_id, world_id: str, pending: dict, *, status: str |
     # docstring 参照）なので、通知もここ1点に集約する（`worker._record` の hook は
     # `finalize=False` の間 `store.finish_ingest_run*` を呼ばないため到達しない＝自然に重複しない）。
     try:
-        webhooks.notify_run_terminal(world_id, run_id, "rebind", st,
-                                     doc_count=len(pending.get("source_doc_ids") or []) or None)
+        # RV是正#9: `source_doc_ids` が空リスト（実際に0件・既知）と None（未算出・不明）を
+        # 区別する——旧実装は `len([]) or None` により両方とも `doc_count=None` に潰れ、
+        # 「0件で成功した rebind」が「件数不明」と見分けられなくなっていた。
+        ids = pending.get("source_doc_ids")
+        doc_count = len(ids) if ids is not None else None
+        webhooks.notify_run_terminal(world_id, run_id, "rebind", st, doc_count=doc_count)
     except Exception:
         logging.getLogger(__name__).warning(
             "Webhook 通知の起動に失敗しました（rebind 自体は継続）: world_id=%s", world_id, exc_info=True)

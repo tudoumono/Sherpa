@@ -1077,7 +1077,9 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
         else:
             _finalize_if_unused("auto_published")
         return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
-    res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id)   # 署名の確定/無効化は run 内部（_run_locked）が lock 内で行う
+    # RV是正#7: `op` を渡し忘れると `run()` の既定 "sync" に固定され、この呼び出し元が実際には
+    # refresh/rerun 等でも Webhook payload の `op` が常に "sync" になってしまう——`op` を配線する。
+    res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op)   # 署名の確定/無効化は run 内部（_run_locked）が lock 内で行う
     return {"world": world, "changed": True, "status": res["status"],
             "ledger": res["ledger"], "flags": list(res.get("flags", []))}
 

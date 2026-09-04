@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from sherpa import store
+from sherpa import store, webhooks
 from sherpa.ingest import background
 
 
@@ -163,6 +163,42 @@ def test_start_or_join_calls_fail_close_when_work_fn_leaves_run_extracting(monke
     _wait_until_idle("w8")
 
     assert calls and calls[0][0] == 55
+
+
+def test_start_or_join_notifies_webhook_when_fail_close_succeeds(monkeypatch):
+    """RV是正#5: この CAS 自体が terminal 化（`status='extracting'`→`'failed'`）の成功なので、
+    ここでも Webhook 通知する——通知は「terminal 更新が実際に成功した」ことだけを条件にする
+    契約どおり、`fail_close_if_extracting` が True（実際に更新した）を返した時だけ呼ばれる。"""
+    monkeypatch.setattr(store, "fail_close_if_extracting", lambda run_id, reason: True)
+    notified = []
+    monkeypatch.setattr(webhooks, "notify_run_terminal",
+                        lambda world, run_id, op, status, **kw: notified.append(
+                            (world, run_id, op, status)))
+
+    def _boom(run_id):
+        raise RuntimeError("boom")
+
+    background.start_or_join("w10", "refresh", "", lambda: 77, _boom)
+    _wait_until_idle("w10")
+
+    assert notified == [("w10", 77, "refresh", "failed")]
+
+
+def test_start_or_join_skips_webhook_notify_when_already_terminal(monkeypatch):
+    """CAS が False（呼び出し元が既に自分で terminal 化済み）を返した場合はここでは通知しない
+    （その操作自身の terminal 化パスが既に通知済みのはず＝二重通知しない）。"""
+    monkeypatch.setattr(store, "fail_close_if_extracting", lambda run_id, reason: False)
+    notified = []
+    monkeypatch.setattr(webhooks, "notify_run_terminal",
+                        lambda *a, **kw: notified.append((a, kw)))
+
+    def _boom(run_id):
+        raise RuntimeError("boom")
+
+    background.start_or_join("w11", "refresh", "", lambda: 88, _boom)
+    _wait_until_idle("w11")
+
+    assert notified == []
 
 
 def test_start_or_join_raises_when_not_accepting():
