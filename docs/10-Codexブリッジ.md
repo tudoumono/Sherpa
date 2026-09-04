@@ -168,7 +168,7 @@ sequenceDiagram
 ```
 → `analyses`＋`analysis_items` に保存（R4/R5/R6/R12）。**根拠DL＝`evidence[].doc_id`**。
 `target_doc_id`/`target_span` は **doc_check（UC-2）の対象文書**用（impact では NULL）。
-**`type` は調べ方＝UC**: `impact`/`troubleshoot`/`qa`/`doc_check` が同じ仕様で型違い（MVP は impact＋薄い troubleshoot/qa）。
+**`type` はやりたいこと＝UC**: `impact`/`troubleshoot`/`qa`/`doc_check` が同じ仕様で型違い（MVP は impact＋薄い troubleshoot/qa）。
 **実測**: 最終結果の形は `codex exec --output-schema <JSON Schema>` で強制できる（emit_result ツールと併用/代替可）。
 
 ## 8. 同時実行・キュー（決定: 会話単位で直列、MVPはin-process）
@@ -194,7 +194,7 @@ sequenceDiagram
 ## 11. API（抜粋）
 **MVP の入口は薄い専用エンドポイント**: `POST /ingest`・`GET /ingest/{id}/preview`・
 `POST /ingest/{id}/publish`・`POST /impact/run`・`GET /impact/{id}`・`GET /impact/{id}/export.xlsx`・
-`GET /documents/{id}/download`。**＋別の調べ方の薄い probe**（read-only）: `POST /troubleshoot/run`・`POST /qa/run`。
+`GET /documents/{id}/download`。**＋別のやりたいことの薄い probe**（read-only）: `POST /troubleshoot/run`・`POST /qa/run`。
 **会話チャットAPI（下記）は Phase 1**。Codex Runner コア・`emit_result` 仕様は共通。
 
 Phase 1 以降（フルチャット基盤）:

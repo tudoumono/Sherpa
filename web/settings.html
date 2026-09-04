@@ -172,7 +172,7 @@
 
       <div class="grp">
         <h3>Codex（チャット専用・grep して調べる）</h3>
-        <div class="hint">Web 検索はチャット画面の調べ方ブロック（参照する行）で会話ごとに切り替えます。管理者が許可し、頭脳が Codex（OpenAI 直結）のときだけ表示されます。</div>
+        <div class="hint">Web 検索はチャット画面のやりたいことブロック（参照する行）で会話ごとに切り替えます。管理者が許可し、頭脳が Codex（OpenAI 直結）のときだけ表示されます。</div>
         <div class="hint">OpenAI 本家への接続は API キー不要（CLI の `codex login` で認証）。接続先が Azure OpenAI 等の OpenAI 互換エンドポイントのときは、上の「OpenAI」欄の API キーを使います（保存前の入力中の値でも接続テストでは使えます）。モデルは管理者の「使えるモデル」の設定に従い、思考の深さは環境設定の既定（通常は `low`）に従います（どちらも個人設定にはありません）。ナレッジ抽出には非対応（チャット用）。接続テストは通常 CLI の有無とログイン状態を確認しますが、接続先が Azure OpenAI 等のときは実際に1回接続して確認します。</div>
         <div class="testrow"><button class="mini" data-test="codex">接続テスト</button><span class="tres muted" id="t-codex"></span></div>
       </div>

@@ -105,7 +105,7 @@
            調べ方（レンズ）・範囲・探す対象・参照する（社内資料/個人ファイル）は右ペイン下部の
            固定フッター（#inquiry）へ集約した（SC-6b・docs/proposals/2026-08-29-調べ方ブロック.md §2.3）。 -->
       <div class="cbar">
-        <button class="inquiry-chip" id="inquiry-chip" type="button" title="調べ方・調べる深さ・範囲・探す対象・参照先を設定する">🎯 <b id="inquiry-chip-label">自動 · 全体 · 資料＋コード · 標準</b></button>
+        <button class="inquiry-chip" id="inquiry-chip" type="button" title="やりたいこと・調べる深さ・範囲・探す対象・参照先を設定する">🎯 <b id="inquiry-chip-label">自動 · 全体 · 資料＋コード · 標準</b></button>
         <button class="kbtoggle" id="chat-upload-btn" title="このファイルを本人だけの個人ワークスペースへ保存する">📎 個人ファイルを追加</button>
         <input id="chat-file-input" type="file" hidden multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.cbl,.cob,.cobol,.cpy,.copybook,.jcl,.sql,.py,.sh,.bat">
         <span id="chat-upload-status" style="font-size:11.5px;color:var(--ink-3)" aria-live="polite"></span>
@@ -131,13 +131,13 @@
     <div class="flow" id="flow"><div class="hint">質問すると、考えた道筋がここに流れます。</div></div>
     <div class="inquiry" id="inquiry">
       <button class="inquiry-head" id="inquiry-head" type="button" aria-expanded="true" aria-controls="inquiry-body">
-        <span class="inquiry-title">🎯 次の質問の調べ方</span>
+        <span class="inquiry-title">🎯 次の質問でやりたいこと</span>
         <span class="inquiry-sum muted" id="inquiry-sum"></span>
         <span class="caret" aria-hidden="true">▾</span>
       </button>
       <div class="inquiry-body" id="inquiry-body">
         <div class="inquiry-row">
-          <span class="inquiry-label">調べ方</span>
+          <span class="inquiry-label">やりたいこと</span>
           <div class="seg" id="lens-seg">
             <button class="segbtn on" data-lens="auto" type="button">自動</button>
             <button class="segbtn" data-lens="impact" type="button">影響</button>

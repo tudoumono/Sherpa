@@ -964,7 +964,7 @@ function _scopeChipsHTML(scope) {
   if (scope.layer) {
     const layerLabel = esc(LAYER_CHIP_LABEL[scope.layer] || scope.layer);
     out += scope.layer_applied === false
-      ? `<span class="chip ghost" title="この調べ方（影響・原因）では探す対象の指定は使われません">${layerLabel}（非適用）</span>`
+      ? `<span class="chip ghost" title="このやりたいこと（影響・原因）では探す対象の指定は使われません">${layerLabel}（非適用）</span>`
       : `<span class="chip">${layerLabel}</span>`;
   }
   return out;

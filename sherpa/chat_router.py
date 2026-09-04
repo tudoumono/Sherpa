@@ -156,7 +156,7 @@ def extract_slash_lens(message: str):
 def clarify_question(message: str) -> dict:
     """曖昧時に出す『どの調べ方か』の確認（ask_user と同じ question イベント形）。"""
     return {"type": "question", "interaction_id": "lens-" + secrets.token_hex(4),
-            "mode": "single", "prompt": "どの調べ方をしますか？（影響範囲／原因／仕様・内容／作成）",
+            "mode": "single", "prompt": "どのやりたいことをしますか？（影響範囲／原因／仕様・内容／作成）",
             "options": list(_CLARIFY_OPTIONS), "allow_free_text": False,
             "original_message": (message or "").strip()}
 
