@@ -173,64 +173,9 @@ def test_all_primary_navigation_links(admin_page, ui_config, artifact_case, live
         assertion="ingest画面のgraph導線を実クリックし認証済みknowledge graph画面へ遷移した",
     )
 
-    original_settings = live_api.get_json("/settings", save_as="state/navigation-settings-before.json")
-    restore_settings = {
-        "extract_provider": original_settings.get("extract_provider") or "auto",
-        "graph_provider": original_settings.get("graph_provider") or "",
-        "ollama_url": original_settings.get("ollama_url") or "",
-        "ollama_model": original_settings.get("ollama_model") or "qwen2.5",
-    }
-    artifact_case.add_cleanup(
-        "restore navigation graph provider settings",
-        lambda: live_api.put_json("/settings", restore_settings),
-    )
-    forced_settings = live_api.put_json(
-        "/settings",
-        {
-            "extract_provider": "ollama",
-            "graph_provider": "ollama",
-            "ollama_url": "http://127.0.0.1:1",
-            "ollama_model": "ui-navigation-unreachable",
-        },
-        save_as="state/navigation-unreachable-ollama-settings.json",
-    )
-    assert forced_settings.get("graph_provider") == "ollama", forced_settings
-    assert forced_settings.get("ollama_url") == "http://127.0.0.1:1", forced_settings
-    admin_page.goto(ui_config.base_url + "/ui/ingest.html")
-    extract_button = admin_page.locator(f'[data-extract="{real_world}"]')
-    expect(extract_button).to_be_visible()
-    _arm_admin_control(admin_page, artifact_case, "@selector:[data-extract]")
-    admin_page.once("dialog", lambda dialog: dialog.accept())
-    with admin_page.expect_response(
-        lambda response: response.request.method == "POST" and response.url.endswith(f"/worlds/{real_world}/extract"),
-        timeout=ui_config.timeout_ms,
-    ) as failed_extract_info:
-        extract_button.click()
-    failed_extract = failed_extract_info.value
-    assert failed_extract.status == 503, failed_extract.text()
-    failed_detail = failed_extract.json().get("detail", "")
-    assert "LLM" in failed_detail or "AI" in failed_detail, failed_detail
-    ingest_settings_link = admin_page.locator('#listmsg a[href="settings.html"]')
-    expect(ingest_settings_link).to_be_visible()
-    artifact_case.attest_control_state(
-        control_key="@selector:[data-extract]",
-        state="abnormal",
-        assertion="到達不能な実Ollamaへのgraph抽出が503となり成功表示せず設定導線を表示した",
-    )
-    artifact_case.screenshot(admin_page, 135, "navigation-ingest-real-llm-failure-settings-link-visible")
-    _arm_admin_control(admin_page, artifact_case, "@href:settings.html")
-    ingest_settings_link.click()
-    _finish_internal_navigation(
-        admin_page,
-        ui_config,
-        artifact_case,
-        destination="settings.html",
-        control_key="@href:settings.html",
-        step=140,
-        screenshot_name="navigation-ingest-ai-failure-settings-loaded",
-        assertion="実LLM接続失敗で表示されたsettings導線を実クリックし認証済み設定画面へ遷移した",
-    )
-
+    # 旧「グラフを生成」ボタン（/worlds/{wid}/extract）とAI失敗→設定導線のフローは
+    # GRAPH-SRC（2026-09-04・意味層撤去）で機能ごと退役したため検証対象から削除した。
+    # 個人設定の extract/graph_provider 上書きも SET-2 で停止済み（サーバは黙って無視する）。
     legacy_page = admin_page.context.new_page()
     cdp = admin_page.context.new_cdp_session(legacy_page)
     try:

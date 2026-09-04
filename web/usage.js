@@ -470,6 +470,10 @@ function providerLabel(p) { return PROVIDER_LABEL[p] || p || '不明'; }
 // S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 用途別（kind）内訳の平文日本語ラベル。
 // 未知 kind は生の kind をそのまま表示（fail-safe）。
 const KIND_LABEL = {
+  'chat-sub': '下調べ（サブAI）',
+  research: '外部連携の調査',
+  extract: 'ナレッジ抽出（旧機能）',
+  propose: '概念の候補づくり（旧機能）',
   chat: '会話', intent: '意図の判定',
   embed: '検索用ベクトル化', graph_ask: 'グラフへの質問', vlm: '画像の読み取り',
   // S4-c（2026-07-15-LLMオーケストレーション実装計画.md §6.3）: 複数プロファイル自動選択の計画呼び出し。

@@ -83,6 +83,14 @@
       "file": "24-システム管理.md"
     },
     {
+      "id": "settingsref",
+      "group": "管理者向け",
+      "title": "設定リファレンス（全項目一覧）",
+      "summary": "個人設定・システム管理の全項目を一覧化。何をする設定か・効く場所・既定値・変えるとどうなるか（トレードオフ）と、OpenAI/Azure OpenAI/Gemini/Ollamaのセットアップ手順。",
+      "tags": ["設定", "リファレンス", "一覧", "既定値", "OpenAI", "Azure OpenAI", "Gemini", "Ollama", "セットアップ"],
+      "file": "25-設定リファレンス.md"
+    },
+    {
       "id": "howitworks",
       "group": "しくみ・運用",
       "title": "しくみ（アーキテクチャ）",

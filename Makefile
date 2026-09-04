@@ -94,7 +94,7 @@ install-docker:    ## Docker Engine を入れる（sudo パスワードを1回�
 	bash scripts/install-docker.sh
 
 graph-load:        ## v1 world を Neo4j に投入（鏡モデル・make up ＋ pip install -r requirements.txt 必要）
-	SHERPA_USE_FIXTURES=1 $(PY) -c "from sherpa import worlds; from sherpa.ingest import world_graph as g, world_neo4j as w; wd=worlds.world_dir('v1'); c,s=worlds.semantic_paths('v1'); n,e,f=g.build_world(wd,'v1',concepts_path=c,semantic_path=s); env=w._env(); print('loaded', w.load_world(n,e,'v1',env['uri'],env['user'],env['pw']),'flags',f)"
+	SHERPA_USE_FIXTURES=1 $(PY) -c "from sherpa import worlds; from sherpa.ingest import world_graph as g, world_neo4j as w; wd=worlds.world_dir('v1'); n,e,f=g.build_world(wd,'v1'); env=w._env(); print('loaded', w.load_world(n,e,'v1',env['uri'],env['user'],env['pw']),'flags',f)"
 
 graph-verify:      ## 実 Neo4j で v1 world の影響 golden を再現するか検証
 	SHERPA_USE_FIXTURES=1 $(PY) scripts/graph_verify.py

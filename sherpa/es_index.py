@@ -549,8 +549,20 @@ _EMBED_CACHE_SHARD_HEX = 2   # 16^2=256 シャード
 
 
 def _embed_cache_dir(world: str) -> Path:
-    """world の埋め込みキャッシュ（シャード群）ディレクトリ。"""
-    return worlds.semantic_dir(world) / "embed_cache"
+    """world の埋め込みキャッシュ（シャード群）ディレクトリ。
+
+    EMBED-3 以前の旧・単一 JSON キャッシュ（`embed_cache.json`・実測で数GB級になり得る）は
+    シャード化以降どこからも読まれない＝残しても機能影響ゼロだが、**誰も消さないと閉域機の
+    ディスクを恒久占有する**（2026-09-05 横並び精査 R2）。ここで見つけ次第1回だけ削除する
+    （失敗は無視＝掃除はベストエフォート）。"""
+    d = worlds.semantic_dir(world) / "embed_cache"
+    legacy = d.parent / "embed_cache.json"
+    if legacy.exists():
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+    return d
 
 
 def _embed_cache_shard_path(world: str, shard_id: str) -> Path:
