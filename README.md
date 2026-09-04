@@ -22,6 +22,10 @@ Sherpa は、社内の設計書・仕様書・Office 資料・COBOL/JCL/コピ�
   <img src="docs/manual/images/20-ingest-status.png" alt="取り込み状況画面（フォルダツリーと状態）" width="32%">
 </p>
 
+## 全体像
+
+<p align="center"><img src="assets/architecture-overview.png" alt="Sherpa アーキテクチャ全体図（Web UI・FastAPI・Agent/検索レンズ・取り込み・Elasticsearch/Neo4j/PostgreSQL・クラウド/ローカルAI）" width="800"></p>
+
 ## 動作環境
 
 - WSL2 または Linux
