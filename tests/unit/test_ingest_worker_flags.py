@@ -91,7 +91,7 @@ def _stub_pipeline(monkeypatch):
 
 def test_es_index_failure_becomes_warn_flag(_stub_pipeline, monkeypatch):
     """ES 索引失敗は握りつぶさず warn flag 化＋status は auto_published_with_flags に倒れる（監査#5）。"""
-    def _boom(world, content_sig=None):
+    def _boom(world, content_sig=None, **kw):
         raise RuntimeError("es down")
     monkeypatch.setattr(es_index, "index_world", _boom)
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
@@ -111,7 +111,7 @@ def test_es_index_failure_becomes_warn_flag(_stub_pipeline, monkeypatch):
 def test_reconcile_failure_becomes_warn_flag(_stub_pipeline, monkeypatch):
     """reconcile 失敗も同様に握りつぶさず warn flag 化される（監査#5）。"""
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 1, "chunks": 1})
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
 
     def _boom(reflect=True):
         raise RuntimeError("reconcile down")
@@ -132,7 +132,7 @@ def test_both_succeed_stays_auto_published(_stub_pipeline, monkeypatch):
     持たないため doctype 対象外＝確定値は 0（pre-invalidate 呼び出しは doc_count=None のまま）。
     """
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 1, "chunks": 1})
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
 
     res = worker.run("w")
@@ -145,7 +145,7 @@ def test_both_succeed_stays_auto_published(_stub_pipeline, monkeypatch):
 def test_es_index_error_dict_becomes_warn_flag(_stub_pipeline, monkeypatch):
     """index_world は主要な失敗（delete/create/bulk）を例外でなく error dict で返す＝それも warn 化する（監査#5 本丸）。"""
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 0, "chunks": 0,
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0,
                                                           "error": "bulk_failed"})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
 
@@ -159,7 +159,7 @@ def test_es_index_error_dict_becomes_warn_flag(_stub_pipeline, monkeypatch):
 def test_es_index_unavailable_does_not_warn(_stub_pipeline, monkeypatch):
     """ES 未起動/未導入（`available=False`・error キー無し）は意図的 no-op＝warn しない（誤警報回帰ガード）。"""
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": False, "indexed": 0, "chunks": 0})
+                        lambda world, content_sig=None, **kw: {"available": False, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
 
     res = worker.run("w")
@@ -180,7 +180,7 @@ def test_human_md_es_confirm_failure_becomes_warn_flag_not_silent_success(
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 1, "chunks": 1})
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
     monkeypatch.setattr(office_md, "confirm_human_md_es_sig", lambda wd, dmd: False)
 
@@ -203,7 +203,7 @@ def test_human_md_es_meta_confirm_failure_becomes_warn_flag(_stub_pipeline, monk
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 1, "chunks": 1})
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
     monkeypatch.setattr(office_md, "confirm_human_md_es_sig", lambda wd, dmd: True)
     monkeypatch.setattr(es_index, "confirm_human_md_meta", lambda world: False)

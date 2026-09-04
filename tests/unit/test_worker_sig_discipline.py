@@ -40,7 +40,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
     monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 0, "chunks": 0})
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
 
     @contextlib.contextmanager

@@ -422,10 +422,21 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
             e._sherpa_ingest_run_pending = pending
         raise
     extra = _office_flags(drep)
-    _progress("es_index")
+    _progress("es_index", done=0, total=None)
+    _last_es_progress_done = [None]
+
+    def _es_progress(done, total):
+        # `_office_progress` と同じ間引き（`_PROGRESS_FILE_INTERVAL` 件ごと・先頭/末尾は必ず書く）。
+        # es_index 側は既に doc グループ（flush）単位で呼ばれるため、ここは二重の安全弁。
+        last = _last_es_progress_done[0]
+        if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
+            _last_es_progress_done[0] = done
+            _progress("es_index", done=done, total=total)
+
     # ES/reconcile は best-effort だが握りつぶさず flag 化＝半壊状態の可視化（監査#5）。取り込み自体は成功扱いのまま。
     try:
-        esr = es_index.index_world(world, content_sig=world_signature(world))   # ES 全文索引（best-effort・署名で鮮度管理）
+        esr = es_index.index_world(world, content_sig=world_signature(world),
+                                   progress=_es_progress)   # ES 全文索引（best-effort・署名で鮮度管理・EMBED-3′: doc単位進捗）
         if esr.get("error"):                                # delete/create/bulk 失敗は例外でなく error dict（available=False の未接続は warn しない）
             extra.append({"doc": None, "action": "warn", "reason": f"es_index_failed:{esr['error']}"})
         elif esr.get("available") is True:

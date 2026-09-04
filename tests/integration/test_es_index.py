@@ -49,6 +49,30 @@ def test_es_roundtrip_if_available():
     assert all(h["doc_id"].startswith("5期") for h in s2)
 
 
+def test_index_world_progress_callback():
+    """`progress`（省略可）は Pass2 が文書グループを flush するたび `(done_docs, total_docs)`
+    で呼ばれる（実環境で最長段の done/total を UI 進捗へ出す配線・`ingest/worker.py:_es_progress`
+    が使う契約）。`total` は毎回同じ値（対象文書一覧の長さ・スキップされた文書も含む）・`done` は
+    単調非減少で最終呼び出しの `done == r["indexed"]`（実際に索引した文書数）。`progress=None`
+    （既定）は他の既存テストが引き続き検証する通常経路のまま（このテストは新規引数の追加分だけを見る）。
+    """
+    if not es.available():
+        pytest.skip("ES 未起動")
+    from _world_registry import register_test_world
+    register_test_world(V)
+    calls = []
+    r = es.index_world(V, progress=lambda done, total: calls.append((done, total)))
+    assert r["available"] and r["indexed"] > 0
+    assert calls, "文書がある world なら progress が最低1回は呼ばれる"
+    totals = {t for _, t in calls}
+    assert len(totals) == 1                                 # total は呼び出し間で一貫している
+    total = totals.pop()
+    assert total >= r["indexed"]                            # total は対象一覧の長さ（スキップ分を含みうる）
+    dones = [d for d, _ in calls]
+    assert dones == sorted(dones)                           # 単調非減少
+    assert dones[-1] == r["indexed"]                         # 最終呼び出しは実際に索引した件数と一致
+
+
 def test_vector_hybrid_stubbed():
     """ベクトル（dense_vector）索引＋ハイブリッド検索の配線を**スタブ埋め込み**で検証（実 API なし）。"""
     if not es.available():

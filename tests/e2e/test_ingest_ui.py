@@ -883,6 +883,42 @@ def test_reconvert_button_calls_reconvert_endpoint_with_rel(page, web_base_url):
     assert reconvert_bodies == [{"rel": "旧料金表.xls"}]
 
 
+def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
+    """ING-3b（利用者報告 2026-09-04）: 登録ボタン（`pickbtn`）は、`setIngestBusy` が止める行ボタン
+    （refresh/rag-rules/del）と違って world_id に紐付かず対象外だった——`worlds.register` は登録処理
+    全体（多くの場合 es_index 段を含み数時間かかりうる）をグローバル advisory lock の下で行うため、
+    実行中に別の登録を投げると新規リクエストが lock 待ちで固まって見える。`loadStat` が集計する
+    実行中 world 集合が1件でもあれば無効化し、平文の理由（`title`）を添える。実行中でなくなれば
+    再び有効化される。
+
+    w1 は既に登録済み（`WORLD`）のため `regcard`（`pickbtn` を含む）自体は非表示だが、`pickbtn` の
+    `disabled`/`title` は表示状態と独立に検証できる（要素は DOM に残ったまま）。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+
+    def handle_running(route):
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            **WORLD_STATUS_RESP,
+            "running_progress": {"stage": "es_index", "stage_label": "全文索引に登録し、ベクトル化中",
+                                 "done": 3, "total": 10, "updated_at": "2026-09-04T00:00:00+00:00"},
+        }))
+    page.route("**/worlds/w1/status", handle_running)
+
+    page.goto(f"{web_base_url}/ingest.html")
+
+    pickbtn = page.locator("#pickbtn")
+    expect(pickbtn).to_be_disabled()
+    expect(pickbtn).to_have_attribute("title", "取り込みの実行中は登録できません")
+
+    page.route("**/worlds/w1/status", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(WORLD_STATUS_RESP)))
+    page.reload()
+
+    expect(pickbtn).to_be_enabled()
+
 
 # ソース正典化（`docs/proposals/2026-09-04-グラフのソース正典化.md`・S3）: 「グラフを生成」ボタン
 # （`data-extract`）・`extractWorld()`・`isGraphExtractFailure`（llm_unavailable/llm_error 案内）は

@@ -323,6 +323,21 @@ function setIngestBusy(world_id, busy) {
     .forEach((b) => { b.disabled = busy; });
 }
 
+// ING-3b（利用者報告 2026-09-04）: 登録ボタン（`pickbtn`）は上の行ボタンと違い world_id に
+// 紐付かない（登録前は世界がまだ無い）ため、`loadStat` が集計した「実行中の world_id 集合」で
+// 管理する——`worlds.register` は登録処理全体（多くの場合 es_index 段を含み数時間かかりうる）を
+// グローバル advisory lock の下で行うため、実行中に別の登録を投げると新規リクエストが完了まで
+// ブロックされてしまう（サーバ側で弾かれず「固まって見える」）。Set のまま（world 単位で複数を
+// 素朴に集計するだけ）にしておき、現行の単一 world 運用が将来複数に広がっても書き直し不要にする。
+const _runningWorldIds = new Set();
+function _updatePickbtnState() {
+  const b = $('pickbtn');
+  if (!b) return;
+  const busy = _runningWorldIds.size > 0;
+  b.disabled = busy;
+  b.title = busy ? '取り込みの実行中は登録できません' : '';
+}
+
 async function loadStat(world_id) {                   // 各行の状況を非同期で表示（実行中は自己ポーリング）
   const el = document.querySelector(`[data-stat="${world_id}"]`);
   if (!el) return;
@@ -331,9 +346,13 @@ async function loadStat(world_id) {                   // 各行の状況を非�
     el.innerHTML = summaryNote(s, world_id);
     const running = !!s.running_progress;
     setIngestBusy(world_id, running);
+    if (running) _runningWorldIds.add(world_id); else _runningWorldIds.delete(world_id);
+    _updatePickbtnState();
     if (running) setTimeout(() => loadStat(world_id), 3000);   // 実行中の間だけ数秒間隔で追跡
   } catch (e) {
     if (e && e.status === 404) {          // 削除完了＝world 行自体が消えた（一覧側の表示を戻す）
+      _runningWorldIds.delete(world_id);
+      _updatePickbtnState();
       reloadAll();
       return;
     }

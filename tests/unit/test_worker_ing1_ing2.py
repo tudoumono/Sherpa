@@ -93,7 +93,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
     monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
-                        lambda world, content_sig=None: {"available": True, "indexed": 0, "chunks": 0})
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
 
     @contextlib.contextmanager
@@ -156,6 +156,32 @@ def test_run_locked_scan_report_computation_failure_confirms_sig_without_report(
     confirm_calls = [c for c in _stub_pipeline["set_world_sig"] if c["sig"] == "sig"]
     assert len(confirm_calls) == 1
     assert confirm_calls[0]["scan_report"] is None
+
+
+def test_run_locked_wires_es_index_progress_to_ingest_run_progress(monkeypatch, _stub_pipeline):
+    """`es_index.index_world` へ渡す `progress` コールバック（EMBED-3′・利用者報告 2026-09-04:
+    最長段で done/total が数時間動かない問題への対処）が `_progress("es_index", done, total)` 経由で
+    `store.update_ingest_run_progress` まで届く。`index_world` スタブが受け取った `progress` を実際に
+    呼び出して配線を検証する（実 ES 不要）。開始時の `done=0/total=None` に続き、コールバックの
+    2回（間引きの安全弁は `done==0`／`done==total` を必ず書く契約なのでどちらも通る）が記録される。
+    """
+    progress_calls = []
+
+    def _fake_update_progress(run_id, progress):
+        progress_calls.append(progress)
+    monkeypatch.setattr(store, "update_ingest_run_progress", _fake_update_progress)
+
+    def _fake_index_world(world, content_sig=None, progress=None, **kw):
+        if progress is not None:
+            progress(3, 10)
+            progress(10, 10)
+        return {"available": True, "indexed": 10, "chunks": 10}
+    monkeypatch.setattr(es_index, "index_world", _fake_index_world)
+
+    res = worker.run("w")
+    assert res["status"] == "auto_published"
+    es_stage_calls = [p for p in progress_calls if p.get("stage") == "es_index"]
+    assert [(p["done"], p["total"]) for p in es_stage_calls] == [(0, None), (3, 10), (10, 10)]
 
 
 def test_run_locked_sig_confirm_write_failure_propagates(monkeypatch, _stub_pipeline):

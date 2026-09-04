@@ -41,7 +41,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(corpus_docs, "scan_report", lambda world: {})
     monkeypatch.setattr(store, "set_scan_report", lambda world, report: None)
     monkeypatch.setattr("sherpa.es_index.index_world",
-                        lambda world, content_sig=None: {"available": None})
+                        lambda world, content_sig=None, **kw: {"available": None})
     monkeypatch.setattr("sherpa.reconcile.reconcile_derivatives", lambda reflect=True: None)
 
     def _fake_start_ingest_run(world, **kw):

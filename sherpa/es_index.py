@@ -20,6 +20,7 @@ import re
 import shutil
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 from . import corpus_docs, doc_text, embeddings, json_io, scope_infer, worlds
@@ -1175,7 +1176,8 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
     return sender.send_group(ids, bodies, vec_by_idx)
 
 
-def index_world(world: str, settings: dict | None = None, content_sig: str | None = None) -> dict:
+def index_world(world: str, settings: dict | None = None, content_sig: str | None = None,
+                progress: Callable[[int, int], None] | None = None) -> dict:
     """world を**クリーン再索引**（delete→create→bulk）。埋め込み設定があればベクトルも付与（kNN 用）。
 
     失敗は古い索引を残さず error を返す（RV Med）。埋め込みを一度も選んでいない構成（BM25 のみで
@@ -1231,6 +1233,13 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     1つの dict へロードしない）。剪定（現存チャンクだけへ縮める）は Pass1 が成功した直後
     （ES 操作より前）に `_prune_embed_cache()` で1回だけ行う——`_embed_cached()` は複数回
     呼ばれるためもう自前で剪定しない（`_embed_cached` docstring 参照）。
+
+    `progress`（省略可）: Pass2 が文書グループを flush するたび `progress(done_docs, total_docs)`
+    を呼ぶ（`total_docs` は Pass1/Pass2 が共有する `docs` リストの長さ＝厳密な事前カウントの
+    ための追加走査はしない）。実環境（数時間かかる最長段）で最長時間 done/total が動かない
+    まま止まって見える問題への対処（office_md 段の `_office_progress` と同じ役割）。呼び出し
+    頻度の間引きは呼び出し元（`ingest/worker.py` の `_progress`）の責務——ここでは flush 単位
+    （`_EMBED_FLUSH_CHUNKS` チャンクごと）でそのまま呼ぶ。
     """
     if not available():
         return {"available": False, "indexed": 0, "chunks": 0}
@@ -1248,6 +1257,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     derived = worlds.derived_rag_dir(world) if use_rag else None   # RAG 正本層（§8.1 三階層）
     rag_exts = _rag_chunk_source_exts() if use_rag else frozenset()
     docs = corpus_docs.world_documents(world, include_rag=True) if use_rag else corpus_docs.world_documents(world)
+    total_docs = len(docs)                             # 進捗表示の total（既に materialize 済みの一覧の長さ・追加走査なし）
     # I2（2026-09-05）: 重要度は world 全体を1回だけ解決し（`res_map`）、各文書のチャンク組み立て
     # （`_doc_chunk_bundle`）へ使い回す。`world_documents()` 呼び出しは既存テスト（`world_documents`
     # を単一引数 `lambda w: docs` で差し替える広範な既存スタブ群）と互換な形（`root=` を渡さない）
@@ -1375,8 +1385,15 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
             if not _flush_doc_group(sender, world, g_ids, g_bodies, g_texts, g_no_embed, ec, embed_feature_applies):
                 break
             g_ids, g_bodies, g_texts, g_no_embed = [], [], [], []
+            if progress is not None:
+                progress(n_docs, total_docs)
     if not sender.failed and g_ids:
         _flush_doc_group(sender, world, g_ids, g_bodies, g_texts, g_no_embed, ec, embed_feature_applies)
+    if progress is not None:
+        # ループ末尾の leftover が0件（直前の mid-loop flush でちょうど割り切れた／末尾が
+        # 全てスキップ/0チャンク文書だった）場合でも最終呼び出しを保証する（`done == total`
+        # を必ず1回は報告する契約・上の mid-loop 呼び出しに畳み込まず独立させる）。
+        progress(n_docs, total_docs)
 
     rag_report = {}
     if use_rag:                                        # OFF はキー自体を返さない（戻り値の形も完全不変）
