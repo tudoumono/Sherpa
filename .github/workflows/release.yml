@@ -1,0 +1,40 @@
+name: release
+
+# タグ（v*）を push したら配布物 tarball を作り、GitHub Release に添付する。
+#   例:  git tag v0.1.0 && git push origin v0.1.0
+#
+# CI テストゲート（test.yml）は 2026-09-02 に撤去（ユーザー裁定）——ストア無し環境で恒常的に
+# failure（直近100 push 全て赤）となり形骸化していたため。品質ゲートはローカルの
+# scripts/gate-lane.sh（実ストア込み）＋レーンごとの RV 運用が担う。
+on:
+  push:
+    tags:
+      - 'v*'
+
+# RV MEDIUM（2026-07-15）: workflow top-level の permissions は全 job（reusable の test 含む）に
+# 継承される。テスト実行（pip install / pytest）に contents: write を持たせないよう top-level は
+# read に落とし、write は Release 作成する release job だけに付ける。
+permissions:
+  contents: read
+
+jobs:
+
+  release:
+    permissions:
+      contents: write    # Release 作成＋アセット添付に必要（この job のみ）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe --tags のためタグ/履歴を取得
+
+      - name: Build distribution tarball (make dist)
+        run: make dist     # dist/sherpa-<tag>.tar.gz と .sha256 を生成（fixtures/tests/mockups 非同梱）
+
+      - name: Create GitHub Release and attach assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sherpa-*.tar.gz
+            dist/sherpa-*.tar.gz.sha256
+          generate_release_notes: true

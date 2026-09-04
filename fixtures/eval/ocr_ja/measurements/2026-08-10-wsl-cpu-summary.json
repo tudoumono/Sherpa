@@ -1,0 +1,69 @@
+{
+  "schema": "sherpa-ocr-engine-measurement-summary-v1",
+  "not_an_oracle": true,
+  "source_result": {
+    "local_path": "data/eval-results/ocr-engine-poc/2026-08-10-wsl-cpu.json",
+    "sha256": "46517befbbf3a72a981371e8833bc142efe9af176fd357f471ed5d9ddd6a476e"
+  },
+  "oracle_sha256": "456e10107b0a4198de465f6f091c27fbd9e14206dae754b9f3ba99858e3c3624",
+  "measured_at": "2026-08-09T16:21:40Z",
+  "environment": {
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "cpu": "Intel(R) Core(TM) i7-4790K CPU @ 4.00GHz",
+    "logical_cpu_count": 8,
+    "python": "3.12.3",
+    "gpu_used": false
+  },
+  "engines": {
+    "tesseract": {
+      "version": "5.3.4",
+      "languages": "jpn+eng",
+      "page_segmentation_mode": 11,
+      "input_scale": 1.0,
+      "summary": {
+        "term_recall": {"passed": 35, "total": 65, "rate": 0.538462},
+        "region_checks": {"passed": 7, "total": 20},
+        "macro_character_error_rate": 0.507113,
+        "elapsed_seconds": 1.296
+      },
+      "cases": {
+        "office_screen": {"term_recall": "8/21", "character_error_rate": 0.485981, "elapsed_seconds": 0.331},
+        "scan_pdf": {"term_recall": "13/23", "character_error_rate": 0.225806, "elapsed_seconds": 0.356},
+        "hybrid_pdf": {"term_recall": "14/20", "character_error_rate": 0.316667, "elapsed_seconds": 0.404},
+        "deprecated_stamp": {"term_recall": "0/1", "character_error_rate": 1.0, "elapsed_seconds": 0.205}
+      },
+      "language_artifacts": {
+        "jpn.traineddata": "sha256:1f5de9236d2e85f5fdf4b3c500f2d4926f8d9449f28f5394472d9e8d83b91b4d",
+        "eng.traineddata": "sha256:7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2"
+      }
+    },
+    "paddleocr": {
+      "version": "3.7.0",
+      "paddlepaddle_version": "3.3.0",
+      "device": "cpu",
+      "enable_mkldnn": false,
+      "summary": {
+        "term_recall": {"passed": 61, "total": 65, "rate": 0.938462},
+        "region_checks": {"passed": 16, "total": 20},
+        "macro_character_error_rate": 0.010722,
+        "elapsed_seconds": 35.173
+      },
+      "cases": {
+        "office_screen": {"term_recall": "20/21", "character_error_rate": 0.018692, "elapsed_seconds": 9.342},
+        "scan_pdf": {"term_recall": "20/23", "character_error_rate": 0.024194, "elapsed_seconds": 12.897},
+        "hybrid_pdf": {"term_recall": "20/20", "character_error_rate": 0.0, "elapsed_seconds": 12.655},
+        "deprecated_stamp": {"term_recall": "1/1", "character_error_rate": 0.0, "elapsed_seconds": 0.279}
+      },
+      "models": {
+        "PP-OCRv6_medium_det": {"tree_sha256": "e59763535abdbba01740cb085a54d0b17e9a8a69cac76cbb46b90961d630e956", "logical_size_bytes": 62299797},
+        "PP-OCRv6_medium_rec": {"tree_sha256": "1de18a973c06afb905d8f74d01df5a891082ce543bc7c6e50c497a8d65a2b7f5", "logical_size_bytes": 76863995}
+      }
+    }
+  },
+  "tesseract_configuration_check": [
+    {"psm": 3, "input_scale": 1.0, "term_recall": "20/65", "rate": 0.307692},
+    {"psm": 6, "input_scale": 1.0, "term_recall": "24/65", "rate": 0.369231},
+    {"psm": 11, "input_scale": 1.0, "term_recall": "35/65", "rate": 0.538462},
+    {"psm": 11, "input_scale": 2.0, "term_recall": "25/65", "rate": 0.384615}
+  ]
+}

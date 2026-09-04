@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 資料</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  /* セクション見出し（上=資料フォルダ／下=取り込み状況） */
+  .section-title{font-size:15px;font-weight:700;color:var(--ink);margin:0}
+  .section-head{display:flex;align-items:flex-end;gap:14px;margin:28px 0 12px}
+  .section-head .spacer{flex:1}
+  /* 上: 資料フォルダ（登録・一覧）＝旧 ingest-new.html。
+     .field label / .field input / .mini 等は app.css のグローバル定義を上書きするため、
+     必ず .folders 配下に限定してスコープする（下の「取り込み状況」の .field/.mini に波及させない）。*/
+  .folders{max-width:920px}
+  .folders .field label{display:block;font-size:12px;color:var(--ink-3,#8b95a3);margin-bottom:3px}
+  .folders .field input{width:100%;min-width:0}
+  .folders .formrow{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:6px}
+  .folders .chosen{font-size:13px;color:var(--ink-3,#8b95a3);margin-top:6px;word-break:break-all}
+  .folders .chosen b{color:var(--ink,#1f2937)}
+  .folders .row{padding:10px 0;border-bottom:1px solid var(--border,#e3e6ea)}
+  .folders .rowmain{display:flex;align-items:center;gap:12px}
+  .folders .row .nm{font-weight:600}
+  .folders .row .pth{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-size:12px;color:var(--ink-3,#8b95a3)}
+  .folders .rowstat{margin-top:6px;font-size:12px;color:var(--ink-2,#5b6573)}
+  .folders .mini{font-size:12px;padding:4px 10px}
+  /* 差分チェック結果 */
+  .diffout:empty{display:none}
+  .diffout{margin-top:10px;border:1px solid var(--border,#e3e6ea);border-radius:10px;padding:10px 12px;background:var(--surface-2,#f1f3f5)}
+  .diffsum{font-size:13px;font-weight:600;color:var(--ink,#1f2937)}
+  .diffsum .pill{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:999px;margin-right:6px}
+  .diffsum .add{background:var(--ok-bg,#e9f7ef);color:var(--ok,#16a34a)}
+  .diffsum .chg{background:var(--warn-bg,#fdf3e7);color:var(--warn,#d97706)}
+  .diffsum .del{background:var(--danger-bg,#fdecec);color:var(--danger,#dc2626)}
+  .difflist{margin-top:8px;font-size:12px;color:var(--ink-2,#5b6573)}
+  .difflist b{color:var(--ink,#1f2937);font-weight:600}
+  .difflist ul{margin:3px 0 8px;padding-left:18px;font-family:var(--font-code,ui-monospace,Menlo,Consolas,monospace);font-size:11.5px}
+  /* フォルダ選択モーダル（テーマトークンに統一＝暗色でも文字が見える）*/
+  .ovl{position:fixed;inset:0;background:rgba(20,24,33,.45);display:none;align-items:center;justify-content:center;z-index:50}
+  .ovl.open{display:flex}
+  .picker{background:var(--surface,#fff);color:var(--ink,#1f2937);border-radius:14px;width:min(640px,92vw);max-height:80vh;
+    display:flex;flex-direction:column;box-shadow:var(--shadow-lg,0 12px 40px rgba(0,0,0,.25));overflow:hidden}
+  .picker .ph{padding:14px 16px;border-bottom:1px solid var(--border,#e3e6ea);display:flex;gap:10px;align-items:center}
+  .picker .cur{flex:1;min-width:0;font-size:12px;color:var(--ink-3,#8b95a3);word-break:break-all}
+  .picker .body{overflow:auto;padding:6px 8px}
+  .fitem{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--ink,#1f2937)}
+  .fitem:hover{background:var(--accent-weak,#ccfbf1)}
+  .picker .pf{padding:12px 16px;border-top:1px solid var(--border,#e3e6ea);display:flex;gap:10px;justify-content:flex-end}
+  /* admin ガード（W1・2026-09-03）: この画面のデータ（資料フォルダ一覧・取り込み状況・全文検索）は
+     全て admin 限定 API に依存する（`/worlds`・`/ingest/preview`・`/admin/es/search`）。admin-settings.html
+     / audit.html と同じ「非 admin は access-denied だけ見せる」パターン。 */
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:13px">管理者権限が必要です。</div>
+  </div>
+
+  <div id="main-content">
+  <div class="pagehead">
+    <div><h1>資料</h1>
+      <div class="sub">資料フォルダを登録して取り込み、どの資料が使えるかを確認します（フォルダ構成がそのまま範囲）。</div></div>
+    <div class="spacer"></div>
+    <a class="help-link" href="manual.html#register">この画面の使い方 →</a>
+  </div>
+
+  <!-- ===== 上: 資料フォルダ（登録・一覧）＝旧 ingest-new.html ===== -->
+  <div class="folders">
+    <div class="section-head"><div class="section-title">資料フォルダ</div></div>
+
+    <!-- 登録（未登録のときだけ表示） -->
+    <div class="card" id="regcard" hidden>
+      <div class="card-head">資料フォルダを登録</div>
+      <div class="muted" style="font-size:13px;margin-bottom:8px">
+        Windows のフォルダを指定すると、その中身をそのまま検索・分析できるようになります。
+        <b>ファイルの追加・編集・削除は今までどおり Windows のエクスプローラーで</b>行ってください
+        （ここでフォルダを作ったりアップロードはしません。変更は「更新」か自動チェックで反映）。
+        登録できるフォルダは<b>1つ</b>です。</div>
+      <div class="formrow">
+        <button class="btn-ghost" id="pickbtn">📁 フォルダを選ぶ…</button>
+        <span class="field" style="flex:1;min-width:200px"><label>表示名（任意・画面での呼び名）</label>
+          <input id="label" placeholder="未入力ならフォルダ名（例: 4期更改）"></span>
+        <button class="btn-ghost" id="diffbtn" disabled>中身を確認</button>
+        <button class="btn-primary" id="regbtn" disabled>このフォルダを登録</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:2px">
+        ※「中身を確認」は<b>登録せずに</b>何件取り込まれるかを見るだけです。表示名は画面での見た目だけで中身は変わりません。</div>
+      <div class="chosen" id="chosen">選択中のフォルダ: <b>（未選択）</b></div>
+      <div class="note" id="regmsg"></div>
+      <div class="diffout" id="diffout"></div>
+    </div>
+
+    <!-- 登録中のフォルダ（登録済みのときだけ表示） -->
+    <div class="card" id="currentcard" style="margin-top:16px" hidden>
+      <div class="card-head">登録中の資料フォルダ</div>
+      <div id="list"><div class="muted">読み込み中…</div></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">
+        ※「更新」は変更があったファイルだけを取り込み直します。「削除」は Sherpa の
+        <b>検索用データ（索引・テキスト化した写し・関係グラフ）だけ</b>を消します。
+        元の Windows フォルダ・ファイルは一切消えません。</div>
+      <div class="note" id="listmsg"></div>
+      <div class="diffout" id="rowdiff"></div>
+    </div>
+  </div>
+
+  <!-- ===== 下: 取り込み状況（文書一覧・全文検索）＝旧 ingest.html ===== -->
+  <div class="section-head">
+    <div><div class="section-title">取り込み状況</div>
+      <div class="sub" style="font-size:12px">どの資料が使えるかを確認し、失敗したものをやり直します</div>
+      <div class="sub" id="curpath" style="font-size:12px"></div>
+      <a class="help-link" href="graph.html">ナレッジグラフで見る →</a></div>
+    <div class="spacer"></div>
+    <span class="field"><label>資料フォルダ</label><select id="version"><option value="v1">v1</option></select></span>
+    <button class="btn-ghost" id="detailbtn" hidden>詳細（管理）</button>
+  </div>
+
+  <div class="ingestwrap">
+    <!-- 副導線: フォルダツリー（構造把握＋範囲選択） -->
+    <aside class="treeside">
+      <div class="treehead">範囲</div>
+      <div id="impdiag" class="impdiag" hidden></div>
+      <div id="tree"></div>
+    </aside>
+
+    <!-- 主: 検索＋状態フィルタ（検索ファースト・2TB前提） -->
+    <div class="ingestmain">
+      <div class="toolbar">
+        <span class="field" style="flex:1;max-width:320px"><span>🔎</span>
+          <input id="q" placeholder="資料名で検索" style="min-width:0;width:100%"></span>
+        <span class="field"><label>種類</label><select id="type"><option value="">すべて</option></select></span>
+        <span class="lbl">状態:</span>
+        <button class="filterchip on" data-state="all" onclick="setState(this)">すべて</button>
+        <button class="filterchip" data-state="ready" onclick="setState(this)">✓ 使えます</button>
+        <button class="filterchip" data-state="processing" onclick="setState(this)">⏳ 処理中</button>
+        <button class="filterchip" data-state="failed" onclick="setState(this)">⚠ 失敗</button>
+        <span class="spacer"></span>
+        <span class="lbl" id="count"></span>
+      </div>
+      <div class="card es-card">
+        <div class="card-head"><span class="ico">🔎</span><div><div class="title">全文検索</div>
+          <div class="sub" id="es-scope">現在の資料フォルダ全体</div></div></div>
+        <div class="es-searchbar">
+          <span class="field" style="flex:1"><span>🔎</span>
+            <input id="esq" placeholder="共有資料を全文検索" style="min-width:0;width:100%"></span>
+          <button class="btn-primary" id="esbtn">検索</button>
+        </div>
+        <div id="eshits" class="es-results"><div class="muted">検索語を入力してください</div></div>
+      </div>
+      <div class="card" style="box-shadow:none">
+        <table class="grid">
+          <thead><tr><th>名前</th><th style="width:96px">種類</th><th style="width:150px">状態</th>
+            <th style="width:160px">場所（範囲）</th><th style="width:90px">重要度</th><th style="width:170px"></th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div class="note">✓ 使えます＝検索・影響分析の対象 ／ ⏳ 処理中 ／ ⚠ 失敗＝理由を見て「やり直す」。
+        左の<b>範囲</b>（フォルダ）で絞れます（どの階層でも部分木を1範囲として検索）。共有資料は閲覧のみ。</div>
+    </div>
+  </div>
+  </div>
+</div>
+
+<!-- 詳細（管理）: A17 抽出プレビュー（関係・廃止ラベルの精度監査） -->
+<div class="overlay" id="overlay">
+  <div class="rv">
+    <div class="rv-h">
+      <div><div class="hl">取り込み内容の詳細（管理）</div>
+        <div class="sub">関係・廃止ラベルの精度監査</div></div>
+      <div class="spacer"></div>
+      <button class="closebtn" onclick="closePrev()">✕</button>
+    </div>
+    <div class="rv-bar" id="pv-bar"></div>
+    <div class="rv-cols">
+      <div class="col left">
+        <h4>抽出された要素</h4><div id="pv-ents"></div>
+      </div>
+      <div class="col"><h4>関係</h4><div id="pv-rels"></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- フォルダ選択モーダル（資料フォルダ登録用） -->
+<div class="ovl" id="ovl">
+  <div class="picker">
+    <div class="ph">
+      <button class="btn-ghost mini" id="upbtn">↑ 上へ</button>
+      <span class="cur" id="pickcur">/mnt</span>
+    </div>
+    <div class="body" id="pbody"></div>
+    <div class="pf">
+      <button class="btn-ghost" id="pcancel">閉じる</button>
+      <button class="btn-primary" id="pchoose">このフォルダにする</button>
+    </div>
+  </div>
+</div>
+
+<script src="ingest.js"></script>
+</body>
+</html>

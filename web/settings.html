@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 個人設定</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:none;margin:0}
+  .frm label{display:block;font-size:13px;font-weight:600;color:var(--ink,#1f2937);margin:14px 0 4px}
+  .frm input,.frm select,.frm textarea{width:100%;box-sizing:border-box;font-family:inherit;font-size:14px;
+    padding:8px 10px;border:1px solid var(--border,#e3e6ea);border-radius:8px;
+    background:var(--surface,#fff);color:var(--ink,#1f2937)}
+  .frm textarea{resize:vertical}
+  .hint{font-size:12.5px;color:var(--ink-2,#5b6573);margin-top:4px}
+  .grp{border:1px solid var(--border,#e3e6ea);border-radius:10px;padding:6px 14px 14px;margin-top:14px}
+  .grp h3{font-size:13px;margin:12px 0 0;color:var(--ink-2,#5b6573)}
+  .testrow{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+  .tres{font-size:12.5px} .ok{color:var(--ok,#16a34a)} .danger{color:var(--danger,#dc2626)} .muted{color:var(--ink-3,#8b95a3)}
+  .linkbtn{background:none;border:none;color:var(--accent-ink,#0f766e);cursor:pointer;font-size:12px;padding:0;margin-left:8px}
+  .mini{height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);font-size:12.5px;color:var(--ink-2);cursor:pointer}
+  /* 保存アクションバー: ページ下端に固定（スクロール位置に関わらず常に見える）。
+     控えめな装飾（背景ぼかし＋上境界線のみ）で両テーマに馴染ませる。settings.js は #save/#msg の
+     id のみ参照するため、ここでの配置変更はロジックに影響しない。 */
+  .action-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;
+    display:flex;justify-content:center;padding:12px 24px;
+    border-top:1px solid var(--border);
+    background:color-mix(in srgb,var(--surface) 88%,transparent);
+    backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+  .action-bar-inner{max-width:1052px;width:100%;display:flex;gap:10px;align-items:center}
+  /* 固定バーの高さぶん、最後のカードが隠れないように余白を確保。 */
+  .wrap2.frm{padding-bottom:76px}
+  /* 外部連携（自分の API キー）カード */
+  .ek-table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
+  .ek-table th,.ek-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
+  .ek-table th{color:var(--ink-3);font-weight:600;font-size:11.5px}
+  .ek-table td.ek-muted{color:var(--ink-3)}
+  .ek-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px}
+  .ek-badge.ek-active{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .ek-badge.ek-revoked,.ek-badge.ek-expired{background:color-mix(in srgb,var(--ink-3) 16%,transparent);color:var(--ink-3)}
+  .mini.ek-danger{color:var(--danger);border-color:var(--danger)}
+  #ek-issue-form label{font-size:12px;color:var(--ink-3);display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+  #ek-issue-form input{padding:6px 8px;font-size:13px;font-family:inherit;
+    border:1px solid var(--border);border-radius:var(--radius,8px);background:var(--surface);color:var(--ink)}
+  #ek-reveal-key{font-size:13px;word-break:break-all;padding:10px;border:1px solid var(--border);
+    border-radius:var(--radius,8px);background:var(--surface-2);margin:10px 0}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div class="pagehead">
+    <div><h1>個人設定</h1>
+      <div class="sub">自分にだけ効く設定です。チャットに使う AI・許可されている場合は自分の API キー、
+        回答方針、表示の好みを設定します。API キーは画面に再表示しません。
+        使えるモデルの一覧や機能ごとの AI の割り当ては管理者の「システム管理」で管理します。</div></div>
+    <div class="spacer"></div>
+    <a class="help-link" href="manual.html#settings">この画面の使い方 →</a>
+  </div>
+
+  <div class="wrap2 frm">
+    <!-- チャットに使う AI（既定）。チャット画面のメニュー（🧠バッジ）から変えても、この既定が
+         書き換わる（個人設定という単一の真実源・会話単位の一時的な上書きは無い）。 -->
+    <div class="card">
+      <div class="card-head">チャットに使う AI（既定）</div>
+      <div class="hint" style="margin-bottom:6px">チャットの回答に使う頭脳の既定です。
+        チャット画面のメニューからも変更できます（この既定そのものが書き換わります）。</div>
+      <label>実行構成</label>
+      <!-- 選択肢はサーバの constructs_available から描画する（settings.js）。この環境で使えるものだけが出る。 -->
+      <select id="agent"></select>
+      <div class="hint" id="agent-hint"></div>
+      <div class="hint">許可されている場合は、自分の API キーを下の「API キー」で設定できます。</div>
+    </div>
+
+    <!-- 下調べ（資料の検索）に使う AI ＝検索アシスタント（2026-08-15・sherpa/search_helper.py）。
+         旧「サブエージェント・プロファイル」を1設定へ置き換えたもの。利用者ごとの設定。 -->
+    <div class="card" id="search-helper-card" style="margin-top:16px">
+      <div class="card-head">下調べ（資料の検索）に使う AI</div>
+      <div class="hint" style="margin-bottom:6px">資料をたくさん読む「下調べ」だけを安い AI に任せ、
+        <b>最終的な回答は上で選んだ AI が作ります</b>（費用の節約）。
+        資料調査は読む量が多く、費用の大半がここで発生します。
+        <b>「OpenAI」を選んでいるときだけ働きます</b>（Codex は自分で調べるため対象外）。</div>
+      <label>使う AI</label>
+      <select id="search_helper">
+        <option value="">使わない（上で選んだ AI が自分で調べる）</option>
+        <option value="ollama">ローカル（Ollama）— 無料</option>
+        <option value="openai">OpenAI の低コストモデル</option>
+      </select>
+      <div class="hint">モデルは管理者が設定した既定を使います。うまく調べられなかった時は、
+        黙って他の方法に切り替えず、エラーとして知らせます。案内に従って設定を見直すか、
+        「使わない」に変更してください。</div>
+      <div class="hint danger" id="search-helper-legacy-note" hidden></div>
+    </div>
+
+    <!-- API キー（あなた専用・許可時のみ入力可） -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-head">API キー（あなた専用）</div>
+      <div class="hint" style="margin-bottom:6px">管理者が許可している場合、現在選ばれているクラウド AI について
+        自分専用のキーを入力できます。使うモデルは管理者の「使えるモデル」設定に従います。</div>
+
+      <div class="grp" id="grp-openai">
+        <h3>OpenAI</h3>
+        <div id="okey-row">
+          <label>API キー</label>
+          <input id="okey" type="password" placeholder="未設定（sk-...）" autocomplete="off">
+        </div>
+        <div class="hint" id="okey-disabled-note" hidden>キーは管理者が設定します（このパソコン・利用者ごとの入力はできません）。</div>
+        <!-- S3（2026-08-18-AzureOpenAI対応）: 接続先が Azure OpenAI／その他 OpenAI 互換のときだけ
+             settings.js（renderOpenAIEndpointNote）が表示する。既定（OpenAI 直結）では隠したまま。 -->
+        <div class="hint" id="openai-endpoint-note" hidden></div>
+        <div class="hint">本文テキストのみ送信（ファイルは送りません）。</div>
+        <div class="testrow"><button class="mini" data-test="openai">接続テスト</button><span class="tres muted" id="t-openai"></span></div>
+      </div>
+
+      <div class="grp" id="grp-gemini">
+        <h3>Gemini（Google）</h3>
+        <div id="gkey-row">
+          <label>API キー</label>
+          <input id="gkey" type="password" placeholder="未設定（AIza...）" autocomplete="off">
+        </div>
+        <div class="hint" id="gkey-disabled-note" hidden>キーは管理者が設定します（このパソコン・利用者ごとの入力はできません）。</div>
+        <div class="hint">キーは <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> で取得。本文テキストのみ送信。</div>
+        <div class="testrow"><button class="mini" data-test="gemini">接続テスト</button><span class="tres muted" id="t-gemini"></span></div>
+      </div>
+
+      <div class="grp" id="grp-bedrock">
+        <h3>AWS Bedrock (Claude)</h3>
+        <div id="bkey-row">
+          <label>Bedrock API キー</label>
+          <input id="bkey" type="password" placeholder="未設定（Bedrock コンソールで発行）" autocomplete="off">
+        </div>
+        <div class="hint" id="bkey-disabled-note" hidden>キーは管理者が設定します（このパソコン・利用者ごとの入力はできません）。</div>
+        <label>モデル</label>
+        <select id="bmodel">
+          <option value="jp.anthropic.claude-haiku-4-5-20251001-v1:0">Claude Haiku 4.5（JP 推論プロファイル・既定）</option>
+          <option value="global.anthropic.claude-haiku-4-5-20251001-v1:0">Claude Haiku 4.5（Global 推論プロファイル）</option>
+        </select>
+        <div class="testrow"><button class="mini" id="bmodel-fetch" type="button">利用可能なモデルを取得</button><span class="tres muted" id="bmodel-fetch-res"></span></div>
+        <div class="hint">リージョン: 東京固定・モデルは推論プロファイル経由です。Bedrock コンソール（Playground）で発行した
+          API キー（長期/短期）。未入力ならサーバ側 env（<code>AWS_BEARER_TOKEN_BEDROCK</code> など、または
+          AWS 認証情報）を使用。本文テキストのみ送信。「利用可能なモデルを取得」は保存済みのキーでアカウントが
+          実際に使えるモデルを確認します（未保存の入力中キーは対象外・先に保存してください）。
+          Bedrock はアカウントごとに使えるモデルが異なるため、他の AI と違い一覧を管理者が
+          一律には用意できません（このためモデル選択のみここに残っています）。</div>
+        <div class="testrow"><button class="mini" data-test="bedrock">接続テスト</button><span class="tres muted" id="t-bedrock"></span></div>
+
+        <!-- バッチ2・1番（2026-07-03）: 「利用可能なモデルを取得」（一覧取得＝control-plane 権限が
+             要る）が使えない構成向け。分かっているモデルIDを実際に1回叩いて検証してから追加する。 -->
+        <label for="bmodel-manual">モデルIDを直接追加</label>
+        <div class="testrow">
+          <input id="bmodel-manual" type="text" placeholder="例: jp.anthropic.claude-sonnet-4-6-20260101-v1:0" style="flex:1">
+          <button class="mini" id="bmodel-verify" type="button">検証して追加</button>
+        </div>
+        <span class="tres muted" id="bmodel-verify-res"></span>
+        <div class="hint">「利用可能なモデルを取得」が失敗する場合（一覧取得には接続テストと別の AWS 権限が
+          必要なことがあります）でも、モデルIDが分かっていれば個別に検証して選択肢に追加できます
+          （保存済みのキーで実際に1回だけ呼び出して確認・推測での追加はしません）。</div>
+      </div>
+
+      <div class="grp">
+        <h3>ローカル LLM（Ollama）</h3>
+        <label>接続先</label><select id="ourl"></select>
+        <div class="hint danger" id="ourl-warn" hidden></div>
+        <div class="hint" id="ourl-hint">管理者が許可した接続先から選びます。使うモデルは管理者の既定に従います。</div>
+        <div class="testrow"><button class="mini" data-test="ollama">接続テスト</button><span class="tres muted" id="t-ollama"></span></div>
+      </div>
+
+      <div class="grp">
+        <h3>Codex（チャット専用・grep して調べる）</h3>
+        <div class="hint">Web 検索はチャット画面の調べ方ブロック（参照する行）で会話ごとに切り替えます。管理者が許可し、頭脳が Codex（OpenAI 直結）のときだけ表示されます。</div>
+        <div class="hint">OpenAI 本家への接続は API キー不要（CLI の `codex login` で認証）。接続先が Azure OpenAI 等の OpenAI 互換エンドポイントのときは、上の「OpenAI」欄の API キーを使います（保存前の入力中の値でも接続テストでは使えます）。モデルは管理者の「使えるモデル」の設定に従い、思考の深さは環境設定の既定（通常は `low`）に従います（どちらも個人設定にはありません）。ナレッジ抽出には非対応（チャット用）。接続テストは通常 CLI の有無とログイン状態を確認しますが、接続先が Azure OpenAI 等のときは実際に1回接続して確認します。</div>
+        <div class="testrow"><button class="mini" data-test="codex">接続テスト</button><span class="tres muted" id="t-codex"></span></div>
+      </div>
+    </div>
+
+    <!-- チャットの回答方針 -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-head">チャットの回答方針（システムプロンプト）</div>
+      <label style="margin-top:6px">回答方針 <button class="linkbtn" id="sysdefault" type="button">既定に戻す</button></label>
+      <textarea id="sysprompt" rows="6" placeholder="空にすると追加の回答方針なし（モデル既定のまま）"></textarea>
+      <div class="hint">チャットの AI・モデルの切り替えはチャット画面の頭脳バッジから行えます。</div>
+    </div>
+
+    <!-- 利用者本人による API キー自己発行。管理者が「利用者のキー発行を許可する」を ON に
+         したときだけ表示する（個人キー許可トグルと同型の出し分け）。 -->
+    <div class="card" id="ext-keys-card" style="margin-top:16px" hidden>
+      <div class="card-head">外部連携（自分の API キー）</div>
+      <div class="hint" style="margin:8px 0 0">他のアプリからこの Sherpa の検索・変換を、あなた専用のキーで呼び出せます。
+        アクセスできる範囲はあなたの権限内に限られます。発行直後だけキー本体を表示します（以後は再表示できません）。</div>
+      <div id="ext-keys-list" style="margin-top:8px"><!-- JS が描画 --></div>
+      <div class="testrow">
+        <button class="mini" id="ext-key-issue-open" type="button">発行</button>
+      </div>
+    </div>
+
+    <!-- 開発者向け API 仕様書への導線（利用者も見れる・管理画面ヘッダのリンクとは別に個人設定にも置く）。 -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-head">Swagger 仕様書</div>
+      <div style="padding:14px">
+        <a class="btn-secondary" href="/docs" target="_blank" rel="noopener">Swagger UI（API仕様書）を開く</a>
+        <div class="hint">API キーや外部連携の設定ではありません。開発者が画面裏の HTTP API 仕様を確認するためのドキュメントです。</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- API キー発行モーダル（発行フォーム→成功時はプレーンキーの1回表示に差し替える） -->
+<div class="overlay" id="ek-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ek-modal-title">
+    <div class="modal-h"><span id="ek-modal-title">API キーを発行</span><span class="spacer"></span>
+      <button class="modal-close" id="ek-modal-close" type="button" aria-label="閉じる">✕</button></div>
+    <div class="modal-b">
+      <form id="ek-issue-form">
+        <label>ラベル（用途のメモ）
+          <input type="text" id="ek-label" maxlength="100" placeholder="例: 社内ツール連携" required></label>
+        <label>この日まで有効（任意・空欄で無期限）<input type="date" id="ek-expires"></label>
+        <label>1日あたりの呼び出し上限（任意・空欄で管理者の既定を適用）
+          <input type="number" id="ek-quota" min="1" step="1"></label>
+        <label>Webhook URL（任意・取り込み完了/失敗の通知先）
+          <input type="url" id="ek-webhook-url" maxlength="2048"
+                 placeholder="https://example.com/hooks/sherpa"></label>
+        <div class="hint">管理者が許可した宛先のみ設定できます（自分のパソコン＝localhost は常に使えます）。</div>
+      </form>
+      <div id="ek-reveal" hidden>
+        <div class="hint danger">このキーは今だけ表示されます。控えを保管してください（再表示はできません）。</div>
+        <div id="ek-reveal-key"></div>
+        <button class="mini" id="ek-copy" type="button">コピー</button>
+        <span class="tres muted" id="ek-copy-res"></span>
+        <div id="ek-reveal-webhook" hidden style="margin-top:10px">
+          <div class="hint danger">Webhook の署名検証用シークレットも今だけ表示されます（再表示はできません）。</div>
+          <div id="ek-reveal-webhook-secret"></div>
+          <button class="mini" id="ek-copy-webhook-secret" type="button">コピー</button>
+          <span class="tres muted" id="ek-copy-webhook-secret-res"></span>
+        </div>
+      </div>
+      <span class="tres danger" id="ek-issue-err"></span>
+    </div>
+    <div class="modal-f">
+      <button class="btn-ghost" id="ek-modal-cancel" type="button">キャンセル</button>
+      <button class="btn-primary" id="ek-modal-submit" type="button">発行</button>
+    </div>
+  </div>
+</div>
+
+<div class="action-bar">
+  <div class="action-bar-inner">
+    <button class="btn-primary" id="save">保存</button>
+    <span class="note" id="msg"></span>
+  </div>
+</div>
+
+<script src="settings.js"></script>
+</body>
+</html>

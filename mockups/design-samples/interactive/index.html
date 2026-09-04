@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<!--
+  Sherpa 操作感デモ — インタラクション一覧（自己完結・現行デザイン維持）
+  2026-07-02 決定「見た目は現行維持・改善はインタラクション」に基づく動くデモの入口。
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 操作感デモ 一覧</title>
+<style>
+  :root{
+    --accent:#0d9488; --accent-weak:#ccfbf1; --accent-ink:#0f766e;
+    --bg:#f6f7f9; --surface:#fff; --surface-2:#f1f3f5; --border:#e3e6ea;
+    --ink:#1f2937; --ink-2:#5b6573; --ink-3:#8b95a3;
+    --ok:#16a34a; --ok-bg:#e9f7ef; --warn:#d97706; --warn-bg:#fdf3e7;
+    --radius:12px;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+    --shadow-lg:0 10px 30px rgba(16,24,40,.18);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);line-height:1.7;
+    font-size:14px;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+  a{color:var(--accent-ink)}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 32px 72px}
+
+  .disclaimer{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;
+    color:var(--accent-ink);background:var(--accent-weak);border-radius:999px;padding:6px 15px;margin-bottom:20px}
+  h1{font-size:28px;font-weight:800;letter-spacing:.01em;margin:0 0 8px}
+  .lead{font-size:15px;color:var(--ink-2);max-width:760px;margin:0 0 6px}
+  .meta{font-size:12.5px;color:var(--ink-3);margin:0 0 26px}
+
+  .cta{display:inline-flex;align-items:center;gap:9px;text-decoration:none;font-weight:700;font-size:14px;
+    color:#fff;background:var(--accent);border-radius:12px;padding:13px 22px;box-shadow:var(--shadow-lg);margin-bottom:34px}
+  .cta:hover{filter:brightness(1.05)}
+  .cta small{font-weight:500;opacity:.85}
+
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+  .item{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:16px 18px;display:flex;gap:14px;transition:box-shadow .2s,transform .2s}
+  .item:hover{box-shadow:var(--shadow-lg);transform:translateY(-1px)}
+  .num{width:34px;height:34px;border-radius:9px;flex:0 0 auto;display:grid;place-items:center;
+    background:var(--accent-weak);color:var(--accent-ink);font-weight:800;font-size:15px}
+  .name{font-size:15px;font-weight:700;margin:2px 0 6px}
+  .see{font-size:12.5px;color:var(--ink-2)}
+  .try{font-size:12px;color:var(--ink-3);margin-top:7px;border-top:1px dashed var(--border);padding-top:7px}
+  .try b{color:var(--accent-ink);font-weight:600}
+
+  .foot{margin-top:34px;padding-top:20px;border-top:1px solid var(--border);font-size:12.5px;color:var(--ink-3);line-height:1.85}
+  .foot b{color:var(--ink-2)}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="disclaimer">✋ 操作感（インタラクション）改善のデモ・本番未反映（web/** には手を入れていません）</div>
+  <h1>Sherpa 操作感デモ — 現行デザイン維持・操作感改善</h1>
+  <p class="lead"><b>選定結果（2026-07-02）</b>：見た目は現行デザイン（<code>web/chat.html</code> ＋ <code>web/app.css</code>）のまま維持し、
+  改善は<b>インタラクション（操作感）</b>に集中する方針に決定。前回の視覚リスキン3案（<a href="../index.html">../variant-*</a>）は不採用です。
+  下の10項目は、現行チャット画面の見た目をそのままに「触って分かる操作感」を実装した動くデモです。</p>
+  <p class="meta">2026-07-02 作成 ・ ダブルクリックで開けます（インライン CSS/JS・外部依存なし・ネットワーク不要） ・
+  演出はソフト＆短時間（150〜300ms）／<code>prefers-reduced-motion</code> で自動的に無効化。</p>
+
+  <a class="cta" href="chat-interactive.html">▶ 統合デモを開く（chat-interactive.html）<small>10項目すべてが1画面で動きます</small></a>
+
+  <div class="grid">
+    <div class="item"><div class="num">1</div><div>
+      <div class="name">メッセージ hover アクション</div>
+      <div class="see">AI 回答にホバーすると「コピー／引用して質問／再実行」がふわりと出現。</div>
+      <div class="try">試し方：<b>AI の回答にマウスを乗せる</b> → コピー（クリップボード＋toast）、引用（入力欄に <code>&gt; 引用</code> 挿入）。</div>
+    </div></div>
+
+    <div class="item"><div class="num">2</div><div>
+      <div class="name">影響カードの展開/折りたたみ</div>
+      <div class="see">項目の「経路 ▾」で詳細（経路全体＋根拠の該当文）が滑らかに展開。経路チップが連動して点灯。</div>
+      <div class="try">試し方：<b>影響一覧の各行「経路 ▾」を押す</b> → height アニメで開閉・チップが順に現れる。</div>
+    </div></div>
+
+    <div class="item"><div class="num">3</div><div>
+      <div class="name">フィルタチップ</div>
+      <div class="see">サマリの「● 確実 6」「○ 要確認 7」がトグル。押すと一覧が絞り込まれ、表示件数が更新。</div>
+      <div class="try">試し方：<b>サマリのチップを押す</b> → 「全て / 確実 / 要確認」で切替、件数バッジと表示中件数が変わる。</div>
+    </div></div>
+
+    <div class="item"><div class="num">4</div><div>
+      <div class="name">出典ホバープレビュー</div>
+      <div class="see">出典フッターの各項目にホバーで、該当文スニペットがソフトな影のポップオーバーで（遅延150ms）。</div>
+      <div class="try">試し方：<b>出典の「📄 …」にマウスを乗せる</b>（少し待つ）→ クリックで「ダウンロードしました」toast。</div>
+    </div></div>
+
+    <div class="item"><div class="num">5</div><div>
+      <div class="name">ストリーミング再生</div>
+      <div class="see">思考の流れ（検索→グラフ探索→根拠整理が順に✓）→回答がトークン風に流れ→サマリ→カードが1枚ずつ。</div>
+      <div class="try">試し方：入力欄上の <b>「▶ ストリーミングを再生」</b> を押す（初期表示の一発表示との差が体感できる）。</div>
+    </div></div>
+
+    <div class="item"><div class="num">6</div><div>
+      <div class="name">スクロール追従ピル</div>
+      <div class="see">上へスクロール中に新着（再生中）があると右下に「↓ 最新へ」がソフトに出現。</div>
+      <div class="try">試し方：<b>再生中に会話を上へスクロール</b> → 右下のピルをクリックで滑らかに最下部へ。</div>
+    </div></div>
+
+    <div class="item"><div class="num">7</div><div>
+      <div class="name">入力欄の改善</div>
+      <div class="see">ファイルの D&D 受け皿（ドラッグ中に枠がハイライト）・チップ表示＋×削除・送信中スピナー・改行ヒント。</div>
+      <div class="try">試し方：<b>ファイルを入力欄にドラッグ</b>、または「📎 個人ファイルを追加」。送信で ↑ がスピナーに。</div>
+    </div></div>
+
+    <div class="item"><div class="num">8</div><div>
+      <div class="name">/ コマンドパレット</div>
+      <div class="see">入力欄で「/」を打つと定型質問（影響調査／障害調査／仕様確認）のポップアップ。</div>
+      <div class="try">試し方：<b>入力欄で <code>/</code> を1文字打つ</b> → ↑↓ で選択、Enter で挿入、Esc で閉じる。</div>
+    </div></div>
+
+    <div class="item"><div class="num">9</div><div>
+      <div class="name">スケルトンローディング</div>
+      <div class="see">初期表示時に会話部分が薄いシマーのスケルトン（約0.6秒）→ 内容がフェードイン。</div>
+      <div class="try">試し方：<b>ページを再読み込み</b>（F5）→ 冒頭のスケルトン → 実コンテンツへ。</div>
+    </div></div>
+
+    <div class="item"><div class="num">10</div><div>
+      <div class="name">状態ドットのリッチツールチップ</div>
+      <div class="see">右上の健全性ドットにホバーで「サービスは正常です・最終チェック 12:34」を styled tooltip で。</div>
+      <div class="try">試し方：<b>右上の緑のドットにマウスを乗せる</b>（title 属性でなく整形されたカード）。</div>
+    </div></div>
+  </div>
+
+  <div class="foot">
+    <b>この一覧の位置づけ：</b> 見た目は現行のまま（teal・角丸・ソフト影・●塗り＝確実／○白抜き＝要確認）。
+    追加したのは操作感だけです。各改善の狙い（解消するフラストレーション）と<b>本番実装時の対応箇所</b>
+    （<code>web/chat.js</code> のどの領域・SSE 連携の要否・既存の「思考の流れ」アニメとの関係）は
+    <a href="README.md"><b>README.md</b></a> の表を参照してください。<br>
+    コンテンツは前回サンプルと同一（消費税率の影響範囲・13件＝確実6/要確認7・経路チップ・出典3件）です。
+  </div>
+</div>
+</body>
+</html>

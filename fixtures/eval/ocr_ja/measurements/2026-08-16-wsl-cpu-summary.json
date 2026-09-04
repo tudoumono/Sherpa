@@ -1,0 +1,50 @@
+{
+ "schema": "sherpa-ocr-engine-measurement-summary-v1",
+ "measured_at": "2026-08-16T07:16:07Z",
+ "note": "merge/staged-integration へのOCR移植時の再実測。2026-08-10（feat/rag-gate）と同一モデル・同一結果であることの確認。model tree hash は取得メタデータ（.cache/）を除いて再ロックした値。",
+ "production_data_used": false,
+ "oracle": "fixtures/eval/ocr_ja/oracle.json",
+ "oracle_sha256": "456e10107b0a4198de465f6f091c27fbd9e14206dae754b9f3ba99858e3c3624",
+ "environment": {
+  "cpu": "x86_64",
+  "machine": "x86_64",
+  "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python": "3.12.3"
+ },
+ "engine": {
+  "device": "cpu",
+  "document_orientation": false,
+  "enable_mkldnn": false,
+  "engine": "paddleocr",
+  "models": {
+   "PP-OCRv6_medium_det": {
+    "file_count": 18,
+    "sha256": "44612911ea59e11aaf195ccb307d346a2b550f3839ba9f1460d844b9947f23d9",
+    "size_bytes": 62299796
+   },
+   "PP-OCRv6_medium_rec": {
+    "file_count": 18,
+    "sha256": "805057b3c09dd41551dbaa50cbccb597e737fe750b4e3b6f3c1abf899d718cfe",
+    "size_bytes": 76863995
+   }
+  },
+  "paddleocr_version": "3.7.0",
+  "paddlepaddle_version": "3.3.0",
+  "textline_orientation": false
+ },
+ "summary": {
+  "case_count": 4,
+  "elapsed_seconds": 33.355,
+  "macro_character_error_rate": 0.010722,
+  "region_checks": {
+   "passed": 16,
+   "total": 20
+  },
+  "term_recall": {
+   "passed": 61,
+   "rate": 0.938462,
+   "total": 65
+  }
+ },
+ "reproduces_measurement": "2026-08-10-wsl-cpu-summary.json"
+}

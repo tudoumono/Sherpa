@@ -1,0 +1,74 @@
+{
+  "schema": "sherpa-ocr-ja-oracle-v1",
+  "description": "日本語Office/PDFの画像内文字をOCRエンジン間で比較する独立oracle。製品出力を正解に使わない。",
+  "cases": [
+    {
+      "case_id": "office_screen",
+      "input": "fixtures/eval/office_ja/assets/office-decoration.png",
+      "input_sha256": "5b3fe6d249ad36ebf3c11a50b95aacd8c3501e525e62d7b8a3e8645862ce21f9",
+      "image_size": [640, 360],
+      "source_context": [
+        "fixtures/eval/excel_ja/inputs/JPX-015.xlsx",
+        "fixtures/eval/office_ja/inputs/OJA-DOCX-HARD.docx",
+        "fixtures/eval/office_ja/inputs/OJA-PPTX-HARD.pptx"
+      ],
+      "purpose": "表、英数識別子、日本語、処理ID、注記を同時に含む共通埋込画像",
+      "reference_text": "振込取消画面\nIMG-SCR-401\n項目ID 表示名 制約 状態\nACCOUNT_NO 口座番号 7桁 現行\nOLD_CODE 旧受付区分 2桁 廃止\nA01 入力検証\nA02 更新確定\n注記 N-IMG-401: OLD_CODEだけを廃止対象とする",
+      "regions": [
+        {"check_id": "office:title", "label": "画面名と画像ID", "bbox": [18, 18, 622, 60], "terms": [{"text": "振込取消画面", "kind": "text"}, {"text": "IMG-SCR-401", "kind": "identifier"}]},
+        {"check_id": "office:header", "label": "表ヘッダー", "bbox": [20, 78, 620, 112], "terms": [{"text": "項目ID", "kind": "text"}, {"text": "表示名", "kind": "text"}, {"text": "制約", "kind": "text"}, {"text": "状態", "kind": "text"}]},
+        {"check_id": "office:account", "label": "ACCOUNT_NO行", "bbox": [20, 112, 620, 151], "terms": [{"text": "ACCOUNT_NO", "kind": "identifier"}, {"text": "口座番号", "kind": "text"}, {"text": "7桁", "kind": "number"}, {"text": "現行", "kind": "status"}]},
+        {"check_id": "office:old", "label": "OLD_CODE行", "bbox": [20, 151, 620, 190], "terms": [{"text": "OLD_CODE", "kind": "identifier"}, {"text": "旧受付区分", "kind": "text"}, {"text": "2桁", "kind": "number"}, {"text": "廃止", "kind": "status"}]},
+        {"check_id": "office:flow", "label": "処理IDと名称", "bbox": [40, 214, 590, 270], "terms": [{"text": "A01", "kind": "identifier"}, {"text": "入力検証", "kind": "text"}, {"text": "A02", "kind": "identifier"}, {"text": "更新確定", "kind": "text"}]},
+        {"check_id": "office:note", "label": "限定注記", "bbox": [20, 296, 620, 342], "terms": [{"text": "N-IMG-401", "kind": "identifier"}, {"text": "OLD_CODE", "kind": "identifier"}, {"text": "廃止対象とする", "kind": "text"}]}
+      ]
+    },
+    {
+      "case_id": "scan_pdf",
+      "input": "fixtures/eval/office_ja/assets/scan-page.png",
+      "input_sha256": "026ecf2267edc6220887e70567930f3acb9aabbd474fe82d326a34e214707b06",
+      "image_size": [840, 1188],
+      "source_context": ["fixtures/eval/office_ja/inputs/OJA-PDF-MEDIUM.pdf"],
+      "purpose": "text layerを持たない日本語scan PDFの可視ページ",
+      "reference_text": "スキャン受付設計書\nS-PDF-201\n画面ID: SCR-PDF-01\n項目ID 表示名 桁数 状態\nACCOUNT_NO 口座番号 7 現行\nAMOUNT 取引金額 12 現行\nOLD_CODE 旧受付区分 2 廃止\n注記 N-PDF-REMOTE: OLD_CODEだけを廃止対象とする",
+      "regions": [
+        {"check_id": "scan:title", "label": "文書名と文書ID", "bbox": [36, 36, 804, 128], "terms": [{"text": "スキャン受付設計書", "kind": "text"}, {"text": "S-PDF-201", "kind": "identifier"}]},
+        {"check_id": "scan:screen", "label": "画面ID", "bbox": [36, 128, 804, 225], "terms": [{"text": "画面ID", "kind": "text"}, {"text": "SCR-PDF-01", "kind": "identifier"}]},
+        {"check_id": "scan:header", "label": "表ヘッダー", "bbox": [62, 245, 782, 321], "terms": [{"text": "項目ID", "kind": "text"}, {"text": "表示名", "kind": "text"}, {"text": "桁数", "kind": "text"}, {"text": "状態", "kind": "text"}]},
+        {"check_id": "scan:account", "label": "ACCOUNT_NO行", "bbox": [62, 321, 782, 397], "terms": [{"text": "ACCOUNT_NO", "kind": "identifier"}, {"text": "口座番号", "kind": "text"}, {"text": "7", "kind": "number"}, {"text": "現行", "kind": "status"}]},
+        {"check_id": "scan:amount", "label": "AMOUNT行", "bbox": [62, 397, 782, 473], "terms": [{"text": "AMOUNT", "kind": "identifier"}, {"text": "取引金額", "kind": "text"}, {"text": "12", "kind": "number"}, {"text": "現行", "kind": "status"}]},
+        {"check_id": "scan:old", "label": "OLD_CODE行", "bbox": [62, 473, 782, 549], "terms": [{"text": "OLD_CODE", "kind": "identifier"}, {"text": "旧受付区分", "kind": "text"}, {"text": "2", "kind": "number"}, {"text": "廃止", "kind": "status"}]},
+        {"check_id": "scan:note", "label": "限定注記", "bbox": [62, 594, 778, 699], "terms": [{"text": "N-PDF-REMOTE", "kind": "identifier"}, {"text": "OLD_CODE", "kind": "identifier"}, {"text": "廃止対象とする", "kind": "text"}]}
+      ]
+    },
+    {
+      "case_id": "hybrid_pdf",
+      "input": "fixtures/eval/office_ja/assets/hybrid-current-page.png",
+      "input_sha256": "20f212530438f287e36c278300470f96998e7fc4addb35d48bb9d497975106da",
+      "image_size": [840, 1188],
+      "source_context": ["fixtures/eval/office_ja/inputs/OJA-PDF-HARD.pdf"],
+      "purpose": "古いtext layerを現行ページ画像が全面被覆するhybrid PDFの可視ページ",
+      "reference_text": "現行 取消制御設計書\nH-PDF-301\n画面ID: SCR-PDF-01\n条件 現行上限 動作 エラー\n取消金額 1,000,000円 受付を継続 なし\n上限超過 1,000,000円超 更新せず終了 E-HYB-301\n現行仕様: 取消上限は100万円。50万円ではない。",
+      "regions": [
+        {"check_id": "hybrid:title", "label": "現行文書名と文書ID", "bbox": [36, 36, 804, 128], "terms": [{"text": "現行", "kind": "status"}, {"text": "取消制御設計書", "kind": "text"}, {"text": "H-PDF-301", "kind": "identifier"}]},
+        {"check_id": "hybrid:screen", "label": "画面ID", "bbox": [36, 128, 804, 225], "terms": [{"text": "画面ID", "kind": "text"}, {"text": "SCR-PDF-01", "kind": "identifier"}]},
+        {"check_id": "hybrid:header", "label": "表ヘッダー", "bbox": [62, 245, 782, 321], "terms": [{"text": "条件", "kind": "text"}, {"text": "現行上限", "kind": "text"}, {"text": "動作", "kind": "text"}, {"text": "エラー", "kind": "text"}]},
+        {"check_id": "hybrid:normal", "label": "取消金額行", "bbox": [62, 321, 782, 397], "terms": [{"text": "取消金額", "kind": "text"}, {"text": "1,000,000円", "kind": "number"}, {"text": "受付を継続", "kind": "text"}, {"text": "なし", "kind": "text"}]},
+        {"check_id": "hybrid:over", "label": "上限超過行", "bbox": [62, 397, 782, 473], "terms": [{"text": "上限超過", "kind": "text"}, {"text": "1,000,000円超", "kind": "number"}, {"text": "更新せず終了", "kind": "text"}, {"text": "E-HYB-301", "kind": "identifier"}]},
+        {"check_id": "hybrid:note", "label": "現行上限の否定付き注記", "bbox": [62, 518, 778, 623], "terms": [{"text": "現行仕様", "kind": "status"}, {"text": "100万円", "kind": "number"}, {"text": "50万円ではない", "kind": "number"}]}
+      ]
+    },
+    {
+      "case_id": "deprecated_stamp",
+      "input": "fixtures/eval/excel_ja/assets/廃止スタンプ.png",
+      "input_sha256": "ff9110cb7aa3f9de52d10b8bf1b7f158fb49f1902754e7ba23e116a0750cda55",
+      "image_size": [200, 80],
+      "source_context": ["fixtures/eval/excel_ja/inputs/JPX-011.xlsx"],
+      "purpose": "セル値の上へ重なる画像オブジェクトにだけ存在する廃止文字",
+      "reference_text": "廃止",
+      "regions": [
+        {"check_id": "stamp:text", "label": "廃止スタンプ文字", "bbox": [0, 0, 200, 80], "terms": [{"text": "廃止", "kind": "status"}]}
+      ]
+    }
+  ]
+}

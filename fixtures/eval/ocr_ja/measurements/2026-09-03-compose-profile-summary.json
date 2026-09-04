@@ -1,0 +1,121 @@
+{
+ "schema": "sherpa-ocr-compose-profile-measurement-v1",
+ "measured_at": "2026-09-02T23:57:30Z",
+ "production_data_used": false,
+ "compose_project": "sherpa-ocr-verify-20260903",
+ "profile": "ocr",
+ "environment_file_loaded": false,
+ "note": "O2（RV是正）: 2026-08-16実測の再実測。前回はrequirements.txt/constraints.txt/docker-compose.ymlを丸ごとハッシュしていたため、性能台帳#17 QW2（psycopg_poolの core requirements.txt 追加）のようなOCR無関係な依存追加でも赤くなっていた。束縛を絞り込み（compute_ocr_implementation_bindingを参照）、psycopg関連行とocr-workerサービス定義のみを対象にした上で、67d3b4a8（O1: OCR観測をrag.mdへ統合）とbac1d024/722c139e（QW2: PGプール化）を反映した現行実装に対して再測定した。単発のmount/network静的チェックだけでなく、raster_evidence→ocr_router.build_manifest→ocr_jobs.enqueue_manifest_jobsで実際にjobを積み、隔離ワーカー（起動中コンテナ）に実PaddleOCR推論をさせてrag_observation_chunksが得られること（『廃止』の実認識）まで確認した。",
+ "files_updated_at": "2026-09-03T00:00:00Z",
+ "files_updated_note": "CLEAN-2 item a/e: `implementation.files` のみを機械的に更新した（フル O2 手順の再実測ではない）。(1) item a で `sherpa/ingest/observation_render.py` から検索専用描画（Markdown/chunk JSONL 生成）を撤去し、`.ai_observations.jsonl`（office_md._load_ocr_observation_sets が読む Observation Set 本体）の永続化・世代管理だけを残した＝ファイル内容が変わったためハッシュ更新。(2) item e で `sherpa/store/db.py` の束縛を全文ハッシュから `sherpa/store/db.py:ocr-relevant`（`world_lock`/`_connect`/`_ensure`/PG プール一式・OCR関連テーブルのDDLだけを抽出）へ絞り込んだ＝会話/監査等の無関係テーブル変更で赤くならないようにする是正（`compute_ocr_implementation_binding`/`_db_ocr_relevant_source` 参照）。Dockerfile/docker-compose.yml/requirements-ocr.txt/constraints-ocr.txt/ocr-models.lock.json はいずれも無変更のため、`image`/`runtime`/`mount_checks`/`network_checks`/`image_inventory`（`python_package_inventory_sha256` 等）の実測値はこの更新の対象外＝直前の実測（2026-09-02T23:57:30Z・上記 note 参照）をそのまま維持する。フルの隔離 compose 実行による再実測（image.id の更新等）は本レーンのスコープ外として次回に持ち越す。",
+ "input": {
+  "kind": "synthetic_fixture",
+  "source": "fixtures/eval/excel_ja/assets/廃止スタンプ.png",
+  "source_sha256": "ff9110cb7aa3f9de52d10b8bf1b7f158fb49f1902754e7ba23e116a0750cda55",
+  "source_size_bytes": 2581,
+  "source_hash_size_mtime_unchanged": true,
+  "source_files_created_by_worker": 0
+ },
+ "job_processing": {
+  "note": "raster_evidence.extract→ocr_router.build_manifest→ocr_jobs.enqueue_manifest_jobsで実job（world=ocrverify20260903・synthetic registry行のみ・production worldは未使用）を積み、常駐中の隔離ワーカーに実PaddleOCRで処理させた。",
+  "canonical_generation_id": "d10bcd913eedb7556561b0fdb8c0de6ec8fea2b5cccd45faa6dc9623830f1060",
+  "status_summary": {"targets": 1, "processed": 1, "cached": 0, "empty": 0, "failed": 0, "pending": 0,
+   "counts": {"queued": 0, "leased": 0, "succeeded": 1, "failed": 0, "stale": 0, "cancelled": 0}, "total": 1},
+  "recognized_text": "廃止",
+  "recognized_confidence": 0.99988,
+  "observation_written_under": "SHERPA_OBSERVATION_DIR (writable) のみ・SHERPA_DERIVED_DIR (/derived) は job 完了後もファイル数/mtime とも不変（read-only mount がworkerからの書き込みも防いでいることを確認）",
+  "evidence_tier": "ocr_observation",
+  "searchable": true,
+  "use_for_answer": true
+ },
+ "image": {
+  "name": "sherpa/ocr-worker:paddleocr-3.7.0-cpu",
+  "id": "sha256:0333273a29c186830d0e5fc87aa13102816c450caa2878c8857ef8c9d604c0df",
+  "created": "2026-09-03T08:50:27.597216558+09:00"
+ },
+ "implementation": {
+  "git_head_before_commit": "67d3b4a81d0d7bde154c7142e8c61b8604009552",
+  "engine_profile_hash": "sha256:c897791f09dc29f9010c36e30d784e719d100bc040774e049bfa1b9e6e9a1435",
+  "ocr_router_profile": "evidence-raster-router-v3",
+  "binding_scope": "compute_ocr_implementation_binding()（tests/contract/test_ocr_observation_contract.py）が定義する、OCR worker の実行に効くファイル集合のみ（2026-09-03 に requirements.txt 等の丸ごとハッシュから絞り込み・理由は上の note を参照）。",
+  "files": {
+   "docker/ocr/Dockerfile": "6dd5ddffc57de9122e3e192e77c181b7f5bce089d0e7c839a1c1a7e3df93dc9f",
+   "requirements-ocr.txt": "a9b42ec0d1e4b16779ab618094581bcb993ea9dd124f612a9252afc8d96a57e0",
+   "constraints-ocr.txt": "b3d32ad9ed2018402ca7f2f9b46897ca97243921b99a1ed663bb827ae25063bb",
+   "docker/ocr-models.lock.json": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
+   "sherpa/ingest/ai_observation.py": "15cebd1a3aff340c63584793fdc53ac9c8362a67408bf490a8087bf275130f75",
+   "sherpa/ingest/ocr_worker.py": "a163ad92ea697c61070939e28adfce45dd91aec9909bff4f3b6d5152b84665bc",
+   "sherpa/ingest/ocr_router.py": "26dcd240df907ff417d29fd7ef129b7a8d221216f0f8ab669f3d52344679ee73",
+   "sherpa/ingest/observation_render.py": "486061136c3e863390ce39b545ef5fc29f33bd51b7a09c3957ac803ffd70d4f4",
+   "sherpa/store/ocr_jobs.py": "9938f86735ff6bab161b7fbf8aaf49b5914f4222b8d813e8a4c5159204d4562a",
+   "sherpa/store/db.py:ocr-relevant": "af23d2c5a99a501e5d714d117bc6a70f5d0b2a28ac74b2f989eef37fafa97bf2",
+   "requirements.txt+constraints.txt:psycopg-lines": "b8d7d98a99031315f6df04b4f349c609fdc95c223d70a79b4e7eea80b13348e7",
+   "docker-compose.yml:services.ocr-worker+networks": "4e27ba3424822bba8ed1058d15e7aea117e7c8e7616190589184e6f2f34c94ff"
+  }
+ },
+ "runtime": {
+  "worker_uid": 1000,
+  "worker_gid": 1000,
+  "heartbeat_available": true,
+  "heartbeat_status": "idle",
+  "model_hashes_valid": true,
+  "root_filesystem_read_only": true,
+  "capabilities_dropped": [
+   "ALL"
+  ],
+  "no_new_privileges": true,
+  "internal_network": true,
+  "host_published_ports": 0,
+  "isolated_postgres_host_port": 55440
+ },
+ "mount_checks": {
+  "world_root_read_only": true,
+  "canonical_derived_read_only": true,
+  "model_cache_read_only": true,
+  "observation_root_read_write": true,
+  "repository_not_mounted": true,
+  "environment_files_in_image": 0,
+  "write_to_world_root_rejected": true,
+  "write_to_canonical_derived_rejected": true,
+  "write_to_model_cache_rejected": true,
+  "write_to_container_root_rejected": true,
+  "write_to_observation_root_succeeded": true,
+  "write_rejection_errno": 30
+ },
+ "network_checks": {
+  "outbound_ipv4_connection_rejected": true,
+  "successful_external_connections": 0,
+  "error": "OSError: [Errno 101] Network is unreachable",
+  "postgres_on_internal_network_reachable": true
+ },
+ "image_inventory": {
+  "python_package_inventory_sha256": "f7491185356f4a2fa529b24410fb3010e16e8b9f0fd8ab33fe3ccf80420d81c9",
+  "model_lock_sha256": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
+  "notice_sha256": "9adc11caf5590e85426872d4397e8e46e30a93dad97cb5ecdd86c1bad5db0e1c",
+  "real_sbom_complete": false,
+  "legal_review_complete": false,
+  "models_bundled": false
+ },
+ "commands": [
+  "docker compose -p sherpa-ocr-verify-20260903 --env-file /dev/null --profile ocr build ocr-worker",
+  "env SHERPA_OCR_WORLD_ROOT=<temporary-synthetic-world-root> SHERPA_DERIVED_DIR=<temporary-derived-root> SHERPA_OBSERVATION_DIR=<temporary-observation-root> SHERPA_OCR_MODEL_CACHE=<host-paddlex-cache> POSTGRES_PASSWORD=<ephemeral-test-value> PGPORT=55440 docker compose -p sherpa-ocr-verify-20260903 --env-file /dev/null --profile ocr up -d --no-build postgres",
+  "python -c \"from sherpa.store.worlds import upsert_world; upsert_world('ocrverify20260903', '<temporary-synthetic-world-root>')\" （分離Postgres・productionのworldsテーブルは一切未使用）",
+  "python <prep_canonical.py>  # raster_evidence.extract + evidence_render.render + ocr_router.build_manifest で /derived を作る（read-only mountの前提を守るためworker起動前にhost側で作成）",
+  "env ... docker compose -p sherpa-ocr-verify-20260903 --env-file /dev/null --profile ocr up -d --no-build ocr-worker",
+  "docker inspect sherpa-ocr-verify-20260903-ocr-worker-1",
+  "docker exec -i sherpa-ocr-verify-20260903-ocr-worker-1 python - < <mount/network write-rejection checks>",
+  "docker exec -i sherpa-ocr-verify-20260903-ocr-worker-1 python -c \"from sherpa.ingest import ocr_worker; ocr_worker.paddle_availability()\"",
+  "python -c \"from sherpa.ingest import ocr_router, evidence_ir; from sherpa.store import ocr_jobs; ocr_jobs.enqueue_manifest_jobs(...)\"  # 分離Postgresへ実job投入（host venvから127.0.0.1:55440経由）",
+  "python -c \"from sherpa.store import ocr_jobs; ocr_jobs.status_summary(...)\"  # succeeded=1を確認するまでポーリング",
+  "docker exec sherpa-ocr-verify-20260903-postgres-1 psql -U sherpa -d sherpa -c \"SELECT worker_id, status, available, model_hashes_valid FROM ocr_worker_heartbeats\"",
+  "docker compose -p sherpa-ocr-verify-20260903 --env-file /dev/null --profile ocr down -v"
+ ],
+ "cleanup": {
+  "isolated_stack_removed": true,
+  "isolated_volume_removed": true,
+  "temporary_input_and_output_roots_removed": true,
+  "main_stack_container_lifecycle_touched": false,
+  "shared_image_tag_rebuilt": true,
+  "shared_image_tag_rebuilt_note": "docker compose build は image tag `sherpa/ocr-worker:paddleocr-3.7.0-cpu` を現行実装で上書きした（他 profile/開発中の docker-compose.yml からも参照される共有タグ）。稼働中の `sherpa-mvp-ocr-worker-1`（本番寄りの登録 world を read-only mount 済み）はコンテナ起動時点の image に固定されるため、この rebuild では再作成・再起動していない＝無停止。"
+ }
+}

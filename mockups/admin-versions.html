@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 版管理（UI モック）</title>
+<style>
+  :root{
+    --accent:#0d9488;--accent-weak:#ccfbf1;--accent-ink:#0f766e;
+    --bg:#f6f7f9;--surface:#fff;--surface-2:#f1f3f5;--border:#e3e6ea;
+    --ink:#1f2937;--ink-2:#5b6573;--ink-3:#8b95a3;
+    --ok:#16a34a;--ok-bg:#e9f7ef;--warn:#d97706;--warn-bg:#fdf3e7;--danger:#dc2626;--danger-bg:#fdecec;--info:#2563eb;--info-bg:#e8effc;
+    --radius:12px;--radius-sm:8px;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);--shadow-lg:0 10px 30px rgba(16,24,40,.18);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+  .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700}.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#fff}.brand small{font-weight:500;color:var(--ink-3)}
+  .nav{display:flex;gap:4px}.nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;color:var(--ink-2);text-decoration:none}.nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .topbar .spacer{flex:1}.user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 24px 48px}
+  .subnav{display:flex;gap:6px;margin-bottom:16px}.subnav a{font-size:13px;padding:6px 12px;border-radius:999px;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);background:var(--surface)}.subnav a.on{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent-weak);font-weight:600}
+  .pagehead{display:flex;align-items:flex-end;gap:14px;margin-bottom:16px}.pagehead h1{font-size:21px;margin:0;font-weight:700}.pagehead .sub{font-size:12.5px;color:var(--ink-3)}.pagehead .spacer{flex:1}
+  .btn-primary{height:34px;padding:0 14px;border:none;border-radius:var(--radius-sm);background:var(--accent);color:#fff;font-weight:600;font-size:13px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-size:11.5px;font-weight:600;color:var(--ink-2);padding:11px 14px;border-bottom:1px solid var(--border);background:var(--surface-2)}
+  td{padding:12px 14px;border-bottom:1px solid var(--border);vertical-align:middle}tr:last-child td{border-bottom:none}
+  td.num{text-align:right}
+  .vname{font-weight:700}
+  .badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px}
+  .badge .d{width:7px;height:7px;border-radius:50%}
+  .b-active{background:var(--ok-bg);color:var(--ok)} .b-active .d{background:var(--ok)}
+  .b-frozen{background:var(--info-bg);color:var(--info)} .b-frozen .d{background:var(--info)}
+  .b-arch{background:var(--surface-2);color:var(--ink-3)} .b-arch .d{background:var(--ink-3)}
+  .latest{display:inline-flex;align-items:center;gap:6px;font-size:12px}
+  .radio{width:14px;height:14px;border-radius:50%;border:2px solid var(--accent);display:inline-block;position:relative}
+  .radio.on::after{content:"";position:absolute;inset:2px;border-radius:50%;background:var(--accent)}
+  .radio.off{border-color:var(--ink-3)}
+  .muted{color:var(--ink-3)} code{background:var(--surface-2);padding:1px 6px;border-radius:4px;font-size:12px}
+  .rowact{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+  .mini{height:30px;padding:0 11px;border-radius:7px;border:1px solid var(--border);background:var(--surface);font-size:12px;color:var(--ink-2)}
+  .mini.warn{color:var(--info);border-color:#bcd3f5} .mini.del{color:var(--danger);border-color:#f3c0c0}
+  .note{font-size:11.5px;color:var(--ink-3);margin-top:10px}
+
+  /* modal */
+  .overlay{position:fixed;inset:0;background:rgba(16,24,40,.42);display:none;z-index:30;align-items:center;justify-content:center}
+  .overlay.open{display:flex}
+  .modal{width:560px;max-width:92vw;background:var(--surface);border-radius:14px;box-shadow:var(--shadow-lg);overflow:hidden}
+  .modal-h{padding:15px 18px;border-bottom:1px solid var(--border);font-weight:700;display:flex;align-items:center;gap:10px}
+  .modal-h .warnico{width:26px;height:26px;border-radius:7px;background:var(--danger-bg);color:var(--danger);display:grid;place-items:center}
+  .modal-b{padding:16px 18px}
+  .prevbox{border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:6px 0 12px}
+  .prevbox .r{display:flex;justify-content:space-between;padding:9px 12px;border-bottom:1px solid var(--border);font-size:13px}
+  .prevbox .r:last-child{border-bottom:none}.prevbox .r b{font-variant-numeric:tabular-nums}
+  .danger-note{background:var(--danger-bg);color:var(--danger);border-radius:8px;padding:9px 11px;font-size:12.5px;margin-bottom:12px}
+  .opt{display:flex;gap:8px;margin-bottom:12px}
+  .opt label{flex:1;border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-size:12.5px;cursor:pointer}
+  .opt label.sel{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink)}
+  .modal-f{display:flex;gap:9px;justify-content:flex-end;padding:13px 18px;border-top:1px solid var(--border)}
+  .btn-cancel{height:36px;padding:0 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--ink-2)}
+  .btn-danger{height:36px;padding:0 16px;border:none;border-radius:8px;background:var(--danger);color:#fff;font-weight:700}
+  .field{margin-bottom:12px}.field label{display:block;font-size:12px;color:var(--ink-2);margin-bottom:4px}
+  .field input,.field select{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;font:inherit}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav"><a href="chat-impact-analysis.html">チャット</a><a href="file-manager.html">ファイル管理</a><a class="on">管理</a></nav>
+  <div class="spacer"></div><div class="user">管</div>
+</div>
+
+<div class="wrap">
+  <div class="subnav">
+    <a href="admin-usage.html">利用統計</a><a href="admin-ingest.html">KB取り込み</a>
+    <a class="on">版管理</a><a href="admin-users.html">ユーザー</a><a href="admin-cost.html">コスト/キー</a>
+  </div>
+  <div class="pagehead">
+    <div><h1>版管理</h1><div class="sub">版の作成・凍結・アーカイブ・最新aliasの付替え ・ Neo4jは版ごとに分離（決定2）</div></div>
+    <div class="spacer"></div>
+    <button class="btn-primary" onclick="openNew()">＋ 新規版作成</button>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>版</th><th style="width:110px">状態</th><th class="num" style="width:80px">文書</th><th class="num" style="width:120px">ノード/エッジ</th><th style="width:140px">Neo4j DB</th><th style="width:100px">最新alias</th><th style="width:200px"></th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="vname">2025冬リリース</span><div class="muted" style="font-size:11px">2026-06-01 作成</div></td>
+          <td><span class="badge b-active"><span class="d"></span>稼働中</span></td>
+          <td class="num">142</td><td class="num">3,420 / 9,180</td>
+          <td><code>neo4j_2025w</code></td>
+          <td><span class="latest"><span class="radio on"></span>最新</span></td>
+          <td><div class="rowact"><button class="mini">凍結</button><button class="mini del" onclick="openDel('2025冬リリース')">削除</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="vname">2025春更改</span><div class="muted" style="font-size:11px">2025-03-10 作成</div></td>
+          <td><span class="badge b-active"><span class="d"></span>稼働中</span></td>
+          <td class="num">98</td><td class="num">2,180 / 5,940</td>
+          <td><code>neo4j_2025s</code></td>
+          <td><span class="latest"><span class="radio off"></span><span class="muted">最新にする</span></span></td>
+          <td><div class="rowact"><button class="mini">凍結</button><button class="mini del" onclick="openDel('2025春更改')">削除</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="vname">2024冬リリース</span><div class="muted" style="font-size:11px">2024-12-02 作成</div></td>
+          <td><span class="badge b-frozen"><span class="d"></span>凍結</span></td>
+          <td class="num">76</td><td class="num">1,610 / 4,120</td>
+          <td><code>neo4j_2024w</code></td>
+          <td class="muted">—</td>
+          <td><div class="rowact"><button class="mini warn">再有効化</button><button class="mini">アーカイブ</button><button class="mini del" onclick="openDel('2024冬リリース')">削除</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="vname">2024春更改</span><div class="muted" style="font-size:11px">2024-03-08 作成</div></td>
+          <td><span class="badge b-arch"><span class="d"></span>アーカイブ</span></td>
+          <td class="num">54</td><td class="num muted">退避済</td>
+          <td class="muted">退避（dump）</td>
+          <td class="muted">—</td>
+          <td><div class="rowact"><button class="mini warn">再有効化</button><button class="mini del" onclick="openDel('2024春更改')">削除</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">凍結＝取り込み停止・検索は可 ／ アーカイブ＝検索対象外・Neo4j版DBを退避（A20 影響説明）。
+  「最新」aliasは検索の既定版（A21）。削除は派生物まで一括（UC-A4）。</div>
+</div>
+
+<!-- 削除プレビュー（UC-A4 / A23・A24・A26） -->
+<div class="overlay" id="delOverlay">
+  <div class="modal">
+    <div class="modal-h"><span class="warnico">!</span>削除プレビュー: <span id="delName">2025春更改</span></div>
+    <div class="modal-b">
+      <div style="font-size:12.5px;color:var(--ink-2);margin-bottom:6px">台帳を辿り、以下の派生物を一括削除します（取り消し不可）。</div>
+      <div class="prevbox">
+        <div class="r"><span>MD ファイル</span><b>98 件</b></div>
+        <div class="r"><span>ES チャンク</span><b>2,940 件</b></div>
+        <div class="r"><span>Neo4j ノード / エッジ</span><b>2,180 / 5,940</b></div>
+        <div class="r"><span>原ファイル（uploads）</span><b>98 件</b></div>
+      </div>
+      <div class="danger-note">⚠ この版を根拠に持つ過去の回答 <b>12 件</b> の参照（evidence）が dangling になります。再解決または印付けを行います。</div>
+      <div style="font-size:12px;color:var(--ink-2);margin-bottom:6px">削除方法（A26）:</div>
+      <div class="opt">
+        <label class="sel">物理削除<div class="muted" style="font-size:11px">派生物を完全削除</div></label>
+        <label>論理削除/アーカイブ<div class="muted" style="font-size:11px">検索対象外にし退避（推奨）</div></label>
+      </div>
+      <div class="field"><label>確認のため版名を入力（二段階確認・A24）</label><input placeholder="2025春更改"></div>
+    </div>
+    <div class="modal-f"><button class="btn-cancel" onclick="closeDel()">キャンセル</button><button class="btn-danger" onclick="closeDel()">削除を実行</button></div>
+  </div>
+</div>
+
+<!-- 新規版作成（A19） -->
+<div class="overlay" id="newOverlay">
+  <div class="modal">
+    <div class="modal-h">新規版作成</div>
+    <div class="modal-b">
+      <div class="field"><label>版名</label><input placeholder="例: 2026夏リリース"></div>
+      <div class="field"><label>初期内容（A19）</label><select><option>空（ゼロから取り込み）</option><option>2025冬リリースから複製</option><option>2025春更改から複製</option></select></div>
+      <div class="note" style="margin-top:0">作成後、KB取り込み画面で文書を登録します。Neo4j は新しい版DBを割り当て。</div>
+    </div>
+    <div class="modal-f"><button class="btn-cancel" onclick="closeNew()">キャンセル</button><button class="btn-primary" onclick="closeNew()">作成</button></div>
+  </div>
+</div>
+
+<script>
+  function openDel(n){document.getElementById('delName').textContent=n;document.getElementById('delOverlay').classList.add('open');}
+  function closeDel(){document.getElementById('delOverlay').classList.remove('open');}
+  function openNew(){document.getElementById('newOverlay').classList.add('open');}
+  function closeNew(){document.getElementById('newOverlay').classList.remove('open');}
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeDel();closeNew();}});
+  document.querySelectorAll('.opt label').forEach(l=>l.onclick=function(){this.parentNode.querySelectorAll('label').forEach(x=>x.classList.remove('sel'));this.classList.add('sel');});
+</script>
+</body>
+</html>

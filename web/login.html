@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ログイン</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>   <!-- topbar は置かないが、テーマ等の共通初期化に共用 -->
+<style>
+  body{display:flex;align-items:center;justify-content:center;min-height:100vh;background:var(--bg)}
+  .login-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:36px 40px;width:340px;box-shadow:var(--shadow-lg)}
+  .login-brand{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+  .login-brand .mark{width:32px;height:32px;border-radius:9px;background:var(--accent);
+    display:grid;place-items:center;color:#fff;font-size:16px}
+  .login-brand b{font-size:18px;font-weight:700}
+  .login-brand small{color:var(--ink-3);font-size:12px;display:block}
+  .login-title{font-size:15px;font-weight:700;color:var(--ink);margin-bottom:18px}
+  .lfield{margin-bottom:14px}
+  .lfield label{display:block;font-size:12.5px;font-weight:600;color:var(--ink-2);margin-bottom:5px}
+  .lfield input{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid var(--border);
+    border-radius:var(--radius-sm);font-family:inherit;font-size:14px;background:var(--surface);
+    color:var(--ink);outline:none}
+  .lfield input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-weak)}
+  .login-err{background:var(--danger-bg);color:var(--danger);border-radius:var(--radius-sm);
+    font-size:12.5px;padding:9px 12px;margin-bottom:14px;display:none}
+  .login-err.show{display:block}
+  .login-submit{width:100%;height:40px;border:none;border-radius:var(--radius-sm);background:var(--accent);
+    color:#fff;font-weight:700;font-size:14px;cursor:pointer;margin-top:4px}
+  .login-submit:hover{background:var(--accent-ink)}
+  .login-submit:disabled{opacity:.6;cursor:not-allowed}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="login-brand">
+    <div class="mark">⛰</div>
+    <div><b>Sherpa</b><small>業務AI基盤</small></div>
+  </div>
+  <div class="login-title">ログイン</div>
+  <div class="login-err" id="err"></div>
+  <form id="form" autocomplete="on">
+    <div class="lfield">
+      <label for="username">ユーザー名</label>
+      <input id="username" name="username" type="text" autocomplete="username" placeholder="ユーザー名を入力" required>
+    </div>
+    <div class="lfield">
+      <label for="password">パスワード</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" placeholder="パスワードを入力" required>
+    </div>
+    <button class="login-submit" id="submit" type="submit">ログイン</button>
+  </form>
+</div>
+<script src="login.js"></script>
+</body>
+</html>

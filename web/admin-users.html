@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ユーザー管理</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:none;margin:0}
+  /* UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時だけ、
+     自ページの共通トップバー/ナビを隠す（単独 URL 直開きは従来どおり・admin-users.js 冒頭が判定）。 */
+  .embedded .topbar,.embedded nav{display:none}
+  .embedded .wrap{padding-top:8px}
+  /* フィルターバー（audit.html と同じ流儀） */
+  .filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding:12px 14px 4px}
+  .filter-bar .ff{display:flex;flex-direction:column;gap:3px}
+  .filter-bar label{font-size:11.5px;font-weight:600;color:var(--ink-3)}
+  .filter-bar input,.filter-bar select{padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
+    font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink);height:36px;box-sizing:border-box}
+  .filter-bar input{width:240px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th{text-align:left;font-size:12px;font-weight:600;color:var(--ink-3);padding:8px 12px;
+    border-bottom:2px solid var(--border);white-space:nowrap}
+  td{padding:9px 12px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:middle}
+  tr:hover td{background:var(--surface-2)}
+  .badge-admin{display:inline-block;font-size:10px;font-weight:700;color:var(--accent-ink);
+    background:var(--accent-weak);border-radius:4px;padding:1px 6px}
+  .badge-user{display:inline-block;font-size:10px;color:var(--ink-3);background:var(--surface-2);
+    border-radius:4px;padding:1px 6px;border:1px solid var(--border)}
+  .badge-disabled{display:inline-block;font-size:10px;color:var(--danger);background:var(--danger-bg);
+    border-radius:4px;padding:1px 6px}
+  .badge-pending{display:inline-block;font-size:10px;color:var(--warn);background:var(--warn-bg);
+    border-radius:4px;padding:1px 6px}
+  .act-btn{height:28px;padding:0 10px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-2);font-size:12px;color:var(--ink-2);cursor:pointer}
+  .act-btn:hover{background:var(--surface);color:var(--ink)}
+  .act-btn.danger{color:var(--danger);border-color:var(--danger)}
+  /* 新規ユーザーフォーム */
+  .create-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:20px 22px;margin-bottom:20px}
+  .create-card h2{font-size:14px;font-weight:700;margin:0 0 14px}
+  .cform{display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:10px;align-items:end}
+  .cform label{display:block;font-size:11.5px;font-weight:600;color:var(--ink-3);margin-bottom:4px}
+  .cform input,.cform select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);
+    border-radius:var(--radius-sm);font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink)}
+  .cform-err{font-size:12px;color:var(--danger);margin-top:8px;min-height:16px}
+  /* ダイアログ */
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;
+    justify-content:center;z-index:200}
+  .modal-overlay[hidden]{display:none}
+  .modal{background:var(--surface);border-radius:var(--radius);padding:26px 28px;width:340px;
+    box-shadow:var(--shadow-lg);position:relative;left:auto;top:auto;transform:none;
+    border:1px solid var(--border);overflow:visible}
+  .modal h2{font-size:14px;font-weight:700;margin:0 0 14px}
+  .modal label{display:block;font-size:12px;font-weight:600;color:var(--ink-2);margin:10px 0 4px}
+  .modal input,.modal select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);
+    border-radius:var(--radius-sm);font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink)}
+  .modal-err{font-size:12px;color:var(--danger);margin-top:6px;min-height:14px}
+  .modal-actions{display:flex;gap:10px;margin-top:16px}
+  .modal-close{position:absolute;top:12px;right:14px;background:none;border:none;font-size:17px;
+    color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
+  .modal-close:hover{background:var(--surface-2)}
+  .modal-note{font-size:11.5px;color:var(--ink-3);line-height:1.5;margin:2px 0 4px}
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:13px">管理者権限が必要です。</div>
+  </div>
+  <div id="main-content">
+    <div class="pagehead">
+      <div><a class="crumb" href="admin-settings.html">← システム管理</a><h1>ユーザー管理</h1>
+        <div class="sub">ユーザーの作成・無効化・役割変更・パスワード再設定。</div>
+      </div>
+    </div>
+
+    <div class="wrap2">
+      <!-- 新規ユーザー作成 -->
+      <div class="create-card">
+        <h2>ユーザーを追加</h2>
+        <div class="cform">
+          <div>
+            <label for="nu-uid">ユーザー名（uid）</label>
+            <input id="nu-uid" type="text" placeholder="例: sato" autocomplete="off">
+          </div>
+          <div>
+            <label for="nu-name">表示名</label>
+            <input id="nu-name" type="text" placeholder="例: 佐藤 太郎" autocomplete="off">
+          </div>
+          <div>
+            <label for="nu-role">役割</label>
+            <select id="nu-role">
+              <option value="user">ユーザー</option>
+              <option value="admin">管理者</option>
+            </select>
+          </div>
+          <div>
+            <label for="nu-pw">初期パスワード</label>
+            <input id="nu-pw" type="password" placeholder="半角の初期パスワード" autocomplete="new-password">
+          </div>
+          <div>
+            <button class="btn-primary" id="nu-submit" style="height:38px;white-space:nowrap">追加</button>
+          </div>
+        </div>
+        <div class="cform-err" id="nu-err"></div>
+      </div>
+
+      <!-- ユーザー一覧 -->
+      <div class="card">
+        <div class="card-head" style="display:flex;align-items:center;gap:10px">
+          ユーザー一覧
+          <span class="muted" id="user-count" style="font-size:12px"></span>
+        </div>
+        <div class="filter-bar">
+          <div class="ff">
+            <label for="f-q">検索</label>
+            <input id="f-q" type="text" placeholder="ユーザー名・表示名・メールで絞り込み" autocomplete="off">
+          </div>
+          <div class="ff">
+            <label for="f-status">状態</label>
+            <select id="f-status">
+              <option value="active" selected>有効のみ</option>
+              <option value="all">すべて</option>
+              <option value="disabled">無効のみ</option>
+            </select>
+          </div>
+        </div>
+        <div id="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ユーザー名</th>
+                <th>表示名</th>
+                <th>役割</th>
+                <th>状態</th>
+                <th>最終ログイン</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="user-tbody"></tbody>
+          </table>
+          <div id="table-empty" style="display:none;padding:20px;text-align:center;color:var(--ink-3);font-size:13px">ユーザーはまだいません</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 編集ダイアログ（役割変更・無効化・パスワード再設定） -->
+<div class="modal-overlay" id="edit-overlay" hidden>
+  <div class="modal" role="dialog" aria-labelledby="edit-modal-title">
+    <button class="modal-close" onclick="document.getElementById('edit-overlay').hidden=true">✕</button>
+    <h2 id="edit-modal-title">ユーザーを編集</h2>
+    <input type="hidden" id="edit-uid">
+    <div class="modal-note">ユーザーID は変更できません（記録の参照キーのため）。名前の誤りは表示名で直してください。</div>
+    <label for="edit-name">表示名</label>
+    <input id="edit-name" type="text" placeholder="例: 佐藤 太郎（空欄で消去）" autocomplete="off">
+    <label for="edit-role">役割</label>
+    <select id="edit-role">
+      <option value="user">ユーザー</option>
+      <option value="admin">管理者</option>
+    </select>
+    <label for="edit-status">状態</label>
+    <select id="edit-status">
+      <option value="active">有効</option>
+      <option value="disabled">無効</option>
+    </select>
+    <label for="edit-pw">新しいパスワード（空欄=変更しない）</label>
+    <input id="edit-pw" type="password" placeholder="半角の新しいパスワード（任意）" autocomplete="new-password">
+    <div class="modal-err" id="edit-err"></div>
+    <div class="modal-actions">
+      <button class="btn-primary" id="edit-submit" style="flex:1">保存</button>
+      <button class="mini" onclick="document.getElementById('edit-overlay').hidden=true">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="admin-users.js"></script>
+</body>
+</html>

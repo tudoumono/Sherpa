@@ -1,0 +1,9 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. COMMISUP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           COPY FEE-CPY.
+           COPY AGENT-CPY.
+       PROCEDURE DIVISION.
+           CALL 'FEECALC'.
+           GOBACK.

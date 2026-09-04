@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ナレッジグラフ</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="vendor/cytoscape.min.js"></script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  /* admin ガード（CLEAN-1・2026-09-03・W1 の残・同型是正）: この画面のデータ（`/graph`・
+     `/graph/facets`・`/graph/search`・`POST /graph/ask`）は全て admin 限定 API に依存する。
+     ingest.html（W1）/ admin-settings.html と同じ「非 admin は access-denied だけ見せる」パターン。 */
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div id="access-denied">
+  <div style="font-size:32px;margin-bottom:12px">🚫</div>
+  <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+  <div style="font-size:13px">管理者権限が必要です。</div>
+</div>
+
+<div id="main-content" class="graphwrap">
+  <div class="graphmain">
+    <div class="graphbar">
+      <input class="gsearch" id="gsearch" placeholder="🔎 表示中から名前で探す（例: 消費税率）">
+      <select class="gselect" id="relfilter"><option value="">関係</option></select>
+      <select class="gselect" id="fieldfilter"><option value="">条件</option></select>
+      <select class="gselect small" id="opfilter">
+        <option value="eq">=</option>
+        <option value="contains">含む</option>
+        <option value="prefix">前方</option>
+      </select>
+      <input class="gsearch cond" id="condvalue" placeholder="値（例: 03_開発 / Module）">
+      <button class="btn-ghost" id="gfilter">検索</button>
+      <button class="btn-ghost" id="greset" hidden>全体</button>
+      <span class="gcount" id="gcount">読み込み中…</span>
+      <button class="btn-ghost" id="showall" hidden title="すべてのつながりを表示します（数が多いと重くなることがあります）">すべて表示</button>
+      <span class="spacer"></span>
+      <button class="btn-ghost" id="relayout">再配置</button>
+      <button class="btn-ghost" id="fit">全体表示</button>
+    </div>
+    <div id="cy"></div>
+    <div class="loading-overlay" id="graph-loading" role="status" aria-live="polite">
+      <span class="spinner"></span><span>ナレッジグラフを読み込んでいます...</span>
+    </div>
+    <div class="nodecard" id="nodecard"></div>
+  </div>
+
+  <aside class="graphlegend">
+    <h4>この画面は</h4>
+    <div class="leg-help">取り込んだ資料が<b>どう繋がっているか</b>の地図です。丸=もの、線=関係。
+      丸を<b>クリック</b>すると、その周りだけが残ります。背景クリックで戻ります。</div>
+    <div class="leg-help"><a class="help-link" href="manual.html#graph">この画面の使い方 →</a></div>
+    <div class="leg-help"><a class="help-link" href="ingest.html">資料の取り込み状況 →</a></div>
+    <h4>種別（色）<small class="leg-help" style="font-weight:400">クリックで絞り込み</small>
+      <button class="btn-ghost mini" id="fclear" hidden style="float:right">クリア</button></h4>
+    <div id="legtypes"></div>
+    <h4>状態</h4>
+    <div class="legrow ftog" data-fdep="1"><span class="legdot" style="background:#94a3b8;opacity:.5"></span>廃止/隠し候補を隠す</div>
+    <h4>線</h4>
+    <div class="leg-help">矢印＝依存の向き。</div>
+    <h4>ナレッジ状況に質問</h4>
+    <textarea class="gask" id="gask" rows="4" placeholder="例: このナレッジベースはどこが弱い？"></textarea>
+    <button class="btn-ghost gaskbtn" id="gaskbtn">質問</button>
+    <div class="ganswer" id="ganswer"></div>
+  </aside>
+</div>
+
+<script src="graph.js"></script>
+</body>
+</html>

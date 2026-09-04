@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — コスト・APIキー運用（UI モック）</title>
+<style>
+  :root{
+    --accent:#0d9488;--accent-weak:#ccfbf1;--accent-ink:#0f766e;
+    --bg:#f6f7f9;--surface:#fff;--surface-2:#f1f3f5;--border:#e3e6ea;
+    --ink:#1f2937;--ink-2:#5b6573;--ink-3:#8b95a3;
+    --ok:#16a34a;--ok-bg:#e9f7ef;--warn:#d97706;--warn-bg:#fdf3e7;--danger:#dc2626;--danger-bg:#fdecec;--info:#2563eb;--info-bg:#e8effc;
+    --radius:12px;--radius-sm:8px;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+  .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700}.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#fff}.brand small{font-weight:500;color:var(--ink-3)}
+  .nav{display:flex;gap:4px}.nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;color:var(--ink-2);text-decoration:none}.nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .topbar .spacer{flex:1}.user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 24px 48px}
+  .subnav{display:flex;gap:6px;margin-bottom:16px}.subnav a{font-size:13px;padding:6px 12px;border-radius:999px;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);background:var(--surface)}.subnav a.on{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent-weak);font-weight:600}
+  .pagehead{margin-bottom:16px}.pagehead h1{font-size:21px;margin:0;font-weight:700}.pagehead .sub{font-size:12.5px;color:var(--ink-3)}
+  .grid{display:grid;grid-template-columns:1.3fr 1fr;gap:14px;margin-bottom:14px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px}
+  .card h3{font-size:14px;margin:0 0 2px}.card .cap{font-size:11.5px;color:var(--ink-3);margin-bottom:12px}
+
+  .gauge{height:18px;border-radius:9px;background:var(--surface-2);overflow:hidden;margin:8px 0}
+  .gauge .fill{height:100%;background:var(--accent);border-radius:9px}
+  .gauge.warn .fill{background:var(--warn)}
+  .bigfig{font-size:28px;font-weight:700}.bigfig small{font-size:14px;color:var(--ink-3);font-weight:500}
+  .threshold{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-2);margin-top:8px}
+  .threshold input{width:64px;height:30px;border:1px solid var(--border);border-radius:7px;padding:0 8px;font:inherit}
+
+  .bars{display:flex;flex-direction:column;gap:9px}
+  .bar{display:grid;grid-template-columns:120px 1fr 72px;align-items:center;gap:10px;font-size:12.5px}
+  .bar .lab{color:var(--ink-2)}.bar .track{height:12px;background:var(--surface-2);border-radius:6px;overflow:hidden}.bar .fill{height:100%;background:var(--accent);border-radius:6px}
+  .bar .val{text-align:right;font-weight:600}
+
+  .split{height:16px;border-radius:8px;overflow:hidden;display:flex;margin:8px 0 6px}.split .a{background:var(--accent)}.split .b{background:var(--ink-3)}
+  .legend{display:flex;gap:16px;font-size:12px;color:var(--ink-2)}.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}.legend .a{background:var(--accent)}.legend .b{background:var(--ink-3)}
+  .toggle{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-2);margin-top:10px}
+  .sw{width:38px;height:22px;border-radius:999px;background:var(--accent);position:relative}.sw::after{content:"";position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;top:2px;right:2px}
+
+  /* APIキー運用 */
+  .keycard{display:flex;flex-direction:column;gap:12px}
+  .krow{display:flex;align-items:center;gap:10px;padding:11px 12px;border:1px solid var(--border);border-radius:10px}
+  .krow .ico{width:30px;height:30px;border-radius:7px;background:var(--info-bg);color:var(--info);display:grid;place-items:center}
+  .krow .info{flex:1}.krow .info b{font-weight:600}.krow .info small{display:block;color:var(--ink-3);font-size:11.5px}
+  .keyval{font-family:ui-monospace,Menlo,Consolas,monospace;letter-spacing:1px;color:var(--ink-2)}
+  .pill{font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px}.p-ok{background:var(--ok-bg);color:var(--ok)}.p-store{background:var(--surface-2);color:var(--ink-2)}
+  .btn-ghost{height:32px;padding:0 12px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--ink-2);font-size:12.5px}
+  .btn-rotate{height:32px;padding:0 12px;border:1px solid var(--accent);border-radius:7px;background:var(--surface);color:var(--accent-ink);font-size:12.5px;font-weight:600}
+  .warnline{background:var(--warn-bg);color:var(--warn);font-size:12px;border-radius:8px;padding:9px 11px}
+  .secnote{font-size:11.5px;color:var(--ink-3);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav"><a href="chat-impact-analysis.html">チャット</a><a href="file-manager.html">ファイル管理</a><a class="on">管理</a></nav>
+  <div class="spacer"></div><div class="user">管</div>
+</div>
+
+<div class="wrap">
+  <div class="subnav">
+    <a href="admin-usage.html">利用統計</a><a href="admin-ingest.html">KB取り込み</a>
+    <a href="admin-versions.html">版管理</a><a href="admin-users.html">ユーザー</a><a class="on">コスト/キー</a>
+  </div>
+  <div class="pagehead"><h1>コスト・APIキー運用</h1><div class="sub">予算・按分・キーのローテーション ・ キー値は表示しない（RUNTIME-SANDBOX §7）</div></div>
+
+  <!-- 予算＋按分 -->
+  <div class="grid">
+    <div class="card">
+      <h3>今月の予算消化（A30）</h3>
+      <div class="cap">OpenAI プロジェクト「sherpa-prod」 ・ 月次予算 ¥120,000</div>
+      <div class="bigfig">¥58,200 <small>/ ¥120,000（49%）</small></div>
+      <div class="gauge"><div class="fill" style="width:49%"></div></div>
+      <div class="threshold">アラート閾値 <input value="80"> % 到達で通知 ／ <input value="100"> % で自動スロットリング（代替A）</div>
+      <div class="secnote">超過見込み: 月末で ¥97,000（予算内）。</div>
+    </div>
+    <div class="card">
+      <h3>部門別コスト按分（A31）</h3>
+      <div class="cap">usage_events.est_cost を集計</div>
+      <div class="bars">
+        <div class="bar"><span class="lab">経理システム課</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">¥24,800</span></div>
+        <div class="bar"><span class="lab">販売管理課</span><span class="track"><span class="fill" style="width:73%"></span></span><span class="val">¥18,100</span></div>
+        <div class="bar"><span class="lab">基盤保守課</span><span class="track"><span class="fill" style="width:62%"></span></span><span class="val">¥15,300</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 機密モード＋外部送信ガード -->
+  <div class="card" style="margin-bottom:14px">
+    <h3>外部送信の割合（機密モード比率・A33）</h3>
+    <div class="cap">推論先の内訳 ・ メイン=OpenAI（外部）/ ローカル=Ollama（機密モード）</div>
+    <div class="split"><div class="a" style="width:78%"></div><div class="b" style="width:22%"></div></div>
+    <div class="legend"><span><i class="a"></i>OpenAI（外部送信）78%</span><span><i class="b"></i>Ollama（ローカル・送信ゼロ）22%</span></div>
+    <div class="toggle"><span class="sw"></span>外部送信ガード: 機密モードのセッションは egress を遮断（二重化・RUNTIME-SANDBOX §5）</div>
+  </div>
+
+  <!-- APIキー運用 -->
+  <div class="card">
+    <h3>APIキー運用（A32）</h3>
+    <div class="cap">キー値は UI に表示しない。保管は systemd 暗号化クレデンシャル。利用者には発行しない</div>
+    <div class="keycard">
+      <div class="krow">
+        <span class="ico">🔑</span>
+        <div class="info"><b>OpenAI — sherpa-prod</b><small>プロジェクト単位キー ・ 予算上限あり</small></div>
+        <span class="keyval">sk-•••• •••• •••• 4f2a</span>
+        <span class="pill p-store">systemd-creds</span>
+        <span class="pill p-ok">有効</span>
+      </div>
+      <div class="warnline">最終ローテーション: 2026-04-12（74日前） ・ 推奨周期 90日 → あと16日</div>
+      <div style="display:flex;gap:9px;align-items:center">
+        <button class="btn-rotate">ローテーション実行</button>
+        <button class="btn-ghost">即時失効（漏洩時・代替B）</button>
+        <span class="secnote" style="margin:0">実行＝「ストア更新＋再起動」。新旧キーを一時併用（二重鍵オーバーラップ）で無停止切替。</span>
+      </div>
+    </div>
+    <div class="secnote">ログにキー値は残さない。`.gitignore`＋シークレットスキャンで流入防止（RUNTIME-SANDBOX §7）。</div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,47 @@
+# Sherpa LAN 公開用 Caddyfile の例（HTTPS リバースプロキシ）。
+#
+# 使い方:
+#   1) https://caddyserver.com/ から caddy を導入する
+#   2) cp deploy/Caddyfile.example deploy/Caddyfile して、下の <host> を
+#      自分のホスト名か LAN の IP（例 192.168.1.50）に書き換える
+#   3) LAN=1 ./scripts/start.sh   （caddy コマンドと deploy/Caddyfile があれば自動起動）
+#      単体で動かすなら:  caddy run --config deploy/Caddyfile
+#
+# なぜ HTTPS が要るか:
+#   serve モード（SHERPA_ENV=production）はセッション cookie に Secure 属性を付ける。
+#   平文 http:// ではブラウザが cookie を送らずログインできない。Caddy で HTTPS 終端し、
+#   内側は 127.0.0.1:8000（アプリ）へ平文で渡すことで、この罠を避ける。
+#
+# 443 バインドやローカル CA のインストールには管理者権限が要る場合がある
+# （Linux では `sudo caddy run ...` か、caddy バイナリへの cap_net_bind_service 付与）。
+
+# <host> は公開したいホスト名か IP に置き換える。
+# 例1（ホスト名）:  sherpa.local
+# 例2（IP）:        192.168.1.50
+# 例3（任意ホスト名で受ける・内部CA証明書）:  :443
+<host> {
+	# ローカル CA でサーバ証明書を自動発行する（社内に正式証明書がある場合は
+	# この行を消して `tls /path/cert.pem /path/key.pem` に置き換える）。
+	# クライアント端末では Caddy のローカル CA を信頼させる必要がある。
+	tls internal
+
+	# レスポンス圧縮（任意）。
+	encode zstd gzip
+
+	# アプリ（uvicorn）へ委譲。Sherpa は既定で 127.0.0.1:8000 で待受している。
+	# SHERPA_PORT でアプリのポートを変えた場合は、下の 8000 も同じ値に合わせること。
+	# （443/80 自体が既存サービスと衝突する場合は、この Caddyfile の待受アドレス行を
+	#   例えば `:8443` のように変更する）
+	reverse_proxy 127.0.0.1:8000 {
+		# SSE（GET /chat/stream の text/event-stream）はそのまま流れる。
+		# Caddy は既定でレスポンスをバッファせずストリーミングするため、通常この設定は不要。
+		# もし環境依存でチャットのストリーミングが詰まる場合だけ、次のフラッシュ即時化を有効にする:
+		# flush_interval -1
+	}
+
+	# 個人ファイルのアップロード上限。アプリ側の既定は 10MB（SHERPA_WORKSPACE_MAX_BYTES）。
+	# 大きいファイルを許可したい場合は、こことアプリ側の上限の両方を上げること。
+	request_body {
+		max_size 100MB
+	}
+}

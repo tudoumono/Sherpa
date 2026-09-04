@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ホーム</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:900px;margin:0 auto}
+  /* ヒーロー（チャットへの導線＝1クリック） */
+  .home-hero{max-width:900px;margin:0 auto 26px;padding:34px 30px;border-radius:var(--radius);
+    background:linear-gradient(135deg,var(--accent-weak),var(--surface));border:1px solid var(--border);
+    display:flex;align-items:center;gap:22px;flex-wrap:wrap;position:relative;overflow:hidden}
+  /* ロゴの透かし: ボタンの裏に薄く敷く（読みやすさ優先で薄め・操作は透過） */
+  .home-hero::after{content:"";position:absolute;right:8px;top:50%;transform:translateY(-50%);
+    width:240px;height:220px;background:url(hero-logo.png) no-repeat center/contain;
+    opacity:.16;pointer-events:none}
+  .home-hero>*{position:relative;z-index:1}
+  .home-hero .txt{flex:1;min-width:240px}
+  .home-hero h1{font-size:26px;line-height:1.3;margin:0 0 8px}
+  .home-hero p{font-size:13.5px;color:var(--ink-2);margin:0;max-width:520px}
+  .home-cta{margin-top:16px;height:48px;padding:0 26px;font-size:15px;border-radius:999px;white-space:nowrap;
+    display:inline-flex;align-items:center;gap:8px;text-decoration:none}
+  .section-title{font-size:14px;font-weight:700;margin:0 0 12px;color:var(--ink)}
+  /* 投稿フォーム（admin のみ・既定は折りたたみ） */
+  .post-form-toggle{margin-bottom:20px}
+  .post-card{margin-bottom:20px}
+  .post-card h2{font-size:14px;font-weight:700;margin:0 0 12px}
+  .pform{display:flex;flex-direction:column;gap:10px}
+  .pform-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .pform-row .spacer{flex:1}
+  .pform label{display:block;font-size:11.5px;font-weight:600;color:var(--ink-3);margin-bottom:4px}
+  .pform input[type=text],.pform input[type=datetime-local],.pform select,.pform textarea{width:100%;box-sizing:border-box;padding:8px 10px;
+    border:1px solid var(--border);border-radius:var(--radius-sm);font-family:inherit;font-size:13px;
+    background:var(--surface);color:var(--ink)}
+  .pform textarea{min-height:90px;resize:vertical;line-height:1.6}
+  .pform .col-title{flex:2;min-width:220px}
+  .pform .col-cat{flex:1;min-width:140px}
+  .pform-err{font-size:12px;color:var(--danger);min-height:16px}
+  /* ダークテーマではネイティブのカレンダーアイコンも明色側に切り替える（背景に対して読める配色にする）。 */
+  [data-theme="dark"] .pform input[type=datetime-local]{color-scheme:dark}
+  /* お知らせ一覧 */
+  .ann{padding:16px 18px;border-bottom:1px solid var(--border)}
+  .ann:last-child{border-bottom:none}
+  .ann-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+  .ann-title{font-weight:700;font-size:14.5px;flex:1;min-width:120px}
+  .ann-date{font-size:11.5px;color:var(--ink-3);white-space:nowrap}
+  .ann-body{font-size:13.5px;line-height:1.75;color:var(--ink-2)}
+  .cat-badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
+  .cat-maintenance{background:var(--warn-bg);color:var(--warn)}
+  .cat-case{background:var(--ok-bg);color:var(--ok)}
+  .cat-notice{background:var(--surface-2);color:var(--ink-3)}
+  .pin{color:var(--accent-ink)}
+  .unpub-badge{font-size:10.5px;color:var(--ink-3);background:var(--surface-2);border:1px solid var(--border);
+    border-radius:5px;padding:1px 6px}
+  .ann-admin{display:flex;gap:8px;margin-top:10px}
+  .ann-admin .act-btn{height:26px;padding:0 9px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-2);font-size:11.5px;color:var(--ink-2);cursor:pointer}
+  .ann-admin .act-btn:hover{background:var(--surface)}
+  .ann-admin .act-btn.danger{color:var(--danger);border-color:var(--danger)}
+  .ann-empty{padding:30px;text-align:center;color:var(--ink-3);font-size:13px}
+  /* 通知（NOTIFY-1・掲示板とは別区画・平文・既読管理なし） */
+  .notif{padding:14px 18px;border-bottom:1px solid var(--border)}
+  .notif:last-child{border-bottom:none}
+  .notif-head{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap}
+  .notif-icon{font-size:14px}
+  .notif-world{font-weight:700;font-size:13.5px}
+  .notif-date{font-size:11.5px;color:var(--ink-3);white-space:nowrap;margin-left:auto}
+  .notif-body{font-size:13px;line-height:1.6;color:var(--ink-2)}
+  .notif-actions{margin-top:8px}
+  .notif-actions .act-btn{height:26px;padding:0 10px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-2);font-size:11.5px;color:var(--ink-2);cursor:pointer}
+  .notif-actions .act-btn:hover{background:var(--surface)}
+  .notif-actions .act-btn:disabled{opacity:.6;cursor:default}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div class="home-hero">
+    <div class="txt">
+      <h1>Sherpa へようこそ</h1>
+      <p>社内資料をチャットで調べる・分析する業務AI基盤です。まずはチャットを開いて質問してみましょう。</p>
+      <p class="home-hero-note">Sherpa（シェルパ）は、ヒマラヤ登山で道を知り荷を担ぐ案内人の呼び名。社内資料の山を知り尽くした案内役、という意味を込めています。</p>
+      <a class="btn-primary home-cta" href="chat.html">💬 チャットを開く</a>
+    </div>
+  </div>
+
+  <div class="wrap2">
+    <div id="post-form-wrap"></div>
+
+    <div class="section-title">通知</div>
+    <div class="card" id="notif-card">
+      <div id="notif-list"></div>
+    </div>
+
+    <div class="section-title">お知らせ</div>
+    <div class="card" id="ann-card">
+      <div id="ann-list"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="home.js"></script>
+</body>
+</html>

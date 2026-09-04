@@ -1,0 +1,50 @@
+# Local agent/editor state
+.agents/
+.codex/
+.vscode/
+.claude/settings.local.json
+.claude/agent-memory/
+
+# Generated review/output files
+tmp/
+
+# MVP dev runtime data (prod = /srv/sherpa). kb/uploads・md・src と users/*/workspace
+data/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.dify-kb-import*.json
+.dify-kb-import*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+# OCR 用の隔離 venv（コアと numpy が両立しないため別建て・requirements-ocr.txt から再作成できる）
+.venv-ocr/
+
+# Node/build outputs（make dist の本番配布 tarball も dist/ 配下＝git に上げない）
+node_modules/
+dist/
+build/
+coverage/
+# 独立UI自動化のスクリーンショット・ログ・trace・集計結果
+ui_automation/artifacts/
+# pytest-cov のローカル成果物（CI と同じ --cov をローカル実行すると生成される）
+.coverage
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
+
+# ローカルの Caddy 設定（LAN 公開時に .example からコピーして host/IP を書く）。例だけ追跡。
+deploy/Caddyfile
+# Claude Code のローカル権限設定（各自の環境ごと）
+.claude/settings.json

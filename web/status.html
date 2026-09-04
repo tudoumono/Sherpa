@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — システム状態</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:1100px;margin:0 auto}
+  /* UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時だけ、
+     自ページの共通トップバー/ナビを隠す（単独 URL 直開きは従来どおり・status.js 冒頭が判定）。 */
+  .embedded .topbar,.embedded nav{display:none}
+  .embedded .wrap{padding-top:8px}
+  /* 全体バナー */
+  .status-pill{font-size:14px;font-weight:700;padding:7px 16px;border-radius:999px;white-space:nowrap}
+  .status-pill.ok{background:var(--ok-bg);color:var(--ok)}
+  .status-pill.warn{background:var(--warn-bg);color:var(--warn)}
+  .status-pill.danger{background:var(--danger-bg);color:var(--danger)}
+  /* コンポーネント表 */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;font-size:11px;font-weight:600;color:var(--ink-3);padding:7px 10px;
+    border-bottom:2px solid var(--border);white-space:nowrap}
+  td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:top}
+  tr:hover td{background:var(--surface-2)}
+  .state-cell{white-space:nowrap;font-weight:600}
+  .detail-cell{max-width:320px;word-break:break-all;font-family:var(--font-code,monospace);font-size:11px;color:var(--ink-3)}
+  .hint-cell{max-width:280px;font-size:11.5px;color:var(--ink-3)}
+  .latency-cell{text-align:right;color:var(--ink-3);font-variant-numeric:tabular-nums}
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+  .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:13px">管理者権限が必要です。</div>
+  </div>
+  <div id="main-content">
+    <div class="pagehead">
+      <div>
+        <a class="crumb" href="admin-settings.html">← システム管理</a>
+        <h1>システム状態</h1>
+        <div class="sub">何が止まっているのかを一目で把握し、対処を計画できます。</div>
+      </div>
+    </div>
+
+    <div class="wrap2">
+      <!-- 全体バナー -->
+      <div class="card">
+        <div class="card-head">
+          <span class="ico">📡</span>
+          <div>
+            <div class="title">サービス全体</div>
+            <div class="sub" id="checked-at">最終チェック: —</div>
+          </div>
+          <div class="spacer"></div>
+          <span class="status-pill" id="status-pill">確認中…</span>
+          <button class="btn-secondary" id="recheck-btn">再チェック</button>
+        </div>
+      </div>
+
+      <!-- コンポーネント表 -->
+      <div class="card" style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>状態</th>
+              <th>コンポーネント</th>
+              <th>応答(ms)</th>
+              <th>詳細</th>
+              <th>対処</th>
+            </tr>
+          </thead>
+          <tbody id="health-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="status.js"></script>
+</body>
+</html>

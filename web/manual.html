@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa - マニュアル</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="manual-shell">
+  <aside class="manual-side">
+    <div class="manual-side-head">
+      <div class="manual-kicker">Sherpa Docs</div>
+      <h1>利用マニュアル</h1>
+      <p>画面で迷わず、調査・共有・資料更新ができるための内蔵マニュアルです。</p>
+    </div>
+    <label class="manual-search">
+      <span>検索</span>
+      <input id="doc-search" type="search" placeholder="例: 共有 / 出典 / 資料フォルダ / 取り込み">
+    </label>
+    <nav class="manual-nav" id="manual-nav"></nav>
+  </aside>
+
+  <main class="manual-main">
+    <div class="manual-hero">
+      <div>
+        <div class="manual-kicker">Sherpa User Guide</div>
+        <h2 id="doc-title">読み込み中...</h2>
+        <p id="doc-summary"></p>
+      </div>
+      <div class="manual-actions">
+        <a class="btn-ghost" href="chat.html">チャットへ</a>
+        <a class="btn-ghost" href="ingest.html">資料</a>
+      </div>
+    </div>
+
+    <div class="manual-filter-result" id="manual-filter-result" hidden></div>
+    <article class="manual-doc" id="manual-doc"></article>
+  </main>
+</div>
+
+<script src="vendor/marked.min.js"></script>
+<script src="manual.js"></script>
+</body>
+</html>

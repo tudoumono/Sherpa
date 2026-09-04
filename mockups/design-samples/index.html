@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<!--
+  Sherpa フロント洗練 — デザイン方向性の選定用ギャラリー（自己完結）
+  ここに並ぶ3案は「方向性のサンプル」で、本番コード（web/**）には未反映です。
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — デザイン方向性サンプル</title>
+<style>
+  :root{
+    --accent:#0d9488; --accent-weak:#d3f4ee; --accent-ink:#0f766e;
+    --bg:#f5f7f8; --surface:#fff; --surface-2:#eef1f3; --border:#e6eaee;
+    --ink:#1e2733; --ink-2:#586372; --ink-3:#8b96a4;
+    --radius:16px; --shadow-1:0 1px 3px rgba(16,24,40,.06);
+    --shadow-2:0 8px 30px rgba(16,24,40,.1);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);line-height:1.7;
+    font-size:14px;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent-ink)}
+  .wrap{max-width:1180px;margin:0 auto;padding:40px 32px 72px}
+
+  .disclaimer{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;
+    color:var(--accent-ink);background:var(--accent-weak);border-radius:999px;padding:6px 15px;margin-bottom:22px}
+  h1{font-size:30px;font-weight:800;letter-spacing:.01em;margin:0 0 8px}
+  .lead{font-size:15px;color:var(--ink-2);max-width:760px;margin:0 0 6px}
+  .meta{font-size:12.5px;color:var(--ink-3);margin:0 0 34px}
+
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow-1);overflow:hidden;display:flex;flex-direction:column;transition:box-shadow .2s,transform .2s}
+  .card:hover{box-shadow:var(--shadow-2);transform:translateY(-2px)}
+  /* スケール表示のプレビュー枠（実ファイルを iframe で縮小表示） */
+  .preview{position:relative;height:236px;background:var(--surface-2);border-bottom:1px solid var(--border);overflow:hidden}
+  .preview iframe{position:absolute;top:0;left:0;width:1200px;height:800px;border:0;
+    transform:scale(.294);transform-origin:top left;pointer-events:none}
+  .preview .cover{position:absolute;inset:0;text-decoration:none}
+  .badge{position:absolute;top:12px;left:12px;z-index:2;font-size:11px;font-weight:800;letter-spacing:.02em;
+    color:#fff;background:rgba(15,23,32,.72);border-radius:999px;padding:4px 11px}
+
+  .body{padding:18px 18px 20px;display:flex;flex-direction:column;flex:1}
+  .dir{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--accent-ink);text-transform:uppercase}
+  .name{font-size:18px;font-weight:800;margin:5px 0 12px}
+  .rows{display:flex;flex-direction:column;gap:9px;flex:1}
+  .row{font-size:12.5px;line-height:1.6}
+  .row .k{display:block;font-size:10.5px;font-weight:700;letter-spacing:.05em;color:var(--ink-3);
+    text-transform:uppercase;margin-bottom:2px}
+  .row .v{color:var(--ink-2)}
+  .swatches{display:flex;gap:6px;margin:14px 0 16px}
+  .sw{width:22px;height:22px;border-radius:6px;border:1px solid rgba(0,0,0,.08)}
+  .open{display:block;text-align:center;text-decoration:none;font-weight:700;font-size:13.5px;
+    color:#fff;background:var(--accent);border-radius:10px;padding:11px;box-shadow:var(--shadow-1)}
+  .open:hover{filter:brightness(1.05)}
+
+  .foot{margin-top:40px;padding-top:22px;border-top:1px solid var(--border);font-size:12.5px;color:var(--ink-3);line-height:1.85}
+  .foot b{color:var(--ink-2)}
+  @media(max-width:1024px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="disclaimer">🎨 デザイン方向性の選定用サンプル・本番未反映（web/** には手を入れていません）</div>
+  <h1>Sherpa フロント洗練 — 方向性サンプル 3案</h1>
+  <p class="lead" style="color:var(--accent-ink);font-weight:700">✅ 選定結果（2026-07-02）: 見た目は現行維持・下記 variant 3案は不採用。以後の改善はインタラクション（操作感）→ <a href="interactive/index.html">interactive/ の操作感デモを見る →</a></p>
+  <p class="lead">チャット画面（アプリの主戦場）を題材に、同じ会話内容のまま「見た目の方向性」だけを3通りに振り分けた静的モックです。以下は方向性検討の記録として残しています。</p>
+  <p class="meta">2026-07-02 作成 ・ 各案はダブルクリックで単体でも開けます（インライン CSS・外部依存なし） ・ 共通の柔らかいトーン（丸み・余白・穏やかな影）を土台に、タイポ・密度・面の使い方で差を付けています。</p>
+
+  <div class="grid">
+    <!-- 方向1 -->
+    <div class="card">
+      <div class="preview">
+        <span class="badge">方向 1</span>
+        <iframe src="variant-1-refined-teal.html" title="方向1 正統進化のプレビュー" scrolling="no" loading="lazy"></iframe>
+        <a class="cover" href="variant-1-refined-teal.html" title="方向1を開く"></a>
+      </div>
+      <div class="body">
+        <span class="dir">Refined Teal</span>
+        <div class="name">正統進化</div>
+        <div class="rows">
+          <div class="row"><span class="k">コンセプト</span><span class="v">現行のティール／丸み／ソフト影のトーンを保ったまま、タイポ階層・余白リズム・影と角丸の一貫性を整えて品を一段上げる。</span></div>
+          <div class="row"><span class="k">現行からの主な変更</span><span class="v">見出しの明確な階層化、カード影の層化、背景にごく淡いパステルのにじみ、コンポーザーを丸ピル化。</span></div>
+          <div class="row"><span class="k">向いている場合</span><span class="v">現行ユーザーが違和感なく移行でき、リスク低く「今より綺麗」にしたいとき。</span></div>
+        </div>
+        <div class="swatches" aria-label="配色">
+          <span class="sw" style="background:#0d9488"></span>
+          <span class="sw" style="background:#d3f4ee"></span>
+          <span class="sw" style="background:#f5f7f8"></span>
+          <span class="sw" style="background:#1e2733"></span>
+        </div>
+        <a class="open" href="variant-1-refined-teal.html">この案を開く →</a>
+      </div>
+    </div>
+
+    <!-- 方向2 -->
+    <div class="card">
+      <div class="preview">
+        <span class="badge">方向 2</span>
+        <iframe src="variant-2-warm-paper.html" title="方向2 温かみのプレビュー" scrolling="no" loading="lazy"></iframe>
+        <a class="cover" href="variant-2-warm-paper.html" title="方向2を開く"></a>
+      </div>
+      <div class="body">
+        <span class="dir">Warm Paper</span>
+        <div class="name">温かみ（ペーパー/クラフト調）</div>
+        <div class="rows">
+          <div class="row"><span class="k">コンセプト</span><span class="v">生成り色の紙のような背景に、見出しは明朝の表情。手触りのある落ち着きと、朱の差し色で温度を持たせる。</span></div>
+          <div class="row"><span class="k">現行からの主な変更</span><span class="v">配色を松葉色＋朱に、見出しを明朝混植に、背景を和紙調に。本文はサンセリフ＋●○符号化のまま可読性維持。</span></div>
+          <div class="row"><span class="k">向いている場合</span><span class="v">冷たさを避けたい／長時間読む文書業務で、目にやさしい落ち着いた雰囲気を出したいとき。</span></div>
+        </div>
+        <div class="swatches" aria-label="配色">
+          <span class="sw" style="background:#2f6d5c"></span>
+          <span class="sw" style="background:#b4472e"></span>
+          <span class="sw" style="background:#ece3d1"></span>
+          <span class="sw" style="background:#2c2620"></span>
+        </div>
+        <a class="open" href="variant-2-warm-paper.html">この案を開く →</a>
+      </div>
+    </div>
+
+    <!-- 方向3 -->
+    <div class="card">
+      <div class="preview">
+        <span class="badge">方向 3</span>
+        <iframe src="variant-3-focus-dark.html" title="方向3 モダン・フォーカスのプレビュー" scrolling="no" loading="lazy"></iframe>
+        <a class="cover" href="variant-3-focus-dark.html" title="方向3を開く"></a>
+      </div>
+      <div class="body">
+        <span class="dir">Focus Dark</span>
+        <div class="name">モダン・フォーカス</div>
+        <div class="rows">
+          <div class="row"><span class="k">コンセプト</span><span class="v">暖かみのあるダークチャコール＋単一のティールアクセント。柔らかい光で会話（中央）を持ち上げ、両サイドを静かに後退させる。</span></div>
+          <div class="row"><span class="k">現行からの主な変更</span><span class="v">既存のダークテーマを土台に、オーロラ状の淡い発光・回答カードの立ち上げ・送信ボタンの光でフォーカス感を追加。</span></div>
+          <div class="row"><span class="k">向いている場合</span><span class="v">集中して読む・映える見た目を求める層／既存ダークテーマを主役に格上げしたいとき。</span></div>
+        </div>
+        <div class="swatches" aria-label="配色">
+          <span class="sw" style="background:#2dd4bf"></span>
+          <span class="sw" style="background:#0f3b35"></span>
+          <span class="sw" style="background:#0f141b"></span>
+          <span class="sw" style="background:#e8eef4"></span>
+        </div>
+        <a class="open" href="variant-3-focus-dark.html">この案を開く →</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>見方のヒント：</b> プレビューは実ファイルの縮小表示です。「この案を開く」で原寸（デスクトップ 1200px 想定）を確認できます。<br>
+    3案とも会話内容は同一（消費税率の影響範囲分析）で、違うのはデザインだけです。トークンの対応（採用時にどの変数がどう変わるか）は <b>README.md</b> を参照してください。
+  </div>
+</div>
+</body>
+</html>

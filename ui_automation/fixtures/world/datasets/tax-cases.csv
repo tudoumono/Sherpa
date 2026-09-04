@@ -1,0 +1,3 @@
+case_id,amount,rate,rounding,expected
+SHERPA-LIVE-ALPHA-927,1000,0.125,floor,125
+SHERPA-LIVE-REFERENCE-314,999,0.125,floor,124

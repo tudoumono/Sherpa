@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 影響範囲分析（UI モック）</title>
+<style>
+  /* ===== デザイントークン（ここを変えれば一括リスキン可能） ===== */
+  :root{
+    --accent:#0d9488;          /* Sherpa: 落ち着いたティール（信頼/案内） */
+    --accent-weak:#ccfbf1;
+    --accent-ink:#0f766e;
+    --bg:#f6f7f9;
+    --surface:#ffffff;
+    --surface-2:#f1f3f5;
+    --border:#e3e6ea;
+    --ink:#1f2937;
+    --ink-2:#5b6573;
+    --ink-3:#8b95a3;
+    --ok:#16a34a;              /* 確実（静的解析） */
+    --ok-bg:#e9f7ef;
+    --warn:#d97706;            /* 要確認（LLM） */
+    --warn-bg:#fdf3e7;
+    --radius:12px;
+    --radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+    --shadow-lg:0 10px 30px rgba(16,24,40,.18);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+
+  /* ===== トップバー ===== */
+  .topbar{height:52px;display:flex;align-items:center;gap:12px;padding:0 16px;
+    background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.02em}
+  .brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);
+    display:grid;place-items:center;color:#fff;font-size:14px}
+  .brand small{font-weight:500;color:var(--ink-3);margin-left:2px}
+  .topbar .spacer{flex:1}
+  .user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);
+    border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+
+  /* ===== 3ペイン ===== */
+  .app{display:grid;grid-template-columns:262px 1fr 332px;height:calc(100vh - 52px)}
+  .pane{min-height:0;min-width:0;display:flex;flex-direction:column}
+  .pane.left{border-right:1px solid var(--border);background:var(--surface)}
+  .pane.right{border-left:1px solid var(--border);background:var(--surface)}
+  .pane.center{background:var(--bg)}
+  .pane-head{height:46px;display:flex;align-items:center;gap:8px;padding:0 14px;
+    border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--ink-2);flex:0 0 auto}
+  .pane-body{flex:1;overflow:auto;padding:12px}
+
+  /* ===== 左: 会話履歴 ===== */
+  .newbtn{width:100%;height:36px;border:1px solid var(--accent);color:var(--accent-ink);
+    background:var(--accent-weak);border-radius:var(--radius-sm);font-weight:600;margin-bottom:10px}
+  .search{width:100%;height:34px;border:1px solid var(--border);border-radius:var(--radius-sm);
+    padding:0 10px;background:var(--surface-2);color:var(--ink);margin-bottom:12px}
+  .conv{padding:9px 11px;border-radius:var(--radius-sm);margin-bottom:4px;cursor:pointer;color:var(--ink-2)}
+  .conv:hover{background:var(--surface-2)}
+  .conv.active{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .conv .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .conv .d{font-size:11px;color:var(--ink-3);font-weight:400}
+
+  /* ===== 中央: チャット ===== */
+  .conv-head{display:flex;align-items:center;gap:10px;padding:0 16px;height:50px;
+    border-bottom:1px solid var(--border);background:var(--surface);flex:0 0 auto}
+  .conv-title{font-weight:600}
+  .verselect{margin-left:6px;display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 10px;
+    border:1px solid var(--border);border-radius:999px;background:var(--surface-2);font-size:12.5px;color:var(--ink-2)}
+  .verselect b{color:var(--ink)}
+  .verselect .caret{color:var(--ink-3)}
+  .conv-head .spacer{flex:1}
+  .ghostbtn{height:30px;padding:0 12px;border:1px solid var(--border);background:var(--surface);
+    border-radius:var(--radius-sm);color:var(--ink-2);font-size:12.5px}
+  .messages{flex:1;overflow:auto;padding:20px 18px}
+  .msg{width:min(820px,100%);margin:0 auto 20px}
+  .msg.user{display:flex;justify-content:flex-end}
+  .bubble-user{background:var(--accent);color:#fff;padding:10px 14px;border-radius:14px 14px 4px 14px;max-width:70%}
+  .a-row{display:flex;gap:11px}
+  .a-avatar{width:30px;height:30px;border-radius:8px;background:var(--accent-weak);color:var(--accent-ink);
+    display:grid;place-items:center;font-size:13px;flex:0 0 auto;font-weight:700}
+  .a-body{flex:1;min-width:0}
+
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
+  .chip{display:inline-flex;align-items:center;gap:5px;height:25px;padding:0 9px;border-radius:999px;
+    font-size:11.5px;border:1px solid var(--border);background:var(--surface);color:var(--ink-3)}
+  .chip.on{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .chip .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+  .a-text{margin:2px 0 12px}
+
+  /* ===== 影響一覧サマリカード ===== */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);overflow:hidden;margin-bottom:12px}
+  .card-head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--border)}
+  .card-head .ico{width:28px;height:28px;border-radius:7px;background:var(--accent-weak);color:var(--accent-ink);
+    display:grid;place-items:center;font-size:14px}
+  .card-head .title{font-weight:700}
+  .card-head .sub{font-size:12px;color:var(--ink-3)}
+  .card-head .spacer{flex:1}
+  .pill{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600}
+  .pill.ok{background:var(--ok-bg);color:var(--ok)}
+  .pill.warn{background:var(--warn-bg);color:var(--warn)}
+
+  .summary{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--border)}
+  .sumcell{background:var(--surface);padding:11px 12px;text-align:center}
+  .sumcell .n{font-size:20px;font-weight:700}
+  .sumcell .l{font-size:11px;color:var(--ink-3)}
+  .sumcell .mini{margin-top:3px;font-size:10.5px;display:flex;gap:7px;justify-content:center}
+  .sumcell .mini .ok{color:var(--ok)} .sumcell .mini .warn{color:var(--warn)}
+
+  .card-actions{display:flex;gap:9px;padding:12px 14px;border-top:1px solid var(--border);align-items:center}
+  .btn-primary{height:34px;padding:0 14px;border:none;border-radius:var(--radius-sm);background:var(--accent);
+    color:#fff;font-weight:600;font-size:13px}
+  .btn-secondary{height:34px;padding:0 13px;border:1px solid var(--border);border-radius:var(--radius-sm);
+    background:var(--surface);color:var(--ink);font-size:13px;display:inline-flex;align-items:center;gap:6px}
+  .card-actions .spacer{flex:1}
+  .card-actions .hint{font-size:11.5px;color:var(--ink-3)}
+
+  /* 参照DL チップ */
+  .reflist{display:flex;flex-wrap:wrap;gap:7px}
+  .refchip{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 11px;border-radius:999px;
+    border:1px solid var(--border);background:var(--surface);font-size:12px;color:var(--ink-2)}
+  .refchip .dl{color:var(--accent-ink)}
+
+  /* ===== 入力 ===== */
+  .composer{flex:0 0 auto;padding:12px 18px;border-top:1px solid var(--border);background:var(--surface)}
+  .composer .box{max-width:820px;margin:0 auto;border:1px solid var(--border);border-radius:var(--radius);
+    padding:8px 10px;display:flex;align-items:flex-end;gap:8px;background:var(--surface)}
+  .composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;font-size:14px;
+    max-height:120px;background:transparent;color:var(--ink);padding:6px 2px}
+  .iconbtn{width:34px;height:34px;border-radius:8px;border:1px solid var(--border);background:var(--surface);
+    color:var(--ink-2);display:grid;place-items:center;flex:0 0 auto}
+  .sendbtn{width:34px;height:34px;border-radius:8px;border:none;background:var(--accent);color:#fff;
+    display:grid;place-items:center;flex:0 0 auto}
+
+  /* ===== 右: トレース ===== */
+  .tabs{display:flex;gap:4px;padding:8px 10px 0}
+  .tab{flex:1;text-align:center;height:32px;line-height:32px;font-size:12.5px;color:var(--ink-3);
+    border-radius:8px 8px 0 0;cursor:pointer}
+  .tab.on{color:var(--accent-ink);font-weight:600;background:var(--accent-weak)}
+  .tabpane{display:none;padding:14px} .tabpane.on{display:block}
+  .trace .step{position:relative;padding:0 0 16px 22px;border-left:2px solid var(--border);margin-left:5px}
+  .trace .step:last-child{border-left-color:transparent}
+  .trace .step::before{content:"";position:absolute;left:-7px;top:2px;width:12px;height:12px;border-radius:50%;
+    background:var(--surface);border:2px solid var(--accent)}
+  .trace .step.done::before{background:var(--accent)}
+  .trace .k{font-size:12.5px;font-weight:600}
+  .trace .v{font-size:12px;color:var(--ink-3)}
+  .filebox{display:flex;align-items:center;gap:9px;padding:9px;border:1px solid var(--border);
+    border-radius:var(--radius-sm);margin-bottom:8px}
+  .filebox .fi{width:28px;height:28px;border-radius:6px;background:var(--surface-2);display:grid;place-items:center;color:var(--ink-2)}
+  .filebox .fn{font-size:12.5px;flex:1;min-width:0}
+  .filebox .fn small{display:block;color:var(--ink-3);font-size:11px}
+  .filebox .dl{color:var(--accent-ink);font-size:12px;border:none;background:none}
+
+  /* ===== 結果ビュー（全画面オーバーレイ / R4・R5） ===== */
+  .overlay{position:fixed;inset:0;background:rgba(16,24,40,.42);display:none;z-index:30}
+  .overlay.open{display:block}
+  .resultview{position:absolute;inset:24px;background:var(--surface);border-radius:16px;
+    box-shadow:var(--shadow-lg);display:flex;flex-direction:column;overflow:hidden}
+  .rv-head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--border)}
+  .rv-head .title{font-weight:700;font-size:16px}
+  .rv-head .headline{font-weight:700;font-size:19px;line-height:1.3;max-width:680px}
+  .rv-head .sub{font-size:12.5px;color:var(--ink-3);margin-top:5px}
+  .rv-head .spacer{flex:1}
+  .closebtn{width:34px;height:34px;border-radius:8px;border:1px solid var(--border);background:var(--surface);font-size:16px;color:var(--ink-2)}
+  .rv-toolbar{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+  .rv-toolbar .lbl{font-size:12px;color:var(--ink-3)}
+  .filterchip{height:28px;padding:0 11px;border-radius:999px;border:1px solid var(--border);background:var(--surface);
+    font-size:12px;color:var(--ink-2)}
+  .filterchip.on{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .rv-body{flex:1;overflow:auto;padding:0 20px 20px}
+  table.impact{width:100%;border-collapse:collapse;font-size:13px}
+  table.impact thead th{position:sticky;top:0;background:var(--surface);text-align:left;
+    padding:11px 10px;border-bottom:2px solid var(--border);color:var(--ink-2);font-size:12px;font-weight:600}
+  table.impact td{padding:11px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+  .kind{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;background:var(--surface-2);color:var(--ink-2)}
+  .conf{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}
+  .conf .d{width:8px;height:8px;border-radius:50%}
+  .conf.ok{color:var(--ok)} .conf.ok .d{background:var(--ok)}                       /* ● 確実=塗り */
+  .conf.warn{color:var(--warn)} .conf.warn .d{background:transparent;border:2px solid var(--warn);width:9px;height:9px} /* ○ 要確認=白抜き */
+  .pathbtn{border:none;background:none;color:var(--accent-ink);font-size:12px;cursor:pointer;padding:0}
+  .path{margin-top:8px;display:none;font-size:12px;color:var(--ink-2);background:var(--surface-2);
+    border-radius:8px;padding:9px 11px}
+  tr.expanded .path{display:block}
+  .path .chain{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:var(--ink)}
+  .path .ev{margin-top:6px;color:var(--ink-3)}
+  .rowdl{border:1px solid var(--border);background:var(--surface);border-radius:7px;height:28px;padding:0 10px;font-size:12px;color:var(--accent-ink)}
+  tr.hideRow{display:none}
+</style>
+</head>
+<body>
+
+<!-- トップバー -->
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <div class="spacer"></div>
+  <button class="ghostbtn">共有</button>
+  <div class="user">田</div>
+</div>
+
+<div class="app">
+  <!-- 左: 会話履歴 -->
+  <aside class="pane left">
+    <div class="pane-body">
+      <button class="newbtn">＋ 新しい会話</button>
+      <input class="search" placeholder="会話を検索">
+      <div class="conv active">
+        <div class="t">消費税率の改修 影響範囲</div>
+        <div class="d">今日 14:32 ・ 2025冬リリース</div>
+      </div>
+      <div class="conv">
+        <div class="t">請求書フォーマット変更の確認</div>
+        <div class="d">昨日 ・ 2025冬リリース</div>
+      </div>
+      <div class="conv">
+        <div class="t">夜間バッチ ABEND 切り分け</div>
+        <div class="d">6/22 ・ 2025春更改</div>
+      </div>
+      <div class="conv">
+        <div class="t">新設計書ドラフトの規約チェック</div>
+        <div class="d">6/20 ・ 個人アップロード</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中央: チャット -->
+  <main class="pane center">
+    <div class="conv-head">
+      <span class="conv-title">消費税率の改修 影響範囲</span>
+      <span class="verselect" title="版スコープ（R1）"><span>版</span><b>2025冬リリース</b><span class="caret">▾</span></span>
+      <div class="spacer"></div>
+      <button class="ghostbtn">共有</button>
+    </div>
+
+    <div class="messages">
+      <!-- ユーザー -->
+      <div class="msg user"><div class="bubble-user">消費税率を変更したい。影響範囲を教えて。</div></div>
+
+      <!-- アシスタント -->
+      <div class="msg">
+        <div class="a-row">
+          <div class="a-avatar">S</div>
+          <div class="a-body">
+            <!-- 経路チップ（R2） -->
+            <div class="chips">
+              <span class="chip on"><span class="dot"></span>RAG-Neo4j</span>
+              <span class="chip">RAG-ES</span>
+              <span class="chip">grep</span>
+              <span class="chip">コード実行</span>
+            </div>
+
+            <div class="a-text">
+              「<b>消費税率</b>」（<code>Parameter: TAX-RATE</code>）を起点に <b>2025冬リリース版</b>の
+              グラフを逆向きにたどりました。修正対象の候補は <b>11 件</b>です（確実 8 / 要確認 3）。
+              下のサマリから全画面の結果ビューで確認できます。
+            </div>
+
+            <!-- 影響一覧サマリカード（R4） -->
+            <div class="card">
+              <div class="card-head">
+                <span class="ico">📊</span>
+                <div>
+                  <div class="title">影響範囲: 消費税率</div>
+                  <div class="sub">起点 TAX-RATE ・ 2025冬リリース ・ 深さ ≤6 ・ 計 11 件</div>
+                </div>
+                <div class="spacer"></div>
+                <span class="pill ok">● 確実 8</span>
+                <span class="pill warn">○ 要確認 3</span>
+              </div>
+              <div class="summary">
+                <div class="sumcell"><div class="n">3</div><div class="l">機能</div><div class="mini"><span class="ok">●2</span><span class="warn">○1</span></div></div>
+                <div class="sumcell"><div class="n">2</div><div class="l">帳票</div><div class="mini"><span class="ok">●1</span><span class="warn">○1</span></div></div>
+                <div class="sumcell"><div class="n">1</div><div class="l">画面</div><div class="mini"><span class="ok">●1</span></div></div>
+                <div class="sumcell"><div class="n">4</div><div class="l">ソース</div><div class="mini"><span class="ok">●4</span></div></div>
+                <div class="sumcell"><div class="n">1</div><div class="l">バッチ</div><div class="mini"><span class="warn">○1</span></div></div>
+              </div>
+              <div class="card-actions">
+                <button class="btn-primary" onclick="openRV()">全画面の結果ビューで開く</button>
+                <button class="btn-secondary">⬇ Excel 出力（影響一覧）</button>
+                <div class="spacer"></div>
+                <span class="hint">● 確実=静的解析 / ○ 要確認=LLM 抽出</span>
+              </div>
+            </div>
+
+            <!-- 参照DL（R6） -->
+            <div class="reflist">
+              <span class="refchip">📄 請求機能設計書.pdf <span class="dl">⬇</span></span>
+              <span class="refchip">📄 税計算仕様書.xlsx <span class="dl">⬇</span></span>
+              <span class="refchip">📄 INVOICE-CPY 定義.txt <span class="dl">⬇</span></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 入力 -->
+    <div class="composer">
+      <div class="box">
+        <button class="iconbtn" title="ファイル添付（R9）">＋</button>
+        <textarea rows="1" placeholder="メッセージを入力（例: 要確認の3件だけ詳しく）"></textarea>
+        <button class="sendbtn">↑</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右: トレース＋参照ファイル -->
+  <aside class="pane right">
+    <div class="tabs">
+      <div class="tab on" onclick="switchTab(event,'trace')">実行トレース</div>
+      <div class="tab" onclick="switchTab(event,'files')">参照ファイル</div>
+    </div>
+    <div class="pane-body" style="padding-top:4px">
+      <div id="trace" class="tabpane on">
+        <div class="trace">
+          <div class="step done"><div class="k">経路選択</div><div class="v">影響範囲分析 → RAG-Neo4j</div></div>
+          <div class="step done"><div class="k">版スコープ解決</div><div class="v">2025冬リリース（最新）</div></div>
+          <div class="step done"><div class="k">起点エンティティ解決</div><div class="v">「消費税率」→ Parameter:TAX-RATE（候補2件→確定）</div></div>
+          <div class="step done"><div class="k">グラフ探索</div><div class="v">逆向き推移たどり 深さ≤6（COPIES/USES/IMPLEMENTED_BY…）</div></div>
+          <div class="step done"><div class="k">影響ノード収集</div><div class="v">11件（確実8 / 要確認3）</div></div>
+          <div class="step done"><div class="k">根拠設計書 解決</div><div class="v">documents 台帳経由で 7件</div></div>
+          <div class="step"><div class="k">メイン精査</div><div class="v">OpenAI で確信度を検証・整列 … 完了</div></div>
+        </div>
+      </div>
+      <div id="files" class="tabpane">
+        <div class="filebox"><span class="fi">📄</span><span class="fn">請求機能設計書.pdf<small>uploads/2025冬/設計書/</small></span><button class="dl">⬇</button></div>
+        <div class="filebox"><span class="fi">📊</span><span class="fn">税計算仕様書.xlsx<small>uploads/2025冬/仕様/</small></span><button class="dl">⬇</button></div>
+        <div class="filebox"><span class="fi">📄</span><span class="fn">INVOICE-CPY 定義.txt<small>uploads/2025冬/src/copy/</small></span><button class="dl">⬇</button></div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- 結果ビュー（全画面 / R4・R5・R6） -->
+<div class="overlay" id="overlay">
+  <div class="resultview">
+    <div class="rv-head">
+      <div>
+        <div class="headline">消費税率を改定すると、11 件の資材に影響が及ぶ</div>
+        <div class="sub">影響範囲分析 ・ 2025冬リリース ・ 起点 TAX-RATE ・ ● 確実 8（静的）/ ○ 要確認 3（LLM）・ 出典 documents 台帳</div>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn-secondary">⬇ Excel 出力</button>
+      <button class="closebtn" onclick="closeRV()">✕</button>
+    </div>
+    <div class="rv-toolbar">
+      <span class="lbl">種別:</span>
+      <button class="filterchip on">すべて</button>
+      <button class="filterchip">機能</button><button class="filterchip">帳票</button>
+      <button class="filterchip">画面</button><button class="filterchip">ソース</button><button class="filterchip">バッチ</button>
+      <span style="width:14px"></span>
+      <span class="lbl">確信度:</span>
+      <button class="filterchip on" onclick="filterConf(event,'all')">すべて</button>
+      <button class="filterchip" onclick="filterConf(event,'ok')">確実</button>
+      <button class="filterchip" onclick="filterConf(event,'warn')">要確認</button>
+    </div>
+    <div class="rv-body">
+      <table class="impact">
+        <thead><tr>
+          <th style="width:90px">種別 ▾</th><th>対象</th><th style="width:120px">確信度 ▾</th>
+          <th style="width:130px">経路（理由）</th><th style="width:90px">根拠</th>
+        </tr></thead>
+        <tbody id="impactBody">
+          <tr data-conf="ok">
+            <td><span class="kind">機能</span></td>
+            <td><b>請求書発行機能</b></td>
+            <td><span class="conf ok"><span class="d"></span>確実</span></td>
+            <td><button class="pathbtn" onclick="togglePath(this)">経路を表示 ▾</button>
+              <div class="path"><div class="chain">TAX-RATE ←REFERENCES← 税計算ルール ←USES← 請求書発行機能</div>
+              <div class="ev">根拠: 請求機能設計書.pdf §4「請求額は消費税率を用いて算出」</div></div></td>
+            <td><button class="rowdl">⬇ DL</button></td>
+          </tr>
+          <tr data-conf="ok">
+            <td><span class="kind">ソース</span></td>
+            <td><b>BILLGEN</b>（COBOL）</td>
+            <td><span class="conf ok"><span class="d"></span>確実</span></td>
+            <td><button class="pathbtn" onclick="togglePath(this)">経路を表示 ▾</button>
+              <div class="path"><div class="chain">TAX-RATE ←CONTAINS← INVOICE-CPY ←COPIES← BILLGEN</div>
+              <div class="ev">根拠（静的解析）: BILLGEN が INVOICE-CPY を COPY / 50本中の1本</div></div></td>
+            <td><button class="rowdl">⬇ DL</button></td>
+          </tr>
+          <tr data-conf="ok">
+            <td><span class="kind">帳票</span></td>
+            <td><b>請求書</b></td>
+            <td><span class="conf ok"><span class="d"></span>確実</span></td>
+            <td><button class="pathbtn" onclick="togglePath(this)">経路を表示 ▾</button>
+              <div class="path"><div class="chain">TAX-RATE ← … ← 請求書発行機能 ←PRODUCED_BY← 請求書</div></div></td>
+            <td><button class="rowdl">⬇ DL</button></td>
+          </tr>
+          <tr data-conf="ok">
+            <td><span class="kind">画面</span></td>
+            <td><b>請求入力画面</b></td>
+            <td><span class="conf ok"><span class="d"></span>確実</span></td>
+            <td><button class="pathbtn" onclick="togglePath(this)">経路を表示 ▾</button>
+              <div class="path"><div class="chain">請求入力画面 ←INVOKES→ 請求書発行機能 →USES→ TAX-RATE</div></div></td>
+            <td><button class="rowdl">⬇ DL</button></td>
+          </tr>
+          <tr data-conf="warn">
+            <td><span class="kind">機能</span></td>
+            <td><b>見積機能</b></td>
+            <td><span class="conf warn"><span class="d"></span>要確認</span></td>
+            <td><button class="pathbtn" onclick="togglePath(this)">経路を表示 ▾</button>
+              <div class="path"><div class="chain">TAX-RATE ←USES?← 見積機能（LLM抽出・確信度0.62）</div>
+              <div class="ev">要確認: 設計書の記述から推定。税抜表示のみの可能性あり。</div></div></td>
+            <td><button class="rowdl">⬇ DL</button></td>
+          </tr>
+          <tr data-conf="warn">
+            <td><span class="kind">バッチ</span></td>
+            <td><b>日次売上集計バッチ</b></td>
+            <td><span class="conf warn"><span class="d"></span>要確認</span></td>
+            <td><button class="pathbtn" onclick="togglePath(this)">経路を表示 ▾</button>
+              <div class="path"><div class="chain">日次売上集計バッチ ←INVOKES→ 売上計上機能 →USES?→ TAX-RATE</div>
+              <div class="ev">要確認: 税込/税抜の集計区分が設計書から判別できず。</div></div></td>
+            <td><button class="rowdl">⬇ DL</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+  function openRV(){document.getElementById('overlay').classList.add('open');}
+  function closeRV(){document.getElementById('overlay').classList.remove('open');}
+  function switchTab(e,id){
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+    document.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('on'));
+    e.currentTarget.classList.add('on');
+    document.getElementById(id).classList.add('on');
+  }
+  function togglePath(btn){
+    const tr=btn.closest('tr'); tr.classList.toggle('expanded');
+    btn.textContent = tr.classList.contains('expanded') ? '経路を隠す ▴' : '経路を表示 ▾';
+  }
+  function filterConf(e,kind){
+    e.currentTarget.parentNode.querySelectorAll('.filterchip').forEach((c,i)=>{ if(i>=4) c.classList.remove('on'); });
+    e.currentTarget.classList.add('on');
+    document.querySelectorAll('#impactBody tr').forEach(tr=>{
+      tr.classList.toggle('hideRow', kind!=='all' && tr.dataset.conf!==kind);
+    });
+  }
+  // 全画面ビューをデフォルトで一度見せたい場合はコメント解除:
+  // openRV();
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeRV(); });
+</script>
+</body>
+</html>

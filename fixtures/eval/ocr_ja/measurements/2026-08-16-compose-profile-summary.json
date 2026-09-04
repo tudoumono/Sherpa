@@ -1,0 +1,109 @@
+{
+ "schema": "sherpa-ocr-compose-profile-measurement-v1",
+ "measured_at": "2026-08-16T11:37:00Z",
+ "production_data_used": false,
+ "compose_project": "sherpa-ocr-staged-20260816",
+ "profile": "ocr",
+ "environment_file_loaded": false,
+ "note": "merge/staged-integration へOCRを移植した際の実測。OCR を既定ONにし取り込みへ配線した後、コード変更を反映して測り直した（reindex 経路の是正・観測の検索接続）。",
+ "input": {
+  "kind": "synthetic_fixture",
+  "source": "fixtures/eval/excel_ja/assets/廃止スタンプ.png",
+  "source_sha256": "ff9110cb7aa3f9de52d10b8bf1b7f158fb49f1902754e7ba23e116a0750cda55",
+  "source_size_bytes": 2581,
+  "source_hash_size_mtime_unchanged": true,
+  "source_files_created_by_worker": 0
+ },
+ "image": {
+  "name": "sherpa/ocr-worker:paddleocr-3.7.0-cpu",
+  "id": "sha256:837a98362bbdfa907b148e6e145c2b326b91858d374b6b85a9a74910f3793939",
+  "created": "2026-08-16T20:36:33.465100103+09:00"
+ },
+ "implementation": {
+  "git_head_before_commit": "cd98ff16e7405082101922319d76fa1be6968705",
+  "engine_profile_hash": "sha256:c897791f09dc29f9010c36e30d784e719d100bc040774e049bfa1b9e6e9a1435",
+  "ocr_router_profile": "evidence-raster-router-v3",
+  "files": {
+   ".dockerignore": "458ff3a412e50a3599a9c35f31dd139343bd7692de6d0c665846034b4e3e1772",
+   "docker-compose.yml": "74c567b7693511e08b85b69a867f6a536678d61517fe29d433824aab7936ec8f",
+   "docker/ocr/Dockerfile": "6dd5ddffc57de9122e3e192e77c181b7f5bce089d0e7c839a1c1a7e3df93dc9f",
+   "requirements.txt": "316ec2487aab90fb691ea1f75e6336d57ba407356071e00ecf6c1af934bf263f",
+   "requirements-ocr.txt": "a9b42ec0d1e4b16779ab618094581bcb993ea9dd124f612a9252afc8d96a57e0",
+   "constraints.txt": "7d179d4f4944a0cc9c08fb3b8dc3385c241cf41d649e0212e17f5695ea8e2d2a",
+   "constraints-ocr.txt": "b3d32ad9ed2018402ca7f2f9b46897ca97243921b99a1ed663bb827ae25063bb",
+   "docker/ocr-models.lock.json": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
+   "sherpa/ingest/ai_observation.py": "c18493e7a06bb24231ead134399e47042a758b4acb5920a70b405e4fb7930fe2",
+   "sherpa/ingest/ocr_worker.py": "ab05dadb196363b2e00c680e3bda134e95a701ad04fb73e30097dcd0be842e57",
+   "sherpa/ingest/ocr_router.py": "26dcd240df907ff417d29fd7ef129b7a8d221216f0f8ab669f3d52344679ee73",
+   "sherpa/ingest/observation_render.py": "ae15d006c4ca7054292d3427f3729f2a293960731f85e2023643b12ba7728004",
+   "sherpa/store/ocr_jobs.py": "9938f86735ff6bab161b7fbf8aaf49b5914f4222b8d813e8a4c5159204d4562a"
+  }
+ },
+ "runtime": {
+  "worker_uid": 1000,
+  "worker_gid": 1000,
+  "heartbeat_available": true,
+  "heartbeat_status": "idle",
+  "model_hashes_valid": true,
+  "root_filesystem_read_only": true,
+  "capabilities_dropped": [
+   "ALL"
+  ],
+  "no_new_privileges": true,
+  "internal_network": true,
+  "host_published_ports": 0,
+  "isolated_postgres_host_port": 55439
+ },
+ "mount_checks": {
+  "world_root_read_only": true,
+  "canonical_derived_read_only": true,
+  "model_cache_read_only": true,
+  "observation_root_read_write": true,
+  "repository_not_mounted": true,
+  "environment_files_in_image": 0,
+  "write_to_world_root_rejected": true,
+  "write_to_canonical_derived_rejected": true,
+  "write_to_model_cache_rejected": true,
+  "write_to_container_root_rejected": true,
+  "write_to_observation_root_succeeded": true,
+  "write_rejection_errno": 30
+ },
+ "network_checks": {
+  "outbound_ipv4_connection_rejected": true,
+  "successful_external_connections": 0,
+  "error": "OSError: [Errno 101] Network is unreachable",
+  "postgres_on_internal_network_reachable": true
+ },
+ "image_inventory": {
+  "python_package_inventory_sha256": "7fcaf9d865e1eb70535c7021a47fd016b8f522a4ee12a1c0e95a19c3a3344978",
+  "model_lock_sha256": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
+  "notice_sha256": "9adc11caf5590e85426872d4397e8e46e30a93dad97cb5ecdd86c1bad5db0e1c",
+  "real_sbom_complete": false,
+  "legal_review_complete": false,
+  "models_bundled": false
+ },
+ "commands": [
+  "env SHERPA_OCR_WORLD_ROOT=<temporary-synthetic-world-root> SHERPA_DERIVED_DIR=<temporary-derived-root> SHERPA_OBSERVATION_DIR=<temporary-observation-root> SHERPA_OCR_MODEL_CACHE=<host-paddlex-cache> POSTGRES_PASSWORD=<ephemeral-test-value> PGPORT=55439 docker compose -p sherpa-ocr-staged-20260816 --env-file /dev/null --profile ocr build ocr-worker",
+  "env ... docker compose -p sherpa-ocr-staged-20260816 --env-file /dev/null --profile ocr up -d --no-build postgres ocr-worker",
+  "docker inspect sherpa-ocr-staged-20260816-ocr-worker-1",
+  "docker exec -i sherpa-ocr-staged-20260816-ocr-worker-1 python - < <read-only, network and model checks>",
+  "docker exec sherpa-ocr-staged-20260816-postgres-1 psql <heartbeat query>",
+  "docker compose -p sherpa-ocr-staged-20260816 --env-file /dev/null --profile ocr down -v"
+ ],
+ "cleanup": {
+  "isolated_stack_removed": true,
+  "isolated_volume_removed": true,
+  "temporary_input_and_output_roots_removed": true,
+  "main_stack_lifecycle_touched": false
+ },
+ "amendments": [
+  {
+   "date": "2026-08-22",
+   "field": "implementation.files.docker-compose.yml",
+   "old_sha256": "cac258574f7e65da2c55c2fa9a6c88c6e7893a9c3f12f6f35a255fb234d3eb7a",
+   "new_sha256": "74c567b7693511e08b85b69a867f6a536678d61517fe29d433824aab7936ec8f",
+   "reason": "Elasticsearch イメージタグ更新（sherpa/es-kuromoji:8.15.0→8.19.20・EOL対応）。",
+   "verification": "計測時バイト（コミット191251fのdocker-compose.yml）と改訂時点の差分は elasticsearch サービスの image タグ1行のみであることを git diff で確認。ocr-worker サービス定義・分離設定（read_only/network/mount）は計測時と同一バイト。分離設定自体は test_ocr_compose_profile_has_no_external_network_and_only_observation_is_writable がライブ検証を継続している。再実測は行っていない（変更が ocr-worker 非関連であることの証明をもって代える）。"
+  }
+ ]
+}

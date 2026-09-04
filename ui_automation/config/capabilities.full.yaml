@@ -1,0 +1,336 @@
+version: 1
+suite: full
+description: >-
+  full suiteが実行前に確認する実能力。required_forに現在のsuiteが含まれる能力が
+  不足した場合はskipせずFAILとして記録し、検査可能な後続ケースは継続する。
+
+policy:
+  missing_status: FAIL
+  allow_mock: false
+  allow_stub: false
+  allow_fake_provider: false
+  allow_request_interception: false
+  continue_after_failure: true
+  credentials_are_presence_only: true
+  record_secret_values: false
+
+requirements:
+  - id: python-runtime
+    kind: command
+    required_for: [full, smoke, chat, env]
+    check: {command: "${PYTHON:-python3}", args: [--version]}
+    evidence: services/capability-python-runtime.json
+
+  - id: docker-engine
+    kind: command
+    required_for: [full, smoke, chat, env]
+    check: {command: docker, args: [version, --format, "{{json .Server.Version}}"]}
+    evidence: services/capability-docker-engine.json
+
+  - id: docker-compose
+    kind: command
+    required_for: [full, smoke, chat, env]
+    check: {command: docker, args: [compose, version]}
+    evidence: services/capability-docker-compose.json
+
+  - id: isolated-compose-project
+    kind: setting
+    required_for: [full, smoke, chat, env]
+    check:
+      env: SHERPA_COMPOSE_PROJECT
+      required_prefix: sherpa-ui-automation-
+      reject_values: [sherpa-mvp, sherpa, default]
+    evidence: services/capability-isolated-compose-project.json
+
+  - id: isolated-data-roots
+    kind: setting
+    required_for: [full, smoke, chat, env]
+    check:
+      envs: [SHERPA_KB_DIR, SHERPA_USERS_DIR, SHERPA_DERIVED_DIR, SHERPA_OBSERVATION_DIR]
+      must_be_under_run_directory: true
+      reject_repository_data_directory: true
+    evidence: services/capability-isolated-data-roots.json
+
+  - id: postgres
+    kind: tcp
+    required_for: [full, smoke, chat, env]
+    check: {phase: post_stack, host: 127.0.0.1, port_env: PGPORT}
+    evidence: services/capability-postgres.json
+
+  - id: elasticsearch
+    kind: http
+    required_for: [full, smoke, chat, env]
+    check: {phase: post_stack, url_env: ES_URL, fallback: "http://127.0.0.1:${SHERPA_ES_PORT}", path: /}
+    evidence: services/capability-elasticsearch.json
+
+  - id: neo4j
+    kind: tcp
+    required_for: [full, smoke, chat, env]
+    check: {phase: post_stack, host: 127.0.0.1, port_env: SHERPA_NEO4J_BOLT_PORT}
+    evidence: services/capability-neo4j.json
+
+  - id: fastapi-application
+    kind: http
+    required_for: [full, smoke, chat, env]
+    check: {phase: post_app, url_env: UI_AUTOMATION_BASE_URL, path: /healthz, expected_status: 200}
+    evidence: services/capability-fastapi-application.json
+
+  - id: playwright-python
+    kind: python_module
+    required_for: [full, smoke, chat, env]
+    check: {module: playwright.sync_api}
+    evidence: services/capability-playwright-python.json
+
+  - id: chromium
+    kind: browser
+    required_for: [full, smoke, chat, env]
+    check: {engine: chromium, launch: true, headless: true}
+    evidence: services/capability-chromium.json
+
+  - id: codex-cli
+    kind: command
+    required_for: [full, chat, env]
+    required_profiles:
+      - baseline-full
+      - chat-real
+      - codex-cli-failure-real
+      - pairwise-ai-selection-r03
+      - pairwise-ai-selection-r04
+      - pairwise-codex-mcp-sandbox-web
+      - pairwise-codex-mcp-sandbox-web-r02
+      - pairwise-codex-mcp-sandbox-web-r03
+      - pairwise-codex-mcp-sandbox-web-r04
+    check: {command: codex, args: [--version]}
+    evidence: services/capability-codex-cli.json
+
+  - id: codex-authentication
+    kind: command
+    required_for: [full, chat, env]
+    required_profiles:
+      - baseline-full
+      - chat-real
+      - pairwise-ai-selection-r03
+      - pairwise-ai-selection-r04
+      - pairwise-codex-mcp-sandbox-web
+      - pairwise-codex-mcp-sandbox-web-r02
+      - pairwise-codex-mcp-sandbox-web-r03
+      - pairwise-codex-mcp-sandbox-web-r04
+    check: {command: codex, args: [login, status], expected_exit: 0}
+    evidence: services/capability-codex-authentication.json
+
+  - id: openai-real-credential
+    kind: secret_presence
+    required_for: [full, chat, env]
+    required_profiles:
+      - baseline-full
+      - chat-real
+      - provider-openai-real
+      - subagent-planner-real
+      - provider-timeout-real
+      - pairwise-ai-selection
+      - pairwise-ai-selection-r03
+      - pairwise-ai-selection-r06
+      - pairwise-codex-mcp-sandbox-web
+      - pairwise-ingest-arms-ocr-vlm-legacy-r02
+      - pairwise-ingest-arms-ocr-vlm-legacy-r05
+      - no-chat-history
+      - envgen-sherpa-history-*
+    check:
+      env_or_seeded_setting: OPENAI_API_KEY
+      reject_placeholders: [REPLACE_ME, sk-REPLACE_ME]
+    evidence: services/capability-openai-real-credential.json
+
+  - id: openai-chat
+    kind: provider
+    required_for: [full, chat, env]
+    required_profiles:
+      - provider-openai-real
+      - subagent-planner-real
+      - pairwise-ai-selection
+      - no-chat-history
+      - envgen-sherpa-history-*
+    check:
+      provider: openai
+      require_nonzero_usage: true
+    evidence: services/capability-openai-chat.json
+
+  - id: codex-chat
+    kind: provider
+    required_for: [full, chat, env]
+    required_profiles: [baseline-full, chat-real, pairwise-codex-mcp-sandbox-web]
+    check:
+      provider: codex
+      require_nonzero_usage: true
+      evidence_glob: "**/state/provider-correlation.json*"
+    evidence: services/capability-codex-chat.json
+
+  - id: gemini-real-credential
+    kind: secret_presence
+    required_for: [full, chat]
+    required_profiles: [provider-gemini-real]
+    check:
+      env_or_seeded_setting: GEMINI_API_KEY
+      reject_placeholders: [REPLACE_ME]
+    evidence: services/capability-gemini-real-credential.json
+
+  - id: gemini-chat
+    kind: provider
+    required_for: [full, chat]
+    required_profiles: [provider-gemini-real]
+    check:
+      provider: gemini
+      require_nonzero_usage: true
+      perform_real_request: true
+    evidence: services/capability-gemini-chat.json
+
+  - id: bedrock-real-credential
+    kind: secret_presence
+    required_for: [full, chat]
+    required_profiles: [provider-bedrock-real]
+    check:
+      env_any_of: [AWS_BEARER_TOKEN_BEDROCK, ANTHROPIC_AWS_API_KEY, AWS_PROFILE, AWS_ACCESS_KEY_ID]
+      all_with:
+        AWS_ACCESS_KEY_ID: [AWS_SECRET_ACCESS_KEY]
+      reject_placeholders: [REPLACE_ME]
+    evidence: services/capability-bedrock-real-credential.json
+
+  - id: bedrock-chat
+    kind: provider
+    required_for: [full, chat]
+    required_profiles: [provider-bedrock-real]
+    check:
+      provider: bedrock
+      require_nonzero_usage: true
+      perform_real_request: true
+    evidence: services/capability-bedrock-chat.json
+
+  - id: ollama
+    kind: http
+    required_for: [full, chat, env]
+    required_profiles:
+      - ingestion-real
+      - provider-ollama-real
+      - pairwise-ai-selection
+      - pairwise-ai-selection-r03
+      - pairwise-ai-selection-r05
+      - pairwise-ingest-arms-ocr-vlm-legacy
+      - pairwise-ingest-arms-ocr-vlm-legacy-r06
+    check: {url_env: OLLAMA_URL, path: /api/tags, expected_status: 200}
+    evidence: services/capability-ollama.json
+
+  - id: ollama-model
+    kind: provider
+    required_for: [full, chat]
+    required_profiles: [provider-ollama-real]
+    check:
+      provider: ollama
+      perform_real_request: true
+    evidence: services/capability-ollama-model.json
+
+  - id: ocr-model-cache
+    kind: directory
+    required_for: [full, env]
+    required_profiles:
+      - ingestion-real
+      - pairwise-ingest-arms-ocr-vlm-legacy
+      - pairwise-ingest-arms-ocr-vlm-legacy-r03
+      - pairwise-ingest-arms-ocr-vlm-legacy-r05
+    check: {path_env: SHERPA_OCR_MODEL_CACHE, must_exist: true, must_not_be_empty: true}
+    evidence: services/capability-ocr-model-cache.json
+
+  - id: paddle-ocr-worker
+    kind: compose_service
+    required_for: [full, env]
+    required_profiles:
+      - ingestion-real
+      - pairwise-ingest-arms-ocr-vlm-legacy
+      - pairwise-ingest-arms-ocr-vlm-legacy-r03
+      - pairwise-ingest-arms-ocr-vlm-legacy-r05
+    check: {phase: post_stack, service: ocr-worker, profile: ocr, require_healthy_or_completed_probe: true}
+    evidence: services/capability-paddle-ocr-worker.json
+
+  - id: vlm-provider
+    kind: provider
+    required_for: [full, env]
+    required_profiles: [ingestion-real, pairwise-ingest-arms-ocr-vlm-legacy]
+    check:
+      provider_env: SHERPA_VLM_PROVIDER
+      model_env: SHERPA_VLM_MODEL
+      perform_real_image_request: true
+      require_observation_record: true
+      evidence_glob: "**/state/vlm-observation.json"
+    evidence: services/capability-vlm-provider.json
+
+  - id: office-ooxml
+    kind: python_module
+    required_for: [full, env]
+    required_profiles:
+      - ingestion-real
+      - pairwise-ingest-arms-ocr-vlm-legacy
+      - pairwise-ingest-arms-ocr-vlm-legacy-r02
+      - pairwise-ingest-arms-ocr-vlm-legacy-r03
+      - pairwise-ingest-arms-ocr-vlm-legacy-r04
+      - pairwise-ingest-arms-ocr-vlm-legacy-r05
+      - pairwise-ingest-arms-ocr-vlm-legacy-r06
+    check:
+      modules: [docx, openpyxl, pptx]
+    evidence: services/capability-office-ooxml.json
+
+  - id: libreoffice-legacy
+    kind: command
+    required_for: [full, env]
+    required_profiles:
+      - ingestion-real
+      - pairwise-ingest-arms-ocr-vlm-legacy
+      - pairwise-ingest-arms-ocr-vlm-legacy-r04
+      - pairwise-ingest-arms-ocr-vlm-legacy-r05
+      - pairwise-ingest-arms-ocr-vlm-legacy-r06
+    check: {command_env: SHERPA_SOFFICE_BIN, fallback_command: soffice, args: [--version]}
+    evidence: services/capability-libreoffice-legacy.json
+
+  - id: deterministic-world-fixture
+    kind: directory
+    required_for: [full, smoke, chat]
+    check:
+      path: ui_automation/fixtures/world
+      must_exist: true
+      must_not_be_empty: true
+    evidence: services/capability-deterministic-world-fixture.json
+
+  - id: no-network-interception
+    kind: source_policy
+    required_for: [full, smoke, chat, env]
+    check:
+      roots: [ui_automation]
+      forbidden_tokens:
+        - page.route(
+        - context.route(
+        - route.fulfill(
+        - route.abort(
+        - route_from_har
+        - route_web_socket
+        - set_offline(
+        - unroute
+        - unroute_all
+        - Fetch.enable
+        - Fetch.fulfillRequest
+        - Fetch.continueRequest
+        - Fetch.failRequest
+        - Network.setRequestInterception
+        - Network.continueInterceptedRequest
+        - window.fetch =
+        - globalThis.fetch =
+        - window.EventSource =
+        - globalThis.EventSource =
+        - XMLHttpRequest.prototype
+        - navigator.serviceWorker.register
+        - http.server
+        - mock
+        - mocker
+        - monkeypatch
+        - MockTransport
+        - stub
+        - fake_provider
+        - tests.
+        - conftest
+    evidence: services/capability-no-network-interception.json

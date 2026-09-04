@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — マイワークスペース</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:none;margin:0}
+  /* アップロードゾーン */
+  .upload-zone{border:2px dashed var(--border,#e3e6ea);border-radius:var(--radius);padding:28px 20px;
+    text-align:center;cursor:pointer;transition:border-color .15s,background .15s;margin-bottom:18px}
+  .upload-zone.drag{border-color:var(--accent,#0f766e);background:var(--accent-weak,#f0fdf4)}
+  .upload-zone input[type=file]{display:none}
+  .upload-zone .hint{font-size:12px;color:var(--ink-2,#5b6573);margin-top:6px}
+  .upload-zone .uh{font-size:14px;font-weight:600;color:var(--ink-2,#374151);margin-bottom:4px}
+  /* ファイル一覧 */
+  .file-table{width:100%;border-collapse:collapse;font-size:13.5px}
+  .file-table th{text-align:left;font-size:12px;font-weight:600;color:var(--ink-3);
+    padding:7px 10px;border-bottom:2px solid var(--border);white-space:nowrap}
+  .file-table td{padding:9px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:middle}
+  .file-table tr:hover td{background:var(--surface-2)}
+  .del-btn{height:26px;padding:0 10px;border-radius:6px;border:1px solid var(--danger,#dc2626);
+    background:transparent;font-size:12px;color:var(--danger,#dc2626);cursor:pointer}
+  .del-btn:hover{background:var(--danger-bg,#fef2f2)}
+  /* 検索 */
+  .search-bar{display:flex;gap:8px;margin-bottom:12px}
+  .search-bar input{flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);
+    font-family:inherit;font-size:13.5px;background:var(--surface);color:var(--ink)}
+  .search-bar button{padding:0 16px;border-radius:var(--radius-sm)}
+  .hit-card{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);
+    padding:10px 14px;margin-bottom:8px;font-size:13px}
+  .hit-card .hit-meta{font-size:11.5px;color:var(--ink-3);margin-bottom:4px}
+  .hit-card pre{margin:0;white-space:pre-wrap;word-break:break-all;font-size:12.5px;
+    background:var(--surface);border-radius:4px;padding:6px 8px}
+  /* アップロード進捗 */
+  .progress-bar{height:4px;border-radius:2px;background:var(--accent,#0f766e);transition:width .2s}
+  .progress-wrap{height:4px;background:var(--surface-2);border-radius:2px;margin-top:8px;display:none}
+  /* ラベル */
+  .personal-badge{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:4px;
+    background:var(--surface-2);color:var(--ink-3);border:1px solid var(--border);vertical-align:middle}
+  /* 注意事項バナー */
+  .notice{font-size:12px;color:var(--ink-3);background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:8px 12px;margin-bottom:16px}
+  /* toast */
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(16px);
+    background:var(--ink);color:#fff;padding:8px 18px;border-radius:8px;font-size:13px;
+    opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div class="pagehead">
+    <div>
+      <h1>マイワークスペース <span class="personal-badge">個人</span></h1>
+      <div class="sub">自分だけが使える個人ファイル置き場です。キーワードで検索できますが、共有ナレッジ（グラフ・全文検索）には含まれません。</div>
+    </div>
+    <div class="spacer"></div>
+    <a class="help-link" href="manual.html#workspace">この画面の使い方 →</a>
+  </div>
+
+  <div class="wrap2">
+    <div class="notice">
+      アップロードしたファイルは <strong>あなただけが</strong> 閲覧・検索できます。
+      共有ナレッジベース（全文検索・グラフ）には索引化されません。
+      共有したい資料は「資料」画面を使用してください。
+    </div>
+
+    <!-- アップロードエリア -->
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-head">ファイルをアップロード</div>
+      <div class="upload-zone" id="dropzone">
+        <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.cbl,.cob,.cobol,.cpy,.copybook,.jcl,.sql,.py,.sh,.bat">
+        <div class="uh">クリックまたはドラッグ＆ドロップ</div>
+        <div class="hint">テキスト系ファイルのみ（最大 10MB）。.txt .md .csv .json .yaml .cbl .jcl 等</div>
+      </div>
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-bar" id="progress-bar" style="width:0%"></div>
+      </div>
+      <div id="upload-msg" style="font-size:12px;margin-top:6px;min-height:16px"></div>
+    </div>
+
+    <!-- ファイル一覧 -->
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-head" style="display:flex;align-items:center;gap:8px">
+        個人ファイル一覧
+        <span id="file-count" style="font-size:12px;color:var(--ink-3)"></span>
+        <span class="spacer"></span>
+        <button class="btn-ghost" style="height:28px;font-size:12px" onclick="loadFiles()">更新</button>
+      </div>
+      <div id="file-list">
+        <div class="loading" role="status" style="padding:16px 0"><span class="spinner spinner-sm"></span><span>個人ワークスペースを読み込んでいます...</span></div>
+      </div>
+    </div>
+
+    <!-- 個人 grep 検索 -->
+    <div class="card">
+      <div class="card-head">個人ファイル内を検索</div>
+      <div class="notice" style="margin-bottom:10px">
+        この検索は <strong>あなたのファイルだけ</strong> を対象にします。
+        共有ナレッジの引用源にはなりません。
+      </div>
+      <div class="search-bar">
+        <input type="text" id="search-q" placeholder="検索語を入力">
+        <button class="btn-primary" id="search-btn">検索</button>
+      </div>
+      <div id="search-results"></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="workspace.js"></script>
+</body>
+</html>

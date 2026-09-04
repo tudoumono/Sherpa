@@ -1,0 +1,70 @@
+{
+  "schema": "sherpa-ocr-product-profile-measurement-v1",
+  "measured_at": "2026-08-11T10:01:37Z",
+  "production_data_used": false,
+  "profile": "paddleocr_ppocrv6_medium_cpu_v1",
+  "engine_profile_hash": "sha256:938ee9b0e9d6757d8d9c3f534bf352df9dcaef28d8725fc870e3899311fdd547",
+  "runtime": {
+    "device": "cpu",
+    "enable_mkldnn": false,
+    "runtime_model_download": false,
+    "paddleocr_version": "3.7.0",
+    "paddlepaddle_version": "3.3.0",
+    "pillow_version": "12.3.0",
+    "pypdfium2_version": "5.11.0"
+  },
+  "models": {
+    "PP-OCRv6_medium_det": {
+      "sha256": "e59763535abdbba01740cb085a54d0b17e9a8a69cac76cbb46b90961d630e956",
+      "size_bytes": 62299797
+    },
+    "PP-OCRv6_medium_rec": {
+      "sha256": "1de18a973c06afb905d8f74d01df5a891082ce543bc7c6e50c497a8d65a2b7f5",
+      "size_bytes": 76863995
+    }
+  },
+  "fixed_oracle": {
+    "measured_at": "2026-08-11T10:00:14Z",
+    "command": "env PYTHONPATH=/home/tudo/projects/Sherpa/.venv/lib/python3.12/site-packages:/home/tudo/projects/Sherpa PADDLE_PDX_CACHE_HOME=/tmp/sherpa-paddlex-cache HOME=/tmp/sherpa-ocr-home PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True FLAGS_use_mkldnn=0 /tmp/sherpa-ocr-poc-paddle/bin/python -m sherpa.eval.ocr_engine_poc --engine paddle --paddle-cache /tmp/sherpa-paddlex-cache --out <temporary-result.json>",
+    "path": "fixtures/eval/ocr_ja/oracle.json",
+    "sha256": "456e10107b0a4198de465f6f091c27fbd9e14206dae754b9f3ba99858e3c3624",
+    "raw_result_sha256": "460614beb199073c3dc71ec90f9b120a69facbf958149b957aae45f1d78f8b58",
+    "case_count": 4,
+    "term_recall": {
+      "passed": 61,
+      "total": 65,
+      "rate": 0.938462
+    },
+    "region_checks": {
+      "passed": 16,
+      "total": 20
+    },
+    "macro_character_error_rate": 0.010722,
+    "elapsed_seconds": 32.953
+  },
+  "product_flow": {
+    "command": "env PYTHONPATH=/home/tudo/projects/Sherpa/.venv/lib/python3.12/site-packages:/home/tudo/projects/Sherpa PADDLE_PDX_CACHE_HOME=/tmp/sherpa-paddlex-cache HOME=/tmp/sherpa-ocr-home PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True FLAGS_use_mkldnn=0 /tmp/sherpa-ocr-poc-paddle/bin/python -m pytest -q tests/e2e_live/test_ocr_worker_live.py",
+    "tests": 2,
+    "tests_passed": 2,
+    "elapsed_seconds": 9.48,
+    "route_to_postgresql_to_child_process_to_observation_generation": "pass",
+    "postgresql_random_test_world_rows_purged": true,
+    "canonical_evidence_hash_unchanged": true,
+    "canonical_rag_markdown_hash_unchanged": true,
+    "source_hash_and_mtime_unchanged": true,
+    "use_for_answer_default": false,
+    "searchable_default": true
+  },
+  "implementation": {
+    "git_head_before_commit": "38ffa52c094336adf9b64ede9144f5fcade50a72",
+    "engine_profile_hash": "sha256:938ee9b0e9d6757d8d9c3f534bf352df9dcaef28d8725fc870e3899311fdd547",
+    "ocr_router_profile": "evidence-raster-router-v3",
+    "e2e_live_test_sha256": "8c04ef86acb9ecd0614bd34cbd7bf62f2eb405aa7cc3cba7c91907fc763015d4",
+    "ai_observation_sha256": "c18493e7a06bb24231ead134399e47042a758b4acb5920a70b405e4fb7930fe2",
+    "ocr_worker_sha256": "db1ec5543fa24e285b5f526e882a404424834f2b4d99f3193417406131094e15",
+    "ocr_router_sha256": "26dcd240df907ff417d29fd7ef129b7a8d221216f0f8ab669f3d52344679ee73",
+    "observation_render_sha256": "ae15d006c4ca7054292d3427f3729f2a293960731f85e2023643b12ba7728004"
+  },
+  "compose_profile_measurement": "fixtures/eval/ocr_ja/measurements/2026-08-10-compose-profile-summary.json",
+  "raw_measurement_sha256": "6d2a4ebf55f8fe475a8b9306a78446c53a64d4ba5fccc0ceba722b7a7ee9b371"
+}

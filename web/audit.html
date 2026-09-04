@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — 監査ログ</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:none;margin:0}
+  /* UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時だけ、
+     自ページの共通トップバー/ナビを隠す（単独 URL 直開きは従来どおり・audit.js 冒頭が判定）。 */
+  .embedded .topbar,.embedded nav{display:none}
+  .embedded .wrap{padding-top:8px}
+  /* フィルターバー */
+  .filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:16px}
+  .filter-bar .ff{display:flex;flex-direction:column;gap:3px}
+  .filter-bar label{font-size:11.5px;font-weight:600;color:var(--ink-3)}
+  .filter-bar input,.filter-bar select{padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
+    font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink);height:36px;box-sizing:border-box}
+  .filter-bar input{width:150px}
+  /* タイムライン テーブル */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;font-size:11px;font-weight:600;color:var(--ink-3);padding:7px 10px;
+    border-bottom:2px solid var(--border);white-space:nowrap}
+  td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:top}
+  tr:hover td{background:var(--surface-2)}
+  .oc-success{color:var(--ok)} .oc-deny{color:var(--warn)} .oc-error{color:var(--danger)}
+  .oc-pending{color:var(--ink-3)}
+  .sev-critical{font-weight:700;color:var(--danger)}
+  .sev-warning{color:var(--warn)}
+  .detail-cell{max-width:280px;word-break:break-all;font-family:var(--font-code,monospace);font-size:11px;color:var(--ink-3)}
+  .action-cell{font-family:var(--font-code,monospace);font-size:12px;font-weight:600}
+  .ts-cell{white-space:nowrap;color:var(--ink-3);font-size:11px}
+  /* ページネーション */
+  .pager{display:flex;align-items:center;gap:8px;padding:14px 0}
+  .pager .info{font-size:12px;color:var(--ink-3)}
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+  .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
+  /* UI フィードバック6（2026-07-03）: 表示項目カスタマイズ（列の表示/非表示・端末ローカル保存）。 */
+  .colcfg{display:flex;flex-wrap:wrap;gap:3px 14px;align-items:center;margin-bottom:10px;font-size:12px;color:var(--ink-2)}
+  .colcfg label{display:inline-flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap}
+  .colcfg input{margin:0}
+  #audit-table[data-hide~="ts"] .col-ts,
+  #audit-table[data-hide~="actor"] .col-actor,
+  #audit-table[data-hide~="action"] .col-action,
+  #audit-table[data-hide~="resource"] .col-resource,
+  #audit-table[data-hide~="outcome"] .col-outcome,
+  #audit-table[data-hide~="severity"] .col-severity,
+  #audit-table[data-hide~="reason"] .col-reason,
+  #audit-table[data-hide~="detail"] .col-detail{display:none}
+  /* 詳細（既定非表示）を行クリック/「詳細」ボタンで個別に開ける展開行。 */
+  .detail-row td{background:var(--surface-2);white-space:pre-wrap;word-break:break-all;
+    font-family:var(--font-code,monospace);font-size:11px;color:var(--ink-2)}
+  tr.audit-row{cursor:pointer}
+  .detail-toggle{font-size:11px;color:var(--accent-ink);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:13px">管理者権限が必要です。</div>
+  </div>
+  <div id="main-content">
+    <div class="pagehead">
+      <div>
+        <a class="crumb" href="admin-settings.html">← システム管理</a>
+        <h1>監査ログ</h1>
+        <div class="sub">誰が・いつ・何を・どの結果で実行したかの時系列。閲覧自体も記録されます。</div>
+      </div>
+      <div class="spacer"></div>
+      <button class="btn-ghost" id="export-csv">CSV</button>
+      <button class="btn-ghost" id="export-jsonl">JSONL</button>
+      <span id="export-status" style="font-size:12px;color:var(--ink-3)" aria-live="polite"></span>
+    </div>
+
+    <div class="wrap2">
+      <!-- フィルターバー -->
+      <div class="filter-bar">
+        <div class="ff">
+          <label for="f-actor">実行者（uid）</label>
+          <input id="f-actor" type="text" placeholder="例: admin">
+        </div>
+        <div class="ff">
+          <label for="f-action">操作（* で前方一致）</label>
+          <input id="f-action" type="text" placeholder="例: auth.* user.created">
+        </div>
+        <div class="ff">
+          <label for="f-outcome">結果</label>
+          <select id="f-outcome">
+            <option value="">すべて</option>
+            <option value="success">成功</option>
+            <option value="deny">拒否</option>
+            <option value="failure">失敗</option>
+            <option value="error">エラー</option>
+            <option value="pending">送信前記録</option>
+          </select>
+        </div>
+        <div class="ff">
+          <label for="f-severity">重要度</label>
+          <select id="f-severity">
+            <option value="">すべて</option>
+            <option value="info">情報</option>
+            <option value="warning">警告</option>
+            <option value="critical">重大</option>
+          </select>
+        </div>
+        <div class="ff">
+          <label for="f-from">期間 from</label>
+          <input id="f-from" type="datetime-local">
+        </div>
+        <div class="ff">
+          <label for="f-to">期間 to</label>
+          <input id="f-to" type="datetime-local">
+        </div>
+        <div class="ff" style="justify-content:flex-end">
+          <button class="btn-primary" id="search-btn" style="height:36px;padding:0 16px">検索</button>
+        </div>
+      </div>
+
+      <!-- 表示項目カスタマイズ（端末ローカル保存・既定は「詳細」だけ OFF） -->
+      <div class="colcfg" id="colcfg">
+        <span style="color:var(--ink-3)">表示項目:</span>
+        <label><input type="checkbox" data-col="ts" checked>日時</label>
+        <label><input type="checkbox" data-col="actor" checked>実行者</label>
+        <label><input type="checkbox" data-col="action" checked>操作</label>
+        <label><input type="checkbox" data-col="resource" checked>対象</label>
+        <label><input type="checkbox" data-col="outcome" checked>結果</label>
+        <label><input type="checkbox" data-col="severity" checked>重要度</label>
+        <label><input type="checkbox" data-col="reason" checked>理由</label>
+        <label><input type="checkbox" data-col="detail">詳細</label>
+      </div>
+
+      <!-- タイムライン テーブル -->
+      <div class="card" style="overflow-x:auto">
+        <table id="audit-table">
+          <thead>
+            <tr>
+              <th class="col-ts">日時</th>
+              <th class="col-actor">実行者</th>
+              <th class="col-action">操作</th>
+              <th class="col-resource">対象</th>
+              <th class="col-outcome">結果</th>
+              <th class="col-severity">重要度</th>
+              <th class="col-reason">理由</th>
+              <th class="col-detail">詳細</th>
+            </tr>
+          </thead>
+          <tbody id="audit-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- ページネーション -->
+      <div class="pager">
+        <button class="mini" id="prev-btn" disabled>← 前</button>
+        <span class="info" id="pager-info"></span>
+        <button class="mini" id="next-btn" disabled>次 →</button>
+        <span class="info" id="result-count"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="audit.js"></script>
+</body>
+</html>

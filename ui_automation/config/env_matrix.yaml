@@ -1,0 +1,918 @@
+version: 1
+description: >-
+  .env.example、Python、shell、Makefile、Composeの環境変数を分類する実行台帳。
+  tested変数は実プロセスを再起動して観測し、excluded変数は理由なしでは登録できない。
+
+sources:
+  include:
+    - .env.example
+    - docker-compose.yml
+    - Makefile
+    - sherpa/**/*.py
+    - scripts/**/*.sh
+    - scripts/**/*.py
+  exclude_from_discovery:
+    - ui_automation/**
+    - tests/**
+    - .venv/**
+  prefixes: [SHERPA_, OPENAI_, OLLAMA_, GEMINI_, AWS_, ANTHROPIC_, NEO4J_, POSTGRES_, PG, ES_, CODEX_]
+  explicit_standard_names:
+    - DATABASE_URL
+    - ES_URL
+    - HTTP_PROXY
+    - HTTPS_PROXY
+    - NO_PROXY
+    - SSL_CERT_FILE
+    - SSL_CERT_DIR
+    - NODE_EXTRA_CA_CERTS
+    - REQUESTS_CA_BUNDLE
+    - CURL_CA_BUNDLE
+    - CHROME_PATH
+    - CODEX_HOME
+    - HOME
+    - TMPDIR
+    - LAN
+    - KEEP_STORES
+    - PLAYWRIGHT_BROWSERS_PATH
+    - ALL_PROXY
+    - APP_PID_FILE
+    - COMPOSE_PROJECT_NAME
+    - DIFY_API_KEY
+    - DIFY_BASE_URL
+    - LANG
+    - PATH
+    - PLAYWRIGHT_HOME
+    - PYTHONDONTWRITEBYTECODE
+    - PYTHONUNBUFFERED
+    - PYTHON_BIN
+    - RUN_DIR
+    - WSL_DISTRO_NAME
+    - all_proxy
+    - http_proxy
+    - https_proxy
+    - no_proxy
+  dynamic_reference_exclusions:
+    - path: scripts/azure_smoke.py
+      function: _load_env_file
+      kind: membership
+      expression: key
+      reason: 診断CLIが利用者指定envファイルの任意キーを汎用的に読み込む処理であり有限な製品runtime変数ではない
+    - path: scripts/azure_smoke.py
+      function: _load_env_file
+      kind: subscript
+      expression: key
+      reason: 診断CLIが利用者指定envファイルの任意キーをos.environへ設定する汎用loaderであり個別変数へ展開できない
+    - path: scripts/check-production.sh
+      function: <shell>
+      kind: shell-indirect
+      expression: var
+      reason: 固定列挙した永続データパス変数を同一検証へ渡す間接展開であり各キーは台帳で個別分類する
+    - path: scripts/run-common.sh
+      function: <shell>
+      kind: shell-indirect
+      expression: name
+      reason: dotenvから読み込むキー名を引数で受ける共通処理であり呼出側の対象キーは台帳で個別分類する
+    - path: scripts/run-common.sh
+      function: <shell>
+      kind: shell-indirect
+      expression: pre_names
+      reason: dotenv適用前に存在した任意キーを復元する共通処理であり有限な製品runtime変数ではない
+
+classification_policy:
+  unknown_variable_status: FAIL
+  tested_requires_scenario_set: true
+  tested_requires_restart: true
+  tested_requires_observable: true
+  excluded_requires_reason: true
+  full_suite_skip_status: FAIL
+  secrets_recording: presence-only
+  precedence: explicit-process-env > SHERPA_ENV_FILE > product-default
+  one_variable_at_a_time: true
+  pairwise_for_interactions: true
+  full_cartesian_product: false
+  security_boundaries_are_individual_cases: true
+
+scenario_catalog:
+  standard:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: unsetして製品既定値と画面表示を確認
+    valid: 既定とは異なる有効値を設定して反映を確認
+    boundary: 空値または最小の有効値を確認
+    invalid: 不正値がfail-closedまたは明示エラーになることを確認
+    precedence: process env、専用env file、既定値の優先順を確認
+    restart: 同じstackでアプリを再起動し、必要ならfresh stackでも確認
+  boolean:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: unset時の既定ON/OFFを確認
+    valid: "0と1を別プロセスで確認"
+    boundary: 空値の扱いを確認
+    invalid: 真偽値以外を成功扱いしないことを確認
+    precedence: process envがenv fileより優先されることを確認
+    restart: 変更前後でアプリを再起動して画面/API差分を確認
+  numeric:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: unset時の既定値を確認
+    valid: 既定とは異なる正数で上限または待機動作を確認
+    boundary: "0、1、上限直前を変数の契約に応じて確認"
+    invalid: 負数、非数、過大値の拒否または明示的縮退を確認
+    precedence: process envがenv fileより優先されることを確認
+    restart: アプリ再起動後のeffective valueを確認
+  path:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: unset時の専用run directoryを確認
+    valid: 空白と日本語を含む専用pathで確認
+    boundary: 空ディレクトリまたはread-onlyディレクトリを確認
+    invalid: 許可外、symlink、存在しないpathを安全に拒否することを確認
+    precedence: process envがenv fileより優先されることを確認
+    restart: appまたはstack再起動後も同じ物理領域を参照することを確認
+  port:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: 専用動的portの採用を確認
+    valid: 空いている別portで実接続を確認
+    boundary: 1024以上の最小許可portと65535を確認
+    invalid: 非数、範囲外、占有、接続URL不一致を起動前に拒否
+    precedence: process envとenv fileとURL指定の優先・整合を確認
+    restart: stack再作成後に旧portへ接続しないことを確認
+  connection:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: localhostとport変数から組み立てた接続先を確認
+    valid: 専用stackの明示URLでidentityを確認
+    boundary: URL encodingが必要な資格情報で確認
+    invalid: 名前解決不能、不正scheme、別stack identityを拒否
+    precedence: 明示URLと個別portの優先・整合を確認
+    restart: stackを再作成してidentityを再確認
+  enum:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: unset時の自動選択または既定選択を確認
+    valid: allowlist内の各値を実能力とともに確認
+    boundary: 空値の意味を確認
+    invalid: allowlist外を拒否または明示的に未選択とすることを確認
+    precedence: process envがenv fileより優先されることを確認
+    restart: アプリ再起動後の設定画面と実providerを照合
+  secret:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: 未設定時に未接続と表示されることを確認
+    valid: 実資格情報で実リクエストを行う
+    boundary: 空白値を未設定として扱うことを確認
+    invalid: placeholderまたは無効資格情報を成功扱いしない
+    precedence: 初回seed前だけenvを採用することを確認
+    restart: 値を記録せずset/unsetと接続結果だけを再確認
+  seeded:
+    required: [default, valid, boundary, invalid, precedence, restart]
+    default: fresh databaseで未設定時の初期状態を確認
+    valid: fresh databaseで初回seed結果を確認
+    boundary: 空値をseed済み成功として扱わないことを確認
+    invalid: 不正値を設定済みまたは接続成功として扱わない
+    precedence: seed後はDB/UI設定がenv変更より優先されることを確認
+    restart: 同じDBとfresh DBを分けて再起動する
+
+execution:
+  generate_profiles_from_variables: true
+  reset_process_between_profiles: true
+  fresh_stack_for_restart_values: [stack, seed]
+  pairwise_groups:
+    - id: connection-port-precedence
+      variables: [SHERPA_ENV_FILE, SHERPA_PORT, DATABASE_URL, NEO4J_URI, ES_URL]
+      profile: pairwise-connection-port-precedence
+      case_nodeid: cases/environment/test_environment.py::test_effective_environment_contract
+      observables: [healthz, ports, database-identity, compose-labels]
+      profile_template: {restart: stack}
+      factors:
+        SHERPA_ENV_FILE:
+          - {id: primary-run-file, process: {runtime: env_file_primary}}
+          - {id: secondary-run-file, process: {runtime: env_file_secondary}}
+        SHERPA_PORT:
+          - {id: primary-port, process: {runtime: app_port_primary}}
+          - id: process-over-env-file
+            process: {runtime: app_port_secondary}
+            env_file: {runtime: app_port_primary}
+        DATABASE_URL:
+          - {id: loopback-ip, process: {runtime: database_loopback}}
+          - id: localhost-over-env-file
+            process: {runtime: database_localhost}
+            env_file: {runtime: database_loopback}
+        NEO4J_URI:
+          - {id: loopback-ip, process: {runtime: neo4j_loopback}}
+          - id: localhost-over-env-file
+            process: {runtime: neo4j_localhost}
+            env_file: {runtime: neo4j_loopback}
+        ES_URL:
+          - {id: loopback-ip, process: {runtime: es_loopback}}
+          - id: localhost-over-env-file
+            process: {runtime: es_localhost}
+            env_file: {runtime: es_loopback}
+    - id: auth-session
+      variables: [SHERPA_AUTH_DISABLED, SHERPA_COOKIE_SECURE, SHERPA_SESSION_DAYS]
+      profile: pairwise-auth-session
+      case_nodeid: cases/environment/test_environment.py::test_effective_environment_contract
+      observables: [cookie-flags]
+      profile_template: {restart: app}
+      factors:
+        SHERPA_AUTH_DISABLED:
+          - {id: auth-enabled, process: {value: "0"}}
+          - {id: auth-disabled, process: {value: "1"}}
+        SHERPA_COOKIE_SECURE:
+          - {id: explicit-zero, process: {value: "0"}}
+          - {id: explicit-one, process: {value: "1"}}
+        SHERPA_SESSION_DAYS:
+          - {id: one-day, process: {value: "1"}}
+          - {id: thirty-days, process: {value: "30"}}
+    - id: ai-selection
+      variables: [SHERPA_AGENT, SHERPA_EXTRA_AGENTS, OPENAI_API_KEY, OLLAMA_URL]
+      profile: pairwise-ai-selection
+      case_nodeid: cases/environment/test_environment.py::test_effective_environment_contract
+      observables: [healthz, settings, navigation]
+      profile_template:
+        restart: app
+        env: {SHERPA_AUTH_DISABLED: "0"}
+      primary_marker: ui_automation
+      primary_case_nodeids:
+        - cases/environment/test_environment.py::test_effective_environment_contract
+        - cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service
+      factors:
+        SHERPA_AGENT:
+          - {id: openai, process: {value: openai}}
+          - {id: codex, process: {value: codex}}
+        SHERPA_EXTRA_AGENTS:
+          - {id: gemini, process: {value: gemini}}
+          - {id: bedrock, process: {value: bedrock}}
+        OPENAI_API_KEY:
+          - {id: inherited-real, process: {from_env: OPENAI_API_KEY}}
+          - {id: unset, process: null, env_file: null}
+        OLLAMA_URL:
+          - {id: loopback-ip, process: {value: "http://127.0.0.1:11434"}}
+          - {id: loopback-name, process: {value: "http://localhost:11434"}}
+    - id: codex-mcp-sandbox-web
+      variables: [SHERPA_CODEX_MCP, SHERPA_CODEX_SANDBOX, SHERPA_ALLOW_WEB_SEARCH]
+      profile: pairwise-codex-mcp-sandbox-web
+      case_nodeid: cases/environment/test_environment.py::test_effective_environment_contract
+      observables: [healthz, settings, navigation]
+      profile_template:
+        restart: app
+        env: {SHERPA_AUTH_DISABLED: "0", SHERPA_AGENT: codex}
+      primary_marker: ui_automation
+      primary_case_nodeids:
+        - cases/environment/test_environment.py::test_effective_environment_contract
+        - cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service
+      factors:
+        SHERPA_CODEX_MCP:
+          - {id: enabled, process: {value: "1"}}
+          - {id: disabled, process: {value: "0"}}
+        SHERPA_CODEX_SANDBOX:
+          - {id: enabled, process: {value: "1"}}
+          - {id: disabled, process: {value: "0"}}
+        SHERPA_ALLOW_WEB_SEARCH:
+          - {id: disabled, process: {value: "0"}}
+          - {id: enabled, process: {value: "1"}}
+    - id: ingest-arms-ocr-vlm-legacy
+      variables: [SHERPA_ARMS, SHERPA_OCR_ENABLED, SHERPA_VLM_PROVIDER, SHERPA_LEGACY_BACKEND]
+      profile: pairwise-ingest-arms-ocr-vlm-legacy
+      case_nodeid: cases/environment/test_environment.py::test_effective_environment_contract
+      observables: [healthz, settings, database-identity, compose-labels]
+      profile_template:
+        restart: stack
+        env: {SHERPA_AUTH_DISABLED: "0"}
+      primary_marker: ui_automation
+      primary_case_nodeids:
+        - cases/environment/test_environment.py::test_effective_environment_contract
+        - cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence
+      factors:
+        SHERPA_ARMS:
+          - {id: vision-enabled, process: {value: "ooxml,pdf_text,vision"}}
+          - {id: text-office, process: {value: "ooxml,pdf_text"}}
+        SHERPA_OCR_ENABLED:
+          - {id: enabled, process: {value: "1"}}
+          - {id: disabled, process: {value: "0"}}
+        SHERPA_VLM_PROVIDER:
+          - {id: ollama, process: {value: ollama}}
+          - {id: openai, process: {value: openai}}
+        SHERPA_LEGACY_BACKEND:
+          - {id: libreoffice, process: {value: libreoffice}}
+          - {id: none, process: {value: none}}
+  fail_closed_groups:
+    - [SHERPA_ENV_FILE, SHERPA_COMPOSE_PROJECT]
+    - [PGPORT, DATABASE_URL]
+    - [SHERPA_ES_PORT, ES_URL]
+    - [SHERPA_NEO4J_BOLT_PORT, NEO4J_URI]
+    - [SHERPA_BROWSE_ROOTS, SHERPA_OCR_WORLD_ROOT]
+    - [SHERPA_KB_DIR, SHERPA_USERS_DIR, SHERPA_DERIVED_DIR, SHERPA_OBSERVATION_DIR]
+    - [SHERPA_CODEX_SANDBOX, SHERPA_ALLOW_WEB_SEARCH]
+
+execution_coverage:
+  case_nodeid: cases/environment/test_environment.py::test_effective_environment_contract
+  required_scenarios: [default, valid, boundary, invalid, precedence, restart]
+  missing_status: FAIL
+  description: >-
+    変数を台帳へ書いただけでは実行済みにしない。各scenarioはここで実profileへ対応し、
+    profileのresultとeffective-environment証跡がそろった場合だけcoverageを満たす。
+  variables:
+    SHERPA_AUTH_DISABLED:
+      default: env-default
+      valid: auth-disabled
+      boundary: auth-enabled
+      restart: auth-enabled
+    SHERPA_EXEC_EVENT_V2:
+      default: exec-event-v1
+      valid: exec-event-v2
+      boundary: exec-event-v1
+      restart: exec-event-v2
+    SHERPA_DISABLE_EMBED:
+      default: env-default
+      valid: disable-embed-present-zero
+      boundary: disable-embed-present-zero
+      restart: disable-embed-present-zero
+    SHERPA_HISTORY_TURNS:
+      default: env-default
+      boundary: no-chat-history
+      restart: no-chat-history
+    SHERPA_HISTORY_MSG_CHARS:
+      default: env-default
+      boundary: no-chat-history
+      restart: no-chat-history
+    SHERPA_HISTORY_CHAR_BUDGET:
+      default: env-default
+      boundary: no-chat-history
+      restart: no-chat-history
+    SHERPA_STREAM_PACE:
+      default: env-default
+      boundary: env-precedence
+      precedence: env-precedence
+      restart: env-precedence
+    PGPORT:
+      default: env-default
+      invalid: port-mismatch-rejected
+      precedence: port-mismatch-rejected
+      restart: port-mismatch-rejected
+    DATABASE_URL:
+      default: env-default
+      invalid: invalid-database-url-rejected
+      precedence: port-mismatch-rejected
+      restart: invalid-database-url-rejected
+    OLLAMA_URL:
+      precedence: seed-ollama-url-persistence
+      restart: seed-ollama-url-persistence
+profiles:
+  baseline-full:
+    suites: [full]
+    marker: ui_automation and not ingestion_real and not provider_profile_real
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_EXEC_EVENT_V2: "1"
+      SHERPA_DISABLE_EMBED: null
+    expected: [全required capabilityが実サービスで利用可能, 全caseを最後まで実行]
+    observables: [healthz, health-summary, settings, database-identity, compose-labels]
+
+  ingestion-real:
+    suites: [full]
+    marker: ingestion_real
+    case_nodeids: [cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_OCR_ENABLED: "1"
+      SHERPA_ARMS: ooxml,pdf_text,vision
+      SHERPA_VLM_PROVIDER: ollama
+      SHERPA_LEGACY_BACKEND: libreoffice
+    expected_values: {vlm_provider: ollama, ocr_enabled: true}
+    expected: [実OCRはvisionアームやVLM結果に依存せず原本とDB観測へ相関, 実VLM・OOXML・legacy Officeは各変換来歴へ相関]
+    observables: [ocr-worker-state, observation, conversion-result, ingest-status]
+
+  smoke-real:
+    suites: [smoke]
+    restart: stack
+    fresh_database: true
+    env: {SHERPA_AUTH_DISABLED: "0"}
+    expected: [実FastAPIと実storeとChromiumへ接続]
+    observables: [healthz, ui-shell, database-identity]
+
+  chat-real:
+    suites: [full, chat]
+    marker: chat or thought_flow
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_AGENT: codex
+      SHERPA_CODEX_MCP: "1"
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {agent: codex, exec_event_v2: true}
+    expected: [実Codexターン, 非ゼロusage, 実tool node, DB永続化]
+    observables: [sse, ui-trace, conversation-api, postgres, audit, usage]
+
+  provider-openai-real:
+    suites: [full, chat]
+    marker: chat
+    case_nodeids: [cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_AGENT: openai
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {agent: openai, exec_event_v2: true}
+    expected: [実OpenAI providerを選択, 非ゼロusage, selected providerを永続化]
+    observables: [settings, provider-probe, sse, postgres, usage]
+
+  provider-ollama-real:
+    suites: [full, chat]
+    marker: chat
+    case_nodeids: [cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_AGENT: ollama
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {agent: ollama, exec_event_v2: true}
+    expected: [実Ollama providerを選択, 実model回答, selected providerを永続化]
+    observables: [settings, ollama-probe, sse, postgres, usage]
+
+  provider-gemini-real:
+    suites: [full, chat]
+    marker: chat
+    case_nodeids: [cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_EXTRA_AGENTS: gemini
+      SHERPA_AGENT: gemini
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {agent: gemini, exec_event_v2: true}
+    expected: [実Gemini providerを選択, 実課金request, selected providerを永続化]
+    observables: [settings, gemini-probe, sse, postgres, usage]
+
+  provider-bedrock-real:
+    suites: [full, chat]
+    marker: chat
+    case_nodeids: [cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_EXTRA_AGENTS: bedrock
+      SHERPA_AGENT: bedrock
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {agent: bedrock, exec_event_v2: true}
+    expected: [実Bedrock providerを選択, 実課金request, selected providerを永続化]
+    observables: [settings, bedrock-probe, sse, postgres, usage]
+
+  subagent-planner-real:
+    suites: [full, chat]
+    marker: subagent_planner_real
+    case_nodeids: [cases/chat/test_subagent_planner.py::test_real_openai_planner_delegates_to_real_subagent]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_AGENT: openai
+      SHERPA_SUBAGENTS_ENABLED: "1"
+      SHERPA_USAGE_METERING: "1"
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {agent: openai, subagents_enabled: true, exec_event_v2: true}
+    expected: [実OpenAI plannerが実subagentへ委譲しusageと監査を永続化]
+    observables: [sse-tool-nodes, subagent-step-count, provider-usage, audit]
+
+  auth-expiry-real:
+    suites: [full, chat]
+    marker: auth_expiry_real
+    case_nodeids: [cases/chat/test_failure_profiles.py::test_expired_session_rejects_turn_and_releases_slot]
+    restart: stack
+    fresh_database: true
+    env: {SHERPA_AUTH_DISABLED: "0"}
+    expected_values: {failure_mode: session_expiry}
+    expected: [失効済み実sessionを401で拒否し会話と実行slotを残さない]
+    observables: [session-expiry, postgres-session, audit, turn-slot-release]
+
+  provider-timeout-real:
+    suites: [full, chat]
+    marker: provider_timeout_real
+    case_nodeids: [cases/chat/test_failure_profiles.py::test_real_provider_timeout_is_error_and_releases_slot]
+    restart: stack
+    fresh_database: true
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_AGENT: openai
+      SHERPA_LLM_TIMEOUT: "0.05"
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {failure_mode: provider_timeout, agent: openai}
+    expected: [実OpenAI timeoutを成功回答にせずUI・SSE・DB・監査へerrorとして保存]
+    observables: [provider-duration, chat-error, turn-slot-release, audit]
+
+  codex-cli-failure-real:
+    suites: [full, chat]
+    marker: codex_cli_failure_real
+    case_nodeids: [cases/chat/test_failure_profiles.py::test_real_codex_cli_nonzero_is_error_and_releases_slot]
+    restart: stack
+    fresh_database: true
+    codex_auth_mode: intentionally-unconfigured
+    env:
+      SHERPA_AUTH_DISABLED: "0"
+      SHERPA_AGENT: codex
+      OPENAI_API_KEY: null
+      SHERPA_EXEC_EVENT_V2: "1"
+    expected_values: {failure_mode: codex_cli_nonzero, agent: codex}
+    expected: [実Codex CLIの非ゼロ終了を成功回答にせずUI・SSE・DB・監査へerrorとして保存]
+    observables: [codex-invocation-summary, chat-error, turn-slot-release, audit]
+
+  env-default:
+    suites: [env]
+    marker: environment
+    restart: stack
+    fresh_database: true
+    env: {}
+    expected: [専用env file未指定時もtest runnerの隔離値を採用]
+    observables: [effective-environment, ports, compose-labels]
+
+  env-precedence:
+    suites: [env]
+    marker: environment
+    restart: stack
+    fresh_database: true
+    env: {SHERPA_STREAM_PACE: "0"}
+    env_file: {SHERPA_STREAM_PACE: "0.35"}
+    expected_values: {stream_pace: "0"}
+    expected: [process envの0を採用]
+    observables: [effective-environment, sse-timing]
+
+  auth-disabled:
+    suites: [env]
+    marker: environment
+    restart: app
+    fresh_database: true
+    env: {SHERPA_AUTH_DISABLED: "1"}
+    expected_values: {auth_disabled: true}
+    expected: [全requestをadminとして扱いloginへredirectしない]
+    observables: [auth-me, navigation, admin-page]
+
+  auth-enabled:
+    suites: [env]
+    marker: environment
+    restart: app
+    fresh_database: true
+    env: {SHERPA_AUTH_DISABLED: "0"}
+    expected_values: {auth_disabled: false}
+    expected: [anonymousをloginへredirect, role境界を強制]
+    observables: [login, auth-me, session-cookie, audit]
+
+  exec-event-v1:
+    suites: [env]
+    marker: environment
+    restart: app
+    fresh_database: true
+    env: {SHERPA_EXEC_EVENT_V2: "0"}
+    expected_values: {exec_event_v2: false}
+    expected: [v1 traceをUIとDBで復元]
+    observables: [sse, ui-trace, postgres]
+
+  exec-event-v2:
+    suites: [env]
+    marker: environment
+    restart: app
+    fresh_database: true
+    env: {SHERPA_EXEC_EVENT_V2: "1"}
+    expected_values: {exec_event_v2: true}
+    expected: [v2 traceをUIとDBで復元]
+    observables: [sse, ui-trace, postgres]
+
+  disable-embed-present-zero:
+    suites: [env]
+    marker: environment
+    restart: app
+    fresh_database: true
+    env: {SHERPA_DISABLE_EMBED: "0"}
+    expected_values: {disable_embed_present: true}
+    expected: [値が0でも変数の存在によりembeddingを無効化]
+    observables: [app-log, ingest-result, elasticsearch-document]
+
+  no-chat-history:
+    suites: [env]
+    marker: environment
+    restart: app
+    fresh_database: true
+    env:
+      SHERPA_AGENT: openai
+      SHERPA_HISTORY_TURNS: "0"
+      SHERPA_HISTORY_MSG_CHARS: "0"
+      SHERPA_HISTORY_CHAR_BUDGET: "0"
+    expected_values: {history_turns: 0, history_msg_chars: 0, history_char_budget: 0}
+    expected: [新規promptへ過去本文をprimingしないがDB履歴は保持]
+    observables: [provider-request-summary, postgres, conversation-ui]
+
+  seed-ollama-url-persistence:
+    suites: [env]
+    marker: env_seed_lifecycle
+    case_nodeids: [cases/environment/test_environment.py::test_fresh_env_seed_then_env_change_then_ui_override_persists]
+    restart: none
+    fresh_database: true
+    env: {OLLAMA_URL: "http://127.0.0.1:11434"}
+    restart_env: {OLLAMA_URL: "http://127.0.0.1:11435"}
+    restart_transition_id: ollama-url-after-seed
+    restart_observable:
+      kind: admin_ollama_url_seed
+      fresh: "http://127.0.0.1:11434"
+      transition_env: "http://127.0.0.1:11435"
+      ui_override: "http://127.0.0.1:11436"
+      fresh_database: true
+    expected: [fresh DB seed, 同じDBでenv変更を無視, UI保存値を再起動後も維持]
+    observables: [admin-settings, restart-effective-environment, postgres-settings]
+
+  port-mismatch-rejected:
+    suites: [env]
+    marker: environment
+    restart: stack
+    fresh_database: true
+    env:
+      PGPORT: "55432"
+      DATABASE_URL: postgresql://sherpa:unused@localhost:5432/sherpa
+    expect_startup_failure: true
+    expected_failure_stage: port_check
+    expected_error_patterns: [PostgreSQL, DATABASE_URL, 不一致]
+    expected_error_sources: [port-check-log]
+    expected: [不一致をアプリ起動前に拒否]
+    observables: [preflight-log, process-exit, open-ports]
+
+  invalid-database-url-rejected:
+    suites: [env]
+    marker: environment
+    restart: stack
+    fresh_database: true
+    env: {DATABASE_URL: "file:///not-a-postgres-database"}
+    expect_startup_failure: true
+    expected_failure_stage: isolation
+    expected_error_patterns: [DATABASE_URL, scheme]
+    expected_error_sources: [runner-message]
+    expected: [不正schemeを起動前に拒否]
+    observables: [preflight-log, process-exit]
+
+  port-owner-mismatch-run-owned-rejected:
+    suites: [env]
+    restart: none
+    fresh_database: true
+    preflight_fixture: occupy_app_port
+    expect_startup_failure: true
+    expected_failure_stage: port_check
+    expected_error_patterns: [アプリ, 他のプロセス]
+    expected_error_sources: [port-check-log]
+    expected: [runner所有listenerのPIDを記録し、別app所有者として起動前に拒否]
+    observables: [preflight-log, process-identity, port-owner-check]
+
+variables:
+  RUN_DIR: {classification: tested, category: isolation, secret: false, scenario_set: path, restart: app, observable: [write-boundary], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["RUN_DIR"],"error_sources":["api","ui","service-log"]}}}
+  APP_PID_FILE: {classification: tested, category: isolation, secret: false, scenario_set: path, restart: app, observable: [pid-file, process-identity], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["APP_PID_FILE"],"error_sources":["api","ui","service-log"]}}}
+  APP_PROC_NEEDLE: {classification: tested, category: safety, secret: false, scenario_set: standard, restart: app, observable: [port-owner-check], test_values: {"default":null,"valid":"sherpa.api:app","boundary":"","invalid":"__invalid_app_proc_needle__","precedence":{"process":"sherpa.api:app","env_file":"__invalid_app_proc_needle__"},"restart":"sherpa.api:app"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["APP_PROC_NEEDLE"],"error_sources":["api","ui","service-log"]}}}
+  PYTHON_BIN: {classification: tested, category: startup, secret: false, scenario_set: path, restart: app, observable: [python-version, app-process], test_values: {"default":null,"valid":{"runtime":"python_bin"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"python_bin"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"python_bin"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"app_start","error_patterns":["directory|ディレクトリ"],"error_sources":["app-log"]},"invalid":{"outcome":"reject","failure_stage":"app_start","error_patterns":["No such file|見つかりません"],"error_sources":["app-log"]}}}
+  COMPOSE_PROJECT_NAME: {classification: tested, category: isolation, secret: false, scenario_set: standard, restart: stack, observable: [volume-names], test_values: {"default":null,"valid":{"runtime":"isolated_project"},"boundary":"unsafe-boundary-compose_project_name","invalid":"unsafe-invalid-compose_project_name","precedence":{"process":{"runtime":"isolated_project"},"env_file":"unsafe-env-file-project"},"restart":{"runtime":"isolated_project"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"isolation","error_patterns":["COMPOSE_PROJECT_NAME","run-owned"],"error_sources":["runner-message"]},"invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["COMPOSE_PROJECT_NAME","run-owned"],"error_sources":["runner-message"]}}}
+  LANG: {classification: tested, category: runtime, secret: false, scenario_set: standard, restart: app, observable: [unicode-ui], test_values: {"default":null,"valid":"C","boundary":"","invalid":"__invalid_lang__","precedence":{"process":"C","env_file":"__invalid_lang__"},"restart":"C"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["LANG"],"error_sources":["api","ui","service-log"]}}}
+  PATH: {classification: tested, category: runtime, secret: false, scenario_set: path, restart: app, observable: [command-resolution, codex-version], test_values: {"default":null,"valid":{"runtime":"safe_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"safe_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"safe_path"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"app_start","error_patterns":["(?:/usr/bin/env|\\benv):.*bash.*(?:No such file|not found|見つかりません|ディレクトリ)"],"error_sources":["app-log"]},"invalid":{"outcome":"reject","failure_stage":"app_start","error_patterns":["(?:/usr/bin/env|\\benv):.*bash.*(?:No such file|not found|見つかりません|ディレクトリ)"],"error_sources":["app-log"]}}}
+  WSL_DISTRO_NAME: {classification: tested, category: legacy, secret: false, scenario_set: standard, restart: app, observable: [legacy-backend-selection, app-log], test_values: {"default":null,"valid":"Ubuntu","boundary":"","invalid":"__invalid_wsl_distro_name__","precedence":{"process":"Ubuntu","env_file":"__invalid_wsl_distro_name__"},"restart":"Ubuntu"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["WSL_DISTRO_NAME"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_ENV_FILE: {classification: tested, category: startup, secret: false, scenario_set: path, restart: stack, observable: [compose-config], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"app_start","error_patterns":["missing env file"],"error_sources":["app-log"]},"invalid":{"outcome":"reject","failure_stage":"app_start","error_patterns":["missing env file"],"error_sources":["app-log"]}}}
+  SHERPA_REQUIRE_ENV_FILE: {classification: tested, category: startup, secret: false, scenario_set: boolean, restart: stack, observable: [preflight-exit, app-log], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_REQUIRE_ENV_FILE"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HOST: {classification: tested, category: startup, secret: false, scenario_set: standard, restart: app, observable: [listen-address, healthz], test_values: {"default":null,"valid":"localhost","boundary":"","invalid":"__invalid_sherpa_host__","precedence":{"process":"localhost","env_file":"__invalid_sherpa_host__"},"restart":"localhost"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"app_start","error_patterns":["ERROR:\\s*\\[Errno\\s+-2\\]\\s*Name or service not known"],"error_sources":["app-log"]}}}
+  SHERPA_PORT: {classification: tested, category: startup, secret: false, scenario_set: port, restart: app, observable: [listen-address, healthz], test_values: {"default":null,"valid":{"runtime":"dynamic_port"},"boundary":"65535","invalid":"not-a-port","precedence":{"process":{"runtime":"dynamic_port"},"env_file":"65535"},"restart":{"runtime":"dynamic_port"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_PORT","invalid"],"error_sources":["runner-message"]}}}
+  SHERPA_LAN: {classification: tested, category: startup, secret: false, scenario_set: boolean, restart: app, observable: [listen-address, status-url], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_LAN"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_COMPOSE_PROJECT: {classification: tested, category: isolation, secret: false, scenario_set: standard, restart: stack, observable: [volume-names], test_values: {"default":null,"valid":{"runtime":"isolated_project"},"boundary":"unsafe-boundary-sherpa_compose_project","invalid":"unsafe-invalid-sherpa_compose_project","precedence":{"process":{"runtime":"isolated_project"},"env_file":"unsafe-env-file-project"},"restart":{"runtime":"isolated_project"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_COMPOSE_PROJECT","run-owned"],"error_sources":["runner-message"]},"invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_COMPOSE_PROJECT","run-owned"],"error_sources":["runner-message"]}}}
+  SHERPA_UVICORN_WORKERS: {classification: tested, category: startup, secret: false, scenario_set: numeric, restart: app, observable: [process-count, app-log], test_values: {"default":null,"valid":"01","boundary":"1","invalid":"2","precedence":{"process":"01","env_file":"2"},"restart":"01"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"app_start","error_patterns":["SHERPA_UVICORN_WORKERS=2.*(?:複数 worker|起動を拒否)"],"error_sources":["app-log"]}}}
+  SHERPA_ASGI_APP: {classification: tested, category: startup, secret: false, scenario_set: standard, restart: app, observable: [app-log], test_values: {"default":null,"valid":"sherpa.api:app.__call__","boundary":"","invalid":"__invalid_sherpa_asgi_app__","precedence":{"process":"sherpa.api:app.__call__","env_file":"__invalid_sherpa_asgi_app__"},"restart":"sherpa.api:app.__call__"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"app_start","error_patterns":["__invalid_sherpa_asgi_app__"],"error_sources":["app-log"]}}}
+  SHERPA_APP_WAIT: {classification: tested, category: startup, secret: false, scenario_set: numeric, restart: app, observable: [startup-duration, process-exit], test_values: {"default":null,"valid":"45","boundary":"0","invalid":"not-a-number","precedence":{"process":"45","env_file":"0"},"restart":"45"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_APP_WAIT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_STORE_WAIT: {classification: tested, category: startup, secret: false, scenario_set: numeric, restart: stack, observable: [startup-duration, compose-health], test_values: {"default":null,"valid":"180","boundary":"0","invalid":"not-a-number","precedence":{"process":"180","env_file":"0"},"restart":"180"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_STORE_WAIT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_STOP_WAIT: {classification: tested, category: startup, secret: false, scenario_set: numeric, restart: app, observable: [shutdown-duration, process-exit], test_values: {"default":null,"valid":"2","boundary":"0","invalid":"not-a-number","precedence":{"process":"2","env_file":"0"},"restart":"2"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_STOP_WAIT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SKIP_PORT_CHECK: {classification: tested, category: safety, secret: false, scenario_set: boolean, restart: stack, observable: [preflight-log, process-exit], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SKIP_PORT_CHECK"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HEALTH_CURL_TIMEOUT: {classification: tested, category: health, secret: false, scenario_set: numeric, restart: app, observable: [status-command-duration, status-output], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HEALTH_CURL_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+  LAN: {classification: tested, category: startup, secret: false, scenario_set: boolean, restart: app, observable: [listen-address, status-url, cookie-flags], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["LAN"],"error_sources":["api","ui","service-log"]}}}
+  KEEP_STORES: {classification: tested, category: startup, secret: false, scenario_set: boolean, restart: stack, observable: [volume-identity], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["KEEP_STORES"],"error_sources":["api","ui","service-log"]}}}
+
+  POSTGRES_PASSWORD: {classification: tested, category: connection, secret: true, scenario_set: secret, restart: stack, observable: [redacted-compose-config], test_values: {"default":null,"valid":{"runtime":"isolated_secret"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"runtime":"isolated_secret"},"env_file":"REPLACE_ME"},"restart":{"runtime":"isolated_secret"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["POSTGRES_PASSWORD"],"error_sources":["api","ui","service-log"]}}}
+  POSTGRES_USER: {classification: excluded, category: internal-generated, exclude_reason: docker-compose.ymlがcontainer内POSTGRES_USERをsherpaへ固定しておりhost環境変数を補間しない}
+  POSTGRES_DB: {classification: excluded, category: internal-generated, exclude_reason: docker-compose.ymlがcontainer内POSTGRES_DBをsherpaへ固定しておりhost環境変数を補間しない}
+  PGHOST: {classification: tested, category: connection, secret: false, scenario_set: connection, restart: app, observable: [effective-environment, postgres-identity], test_values: {"default":null,"valid":"127.0.0.1","boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":"127.0.0.1","env_file":"invalid://127.0.0.1:not-a-port"},"restart":"127.0.0.1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["PGHOST"],"error_sources":["api","ui","service-log"]}}}
+  PGUSER: {classification: tested, category: connection, secret: false, scenario_set: connection, restart: app, observable: [effective-environment, postgres-identity], test_values: {"default":null,"valid":"sherpa","boundary":"","invalid":"ui_automation_missing_role","precedence":{"process":"sherpa","env_file":"ui_automation_missing_role"},"restart":"sherpa"}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"app_health","error_patterns":["スキーマ初期化に失敗","(role|user name|authentication)"],"error_sources":["app-log"]},"invalid":{"outcome":"reject","failure_stage":"app_health","error_patterns":["ui_automation_missing_role","(role|authentication)"],"error_sources":["app-log"]}}}
+  PGPASSWORD: {classification: tested, category: connection, secret: true, scenario_set: secret, restart: app, observable: [redacted-effective-environment], test_values: {"default":null,"valid":{"runtime":"isolated_secret"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"runtime":"isolated_secret"},"env_file":"REPLACE_ME"},"restart":{"runtime":"isolated_secret"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["PGPASSWORD"],"error_sources":["api","ui","service-log"]}}}
+  PGDATABASE: {classification: tested, category: connection, secret: false, scenario_set: connection, restart: app, observable: [effective-environment, postgres-identity], test_values: {"default":null,"valid":"sherpa","boundary":"","invalid":"ui_automation_missing_database","precedence":{"process":"sherpa","env_file":"ui_automation_missing_database"},"restart":"sherpa"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"app_health","error_patterns":["ui_automation_missing_database","database"],"error_sources":["app-log"]}}}
+  PGPORT: {classification: tested, category: connection, secret: false, scenario_set: port, restart: stack, observable: [listen-address, postgres-identity], test_values: {"default":null,"valid":{"runtime":"dynamic_port"},"boundary":"65535","invalid":"not-a-port","precedence":{"process":{"runtime":"dynamic_port"},"env_file":"65535"},"restart":{"runtime":"dynamic_port"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["PGPORT","invalid"],"error_sources":["runner-message"]}}}
+  DATABASE_URL: {classification: tested, category: connection, secret: true, scenario_set: connection, restart: stack, observable: [redacted-effective-environment], test_values: {"default":null,"valid":{"runtime":"isolated_connection"},"boundary":"","invalid":{"runtime":"invalid_connection"},"precedence":{"process":{"runtime":"isolated_connection"},"env_file":{"runtime":"invalid_connection"}},"restart":{"runtime":"isolated_connection"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"isolation","error_patterns":["DATABASE_URL","invalid"],"error_sources":["runner-message"]},"invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["DATABASE_URL","invalid"],"error_sources":["runner-message"]}}}
+  SHERPA_PG_DSN: {classification: tested, category: connection, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment], test_values: {"default":null,"valid":{"runtime":"isolated_connection"},"boundary":"","invalid":{"runtime":"invalid_connection"},"precedence":{"process":{"runtime":"isolated_connection"},"env_file":{"runtime":"invalid_connection"}},"restart":{"runtime":"isolated_connection"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_PG_DSN","invalid"],"error_sources":["runner-message"]},"invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_PG_DSN","invalid"],"error_sources":["runner-message"]}}}
+  NEO4J_USER: {classification: tested, category: connection, secret: false, scenario_set: connection, restart: app, observable: [neo4j-identity], valid_matches_default_reason: Neo4j Communityの専用stackは単一のneo4j principalだけをprovisionするためvalidは明示設定経路を実接続で確認し、変数が実際に接続へ効くことはboundary・invalidの実認証失敗で別途証明する, test_values: {"default":null,"valid":"neo4j","boundary":"","invalid":"ui_automation_missing_neo4j_user","precedence":{"process":"neo4j","env_file":"ui_automation_missing_neo4j_user"},"restart":"neo4j"}, expected_outcomes: {"boundary":{"outcome":"explicit-error","error_patterns":["neo4j","認証失敗"],"error_sources":["api"]},"invalid":{"outcome":"explicit-error","error_patterns":["neo4j","認証失敗"],"error_sources":["api"]}}}
+  NEO4J_PASSWORD: {classification: tested, category: connection, secret: true, scenario_set: secret, restart: stack, observable: [redacted-compose-config], test_values: {"default":null,"valid":{"runtime":"isolated_secret"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"runtime":"isolated_secret"},"env_file":"REPLACE_ME"},"restart":{"runtime":"isolated_secret"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["NEO4J_PASSWORD"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_NEO4J_BOLT_PORT: {classification: tested, category: connection, secret: false, scenario_set: port, restart: stack, observable: [listen-address, neo4j-identity], test_values: {"default":null,"valid":{"runtime":"dynamic_port"},"boundary":"65535","invalid":"not-a-port","precedence":{"process":{"runtime":"dynamic_port"},"env_file":"65535"},"restart":{"runtime":"dynamic_port"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_NEO4J_BOLT_PORT","invalid"],"error_sources":["runner-message"]}}}
+  SHERPA_NEO4J_HTTP_PORT: {classification: tested, category: connection, secret: false, scenario_set: port, restart: stack, observable: [listen-address, neo4j-http], test_values: {"default":null,"valid":{"runtime":"dynamic_port"},"boundary":"65535","invalid":"not-a-port","precedence":{"process":{"runtime":"dynamic_port"},"env_file":"65535"},"restart":{"runtime":"dynamic_port"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_NEO4J_HTTP_PORT","invalid"],"error_sources":["runner-message"]}}}
+  NEO4J_URI: {classification: tested, category: connection, secret: false, scenario_set: connection, restart: stack, observable: [effective-environment, neo4j-identity], test_values: {"default":null,"valid":{"runtime":"isolated_connection"},"boundary":"","invalid":{"runtime":"invalid_connection"},"precedence":{"process":{"runtime":"isolated_connection"},"env_file":{"runtime":"invalid_connection"}},"restart":{"runtime":"isolated_connection"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"isolation","error_patterns":["NEO4J_URI","invalid"],"error_sources":["runner-message"]},"invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["NEO4J_URI","invalid"],"error_sources":["runner-message"]}}}
+  SHERPA_ES_PORT: {classification: tested, category: connection, secret: false, scenario_set: port, restart: stack, observable: [elasticsearch-identity], test_values: {"default":null,"valid":{"runtime":"dynamic_port"},"boundary":"65535","invalid":"not-a-port","precedence":{"process":{"runtime":"dynamic_port"},"env_file":"65535"},"restart":{"runtime":"dynamic_port"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["SHERPA_ES_PORT","invalid"],"error_sources":["runner-message"]}}}
+  ES_URL: {classification: tested, category: connection, secret: false, scenario_set: connection, restart: stack, observable: [elasticsearch-identity], test_values: {"default":null,"valid":{"runtime":"isolated_connection"},"boundary":"","invalid":{"runtime":"invalid_connection"},"precedence":{"process":{"runtime":"isolated_connection"},"env_file":{"runtime":"invalid_connection"}},"restart":{"runtime":"isolated_connection"}}, expected_outcomes: {"boundary":{"outcome":"reject","failure_stage":"isolation","error_patterns":["ES_URL","invalid"],"error_sources":["runner-message"]},"invalid":{"outcome":"reject","failure_stage":"isolation","error_patterns":["ES_URL","invalid"],"error_sources":["runner-message"]}}}
+  ES_MAPPING_VERSION: {classification: excluded, category: internal-constant, exclude_reason: sherpa/es_index.py内の固定mapping定数であり環境変数として参照されない}
+
+  SHERPA_KB_DIR: {classification: tested, category: storage, secret: false, scenario_set: path, restart: stack, observable: [world-registry], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_KB_DIR"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_USERS_DIR: {classification: tested, category: storage, secret: false, scenario_set: path, restart: stack, observable: [workspace-files], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_USERS_DIR"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_DERIVED_DIR: {classification: tested, category: storage, secret: false, scenario_set: path, restart: stack, observable: [derived-files], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_DERIVED_DIR"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OBSERVATION_DIR: {classification: tested, category: storage, secret: false, scenario_set: path, restart: stack, observable: [ocr-observations], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OBSERVATION_DIR"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_MODEL_CACHE: {classification: tested, category: storage, secret: false, scenario_set: path, restart: stack, observable: [model-files-sha256, ocr-worker-log], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_MODEL_CACHE"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_BROWSE_ROOTS: {classification: tested, category: safety, secret: false, scenario_set: path, restart: app, observable: [folder-picker, fs-list-rejection], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_BROWSE_ROOTS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_UID: {classification: excluded, category: bootstrap, exclude_reason: scripts/bootstrap.shとdemo_codex.shだけが使う旧bootstrap入力で専用UI bootstrapは参照しない}
+  SHERPA_VERSION: {classification: tested, category: storage, secret: false, scenario_set: standard, restart: app, observable: [world-path, status-api], test_values: {"default":null,"valid":"ui-auto-default-world","boundary":"","invalid":"__invalid_sherpa_version__","precedence":{"process":"ui-auto-default-world","env_file":"__invalid_sherpa_version__"},"restart":"ui-auto-default-world"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_VERSION"],"error_sources":["api","ui","service-log"]}}}
+
+  SHERPA_ADMIN_PASSWORD: {classification: tested, category: authentication, secret: true, scenario_set: seeded, restart: seed, observable: [login-result, password-change-required, redacted-audit], test_values: {"default":null,"valid":{"runtime":"isolated_secret"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"runtime":"isolated_secret"},"env_file":"REPLACE_ME"},"restart":{"runtime":"isolated_secret"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_ADMIN_PASSWORD"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AUTH_DISABLED: {classification: tested, category: authentication, secret: false, scenario_set: boolean, restart: app, observable: [login-redirect, role-boundary], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AUTH_DISABLED"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AUTH_ENABLED: {classification: tested, category: authentication, secret: false, scenario_set: boolean, restart: app, observable: [compatibility-warning], test_values: {"default":null,"valid":"0","boundary":"1","invalid":"__invalid_boolean__","precedence":{"process":"0","env_file":"1"},"restart":"0"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AUTH_ENABLED"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_COOKIE_SECURE: {classification: tested, category: authentication, secret: false, scenario_set: boolean, restart: app, observable: [login-result], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_COOKIE_SECURE"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SESSION_DAYS: {classification: tested, category: authentication, secret: false, scenario_set: numeric, restart: app, observable: [session-expiry, postgres-session], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SESSION_DAYS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AUDIT_IP_SALT: {classification: tested, category: audit, secret: true, scenario_set: secret, restart: app, observable: [audit-ip-hash, redacted-effective-environment], test_values: {"default":null,"valid":{"runtime":"isolated_secret"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"runtime":"isolated_secret"},"env_file":"REPLACE_ME"},"restart":{"runtime":"isolated_secret"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AUDIT_IP_SALT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_PERSONAL_API_KEYS: {classification: tested, category: authentication, secret: false, scenario_set: seeded, restart: seed, observable: [settings-fields, postgres-settings], test_values: {"default":null,"valid":"1","boundary":"","invalid":"REPLACE_ME","precedence":{"process":"1","env_file":"REPLACE_ME"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_PERSONAL_API_KEYS"],"error_sources":["api","ui","service-log"]}}}
+
+  OPENAI_API_KEY: {classification: tested, category: ai, secret: true, scenario_set: seeded, restart: seed, observable: [settings-connection-state], test_values: {"default":null,"valid":{"from_env":"OPENAI_API_KEY"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"OPENAI_API_KEY"},"env_file":"REPLACE_ME"},"restart":{"from_env":"OPENAI_API_KEY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OPENAI_API_KEY"],"error_sources":["api","ui","service-log"]}}}
+  OPENAI_BASE_URL: {classification: tested, category: ai, secret: false, scenario_set: connection, restart: seed, observable: [provider-endpoint-kind], test_values: {"default":null,"valid":"https://api.openai.com/v1","boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":"https://api.openai.com/v1","env_file":"invalid://127.0.0.1:not-a-port"},"restart":"https://api.openai.com/v1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OPENAI_BASE_URL"],"error_sources":["api","ui","service-log"]}}}
+  OPENAI_CHAT_MODEL: {classification: excluded, category: external-script, exclude_reason: Sherpa製品runtimeでは参照せずscripts/azure_smoke.pyだけが利用する診断用入力}
+  OPENAI_CHAT_URL: {classification: tested, category: ai, secret: true, scenario_set: connection, restart: app, observable: [redacted-provider-request], test_values: {"default":null,"valid":"https://api.openai.com/v1/chat/completions","boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":"https://api.openai.com/v1/chat/completions","env_file":"invalid://127.0.0.1:not-a-port"},"restart":"https://api.openai.com/v1/chat/completions"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OPENAI_CHAT_URL"],"error_sources":["api","ui","service-log"]}}}
+  OPENAI_EMBED_MODEL: {classification: tested, category: ai, secret: false, scenario_set: standard, restart: app, observable: [elasticsearch-vector-field, ingest-log], test_values: {"default":null,"valid":"text-embedding-3-small","boundary":"","invalid":"__invalid_openai_embed_model__","precedence":{"process":"text-embedding-3-small","env_file":"__invalid_openai_embed_model__"},"restart":"text-embedding-3-small"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OPENAI_EMBED_MODEL"],"error_sources":["api","ui","service-log"]}}}
+  OPENAI_EMBED_URL: {classification: tested, category: ai, secret: true, scenario_set: connection, restart: app, observable: [redacted-provider-request, ingest-result], test_values: {"default":null,"valid":"https://api.openai.com/v1/embeddings","boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":"https://api.openai.com/v1/embeddings","env_file":"invalid://127.0.0.1:not-a-port"},"restart":"https://api.openai.com/v1/embeddings"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OPENAI_EMBED_URL"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OPENAI_AUTH_HEADER: {classification: tested, category: ai, secret: false, scenario_set: enum, restart: seed, observable: [provider-auth-kind, connection-test], test_values: {"default":null,"valid":"api-key","boundary":"","invalid":"__invalid_sherpa_openai_auth_header__","precedence":{"process":"api-key","env_file":"__invalid_sherpa_openai_auth_header__"},"restart":"api-key"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OPENAI_AUTH_HEADER"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OPENAI_API_VERSION: {classification: tested, category: ai, secret: false, scenario_set: standard, restart: seed, observable: [provider-url-summary, connection-test], test_values: {"default":null,"valid":"2024-10-21","boundary":"","invalid":"__invalid_sherpa_openai_api_version__","precedence":{"process":"2024-10-21","env_file":"__invalid_sherpa_openai_api_version__"},"restart":"2024-10-21"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OPENAI_API_VERSION"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OPENAI_ENDPOINT_KIND: {classification: tested, category: ai, secret: false, scenario_set: enum, restart: seed, observable: [settings-labels, provider-url-summary], test_values: {"default":null,"valid":"openai","boundary":"","invalid":"__invalid_sherpa_openai_endpoint_kind__","precedence":{"process":"openai","env_file":"__invalid_sherpa_openai_endpoint_kind__"},"restart":"openai"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OPENAI_ENDPOINT_KIND"],"error_sources":["api","ui","service-log"]}}}
+  OLLAMA_URL: {classification: tested, category: ai, secret: false, scenario_set: seeded, restart: seed, observable: [settings-connection-state], test_values: {"default":null,"valid":"http://127.0.0.1:11434","boundary":"","invalid":"REPLACE_ME","precedence":{"process":"http://127.0.0.1:11434","env_file":"REPLACE_ME"},"restart":"http://127.0.0.1:11434"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OLLAMA_URL"],"error_sources":["api","ui","service-log"]}}}
+  OLLAMA_HOST: {classification: tested, category: ai, secret: false, scenario_set: connection, restart: app, observable: [ollama-listen-address, provider-probe], test_values: {"default":null,"valid":"http://localhost:11434","boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":"http://localhost:11434","env_file":"invalid://127.0.0.1:not-a-port"},"restart":"http://localhost:11434"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["OLLAMA_HOST"],"error_sources":["api","ui","service-log"]}}}
+  OLLAMA_HOME: {classification: excluded, category: install, exclude_reason: offline kitのbuildとinstallだけがモデル保管元として参照しSherpa UI runtimeは使用しない}
+  OLLAMA_MODELS_DIR: {classification: excluded, category: install, exclude_reason: offline kitのbuildとinstallだけがモデル配置先として参照しSherpa UI runtimeは使用しない}
+  GEMINI_API_KEY: {classification: tested, category: ai, secret: true, scenario_set: seeded, restart: seed, observable: [settings-connection-state], test_values: {"default":null,"valid":{"from_env":"GEMINI_API_KEY"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"GEMINI_API_KEY"},"env_file":"REPLACE_ME"},"restart":{"from_env":"GEMINI_API_KEY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["GEMINI_API_KEY"],"error_sources":["api","ui","service-log"]}}}
+  AWS_BEARER_TOKEN_BEDROCK: {classification: tested, category: ai, secret: true, scenario_set: seeded, restart: seed, observable: [settings-connection-state], test_values: {"default":null,"valid":{"from_env":"AWS_BEARER_TOKEN_BEDROCK"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"AWS_BEARER_TOKEN_BEDROCK"},"env_file":"REPLACE_ME"},"restart":{"from_env":"AWS_BEARER_TOKEN_BEDROCK"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["AWS_BEARER_TOKEN_BEDROCK"],"error_sources":["api","ui","service-log"]}}}
+  ANTHROPIC_AWS_API_KEY: {classification: tested, category: ai, secret: true, scenario_set: seeded, restart: seed, observable: [settings-connection-state], test_values: {"default":null,"valid":{"from_env":"ANTHROPIC_AWS_API_KEY"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"ANTHROPIC_AWS_API_KEY"},"env_file":"REPLACE_ME"},"restart":{"from_env":"ANTHROPIC_AWS_API_KEY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["ANTHROPIC_AWS_API_KEY"],"error_sources":["api","ui","service-log"]}}}
+  AWS_ACCESS_KEY_ID: {classification: tested, category: ai, secret: true, scenario_set: secret, restart: app, observable: [bedrock-auth-kind], test_values: {"default":null,"valid":{"from_env":"AWS_ACCESS_KEY_ID"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"AWS_ACCESS_KEY_ID"},"env_file":"REPLACE_ME"},"restart":{"from_env":"AWS_ACCESS_KEY_ID"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["AWS_ACCESS_KEY_ID"],"error_sources":["api","ui","service-log"]}}}
+  AWS_SECRET_ACCESS_KEY: {classification: tested, category: ai, secret: true, scenario_set: secret, restart: app, observable: [bedrock-auth-kind], test_values: {"default":null,"valid":{"from_env":"AWS_SECRET_ACCESS_KEY"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"AWS_SECRET_ACCESS_KEY"},"env_file":"REPLACE_ME"},"restart":{"from_env":"AWS_SECRET_ACCESS_KEY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["AWS_SECRET_ACCESS_KEY"],"error_sources":["api","ui","service-log"]}}}
+  AWS_PROFILE: {classification: tested, category: ai, secret: false, scenario_set: standard, restart: app, observable: [bedrock-auth-kind], test_values: {"default":null,"valid":{"from_env":"AWS_PROFILE"},"boundary":"","invalid":"__invalid_aws_profile__","precedence":{"process":{"from_env":"AWS_PROFILE"},"env_file":"__invalid_aws_profile__"},"restart":{"from_env":"AWS_PROFILE"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["AWS_PROFILE"],"error_sources":["api","ui","service-log"]}}}
+  AWS_REGION: {classification: tested, category: ai, secret: false, scenario_set: standard, restart: app, observable: [bedrock-region], test_values: {"default":null,"valid":"us-east-1","boundary":"","invalid":"__invalid_aws_region__","precedence":{"process":"us-east-1","env_file":"__invalid_aws_region__"},"restart":"us-east-1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["AWS_REGION"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AGENT: {classification: tested, category: ai, secret: false, scenario_set: enum, restart: app, observable: [settings-agent, provider-usage, chat-answer], test_values: {"default":null,"valid":"codex","boundary":"","invalid":"__invalid_sherpa_agent__","precedence":{"process":"codex","env_file":"__invalid_sherpa_agent__"},"restart":"codex"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AGENT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_EXTRA_AGENTS: {classification: tested, category: ai, secret: false, scenario_set: enum, restart: app, observable: [settings-options, connection-test], test_values: {"default":null,"valid":"gemini","boundary":"","invalid":"__invalid_sherpa_extra_agents__","precedence":{"process":"gemini","env_file":"__invalid_sherpa_extra_agents__"},"restart":"gemini"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_EXTRA_AGENTS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_LLM_TIMEOUT: {classification: tested, category: ai, secret: false, scenario_set: numeric, restart: app, observable: [provider-duration, chat-error], test_values: {"default":null,"valid":"90","boundary":"0","invalid":"not-a-number","precedence":{"process":"90","env_file":"0"},"restart":"90"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_LLM_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+
+  SHERPA_SUBAGENTS_ENABLED: {classification: tested, category: chat, secret: false, scenario_set: boolean, restart: app, observable: [sse-tool-nodes], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SUBAGENTS_ENABLED"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HISTORY_TURNS: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [provider-request-summary, conversation-continuity], test_values: {"default":null,"valid":"2","boundary":"0","invalid":"not-a-number","precedence":{"process":"2","env_file":"0"},"restart":"2"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HISTORY_TURNS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HISTORY_MSG_CHARS: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [provider-request-summary, conversation-continuity], test_values: {"default":null,"valid":"256","boundary":"0","invalid":"not-a-number","precedence":{"process":"256","env_file":"0"},"restart":"256"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HISTORY_MSG_CHARS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HISTORY_CHAR_BUDGET: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [provider-request-summary, conversation-continuity], test_values: {"default":null,"valid":"1024","boundary":"0","invalid":"not-a-number","precedence":{"process":"1024","env_file":"0"},"restart":"1024"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HISTORY_CHAR_BUDGET"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AGENTIC_MAX_TURNS: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [sse-node-count, chat-error], test_values: {"default":null,"valid":"4","boundary":"0","invalid":"not-a-number","precedence":{"process":"4","env_file":"0"},"restart":"4"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AGENTIC_MAX_TURNS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AGENTIC_MAX_TOOLS_PER_TURN: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [sse-tool-count, chat-error], test_values: {"default":null,"valid":"2","boundary":"0","invalid":"not-a-number","precedence":{"process":"2","env_file":"0"},"restart":"2"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AGENTIC_MAX_TOOLS_PER_TURN"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AGENTIC_MAX_TOOL_RESULT_BYTES: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [trace-result-size, app-log], test_values: {"default":null,"valid":"2048","boundary":"0","invalid":"not-a-number","precedence":{"process":"2048","env_file":"0"},"restart":"2048"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AGENTIC_MAX_TOOL_RESULT_BYTES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AGENTIC_MAX_TOTAL_TOOL_RESULT_BYTES: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [trace-total-size, app-log], test_values: {"default":null,"valid":"8192","boundary":"0","invalid":"not-a-number","precedence":{"process":"8192","env_file":"0"},"restart":"8192"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_AGENTIC_MAX_TOTAL_TOOL_RESULT_BYTES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_AGENTIC_EVAL_CYCLE_TURNS: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [evaluation-cycle-count], test_values: {"default":null,"valid":"2","boundary":"1","invalid":"not-a-number","precedence":{"process":"2","env_file":"1"},"restart":"2"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":"accepted-boundary"}}
+  SHERPA_AGENTIC_EVIDENCE_VERIFY: {classification: tested, category: chat, secret: false, scenario_set: boolean, restart: app, observable: [evidence-verification], test_values: {"default":null,"valid":"0","boundary":"","invalid":"__invalid_boolean__","precedence":{"process":"0","env_file":"1"},"restart":"0"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":"accepted-boundary"}}
+  SHERPA_GREP_FILE_CAP_BYTES: {classification: tested, category: search, secret: false, scenario_set: numeric, restart: app, observable: [app-log], test_values: {"default":null,"valid":"131072","boundary":"0","invalid":"not-a-number","precedence":{"process":"131072","env_file":"0"},"restart":"131072"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_GREP_FILE_CAP_BYTES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_GREP_HIT_TEXT_MAX_BYTES: {classification: tested, category: search, secret: false, scenario_set: numeric, restart: app, observable: [search-hit-size], test_values: {"default":null,"valid":"2048","boundary":"0","invalid":"not-a-number","precedence":{"process":"2048","env_file":"0"},"restart":"2048"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_GREP_HIT_TEXT_MAX_BYTES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SEARCH_RAG_GREP: {classification: tested, category: search, secret: false, scenario_set: boolean, restart: app, observable: [search-source], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SEARCH_RAG_GREP"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SEARCH_RAG_ES: {classification: tested, category: search, secret: false, scenario_set: boolean, restart: app, observable: [elasticsearch-source], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SEARCH_RAG_ES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SUB_PLAN_MAX_CALLS: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [subagent-call-count, chat-error], test_values: {"default":null,"valid":"2","boundary":"0","invalid":"not-a-number","precedence":{"process":"2","env_file":"0"},"restart":"2"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SUB_PLAN_MAX_CALLS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SUB_PLAN_MAX_STEPS: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [subagent-step-count], test_values: {"default":null,"valid":"2","boundary":"0","invalid":"not-a-number","precedence":{"process":"2","env_file":"0"},"restart":"2"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SUB_PLAN_MAX_STEPS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_NEO4J_QUERY_TIMEOUT_S: {classification: tested, category: graph, secret: false, scenario_set: numeric, restart: app, observable: [query-duration, graph-error], test_values: {"default":null,"valid":"5","boundary":"0","invalid":"not-a-number","precedence":{"process":"5","env_file":"0"},"restart":"5"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_NEO4J_QUERY_TIMEOUT_S"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_NEO4J_MAX_ROWS: {classification: tested, category: graph, secret: false, scenario_set: numeric, restart: app, observable: [graph-row-count, truncated-flag], test_values: {"default":null,"valid":"100","boundary":"0","invalid":"not-a-number","precedence":{"process":"100","env_file":"0"},"restart":"100"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_NEO4J_MAX_ROWS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_GRAPH_NODE_LIMIT: {classification: tested, category: graph, secret: false, scenario_set: numeric, restart: app, observable: [graph-node-count, truncated-flag], test_values: {"default":null,"valid":"5","boundary":"0","invalid":"not-a-number","precedence":{"process":"5","env_file":"0"},"restart":"5"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_GRAPH_NODE_LIMIT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_STREAM_PACE: {classification: tested, category: chat, secret: false, scenario_set: numeric, restart: app, observable: [sse-timing, ui-trace-order], test_values: {"default":null,"valid":"0.05","boundary":"0","invalid":"not-a-number","precedence":{"process":"0.05","env_file":"0"},"restart":"0.05"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_STREAM_PACE"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_EXEC_EVENT_V2: {classification: tested, category: thought-flow, secret: false, scenario_set: boolean, restart: app, observable: [postgres-trace], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_EXEC_EVENT_V2"],"error_sources":["api","ui","service-log"]}}}
+
+  SHERPA_CODEX_MCP: {classification: tested, category: codex, secret: false, scenario_set: boolean, restart: app, observable: [tool-nodes], test_values: {"default":null,"valid":"0","boundary":"1","invalid":"__invalid_boolean__","precedence":{"process":"0","env_file":"1"},"restart":"0"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_CODEX_MCP"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_CODEX_SANDBOX: {classification: tested, category: codex, secret: false, scenario_set: boolean, restart: app, observable: [codex-invocation-summary, write-boundary], test_values: {"default":null,"valid":"0","boundary":"1","invalid":"__invalid_boolean__","precedence":{"process":"0","env_file":"1"},"restart":"0"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_CODEX_SANDBOX"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_CODEX_REASONING: {classification: tested, category: codex, secret: false, scenario_set: enum, restart: app, observable: [settings-reasoning], test_values: {"default":null,"valid":"medium","boundary":"","invalid":"__invalid_sherpa_codex_reasoning__","precedence":{"process":"medium","env_file":"__invalid_sherpa_codex_reasoning__"},"restart":"medium"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_CODEX_REASONING"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_CODEX_TIMEOUT: {classification: tested, category: codex, secret: false, scenario_set: numeric, restart: app, observable: [turn-duration, chat-error, turn-slot-release], test_values: {"default":null,"valid":"300","boundary":"0","invalid":"not-a-number","precedence":{"process":"300","env_file":"0"},"restart":"300"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_CODEX_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_CODEX_REASONING_AUTHOR: {classification: tested, category: codex, secret: false, scenario_set: enum, restart: app, observable: [author-trace], test_values: {"default":null,"valid":"low","boundary":"","invalid":"__invalid_sherpa_codex_reasoning_author__","precedence":{"process":"low","env_file":"__invalid_sherpa_codex_reasoning_author__"},"restart":"low"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_CODEX_REASONING_AUTHOR"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_CODEX_TIMEOUT_AUTHOR: {classification: tested, category: codex, secret: false, scenario_set: numeric, restart: app, observable: [author-duration, author-error], test_values: {"default":null,"valid":"300","boundary":"0","invalid":"not-a-number","precedence":{"process":"300","env_file":"0"},"restart":"300"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_CODEX_TIMEOUT_AUTHOR"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_ALLOW_WEB_SEARCH: {classification: tested, category: codex, secret: false, scenario_set: boolean, restart: app, observable: [settings-toggle, tool-nodes], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_ALLOW_WEB_SEARCH"],"error_sources":["api","ui","service-log"]}}}
+  CODEX_HOME: {classification: tested, category: isolation, secret: true, scenario_set: path, restart: app, observable: [hashed-codex-home, codex-login-status], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["CODEX_HOME"],"error_sources":["api","ui","service-log"]}}}
+  HOME: {classification: tested, category: isolation, secret: true, scenario_set: path, restart: app, observable: [hashed-home, hashed-codex-home, write-boundary], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["HOME"],"error_sources":["api","ui","service-log"]}}}
+  CODEX_BIN_REAL: {classification: excluded, category: install, exclude_reason: scripts/install_offline_kit.sh内だけで展開済みCodex実体pathを保持するinstall内部変数}
+  SHERPA_MARP_BIN: {classification: tested, category: authoring, secret: false, scenario_set: path, restart: app, observable: [artifact-file, author-trace], test_values: {"default":null,"valid":{"from_env":"SHERPA_MARP_BIN"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"SHERPA_MARP_BIN"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"SHERPA_MARP_BIN"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_MARP_BIN"],"error_sources":["api","ui","service-log"]}}}
+  CHROME_PATH: {classification: tested, category: authoring, secret: false, scenario_set: path, restart: app, observable: [artifact-render], test_values: {"default":null,"valid":{"from_env":"CHROME_PATH"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"CHROME_PATH"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"CHROME_PATH"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["CHROME_PATH"],"error_sources":["api","ui","service-log"]}}}
+  CHROMIUM_PATH: {classification: tested, category: authoring, secret: false, scenario_set: path, restart: app, observable: [artifact-render], test_values: {"default":null,"valid":{"from_env":"CHROME_PATH"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"CHROME_PATH"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"CHROME_PATH"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["CHROMIUM_PATH"],"error_sources":["api","ui","service-log"]}}}
+
+  SHERPA_ARMS: {classification: tested, category: ingestion, secret: false, scenario_set: enum, restart: app, observable: [derived-files], test_values: {"default":null,"valid":"ooxml,pdf_text,vision","boundary":"","invalid":"__invalid_sherpa_arms__","precedence":{"process":"ooxml,pdf_text,vision","env_file":"__invalid_sherpa_arms__"},"restart":"ooxml,pdf_text,vision"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_ARMS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_PDF_TEXT_MIN_CHARS: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [selected-arm, derived-markdown], test_values: {"default":null,"valid":"100","boundary":"0","invalid":"not-a-number","precedence":{"process":"100","env_file":"0"},"restart":"100"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_PDF_TEXT_MIN_CHARS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_MAX_PAGES: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [processed-page-count, observation], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_MAX_PAGES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_MAX_PIXELS: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [rendered-image-size, observation], test_values: {"default":null,"valid":"512","boundary":"0","invalid":"not-a-number","precedence":{"process":"512","env_file":"0"},"restart":"512"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_MAX_PIXELS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_VLM_PROVIDER: {classification: tested, category: ingestion, secret: false, scenario_set: enum, restart: app, observable: [observation-provider], test_values: {"default":null,"valid":"openai","boundary":"","invalid":"__invalid_sherpa_vlm_provider__","precedence":{"process":"openai","env_file":"__invalid_sherpa_vlm_provider__"},"restart":"openai"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_VLM_PROVIDER"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_VLM_MODEL: {classification: tested, category: ingestion, secret: false, scenario_set: standard, restart: app, observable: [observation-model], test_values: {"default":null,"valid":"qwen2.5vl:latest","boundary":"","invalid":"__invalid_sherpa_vlm_model__","precedence":{"process":"qwen2.5vl:latest","env_file":"__invalid_sherpa_vlm_model__"},"restart":"qwen2.5vl:latest"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_VLM_MODEL"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_VLM_OLLAMA_URL: {classification: tested, category: ingestion, secret: false, scenario_set: connection, restart: app, observable: [provider-probe, observation], test_values: {"default":null,"valid":"http://127.0.0.1:11434","boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":"http://127.0.0.1:11434","env_file":"invalid://127.0.0.1:not-a-port"},"restart":"http://127.0.0.1:11434"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_VLM_OLLAMA_URL"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_VLM_TIMEOUT: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [provider-duration, ingest-error], test_values: {"default":null,"valid":"60","boundary":"0","invalid":"not-a-number","precedence":{"process":"60","env_file":"0"},"restart":"60"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_VLM_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_VLM_MAX_IMAGE_MB: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [upload-rejection], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_VLM_MAX_IMAGE_MB"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_LEGACY_BACKEND: {classification: tested, category: ingestion, secret: false, scenario_set: enum, restart: app, observable: [legacy-status, derived-files], test_values: {"default":null,"valid":"libreoffice","boundary":"","invalid":"__invalid_sherpa_legacy_backend__","precedence":{"process":"libreoffice","env_file":"__invalid_sherpa_legacy_backend__"},"restart":"libreoffice"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_LEGACY_BACKEND"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_LEGACY_TIMEOUT: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [conversion-duration, ingest-error], test_values: {"default":null,"valid":"30","boundary":"0","invalid":"not-a-number","precedence":{"process":"30","env_file":"0"},"restart":"30"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_LEGACY_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_SOFFICE_BIN: {classification: tested, category: ingestion, secret: false, scenario_set: path, restart: app, observable: [conversion-result], test_values: {"default":null,"valid":{"from_env":"SHERPA_SOFFICE_BIN"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"SHERPA_SOFFICE_BIN"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"SHERPA_SOFFICE_BIN"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_SOFFICE_BIN"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OFFICE_COM_URL: {classification: tested, category: ingestion, secret: false, scenario_set: connection, restart: app, observable: [worker-probe, conversion-result], test_values: {"default":null,"valid":{"from_env":"SHERPA_OFFICE_COM_URL"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"SHERPA_OFFICE_COM_URL"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"SHERPA_OFFICE_COM_URL"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OFFICE_COM_URL"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OFFICE_COM_TOKEN: {classification: tested, category: ingestion, secret: true, scenario_set: secret, restart: app, observable: [redacted-worker-request, conversion-result], test_values: {"default":null,"valid":{"from_env":"SHERPA_OFFICE_COM_TOKEN"},"boundary":"","invalid":"REPLACE_ME","precedence":{"process":{"from_env":"SHERPA_OFFICE_COM_TOKEN"},"env_file":"REPLACE_ME"},"restart":{"from_env":"SHERPA_OFFICE_COM_TOKEN"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OFFICE_COM_TOKEN"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OFFICE_TRANSFER_MODE: {classification: tested, category: ingestion, secret: false, scenario_set: enum, restart: app, observable: [worker-request-summary, conversion-result], test_values: {"default":null,"valid":"upload","boundary":"","invalid":"__invalid_sherpa_office_transfer_mode__","precedence":{"process":"upload","env_file":"__invalid_sherpa_office_transfer_mode__"},"restart":"upload"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OFFICE_TRANSFER_MODE"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_POWERSHELL_BIN: {classification: tested, category: ingestion, secret: false, scenario_set: path, restart: app, observable: [worker-version, conversion-result], test_values: {"default":null,"valid":{"from_env":"SHERPA_POWERSHELL_BIN"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"SHERPA_POWERSHELL_BIN"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"SHERPA_POWERSHELL_BIN"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_POWERSHELL_BIN"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_POLL_SECONDS: {classification: tested, category: ingestion, secret: false, scenario_set: numeric, restart: app, observable: [refresh-time, ingest-run], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_POLL_SECONDS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_DISABLE_EMBED: {classification: tested, category: ingestion, secret: false, scenario_set: standard, restart: app, observable: [elasticsearch-vector-field, ingest-log], test_values: {"default":null,"valid":"0","boundary":"","invalid":"__invalid_sherpa_disable_embed__","precedence":{"process":"0","env_file":"__invalid_sherpa_disable_embed__"},"restart":"0"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_DISABLE_EMBED"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_ENABLED: {classification: tested, category: ingestion, secret: false, scenario_set: boolean, restart: stack, observable: [observation], test_values: {"default":null,"valid":"0","boundary":"1","invalid":"__invalid_boolean__","precedence":{"process":"0","env_file":"1"},"restart":"0"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_ENABLED"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_WORLD_ROOT: {classification: tested, category: safety, secret: false, scenario_set: path, restart: stack, observable: [compose-mount, world-root-check], test_values: {"default":null,"valid":{"runtime":"valid_path"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"runtime":"valid_path"},"env_file":{"runtime":"alternate_path"}},"restart":{"runtime":"valid_path"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_WORLD_ROOT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_UID: {classification: tested, category: isolation, secret: false, scenario_set: numeric, restart: stack, observable: [container-user, created-file-owner], test_values: {"default":null,"valid":"1001","boundary":"0","invalid":"not-a-number","precedence":{"process":"1001","env_file":"0"},"restart":"1001"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_UID"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_GID: {classification: tested, category: isolation, secret: false, scenario_set: numeric, restart: stack, observable: [container-group, created-file-owner], test_values: {"default":null,"valid":"1001","boundary":"0","invalid":"not-a-number","precedence":{"process":"1001","env_file":"0"},"restart":"1001"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_GID"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_OCR_MEMORY_LIMIT: {classification: tested, category: isolation, secret: false, scenario_set: standard, restart: stack, observable: [container-memory-limit], test_values: {"default":null,"valid":"4g","boundary":"","invalid":"__invalid_sherpa_ocr_memory_limit__","precedence":{"process":"4g","env_file":"__invalid_sherpa_ocr_memory_limit__"},"restart":"4g"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_OCR_MEMORY_LIMIT"],"error_sources":["api","ui","service-log"]}}}
+
+  SHERPA_WORKSPACE_MAX_BYTES: {classification: tested, category: workspace, secret: false, scenario_set: numeric, restart: app, observable: [upload-result], test_values: {"default":null,"valid":"1048576","boundary":"0","invalid":"not-a-number","precedence":{"process":"1048576","env_file":"0"},"restart":"1048576"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_WORKSPACE_MAX_BYTES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_WORKSPACE_TTL_DAYS: {classification: tested, category: workspace, secret: false, scenario_set: numeric, restart: app, observable: [expiry-time], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_WORKSPACE_TTL_DAYS"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_EXT_CONVERT_MAX_BYTES: {classification: tested, category: external-api, secret: false, scenario_set: numeric, restart: app, observable: [upload-result], test_values: {"default":null,"valid":"1048576","boundary":"0","invalid":"not-a-number","precedence":{"process":"1048576","env_file":"0"},"restart":"1048576"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_EXT_CONVERT_MAX_BYTES"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HEALTH_TTL: {classification: tested, category: health, secret: false, scenario_set: numeric, restart: app, observable: [health-cache-age, request-count], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HEALTH_TTL"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HEALTH_TIMEOUT: {classification: tested, category: health, secret: false, scenario_set: numeric, restart: app, observable: [health-duration], test_values: {"default":null,"valid":"5","boundary":"0","invalid":"not-a-number","precedence":{"process":"5","env_file":"0"},"restart":"5"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HEALTH_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HEALTH_AI_TTL: {classification: tested, category: health, secret: false, scenario_set: numeric, restart: app, observable: [ai-health-cache-age, provider-request-count], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"not-a-number","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HEALTH_AI_TTL"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_HEALTH_AI_TIMEOUT: {classification: tested, category: health, secret: false, scenario_set: numeric, restart: app, observable: [ai-health-duration], test_values: {"default":null,"valid":"15","boundary":"0","invalid":"not-a-number","precedence":{"process":"15","env_file":"0"},"restart":"15"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_HEALTH_AI_TIMEOUT"],"error_sources":["api","ui","service-log"]}}}
+  SHERPA_USAGE_METERING: {classification: tested, category: usage, secret: false, scenario_set: boolean, restart: app, observable: [usage-records, usage-page], test_values: {"default":null,"valid":"1","boundary":"0","invalid":"__invalid_boolean__","precedence":{"process":"1","env_file":"0"},"restart":"1"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SHERPA_USAGE_METERING"],"error_sources":["api","ui","service-log"]}}}
+
+  HTTP_PROXY: {classification: tested, category: network, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment, provider-probe], test_values: {"default":null,"valid":{"from_env":"HTTP_PROXY"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"HTTP_PROXY"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"HTTP_PROXY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["HTTP_PROXY"],"error_sources":["api","ui","service-log"]}}}
+  HTTPS_PROXY: {classification: tested, category: network, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment, provider-probe], test_values: {"default":null,"valid":{"from_env":"HTTPS_PROXY"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"HTTPS_PROXY"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"HTTPS_PROXY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["HTTPS_PROXY"],"error_sources":["api","ui","service-log"]}}}
+  ALL_PROXY: {classification: tested, category: network, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment, provider-probe], test_values: {"default":null,"valid":{"from_env":"ALL_PROXY"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"ALL_PROXY"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"ALL_PROXY"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["ALL_PROXY"],"error_sources":["api","ui","service-log"]}}}
+  http_proxy: {classification: tested, category: network, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment, provider-probe], test_values: {"default":null,"valid":{"from_env":"http_proxy"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"http_proxy"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"http_proxy"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["http_proxy"],"error_sources":["api","ui","service-log"]}}}
+  https_proxy: {classification: tested, category: network, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment, provider-probe], test_values: {"default":null,"valid":{"from_env":"https_proxy"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"https_proxy"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"https_proxy"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["https_proxy"],"error_sources":["api","ui","service-log"]}}}
+  all_proxy: {classification: tested, category: network, secret: true, scenario_set: connection, restart: app, observable: [redacted-effective-environment, provider-probe], test_values: {"default":null,"valid":{"from_env":"all_proxy"},"boundary":"","invalid":"invalid://127.0.0.1:not-a-port","precedence":{"process":{"from_env":"all_proxy"},"env_file":"invalid://127.0.0.1:not-a-port"},"restart":{"from_env":"all_proxy"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["all_proxy"],"error_sources":["api","ui","service-log"]}}}
+  NO_PROXY: {classification: tested, category: network, secret: false, scenario_set: standard, restart: app, observable: [proxy-log], test_values: {"default":null,"valid":"127.0.0.1,localhost","boundary":"","invalid":"__invalid_no_proxy__","precedence":{"process":"127.0.0.1,localhost","env_file":"__invalid_no_proxy__"},"restart":"127.0.0.1,localhost"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["NO_PROXY"],"error_sources":["api","ui","service-log"]}}}
+  no_proxy: {classification: tested, category: network, secret: false, scenario_set: standard, restart: app, observable: [proxy-log], test_values: {"default":null,"valid":"127.0.0.1,localhost","boundary":"","invalid":"__invalid_no_proxy__","precedence":{"process":"127.0.0.1,localhost","env_file":"__invalid_no_proxy__"},"restart":"127.0.0.1,localhost"}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["no_proxy"],"error_sources":["api","ui","service-log"]}}}
+  SSL_CERT_FILE: {classification: tested, category: network, secret: false, scenario_set: path, restart: app, observable: [tls-probe], test_values: {"default":null,"valid":{"from_env":"SSL_CERT_FILE"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"SSL_CERT_FILE"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"SSL_CERT_FILE"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SSL_CERT_FILE"],"error_sources":["api","ui","service-log"]}}}
+  SSL_CERT_DIR: {classification: tested, category: network, secret: false, scenario_set: path, restart: app, observable: [tls-probe], test_values: {"default":null,"valid":{"from_env":"SSL_CERT_DIR"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"SSL_CERT_DIR"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"SSL_CERT_DIR"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["SSL_CERT_DIR"],"error_sources":["api","ui","service-log"]}}}
+  NODE_EXTRA_CA_CERTS: {classification: tested, category: network, secret: false, scenario_set: path, restart: app, observable: [codex-tls-probe], test_values: {"default":null,"valid":{"from_env":"NODE_EXTRA_CA_CERTS"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"NODE_EXTRA_CA_CERTS"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"NODE_EXTRA_CA_CERTS"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["NODE_EXTRA_CA_CERTS"],"error_sources":["api","ui","service-log"]}}}
+  REQUESTS_CA_BUNDLE: {classification: tested, category: network, secret: false, scenario_set: path, restart: app, observable: [codex-tls-probe], test_values: {"default":null,"valid":{"from_env":"REQUESTS_CA_BUNDLE"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"REQUESTS_CA_BUNDLE"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"REQUESTS_CA_BUNDLE"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["REQUESTS_CA_BUNDLE"],"error_sources":["api","ui","service-log"]}}}
+  CURL_CA_BUNDLE: {classification: tested, category: network, secret: false, scenario_set: path, restart: app, observable: [codex-tls-probe], test_values: {"default":null,"valid":{"from_env":"CURL_CA_BUNDLE"},"boundary":{"runtime":"empty_path"},"invalid":{"runtime":"invalid_path"},"precedence":{"process":{"from_env":"CURL_CA_BUNDLE"},"env_file":{"runtime":"alternate_path"}},"restart":{"from_env":"CURL_CA_BUNDLE"}}, expected_outcomes: {"boundary":"accepted-boundary","invalid":{"outcome":"explicit-error","error_patterns":["CURL_CA_BUNDLE"],"error_sources":["api","ui","service-log"]}}}
+
+  SHERPA_BACKUP_DIR: {classification: excluded, category: backup, exclude_reason: UI実行時に使用せずbackupコマンドだけが使用する}
+  SHERPA_TEST_PG_DSN: {classification: excluded, category: pytest, exclude_reason: 既存pytestが隔離PostgreSQLを指定する内部入力で実サービスUI試験では使用しない}
+  PYTHONDONTWRITEBYTECODE: {classification: excluded, category: internal-generated, exclude_reason: run-apiが子Python processへ固定設定する内部値}
+  PYTHONUNBUFFERED: {classification: excluded, category: internal-generated, exclude_reason: run-apiが子Python processへ固定設定する内部値}
+  PLAYWRIGHT_HOME: {classification: excluded, category: install, exclude_reason: Playwright導入先の構築と検査だけに使用する}
+  DIFY_API_KEY: {classification: excluded, category: external-script, exclude_reason: UI外のDify KB import補助scriptだけが使用する}
+  DIFY_BASE_URL: {classification: excluded, category: external-script, exclude_reason: UI外のDify KB import補助scriptだけが使用する}
+  APP_RUNNING: {classification: excluded, category: backup, exclude_reason: backup scriptが稼働状態検査から生成する内部値}
+  RUNNING: {classification: excluded, category: backup, exclude_reason: backup scriptがcontainer稼働状態から生成する内部値}
+  ATTACHED_ALL: {classification: excluded, category: restore, exclude_reason: restore scriptがvolume接続一覧から生成する内部値}
+  PROJECT: {classification: excluded, category: restore, exclude_reason: restore scriptだけがCompose projectの既定名保持に使用する}
+  "YES": {classification: excluded, category: destructive-cli, exclude_reason: nukeとrestoreの対話確認を省略するCLI専用入力}
+  APT_BASE_IMAGE: {classification: excluded, category: build, exclude_reason: offline kitのapt収集用container image指定だけに使用する}
+  BASE_CLOSURE_PACKAGES: {classification: excluded, category: build, exclude_reason: offline kitが依存package集合を生成する内部値}
+  CURRENT_REAL: {classification: excluded, category: install, exclude_reason: install scriptが現在のsymlink解決先から生成する内部値}
+  CURRENT_STEP: {classification: excluded, category: install, exclude_reason: install scriptが失敗表示用に生成する内部値}
+  _ERR_SHOWN: {classification: excluded, category: install, exclude_reason: install scriptのtrap重複表示防止に使う内部値}
+  _LOG_FILE: {classification: excluded, category: install, exclude_reason: install scriptが実行時に生成するlog path内部値}
+  ID: {classification: excluded, category: build, exclude_reason: apt offline scriptがos-releaseから読むOS識別内部値}
+  VERSION: {classification: excluded, category: build, exclude_reason: apt offline scriptがos-releaseから読むOS版内部値}
+  VERSION_ID: {classification: excluded, category: build, exclude_reason: apt offline scriptがos-releaseから読むOS版内部値}
+  VERSION_CODENAME: {classification: excluded, category: build, exclude_reason: apt offline scriptがos-releaseから読むOS codename内部値}
+  SHERPA_BACKUP_BEFORE_SWITCH: {classification: excluded, category: backup, exclude_reason: install更新の切替前backupだけが使用する}
+  SHERPA_SRV_ROOT: {classification: excluded, category: install, exclude_reason: 配布物install先の構築だけが使用する}
+  SHERPA_VENV: {classification: excluded, category: install, exclude_reason: install scriptが仮想環境を選ぶためだけに使用する}
+  SHERPA_ALLOW_PY_MISMATCH: {classification: excluded, category: install, exclude_reason: offline kit導入時のPython互換検査だけに使用する}
+  SHERPA_APT_OFFLINE_SUDO: {classification: excluded, category: install, exclude_reason: offline apt導入scriptだけが使用する}
+  SHERPA_DOCKER: {classification: excluded, category: install, exclude_reason: offline kit導入script内部でdocker commandを指定する}
+  SHERPA_OFFLINE_ALLOW_BASELINE_MISMATCH: {classification: excluded, category: install, exclude_reason: offline kit検証だけが使用する}
+  SHERPA_WHEELS_IN_CONTAINER: {classification: excluded, category: build, exclude_reason: offline wheel収集containerだけが生成する}
+  SHERPA_WFTEST_ALLOW_MISSING_GROUPS: {classification: excluded, category: build, exclude_reason: wheelhouse検証script専用}
+  SHERPA_WFTEST_HOST_IMAGE: {classification: excluded, category: build, exclude_reason: wheelhouse検証script専用}
+  SHERPA_WFTEST_REBUILD_HOST: {classification: excluded, category: build, exclude_reason: wheelhouse検証script専用}
+  SHERPA_WFTEST_SNAPSHOT: {classification: excluded, category: build, exclude_reason: wheelhouse検証script専用}
+  PG_IMAGE: {classification: excluded, category: build, exclude_reason: offline image保存scriptの一時変数}
+  NEO4J_IMAGE: {classification: excluded, category: build, exclude_reason: offline image保存scriptの一時変数}
+  ES_IMAGE: {classification: excluded, category: build, exclude_reason: offline image保存scriptの一時変数}
+  ES_JAVA_OPTS: {classification: excluded, category: internal-generated, exclude_reason: ComposeがElasticsearch containerへ固定値として渡す内部値}
+  NEO4J_AUTH: {classification: excluded, category: internal-generated, exclude_reason: ComposeがNEO4J_PASSWORDから生成してcontainerへ渡す内部値}
+  PADDLE_PDX_CACHE_HOME: {classification: excluded, category: internal-generated, exclude_reason: ComposeがOCR container内固定pathとして生成する}
+  PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: {classification: excluded, category: internal-generated, exclude_reason: ComposeがOCR containerへ固定値として渡す}
+  PADDLE_CPU_PROFILE: {classification: excluded, category: internal-generated, exclude_reason: OCR worker内部診断用でUI runtime契約ではない}
+  SHERPA_ENV: {classification: excluded, category: internal-generated, exclude_reason: run-apiがserveまたはdevを固定して子processへ渡す}
+  SHERPA_USE_FIXTURES: {classification: excluded, category: pytest, exclude_reason: 既存fixture試験専用で実サービスUI試験では設定を禁止する}
+  SHERPA_TEST_DB_ISOLATED: {classification: excluded, category: pytest, exclude_reason: 既存pytestがテストDBを識別する内部値}
+  SHERPA_TEST_WORLD_ID: {classification: excluded, category: pytest, exclude_reason: 既存pytestがworldを識別する内部値}
+  SHERPA_CONCEPTS: {classification: excluded, category: pytest, exclude_reason: 開発用fixture path上書きで実サービスUI試験では使用しない}
+  SHERPA_SEMANTIC: {classification: excluded, category: pytest, exclude_reason: 開発用fixture path上書きで実サービスUI試験では使用しない}
+  SHERPA_MCP_WORLD: {classification: excluded, category: internal-generated, exclude_reason: 親processがCodex MCP子processへturn単位で生成する}
+  SHERPA_MCP_SCOPE: {classification: excluded, category: internal-generated, exclude_reason: 親processがCodex MCP子processへturn単位で生成する}
+  SHERPA_MCP_WORLD_ROOT: {classification: excluded, category: internal-generated, exclude_reason: 親processがCodex MCP子processへturn単位で生成する}
+  SHERPA_MCP_ASK_DISABLED: {classification: excluded, category: internal-generated, exclude_reason: 親processがCodex MCP子processへturn単位で生成する}
+  SHERPA_VLM_USABLE: {classification: excluded, category: internal-generated, exclude_reason: 取込processが能力検査後に子processへ生成する}
+  SHERPA_LEGACY_EXTS: {classification: excluded, category: internal-generated, exclude_reason: legacy変換processが子processへ生成する}
+  CODEX_MODEL_PROVIDERS: {classification: excluded, category: internal-generated, exclude_reason: Codex sandboxが中央設定から一時生成する}
+  CODEX_COLLECTED: {classification: excluded, category: build, exclude_reason: Codex offline収集scriptの一時変数}
+  CODEX_DEST: {classification: excluded, category: build, exclude_reason: Codex offline収集scriptの一時変数}
+  CODEX_PKG_DIR: {classification: excluded, category: build, exclude_reason: Codex offline収集scriptの一時変数}
+  CODEX_TARBALL: {classification: excluded, category: build, exclude_reason: Codex offline収集scriptの一時変数}
+  CODEX_VER: {classification: excluded, category: build, exclude_reason: Codex offline収集scriptの一時変数}
+  TMPDIR: {classification: excluded, category: internal-generated, exclude_reason: Codex sandboxと検証scriptが専用一時領域を子processへ生成する}
+  PLAYWRIGHT_BROWSERS_PATH: {classification: excluded, category: install, exclude_reason: offline kitがChromiumを配置・確認するためにだけ使用する}
+  APP_LOG: {classification: excluded, category: shell-local, exclude_reason: run-commonがRUN_DIRから生成してstartへ渡すapp log path内部値}
+  ARGS: {classification: excluded, category: make-local, exclude_reason: Make recipeがコマンド引数を組み立てる内部変数}
+  AUTH: {classification: excluded, category: shell-local, exclude_reason: Codex sandbox検証scriptが一時認証結果を保持する内部変数}
+  BAD_PORTS: {classification: excluded, category: shell-local, exclude_reason: port検査scriptの関数間で不正port集合を保持する内部配列}
+  BASH_COMMAND: {classification: excluded, category: shell-builtin, exclude_reason: bashがERR trapへ提供する組込み診断値}
+  BASH_REMATCH: {classification: excluded, category: shell-builtin, exclude_reason: bashが正規表現照合結果を提供する組込み配列}
+  BASH_SOURCE: {classification: excluded, category: shell-builtin, exclude_reason: bashがsource元pathを提供する組込み配列}
+  CADDY_LOG: {classification: excluded, category: shell-local, exclude_reason: run-commonがRUN_DIRから生成するCaddy log path内部値}
+  CADDY_PID_FILE: {classification: excluded, category: shell-local, exclude_reason: run-commonがRUN_DIRから生成するCaddy PID path内部値}
+  CADDY_PROC_NEEDLE: {classification: excluded, category: shell-local, exclude_reason: run-commonがCaddy process照合用に生成する内部値}
+  CHAT_URL: {classification: excluded, category: shell-local, exclude_reason: run-commonがSHERPA_HOSTとSHERPA_PORTから生成する表示用URL}
+  COMPOSE: {classification: excluded, category: make-local, exclude_reason: MakefileがCompose command列を組み立てる内部変数}
+  COMPOSE_ALL: {classification: excluded, category: make-local, exclude_reason: Makefileが全profile用Compose command列を組み立てる内部変数}
+  COMPOSE_ENV_FLAG: {classification: excluded, category: make-local, exclude_reason: Makefileがenv file引数を組み立てる内部変数}
+  DRY_RUN: {classification: excluded, category: shell-local, exclude_reason: backup CLIの引数解析結果を保持する内部フラグ}
+  FROM: {classification: excluded, category: make-local, exclude_reason: Make recipeが更新元引数を保持する内部変数}
+  LINENO: {classification: excluded, category: shell-builtin, exclude_reason: bashがtrapへ現在行番号を提供する組込み値}
+  MAKEFILE_LIST: {classification: excluded, category: make-builtin, exclude_reason: makeが読込済みMakefile一覧を提供する組込み変数}
+  MODE: {classification: excluded, category: make-local, exclude_reason: Make recipeがserveまたはdev引数を選ぶ内部変数}
+  PY: {classification: excluded, category: build, exclude_reason: Makeとoffline kitが選択済みPython commandを保持する内部変数}
+  SEEN: {classification: excluded, category: shell-local, exclude_reason: restore検証が重複entryを検出する内部連想配列}
+  UI_AUTOMATION_ARGS: {classification: excluded, category: test-runner, exclude_reason: Makeから独立UI runnerへ追加CLI引数を渡す試験専用入力}
+  USER: {classification: excluded, category: install, exclude_reason: install補助scriptが所有者表示とgroup確認だけに読むOS標準値}
+  WHEELS_IN_CONTAINER: {classification: excluded, category: build, exclude_reason: SHERPA_WHEELS_IN_CONTAINERから導出するoffline wheel収集内部値}
+  WITH_DERIVED: {classification: excluded, category: shell-local, exclude_reason: backup CLIの派生物含有optionを保持する内部フラグ}
+  _CX_ENV: {classification: excluded, category: install, exclude_reason: install scriptがCodex認証用env file pathを一時保持する内部値}

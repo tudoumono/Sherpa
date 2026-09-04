@@ -1,0 +1,13 @@
+cytoscape.min.js — vendored third-party library
+================================================
+
+Package : cytoscape
+License : MIT
+Upstream: https://github.com/cytoscape/cytoscape.js
+Copyright (c) 2016-2024, The Cytoscape Consortium.
+
+The full MIT license text is embedded in the banner comment at the top of
+web/vendor/cytoscape.min.js (unmodified official build). This file records
+provenance in the same format as marked.LICENSE.txt: the library is loaded
+locally — never from a CDN — so Sherpa's graph UI works without internet
+access (see docs/manual/offline-kit.md).

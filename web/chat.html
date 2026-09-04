@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — チャット</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="vendor/cytoscape.min.js"></script>   <!-- 回答の「参照したナレッジグラフ」用（#5・遅延init） -->
+<script src="common.js"></script>
+<script src="nav.js"></script>                      <!-- 共通の上部ナビ（コンポーネント）-->
+<style>
+  /* ヘッダは折り返さず1行に。タイトルは長ければ省略。 */
+  .chead{flex-wrap:nowrap}
+  #conv-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* 画面が狭いときはボタン文言（.btxt）を隠してアイコンのみ＝2段にしない（書き出し/共有/資料フォルダ）。*/
+  @media (max-width:1280px){ .chead .btxt{display:none} }
+  /* 頭脳メニュー内のモデル切替（チャット画面でモデルも完結）。*/
+  .bm-model{display:flex;gap:6px;align-items:center;padding:8px 10px;border-top:1px solid var(--border)}
+  .bm-model input, .bm-model select{flex:1;min-width:0;font-size:12.5px;padding:6px 8px;border:1px solid var(--border);
+    border-radius:7px;background:var(--surface);color:var(--ink);font-family:inherit}
+  .bm-model .mini{height:30px;padding:0 10px;border-radius:7px;border:1px solid var(--border);
+    background:var(--surface-2);color:var(--ink-2);font-size:12px;cursor:pointer;white-space:nowrap}
+  .bm-tres{padding:0 12px 8px;font-size:12px}
+  .bm-tres.ok{color:var(--ok)} .bm-tres.danger{color:var(--danger)} .bm-tres.muted{color:var(--ink-3)}
+
+  /* 会話履歴: セクション見出し */
+  .conv-section-head{font-size:11px;font-weight:600;color:var(--ink-3);padding:8px 10px 3px;text-transform:uppercase;letter-spacing:.05em}
+  /* 受領共有バッジ */
+  .badge-shared{display:inline-block;font-size:10px;font-weight:700;color:var(--accent-ink);background:var(--accent-weak);
+    border-radius:4px;padding:1px 5px;margin-right:4px;vertical-align:middle}
+  .badge-ro{margin-right:3px;vertical-align:middle;font-size:12px}
+  .badge-status{display:inline-block;font-size:10px;color:var(--ink-3);background:var(--surface-2);
+    border-radius:4px;padding:1px 5px;margin-left:4px;vertical-align:middle}
+  .conv-inactive{opacity:.55}
+  .shared-by{color:var(--ink-3);font-size:11px}
+
+  /* 共有ダイアログ */
+  .share-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;
+    justify-content:center;z-index:200}
+  .share-overlay[hidden]{display:none}   /* [hidden] と .share-overlay は詳細度が同じで後勝ちになるため明示上書き（さもないと常時表示・×で閉じない） */
+  .share-modal{background:var(--surface);border-radius:var(--radius);padding:28px 30px;width:360px;
+    box-shadow:var(--shadow-lg);position:relative}
+  .share-modal h2{font-size:15px;font-weight:700;margin:0 0 4px}
+  .share-modal .sub{font-size:12px;color:var(--ink-3);margin-bottom:16px}
+  .share-modal label{display:block;font-size:12.5px;font-weight:600;color:var(--ink-2);margin:12px 0 4px}
+  .share-modal input,.share-modal select{width:100%;box-sizing:border-box;padding:8px 10px;
+    border:1px solid var(--border);border-radius:var(--radius-sm);font-family:inherit;font-size:13.5px;
+    background:var(--surface);color:var(--ink)}
+  .share-err{font-size:12px;color:var(--danger);margin-top:6px;min-height:16px}
+  .share-result{background:var(--ok-bg);border-radius:var(--radius-sm);padding:12px;margin-top:4px}
+  .share-result .lbl{font-size:12px;color:var(--ok);font-weight:600;margin-bottom:6px}
+  .share-url-row{display:flex;align-items:center;gap:6px}
+  .share-url-val{font-size:11.5px;word-break:break-all;flex:1;color:var(--ink-2);font-family:var(--font-code,monospace);
+    background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 8px}
+  .share-close-x{position:absolute;top:14px;right:16px;background:none;border:none;font-size:18px;
+    color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
+  .share-close-x:hover{background:var(--surface-2)}
+</style>
+</head>
+<body>
+<!-- 全ページ共通の上部ナビ（コンポーネント・nav.js）-->
+<sherpa-topbar></sherpa-topbar>
+
+<div class="app">
+  <!-- 左: ロゴ・チャット履歴・開閉（補助）。主要メニューは上部ナビへ移動 -->
+  <aside class="pane left">
+    <div class="pane-body">
+      <div class="lbrand">
+        <button class="sidetoggle" id="sideclose" title="サイドバーを閉じる"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg></button>
+        <span class="ltitle">チャット履歴</span>
+      </div>
+      <button class="newbtn" id="newbtn">＋ 新しいチャット</button>
+      <div class="hist" id="convlist"></div>
+      <!-- ユーザー情報・ログアウトは全ページ共通の上部ナビ（右上・sherpa-topbar）へ移動済み -->
+    </div>
+  </aside>
+
+  <div class="splitter" id="splitL" title="幅をドラッグで変更"></div>
+
+  <!-- 中央: 会話 -->
+  <main class="pane center">
+    <div class="chead">
+      <button class="sidetoggle" id="sideopen" title="サイドバーを開く"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg></button>
+      <span id="conv-title">新しい会話</span>
+      <span class="spacer"></span>
+      <span class="fontsel">
+        <button class="iconbtn" id="fontbtn" title="チャットの文字サイズ">あ</button>
+        <div class="fontmenu" id="fontmenu" hidden></div>
+      </span>
+      <span class="headctl">
+        <span class="exportsel">
+          <button class="btn-ghost" id="exportbtn" title="この会話を書き出す">⬇ <span class="btxt">書き出し</span></button>
+          <div class="exportmenu fontmenu" id="exportmenu" hidden></div>
+        </span>
+        <button class="btn-ghost" id="sharebtn" title="この会話を共有">🔗 <span class="btxt">共有</span></button>
+        <span class="verselect"><span class="btxt">資料フォルダ</span> <select id="version"></select></span>
+        <button class="sidetoggle" id="rightopen" title="思考パネルを開く"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg></button>
+      </span>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="composer">
+      <!-- 入力欄付近のコントロール: 調べ方ブロックの要約チップ＋個人ファイル追加＋頭脳（AI）。
+           調べ方（レンズ）・範囲・探す対象・参照する（社内資料/個人ファイル）は右ペイン下部の
+           固定フッター（#inquiry）へ集約した（SC-6b・docs/proposals/2026-08-29-調べ方ブロック.md §2.3）。 -->
+      <div class="cbar">
+        <button class="inquiry-chip" id="inquiry-chip" type="button" title="調べ方・調べる深さ・範囲・探す対象・参照先を設定する">🎯 <b id="inquiry-chip-label">自動 · 全体 · 資料＋コード · 標準</b></button>
+        <button class="kbtoggle" id="chat-upload-btn" title="このファイルを本人だけの個人ワークスペースへ保存する">📎 個人ファイルを追加</button>
+        <input id="chat-file-input" type="file" hidden multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.cbl,.cob,.cobol,.cpy,.copybook,.jcl,.sql,.py,.sh,.bat">
+        <span id="chat-upload-status" style="font-size:11.5px;color:var(--ink-3)" aria-live="polite"></span>
+        <span id="personal-blocked-note" style="display:none;font-size:11px;color:var(--text-muted,#888);margin-left:4px">（共有不可の会話）</span>
+        <span class="spacer"></span>
+        <span class="brainwrap">
+          <button class="badge-brain" id="brainbadge" title="利用するAI・実行環境を選ぶ">🧠 <b id="brain-label">…</b> <small id="brain-model"></small> ▾</button>
+          <div class="brainmenu" id="brainmenu" hidden></div>
+        </span>
+      </div>
+      <div class="box">
+        <textarea id="input" rows="1" placeholder="メッセージを入力（例: 消費税率を変えたい。影響は？）"></textarea>
+        <button class="sendbtn" id="send" title="送信">↑</button>
+      </div>
+    </div>
+  </main>
+
+  <div class="splitter" id="splitR" title="幅をドラッグで変更"></div>
+
+  <!-- 右: 思考の流れ（上・スクロール）＋調べ方ブロック（下・固定フッター） -->
+  <aside class="pane right">
+    <div class="rhead"><button class="sidetoggle" id="rightclose" title="思考パネルを閉じる"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg></button>思考の流れ <span class="rt" id="rt"><span class="dot"></span>待機中</span></div>
+    <div class="flow" id="flow"><div class="hint">質問すると、考えた道筋がここに流れます。</div></div>
+    <div class="inquiry" id="inquiry">
+      <button class="inquiry-head" id="inquiry-head" type="button" aria-expanded="true" aria-controls="inquiry-body">
+        <span class="inquiry-title">🎯 次の質問の調べ方</span>
+        <span class="inquiry-sum muted" id="inquiry-sum"></span>
+        <span class="caret" aria-hidden="true">▾</span>
+      </button>
+      <div class="inquiry-body" id="inquiry-body">
+        <div class="inquiry-row">
+          <span class="inquiry-label">調べ方</span>
+          <div class="seg" id="lens-seg">
+            <button class="segbtn on" data-lens="auto" type="button">自動</button>
+            <button class="segbtn" data-lens="impact" type="button">影響</button>
+            <button class="segbtn" data-lens="troubleshoot" type="button">原因</button>
+            <button class="segbtn" data-lens="qa" type="button">内容</button>
+            <button class="segbtn" data-lens="author" type="button">作成</button>
+          </div>
+        </div>
+        <div class="inquiry-row" id="depth-row">
+          <span class="inquiry-label" title="頭脳によって効く範囲が違います（推論の深さは Codex のみ・検索の反復回数やヒット件数は共通で効きます）">調べる深さ</span>
+          <div class="seg" id="depth-seg">
+            <button class="segbtn on" data-depth="standard" type="button">標準</button>
+            <button class="segbtn" data-depth="deep" type="button">深く</button>
+            <button class="segbtn" data-depth="max" type="button">最大</button>
+          </div>
+        </div>
+        <div class="inquiry-row" id="scope-row">
+          <span class="inquiry-label">範囲</span>
+          <span class="scopesel" id="scopesel" style="display:none">
+            <button class="scopebtn" id="scopebtn" title="参照する範囲を絞る">📂 <b id="scopelabel">全体</b> ▾</button>
+            <div class="scopepanel" id="scopepanel" hidden></div>
+          </span>
+        </div>
+        <div class="inquiry-row" id="layer-row">
+          <span class="inquiry-label">探す対象</span>
+          <div class="seg" id="layer-seg">
+            <button class="segbtn on" data-layer="both" type="button">資料＋コード</button>
+            <button class="segbtn" data-layer="docs" type="button">資料のみ</button>
+            <button class="segbtn" data-layer="code" type="button">コードのみ</button>
+          </div>
+        </div>
+        <div class="inquiry-note muted" id="layer-note" hidden>ⓘ 影響検索（原因調べ）は資料とコードをつないで辿るため、探す対象の指定は使われません</div>
+        <div class="inquiry-row">
+          <span class="inquiry-label">参照する</span>
+          <button class="kbtoggle" id="kbtoggle" aria-pressed="false" title="社内ナレッジ（資料）を参照する">📚 社内資料 <b>オフ</b></button>
+          <button class="kbtoggle" id="personaltoggle" aria-pressed="false" title="自分の個人ファイル（アップロード済み）を参照する">🗂 個人ファイル <b>オフ</b></button>
+          <!-- WEB-1: 管理者が許可し、かつ現在の頭脳が Codex（OpenAI直結）のときだけ表示する（既定は非表示）。 -->
+          <button class="kbtoggle" id="websearchtoggle" aria-pressed="false" hidden
+                  title="Web も参照する（社内資料に加えて・Codex のみ）">🌐 Web 検索 <b>オフ</b></button>
+        </div>
+        <!-- SC-6e: 検索経路トグル（試せる場所）。既定閉の「詳細」の中に置き、通常は目に入らないようにする。 -->
+        <div class="inquiry-details" id="tools-details">
+          <button class="inquiry-details-head" id="tools-details-head" type="button" aria-expanded="false" aria-controls="tools-details-body">
+            詳細 <span class="caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="inquiry-details-body" id="tools-details-body" hidden>
+            <div class="inquiry-row">
+              <span class="inquiry-label" title="Codex では効きません（Codex は自前でファイルを検索するため）">使う検索</span>
+              <div class="seg" id="tools-seg">
+                <button class="segbtn on" data-tool="grep" type="button">コマンド検索</button>
+                <button class="segbtn on" data-tool="fulltext" type="button">全文・ベクトル</button>
+                <button class="segbtn on" data-tool="graph" type="button">グラフ</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- 設定（APIキー・モデル・抽出プロバイダ）は専用ページ settings.html へ集約。
+     チャットの AI/モデルは上部の頭脳バッジ（brainmenu）で完結。 -->
+<div class="toast" id="toast"></div>
+
+<!-- 共有ダイアログ（所有者が共有リンクを発行） -->
+<div class="share-overlay" id="share-overlay" hidden>
+  <div class="share-modal" role="dialog" aria-labelledby="share-dialog-title">
+    <button class="share-close-x" id="share-close" aria-label="閉じる">✕</button>
+    <h2>会話を共有</h2>
+    <div class="sub" id="share-dialog-title"></div>
+
+    <div id="share-form">
+      <label for="share-invitees">招待するユーザー</label>
+      <div class="invitee-chips" id="share-invitee-chips"></div>
+      <div class="share-suggest-wrap">
+        <input id="share-invitees" type="text" placeholder="uid や表示名で検索（カンマ区切りの手入力も可）" autocomplete="off">
+        <div class="share-suggest" id="share-invitee-suggest" hidden></div>
+      </div>
+      <label for="share-days">有効期限（日数）</label>
+      <select id="share-days">
+        <option value="1">1日</option>
+        <option value="3">3日</option>
+        <option value="7" selected>7日</option>
+        <option value="14">14日</option>
+        <option value="30">30日</option>
+        <option value="0">無期限</option>
+      </select>
+      <div class="share-err" id="share-err"></div>
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button class="btn-primary" id="share-submit" style="flex:1">共有リンクを発行</button>
+        <button class="mini" id="share-cancel" onclick="document.getElementById('share-overlay').hidden=true">キャンセル</button>
+      </div>
+    </div>
+
+    <div class="share-result" id="share-result" hidden>
+      <div class="lbl">共有リンクを発行しました（この画面にのみ表示されます）</div>
+      <div class="share-url-row">
+        <div class="share-url-val" id="share-url-val"></div>
+        <button class="mini" id="share-copy">コピー</button>
+      </div>
+      <div style="font-size:11.5px;color:var(--ink-3);margin-top:8px">招待したユーザーがこのリンクをクリックすると、履歴に追加されます。</div>
+      <div style="margin-top:10px"><button class="mini" onclick="document.getElementById('share-overlay').hidden=true">閉じる</button></div>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="chat.js"></script>
+</body>
+</html>

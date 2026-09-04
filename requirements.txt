@@ -1,0 +1,16 @@
+# Sherpa MVP — ランタイム依存
+# 静的解析(static_analysis)と M1/M2 の in-memory テストは標準ライブラリのみで動く。
+# 開発/テスト用の依存は requirements-dev.txt（利用者は scripts/start.sh が本ファイルのみを入れる）。
+neo4j>=6,<7          # グラフ投入・正準 Cypher
+psycopg[binary]>=3   # 会話の永続化（conversations/messages・M8）
+psycopg_pool>=3.2    # PG コネクションプール（性能台帳#17 QW2・store/db.py::_connect）
+fastapi>=0.110       # 薄い API（/impact/run 等）
+python-multipart>=0.0.7  # FastAPI multipart/form-data（ファイルアップロード）
+uvicorn[standard]    # ASGI サーバ
+openpyxl>=3          # Excel 出力（R7）
+python-docx>=1.1     # Feature A: Codex が Word 文書（.docx）を生成するためのライブラリ
+python-pptx>=0.6     # Feature A: Codex が PowerPoint（.pptx）を生成するためのライブラリ
+anthropic[bedrock]>=0.115  # AWS Bedrock（Claude）プロバイダ（Mantle クライアント＋boto3 依存）
+pypdf>=6             # PDF テキスト層抽出（MD化アーム④・同梱既定・2026-07-08 ユーザー指示）
+olefile>=0.47        # OLE2/CFB（暗号化 OOXML・旧 Office バイナリ）の暗号化ストリーム判定（ING-1 閉じた理由語彙）
+markitdown[all]>=0.1  # MD化アーム②の汎用変換（同梱既定・全部入り・2026-07-08 ユーザー指示）

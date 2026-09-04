@@ -1,0 +1,1253 @@
+version: 1
+description: >-
+  実サービスだけを使うUI自動化の機能台帳。full suiteでは、ここに登録されていない
+  HTML画面、ナビゲーション先、フロントエンドAPI呼出しを検出した時点で失敗する。
+
+discovery:
+  html_globs:
+    - web/*.html
+  javascript_globs:
+    - web/*.js
+    - web/chat/*.js
+  route_globs:
+    - sherpa/**/*.py
+  excluded_paths:
+    - path: web/vendor/**
+      reason: 追跡済み第三者ライブラリでありSherpaの画面・API契約ではない
+  allow_unmapped_routes:
+    - route: GET /
+      reason: /ui/chat.htmlへのサーバリダイレクトとしてnavigationケースで検証する
+    - route: GET /healthz
+      reason: ブラウザ起動前の実サービス前提として専用smokeケースで直接検証する
+    - route: /ext/v1/**
+      reason: ブラウザUIではなく外部連携APIでありadminのキー管理だけをUI対象にする
+    - route: /impact/**
+      reason: チャットのimpactレンズを通じて実行し、専用APIの契約試験は既存integration層が担う
+    - route: /troubleshoot/**
+      reason: チャットのtroubleshootレンズを通じて実行する
+    - route: /qa/**
+      reason: 現行UIではチャットのqaレンズを通じて実サービス上で同じ処理を実行する
+    - route: POST /chat
+      reason: 現行UIが使用しない旧同期チャット互換APIでありturn APIの画面試験とは分離する
+    - route: GET /chat/stream
+      reason: 現行UIが使用しない旧ストリーム互換APIでありEventSourceはturn別streamを検証する
+    - route: POST /chat/stream/stop
+      reason: 現行UIが使用しない旧停止互換APIでありturn別stop操作を画面から検証する
+  allow_unresolved_browser_calls:
+    - source: web/common.js
+      call: fetch
+      expression: url
+      reason: 共通APIラッパーが呼出元から受け取るURLであり各呼出元の具体URLを別々に静的登録する
+    - source: web/chat.js
+      call: fetch
+      expression: dl.getAttribute('href')
+      reason: サーバ回答に描画された原本文書リンクであり実クリック後の応答とdownload証跡をcaseで検証する
+  required_viewports:
+    desktop: {width: 1440, height: 1000}
+    narrow: {width: 390, height: 844}
+
+required_feature_categories:
+  - stack-health
+  - authentication
+  - authorization
+  - navigation
+  - worlds
+  - ingestion
+  - ocr
+  - vlm
+  - office-conversion
+  - legacy-office-conversion
+  - documents
+  - search
+  - graph
+  - chat
+  - thought-flow
+  - conversations
+  - sharing
+  - workspace
+  - settings
+  - settings-navigation
+  - administration
+  - audit
+  - usage
+  - status
+  - help
+  - accessibility
+  - environment
+  - evidence
+  - verified-sources
+  - real-provider-matrix
+  - external-api-keys
+  - responsive
+
+# These contracts cannot be proven by case PASS alone.  The real provider may
+# legitimately stay below the fixed persistence cap, so full coverage remains
+# NOT_PROVEN until at least one passing real-service turn records cap_applied.
+runtime_evidence_contracts:
+  - id: persisted-trace-cap-after-real-turn
+    feature: thought-flow
+    description: 完全な生SSEを保存上限適用後のPostgres traceへ厳密に畳み込めること
+    cases:
+      - cases/thought_flow/test_thought_flow.py::test_sse_trace_matches_ui_api_and_database
+    artifact: state/persisted-trace-cap-correlation.json
+    required_values:
+      cap_applied: true
+
+surfaces:
+  - id: application-shell
+    page: /ui/home.html
+    roles: [admin, user]
+    features: [stack-health, navigation, status, administration, accessibility, evidence, responsive]
+    endpoints:
+      - GET /healthz
+      - GET /health/summary
+      - GET /auth/me
+      - GET /announcements
+      - POST /admin/announcements
+      - PATCH /admin/announcements/{id}
+      - DELETE /admin/announcements/{id}
+    cases:
+      - cases/smoke/test_smoke.py::test_live_stack_health_and_ui_shell
+      - cases/navigation/test_navigation.py::test_all_primary_navigation_links
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+      - cases/admin/test_admin.py::test_announcement_create_edit_publish_and_delete_lifecycle
+    control_exclusions:
+      - key: "@unkeyed:web/common.js:39:a"
+        reason: downloadBlobが一時生成して同期click後に破棄する内部anchorであり、利用者が直接操作できる永続controlではない
+    controls:
+      - ids: [healthdot]
+        action: 実serviceの集約healthを表示し管理者を詳細状態画面へ移動する
+        states:
+          normal: 実storeを含む正常状態を示しstatus画面の実probeへ移動する
+          abnormal: service到達不能を正常表示せず一般userには管理詳細linkを与えない
+        roles: [admin, user]
+        cases: [cases/smoke/test_smoke.py::test_live_stack_health_and_ui_shell]
+      - ids: [themebtn]
+        action: 画面themeを切り替えてbrowser再読込後も選択を保持する
+        states:
+          normal: lightとdarkを切り替えてlocal storageから再適用する
+          abnormal: 未知のtheme値や再読込で操作不能な表示へしない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - ids: [topbar-user, um-changepw]
+        action: 実login userのmenuを開き安全なpassword変更導線へ移動する
+        states:
+          normal: 現在userを表示し安全なreturn先を持つ変更画面へ進む
+          abnormal: 認証無効時や未認証時に利用不能なuser操作を成功表示しない
+        roles: [admin, user]
+        cases:
+          - cases/auth/test_auth.py::test_login_session_logout
+          - cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard
+      - ids: [um-logout]
+        action: 操作直前の実session roleを確定してlogoutする
+        states:
+          normal: 現在の認証済みsessionだけを終了してlogin画面へ戻る
+          abnormal: 未認証または別sessionをlogout成功として扱わない
+        roles: [admin, user]
+        authorization_mode: awaited-pre-action
+        cases: [cases/auth/test_auth.py::test_login_session_logout]
+      - ids: [turnnotice]
+        action: 実行中の実AI turnを全画面共通で通知し同じconversationへ戻る
+        states:
+          normal: running APIのconversation IDと一致するchatへ遷移して購読を再開する
+          abnormal: 完了済みまたは存在しないturnを実行中として表示しない
+        roles: [admin, user]
+        cases: [cases/thought_flow/test_thought_flow.py::test_running_turn_reload_resume_and_stop]
+      - ids: [pf-open, pf-title, pf-body, pf-cat, pf-publish, pf-expire, pf-pinned, pf-cancel, pf-submit]
+        action: admin投稿formを開閉し本文、分類、公開期間、pinを指定して実お知らせを投稿する
+        states:
+          normal: 取消は未送信のまま破棄し投稿は全入力を実APIと一覧へ反映する
+          abnormal: 必須不足、逆転した公開期間、取消済み入力を投稿成功にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_announcement_create_edit_publish_and_delete_lifecycle]
+      - selectors: ["[data-edit]", "[data-cancel]", "[data-save]", "[data-toggle-pub]", "[data-delete]"]
+        action: 動的お知らせ行を編集、取消、保存、公開切替、削除する
+        states:
+          normal: 選択した実お知らせだけを変更しAPIと再描画へ反映する
+          abnormal: 取消操作や別お知らせを保存・削除しない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_announcement_create_edit_publish_and_delete_lifecycle]
+      - hrefs: [home.html, chat.html, ingest.html, graph.html, manual.html, settings.html, workspace.html, admin-settings.html]
+        action: 共通navigationから各主要画面へ実際に移動する
+        states:
+          normal: 選択した登録済み画面へ遷移し認証済みUIを表示する
+          abnormal: 壊れたhrefや権限外画面を正常な遷移として扱わない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - id_prefixes: [ef-title-, ef-cat-, ef-body-, ef-publish-, ef-expire-, ef-pinned-]
+        action: 選択した実お知らせの動的編集欄へ値を入力する
+        states:
+          normal: 対象お知らせの各項目だけを編集して保存結果へ反映する
+          abnormal: 別のお知らせや無効な公開期間を保存成功にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_announcement_create_edit_publish_and_delete_lifecycle]
+      - selectors: [".home-cta"]
+        action: homeの主要導線から実AI chat画面へ移動する
+        states:
+          normal: 認証済みchat画面へ移動して質問入力を利用可能にする
+          abnormal: 認証切れや遷移失敗を利用可能なchatとして表示しない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+    viewports: [desktop, narrow]
+
+  - id: login
+    page: /ui/login.html
+    roles: [anonymous]
+    features: [authentication, authorization, accessibility, evidence]
+    endpoints:
+      - POST /auth/login
+      - GET /auth/me
+    cases:
+      - cases/auth/test_auth.py::test_anonymous_redirect_and_auth_disabled_profile
+      - cases/auth/test_auth.py::test_login_session_logout
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+    controls:
+      - ids: [username, password]
+        action: 実session開始用の資格情報を入力する
+        states:
+          normal: 正しい資格情報を入力欄へ保持して送信可能にする
+          abnormal: 空欄や不正資格情報を認証済み状態として表示しない
+        roles: [anonymous]
+        cases: [cases/auth/test_auth.py::test_login_session_logout]
+      - ids: [submit]
+        action: 操作直前のanonymous roleを確定して実login APIへ資格情報を送信する
+        states:
+          normal: 正しい資格情報で初回変更または遷移先へ進む
+          abnormal: 不正資格情報を拒否し認証済み画面へ進ませない
+        roles: [anonymous]
+        authorization_mode: awaited-pre-action
+        cases: [cases/auth/test_auth.py::test_login_session_logout]
+    viewports: [desktop, narrow]
+
+  - id: change-password
+    page: /ui/change-password.html
+    roles: [admin, user]
+    features: [authentication, authorization, accessibility, evidence]
+    endpoints:
+      - GET /auth/me
+      - POST /auth/change-password
+      - POST /auth/logout
+    cases:
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/auth/test_auth.py::test_login_session_logout
+    controls:
+      - ids: [current-password, new-password, confirm-password, submit]
+        action: 初回または任意のパスワード変更を確定する
+        states:
+          normal: 現在値と一致する強い新パスワードを保存する
+          abnormal: 不一致または不正な新パスワードを拒否する
+        roles: [admin, user]
+        cases: [cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary]
+    viewports: [desktop, narrow]
+
+  - id: chat
+    page: /ui/chat.html
+    roles: [admin, user]
+    features:
+      - chat
+      - thought-flow
+      - conversations
+      - sharing
+      - workspace
+      - search
+      - evidence
+      - verified-sources
+      - real-provider-matrix
+      - accessibility
+      - responsive
+    endpoints:
+      - GET /world-options
+      - GET /scopes
+      - GET /conversations
+      - GET /conversations/{cid}
+      - PATCH /conversations/{cid}
+      - DELETE /conversations/{cid}
+      - POST /conversations/{cid}/pin
+      - POST /chat/turns
+      - GET /chat/turns/{turn_id}/stream
+      - GET /chat/turns/running
+      - POST /chat/turns/{turn_id}/stop
+      - GET /users/suggest
+      - POST /conversations/{cid}/shares
+      - POST /conversation-shares/{share_id}/revoke
+      - POST /workspace/files
+      - GET /workspace/files/{file_id}/download
+      - GET /settings
+      - PUT /settings
+      - POST /settings/test
+    cases:
+      - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+      - cases/chat/test_chat.py::test_real_impact_filter_and_reference_graph_controls
+      - cases/chat/test_chat.py::test_ext23_verified_and_reference_sources
+      - cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service
+      - cases/chat/test_lifecycle.py::test_codex_created_artifact_downloads_from_real_workspace
+      - cases/chat/test_lifecycle.py::test_codex_native_resume_fallback_and_new_session
+      - cases/chat/test_lifecycle.py::test_followup_session_rename_pin_switch_and_delete
+      - cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls
+      - cases/chat/test_chat_controls.py::test_chat_upload_button_and_file_input_store_real_workspace_file
+      - cases/chat/test_failure_profiles.py::test_expired_session_rejects_turn_and_releases_slot
+      - cases/chat/test_failure_profiles.py::test_real_provider_timeout_is_error_and_releases_slot
+      - cases/chat/test_failure_profiles.py::test_real_codex_cli_nonzero_is_error_and_releases_slot
+      - cases/chat/test_subagent_planner.py::test_real_openai_planner_delegates_to_real_subagent
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/thought_flow/test_thought_flow.py::test_sse_trace_matches_ui_api_and_database
+      - cases/thought_flow/test_thought_flow.py::test_running_turn_reload_resume_and_stop
+      - cases/thought_flow/test_runtime_behaviors.py::test_confirmation_card_persists_and_resumes_real_turn
+      - cases/thought_flow/test_runtime_behaviors.py::test_eventsource_disconnect_reloads_and_replays_same_real_turn
+      - cases/thought_flow/test_runtime_behaviors.py::test_real_concurrent_turn_limit_has_no_rejected_conversation_side_effect
+      - cases/thought_flow/test_runtime_behaviors.py::test_server_restart_does_not_mark_interrupted_turn_complete
+    control_exclusions:
+      - key: "@unkeyed:web/chat.js:177:textarea"
+        reason: clipboard拒否時だけ一時生成され即時削除されるfallback textareaであり、利用者が直接操作するcontrolではない
+    controls:
+      - ids: [newbtn, exportbtn]
+        action: 会話を新規作成または成果物として書き出す
+        states:
+          normal: 操作対象の会話が利用可能で処理が完了する
+          abnormal: 対象なしまたは処理失敗を成功表示にしない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_lifecycle.py::test_followup_session_rename_pin_switch_and_delete
+          - cases/chat/test_lifecycle.py::test_codex_created_artifact_downloads_from_real_workspace
+      - ids: [sideclose, sideopen, fontbtn, rightopen, rightclose, brainbadge]
+        action: 会話画面の左右panelと表示補助を切り替える
+        states:
+          normal: desktopと狭幅で対象panelまたは表示状態を切り替える
+          abnormal: 狭幅でも主要操作を隠したまま復帰不能にしない
+        roles: [admin, user]
+        cases:
+          - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+          - cases/chat/test_lifecycle.py::test_followup_session_rename_pin_switch_and_delete
+          - cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls
+      - ids: [version, kbtoggle, scopebtn, personaltoggle]
+        action: World、scope、個人領域を実チャットへ適用する
+        states:
+          normal: 選択scopeの根拠だけで回答する
+          abnormal: 未選択または権限外scopeを回答根拠に混ぜない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+          - cases/thought_flow/test_thought_flow.py::test_sse_trace_matches_ui_api_and_database
+          - cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls
+        selector_sources: [ui_automation/support/chat_flow.py]
+      - ids: [chat-upload-btn, chat-file-input]
+        action: 実ファイルを会話workspaceへ追加する
+        states:
+          normal: 許可されたファイルをuploadし会話で利用する
+          abnormal: 不正形式またはupload失敗を添付済みにしない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_lifecycle.py::test_codex_created_artifact_downloads_from_real_workspace
+          - cases/chat/test_chat_controls.py::test_chat_upload_button_and_file_input_store_real_workspace_file
+      - ids: [input, send]
+        action: 質問を送信し実turnを開始または停止する
+        states:
+          normal: SSEと画面traceを相関して完了する
+          abnormal: 同時実行制限、切断、停止を誤って完了扱いしない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+          - cases/thought_flow/test_runtime_behaviors.py::test_real_concurrent_turn_limit_has_no_rejected_conversation_side_effect
+          - cases/chat/test_failure_profiles.py::test_expired_session_rejects_turn_and_releases_slot
+          - cases/chat/test_failure_profiles.py::test_real_provider_timeout_is_error_and_releases_slot
+          - cases/chat/test_failure_profiles.py::test_real_codex_cli_nonzero_is_error_and_releases_slot
+        selector_sources: [ui_automation/support/chat_flow.py]
+      - ids: [sharebtn, share-close, share-invitees, share-days, share-submit, share-cancel, share-copy]
+        action: 会話共有を作成、copy、取消する
+        states:
+          normal: 招待相手と期限を反映した共有URLを発行する
+          abnormal: 無効入力または取消済み共有を利用可能にしない
+        roles: [admin, user]
+        cases: [cases/chat/test_lifecycle.py::test_share_url_acceptance_and_revocation]
+      - selectors: ["[data-fs]", "[data-exec]", "[data-cfg]", "[data-scope]"]
+        action: 動的menuから文字サイズ、実行provider、設定導線、検索scopeを選択する
+        states:
+          normal: 選択結果が画面状態または設定画面への遷移へ反映される
+          abnormal: 利用不能なproviderやscopeを選択済みとして見せない
+        roles: [admin, user]
+        cases: [cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls]
+      - ids: [bm-modelinput, bm-modelsave, bm-modeltest]
+        action: quick menuで実providerのmodelを保存し実接続probeを実行する
+        states:
+          normal: 保存したmodelとproviderを設定APIで照合し実providerの接続成功を確認する
+          abnormal: 資格情報不足、到達不能、存在しないmodelを接続成功にしない
+        roles: [admin, user]
+        cases: [cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls]
+      - selectors: ["[data-ex]", "[data-qopt]", "[data-qfree]", "[data-ask-submit]"]
+        action: 質問例または確認cardの選択肢と自由入力から実turnを続行する
+        states:
+          normal: 選択内容を同じturnへ結び付けて実行を再開する
+          abnormal: 未回答または別turnの回答を完了として扱わない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls
+          - cases/thought_flow/test_runtime_behaviors.py::test_confirmation_card_persists_and_resumes_real_turn
+      - selectors: ["[data-cites]", "[data-filter]", "[data-rg]"]
+        action: 実回答の引用、根拠filter、参照graphを展開して対応する根拠を確認する
+        states:
+          normal: 実turnが返した根拠だけを展開またはfilterする
+          abnormal: 根拠なし回答に偽の引用やgraphを生成しない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+          - cases/chat/test_chat.py::test_real_impact_filter_and_reference_graph_controls
+      - selectors: ["[data-showtrace]"]
+        action: 保存済み実回答から同じturnの構造化実行traceを開いて表示する
+        states:
+          normal: 対応するturnだけを展開し保存済みdone nodeを表示する
+          abnormal: traceのない回答や別turnのtraceを表示しない
+        roles: [admin, user]
+        cases: [cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit]
+      - selectors: ["[data-copy]", "[data-export]"]
+        action: 実回答本文をclipboardまたはdownload可能な成果物へ書き出す
+        states:
+          normal: 表示中の実回答内容と書き出し内容が一致する
+          abnormal: 空回答または書き出し失敗を完了表示にしない
+        roles: [admin, user]
+        cases: [cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit]
+      - selectors: ["[data-exp]"]
+        action: 会話全体を選択形式でdownloadする
+        states:
+          normal: 選択形式と実会話内容が一致するfileを生成する
+          abnormal: 空会話や生成失敗をdownload成功にしない
+        roles: [admin, user]
+        cases: [cases/chat/test_lifecycle.py::test_followup_session_rename_pin_switch_and_delete]
+      - selectors: ["[data-pin]", "[data-rename]", "[data-del]", "[data-sharecid]"]
+        action: 動的会話行をpin、rename、delete、shareする
+        states:
+          normal: 対象conversationだけを変更し再読込後も結果を保持する
+          abnormal: 共有受信または権限外conversationの変更を許可しない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_lifecycle.py::test_followup_session_rename_pin_switch_and_delete
+          - cases/chat/test_lifecycle.py::test_share_url_acceptance_and_revocation
+      - selectors: ["[data-pick-invitee]", "[data-rm-invitee]"]
+        action: 実user候補を共有相手へ追加し、選択済み候補を取り除く
+        states:
+          normal: 選択した実userだけを共有対象へ含める
+          abnormal: 存在しないuserまたは削除済み候補を共有しない
+        roles: [admin, user]
+        cases: [cases/chat/test_lifecycle.py::test_share_url_acceptance_and_revocation]
+      - selectors: ["[data-dl]"]
+        action: 実回答が作成または引用したworkspace原本をdownloadする
+        states:
+          normal: 表示された実fileとdownload内容が一致する
+          abnormal: 欠落fileまたは権限外fileをdownloadさせない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_chat.py::test_ext23_verified_and_reference_sources
+          - cases/chat/test_lifecycle.py::test_codex_created_artifact_downloads_from_real_workspace
+      - ids: [conv-title]
+        selectors: ["[data-open]"]
+        action: 会話一覧またはheader titleから実conversationを開き改名する
+        states:
+          normal: 選択conversationの履歴を開きtitle変更を再読込後も保持する
+          abnormal: 期限切れ共有や存在しないconversationを開いた状態にしない
+        roles: [admin, user]
+        cases: [cases/chat/test_lifecycle.py::test_followup_session_rename_pin_switch_and_delete]
+      - selectors: [".fhist"]
+        action: 実turn内で同じ実行nodeのdetail履歴を展開・折り畳みする
+        states:
+          normal: 同じturnの生SSEにある過去detailだけを順序どおり表示する
+          abnormal: 閉じたnodeや別nodeのdetail履歴を展開状態として残さない
+        roles: [admin, user]
+        cases: [cases/thought_flow/test_runtime_behaviors.py::test_eventsource_disconnect_reloads_and_replays_same_real_turn]
+      - selectors: [".fturn", ".fturn-head"]
+        action: 実conversationの選択turnに紐付く構造化実行traceを展開・折り畳みする
+        states:
+          normal: 同じ質問と生SSEに相関済みの実行nodeだけを表示する
+          abnormal: 閉じたturnまたは別turnのtrace本文を表示状態にしない
+        roles: [admin, user]
+        cases: [cases/thought_flow/test_runtime_behaviors.py::test_eventsource_disconnect_reloads_and_replays_same_real_turn]
+      - selectors: ["[data-toggle]"]
+        action: 実impact回答の選択行に紐付く影響経路と根拠を展開・折り畳みする
+        states:
+          normal: 同じ構造化itemのtrace順序と根拠fileだけを表示する
+          abnormal: 閉じた行または別の影響行を展開状態として残さない
+        roles: [admin, user]
+        cases: [cases/chat/test_chat.py::test_real_impact_filter_and_reference_graph_controls]
+      - unkeyed:
+          - "@unkeyed:web/chat/render.js:185:summary"
+          - "@unkeyed:web/chat/render.js:212:summary"
+        selectors: [".usage-meta", ".usage-sub-meta"]
+        action: 実providerとsubagentのtoken使用量内訳を展開する
+        states:
+          normal: 同じturnの保存済み非ゼロusage内訳を表示する
+          abnormal: usage未記録または別turnの数値を内訳として表示しない
+        roles: [admin, user]
+        cases:
+          - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+          - cases/chat/test_subagent_planner.py::test_real_openai_planner_delegates_to_real_subagent
+      - selectors: [".created-files-link"]
+        action: 実AIが作成した成果物cardからworkspace画面へ移動する
+        states:
+          normal: 作成済み成果物を保持した実workspaceへ移動する
+          abnormal: 成果物がないturnへ導線を生成せず欠落fileを成功表示しない
+        roles: [admin, user]
+        cases: [cases/chat/test_lifecycle.py::test_codex_created_artifact_downloads_from_real_workspace]
+      - unkeyed: ["@unkeyed:web/chat.html:179:button"]
+        action: 共有URL発行結果dialogを閉じる
+        states:
+          normal: 表示中の共有結果だけを閉じて会話画面へ戻る
+          abnormal: 共有作成失敗や別dialogを閉鎖成功として扱わない
+        roles: [admin, user]
+        cases: [cases/chat/test_lifecycle.py::test_share_url_acceptance_and_revocation]
+    viewports: [desktop, narrow]
+
+  - id: shared-conversation
+    page: /share/conversations/{token}
+    evidence_pages: [/ui/chat.html]
+    role_aliases:
+      invited-user: [user]
+    roles: [invited-user]
+    features: [sharing, conversations, authorization, evidence]
+    endpoints:
+      - GET /share/conversations/{token}
+      - POST /conversation-shares/{share_id}/revoke
+    cases:
+      - cases/chat/test_lifecycle.py::test_share_url_acceptance_and_revocation
+    controls: []
+    viewports: [desktop]
+
+  - id: ingest
+    page: /ui/ingest.html
+    roles: [admin]
+    features:
+      - worlds
+      - ingestion
+      - ocr
+      - vlm
+      - office-conversion
+      - legacy-office-conversion
+      - documents
+      - search
+      - authorization
+      - evidence
+      - accessibility
+      - responsive
+    endpoints:
+      - GET /fs/list
+      - GET /worlds
+      - GET /worlds/{wid}/status
+      - POST /worlds
+      - POST /worlds/diff
+      - GET /worlds/{wid}/diff
+      - POST /worlds/{wid}/rebind
+      - POST /worlds/{wid}/refresh
+      - DELETE /worlds/{wid}
+      - GET /ingest/preview
+      - POST /ingest/rerun
+      - GET /ingest/runs
+      - GET /documents
+      - GET /documents/download
+      - GET /admin/es/search
+    cases:
+      - cases/worlds_ingest/test_worlds_ingest.py::test_register_real_world_refresh_search_and_delete
+      - cases/worlds_ingest/test_worlds_ingest.py::test_world_picker_rejects_outside_browse_roots
+      - cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence
+      - cases/worlds_ingest/test_worlds_ingest.py::test_ingest_state_filters_and_failed_row_rerun_control
+      - cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [pickbtn, label, regbtn, upbtn, pcancel, pchoose]
+        action: 許可root内のfolderを選択してWorldとして登録する
+        states:
+          normal: fixture Worldを登録して実取込を開始する
+          abnormal: 許可root外、未選択、取消を登録成功にしない
+        roles: [admin]
+        cases:
+          - cases/worlds_ingest/test_worlds_ingest.py::test_register_real_world_refresh_search_and_delete
+          - cases/worlds_ingest/test_worlds_ingest.py::test_world_picker_rejects_outside_browse_roots
+      - ids: [diffbtn, version, detailbtn, q, type]
+        action: World差分、document一覧、型filterと全文検索を操作する
+        states:
+          normal: 選択Worldの実documentと差分だけを表示する
+          abnormal: 未選択Worldまたは該当なしを成功結果で埋めない
+        roles: [admin]
+        cases:
+          - cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces
+          - cases/worlds_ingest/test_worlds_ingest.py::test_world_picker_rejects_outside_browse_roots
+          - cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence
+      - ids: [esq, esbtn]
+        action: Elasticsearchへ実全文検索を送る
+        states:
+          normal: fixture固有語の実hitと原本情報を表示する
+          abnormal: 該当なしまたはservice異常を偽hitにしない
+        roles: [admin]
+        cases:
+          - cases/worlds_ingest/test_worlds_ingest.py::test_register_real_world_refresh_search_and_delete
+          - cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces
+      - selectors: ["[data-refresh]", "[data-del]"]
+        action: 動的World行を再取込、削除する
+        states:
+          normal: 選択Worldだけの実jobまたは削除を実行する
+          abnormal: 実行失敗や別Worldを成功状態にしない
+        roles: [admin]
+        cases:
+          - cases/worlds_ingest/test_worlds_ingest.py::test_register_real_world_refresh_search_and_delete
+      - selectors: ["[data-state]", "[data-rerun]"]
+        action: document状態を絞り込み、実失敗documentの再取込を要求する
+        states:
+          normal: 選択状態だけを表示し再取込の状態遷移を観測する
+          abnormal: 失敗のないdocumentへ再実行を表示せず再失敗を成功にしない
+        roles: [admin]
+        cases: [cases/worlds_ingest/test_worlds_ingest.py::test_ingest_state_filters_and_failed_row_rerun_control]
+      - selectors: ["[data-dl]"]
+        action: 動的document行から取込元の実原本をdownloadする
+        states:
+          normal: 選択documentの原本hashとdownload内容が一致する
+          abnormal: 欠落または許可範囲外原本をdownloadさせない
+        roles: [admin]
+        cases: [cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence]
+      - hrefs: [manual.html, graph.html, settings.html]
+        action: 取込画面からmanual、graph、個人設定の関連画面へ移動する
+        states:
+          normal: 選択した関連画面を実際に読み込み利用可能な内容を表示する
+          abnormal: 権限外または壊れたhrefを正常な遷移として扱わない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - selectors: ["[data-cd]"]
+        action: 実filesystem picker内で許可browse rootのfolderへ移動する
+        states:
+          normal: 許可browse root内だけを移動して選択pathへ反映する
+          abnormal: 許可root外のpathをpicker項目として表示または選択しない
+        roles: [admin]
+        cases:
+          - cases/worlds_ingest/test_worlds_ingest.py::test_register_real_world_refresh_search_and_delete
+          - cases/worlds_ingest/test_worlds_ingest.py::test_world_picker_rejects_outside_browse_roots
+      - selectors: ["[data-folder]"]
+        action: 実取込previewを原本folder単位で絞り込む
+        states:
+          normal: 選択folder配下の実documentだけを一覧へ表示する
+          abnormal: 存在しないfolderや別folderのdocumentを一致扱いしない
+        roles: [admin]
+        cases: [cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence]
+      - selectors: [".closebtn"]
+        action: 実取込詳細overlayをclose buttonで閉じる
+        states:
+          normal: 表示中の詳細overlayだけを閉じて取込一覧へ戻る
+          abnormal: 未保存操作や別画面を完了扱いしない
+        roles: [admin]
+        cases: [cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence]
+    viewports: [desktop, narrow]
+
+  - id: ingest-legacy-entry
+    page: /ui/ingest-new.html
+    evidence_pages: [/ui/ingest.html]
+    roles: [admin]
+    features: [navigation, worlds]
+    endpoints: []
+    cases:
+      - cases/navigation/test_navigation.py::test_all_primary_navigation_links
+    controls:
+      - hrefs: [ingest.html]
+        action: 旧取込entryから現行の実取込画面へ移動する
+        states:
+          normal: 現行取込画面へ移動してWorld操作を利用可能にする
+          abnormal: redirect先が壊れている時に旧画面を利用可能として残さない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+    viewports: [desktop]
+
+  - id: graph
+    page: /ui/graph.html
+    roles: [admin, user]
+    features: [graph, search, worlds, evidence, accessibility]
+    endpoints:
+      - GET /worlds
+      - GET /graph
+      - GET /graph/facets
+      - GET /graph/search
+      - POST /graph/ask
+    cases:
+      - cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces
+      - cases/search_graph/test_search_graph.py::test_real_graph_facets_relationship_search_and_grounded_question
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [graph-retry]
+        action: run専用Neo4jの実停止で表示された失敗画面からservice復旧後に再読込する
+        states:
+          normal: 同じWorldの実Neo4j graphを再取得してcanvasと件数を復元する
+          abnormal: Neo4j停止中の取得失敗を空graphまたは成功表示にしない
+        roles: [admin, user]
+        cases: [cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces]
+      - ids: [gsearch, relfilter, fieldfilter, opfilter, condvalue, gfilter, greset, fclear]
+        action: graphの語句、関係、field条件を絞り込む
+        states:
+          normal: fixtureのnodeとrelationshipだけを条件どおり表示する
+          abnormal: 不正条件または該当なしを全件hitにしない
+        roles: [admin, user]
+        cases:
+          - cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces
+          - cases/search_graph/test_search_graph.py::test_real_graph_facets_relationship_search_and_grounded_question
+      - ids: [showall, relayout, fit]
+        action: graph全件表示、再配置、viewport fitを行う
+        states:
+          normal: 実graphを再描画し操作可能なviewportへ収める
+          abnormal: graph service異常時に空canvasを成功扱いしない
+        roles: [admin, user]
+        cases: [cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces]
+      - ids: [gask, gaskbtn]
+        action: graph根拠に限定した質問を送信する
+        states:
+          normal: 実graphの固有事実を根拠付きで回答する
+          abnormal: 根拠なしまたはservice異常をgrounded回答にしない
+        roles: [admin, user]
+        cases: [cases/search_graph/test_search_graph.py::test_real_graph_facets_relationship_search_and_grounded_question]
+      - selectors: ["[data-ask]"]
+        action: 実graph nodeの動的質問導線からchatへ質問を引き渡す
+        states:
+          normal: 選択nodeを含む質問がchat入力へ設定される
+          abnormal: node未選択または描画失敗時に別nodeを質問対象にしない
+        roles: [admin, user]
+        cases: [cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces]
+      - hrefs: [manual.html, ingest.html]
+        action: graph画面からmanualまたは取込画面へ移動する
+        states:
+          normal: 選択した関連画面を実際に読み込む
+          abnormal: 権限外または壊れたhrefを正常な遷移として扱わない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - selectors: [".ftog"]
+        action: 実graph facetの値を展開・折り畳みする
+        states:
+          normal: 選択facetの実値だけを表示してfilter操作へ利用できる
+          abnormal: graph取得失敗や空facetへ偽の選択肢を表示しない
+        roles: [admin, user]
+        cases: [cases/search_graph/test_search_graph.py::test_real_search_and_graph_surfaces]
+    viewports: [desktop, narrow]
+
+  - id: workspace
+    page: /ui/workspace.html
+    roles: [admin, user]
+    features: [workspace, search, documents, authorization, evidence, accessibility]
+    endpoints:
+      - GET /workspace/files
+      - POST /workspace/files
+      - DELETE /workspace/files/{file_id}
+      - GET /workspace/files/{file_id}/download
+      - GET /workspace/search
+    cases:
+      - cases/workspace/test_workspace.py::test_real_upload_search_download_delete
+      - cases/workspace/test_workspace.py::test_workspace_file_share
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [file-input]
+        action: 実ファイルを個人workspaceへuploadする
+        states:
+          normal: 許可fileを保存し一覧とdownloadへ反映する
+          abnormal: 不正fileまたは容量超過を保存済みにしない
+        roles: [admin, user]
+        cases: [cases/workspace/test_workspace.py::test_real_upload_search_download_delete]
+      - ids: [search-q, search-btn]
+        action: workspace内の実ファイル本文を検索する
+        states:
+          normal: fixture固有語を含むfileだけを表示する
+          abnormal: 該当なしまたは削除済みfileをhitにしない
+        roles: [admin, user]
+        cases: [cases/workspace/test_workspace.py::test_real_upload_search_download_delete]
+      - selectors: ["[data-fileid]"]
+        action: 動的workspace行のdownloadとdeleteを実fileに対して実行する
+        states:
+          normal: 選択fileだけをdownloadまたは削除する
+          abnormal: 他user、欠落、削除済みfileを操作させない
+        roles: [admin, user]
+        cases:
+          - cases/workspace/test_workspace.py::test_real_upload_search_download_delete
+          - cases/workspace/test_workspace.py::test_workspace_file_share
+      - ids: [dropzone]
+        action: 実fileをdrag and dropして個人workspaceへuploadする
+        states:
+          normal: 許可fileをdropし一覧と実storageへ反映する
+          abnormal: 不正fileまたは容量超過をupload済みにしない
+        roles: [admin, user]
+        cases: [cases/workspace/test_workspace.py::test_real_upload_search_download_delete]
+      - hrefs: [manual.html]
+        action: workspaceから関連manualへ移動する
+        states:
+          normal: manual画面を実際に読み込みworkspace説明を参照できる
+          abnormal: 壊れたhrefを正常な遷移として扱わない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard]
+      - unkeyed: ["@unkeyed:web/workspace.html:96:button"]
+        action: 個人workspaceの実file一覧を再取得して更新する
+        states:
+          normal: 実APIの最新file一覧と件数を再描画する
+          abnormal: 取得失敗や削除済みfileを最新状態として残さない
+        roles: [admin, user]
+        cases: [cases/workspace/test_workspace.py::test_real_upload_search_download_delete]
+    viewports: [desktop, narrow]
+
+  - id: personal-settings
+    page: /ui/settings.html
+    roles: [admin, user]
+    features: [settings, settings-navigation, authentication, chat, accessibility, evidence, responsive]
+    endpoints:
+      - GET /config
+      - GET /settings
+      - PUT /settings
+      - POST /settings/test
+      - GET /settings/bedrock-models
+      - POST /settings/bedrock-models/verify
+    cases:
+      - cases/settings/test_settings.py::test_personal_settings_persist_through_api_and_reload
+      - cases/settings/test_settings.py::test_selected_ai_provider_real_connection_from_settings_ui
+      - cases/settings/test_settings.py::test_u3_settings_toc_and_collapse
+      - cases/settings/test_settings_controls.py::test_personal_agent_helper_and_function_provider_controls_persist
+      - cases/settings/test_settings_controls.py::test_personal_cloud_key_and_bedrock_model_controls_use_real_providers
+      - cases/settings/test_settings_controls.py::test_personal_ollama_and_codex_controls_persist_and_reload
+      - cases/settings/test_settings_controls.py::test_personal_system_prompt_default_control_persists
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [agent, search_helper, search_helper_model, sub_profile, sub_planner, extract_provider, graph_provider, intent_provider, embed_provider, intent_model]
+        action: 主agent、補助provider、subagent構成を個人設定へ保存する
+        states:
+          normal: 許可されたproviderとmodelを再読込後も保持する
+          abnormal: 未許可providerまたは不正modelを接続成功にしない
+        roles: [admin, user]
+        cases:
+          - cases/settings/test_settings.py::test_personal_settings_persist_through_api_and_reload
+          - cases/settings/test_settings.py::test_selected_ai_provider_real_connection_from_settings_ui
+          - cases/settings/test_settings_controls.py::test_personal_agent_helper_and_function_provider_controls_persist
+      - ids: [okey, omodel, gkey, gmodel, bkey, bmodel, bmodel-fetch, bmodel-manual, bmodel-verify]
+        action: OpenAI、Gemini、Bedrockの個人資格情報とmodelを設定・検証する
+        states:
+          normal: 実provider接続と選択modelを確認して秘密を再表示しない
+          abnormal: 無効資格情報、model取得失敗、未検証modelを成功にしない
+        roles: [admin, user]
+        cases:
+          - cases/settings/test_settings.py::test_selected_ai_provider_real_connection_from_settings_ui
+          - cases/settings/test_settings.py::test_admin_central_ai_selection_and_personal_key_policy_persist_after_reload
+          - cases/settings/test_settings_controls.py::test_personal_cloud_key_and_bedrock_model_controls_use_real_providers
+      - ids: [ourl, omodel2, cmodel, reason, cwebsearch]
+        action: OllamaとCodexのendpoint、model、reasoning、web検索を設定する
+        states:
+          normal: 実接続可能な値を保存し実provider実行へ反映する
+          abnormal: 接続不能endpointまたは不正値をready扱いしない
+        roles: [admin, user]
+        cases:
+          - cases/settings/test_settings.py::test_selected_ai_provider_real_connection_from_settings_ui
+          - cases/chat/test_chat.py::test_real_provider_profile_uses_selected_service
+          - cases/settings/test_settings_controls.py::test_personal_ollama_and_codex_controls_persist_and_reload
+      - ids: [sysdefault, sysprompt, save]
+        action: system promptを既定化または保存する
+        states:
+          normal: 保存値を再読込後も保持する
+          abnormal: 保存失敗または不正入力を保存済みにしない
+        roles: [admin, user]
+        cases:
+          - cases/settings/test_settings.py::test_personal_settings_persist_through_api_and_reload
+          - cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard
+          - cases/settings/test_settings_controls.py::test_personal_system_prompt_default_control_persists
+      - selectors: ["[data-test]"]
+        action: 選択した実AI providerごとの接続確認を行う
+        states:
+          normal: 実provider応答と一致する接続結果を表示する
+          abnormal: 資格情報不足や到達不能を接続成功にしない
+        roles: [admin, user]
+        cases: [cases/settings/test_settings.py::test_selected_ai_provider_real_connection_from_settings_ui]
+      - hrefs: [manual.html, /docs, "https://aistudio.google.com/apikey"]
+        action: 個人設定からmanual、Swagger、公式Gemini key取得先を開く
+        states:
+          normal: 固定された期待先だけへ安全に移動する
+          abnormal: 改変hrefや壊れた内部導線を正常なlinkとして扱わない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard]
+    viewports: [desktop, narrow]
+
+  - id: admin-settings
+    page: /ui/admin-settings.html
+    roles: [admin]
+    features: [administration, settings, authentication, authorization, external-api-keys, evidence, accessibility]
+    endpoints:
+      - GET /admin/settings
+      - PUT /admin/settings
+      - POST /settings/test
+      - GET /ext/v1/admin/keys
+      - POST /ext/v1/admin/keys
+      - DELETE /ext/v1/admin/keys/{key_id}
+    cases:
+      - cases/settings/test_settings.py::test_personal_settings_persist_through_api_and_reload
+      - cases/settings/test_settings.py::test_admin_central_ai_selection_and_personal_key_policy_persist_after_reload
+      - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+      - cases/admin/test_admin.py::test_external_api_key_create_use_list_and_revoke
+      - cases/environment/test_environment.py::test_fresh_env_seed_then_env_change_then_ui_override_persists
+      - cases/admin/test_admin_controls.py::test_admin_cloud_key_rejects_invalid_credential_without_persisting
+      - cases/admin/test_admin_controls.py::test_admin_ingestion_default_reset_controls_restore_saved_values
+      - cases/admin/test_admin_controls.py::test_admin_vlm_controls_persist_then_reset_to_environment_default
+      - cases/admin/test_admin_controls.py::test_admin_usage_and_subagent_profile_controls_persist
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [cloud-key, cloud-key-test, personal-keys-allowed, cloud-ollama-url]
+        action: 中央cloud資格情報、個人key許可、Ollama URLを管理する
+        states:
+          normal: 選択providerの実接続と永続化を確認する
+          abnormal: 無効key、未選択provider、接続不能URLを成功にしない
+        roles: [admin]
+        cases:
+          - cases/settings/test_settings.py::test_admin_central_ai_selection_and_personal_key_policy_persist_after_reload
+          - cases/environment/test_environment.py::test_fresh_env_seed_then_env_change_then_ui_override_persists
+          - cases/admin/test_admin_controls.py::test_admin_cloud_key_rejects_invalid_credential_without_persisting
+      - ids: [arms-reset, legacy-reset]
+        action: 取込armとlegacy backendを明示的な既定値へ戻す
+        states:
+          normal: reset後の実効値と再起動後の値が一致する
+          abnormal: 利用不能backendを有効として表示しない
+        roles: [admin]
+        cases:
+          - cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence
+          - cases/admin/test_admin_controls.py::test_admin_ingestion_default_reset_controls_restore_saved_values
+      - ids: [vlm-provider, vlm-model, vlm-cloud-allowed, vlm-reset]
+        action: VLM provider、model、cloud送信許可を管理する
+        states:
+          normal: 実providerと観測recordへ設定を反映する
+          abnormal: cloud未許可または実provider失敗を画像解釈成功にしない
+        roles: [admin]
+        cases:
+          - cases/settings/test_settings.py::test_admin_central_ai_selection_and_personal_key_policy_persist_after_reload
+          - cases/worlds_ingest/test_worlds_ingest.py::test_real_pdf_image_ooxml_legacy_ingestion_evidence
+          - cases/admin/test_admin_controls.py::test_admin_vlm_controls_persist_then_reset_to_environment_default
+      - ids: [usage-metering, subagent-profile-add]
+        action: 利用量計測と追加subagent profileを管理する
+        states:
+          normal: 有効設定をusageと実turnへ反映する
+          abnormal: 無効構成または計測不能を有効扱いしない
+        roles: [admin]
+        cases:
+          - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+          - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+          - cases/admin/test_admin_controls.py::test_admin_usage_and_subagent_profile_controls_persist
+      - ids: [save]
+        action: 中央管理設定を保存する
+        states:
+          normal: 保存値がAPI、画面、再起動後で一致する
+          abnormal: validationまたは保存失敗を保存済みにしない
+        roles: [admin]
+        cases:
+          - cases/settings/test_settings.py::test_admin_central_ai_selection_and_personal_key_policy_persist_after_reload
+          - cases/environment/test_environment.py::test_fresh_env_seed_then_env_change_then_ui_override_persists
+      - selectors: ["[data-cloud-provider]"]
+        action: 中央で利用する実cloud providerを動的radioから選択する
+        states:
+          normal: 選択providerと対応資格情報blockを保存・再表示する
+          abnormal: 未設定providerを接続済みまたは選択済みにしない
+        roles: [admin]
+        cases: [cases/settings/test_settings.py::test_admin_central_ai_selection_and_personal_key_policy_persist_after_reload]
+      - selectors: ["[data-arm]", "[data-legacy]"]
+        action: 利用可能な取込armとlegacy Office backendを動的選択する
+        states:
+          normal: 利用可能項目だけを選択でき、既定resetで保存上書きを解除する
+          abnormal: 利用不能converterを選択可能または保存済みにしない
+        roles: [admin]
+        cases: [cases/admin/test_admin_controls.py::test_admin_ingestion_default_reset_controls_restore_saved_values]
+      - selectors: ["[data-sap-tool]"]
+        action: 追加subagent profileへ許可する実toolを選択する
+        states:
+          normal: 選択toolをprofile保存値と実turnへ反映する
+          abnormal: 未許可toolや不正profileを利用可能にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin_controls.py::test_admin_usage_and_subagent_profile_controls_persist]
+      - hrefs: [manual.html, admin-users.html, ingest.html, usage.html, audit.html, status.html]
+        action: 管理設定からmanualと各管理画面へ移動する
+        states:
+          normal: 管理者sessionで選択した固定宛先を実際に読み込む
+          abnormal: 一般userや壊れたhrefを管理画面へ到達済みとして扱わない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - selectors: [".sap-id", ".sap-name", ".sap-provider", ".sap-model", ".sap-enabled-cb", ".sap-del", ".sap-description", ".sap-min-citations", ".sap-max-turns", ".sap-llm-timeout"]
+        action: 動的subagent profileの識別子、provider、model、説明、guard、有効状態を編集または削除する
+        states:
+          normal: 選択profileだけを実設定へ保存し実planner turnへ反映する
+          abnormal: 不正profile、未許可provider、範囲外guardを利用可能にしない
+        roles: [admin]
+        cases:
+          - cases/admin/test_admin_controls.py::test_admin_usage_and_subagent_profile_controls_persist
+          - cases/chat/test_subagent_planner.py::test_real_openai_planner_delegates_to_real_subagent
+    viewports: [desktop, narrow]
+
+  - id: admin-users
+    page: /ui/admin-users.html
+    roles: [admin]
+    features: [administration, authentication, authorization, evidence, accessibility]
+    endpoints:
+      - GET /admin/users
+      - POST /admin/users
+      - PATCH /admin/users/{uid}
+    cases:
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+      - cases/admin/test_admin_controls.py::test_admin_user_edit_controls_update_role_status_and_password
+    controls:
+      - ids: [nu-uid, nu-name, nu-role, nu-pw, nu-submit]
+        action: 一般または管理userを新規作成する
+        states:
+          normal: roleと初回password変更要求を含むuserを作成する
+          abnormal: 重複ID、不正role、弱いpasswordを拒否する
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management]
+      - ids: [edit-role, edit-status, edit-pw, edit-submit]
+        action: 既存userのrole、状態、passwordを変更する
+        states:
+          normal: 更新後の認可境界とlogin結果が一致する
+          abnormal: 自己lockoutまたは不正変更を成功にしない
+        roles: [admin]
+        cases:
+          - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+          - cases/admin/test_admin_controls.py::test_admin_user_edit_controls_update_role_status_and_password
+      - selectors: ["[data-edit]"]
+        action: 動的user行から編集dialogを開く
+        states:
+          normal: 選択userのrole、状態、password編集へ進む
+          abnormal: 別userまたは権限外userを編集対象にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin_controls.py::test_admin_user_edit_controls_update_role_status_and_password]
+      - hrefs: [admin-settings.html]
+        action: user管理から管理設定画面へ戻る
+        states:
+          normal: 管理者sessionを維持して管理設定を読み込む
+          abnormal: 一般userや壊れたhrefを管理設定へ到達済みとして扱わない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - selectors: [".modal-close"]
+        action: user編集dialogを保存せず閉じる
+        states:
+          normal: 未保存の編集を実userへ反映せずdialogを閉じる
+          abnormal: 取消操作をuser更新成功として扱わない
+        roles: [admin]
+        cases: [cases/admin/test_admin_controls.py::test_admin_user_edit_controls_update_role_status_and_password]
+      - unkeyed: ["@unkeyed:web/admin-users.html:152:button"]
+        action: user編集dialogの取消buttonで未保存変更を破棄する
+        states:
+          normal: 実userを変更せずdialogを閉じる
+          abnormal: 未保存変更や取消操作をuser更新成功として扱わない
+        roles: [admin]
+        cases: [cases/admin/test_admin_controls.py::test_admin_user_edit_controls_update_role_status_and_password]
+    viewports: [desktop]
+
+  - id: audit
+    page: /ui/audit.html
+    roles: [admin]
+    features: [audit, administration, authorization, evidence]
+    endpoints:
+      - GET /admin/audit
+      - GET /admin/audit/verify
+      - GET /admin/audit/export
+    cases:
+      - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+      - cases/admin/test_admin.py::test_audit_chain_verify_and_ui_export
+      - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+      - cases/admin/test_admin_controls.py::test_audit_filter_controls_apply_real_actor_action_outcome_severity_and_time
+      - cases/admin/test_admin_controls.py::test_audit_pagination_controls_cover_next_and_previous_pages
+    controls:
+      - ids: [export-csv, export-jsonl]
+        action: audit chainをCSVまたはJSONLでexportする
+        states:
+          normal: 検証済みchainを指定形式でdownloadする
+          abnormal: 改ざんまたはexport失敗を正常fileとして扱わない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_audit_chain_verify_and_ui_export]
+      - ids: [f-actor, f-action, f-outcome, f-severity, f-from, f-to, search-btn]
+        action: actor、action、結果、重要度、期間でauditを絞り込む
+        states:
+          normal: 実audit recordだけを条件どおり表示する
+          abnormal: 不正期間または該当なしを全件一致にしない
+        roles: [admin]
+        cases:
+          - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+          - cases/admin/test_admin.py::test_audit_chain_verify_and_ui_export
+          - cases/admin/test_admin_controls.py::test_audit_filter_controls_apply_real_actor_action_outcome_severity_and_time
+      - ids: [prev-btn, next-btn]
+        action: audit結果pageを前後移動する
+        states:
+          normal: cursor境界内で重複や欠落なく移動する
+          abnormal: 先頭末尾または取得失敗時に無効pageへ進まない
+        roles: [admin]
+        cases:
+          - cases/admin/test_admin.py::test_audit_chain_verify_and_ui_export
+          - cases/admin/test_admin_controls.py::test_audit_pagination_controls_cover_next_and_previous_pages
+      - selectors: ["[data-col]"]
+        action: audit表の表示列を切り替えて端末設定へ保持する
+        states:
+          normal: 選択列だけの表示状態へ即時反映する
+          abnormal: 必須record自体を削除または改変しない
+        roles: [admin]
+        cases: [cases/admin/test_admin_controls.py::test_audit_filter_controls_apply_real_actor_action_outcome_severity_and_time]
+      - selectors: ["[data-detail-toggle]"]
+        action: 動的audit行の詳細を展開・折り畳みする
+        states:
+          normal: 選択recordの実detailだけを表示する
+          abnormal: 別recordまたは存在しないdetailを表示しない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management]
+      - hrefs: [admin-settings.html]
+        action: audit画面から管理設定へ戻る
+        states:
+          normal: 管理者sessionを維持して管理設定を読み込む
+          abnormal: 一般userや壊れたhrefを管理設定へ到達済みとして扱わない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - selectors: [".audit-row"]
+        action: 実audit record行を選択して詳細表示対象にする
+        states:
+          normal: 選択recordと一致する実detailだけを表示する
+          abnormal: 空行や別recordのdetailを選択結果にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management]
+    viewports: [desktop]
+
+  - id: usage
+    page: /ui/usage.html
+    roles: [admin]
+    features: [usage, administration, authorization, evidence]
+    endpoints:
+      - GET /admin/usage/stats
+    cases:
+      - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+      - cases/chat/test_chat.py::test_real_ai_chat_persists_usage_trace_and_audit
+    controls:
+      - selectors: ["[data-days]"]
+        action: 利用量集計期間を動的period buttonから切り替える
+        states:
+          normal: 選択期間の実usage API結果とactive表示が一致する
+          abnormal: 取得失敗や別期間の値を選択結果にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management]
+      - hrefs: [admin-settings.html]
+        action: 利用量画面から管理設定へ戻る
+        states:
+          normal: 管理者sessionを維持して管理設定を読み込む
+          abnormal: 一般userや壊れたhrefを管理設定へ到達済みとして扱わない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - unkeyed: ["@unkeyed:web/usage.js:396:rect"]
+        selectors: [".hit", ".cell", ".info-dot"]
+        action: 実usage chartの点、cell、説明へpointerまたはkeyboardでfocusする
+        states:
+          normal: 対応する実集計値または説明だけをtooltipとして表示する
+          abnormal: 空系列や別期間の値をtooltipとして表示しない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management]
+      - selectors: [".sortable", ".u-row"]
+        action: 実user利用量表をsortし選択行の内訳を展開する
+        states:
+          normal: 選択列の順序と選択userの実内訳を表示する
+          abnormal: 空行や別userの内訳を選択結果にしない
+        roles: [admin]
+        cases: [cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management]
+    viewports: [desktop]
+
+  - id: status
+    page: /ui/status.html
+    roles: [admin]
+    features: [status, stack-health, administration, authorization, evidence]
+    endpoints:
+      - GET /auth/me
+      - GET /health/summary
+      - GET /admin/health
+    cases:
+      - cases/smoke/test_smoke.py::test_live_stack_health_and_ui_shell
+      - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+      - cases/admin/test_admin_controls.py::test_status_recheck_control_refreshes_all_real_service_health
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [recheck-btn]
+        action: 全serviceのhealth probeを再実行する
+        states:
+          normal: 実service状態を再取得して時刻と結果を更新する
+          abnormal: 到達不能serviceを正常へ書き換えない
+        roles: [admin]
+        cases:
+          - cases/admin/test_admin.py::test_admin_status_audit_usage_and_user_management
+          - cases/admin/test_admin_controls.py::test_status_recheck_control_refreshes_all_real_service_health
+      - hrefs: [admin-settings.html]
+        action: service状態画面から管理設定へ戻る
+        states:
+          normal: 管理者sessionを維持して管理設定を読み込む
+          abnormal: 一般userや壊れたhrefを管理設定へ到達済みとして扱わない
+        roles: [admin]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+    viewports: [desktop, narrow]
+
+  - id: manual
+    page: /ui/manual.html
+    roles: [admin, user]
+    features: [help, navigation, accessibility, evidence]
+    endpoints:
+      - GET /ui/manual-src/manifest.json
+      - GET /ui/manual-src/{document}
+    cases:
+      - cases/navigation/test_navigation.py::test_all_primary_navigation_links
+      - cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+      - cases/navigation/test_navigation.py::test_narrow_viewport_primary_navigation
+    controls:
+      - ids: [doc-search]
+        action: manual文書を語句でfilterする
+        states:
+          normal: 一致するmanual項目と本文へ移動できる
+          abnormal: 該当なしまたは壊れたlinkを結果として表示しない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard]
+      - selectors: ["[data-doc]"]
+        action: 動的manual目次から対応文書anchorへ移動する
+        states:
+          normal: 選択項目の実Markdown本文とactive目次を表示する
+          abnormal: 壊れた文書または別anchorを成功表示にしない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard]
+      - selectors: [".manual-copy"]
+        action: 実manual本文に描画されたcommand blockをclipboardへ正確にcopyする
+        states:
+          normal: 表示中codeの全文とclipboard内容が一致して完了表示になる
+          abnormal: clipboard拒否や空codeをcopy成功として表示しない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard]
+      - hrefs: [chat.html, ingest.html]
+        action: manualの固定header導線からchatまたは取込画面へ移動する
+        states:
+          normal: 選択した固定宛先を実際に読み込む
+          abnormal: 権限外または壊れたhrefを正常な遷移として扱わない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_all_primary_navigation_links]
+      - unkeyed: ["@unkeyed:web/manual.js:119:a"]
+        action: sanitization済みmanual本文内の実linkを開く
+        states:
+          normal: 許可された内部または外部hrefだけを選択先として開く
+          abnormal: 危険schemeや解決不能hrefをclick可能なlinkとして残さない
+        roles: [admin, user]
+        cases: [cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard]
+    viewports: [desktop, narrow]
+
+  - id: swagger
+    page: /docs
+    roles: [admin, user]
+    features: [help, navigation, evidence]
+    endpoints:
+      - GET /docs
+      - GET /openapi.json
+    cases:
+      - cases/navigation/test_navigation.py::test_all_primary_navigation_links
+      - cases/navigation/test_navigation.py::test_help_manual_swagger_internal_links_and_keyboard
+      - cases/auth/test_auth.py::test_new_user_password_change_and_role_boundary
+    controls: []
+    viewports: [desktop]
+
+  - id: environment-contract
+    page: null
+    roles: [system]
+    features: [environment, stack-health, authentication, settings, evidence]
+    endpoints:
+      - GET /healthz
+      - GET /health/summary
+      - GET /settings
+      - GET /admin/settings
+    cases:
+      - cases/environment/test_environment.py::test_effective_environment_contract
+      - cases/environment/test_environment.py::test_fresh_env_seed_then_env_change_then_ui_override_persists
+    controls: []
+    viewports: []

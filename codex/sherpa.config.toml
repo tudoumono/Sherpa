@@ -1,0 +1,11 @@
+# Sherpa 用 Codex プロファイル（本番運用の重ね設定）
+# 使い方: このファイルを $CODEX_HOME（既定 ~/.codex）に置き、`codex exec -p sherpa ...` で重ねる。
+# モデル/思考深さは global config.toml の gpt-5.5 / reasoning=xhigh を踏襲（ここでは上書きしない）。
+# 参照: docs/08-実行権限と隔離.md §3/§4。
+
+[sandbox_workspace_write]
+# 書込は当該ユーザーの workspace のみ。kb(uploads/md/src) は読めるが書けない。
+# ※ ${...} 展開が効かない環境では、起動ラッパーで実パスに解決するか、
+#    CLI フラグ（-C <workspace> / --add-dir / -s）で渡す（M0 demo は CLI フラグ方式）。
+writable_roots = ["${SHERPA_USERS_DIR}/${SHERPA_UID}/workspace"]
+network_access = false   # 実行シェルコマンドの外部通信を遮断（メイン推論の OpenAI 呼び出しは別経路）

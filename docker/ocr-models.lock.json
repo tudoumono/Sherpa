@@ -1,0 +1,22 @@
+{
+  "distribution_policy": "not_bundled_until_legal_review",
+  "models": [
+    {
+      "cache_relative_path": "official_models/PP-OCRv6_medium_det",
+      "license_declared_by_upstream": "Apache-2.0",
+      "name": "PP-OCRv6_medium_det",
+      "tree_sha256": "f74ebd70d463d5fe627dd1d0d235bc5097acda0ff1c05f527c363054bd6975ee"
+    },
+    {
+      "cache_relative_path": "official_models/PP-OCRv6_medium_rec",
+      "license_declared_by_upstream": "Apache-2.0",
+      "name": "PP-OCRv6_medium_rec",
+      "tree_sha256": "a0e6515f7e4c2745c07de72ffa867836f68a7aec988989754b8afb0d019bf3db"
+    }
+  ],
+  "runtime_download_allowed": false,
+  "schema": "sherpa-ocr-model-lock-v1",
+  "tree_hash_excludes": [".cache"],
+  "relocked_at": "2026-08-16",
+  "relock_reason": "取得メタデータ（.cache/）を含めていたため再downloadで必ずhashが変わり、同一modelでも起動を拒んだ。model本体だけを対象に再計算した（精度は 2026-08-10 と完全一致＝語recall 61/65・macro CER 0.010722 を再現）。"
+}
