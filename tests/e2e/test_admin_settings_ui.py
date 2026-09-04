@@ -36,6 +36,25 @@ def re_compile_hash(tab):
     return re.compile(re.escape(f"#{tab}") + r"$")
 
 
+def test_admin_settings_chat_examples_hint_matches_empty_save_is_hidden_contract(page, web_base_url):
+    """RV是正（rv-periphery #6）: 空欄のまま保存すると「非表示」になる（既定に戻すには別の
+    「未設定に戻す」ボタンが要る）という実際の契約（`sherpa/chat_examples.py::validate`）と、
+    案内文言を一致させる——旧文言は「空欄のままなら組み込みの既定が使われます」と誤って案内していた。
+
+    未設定（`configured=None`・既定の mock 応答）での初回描画は baseline（`_chatExamplesBaseline`）
+    と実際の入力欄の状態が一致し、プロバイダタブに未保存の丸印が付かない（初期値の形の食い違いが
+    誤って「変更あり」と判定しないことの回帰確認）。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html")
+
+    expect(page.locator("#chat-examples-card")).to_contain_text(
+        "空欄のまま保存すると質問例は表示されません。組み込みの既定（4例）に戻すには、"
+        "下の「未設定に戻す」を使ってください。")
+    expect(page.locator("#tab-dot-provider")).to_be_hidden()   # baseline が render 直後の実値と一致＝未保存無し
+
+
 def test_admin_settings_renders_and_saves(page, web_base_url):
     from playwright.sync_api import expect
 

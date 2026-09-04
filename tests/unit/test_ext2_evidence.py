@@ -404,6 +404,28 @@ def test_evidence_packet_evidence_list_meta_and_card_meta_are_type_validated():
     assert out[0]["list_meta"] == {"shown": 1}
 
 
+def test_evidence_packet_evidence_keeps_tree_meta_for_audit():
+    """RV是正（rv-periphery #1）: folder_tree の `tree_meta`（prefix/depth/count/shown）も
+    list_meta/card_meta と同じく Evidence Packet に載る（型検証つき・監査可能な1対1）。"""
+    em = [{"doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+          "matched_doc_ids": [],
+          "tree_meta": {"prefix": "top", "depth": 2, "count": 3, "shown": 3}}]
+    out = PB._evidence_packet_evidence(em)
+    assert out[0]["tree_meta"] == {"prefix": "top", "depth": 2, "count": 3, "shown": 3}
+    assert "list_meta" not in out[0] and "card_meta" not in out[0]
+
+
+def test_dedupe_structural_evidence_distinguishes_different_folder_tree_conditions():
+    """`tree_meta` の prefix/depth が異なる folder_tree 呼び出しは別 Evidence として残す
+    （`matched_doc_ids` は folder_tree では常に空のため、そこだけを鍵にすると誤って1本化される）。"""
+    items = [{"doc_id": None, "verification_method": "folder_tree_verified", "matched_doc_ids": [],
+             "tree_meta": {"prefix": "top", "depth": 3, "count": 2, "shown": 2}},
+            {"doc_id": None, "verification_method": "folder_tree_verified", "matched_doc_ids": [],
+             "tree_meta": {"prefix": "other", "depth": 3, "count": 2, "shown": 2}}]
+    out = PB._dedupe_structural_evidence(items)
+    assert len(out) == 2
+
+
 def test_dedupe_structural_evidence_distinguishes_different_list_docs_conditions():
     """`matched_doc_ids` が同じでも条件（`prefix`/`pattern`）が異なる list_docs 呼び出しは
     別 Evidence として残す（誤って1本化しない）。"""
@@ -1082,6 +1104,69 @@ def test_empty_list_docs_alone_passes_evidence_gate_as_aggregate_evidence_sub_pa
         _restore_post(orig)
 
 
+def _fake_run_tool_folder_tree(name, args, world, scope_paths, **kw):
+    if name == "folder_tree":
+        return ({"path_prefix": "top", "depth": 3, "count": 2,
+                 "folders": [{"path": "top/a", "depth": 1, "direct_files": 1, "total_files": 1,
+                             "subfolders": 0, "truncated": False}],
+                 "folders_truncated": True}, set(), [], [])
+    return ({"error": f"unexpected tool {name}"}, set(), [], [])
+
+
+def test_folder_tree_alone_passes_evidence_gate_as_aggregate_evidence_main_path(monkeypatch):
+    """RV是正（rv-periphery #1）: folder_tree だけ（citation 無し）でも、呼び出し単位の集計
+    Evidence を1件持つため根拠ゲートを通す（list_docs と同じ扱い・main 経路）。"""
+    monkeypatch.setattr(A, "run_tool", _fake_run_tool_folder_tree)
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "folder_tree", "arguments": '{"path_prefix":"top"}'}}]}}]},
+        {"choices": [{"message": {"content": "top 配下は2フォルダです。"}}]},
+    ]
+    orig = _install_post(seq)
+    try:
+        p = OpenAIProvider("sk-dummy", "gpt-5.5")
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        env = next(e["env"] for e in events if e.get("type") == "_result")
+        assert env["headline"] == "top 配下は2フォルダです。"
+        packet = env["data"]["evidence_packet"]
+        assert packet["investigation_status"] == "sufficient"
+        assert any(ev["verification_method"] == "folder_tree_verified" for ev in packet["evidence"])
+    finally:
+        _restore_post(orig)
+
+
+def _fake_run_tool_graph_neighbors_schema_era_error(name, args, world, scope_paths, **kw):
+    if name == "graph_neighbors":
+        from sherpa.ingest.world_neo4j import GraphSchemaEraError
+        raise GraphSchemaEraError(world, "old-era", lens="qa")
+    return ({"error": f"unexpected tool {name}"}, set(), [], [])
+
+
+def test_run_reraises_graph_schema_era_error_instead_of_generic_fallback(monkeypatch):
+    """RV是正（rv-periphery #11・2026-09-05）: `graph_neighbors` ツール経由で上がる
+    `GraphSchemaEraError` は、下調べ役の技術的失敗と同じ広い except で「下調べAIでの調査が
+    うまくいきませんでした」等の generic フォールバック文言へ丸めない——`run()`（`_agentic_run`
+    の呼び出し元）から re-raise され、`chat_service._degrade_overload`（provider.run() 全体を
+    包む既存の縮退）に固定文言（再取り込み案内）への変換を委ねる。`self._sub is None`
+    （下調べ役なし＝本テストの main 経路）でも generic フォールバックへ丸めないことを固定する。
+    """
+    from sherpa.ingest.world_neo4j import GraphSchemaEraError
+    monkeypatch.setattr(A, "run_tool", _fake_run_tool_graph_neighbors_schema_era_error)
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"TAX-RATE"}'}}]}}]},
+    ]
+    orig = _install_post(seq)
+    try:
+        p = OpenAIProvider("sk-dummy", "gpt-5.5")
+        ctx = _ctx()
+        with pytest.raises(GraphSchemaEraError):
+            list(p.run(ctx))
+    finally:
+        _restore_post(orig)
+
+
 def _fake_run_tool_graph_neighbors_claimless_only(name, args, world, scope_paths, **kw):
     if name == "graph_neighbors":
         # 裏付け doc を1件も主張しない card（純粋なグラフ位相情報＝Neo4j の実在ノードのみが根拠）。
@@ -1360,6 +1445,21 @@ def test_build_evidence_digest_zero_result_list_docs_still_gets_one_evidence():
     assert "ev-1" in ev_map
     assert ev_map["ev-1"] == []
     assert A.resolve_attributed_doc_ids({"ev-1"}, ev_map) == set()   # 該当 doc は無いので空集合のまま
+
+
+def test_build_evidence_digest_folder_tree_shows_prefix_depth_and_counts():
+    """RV是正（rv-periphery #1）: folder_tree の構造 Evidence は `tree_meta`（prefix/depth/count/
+    shown）を事実として digest 本文へ載せる。`matched_doc_ids` は常に空（裏付け doc 無し）でも
+    `ev_map` には空リストとして残り、帰属しても doc は増えない（list_docs の0件と同じ扱い）。"""
+    meta = [{"doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+            "tree_meta": {"prefix": "top/a", "depth": 3, "count": 5, "shown": 5},
+            "matched_doc_ids": []}]
+    digest, ev_map = A.build_evidence_digest([], meta)
+    assert "[folder_tree]" in digest
+    assert "top/a" in digest and "深さ3" in digest
+    assert "該当フォルダ 5 件" in digest and "列挙 5 件" in digest
+    assert ev_map["ev-1"] == []
+    assert A.resolve_attributed_doc_ids({"ev-1"}, ev_map) == set()
 
 
 def test_build_evidence_digest_same_doc_different_spans_get_separate_ev_ids_with_own_quotes():

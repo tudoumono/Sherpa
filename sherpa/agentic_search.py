@@ -1247,7 +1247,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         # K6: フォルダはドキュメントではない（`docs`＝doc_id 集合には何も足さない・出典/引用の対象外
         # ——list_docs/glob_search が返す実ファイル rel_path とは異なる）。
         from . import folder_tree as folder_tree_mod
-        result = folder_tree_mod.build(world, args, scope_paths=sp, deadline=deadline, layer=layer)
+        result = folder_tree_mod.build(world, args, scope_paths=sp, deadline=deadline, layer=layer,
+                                       tool_result_max_bytes=tr_max_bytes)
         return (result, docs, cites, cards)
     if name == "glob_search":
         from . import doc_ledger                          # list_docs と同じ台帳走査（鏡モデル・常に live）
@@ -2721,6 +2722,13 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
                 paths = "、".join(_digest_clean(d) for d in matched[:10])
                 fact = (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
                        f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else ""))
+            elif "tree_meta" in m:
+                # RV是正（rv-periphery #1）: folder_tree の構造 Evidence（`matched_doc_ids` は常に
+                # 空・裏付け doc 無し）。list_docs と同じ「条件＋件数」の事実整形。
+                tm = m.get("tree_meta") or {}
+                cond_text = f"（path_prefix={_digest_clean(tm['prefix'])}）" if tm.get("prefix") else ""
+                fact = (f"[folder_tree] 深さ{tm.get('depth')}{cond_text}／該当フォルダ "
+                       f"{tm.get('count', 0)} 件／列挙 {tm.get('shown', 0)} 件")
             else:
                 cm = m.get("card_meta") or {}
                 docs_text = "、".join(_digest_clean(d) for d in matched[:5])
@@ -3669,6 +3677,17 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                                   "prefix": str(args.get("path_prefix") or "").strip(),
                                   "pattern": str(args.get("name_pattern") or "").strip()},
                     "matched_doc_ids": _matched})
+            if name == "folder_tree" and "error" not in result:
+                # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
+                # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
+                # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
+                # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
+                structural_evidence_meta.append({
+                    "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+                    "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
+                                 "count": result.get("count", 0),
+                                 "shown": len(result.get("folders") or [])},
+                    "matched_doc_ids": []})
             if name == "graph_neighbors" and cd:
                 # `run_tool` が既にカード単位で裏付け doc を検証済み（無効カードは cd に含まれない・
                 # `d` はその検証済み doc_id 集合そのもの）——ここで再検証しない。裏付け doc を
@@ -4139,6 +4158,17 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                   "prefix": str(args.get("path_prefix") or "").strip(),
                                   "pattern": str(args.get("name_pattern") or "").strip()},
                     "matched_doc_ids": _matched})
+            if name == "folder_tree" and "error" not in result:
+                # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
+                # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
+                # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
+                # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
+                structural_evidence_meta.append({
+                    "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+                    "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
+                                 "count": result.get("count", 0),
+                                 "shown": len(result.get("folders") or [])},
+                    "matched_doc_ids": []})
             if name == "graph_neighbors" and cd:
                 # `run_tool` が既にカード単位で裏付け doc を検証済み（無効カードは cd に含まれない・
                 # `d` はその検証済み doc_id 集合そのもの）——ここで再検証しない。裏付け doc を
@@ -4351,6 +4381,17 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                                   "prefix": str(args.get("path_prefix") or "").strip(),
                                   "pattern": str(args.get("name_pattern") or "").strip()},
                     "matched_doc_ids": _matched})
+            if name == "folder_tree" and "error" not in result:
+                # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
+                # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
+                # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
+                # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
+                structural_evidence_meta.append({
+                    "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+                    "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
+                                 "count": result.get("count", 0),
+                                 "shown": len(result.get("folders") or [])},
+                    "matched_doc_ids": []})
             if name == "graph_neighbors" and cd:
                 # `run_tool` が既にカード単位で裏付け doc を検証済み（無効カードは cd に含まれない・
                 # `d` はその検証済み doc_id 集合そのもの）——ここで再検証しない。裏付け doc を

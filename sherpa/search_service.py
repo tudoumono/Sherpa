@@ -29,6 +29,7 @@ DEGRADE_REASONS = frozenset({
     "hybrid_query_failed",  # RV3（FBK-1）: hybrid 自体が失敗し BM25 は成功（hits は空でない）
     "vector_feature_mismatch", "query_embed_failed",
     "neo4j_unavailable", "graph_query_failed",
+    "graph_reingest_required",  # RV是正（rv-periphery #12）: 旧世代グラフ（GraphSchemaEraError）
 })
 
 
@@ -180,11 +181,18 @@ def _search_graph(world, query, sp, k, settings, depth=IMPACT_MAX_DEPTH):
     depth: 影響たどりの深さ（呼び出し元から素通し・既定は `impact_service.IMPACT_MAX_DEPTH`）。
     """
     from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    from .ingest.world_neo4j import GraphSchemaEraError
     try:
         with _neo4j_session() as s:
             result = run_impact(s, query, world, scope_prefixes=(sp or None), depth=depth)
     except (ServiceUnavailable, AuthError, OSError):
         return [], "neo4j_unavailable"
+    except GraphSchemaEraError:
+        # RV是正（rv-periphery #12・2026-09-05）: 旧世代グラフは他の Neo4j 失敗と同じ generic
+        # 理由（`graph_query_failed`）に丸めず、閉じた理由を返す（呼び出し元は再取り込み案内へ
+        # 分けて表示できる）。
+        return [], "graph_reingest_required"
     except Exception:
         return [], "graph_query_failed"
     return _graph_hits(result, k), None

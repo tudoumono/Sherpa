@@ -109,6 +109,39 @@ def test_build_entries_truncated_by_safety_valve_reports_total_count(monkeypatch
         folder_tree._MAX_FOLDERS = orig
 
 
+def test_build_entries_truncated_by_byte_budget_reports_total_count(monkeypatch):
+    """RV是正（rv-periphery #2）: `tool_result_max_bytes` の実効値までエントリ単位で詰め、
+    件数上限（`_MAX_FOLDERS`）に達していなくてもバイト予算超過で打ち切る。`count` は打切り前の
+    総数のまま・`folders_truncated` はバイト打切りでも真になる（黙って一部だけ返さない）。"""
+    rows = _rows(*[f"f{i}/x.md" for i in range(5)])           # f0..f4 の5フォルダ（path はどれも2バイト）
+    _patch(monkeypatch, rows)
+    res = folder_tree.build("v1", {}, tool_result_max_bytes=6)   # "f0"+"f1"+"f2" で丁度6バイト
+    assert res["count"] == 5                                    # 打ち切り前の総フォルダ数は不変
+    assert len(res["folders"]) == 3                             # 3エントリ分でバイト予算を使い切る
+    assert res["folders_truncated"] is True
+
+
+def test_build_default_byte_budget_used_when_not_specified(monkeypatch):
+    """`tool_result_max_bytes` 省略時はモジュール既定（`_DEFAULT_TOOL_RESULT_MAX_BYTES`）を使う
+    ——少数フォルダの通常呼び出しでは打ち切りが発生しない（既存動作の非破壊確認）。"""
+    _patch(monkeypatch, _SAMPLE)
+    res = folder_tree.build("v1", {})
+    assert res["folders_truncated"] is False
+    assert len(res["folders"]) == 5
+
+
+def test_run_tool_forwards_tool_result_max_bytes_to_folder_tree(monkeypatch):
+    """`run_tool` は run 単位で解決した実効バイト予算（`tr_max_bytes`）をそのまま `folder_tree.
+    build` へ転送する（他ツール＝doc_outline 等と同じ配線）。"""
+    rows = _rows(*[f"f{i}/x.md" for i in range(5)])
+    _patch(monkeypatch, rows)
+    result, _docs, _cites, _cards = agentic_search.run_tool(
+        "folder_tree", {}, "v1", None, tool_result_max_bytes=6)
+    assert result["count"] == 5
+    assert len(result["folders"]) == 3
+    assert result["folders_truncated"] is True
+
+
 def test_build_scope_paths_filters_before_counting(monkeypatch):
     _patch(monkeypatch, _SAMPLE)
     res = folder_tree.build("v1", {}, scope_paths=["top"])

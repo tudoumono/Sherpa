@@ -111,13 +111,14 @@ from .providers.codex.sandbox import (  # noqa: F401 -- facade 再エクスポ�
     _web_search_disabled_value,
     _write_codex_authoring_config,
 )
-from .providers.codex.mcp import (  # noqa: F401 -- facade 再エクスポート（フェーズ5 S9・純移動）
+from .providers.codex.mcp import (  # noqa: F401 -- facade 再エクスポート（フェーズ5 S9・純移動＋以後の追加分）
     _MCP_PASSTHROUGH,
     _abs_kb_or_derived,
     _apply_codex_neighbors,
     _codex_ask_capture,
     _codex_ask_question,
     _codex_mcp_enabled,
+    _graph_schema_era_from_item,  # RV是正 rv-periphery #11（2026-09-05）で追加
     _mcp_config_args,
     _mcp_env,
     _mcp_neighbors_from,

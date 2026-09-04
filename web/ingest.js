@@ -378,6 +378,12 @@ async function loadStat(world_id) {                   // 各行の状況を非�
       return;
     }
     el.innerHTML = '<span class="muted">状況を取得できませんでした</span>';
+    // ING-3b是正（rv-periphery #5）: 404 以外の一時的な失敗（ネットワーク瞬断等）でポーリングを
+    // 止めると、既に「実行中」と分かっている world_id が `_runningWorldIds` に残ったまま二度と
+    // 更新されず、pickbtn が「取り込み実行中」表示のまま固まる。既知の実行中 world だけ、同じ
+    // 3秒間隔でポーリングを継続する（world 未登録等の恒久的な失敗まで無限リトライしないよう、
+    // 既に実行中と分かっている world_id に限る）。
+    if (_runningWorldIds.has(world_id)) setTimeout(() => loadStat(world_id), 3000);
   }
 }
 

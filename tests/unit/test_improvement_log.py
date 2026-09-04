@@ -151,6 +151,33 @@ def test_trace_tool_stats_counts_doc_outline_as_tool_call_but_not_files_read():
     assert truncated is False
 
 
+def test_trace_tool_stats_counts_folder_tree_label():
+    """RV是正（rv-periphery #7）: folder_tree（「フォルダ構成を確認」）も tool_calls に数える
+    （list_docs 等と同様・本文を読んでいないため files_read には数えない）。"""
+    trace = [{"id": "n1", "kind": "tool", "label": "フォルダ構成を確認", "detail": "x", "status": "done"}]
+    tool_calls, files_read, truncated = IL.trace_tool_stats(trace)
+    assert tool_calls == 1
+    assert files_read == 0
+    assert truncated is False
+
+
+def test_trace_tool_stats_counts_compare_documents_label():
+    """RV是正（rv-periphery #7）: compare_documents（「世代間の差分を比較」）も tool_calls に数える。"""
+    trace = [{"id": "n1", "kind": "tool", "label": "世代間の差分を比較", "detail": "x", "status": "done"}]
+    tool_calls, _files_read, _truncated = IL.trace_tool_stats(trace)
+    assert tool_calls == 1
+
+
+def test_trace_tool_stats_counts_legacy_ripgrep_grep_label_for_backward_compat():
+    """RV是正（rv-periphery #7）: 「資料を検索（grep）」は ripgrep_search の旧ラベル（現行は
+    「資料を検索（語句そのまま）」）。過去に保存済みの `messages.trace`（履歴データ）を読む集計は
+    現行コードが生成しなくなった旧ラベルも数え続ける必要がある（`_V1_TRACE_OMITTED_NODE_ID` と
+    同じ後方互換の理由）。"""
+    trace = [{"id": "n1", "kind": "tool", "label": "資料を検索（grep）", "detail": "x", "status": "done"}]
+    tool_calls, _files_read, _truncated = IL.trace_tool_stats(trace)
+    assert tool_calls == 1
+
+
 def test_trace_tool_stats_ignores_non_tool_call_labels():
     """予算上限マーカー等（kind="tool" だが実際のツール呼び出しではない）は数えない。"""
     trace = [{"id": "n1", "kind": "tool", "label": "呼び出し予算の上限", "detail": "", "status": "done"}]

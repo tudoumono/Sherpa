@@ -160,22 +160,30 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     `graph_admin.graph_search`）がそれぞれ1回呼ぶ——per-query の追加ラウンドトリップにはなるが
     1クエリで完結させており（count と meta を同一クエリで取得）、20人規模の運用では
     最適化不要（過剰最適化しない・タスク前提）。呼び出し位置は各関数の**主クエリの後**（本関数自体は
-    `GraphQueryOverloadError` を扱わない・下記参照）。
+    `GraphQueryOverloadError` を扱わない・下記参照）。存在確認は `LIMIT 1`（RV是正・rv-periphery
+    #9・2026-09-05）——`count(n)` の値自体は真偽判定にしか使わないため、`world_id` 一致ノードが
+    大量にある world でも全件を数え上げる必要が無い（1件見つかった時点で打ち切る）。
 
-    世代プローブ自体が失敗（timeout/接続断等の `Neo4jError`）した場合はゲートを発動せず黙って戻る
-    ——それは Neo4j 側の別の問題で、呼び出し元の主クエリが既に fail-loud（`_run_read_capped`）か
-    縮退（`lens_service._run_capped`）のどちらかで扱っている。ここで新しい失敗モードを増やさない。
+    世代プローブ自体が失敗（timeout/接続断等の `Neo4jError`）した場合は、警告ログを残したうえで
+    そのまま re-raise する（RV是正・rv-periphery #9）——旧実装は黙って戻っており、この安全弁
+    （旧世代グラフの検知）自体が Neo4j の一時的な不調のたびに無条件で無効化されてしまっていた
+    （fail-open は本来の目的＝旧世代データの読み取り防止に反する）。呼び出し元
+    （`routers/impact.py`・`routers/graph.py`・`chat_service.py`・`graph_admin.ask_graph`・
+    `search_service._search_graph`）は他の `Neo4jError` と同じ経路（既存の broad except・
+    FastAPI 既定 500 等）で扱う。
     """
     try:
         rows = session.run(
-            "OPTIONAL MATCH (n:Entity {world_id:$w}) "
+            "OPTIONAL MATCH (n:Entity {world_id:$w}) WITH n LIMIT 1 "
             "WITH count(n) AS c "
             "OPTIONAL MATCH (m:SherpaMeta {world_id:$w}) "
             "RETURN c, m.schema_era AS era",
             w=world,
         ).data()
     except Neo4jError:
-        return
+        _log.warning("check_schema_era: 世代プローブが失敗しました（world=%s lens=%s）",
+                    world, lens, exc_info=True)
+        raise
     row = rows[0] if rows else None
     if not row or not row.get("c"):
         return
@@ -475,9 +483,11 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
     業務語→コードの橋渡し（旧 REALIZES）は撤去済み（K10）——業務語の入口はクエリ時のエージェントが
     文書を grep してコード名を発見する経路に委ねる（§2）。
 
-    rv-s3-removal: `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError`
-    で fail-loud）。主クエリの**後**に呼ぶ——主クエリ自体の安全弁（`_run_read_capped` の
-    timeout/緊急天井＝`GraphQueryOverloadError`）を先に効かせるため（結果を返す直前の最終ゲート）。
+    rv-s3-removal: 単独では `check_schema_era` を呼ばない（RV是正・rv-periphery #9・2026-09-05で
+    変更）——本関数の唯一の呼び出し元 `run_world_impact` が直後に `world_impact` も呼び、そちらが
+    同じゲートを最終クエリの後に1回だけ確認する（`run_world_impact` docstring 参照）。本関数が
+    別の場所から単独で呼ばれるようになった場合は、その呼び出し元で改めてゲートを追加すること
+    （旧実装は `world_impact` と2回連続で同じ world の世代プローブを重複実行していた）。
     """
     prefixes = list(scope_prefixes or [])
     rows = _run_read_capped(
@@ -488,7 +498,6 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, n.name AS name",
         world=world_id, w=world_id, name=term, incl=include_deprecated, prefixes=prefixes,
     )
-    check_schema_era(session, world_id, lens="impact")
     return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"]} for r in rows]
 
 
@@ -501,8 +510,12 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
     K12（2026-09-04-グラフのソース正典化.md §4）: 「確実/要確認」の二重クエリ・判定表示は
     機構ごと撤去（全件同格）。1本の Cypher で足りる（旧 all-static 判定クエリは撤去）。
 
-    rv-s3-removal: `check_schema_era` を呼ぶ（`resolve_world_entity` と同じゲート・呼び出し元が
-    別でも二重に守る）。`resolve_world_entity` と同じ理由で主クエリの**後**に呼ぶ。
+    rv-s3-removal: `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError`
+    で fail-loud）。主クエリの**後**に呼ぶ——主クエリ自体の安全弁（`_run_read_capped` の
+    timeout/緊急天井＝`GraphQueryOverloadError`）を先に効かせるため（結果を返す直前の最終ゲート）。
+    RV是正（rv-periphery #9・2026-09-05）: 唯一の呼び出し元 `run_world_impact` は本関数の**前**に
+    `resolve_world_entity` も呼ぶが、そちらは単独では同じゲートを呼ばない（`run_world_impact`
+    全体を1回だけ守れば足りる・重複ラウンドトリップの解消）。
     """
     # "world" キーは params に含めない＝ `_run_read_capped` の専用キーワード引数（world=world_id）から
     # `session.run` へ渡す（衝突回避・関数 docstring 参照）。

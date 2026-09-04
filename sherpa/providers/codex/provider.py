@@ -81,6 +81,7 @@ from .mcp import (
     _apply_codex_neighbors,
     _codex_ask_capture,
     _codex_mcp_enabled,
+    _graph_schema_era_from_item,
     _mcp_config_args,
     _mcp_env,
     _mcp_neighbors_from,
@@ -538,6 +539,13 @@ class CodexProvider(Provider):
         _codex_timeout_confirmed = False
         codex_question = None                                    # S2: ask_user 由来の question（出たら env/_result を出さずターン終了）
         codex_usage = None                                       # F3: turn.completed の usage（best-effort・出なければ None）
+        # RV是正（rv-periphery #11・2026-09-05）: `graph_neighbors` の mcp_tool_call item が旧世代
+        # グラフの構造化エラー（`_graph_schema_era_from_item`）を運んできたら、ここへ捕まえておく。
+        # `for line in proc.stdout:` を包む2重の `except Exception:`（_attempt 自身・呼び出し元の
+        # `_run_authoring`）は技術的失敗を `_stream_error` へ丸めてしまうため、その中で直接 raise
+        # しても握り潰される——両方の try/except/finally を抜けた後（下の `if codex_question is
+        # not None:` の直前）でこのフラグを見て改めて raise する。
+        _graph_schema_era_error = None
         # S2 ガード②: 確認ID 付き再送（前の質問への回答）では ask_user を無視＝再質問ループ防止
         # （chat.js が回答再送に `確認ID: {interaction_id}` を必ず含める・chat_router の marker と同流儀）。
         _ask_disabled = bool(re.search(r"確認ID[:：]", ctx.message or ""))
@@ -736,7 +744,7 @@ class CodexProvider(Provider):
                 """1回分の codex exec 実行（node/answer_delta を yield）。proc/killer はこの1回限りの
                 ローカル状態（呼出側は再試行のたびに新しい Popen を張るだけでよい）。"""
                 nonlocal got_any_line, ran, codex_question, codex_usage, thread_id, attempt_returncode
-                nonlocal _agent_partial, _stream_error, _codex_timed_out
+                nonlocal _agent_partial, _stream_error, _codex_timed_out, _graph_schema_era_error
                 got_any_line = False
                 attempt_returncode = None
                 _codex_timed_out = False
@@ -821,14 +829,31 @@ class CodexProvider(Provider):
                                 if codex_question is not None:
                                     break
                                 continue
+                            # RV是正（rv-periphery #7）: folder_tree/compare_documents は MCP 経由で
+                            # Codex にも公開済み（`mcp_server.py::_tool_defs`）だが、この表示用ラベル
+                            # 辞書に対応が無く「その他の処理」の汎用ラベルに丸まっていた
+                            # （`improvement_log._TOOL_CALL_LABELS` の集計対象からも漏れる）。
                             tlabel = {"graph_neighbors": "関係グラフをたどる", "ripgrep_search": "資料を検索（語句そのまま）",
                                       "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
-                                      "list_docs": "資料の一覧を確認"}.get(tool, "その他の処理")
+                                      "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認",
+                                      "compare_documents": "世代間の差分を比較"}.get(tool, "その他の処理")
                             detail = (a.get("name") or a.get("query") or a.get("doc_id")
                                      or a.get("path_prefix") or a.get("name_pattern") or "")
                             if done and tool == "graph_neighbors" and item.get("status") == "completed":
-                                mcp_neighbors.extend(_mcp_neighbors_from(item))
+                                # RV是正（rv-periphery #11）: 旧世代グラフの構造化エラー
+                                # （`mcp_server.py::handle` が isError で返す）を先に見る——
+                                # 検知したら `_mcp_neighbors_from` は呼ばない（近傍データではない）。
+                                _era_err = _graph_schema_era_from_item(
+                                    item, ctx.world, decision.get("lens") if decision else None)
+                                if _era_err is not None:
+                                    _graph_schema_era_error = _era_err
+                                else:
+                                    mcp_neighbors.extend(_mcp_neighbors_from(item))
                             yield _node(f"cx-{iid}", "tool", tlabel, f"「{detail}」", "done" if done else "active")
+                            if _graph_schema_era_error is not None:
+                                # 検知後は以降の Codex 自身の調査を待たない（このターンの答えは
+                                # どのみち `_degrade_overload` の固定文言に置き換わるため）。
+                                break
                         elif it == "reasoning" and e.get("type") == "item.completed":
                             txt = (item.get("text") or "").strip().splitlines()
                             if txt:
@@ -947,6 +972,13 @@ class CodexProvider(Provider):
                             shutil.rmtree(codex_home, ignore_errors=True)
                         except Exception:
                             pass
+            if _graph_schema_era_error is not None:
+                # RV是正（rv-periphery #11・2026-09-05）: 検知した専用例外を、それを飲み込む2重の
+                # try/except（`_attempt` 自身・この呼び出し元）を両方抜けた後でようやく re-raise
+                # する——`run()` から uncaught のまま伝播させ、`chat_service._degrade_overload`
+                # （provider.run() 全体を包む既存の縮退）に固定文言（再取り込み案内）への変換を
+                # 委ねる（`GraphQueryOverloadError` と同じ既存の fail-loud 経路）。
+                raise _graph_schema_era_error
             # S2: ask_user が出たターンは question 優先＝env/_result・成果物台帳登録を出さずここで終了する
             # （agentic の {"question":..}→return と同じ意味論・回答は chat.js の整形再送＝新 codex exec で拾う）。
             # proc は直上の finally で後始末済み。chat_service はこの question を answer.question として保存する（S1）。

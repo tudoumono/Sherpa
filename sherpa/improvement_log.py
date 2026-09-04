@@ -42,10 +42,15 @@ _KNOWN_STOP_REASONS = frozenset(HONEST_FAILURE_STOP_REASONS) | frozenset(INCOMPL
 # プロバイダごとにラベル文言が異なる（`agentic_search._tool_node`/`_SUB_TOOL_FIXED_WORDING` と
 # `providers/codex/provider.py` の tlabel 辞書）ため両方を含める。ラベル文字列に依存するため、
 # いずれかのプロバイダ側でラベルが変わればここも追随させる必要がある。
+# 「資料を検索（grep）」は `ripgrep_search` の旧ラベル（現行は「資料を検索（語句そのまま）」）——
+# 過去に保存済みの `messages.trace`（履歴データ）を読む集計は現行コードが生成しなくなった旧ラベルも
+# 数え続ける必要がある（`_V1_TRACE_OMITTED_NODE_ID` と同じ後方互換の理由・RV是正 rv-periphery #7）。
 _TOOL_CALL_LABELS = frozenset({
     "資料の一覧を確認", "資料を検索（語句そのまま）", "資料を検索（全文/日本語）", "資料を検索（全文）",
-    "ファイル名で検索",
-    "該当箇所を精読", "文書を通読", "見出し構造を確認", "関係グラフをたどる", "ユーザに確認",
+    "資料を検索（grep）",
+    "ファイル名で検索", "フォルダ構成を確認",
+    "該当箇所を精読", "文書を通読", "見出し構造を確認", "関係グラフをたどる", "世代間の差分を比較",
+    "ユーザに確認",
 })
 # 本文を実際に読んだ（精読/通読した）とみなすラベル集合。「見出し構造を確認」（doc_outline）は
 # 構造を見るだけで本文を読んだことにはならないため対象外——`files_read` に含めるのは

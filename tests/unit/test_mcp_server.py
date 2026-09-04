@@ -120,6 +120,22 @@ def test_tools_call_graph_neighbors_stubbed():
         lens_service.neighbor_cards = orig
 
 
+def test_tools_call_graph_schema_era_error_returns_structured_tool_error(monkeypatch):
+    """RV是正（rv-periphery #11・2026-09-05）: `graph_neighbors` が旧世代グラフ
+    （`GraphSchemaEraError`）を検知したら、汎用の JSON-RPC プロトコルエラー（-32603）に丸めず、
+    通常のツール結果と同じ経路（`isError: true`・`content[].text` に安定した機械可読コード
+    `graph_reingest_required`）で返す——Codex 側の `item["result"]` にそのまま載せるため。"""
+    def _boom(name, args, world, scope_paths, **kw):
+        raise M.GraphSchemaEraError(world, "old-era", lens="troubleshoot")
+    monkeypatch.setattr(M.agentic_search, "run_tool", _boom)
+    resp = M.handle({"jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                     "params": {"name": "graph_neighbors", "arguments": {"name": "請求"}}})
+    assert "error" not in resp                        # JSON-RPC プロトコルエラーではない
+    assert resp["result"]["isError"] is True
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload == {"error": "graph_reingest_required", "world": "v1", "stored_era": "old-era"}
+
+
 def test_unknown_method_errors():
     resp = M.handle({"jsonrpc": "2.0", "id": 5, "method": "bogus/method"})
     assert resp["error"]["code"] == -32601

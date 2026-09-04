@@ -11,7 +11,9 @@
   - `_compute_graph_schema_era()`: 決定的な合成（同じ入力→同じ値・材料の版を1つ上げると変わる）。
   - `check_schema_era()`: 実データ0件の world は素通り／世代一致は素通り／世代不一致
     （未保存＝旧世代含む）は `GraphSchemaEraError`／世代プローブ自体の Neo4jError は
-    新しい失敗モードを増やさず黙ってスキップする。
+    警告ログを残したうえで re-raise する（RV是正・rv-periphery #9・2026-09-05——旧実装は
+    黙ってスキップしていたが、それだとこの安全弁自体が Neo4j の一時的な不調のたびに無条件で
+    無効化されてしまう）。存在確認は `LIMIT 1`（全件走査しない）。
 
 実 Neo4j は使わず fake session で検証する（`tests/unit/test_world_neo4j_overload.py` の
 `_FakeResult`/`.data()` パターンを踏襲）。実 Neo4j を使った `load_world`→世代保存→ゲート発動の
@@ -124,8 +126,27 @@ def test_check_schema_era_raises_when_era_stamp_missing():
         assert e.stored_era is None
 
 
-def test_check_schema_era_skips_silently_on_probe_neo4j_error():
-    """世代プローブ自体が失敗（timeout 等）した場合はゲートを発動せず黙って戻る（新しい失敗
-    モードを増やさない・呼び出し元の主クエリ側の安全弁/縮退が既に扱っている前提）。"""
-    s = _FakeSession(raise_exc=_timeout_error())
-    wn.check_schema_era(s, "w1")   # raise しない
+def test_check_schema_era_reraises_probe_neo4j_error_with_log(caplog):
+    """RV是正（rv-periphery #9・2026-09-05）: 世代プローブ自体が失敗（timeout 等）した場合、
+    警告ログを残したうえでそのまま re-raise する（黙ってスキップしない＝この安全弁自体が
+    Neo4j の一時的な不調で無条件に無効化されない）。"""
+    import logging
+    exc = _timeout_error()
+    s = _FakeSession(raise_exc=exc)
+    with caplog.at_level(logging.WARNING, logger="sherpa"):
+        try:
+            wn.check_schema_era(s, "w1", lens="impact")
+            assert False, "世代プローブの Neo4jError は re-raise されるはず"
+        except Neo4jError as e:
+            assert e is exc
+    assert any("世代プローブ" in r.message for r in caplog.records)
+
+
+def test_check_schema_era_probe_query_limits_existence_check_to_one_row():
+    """RV是正（rv-periphery #9）: 存在確認（`:Entity` の有無）は `count(n)` を真偽判定にしか
+    使わないため、`LIMIT 1` で1件見つかった時点で打ち切る（world_id 一致ノードが大量にある
+    world でも全件を数え上げない）。"""
+    s = _FakeSession(rows=[{"c": 1, "era": wn.GRAPH_SCHEMA_ERA}])
+    wn.check_schema_era(s, "w1")
+    query, _params = s.calls[0]
+    assert "LIMIT 1" in query

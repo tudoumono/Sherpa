@@ -157,6 +157,34 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None) ->
     return env
 
 
+def _graph_schema_era_from_item(item: dict, world: str, lens: str | None):
+    """完了した `graph_neighbors` の mcp_tool_call item が構造化エラー
+    （`{"error": "graph_reingest_required", "world", "stored_era"}`・`isError: true`・
+    `mcp_server.py::handle` 参照）を運んでいれば `GraphSchemaEraError` を再構成する（RV是正・
+    rv-periphery #11・2026-09-05）。
+
+    JSON-RPC のプロトコルエラー（top-level `error`）ではなく通常のツール結果（`result.content[].
+    text`）として運ぶ理由: Codex（外部プロセス）自身の `--json` item 表現がプロトコルエラーを
+    どう表すかは Sherpa 側で保証できないが、通常のツール結果は `_mcp_neighbors_from` と同じ経路
+    （`item["result"]["content"][0]["text"]`）で確実に読める。
+
+    それ以外（通常結果・壊れた形・対象外のツール）は None——呼び出し元（`CodexProvider.
+    _run_authoring`）は None のとき従来どおりの表示（`tlabel` 辞書によるノード表示）を続ける。
+    """
+    try:
+        res = item["result"]
+        if not res.get("isError"):
+            return None
+        text = res["content"][0]["text"]
+        data = json.loads(text)
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return None
+    if not isinstance(data, dict) or data.get("error") != "graph_reingest_required":
+        return None
+    from ...ingest.world_neo4j import GraphSchemaEraError
+    return GraphSchemaEraError(world, data.get("stored_era"), lens=lens)
+
+
 def _mcp_neighbors_from(item: dict) -> list:
     """完了した graph_neighbors の mcp_tool_call item から neighbors（compact view）を取り出す（A2）。
 

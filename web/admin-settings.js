@@ -111,9 +111,12 @@ function cloudProviderNeedsExplicitSave(provider) {
 let _ollamaAllowlistBaseline = [];
 let _webhookAllowlistBaseline = [];   // PART-6: Webhook 宛先の SSRF allowlist（ollama_allowlist と同型）
 let _openaiEndpointBaseline = { kind: 'openai', base_url: '', auth_header: 'bearer', api_version: '' };
-// チャット画面のクイック入力例（`chat_examples`・sherpa/chat_examples.py）。`text` はテキスト
-// エリアの1行1例表記（`enabled`/`items` 未設定＝組み込み既定のまま＝カードは「未設定」表示）。
-let _chatExamplesBaseline = { enabled: true, text: '' };
+// チャット画面のクイック入力例（`chat_examples`・sherpa/chat_examples.py）。実際の baseline は
+// 初回描画（`renderChatExamples`）が `{enabled, items}`（items は配列）で上書きする——この初期値は
+// その描画がまだ走っていない間だけ参照されうるフォールバックなので、実描画後の形（`items` 配列）
+// と揃えておく（RV是正・rv-periphery #6：旧 `text: ''` は `chatExamplesChanged()` が参照する
+// `.items` と形が食い違い、描画前に呼ばれると誤って「変更あり」と判定しかねなかった）。
+let _chatExamplesBaseline = { enabled: true, items: [] };
 let _armsBaseline = [];
 let _legacyBaseline = null;
 let _vlmBaseline = null;

@@ -24,6 +24,7 @@ import os
 import sys
 
 from . import agentic_search, es_index
+from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "sherpa", "version": "0.1.0"}
@@ -129,7 +130,19 @@ def handle(req: dict) -> dict | None:
             _ASK_STATE["count"] += 1
             text = _ASK_RESULT_FIRST if _ASK_STATE["count"] == 1 else _ASK_RESULT_AGAIN
             return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": False})
-        result, _docs, _cites, _cards = agentic_search.run_tool(name, args, _world(), _scope(), layer=_layer())
+        try:
+            result, _docs, _cites, _cards = agentic_search.run_tool(name, args, _world(), _scope(), layer=_layer())
+        except GraphSchemaEraError as e:
+            # RV是正（rv-periphery #11）: `graph_neighbors`（`lens_service.neighbor_cards` 経由）が
+            # 検知した旧世代グラフは、汎用の JSON-RPC プロトコルエラー（-32603・`serve()` の
+            # broad except）に丸めず、通常のツール結果と同じ経路（`isError` あり・
+            # `content[].text` に安定した機械可読コード）で返す——Codex 側の `item["result"]` に
+            # そのまま載るため（JSON-RPC のプロトコルエラーは Codex 自身の item 表現が保証されて
+            # いない）、`providers/codex/mcp.py::_graph_schema_era_from_item` が読み取って
+            # `GraphSchemaEraError` を再構成できる。
+            err_body = {"error": "graph_reingest_required", "world": e.world, "stored_era": e.stored_era}
+            return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
+                             "isError": True})
         # MCP 標準＝content[].text。Codex が読む本文＝run_tool の結果（graph_neighbors は compact neighbors）。
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
                          "isError": bool(isinstance(result, dict) and result.get("error"))})

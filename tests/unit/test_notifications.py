@@ -19,20 +19,22 @@ def _label(world_id="w1", label="資料フォルダ1"):
 # ---- _world_labels: world_id の生露出防止（VOCAB-1）-----------------------------------------------
 
 def test_world_labels_falls_back_to_placeholder_when_unnamed(monkeypatch):
-    """ラベル未設定（空）・ID と同値（実質未設定）のいずれも、world_id を生で見せず
-    固定プレースホルダに丸める（利用者向け通知に内部識別子を出さない）。"""
+    """ラベル未設定（空/None）は世界_id を生で見せず固定プレースホルダに丸める（利用者向け通知に
+    内部識別子を出さない）。RV是正（rv-periphery #8・2026-09-05）: label が world_id と同値でも、
+    それは管理者が明示設定した正規のラベル（`worlds.register` は label を world_id へ自動コピー
+    しない）——「実質未設定」とみなして丸めるのは誤り。"""
     monkeypatch.setattr(notifications.store, "list_worlds_db", lambda: [
         {"world_id": "w1", "label": "資料フォルダ1"},   # 正式ラベルあり→そのまま
         {"world_id": "w2", "label": ""},                # ラベル空→プレースホルダ
         {"world_id": "w3", "label": None},               # ラベル未設定（None）→プレースホルダ
-        {"world_id": "w4", "label": "w4"},               # ラベル＝ID（実質未設定）→プレースホルダ
+        {"world_id": "w4", "label": "w4"},               # ラベル＝ID（管理者の明示選択）→そのまま尊重
     ])
     labels = notifications._world_labels()
     assert labels["w1"] == "資料フォルダ1"
     assert labels["w2"] == notifications._UNNAMED_WORLD_LABEL
     assert labels["w3"] == notifications._UNNAMED_WORLD_LABEL
-    assert labels["w4"] == notifications._UNNAMED_WORLD_LABEL
-    assert "w2" not in labels["w2"] and "w4" not in labels["w4"]   # world_id が文言に生で出ない
+    assert labels["w4"] == "w4"
+    assert "w2" not in labels["w2"]   # 未設定分は world_id が文言に生で出ない
 
 
 # ---- a) 取り込み run の完了/失敗（全利用者） -----------------------------------------------------

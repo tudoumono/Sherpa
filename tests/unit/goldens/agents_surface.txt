@@ -54,6 +54,7 @@ _detect_chrome_path
 _facts
 _gather
 _gemini_usage
+_graph_schema_era_from_item
 _humanize_cmd
 _is_anthropic_profile
 _is_progress_only

@@ -9117,7 +9117,7 @@
                 }
               }
             },
-            "description": "入力値が不正です（自動バリデーション、または allowed_worlds に実在しない world_id が含まれる場合、有効期限が過去日時の場合、client_op_id が UUID 形式でない場合、webhook_url が宛先ポリシー（loopback／admin allowlist）を満たさない場合）",
+            "description": "入力値が不正です（自動バリデーション、または allowed_worlds に実在しない world_id が含まれる場合、有効期限が過去日時の場合、client_op_id が UUID 形式でない場合、webhook_url が宛先ポリシー（admin allowlist・loopback 含む）を満たさない場合）",
             "headers": {
               "X-Request-Id": {
                 "description": "リクエスト追跡ID",
@@ -9993,7 +9993,7 @@
                 }
               }
             },
-            "description": "入力値が不正です（自動バリデーション、または allowed_worlds に実在しない world_id が含まれる場合、有効期限が過去日時の場合、daily_quota が現在の上限を超える場合、client_op_id が UUID 形式でない場合、webhook_url が宛先ポリシー（loopback／admin allowlist）を満たさない場合）",
+            "description": "入力値が不正です（自動バリデーション、または allowed_worlds に実在しない world_id が含まれる場合、有効期限が過去日時の場合、daily_quota が現在の上限を超える場合、client_op_id が UUID 形式でない場合、webhook_url が宛先ポリシー（admin allowlist・loopback 含む）を満たさない場合）",
             "headers": {
               "X-Request-Id": {
                 "description": "リクエスト追跡ID",

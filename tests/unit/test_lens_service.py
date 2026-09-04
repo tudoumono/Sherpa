@@ -171,12 +171,17 @@ def test_resolve_anchor_passes_query_timeout():
 
 # ---- タイムアウト時の縮退（黙殺ではなく log.warning＋空リスト） --------------
 
-def test_neo4j_related_degrades_to_empty_on_timeout(caplog):
+def test_neo4j_related_main_query_degrades_but_era_probe_failure_still_propagates(caplog):
+    """主クエリのタイムアウトは `_run_capped` が空へ縮退させる（troubleshoot 独自の安全弁・不変）。
+    RV是正（rv-periphery #9・2026-09-05）: 直後の世代プローブが**同じ理由で**失敗した場合、もう
+    黙ってスキップしない——re-raise されるため、Neo4j 全体が不調なときに「近傍0件」という
+    誤った安心を返さない（両方のログ＝主クエリの縮退・世代プローブの失敗が残る）。"""
     s = _FakeSession(raise_exc=_timeout_error())
     with caplog.at_level(logging.WARNING, logger="sherpa"):
-        out = ls.neo4j_related(s, ["root"], "w1")
-    assert out == []
+        with pytest.raises(Neo4jError):
+            ls.neo4j_related(s, ["root"], "w1")
     assert any("タイムアウト" in r.getMessage() and "w1" in r.getMessage() for r in caplog.records)
+    assert any("世代プローブ" in r.getMessage() for r in caplog.records)
 
 
 def test_resolve_anchor_degrades_to_empty_on_timeout(caplog):
@@ -219,11 +224,15 @@ def test_resolve_anchor_shape_unchanged():
     assert out == [("cid:1", "TAXCALC")]
 
 
-def test_neo4j_related_empty_anchors_short_circuits_without_query():
-    """anchors が空なら session.run 自体を呼ばない（既存の早期 return）。"""
-    s = _FakeSession(rows=[_related_row("cid:1", "X")])
+def test_neo4j_related_empty_anchors_still_checks_schema_era():
+    """RV是正（rv-periphery #10・2026-09-05）: anchors が空でも、近傍探索の主クエリは省略しつつ
+    世代プローブ（`check_schema_era`）は省略しない——旧実装は主クエリごと早期 return しており、
+    旧世代グラフ（例えば旧スキーマではノード名の一致自体が起きず anchors が常に空になる）を
+    「近傍0件」という平常の結果と区別できなかった（沈黙する再取り込み要求）。"""
+    s = _FakeSession(rows=[{"c": 0, "era": None}])   # 実データ無し world＝era ゲート自体は素通り
     assert ls.neo4j_related(s, [], "w1") == []
-    assert s.calls == []
+    assert len(s.calls) == 1
+    assert "LIMIT 1" in s.calls[0][0]   # 呼ばれたのは近傍探索クエリではなく era プローブ
 
 
 # ---- cid（Neo4j canonical_id）は内部専用: run_troubleshoot は公開前に除去する ----------------

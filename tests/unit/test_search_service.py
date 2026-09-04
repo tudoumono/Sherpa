@@ -298,6 +298,27 @@ def test_search_graph_generic_error_is_query_failed(monkeypatch):
     assert hits == [] and reason == "graph_query_failed"
 
 
+def test_search_graph_schema_era_error_is_reingest_required(monkeypatch):
+    """RV是正（rv-periphery #12・2026-09-05）: 旧世代グラフ（`GraphSchemaEraError`）は他の
+    Neo4j 失敗と同じ generic 理由（`graph_query_failed`）に丸めず、閉じた理由
+    `graph_reingest_required` を返す。"""
+    import contextlib
+
+    from sherpa.ingest.world_neo4j import GraphSchemaEraError
+
+    @contextlib.contextmanager
+    def _fake_session():
+        yield object()
+    monkeypatch.setattr(ss, "_neo4j_session", _fake_session)
+
+    def _boom(*a, **kw):
+        raise GraphSchemaEraError("w", "old-era")
+    monkeypatch.setattr(ss, "run_impact", _boom)
+
+    hits, reason = ss._search_graph("w", "q", [], 10, None)
+    assert hits == [] and reason == "graph_reingest_required"
+
+
 class _CtxRaise:
     """`with ...` に入る際に例外を送出するダミーコンテキストマネージャ（テスト用）。"""
 
@@ -320,6 +341,7 @@ def test_degrade_vocabulary():
         "hybrid_query_failed",   # RV3（FBK-1）: hybrid 自体が失敗し BM25 は成功（hits は空でない）
         "vector_feature_mismatch", "query_embed_failed",
         "neo4j_unavailable", "graph_query_failed",
+        "graph_reingest_required",   # RV是正（rv-periphery #12）: 旧世代グラフ（GraphSchemaEraError）
     })
 
 

@@ -1375,9 +1375,14 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     （`_EMBED_FLUSH_CHUNKS` チャンクごと）でそのまま呼ぶ。**Pass1（埋め込み・rv-oom-resume
     item6）も文書1件処理し終えるたび同じ `progress(done_docs, total_docs)` を呼ぶ**——冷キャッシュ
     時は実 embed API 呼び出しを伴う Pass1 が最長段になりうるため。Pass1/Pass2 は同じ目盛り
-    （`docs` の長さ）を共有し別カウンタとしては合成しない——Pass2 開始時に done が一旦小さく
-    戻る（Pass1 完走時の値→Pass2 の0からの再カウント）が、「数時間 done/total が完全に動かない」
-    より許容できる（呼び出し元は単調増加を前提にしないこと）。
+    （`docs` の長さ）を共有し別カウンタとしては合成しない——Pass2 開始時に `progress(0,
+    total_docs)` を明示的に1回呼んでから開始する（rv-periphery #3・2026-09-05）——間引き
+    ラッパー（`_es_progress`）は「直近との差分」で書込みを間引くため、明示の0通知が無いと
+    Pass1 完走時の高い done 値のまま何十件も進むまで画面が更新されない窓ができる。Pass2 の
+    done（`docs_done`）は**対象外（チャンク0件）文書も1件として数える**——`n_docs`（戻り値
+    `indexed`＝実際に索引した文書数）とは別の目盛りで、対象外文書が連続する world でも
+    total_docs へ確実に収束させる。呼び出し元は単調増加を前提にしないこと（Pass1→Pass2 の
+    切替で一度小さく戻る）。
     """
     if not available():
         return {"available": False, "indexed": 0, "chunks": 0}
@@ -1524,14 +1529,31 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     g_bodies: list = []
     g_texts: list = []
     g_no_embed: list = []
+    # RV是正（rv-periphery #3・2026-09-05）: `docs_done` は Pass2 が見終えた文書数（対象外＝
+    # チャンク0件の文書も含む・`n_docs`＝実際に索引した文書数とは別に持つ）。旧実装は `n_docs`
+    # だけを progress の done に使っており、対象外文書が連続する world では実際には進んでいる
+    # のに done が長時間動かず「止まって見える」（対象外文書は total_docs の目盛りでは「見終えた」
+    # 1件のはずなのに数えていなかった）。
+    docs_done = 0
+    if progress is not None:
+        # Pass1→Pass2 の切替では、間引きラッパー（`ingest/worker.py::_es_progress`）が既に
+        # Pass1 完走時の高い done 値を「直近の通知」として覚えているため、`done==0` の特例を
+        # 明示的に叩かないと「Pass2 が始まって暫くの間 done が Pass1 の値のまま止まって見える」
+        # （Pass1 開始時は間引きラッパーの `last is None` 特例で救われるが、Pass2 はもう救われない）。
+        # ここで明示的に 0/total を通知して切替を確実に可視化する。
+        progress(0, total_docs)
     for d in docs:
         chunk_iter, degraded_entry = _iter_doc_chunk_records(world, d, derived, rag_exts, res_map)
         if degraded_entry is not None:
             rag_degraded += 1
             rag_degraded_docs.append(degraded_entry)
         if chunk_iter is None:
+            docs_done += 1
+            if progress is not None:
+                progress(docs_done, total_docs)
             continue
         n_docs += 1
+        docs_done += 1
         for cid, body, text, skip in chunk_iter:
             g_ids.append(cid)
             g_bodies.append(body)
@@ -1543,7 +1565,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                     break
                 g_ids, g_bodies, g_texts, g_no_embed = [], [], [], []
                 if progress is not None:
-                    progress(n_docs, total_docs)
+                    progress(docs_done, total_docs)
         if sender.failed:
             break
     if not sender.failed and g_ids:
@@ -1552,7 +1574,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # ループ末尾の leftover が0件（直前の mid-loop flush でちょうど割り切れた／末尾が
         # 全てスキップ/0チャンク文書だった）場合でも最終呼び出しを保証する（`done == total`
         # を必ず1回は報告する契約・上の mid-loop 呼び出しに畳み込まず独立させる）。
-        progress(n_docs, total_docs)
+        progress(docs_done, total_docs)
 
     rag_report = {}
     if use_rag:                                        # OFF はキー自体を返さない（戻り値の形も完全不変）

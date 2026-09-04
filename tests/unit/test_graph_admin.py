@@ -111,6 +111,34 @@ def test_ask_graph_uses_existing_graph_tool_only(monkeypatch):
         A._post, lens_service.neighbor_cards = o_post, o_cards
 
 
+def test_ask_graph_graph_schema_era_error_returns_closed_reason(monkeypatch):
+    """RV是正（rv-periphery #12・2026-09-05）: `graph_neighbors` ツール経由で上がる
+    `GraphSchemaEraError` は generic な "failed" 状態に丸めず、閉じた理由
+    `graph_reingest_required` を返す——`ask_graph` は例外を投げず常に status dict を返す既存契約
+    のまま（`routers/graph.py::graph_ask` はこの戻り値をそのまま返すだけで済む）。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"TAX-RATE"}'}}]}}]},
+    ]
+
+    def _boom(world, term, sp=None):
+        from sherpa.ingest.world_neo4j import GraphSchemaEraError
+        raise GraphSchemaEraError(world, "old-era", lens="troubleshoot")
+
+    o_post, o_cards = A._post, lens_service.neighbor_cards
+    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
+    lens_service.neighbor_cards = _boom
+    try:
+        res = graph_admin.ask_graph(
+            "TAX-RATE の関連は？", "w", scope_paths=["4期"],
+            settings={"agent": "openai", "openai_api_key": "x", "openai_model": "gpt-test"})
+        assert res["status"] == "graph_reingest_required"
+        assert res["cited_nodes"] == [] and res["docs"] == []
+    finally:
+        A._post, lens_service.neighbor_cards = o_post, o_cards
+
+
 def test_ask_graph_uses_effective_agent_not_saved_when_a7_mismatches(monkeypatch):
     """保存済み agent（openai）が選択中のクラウドプロバイダ（A7・gemini）と一致しない場合、
     ask_graph は保存値をそのまま見ず effective_agent() 経由で ollama として実行する。

@@ -5,11 +5,21 @@ Neo4j の world グラフを直接読む検索と、既存 agentic_search の gr
 """
 from __future__ import annotations
 
+import logging
+
 from . import agent_constructs, agentic_search, llm, store
 from .impact_service import CATEGORY
 from .ingest.model import NODE_LABELS
-from .ingest.world_neo4j import WORLD_EDGE_TYPES, _scope_pred, check_schema_era
+from .ingest.world_neo4j import (
+    GRAPH_SCHEMA_ERA_USER_MESSAGE,
+    WORLD_EDGE_TYPES,
+    GraphSchemaEraError,
+    _scope_pred,
+    check_schema_era,
+)
 from .preview_service import _TYPE_JA
+
+_log = logging.getLogger("sherpa")
 
 _COND_FIELDS = {
     "category": lambda v: f"{v}.category",
@@ -376,6 +386,16 @@ def ask_graph(question: str, world: str, scope_paths=None, settings: dict | None
         answer, docs, cards, usage = _collect(events)
         from . import metering
         metering.record("graph_ask", prov, mod, usage, user_id=user_id, world=world)
+    except GraphSchemaEraError as e:
+        # RV是正（rv-periphery #12・2026-09-05）: `graph_neighbors` ツール経由で上がる専用例外を
+        # 下の generic except（"failed"）へ丸めず、閉じた理由 `graph_reingest_required` を返す
+        # （`ask_graph` は例外を投げず常に status dict を返す既存契約——`routers/graph.py::
+        # graph_ask` はこの戻り値をそのまま返すだけで済む・503 化はしない）。
+        _log.warning("graph_ask がスキーマ世代不一致で失敗（fail-loud・world=%s・stored=%s）",
+                    world, e.stored_era)
+        return {"status": "graph_reingest_required", "world": world, "question": q,
+                "answer": GRAPH_SCHEMA_ERA_USER_MESSAGE,
+                "cited_nodes": [], "docs": [], "summary": status_summary}
     except Exception:
         return {"status": "failed", "world": world, "question": q,
                 "answer": _FAILED_ANSWER,

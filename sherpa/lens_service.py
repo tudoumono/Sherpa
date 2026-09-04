@@ -197,16 +197,20 @@ def resolve_anchor(session, text, world, scope_prefixes=None):
 def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False):
     """アンカー近傍（**厳密な影響ではない**）。各近傍への最短経路を代表に返す（範囲内・無向・全エッジ型）。
 
-    rv-s3-removal: `anchors` が非空（＝実際にグラフへ問い合わせる）のときだけ、主クエリの**後**に
-    `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError` で fail-loud・
-    `world_neo4j` 参照）。主クエリの安全弁（`_run_capped` の timeout 縮退）を先に効かせるための順序
-    （`check_schema_era` 自身も世代プローブの Neo4jError は黙ってスキップするため、主クエリが既に
-    縮退した後にここで新たな失敗にはならない）。`lens="troubleshoot"`——直接 dispatch（troubleshoot
-    レンズ）経由の呼び出しを想定した既定値。agentic ツール `graph_neighbors`（`neighbor_cards` 経由・
-    qa/author レンズからも呼ばれ得る）でも同じ既定値のまま返す（呼び出し元のチャットレンズまでは
-    本関数から見えないため・新規のレンズ追跡機構は作らない＝縮小形の方針）。
+    rv-s3-removal: 主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
+    `GraphSchemaEraError` で fail-loud・`world_neo4j` 参照）。`lens="troubleshoot"`——直接 dispatch
+    （troubleshoot レンズ）経由の呼び出しを想定した既定値。agentic ツール `graph_neighbors`
+    （`neighbor_cards` 経由・qa/author レンズからも呼ばれ得る）でも同じ既定値のまま返す（呼び出し元
+    のチャットレンズまでは本関数から見えないため・新規のレンズ追跡機構は作らない＝縮小形の方針）。
+
+    RV是正（rv-periphery #10・2026-09-05）: `anchors` が空（症状文にグラフ上のノード名が1つも
+    見当たらなかった）でも `check_schema_era` は呼ぶ——旧実装は主クエリごと丸々スキップして早期
+    `return []` していたため、旧世代グラフ（例えば旧スキーマではノード名の一致自体が起きず
+    anchors が常に空になる）を「近傍0件」という平常の結果と区別できなかった（再取り込みが必要な
+    world が沈黙して見える穴）。
     """
     if not anchors:
+        check_schema_era(session, world, lens="troubleshoot")
         return []
     cy = (
         "MATCH (a:Entity) WHERE a.canonical_id IN $anchors "

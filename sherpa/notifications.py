@@ -50,13 +50,17 @@ _UNNAMED_WORLD_LABEL = "名称未設定の資料フォルダ"
 
 
 def _world_labels() -> dict[str, str]:
-    # world_id を生で見せない——ラベル未設定（空）や ID と同値（実質未設定）のときは
-    # 平文のプレースホルダに丸める（利用者に world_id 等の内部識別子を露出しない・docs/04 §6）。
+    # world_id を生で見せない——ラベル未設定（空/null）のときだけ平文のプレースホルダに丸める
+    # （利用者に world_id 等の内部識別子を露出しない・docs/04 §6）。RV是正（rv-periphery #8）:
+    # 「label が world_id と同値なら実質未設定」という以前の判定は誤り——label はレジストリ登録時
+    # に任意で明示設定する値で（`worlds.register` 参照）、world_id を自動でコピーする経路は無い。
+    # 管理者が意図的に world_id と同じ文字列を label として設定した場合は正規の表示名として尊重する
+    # （空/未設定のときだけプレースホルダへ丸める）。
     out = {}
     for row in store.list_worlds_db():
         wid = row["world_id"]
         label = row.get("label") or ""
-        out[wid] = label if (label and label != wid) else _UNNAMED_WORLD_LABEL
+        out[wid] = label if label else _UNNAMED_WORLD_LABEL
     return out
 
 

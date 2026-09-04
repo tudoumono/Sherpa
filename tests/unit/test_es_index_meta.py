@@ -221,6 +221,31 @@ def test_rerank_knn_by_importance_is_noop_without_any_importance_field():
     assert [h["score"] for h in out] == original_scores
 
 
+def test_index_world_pass2_progress_resets_to_zero_and_advances_for_excluded_docs(monkeypatch, tmp_path):
+    """RV是正（rv-periphery #3・2026-09-05）: Pass2 開始時に `progress(0, total_docs)` を明示的に
+    1回呼ぶ（Pass1 完走時の高い done 値のまま止まって見えないように）。対象外文書（`state`=
+    "unreadable"＝`chunk_iter` が None）も `docs_done`（total_docs へ収束する目盛り）を1件分
+    進める——旧実装は実際に索引した文書数（`n_docs`）だけを done として使っており、対象外文書は
+    数えていなかった。"""
+    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
+    docs = [{"name": "skip.md", "md_path": None, "top_scope": "t", "state": "unreadable"},
+           {"name": "a.md", "md_path": None, "top_scope": "t"}]
+    monkeypatch.setattr(es_index.corpus_docs, "world_documents", lambda w: docs)
+    monkeypatch.setattr(es_index.doc_text, "read_world_doc_text", lambda w, d: "本文1\n本文2")
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+    monkeypatch.setattr(es_index, "ensure_index", lambda w, dim=None, emeta=None: True)
+    monkeypatch.setattr(es_index, "_embed_cached", lambda *a, **k: (None, 0, 0))
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
+    monkeypatch.setattr(es_index, "_req", lambda method, path, body=None, **kw: {})
+    calls = []
+    r = es_index.index_world("w", progress=lambda done, total: calls.append((done, total)))
+    assert r["indexed"] == 1                          # 対象外文書は「索引した」数には数えない（不変）
+    assert calls[0] == (0, 2)                          # Pass2 開始の明示 0/total
+    assert (1, 2) in calls                              # 対象外文書1件を見終えた時点で1件分進む
+    assert calls[-1] == (2, 2)                          # 最終呼び出しは必ず done==total
+
+
 def test_index_world_skips_embedding_for_branch_source(monkeypatch, tmp_path):
     """branch=="source"（登録コード＋軽量テキスト枠の汎用コード・`ingest.text_kind`）のチャンクは
     埋め込み対象から除外する——embed API 呼び出しから除外され、bulk body に `embedding` フィールドを

@@ -184,6 +184,29 @@ def test_run_locked_wires_es_index_progress_to_ingest_run_progress(monkeypatch, 
     assert [(p["done"], p["total"]) for p in es_stage_calls] == [(0, None), (3, 10), (10, 10)]
 
 
+def test_run_locked_es_progress_dedupes_consecutive_same_value(monkeypatch, _stub_pipeline):
+    """RV是正（rv-periphery #3(c)・2026-09-05）: `_es_progress` は直前と全く同じ `done` を
+    無条件に書かない——`done==0`/`done==total` は同値でも毎回書く特例だったため、例えば
+    Pass2 が同じ値を2回連続で通知するケース（空 world の 0/0 等）で重複書込みしていた。"""
+    progress_calls = []
+    monkeypatch.setattr(store, "update_ingest_run_progress",
+                        lambda run_id, progress: progress_calls.append(progress))
+
+    def _fake_index_world(world, content_sig=None, progress=None, **kw):
+        if progress is not None:
+            progress(0, 10)
+            progress(0, 10)     # 同値の2回目＝抑止される
+            progress(10, 10)
+            progress(10, 10)    # 同値の2回目＝抑止される
+        return {"available": True, "indexed": 10, "chunks": 10}
+    monkeypatch.setattr(es_index, "index_world", _fake_index_world)
+
+    res = worker.run("w")
+    assert res["status"] == "auto_published"
+    es_stage_calls = [p for p in progress_calls if p.get("stage") == "es_index" and p.get("total") == 10]
+    assert [(p["done"], p["total"]) for p in es_stage_calls] == [(0, 10), (10, 10)]
+
+
 def test_run_locked_sig_confirm_write_failure_propagates(monkeypatch, _stub_pipeline):
     """run 完了と sig/doc_count/scan_report 確定は同一トランザクション
     （`finish_ingest_run_and_confirm_world`）——その書込自体が失敗すれば（PG断等）例外がそのまま

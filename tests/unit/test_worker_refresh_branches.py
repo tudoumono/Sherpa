@@ -187,6 +187,36 @@ def test_sync_human_md_only_drift_still_reaches_es_repair_same_call(_stub, monke
     assert res["status"] == "unchanged" and res["changed"] is False
 
 
+def test_sync_unchanged_es_repair_progress_throttled_and_dedupes_same_value(_stub, monkeypatch):
+    """RV是正（rv-periphery #4・2026-09-05）: unchanged 分岐の ES 自己修復
+    （`index_world_with_human_md_holdback` の progress コールバック）に、`_run_locked` 側の
+    `_es_progress` と同じ「100件間隔の間引き＋同値抑止」（rv-periphery #3(c)）を適用する——
+    旧実装は doc グループ（flush）単位の呼び出しをそのまま DB 書込みへ転送しており、間引きが
+    掛かっていなかった。連続する同値（1,1／150,150／300,300）は2回目を書かない。"""
+    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
+
+    def _index_world_holdback(world, *, content_sig=None, run_id=None, progress=None):
+        for done in (0, 1, 1, 2, 150, 150, 300, 300):     # es_index.index_world の実呼び出し列を模す
+            progress(done, 300)
+        return {"available": True, "indexed": 300, "chunks": 300}
+    monkeypatch.setattr(worker, "index_world_with_human_md_holdback", _index_world_holdback)
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(store, "update_ingest_run_progress",
+                        lambda run_id, payload: recorded.append(payload))
+    monkeypatch.setattr(store, "finish_ingest_run", lambda *a, **k: None)
+    monkeypatch.setattr(worker.webhooks, "notify_run_terminal", lambda *a, **k: None)
+
+    res = worker.sync("w", run_id=999)
+    assert res["status"] == "unchanged"
+    # `total == 300` で絞る＝直前の無条件なステージ遷移記録（`_progress("es_index", done=0,
+    # total=None)`・本テストの対象外）を除外し、ホールドバックの progress コールバックが実際に
+    # 書いた値だけを見る。1/1/2 は 100件間隔未満のため間引かれ、150/150・300/300 は同値の2回目が
+    # 抑止される。
+    done_values = [r["done"] for r in recorded if r["stage"] == "es_index" and r["total"] == 300]
+    assert done_values == [0, 150, 300]
+
+
 def test_sync_self_heal_success_confirms_human_md_es_marker(_stub, monkeypatch):
     """ES 自己修復（unchanged 分岐）の `index_world` が成功（bulk_errors 等の失敗が無い）したら、
     `office_md.confirm_human_md_es_sig` で `.human_md_es_sig` マーカーを確定し、続けて

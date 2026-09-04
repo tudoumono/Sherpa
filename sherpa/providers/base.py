@@ -413,6 +413,23 @@ def _safe_list_meta(lm) -> dict | None:
     return out or None
 
 
+def _safe_tree_meta(tm) -> dict | None:
+    """folder_tree 集計 Evidence の `tree_meta`（対象 prefix・深さ・該当件数・列挙件数）を型検証して
+    返す（`_safe_list_meta` と同じ allowlist 規律・RV是正 rv-periphery #1）。未知の形・空なら None。
+    """
+    if not isinstance(tm, dict):
+        return None
+    out = {}
+    for k in ("count", "shown", "depth"):
+        v = tm.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[k] = v
+    v = tm.get("prefix")
+    if isinstance(v, str):
+        out["prefix"] = v
+    return out or None
+
+
 def _safe_card_meta(cm) -> dict | None:
     """graph カード Evidence の `card_meta`（対象名・関係・カテゴリ・経路）を型検証して返す
     （`_safe_list_meta` と同じ allowlist 規律）。`path` は文字列のリストのときだけ通す。
@@ -480,6 +497,9 @@ def _evidence_packet_evidence(evidence_meta: list, attributed_ev_ids: set | None
             lm = _safe_list_meta(m.get("list_meta"))
             if lm is not None:
                 entry["list_meta"] = lm
+            tm = _safe_tree_meta(m.get("tree_meta"))
+            if tm is not None:
+                entry["tree_meta"] = tm
             cm = _safe_card_meta(m.get("card_meta"))
             if cm is not None:
                 entry["card_meta"] = cm
@@ -598,10 +618,12 @@ def _dedupe_structural_evidence(items: list) -> list:
     seen, out = set(), []
     for m in items:
         lm = m.get("list_meta") or {}
+        tm = m.get("tree_meta") or {}
         cm = m.get("card_meta") or {}
         key = (m.get("doc_id"), m.get("verification_method"),
               tuple(sorted(m.get("matched_doc_ids") or [])),
               lm.get("count"), lm.get("shown"), lm.get("prefix"), lm.get("pattern"),
+              tm.get("count"), tm.get("shown"), tm.get("prefix"), tm.get("depth"),
               cm.get("name"), cm.get("role"), cm.get("category"),
               tuple(cm.get("path") or []))
         if key in seen:
@@ -2239,9 +2261,18 @@ class _GenProvider(Provider):
             # agentic_search のツール一覧にはグラフ照会（graph_neighbors/find_paths）も含まれるため、
             # グラフが使える環境では従来の情報を取りつつ、0 件でも grep/ES で調べ続けられる。
             if decision.get("lens") != "author":               # P1-a: author は agentic_search 未対応ツール＝単発取得へ
+                from ..ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
                 try:
                     yield from self._agentic_run(ctx, decision)
                     return
+                except GraphSchemaEraError:
+                    # RV是正（rv-periphery #11・2026-09-05）: `graph_neighbors` ツール経由で上がる
+                    # 専用例外は、下調べ役の技術的失敗と同じ広い except で黙って generic フォール
+                    # バック文言へ丸めない——そのまま re-raise し、この呼び出し元（`_gather`
+                    # 経由の provider.run() 全体）を包む `chat_service._degrade_overload` に
+                    # 固定文言（再取り込み案内）への変換を委ねる（`GraphQueryOverloadError` と
+                    # 同じ既存の fail-loud 経路・`chat_service.py::_degrade_overload` 参照）。
+                    raise
                 except Exception as agentic_exc:
                     # 下調べ役（検索アシスタント）付きのターンでは、反復検索の失敗（一時的な通信
                     # 失敗は `agentic_search._post` が既に限定リトライ済み・技術的失敗と根拠ゲート

@@ -246,19 +246,44 @@ def test_world_impact_propagates_overload_from_query():
 
 def test_resolve_world_entity_shape_unchanged():
     """K10（REALIZES 橋の撤去）以降、`resolve_world_entity` は名前一致の1クエリだけで業務ロジックが
-    完結する（＝旧 REALIZES 橋の2段目クエリは復活していない）。rv-s3-removal で主クエリの後に
-    `check_schema_era` の世代プローブが1回加わるため、`session.run` 呼び出し総数は2になる
-    （era プローブは `rows` を `{"cid":...}` 形として読むため `c` キーが無く早期 return・素通り）。
+    完結する（＝旧 REALIZES 橋の2段目クエリは復活していない）。RV是正（rv-periphery #9・
+    2026-09-05）: 単独では `check_schema_era` の世代プローブをもう呼ばない（唯一の呼び出し元
+    `run_world_impact` が直後に呼ぶ `world_impact` 側で1回だけ確認する・重複ラウンドトリップの
+    解消）——`session.run` 呼び出し総数は1のまま。
     """
     rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}]
     s = _FakeSession([rows])
     starts = wn.resolve_world_entity(s, "TAX-RATE", "w1")
-    assert len(s.calls) == 2
+    assert len(s.calls) == 1
     assert "MATCH (n:Entity {world_id:$w}) WHERE n.name=$name" in s.calls[0][0].text
-    assert "SherpaMeta" in s.calls[1][0]
     by = {x["canonical_id"]: x for x in starts}
     assert set(by) == {"dataitem:w1:D"}
     assert by["dataitem:w1:D"] == {"canonical_id": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}
+
+
+def test_run_world_impact_probes_schema_era_exactly_once():
+    """RV是正（rv-periphery #9・2026-09-05）: `run_world_impact`（`resolve_world_entity` →
+    `world_impact` の合成）は世代プローブを1回だけ実行する——旧実装は両関数がそれぞれ独立に
+    プローブしており、同じ world に対して era プローブが2回連続で走っていた（重複ラウンド
+    トリップ）。"""
+    resolve_rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}]
+    impact_rows = [_impact_row("cid:a", "NODE-A")]
+    era_rows = {"c": 1, "era": wn.GRAPH_SCHEMA_ERA}
+
+    class _SeqSession(_FakeSession):
+        def run(self, query, **params):
+            self.calls.append((query, params))
+            text = query.text if hasattr(query, "text") else query
+            if "SherpaMeta" in text:
+                return _FakeResult([era_rows])
+            if "n.name=$name" in text:
+                return _FakeResult(resolve_rows)
+            return _FakeResult(impact_rows)
+
+    s = _SeqSession([])
+    wn.run_world_impact(s, "TAX-RATE", "w1")
+    era_probe_calls = [c for c in s.calls if "SherpaMeta" in (c[0].text if hasattr(c[0], "text") else c[0])]
+    assert len(era_probe_calls) == 1
 
 
 def test_world_impact_shape_unchanged():

@@ -452,6 +452,11 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         # `_office_progress` と同じ間引き（`_PROGRESS_FILE_INTERVAL` 件ごと・先頭/末尾は必ず書く）。
         # es_index 側は既に doc グループ（flush）単位で呼ばれるため、ここは二重の安全弁。
         last = _last_es_progress_done[0]
+        # RV是正（rv-periphery #3(c)・2026-09-05）: 直前と全く同じ done は無条件に書かない
+        # （`done==0`/`done==total` は同値でも毎回書く特例だったため、例えば空 world の Pass2 が
+        # `progress(0, 0)` を2回通知するケースで同一内容を重複書込みしていた）。
+        if last == done:
+            return
         if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_es_progress_done[0] = done
             _progress("es_index", done=done, total=total)
@@ -1006,6 +1011,21 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             _log.warning(
                 "進捗の記録に失敗しました（sync 自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
 
+    # RV是正（rv-periphery #4・2026-09-05）: unchanged 自己修復（下の ES 修復分岐）の
+    # `index_world_with_human_md_holdback` progress コールバックは、従来 doc グループ（flush）
+    # 単位の呼び出しをそのまま `_progress`（DB 書込み）へ転送しており、`_run_locked` 側の
+    # `_es_progress`（`_PROGRESS_FILE_INTERVAL`＝100件間隔・先頭/末尾のみ必ず書く）と同じ間引きが
+    # 掛かっていなかった（大規模 world の自己修復で毎 flush ごとに DB 書込みが積み重なる）。
+    _last_unchanged_es_progress_done = [None]
+
+    def _unchanged_es_progress(done, total):
+        last = _last_unchanged_es_progress_done[0]
+        if last == done:              # #3(c) と同じ同値抑止
+            return
+        if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
+            _last_unchanged_es_progress_done[0] = done
+            _progress("es_index", done=done, total=total)
+
     _progress("scanning")
     sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
     if sig is None:
@@ -1103,7 +1123,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                     _progress("es_index", done=0, total=None)
                     esr = index_world_with_human_md_holdback(
                         world, content_sig=sig, run_id=run_id,
-                        progress=lambda done, total: _progress("es_index", done=done, total=total))
+                        progress=_unchanged_es_progress)
                     if not (esr.get("available") is True and not esr.get("error")):
                         es_repair_failure = esr.get("error") or "unavailable"
             except Exception as e:

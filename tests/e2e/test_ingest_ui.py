@@ -920,6 +920,50 @@ def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
     expect(pickbtn).to_be_enabled()
 
 
+def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, web_base_url):
+    """RV是正（rv-periphery #5・2026-09-05）: `loadStat` の自己ポーリング中に 404 以外の一時的な
+    失敗（ネットワーク瞬断・5xx等）が起きても、既知の実行中 world はポーリングを止めない。旧実装は
+    非404失敗でポーリングが完全に停止し、`_runningWorldIds` に world_id が残ったまま更新される
+    見込みが無くなり、`pickbtn`（登録ボタン）が「取り込み実行中」表示のまま永久に無効化されて
+    固まっていた。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+
+    state = {"calls": 0}
+
+    def handle_status(route):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                **WORLD_STATUS_RESP,
+                "running_progress": {"stage": "es_index", "stage_label": "全文索引に登録し、ベクトル化中",
+                                     "done": 3, "total": 10, "updated_at": "2026-09-04T00:00:00+00:00"},
+            }))
+            return
+        if state["calls"] == 2:
+            route.fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "boom"}))
+            return
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(WORLD_STATUS_RESP))
+
+    page.route("**/worlds/w1/status", handle_status)
+
+    page.goto(f"{web_base_url}/ingest.html")
+    page.clock.install()
+
+    pickbtn = page.locator("#pickbtn")
+    expect(pickbtn).to_be_disabled()
+
+    page.clock.fast_forward(3500)   # 2回目のポーリング＝一時的な500失敗（ポーリングは継続する）
+    expect(page.locator('[data-stat="w1"]')).to_contain_text("状況を取得できませんでした")
+    expect(pickbtn).to_be_disabled()   # まだ実行中扱いのまま（_runningWorldIds は消えていない）
+
+    page.clock.fast_forward(3500)   # 3回目のポーリング＝復旧して running_progress が無くなる
+    expect(pickbtn).to_be_enabled()
+
+
 # ソース正典化（`docs/proposals/2026-09-04-グラフのソース正典化.md`・S3）: 「グラフを生成」ボタン
 # （`data-extract`）・`extractWorld()`・`isGraphExtractFailure`（llm_unavailable/llm_error 案内）は
 # web/ingest.js から機構ごと撤去済み（意味層 LLM 抽出は K9 で撤去・バックエンドの `/extract` は
