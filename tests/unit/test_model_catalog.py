@@ -429,3 +429,13 @@ def test_hardcoded_fallback_render_is_empty_by_design():
     """`render` は組み込み既定を持たない＝`hardcoded_fallback` 単体では空文字（フォールバック連鎖は
     `resolve_model` 側の責務）。"""
     assert model_catalog.hardcoded_fallback("openai", "render") == ""
+
+
+def test_validate_catalog_accepts_legacy_extract_cell_passthrough():
+    """GRAPH-SRC 是正（2026-09-05）: 既存 DB の extract セル（レガシー）を含むカタログを
+    保存し直しても拒否しない（拒否すると管理画面の設定保存が全滅する・実環境で観測）。
+    値は素通し＝render→extract フォールバックの読み取り元として保持される。"""
+    from sherpa import model_catalog as mc
+    cat = {"gemini": {"extract": {"allowed": ["gemini-2.5-flash"], "default": "gemini-2.5-flash"}}}
+    out = mc.validate_catalog(cat)
+    assert out["gemini"]["extract"]["default"] == "gemini-2.5-flash"

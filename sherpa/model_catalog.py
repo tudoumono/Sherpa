@@ -314,7 +314,12 @@ def validate_catalog(value) -> dict | None:
         for usage, cell in usages.items():
             if not isinstance(usage, str) or not usage.strip():
                 raise ValueError("model_catalog の用途名は空でない文字列で指定してください")
-            if usage not in USAGES:
+            if usage not in USAGES and usage != "extract":
+                # "extract" はレガシー受け入れ（GRAPH-SRC 2026-09-05 是正）: 既存 DB に保存済みの
+                # extract セルを UI が読み込み→そのまま PUT し返すため、拒否すると**設定保存が
+                # 一切できなくなる**（実環境で観測）。セルの中身の検証は他用途と同じに通し、
+                # 値は素通しで保存する——`_USAGE_FALLBACK`（render→extract）の読み取り元として
+                # 既存のカスタム値（Azure のデプロイ名等）を失わないため。管理画面には出ない。
                 raise ValueError(f"model_catalog[{provider}] の未知の用途です: {usage}"
                                  f"（利用可能: {', '.join(USAGES)}）")
             if not isinstance(cell, dict):

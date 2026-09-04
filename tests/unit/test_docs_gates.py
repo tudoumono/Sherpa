@@ -13,9 +13,13 @@
 - test_api_version_param_retired: archive/proposals 以外の docs（＋ CLAUDE.md）に、旧 `version` が
   API のクエリ/ボディパラメータとして**今なお受理される**という記載が残っていないか検査する
   （フェーズ2第2段＝`version` 受理終了・2026-07-13 完了後のドリフト検査）。
+- test_settings_keys_documented: `PUT /settings`（個人設定・`SettingsReq`）／`PUT /admin/settings`
+  （全体設定・`SystemSettingsReq`）のフィールド名が `docs/manual/25-設定リファレンス.md` に
+  バックティック表記（`` `key_name` ``）で記載されているか検査する（MANUAL-2・一方向のみ）。
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 
@@ -166,3 +170,49 @@ def test_env_vars_documented():
 
     missing = sorted(code_vars - documented)
     assert not missing, "未文書化の環境変数（.env.example / manual/90 に追記が必要）:\n" + "\n".join(missing)
+
+
+# MANUAL-2（設定リファレンス新設）: 個人設定／全体設定の PUT ボディのフィールド名が
+# docs/manual/25-設定リファレンス.md にバックティック表記で載っているかの検査。
+# JS 側（web/settings.js・web/admin-settings.js）が組み立てる PUT ボディのキー名を正規表現で
+# 抜き出す方式は、body への代入が `body[provider + '_api_key']` のような動的組み立てを含み
+# 安定しないため、代わりに両エンドポイントの pydantic リクエストモデル（`SettingsReq`／
+# `SystemSettingsReq`）のフィールド名を ast で列挙する（タスク指示どおりスキーマ列挙ベースに
+# 簡素化・値は変わらない静的な `ast.AnnAssign` のみ拾う）。
+_SETTINGS_REQ_TARGETS = (
+    (ROOT / "sherpa" / "routers" / "system.py", "SettingsReq"),               # 個人設定（PUT /settings）
+    (ROOT / "sherpa" / "routers" / "system_extras.py", "SystemSettingsReq"),  # 全体設定（PUT /admin/settings）
+)
+
+_BACKTICK_IDENT_RE = re.compile(r"`([a-zA-Z_][a-zA-Z0-9_]*)`")
+
+
+def _pydantic_field_names(path: pathlib.Path, class_name: str) -> set[str]:
+    """`path` 内の `class_name`（BaseModel）が直接持つフィールド名（`ast.AnnAssign` のみ・
+    メソッド/プロパティは無視）。クラスが見つからなければテスト失敗（リネーム検知）。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                stmt.target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            }
+    raise AssertionError(f"{path.relative_to(ROOT)}: class {class_name} が見つかりません（リネーム/削除？）")
+
+
+def test_settings_keys_documented():
+    """`SettingsReq`／`SystemSettingsReq` の全フィールドが manual/25 にバックティック表記で
+    載っていること（検査は「スキーマにあるのに docs に無い」の一方向のみ）。"""
+    code_keys: set[str] = set()
+    for path, class_name in _SETTINGS_REQ_TARGETS:
+        code_keys |= _pydantic_field_names(path, class_name)
+
+    doc_path = DOCS / "manual" / "25-設定リファレンス.md"
+    documented = set(_BACKTICK_IDENT_RE.findall(doc_path.read_text(encoding="utf-8")))
+
+    missing = sorted(code_keys - documented)
+    assert not missing, (
+        "未文書化の設定キー（docs/manual/25-設定リファレンス.md にバックティック表記で追記が必要）:\n"
+        + "\n".join(missing)
+    )
