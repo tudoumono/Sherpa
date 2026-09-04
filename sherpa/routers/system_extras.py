@@ -29,6 +29,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator
 
 from sherpa import (
+    chat_examples,
     depth_profile,
     ext_api,
     health,
@@ -191,6 +192,10 @@ class SystemSettingsReq(BaseModel):
     # 追加/上書き/削除）。意味検証は `sherpa.model_windows.validate_model_windows`（`_validate_
     # model_windows` が 422 へ変換）。null は未設定へ戻す（以後はプロバイダAPI/シード表/不明段のみ）。
     model_context_windows: dict[str, StrictInt] | None = None
+    # チャット画面のクイック入力例（ウェルカム画面のチップ）のカスタマイズ。`{enabled, items}`
+    # （意味検証は `sherpa.chat_examples.validate`・`_validate_chat_examples` が 422 へ変換）。
+    # null は未設定へ戻す（既定＝表示・組み込み4例）。
+    chat_examples: dict | None = None
 
 
 def _normalize_world_list_field(v: list[str] | None) -> list[str] | None:
@@ -889,6 +894,18 @@ def _admin_settings_view() -> dict:
             # `model_context_windows`）。`configured` はそのままの生値（未設定なら null）。
             "model_windows": {"configured": sysset.get(model_windows.MODEL_WINDOWS_KEY)},
         },
+        # チャット画面のクイック入力例（ウェルカム画面のチップ）。`configured` は生値（未設定なら
+        # null）、`effective` は実際に表示される内容（非表示なら空リスト）、`default` は組み込み既定
+        # （未設定に戻したときに使われる4例・`GET /settings` の非 admin 向け応答はこの既定文言自体は
+        # 返さない＝フロントの組み込み既定 `web/chat/state.js::DEFAULT_EXAMPLES` と一致させる必要が
+        # あるため、値がずれていないか確認する参考表示として返す）。
+        "chat_examples": {
+            "configured": sysset.get("chat_examples"),
+            "effective": chat_examples.effective_examples(sysset),
+            "default": list(chat_examples.DEFAULT_ITEMS),
+            "max_items": chat_examples.MAX_ITEMS,
+            "max_item_length": chat_examples.MAX_ITEM_LENGTH,
+        },
     }
 
 
@@ -1295,6 +1312,16 @@ def _validate_model_windows(value):
         raise HTTPException(422, str(e))
 
 
+def _validate_chat_examples(value):
+    """`chat_examples`（チャット画面のクイック入力例）の検証。形・意味の検証本体は
+    `sherpa.chat_examples.validate`（`ValueError` を送出）で行い、ここでは 422 へ変換するだけ
+    （`_validate_model_catalog` と同じ流儀）。"""
+    try:
+        return chat_examples.validate(value)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 def _validate_codex_session_retention_days(value):
     """`codex_session_retention_days`（R1b・決定5）の検証。None は未設定（＝0/無制限へフォールバック）。
     0 以上の整数のみ許可（0＝無制限・明示的に保存できる）。負値・非整数は 422。"""
@@ -1343,6 +1370,8 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     agentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・
     累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は "provider:model" →
     tokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。
+    chat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・
+    `sherpa.chat_examples.validate` が意味検証・不正は422）。
     監査 INSERT の失敗は
     `store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（2026-07-08
     RV High: commit 後の別接続 audit＋失敗時 compensate 方式は穴があったため、原子性で置き換えた・
@@ -1403,6 +1432,8 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     # BUDGET-2（§3.4）: モデル窓の管理者登録（"provider:model" → tokens）。
     if "model_context_windows" in provided:
         updates["model_context_windows"] = _validate_model_windows(provided["model_context_windows"])
+    if "chat_examples" in provided:
+        updates["chat_examples"] = _validate_chat_examples(provided["chat_examples"])
     _cloud_secret_keys = frozenset({"openai_api_key", "gemini_api_key", "bedrock_api_key"})
     for _k in _cloud_secret_keys:
         if _k in provided:

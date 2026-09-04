@@ -29,6 +29,16 @@ const LENS_LABEL = { impact: '影響範囲分析', troubleshoot: 'トラブル�
 const STATUS_CLASS = { deprecated: 'deprecated', hidden_candidate: 'hidden_candidate' };
 const STATUS_LABEL = { deprecated: '廃止', hidden_candidate: '隠し候補' };
 
+// 質問例チップのブロック（EXAMPLES が空＝管理者が非表示に設定＝空文字を返しブロック自体を出さない）。
+// welcome() の初回描画・refreshWelcomeExamples() の後追い更新（管理者設定 `chat_examples` の
+// 取得が welcome() より遅れて完了する経路・menus.js::loadConfig 参照）の両方から使う。
+// アイコンは実際の挙動（入力欄に読み込むだけ・送信はしない）に合わせる＝送信を示す記号は使わない。
+function _examplesHtml() {
+  if (!EXAMPLES.length) return '';
+  return '<div class="examples">' + EXAMPLES.map((t, i) =>
+    `<button class="example" data-ex="${i}"><span class="exq">${esc(t)}</span><span class="exarrow">✎</span></button>`).join('') + '</div>';
+}
+
 export function welcome() {
   $('messages').innerHTML = '';
   // 初回の「ようこそ」3ステップ（初見に使い方が伝わるように）。文言は固定＝ユーザ入力を含まないため esc 不要。
@@ -39,13 +49,23 @@ export function welcome() {
     + '<li><b>チャットで質問</b><br><span class="muted">例:「消費税率を変えると何に影響する？」／「夜間バッチの異常終了の原因候補は？」</span></li>'
     + '<li><b>出典から原本を確認</b><br><span class="muted">回答末尾の出典リンクから、根拠になった元ファイルを開けます。</span></li>'
     + '</ol>';
-  // アイコンは実際の挙動（入力欄に読み込むだけ・送信はしない）に合わせる＝送信を示す記号は使わない。
-  const ex = '<div class="examples">' + EXAMPLES.map((t, i) =>
-    `<button class="example" data-ex="${i}"><span class="exq">${esc(t)}</span><span class="exarrow">✎</span></button>`).join('') + '</div>';
   const el = appendAssistantRaw(steps
     + '<div class="muted">気になることを、いつもの言葉で質問してください。'
-    + '社内資料に基づく回答が必要なときは、<b>「ナレッジ参照」をオン</b>に。</div>' + ex);
+    + '社内資料に基づく回答が必要なときは、<b>「ナレッジ参照」をオン</b>に。</div>' + _examplesHtml());
   el.classList.add('welcome-msg');   // 送信時に消すための目印（重なり防止）
+}
+
+// menus.js::loadConfig（GET /settings）が welcome() より後に完了した場合の後追い更新。
+// ウェルカムメッセージが今も表示中（会話を開いていない・新規会話のまま）のときだけ、質問例
+// ブロックをサーバ値（EXAMPLES は setChatExamples 済み）で置き換える。表示中でなければ何もしない
+// （既に会話を開いていれば welcome-msg は無い＝安全に no-op）。
+export function refreshWelcomeExamples() {
+  const msg = document.querySelector('.welcome-msg');
+  if (!msg) return;
+  const html = _examplesHtml();
+  const old = msg.querySelector('.examples');
+  if (old) { if (html) old.outerHTML = html; else old.remove(); }
+  else if (html) { msg.insertAdjacentHTML('beforeend', html); }
 }
 
 // ===== trace / turn stack（右ペイン・積み上げ表示と共通で使う描画） =====

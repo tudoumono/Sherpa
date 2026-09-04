@@ -3913,6 +3913,20 @@
             "title": "Bedrock Model Label",
             "type": "string"
           },
+          "chat_examples": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chat Examples"
+          },
           "cloud_provider": {
             "title": "Cloud Provider",
             "type": "string"
@@ -4037,7 +4051,8 @@
           "user_api_keys_daily_quota_default",
           "model_catalog",
           "model_catalog_by_provider",
-          "ollama_url_choice"
+          "ollama_url_choice",
+          "chat_examples"
         ],
         "title": "SettingsResponse",
         "type": "object"
@@ -4193,6 +4208,18 @@
               }
             ],
             "title": "Bedrock Api Key"
+          },
+          "chat_examples": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chat Examples"
           },
           "cloud_provider": {
             "anyOf": [
@@ -7343,7 +7370,7 @@
         ]
       },
       "put": {
-        "description": "全体設定を部分更新（admin のみ・検証・監査・fail-closed）。\n\n未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名\nのみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・\nvlm は provider/model/cloud_allowed の型を検証する\n（不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。\ncodex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/\nwebhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する\n（junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら\n実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama\nのみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は\nollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。\"openai\" への\n変更はこの PUT 適用後の実効設定で実送信可能性も preflight する\n（`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの\n基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は\n`sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。agentic_budget_per_result/\nagentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・\n累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は \"provider:model\" →\ntokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。\n監査 INSERT の失敗は\n`store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（2026-07-08\nRV High: commit 後の別接続 audit＋失敗時 compensate 方式は穴があったため、原子性で置き換えた・\nannouncement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。",
+        "description": "全体設定を部分更新（admin のみ・検証・監査・fail-closed）。\n\n未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名\nのみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・\nvlm は provider/model/cloud_allowed の型を検証する\n（不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。\ncodex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/\nwebhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する\n（junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら\n実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama\nのみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は\nollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。\"openai\" への\n変更はこの PUT 適用後の実効設定で実送信可能性も preflight する\n（`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの\n基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は\n`sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。agentic_budget_per_result/\nagentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・\n累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は \"provider:model\" →\ntokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。\nchat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・\n`sherpa.chat_examples.validate` が意味検証・不正は422）。\n監査 INSERT の失敗は\n`store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（2026-07-08\nRV High: commit 後の別接続 audit＋失敗時 compensate 方式は穴があったため、原子性で置き換えた・\nannouncement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。",
         "operationId": "admin_settings_put_admin_settings_put",
         "requestBody": {
           "content": {

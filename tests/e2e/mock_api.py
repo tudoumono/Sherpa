@@ -888,6 +888,15 @@ def _default_model_catalog() -> dict:
     }
 
 
+# 組み込みの質問例4例（実サーバ `sherpa/chat_examples.py::DEFAULT_ITEMS`／
+# `web/chat/state.js::DEFAULT_EXAMPLES` と一致させる）。
+_CHAT_EXAMPLES_DEFAULT = (
+    '消費税率を変更すると、影響がありそうな箇所を教えてください。',
+    '夜間バッチが異常終了しました。原因の候補を教えてください。',
+    '消費税の端数処理の仕様を教えてください。',
+    '登録されている資料の内容を要約した概要資料を作ってください。',
+)
+
 # S1（2026-07-08-設定分離とUI整備.md）: GET /admin/settings の既定応答（全体設定の現行値＋実効値）。
 # admin-settings.html の描画・保存 e2e 用。configured=None＝未設定（既定/env に従う）状態。
 SYSTEM_SETTINGS_VIEW = {
@@ -1010,6 +1019,15 @@ SYSTEM_SETTINGS_VIEW = {
         "window": {"provider": "ollama", "model": "qwen2.5", "window_tokens": None,
                   "source": "unknown", "derived_cap_bytes": None},
         "model_windows": {"configured": None},
+    },
+    # チャット画面のクイック入力例（`sherpa/chat_examples.py`）。既定（未設定）は表示・組み込み4例
+    # （`GET /settings` の非 admin 向け `chat_examples` は None を返す＝下記 SETTINGS_RESP 参照）。
+    "chat_examples": {
+        "configured": None,
+        "effective": list(_CHAT_EXAMPLES_DEFAULT),
+        "default": list(_CHAT_EXAMPLES_DEFAULT),
+        "max_items": 8,
+        "max_item_length": 200,
     },
 }
 
@@ -1158,7 +1176,10 @@ SETTINGS_RESP = {"agent": "openai",   # construct_id="openai_only" と一致さ�
                          "ollama": {"allowed": ["qwen2.5"], "default": "qwen2.5"},
                      },
                  },
-                 "system_prompt": "既定の方針"}
+                 "system_prompt": "既定の方針",
+                 # チャット画面のクイック入力例（`sherpa/chat_examples.py::public_examples`）。
+                 # None＝未設定（フロントは組み込み既定 `web/chat/state.js::DEFAULT_EXAMPLES` を使う）。
+                 "chat_examples": None}
 
 # 追加AI（gemini/bedrock）を `SHERPA_EXTRA_AGENTS` で有効化した環境の応答。これらの AI を扱う
 # テスト（Bedrock のモデル検証・機能ごとの AI に gemini を選ぶ等）はこちらを使う。
@@ -1752,6 +1773,15 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             # docstring の比較粒度の方針どおり）。
             if "model_context_windows" in body and "agentic_budget" in view:
                 view["agentic_budget"]["model_windows"]["configured"] = body["model_context_windows"]
+            # チャット画面のクイック入力例（簡易反映・null は default（組み込み4例）へ戻す・
+            # enabled=false／items=[] は effective=[] ＝非表示）。
+            if "chat_examples" in body and "chat_examples" in view:
+                val = body["chat_examples"]
+                view["chat_examples"]["configured"] = val
+                if val is None:
+                    view["chat_examples"]["effective"] = list(view["chat_examples"]["default"])
+                else:
+                    view["chat_examples"]["effective"] = (val.get("items") or []) if val.get("enabled", True) else []
             # PUT を状態保持型にする（GET へ反映）: system_settings_resp から使い捨てのコピーを
             # 作って PUT 自身の応答だけに返すと、後続の GET /admin/settings は常にこの
             # install_api_mocks 呼び出し時点の初期値のまま（PUT の変更が一切反映されない）になり、
@@ -1765,6 +1795,12 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             # 管理画面で切り替えた直後の判定が実サーバと食い違う（拒否すべきを許可・許可すべきを拒否）。
             if "cloud_provider" in body:
                 settings_resp["cloud_provider"] = view["cloud"]["provider"]
+            # 個人設定（settings_resp）側のチャット質問例も同期する（GET /settings の
+            # `chat_examples` は None＝未設定／配列＝管理者の明示設定という公開契約
+            # （`sherpa.chat_examples.public_examples`）を反映する）。
+            if "chat_examples" in body:
+                settings_resp["chat_examples"] = None if body["chat_examples"] is None \
+                    else view["chat_examples"]["effective"]
             return _json(route, view)
         if method == "POST" and path == "/admin/settings/openai-endpoint-test":
             # SET-2c: 接続先の接続テストは admin 専用の別ルートに分離済み（個人設定用

@@ -238,6 +238,9 @@ class SettingsResponse(BaseModel):
     model_catalog_by_provider: dict[str, dict[str, ModelChoiceInfo]]
     # 個人の Ollama 接続先 `<select>` の選択肢（system.py::_ollama_url_choice。allowed は完全 URL）。
     ollama_url_choice: OllamaUrlChoiceInfo
+    # チャット画面のクイック入力例（管理者設定・`sherpa/chat_examples.py::public_examples`）。
+    # None＝未設定（フロントの組み込み既定を使う）。配列（空含む）＝管理者の明示設定（空＝非表示）。
+    chat_examples: list[str] | None
 
 
 class SettingsTestResponse(BaseModel):
@@ -447,6 +450,17 @@ class CodexSessionRetentionInfo(BaseModel):
     effective: int
 
 
+class ChatExamplesAdminInfo(BaseModel):
+    """チャット画面のクイック入力例（`sherpa/chat_examples.py`）。`configured` は保存されている
+    生値（未設定なら None・破損値も含め透過表示するため `Any`＝他の *AdminInfo と同じ理由）。
+    `effective` は実際に表示される内容（非表示なら空リスト）、`default` は組み込み既定4例。"""
+    configured: dict[str, Any] | None
+    effective: list[str]
+    default: list[str]
+    max_items: int
+    max_item_length: int
+
+
 class UsageChatAdminInfo(BaseModel):
     """STAT-2: 利用統計チャット専用の AI 選択（`usage_chat_provider`・"openai"|"ollama"・
     利用者の実行構成には依存しない・管理者全体で統一）。`configured` は保存されている生値
@@ -561,6 +575,7 @@ class AdminSettingsView(BaseModel):
     usage_chat: UsageChatAdminInfo
     depth_profile: DepthProfileAdminInfo
     agentic_budget: AgenticBudgetAdminInfo
+    chat_examples: ChatExamplesAdminInfo
 
 
 # ---- 運営掲示板（system_extras.py::_announcement_out）----

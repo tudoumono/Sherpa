@@ -2401,3 +2401,120 @@ def test_admin_settings_model_windows_registered_value_narrows_effective_budget(
     expected_cap = model_windows.derive_window_bytes(40_000)
     assert ab["per_result"]["effective"] == expected_cap
     assert ab["total"]["effective"] == expected_cap
+
+
+# ===== チャットの質問例（chat_examples） =====
+
+def test_admin_settings_view_chat_examples_shape_unset():
+    """未設定（既定）は configured=None・effective=組み込み4例（`sherpa.chat_examples.DEFAULT_ITEMS`）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import chat_examples as ce
+    admin, _ = _admin_client()
+    r = admin.get("/admin/settings")
+    assert r.status_code == 200, r.text
+    view = r.json()["chat_examples"]
+    assert view["configured"] is None
+    assert view["effective"] == list(ce.DEFAULT_ITEMS)
+    assert view["default"] == list(ce.DEFAULT_ITEMS)
+    assert view["max_items"] == ce.MAX_ITEMS
+    assert view["max_item_length"] == ce.MAX_ITEM_LENGTH
+
+
+def test_put_chat_examples_reflects_and_resets():
+    """items は trim・空要素の除外込みで configured/effective に反映され、null で未設定（組み込み
+    既定）へ戻る。非 admin 向け `GET /settings` の `chat_examples` にも同じ内容が反映される。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import chat_examples as ce
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={
+        "chat_examples": {"enabled": True, "items": ["  在庫の締め処理は？  ", "", "月次バッチの流れは？"]}})
+    assert r.status_code == 200, r.text
+    view = r.json()["chat_examples"]
+    assert view["configured"] == {"enabled": True, "items": ["在庫の締め処理は？", "月次バッチの流れは？"]}
+    assert view["effective"] == ["在庫の締め処理は？", "月次バッチの流れは？"]
+
+    r_settings = admin.get("/settings")
+    assert r_settings.status_code == 200, r_settings.text
+    assert r_settings.json()["chat_examples"] == ["在庫の締め処理は？", "月次バッチの流れは？"]
+
+    r2 = admin.put("/admin/settings", json={"chat_examples": None})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["chat_examples"]["configured"] is None
+    assert r2.json()["chat_examples"]["effective"] == list(ce.DEFAULT_ITEMS)
+    # 未設定へ戻すと非 admin 向けは None（フロントは自分の組み込み既定を使う契約）。
+    assert admin.get("/settings").json()["chat_examples"] is None
+
+
+def test_put_chat_examples_enabled_false_hides_regardless_of_items():
+    """enabled=false は items があっても非表示（effective=[]）。非 admin 向けも空配列（None ではない
+    ＝「明示的に非表示」と「未設定」を区別する契約）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={
+        "chat_examples": {"enabled": False, "items": ["これは表示されない"]}})
+    assert r.status_code == 200, r.text
+    assert r.json()["chat_examples"]["effective"] == []
+    assert admin.get("/settings").json()["chat_examples"] == []
+
+
+def test_put_chat_examples_enabled_true_empty_items_is_explicit_hide():
+    """enabled=true かつ items が実質空（trim 後に空要素しか残らない）は明示的な非表示
+    （「未設定＝組み込み既定を出す」とは区別する）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={"chat_examples": {"enabled": True, "items": ["   ", ""]}})
+    assert r.status_code == 200, r.text
+    assert r.json()["chat_examples"]["configured"] == {"enabled": True, "items": []}
+    assert r.json()["chat_examples"]["effective"] == []
+    assert admin.get("/settings").json()["chat_examples"] == []
+
+
+@pytest.mark.parametrize("bad", [
+    "not-a-dict",
+    123,
+    {"enabled": "yes"},
+    {"items": "not-a-list"},
+    {"items": [1, 2]},
+    {"items": ["x"] * 9},
+    {"items": ["x" * 201]},
+])
+def test_put_chat_examples_rejects_bad_shapes(bad):
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={"chat_examples": bad})
+    assert r.status_code == 422, r.text
+
+
+def test_put_chat_examples_accepts_max_items_boundary():
+    """ちょうど上限件数（8件）・上限文字数（200文字）は許可される（境界値）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    items = [f"質問{i}" for i in range(8)]
+    r = admin.put("/admin/settings", json={"chat_examples": {"items": items}})
+    assert r.status_code == 200, r.text
+    assert r.json()["chat_examples"]["configured"]["items"] == items
+    # enabled 省略時は既定 true。
+    assert r.json()["chat_examples"]["configured"]["enabled"] is True
+
+    r2 = admin.put("/admin/settings", json={"chat_examples": {"items": ["x" * 200]}})
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["chat_examples"]["configured"]["items"] == ["x" * 200]
+
+
+def test_admin_settings_chat_examples_gates():
+    """非 admin は 403・未ログインは 401（他の全体設定と同じ authz 契約）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    anon = TestClient(app, raise_server_exceptions=False)
+    assert anon.put("/admin/settings", json={"chat_examples": {"items": ["x"]}}).status_code == 401
+    uid, pw = f"chatexusr{sfx}", f"ChatExUsr{sfx}"
+    _mk_user(uid, pw, role="user")
+    user = _login(uid, pw)
+    assert user.put("/admin/settings", json={"chat_examples": {"items": ["x"]}}).status_code == 403

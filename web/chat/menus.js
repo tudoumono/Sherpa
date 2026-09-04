@@ -13,9 +13,10 @@
 // （inquiry.js/scope.js は本モジュールを import しない＝新たな循環は増やさない）。
 'use strict';
 
-import { S } from './state.js';
+import { S, setChatExamples } from './state.js';
 import { setKbLocked } from './scope.js';   // Codex構成は資料参照ON固定（決定 2026-08-15）
 import { setWebSearchEligible } from './inquiry.js';   // WEB-1: 表示条件（admin許可×Codex×OpenAI直結）の通知
+import { refreshWelcomeExamples } from './render.js';   // 管理者設定 chat_examples の後追い反映
 import { toast } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;   // 共通ユーティリティ(common.js)
@@ -79,6 +80,10 @@ export async function loadConfig() {
     _webSearchAvailable = !!s.web_search_available;
     _openaiEndpointKind = s.openai_endpoint_kind || 'openai';
     _syncWebSearchEligibility();
+    // chat_examples（管理者設定・quick入力例のカスタマイズ）: null=未設定は組み込み既定のまま・
+    // 取得失敗時（catch）は呼ばない＝どちらも fail-open で既定表示を保つ。
+    setChatExamples(s.chat_examples);
+    refreshWelcomeExamples();
   } catch (e) { }
 }
 // #1: バッジ＝AI/実行環境のクイック切替メニュー（接続テストもここで完結／モデルは管理画面）

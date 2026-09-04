@@ -111,6 +111,9 @@ function cloudProviderNeedsExplicitSave(provider) {
 let _ollamaAllowlistBaseline = [];
 let _webhookAllowlistBaseline = [];   // PART-6: Webhook 宛先の SSRF allowlist（ollama_allowlist と同型）
 let _openaiEndpointBaseline = { kind: 'openai', base_url: '', auth_header: 'bearer', api_version: '' };
+// チャット画面のクイック入力例（`chat_examples`・sherpa/chat_examples.py）。`text` はテキスト
+// エリアの1行1例表記（`enabled`/`items` 未設定＝組み込み既定のまま＝カードは「未設定」表示）。
+let _chatExamplesBaseline = { enabled: true, text: '' };
 let _armsBaseline = [];
 let _legacyBaseline = null;
 let _vlmBaseline = null;
@@ -1412,6 +1415,7 @@ function renderProviderTab(view) {
     api_version: cfg.api_version || '',
   };
   renderDepthProfile(view.depth_profile);
+  renderChatExamples(view.chat_examples);
 }
 
 // SC-6c: 調べる深さの基準値（標準時の値）。同じ「プロバイダ＋接続先」タブの2つ目のカード。
@@ -1455,6 +1459,38 @@ function depthProfileChanged() {
     ((($(id) || {}).value || '').trim()) !== (_depthProfileBaseline[put] || ''));
   const sel = $('depth-base-codex-reasoning');
   return intChanged || (!!sel && sel.value !== _depthReasoningBaseline);
+}
+
+// チャット画面のクイック入力例（`chat_examples`）。同じ「プロバイダ＋接続先」タブの3つ目のカード。
+function renderChatExamples(ce) {
+  ce = ce || {};
+  const configured = ce.configured;
+  const enabledInput = $('chat-examples-enabled');
+  const itemsInput = $('chat-examples-items');
+  const enabled = configured != null ? (configured.enabled !== false) : true;
+  const items = configured != null ? (configured.items || []) : [];
+  if (enabledInput) enabledInput.checked = enabled;
+  if (itemsInput) itemsInput.value = items.join('\n');
+  _chatExamplesBaseline = { enabled, items };
+  const status = $('chat-examples-status');
+  if (status) {
+    status.textContent = configured != null
+      ? `固定中です（${(ce.effective || []).length ? (ce.effective || []).length + '件を表示' : '非表示'}）。`
+      : `未設定です（組み込みの既定 ${(ce.default || []).length}例が表示されます）。`;
+  }
+}
+function _collectChatExamplesItems() {
+  return (($('chat-examples-items') || {}).value || '').split('\n')
+    .map((s) => s.trim()).filter((s) => s !== '');
+}
+function collectChatExamples() {
+  return { enabled: !!($('chat-examples-enabled') || {}).checked, items: _collectChatExamplesItems() };
+}
+function chatExamplesChanged() {
+  const enabledNow = !!($('chat-examples-enabled') || {}).checked;
+  const itemsNow = _collectChatExamplesItems();
+  return enabledNow !== _chatExamplesBaseline.enabled
+    || JSON.stringify(itemsNow) !== JSON.stringify(_chatExamplesBaseline.items);
 }
 // 保存前にサーバと同じ範囲（HTML の min/max 属性・実 API の Field(ge,le) と同じ値）を検証し、
 // 日本語で案内する。pydantic の 422 応答（`detail` が配列）をそのまま共通のエラー表示へ渡すと
@@ -1867,6 +1903,7 @@ async function save() {
     if (v !== _RESEARCH_PROVIDER_INVALID) body.research_default_provider = v;
   }
   collectDepthProfile(body);   // SC-6c: 調べる深さの基準値（変わった項目だけ送る）
+  if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
   collectAgenticBudget(body);  // BUDGET-1（§3.4）: 検索の情報量予算（変わった項目だけ送る）
   collectModelWindowsTable(body);   // BUDGET-2（§3.4）: モデル窓の登録表（変わっていれば送る）
   try {
@@ -1953,6 +1990,7 @@ async function resetProviderTab() {
     depth_base_impact_depth: null,
     depth_base_troubleshoot_depth: null,
     depth_base_codex_reasoning: null,
+    chat_examples: null,
   };
   let view;
   try { view = await _putResetBody(body, resEl); } catch (e) { return; }
@@ -2059,6 +2097,20 @@ document.querySelectorAll('[data-reset-tab]').forEach((b) => {
   if (handler) b.addEventListener('click', handler);
 });
 
+// チャットの質問例カードだけの「未設定に戻す」（タブ全体のリセットとは別に、この項目単体を
+// 未設定へ戻す・_putResetBody を共用してクラウドキー削除待ちの無効化等の共通処理に乗せる）。
+const _chatExamplesReset = $('chat-examples-reset');
+if (_chatExamplesReset) _chatExamplesReset.addEventListener('click', async () => {
+  const resEl = 'chat-examples-reset-res';
+  let view;
+  try { view = await _putResetBody({ chat_examples: null }, resEl); } catch (e) { return; }
+  _view = view;
+  renderChatExamples(view.chat_examples);
+  applyConfigChangedHighlights(view);
+  refreshTabDots();
+  _markResetOk(resEl);
+});
+
 // ===== タブ切り替え（URL ハッシュで記憶）・未保存タブの丸印 =====
 const TAB_KEYS = ['provider', 'models', 'ingest', 'usage', 'extkeys'];
 // 埋め込みタブ（管理系ページを iframe で表示・UI-TABS2・2026-09-04）。設定タブと違い保存対象が
@@ -2092,7 +2144,7 @@ window.addEventListener('hashchange', () => activateTab(location.hash.replace('#
 const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
     || openaiEndpointChanged() || mcEmbedChanged()
-    || depthProfileChanged(),
+    || depthProfileChanged() || chatExamplesChanged(),
   models: () => mcCatalogChangedExcludingEmbed(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged()
     || agenticBudgetChanged() || modelWindowsTableChanged(),
@@ -2152,6 +2204,8 @@ function applyConfigChangedHighlights(view) {
   });
   const reasoning = dp.codex_reasoning || {};
   mark($('depth-base-codex-reasoning'), reasoning.effective !== reasoning.default);
+  const ce = view.chat_examples || {};
+  mark($('chat-examples-card'), (ce.configured != null));
   // 取り込み
   const arms = view.arms || {};
   mark($('arms-list'), JSON.stringify([...(arms.enabled || [])].sort())

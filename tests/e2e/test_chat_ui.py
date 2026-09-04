@@ -1695,8 +1695,11 @@ def test_codex_construct_locks_knowledge_toggle_on(page, web_base_url):
 def test_chat_welcome_examples_are_concrete_and_load_only_into_input(page, web_base_url):
     """ウェルカム画面の質問例チップは、編集前提のテンプレ文（「【質問内容に置き換えて】」等）を
     含まない、そのまま送信して意味が通る文言・順序で固定されている（web/chat/state.js の
-    EXAMPLES と一致＝回帰ピン）。アイコンは送信を示す記号ではなく、クリックの実際の挙動どおり
-    入力欄に読み込むだけで自動送信しない（POST /chat/turns は起きない）。4チップすべてで確認する。"""
+    DEFAULT_EXAMPLES と一致＝回帰ピン）。管理者設定 `chat_examples` が未設定（`GET /settings` の
+    `chat_examples` が None・既定の mock 応答＝`mock_api.SETTINGS_RESP`）のときは、フロントの
+    組み込み既定（この4例）がそのまま使われる契約も兼ねて確認する。アイコンは送信を示す記号では
+    なく、クリックの実際の挙動どおり入力欄に読み込むだけで自動送信しない
+    （POST /chat/turns は起きない）。4チップすべてで確認する。"""
     from playwright.sync_api import expect
 
     expected_examples = [
@@ -1721,6 +1724,39 @@ def test_chat_welcome_examples_are_concrete_and_load_only_into_input(page, web_b
         expect(page.locator("#input")).to_have_value(expected_text)
         assert records["turn_starts"] == [], f"チップ{i}のクリックだけで送信されている（読み込みのみのはず）"
         expect(page.locator(".msg.user")).to_have_count(0)
+
+
+def test_chat_welcome_examples_use_admin_configured_content_when_set(page, web_base_url):
+    """管理者設定 `chat_examples`（`GET /settings` の同名フィールド）が配列で返ると、組み込み既定
+    ではなくその内容へ差し替わる（`web/chat/menus.js::loadConfig` の後追い反映・
+    `web/chat/render.js::refreshWelcomeExamples`）。件数・文言・クリック時の入力欄反映まで確認する。"""
+    from playwright.sync_api import expect
+
+    custom_examples = ["在庫の締め処理はどうなっていますか？", "月次バッチの流れを教えてください。"]
+    settings = {**mock_api.SETTINGS_RESP, "chat_examples": custom_examples}
+    install_api_mocks(page, settings=settings)
+    page.goto(f"{web_base_url}/chat.html")
+
+    chips = page.locator(".example")
+    expect(chips).to_have_count(len(custom_examples))
+    expect(chips.locator(".exq")).to_have_text(custom_examples)
+
+    chips.nth(0).click()
+    expect(page.locator("#input")).to_have_value(custom_examples[0])
+
+
+def test_chat_welcome_examples_hidden_when_admin_disabled(page, web_base_url):
+    """管理者設定 `chat_examples` が空配列（`enabled=false`、または明示的に空の `items`）で返ると、
+    質問例ブロック自体が表示されない（組み込み既定へのフォールバックはしない＝非表示の意図を尊重する）。
+    ウェルカム画面の他の案内（ようこそ見出し）は影響を受けない。"""
+    from playwright.sync_api import expect
+
+    settings = {**mock_api.SETTINGS_RESP, "chat_examples": []}
+    install_api_mocks(page, settings=settings)
+    page.goto(f"{web_base_url}/chat.html")
+
+    expect(page.locator(".example")).to_have_count(0)
+    expect(page.locator(".headline")).to_contain_text("ようこそ Sherpa へ")
 
 
 _EV0_ANSWER = {

@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, StrictBool
 
-from sherpa import agent_constructs, keys, llm, model_catalog, search_helper, store
+from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, search_helper, store
 # RV MED（N1・2026-07-16 Codex RV 3巡目再検証）: `_bedrock_key_fingerprint` は `sherpa/store/settings.py`
 # へ移設した（`add_bedrock_verified_models` が同一トランザクション内で使う必要があるため）。ここでは
 # store facade から re-export する（`sherpa.routers.system._bedrock_key_fingerprint`／
@@ -315,7 +315,11 @@ def _public_settings(s: dict) -> dict:
             # 再往復無しで追従するため・`web/settings.js::_resyncModelChoicesForProvider` 参照）。
             "model_catalog_by_provider": _model_choice_table_by_provider(sys_s),
             # 個人の Ollama 接続先は許可ホスト一覧から選ぶ（許可ホスト一覧＋中央既定・full URL 保持）。
-            "ollama_url_choice": _ollama_url_choice(s, system_settings=sys_s)}
+            "ollama_url_choice": _ollama_url_choice(s, system_settings=sys_s),
+            # チャット画面のクイック入力例（管理者設定・`sherpa/chat_examples.py`）。
+            # None＝未設定（フロントの組み込み既定を使う）。配列（空含む）＝管理者が明示設定済み
+            # （空配列＝非表示）。
+            "chat_examples": chat_examples.public_examples(sys_s)}
 
 
 @settings_router.get("/config", tags=["設定"], response_model=ConfigResponse)

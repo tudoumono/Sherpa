@@ -320,6 +320,34 @@
             <div class="hint">頭脳が Codex のときだけ効きます。他の AI には推論レベルの指定自体がありません。</div>
           </div>
         </div>
+
+        <!-- チャット画面のクイック入力例（ウェルカム画面のチップ・sherpa/chat_examples.py）。
+             導入先ごとに例文を差し替えられるようにする（既定は組み込みの4例）。 -->
+        <div class="card sec" id="chat-examples-card">
+          <div class="card-head"><span class="title">チャットの質問例（クイック入力）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">チャット画面を開いたときに表示される、クリックで入力欄に読み込める質問例です。
+              空欄のままなら組み込みの既定（4例）が使われます。</div>
+
+            <label class="armrow">
+              <input type="checkbox" id="chat-examples-enabled" checked>
+              <span><span class="arm-t">質問例を表示する</span>
+                <div class="arm-d">オフにすると、下欄の内容にかかわらず質問例のブロック自体を表示しません。</div></span>
+            </label>
+
+            <label class="vlm-field" style="margin-top:10px">
+              <span class="vlm-l">質問例（1行に1つ・最大8件・各200文字まで）</span>
+              <textarea id="chat-examples-items" rows="4"
+                        placeholder="例: 消費税率を変更すると、影響がありそうな箇所を教えてください。"></textarea>
+            </label>
+            <div class="hint" id="chat-examples-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
+
+            <div class="sec-actions">
+              <button class="btn-ghost" id="chat-examples-reset" type="button">未設定に戻す（組み込みの既定を使う）</button>
+              <span class="tres muted" id="chat-examples-reset-res"></span>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- ===== タブ2: 使えるモデル ===== -->
