@@ -45,14 +45,11 @@ def test_admin_settings_renders_and_saves(page, web_base_url):
 
     # 取り込みアーム（既知4つ・tesseract 直の ocr は撤去済み 2026-07-08）が平文説明つきで描画される。
     arms = page.locator("#arms-list input[type=checkbox]")
-    expect(arms).to_have_count(4)
+    expect(arms).to_have_count(3)
     expect(page.locator("#arms-list")).to_contain_text("Office 文書から直接読み取り")
     expect(page.locator("#arms-list")).to_contain_text("PDF の文字を抽出")
-    expect(page.locator("#arms-list")).to_contain_text("文書を広く読み取り")                  # markitdown（汎用化・照合）
-    expect(page.locator("#arms-list")).to_contain_text("画像・スキャン文書を AI が見て読み取り")  # markitdown_ocr（視覚読み取り）
-    # pypdf・markitdown[all] は同梱既定（2026-07-08）＝available=true・選べる（未導入案内は出ない）。
-    expect(page.locator("#arms-list input[data-arm='markitdown']")).to_be_enabled()
-    expect(page.locator("#arms-list input[data-arm='markitdown_ocr']")).to_be_enabled()
+    expect(page.locator("#arms-list")).to_contain_text("画像・スキャン文書を AI が見て読み取り")  # vision（視覚読み取り）
+    expect(page.locator("#arms-list input[data-arm='vision']")).to_be_enabled()
     # Med2: 未設定（configured=None）＝「既定に従っています」の平文ヒント。
     expect(page.locator("#arms-status")).to_contain_text("既定")
 

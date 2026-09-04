@@ -932,8 +932,8 @@ SYSTEM_SETTINGS_VIEW = {
         "usages": ["chat", "intent", "embed", "route", "subsearch", "codex", "render"],
     },
     "arms": {
-        # known_arm_names() はソート済み（⑤ markitdown_ocr 追加・tesseract 直の ocr は撤去済み 2026-07-08＝4 本）。
-        "known": ["markitdown", "markitdown_ocr", "ooxml", "pdf_text"],
+        # known_arm_names() はソート済み（markitdown 系は 2026-08 撤去＝現行3本: ooxml/pdf_text/vision）。
+        "known": ["ooxml", "pdf_text", "vision"],
         "enabled": ["ooxml", "pdf_text"],
         "configured": None,
         "env_default": ["ooxml", "pdf_text"],
