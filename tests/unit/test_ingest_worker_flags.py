@@ -24,7 +24,7 @@ def _stub_pipeline(monkeypatch):
     happy path（ES/reconcile の flag 化）を検証できるようにする。あわせて pre-invalidate/確定の
     `store.set_world_sig` も DB 無しで記録だけするようスタブする（`tests/unit` は外部サービス不要）。
     """
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {"a": [1, 2, 3]}))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
                         lambda world, **_kw: {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}})

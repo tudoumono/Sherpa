@@ -31,7 +31,7 @@ from sherpa.ingest import world_neo4j, worker
 @pytest.fixture(autouse=True)
 def _stub_pipeline(monkeypatch):
     """`worker.run` を DB/Neo4j 無しで駆動できるよう周辺を差し替える（happy path 既定）。"""
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {"a": [1, 2, 3]}))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
                         lambda world, **_kw: {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}})
@@ -94,7 +94,7 @@ def _stub_pipeline(monkeypatch):
 
 def test_sig_none_fails_immediately_without_mutation(monkeypatch, _stub_pipeline):
     """(J) world 未解決＝ mutation 前に即 failed。set_world_sig は一度も呼ばれない。"""
-    monkeypatch.setattr(worker, "world_state", lambda world: (None, None))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: (None, None))
     build_calls = {"derived": 0, "graph": 0}
     monkeypatch.setattr(worker, "_build_derived",
                         lambda world, **_kw: build_calls.__setitem__("derived", build_calls["derived"] + 1))
@@ -251,7 +251,7 @@ def test_build_derived_error_then_next_sync_retries(monkeypatch, _stub_pipeline)
         return {"id": run_id, "status": status}
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig-B", {"a": [1, 2, 3]}))  # 原本はBへ更新済み
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig-B", {"a": [1, 2, 3]}))  # 原本はBへ更新済み
 
     build_derived_calls = []
 
@@ -300,7 +300,7 @@ def test_build_derived_publish_rename_failure_leaves_sig_unconfirmed_and_retries
         return {"id": run_id, "status": status}
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig-B", {"a": [1, 2, 3]}))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig-B", {"a": [1, 2, 3]}))
 
     build_derived_calls = []
 

@@ -240,7 +240,8 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                 "進捗の記録に失敗しました（取り込み自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
 
     _progress("scanning")
-    sig, manifest = world_state(world)
+    # 走査済み件数を逐次報告（総数は走査完了まで不明＝done のみ・UI 側は「N件確認済み」表示）。
+    sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
 
     nodes, edges, flags, rows = [], [], [], []              # 台帳行は派生MD（既に作成済）から確定（Office を含める）
 
@@ -572,8 +573,15 @@ def rerun(world, **kw) -> dict:
     return run(world, **kw)
 
 
-def _scan_dir(wd) -> list:
-    """wd 配下の対象ファイルを `(rel, mtime_ns, ctime_ns, size)` のソート済みリストで返す（stat のみ・中身は読まない＝軽い）。"""
+_SCAN_PROGRESS_INTERVAL = 500   # 走査進捗の報告間隔（ファイル数。SMB 越しの1万ファイル級で「無音の走査段」を無くす）
+
+
+def _scan_dir(wd, progress=None) -> list:
+    """wd 配下の対象ファイルを `(rel, mtime_ns, ctime_ns, size)` のソート済みリストで返す（stat のみ・中身は読まない＝軽い）。
+
+    `progress`（省略可・`Callable[[int], None]`）: 走査済みファイル数を `_SCAN_PROGRESS_INTERVAL`
+    件ごと＋最後に1回報告する（総数は走査が終わるまで不明＝件数のみ。実環境フィードバック
+    2026-09-04「走査段が無音で止まって見える」への対処）。"""
     parts = []
     for rp, rel in scope_infer.safe_files(wd):
         try:
@@ -581,6 +589,10 @@ def _scan_dir(wd) -> list:
             parts.append((rel, st.st_mtime_ns, st.st_ctime_ns, st.st_size))   # ctime も（粗い mtime 対策・RV Med#4）
         except OSError:
             parts.append((rel, None, None, None))
+        if progress is not None and len(parts) % _SCAN_PROGRESS_INTERVAL == 0:
+            progress(len(parts))
+    if progress is not None:
+        progress(len(parts))
     parts.sort()
     return parts
 
@@ -620,12 +632,13 @@ def world_signature(world) -> str | None:
     return world_signature_of_root(wd) if wd else None
 
 
-def world_state(world):
-    """`(署名, ファイル明細)` を**1スキャン**で返す（取り込み時に両方を保存する用）。world 不在は `(None, None)`。"""
+def world_state(world, progress=None):
+    """`(署名, ファイル明細)` を**1スキャン**で返す（取り込み時に両方を保存する用）。world 不在は `(None, None)`。
+    `progress` は `_scan_dir` へそのまま転送（走査済み件数の報告・省略可）。"""
     wd = worlds.world_dir(world)
     if not wd:
         return None, None
-    parts = _scan_dir(wd)
+    parts = _scan_dir(wd, progress=progress)
     return _sig(parts), _manifest(parts)
 
 

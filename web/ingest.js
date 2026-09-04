@@ -255,7 +255,9 @@ function ingestDetailHtml(wid, s) {
 function progressNote(s) {
   const p = s && s.running_progress;
   if (!p) return '';
-  const counts = (p.done != null && p.total != null) ? `（${esc(p.done)}/${esc(p.total)}）` : '';
+  // total 不明の段（走査中）は件数のみ「N件確認済み」表示（実環境フィードバック 2026-09-04）。
+  const counts = (p.done != null && p.total != null) ? `（${esc(p.done)}/${esc(p.total)}）`
+    : (p.done != null ? `（${esc(p.done)}件確認済み）` : '');
   return `<div class="muted" style="margin-top:3px"><span class="loading-inline" role="status">`
     + `<span class="spinner spinner-sm"></span><span>${esc(p.stage_label)}${counts}</span></span></div>`;
 }

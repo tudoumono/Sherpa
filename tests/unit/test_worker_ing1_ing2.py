@@ -84,7 +84,7 @@ def _stub_pipeline(monkeypatch):
     `store.set_world_sig` を実際に検証したいので**差し替えず呼び出しを記録するだけ**にする
     （他の DB/Neo4j/ES 呼び出しは従来どおりスタブして DB 不要を保つ）。
     """
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {"a": [1, 2, 3]}))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
                         lambda world, **_kw: {"converted": 1, "failed": 0, "unsupported": 0, "by_ext": {}})
@@ -138,7 +138,7 @@ def test_run_locked_success_folds_scan_report_into_sig_confirm(monkeypatch, _stu
 
 def test_run_locked_failure_before_success_does_not_compute_scan_report(monkeypatch, _stub_pipeline):
     """world 未解決（sig=None）で即 failed の経路は scan_report の計算にすら触れない。"""
-    monkeypatch.setattr(worker, "world_state", lambda world: (None, None))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: (None, None))
     res = worker.run("w")
     assert res["status"] == "failed"
     assert _stub_pipeline["scan_report"] == []
@@ -291,3 +291,21 @@ def test_ingest_summary_db_failure_propagates_not_zeroes(monkeypatch):
     row = {"last_scan_report": None, "last_scan_report_at": None}
     with pytest.raises(RuntimeError, match="db down"):
         worlds_router._ingest_summary("w", row)
+
+
+def test_scan_dir_reports_progress_counts(tmp_path):
+    """走査段の件数進捗（2026-09-04・実環境「走査段が無音」対応）: `_scan_dir(progress=...)` が
+    `_SCAN_PROGRESS_INTERVAL` 件ごと＋最後に走査済み件数を単調増加で報告する。"""
+    from sherpa.ingest import worker
+    for i in range(7):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+    calls = []
+    monkey_interval = 3
+    orig = worker._SCAN_PROGRESS_INTERVAL
+    worker._SCAN_PROGRESS_INTERVAL = monkey_interval
+    try:
+        parts = worker._scan_dir(tmp_path, progress=calls.append)
+    finally:
+        worker._SCAN_PROGRESS_INTERVAL = orig
+    assert len(parts) == 7
+    assert calls == [3, 6, 7]
