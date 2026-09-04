@@ -1,5 +1,7 @@
 # Sherpa
 
+<p align="center"><img src="assets/logo-banner.png" alt="Sherpa — AI knowledge search across documents and code" width="420"></p>
+
 Sherpa は、社内の設計書・仕様書・Office 資料・COBOL/JCL/コピーブックといった業務ドキュメントを対象に、
 **チャットで検索・影響範囲の調査・トラブルシュートができる Agentic RAG 基盤**です。
 資料フォルダを登録すると、全文検索とナレッジグラフが構築され、根拠（出典）つきの回答が返ります。
