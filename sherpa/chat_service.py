@@ -32,7 +32,12 @@ from .chat_router import route as _heuristic_route
 from .chat_router import wants_confirm_first as _wants_confirm_first
 from .impact_service import IMPACT_MAX_DEPTH, IMPACT_MAX_DEPTH_ABS_MAX, run_impact
 from .ingest.analyzers import registry as _analyzer_registry
-from .ingest.world_neo4j import GRAPH_OVERLOAD_USER_MESSAGE, GraphQueryOverloadError
+from .ingest.world_neo4j import (
+    GRAPH_OVERLOAD_USER_MESSAGE,
+    GRAPH_SCHEMA_ERA_USER_MESSAGE,
+    GraphQueryOverloadError,
+    GraphSchemaEraError,
+)
 from .lens_service import (
     TROUBLESHOOT_GRAPH_DEPTH,
     TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX,
@@ -558,7 +563,19 @@ def _sources(docs, world) -> list:
     # I2: world 全体を1回だけ解決し（`resolve_many`）、対象の doc だけ引く（`_src_url` へ渡す）。
     # 未登録 world（`worlds.world_dir` が None）は解決しない＝従来どおり2キーのまま。
     wd = worlds.world_dir(world)
-    res_map = importance.resolve_many(world, filtered, root=wd) if wd else {}
+    sig = None
+    # RV是正（rv-i2-importance #3・2026-09）: `sig` 省略時 `resolve_for_world` は
+    # `worker.world_signature_of_root(wd)` で world 全体をもう一度全木走査する（`grep_tool` と
+    # 同じ理由・§該当箇所参照）。出典（この関数）は1チャット応答につき1回だけの呼び出しだが、
+    # registry の `last_sig`（狭い1行 SELECT・`store.get_world_status_row`）を渡せば同じだけ省ける。
+    # 取得できなくても fail-closed にはせず自前計算へフォールバックする。
+    if wd:
+        try:
+            row = store.get_world_status_row(world)
+            sig = (row or {}).get("last_sig") or None
+        except Exception:
+            sig = None
+    res_map = importance.resolve_many(world, filtered, root=wd, sig=sig) if wd else {}
     return [_src_url(d, world, res_map.get(d)) for d in filtered]
 
 
@@ -1008,29 +1025,53 @@ def _impact_overload_result(message: str, world: str, scope_meta: dict | None) -
     という偽陰性の文言を生成し得るため、ここで完結させる（events/get_provider の外側の骨組みが
     そのまま保存・監査できる `_result` 形＝正常系と同じ形で返す）。
     """
-    sm = layer_mod.scope_with_layer(scope_meta, world=world, lens="impact")
-    env = {"lens": "impact", "headline": GRAPH_OVERLOAD_USER_MESSAGE, "summary": {"total": 0},
+    return _fixed_lens_result("impact", GRAPH_OVERLOAD_USER_MESSAGE, "Neo4j 安全弁（timeout/緊急天井）",
+                              message, world, scope_meta)
+
+
+# rv-s3-removal（Codex RV HIGH）: `GraphQueryOverloadError` と同じ理由（LLM 合成を経由させず固定
+# 文言で終端）で `GraphSchemaEraError` も扱う。ただし**発生元は impact に限らない**——
+# `world_impact`/`resolve_world_entity`（impact レンズ・直接 dispatch）に加え、`lens_service.
+# neo4j_related`（troubleshoot レンズ・直接 dispatch、または agentic ツール `graph_neighbors`
+# 経由）からも上がり得るため、`GraphSchemaEraError.lens`（判明していれば "impact"/"troubleshoot"）
+# を見てエンベロープの lens を決める（不明＝agentic 経路等は "impact" にフォールバック——新規の
+# レンズ追跡機構は作らない＝縮小形の方針）。
+def _fixed_lens_result(lens: str, headline: str, reason: str, message: str, world: str,
+                       scope_meta: dict | None) -> dict:
+    """固定文言のエンベロープ（LLM合成なし・`lens` 汎化版）。`_impact_overload_result`/
+    `_degrade_overload` が共有する（`_result` 形＝正常系と同じ形で返す）。
+    """
+    sm = layer_mod.scope_with_layer(scope_meta, world=world, lens=lens)
+    env = {"lens": lens, "headline": headline, "summary": {"total": 0},
            "data": {}, "sources": [], "scope": sm,
-           "route": {"lens": "impact", "reason": "Neo4j 安全弁（timeout/緊急天井）",
-                     "path": _ROUTE_PATH.get("impact", [])}}
-    decision = {"lens": "impact", "input": message, "reason": "Neo4j 安全弁（timeout/緊急天井）"}
+           "route": {"lens": lens, "reason": reason, "path": _ROUTE_PATH.get(lens, [])}}
+    decision = {"lens": lens, "input": message, "reason": reason}
     return {"env": env, "decision": decision}
 
 
 def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None):
-    """provider.run() のイテレーション中に `GraphQueryOverloadError` が飛んだら、固定文言の
-    `_result` イベントへ差し替えて終端する（handle_message/stream_message の共通ラッパー）。
+    """provider.run() のイテレーション中に `GraphQueryOverloadError`／`GraphSchemaEraError` が
+    飛んだら、固定文言の `_result` イベントへ差し替えて終端する（handle_message/stream_message の
+    共通ラッパー）。
 
-    例外は `providers/base.py::_gather` 内の `ctx.dispatch(...)`（＝ここでの `_dispatch` の impact
-    分岐）から上がる。`_GenProvider.run`/`HeuristicProvider.run` いずれも `_gather` の呼び出しを
-    ラップしていない（`_env` を受け取る前に例外が伝播する）ため、ここで捕まえた時点で以降の
-    LLM 事実合成（`_answer_prompt`・`_facts`）は一度も実行されていない＝偽陰性の温床を断てる。
+    例外は `providers/base.py::_gather` 内の `ctx.dispatch(...)`（＝ここでの `_dispatch` の impact/
+    troubleshoot 分岐、または agentic ツール `graph_neighbors` の実行）から上がる。
+    `_GenProvider.run`/`HeuristicProvider.run` いずれも `_gather` の呼び出しをラップしていない
+    （`_env` を受け取る前に例外が伝播する）ため、ここで捕まえた時点で以降の LLM 事実合成
+    （`_answer_prompt`・`_facts`）は一度も実行されていない＝偽陰性の温床を断てる。
     """
     try:
         yield from gen
     except GraphQueryOverloadError as e:
         _log.warning("impact 経路が Neo4j 安全弁で縮退（fail-loud・reason=%s・world=%s）", e.reason, world)
         yield {"type": "_result", **_impact_overload_result(message, world, scope_meta)}
+    except GraphSchemaEraError as e:
+        lens = e.lens or "impact"
+        _log.warning("グラフ読み取りがスキーマ世代不一致で縮退（fail-loud・lens=%s・world=%s・stored=%s）",
+                    lens, world, e.stored_era)
+        yield {"type": "_result", **_fixed_lens_result(
+            lens, GRAPH_SCHEMA_ERA_USER_MESSAGE, "グラフのスキーマ世代不一致（再取り込みが必要）",
+            message, world, scope_meta)}
 
 
 def _clip_history_msg(text: str) -> str:

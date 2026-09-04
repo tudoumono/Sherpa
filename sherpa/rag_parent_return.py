@@ -219,13 +219,19 @@ def resolve_parent_return(world: str, rag_groups: dict, budget_for_rag: int) -> 
 
 
 def apply_to_hits(world: str, hits: list) -> list:
-    """ES ヒット list（`es_index.search`/`search_knn_only` の戻り値）へ親返しを適用する。
+    """ES ヒット list（`es_index.search`/`search_knn_only` の戻り値・スコア降順）へ親返しを適用する。
 
     `chunk_id` を持つヒット（rag チャンク由来）だけを doc_id で束ね、`resolve_parent_return` に通す。
     1 doc につき1エントリへ集約する（複数チャンクのヒットは代表1件＝最高スコアのヒットへ、`text`/
     `tier` だけを差し替えて統合する——locator/section_path 等の他フィールドは代表ヒットのものを保つ）。
     `chunk_id` を持たないヒット（legacy 40行チャンク由来）はそのまま素通し。無効化時・対象ヒットが
     無いときは無変更のまま返す。
+
+    **順位保持**（RV是正・rv-i2-importance #6・2026-09）: 集約結果は入力 `hits` の**代表ヒットが
+    元々あった位置**へ差し戻す——旧実装は非rag ヒットを先頭へまとめて連結し、集約済み rag 文書を
+    末尾へ追加していたため、rag 文書のスコアが非rag ヒットより高くても常に後方へ表示されてしまう
+    （検索結果全体のスコア降順という契約を後処理が壊していた）。同じ doc の代表以外のメンバー
+    ヒットは、代表の位置で1エントリへ統合済みのため出力しない（吸収）。
 
     `search_service.py`/`chat_service.py` の両方から呼ばれる共有部品（重複実装しない）。
     """
@@ -234,7 +240,6 @@ def apply_to_hits(world: str, hits: list) -> list:
     rag_hits = [h for h in hits if h.get("chunk_id")]
     if not rag_hits:
         return hits
-    other_hits = [h for h in hits if not h.get("chunk_id")]
     by_doc: dict[str, list] = {}
     for h in rag_hits:
         by_doc.setdefault(h["doc_id"], []).append(h)
@@ -244,9 +249,18 @@ def apply_to_hits(world: str, hits: list) -> list:
         for doc, items in by_doc.items()
     }
     resolved = resolve_parent_return(world, groups, excerpt_budget_bytes())
-    out = list(other_hits)
-    for r in resolved:
-        items = by_doc[r["doc_id"]]
-        rep = max(items, key=lambda h: float(h.get("score") or 0))   # 代表ヒット（最高スコア）
-        out.append({**rep, "text": r["text"], "tier": r["tier"]})
+    resolved_by_doc = {r["doc_id"]: r for r in resolved}
+    # 各 doc の代表ヒット（最高スコア・同点は最初に出現した方＝`hits` は既にスコア降順のため
+    # 先に出現した方が優先されるべき）の identity を記録し、その入力上の位置だけへ集約結果を書き戻す。
+    rep_id_by_doc = {doc: id(max(items, key=lambda h: float(h.get("score") or 0)))
+                     for doc, items in by_doc.items()}
+    out = []
+    for h in hits:
+        doc_id = h.get("doc_id")
+        if h.get("chunk_id") and doc_id in resolved_by_doc:
+            if id(h) == rep_id_by_doc[doc_id]:
+                r = resolved_by_doc[doc_id]
+                out.append({**h, "text": r["text"], "tier": r["tier"]})
+            continue                                     # 非代表メンバーは代表への統合済み＝出力しない
+        out.append(h)
     return out

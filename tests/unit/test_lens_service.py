@@ -37,11 +37,13 @@ class _FakeRecord:
 
 
 class _FakeResult:
-    """`neo4j.Result` の最小スタブ（for 反復のみ使う・`.data()` 一括展開はしない）。
+    """`neo4j.Result` の最小スタブ（for 反復が主・`check_schema_era`（rv-s3-removal）向けに
+    `.data()` 一括展開も持つ）。
 
     `consumed`（HIGH-1・secRV 範囲外是正 追補・2026-07-19）: `consume()` 呼び出しを記録する。
     driver 6.2.0 は未消費 Result を残したまま同一 session で次の `session.run()` を呼ぶと、前の
     Result の残りを全件 fetch/buffer してしまうため、天井 break 後は必ず `consume()` される想定。
+    `.data()` も実 driver と同じく「残りを一括取得＝実質フルに消費する」ため consumed を立てる。
     """
 
     def __init__(self, rows):
@@ -53,6 +55,10 @@ class _FakeResult:
 
     def consume(self):
         self.consumed = True
+
+    def data(self):
+        self.consumed = True
+        return [dict(r) for r in self._rows]
 
 
 class _FakeSession:

@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -37,7 +38,38 @@ WORLD_CONSTRAINTS = [
     "CREATE CONSTRAINT canon IF NOT EXISTS FOR (n:Entity) REQUIRE n.canonical_id IS UNIQUE",
     "CREATE INDEX ent_world IF NOT EXISTS FOR (n:Entity) ON (n.world_id)",
     "CREATE INDEX ent_name IF NOT EXISTS FOR (n:Entity) ON (n.name)",
+    # rv-s3-removal: world ごとのスキーマ世代スタンプ（`GRAPH_SCHEMA_ERA`）を持つメタノード。
+    # `:Entity` とは別ラベルのため `load_world`/`delete_world` の `DETACH DELETE (n:Entity ...)` の
+    # 対象に入らない（明示的に別途 MERGE/DELETE する）。
+    "CREATE CONSTRAINT sherpa_meta_world IF NOT EXISTS FOR (m:SherpaMeta) REQUIRE m.world_id IS UNIQUE",
 ]
+
+
+def _compute_graph_schema_era() -> str:
+    """`GRAPH_SCHEMA_ERA` の合成（sha256 先頭12桁・決定的・rv-s3-removal）。
+
+    材料: コードアナライザの分類契約版（`analyzers.registry.CODE_ANALYZERS_SCHEMA_VERSION`）・
+    言及エッジ突合の仕様版（`world_graph.MENTION_SCHEMA_VERSION`）・グラフ語彙
+    （`model.NODE_LABELS`/`EDGE_TYPES` のソート済みタプル）。いずれかが変われば合成値も変わる。
+
+    **`ingest.worker._sig`（last_sig・ファイル走査込みの内容署名）とは別物**——last_sig は原本の
+    追加・変更のたびに動く「次回 sync で再取り込みが必要（鏡モデルの正常運転）」の署名で、
+    こちらはコード側のグラフ内部形式そのものが変わったときだけ動く「**保存済みグラフを
+    そのまま読んでよい前提が崩れた**」署名（Codex 案の「last_sig 不一致で 503」は不採用・
+    原本変更〜次 sync の署名差は正常運転のため）。
+
+    循環 import 回避のため、材料モジュール（`world_graph`/`analyzers.registry`）は本関数の中で
+    遅延 import する（本モジュールを読み込む側から見て、これらは下位層のため実際には循環しない
+    が、この慣例に揃える）。呼び出しは module import 時に一度だけ（`GRAPH_SCHEMA_ERA` 定義）。
+    """
+    from .analyzers.registry import CODE_ANALYZERS_SCHEMA_VERSION
+    from .world_graph import MENTION_SCHEMA_VERSION
+    material = repr((CODE_ANALYZERS_SCHEMA_VERSION, MENTION_SCHEMA_VERSION,
+                     tuple(sorted(NODE_LABELS)), tuple(sorted(EDGE_TYPES))))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+GRAPH_SCHEMA_ERA = _compute_graph_schema_era()
 
 # 検索スコープ（フォルダ prefix）述語。`$prefixes` 空＝全体。
 # S3（K9-K11）以降、ノードは全てファイル由来（コード＝Pass1/Pass2・Document＝Pass3 言及元）で
@@ -81,6 +113,75 @@ class GraphQueryOverloadError(RuntimeError):
 GRAPH_OVERLOAD_USER_MESSAGE = (
     "対象が大きすぎるか、グラフ検索が時間内に終わりませんでした。範囲（フォルダ）を絞って再実行してください。"
 )
+
+
+# rv-s3-removal（Codex RV HIGH・縮小形）: K13 語彙撤去後に**再構築前の旧 Neo4j グラフ**を読むと、
+# 「旧 LLM 由来エッジの混入」や「もっともらしい影響なし」を正常応答として返してしまう。
+# 「last_sig 不一致で 503」（Codex 案）は不採用——鏡モデルでは原本変更〜次 sync の署名差は
+# 正常運転（最後に取り込んだ状態で答えるのが契約）。代わりに、グラフを構築した時の
+# スキーマ世代（`GRAPH_SCHEMA_ERA`）を Neo4j 側へ保存し（`load_world`）、現行コードの世代と
+# 異なる場合**だけ**（＝コード側のグラフ内部形式が変わったのに再取り込みが済んでいない場合だけ）
+# 読み取りを明示エラーにする。
+class GraphSchemaEraError(RuntimeError):
+    """保存済み world グラフのスキーマ世代が現行コードと不一致（＝旧世代の実データを読んでいる）。
+
+    `world`＝対象 world_id。`stored_era`＝グラフに保存されていた世代（`None`＝世代スタンプ自体が
+    無い＝`load_world` が現行コード以前に作った旧世代のグラフ）。`lens`（省略可）＝分かっている
+    範囲でのチャットレンズ名（"impact"/"troubleshoot"・呼び出し元が分かる場合のみ添える・
+    `check_schema_era` 参照）。`GraphQueryOverloadError` と同じ fail-loud 契約——呼び出し側は
+    空/部分結果へ握り潰さず、ユーザーへ「再取り込みが必要」の明示エラーとして可視化すること。
+    """
+
+    def __init__(self, world: str, stored_era: str | None, *, lens: str | None = None):
+        self.world = world
+        self.stored_era = stored_era
+        self.lens = lens
+        super().__init__(
+            f"graph schema era mismatch: world={world} stored={stored_era!r} current={GRAPH_SCHEMA_ERA!r}")
+
+
+# ユーザー向け平文メッセージ（専門用語ゼロ・docs/04-画面の原則.md §5/§6）。GRAPH_OVERLOAD_USER_MESSAGE
+# と同じく呼び出し側（routers/impact.py・routers/graph.py の 503・chat_service のチャット縮退）が共有する。
+GRAPH_SCHEMA_ERA_USER_MESSAGE = (
+    "この資料フォルダは再取り込みが必要です（内部形式が更新されました）。管理者にご連絡ください。"
+)
+
+
+def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
+    """world の保存済みスキーマ世代を確認する（fail-loud・rv-s3-removal）。
+
+    グラフに実データ（`world_id` を持つ `:Entity`）が無い world は対象外——ゲートは
+    「**旧世代の実データがある**」場合だけ発動し、未投入 world の既存の空応答/既存エラーは
+    変えない。実データがあり、かつ保存世代（`:SherpaMeta{world_id}.schema_era`）が現行
+    `GRAPH_SCHEMA_ERA` と不一致（未保存＝スタンプの無い旧世代グラフも含む）なら
+    `GraphSchemaEraError` を raise する。
+
+    グラフ読み取りの入口（`world_impact`/`resolve_world_entity`/`lens_service.neo4j_related`/
+    `graph_admin.graph_search`）がそれぞれ1回呼ぶ——per-query の追加ラウンドトリップにはなるが
+    1クエリで完結させており（count と meta を同一クエリで取得）、20人規模の運用では
+    最適化不要（過剰最適化しない・タスク前提）。呼び出し位置は各関数の**主クエリの後**（本関数自体は
+    `GraphQueryOverloadError` を扱わない・下記参照）。
+
+    世代プローブ自体が失敗（timeout/接続断等の `Neo4jError`）した場合はゲートを発動せず黙って戻る
+    ——それは Neo4j 側の別の問題で、呼び出し元の主クエリが既に fail-loud（`_run_read_capped`）か
+    縮退（`lens_service._run_capped`）のどちらかで扱っている。ここで新しい失敗モードを増やさない。
+    """
+    try:
+        rows = session.run(
+            "OPTIONAL MATCH (n:Entity {world_id:$w}) "
+            "WITH count(n) AS c "
+            "OPTIONAL MATCH (m:SherpaMeta {world_id:$w}) "
+            "RETURN c, m.schema_era AS era",
+            w=world,
+        ).data()
+    except Neo4jError:
+        return
+    row = rows[0] if rows else None
+    if not row or not row.get("c"):
+        return
+    era = row.get("era")
+    if era != GRAPH_SCHEMA_ERA:
+        raise GraphSchemaEraError(world, era, lens=lens)
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -228,6 +329,11 @@ def load_world(nodes, edges, world_id, uri, user, password):
     削除と再ロードを同一 tx にして、途中失敗で live グラフを空/部分にしない（neo4j_load.reload と同方針・RV High）。
     schema コマンドはデータ tx と混ぜられないので先に流す。
 
+    rv-s3-removal: 同じ tx の最後に `GRAPH_SCHEMA_ERA`（`:SherpaMeta{world_id}.schema_era`）を
+    刻む——グラフを構築した時のスキーマ世代を保存し、読み取り側（`check_schema_era`）が現行
+    コードの世代と比較できるようにする（旧世代のまま再取り込みされていない world を fail-loud
+    で検知するため）。
+
     GRAPH-MEM（2026-09-04）: ノード/エッジの投入は `_NEO4J_BATCH_ROWS` 件ずつの **UNWIND バッチ**へ
     分割して送る（ラベル/エッジ型は Cypher に直埋め＝1バッチ=1ラベル or 1エッジ型・許容語彙は事前検証済み）。
     **原子性は変えない**——バッチはすべて同一の明示 write tx（`s.execute_write(_apply)`）の中で送るので、
@@ -294,6 +400,11 @@ def load_world(nodes, edges, world_id, uri, user, password):
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_edge_row(e) for e in batch]
                         tx.run(edge_cypher, rows=rows, world=world_id)
+                # rv-s3-removal: このロードが作った world グラフのスキーマ世代を刻む
+                # （同一 tx＝rebuild と不可分。`:Entity` とは別ラベルなので上の DETACH DELETE の
+                # 対象に入らない——MERGE で世代を上書きするだけでよい）。
+                tx.run("MERGE (m:SherpaMeta {world_id:$w}) SET m.schema_era=$era",
+                      w=world_id, era=GRAPH_SCHEMA_ERA)
                 return len(nodes), len(edges)
             return s.execute_write(_apply)
     finally:
@@ -301,12 +412,21 @@ def load_world(nodes, edges, world_id, uri, user, password):
 
 
 def delete_world(world_id, uri, user, password) -> int:
-    """その world の全ノード（と接続辺）を削除（rebind/delete の wipe・`world_id` 単位）。"""
+    """その world の全ノード（と接続辺）を削除（rebind/delete の wipe・`world_id` 単位）。
+
+    `SherpaMeta`（スキーマ世代スタンプ・rv-s3-removal）も同じクエリで合わせて削除する——`:Entity`
+    とは別ラベルのため素の `MATCH (n:Entity ...)` の対象には入らず、放置すると同じ world_id を
+    後で再利用したとき古い世代スタンプが残る。戻り値は削除ノード総数（Entity＋あれば SherpaMeta
+    1件・呼び出し元は件数を厳密検証しない集計値としてのみ使う）。
+    """
     from neo4j import GraphDatabase
     driver = GraphDatabase.driver(uri, auth=(user, password))
     try:
         with driver.session() as s:
-            r = s.run("MATCH (n:Entity {world_id:$w}) DETACH DELETE n RETURN count(n) AS n", w=world_id)
+            r = s.run(
+                "MATCH (n) WHERE n.world_id=$w AND (n:Entity OR n:SherpaMeta) "
+                "DETACH DELETE n RETURN count(n) AS n",
+                w=world_id)
             return r.single()["n"]
     finally:
         driver.close()
@@ -333,7 +453,10 @@ def reconcile(valid_worlds, uri, user, password) -> list:
                 if wid in keep:
                     continue
                 try:
-                    s.run("MATCH (n:Entity {world_id:$w}) DETACH DELETE n", w=wid)
+                    # rv-s3-removal: `SherpaMeta`（スキーマ世代スタンプ）も同じクエリで一緒に消す
+                    # （`delete_world` と同じ理由・別ラベルなので `n:Entity` 単独の MATCH には入らない）。
+                    s.run("MATCH (n) WHERE n.world_id=$w AND (n:Entity OR n:SherpaMeta) "
+                         "DETACH DELETE n", w=wid)
                     deleted.append(wid)
                 except Exception:
                     pass
@@ -351,6 +474,10 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
     impact_service.resolve_entity の world 版。`scope_prefixes` で起点も範囲に絞る（範囲外の同名は起点にしない）。
     業務語→コードの橋渡し（旧 REALIZES）は撤去済み（K10）——業務語の入口はクエリ時のエージェントが
     文書を grep してコード名を発見する経路に委ねる（§2）。
+
+    rv-s3-removal: `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError`
+    で fail-loud）。主クエリの**後**に呼ぶ——主クエリ自体の安全弁（`_run_read_capped` の
+    timeout/緊急天井＝`GraphQueryOverloadError`）を先に効かせるため（結果を返す直前の最終ゲート）。
     """
     prefixes = list(scope_prefixes or [])
     rows = _run_read_capped(
@@ -361,6 +488,7 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
         "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, n.name AS name",
         world=world_id, w=world_id, name=term, incl=include_deprecated, prefixes=prefixes,
     )
+    check_schema_era(session, world_id, lens="impact")
     return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"]} for r in rows]
 
 
@@ -372,6 +500,9 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
     骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES）のみを辿る決定的な構造たどり——
     K12（2026-09-04-グラフのソース正典化.md §4）: 「確実/要確認」の二重クエリ・判定表示は
     機構ごと撤去（全件同格）。1本の Cypher で足りる（旧 all-static 判定クエリは撤去）。
+
+    rv-s3-removal: `check_schema_era` を呼ぶ（`resolve_world_entity` と同じゲート・呼び出し元が
+    別でも二重に守る）。`resolve_world_entity` と同じ理由で主クエリの**後**に呼ぶ。
     """
     # "world" キーは params に含めない＝ `_run_read_capped` の専用キーワード引数（world=world_id）から
     # `session.run` へ渡す（衝突回避・関数 docstring 参照）。
@@ -410,6 +541,7 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
             "trace": r["path_names"],                                 # なぜ影響するか（ノード名列）
             "evidence": [e for e in r["edges"] if e.get("doc")],      # 根拠(doc=rel_path/line)
         })
+    check_schema_era(session, world_id, lens="impact")
     _attach_importance(items, world_id)
     return items
 

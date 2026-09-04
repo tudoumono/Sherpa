@@ -833,6 +833,27 @@ def test_large_file_normal_lines_bounded_memory(tmp_path):
     assert peak < 2 * 1024 * 1024   # 20MB超のファイルに対しピーク割当は2MB未満（比例しない）
 
 
+def test_many_matches_in_single_file_bounded_memory_and_respects_max_hits(tmp_path):
+    """RV是正（rv-i2-importance #1・2026-09）: 1ファイルに大量の一致（`max_hits` を大きく超える件数）
+    があっても、ヒット発見〜top-K ヒープ供給までのピーク割当は `max_hits` に比例する程度で収まり、
+    ファイル内の一致総数には比例しない（旧 `file_hits`/世界規模の `seen` がヒット総数ぶん際限なく
+    肥大していた secRV 2026-07-19 型の攻撃面の是正）。`_重要度.txt` が無い world（`roots=` 明示指定）
+    なので、返るのは発見順の先頭 `max_hits` 件（既存の I2 契約と完全に同一）。"""
+    import tracemalloc
+    n = 200_000
+    _write(tmp_path, "many.txt", "NEEDLE\n" * n)
+
+    tracemalloc.start()
+    try:
+        hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=5)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert [h["line"] for h in hits] == [1, 2, 3, 4, 5]   # 発見順の先頭5件（旧早期打切りと同じ集合）
+    assert peak < 3 * 1024 * 1024   # 20万件の一致に対しピーク割当は3MB未満（max_hits に比例・一致数に非比例）
+
+
 def test_single_huge_line_bounded_memory(tmp_path, monkeypatch):
     """改行が来ないまま数十MB続く単一行（secRV MED-B 型の懸念）でも、Python 側のピーク割当は
     `_GREP_LINE_MAX_BYTES` で頭打ちになりファイルサイズに比例しない。"""

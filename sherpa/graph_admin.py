@@ -8,7 +8,7 @@ from __future__ import annotations
 from . import agent_constructs, agentic_search, llm, store
 from .impact_service import CATEGORY
 from .ingest.model import NODE_LABELS
-from .ingest.world_neo4j import WORLD_EDGE_TYPES, _scope_pred
+from .ingest.world_neo4j import WORLD_EDGE_TYPES, _scope_pred, check_schema_era
 from .preview_service import _TYPE_JA
 
 _COND_FIELDS = {
@@ -115,7 +115,11 @@ def _ret(prefix: str, var: str) -> str:
 def graph_search(session, world: str, relationship_types=None, field: str | None = None,
                  value: str | None = None, op: str = "eq", scope_paths=None,
                  include_deprecated: bool = False, limit: int = 200) -> dict:
-    """関係種別/属性条件で world グラフを検索し、可視化と同じ nodes/edges 形で返す。"""
+    """関係種別/属性条件で world グラフを検索し、可視化と同じ nodes/edges 形で返す。
+
+    rv-s3-removal: 主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
+    `GraphSchemaEraError`・呼び出し元 `routers/graph.py::graph_search` が 503 へ変換する）。
+    """
     rels = [str(r).strip().upper() for r in (relationship_types or []) if str(r).strip()]
     bad = [r for r in rels if r not in WORLD_EDGE_TYPES]
     if bad:
@@ -145,6 +149,7 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
             "ORDER BY edge_type, source_name, target_name LIMIT $limit"
         )
         rows = session.run(cy, **params).data()
+        check_schema_era(session, world)
         return _rows_to_graph(rows, world)
 
     cond_n = _condition("n", field, value, op)
@@ -165,6 +170,7 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
         "ORDER BY source_name, edge_type, target_name"
     )
     rows = session.run(cy, **params).data()
+    check_schema_era(session, world)
     return _rows_to_graph(rows, world)
 
 

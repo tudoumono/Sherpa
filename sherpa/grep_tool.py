@@ -107,6 +107,11 @@ _SCAN_CHUNK_BYTES = 64 * 1024
 # 呼び出し元から差し込める（省略時だけこの既定を使う）。
 _GREP_LINE_MAX_BYTES = _env_int("SHERPA_GREP_LINE_MAX_BYTES", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024)
 
+# RV是正（rv-i2-importance #1・2026-09）: 隣接ヒット窓の重複排除（`grep_search` 内 `seen`）に
+# 使う小さな有界窓。衝突が起こり得るのは常に直近の窓どうしだけ（`grep_search` 内コメント参照）
+# のため、ファイル内の全ヒット数に比例させる必要が無い——固定サイズの小さな `deque` で十分。
+_SEEN_RECENT_MAX = 16
+
 
 class _CappedStreamReader:
     """open 済みバイナリファイル `f` を bounded chunk で読み、`cap` バイトまでの行
@@ -350,7 +355,24 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
         # I2（2026-09-05）: ヒットの優先順位付け（`_offer` 参照）用に world の重要度を1回だけ解決する
         # （`_重要度.txt` が無い world は空 dict＝以下のヒープ処理が rank 均一のまま完全にno-op化する）。
         if wd:
-            imp_map = importance.resolve_for_world(world, root=wd)
+            # RV是正（rv-i2-importance #3・2026-09）: `sig` を渡さないと `resolve_for_world` は
+            # `worker.world_signature_of_root(wd)` で world 全体をもう一度全木走査してキャッシュ
+            # キー用の署名を作ってしまう（`_read_all_control_contents` 自身の走査とは別の、もう1回の
+            # 走査）。grep は1回のチャット往復（agentic ループ）で何度も呼ばれうるため、この二重
+            # 走査コストを毎回払うのは無駄——registry の `last_sig`（狭い1行 SELECT・
+            # `store.get_world_status_row` 参照・`last_manifest` を含まないため O(1)）を渡せば1回
+            # 省ける（`doc_ledger.preview_documents`/`preview_service.build_preview` と同じ流儀）。
+            # 取得できなくても（DB 不達・未登録 world 等）fail-closed にはせず `sig=None` のまま
+            # 従来どおり自前計算へフォールバックする（grep 自体は DB 不要で動く契約を壊さない・
+            # 空文字は渡さない＝`resolve_for_world` 側の署名キャッシュ契約を固定してしまわない）。
+            sig = None
+            try:
+                from . import store                     # 遅延 import（循環回避）
+                row = store.get_world_status_row(world)
+                sig = (row or {}).get("last_sig") or None
+            except Exception:
+                sig = None
+            imp_map = importance.resolve_for_world(world, root=wd, sig=sig)
     # ---- top-K（優先度つき）ヒット選抜（I2）----
     # 早期打切り（旧: ファイル内でヒット数到達時に break／ファイル境界でヒット数到達時に return）は
     # 撤去し、常に対象を全量走査する。ヒットは `_offer` を通じて上限 `max_hits` の有界ヒープへ
@@ -377,7 +399,6 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
         elif entry > heap[0]:
             heapq.heapreplace(heap, entry)
 
-    seen: set[tuple] = set()
     for root, is_derived in roots_spec:
         _check_deadline()
         if not root.is_dir():
@@ -480,7 +501,17 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 reader = _CappedStreamReader(f)
                 is_md = is_derived or ext in _MD_EXT
                 out_ext = Path(rel).suffix.lower()      # doc_id（元ファイル）の拡張子で表示
-                file_hits: list[dict] = []              # この1ファイル分（全量走査・§I2）
+                # RV是正（rv-i2-importance #1・2026-09）: `seen`（隣接ヒット窓の同一 span 重複排除）を
+                # ファイル内の全ヒット数に比例して肥大する `set` のまま持たない——1ファイルに
+                # マッチが大量にある病的ケース（secRV 2026-07-19 が対策した「共有フォルダに巨大
+                # テキストを置ける主体」と同種の攻撃面）では、この1ファイル内だけで `seen` が
+                # ヒット総数ぶん際限なく増える。重複が起こり得るのは常に**直近**の窓どうし
+                # （非MD: `pending` は「まだ2行分の確認猶予中」のヒットしか保持しない設計のため
+                # 定常時は高々2〜3件・MD: セクション境界は単調増加するため遠く離れた節どうしが
+                # 衝突することは無い）——`maxlen` 付き `deque` による小さな有界窓で十分に同じ
+                # 重複排除効果が得られる（`key in seen` は O(_SEEN_RECENT_MAX) の線形走査だが
+                # 窓が小さいため無視できるコスト）。
+                seen: deque = deque(maxlen=_SEEN_RECENT_MAX)
                 line_i = 0
                 if is_md:
                     section_start = 1
@@ -497,8 +528,14 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     key = (str(p), s, e)
                     if key in seen:
                         return
-                    seen.add(key)
-                    file_hits.append({
+                    seen.append(key)
+                    # RV是正（rv-i2-importance #1）: ファイル単位のバッファ（旧 `file_hits`）へ溜めず、
+                    # 見つけ次第すぐ世界全体の top-K ヒープへ供せる（`_offer` は既に有界＝高々
+                    # `max_hits` 件しか保持しない）。`file_truncated` の付与（この1ファイルの走査を
+                    # 終えるまで確定しない）は、ヒープに残っている（このファイル由来の）エントリを
+                    # 事後に見つけて付与する形にする（下の該当箇所参照・ヒープは有界なのでこの事後
+                    # 走査も高々 `max_hits` 件で終わる）。
+                    _offer({
                         "doc_id": rel,                # world root 相対パス（来歴・DL キー・§2.2）
                         "path": str(p),                # 内部用（物理パス）。API 露出は lens 層で除去。
                         "ext": out_ext,
@@ -569,20 +606,21 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             finally:
                 f.close()
             # ファイル全体（cap まで）の走査を終えた時点で「探せていない範囲があるか」が確定する。
-            # この1ファイルから得た全ヒットへ一律に適用する（`agentic_search.run_tool` の
-            # read_doc/doc_outline 分岐が返す `file_truncated` と同じ語彙・同じ意味）。
-            # 理由が無ければキーを作らない既存の流儀に合わせ、打切りが無い通常のヒットは従来どおり
-            # キー無し＝戻り値の形が完全に不変。
+            # この1ファイル由来でヒープに**現に残っている**エントリへ一律に適用する
+            # （`agentic_search.run_tool` の read_doc/doc_outline 分岐が返す `file_truncated` と
+            # 同じ語彙・同じ意味）。ヒットは既に `_add_hit`→`_offer` で見つけ次第ヒープへ供給済み
+            # （RV是正 #1・file_hits バッファは撤去）——この時点で他ファイルに追い出されず残って
+            # いるものだけが最終的に出力されうるため、ヒープ（高々 `max_hits` 件・有界）を1回
+            # 走査して `path` が一致するものにだけ付ける。理由が無ければキーを作らない既存の
+            # 流儀に合わせ、打切りが無い通常のヒットは従来どおりキー無し＝戻り値の形が完全に不変。
             effective_truncated = reader.truncated or reader.line_overflowed
             if effective_truncated:
-                for h in file_hits:
-                    h["file_truncated"] = True
+                p_str = str(p)
+                for _rank, _neg_seq, h in heap:
+                    if h["path"] == p_str:
+                        h["file_truncated"] = True
                 if truncated_docs is not None and rel not in truncated_docs:
                     truncated_docs.append(rel)
-            # I2: この1ファイル分のヒットを世界全体の top-K ヒープへ供給する（早期打切りの代わり・
-            # 上のモジュールdocstring/`_offer` 参照）。
-            for h in file_hits:
-                _offer(h)
     _check_deadline()
     # heap は有界（高々 max_hits 件）——最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・
     # 同rankは発見順）へ並べ替えて返す。`entry`=(rank, -seq, hit) なので、

@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from sherpa import doc_ledger, graph_admin, store
 from sherpa import scope as scope_mod
 from sherpa.deps import _WORLD_PATTERN, _WorldField, _current_user, _require_admin, _resolve_world, neo4j_session, validated_scope
+from sherpa.ingest.world_neo4j import GRAPH_SCHEMA_ERA_USER_MESSAGE, GraphSchemaEraError
 from sherpa.preview_service import graph_view
 from sherpa.schemas import GraphAskResponse, GraphFacetsResponse, GraphResponse, GraphSearchResponse
 
@@ -176,6 +177,10 @@ def graph_search(request: Request, world: str | None = Query(None, pattern=_WORL
                 scope_paths=sp, include_deprecated=include_deprecated, limit=limit)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    except GraphSchemaEraError as e:
+        # rv-s3-removal: 旧世代の実データがある world（fail-loud）。専門用語ゼロの平文で 503。
+        _log.warning("graph/search がスキーマ世代不一致で失敗（fail-loud・world=%s・stored=%s）", w, e.stored_era)
+        raise HTTPException(503, GRAPH_SCHEMA_ERA_USER_MESSAGE) from e
 
 
 @router.post("/graph/ask", tags=["ナレッジグラフ"], response_model=GraphAskResponse,

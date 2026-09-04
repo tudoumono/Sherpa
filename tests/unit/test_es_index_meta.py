@@ -743,7 +743,11 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
         if method == "GET" and path.endswith("/_mapping"):
             return {"idx": {"mappings": {"_meta": {"embed_provider": "openai", "embed_model": "m", "dim": 3}}}}
         if method == "POST" and path.endswith("/_search"):
-            if body and "knn" in body:
+            # RV是正（rv-i2-importance #4）: hybrid（vector=True・knn 併用）は `bool.should` に
+            # match/knn の2節を並べる形（`es_index.search` 参照）——BM25-only 本文（`bool.must`
+            # 1節のみ）と区別する検出条件を新しい形に合わせる。
+            bool_q = (body or {}).get("query", {}).get("function_score", {}).get("query", {}).get("bool", {})
+            if "should" in bool_q:
                 raise RuntimeError("hybrid query failed (dimension mismatch etc.)")
             return {"hits": {"hits": [{"_source": {"doc_id": "a.md", "line": 1, "text": "hit"}, "_score": 1.0}]}}
         return {}
@@ -2144,7 +2148,13 @@ def test_hybrid_weight_env_change_after_import_has_no_effect(monkeypatch):
 
 def test_search_hybrid_query_omits_boost_at_default_weight_for_byte_identical_body(monkeypatch):
     """既定配分（w=0.5）では boost キー自体を書かない（match 節が生の `{"match": {"text": q}}`
-    のまま・knn に "boost" が無い＝無指定と同じ本文になる）。"""
+    のまま・knn に "boost" が無い＝無指定と同じ本文になる）。
+
+    RV是正（rv-i2-importance #4・2026-09）: hybrid（vector=True）は match/knn を同一 `bool.should`
+    に並べ、その bool 全体を `function_score`（重要度ブースト）で1回だけ包む形に変わった
+    （`es_index.search` docstring 参照・旧実装は top-level `query`+top-level `knn` の別々の節で、
+    function_score は `query` 側だけに掛かっていた＝合成スコアの一部にしか重要度が反映されない
+    実害があった）。"""
     monkeypatch.setattr(es_index, "_HYBRID_WEIGHT", 0.5)
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
@@ -2161,8 +2171,10 @@ def test_search_hybrid_query_omits_boost_at_default_weight_for_byte_identical_bo
     monkeypatch.setattr(es_index, "_req", fake_req)
     es_index.search("w", "query")
     body = captured["body"]
-    assert body["query"]["function_score"]["query"]["bool"]["must"][0] == {"match": {"text": "query"}}   # I2: function_score に包まれる（重要度ブースト）
-    assert "boost" not in body["knn"]
+    assert "knn" not in body   # top-level knn パラメータはもう使わない（query 節の中身へ移した）
+    bool_q = body["query"]["function_score"]["query"]["bool"]
+    assert bool_q["should"][0] == {"match": {"text": "query"}}
+    assert "boost" not in bool_q["should"][1]["knn"]
 
 
 def test_search_hybrid_query_weight_skews_boost_toward_keyword(monkeypatch):
@@ -2185,8 +2197,9 @@ def test_search_hybrid_query_weight_skews_boost_toward_keyword(monkeypatch):
     monkeypatch.setattr(es_index, "_req", fake_req)
     es_index.search("w", "query")
     body = captured["body"]
-    match_boost = body["query"]["function_score"]["query"]["bool"]["must"][0]["match"]["text"]["boost"]   # I2: function_score に包まれる（重要度ブースト）
-    knn_boost = body["knn"]["boost"]
+    bool_q = body["query"]["function_score"]["query"]["bool"]
+    match_boost = bool_q["should"][0]["match"]["text"]["boost"]
+    knn_boost = bool_q["should"][1]["knn"]["boost"]
     assert match_boost > knn_boost
     assert round(match_boost + knn_boost, 6) == 2.0
 

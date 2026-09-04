@@ -1610,19 +1610,27 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
             # 既定配分（w=0.5）のときは boost キー自体を書かない（無指定と同じ本文にする）。
             # 0.5 以外のときだけ boost を付与する（合計2.0に配分）。
             match_clause = {"match": {"text": q}}
-            knn_extra: dict = {}
+            knn_clause = {"knn": {"field": "embedding", "query_vector": qv[0], "k": k,
+                                  "num_candidates": max(50, k * 5), "filter": flt}}
             if _HYBRID_WEIGHT != 0.5:
                 match_clause = {"match": {"text": {"query": q, "boost": _HYBRID_WEIGHT * 2.0}}}
-                knn_extra = {"boost": (1.0 - _HYBRID_WEIGHT) * 2.0}
-            # I2（J2）: 重要度ブーストは `query`（BM25/keyword 側）だけへ掛ける——ES はこの top-level
-            # `query`+`knn` 併記を「両者のスコアを加算」で合成するため（`_HYBRID_WEIGHT` の
-            # boost 配分と同じ仕組み）、`knn` 側は素のベクトル類似度のまま残る（純kNN側の重要度
-            # ブーストは `search_knn_only`/`_rerank_knn_by_importance` が別途担う・実装形の選択理由は
-            # 提案書 I2 の報告を参照）。
-            hybrid = {"size": k, "highlight": hl,
-                      "query": _importance_boost_query({"bool": {"must": [match_clause], "filter": flt}}),
-                      "knn": {"field": "embedding", "query_vector": qv[0], "k": k,
-                              "num_candidates": max(50, k * 5), "filter": flt, **knn_extra}}
+                knn_clause["knn"]["boost"] = (1.0 - _HYBRID_WEIGHT) * 2.0
+            # RV是正（rv-i2-importance #4・2026-09）: 重要度ブーストは合成スコア（BM25+kNN）**全体へ
+            # 一度だけ**掛ける。旧実装は top-level `query`＋top-level `knn` を並記していた——ES 8系は
+            # この2つを「両者のスコアを加算」で合成するため、function_score を `query` 側だけに巻くと
+            # 掛かるのは BM25 成分だけで、kNN 成分（通常 BM25 より絶対値が大きい）には一切効かず、
+            # 重要度による押し上げ/押し下げが合成スコアのごく一部にしか反映されなかった（実 ES で
+            # 高=1.2倍を指定しても合成スコアの上昇幅が数%に希釈されることを確認済み）。
+            # ES 8.9+ で `knn` を**top-level パラメータではなく query 節の中身**（`bool`/`dis_max` の
+            # 1要素）として書ける形式を使い、match/knn を同一 `bool.should` に並べてから
+            # `_importance_boost_query`（function_score）で1回だけ包む——bool の合成スコア
+            # （=match_score+knn_score・`should` の既定の加算合成）に対して掛かるため、旧実装の
+            # 「top-level query+knn の加算」と同じ合成値へ、重要度の乗数がちょうど1回だけ効く。
+            # union（どちらか一方だけに一致した文書も出る）・重要度なし world でのスコア完全不変も
+            # 実 ES（8.19・docker/elasticsearch）で確認済み（`_重要度.txt` の無い world は
+            # function_score の全 function が不一致→乗数1.0→合成スコアは旧実装と bit 単位で同一）。
+            combined = {"bool": {"should": [match_clause, knn_clause], "filter": flt}}
+            hybrid = {"size": k, "highlight": hl, "query": _importance_boost_query(combined)}
             try:
                 return _parse_hits(_req("POST", f"/{_index(world)}/_search", hybrid)), None
             except Exception:
@@ -1683,12 +1691,22 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
-    body = {"size": k,
-            "knn": {"field": "embedding", "query_vector": qv[0], "k": k,
-                    "num_candidates": max(50, k * 5), "filter": flt}}
+    # RV是正（rv-i2-importance #5・2026-09）: 旧実装は ES から**ちょうど `k` 件**（生コサイン類似度の
+    # 上位）だけ取ってから `_rerank_knn_by_importance` で並べ替えていた——生スコアで `k` 件に入らな
+    # かった「高」重要度ヒットは、取得された時点で既に落選しているため、並べ替えでも決して浮上
+    # できない（grep の旧・早期打切りと同じ「切ってから補正」の構造的欠陥）。ES へは有界の
+    # overfetch（`k*3`・上限 `k+50`・小さく抑える＝ES 側コストを際限なく増やさない）で少し多めに
+    # 取り、重要度補正・再ソートの**後**に `k` 件へ切り詰める——`_重要度.txt` の無い world は
+    # 補正が no-op（乗数1.0）のまま先頭 `k` 件を返すため、受け入れ条件（スコア/順序完全不変）は
+    # 変わらない。
+    fetch_k = min(k * 3, k + 50)
+    body = {"size": fetch_k,
+            "knn": {"field": "embedding", "query_vector": qv[0], "k": fetch_k,
+                    "num_candidates": max(50, fetch_k * 5), "filter": flt}}
     try:
         # I2（J2）: 純 kNN は function_score で `query` を包めない（`knn` 節は対象外）ため、
         # 取得後の再ランクで重要度ブーストを適用する（`_rerank_knn_by_importance` 参照）。
-        return _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body))), None
+        hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body)))
+        return hits[:k], None
     except Exception:
         return [], "es_query_failed"

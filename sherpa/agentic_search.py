@@ -1302,8 +1302,17 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         # 親返し（L4c・§3.3/§3.4）: es_search 限定・既定 ON。rag チャンク由来のヒット（`chunk_id`
         # あり）は doc_id ごとに束ねて `_resolve_parent_return` へ渡し、legacy ヒット（`chunk_id`
         # 無し・40行チャンク由来）は従来どおり素通しする（`out` へ直接積む）。
+        #
+        # 順位保持（RV是正・rv-i2-importance #6・2026-09）: `hits` は ES ヒットのスコア降順のまま
+        # 渡ってくる（`es_index.search`）。旧実装は legacy ヒットを先に全部積み、rag 文書の集約結果を
+        # 末尾へ `extend` していたため、rag 文書のスコアが legacy ヒットより高くても常に後方へ回る
+        # （検索結果全体のスコア降順という契約を後処理が壊していた）。`rag_slot_index` で各 doc の
+        # **最初に出現した（＝最高スコアの）ヒットの位置**を `out` 内に予約し、legacy ヒットはその場で
+        # 確定させる二段構えにする——`_resolve_parent_return`（budget 計算後にしか結果が出ない）の
+        # 完了を待たずに全体の並びを一度の走査で確定できる。
         parent_return_on = name == "es_search" and _parent_return_enabled()
         rag_groups: dict = {}
+        rag_slot_index: dict[str, int] = {}   # doc_id -> `out` 内の予約位置（代表ヒットの位置）
         for h in hits:
             docs.add(h["doc_id"])
             quote = _redact(h["text"])[:500]            # redaction/clip は呼び出し側のポリシー（citations には入れない）
@@ -1323,6 +1332,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     "chunk_id": h["chunk_id"], "parent_id": h.get("parent_id"),
                     "locator": h.get("locator"), "score": h.get("score"), "text": text_for_llm,
                 })
+                if h["doc_id"] not in rag_slot_index:
+                    # 最初に出現した位置＝ES ヒットのスコア降順の下でその doc の最高スコア
+                    # （同 doc の2件目以降は既に予約済みの枠へ集約されるだけ・新しい枠は作らない）。
+                    rag_slot_index[h["doc_id"]] = len(out)
+                    out.append(None)                      # 集約結果が確定するまでの予約枠
                 continue
             hit_view = {"doc_id": h["doc_id"], "line": h["line"], "text": text_for_llm}
             # I2（2026-09-05）: grep（`ripgrep_search`）ヒットが持つ登録者重要度（`grep_tool.
@@ -1343,11 +1357,15 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 hit_view["file_truncated"] = True
             out.append(hit_view)
         if rag_groups:
-            # legacy ヒット分（`out` に既に積んだ分）を先に差し引いた残りが rag doc 群の予算
-            # （§3.4「全文書ぶんの最低保証」は legacy を含めた tool result 全体の予算から見る）。
-            legacy_bytes = sum(len(hv["text"].encode("utf-8")) for hv in out)
+            # legacy ヒット分（`out` に既に積んだ分・予約枠の `None` は除く）を先に差し引いた残りが
+            # rag doc 群の予算（§3.4「全文書ぶんの最低保証」は legacy を含めた tool result 全体の
+            # 予算から見る＝旧実装と同じ計算）。
+            legacy_bytes = sum(len(hv["text"].encode("utf-8")) for hv in out if hv is not None)
             budget_for_rag = max(0, tr_max_bytes - legacy_bytes)
-            out.extend(_resolve_parent_return(world, rag_groups, sp, layer, budget_for_rag))
+            resolved = _resolve_parent_return(world, rag_groups, sp, layer, budget_for_rag)
+            resolved_by_doc = {r["doc_id"]: r for r in resolved}
+            for doc_id, idx in rag_slot_index.items():
+                out[idx] = resolved_by_doc[doc_id]   # 予約した代表位置へ集約結果を差し戻す（§順位保持）
         view = {"hits": out}
         if degrade_reason:                              # es_search のみ・BM25 継続時の縮退理由（RV2）
             view["degrade_reason"] = degrade_reason

@@ -763,6 +763,12 @@ class _CidFakeResult:
     def consume(self):
         pass
 
+    def data(self):
+        # rv-s3-removal: `check_schema_era`（`neo4j_related` の主クエリ直後に呼ばれる）は `.data()`
+        # で一括取得する。このフェイクは常に同じ cid 付き行を返すため（`c`/`era` キーは無い）、
+        # `check_schema_era` は形が合わず早期 return する（ゲート不発動・既存の cid 除去検証には無関係）。
+        return [dict(r) for r in self._rows]
+
 
 class _CidFakeSession:
     """`lens_service.run_troubleshoot` が呼ぶクエリに cid 付きの1行を返す最小スタブ

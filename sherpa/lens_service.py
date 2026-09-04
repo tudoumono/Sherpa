@@ -20,7 +20,7 @@ from neo4j.exceptions import Neo4jError
 from . import citations, scope
 from .grep_tool import grep_search
 from .impact_service import CATEGORY
-from .ingest.world_neo4j import _scope_pred
+from .ingest.world_neo4j import GraphSchemaEraError, _scope_pred, check_schema_era
 
 _log = logging.getLogger("sherpa")
 
@@ -195,7 +195,17 @@ def resolve_anchor(session, text, world, scope_prefixes=None):
 
 
 def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False):
-    """アンカー近傍（**厳密な影響ではない**）。各近傍への最短経路を代表に返す（範囲内・無向・全エッジ型）。"""
+    """アンカー近傍（**厳密な影響ではない**）。各近傍への最短経路を代表に返す（範囲内・無向・全エッジ型）。
+
+    rv-s3-removal: `anchors` が非空（＝実際にグラフへ問い合わせる）のときだけ、主クエリの**後**に
+    `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError` で fail-loud・
+    `world_neo4j` 参照）。主クエリの安全弁（`_run_capped` の timeout 縮退）を先に効かせるための順序
+    （`check_schema_era` 自身も世代プローブの Neo4jError は黙ってスキップするため、主クエリが既に
+    縮退した後にここで新たな失敗にはならない）。`lens="troubleshoot"`——直接 dispatch（troubleshoot
+    レンズ）経由の呼び出しを想定した既定値。agentic ツール `graph_neighbors`（`neighbor_cards` 経由・
+    qa/author レンズからも呼ばれ得る）でも同じ既定値のまま返す（呼び出し元のチャットレンズまでは
+    本関数から見えないため・新規のレンズ追跡機構は作らない＝縮小形の方針）。
+    """
     if not anchors:
         return []
     cy = (
@@ -218,6 +228,7 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
     out = []
     rows = _run_capped(session, cy, log_world=world, anchors=list(anchors), world=world,
                        prefixes=list(scope_prefixes or []), incl=include_deprecated)
+    check_schema_era(session, world, lens="troubleshoot")
     for r in rows:
         out.append({
             "cid": r["cid"], "name": r["name"], "label": r["label"],
@@ -311,6 +322,11 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
     開いて**呼ぶ薄いラッパ。`run_troubleshoot`（公開・`cid` 除去済み）は経由しない——`cid` 付きの
     card をそのまま返す（agentic_search 側の構造 Evidence 生成が使う・公開経路には出さない）。
     Neo4j 不可・未解決はグレースフルに `[]`（agentic はツール結果が空でも他の道具で続行できる）。
+
+    rv-s3-removal: **`GraphSchemaEraError` だけは再送出**する（`impact_service.presumed_impact` の
+    `GraphQueryOverloadError` 特別扱いと同じ流儀）——旧世代の実データを黙って空カードへ縮退させると
+    「見つからなかった」（本当に0件）と「読めない世代のグラフ」を区別できず、チャット側
+    （`chat_service._degrade_overload`）が honest failure を出す機会を失う。
     """
     if not (term or "").strip():
         return []
@@ -326,6 +342,8 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
             # 別途 truncated_docs を申告する（`_troubleshoot_cards` docstring 参照）。
             _anchor_names, cards, _truncated_docs = _troubleshoot_cards(s, term, world, scope_paths=scope_paths)
         return cards
+    except GraphSchemaEraError:
+        raise
     except Exception:
         return []
     finally:

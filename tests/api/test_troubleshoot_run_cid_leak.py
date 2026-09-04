@@ -38,6 +38,12 @@ class _FakeResult:
     def consume(self):
         pass
 
+    def data(self):
+        # rv-s3-removal: `check_schema_era`（`neo4j_related` の主クエリ直後）が `.data()` で
+        # 一括取得する。このフェイクは常に同じ cid 付き行を返すため（`c`/`era` キーは無く）
+        # ゲートは早期 return で不発動——本テストの関心（cid 不在）には無関係。
+        return [dict(r) for r in self._rows]
+
 
 class _FakeSession:
     """`run_troubleshoot` が呼ぶクエリに1種類の行を返す最小スタブ（`tests/unit/test_lens_service.py`

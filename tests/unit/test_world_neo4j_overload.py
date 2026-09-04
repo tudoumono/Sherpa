@@ -34,9 +34,11 @@ class _FakeRecord:
 
 
 class _FakeResult:
-    """`neo4j.Result` の最小スタブ（for 反復のみ使う・`.data()` 一括展開はしない）。
+    """`neo4j.Result` の最小スタブ（for 反復が主・`check_schema_era`（rv-s3-removal）向けに
+    `.data()` 一括展開も持つ）。
 
     `consumed`（HIGH-1・secRV 範囲外是正 追補・2026-07-19）: `consume()` 呼び出しを記録する。
+    `.data()` も実 driver と同じく「残りを一括取得＝実質フルに消費する」ため consumed を立てる。
     """
 
     def __init__(self, rows):
@@ -48,6 +50,10 @@ class _FakeResult:
 
     def consume(self):
         self.consumed = True
+
+    def data(self):
+        self.consumed = True
+        return [dict(r) for r in self._rows]
 
 
 class _FakeSession:
@@ -239,23 +245,32 @@ def test_world_impact_propagates_overload_from_query():
 # ---- 正常系回帰: resolve_world_entity/world_impact の返却形状は不変 ---------
 
 def test_resolve_world_entity_shape_unchanged():
-    """K10（REALIZES 橋の撤去）以降、`resolve_world_entity` は名前一致の1クエリだけで完結する。"""
+    """K10（REALIZES 橋の撤去）以降、`resolve_world_entity` は名前一致の1クエリだけで業務ロジックが
+    完結する（＝旧 REALIZES 橋の2段目クエリは復活していない）。rv-s3-removal で主クエリの後に
+    `check_schema_era` の世代プローブが1回加わるため、`session.run` 呼び出し総数は2になる
+    （era プローブは `rows` を `{"cid":...}` 形として読むため `c` キーが無く早期 return・素通り）。
+    """
     rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}]
     s = _FakeSession([rows])
     starts = wn.resolve_world_entity(s, "TAX-RATE", "w1")
-    assert len(s.calls) == 1
+    assert len(s.calls) == 2
+    assert "MATCH (n:Entity {world_id:$w}) WHERE n.name=$name" in s.calls[0][0].text
+    assert "SherpaMeta" in s.calls[1][0]
     by = {x["canonical_id"]: x for x in starts}
     assert set(by) == {"dataitem:w1:D"}
     assert by["dataitem:w1:D"] == {"canonical_id": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}
 
 
 def test_world_impact_shape_unchanged():
-    """K12（判定表示の撤去）以降、items は judgement/extraction_method を持たない（全件同格）。"""
+    """K12（判定表示の撤去）以降、items は judgement/extraction_method を持たない（全件同格）。
+    影響たどり自体は1本の Cypher で完結する（二重クエリ撤去は復活していない）——rv-s3-removal で
+    主クエリの後に `check_schema_era` の世代プローブが1回加わるため、呼び出し総数は2になる。
+    """
     impact_rows = [_impact_row("cid:a", "NODE-A", analyzer="cobol"),
                   _impact_row("cid:b", "NODE-B")]     # analyzer 無し(None) の来歴も通る
     s = _FakeSession([impact_rows])
     items = wn.world_impact(s, ["start:1"], "w1")
-    assert len(s.calls) == 1                          # K12: 1本の Cypher で完結（二重クエリ撤去）
+    assert len(s.calls) == 2                          # K12: 影響たどりは1本の Cypher（+ era プローブ1本）
     by = {i["name"]: i for i in items}
     assert by["NODE-A"]["analyzer"] == "cobol"                        # 担当アナライザの来歴が通る
     assert by["NODE-B"]["analyzer"] is None
@@ -270,7 +285,7 @@ def test_world_impact_shape_unchanged():
 def test_world_impact_passes_query_timeout():
     s = _FakeSession([[]])
     wn.world_impact(s, ["start:1"], "w1")
-    assert len(s.calls) == 1
+    assert len(s.calls) == 2                        # 主クエリ（timeout 付き）+ era プローブ（rv-s3-removal）
     query, params = s.calls[0]
     assert query.timeout == wn._NEO4J_QUERY_TIMEOUT_S
     assert params["world"] == "w1" and params["starts"] == ["start:1"]

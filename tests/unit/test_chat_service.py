@@ -77,7 +77,7 @@ def test_sources_attaches_importance_when_resolved(monkeypatch):
     from sherpa.ingest import importance as imp
     monkeypatch.setattr(CS.worlds, "world_dir", lambda w: "/tmp/x")
     res = imp.Resolution(value="高", reason="契約書", config_path="_重要度.txt", rule_line=1)
-    monkeypatch.setattr(CS.importance, "resolve_many", lambda w, rels, root=None: {"a.md": res})
+    monkeypatch.setattr(CS.importance, "resolve_many", lambda w, rels, root=None, sig=None: {"a.md": res})
     out = {s["doc_id"]: s for s in CS._sources(["a.md", "b.md"], "v1")}
     assert out["a.md"]["importance"] == "高" and out["a.md"]["importance_reason"] == "契約書"
     assert "importance_source" not in out["a.md"]

@@ -39,7 +39,12 @@ from sherpa.deps import (
 )
 from sherpa.export_excel import build_xlsx
 from sherpa.impact_service import run_impact
-from sherpa.ingest.world_neo4j import GRAPH_OVERLOAD_USER_MESSAGE, GraphQueryOverloadError
+from sherpa.ingest.world_neo4j import (
+    GRAPH_OVERLOAD_USER_MESSAGE,
+    GRAPH_SCHEMA_ERA_USER_MESSAGE,
+    GraphQueryOverloadError,
+    GraphSchemaEraError,
+)
 from sherpa.lens_service import run_qa, run_troubleshoot
 from sherpa.schemas import ScopesResponse
 
@@ -106,6 +111,11 @@ def impact_run(req: ImpactReq, request: Request):
         # 従来どおり FastAPI の既定 500 に委ねる（本エンドポイント固有の縮退はここだけ）。
         _log.warning("impact/run が Neo4j 安全弁で失敗（fail-loud・reason=%s・world=%s）", e.reason, w)
         raise HTTPException(503, GRAPH_OVERLOAD_USER_MESSAGE) from e
+    except GraphSchemaEraError as e:
+        # rv-s3-removal: 旧世代の実データがある world（fail-loud）。空/部分結果を「影響なし」と
+        # 誤読させないのは上と同じ理由——ただし原因は安全弁ではなく再取り込み未了。
+        _log.warning("impact/run がスキーマ世代不一致で失敗（fail-loud・world=%s・stored=%s）", w, e.stored_era)
+        raise HTTPException(503, GRAPH_SCHEMA_ERA_USER_MESSAGE) from e
     _impact_gc_expired()   # 新規実行のたびに期限切れエントリを一括掃除（監査台帳#1 TTL）
     with _analyses_lock:   # 採番＋保存を排他（監査台帳 MED-1・重い run_impact は lock 外で既に完了済み）
         _seq[0] += 1
@@ -174,8 +184,13 @@ def troubleshoot_run(req: TroubleshootReq, request: Request):
     _current_user(request)   # ログイン必須（auth 有効時）
     w = _resolve_world(req.world)
     sp = validated_scope(w, req.scope_paths) or None
-    with neo4j_session() as s:
-        return run_troubleshoot(s, req.symptom, w, scope_paths=sp)
+    try:
+        with neo4j_session() as s:
+            return run_troubleshoot(s, req.symptom, w, scope_paths=sp)
+    except GraphSchemaEraError as e:
+        # rv-s3-removal: 旧世代の実データがある world（fail-loud・impact/run と同じ 503）。
+        _log.warning("troubleshoot/run がスキーマ世代不一致で失敗（fail-loud・world=%s・stored=%s）", w, e.stored_era)
+        raise HTTPException(503, GRAPH_SCHEMA_ERA_USER_MESSAGE) from e
 
 
 @lens_router.post("/qa/run", tags=["トラブルシュート・QA"])
