@@ -177,6 +177,7 @@ def configure_logging(*, log_dir: Path | str | None = None, force: bool = False)
         logger.propagate = True  # WARNING 以上は "sherpa" 経由で run ログにも残る
 
     _attach_access_log_noise_filter()
+    _reformat_uvicorn_handlers()
     _configured = True
 
 
@@ -200,6 +201,18 @@ class _AccessLogNoiseFilter(logging.Filter):
         if not isinstance(path, str) or not isinstance(status, int):
             return True
         return not (status < 400 and path.split("?", 1)[0] in _ACCESS_LOG_DROP_PATHS)
+
+
+def _reformat_uvicorn_handlers() -> None:
+    """uvicorn のロガー（access/error）の既定フォーマットには時刻が無い（`INFO:     127.0.0.1 - ...`）。
+    障害調査で「いつのアクセスか」が分からない、という実利用フィードバック（2026-09-04）への対処:
+    uvicorn が起動時に付けた既存ハンドラのフォーマッタを、サブシステムログと同じ時刻付き書式へ
+    差し替える（uvicorn のログ設定は本関数より先に済んでいる＝lifespan 起動時に呼ばれる前提）。
+    ハンドラの付け外しはしない（uvicorn の配線を壊さない・書式だけ）。"""
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        for h in logging.getLogger(name).handlers:
+            h.setFormatter(fmt)
 
 
 def _attach_access_log_noise_filter() -> None:

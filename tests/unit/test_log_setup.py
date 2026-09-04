@@ -201,3 +201,21 @@ def test_configure_attaches_access_filter_once(tmp_path):
     flt = [f for f in logging.getLogger("uvicorn.access").filters
            if isinstance(f, log_setup._AccessLogNoiseFilter)]
     assert len(flt) == 1
+
+
+def test_configure_logging_adds_timestamps_to_uvicorn_handlers(tmp_path):
+    """uvicorn アクセス行に時刻が無い（実利用フィードバック 2026-09-04）: configure_logging が
+    uvicorn/uvicorn.access/uvicorn.error の既存ハンドラへ時刻付きフォーマッタを差し替える。"""
+    import logging
+
+    from sherpa import log_setup
+    lg = logging.getLogger("uvicorn.access")
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))   # uvicorn 既定相当（時刻なし）
+    lg.addHandler(h)
+    try:
+        log_setup.configure_logging(force=True, log_dir=tmp_path)
+        assert "asctime" in (h.formatter._fmt or "")
+    finally:
+        lg.removeHandler(h)
+        log_setup._reset_state_for_tests()
