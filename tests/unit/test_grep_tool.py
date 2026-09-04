@@ -733,11 +733,13 @@ def test_grep_search_importance_reason_is_conditional_key(monkeypatch, tmp_path)
     assert hits["b.md"]["importance"] == "低" and "importance_reason" not in hits["b.md"]
 
 
-def test_grep_search_continues_scanning_past_max_hits_and_can_hit_deadline_there(monkeypatch, tmp_path):
-    """I2 是正の固定: 早期打切りを撤去したことで、`max_hits` 到達後も走査は続く——旧実装なら
-    1文書目の処理直後に成功で返っていた場面（呼び出し回数5回で return）でも、新実装は2文書目の
-    走査へ進むため、その途中/末尾で deadline を超えれば例外になる（＝deadline 消費が増えるという
-    ドキュメント化した挙動変化の固定）。"""
+def test_grep_search_stops_scanning_at_max_hits_when_imp_map_empty(monkeypatch, tmp_path):
+    """コーディネータ裁定（rv-i2-importance #2・2026-09-05・再判定・二経路化採用）: `_重要度.txt`
+    の無い world（`imp_map` 空・`roots=` 明示指定も同様）は、旧実装（I2以前）と同じ2つの打切り点
+    （ファイル内 break／ファイル境界 return）で `max_hits` 到達時に走査を終える——`deadline` の
+    消費も旧水準（5回）に戻り、2文書目（b.md）には一切到達しない（`_check_deadline` はファイル
+    境界のチェック止まりで、2文書目の「エントリ処理直前」「ファイル読込直後」チェックは発火
+    しない）。sorted() で a.md が先に見つかるため、確実に a.md だけで打ち切れる max_hits=1 を使う。"""
     _write(tmp_path, "a.md", "NEEDLE\n")
     _write(tmp_path, "b.md", "NEEDLE\n")
 
@@ -745,15 +747,40 @@ def test_grep_search_continues_scanning_past_max_hits_and_can_hit_deadline_there
 
     def _clock():
         calls["n"] += 1
-        # 6回目まで（1文書目の走査完了相当）は通す。旧実装ならここまでで成功して return していた
-        # （早期打切りの `_check_deadline()` は5回目に当たる）。7回目（2文書目の処理に入ってから
+        return 0.0   # 一度も超過させない——それでも b.md には進まないことが本題
+
+    monkeypatch.setattr(G.time, "monotonic", _clock)
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=1, deadline=50.0)
+    assert [h["doc_id"] for h in hits] == ["a.md"]   # b.md には到達しない（早期終了）
+    # 開始直後・root境界・a.md のエントリ処理直前・ファイル読込直後・最終return前の5回のみ
+    # （旧実装の「早期打切りの check_deadline は5回目」と同水準・b.md 分の追加チェックが無い）。
+    assert calls["n"] == 5
+
+
+def test_grep_search_continues_scanning_past_max_hits_when_imp_map_nonempty(monkeypatch, tmp_path):
+    """`_重要度.txt` がある world（`imp_map` 非空）は、後から見つかった `高` 文書がヒープ最下位を
+    上書きしうるため上の早期終了条件が成立せず、`max_hits` 到達後も**全量走査**を続ける——旧実装
+    （I2以前）なら1文書目の処理直後に成功で返っていた場面（呼び出し回数5回で return）でも、
+    2文書目（b.md）の走査へ進むため、その途中/末尾で deadline を超えれば例外になる。"""
+    world_root = tmp_path / "world"
+    world_root.mkdir()
+    _write(world_root, "a.md", "NEEDLE\n")
+    _write(world_root, "b.md", "NEEDLE\n")
+    _write(world_root, "_重要度.txt", "a.md: 中\n")   # imp_map を非空にするためだけの最小規則
+    _isolate_derived_world(monkeypatch, world_root, tmp_path / "no_derived_md")
+
+    calls = {"n": 0}
+
+    def _clock():
+        calls["n"] += 1
+        # 6回目まで（1文書目の走査完了相当）は通す。7回目（2文書目の処理に入ってから
         # 最終チェックに至るまでの間）で超過させる。
         return 0.0 if calls["n"] <= 6 else 100.0
 
     monkeypatch.setattr(G.time, "monotonic", _clock)
     with pytest.raises(G.GrepDeadlineExceeded):
-        list(G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=1, deadline=50.0))
-    assert calls["n"] >= 7   # 旧実装（5回で return）を超えて走査を続けたことの証跡
+        list(G.grep_search("NEEDLE", world="anyworld", max_hits=1, deadline=50.0))
+    assert calls["n"] >= 7   # 全量走査（早期終了しない）ことの証跡
 
 
 # ===== 打切りの申告: ヒット0件の打切り文書も報告する（検収是正） =====
@@ -776,6 +803,26 @@ def test_truncated_docs_reports_file_with_no_hits(monkeypatch, tmp_path):
     hits = G.grep_search("NEEDLE_TAIL", world="anyworld", truncated_docs=truncated)
     assert hits == []                       # cap より後ろなので1件も引けない
     assert truncated == ["big.docx"]        # それでも「探せていない文書がある」ことは伝わる
+
+
+def test_truncated_docs_misses_files_past_the_early_exit_point_when_imp_map_empty(monkeypatch, tmp_path):
+    """コーディネータ裁定（rv-i2-importance #2・再判定）: `imp_map` が空で `max_hits` 到達により
+    早期終了した場合、それより後の（sorted() 順で後にある）打切り文書は `truncated_docs` に
+    載らない——旧実装（I2以前）と同じ意味論に戻るだけであり契約劣化ではない（`_重要度.txt` が
+    ある world は常に全量走査するためこの限定は無い・上の
+    `test_truncated_docs_reports_file_with_no_hits` が引き続き固定する）。"""
+    world_root = tmp_path / "world"
+    world_root.mkdir()
+    der = tmp_path / "derived" / "md"
+    _write(der, "a.docx.md", "NEEDLE\n")                              # sorted() で先に見つかる・1ヒット
+    _write(der, "z_big.docx.md", "x" * 400 + "\nNEEDLE\n")             # sorted() で後・cap 超過で打切り
+    _isolate_derived_world(monkeypatch, world_root, der)
+    monkeypatch.setattr(G, "_GREP_FILE_CAP_BYTES", 100)
+
+    truncated: list = []
+    hits = G.grep_search("NEEDLE", world="anyworld", max_hits=1, truncated_docs=truncated)
+    assert [h["doc_id"] for h in hits] == ["a.docx"]   # 早期終了・z_big.docx には到達しない
+    assert truncated == []                             # z_big.docx の打切りは報告されない（旧実装と同じ）
 
 
 def test_truncated_docs_omitted_when_caller_passes_nothing(monkeypatch, tmp_path):

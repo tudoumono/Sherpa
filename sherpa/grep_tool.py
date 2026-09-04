@@ -274,14 +274,22 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     MD は**該当見出し節**を `text`/`span`（qa の引用）、ソースは該当行＋前後数行。同一 (doc, 節) は1集約。
     `scope_paths`（フォルダ prefix）を渡すと、**その範囲の文書だけ** grep する（範囲外は読まない・MIRROR §3）。
 
-    **ヒットの選抜（I2）**: 対象は常に**全量走査**する（旧実装のような `max_hits` 到達での早期
-    打切りは行わない）。返すのは上限 `max_hits` 件の **top-K**——優先度は `(重要度rank降順, 発見順
-    昇順)`（重要度＝`高`>`中`/未設定>`低`・同 rank は先に見つかった方を残す）。`_重要度.txt` の無い
-    world（または `roots` 明示指定の呼び出し）は全ヒットの rank が揃うため、top-K の選抜は
-    「発見順で先頭 `max_hits` 件」＝早期打切りしていた旧実装と完全に同じ集合・同じ順序になる。
-    全量走査化に伴い、`deadline` の消費（`_check_deadline` の呼び出し頻度・到達しうる時間）は
-    旧実装より増える（`max_hits` 到達後も走査を続けるため）——これは意図した変化であり、
-    既存の周期チェックが引き続き効くことでハングしないことがテストの固定対象。
+    **ヒットの選抜（I2・二経路化＝rv-i2-importance #2・コーディネータ裁定2026-09-05再判定）**:
+    返すのは上限 `max_hits` 件の **top-K**——優先度は `(重要度rank降順, 発見順昇順)`（重要度＝
+    `高`>`中`/未設定>`低`・同 rank は先に見つかった方を残す）。`_重要度.txt` が無い world（または
+    `roots` 明示指定の呼び出し）は `imp_map` が空＝全ヒットの rank が揃う。この場合、ヒープが
+    `max_hits` で満杯になった時点で**以後どのヒットも数学的に二度と採用され得ない**
+    （min-heap のキー `(rank, -seq)` は rank 一様なら新エントリの `-seq` が既存最小値より必ず
+    小さくなるため、`entry > heap[0]` が恒に False になる）——この事実を使い、旧実装（I2以前）と
+    同じ2つの打切り点で走査を早期終了する: **ファイル内**（行走査ループの各行の後・MD 最終節／
+    未確定 pending 行の flush は行わない＝旧実装と同じ取りこぼし挙動）と**ファイル境界**
+    （1ファイルを終えるたびに判定・満たせば以後のファイル・root を一切開かない）。結果として
+    選抜は「発見順で先頭 `max_hits` 件」＝早期打切りしていた旧実装と完全に同じ集合・同じ順序に
+    なり、`deadline` の消費（`_check_deadline` の呼び出し頻度）も旧実装の水準に戻る。
+    一方、`_重要度.txt` がある world（`imp_map` が非空）は、後から見つかった `高` 文書が現在の
+    ヒープ最下位を上書きしうるため、この早期終了条件は成立せず**常に全量走査**する（`max_hits`
+    到達後も走査を続けるぶん `deadline` 消費は増える——既存の周期チェックが引き続き効くことで
+    ハングしないことがテストの固定対象）。
 
     **打切りの申告**（`agentic_search.run_tool` の read_doc/doc_outline 分岐が返す `file_truncated`
     と同じ語彙・同じ意味＝
@@ -289,10 +297,13 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
 
     - ヒット元が打ち切られていたら、そのヒットにだけ `file_truncated: True` を付ける。打切りが無い
       通常のヒットにはキー自体を作らない（`degrade_reason` と同じ流儀＝戻り値の形は不変）。
-    - `truncated_docs`（省略可）にリストを渡すと、**打ち切られた全文書の `doc_id`** を重複なく追記する。
-      **ヒットを1件も出さなかった打切り文書もここに載る**——これが本命で、ヒット経由の申告だけでは
-      「cap より後ろにしか一致が無い文書」が完全に無音になる（＝『検索したのに出てこない』の正体）。
-      呼び出し元がリストを渡さなければ何もしない（既存呼び出し元は無変更）。
+    - `truncated_docs`（省略可）にリストを渡すと、**打ち切られた文書の `doc_id`** を重複なく追記する。
+      **ヒットを1件も出さなかった打切り文書もここに載る**——ヒット経由の申告だけでは「cap より
+      後ろにしか一致が無い文書」が完全に無音になる（＝『検索したのに出てこない』の正体）。
+      呼び出し元がリストを渡さなければ何もしない（既存呼び出し元は無変更）。ただし上記の早期終了
+      （`imp_map` が空かつヒープ満杯）が発生した場合、そこから先は文書を一切開かないため、その
+      時点より後にある打切り文書は報告されない——旧実装（I2以前）と同じ意味論に戻るだけであり、
+      `_重要度.txt` がある world（常に全量走査）ではこの限定は無い。
 
     軽量テキスト枠（`ingest.text_kind`＝未登録拡張子のテキストファイル）だけは、台帳/ES と同じ基準
     （`text_kind.MAX_BYTES`＝8MiB）でサイズ超過を丸ごと対象外にし、これも `truncated_docs` へ
@@ -399,6 +410,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
         elif entry > heap[0]:
             heapq.heapreplace(heap, entry)
 
+    stop_scan = False   # コーディネータ裁定（rv-i2-importance #2・2026-09-05・再判定・ファイル境界の打切り点）
     for root, is_derived in roots_spec:
         _check_deadline()
         if not root.is_dir():
@@ -556,6 +568,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     _add_hit(section_hit_line, section_start, end_line, text)
                     section_has_hit = False
 
+                hit_limit_reached = False   # コーディネータ裁定（rv-i2-importance #2・2026-09-05・再判定）
                 try:
                     for t in _logical_lines(reader, _GREP_FILE_CAP_BYTES):
                         if (deadline is not None and line_i > 0 and line_i % _DEADLINE_CHECK_LINES == 0
@@ -589,18 +602,24 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                                 text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
                                 _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
                         line_i += 1
-                    # I2（2026-09-05）: 旧実装はここで `len(hits) >= max_hits` の早期 break を持ち、
-                    # 打ち切った場合は下の flush（MD 最終節／未確定 pending 行）を**スキップ**していた
-                    # （副作用として、たまたま上限直前で終わった場合に最後の節・pending 行を取りこぼす
-                    # ケースがあった）。全量走査化に伴いこの break 自体を撤去したので、ループが尽きたら
-                    # 常にここへ到達し、flush は無条件で行う（早期打切りが無くなった分、単純化）。
-                    if is_md:
-                        _emit_md_section(line_i)
-                    else:
-                        for h in pending:
-                            s, e = max(1, h - 2), min(line_i, h + 2)
-                            text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
-                            _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
+                        # RV是正 再判定（rv-i2-importance #2・コーディネータ裁定2026-09-05）: `imp_map`
+                        # が空（rank一様）でヒープが `max_hits` で満杯なら、以後どのファイル・どの行の
+                        # ヒットも数学的に二度とヒープへ採用されない（min-heap の比較キー `(rank, -seq)`
+                        # は rank が一様なとき新エントリの `-seq` が既存最小値より必ず小さくなるため
+                        # `entry > heap[0]` が恒に False になる証明・モジュール docstring 参照）。
+                        # ファイル内break＝旧実装と同じ打切り点（この時点で MD 最終節／未確定 pending
+                        # 行の flush は**行わない**＝旧実装の取りこぼし挙動を再現する）。
+                        if not imp_map and len(heap) >= max_hits:
+                            hit_limit_reached = True
+                            break
+                    if not hit_limit_reached:
+                        if is_md:
+                            _emit_md_section(line_i)
+                        else:
+                            for h in pending:
+                                s, e = max(1, h - 2), min(line_i, h + 2)
+                                text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
+                                _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
                 except OSError:
                     pass
             finally:
@@ -621,6 +640,15 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                         h["file_truncated"] = True
                 if truncated_docs is not None and rel not in truncated_docs:
                     truncated_docs.append(rel)
+            # RV是正 再判定（rv-i2-importance #2・コーディネータ裁定2026-09-05）: ファイル境界の
+            # 打切り点（旧実装と同じ「ヒット数到達時の return」の意味論）——`imp_map` が空（rank一様）
+            # でヒープが `max_hits` で満杯なら、以後のファイル・root を一切開かない（`_check_deadline()`
+            # を含む以降の周期チェックも実行されない＝旧実装の deadline 消費水準に戻る）。
+            if not imp_map and len(heap) >= max_hits:
+                stop_scan = True
+                break
+        if stop_scan:
+            break
     _check_deadline()
     # heap は有界（高々 max_hits 件）——最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・
     # 同rankは発見順）へ並べ替えて返す。`entry`=(rank, -seq, hit) なので、
