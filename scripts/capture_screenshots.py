@@ -268,7 +268,9 @@ def _scene_es_search(page):
 
 def _scene_admin_settings(page):
     # admin-settings.js は checkAdmin()（/auth/me）成功後に load()（/admin/settings）を呼ぶ。
-    # 取り込みアーム一覧（#arms-list）が描画され、既定/固定中の判定文言が入るまで待つ（RV Med と同型の待ち方）。
+    # UI-TABS 化（2026-09-04）以降、アーム一覧（#arms-list）は「取り込み設定」タブの中＝既定タブでは
+    # 非表示。先にタブを選択してから描画完了（既定/固定中の判定文言）を待つ。
+    page.click('.tab-btn[data-tab="ingest"]')
     page.wait_for_selector("#arms-list .armrow", state="visible", timeout=10000)
     page.wait_for_function(
         "() => (document.getElementById('arms-status')?.textContent || '').length > 0",
@@ -329,7 +331,7 @@ SCENES: list[Scene] = [
           "取り込み状況内の全文検索パネルで検索し、ヒット一覧カードを切り出す",
           setup=_scene_es_search, crop=".es-card", routes=routes_es_search),
     # --- 30. システム管理 ---
-    Scene("30-admin-settings", "admin-settings.html",
+    Scene("24-admin-settings", "admin-settings.html",
           "システム管理画面（取り込み設定・旧形式変換・視覚読み取りAI・管理メニュー）を上部から",
           setup=_scene_admin_settings, crop=".wrap2.frm", viewport=WIDE_VIEWPORT),
 ]
