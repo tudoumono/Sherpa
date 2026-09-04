@@ -1558,7 +1558,7 @@ def test_history_does_not_leak_into_message_for_confirm_id_or_routing():
     from sherpa.providers.base import _can_ask
 
     history = [
-        {"role": "user", "content": "選択: 影響を調べる\n確認ID: lens-0011\n元の依頼: 消費税率を変えたい"},
+        {"role": "user", "content": "選択: 影響を調べる\n確認ID: ask-0011\n元の依頼: 消費税率を変えたい"},
         {"role": "assistant", "content": "影響分析の結果です。"},
     ]
     assert "確認ID" in history[0]["content"]                          # 前提: 履歴側には確かにマーカーがある
@@ -1902,10 +1902,10 @@ def test_finalize_replaces_headline_for_hybrid_sub_task_id_even_with_budget_stop
 def test_finalize_does_not_replace_headline_for_impact_even_when_loosest():
     """impact/troubleshoot には層の概念が無く既存 headline が十分具体的なため対象外（RV1 #9）。"""
     env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": False})
-    env["headline"] = "「税率」に依存する資材は見つかりませんでした（表記ゆれ、または影響なし）。"
+    env["headline"] = "「税率」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
     out = CS._finalize(env, {"lens": "impact", "reason": "変更・影響の語"})
     assert "retry_hints" not in out
-    assert out["headline"] == "「税率」に依存する資材は見つかりませんでした（表記ゆれ、または影響なし）。"
+    assert out["headline"] == "「税率」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
 
 
 # ===== handle_message/stream_message の lens 配線（SC-6b・end-to-end but DB 不要）=====

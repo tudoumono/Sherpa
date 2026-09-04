@@ -133,10 +133,10 @@ let _usageChatAiAvailable = false;
 // 同じセンチネルに揃えておけば、実際に openai/ollama のどちらかを選ぶまで「未変更」のまま
 // 保てる（`renderUsageChatAi`/`usageChatProviderChanged` 参照）。
 const _USAGE_CHAT_PROVIDER_INVALID = '__invalid__';
-// 「実行構成に合わせる（既定）」選択肢の DOM 上の値（`data-usage-chat-provider=""`）。
+// 「頭脳の選択に合わせる（既定）」選択肢の DOM 上の値（`data-usage-chat-provider=""`）。
 // `configured`（生の保存値・null＝未設定）と 1:1 対応させる——選択/dirty 判定・PUT で送る値の
 // 生成は全てこの値と `configured` の対応（`''` ⇔ `null`）を介して行う。ラジオの3択
-// （実行構成に合わせる／OpenAI に固定／ローカル(Ollama) に固定）は、`effective`（A7 連動で
+// （頭脳の選択に合わせる／OpenAI に固定／ローカル(Ollama) に固定）は、`effective`（A7 連動で
 // 解決された「いま実際に使われる値」・毎回変わりうる）ではなく、常にこの `configured` を
 // 基準に選択状態を決める——`effective` を基準にすると、「未設定なので今はたまたま openai」と
 // 「明示的に openai へ固定」が画面上で区別できず、admin が「OpenAI が選ばれている」ように
@@ -400,7 +400,7 @@ function renderRagLlmRenderStatus(rr) {
     : '既定に従っています（変更して保存すると、この内容で固定されます）。';
 }
 
-// STAT-2: 利用統計チャット専用の AI 選択。3択（実行構成に合わせる／OpenAI に固定／
+// STAT-2: 利用統計チャット専用の AI 選択。3択（頭脳の選択に合わせる／OpenAI に固定／
 // ローカル(Ollama) に固定）——選択状態は常に `configured`（生の保存値）を基準にする
 // （`_USAGE_CHAT_FOLLOW_VALUE` 参照・`effective` を基準にしない理由も同所参照）。
 // 実サーバは常にこのキーを持つ（`AdminSettingsView` の drift ガードで保証）ため、欠落/形状
@@ -453,14 +453,14 @@ function renderUsageChatAi(uc, cloud) {
   // 選択肢の横に注記する。
   const cloudProvider = (cloud && cloud.provider) || 'openai';
   const cloudLabelFor = (p) => (CLOUD_PROVIDER_LABELS[p] || { label: p }).label;
-  const options = [{ value: _USAGE_CHAT_FOLLOW_VALUE, label: '実行構成に合わせる（既定）' }]
+  const options = [{ value: _USAGE_CHAT_FOLLOW_VALUE, label: '頭脳の選択に合わせる（既定）' }]
     .concat(uc.providers.map((p) => ({ value: p, label: `${USAGE_CHAT_PROVIDER_LABELS[p] || p} に固定` })));
   wrap.innerHTML = warningHtml + invalidRadio + options.map((opt) => {
     const isFollow = opt.value === _USAGE_CHAT_FOLLOW_VALUE;
     const checked = !invalidSaved && (isFollow ? configured == null : opt.value === configured)
       ? ' checked' : '';
     const openaiKeyHint = (opt.value === 'openai' && cloudProvider !== 'openai')
-      ? `<div class="hint">OpenAI のキーは実行構成が OpenAI のときだけ使えます`
+      ? `<div class="hint">OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます`
         + `（現在: ${esc(cloudLabelFor(cloudProvider))}）。</div>`
       : '';
     return `<label class="cloud-provider-row">`
@@ -480,8 +480,8 @@ function renderUsageChatAiStatus(uc, cloud) {
   const cloudLabel = (CLOUD_PROVIDER_LABELS[cloudProvider] || { label: cloudProvider }).label;
   const lead = (uc.configured != null)
     ? 'この設定で固定中です（既定の変更にはこの先も追従しません）。'
-    : '実行構成に合わせています（変更して保存すると、この内容で固定されます）。';
-  el.textContent = `${lead} いま実際に使われるのは: ${label(uc.effective)}（実行構成: ${cloudLabel}）。`;
+    : '頭脳の選択に合わせています（変更して保存すると、この内容で固定されます）。';
+  el.textContent = `${lead} いま実際に使われるのは: ${label(uc.effective)}（頭脳の選択: ${cloudLabel}）。`;
 }
 function selectedUsageChatProvider() {
   if (!_usageChatAiAvailable) return null;
@@ -1569,7 +1569,7 @@ function validateAgenticBudgetInputs() {
 }
 
 // ===== BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定・
-// モデル窓連動）: 現在のモデルの窓ヒント表示＋モデル窓の管理者登録表（追加/上書き/削除）。=====
+// モデルが一度に読める量との連動）: 現在のモデルのヒント表示＋一度に読める量の管理者登録表（追加/上書き/削除）。=====
 
 const _MODEL_WINDOW_PROVIDER_LABELS = {
   openai: 'OpenAI', gemini: 'Gemini（Google）', bedrock: 'AWS Bedrock (Claude)',
@@ -1580,7 +1580,7 @@ const _MODEL_WINDOW_SOURCE_LABELS = {
   unknown: '不明',
 };
 
-// 現在のモデル・窓・出所・自動調整後の上限（ヒント表示のみ・入力欄ではない）。
+// 現在のモデル・一度に読める量・出所・自動調整後の上限（ヒント表示のみ・入力欄ではない）。
 function renderAgenticBudgetWindow(ab) {
   const status = $('agentic-budget-window-status');
   const unknownBox = $('agentic-budget-window-unknown');
@@ -1593,7 +1593,7 @@ function renderAgenticBudgetWindow(ab) {
     unknownBox.hidden = false;
   } else {
     const sourceLabel = _MODEL_WINDOW_SOURCE_LABELS[w.source] || w.source;
-    status.textContent = `現在のモデル: ${providerLabel} / ${modelLabel}　窓: `
+    status.textContent = `現在のモデル: ${providerLabel} / ${modelLabel}　一度に読める量: `
       + `${w.window_tokens.toLocaleString('ja-JP')} トークン（出所: ${sourceLabel}）　`
       + `自動調整後の上限: ${_fmtBytesHuman(w.derived_cap_bytes)}`;
     unknownBox.hidden = true;
@@ -1672,10 +1672,10 @@ function validateModelWindowsInputs() {
     const model = ((tr.querySelector('.mw-model') || {}).value || '').trim();
     const tokensRaw = ((tr.querySelector('.mw-tokens') || {}).value || '').trim();
     if (!model && tokensRaw === '') return;   // 完全な空行は無視
-    if (!model) { errors.push('モデルの窓の登録: モデル名を入力してください'); return; }
+    if (!model) { errors.push('モデルが一度に読める量の登録: モデル名を入力してください'); return; }
     const n = Number(tokensRaw);
     if (tokensRaw === '' || !Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 10_000_000) {
-      errors.push(`モデルの窓の登録（${model}）: 窓（トークン数）は1〜10,000,000の整数で指定してください`);
+      errors.push(`モデルが一度に読める量の登録（${model}）: 一度に読める量（トークン数）は1〜10,000,000の整数で指定してください`);
     }
   });
   return errors;
@@ -1822,7 +1822,7 @@ async function save() {
   const depthProfileErrors = validateDepthProfileInputs();
   // BUDGET-1（§3.4）: agentic search の tool-result バイト予算も同じ理由で保存前に弾く。
   const agenticBudgetErrors = validateAgenticBudgetInputs();
-  // BUDGET-2（§3.4）: モデル窓の登録表も同様に保存前に弾く。
+  // BUDGET-2（§3.4）: モデルが一度に読める量の登録表も同様に保存前に弾く。
   const modelWindowsErrors = validateModelWindowsInputs();
   const rangeErrors = depthProfileErrors.concat(agenticBudgetErrors).concat(modelWindowsErrors);
   if (rangeErrors.length) {
@@ -1905,7 +1905,7 @@ async function save() {
   collectDepthProfile(body);   // SC-6c: 調べる深さの基準値（変わった項目だけ送る）
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
   collectAgenticBudget(body);  // BUDGET-1（§3.4）: 検索の情報量予算（変わった項目だけ送る）
-  collectModelWindowsTable(body);   // BUDGET-2（§3.4）: モデル窓の登録表（変わっていれば送る）
+  collectModelWindowsTable(body);   // BUDGET-2（§3.4）: モデルが一度に読める量の登録表（変わっていれば送る）
   try {
     const view = await api('PUT', '/admin/settings', body);
     render(view);
@@ -2038,7 +2038,7 @@ async function resetIngestTab() {
     arms_enabled: null, legacy_backend: null, vlm: null, rag_llm_render: null,
     // BUDGET-1（§3.4）: 検索の情報量予算も「取り込み」タブの一部（このタブの既定に戻す対象）。
     agentic_budget_per_result: null, agentic_budget_total: null,
-    // BUDGET-2（§3.4）: モデル窓の登録表も同じタブの一部。
+    // BUDGET-2（§3.4）: モデルが一度に読める量の登録表も同じタブの一部。
     model_context_windows: null,
   };
   let view;

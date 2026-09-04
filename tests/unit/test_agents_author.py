@@ -54,7 +54,7 @@ def _ctx_with_blocked_dispatch(lens="qa"):
         world="v1",
         route=lambda msg: {"lens": lens, "input": msg, "reason": "test", "confident": True},
         dispatch=lambda lens_, inp: {
-            "headline": "資料の検索経路がすべてOFF/利用できません（「詳細」で grep・全文のいずれかを有効にしてください）。",
+            "headline": "資料の「使う検索」がすべてOFF/利用できません（「詳細」で grep・全文のいずれかを有効にしてください）。",
             "summary": {"total": 0}, "data": {}, "sources": [], "_tools_blocked": True,
         },
         knowledge=True,
@@ -71,7 +71,7 @@ def test_gather_tools_blocked_replaces_done_detail_with_blocked_message():
     assert tool_done, "tool ノードが無い"
     for n in tool_done:
         assert "件を確認" not in n["detail"]
-        assert "検索経路が無効" in n["detail"]
+        assert "使う検索が無効" in n["detail"]
 
 
 def test_gather_tools_blocked_sidecar_not_leaked_to_public_env():

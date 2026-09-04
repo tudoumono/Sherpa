@@ -172,7 +172,7 @@ def _gather(ctx: Ctx):
     検索経路トグル（調べ方ブロック §3.6・SC-6e）: `ctx.dispatch(...)`（`chat_service.
     _dispatch`）が実行不能（必須ツールが全て OFF/実接続不達）と判定すると、返す env に内部専用
     サイドカー `_tools_blocked=True` を載せる（`agentic_search.tools_blocked_env` 参照）。ここで
-    pop して読み、"done" ノードの文言を「N件を確認」から「検索経路が無効です」へ切り替える——
+    pop して読み、"done" ノードの文言を「N件を確認」から「使う検索が無効です」へ切り替える——
     実際には何も検索していないのに完了したかのような trace を出さないため。可用性そのものを
     ここで再計算しない（`_dispatch` 側で1回だけ判定済みの結果を trace 表示に反映するだけ）。
     """
@@ -198,11 +198,11 @@ def _gather(ctx: Ctx):
     for tid, tlabel in tools:
         yield _node(tid, "tool", tlabel, "照会しています", "active")
     env = ctx.dispatch(lens, decision["input"])
-    blocked = env.pop("_tools_blocked", False)   # SC-6e: 検索経路が全て OFF/不達で未実行
+    blocked = env.pop("_tools_blocked", False)   # SC-6e: 使う検索が全て OFF/不達で未実行
     total = env.get("summary", {}).get("total", 0)
     for tid, tlabel in tools:
         pace()
-        detail = "検索経路が無効です（詳細で ON にしてください）" if blocked else f"{total}件を確認"
+        detail = "使う検索が無効です（詳細で ON にしてください）" if blocked else f"{total}件を確認"
         yield _node(tid, "tool", tlabel, detail, "done")
     yield {"type": "_env", "decision": decision, "env": env}
 
@@ -1789,7 +1789,7 @@ class _GenProvider(Provider):
         structural_evidence_meta: list = []   # 検証済み list entry/card 裏付け doc の内訳
         agentic_usage = None       # F3: agentic_search がターンを跨いで合算した usage（生トークン・"final" 到達時のみ）。
         # 検索アシスタント（2026-08-15）: 誰が資料を読んでいるかを思考の流れで分かるようにする。
-        # 以前は「資料を検索（grep）」等のノードがメイン検索時と全く同じで、回答末尾の使用量を
+        # 以前は「資料を検索（語句そのまま）」等のノードがメイン検索時と全く同じで、回答末尾の使用量を
         # 開くまで区別できなかった（実測での指摘）。
         # EXT-4（拡張設計 §10・UI 階層表示）: ハイブリッド（単一下調べ役）の全ノードへ `agent_run_id`
         # （`sub:{profile_id}:1`＝実行が1本のため seq 固定）と `metrics.provider`/`model` を付与する。

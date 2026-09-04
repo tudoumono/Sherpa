@@ -462,23 +462,23 @@
               （調べきれなかった旨も併せて伝えます）。</div>
 
             <!-- BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定）:
-                 現在のモデルの「窓」（一度に読める分量の上限）に合わせて、上の予算を自動で
+                 現在のモデルが一度に読める量（トークン数の上限）に合わせて、上の予算を自動で
                  これ以上安全な値まで縮める（縮むだけ・自動では増えない）。 -->
             <div class="hint" style="margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--border)">
-              現在のモデルの窓（一度に読める分量の上限）が分かっている場合、上の予算はその窓を
-              超えないところまで自動的に絞られます（窓が大きくても、上の予算より増えることはありません）。</div>
-            <div class="hint" id="agentic-budget-window-status"><!-- JS: 現在のモデル・窓・出所・自動調整後の上限 --></div>
+              現在のモデルが一度に読める量（トークン数）が分かっている場合、上の予算はその量を
+              超えないところまで自動的に絞られます（一度に読める量が大きくても、上の予算より増えることはありません）。</div>
+            <div class="hint" id="agentic-budget-window-status"><!-- JS: 現在のモデル・一度に読める量・出所・自動調整後の上限 --></div>
             <div class="hint danger" id="agentic-budget-window-unknown" hidden>
-              このモデルの窓が未登録です。既定予算で動作中です——窓のトークン数を下の表に登録すると、
+              このモデルが一度に読める量が未登録です。既定予算で動作中です——下の表に登録すると、
               予算が自動調整されるようになります。</div>
 
             <div style="margin-top:14px">
-              <div class="vlm-l" style="margin-bottom:6px">モデルの窓の登録（任意）</div>
-              <div class="hint" style="margin-bottom:8px">プロバイダAPIから自動で分からないモデルの窓（トークン数）を
-                手動で登録できます。行を追加・値を上書き・不要な行を削除できます（プロバイダ名は
+              <div class="vlm-l" style="margin-bottom:6px">モデルが一度に読める量の登録（任意）</div>
+              <div class="hint" style="margin-bottom:8px">プロバイダAPIから自動で分からない場合に手動で登録できます。
+                行を追加・値を上書き・不要な行を削除できます（プロバイダ名は
                 「使えるモデル」タブと同じもの・モデル名は実際に使っているモデル名と一致させてください）。</div>
               <table class="mc-table" id="agentic-model-windows-table">
-                <thead><tr><th>プロバイダ</th><th>モデル名</th><th>窓（トークン数）</th><th></th></tr></thead>
+                <thead><tr><th>プロバイダ</th><th>モデル名</th><th>一度に読める量（トークン数）</th><th></th></tr></thead>
                 <tbody id="agentic-model-windows-rows"></tbody>
               </table>
               <button class="btn-ghost" id="agentic-model-windows-add" type="button" style="margin-top:8px">行を追加</button>

@@ -112,7 +112,7 @@ def test_is_incomplete_false_for_other_stop_reasons(stop_reason):
 
 def test_trace_tool_stats_counts_calls_and_files_read():
     trace = [
-        {"id": "n1", "kind": "tool", "label": "資料を検索（grep）", "detail": "x", "status": "done"},
+        {"id": "n1", "kind": "tool", "label": "資料を検索（語句そのまま）", "detail": "x", "status": "done"},
         {"id": "n2", "kind": "tool", "label": "該当箇所を精読", "detail": "y", "status": "done"},
         {"id": "n3", "kind": "tool", "label": "該当箇所を精読", "detail": "z", "status": "done"},
         {"id": "n4", "kind": "think", "label": "質問を理解", "detail": "", "status": "done"},

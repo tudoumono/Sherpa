@@ -27,7 +27,7 @@ const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime, mdLite =
 
 const LENS_LABEL = { impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', author: '資料を作成' };
 const STATUS_CLASS = { deprecated: 'deprecated', hidden_candidate: 'hidden_candidate' };
-const STATUS_LABEL = { deprecated: '廃止', hidden_candidate: '隠し候補' };
+const STATUS_LABEL = { deprecated: '廃止', hidden_candidate: '未使用の疑い' };
 
 // 質問例チップのブロック（EXAMPLES が空＝管理者が非表示に設定＝空文字を返しブロック自体を出さない）。
 // welcome() の初回描画・refreshWelcomeExamples() の後追い更新（管理者設定 `chat_examples` の
@@ -51,7 +51,7 @@ export function welcome() {
     + '</ol>';
   const el = appendAssistantRaw(steps
     + '<div class="muted">気になることを、いつもの言葉で質問してください。'
-    + '社内資料に基づく回答が必要なときは、<b>「ナレッジ参照」をオン</b>に。</div>' + _examplesHtml());
+    + '社内資料に基づく回答が必要なときは、<b>「社内資料」をオン</b>に。</div>' + _examplesHtml());
   el.classList.add('welcome-msg');   // 送信時に消すための目印（重なり防止）
 }
 
@@ -120,7 +120,7 @@ function agentProfileOf(key) {
 }
 function _humanizeProfile(profile) {
   const cleaned = String(profile || '').replace(/^search-helper-/, '').replace(/[-_]+/g, ' ').trim();
-  return cleaned || '下調べ役';
+  return cleaned || '下調べ';
 }
 const AGENT_STATUS_LABEL = { active: '実行中', done: '完了', failed: '失敗', cancelled: '取消', aborted: '中断' };
 function agentStatusChipHTML(status) {
@@ -221,7 +221,7 @@ function _bucketKeyFor(e) {
   return null;   // think/agent/evaluation/hook 等は常に個別表示（milestone を隠さない）
 }
 function _bucketLabelFor(e, key) {
-  return key.startsWith('tool:') ? (e.label || 'ツール呼び出し') : (EVENT_TYPE_AGG_LABEL[e.event_type] || e.event_type);
+  return key.startsWith('tool:') ? (e.label || '調べる操作の回数') : (EVENT_TYPE_AGG_LABEL[e.event_type] || e.event_type);
 }
 
 // ---- 葉ノード（.fstep）: v1 の見た目を踏襲しつつ kind/status の新設値・担当バッジに対応 ----
@@ -441,7 +441,7 @@ export class TraceTreeV2 {
     bits.push(agentStatusChipHTML(s.status));
     if (s.skill) bits.push(`<span class="fagent-stat">得意分野: ${esc(s.skill)}</span>`);
     bits.push(`<span class="fagent-stat">調査の回数 ${s.cycles}</span>`);
-    bits.push(`<span class="fagent-stat">道具の使用回数 ${s.toolCalls}</span>`);
+    bits.push(`<span class="fagent-stat">調べる操作の回数 ${s.toolCalls}</span>`);
     // サーバが候補/根拠の専用イベントをまだ発行していない現状では、一度もそれらしいイベントを
     // 見ていないレーンに「候補 0」「根拠 0」を出さない（誤って「調べて0件だった」と読めて
     // しまうため・実際は「未計測」）。
@@ -661,7 +661,7 @@ const STOP_REASON_TOKEN_LABEL = Object.assign(Object.create(null), {
   // 語彙一致テストが対応表のキーをリテラル文字列として抽出するため、変数参照ではなく直書きする）。
   unknown: '終了理由を確認できませんでした',
   turns_exhausted: '調査の上限に到達', budget_exceeded: '調査の上限に到達',
-  tools_per_turn_exceeded: '道具の使用回数の上限に到達',
+  tools_per_turn_exceeded: '調べる操作の回数の上限に到達',
   evaluation_blocked: '根拠不足で中断', evidence_verification_failed: '根拠不足で中断',
   refusal: 'AI が回答を控えた',
   truncated: '出力上限で途中終了', content_filtered: '内容の制限で終了',
@@ -670,7 +670,7 @@ function _stopReasonText(raw) {
   if (!raw || typeof raw !== 'string') return STOP_REASON_UNKNOWN_TEXT;
   return STOP_REASON_TOKEN_LABEL[raw] || STOP_REASON_UNKNOWN_TEXT;
 }
-// STOP-1: 調査予算（ターン数／呼び出し予算／1応答あたりの道具の使用回数）到達で打ち切られた
+// STOP-1: 調査予算（ターン数／呼び出し予算／1応答あたりの調べる操作の回数）到達で打ち切られた
 // ターン——本文が「途中までの結果」であることに利用者が気づけるよう、答弁本文とは別に注記を出す
 // 対象の stop_reason（根拠不足・出力上限・安全フィルタ・回答拒否・理由不明は対象外＝それぞれ別の
 // 意味を持つため、この注記の「範囲を絞る／続きを調べて」という案内は当てはまらない）。
@@ -710,7 +710,7 @@ function _computeProviderSummary(trace, answer) {
   };
   (Array.isArray(trace) ? trace : []).forEach((e) => {
     if (!e || e.type !== 'node') return;
-    // `agent_completed`（下調べ役が1ステップを終えた合図）は担当バッジ表示用に metrics を持つが、
+    // `agent_completed`（下調べが1ステップを終えた合図）は担当バッジ表示用に metrics を持つが、
     // それ自体は新しい作業ではなく既に集計済みの作業の完了通知なので、ここでは数えない
     // （数えると「その他の処理」に実体のない1回が水増しされる）。
     if (e.event_type === 'agent_completed') return;
@@ -861,7 +861,7 @@ function usageMetaHTML(u) {
     + `<div>出力トークン: ${(u.output_tokens | 0).toLocaleString()} <span class="muted">${reason}</span></div>`
     + '</div></details>';
 }
-// S4-e（複数プロファイル並用・UI表示・§6.3）: サブループ（下調べ役等）のトークン使用量を
+// S4-e（複数プロファイル並用・UI表示・§6.3）: サブループ（下調べ等）のトークン使用量を
 // プロファイル別に additive 表示する。`answer.usage_subs`（複数・S4 プランナ実行時）と
 // `answer.usage_sub`（単一・S3 以来のハイブリッド）のどちらも見る（無ければ何も出さない＝
 // 旧メッセージ・非プランナ経路は従来どおり何も出ない）。折りたたみは既存 usage-meta の流儀
@@ -878,12 +878,12 @@ function usageSubMetaHTML(answer) {
   const list = subs.length >= 2 ? subs : (answer.usage_sub ? [answer.usage_sub] : subs);
   if (!list.length) return '';
   const rows = list.map((u) => {
-    const name = esc((u && u.profile) || '下調べ役');
+    const name = esc((u && u.profile) || '下調べ');
     const inN = ((u && u.input_tokens) | 0).toLocaleString();
     const outN = ((u && u.output_tokens) | 0).toLocaleString();
     return `<div>${name}: 入力 ${inN} / 出力 ${outN} トークン</div>`;
   }).join('');
-  const summary = list.length > 1 ? `🧭 下調べ役の使用量（${list.length}件）` : '🧭 下調べ役の使用量';
+  const summary = list.length > 1 ? `🧭 下調べの使用量（${list.length}件）` : '🧭 下調べの使用量';
   return `<details class="usage-meta usage-sub-meta"><summary>${summary}</summary>`
     + `<div class="usage-detail">${rows}</div></details>`;
 }
@@ -923,8 +923,8 @@ function answerHTML(answer, trace, feedback) {
   // を出す（v1 は従来どおり何も出さない）。
   const summaryHTML = (answer.trace_version === 2)
     ? _providerSummaryHTML(_computeProviderSummary(trace, answer)) : '';
-  if (answer.lens === 'chat') {   // ナレッジ参照オフ＝素の会話（出典枠なし・通常チャット表示）
-    return `<div class="chips"><span class="chip ghost">💬 通常チャット（ナレッジ参照オフ）</span></div>`
+  if (answer.lens === 'chat') {   // 社内資料参照オフ＝素の会話（出典枠なし・通常チャット表示）
+    return `<div class="chips"><span class="chip ghost">💬 通常チャット（社内資料参照オフ）</span></div>`
       + `<div class="headline">${mdLite(answer.headline)}</div>`
       + personalHTML + summaryHTML + usageHTML + usageSubHTML
       + '<button class="copybtn" data-copy>⧉ コピー</button><button class="copybtn" data-export>⬇ 書き出し</button>'
@@ -1037,7 +1037,7 @@ function refGraphHTML(answer) {   // #5: 折りたたみで「参照したナレ
   const sub = subgraphFromAnswer(answer);
   if (sub.nodes.length < 2) return '';
   return `<div class="refgraph"><button class="refgraph-h" data-rg="${esc(JSON.stringify(sub))}">`
-    + `🕸 参照したナレッジグラフ（${sub.nodes.length} ノード・${sub.edges.length} 関係）<span class="caret">▾</span></button>`
+    + `🕸 参照したナレッジグラフ（${sub.nodes.length}件・つながり${sub.edges.length}本）<span class="caret">▾</span></button>`
     + '<div class="refgraph-body" hidden></div></div>';
 }
 export function initRefGraph(el, sub) {   // 小さな部分グラフを cytoscape で描く（起点=オレンジ大／影響=teal）

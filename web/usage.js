@@ -470,19 +470,19 @@ function providerLabel(p) { return PROVIDER_LABEL[p] || p || '不明'; }
 // S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 用途別（kind）内訳の平文日本語ラベル。
 // 未知 kind は生の kind をそのまま表示（fail-safe）。
 const KIND_LABEL = {
-  'chat-sub': '下調べ（サブAI）',
+  'chat-sub': '下調べ',
   research: '外部連携の調査',
   extract: 'ナレッジ抽出（旧機能）',
   propose: '概念の候補づくり（旧機能）',
-  chat: '会話', intent: '意図の判定',
-  embed: '検索用ベクトル化', graph_ask: 'グラフへの質問', vlm: '画像の読み取り',
+  chat: '会話', intent: '依頼の仕分け',
+  embed: '検索の索引づくり', graph_ask: 'グラフへの質問', vlm: '画像の読み取り',
   // S4-c（2026-07-15-LLMオーケストレーション実装計画.md §6.3）: 複数プロファイル自動選択の計画呼び出し。
   'chat-plan': '進め方の計画',
   usage_chat: '利用統計チャット',
   // EXT-2c: 清書前のメイン査読（根拠の十分性判定・限定ツール精読）。
   'chat-review': '根拠の査読',
   // M1（§8.6-4）: 取り込み後にバックグラウンドで後追い実行する rag.md の LLM 成形。
-  rag_render: 'ナレッジの読みやすさ整形',
+  rag_render: '検索用文書の整形',
 };
 function kindLabel(k) { return KIND_LABEL[k] || k; }
 // トークン列は null（プロバイダが usage を報告しなかった「報告不能」マーカー）なら「—」で表示する。
@@ -585,10 +585,10 @@ function detailHTML(u) {
 
 function zeroHitCellHTML(u) {
   if (u.zero_hit_rate === null || u.zero_hit_rate === undefined) {
-    return '<td class="num zhr-cell" title="ナレッジ参照ターンがありません">—</td>';
+    return '<td class="num zhr-cell" title="社内資料参照ターンがありません">—</td>';
   }
   const pct = Math.round(u.zero_hit_rate * 100);
-  const tip = `${(u.knowledge_turns || 0).toLocaleString('ja-JP')}件中${(u.zero_hit_turns || 0).toLocaleString('ja-JP')}件がゼロヒット`;
+  const tip = `${(u.knowledge_turns || 0).toLocaleString('ja-JP')}件中${(u.zero_hit_turns || 0).toLocaleString('ja-JP')}件が根拠なし`;
   return `<td class="num zhr-cell" title="${esc(tip)}">${pct}%</td>`;
 }
 
@@ -842,7 +842,7 @@ function ucUpdateOpenaiKeyHint() {
   const show = _ucCloudProvider != null && _ucCloudProvider !== 'openai';
   el.hidden = !show;
   el.textContent = show
-    ? `OpenAI のキーは実行構成が OpenAI のときだけ使えます`
+    ? `OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます`
       + `（現在: ${UC_CLOUD_PROVIDER_LABELS[_ucCloudProvider] || _ucCloudProvider}）。`
     : '';
 }

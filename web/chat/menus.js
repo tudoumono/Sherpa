@@ -210,9 +210,9 @@ function _exportName(title, ext) {   // ファイル名にタイトル＋日時
 const LENS_FULL = { impact: '影響範囲分析', troubleshoot: 'トラブルシュート', qa: '仕様問い合わせ', chat: '通常チャット', author: '資料を作成' };
 function _scopeText(ans) {   // 参照範囲（world/scope/source）を1行に
   const sc = ans.scope || {};
-  if (sc.source === 'off') return 'ナレッジ参照オフ';
+  if (sc.source === 'off') return '社内資料参照オフ';
   const r = (sc.scope_paths && sc.scope_paths.length) ? sc.scope_paths.join('、') : '全体';
-  return (sc.world ? (S.verLabels[sc.world] || sc.world) + ' / ' : '') + r;   // 表示は実名(4期)
+  return (sc.world ? (S.verLabels[sc.world] || '名称未設定の資料フォルダ') + ' / ' : '') + r;   // 表示は実名(4期)
 }
 function _answerLines(ans, md) {
   const L = [(md ? '**回答（' : '回答（') + (LENS_FULL[ans.lens] || ans.lens) + (md ? '）**' : '）'),

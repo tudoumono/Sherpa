@@ -43,7 +43,7 @@ _KNOWN_STOP_REASONS = frozenset(HONEST_FAILURE_STOP_REASONS) | frozenset(INCOMPL
 # `providers/codex/provider.py` の tlabel 辞書）ため両方を含める。ラベル文字列に依存するため、
 # いずれかのプロバイダ側でラベルが変わればここも追随させる必要がある。
 _TOOL_CALL_LABELS = frozenset({
-    "資料の一覧を確認", "資料を検索（grep）", "資料を検索（全文/日本語）", "資料を検索（全文）",
+    "資料の一覧を確認", "資料を検索（語句そのまま）", "資料を検索（全文/日本語）", "資料を検索（全文）",
     "ファイル名で検索",
     "該当箇所を精読", "文書を通読", "見出し構造を確認", "関係グラフをたどる", "ユーザに確認",
 })

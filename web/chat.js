@@ -71,7 +71,7 @@ $('messages').addEventListener('click', (e) => {
   const free = freeEl ? freeEl.value.trim() : '';
   if (!picked.length && !free) { toast('選択してください'); return; }
   const lines = [`確認事項: ${q.prompt || ''}`];
-  if (q.interaction_id) lines.push(`確認ID: ${q.interaction_id}`);   // router clarify(lens-*)の識別＝再質問ループ防止（generic ask_user と区別）
+  if (q.interaction_id) lines.push(`確認ID: ${q.interaction_id}`);   // router clarify(ask-*)の識別＝再質問ループ防止（generic ask_user と区別）
   if (picked.length) lines.push(`選択: ${picked.join('、')}`);
   if (free) lines.push(`補足: ${free}`);
   if (q.original_message) lines.push(`元の依頼: ${q.original_message}`);
@@ -83,7 +83,7 @@ $('messages').addEventListener('click', (e) => {
   // ChatReq.lens として直接送ると「1回限り」契約が崩れる（次に会話を開き直すと explicit 扱いに
   // なる）ため、既存のスラッシュ接頭辞（/影響 等）を再送本文の先頭へ復元し、送信 override の
   // lens にはブロックの継続設定（q.lens_block）を渡して既存の _resolve_lens 経路へそのまま乗せる。
-  // lens 選択の確認カード（interaction_id が lens-*）は本文の「選択:」から chat_router 側で
+  // lens 選択の確認カード（interaction_id が ask-*）は本文の「選択:」から chat_router 側で
   // 解決するため対象外（通常どおり send() を呼ぶ）。
   const isConfirmFirst = typeof q.interaction_id === 'string' && q.interaction_id.startsWith('confirm-');
   let resendText = lines.join('\n');

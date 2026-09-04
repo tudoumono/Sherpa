@@ -76,11 +76,12 @@ def _decision(lens: str, message: str, known_terms, reason: str, confident: bool
 def _resume_lens(message: str):
     """clarify の回答を検出し (lens, original) を返す。検出できなければ (None, None)。
 
-    **router 由来の clarify だけ**を識別するため `確認ID: lens-*` marker を必須にする（agentic の generic
+    **router 由来の clarify だけ**を識別するため `確認ID: ask-*` marker を必須にする（agentic の generic
     `ask_user` も『選択:/元の依頼:』形式を使うため・誤検出回避＝Codex RV High）。marker があれば選択ラベルを
     lens にマップ（解決不可は qa＝再質問しない）。**再開は heuristic/曖昧判定に戻さない**＝再質問ループ回避。
+    旧 `lens-*`（VOCAB-1 改称前に発行済みの確認カードへの回答）も引き続き受理する＝進行中の会話を壊さない。
     """
-    if not re.search(r"確認ID[:：]\s*lens-\S+", message):
+    if not re.search(r"確認ID[:：]\s*(?:ask|lens)-\S+", message):
         return None, None                               # router clarify でない（generic ask_user 等）→ 通常判定へ
     pick = re.search(r"選択[:：]\s*(.+)", message)
     label = pick.group(1) if pick else ""
@@ -93,7 +94,7 @@ def _resume_lens(message: str):
 def route(message: str, world: str = "v1", known_terms=None) -> dict:
     """メッセージ → {lens, input, reason, confident}。`confident=False`＝曖昧（chat_service が LLM/clarify へ）。
 
-    - clarify の回答（`確認ID: lens-*` marker 付き）は**最初に**解決（選択→lens・元の依頼を input に）＝再質問ループ防止。
+    - clarify の回答（`確認ID: ask-*` marker 付き）は**最初に**解決（選択→lens・元の依頼を input に）＝再質問ループ防止。
     - **強い cue（障害/影響/作成）が2カテゴリ以上同居の時だけ曖昧**。1カテゴリだけ＝確定。
       弱い qa cue（?/ですか 等）は曖昧要因にしない（P1-a: author 追加も同じ既存設計を踏襲）。
     - cue 無しは **qa 既定（confident）**＝AIなし環境で素の検索に毎回 lens 確認を出さない（Codex RV）。
@@ -155,7 +156,7 @@ def extract_slash_lens(message: str):
 
 def clarify_question(message: str) -> dict:
     """曖昧時に出す『どの調べ方か』の確認（ask_user と同じ question イベント形）。"""
-    return {"type": "question", "interaction_id": "lens-" + secrets.token_hex(4),
+    return {"type": "question", "interaction_id": "ask-" + secrets.token_hex(4),
             "mode": "single", "prompt": "どのやりたいことをしますか？（影響範囲／原因／仕様・内容／作成）",
             "options": list(_CLARIFY_OPTIONS), "allow_free_text": False,
             "original_message": (message or "").strip()}
@@ -171,7 +172,7 @@ def clarify_decision(message: str) -> dict:
 # 調査/作成（dispatch/provider）に入る前に**必ず**確認カードを出す決定的ガード。プロンプト遵守任せ
 # （agents 側 F2 の文言）では「必ず」を保証できないため、ルーター層で question を emit して停止する。
 # lens 選択の clarify とは別物（どの lens かではなく「何を確認してから進めるか」を聞く）＝interaction_id は
-# lens-* を使わない（_resume_lens に横取りさせず、回答再送はフル本文で通常ルーティングさせる）。
+# ask-*（および旧 lens-*）を使わない（_resume_lens に横取りさせず、回答再送はフル本文で通常ルーティングさせる）。
 # 「し」の有無（確認**し**てから／聞いてから）と 進める／すすめる の表記ゆれを吸収する。
 _CONFIRM_FIRST_RE = re.compile(r"(?:確認し?|聞い)てから\s*(?:進|すす)め")
 _CONFIRM_FIRST_OPTIONS = [

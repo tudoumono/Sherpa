@@ -23,9 +23,9 @@ from mock_api import (
 def test_v2_live_stream_shows_agent_lane_aggregation_and_summary(page, web_base_url):
     """ライブ配信（trace_meta マーカー→v2 ノード列→answer）で:
     (a) サブエージェント レーンのカードが折りたたみ可能な形で出て、担当バッジ（ローカル: qwen2.5）・
-        状態・平文の統計（調査の回数/道具の使用回数）が表示される（専門用語ゼロ・内部 slug
+        状態・平文の統計（調査の回数/調べる操作の回数）が表示される（専門用語ゼロ・内部 slug
         "researcher" ではなくサーバの表示名「下調べ役」を出す）、
-    (b) 3件並んだ同種操作（資料を検索（grep））が集約表示（×3）に畳まれ、展開すると個別ノードが見える、
+    (b) 3件並んだ同種操作（資料を検索（語句そのまま））が集約表示（×3）に畳まれ、展開すると個別ノードが見える、
     (c) 「実行の分担」サマリにローカル/クラウド両方の担当が出る、
     (d) 終了理由（自然終了）が明示される、
     (e) サーバがまだ発行していない「候補」統計はレーンに出ない（0 の誤断定をしない）、
@@ -52,7 +52,7 @@ def test_v2_live_stream_shows_agent_lane_aggregation_and_summary(page, web_base_
     expect(lane).to_contain_text("ローカル: qwen2.5")        # 担当バッジ（is_local="local" をサーバから受け取る）
     expect(lane.locator(".fagent-status")).to_contain_text("完了")
     expect(lane).to_contain_text("調査の回数 1")            # 旧 "Cycle 1"（専門用語ゼロ・中8）
-    expect(lane).to_contain_text("道具の使用回数 4")         # 旧 "Tool 4"（grep×3 + 精読×1）
+    expect(lane).to_contain_text("調べる操作の回数 4")         # 旧 "Tool 4"（grep×3 + 精読×1）
     expect(lane).not_to_contain_text("候補")                # サーバ未発行のため 0 の誤断定をしない（中6）
     # evidence_committed（evidence-committed ノード）は agent_run_id を持たない（providers/base.py の
     # 実際の発行位置＝根拠ゲート直後・run 全体の最終確定であり特定サブに属さない）＝main 直下に出る。
@@ -61,7 +61,7 @@ def test_v2_live_stream_shows_agent_lane_aggregation_and_summary(page, web_base_
 
     agg = lane.locator(".fagg")
     expect(agg).to_have_count(1)
-    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（grep）×3")
+    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（語句そのまま）×3")
     expect(agg.locator(".fagg-body")).to_be_hidden()   # 既定は折りたたみ（<details> 既定 closed）
     agg.locator(".fagg-head").click()
     expect(agg.locator(".fagg-body")).to_be_visible()
@@ -118,7 +118,7 @@ def test_v2_parent_id_nests_child_nodes_under_parent(page, web_base_url):
     plan_step = page.locator("#flow .fstep", has_text="進め方を計画").first
     child = plan_step.locator("> .fbody").locator("> .fchildren").locator("> .fstep")
     expect(child).to_have_count(1)
-    expect(child).to_contain_text("資料を検索（grep）")
+    expect(child).to_contain_text("資料を検索（語句そのまま）")
     grandchild = child.locator("> .fbody").locator("> .fchildren").locator("> .fstep")
     expect(grandchild).to_have_count(1)
     expect(grandchild).to_contain_text("検索結果を確認")
@@ -143,7 +143,7 @@ def test_v2_parent_id_child_arriving_before_parent_is_reparented_on_arrival(page
     parent_step = page.locator("#flow .fstep", has_text="進め方を計画").first
     child = parent_step.locator("> .fbody").locator("> .fchildren").locator("> .fstep")
     expect(child).to_have_count(1)
-    expect(child).to_contain_text("資料を検索（grep）")
+    expect(child).to_contain_text("資料を検索（語句そのまま）")
 
 
 def test_v2_bucket_reparent_order_a_full_cleanup_before_aggregation(page, web_base_url):
@@ -194,7 +194,7 @@ def test_v2_bucket_reparent_order_b_partial_cleanup_then_later_aggregation(page,
     expect(child).to_contain_text("A")
     agg = page.locator("#flow .fagg")
     expect(agg).to_have_count(1)
-    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（grep）×3")
+    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（語句そのまま）×3")
     agg.locator(".fagg-head").click()
     expect(agg.locator(".fagg-body .fstep")).to_have_count(3)
     expect(agg).not_to_contain_text("A")   # child は集約枠の外（P の下）にいる
@@ -244,7 +244,7 @@ def test_v2_bucket_reparent_order_c_detach_from_existing_aggregation_frame(page,
 
     agg = root.locator(".fagg")
     expect(agg).to_have_count(1)
-    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（grep）×3")
+    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（語句そのまま）×3")
     agg.locator(".fagg-head").click()
     expect(agg.locator(".fagg-body .fstep")).to_have_count(3)
     expect(agg).not_to_contain_text("A")   # child は集約枠から取り除かれ P の下にいたまま
@@ -306,7 +306,7 @@ def test_v2_bucket_surviving_frame_repositions_on_detach(page, web_base_url):
     expect(top).to_have_count(3)
     expect(top.nth(0)).to_contain_text("念のため確認")
     agg = top.nth(1)
-    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（grep）×3")
+    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（語句そのまま）×3")
     expect(top.nth(2)).to_contain_text("進め方を計画")
     agg.locator(".fagg-head").click()
     expect(agg.locator(".fagg-body .fstep")).to_have_count(3)
@@ -421,7 +421,7 @@ def test_v2_stop_reason_blocked_and_budget_categories(page, web_base_url):
     for answer, expected in (
         (V2_BLOCKED_ANSWER, "根拠不足で中断"),
         (V2_BUDGET_ANSWER, "調査の上限に到達"),
-        (V2_TOOLS_LIMIT_ANSWER, "道具の使用回数の上限に到達"),
+        (V2_TOOLS_LIMIT_ANSWER, "調べる操作の回数の上限に到達"),
         (V2_REFUSAL_ANSWER, "AI が回答を控えた"),
         (V2_TRUNCATED_ANSWER, "出力上限で途中終了"),
         (V2_CONTENT_FILTERED_ANSWER, "内容の制限で終了"),
@@ -503,7 +503,7 @@ def test_v2_lane_status_becomes_aborted_when_connection_drops_mid_run(page, web_
         {"type": "node", "id": "search-helper", "kind": "think", "label": "下調べ役に任せる",
          "detail": "qwen2.5 が資料を探して読みます", "status": "done", "agent_run_id": "sub:researcher:1",
          "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
-        {"type": "node", "id": "sub:researcher:1:grep-1", "kind": "tool", "label": "資料を検索（grep）",
+        {"type": "node", "id": "sub:researcher:1:grep-1", "kind": "tool", "label": "資料を検索（語句そのまま）",
          "detail": "「消費税率」", "status": "active", "agent_run_id": "sub:researcher:1",
          "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
     ]
@@ -643,7 +643,7 @@ def test_v2_history_replay_has_same_hierarchy_as_live(page, web_base_url):
 
     agg = lane.locator(".fagg")
     expect(agg).to_have_count(1)
-    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（grep）×3")
+    expect(agg.locator(".fagg-head")).to_contain_text("資料を検索（語句そのまま）×3")
 
     expect(turn.locator(".ftrace-stopreason")).to_contain_text("自然終了")
 

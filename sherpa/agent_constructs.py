@@ -33,9 +33,9 @@ CONSTRUCTS: tuple[dict[str, Any], ...] = (
     {"id": "ollama_only", "agent": "ollama", "codex_model_provider": None,
      "label": "ローカル（Ollama）", "hint": "このパソコン/社内のローカルLLM"},
     {"id": "codex_openai", "agent": "codex", "codex_model_provider": "openai",
-     "label": "Codex（OpenAI）", "hint": "Codex が自分で grep して調べる・モデルは OpenAI"},
+     "label": "Codex（OpenAI）", "hint": "Codex が自分で資料を探して調べる・モデルは OpenAI"},
     {"id": "codex_ollama", "agent": "codex", "codex_model_provider": "ollama",
-     "label": "Codex（Ollama）", "hint": "Codex が自分で grep して調べる・モデルは Ollama"},
+     "label": "Codex（Ollama）", "hint": "Codex が自分で資料を探して調べる・モデルは Ollama"},
 )
 
 # 標準構成が使う頭脳（env に関わらず常に有効）。

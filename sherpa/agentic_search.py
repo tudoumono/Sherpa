@@ -855,15 +855,15 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
 # SYSTEM は検索経路トグル（調べ方ブロック §3.6・SC-6e）に応じて `system_prompt()` が
 # 組み立てる。全ON（既定・省略）は下の断片をそのまま連結した文字列（固定 byte 長＋SHA-256 の
 # golden テストで検証・断片分割はここでしか観測できない実装詳細）。
-# この SYSTEM 文言と調べ方ブロックのチップ表記は「grep」ではなく「コマンド検索」を使う
-# （内部識別子＝ツール名 `ripgrep_search`・tools_pref の `grep` キーは不変。trace ノードの
-# 「資料を検索（grep）」ラベルは e2e/改善ログ語彙が固定しており別スライスで扱う）。
+# この SYSTEM 文言・調べ方ブロックのチップ表記・trace ノードの表示は「grep」ではなく
+# 「語句そのまま検索」で揃える。内部識別子＝ツール名 `ripgrep_search`・tools_pref の
+# `grep` キーは不変（表記のみの統一）。
 _SYS_INTRO_AND_LIST_DOCS = (
     "あなたは社内資料を調べて答えるアシスタントです。事前の索引はありません。"
     "ツールで資料を実際に検索して、**根拠のある事実だけ**で日本語で簡潔（2〜4文）に答えてください。\n"
     "**ドキュメント数・一覧・どんな資料があるか・フォルダ構成といった台帳質問は、まず list_docs を使う**"
-    "（コマンド検索は本文中の一致しか探せず件数/一覧には答えられない）。フォルダ名・ファイル名はパスに含まれるので、"
-    "名前の部分一致は list_docs の name_pattern で当てる（コマンド検索で本文からは探さない）。"
+    "（語句そのまま検索は本文中の一致しか探せず件数/一覧には答えられない）。フォルダ名・ファイル名はパスに含まれるので、"
+    "名前の部分一致は list_docs の name_pattern で当てる（語句そのまま検索で本文からは探さない）。"
     "表記が揺れそうな語（送り仮名・略し方など）は短い部分語で試す（例:「4期更改」がヒットしなければ「4期」）。\n"
     "**件数を答えるときは list_docs の path_prefix でフォルダを確定してから数え、どのフォルダを数えたかを"
     "回答に明示する**（曖昧なら『4期更改』と『4期保守』のように候補フォルダ別の内訳で答える）。\n"
@@ -878,7 +878,7 @@ _SYS_GREP_STEP = (
     "本文の内容を調べる質問の手順: まず ripgrep_search で当たりを付け、関係しそうな箇所を read_around で精読し、"
     "外していれば検索語を変えて再検索する（台帳質問は上記のとおり list_docs が先）。"
 )
-# ファイル名/パスのパターンで探したいとき用（コマンド検索＝grep 軸に同居・grep OFF/不達では
+# ファイル名/パスのパターンで探したいとき用（語句そのまま検索＝grep 軸に同居・grep OFF/不達では
 # glob_search 自体を提示しない・§system_prompt/openai_tools/gemini_tools 参照）。
 _SYS_GLOB_STEP = (
     "ファイル名・フォルダ名のパターンで探したいとき（例:「請求書系のExcelだけ」「JCLを一覧して」）は "
@@ -887,7 +887,7 @@ _SYS_GLOB_STEP = (
 )
 _SYS_ES_FOLLOWUP = (
     "**ripgrep_search が0件/空振りのとき、または言い回しが揺れる概念・日本語の同義語で"
-    "言い換えが必要なときは es_search（全文＋ベクトル）を試す**（コマンド検索は完全一致・固有名詞にしか強くない）。"
+    "言い換えが必要なときは es_search（全文＋ベクトル）を試す**（語句そのまま検索は完全一致・固有名詞にしか強くない）。"
 )
 # grep OFF/不達で es_search が唯一の本文検索手段のときの代替文（ripgrep_search への言及を含めない）。
 _SYS_ES_PRIMARY_STEP = (
@@ -900,10 +900,10 @@ _SYS_GRAPH_STEP = (
     "関連文書など）をたどりたいときは graph_neighbors に正確な名前を渡して関係グラフを引く"
     "（つながりの経路つきで返る）。"
 )
-# grep が使えるときだけ言及する比較文（grep OFF/不達では「コマンド検索を打ち直すより」という
+# grep が使えるときだけ言及する比較文（grep OFF/不達では「語句そのまま検索を打ち直すより」という
 # 比較自体が意味を持たないため外す）。
 _SYS_GRAPH_GREP_COMPARISON = (
-    "**プログラム名/データ項目名などの名前が一つでも判明したら、その関連の広がりはコマンド検索を何度も打ち直すより"
+    "**プログラム名/データ項目名などの名前が一つでも判明したら、その関連の広がりは語句そのまま検索を何度も打ち直すより"
     "先に graph_neighbors で辿るほうが早い**。"
 )
 _SYS_COMPARE_STEP = (
@@ -1617,7 +1617,7 @@ def _tool_node(name: str, args: dict) -> dict:
         a = args or {}
         return _node("フォルダ構成を確認", f"「{a.get('path_prefix') or '全体'}」")
     if name == "ripgrep_search":
-        return _node("資料を検索（grep）", f"「{(args or {}).get('query', '')}」")
+        return _node("資料を検索（語句そのまま）", f"「{(args or {}).get('query', '')}」")
     if name == "glob_search":
         return _node("ファイル名で検索", f"「{(args or {}).get('pattern', '')}」")
     if name == "es_search":
@@ -1644,7 +1644,7 @@ def _tool_node(name: str, args: dict) -> dict:
 _SUB_TOOL_FIXED_WORDING = {
     "list_docs": ("資料の一覧を確認", "資料の一覧を確認しています"),
     "folder_tree": ("フォルダ構成を確認", "フォルダ構成を確認しています"),
-    "ripgrep_search": ("資料を検索（grep）", "資料を検索しています"),
+    "ripgrep_search": ("資料を検索（語句そのまま）", "資料を検索しています"),
     "glob_search": ("ファイル名で検索", "ファイル名で検索しています"),
     "es_search": ("資料を検索（全文/日本語）", "資料を検索しています"),
     "read_around": ("該当箇所を精読", "該当箇所を精読しています"),
@@ -1732,7 +1732,7 @@ def _truncated_docs_node(result: dict) -> dict | None:
 # の両方が起きる）。メイン経路・サブ経路の追加ノードは同じ label を共有する
 # （中身の詳しさだけが違う＝同じ「何のツールの結果か」を指す）。
 _HIT_SUMMARY_LABELS = {
-    "ripgrep_search": "検索結果（grep）",
+    "ripgrep_search": "検索結果（語句そのまま）",
     "glob_search": "検索結果（ファイル名）",
     "es_search": "検索結果（全文/日本語）",
     "graph_neighbors": "検索結果（グラフ）",
@@ -2173,11 +2173,11 @@ def effective_tools_pref(tools_pref: dict | None, availability: dict | None = No
 # （`_DISPATCH_REQUIRES_GRAPH` と対になる2値のみ）。
 _TOOLS_BLOCKED_HEADLINE = {
     "impact": "影響分析はグラフ検索が必要です（現在OFFまたは利用できません）。"
-             "「詳細」で検索経路のグラフをONにしてください。",
+             "「詳細」で使う検索のグラフをONにしてください。",
     "troubleshoot": "トラブルシュートはグラフ検索が必要です（現在OFFまたは利用できません）。"
-                   "「詳細」で検索経路のグラフをONにしてください。",
+                   "「詳細」で使う検索のグラフをONにしてください。",
 }
-_TOOLS_BLOCKED_HEADLINE_DEFAULT = ("資料の検索経路がすべてOFF/利用できません"
+_TOOLS_BLOCKED_HEADLINE_DEFAULT = ("資料の「使う検索」がすべてOFF/利用できません"
                                   "（「詳細」で grep・全文のいずれかを有効にしてください）。")
 
 
@@ -2775,11 +2775,11 @@ STOP_REASONS = frozenset({
     "evaluation_blocked",            # 根拠不足で中断（評価フェーズが「行き詰まり」と判定）
     "turns_exhausted",               # 調査の上限に到達（MAX_TURNS 到達）
     "budget_exceeded",               # 調査の上限に到達（呼び出し予算 call_budget 枯渇）
-    "tools_per_turn_exceeded",       # 道具の使用回数の上限に到達（1応答内の tool 呼び出し数上限）
+    "tools_per_turn_exceeded",       # 調べる操作の回数の上限に到達（1応答内の tool 呼び出し数上限）
     "refusal",                       # AI が回答を控えた（安全上の理由）
     "evidence_verification_failed",  # 根拠不足で中断（citation が全て機械検証で落ちた）
 })
-# STOP-1: 調査予算（ターン数／呼び出し予算／1応答あたりの道具の使用回数）到達で
+# STOP-1: 調査予算（ターン数／呼び出し予算／1応答あたりの調べる操作の回数）到達で
 # 打ち切られた3値——`providers/base.py::_agentic_run` がこの3値を「一般的な失敗」（空回答→単発
 # grep フォールバック）から分離し、固定文言の headline と既存 Evidence Packet を最終 envelope へ
 # 載せる根拠に使う（`web/chat/render.js::BUDGET_EXHAUSTED_STOP_REASONS` と同じ分類・そちらは表示側

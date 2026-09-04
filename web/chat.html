@@ -96,7 +96,7 @@
         </span>
         <button class="btn-ghost" id="sharebtn" title="この会話を共有">🔗 <span class="btxt">共有</span></button>
         <span class="verselect"><span class="btxt">資料フォルダ</span> <select id="version"></select></span>
-        <button class="sidetoggle" id="rightopen" title="思考パネルを開く"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg></button>
+        <button class="sidetoggle" id="rightopen" title="思考の流れを開く"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg></button>
       </span>
     </div>
     <div class="messages" id="messages"></div>
@@ -127,8 +127,8 @@
 
   <!-- 右: 思考の流れ（上・スクロール）＋調べ方ブロック（下・固定フッター） -->
   <aside class="pane right">
-    <div class="rhead"><button class="sidetoggle" id="rightclose" title="思考パネルを閉じる"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg></button>思考の流れ <span class="rt" id="rt"><span class="dot"></span>待機中</span></div>
-    <div class="flow" id="flow"><div class="hint">質問すると、考えた道筋がここに流れます。</div></div>
+    <div class="rhead"><button class="sidetoggle" id="rightclose" title="思考の流れを閉じる"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg></button>思考の流れ <span class="rt" id="rt"><span class="dot"></span>待機中</span></div>
+    <div class="flow" id="flow"><div class="hint">質問すると、考えた流れがここに流れます。</div></div>
     <div class="inquiry" id="inquiry">
       <button class="inquiry-head" id="inquiry-head" type="button" aria-expanded="true" aria-controls="inquiry-body">
         <span class="inquiry-title">🎯 次の質問でやりたいこと</span>
@@ -187,8 +187,8 @@
             <div class="inquiry-row">
               <span class="inquiry-label" title="Codex では効きません（Codex は自前でファイルを検索するため）">使う検索</span>
               <div class="seg" id="tools-seg">
-                <button class="segbtn on" data-tool="grep" type="button">コマンド検索</button>
-                <button class="segbtn on" data-tool="fulltext" type="button">全文・ベクトル</button>
+                <button class="segbtn on" data-tool="grep" type="button" title="(grep)">語句そのまま検索</button>
+                <button class="segbtn on" data-tool="fulltext" type="button" title="(全文・ベクトル)">意味・表記ゆれも探す</button>
                 <button class="segbtn on" data-tool="graph" type="button">グラフ</button>
               </div>
             </div>
@@ -214,7 +214,7 @@
       <label for="share-invitees">招待するユーザー</label>
       <div class="invitee-chips" id="share-invitee-chips"></div>
       <div class="share-suggest-wrap">
-        <input id="share-invitees" type="text" placeholder="uid や表示名で検索（カンマ区切りの手入力も可）" autocomplete="off">
+        <input id="share-invitees" type="text" placeholder="ユーザー名や表示名で検索（カンマ区切りの手入力も可）" autocomplete="off">
         <div class="share-suggest" id="share-invitee-suggest" hidden></div>
       </div>
       <label for="share-days">有効期限（日数）</label>

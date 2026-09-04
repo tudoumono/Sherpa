@@ -119,7 +119,7 @@ def test_improvement_log_export_csv_and_jsonl_include_feedback_and_derived_field
     am = store.add_message(
         conv["id"], "assistant", "回答headlineです", lens="qa",
         answer=_qa_answer(stop_reason="evaluation_blocked", evidence_selected=0, sources=[]),
-        trace=[{"id": "n1", "kind": "tool", "label": "資料を検索（grep）", "detail": "x", "status": "done"},
+        trace=[{"id": "n1", "kind": "tool", "label": "資料を検索（語句そのまま）", "detail": "x", "status": "done"},
               {"id": "n2", "kind": "tool", "label": "該当箇所を精読", "detail": "y", "status": "done"}])
     _mk_chat_turn_audit(user_uid, conv["id"], um["id"], am["id"])
 

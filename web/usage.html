@@ -138,7 +138,7 @@
       <!-- 統計チャット（自然言語で統計について質問する・admin のみ・本文はサーバに保存しない） -->
       <div class="card" id="usage-chat-card">
         <div class="chart-title">統計について質問する</div>
-        <div class="uc-send-notice">質問文に加え、この欄の直近のやり取り（履歴）と、利用統計の集計（利用者ID・表示名・ターン数・最終利用日時・個人ファイル参照件数・ログイン/ダウンロード/アップロード/共有件数・ユーザー別トークン内訳・world ID など）、および改善ログの要約（フィードバック件数・タグの内訳・回答が途中で止まった理由の内訳・見つからないと正直に答えた割合・所要時間の分布・👎が付いた質問と一言コメントの先頭100字を最大20件ずつ）を送信します（<span id="usage-chat-provider-note">確認中…</span>）。この欄以外の会話本文は👎が付いた質問/一言の先頭100字を除き含まれません。</div>
+        <div class="uc-send-notice">質問文に加え、この欄の直近のやり取り（履歴）と、利用統計の集計（利用者ID・表示名・ターン数・最終利用日時・個人ファイル参照件数・ログイン/ダウンロード/アップロード/共有件数・ユーザー別トークン内訳・資料フォルダの識別子など）、および改善ログの要約（フィードバック件数・タグの内訳・回答が途中で止まった理由の内訳・見つからないと正直に答えた割合・所要時間の分布・👎が付いた質問と一言コメントの先頭100字を最大20件ずつ）を送信します（<span id="usage-chat-provider-note">確認中…</span>）。この欄以外の会話本文は👎が付いた質問/一言の先頭100字を除き含まれません。</div>
         <div class="uc-hint">例:「今月一番使っているユーザーは？」「先週とのトークン量の差は？」</div>
         <div class="uc-provider-row" id="usage-chat-provider-toggle" role="group" aria-label="今回だけ使う AI">
           <span class="uc-provider-label">今回だけ:</span>
@@ -168,8 +168,8 @@
           <div class="sumcell"><div class="n" id="t-active">—</div><div class="l">アクティブユーザー</div></div>
           <div class="sumcell"><div class="n" id="t-turns">—</div><div class="l">総ターン数</div></div>
           <div class="sumcell"><div class="n" id="t-conversations">—</div><div class="l">会話数</div></div>
-          <div class="sumcell" title="ナレッジ参照オンのターンのうち、確証資料が見つからなかった割合。ナレッジの穴を見つけるための指標です。">
-            <div class="n" id="t-zerohit">—</div><div class="l">ゼロヒット率</div>
+          <div class="sumcell" title="社内資料参照オンのターンのうち、確証資料が見つからなかった割合。社内資料の穴を見つけるための指標です。">
+            <div class="n" id="t-zerohit">—</div><div class="l">根拠なし率</div>
           </div>
         </div>
       </div>
@@ -214,7 +214,7 @@
               <th class="num">活動日数</th>
               <th class="sortable" data-sort="last_active">最終利用<span class="arrow"></span></th>
               <th class="num">個人利用</th>
-              <th class="sortable num" data-sort="zero_hit_rate" title="ナレッジ参照オンのターンのうち確証資料が見つからなかった割合">ゼロヒット率<span class="arrow"></span></th>
+              <th class="sortable num" data-sort="zero_hit_rate" title="社内資料参照オンのターンのうち確証資料が見つからなかった割合">根拠なし率<span class="arrow"></span></th>
             </tr>
           </thead>
           <tbody id="usage-tbody"></tbody>
@@ -333,7 +333,7 @@
         </table>
       </div>
       <!-- 用途別（S1・2026-07-15-LLMオーケストレーション実装計画.md §3）: チャット以外の LLM 呼び出し
-           （意図の判定・ナレッジ抽出・検索用ベクトル化・admin グラフ質問・画像の読み取り）も含む内訳。
+           （依頼の仕分け・ナレッジ抽出・検索の索引づくり・admin グラフ質問・画像の読み取り）も含む内訳。
            tokens.by_kind が空/不在なら JS がカードごと隠す（旧 API 応答との前方互換）。 -->
       <div class="card" id="token-kind-card" style="overflow-x:auto;margin-bottom:14px" hidden>
         <div class="chart-title">用途別</div>

@@ -98,7 +98,7 @@ def test_received_share_strips_route_and_trace():
     conv = store.create_conversation(user_id=owner, world="v1", title="内部情報を含む調査")
     cid = conv["id"]
     store.add_message(cid, "user", "TAXCALC の影響は？")
-    trace = [{"type": "node", "id": "tool-grep", "kind": "tool", "label": "資料を検索（grep）",
+    trace = [{"type": "node", "id": "tool-grep", "kind": "tool", "label": "資料を検索（語句そのまま）",
              "detail": "「TAX-RATE」", "status": "done"}]
     route = {"lens": "qa", "path": ["4期/03_開発/01_ソース/TAXCALC.cbl"], "reason": "grep hit"}
     store.add_message(cid, "assistant", "TAXCALC に影響します", route=route, trace=trace)
@@ -207,7 +207,7 @@ def test_received_share_strips_question_card():
     conv = store.create_conversation(user_id=owner, world="v1", title="確認を含む調査")
     cid = conv["id"]
     store.add_message(cid, "user", "税率を変えたら夜間バッチが落ちる？")
-    question = {"interaction_id": "lens-cafef00d", "mode": "single", "prompt": "どの調べ方をしますか？",
+    question = {"interaction_id": "ask-cafef00d", "mode": "single", "prompt": "どの調べ方をしますか？",
                 "options": [{"id": "impact", "label": "影響範囲", "description": ""}],
                 "allow_free_text": False, "original_message": "税率を変えたら夜間バッチが落ちる？"}
     store.add_message(cid, "assistant", "どの調べ方をしますか？", lens="clarify",
@@ -224,12 +224,12 @@ def test_received_share_strips_question_card():
     assert assistant_msg["answer"].get("lens") == "clarify"        # 他の answer キーは posture どおり保持
     assert assistant_msg["route"] is None and assistant_msg["trace"] is None
     blob = str(assistant_msg["answer"])
-    assert "lens-cafef00d" not in blob and "影響範囲" not in blob
+    assert "ask-cafef00d" not in blob and "影響範囲" not in blob
 
     # 所有者本人は引き続き確認カードを読める（伏せるのは受領共有だけ）。
     owner_view = store.get_conversation_for_read(owner, cid)
     owner_assistant = next(m for m in owner_view["messages"] if m["role"] == "assistant")
-    assert owner_assistant["answer"]["question"]["interaction_id"] == "lens-cafef00d"
+    assert owner_assistant["answer"]["question"]["interaction_id"] == "ask-cafef00d"
 
 
 # ===== 2026-07-02-共有の無期限と永続化.md: 無期限＋削除巻き添え解消 =====

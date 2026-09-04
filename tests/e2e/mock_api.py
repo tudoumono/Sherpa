@@ -184,7 +184,7 @@ _DEFAULT_STREAM_EVENTS = [
      "label": "グラフ検索", "detail": "2件"},
     # ツール detail が「」形式＝クエリがチップ化される。
     {"type": "node", "id": "flow-chip", "kind": "tool", "status": "done",
-     "label": "資料を検索（grep）", "detail": "「消費税率」"},
+     "label": "資料を検索（語句そのまま）", "detail": "「消費税率」"},
     {"type": "node", "id": "mcp-graph-neighbors", "kind": "tool", "status": "done",
      "label": "MCP graph_neighbors", "detail": "TAX-RATE の近傍を確認"},
     {"type": "node", "id": "flow-hist", "kind": "think", "status": "done",
@@ -210,7 +210,7 @@ PLAN_TRACE = [
      "detail": "researcher・reviewer の順で調べます", "status": "done"},
     {"type": "node", "id": "sub:researcher:think", "kind": "think", "label": "意図を特定",
      "detail": "検索: 消費税率", "status": "done"},
-    {"type": "node", "id": "sub:researcher:tool-1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sub:researcher:tool-1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「消費税率」", "status": "done"},
     {"type": "node", "id": "sub:reviewer:tool-1", "kind": "tool", "label": "関係グラフを照会",
      "detail": "「TAX-RATE」", "status": "done"},
@@ -229,7 +229,7 @@ PLAN_ANSWER = {**IMPACT_ANSWER, "usage_subs": [
 V2_PARENT_ID_TRACE = [
     {"type": "node", "id": "plan", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done", "event_type": "plan_created"},
-    {"type": "node", "id": "step-1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "step-1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「消費税率」", "status": "done", "parent_id": "plan"},
     {"type": "node", "id": "step-1-detail", "kind": "think", "label": "検索結果を確認",
      "detail": "3件ヒット", "status": "done", "parent_id": "step-1"},
@@ -238,7 +238,7 @@ V2_PARENT_ID_TRACE = [
 # 同じネストを**子が親より先に届く順**で固定する——親がまだ無い間は一時的にレーン直下（フラット）へ
 # 置き、親（"late-parent"）が届いた時点で実 DOM 要素ごと子コンテナへ付け替わることを検証する。
 V2_PARENT_ID_OUT_OF_ORDER_TRACE = [
-    {"type": "node", "id": "child-early", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-early", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「消費税率」", "status": "done", "parent_id": "late-parent"},
     {"type": "node", "id": "late-parent", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
@@ -251,28 +251,28 @@ V2_PARENT_ID_OUT_OF_ORDER_TRACE = [
 # 順序A: child(P) → P → 兄弟×2（親到着時点でバケットは1件だけ＝取り除くと0件になり丸ごと削除。
 # 残り2件は新規バケットとして始まり、3件に届かないため集約は発生しない）。
 V2_BUCKET_REPARENT_ORDER_A_TRACE = [
-    {"type": "node", "id": "child-a", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-a", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「A」", "status": "done", "parent_id": "plan-a"},
     {"type": "node", "id": "plan-a", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
-    {"type": "node", "id": "sib-a1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-a1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「B」", "status": "done"},
-    {"type": "node", "id": "sib-a2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-a2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「C」", "status": "done"},
 ]
 
 # 順序B: child(P) → 兄弟1 → P → 兄弟2 → 兄弟3（親到着時点でバケットはまだ集約前・2件中の1件を
 # 取り除く＝leafEls から途中要素を splice する経路。残った1件から後で3件目に届いて正しく集約する）。
 V2_BUCKET_REPARENT_ORDER_B_TRACE = [
-    {"type": "node", "id": "child-b", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-b", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「A」", "status": "done", "parent_id": "plan-b"},
-    {"type": "node", "id": "sib-b1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-b1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「B」", "status": "done"},
     {"type": "node", "id": "plan-b", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
-    {"type": "node", "id": "sib-b2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-b2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「C」", "status": "done"},
-    {"type": "node", "id": "sib-b3", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-b3", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「D」", "status": "done"},
 ]
 
@@ -281,18 +281,18 @@ V2_BUCKET_REPARENT_ORDER_B_TRACE = [
 # 解体して個別2件表示へ戻す経路（枠を残したまま「×2」で居座らせない）。その後届く兄弟3件目で
 # 件数が再び3件に達し、新しく集約枠を作り直す（「×3」へ再集約）。
 V2_BUCKET_REPARENT_ORDER_C_TRACE = [
-    {"type": "node", "id": "child-c", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-c", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「A」", "status": "done", "parent_id": "plan-c"},
-    {"type": "node", "id": "sib-c1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-c1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「B」", "status": "done"},
-    {"type": "node", "id": "sib-c2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-c2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「C」", "status": "done"},
     {"type": "node", "id": "plan-c", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
     # 親到着で child が集約枠から取り除かれ、枠が解体されて個別2件表示（B・C）へ戻った*後*に、
     # 同種の4件目（実質バケット内では3件目）が届く——件数が再び AGG_MIN_RUN(3) に達し、
     # 新しく集約枠を作り直す（「×3」へ再集約）。
-    {"type": "node", "id": "sib-c3", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-c3", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「D」", "status": "done"},
 ]
 
@@ -301,13 +301,13 @@ V2_BUCKET_REPARENT_ORDER_C_TRACE = [
 # 枠の外側に挟まっていた別種ノードXとの到着順が壊れる（本来 X,B,C,P の順であるべきところ
 # B,C,X,P になる）。各要素が自分の到着順（_seq）が指す位置へ個別に戻ることを固定する。
 V2_BUCKET_DISMANTLE_PRESERVES_ARRIVAL_ORDER_TRACE = [
-    {"type": "node", "id": "child-d", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-d", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「A」", "status": "done", "parent_id": "plan-d"},
     {"type": "node", "id": "mid-d", "kind": "think", "label": "念のため確認",
      "detail": "他に手がかりが無いか探します", "status": "done"},
-    {"type": "node", "id": "sib-d1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-d1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「B」", "status": "done"},
-    {"type": "node", "id": "sib-d2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-d2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「C」", "status": "done"},
     {"type": "node", "id": "plan-d", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
@@ -319,15 +319,15 @@ V2_BUCKET_DISMANTLE_PRESERVES_ARRIVAL_ORDER_TRACE = [
 # 取り除かれた最古参のままだと、枠より後・X より前という誤った位置に取り残される
 # （本来 X, 枠(B・C・D), P の順であるべきところ 枠, X, P になる）。
 V2_BUCKET_SURVIVING_FRAME_REPOSITIONS_ON_DETACH_TRACE = [
-    {"type": "node", "id": "child-e", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-e", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「A」", "status": "done", "parent_id": "plan-e"},
     {"type": "node", "id": "mid-e", "kind": "think", "label": "念のため確認",
      "detail": "他に手がかりが無いか探します", "status": "done"},
-    {"type": "node", "id": "sib-e1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-e1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「B」", "status": "done"},
-    {"type": "node", "id": "sib-e2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-e2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「C」", "status": "done"},
-    {"type": "node", "id": "sib-e3", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-e3", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「D」", "status": "done"},
     {"type": "node", "id": "plan-e", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
@@ -338,15 +338,15 @@ V2_BUCKET_SURVIVING_FRAME_REPOSITIONS_ON_DETACH_TRACE = [
 # 到着順が刻まれていないと、集約枠の解体時の兄弟位置比較から漏れる（本来 B, レーン, C, P の
 # 順であるべきところ レーン, B, C, P になる）。
 V2_BUCKET_SURVIVES_SUBAGENT_LANE_INTERLEAVED_TRACE = [
-    {"type": "node", "id": "child-f", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "child-f", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「A」", "status": "done", "parent_id": "plan-f"},
-    {"type": "node", "id": "sib-f1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-f1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「B」", "status": "done"},
     {"type": "node", "id": "sub-f-start", "kind": "think", "label": "下調べ役に任せる",
      "detail": "qwen2.5 が資料を探して読みます（回答はこの後メインのAIが作ります）",
      "status": "done", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
-    {"type": "node", "id": "sib-f2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sib-f2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「C」", "status": "done"},
     {"type": "node", "id": "plan-f", "kind": "think", "label": "進め方を計画",
      "detail": "下調べ役に任せます", "status": "done"},
@@ -357,7 +357,7 @@ V2_BUCKET_SURVIVES_SUBAGENT_LANE_INTERLEAVED_TRACE = [
 # sherpa/providers/base.py（ハイブリッド下調べ役の `_sub_agent_metrics`/`_sub_agent_completed_node`）
 # が実際に組む shape と同じ。`is_local`/`name` はサーバの権威ある判定（`agent_constructs.is_local`）・
 # 表示名（`search_helper.resolve()` の "name"）をそのまま模す＝フロントは推測しない契約。
-# 「資料を検索（grep）」を3件並べて集約表示（GREP×N 相当）の閾値（AGG_MIN_RUN=3）に届かせる。
+# 「資料を検索（語句そのまま）」を3件並べて集約表示（GREP×N 相当）の閾値（AGG_MIN_RUN=3）に届かせる。
 V2_LANE_TRACE = [
     # 計画ノードの detail は表示名（「下調べ役」）のみを載せる（内部 slug "researcher" を
     # 直接出さない・providers/base.py::_agentic_run_plan の
@@ -368,13 +368,13 @@ V2_LANE_TRACE = [
      "detail": "qwen2.5 が資料を探して読みます（回答はこの後メインのAIが作ります）",
      "status": "done", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
-    {"type": "node", "id": "sub:researcher:1:grep-1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sub:researcher:1:grep-1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「消費税率」", "status": "done", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
-    {"type": "node", "id": "sub:researcher:1:grep-2", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sub:researcher:1:grep-2", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「税率 改定」", "status": "done", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
-    {"type": "node", "id": "sub:researcher:1:grep-3", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sub:researcher:1:grep-3", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「TAX-RATE」", "status": "done", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
     {"type": "node", "id": "sub:researcher:1:read-1", "kind": "tool", "label": "該当箇所を精読",
@@ -456,7 +456,7 @@ V2_BUDGET_ANSWER = {**IMPACT_ANSWER, "trace_version": 2,
                              "cached_input_tokens": 0, "reasoning_output_tokens": 0, "is_local": "cloud"}}
 
 # 道具（tool）の1ターンあたり呼び出し上限に到達（`tools_per_turn_exceeded`・agentic_search.py が
-# 実際に設定する値）→「道具の使用回数の上限に到達」の平文固定の回帰用。
+# 実際に設定する値）→「調べる操作の回数の上限に到達」の平文固定の回帰用。
 V2_TOOLS_LIMIT_ANSWER = {**IMPACT_ANSWER, "trace_version": 2,
                          "data": {**IMPACT_ANSWER["data"],
                                  "evidence_packet": {"stop_reason": "tools_per_turn_exceeded"}},
@@ -510,7 +510,7 @@ V2_UNKNOWN_STOP_REASON_TRACE = [
     {"type": "node", "id": "search-helper", "kind": "think", "label": "下調べ役に任せる",
      "detail": "qwen2.5 が資料を探して読みます", "status": "done", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
-    {"type": "node", "id": "sub:researcher:1:grep-1", "kind": "tool", "label": "資料を検索（grep）",
+    {"type": "node", "id": "sub:researcher:1:grep-1", "kind": "tool", "label": "資料を検索（語句そのまま）",
      "detail": "「消費税率」", "status": "active", "agent_run_id": "sub:researcher:1",
      "metrics": {"provider": "ollama", "model": "qwen2.5", "is_local": "local", "name": "下調べ役"}},
 ]
@@ -1159,9 +1159,9 @@ SETTINGS_RESP = {"agent": "openai",   # construct_id="openai_only" と一致さ�
                      {"id": "ollama_only", "agent": "ollama", "codex_model_provider": None,
                       "label": "ローカル（Ollama）", "hint": "このパソコン/社内のローカルLLM"},
                      {"id": "codex_openai", "agent": "codex", "codex_model_provider": "openai",
-                      "label": "Codex（OpenAI）", "hint": "Codex が自分で grep して調べる・モデルは OpenAI"},
+                      "label": "Codex（OpenAI）", "hint": "Codex が自分で資料を探して調べる・モデルは OpenAI"},
                      {"id": "codex_ollama", "agent": "codex", "codex_model_provider": "ollama",
-                      "label": "Codex（Ollama）", "hint": "Codex が自分で grep して調べる・モデルは Ollama"},
+                      "label": "Codex（Ollama）", "hint": "Codex が自分で資料を探して調べる・モデルは Ollama"},
                  ],
                  # intent_model／search_helper_model のプロバイダ別選択肢（実サーバの
                  # `_model_choice_table_by_provider`。セレクタ変更時の再描画を検証する e2e が使う）。
@@ -2205,11 +2205,11 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 # S1（ask_user-improvements.md）: 保存された確認カード（answer.question）の履歴復元。
                 # 1つ目の確認は回答済み（それ以降の user に同じ「確認ID:」がある＝選択内容つき・disabled）、
                 # 2つ目の確認は未回答（最新＝操作可能のまま）。
-                q1 = {"interaction_id": "lens-aaa111", "mode": "single", "prompt": "どの調べ方をしますか？",
+                q1 = {"interaction_id": "ask-aaa111", "mode": "single", "prompt": "どの調べ方をしますか？",
                       "options": [{"id": "impact", "label": "影響範囲", "description": "変更の波及を調べる"},
                                   {"id": "qa", "label": "仕様・内容", "description": "資料を検索する"}],
                       "allow_free_text": False, "original_message": "税率を変えたい"}
-                q2 = {"interaction_id": "lens-bbb222", "mode": "single", "prompt": "どの範囲で調べますか？",
+                q2 = {"interaction_id": "ask-bbb222", "mode": "single", "prompt": "どの範囲で調べますか？",
                       "options": [{"id": "all", "label": "全体", "description": ""},
                                   {"id": "sub", "label": "この部分だけ", "description": ""}],
                       "allow_free_text": True, "original_message": "範囲を絞りたい"}
@@ -2223,7 +2223,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                                           "trace": ANSWER_TRACE, "created_at": "2026-07-01T10:00:05+00:00"},
                                          # 回答（[data-ask-submit] が組み立てる整形文＝確認ID を含む）。
                                          {"role": "user",
-                                          "content": "確認事項: どの調べ方をしますか？\n確認ID: lens-aaa111\n選択: 影響範囲\n元の依頼: 税率を変えたい",
+                                          "content": "確認事項: どの調べ方をしますか？\n確認ID: ask-aaa111\n選択: 影響範囲\n元の依頼: 税率を変えたい",
                                           "created_at": "2026-07-01T10:00:30+00:00"},
                                          {"role": "assistant", "answer": IMPACT_ANSWER, "trace": ANSWER_TRACE,
                                           "created_at": "2026-07-01T10:00:40+00:00"},

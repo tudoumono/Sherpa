@@ -244,7 +244,7 @@ def test_chat_stream_agentic_ask_user_question_persists_with_correct_shape():
         label, model = "Fake Agentic", "fake-agentic-1"
 
         def run(self, ctx):
-            yield {"type": "node", "id": "tool-1", "kind": "tool", "label": "資料を検索（grep）",
+            yield {"type": "node", "id": "tool-1", "kind": "tool", "label": "資料を検索（語句そのまま）",
                   "detail": "「TAX-RATE」", "status": "done"}
             q = agentic_search._question_from_args({
                 "mode": "single", "prompt": "対象範囲を教えてください",

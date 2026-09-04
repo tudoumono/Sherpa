@@ -148,7 +148,7 @@ def test_degrade_result_node_known_reasons_only():
 def test_hit_summary_node_ripgrep_includes_query_and_count():
     node = A._hit_summary_node("ripgrep_search", {"query": "TAX-RATE"},
                                {"hits": [{"doc_id": "a.md"}] * 12})
-    assert node["label"] != "資料を検索（grep）"          # `_tool_node` の label とは別ノード
+    assert node["label"] != "資料を検索（語句そのまま）"          # `_tool_node` の label とは別ノード
     assert "TAX-RATE" in node["detail"] and "12件" in node["detail"]
 
 
@@ -2493,7 +2493,7 @@ def test_openai_style_caps_tool_calls_per_turn():
                     if "node" in ev and ev["node"]["label"] == "ツール呼び出し上限"]
         assert len(cap_nodes) == 1   # 超過件数に関わらず固定ノードは1件だけ（LOW-D）
         executed_nodes = [ev["node"] for ev in events
-                          if "node" in ev and ev["node"]["label"] == "資料を検索（grep）"]
+                          if "node" in ev and ev["node"]["label"] == "資料を検索（語句そのまま）"]
         assert len(executed_nodes) == A.MAX_TOOLS_PER_TURN   # 実行されたのは上限まで
         final = next(ev for ev in events if "final" in ev)
         assert final["final"] == ""   # 打ち切り＝最終回答は空
@@ -2668,7 +2668,7 @@ def test_openai_style_sub_path_tool_node_omits_model_generated_args():
                                      allowed_tools=frozenset({"ripgrep_search"})))
         nodes = [ev["node"] for ev in events if "node" in ev]
         assert not any("SENTINEL_SUB_QUERY" in str(n) for n in nodes)
-        assert any(n["label"] == "資料を検索（grep）" for n in nodes)   # ラベル自体は維持（固定文言の範囲内）
+        assert any(n["label"] == "資料を検索（語句そのまま）" for n in nodes)   # ラベル自体は維持（固定文言の範囲内）
     finally:
         A._post = orig
 
@@ -4030,9 +4030,9 @@ def test_anthropic_style_mixed_tool_use_and_ask_user_discards_prior_results():
     assert q["mode"] == "single" and [o["label"] for o in q["options"]] == ["全体", "設計"]
     assert not any("final" in e for e in evs)                       # 実行済み結果は final に出ず破棄される
     node_labels = [e["node"]["label"] for e in evs if "node" in e]
-    # run_tool 実行後に「検索結果（grep）」（ヒット件数の追加ノード）がもう1件挟まる
+    # run_tool 実行後に「検索結果（語句そのまま）」（ヒット件数の追加ノード）がもう1件挟まる
     # （`_hit_summary_node` 参照）。
-    assert node_labels == ["資料を検索（grep）", "検索結果（grep）", "ユーザに確認"]   # 3ノードとも流れる（UI 表示用）
+    assert node_labels == ["資料を検索（語句そのまま）", "検索結果（語句そのまま）", "ユーザに確認"]   # 3ノードとも流れる（UI 表示用）
 
 
 def test_openai_style_mixed_tool_calls_and_ask_user_discards_prior_results():
@@ -4890,11 +4890,11 @@ def test_dispatch_tools_for_lens_availability_omitted_means_fully_available():
 # 返す」だけ（`if grep and fulltext and graph: return SYSTEM` 等）のため、`is A.SYSTEM`/
 # `== A._DESC_ES` の自己参照比較は SYSTEM/_DESC_ES/_DESC_GRAPH の中身が何であっても必ず通る恒真式
 # になり、意図しない内容変化を検出できない。固定 byte 長＋SHA-256（独立の golden）で比較する。
-# `_SYSTEM_GOLDEN_*` は現在の SYSTEM の中身（glob_search の使いどころ・「コマンド検索」表記を
+# `_SYSTEM_GOLDEN_*` は現在の SYSTEM の中身（glob_search の使いどころ・「語句そのまま検索」表記を
 # 含む）に対する固定値——中身を変えたらここも更新する（golden の意図は「意図しない変化を検知
 # する」ことであって、特定の過去の値に固定し続けることではない）。
-_SYSTEM_GOLDEN_BYTES = 3900
-_SYSTEM_GOLDEN_SHA256 = "ad36c79d371aa0de27cac844c983814ae28420eb6235f9b83835dd0719a7745c"
+_SYSTEM_GOLDEN_BYTES = 3924
+_SYSTEM_GOLDEN_SHA256 = "b57968b29f7f3792650b0954130cfe157d8b77390be39793061765a3a00bb364"
 _DESC_ES_GOLDEN_BYTES = 315
 _DESC_ES_GOLDEN_SHA256 = "3cf6ee101c15db27cd4ac5a9315f6c55f0de61e6e67eefd8971a5217326135ee"
 _DESC_GRAPH_GOLDEN_BYTES = 553
@@ -5162,7 +5162,7 @@ def test_can_ask_helper_detects_confirm_id_resend():
     from sherpa import agents as AG
     assert AG._can_ask("税率を変えたら夜間バッチが落ちる？") is True
     assert AG._can_ask("選択: 対象範囲\n確認ID: confirm-abcd\n元の依頼: …") is False
-    assert AG._can_ask("確認ID：lens-0011\n選択: 影響") is False   # 全角コロンも検出
+    assert AG._can_ask("確認ID：ask-0011\n選択: 影響") is False   # 全角コロンも検出
 
 
 def test_impact_lens_uses_agentic_tool_loop():
@@ -5188,7 +5188,7 @@ def test_impact_lens_uses_agentic_tool_loop():
 
         def _agentic_loop(self, ctx):
             seen.append("agentic")
-            yield {"node": {"type": "node", "id": "n", "kind": "tool", "label": "資料を検索（grep）"}}
+            yield {"node": {"type": "node", "id": "n", "kind": "tool", "label": "資料を検索（語句そのまま）"}}
             yield {"final": "税率変更は夜間バッチに影響します", "docs": {real_doc}, "searched": True,
                    "cites": [{"doc_id": real_doc, "span": [1, 1], "quote": "# 障害記録"}], "cards": []}
 

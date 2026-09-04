@@ -107,7 +107,7 @@ _TROUBLE_STREAM = [
     {"type": "node", "id": "understand", "kind": "think", "status": "done",
      "label": "依頼を理解", "detail": "夜間バッチの異常終了の原因調査"},
     {"type": "node", "id": "tool-grep", "kind": "tool", "status": "done",
-     "label": "資料を検索（grep）", "detail": "「異常終了」"},
+     "label": "資料を検索（語句そのまま）", "detail": "「異常終了」"},
     {"type": "node", "id": "tool-graph", "kind": "tool", "status": "done",
      "label": "関係グラフを照会", "detail": "TAXCALC の近傍"},
     {"type": "answer", "conversation_id": 101, "message": {"answer": _TROUBLE_ANSWER}},
@@ -117,7 +117,7 @@ _TROUBLE_STREAM = [
 _CLARIFY_STREAM = [
     {"type": "node", "id": "understand", "kind": "think", "status": "done",
      "label": "依頼を理解", "detail": "調べ方を確認"},
-    {"type": "question", "conversation_id": 101, "interaction_id": "lens-demo01", "mode": "single",
+    {"type": "question", "conversation_id": 101, "interaction_id": "ask-demo01", "mode": "single",
      "prompt": "どの調べ方をしますか？（結果が大きく変わるため確認します）",
      "options": [
          {"id": "impact", "label": "影響範囲を調べる", "description": "変更がどこに波及するかを洗い出す"},

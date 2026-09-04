@@ -1019,7 +1019,7 @@ def test_chat_turn_stack_renders_for_own_conversation_with_no_trace_at_all(page,
     expect(turns).to_have_count(1)
     expect(turns.nth(0)).to_contain_text("こんにちは")
     expect(turns.nth(0)).to_contain_text("（記録なし）")
-    expect(page.locator("#flow")).not_to_contain_text("質問すると、考えた道筋がここに流れます")
+    expect(page.locator("#flow")).not_to_contain_text("質問すると、考えた流れがここに流れます")
 
 
 def test_chat_received_share_keeps_flow_pane_as_placeholder(page, web_base_url):
@@ -1032,7 +1032,7 @@ def test_chat_received_share_keeps_flow_pane_as_placeholder(page, web_base_url):
     page.evaluate("window.__sherpaChatTest.openConversation(104)")
 
     expect(page.locator(".fturn")).to_have_count(0)
-    expect(page.locator("#flow")).to_contain_text("質問すると、考えた道筋がここに流れます")
+    expect(page.locator("#flow")).to_contain_text("質問すると、考えた流れがここに流れます")
 
 
 def test_chat_history_restores_answered_and_operable_question_cards(page, web_base_url):
@@ -1597,13 +1597,13 @@ def test_chat_sub_planner_plan_and_usage_subs_render_additively(page, web_base_u
     page.locator("#send").click()
 
     expect(page.locator("#flow")).to_contain_text("進め方を計画")
-    expect(page.locator("#flow")).to_contain_text("資料を検索（grep）")
+    expect(page.locator("#flow")).to_contain_text("資料を検索（語句そのまま）")
     expect(page.locator("#flow")).to_contain_text("関係グラフを照会")
     expect(page.locator("#messages")).to_contain_text("影響範囲分析")
 
     sub_meta = page.locator(".usage-sub-meta")
     expect(sub_meta).to_have_count(1)
-    expect(sub_meta.locator("summary")).to_contain_text("下調べ役の使用量（2件）")
+    expect(sub_meta.locator("summary")).to_contain_text("下調べの使用量（2件）")
     expect(sub_meta.locator(".usage-detail")).to_be_hidden()   # 既定は折りたたみ
 
     sub_meta.locator("summary").click()
@@ -1647,7 +1647,7 @@ def test_chat_history_restores_plan_node_and_sub_namespaced_trace(page, web_base
     expect(turn).to_have_js_property("open", True)
     expect(turn).to_contain_text("進め方を計画")
     expect(turn).to_contain_text("意図を特定")
-    expect(turn).to_contain_text("資料を検索（grep）")
+    expect(turn).to_contain_text("資料を検索（語句そのまま）")
     expect(turn).to_contain_text("関係グラフを照会")
 
     sub_meta = page.locator(".usage-sub-meta")
@@ -2097,7 +2097,7 @@ def test_inquiry_tools_graph_only_send_reflects_body_and_hides_grep_fulltext_nod
     body = records["turn_starts"][-1]
     assert body.get("tools") == {"grep": False, "fulltext": False, "graph": True}
     expect(page.locator("#flow")).to_contain_text("関係グラフをたどる")
-    expect(page.locator("#flow")).not_to_contain_text("資料を検索（grep）")
+    expect(page.locator("#flow")).not_to_contain_text("資料を検索（語句そのまま）")
     expect(page.locator("#flow")).not_to_contain_text("資料を検索（全文/日本語）")
 
 

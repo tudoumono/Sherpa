@@ -597,7 +597,7 @@ def _answer_impact(result, world):
         headline = (f"「{start}」に構造的な依存は見つかりませんでしたが、資料から"
                     f"**関連の可能性**が {len(presumed)}件（推定・要確認）: {names} など。")
     else:
-        headline = f"「{start}」に依存する資材は見つかりませんでした（表記ゆれ、または影響なし）。"
+        headline = f"「{start}」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
     if code_silent:                                    # 次の一手＝検索へ素直に誘導（フォルダ起因と断定しない・RV Low）
         headline += "　▶ 資料の検索（仕様問い合わせ・トラブルシュート）で仕様/運用の記述を確認できます。"
     docs = [e["doc"] for it in items for e in it.get("evidence", []) if e.get("doc")]

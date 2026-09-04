@@ -821,9 +821,9 @@ class CodexProvider(Provider):
                                 if codex_question is not None:
                                     break
                                 continue
-                            tlabel = {"graph_neighbors": "関係グラフをたどる", "ripgrep_search": "資料を検索（grep）",
+                            tlabel = {"graph_neighbors": "関係グラフをたどる", "ripgrep_search": "資料を検索（語句そのまま）",
                                       "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
-                                      "list_docs": "資料の一覧を確認"}.get(tool, f"ツール: {tool}")
+                                      "list_docs": "資料の一覧を確認"}.get(tool, "その他の処理")
                             detail = (a.get("name") or a.get("query") or a.get("doc_id")
                                      or a.get("path_prefix") or a.get("name_pattern") or "")
                             if done and tool == "graph_neighbors" and item.get("status") == "completed":

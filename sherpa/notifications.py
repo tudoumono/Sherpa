@@ -46,8 +46,18 @@ def _iso(value) -> str | None:
     return value.isoformat()
 
 
+_UNNAMED_WORLD_LABEL = "名称未設定の資料フォルダ"
+
+
 def _world_labels() -> dict[str, str]:
-    return {row["world_id"]: (row.get("label") or row["world_id"]) for row in store.list_worlds_db()}
+    # world_id を生で見せない——ラベル未設定（空）や ID と同値（実質未設定）のときは
+    # 平文のプレースホルダに丸める（利用者に world_id 等の内部識別子を露出しない・docs/04 §6）。
+    out = {}
+    for row in store.list_worlds_db():
+        wid = row["world_id"]
+        label = row.get("label") or ""
+        out[wid] = label if (label and label != wid) else _UNNAMED_WORLD_LABEL
+    return out
 
 
 def _item(*, kind: str, world: str, world_label: str, status: str, message: str, at,

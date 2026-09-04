@@ -759,7 +759,7 @@ async function searchEs() {
   const ps = new URLSearchParams({ world: $('version').value, query: q });
   if (_folder) ps.append('scope_paths', _folder);
   $('eshits').setAttribute('aria-busy', 'true');
-  $('eshits').innerHTML = '<div class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>共有ナレッジを検索しています...</span></div>';
+  $('eshits').innerHTML = '<div class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>社内資料を検索しています...</span></div>';
   try {
     const d = await api('GET', `/admin/es/search?${ps.toString()}`);
     renderEsHits(d.hits || []);
@@ -783,7 +783,7 @@ async function checkAdmin() {
 }
 
 const statusTag = (s) => (s && s !== 'active')
-  ? `<span class="statustag ${s === 'deprecated' ? 'deprecated' : 'hidden_candidate'}">${s === 'deprecated' ? '廃止' : '隠し候補'}</span>` : '';
+  ? `<span class="statustag ${s === 'deprecated' ? 'deprecated' : 'hidden_candidate'}">${s === 'deprecated' ? '廃止' : '未使用の疑い'}</span>` : '';
 
 function openPrev() {
   if (!_pv) return;

@@ -380,7 +380,7 @@ def test_agentic_budget_window_unknown_shows_plain_language_notice(page, web_bas
     open_tab(page, "ingest")
 
     expect(page.locator("#agentic-budget-window-unknown")).to_be_visible()
-    expect(page.locator("#agentic-budget-window-unknown")).to_contain_text("窓が未登録です")
+    expect(page.locator("#agentic-budget-window-unknown")).to_contain_text("一度に読める量が未登録です")
     expect(page.locator("#agentic-budget-window-status")).to_contain_text("現在のモデル")
 
 
@@ -482,7 +482,7 @@ def test_model_windows_table_save_rejects_invalid_tokens_client_side(page, web_b
     row.locator(".mw-tokens").fill("0")
     page.locator("#save").click()
 
-    expect(page.locator("#msg")).to_contain_text("窓（トークン数）は1〜10,000,000の整数で指定してください")
+    expect(page.locator("#msg")).to_contain_text("一度に読める量（トークン数）は1〜10,000,000の整数で指定してください")
     assert records["admin_settings_put"] == []
 
 
@@ -1163,7 +1163,7 @@ def test_admin_settings_usage_chat_ai_openai_fix_shows_hint_when_a7_not_openai(p
     open_tab(page, "usage")
 
     expect(page.locator("#usage-chat-ai-radios")).to_contain_text(
-        "OpenAI のキーは実行構成が OpenAI のときだけ使えます")
+        "OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます")
     expect(page.locator("#usage-chat-ai-radios")).to_contain_text("現在: Gemini")
 
     # A7 を openai へ戻すと注記は消える（保存せず、同じページ内の別タブの変更だけでは反映
@@ -1173,7 +1173,7 @@ def test_admin_settings_usage_chat_ai_openai_fix_shows_hint_when_a7_not_openai(p
     install_api_mocks(page, system_settings=settings2)
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "usage")
-    expect(page.locator("#usage-chat-ai-radios")).not_to_contain_text("実行構成が OpenAI のとき")
+    expect(page.locator("#usage-chat-ai-radios")).not_to_contain_text("頭脳の選択が OpenAI のとき")
 
 
 def test_admin_settings_usage_chat_ai_shows_explicit_error_when_response_malformed(page, web_base_url):

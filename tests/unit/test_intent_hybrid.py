@@ -94,7 +94,7 @@ def test_confirm_first_emits_question_before_provider():
         d = C._build_router([], "v1", {}, can_ask=True)(_CONFIRM)
         assert d["lens"] == "clarify" and d["question"]["type"] == "question"
         assert d["question"]["allow_free_text"] is True
-        assert not d["question"]["interaction_id"].startswith("lens-")   # lens 選択 clarify とは別採番
+        assert not d["question"]["interaction_id"].startswith("ask-")   # lens 選択 clarify とは別採番（VOCAB-1: lens-→ask-）
         assert calls == []                                               # ガードが先＝LLM 分類に到達しない
     finally:
         intent_llm.classify = orig

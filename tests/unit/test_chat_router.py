@@ -26,13 +26,13 @@ def test_ambiguous_only_on_conflict():
 
 def test_resume_from_clarify_breaks_loop():
     # フロント整形の clarify 回答（確認ID marker 付き）。元の依頼が衝突 cue でも『選択』で確定＝再質問しない。
-    msg = ("確認事項: どの調べ方をしますか？\n確認ID: lens-abc123\n選択: 影響を調べる\n"
+    msg = ("確認事項: どの調べ方をしますか？\n確認ID: ask-abc123\n選択: 影響を調べる\n"
            "元の依頼: 税率を変えたら夜間バッチが落ちる？")
     r = R.route(msg, known_terms=["税率"])
     assert r["lens"] == "impact" and r["confident"] is True     # ループ回避（再び曖昧にしない）
     assert r["input"] == "税率"                                  # input は『元の依頼』から抽出
-    assert R.route("確認ID: lens-x\n選択: 原因を調べる\n元の依頼: y")["lens"] == "troubleshoot"
-    assert R.route("確認ID: lens-x\n選択: 内容・仕様を調べる\n元の依頼: y")["lens"] == "qa"
+    assert R.route("確認ID: ask-x\n選択: 原因を調べる\n元の依頼: y")["lens"] == "troubleshoot"
+    assert R.route("確認ID: ask-x\n選択: 内容・仕様を調べる\n元の依頼: y")["lens"] == "qa"
 
 
 def test_resume_requires_marker_and_handles_malformed():
@@ -40,7 +40,13 @@ def test_resume_requires_marker_and_handles_malformed():
     r = R.route("選択: 4期\n元の依頼: 影響を教えて")
     assert r["lens"] == "impact" and r["reason"] != "確認の選択"  # 通常 heuristic（影響）で判定
     # marker あり・ラベル解決不可（malformed）は qa（再質問しない）。
-    assert R.route("確認ID: lens-x\n選択: 4期\n元の依頼: なにか")["lens"] == "qa"
+    assert R.route("確認ID: ask-x\n選択: 4期\n元の依頼: なにか")["lens"] == "qa"
+
+
+def test_resume_accepts_legacy_lens_prefix_for_backcompat():
+    # VOCAB-1 で marker を lens-* → ask-* に改称。改称前に発行済みの確認カードへの回答
+    # （旧 lens-* 付き）が届いても resume が壊れない＝進行中の会話を切断しない。
+    assert R.route("確認ID: lens-legacy1\n選択: 原因を調べる\n元の依頼: y")["lens"] == "troubleshoot"
 
 
 def test_clarify_decision_shape():
@@ -50,6 +56,7 @@ def test_clarify_decision_shape():
     assert q["type"] == "question" and q["mode"] == "single"
     assert [o["id"] for o in q["options"]] == ["impact", "troubleshoot", "qa", "author"]
     assert q["original_message"] == "これ直すと？"
+    assert q["interaction_id"].startswith("ask-")   # VOCAB-1: lens-* → ask-*
 
 
 def test_decision_for_maps_and_guards():
@@ -77,7 +84,7 @@ def test_author_ambiguous_when_combined_with_other_strong_cue():
 
 
 def test_author_resume_from_clarify_selects_author_lens():
-    msg = ("確認事項: どの調べ方をしますか？\n確認ID: lens-abc123\n選択: 資料を作成する\n"
+    msg = ("確認事項: どの調べ方をしますか？\n確認ID: ask-abc123\n選択: 資料を作成する\n"
            "元の依頼: 消費税率の一覧をまとめて")
     r = R.route(msg)
     assert r["lens"] == "author" and r["confident"] is True

@@ -164,7 +164,7 @@ def test_snapshot_drops_question_card_payload():
     store.add_message(cid, "user", content="税率を変えたら夜間バッチが落ちる？")
     store.add_message(cid, "assistant", content="どの調べ方をしますか？", lens="clarify",
                       answer={"lens": "clarify", "question": {
-                          "interaction_id": "lens-deadbeef", "mode": "single",
+                          "interaction_id": "ask-deadbeef", "mode": "single",
                           "prompt": "どの調べ方をしますか？",
                           "options": [{"id": "impact", "label": "影響範囲該否", "description": "説明文"}],
                           "allow_free_text": False,
@@ -177,7 +177,7 @@ def test_snapshot_drops_question_card_payload():
         blob += (m.get("content") or "") + str(m.get("answer") or "")
         assert not (isinstance(m.get("answer"), dict) and m["answer"].get("question")), \
             "snapshot の answer に question payload が残っている"
-    for leak in ("lens-deadbeef", "影響範囲該否", "説明文", "original_message"):
+    for leak in ("ask-deadbeef", "影響範囲該否", "説明文", "original_message"):
         assert leak not in blob, f"確認カードの内部情報 '{leak}' が snapshot に漏れている"
 
 
@@ -224,7 +224,7 @@ def test_snapshot_clarify_answer_is_exactly_lens_only():
     store.add_message(cid, "user", content="税率を変えたら夜間バッチが落ちる？")
     store.add_message(cid, "assistant", content="どの調べ方をしますか？", lens="clarify",
                       answer={"lens": "clarify", "question": {
-                          "interaction_id": "lens-shapecheck", "mode": "single",
+                          "interaction_id": "ask-shapecheck", "mode": "single",
                           "prompt": "どの調べ方をしますか？", "options": [], "allow_free_text": False}})
     snap = store.create_sanitized_snapshot(uid, cid)
     assert snap is not None
@@ -247,7 +247,7 @@ def test_snapshot_personal_clarify_still_redacted_qa():
     store.add_message(cid, "user", content="my_salary.xlsx の件で確認したい", personal=True)
     store.add_message(cid, "assistant", content="どの調べ方をしますか？", lens="clarify", personal=True,
                       answer={"lens": "clarify", "question": {
-                          "interaction_id": "lens-personalcheck", "mode": "single",
+                          "interaction_id": "ask-personalcheck", "mode": "single",
                           "prompt": "my_salary.xlsx について、どの調べ方をしますか？",
                           "options": [], "allow_free_text": False}})
     store.set_contains_personal_workspace(cid)

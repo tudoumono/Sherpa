@@ -12,7 +12,7 @@ def test_workspace_upload_search_and_delete_flow(page, web_base_url, tmp_path):
 
     expect(page.locator("#file-list")).to_contain_text("onboarding.md")
     expect(page.locator("#file-count")).to_have_text("(2 件)")
-    expect(page.locator(".notice").first).to_contain_text("共有ナレッジベース")
+    expect(page.locator(".notice").first).to_contain_text("社内資料")
 
     upload = tmp_path / "memo.md"
     upload.write_text("TAX-RATE は消費税率の個人メモです。\n", encoding="utf-8")

@@ -47,7 +47,7 @@ export function resetFlow() {
   // 出さず destroy/stop だけに留める）。
   _stopThinkingTicker();
   if (S.liveTraceTree) { S.liveTraceTree.destroy(); S.liveTraceTree = null; }   // ティックの残骸を片付ける
-  $('flow').innerHTML = '<div class="hint">質問すると、考えた道筋がここに流れます。</div>';
+  $('flow').innerHTML = '<div class="hint">質問すると、考えた流れがここに流れます。</div>';
   S.nodes = {}; S.liveTurnId = null; S.turnSeq = 0;
   setRt('待機中', false);
 }

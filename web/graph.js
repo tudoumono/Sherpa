@@ -11,7 +11,7 @@ const TYPE_JA = {
   Document: '文書', Batch: 'バッチ', Table: 'テーブル',
 };
 const FIELD_LABEL = {
-  category: 'カテゴリ', phase: '工程', role: '種別', top_scope: '世代', status: '状態',
+  category: 'カテゴリ', phase: '工程', role: '種別', top_scope: '最上位フォルダ', status: '状態',
 };
 let cy = null, _world = null, _fullGraph = null, _truncated = false;   // _truncated=表示中は主要ノードのみ（全体ではない）
 
@@ -260,7 +260,7 @@ function selectNode(n) {
   if (d.parent) rows.push(`<div class="nrow">所属: ${esc(d.parent)}</div>`);
   if (d.category) rows.push(`<div class="nrow">カテゴリ: ${esc(d.category)}</div>`);
   if (d.phase) rows.push(`<div class="nrow">工程: ${esc(d.phase)}</div>`);
-  if (d.status !== 'active') rows.push(`<div class="nrow">状態: ${d.status === 'deprecated' ? '廃止' : '隠し候補'}</div>`);
+  if (d.status !== 'active') rows.push(`<div class="nrow">状態: ${d.status === 'deprecated' ? '廃止' : '未使用の疑い'}</div>`);
   // n.degree() は現在 cy に載っているノードだけを数える（主要ノードのみの表示中は部分グラフ上の値）。
   rows.push(`<div class="nrow">表示中のつながり数: ${n.degree()} 本</div>`);
   $('nodecard').innerHTML = `<span class="nt">${esc(d.type_ja)}</span><div class="nn">${esc(d.label)}</div>`

@@ -23,7 +23,7 @@ const LAYER_LABEL = { both: '資料＋コード', docs: '資料のみ', code: '�
 const DEPTH_LABEL = { standard: '標準', deep: '深く', max: '最大' };
 // 検索経路トグル（調べ方ブロック §3.6・SC-6e）。キー順は要約ラベルの表示順にもなる。
 const TOOL_KEYS = ['grep', 'fulltext', 'graph'];
-const TOOL_LABEL = { grep: 'コマンド検索', fulltext: '全文・ベクトル', graph: 'グラフ' };
+const TOOL_LABEL = { grep: '語句そのまま検索', fulltext: '意味・表記ゆれも探す', graph: 'グラフ' };
 // このレンズでは層フィルタが実効しない（サーバ側 sherpa/layer.py の _LENS_NOT_APPLIED と同じ2つ・
 // §3.5 裁定1）。ここでは「探す対象」セグメントをグレーアウトし理由を明示するためだけに使う
 // （黙って無視しない・docs/04 §5「エラーは平文で理由＋次の一手」の作法を転用）。

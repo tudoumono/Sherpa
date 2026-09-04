@@ -138,11 +138,11 @@ def test_token_kind_table_renders(page, web_base_url):
     kind_tbody = page.locator("#token-kind-tbody")
     expect(page.locator("#token-kind-card")).to_be_visible()
     expect(kind_tbody).to_contain_text("会話")          # kind=chat
-    expect(kind_tbody).to_contain_text("意図の判定")     # kind=intent
-    expect(kind_tbody).to_contain_text("検索用ベクトル化")  # kind=embed
+    expect(kind_tbody).to_contain_text("依頼の仕分け")     # kind=intent
+    expect(kind_tbody).to_contain_text("検索の索引づくり")  # kind=embed
 
     # gemini/embed 行はトークン列が全て null（報告不能マーカー）＝「—」で表示される。
-    embed_row = kind_tbody.locator("tr", has_text="検索用ベクトル化")
+    embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")
     expect(embed_row).to_contain_text("—")
 
 
@@ -878,7 +878,7 @@ def test_usage_chat_openai_key_hint_shown_when_a7_not_openai(page, web_base_url)
     page.goto(f"{web_base_url}/usage.html")
     expect(page.locator("#usage-chat-openai-key-hint")).to_be_visible()
     expect(page.locator("#usage-chat-openai-key-hint")).to_contain_text(
-        "OpenAI のキーは実行構成が OpenAI のときだけ使えます")
+        "OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます")
     expect(page.locator("#usage-chat-openai-key-hint")).to_contain_text("現在: Gemini")
 
 

@@ -17,7 +17,7 @@ Sherpa は、社内の設計書・仕様書・Office 資料・COBOL/JCL/コピ�
 ## 画面
 
 <p>
-  <img src="docs/manual/images/10-chat-overview.png" alt="チャット画面（左=会話履歴／中央=回答／右=調査の流れ）" width="32%">
+  <img src="docs/manual/images/10-chat-overview.png" alt="チャット画面（左=会話履歴／中央=回答／右=思考の流れ）" width="32%">
   <img src="docs/manual/images/10-chat-impact-card.png" alt="影響分析の回答カード（内訳と対象一覧）" width="32%">
   <img src="docs/manual/images/20-ingest-status.png" alt="取り込み状況画面（フォルダツリーと状態）" width="32%">
 </p>
