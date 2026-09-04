@@ -166,9 +166,12 @@ def list_api_keys(owner_uid: str | None = None) -> list:
 
 
 def list_webhook_keys_for_world(world: str) -> list:
-    """`world` を許可する、Webhook 宛先が登録済みの有効キー一覧（PART-6）。
+    """`world` を許可する、Webhook 宛先が登録済みの有効キー一覧（PART-6・RV是正#2）。
 
-    対象: 失効しておらず（`revoked_at IS NULL`）`webhook_url` を持ち、`allowed_worlds` が
+    対象: 失効しておらず（`revoked_at IS NULL`）・期限切れでなく（`expires_at IS NULL OR
+    expires_at > now()`・`_verify_key_sync` と同じ判定規則）・所有ユーザーが有効
+    （`owner_uid IS NULL`＝admin 発行キーは対象外の判定なし・非 NULL は `users.status='active'`
+    ——`api_key_by_hash` の `owner_status` 判定と同型）・`webhook_url` を持ち、`allowed_worlds` が
     `world` を許可する（None＝全 world 許可、または `world` を含む）キー全部——
     `ext_api._enforce_world_scope`（`allowed is None or world not in allowed` の否定）と
     同じ判定規則を SQL 側で再現する。`webhook_secret`（署名生成に必須・平文）も返す——
@@ -177,9 +180,12 @@ def list_webhook_keys_for_world(world: str) -> list:
     _ensure()
     with _connect() as c:
         return c.execute(
-            "SELECT id, webhook_url, webhook_secret FROM api_keys "
-            "WHERE revoked_at IS NULL AND webhook_url IS NOT NULL "
-            "  AND (allowed_worlds IS NULL OR %s = ANY(allowed_worlds))",
+            "SELECT k.id, k.webhook_url, k.webhook_secret FROM api_keys k "
+            "LEFT JOIN users u ON u.uid = k.owner_uid "
+            "WHERE k.revoked_at IS NULL AND k.webhook_url IS NOT NULL "
+            "  AND (k.expires_at IS NULL OR k.expires_at > now()) "
+            "  AND (k.owner_uid IS NULL OR u.status = 'active') "
+            "  AND (k.allowed_worlds IS NULL OR %s = ANY(k.allowed_worlds))",
             (world,),
         ).fetchall()
 

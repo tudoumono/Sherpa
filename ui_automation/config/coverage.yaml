@@ -384,10 +384,10 @@ surfaces:
         cases:
           - cases/chat/test_chat_controls.py::test_chat_panel_font_brain_scope_and_personal_controls
           - cases/thought_flow/test_runtime_behaviors.py::test_confirmation_card_persists_and_resumes_real_turn
-      - selectors: ["[data-cites]", "[data-filter]", "[data-rg]"]
-        action: 実回答の引用、根拠filter、参照graphを展開して対応する根拠を確認する
+      - selectors: ["[data-cites]", "[data-rg]"]
+        action: 実回答の引用、参照graphを展開して対応する根拠を確認する
         states:
-          normal: 実turnが返した根拠だけを展開またはfilterする
+          normal: 実turnが返した根拠だけを展開する
           abnormal: 根拠なし回答に偽の引用やgraphを生成しない
         roles: [admin, user]
         cases:

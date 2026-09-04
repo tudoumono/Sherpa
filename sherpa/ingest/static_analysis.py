@@ -16,7 +16,9 @@ _PROGRAM_ID = re.compile(r"PROGRAM-ID\s*\.\s*([A-Z0-9#@$-]+)", re.I)
 # 末尾に偶然 COPY/CALL が現れるケースを偽参照として拾っていた（CODE-1a RV7 指摘・2026-09-05 是正）。
 # 前方は `_DYNAMIC_CALL` と同じ COBOL 識別子境界（直前が `A-Z0-9#@$-` でない）を使う。
 _COPY = re.compile(r"(?<![A-Z0-9#@$-])COPY\s+([A-Z0-9#@$-]+)", re.I)
-_CALL = re.compile(r"(?<![A-Z0-9#@$-])CALL\s+'([^']+)'", re.I)
+# rv-s2-mention #5（2026-09-05）: `'...'` に加え `"..."` の CALL も INVOKES として受理する
+# （`_strip_quoted`/`_strip_inline_comment` と組み合わせて呼び出し元 `analyzers/cobol.py` が使う）。
+_CALL = re.compile(r"(?<![A-Z0-9#@$-])CALL\s+['\"]([^'\"]+)['\"]", re.I)
 _ITEM = re.compile(r"^\s*(\d{2})\s+([A-Z0-9#@$-]+)")          # 01/05.. レベル項目
 _VALUE = re.compile(r"\bVALUE\s+([+-]?[0-9]+(?:\.[0-9]+)?)", re.I)  # VALUE 句の数値リテラル
 _JOB = re.compile(r"^//(\S+)\s+JOB\b", re.I)
@@ -29,7 +31,9 @@ _EXEC = re.compile(r"^//(\S+)\s+EXEC\s+PGM=([A-Z0-9#@$-]+)", re.I)
 _DYNAMIC_CALL = re.compile(r"(?<![A-Z0-9#@$-])CALL\s+([A-Z][A-Z0-9#@$-]*)\b", re.I)
 _JCL_EXEC_ANY = re.compile(r"^//(\S+)\s+EXEC\s+(\S+)", re.I)           # PGM= に限らない EXEC（PROC 実行を含む）
 _JCL_INCLUDE = re.compile(r"^//\S*\s*INCLUDE\b", re.I)                 # // INCLUDE MEMBER=
-_QUOTED_RE = re.compile(r"'[^']*'")                                    # COBOL 文字列リテラル（'...'）
+# COBOL 文字列リテラル（`'...'`／`"..."`）。rv-s2-mention #5（2026-09-05）で二重引用符も対象へ拡張
+# （元は単一引用符のみ・`_strip_quoted` の docstring 参照）。
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 # 固定形式/自由形式は入力から判定する（設定は持たない・docs/proposals/2026-08-29-コード解析層の
 # コンポーネント化.md §2.2・§5）。ファイル単位の近似——ファイル中で**最初に現れる**指示文
 # （`>>SOURCE FORMAT FREE/FIXED`・`>>SOURCE FREE/FIXED` も同義）で判定し、それ以降の途中切替や
@@ -104,6 +108,36 @@ def _split_statements(line: str) -> list:
 
 
 def _strip_quoted(s: str) -> str:
-    """引用符 `'...'` の中身を除去する（`DISPLAY 'CALL X'` のような文字列リテラル中の語を、
-    動的 CALL 判定が構文と誤認しないようにするための前処理）。"""
+    """引用符（`'...'`／`"..."`）の中身を除去する（`DISPLAY 'CALL X'`／`DISPLAY "COPY X"` のような
+    文字列リテラル中の語を、動的 CALL 判定・COPY 抽出が構文と誤認しないようにするための前処理・
+    rv-s2-mention #5 で二重引用符にも対応）。`CALL '...'`/`CALL "..."` 自体のリテラル抽出
+    （`_CALL`）には使わない——そちらは引用符の**中身**（呼び出し先プログラム名）を読む側のため。"""
     return _QUOTED_RE.sub("''", s)
+
+
+def _strip_inline_comment(line: str) -> str:
+    """引用符の外側にある `*>`（自由形式のインラインコメント）以降を切り捨てる（rv-s2-mention #5）。
+
+    `_is_comment` は行**全体**が `*` 始まりのコメント行かどうかしか見ない——`MOVE X TO Y. *> COPY
+    FAKE` のように実コードに続けて書かれた行末コメントは対象外だった。COPY/CALL のリテラル抽出
+    （`analyzers/cobol.py` の `_COPY`/`_CALL` 呼び出し）の前段でこれを切り捨てないと、コメント中の
+    語を構文と誤認する。引用符 `'...'`/`"..."` の中の `*>` は区切りに使わない（文字列リテラル内の
+    偶然の一致を誤って打ち切らない）。
+    """
+    in_quote = None
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+            i += 1
+            continue
+        if ch == "*" and line[i + 1:i + 2] == ">":
+            return line[:i]
+        i += 1
+    return line

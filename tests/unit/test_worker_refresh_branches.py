@@ -54,7 +54,14 @@ def _bump_marker(dmd, name):
 def _stub(monkeypatch, tmp_path):
     """`sync()` を DB/Neo4j/ES 無しで駆動する。`office_md`/派生ファイルは実物のまま。"""
     wd, dmd = _build_world(tmp_path)
-    calls: dict[str, list] = {"run": [], "index_world": [], "needs_reindex": []}
+    calls: dict[str, list] = {"run": [], "index_world": [], "needs_reindex": [], "reflect_graph": []}
+
+    # rv-s2-mention #1: 軽量再生成が成功すると `_reflect_graph_after_rag_rewrite`
+    # （`build_world_graph`→`world_neo4j.load_world`）が呼ばれるようになった——本ファイルの
+    # 対象は ES/マーカーの分岐配線であり Neo4j 反映自体の中身は対象外（実 Neo4j に触れない、
+    # という本ファイルの docstring の前提を保つ）。呼ばれたことだけを記録する。
+    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite",
+                        lambda world: calls["reflect_graph"].append(world))
 
     monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
@@ -130,6 +137,7 @@ def test_sync_rag_drift_only_regenerates_via_real_refresh_rag(_stub):
     assert office_md.evidence_ir_sig_drift(dmd) is False   # evidence側は無関係のまま変化しない
     assert _stub["calls"]["run"] == []
     assert res["status"] == "unchanged" and res["changed"] is False
+    assert _stub["calls"]["reflect_graph"] == ["w"]  # rv-s2-mention #1: rag.md書換え成功後にグラフも追随させる
 
 
 def test_sync_evidence_drift_regenerates_via_real_refresh_evidence_ir_only(_stub):
@@ -153,6 +161,7 @@ def test_sync_no_drift_keeps_existing_backfill_and_es_repair(_stub):
     assert (dmd.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8") == old_rag_md
     assert _stub["calls"]["needs_reindex"] == ["sig"]        # 既存のES自己修復チェックは変わらず走る
     assert res["status"] == "unchanged" and res["changed"] is False
+    assert _stub["calls"]["reflect_graph"] == []   # rag.md自体が書き換わっていない＝グラフ反映も不要
 
 
 def test_sync_human_md_only_drift_still_reaches_es_repair_same_call(_stub, monkeypatch):

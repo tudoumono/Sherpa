@@ -114,11 +114,18 @@ def test_reindex_after_rag_rewrite_returns_false_when_sig_missing(monkeypatch):
 def test_reindex_after_rag_rewrite_skips_es_when_rag_es_disabled(monkeypatch):
     monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": "sig"})
     monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
+    monkeypatch.setattr(store, "world_lock", _noop_lock)
+    # rv-s2-mention #1: グラフ反映は RAG_ES の有無に関わらず常に呼ばれる（ES を経ない world でも
+    # 言及エッジは陳腐化しうるため）——ここでは呼ばれたことだけを確認する（内部の
+    # build_world_graph/load_world 自体は `test_worker_rag_refresh.py` 側の統合テストで確認済み）。
+    reflect_calls = []
+    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: reflect_calls.append(world))
 
     def _boom(*a, **kw):
         raise AssertionError("RAG_ES無効ならESに触れてはいけない")
-    monkeypatch.setattr(store, "world_lock", _boom)
+    monkeypatch.setattr(office_md, "drop_rag_sig_marker", _boom)
     assert worker._reindex_after_rag_rewrite("v1") is True
+    assert reflect_calls == ["v1"]
 
 
 def test_reindex_after_rag_rewrite_marker_drop_failure(monkeypatch):
@@ -126,6 +133,7 @@ def test_reindex_after_rag_rewrite_marker_drop_failure(monkeypatch):
     monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: "dmd")
+    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: None)
     monkeypatch.setattr(office_md, "drop_rag_sig_marker", lambda dmd: False)
 
     def _boom(*a, **kw):
@@ -139,6 +147,7 @@ def test_reindex_after_rag_rewrite_success_writes_marker(monkeypatch):
     monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: "dmd")
+    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: None)
     monkeypatch.setattr(office_md, "drop_rag_sig_marker", lambda dmd: True)
     monkeypatch.setattr(worker, "index_world_with_human_md_holdback",
                         lambda world, content_sig=None: {"available": True})
@@ -153,6 +162,7 @@ def test_reindex_after_rag_rewrite_es_failure_does_not_write_marker(monkeypatch)
     monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: "dmd")
+    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: None)
     monkeypatch.setattr(office_md, "drop_rag_sig_marker", lambda dmd: True)
     monkeypatch.setattr(worker, "index_world_with_human_md_holdback",
                         lambda world, content_sig=None: {"available": False, "error": "unreachable"})

@@ -240,49 +240,12 @@ def test_real_impact_filter_and_reference_graph_controls(admin_page, live_api, u
     answer = assistant.get("answer") or {}
     assert answer.get("lens") == "impact", f"impact request was routed to {answer.get('lens')!r}"
     items = (answer.get("data") or {}).get("items") or []
-    assert items, "real impact turn produced no structured graph items; data-filter/data-rg controls must not be marked covered"
+    assert items, "real impact turn produced no structured graph items; data-toggle/data-rg controls must not be marked covered"
     graph_items = [item for item in items if len(item.get("trace") or []) >= 2]
     assert graph_items, "real impact items have no multi-node trace for the reference-graph UI"
-    expected_by_filter = {
-        "all": items,
-        "sure": [item for item in items if item.get("judgement") == "sure"],
-        "review": [item for item in items if item.get("judgement") != "sure"],
-    }
     assistant_card = admin_page.locator("#messages .msg:not(.user)").last
-    filter_summary = assistant_card.locator(".ix-summary")
-    expect(filter_summary).to_be_visible()
     rows = assistant_card.locator(".ilist").first.locator(":scope > li")
     expect(rows).to_have_count(len(items))
-    observed_filters: dict[str, list[str]] = {}
-    for state in ("sure", "review", "all"):
-        control = filter_summary.locator(f'[data-filter="{state}"]')
-        expect(control).to_be_visible()
-        control.click()
-        expect(control).to_have_attribute("aria-pressed", "true")
-        expect(filter_summary.locator(f'[data-filter]:not([data-filter="{state}"])').first).to_have_attribute("aria-pressed", "false")
-        visible_names = rows.evaluate_all(
-            "els => els.filter(el => !el.classList.contains('ix-hide')).map(el => el.querySelector('.nm').textContent.trim())"
-        )
-        expected_names = [str(item.get("name") or "").strip() for item in expected_by_filter[state]]
-        assert visible_names == expected_names, {
-            "filter": state,
-            "expected": expected_names,
-            "rendered": visible_names,
-        }
-        expected_label = (
-            f"{len(expected_names)}件を表示中"
-            if state == "all"
-            else f"{'確実' if state == 'sure' else '要確認'}の{len(expected_names)}件を表示中"
-        )
-        expect(filter_summary.locator(".ix-shown")).to_have_text(expected_label)
-        observed_filters[state] = visible_names
-
-    assert observed_filters["all"] == [str(item.get("name") or "").strip() for item in items]
-    artifact_case.attest_control_state(
-        control_key="@selector:[data-filter]",
-        state="normal",
-        assertion="実impact回答の全件filterがAPI構造化itemと同じ順序と名称を表示した",
-    )
 
     detail_index = next(
         index
@@ -371,11 +334,10 @@ def test_real_impact_filter_and_reference_graph_controls(admin_page, live_api, u
         {
             "provider": ((answer.get("usage") or {}).get("provider")),
             "item_count": len(items),
-            "filter_results": observed_filters,
             "reference_graph": graph_state,
         },
     )
-    artifact_case.screenshot(admin_page, 30, "chat-impact-filter-and-reference-graph-operated")
+    artifact_case.screenshot(admin_page, 30, "chat-impact-detail-and-reference-graph-operated")
 
 
 def test_ext23_verified_and_reference_sources(admin_page, live_api, ui_config, artifact_case, real_world):

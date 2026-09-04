@@ -87,7 +87,7 @@ bootstrap:         ## ローカル利用ディレクトリ作成＋.env 用意�
 demo:              ## M0 demo: Codex が workspace で走り kb を read-only で読める
 	./scripts/demo_codex.sh
 
-mirror:            ## 鏡モデル契約テスト＋L層（docker 不要）
+mirror:            ## 鏡モデル契約テスト（docker 不要）
 	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/contract/test_mirror_contract.py -m contract
 
 install-docker:    ## Docker Engine を入れる（sudo パスワードを1回入力）

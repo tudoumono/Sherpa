@@ -214,6 +214,38 @@ def test_source_format_directive_uses_first_occurrence_not_any_occurrence():
     assert _is_free_format("no directive here") is False
 
 
+def test_extract_refs_ignores_copy_keyword_inside_string_literal():
+    """`DISPLAY 'COPY FAKECPY'.` のように文字列リテラルの中に `COPY` という語があるだけでは、
+    COPIES 参照として誤検知しない（`_CALL` 側の既存テスト`test_extract_refs_ignores_call_keyword_
+    inside_string_literal` と対になる COPY 版・rv-s2-mention #5）。"""
+    text = "       PROGRAM-ID. ORDER-MAIN.\n           DISPLAY 'COPY FAKECPY'.\n"
+    res = A.extract_refs(text, "ORDER-MAIN.cbl")
+    assert res.refs == [] and res.dropped == []
+
+
+def test_extract_refs_ignores_copy_after_inline_comment_marker():
+    """`*>` 以降はコメント——行全体が `*>` コメントの `*> COPY X`（`_is_comment` が拾う既存動作）に
+    加え、`MOVE 1 TO Y. *> COPY FAKE` のように実コードへ続けて書かれた行末コメント中の COPY も
+    拾わない（`_is_comment` は行**全体**がコメント行かどうかしか見ないため、行末コメントは
+    従来対象外だった＝rv-s2-mention #5 で新規に塞いだ穴）。"""
+    text = (
+        "       PROGRAM-ID. ORDER-MAIN.\n"
+        "      *> COPY X\n"
+        "           MOVE 1 TO Y. *> COPY FAKE\n"
+    )
+    res = A.extract_refs(text, "ORDER-MAIN.cbl")
+    assert res.refs == [] and res.dropped == []
+
+
+def test_extract_refs_accepts_double_quoted_call_literal():
+    """`CALL "REALPGM"`（二重引用符）も単一引用符と同様に INVOKES として受理する（rv-s2-mention #5）。"""
+    text = "       PROGRAM-ID. ORDER-MAIN.\n           CALL \"REALPGM\".\n"
+    res = A.extract_refs(text, "ORDER-MAIN.cbl")
+    kinds = {(r.edge_type, r.kind, r.name) for r in res.refs}
+    assert kinds == {("INVOKES", "Module", "REALPGM")}
+    assert res.dropped == []
+
+
 def test_call_copy_do_not_match_inside_cobol_identifiers():
     """語境界是正（2026-09-05）: `WS-CALL 'X'`／`WS-COPY ITEM` のような COBOL 識別子の末尾に
     偶然 COPY/CALL が現れる行を偽参照として拾わない（`_DYNAMIC_CALL` と同じ前方境界規則）。

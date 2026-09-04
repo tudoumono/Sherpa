@@ -74,6 +74,33 @@ def test_mention_tokenize_containment_boundary_hyphen_and_japanese_mix():
     assert toks2 == ["AAA", "BBB"]
 
 
+def test_mention_tokenize_includes_cobol_identifier_chars_hash_at_dollar():
+    """トークン文字集合はアナライザの COBOL 識別子文字集合（`static_analysis._PROGRAM_ID` 等の
+    `[A-Z0-9#@$-]`）と揃える（rv-s2-mention #3）——`#`/`@`/`$` を含む識別子も1トークンとして
+    扱う。以前は `BILL@01` が `BILL`/`01` に分割され、無関係な定義（`BILL`）へ誤って言及
+    リンクしていた。"""
+    toks = world_graph._mention_tokenize("この文書は BILL@01 を扱う。")
+    assert "BILL@01" in toks
+    assert "BILL" not in toks
+    assert "01" not in toks
+
+
+def test_mention_edge_uses_full_token_and_does_not_link_to_unrelated_prefix(tmp_path, monkeypatch):
+    """`BILL@01` という定義名は1トークンとして辞書に載り、別定義 `BILL` への誤リンクを起こさない
+    （rv-s2-mention #3・トークン文字集合の是正）。"""
+    wd = _world(tmp_path, {
+        "g1/a.fk": "x", "g1/b.fk": "y",
+        "g1/note.md": "この文書は BILL@01 を扱う。",
+    })
+    defs = {"g1/a.fk": _def("Module", "BILL@01"), "g1/b.fk": _def("Module", "BILL")}
+    monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
+
+    _, edges, _ = world_graph.build_world(wd, "w")
+    dsts = {e["dst"] for e in _mention_edges(edges)}
+    assert dsts == {world_graph._cid("Module", "w", "g1/a.fk", "BILL@01")}
+    assert world_graph._cid("Module", "w", "g1/b.fk", "BILL") not in dsts
+
+
 # ---- 長さ下限 --------------------------------------------------------------------------------
 
 def test_min_len_filters_short_names_env_adjustable(tmp_path, monkeypatch):
@@ -89,6 +116,47 @@ def test_min_len_filters_short_names_env_adjustable(tmp_path, monkeypatch):
     doc_edges = _mention_edges(edges)
     assert len(doc_edges) == 1
     assert doc_edges[0]["via"] == "mention"
+
+
+def test_dictionary_excludes_short_names_before_document_scan_is_skipped(tmp_path, monkeypatch):
+    """rv-s2-mention #4: 長さ下限未満の名前は**辞書構築の時点で**除外される（以前は文書側の
+    トークンを都度足切りするだけで、辞書自体には短名が残っていた）——定義が全て短名だけの
+    world は辞書が空になり、文書走査自体が省かれる（読めない資料があっても `unreadable_mention_doc`
+    すら申告されない＝走査に入っていない証拠）。"""
+    wd = _world(tmp_path, {"g1/a.fk": "x", "g1/unreadable.md": "ABC に言及する。"})
+    defs = {"g1/a.fk": _def("Module", "ABC")}    # 3文字＝既定4文字未満
+    monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
+
+    real_read_text = pathlib.Path.read_text
+
+    def _boom_read_text(self, *a, **kw):          # 呼ばれたら「走査に入ってしまった」証拠として失敗させる
+        if self.name == "unreadable.md":
+            raise OSError("boom")
+        return real_read_text(self, *a, **kw)
+    monkeypatch.setattr(pathlib.Path, "read_text", _boom_read_text)
+
+    _, edges, flags = world_graph.build_world(wd, "w")
+    assert _mention_edges(edges) == []
+    assert flags == []                            # unreadable_mention_doc も出ない＝走査が省かれた
+
+
+def test_ambiguous_alias_count_excludes_names_below_min_len(tmp_path, monkeypatch):
+    """rv-s2-mention #4: 長さ下限未満の別名（表示名）は辞書構築時点で除外されるため、同世代衝突が
+    あっても `mention_ambiguous_names` へ数えない（突合し得ない名前まで誤ってカウントしていた
+    穴の是正）。"""
+    wd = _world(tmp_path, {
+        "g1/a.fk": "x", "g1/b.fk": "y",
+        "g1/note.md": "この文書は AB という項目を扱う。",
+    })
+    defs = {
+        "g1/a.fk": _def_with_child("Copybook", "GROUPA", "DataItem", "AB", "GROUPA.AB"),
+        "g1/b.fk": _def_with_child("Copybook", "GROUPB", "DataItem", "AB", "GROUPB.AB"),
+    }   # 表示名 "AB" は2文字＝既定4文字未満・同世代で衝突
+    monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
+
+    _, edges, flags = world_graph.build_world(wd, "w")
+    assert _mention_edges(edges) == []
+    assert not [f for f in flags if f.get("reason") == "mention_ambiguous_names"]
 
 
 # ---- 修飾名を持つ子定義は単純名（表示名）でも突合できる（S2-LEAFNAME） --------------------------
@@ -261,3 +329,30 @@ def test_mention_edge_is_documents_type_reachable_via_related_rel(tmp_path, monk
     doc_edges = _mention_edges(edges)
     assert len(doc_edges) == 1
     assert doc_edges[0]["type"] in lens_service._RELATED_REL
+
+
+# ---- 言及エッジの実効設定は world 署名の材料に含まれる（rv-s2-mention #2） ------------------------
+
+def test_world_signature_changes_with_mention_min_len_and_max_per_doc(monkeypatch, tmp_path):
+    """`SHERPA_MENTION_MIN_LEN`/`SHERPA_MENTION_MAX_PER_DOC` の実効値は `worker.world_signature`
+    （`worker._sig` の材料）に含まれる——env を変えると、ソースファイル自体が不変でも署名が
+    変わる。旧実装は `world_graph.MENTION_SCHEMA_VERSION`（仕様版）だけを材料にしており、
+    設定変更後も既存 world の言及エッジが旧しきい値のまま素通りしていた。"""
+    from sherpa.ingest import worker
+    wd = tmp_path / "world"
+    wd.mkdir()
+    (wd / "a.md").write_text("x", encoding="utf-8")
+
+    sig_default = worker.world_signature_of_root(wd)
+
+    monkeypatch.setenv("SHERPA_MENTION_MIN_LEN", "6")
+    sig_min_len = worker.world_signature_of_root(wd)
+    assert sig_min_len != sig_default
+    monkeypatch.delenv("SHERPA_MENTION_MIN_LEN", raising=False)
+    assert worker.world_signature_of_root(wd) == sig_default, "既定値へ戻せば署名も再現する"
+
+    monkeypatch.setenv("SHERPA_MENTION_MAX_PER_DOC", "50")
+    sig_max_per_doc = worker.world_signature_of_root(wd)
+    assert sig_max_per_doc != sig_default
+    monkeypatch.delenv("SHERPA_MENTION_MAX_PER_DOC", raising=False)
+    assert worker.world_signature_of_root(wd) == sig_default

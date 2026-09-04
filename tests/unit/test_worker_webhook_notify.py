@@ -20,7 +20,7 @@ from sherpa.ingest import world_neo4j, worker
 def _stub_pipeline(monkeypatch):
     """`worker.run`/`worker.sync` を DB/Neo4j 無しで駆動できるよう周辺を差し替える（happy path 既定・
     `test_ingest_worker_flags.py::_stub_pipeline` と同型）。"""
-    monkeypatch.setattr(worker, "world_state", lambda world: ("sig", {"a": [1, 2, 3]}))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
                         lambda world, **_kw: {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}})
@@ -90,7 +90,7 @@ def test_explicit_op_overrides_default(_stub_pipeline):
 def test_world_unresolved_notifies_failed_status(_stub_pipeline, monkeypatch):
     """`world_state` が `sig=None`（未解決）を返すと mutation 前に即 failed で終了する経路
     （`_run_locked` 冒頭）でも通知される。"""
-    monkeypatch.setattr(worker, "world_state", lambda world: (None, None))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: (None, None))
     res = worker.run("w2")
     assert res["status"] == "failed"
     assert len(_stub_pipeline) == 1
@@ -101,7 +101,7 @@ def test_world_unresolved_notifies_failed_status(_stub_pipeline, monkeypatch):
 def test_sync_unchanged_world_unresolved_notifies_via_finalize_if_unused(_stub_pipeline, monkeypatch):
     """`_sync_impl` の `_run_locked` を経由しない終了点（world 未解決）でも `run_id` があれば
     通知される（`_finalize_if_unused` 経由）。"""
-    monkeypatch.setattr(worker, "world_state", lambda world: (None, None))
+    monkeypatch.setattr(worker, "world_state", lambda world, progress=None: (None, None))
     result = worker.sync("w3", run_id=99)
     assert result["status"] == "unavailable"
     assert len(_stub_pipeline) == 1

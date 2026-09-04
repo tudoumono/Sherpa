@@ -2,6 +2,9 @@
 
 > **⚠ 2026-06-28 同一性/範囲は [03-鏡モデル.md](03-鏡モデル.md) が一次情報・移行完了**。本書 tool contract の
 > `@version` 表記・`version` フィルタは**`world_id + scope_prefixes` ＋ パス修飾 ID へ置換済**（DL は rel_path 基準）。矛盾時は [03-鏡モデル.md](03-鏡モデル.md) を優先。
+> **⚠ 2026-09-04 グラフのソース正典化（K9-K13）で `REALIZES` 橋・`Parameter`/`Function` 等のラベル・
+> 影響結果の `confidence`(sure/review) 判定は撤去済み**。本書のツール契約例に残る言及は当時の MVP 設計の
+> 記録であり、現行の語彙は [03-鏡モデル.md](03-鏡モデル.md) §2.1／[proposals/2026-09-04-グラフのソース正典化.md](proposals/2026-09-04-グラフのソース正典化.md) を優先する。
 
 > FastAPI と Codex CLI のセッション管理の実装詳細。**DB を基準**に Codex CLI をヘッドレス駆動し、
 > 実行トレース（調査ログ）を SSE 配信、結果を `analyses`/`analysis_items` に落とす。
@@ -148,8 +151,10 @@ sequenceDiagram
 - `neo4j_impact(start, version, depth)` … 版DBで逆向き推移たどり（[05-グラフ語彙.md](05-グラフ語彙.md) §6）。**版内完結**。
 - `neo4j_related(anchor, version, depth)` … 厳密な依存影響でなく**近傍**（`INVOKES`/`RELATES_TO`/`DOCUMENTS` 含む）。
   **トラブルシュート用**。
-- `resolve_entity(term, version)` … 起点曖昧性解消（R3）。**業務名は Parameter と対応 DataItem を
-  複数起点で返してよい**（`REALIZES` 橋とあわせ、コピーブック系譜への到達を保証・[05-グラフ語彙.md](05-グラフ語彙.md)）。
+- `resolve_entity(term, version)` … 起点曖昧性解消（R3）。**当時は業務名を Parameter ノードへ `REALIZES` 橋で
+  結び複数起点の DataItem を返す設計だったが、この橋は撤去済み（K10）**。現行は業務語→コード名の変換を
+  クエリ時のエージェント検索（文書 grep→コード名発見）＋辞書突合の**言及エッジ**（`DOCUMENTS via="mention"`）
+  が担う（[03-鏡モデル.md](03-鏡モデル.md) §2.1/§2.4）。
 - `emit_result(type, items[])` … 構造化結果を返す仕様（§7）。
 各ツールは **版・共有/個人スコープを強制**し、結果に **provenance（`doc_id` ＋ span/line）** を付けて返す
 （ソースも台帳行なので doc_id で統一・[05-グラフ語彙.md](05-グラフ語彙.md) §3。→ 参照DL R6/R14、個人ファイルは RAG 引用元に出さない）。
@@ -160,9 +165,10 @@ sequenceDiagram
 散文を正規表現で拾わず、**`emit_result` ツール**でエージェントに構造化結果を返させる:
 ```jsonc
 // impact の例（根拠DLは evidence[].doc_id。target_doc_id は使わない＝UC-2 専用）
+// confidence(sure/review) 判定は撤去済み（K12）＝items は全件同格。旧例の名残として残していた
+// フィールドは削除。
 { "type":"impact", "version":"2025冬",
   "items":[ {"category":"機能","label":"請求書発行機能",
-             "confidence":"sure","extraction_method":"static",
              "path":["TAX-RATE","税計算ルール","請求書発行機能"],
              "evidence":[{"doc_id":123,"span":[40,72],"text":"…"}]} ] }
 ```

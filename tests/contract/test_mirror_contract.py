@@ -255,6 +255,41 @@ def test_regenerate_migration_golden_from_base_sha():
         sys.modules.pop(tmp_name, None)
 
 
+MENTION_GOLDEN = ROOT / "tests/contract/goldens/mention_edges_v1.json"
+
+
+def test_mention_edges_golden_and_determinism():
+    """言及エッジ（Pass3・辞書突合）専用の golden 検査（rv-s2-mention #7）。
+
+    `_rich_summary()`/`test_analyzer_registry_migration_keeps_graph_set_identical` は骨格の golden
+    と混ざらないよう `via=="mention"` を明示的に**除外**している（同関数 docstring 参照）——言及
+    エッジ自体の回帰は別に固定していなかったため、ここで `fixtures/corpus/v1` の DOCUMENTS
+    (via=mention) の (src,dst) をソート済み全列挙して golden 比較する。あわせて①全端点（src/dst
+    双方の cid）がノード集合に実在すること、②2回連続で構築した結果が完全一致すること（決定的＝
+    辞書突合が構築順や内部キャッシュに依存しない）も固定する。
+    """
+    import json
+    from sherpa.ingest import world_graph
+    nodes1, edges1, flags1 = world_graph.build_world(CORPUS_V1, "v1")
+    nodes2, edges2, flags2 = world_graph.build_world(CORPUS_V1, "v1")
+    assert flags1 == [] and flags2 == []
+
+    def _mention_pairs(edges):
+        return sorted({(e["src"], e["dst"]) for e in edges
+                       if e["type"] == "DOCUMENTS" and e.get("via") == "mention"})
+
+    pairs1, pairs2 = _mention_pairs(edges1), _mention_pairs(edges2)
+    assert pairs1 == pairs2                               # 2回構築して完全一致（決定的）
+
+    all_cids = {n["cid"] for n in nodes1}
+    missing = [p for p in pairs1 if p[0] not in all_cids or p[1] not in all_cids]
+    assert not missing, f"言及エッジの端点がノード集合に無い: {missing}"
+
+    golden = json.loads(MENTION_GOLDEN.read_text(encoding="utf-8"))
+    assert [list(p) for p in pairs1] == golden["mention_edges"], \
+        "言及エッジ (src,dst) の全列挙が golden と不一致（回帰の疑い）"
+
+
 def test_deleted_doc_yields_no_mention_edges_on_rebuild():
     """鏡＝削除で消える: 言及元 Document（Pass3）は毎回 `files`（現存ファイル一覧）だけを走査する
     ため、削除済み doc は再構築時にそもそも走査されず、その言及エッジも載らない（旧 L 意味層の

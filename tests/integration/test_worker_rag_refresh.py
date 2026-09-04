@@ -20,7 +20,7 @@ import pytest
 from sherpa import es_index, json_io, store, worlds
 from sherpa.ingest import evidence_ir as IR
 from sherpa.ingest import evidence_render as R
-from sherpa.ingest import office_md, worker
+from sherpa.ingest import office_md, worker, world_graph, world_neo4j
 
 
 def _build_world(tmp_path):
@@ -200,6 +200,51 @@ def test_rag_refresh_es_failure_leaves_marker_for_retry(_world, monkeypatch):
                          {"available": True, "indexed": 1, "chunks": 1})
     worker.sync("w")
     assert office_md.rag_sig_drift(dmd) is False          # 2回目のES成功で収束する
+
+
+def test_llm_rag_rewrite_reflects_mention_edges_in_graph(_world, monkeypatch):
+    """rv-s2-mention #1: `.rag.md` の軽量書換え後（`_reindex_after_rag_rewrite`＝`_llm_render_pass`／
+    `regenerate_rag_rule_only` が呼ぶ経路）、Neo4j のグラフ（言及エッジ）が追随することを固定する。
+    以前は ES だけ更新し `build_world_graph`→`load_world` を経由しないため、言及エッジが陳腐化した
+    まま固定されていた。ここでは実際に `world_graph.build_world` が構築した edges が
+    `world_neo4j.load_world` へ渡っていることを、SAMPLE への言及エッジの有無で直接確認する。
+    """
+    wd = _world["wd"]
+    dmd = _world["dmd"]
+    # `corpus_docs.iter_world_documents` は `.rag.md` の場所を `worlds.derived_rag_dir` で解決する
+    # （`derived_md_dir` とは別の getter・§8.1 三階層）——`_apply_world_monkeypatches` は
+    # `derived_md_dir` しか差し替えないため、ここで揃えて差し替える（辞書突合の対象決定に効く
+    # ため、事前条件確認より前に揃える）。
+    monkeypatch.setattr(worlds, "derived_rag_dir", lambda world: _rag(dmd))
+    (wd / "sample.cbl").write_text(
+        "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. SAMPLE.\n       PROCEDURE DIVISION.\n",
+        encoding="utf-8")
+
+    # 事前条件: 書換え前の rag.md は SAMPLE に言及していない＝言及エッジは無い。
+    nodes0, edges0, flags0 = world_graph.build_world(wd, "w")
+    assert flags0 == []
+    assert not [e for e in edges0 if e["type"] == "DOCUMENTS" and e.get("via") == "mention"]
+
+    # LLM 成形／規則版再生成が rag.md を書き換えた状況を模擬する（本文へ SAMPLE への言及を追加）。
+    rag_md_path = _rag(dmd) / "a.xlsx.rag.md"
+    rag_md_path.write_text(rag_md_path.read_text(encoding="utf-8") + "\nSAMPLE を使う。\n", encoding="utf-8")
+
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+    load_calls = []
+
+    def _fake_load_world(nodes, edges, world, uri, user, pw):
+        load_calls.append((nodes, edges))
+        return (len(nodes), len(edges))
+    monkeypatch.setattr(world_neo4j, "load_world", _fake_load_world)
+
+    ok = worker._reindex_after_rag_rewrite("w")
+    assert ok is True                                    # RAG_ES 無効（`_world` fixture の既定）＝無条件成功
+    assert len(load_calls) == 1                           # グラフ反映が実際に呼ばれた
+    _nodes, edges = load_calls[0]
+    dst_cid = world_graph._cid("Module", "w", "sample.cbl", "SAMPLE")
+    mentions = [e for e in edges if e["type"] == "DOCUMENTS" and e.get("via") == "mention"
+               and e["dst"] == dst_cid]
+    assert len(mentions) == 1, "書換え後の rag.md に追随した言及エッジが Neo4j 反映に含まれていない"
 
 
 def test_document_ir_drift_cascades_to_evidence_and_rag_via_sync(_world):

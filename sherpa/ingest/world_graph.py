@@ -96,11 +96,15 @@ def _document_cid(world_id: str, rel: str) -> str:
 # `Document -DOCUMENTS(via="mention")-> コードノード` を張る——`DOCUMENTS` は既存の型（`CORRESPONDS_TO`
 # と同族）で影響 traversal（`_IMPACT_REL`）に含まれない＝規律は自動で満たされる。
 
-MENTION_SCHEMA_VERSION = 2   # 突合仕様の版（worker._sig の材料。仕様変更時に既存 world を素通りさせない）
+MENTION_SCHEMA_VERSION = 3   # 突合仕様の版（worker._sig の材料。仕様変更時に既存 world を素通りさせない）
                               # v2（S2-LEAFNAME）: 修飾名（cid_key）を持つ子定義も単純名（表示名）で
                               # 辞書突合できるようにした（後述 `_mention_dictionary` 参照）。
+                              # v3（rv-s2-mention #3・2026-09-05）: トークン文字集合をアナライザの
+                              # COBOL 識別子文字集合（`static_analysis._PROGRAM_ID` 等の `[A-Z0-9#@$-]`）
+                              # と揃えた（`#@$` を追加）——`BILL@01` のような識別子が `BILL`/`01` に
+                              # 分割され、無関係な定義へ誤って言及リンクしていた穴を塞ぐ。
 
-_MENTION_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")
+_MENTION_TOKEN_RE = re.compile(r"[A-Za-z0-9_#@$-]+")
 
 
 def _mention_tokenize(text: str) -> list:
@@ -150,8 +154,26 @@ def _mention_max_per_doc() -> int:
     return _env_int("SHERPA_MENTION_MAX_PER_DOC", 200, 1, 100_000)
 
 
-def _mention_dictionary(defs: dict, aliases: dict | None = None) -> tuple[dict, int]:
+def _mention_eligible(name: str, min_len: int) -> bool:
+    """名前が辞書突合の対象になり得るか（rv-s2-mention #4）。
+
+    ①長さ下限未満、②`_MENTION_TOKEN_RE` の1トークンとして丸ごと一致しない名前（例:
+    コピーブック子項目の修飾名 `GROUP.LEAFNAME`——`.` を含み `_mention_tokenize` が
+    構造的に複数トークンへ分断するため、資料文書のどんなテキストからも単一トークンとして
+    出現し得ない）は、辞書に載せても絶対に突合しない死重みなので除外する。"""
+    return len(name) >= min_len and _MENTION_TOKEN_RE.fullmatch(name) is not None
+
+
+def _mention_dictionary(defs: dict, aliases: dict | None = None, *, min_len: int = 1) -> tuple[dict, int]:
     """`defs`（Pass1 の定義索引 `(label,key)->[rel,...]`）→ 言及突合の辞書 `name->[(label,rel,key),...]`。
+
+    `min_len`（rv-s2-mention #4）: 突合され得ない名前（長さ下限未満／`_mention_tokenize` が
+    決して1トークンとして生成しない修飾名）を**辞書構築の時点で**除外する——以前は文書側の
+    トークンを都度 `min_len` で足切りしていたため、辞書自体には短い名前/修飾名がそのまま残り、
+    (a) 定義が全て短名だけの world でも辞書が非空になり文書走査がスキップされない、
+    (b) 突合し得ない修飾名の同世代衝突まで `ambiguous_alias_count` に数えてしまう、の2点で
+    無駄・誤カウントを生んでいた。ここで先に落とすことで両方解消する（辞書構築後の
+    突合結果自体は同値——除外される名前はそもそも一致し得なかったもののみ）。
 
     **同一 top_scope（世代）内に同名の定義が複数あるものは曖昧＝その世代は除外**（K4④・名前解決と
     同じ流儀・ラベルは問わない＝同一世代で異なるラベルが同名でも曖昧）。**世代が違う同名は
@@ -174,9 +196,13 @@ def _mention_dictionary(defs: dict, aliases: dict | None = None) -> tuple[dict, 
     by_name_gen: dict = {}
     alias_names: set = set()
     for (label, key), rels in defs.items():
+        if not _mention_eligible(key, min_len):
+            continue
         for rel in rels:
             by_name_gen.setdefault(key, {}).setdefault(_top(rel), []).append((label, rel, key))
     for (label, name), pairs in (aliases or {}).items():
+        if not _mention_eligible(name, min_len):
+            continue
         alias_names.add(name)
         for rel, key in pairs:
             by_name_gen.setdefault(name, {}).setdefault(_top(rel), []).append((label, rel, key))
@@ -272,13 +298,13 @@ def _mention_pass(world_dir, world_id: str, defs: dict, aliases: dict, files, no
     を呼ぶため、レジストリ未登録/別 root での呼び出し（テスト fixture・`world_id` がまだ登録されて
     いない preview 等）でも同じ物理 root を確実に見る（`pin_world_root` の既存規律と同じ）。
     """
-    mdict, ambiguous_count = _mention_dictionary(defs, aliases)
+    min_len = _mention_min_len()
+    max_per_doc = _mention_max_per_doc()
+    mdict, ambiguous_count = _mention_dictionary(defs, aliases, min_len=min_len)
     if ambiguous_count:
         flags.append({"reason": "mention_ambiguous_names", "count": ambiguous_count})
     if not mdict:
         return
-    min_len = _mention_min_len()
-    max_per_doc = _mention_max_per_doc()
     with worlds.pin_world_root(world_id, world_dir):
         docs = corpus_docs.iter_world_documents(world_id, include_rag=grep_tool.rag_grep_enabled(),
                                                 root=world_dir, files=files)
@@ -454,6 +480,13 @@ def build_world(world_dir, world_id: str, *, files=None):
                 continue
             _link(ref.edge_type, src, ref.kind, ref.name, rel, ref.line,
                  analyzer_name=analyzer.name, extra=ref.extra)
+
+    # rv-s2-mention #6（2026-09-05）: Pass2 完了直後にコード本文を解放する——Pass3（`_mention_pass`）
+    # は `corpus_docs.iter_world_documents`/`doc_text.read_world_doc_text` 経由で資料文書
+    # （`branch=="office"`）の本文を都度読み直す独立した経路で、この `texts` 辞書（Pass1 で読んだ
+    # コード全文）を参照しない。大きい world ではコード全文を Pass3 の間も保持し続けるだけ無駄
+    # （メモリの早期解放）。
+    texts.clear()
 
     # Pass3: 辞書突合→言及エッジ（S2・単純名エイリアス込み＝S2-LEAFNAME）
     _mention_pass(world_dir, world_id, defs, mention_aliases, files, nodes, edges, flags)

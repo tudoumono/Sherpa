@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """実 Neo4j で v1 world を投入し、影響の golden を再現するか検証する（鏡モデル・要 `make up`）。
 
-`world_graph.build_world` → `world_neo4j.load_world` → `run_world_impact` を通し、影響レンズの
-golden（消費税率まわり）と precision 番人を確認する。テストのオラクル（正解）なのでテーマ名を含む。
+`world_graph.build_world` → `world_neo4j.load_world` → `run_world_impact` を通し、構造的な影響
+レンズの golden（TAX-RATE まわり・骨格到達集合）と番人（顧客マスタ側への誤到達）を確認する。
+テストのオラクル（正解）なのでコード名を含む。
 """
 from __future__ import annotations
 
@@ -17,9 +18,9 @@ from sherpa.impact_service import run_impact                       # noqa: E402
 from sherpa.ingest import world_graph, world_neo4j                 # noqa: E402
 
 V = "v1"
-GOLDEN = {"TAX-RATE", "TAXCALC", "BILLGEN", "SALESUP", "NIGHTLY",
-          "請求機能", "売上計上機能", "見積機能", "消費税計算ルール", "請求書", "納品書", "売上日報"}
-FORBIDDEN = {"顧客マスタ機能", "消費税法", "税率改定障害記録", "CUSTMNT"}
+ENTRY = "TAX-RATE"
+GOLDEN = {"TAX-CPY", "TAXCALC", "BILLGEN", "SALESUP", "NIGHTLY"}
+FORBIDDEN = {"CUSTMNT", "CUSTOMER-CPY"}
 
 
 def main():
@@ -38,20 +39,20 @@ def main():
                                   notifications_min_severity="OFF")
     try:
         with driver.session() as s:
-            tax = {i["name"] for i in run_impact(s, "消費税率", V)["items"]}
+            names = {i["name"] for i in run_impact(s, ENTRY, V)["items"]}
     finally:
         driver.close()
 
     ok = True
-    if not (GOLDEN <= tax):
+    if not (GOLDEN <= names):
         ok = False
-        print("FAIL impact(消費税率) 不足:", sorted(GOLDEN - tax))
-    if tax & FORBIDDEN:
+        print(f"FAIL impact({ENTRY}) 不足:", sorted(GOLDEN - names))
+    if names & FORBIDDEN:
         ok = False
-        print("FAIL impact(消費税率) に番人が混入:", sorted(tax & FORBIDDEN))
+        print(f"FAIL impact({ENTRY}) に番人が混入:", sorted(names & FORBIDDEN))
     if ok:
         print("PASS: 実 Neo4j の world 影響が golden を再現")
-        print("  impact(消費税率) =", sorted(tax))
+        print(f"  impact({ENTRY}) =", sorted(names))
     else:
         sys.exit(1)
 

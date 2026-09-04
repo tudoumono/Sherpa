@@ -62,6 +62,27 @@ def build_world_graph(world: str):
     return world_graph_service.build_effective_world(world)
 
 
+def _reflect_graph_after_rag_rewrite(world: str) -> None:
+    """`.rag.md` の軽量書換え後、Neo4j のグラフ（言及エッジ）を追いつかせる（rv-s2-mention #1）。
+
+    言及エッジ（Pass3・辞書突合）は `{rel}.rag.md` があればそれを本文として読む
+    （`corpus_docs.iter_world_documents` の `md_path` 選定・`world_graph._mention_pass` 参照）。
+    `_llm_render_pass`／`regenerate_rag_rule_only`／`_refresh_derived_representations`
+    （OCR 反映後の catch-up 等）はいずれも rag.md を書き換えるが世代（world 署名）は変えない
+    軽量経路のため、`_run_locked`（通常の full sync）の `build_world_graph`→`load_world` を
+    経由しない——放置すると ES だけ追随しグラフ（言及エッジ）が陳腐化したまま固定される。
+
+    ES 反映（RAG_ES 無効なら不要）とは独立に**常に**呼ぶ——グラフは RAG_ES の設定に関わらず
+    追随させる必要がある。呼び出し元が既に `store.world_lock(world)` を保持している前提の
+    lock-free ヘルパー（`_wipe_locked`/`_run_locked` と同じ流儀・世界単位ロックの再入不可を
+    避ける）。失敗は例外のまま呼び出し元へ伝播させる（ここで揉み消さない・best-effort にしない
+    ——各呼び出し元は既に `sync()`/`regenerate_rag_rule_only()` の例外伝播契約で受け止める）。
+    """
+    nodes, edges, _flags = build_world_graph(world)
+    env = world_neo4j._env()
+    world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
+
+
 # `office_md.build_derived()` が持つ per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。
 # ING-1: status 画面の「失敗ファイル一覧＋再変換ボタン」の元データへ一本化する（キー名の末尾
 # `_failures` を落とした残りを stage 名として使う）。
@@ -599,13 +620,16 @@ def _scan_dir(wd, progress=None) -> list:
 
 def _sig(parts) -> str:
     # `importance.IMPORTANCE_SCHEMA_VERSION`／`analyzer_registry.config_signature()`／
-    # `world_graph.MENTION_SCHEMA_VERSION` を材料に含める——重要度機能のスキーマ、コード解析
-    # アナライザの有効構成（登録順・拡張子集合・分類契約版）、または辞書突合（言及エッジ）の
-    # 仕様版が変わった world は、ソースファイル自体が不変でも署名が変わり、標準の
-    # 「署名不一致→全再構築」経路で自動的に full rebuild される（旧世代の台帳/Neo4j データの
-    # 後始末に専用の移行経路を持たない）。
+    # `world_graph.MENTION_SCHEMA_VERSION`＋実効値（`_mention_min_len()`/`_mention_max_per_doc()`）
+    # を材料に含める——重要度機能のスキーマ、コード解析アナライザの有効構成（登録順・拡張子集合・
+    # 分類契約版）、辞書突合（言及エッジ）の仕様版、または env（`SHERPA_MENTION_MIN_LEN`/
+    # `SHERPA_MENTION_MAX_PER_DOC`）の実効値が変わった world は、ソースファイル自体が不変でも
+    # 署名が変わり、標準の「署名不一致→全再構築」経路で自動的に full rebuild される（旧世代の
+    # 台帳/Neo4j データの後始末に専用の移行経路を持たない・rv-s2-mention #2＝実効値未対応だと
+    # 設定変更後も既存 world の言及エッジが旧しきい値のまま素通りしていた）。
     return hashlib.sha1(repr((importance.IMPORTANCE_SCHEMA_VERSION, analyzer_registry.config_signature(),
-                             world_graph.MENTION_SCHEMA_VERSION, parts)).encode("utf-8")).hexdigest()
+                             world_graph.MENTION_SCHEMA_VERSION, world_graph._mention_min_len(),
+                             world_graph._mention_max_per_doc(), parts)).encode("utf-8")).hexdigest()
 
 
 def _manifest(parts) -> dict:
@@ -861,6 +885,10 @@ def _refresh_derived_representations(world, sig) -> str | None:
             "RAG/Evidence IR の軽量再生成に失敗しました（次回 sync で再試行）: world=%s detail=%s",
             world, result)
         return "handled"
+    # rv-s2-mention #1: rag.md が実際に書き換わった（`ok`）ので、ES 反映の成否に関わらずグラフ
+    # （言及エッジ）を追いつかせる。呼び出し元（`_sync_impl`）が既に `store.world_lock` を保持中
+    # ＝lock-free ヘルパーをそのまま呼ぶ（`_reflect_graph_after_rag_rewrite` docstring 参照）。
+    _reflect_graph_after_rag_rewrite(world)
     es_ok = True                                         # holdback対象外（defer=False）なら確定済み扱い
     if defer:
         # human_md は RAG_ES の設定に関わらず ES の索引内容に影響しうる（rag_chunks 無効時の
@@ -1062,15 +1090,18 @@ def _reindex_after_rag_rewrite(world: str) -> bool:
     `store.world_lock` 区間の中で行う（derived への書込を並行 sync と直列化する・
     `_refresh_derived_representations` docstring 参照）。**RAG_ES が無効な world では ES に
     触れる必要が無い**ため、その場合は無条件で成功扱いにする（マーカー操作自体をスキップ）。
+    グラフ反映（`_reflect_graph_after_rag_rewrite`・rv-s2-mention #1）は RAG_ES の有無に
+    関わらず常に行う——言及エッジは ES とは独立に陳腐化しうる。
     """
     row = store.get_world(world)
     sig = row.get("last_sig") if row else None
     if not sig:
         return False
-    if not es_index.rag_es_enabled():
-        return True
     dmd = worlds.derived_md_dir(world)
     with store.world_lock(world):
+        _reflect_graph_after_rag_rewrite(world)
+        if not es_index.rag_es_enabled():
+            return True
         if not office_md.drop_rag_sig_marker(dmd):
             _log.warning(
                 "LLM 成形反映後、`.rag_sig` の無効化に失敗しました（ES 再索引を見送ります）: world=%s",

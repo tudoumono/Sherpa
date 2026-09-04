@@ -9,7 +9,8 @@ from __future__ import annotations
 from ..identifiers import normalize_code_name as _norm
 from ..static_analysis import (COBOL_EXT, _CALL, _COPY, _DYNAMIC_CALL,
                                _PROGRAM_ID, _is_comment, _is_free_format,
-                               _split_statements, _strip_quoted)
+                               _split_statements, _strip_inline_comment,
+                               _strip_quoted)
 from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
 
 # 固定形式 COBOL の実コード領域は8〜72桁（73桁以降は採番/識別領域）。自由形式（`_is_free_format`
@@ -47,13 +48,20 @@ class CobolAnalyzer(Analyzer):
                 if _PROGRAM_ID.search(line):
                     after_id = True
                 continue
-            for cb in _COPY.findall(line):
+            # COPY/CALL のリテラル抽出は、行末インラインコメント（`*>` 以降・rv-s2-mention #5）を
+            # 先に切り捨ててから行う——`MOVE X TO Y. *> COPY FAKE` のような行末コメント中の語を
+            # 構文と誤認しない（`_is_comment` は行全体がコメントの場合しか見ない）。
+            code = _strip_inline_comment(line)
+            # COPY 抽出だけはさらに引用文字列の中身も除去する（`DISPLAY 'COPY FAKECPY'.` のような
+            # 文字列リテラル中の語を誤検知しない）。CALL は引用符の中身（呼び出し先プログラム名）
+            # 自体を読むため、こちらには適用しない。
+            for cb in _COPY.findall(_strip_quoted(code)):
                 refs.append(RefCandidate("COPIES", "Copybook", _norm(cb), i))
             # CALL は文単位（ピリオド／END-CALL 区切り）で判定する——同一行に複数の CALL 文が
             # 並ぶ場合（`CALL 'A'. CALL B.`・`CALL 'A' END-CALL CALL B END-CALL.`）でも
             # 取りこぼさない。引用文字列の中身は動的呼び出し判定の対象外にする（`DISPLAY 'CALL X'.`
             # のような文字列リテラルを誤検知しない）。
-            for stmt in _split_statements(line):
+            for stmt in _split_statements(code):
                 for callee in _CALL.findall(stmt):
                     refs.append(RefCandidate("INVOKES", "Module", _norm(callee), i))
             # 動的 CALL の検知だけは固定形式の採番/識別領域（73桁以降）を見ない（自由形式は切り詰めない・
