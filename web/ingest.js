@@ -250,16 +250,35 @@ function ingestDetailHtml(wid, s) {
   if (!body) return '';
   return `<details class="adv"><summary>詳細を表示</summary>${body}</details>`;
 }
-// ING-3: 実行中 run の逐次進捗（`running_progress`）。段の平文はサーバ側で確定済み（`stage_label`）・
-// ここでは done/total が両方あるファイル単位の件数だけ添える。
+// ING-3: 実行中 run の逐次進捗（`running_progress`）。段の平文はサーバ側で確定済み（`stage_label`）。
+// ステッパー表示（2026-09-04 実環境フィードバック）: 数時間級の取り込みで「あと何段あるのか」が
+// 見えるよう、済んだ段✓・いまの段▶（件数付き）・残りの段を1行に並べる。段の並びはサーバの
+// `worker.STAGE_LABELS` の取り込み系5段のミラー（キーが未知の段＝削除等は従来の1行表示へ
+// フォールバック＝ズレても壊れない）。ラベルはステッパー用の短縮形（正式な平文は stage_label）。
+const INGEST_STAGE_STEPS = [
+  ['scanning', 'フォルダ確認'],
+  ['office_md', '読める写し(MD)作成'],
+  ['graph_build', '関係グラフ'],
+  ['es_index', '全文索引・ベクトル化'],
+  ['finalize', '仕上げ'],
+];
 function progressNote(s) {
   const p = s && s.running_progress;
   if (!p) return '';
   // total 不明の段（走査中）は件数のみ「N件確認済み」表示（実環境フィードバック 2026-09-04）。
   const counts = (p.done != null && p.total != null) ? `（${esc(p.done)}/${esc(p.total)}）`
     : (p.done != null ? `（${esc(p.done)}件確認済み）` : '');
-  return `<div class="muted" style="margin-top:3px"><span class="loading-inline" role="status">`
-    + `<span class="spinner spinner-sm"></span><span>${esc(p.stage_label)}${counts}</span></span></div>`;
+  const idx = INGEST_STAGE_STEPS.findIndex(([k]) => k === p.stage);
+  if (idx < 0) {                                   // 未知の段（accepted/deleting 等）＝従来の1行表示
+    return `<div class="muted" style="margin-top:3px"><span class="loading-inline" role="status">`
+      + `<span class="spinner spinner-sm"></span><span>${esc(p.stage_label)}${counts}</span></span></div>`;
+  }
+  const steps = INGEST_STAGE_STEPS.map(([k, label], i) => {
+    if (i < idx) return `<span class="step done">✓ ${esc(label)}</span>`;
+    if (i === idx) return `<span class="step now" role="status"><span class="spinner spinner-sm"></span>${esc(label)}${counts}</span>`;
+    return `<span class="step todo">${esc(label)}</span>`;
+  }).join('<span class="step-arrow">→</span>');
+  return `<div class="muted ingest-steps" style="margin-top:3px">${steps}</div>`;
 }
 function summaryNote(s, wid) {
   if (!s) return '';

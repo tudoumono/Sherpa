@@ -925,3 +925,24 @@ def test_pickbtn_disabled_while_ingest_running(page, web_base_url):
 # web/ingest.js から機構ごと撤去済み（意味層 LLM 抽出は K9 で撤去・バックエンドの `/extract` は
 # 後続レーンで撤去予定）。この機構だけを検証していた
 # `test_extract_failure_shows_selected_cloud_hint_not_local_ai` は対象機能の消滅により削除。
+
+
+def test_ingest_progress_stepper_shows_stage_position(page, web_base_url):
+    """ステッパー表示（2026-09-04）: 取り込み系の段では 済✓/現在(件数付き)/残り が1行に並ぶ。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.route("**/worlds/w1/status", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps({
+            **WORLD_STATUS_RESP,
+            "running_progress": {"stage": "es_index", "stage_label": "全文索引に登録し、ベクトル化中",
+                                 "done": 42, "total": 100, "updated_at": "2026-09-04T00:00:00+00:00"},
+        })))
+    page.goto(f"{web_base_url}/ingest.html")
+    steps = page.locator(".ingest-steps")
+    expect(steps).to_be_visible()
+    expect(steps.locator(".step.done")).to_have_count(3)          # scanning/office_md/graph_build が済
+    expect(steps.locator(".step.now")).to_contain_text("全文索引・ベクトル化（42/100）")
+    expect(steps.locator(".step.todo")).to_have_count(1)          # finalize が残り
