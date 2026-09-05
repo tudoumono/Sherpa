@@ -232,8 +232,10 @@ app.include_router(improvement_log.improvement_log_router)
 
 
 # /users/suggest・POST /conversations/{cid}/shares・GET /share/conversations/{token}・
-# POST /conversation-shares/{share_id}/revoke は sherpa/routers/shares.py へ移動済み
-# （shares.router を include_router・conversation_share_create は上記で再エクスポート）。
+# POST /conversation-shares/{share_id}/revoke・POST /conversations/{wid}/fork（SH-1）・
+# POST /conversation-shares/{share_id}/refresh（SH-2）・GET /conversations/{cid}/shares（SH-2）は
+# sherpa/routers/shares.py へ移動済み（shares.router を include_router・conversation_share_create は
+# 上記で再エクスポート）。
 app.include_router(shares.router)
 
 

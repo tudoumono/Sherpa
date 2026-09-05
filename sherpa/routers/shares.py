@@ -1,9 +1,9 @@
-"""会話共有エンドポイント（フェーズ3スライス3・純移動）。
+"""会話共有エンドポイント（フェーズ3スライス3・純移動＋SH-1/SH-2・2026-08-23-共有フォーク.md）。
 
 `GET /users/suggest`・`POST /conversations/{cid}/shares`・`GET /share/conversations/{token}`・
-`POST /conversation-shares/{share_id}/revoke` を api.py から抽出する。
-ロジックは変更しない（コード移動のみ）。ルート表 golden の定義順を保つため、api.py 側は
-削除したブロックの元位置に `app.include_router(shares.router)` を1回だけ置く。
+`POST /conversation-shares/{share_id}/revoke`・`POST /conversations/{wid}/fork`（SH-1・
+引き継いで質問）・`POST /conversation-shares/{share_id}/refresh`（SH-2・スナップショット更新）・
+`GET /conversations/{cid}/shares`（SH-2・共有一覧）を持つ。
 
 このモジュールは `sherpa.api` を import しない（循環回避）。
 """
@@ -18,7 +18,13 @@ from pydantic import BaseModel
 
 from sherpa import auth, store
 from sherpa.deps import _COOKIE, _client_ip_hash, _current_user, _synthetic_admin
-from sherpa.schemas import ShareCreateResponse, UsersSuggestResponse
+from sherpa.schemas import (
+    ConversationForkResponse,
+    ConversationShareRefreshResponse,
+    ShareCreateResponse,
+    ShareListItem,
+    UsersSuggestResponse,
+)
 
 _log = logging.getLogger("sherpa")
 
@@ -230,3 +236,83 @@ def conversation_share_revoke(share_id: int, request: Request):
         _log.critical("audit write failed for share.revoked (fail-closed)")
         raise HTTPException(500, "取消処理中にエラーが発生しました")
     return {"ok": True, "share_id": share_id}
+
+
+# ===== SH-1: フォーク（「この会話を引き継いで質問」）=====
+
+_FORK_DENY_MESSAGES = {
+    "not_received_share": "自分の受領した共有のみ引き継げます",
+    "share_unavailable": "この共有は開けません（無効・期限切れ・取消済み・招待外のいずれか）",
+    "personal_blocked": "この共有は開けません（元会話が個人ファイルを参照しています）",
+}
+
+
+@router.post("/conversations/{wid}/fork", tags=["会話共有"], response_model=ConversationForkResponse)
+def conversation_fork(wid: int, request: Request):
+    """受領共有ラッパー `wid` を自分の会話として複製し、続けて質問できるようにする（SH-1）。"""
+    u = _current_user(request)
+    ip_hash = _client_ip_hash(request)
+    ua = request.headers.get("user-agent", "")[:512]
+    try:
+        # RV 是正1（2026-09-05）: 複製と監査を同一トランザクションで書く（store.fork_received_share
+        # 参照）。再読取・取消(discard)は不要——監査失敗はそのまま例外として伝播し、下の
+        # 汎用 except で fail-closed（複製ごと自動 rollback 済み）。
+        new_cid = store.fork_received_share(u["uid"], wid, ip_hash=ip_hash, user_agent=ua)
+    except LookupError:
+        raise HTTPException(404, "会話が見つかりません")
+    except store.ForkNotAllowedError as e:
+        reason = e.args[0] if e.args else "share_unavailable"
+        try:
+            store.audit(u["uid"], "share.forked", "share", None,
+                        outcome="deny", reason=reason, severity="warning",
+                        ip_hash=ip_hash, user_agent=ua, detail={"wrapper_conversation_id": wid})
+        except Exception:
+            pass
+        raise HTTPException(403, _FORK_DENY_MESSAGES.get(reason, _FORK_DENY_MESSAGES["share_unavailable"]))
+    except Exception:
+        _log.critical("audit write failed for share.forked (fail-closed) – wrapper %s", wid)
+        raise HTTPException(500, "フォーク処理中にエラーが発生しました")
+    return {"ok": True, "conversation_id": new_cid}
+
+
+# ===== SH-2: 再共有（「スナップショットを更新」）=====
+
+@router.post("/conversation-shares/{share_id}/refresh", tags=["会話共有"],
+             response_model=ConversationShareRefreshResponse)
+def conversation_share_refresh(share_id: int, request: Request):
+    """サニタイズ共有のスナップショットを最新の内容へ取り直す（SH-2・所有者のみ）。
+    通常共有（元会話をライブ参照）は 409（常に最新のため更新の概念が無い）。"""
+    u = _current_user(request)
+    ip_hash = _client_ip_hash(request)
+    ua = request.headers.get("user-agent", "")[:512]
+    try:
+        result = store.refresh_sanitized_share(u["uid"], share_id)
+    except LookupError:
+        raise HTTPException(404, "共有が見つかりません")
+    except PermissionError:
+        raise HTTPException(403, "所有者のみ更新できます")
+    except store.ShareNotSanitizedError:
+        raise HTTPException(409, "この共有は常に最新の内容を表示します")
+
+    try:
+        store.audit(u["uid"], "share.refreshed", "share", f"share:{share_id}",
+                    detail={"old_snapshot_id": result["old_snapshot_id"],
+                            "new_snapshot_id": result["new_snapshot_id"],
+                            "source_conversation_id": result["source_conversation_id"]},
+                    outcome="success", severity="info", ip_hash=ip_hash, user_agent=ua)
+    except Exception:
+        # fail-closed: DB 側は既に確定済み（1トランザクションで commit 済み）だが、監査できない
+        # 状態を成功として返さない（他の書込系エンドポイントと同じ流儀）。
+        _log.critical("audit write failed for share.refreshed (share %s) – fail-closed", share_id)
+        raise HTTPException(500, "更新処理中にエラーが発生しました")
+    return {"ok": True, "share_id": share_id, "refreshed_at": result["refreshed_at"]}
+
+
+@router.get("/conversations/{cid}/shares", tags=["会話共有"], response_model=list[ShareListItem])
+def conversation_shares_list(cid: int, request: Request):
+    """元会話 `cid` を対象にした共有一覧（SH-2・所有者のみ）。サニタイズ有無・招待者・期限・取消・
+    最終更新時刻を返す（発行用ダイアログの一覧表示に使う）。"""
+    u = _current_user(request)
+    if not store.owns_conversation(u["uid"], cid):
+        raise HTTPException(403, "自分の会話のみ確認できます")
+    return store.list_shares_for_conversation(u["uid"], cid)

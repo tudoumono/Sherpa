@@ -1058,6 +1058,49 @@
         "title": "ConstructChoice",
         "type": "object"
       },
+      "ConversationForkResponse": {
+        "description": "POST /conversations/{wid}/fork（SH-1・shares.py::conversation_fork）。",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "integer"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "conversation_id"
+        ],
+        "title": "ConversationForkResponse",
+        "type": "object"
+      },
+      "ConversationShareRefreshResponse": {
+        "description": "POST /conversation-shares/{share_id}/refresh（SH-2・shares.py::conversation_share_refresh）。",
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "refreshed_at": {
+            "title": "Refreshed At",
+            "type": "string"
+          },
+          "share_id": {
+            "title": "Share Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "share_id",
+          "refreshed_at"
+        ],
+        "title": "ConversationShareRefreshResponse",
+        "type": "object"
+      },
       "DiffReq": {
         "properties": {
           "path": {
@@ -4153,6 +4196,123 @@
           "note"
         ],
         "title": "ShareCreateResponse",
+        "type": "object"
+      },
+      "ShareInviteeItem": {
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "name",
+          "accepted_at"
+        ],
+        "title": "ShareInviteeItem",
+        "type": "object"
+      },
+      "ShareListItem": {
+        "description": "`GET /conversations/{cid}/shares`（SH-2・store/shares.py::list_shares_for_conversation）の1件。",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "invitees": {
+            "items": {
+              "$ref": "#/components/schemas/ShareInviteeItem"
+            },
+            "title": "Invitees",
+            "type": "array"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "refreshed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refreshed At"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "sanitized": {
+            "title": "Sanitized",
+            "type": "boolean"
+          },
+          "share_id": {
+            "title": "Share Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "share_id",
+          "sanitized",
+          "created_at",
+          "expires_at",
+          "revoked_at",
+          "refreshed_at",
+          "last_used_at",
+          "invitees"
+        ],
+        "title": "ShareListItem",
         "type": "object"
       },
       "SystemSettingsReq": {
@@ -8519,6 +8679,49 @@
         ]
       }
     },
+    "/conversation-shares/{share_id}/refresh": {
+      "post": {
+        "description": "サニタイズ共有のスナップショットを最新の内容へ取り直す（SH-2・所有者のみ）。\n通常共有（元会話をライブ参照）は 409（常に最新のため更新の概念が無い）。",
+        "operationId": "conversation_share_refresh_conversation_shares__share_id__refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "share_id",
+            "required": true,
+            "schema": {
+              "title": "Share Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationShareRefreshResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Conversation Share Refresh",
+        "tags": [
+          "会話共有"
+        ]
+      }
+    },
     "/conversation-shares/{share_id}/revoke": {
       "post": {
         "description": "共有を取消（所有者のみ）。",
@@ -8761,6 +8964,51 @@
       }
     },
     "/conversations/{cid}/shares": {
+      "get": {
+        "description": "元会話 `cid` を対象にした共有一覧（SH-2・所有者のみ）。サニタイズ有無・招待者・期限・取消・\n最終更新時刻を返す（発行用ダイアログの一覧表示に使う）。",
+        "operationId": "conversation_shares_list_conversations__cid__shares_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "cid",
+            "required": true,
+            "schema": {
+              "title": "Cid",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ShareListItem"
+                  },
+                  "title": "Response Conversation Shares List Conversations  Cid  Shares Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Conversation Shares List",
+        "tags": [
+          "会話共有"
+        ]
+      },
       "post": {
         "description": "共有リンク発行（所有者のみ・個人 workspace 含む会話は拒否）。一度だけ表示する URL を返す。",
         "operationId": "conversation_share_create_conversations__cid__shares_post",
@@ -8808,6 +9056,49 @@
           }
         },
         "summary": "Conversation Share Create",
+        "tags": [
+          "会話共有"
+        ]
+      }
+    },
+    "/conversations/{wid}/fork": {
+      "post": {
+        "description": "受領共有ラッパー `wid` を自分の会話として複製し、続けて質問できるようにする（SH-1）。",
+        "operationId": "conversation_fork_conversations__wid__fork_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "title": "Wid",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationForkResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Conversation Fork",
         "tags": [
           "会話共有"
         ]

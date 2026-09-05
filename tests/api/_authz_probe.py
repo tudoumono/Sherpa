@@ -38,6 +38,14 @@ _PLACEHOLDERS = {
     "conversation_id": "999999999", "message_id": "999999999",
 }
 
+# SH-1（2026-08-23-共有フォーク.md）: `POST /conversations/{wid}/fork` は `wid` を**会話 id（int）**
+# として使う（受領共有ラッパーの id・`_PLACEHOLDERS["wid"]="w1"` は world id（str）用の既存割当で
+# 衝突する）。この1ルートに限り `wid` の置換値を上書きする（グローバル割当は変えない＝
+# `/worlds/{wid}/...` 系への影響ゼロ）。
+_PATH_PLACEHOLDER_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
+    ("POST", "/conversations/{wid}/fork"): {"wid": "999999999"},
+}
+
 # POST/PUT/PATCH の最小有効 body（Pydantic の必須フィールドだけ満たし、handler 先頭の
 # `_current_user`/`_require_admin` まで到達させる）。値は認証チェックより前に評価されないため、
 # 型さえ満たせば内容は任意。ここに無いルートは全フィールドが optional（既定 `{}` で
@@ -93,8 +101,9 @@ _EXTRA_QUERY: dict[tuple[str, str], dict] = {
 _MULTIPART_ROUTES = {("POST", "/workspace/files"), ("POST", "/ext/v1/convert")}
 
 
-def _fill(path: str) -> str:
-    return re.sub(r"\{(\w+)\}", lambda m: _PLACEHOLDERS.get(m.group(1), "x"), path)
+def _fill(path: str, key: tuple[str, str] | None = None) -> str:
+    overrides = _PATH_PLACEHOLDER_OVERRIDES.get(key, {}) if key else {}
+    return re.sub(r"\{(\w+)\}", lambda m: overrides.get(m.group(1), _PLACEHOLDERS.get(m.group(1), "x")), path)
 
 
 def _add_route_keys(keys: set[tuple[str, str]], r: APIRoute) -> None:
@@ -125,8 +134,8 @@ def _request(client: TestClient, method: str, path: str, *, extra_query: dict | 
     `include_unpublished=true` の条件付き認可テスト）に使う。`json_override` は非 GET/DELETE の
     JSON body を丸ごと差し替える（RV MED 2026-07-14: 認可マトリクスの「安全な許可側 probe」用＝
     handler 到達後・外部接続/実行前の決定的分岐で返させる専用 body）。"""
-    url = _fill(path)
     key = (method, path)
+    url = _fill(path, key)
     if key in _MULTIPART_ROUTES:
         return client.post(url, files={"file": ("probe.txt", b"probe", "text/plain")})
     if method == "GET":

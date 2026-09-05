@@ -21,7 +21,7 @@ import { openShareDialog } from './chat/share-dialog.js';
 import { welcome, initRefGraph } from './chat/render.js';
 import {
   loadConversations, deleteConversation, togglePin, renameConversation,
-  newConversation, openConversation, resumeRunningTurn,
+  newConversation, openConversation, resumeRunningTurn, forkConversation,
 } from './chat/history.js';
 import { send, sendOrStop, _closeOtherTurns } from './chat/stream.js';
 import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel } from './chat/scope.js';
@@ -249,6 +249,12 @@ $('sharebtn').addEventListener('click', () => {
   if (!S.cid) { toast('共有したい会話を開いてください'); return; }
   if (S.convHasPersonal) { toast('個人ファイルを参照した会話は共有できません'); return; }
   openShareDialog(S.cid, $('conv-title').textContent || '会話');
+});
+// SH-1（引き継いで質問）: 受領共有を開いている間だけ表示される（history.js::updateForkButtonState）。
+$('forkbtn').addEventListener('click', () => {
+  const wid = Number($('forkbtn').dataset.wid);
+  if (!wid) return;
+  forkConversation(wid);
 });
 
 $('send').addEventListener('click', sendOrStop);

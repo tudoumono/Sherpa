@@ -77,6 +77,10 @@ EXPECTED: dict[tuple[str, str], int] = {
     ("POST", "/conversations/{cid}/shares"): 401,
     ("GET", "/share/conversations/{token}"): 302,
     ("POST", "/conversation-shares/{share_id}/revoke"): 401,
+    # SH-1/SH-2（2026-08-23-共有フォーク.md・2026-09-05実装）。
+    ("POST", "/conversations/{wid}/fork"): 401,
+    ("POST", "/conversation-shares/{share_id}/refresh"): 401,
+    ("GET", "/conversations/{cid}/shares"): 401,
     ("POST", "/workspace/files"): 401,
     ("GET", "/workspace/files"): 401,
     ("DELETE", "/workspace/files/{file_id}"): 401,

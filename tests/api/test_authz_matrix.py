@@ -178,6 +178,10 @@ POLICY: dict[tuple[str, str], str] = {
     ("GET", "/users/suggest"): "login",
     ("POST", "/conversations/{cid}/shares"): "login",
     ("POST", "/conversation-shares/{share_id}/revoke"): "login",
+    # SH-1/SH-2（2026-08-23-共有フォーク.md・2026-09-05実装）。
+    ("POST", "/conversations/{wid}/fork"): "login",
+    ("POST", "/conversation-shares/{share_id}/refresh"): "login",
+    ("GET", "/conversations/{cid}/shares"): "login",
     ("POST", "/workspace/files"): "login",
     ("GET", "/workspace/files"): "login",
     ("DELETE", "/workspace/files/{file_id}"): "login",
@@ -239,6 +243,12 @@ DENY_ONLY: set[tuple[str, str]] = {
     ("POST", "/ext/v1/admin/keys"),
     ("POST", "/conversations/{cid}/shares"),
     ("POST", "/conversation-shares/{share_id}/revoke"),
+    # SH-2（refresh・一覧）も同じ所有権 403 パターン（フレッシュな probe セッションは対象の
+    # 会話/共有を持たない＝auth ゲート由来の403と区別できない）。SH-1（fork）は対象なし
+    # （wid=999999999 は必ず 404 の LookupError になり所有権チェックの 403 分岐に届かないため
+    # 安全に許可側 probe できる＝DENY_ONLY に入れない）。
+    ("POST", "/conversation-shares/{share_id}/refresh"),
+    ("GET", "/conversations/{cid}/shares"),
     # system_settings.user_api_keys_allowed は既定 false（テスト環境でも未設定）のため、
     # 許可側 probe（一意の新規ログインユーザー）は4ルートとも毎回403（機能無効）を返す——
     # これは認可ゲート由来の403と区別できない（`ext_key_admin_create` と同様のパターン）。
@@ -343,10 +353,11 @@ def test_policy_covers_all_routes():
     # login=NOTIFY-1（GET /notifications）1件追加で46。
     # admin=GRAPH-SRC（2026-09-04・K9-K11）で旧・意味層フル抽出/対応橋の4ルート（extract・
     # concepts/propose・confirm・disable）を撤去し40。
+    # login=SH-1/SH-2（2026-09-05・共有フォーク＋再共有）で3ルート追加（fork・refresh・共有一覧）し49。
     assert len(ADMIN_ROUTES) == 40
     assert len(EXT_KEY_ROUTES) == 6
     assert len(SPECIAL_ROUTES) == 7
-    assert len(LOGIN_ROUTES) == 46
+    assert len(LOGIN_ROUTES) == 49
 
 
 def test_admin_routes_deny_for_anon_and_nonadmin_user():

@@ -86,22 +86,47 @@ def get_conversation(conversation_id) -> dict | None:
 
 
 def list_conversations(user_id="admin", limit=50) -> list:
-    """自分の会話＋受領共有ラッパーを返す（origin/read_only/shared_by/share_status 付き・削除済みは除外）。"""
+    """自分の会話＋受領共有ラッパーを返す（origin/read_only/shared_by/share_status 付き・削除済みは除外）。
+
+    SH-1（2026-08-23-共有フォーク.md）: フォークで複製した会話（`forked_at` 設定済み）は
+    `forked_from`（`{share_id, user_id, name, at}`・出所表示用・編集不可）を持つ。フォークでない
+    会話は `forked_from=None`。表示名は `shared_by_name` と同じ流儀（`users.display_name` の
+    LEFT JOIN）で解決する。
+
+    是正4（2026-09-05）: 判定は `forked_from_share_id IS NOT NULL` ではなく **`forked_at IS NOT NULL`**
+    で行う。`forked_from_share_id` は共有そのものが後で削除されると `ON DELETE SET NULL` で
+    NULL に落ちる（`forked_from_user_id`/`forked_at` は影響を受けない・db.py のスキーマ参照）ため、
+    `forked_from_share_id` を判定に使うと共有削除後に出所表示ごと消えてしまう。`forked_from` の
+    `share_id` は `forked_from_share_id` をそのまま返す（NULL を許す＝共有削除後は `share_id: null`
+    だが `user_id`/`name`/`at` は残る）。
+    """
     _ensure()
     with _connect() as c:
-        return c.execute(
+        rows = c.execute(
             "SELECT c.id, c.title, c.version, c.pinned, c.updated_at, c.origin, c.read_only, c.received_at, "
             "c.shared_by_user_id, u.display_name AS shared_by_name, "
+            "c.forked_from_share_id, c.forked_from_user_id, fu.display_name AS forked_from_name, c.forked_at, "
             "CASE WHEN c.origin='received_share' THEN "
             "  (SELECT CASE WHEN s.revoked_at IS NOT NULL THEN 'revoked' "
             "               WHEN s.expires_at IS NOT NULL AND s.expires_at<=now() THEN 'expired' "
             "               ELSE 'active' END "   # expires_at IS NULL = 無期限（常に active 側）
             "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_status "
             "FROM conversations c LEFT JOIN users u ON u.uid=c.shared_by_user_id "
+            "LEFT JOIN users fu ON fu.uid=c.forked_from_user_id "
             "WHERE c.user_id=%s AND c.deleted_at IS NULL AND c.origin<>'sanitized_snapshot' "  # snapshot は内部成果物＝非表示
             "ORDER BY c.origin, c.pinned DESC, c.updated_at DESC LIMIT %s",   # own が先・ピンは上部（#8）
             (user_id, limit),
         ).fetchall()
+        out = []
+        for r in rows:
+            forked_from = None
+            if r["forked_at"] is not None:
+                forked_from = {"share_id": r["forked_from_share_id"], "user_id": r["forked_from_user_id"],
+                              "name": r["forked_from_name"], "at": r["forked_at"]}
+            out.append({k: v for k, v in r.items()
+                       if k not in ("forked_from_share_id", "forked_from_user_id", "forked_from_name", "forked_at")}
+                      | {"forked_from": forked_from})
+        return out
 
 
 def delete_conversation(conversation_id, user_id="admin") -> bool:

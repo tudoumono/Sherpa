@@ -64,9 +64,13 @@ function _ownConvHTML(c) {
   // ID は必ず整数に正規化（data-* 属性に入れるので非数値を防ぐ）。
   const id = Number(c.id);
   const date = esc(fmtDateTime(c.updated_at));
+  // SH-1: フォークで複製した会話は出所（○○さんの共有・日時）を編集不可の表示として残す。
+  const f = c.forked_from;
+  const forkedFromLine = f
+    ? `<div class="d forked-from">出所: ${esc(f.name || f.user_id)}さんの共有（${esc(fmtDateTime(f.at))}）</div>` : '';
   return `<div class="conv${c.pinned ? ' pinned' : ''}${id === S.cid ? ' on' : ''}" data-open="${id}">
      <div class="cmain"><div class="t">${c.pinned ? '<span class="pin">📌</span>' : ''}${esc(c.title || '会話')}</div>
-       <div class="d">${date}</div></div>
+       <div class="d">${date}</div>${forkedFromLine}</div>
      <div class="cacts">
        <button class="cact" data-rename="${id}" data-title="${esc(c.title || '')}" title="名前を変更">✎</button>
        <button class="cact" data-pin="${id}" data-pinned="${c.pinned ? '1' : '0'}" title="${c.pinned ? 'ピンを外す' : 'ピン止め'}">${c.pinned ? '📌' : '📍'}</button>
@@ -161,7 +165,36 @@ export function newConversation() {
   S.scope = []; if (S.scopeTree) renderScopePanel(S.scopeTree); setScopeLabel('全体');   // 範囲を全体に戻す
   resetInquiryForNewConversation();   // SC-6b: 調べ方/探す対象も自動・両方に戻し、ブロックを開く（§8 裁定12）
   S.convHasPersonal = false; updateShareButtonState();   // Feature C: 新規会話は共有可能状態にリセット
+  updateForkButtonState(null);   // SH-1: 新規会話は「引き継いで質問」対象外
   welcome(); resetFlow(); loadConversations();
+}
+
+// SH-1（引き継いで質問）: 受領共有を開いた画面でだけボタンを出す（無効・個人ブロックの共有は除く）。
+// `data` は GET /conversations/{cid} の応答（`openConversation` から渡す）か、対象外なら null。
+function updateForkButtonState(data) {
+  const btn = $('forkbtn');
+  if (!btn) return;
+  const isReceivedShare = !!(data && data.conversation && data.conversation.origin === 'received_share');
+  const blocked = data && (data.share_status === 'unavailable' || data.share_status === 'personal_blocked');
+  if (isReceivedShare && !blocked) {
+    btn.hidden = false;
+    btn.dataset.wid = String(data.conversation.id);
+  } else {
+    btn.hidden = true;
+    delete btn.dataset.wid;
+  }
+}
+
+// SH-1: 受領共有ラッパー wid を自分の会話として複製し、そのまま開く。
+export async function forkConversation(wid) {
+  let d;
+  try {
+    const r = await fetch(`/conversations/${wid}/fork`, { method: 'POST' });
+    d = await r.json().catch(() => null);
+    if (!r.ok || !d || !d.ok) { toast((d && d.detail) || '引き継ぎに失敗しました'); return; }
+  } catch (e) { toast('通信エラーが発生しました'); return; }
+  toast('会話を引き継ぎました');
+  await openConversation(d.conversation_id);
 }
 export async function openConversation(cid) {
   // 会話取得が成功するまで画面遷移を確定しない＝ unsubscribeTurn（世代の無効化を含む）は
@@ -174,6 +207,7 @@ export async function openConversation(cid) {
   // Feature C: 会話の contains_personal_workspace フラグを反映。
   S.convHasPersonal = !!(data.conversation && data.conversation.contains_personal_workspace);
   updateShareButtonState();
+  updateForkButtonState(data);   // SH-1: 引き継いで質問ボタンの表示切替
   // UIフィードバック（2026-07-03・RV再検証 HIGH#1）: 右ペインに全ターンを時系列で積み上げ表示するため、
   // **user 発言ごとにターンを起こす**（clarify/停止等で assistant 応答が無いターンも取りこぼさない）。
   // 直後に assistant が来ればその trace を紐づけ、来なければ trace:null（「（記録なし）」）のまま残す。

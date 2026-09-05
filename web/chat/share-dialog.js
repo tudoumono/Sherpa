@@ -4,9 +4,9 @@
 // 確認した結果このモジュール自体は S（共有状態）に依存しない）。
 'use strict';
 
-import { copyText } from '../chat.js';
+import { copyText, toast } from '../chat.js';
 
-const esc = Sherpa.esc;   // 共通ユーティリティ（common.js・グローバル参照のまま）
+const esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;   // 共通ユーティリティ（common.js・グローバル参照のまま）
 
 // 所有者のみ: POST /conversations/{cid}/shares → 一度だけ表示する URL。
 // バッチ2・5番（2026-07-03）: GET /users/suggest による入力補完（デバウンス200ms）→
@@ -57,6 +57,56 @@ async function fetchInviteeSuggest(q) {
   } catch (_) { hideInviteeSuggest(); }
 }
 
+// SH-2（再共有）: 発行ダイアログ上部に「この会話の共有」一覧を出す（招待者・期限・状態・
+// サニタイズ有無）。各行に「取消」、サニタイズ済かつ未取消の行だけ「最新の内容に更新」を出す。
+function _shareStatusLabel(s) {
+  if (s.revoked_at) return '取消済み';
+  if (s.expires_at && new Date(s.expires_at).getTime() <= Date.now()) return '期限切れ';
+  return '有効';
+}
+
+function _shareExistingRowHTML(s) {
+  const invitees = (s.invitees || []).map((i) => esc(i.name || i.uid)).join('、') || '（招待者なし）';
+  const expiresText = s.expires_at ? `期限: ${esc(fmtDateTime(s.expires_at))}` : '無期限';
+  const sanitizedText = s.sanitized ? '個人部分を除いて共有' : '会話をそのまま共有';
+  const active = !s.revoked_at;
+  const refreshedText = s.refreshed_at ? `・最終更新: ${esc(fmtDateTime(s.refreshed_at))}` : '';
+  return `<div class="share-existing-row" data-share-id="${s.share_id}">
+    <div class="share-existing-main">
+      <div class="share-existing-invitees">${invitees}</div>
+      <div class="share-existing-meta">${esc(_shareStatusLabel(s))}・${esc(sanitizedText)}・${esc(expiresText)}${refreshedText}</div>
+    </div>
+    <div class="share-existing-acts">
+      ${(s.sanitized && active) ? `<button class="mini" data-share-refresh="${s.share_id}">最新の内容に更新</button>` : ''}
+      ${active ? `<button class="mini ek-danger" data-share-revoke="${s.share_id}">取消</button>` : ''}
+    </div>
+  </div>`;
+}
+
+let _shareListGen = 0;   // loadShareExistingList の世代カウンタ（下の関数参照）
+
+async function loadShareExistingList(cid) {
+  const box = document.getElementById('share-existing-list');
+  if (!box) return;
+  const gen = ++_shareListGen;
+  box.textContent = '読み込み中...';
+  let html;
+  try {
+    const shares = await (await fetch(`/conversations/${cid}/shares`)).json();
+    html = shares.length ? shares.map(_shareExistingRowHTML).join('')
+      : '<div class="muted" style="font-size:12px">まだ共有していません</div>';
+  } catch (_) {
+    html = '<div class="muted" style="font-size:12px">共有一覧を読み込めませんでした</div>';
+  }
+  // 世代チェック（history.js の resumeRunningTurn と同型）: この fetch の await 中に、別の
+  // 呼び出し（取消/更新/発行直後の再取得・ダイアログの開き直し）がさらに新しい世代を進めていたら、
+  // この応答はもう古い。世代が最新でも、ダイアログが既に別会話向けに開き直されていれば
+  // （overlay.dataset.cid が呼び出し時の cid と一致しなければ）同様に捨てる。
+  const overlay = document.getElementById('share-overlay');
+  if (gen !== _shareListGen || !overlay || overlay.dataset.cid !== String(cid)) return;
+  box.innerHTML = html;
+}
+
 export function openShareDialog(cid, title) {
   const overlay = document.getElementById('share-overlay');
   const tidEl = document.getElementById('share-dialog-title');
@@ -76,6 +126,7 @@ export function openShareDialog(cid, title) {
   hideInviteeSuggest();
   overlay.dataset.cid = String(cid);
   overlay.hidden = false;
+  loadShareExistingList(cid);
 }
 
 // フェーズ6 S3（地雷7対応）: DOMContentLoaded 依存を即時実行へ（S4 module 化後は動的 import 等で
@@ -96,6 +147,32 @@ export function openShareDialog(cid, title) {
     const url = document.getElementById('share-url-val').textContent;
     if (!url) return;
     copyText(url);
+  });
+
+  // SH-2: 既存共有一覧の「取消」「最新の内容に更新」（イベント委譲）。
+  document.getElementById('share-existing-list')?.addEventListener('click', async (e) => {
+    const cid = overlay.dataset.cid;
+    const revokeBtn = e.target.closest('[data-share-revoke]');
+    if (revokeBtn) {
+      if (!confirm('この共有を取消します。招待者は開けなくなります。よろしいですか？')) return;
+      revokeBtn.disabled = true;
+      try {
+        const r = await fetch(`/conversation-shares/${revokeBtn.dataset.shareRevoke}/revoke`, { method: 'POST' });
+        if (!r.ok) throw new Error(String(r.status));
+      } catch (_) { revokeBtn.disabled = false; return; }
+      loadShareExistingList(cid);
+      return;
+    }
+    const refreshBtn = e.target.closest('[data-share-refresh]');
+    if (refreshBtn) {
+      refreshBtn.disabled = true;
+      try {
+        const r = await fetch(`/conversation-shares/${refreshBtn.dataset.shareRefresh}/refresh`, { method: 'POST' });
+        if (!r.ok) throw new Error(String(r.status));
+      } catch (_) { refreshBtn.disabled = false; return; }
+      await loadShareExistingList(cid);
+      toast('更新しました（招待者には次に開いたときから最新が見えます）');
+    }
   });
 
   // チップの削除（× クリック・イベント委譲）
@@ -189,6 +266,7 @@ export function openShareDialog(cid, title) {
         document.getElementById('share-url-val').textContent = absUrl;
         document.getElementById('share-form').hidden = true;
         document.getElementById('share-result').hidden = false;
+        loadShareExistingList(cid);   // SH-2: 発行直後に一覧へ反映
       } else {
         errEl.textContent = d.detail || '共有に失敗しました';
       }

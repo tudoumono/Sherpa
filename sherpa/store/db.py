@@ -444,6 +444,16 @@ _SCHEMA = [
     # 同じユーザー・同じ share は履歴に1行だけ（受領ラッパーの冪等キー）。
     "CREATE UNIQUE INDEX IF NOT EXISTS conv_received_share_once ON conversations(user_id, share_id) "
     "WHERE origin='received_share' AND share_id IS NOT NULL AND deleted_at IS NULL",
+    # SH-1（2026-08-23-共有フォーク.md）: 受領共有ラッパーを自分の会話として複製した出所（フォーク元）。
+    # `forked_from_share_id` は共有そのものが後で取消されても孤児化しないよう SET NULL
+    # （出所表示は「編集不可の履歴情報」であり、共有の生死とは独立に残す）。
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_from_share_id BIGINT "
+    "REFERENCES conversation_shares(id) ON DELETE SET NULL",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_from_user_id TEXT",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_at TIMESTAMPTZ",
+    # SH-2（2026-08-23-共有フォーク.md）: サニタイズ共有の再共有（スナップショット更新）で最後に
+    # 取り直した時刻。NULL＝一度も refresh していない（発行直後の状態）。
+    "ALTER TABLE conversation_shares ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMPTZ",
     # W3: uid スラッグ形式を DB レベルで強制（多層防御）。
     # NULL uid も拒否する（Postgres の CHECK は NULL/UNKNOWN を通してしまうため IS NOT NULL を含む）。
     # 冪等化: 古い（NULL を許した）制約が存在すれば先に DROP し、正しい定義で再追加する。

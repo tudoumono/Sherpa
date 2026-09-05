@@ -14,6 +14,7 @@ import は不要（純移動でこの契約は変わらない）。
 """
 from __future__ import annotations
 
+import hashlib
 import math
 
 from psycopg.types.json import Json
@@ -23,6 +24,21 @@ from ..ingest import importance
 from .conversations import is_personal_tainted
 from .db import _connect, _ensure
 from .feedback import get_feedback_by_message_ids_for_user
+
+
+def _share_lock_key(share_id) -> int:
+    """`accept_share`/`refresh_sanitized_share` 共通の advisory lock key（是正3・2026-09-05）。
+
+    両関数は同じ2種の行（共有元/対象 conversation 行・conversation_shares 行）を**逆順**で
+    ロックする（`accept_share`: conversation→share／`refresh_sanitized_share`: share→conversation・
+    各関数の docstring 参照）ため、同一 share を同時に対象にするとデッドロックが成立し得る。
+    両関数の**先頭**（どちらの行ロックよりも前）でこの advisory lock を取ることで直列化する
+    （`world_lock`/`_world_lock_key` と同じ手法＝sha1 truncate で 64bit key 空間へ写像し、
+    `share_id` を裸の bigint key として使わない——`_AUDIT_CHAIN_LOCK` 等の固定小整数キーとの
+    衝突を避けるため）。トランザクションスコープ（xact lock）＝commit/rollback で自動解放。
+    """
+    return int.from_bytes(hashlib.sha1(f"share_fork_refresh:{share_id}".encode("utf-8")).digest()[:8],
+                          "big", signed=True)
 
 
 def _filter_importance_from_citations(cites):
@@ -206,7 +222,8 @@ def get_conversation_for_read(uid, cid) -> dict | None:
     with _connect() as c:
         conv = c.execute(
             "SELECT id, user_id, version, title, codex_session_id, origin, source_conversation_id, "
-            "share_id, shared_by_user_id, read_only, contains_personal_workspace, created_at, updated_at "
+            "share_id, shared_by_user_id, read_only, contains_personal_workspace, "
+            "forked_from_share_id, forked_from_user_id, forked_at, created_at, updated_at "
             "FROM conversations WHERE id=%s AND deleted_at IS NULL", (cid,)).fetchone()
         if not conv or conv["user_id"] != uid:
             return None                                    # 他人の id 直アクセスは不可（呼出側で 403/404）
@@ -496,6 +513,59 @@ def _safe_share_answer(answer):
     return out
 
 
+def _create_sanitized_snapshot_tx(c, owner_uid: str, source_cid: int) -> int | None:
+    """`create_sanitized_snapshot` の本体（**呼び出し側が用意した接続 `c` 上で**実行する）。
+
+    SH-2（再共有・スナップショット更新）が「新 snapshot の作成」と「共有/受領ラッパーの
+    付け替え」を**1トランザクション**にしたいため、接続を引数で受けられる形に分離した
+    （`create_sanitized_snapshot` はこれを自前の接続で包むだけの薄いラッパーに変わる・
+    挙動は不変）。docstring・契約は `create_sanitized_snapshot` 側を参照。
+    """
+    conv = c.execute(
+        "SELECT version FROM conversations WHERE id=%s AND deleted_at IS NULL",
+        (source_cid,)).fetchone()
+    if not conv:
+        return None
+    new = c.execute(
+        "INSERT INTO conversations (user_id, version, title, origin, read_only, "
+        "  source_conversation_id, contains_personal_workspace) "
+        "VALUES (%s,%s,%s,'sanitized_snapshot', TRUE, %s, FALSE) RETURNING id",
+        (owner_uid, conv["version"], _SANITIZED_TITLE, source_cid)).fetchone()
+    new_cid = new["id"]
+    msgs = c.execute(
+        "SELECT role, content, lens, answer, personal FROM messages "
+        "WHERE conversation_id=%s ORDER BY id", (source_cid,)).fetchall()
+    # taint 判定は共通ヘルパ（`conversations.py::is_personal_tainted`）に集約
+    # （改善ログエクスポートの個人情報除外と同じ基準を使う）。
+    def _tainted(m):
+        return is_personal_tainted(m)
+    prepped = [{"m": m, "tainted": _tainted(m)} for m in msgs]
+    # 2nd pass: user 質問も、対応する（直後の）assistant が taint なら伏字化
+    #   （旧データは user message が未マークのため・ファイル名等の漏れ防止）。
+    for i, pm in enumerate(prepped):
+        if pm["m"]["role"] == "user" and not pm["tainted"]:
+            nxt = next((prepped[j] for j in range(i + 1, len(prepped))
+                        if prepped[j]["m"]["role"] == "assistant"), None)
+            if nxt and nxt["tainted"]:
+                pm["tainted"] = True
+    for pm in prepped:
+        m = pm["m"]
+        if pm["tainted"]:                        # 個人ターン: Q/A とも伏字・answer は最小化
+            content = _REDACTED_TEXT
+            answer = {"headline": _REDACTED_TEXT} if m["role"] == "assistant" else None
+            lens = None
+        else:                                    # 非個人ターン: content 保持・answer は allowlist 再構築
+            content = m["content"]
+            answer = _safe_share_answer(m["answer"])
+            lens = m["lens"] if m["lens"] in _SHARE_SAFE_LENS else None
+        c.execute(
+            "INSERT INTO messages (conversation_id, role, content, lens, route, trace, answer, personal) "
+            "VALUES (%s,%s,%s,%s,NULL,NULL,%s,FALSE)",   # route/trace は常に落とす
+            (new_cid, m["role"], content, lens,
+             Json(answer) if answer is not None else None))
+    return new_cid
+
+
 def create_sanitized_snapshot(owner_uid: str, source_cid: int) -> int | None:
     """会話の sanitized コピー（共有用・凍結スナップショット）を作る。
     - **title は固定文言**（元 title のファイル名等を漏らさない）。
@@ -508,49 +578,7 @@ def create_sanitized_snapshot(owner_uid: str, source_cid: int) -> int | None:
     """
     _ensure()
     with _connect() as c:
-        conv = c.execute(
-            "SELECT version FROM conversations WHERE id=%s AND deleted_at IS NULL",
-            (source_cid,)).fetchone()
-        if not conv:
-            return None
-        new = c.execute(
-            "INSERT INTO conversations (user_id, version, title, origin, read_only, "
-            "  source_conversation_id, contains_personal_workspace) "
-            "VALUES (%s,%s,%s,'sanitized_snapshot', TRUE, %s, FALSE) RETURNING id",
-            (owner_uid, conv["version"], _SANITIZED_TITLE, source_cid)).fetchone()
-        new_cid = new["id"]
-        msgs = c.execute(
-            "SELECT role, content, lens, answer, personal FROM messages "
-            "WHERE conversation_id=%s ORDER BY id", (source_cid,)).fetchall()
-        # taint 判定は共通ヘルパ（`conversations.py::is_personal_tainted`）に集約
-        # （改善ログエクスポートの個人情報除外と同じ基準を使う）。
-        def _tainted(m):
-            return is_personal_tainted(m)
-        prepped = [{"m": m, "tainted": _tainted(m)} for m in msgs]
-        # 2nd pass: user 質問も、対応する（直後の）assistant が taint なら伏字化
-        #   （旧データは user message が未マークのため・ファイル名等の漏れ防止）。
-        for i, pm in enumerate(prepped):
-            if pm["m"]["role"] == "user" and not pm["tainted"]:
-                nxt = next((prepped[j] for j in range(i + 1, len(prepped))
-                            if prepped[j]["m"]["role"] == "assistant"), None)
-                if nxt and nxt["tainted"]:
-                    pm["tainted"] = True
-        for pm in prepped:
-            m = pm["m"]
-            if pm["tainted"]:                        # 個人ターン: Q/A とも伏字・answer は最小化
-                content = _REDACTED_TEXT
-                answer = {"headline": _REDACTED_TEXT} if m["role"] == "assistant" else None
-                lens = None
-            else:                                    # 非個人ターン: content 保持・answer は allowlist 再構築
-                content = m["content"]
-                answer = _safe_share_answer(m["answer"])
-                lens = m["lens"] if m["lens"] in _SHARE_SAFE_LENS else None
-            c.execute(
-                "INSERT INTO messages (conversation_id, role, content, lens, route, trace, answer, personal) "
-                "VALUES (%s,%s,%s,%s,NULL,NULL,%s,FALSE)",   # route/trace は常に落とす
-                (new_cid, m["role"], content, lens,
-                 Json(answer) if answer is not None else None))
-        return new_cid
+        return _create_sanitized_snapshot_tx(c, owner_uid, source_cid)
 
 
 def create_share(cid, owner_uid, token_hash, expires_at, invitee_uids, created_by=None) -> int:
@@ -592,9 +620,14 @@ def accept_share(share_id, uid) -> int:
     `SELECT ... FOR UPDATE OF c` でロックする（delete_conversation 側も同じ行をロックするため直列化）。
     ロックを取った時点で共有元が既に無ければ（同時に物理削除された等）ValueError を送出する
     （壊れた wrapper: source_conversation_id が実体の無い/後で消える id を指す状態を作らない）。
+
+    是正3（2026-09-05）: `refresh_sanitized_share` と共有 conversation 行／share 行を**逆順**で
+    ロックするため、関数の先頭（下の行ロックより前）で `_share_lock_key` の advisory lock を
+    取って直列化する（`_share_lock_key` の docstring 参照）。
     """
     _ensure()
     with _connect() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s)", (_share_lock_key(share_id),))
         existing = c.execute(
             "SELECT id FROM conversations WHERE user_id=%s AND share_id=%s "
             "AND origin='received_share' AND deleted_at IS NULL", (uid, share_id)).fetchone()
@@ -627,3 +660,190 @@ def revoke_share(share_id, owner_uid) -> bool:
                       "WHERE id=%s AND owner_user_id=%s AND revoked_at IS NULL",
                       (share_id, owner_uid)).rowcount
     return n > 0
+
+
+# ==== SH-1: フォーク（「この会話を引き継いで質問」・2026-08-23-共有フォーク.md）====
+
+class ForkNotAllowedError(Exception):
+    """フォーク不可（403 相当）。`args[0]` に reason（監査 detail・エラーメッセージ用）を持つ:
+    `"not_received_share"`（対象が受領共有ラッパーでない）・`"share_unavailable"`（共有が
+    取消/期限切れ/招待外）・`"personal_blocked"`（元会話が個人 workspace を参照）。"""
+
+
+def _fork_title(conv: dict, messages: list) -> str:
+    """フォーク先タイトル（是正5・2026-09-05）。
+
+    通常共有（ライブ参照）からのフォークは元 title をそのまま複製する（従来どおり）。
+    サニタイズ共有（title が固定文言 `_SANITIZED_TITLE`）からのフォークは、固定文言のままだと
+    利用者が新しい会話を一覧で識別できないため、複製する `messages`（＝読者に見えている形・
+    伏字済み）のうち最初の**伏字でない**（`content` が `_REDACTED_TEXT` でない）user 発言の
+    先頭40文字を title にする（`chat_service._ensure_conversation` と同じ `strip()[:40]` 規則）。
+    該当が無ければ「引き継いだ会話」。**元会話（sanitized snapshot のさらに元）の title は
+    一切参照しない**（ファイル名等を漏らさないという sanitized snapshot の契約を壊さないため）。
+    """
+    if conv["title"] != _SANITIZED_TITLE:
+        return conv["title"]
+    for m in messages:
+        if m["role"] == "user" and m["content"] != _REDACTED_TEXT:
+            t = (m["content"] or "").strip()[:40]
+            if t:
+                return t
+    return "引き継いだ会話"
+
+
+def fork_received_share(uid, wid, *, ip_hash=None, user_agent=None) -> int:
+    """受領共有ラッパー `wid` を、`uid` 自身の新しい会話として複製する（SH-1）。
+
+    複製元は「読者に見えている形」＝`get_conversation_for_read(uid, wid)` と**同じ検証・
+    同じ本文**（伏字済み・route/trace 除去済み・確認カード payload 除去済み）。元スナップショット/
+    元会話は一切変更しない（読むだけ）。新会話は `origin='own'`（既存の書込可判定 `owns_conversation`
+    をそのまま満たす）・`read_only=FALSE`・`contains_personal_workspace=FALSE`・
+    `forked_from_share_id`/`forked_from_user_id`/`forked_at` を持つ。同じラッパーから
+    何度でもフォークできる（冪等にしない＝呼ぶたびに新しい会話ができる）。
+
+    RV 是正1（2026-09-05）: 複製（会話＋messages の INSERT）と監査（`share.forked`）を
+    **同一トランザクション**で書く（`settings.set_system_settings` と同じ方式）。監査 INSERT の
+    例外は psycopg のトランザクション契約に従い `with _connect()` を抜ける際に自動 rollback される
+    ため、複製もまとめて取り消される（呼び出し側で別接続の再読取・補償削除は不要）。
+    `_audit_insert` は facade（`sherpa.store`）属性経由で実行時解決する（settings.py と同じ理由・
+    テストの `monkeypatch.setattr(store, "_audit_insert", …)` シームを保つため）。
+
+    returns 新会話 id。
+    raises `LookupError`（`wid` が存在しない/自分のものでない/削除済み＝404 相当）、
+    `ForkNotAllowedError`（受領共有ラッパーでない・共有が無効・個人ブロック＝403 相当）。
+    監査 INSERT が失敗した場合はその例外がそのまま伝播する（呼び出し側で 500 に変換）。
+    """
+    _ensure()
+    from sherpa import store as _facade   # settings.py と同じ理由: 実行時解決（monkeypatch シーム維持）
+    got = get_conversation_for_read(uid, wid)
+    if got is None:
+        raise LookupError(f"会話が見つかりません（wid={wid}）")
+    conv = got["conversation"]
+    if conv["origin"] != "received_share":
+        raise ForkNotAllowedError("not_received_share")
+    if got.get("share_status") in ("unavailable", "personal_blocked"):
+        raise ForkNotAllowedError(got["share_status"])
+    with _connect() as c:
+        new = c.execute(
+            "INSERT INTO conversations (user_id, version, title, origin, read_only, "
+            "  contains_personal_workspace, forked_from_share_id, forked_from_user_id, forked_at) "
+            "VALUES (%s,%s,%s,'own', FALSE, FALSE, %s,%s, now()) RETURNING id",
+            (uid, conv["version"], _fork_title(conv, got["messages"]), conv["share_id"], conv["shared_by_user_id"])
+        ).fetchone()
+        new_cid = new["id"]
+        for m in got["messages"]:
+            c.execute(
+                "INSERT INTO messages (conversation_id, role, content, lens, route, trace, answer, personal) "
+                "VALUES (%s,%s,%s,%s,NULL,NULL,%s,FALSE)",   # route/trace は常に NULL・personal=FALSE
+                (new_cid, m["role"], m["content"], m.get("lens"),
+                 Json(m["answer"]) if m.get("answer") is not None else None))
+        _facade._audit_insert(
+            c, uid, "share.forked", "share",
+            f"share:{conv['share_id']}" if conv.get("share_id") is not None else None,
+            detail={"wrapper_conversation_id": wid, "new_conversation_id": new_cid,
+                    "source_conversation_id": conv.get("source_conversation_id")},
+            outcome="success", severity="info", ip_hash=ip_hash, user_agent=user_agent)
+        return new_cid
+
+
+# ==== SH-2: 再共有（「スナップショットを更新」・2026-08-23-共有フォーク.md）====
+
+class ShareNotSanitizedError(Exception):
+    """通常共有（元会話をライブ参照＝更新の概念が無い）への refresh 要求（409 相当）。"""
+
+
+def refresh_sanitized_share(owner_uid, share_id) -> dict:
+    """サニタイズ共有のスナップショットを最新の内容へ取り直す（SH-2）。リンク・招待・期限は不変。
+
+    対象は **サニタイズ共有だけ**（`conversation_shares.conversation_id` が
+    `origin='sanitized_snapshot'` の会話）。通常共有（元会話をライブ参照）には
+    `ShareNotSanitizedError` を送出する（更新の概念が無い＝呼び出し側で 409 に変換）。
+
+    手順（**1トランザクション**）: 対象 share 行を `FOR UPDATE` でロック（同時 refresh/revoke と
+    直列化）→ 所有者確認 → 現行 snapshot の `source_conversation_id`（常に元会話を指す・
+    refresh を重ねても付け替わらない）から元会話が生きているか確認 → 新 snapshot を
+    `_create_sanitized_snapshot_tx` で同一トランザクション上に作る →
+    `conversation_shares.conversation_id`/`refreshed_at` を新 snapshot へ →
+    受領ラッパー（`origin='received_share' AND share_id=当該`）の `source_conversation_id` を
+    新 snapshot へ付け替える（**先に付け替えてから**旧 snapshot を消す） →
+    旧 snapshot 行は `deleted_at=now()`（物理削除しない・既存の soft delete と同じ）。
+
+    期限切れでも更新自体は許す（`expires_at` は変えない）。存在しない/取消済み（`revoked_at`
+    設定済み）は `LookupError`（404 相当）。所有者不一致は `PermissionError`（403 相当・
+    存在確認より先に判定すると所有権の有無が漏れるため、行が存在することが分かった後で判定する）。
+    元会話が削除済みなら `LookupError`。
+
+    returns `{"share_id", "old_snapshot_id", "new_snapshot_id", "source_conversation_id", "refreshed_at"}`。
+
+    是正3（2026-09-05）: `accept_share` と share 行／共有 conversation 行を**逆順**でロックするため、
+    関数の先頭（下の `FOR UPDATE` より前）で `_share_lock_key` の advisory lock を取って直列化する
+    （`_share_lock_key` の docstring 参照）。
+    """
+    _ensure()
+    with _connect() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s)", (_share_lock_key(share_id),))
+        share = c.execute(
+            "SELECT id, conversation_id, owner_user_id, revoked_at "
+            "FROM conversation_shares WHERE id=%s FOR UPDATE", (share_id,)).fetchone()
+        if not share:
+            raise LookupError(f"共有が見つかりません（share_id={share_id}）")
+        if share["owner_user_id"] != owner_uid:
+            raise PermissionError("所有者のみ更新できます")
+        if share["revoked_at"] is not None:
+            raise LookupError(f"共有が見つかりません（share_id={share_id}）")
+        old_snapshot = c.execute(
+            "SELECT id, origin, source_conversation_id FROM conversations "
+            "WHERE id=%s AND deleted_at IS NULL", (share["conversation_id"],)).fetchone()
+        if not old_snapshot:
+            raise LookupError(f"共有対象の会話が見つかりません（share_id={share_id}）")
+        if old_snapshot["origin"] != "sanitized_snapshot":
+            raise ShareNotSanitizedError("この共有は常に最新の内容を表示します")
+        source_cid = old_snapshot["source_conversation_id"]
+        source_conv = c.execute(
+            "SELECT id FROM conversations WHERE id=%s AND deleted_at IS NULL",
+            (source_cid,)).fetchone() if source_cid is not None else None
+        if not source_conv:
+            raise LookupError(f"元会話が見つかりません（source_conversation_id={source_cid}）")
+        new_snapshot_id = _create_sanitized_snapshot_tx(c, owner_uid, source_cid)
+        if new_snapshot_id is None:   # 直前チェックと同じ条件を見ているため通常到達しない防御的分岐
+            raise LookupError(f"元会話が見つかりません（source_conversation_id={source_cid}）")
+        refreshed = c.execute(
+            "UPDATE conversation_shares SET conversation_id=%s, refreshed_at=now() "
+            "WHERE id=%s RETURNING refreshed_at", (new_snapshot_id, share_id)).fetchone()
+        c.execute(
+            "UPDATE conversations SET source_conversation_id=%s "
+            "WHERE origin='received_share' AND share_id=%s AND deleted_at IS NULL",
+            (new_snapshot_id, share_id))
+        c.execute("UPDATE conversations SET deleted_at=now() WHERE id=%s", (old_snapshot["id"],))
+        return {"share_id": share_id, "old_snapshot_id": old_snapshot["id"],
+                "new_snapshot_id": new_snapshot_id, "source_conversation_id": source_cid,
+                "refreshed_at": refreshed["refreshed_at"]}
+
+
+def list_shares_for_conversation(owner_uid, cid) -> list[dict]:
+    """`cid`（所有者の元会話）を対象にした共有一覧（SH-2・所有者専用）。
+
+    通常共有（`share.conversation_id=cid`）とサニタイズ共有（現行 snapshot の
+    `source_conversation_id=cid`）の両方を対象にする——refresh で snapshot が差し替わった後も
+    `conversation_shares.conversation_id` は常に「現在の」snapshot を指すため、この JOIN だけで
+    最新状態が拾える（置き換え済みの旧 snapshot は refresh 後どの share からも参照されなくなる
+    ため二重に出ない）。招待者一覧（`invitees`）は表示名を `shared_by_name` と同じ流儀
+    （`users.display_name` の LEFT JOIN）で解決する。
+    """
+    _ensure()
+    with _connect() as c:
+        rows = c.execute(
+            "SELECT s.id AS share_id, (t.origin='sanitized_snapshot') AS sanitized, "
+            "  s.created_at, s.expires_at, s.revoked_at, s.refreshed_at, s.last_used_at "
+            "FROM conversation_shares s JOIN conversations t ON t.id = s.conversation_id "
+            "WHERE s.owner_user_id=%s AND (t.id=%s OR t.source_conversation_id=%s) "
+            "ORDER BY s.created_at DESC",
+            (owner_uid, cid, cid)).fetchall()
+        out = []
+        for r in rows:
+            invitees = c.execute(
+                "SELECT i.invitee_user_id AS uid, u.display_name AS name, i.accepted_at "
+                "FROM conversation_share_invites i LEFT JOIN users u ON u.uid=i.invitee_user_id "
+                "WHERE i.share_id=%s ORDER BY i.created_at", (r["share_id"],)).fetchall()
+            out.append({**r, "invitees": invitees})
+        return out

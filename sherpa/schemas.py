@@ -1304,6 +1304,14 @@ class ScopesResponse(BaseModel):
 # 会話管理・会話共有（sherpa/routers/conversations.py・sherpa/routers/shares.py）
 # ===================================================================================
 
+class ForkedFromInfo(BaseModel):
+    """SH-1: フォーク元の出所表示（編集不可）。`name` は表示名未設定/退会等で `None` になりうる。"""
+    share_id: int
+    user_id: str
+    name: str | None
+    at: WireDateTime
+
+
 class ConversationSummary(BaseModel):
     """`GET /conversations`（store.list_conversations）の1行。
 
@@ -1323,6 +1331,7 @@ class ConversationSummary(BaseModel):
     shared_by_user_id: str | None
     shared_by_name: str | None
     share_status: str | None
+    forked_from: ForkedFromInfo | None = None
 
 
 class ConversationDetailConv(BaseModel):
@@ -1339,6 +1348,9 @@ class ConversationDetailConv(BaseModel):
     shared_by_user_id: str | None
     read_only: bool
     contains_personal_workspace: bool
+    forked_from_share_id: int | None
+    forked_from_user_id: str | None
+    forked_at: WireDateTime | None
     created_at: WireDateTime
     updated_at: WireDateTime
 
@@ -1384,6 +1396,37 @@ class ShareCreateResponse(BaseModel):
     share_id: int
     url: str
     note: str
+
+
+class ConversationForkResponse(BaseModel):
+    """POST /conversations/{wid}/fork（SH-1・shares.py::conversation_fork）。"""
+    ok: bool
+    conversation_id: int
+
+
+class ConversationShareRefreshResponse(BaseModel):
+    """POST /conversation-shares/{share_id}/refresh（SH-2・shares.py::conversation_share_refresh）。"""
+    ok: bool
+    share_id: int
+    refreshed_at: WireDateTime
+
+
+class ShareInviteeItem(BaseModel):
+    uid: str
+    name: str | None
+    accepted_at: WireDateTime | None
+
+
+class ShareListItem(BaseModel):
+    """`GET /conversations/{cid}/shares`（SH-2・store/shares.py::list_shares_for_conversation）の1件。"""
+    share_id: int
+    sanitized: bool
+    created_at: WireDateTime
+    expires_at: WireDateTime | None
+    revoked_at: WireDateTime | None
+    refreshed_at: WireDateTime | None
+    last_used_at: WireDateTime | None
+    invitees: list[ShareInviteeItem]
 
 
 # ===================================================================================

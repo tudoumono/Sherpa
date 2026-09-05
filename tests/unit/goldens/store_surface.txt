@@ -1,12 +1,14 @@
 AnnouncementOrderError
 ClientOpIdConflictError
 DEFAULT_SYSTEM_PROMPT
+ForkNotAllowedError
 MESSAGE_FEEDBACK_COMMENT_MAX_LEN
 MESSAGE_FEEDBACK_TAGS
 OpenAIEndpointSettingsConflict
 PersonalKeysDisallowedError
 SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK
 SelfIssuedQuotaExceededError
+ShareNotSanitizedError
 UserApiKeysDisallowedError
 _ANNOUNCEMENT_FIELDS
 _AUDIT_CANON_FIELDS
@@ -33,6 +35,7 @@ _audit_insert
 _bedrock_key_fingerprint
 _compute_retention
 _connect
+_create_sanitized_snapshot_tx
 _dsn
 _ensure
 _inited
@@ -88,6 +91,7 @@ fail_close_if_extracting
 finish_ingest_run
 finish_ingest_run_and_confirm_world
 finish_ingest_run_and_delete_world
+fork_received_share
 get_announcement
 get_conversation
 get_conversation_for_read
@@ -119,6 +123,7 @@ list_documents
 list_documents_page
 list_export_messages
 list_ingest_runs
+list_shares_for_conversation
 list_users
 list_webhook_keys_for_world
 list_workspace_files
@@ -132,6 +137,7 @@ owns_conversation
 purge_personal_api_keys
 recent_messages
 record_workspace_file
+refresh_sanitized_share
 rename_conversation
 replace_documents
 resolve_self_issued_daily_quota_cap
