@@ -44,7 +44,7 @@ Scene("21-新しい図", "graph.html",        # 画像名（.png なし）／対
 - `10-chat-clarify.png` — 曖昧時の**確認カード**（選択肢で絞り込む）
 
 ### 11. 使い方：範囲とAIの切り替え
-- `11-knowledge-toggle.png` — 「ナレッジ参照」トグル（既定オフ）
+- `11-knowledge-toggle.png` — 「社内資料」トグル（既定オフ）
 - `11-scope-brain.png` — **範囲**（フォルダ）と**頭脳**（AI）の選択
 - `11-settings.png` — 設定画面（AI 接続：OpenAI/Gemini/Ollama/Codex のキー・モデル）
 
