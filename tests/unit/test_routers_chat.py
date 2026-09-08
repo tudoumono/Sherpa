@@ -33,7 +33,7 @@ def test_chat_turns_start_uses_slash_stripped_message_for_conversation_title(mon
         turn_id = "turn-x"
         conversation_id = 999
 
-    def fake_start_turn(uid, conversation_factory, run_fn_factory):
+    def fake_start_turn(uid, conversation_factory, run_fn_factory, known_conversation_id=None):
         # 本番と同じ呼び出し順（枠予約の直後・lock の外で会話を作る）。
         conversation_factory()
         return _FakeRec()
@@ -71,7 +71,7 @@ def test_chat_turns_start_no_slash_message_unchanged(monkeypatch):
         turn_id = "turn-x"
         conversation_id = 999
 
-    def fake_start_turn(uid, conversation_factory, run_fn_factory):
+    def fake_start_turn(uid, conversation_factory, run_fn_factory, known_conversation_id=None):
         conversation_factory()
         return _FakeRec()
 

@@ -155,13 +155,15 @@ def test_dedupe_still_collapses_identical_null_span_quote():
 # ==== merge_overlapping_citations（同一 doc の重なる span を1件に統合）====
 
 def test_merge_overlapping_citations_containment_keeps_widest_span():
-    """行1-10 が行3-5 を包含する場合、1件に統合され span は最も広い方（[1,10]）になる。"""
+    """行1-10 が行3-5 を包含する場合、1件に統合され span は最も広い方（[1,10]）になる。
+    採用しなかった quote（"narrow"）は "wide" の部分文字列でも同一でもないため、
+    `extra_quotes` として evidence_meta 側に残る（citation.quote/span 自体は従来どおり）。"""
     wide = {"doc_id": "a.md", "span": [1, 10], "quote": "wide"}
     narrow = {"doc_id": "a.md", "span": [3, 5], "quote": "narrow"}
     out_c, out_m, flags = citations.merge_overlapping_citations(
         [wide, narrow], [{"k": "w"}, {"k": "n"}])
     assert out_c == [{"doc_id": "a.md", "span": [1, 10], "quote": "wide"}]
-    assert out_m == [{"k": "w", "span": [1, 10]}]   # evidence_meta も widest 側の1件・span は同期
+    assert out_m == [{"k": "w", "span": [1, 10], "extra_quotes": ["narrow"]}]
     assert flags == [True]
 
 
@@ -251,3 +253,125 @@ def test_merge_overlapping_citations_reversed_span_is_excluded_from_merging():
 
 def test_merge_overlapping_citations_empty_input_returns_empty():
     assert citations.merge_overlapping_citations([], []) == ([], [], [])
+
+
+# ==== extra_quotes（統合で消える本文を evidence_meta 側に残す）====
+
+def test_merge_overlapping_citations_extra_quotes_keeps_non_adopted_quote():
+    """`[1,3]`＋`[3,6]` は行3を共有して統合される。`[3,6]`（幅3）の方が `[1,3]`（幅2）より広いため
+    採用される——採用されなかった `[1,3]` 側の本文が `extra_quotes` に残る。citation.quote/span
+    自体は従来どおり（代表1件・和集合 span）で変わらない。"""
+    a = {"doc_id": "a.md", "span": [1, 3], "quote": "前半の条件"}
+    b = {"doc_id": "a.md", "span": [3, 6], "quote": "後半まで含む広い引用"}
+    out_c, out_m, flags = citations.merge_overlapping_citations([a, b], [{}, {}])
+    assert out_c[0]["span"] == [1, 6]
+    assert out_c[0]["quote"] == "後半まで含む広い引用"   # 従来どおり代表1件のまま
+    assert out_m[0]["extra_quotes"] == ["前半の条件"]
+    assert flags == [True]
+
+
+def test_merge_overlapping_citations_extra_quotes_excludes_substring_of_adopted():
+    """採用された quote の部分文字列（新情報なし）は `extra_quotes` に残さない。"""
+    a = {"doc_id": "a.md", "span": [1, 3], "quote": "広い"}
+    b = {"doc_id": "a.md", "span": [2, 8], "quote": "とても広い引用文"}   # "広い" を包含する
+    out_c, out_m, flags = citations.merge_overlapping_citations([a, b], [{}, {}])
+    assert out_c[0]["quote"] == "とても広い引用文"
+    assert "extra_quotes" not in out_m[0]   # "広い" は採用 quote の部分文字列＝新情報なし
+
+
+def test_merge_overlapping_citations_extra_quotes_dedupes_and_caps_at_three():
+    """3件を超えるグループでは重複を除去し、先頭3件・各400字までに切り詰める。"""
+    long_quote = "z" * 500
+    group = [
+        {"doc_id": "a.md", "span": [1, 2], "quote": "alpha"},
+        {"doc_id": "a.md", "span": [2, 3], "quote": "beta"},
+        {"doc_id": "a.md", "span": [3, 4], "quote": "gamma"},
+        {"doc_id": "a.md", "span": [4, 5], "quote": "alpha"},          # alpha と重複
+        {"doc_id": "a.md", "span": [5, 20], "quote": long_quote},      # 最も広い→代表に採用
+    ]
+    out_c, out_m, flags = citations.merge_overlapping_citations(group, [{} for _ in group])
+    assert out_c[0]["quote"] == long_quote
+    assert out_m[0]["extra_quotes"] == ["alpha", "beta", "gamma"]   # 重複除去・出現順・最大3件
+    assert all(len(q) <= 400 for q in out_m[0]["extra_quotes"])
+
+
+def test_merge_overlapping_citations_extra_quotes_dedupes_candidates_by_containment_before_cap():
+    """候補同士が部分文字列の包含関係にある場合、上限3件を適用する前に重複排除する——短い方
+    （他候補に包含され新情報が無い）を先に落とすことで、無関係な独自候補が枠から押し出されない。
+    「条件」は「条件と例外」の部分文字列のため落ち、残り3件（出現順）が採用される。"""
+    group = [
+        {"doc_id": "a.md", "span": [1, 2], "quote": "条件"},
+        {"doc_id": "a.md", "span": [2, 3], "quote": "条件と例外"},
+        {"doc_id": "a.md", "span": [3, 4], "quote": "税率"},
+        {"doc_id": "a.md", "span": [4, 5], "quote": "開始日"},
+        {"doc_id": "a.md", "span": [5, 30], "quote": "代表"},   # 最も広い span→代表に採用
+    ]
+    out_c, out_m, flags = citations.merge_overlapping_citations(group, [{} for _ in group])
+    assert out_c[0]["quote"] == "代表"
+    assert out_m[0]["extra_quotes"] == ["条件と例外", "税率", "開始日"]
+
+
+def test_merge_overlapping_citations_extra_quotes_containment_uses_400_char_truncated_text():
+    """包含・同一判定は実際に清書へ渡る文字列（400字に切った後）で行う。代表 quote が
+    「あ」×400＋「条件」（切ると「条件」の部分が消える）でも、候補「条件」は代表の切断後の
+    文字列には含まれないため除外されない。"""
+    rep_quote = "あ" * 400 + "条件"
+    group = [
+        {"doc_id": "a.md", "span": [1, 2], "quote": "条件"},
+        {"doc_id": "a.md", "span": [2, 3], "quote": "税率"},
+        {"doc_id": "a.md", "span": [3, 4], "quote": "開始日"},
+        {"doc_id": "a.md", "span": [4, 30], "quote": rep_quote},   # 最も広い span→代表に採用
+    ]
+    out_c, out_m, flags = citations.merge_overlapping_citations(group, [{} for _ in group])
+    assert out_c[0]["quote"] == rep_quote   # 公開 citation.quote 自体は切らない（代表1件そのまま）
+    assert out_m[0]["extra_quotes"] == ["条件", "税率", "開始日"]
+
+
+def test_merge_overlapping_citations_extra_quotes_candidates_identical_after_truncation_count_once():
+    """401字目以降だけ異なる候補同士は、切断後の文字列としては同一になるため1件分の枠しか
+    消費しない（切断前の全文で比較すると別々の2件として枠を無駄に使ってしまう）。"""
+    c1 = "あ" * 400 + "X"
+    c2 = "あ" * 400 + "Y"
+    group = [
+        {"doc_id": "b.md", "span": [1, 2], "quote": c1},
+        {"doc_id": "b.md", "span": [2, 3], "quote": c2},
+        {"doc_id": "b.md", "span": [3, 4], "quote": "税率"},
+        {"doc_id": "b.md", "span": [4, 30], "quote": "代表"},   # 最も広い span→代表に採用
+    ]
+    out_c, out_m, flags = citations.merge_overlapping_citations(group, [{} for _ in group])
+    assert out_m[0]["extra_quotes"] == ["あ" * 400, "税率"]   # c1/c2 は切断後同一＝1件のみ
+
+
+def test_merge_overlapping_citations_extra_quotes_preserves_original_array_order_over_span_order():
+    """統合グループは span 順に処理されるが、候補の並びは元の citations 配列の出現順（index順）
+    を保つ——先頭の候補が最も広い span を持たなくても、上限3件の適用で不当に落とされない。"""
+    group = [
+        {"doc_id": "c.md", "span": [20, 21], "quote": "Q0"},   # 元配列の先頭だが span は最後
+        {"doc_id": "c.md", "span": [1, 2], "quote": "Q1"},
+        {"doc_id": "c.md", "span": [5, 6], "quote": "Q2"},
+        {"doc_id": "c.md", "span": [10, 11], "quote": "Q3"},
+        {"doc_id": "c.md", "span": [1, 30], "quote": "代表"},   # 最も広い span→代表に採用
+    ]
+    out_c, out_m, flags = citations.merge_overlapping_citations(group, [{} for _ in group])
+    assert out_c[0]["quote"] == "代表"
+    # 元配列の出現順どおり Q0,Q1,Q2 が残り、最後の Q3 が上限3件で落ちる
+    # （span 順のまま抽出すると Q0 が4番目に回され誤って落ちる）。
+    assert out_m[0]["extra_quotes"] == ["Q0", "Q1", "Q2"]
+
+
+def test_merge_overlapping_citations_extra_quotes_absent_when_identical():
+    """採用 quote と完全に同一な quote は `extra_quotes` に残さない（新情報が無い）。"""
+    a = {"doc_id": "a.md", "span": [1, 3], "quote": "同じ引用"}
+    b = {"doc_id": "a.md", "span": [2, 6], "quote": "同じ引用"}
+    out_c, out_m, flags = citations.merge_overlapping_citations([a, b], [{}, {}])
+    assert "extra_quotes" not in out_m[0]
+
+
+def test_merge_overlapping_citations_extra_quotes_not_added_for_single_member_group():
+    """重ならない（統合されない）citation は `extra_quotes` を持たない——`merged_flags=False` の
+    エントリに新フィールドが混入しないことの回帰。"""
+    a = {"doc_id": "a.md", "span": [1, 3], "quote": "x"}
+    b = {"doc_id": "a.md", "span": [5, 8], "quote": "y"}
+    out_c, out_m, flags = citations.merge_overlapping_citations([a, b], [{}, {}])
+    assert out_m == [{}, {}]
+    assert flags == [False, False]

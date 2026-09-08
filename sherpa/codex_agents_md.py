@@ -25,6 +25,8 @@ AGENTS_MD = """\
   Marp 形式の `.md` を書くだけでよく、レンダ（HTML/PDF/PPTX への変換）は完了後に Sherpa 側が自動で行う
   （自分でレンダコマンドを実行する必要は無い）。ただし「あとで PowerPoint で編集したい」と明示された
   場合だけ、marp ではなく pptx スキル（python-pptx）を使う（marp の PPTX は画像ベースで本文編集ができない）。
+- 調査の途中経過（「次に〜を調べます」等の作業宣言）だけで終えない。調査を最後まで進めてから、
+  結論と根拠を最終回答として書く。
 - 最後は日本語で簡潔に回答する。出典の列挙は不要（Sherpa 側で別途付与する）。
 - 回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。
 - 件数を答えるときは list_docs の path_prefix でフォルダを確定してから数え、どのフォルダを数えたかを
@@ -39,13 +41,27 @@ AGENTS_MD = """\
   （同じことを再度聞かない）。
 """
 
+# `--output-schema`（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3）有効時だけ付け足す段落。
+# スキーマ無効時にこの構造化応答の要求を出すと、Codex が実際には守れない形式を約束させられるだけで
+# 実害がある（`--output-schema` が無ければ CLI 側の強制も無い）ため、`write_agents_md` の
+# `output_schema` 引数が真のときだけ本文に足す。
+_STRUCTURED_RESPONSE_PARAGRAPH = """\
+- 最終応答は `status`／`answer`／`next_step` の3項目で返す。`status` が `final` になるのは、結論と根拠が
+  揃ったときだけ。調べる作業がまだ残っているなら、同じ応答内で続けて調査するか、`in_progress` にして
+  `next_step` へ次に何を調べるかを書く（`final` のときの `next_step` は null）。手順や計画の説明を
+  求められた依頼は、その説明を書き終えた時点で `final`。
+"""
 
-def write_agents_md(authoring: Path) -> None:
+
+def write_agents_md(authoring: Path, output_schema: bool = False) -> None:
     """authoring 直下へ AGENTS.md を書く（per-request・冪等・上書き）。
 
     呼び出し側で try/except すること（AGENTS.md はあくまで補助・書込に失敗しても Codex 実行自体は
     継続してよい＝fail-open。プロンプト側には containment/grounding の短縮形を常置してあるので、
     失敗時もプロンプトの質問固有部分＋短縮ルールだけで動くことを前提にする）。
+
+    `output_schema`（既定 False）が真のときだけ、構造化最終応答（`status`／`answer`／`next_step`）を
+    求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
 
     RV MEDIUM（2026-07-03）: 単純な `Path.write_text()` は既存の `AGENTS.md` が symlink だった場合に
     その**指す先へ**書き込んでしまう（authoring 配下の想定外の場所を書き換え得る）。
@@ -53,12 +69,13 @@ def write_agents_md(authoring: Path) -> None:
     （`rename`/`replace` はディレクトリエントリの張替えでシンボリックリンクを一切追従しない＝
     既存 AGENTS.md が symlink でも安全に「通常ファイルの AGENTS.md」へ置き換わる）。
     """
+    content = AGENTS_MD + (_STRUCTURED_RESPONSE_PARAGRAPH if output_schema else "")
     target = authoring / "AGENTS.md"
     tmp = authoring / f".AGENTS.md.tmp-{os.urandom(6).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(tmp), flags, 0o644)
     try:
-        os.write(fd, AGENTS_MD.encode("utf-8"))
+        os.write(fd, content.encode("utf-8"))
     finally:
         os.close(fd)
     try:

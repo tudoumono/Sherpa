@@ -251,14 +251,16 @@ def test_resolve_world_entity_shape_unchanged():
     `run_world_impact` が直後に呼ぶ `world_impact` 側で1回だけ確認する・重複ラウンドトリップの
     解消）——`session.run` 呼び出し総数は1のまま。
     """
-    rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}]
+    rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE", "path": "gen1/D.cbl"}]
     s = _FakeSession([rows])
     starts = wn.resolve_world_entity(s, "TAX-RATE", "w1")
     assert len(s.calls) == 1
     assert "MATCH (n:Entity {world_id:$w}) WHERE n.name=$name" in s.calls[0][0].text
     by = {x["canonical_id"]: x for x in starts}
     assert set(by) == {"dataitem:w1:D"}
-    assert by["dataitem:w1:D"] == {"canonical_id": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}
+    # `path`（RV波1是正）: 同名の起点候補を呼び出し側が区別できるよう追加（既存キーは不変）。
+    assert by["dataitem:w1:D"] == {"canonical_id": "dataitem:w1:D", "label": "DataItem",
+                                   "name": "TAX-RATE", "path": "gen1/D.cbl"}
 
 
 def test_run_world_impact_probes_schema_era_exactly_once():
@@ -266,7 +268,7 @@ def test_run_world_impact_probes_schema_era_exactly_once():
     `world_impact` の合成）は世代プローブを1回だけ実行する——旧実装は両関数がそれぞれ独立に
     プローブしており、同じ world に対して era プローブが2回連続で走っていた（重複ラウンド
     トリップ）。"""
-    resolve_rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE"}]
+    resolve_rows = [{"cid": "dataitem:w1:D", "label": "DataItem", "name": "TAX-RATE", "path": "gen1/D.cbl"}]
     impact_rows = [_impact_row("cid:a", "NODE-A")]
     era_rows = {"c": 1, "era": wn.GRAPH_SCHEMA_ERA}
 

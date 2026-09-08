@@ -12,8 +12,6 @@ OllamaProvider
 OpenAIProvider
 Path
 Provider
-_AUTHORING_LOCKS
-_AUTHORING_LOCKS_GUARD
 _AUTHOR_FALLBACK_NOTE
 _BEARER_RE
 _BEDROCK_ENV_KEYS
@@ -21,6 +19,7 @@ _BEDROCK_LIST_TIMEOUT
 _BEDROCK_MAX_TOKENS
 _BEDROCK_MODEL
 _BEDROCK_PROFILE_REGION_LABEL
+_CONTINUE_PROMPT
 _GenProvider
 _LAST_MESSAGE_MAX_BYTES
 _LENS_INTENT
@@ -34,10 +33,10 @@ _SKILLS_BASE
 _TOOLS
 _UnwiredProvider
 _abs_kb_or_derived
+_accumulate_codex_usage
 _answer_prompt
 _anthropic_usage_raw
 _apply_codex_neighbors
-_authoring_lock
 _bedrock_auth_available
 _bedrock_error_detail
 _bedrock_list_error_message
@@ -67,6 +66,7 @@ _marp_bin
 _mcp_config_args
 _mcp_env
 _mcp_neighbors_from
+_needs_continuation
 _node
 _openai_usage
 _pick_codex_headline

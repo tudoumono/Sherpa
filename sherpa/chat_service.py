@@ -973,29 +973,41 @@ def _is_codex_timed_out_partial(env: dict) -> bool:
     return bool(env.get("codex_timed_out"))
 
 
+def _is_codex_stopped_early(env: dict) -> bool:
+    """Codex CLI が正常終了（timeout ではない）したにもかかわらず、自動継続を尽くしてもなお
+    agent_message が作業宣言だけ（結論に届かなかった）で終わったターンかどうか
+    （`providers/codex/provider.py::_run_authoring` が直接立てる `env["codex_stopped_early"]`）。
+
+    `_is_codex_timed_out_partial` と同型のガード（timeout とは別の切り口の「途中結果」・両者が
+    同時に立つことは無い）。出典0件と重なっても「恒久的に見つからない」とは違うため、`_finalize`
+    の断定文言で headline を上書きしない。"""
+    return bool(env.get("codex_stopped_early"))
+
+
 def _finalize(env, decision):
     env["lens"] = decision["lens"]
     env["route"] = {"lens": decision["lens"], "reason": decision["reason"],
                     "path": _ROUTE_PATH.get(decision["lens"], [])}
     _codex_timed_out = _is_codex_timed_out_partial(env)
+    _codex_stopped_early = _is_codex_stopped_early(env)
     if _no_genuine_results(env):
         hints = _retry_hints(env)
         if hints:
             env["retry_hints"] = hints
         elif (decision["lens"] in ("qa", "author") and not _is_budget_exhausted(env)
-              and not _codex_timed_out):
+              and not _codex_timed_out and not _codex_stopped_early):
             # 全軸が既に最も緩い設定（全体・資料＋コード・最大）でなお0件＝これ以上緩める軸が無い
             # （§5・RV1 #9・SC-6c で調べる深さの軸を追加）。予算到達の途中結果（STOP-1）・Codex
-            # タイムアウトの途中結果はいずれも「見つからなかった」ではないため上書きしない。
-            # impact/troubleshoot は層の概念が無く既存の headline が十分具体的なため対象外にする
-            # （`_answer_impact`/`_answer_troubleshoot` は変更しない）。
+            # タイムアウト／作業宣言止まりの途中結果はいずれも「見つからなかった」ではないため
+            # 上書きしない。impact/troubleshoot は層の概念が無く既存の headline が十分具体的なため
+            # 対象外にする（`_answer_impact`/`_answer_troubleshoot` は変更しない）。
             env["headline"] = _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
-    if _codex_timed_out:
+    if _codex_timed_out or _codex_stopped_early:
         # SC-6d と同じボタン機構（retry_hints・data-retry-kind）に載せる——0件案内の hints とは
         # 独立に常に追加する（0件でも中身があっても「続きから調べ直せる」こと自体は変わらない）。
         # クリック時の送信は kind="resume" 専用分岐（web/chat.js）が扱う＝直前の質問を広げて
         # 再送する他の kind とは別系統（固定文言をそのまま送るだけ・resume は codex_session_id
-        # 継続に委ねる）。
+        # 継続に委ねる）。両フラグが同時に立つことは無いが、立っていても hint は1件だけ（or で束ねる）。
         env.setdefault("retry_hints", []).append(
             {"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}})
     return env
@@ -1294,6 +1306,9 @@ def handle_message(session, message, world="v1",
     # R1b（Codex ネイティブ resume）: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に
     # 渡す（resume 判定用・他 provider は無視）。history と同じく質問保存より前に読む。
     codex_session_id = store.get_session_id(conversation_id)
+    # 直近 assistant メッセージが記録した Codex 累計 usage（resume ターンの usage をターン差分に
+    # するための前ターン値・CodexProvider だけが消費する）。
+    codex_usage_prev_total = store.get_codex_usage_total(conversation_id)
     # RV BLOCKER: トグル ON のターンは、**保存時点で**質問を個人扱いにし、**provider 実行前に**会話も個人扱いにする
     #   （in-flight で共有されても質問が漏れない／clarify で _result に至らなくても未マークにならない）。
     _user_msg = store.add_message(conversation_id, "user", message, personal=personal)
@@ -1353,6 +1368,7 @@ def handle_message(session, message, world="v1",
               # R1a: 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。
               # R1b: conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
               history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
+              codex_usage_prev_total=codex_usage_prev_total,
               # SC-6e: ターン先頭で1回だけ計算した可用性 snapshot を provider まで渡す。
               tools_availability=tools_availability)
     # S3: stream_message と同じく node を id で dedup 蓄積し、trace として保存する（非ストリーミング経路の対称）。
@@ -1371,6 +1387,7 @@ def handle_message(session, message, world="v1",
             trace_nodes[ev["id"]] = ev
     env = _finalize(result["env"], result["decision"])
     _pop_evidence_committed(env, trace_nodes)   # _result のサイドカーを trace へ折り込む（孤児イベント防止）
+    env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない
     env["trace_version"] = 2
     # R1b: CodexProvider が捕捉/更新した session id を返してきたら会話に永続化する（次ターンの resume 用）。
     # fail-open（保存に失敗しても本ターンの回答自体は成立させる＝次回は resume 不可のまま priming に委ねる）。
@@ -1460,6 +1477,9 @@ def stream_message(session, message, world="v1",
     # R1b（Codex ネイティブ resume）: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に
     # 渡す（resume 判定用・他 provider は無視）。history と同じく質問保存より前に読む。
     codex_session_id = store.get_session_id(conversation_id)
+    # 直近 assistant メッセージが記録した Codex 累計 usage（resume ターンの usage をターン差分に
+    # するための前ターン値・CodexProvider だけが消費する）。
+    codex_usage_prev_total = store.get_codex_usage_total(conversation_id)
     # RV BLOCKER: トグル ON のターンは、**保存時点で**質問を個人扱いにし、**provider 実行前に**会話も個人扱いにする
     #   （in-flight で共有されても質問が漏れない／clarify で _result に至らなくても未マークにならない）。
     _user_msg = store.add_message(conversation_id, "user", message, personal=personal)
@@ -1530,6 +1550,7 @@ def stream_message(session, message, world="v1",
         # R1a: 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。
         # R1b: conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
         history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
+        codex_usage_prev_total=codex_usage_prev_total,
         # SC-6e: ターン先頭で1回だけ計算した可用性 snapshot を provider まで渡す。
         tools_availability=tools_availability,
     )
@@ -1556,6 +1577,7 @@ def stream_message(session, message, world="v1",
             env = _finalize(ev["env"], ev["decision"])
             # _result のサイドカーを trace へ折り込む（孤児イベント防止・下で永続化後にライブ配信もする）。
             _ev_committed_node = _pop_evidence_committed(env, trace_nodes)
+            env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない
             env["trace_version"] = 2
             # R1b: CodexProvider が捕捉/更新した session id を会話に永続化する（次ターンの resume 用）。
             # fail-open（保存に失敗しても本ターンの回答自体は成立させる＝次回は resume 不可のまま priming に委ねる）。

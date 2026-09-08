@@ -179,7 +179,8 @@ $('brainmenu').addEventListener('click', (e) => {
 document.addEventListener('click', (e) => { if (!e.target.closest('.brainwrap')) $('brainmenu').hidden = true; });
 
 // ===== チャット欄のみ文字サイズ（#5・localStorage 保持）=====
-const FONTS = [['小', '13px'], ['標準', '14.5px'], ['大', '16.5px'], ['特大', '19px']];
+const FONTS = [['小', 'var(--chatfont-small)'], ['標準', 'var(--chatfont-standard)'],
+  ['大', 'var(--chatfont-large)'], ['特大', 'var(--chatfont-largest)']];
 let _font = localStorage.getItem('sherpa-chatfont') || '標準';
 function applyFont() {
   const f = FONTS.find((x) => x[0] === _font) || FONTS[1];
@@ -196,6 +197,56 @@ $('fontmenu').addEventListener('click', (e) => {
 });
 document.addEventListener('click', (e) => { if (!e.target.closest('.fontsel')) $('fontmenu').hidden = true; });
 applyFont();
+
+// 履歴の補助操作。既存の data-rename/-pin/-sharecid/-del の委譲先は変えない。
+function closeConversationMenu(restoreFocus = false) {
+  const trigger = $('convlist').querySelector('[data-conv-menu][aria-expanded="true"]');
+  if (!trigger) return;
+  $(trigger.getAttribute('aria-controls')).hidden = true;
+  trigger.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) trigger.focus();
+}
+$('convlist').addEventListener('click', (e) => {
+  const trigger = e.target.closest('[data-conv-menu]');
+  if (trigger) {
+    const wasOpen = trigger.getAttribute('aria-expanded') === 'true';
+    closeConversationMenu();
+    if (wasOpen) return;
+    const menu = $(trigger.getAttribute('aria-controls'));
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    const rect = trigger.getBoundingClientRect();
+    menu.style.left = Math.max(8, Math.min(rect.left, innerWidth - menu.offsetWidth - 8)) + 'px';
+    menu.style.top = Math.max(8, Math.min(rect.bottom + 4, innerHeight - menu.offsetHeight - 8)) + 'px';
+    menu.querySelector('button').focus();
+  } else if (e.target.closest('.cacts button')) {
+    closeConversationMenu(true);
+  }
+});
+$('convlist').addEventListener('keydown', (e) => {
+  const menu = e.target.closest('.cacts');
+  if (e.key === 'Escape') {
+    if (!$('convlist').querySelector('[data-conv-menu][aria-expanded="true"]')) return;
+    e.preventDefault();
+    closeConversationMenu(true);
+  } else if (menu && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+    e.preventDefault();
+    const buttons = [...menu.querySelectorAll('button')];
+    const index = buttons.indexOf(document.activeElement);
+    const next = e.key === 'Home' ? 0 : e.key === 'End' ? buttons.length - 1
+      : (index + (e.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+    buttons[next].focus();
+  }
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.cacts, [data-conv-menu]')) closeConversationMenu();
+});
+document.addEventListener('focusin', (e) => {
+  if (!e.target.closest('.cacts, [data-conv-menu]')) closeConversationMenu();
+});
+// スクロールやリサイズ後にトリガーと離れた位置へメニューを残さない。
+$('convlist').closest('.pane-body').addEventListener('scroll', () => closeConversationMenu(true));
+window.addEventListener('resize', () => closeConversationMenu(true));
 
 // ===== エクスポート（#6・会話全体＋回答単位／Markdown・テキスト・JSON・PDF(印刷)）=====
 function _stamp() {

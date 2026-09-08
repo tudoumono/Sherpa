@@ -23,6 +23,9 @@ import {
   loadConversations, deleteConversation, togglePin, renameConversation,
   newConversation, openConversation, resumeRunningTurn, forkConversation,
 } from './chat/history.js';
+// H2（左ペイン履歴検索）: 副作用のみの import（#hist-search の配線・#convlist 再描画の監視は
+// history-search.js 内で完結し、history.js には触れない＝束縛する名前は無い）。
+import './chat/history-search.js';
 import { send, sendOrStop, _closeOtherTurns } from './chat/stream.js';
 import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel } from './chat/scope.js';
 import { setLayer, setDepthProfile, setTools, setToolsAvailability, resetInquiryForNewConversation, refreshInquirySummary, toolsExplicitForRestore } from './chat/inquiry.js';
@@ -225,10 +228,12 @@ $('flow').addEventListener('click', (e) => {
   h.setAttribute('aria-expanded', open ? 'true' : 'false');
 });
 $('convlist').addEventListener('click', (e) => {
+  if (e.target.closest('[data-conv-menu]')) return;
   const rn = e.target.closest('[data-rename]'); if (rn) { e.stopPropagation(); return renameConversation(Number(rn.dataset.rename), rn.dataset.title || ''); }
   const del = e.target.closest('[data-del]'); if (del) { e.stopPropagation(); return deleteConversation(Number(del.dataset.del)); }
   const pin = e.target.closest('[data-pin]'); if (pin) { e.stopPropagation(); return togglePin(Number(pin.dataset.pin), pin.dataset.pinned !== '1'); }
   const sh = e.target.closest('[data-sharecid]'); if (sh) { e.stopPropagation(); return openShareDialog(Number(sh.dataset.sharecid), sh.dataset.title || ''); }
+  if (e.target.closest('.cacts')) return;
   const c = e.target.closest('[data-open]');
   if (c) {
     if (c.dataset.inactive === '1') {

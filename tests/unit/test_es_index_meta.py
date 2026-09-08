@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
 from sherpa import es_index
 
@@ -781,6 +783,85 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
     hits, reason = es_index.search("w", "query")
     assert reason == "hybrid_query_failed"
     assert hits and hits[0]["doc_id"] == "a.md"   # BM25 の hits はそのまま返る（空にならない）
+
+
+def _mismatch_search_env(monkeypatch, *, meta, bm25_fails=False):
+    """索引 `_meta` を `meta` に固定し、埋め込み設定は openai/m/3 で解決済み。クエリ埋め込みが
+    呼ばれたら失敗させる（不一致時は呼ばれない契約）。"""
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index.embeddings, "cfg",
+                        lambda settings=None, **kw: {"provider": "openai", "model": "m", "dim": 3})
+    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
+    embed_calls = []
+
+    def _embed(texts, ec, **kw):
+        embed_calls.append(texts)
+        raise AssertionError("query embedding must not be called on feature mismatch")
+    monkeypatch.setattr(es_index.embeddings, "embed", _embed)
+
+    def _fake_req(method, path, body=None, **kw):
+        if method == "GET" and path.endswith("/_mapping"):
+            return {"idx": {"mappings": {"_meta": meta}}}
+        if method == "POST" and path.endswith("/_search"):
+            if bm25_fails:
+                raise RuntimeError("bm25 failed")
+            return {"hits": {"hits": [{"_source": {"doc_id": "a.md", "line": 1, "text": "hit"}, "_score": 1.0}]}}
+        return {}
+    monkeypatch.setattr(es_index, "_req", _fake_req)
+    return embed_calls
+
+
+@pytest.mark.parametrize("meta", [
+    {"embed_provider": "azure", "embed_model": "m", "dim": 3},      # provider 不一致
+    {"embed_provider": "openai", "embed_model": "m2", "dim": 3},    # model 不一致
+    {"embed_provider": "openai", "embed_model": "m", "dim": 1536},  # dim 不一致
+    {},                                                             # 未ベクトル索引（_meta なし）
+])
+def test_search_vector_feature_mismatch_reports_reason_keeps_bm25_and_skips_embed(monkeypatch, meta):
+    """埋め込み設定は解決済みだが索引の素性（provider/model/dim）が合わない＝`vector_feature_mismatch`
+    を注記して BM25 の hits はそのまま返す。クエリ埋め込みは呼ばない（`search_knn_only()` と同じ語彙・
+    以前は reason=None のまま BM25 へ落ちて利用者にはハイブリッド成功に見えていた）。"""
+    embed_calls = _mismatch_search_env(monkeypatch, meta=meta)
+    hits, reason = es_index.search("w", "query")
+    assert reason == "vector_feature_mismatch"
+    assert hits and hits[0]["doc_id"] == "a.md"
+    assert embed_calls == []
+
+
+def test_search_vector_false_never_reports_feature_mismatch(monkeypatch):
+    """`vector=False`（BM25 のみ・facts 統合用）は素性照合そのものをしない＝reason は常に None・
+    `_meta` も読まない・埋め込み設定も解決しない。"""
+    embed_calls = _mismatch_search_env(monkeypatch, meta={"embed_provider": "azure", "embed_model": "m", "dim": 3})
+    monkeypatch.setattr(es_index.embeddings, "cfg",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cfg must not be called")))
+    hits, reason = es_index.search("w", "query", vector=False)
+    assert reason is None and hits and embed_calls == []
+
+
+def test_search_embedding_unresolved_keeps_existing_reason_not_mismatch(monkeypatch):
+    """埋め込み設定が解決できない（ec None）＝既存の区別（`embedding_cloud_unavailable`／None）を
+    維持し、不一致理由で上書きしない。"""
+    _mismatch_search_env(monkeypatch, meta={"embed_provider": "azure", "embed_model": "m", "dim": 3})
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
+    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: True)
+    _, reason = es_index.search("w", "query")
+    assert reason == "embedding_cloud_unavailable"
+    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
+    _, reason = es_index.search("w", "query")
+    assert reason is None
+
+
+def test_search_feature_mismatch_with_bm25_failure_prefers_es_query_failed(monkeypatch):
+    """不一致に加えて BM25 自体も失敗＝hits が空になる理由 `es_query_failed` を優先する。"""
+    _mismatch_search_env(monkeypatch, meta={"embed_provider": "openai", "embed_model": "m", "dim": 8},
+                         bm25_fails=True)
+    hits, reason = es_index.search("w", "query")
+    assert hits == [] and reason == "es_query_failed"
+
+
+def test_degrade_vocabulary_includes_vector_feature_mismatch():
+    from sherpa import search_service
+    assert "vector_feature_mismatch" in search_service.DEGRADE_REASONS
 
 
 def test_degrade_vocabulary_includes_hybrid_query_failed():

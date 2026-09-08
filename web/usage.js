@@ -579,7 +579,7 @@ function detailHTML(u) {
       <div class="g"><b>${(u.downloads || 0).toLocaleString('ja-JP')}</b><span>原本ダウンロード</span></div>
       <div class="g"><b>${(u.uploads || 0).toLocaleString('ja-JP')}</b><span>個人ファイルアップロード</span></div>
       <div class="g"><b>${(u.shares || 0).toLocaleString('ja-JP')}</b><span>会話共有の発行</span></div>
-      <div class="g"><b style="font-size:11.5px">${worlds}</b><span>利用フォルダ</span></div>
+      <div class="g"><b style="font-size:var(--text-caption)">${worlds}</b><span>利用フォルダ</span></div>
     </div>`;
 }
 

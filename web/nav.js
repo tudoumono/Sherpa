@@ -44,19 +44,75 @@
   // ここに保持して applyHealth から参照する（クリックで詳細リンク・title の出し分け用）。
   let _isAdminUser = false;
 
+  // タブの折りたたみ。横幅に収まらないタブは右端の「その他 ▾」の下（#navmenu）へ移す＝隠しスクロールで
+  // 切って見えなくしない。不変条件: <a> 要素は移動するだけ（複製・再生成しない）ので href／現在ページの
+  // `.on`／テストのセレクタ（`.nav a[href=…]`）は置き場が変わっても同じ。極端に狭いときは全タブを畳み、
+  // ボタンだけは必ず表示範囲に残す（ボタンが切れると畳んだタブへ到達できない）。
+  // 判定は #navlist（overflow:hidden）の scrollWidth > clientWidth。
+  function fitNav() {
+    const list = document.getElementById('navlist');
+    const more = document.getElementById('navmore');
+    const menu = document.getElementById('navmenu');
+    if (!list || !more || !menu) return;
+    closeNavMenu();
+    while (menu.firstChild) list.insertBefore(menu.firstChild, more);   // いったん全部リストへ戻して測り直す
+    more.hidden = true;
+    more.classList.remove('on');
+    if (list.scrollWidth <= list.clientWidth) return;
+    more.hidden = false;                                                 // ボタン自身の幅も含めて収まるまで末尾から畳む
+    const links = Array.from(list.querySelectorAll(':scope > a'));
+    while (list.scrollWidth > list.clientWidth && links.length > 0) {
+      menu.insertBefore(links.pop(), menu.firstChild);                   // 末尾から前へ詰めるので元の並び順を保つ
+    }
+    more.classList.toggle('on', !!menu.querySelector('a.on'));           // 現在ページが畳まれている間はボタンを強調
+  }
+  // /auth/me 後に足すリンクは並びの末尾。既に末尾側が畳まれていればメニューの末尾へ足す（リストの
+  // ボタン手前へ挟むと、次の fitNav で畳まれていたタブがその後ろへ戻り、順序が入れ替わる）。
+  function addNavLink(href, label, here) {
+    const list = document.getElementById('navlist');
+    const more = document.getElementById('navmore');
+    const menu = document.getElementById('navmenu');
+    if (!list) return;
+    const a = document.createElement('a');
+    if (href === here) a.className = 'on';
+    a.href = href;
+    a.textContent = label;
+    if (menu && menu.childElementCount) menu.appendChild(a);
+    else list.insertBefore(a, more && more.parentNode === list ? more : null);
+  }
+  function openNavMenu() {
+    const more = document.getElementById('navmore');
+    const menu = document.getElementById('navmenu');
+    if (!more || !menu) return;
+    menu.hidden = false;
+    // ボタンの右端に揃える（ボタンはリストの右端＝メニューがナビの外へはみ出さない）。左は 0 で止める。
+    menu.style.left = Math.max(0, more.offsetLeft + more.offsetWidth - menu.offsetWidth) + 'px';
+    more.setAttribute('aria-expanded', 'true');
+  }
+  function closeNavMenu() {
+    const more = document.getElementById('navmore');
+    const menu = document.getElementById('navmenu');
+    if (menu) menu.hidden = true;
+    if (more) more.setAttribute('aria-expanded', 'false');
+  }
+
   class SherpaTopbar extends HTMLElement {
     connectedCallback() {
       const here = location.pathname.split('/').pop() || 'chat.html';
       this.className = 'topbar';
       this.innerHTML =
         '<div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>'
-        + '<nav class="nav" id="sherpa-nav">'
+        + '<nav class="nav" id="sherpa-nav" aria-label="ページ">'
+        + '<div class="navlist" id="navlist">'
         + LINKS.map(([href, label]) => {
             const on = href === here ? ' class="on"' : '';
             return `<a${on} href="${href}">${label}</a>`;
           }).join('')
+        + '<button class="navmore" id="navmore" type="button" hidden aria-expanded="false"'
+        + ' aria-controls="navmenu">その他 ▾</button>'
+        + '</div>'
+        + '<div class="navmenu" id="navmenu" hidden></div>'
         + '</nav>'
-        + '<div class="spacer"></div>'
         + '<a class="turnnotice" id="turnnotice" hidden></a>'
         + '<a class="healthdot" id="healthdot" title="サービス状態を確認中…" hidden></a>'
         + '<button class="iconbtn" id="themebtn" title="テーマ切替">🌙</button>'
@@ -82,25 +138,47 @@
       if (userBtn && userMenu) {
         userBtn.addEventListener('click', (e) => {
           e.stopPropagation();
+          closeNavMenu();
           const willOpen = userMenu.hidden;
           userMenu.hidden = !willOpen;
           userBtn.setAttribute('aria-expanded', String(willOpen));
         });
         userMenu.addEventListener('click', (e) => e.stopPropagation());   // メニュー内クリックで外側判定を発火させない
       }
+      // 「その他 ▾」（収まらないタブの置き場・fitNav が出し入れする）。開閉の作法はユーザーメニューと同じ。
+      const moreBtn = document.getElementById('navmore');
+      const navMenu = document.getElementById('navmenu');
+      if (moreBtn && navMenu) {
+        moreBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          closeUserMenu();
+          if (navMenu.hidden) openNavMenu(); else closeNavMenu();
+        });
+        navMenu.addEventListener('click', (e) => e.stopPropagation());
+      }
       // RV再検証 LOW: document への委譲リスナーは要素（#userwrap 等）の生死と無関係に残るため、
       // connectedCallback が複数回走っても重複登録しないよう、ハンドラをインスタンスに保持して
       // 使い回す（初回だけ生成・以降は remove→add で必ず1本にする）。ハンドラ本体は呼び出し時に
       // 都度 document.getElementById する（closure で古い DOM 参照を握らない＝再構築後も正しく動く）。
       if (!this._onDocClick) {
-        this._onDocClick = (e) => { if (!e.target.closest('#userwrap')) closeUserMenu(); };
+        this._onDocClick = (e) => {
+          if (!e.target.closest('#userwrap')) closeUserMenu();
+          if (!e.target.closest('#navmore,#navmenu')) closeNavMenu();
+        };
       }
       if (!this._onDocKeydown) {
         this._onDocKeydown = (e) => {
+          if (e.key !== 'Escape') return;
           const m = document.getElementById('usermenu');
-          if (e.key === 'Escape' && m && !m.hidden) {
+          if (m && !m.hidden) {
             closeUserMenu();
             const b = document.getElementById('topbar-user');
+            if (b) b.focus();
+          }
+          const nm = document.getElementById('navmenu');
+          if (nm && !nm.hidden) {
+            closeNavMenu();
+            const b = document.getElementById('navmore');
             if (b) b.focus();
           }
         };
@@ -109,6 +187,20 @@
       document.removeEventListener('keydown', this._onDocKeydown);
       document.addEventListener('click', this._onDocClick);
       document.addEventListener('keydown', this._onDocKeydown);
+      // 幅が変わったら畳み直す（ウィンドウ幅・右側の「実行中」バッジや状態ドットの出入り・狭幅でのブランド副題非表示）。
+      // .nav は topbar の余白を独占する flex:1 なので、タブの出し入れ自体では .nav の幅は変わらない＝自己再発火しない。
+      const navEl = document.getElementById('sherpa-nav');
+      if (typeof ResizeObserver === 'function') {
+        if (!this._navResize) this._navResize = new ResizeObserver(() => fitNav());
+        this._navResize.disconnect();
+        if (navEl) this._navResize.observe(navEl);   // observe 直後の初回通知で最初の畳み込みが走る
+      } else {
+        if (!this._onWinResize) this._onWinResize = () => fitNav();
+        window.removeEventListener('resize', this._onWinResize);
+        window.addEventListener('resize', this._onWinResize);
+        fitNav();
+      }
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitNav, () => {});   // フォント確定で幅が変わる
       const logoutBtn = document.getElementById('um-logout');
       if (logoutBtn) logoutBtn.addEventListener('click', async () => {
         if (!confirm('ログアウトしますか？')) return;
@@ -242,29 +334,11 @@
         if (umChangePw) umChangePw.hidden = authOff;
         if (umLogout) umLogout.hidden = authOff;
         if (umNote) umNote.hidden = !authOff;
-        const nav = document.getElementById('sherpa-nav');
         // ログイン済み全員にマイワークスペースリンクを追加。
-        if (nav) {
-          USER_LINKS.forEach(([href, label]) => {
-            const a = document.createElement('a');
-            if (href === here) a.className = 'on';
-            a.href = href;
-            a.textContent = label;
-            nav.appendChild(a);
-          });
-        }
+        USER_LINKS.forEach(([href, label]) => addNavLink(href, label, here));
         // admin ロールなら管理リンクをナビに追加。
-        if (u.role === 'admin') {
-          if (nav) {
-            ADMIN_LINKS.forEach(([href, label]) => {
-              const a = document.createElement('a');
-              if (href === here) a.className = 'on';
-              a.href = href;
-              a.textContent = label;
-              nav.appendChild(a);
-            });
-          }
-        }
+        if (u.role === 'admin') ADMIN_LINKS.forEach(([href, label]) => addNavLink(href, label, here));
+        fitNav();
         // 健全性ドットの「クリックで詳細」表示を役割判明直後に反映（非 admin は false へ
         // 戻し、再接続・ロール変更で admin 表示が残留しないようにする）。
         _isAdminUser = (u.role === 'admin');
@@ -275,6 +349,8 @@
     disconnectedCallback() {
       if (this._onDocClick) document.removeEventListener('click', this._onDocClick);
       if (this._onDocKeydown) document.removeEventListener('keydown', this._onDocKeydown);
+      if (this._navResize) this._navResize.disconnect();
+      if (this._onWinResize) window.removeEventListener('resize', this._onWinResize);
     }
   }
   if (!customElements.get('sherpa-topbar')) customElements.define('sherpa-topbar', SherpaTopbar);

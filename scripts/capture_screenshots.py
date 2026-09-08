@@ -207,13 +207,10 @@ def _scene_graph(page):
 
 
 def _scene_graph_search(page):
-    # 初期グラフの cose レイアウト（animate:true）が終わってから検索させる。
-    # 検索は renderGraph 内で cy.destroy() するため、アニメ中に叩くと cytoscape が
-    # null renderer に notify して落ちる（ページ内 JS エラー）。
     page.wait_for_function(
         "() => (document.getElementById('gcount')?.textContent || '').includes('ノード')",
         timeout=15000)
-    page.wait_for_timeout(1800)
+    page.locator(".gconditions summary").click()
     page.wait_for_selector("#relfilter option[value='COPIES']", state="attached", timeout=10000)
     page.select_option("#relfilter", "COPIES")
     page.click("#gfilter")
@@ -231,6 +228,8 @@ def _scene_graph_ask(page):
     page.wait_for_function(
         "() => (document.getElementById('ganswer')?.textContent || '').trim().length > 0",
         timeout=10000)
+    # サイドバーはスクロールするので、質問セクションを先頭に寄せてから撮る（回答と根拠が下端で切れない）。
+    page.evaluate("document.querySelector('.graphlegend section:has(#ganswer)').scrollIntoView({block:'start'})")
 
 
 def _scene_settings(page):

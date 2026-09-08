@@ -16,19 +16,19 @@
   .embedded .topbar,.embedded nav{display:none}
   .embedded .wrap{padding-top:8px}
   /* 全体バナー */
-  .status-pill{font-size:14px;font-weight:700;padding:7px 16px;border-radius:999px;white-space:nowrap}
+  .status-pill{font-size:var(--text-body);font-weight:700;padding:7px 16px;border-radius:999px;white-space:nowrap}
   .status-pill.ok{background:var(--ok-bg);color:var(--ok)}
   .status-pill.warn{background:var(--warn-bg);color:var(--warn)}
   .status-pill.danger{background:var(--danger-bg);color:var(--danger)}
   /* コンポーネント表 */
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{text-align:left;font-size:11px;font-weight:600;color:var(--ink-3);padding:7px 10px;
+  table{width:100%;border-collapse:collapse;font-size:var(--text-label)}
+  th{text-align:left;font-size:var(--text-small);font-weight:600;color:var(--ink-3);padding:7px 10px;
     border-bottom:2px solid var(--border);white-space:nowrap}
   td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:top}
   tr:hover td{background:var(--surface-2)}
   .state-cell{white-space:nowrap;font-weight:600}
-  .detail-cell{max-width:320px;word-break:break-all;font-family:var(--font-code,monospace);font-size:11px;color:var(--ink-3)}
-  .hint-cell{max-width:280px;font-size:11.5px;color:var(--ink-3)}
+  .detail-cell{max-width:320px;word-break:break-all;font-family:var(--font-code,monospace);font-size:var(--text-caption);color:var(--ink-3)}
+  .hint-cell{max-width:280px;font-size:var(--text-caption);color:var(--ink-3)}
   .latency-cell{text-align:right;color:var(--ink-3);font-variant-numeric:tabular-nums}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
@@ -40,8 +40,8 @@
 <div class="wrap">
   <div id="access-denied">
     <div style="font-size:32px;margin-bottom:12px">🚫</div>
-    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
-    <div style="font-size:13px">管理者権限が必要です。</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
   </div>
   <div id="main-content">
     <div class="pagehead">

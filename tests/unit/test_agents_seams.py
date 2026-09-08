@@ -82,7 +82,7 @@ def test_gather_seam_intercepted_by_gen_provider(monkeypatch):
     """`agents._gather` の monkeypatch が `_GenProvider.run()`（base.py 側の呼び出し・facade 実行時解決）
     にも効くことを確認する（RV LOW 2026-07-14: Heuristic 経由のテストだけでは base.py 側の
     ローカル束縛化の退行を直接検知できない指摘の回収。CodexProvider._run_authoring 経由は
-    `tests/unit/test_agents_author.py::test_authoring_lock_released_on_generator_close` が検知器）。
+    `tests/unit/test_agents_author.py::test_gather_seam_intercepted_by_codex_provider` が検知器）。
 
     `_stream` をスタブ化した最小サブクラスで駆動する（HTTP なし・`make_sources=None` なので
     agentic 分岐は通らず `_gather` 経路に直行する）。

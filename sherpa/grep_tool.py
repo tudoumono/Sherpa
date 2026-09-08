@@ -459,7 +459,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 # 「コード」と見なさない）。ほとんどの拡張子（登録済みコード拡張子でも既定 accepts
                 # のみなら）は候補が無い/内容を読まないので判定コストは増えない。
                 verdict = corpus_docs.classify_document(
-                    rel, Path(rel).suffix.lower(), lambda p=p: corpus_docs._read_head(p))
+                    rel, Path(rel).suffix.lower(),
+                    lambda p=p, size=4096: corpus_docs._read_head(p, size))
                 if verdict["kind"] == "unreadable":
                     continue
                 if verdict["kind"] != "code" and verdict.get("doctype") is None:
@@ -475,7 +476,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 # `_GREP_FILE_CAP_BYTES` まで検索する）。黙って消さず、`truncated_docs`
                 # （打ち切られた文書 doc_id の既存申告流儀）へ伝える——ヒットが1件も無い打切りも
                 # 無音にしない、という既存契約と同じ扱い。
-                if verdict.get("doctype") in (text_kind.CODE_DOCTYPE_LABEL, text_kind.DOCUMENT_DOCTYPE_LABEL):
+                # 登録アナライザ対象（`kind=="code"`）も台帳・グラフと同じ上限で除外する（台帳では
+                # `size_exceeded` で unreadable なのに grep だけヒットする矛盾を作らない）。
+                if (verdict["kind"] == "code"
+                        or verdict.get("doctype") in (text_kind.CODE_DOCTYPE_LABEL, text_kind.DOCUMENT_DOCTYPE_LABEL)):
                     try:
                         oversize = p.stat().st_size > text_kind.MAX_BYTES
                     except OSError:

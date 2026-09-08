@@ -94,9 +94,9 @@ async function loadShareExistingList(cid) {
   try {
     const shares = await (await fetch(`/conversations/${cid}/shares`)).json();
     html = shares.length ? shares.map(_shareExistingRowHTML).join('')
-      : '<div class="muted" style="font-size:12px">まだ共有していません</div>';
+      : '<div class="muted" style="font-size:var(--text-small)">まだ共有していません</div>';
   } catch (_) {
-    html = '<div class="muted" style="font-size:12px">共有一覧を読み込めませんでした</div>';
+    html = '<div class="muted" style="font-size:var(--text-small)">共有一覧を読み込めませんでした</div>';
   }
   // 世代チェック（history.js の resumeRunningTurn と同型）: この fetch の await 中に、別の
   // 呼び出し（取消/更新/発行直後の再取得・ダイアログの開き直し）がさらに新しい世代を進めていたら、
@@ -105,6 +105,12 @@ async function loadShareExistingList(cid) {
   const overlay = document.getElementById('share-overlay');
   if (gen !== _shareListGen || !overlay || overlay.dataset.cid !== String(cid)) return;
   box.innerHTML = html;
+}
+
+let shareReturnSelector;
+function closeShareDialog() {
+  document.getElementById('share-overlay').hidden = true;
+  document.querySelector(shareReturnSelector).focus();
 }
 
 export function openShareDialog(cid, title) {
@@ -125,7 +131,11 @@ export function openShareDialog(cid, title) {
   renderInviteeChips();
   hideInviteeSuggest();
   overlay.dataset.cid = String(cid);
+  // 背景ターン完了で履歴DOMが再描画されても、現在のトリガーへ戻す。
+  shareReturnSelector = document.activeElement.matches('[data-conv-menu]')
+    ? `[data-conv-menu="${document.activeElement.dataset.convMenu}"]` : '#sharebtn';
   overlay.hidden = false;
+  document.getElementById('share-invitees').focus();
   loadShareExistingList(cid);
 }
 
@@ -138,9 +148,24 @@ export function openShareDialog(cid, title) {
   if (!overlay) return;
 
   // overlay 外クリックで閉じる
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.hidden = true; });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeShareDialog(); });
   const closeBtn = document.getElementById('share-close');
-  if (closeBtn) closeBtn.addEventListener('click', () => { overlay.hidden = true; });
+  if (closeBtn) closeBtn.addEventListener('click', closeShareDialog);
+  overlay.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !e.defaultPrevented) {
+      e.preventDefault();
+      closeShareDialog();
+    } else if (e.key === 'Tab') {
+      const items = [...overlay.querySelectorAll('button,input,select,a[href]')]
+        .filter((el) => !el.disabled && el.getClientRects().length);
+      const first = items[0], last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault(); first.focus();
+      }
+    }
+  });
 
   // コピーボタン
   document.getElementById('share-copy')?.addEventListener('click', () => {

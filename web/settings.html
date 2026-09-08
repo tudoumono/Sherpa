@@ -11,18 +11,18 @@
 <script src="nav.js"></script>
 <style>
   .wrap2{max-width:none;margin:0}
-  .frm label{display:block;font-size:13px;font-weight:600;color:var(--ink,#1f2937);margin:14px 0 4px}
-  .frm input,.frm select,.frm textarea{width:100%;box-sizing:border-box;font-family:inherit;font-size:14px;
-    padding:8px 10px;border:1px solid var(--border,#e3e6ea);border-radius:8px;
+  .frm label{display:block;font-size:var(--text-label);font-weight:600;color:var(--ink,#1f2937);margin:14px 0 4px}
+  .frm input,.frm select,.frm textarea{width:100%;box-sizing:border-box;font-family:inherit;font-size:var(--text-body);
+    padding:8px 10px;border:1px solid var(--control-border);border-radius:8px;
     background:var(--surface,#fff);color:var(--ink,#1f2937)}
   .frm textarea{resize:vertical}
-  .hint{font-size:12.5px;color:var(--ink-2,#5b6573);margin-top:4px}
+  .hint{font-size:var(--text-small);color:var(--ink-2,#5b6573);margin-top:4px}
   .grp{border:1px solid var(--border,#e3e6ea);border-radius:10px;padding:6px 14px 14px;margin-top:14px}
-  .grp h3{font-size:13px;margin:12px 0 0;color:var(--ink-2,#5b6573)}
+  .grp h3{font-size:var(--text-label);margin:12px 0 0;color:var(--ink-2,#5b6573)}
   .testrow{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
-  .tres{font-size:12.5px} .ok{color:var(--ok,#16a34a)} .danger{color:var(--danger,#dc2626)} .muted{color:var(--ink-3,#8b95a3)}
-  .linkbtn{background:none;border:none;color:var(--accent-ink,#0f766e);cursor:pointer;font-size:12px;padding:0;margin-left:8px}
-  .mini{height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);font-size:12.5px;color:var(--ink-2);cursor:pointer}
+  .tres{font-size:var(--text-small)} .ok{color:var(--ok,#16a34a)} .danger{color:var(--danger,#dc2626)} .muted{color:var(--ink-3,#8b95a3)}
+  .linkbtn{background:none;border:none;color:var(--accent-ink,#0f766e);cursor:pointer;font-size:var(--text-small);padding:0;margin-left:8px}
+  .mini{min-height:36px;padding:0 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);font-size:var(--text-small);color:var(--ink-2);cursor:pointer}
   /* 保存アクションバー: ページ下端に固定（スクロール位置に関わらず常に見える）。
      控えめな装飾（背景ぼかし＋上境界線のみ）で両テーマに馴染ませる。settings.js は #save/#msg の
      id のみ参照するため、ここでの配置変更はロジックに影響しない。 */
@@ -35,19 +35,28 @@
   /* 固定バーの高さぶん、最後のカードが隠れないように余白を確保。 */
   .wrap2.frm{padding-bottom:76px}
   /* 外部連携（自分の API キー）カード */
-  .ek-table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
+  .ek-table{width:100%;border-collapse:collapse;font-size:var(--text-label);margin-top:8px}
   .ek-table th,.ek-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
-  .ek-table th{color:var(--ink-3);font-weight:600;font-size:11.5px}
+  .ek-table th{color:var(--ink-3);font-weight:600;font-size:var(--text-small)}
   .ek-table td.ek-muted{color:var(--ink-3)}
-  .ek-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px}
+  .ek-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:var(--text-caption)}
   .ek-badge.ek-active{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
   .ek-badge.ek-revoked,.ek-badge.ek-expired{background:color-mix(in srgb,var(--ink-3) 16%,transparent);color:var(--ink-3)}
   .mini.ek-danger{color:var(--danger);border-color:var(--danger)}
-  #ek-issue-form label{font-size:12px;color:var(--ink-3);display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
-  #ek-issue-form input{padding:6px 8px;font-size:13px;font-family:inherit;
-    border:1px solid var(--border);border-radius:var(--radius,8px);background:var(--surface);color:var(--ink)}
-  #ek-reveal-key{font-size:13px;word-break:break-all;padding:10px;border:1px solid var(--border);
+  #ek-issue-form label{font-size:var(--text-small);color:var(--ink-3);display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+  #ek-issue-form input{padding:6px 8px;font-size:var(--text-label);font-family:inherit;
+    border:1px solid var(--control-border);border-radius:var(--radius,8px);background:var(--surface);color:var(--ink)}
+  #ek-reveal-key{font-size:var(--text-label);word-break:break-all;padding:10px;border:1px solid var(--border);
     border-radius:var(--radius,8px);background:var(--surface-2);margin:10px 0}
+  body{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+  body > sherpa-topbar{flex:none}
+  body > .wrap{flex:1;min-height:0;overflow:auto;width:100%;max-width:1200px}
+  .wrap2.frm{padding-bottom:0}
+  .frm > .card{padding:0 24px 24px}
+  .frm > .card > .card-head{margin:0 -24px 20px;font-size:var(--text-section);font-weight:600}
+  .action-bar{position:static;flex:none;background:var(--surface)}
+  .action-bar-inner{flex-wrap:wrap}
+  #msg{margin:0}
 </style>
 </head>
 <body>

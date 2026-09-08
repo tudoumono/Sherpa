@@ -542,7 +542,9 @@ def chat_turns_start(req: ChatReq, request: Request):
     """チャットターンをバックグラウンドで開始する（画面遷移しても止まらない・覗き窓方式）。
 
     返り値 `{turn_id, conversation_id}` の `turn_id` で `GET /chat/turns/{turn_id}/stream` を購読する
-    （途中からでも cursor で replay→追従）。同時実行数の上限（1ユーザー2・全体8）を超えると 429
+    （途中からでも cursor で replay→追従）。同時実行数の上限（既定 1ユーザー2・全体8＝`SHERPA_CHAT_MAX_TURNS_PER_USER`／`SHERPA_CHAT_MAX_TURNS_GLOBAL`・
+    管理画面「システム管理」の「同時実行の上限」で上書き可＝`chat_turns.effective_limits()` が
+    ターン受付のたびに解決する）を超えると 429
     （MEDIUM・Codex RV 修正: 予約方式＝上限判定と枠の登録が atomic なので、429 のときは会話が
     一切作られない）。
     """
@@ -578,9 +580,14 @@ def chat_turns_start(req: ChatReq, request: Request):
                                   tools_availability=tools_availability,
                                   provider=provider, settings=settings, sys_settings=sys_settings)
     try:
+        # `known_conversation_id`: リクエストが既存会話への継続（`req.conversation_id` 明示）の
+        # ときだけ渡す。新規会話（None）は会話単位の排他判定の対象外のまま。
         rec = chat_turns.start_turn(uid=uid, conversation_factory=_make_conversation,
-                                    run_fn_factory=run_fn_factory)
-    except chat_turns.TurnLimitError:
+                                    run_fn_factory=run_fn_factory,
+                                    known_conversation_id=req.conversation_id)
+    except chat_turns.TurnLimitError as e:
+        if e.scope == "conversation":
+            raise HTTPException(429, "この会話の別の回答を実行中です。終わってからもう一度お試しください。")
         raise HTTPException(429, "実行中の回答が終わってからもう一度お試しください。")
     return {"turn_id": rec.turn_id, "conversation_id": rec.conversation_id}
 

@@ -559,6 +559,7 @@ def _mock_store_no_db(monkeypatch):
     monkeypatch.setattr(store, "add_message", fake_add_message)
     monkeypatch.setattr(store, "recent_messages", lambda conversation_id, limit: [])
     monkeypatch.setattr(store, "get_session_id", lambda conversation_id: None)
+    monkeypatch.setattr(store, "get_codex_usage_total", lambda conversation_id: None)
     monkeypatch.setattr(store, "get_settings", lambda user_id: {})
     # get_provider() と共有する WEB-1 唯一の読取点（fresh・非キャッシュ）。handle_message/
     # stream_message は knowledge の有無に関わらず必ずこれを呼ぶため、get_system_settings
@@ -818,6 +819,23 @@ def test_stream_message_evidence_committed_sidecar_persisted_and_streamed_after_
                     if e.get("type") == "node" and e.get("id") == "evidence-committed")
     idx_answer = next(i for i, e in enumerate(out_events) if e.get("type") == "answer")
     assert idx_node < idx_answer   # ライブ配信でも answer より前（永続化成功後に配信）
+
+
+def test_stream_message_synthesis_digest_not_persisted_in_public_answer(monkeypatch):
+    """`_result.env["_synthesis_digest"]`（`_answer_prompt` 専用の合成入力・`_personal_facts` と
+    同じ「合成専用の非公開キー」の流儀）は永続化する answer に残らない——`_evidence_committed` と
+    違い trace へ折り込む先も無いため、`_finalize` 直後に黙って pop するだけの契約。"""
+    saved = _mock_store_no_db(monkeypatch)
+    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
+            "detail": "内容を把握しました", "status": "done"}
+    result = _fixed_result("digest 付き回答")
+    result["env"]["_synthesis_digest"] = "ev-1: 4期/a.md 行 1-1「本文」"
+    events_in = [node, result]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events_in))
+
+    list(CS.stream_message(None, "synthesis digest テスト", world="v1",
+                           conversation_id=999, user_id="admin", knowledge=False))
+    assert "_synthesis_digest" not in saved[-1]["answer"]
 
 
 def _stoppable_provider(stop_event, env):

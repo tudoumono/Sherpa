@@ -35,9 +35,14 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import stat
 import sys
+import threading
+import time
 from pathlib import Path
 
+from ..base import _log
 from .mcp import _mcp_env, _toml_str
 
 
@@ -493,6 +498,162 @@ def _safe_workspace_authoring(users_dir: Path, uid: str):
     except (OSError, ValueError):
         return None
     return authoring
+
+
+_RUN_DIR_TTL_SECONDS = 24 * 60 * 60   # 実行ごとの作業領域の掃除しきい値（クラッシュ等で rmtree されず残存した場合のみ対象）
+
+# 24時間しきい値は「mtime が古い」ことしか見ないため、実行時間が長いターン（timeout 延長・
+# author の長時間実行等）の run dir を「稼働中のまま」誤って掃除しうる。プロセス内の
+# 「現在稼働中の run dir」集合を持ち、掃除対象から常に除外する（`_safe_run_authoring` が
+# 作成直後に登録し、呼び出し元＝`CodexProvider._run_authoring` の finally が実行終了時に解除する）。
+_ACTIVE_RUN_DIRS: set = set()
+_ACTIVE_RUN_DIRS_GUARD = threading.Lock()
+
+
+def _register_active_run_dir(run_dir: Path) -> None:
+    with _ACTIVE_RUN_DIRS_GUARD:
+        _ACTIVE_RUN_DIRS.add(run_dir)
+
+
+def _release_active_run_dir(run_dir: Path) -> None:
+    """呼び出し側（`_run_authoring` の finally）が実行終了時に呼ぶ。未登録・二重解除でも例外にしない
+    （fail-open＝解除漏れがあっても次回以降の掃除が効かなくなるだけで、実害は「掃除が遅れる」のみ）。"""
+    with _ACTIVE_RUN_DIRS_GUARD:
+        _ACTIVE_RUN_DIRS.discard(run_dir)
+
+
+def _mask_path_relative_to(fp, root: Path) -> str:
+    """失敗ログに `users_dir`/uid を含むフルパスをそのまま出さない。`root` からの相対部分だけを、
+    root 自身の識別子（`run-<乱数>`＝uid を含まない）に付けて返す。相対化できなければ root の
+    識別子だけを返す。"""
+    try:
+        rel = Path(fp).resolve().relative_to(root.resolve())
+        return f"{root.name}/{rel}"
+    except (OSError, ValueError):
+        return root.name
+
+
+def _chmod_if_not_symlink(path) -> None:
+    """symlink には絶対に chmod しない——chmod は既定で symlink を追従し、リンク先（root 外の
+    任意のディレクトリでありうる）の権限を変えてしまう。`follow_symlinks=False` が使える環境
+    ではそれで確実に symlink 自体に限定し、未対応環境（Linux の多くはここで
+    `NotImplementedError`）では、その環境で symlink 自体にだけ作用させる手段が無い以上
+    chmod 自体を諦める（`follow_symlinks=True` へのフォールバックはしない＝
+    symlink 先を書き換える経路を残さない）。"""
+    try:
+        if os.path.islink(path):
+            return
+    except OSError:
+        return
+    try:
+        os.chmod(path, stat.S_IRWXU, follow_symlinks=False)
+    except NotImplementedError:
+        pass
+    except OSError:
+        pass
+
+
+def _restore_removable_permissions(root: Path) -> None:
+    """`root` 配下（root 自身を含む）の非 symlink **ディレクトリ**だけ、削除に必要な権限
+    （書込＋実行）へ戻す。`rmtree` が実際に必要とするのはディレクトリ側の書込/実行権だけ
+    （エントリの削除は親ディレクトリの権限で決まり、ファイル自体の権限は無関係）——ファイルには
+    一切 chmod しない。ファイルは同一ファイルシステム上の run_dir 外のパスとハードリンク
+    （同一 inode＝同一の権限ビットを共有）していることがあり、ファイルへ chmod すると
+    run_dir 外の共有先まで権限が変わってしまう（symlink とは別種の封じ込め漏れ）。
+
+    `root` 自身は **`os.walk` の前に** chmod する——`root` が読み書き不可（例: 000）だと
+    `os.walk(root)` はその中身を一切列挙できず（listdir 自体が権限で失敗する）、配下の子を
+    発見できないまま素通りしてしまう。`root` を先に書込/実行可能へ戻せば、`os.walk` は
+    以後は各階層の子を chmod してから次の階層へ降りる（`topdown=True` の遅延評価により、
+    ある階層を chmod した後で `os.walk` がその階層へ実際に降りる＝毎階層で自然に連鎖する）。"""
+    _chmod_if_not_symlink(str(root))
+    for dirpath, dirnames, _filenames in os.walk(str(root), topdown=True, followlinks=False):
+        # os.walk は symlink ディレクトリの中には入らない（followlinks=False）が、
+        # dirnames にはその名前自体が残るため、chmod 対象からも明示的に外す。
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+        for name in dirnames:
+            _chmod_if_not_symlink(os.path.join(dirpath, name))
+
+
+def _remove_dir_best_effort(root: Path) -> None:
+    """`root` を削除する（best-effort）。素の `rmtree` が失敗したら、非 symlink エントリの権限を
+    戻して `root` 全体をもう1回だけ再試行する（symlink には絶対に chmod しない＝
+    `_chmod_if_not_symlink` 参照）。それでも残れば、相対パスと例外型・errno だけを warning に
+    記録する（フルパスは出さない・呼び出し元の処理は止めない）。"""
+    try:
+        shutil.rmtree(str(root))
+        return
+    except OSError:
+        pass
+    _restore_removable_permissions(root)
+
+    def _onexc(func, path, exc):
+        _log.warning("run dir cleanup left an entry: %s type=%s errno=%s",
+                    _mask_path_relative_to(path, root), type(exc).__name__, getattr(exc, "errno", None))
+
+    shutil.rmtree(str(root), onexc=_onexc)
+
+
+def _cleanup_stale_run_dirs(authoring: Path) -> None:
+    """`authoring/` 直下の `run-*` のうち mtime がこれより古い**かつ稼働中でない**ものを
+    best-effort で削除する（クラッシュ・強制終了で `_run_authoring` 側の finally が走らず残った
+    前回実行の作業領域の掃除。`_remove_dir_best_effort` の権限回復付き再試行により、0500 等の
+    権限制限で残った残骸も回収する）。稼働中（`_ACTIVE_RUN_DIRS` 登録済み）は mtime に関わらず
+    対象外——実行時間が24時間を超えても掃除で消さない。symlink は削除せずそのまま無視する
+    （symlink の指す先を巻き込まないため）。それ以外（`authoring/` 直下の既存ファイル・
+    AGENTS.md・`.codexhome-*` 等）には触れない。"""
+    try:
+        entries = list(authoring.iterdir())
+    except OSError:
+        return
+    now = time.time()
+    with _ACTIVE_RUN_DIRS_GUARD:
+        active_snapshot = set(_ACTIVE_RUN_DIRS)
+    for p in entries:
+        if p.is_symlink() or not p.name.startswith("run-") or not p.is_dir():
+            continue
+        if p in active_snapshot:
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError as e:
+            # `p` は絶対パス（users_dir/uid を含む）——相対名（run-* 自身の識別子）と
+            # 例外の型・errno だけを記録する（フルパス・例外の文字列表現は出さない）。
+            _log.warning("stale codex run dir cleanup failed for %s: type=%s errno=%s",
+                        p.name, type(e).__name__, getattr(e, "errno", None))
+            continue
+        if now - mtime <= _RUN_DIR_TTL_SECONDS:
+            continue
+        _remove_dir_best_effort(p)
+
+
+def _safe_run_authoring(users_dir: Path, uid: str) -> "Path | None":
+    """実行ごとに専用の作業領域（`authoring/run-<乱数>`）を作る（RV MEDIUM「同一 uid 直列化」の
+    撤去に伴う置き換え: 実行ごとに cwd/書込 root を分ければ、同一 uid の複数実行が snapshot・
+    files/ move・`.agents` rebuild で交差する心配がなくなり、直列化 lock 自体が不要になる）。
+
+    `_safe_workspace_authoring` と同じ封じ込め（uid 形式・symlink 拒否・非 dir 拒否・実体が
+    workspace 配下）を満たした `authoring/` を土台にしたうえで、衝突しない乱数名のディレクトリを
+    非再入（`mkdir(exist_ok=False)`）で新規作成し、実体が workspace 配下に収まることを再確認して
+    返す。異常時（authoring 自体が不正・作成先が既存/symlink/OSError）はいずれも None＝fail-closed
+    （呼び出し側は Codex を起動しない）。成功時は返す前に `_register_active_run_dir` で稼働中集合へ
+    登録する——呼び出し側は実行終了時に必ず `_release_active_run_dir` で解除すること。
+
+    副作用として、`authoring/` 直下に残った期限切れ（かつ非稼働）の `run-*`
+    （`_cleanup_stale_run_dirs` 参照）を best-effort で掃除する。"""
+    authoring = _safe_workspace_authoring(users_dir, uid)
+    if authoring is None:
+        return None
+    _cleanup_stale_run_dirs(authoring)
+    ws = users_dir / uid / "workspace"
+    run_dir = authoring / f"run-{os.urandom(6).hex()}"
+    try:
+        run_dir.mkdir(exist_ok=False)
+        run_dir.resolve().relative_to(ws.resolve())     # 最終確認: 実体が workspace 配下
+    except (OSError, ValueError):
+        return None
+    _register_active_run_dir(run_dir)
+    return run_dir
 
 
 def _safe_codex_sessions_home(users_dir: Path, uid: str, conversation_id) -> "Path | None":

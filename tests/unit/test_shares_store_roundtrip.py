@@ -578,6 +578,24 @@ def test_strip_shared_message_drops_usage_subs():
     assert out["answer"]["keep"] == "ok"
 
 
+def test_strip_shared_message_drops_codex_usage_total():
+    """codex_usage_total（Codex のセッション累計 usage・次ターンの差分計算にしか使わない内部専用
+    メタ）も usage と同格の内部情報＝受領共有の読者に見せない。"""
+    msg = {
+        "id": 5, "role": "assistant", "content": "answer text",
+        "route": None, "trace": None,
+        "answer": {"headline": "h",
+                   "codex_usage_total": {"session_id": "sid-1", "input_tokens": 30,
+                                        "cached_input_tokens": 2, "output_tokens": 13,
+                                        "reasoning_output_tokens": 3},
+                   "keep": "ok"},
+    }
+    out = store._strip_shared_message(msg)
+    assert "codex_usage_total" not in out["answer"]
+    assert "sid-1" not in str(out["answer"])
+    assert out["answer"]["keep"] == "ok"
+
+
 def test_strip_shared_message_passes_through_when_answer_not_dict():
     msg = {"id": 2, "role": "user", "content": "q", "route": None, "trace": None, "answer": None}
     out = store._strip_shared_message(msg)

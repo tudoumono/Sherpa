@@ -93,6 +93,7 @@ finish_ingest_run_and_confirm_world
 finish_ingest_run_and_delete_world
 fork_received_share
 get_announcement
+get_codex_usage_total
 get_conversation
 get_conversation_for_read
 get_feedback_by_message_ids
@@ -151,6 +152,7 @@ revoke_session
 revoke_share
 revoke_unconfirmed_key_by_client_op_id
 schema_ready
+search_conversations
 seed_system_settings_once
 session_user
 set_contains_personal_workspace

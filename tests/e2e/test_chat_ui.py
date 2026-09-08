@@ -1458,7 +1458,7 @@ def test_export_menu_opens_with_expected_items(page, web_base_url):
 
 
 def test_font_menu_opens_and_applies_selected_size(page, web_base_url):
-    """文字サイズメニュー（#fontbtn）の開閉と適用（`--chatfont` カスタムプロパティの変化を1点確認）を固定する。"""
+    """文字サイズメニューの開閉と「大」の表示サイズ（UI改善計画の18px）を確認する。"""
     from playwright.sync_api import expect
 
     install_api_mocks(page)
@@ -1469,8 +1469,7 @@ def test_font_menu_opens_and_applies_selected_size(page, web_base_url):
     expect(page.locator("#fontmenu")).to_be_visible()
     page.locator("#fontmenu [data-fs='大']").click()
     expect(page.locator("#fontmenu")).to_be_hidden()   # 選択後は自動で閉じる
-    applied = page.evaluate("document.documentElement.style.getPropertyValue('--chatfont')")
-    assert applied == "16.5px", f"文字サイズ「大」が適用されていない: {applied}"
+    expect(page.locator("#messages")).to_have_css("font-size", "18px")
 
 
 def test_brain_menu_opens_and_shows_model_note_for_llm_provider(page, web_base_url):
@@ -2527,6 +2526,45 @@ def test_codex_timeout_note_and_continue_button_resends_fixed_message(page, web_
     note = page.locator(".budget-note").last
     expect(note).to_be_visible()
     expect(note).to_contain_text("調査の時間上限に達したため途中までの結果です")
+
+    page.locator(".retry-hint-btn", has_text="続きを調べる").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    body = records["turn_starts"][-1]
+    assert body.get("message") == "続きを調べて"
+    assert not body.get("scope_paths")   # 範囲は変えない（元回答は全体のまま）
+    assert body.get("layer") is None     # 探す対象も変えない（既定=送らない）
+
+
+# Codex 自動継続を尽くしてもなお作業宣言だけだったターン（timeout ではない・正常終了）にも、
+# 同じ resume ボタン機構で「続きを調べる」を出す（`chat_service._is_codex_stopped_early` が根拠・
+# `answer.codex_stopped_early`）。注記文言だけが timeout 版と異なる。
+_CODEX_STOPPED_EARLY_ANSWER = {
+    "lens": "qa", "headline": "次に資料を確認します。",
+    "route": {"path": ["文書を検索"]}, "summary": {"total": 0},
+    "scope": {"world": "w1", "scope_paths": [], "source": "explicit", "layer": "both", "layer_applied": True},
+    "data": {"citations": ["doc1"]}, "sources": ["doc1"],
+    "codex_stopped_early": True,
+    "retry_hints": [{"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}}],
+}
+
+
+def test_codex_stopped_early_note_and_continue_button_resends_fixed_message(page, web_base_url):
+    """注記（本文とは別要素）とボタンが表示され、クリックで固定文言「続きを調べて」を送信する
+    （timeout 版と同じボタン機構・注記文言だけが異なる）。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": _CODEX_STOPPED_EARLY_ANSWER}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#kbtoggle").click()
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#messages")).to_contain_text("次に資料を確認します。")
+    note = page.locator(".budget-note").last
+    expect(note).to_be_visible()
+    expect(note).to_contain_text("AI が途中経過を伝えたまま調査を終えたため、途中までの結果です")
 
     page.locator(".retry-hint-btn", has_text="続きを調べる").click()
     expect(page.locator("#rt")).to_contain_text("完了")

@@ -134,11 +134,12 @@ def test_children_are_registered_into_the_resolution_index_without_corrupting_pr
 
 
 def test_cobol_jcl_copybook_graph_is_unaffected_by_the_extra_transparency_mechanism():
-    """CODE-2 の受け入れ条件: COBOL/JCL/コピーブックはどれも `RefCandidate.extra` を積まない
-    ——エッジ属性の透過機構を足しても、その graph は不変（`nodes`/`edges`/`flags` を丸ごと
-    byte 同一で比較・実測は git stash による before/after 比較で確認済み・報告参照）。ここでは
-    恒久リグレッションとして「COBOL/JCL/コピーブック由来のエッジに `via`/追加キーが一切乗らない」
-    ことを固定する。"""
+    """CODE-2 の受け入れ条件: COBOL/JCL/コピーブックは `RefCandidate.extra` をほぼ積まない
+    ——エッジ属性の透過機構を足しても、その graph は（S1 の意図した差分を除き）不変（`nodes`/
+    `edges`/`flags` を丸ごと byte 同一で比較・実測は git stash による before/after 比較で確認済み・
+    報告参照）。**唯一の例外**は COBOL の CALL 由来 `INVOKES` エッジの `via=call`（S1・RV1 是正・
+    docs/proposals/2026-09-05-アナライザ拡張.md §4(d)）——それ以外（JCL/コピーブック・COBOL の
+    `COPIES` 等）は引き続き `via`/追加キーが一切乗らないことを固定する。"""
     wd = ROOT / "fixtures" / "corpus" / "v1"
     nodes, edges, flags = world_graph.build_world(wd, "v1_regress_test")
     assert edges, "COBOL/JCL コーパスなら少なくとも1本はエッジが立つはず"
@@ -147,4 +148,8 @@ def test_cobol_jcl_copybook_graph_is_unaffected_by_the_extra_transparency_mechan
     for e in edges:
         src_node = by_cid.get(e["src"])
         if src_node and src_node.get("analyzer") in ("cobol", "jcl", "copybook"):
-            assert set(e) <= base_edge_keys, e
+            is_cobol_call = src_node["analyzer"] == "cobol" and e["type"] == "INVOKES"
+            allowed = base_edge_keys | {"via"} if is_cobol_call else base_edge_keys
+            assert set(e) <= allowed, e
+            if is_cobol_call and "via" in e:
+                assert e["via"] == "call"

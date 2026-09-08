@@ -38,7 +38,7 @@ def _stub_pipeline(monkeypatch):
                         lambda world, sig, manifest=None, doc_count=None, scan_report=None: None)
     monkeypatch.setattr(store, "downgrade_orphaned_extracting_runs", lambda world=None: [])
     monkeypatch.setattr(store, "update_ingest_run_progress", lambda run_id, progress: None)
-    monkeypatch.setattr(corpus_docs, "scan_report", lambda world: {})
+    monkeypatch.setattr(corpus_docs, "scan_report", lambda world, expected_rels=None: {})
     monkeypatch.setattr(store, "set_scan_report", lambda world, report: None)
     monkeypatch.setattr("sherpa.es_index.index_world",
                         lambda world, content_sig=None, **kw: {"available": None})

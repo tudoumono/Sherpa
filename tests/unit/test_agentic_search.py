@@ -138,6 +138,9 @@ def test_degrade_result_node_known_reasons_only():
     node3 = A._degrade_result_node({"hits": [], "degrade_reason": "hybrid_query_failed"})
     assert node3["label"] == node["label"]
     assert node3["detail"] not in (node["detail"], node2["detail"])
+    node4 = A._degrade_result_node({"hits": [], "degrade_reason": "vector_feature_mismatch"})
+    assert node4["label"] == node["label"]                  # 索引素性ズレ（再取り込み待ち）も同ラベル
+    assert "取り込み" in node4["detail"]                     # 一時障害ではなく取り込みやり直しを案内
     assert A._degrade_result_node({"hits": []}) is None
     assert A._degrade_result_node({"hits": [], "degrade_reason": "es_query_failed"}) is None
     assert A._degrade_result_node({"count": 0, "docs": []}) is None   # list_docs 等の無関係な result
@@ -173,12 +176,13 @@ def test_hit_summary_node_es_search_unavailable_or_query_failed_omits_node():
     """M-1是正: `es_unavailable`/`es_query_failed`（BM25 自体も失敗し hits が強制的に空になっている
     ＝`_ES_DEGRADE_WORDING` の3語彙に含まれない）は「0件（キーワード一致のみ）」という、検索は
     実行できたかのような誤表示を避けるため、追加ノード自体を出さない（メイン・サブ両経路とも）。
-    既知の3語彙（BM25 は継続して成立）は従来どおり件数を出す。"""
+    BM25 が継続して成立する既知語彙（`_ES_DEGRADE_WORDING`）は従来どおり件数を出す。"""
     for reason in ("es_unavailable", "es_query_failed"):
         result = {"hits": [], "degrade_reason": reason}
         assert A._hit_summary_node("es_search", {"query": "税率"}, result) is None
         assert A._hit_summary_node_sub("es_search", result) is None
-    for reason in ("embedding_cloud_unavailable", "query_embed_failed", "hybrid_query_failed"):
+    for reason in ("embedding_cloud_unavailable", "query_embed_failed", "hybrid_query_failed",
+                   "vector_feature_mismatch"):
         result = {"hits": [], "degrade_reason": reason}
         assert A._hit_summary_node("es_search", {"query": "税率"}, result) is not None
         assert A._hit_summary_node_sub("es_search", result) is not None
@@ -599,6 +603,33 @@ def test_openai_style_refusal_response_uses_refusal_text_as_final_answer():
         assert final["attribution_eligible"] is True
     finally:
         A._post = orig
+
+
+def test_openai_style_surfaces_vector_feature_mismatch_node_end_to_end(monkeypatch):
+    """`es_index.search()` が BM25 hits＋`vector_feature_mismatch` を返す → 実 `run_tool()` が
+    tool result に載せる → `openai_style()` のイベント列に精度低下ノードが現れる（受入条件(5)・
+    理由固有の搬送漏れを検出する）。内部語彙（索引/ベクトル等）は文言に出さない。"""
+    from sherpa import documents
+
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
+    monkeypatch.setattr(A.es_index, "search",
+                        lambda world, q, scope_paths=None, k=20, layer=None, **kw:
+                            ([{"doc_id": "a.md", "line": 1, "text": "x", "ext": ".md"}],
+                             "vector_feature_mismatch"))
+    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
+               {"id": "c1", "function": {"name": "es_search", "arguments": '{"query":"x"}'}}]}}]},
+           {"choices": [{"message": {"content": "回答"}}]}]
+    orig = A._post
+    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
+    try:
+        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
+    finally:
+        A._post = orig
+    expected = A._ES_DEGRADE_WORDING["vector_feature_mismatch"]
+    nodes = [ev["node"] for ev in events if isinstance(ev.get("node"), dict)
+             and ev["node"].get("label") == expected[0] and ev["node"].get("detail") == expected[1]]
+    assert len(nodes) == 1
+    assert "索引" not in expected[1] and "ベクトル" not in expected[1]
 
 
 def test_list_docs_path_prefix_and_doctype():
@@ -2467,6 +2498,49 @@ def test_openai_style_ask_user_stub():
 
 # ===== secRV MED-3（2026-07-18・DoS/コスト増幅）: 1応答あたりのツール実行数上限 =====
 
+@pytest.mark.parametrize("dialect", ["openai", "ollama", "gemini", "anthropic"])
+@pytest.mark.parametrize("parallel", [1, 3])
+def test_admin_tool_limit_applies_before_execution(monkeypatch, dialect, parallel):
+    """保存値で実際の実行を止める。実行途中の設定変更は次の調査から適用する。"""
+    configured = {"agentic_max_tools_per_turn": 2}
+    monkeypatch.setattr(store, "get_system_settings", lambda **kw: dict(configured))
+    monkeypatch.setattr(A, "SHERPA_TOOL_PARALLEL", parallel)
+    executed = []
+
+    def run_tool(name, args, *a, **kw):
+        executed.append(args["query"])
+        configured["agentic_max_tools_per_turn"] = 1
+        return {"hits": []}, set(), [], []
+
+    monkeypatch.setattr(A, "run_tool", run_tool)
+    if dialect in ("openai", "ollama"):
+        calls = [{"id": f"c{i}", "function": {
+            "name": "ripgrep_search", "arguments": json.dumps({"query": str(i)})}} for i in range(3)]
+        message = {"content": "", "tool_calls": calls}
+        response = {"message": message} if dialect == "ollama" else {"choices": [{"message": message}]}
+        monkeypatch.setattr(A, "_post", lambda *a, **kw: response)
+        events = list(A.openai_style("http://x", {}, "m", A.SYSTEM, "調べて", "v1", None,
+                                     ollama=dialect == "ollama"))
+    elif dialect == "gemini":
+        response = {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "ripgrep_search", "args": {"query": str(i)}}} for i in range(3)]}}]}
+        monkeypatch.setattr(A, "_post", lambda *a, **kw: response)
+        events = list(A.gemini("key", "m", A.SYSTEM, "調べて", "v1", None))
+    else:
+        client = _AClient([_AResp([
+            _ABlock("tool_use", name="ripgrep_search", input={"query": str(i)}, id=f"t{i}")
+            for i in range(3)], stop_reason="tool_use")])
+        events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None))
+    assert sorted(executed) == ["0", "1"]
+    assert next(e for e in events if "final" in e)["stop_reason"] == "tools_per_turn_exceeded"
+
+
+def test_admin_tool_limit_unset_uses_environment_default(monkeypatch):
+    monkeypatch.setattr(A, "MAX_TOOLS_PER_TURN", 32)
+    assert A.effective_max_tools_per_turn({}) == 32
+    assert A.effective_max_tools_per_turn({"agentic_max_tools_per_turn": None}) == 32
+    assert A.effective_max_tools_per_turn({"agentic_max_tools_per_turn": 5}) == 5
+
 def test_openai_style_caps_tool_calls_per_turn():
     """1応答に25個の tool_calls が積まれていても、`MAX_TOOLS_PER_TURN`（既定16）を超えた分は
     `run_tool` を呼ばずに打ち切る（次のターンへは進まない・fail-closed）。
@@ -2518,11 +2592,18 @@ def test_openai_style_extreme_excess_still_emits_single_cap_node():
         A._post = orig
 
 
-def test_openai_style_stop_event_checked_before_each_tool_within_turn():
+def test_openai_style_stop_event_checked_before_each_tool_within_turn(monkeypatch):
     """secRV MED-3 (b): stop_event は各ツール実行の直前にも確認する（1応答内に複数 tool_calls が
-    あっても、途中で停止要求が来たら即座に打ち切り、以降のツールは実行しない）。"""
+    あっても、途中で停止要求が来たら即座に打ち切り、以降のツールは実行しない）。
+
+    D1（ツール並列）: この検証は「1件ずつ順に実行し、直前に stop_event を見る」という直列実行の
+    契約を固定するもの——`SHERPA_TOOL_PARALLEL` の既定（3）だとこの5本の応答は並列実行の対象に
+    なり、投入は各呼び出しの active ノード yield 直後の再確認でしか止まらない（並列時の停止契約は
+    `tests/unit/test_tool_parallel.py` 側で固定）。ここでは `SHERPA_TOOL_PARALLEL=1` を明示して
+    従来どおりの直列経路を強制する。"""
     import threading
 
+    monkeypatch.setattr(A, "SHERPA_TOOL_PARALLEL", 1)
     stop_event = threading.Event()
     calls = [{"id": f"c{i}", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}
              for i in range(5)]
@@ -4895,8 +4976,8 @@ def test_dispatch_tools_for_lens_availability_omitted_means_fully_available():
 # する」ことであって、特定の過去の値に固定し続けることではない）。
 _SYSTEM_GOLDEN_BYTES = 3924
 _SYSTEM_GOLDEN_SHA256 = "b57968b29f7f3792650b0954130cfe157d8b77390be39793061765a3a00bb364"
-_DESC_ES_GOLDEN_BYTES = 315
-_DESC_ES_GOLDEN_SHA256 = "3cf6ee101c15db27cd4ac5a9315f6c55f0de61e6e67eefd8971a5217326135ee"
+_DESC_ES_GOLDEN_BYTES = 449
+_DESC_ES_GOLDEN_SHA256 = "453247ab3710f36a9da0986e071bda2378b56c530d21bff4984921cee88d48e0"
 _DESC_GRAPH_GOLDEN_BYTES = 553
 _DESC_GRAPH_GOLDEN_SHA256 = "8a039ffdb660f76dd3d976aef666ee68eec716b666549dc5861fb9d090f52820"
 
@@ -5554,6 +5635,17 @@ def test_tool_hit_count_doc_outline_uses_count_field():
 def test_tool_hit_count_new_tools_none_on_error():
     assert A._tool_hit_count("read_doc", {"error": "boom"}) is None
     assert A._tool_hit_count("doc_outline", {"error": "boom"}) is None
+
+
+def test_tool_hit_count_compare_documents_header_excluded_positionally():
+    """diff の本文（3行目以降）に "+++"/"---" で始まる行があっても、diff 自身のヘッダー
+    （先頭2行だけ）と誤認して除外しない——ヘッダー除外は内容一致でなく位置で行う契約を固定する
+    （`investigation_state.py` の compare_documents 抜粋と同じ契約）。"""
+    normal_diff = "--- a\n+++ b\n+新しい行\n-古い行\n 変化なし行"
+    assert A._tool_hit_count("compare_documents", {"status": "comparable", "diff": normal_diff}) == 2
+
+    tricky_diff = "--- a\n+++ b\n+++valid content+++\n---also valid---"
+    assert A._tool_hit_count("compare_documents", {"status": "comparable", "diff": tricky_diff}) == 2
 
 
 def test_hit_summary_node_read_doc_includes_doc_and_range():

@@ -521,19 +521,22 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
     scan_rep = None
     if sig is not None:
         try:
-            scan_rep = corpus_docs.scan_report(world)
+            # `expected_rels`（取り込み冒頭の manifest の rel 集合）を渡す——本走査時点の実集合と
+            # 食い違えば（取り込み中にファイルが増減した世代混在）`scan_rep["document_count"]` は
+            # `None` になり、下でそのまま「更新保留」に伝わる（`corpus_docs.scan_report` docstring 参照）。
+            scan_rep = corpus_docs.scan_report(world, expected_rels=frozenset(manifest))
         except Exception:
             scan_rep = None
             _log.warning(
                 "取り込み集計（scan_report）の計算に失敗しました（次回 status は前回値のまま）: "
                 "world=%s", world, exc_info=True)
         # doc_count は外部公開 discovery（/ext/v1/capabilities）の事前集計値・ここ（成功確定）でだけ
-        # 更新する＝ホットパスでのファイルツリー走査を無くすための唯一の書き込み点。`len(rows)`
-        # （変換に成功して検索可能になった件数）ではなく、冒頭の `world_state()` と**同一スキャン**の
-        # `manifest` から doctype 対応原本件数を数える（変換失敗/未対応の Office・PDF・画像も
-        # 「原本」としては存在し `/doc` の対象なので、検索可能台帳数に矮小化しない。sig と同じ
-        # manifest から数えるため世代もずれない）。
-        confirm_doc_count = corpus_docs.manifest_doctype_count(manifest, world)
+        # 更新する＝ホットパスでのファイルツリー走査を無くすための唯一の書き込み点。`scan_rep` の
+        # 算出自体が失敗した場合は `None` のまま渡す（`finish_ingest_run_and_confirm_world()` は
+        # `None` の列を更新せず前回値を保持する）——`manifest_doctype_count(manifest, world)` 等の
+        # 別経路で数え直すフォールバックは持たない（scan_report が best-effort である契約を、
+        # 失敗理由の異なる代替集計で覆い隠さないため）。
+        confirm_doc_count = scan_rep.get("document_count") if scan_rep is not None else None
     return _record(status, reflected={"nodes": n, "edges": m}, ledger=written, extra_flags=extra,
                   drep=drep, es_summary=es_summary, neo4j_summary=neo4j_summary,
                   confirm_sig=sig, confirm_manifest=manifest,
@@ -1082,13 +1085,19 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 # 既に本関数の外側 `with` で lock 保持中——ここで再度 `store.world_lock` は
                 # 呼ばない（呼べば同一 lock の再入＝別コネクションでの自己デッドロック）。
                 cur = store.get_world(world)                    # 他 writer が割り込んでいないか再読
+                # world root は1回だけ解決し（`worlds.world_dir` の DB 往復もありうる解決を
+                # manifest 件数分繰り返さない）、以降の doc_count 集計へそのまま渡す
+                # （`manifest_doctype_count_from_root` 参照——`manifest_doctype_count` を直接
+                # 呼ぶと accepts() 上書きアナライザの拡張子ごとに再解決してしまう）。
+                backfill_root = worlds.world_dir(world)
                 if cur is not None and cur.get("last_sig") == sig:
                     if cur.get("last_manifest") is None and cur.get("last_doc_count") is None:
                         # 両方 NULL＝1回の UPDATE でまとめて補完する（last_synced_at は変更しない・
                         # 2ステップに分けて先に set_world_sig() で manifest だけ書くと、そちらが
                         # last_synced_at=now() を書いてしまい「いつ確定したか」を偽ってしまう）。
                         store.backfill_manifest_and_doc_count(
-                            world, manifest, corpus_docs.manifest_doctype_count(manifest, world), sig)
+                            world, manifest,
+                            corpus_docs.manifest_doctype_count_from_root(manifest, backfill_root), sig)
                     else:
                         if cur.get("last_manifest") is None:
                             store.set_world_sig(world, sig, manifest=manifest)
@@ -1100,7 +1109,9 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                             # last_synced_at は更新しない（`backfill_doc_count` 自体がそういう契約・
                             # 「いつ確定したか」の事実を後追い補完で書き換えない）。
                             store.backfill_doc_count(
-                                world, corpus_docs.manifest_doctype_count(saved_manifest, world), sig)
+                                world,
+                                corpus_docs.manifest_doctype_count_from_root(saved_manifest, backfill_root),
+                                sig)
                     if cur.get("last_scan_report") is None:
                         # sig 一致を確認済みの区間内＝この世代の内容に対する scan_report として正当。
                         # `set_scan_report` は `last_synced_at` を更新しない（sig 確定の事実を書き換えない）。

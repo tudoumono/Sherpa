@@ -53,8 +53,9 @@ def _stub_pipeline(monkeypatch):
     # ING-2: 成功パス確定に続けて scan_report をキャッシュする（`worker._run_locked` 参照）。
     # `corpus_docs.scan_report` は内部で `worlds.world_dir`（DB 登録行を読む）を呼ぶため、実行すると
     # このテストの架空 world "w" に対して不要な DB 接続を試みてしまう——両方スタブして DB/ネットワーク
-    # 不要という本ファイルの前提を保つ。
-    monkeypatch.setattr(corpus_docs, "scan_report", lambda world: {})
+    # 不要という本ファイルの前提を保つ。`document_count`（`confirm_doc_count` の材料・"a" は拡張子
+    # 無しで対象外＝0）を持たせる——成功パスは manifest から独立に数え直さず、この値をそのまま使う。
+    monkeypatch.setattr(corpus_docs, "scan_report", lambda world, expected_rels=None: {"document_count": 0})
     monkeypatch.setattr(store, "set_scan_report", lambda world, report: None)
 
     # ING-3: 開始時 INSERT（`start_ingest_run`）→完了時 UPDATE（`finish_ingest_run`）の2段構成
@@ -127,9 +128,8 @@ def test_reconcile_failure_becomes_warn_flag(_stub_pipeline, monkeypatch):
 def test_both_succeed_stays_auto_published(_stub_pipeline, monkeypatch):
     """ES/reconcile が両方成功すれば flags は空のまま status は auto_published（既定の happy path 回帰）。
 
-    成功確定の `set_world_sig` 呼び出しは `manifest`（`world_state` スタブが返す
-    `{"a": [1, 2, 3]}`）から doctype 対応原本件数を数えた `doc_count` を渡す。`"a"` は拡張子を
-    持たないため doctype 対象外＝確定値は 0（pre-invalidate 呼び出しは doc_count=None のまま）。
+    成功確定の `set_world_sig` 呼び出しは直前の `scan_report()`（本fixtureのスタブ）が返す
+    `document_count` をそのまま `doc_count` に渡す（pre-invalidate 呼び出しは doc_count=None のまま）。
     """
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})

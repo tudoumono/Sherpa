@@ -108,7 +108,8 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(store, "finish_ingest_run", lambda run_id, **kw: {"id": run_id, **kw})
 
     calls = {"scan_report": [], "set_world_sig": []}
-    monkeypatch.setattr(corpus_docs, "scan_report", lambda world: calls["scan_report"].append(world) or {"indexed": 5})
+    monkeypatch.setattr(corpus_docs, "scan_report",
+                        lambda world, expected_rels=None: calls["scan_report"].append(world) or {"indexed": 5})
 
     # ING-3: 成功パスの sig/manifest/doc_count/scan_report 確定は run 完了と同一トランザクション
     # （`finish_ingest_run_and_confirm_world`）へ移った——`set_world_sig` 単体呼び出しはもう発生しない。

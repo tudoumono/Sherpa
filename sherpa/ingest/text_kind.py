@@ -20,7 +20,7 @@
 秘匿ファイル（`.env`/`.pem`/`.ppk`/`.key`・SSH秘密鍵 `id_rsa`系・`credentials`/`.netrc`/
 `.npmrc`/`.git-credentials`）は名前/拡張子で両段とも対象外（`is_sensitive`・小文字化して判定）。
 **内容による秘密鍵PEMヘッダ検知は第2段（未知拡張子の sniff）のみ**——第1段は設計上ファイル内容を
-読まない（O(1)/コスト増ゼロ契約）ため、第1段拡張子（.json/.yaml 等）の中身に秘密が書かれている
+読まない（O(1)/コスト増ゼロ契約）ため、第1段拡張子（.json/.toml 等）の中身に秘密が書かれている
 場合は検知しない（`.txt` 直行の既存経路と同じ残余リスク・受容記録はバックログ参照）。
 
 このモジュールは `corpus_docs`／`grep_tool` 等どこからでも安全に import できる葉ノードとして保つ
@@ -38,15 +38,24 @@ CODE_EXT = frozenset({
     # 一般言語（`.java` は含めない——`sherpa.ingest.analyzers.registry` に専用の `JavaAnalyzer`
     # が登録済みのため、ここに残すと本モジュール自身の docstring が謳う「既存登録簿と重複しない」
     # 契約に反する＝CODE-1d で新言語を1つ足した際に判明・以後は「登録簿に専用アナライザが
-    # 増えたら、その拡張子はここから外す」運用とする）。
-    ".sql", ".sh", ".bash", ".zsh", ".py", ".js", ".ts",
-    ".c", ".h", ".cpp", ".hpp", ".cs", ".vb", ".pl", ".ps1", ".psm1", ".bat", ".cmd",
+    # 増えたら、その拡張子はここから外す」運用とする）。`.properties`/`.yaml`/`.yml`/`.xml` も
+    # 同じ理由で含めない——アナライザ拡張 S3b で `PropertiesAnalyzer`/`YamlConfigAnalyzer`/
+    # `XmlConfigAnalyzer` が登録済み（docs/proposals/2026-09-05-アナライザ拡張.md §6）。`.sql` も
+    # 同じ理由で含めない——アナライザ拡張 S2 で `SqlDdlAnalyzer` が登録済み。`.c`/`.h`/`.cs` も
+    # 同じ理由で含めない——アナライザ拡張 S6/S7 で `CAnalyzer`/`CSharpAnalyzer` が登録済み。
+    # `.js`/`.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb` も同じ理由で含めない——アナライザ拡張 波3 で
+    # `JsAnalyzer`/`ShellBatchAnalyzer`/`VbAnalyzer` が登録済み（`.mjs`/`.ksh`/`.bas`/`.cls`/
+    # `.frm`/`.ctl`/`.vbs` はそれぞれの専用アナライザが直接担当し元々ここには無かった拡張子）。
+    # `.cpp`/`.hpp`/`.ts`/`.ps1`/`.psm1` は対象外（A1 裁定＝C++/TypeScript/PowerShell アナライザは
+    # 作らない）のためここに残す。
+    ".py", ".ts",
+    ".cpp", ".hpp", ".pl", ".ps1", ".psm1",
     ".go", ".rb", ".php", ".kt", ".swift", ".scala", ".lua", ".r", ".awk",
     # 設定ファイル系（構造化された key=value / key: value が支配的＝コード側扱い）。
     # `.env` は要件の列挙に含まれるが `SENSITIVE_EXT`（下記）へ切り出す——両方の集合に置くと
     # `scope._CONTENT_EXT`（`CODE_EXT` を直接参照）で範囲ツリーには数えるのに実際は
     # 台帳/grep/ES から除外される、という矛盾した見え方になるため。
-    ".ini", ".cfg", ".conf", ".properties", ".yaml", ".yml", ".json", ".xml", ".toml",
+    ".ini", ".cfg", ".conf", ".json", ".toml",
 })
 
 # 資料側（自然文・表データ等）。

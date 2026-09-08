@@ -59,8 +59,9 @@ def _stub_pipeline(monkeypatch):
     # ING-2: 成功パス確定に続けて scan_report をキャッシュする（`worker._run_locked` 参照）。
     # `corpus_docs.scan_report` は内部で `worlds.world_dir`（DB 登録行を読む）を呼ぶため、実行すると
     # このテストの架空 world "w" に対して不要な DB 接続を試みてしまう——両方スタブして DB/ネットワーク
-    # 不要という本ファイルの前提を保つ。
-    monkeypatch.setattr(corpus_docs, "scan_report", lambda world: {})
+    # 不要という本ファイルの前提を保つ。`document_count`（`confirm_doc_count` の材料・"a" は拡張子
+    # 無しで対象外＝0）を持たせる——成功パスは manifest から独立に数え直さず、この値をそのまま使う。
+    monkeypatch.setattr(corpus_docs, "scan_report", lambda world, expected_rels=None: {"document_count": 0})
     monkeypatch.setattr(store, "set_scan_report", lambda world, report: None)
 
     # ING-3: 開始時 INSERT（`start_ingest_run`）→完了時 UPDATE（`finish_ingest_run`）の2段構成
@@ -112,8 +113,8 @@ def test_sig_none_fails_immediately_without_mutation(monkeypatch, _stub_pipeline
 def test_success_path_confirms_sig_only_after_record_succeeds(_stub_pipeline):
     """(K・happy path) 正常時は pre-invalidate('')→記録→確定(sig) の順で `set_world_sig` が2回呼ばれる。
 
-    確定呼び出しの `doc_count` は `world_state` スタブの manifest
-    `{"a": [1, 2, 3]}` から doctype 対応原本件数を数えた値（"a" は拡張子無し＝対象外＝0）。
+    確定呼び出しの `doc_count` は直前の `scan_report()`（本fixtureのスタブ）が返す `document_count`
+    をそのまま使う（成功パスは `manifest_doctype_count()` を別途呼ばない）。
     """
     res = worker.run("w")
 

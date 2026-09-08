@@ -40,14 +40,14 @@ def test_documents_for_marks_unreadable_code_file_from_last_run_blocked_flags(mo
     assert docs_before[0]["state"] == "ready" and docs_before[0]["doctype"] == "cobol"
 
     # 実経路: build_world の実読込で OSError → blocked flag（Pass1 の既存挙動そのもの）。
-    real_read_text = Path.read_text
+    real_read_bytes = Path.read_bytes            # Pass1 はバイナリ1回読取（read_full_text_and_raw）
 
     def _boom(self, *a, **kw):
         if self.name == "BADPROG.cbl":               # 対象ファイル限定（他の読み取りは通常どおり）
             raise OSError("simulated read failure")
-        return real_read_text(self, *a, **kw)
+        return real_read_bytes(self, *a, **kw)
 
-    monkeypatch.setattr(Path, "read_text", _boom)
+    monkeypatch.setattr(Path, "read_bytes", _boom)
     _nodes, _edges, flags = world_graph.build_world(wd, "w")
     blocked = [f for f in flags if f.get("action") == "blocked"]
     assert blocked == [{"doc": "BADPROG.cbl", "reason": "unreadable_code_file", "action": "blocked"}]

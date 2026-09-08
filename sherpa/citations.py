@@ -159,6 +159,31 @@ def citation_dedupe_key(c: Mapping) -> tuple:
     return (c.get("doc_id"), span) if any(span) else (c.get("doc_id"), span, c.get("quote"))
 
 
+def _dedupe_quotes_by_containment(quotes: list) -> list:
+    """`quotes`（元の出現順）から、他の要素の部分文字列（同一を含む）である要素を除去する。
+
+    包含関係にある候補は情報量の多い（長い）方だけを残す。完全に同一な候補は最初の1件だけを
+    残す（後続の同一要素を除去）。生き残った要素は元の出現順のまま返す——呼び出し元が件数上限を
+    適用する**前**に使う契約（先に上限を適用すると、他候補の部分文字列でしかない短い候補が
+    無関係な独自候補を枠から押し出してしまう）。
+    """
+    keep = [True] * len(quotes)
+    for i, qi in enumerate(quotes):
+        if not keep[i]:
+            continue
+        for j, qj in enumerate(quotes):
+            if i == j or not keep[j]:
+                continue
+            if qi == qj:
+                if j > i:
+                    keep[j] = False
+                continue
+            if qi in qj and len(qi) < len(qj):
+                keep[i] = False
+                break
+    return [q for q, k in zip(quotes, keep) if k]
+
+
 def merge_overlapping_citations(citations: list, evidence_meta: list) -> tuple[list, list, list]:
     """同一 doc_id・行範囲（span）が重なる/包含する citation を1件に統合する（`citation_dedupe_key`
     による完全一致の重複排除の直後に適用・呼び出し元＝`providers/base.py::_dedupe_citations_and_evidence`）。
@@ -180,6 +205,14 @@ def merge_overlapping_citations(citations: list, evidence_meta: list) -> tuple[l
     られるようにする）。3件目の戻り値 `merged_flags` は各出力エントリが実際に複数件から統合された
     かどうかの bool list——呼び出し元（`providers/base.py`）が統合後の span を再検証するかどうかの
     判定に使う（統合されていないエントリは `_commit_evidence` で既に検証済みのため再検証不要）。
+
+    採用されなかった citation の quote は、採用 quote と同一／部分文字列でなければ
+    `evidence_meta[i]["extra_quotes"]`（候補同士でも部分文字列の包含関係を除去
+    （`_dedupe_quotes_by_containment`）してから最大3件・各400字）として保持する——統合は範囲を
+    広げるだけで本文を再取得しないため、範囲内の独自の記述（採用 quote には無い条件・例外等）が
+    消えないようにする。公開 `citation.quote`/`span` 自体は代表1件のまま変えない（span 検証・
+    Evidence Packet の契約は不変・`extra_quotes` は `agentic_search.build_synthesis_digest`
+    だけが読む内部フィールド）。
     """
     def _span_range(c):
         span = c.get("span")
@@ -246,6 +279,25 @@ def merge_overlapping_citations(citations: list, evidence_meta: list) -> tuple[l
         merged_c["span"] = merged_span
         merged_m = dict(evidence_meta[rep_i]) if rep_i < len(evidence_meta) else {}
         merged_m["span"] = merged_span   # evidence_meta 側の span も和集合へ同期する
+        # 採用しなかった citation の quote を捨てない（清書ダイジェスト専用の内部フィールドだけが
+        # 読む・公開 citation.quote/span は代表1件のまま＝span 検証・Evidence Packet の契約は不変）。
+        # 包含・同一判定は**実際に清書へ渡る文字列（各400字に切った後）**で行う——切断前の全文で
+        # 判定すると、代表側は切って消える範囲に候補が含まれるだけで誤って重複扱いになり、逆に
+        # 401字目以降だけ異なる候補同士は切断後には同一化するのに別枠を消費してしまう。採用 quote
+        # の部分文字列（`in`）は新情報が無いため除外し、残った候補同士も部分文字列で重複排除して
+        # から（`_dedupe_quotes_by_containment`）上限3件にする——候補同士の重複排除を件数上限より
+        # 前に行わないと、他候補に包含されるだけの短い候補が枠を消費して独自の候補を落としうる。
+        # `g` は span（[start, end]）順にソート済みのため、候補の並びだけは元の出現順
+        # （citations 配列の index 順）へ戻す——上限3件は先着順で切るため、span 順のまま抽出すると
+        # 元配列で先に出た候補が後ろへ回されて不公平に落とされうる。
+        rep_quote = (citations[rep_i].get("quote") or "")[:400]
+        g_by_index = sorted(g, key=lambda t: t[0])
+        candidate_quotes = [q for q in ((citations[j].get("quote") or "")[:400]
+                                        for j, _rng in g_by_index if j != rep_i)
+                           if q and q not in rep_quote]
+        extra_quotes = _dedupe_quotes_by_containment(candidate_quotes)[:3]
+        if extra_quotes:
+            merged_m["extra_quotes"] = extra_quotes
         out_c.append(merged_c)
         out_m.append(merged_m)
         merged_flags.append(True)

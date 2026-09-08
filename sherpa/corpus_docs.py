@@ -88,9 +88,12 @@ def __getattr__(name: str):
 def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True) -> dict:
     """1ファイルの分類（列挙・集計・状態APIが共有する単一の判定）。
 
-    `read_head`（zero-arg callable）は `registry.resolve_lazy` の内容判定にそのまま渡す——
-    実際に必要な時（拡張子を要求する候補の誰かが `accepts()` を上書きしている時）だけ呼ばれる
-    （既定 accepts のみなら内容を読まない・§7 裁定10）。
+    `read_head`（`size` キーワードを受け取れる callable）は `registry.resolve_lazy` の内容判定に
+    そのまま渡す——実際に必要な時（拡張子を要求する候補の誰かが `accepts()` を上書きしている時）
+    だけ呼ばれる（既定 accepts のみなら内容を読まない・§7 裁定10）。`resolve_lazy` が実際に読んだ
+    head はここでキャッシュし、`accepts()` 全滅で `_classify_generic_text` の内容推定へ回った
+    場合に**追加 I/O なしで**再利用する（`allow_content_sniff=False` でも同様——`accepts()` 用に
+    既に読んだ内容を使うだけで新たな読み取り/world root 再解決は発生しない）。
 
     戻り値:
     - `{"kind": "code", "doctype": ..., "analyzer": ...}` — `resolve_lazy` が担当を確定。
@@ -105,6 +108,12 @@ def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff
       裁定10「その旨を内訳へ」）。
     - `{"kind": "unreadable", "had_code_candidates": True}` — 内容判定が必要だったが
       読み取れなかった。次点アナライザへは進まず（誤配属しない）ここで判定を打ち切る。
+
+    `accepts()` が全滅（`analyzer is None`）した場合、候補のいずれかが `fallback_to_text_kind_
+    when_declined=True`（`Analyzer` 既定 False・`HtmlTemplateAnalyzer` 専用）を宣言していれば、
+    `_classify_generic_text` の「登録済み候補が拒否した拡張子は資料枠へ即倒す」早期returnを
+    行わず、通常の内容推定経路へ進める（コーディネータ裁定・HTML の分類——アプリ画面の目印が
+    無い HTML は日本語本文主体の資料として扱う）。
 
     「担当なし」（登録簿にもアナライザにも拾われなかった）拡張子は、`.md`/`.txt` 等の既存の
     資料表にも無ければ `_classify_generic_text()`（軽量テキスト枠・`ingest.text_kind`）へ回す。
@@ -132,8 +141,18 @@ def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff
             return {"kind": "document", "doctype": doctype, "had_code_candidates": False}
         return _classify_generic_text(rel_path, ext, read_head, had_code_candidates=False,
                                       allow_content_sniff=allow_content_sniff)
+    # `resolve_lazy` が accepts() 判定用に実際に読んだ head をここで捕らえておく——`accepts()`
+    # 全滅で内容推定（`_classify_generic_text`）へ回った場合に、追加の read_head() 呼び出し
+    # （＝status 経路では world root 再解決）を経ずそのまま再利用する。
+    cached_head: list = []
+
+    def _capturing_read_head(size: int = 4096) -> str:
+        head = read_head(size=size)
+        cached_head[:] = [head]
+        return head
+
     try:
-        analyzer = _analyzer_registry.resolve_lazy(rel_path, read_head)
+        analyzer = _analyzer_registry.resolve_lazy(rel_path, _capturing_read_head)
     except _HeadUnreadable:
         return {"kind": "unreadable", "had_code_candidates": True}
     if analyzer is not None:
@@ -141,12 +160,18 @@ def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff
     doctype = _NONCODE_DOCTYPE.get(ext)
     if doctype is not None:
         return {"kind": "document", "doctype": doctype, "had_code_candidates": True}
+    declined_allows_text_kind = any(
+        getattr(a, "fallback_to_text_kind_when_declined", False) for a in candidates)
     return _classify_generic_text(rel_path, ext, read_head, had_code_candidates=True,
-                                  allow_content_sniff=allow_content_sniff)
+                                  allow_content_sniff=allow_content_sniff,
+                                  declined_allows_text_kind=declined_allows_text_kind,
+                                  cached_head=cached_head[0] if cached_head else None)
 
 
 def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidates: bool,
-                           allow_content_sniff: bool = True) -> dict:
+                           allow_content_sniff: bool = True,
+                           declined_allows_text_kind: bool = False,
+                           cached_head: str | None = None) -> dict:
     """軽量テキスト枠（`ingest.text_kind`）＝**登録簿に候補が一つも無い**（＝真に未登録の）拡張子の
     テキストファイル判定。
 
@@ -156,6 +181,17 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
     まま `doctype=None` を返す（`test_declined_extension_...`/`test_grep_search_excludes_declined_
     registered_code_extension_...` 系が固定する既存契約。軽量テキスト枠は「未登録拡張子」だけが
     対象で、「登録されているが拒否された」ケースの扱いを緩めない）。
+
+    `declined_allows_text_kind=True`（拒否した候補のいずれかが `fallback_to_text_kind_when_
+    declined=True` を宣言＝`HtmlTemplateAnalyzer` 専用）のときだけ、この「拒否は資料枠へ即倒す」
+    早期returnを行わず、通常の内容推定（第1段の拡張子マップ→第2段の内容 sniff）へ進める
+    （コーディネータ裁定・HTML の分類）。
+
+    `cached_head`（`classify_document` が `resolve_lazy` の accepts() 判定用の読み取りを捕らえた
+    もの）が渡されていれば、第2段の内容推定はこれをそのまま使う——
+    `allow_content_sniff=False`（status 経路）でも読み取り自体は既に済んでいる（追加の
+    `read_head()` 呼び出し＝status 経路では world root 再解決を伴う I/O を発生させない）ため、
+    通常の `allow_content_sniff` ゲートを迂回してよい。
 
     Office/画像は既存の資料種別として呼び出し側（`scan_report`/`iter_world_documents`/
     `status_document_doctype`）が別途扱うため、ここで対象外のまま `doctype=None` を返し、内容も
@@ -180,7 +216,7 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
     from .ingest import office_md
     if ext in office_md.IMAGE_EXT:
         return {"kind": "document", "doctype": None, "had_code_candidates": had_code_candidates}
-    if had_code_candidates:
+    if had_code_candidates and not declined_allows_text_kind:
         return {"kind": "document", "doctype": None, "had_code_candidates": True}
     if worlds.is_semantic_control_path(rel_path):
         return {"kind": "document", "doctype": None, "had_code_candidates": False}
@@ -189,12 +225,15 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
         return {"kind": "document", "doctype": None, "had_code_candidates": False}
     kind = text_kind.classify_ext(ext)
     if kind is None:
-        if not allow_content_sniff:
+        if cached_head is not None:
+            head = cached_head                # accepts() 用に既に読んだ head を再利用（追加I/Oなし）
+        elif not allow_content_sniff:
             return {"kind": "document", "doctype": None, "had_code_candidates": False}
-        try:
-            head = read_head()
-        except _HeadUnreadable:
-            return {"kind": "unreadable", "had_code_candidates": had_code_candidates}
+        else:
+            try:
+                head = read_head()
+            except _HeadUnreadable:
+                return {"kind": "unreadable", "had_code_candidates": had_code_candidates}
         sniff = text_kind.sniff_content(head)
         if sniff == "binary":
             return {"kind": "document", "doctype": None, "had_code_candidates": had_code_candidates}
@@ -207,32 +246,67 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
 
 
 def _read_head(rp: Path, size: int = 4096) -> str:
-    """先頭 `size` 文字を読む（`registry.resolve_lazy` の内容判定専用）。読めなければ `_HeadUnreadable`。"""
+    """先頭 `size` **バイト**を読み UTF-8（不正/途中で切れたバイト列は置換）でデコードする
+    （`registry.resolve_lazy` の内容判定専用・head だけで足りる経路が使う軽量版）。
+    読めなければ `_HeadUnreadable`。
+
+    バイナリで `size` バイトちょうど読んでからデコードする——テキストモードで `size` **文字**
+    読むと、マルチバイト文字（日本語等）を含む文書では実際に読む範囲が `Analyzer.head_bytes`
+    の宣言（例: `HtmlTemplateAnalyzer` の64KiB）よりずっと広くなり、境界の直後にある目印
+    （`<form>` 等）まで誤って拾ってしまう（バイト境界と文字境界の食い違い）。
+    全文も必要な経路（`ingest.world_graph` Pass1）はこの関数を呼ばず `read_full_text_and_raw()`
+    を使う（同じファイルを2回開かない・下記参照）。
+    """
     try:
-        with rp.open("r", encoding="utf-8", errors="replace") as f:
-            return f.read(size)
+        with rp.open("rb") as f:
+            return f.read(size).decode("utf-8", errors="replace")
     except OSError as e:
         raise _HeadUnreadable(str(e)) from e
 
 
-def _read_head_for_status(world: str, rel_path: str) -> str:
+def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
+    """ファイルをバイナリで**1回だけ**読み、全文（UTF-8・不正/途中で切れたバイト列は置換でデコード）
+    と生バイト列の両方を返す。読めなければ `OSError`（呼び出し元の既存の読取失敗処理に委ねる）。
+
+    `ingest.world_graph` の Pass1（構文解析用の全文と、アナライザごとに異なる `accepts()` 判定用の
+    head の両方を同一ファイルから必要とする唯一の経路）専用。生バイト列を返すのは、呼び出し元が
+    アナライザごとに異なる `head_bytes`（既定4KiB・`HtmlTemplateAnalyzer` は64KiB）でスライスして
+    デコードするため——全文読取後に `head_bytes` 分だけ**再度ファイルを開いて**読み直す旧実装は、
+    全文読取と head 読取の間でファイルが消える/権限が変わるなどの TOCTOU が起きると、既に読めた
+    全文を捨てて head だけ「読み取り失敗」を空文字（＝目印なし＝不採用）へ静かに丸めてしまい、
+    本来なら明示の `unreadable_code_file` blocked flag にすべき失敗を見えなくしていた。1回の読み取り
+    から両方を切り出すことでこの再オープン自体を無くす。
+    """
+    raw = rp.read_bytes()
+    # 全文はテキストモード読取（`Path.read_text`）と同じユニバーサル改行（CRLF/単独 CR → LF）に
+    # 揃える——行単位で構文を見るアナライザが単独 CR のファイルで1行に潰れないため。head 用の
+    # 生バイト列は無加工（バイト境界の契約を保つ）。
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return text, raw
+
+
+def _read_head_for_status(world: str, rel_path: str, size: int = 4096) -> str:
     """`status_document_doctype` 系の遅延読み取り（`world` から実体を解決して先頭を読む）。
 
-    `resolve_lazy` は既定 accepts のみの拡張子では呼ばない（§7 裁定10）ため、登録アナライザ側
-    （現行3種はすべて既定 accepts）では実際には呼ばれない。**軽量テキスト枠**（`ingest.text_kind`）
-    の第2段（未知拡張子・拡張子なしの内容推定）も、`status_document_doctype`/
-    `status_document_requires_coverage` は `classify_document(..., allow_content_sniff=False)` で
-    呼ぶため実際には呼ばれない——`manifest_doctype_count`（`ingest/worker.py` がホットパス
-    （毎 sync）で「追加の走査/world root 再解決をしない」前提で使う）がこの関数を経由して
-    `documents.resolve`→`worlds.world_dir` の再解決（DB 往復を伴いうる）に踏み込まないための
-    安全策（2026-09-02・実測: `_run_locked` 系単体テストで world root 解決のモック不足により
-    落ちた）。第1段（拡張子マップ）で判定できる拡張子は元々内容を読まない。
+    `resolve_lazy` は既定 accepts のみの拡張子では呼ばない（§7 裁定10）ため、登録アナライザ側の
+    大半（cobol/copybook/jcl 等・既定 accepts のまま）では実際には呼ばれない——ただし
+    `HtmlTemplateAnalyzer` は `accepts()` を上書きしているため、`.html`/`.htm`/`.xhtml` では
+    実際に呼ばれる（`size` はその head_bytes 宣言＝64KiB に従う）。**軽量テキスト
+    枠**（`ingest.text_kind`）の第2段（未知拡張子・拡張子なしの内容推定）も、
+    `status_document_doctype`/`status_document_requires_coverage` は
+    `classify_document(..., allow_content_sniff=False)` で呼ぶため、`accepts()` 判定用に既に
+    読んだ head が無い場合はここでも呼ばれない（`classify_document` が `resolve_lazy` の読み取り
+    結果をキャッシュして再利用する）——`manifest_doctype_count`（`ingest/worker.py`
+    がホットパス（毎 sync）で「追加の走査/world root 再解決をしない」前提で使う）がこの関数を
+    経由して `documents.resolve`→`worlds.world_dir` の再解決（DB 往復を伴いうる）へ**追加で**
+    踏み込まないための安全策（2026-09-02・実測: `_run_locked` 系単体テストで world root 解決の
+    モック不足により落ちた）。第1段（拡張子マップ）で判定できる拡張子は元々内容を読まない。
     """
     from . import documents
     rp = documents.resolve(rel_path, world)
     if rp is None:
         raise _HeadUnreadable("not_found")
-    return _read_head(rp)
+    return _read_head(rp, size)
 
 
 def status_document_doctype(rel_path: str, world: str) -> str | None:
@@ -258,8 +332,17 @@ def status_document_doctype(rel_path: str, world: str) -> str | None:
     if importance.is_importance_control_path(rel_path):
         return None
     ext = Path(rel_path).suffix.lower()
-    result = classify_document(rel_path, ext, lambda: _read_head_for_status(world, rel_path),
-                              allow_content_sniff=False)
+    result = classify_document(
+        rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
+        allow_content_sniff=False)
+    return _doctype_for_count(result, ext)
+
+
+def _doctype_for_count(result: dict, ext: str) -> str | None:
+    """`classify_document()` の戻り値 `result` から集計用 doctype を導く（`status_document_doctype`
+    の判定そのもの・`manifest_doctype_count`/`manifest_doctype_count_from_root`/`scan_report` の
+    `document_count` が全て共有する単一の判定——`result` を再計算せず呼び出し元がキャッシュを渡せる
+    ようにして重複 I/O を避ける）。"""
     if result["kind"] == "unreadable":
         return _UNREADABLE_DOCTYPE_LABEL
     if result["kind"] == "code" or result["doctype"] is not None:
@@ -276,15 +359,55 @@ def manifest_doctype_count(manifest: dict, world: str) -> int:
     """`manifest`（`ingest/worker.py` の `world_state()`/`_manifest()` が返す `rel -> [...]` 辞書）から
     doctype 対応**原本**件数を数える。
 
-    `/ext/v1/capabilities` の `document_count` はこの値を使う（変換に成功して検索可能になった
-    件数＝`len(_ledger_rows(world))` ではない）。原本が存在するが変換に失敗/未対応な
-    Office/PDF/画像も対象原本として数える——`status_document_doctype()` が None を返す付帯物
-    （semantic/*.json 等）だけを除外する。登録アナライザ側（`accepts()` を上書きするものが無い
-    現行構成）・軽量テキスト枠（`ingest.text_kind`）とも `status_document_doctype()` が
-    `allow_content_sniff=False` で呼ぶため、ファイルツリー走査/world root 再解決は発生しない
-    （`_read_head_for_status` docstring 参照）。
+    原本が存在するが変換に失敗/未対応な Office/PDF/画像も対象原本として数える——
+    `status_document_doctype()` が None を返す付帯物（semantic/*.json 等）だけを除外する。
+    軽量テキスト枠（`ingest.text_kind`）第1段（拡張子マップ）は内容を読まないため無コスト。
+    ただし `accepts()` を上書きする登録アナライザ（`HtmlTemplateAnalyzer` 等）の拡張子は
+    `status_document_doctype()`→`_read_head_for_status()` が rel ごとに `documents.resolve`→
+    `worlds.world_dir` を再解決（DB 往復もありうる）し、その head（64KiB）を読む——**manifest
+    件数に比例したコスト**になる。呼び出し元がこのコストを避けたい場合は、既に world root を
+    握っている経路から呼ぶ: 直前に `scan_report()` を呼んだ成功確定経路はその戻り値の
+    `document_count`（同一の判定を走査ループ内で算出済み）をそのまま使い、バックフィル
+    （`ingest/worker.py` の unchanged 経路）は `manifest_doctype_count_from_root()`
+    （world root を1回だけ解決）を使う——本関数を直接は呼ばない。
     """
     return sum(1 for rel in manifest if status_document_doctype(rel, world) is not None)
+
+
+def manifest_doctype_count_from_root(manifest: dict, root) -> int:
+    """`manifest_doctype_count()` と同じ判定（`_doctype_for_count`）を、**解決済みの world root**
+    （呼び出し側が `worlds.world_dir(world)` を一度だけ呼んだ結果）から数える——バックフィル用
+    集計（`ingest/worker.py` の unchanged 経路・`last_doc_count`/`last_manifest` 列の初期補完）専用。
+
+    `manifest_doctype_count()`（`status_document_doctype`→`_read_head_for_status`経由）は accepts()
+    上書きのある拡張子（`.html`等）ごとに `documents.resolve`→`worlds.world_dir` を**個別に**再解決
+    （DB 往復もありうる）する——バックフィルは `world_lock` 保持中に呼ばれるため、manifest 件数分の
+    再解決を1回の解決に潰す。`root` から `ingest.world_graph.resolve_path`（lstat のみ・階層数に
+    比例するコストで実ファイルへ直接降りる）で個々の rel を辿るため、DB 往復は発生しない。
+    `root` が `None`（world 不在）なら全件を読み取り不能として扱う（`manifest_doctype_count` が
+    `documents.resolve` の `None` を経て `_HeadUnreadable` へ倒すのと同じ挙動）。
+    """
+    from .ingest import world_graph
+
+    def _read_for(rel):
+        def _read(size=4096):
+            if root is None:
+                raise _HeadUnreadable("world_unresolved")
+            rp = world_graph.resolve_path(root, rel)
+            if rp is None:
+                raise _HeadUnreadable("not_found")
+            return _read_head(rp, size)
+        return _read
+
+    count = 0
+    for rel in manifest:
+        if importance.is_importance_control_path(rel):
+            continue
+        ext = Path(rel).suffix.lower()
+        result = classify_document(rel, ext, _read_for(rel), allow_content_sniff=False)
+        if _doctype_for_count(result, ext) is not None:
+            count += 1
+    return count
 
 
 def status_document_requires_coverage(rel_path: str, world: str) -> bool:
@@ -293,8 +416,9 @@ def status_document_requires_coverage(rel_path: str, world: str) -> bool:
     `allow_content_sniff=False`（`status_document_doctype` と同じ理由・docstring参照）。
     """
     ext = Path(rel_path).suffix.lower()
-    result = classify_document(rel_path, ext, lambda: _read_head_for_status(world, rel_path),
-                              allow_content_sniff=False)
+    result = classify_document(
+        rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
+        allow_content_sniff=False)
     if result["kind"] in ("code", "unreadable") or result["doctype"] is not None:
         return False
     if ext in _OFFICE_DOCTYPE:
@@ -440,11 +564,16 @@ def provenance_summary(md_path) -> dict | None:
 
 
 def _text_oversize(rp: Path) -> bool:
-    """軽量テキスト枠（`ingest.text_kind`）だけに適用するサイズ超過判定（grep 上限と同じ 8MiB）。
+    """`kind=="code"` の文書全般（登録アナライザ＝cobol/copybook/jcl/java/xml_config/properties/
+    yaml_config・軽量テキスト枠の汎用コードの両方）に適用するサイズ超過判定（grep 上限と同じ 8MiB・
+    単一の真実源＝`text_kind.MAX_BYTES`）。`.md`/`.txt`・Office/画像には適用しない——呼び出し側が
+    `result["kind"] == "code"` のときだけ呼ぶ（`_NONCODE_DOCTYPE` 由来の資料判定はここを通らない）。
 
-    登録アナライザのコード・`.md`/`.txt`・Office/画像には適用しない（既存動作は無変更）——
-    呼び出し側が `doctype` が `text_kind.CODE_DOCTYPE_LABEL`/`DOCUMENT_DOCTYPE_LABEL` の
-    ときだけ呼ぶ。stat 失敗（消失・権限）はサイズ超過として扱わない（実読込の失敗は別経路
+    登録アナライザは `corpus_docs.classify_document()` の accepts() 判定だけでは実ファイルサイズを
+    見ないため、この上限が無いと `world_graph.build_world()` の Pass1 が `read_full_text_and_raw()` で
+    巨大ファイルを全量メモリに読み込んでしまう（単一 worker を1ファイルで OOM させ得る）。8MiB 超のソース
+    （COBOL/Java/設定ファイル問わず）は実務上あり得ない前提で、コード種別は言語を問わず一律に
+    この上限を適用する。stat 失敗（消失・権限）はサイズ超過として扱わない（実読込の失敗は別経路
     （`unreadable`）が拾う対象で、本関数の責務ではない）。
     """
     try:
@@ -475,11 +604,18 @@ def empty_scan_report() -> dict:
     """
     return {"scanned": 0, "indexed": 0, "by_doctype": {}, "office_md": 0,
             "skipped_office": 0, "office_failed": 0, "skipped_other": 0, "skipped_ext": {},
-            "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0}
+            "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0,
+            "document_count": 0}
 
 
-def scan_report(world: str) -> dict:
+def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> dict:
     """world 走査の内訳（**取り込み状況の正直化**）。インデックス済み・未対応形式・拡張子別の件数を返す。
+
+    `expected_rels`（省略可）: 呼び出し元が既に持つ rel 集合（取り込み冒頭の manifest 等）。本走査
+    （`si.safe_files(wd)`）が実際に見た rel 集合と一致した場合だけ `document_count` を実値で返す
+    ——不一致（本走査より前の集合を渡した後、その間にファイルが追加/削除された＝世代混在）なら
+    `document_count` を `None` にして更新を保留する（呼び出し元が古い/新しい世代の値を取り違えて
+    確定しないための安全弁）。省略時（`None`）は従来どおり比較せず実値をそのまま返す。
 
     `indexed`＝検索対象になる本文（ソース/設計書/テキスト＋**MD化できた Office**＋（OCR 有効時のみ）**OCR できた画像**）。
     `office_md`＝そのうち検索可能なOffice MD（明示partial noticeを含む。画像は別集計）。
@@ -497,10 +633,17 @@ def scan_report(world: str) -> dict:
     しない）。現行の登録拡張子構成（cobol/copybook/jcl のみ）では常に0＝コード拡張子と資料拡張子が
     排他のため。将来アナライザが既存の資料拡張子を要求した場合に非0になる。
     `unreadable`＝内容判定が必要だったが読み取れず明示の失敗にした件数（`iter_world_documents`/
-    `status_document_doctype` と同じ `classify_document()` を共有）。**軽量テキスト枠**
-    （`ingest.text_kind`＝未登録拡張子のテキストファイル）のサイズ超過（8MiB・grep 上限と同じ）
-    もここへ合流する（`skipped_ext` にも計上・`failure_reasons.REASON_CATALOG["size_exceeded"]`
-    と同じ理由）——新しいカウンタは増やさない。
+    `status_document_doctype` と同じ `classify_document()` を共有）。`kind=="code"` 全般
+    （登録アナライザ＝cobol/copybook/jcl/java/xml_config/properties/yaml_config・軽量テキスト枠の
+    汎用コードの両方）のサイズ超過（8MiB・grep 上限と同じ・`_text_oversize` 参照）もここへ合流する
+    （`skipped_ext` にも計上・`failure_reasons.REASON_CATALOG["size_exceeded"]` と同じ理由）——
+    新しいカウンタは増やさない。
+    `document_count`＝`manifest_doctype_count()`/`status_document_doctype()` と同一の判定（doctype
+    対応原本件数・`/ext/v1/capabilities` の `document_count` の材料）をこのループ内で算出したもの。
+    `_doctype_for_count()` を共有し、本ループが既に読んだ head を再利用する（追加 I/O・world root
+    再解決なし）——`ingest/worker.py` の成功確定経路はこの値をそのまま `confirm_doc_count` に使い、
+    `manifest_doctype_count()` を別途呼ばない（HTML 等の accepts() 上書きアナライザに対する per-file
+    `documents.resolve`→`worlds.world_dir` 再解決の重複を無くす）。
     """
     wd = worlds.world_dir(world)
     if not wd:
@@ -509,21 +652,45 @@ def scan_report(world: str) -> dict:
     conv = _office_convertible()                       # OOXML＋（バックエンド有なら）PDF
     image_exts = _image_convertible(conv)              # 画像（OCR 有効時のみ非空・既定は空＝画像は下の else へ）
     (indexed, by, office_md_n, office_skip, office_fail, other, skipped_ext,
-     analyzer_declined, analyzer_declined_as_document, unreadable) = (
-        0, Counter(), 0, 0, 0, 0, Counter(), 0, 0, 0)
+     analyzer_declined, analyzer_declined_as_document, unreadable, doc_count) = (
+        0, Counter(), 0, 0, 0, 0, Counter(), 0, 0, 0, 0)
     scanned = 0
+    # `expected_rels` 比較用（省略時は集めない＝無駄なメモリ確保を避ける）。manifest と同じ母集合
+    # （重要度設定ファイルも含む全 rel）にするため、下の `continue` より前で追加する。
+    actual_rels: set | None = set() if expected_rels is not None else None
     for rp, rel in si.safe_files(wd):
         scanned += 1
+        if actual_rels is not None:
+            actual_rels.add(rel)
         if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は検索可能数・by_doctype に数えない（§5）
             continue
         ext = rp.suffix.lower()
-        result = classify_document(rel, ext, lambda rp=rp: _read_head(rp))
+        head_cache: dict = {}
+
+        def _cached_read_head(size=4096, rp=rp, cache=head_cache):
+            if size not in cache:
+                cache[size] = _read_head(rp, size)
+            return cache[size]
+
+        result = classify_document(rel, ext, _cached_read_head)
+        # `document_count`（`/ext/v1/capabilities` の doc_count が使う値）: `manifest_doctype_count`/
+        # `status_document_doctype` と同一の判定（`allow_content_sniff=False`）を、本ループが既に
+        # 読んだ head を `_cached_read_head` 経由で再利用して求める——`registry` の登録済みアナライザ
+        # （`accepts()` 上書き含む＝HTML等）は `allow_content_sniff` の影響を受けない経路のため
+        # キャッシュヒットで追加 I/O ゼロ、軽量テキスト枠の2段目（内容推定）だけが `allow_content_
+        # sniff=False` で短絡し従来どおり対象外のまま——`ingest/worker.py` の成功確定経路
+        # （`confirm_doc_count`）はこの値をそのまま使い、`manifest_doctype_count()`（`status_
+        # document_doctype`→`documents.resolve`→`worlds.world_dir` の per-file 再解決を伴う）を
+        # 別途呼ばずに済む。
+        if _doctype_for_count(classify_document(rel, ext, _cached_read_head, allow_content_sniff=False),
+                              ext) is not None:
+            doc_count += 1
         if result["kind"] == "unreadable":
             unreadable += 1
             continue
         if result["kind"] == "code":
-            if result["doctype"] == text_kind.CODE_DOCTYPE_LABEL and _text_oversize(rp):
-                unreadable += 1                         # 軽量テキスト枠のみ・サイズ超過は対象外（failure_reasons.size_exceeded）
+            if _text_oversize(rp):
+                unreadable += 1                         # 登録アナライザ/軽量テキスト枠のコード全般・サイズ超過は対象外（failure_reasons.size_exceeded）
                 skipped_ext[ext] += 1
                 continue
             indexed += 1
@@ -575,11 +742,14 @@ def scan_report(world: str) -> dict:
                 analyzer_declined += 1
             other += 1
             skipped_ext[ext or "(拡張子なし)"] += 1
+    if expected_rels is not None and actual_rels != expected_rels:
+        doc_count = None            # 世代混在（走査中の増減）＝実値を確定できないので更新保留
     return {"scanned": scanned, "indexed": indexed, "by_doctype": dict(by), "office_md": office_md_n,
             "skipped_office": office_skip, "office_failed": office_fail,
             "skipped_other": other, "skipped_ext": dict(skipped_ext),
             "analyzer_declined": analyzer_declined,
-            "analyzer_declined_as_document": analyzer_declined_as_document, "unreadable": unreadable}
+            "analyzer_declined_as_document": analyzer_declined_as_document, "unreadable": unreadable,
+            "document_count": doc_count}
 
 
 def iter_world_documents(world: str, include_rag: bool = False, *, root=None, deadline: float | None = None,
@@ -633,7 +803,7 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
         # コード判定は拡張子だけでなく accepts() まで見て確定する（`resolve_lazy` は既定 accepts
         # （常に真）のアナライザしか候補に無ければ内容を読まない＝列挙コストは増やさない・§7 裁定10）。
         # scan_report/status_document_doctype と同じ classify_document() を共有する。
-        result = classify_document(rel, ext, lambda rp=rp: _read_head(rp))
+        result = classify_document(rel, ext, lambda rp=rp, size=4096: _read_head(rp, size))
         if result["kind"] == "unreadable":
             # 内容判定が必要だったが読み取れない＝次点アナライザへ誤配属せず判定を打ち切り、
             # 明示の失敗状態として出す。
@@ -646,7 +816,7 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
             # 担当アナライザの来歴を一覧応答で参照できるようにする）——画面は `analyzer` を表示する。
             # 軽量テキスト枠の汎用コード（`text_kind`）には登録アナライザが無い＝`analyzer=None`。
             analyzer_obj = result.get("analyzer")
-            if result["doctype"] == text_kind.CODE_DOCTYPE_LABEL and _text_oversize(rp):
+            if _text_oversize(rp):
                 yield _size_exceeded_row(rel, result["doctype"], "source")
             else:
                 yield {"name": rel, "path": rel, "doctype": result["doctype"], "branch": "source",

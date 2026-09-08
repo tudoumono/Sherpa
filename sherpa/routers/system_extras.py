@@ -181,6 +181,13 @@ class SystemSettingsReq(BaseModel):
     depth_base_impact_depth: StrictInt | None = Field(default=None, ge=1, le=64)
     depth_base_troubleshoot_depth: StrictInt | None = Field(default=None, ge=1, le=16)
     depth_base_codex_reasoning: str | None = None
+    # API の1応答内のツール実行数。調べる深さの倍率を掛けず、全 API 方言に適用する。
+    agentic_max_tools_per_turn: StrictInt | None = Field(default=None, ge=1, le=256)
+    # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
+    # 既定（未指定=None）は env 既定値（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。
+    # null は未設定へ戻す（env/既定へフォールバック）。
+    chat_max_turns_per_user: StrictInt | None = Field(default=None, ge=1, le=16)
+    chat_max_turns_global: StrictInt | None = Field(default=None, ge=1, le=64)
     # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の
     # tool-result バイト予算を管理者設定へ昇格（SET-2「運用ポリシーは UI が唯一の持ち主」・
     # env フォールバックは ENV-CLEAN で撤去済み）。既定（未指定=None）はコード既定（精度優先・
@@ -602,7 +609,7 @@ def _admin_settings_view() -> dict:
     UI は実効値でチェック/表を描画し、`configured`（生値・未設定なら null）で「既定に従っているか」を判別し、
     `env_default`/`default` で「未設定に戻したら何になるか」を示す（プレースホルダ表示）。
     """
-    from sherpa import agentic_search, chat_service, impact_service, keys, lens_service, llm
+    from sherpa import agentic_search, chat_service, chat_turns, impact_service, keys, lens_service, llm
     from sherpa.ingest import arms as ingest_arms
     from sherpa.ingest import llm_render
     from sherpa.ingest.arms import legacy_convert, vision_arm
@@ -858,6 +865,27 @@ def _admin_settings_view() -> dict:
                     sysset, "codex_reasoning", os.environ.get("SHERPA_CODEX_REASONING", "low")),
                 "default": os.environ.get("SHERPA_CODEX_REASONING", "low"),
                 "options": list(depth_profile.CODEX_REASONING_LEVELS),
+            },
+        },
+        "agentic_tool_limit": {
+            "configured": sysset.get("agentic_max_tools_per_turn"),
+            "effective": agentic_search.effective_max_tools_per_turn(sysset),
+            "default": agentic_search.MAX_TOOLS_PER_TURN,
+        },
+        # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
+        # `effective` は実際にターン受付が使う値そのもの（`effective_limits()` を直接呼ぶ・
+        # 表示とターン受付の解決ロジックを二重化しない）。`default` は env 既定（未設定に戻した
+        # ときの実効値）。
+        "chat_max_turns": {
+            "per_user": {
+                "configured": sysset.get("chat_max_turns_per_user"),
+                "effective": chat_turns.effective_limits()[0],
+                "default": chat_turns.MAX_TURNS_PER_USER,
+            },
+            "global": {
+                "configured": sysset.get("chat_max_turns_global"),
+                "effective": chat_turns.effective_limits()[1],
+                "default": chat_turns.MAX_TURNS_GLOBAL,
             },
         },
         # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の
@@ -1368,7 +1396,9 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     変更はこの PUT 適用後の実効設定で実送信可能性も preflight する
     （`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの
     基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は
-    `sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。agentic_budget_per_result/
+    `sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。chat_max_turns_per_user/
+    chat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field
+    で範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/
     agentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・
     累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は "provider:model" →
     tokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。
@@ -1426,6 +1456,12 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "depth_base_codex_reasoning" in provided:
         updates["depth_base_codex_reasoning"] = _validate_depth_base_codex_reasoning(
             provided["depth_base_codex_reasoning"])
+    if "agentic_max_tools_per_turn" in provided:
+        updates["agentic_max_tools_per_turn"] = provided["agentic_max_tools_per_turn"]
+    # チャット同時実行の上限（2項目とも StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
+    for _k in ("chat_max_turns_per_user", "chat_max_turns_global"):
+        if _k in provided:
+            updates[_k] = provided[_k]
     # BUDGET-1（§3.4）: agentic search の tool-result バイト予算（2項目とも StrictInt+Field(ge,le)
     # で pydantic が範囲検証済み・カスタムバリデータ不要）。
     for _k in ("agentic_budget_per_result", "agentic_budget_total"):

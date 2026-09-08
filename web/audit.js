@@ -104,12 +104,12 @@ function renderRows(rows) {
     const detail = esc(fmtDetail(r.detail));
     return `<tr class="audit-row" data-idx="${i}">
       <td class="ts-cell col-ts">${ts}</td>
-      <td class="col-actor" style="font-family:var(--font-code,monospace);font-size:11.5px">${actor}</td>
+      <td class="col-actor" style="font-family:var(--font-code,monospace);font-size:var(--text-caption)">${actor}</td>
       <td class="action-cell col-action">${action}</td>
-      <td class="col-resource" style="font-size:11px;color:var(--ink-3);font-family:var(--font-code,monospace)">${res}</td>
+      <td class="col-resource" style="font-size:var(--text-caption);color:var(--ink-3);font-family:var(--font-code,monospace)">${res}</td>
       <td class="col-outcome ${outcomeClass(r.outcome)}"${r.request_id ? ` title="request_id: ${esc(r.request_id)}"` : ''}>${oc}</td>
       <td class="col-severity ${sevClass(r.severity)}">${sev}</td>
-      <td class="col-reason" style="font-size:11.5px;color:var(--ink-3)">${reason}</td>
+      <td class="col-reason" style="font-size:var(--text-caption);color:var(--ink-3)">${reason}</td>
       <td class="detail-cell col-detail"><button type="button" class="detail-toggle" data-detail-toggle>▸</button> ${detail}</td>
     </tr>`;
   }).join('');

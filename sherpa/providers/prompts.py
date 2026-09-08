@@ -24,6 +24,12 @@ def _facts(lens: str, env: dict) -> str:
     """取得済みRAGの事実を LLM への根拠として簡潔に整形（ここに無いことは書かせない）。
 
     Feature B: env["_personal_facts"] がある場合は末尾に追記（本人のみ参照・共有 RAG には入れない）。
+
+    qa（impact の引用フォールバックを含む）は `env["_synthesis_digest"]`
+    （`agentic_search.build_synthesis_digest` の全件ダイジェスト）があればそれをそのまま使う——
+    無ければ従来どおり先頭4引用×60字に整形する（ハイブリッド以外の呼び出し元は
+    `_synthesis_digest` を持たないため挙動は不変）。troubleshoot／構造データありの impact は
+    このキーを見ない。
     """
     d = env.get("data", {})
     # 影響調査（impact）も反復ツール検索の対象になった（2026-08-15）。その経路の env は
@@ -66,6 +72,9 @@ def _facts(lens: str, env: dict) -> str:
             parts.append(f"{c['name']}({c.get('role', '')})" + (f" 根拠「{' / '.join(qs)}」" if qs else ""))
         base = "原因候補: " + "、".join(parts) if parts else "原因候補なし"
         return base + (env.get("_personal_facts") or "")
+    digest = env.get("_synthesis_digest")
+    if digest:
+        return digest + (env.get("_personal_facts") or "")
     cites = d.get("citations", [])
     base = "該当箇所: " + " / ".join(f"{c['doc_id']}「{(c.get('quote') or '')[:60]}…」" for c in cites[:4]) if cites else "該当なし"
     return base + (env.get("_personal_facts") or "")

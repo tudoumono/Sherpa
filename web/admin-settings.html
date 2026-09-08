@@ -13,25 +13,31 @@
   .wrap2{max-width:none;margin:0}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .sec{margin-top:18px}
-  .sec .body{padding:14px}
-  .hint{font-size:12.5px;color:var(--ink-2);margin-top:4px}
+  .sec .body{padding:20px 24px}
+  .hint{font-size:var(--text-small);color:var(--ink-2);margin-top:4px}
+  .research-group{margin-top:28px;padding:20px;border:1px solid var(--border);
+    border-top:4px solid var(--ink-2);border-radius:var(--radius);background:var(--surface-2)}
+  .research-group + .research-group{margin-top:40px}
+  .research-group > h2{margin:0 0 20px;font-size:24px;font-weight:700;line-height:1.4;color:var(--ink)}
+  .research-group > .sec{margin-top:16px}
+  @media(max-width:640px){.research-group{padding:12px}.research-group > h2{font-size:21px}}
   /* 取り込みアームのチェックボックス行 */
   .armrow{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--border)}
   .armrow:last-child{border-bottom:none}
   .armrow input[type=checkbox],.armrow input[type=radio]{margin-top:3px;width:16px;height:16px;flex:none}
   .armrow input:disabled{opacity:.5}
-  .armrow .arm-t{font-weight:600;font-size:13.5px;color:var(--ink)}
-  .armrow .arm-d{font-size:12px;color:var(--ink-3);margin-top:2px}
-  .armrow code{font-size:11px;color:var(--ink-3)}
+  .armrow .arm-t{font-weight:600;font-size:var(--text-label);color:var(--ink)}
+  .armrow .arm-d{font-size:var(--text-small);color:var(--ink-3);margin-top:2px}
+  .armrow code{font-size:var(--text-caption);color:var(--ink-3)}
   /* 旧形式変換バックエンド（W0） */
   #legacy-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
   #legacy-lo-missing{margin-top:8px}
   /* 視覚読み取りの VLM 設定（⑤） */
   #vlm-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
   .vlm-field{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-  .vlm-field .vlm-l{font-size:13px;color:var(--ink);min-width:88px}
+  .vlm-field .vlm-l{font-size:var(--text-label);color:var(--ink);min-width:88px}
   .vlm-field select,.vlm-field input[type=text],.vlm-field textarea{flex:1;max-width:360px;padding:6px 8px;
-    font-size:13px;font-family:inherit;border:1px solid var(--border);border-radius:var(--radius);
+    font-size:var(--text-label);font-family:inherit;border:1px solid var(--control-border);border-radius:var(--radius);
     background:var(--surface);color:var(--ink)}
   .vlm-cloud{display:flex;gap:10px;align-items:flex-start;padding:8px 0}
   .vlm-cloud input[type=checkbox]{margin-top:3px;width:16px;height:16px;flex:none}
@@ -41,64 +47,92 @@
   .testrow{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
   .cloud-provider-row{display:flex;gap:10px;align-items:flex-start;padding:8px 0}
   .cloud-provider-row input[type=radio]{margin-top:3px;width:16px;height:16px;flex:none}
-  /* 管理系ページへの埋め込みタブ（#admin-tabs の続き・UI-TABS2・2026-09-04）。ユーザー管理／
-     利用統計／監査ログ／システム状態は、設定タブと同じ .tab-btn（role="tab"）で描画し、パネルは
-     ページ遷移ではなく iframe（?embed=1）を埋め込む＝admin-settings.html に留まったまま切り替わる。
-     設定タブとの間に控えめな仕切り（縦罫）だけ残す。 */
-  .tab-sep{align-self:center;width:1px;height:18px;background:var(--border);margin:0 6px 0 2px;flex:none}
-  .tl-ico{font-size:12px;margin-right:3px}
-  /* 保存アクションバー（settings.html と同じ流儀・固定） */
-  .action-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;justify-content:center;
-    padding:12px 24px;border-top:1px solid var(--border);
-    background:color-mix(in srgb,var(--surface) 88%,transparent);
-    backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
-  .action-bar-inner{max-width:900px;width:100%;display:flex;gap:10px;align-items:center}
-  .wrap2.frm{padding-bottom:76px}
-  .tres{font-size:12.5px} .ok{color:var(--ok)} .danger{color:var(--danger)} .muted{color:var(--ink-3)}
+  /* ヘッダ・保存バーの実寸を除いた残り高さを、ナビとパネルへ割り当てる。 */
+  .admin-layout{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+  .admin-layout > sherpa-topbar{flex:none}
+  .admin-layout > .wrap{width:100%;max-width:1440px;flex:1;min-height:0;padding:24px 28px 16px}
+  #main-content{height:100%;min-height:0;display:flex;flex-direction:column}
+  .pagehead{flex:none;flex-wrap:wrap;align-items:center;gap:8px 20px;margin-bottom:24px}
+  .pagehead > div:first-child{flex:1;min-width:260px}
+  .pagehead .sub{margin-top:6px;max-width:56rem}
+  .pagehead .spacer{display:none}
+  .wrap2.frm{flex:1;min-height:0;display:grid;grid-template-columns:14rem minmax(0,1fr);gap:24px;padding:0}
+  .admin-panels{min-height:0;min-width:0;display:flex;flex-direction:column}
+  .action-bar{flex:none;display:flex;justify-content:center;padding:12px 28px;
+    border-top:1px solid var(--border);background:var(--surface)}
+  .action-bar-inner{max-width:1384px;width:100%;display:flex;gap:10px 20px;align-items:center;flex-wrap:wrap}
+  .save-scope{font-size:var(--text-small);color:var(--ink-2)}
+  #msg{margin:0;font-size:var(--text-small)}
+  #unsaved-note{font-size:var(--text-small);font-weight:600;color:var(--accent-ink)}
+  #save-bar:has(#unsaved-note:not([hidden])) #msg:not(:has(.danger,.loading-inline)){display:none}
+  #save{flex:none}
+  .tres{font-size:var(--text-small)} .ok{color:var(--ok)} .danger{color:var(--danger)} .muted{color:var(--ink-3)}
   /* 使えるモデル（model_catalog）: 用途×プロバイダの1枚表 */
-  .mc-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+  .mc-table{width:100%;border-collapse:collapse;font-size:var(--text-label);margin-top:8px}
   .mc-table th,.mc-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
-  .mc-table th{color:var(--ink-3);font-weight:600;font-size:12px}
+  .mc-table th{color:var(--ink-3);font-weight:600;font-size:var(--text-small)}
   .mc-table td.mc-na{color:var(--ink-3)}
-  .mc-table select.mc-default{max-width:200px;padding:5px 7px;font-size:12.5px;border:1px solid var(--border);
+  .mc-table select.mc-default{max-width:200px;padding:5px 7px;font-size:var(--text-small);border:1px solid var(--control-border);
     border-radius:var(--radius);background:var(--surface);color:var(--ink)}
   .mc-table td.mc-changed select.mc-default{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--surface))}
   #mc-modal-textarea{width:100%;min-height:160px}
-  .modal-close{background:none;border:none;font-size:15px;color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
+  .modal-close{background:none;border:none;font-size:var(--text-body);color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
   .modal-close:hover{background:var(--surface-2)}
   /* 外部連携（API キー）カード */
-  .ek-table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
+  .ek-table{width:100%;border-collapse:collapse;font-size:var(--text-label);margin-top:8px}
   .ek-table th,.ek-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
-  .ek-table th{color:var(--ink-3);font-weight:600;font-size:11.5px}
+  .ek-table th{color:var(--ink-3);font-weight:600;font-size:var(--text-small)}
   .ek-table td.ek-muted{color:var(--ink-3)}
-  .ek-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px}
+  .ek-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:var(--text-caption)}
   .ek-badge.ek-active{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
   .ek-badge.ek-revoked,.ek-badge.ek-expired{background:color-mix(in srgb,var(--ink-3) 16%,transparent);color:var(--ink-3)}
   .mini.ek-danger{color:var(--danger);border-color:var(--danger)}
-  #ek-issue-form label{font-size:12px;color:var(--ink-3);display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
-  #ek-issue-form input,#ek-issue-form textarea{padding:6px 8px;font-size:13px;font-family:inherit;
-    border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);color:var(--ink)}
-  #ek-reveal-key{font-size:13px;word-break:break-all;padding:10px;border:1px solid var(--border);
+  #ek-issue-form label{font-size:var(--text-small);color:var(--ink-3);display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+  #ek-issue-form input,#ek-issue-form textarea{padding:6px 8px;font-size:var(--text-label);font-family:inherit;
+    border:1px solid var(--control-border);border-radius:var(--radius);background:var(--surface);color:var(--ink)}
+  #ek-reveal-key{font-size:var(--text-label);word-break:break-all;padding:10px;border:1px solid var(--border);
     border-radius:var(--radius);background:var(--surface-2);margin:10px 0}
-  /* 5タブ構成（プロバイダ＋接続先／使えるモデル／取り込み／利用量／外部連携）。 */
-  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);flex-wrap:wrap}
-  .tab-btn{position:relative;padding:10px 16px;border:none;background:none;font-size:13.5px;
-    font-weight:600;color:var(--ink-3);cursor:pointer;border-bottom:2px solid transparent;
-    margin-bottom:-1px}
-  .tab-btn:hover{color:var(--ink)}
-  .tab-btn[aria-selected="true"]{color:var(--accent-ink,var(--ink));border-bottom-color:var(--accent)}
-  .tab-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);
+  .tabs{display:flex;flex-direction:column;gap:4px;overflow:auto;padding:0 8px 16px 0;
+    border-right:1px solid var(--border)}
+  .tab-group-title{padding:8px 12px;font-size:var(--text-small);font-weight:600;color:var(--ink-2)}
+  .tab-group-operations{margin-top:20px;border-top:1px solid var(--border);padding-top:20px}
+  .tab-btn{position:relative;flex:none;min-height:44px;padding:10px 12px;border:1px solid transparent;
+    border-radius:var(--radius-sm);background:transparent;font-size:var(--text-label);line-height:1.5;
+    font-weight:500;color:var(--ink-2);cursor:pointer;text-align:left;overflow-wrap:anywhere}
+  .tab-btn:hover{background:var(--surface-2);color:var(--ink)}
+  .tab-btn[aria-selected="true"]{color:var(--accent-ink);background:var(--accent-weak);font-weight:600;
+    border-color:var(--accent)}
+  .tab-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent-ink);
     margin-left:6px;vertical-align:middle}
   .tab-dot[hidden]{display:none}
-  .tabpanel{padding-top:16px}
-  /* 埋め込みタブのパネル: iframe を等幅・タブバー等を差し引いた高さで表示（中身側スクロール・
-     過剰な postMessage 高さ同期はしない・シンプルな固定計算でよい）。 */
-  .tabpanel-embed{padding-top:10px}
-  .embed-frame{display:block;width:100%;border:none;border-radius:var(--radius);
-    height:calc(100vh - 300px);min-height:420px}
+  .tabpanel:not([hidden]){flex:1;min-height:0;overflow:auto;padding:0 8px 20px 0;scrollbar-gutter:stable}
+  .tabpanel > .sec:first-child{margin-top:0}
+  .tabpanel-embed:not([hidden]){display:flex;overflow:hidden;padding:0;scrollbar-gutter:auto}
+  .embed-frame{flex:1;display:block;width:100%;height:100%;min-height:0;border:1px solid var(--border);
+    border-radius:var(--radius);background:var(--surface)}
+  @media(max-width:900px){
+    .admin-layout > .wrap{padding:16px 16px 12px}
+    .wrap2.frm{grid-template-columns:11rem minmax(0,1fr);gap:16px}
+    .pagehead{margin-bottom:16px}
+    .action-bar{padding:12px 16px}
+    .vlm-field{flex-wrap:wrap}
+    .vlm-field .vlm-l{width:100%}
+    .vlm-field select,.vlm-field input,.vlm-field textarea{min-width:0;max-width:100%;width:100%}
+  }
+  @media(max-width:600px){
+    .wrap2.frm{grid-template-columns:9rem minmax(0,1fr);gap:12px}
+    .tab-btn{padding:8px}
+  }
+  /* 拡大表示で縦方向が足りない場合はページをスクロールさせ、操作領域の高さを保つ。 */
+  @media(max-height:400px){
+    .admin-layout{height:auto;min-height:100dvh;overflow:auto}
+    .admin-layout > .wrap{flex:none}
+    #main-content{height:auto}
+    .wrap2.frm{flex:none;height:24rem}
+  }
   /* 高度な設定は「詳細」折りたたみへ（タブあたり1箇所まで）。 */
   details.adv{margin-top:16px;border-top:1px solid var(--border);padding-top:12px}
-  details.adv > summary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--ink-2);
+  details.adv > summary{cursor:pointer;font-size:var(--text-small);font-weight:600;color:var(--ink-2);
     list-style:none}
   details.adv > summary::-webkit-details-marker{display:none}
   details.adv > summary::before{content:'▸ ';color:var(--ink-3)}
@@ -109,21 +143,20 @@
     background:color-mix(in srgb,var(--accent) 8%,var(--surface))}
 </style>
 </head>
-<body>
+<body class="admin-layout">
 <sherpa-topbar></sherpa-topbar>
 
 <div class="wrap">
   <div id="access-denied">
     <div style="font-size:32px;margin-bottom:12px">🚫</div>
-    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
-    <div style="font-size:13px">管理者権限が必要です。</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
   </div>
 
   <div id="main-content">
     <div class="pagehead">
       <div><h1>システム管理</h1>
-        <div class="sub">全ユーザーに効く設定（取り込み）と、管理系の画面への入口です。
-          自分だけの設定は「個人設定」で行います。</div></div>
+        <div class="sub">全ユーザーに適用する設定と、利用状況を管理します。自分だけの設定は「個人設定」へ。</div></div>
       <div class="spacer"></div>
       <!-- 開発者向け API 仕様書への導線（画面裏の HTTP API 仕様を確認する用途）。 -->
       <a class="help-link" href="/docs" target="_blank" rel="noopener">Swagger UI（API仕様書）→</a>
@@ -131,28 +164,25 @@
     </div>
 
     <div class="wrap2 frm">
-      <!-- 5タブ（プロバイダ＋接続先／使えるモデル／取り込み／利用量／外部連携）＋管理系ページへの
-           埋め込みタブ4個（ユーザー管理／利用統計／監査ログ／システム状態）。URL ハッシュで
-           選択中のタブを記憶する（admin-settings.js::activateTab）。保存ボタンはタブ共通・
-           タブごとの丸印は未保存の変更があることを示す。埋め込みタブも同じ role="tab"（本物の
-           タブ挙動＝クリックしてもページ遷移せず admin-settings.html に留まる・2026-09-04
-           フィードバック是正＝UI-TABS2）。パネルの中身は iframe（各ページを ?embed=1 付きで
-           埋め込み・初回選択時に遅延ロード）。設定タブとの間に控えめな仕切り（縦罫）だけ残す。 -->
-      <div class="tabs" role="tablist" id="admin-tabs">
-        <button class="tab-btn" type="button" role="tab" data-tab="provider" aria-selected="true">プロバイダ＋接続先<span class="tab-dot" id="tab-dot-provider" hidden></span></button>
-        <button class="tab-btn" type="button" role="tab" data-tab="models" aria-selected="false">使えるモデル<span class="tab-dot" id="tab-dot-models" hidden></span></button>
-        <button class="tab-btn" type="button" role="tab" data-tab="ingest" aria-selected="false">取り込み<span class="tab-dot" id="tab-dot-ingest" hidden></span></button>
-        <button class="tab-btn" type="button" role="tab" data-tab="usage" aria-selected="false">利用量<span class="tab-dot" id="tab-dot-usage" hidden></span></button>
-        <button class="tab-btn" type="button" role="tab" data-tab="extkeys" aria-selected="false">外部連携<span class="tab-dot" id="tab-dot-extkeys" hidden></span></button>
-        <span class="tab-sep" aria-hidden="true"></span>
-        <button class="tab-btn" type="button" role="tab" data-tab="users" aria-selected="false" id="tab-btn-users" title="利用者の追加・無効化・権限の変更。"><span class="tl-ico">👥</span>ユーザー管理</button>
-        <button class="tab-btn" type="button" role="tab" data-tab="usage-page" aria-selected="false" id="tab-btn-usage-page" title="利用の傾向・トークンの集計。"><span class="tl-ico">📊</span>利用統計</button>
-        <button class="tab-btn" type="button" role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit" title="誰が・いつ・何をしたかの記録。"><span class="tl-ico">📝</span>監査ログ</button>
-        <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況。"><span class="tl-ico">🩺</span>システム状態</button>
+      <!-- タブのキー・保存範囲を維持し、運用画面は初回選択時だけ iframe へ読み込む。 -->
+      <div class="tabs" role="tablist" id="admin-tabs" aria-label="システム管理の項目" aria-orientation="vertical">
+        <div class="tab-group-title" role="presentation">設定</div>
+        <button class="tab-btn" type="button" role="tab" data-tab="provider" aria-selected="true" id="tab-btn-provider" aria-controls="tabpanel-provider" tabindex="0">プロバイダ＋接続先<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-provider" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="research" aria-selected="false" id="tab-btn-research" aria-controls="tabpanel-research" tabindex="-1">調査・回答<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-research" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="models" aria-selected="false" id="tab-btn-models" aria-controls="tabpanel-models" tabindex="-1">使えるモデル<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-models" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="ingest" aria-selected="false" id="tab-btn-ingest" aria-controls="tabpanel-ingest" tabindex="-1">取り込み<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-ingest" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="usage" aria-selected="false" id="tab-btn-usage" aria-controls="tabpanel-usage" tabindex="-1">利用統計の AI<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-usage" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="extkeys" aria-selected="false" id="tab-btn-extkeys" aria-controls="tabpanel-extkeys" tabindex="-1">外部連携<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-extkeys" hidden></span></button>
+        <div class="tab-group-title tab-group-operations" role="presentation">運用・管理</div>
+        <button class="tab-btn" type="button" role="tab" data-tab="users" aria-selected="false" id="tab-btn-users" title="利用者の追加・無効化・権限の変更。" aria-controls="tabpanel-users" tabindex="-1">ユーザー管理</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="usage-page" aria-selected="false" id="tab-btn-usage-page" title="利用の傾向・トークンの集計。" aria-controls="tabpanel-usage-page" tabindex="-1">利用統計</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit" title="誰が・いつ・何をしたかの記録。" aria-controls="tabpanel-audit" tabindex="-1">監査ログ</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況。" aria-controls="tabpanel-status" tabindex="-1">システム状態</button>
       </div>
 
+      <div class="admin-panels">
       <!-- ===== タブ1: プロバイダ＋接続先 ===== -->
-      <div class="tabpanel" id="tabpanel-provider" data-tabpanel="provider">
+      <div class="tabpanel" id="tabpanel-provider" data-tabpanel="provider" role="tabpanel" aria-labelledby="tab-btn-provider" tabindex="0">
         <div class="card sec" id="cloud-card">
           <div class="card-head"><span class="title">AIプロバイダ（クラウド）</span></div>
           <div class="body">
@@ -265,59 +295,27 @@
           </div>
         </div>
 
-        <!-- 調べる深さの基準値（SC-6c・docs/proposals/2026-08-29-調べ方ブロック.md §3.2）。
-             チャットの「調べる深さ」（標準/深く/最大）が掛ける倍率は固定で、ここで編集できるのは
-             「標準」が指す基準値だけ（空欄=既定値のまま動く）。このタブの「既定に戻す」ボタン
+        <!-- 同時実行の上限（背景実行の受付・sherpa/chat_turns.py::effective_limits）。
+             チャットの送信（背景実行のターン）を同時にいくつまで受け付けるかの上限です。
+             空欄のままなら環境設定の初期値（.env）が使われます。このタブの「既定に戻す」ボタン
              （上の cloud-card 内）がこのカードの項目も一緒に既定へ戻す。 -->
-        <div class="card sec" id="depth-profile-card">
-          <div class="card-head"><span class="title">調べる深さの基準値</span></div>
+        <div class="card sec" id="chat-max-turns-card">
+          <div class="card-head"><span class="title">同時実行の上限</span></div>
           <div class="body">
-            <div class="hint" style="margin-bottom:10px">チャットのやりたいことブロックにある「調べる深さ」
-              （標準・深く・最大）が探索の反復回数やヒット件数などにかける倍率の、標準時の基準値です。
-              「深く」「最大」はこの値を元に自動で増減します。空欄のままなら組み込みの既定値が使われます。</div>
+            <div class="hint" style="margin-bottom:10px">チャットで送信した、回答を作成中の質問を同時にいくつまで
+              受け付けるかの上限です。上限に達した分は待たされることなく、その場で
+              「実行中の回答が終わってからもう一度お試しください」という案内になります。空欄のままなら
+              組み込みの既定が使われます。</div>
 
-            <label class="vlm-field"><span class="vlm-l">探索の反復回数（標準）</span>
-              <input type="number" id="depth-base-max-turns" min="1" max="200" step="1" style="max-width:160px">
+            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（1 人あたり）</span>
+              <input type="number" id="chat-max-turns-per-user" min="1" max="16" step="1" style="max-width:160px">
             </label>
-            <div class="hint" id="depth-base-max-turns-hint" style="margin:-8px 0 14px"></div>
+            <div class="hint" id="chat-max-turns-per-user-hint" style="margin:-8px 0 14px"></div>
 
-            <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（標準）</span>
-              <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
+            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（全員の合計）</span>
+              <input type="number" id="chat-max-turns-global" min="1" max="64" step="1" style="max-width:160px">
             </label>
-            <div class="hint" id="depth-base-grep-max-hits-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">内容の質問（仕様問い合わせ）のヒット件数上限（標準）</span>
-              <input type="number" id="depth-base-qa-max-hits" min="1" max="1000" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="depth-base-qa-max-hits-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">1回に読み取る前後の行数（標準）</span>
-              <input type="number" id="depth-base-read-window" min="10" max="400" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="depth-base-read-window-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">影響を調べる深さ（標準）</span>
-              <input type="number" id="depth-base-impact-depth" min="1" max="64" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="depth-base-impact-depth-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">原因を調べる近傍の深さ（標準）</span>
-              <input type="number" id="depth-base-troubleshoot-depth" min="1" max="16" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="depth-base-troubleshoot-depth-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">Codex の推論レベル（標準）</span>
-              <select id="depth-base-codex-reasoning" style="max-width:200px">
-                <option value="">環境設定の既定に従う</option>
-                <option value="minimal">minimal</option>
-                <option value="low">low</option>
-                <option value="medium">medium</option>
-                <option value="high">high</option>
-                <option value="xhigh">xhigh</option>
-              </select>
-            </label>
-            <div class="hint" id="depth-base-codex-reasoning-hint" style="margin:-8px 0 6px"></div>
-            <div class="hint">頭脳が Codex のときだけ効きます。他の AI には推論レベルの指定自体がありません。</div>
+            <div class="hint" id="chat-max-turns-global-hint" style="margin:-8px 0 6px"></div>
           </div>
         </div>
 
@@ -350,13 +348,148 @@
         </div>
       </div>
 
+      <div class="tabpanel" id="tabpanel-research" data-tabpanel="research" role="tabpanel" aria-labelledby="tab-btn-research" tabindex="0" hidden>
+        <p class="hint">利用する AI 経路（Codex または API）の設定と、共通の検索設定を調整します。
+          「標準」の値は、チャットの「深く」「最大」に応じて増えます。</p>
+        <section class="research-group" aria-labelledby="research-codex-heading">
+          <h2 id="research-codex-heading">Codex 専用</h2>
+          <div class="card sec" id="codex-investigation-card">
+            <div class="card-head"><span class="title">Codex に考えさせる量</span></div>
+            <div class="body">
+              <p class="hint">通常の調査で使う推論レベルです。「深く」は high、「最大」は xhigh。「作成」の標準は専用の環境設定を使います。</p>
+              <label class="vlm-field"><span class="vlm-l">Codex の推論レベル（標準・作成以外）</span>
+                <select id="depth-base-codex-reasoning" style="max-width:200px">
+                  <option value="">環境設定の既定に従う</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+              <div class="hint" id="depth-base-codex-reasoning-hint" style="margin:-8px 0 6px"></div>
+            </div>
+          </div>
+        </section>
+        <section class="research-group" aria-labelledby="research-api-heading">
+          <h2 id="research-api-heading">API 専用</h2>
+          <div class="card sec" id="api-investigation-card">
+            <div class="card-head"><span class="title">API での追加調査</span></div>
+            <div class="body">
+              <p class="hint">AI が検索・読み取りを指示し、Sherpa が結果を返すやり取りを繰り返します。
+                下の3項目は OpenAI・Ollama の調査ループと検索アシスタント用です。Codex 内部の調査には適用しません。</p>
+              <label class="vlm-field"><span class="vlm-l">探索の反復回数（標準）</span>
+                <input type="number" id="depth-base-max-turns" min="1" max="200" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-max-turns-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（標準）</span>
+                <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-grep-max-hits-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">1回に読み取る前後の行数（標準）</span>
+                <input type="number" id="depth-base-read-window" min="10" max="400" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-read-window-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">1回の AI 応答で実行するツール数の上限</span>
+                <input type="number" id="agentic-max-tools-per-turn" min="1" max="256" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="agentic-max-tools-per-turn-hint" style="margin:-8px 0 6px"></div>
+              <p class="hint">OpenAI・Ollama・Gemini・Bedrock 用（Codex は対象外）。1質問の累計ではなく、1応答ごとの上限です。
+                超過時は上限まで実行して調査を打ち切ります。「深く」「最大」でも固定です。</p>
+            </div>
+          </div>
+          <!-- BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: AI が検索で1回に読み込む
+               情報量（予算）。既定は精度優先（絞らない）——費用を抑えたいときだけ管理者が明示的に下げる。
+               この画面が唯一の真実源（env 経由の指定は ENV-CLEAN・2026-09-03 で撤去済み）。 -->
+          <div class="card sec" id="agentic-budget-card" tabindex="-1">
+            <div class="card-head"><span class="title">API の調査で受け取る情報量</span></div>
+            <div class="body">
+              <div class="hint" style="margin-bottom:10px">API 経路で検索・読み取りなどのツールから受け取る情報量を制限します（Codex 内部は対象外）。
+                「前後の行数」は読む範囲、この設定は結果のデータ量の上限です。行数の範囲内でも、この上限で切り詰める場合があります。
+                空欄は既定値を使います。1KB＝1024バイトです。</div>
+              <div class="hint">ページ数は、文章中心のA4資料を1ページ約1,000字として換算した目安です。図表・コード・ファイル名などの付加情報によって変わります。</div>
+
+              <label class="vlm-field"><span class="vlm-l">ツール結果1件あたりの上限（KB）</span>
+                <input type="number" id="agentic-budget-per-result" min="1" max="8192" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="agentic-budget-per-result-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">追加調査1回の累計上限（KB）</span>
+                <input type="number" id="agentic-budget-total" min="4" max="65536" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="agentic-budget-total-hint" style="margin:-8px 0 6px"></div>
+              <div class="hint">累計は、追加調査の開始から終了までに受け取った結果の合計です。同じ箇所を再取得した分も含みます。上限を超えると、その時点までの内容で回答をまとめます
+                （調べきれなかった旨も併せて伝えます）。</div>
+
+              <!-- BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定）:
+                   現在のモデルが一度に読める量（トークン数の上限）に合わせて、上の予算を自動で
+                   これ以上安全な値まで縮める（縮むだけ・自動では増えない）。 -->
+              <div class="hint" style="margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--border)">
+                現在のモデルが一度に読める量（トークン数）が分かっている場合、上の予算はその量を
+                超えないところまで自動的に絞られます（一度に読める量が大きくても、上の予算より増えることはありません）。</div>
+              <div class="hint" id="agentic-budget-window-status"><!-- JS: 現在のモデル・一度に読める量・出所・自動調整後の上限 --></div>
+              <div class="hint danger" id="agentic-budget-window-unknown" hidden>
+                コンテキスト上限を判定できないため、情報量の設定値を使います。必要なら「使えるモデル」で仕様値を補足してください。</div>
+
+
+            </div>
+          </div>
+        </section>
+        <section class="research-group" aria-labelledby="research-shared-heading">
+          <h2 id="research-shared-heading">両方に共通</h2>
+          <div class="card sec" id="search-investigation-card">
+            <div class="card-head"><span class="title">共通の資料検索・関係探索</span></div>
+            <div class="body">
+              <p class="hint">Sherpa が資料や候補を集める共通処理の設定です。Codex の事前検索にも使います。AI による追加調査全体の上限ではありません。</p>
+              <label class="vlm-field"><span class="vlm-l">内容の質問（仕様問い合わせ）のヒット件数上限（標準）</span>
+                <input type="number" id="depth-base-qa-max-hits" min="1" max="1000" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-qa-max-hits-hint" style="margin:-8px 0 14px"></div>
+
+              <p class="hint"><b>以下の二つの段数は、揃える必要はありません。</b>原因調査は関係の向きを限定しないため、同じ段数でも探索範囲が広がりやすくなります。範囲を広げたい調査の項目だけ調整してください。</p>
+              <p class="hint">1段は直接つながる箇所まで、2段はその先まで。段数を増やすと、候補数や処理時間が増えることがあります。</p>
+              <label class="vlm-field"><span class="vlm-l">影響分析でたどる段数（標準）</span>
+                <input type="number" id="depth-base-impact-depth" min="1" max="64" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-impact-depth-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">変更箇所から、呼び出し・参照などを影響が及ぶ方向にたどり、影響先の候補を探します。</p>
+
+              <label class="vlm-field"><span class="vlm-l">原因調査でたどる段数（標準）</span>
+                <input type="number" id="depth-base-troubleshoot-depth" min="1" max="16" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-troubleshoot-depth-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">症状文から関連箇所を見つけ、周囲の関係と資料から原因の手がかりを集めます。候補はその後の調査に使い、この処理だけで原因を確定しません。</p>
+            </div>
+          </div>
+        </section>
+        <div class="sec-actions">
+          <button class="btn-ghost" type="button" data-reset-tab="research">このタブを既定に戻す</button>
+          <span class="tres muted" id="tab-reset-res-research"></span>
+        </div>
+      </div>
+
       <!-- ===== タブ2: 使えるモデル ===== -->
-      <div class="tabpanel" id="tabpanel-models" data-tabpanel="models" hidden>
+      <div class="tabpanel" id="tabpanel-models" data-tabpanel="models" role="tabpanel" aria-labelledby="tab-btn-models" tabindex="0" hidden>
         <div class="card sec" id="model-catalog-card">
           <div class="card-head"><span class="title">使えるモデル</span></div>
           <div class="body">
             <div class="hint" style="margin-bottom:6px">用途ごとに、選べるモデルと既定を決めます（表示は選択中のクラウド AI・Ollama・Codex のみ）。</div>
             <div id="model-catalog-table"><!-- JS が描画 --></div>
+              <div style="margin-top:14px">
+                <div class="vlm-l" style="margin-bottom:6px">コンテキスト上限の補足（API モデル・任意）</div>
+                <div class="hint" style="margin-bottom:8px">既定は未登録です。コンテキスト上限はプロバイダから取得、または組み込み情報で判定します。
+                  判定できないモデルは、提供元の仕様値を補足できます。手動登録値を優先します。Codex は対象外です。</div>
+                <div class="hint" style="margin-bottom:8px">判定できない場合は<a href="#agentic-budget-card">調査の情報量設定</a>を使います。そこも未設定なら、ツール結果1件は <b>256KB</b>、追加調査1回の累計は <b>4096KB（4MB）</b> です。
+                  これらは調査の制限値で、モデルのコンテキスト上限ではありません。</div>
+                <table class="mc-table" id="agentic-model-windows-table">
+                  <thead><tr><th>プロバイダ</th><th>モデル名</th><th>コンテキスト上限（トークン数）</th><th></th></tr></thead>
+                  <tbody id="agentic-model-windows-rows"></tbody>
+                </table>
+                <button class="btn-ghost" id="agentic-model-windows-add" type="button" style="margin-top:8px">行を追加</button>
+              </div>
             <div class="sec-actions">
               <button class="btn-ghost" data-reset-tab="models" type="button">このタブを既定に戻す</button>
               <span class="tres muted" id="tab-reset-res-models"></span>
@@ -366,7 +499,7 @@
       </div>
 
       <!-- ===== タブ3: 取り込み ===== -->
-      <div class="tabpanel" id="tabpanel-ingest" data-tabpanel="ingest" hidden>
+      <div class="tabpanel" id="tabpanel-ingest" data-tabpanel="ingest" role="tabpanel" aria-labelledby="tab-btn-ingest" tabindex="0" hidden>
         <div class="card sec">
           <div class="card-head"><span class="title">取り込み設定（資料の読み取り方）</span></div>
           <div class="body">
@@ -439,56 +572,11 @@
           </div>
         </div>
 
-        <!-- BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: AI が検索で1回に読み込む
-             情報量（予算）。既定は精度優先（絞らない）——費用を抑えたいときだけ管理者が明示的に下げる。
-             この画面が唯一の真実源（env 経由の指定は ENV-CLEAN・2026-09-03 で撤去済み）。 -->
-        <div class="card sec" id="agentic-budget-card">
-          <div class="card-head"><span class="title">検索1回あたりの情報量（予算）</span></div>
-          <div class="body">
-            <div class="hint" style="margin-bottom:10px">AI が資料を検索するとき、一度に読み込む情報量の上限です。
-              広いほど検索の精度が上がりますが、AI への送信量（利用料）も増えます。空欄のままなら
-              既定値（精度優先・広め）が使われます。単位は KB（1KB=1024バイト）です。</div>
 
-            <label class="vlm-field"><span class="vlm-l">検索結果1件あたりの上限（KB）</span>
-              <input type="number" id="agentic-budget-per-result" min="1" max="8192" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="agentic-budget-per-result-hint" style="margin:-8px 0 14px"></div>
-
-            <label class="vlm-field"><span class="vlm-l">1回の検索全体の上限（KB）</span>
-              <input type="number" id="agentic-budget-total" min="4" max="65536" step="1" style="max-width:160px">
-            </label>
-            <div class="hint" id="agentic-budget-total-hint" style="margin:-8px 0 6px"></div>
-            <div class="hint">全体の上限に達すると、その時点までに調べた内容だけで回答をまとめます
-              （調べきれなかった旨も併せて伝えます）。</div>
-
-            <!-- BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定）:
-                 現在のモデルが一度に読める量（トークン数の上限）に合わせて、上の予算を自動で
-                 これ以上安全な値まで縮める（縮むだけ・自動では増えない）。 -->
-            <div class="hint" style="margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--border)">
-              現在のモデルが一度に読める量（トークン数）が分かっている場合、上の予算はその量を
-              超えないところまで自動的に絞られます（一度に読める量が大きくても、上の予算より増えることはありません）。</div>
-            <div class="hint" id="agentic-budget-window-status"><!-- JS: 現在のモデル・一度に読める量・出所・自動調整後の上限 --></div>
-            <div class="hint danger" id="agentic-budget-window-unknown" hidden>
-              このモデルが一度に読める量が未登録です。既定予算で動作中です——下の表に登録すると、
-              予算が自動調整されるようになります。</div>
-
-            <div style="margin-top:14px">
-              <div class="vlm-l" style="margin-bottom:6px">モデルが一度に読める量の登録（任意）</div>
-              <div class="hint" style="margin-bottom:8px">プロバイダAPIから自動で分からない場合に手動で登録できます。
-                行を追加・値を上書き・不要な行を削除できます（プロバイダ名は
-                「使えるモデル」タブと同じもの・モデル名は実際に使っているモデル名と一致させてください）。</div>
-              <table class="mc-table" id="agentic-model-windows-table">
-                <thead><tr><th>プロバイダ</th><th>モデル名</th><th>一度に読める量（トークン数）</th><th></th></tr></thead>
-                <tbody id="agentic-model-windows-rows"></tbody>
-              </table>
-              <button class="btn-ghost" id="agentic-model-windows-add" type="button" style="margin-top:8px">行を追加</button>
-            </div>
-          </div>
-        </div>
       </div>
 
       <!-- ===== タブ4: 利用量 ===== -->
-      <div class="tabpanel" id="tabpanel-usage" data-tabpanel="usage" hidden>
+      <div class="tabpanel" id="tabpanel-usage" data-tabpanel="usage" role="tabpanel" aria-labelledby="tab-btn-usage" tabindex="0" hidden>
         <!-- STAT-2: 利用統計チャット専用の AI 選択（利用者の実行構成には依存しない・管理者全体で統一）。 -->
         <div class="card sec" id="usage-chat-ai-card" hidden>
           <div class="card-head"><span class="title">利用統計チャットに使う AI</span></div>
@@ -508,7 +596,7 @@
       </div>
 
       <!-- ===== タブ5: 外部連携（API キー） ===== -->
-      <div class="tabpanel" id="tabpanel-extkeys" data-tabpanel="extkeys" hidden>
+      <div class="tabpanel" id="tabpanel-extkeys" data-tabpanel="extkeys" role="tabpanel" aria-labelledby="tab-btn-extkeys" tabindex="0" hidden>
         <div class="card sec" id="ext-keys-card">
           <div class="card-head"><span class="title">外部連携（API キー）</span></div>
           <div class="body">
@@ -555,17 +643,18 @@
            web/{admin-users,usage,audit,status}.js 冒頭）。初回選択時に data-src → src で
            遅延ロードする（admin-settings.js::loadEmbedFrame）。単独アクセス（?embed 無しで
            直接開く）は各ページとも従来どおり。 -->
-      <div class="tabpanel tabpanel-embed" id="tabpanel-users" data-tabpanel="users" hidden>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-users" data-tabpanel="users" role="tabpanel" aria-labelledby="tab-btn-users" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-users" title="ユーザー管理" data-src="admin-users.html?embed=1"></iframe>
       </div>
-      <div class="tabpanel tabpanel-embed" id="tabpanel-usage-page" data-tabpanel="usage-page" hidden>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-usage-page" data-tabpanel="usage-page" role="tabpanel" aria-labelledby="tab-btn-usage-page" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-usage-page" title="利用統計" data-src="usage.html?embed=1"></iframe>
       </div>
-      <div class="tabpanel tabpanel-embed" id="tabpanel-audit" data-tabpanel="audit" hidden>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-audit" data-tabpanel="audit" role="tabpanel" aria-labelledby="tab-btn-audit" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-audit" title="監査ログ" data-src="audit.html?embed=1"></iframe>
       </div>
-      <div class="tabpanel tabpanel-embed" id="tabpanel-status" data-tabpanel="status" hidden>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-status" data-tabpanel="status" role="tabpanel" aria-labelledby="tab-btn-status" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-status" title="システム状態" data-src="status.html?embed=1"></iframe>
+      </div>
       </div>
     </div>
   </div>
@@ -632,6 +721,8 @@
 <div class="action-bar" id="save-bar">
   <div class="action-bar-inner">
     <button class="btn-primary" id="save">保存</button>
+    <span class="save-scope">すべての設定タブの変更をまとめて保存</span>
+    <span id="unsaved-note" role="status" hidden>未保存の変更があります</span>
     <span class="note" id="msg"></span>
   </div>
 </div>

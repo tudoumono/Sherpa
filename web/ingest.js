@@ -225,7 +225,7 @@ function failedFilesHtml(wid, ff, catalog) {
   const rows = ff.items.map((it) => {
     const info = reasonInfo(catalog, it.reason);
     return `<li><span class="fname">${esc(it.doc)}</span> — ${esc(info.label)}`
-      + (info.advice ? `<div class="muted" style="font-size:11.5px">${esc(info.advice)}</div>` : '')
+      + (info.advice ? `<div class="muted" style="font-size:var(--text-caption)">${esc(info.advice)}</div>` : '')
       + `<button class="mini" data-reconvert-wid="${esc(wid)}" data-rel="${esc(it.doc)}">再変換</button></li>`;
   }).join('');
   const more = ff.truncated ? `<div class="muted">…他 ${esc(ff.total - ff.items.length)} 件</div>` : '';
@@ -237,7 +237,7 @@ function partialSuspectedHtml(ps, advice) {
   const rows = ps.items.map((it) => `<li>${esc(it.doc)}</li>`).join('');
   const more = ps.truncated ? `<div class="muted">…他 ${esc(ps.total - ps.items.length)} 件</div>` : '';
   return `<div class="ingest-partial"><b>抽出不完全の疑い（要確認） ${esc(ps.total)} 件</b>`
-    + (advice ? `<div class="muted" style="font-size:11.5px">${esc(advice)}</div>` : '')
+    + (advice ? `<div class="muted" style="font-size:var(--text-caption)">${esc(advice)}</div>` : '')
     + `<ul>${rows}</ul>${more}</div>`;
 }
 
@@ -532,7 +532,7 @@ const STATE = {  // state → 表示（記号・クラス）。enum のみ。
   unreadable: { mark: '⚠ 読み取り不可', cls: 'fail' },   // 内容判定に必要なヘッダが読み取れない（`STATE.ready` へ倒さない）
   unknown: { mark: '❓ 状態を確認できませんでした', cls: 'fail' },  // 直近取り込みの状況が確認できない（`STATE.ready` へ倒さない）
 };
-const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表' };
+const ABBR = { Module: 'Mod', Copybook: 'Cpy', DataItem: '項目', Document: '文書', Batch: 'ジョブ', Table: '表', Config: '設定' };
 
 let _pv = null, _q = '', _type = '', _state = 'all', _folder = '';
 
@@ -710,7 +710,7 @@ function row(d) {
   const icon = d.branch === 'source' ? '📜' : '📄';
   const place = d.folder || (d.branch === 'source' ? 'プログラム' : '設計書・仕様書');
   const reason = isFailureState(d.state) && d.reason
-    ? `<div class="muted" style="font-size:11.5px;margin-top:3px">理由: ${esc(reasonText(d.reason))}</div>` : '';
+    ? `<div class="muted" style="font-size:var(--text-caption);margin-top:3px">理由: ${esc(reasonText(d.reason))}</div>` : '';
   const rerun = isFailureState(d.state) ? `<button class="mini" data-rerun="${esc(d.name)}">やり直す</button>` : '';
   return `<tr>
     <td><span class="fname">${icon} ${esc(d.name)}</span>${reason}${provBadges(d.provenance)}${analyzerBadgeRow(d)}</td>

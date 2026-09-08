@@ -17,10 +17,10 @@
   .embedded .wrap{padding-top:8px}
   /* 期間切替 */
   .period-bar{display:flex;align-items:center;gap:8px;margin-bottom:16px}
-  .period-bar .lbl{font-size:12px;color:var(--ink-3)}
+  .period-bar .lbl{font-size:var(--text-small);color:var(--ink-3)}
   /* ランキング テーブル */
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th{text-align:left;font-size:11.5px;font-weight:600;color:var(--ink-3);padding:8px 10px;
+  table{width:100%;border-collapse:collapse;font-size:var(--text-label)}
+  th{text-align:left;font-size:var(--text-small);font-weight:600;color:var(--ink-3);padding:8px 10px;
     border-bottom:2px solid var(--border);white-space:nowrap}
   th.sortable{cursor:pointer;user-select:none}
   th.sortable:hover{color:var(--ink)}
@@ -29,11 +29,11 @@
   tr.u-row:hover td{background:var(--surface-2)}
   tr.u-row{cursor:pointer}
   .rank{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
-    border-radius:50%;background:var(--surface-2);color:var(--ink-3);font-size:11px;font-weight:700}
+    border-radius:50%;background:var(--surface-2);color:var(--ink-3);font-size:var(--text-caption);font-weight:700}
   .rank.top1{background:var(--accent-weak);color:var(--accent-ink)}
   .num{text-align:right;font-variant-numeric:tabular-nums}
   .user-name{font-weight:600}
-  .user-uid{font-size:11px;color:var(--ink-3);font-family:var(--font-code,monospace)}
+  .user-uid{font-size:var(--text-caption);color:var(--ink-3);font-family:var(--font-code,monospace)}
   .u-detail{display:none}
   tr.u-row.u-open + tr.u-detail{display:table-row}
   .u-detail td{background:var(--surface-2);padding:14px 16px}
@@ -44,14 +44,14 @@
   .seg-qa{background:var(--ok)}
   .seg-troubleshoot{background:var(--warn)}
   .seg-chat{background:var(--ink-3)}
-  .lenslegend{display:flex;flex-wrap:wrap;gap:12px;font-size:11.5px;color:var(--ink-2);margin-bottom:12px}
+  .lenslegend{display:flex;flex-wrap:wrap;gap:12px;font-size:var(--text-caption);color:var(--ink-2);margin-bottom:12px}
   .lenslegend .item{display:inline-flex;align-items:center;gap:5px}
   .lenslegend .dot{width:8px;height:8px;border-radius:50%;flex:none}
-  .u-meta{display:flex;flex-wrap:wrap;gap:18px;font-size:12px;color:var(--ink-2)}
+  .u-meta{display:flex;flex-wrap:wrap;gap:18px;font-size:var(--text-small);color:var(--ink-2)}
   .u-meta .g{display:flex;flex-direction:column;gap:2px}
-  .u-meta .g b{font-size:12.5px;color:var(--ink)}
-  .u-meta .g span{font-size:11px;color:var(--ink-3)}
-  .worldtag{display:inline-block;font-size:10.5px;background:var(--surface);border:1px solid var(--border);
+  .u-meta .g b{font-size:var(--text-small);color:var(--ink)}
+  .u-meta .g span{font-size:var(--text-caption);color:var(--ink-3)}
+  .worldtag{display:inline-block;font-size:var(--text-caption);background:var(--surface);border:1px solid var(--border);
     border-radius:5px;padding:1px 6px;margin:1px 3px 1px 0;color:var(--ink-2)}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
@@ -59,25 +59,25 @@
   .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
   @media(max-width:720px){.chart-grid{grid-template-columns:1fr}}
   .chart-card{padding:14px 16px 8px}
-  .chart-title{font-size:12.5px;font-weight:700;color:var(--ink-2);margin-bottom:8px}
+  .chart-title{font-size:var(--text-small);font-weight:700;color:var(--ink-2);margin-bottom:8px}
   .chart-wrap{position:relative;height:160px}
   .trendchart{width:100%;height:100%;display:block;overflow:visible}
   .trendchart .hit{cursor:crosshair;outline:none}
   .chart-empty{position:absolute;inset:0;align-items:center;justify-content:center;
-    color:var(--ink-3);font-size:12.5px;text-align:center}
+    color:var(--ink-3);font-size:var(--text-small);text-align:center}
   .chart-empty:not([hidden]){display:flex}   /* [hidden] の既定 display:none を殺さない（重要） */
   .chart-tooltip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--border);
-    border-radius:7px;box-shadow:var(--shadow);padding:6px 10px;font-size:11.5px;color:var(--ink);
+    border-radius:7px;box-shadow:var(--shadow);padding:6px 10px;font-size:var(--text-caption);color:var(--ink);
     white-space:nowrap;transform:translate(-50%,-115%);z-index:5}
   .chart-tooltip .v{font-weight:700;font-variant-numeric:tabular-nums}
-  .chart-tooltip .d{color:var(--ink-3);font-size:10.5px;margin-top:1px}
+  .chart-tooltip .d{color:var(--ink-3);font-size:var(--text-caption);margin-top:1px}
 
   /* バッチ3（2026-07-03）: 利用の傾向セクション（ヒートマップ・横棒・凡例・定着率）。
      色は dataviz skill 呼び出し済み: このアプリに専用カテゴリランプが無いため、既存の semantic token
      （--accent/--ok/--warn/--danger/--ink-3）をカテゴリ色に転用し、常設の凡例＋直接ラベルで
      secondary encoding を担保する（[[dataviz-skill-limited-palette]] と同じ折衷・lens ミニバーの流儀を踏襲）。 */
   .info-dot{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;
-    border-radius:50%;background:var(--surface-2);color:var(--ink-3);font-size:10px;cursor:help;
+    border-radius:50%;background:var(--surface-2);color:var(--ink-3);font-size:var(--text-caption);cursor:help;
     vertical-align:middle;margin-left:2px}
   .heatmap-wrap{position:relative;min-height:150px}
   .heatmapchart{width:100%;height:150px;display:block;overflow:visible}
@@ -85,13 +85,13 @@
   .barchart-wrap{position:relative;min-height:80px}   /* SVG が display:none の空状態でも .chart-empty(inset:0) が潰れないよう最低高さを確保 */
   .barchart{width:100%;display:block;overflow:visible}
   .barchart .bar{cursor:pointer}
-  .chartlegend{display:flex;flex-wrap:wrap;gap:10px 14px;font-size:11.5px;color:var(--ink-2);
+  .chartlegend{display:flex;flex-wrap:wrap;gap:10px 14px;font-size:var(--text-caption);color:var(--ink-2);
     padding:8px 2px 4px}
   .chartlegend .item{display:inline-flex;align-items:center;gap:5px}
   .chartlegend .dot{width:8px;height:8px;border-radius:50%;flex:none}
-  .retention-rate{font-size:12px;color:var(--ink-2);padding:6px 2px 2px}
+  .retention-rate{font-size:var(--text-small);color:var(--ink-2);padding:6px 2px 2px}
   .retention-rate b{color:var(--ink);font-variant-numeric:tabular-nums}
-  .chart-total{font-size:11px;font-weight:400;color:var(--ink-3);margin-left:4px;font-variant-numeric:tabular-nums}
+  .chart-total{font-size:var(--text-caption);font-weight:400;color:var(--ink-3);margin-left:4px;font-variant-numeric:tabular-nums}
   .zhr-cell{cursor:help}
 
   /* 利用統計チャット（自然言語で統計を質問する）。メッセージ本体は既存の .msg/.bubble-user/
@@ -100,20 +100,22 @@
   #usage-chat-messages:empty{display:none}
   #usage-chat-messages .msg{margin-bottom:14px;max-width:none}
   #usage-chat-messages .msg:last-child{margin-bottom:0}
-  .uc-hint{font-size:12.5px;color:var(--ink-2);margin:2px 2px 12px}
-  .uc-send-notice{font-size:12px;color:var(--ink-3);margin:2px 2px 10px;padding:6px 8px;
+  .uc-hint{font-size:var(--text-small);color:var(--ink-2);margin:2px 2px 12px}
+  .uc-send-notice{font-size:var(--text-small);color:var(--ink-3);margin:2px 2px 10px;padding:6px 8px;
     border-radius:var(--radius);background:var(--surface-2)}
   .uc-composer{display:flex;align-items:flex-end;gap:8px;border:1px solid var(--border);
     border-radius:var(--radius);padding:8px 10px;margin-top:10px}
   .uc-composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;
-    font-size:14px;max-height:120px;background:transparent;color:var(--ink);padding:6px 2px}
+    font-size:var(--text-body);max-height:120px;background:transparent;color:var(--ink);padding:6px 2px}
   .uc-error{color:var(--danger)}
   /* STAT-2: 「今回だけ」一時プロバイダ切替（保存しない・リクエスト単位）。 */
   .uc-provider-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 2px 8px}
-  .uc-provider-row .uc-provider-label{font-size:12px;color:var(--ink-3)}
+  .uc-provider-row .uc-provider-label{font-size:var(--text-small);color:var(--ink-3)}
   .uc-provider-btn{border:1px solid var(--border);background:var(--surface-2);color:var(--ink-3);
-    border-radius:999px;padding:3px 10px;font-size:11.5px;cursor:pointer}
-  .uc-provider-btn[aria-pressed="true"]{background:var(--accent);color:#fff;border-color:var(--accent)}
+    border-radius:999px;padding:3px 10px;font-size:var(--text-caption);cursor:pointer}
+  .uc-provider-btn[aria-pressed="true"]{background:var(--action-bg);color:var(--action-fg);border-color:var(--accent)}
+  .period-bar{flex-wrap:wrap}
+  .uc-provider-btn{min-height:36px}
 </style>
 </head>
 <body>
@@ -122,8 +124,8 @@
 <div class="wrap">
   <div id="access-denied">
     <div style="font-size:32px;margin-bottom:12px">🚫</div>
-    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
-    <div style="font-size:13px">管理者権限が必要です。</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
   </div>
   <div id="main-content">
     <div class="pagehead">
@@ -223,7 +225,7 @@
 
       <!-- 利用の傾向（バッチ3・2026-07-03） -->
       <div class="pagehead" style="margin-top:28px">
-        <div><h2 style="font-size:16px;margin:0">利用の傾向</h2></div>
+        <div><h2 style="font-size:var(--text-body);margin:0">利用の傾向</h2></div>
       </div>
 
       <div class="card chart-card" style="margin-bottom:14px">
@@ -286,7 +288,7 @@
 
       <!-- トークン（F3・2026-07-07／2026-07-08 金額表示は撤去） -->
       <div class="pagehead" style="margin-top:28px">
-        <div><h2 style="font-size:16px;margin:0">トークン</h2>
+        <div><h2 style="font-size:var(--text-body);margin:0">トークン</h2>
           <!-- S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 「用途別」カード追加に伴い
                サブタイトルを是正（合計タイル・日別グラフは引き続きチャット限定）。 -->
           <div class="sub">AI が消費したトークン量。上の合計はチャット分です。</div>

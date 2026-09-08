@@ -2203,6 +2203,33 @@ def test_admin_settings_depth_base_int_put_and_get_roundtrip(field, value):
     assert dp2["configured"] is None and dp2["effective"] == dp2["default"]
 
 
+def test_admin_settings_agentic_tool_limit_roundtrip():
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"agentic_max_tools_per_turn": 7})
+    assert response.status_code == 200, response.text
+    assert response.json()["agentic_tool_limit"]["effective"] == 7
+    assert store.get_system_settings()["agentic_max_tools_per_turn"] == 7
+    # 他の項目の部分更新で保存値が消えない。
+    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
+    assert response.json()["agentic_tool_limit"]["configured"] == 7
+    response = admin.put("/admin/settings", json={"agentic_max_tools_per_turn": None})
+    assert response.status_code == 200, response.text
+    limit = response.json()["agentic_tool_limit"]
+    assert limit["configured"] is None and limit["effective"] == limit["default"]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 257, True, "3", 1.5])
+def test_admin_settings_agentic_tool_limit_rejects_invalid_values(bad):
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"agentic_max_tools_per_turn": bad})
+    assert response.status_code == 422, response.text
+    assert "agentic_max_tools_per_turn" not in store.get_system_settings()
+
+
 @pytest.mark.parametrize("field,bad", [
     ("depth_base_max_turns", 0), ("depth_base_max_turns", 500),
     ("depth_base_grep_max_hits", 0), ("depth_base_read_window", 5),
@@ -2259,6 +2286,91 @@ def test_admin_settings_depth_base_audit_records_change():
     rows = store.list_audit(action="system_settings.updated", actor=admin_uid, limit=10)
     assert rows, "system_settings.updated が監査に残っていない"
     assert rows[0]["after_state"].get("depth_base_max_turns") == 30
+
+
+# ===== チャット同時実行の上限（`sherpa/chat_turns.py::effective_limits`・
+#       admin-settings.html「同時実行の上限」カード）=====
+
+def test_admin_settings_view_chat_max_turns_shape_unset():
+    """GET /admin/settings の chat_max_turns は per_user/global の2項目。未設定なら
+    configured=None・effective=default=`chat_turns` の env 既定値。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import chat_turns
+    admin, _ = _admin_client()
+    r = admin.get("/admin/settings")
+    assert r.status_code == 200, r.text
+    cmt = r.json()["chat_max_turns"]
+    assert set(cmt.keys()) == {"per_user", "global"}
+    assert cmt["per_user"] == {"configured": None, "effective": chat_turns.MAX_TURNS_PER_USER,
+                               "default": chat_turns.MAX_TURNS_PER_USER}
+    assert cmt["global"] == {"configured": None, "effective": chat_turns.MAX_TURNS_GLOBAL,
+                             "default": chat_turns.MAX_TURNS_GLOBAL}
+
+
+@pytest.mark.parametrize("field,key,value", [
+    ("chat_max_turns_per_user", "per_user", 5),
+    ("chat_max_turns_global", "global", 30),
+])
+def test_admin_settings_chat_max_turns_put_and_get_roundtrip(field, key, value):
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={field: value})
+    assert r.status_code == 200, r.text
+    cmt = r.json()["chat_max_turns"][key]
+    assert cmt["configured"] == value and cmt["effective"] == value
+
+    r2 = admin.put("/admin/settings", json={field: None})
+    assert r2.status_code == 200, r2.text
+    cmt2 = r2.json()["chat_max_turns"][key]
+    assert cmt2["configured"] is None and cmt2["effective"] == cmt2["default"]
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("chat_max_turns_per_user", 0), ("chat_max_turns_per_user", 17),
+    ("chat_max_turns_global", 0), ("chat_max_turns_global", 65),
+])
+def test_admin_settings_chat_max_turns_rejects_out_of_range(field, bad):
+    """StrictInt+Field(ge,le) の範囲外は 422（保存もされない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={field: bad})
+    assert r.status_code == 422, r.text
+
+
+def test_admin_settings_chat_max_turns_rejects_non_integer():
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={"chat_max_turns_per_user": "five"})
+    assert r.status_code == 422, r.text
+    r2 = admin.put("/admin/settings", json={"chat_max_turns_per_user": True})   # StrictInt は bool を拒否
+    assert r2.status_code == 422, r2.text
+
+
+def test_admin_settings_chat_max_turns_audit_records_change():
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, admin_uid = _admin_client()
+    r = admin.put("/admin/settings", json={"chat_max_turns_global": 30})
+    assert r.status_code == 200, r.text
+    rows = store.list_audit(action="system_settings.updated", actor=admin_uid, limit=10)
+    assert rows, "system_settings.updated が監査に残っていない"
+    assert rows[0]["after_state"].get("chat_max_turns_global") == 30
+
+
+def test_admin_settings_chat_max_turns_effective_limits_prefers_db_value():
+    """`chat_turns.effective_limits()`（ターン受付が実際に使う解決関数）が保存直後の DB 値を
+    そのまま返す（表示用の `effective` と受付側の解決ロジックが分岐していないことの担保）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import chat_turns
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={"chat_max_turns_per_user": 5, "chat_max_turns_global": 30})
+    assert r.status_code == 200, r.text
+    assert chat_turns.effective_limits() == (5, 30)
 
 
 # ===== BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・env→管理者設定への昇格）=====

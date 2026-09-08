@@ -56,7 +56,7 @@ def test_agents_md_excluded_from_both_snapshots():
     before/after 両方のスキャンから除外しないと初回実行で成果物と誤認 → files/ へ move され
     （authoring から消える）→ 毎回 AGENTS_N.md が台帳に蓄積する。両側に除外があること。"""
     src = _src()
-    assert src.count('p.relative_to(ws_authoring) != Path("AGENTS.md")') == 2, \
+    assert src.count('p.relative_to(run_dir) != Path("AGENTS.md")') == 2, \
         "AGENTS.md の除外が before/after の両スキャンに入っていない"
 
 

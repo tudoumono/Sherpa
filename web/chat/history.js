@@ -44,17 +44,21 @@ function _receivedConvHTML(c) {
   const by = esc(c.shared_by_name || c.shared_by_user_id || '');
   const byText = by ? `${by}さんから` : '';
   return `<div class="conv${c.pinned ? ' pinned' : ''}${inactive ? ' conv-inactive' : ''}${id === S.cid ? ' on' : ''}" data-open="${id}" data-inactive="${inactive ? '1' : ''}">
-     <div class="cmain">
-       <div class="t">
+     <button class="cmain" type="button" title="${esc(c.title || '会話')}" aria-label="${esc(c.title || '会話')}を開く">
+       <span class="t">
          ${c.pinned ? '<span class="pin">📌</span>' : ''}
          <span class="badge-shared">共有</span><span class="badge-ro">🔒</span>${esc(c.title || '会話')}
          ${statusLabel ? `<span class="badge-status">${esc(statusLabel)}</span>` : ''}
-       </div>
-       <div class="d">${byText ? `<span class="shared-by">${byText}</span>・` : ''}${date}</div>
-     </div>
-     <div class="cacts">
-       <button class="cact" data-pin="${id}" data-pinned="${c.pinned ? '1' : '0'}" title="${c.pinned ? 'ピンを外す' : 'ピン止め'}">${c.pinned ? '📌' : '📍'}</button>
-       <button class="cact del" data-del="${id}" title="履歴から削除">🗑</button>
+       </span>
+       <span class="d">${byText ? `<span class="shared-by">${byText}</span>・` : ''}${date}</span>
+     </button>
+     <button class="conv-more" type="button" data-conv-menu="${id}" aria-expanded="false"
+       aria-controls="conv-actions-${id}" aria-label="${esc(c.title || '会話')}のその他の操作" title="その他の操作">
+       <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>
+     </button>
+     <div class="cacts" id="conv-actions-${id}" hidden role="group" aria-label="${esc(c.title || '会話')}の操作">
+       <button class="cact" data-pin="${id}" data-pinned="${c.pinned ? '1' : '0'}" title="${c.pinned ? 'ピンを外す' : 'ピン止め'}">${c.pinned ? 'ピンを外す' : 'ピン止め'}</button>
+       <button class="cact del" data-del="${id}" title="履歴から削除">履歴から削除</button>
      </div>
    </div>`;
 }
@@ -67,15 +71,19 @@ function _ownConvHTML(c) {
   // SH-1: フォークで複製した会話は出所（○○さんの共有・日時）を編集不可の表示として残す。
   const f = c.forked_from;
   const forkedFromLine = f
-    ? `<div class="d forked-from">出所: ${esc(f.name || f.user_id)}さんの共有（${esc(fmtDateTime(f.at))}）</div>` : '';
+    ? `<span class="d forked-from">出所: ${esc(f.name || f.user_id)}さんの共有（${esc(fmtDateTime(f.at))}）</span>` : '';
   return `<div class="conv${c.pinned ? ' pinned' : ''}${id === S.cid ? ' on' : ''}" data-open="${id}">
-     <div class="cmain"><div class="t">${c.pinned ? '<span class="pin">📌</span>' : ''}${esc(c.title || '会話')}</div>
-       <div class="d">${date}</div>${forkedFromLine}</div>
-     <div class="cacts">
-       <button class="cact" data-rename="${id}" data-title="${esc(c.title || '')}" title="名前を変更">✎</button>
-       <button class="cact" data-pin="${id}" data-pinned="${c.pinned ? '1' : '0'}" title="${c.pinned ? 'ピンを外す' : 'ピン止め'}">${c.pinned ? '📌' : '📍'}</button>
-       <button class="cact" data-sharecid="${id}" data-title="${esc(c.title || '会話')}" title="この会話を共有">🔗</button>
-       <button class="cact del" data-del="${id}" title="この履歴を削除">🗑</button>
+     <button class="cmain" type="button" title="${esc(c.title || '会話')}" aria-label="${esc(c.title || '会話')}を開く"><span class="t">${c.pinned ? '<span class="pin">📌</span>' : ''}${esc(c.title || '会話')}</span>
+       <span class="d">${date}</span>${forkedFromLine}</button>
+     <button class="conv-more" type="button" data-conv-menu="${id}" aria-expanded="false"
+       aria-controls="conv-actions-${id}" aria-label="${esc(c.title || '会話')}のその他の操作" title="その他の操作">
+       <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>
+     </button>
+     <div class="cacts" id="conv-actions-${id}" hidden role="group" aria-label="${esc(c.title || '会話')}の操作">
+       <button class="cact" data-rename="${id}" data-title="${esc(c.title || '')}" title="名前を変更">名前を変更</button>
+       <button class="cact" data-pin="${id}" data-pinned="${c.pinned ? '1' : '0'}" title="${c.pinned ? 'ピンを外す' : 'ピン止め'}">${c.pinned ? 'ピンを外す' : 'ピン止め'}</button>
+       <button class="cact" data-sharecid="${id}" data-title="${esc(c.title || '会話')}" title="この会話を共有">この会話を共有</button>
+       <button class="cact del" data-del="${id}" title="この履歴を削除">履歴を削除</button>
      </div>
    </div>`;
 }
@@ -98,9 +106,20 @@ export async function loadConversations() {
       html += received.map(_receivedConvHTML).join('');
     }
   } else {
-    html = '<div class="muted" style="font-size:12px;padding:6px">会話はまだありません</div>';
+    html = '<div class="muted" style="font-size:var(--text-small);padding:6px">会話はまだありません</div>';
   }
+  // 操作後の再描画でも、フォーカスを同じ会話か次の履歴へ保つ。
+  const focused = document.activeElement;
+  const focusedRow = focused.closest('#convlist .conv');
+  const rowIndex = focusedRow ? [...$('convlist').querySelectorAll('.conv')].indexOf(focusedRow) : -1;
   $('convlist').innerHTML = html;
+  if (focusedRow) {
+    const rows = [...$('convlist').querySelectorAll('.conv')];
+    const row = rows.find((item) => item.dataset.open === focusedRow.dataset.open)
+      || rows[Math.min(rowIndex, rows.length - 1)];
+    const target = row ? row.querySelector(focused.classList.contains('cmain') ? '.cmain' : '.conv-more') : $('newbtn');
+    target.focus();
+  }
 }
 
 export async function deleteConversation(id) {                 // #6: 確認してから削除（連鎖でメッセージも消える）

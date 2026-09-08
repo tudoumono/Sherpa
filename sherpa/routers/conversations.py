@@ -29,10 +29,16 @@ router = APIRouter()
 # `sherpa.schemas.ConversationSummary` を TypeAdapter 契約のみで固定する
 # （`tests/api/test_response_schemas.py` 参照・response_model 非付与）。
 @router.get("/conversations", tags=["会話管理"])
-def conversations_list(request: Request):
-    """現在ユーザーの会話一覧（所有＋受領共有）を返す。"""
+def conversations_list(request: Request, q: str | None = None):
+    """現在ユーザーの会話一覧（所有＋受領共有）を返す。`q` 指定時はタイトル・本文検索に絞る（H1・
+    trim 後 1〜100 字。省略時は従来どおり全件・応答形も不変）。"""
     u = _current_user(request)
-    return store.list_conversations(u["uid"])
+    if q is None:
+        return store.list_conversations(u["uid"])
+    q = q.strip()
+    if not (1 <= len(q) <= 100):
+        raise HTTPException(422, "検索語は1〜100字です")
+    return store.search_conversations(u["uid"], q)
 
 
 @router.get("/conversations/{cid}", tags=["会話管理"])

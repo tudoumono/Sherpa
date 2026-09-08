@@ -18,55 +18,68 @@
   @media (max-width:1280px){ .chead .btxt{display:none} }
   /* 頭脳メニュー内のモデル切替（チャット画面でモデルも完結）。*/
   .bm-model{display:flex;gap:6px;align-items:center;padding:8px 10px;border-top:1px solid var(--border)}
-  .bm-model input, .bm-model select{flex:1;min-width:0;font-size:12.5px;padding:6px 8px;border:1px solid var(--border);
+  .bm-model input, .bm-model select{flex:1;min-width:0;font-size:var(--text-small);padding:6px 8px;border:1px solid var(--control-border);
     border-radius:7px;background:var(--surface);color:var(--ink);font-family:inherit}
-  .bm-model .mini{height:30px;padding:0 10px;border-radius:7px;border:1px solid var(--border);
-    background:var(--surface-2);color:var(--ink-2);font-size:12px;cursor:pointer;white-space:nowrap}
-  .bm-tres{padding:0 12px 8px;font-size:12px}
+  .bm-model .mini{min-height:36px;padding:0 10px;border-radius:7px;border:1px solid var(--border);
+    background:var(--surface-2);color:var(--ink-2);font-size:var(--text-small);cursor:pointer;white-space:nowrap}
+  .bm-tres{padding:0 12px 8px;font-size:var(--text-small)}
   .bm-tres.ok{color:var(--ok)} .bm-tres.danger{color:var(--danger)} .bm-tres.muted{color:var(--ink-3)}
 
+  /* 会話履歴: 検索欄（H2・×ボタンは値がある時だけ表示） */
+  .histsearch{position:relative;margin:0 0 8px}
+  .histsearch input{width:100%;box-sizing:border-box;min-height:36px;padding:6px 30px 6px 10px;
+    border:1px solid var(--control-border);border-radius:var(--radius-sm);font-family:inherit;
+    font-size:var(--text-label);background:var(--surface);color:var(--ink)}
+  .histsearch-clear{position:absolute;top:50%;right:4px;transform:translateY(-50%);width:26px;height:26px;
+    border:none;background:transparent;color:var(--ink-3);font-size:var(--text-body);line-height:1;cursor:pointer;border-radius:6px}
+  .histsearch-clear:hover{background:var(--surface-2);color:var(--ink)}
+  /* .conv は display:flex（author 指定）が UA の [hidden]{display:none} より優先されてしまうため、
+     絞り込みで隠す行に明示上書きが要る（.share-overlay[hidden] と同じ理由）。 */
+  .conv[hidden]{display:none}
+  /* 本文一致の抜粋（.d の下にもう1行・history.js の行構造は変更しない） */
+  .hist-snippet{display:block;color:var(--ink-3);font-size:var(--text-caption)}
   /* 会話履歴: セクション見出し */
-  .conv-section-head{font-size:11px;font-weight:600;color:var(--ink-3);padding:8px 10px 3px;text-transform:uppercase;letter-spacing:.05em}
+  .conv-section-head{font-size:var(--text-caption);font-weight:600;color:var(--ink-3);padding:8px 10px 3px;text-transform:uppercase;letter-spacing:.05em}
   /* 受領共有バッジ */
-  .badge-shared{display:inline-block;font-size:10px;font-weight:700;color:var(--accent-ink);background:var(--accent-weak);
+  .badge-shared{display:inline-block;font-size:var(--text-caption);font-weight:700;color:var(--accent-ink);background:var(--accent-weak);
     border-radius:4px;padding:1px 5px;margin-right:4px;vertical-align:middle}
-  .badge-ro{margin-right:3px;vertical-align:middle;font-size:12px}
-  .badge-status{display:inline-block;font-size:10px;color:var(--ink-3);background:var(--surface-2);
+  .badge-ro{margin-right:3px;vertical-align:middle;font-size:var(--text-small)}
+  .badge-status{display:inline-block;font-size:var(--text-caption);color:var(--ink-3);background:var(--surface-2);
     border-radius:4px;padding:1px 5px;margin-left:4px;vertical-align:middle}
-  .conv-inactive{opacity:.55}
-  .shared-by{color:var(--ink-3);font-size:11px}
+  .conv-inactive .cmain{color:var(--ink-3)}
+  .shared-by{color:var(--ink-3);font-size:var(--text-caption)}
 
   /* 共有ダイアログ */
   .share-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;
     justify-content:center;z-index:200}
   .share-overlay[hidden]{display:none}   /* [hidden] と .share-overlay は詳細度が同じで後勝ちになるため明示上書き（さもないと常時表示・×で閉じない） */
-  .share-modal{background:var(--surface);border-radius:var(--radius);padding:28px 30px;width:360px;
+  .share-modal{background:var(--surface);border-radius:var(--radius);padding:24px;width:min(440px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;
     box-shadow:var(--shadow-lg);position:relative}
-  .share-modal h2{font-size:15px;font-weight:700;margin:0 0 4px}
-  .share-modal .sub{font-size:12px;color:var(--ink-3);margin-bottom:16px}
-  .share-modal label{display:block;font-size:12.5px;font-weight:600;color:var(--ink-2);margin:12px 0 4px}
+  .share-modal h2{font-size:var(--text-body);font-weight:700;margin:0 0 4px}
+  .share-modal .sub{font-size:var(--text-small);color:var(--ink-3);margin-bottom:16px}
+  .share-modal label{display:block;font-size:var(--text-small);font-weight:600;color:var(--ink-2);margin:12px 0 4px}
   .share-modal input,.share-modal select{width:100%;box-sizing:border-box;padding:8px 10px;
-    border:1px solid var(--border);border-radius:var(--radius-sm);font-family:inherit;font-size:13.5px;
+    border:1px solid var(--control-border);border-radius:var(--radius-sm);font-family:inherit;font-size:var(--text-label);
     background:var(--surface);color:var(--ink)}
-  .share-err{font-size:12px;color:var(--danger);margin-top:6px;min-height:16px}
+  .share-err{font-size:var(--text-small);color:var(--danger);margin-top:6px;min-height:16px}
   .share-result{background:var(--ok-bg);border-radius:var(--radius-sm);padding:12px;margin-top:4px}
-  .share-result .lbl{font-size:12px;color:var(--ok);font-weight:600;margin-bottom:6px}
+  .share-result .lbl{font-size:var(--text-small);color:var(--ok);font-weight:600;margin-bottom:6px}
   .share-url-row{display:flex;align-items:center;gap:6px}
-  .share-url-val{font-size:11.5px;word-break:break-all;flex:1;color:var(--ink-2);font-family:var(--font-code,monospace);
+  .share-url-val{font-size:var(--text-caption);word-break:break-all;flex:1;color:var(--ink-2);font-family:var(--font-code,monospace);
     background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 8px}
-  .share-close-x{position:absolute;top:14px;right:16px;background:none;border:none;font-size:18px;
+  .share-close-x{position:absolute;top:14px;right:16px;background:none;border:none;font-size:var(--text-section);
     color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
   .share-close-x:hover{background:var(--surface-2)}
   /* SH-2: 既存共有一覧（招待者・期限・状態・取消/更新）。 */
   #share-existing{margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:12px}
   .share-existing-list{max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
   .share-existing-row{display:flex;align-items:center;justify-content:space-between;gap:8px;
-    font-size:12px;padding:6px 0}
+    font-size:var(--text-small);padding:6px 0}
   .share-existing-main{min-width:0}
   .share-existing-invitees{font-weight:600;color:var(--ink)}
-  .share-existing-meta{color:var(--ink-3);font-size:11px;margin-top:2px}
+  .share-existing-meta{color:var(--ink-3);font-size:var(--text-caption);margin-top:2px}
   .share-existing-acts{display:flex;gap:4px;flex-shrink:0}
-  .forked-from{font-size:11px;color:var(--ink-3)}
+  .forked-from{font-size:var(--text-caption);color:var(--ink-3)}
 </style>
 </head>
 <body>
@@ -82,7 +95,13 @@
         <span class="ltitle">チャット履歴</span>
       </div>
       <button class="newbtn" id="newbtn">＋ 新しいチャット</button>
+      <div class="histsearch">
+        <input type="text" id="hist-search" placeholder="履歴を検索" autocomplete="off" aria-label="履歴を検索" maxlength="100">
+        <button type="button" class="histsearch-clear" id="hist-search-clear" title="検索をクリア" aria-label="検索をクリア" hidden>×</button>
+      </div>
       <div class="hist" id="convlist"></div>
+      <div class="muted" id="hist-nohit" style="font-size:var(--text-small);padding:6px" hidden>見つかりません</div>
+      <div class="muted" id="hist-search-error" style="font-size:var(--text-small);padding:6px" hidden>本文検索に失敗しました</div>
       <!-- ユーザー情報・ログアウトは全ページ共通の上部ナビ（右上・sherpa-topbar）へ移動済み -->
     </div>
   </aside>
@@ -119,8 +138,8 @@
         <button class="inquiry-chip" id="inquiry-chip" type="button" title="やりたいこと・調べる深さ・範囲・探す対象・参照先を設定する">🎯 <b id="inquiry-chip-label">自動 · 全体 · 資料＋コード · 標準</b></button>
         <button class="kbtoggle" id="chat-upload-btn" title="このファイルを本人だけの個人ワークスペースへ保存する">📎 個人ファイルを追加</button>
         <input id="chat-file-input" type="file" hidden multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.cbl,.cob,.cobol,.cpy,.copybook,.jcl,.sql,.py,.sh,.bat">
-        <span id="chat-upload-status" style="font-size:11.5px;color:var(--ink-3)" aria-live="polite"></span>
-        <span id="personal-blocked-note" style="display:none;font-size:11px;color:var(--text-muted,#888);margin-left:4px">（共有不可の会話）</span>
+        <span id="chat-upload-status" style="font-size:var(--text-caption);color:var(--ink-3)" aria-live="polite"></span>
+        <span id="personal-blocked-note" style="display:none;font-size:var(--text-caption);color:var(--ink-3);margin-left:4px">（共有不可の会話）</span>
         <span class="spacer"></span>
         <span class="brainwrap">
           <button class="badge-brain" id="brainbadge" title="利用するAI・実行環境を選ぶ">🧠 <b id="brain-label">…</b> <small id="brain-model"></small> ▾</button>
@@ -216,7 +235,7 @@
 
 <!-- 共有ダイアログ（所有者が共有リンクを発行） -->
 <div class="share-overlay" id="share-overlay" hidden>
-  <div class="share-modal" role="dialog" aria-labelledby="share-dialog-title">
+  <div class="share-modal" role="dialog" aria-modal="true" aria-labelledby="share-dialog-title">
     <button class="share-close-x" id="share-close" aria-label="閉じる">✕</button>
     <h2>会話を共有</h2>
     <div class="sub" id="share-dialog-title"></div>
@@ -256,7 +275,7 @@
         <div class="share-url-val" id="share-url-val"></div>
         <button class="mini" id="share-copy">コピー</button>
       </div>
-      <div style="font-size:11.5px;color:var(--ink-3);margin-top:8px">招待したユーザーがこのリンクをクリックすると、履歴に追加されます。</div>
+      <div style="font-size:var(--text-caption);color:var(--ink-3);margin-top:8px">招待したユーザーがこのリンクをクリックすると、履歴に追加されます。</div>
       <div style="margin-top:10px"><button class="mini" onclick="document.getElementById('share-overlay').hidden=true">閉じる</button></div>
     </div>
   </div>

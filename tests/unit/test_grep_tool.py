@@ -1029,6 +1029,20 @@ def test_grep_search_excludes_oversized_light_text_code_and_reports_truncated(mo
     assert truncated == ["script.py"]
 
 
+def test_grep_search_excludes_oversized_registered_code_and_reports_truncated(monkeypatch, tmp_path):
+    """登録アナライザ対象（`.cbl`＝`kind=="code"`）も台帳・グラフと同じ `text_kind.MAX_BYTES` で
+    除外する（台帳が `size_exceeded` で unreadable なのに grep だけヒットする矛盾を作らない）。"""
+    monkeypatch.setattr("sherpa.ingest.text_kind.MAX_BYTES", 50)
+    content = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. NEEDLE.\n" + "       DISPLAY 'X'.\n" * 10
+    assert len(content.encode("utf-8")) > 50
+    _write(tmp_path, "NEEDLE.cbl", content)
+
+    truncated: list = []
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], truncated_docs=truncated)
+    assert hits == []
+    assert truncated == ["NEEDLE.cbl"]
+
+
 def test_grep_search_keeps_light_text_within_max_bytes(monkeypatch, tmp_path):
     """`text_kind.MAX_BYTES` 以内の軽量テキストは従来どおり検索される（除外は超過分だけ）。"""
     monkeypatch.setattr("sherpa.ingest.text_kind.MAX_BYTES", 1024)

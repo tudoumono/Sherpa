@@ -335,6 +335,122 @@ def test_start_turn_enforces_global_limit():
             _wait_turn_done(rec.turn_id)
 
 
+def test_start_turn_rejects_same_known_conversation_id_while_unfinished():
+    """既存会話への継続（`known_conversation_id` 明示）だけを対象に、同じ conversation_id の
+    未完了ターンが既にあれば TurnLimitError(scope='conversation')。別会話・新規会話
+    （known_conversation_id 省略）は対象外のまま受け付ける。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+    recs = []
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    try:
+        cid = 9001
+        rec1 = chat_turns.start_turn(
+            uid="convlimit-u1", conversation_factory=lambda: cid,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        recs.append(rec1)
+
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            chat_turns.start_turn(
+                uid="convlimit-u1", conversation_factory=lambda: cid,
+                run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        assert ei.value.scope == "conversation"
+
+        # 別会話（別 conversation_id）は影響を受けない。
+        other_cid = 9002
+        rec2 = chat_turns.start_turn(
+            uid="convlimit-u1", conversation_factory=lambda: other_cid,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=other_cid)
+        recs.append(rec2)
+
+        # 新規会話（known_conversation_id 省略）は同じ conversation_id が未完了でも対象外
+        # （uid は別にして、per-user 上限との干渉を避ける＝本テストの関心はあくまで会話単位判定）。
+        rec3 = chat_turns.start_turn(
+            uid="convlimit-u2", conversation_factory=lambda: cid,
+            run_fn_factory=lambda c: _blocking_run)
+        recs.append(rec3)
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+def test_start_turn_reserves_known_conversation_id_before_factory_completes():
+    """既存会話への継続は `conversation_factory()` の完了を待たず、予約レコード作成時点で
+    `conversation_id` を確定させる——確定が factory 完了後（None のまま）だと、factory 実行中に
+    同じ会話への2本目が会話単位の排他をすり抜けてしまう。"""
+    from sherpa import chat_turns
+    cid = 31001
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+
+    def _slow_factory():
+        factory_started.set()
+        release_factory.wait(timeout=5)
+        return cid
+
+    def _blocking_run(stop_event, emit):
+        pass
+
+    result: dict = {}
+
+    def _drive_first():
+        result["rec"] = chat_turns.start_turn(
+            uid="race-u1", conversation_factory=_slow_factory,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+
+    th = threading.Thread(target=_drive_first, daemon=True)
+    th.start()
+    try:
+        assert factory_started.wait(timeout=5), "1本目の factory が開始しなかった（テスト前提が崩れている）"
+
+        # 1本目の conversation_factory() がまだ完了していない間に、同じ会話へ2本目を試みる。
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            chat_turns.start_turn(
+                uid="race-u2", conversation_factory=lambda: cid,
+                run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        assert ei.value.scope == "conversation", (
+            "factory 実行中（conversation_id が未確定のはずの窓）でも同じ会話の2本目は"
+            "拒否されるべき"
+        )
+    finally:
+        release_factory.set()
+        th.join(timeout=5)
+        _wait_turn_done(result["rec"].turn_id)
+
+
+def test_conversation_scope_check_takes_priority_over_user_limit_when_both_apply(monkeypatch):
+    """ユーザー上限にも同時に達している場合でも、同一会話への2本目は scope='user' ではなく
+    scope='conversation' になる（会話単位の排他を集約上限より先に判定する）。"""
+    from sherpa import chat_turns
+    monkeypatch.setattr(chat_turns, "effective_limits", lambda: (1, 100))
+    gate = threading.Event()
+    recs = []
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    try:
+        cid = 32001
+        recs.append(chat_turns.start_turn(
+            uid="priority-u1", conversation_factory=lambda: cid,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid))
+
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            chat_turns.start_turn(
+                uid="priority-u1", conversation_factory=lambda: cid,
+                run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        assert ei.value.scope == "conversation", (
+            f"ユーザー上限（1）にも達しているが、会話排他が優先されるべき: {ei.value.scope!r}")
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
 def test_chat_turns_start_returns_429_when_limit_exceeded(monkeypatch):
     """POST /chat/turns は chat_turns.TurnLimitError を 429 に変換する（HTTP 層の配線確認）。"""
     from sherpa import chat_turns
@@ -346,6 +462,21 @@ def test_chat_turns_start_returns_429_when_limit_exceeded(monkeypatch):
     c = _client()
     r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": False})
     assert r.status_code == 429
+
+
+def test_chat_turns_start_returns_429_with_conversation_message_when_conversation_busy(monkeypatch):
+    """POST /chat/turns は TurnLimitError(scope='conversation') を 429＋会話継続専用の文言に
+    変換する（uid/global 上限と同じ 429 だが文言で区別する）。"""
+    from sherpa import chat_turns
+
+    def _raise(*a, **k):
+        raise chat_turns.TurnLimitError("conversation")
+
+    monkeypatch.setattr(chat_turns, "start_turn", _raise)
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": False})
+    assert r.status_code == 429
+    assert "この会話の別の回答を実行中です" in r.json()["detail"]
 
 
 def test_chat_turns_start_429_when_admin_already_at_user_limit():

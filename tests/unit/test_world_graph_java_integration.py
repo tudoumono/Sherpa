@@ -78,7 +78,8 @@ def test_same_named_helper_in_two_packages_is_flagged_ambiguous_not_arbitrarily_
     billing_helper = ("Module", "Helper", "com/acme/billing/util/Helper.java")
     assert ("INVOKES", src, tax_helper) not in ek           # 任意解決していない
     assert ("INVOKES", src, billing_helper) not in ek
-    assert {"reason": "ambiguous", "from": "com/acme/Main.java", "kind": "Module", "name": "Helper"} in flags
+    assert {"reason": "ambiguous", "from": "com/acme/Main.java", "kind": "Module", "name": "Helper",
+            "line": 9, "via": "call"} in flags
 
 
 def test_reference_to_non_public_sibling_type_now_resolves_via_children_index():
@@ -99,7 +100,7 @@ def test_static_call_heuristic_flags_unresolved_jdk_reference_rather_than_guessi
     コーパスに `Math` の定義は無いため `unresolved` になる（誤って解決しない）。"""
     _nodes, _edges, flags = _build()
     assert {"reason": "unresolved", "from": "com/acme/tax/TaxCalculator.java",
-            "kind": "Module", "name": "Math"} in flags
+            "kind": "Module", "name": "Math", "line": 29, "via": "call"} in flags
 
 
 def test_analyzer_provenance_is_recorded_on_java_nodes():

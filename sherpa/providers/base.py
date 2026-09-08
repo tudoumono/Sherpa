@@ -84,6 +84,12 @@ class Ctx:
     # None＝新規セッション（resume しない）。resume 失敗時は CodexProvider 内で新規セッションへ
     # 自動フォールバックする（R1a の履歴 priming は resume の有無に関わらずプロンプトに前置済み）。
     codex_session_id: str | None = None
+    # 前ターンまでの Codex 累計 usage（`store.get_codex_usage_total`・conversation_id と同じ
+    # タイミングで chat_service が前渡しする）。CodexProvider だけが消費する（他 provider は無視）。
+    # `turn.completed.usage` はセッション累計のため、resume が効いたターンはこの値との差分を
+    # answer.usage にする（`session_id` が今回の resume 先と一致する時だけ・不一致/None なら
+    # 新規セッション相当として扱い累計をそのまま使う）。
+    codex_usage_prev_total: dict | None = None
     # 検索経路トグルの実接続可用性 snapshot（`agentic_search.tool_availability()`・SC-6e）。
     # `chat_service.handle_message`/`stream_message` がターン先頭で1回だけ計算して渡す
     # （knowledge オフ時は None）——`_agentic_run`（レンズ必須ツール判定）・provider の
@@ -136,6 +142,49 @@ def _synth_citation_view(citations: list, rerun_ids: set) -> list:
     if not new:
         return citations
     return new + [c for c in citations if id(c) not in rerun_ids]
+
+
+def _ingest_sub_final_into_state(state, ev: dict) -> None:
+    """C3（調査結果集約と並列実行の改善方針）: `_sub_loop`（`agentic_search.openai_style`）が返す
+    `final` イベントの確定済み結果（citation・構造的根拠・精読結果）を1質問1調査状態へ集約する
+    （初回・各再調査の `final` 到達ごとに呼ぶ）。`state` が None（非ハイブリッド）のときは何もしない。
+
+    `cites`/`evidence_meta`+`structural_evidence_meta` は既存の `combined_evidence_meta` 契約
+    （citation 由来の meta が先頭 `len(cites)` 件・以降が構造的根拠）とそのまま同じ形で
+    `InvestigationState.add_tool_result` へ渡せる。`read_evidence`（read_around/read_doc の精読
+    本文・`agentic_search._read_evidence_payload` が作る `{"doc_id","span","text"}`）は
+    `add_tool_result` の read_doc 分岐（`start_line`/`end_line` を直接読む）を借りて再構成する——
+    本文は既に `_redact`・800字上限で切り詰め済みのため、ここで再度読み直す必要はない。
+    `gaps`（sub ループ自身のローカル `InvestigationState.gaps`・`agentic_search._build_final_payload`
+    経由で final payload に載る）は sub ループの外（この呼び出し1回限り）では失われるため、
+    重複を避けて親 `state.gaps` へ合流する（`dropped_citations` と同じ「素の文字列を直接追記」
+    経路）。
+    `dropped_citations`（`_commit_evidence`/`_dedupe_citations_and_evidence` が機械検証で除外した
+    citation・`{"doc_id","reason"}`）は根拠ではなく「確認できなかった」事実そのものなので、
+    `state.gaps` へ直接足す（未確認・調査の限界を機械的に記録する契約・`InvestigationState.gaps`
+    は素の `list[str]` で `add_tool_result` を介さない直接追記も許容する）。
+    """
+    if state is None:
+        return
+    state.add_tool_result("sub_loop", {}, {}, ev.get("cites") or [],
+                          (ev.get("evidence_meta") or []) + (ev.get("structural_evidence_meta") or []))
+    for r in (ev.get("read_evidence") or []):
+        if not isinstance(r, dict) or not r.get("doc_id"):
+            continue
+        synthetic = {"doc_id": r.get("doc_id"), "text": r.get("text")}
+        span = r.get("span")
+        if isinstance(span, (list, tuple)) and len(span) == 2:
+            synthetic["start_line"], synthetic["end_line"] = span[0], span[1]
+        state.add_tool_result("read_doc", {}, synthetic, [], None)
+    for gap in (ev.get("gaps") or []):
+        if isinstance(gap, str) and gap not in state.gaps:
+            state.gaps.append(gap)
+    for d in (ev.get("dropped_citations") or []):
+        if not isinstance(d, dict):
+            continue
+        gap = f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）"
+        if gap not in state.gaps:
+            state.gaps.append(gap)
 
 
 def _ctx_with_effective_layer(ctx: Ctx, lens: str) -> Ctx:
@@ -921,8 +970,9 @@ class Provider:
 
 # ---- EXT-2c（査読フェーズの限定ツール精読）----
 _REVIEW_MAX_READS = 4          # read_around/list_docs を許す上限（超過時は次の1回で判定確定を強制）
-_REVIEW_TOOL_RESULT_MAX_CHARS = 2000   # ツール結果をプロンプトへ追記する際の文字数上限
+_REVIEW_READ_MAX_CHARS = 8000  # 読み直し結果（ツール結果 JSON）をプロンプトへ追記する際の文字数上限
 _REVIEW_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+_RERUN_MISSING_MAX_CHARS = 2000   # 査読が不足と判定したとき、再調査依頼へ引き継ぐ不足観点の文字数上限
 
 
 def _review_usage_folded(calls: int, tokens: dict | None, unknown: bool) -> dict | None:
@@ -998,7 +1048,8 @@ class _GenProvider(Provider):
 
     def _sufficiency_verdict(self, orig_message: str, lens: str, digest: str, world: str,
                              scope_paths=None, layer=None,
-                             stop_event=None) -> tuple[dict | None, list, dict | None]:
+                             stop_event=None, state=None,
+                             review_structural_meta: list | None = None) -> tuple[dict | None, list, dict | None]:
         """EXT-2b/EXT-2c（評価フェーズ再起・メイン査読＋限定ツール精読）: 清書前にメイン LLM が
         根拠の十分性を判定する。判定前に、引用箇所（doc_id・行）の前後原文を自分で確かめたければ
         `read_around`／文書一覧を確かめたければ `list_docs`（どちらも `agentic_search.run_tool` を
@@ -1025,6 +1076,20 @@ class _GenProvider(Provider):
         強制し、それでもなお読もうとすれば（モデルが指示に従わない）fail-open で打ち切る——
         ループの反復回数自体も `_REVIEW_MAX_READS + 2`（read 上限＋強制確定1回＋余裕1回）で
         機械的に上限化するため、モデルの応答内容に関わらず必ず終了する。
+
+        `state`（省略可・既定 None・C 追加）: 呼び出し元（`_agentic_run`）が持つ1質問1調査状態
+        （`InvestigationState`）。非 None のとき、この査読ループ自身が `read_around`/`list_docs`
+        で読み直した結果も `state.add_tool_result` で状態へ足す（下調べ役の結果と同じ状態へ集約
+        ＝再調査依頼と一緒に次の下調べへ引き継がれる）。省略時（既存の直接呼び出しテスト等）は
+        従来どおり状態を一切更新しない。
+
+        `review_structural_meta`（省略可・既定 None・C RV是正2巡目）: 非 None（呼び出し元が渡す
+        可変リスト）のとき、`list_docs` で得た構造的根拠（呼び出し単位の集計・`state` へ渡すのと
+        同じ形）を**追記**する（返り値の3-tuple 契約は変えない・既存の直接呼び出しテストは
+        このキーワード引数を渡さないため無変更のまま）。呼び出し元はこれを正規の
+        `structural_evidence_meta` へ合流させ、既存の `_dedupe_structural_evidence` で下調べ役
+        由来の集計と重複排除する——`state.evidence` は文脈整理・査読入力専用の集約先で、Evidence
+        Packet の正式な採番・ゲート判定には使わないため、こちらの別チャンネルで運ぶ。
         """
         from .. import agentic_search
         prompt = (
@@ -1107,6 +1172,26 @@ class _GenProvider(Provider):
                             exc_info=True)
                 return None, nodes, _review_usage_folded(calls, tokens, unknown)
             reads_done += 1
+            # C3: 査読自身が読んだ結果も下調べ役と同じ調査状態へ足す（`read_around` は
+            # `add_tool_result` が kind="read" Evidence として自動処理する・`list_docs` は
+            # `openai_style` と同じ「呼び出し単位で集計した1 Evidence」を組んでから渡す）。
+            # `state`/`review_structural_meta` のどちらか一方だけが非 None でも動くよう独立に扱う。
+            _review_structural = None
+            if action == "list_docs" and isinstance(result, dict) and "error" not in result:
+                _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
+                           if doc.get("rel_path")]
+                _review_structural = [{
+                    "doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                    "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
+                                  "prefix": str(v.get("path_prefix") or "").strip(), "pattern": ""},
+                    "matched_doc_ids": _matched}]
+            if state is not None:
+                state.add_tool_result(action, v, result, _cites, _review_structural)
+            if review_structural_meta is not None and _review_structural:
+                # RV是正2巡目: 査読が list_docs で得た構造的根拠を正規の `structural_evidence_meta`
+                # へ合流させるための別チャンネル（`state.evidence` は文脈整理・査読入力専用で
+                # Evidence Packet の正式採番には使わない・呼び出し元 docstring 参照）。
+                review_structural_meta.extend(_review_structural)
             label = str(v.get("doc_id") or v.get("path_prefix") or "").strip() or "(全体)"
             nodes.append(_node("main-review", "think", f"根拠を査読（{self.label}）",
                                f"原文を確かめています: {label}", "done"))
@@ -1114,7 +1199,10 @@ class _GenProvider(Provider):
                 result_text = json.dumps(result, ensure_ascii=False)
             except Exception:
                 result_text = str(result)
-            prompt += f"\n\n【ツール結果】\n{result_text[:_REVIEW_TOOL_RESULT_MAX_CHARS]}"
+            if len(result_text) > _REVIEW_READ_MAX_CHARS:
+                omitted_chars = len(result_text) - _REVIEW_READ_MAX_CHARS
+                result_text = result_text[:_REVIEW_READ_MAX_CHARS] + f"（以降 {omitted_chars} 字省略）"
+            prompt += f"\n\n【ツール結果】\n{result_text}"
         return None, nodes, _review_usage_folded(calls, tokens, unknown)   # 安全弁到達＝fail-open
 
     def _messages(self, prompt: str) -> list:
@@ -1275,6 +1363,7 @@ class _GenProvider(Provider):
             # サブの散文は `_agentic_run` の S3 分岐が破棄する契約＝上限到達時の最終合成は
             # 発行しない（1回分の呼び出しが丸ごと無駄になるため）。
             final_synthesis=False, layer=(ctx.scope_meta or {}).get("layer"),
+            system_settings=self._system_settings,
             max_hits=max_hits, window_cap=window_cap)
 
     def _sub_agentic_loop(self, ctx: Ctx):
@@ -1663,6 +1752,10 @@ class _GenProvider(Provider):
         # Provider 固有の allowlist を明示的に渡す（4方言の和集合ではない）——状態オブジェクト
         # 自体は従来どおり呼び出しごとに新規生成する。
         completion = _CompletionState(self._natural_completion_reasons)
+        # 清書へ確定根拠の全件ダイジェストを渡す（`_personal_facts` と同じ「合成専用の
+        # 非公開キー」の流儀）。公開 answer には残さない＝chat_service 側で env から pop する。
+        _synthesis_digest, _ = agentic_search.build_synthesis_digest(citations, combined_evidence_meta)
+        env["_synthesis_digest"] = _synthesis_digest
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
                 for chunk in self._stream(_answer_prompt(orig_message, lens, env), completion=completion):
@@ -1738,7 +1831,7 @@ class _GenProvider(Provider):
         ローカルの生散文（`answer`）は絶対にユーザーへ出さない＝合成成功時に `env["headline"]` を
         必ず上書きしてから yield する（失敗時は `_result` 自体を yield しない）。
         """
-        from .. import agentic_search
+        from .. import agentic_search, investigation_state
         t0 = time.monotonic()   # LOG-UX: このメソッド全体（反復ツール検索＋最終合成）の経過秒
         lens = decision["lens"]
         yield _node("understand", "think", "質問を理解", "内容を把握しました", "done")
@@ -1838,7 +1931,19 @@ class _GenProvider(Provider):
         # EXT-2c: 査読（`_sufficiency_verdict`）内の複数回の `_stream` 呼び出し（読み直しを含む）の
         # 消費も、chat-sub と同じく finally で1回だけ metering.record する。
         _review_usage_total = {"calls": 0, "tokens": None, "unknown": False}
+        # C3 RV是正2巡目: 査読が list_docs で得た構造的根拠（呼び出し単位の集計）を正規の
+        # `structural_evidence_meta` へ合流させるための一時蓄積——`_sufficiency_verdict` が
+        # 呼び出しごとに追記し、rerun ループを抜けた後に一括で合流させる（既存の
+        # `_dedupe_structural_evidence` が下調べ役由来のものと重複排除する）。
+        _review_structural_meta: list = []
         _first_rerun_cite_start = None   # EXT-2b: 最初の再調査開始時点の citation 件数（清書ビュー用）
+        # C3（調査結果集約と並列実行の改善方針・§「メインへの入力を最新の調査状態から作る」）:
+        # ハイブリッドの1質問1調査状態。下調べ役の各実行（初回＋再調査）が確定した結果・査読自身の
+        # 精読結果をここへ集約し、査読の入力（`state.render`）・清書の精読引き継ぎ（後述の
+        # `read_evidence`）を同じ状態から組む。非ハイブリッド（`self._sub is None`）は査読・清書の
+        # どちらもこの状態を使わないため作らない（既存の通常経路は無改修のまま）。
+        state = (investigation_state.InvestigationState(question=orig_message, scope={"world": ctx.world})
+                if self._sub is not None else None)
         try:
             for ev in (self._sub_agentic_loop(search_ctx) if self._sub is not None
                       else self._agentic_loop(search_ctx)):
@@ -1869,6 +1974,7 @@ class _GenProvider(Provider):
                     stop_reason = ev.get("stop_reason") or "unknown"
                     has_structural_evidence = ev.get("has_structural_evidence", False)
                     structural_evidence_meta = ev.get("structural_evidence_meta") or []
+                    _ingest_sub_final_into_state(state, ev)
                     if ev.get("evaluation_status") is not None:
                         evaluation = {"status": ev.get("evaluation_status"),
                                       "reason": ev.get("evaluation_reason"),
@@ -1882,35 +1988,28 @@ class _GenProvider(Provider):
             from .. import depth_profile as _depth_mod
             _reruns_allowed = {"standard": 0, "deep": 1, "max": 2}[
                 _depth_mod.normalize_depth_profile((ctx.scope_meta or {}).get("depth_profile"))]
-            _old_cites = _old_ev = _old_st = None   # 直前 rerun 前の件数（再査読 digest の新規優先用）
+            _old_cites = None   # 直前 rerun 前の citation 件数（`_first_rerun_cite_start`／清書ビュー用）
             if (self._sub is not None and _reruns_allowed > 0 and searched
                     and not (ctx.stop_event is not None and ctx.stop_event.is_set())
                     and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
                 for _rerun_i in range(_reruns_allowed + 1):
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
                         return
-                    # 再査読では rerun で得た新規根拠を digest の先頭へ置く——digest は先頭から
-                    # 件数/バイト上限で打ち切られるため、旧根拠が上限を埋めていると不足軸を
-                    # 埋めた新規根拠が査読に一切見えず、誤って honest failure になる。
-                    if _old_ev is None:
-                        _review_cites = cites
-                        _review_meta = evidence_meta + structural_evidence_meta
-                    else:
-                        # `build_evidence_digest` は「先頭 len(citations) 件の meta が citations[i] と
-                        # 1対1」という契約——citation meta を必ず先頭に保ち、**種別内**で新規優先に
-                        # する（種別横断の完全新規優先は現 digest API では対応が壊れるため不可）。
-                        _review_cites = cites[_old_cites:] + cites[:_old_cites]
-                        _review_meta = (evidence_meta[_old_ev:] + evidence_meta[:_old_ev]
-                                        + structural_evidence_meta[_old_st:]
-                                        + structural_evidence_meta[:_old_st])
-                    _digest, _ = agentic_search.build_evidence_digest(_review_cites, _review_meta)
+                    # C3: 査読の入力は1質問1調査状態の要約（`state.render`）——`state` は下調べ役の
+                    # 各実行（初回＋既に終えた再調査）の確定済み結果を ev_id 単位で蓄積済みなので、
+                    # 種別横断で再調査の新規根拠を先頭に置き直す旧来の並べ替え（`_review_cites`/
+                    # `_review_meta`）はもう要らない——render() 自体が「予算超過時は古い根拠から
+                    # 落とす」ため、新規根拠（直近に追加された分）は自然に残る（`InvestigationState.
+                    # render` docstring 参照）。
+                    _digest = state.render(max_bytes=32 * 1024)
                     # EXT-2c: 査読フェーズの限定ツール精読（read_around/list_docs）は下調べ役と
                     # 同じ範囲制約（search_ctx 相当の world/scope_paths/layer）で行う。
                     verdict, _review_nodes, _review_usage = self._sufficiency_verdict(
                         orig_message, lens, _digest, ctx.world,
                         scope_paths=(search_ctx.scope_meta or {}).get("scope_paths"),
                         layer=(search_ctx.scope_meta or {}).get("layer"),
-                        stop_event=ctx.stop_event)
+                        stop_event=ctx.stop_event, state=state,
+                        review_structural_meta=_review_structural_meta)
                     yield from _review_nodes
                     _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
@@ -1920,7 +2019,9 @@ class _GenProvider(Provider):
                             yield _node("main-review", "think", f"根拠を査読（{self.label}）",
                                         "集まった根拠で答えられると判断しました", "done")
                         break
-                    missing = verdict["missing"].strip()[:500]
+                    _missing_raw = verdict["missing"].strip()
+                    missing = (_missing_raw if len(_missing_raw) <= _RERUN_MISSING_MAX_CHARS
+                              else _missing_raw[:_RERUN_MISSING_MAX_CHARS] + "（以下省略）")
                     if _rerun_i >= _reruns_allowed or not missing:
                         # 再調査してもなお不足（または不足軸を特定できない）＝薄い根拠のまま自信ありげに
                         # 清書しない。専用例外で run() の honest failure 文言を「設定障害」と区別する。
@@ -1938,8 +2039,7 @@ class _GenProvider(Provider):
                     # ここまでの消費を先に合算へ退避しないと、下の finally が最後の実行分しか
                     # 記録せず初回下調べの chat-sub 消費が metering から消える。
                     _sub_acc_total = _fold_sub_usage(_sub_acc_total, self._sub_usage_acc)
-                    _old_cites, _old_ev, _old_st = (len(cites), len(evidence_meta),
-                                                    len(structural_evidence_meta))
+                    _old_cites = len(cites)
                     if _first_rerun_cite_start is None:
                         _first_rerun_cite_start = _old_cites
                     for ev in self._sub_agentic_loop(rerun_ctx):
@@ -1974,6 +2074,7 @@ class _GenProvider(Provider):
                                                        or ev.get("has_structural_evidence", False))
                             structural_evidence_meta = (structural_evidence_meta
                                                         + (ev.get("structural_evidence_meta") or []))
+                            _ingest_sub_final_into_state(state, ev)
                             # rerun に evaluation が無いのに初回の古い evaluation（blocked 等）を
                             # 残すと、最新 stop_reason と旧 status が同じ Packet に混在する——
                             # rerun final ごとに無条件で置換する（無ければ None）。
@@ -2042,7 +2143,33 @@ class _GenProvider(Provider):
         citations, evidence_meta, merge_dropped = _dedupe_citations_and_evidence(
             cites, evidence_meta, ctx.world)
         dropped_citations = dropped_citations + merge_dropped
-        structural_evidence_meta = _dedupe_structural_evidence(structural_evidence_meta)
+        # 査読（`_sufficiency_verdict`）が list_docs で得た構造的根拠を、下調べ役由来のものと同じ
+        # 正規の list へ合流させてから重複排除する（非ハイブリッドや査読未発動時は常に空リストの
+        # ため無変化）。
+        structural_evidence_meta = _dedupe_structural_evidence(
+            structural_evidence_meta + _review_structural_meta)
+        # 査読の list_docs 一致 doc は `_sufficiency_verdict` 内の `run_tool` 戻り値（docs 集合）が
+        # そこで使い捨てのため、ここでしか申告されない——merge 後の `structural_evidence_meta` を
+        # OR で反映しないと、下調べ役が根拠ゼロでも査読だけが構造的根拠を得たケースを根拠ゲートが
+        # 誤って弾く（下の evidence_meets_gate 判定）。OR にするのは、sub-loop 側が申告する
+        # `has_structural_evidence` を「対応する `structural_evidence_meta` の非空性」以外の理由
+        # （テスト double 等）で真にしていても、その値を格下げしないため。同様に査読の
+        # matched_doc_ids を `docs`（sources/sources_verified の母集団）へ合流しないと、査読限定の
+        # 一致が出典から欠落する。
+        has_structural_evidence = has_structural_evidence or bool(structural_evidence_meta)
+        for _rsm in _review_structural_meta:
+            if isinstance(_rsm, dict):
+                docs |= {d for d in (_rsm.get("matched_doc_ids") or []) if isinstance(d, str)}
+        # 査読自身の read_around/read_doc（`_sufficiency_verdict` 内の `run_tool` 戻り値の docs 集合）
+        # も同様にそこで使い捨てのため、精読した doc_id は `state.evidence`（kind="read"・
+        # `add_tool_result` が既に取り込み済み）から集合化して合流する——`docs`/`verified` の
+        # どちらにも足さないと、査読限定で精読した doc は sources に出ず（`docs` 未合流）、出典が
+        # 「精読済み」（EV-0・`sources_verified`）にもならない（`verified` 未合流）。sub-loop 自身の
+        # 精読分もここに含まれるが、`verified`/`docs` へは既に別経路で入っているため合流は idempotent。
+        if state is not None:
+            _read_doc_ids = {e.doc_id for e in state.evidence if e.kind == "read" and e.doc_id}
+            docs |= _read_doc_ids
+            verified |= _read_doc_ids
         # 根拠ゲートは main/sub 共通の契約（world 不達で全 citation が機械検証により空になった
         # ケースも honest failure として拾う）。
         min_citations = self._sub["guard"]["min_citations"] if self._sub is not None else 1
@@ -2166,6 +2293,22 @@ class _GenProvider(Provider):
         _synth_cites = _synth_citation_view(citations, _rerun_raw_cite_ids)
         _synth_env = (env if _synth_cites is citations
                       else {**env, "data": {**env["data"], "citations": _synth_cites}})
+        # 清書へ確定根拠の全件ダイジェストを渡す（`_personal_facts` と同じ「合成専用の
+        # 非公開キー」の流儀・公開 answer には残さない＝chat_service 側で env から pop する）。
+        # ev-N 採番は `combined_evidence_meta`（この直前までに組んだ結合済み list）基準——
+        # `_synth_cites` の並び替えはプロンプト表示専用のビューのため、ここでは元の
+        # `citations`/`combined_evidence_meta` の対応（添字が1対1の契約）をそのまま使う。
+        # C3: 下調べ役・査読が実際に read_around/read_doc で読んだ本文（`state` の kind="read"
+        # Evidence）を「精読: doc_id 行a-b「本文」」として引用・構造的根拠に続けて渡す——検索
+        # 引用が概要止まりでも、実際に読んだ本文にある条件・例外を清書が見落とさないようにする
+        # （Evidence Packet／`data.citations` には出さない内部専用チャンネル）。RV是正2巡目:
+        # `state.gaps`（検索0件／打ち切り／未確認）も「調査の限界: …」として続けて渡す——list_docs
+        # の集計事実は既に上で正規の `combined_evidence_meta` へ合流済みのため、ここでは gaps だけ
+        # 追加する（`build_synthesis_digest` 側が件数・文字数上限を適用する）。
+        _synthesis_digest, _ = agentic_search.build_synthesis_digest(
+            citations, combined_evidence_meta, read_evidence=agentic_search._read_evidence_payload(state),
+            gaps=state.gaps)
+        _synth_env["_synthesis_digest"] = _synthesis_digest
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
                 for chunk in self._stream(_answer_prompt(orig_message, lens, _synth_env), completion=completion):

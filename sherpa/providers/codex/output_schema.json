@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "answer", "next_step"],
+  "properties": {
+    "status": {"type": "string", "enum": ["final", "in_progress"]},
+    "answer": {"type": "string"},
+    "next_step": {"type": ["string", "null"]}
+  }
+}

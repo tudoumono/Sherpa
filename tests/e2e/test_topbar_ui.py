@@ -152,3 +152,112 @@ def test_healthdot_polling_pauses_when_hidden_and_resumes_once_visible(page, web
     page.clock.fast_forward(46000)   # 再開した定期ポーリングが動く
     page.wait_for_timeout(200)
     assert calls["n"] == base + 2
+
+
+def test_topbar_nav_collapses_overflow_into_more_menu(page, web_base_url):
+    """横幅に収まらないタブは右端の「その他 ▾」に畳む（2026-09-07）。切れて見えなくなるタブを作らない。
+    <a> は移動するだけ（複製しない）＝href／現在ページの強調はそのまま。広げれば元のリストへ戻る。"""
+    import re
+
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)                       # 既定=admin＝タブ 8 本（一般 5＋管理 3）
+    page.set_viewport_size({"width": 800, "height": 720})
+    page.goto(f"{web_base_url}/graph.html")
+
+    more = page.locator("#navmore")
+    menu = page.locator("#navmenu")
+    expect(more).to_be_visible()
+    expect(more).to_have_attribute("aria-expanded", "false")
+    expect(menu).to_be_hidden()
+    # 末尾側のタブがメニューへ移り、リストには残らない（要素は 1 つのまま）。先頭タブは必ずリストに残る。
+    expect(page.locator('#navmenu a[href="admin-settings.html"]')).to_have_count(1)
+    expect(page.locator('#navlist a[href="admin-settings.html"]')).to_have_count(0)
+    expect(page.locator('.nav a[href="admin-settings.html"]')).to_have_count(1)
+    expect(page.locator('#navlist a[href="home.html"]')).to_be_visible()   # 800px なら先頭は残る
+    # 現在ページ（ナレッジグラフ）が畳まれている間はボタン側を強調する
+    expect(page.locator('#navmenu a[href="graph.html"]')).to_have_count(1)
+    expect(more).to_have_class(re.compile(r"\bon\b"))
+    # リストに残ったタブは切れていない（内容幅が表示幅に収まる）
+    assert page.evaluate(
+        "() => { const l = document.getElementById('navlist'); return l.scrollWidth <= l.clientWidth; }"
+    )
+
+    more.click()
+    expect(menu).to_be_visible()
+    expect(more).to_have_attribute("aria-expanded", "true")
+    graph_item = page.locator('#navmenu a[href="graph.html"]')
+    expect(graph_item).to_be_visible()
+    expect(graph_item).to_have_class(re.compile(r"\bon\b"))
+    box = menu.bounding_box()
+    assert box["x"] >= 0 and box["x"] + box["width"] <= 800   # 画面内に収まる
+
+    page.keyboard.press("Escape")                 # Esc で閉じてボタンへフォーカスを戻す
+    expect(menu).to_be_hidden()
+    expect(more).to_be_focused()
+    expect(more).to_have_attribute("aria-expanded", "false")
+
+    more.click()
+    expect(menu).to_be_visible()
+    page.locator("body").click(position={"x": 5, "y": 400})   # 外側クリックで閉じる
+    expect(menu).to_be_hidden()
+
+    # 極端に狭くても「その他 ▾」自体は切れず、全タブがメニュー側へ移る（ボタンが切れると畳んだタブへ到達できない）
+    page.set_viewport_size({"width": 320, "height": 720})
+    expect(page.locator("#navlist a")).to_have_count(0)
+    expect(page.locator("#navmenu a")).to_have_count(8)
+    assert page.evaluate(
+        "() => { const l = document.getElementById('navlist').getBoundingClientRect();"
+        " const b = document.getElementById('navmore').getBoundingClientRect();"
+        " return b.left >= l.left - 0.5 && b.right <= l.right + 0.5; }"
+    )
+
+    page.set_viewport_size({"width": 1366, "height": 900})   # 広げると全部リストへ戻る
+    expect(more).to_be_hidden()
+    expect(page.locator("#navmenu a")).to_have_count(0)
+    graph_tab = page.locator('#navlist a[href="graph.html"]')
+    expect(graph_tab).to_be_visible()
+    expect(graph_tab).to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator('#navlist a[href="admin-settings.html"]')).to_be_visible()
+
+
+def test_topbar_more_menu_link_navigates(page, web_base_url):
+    """畳まれたタブはメニューから普通のリンクとして辿れる。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.set_viewport_size({"width": 800, "height": 720})
+    page.goto(f"{web_base_url}/home.html")
+    page.locator("#navmore").click()
+    item = page.locator('#navmenu a[href="admin-settings.html"]')
+    expect(item).to_be_visible()
+    item.click()
+    page.wait_for_url("**/admin-settings.html**", timeout=5000)
+
+
+def test_topbar_late_links_keep_order_when_already_folded(page, web_base_url):
+    """/auth/me が遅れて届いたとき（初期タブが畳まれた後）も、後から足すタブは末尾に並ぶ。
+    応答を保留し、初期タブが #navmenu へ移ったのを確認してから返す＝順序の回帰条件を決定的に踏む。"""
+    import json
+
+    from mock_api import auth_me_response
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    held: list = []
+    page.route("**/auth/me", lambda route: held.append(route))   # 後掛けの route が優先＝応答を保留
+    page.set_viewport_size({"width": 480, "height": 720})
+    page.goto(f"{web_base_url}/home.html")
+    expect(page.locator('#navmenu a[href="settings.html"]')).to_have_count(1)   # 初期タブが先に畳まれた
+    expect(page.locator('.nav a[href="workspace.html"]')).to_have_count(0)      # 認証後のタブはまだ無い
+    assert held   # nav.js（＋ページ側スクリプト）の /auth/me がここで待っている
+    for r in held:
+        r.fulfill(status=200, content_type="application/json", body=json.dumps(auth_me_response(USER_ADMIN)))
+    expect(page.locator('#navmenu a[href="admin-settings.html"]')).to_have_count(1)
+    hrefs = page.evaluate(
+        "() => Array.from(document.querySelectorAll('#navlist a, #navmenu a')).map(a => a.getAttribute('href'))"
+    )
+    assert hrefs == [
+        "home.html", "chat.html", "manual.html", "settings.html",
+        "workspace.html", "ingest.html", "graph.html", "admin-settings.html",
+    ]

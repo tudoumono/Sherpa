@@ -156,6 +156,9 @@ def test_on_loop_hits_sub_endpoint_and_single_synthesis():
         assert "LOCAL PROSE" not in "".join(deltas)   # ローカル散文は絶対に出ない
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        # 合成専用の非公開キー——`_agentic_run` はここに全件ダイジェストを乗せる（chat_service
+        # 側が `_finalize` 後に pop する契約・本テストは provider 単体呼び出しなのでまだ残っている）。
+        assert "ev-1:" in result["env"]["_synthesis_digest"]
         assert result["env"]["usage_sub"] == {
             "provider": "ollama", "model": "qwen2.5", "input_tokens": 10,
             "cached_input_tokens": 0, "output_tokens": 5, "reasoning_output_tokens": 0,
@@ -164,6 +167,133 @@ def test_on_loop_hits_sub_endpoint_and_single_synthesis():
         assert "usage" not in result["env"]
     finally:
         A._post = orig
+
+
+def test_read_around_result_reaches_synthesis_digest_when_citation_is_summary_only():
+    """C（B の RV 是正）: 検索引用が概要だけでも、下調べ役が read_around で実際に読んだ本文
+    （条件・例外を含む）は清書入力（`_synthesis_digest`）へ「精読: doc_id 行a-b「本文」」として
+    引き継がれる——検索結果の短い要約だけを根拠に清書させない（`InvestigationState` kind="read"
+    Evidence → `agentic_search._read_evidence_payload` → `build_synthesis_digest` の
+    `read_evidence` 引数、の橋渡しを固定する）。"""
+    doc = "4期/01_標準/消費税法.md"   # fixtures/corpus/v1 に実在（`_commit_evidence` の存在検証を通す）
+    calls = []
+
+    def fake_post(url, headers, body, timeout=90):
+        calls.append((url, dict(body), timeout))
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"税率"}'}}]}}]}
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c2", "function": {"name": "read_around",
+                                          "arguments": f'{{"doc_id":"{doc}","line":3}}'}}]}}]}
+        return {"choices": [{"message": {"content": "LOCAL PROSE (must be discarded)"}}]}
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        if name == "ripgrep_search":
+            c = {"doc_id": doc, "span": [3, 3], "quote": "税率の概要", "ext": ".md"}
+            return ({"hits": [{"doc_id": doc, "span": [3, 3], "text": "税率の概要"}]}, {doc}, [c], [])
+        if name == "read_around":
+            text = "2: \n3: 税率に関する法令上の規約。ただし適用除外ありと明記されている\n4: "
+            return ({"doc_id": doc, "text": text}, {doc}, [], [])
+        return ({"error": "unsupported in test"}, set(), [], [])
+
+    orig_post = A._post
+    orig_run_tool = A.run_tool
+    A._post = fake_post
+    A.run_tool = fake_run_tool
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        synth_prompt = p._synth_prompts[-1]
+        assert "税率の概要" in synth_prompt        # citation 側は要約止まり
+        assert "適用除外あり" in synth_prompt       # 精読本文の条件が清書入力に現れる（本テストの主眼）
+        assert "精読:" in synth_prompt
+        # 精読本文は Evidence Packet／data.citations には出さない内部専用チャンネル。
+        assert "適用除外あり" not in str(result["env"]["data"]["citations"])
+        assert "適用除外あり" not in str(result["env"]["data"]["evidence_packet"])
+    finally:
+        A._post = orig_post
+        A.run_tool = orig_run_tool
+
+
+def test_ingest_sub_final_into_state_records_dropped_citations_as_gaps():
+    """C3: `_sub_loop` の `final` の `dropped_citations`（機械検証で除外された citation）は
+    根拠ではなく「確認できなかった」事実として `state.gaps` に足す（cites/evidence_meta/
+    structural_evidence_meta と並ぶ4つ目の取り込み対象）。`state=None`（非ハイブリッド）は無視する。"""
+    from sherpa.investigation_state import InvestigationState
+    from sherpa.providers.base import _ingest_sub_final_into_state
+
+    state = InvestigationState(question="q", scope={})
+    ev = {"cites": [], "evidence_meta": [], "structural_evidence_meta": [],
+         "dropped_citations": [{"doc_id": "missing.md", "reason": "doc_missing"}]}
+    _ingest_sub_final_into_state(state, ev)
+    assert any("missing.md" in g and "doc_missing" in g for g in state.gaps)
+    _ingest_sub_final_into_state(None, ev)   # state 無し（非ハイブリッド）は例外を出さず何もしない
+
+
+def test_ingest_sub_final_into_state_merges_gaps_from_final_payload():
+    """final payload の `gaps`（sub ループ自身のローカル `InvestigationState.gaps`）も親 state へ
+    重複を避けて合流する——`dropped_citations` と並ぶ5つ目の取り込み対象。"""
+    from sherpa.investigation_state import InvestigationState
+    from sherpa.providers.base import _ingest_sub_final_into_state
+
+    state = InvestigationState(question="q", scope={})
+    state.gaps.append("既存の gap")
+    ev = {"cites": [], "evidence_meta": [], "structural_evidence_meta": [],
+         "gaps": ["ripgrep_search『存在しない語』: 0件", "既存の gap"]}   # 2件目は親と重複
+    _ingest_sub_final_into_state(state, ev)
+    assert state.gaps.count("既存の gap") == 1   # 重複は増やさない
+    assert "ripgrep_search『存在しない語』: 0件" in state.gaps
+
+
+def test_sub_loop_gaps_reach_parent_state_and_synthesis_digest_via_final_payload():
+    """下調べループ自身の gaps（list_docs 成功後、後続 ripgrep_search が0件）は、final payload
+    （`_build_final_payload`/`_finalize_payload` の `gaps`）経由でハイブリッドの親 `state.gaps`
+    へ引き継がれ、清書入力（`_synthesis_digest`）に「調査の限界」として現れる——list_docs の
+    構造的根拠だけで根拠ゲートを通り、citation 0件でも清書に至る。"""
+    doc = "4期/01_標準/消費税法.md"
+    calls: list = []
+
+    def fake_post(url, headers, body, timeout=90):
+        calls.append((url, dict(body), timeout))
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "list_docs", "arguments": '{"path_prefix":"4期"}'}}]}}]}
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c2", "function": {"name": "ripgrep_search", "arguments": '{"query":"存在しない語"}'}}]}}]}
+        return {"choices": [{"message": {"content": "LOCAL PROSE (must be discarded)"}}]}
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        if name == "list_docs":
+            return ({"count": 1, "docs": [{"rel_path": doc, "doctype": "md", "state": "ready"}]},
+                    {doc}, [], [])
+        if name == "ripgrep_search":
+            return ({"hits": []}, set(), [], [])
+        return ({"error": "unsupported in test"}, set(), [], [])
+
+    orig_post = A._post
+    orig_run_tool = A.run_tool
+    A._post = fake_post
+    A.run_tool = fake_run_tool
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"   # citation 0件でも構造的根拠でゲートを通る
+        synth_prompt = p._synth_prompts[-1]
+        assert "調査の限界" in synth_prompt
+        assert "ripgrep_search" in synth_prompt and "0件" in synth_prompt
+    finally:
+        A._post = orig_post
+        A.run_tool = orig_run_tool
 
 
 def test_usage_sub_profile_prefers_display_name_over_internal_slug():
@@ -323,13 +453,18 @@ def test_gate_claimless_graph_card_without_cid_does_not_pass(monkeypatch):
 
 
 def test_hybrid_synthesis_attribution_digest_surfaces_structural_only_evidence(monkeypatch):
-    """list_docs-only（citation 0件）の hybrid 応答は `_facts()` の文面に doc_id が一切現れない
-    （citation が無いため）——外側クラウド合成プロンプト自体には Evidence digest も doc_id も一切
-    乗らない（本文中に制御タグを書かせない設計簡素化）。帰属は回答完了後の別の非ストリーム呼び出し
-    （`self._attribute`）に渡す Evidence digest（`ev-N: 事実`・list_docs の集計 Evidence を含む）
-    で判定し、申告された ev-N は `matched_doc_ids` 経由で doc_id へ逆引きされて sources_verified／
-    Packet の `used` に正しく反映される。digest 本文は**ツール結果と同じ露出**（設計簡素化・
-    2026-08-24）——生 doc_id がそのまま出る。"""
+    """list_docs-only（citation 0件）の hybrid 応答。
+
+    外側クラウド合成プロンプトは `_synthesis_digest`（`build_synthesis_digest` の全件
+    ダイジェスト）を経由して構造的根拠（list_docs 集計）を見る——citation が無いという理由で
+    `_facts()` が『該当なし』に丸めない（引用が無くても構造的根拠だけで清書が事実を参照できる）。
+
+    帰属（回答完了後の別の非ストリーム呼び出し・`self._attribute`）は従来どおり別の Evidence
+    digest（`build_evidence_digest`・`ev-N: 事実`）で判定し、申告された ev-N は `matched_doc_ids`
+    経由で doc_id へ逆引きされて sources_verified／Packet の `used` に正しく反映される——2つの
+    digest は目的が異なる別関数（`build_synthesis_digest` は件数上限を持たない全件版・
+    `build_evidence_digest` は帰属専用の60字/60行/16KiB版）で、どちらも digest 本文は**ツール結果と
+    同じ露出**（設計簡素化・2026-08-24）——生 doc_id がそのまま出る。"""
     doc = "4期/04_運用/障害記録.md"
 
     def fake_run_tool(name, args, world, scope_paths, **kw):
@@ -366,8 +501,10 @@ def test_hybrid_synthesis_attribution_digest_surfaces_structural_only_evidence(m
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert p._synth_prompts, "合成プロンプトが一度も記録されなかった"
         prompt = p._synth_prompts[-1]
-        assert "該当なし" in prompt   # citation 0件なので _facts() 自体には doc_id が出ない
-        assert "Evidence digest" not in prompt and doc not in prompt   # 合成プロンプトには digest を渡さない
+        # citation 0件でも構造的根拠（list_docs 集計）が `_synthesis_digest` 経由で合成
+        # プロンプトへ届く——「該当なし」に丸めない（`build_synthesis_digest` の [list_docs] 表現）。
+        assert "該当なし" not in prompt
+        assert "[list_docs]" in prompt and "該当 1 件" in prompt and doc in prompt
         assert p.attribution_text == "資料が1件あります。"   # 確定した回答本文を渡す
         assert "該当 1 件" in p.attribution_digest and "列挙 1 件" in p.attribution_digest
         assert doc in p.attribution_digest   # digest はツール結果と同じ露出＝生 doc_id がそのまま出る

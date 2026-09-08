@@ -488,13 +488,18 @@ def test_share_boundary_expires_at_equals_now_is_inactive():
 def test_share_boundary_operator_pinned_to_implementation():
     """RV MED（2026-07-14 フェーズ7 1巡目）: 上の境界テストは実装の active 式を複製 SQL で
     再現している（別トランザクションでは now() が前進し「ちょうど」を作れないため）。
-    複製と実装の乖離（`>` が `>=` に変わる等）を検知するため、active 式を持つ実装2関数の
-    ソースに期待する式が現存することを pin する。落ちたら境界テストの複製 SQL と同時に更新すること。"""
+    複製と実装の乖離（`>` が `>=` に変わる等）を検知するため、active 式を持つ実装関数の
+    ソースに期待する式が現存することを pin する。落ちたら境界テストの複製 SQL と同時に更新すること。
+
+    H1（履歴検索）: `get_conversation_for_read` の受領共有 active 判定は `conversations.py::
+    _resolve_received_share_msg_src`（`search_conversations` と共通）へ切り出し済みのため、
+    そちらを見る（`resolve_share_by_token` は引き続き shares.py 自身が持つ）。"""
     import inspect
 
+    from sherpa.store import conversations as _conv
     from sherpa.store import shares as _shares
 
-    for fn in (_shares.get_conversation_for_read, _shares.resolve_share_by_token):
+    for fn in (_conv._resolve_received_share_msg_src, _shares.resolve_share_by_token):
         src = inspect.getsource(fn)
         assert "expires_at IS NULL OR expires_at>now()" in src, (
             f"{fn.__name__} の active 式が 'expires_at IS NULL OR expires_at>now()' から変わった＝"

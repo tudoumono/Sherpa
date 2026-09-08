@@ -41,6 +41,42 @@ def test_tools_list_exposes_family():
     assert ask["description"] == agentic_search._DESC_ASK    # 制約文言は agentic と同一（二重管理しない）
 
 
+def test_tools_list_exposes_read_doc_outline_glob_search():
+    """read_doc/doc_outline/glob_search は read_around 等と同じ土台系＝常に公開する
+    （schema/description は agentic_search と共通・二重管理しない）。"""
+    resp = M.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/list"})
+    tools = resp["result"]["tools"]
+    names = {t["name"] for t in tools}
+    assert {"read_doc", "doc_outline", "glob_search"} <= names
+    from sherpa import agentic_search
+    byname = {t["name"]: t for t in tools}
+    assert byname["read_doc"]["description"] == agentic_search._DESC_READ_DOC
+    assert byname["read_doc"]["inputSchema"] == agentic_search._PARAMS_READ_DOC
+    assert byname["doc_outline"]["description"] == agentic_search._DESC_OUTLINE
+    assert byname["doc_outline"]["inputSchema"] == agentic_search._PARAMS_OUTLINE
+    assert byname["glob_search"]["description"] == agentic_search._DESC_GLOB
+    assert byname["glob_search"]["inputSchema"] == agentic_search._PARAMS_GLOB
+
+
+def test_tools_list_order_stable_with_and_without_es(monkeypatch):
+    """es_search の有無に関わらず、他の土台系ツールの並びが崩れない
+    （es_search は名前で ripgrep_search の位置を探して直後に差し込むだけ）。"""
+    foundation = ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "doc_outline",
+                 "read_doc", "read_around", "compare_documents"]
+
+    monkeypatch.setattr(M.es_index, "available", lambda: False)
+    resp = M.handle({"jsonrpc": "2.0", "id": 8, "method": "tools/list"})
+    names_no_es = [t["name"] for t in resp["result"]["tools"]]
+    assert "es_search" not in names_no_es
+    assert [n for n in names_no_es if n in foundation] == foundation
+
+    monkeypatch.setattr(M.es_index, "available", lambda: True)
+    resp2 = M.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})
+    names_es = [t["name"] for t in resp2["result"]["tools"]]
+    assert names_es.index("es_search") == names_es.index("ripgrep_search") + 1
+    assert [n for n in names_es if n in foundation] == foundation
+
+
 def test_tools_call_ask_user_first_then_second_within_execution():
     """S2 ガード③: 1実行1回。MCP サーバは codex exec 1回＝1プロセスなので、1回目と2回目で
     別のツール結果文言を返す（ラッパー側も2回目を無視するが、ここは Codex が受け取る本文の検証）。"""
@@ -102,6 +138,37 @@ def test_tools_call_list_docs_on_fixtures():
     expected = CE.count_under("4期/02_設計")                        # fixtures 実走査由来（フェーズ7 S1）
     assert payload["count"] == expected and len(payload["docs"]) == expected
     assert all(d["rel_path"].startswith("4期/02_設計/") for d in payload["docs"])
+
+
+def test_tools_call_read_doc_and_doc_outline_on_fixtures():
+    """MCP 経由でも read_doc（通読）・doc_outline（見出し構造）が結果を返す
+    （既存の test_tools_call_ripgrep_on_fixtures と同じ流儀・doc_id は実ヒットから取る）。"""
+    hit_resp = M.handle({"jsonrpc": "2.0", "id": 50, "method": "tools/call",
+                         "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+    hit_payload = json.loads(hit_resp["result"]["content"][0]["text"])
+    doc_id = hit_payload["hits"][0]["doc_id"]
+
+    resp = M.handle({"jsonrpc": "2.0", "id": 51, "method": "tools/call",
+                     "params": {"name": "read_doc", "arguments": {"doc_id": doc_id}}})
+    assert not resp["result"]["isError"]
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload["doc_id"] == doc_id and "text" in payload and "total_lines" in payload
+
+    resp2 = M.handle({"jsonrpc": "2.0", "id": 52, "method": "tools/call",
+                      "params": {"name": "doc_outline", "arguments": {"doc_id": doc_id}}})
+    assert not resp2["result"]["isError"]
+    payload2 = json.loads(resp2["result"]["content"][0]["text"])
+    assert payload2["doc_id"] == doc_id and "headings" in payload2
+
+
+def test_tools_call_glob_search_on_fixtures():
+    """MCP 経由で glob_search がファイル名パターン一致のパス一覧を返す。"""
+    resp = M.handle({"jsonrpc": "2.0", "id": 53, "method": "tools/call",
+                     "params": {"name": "glob_search", "arguments": {"pattern": "*.md"}}})
+    assert not resp["result"]["isError"]
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload["count"] > 0 and payload["paths"]
+    assert all(p.lower().endswith(".md") for p in payload["paths"])
 
 
 def test_tools_call_graph_neighbors_stubbed():

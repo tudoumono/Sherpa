@@ -14,24 +14,28 @@
   .login-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
     padding:36px 40px;width:340px;box-shadow:var(--shadow-lg)}
   .login-brand{display:flex;align-items:center;gap:10px;margin-bottom:24px}
-  .login-brand .mark{width:32px;height:32px;border-radius:9px;background:var(--accent);
-    display:grid;place-items:center;color:#fff;font-size:16px}
-  .login-brand b{font-size:18px;font-weight:700}
-  .login-brand small{color:var(--ink-3);font-size:12px;display:block}
-  .login-title{font-size:15px;font-weight:700;color:var(--ink);margin-bottom:18px}
+  .login-brand .mark{width:32px;height:32px;border-radius:9px;background:var(--action-bg);
+    display:grid;place-items:center;color:var(--action-fg);font-size:var(--text-body)}
+  .login-brand b{font-size:var(--text-section);font-weight:700}
+  .login-brand small{color:var(--ink-3);font-size:var(--text-small);display:block}
+  .login-title{font-size:var(--text-body);font-weight:700;color:var(--ink);margin-bottom:18px}
   .lfield{margin-bottom:14px}
-  .lfield label{display:block;font-size:12.5px;font-weight:600;color:var(--ink-2);margin-bottom:5px}
-  .lfield input{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid var(--border);
-    border-radius:var(--radius-sm);font-family:inherit;font-size:14px;background:var(--surface);
+  .lfield label{display:block;font-size:var(--text-small);font-weight:600;color:var(--ink-2);margin-bottom:5px}
+  .lfield input{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid var(--control-border);
+    border-radius:var(--radius-sm);font-family:inherit;font-size:var(--text-body);background:var(--surface);
     color:var(--ink);outline:none}
   .lfield input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-weak)}
   .login-err{background:var(--danger-bg);color:var(--danger);border-radius:var(--radius-sm);
-    font-size:12.5px;padding:9px 12px;margin-bottom:14px;display:none}
+    font-size:var(--text-small);padding:9px 12px;margin-bottom:14px;display:none}
   .login-err.show{display:block}
-  .login-submit{width:100%;height:40px;border:none;border-radius:var(--radius-sm);background:var(--accent);
-    color:#fff;font-weight:700;font-size:14px;cursor:pointer;margin-top:4px}
-  .login-submit:hover{background:var(--accent-ink)}
+  .login-submit{width:100%;height:40px;border:none;border-radius:var(--radius-sm);background:var(--action-bg);
+    color:var(--action-fg);font-weight:700;font-size:var(--text-body);cursor:pointer;margin-top:4px}
+  .login-submit:hover{filter:brightness(.94)}
   .login-submit:disabled{opacity:.6;cursor:not-allowed}
+  body{height:auto;padding:24px 16px}
+  .login-card{width:min(400px,100%);padding:28px}
+  .login-title{font-size:var(--text-section)}
+  .login-submit{min-height:44px}
 </style>
 </head>
 <body>

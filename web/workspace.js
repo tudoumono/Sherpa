@@ -42,7 +42,7 @@ async function loadFiles() {
     // data-* 属性に ID を持たせて委譲クリックで削除（インラインハンドラなし）。
     const rows = files.map((f) =>
       `<tr>
-        <td style="font-family:var(--font-code,monospace);font-size:12.5px">${esc(f.rel_path)}</td>
+        <td style="font-family:var(--font-code,monospace);font-size:var(--text-small)">${esc(f.rel_path)}</td>
         <td style="text-align:right;white-space:nowrap;color:var(--ink-3)">${esc(fmtSize(f.size_bytes))}</td>
         <td style="color:var(--ink-3);white-space:nowrap">${esc(fmtDate(f.created_at))}</td>
         <td style="color:var(--ink-3);white-space:nowrap">${esc(fmtDate(f.expires_at) || '—')}</td>
@@ -154,7 +154,7 @@ async function doSearch() {
     }
     // 個人ファイル内ヒットバッジ付きで表示。
     const badge = '<span class="personal-badge" style="margin-right:6px">個人ファイル内ヒット</span>';
-    res.innerHTML = `<div style="font-size:12px;color:var(--ink-3);margin-bottom:8px">${badge}${esc(String(hits.length))} 件</div>`
+    res.innerHTML = `<div style="font-size:var(--text-small);color:var(--ink-3);margin-bottom:8px">${badge}${esc(String(hits.length))} 件</div>`
       + hits.map((h) =>
         `<div class="hit-card">
           <div class="hit-meta">${esc(h.rel_path)} — ${esc(String(h.line))} 行目</div>

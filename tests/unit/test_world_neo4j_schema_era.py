@@ -46,6 +46,20 @@ def test_compute_graph_schema_era_changes_when_code_analyzer_version_bumps(monke
     assert after != before
 
 
+def test_compute_graph_schema_era_changes_when_analyzer_registry_config_signature_changes(monkeypatch):
+    """`analyzers.registry.config_signature()`（登録簿の構成署名）が変われば era も
+    変わる——新規アナライザ登録（`CODE_ANALYZERS_SCHEMA_VERSION` 据え置き）でも構成そのものは
+    変わるため、これを材料に含めないと再同期前の読取ゲート（`check_schema_era`）が古いグラフを
+    通してしまう。"""
+    from sherpa.ingest.analyzers import registry as analyzer_registry
+    before = wn._compute_graph_schema_era()
+    original = analyzer_registry.config_signature
+    monkeypatch.setattr(analyzer_registry, "config_signature",
+                        lambda: original() + ("extra",))
+    after = wn._compute_graph_schema_era()
+    assert after != before
+
+
 def test_compute_graph_schema_era_changes_when_mention_schema_version_bumps(monkeypatch):
     """`world_graph.MENTION_SCHEMA_VERSION` の版を1つ上げると era も変わる。"""
     from sherpa.ingest import world_graph

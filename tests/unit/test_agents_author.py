@@ -283,55 +283,509 @@ def test_prompt_mcp_non_author_unchanged_shape():
         assert "graph_neighbors" in prompt   # 既存の MCP ツール案内は健在
 
 
-# ===== 同一 uid の直列化 lock（RV MEDIUM・Phase1） =====
+# ===== 実行ごとの作業領域（run_dir）: 同一 uid の並走（直列化 lock 撤去の置き換え） =====
 
-def test_codex_run_busy_when_same_uid_running():
-    """同一 uid の Codex 実行中はもう1件を実行せず（非ブロッキング）、正直な busy 回答を返す。
-    並行実行は共有 authoring/ の snapshot・files/ move・.agents rebuild が交差して
-    成果物の取り違え/破損を起こすため、直列のみ許可。"""
-    prov = A.CodexProvider()
-    ctx = _ctx()
-    ctx.uid = "lock-busy-u1"
-    lk = A._authoring_lock("lock-busy-u1")
+_FAKE_CODEX_CWD_PY = r'''#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+import time
+
+argv_log = pathlib.Path(r"{argv_log}")
+args = sys.argv[1:]
+with argv_log.open("a", encoding="utf-8") as f:
+    f.write(json.dumps({{"args": args, "cwd": os.getcwd()}}) + "\n")
+    f.flush()
+
+prompt_text = args[-1] if args else ""
+if "PARALLEL_SLOW" in prompt_text:
+    time.sleep(0.5)   # 並走ウィンドウを作る（他方の実行が同じ uid で割り込めることを確認するため）
+print(json.dumps({{"type": "thread.started", "thread_id": "TH-PARALLEL"}}))
+print(json.dumps({{"type": "item.completed",
+                   "item": {{"id": "1", "type": "agent_message", "text": "done-ok"}}}}))
+sys.exit(0)
+'''
+
+
+def _write_fake_codex_cwd(bin_dir, argv_log):
+    """test_codex_resume.py の偽 codex 流儀＋cwd も記録する版（run dir 分離の確認用）。"""
+    import stat
+    script = bin_dir / "codex"
+    script.write_text(_FAKE_CODEX_CWD_PY.format(argv_log=str(argv_log)))
+    mode = script.stat().st_mode
+    script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _read_cwd_log(argv_log):
+    import json
+    if not argv_log.exists():
+        return []
+    return [json.loads(line) for line in argv_log.read_text().splitlines() if line.strip()]
+
+
+def test_same_uid_concurrent_runs_get_separate_run_dirs_and_neither_is_busy(tmp_path, monkeypatch):
+    """RV MEDIUM の同一 uid 直列化 lock は撤去し、実行ごとに専用の作業領域（authoring/run-*）を
+    割り当てる方式に置き換えた——同一 uid の2実行が時間的に重なっても busy にならず、それぞれ
+    別々の run dir を cwd にして両方完走し、終了後は両方とも掃除される。"""
+    import pathlib
+    import threading
+    import time
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    _write_fake_codex_cwd(bin_dir, argv_log)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
+
+    uid = "parallel-run-u1"
+    results: dict = {}
+
+    def _drive(key, message):
+        ctx = A.Ctx(
+            message=message, world="v1",
+            route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+            dispatch=lambda lens_, inp: {
+                "lens": lens_, "headline": "dispatch-headline",
+                "summary": {"total": 0}, "data": {}, "sources": [],
+            },
+            knowledge=True, uid=uid,
+        )
+        results[key] = list(A.CodexProvider().run(ctx))
+
+    th = threading.Thread(target=_drive, args=("slow", "PARALLEL_SLOW 遅い方の実行"), daemon=True)
+    th.start()
+
+    deadline = time.time() + 10
+    while time.time() < deadline and len(_read_cwd_log(argv_log)) < 1:
+        time.sleep(0.02)
+    assert len(_read_cwd_log(argv_log)) == 1, "1本目（slow）の起動が確認できない（テスト前提が崩れている）"
+
+    # slow 側がまだ sleep 中（完走前）のうちに、同じ uid で2本目を同期実行する——
+    # 直列化 lock が残っていればここで busy 応答になるはず。
+    _drive("fast", "速い方の実行")
+
+    th.join(timeout=10)
+    assert not th.is_alive(), "slow 側が想定時間内に完走しない"
+
+    calls = _read_cwd_log(argv_log)
+    assert len(calls) == 2, f"2回とも codex exec が実行されるはず: {calls!r}"
+
+    def _env_of(key):
+        res = [e for e in results[key] if isinstance(e, dict) and e.get("type") == "_result"]
+        assert len(res) == 1, f"{key}: _result が1件でない: {results[key]!r}"
+        return res[0]["env"]
+
+    for label, env in (("slow", _env_of("slow")), ("fast", _env_of("fast"))):
+        assert env.get("busy") is not True, f"{label} 側が busy になっている（直列化 lock の名残）"
+        assert "実行中" not in env["headline"], f"{label} 側が busy 文言のまま: {env['headline']!r}"
+        assert env["headline"] == "done-ok", f"{label} 側が完走していない: {env!r}"
+
+    cwd_slow, cwd_fast = calls[0]["cwd"], calls[1]["cwd"]
+    assert cwd_slow != cwd_fast, "2本の実行が同じ cwd を共有している（run dir が分離されていない）"
+    for cwd in (cwd_slow, cwd_fast):
+        p = pathlib.Path(cwd)
+        assert p.name.startswith("run-"), f"cwd が authoring/run-* 形式でない: {cwd}"
+        assert p.parent.name == "authoring", f"cwd の親が authoring/ でない: {cwd}"
+        assert not p.exists(), f"実行後も run dir が残っている（cleanup 未実施）: {cwd}"
+
+
+# ===== 会話単位ロック: 永続 CODEX_HOME の同時使用を防ぐ =====
+# run dir 自体は実行ごとに独立なので並走可能だが、永続 CODEX_HOME
+# （`.codex-sessions/{conversation_id}`・R1b の会話継続）は同一会話の複数ターンで固定パスを
+# 共有する。同一会話の2実行が重なると config.toml の unlink→再作成・session JSONL の同時書込等が
+# 競合しうる（O_EXCL は直前の unlink で排他にならない）ため、conversation_id 単位の非ブロッキング
+# lock で「永続 CODEX_HOME を使う実行」だけを直列化する（uid・lens とは無関係）。
+
+def test_same_conversation_second_run_is_rejected_while_first_holds_lock(monkeypatch, tmp_path):
+    """同一 conversation_id の2実行が重なると、2本目は Codex を起動せず拒否応答になる。"""
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
+
+    def _no_popen(*_a, **_k):
+        raise AssertionError("会話ロックで拒否されるはずが Codex CLI が起動されている")
+
+    monkeypatch.setattr(subprocess, "Popen", _no_popen)
+
+    from sherpa.providers.codex import provider as PV
+    lk = PV._conversation_lock(5001)
     assert lk.acquire(blocking=False)
     try:
+        prov = A.CodexProvider()
+        ctx = _ctx(lens="qa", message="質問")
+        ctx.uid = "conv-busy-u1"
+        ctx.conversation_id = 5001
         events = list(prov.run(ctx))
     finally:
         lk.release()
     res = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"]
-    assert len(res) == 1, "busy 応答が _result で完結していない"
-    assert "実行中" in res[0]["env"]["headline"]
-    assert res[0]["env"]["sources"] == []
+    assert len(res) == 1, "会話ロック拒否の応答が _result で完結していない"
+    assert res[0]["env"].get("busy") is True
+    assert "この会話の別の回答を実行中です" in res[0]["env"]["headline"]
+    assert res[0]["env"]["scope"]["source"] == "busy"
+    assert res[0]["decision"]["lens"] == "qa"   # busy 応答も実際の decision.lens を引き継ぐ（旧実装は固定 "qa"）
 
 
-def test_authoring_lock_released_on_generator_close(monkeypatch):
-    """直列化 lock は generator が途中で close されても解放される（run() が yield from を
-    try/finally で包む設計の検証。漏れると同一 uid が恒久的に busy になる）。"""
-    def fake_gather(ctx):
-        yield {"type": "node", "id": "x", "kind": "think", "label": "t", "detail": "", "status": "done"}
-        yield {"type": "_env", "decision": {"lens": "qa", "input": ctx.message, "reason": "t"},
-               "env": {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}}
-    monkeypatch.setattr(A, "_gather", fake_gather)
-    prov = A.CodexProvider()
-    ctx = _ctx()
-    ctx.uid = "lock-close-u1"
-    gen = prov.run(ctx)
-    next(gen)                                        # lock 獲得＋最初の node まで進める
-    lk = A._authoring_lock("lock-close-u1")
-    assert not lk.acquire(blocking=False), "実行中に lock が解放されている"
-    gen.close()                                      # 途中終了（クライアント切断相当）
-    assert lk.acquire(blocking=False), "close 後に lock が解放されていない（恒久 busy）"
+def test_different_conversation_ids_do_not_share_the_lock(monkeypatch, tmp_path):
+    """別会話（別 conversation_id）は互いに無関係な CODEX_HOME・run dir を使うため、
+    片方がロックを保持していてももう片方は待たされない（同一 uid でも別会話なら並走可）。"""
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
+
+    def _boom_popen(*_a, **_k):
+        raise OSError("popen intentionally not followed through in this test")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom_popen)
+
+    from sherpa.providers.codex import provider as PV
+    lk_other = PV._conversation_lock(6001)
+    assert lk_other.acquire(blocking=False)
+    try:
+        prov = A.CodexProvider()
+        ctx = _ctx(lens="qa", message="質問")
+        ctx.uid = "conv-other-u1"
+        ctx.conversation_id = 6002   # 別会話 → lk_other とは無関係
+        events = list(prov.run(ctx))
+    finally:
+        lk_other.release()
+    res = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(res) == 1, f"完走していない: {events!r}"
+    assert res[0]["env"].get("busy") is not True, "別会話なのに busy 応答になっている"
+
+
+def test_conversation_lock_held_through_result_event(tmp_path, monkeypatch):
+    """会話ロックは `_result` を送出し終える（generator が完了し finally が走る）まで保持される。
+    途中（成果物処理〜`_result` 送出前）で解放すると、同じ conversation_id の次ターンが
+    古い `codex_session_id`／履歴のまま割り込める窓ができる。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    _write_fake_codex_cwd(bin_dir, argv_log)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
+
+    from sherpa.providers.codex import provider as PV
+    conversation_id = 777001
+    ctx = A.Ctx(
+        message="質問", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid="conv-hold-u1", conversation_id=conversation_id,
+    )
+    gen = A.CodexProvider().run(ctx)
+    events = []
+    result_seen = False
+    for _ in range(200):
+        ev = next(gen)
+        events.append(ev)
+        if isinstance(ev, dict) and ev.get("type") == "_result":
+            result_seen = True
+            break
+    assert result_seen, f"_result に到達しなかった: {events!r}"
+
+    lk = PV._conversation_lock(conversation_id)
+    assert not lk.acquire(blocking=False), "_result 送出直後にもう会話ロックが解放されている"
+
+    try:
+        next(gen)
+        raise AssertionError("_result の後にもう1件 yield された（想定外）")
+    except StopIteration:
+        pass   # generator 完了＝finally 実行＝ここでロックが解放される
+
+    assert lk.acquire(blocking=False), "generator 完了後も会話ロックが解放されていない"
     lk.release()
+
+
+# ===== 成果物 move／台帳登録の失敗 =====
+
+_FAKE_CODEX_WRITES_FILE_PY = r'''#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+pathlib.Path("output.txt").write_text("created by fake codex", encoding="utf-8")
+print(json.dumps({"type": "item.completed",
+                   "item": {"id": "1", "type": "agent_message", "text": "ファイルを作成しました。"}}))
+sys.exit(0)
+'''
+
+
+def _write_fake_codex_creates_file(bin_dir):
+    import stat
+    script = bin_dir / "codex"
+    script.write_text(_FAKE_CODEX_WRITES_FILE_PY)
+    mode = script.stat().st_mode
+    script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def test_created_file_registration_failure_keeps_run_dir_and_appends_note(monkeypatch, tmp_path):
+    """move は成功したが台帳登録（`record_workspace_file`）に失敗した場合、
+    (a) files/ に台帳の無い孤児を残さず run_dir 側へ戻す、(b) run_dir 自体は削除せず
+    回収用に残す、(c) 回答本文の末尾に固定注記を付ける。"""
+    import pathlib
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_codex_creates_file(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    users_dir = tmp_path / "users"
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
+
+    import contextlib
+    from sherpa import store
+
+    @contextlib.contextmanager
+    def _fake_lock(_uid, _rel):
+        yield
+
+    def _boom_record(*_a, **_k):
+        raise RuntimeError("db down (test)")
+
+    monkeypatch.setattr(store, "workspace_file_lock", _fake_lock)
+    monkeypatch.setattr(store, "no_live_upload_for_path", lambda *_a, **_k: True)
+    monkeypatch.setattr(store, "record_workspace_file", _boom_record)
+
+    uid = "created-file-fail-u1"
+    ctx = A.Ctx(
+        message="質問", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid=uid,
+    )
+    envs = [e["env"] for e in A.CodexProvider().run(ctx) if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(envs) == 1, "完走していない"
+    env = envs[0]
+    from sherpa.providers.codex import provider as PV
+    assert PV._CREATED_FILES_FAILURE_NOTE in env["headline"], f"注記が付いていない: {env['headline']!r}"
+
+    users_root = pathlib.Path(users_dir).resolve()
+    run_dirs = list((users_root / uid / "workspace" / "authoring").glob("run-*"))
+    assert len(run_dirs) == 1, f"run dir が想定どおり残っていない（削除されてしまった）: {run_dirs!r}"
+    assert (run_dirs[0] / "output.txt").is_file(), "登録失敗後、ファイルが run_dir 側へ戻っていない"
+    files_dir = users_root / uid / "workspace" / "files"
+    assert not (files_dir / "output.txt").exists(), "登録失敗なのに files/ に台帳無しの孤児が残っている"
+
+
+def test_files_dir_unavailable_keeps_run_dir_and_appends_note(monkeypatch, tmp_path):
+    """`files/` が使えない（symlink 等で `_dest_dir is None`）場合を黙って成功扱いにしない——
+    成果物は run_dir に残ったまま（move していない）なので、保存失敗として run_dir を保持し、
+    回答本文へ固定注記を付ける。"""
+    import pathlib
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_codex_creates_file(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    users_dir = tmp_path / "users"
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
+
+    uid = "files-unavailable-u1"
+    # files/ を symlink にして使えない状態を模す（ws_files.is_symlink() → None 扱い → _dest_dir=None）。
+    ws = users_dir / uid / "workspace"
+    ws.mkdir(parents=True)
+    evil = tmp_path / "evil-files-target"
+    evil.mkdir()
+    (ws / "files").symlink_to(evil)
+
+    ctx = A.Ctx(
+        message="質問", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid=uid,
+    )
+    envs = [e["env"] for e in A.CodexProvider().run(ctx) if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(envs) == 1, "完走していない"
+    env = envs[0]
+    from sherpa.providers.codex import provider as PV
+    assert PV._CREATED_FILES_FAILURE_NOTE in env["headline"], f"注記が付いていない: {env['headline']!r}"
+
+    users_root = pathlib.Path(users_dir).resolve()
+    run_dirs = list((users_root / uid / "workspace" / "authoring").glob("run-*"))
+    assert len(run_dirs) == 1, f"run dir が想定どおり残っていない（削除されてしまった）: {run_dirs!r}"
+    assert (run_dirs[0] / "output.txt").is_file(), "成果物が run_dir に残っていない（黙って消えた）"
+
+
+def test_move_back_failure_after_registration_failure_is_logged_and_keeps_note(monkeypatch, tmp_path, caplog):
+    """台帳登録失敗後の差し戻し（2回目の move）が失敗しても握り潰さない——明示的に warning へ
+    記録し（相対パスのみ）、その場合も `_created_files_failed=True` のまま注記が付く。
+    差し戻し例外そのもの（`shutil.move` の実際の失敗と同様、文字列表現に絶対パスを含む）は
+    そのまま `%s` で出さず、型（`type(exc).__name__`）と errno だけを記録することも確認する。"""
+    import logging
+    import pathlib
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_codex_creates_file(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    users_dir = tmp_path / "users"
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
+
+    import contextlib
+    import shutil as _shutil_mod
+    from sherpa import store
+
+    @contextlib.contextmanager
+    def _fake_lock(_uid, _rel):
+        yield
+
+    def _boom_record(*_a, **_k):
+        raise RuntimeError("db down (test)")
+
+    _orig_move = _shutil_mod.move
+    move_calls = {"n": 0}
+
+    def _move_second_call_fails(src, dst):
+        move_calls["n"] += 1
+        if move_calls["n"] == 2:   # 1回目=run_dir→files/（成功させる）・2回目=差し戻し（失敗させる）
+            # 実際の shutil.move の失敗（PermissionError 等）は例外の文字列表現に絶対パス
+            # （src/dst 両方）を含む——ここでも同じ形を再現し、警告ログにそのまま出ないことを確認する。
+            raise OSError(f"[Errno 13] Permission denied: '{src}' -> '{dst}'")
+        return _orig_move(src, dst)
+
+    monkeypatch.setattr(store, "workspace_file_lock", _fake_lock)
+    monkeypatch.setattr(store, "no_live_upload_for_path", lambda *_a, **_k: True)
+    monkeypatch.setattr(store, "record_workspace_file", _boom_record)
+    monkeypatch.setattr(_shutil_mod, "move", _move_second_call_fails)
+
+    uid = "move-back-fail-u1"
+    ctx = A.Ctx(
+        message="質問", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid=uid,
+    )
+    with caplog.at_level(logging.WARNING, logger="sherpa"):
+        envs = [e["env"] for e in A.CodexProvider().run(ctx) if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(envs) == 1, "完走していない"
+    env = envs[0]
+    from sherpa.providers.codex import provider as PV
+    assert PV._CREATED_FILES_FAILURE_NOTE in env["headline"], f"注記が付いていない: {env['headline']!r}"
+
+    assert any("moved back" in r.message and "orphaned in files" in r.message for r in caplog.records), \
+        "差し戻し失敗が warning として明示的に記録されていない"
+    for r in caplog.records:
+        if "orphaned in files" in r.message:
+            assert str(users_dir) not in r.message, "warning にフルパス（users_dir）が出ている"
+            # 例外（絶対パス入り）の文字列表現そのものが出ていない（型と errno だけを記録する契約）。
+            assert "Permission denied" not in r.message, "例外の文字列表現がそのまま warning に出ている"
+            assert "Errno 13" not in r.message, "例外の文字列表現がそのまま warning に出ている"
+            assert "type=OSError" in r.message and "errno=" in r.message, \
+                f"例外の型・errno が記録されていない: {r.message!r}"
+
+    users_root = pathlib.Path(users_dir).resolve()
+    files_dir = users_root / uid / "workspace" / "files"
+    assert (files_dir / "output.txt").is_file(), "差し戻しに失敗したファイルが files/ に見当たらない（想定どおり孤児として残るはず）"
+
+
+def test_created_file_outright_move_failure_is_logged_without_leaking_path(monkeypatch, tmp_path, caplog):
+    """成果物の最初の move（run_dir → files/）自体が失敗した場合（台帳登録の失敗ではなく move
+    そのものの失敗）も、差し戻し失敗と同じく相対パス＋例外の型・errno だけを記録する——
+    実際の `shutil.move` の失敗（`OSError`/`shutil.Error`）は文字列表現に失敗した src/dst の
+    絶対パスを含むため、そのまま %s で出さないことを確認する。"""
+    import logging
+    import pathlib
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_codex_creates_file(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    users_dir = tmp_path / "users"
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
+
+    import contextlib
+    import shutil as _shutil_mod
+    from sherpa import store
+
+    @contextlib.contextmanager
+    def _fake_lock(_uid, _rel):
+        yield
+
+    def _move_fails_outright(src, dst):
+        # 実際の shutil.move の失敗（PermissionError 等）は例外の文字列表現に絶対パス
+        # （src/dst 両方）を含む——ここでも同じ形を再現し、警告ログにそのまま出ないことを確認する。
+        raise OSError(f"[Errno 13] Permission denied: '{src}' -> '{dst}'")
+
+    monkeypatch.setattr(store, "workspace_file_lock", _fake_lock)
+    monkeypatch.setattr(store, "no_live_upload_for_path", lambda *_a, **_k: True)
+    monkeypatch.setattr(_shutil_mod, "move", _move_fails_outright)
+
+    uid = "outright-move-fail-u1"
+    ctx = A.Ctx(
+        message="質問", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid=uid,
+    )
+    with caplog.at_level(logging.WARNING, logger="sherpa"):
+        envs = [e["env"] for e in A.CodexProvider().run(ctx) if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(envs) == 1, "完走していない"
+    env = envs[0]
+    from sherpa.providers.codex import provider as PV
+    assert PV._CREATED_FILES_FAILURE_NOTE in env["headline"], f"注記が付いていない: {env['headline']!r}"
+
+    matched = [r for r in caplog.records if "move/registration failed" in r.message]
+    assert matched, "move 失敗が warning として記録されていない"
+    for r in matched:
+        assert str(users_dir) not in r.message, "warning にフルパス（users_dir）が出ている"
+        assert "Permission denied" not in r.message, "例外の文字列表現がそのまま warning に出ている"
+        assert "Errno 13" not in r.message, "例外の文字列表現がそのまま warning に出ている"
+        assert "type=OSError" in r.message and "errno=" in r.message, \
+            f"例外の型・errno が記録されていない: {r.message!r}"
+
+    users_root = pathlib.Path(users_dir).resolve()
+    run_dirs = list((users_root / uid / "workspace" / "authoring").glob("run-*"))
+    assert len(run_dirs) == 1, f"run dir が想定どおり残っていない（削除されてしまった）: {run_dirs!r}"
+    assert (run_dirs[0] / "output.txt").is_file(), "move 失敗後、ファイルが run_dir 側に残っていない"
 
 
 def test_gather_seam_intercepted_by_codex_provider(monkeypatch):
     """RV LOW（2026-07-14 フェーズ5 2巡目）: `agents._gather` の facade patch が
     `CodexProvider._run_authoring`（`sherpa/providers/codex/provider.py` 側の呼び出し・facade
-    実行時解決）にも効くことの**明示的な検知器**。上の lock-close テストは `next(gen)` 1回で
-    close するため、provider.py がローカル束縛（`from ...base import _gather`）に退行しても
-    素通りで通ってしまう（Codex RV 指摘）。ここでは fake `_gather` の sentinel node が実際に
-    流れてくること＝fake が呼ばれたこと自体を assert する。HeuristicProvider/_GenProvider 経由の
-    同種検知器は `tests/unit/test_agents_seams.py` にある。
+    実行時解決）にも効くことの**明示的な検知器**。`next(gen)` を数回進めるだけの浅い消費だと、
+    provider.py がローカル束縛（`from ...base import _gather`）に退行しても素通りで通ってしまう
+    （Codex RV 指摘）。ここでは fake `_gather` の sentinel node が実際に流れてくること＝fake が
+    呼ばれたこと自体を assert する。HeuristicProvider/_GenProvider 経由の同種検知器は
+    `tests/unit/test_agents_seams.py` にある。
 
     RV MEDIUM（3巡目）: 退行時（実 _gather がローカル束縛で走る場合）は可視イベント消費後の
     next() が subprocess.Popen に到達しうる＝実環境に codex CLI があると本物が起動してしまう。
@@ -364,7 +818,7 @@ def test_gather_seam_intercepted_by_codex_provider(monkeypatch):
             if isinstance(ev, dict) and ev.get("id") == "seam-pin-codex":
                 break
     finally:
-        gen.close()           # subprocess 起動前に必ず閉じる（run() の try/finally で lock も解放）
+        gen.close()           # subprocess 起動前に必ず閉じる（退行時に実 codex を起動させない）
     assert calls, (
         "monkeypatch した agents._gather が CodexProvider 経由で呼ばれていない"
         f"（facade patch 素通り＝provider.py のローカル束縛化の可能性）。seen={seen!r}"
@@ -372,49 +826,6 @@ def test_gather_seam_intercepted_by_codex_provider(monkeypatch):
     assert any(isinstance(e, dict) and e.get("id") == "seam-pin-codex" for e in seen), (
         f"fake _gather の sentinel node が run() の出力に現れない。seen={seen!r}"
     )
-
-
-def test_busy_env_carries_busy_marker_and_chat_service_guards_it():
-    """RV r2 MEDIUM: busy 応答（実行しなかったターン）に personal_sources を添付しない。
-    provider 側は env["busy"]=True マーカーを出し、chat_service 側は両経路（非ストリーミング/
-    ストリーミング）の添付を `not env.get("busy")` でガードしていること。"""
-    prov = A.CodexProvider()
-    ctx = _ctx()
-    ctx.uid = "lock-busy-marker-u1"
-    lk = A._authoring_lock("lock-busy-marker-u1")
-    assert lk.acquire(blocking=False)
-    try:
-        events = list(prov.run(ctx))
-    finally:
-        lk.release()
-    env = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"][0]["env"]
-    assert env.get("busy") is True, "busy マーカーが envelope に無い"
-
-    import inspect
-    from sherpa import chat_service as CS
-    src = inspect.getsource(CS)
-    assert src.count('if personal_hits and not env.get("busy")') == 2, \
-        "chat_service の personal_sources 添付ガードが両経路（2箇所）に入っていない"
-
-
-def test_busy_response_preserves_scope_with_layer():
-    """Codex busy 応答（直列化中の早期応答）も scope 契約（layer/layer_applied・
-    scope_paths）を欠落させない。既存の "busy" マーカー自体は維持する。"""
-    prov = A.CodexProvider()
-    ctx = _ctx()
-    ctx.uid = "lock-busy-layer-u1"
-    ctx.scope_meta = {"world": "v1", "scope_paths": ["4期/"], "source": "explicit", "layer": "code"}
-    lk = A._authoring_lock("lock-busy-layer-u1")
-    assert lk.acquire(blocking=False)
-    try:
-        events = list(prov.run(ctx))
-    finally:
-        lk.release()
-    env = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"][0]["env"]
-    assert env["scope"]["layer"] == "code"
-    assert env["scope"]["layer_applied"] is True     # busy は qa 相当として扱う
-    assert env["scope"]["source"] == "busy"           # busy マーカー自体は維持
-    assert env["scope"]["scope_paths"] == ["4期/"]    # scope_paths も欠落させない
 
 
 def test_run_authoring_refuses_when_mcp_disabled_and_layer_restricted(monkeypatch):
@@ -476,41 +887,54 @@ def test_run_authoring_proceeds_when_mcp_disabled_but_layer_is_both(monkeypatch)
     assert reached, "layer=both では従来どおり Codex 起動を試みるはずが honest failure で早期終了した"
 
 
-def test_tmp_workspace_cleared_at_start_of_each_turn(monkeypatch, tmp_path):
-    """正典 §3.4「範囲と同じ硬いフィルタ」: authoring/.tmp は複数ターンをまたいで再利用される
-    uid 単位の作業領域の一部だが、前ターンの残存ファイルが cwd の直接読取で次ターンにも読めて
-    しまうと層フィルタの迂回路になる——ターン開始時に必ず空にする（前ターンの残存を持ち越さない）。"""
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+def test_run_dir_ignores_stale_authoring_leftovers(tmp_path, monkeypatch):
+    """正典 §3.4「範囲と同じ硬いフィルタ」: 以前は authoring/.tmp を複数ターンで共有し、ターン開始時に
+    毎回空にすることで前ターンの残存が層フィルタの迂回路にならないよう防いでいた。実行ごとに新規の
+    run_dir（authoring/run-*）を cwd にする方式では、そもそも前ターン（や旧方式）の残存パスが
+    今回の cwd になることが無い——旧方式の残存を模しておいても、今回のターンが実際に使う cwd は
+    それとは別の新規 run-* ディレクトリになり、旧残存には一切触れない。"""
+    import pathlib
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    _write_fake_codex_cwd(bin_dir, argv_log)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
+    # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
+    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     users_dir = tmp_path / "users"
     monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
     uid = "tmp-clear-u1"
 
-    def _boom_popen(*_a, **_k):
-        raise OSError("popen intentionally not followed through in this test")
-
-    monkeypatch.setattr(subprocess, "Popen", _boom_popen)
-
-    def fake_gather(ctx):
-        yield {"type": "_env", "decision": {"lens": "qa", "input": ctx.message, "reason": "t"},
-               "env": {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}}
-
-    monkeypatch.setattr(A, "_gather", fake_gather)
-
-    # 前ターンの残存を模擬する（authoring/.tmp に置かれたまま消えていないファイル）。
-    tmp_dir = users_dir / uid / "workspace" / "authoring" / ".tmp"
-    tmp_dir.mkdir(parents=True)
-    leftover = tmp_dir / "leftover-from-previous-turn.txt"
+    # 旧方式（authoring/.tmp を複数ターンで共有）の残存を模しておく。
+    legacy_tmp = users_dir / uid / "workspace" / "authoring" / ".tmp"
+    legacy_tmp.mkdir(parents=True)
+    leftover = legacy_tmp / "leftover-from-previous-turn.txt"
     leftover.write_text("前ターンの内容の断片（想定: 層が限定される前の資料の一部）", encoding="utf-8")
-    assert leftover.exists()
 
-    prov = A.CodexProvider()
-    ctx = _ctx(lens="qa", message="質問")
-    ctx.uid = uid
-    ctx.scope_meta = {"world": "v1", "scope_paths": [], "source": "all", "layer": "both"}
-    list(prov.run(ctx))   # Popen で打ち切られるが、.tmp のクリアはそれより前に実行済みのはず
+    ctx = A.Ctx(
+        message="質問", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid=uid,
+        scope_meta={"world": "v1", "scope_paths": [], "source": "all", "layer": "both"},
+    )
+    envs = [e["env"] for e in A.CodexProvider().run(ctx) if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(envs) == 1 and envs[0]["headline"] == "done-ok", f"完走していない: {envs!r}"
 
-    assert not leftover.exists(), "前ターンの .tmp 残存を消していない（層フィルタの迂回路が残る）"
-    assert tmp_dir.is_dir(), ".tmp 自体は次ターン用に作り直されているはず"
+    calls = _read_cwd_log(argv_log)
+    assert len(calls) == 1, f"codex exec が1回だけ呼ばれるはず: {calls!r}"
+    used_cwd = pathlib.Path(calls[0]["cwd"])
+    assert used_cwd != legacy_tmp, "旧方式の authoring/.tmp をそのまま cwd に使ってしまっている"
+    assert used_cwd.parent.name == "authoring" and used_cwd.name.startswith("run-"), (
+        f"cwd が authoring/run-* 形式でない: {used_cwd}")
+    assert not used_cwd.exists(), f"実行後も run dir が残っている（cleanup 未実施）: {used_cwd}"
+    assert leftover.exists(), "旧方式の残存ファイルに手を出してしまっている（触れない契約のはず）"
 
 
 def test_run_authoring_refuses_when_sandbox_disabled_and_layer_restricted(monkeypatch):

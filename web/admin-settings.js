@@ -168,13 +168,24 @@ const _DEPTH_BASE_FIELDS = [
   { view: 'read_window', put: 'depth_base_read_window', id: 'depth-base-read-window',
     label: '1回に読み取る前後の行数' },
   { view: 'impact_depth', put: 'depth_base_impact_depth', id: 'depth-base-impact-depth',
-    label: '影響を調べる深さ' },
+    label: '影響分析でたどる段数' },
   { view: 'troubleshoot_depth', put: 'depth_base_troubleshoot_depth', id: 'depth-base-troubleshoot-depth',
-    label: '原因を調べる近傍の深さ' },
+    label: '原因調査でたどる段数' },
 ];
 let _depthProfileBaseline = {};    // put キー -> 文字列化した configured（''=未設定）
 // 他の6項目と同じく configured を基準にする（''=未設定＝「環境設定の既定に従う」の空選択肢）。
 let _depthReasoningBaseline = '';
+let _agenticToolLimitBaseline = '';
+
+// 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
+// （GET 応答は `view.chat_max_turns.<view>`・PUT は `body.<put>`）。
+const _CHAT_MAX_TURNS_FIELDS = [
+  { view: 'per_user', put: 'chat_max_turns_per_user', id: 'chat-max-turns-per-user',
+    label: '同時に実行できる質問の数（1 人あたり）' },
+  { view: 'global', put: 'chat_max_turns_global', id: 'chat-max-turns-global',
+    label: '同時に実行できる質問の数（全員の合計）' },
+];
+let _chatMaxTurnsBaseline = {};    // put キー -> 文字列化した configured（''=未設定）
 
 // BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の tool-result
 // バイト予算。入力欄は人に読みやすい KB 単位（保存/GET は bytes・1KB=1024 換算）——`loBytes`/
@@ -182,9 +193,9 @@ let _depthReasoningBaseline = '';
 // 同じ範囲（HTML の min/max もこの換算値）。
 const _AGENTIC_BUDGET_FIELDS = [
   { view: 'per_result', put: 'agentic_budget_per_result', id: 'agentic-budget-per-result',
-    label: '検索結果1件あたりの上限', loBytes: 1024, hiBytes: 8 * 1024 * 1024 },
+    label: 'ツール結果1件あたりの上限', loBytes: 1024, hiBytes: 8 * 1024 * 1024 },
   { view: 'total', put: 'agentic_budget_total', id: 'agentic-budget-total',
-    label: '1回の検索全体の上限', loBytes: 4096, hiBytes: 64 * 1024 * 1024 },
+    label: '追加調査1回の累計上限', loBytes: 4096, hiBytes: 64 * 1024 * 1024 },
 ];
 let _agenticBudgetBaseline = {};   // put キー -> 文字列化した configured（KB・''=未設定）
 
@@ -1417,11 +1428,28 @@ function renderProviderTab(view) {
     auth_header: cfg.auth_header || 'bearer',
     api_version: cfg.api_version || '',
   };
-  renderDepthProfile(view.depth_profile);
+  renderChatMaxTurns(view.chat_max_turns);
   renderChatExamples(view.chat_examples);
 }
 
-// SC-6c: 調べる深さの基準値（標準時の値）。同じ「プロバイダ＋接続先」タブの2つ目のカード。
+// 「調査・回答」タブは接続設定と独立して描画・リセットする。
+function renderResearchTab(view) {
+  renderAgenticBudget(view.agentic_budget);   // BUDGET-1（§3.4）
+  renderAgenticBudgetWindow(view.agentic_budget);      // BUDGET-2（§3.4）
+  renderDepthProfile(view.depth_profile);
+  const limit = view.agentic_tool_limit;
+  _agenticToolLimitBaseline = limit.configured == null ? '' : String(limit.configured);
+  $('agentic-max-tools-per-turn').value = _agenticToolLimitBaseline;
+  $('agentic-max-tools-per-turn-hint').textContent = limit.configured == null
+    ? `未設定です（環境設定の既定 ${limit.effective} 件が適用されます）。`
+    : `この値で固定中です（環境設定の既定: ${limit.default} 件）。`;
+}
+
+function agenticToolLimitChanged() {
+  return $('agentic-max-tools-per-turn').value.trim() !== _agenticToolLimitBaseline;
+}
+
+// 調べる深さの基準値（標準時の値）。表示上は適用先ごとに分け、保存済みのキーを引き継ぐ。
 function renderDepthProfile(dp) {
   dp = dp || {};
   _depthProfileBaseline = {};
@@ -1462,6 +1490,51 @@ function depthProfileChanged() {
     ((($(id) || {}).value || '').trim()) !== (_depthProfileBaseline[put] || ''));
   const sel = $('depth-base-codex-reasoning');
   return intChanged || (!!sel && sel.value !== _depthReasoningBaseline);
+}
+
+// 同時実行の上限（`chat_max_turns`）。`renderDepthProfile`/`collectDepthProfile`/`depthProfileChanged`
+// と同じ流儀（選択式の項目が無い分だけ単純）。同じ「プロバイダ＋接続先」タブの追加カード。
+function renderChatMaxTurns(cmt) {
+  cmt = cmt || {};
+  _chatMaxTurnsBaseline = {};
+  _CHAT_MAX_TURNS_FIELDS.forEach(({ view, put, id }) => {
+    const info = cmt[view] || {};
+    const input = $(id);
+    if (input) input.value = info.configured != null ? info.configured : '';
+    _chatMaxTurnsBaseline[put] = info.configured != null ? String(info.configured) : '';
+    const hint = $(id + '-hint');
+    if (hint) {
+      hint.textContent = info.configured != null
+        ? `この値で固定中です（既定値: ${info.default}）。`
+        : `未設定です（組み込みの既定 ${info.effective} が適用されます）。`;
+    }
+  });
+}
+function collectChatMaxTurns(body) {
+  _CHAT_MAX_TURNS_FIELDS.forEach(({ put, id }) => {
+    const v = (($(id) || {}).value || '').trim();
+    if (v !== (_chatMaxTurnsBaseline[put] || '')) body[put] = v === '' ? null : Number(v);
+  });
+}
+function chatMaxTurnsChanged() {
+  return _CHAT_MAX_TURNS_FIELDS.some(({ put, id }) =>
+    ((($(id) || {}).value || '').trim()) !== (_chatMaxTurnsBaseline[put] || ''));
+}
+// validateDepthProfileInputs と同じ流儀（422 の配列表示が読みにくいため保存操作では先に弾く）。
+function validateChatMaxTurnsInputs() {
+  const errors = [];
+  _CHAT_MAX_TURNS_FIELDS.forEach(({ id, label }) => {
+    const el = $(id);
+    if (!el) return;
+    const raw = (el.value || '').trim();
+    if (raw === '') return;
+    const n = Number(raw);
+    const lo = Number(el.min), hi = Number(el.max);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < lo || n > hi) {
+      errors.push(`${label}は${lo}〜${hi}の整数で指定してください`);
+    }
+  });
+  return errors;
 }
 
 // チャット画面のクイック入力例（`chat_examples`）。同じ「プロバイダ＋接続先」タブの3つ目のカード。
@@ -1523,6 +1596,13 @@ function _fmtBytesHuman(bytes) {
   return `${Math.round(bytes / 1024)}KB`;
 }
 
+// 文章中心のA4資料を1ページ1,000字、日本語1字をUTF-8で約3バイトとして概算。
+function _fmtDocumentPages(bytes) {
+  if (bytes == null) return '—';
+  const pages = bytes / 3000;
+  return pages < 1 ? 'A4資料1ページ未満' : `A4資料約${Math.round(pages).toLocaleString('ja-JP')}ページ分`;
+}
+
 // SC-6c の depth_profile と同じ「プロバイダ＋接続先」流儀の別カード（取り込みタブに配置）。
 // 表示/入力欄は KB 単位、GET/PUT のやり取り（bytes）とは境界でだけ変換する。
 function renderAgenticBudget(ab) {
@@ -1537,8 +1617,9 @@ function renderAgenticBudget(ab) {
     const hint = $(id + '-hint');
     if (hint) {
       hint.textContent = info.configured != null
-        ? `この値（${_fmtBytesHuman(info.configured)}）で固定中です（既定値: ${_fmtBytesHuman(info.default)}）。`
-        : `未設定です（組み込みの既定 ${_fmtBytesHuman(info.effective)} が適用されます）。`;
+        ? `この値（${_fmtBytesHuman(info.configured)}）で固定中です（既定値: ${_fmtBytesHuman(info.default)}・${_fmtDocumentPages(info.default)}）。`
+        : `未設定です（組み込みの既定 ${_fmtBytesHuman(info.default)}・${_fmtDocumentPages(info.default)}）。`;
+      hint.textContent += ` 現在の上限: ${_fmtBytesHuman(info.effective)}（${_fmtDocumentPages(info.effective)}）。`;
     }
   });
 }
@@ -1589,6 +1670,11 @@ function renderAgenticBudgetWindow(ab) {
   const unknownBox = $('agentic-budget-window-unknown');
   const w = (ab || {}).window || {};
   if (!status || !unknownBox) return;
+  if (w.provider === 'codex') {
+    status.textContent = 'Codex は対象外です。コンテキスト上限による情報量の調整は API 経路に適用します。';
+    unknownBox.hidden = true;
+    return;
+  }
   const providerLabel = _MODEL_WINDOW_PROVIDER_LABELS[w.provider] || w.provider || '不明';
   const modelLabel = w.model || '(未設定)';
   if (w.source === 'unknown' || w.window_tokens == null) {
@@ -1598,7 +1684,7 @@ function renderAgenticBudgetWindow(ab) {
     const sourceLabel = _MODEL_WINDOW_SOURCE_LABELS[w.source] || w.source;
     status.textContent = `現在のモデル: ${providerLabel} / ${modelLabel}　一度に読める量: `
       + `${w.window_tokens.toLocaleString('ja-JP')} トークン（出所: ${sourceLabel}）　`
-      + `自動調整後の上限: ${_fmtBytesHuman(w.derived_cap_bytes)}`;
+      + `自動調整後の上限: ${_fmtBytesHuman(w.derived_cap_bytes)}（${_fmtDocumentPages(w.derived_cap_bytes)}）`;
     unknownBox.hidden = true;
   }
 }
@@ -1606,8 +1692,11 @@ function renderAgenticBudgetWindow(ab) {
 let _modelWindowsBaseline = {};   // render() 時点の登録値（"provider:model" -> tokens）
 
 function _modelWindowsRowHtml(provider, model, tokens) {
-  const providers = ((_view || {}).model_catalog || {}).providers || ['openai', 'gemini', 'ollama', 'bedrock', 'codex'];
-  const opts = providers.map((p) =>
+  const providers = ['openai', 'gemini', 'ollama', 'bedrock'];
+  // 既存の Codex 登録を別プロバイダへ変換せず、適用対象外と表示して削除・変更可能にする。
+  const savedCodex = provider === 'codex'
+    ? '<option value="codex" selected disabled>Codex（適用対象外・保存済み）</option>' : '';
+  const opts = savedCodex + providers.map((p) =>
     `<option value="${esc(p)}"${p === provider ? ' selected' : ''}>${esc(_MODEL_WINDOW_PROVIDER_LABELS[p] || p)}</option>`
   ).join('');
   return `<tr>
@@ -1685,6 +1774,7 @@ function validateModelWindowsInputs() {
 }
 
 function renderModelsTab(view) {
+  renderModelWindowsTable((view.agentic_budget || {}).model_windows);   // BUDGET-2（§3.4）
   renderModelCatalog(view.model_catalog, (view.cloud || {}).provider);
 }
 
@@ -1697,9 +1787,6 @@ function renderIngestTab(view) {
   renderVlmStatus(view.vlm);
   renderRagLlmRender(view.rag_llm_render);
   renderRagLlmRenderStatus(view.rag_llm_render);
-  renderAgenticBudget(view.agentic_budget);   // BUDGET-1（§3.4）
-  renderAgenticBudgetWindow(view.agentic_budget);      // BUDGET-2（§3.4）
-  renderModelWindowsTable((view.agentic_budget || {}).model_windows);   // BUDGET-2（§3.4）
   _armsBaseline = [...((view.arms || {}).enabled || [])].sort();
   _legacyBaseline = _legacySelectedValue(view.legacy_backend);
   const vlm = view.vlm;
@@ -1742,9 +1829,13 @@ function renderExtKeysTab(view) {
 }
 
 function render(view) {
+  if (!view.agentic_tool_limit) {
+    throw new Error('設定項目が不足しています。サーバーを更新・再起動してから、画面を再読み込みしてください。');
+  }
   _view = view;
   renderModelsTab(view);   // _mcState を先に更新（renderProviderTab の埋め込み欄表示が読むため）
   renderProviderTab(view);
+  renderResearchTab(view);
   renderIngestTab(view);
   renderUsageTab(view);
   renderExtKeysTab(view);
@@ -1757,6 +1848,17 @@ async function load() {
     render(await getJSON('/admin/settings'));
   } catch (e) {
     $('msg').innerHTML = '<span class="danger">設定を読み込めませんでした</span>';
+    // 初期描画が止まった場合も、各タブに失敗を表示する。未読込の値は保存させない。
+    const message = '設定を読み込めませんでした。サーバーの更新・稼働状態を確認して、画面を再読み込みしてください。';
+    document.querySelectorAll('.tabpanel:not(.tabpanel-embed)').forEach(panel => {
+      const notice = document.createElement('p');
+      notice.className = 'hint danger';
+      notice.setAttribute('role', 'alert');
+      notice.textContent = message;
+      panel.prepend(notice);
+      panel.querySelectorAll('button, input, select, textarea').forEach(el => { el.disabled = true; });
+    });
+    $('save').disabled = true;
   }
 }
 
@@ -1823,11 +1925,16 @@ async function save() {
   // 調べる深さの基準値は範囲外の値を送る前にここで弾く（422 の配列表示が [object Object] に
   // なる問題を、保存操作では到達させないことで避ける）。
   const depthProfileErrors = validateDepthProfileInputs();
+  // 同時実行の上限も同じ理由で保存前に弾く。
+  const chatMaxTurnsErrors = validateChatMaxTurnsInputs();
   // BUDGET-1（§3.4）: agentic search の tool-result バイト予算も同じ理由で保存前に弾く。
   const agenticBudgetErrors = validateAgenticBudgetInputs();
   // BUDGET-2（§3.4）: モデルが一度に読める量の登録表も同様に保存前に弾く。
   const modelWindowsErrors = validateModelWindowsInputs();
-  const rangeErrors = depthProfileErrors.concat(agenticBudgetErrors).concat(modelWindowsErrors);
+  const rangeErrors = depthProfileErrors.concat(chatMaxTurnsErrors).concat(agenticBudgetErrors)
+    .concat(modelWindowsErrors);
+  const toolLimit = $('agentic-max-tools-per-turn');
+  if (!toolLimit.checkValidity()) rangeErrors.push('ツール実行数の上限は1〜256の整数で指定してください');
   if (rangeErrors.length) {
     $('msg').innerHTML = `<span class="danger">${esc(rangeErrors.join('／'))}</span>`;
     return;
@@ -1906,6 +2013,10 @@ async function save() {
     if (v !== _RESEARCH_PROVIDER_INVALID) body.research_default_provider = v;
   }
   collectDepthProfile(body);   // SC-6c: 調べる深さの基準値（変わった項目だけ送る）
+  if (agenticToolLimitChanged()) {
+    body.agentic_max_tools_per_turn = toolLimit.value === '' ? null : Number(toolLimit.value);
+  }
+  collectChatMaxTurns(body);   // 同時実行の上限（変わった項目だけ送る）
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
   collectAgenticBudget(body);  // BUDGET-1（§3.4）: 検索の情報量予算（変わった項目だけ送る）
   collectModelWindowsTable(body);   // BUDGET-2（§3.4）: モデルが一度に読める量の登録表（変わっていれば送る）
@@ -1985,14 +2096,9 @@ async function resetProviderTab() {
     // 埋め込みのデプロイ名（model_catalog.openai.embed）だけ組み込み既定へ戻す（他タブの
     // 未保存編集は同送しない・上の _configuredRawWithoutOpenaiEmbed 参照）。
     model_catalog: _configuredRawWithoutOpenaiEmbed(),
-    // SC-6c: 調べる深さの基準値も「プロバイダ＋接続先」タブの一部（このタブの既定に戻す対象）。
-    depth_base_max_turns: null,
-    depth_base_grep_max_hits: null,
-    depth_base_qa_max_hits: null,
-    depth_base_read_window: null,
-    depth_base_impact_depth: null,
-    depth_base_troubleshoot_depth: null,
-    depth_base_codex_reasoning: null,
+    // 同時実行の上限も同じタブの一部（このタブの既定に戻す対象）。
+    chat_max_turns_per_user: null,
+    chat_max_turns_global: null,
     chat_examples: null,
   };
   let view;
@@ -2016,12 +2122,28 @@ async function resetProviderTab() {
   _markResetOk(resEl);
 }
 
+async function resetResearchTab() {
+  const resEl = 'tab-reset-res-research';
+  const body = Object.fromEntries(_DEPTH_BASE_FIELDS.map(({ put }) => [put, null]));
+  body.depth_base_codex_reasoning = null;
+  body.agentic_max_tools_per_turn = null;
+  body.agentic_budget_per_result = null;
+  body.agentic_budget_total = null;
+  let view;
+  try { view = await _putResetBody(body, resEl); } catch (e) { return; }
+  _view = view;
+  renderResearchTab(view);
+  applyConfigChangedHighlights(view);
+  refreshTabDots();
+  _markResetOk(resEl);
+}
+
 async function resetModelsTab() {
   const resEl = 'tab-reset-res-models';
   // 対象キーのみ・null で送る（他タブの未保存編集は一切含めない）。model_catalog を丸ごと
   // 既定へ戻すため、プロバイダタブ側に表示されている埋め込みデプロイ名も一緒に戻る
   // （同じキーの一部＝このリセットが正しく対象にする範囲）。
-  const body = { model_catalog: null };
+  const body = { model_catalog: null, model_context_windows: null };
   let view;
   try { view = await _putResetBody(body, resEl); } catch (e) { return; }
   _view = view;
@@ -2029,6 +2151,7 @@ async function resetModelsTab() {
   // 列プロバイダは「プロバイダタブの現在の未保存選択」に合わせる（保存済み値へ戻さない）。
   _mcCloudProvider = selectedCloudProvider();
   renderModelCatalogTable();
+  renderAgenticBudgetWindow(view.agentic_budget);
   syncEmbedDeploymentField();   // プロバイダ＋接続先タブ側の表示も新しい実効値へ追従させる
   applyConfigChangedHighlights(view);
   refreshTabDots();
@@ -2039,10 +2162,6 @@ async function resetIngestTab() {
   const resEl = 'tab-reset-res-ingest';
   const body = {
     arms_enabled: null, legacy_backend: null, vlm: null, rag_llm_render: null,
-    // BUDGET-1（§3.4）: 検索の情報量予算も「取り込み」タブの一部（このタブの既定に戻す対象）。
-    agentic_budget_per_result: null, agentic_budget_total: null,
-    // BUDGET-2（§3.4）: モデルが一度に読める量の登録表も同じタブの一部。
-    model_context_windows: null,
   };
   let view;
   try { view = await _putResetBody(body, resEl); } catch (e) { return; }
@@ -2092,7 +2211,7 @@ async function resetExtKeysTab() {
 }
 
 const _TAB_RESET_HANDLERS = {
-  provider: resetProviderTab, models: resetModelsTab, ingest: resetIngestTab, usage: resetUsageTab,
+  provider: resetProviderTab, research: resetResearchTab, models: resetModelsTab, ingest: resetIngestTab, usage: resetUsageTab,
   extkeys: resetExtKeysTab,
 };
 document.querySelectorAll('[data-reset-tab]').forEach((b) => {
@@ -2115,18 +2234,28 @@ if (_chatExamplesReset) _chatExamplesReset.addEventListener('click', async () =>
 });
 
 // ===== タブ切り替え（URL ハッシュで記憶）・未保存タブの丸印 =====
-const TAB_KEYS = ['provider', 'models', 'ingest', 'usage', 'extkeys'];
+const TAB_KEYS = ['provider', 'research', 'models', 'ingest', 'usage', 'extkeys'];
 // 埋め込みタブ（管理系ページを iframe で表示・UI-TABS2・2026-09-04）。設定タブと違い保存対象が
 // ないため TAB_DIRTY を持たない＝ここへの切替に未保存確認は挟まない（画面を離れないため不要）。
 const EMBED_TAB_KEYS = ['users', 'usage-page', 'audit', 'status'];
 const ALL_TAB_KEYS = TAB_KEYS.concat(EMBED_TAB_KEYS);
 function activateTab(tabKey, opts) {
+  if (tabKey === 'agentic-budget-card') {
+    activateTab('research', { updateHash: false });
+    if (!opts || opts.updateHash !== false) location.hash = tabKey;
+    $(tabKey).scrollIntoView({ block: 'start' });
+    $(tabKey).focus({ preventScroll: true });
+    return;
+  }
   if (!ALL_TAB_KEYS.includes(tabKey)) tabKey = TAB_KEYS[0];
   ALL_TAB_KEYS.forEach((k) => {
     const btn = document.querySelector(`.tab-btn[data-tab="${k}"]`);
     const panel = $('tabpanel-' + k);
     const active = k === tabKey;
-    if (btn) btn.setAttribute('aria-selected', String(active));
+    if (btn) {
+      btn.setAttribute('aria-selected', String(active));
+      btn.tabIndex = active ? 0 : -1;
+    }
     if (panel) panel.hidden = !active;
   });
   if (EMBED_TAB_KEYS.includes(tabKey)) loadEmbedFrame(tabKey);
@@ -2140,6 +2269,22 @@ function loadEmbedFrame(tabKey) {
 }
 document.querySelectorAll('.tab-btn[data-tab]').forEach((btn) =>
   btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
+// iframe の読み込みは選択時だけ。矢印キーはフォーカス移動に限定する。
+$('admin-tabs').addEventListener('keydown', (e) => {
+  const current = e.target.closest('[role="tab"]');
+  if (!current) return;
+  const tabs = [...$('admin-tabs').querySelectorAll('[role="tab"]')]
+    .filter((tab) => !tab.disabled && tab.getClientRects().length);
+  const index = tabs.indexOf(current);
+  let next;
+  if (e.key === 'ArrowDown') next = tabs[(index + 1) % tabs.length];
+  else if (e.key === 'ArrowUp') next = tabs[(index - 1 + tabs.length) % tabs.length];
+  else if (e.key === 'Home') next = tabs[0];
+  else if (e.key === 'End') next = tabs[tabs.length - 1];
+  else return;
+  e.preventDefault();
+  next.focus();
+});
 window.addEventListener('hashchange', () => activateTab(location.hash.replace('#', ''), { updateHash: false }));
 
 // タブごとの未保存インジケータ。render() 時点の基準値と今の値が異なるタブだけ丸印を出す
@@ -2147,10 +2292,11 @@ window.addEventListener('hashchange', () => activateTab(location.hash.replace('#
 const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
     || openaiEndpointChanged() || mcEmbedChanged()
-    || depthProfileChanged() || chatExamplesChanged(),
-  models: () => mcCatalogChangedExcludingEmbed(),
-  ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged()
-    || agenticBudgetChanged() || modelWindowsTableChanged(),
+    || chatMaxTurnsChanged() || chatExamplesChanged(),
+  research: () => depthProfileChanged() || agenticToolLimitChanged()
+    || agenticBudgetChanged(),
+  models: () => mcCatalogChangedExcludingEmbed() || modelWindowsTableChanged(),
+  ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
   usage: () => usageChatProviderChanged(),
   extkeys: () => extKeysAllowedChanged() || extKeysQuotaChanged() || extKeysResearchProviderChanged(),
 };
@@ -2159,6 +2305,7 @@ function refreshTabDots() {
     const dot = $('tab-dot-' + k);
     if (dot) dot.hidden = !TAB_DIRTY[k]();
   });
+  $('unsaved-note').hidden = !document.querySelector('#admin-tabs .tab-dot:not([hidden])');
 }
 
 // 接続先関連（種別ラジオ・埋め込みデプロイ名）の変更監視は、各要素が DOM 上どこに置かれているか
@@ -2207,6 +2354,13 @@ function applyConfigChangedHighlights(view) {
   });
   const reasoning = dp.codex_reasoning || {};
   mark($('depth-base-codex-reasoning'), reasoning.effective !== reasoning.default);
+  mark($('agentic-max-tools-per-turn'), view.agentic_tool_limit.effective !== view.agentic_tool_limit.default);
+  // 同時実行の上限。
+  const cmt = view.chat_max_turns || {};
+  _CHAT_MAX_TURNS_FIELDS.forEach(({ view: vk, id }) => {
+    const info = cmt[vk] || {};
+    mark($(id), info.effective !== info.default);
+  });
   const ce = view.chat_examples || {};
   mark($('chat-examples-card'), (ce.configured != null));
   // 取り込み
@@ -2331,10 +2485,17 @@ document.addEventListener('keydown', (e) => {
   }
 });
 function applyThemeIcon() { const b = $('themebtn'); if (b) b.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙'; }
+function syncFrameTheme(frame) {
+  frame.contentDocument.documentElement.dataset.theme = document.documentElement.dataset.theme;
+}
+document.querySelectorAll('.embed-frame').forEach((frame) => {
+  frame.addEventListener('load', () => syncFrameTheme(frame));
+});
 document.addEventListener('click', (e) => {
   if (!e.target.closest('#themebtn')) return;
   const d = document.documentElement, next = d.dataset.theme === 'dark' ? 'light' : 'dark';
   d.dataset.theme = next; localStorage.setItem('sherpa-theme', next); applyThemeIcon();
+  document.querySelectorAll('.embed-frame[src]').forEach(syncFrameTheme);
 });
 applyThemeIcon();
 

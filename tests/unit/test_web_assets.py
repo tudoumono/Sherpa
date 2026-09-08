@@ -47,7 +47,7 @@ _SCRIPT_ORDER_GOLDEN = pathlib.Path(__file__).resolve().parent / "goldens" / "we
 # nav.js が <sherpa-topbar> のパース中同期 upgrade（classic script 必須・危険地雷8）で生成する
 # id（web/nav.js を実際に読んで列挙）。chat.js 等の $('themebtn') 等はここで作られる id を指す。
 NAV_GENERATED_IDS = {
-    "sherpa-nav", "turnnotice", "healthdot", "themebtn", "userwrap",
+    "sherpa-nav", "navlist", "navmore", "navmenu", "turnnotice", "healthdot", "themebtn", "userwrap",
     "topbar-user", "usermenu", "um-name", "um-role", "um-changepw",
     "um-logout", "um-note",
 }

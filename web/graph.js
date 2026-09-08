@@ -4,16 +4,17 @@ const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;     // 共通ユ
 
 const COLOR = {
   Module: '#0d9488', Copybook: '#0891b2', DataItem: '#64748b',
-  Batch: '#ea580c', Document: '#16a34a', Table: '#0e7490',
+  Batch: '#ea580c', Document: '#16a34a', Table: '#0e7490', Config: '#a855f7',
 };
 const TYPE_JA = {
   Module: 'プログラム', Copybook: 'コピーブック', DataItem: '項目',
-  Document: '文書', Batch: 'バッチ', Table: 'テーブル',
+  Document: '文書', Batch: 'バッチ', Table: 'テーブル', Config: '設定',
 };
 const FIELD_LABEL = {
   category: 'カテゴリ', phase: '工程', role: '種別', top_scope: '最上位フォルダ', status: '状態',
 };
 let cy = null, _world = null, _fullGraph = null, _truncated = false;   // _truncated=表示中は主要ノードのみ（全体ではない）
+let _countText = '', _overviewPositions = null;
 
 function setGraphLoading(on, message, error) {
   const main = document.querySelector('.graphmain');
@@ -33,24 +34,41 @@ function setGraphLoading(on, message, error) {
 function styleFor(dark) {
   const labelColor = dark ? '#e6edf3' : '#1f2937';
   const outline = dark ? '#0f1419' : '#ffffff';
-  const edge = dark ? '#3a4550' : '#cbd5e1';
+  // 未選択の関係線は背景に対して 3:1 以上（非テキストの目安）。関係名は選択時にしか出ないので線だけで向きが読めること。
+  const edge = dark ? '#526577' : '#7c8b99';
   return [
     { selector: 'node', style: {
-      'background-color': (e) => COLOR[e.data('type')] || '#64748b',
-      'label': 'data(label)', 'font-size': 10, 'color': labelColor, 'width': 22, 'height': 22,
-      'text-valign': 'bottom', 'text-margin-y': 3, 'border-width': 2, 'border-color': outline,
-      'text-outline-width': 2, 'text-outline-color': outline, 'text-max-width': 110, 'text-wrap': 'ellipsis',
+      'background-color': 'data(color)',
+      'label': 'data(label)', 'font-size': 14, 'font-family': getComputedStyle(document.body).fontFamily,
+      'min-zoomed-font-size': 11, 'color': labelColor, 'width': 28, 'height': 28,
+      'text-valign': 'bottom', 'text-margin-y': 6, 'border-width': 2, 'border-color': outline,
+      'text-max-width': 160, 'text-wrap': 'ellipsis',
     } },
     { selector: 'node[status="deprecated"]', style: { 'opacity': 0.45, 'border-style': 'dashed' } },
     { selector: 'node[status="hidden_candidate"]', style: { 'opacity': 0.55 } },
     { selector: 'edge', style: {
       'width': 1.4, 'line-color': edge, 'target-arrow-color': edge, 'target-arrow-shape': 'triangle',
-      'curve-style': 'bezier', 'arrow-scale': 0.8, 'label': 'data(label)', 'font-size': 7,
-      'color': dark ? '#6b7a8a' : '#94a3b8', 'text-rotation': 'autorotate',
+      'curve-style': 'straight', 'arrow-scale': 0.8, 'label': '', 'font-size': 12,
+      'min-zoomed-font-size': 10, 'color': labelColor, 'text-rotation': 'autorotate',
     } },
-    { selector: '.dim', style: { 'opacity': 0.1 } },
-    { selector: '.hi', style: { 'border-color': '#0d9488', 'border-width': 4 } },
+    { selector: 'edge[?curved]', style: { 'curve-style': 'bezier' } },
+    { selector: 'node.dim', style: { 'background-color': dark ? '#293540' : '#dce4ec', 'text-opacity': 0 } },
+    { selector: 'edge.dim', style: { 'line-color': dark ? '#293540' : '#e0e7ee',
+      'target-arrow-color': dark ? '#293540' : '#e0e7ee' } },
+    { selector: 'node.hi', style: { 'border-color': '#0d9488', 'border-width': 4, 'min-zoomed-font-size': 0 } },
+    { selector: 'node.near, node.hi', style: { 'text-outline-width': 2, 'text-outline-color': outline } },
+    { selector: 'edge.related', style: { 'label': 'data(label)', 'width': 2,
+      'line-color': dark ? '#9fb0c0' : '#60788b', 'target-arrow-color': dark ? '#9fb0c0' : '#60788b',
+      'text-background-color': outline, 'text-background-opacity': 1, 'text-background-padding': 3 } },
+    { selector: '.filtered, .outside', style: { 'display': 'none' } },
   ];
+}
+
+// 反復計算・ランダムな移動を避け、つながりが多い要素を中心に一度だけ配置する。
+// concentric は各円の件数に合わせて半径を広げるため、枝が多くてもノードが重ならない。
+function graphLayout() {
+  return { name: 'concentric', animate: false, padding: 40, minNodeSpacing: 36,
+    concentric: (n) => n.degree(), levelWidth: () => 1, nodeDimensionsIncludeLabels: false };
 }
 
 // ── 段階読み込み＋ETag キャッシュ（②graph 軽量化 2026-07-08）──
@@ -138,7 +156,7 @@ function emptyGraph(g) {
   $('gcount').textContent = `関係グラフは空（文書 ${docs} 件は取り込み済み）`;
   $('cy').innerHTML = '<div style="padding:48px 24px;text-align:center;max-width:560px;margin:0 auto;'
     + 'line-height:1.7;color:var(--ink-3,#8b95a3)">'
-    + '<div style="font-size:15px;font-weight:600;color:var(--ink,#1f2937);margin-bottom:8px">関係グラフはまだありません</div>'
+    + '<div style="font-size:var(--text-body);font-weight:600;color:var(--ink,#1f2937);margin-bottom:8px">関係グラフはまだありません</div>'
     + '関係グラフは<b>ソースコード（COBOL/JCL/コピーブック）</b>から作られます。'
     + 'このフォルダが文書（Office/テキスト）のみの場合、関係グラフは空のままです（想定どおりです）。'
     + '文書そのものは取り込み済みで、検索からも使えます。</div>';
@@ -146,24 +164,26 @@ function emptyGraph(g) {
 
 function renderGraph(g, searched) {
   if (cy) { cy.destroy(); cy = null; }
-  $('nodecard').classList.remove('show');
+  _overviewPositions = null;
+  clearSelection();
   $('cy').innerHTML = '';
+  $('gsearch').value = '';
+  $('gresults-section').hidden = true;
+  _truncated = !searched && !!g.truncated;
+  $('greset').hidden = !searched;
   clearFilter(false);
   $('showall').hidden = true;                     // 既定は隠す（主要ノードで切れている時だけ下で出す）
   if (!g.nodes.length) {
+    renderLegend([]);
     if (searched) {
       $('gcount').textContent = '検索結果 0件';
       $('cy').innerHTML = '<div class="gempty">一致するグラフ要素はありません</div>';
       $('greset').hidden = false;
-      renderLegend([]);
       return;
     }
     emptyGraph(g);
     return;
   }
-  // _truncated: 現在 cy に載っているのが主要ノードのみ（全体ではない）＝クイック名検索の案内文言に使う。
-  // 検索結果（/graph/search）は node-limit 由来の truncation とは別概念なので false 扱い。
-  _truncated = !searched && !!g.truncated;
   if (searched) {
     $('gcount').textContent = `検索結果 ノード ${g.nodes.length}・関係 ${g.edges.length}`;
   } else if (g.truncated) {                        // 主要ノードのみ＝残りは「すべて表示」で辿る（専門用語ゼロ）
@@ -172,24 +192,29 @@ function renderGraph(g, searched) {
   } else {
     $('gcount').textContent = `ノード ${g.nodes.length}・関係 ${g.edges.length}`;
   }
-  $('greset').hidden = !searched;
+  _countText = $('gcount').textContent;
+  // 並行する関係と自己参照は曲線で分け、それ以外は描画負荷の小さい直線にする。
+  const pairKey = (e) => JSON.stringify([e.source, e.target].sort());
+  const pairs = new Map();
+  g.edges.forEach((e) => { const key = pairKey(e); pairs.set(key, (pairs.get(key) || 0) + 1); });
   const els = [
     ...g.nodes.map((n) => ({ data: {
-      id: n.id, label: n.name, type: n.type, type_ja: n.type_ja || TYPE_JA[n.type] || n.type,
+      id: n.id, label: n.name, color: COLOR[n.type] || '#64748b',
+      type: n.type, type_ja: n.type_ja || TYPE_JA[n.type] || n.type,
       status: n.status, value: n.value, parent: n.parent, category: n.category,
       phase: n.phase, top_scope: n.top_scope, path: n.path,
     } })),
-    ...g.edges.map((e) => ({ data: { source: e.source, target: e.target, label: e.type, status: e.status } })),
+    ...g.edges.map((e) => ({ data: { source: e.source, target: e.target, label: e.type, status: e.status,
+      curved: e.source === e.target || pairs.get(pairKey(e)) > 1 } })),
   ];
   cy = cytoscape({
     container: $('cy'), elements: els, style: styleFor(document.documentElement.dataset.theme === 'dark'),
-    layout: { name: 'cose', animate: true, idealEdgeLength: 95, nodeRepulsion: 9000, padding: 50, randomize: true, fit: true },
-    wheelSensitivity: 0.2, maxZoom: 1.6, minZoom: 0.12,
+    layout: graphLayout(),
+    wheelSensitivity: 0.2, maxZoom: 2.5, minZoom: 0.01,
   });
-  cy.one('layoutstop', () => cy.fit(undefined, 50));
   renderLegend(g.nodes);
-  cy.on('tap', 'node', (evt) => selectNode(evt.target));
-  cy.on('tap', (evt) => { if (evt.target === cy) { cy.elements().removeClass('dim hi'); $('nodecard').classList.remove('show'); } });
+  cy.on('tap', 'node', (evt) => focusNode(evt.target));
+  cy.on('tap', (evt) => { if (evt.target === cy) clearSelection(); });
 }
 
 async function loadFacets(g) {
@@ -207,9 +232,11 @@ async function loadFacets(g) {
 }
 
 function renderLegend(nodes) {
+  const counts = new Map();
+  nodes.forEach((n) => counts.set(n.type, (counts.get(n.type) || 0) + 1));
   const types = [...new Set(nodes.map((n) => n.type))].sort((a, b) => (TYPE_JA[a] || a).localeCompare(TYPE_JA[b] || b, 'ja'));
   $('legtypes').innerHTML = types.map((t) =>
-    `<div class="legrow ftog" data-ftype="${esc(t)}"><span class="legdot" style="background:${COLOR[t] || '#64748b'}"></span>${esc(TYPE_JA[t] || t)}</div>`).join('');
+    `<button type="button" class="legrow ftog" data-ftype="${esc(t)}" aria-pressed="true"><span class="legdot" style="background:${COLOR[t] || '#64748b'}"></span>${esc(TYPE_JA[t] || t)}<span class="legcount">${counts.get(t)}</span></button>`).join('');
 }
 
 // ── 絞り込み（種別 / 状態。cytoscape の display で適用）──
@@ -221,21 +248,21 @@ function applyFilter() {
     cy.nodes().forEach((n) => {
       const st = n.data('status');
       const off = filt.types.has(n.data('type')) || (filt.hideDep && st && st !== 'active');
-      n.style('display', off ? 'none' : 'element');
+      n.toggleClass('filtered', !!off);
     });
     cy.edges().forEach((e) => {
-      const vis = e.source().style('display') !== 'none' && e.target().style('display') !== 'none';
-      e.style('display', vis ? 'element' : 'none');
+      e.toggleClass('filtered', e.source().hasClass('filtered') || e.target().hasClass('filtered'));
     });
   });
-  const total = cy.nodes().length;
-  const shown = cy.nodes().filter((n) => n.style('display') !== 'none').length;
-  $('gcount').textContent = (shown === total) ? `ノード ${total}・関係 ${cy.edges().length}` : `表示 ${shown} / ${total} ノード（絞り込み中）`;
+  search($('gsearch').value);
   const active = filt.types.size || filt.hideDep;
   $('fclear').hidden = !active;
 }
 
-function toggleRow(el, on) { el.classList.toggle('off', on); el.style.opacity = on ? '.4' : ''; el.style.textDecoration = on ? 'line-through' : ''; }
+function toggleRow(el, on) {
+  el.classList.toggle('off', !!el.dataset.ftype && on);
+  el.setAttribute('aria-pressed', String(el.dataset.ftype ? !on : on));
+}
 
 function onLegendClick(e) {
   const row = e.target.closest('.ftog'); if (!row) return;
@@ -251,38 +278,93 @@ function clearFilter(update) {
   if (update !== false) applyFilter();
 }
 
+function clearSelection() {
+  if (cy) {
+    cy.batch(() => {
+      cy.elements().removeClass('dim hi near related outside');
+      if (_overviewPositions) cy.nodes().positions((n) => _overviewPositions.get(n.id()));
+    });
+    if (_overviewPositions) cy.fit(cy.elements().not('.filtered'), 40);
+    const visible = cy.nodes().not('.filtered');
+    $('gcount').textContent = visible.length === cy.nodes().length ? _countText
+      : `表示 ${visible.length} / ${cy.nodes().length} ノード（絞り込み中）`;
+  }
+  _overviewPositions = null;
+  $('nodecard').classList.remove('show');
+  $('nodecard-empty').hidden = false;
+  $('gselection-clear').hidden = true;
+}
+
+function focusNode(n) {
+  if (!_overviewPositions) _overviewPositions = new Map(cy.nodes().map((node) => [node.id(), { ...node.position() }]));
+  const around = n.closedNeighborhood().not('.filtered');
+  cy.batch(() => {
+    cy.elements().difference(around).addClass('outside');
+    around.removeClass('outside');
+  });
+  around.layout({ ...graphLayout(), minNodeSpacing: 70, concentric: (node) => node === n ? 1 : 0 }).run();
+  selectNode(n);
+  $('gcount').textContent = `周辺 ${around.nodes().length} ノード・関係 ${around.edges().length}（読み込み済み ${cy.nodes().length} ノード）`;
+}
+
 function selectNode(n) {
-  cy.elements().addClass('dim'); cy.elements().removeClass('hi');
-  n.removeClass('dim'); n.neighborhood().removeClass('dim'); n.addClass('hi');
+  cy.batch(() => {
+    cy.elements().removeClass('hi near related').addClass('dim');
+    n.removeClass('dim').addClass('hi');
+    n.neighborhood().removeClass('dim').addClass('near');
+    n.connectedEdges().addClass('related');
+  });
   const d = n.data();
   const rows = [];
   if (d.value != null) rows.push(`<div class="nrow">値: <b>${esc(d.value)}</b></div>`);
   if (d.parent) rows.push(`<div class="nrow">所属: ${esc(d.parent)}</div>`);
   if (d.category) rows.push(`<div class="nrow">カテゴリ: ${esc(d.category)}</div>`);
   if (d.phase) rows.push(`<div class="nrow">工程: ${esc(d.phase)}</div>`);
+  if (d.path) rows.push(`<div class="nrow">資料: ${esc(d.path)}</div>`);
   if (d.status !== 'active') rows.push(`<div class="nrow">状態: ${d.status === 'deprecated' ? '廃止' : '未使用の疑い'}</div>`);
-  // n.degree() は現在 cy に載っているノードだけを数える（主要ノードのみの表示中は部分グラフ上の値）。
-  rows.push(`<div class="nrow">表示中のつながり数: ${n.degree()} 本</div>`);
+  // 主要ノードの上限・種別フィルターを適用した表示範囲で数える。
+  rows.push(`<div class="nrow">表示中のつながり数: ${n.connectedEdges().not('.filtered').length} 本</div>`);
+  const connections = n.connectedEdges().not('.filtered').map((edge) => {
+    const outgoing = edge.source().id() === n.id();
+    const other = outgoing ? edge.target() : edge.source();
+    return `<button type="button" class="gresult" data-node="${esc(other.id())}">${esc(other.data('label'))}`
+      + `<small>${outgoing ? 'この要素 → 接続先' : '接続先 → この要素'} · ${esc(edge.data('label'))}</small></button>`;
+  }).join('');
   $('nodecard').innerHTML = `<span class="nt">${esc(d.type_ja)}</span><div class="nn">${esc(d.label)}</div>`
-    + rows.join('') + `<button class="btn-secondary ask" data-ask="${esc(d.label)}">💬 この語で影響を調べる</button>`;
+    + rows.join('')
+    + `<button class="btn-secondary ask" data-ask="${esc(d.label)}">この語で影響を調べる</button>`
+    + (connections ? '<h3>つながり</h3><div class="nconnections">' + connections + '</div>' : '');
   $('nodecard').classList.add('show');
+  $('nodecard-empty').hidden = true;
+  $('gselection-clear').hidden = false;
 }
 
 function search(q) {
   // クイック名検索は現在 cy に読み込み済みのノードだけが対象（主要ノードのみの表示中は部分一致）。
   if (!cy) return;
-  cy.elements().removeClass('dim hi');
+  clearSelection();
   q = q.trim().toLowerCase();
+  const visible = cy.nodes().not('.filtered');
+  $('gresults-section').hidden = !q;
   if (!q) return;
-  const m = cy.nodes().filter((n) => n.data('label').toLowerCase().includes(q));
+  const m = visible.filter((n) => n.data('label').toLowerCase().includes(q));
+  // 一覧は先頭50件を明記。グラフ上の強調は一致した全件に適用する。
+  $('gresults-count').textContent = `${m.length} 件`;
+  $('gresults').innerHTML = m.slice(0, 50).map((n) =>
+    `<button type="button" class="gresult" data-node="${esc(n.id())}">${esc(n.data('label'))}<small>${esc(n.data('type_ja'))}</small></button>`).join('')
+    + (m.length > 50 ? '<p class="leg-help">先頭 50 件を表示しています。名前を追加して絞り込んでください。</p>' : '');
   if (!m.length) {
     $('gcount').textContent = _truncated
       ? '表示中には見つかりません。「すべて表示」で全体から探せます'
       : `「${q}」に一致なし`;
+    $('gresults').textContent = $('gcount').textContent;
     return;
   }
-  cy.elements().addClass('dim'); m.removeClass('dim'); m.neighborhood().removeClass('dim'); m.addClass('hi');
-  cy.animate({ fit: { eles: cy.elements(), padding: 40 } }, { duration: 400 });
+  cy.batch(() => {
+    cy.elements().addClass('dim'); m.removeClass('dim').addClass('hi');
+    m.neighborhood().removeClass('dim');
+  });
+  cy.fit(m, 60);
 }
 
 async function runGraphSearch() {
@@ -362,6 +444,20 @@ async function askGraph() {
 $('nodecard').addEventListener('click', (e) => {
   const a = e.target.closest('[data-ask]');
   if (a) { localStorage.setItem('sherpa-ask', a.dataset.ask + 'を変えたい。影響は？'); location.href = 'chat.html'; }
+  const connection = e.target.closest('[data-node]');
+  if (connection) {
+    const hadFocus = document.activeElement === connection;
+    focusNode(cy.getElementById(connection.dataset.node));
+    if (hadFocus) $('gselection-clear').focus();
+  }
+});
+// 「解除」は押すと自分が hidden になる＝フォーカスの行き先を名前検索欄へ移す（キーボード操作を途切れさせない）。
+$('gselection-clear').addEventListener('click', () => { clearSelection(); $('gsearch').focus(); });
+$('gresults').addEventListener('click', (e) => {
+  const result = e.target.closest('[data-node]');
+  if (!result || !cy) return;
+  const n = cy.getElementById(result.dataset.node);
+  focusNode(n);
 });
 $('gsearch').addEventListener('input', (e) => search(e.target.value));
 $('gfilter').addEventListener('click', runGraphSearch);
@@ -370,8 +466,8 @@ $('showall').addEventListener('click', showAllNodes);
 $('condvalue').addEventListener('keydown', (e) => { if (e.key === 'Enter') runGraphSearch(); });
 $('gaskbtn').addEventListener('click', askGraph);
 $('gask').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) askGraph(); });
-$('relayout').addEventListener('click', () => cy && cy.layout({ name: 'cose', animate: true, idealEdgeLength: 95, nodeRepulsion: 9000, randomize: true }).run());
-$('fit').addEventListener('click', () => cy && cy.animate({ fit: { padding: 40 } }, { duration: 400 }));
+$('relayout').addEventListener('click', () => { if (cy) { clearSelection(); cy.layout(graphLayout()).run(); } });
+$('fit').addEventListener('click', () => { if (cy) { clearSelection(); cy.fit(cy.elements().not('.filtered'), 40); } });
 document.querySelector('.graphlegend').addEventListener('click', onLegendClick);
 $('fclear').addEventListener('click', clearFilter);
 document.addEventListener('click', (e) => { if (e.target && e.target.id === 'graph-retry') load(); });

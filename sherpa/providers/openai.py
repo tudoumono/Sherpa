@@ -121,6 +121,7 @@ class OpenAIProvider(_GenProvider):
             stop_event=ctx.stop_event, can_ask=_can_ask(ctx.message), history=ctx.history or [],
             layer=(ctx.scope_meta or {}).get("layer"),
             max_turns=max_turns, max_hits=max_hits, window_cap=window_cap,
+            system_settings=self._system_settings,
             tools_pref=_tools_pref, tools_availability=ctx.tools_availability)
 
     def _stream(self, prompt: str, completion: _CompletionState | None = None) -> Iterator[str]:

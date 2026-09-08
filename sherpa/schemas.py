@@ -45,7 +45,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, PlainSerializer
+from pydantic import BaseModel, Field, PlainSerializer
 
 # Codex RV HIGH（フェーズ7-1 再RV・2026-07-16）是正: pydantic v2 は response_model 経由だと
 # aware datetime を既定で `2026-07-01T09:10:00Z`（Z サフィックス）に正規化する。response_model
@@ -519,6 +519,16 @@ class DepthProfileAdminInfo(BaseModel):
     codex_reasoning: DepthProfileCodexReasoningInfo
 
 
+class ChatMaxTurnsAdminInfo(BaseModel):
+    """GET・PUT /admin/settings の `chat_max_turns`（同時実行の上限・`sherpa/chat_turns.py::
+    effective_limits`・system_extras.py::_admin_settings_view）。`per_user`/`global` は
+    `DepthProfileBaseInfo` と同型（configured=管理者の生値・effective=system_settings→env の
+    解決結果・default=env 既定＝未設定に戻したときの実効値）。`global` は Python の予約語のため
+    属性名は `global_`（`Field(alias="global")`）——JSON 上のキーは `chat_max_turns.global` のまま。"""
+    per_user: DepthProfileBaseInfo
+    global_: DepthProfileBaseInfo = Field(alias="global")
+
+
 class ModelWindowResolutionInfo(BaseModel):
     """`agentic_budget.window`（BUDGET-2・§3.4・`sherpa/model_windows.py::resolve_window_tokens`・
     system_extras.py::_current_chat_provider_model）。現在のモデル（システム既定のチャット/
@@ -574,6 +584,7 @@ class AdminSettingsView(BaseModel):
     codex_session_retention_days: CodexSessionRetentionInfo
     usage_chat: UsageChatAdminInfo
     depth_profile: DepthProfileAdminInfo
+    chat_max_turns: ChatMaxTurnsAdminInfo
     agentic_budget: AgenticBudgetAdminInfo
     chat_examples: ChatExamplesAdminInfo
 
@@ -1312,8 +1323,16 @@ class ForkedFromInfo(BaseModel):
     at: WireDateTime
 
 
+class ConversationSearchMatch(BaseModel):
+    """H1（履歴検索）: `GET /conversations?q=`（store.search_conversations）が行に付ける一致箇所。
+    `where="title"` はタイトル一致、`"message"` は本文（messages.content／answer.headline）一致。"""
+    where: Literal["title", "message"]
+    snippet: str
+
+
 class ConversationSummary(BaseModel):
-    """`GET /conversations`（store.list_conversations）の1行。
+    """`GET /conversations`（store.list_conversations／`q` 指定時は store.search_conversations）の1行。
+    `match` は `q` 指定時のみ付く（省略時は常に欠落・従来どおり）。
 
     response_model は付与しない: `version`（DB 列・歴史的名称＝世代/世界 ID の実体・語彙統一の
     スコープ外＝DB 不変）が OpenAPI スキーマに `version` プロパティとして露出し、
@@ -1332,6 +1351,7 @@ class ConversationSummary(BaseModel):
     shared_by_name: str | None
     share_status: str | None
     forked_from: ForkedFromInfo | None = None
+    match: ConversationSearchMatch | None = None
 
 
 class ConversationDetailConv(BaseModel):

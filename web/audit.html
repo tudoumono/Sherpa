@@ -18,13 +18,13 @@
   /* フィルターバー */
   .filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:16px}
   .filter-bar .ff{display:flex;flex-direction:column;gap:3px}
-  .filter-bar label{font-size:11.5px;font-weight:600;color:var(--ink-3)}
-  .filter-bar input,.filter-bar select{padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
-    font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink);height:36px;box-sizing:border-box}
+  .filter-bar label{font-size:var(--text-caption);font-weight:600;color:var(--ink-3)}
+  .filter-bar input,.filter-bar select{padding:7px 10px;border:1px solid var(--control-border);border-radius:var(--radius-sm);
+    font-family:inherit;font-size:var(--text-label);background:var(--surface);color:var(--ink);height:36px;box-sizing:border-box}
   .filter-bar input{width:150px}
   /* タイムライン テーブル */
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{text-align:left;font-size:11px;font-weight:600;color:var(--ink-3);padding:7px 10px;
+  table{width:100%;border-collapse:collapse;font-size:var(--text-label)}
+  th{text-align:left;font-size:var(--text-small);font-weight:600;color:var(--ink-3);padding:7px 10px;
     border-bottom:2px solid var(--border);white-space:nowrap}
   td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:top}
   tr:hover td{background:var(--surface-2)}
@@ -32,16 +32,16 @@
   .oc-pending{color:var(--ink-3)}
   .sev-critical{font-weight:700;color:var(--danger)}
   .sev-warning{color:var(--warn)}
-  .detail-cell{max-width:280px;word-break:break-all;font-family:var(--font-code,monospace);font-size:11px;color:var(--ink-3)}
-  .action-cell{font-family:var(--font-code,monospace);font-size:12px;font-weight:600}
-  .ts-cell{white-space:nowrap;color:var(--ink-3);font-size:11px}
+  .detail-cell{max-width:280px;word-break:break-all;font-family:var(--font-code,monospace);font-size:var(--text-caption);color:var(--ink-3)}
+  .action-cell{font-family:var(--font-code,monospace);font-size:var(--text-small);font-weight:600}
+  .ts-cell{white-space:nowrap;color:var(--ink-3);font-size:var(--text-caption)}
   /* ページネーション */
   .pager{display:flex;align-items:center;gap:8px;padding:14px 0}
-  .pager .info{font-size:12px;color:var(--ink-3)}
+  .pager .info{font-size:var(--text-small);color:var(--ink-3)}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .empty-row td{text-align:center;color:var(--ink-3);padding:24px}
   /* UI フィードバック6（2026-07-03）: 表示項目カスタマイズ（列の表示/非表示・端末ローカル保存）。 */
-  .colcfg{display:flex;flex-wrap:wrap;gap:3px 14px;align-items:center;margin-bottom:10px;font-size:12px;color:var(--ink-2)}
+  .colcfg{display:flex;flex-wrap:wrap;gap:3px 14px;align-items:center;margin-bottom:10px;font-size:var(--text-small);color:var(--ink-2)}
   .colcfg label{display:inline-flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap}
   .colcfg input{margin:0}
   #audit-table[data-hide~="ts"] .col-ts,
@@ -54,9 +54,9 @@
   #audit-table[data-hide~="detail"] .col-detail{display:none}
   /* 詳細（既定非表示）を行クリック/「詳細」ボタンで個別に開ける展開行。 */
   .detail-row td{background:var(--surface-2);white-space:pre-wrap;word-break:break-all;
-    font-family:var(--font-code,monospace);font-size:11px;color:var(--ink-2)}
+    font-family:var(--font-code,monospace);font-size:var(--text-caption);color:var(--ink-2)}
   tr.audit-row{cursor:pointer}
-  .detail-toggle{font-size:11px;color:var(--accent-ink);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline}
+  .detail-toggle{font-size:var(--text-caption);color:var(--accent-ink);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline}
 </style>
 </head>
 <body>
@@ -65,8 +65,8 @@
 <div class="wrap">
   <div id="access-denied">
     <div style="font-size:32px;margin-bottom:12px">🚫</div>
-    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
-    <div style="font-size:13px">管理者権限が必要です。</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
   </div>
   <div id="main-content">
     <div class="pagehead">
@@ -78,7 +78,7 @@
       <div class="spacer"></div>
       <button class="btn-ghost" id="export-csv">CSV</button>
       <button class="btn-ghost" id="export-jsonl">JSONL</button>
-      <span id="export-status" style="font-size:12px;color:var(--ink-3)" aria-live="polite"></span>
+      <span id="export-status" style="font-size:var(--text-small);color:var(--ink-3)" aria-live="polite"></span>
     </div>
 
     <div class="wrap2">

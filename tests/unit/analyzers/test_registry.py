@@ -13,13 +13,20 @@ from sherpa.ingest.analyzers.jcl import JclAnalyzer
 
 def test_known_analyzers_are_cobol_copybook_jcl_java_in_priority_order():
     names = [a.name for a in registry.known_analyzers()]
-    assert names == ["cobol", "copybook", "jcl", "java"]
+    assert names == ["cobol", "copybook", "jcl", "java", "properties", "yaml_config", "xml_config", "sql",
+                     "c", "csharp", "jsp", "html", "js", "css", "shell", "vb"]
 
 
 def test_registered_extensions_is_union_of_known_analyzers():
     expected = frozenset().union(*(a.extensions for a in registry.known_analyzers()))
     assert registry.registered_extensions() == expected
-    assert registry.registered_extensions() == {".cbl", ".cob", ".cobol", ".cpy", ".copybook", ".jcl", ".java"}
+    assert registry.registered_extensions() == {".cbl", ".cob", ".cobol", ".cpy", ".copybook", ".jcl", ".java",
+                                                 ".properties", ".yaml", ".yml", ".xml", ".sql",
+                                                 ".c", ".h", ".cs",
+                                                 ".jsp", ".jspx", ".jspf", ".tag", ".tagx",
+                                                 ".html", ".htm", ".xhtml", ".js", ".mjs", ".css",
+                                                 ".sh", ".bash", ".ksh", ".zsh", ".bat", ".cmd",
+                                                 ".vb", ".bas", ".cls", ".frm", ".ctl", ".vbs"}
 
 
 # ---- config_signature（world 署名・ES 設定署名の材料） ----
@@ -141,10 +148,11 @@ class _PlainAnalyzer(Analyzer):
 
 
 def test_resolve_lazy_reads_head_only_when_a_candidate_overrides_accepts(monkeypatch):
-    """`accepts()` を上書きしている候補が1つでもあれば `read_head` を呼ぶ（既定のみの候補と混在する場合）。"""
+    """`accepts()` を上書きしている候補が1つでもあれば `read_head` を呼ぶ（既定のみの候補と混在する場合）。
+    `read_head` は `size`（要求 head バイト数）をキーワードで受け取れる必要がある。"""
     calls = []
 
-    def read_head():
+    def read_head(size=4096):
         calls.append(1)
         return "MAGIC"
 
@@ -320,10 +328,11 @@ def test_reserved_keys_in_extra_are_stripped_and_flagged(monkeypatch):
         assert ("reserved_key_in_extra", "BAR", ("name", "world_id")) in reasons
 
 
-def test_jcl_proc_file_without_job_still_detects_dropped_syntax():
-    """JOB を持たない JCL PROC ファイル（主体なし）でも、受理済み（拡張子一致＋accepts 通過）
-    である以上 Pass2 を必ず通り、`EXEC PROC=`/`INCLUDE MEMBER=` が dropped_syntax として
-    flags に記録される（主体の有無で Pass2 の実行を左右しない）。"""
+def test_jcl_proc_file_without_job_is_batch_with_unresolved_refs():
+    """JOB を持たない JCL PROC ファイルは `collect_defs` で primary=`Batch`（PROC 名）を持つ
+    （S5a・アナライザ拡張）——`EXEC PROC=`/`INCLUDE MEMBER=` は通常の `RefCandidate` になり、
+    参照先が world 内に無ければ `dropped_syntax` ではなく通常の `unresolved` flag に倒れる
+    （二重申告しない・誤った先を推測しない）。"""
     from sherpa.ingest import world_graph
     with tempfile.TemporaryDirectory() as d:
         base = Path(d) / "案件A"
@@ -334,10 +343,13 @@ def test_jcl_proc_file_without_job_still_detects_dropped_syntax():
             "// INCLUDE MEMBER=SHARED\n",
             encoding="utf-8")
         nodes, edges, flags = world_graph.build_world(Path(d), "w")
-        assert nodes == [] and edges == []          # 主体（JOB）が無いのでノード/エッジは作られない
-        reasons = {(fl["reason"], fl.get("why")) for fl in flags}
-        assert ("dropped_syntax", "proc_exec") in reasons
-        assert ("dropped_syntax", "include_member") in reasons
+        assert [n["name"] for n in nodes] == ["INNERPRC"]
+        assert nodes[0]["label"] == "Batch"
+        assert edges == []                          # 参照先（INNER/SHARED）が world 内に無い＝解決不能
+        reasons = {(fl["reason"], fl.get("kind"), fl.get("name")) for fl in flags}
+        assert ("unresolved", "Batch", "INNER") in reasons
+        assert ("unresolved", "Batch", "SHARED") in reasons
+        assert not any(fl["reason"] == "dropped_syntax" for fl in flags)
 
 
 def test_unreadable_registered_code_file_produces_blocked_flag(monkeypatch):
@@ -354,14 +366,14 @@ def test_unreadable_registered_code_file_produces_blocked_flag(monkeypatch):
         base.mkdir()
         (base / "BADPROG.cbl").write_text("       PROGRAM-ID. BADPROG.\n", encoding="utf-8")
 
-        real_read_text = Path.read_text
+        real_read_bytes = Path.read_bytes
 
         def _boom(self, *a, **kw):
             if self.name == "BADPROG.cbl":              # 対象ファイル限定（他の読み取りは通常どおり）
                 raise OSError("simulated read failure")
-            return real_read_text(self, *a, **kw)
+            return real_read_bytes(self, *a, **kw)
 
-        monkeypatch.setattr(Path, "read_text", _boom)
+        monkeypatch.setattr(Path, "read_bytes", _boom)
         nodes, edges, flags = world_graph.build_world(Path(d), "w")
         assert nodes == [] and edges == []
         blocked = [f for f in flags if f.get("action") == "blocked"]

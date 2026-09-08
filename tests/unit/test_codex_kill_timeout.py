@@ -52,8 +52,10 @@ from sherpa import agents as A  # noqa: E402
 _SLEEP_SECONDS = 120
 
 
-def _ctx(uid: str, stop_event=None) -> "A.Ctx":
-    """DB 不要な最小 Ctx（route/dispatch を固定ラムダにし、_gather の実処理だけ本物を通す）。"""
+def _ctx(uid: str, stop_event=None, conversation_id=None) -> "A.Ctx":
+    """DB 不要な最小 Ctx（route/dispatch を固定ラムダにし、_gather の実処理だけ本物を通す）。
+    `conversation_id`（省略可）: 指定すると永続 CODEX_HOME（`.codex-sessions/{cid}`）経路＋
+    会話単位の非ブロッキング lock（`_conversation_lock`）が働く経路になる。"""
     return A.Ctx(
         message="偽 codex kill/timeout テスト",
         world="v1",
@@ -65,6 +67,7 @@ def _ctx(uid: str, stop_event=None) -> "A.Ctx":
         knowledge=True,
         uid=uid,
         stop_event=stop_event,
+        conversation_id=conversation_id,
     )
 
 
@@ -244,9 +247,60 @@ def test_generator_close_kills_process_and_removes_codex_home(tmp_path, monkeypa
         f"per-request CODEX_HOME が想定どおり1個作られていない: {codex_homes_before!r}"
     )
     codex_home = codex_homes_before[0]
+    # run dir（cwd）も close() の finally で消えることを確認する。
+    run_dirs_before = list((ws_dir / "authoring").glob("run-*"))
+    assert len(run_dirs_before) == 1, f"run dir が想定どおり1個作られていない: {run_dirs_before!r}"
+    run_dir = run_dirs_before[0]
 
     gen.close()   # クライアント切断相当（finally: killer.cancel→_killpg→proc.wait(5)→rmtree(codex_home)）
 
     assert not _pid_alive(pid), f"close() 後も偽 codex 本体(pid={pid})が生きている（finally の _killpg が効いていない）"
     assert not _pid_alive(child_pid), f"close() 後もプロセスグループ内の子(pid={child_pid})が生きている"
     assert not codex_home.exists(), f"close() 後も CODEX_HOME が残っている（finally の rmtree が効いていない）: {codex_home}"
+    assert not run_dir.exists(), f"close() 後も run dir が残っている（finally の rmtree が効いていない）: {run_dir}"
+
+
+# ===== 会話単位ロックの解放 =====
+
+def test_generator_close_releases_conversation_lock(tmp_path, monkeypatch):
+    """永続 CODEX_HOME 経路（`conversation_id` あり）でも、generator の途中 close で
+    `_conversation_lock` が確実に解放される（漏れると同一会話が恒久的に拒否され続ける）。"""
+    from sherpa.providers.codex import provider as PV
+
+    _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_close_conv")
+    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "120")
+
+    prov = A.CodexProvider()
+    uid = "killclose-conv-u1"
+    conversation_id = 424242
+    ctx = _ctx(uid=uid, conversation_id=conversation_id)
+
+    gen = prov.run(ctx)
+    seen: list = []
+    for _ in range(20):
+        ev = next(gen)
+        seen.append(ev)
+        if isinstance(ev, dict) and str(ev.get("id", "")).startswith("cx-"):
+            break
+    else:
+        raise AssertionError(f"command_execution node（cx-*）に到達しなかった。seen={seen!r}")
+
+    pid_file = sentinel_dir / "codex.pid"
+    assert pid_file.exists() and pid_file.read_text().strip(), "偽 codex プロセスが起動した形跡が無い（テスト前提が崩れている）"
+    pid = _read_pid(pid_file)
+    assert _pid_alive(pid), "close() 前提: 偽 codex 本体がまだ生きていること"
+
+    lk = PV._conversation_lock(conversation_id)
+    assert not lk.acquire(blocking=False), "実行中に会話ロックが解放されている（テスト前提が崩れている）"
+
+    users_dir = Path(os.environ["SHERPA_USERS_DIR"]).resolve()
+    run_dirs_before = list((users_dir / uid / "workspace" / "authoring").glob("run-*"))
+    assert len(run_dirs_before) == 1
+    run_dir = run_dirs_before[0]
+
+    gen.close()   # クライアント切断相当
+
+    assert not _pid_alive(pid), "close() 後も偽 codex 本体が生きている"
+    assert lk.acquire(blocking=False), "close() 後も会話ロックが解放されていない（恒久拒否になる）"
+    lk.release()
+    assert not run_dir.exists(), f"close() 後も run dir が残っている: {run_dir}"

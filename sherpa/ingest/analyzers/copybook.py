@@ -9,8 +9,9 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 
 from ..identifiers import normalize_code_name as _norm
-from ..static_analysis import COPYBOOK_EXT, _ITEM, _VALUE, _is_comment
-from ._base import Analyzer, DefItem, DefResult, RefResult
+from ..static_analysis import (COPYBOOK_EXT, _ITEM, _VALUE, _is_comment,
+                               _is_free_format, _normalize_logical_lines)
+from ._base import Analyzer, DefItem, DefResult, Dropped, RefResult
 
 
 class CopybookAnalyzer(Analyzer):
@@ -24,10 +25,15 @@ class CopybookAnalyzer(Analyzer):
         cb = _norm(PurePosixPath(rel_path).stem)
         children: list = []
         stack: list = []                              # (level:int, name) ＝COBOL レベルスタックで修飾名
-        for i, line in enumerate(text.splitlines(), 1):
-            if _is_comment(line):
+        free_format = _is_free_format(text)
+        # `_ITEM` は行頭アンカー（採番領域の連番を「レベル番号」として誤マッチしうる）のため、
+        # 正規化済みの論理行（1〜6桁連番除去済み・S1）に対して適用する（`cobol.py` と共通の
+        # 正規化器・自由形式には適用しない）。
+        entries, debug_dropped = _normalize_logical_lines(text, free_format)
+        for logical, i, _segs in entries:
+            if _is_comment(logical):
                 continue
-            m = _ITEM.match(line)
+            m = _ITEM.match(logical)
             if not m:
                 continue
             if m.group(1) in ("66", "88") or _norm(m.group(2)) == "FILLER":
@@ -37,11 +43,12 @@ class CopybookAnalyzer(Analyzer):
                 stack.pop()
             qualified = ".".join([s[1] for s in stack] + [item])   # GROUP.ITEM（同名衝突回避）
             stack.append((level, item))
-            mv = _VALUE.search(line)
+            mv = _VALUE.search(logical)
             children.append(DefItem(label="DataItem", name=item, cid_key=qualified,
                                      value=mv.group(1) if mv else None, line=i,
                                      extra={"qualified": qualified}))
-        return DefResult(primary=DefItem(label="Copybook", name=cb), children=children)
+        dropped = [Dropped("debug_line", ln, snippet) for ln, snippet in debug_dropped]
+        return DefResult(primary=DefItem(label="Copybook", name=cb), children=children, dropped=dropped)
 
     def extract_refs(self, text: str, rel_path: str) -> RefResult:
         return RefResult()

@@ -4381,6 +4381,32 @@
             ],
             "title": "Chat Examples"
           },
+          "chat_max_turns_global": {
+            "anyOf": [
+              {
+                "maximum": 64.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chat Max Turns Global"
+          },
+          "chat_max_turns_per_user": {
+            "anyOf": [
+              {
+                "maximum": 16.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chat Max Turns Per User"
+          },
           "cloud_provider": {
             "anyOf": [
               {
@@ -7530,7 +7556,7 @@
         ]
       },
       "put": {
-        "description": "全体設定を部分更新（admin のみ・検証・監査・fail-closed）。\n\n未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名\nのみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・\nvlm は provider/model/cloud_allowed の型を検証する\n（不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。\ncodex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/\nwebhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する\n（junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら\n実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama\nのみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は\nollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。\"openai\" への\n変更はこの PUT 適用後の実効設定で実送信可能性も preflight する\n（`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの\n基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は\n`sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。agentic_budget_per_result/\nagentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・\n累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は \"provider:model\" →\ntokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。\nchat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・\n`sherpa.chat_examples.validate` が意味検証・不正は422）。\n監査 INSERT の失敗は\n`store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（2026-07-08\nRV High: commit 後の別接続 audit＋失敗時 compensate 方式は穴があったため、原子性で置き換えた・\nannouncement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。",
+        "description": "全体設定を部分更新（admin のみ・検証・監査・fail-closed）。\n\n未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名\nのみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・\nvlm は provider/model/cloud_allowed の型を検証する\n（不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。\ncodex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/\nwebhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する\n（junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら\n実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama\nのみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は\nollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。\"openai\" への\n変更はこの PUT 適用後の実効設定で実送信可能性も preflight する\n（`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの\n基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は\n`sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。chat_max_turns_per_user/\nchat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field\nで範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/\nagentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・\n累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は \"provider:model\" →\ntokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。\nchat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・\n`sherpa.chat_examples.validate` が意味検証・不正は422）。\n監査 INSERT の失敗は\n`store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（2026-07-08\nRV High: commit 後の別接続 audit＋失敗時 compensate 方式は穴があったため、原子性で置き換えた・\nannouncement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。",
         "operationId": "admin_settings_put_admin_settings_put",
         "requestBody": {
           "content": {
@@ -8399,7 +8425,7 @@
     },
     "/chat/turns": {
       "post": {
-        "description": "チャットターンをバックグラウンドで開始する（画面遷移しても止まらない・覗き窓方式）。\n\n返り値 `{turn_id, conversation_id}` の `turn_id` で `GET /chat/turns/{turn_id}/stream` を購読する\n（途中からでも cursor で replay→追従）。同時実行数の上限（1ユーザー2・全体8）を超えると 429\n（MEDIUM・Codex RV 修正: 予約方式＝上限判定と枠の登録が atomic なので、429 のときは会話が\n一切作られない）。",
+        "description": "チャットターンをバックグラウンドで開始する（画面遷移しても止まらない・覗き窓方式）。\n\n返り値 `{turn_id, conversation_id}` の `turn_id` で `GET /chat/turns/{turn_id}/stream` を購読する\n（途中からでも cursor で replay→追従）。同時実行数の上限（既定 1ユーザー2・全体8＝`SHERPA_CHAT_MAX_TURNS_PER_USER`／`SHERPA_CHAT_MAX_TURNS_GLOBAL`・\n管理画面「システム管理」の「同時実行の上限」で上書き可＝`chat_turns.effective_limits()` が\nターン受付のたびに解決する）を超えると 429\n（MEDIUM・Codex RV 修正: 予約方式＝上限判定と枠の登録が atomic なので、429 のときは会話が\n一切作られない）。",
         "operationId": "chat_turns_start_chat_turns_post",
         "requestBody": {
           "content": {
@@ -8765,8 +8791,26 @@
     },
     "/conversations": {
       "get": {
-        "description": "現在ユーザーの会話一覧（所有＋受領共有）を返す。",
+        "description": "現在ユーザーの会話一覧（所有＋受領共有）を返す。`q` 指定時はタイトル・本文検索に絞る（H1・\ntrim 後 1〜100 字。省略時は従来どおり全件・応答形も不変）。",
         "operationId": "conversations_list_conversations_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -8775,6 +8819,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Conversations List",

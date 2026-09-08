@@ -85,47 +85,161 @@ def get_conversation(conversation_id) -> dict | None:
         return {"conversation": conv, "messages": msgs}
 
 
-def list_conversations(user_id="admin", limit=50) -> list:
-    """自分の会話＋受領共有ラッパーを返す（origin/read_only/shared_by/share_status 付き・削除済みは除外）。
+_DEFAULT_LIST_LIMIT = 50   # list_conversations/search_conversations 共通の既定件数
+
+
+def _visible_conversations_rows(c, user_id, limit) -> list:
+    """所有会話＋受領共有ラッパーの可視行を取得する（`list_conversations`/`search_conversations` 共通の
+    可視集合判定＝新しい認可分岐を作らない）。`list_conversations` の公開行には出さない
+    `share_id`/`source_conversation_id`（`search_conversations` が受領共有の本文所在を解決するために
+    使う）も含む——公開行を組み立てる側（`_public_conversation_row`）がこの2列を落として従来の
+    応答形を保つ。
 
     SH-1（2026-08-23-共有フォーク.md）: フォークで複製した会話（`forked_at` 設定済み）は
-    `forked_from`（`{share_id, user_id, name, at}`・出所表示用・編集不可）を持つ。フォークでない
-    会話は `forked_from=None`。表示名は `shared_by_name` と同じ流儀（`users.display_name` の
-    LEFT JOIN）で解決する。
+    `forked_from_share_id`/`forked_from_user_id`/`forked_from_name`/`forked_at`（出所表示用）を持つ。
+    判定は `forked_from_share_id IS NOT NULL` ではなく **`forked_at IS NOT NULL`** で行う
+    （`forked_from_share_id` は共有そのものが後で削除されると `ON DELETE SET NULL` で NULL に
+    落ちる・`forked_from_user_id`/`forked_at` は影響を受けない・db.py のスキーマ参照）。
+    """
+    return c.execute(
+        "SELECT c.id, c.title, c.version, c.pinned, c.updated_at, c.origin, c.read_only, c.received_at, "
+        "c.shared_by_user_id, u.display_name AS shared_by_name, "
+        "c.forked_from_share_id, c.forked_from_user_id, fu.display_name AS forked_from_name, c.forked_at, "
+        "c.share_id, c.source_conversation_id, "
+        "CASE WHEN c.origin='received_share' THEN "
+        "  (SELECT CASE WHEN s.revoked_at IS NOT NULL THEN 'revoked' "
+        "               WHEN s.expires_at IS NOT NULL AND s.expires_at<=now() THEN 'expired' "
+        "               ELSE 'active' END "   # expires_at IS NULL = 無期限（常に active 側）
+        "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_status "
+        "FROM conversations c LEFT JOIN users u ON u.uid=c.shared_by_user_id "
+        "LEFT JOIN users fu ON fu.uid=c.forked_from_user_id "
+        "WHERE c.user_id=%s AND c.deleted_at IS NULL AND c.origin<>'sanitized_snapshot' "  # snapshot は内部成果物＝非表示
+        "ORDER BY c.origin, c.pinned DESC, c.updated_at DESC LIMIT %s",   # own が先・ピンは上部（#8）
+        (user_id, limit),
+    ).fetchall()
 
-    是正4（2026-09-05）: 判定は `forked_from_share_id IS NOT NULL` ではなく **`forked_at IS NOT NULL`**
-    で行う。`forked_from_share_id` は共有そのものが後で削除されると `ON DELETE SET NULL` で
-    NULL に落ちる（`forked_from_user_id`/`forked_at` は影響を受けない・db.py のスキーマ参照）ため、
-    `forked_from_share_id` を判定に使うと共有削除後に出所表示ごと消えてしまう。`forked_from` の
-    `share_id` は `forked_from_share_id` をそのまま返す（NULL を許す＝共有削除後は `share_id: null`
-    だが `user_id`/`name`/`at` は残る）。
+
+def _public_conversation_row(r) -> dict:
+    """`_visible_conversations_rows` の1行を `GET /conversations` の公開形へ変換する
+    （`share_id`/`source_conversation_id` を含む内部専用列を落とし、`forked_from` を組み立てる。
+    `forked_from` の `share_id` は `forked_from_share_id` をそのまま返す＝NULL を許す
+    （共有削除後は `share_id: null` だが `user_id`/`name`/`at` は残る）。"""
+    forked_from = None
+    if r["forked_at"] is not None:
+        forked_from = {"share_id": r["forked_from_share_id"], "user_id": r["forked_from_user_id"],
+                      "name": r["forked_from_name"], "at": r["forked_at"]}
+    return {k: v for k, v in r.items()
+           if k not in ("forked_from_share_id", "forked_from_user_id", "forked_from_name", "forked_at",
+                        "share_id", "source_conversation_id")} | {"forked_from": forked_from}
+
+
+def list_conversations(user_id="admin", limit=_DEFAULT_LIST_LIMIT) -> list:
+    """自分の会話＋受領共有ラッパーを返す（origin/read_only/shared_by/share_status 付き・削除済みは除外）。
+    表示名は `shared_by_name` と同じ流儀（`users.display_name` の LEFT JOIN）で解決する。"""
+    _ensure()
+    with _connect() as c:
+        return [_public_conversation_row(r) for r in _visible_conversations_rows(c, user_id, limit)]
+
+
+def _resolve_received_share_msg_src(c, uid, share_id, source_conversation_id):
+    """受領共有ラッパーの本文所在を判定する（`shares.py::get_conversation_for_read`・
+    `search_conversations` 共通・呼び出し側の接続 `c` 上でそのまま実行する＝二重実装しない）。
+
+    共有が有効（取消なし・期限内・招待済み）かつ元会話が個人 workspace 参照でブロックされて
+    いなければ `(source_conversation_id, None)` を返す。無効なら `(None, "unavailable")`、
+    共有後に元会話が個人 workspace を参照するようになっていたら `(None, "personal_blocked")`。
+    """
+    # expires_at IS NULL = 無期限（revoke されない限り active）。
+    share = c.execute(
+        "SELECT (revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())) AS active "
+        "FROM conversation_shares WHERE id=%s", (share_id,)).fetchone()
+    invited = c.execute("SELECT 1 FROM conversation_share_invites "
+                        "WHERE share_id=%s AND invitee_user_id=%s", (share_id, uid)).fetchone()
+    if not share or not share["active"] or not invited:
+        return None, "unavailable"
+    src_conv = c.execute(
+        "SELECT contains_personal_workspace FROM conversations WHERE id=%s",
+        (source_conversation_id,)).fetchone()
+    if src_conv and src_conv["contains_personal_workspace"]:
+        return None, "personal_blocked"
+    return source_conversation_id, None
+
+
+_SEARCH_SNIPPET_RADIUS = 60   # H1（履歴検索）: 抜粋は最初の一致位置の前後 60 字
+
+
+def _search_snippet(text, q) -> str | None:
+    """`text` 内で `q`（大小文字を区別しない）が最初に現れた位置の前後 `_SEARCH_SNIPPET_RADIUS` 字を
+    返す。一致しなければ None（`text` が空/None のときも None）。"""
+    if not text:
+        return None
+    idx = text.lower().find(q.lower())
+    if idx < 0:
+        return None
+    start = max(0, idx - _SEARCH_SNIPPET_RADIUS)
+    end = min(len(text), idx + len(q) + _SEARCH_SNIPPET_RADIUS)
+    return text[start:end]
+
+
+def search_conversations(user_id, q) -> list:
+    """本人が読める会話（自分の会話＋有効な受領共有）のタイトル・本文を対象にした検索（H1）。
+
+    可視集合は `list_conversations` と同じ判定（`_visible_conversations_rows`）を再利用する
+    （新しい認可分岐を作らない）。受領共有の本文所在は `_resolve_received_share_msg_src` で判定し、
+    無効（取消・期限切れ・招待外）・個人ブロックの共有はタイトルのみを対象にする（本文は
+    問い合わせない）。sanitized 共有はスナップショット会話自身が可視集合に含まれる（元会話の
+    `source_conversation_id` は snapshot を指す）ため、対象本文は自動的に伏字後のものになる。
+
+    タイトル一致を本文一致より優先する（`match.where`）。本文一致は `messages.content`／
+    `answer->>'headline'` への ILIKE 1回（可視集合の本文所在 id へまとめて・索引は増やさない）。
+    タイトル・本文のどちらにも一致しない行は返さない。
     """
     _ensure()
     with _connect() as c:
-        rows = c.execute(
-            "SELECT c.id, c.title, c.version, c.pinned, c.updated_at, c.origin, c.read_only, c.received_at, "
-            "c.shared_by_user_id, u.display_name AS shared_by_name, "
-            "c.forked_from_share_id, c.forked_from_user_id, fu.display_name AS forked_from_name, c.forked_at, "
-            "CASE WHEN c.origin='received_share' THEN "
-            "  (SELECT CASE WHEN s.revoked_at IS NOT NULL THEN 'revoked' "
-            "               WHEN s.expires_at IS NOT NULL AND s.expires_at<=now() THEN 'expired' "
-            "               ELSE 'active' END "   # expires_at IS NULL = 無期限（常に active 側）
-            "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_status "
-            "FROM conversations c LEFT JOIN users u ON u.uid=c.shared_by_user_id "
-            "LEFT JOIN users fu ON fu.uid=c.forked_from_user_id "
-            "WHERE c.user_id=%s AND c.deleted_at IS NULL AND c.origin<>'sanitized_snapshot' "  # snapshot は内部成果物＝非表示
-            "ORDER BY c.origin, c.pinned DESC, c.updated_at DESC LIMIT %s",   # own が先・ピンは上部（#8）
-            (user_id, limit),
-        ).fetchall()
+        rows = _visible_conversations_rows(c, user_id, _DEFAULT_LIST_LIMIT)
+        msg_src_by_cid: dict = {}   # 可視行 id -> 本文を読みに行く先（own は自分自身・received_share は元会話）
+        for r in rows:
+            if r["origin"] == "received_share":
+                resolved, _status = _resolve_received_share_msg_src(
+                    c, user_id, r["share_id"], r["source_conversation_id"])
+                if resolved is not None:
+                    msg_src_by_cid[r["id"]] = resolved
+            else:
+                msg_src_by_cid[r["id"]] = r["id"]
+        content_hits: dict = {}   # 本文所在 id -> 抜粋（同じ会話に複数一致があれば ORDER BY id DESC の先頭＝最新を採用）
+        msg_src_ids = sorted(set(msg_src_by_cid.values()))
+        if msg_src_ids:
+            # ILIKE の `%`/`_`（ワイルドカード）とエスケープ文字自身をリテラル化する
+            # （`users.py::suggest_users` と同じ手当て）。
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            msg_rows = c.execute(
+                "SELECT conversation_id, content, answer->>'headline' AS headline FROM messages "
+                "WHERE conversation_id = ANY(%s) "
+                "  AND (content ILIKE %s ESCAPE '\\' OR answer->>'headline' ILIKE %s ESCAPE '\\') "
+                "ORDER BY id DESC",
+                (msg_src_ids, like, like),
+            ).fetchall()
+            for mr in msg_rows:
+                cid = mr["conversation_id"]
+                if cid in content_hits:
+                    continue   # 既により新しい行（id DESC の先頭）で確定済み
+                snippet = _search_snippet(mr["content"], q) or _search_snippet(mr["headline"], q)
+                if snippet is not None:
+                    content_hits[cid] = snippet
         out = []
         for r in rows:
-            forked_from = None
-            if r["forked_at"] is not None:
-                forked_from = {"share_id": r["forked_from_share_id"], "user_id": r["forked_from_user_id"],
-                              "name": r["forked_from_name"], "at": r["forked_at"]}
-            out.append({k: v for k, v in r.items()
-                       if k not in ("forked_from_share_id", "forked_from_user_id", "forked_from_name", "forked_at")}
-                      | {"forked_from": forked_from})
+            row = _public_conversation_row(r)
+            title_snippet = _search_snippet(row["title"] or "", q)
+            if title_snippet is not None:
+                row["match"] = {"where": "title", "snippet": title_snippet}
+            else:
+                msg_src = msg_src_by_cid.get(r["id"])
+                snippet = content_hits.get(msg_src) if msg_src is not None else None
+                if snippet is None:
+                    continue   # タイトル不一致かつ本文不一致
+                row["match"] = {"where": "message", "snippet": snippet}
+            out.append(row)
         return out
 
 
@@ -216,6 +330,21 @@ def get_session_id(conversation_id) -> str | None:
         row = c.execute(
             "SELECT codex_session_id FROM conversations WHERE id=%s", (conversation_id,)).fetchone()
         return row["codex_session_id"] if row else None
+
+
+def get_codex_usage_total(conversation_id) -> dict | None:
+    """会話の直近 assistant メッセージが記録した Codex 累計 usage（`answer->'codex_usage_total'`）。
+
+    行が無い/該当メッセージが無い/未設定なら None（chat_service はこれを
+    `Ctx.codex_usage_prev_total` に渡すだけで、CodexProvider がターン差分の判定に使う）。
+    """
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "SELECT answer->'codex_usage_total' AS codex_usage_total FROM messages "
+            "WHERE conversation_id=%s AND role='assistant' "
+            "ORDER BY id DESC LIMIT 1", (conversation_id,)).fetchone()
+        return row["codex_usage_total"] if row else None
 
 
 def owns_conversation(uid, cid) -> bool:

@@ -19,7 +19,7 @@ from mock_api import SYSTEM_SETTINGS_VIEW, USER_MEMBER, install_api_mocks
 
 
 def open_tab(page, key):
-    """管理画面の5タブ（プロバイダ＋接続先/使えるモデル/取り込み/利用量/外部連携）のうち `key` を表に出す。
+    """管理画面の設定タブのうち `key` を表に出す。
     既定で表示されている「プロバイダ＋接続先」（"provider"）以外の要素を操作する e2e は、
     アクション（click/fill/select_option 等）の actionability チェック（可視であること）を
     満たすため、操作前に必ずこれを呼ぶ。"""
@@ -145,8 +145,7 @@ def test_admin_settings_ingest_tab_reset_sends_null_for_arms_legacy_vlm_and_rag_
         page, web_base_url):
     """「すべて既定に戻す」はタブ単位（カードごとの個別 reset ボタンはこのタブ共通の1つに
     統合済み）。「取り込み」タブのリセットは arms_enabled・legacy_backend・vlm・rag_llm_render
-    （L5・U1）・agentic_budget_per_result・agentic_budget_total（BUDGET-1・§3.4）・
-    model_context_windows（BUDGET-2・§3.4）の7キーをまとめて null で送る。"""
+    の4キーをまとめて null で送る。調査用の情報量設定は含めない。"""
     from playwright.sync_api import expect
 
     records = install_api_mocks(page)
@@ -157,8 +156,7 @@ def test_admin_settings_ingest_tab_reset_sends_null_for_arms_legacy_vlm_and_rag_
     expect(page.locator("#tab-reset-res-ingest")).to_contain_text("既定に戻しました")
     assert records["admin_settings_put"][-1] == {
         "arms_enabled": None, "legacy_backend": None, "vlm": None, "rag_llm_render": None,
-        "agentic_budget_per_result": None, "agentic_budget_total": None,
-        "model_context_windows": None}
+    }
 
 
 def test_admin_settings_rag_llm_render_card_shows_plain_language_and_cost_notice(page, web_base_url):
@@ -252,7 +250,7 @@ def test_agentic_budget_card_renders_unset_state(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     expect(page.locator("#agentic-budget-per-result")).to_have_value("")
     expect(page.locator("#agentic-budget-per-result-hint")).to_contain_text("未設定です")
@@ -270,7 +268,7 @@ def test_agentic_budget_card_renders_configured_values_in_kb(page, web_base_url)
         "configured": 256000, "effective": 256000, "default": 262144}
     install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     expect(page.locator("#agentic-budget-per-result")).to_have_value("250")
     expect(page.locator("#agentic-budget-per-result-hint")).to_contain_text("で固定中です")
@@ -282,7 +280,7 @@ def test_agentic_budget_card_save_sends_kb_converted_to_bytes(page, web_base_url
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     page.locator("#agentic-budget-per-result").fill("500")
     page.locator("#save").click()
@@ -303,7 +301,7 @@ def test_agentic_budget_card_clear_field_sends_null(page, web_base_url):
         "configured": 2_000_000, "effective": 2_000_000, "default": 4194304}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
     expect(page.locator("#agentic-budget-total")).to_have_value(str(round(2_000_000 / 1024)))
 
     page.locator("#agentic-budget-total").fill("")
@@ -320,13 +318,13 @@ def test_agentic_budget_card_save_rejects_out_of_range_client_side(page, web_bas
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     page.locator("#agentic-budget-per-result").fill("8193")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text(
-        "検索結果1件あたりの上限は1〜8192（KB）の整数で指定してください")
+        "ツール結果1件あたりの上限は1〜8192（KB）の整数で指定してください")
     assert records["admin_settings_put"] == []
 
 
@@ -336,13 +334,13 @@ def test_agentic_budget_card_save_rejects_zero_client_side(page, web_base_url):
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     page.locator("#agentic-budget-total").fill("0")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text(
-        "1回の検索全体の上限は4〜65536（KB）の整数で指定してください")
+        "追加調査1回の累計上限は4〜65536（KB）の整数で指定してください")
     assert records["admin_settings_put"] == []
 
 
@@ -358,15 +356,15 @@ def test_agentic_budget_card_highlight_differs_from_default(page, web_base_url):
         "configured": 100_000, "effective": 100_000, "default": 262144}
     install_api_mocks(page, system_settings=settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     expect(page.locator("#agentic-budget-per-result")).to_have_class(re.compile(r"\bcfg-changed\b"))
     expect(page.locator("#agentic-budget-total")).not_to_have_class(re.compile(r"\bcfg-changed\b"))
 
 
-def test_agentic_budget_card_reset_tab_included_in_ingest_reset(page, web_base_url):
-    """「取り込み」タブの「既定に戻す」は agentic_budget_per_result/agentic_budget_total も
-    まとめて null で送る（他の4キーと同じ1つのボタン）。"""
+def test_agentic_budget_card_reset_tab_included_in_research_reset(page, web_base_url):
+    """「調査・回答」タブの「既定に戻す」は agentic_budget_per_result/agentic_budget_total も
+    まとめて null で送る（他の調査設定と同じ1つのボタン）。"""
     from playwright.sync_api import expect
     import mock_api
 
@@ -375,11 +373,11 @@ def test_agentic_budget_card_reset_tab_included_in_ingest_reset(page, web_base_u
         "configured": 100_000, "effective": 100_000, "default": 262144}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
     expect(page.locator("#agentic-budget-per-result")).to_have_value(str(round(100_000 / 1024)))
 
-    page.locator('[data-reset-tab="ingest"]').click()
-    expect(page.locator("#tab-reset-res-ingest")).to_contain_text("既定に戻しました")
+    page.locator('[data-reset-tab="research"]').click()
+    expect(page.locator("#tab-reset-res-research")).to_contain_text("既定に戻しました")
     put = records["admin_settings_put"][-1]
     assert put["agentic_budget_per_result"] is None
     assert put["agentic_budget_total"] is None
@@ -396,10 +394,10 @@ def test_agentic_budget_window_unknown_shows_plain_language_notice(page, web_bas
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     expect(page.locator("#agentic-budget-window-unknown")).to_be_visible()
-    expect(page.locator("#agentic-budget-window-unknown")).to_contain_text("一度に読める量が未登録です")
+    expect(page.locator("#agentic-budget-window-unknown")).to_contain_text("コンテキスト上限を判定できない")
     expect(page.locator("#agentic-budget-window-status")).to_contain_text("現在のモデル")
 
 
@@ -415,7 +413,7 @@ def test_agentic_budget_window_resolved_shows_tokens_source_and_cap(page, web_ba
         "source": "seed", "derived_cap_bytes": 96_000}
     install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "research")
 
     status = page.locator("#agentic-budget-window-status")
     expect(status).to_contain_text("gpt-4o-mini")
@@ -435,7 +433,7 @@ def test_model_windows_table_renders_registered_rows(page, web_base_url):
         "configured": {"openai:gpt-4o": 128000, "ollama:qwen2.5": 32768}}
     install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "models")
 
     rows = page.locator("#agentic-model-windows-rows tr")
     expect(rows).to_have_count(2)
@@ -451,7 +449,7 @@ def test_model_windows_table_add_row_and_save_sends_new_entry(page, web_base_url
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "models")
 
     page.locator("#agentic-model-windows-add").click()
     row = page.locator("#agentic-model-windows-rows tr").last
@@ -475,7 +473,7 @@ def test_model_windows_table_delete_row_and_save_sends_remaining(page, web_base_
         "configured": {"openai:gpt-4o": 128000}}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "models")
     expect(page.locator("#agentic-model-windows-rows tr")).to_have_count(1)
 
     page.locator("#agentic-model-windows-rows .mw-remove").click()
@@ -493,7 +491,7 @@ def test_model_windows_table_save_rejects_invalid_tokens_client_side(page, web_b
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "models")
 
     page.locator("#agentic-model-windows-add").click()
     row = page.locator("#agentic-model-windows-rows tr").last
@@ -505,8 +503,8 @@ def test_model_windows_table_save_rejects_invalid_tokens_client_side(page, web_b
     assert records["admin_settings_put"] == []
 
 
-def test_model_windows_table_included_in_ingest_reset(page, web_base_url):
-    """「取り込み」タブの「既定に戻す」は model_context_windows も null で送る。"""
+def test_model_windows_table_included_in_models_reset(page, web_base_url):
+    """「使えるモデル」タブの「既定に戻す」は model_context_windows も null で送る。"""
     from playwright.sync_api import expect
     import mock_api
 
@@ -515,10 +513,10 @@ def test_model_windows_table_included_in_ingest_reset(page, web_base_url):
         "configured": {"openai:gpt-4o": 128000}}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "ingest")
+    open_tab(page, "models")
 
-    page.locator('[data-reset-tab="ingest"]').click()
-    expect(page.locator("#tab-reset-res-ingest")).to_contain_text("既定に戻しました")
+    page.locator('[data-reset-tab="models"]').click()
+    expect(page.locator("#tab-reset-res-models")).to_contain_text("既定に戻しました")
     put = records["admin_settings_put"][-1]
     assert put["model_context_windows"] is None
     expect(page.locator("#agentic-model-windows-rows tr")).to_have_count(0)
@@ -1020,6 +1018,23 @@ def test_admin_settings_vlm_save_without_touching_omits_vlm(page, web_base_url):
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
     assert "vlm" not in records["admin_settings_put"][-1]
+
+
+def test_admin_settings_missing_tool_limit_shows_error_in_usage_tab(page, web_base_url):
+    """更新前サーバーの応答で描画が止まっても、利用統計AIタブを空白にしない。"""
+    from copy import deepcopy
+
+    from playwright.sync_api import expect
+
+    view = deepcopy(SYSTEM_SETTINGS_VIEW)
+    del view['agentic_tool_limit']
+    records = install_api_mocks(page, system_settings=view)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, 'usage')
+    expect(page.locator('#tabpanel-usage [role="alert"]')).to_contain_text('設定を読み込めませんでした')
+    expect(page.locator('#save')).to_be_disabled()
+    expect(page.locator('[data-reset-tab="usage"]')).to_be_disabled()
+    assert not records['admin_settings_put']
 
 
 def test_admin_settings_usage_chat_ai_radio_toggle(page, web_base_url):
@@ -3409,7 +3424,86 @@ def test_admin_settings_usage_chat_ai_invalid_sentinel_not_keyboard_or_ax_reacha
         "末尾から ArrowDown で循環する時、センチネルではなく実在するラジオへ戻るはず"
 
 
-# ===== SC-6c: 調べる深さの基準値（調べ方ブロック §3.2・「プロバイダ＋接続先」タブの追加カード） =====
+# ===== SC-6c: 調べる深さの基準値（調べ方ブロック §3.2・「調査・回答」タブのカード） =====
+
+def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    expect(page.locator('#tabpanel-provider [id^="depth-base-"]')).to_have_count(0)
+    expect(page.locator('#codex-investigation-card #depth-base-codex-reasoning')).to_be_visible()
+    expect(page.locator('#api-investigation-card #depth-base-max-turns')).to_be_visible()
+    expect(page.locator('#search-investigation-card #depth-base-impact-depth')).to_have_count(1)
+    page.locator('#agentic-max-tools-per-turn').fill('6')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    expect(page.locator('#tab-dot-provider')).to_be_hidden()
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'agentic_max_tools_per_turn': 6}
+    page.reload()
+    expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('6')
+    expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('固定中')
+
+
+def test_research_reset_preserves_provider_draft(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    page.locator('#cloud-key').fill('sk-test-unsaved')
+    open_tab(page, 'research')
+    page.locator('#agentic-max-tools-per-turn').fill('5')
+    page.locator('#depth-base-codex-reasoning').select_option('high')
+    page.locator('[data-reset-tab="research"]').click()
+    expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
+    body = records['admin_settings_put'][-1]
+    assert len(body) == 10 and all(value is None for value in body.values())
+    assert 'openai_api_key' not in body and 'cloud_provider' not in body
+    expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')
+    expect(page.locator('#tab-dot-research')).to_be_hidden()
+    open_tab(page, 'provider')
+    expect(page.locator('#cloud-key')).to_have_value('sk-test-unsaved')
+    expect(page.locator('#tab-dot-provider')).to_be_visible()
+
+
+def test_provider_reset_preserves_research_draft(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    page.locator('#depth-base-max-turns').fill('20')
+    page.locator('#agentic-max-tools-per-turn').fill('5')
+    open_tab(page, 'provider')
+    page.locator('[data-reset-tab="provider"]').click()
+    expect(page.locator('#tab-reset-res-provider')).to_contain_text('既定に戻しました')
+    assert not any(key.startswith('depth_base_') for key in records['admin_settings_put'][-1])
+    assert 'agentic_max_tools_per_turn' not in records['admin_settings_put'][-1]
+    open_tab(page, 'research')
+    expect(page.locator('#depth-base-max-turns')).to_have_value('20')
+    expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('5')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'depth_base_max_turns': 20, 'agentic_max_tools_per_turn': 5}
+
+
+def test_research_tool_limit_rejects_out_of_range_and_can_clear(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    page.locator('#agentic-max-tools-per-turn').fill('257')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('1〜256')
+    assert not records['admin_settings_put']
+    page.locator('#agentic-max-tools-per-turn').fill('3')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    page.locator('#agentic-max-tools-per-turn').fill('')
+    page.locator('#save').click()
+    expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('未設定')
+    assert records['admin_settings_put'][-1] == {'agentic_max_tools_per_turn': None}
 
 def test_depth_profile_card_renders_unset_state(page, web_base_url):
     """未設定（既定モック）は全欄が空欄・ヒントは組み込み既定を案内する。Codex 推論レベルは
@@ -3419,6 +3513,7 @@ def test_depth_profile_card_renders_unset_state(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     expect(page.locator("#depth-base-max-turns")).to_have_value("")
     expect(page.locator("#depth-base-max-turns-hint")).to_contain_text("未設定です")
@@ -3438,6 +3533,7 @@ def test_depth_profile_card_renders_configured_values(page, web_base_url):
         "options": ["minimal", "low", "medium", "high", "xhigh"]}
     install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     expect(page.locator("#depth-base-max-turns")).to_have_value("20")
     expect(page.locator("#depth-base-max-turns-hint")).to_contain_text("この値で固定中")
@@ -3451,6 +3547,7 @@ def test_depth_profile_card_save_sends_changed_fields_only(page, web_base_url):
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     page.locator("#depth-base-max-turns").fill("30")
     page.locator("#depth-base-codex-reasoning").select_option("xhigh")
@@ -3472,6 +3569,7 @@ def test_depth_profile_card_clear_field_sends_null(page, web_base_url):
     system_settings["depth_profile"]["read_window"] = {"configured": 80, "effective": 80, "default": 40}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
     expect(page.locator("#depth-base-read-window")).to_have_value("80")
 
     page.locator("#depth-base-read-window").fill("")
@@ -3494,6 +3592,7 @@ def test_depth_profile_card_codex_reasoning_standalone_reset_sends_null_only(pag
         "options": ["minimal", "low", "medium", "high", "xhigh"]}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
     expect(page.locator("#depth-base-codex-reasoning")).to_have_value("high")
 
     page.locator("#depth-base-codex-reasoning").select_option("")
@@ -3506,7 +3605,7 @@ def test_depth_profile_card_codex_reasoning_standalone_reset_sends_null_only(pag
 
 
 def test_depth_profile_card_reset_tab_nulls_all_seven_fields(page, web_base_url):
-    """「このタブを既定に戻す」（プロバイダ＋接続先タブ）は調べる深さの基準値7項目も対象に含む。"""
+    """「このタブを既定に戻す」（調査・回答タブ）は調べる深さの基準値7項目も対象に含む。"""
     from playwright.sync_api import expect
     import mock_api
 
@@ -3514,10 +3613,11 @@ def test_depth_profile_card_reset_tab_nulls_all_seven_fields(page, web_base_url)
     system_settings["depth_profile"]["max_turns"] = {"configured": 20, "effective": 20, "default": 12}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
     expect(page.locator("#depth-base-max-turns")).to_have_value("20")
 
-    page.locator('[data-reset-tab="provider"]').click()
-    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定に戻しました")
+    page.locator('[data-reset-tab="research"]').click()
+    expect(page.locator("#tab-reset-res-research")).to_contain_text("既定に戻しました")
     expect(page.locator("#depth-base-max-turns")).to_have_value("")
 
     body = records["admin_settings_put"][-1]
@@ -3599,6 +3699,7 @@ def test_admin_settings_put_normalizes_and_saves_codex_reasoning_case_and_whites
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     status = page.evaluate("""
         async () => {
@@ -3625,6 +3726,7 @@ def test_admin_settings_put_returns_422_for_out_of_range_depth_base(page, web_ba
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     status = page.evaluate("""
         async () => {
@@ -3649,6 +3751,7 @@ def test_depth_profile_card_save_rejects_out_of_range_client_side(page, web_base
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     page.locator("#depth-base-max-turns").fill("201")
     page.locator("#save").click()
@@ -3663,11 +3766,127 @@ def test_depth_profile_card_save_rejects_zero_client_side(page, web_base_url):
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "research")
 
     page.locator("#depth-base-troubleshoot-depth").fill("0")
     page.locator("#save").click()
 
-    expect(page.locator("#msg")).to_contain_text("原因を調べる近傍の深さは1〜16の整数で指定してください")
+    expect(page.locator("#msg")).to_contain_text("原因調査でたどる段数は1〜16の整数で指定してください")
+    assert records["admin_settings_put"] == []
+
+
+# ===== 同時実行の上限（`sherpa/chat_turns.py::effective_limits`・「調査・回答」タブのカード）=====
+
+def test_chat_max_turns_card_renders_unset_state(page, web_base_url):
+    """未設定（既定モック）は両欄とも空欄・ヒントは env 既定値を案内する。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html")
+
+    expect(page.locator("#chat-max-turns-per-user")).to_have_value("")
+    expect(page.locator("#chat-max-turns-per-user-hint")).to_contain_text("未設定です")
+    expect(page.locator("#chat-max-turns-global")).to_have_value("")
+    expect(page.locator("#chat-max-turns-global-hint")).to_contain_text("未設定です")
+
+
+def test_chat_max_turns_card_renders_configured_values(page, web_base_url):
+    """管理者が既に保存済みの上限は、各欄に生値（configured）が表示される。"""
+    from playwright.sync_api import expect
+    import mock_api
+
+    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    system_settings["chat_max_turns"]["per_user"] = {"configured": 5, "effective": 5, "default": 2}
+    install_api_mocks(page, system_settings=system_settings)
+    page.goto(f"{web_base_url}/admin-settings.html")
+
+    expect(page.locator("#chat-max-turns-per-user")).to_have_value("5")
+    expect(page.locator("#chat-max-turns-per-user-hint")).to_contain_text("この値で固定中")
+
+
+def test_chat_max_turns_card_save_sends_changed_fields_only(page, web_base_url):
+    """変更した項目だけを PUT body に含める（触っていない項目は送らない・他タブと同じダーティ判定）。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html")
+
+    page.locator("#chat-max-turns-per-user").fill("5")
+    page.locator("#save").click()
+
+    expect(page.locator("#msg")).to_contain_text("保存しました")
+    body = records["admin_settings_put"][-1]
+    assert body.get("chat_max_turns_per_user") == 5
+    assert "chat_max_turns_global" not in body   # 触っていない項目は送らない
+
+
+def test_chat_max_turns_card_clear_field_sends_null(page, web_base_url):
+    """既に設定済みの欄を空欄に戻して保存すると null（未設定へ戻す）を送る。"""
+    from playwright.sync_api import expect
+    import mock_api
+
+    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    system_settings["chat_max_turns"]["global"] = {"configured": 30, "effective": 30, "default": 8}
+    records = install_api_mocks(page, system_settings=system_settings)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    expect(page.locator("#chat-max-turns-global")).to_have_value("30")
+
+    page.locator("#chat-max-turns-global").fill("")
+    page.locator("#save").click()
+
+    expect(page.locator("#msg")).to_contain_text("保存しました")
+    assert records["admin_settings_put"][-1].get("chat_max_turns_global") is None
+
+
+def test_chat_max_turns_card_reset_tab_nulls_both_fields(page, web_base_url):
+    """「このタブを既定に戻す」（プロバイダ＋接続先タブ）は同時実行の上限2項目も対象に含む。"""
+    from playwright.sync_api import expect
+    import mock_api
+
+    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    system_settings["chat_max_turns"]["per_user"] = {"configured": 5, "effective": 5, "default": 2}
+    records = install_api_mocks(page, system_settings=system_settings)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    expect(page.locator("#chat-max-turns-per-user")).to_have_value("5")
+
+    page.locator('[data-reset-tab="provider"]').click()
+    expect(page.locator("#tab-reset-res-provider")).to_contain_text("既定に戻しました")
+    expect(page.locator("#chat-max-turns-per-user")).to_have_value("")
+
+    body = records["admin_settings_put"][-1]
+    assert body.get("chat_max_turns_per_user") is None
+    assert body.get("chat_max_turns_global") is None
+
+
+def test_mock_validate_chat_max_turns_rejects_out_of_range_and_accepts_boundary_and_null():
+    """mock の 422 契約を実サーバの範囲（`SystemSettingsReq` の Field(ge,le)＝1〜16／1〜64）と
+    同じ境界で固定する（負値・0・上限+1は拒否・境界値と null は受理）。"""
+    import mock_api
+
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_per_user": -1}) is not None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_per_user": 0}) is not None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_per_user": 17}) is not None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_global": 65}) is not None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_per_user": 1}) is None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_per_user": 16}) is None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_global": 1}) is None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_global": 64}) is None
+    assert mock_api._mock_validate_chat_max_turns({"chat_max_turns_per_user": None}) is None
+
+
+def test_chat_max_turns_card_save_rejects_out_of_range_client_side(page, web_base_url):
+    """保存ボタン押下時、サーバと同じ範囲を超える値は日本語エラーを表示して PUT 自体を送らない
+    （422 の配列表示が読めなくなる問題を未然に防ぐ・`validateDepthProfileInputs` と同じ流儀）。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html")
+
+    page.locator("#chat-max-turns-global").fill("65")
+    page.locator("#save").click()
+
+    expect(page.locator("#msg")).to_contain_text(
+        "同時に実行できる質問の数（全員の合計）は1〜64の整数で指定してください")
     assert records["admin_settings_put"] == []
 
 
@@ -3791,3 +4010,96 @@ def test_admin_users_embed_param_hides_own_nav(page, web_base_url):
     expect(page.locator("html")).to_have_class("embedded")
     expect(page.locator("sherpa-topbar")).to_be_hidden()
     expect(page.locator("#user-tbody tr").first).to_be_visible()
+
+
+def test_research_budget_draft_survives_ingest_reset(page, web_base_url):
+    """取り込みのリセットにモデル登録を含めず、別タブの情報量の未保存編集を残す。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, 'research')
+    page.locator('#agentic-budget-per-result').fill('512')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    expect(page.locator('#tab-dot-ingest')).to_be_hidden()
+    open_tab(page, 'ingest')
+    page.locator('[data-reset-tab="ingest"]').click()
+    expect(page.locator('#tab-reset-res-ingest')).to_contain_text('既定に戻しました')
+    assert 'agentic_budget_per_result' not in records['admin_settings_put'][-1]
+    assert 'model_context_windows' not in records['admin_settings_put'][-1]
+    open_tab(page, 'research')
+    expect(page.locator('#agentic-budget-per-result')).to_have_value('512')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1]['agentic_budget_per_result'] == 512 * 1024
+
+
+def test_model_windows_excludes_codex_and_preserves_existing_entry(page, web_base_url):
+    """新規登録はAPIだけ。保存済みCodexを別プロバイダへ誤変換しない。"""
+    from copy import deepcopy
+
+    from playwright.sync_api import expect
+
+    view = deepcopy(SYSTEM_SETTINGS_VIEW)
+    view['agentic_budget']['model_windows']['configured'] = {'codex:gpt-test': 128000}
+    records = install_api_mocks(page, system_settings=view)
+    page.goto(f'{web_base_url}/admin-settings.html')
+    open_tab(page, 'models')
+    saved = page.locator('#agentic-model-windows-rows tr').first
+    expect(saved.locator('.mw-provider')).to_have_value('codex')
+    expect(saved.locator('option[value="codex"]')).to_be_disabled()
+    expect(saved.locator('option[value="codex"]')).to_contain_text('適用対象外')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert 'model_context_windows' not in records['admin_settings_put'][-1]
+    page.locator('#agentic-model-windows-add').click()
+    added = page.locator('#agentic-model-windows-rows tr').last
+    expect(added.locator('option[value="codex"]')).to_have_count(0)
+    added.locator('.mw-model').fill('api-test')
+    added.locator('.mw-tokens').fill('64000')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1]['model_context_windows'] == {
+        'codex:gpt-test': 128000, 'openai:api-test': 64000,
+    }
+
+
+def test_codex_budget_window_is_not_applicable(page, web_base_url):
+    from copy import deepcopy
+
+    from playwright.sync_api import expect
+
+    view = deepcopy(SYSTEM_SETTINGS_VIEW)
+    view['agentic_budget']['window'] = {
+        'provider': 'codex', 'model': '', 'source': 'unknown', 'window_tokens': None,
+    }
+    install_api_mocks(page, system_settings=view)
+    page.goto(f'{web_base_url}/admin-settings.html')
+    open_tab(page, 'research')
+    expect(page.locator('#agentic-budget-window-status')).to_contain_text('Codex は対象外')
+    expect(page.locator('#agentic-budget-window-status')).not_to_contain_text('未設定')
+    expect(page.locator('#agentic-budget-window-unknown')).to_be_hidden()
+
+
+def test_model_window_draft_survives_research_reset(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f'{web_base_url}/admin-settings.html')
+    open_tab(page, 'models')
+    page.locator('#agentic-model-windows-add').click()
+    row = page.locator('#agentic-model-windows-rows tr').last
+    row.locator('.mw-model').fill('gpt-4o')
+    row.locator('.mw-tokens').fill('128000')
+    expect(page.locator('#tab-dot-models')).to_be_visible()
+    expect(page.locator('#tab-dot-research')).to_be_hidden()
+    open_tab(page, 'research')
+    page.locator('[data-reset-tab="research"]').click()
+    expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
+    assert 'model_context_windows' not in records['admin_settings_put'][-1]
+    open_tab(page, 'models')
+    expect(row.locator('.mw-tokens')).to_have_value('128000')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1]['model_context_windows'] == {'openai:gpt-4o': 128000}

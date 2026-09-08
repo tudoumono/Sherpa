@@ -180,9 +180,11 @@ def set_world_sig(world_id, sig, manifest=None, doc_count=None, scan_report=None
     ④ **manifest バックフィル**（`sync` の unchanged パス・lock 内で再読・署名一致を再確認した時のみ）。
     `manifest`＝rel→[mtime_ns,ctime_ns,size] の dict（差分チェック用）。None なら明細は更新しない。
     `doc_count`（外部公開 discovery の事前集計・`/ext/v1/capabilities` 用）は**③確定でのみ**渡す
-    （`_run_locked` の成功パス・`manifest` から `corpus_docs.manifest_doctype_count()` で算出した
-    doctype 対応原本件数——検索可能になった台帳行数〔`documents` テーブル〕とは別物で、変換され
-    ない legacy Office 等も含む）。`scan_report`（`corpus_docs.scan_report()` の結果・ING-2）も
+    （`_run_locked` の成功パスが直前に計算済みの `corpus_docs.scan_report()` の `document_count`
+    ——doctype 対応原本件数。検索可能になった台帳行数〔`documents` テーブル〕とは別物で、変換され
+    ない legacy Office 等も含む——をそのまま使う。`scan_report` 自体が失敗、または走査中にファイルが
+    増減した世代混在を検知した場合は `None`＝この列は更新せず前回値を保持する）。`scan_report`
+    （`corpus_docs.scan_report()` の結果・ING-2）も
     **③確定でのみ**渡す——sig 確定と**同一 UPDATE 文**へ含めることで、`GET /worlds/{wid}/status`
     が読むキャッシュ（`last_scan_report`/`_at`）を sig/doc_count と同じトランザクションで一斉に
     確定させる（「成功確定した世代の sig と集計が食い違う瞬間」を作らない）。

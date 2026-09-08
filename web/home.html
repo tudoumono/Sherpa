@@ -21,61 +21,64 @@
     opacity:.16;pointer-events:none}
   .home-hero>*{position:relative;z-index:1}
   .home-hero .txt{flex:1;min-width:240px}
-  .home-hero h1{font-size:26px;line-height:1.3;margin:0 0 8px}
-  .home-hero p{font-size:13.5px;color:var(--ink-2);margin:0;max-width:520px}
-  .home-cta{margin-top:16px;height:48px;padding:0 26px;font-size:15px;border-radius:999px;white-space:nowrap;
+  .home-hero h1{font-size:var(--text-heading);line-height:1.3;margin:0 0 8px}
+  .home-hero p{font-size:var(--text-label);color:var(--ink-2);margin:0;max-width:520px}
+  .home-cta{margin-top:16px;height:48px;padding:0 26px;font-size:var(--text-body);border-radius:999px;white-space:nowrap;
     display:inline-flex;align-items:center;gap:8px;text-decoration:none}
-  .section-title{font-size:14px;font-weight:700;margin:0 0 12px;color:var(--ink)}
+  .section-title{font-size:var(--text-body);font-weight:700;margin:0 0 12px;color:var(--ink)}
   /* 投稿フォーム（admin のみ・既定は折りたたみ） */
   .post-form-toggle{margin-bottom:20px}
   .post-card{margin-bottom:20px}
-  .post-card h2{font-size:14px;font-weight:700;margin:0 0 12px}
+  .post-card h2{font-size:var(--text-body);font-weight:700;margin:0 0 12px}
   .pform{display:flex;flex-direction:column;gap:10px}
   .pform-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
   .pform-row .spacer{flex:1}
-  .pform label{display:block;font-size:11.5px;font-weight:600;color:var(--ink-3);margin-bottom:4px}
+  .pform label{display:block;font-size:var(--text-caption);font-weight:600;color:var(--ink-3);margin-bottom:4px}
   .pform input[type=text],.pform input[type=datetime-local],.pform select,.pform textarea{width:100%;box-sizing:border-box;padding:8px 10px;
-    border:1px solid var(--border);border-radius:var(--radius-sm);font-family:inherit;font-size:13px;
+    border:1px solid var(--control-border);border-radius:var(--radius-sm);font-family:inherit;font-size:var(--text-label);
     background:var(--surface);color:var(--ink)}
   .pform textarea{min-height:90px;resize:vertical;line-height:1.6}
   .pform .col-title{flex:2;min-width:220px}
   .pform .col-cat{flex:1;min-width:140px}
-  .pform-err{font-size:12px;color:var(--danger);min-height:16px}
+  .pform-err{font-size:var(--text-small);color:var(--danger);min-height:16px}
   /* ダークテーマではネイティブのカレンダーアイコンも明色側に切り替える（背景に対して読める配色にする）。 */
   [data-theme="dark"] .pform input[type=datetime-local]{color-scheme:dark}
   /* お知らせ一覧 */
   .ann{padding:16px 18px;border-bottom:1px solid var(--border)}
   .ann:last-child{border-bottom:none}
   .ann-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
-  .ann-title{font-weight:700;font-size:14.5px;flex:1;min-width:120px}
-  .ann-date{font-size:11.5px;color:var(--ink-3);white-space:nowrap}
-  .ann-body{font-size:13.5px;line-height:1.75;color:var(--ink-2)}
-  .cat-badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
+  .ann-title{font-weight:700;font-size:var(--text-body);flex:1;min-width:120px}
+  .ann-date{font-size:var(--text-caption);color:var(--ink-3);white-space:nowrap}
+  .ann-body{font-size:var(--text-label);line-height:1.75;color:var(--ink-2)}
+  .cat-badge{font-size:var(--text-caption);font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
   .cat-maintenance{background:var(--warn-bg);color:var(--warn)}
   .cat-case{background:var(--ok-bg);color:var(--ok)}
   .cat-notice{background:var(--surface-2);color:var(--ink-3)}
   .pin{color:var(--accent-ink)}
-  .unpub-badge{font-size:10.5px;color:var(--ink-3);background:var(--surface-2);border:1px solid var(--border);
+  .unpub-badge{font-size:var(--text-caption);color:var(--ink-3);background:var(--surface-2);border:1px solid var(--border);
     border-radius:5px;padding:1px 6px}
   .ann-admin{display:flex;gap:8px;margin-top:10px}
-  .ann-admin .act-btn{height:26px;padding:0 9px;border-radius:6px;border:1px solid var(--border);
-    background:var(--surface-2);font-size:11.5px;color:var(--ink-2);cursor:pointer}
+  .ann-admin .act-btn{min-height:36px;padding:0 9px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-2);font-size:var(--text-caption);color:var(--ink-2);cursor:pointer}
   .ann-admin .act-btn:hover{background:var(--surface)}
   .ann-admin .act-btn.danger{color:var(--danger);border-color:var(--danger)}
-  .ann-empty{padding:30px;text-align:center;color:var(--ink-3);font-size:13px}
+  .ann-empty{padding:30px;text-align:center;color:var(--ink-3);font-size:var(--text-label)}
   /* 通知（NOTIFY-1・掲示板とは別区画・平文・既読管理なし） */
   .notif{padding:14px 18px;border-bottom:1px solid var(--border)}
   .notif:last-child{border-bottom:none}
   .notif-head{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap}
-  .notif-icon{font-size:14px}
-  .notif-world{font-weight:700;font-size:13.5px}
-  .notif-date{font-size:11.5px;color:var(--ink-3);white-space:nowrap;margin-left:auto}
-  .notif-body{font-size:13px;line-height:1.6;color:var(--ink-2)}
+  .notif-icon{font-size:var(--text-body)}
+  .notif-world{font-weight:700;font-size:var(--text-label)}
+  .notif-date{font-size:var(--text-caption);color:var(--ink-3);white-space:nowrap;margin-left:auto}
+  .notif-body{font-size:var(--text-label);line-height:1.6;color:var(--ink-2)}
   .notif-actions{margin-top:8px}
-  .notif-actions .act-btn{height:26px;padding:0 10px;border-radius:6px;border:1px solid var(--border);
-    background:var(--surface-2);font-size:11.5px;color:var(--ink-2);cursor:pointer}
+  .notif-actions .act-btn{min-height:36px;padding:0 10px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-2);font-size:var(--text-caption);color:var(--ink-2);cursor:pointer}
   .notif-actions .act-btn:hover{background:var(--surface)}
   .notif-actions .act-btn:disabled{opacity:.6;cursor:default}
+  .section-title,.post-card h2{font-size:var(--text-section)}
+  .ann-body{font-size:var(--text-body)}
+  .pform label{font-size:var(--text-small)}
 </style>
 </head>
 <body>

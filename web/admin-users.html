@@ -18,36 +18,36 @@
   /* フィルターバー（audit.html と同じ流儀） */
   .filter-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding:12px 14px 4px}
   .filter-bar .ff{display:flex;flex-direction:column;gap:3px}
-  .filter-bar label{font-size:11.5px;font-weight:600;color:var(--ink-3)}
-  .filter-bar input,.filter-bar select{padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
-    font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink);height:36px;box-sizing:border-box}
+  .filter-bar label{font-size:var(--text-caption);font-weight:600;color:var(--ink-3)}
+  .filter-bar input,.filter-bar select{padding:7px 10px;border:1px solid var(--control-border);border-radius:var(--radius-sm);
+    font-family:inherit;font-size:var(--text-label);background:var(--surface);color:var(--ink);height:36px;box-sizing:border-box}
   .filter-bar input{width:240px}
-  table{width:100%;border-collapse:collapse;font-size:13.5px}
-  th{text-align:left;font-size:12px;font-weight:600;color:var(--ink-3);padding:8px 12px;
+  table{width:100%;border-collapse:collapse;font-size:var(--text-label)}
+  th{text-align:left;font-size:var(--text-small);font-weight:600;color:var(--ink-3);padding:8px 12px;
     border-bottom:2px solid var(--border);white-space:nowrap}
   td{padding:9px 12px;border-bottom:1px solid var(--border);color:var(--ink);vertical-align:middle}
   tr:hover td{background:var(--surface-2)}
-  .badge-admin{display:inline-block;font-size:10px;font-weight:700;color:var(--accent-ink);
+  .badge-admin{display:inline-block;font-size:var(--text-caption);font-weight:700;color:var(--accent-ink);
     background:var(--accent-weak);border-radius:4px;padding:1px 6px}
-  .badge-user{display:inline-block;font-size:10px;color:var(--ink-3);background:var(--surface-2);
+  .badge-user{display:inline-block;font-size:var(--text-caption);color:var(--ink-3);background:var(--surface-2);
     border-radius:4px;padding:1px 6px;border:1px solid var(--border)}
-  .badge-disabled{display:inline-block;font-size:10px;color:var(--danger);background:var(--danger-bg);
+  .badge-disabled{display:inline-block;font-size:var(--text-caption);color:var(--danger);background:var(--danger-bg);
     border-radius:4px;padding:1px 6px}
-  .badge-pending{display:inline-block;font-size:10px;color:var(--warn);background:var(--warn-bg);
+  .badge-pending{display:inline-block;font-size:var(--text-caption);color:var(--warn);background:var(--warn-bg);
     border-radius:4px;padding:1px 6px}
-  .act-btn{height:28px;padding:0 10px;border-radius:6px;border:1px solid var(--border);
-    background:var(--surface-2);font-size:12px;color:var(--ink-2);cursor:pointer}
+  .act-btn{min-height:36px;padding:0 10px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-2);font-size:var(--text-small);color:var(--ink-2);cursor:pointer}
   .act-btn:hover{background:var(--surface);color:var(--ink)}
   .act-btn.danger{color:var(--danger);border-color:var(--danger)}
   /* 新規ユーザーフォーム */
   .create-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
     padding:20px 22px;margin-bottom:20px}
-  .create-card h2{font-size:14px;font-weight:700;margin:0 0 14px}
+  .create-card h2{font-size:var(--text-body);font-weight:700;margin:0 0 14px}
   .cform{display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:10px;align-items:end}
-  .cform label{display:block;font-size:11.5px;font-weight:600;color:var(--ink-3);margin-bottom:4px}
-  .cform input,.cform select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);
-    border-radius:var(--radius-sm);font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink)}
-  .cform-err{font-size:12px;color:var(--danger);margin-top:8px;min-height:16px}
+  .cform label{display:block;font-size:var(--text-caption);font-weight:600;color:var(--ink-3);margin-bottom:4px}
+  .cform input,.cform select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--control-border);
+    border-radius:var(--radius-sm);font-family:inherit;font-size:var(--text-label);background:var(--surface);color:var(--ink)}
+  .cform-err{font-size:var(--text-small);color:var(--danger);margin-top:8px;min-height:16px}
   /* ダイアログ */
   .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;
     justify-content:center;z-index:200}
@@ -55,17 +55,20 @@
   .modal{background:var(--surface);border-radius:var(--radius);padding:26px 28px;width:340px;
     box-shadow:var(--shadow-lg);position:relative;left:auto;top:auto;transform:none;
     border:1px solid var(--border);overflow:visible}
-  .modal h2{font-size:14px;font-weight:700;margin:0 0 14px}
-  .modal label{display:block;font-size:12px;font-weight:600;color:var(--ink-2);margin:10px 0 4px}
-  .modal input,.modal select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border);
-    border-radius:var(--radius-sm);font-family:inherit;font-size:13px;background:var(--surface);color:var(--ink)}
-  .modal-err{font-size:12px;color:var(--danger);margin-top:6px;min-height:14px}
+  .modal h2{font-size:var(--text-body);font-weight:700;margin:0 0 14px}
+  .modal label{display:block;font-size:var(--text-small);font-weight:600;color:var(--ink-2);margin:10px 0 4px}
+  .modal input,.modal select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--control-border);
+    border-radius:var(--radius-sm);font-family:inherit;font-size:var(--text-label);background:var(--surface);color:var(--ink)}
+  .modal-err{font-size:var(--text-small);color:var(--danger);margin-top:6px;min-height:14px}
   .modal-actions{display:flex;gap:10px;margin-top:16px}
-  .modal-close{position:absolute;top:12px;right:14px;background:none;border:none;font-size:17px;
+  .modal-close{position:absolute;top:12px;right:14px;background:none;border:none;font-size:var(--text-section);
     color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
   .modal-close:hover{background:var(--surface-2)}
-  .modal-note{font-size:11.5px;color:var(--ink-3);line-height:1.5;margin:2px 0 4px}
+  .modal-note{font-size:var(--text-caption);color:var(--ink-3);line-height:1.5;margin:2px 0 4px}
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+  #table-wrap{overflow:auto}
+  @media(max-width:1100px){.cform{grid-template-columns:repeat(2,minmax(0,1fr))}.cform > button{justify-self:start}}
+  @media(max-width:520px){.cform{grid-template-columns:minmax(0,1fr)}}
 </style>
 </head>
 <body>
@@ -74,8 +77,8 @@
 <div class="wrap">
   <div id="access-denied">
     <div style="font-size:32px;margin-bottom:12px">🚫</div>
-    <div style="font-size:16px;font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
-    <div style="font-size:13px">管理者権限が必要です。</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
   </div>
   <div id="main-content">
     <div class="pagehead">
@@ -119,7 +122,7 @@
       <div class="card">
         <div class="card-head" style="display:flex;align-items:center;gap:10px">
           ユーザー一覧
-          <span class="muted" id="user-count" style="font-size:12px"></span>
+          <span class="muted" id="user-count" style="font-size:var(--text-small)"></span>
         </div>
         <div class="filter-bar">
           <div class="ff">
@@ -149,7 +152,7 @@
             </thead>
             <tbody id="user-tbody"></tbody>
           </table>
-          <div id="table-empty" style="display:none;padding:20px;text-align:center;color:var(--ink-3);font-size:13px">ユーザーはまだいません</div>
+          <div id="table-empty" style="display:none;padding:20px;text-align:center;color:var(--ink-3);font-size:var(--text-label)">ユーザーはまだいません</div>
         </div>
       </div>
     </div>

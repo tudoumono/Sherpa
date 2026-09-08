@@ -78,7 +78,7 @@ REQUIRED_NAMES = (
     "_gather", "CodexProvider", "HeuristicProvider", "OpenAIProvider",
     "OllamaProvider", "GeminiProvider", "_GenProvider", "_plain_run", "_facts",
     "_kb_hint", "_mcp_env", "_mcp_config_args", "_mcp_neighbors_from",
-    "_apply_codex_neighbors", "_authoring_lock", "_codex_ask_question",
+    "_apply_codex_neighbors", "_codex_ask_question",
     "_codex_ask_capture", "_codex_mcp_enabled", "_marp_bin", "_detect_chrome_path",
     "_select_provider", "_SKILLS_BASE",
 )

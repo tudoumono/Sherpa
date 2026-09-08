@@ -10,6 +10,8 @@ Ollama の function-calling で回す。範囲は **選択中の資料フォル�
 """
 from __future__ import annotations
 
+import concurrent.futures
+import contextvars
 import errno
 import json
 import logging
@@ -24,7 +26,7 @@ import time
 import urllib.error
 from pathlib import Path
 
-from . import citations, es_index, exec_event, grep_tool, llm, worlds
+from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
 from . import tools_pref as tools_pref_mod
@@ -93,6 +95,27 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
 # 設ける（既定16は通常のツール呼び出し数を十分上回るため正常系には影響しない）。
 # FIX-W: 負値でスライスが反転し上限が無効化されるため `_env_int` で範囲検証（hard cap 256）。
 MAX_TOOLS_PER_TURN = _env_int("SHERPA_AGENTIC_MAX_TOOLS_PER_TURN", 16, 1, 256)
+
+
+def effective_max_tools_per_turn(system_settings: dict) -> int:
+    """API の1応答内の実行上限。管理者の保存値を優先し、未設定なら既存の環境設定を使う。"""
+    configured = system_settings.get("agentic_max_tools_per_turn")
+    return MAX_TOOLS_PER_TURN if configured is None else configured
+
+
+# D1（調査結果集約と並列実行の改善方針・ツール並列）: 1 応答内に ask_user を含まない呼び出しが
+# 2 本以上あるとき、`ThreadPoolExecutor(max_workers=SHERPA_TOOL_PARALLEL)` で同時実行する worker
+# 数（各 dialect のツール実行ループ参照）。1 なら常に従来どおり直列（並列分岐そのものに入らない）。
+SHERPA_TOOL_PARALLEL = _env_int("SHERPA_TOOL_PARALLEL", 3, 1, 8)
+# C2（探索ループの文脈整理・調査結果集約と並列実行の改善方針）: `msgs`（会話履歴）が この
+# バイト数を超えたら、最新 `SHERPA_AGENTIC_KEEP_RECENT_TOOLS` 回分のツール往復を残し、それより
+# 古い分を `InvestigationState.render()` の要約1通へ置換する。上限値の一括増量はしない方針のため
+# 既定値は現行の実効窓（`TOOL_RESULT_MAX_TOTAL_BYTES` 等）を変えない範囲で選ぶ。
+SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES = _env_int(
+    "SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES", 96 * 1024, 16 * 1024, 1024 * 1024)
+# 置換後も直近この回数分のツール往復は生のまま残す（0 を許すとゼロ除算相当のスライス事故
+# （`lst[-0]` は `lst[0]` と等価＝反転）を招くため下限1・`_env_int` の閉区間クランプで機械的に防ぐ）。
+SHERPA_AGENTIC_KEEP_RECENT_TOOLS = _env_int("SHERPA_AGENTIC_KEEP_RECENT_TOOLS", 4, 1, 50)
 # grep/es_search 1回あたりのヒット数上限。精度優先で広げるほど根拠を落としにくくなる代わりに
 # LLM への送信トークンが増える。
 MAX_HITS = _env_int("SHERPA_GREP_MAX_HITS", 30, 1, 1000)
@@ -344,6 +367,28 @@ def _result_byte_size(result) -> int:
         return _UNMEASURABLE_SIZE
 
 
+def _messages_byte_size(msgs: list) -> int:
+    """C2（探索ループの文脈整理）: 会話履歴（`msgs`/`messages`/`contents`）全体の概算 UTF-8
+    バイト数。`_result_byte_size` と違い `default=str` を渡す——Anthropic 方言の `messages` は
+    SDK のブロックオブジェクト（Pydantic 等・素の `json.dumps` では直列化できない）を**通常運用で
+    毎回**含むため、失敗＝異常ではなく「文字列化してでも概算する」を既定にする（fail-closed で
+    特大値を返すと Anthropic 方言だけ毎ターン強制的に文脈整理が発動してしまう）。
+    """
+    try:
+        return len(json.dumps(msgs, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:
+        return _UNMEASURABLE_SIZE
+
+
+def _read_evidence_payload(state: "investigation_state.InvestigationState") -> list:
+    """C2/C3: 探索ループのローカル `InvestigationState` から kind="read"（read_around/read_doc の
+    精読結果）だけを抜き出し、`final` payload の `read_evidence` キー用に薄く写す（`Evidence`
+    データクラス自体は payload に出さない＝内部専用の実装詳細を漏らさない）。
+    """
+    return [{"doc_id": e.doc_id, "span": list(e.span) if e.span else None, "text": e.text}
+           for e in state.evidence if e.kind == "read"]
+
+
 def _tool_bytes_over_budget(total_tool_bytes: int, shared_budget: dict | None,
                             max_total_bytes: int | None = None) -> bool:
     """S4-b（複数プロファイル横断予算・§6.2 項1）: per-run 上限（`max_total_bytes`）
@@ -410,6 +455,10 @@ def _clip_cards(cards: list, max_count: int = _GRAPH_CARDS_MAX, max_bytes: int =
     return out
 
 
+# grep/es ヒットの LLM 向け本文（`text_for_llm`）の文字数上限。テストから monkeypatch できるよう
+# 定数化する——citation の `quote` の 500 字上限（`[:500]` 直書き）とは独立（切り詰め方針が変われば
+# 別々に変えられる・quote 側は変えない契約）。
+_HIT_TEXT_MAX_CHARS = 500
 # glob_search の返却上限（要件: 200件で打ち切り・打ち切りは明示）。grep/es の MAX_HITS とは
 # 独立の固定値（ファイル名だけを返す軽い列挙のため env 化しない）。
 _GLOB_MAX_RESULTS = 200
@@ -534,7 +583,8 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
     is_code = False
     if not is_office:
         from . import corpus_docs
-        verdict = corpus_docs.classify_document(doc_id, ext, lambda p=rp: corpus_docs._read_head(p))
+        verdict = corpus_docs.classify_document(
+            doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size))
         if verdict["kind"] == "unreadable" or (verdict["kind"] != "code" and verdict.get("doctype") is None):
             return None
         is_code = verdict["kind"] == "code"
@@ -715,9 +765,13 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
        残り予算に入るなら P3 全文／領域なら P2／どちらも無理なら chunk（子チャンクの結合）
        のまま——という優先順で使う。
     3. 各 doc は必ず1エントリを返し（消えない）、`tier` を必ず申告する（黙って縮退しない）。
+    4. 予算不足で "chunk" のまま残った doc は、束ねた子チャンクのいずれかが `_HIT_TEXT_MAX_CHARS`
+       で切られていた（`text_truncated`）なら、そのままエントリの `text_truncated: true` に引き継ぐ
+       （"full"/"region" は rag.md 由来の別文字列に置き換わるため対象外＝切れていない）。
 
-    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`
-    （`text` は既に redaction/500字クリップ済みの子チャンク本文＝chunk tier の最低保証そのもの）。
+    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text",
+    "text_truncated"(省略可)}, ...]}`（`text` は既に redaction/500字クリップ済みの子チャンク本文＝
+    chunk tier の最低保証そのもの）。
     `budget_for_rag`: この tool result のうち rag doc 群に残っている予算（legacy ヒット分を
     差し引いた残り・呼び出し元が計算する）。
     """
@@ -761,6 +815,8 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
                  "chunks": [{"chunk_id": it["chunk_id"],
                              **({"locator": it["locator"]} if it.get("locator") is not None else {})}
                             for it in items]}
+        if tier == "chunk" and any(it.get("text_truncated") for it in items):
+            entry["text_truncated"] = True
         out.append(entry)
     return out
 
@@ -997,8 +1053,10 @@ _PARAMS_ASK = {"type": "object", "properties": {
     "required": ["prompt", "mode", "options"]}
 _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id と行番号つきのヒットを返す）。完全一致・固有名詞に強い。"
                 "file_truncated が付くヒットは、その文書がまだ検索し切れていない可能性がある——"
-                "read_doc で続きを確認する。")
-_DESC_READ = "ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
+                "read_doc で続きを確認する。text_truncated が付くヒットは本文が途中で切れている——"
+                "read_around（周辺）か read_doc（続き）で読む。")
+_DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
+             "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。")
 _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・全文を一度には読まない）。"
                   "doc_id と start_line（省略時1）を渡す。1回の返却行数には上限があり、"
                   "「全◯行中 X〜Y行目」を返すので、続きが必要なら次の開始行（end_line+1）を"
@@ -1024,7 +1082,9 @@ _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フ�
                      "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
-            "ripgrep_search が0件/空振りのときはまずこれを試す。doc_id と抜粋を関連度順で返す。")
+            "ripgrep_search が0件/空振りのときはまずこれを試す。doc_id と抜粋を関連度順で返す。"
+            "text_truncated が付くヒットは本文が途中で切れている——read_around（周辺）か "
+            "read_doc（続き）で読む。")
 _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する。結果が大きく変わる曖昧さがある場合だけ使う。"
              "例: 影響分析で起点や影響先が複数候補に割れるとき、確実な波及が0件で要確認だけになったときは、"
              "対象の絞り込みを確認してよい。依頼に「確認してから進めて」とあるときは調査より先に確認する。"
@@ -1316,23 +1376,33 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         rag_slot_index: dict[str, int] = {}   # doc_id -> `out` 内の予約位置（代表ヒットの位置）
         for h in hits:
             docs.add(h["doc_id"])
-            quote = _redact(h["text"])[:500]            # redaction/clip は呼び出し側のポリシー（citations には入れない）
+            redacted_text = _redact(h["text"])
+            quote = redacted_text[:500]            # citation の quote は独立の固定上限（_HIT_TEXT_MAX_CHARS とは別・変えない）
             # rag_chunks 由来（locator あり）は位置ヒントを LLM への text にだけ添える（SEARCH-CUT-3）。
             # citation の quote は hint 抜きのまま（redaction/500字上限は従来どおり適用済み・出典
             # フッターは doc_id リンクのみで locator は出さない・docs/04 契約は不変）。
-            # hint は本文と結合してから redaction・500字上限を通す（RV MED-3: 先に切ってから足すと
+            # hint は本文と結合してから redaction・上限を通す（RV MED-3: 先に切ってから足すと
             # 双方のガードを迂回する＝結合後にもう一度まとめて掛け直す）。`locator_hint` 自体も
             # 型検証・改行除去・長さ上限済みだが、ここでの redaction は本文と同じ扱いにする。
             hint = citations.locator_hint(h.get("locator"))
-            text_for_llm = _redact(f"{h['text']}（位置: {hint}）")[:500] if hint else quote
+            text_for_llm_full = _redact(f"{h['text']}（位置: {hint}）") if hint else redacted_text
+            hit_text_truncated = len(text_for_llm_full) > _HIT_TEXT_MAX_CHARS
+            text_for_llm = text_for_llm_full[:_HIT_TEXT_MAX_CHARS]
             # 引用（cites）は tier に関わらず**子チャンク単位**のまま（親返しで粒度を落とさない・
             # §3.3「引用の粒度は落とさない」）——doc 単位への束ねは `out`（LLM 向け表示）にだけ効く。
             cites.append(citations.from_grep_hit(h, quote=quote, include_match=False))  # match 無し・整形は citations に集約
             if parent_return_on and h.get("chunk_id"):
-                rag_groups.setdefault(h["doc_id"], []).append({
+                rag_item = {
                     "chunk_id": h["chunk_id"], "parent_id": h.get("parent_id"),
                     "locator": h.get("locator"), "score": h.get("score"), "text": text_for_llm,
-                })
+                }
+                if hit_text_truncated:
+                    # `_resolve_parent_return` へ切断状態を持ち越す——最終的に "full"/"region" へ
+                    # 展開されれば rag.md 由来の別の文字列に置き換わる（切断は解消される）が、
+                    # 予算不足で "chunk" のまま残るとこの子チャンク本文（_HIT_TEXT_MAX_CHARS で
+                    # 既に切られている）がそのまま LLM へ渡るため、印を保つ必要がある。
+                    rag_item["text_truncated"] = True
+                rag_groups.setdefault(h["doc_id"], []).append(rag_item)
                 if h["doc_id"] not in rag_slot_index:
                     # 最初に出現した位置＝ES ヒットのスコア降順の下でその doc の最高スコア
                     # （同 doc の2件目以降は既に予約済みの枠へ集約されるだけ・新しい枠は作らない）。
@@ -1340,6 +1410,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     out.append(None)                      # 集約結果が確定するまでの予約枠
                 continue
             hit_view = {"doc_id": h["doc_id"], "line": h["line"], "text": text_for_llm}
+            if hit_text_truncated:
+                # 親返し（`_resolve_parent_return`）で全文/領域へ展開されたヒットはこの分岐を通らない
+                # （上の `continue` で除外済み）＝ここに来るのは展開されず _HIT_TEXT_MAX_CHARS で
+                # 切られたヒットだけ。理由が無ければキー自体を作らない既存の流儀（`file_truncated` と同じ）。
+                hit_view["text_truncated"] = True
             # I2（2026-09-05）: grep（`ripgrep_search`）ヒットが持つ登録者重要度（`grep_tool.
             # grep_search` が条件付きで付ける）を LLM 向け tool result にも転送する——重要文書を
             # 優先的に精読（read_around）できるようにする。es_search 側の `h` はこのキーを
@@ -1453,10 +1528,16 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             f.close()
         text = _redact("\n".join(f"{i}: {t}" for i, t in collected))
         # secRV MED-B (a): 返却テキストの UTF-8 バイト数を上限で切り詰める（単一行が巨大な文書でも、
-        # 履歴/SSE/次ターンの LLM 要求へ複製される量を bound する）。
+        # 履歴/SSE/次ターンの LLM 要求へ複製される量を bound する）。上限で実際に短くなった時だけ
+        # `text_truncated` を明示する（read_doc/doc_outline の `text_truncated`/`file_truncated` と
+        # 同じ語彙＝精読が黙って取りこぼさない）。
+        read_around_truncated = len(text.encode("utf-8")) > tr_max_bytes
         text = _clip_utf8_bytes(text, tr_max_bytes)
         docs.add(doc_id)
-        return ({"doc_id": doc_id, "text": text}, docs, cites, cards)
+        result = {"doc_id": doc_id, "text": text}
+        if read_around_truncated:
+            result["text_truncated"] = True
+        return (result, docs, cites, cards)
     if name == "read_doc":
         doc_id = str(args.get("doc_id") or "")
         try:
@@ -1602,6 +1683,16 @@ def _node(label: str, detail: str) -> dict:
     return {"type": "node", "id": _nid(), "kind": "tool", "label": label, "detail": detail, "status": "done"}
 
 
+def _context_compacted_node(n: int) -> dict:
+    """C2（探索ループの文脈整理）: 古いツール往復を `InvestigationState.render()` の要約1通へ
+    置換したことを示す think ノード（本モジュールの他ノードは検索・確認の「行動」＝kind="tool"
+    固定の `_node` を使うが、これは調査そのものではなく文脈整理という「考える」操作のため
+    kind="think" にする）。
+    """
+    return {"type": "node", "id": _nid(), "kind": "think", "label": "調査の文脈を整理",
+           "detail": f"古いツール結果 {n} 件を調査状態の要約に置換", "status": "done"}
+
+
 def _clip(s, n: int) -> str:
     return str(s or "").strip()[:n]
 
@@ -1706,6 +1797,11 @@ _ES_DEGRADE_WORDING = {
     # 結果は同じ）。
     "hybrid_query_failed": ("検索の精度が一部低下しています",
                            "意味検索の問い合わせが一時的に失敗したため、キーワード一致のみで探しています"),
+    # 索引の埋め込み素性と現在の AI 設定が合わない（設定変更後の再取り込み待ち）。一時障害ではなく
+    # 再取り込みまで続く状態なので、案内文で「取り込みのやり直し」まで示す。
+    "vector_feature_mismatch": ("検索の精度が一部低下しています",
+                                "取り込んだ資料が現在の AI 設定では意味検索に使えないため、キーワード一致のみで探しています"
+                                "（資料の取り込みをやり直すと戻ります）"),
 }
 
 
@@ -1768,7 +1864,7 @@ def _tool_hit_count(name: str, result: dict) -> int | None:
     """run_tool() の結果から「ヒット件数」を数える（対象外のツール／エラー応答は None）。
     メイン経路・サブ経路の追加ノード（`_hit_summary_node`/`_hit_summary_node_sub`）が共通で使う。
 
-    `es_search` は `degrade_reason` が `_ES_DEGRADE_WORDING`（BM25 継続時の3語彙）に含まれない
+    `es_search` は `degrade_reason` が `_ES_DEGRADE_WORDING`（BM25 継続時の語彙）に含まれない
     既知値（`es_unavailable`/`es_query_failed`＝BM25 自体も失敗し hits が強制的に空になっている）
     のときも None にする——「検索は実行できたが0件だった」ことにはならないため、件数ノードで
     「0件（キーワード一致のみ）」と出すと実際には検索していないのに検索したかのような誤表示になる。
@@ -1802,9 +1898,12 @@ def _tool_hit_count(name: str, result: dict) -> int | None:
         # （es_search の degrade 同様、実行できなかったことを 0 件と混同しない）。
         if result.get("status") != "comparable":
             return None
-        diff = result.get("diff") or ""
-        return sum(1 for ln in diff.splitlines()
-                  if (ln.startswith("+") or ln.startswith("-")) and not ln.startswith(("+++", "---")))
+        diff_lines = (result.get("diff") or "").splitlines()
+        # 先頭2行（`difflib.unified_diff` が出す `--- fromfile`/`+++ tofile`）だけを位置で
+        # ヘッダーとして除外する——内容が偶然 "+++"/"---" で始まる変更行（3行目以降）まで誤って
+        # 除外しない（`investigation_state.py` の compare_documents 抜粋と同じ契約）。
+        body_lines = diff_lines[2:] if len(diff_lines) >= 2 else []
+        return sum(1 for ln in body_lines if ln.startswith("+") or ln.startswith("-"))
     return None
 
 
@@ -2637,6 +2736,14 @@ def _digest_clean(text: str) -> str:
     return _redact(cleaned)
 
 
+# 複数項目を列挙する区切り記号——末尾に半角空白を含める。`build_evidence_digest`/
+# `build_synthesis_digest` はどちらも列挙済みの1行を後で（citation 側の quote と混ぜた
+# 全体 fact 文字列などへ）埋め込んでから `_digest_clean` を再適用する箇所があり、空白の無い
+# 区切りだと `_KV_SECRET_RE` の `\S+`（空白でしか止まらない）が区切り記号ごと次の項目まで
+# 飲み込み、`key=value` 形の秘密を含む項目の直後の項目が丸ごと消える
+# （`sherpa/investigation_state.py` の `_LIST_SEP` と同じ理由・同じ対処）。
+_LIST_SEP = "、 "
+
 _ATTRIBUTION_TRUNCATION_NOTICE = "（上限のため以降の項目は省略）"
 
 
@@ -2717,9 +2824,9 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
                 lm = m.get("list_meta") or {}
                 cond_parts = [f"path_prefix={_digest_clean(lm['prefix'])}" if lm.get("prefix") else None,
                              f"name_pattern={_digest_clean(lm['pattern'])}" if lm.get("pattern") else None]
-                cond = "、".join(c for c in cond_parts if c)
+                cond = _LIST_SEP.join(c for c in cond_parts if c)
                 cond_text = f"（条件: {cond}）" if cond else ""
-                paths = "、".join(_digest_clean(d) for d in matched[:10])
+                paths = _LIST_SEP.join(_digest_clean(d) for d in matched[:10])
                 fact = (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
                        f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else ""))
             elif "tree_meta" in m:
@@ -2731,7 +2838,7 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
                        f"{tm.get('count', 0)} 件／列挙 {tm.get('shown', 0)} 件")
             else:
                 cm = m.get("card_meta") or {}
-                docs_text = "、".join(_digest_clean(d) for d in matched[:5])
+                docs_text = _LIST_SEP.join(_digest_clean(d) for d in matched[:5])
                 fact = (f"[graph] {_digest_clean(cm.get('name', ''))}"
                        f"（{_digest_clean(cm.get('role', ''))}"
                        f"{'・' + _digest_clean(cm['category']) if cm.get('category') else ''}"
@@ -2765,6 +2872,185 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
             del ev_map[line_ev_ids.pop()]
         total_bytes += _marginal_cost(_ATTRIBUTION_TRUNCATION_NOTICE)
         lines.append(_ATTRIBUTION_TRUNCATION_NOTICE)
+    return "\n".join(lines), ev_map
+
+
+# ---- 清書入力: 確定根拠の全件ダイジェスト —— 下調べ役が集めた根拠を、清書
+# （`_answer_prompt` → `providers/prompts.py::_facts`）が QA の先頭4引用×60字に絞らず全件参照
+# できるようにする。`build_evidence_digest`（帰属専用・60字・60行上限）とは目的・上限が異なる
+# 別関数（`build_evidence_digest` 自体はここでは変更しない）——ev-N の採番・入力順だけを揃える。
+
+_SYNTHESIS_QUOTE_CAP = 400            # 清書ダイジェストの quote 切り詰め長（帰属用 digest の60字とは別契約）
+_SYNTHESIS_MAX_BYTES = 24 * 1024      # 清書ダイジェスト全体のバイト数上限（最終 UTF-8 列で厳密判定）
+_SYNTHESIS_TRUNCATION_NOTICE_TMPL = "（他 {n} 件は省略）"
+_SYNTHESIS_GAPS_MAX_ITEMS = 20         # 清書ダイジェストへ渡す「調査の限界」の件数上限（先頭優先）
+_SYNTHESIS_GAP_CAP = 200              # 「調査の限界」1件あたりの切り詰め長
+
+
+def _synthesis_quote(text: str, cap: int) -> str:
+    """`_digest_clean` を通してから `cap` 文字まで切り詰める。切り詰めが発生したときだけ末尾に
+    「…」を付ける（`build_evidence_digest` の quote 切断は個別注記が無い契約だが、清書ダイジェストは
+    「全件ダイジェスト」の契約上、個々の切断も打ち切りも明示する）。
+    """
+    cleaned = _digest_clean(text)
+    return cleaned if len(cleaned) <= cap else cleaned[:cap] + "…"
+
+
+def _synthesis_span_loc(span) -> str:
+    """citation の `span`（`[start_line, end_line]`）から「 行 a-b」を組む。span が無い/行番号を
+    持たない（rag_chunks 由来等）ときは空文字（doc_id だけの表示に落ちる）。
+    """
+    if (isinstance(span, (list, tuple)) and len(span) == 2
+            and isinstance(span[0], int) and not isinstance(span[0], bool)
+            and isinstance(span[1], int) and not isinstance(span[1], bool)):
+        return f" 行 {span[0]}-{span[1]}"
+    return ""
+
+
+def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
+                           quote_cap: int = _SYNTHESIS_QUOTE_CAP,
+                           max_bytes: int = _SYNTHESIS_MAX_BYTES,
+                           read_evidence: list | None = None,
+                           gaps: list | None = None) -> tuple[str, dict]:
+    """清書（`_answer_prompt` → `providers/prompts.py::_facts`）専用の**確定根拠の全件ダイジェスト**。
+
+    `build_evidence_digest` と**同じ ev-N 採番・同じ入力順**（`combined_evidence_meta` の
+    添字＋1）を使う——同じ入力を渡せば同じエントリに同じ ev-N が付く（両関数の唯一の共通契約。
+    件数上限は持たない＝`_ATTRIBUTION_MAX_ITEMS` 相当の頭打ちをしない）。
+
+    citation エントリは `ev-N: doc_id 行 a-b「quote」`（`quote_cap` 文字まで・超過時は「…」で
+    明示）。統合で消えなかった別の一致（`evidence_meta[i]["extra_quotes"]`・
+    `citations.merge_overlapping_citations` が積む）があれば「／別の一致: 「…」」を追記する。
+    list_docs 集計・graph カードのエントリは `build_evidence_digest` と**同じ表現**（文書パス
+    先頭10件・裏付け doc 先頭5件のまま——`quote_cap` はこれらには適用しない）。
+
+    `read_evidence`（省略可・既定 None＝空・C 追加）: ハイブリッドの下調べ役／査読が実際に
+    read_around／read_doc で読んだ本文（`InvestigationState` の kind="read" Evidence・
+    `{"doc_id","span","text"}` の辞書列・本文は呼び出し元が既に `_redact`・800字まで切り詰め
+    済み）。citation／構造的根拠のダイジェスト行に**続けて**「精読: doc_id 行 a-b「本文」」行を
+    追加する——`quote_cap` は適用しない（精読本文は既に800字上限で切り詰め済みで、citation の
+    400字上限とは別契約のため二重に切り詰めない）。**同じ `max_bytes` 予算・同じ打ち切り注記**
+    （件数へ合算）を共有するが、Evidence Packet／`data.citations` には出さない内部専用行のため
+    `ev_map` には登録しない（`ev-N` を割り当てない＝攻撃的な幻覚 ev-N と衝突しない）。
+
+    `gaps`（省略可・既定 None＝空・C RV是正2巡目）: `InvestigationState.gaps`（検索0件／打ち切り／
+    未確認という調査の限界・機械生成の文字列列）。`read_evidence` に続けて「調査の限界: …」行を
+    先頭 `_SYNTHESIS_GAPS_MAX_ITEMS`（20）件・各 `_SYNTHESIS_GAP_CAP`（200字）まで追加する——
+    同じ `max_bytes` 予算・打ち切り注記を共有し、`ev_map` には登録しない（`read_evidence` と同じ
+    内部専用行）。gap の文字列自体は呼び出し元が既に `_digest_clean` 済みの前提だが、ここでも
+    `_digest_clean` を通す（二重適用は無害・唯一の redaction 境界を貫く）。
+
+    `max_bytes`（最終 `"\\n".join(lines)` の UTF-8 バイト数）を超える分は**根拠単位**で末尾から
+    打ち切り、末尾に `"（他 M 件は省略）"` を付ける（M＝実際に省略した件数。注記自身の追加
+    バイトも上限に含めて判定するため、注記の桁数が変わるたびに数え直す）。
+
+    戻り値 `(digest_text, ev_map)` は `build_evidence_digest` と同じ形（`ev_map` は
+    `{"ev-N": [doc_id, ...], ...}`）。根拠が1件も無ければ `digest_text == ""`。
+    """
+    n_citations = len(citations)
+    # [(ev_id, line, matched_doc_ids), ...]（バイト上限判定より前の全件）。`read_evidence` 由来の
+    # 行は `ev_id=None`（Evidence Packet／帰属に使わない内部専用行の印・下の2ループが `ev_map` へ
+    # 触れない条件として使う）。
+    candidates: list = []
+    for i, m in enumerate(combined_evidence_meta):
+        ev_id = f"ev-{i + 1}"
+        matched = m.get("matched_doc_ids")
+        if matched is not None:
+            if "list_meta" in m:
+                lm = m.get("list_meta") or {}
+                cond_parts = [f"path_prefix={_digest_clean(lm['prefix'])}" if lm.get("prefix") else None,
+                             f"name_pattern={_digest_clean(lm['pattern'])}" if lm.get("pattern") else None]
+                cond = _LIST_SEP.join(c for c in cond_parts if c)
+                cond_text = f"（条件: {cond}）" if cond else ""
+                paths = _LIST_SEP.join(_digest_clean(d) for d in matched[:10])
+                fact = (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
+                       f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else ""))
+            elif "tree_meta" in m:
+                tm = m.get("tree_meta") or {}
+                cond_text = f"（path_prefix={_digest_clean(tm['prefix'])}）" if tm.get("prefix") else ""
+                fact = (f"[folder_tree] 深さ{tm.get('depth')}{cond_text}／該当フォルダ "
+                       f"{tm.get('count', 0)} 件／列挙 {tm.get('shown', 0)} 件")
+            else:
+                cm = m.get("card_meta") or {}
+                docs_text = _LIST_SEP.join(_digest_clean(d) for d in matched[:5])
+                fact = (f"[graph] {_digest_clean(cm.get('name', ''))}"
+                       f"（{_digest_clean(cm.get('role', ''))}"
+                       f"{'・' + _digest_clean(cm['category']) if cm.get('category') else ''}"
+                       f"・経路={_digest_clean(str(cm.get('path') or ''))}）"
+                       + (f"／裏付け: {docs_text}" if docs_text else ""))
+            candidates.append((ev_id, _digest_clean(f"{ev_id}: {fact}"), list(matched)))
+            continue
+        doc_id = m.get("doc_id")
+        if not doc_id:
+            continue
+        if i < n_citations:
+            c = citations[i]
+            quote = _synthesis_quote(c.get("quote") or "", quote_cap)
+            loc = _synthesis_span_loc(c.get("span"))
+            fact = f"{_digest_clean(doc_id)}{loc}「{quote}」" if quote else f"{_digest_clean(doc_id)}{loc}"
+            extra_quotes = m.get("extra_quotes") or []
+            if extra_quotes:
+                extras_text = _LIST_SEP.join(f"「{_synthesis_quote(q, quote_cap)}」" for q in extra_quotes)
+                fact += f"／別の一致: {extras_text}"
+        else:
+            fact = _digest_clean(doc_id)
+        candidates.append((ev_id, _digest_clean(f"{ev_id}: {fact}"), [doc_id]))
+
+    for r in (read_evidence or []):
+        if not isinstance(r, dict):
+            continue
+        doc_id = r.get("doc_id")
+        if not doc_id:
+            continue
+        loc = _synthesis_span_loc(r.get("span"))
+        text = _digest_clean(str(r.get("text") or ""))
+        fact = f"精読: {_digest_clean(doc_id)}{loc}「{text}」" if text else f"精読: {_digest_clean(doc_id)}{loc}"
+        candidates.append((None, _digest_clean(fact), None))
+
+    for g in list(gaps or [])[:_SYNTHESIS_GAPS_MAX_ITEMS]:
+        gap_text = _digest_clean(str(g or ""))[:_SYNTHESIS_GAP_CAP]
+        if not gap_text:
+            continue
+        candidates.append((None, _digest_clean(f"調査の限界: {gap_text}"), None))
+
+    lines: list = []
+    costs: list = []
+    line_ev_ids: list = []
+    ev_map: dict = {}
+    total_bytes = 0
+
+    def _marginal_cost(line: str) -> int:
+        enc = len(line.encode("utf-8", errors="replace"))
+        return enc if not lines else enc + 1
+
+    included = 0
+    for ev_id, line, matched in candidates:
+        b = _marginal_cost(line)
+        if total_bytes + b > max_bytes:
+            break
+        lines.append(line)
+        costs.append(b)
+        line_ev_ids.append(ev_id)
+        if ev_id is not None:   # read_evidence 行（ev_id=None）は ev_map に登録しない
+            ev_map[ev_id] = matched
+        total_bytes += b
+        included += 1
+
+    omitted = len(candidates) - included
+    if omitted > 0:
+        # 注記の桁数（M）は pop するたびに増える——先に一度だけ計算した注記コストで固定判定すると
+        # 桁上がり（9件→10件等）でわずかに上限を超えうるため、pop の都度注記を作り直す。
+        notice = _SYNTHESIS_TRUNCATION_NOTICE_TMPL.format(n=omitted)
+        while lines and total_bytes + _marginal_cost(notice) > max_bytes:
+            total_bytes -= costs.pop()
+            lines.pop()
+            _popped_id = line_ev_ids.pop()
+            if _popped_id is not None:
+                del ev_map[_popped_id]
+            omitted += 1
+            notice = _SYNTHESIS_TRUNCATION_NOTICE_TMPL.format(n=omitted)
+        total_bytes += _marginal_cost(notice)
+        lines.append(notice)
     return "\n".join(lines), ev_map
 
 
@@ -3132,7 +3418,9 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
                       attributed_ev_ids: set | None = None,
                       synthesis_failed: bool = False,
                       attribution_eligible: bool = False,
-                      failure_kind: str | None = None) -> dict:
+                      failure_kind: str | None = None,
+                      read_evidence: list | None = None,
+                      gaps: list | None = None) -> dict:
     """`{"final": ...}` イベントの共通組み立て（Committed Evidence 化は呼び出し元が済ませた状態で
     受け取る）。候補があったのに全滅した場合は `stop_reason` を `evidence_verification_failed` へ
     上書きする（honest failure）。
@@ -3166,6 +3454,20 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
     組むため、ここで作った digest の添字と揃う保証が無く、意図的に絞り込みを適用しない・plan/hybrid
     は base.py 自身が `build_evidence_digest` を呼び直して**自分の** `adopted_ev_ids` をローカルに
     持つため、そもそも payload 側の値を必要としない）。
+
+    `read_evidence`（省略可・既定 None＝空・C 追加）: この run 中に read_around/read_doc で実際に
+    読んだ本文（`InvestigationState` の kind="read" Evidence を `{"doc_id","span","text"}` へ薄く
+    写したもの・本文は既に `_redact`・800字上限で切り詰め済み）。ハイブリッド
+    （`providers/base.py::_agentic_run`）が清書入力（`build_synthesis_digest` の `read_evidence`
+    引数）へ引き継ぐための内部専用チャンネル——citation でも構造 Evidence でもない（Evidence
+    Packet／`data.citations` には出さない）。
+
+    `gaps`（省略可・既定 None＝空）: この run の `InvestigationState.gaps`
+    （0件検索・エラー・打ち切り等の機械的な調査の限界の記録・文字列のまま）。sub ループの
+    ローカル状態はこの呼び出しを最後にループの外へは公開されないため、ハイブリッドの親
+    `state`（`providers/base.py::_ingest_sub_final_into_state`）へ引き継ぐにはここに載せる
+    必要がある——`read_evidence` と同じ内部専用チャンネル（Evidence Packet／`data.citations`
+    には出さない）。
     """
     structural_evidence_meta = structural_evidence_meta or []
     has_structural_evidence = bool(structural_evidence_meta)
@@ -3193,7 +3495,9 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
               # それ以外は None（`research_service.py` は汎用の合成失敗文言を使う）。
               "synthesis_failed": synthesis_failed,
               "attribution_eligible": attribution_eligible,
-              "failure_kind": failure_kind}
+              "failure_kind": failure_kind,
+              "read_evidence": read_evidence or [],
+              "gaps": gaps or []}
     if evaluation is not None:
         payload["evaluation_status"] = evaluation.get("status")
         payload["evaluation_reason"] = evaluation.get("reason")
@@ -3206,7 +3510,9 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
                          evaluation: dict | None = None,
                          structural_evidence_meta: list | None = None,
                          used_evidence_docs: set | None = None,
-                         attributed_ev_ids: set | None = None) -> dict:
+                         attributed_ev_ids: set | None = None,
+                         read_evidence: list | None = None,
+                         gaps: list | None = None) -> dict:
     """`_finalize_payload` の薄いラッパー。citation 列（Candidate のまま）を受け取り、ここで
     `_commit_evidence` を1回だけ実行してから共通組み立てへ渡す（緊急打ち切り経路でも未検証
     citation を外へ出さない）。
@@ -3214,7 +3520,8 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
     committed, evidence_meta, dropped = _commit_evidence(cites, world)
     return _finalize_payload(text, docs, searched, committed, evidence_meta, dropped, cards, usage,
                              verified_docs, stop_reason, evaluation, structural_evidence_meta,
-                             used_evidence_docs, attributed_ev_ids)
+                             used_evidence_docs, attributed_ev_ids, read_evidence=read_evidence,
+                             gaps=gaps)
 
 
 # ---- 反復ループ（OpenAI 形式＝OpenAI/Ollama 共用 ／ Gemini 形式）----
@@ -3229,7 +3536,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                  call_budget: "_CallBudget | None" = None,
                  tool_deadline: float | None = None, layer=None,
                  max_hits: int | None = None, window_cap: int | None = None,
-                 tools_pref: dict | None = None, tools_availability: dict | None = None):
+                 tools_pref: dict | None = None, tools_availability: dict | None = None,
+                 system_settings: dict | None = None):
     """OpenAI/Ollama の tool-use を反復。`{"node":..}` を yield しつつ最後に `{"final","docs"}`。
 
     `layer`（省略可・既定 `None`＝`"both"`＝既存呼び出し元は無変更）: `scope_paths` と同じく
@@ -3296,8 +3604,18 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
 
     レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分（例: 1応答に10万件の tool_calls）に対して
     「上限」ノードを超過件数と同数（99,984件）生成し SSE/trace を肥大化させていた。是正後は
-    `calls[:MAX_TOOLS_PER_TURN]` だけを処理し、超過があればループ終了後に**固定ノード1件だけ**生成
+    `calls[:max_tools_per_turn]` だけを処理し、超過があればループ終了後に**固定ノード1件だけ**生成
     して打ち切る。
+
+    `SHERPA_TOOL_PARALLEL`（D1・ツール並列）: 1 応答内の呼び出しが2本以上・ask_user を含まない
+    ときだけ `ThreadPoolExecutor(max_workers=SHERPA_TOOL_PARALLEL)` で同時実行する（同一応答内の
+    呼び出しは引数が確定済み＝互いに依存しない読み取りのため）。既定3・1なら常に直列（モデルが
+    結果を見て次を決める応答間の反復は変えない）。完了順に関わらず `msgs` へ積む結果は元の呼び出し
+    順で組む（`tool_call_id` 対応を壊さない）。`shared_budget`/`docs`/`cites`/`cards`/`state` の
+    更新はワーカー（`run_tool` 呼び出しそのもの）の外・メインスレッドでのみ行う。ワーカーの例外は
+    その呼び出し1件だけの error 結果に変換し、他の呼び出しは止めない。停止は各呼び出しの投入前に
+    確認し、投入済みの完了は待ってから（未投入分は実行せず）既存の停止契約（final を出さない）に
+    従う。
 
     レビュー是正（LOW-E・secRV・2026-07-18 再検証）: ツールノードを yield した直後（generator が
     一時停止し、呼び出し元がノードを処理してから再開される窓）に停止要求が来ても、再開後は
@@ -3441,11 +3759,22 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     # 導出し、`allowed_tools` 未指定（メイン経路）でも「提示していないツール名は拒否」を強制する。
     offered_names = frozenset(t["function"]["name"] for t in tools)
     effective_allowed = allowed_tools if allowed_tools is not None else offered_names
+    # C2（探索ループの文脈整理）: この run 専用のローカル調査状態（呼び出し元には公開しない・
+    # `_read_evidence_payload` だけが `final` payload へ橋渡しする）。`_round_bounds` は
+    # `msgs` 内の「assistant(tool_calls)＋対応する tool メッセージ全部」1組ぶんの `[start, end)`
+    # を古い順に積む——置換境界は常にこの組の先頭に揃えるため、組の途中で切ることがない。
+    state = investigation_state.InvestigationState(question=user, scope={"world": world, "layer": layer})
+    _prefix_len = len(msgs)
+    _round_bounds: list[tuple[int, int]] = []
     docs: set = set()
     cites: list = []
     cards: list = []
     searched = False
     usage = _new_usage_acc()                   # F3: 全ツールターンの usage を合算
+    if system_settings is None:
+        from . import store
+        system_settings = store.get_system_settings()
+    max_tools_per_turn = effective_max_tools_per_turn(system_settings)
     total_tool_bytes = 0                        # secRV MED-B (c): 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
     # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: メイン頭脳の provider/model を渡し、
@@ -3453,6 +3782,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     # だけ `/api/show` 照会用の base_url を導出する（`model_windows.derive_ollama_base_url`）。
     from . import model_windows as _model_windows
     tool_result_max_bytes, tool_result_max_total_bytes = resolve_tool_result_budgets(
+        system_settings=system_settings,
         provider=("ollama" if ollama else "openai"), model=model,
         ollama_base_url=(_model_windows.derive_ollama_base_url(endpoint) if ollama else None))
     verified_docs: set = set()                  # EXT-2/EV-0: read_around で実際に精読した doc_id
@@ -3466,6 +3796,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     for turn_idx in range(turns):
         if stop_event is not None and stop_event.is_set():
             return
+        _round_start = len(msgs)   # C2: この turn で足す「assistant(tool_calls)＋tool 結果」組の開始位置
         body = {"model": model, "messages": msgs, "tools": tools}
         if ollama:
             body["stream"] = False
@@ -3483,7 +3814,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield {"node": _node("call 予算の上限", "この会話で発行できる呼び出し数の上限に達しました")}
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "budget_exceeded", world,
-                                       structural_evidence_meta=structural_evidence_meta)
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
         _acc_openai_usage(usage, resp, ollama)
         if usage_acc is not None:
@@ -3506,7 +3838,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 if verdict.get("budget_exceeded"):
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world, verdict,
-                                               structural_evidence_meta=structural_evidence_meta)
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 if verdict["status"] in ("insufficient", "conflicting"):
                     if verdict["status"] == "conflicting":
@@ -3541,11 +3874,155 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             break   # 共通の tail（Committed Evidence 化ゲート＋必要なら再合成）へ合流する
         searched = True
         msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
-        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `calls[:MAX_TOOLS_PER_TURN]` で
-        # 単純に切り捨てる（超過件数分のノードを生成しない＝下のループ後にまとめて固定ノード1件だけ
-        # 流す）。
-        over_limit = len(calls) > MAX_TOOLS_PER_TURN
-        for tc in calls[:MAX_TOOLS_PER_TURN]:
+        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `_pending_calls`
+        # （`calls[:max_tools_per_turn]`）で単純に切り捨てる（超過件数分のノードを生成しない＝
+        # 下のループ後にまとめて固定ノード1件だけ流す）。
+        _pending_calls = calls[:max_tools_per_turn]
+        over_limit = len(calls) > max_tools_per_turn
+        # D1（ツール並列・同一応答内の独立した読み取りの同時実行）: ask_user を含まず・呼び出しが
+        # 2本以上あるときだけ並列にする（`SHERPA_TOOL_PARALLEL<=1` は常にこの分岐へ入らない＝
+        # 従来どおり直列）。ask_user を含む応答は question 優先の早期 return 契約（下の直列ループ）を
+        # 変えないため対象外にする。
+        _has_ask_user = any((tc.get("function") or {}).get("name") == "ask_user" for tc in _pending_calls)
+        _use_parallel = SHERPA_TOOL_PARALLEL > 1 and len(_pending_calls) >= 2 and not _has_ask_user
+        _tool_batch_started = time.monotonic()
+        if _use_parallel:
+            # 呼び出しと結果の対応は元の呼び出し順で保つ（完了順ではない）——`_futures` は投入順
+            # そのまま積み、後段の結果処理も同じ順で走査する。ワーカーは `run_tool` の戻り値を
+            # 返すだけで、docs/cites/cards/state/msgs/共有バイト予算の更新は全てこのメイン
+            # スレッドで行う（共有 dict をワーカーから直接触らせない）。
+            from .ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
+            _futures: list = []   # (kind, tc, name, args, payload)・kind="rejected"|"run"
+            _stopped = False
+            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=SHERPA_TOOL_PARALLEL)
+            try:
+                for tc in _pending_calls:
+                    # 各呼び出しの投入前に stop_event を確認する——立っていれば未投入分（このtc
+                    # 以降）は投入しない。投入済み（既に active ノードを yield 済み）は下の
+                    # `finally` で完了を待つ（`run_tool` 自体には停止が伝わらない＝待つだけ）。
+                    if stop_event is not None and stop_event.is_set():
+                        _stopped = True
+                        break
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    args = _safe_json(fn.get("arguments"))
+                    if name not in effective_allowed:
+                        yield {"node": _node("許可外のツール呼び出し", "許可されていないため拒否しました")}
+                        safe_name = _clip_utf8_bytes(str(name or ""), _REJECTED_TOOL_NAME_MAX_BYTES)
+                        _futures.append(("rejected", tc, name, args, safe_name))
+                        continue
+                    yield {"node": (_tool_node_sub(name) if allowed_tools is not None else _tool_node(name, args))}
+                    # ノード yield 直後（generator 再開後）にも stop_event を再確認する（単体呼び出し
+                    # 時と同じ LOW-E の窓塞ぎ）。
+                    if stop_event is not None and stop_event.is_set():
+                        _stopped = True
+                        break
+                    # `ThreadPoolExecutor` は呼び出し元スレッドの `contextvars.Context`（
+                    # `worlds.pin_world_root` の pin 等）を継承しない——`copy_context().run(...)` で
+                    # ワーカーへ明示的に持ち込む（さもないと pin が見えず別 root/fallback を解決しうる）。
+                    _ctx = contextvars.copy_context()
+                    fut = _executor.submit(_ctx.run, run_tool, name, args, world, scope_paths,
+                                           deadline=tool_deadline, layer=layer, max_hits=max_hits,
+                                           window_cap=window_cap, tool_result_max_bytes=tool_result_max_bytes)
+                    _futures.append(("run", tc, name, args, fut))
+            finally:
+                _executor.shutdown(wait=True)
+            # 投入完了後・結果収集前にも stop_event を再確認する——全件投入済みで待機中に停止要求が
+            # 来ると `_stopped`（投入時にしか更新しない）は偽のままのため、ここで別途確認しないと
+            # 停止後に結果を msgs/state へ積み done ノードを yield してしまう。
+            if _stopped or (stop_event is not None and stop_event.is_set()):
+                return   # 停止契約: 結果は msgs に積まず final も出さない（既存の stop_event 契約と同型）。
+            for kind, tc, name, args, payload in _futures:
+                if kind == "rejected":
+                    safe_name = payload
+                    result = {"error": f"ツール {safe_name} は使用できません"}
+                    _sz = _result_byte_size(result)
+                    total_tool_bytes += _sz
+                    if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
+                        shared_budget["tool_bytes_used"] += _sz
+                    if _tool_bytes_over_budget(total_tool_bytes, shared_budget, tool_result_max_total_bytes):
+                        yield {"node": _node("ツール結果の合計サイズ上限",
+                                             "この会話で取得した量が多すぎるため打ち切りました")}
+                        yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                                   verified_docs, "budget_exceeded", world,
+                                                   structural_evidence_meta=structural_evidence_meta,
+                                                   read_evidence=_read_evidence_payload(state))
+                        return
+                    tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
+                    if tc.get("id"):
+                        tmsg["tool_call_id"] = tc["id"]
+                    msgs.append(tmsg)
+                    continue
+                try:
+                    result, d, c, cd = payload.result()
+                except GraphSchemaEraError:
+                    # 旧世代グラフ→再取り込み案内で停止する既存契約（`providers/base.py::_agentic_run`
+                    # の `except GraphSchemaEraError: raise` 参照）——通常のツールエラーへ丸めず、
+                    # 直列時と同じくそのまま再送出する（他の呼び出しは既に並走して完了済みでも
+                    # run 全体を止める・fail-loud）。
+                    raise
+                except Exception as e:
+                    # ワーカー（`run_tool`）の例外はこの呼び出しだけの error 結果に変換する
+                    # （他の呼び出しは既に並走して完了済み・止めない）。生の例外文字列（絶対パス
+                    # 等を含みうる）は次ターンの外部 LLM 送信本文へは出さず、固定文言にする——
+                    # 詳細はマスク済みのサーバーログにだけ残す（他の例外経路と同じ流儀）。
+                    from .ingest.graph_extract import _log_masked_exception
+                    _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e,
+                                          _header_secret(headers))
+                    result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
+                hit_node = (_hit_summary_node_sub(name, result) if allowed_tools is not None
+                           else _hit_summary_node(name, args, result))
+                if hit_node:
+                    yield {"node": hit_node}
+                degrade_node = _degrade_result_node(result)
+                if degrade_node:
+                    yield {"node": degrade_node}
+                truncated_node = _truncated_docs_node(result)
+                if truncated_node:
+                    yield {"node": truncated_node}
+                _sz = _result_byte_size(result) + _result_byte_size(cd)
+                total_tool_bytes += _sz
+                if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
+                    shared_budget["tool_bytes_used"] += _sz
+                if _tool_bytes_over_budget(total_tool_bytes, shared_budget, tool_result_max_total_bytes):
+                    yield {"node": _node("ツール結果の合計サイズ上限",
+                                         "この会話で取得した量が多すぎるため打ち切りました")}
+                    yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                               verified_docs, "budget_exceeded", world,
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state))
+                    return
+                docs |= d
+                cites += c
+                cards += cd
+                if name in ("read_around", "read_doc") and "error" not in result:
+                    verified_docs |= d
+                _call_structural: list = []
+                if name == "list_docs" and "error" not in result:
+                    _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
+                               if doc.get("rel_path")]
+                    _call_structural.append({
+                        "doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                        "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
+                                      "prefix": str(args.get("path_prefix") or "").strip(),
+                                      "pattern": str(args.get("name_pattern") or "").strip()},
+                        "matched_doc_ids": _matched})
+                if name == "folder_tree" and "error" not in result:
+                    _call_structural.append({
+                        "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+                        "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
+                                     "count": result.get("count", 0),
+                                     "shown": len(result.get("folders") or [])},
+                        "matched_doc_ids": []})
+                if name == "graph_neighbors" and cd:
+                    _call_structural += _card_structural_evidence(cd)
+                structural_evidence_meta += _call_structural
+                state.add_tool_result(name, args, result, c, _call_structural)
+                tmsg = {"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)}
+                if tc.get("id"):
+                    tmsg["tool_call_id"] = tc["id"]
+                msgs.append(tmsg)
+        for tc in ([] if _use_parallel else _pending_calls):
             # secRV MED-3 (b): 各ツール実行の直前に stop_event を確認する（1応答内に大量の tool_calls
             # が積まれていても、途中停止が反映されないまま実行し続けることを防ぐ）。
             if stop_event is not None and stop_event.is_set():
@@ -3586,7 +4063,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
-                                               structural_evidence_meta=structural_evidence_meta)
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                 if tc.get("id"):
@@ -3651,7 +4129,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                                      "この会話で取得した量が多すぎるため打ち切りました")}
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
-                                           structural_evidence_meta=structural_evidence_meta)
+                                           structural_evidence_meta=structural_evidence_meta,
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                 return
             docs |= d
             cites += c
@@ -3665,13 +4144,16 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             # card/edge）は citation を生成しないが、具体的な検証済みエントリがあれば根拠として正当。
             # 根拠ゲートが citation 件数だけで判定して資料一覧・件数質問や graph-only 回答を誤って
             # 落とさないためのシグナルとして記録する（troubleshoot 以外の lens でも graph 根拠を認める）。
+            # C2: この呼び出し1回分の構造的根拠だけを先にローカルへ集め（`state.add_tool_result` は
+            # 「この呼び出しで新たに得た分」だけを見る契約）、その後にターン全体の累積へ合流する。
+            _call_structural: list = []
             if name == "list_docs" and "error" not in result:
                 # EV-0（拡張設計 §4.4）: list_docs は**呼び出し単位で集計した1 Evidence**とする
                 # （総件数・適用条件・列挙範囲＋列挙した各パス）——0件の呼び出しも「該当0件」という
                 # 具体的な事実として1 Evidence（ev-N）を持つ（根拠ゲート・帰属の対象になる）。
                 _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
                            if doc.get("rel_path")]
-                structural_evidence_meta.append({
+                _call_structural.append({
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                   "prefix": str(args.get("path_prefix") or "").strip(),
@@ -3682,7 +4164,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
                 # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
                 # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
-                structural_evidence_meta.append({
+                _call_structural.append({
                     "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
                     "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
                                  "count": result.get("count", 0),
@@ -3693,19 +4175,45 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 # `d` はその検証済み doc_id 集合そのもの）——ここで再検証しない。裏付け doc を
                 # 主張しないカード（純粋なグラフ位相情報）は、Neo4j から実際に返ったノードである
                 # こと自体を source_type=graph の構造 Evidence として計上する。
-                structural_evidence_meta += _card_structural_evidence(cd)
+                _call_structural += _card_structural_evidence(cd)
+            structural_evidence_meta += _call_structural
+            # C2（探索ループの文脈整理）: 既存の docs/cites/cards の収集と並行して調査状態も育てる
+            # （検証前の生 citation・確定済みの構造的根拠・精読本文——`add_tool_result` docstring 参照）。
+            state.add_tool_result(name, args, result, c, _call_structural)
             tmsg = {"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)}
             if tc.get("id"):
                 tmsg["tool_call_id"] = tc["id"]
             msgs.append(tmsg)
+        # D2（計測）: ラウンドごとに件数・並列度・所要時間だけを1行残す（本文は出さない）。
+        _log.debug("tool batch: n=%d parallel=%d elapsed=%.2fs", len(_pending_calls),
+                  (SHERPA_TOOL_PARALLEL if _use_parallel else 1), time.monotonic() - _tool_batch_started)
         if over_limit:
             # レビュー是正（LOW-D）: 超過件数に関わらず固定ノード1件だけ生成する。
             yield {"node": _node("ツール呼び出し上限", "1回の応答あたりの実行数上限に達したため打ち切りました")}
             # secRV MED-3 (c): この応答は上限超過＝以降のターンへは進まず、ここで打ち切る。
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
-                                       structural_evidence_meta=structural_evidence_meta)
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
+        _round_bounds.append((_round_start, len(msgs)))
+        # 探索ループの文脈整理: `msgs` が予算を超えたら、最新 `SHERPA_AGENTIC_KEEP_RECENT_TOOLS`
+        # 回分のツール往復を残し、それより古い「assistant(tool_calls)＋対応する tool
+        # メッセージ全部」の組を丸ごと1通の user メッセージへ置換する（system・元の質問＝
+        # `msgs[:_prefix_len]` は触れない）。境界は常に組の先頭 `_round_bounds[i][0]` に揃えるため、
+        # 組の途中で切ることはない。置換後にまた予算を超えれば、次のターン終端で同じ判定が再び
+        # 発動し、その時点の最新状態で1通だけ作り直す（要約メッセージを積み増ししない）。
+        if (len(_round_bounds) > SHERPA_AGENTIC_KEEP_RECENT_TOOLS
+                and _messages_byte_size(msgs) > SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES):
+            _cutoff = _round_bounds[-SHERPA_AGENTIC_KEEP_RECENT_TOOLS][0]
+            _collapsed_rounds = len(_round_bounds) - SHERPA_AGENTIC_KEEP_RECENT_TOOLS
+            _summary = state.render(max_bytes=SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES // 2,
+                                    keep_recent_tools=SHERPA_AGENTIC_KEEP_RECENT_TOOLS)
+            msgs[_prefix_len:_cutoff] = [
+                {"role": "user", "content": f"【ここまでの調査状態】\n{_summary}"}]
+            _shift = (_cutoff - _prefix_len) - 1   # 置換前の範囲長 → 置換後は1通ぶんだけ
+            _round_bounds = [(s - _shift, e - _shift) for s, e in _round_bounds[_collapsed_rounds:]]
+            yield {"node": _context_compacted_node(_collapsed_rounds)}
         # EXT-3（拡張設計 §3.2/§3.3）: Research Cycle 境界（`RESEARCH_CYCLE_TURNS` ターンごと）で
         # 構造化評価を1回挟む。`depth`（既定 "light"）が Medium/Deep でないときは `eval_active=False`
         # のままこのブロックを丸ごと素通りする（既存呼び出し元は誰も `depth` を渡さない＝
@@ -3720,7 +4228,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             if verdict.get("budget_exceeded"):
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world, verdict,
-                                           structural_evidence_meta=structural_evidence_meta)
+                                           structural_evidence_meta=structural_evidence_meta,
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                 return
             if verdict["status"] == "sufficient":
                 # §3.2: sufficient → Candidate/Verified から Committed Evidence へ（tail で確定）。
@@ -3762,7 +4271,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     if not final_synthesis:
         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                    verified_docs, stop_reason, world, evaluation,
-                                   structural_evidence_meta=structural_evidence_meta)
+                                   structural_evidence_meta=structural_evidence_meta,
+                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
         return
 
     committed, evidence_meta, dropped = _commit_evidence(cites, world)
@@ -3926,7 +4436,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                             used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
                             attributed_ev_ids=_attributed,
                             synthesis_failed=_synthesis_failed, attribution_eligible=_eligible,
-                            failure_kind=_failure_kind)
+                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state), gaps=state.gaps)
 
 
 def anthropic_tools_from_openai(tools: list) -> list:
@@ -3976,6 +4486,10 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     ツール名集合 `offered_names` を導出し、モデルが提示していないツール名を呼んでも `run_tool` を
     実行せず拒否する（`openai_style`/`gemini` と同じ対称化。Anthropic 経路も元々 `allowed_tools`
     引数を持たない＝常に `offered_names` を allowlist として使う）。
+
+    `SHERPA_TOOL_PARALLEL`（D1・ツール並列）: `openai_style` と同じ（tool_use が2本以上・ask_user
+    を含まないときだけ同時実行・完了順に関わらず `tool_use_id` は元の呼び出し順で `results` に
+    組む）。
     """
     if callable(client):                       # client_factory（遅延生成）にも対応
         client = client()
@@ -3990,11 +4504,21 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     tools = anthropic_tools_from_openai(src_tools)
     offered_names = frozenset(t["name"] for t in tools)
     messages: list = [*(history or []), {"role": "user", "content": user}]
+    # C2（探索ループの文脈整理）: `openai_style` と同じローカル調査状態＋ラウンド境界の追跡
+    # （Anthropic 方言は1ターンにつき assistant 1件＋user(tool_result 配列) 1件＝計2メッセージが
+    # 「組」——`_round_bounds` はメッセージの中身の形に依存せず `[start, end)` だけで組を表すため、
+    # OpenAI 方言と同じロジックをそのまま使える）。
+    state = investigation_state.InvestigationState(question=user, scope={"world": world, "layer": layer})
+    _prefix_len = len(messages)
+    _round_bounds: list[tuple[int, int]] = []
     docs: set = set()
     cites: list = []
     cards: list = []
     searched = False
     usage = _new_usage_acc()                         # F3: 全ツールターンの usage を合算
+    from . import store
+    system_settings = store.get_system_settings()
+    max_tools_per_turn = effective_max_tools_per_turn(system_settings)
     total_tool_bytes = 0                              # secRV MED-B (c): 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
     # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: provider="bedrock"（本アプリの
@@ -4002,6 +4526,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     # `AnthropicBedrock` は非対応のため実質 no-op・`model_windows.query_anthropic_context_length`
     # docstring 参照）を渡す。
     tool_result_max_bytes, tool_result_max_total_bytes = resolve_tool_result_budgets(
+        system_settings=system_settings,
         provider="bedrock", model=model, anthropic_client=client)
     verified_docs: set = set()                        # EXT-2/EV-0: read_around で実際に精読した doc_id
     structural_evidence_meta: list = []       # list_docs/graph_neighbors の検証済み根拠 detail（Evidence ID 割当用）
@@ -4009,6 +4534,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     for _ in range(MAX_TURNS):
         if stop_event is not None and stop_event.is_set():
             return
+        _round_start = len(messages)   # C2: この turn で足す assistant＋tool_result 組の開始位置
         kwargs = {"model": model, "max_tokens": mt, "messages": messages, "tools": tools}
         if system:
             kwargs["system"] = system
@@ -4019,7 +4545,8 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
         if stop == "refusal":                            # 安全上の理由で回答を控えた＝安全に終了
             yield _build_final_payload(_ANTHROPIC_REFUSAL, docs, searched, cites, cards,
                                        _usage_or_none(usage), verified_docs, "refusal", world,
-                                       structural_evidence_meta=structural_evidence_meta)
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
         tool_uses = [b for b in blocks if getattr(b, "type", None) == "tool_use"]
         if not tool_uses or stop == "max_tokens":        # ツール要求なし／打ち切り＝集めたテキストを最終回答に
@@ -4053,17 +4580,151 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                     cards, _usage_or_none(usage), verified_docs, _stop_reason,
                                     structural_evidence_meta=structural_evidence_meta,
                                     used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
-                                    attributed_ev_ids=_attributed)
+                                    attributed_ev_ids=_attributed,
+                                    read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
         searched = True
         messages.append({"role": "assistant", "content": resp.content})   # ブロックはそのまま履歴へ戻す
         results = []                                     # 全ツール結果を **1つの** user メッセージで返す
         # secRV MED-3（2026-07-18・DoS/コスト増幅）: openai_style と同じ上限を適用する（`MAX_TURNS` は
         # 応答ラウンド数だけを制限し、1応答内の tool_use 実行数は無制限だった）。
-        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `tool_uses[:MAX_TOOLS_PER_TURN]` で
-        # 単純に切り捨てる（超過件数分のノードを生成しない＝下のループ後に固定ノード1件だけ流す）。
-        over_limit = len(tool_uses) > MAX_TOOLS_PER_TURN
-        for tu in tool_uses[:MAX_TOOLS_PER_TURN]:
+        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `_pending_calls`
+        # （`tool_uses[:max_tools_per_turn]`）で単純に切り捨てる（超過件数分のノードを生成しない＝
+        # 下のループ後に固定ノード1件だけ流す）。
+        _pending_calls = tool_uses[:max_tools_per_turn]
+        over_limit = len(tool_uses) > max_tools_per_turn
+        # D1（ツール並列・同一応答内の独立した読み取りの同時実行）: ask_user を含まず・呼び出しが
+        # 2本以上あるときだけ並列にする（`SHERPA_TOOL_PARALLEL<=1` は常にこの分岐へ入らない＝
+        # 従来どおり直列）。ask_user を含む応答は question 優先の早期 return 契約（下の直列ループ）を
+        # 変えないため対象外にする。
+        _has_ask_user = any(getattr(tu, "name", None) == "ask_user" for tu in _pending_calls)
+        _use_parallel = SHERPA_TOOL_PARALLEL > 1 and len(_pending_calls) >= 2 and not _has_ask_user
+        _tool_batch_started = time.monotonic()
+        if _use_parallel:
+            # 呼び出しと結果の対応は元の呼び出し順で保つ（完了順ではない）——`_futures` は投入順
+            # そのまま積み、後段の結果処理も同じ順で走査する。ワーカーは `run_tool` の戻り値を
+            # 返すだけで、docs/cites/cards/state/results/バイト予算の更新は全てこのメインスレッド
+            # で行う。
+            from .ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
+            _futures: list = []   # (kind, tu, name, args, payload)・kind="rejected"|"run"
+            _stopped = False
+            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=SHERPA_TOOL_PARALLEL)
+            try:
+                for tu in _pending_calls:
+                    # 各呼び出しの投入前に stop_event を確認する——立っていれば未投入分は投入しない。
+                    # 投入済み（既に active ノードを yield 済み）は下の `finally` で完了を待つ。
+                    if stop_event is not None and stop_event.is_set():
+                        _stopped = True
+                        break
+                    name = getattr(tu, "name", None)
+                    args = getattr(tu, "input", None) or {}      # SDK ではパース済み dict
+                    if not isinstance(args, dict):
+                        args = {}
+                    if name not in offered_names:
+                        yield {"node": _node("許可外のツール呼び出し", "許可されていないため拒否しました")}
+                        safe_name = _clip_utf8_bytes(str(name or ""), _REJECTED_TOOL_NAME_MAX_BYTES)
+                        _futures.append(("rejected", tu, name, args, safe_name))
+                        continue
+                    yield {"node": _tool_node(name, args)}
+                    # ノード yield 直後（generator 再開後）にも stop_event を再確認する（単体呼び出し
+                    # 時と同じ LOW-E の窓塞ぎ）。
+                    if stop_event is not None and stop_event.is_set():
+                        _stopped = True
+                        break
+                    # `ThreadPoolExecutor` は呼び出し元スレッドの `contextvars.Context`（
+                    # `worlds.pin_world_root` の pin 等）を継承しない——`copy_context().run(...)` で
+                    # ワーカーへ明示的に持ち込む（さもないと pin が見えず別 root/fallback を解決しうる）。
+                    _ctx = contextvars.copy_context()
+                    fut = _executor.submit(_ctx.run, run_tool, name, args, world, scope_paths,
+                                           layer=layer, tool_result_max_bytes=tool_result_max_bytes)
+                    _futures.append(("run", tu, name, args, fut))
+            finally:
+                _executor.shutdown(wait=True)
+            # 投入完了後・結果収集前にも stop_event を再確認する——全件投入済みで待機中に停止要求が
+            # 来ると `_stopped`（投入時にしか更新しない）は偽のままのため、ここで別途確認しないと
+            # 停止後に結果を results/state へ積み done ノードを yield してしまう。
+            if _stopped or (stop_event is not None and stop_event.is_set()):
+                return   # 停止契約: 結果は results に積まず final も出さない（既存の stop_event 契約と同型）。
+            for kind, tu, name, args, payload in _futures:
+                if kind == "rejected":
+                    safe_name = payload
+                    result = {"error": f"ツール {safe_name} は使用できません"}
+                    total_tool_bytes += _result_byte_size(result)
+                    if total_tool_bytes > tool_result_max_total_bytes:
+                        yield {"node": _node("ツール結果の合計サイズ上限",
+                                             "この会話で取得した量が多すぎるため打ち切りました")}
+                        yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                                   verified_docs, "budget_exceeded", world,
+                                                   structural_evidence_meta=structural_evidence_meta,
+                                                   read_evidence=_read_evidence_payload(state))
+                        return
+                    results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
+                                    "content": json.dumps(result, ensure_ascii=False)})
+                    continue
+                try:
+                    result, d, c, cd = payload.result()
+                except GraphSchemaEraError:
+                    # 旧世代グラフ→再取り込み案内で停止する既存契約（`providers/base.py::_agentic_run`
+                    # の `except GraphSchemaEraError: raise` 参照）——通常のツールエラーへ丸めず、
+                    # 直列時と同じくそのまま再送出する（他の呼び出しは既に並走して完了済みでも
+                    # run 全体を止める・fail-loud）。
+                    raise
+                except Exception as e:
+                    # ワーカー（`run_tool`）の例外はこの呼び出しだけの error 結果に変換する
+                    # （他の呼び出しは既に並走して完了済み・止めない）。生の例外文字列（絶対パス
+                    # 等を含みうる）は次ターンの外部 LLM 送信本文へは出さず、固定文言にする——
+                    # 詳細はマスク済みのサーバーログにだけ残す（`openai_style` と同じ流儀。
+                    # Anthropic 経路は raw headers を持たない＝secret 抽出対象が無い）。
+                    from .ingest.graph_extract import _log_masked_exception
+                    _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e, None)
+                    result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
+                hit_node = _hit_summary_node(name, args, result)
+                if hit_node:
+                    yield {"node": hit_node}
+                degrade_node = _degrade_result_node(result)
+                if degrade_node:
+                    yield {"node": degrade_node}
+                truncated_node = _truncated_docs_node(result)
+                if truncated_node:
+                    yield {"node": truncated_node}
+                total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
+                if total_tool_bytes > tool_result_max_total_bytes:
+                    yield {"node": _node("ツール結果の合計サイズ上限",
+                                         "この会話で取得した量が多すぎるため打ち切りました")}
+                    yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                               verified_docs, "budget_exceeded", world,
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state))
+                    return
+                docs |= d
+                cites += c
+                cards += cd
+                if name in ("read_around", "read_doc") and "error" not in result:
+                    verified_docs |= d
+                _call_structural: list = []
+                if name == "list_docs" and "error" not in result:
+                    _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
+                               if doc.get("rel_path")]
+                    _call_structural.append({
+                        "doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                        "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
+                                      "prefix": str(args.get("path_prefix") or "").strip(),
+                                      "pattern": str(args.get("name_pattern") or "").strip()},
+                        "matched_doc_ids": _matched})
+                if name == "folder_tree" and "error" not in result:
+                    _call_structural.append({
+                        "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+                        "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
+                                     "count": result.get("count", 0),
+                                     "shown": len(result.get("folders") or [])},
+                        "matched_doc_ids": []})
+                if name == "graph_neighbors" and cd:
+                    _call_structural += _card_structural_evidence(cd)
+                structural_evidence_meta += _call_structural
+                state.add_tool_result(name, args, result, c, _call_structural)
+                results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
+                                "content": json.dumps(result, ensure_ascii=False)})
+        for tu in ([] if _use_parallel else _pending_calls):
             # secRV MED-3 (b): 各ツール実行の直前に stop_event を確認する。
             if stop_event is not None and stop_event.is_set():
                 return
@@ -4084,7 +4745,8 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
-                                               structural_evidence_meta=structural_evidence_meta)
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
                                 "content": json.dumps(result, ensure_ascii=False)})
@@ -4135,7 +4797,8 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                      "この会話で取得した量が多すぎるため打ち切りました")}
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
-                                           structural_evidence_meta=structural_evidence_meta)
+                                           structural_evidence_meta=structural_evidence_meta,
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                 return
             docs |= d
             cites += c
@@ -4146,13 +4809,16 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 verified_docs |= d
             # list_docs／graph_neighbors は citation を生成しないが、それ自体が根拠として正当
             # （`openai_style` と同じ規則・§1 参照）。
+            # C2: この呼び出し1回分の構造的根拠だけを先にローカルへ集め（`state.add_tool_result` は
+            # 「この呼び出しで新たに得た分」だけを見る契約）、その後にターン全体の累積へ合流する。
+            _call_structural: list = []
             if name == "list_docs" and "error" not in result:
                 # EV-0（拡張設計 §4.4）: list_docs は**呼び出し単位で集計した1 Evidence**とする
                 # （総件数・適用条件・列挙範囲＋列挙した各パス）——0件の呼び出しも「該当0件」という
                 # 具体的な事実として1 Evidence（ev-N）を持つ（根拠ゲート・帰属の対象になる）。
                 _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
                            if doc.get("rel_path")]
-                structural_evidence_meta.append({
+                _call_structural.append({
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                   "prefix": str(args.get("path_prefix") or "").strip(),
@@ -4163,7 +4829,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
                 # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
                 # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
-                structural_evidence_meta.append({
+                _call_structural.append({
                     "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
                     "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
                                  "count": result.get("count", 0),
@@ -4174,9 +4840,14 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 # `d` はその検証済み doc_id 集合そのもの）——ここで再検証しない。裏付け doc を
                 # 主張しないカード（純粋なグラフ位相情報）は、Neo4j から実際に返ったノードである
                 # こと自体を source_type=graph の構造 Evidence として計上する。
-                structural_evidence_meta += _card_structural_evidence(cd)
+                _call_structural += _card_structural_evidence(cd)
+            structural_evidence_meta += _call_structural
+            state.add_tool_result(name, args, result, c, _call_structural)
             results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
                             "content": json.dumps(result, ensure_ascii=False)})
+        # D2（計測）: ラウンドごとに件数・並列度・所要時間だけを1行残す（本文は出さない）。
+        _log.debug("tool batch: n=%d parallel=%d elapsed=%.2fs", len(_pending_calls),
+                  (SHERPA_TOOL_PARALLEL if _use_parallel else 1), time.monotonic() - _tool_batch_started)
         if over_limit:
             # レビュー是正（LOW-D）: 超過件数に関わらず固定ノード1件だけ生成する。
             yield {"node": _node("ツール呼び出し上限", "1回の応答あたりの実行数上限に達したため打ち切りました")}
@@ -4184,12 +4855,28 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             # tool_result が欠けたまま Anthropic API へ送り返さない＝プロトコル違反も避けられる）。
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
-                                       structural_evidence_meta=structural_evidence_meta)
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
         messages.append({"role": "user", "content": results})
+        _round_bounds.append((_round_start, len(messages)))
+        # C2（探索ループの文脈整理）: `openai_style` と同じ判定・置換（この方言は1組＝
+        # assistant 1件＋user(tool_result 配列) 1件の2メッセージ）。
+        if (len(_round_bounds) > SHERPA_AGENTIC_KEEP_RECENT_TOOLS
+                and _messages_byte_size(messages) > SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES):
+            _cutoff = _round_bounds[-SHERPA_AGENTIC_KEEP_RECENT_TOOLS][0]
+            _collapsed_rounds = len(_round_bounds) - SHERPA_AGENTIC_KEEP_RECENT_TOOLS
+            _summary = state.render(max_bytes=SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES // 2,
+                                    keep_recent_tools=SHERPA_AGENTIC_KEEP_RECENT_TOOLS)
+            messages[_prefix_len:_cutoff] = [
+                {"role": "user", "content": f"【ここまでの調査状態】\n{_summary}"}]
+            _shift = (_cutoff - _prefix_len) - 1
+            _round_bounds = [(s - _shift, e - _shift) for s, e in _round_bounds[_collapsed_rounds:]]
+            yield {"node": _context_compacted_node(_collapsed_rounds)}
     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                verified_docs, "turns_exhausted", world,
-                               structural_evidence_meta=structural_evidence_meta)
+                               structural_evidence_meta=structural_evidence_meta,
+                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
 
 
 def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_paths,
@@ -4215,6 +4902,10 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     ツール名集合 `offered_names` を導出し、モデルが提示していないツール名を呼んでも `run_tool` を
     実行せず拒否する（`openai_style` と同じ対称化。Gemini は元々 `allowed_tools` 引数を持たない＝
     常に `offered_names` を allowlist として使う）。
+
+    `SHERPA_TOOL_PARALLEL`（D1・ツール並列）: `openai_style` と同じ（functionCall が2本以上・
+    ask_user を含まないときだけ同時実行）。Gemini の functionResponse は id を持たないため、
+    完了順に関わらず要求と同じ順に `resp_parts` を組むことが対応の唯一の手がかりになる。
     """
     url = llm.gemini_url(model)
     headers = llm.gemini_headers(api_key)
@@ -4231,22 +4922,33 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     contents = [{"role": ("model" if h.get("role") == "assistant" else "user"),
                 "parts": [{"text": h.get("content", "")}]} for h in (history or [])]
     contents.append({"role": "user", "parts": [{"text": user}]})
+    # C2（探索ループの文脈整理）: `openai_style`/`anthropic_style` と同じローカル調査状態＋
+    # ラウンド境界の追跡（この方言は1ターンにつき role=model 1件＋role=user(functionResponse 配列)
+    # 1件＝計2メッセージが「組」）。
+    state = investigation_state.InvestigationState(question=user, scope={"world": world, "layer": layer})
+    _prefix_len = len(contents)
+    _round_bounds: list[tuple[int, int]] = []
     docs: set = set()
     cites: list = []
     cards: list = []
     searched = False
     usage = _new_usage_acc()                   # F3: 全ツールターンの usage を合算
+    from . import store
+    system_settings = store.get_system_settings()
+    max_tools_per_turn = effective_max_tools_per_turn(system_settings)
     total_tool_bytes = 0                        # secRV MED-B (c): 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
     # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: provider="gemini"（現状ライブ窓照会も
     # シード表も対象外＝登録値/不明のみを通る・管理画面の登録欄で上書き可能）。
     tool_result_max_bytes, tool_result_max_total_bytes = resolve_tool_result_budgets(
+        system_settings=system_settings,
         provider="gemini", model=model)
     verified_docs: set = set()                  # EXT-2/EV-0: read_around で実際に精読した doc_id
     structural_evidence_meta: list = []       # list_docs/graph_neighbors の検証済み根拠 detail（Evidence ID 割当用）
     for _ in range(MAX_TURNS):
         if stop_event is not None and stop_event.is_set():
             return
+        _round_start = len(contents)   # C2: この turn で足す model＋functionResponse 組の開始位置
         body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents,
                 "tools": tools, "generationConfig": {"temperature": 0.2}}
         resp = _post(url, headers, body)
@@ -4283,16 +4985,147 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                                     cards, _usage_or_none(usage), verified_docs, _stop_reason,
                                     structural_evidence_meta=structural_evidence_meta,
                                     used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
-                                    attributed_ev_ids=_attributed)
+                                    attributed_ev_ids=_attributed,
+                                    read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
         searched = True
         contents.append({"role": "model", "parts": parts})
         resp_parts = []
         # secRV MED-3（2026-07-18・DoS/コスト増幅）: openai_style/anthropic_style と同じ上限を適用する。
-        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `calls[:MAX_TOOLS_PER_TURN]` で
-        # 単純に切り捨てる（超過件数分のノードを生成しない＝下のループ後に固定ノード1件だけ流す）。
-        over_limit = len(calls) > MAX_TOOLS_PER_TURN
-        for fc in calls[:MAX_TOOLS_PER_TURN]:
+        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `_pending_calls`
+        # （`calls[:max_tools_per_turn]`）で単純に切り捨てる（超過件数分のノードを生成しない＝
+        # 下のループ後に固定ノード1件だけ流す）。
+        _pending_calls = calls[:max_tools_per_turn]
+        over_limit = len(calls) > max_tools_per_turn
+        # D1（ツール並列・同一応答内の独立した読み取りの同時実行）: ask_user を含まず・呼び出しが
+        # 2本以上あるときだけ並列にする（`SHERPA_TOOL_PARALLEL<=1` は常にこの分岐へ入らない＝
+        # 従来どおり直列）。ask_user を含む応答は question 優先の早期 return 契約（下の直列ループ）を
+        # 変えないため対象外にする。
+        _has_ask_user = any(fc.get("name") == "ask_user" for fc in _pending_calls)
+        _use_parallel = SHERPA_TOOL_PARALLEL > 1 and len(_pending_calls) >= 2 and not _has_ask_user
+        _tool_batch_started = time.monotonic()
+        if _use_parallel:
+            # 呼び出しと結果の対応は元の呼び出し順で保つ（完了順ではない・Gemini の functionResponse
+            # は id を持たないため要求順そのものが対応の唯一の手がかり）——`_futures` は投入順
+            # そのまま積み、後段の結果処理も同じ順で走査する。ワーカーは `run_tool` の戻り値を
+            # 返すだけで、docs/cites/cards/state/resp_parts/バイト予算の更新は全てこのメイン
+            # スレッドで行う。
+            from .ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
+            _futures: list = []   # (kind, fc, name, args, payload)・kind="rejected"|"run"
+            _stopped = False
+            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=SHERPA_TOOL_PARALLEL)
+            try:
+                for fc in _pending_calls:
+                    # 各呼び出しの投入前に stop_event を確認する——立っていれば未投入分は投入しない。
+                    # 投入済み（既に active ノードを yield 済み）は下の `finally` で完了を待つ。
+                    if stop_event is not None and stop_event.is_set():
+                        _stopped = True
+                        break
+                    name = fc.get("name")
+                    args = fc.get("args") or {}
+                    if name not in offered_names:
+                        yield {"node": _node("許可外のツール呼び出し", "許可されていないため拒否しました")}
+                        safe_name = _clip_utf8_bytes(str(name or ""), _REJECTED_TOOL_NAME_MAX_BYTES)
+                        _futures.append(("rejected", fc, name, args, safe_name))
+                        continue
+                    yield {"node": _tool_node(name, args)}
+                    # ノード yield 直後（generator 再開後）にも stop_event を再確認する（単体呼び出し
+                    # 時と同じ LOW-E の窓塞ぎ）。
+                    if stop_event is not None and stop_event.is_set():
+                        _stopped = True
+                        break
+                    # `ThreadPoolExecutor` は呼び出し元スレッドの `contextvars.Context`（
+                    # `worlds.pin_world_root` の pin 等）を継承しない——`copy_context().run(...)` で
+                    # ワーカーへ明示的に持ち込む（さもないと pin が見えず別 root/fallback を解決しうる）。
+                    _ctx = contextvars.copy_context()
+                    fut = _executor.submit(_ctx.run, run_tool, name, args, world, scope_paths,
+                                           layer=layer, tool_result_max_bytes=tool_result_max_bytes)
+                    _futures.append(("run", fc, name, args, fut))
+            finally:
+                _executor.shutdown(wait=True)
+            # 投入完了後・結果収集前にも stop_event を再確認する——全件投入済みで待機中に停止要求が
+            # 来ると `_stopped`（投入時にしか更新しない）は偽のままのため、ここで別途確認しないと
+            # 停止後に結果を resp_parts/state へ積み done ノードを yield してしまう。
+            if _stopped or (stop_event is not None and stop_event.is_set()):
+                return   # 停止契約: 結果は resp_parts に積まず final も出さない（既存の stop_event 契約と同型）。
+            for kind, fc, name, args, payload in _futures:
+                if kind == "rejected":
+                    safe_name = payload
+                    result = {"error": f"ツール {safe_name} は使用できません"}
+                    total_tool_bytes += _result_byte_size(result)
+                    if total_tool_bytes > tool_result_max_total_bytes:
+                        yield {"node": _node("ツール結果の合計サイズ上限",
+                                             "この会話で取得した量が多すぎるため打ち切りました")}
+                        yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                                   verified_docs, "budget_exceeded", world,
+                                                   structural_evidence_meta=structural_evidence_meta,
+                                                   read_evidence=_read_evidence_payload(state))
+                        return
+                    resp_parts.append({"functionResponse": {"name": name, "response": result}})
+                    continue
+                try:
+                    result, d, c, cd = payload.result()
+                except GraphSchemaEraError:
+                    # 旧世代グラフ→再取り込み案内で停止する既存契約（`providers/base.py::_agentic_run`
+                    # の `except GraphSchemaEraError: raise` 参照）——通常のツールエラーへ丸めず、
+                    # 直列時と同じくそのまま再送出する（他の呼び出しは既に並走して完了済みでも
+                    # run 全体を止める・fail-loud）。
+                    raise
+                except Exception as e:
+                    # ワーカー（`run_tool`）の例外はこの呼び出しだけの error 結果に変換する
+                    # （他の呼び出しは既に並走して完了済み・止めない）。生の例外文字列（絶対パス
+                    # 等を含みうる）は次ターンの外部 LLM 送信本文へは出さず、固定文言にする——
+                    # 詳細はマスク済みのサーバーログにだけ残す（`openai_style` と同じ流儀。
+                    # `api_key` は実キーそのもの＝`_log_masked_exception` の secret へそのまま渡せる）。
+                    from .ingest.graph_extract import _log_masked_exception
+                    _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e, api_key)
+                    result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
+                hit_node = _hit_summary_node(name, args, result)
+                if hit_node:
+                    yield {"node": hit_node}
+                degrade_node = _degrade_result_node(result)
+                if degrade_node:
+                    yield {"node": degrade_node}
+                truncated_node = _truncated_docs_node(result)
+                if truncated_node:
+                    yield {"node": truncated_node}
+                total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
+                if total_tool_bytes > tool_result_max_total_bytes:
+                    yield {"node": _node("ツール結果の合計サイズ上限",
+                                         "この会話で取得した量が多すぎるため打ち切りました")}
+                    yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                               verified_docs, "budget_exceeded", world,
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state))
+                    return
+                docs |= d
+                cites += c
+                cards += cd
+                if name in ("read_around", "read_doc") and "error" not in result:
+                    verified_docs |= d
+                _call_structural: list = []
+                if name == "list_docs" and "error" not in result:
+                    _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
+                               if doc.get("rel_path")]
+                    _call_structural.append({
+                        "doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                        "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
+                                      "prefix": str(args.get("path_prefix") or "").strip(),
+                                      "pattern": str(args.get("name_pattern") or "").strip()},
+                        "matched_doc_ids": _matched})
+                if name == "folder_tree" and "error" not in result:
+                    _call_structural.append({
+                        "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
+                        "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
+                                     "count": result.get("count", 0),
+                                     "shown": len(result.get("folders") or [])},
+                        "matched_doc_ids": []})
+                if name == "graph_neighbors" and cd:
+                    _call_structural += _card_structural_evidence(cd)
+                structural_evidence_meta += _call_structural
+                state.add_tool_result(name, args, result, c, _call_structural)
+                resp_parts.append({"functionResponse": {"name": name, "response": result}})
+        for fc in ([] if _use_parallel else _pending_calls):
             # secRV MED-3 (b): 各ツール実行の直前に stop_event を確認する。
             if stop_event is not None and stop_event.is_set():
                 return
@@ -4311,7 +5144,8 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
-                                               structural_evidence_meta=structural_evidence_meta)
+                                               structural_evidence_meta=structural_evidence_meta,
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 resp_parts.append({"functionResponse": {"name": name, "response": result}})
                 continue
@@ -4358,7 +5192,8 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                                      "この会話で取得した量が多すぎるため打ち切りました")}
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
-                                           structural_evidence_meta=structural_evidence_meta)
+                                           structural_evidence_meta=structural_evidence_meta,
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                 return
             docs |= d
             cites += c
@@ -4369,13 +5204,16 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 verified_docs |= d
             # list_docs／graph_neighbors は citation を生成しないが、それ自体が根拠として正当
             # （`openai_style` と同じ規則・§1 参照）。
+            # C2: この呼び出し1回分の構造的根拠だけを先にローカルへ集め（`state.add_tool_result` は
+            # 「この呼び出しで新たに得た分」だけを見る契約）、その後にターン全体の累積へ合流する。
+            _call_structural: list = []
             if name == "list_docs" and "error" not in result:
                 # EV-0（拡張設計 §4.4）: list_docs は**呼び出し単位で集計した1 Evidence**とする
                 # （総件数・適用条件・列挙範囲＋列挙した各パス）——0件の呼び出しも「該当0件」という
                 # 具体的な事実として1 Evidence（ev-N）を持つ（根拠ゲート・帰属の対象になる）。
                 _matched = [doc.get("rel_path") for doc in (result.get("docs") or [])
                            if doc.get("rel_path")]
-                structural_evidence_meta.append({
+                _call_structural.append({
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                   "prefix": str(args.get("path_prefix") or "").strip(),
@@ -4386,7 +5224,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
                 # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
                 # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
-                structural_evidence_meta.append({
+                _call_structural.append({
                     "doc_id": None, "span": None, "verification_method": "folder_tree_verified",
                     "tree_meta": {"prefix": result.get("path_prefix", ""), "depth": result.get("depth"),
                                  "count": result.get("count", 0),
@@ -4397,17 +5235,38 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 # `d` はその検証済み doc_id 集合そのもの）——ここで再検証しない。裏付け doc を
                 # 主張しないカード（純粋なグラフ位相情報）は、Neo4j から実際に返ったノードである
                 # こと自体を source_type=graph の構造 Evidence として計上する。
-                structural_evidence_meta += _card_structural_evidence(cd)
+                _call_structural += _card_structural_evidence(cd)
+            structural_evidence_meta += _call_structural
+            state.add_tool_result(name, args, result, c, _call_structural)
             resp_parts.append({"functionResponse": {"name": name, "response": result}})
+        # D2（計測）: ラウンドごとに件数・並列度・所要時間だけを1行残す（本文は出さない）。
+        _log.debug("tool batch: n=%d parallel=%d elapsed=%.2fs", len(_pending_calls),
+                  (SHERPA_TOOL_PARALLEL if _use_parallel else 1), time.monotonic() - _tool_batch_started)
         if over_limit:
             # レビュー是正（LOW-D）: 超過件数に関わらず固定ノード1件だけ生成する。
             yield {"node": _node("ツール呼び出し上限", "1回の応答あたりの実行数上限に達したため打ち切りました")}
             # secRV MED-3 (c): 上限超過＝以降のターンへは進まず、ここで打ち切る。
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
-                                       structural_evidence_meta=structural_evidence_meta)
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
             return
         contents.append({"role": "user", "parts": resp_parts})
+        _round_bounds.append((_round_start, len(contents)))
+        # C2（探索ループの文脈整理）: `openai_style`/`anthropic_style` と同じ判定・置換
+        # （この方言は1組＝role=model 1件＋role=user(functionResponse 配列) 1件の2メッセージ）。
+        if (len(_round_bounds) > SHERPA_AGENTIC_KEEP_RECENT_TOOLS
+                and _messages_byte_size(contents) > SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES):
+            _cutoff = _round_bounds[-SHERPA_AGENTIC_KEEP_RECENT_TOOLS][0]
+            _collapsed_rounds = len(_round_bounds) - SHERPA_AGENTIC_KEEP_RECENT_TOOLS
+            _summary = state.render(max_bytes=SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES // 2,
+                                    keep_recent_tools=SHERPA_AGENTIC_KEEP_RECENT_TOOLS)
+            contents[_prefix_len:_cutoff] = [
+                {"role": "user", "parts": [{"text": f"【ここまでの調査状態】\n{_summary}"}]}]
+            _shift = (_cutoff - _prefix_len) - 1
+            _round_bounds = [(s - _shift, e - _shift) for s, e in _round_bounds[_collapsed_rounds:]]
+            yield {"node": _context_compacted_node(_collapsed_rounds)}
     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                verified_docs, "turns_exhausted", world,
-                               structural_evidence_meta=structural_evidence_meta)
+                               structural_evidence_meta=structural_evidence_meta,
+                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)

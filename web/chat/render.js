@@ -944,6 +944,7 @@ function answerHTML(answer, trace, feedback) {
   const evidencePacketForBadges = answer.trace_version === 2 ? (answer.data && answer.data.evidence_packet) : null;
   return chip + `<div class="headline">${mdLite(answer.headline)}</div>`
     + budgetNoteHTML(answer.data && answer.data.evidence_packet) + codexTimeoutNoteHTML(answer)
+    + codexStoppedEarlyNoteHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
     + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
     + renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges) + personalHTML
@@ -1015,6 +1016,17 @@ const CODEX_TIMEOUT_NOTE_TEXT = '調査の時間上限に達したため途中�
 function codexTimeoutNoteHTML(answer) {
   if (!answer || !answer.codex_timed_out) return '';
   return `<div class="budget-note">${esc(CODEX_TIMEOUT_NOTE_TEXT)}</div>`;
+}
+
+// Codex CLI が正常終了したが、自動継続を尽くしてもなお agent_message が作業宣言だけ（結論に
+// 届かなかった）ターン（`chat_service._is_codex_stopped_early` が根拠・`answer.codex_stopped_early`）。
+// timeout とは別マーカー（両者が同時に立つことは無い）だが、同じ注記形式・同じ resume ボタン
+// （retry_hints の kind="resume"）で案内する。
+const CODEX_STOPPED_EARLY_NOTE_TEXT = 'AI が途中経過を伝えたまま調査を終えたため、途中までの結果です。'
+  + '「続きを調べる」を押すと続きから調べられます。';
+function codexStoppedEarlyNoteHTML(answer) {
+  if (!answer || !answer.codex_stopped_early) return '';
+  return `<div class="budget-note">${esc(CODEX_STOPPED_EARLY_NOTE_TEXT)}</div>`;
 }
 
 // 回答が参照したノード/関係から小さな部分グラフを組む（impact=経路、troubleshoot=近傍チェーン）
@@ -1175,7 +1187,7 @@ function renderQa(a) {
 function renderSources(sources, verifiedDocIds, evidencePacket) {   // 04-画面の原則.md §4: 出典は常に表示（0件でも明示）
   if (!sources || !sources.length) {
     return `<div class="sources"><div class="h">出典（原本をダウンロード）</div>`
-      + '<span class="muted" style="font-size:12px">確証のある資料は見つかりませんでした</span></div>';
+      + '<span class="muted" style="font-size:var(--text-small)">確証のある資料は見つかりませんでした</span></div>';
   }
   // EXT-4（拡張設計 §10「検証バッジ」）: Evidence Packet の verification_method（あれば）を doc_id ごとに
   // 添える。無い回答（Packet を持たない/該当エントリが無い）は従来どおりバッジ無し（byte-identical）。

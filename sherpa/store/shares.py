@@ -21,7 +21,7 @@ from psycopg.types.json import Json
 
 from .. import citations as citations_mod
 from ..ingest import importance
-from .conversations import is_personal_tainted
+from .conversations import is_personal_tainted, _resolve_received_share_msg_src
 from .db import _connect, _ensure
 from .feedback import get_feedback_by_message_ids_for_user
 
@@ -177,7 +177,9 @@ def _strip_shared_message(m: dict) -> dict:
     # サイドカー）も usage と同格の内部情報＝受領共有の読者に見せない。
     # S4-b（同計画 §6.3）: usage_subs（複数プロファイル並用時の複数形サイドカー）も同格＝同一コミットで
     # usage_sub の隣に並べる（漏洩防止）。
-    _drop = ("question", "route", "trace", "usage", "usage_sub", "usage_subs")
+    # codex_usage_total（Codex のセッション累計 usage）も同格の内部専用メタ（次ターンの差分計算にしか
+    # 使わない）＝usage と同じ扱いで受領共有の読者に見せない。
+    _drop = ("question", "route", "trace", "usage", "usage_sub", "usage_subs", "codex_usage_total")
     if isinstance(a, dict):
         needs_copy = any(k in a for k in _drop)
         # 通常の受領共有は元会話の answer をそのまま読むため、`_safe_share_answer`（sanitized
@@ -229,22 +231,12 @@ def get_conversation_for_read(uid, cid) -> dict | None:
             return None                                    # 他人の id 直アクセスは不可（呼出側で 403/404）
         msg_src = conv["id"]
         if conv["origin"] == "received_share":
-            # expires_at IS NULL = 無期限（revoke されない限り active）。
-            share = c.execute(
-                "SELECT (revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())) AS active "
-                "FROM conversation_shares WHERE id=%s", (conv["share_id"],)).fetchone()
-            invited = c.execute("SELECT 1 FROM conversation_share_invites "
-                                "WHERE share_id=%s AND invitee_user_id=%s", (conv["share_id"], uid)).fetchone()
-            if not share or not share["active"] or not invited:
-                return {"conversation": conv, "messages": [], "share_status": "unavailable"}
-            # BLOCKER 1 fix: 共有後に個人 workspace 参照が追加された場合も read をブロックする。
-            # 元会話の contains_personal_workspace を確認し、TRUE ならメッセージを返さない。
-            src_conv = c.execute(
-                "SELECT contains_personal_workspace FROM conversations WHERE id=%s",
-                (conv["source_conversation_id"],)).fetchone()
-            if src_conv and src_conv["contains_personal_workspace"]:
-                return {"conversation": conv, "messages": [], "share_status": "personal_blocked"}
-            msg_src = conv["source_conversation_id"]       # 本文は元会話から（コピーしない＝取消/期限が効く）
+            # 本文は元会話から都度読む（コピーしない＝取消/期限/共有後の個人参照追加が即座に効く）。
+            # 判定は conversations.py と共有（`search_conversations` も同じ関数を使う＝二重実装しない）。
+            msg_src, status = _resolve_received_share_msg_src(
+                c, uid, conv["share_id"], conv["source_conversation_id"])
+            if status is not None:
+                return {"conversation": conv, "messages": [], "share_status": status}
         msgs = c.execute(
             "SELECT id, role, content, lens, route, trace, answer, created_at FROM messages "
             "WHERE conversation_id=%s ORDER BY id", (msg_src,)).fetchall()

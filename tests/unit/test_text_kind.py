@@ -12,15 +12,37 @@ from sherpa.ingest import text_kind
 # ---- 第1段: 拡張子マップ ----
 
 def test_classify_ext_general_languages_are_code():
-    # `.java` は含めない——`JavaAnalyzer`（登録簿）に専用対応済みのため、この軽量テキスト枠には
-    # もう来ない（`text_kind.CODE_EXT` から外している・CODE-1d）。
-    for ext in (".sql", ".sh", ".py", ".js", ".c", ".h", ".cs", ".vb", ".pl", ".ps1", ".bat"):
+    # `.java`/`.sql`/`.c`/`.h`/`.cs`/`.js`/`.sh`/`.bat`/`.vb` は含めない——専用アナライザ
+    # （`JavaAnalyzer`/`SqlDdlAnalyzer`/`CAnalyzer`/`CSharpAnalyzer`/`JsAnalyzer`/
+    # `ShellBatchAnalyzer`/`VbAnalyzer`・登録簿）が対応済みのため、この軽量テキスト枠にはもう来ない
+    # （`text_kind.CODE_EXT` から外している・CODE-1d／アナライザ拡張 S2/S6/S7/波3）。
+    for ext in (".py", ".pl", ".ps1"):
         assert text_kind.classify_ext(ext) == "code", ext
+
+
+def test_classify_ext_cpp_remains_in_lightweight_text_kind():
+    """`.cpp`/`.hpp` は A1 裁定で C++ アナライザを作らない対象外のため、専用アナライザに移らず
+    引き続き軽量テキスト枠（`text_kind.CODE_EXT`）に残る（§6）。"""
+    for ext in (".cpp", ".hpp"):
+        assert text_kind.classify_ext(ext) == "code", ext
+        assert ext in text_kind.CODE_EXT
 
 
 def test_classify_ext_config_files_are_code():
-    for ext in (".ini", ".cfg", ".conf", ".properties", ".yaml", ".yml", ".json", ".xml", ".toml"):
+    for ext in (".ini", ".cfg", ".conf", ".json", ".toml"):
         assert text_kind.classify_ext(ext) == "code", ext
+
+
+def test_classify_ext_excludes_extensions_with_dedicated_analyzers():
+    """`.properties`/`.yaml`/`.yml`/`.xml`/`.sql` はアナライザ拡張 S3b/S2 で専用アナライザ
+    （`PropertiesAnalyzer`/`YamlConfigAnalyzer`/`XmlConfigAnalyzer`/`SqlDdlAnalyzer`）が
+    登録済みのため、この軽量テキスト枠にはもう来ない（`.java` と同じ手順・CODE-1d・§6）。
+    `.js`/`.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb` も同じ理由（波3・`JsAnalyzer`/
+    `ShellBatchAnalyzer`/`VbAnalyzer`）で外している。"""
+    for ext in (".properties", ".yaml", ".yml", ".xml", ".sql", ".c", ".h", ".cs",
+               ".js", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".vb"):
+        assert text_kind.classify_ext(ext) is None, ext
+        assert ext not in text_kind.CODE_EXT
 
 
 def test_sensitive_ext_excluded_from_code_map():

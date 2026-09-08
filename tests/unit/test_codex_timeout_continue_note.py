@@ -94,6 +94,10 @@ def _setup(tmp_path: Path, monkeypatch, write_fake, users_dirname: str, timeout:
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
     monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", timeout)
+    # 偽 codex は平文 agent_message を返す（timeout 注記の検証が目的で出力スキーマは対象外）。
+    # `--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため無効化する
+    # （docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     return bin_dir
 
 

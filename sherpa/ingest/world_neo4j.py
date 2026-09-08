@@ -49,8 +49,12 @@ def _compute_graph_schema_era() -> str:
     """`GRAPH_SCHEMA_ERA` の合成（sha256 先頭12桁・決定的・rv-s3-removal）。
 
     材料: コードアナライザの分類契約版（`analyzers.registry.CODE_ANALYZERS_SCHEMA_VERSION`）・
-    言及エッジ突合の仕様版（`world_graph.MENTION_SCHEMA_VERSION`）・グラフ語彙
-    （`model.NODE_LABELS`/`EDGE_TYPES` のソート済みタプル）。いずれかが変われば合成値も変わる。
+    アナライザ登録簿の構成署名（`analyzers.registry.config_signature()`）・言及エッジ突合の仕様版
+    （`world_graph.MENTION_SCHEMA_VERSION`）・グラフ語彙（`model.NODE_LABELS`/`EDGE_TYPES` の
+    ソート済みタプル）。いずれかが変われば合成値も変わる。`config_signature()` を材料に含めるのは
+    `worker._sig`（world 署名）と同じ真実源を共有するため——新規アナライザの登録（版据え置き）でも
+    構成そのものは変わるので、これを含めないと再同期前の読取ゲート（`check_schema_era`）が
+    古いグラフをそのまま通してしまう。
 
     **`ingest.worker._sig`（last_sig・ファイル走査込みの内容署名）とは別物**——last_sig は原本の
     追加・変更のたびに動く「次回 sync で再取り込みが必要（鏡モデルの正常運転）」の署名で、
@@ -62,9 +66,9 @@ def _compute_graph_schema_era() -> str:
     遅延 import する（本モジュールを読み込む側から見て、これらは下位層のため実際には循環しない
     が、この慣例に揃える）。呼び出しは module import 時に一度だけ（`GRAPH_SCHEMA_ERA` 定義）。
     """
-    from .analyzers.registry import CODE_ANALYZERS_SCHEMA_VERSION
+    from .analyzers.registry import CODE_ANALYZERS_SCHEMA_VERSION, config_signature
     from .world_graph import MENTION_SCHEMA_VERSION
-    material = repr((CODE_ANALYZERS_SCHEMA_VERSION, MENTION_SCHEMA_VERSION,
+    material = repr((CODE_ANALYZERS_SCHEMA_VERSION, config_signature(), MENTION_SCHEMA_VERSION,
                      tuple(sorted(NODE_LABELS)), tuple(sorted(EDGE_TYPES))))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
@@ -306,7 +310,11 @@ def _sources_json(sources) -> str | None:
 
 def _node_row(n: dict) -> dict:
     """1ノード分の UNWIND 行（`world_id` はバッチ全体で共通なのでクエリの `$world` 側に出す・
-    行ごとの重複を避ける。`sources` は JSON 文字列化済み）。"""
+    行ごとの重複を避ける。`sources` は JSON 文字列化済み）。
+
+    `jcl_kind`（アナライザ拡張 S5a・JCL の `Batch` 種別＝`job`/`proc`/`include`）: JCL 以外の
+    ノードや旧 world では `None`（無いノードは null のまま・属性の追加のみ）。
+    """
     return {
         "cid": n["cid"], "name": n["name"],
         "top": n.get("top_scope"), "phase": n.get("phase"), "cat": n.get("category"),
@@ -315,6 +323,7 @@ def _node_row(n: dict) -> dict:
         "analyzer": n.get("analyzer"),
         "sources": _sources_json(n.get("sources")),
         "sources_overflow": n.get("sources_overflow_count", 0),
+        "jcl_kind": n.get("jcl_kind"),
     }
 
 
@@ -389,7 +398,7 @@ def load_world(nodes, edges, world_id, uri, user, password):
                         f"x.top_scope=row.top, x.phase=row.phase, x.category=row.cat, x.path=row.path, "
                         f"x.scope_path=row.sp, x.value=row.value, x.extraction_method=row.em, "
                         f"x.status=row.status, x.analyzer=row.analyzer, x.sources=row.sources, "
-                        f"x.sources_overflow_count=row.sources_overflow"
+                        f"x.sources_overflow_count=row.sources_overflow, x.jcl_kind=row.jcl_kind"
                     )
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_node_row(n) for n in batch]
@@ -495,10 +504,14 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
         "MATCH (n:Entity {world_id:$w}) WHERE n.name=$name "
         "  AND ($incl OR coalesce(n.status,'active')='active') "
         f"  AND {_scope_pred('n')} "
-        "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, n.name AS name",
+        "RETURN n.canonical_id AS cid, [l IN labels(n) WHERE l<>'Entity'][0] AS label, "
+        "  n.name AS name, n.path AS path",
         world=world_id, w=world_id, name=term, incl=include_deprecated, prefixes=prefixes,
     )
-    return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"]} for r in rows]
+    # `path`（RV波1是正）: 同名の起点候補（例: environment-dev/prod 相当の同名 Config キー）を
+    # 呼び出し側が区別できるようにする——既存キー（`canonical_id`/`label`/`name`）は不変・追加のみ。
+    return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"], "path": r["path"]}
+           for r in rows]
 
 
 def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPACT_MAX_DEPTH,

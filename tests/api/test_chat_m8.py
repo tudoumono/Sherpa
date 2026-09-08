@@ -942,7 +942,8 @@ def test_no_inline_handlers_in_web_js():
     import re
     web = ROOT / "web"
     assert not (web / "impact.html").exists() and not (web / "impact.js").exists()
-    bad = re.compile(r"on\w+\s*=\s*([\"']).*?\$\{")   # onclick="...${...}" 等
+    # 属性名の先頭が on で始まるものだけ（`aria-controls=` の「controls=」を on\w+= と誤検出しない）。
+    bad = re.compile(r"\bon\w+\s*=\s*([\"']).*?\$\{")   # onclick="...${...}" 等
     for p in _web_js_files():
         assert not bad.search(p.read_text(encoding="utf-8")), f"inline handler with data in {p.name}"
 

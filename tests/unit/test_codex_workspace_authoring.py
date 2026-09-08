@@ -142,6 +142,277 @@ def test_authoring_symlink_rejected_fail_closed():
     assert A._safe_workspace_authoring(ud, "a/b") is None
 
 
+# ===== `_safe_run_authoring`: 実行ごとの作業領域（同一 uid 直列化 lock 撤去の置き換え） =====
+
+def test_safe_run_authoring_creates_distinct_dirs_under_authoring():
+    """毎回 `authoring/run-<乱数>` という別名の新規ディレクトリを作って返す（同一 uid でも衝突しない）。"""
+    from sherpa.providers.codex import sandbox as SB
+    import pathlib, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    ud = d / "users"
+    (ud / "u1" / "workspace").mkdir(parents=True)
+
+    r1 = SB._safe_run_authoring(ud, "u1")
+    r2 = SB._safe_run_authoring(ud, "u1")
+    assert r1 is not None and r2 is not None
+    assert r1 != r2, "2回の呼び出しで同じ run dir を返している（並走時に衝突する）"
+    for r in (r1, r2):
+        assert r.is_dir()
+        assert r.name.startswith("run-")
+        assert r.parent == ud / "u1" / "workspace" / "authoring"
+        assert r.resolve().relative_to((ud / "u1" / "workspace").resolve()) == pathlib.Path(
+            "authoring") / r.name
+
+
+def test_safe_run_authoring_fail_closed_on_invalid_uid_and_symlinked_authoring():
+    """`_safe_workspace_authoring` と同じ封じ込め（uid 形式・symlink 拒否）を土台にしているため、
+    それらが拒否するケースはそのまま None（fail-closed）になる。"""
+    from sherpa.providers.codex import sandbox as SB
+    import pathlib, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    ud = d / "users"
+
+    assert SB._safe_run_authoring(ud, "../etc") is None
+    assert SB._safe_run_authoring(ud, "a/b") is None
+
+    (ud / "bad" / "workspace").mkdir(parents=True)
+    evil = d / "evil"; evil.mkdir()
+    (ud / "bad" / "workspace" / "authoring").symlink_to(evil)
+    assert SB._safe_run_authoring(ud, "bad") is None, "symlink authoring 配下で run dir を作ってしまった"
+    assert not list(evil.iterdir()), "symlink の指す先（authoring 外）に run dir を作ってしまった"
+
+
+def test_safe_run_authoring_sweeps_stale_run_dirs_but_keeps_fresh_ones():
+    """`authoring/` 直下の `run-*` のうち mtime が24時間より古いものだけ best-effort で削除する
+    （クラッシュ等で残った前回実行の作業領域の掃除）。新しいものと symlink はそのまま残る。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, tempfile, time
+    d = pathlib.Path(tempfile.mkdtemp())
+    ud = d / "users"
+    authoring = ud / "u1" / "workspace" / "authoring"
+    authoring.mkdir(parents=True)
+
+    stale = authoring / "run-deadbeef0000"
+    stale.mkdir()
+    (stale / "leftover.txt").write_text("crashed run leftover", encoding="utf-8")
+    old_time = time.time() - SB._RUN_DIR_TTL_SECONDS - 3600
+    _os.utime(stale, (old_time, old_time))
+
+    fresh = authoring / "run-cafebabe0000"
+    fresh.mkdir()
+
+    stale_link_target = d / "evil-link-target"; stale_link_target.mkdir()
+    stale_link = authoring / "run-symlinked00000"
+    stale_link.symlink_to(stale_link_target)
+    _os.utime(stale_link, (old_time, old_time), follow_symlinks=False)
+
+    new_run = SB._safe_run_authoring(ud, "u1")
+
+    assert new_run is not None and new_run.is_dir()
+    assert not stale.exists(), "24時間より古い run-* が掃除されていない"
+    assert fresh.is_dir(), "新しい run-* まで誤って消してしまった"
+    assert stale_link.is_symlink(), "symlink の run-* を削除してしまった（symlink target を巻き込む危険）"
+    assert stale_link_target.is_dir(), "symlink の指す先を巻き込んで削除してしまった"
+
+
+def test_safe_run_authoring_keeps_active_run_dir_even_when_mtime_is_stale():
+    """24時間しきい値は mtime だけを見ると、実行時間が長いターン
+    （timeout 延長・長時間実行等）の run dir を「稼働中のまま」誤って掃除しうる。
+    `_register_active_run_dir`（`_safe_run_authoring` が作成直後に登録）された run dir は、
+    mtime が期限切れでも掃除対象から除外される——解放（`_release_active_run_dir`）後の
+    次回スイープで初めて掃除対象になる。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, tempfile, time
+    d = pathlib.Path(tempfile.mkdtemp())
+    ud = d / "users"
+    (ud / "u1" / "workspace").mkdir(parents=True)
+
+    active_run = SB._safe_run_authoring(ud, "u1")   # 作成直後に「稼働中」へ登録される
+    assert active_run is not None
+    old_time = time.time() - SB._RUN_DIR_TTL_SECONDS - 3600
+    _os.utime(active_run, (old_time, old_time))     # 長時間実行で mtime が古くなった状態を模す
+
+    # 別の実行がもう1回 run dir を要求する＝掃除スイープが走るが、稼働中なので対象外のはず。
+    another_run = SB._safe_run_authoring(ud, "u1")
+    assert another_run is not None and another_run != active_run
+    assert active_run.is_dir(), "稼働中の run dir が mtime だけを理由に掃除されてしまった"
+
+    SB._release_active_run_dir(active_run)
+    third_run = SB._safe_run_authoring(ud, "u1")   # 解放後・次回スイープでようやく掃除対象になる
+    assert third_run is not None
+    assert not active_run.exists(), "解放後の次回スイープで期限切れ run dir が掃除されていない"
+
+
+def test_chmod_if_not_symlink_never_follows_symlinks():
+    """`_chmod_if_not_symlink`（単体）は symlink を渡されても何もしない——`os.chmod` は既定で
+    symlink を追従してリンク先の権限を変えてしまうため、呼び出し側（`_restore_removable_permissions`
+    の dirnames フィルタ等）が症状を防いでいるだけでなく、この関数自体も symlink 単体で
+    呼ばれても安全であることを直接確認する（symlink-to-ファイルは dirnames フィルタの対象外
+    ＝この関数自身のチェックだけが頼り）。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, stat, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    target = d / "target-file"
+    target.write_text("x", encoding="utf-8")
+    _os.chmod(target, 0o644)
+    link = d / "link-to-file"
+    link.symlink_to(target)
+    original_mode = stat.S_IMODE(_os.stat(target).st_mode)
+
+    SB._chmod_if_not_symlink(str(link))
+
+    assert stat.S_IMODE(_os.stat(target).st_mode) == original_mode, \
+        "symlink 経由でリンク先の権限が変わってしまった"
+
+
+def test_remove_dir_best_effort_does_not_chmod_symlink_targets():
+    """後始末（`_remove_dir_best_effort`）は symlink を辿ってリンク先（run dir 外の任意の
+    ディレクトリでありうる）の権限を変えてはいけない。書込不可のディレクトリ配下に外部への
+    symlink を置いた run dir でも、リンク先の権限は無変更のまま run dir 自体は削除できること。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, stat, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    run_dir = d / "run-abc123456789"
+    locked = run_dir / "locked"
+    locked.mkdir(parents=True)
+    evil_target = d / "external-target"
+    evil_target.mkdir()
+    _os.chmod(evil_target, 0o755)
+    (locked / "evil").symlink_to(evil_target)
+    _os.chmod(locked, 0o500)   # 書込不可＝配下のエントリを削除できない（クラッシュ等で戻し忘れた想定）
+
+    original_target_mode = stat.S_IMODE(_os.stat(evil_target).st_mode)
+
+    SB._remove_dir_best_effort(run_dir)
+
+    assert stat.S_IMODE(_os.stat(evil_target).st_mode) == original_target_mode, \
+        "symlink のリンク先（run dir 外）の権限が変わってしまった"
+    assert not run_dir.exists(), "run dir 自体が削除されていない（権限回復付き再試行が効いていない）"
+
+
+def test_remove_dir_best_effort_does_not_chmod_hardlinked_files():
+    """後始末はファイルには一切 chmod しない——run dir 内のファイルが run dir 外のファイルと
+    ハードリンク（同一 inode＝同一の権限ビットを共有）していると、ファイルへの chmod は
+    symlink とは別経路で run dir 外の権限を変えてしまう（rmtree に必要なのはディレクトリの
+    書込/実行権だけで、ファイル自体の権限は無関係）。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, stat, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    run_dir = d / "run-hardlink0000001"
+    locked = run_dir / "locked"
+    locked.mkdir(parents=True)
+    external_file = d / "external-shared-file.txt"
+    external_file.write_text("shared content", encoding="utf-8")
+    _os.chmod(external_file, 0o644)
+    _os.link(str(external_file), str(locked / "hardlinked.txt"))   # 同一 inode を共有
+    _os.chmod(locked, 0o500)   # 書込不可＝配下のエントリを削除できない（クラッシュ等で戻し忘れた想定）
+
+    original_mode = stat.S_IMODE(_os.stat(external_file).st_mode)
+
+    SB._remove_dir_best_effort(run_dir)
+
+    assert stat.S_IMODE(_os.stat(external_file).st_mode) == original_mode, \
+        "ハードリンク経由で run dir 外のファイルの権限が変わってしまった"
+    assert not run_dir.exists(), "run dir 自体が削除されていない（権限回復付き再試行が効いていない）"
+
+
+def test_cleanup_stale_run_dirs_recovers_permission_restricted_leftover():
+    """24時間掃除は権限制限（0500 のサブディレクトリ）が残ったクラッシュ残骸を回収できず
+    残り続けていた——`_remove_dir_best_effort` を共通ヘルパーとして使うことで、非 symlink
+    エントリの権限を戻して確実に掃除できることを確認する。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, tempfile, time
+    d = pathlib.Path(tempfile.mkdtemp())
+    ud = d / "users"
+    authoring = ud / "u1" / "workspace" / "authoring"
+    authoring.mkdir(parents=True)
+
+    stale = authoring / "run-permlocked0000"
+    locked_sub = stale / "locked"
+    locked_sub.mkdir(parents=True)
+    (locked_sub / "leftover.txt").write_text("crashed run leftover", encoding="utf-8")
+    _os.chmod(locked_sub, 0o500)
+    old_time = time.time() - SB._RUN_DIR_TTL_SECONDS - 3600
+    _os.utime(stale, (old_time, old_time))
+
+    new_run = SB._safe_run_authoring(ud, "u1")
+
+    assert new_run is not None
+    assert not stale.exists(), "権限制限された残骸（0500 のサブディレクトリ）が回収されずに残っている"
+
+
+def test_cleanup_stale_run_dirs_stat_failure_is_logged_without_leaking_path(monkeypatch, caplog):
+    """staleness 判定の `p.stat()` 自体が失敗した場合（クラッシュ・並行削除等との競合）も、
+    `p` は絶対パス（users_dir/uid を含む）——そのまま記録せず、相対名（run-* 自身の識別子）と
+    例外の型・errno だけを記録することを確認する。"""
+    import logging
+    import pathlib
+    import tempfile
+    from sherpa.providers.codex import sandbox as SB
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    authoring = d / "users" / "u1" / "workspace" / "authoring"
+    authoring.mkdir(parents=True)
+    target = authoring / "run-statfail0000"
+    target.mkdir()
+
+    _orig_stat = pathlib.Path.stat
+    call_counts: dict = {}
+
+    def _boom_stat(self, *a, **kw):
+        # 掃除対象フィルタ（`p.is_symlink()`/`p.is_dir()` は Python 3.12 pathlib では
+        # いずれも内部で `self.stat()` を呼ぶ）ぶんは本物を通し、対象コードの明示的な
+        # mtime 取得（3回目の呼び出し）だけ失敗させる。
+        if self.name == "run-statfail0000":
+            call_counts[self.name] = call_counts.get(self.name, 0) + 1
+            if call_counts[self.name] >= 3:
+                raise OSError(13, "Permission denied", str(self))
+        return _orig_stat(self, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "stat", _boom_stat)
+
+    with caplog.at_level(logging.WARNING, logger="sherpa"):
+        SB._cleanup_stale_run_dirs(authoring)
+    monkeypatch.undo()   # 以降のアサーション自体が stat を呼んでも罠に掛からないよう即座に戻す
+
+    matched = [r for r in caplog.records if "stale codex run dir cleanup failed" in r.message]
+    assert matched, "stat 失敗が warning として記録されていない"
+    for r in matched:
+        assert str(d) not in r.message, "warning にフルパス（users_dir を含む絶対パス）が出ている"
+        assert "Permission denied" not in r.message, "例外の文字列表現がそのまま warning に出ている"
+        # OSError(13, ...) は CPython の errno 連動サブクラス化で PermissionError になる
+        # （型そのものは何であれ、型名・errno が記録されていることだけを確認する）。
+        assert "type=PermissionError" in r.message and "errno=13" in r.message, \
+            f"例外の型・errno が記録されていない: {r.message!r}"
+    assert target.exists(), "stat 失敗時は掃除対象から外れる契約（continue）のはずが削除されている"
+
+
+def test_restore_removable_permissions_recovers_when_root_itself_is_mode_000():
+    """`root` 自身が 000（読み書き不可）だと、`os.walk` の前に root を chmod しないと配下の
+    子（同じく 000）を一切列挙できず取り残る——root を先に chmod してから `os.walk` することで、
+    root・子とも回収できることを確認する。"""
+    from sherpa.providers.codex import sandbox as SB
+    import os as _os
+    import pathlib, tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    run_dir = d / "run-rootlocked0000"
+    child = run_dir / "child"
+    child.mkdir(parents=True)
+    (child / "leftover.txt").write_text("crashed run leftover", encoding="utf-8")
+    _os.chmod(child, 0o000)
+    _os.chmod(run_dir, 0o000)
+
+    SB._remove_dir_best_effort(run_dir)
+
+    assert not run_dir.exists(), "root 自身が 000 のとき配下の子（同じく 000）が回収されずに残った"
+
+
 def test_codex_sessions_home_symlink_rejected_fail_closed():
     """R1b RV再検証 MEDIUM-3: 会話ごとの永続 CODEX_HOME（`.codex-sessions/{cid}`）も
     `_safe_workspace_authoring` と同じ契約で symlink を拒否する（fail-closed・None）。"""
@@ -377,19 +648,19 @@ def test_office_libs_importable():
 
 
 def test_codex_files_scan_in_ws_files(tmp_path=None):
-    """Codex 実行後に authoring/ の新規ファイルを検出するロジックを確認。
+    """Codex 実行後に run_dir の新規ファイルを検出するロジックを確認。
 
-    BLOCKER-2 fix 後: cwd = workspace/authoring/（personal files/ とは分離）。
-    _before_ws_files で authoring/ のスナップショットを取り差分検出する。
+    BLOCKER-2 fix 後: cwd = workspace/authoring/run-*/（personal files/ とは分離）。
+    _before_ws_files で run_dir のスナップショットを取り差分検出する。
     """
     from sherpa import agents as A
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
     assert "_before_ws_files" in src, "_before_ws_files スナップショットが無い"
-    assert "ws_authoring" in src, "ws_authoring（Codex cwd）が無い（BLOCKER-2 fix 確認）"
+    assert "run_dir" in src, "run_dir（Codex cwd）が無い（BLOCKER-2 fix 確認）"
     assert "record_workspace_file" in src, "record_workspace_file が呼ばれていない"
     assert "codex_wrote_files" in src, "env['codex_wrote_files'] のセットが無い"
-    # Codex の cwd は authoring/（personal files/ とは別ディレクトリ）。
+    # Codex の cwd は authoring/run-*/（personal files/ とは別ディレクトリ）。
     assert "authoring" in src, "cwd に authoring が含まれていない（BLOCKER-2: files/ 分離の確認）"
 
 
@@ -530,6 +801,35 @@ def test_facts_includes_personal(tmp_path=None):
     assert "shared.md" in result, "共有 KB の引用が消えた"
 
 
+def test_facts_qa_falls_back_to_four_citations_without_synthesis_digest():
+    """env['_synthesis_digest'] が無い呼び出し元（Heuristic/_GenProvider 等）は従来どおり
+    先頭4引用×60字のまま（回帰）——5件目の doc_id は facts に現れない。"""
+    from sherpa.agents import _facts
+    cites = [{"doc_id": f"shared{i}.md", "quote": f"quote{i}"} for i in range(5)]
+    env = {"data": {"citations": cites}}
+    result = _facts("qa", env)
+    assert all(f"shared{i}.md" in result for i in range(4))
+    assert "shared4.md" not in result
+
+
+def test_facts_qa_uses_synthesis_digest_when_present():
+    """env['_synthesis_digest']（`agentic_search.build_synthesis_digest` の全件ダイジェスト）が
+    あれば、citations の4件×60字整形の代わりにそれをそのまま使う——個人ファイル事実は従来どおり
+    末尾に追記する。"""
+    from sherpa.agents import _facts
+    cites = [{"doc_id": f"shared{i}.md", "quote": f"quote{i}"} for i in range(5)]
+    env = {
+        "data": {"citations": cites},
+        "_synthesis_digest": "ev-1: shared0.md 行 1-1「quote0」\nev-5: shared4.md 行 1-1「quote4」",
+        "_personal_facts": "\n【個人ファイル内ヒット】\n[個人ファイル: my.txt 行1] TAX=10",
+    }
+    result = _facts("qa", env)
+    assert result.startswith("ev-1: shared0.md")
+    assert "shared4.md" in result   # digest 経由なら5件目も見える
+    assert "該当箇所:" not in result   # digest 経由なので4件整形は使わない
+    assert "個人ファイル内ヒット" in result   # 個人事実は従来どおり末尾に付く
+
+
 # ===== Feature C: contains_personal_workspace =====
 
 def test_set_contains_personal_workspace_exists():
@@ -614,17 +914,17 @@ def test_high1_personal_facts_injected_into_agentic_prompt():
 
 
 def test_blocker2_codex_cwd_is_authoring_not_files():
-    """BLOCKER-2 fix: CodexProvider の cwd は workspace/authoring/（files/ を含まない）。"""
+    """BLOCKER-2 fix: CodexProvider の cwd は workspace/authoring/run-*/（files/ を含まない）。"""
     from sherpa import agents as A
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    # ws_authoring を cwd に使い、files/ とは別にする。
-    assert "ws_authoring" in src, "BLOCKER-2: ws_authoring が CodexProvider.run に無い"
-    # -C オプションに ws_authoring を渡す（files/ ではない）。
-    assert '"-C", str(ws_authoring)' in src or '"-C",\n' in src, \
-        "BLOCKER-2: -C オプションに ws_authoring が渡されていない"
-    # authoring/ の cwd は files/ を含まない（files/ は cwd の外）。
-    # files/ も ws_authoring の外で作られることをソースで確認。
+    # run_dir（authoring/run-* ・ _safe_run_authoring が作る実行ごとの作業領域）を cwd に使い、files/ とは別にする。
+    assert "run_dir" in src, "BLOCKER-2: run_dir が CodexProvider.run に無い"
+    # -C オプションに run_dir を渡す（files/ ではない）。
+    assert '"-C", str(run_dir)' in src or '"-C",\n' in src, \
+        "BLOCKER-2: -C オプションに run_dir が渡されていない"
+    # authoring/run-*/ の cwd は files/ を含まない（files/ は cwd の外）。
+    # files/ も run_dir の外で作られることをソースで確認。
     assert "ws_files" in src, "files/ の参照が消えた（台帳登録 or symlink チェックに必要）"
 
 
@@ -784,12 +1084,12 @@ def test_run_argv_includes_ephemeral_and_output_last_message():
 
 
 def test_run_writes_agents_md():
-    """Phase0・§2: run() が Codex 起動前に AGENTS.md を authoring へ書く（ベストエフォート）。"""
+    """Phase0・§2: run() が Codex 起動前に AGENTS.md を run_dir（authoring/run-*）へ書く（ベストエフォート）。"""
     from sherpa import agents as A
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    assert "codex_agents_md.write_agents_md(ws_authoring)" in src, \
-        "run() から write_agents_md(ws_authoring) が呼ばれていない"
+    assert "codex_agents_md.write_agents_md(run_dir, output_schema=_schema_on)" in src, \
+        "run() から write_agents_md(run_dir, output_schema=_schema_on) が呼ばれていない"
 
 
 def test_read_last_message_fallback_reads_and_strips():

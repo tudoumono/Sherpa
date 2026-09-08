@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -30,9 +31,26 @@ from typing import Callable, Iterator
 
 _log = logging.getLogger("sherpa")
 
-# 同時実行の上限（proposal §制約）。超過は呼び出し側で 429 に変換する（TurnLimitError）。
-MAX_TURNS_PER_USER = 2
-MAX_TURNS_GLOBAL = 8
+# 同時実行の上限。超過は呼び出し側で 429 に変換する（TurnLimitError）。単一 uvicorn worker の
+# メモリと API 呼び出し量を抑える運用値＝管理画面（system_settings）で上書き可能・この2定数は
+# 未設定/DB 不達時の env フォールバック（既定）として残る（`effective_limits()` 参照）。
+# 不正値・範囲外は既定へ戻す（黙って上限ゼロや無制限にしない）。
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    """env の整数解析（`agentic_search._env_int` と同型・循環 import 回避のため独立実装）。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return v if lo <= v <= hi else default
+
+
+MAX_TURNS_PER_USER = _env_int("SHERPA_CHAT_MAX_TURNS_PER_USER", 2, 1, 16)
+MAX_TURNS_GLOBAL = _env_int("SHERPA_CHAT_MAX_TURNS_GLOBAL", 8, 1, 64)
 
 # バッファの有界化＝既存 _cap_trace（chat_service.py・trace 保存の上限）と同じ「劣化はしても壊れない」
 # 思想。ただしこちらは node だけでなく answer_delta の逐語チャンク等も含む生ログのため、桁を上げて
@@ -188,22 +206,79 @@ def _sweep_expired_locked() -> None:
         _REGISTRY.pop(tid, None)
 
 
-def _raise_if_over_limit_locked(uid: str) -> None:
+def _clamped_setting_int(raw, lo: int, hi: int) -> int | None:
+    """system_settings の生値を整数として検証する（`agentic_search._clamped_setting_int` と同型・
+    循環 import 回避のため独立実装）。型不正・範囲外は None（呼び出し側が env 既定へ倒す）。"""
+    if raw is None:
+        return None
+    try:
+        iv = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return iv if lo <= iv <= hi else None
+
+
+def effective_limits() -> tuple[int, int]:
+    """同時実行上限の実効値 `(per_user, global)`。import 時定数ではなく**ターン受付のたび**に
+    解決する（`start_turn` が `_REGISTRY_LOCK` を取得する**前**に呼ぶ・下記参照）——管理画面での
+    変更を次の受付から即反映するため。
+
+    解決順: `store.get_system_settings()`（短TTLキャッシュ付き）の `chat_max_turns_per_user`／
+    `chat_max_turns_global` → 無効・未設定・DB 不達・**契約上あり得る `None` 返り値**なら
+    env 由来の既定（`MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。`depth_profile.effective_base`
+    （`(system_settings or {}).get(...)`）と同じ fail-open（DB 不達を理由にターン受付自体を
+    落とさない・`None` 返り値もここで dict へ倒すため `sysset.get(...)` が落ちることはない）。
+    """
+    try:
+        from . import store
+        sysset = store.get_system_settings() or {}
+    except Exception:
+        sysset = {}
+    per_user = _clamped_setting_int(sysset.get("chat_max_turns_per_user"), 1, 16)
+    glob = _clamped_setting_int(sysset.get("chat_max_turns_global"), 1, 64)
+    return (per_user if per_user is not None else MAX_TURNS_PER_USER,
+            glob if glob is not None else MAX_TURNS_GLOBAL)
+
+
+def _raise_if_over_limit_locked(uid: str, max_per_user: int, max_global: int) -> None:
     """呼び出し側で `_REGISTRY_LOCK` 保持済み前提。上限超過なら `TurnLimitError` を送出する。
+
+    `max_per_user`/`max_global`: `effective_limits()` の解決結果——**呼び出し側
+    （`start_turn`）がロック取得前に解決して渡す**（`effective_limits()` はキャッシュミス時に
+    DB へ読みに行きうるため、ここで自前解決すると `_REGISTRY_LOCK` を DB I/O の間ずっと
+    保持してしまい、同じロックを取る `get_turn`/`list_running`/`stop_turn` が DB 遅延に
+    引きずられて待たされる。ここでは渡された値をそのまま使うだけで、DB には一切触れない）。
 
     conversation_id が未確定（予約中）のレコードも「未完了」として数える＝予約フェーズも
     ちゃんと枠を消費する（MEDIUM・Codex RV: これが無いと予約の意味が無くなる）。
     """
     running = [r for r in _REGISTRY.values() if not r.buffer.done]
-    if len(running) >= MAX_TURNS_GLOBAL:
+    if len(running) >= max_global:
         raise TurnLimitError("global")
-    if sum(1 for r in running if r.uid == uid) >= MAX_TURNS_PER_USER:
+    if sum(1 for r in running if r.uid == uid) >= max_per_user:
         raise TurnLimitError("user")
+
+
+def _raise_if_conversation_busy_locked(conversation_id: int) -> None:
+    """呼び出し側で `_REGISTRY_LOCK` 保持済み前提。既存会話への継続ターン（呼び出し元が
+    conversation_id を事前に把握している場合）だけを対象に、同じ conversation_id の未完了ターンが
+    既にあれば `TurnLimitError("conversation")` を送出する。
+
+    provider 側の会話単位 lock（`CodexProvider._run_authoring` の `_conversation_lock`）は
+    `_result` 送出まで保持するが、chat_service 側の永続化（`store.set_session_id`／履歴保存）は
+    その後（generator 完了後）に呼び出し元が行うため、非ストリーミング経路で `_result` を受けた
+    時点で呼び出し元が反復を打ち切ると、永続化前に provider 側の lock だけが解放されうる——
+    ターン受付そのものを会話単位で直列化し、多層防御にする。
+    """
+    for r in _REGISTRY.values():
+        if not r.buffer.done and r.conversation_id == conversation_id:
+            raise TurnLimitError("conversation")
 
 
 def start_turn(*, uid: str,
               conversation_factory: Callable[[], int],
-              run_fn_factory: Callable[[int], Callable[[threading.Event, Callable[[dict], None]], None]]
+              run_fn_factory: Callable[[int], Callable[[threading.Event, Callable[[dict], None]], None]],
+              known_conversation_id: int | None = None,
               ) -> TurnRecord:
     """新規ターンを background thread で開始する（予約方式・MEDIUM Codex RV 修正）。
 
@@ -220,12 +295,33 @@ def start_turn(*, uid: str,
     上限超過は 1) の時点で `TurnLimitError` を送出する＝**会話は一切作られない**。
     `conversation_factory()` 自体が失敗した場合は予約を取り消してから re-raise する
     （枠を占有したまま残さない）。
+
+    `known_conversation_id`（省略可）: 呼び出し元が**既存会話への継続**だと事前に把握している
+    ときだけ渡す（新規会話＝リクエストに conversation_id が無い場合は省略し、この関数自体を
+    呼ばない＝対象外のまま）。1) の予約フェーズで同じ conversation_id の未完了ターンが既にあれば
+    `TurnLimitError("conversation")`（`_raise_if_conversation_busy_locked` 参照）。
+
+    `effective_limits()`（DB 読み取りを伴いうる）は 1) の**ロック取得より前**に呼ぶ。ロックの中で
+    解決すると、DB 遅延が `_REGISTRY_LOCK` の保持時間に直結し、同じロックを取る
+    `get_turn`/`list_running`/`stop_turn` まで巻き込んで待たせる——`conversation_factory()`/
+    `run_fn_factory()` を lock の外で呼ぶのと同じ「DB I/O をロック保持中に行わない」原則。
     """
+    max_per_user, max_global = effective_limits()
     with _REGISTRY_LOCK:
         _sweep_expired_locked()
-        _raise_if_over_limit_locked(uid)
+        # 会話単位の排他は集約上限（user/global）より先に判定する——両方に同時に該当する場合
+        # （例: per-user 上限=1で同一会話の2本目）でも、利用者には会話継続専用の文言
+        # （scope="conversation"）を出す。
+        if known_conversation_id is not None:
+            _raise_if_conversation_busy_locked(known_conversation_id)
+        _raise_if_over_limit_locked(uid, max_per_user, max_global)
         turn_id = uuid.uuid4().hex
-        rec = TurnRecord(turn_id=turn_id, uid=uid, stop_event=threading.Event())
+        # `known_conversation_id`（既存会話への継続）は conversation_factory() の完了を待たず
+        # 予約時点で確定させる——`conversation_factory()` は lock の外で呼ぶため、None のままだと
+        # factory 実行中に同じ会話への2本目が `_raise_if_conversation_busy_locked` をすり抜ける
+        # （新規会話は conversation_factory() が返すまで実際の id が無いため None のまま）。
+        rec = TurnRecord(turn_id=turn_id, uid=uid, stop_event=threading.Event(),
+                         conversation_id=known_conversation_id)
         _REGISTRY[turn_id] = rec
 
     try:

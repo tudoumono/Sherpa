@@ -38,6 +38,9 @@ _ASK_RESULT_AGAIN = "既に質問済みです。調査を続けて回答をま�
 
 def _tool_defs() -> list:
     """公開ツール定義（schema は agentic_search と共通＝二重管理しない）。ES はインデックスがある時だけ。
+    `read_doc`/`doc_outline`/`glob_search` は `read_around` 等と同じ土台系ツール（ES/graph の可用性に
+    依存しない）＝常に公開する。並びは `agentic_search.openai_tools` と同じ「構造を掴む→通読→精読」
+    （ripgrep_search の直後に glob_search、read_around の直前に doc_outline・read_doc）。
     S2 RV HIGH: `SHERPA_MCP_ASK_DISABLED=1`（確認ID 付き再送）の実行では ask_user 自体を外す
     （呼べる道具を最初から見せない＝プロンプト指示だけに頼らない最強のガード）。
     探す対象（層）が限定されている間は `graph_neighbors` 自体を外す（呼べる道具を最初から見せない・
@@ -51,6 +54,12 @@ def _tool_defs() -> list:
          "inputSchema": agentic_search._PARAMS_FOLDER_TREE},
         {"name": "ripgrep_search", "description": agentic_search._DESC_SEARCH,
          "inputSchema": agentic_search._PARAMS_SEARCH},
+        {"name": "glob_search", "description": agentic_search._DESC_GLOB,
+         "inputSchema": agentic_search._PARAMS_GLOB},
+        {"name": "doc_outline", "description": agentic_search._DESC_OUTLINE,
+         "inputSchema": agentic_search._PARAMS_OUTLINE},
+        {"name": "read_doc", "description": agentic_search._DESC_READ_DOC,
+         "inputSchema": agentic_search._PARAMS_READ_DOC},
         {"name": "read_around", "description": agentic_search._DESC_READ,
          "inputSchema": agentic_search._PARAMS_READ},
         # GEN-DIFF（`docs/proposals/2026-09-03-世代間diff比較.md` §5）: ES/graph の可用性に依存しない
@@ -66,10 +75,11 @@ def _tool_defs() -> list:
         defs.append({"name": "ask_user", "description": agentic_search._DESC_ASK,
                      "inputSchema": agentic_search._PARAMS_ASK})
     if es_index.available():
-        # K6 で folder_tree を list_docs の直後に挿入したため、ripgrep_search の直後（read_around の
-        # 直前）は index 3 になった（list_docs, folder_tree, ripgrep_search, [es_search], read_around, ...）。
-        defs.insert(3, {"name": "es_search", "description": agentic_search._DESC_ES,
-                        "inputSchema": agentic_search._PARAMS_SEARCH})
+        # ripgrep_search の直後に挿む。手前のツール構成が変わっても崩れないよう、index 決め打ちでは
+        # なく名前で位置を探す。
+        _idx = next(i for i, d in enumerate(defs) if d["name"] == "ripgrep_search") + 1
+        defs.insert(_idx, {"name": "es_search", "description": agentic_search._DESC_ES,
+                           "inputSchema": agentic_search._PARAMS_SEARCH})
     return defs
 
 

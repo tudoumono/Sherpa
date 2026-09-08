@@ -1,0 +1,4 @@
+<%-- shared header fragment --%>
+<div class="header">
+  Welcome, ${user.name}
+</div>

@@ -19,6 +19,7 @@ from sherpa import corpus_docs, worlds
 from sherpa.ingest import worker
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import Analyzer, DefResult, RefResult
+from sherpa.ingest.analyzers.html import HtmlTemplateAnalyzer
 
 
 def _world(monkeypatch, tmp_path):
@@ -330,6 +331,67 @@ def test_unreadable_head_produces_explicit_label_in_status_document_doctype(monk
     assert corpus_docs.status_document_doctype("bad.zz", "w") == corpus_docs._UNREADABLE_DOCTYPE_LABEL
     # 存在する原本として数える（対象外の付帯物＝None とは区別する）。
     assert corpus_docs.manifest_doctype_count(["bad.zz"], "w") == 1
+
+
+def test_scan_report_document_count_matches_manifest_doctype_count_without_extra_html_reads(
+        monkeypatch, tmp_path):
+    """`scan_report()` が算出する `document_count` は `manifest_doctype_count()` と同じ値になる
+    （HTML の `accepts()` 上書きを含む manifest でも一致）。`scan_report` 自身のループが既に読んだ
+    head を再利用するため、HTML ファイルの `_read_head` 呼び出しは1回だけに留まり、追加の
+    `worlds.world_dir` 呼び出し（per-file 再解決）も発生しない——`ingest/worker.py` の成功確定
+    経路がこの値をそのまま使い、`manifest_doctype_count()`（rel ごとに `documents.resolve`→
+    `worlds.world_dir` を再解決する）を別途呼ばずに済む理由。"""
+    monkeypatch.setattr(registry, "_ANALYZERS", (HtmlTemplateAnalyzer(),))
+    wd, _der = _world(monkeypatch, tmp_path)
+    (wd / "form.html").write_text('<form action="/x"></form>', encoding="utf-8")           # accept
+    (wd / "memo.html").write_text("日本語の本文のみで目印なし。" * 5, encoding="utf-8")     # decline→資料
+
+    world_dir_calls = []
+    orig_world_dir = worlds.world_dir
+
+    def _tracking_world_dir(w):
+        world_dir_calls.append(w)
+        return orig_world_dir(w)
+    monkeypatch.setattr(worlds, "world_dir", _tracking_world_dir)
+
+    read_head_sizes = []
+    orig_read_head = corpus_docs._read_head
+
+    def _tracking_read_head(rp, size=4096):
+        read_head_sizes.append((rp.name, size))
+        return orig_read_head(rp, size)
+    monkeypatch.setattr(corpus_docs, "_read_head", _tracking_read_head)
+
+    rep = corpus_docs.scan_report("w")
+    assert world_dir_calls == ["w"]                       # scan_report 自身の1回だけ（per-file 再解決なし）
+    form_reads = [size for (name, size) in read_head_sizes if name == "form.html"]
+    assert form_reads.count(65536) == 1                   # HTML の64KiB読みは1回だけ（document_count 算出でも再読しない）
+
+    manifest = {"form.html": [1], "memo.html": [1]}
+    assert rep["document_count"] == corpus_docs.manifest_doctype_count(manifest, "w") == 2
+
+
+def test_manifest_doctype_count_from_root_matches_manifest_doctype_count_without_world_dir_calls(
+        monkeypatch, tmp_path):
+    """`manifest_doctype_count_from_root()`（バックフィル専用・world root を呼び出し側が1回だけ
+    解決して渡す）は、`manifest_doctype_count()`（rel ごとに `documents.resolve`→`worlds.world_dir`
+    を再解決する）と同じ値を返しつつ、`worlds.world_dir` を一切呼ばない
+    （root から `ingest.world_graph.resolve_path` で直接辿るため）。"""
+    monkeypatch.setattr(registry, "_ANALYZERS", (HtmlTemplateAnalyzer(),))
+    wd, _der = _world(monkeypatch, tmp_path)
+    (wd / "form.html").write_text('<form action="/x"></form>', encoding="utf-8")
+    (wd / "memo.html").write_text("日本語の本文のみで目印なし。" * 5, encoding="utf-8")
+    manifest = {"form.html": [1], "memo.html": [1]}
+
+    baseline = corpus_docs.manifest_doctype_count(manifest, "w")
+
+    world_dir_calls = []
+    monkeypatch.setattr(worlds, "world_dir", lambda w: world_dir_calls.append(w) or wd)
+
+    from_root = corpus_docs.manifest_doctype_count_from_root(manifest, wd)
+
+    assert from_root == baseline
+    assert world_dir_calls == []                          # world root は呼び出し側で解決済み＝内部で再解決しない
 
 
 # ===================================================================

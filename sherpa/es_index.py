@@ -1743,7 +1743,8 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     `search_knn_only()` と違い、本関数は degrade 時も **BM25 の hits をそのまま返す**（reason は
     「hybrid でなく BM25 だけになった理由」の注記であって、hits を空にする合図ではない）。
     `es_unavailable`／クエリ空はこれまでどおり `[]` を返す。
-    degrade_reason 語彙: `es_unavailable`／`embedding_cloud_unavailable`／`query_embed_failed`／
+    degrade_reason 語彙: `es_unavailable`／`embedding_cloud_unavailable`／`vector_feature_mismatch`
+    （索引の埋め込み素性が現在の設定と不一致＝再索引待ち・クエリ埋め込みは呼ばない）／`query_embed_failed`／
     `hybrid_query_failed`（hybrid 自体が失敗し BM25 は成功＝hits は空でない）／
     `es_query_failed`（BM25 自体も失敗＝hits は空。`search_service.DEGRADE_REASONS` と同一集合・
     増やすときは両方直す）。
@@ -1786,7 +1787,13 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     meta = _index_meta(world) if ec else {}
     same = bool(ec) and (meta.get("embed_provider") == ec["provider"]
                          and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"])
-    if same:                                          # 索引のベクトル素性が一致する時だけ kNN（不一致は BM25・無駄な embed もしない）
+    if ec and not same:
+        # 索引のベクトル素性（provider/model/dim）が現在の埋め込み設定と合わない＝再索引待ちの
+        # 世代ズレ。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない（無駄な費用）。
+        # 理由を返さないと利用者にはハイブリッド成功に見える（静かな縮退）＝`search_knn_only()`
+        # と同じ語彙で注記する。`vector=False`／埋め込み未設定（ec None）はこの分岐に入らない。
+        reason = "vector_feature_mismatch"
+    if same:                                          # 索引のベクトル素性が一致する時だけ kNN
         qv = embeddings.embed([q], ec, world=world)
         if qv:
             # 既定配分（w=0.5）のときは boost キー自体を書かない（無指定と同じ本文にする）。

@@ -538,6 +538,7 @@ def run_research(*, world: str, query: str, scope_paths: list | None, model: str
                                 endpoint, headers, mod, agentic_search.SYSTEM, query, world,
                                 scope_paths, ollama=(provider == "ollama"), can_ask=False,
                                 max_turns=turns, timeout=_turn_timeout, usage_acc=usage_acc,
+                                system_settings=sys_s,
                                 stop_event=stop_event, tool_deadline=absolute_deadline):
                             if "node" in ev:
                                 # TRACE-HITS の結果ノード（event_type="tool_completed"・件数表示の

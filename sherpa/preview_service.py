@@ -19,7 +19,7 @@ from .ingest import world_graph_service
 # 種別ラベル → 表示の日本語（非エンジニア向け・04-画面の原則.md §6）。K13 で供給源を失ったラベルは刈った。
 _TYPE_JA = {
     "Module": "プログラム", "Copybook": "コピーブック", "DataItem": "項目",
-    "Document": "文書", "Batch": "バッチ", "Table": "テーブル",
+    "Document": "文書", "Batch": "バッチ", "Table": "テーブル", "Config": "設定",
 }
 
 

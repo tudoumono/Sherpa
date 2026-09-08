@@ -51,7 +51,7 @@ function statusLabel(s) {
   // disabled 以外を無条件で「有効」扱いにすると pending が誤って有効表示になるため個別に分岐する。
   if (s === 'disabled') return '<span class="badge-disabled">無効</span>';
   if (s === 'pending') return '<span class="badge-pending">保留</span>';
-  return '<span style="color:var(--ok);font-size:12px">● 有効</span>';
+  return '<span style="color:var(--ok);font-size:var(--text-small)">● 有効</span>';
 }
 
 function renderUsers(users, total) {

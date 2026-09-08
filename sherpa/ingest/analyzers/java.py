@@ -33,9 +33,51 @@ CODE-2/JAVA-2＝宣言型参照の一般抽出）。
 大文字小文字を区別する言語であり、正規化すると別クラスを同一視してしまう（CODE-1d の検証で
 判明した既存正規化ヘルパの言語依存性・詳細は docs/proposals/2026-08-29 の CODE-1d 節）。
 正規表現の捕捉結果（識別子）はそのまま使う。
+
+**設定キー参照（S3'・A7 案B）**: `@Value("${k}")`（デフォルト値 `@Value("${k:default}")` は
+デフォルト部分を捨てる・`@Value("${a}-${b}")` のように1つの文字列に複数現れれば分解できる限り
+全部抽出する）・`getProperty("k")`（レシーバ有無を問わない・`env.getProperty(...)`/
+`System.getProperty(...)` も同形）・`getString("k")`・`getBean("k")`（レシーバ有無を問わない・
+`ctx.getBean(...)` も同形・Spring の `BeanFactory`/`ApplicationContext` 前提）の文字列リテラル、
+および `@Qualifier("k")`／`@Qualifier(value="k")`／`@Named("k")`／`@Named(value="k")`／
+`@Resource(name="k")` の属性値から設定キーを
+`RefCandidate("ACCESSES", "Config", key, line, extra={"via": "config_key", "key_kind": ...})` として
+返す（共通層の A9＝同一 top_scope 内の同名 `Config` キー全件へ接続——XML アナライザの
+`<bean id="k">` children とも同じキー空間で突合する）。`extra["key_kind"]`（Config キーは種別で
+名前空間を分ける裁定・2026-09-06）は `@Value`/`getProperty`/`getString` が `"property"`、
+`getBean`/`@Qualifier`/`@Named`/`@Resource(name=...)` が `"bean"`——共通層の索引はラベルに加えて
+この種別でも引くため、たまたま同じ裸キー文字列を持つ bean と property が誤って同一視されない。
+`@Autowired` は文字列引数を持たない注釈のため対象外（既存の DI 注釈による `via=inject` 格上げの
+み・本抽出とは別軸）。`@Value("#{...}")`（SpEL 式）は分解せず `Dropped("config_spel", ...)` として
+申告するだけ（推測接続はしない）。`getProperty(KEY_CONST)`／`getString(var)`／`getBean(var)` の
+ような非リテラル引数も同様に黙って無視せず `Dropped("config_nonliteral", ...)` として申告する。
+`getBean`/`getProperty`/`getString` の呼び出し候補自体が通常の文字列/char リテラルの中身
+（例: `String s = "getBean(k)";`）に現れた場合は実際のコードではないため、参照にも `Dropped` にも
+せず黙って除外する（`_quoted_string_spans()` で位置チェックする・text block の中身は
+`_sanitize_comments_only()` が既に空白化済みのため自然に除外される）。`@Qualifier`/`@Named`/
+`@Resource(name=...)` は非リテラル形（定数参照等）を検知する構文を持たない——文字列リテラル形に
+一致しなければ黙って抽出対象外にするだけ（`@Value` の非リテラル値と同じ既存の扱いに揃える）。
+`@ConfigurationProperties(prefix="p")` の `prefix` は接続せず `Dropped("config_prefix", ...)` として
+申告するだけ（プレフィックス自体はキーではない・推測接続はしない）。抽出対象のキーは
+`[A-Za-z0-9_.\\-]+`（識別子形）のみ——この走査は `_sanitize()`（文字列内容を空白化）ではなく、
+コメントと text block だけを除去し文字列リテラルは温存する別のサニタイズ
+（`_sanitize_comments_only()`）に対して行う（既存の宣言型参照/呼び出し抽出はこれまでどおり
+`_sanitize()` の結果を使い、挙動を変えない）。同じ `(key, key_kind)` が複数回現れても
+`RefCandidate` は1回（最初に出現した行）にまとめる。
+
+**URL キー定義側（波3 統合・Spring MVC）**: クラスレベルの `@RequestMapping("/x")`（`value=`/`path=`
+属性形・配列 `{…}` 対応——配列なら prefix ごとに1本ずつ、メソッドレベルパスの各要素と**直積**で
+連結する）と、メソッドレベルの `@RequestMapping`/`@GetMapping`/`@PostMapping`/
+`@PutMapping`/`@DeleteMapping`/`@PatchMapping` を連結したパスを、primary の children として
+`DefItem("Config", name=<URL パス>, cid_key="key:url:"+パス, extra={"key_kind": "url"})` で返す
+（properties/xml_config と同じ `cid_key` 接頭辞規約・続く `key_kind` を挟む形も揃える・
+`key_kind="url"` は JSP/HTML/JS の `action`/`href`/URL 文字列リテラル参照と同じ名前空間）。
+注釈は自身の行だけで完結する形（引数を含め同一行内・複数行にまたがる形やメソッド宣言と同一行の
+形は対象外）のみ検出する。
 """
 from __future__ import annotations
 
+import bisect
 import re
 
 from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
@@ -102,6 +144,56 @@ _PARAM_ENTRY_TYPE = re.compile(
     r"\s+[A-Za-z_$][\w$]*$"
 )
 
+# 設定キー参照（S3'）: 識別子形のキーのみ（ドット/ハイフン区切りを許す）。
+_CONFIG_KEY = r"[A-Za-z0-9_.\-]+"
+# `@Value(...)` の文字列引数全体を捕捉する（中身は後段で `${...}` を全部抽出する・エスケープされた
+# `\"` は文字列境界とみなさない）。
+_VALUE_CALL = re.compile(r'@Value\s*\(\s*"(?P<content>(?:\\.|[^"\\])*)"\s*\)')
+# `${key}`／`${key:default}`（デフォルト部分は捨てる）——1つの `@Value` 文字列に複数現れてもよい。
+_VALUE_PLACEHOLDER = re.compile(r'\$\{(?P<key>[^}:]*)(?::[^}]*)?\}')
+# SpEL（`#{...}`）は分解せず Dropped("config_spel") として申告する目印。
+_SPEL_MARKER = "#{"
+# レシーバの有無を問わない（`getProperty("k")`／`env.getProperty("k")`／`System.getProperty("k")`
+# いずれも同形で拾う——レシーバは高々1段の単純な `識別子.` のみ許す）。引数はいったん丸ごと
+# 捕捉し（`(...)` を跨がない範囲）、後段で「文字列リテラル1個だけか」を判定する——
+# `getProperty(KEY_CONST)`／`getString(var)` のような非リテラル引数を黙って無視しないため。
+# `recv` を named group にするのは、レシーバ有りならメソッド**宣言**ではあり得ないと
+# 判定できるようにするため（`_is_method_declaration` 参照）。
+_GET_PROPERTY_CALL = re.compile(r'\b(?:(?P<recv>[A-Za-z_$][\w$]*)\.)?getProperty\(\s*(?P<arg>[^()]*)\)')
+_GET_STRING_CALL = re.compile(r'\b(?:(?P<recv>[A-Za-z_$][\w$]*)\.)?getString\(\s*(?P<arg>[^()]*)\)')
+# `getBean("k")`（Spring の `BeanFactory`/`ApplicationContext` 前提・レシーバ有無を問わない）。
+_GET_BEAN_CALL = re.compile(r'\b(?:(?P<recv>[A-Za-z_$][\w$]*)\.)?getBean\(\s*(?P<arg>[^()]*)\)')
+_STRING_LITERAL_ARG = re.compile(r'^"(?:\\.|[^"\\])*"$')
+# `@Qualifier("k")`／`@Qualifier(value="k")`／`@Named("k")`／`@Named(value="k")`／
+# `@Resource(name="k")`（属性値が識別子形の文字列リテラルの場合のみ抽出——非リテラル形を検知する
+# 構文は持たず、`@Value` の非リテラル値と同様に黙って抽出対象外にする）。
+_QUALIFIER_ANNOTATION = re.compile(
+    r'@Qualifier\(\s*(?:value\s*=\s*)?"(?P<key>' + _CONFIG_KEY + r')"\s*\)')
+_NAMED_ANNOTATION = re.compile(
+    r'@Named\(\s*(?:value\s*=\s*)?"(?P<key>' + _CONFIG_KEY + r')"\s*\)')
+_RESOURCE_NAME_ANNOTATION = re.compile(
+    r'@Resource\(\s*name\s*=\s*"(?P<key>' + _CONFIG_KEY + r')"\s*\)')
+# メソッド**宣言**（`String getProperty(String key) { ... }` 等）を呼び出しと誤認しないための
+# 3条件（`_is_method_declaration` が全部揃った時だけ宣言と判定する）。
+_DECL_RETURN_TYPE_BEFORE = re.compile(r'[A-Za-z_$][\w$.\[\]<>]*\s+$')
+_DECL_AFTER_PARENS = re.compile(r'^\s*(?:\{|throws\b|;)')
+# `@ConfigurationProperties(prefix="p")` の prefix は接続しない（申告のみ・Dropped("config_prefix")）。
+_CONFIGURATION_PROPERTIES_PREFIX = re.compile(
+    r'@ConfigurationProperties\(\s*prefix\s*=\s*"(?P<prefix>' + _CONFIG_KEY + r')"\s*\)')
+
+# URL キー定義側（波3 統合・Spring MVC のマッピング注釈）: `@RequestMapping`/`@GetMapping`/
+# `@PostMapping`/`@PutMapping`/`@DeleteMapping`/`@PatchMapping` は自身の行だけで完結する
+# アノテーション専用行（引数は同一行内・複数行にまたがる形は対象外）としてのみ検出する。
+_MAPPING_ANNOTATION_NAMES = frozenset({
+    "RequestMapping", "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
+})
+# アノテーション専用行（`@名前` または `@名前(引数)`・引数は `)` を含まない前提＝配列 `{...}` は
+# 許容するが `)` を含む式は非対応）。クラスレベルの prefix 探索・メソッドレベルの検出の両方で使う。
+_ANNOTATION_ONLY_LINE_ANY_ARGS = re.compile(r'^@(?P<name>[A-Za-z_$][\w$]*)(?:\s*\((?P<args>[^)]*)\))?\s*$')
+# `value=`/`path=` 属性値（単一文字列、または `{"a", "b"}` の配列）。
+_MAPPING_PATH_ATTR = re.compile(r'\b(?:value|path)\s*=\s*(?P<val>\{[^}]*\}|"(?:\\.|[^"\\])*")')
+_QUOTED_STRING_ITER = re.compile(r'"(?:\\.|[^"\\])*"')
+
 
 def _sanitize(text: str) -> str:
     """コメント（`//`・`/* */`）と文字列/char/text-block リテラルの中身を空白化した、
@@ -163,6 +255,302 @@ def _sanitize(text: str) -> str:
 
 def _line_at(sanitized: str, pos: int) -> int:
     return sanitized.count("\n", 0, pos) + 1
+
+
+def _sanitize_comments_only(text: str) -> str:
+    """コメント（`//`・`/* */`）だけを空白化し、文字列リテラルの中身はそのまま残す
+    （設定キー参照抽出専用・`_sanitize()` と違い文字列内容を読む必要があるため）。
+
+    text block（三連続の二重引用符で囲む複数行リテラル）は本文を（改行維持で）空白化する——
+    `_sanitize()` と同じ扱い。text block の本文は複数行の説明文であることが多く、単純な
+    引用符スキャンに任せると開始の三連続引用符を「空文字列＋新しい文字列の開始」と誤読し、
+    本文中に書かれた `getProperty("x")` のような記述を実在の参照として拾ってしまう
+    （黙って誤解釈することになる）ため、本文自体を設定キー抽出の走査対象から除外する。
+
+    行数・改行位置は元テキストと1対1のまま保つ（`_line_at()` をそのまま再利用できる）。
+    """
+    out: list = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "/" and text[i:i + 2] == "/*":
+            out.append("  ")
+            i += 2
+            while i < n and text[i:i + 2] != "*/":
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+            continue
+        if ch == "/" and text[i:i + 2] == "//":
+            out.append("  ")
+            i += 2
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if text[i:i + 3] == '"""':                       # text block（Java 15+）
+            out.append("   ")
+            i += 3
+            while i < n and text[i:i + 3] != '"""':
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append("   ")
+                i += 3
+            continue
+        if ch == '"' or ch == "'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n and text[i] != quote:
+                if text[i] == "\\" and i + 1 < n:
+                    out.append(text[i:i + 2])
+                    i += 2
+                    continue
+                out.append(text[i])
+                i += 1
+            if i < n:
+                out.append(quote)
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_method_declaration(sanitized: str, m: re.Match) -> bool:
+    """`getProperty(...)`/`getString(...)` の出現がメソッド**宣言**（呼び出しではない）か。
+
+    レシーバ付き（`env.getProperty(...)`）は宣言ではあり得ないため対象外。レシーバなしでも
+    「直前に戻り値型（識別子・ジェネリクス・配列可）」「`)` の直後が `{`／`throws`／`;`」の
+    2条件を**両方**満たす場合だけ宣言とみなす（例: `String getProperty(String key) { ... }`）。
+    加えて引数リストの各エントリが宣言形（型＋変数名・注釈/varargs 可）であることを要求する
+    （`return getProperty(KEY)` の `return` が戻り値型に見える呼び出しを除外するため）。
+    呼び出し `getProperty(KEY_CONST)` は before/after のどちらも満たさないため引き続き
+    `config_nonliteral` を申告する。
+    """
+    if m.group("recv") is not None:
+        return False
+    before = sanitized[max(0, m.start() - 80):m.start()]
+    if not _DECL_RETURN_TYPE_BEFORE.search(before):
+        return False
+    after = sanitized[m.end():m.end() + 20]
+    if not _DECL_AFTER_PARENS.match(after):
+        return False
+    # `return getProperty(KEY)` のように `return`/`throw` が「戻り値型」に見える呼び出しを
+    # 宣言と誤認しないよう、引数リストが全て宣言形（型＋変数名）であることも要求する。
+    args = (m.group("arg") or "").strip()
+    if not args:
+        return True
+    return all(_PARAM_ENTRY_TYPE.match(a.strip()) for a in _split_top_level_commas(args))
+
+
+def _quoted_string_spans(text: str) -> list:
+    """`"..."`／`'...'`（通常の文字列/char リテラル）の `(start, end)` 区間を、開始位置の昇順で
+    返す——`getBean`/`getProperty`/`getString` の呼び出し候補が、通常の文字列/char リテラルの
+    **中身に書かれた記述**（例: `String example = "getBean(k)";`）を実際の呼び出しと誤認しない
+    ための位置チェック専用（`_collect_config_key_refs` だけが使う）。text block（三連続引用符）は
+    `_sanitize_comments_only()` 側で既に本文ごと空白化されているため対象に含めない——ここでは
+    コメントと text block を読み飛ばすだけで、通常の引用符の対だけを区間として記録する。
+    エスケープ扱いは `_sanitize()` と同じ。
+    """
+    spans: list = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "/" and text[i:i + 2] == "/*":
+            i += 2
+            while i < n and text[i:i + 2] != "*/":
+                i += 1
+            if i < n:
+                i += 2
+            continue
+        if ch == "/" and text[i:i + 2] == "//":
+            i += 2
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if text[i:i + 3] == '"""':
+            i += 3
+            while i < n and text[i:i + 3] != '"""':
+                i += 1
+            if i < n:
+                i += 3
+            continue
+        if ch == '"' or ch == "'":
+            start = i
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                if text[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                i += 1
+            if i < n:
+                i += 1
+            spans.append((start, i))
+            continue
+        i += 1
+    return spans
+
+
+def _in_quoted_string(spans: list, starts: list, pos: int) -> bool:
+    """`pos` が `_quoted_string_spans()` の区間のいずれかに含まれるか（`starts` は各区間の開始位置
+    だけを昇順で抜き出したもの・二分探索で候補区間を1つに絞る）。"""
+    idx = bisect.bisect_right(starts, pos) - 1
+    if idx < 0:
+        return False
+    start, end = spans[idx]
+    return start <= pos < end
+
+
+def _collect_config_key_refs(text: str) -> tuple:
+    """`@Value`/`getProperty`/`getString`/`getBean`/`@Qualifier`/`@Named`/`@Resource(name=...)`
+    から設定キー参照候補を返す（`(refs, dropped)`）。
+
+    - `@Value("${a}-${b}")` のように1つの文字列に複数の `${key}` が現れる場合は分解できる限り
+      全部抽出する（`${key:default}` はデフォルト部分を捨てる）。`@Value("#{...}")`（SpEL 式）は
+      分解せず `Dropped("config_spel", ...)` として申告するだけ（推測接続はしない）。
+    - `getProperty(KEY_CONST)`／`getString(var)`／`getBean(var)` のように引数が文字列リテラルで
+      ない場合は黙って無視せず `Dropped("config_nonliteral", ...)` として申告する。ただし呼び出し
+      候補自体が通常の文字列/char リテラルの中身（`_quoted_string_spans`）に現れた場合は、実際の
+      コードではないため参照にも `Dropped` にもしない（黙って除外するだけ・申告不要）。
+    - 種別（`extra["key_kind"]`・Config キーの名前空間分離）: `@Value`/`getProperty`/`getString`
+      は `"property"`、`getBean`/`@Qualifier`/`@Named`/`@Resource(name=...)` は `"bean"`。
+    同じ `(key, key_kind)` が複数回現れても `refs` は最初の出現行のみ1回にまとめる（出現順は
+    ファイル内の物理位置順）。
+    `@ConfigurationProperties(prefix=...)` は接続せず `dropped` に申告するだけ。
+    """
+    sanitized = _sanitize_comments_only(text)
+    string_spans = _quoted_string_spans(text)
+    string_starts = [s for s, _ in string_spans]
+    hits: list = []                            # (pos, key, key_kind)
+    dropped: list = []
+
+    for m in _VALUE_CALL.finditer(sanitized):
+        content = m.group("content")
+        if _SPEL_MARKER in content:
+            snippet = content[2:-1] if content.startswith("#{") and content.endswith("}") else content
+            dropped.append(Dropped("config_spel", _line_at(sanitized, m.start()), snippet[:120]))
+            continue
+        for pm in _VALUE_PLACEHOLDER.finditer(content):
+            key = pm.group("key")
+            if re.fullmatch(_CONFIG_KEY, key):
+                hits.append((m.start(), key, "property"))
+
+    for pattern in (_GET_PROPERTY_CALL, _GET_STRING_CALL, _GET_BEAN_CALL):
+        key_kind = "bean" if pattern is _GET_BEAN_CALL else "property"
+        for m in pattern.finditer(sanitized):
+            if _in_quoted_string(string_spans, string_starts, m.start()):
+                continue                   # 文字列/char リテラルの中身（実コードではない）
+            if _is_method_declaration(sanitized, m):
+                continue                   # 宣言（例: `String getProperty(String key) { ... }`）
+            arg = m.group("arg").strip()
+            if _STRING_LITERAL_ARG.match(arg):
+                key = arg[1:-1]
+                if re.fullmatch(_CONFIG_KEY, key):
+                    hits.append((m.start(), key, key_kind))
+                continue
+            if arg:
+                dropped.append(Dropped("config_nonliteral", _line_at(sanitized, m.start()), arg[:120]))
+
+    for pattern in (_QUALIFIER_ANNOTATION, _NAMED_ANNOTATION, _RESOURCE_NAME_ANNOTATION):
+        for m in pattern.finditer(sanitized):
+            hits.append((m.start(), m.group("key"), "bean"))
+
+    hits.sort(key=lambda h: h[0])
+
+    refs: list = []
+    seen: set = set()
+    for pos, key, key_kind in hits:
+        if (key, key_kind) in seen:
+            continue
+        seen.add((key, key_kind))
+        refs.append(RefCandidate("ACCESSES", "Config", key, _line_at(sanitized, pos),
+                                 extra={"via": "config_key", "key_kind": key_kind}))
+
+    dropped.extend(Dropped("config_prefix", _line_at(sanitized, m.start()), m.group("prefix"))
+                   for m in _CONFIGURATION_PROPERTIES_PREFIX.finditer(sanitized))
+    return refs, dropped
+
+
+def _extract_mapping_paths(args: str) -> list:
+    """`@GetMapping`/`@RequestMapping` 等の引数から URL パスのリストを返す（`value=`/`path=` 属性、
+    または裸の引数のいずれか・単一文字列／配列 `{"a", "b"}` の両方に対応・属性なしは空リスト）。"""
+    args = args.strip()
+    if not args:
+        return []
+    am = _MAPPING_PATH_ATTR.search(args)
+    val = am.group("val") if am else (args if args.startswith(("{", '"')) else None)
+    if not val:
+        return []
+    if val.startswith("{"):
+        return [m.group(0)[1:-1] for m in _QUOTED_STRING_ITER.finditer(val)]
+    m = _QUOTED_STRING_ITER.match(val)
+    return [m.group(0)[1:-1]] if m else []
+
+
+def _join_mapping_path(prefix: str, path: str) -> str:
+    """クラスレベル prefix とメソッドレベル path を連結する（重複スラッシュを畳む）。"""
+    if not path:
+        return prefix
+    if not prefix:
+        return path if path.startswith("/") else f"/{path}"
+    return prefix.rstrip("/") + "/" + path.lstrip("/")
+
+
+def _leading_mapping_class_prefixes(comments_only_lines: list, decl_line_no: int) -> list:
+    """`decl_line_no`（1-based・型宣言自体の行）の直前に連続するアノテーション専用行から、
+    クラスレベルの `@RequestMapping` の prefix 一覧を返す（配列 `{"/v1","/v2"}` は全件・
+    単一文字列は1件・見つからなければ prefix なしを表す `[""]`）。
+    """
+    i = decl_line_no - 2                                       # 直前行の 0-based index
+    while i >= 0:
+        stripped = comments_only_lines[i].strip()
+        if not stripped:
+            i -= 1
+            continue
+        m = _ANNOTATION_ONLY_LINE_ANY_ARGS.match(stripped)
+        if not m:
+            break
+        if m.group("name") == "RequestMapping":
+            paths = _extract_mapping_paths(m.group("args") or "")
+            if paths:
+                return paths
+        i -= 1
+    return [""]
+
+
+def _collect_url_config_children(comments_only: str, class_prefixes: list) -> list:
+    """クラス直下（brace 深度=1）のマッピング注釈専用行から URL キー `Config` children を返す
+    （`cid_key="key:url:"+URL`・`extra={"key_kind": "url"}`・properties/yaml/xml_config と同じ
+    `cid_key` 接頭辞規約）。クラスレベル prefix が配列（複数）の場合は各 prefix とメソッドレベル
+    パスの直積を1本ずつ返す（`{"/v1","/v2"}`×`/x` → `/v1/x`・`/v2/x`）。注釈は
+    自身の行だけで完結する形（メソッド宣言と同一行の場合は対象外）のみ検出する——
+    `_collect_declared_type_refs` と同じ brace 深度カウント手法を流用する。"""
+    children: list = []
+    depth = 0
+    for i, raw_line in enumerate(comments_only.split("\n"), 1):
+        line_depth = depth
+        depth += raw_line.count("{") - raw_line.count("}")
+        stripped = raw_line.strip()
+        if not stripped or line_depth != 1:
+            continue
+        m = _ANNOTATION_ONLY_LINE_ANY_ARGS.match(stripped)
+        if not m or m.group("name") not in _MAPPING_ANNOTATION_NAMES:
+            continue
+        paths = _extract_mapping_paths(m.group("args") or "") or [""]
+        for class_prefix in class_prefixes:
+            for path in paths:
+                full = _join_mapping_path(class_prefix, path)
+                if not full:
+                    continue
+                children.append(DefItem(label="Config", name=full, line=i,
+                                        cid_key=f"key:url:{full}",
+                                        extra={"key_kind": "url"}))
+    return children
 
 
 def _strip_generics(s: str) -> str:
@@ -361,7 +749,7 @@ class JavaAnalyzer(Analyzer):
         # （非public型だけのファイルでもノードを黙って消さないための既定挙動・§7 裁定10の
         # 「黙って倒さない」精神を踏襲した実装判断・CODE-1d 節で報告）。
         primary_idx = next((i for i, (_m, _l, pub) in enumerate(top) if pub), 0)
-        primary_m, _primary_line, _pub = top[primary_idx]
+        primary_m, primary_line, _pub = top[primary_idx]
         primary_name = primary_m.group(1)
 
         pm = _PACKAGE.search(sanitized)
@@ -378,6 +766,12 @@ class JavaAnalyzer(Analyzer):
 
         children = [DefItem(label="Module", name=m.group(1), line=line)
                     for i, (m, line, _pub) in enumerate(top) if i != primary_idx]
+
+        # URL キー定義側（波3 統合・Spring MVC マッピング注釈）: クラスレベル @RequestMapping の
+        # prefix とメソッドレベルのマッピング注釈を連結し、`Config` children として返す。
+        comments_only_lines = _sanitize_comments_only(text).split("\n")
+        class_prefixes = _leading_mapping_class_prefixes(comments_only_lines, primary_line)
+        children.extend(_collect_url_config_children("\n".join(comments_only_lines), class_prefixes))
 
         return DefResult(primary=primary, children=children, dropped=dropped)
 
@@ -410,6 +804,11 @@ class JavaAnalyzer(Analyzer):
         # 一般抽出）。DI アノテーションが直前に付くフィールドは via=inject へ格上げ済み。
         refs.extend(_collect_declared_type_refs(sanitized))
 
+        # 設定キー参照（S3'・A7 案B）。文字列リテラルの中身を読む必要があるため、上の
+        # `sanitized`（文字列内容を空白化済み）ではなく元テキストを別途サニタイズして走査する。
+        config_refs, config_dropped = _collect_config_key_refs(text)
+        refs.extend(config_refs)
+
         # nested type（内部クラス）は collect_defs 側の dropped で既に記録済み——ここで
         # 二重記録しない。
-        return RefResult(refs=refs, dropped=[])
+        return RefResult(refs=refs, dropped=config_dropped)

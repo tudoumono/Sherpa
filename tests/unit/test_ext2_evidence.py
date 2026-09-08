@@ -1434,6 +1434,17 @@ def test_build_evidence_digest_list_docs_aggregate_shows_total_count_and_paths()
     assert A.resolve_attributed_doc_ids({"ev-1"}, ev_map) == set(shown)
 
 
+def test_build_evidence_digest_list_docs_join_separator_does_not_swallow_next_path():
+    """列挙区切り（`_LIST_SEP`）に空白が無いと、1件目が `key=value` 形の秘密パターンに
+    マッチする場合、`_add` が呼ぶ後段の再 `_digest_clean`（`_KV_SECRET_RE` の `\\S+` は空白でしか
+    止まらない）が区切り記号ごと2件目まで飲み込んで消してしまう——区切りに空白を含めて守る。"""
+    meta = [{"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+            "list_meta": {"count": 2, "shown": 2, "prefix": "", "pattern": ""},
+            "matched_doc_ids": ["config/api_key=secret.md", "keep.md"]}]
+    digest, _ = A.build_evidence_digest([], meta)
+    assert "keep.md" in digest
+
+
 def test_build_evidence_digest_zero_result_list_docs_still_gets_one_evidence():
     """0件の list_docs 呼び出しも1 Evidence（ev-N）を持つ——件数質問の集計 Evidence が帰属できる
     ことの固定（`matched_doc_ids` が空でも digest/ev_map には載る）。"""

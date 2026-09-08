@@ -1005,6 +1005,13 @@ SYSTEM_SETTINGS_VIEW = {
         "codex_reasoning": {"configured": None, "effective": "low", "default": "low",
                             "options": ["minimal", "low", "medium", "high", "xhigh"]},
     },
+    # チャット同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。既定（未設定）は env 既定値
+    # （`MAX_TURNS_PER_USER`=2／`MAX_TURNS_GLOBAL`=8）。depth_profile の各項目と同型。
+    "agentic_tool_limit": {"configured": None, "effective": 16, "default": 16},
+    "chat_max_turns": {
+        "per_user": {"configured": None, "effective": 2, "default": 2},
+        "global": {"configured": None, "effective": 8, "default": 8},
+    },
     # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の tool-result
     # バイト予算（1件あたり／1 run 累計）。既定（未設定）は env/コード既定（精度優先・262144/4194304
     # ＝`sherpa/agentic_search.py::TOOL_RESULT_MAX_BYTES`/`TOOL_RESULT_MAX_TOTAL_BYTES` の
@@ -1245,6 +1252,26 @@ CONVERSATIONS_LIST = [
      "shared_by_name": "管理者", "share_status": "active"},
 ]
 
+# H2（履歴検索・e2e 専用フィクスチャ）: id=101（「消費税率の相談」）のタイトルには現れない語彙で
+# 本文一致したことにする（`match.where=="message"`・実装と同じく検索対象は list_conversations と
+# 同じ可視集合＝行は既に #convlist に描画済みで、タイトル不一致により隠れているだけ、という状況を
+# 再現する。存在しない id を新規に描くわけではない）。`conversations_search_response` が使う。
+CONVERSATIONS_MESSAGE_MATCH_SNIPPET = "税率を変えたら夜間バッチが落ちるか心配です"
+
+
+def conversations_search_response(q: str) -> list:
+    """GET /conversations?q= のモック（H1 API の簡易再現・大小文字を区別しない部分一致）。
+    タイトル一致は `CONVERSATIONS_LIST` 全行が対象。加えて `CONVERSATIONS_MESSAGE_MATCH_SNIPPET`
+    に含まれる語での問い合わせは、id=101 をタイトル不一致の本文一致として1件足す（e2e の
+    「タイトル不一致でも本文一致なら表示」シナリオ専用）。どちらにも一致しない行は返さない。"""
+    ql = q.lower()
+    out = [{**c, "match": {"where": "title", "snippet": c.get("title") or ""}}
+           for c in CONVERSATIONS_LIST if ql in (c.get("title") or "").lower()]
+    if ql in CONVERSATIONS_MESSAGE_MATCH_SNIPPET.lower():
+        message_hit = next(c for c in CONVERSATIONS_LIST if c["id"] == 101)
+        out.append({**message_hit, "match": {"where": "message", "snippet": CONVERSATIONS_MESSAGE_MATCH_SNIPPET}})
+    return out
+
 
 _OPENAI_ENDPOINT_KINDS = frozenset({"openai", "azure", "custom"})
 _OPENAI_AUTH_HEADERS = frozenset({"bearer", "api-key"})
@@ -1344,6 +1371,7 @@ def _mock_validate_openai_endpoint_cross(kind: str, base_url: str) -> str | None
 # 調べる深さの基準値（`sherpa/routers/system_extras.py::SystemSettingsReq` の StrictInt+Field(ge,le)
 # と同じ範囲）。整数以外・bool・範囲外はすべて 422（実 API の pydantic 検証を模す）。
 _DEPTH_BASE_INT_BOUNDS = {
+    "agentic_max_tools_per_turn": (1, 256),
     "depth_base_max_turns": (1, 200),
     "depth_base_grep_max_hits": (1, 1000),
     "depth_base_qa_max_hits": (1, 1000),
@@ -1352,6 +1380,28 @@ _DEPTH_BASE_INT_BOUNDS = {
     "depth_base_troubleshoot_depth": (1, 16),
 }
 _DEPTH_BASE_CODEX_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
+
+# チャット同時実行の上限（`sherpa/routers/system_extras.py::SystemSettingsReq` の StrictInt+Field(ge,le)
+# と同じ範囲）。`_mock_validate_depth_base_int` を共用する（型/範囲の判定形は depth_base_* と同じ）。
+_CHAT_MAX_TURNS_INT_BOUNDS = {
+    "chat_max_turns_per_user": (1, 16),
+    "chat_max_turns_global": (1, 64),
+}
+
+
+def _mock_validate_chat_max_turns(body: dict):
+    """`admin_settings_put` の chat_max_turns_* 検証を模す純関数（`_mock_validate_agentic_budget`
+    と同型）。問題なければ None、あれば実 API と同形の `detail`。"""
+    for key, (lo, hi) in _CHAT_MAX_TURNS_INT_BOUNDS.items():
+        if key not in body:
+            continue
+        val = body[key]
+        if val is None:
+            continue   # 未設定へ戻す（有効な選択）
+        err = _mock_validate_depth_base_int(key, val, lo, hi)
+        if err:
+            return err
+    return None
 
 # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の tool-result
 # バイト予算（`sherpa/routers/system_extras.py::SystemSettingsReq` の StrictInt+Field(ge,le) と
@@ -1579,6 +1629,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             _depth_base_err = _mock_validate_depth_base(body)
             if _depth_base_err:
                 return _json(route, {"detail": _depth_base_err}, status=422)
+            _chat_max_turns_err = _mock_validate_chat_max_turns(body)
+            if _chat_max_turns_err:
+                return _json(route, {"detail": _chat_max_turns_err}, status=422)
             _agentic_budget_err = _mock_validate_agentic_budget(body)
             if _agentic_budget_err:
                 return _json(route, {"detail": _agentic_budget_err}, status=422)
@@ -1758,6 +1811,20 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                     view["depth_profile"]["codex_reasoning"]["configured"] = _val
                     view["depth_profile"]["codex_reasoning"]["effective"] = (
                         _val if _val is not None else view["depth_profile"]["codex_reasoning"]["default"])
+            if "agentic_max_tools_per_turn" in body:
+                value = body["agentic_max_tools_per_turn"]
+                limit = view["agentic_tool_limit"]
+                limit["configured"] = value
+                limit["effective"] = value if value is not None else limit["default"]
+            # 同時実行の上限（簡易反映・null は default へ戻す・depth_profile と同型）。
+            if "chat_max_turns" in view:
+                for _key, _put in (("per_user", "chat_max_turns_per_user"),
+                                   ("global", "chat_max_turns_global")):
+                    if _put in body:
+                        _val = body[_put]
+                        view["chat_max_turns"][_key]["configured"] = _val
+                        view["chat_max_turns"][_key]["effective"] = (
+                            _val if _val is not None else view["chat_max_turns"][_key]["default"])
             # BUDGET-1（§3.4）: agentic search の tool-result バイト予算（簡易反映・null は default
             # へ戻す・depth_profile と同型）。
             if "agentic_budget" in view:
@@ -2100,6 +2167,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 "ok": True, "id": model_id, "label": f"{model_id}（検証済み）"}
             return _json(route, resp)
         if method == "GET" and path == "/conversations":
+            q = (query.get("q") or [None])[0]
+            if q is not None:
+                return _json(route, conversations_search_response(q))
             return _json(route, CONVERSATIONS_LIST)
         if method == "GET" and path.startswith("/conversations/"):
             cid_str = path.rsplit("/", 1)[-1]

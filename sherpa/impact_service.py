@@ -40,7 +40,7 @@ IMPACT_MAX_DEPTH_ABS_MAX = 64
 # BusinessRule/Parameter/Standard/Incident）は刈った——語彙（`ingest.model.NODE_LABELS`）と揃える。
 CATEGORY = {
     "Module": "ソース", "Copybook": "ソース", "DataItem": "ソース",
-    "Batch": "バッチ", "Document": "文書", "Table": "テーブル",
+    "Batch": "バッチ", "Document": "文書", "Table": "テーブル", "Config": "設定",
 }
 
 # 推定トレースで拾う「コード成果物」ラベル（変更対象になり得るもの）。概念/文書は対象外。
