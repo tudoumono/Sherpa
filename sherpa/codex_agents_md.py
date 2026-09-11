@@ -1,4 +1,4 @@
-"""Codex authoring 実行前に authoring ディレクトリへ書き出す AGENTS.md（Codex 強化計画 Phase0・§2）。
+"""Codex authoring 実行前に authoring ディレクトリへ書き出す AGENTS.md（docs/proposals/2026-07-02-Codex強化計画.md §2）。
 
 `agents.py` の `CodexProvider._prompt`/`_prompt_mcp` に埋め込んでいた**共通ルール**（KB 以外を読まない・
 根拠ベースで答える・成果物は authoring 直下 等）をここへ切り出し、プロンプト側は
@@ -56,7 +56,7 @@ AGENTS_MD = """\
   回答に明示する（曖昧なら候補フォルダ別の内訳で答える）。
 - 調査範囲・目的・選択肢が曖昧で、確認しないと結果が大きく変わる場合だけ ask_user でユーザに確認する
   （例: 影響分析で起点や影響先が複数候補に割れるとき、確実な波及が0件で要確認だけのときは、対象の絞り込みを
-  確認してよい。質問は1実行につき1回まで。質問したら追加調査はせず、現状を簡潔に要約して終了する）。
+  確認してよい。質問は1実行につき1回まで。質問したら追加調査はせず、ここまでに確認できたことをまとめて終了する）。
 - 依頼文に「確認してから進めて」（同義: 確認してから／聞いてから進めて）が含まれる場合は、調査より先に
   必ず ask_user で要件を確認してから進める（通常はシステムが先に確認カードを出すので、届いた依頼にこの句が
   残っていて「確認ID:」が無いときだけ自分で ask_user する）。ただし依頼に「確認ID:」が含まれる場合は
@@ -96,9 +96,9 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
     開く前提）への誘導段落を落とす。`output_schema`（既定 False）が真のときだけ、構造化最終応答
     （`status`／`answer`／`next_step`）を求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
 
-    RV MEDIUM（2026-07-03）: 単純な `Path.write_text()` は既存の `AGENTS.md` が symlink だった場合に
-    その**指す先へ**書き込んでしまう（authoring 配下の想定外の場所を書き換え得る）。
-    一時ファイルを `O_CREAT|O_EXCL|O_NOFOLLOW` で新規作成し、`os.replace()` で置換する
+    単純な `Path.write_text()` は既存の `AGENTS.md` が symlink だった場合にその**指す先へ**書き込んで
+    しまう（authoring 配下の想定外の場所を書き換え得る）ため、一時ファイルを
+    `O_CREAT|O_EXCL|O_NOFOLLOW` で新規作成し、`os.replace()` で置換する
     （`rename`/`replace` はディレクトリエントリの張替えでシンボリックリンクを一切追従しない＝
     既存 AGENTS.md が symlink でも安全に「通常ファイルの AGENTS.md」へ置き換わる）。
     """

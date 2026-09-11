@@ -25,6 +25,10 @@ SHERPA_UNIT_BUDGET_SEC ?= 300
 # 元から環境変数だった場合を除く）。scripts/lib/gate_budget.sh は環境変数として読むため export する。
 export SHERPA_UNIT_BUDGET_SEC
 
+hooks:            ## git フック（scripts/git-hooks）を有効化＝Agent worktree の基点をローカル main に自動で揃える
+	git config core.hooksPath scripts/git-hooks
+	@echo "core.hooksPath=scripts/git-hooks（post-checkout: .claude/worktrees/agent-* の基点を main へ揃える）"
+
 help:             ## このコマンド一覧を表示
 	@echo "Sherpa — make の使い方"
 	@echo

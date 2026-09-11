@@ -1,4 +1,4 @@
-"""API 応答スキーマ集約（フェーズ7-1・docs/proposals/2026-07-02-リファクタリング計画.md フェーズ7 作業項目1）。
+"""API 応答スキーマ集約。
 
 `tests/e2e/mock_api.py` の `MOCKED` レジストリ（`len(mock_api.MOCKED)` 件・実測は
 `tests/api/test_response_schemas.py::test_mocked_registry_route_count_matches_docstring_claim`
@@ -8,17 +8,16 @@
   1. **TypeAdapter 契約テスト**（`tests/api/test_response_schemas.py`）: `MOCKED` の実応答を
      ここのモデルで validate する（response_model は付与していないので挙動リスクはゼロ）。
   2. **response_model 付与**（各 `sherpa/routers/*.py`）: この中の一部（キー集合が常に固定＝
-     条件分岐で増減しない）だけに実際に付与する。付与状況・除外理由は
-     `docs/proposals/2026-07-02-リファクタリング計画.md` フェーズ7-1 実装ログ参照。
+     条件分岐で増減しない）だけに実際に付与する。
 
 **設計方針**:
   - 応答内容は変更しない（挙動不変が絶対条件）。DB 由来の値をハンドラが `str(...)` で明示的に
     文字列化している箇所（例: `workspace_file_list` の `created_at`）は、モデル側も `str` 型にする
     （`datetime` 型にすると pydantic が再シリアライズし、既存の `str(datetime)` 形式（空白区切り）
     と食い違う＝挙動変更になるため）。ハンドラが生の datetime を返す箇所は下記 `WireDateTime` 型を使う
-    （生の `datetime` 型は使わない＝ Codex RV HIGH 参照）。
-  - **datetime 型は必ず `WireDateTime`（下で定義）を使う。生の `datetime` を直接フィールド型にしない**
-    （Codex RV HIGH・2026-07-16 再RV）: pydantic v2 は response_model 経由の aware datetime を
+    （生の `datetime` 型は使わない）。
+  - **datetime 型は必ず `WireDateTime`（下で定義）を使う。生の `datetime` を直接フィールド型にしない**:
+    pydantic v2 は response_model 経由の aware datetime を
     既定で `...Z`（Z サフィックス）に正規化するが、response_model 非付与時（FastAPI 既定の
     jsonable_encoder）は `dt.isoformat()`（`+00:00` オフセット表記）を返す＝response_model の
     有無だけで同じ値のワイヤー表現が変わってしまう（実測で確認済み）。`WireDateTime` は
@@ -47,7 +46,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, PlainSerializer
 
-# Codex RV HIGH（フェーズ7-1 再RV・2026-07-16）是正: pydantic v2 は response_model 経由だと
+# pydantic v2 は response_model 経由だと
 # aware datetime を既定で `2026-07-01T09:10:00Z`（Z サフィックス）に正規化する。response_model
 # 非付与時（FastAPI 既定の jsonable_encoder）は `dt.isoformat()`（`+00:00` オフセット表記）を返す
 # ため、response_model を付与しただけで**同じ datetime 値のワイヤー表現が変わってしまう**
@@ -194,7 +193,7 @@ class SettingsResponse(BaseModel):
     web_search_available: bool
     codex_web_search: bool
     openai_key_set: bool
-    # S3（2026-08-18-AzureOpenAI対応・system.py::_public_settings）: 接続先の種類
+    # 接続先の種類
     # （openai/azure/custom）とホスト名のみ（キー・パスは出さない）。
     openai_endpoint_kind: str
     openai_base_url_host: str
@@ -202,16 +201,14 @@ class SettingsResponse(BaseModel):
     gemini_key_set: bool
     bedrock_model: str
     bedrock_key_set: bool
-    # f181861（RV MED 2026-07-15）: legacy 表示と検証済み表示の区別用（system.py::_public_settings）。
-    # 7-1 の契約固定と f181861 が別ブランチで合流した際、この2キーがスキーマ側に無く
-    # response_model に黙って落とされていた（マージ是正 2026-07-17）。
+    # legacy 表示と検証済み表示の区別用（system.py::_public_settings）。
     bedrock_model_known: bool
     bedrock_model_label: str
-    # 4構成（2026-08-15・sherpa/agent_constructs.py）: 標準MVPが見せる実行構成
+    # 4構成（`sherpa/agent_constructs.py`）: 標準MVPが見せる実行構成
     # （openai_only / ollama_only / codex_openai / codex_ollama）。`constructs_available` は
     # この環境で選べるものだけ（env `SHERPA_EXTRA_AGENTS` で追加AIを有効化したら増える）。
     codex_model_provider: str
-    # 検索アシスタント（2026-08-15・sherpa/search_helper.py）: 下調べだけを安いモデルへ任せる
+    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べだけを安いモデルへ任せる
     # 利用者ごとの設定（''＝使わない／'ollama'／'openai'）。モデル名は管理者のカタログ既定に従う。
     search_helper: str
     # 旧・個人上書き時代のモデル指定（読み取り専用・注記表示のみ）。
@@ -256,7 +253,7 @@ class SettingsTestResponse(BaseModel):
 class CloudInfo(BaseModel):
     """クラウド AI プロバイダの中央設定（A6/A7）。"""
     provider: str
-    # FBK-1 RV1（fail-loud の境界・2026-09-01）: `provider` は既定 openai への読み替え込みの実効値
+    # `provider` は既定 openai への読み替え込みの実効値
     # （常に非 null）。`provider_raw` は `cloud_provider` の生の保存値（未選択＝一度も PUT されて
     # いない場合は null）——UI はこれで「admin が実際に選んだか」を判別する（`provider` だけでは
     # 初期表示の既定 openai と明示選択した openai を区別できない）。
@@ -416,7 +413,7 @@ class LegacyBackendInfo(BaseModel):
 
 
 class RagLlmRenderInfo(BaseModel):
-    """L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）: rag.md の LLM 成形トグル。"""
+    """rag.md の LLM 成形トグル。"""
     configured: str | None
     effective: bool
     default: bool
@@ -438,7 +435,7 @@ class OllamaAllowlistInfo(BaseModel):
 
 
 class WebhookAllowlistInfo(BaseModel):
-    """PART-6（`docs/proposals/2026-09-05-Webhook通知.md` W3）: Webhook 宛先の SSRF allowlist。
+    """Webhook 宛先の SSRF allowlist。
     `OllamaAllowlistInfo` と同形（`configured`=管理者の生値・`effective`=loopback を除いた
     実際に許可される非 loopback 接続先の host:port）。"""
     configured: list[str] | None
@@ -550,13 +547,12 @@ class ModelWindowsRegisteredInfo(BaseModel):
 
 
 class AgenticBudgetAdminInfo(BaseModel):
-    """GET・PUT /admin/settings の `agentic_budget`（BUDGET-1/BUDGET-2・
-    `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.4・`sherpa/agentic_search.py::
+    """GET・PUT /admin/settings の `agentic_budget`（`sherpa/agentic_search.py::
     resolve_tool_result_budgets`・system_extras.py::_admin_settings_view）。agentic search の
     tool-result バイト予算（1件あたり／1 run 累計）——`DepthProfileBaseInfo` と同型
-    （configured=管理者の生値・effective=system_settings→env→コード既定→BUDGET-2 の窓由来上限との
+    （configured=管理者の生値・effective=system_settings→env→コード既定→窓由来上限との
     min() の解決結果・default=env/コード既定＝未設定に戻したときの実効値・窓連動を含まない）。
-    `window`/`model_windows` は BUDGET-2 の追加（窓のヒント表示＋管理者登録表）。"""
+    `window`/`model_windows` は窓のヒント表示＋管理者登録表。"""
     per_result: DepthProfileBaseInfo
     total: DepthProfileBaseInfo
     window: ModelWindowResolutionInfo
@@ -750,6 +746,15 @@ class UsageProviderRow(BaseModel):
     turns: int
 
 
+class UsageStopKindRow(BaseModel):
+    """STAT-3 S3（2026-09-11-利用統計の拡充.md T3）: `sherpa/stop_kind.py` の閉じた8値
+    （`completed`/`stopped_by_user`/`budget`/`no_evidence`/`transport_error`/`timeout`/
+    `codex_silent`/`codex_partial`）またはそのいずれにも該当しない過去データ/未計測経路の
+    `unknown` のいずれか。"""
+    stop_kind: str
+    turns: int
+
+
 class UsageHeatmapCell(BaseModel):
     weekday: int
     hour: int
@@ -811,13 +816,13 @@ class UsageTokenTotals(BaseModel):
 
 
 class UsageTokenByKind(BaseModel):
-    """S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 用途別（kind）内訳。
+    """用途別（kind）内訳。
 
     chat 行は messages.answer->'usage' 由来（トークン列は常に int）。それ以外の kind（`metering.KINDS`
     参照・intent/embed/graph_ask/vlm 等）は usage_events 由来で、プロバイダが usage を報告しなかった
     行はトークン列が None（「報告不能」マーカー・0 に丸めない）。
 
-    `elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n`（STAT-3 S2・2026-09-11-利用統計の拡充.md T2）:
+    `elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n`:
     usage_events.elapsed_ms（計測スコープの無い呼び出しは NULL）の合計・平均（NULL 行を除く）・
     計測ありの行数。chat 行は対象外（別契約）＝常に total/avg=None・n=0。
     """
@@ -842,6 +847,18 @@ class UsageTokens(BaseModel):
     by_kind: list[UsageTokenByKind]
 
 
+class UsageConversationTurns(BaseModel):
+    """会話あたりの user ターン数分布。
+
+    値は期間内に発言のあった会話に絞った上で、その会話の全履歴の user ターン数を集計したもの
+    （期間内のターンだけに限定しない）。対象会話が無ければ全て None。
+    """
+    avg: float | None
+    median: float | None
+    max: int | None
+    p90: float | None
+
+
 class AdminUsageStatsResponse(BaseModel):
     """GET /admin/usage/stats（store/usage.py::usage_stats）。"""
     users: list[UsageUserRow]
@@ -855,6 +872,10 @@ class AdminUsageStatsResponse(BaseModel):
     retention: UsageRetention
     downloads: UsageDownloads
     tokens: UsageTokens
+    conversation_turns: UsageConversationTurns
+    resume_rate: float | None
+    stop_kinds: list[UsageStopKindRow]
+    stopped_turns: int
 
 
 class UsageChatResponse(BaseModel):
@@ -956,8 +977,8 @@ class FsListResponse(BaseModel):
 # response_model は付与しない: `documents[].provenance`（corpus_docs.provenance_summary が真値の
 # 時だけ足す）・`documents[].importance`（`_重要度.txt` の解決結果がある時だけ足す・無ければ3キー
 # とも省略）が条件付きキーのため（TypeAdapter 契約のみ・欠落キーを常時 `null` 出力に変える挙動変化を
-# 避ける）。名寄せ（merges・旧・業務語↔コード対応橋 由来）・extraction_method は S3 で撤去済み
-# （K12・2026-09-04-グラフのソース正典化.md §4＝全ノード/エッジが常に static のため意味を持たない）。
+# 避ける）。名寄せ（merges）・extraction_method は持たない（全ノード/エッジが常に static のため
+# 意味を持たない）。
 
 class IngestPreviewDocument(BaseModel):
     name: str
@@ -1117,13 +1138,11 @@ class WorldDiffResponse(BaseModel):
 
 class WorldIngestAcceptedResponse(BaseModel):
     """POST /worlds・POST /worlds/{wid}/refresh・DELETE /worlds/{wid}・
-    POST /worlds/{wid}/rebind・POST /ingest/rerun（ING-3・即受付契約・HTTP 202）。
+    POST /worlds/{wid}/rebind・POST /ingest/rerun（即受付契約・HTTP 202）。
 
     取り込み本体（登録/更新の再取り込み・削除の派生物wipe・参照先変更の
     破棄→再作成・強制フル再構築）は背景（`sherpa.ingest.background`）で継続する——この応答は
-    「受け付けた」ことだけを示す。旧・意味層フル抽出（`POST /worlds/{wid}/extract`）・業務語対応の
-    承認/無効化（`concepts/confirm`・`concepts/disable`）は GRAPH-SRC（2026-09-04・K9-K11）で
-    撤去済み（復活させない）。
+    「受け付けた」ことだけを示す。
     `run_id`＝`ingest_runs.id`（受付処理自身が O(1) の INSERT で確保してから
     背景実行へ渡すため、この応答の時点で**必ず**判明している＝非 null）。`joined=True`＝world
     単位の多重クリック制御（操作種別＋正規化 payload の一致）により新規実行はせず既存 run へ

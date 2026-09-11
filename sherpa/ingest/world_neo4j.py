@@ -22,14 +22,14 @@ from neo4j.exceptions import Neo4jError
 from .. import worlds                                # world root 解決（重要度の解決に使う・I2）
 from ..impact_service import CATEGORY                # 種別→結果カテゴリ（再利用・読み取りのみ）
 from . import importance                             # 文書の重要度（`_重要度.txt`・I2）
-from .model import EDGE_TYPES, NODE_LABELS           # 閉じた語彙（Cypher 直埋めの allowlist・RV Med#1）
+from .model import EDGE_TYPES, NODE_LABELS           # 閉じた語彙（Cypher 直埋めの allowlist）
 
 _log = logging.getLogger("sherpa")
 
 # 鏡の許容エッジ＝旧オントロジー語彙＋**対応エッジ `CORRESPONDS_TO`**（世代横断の対応・MIRROR §2.3）。
 WORLD_EDGE_TYPES = EDGE_TYPES | {"CORRESPONDS_TO"}
 
-# 影響たどりのエッジ＝構造（コード依存）のみ（K13・2026-09-04-グラフのソース正典化.md §4）。
+# 影響たどりのエッジ＝構造（コード依存）のみ（2026-09-04-グラフのソース正典化.md §4）。
 # **対応エッジ `CORRESPONDS_TO` と 添付 `DOCUMENTS`（言及エッジ含む）は辿らない**
 # （世代横断の比較・根拠添付＝影響伝播ではない・MIRROR §2.3 / ONTOLOGY §7）。
 _IMPACT_REL = "COPIES|CONTAINS|INVOKES|ACCESSES"
@@ -38,7 +38,7 @@ WORLD_CONSTRAINTS = [
     "CREATE CONSTRAINT canon IF NOT EXISTS FOR (n:Entity) REQUIRE n.canonical_id IS UNIQUE",
     "CREATE INDEX ent_world IF NOT EXISTS FOR (n:Entity) ON (n.world_id)",
     "CREATE INDEX ent_name IF NOT EXISTS FOR (n:Entity) ON (n.name)",
-    # rv-s3-removal: world ごとのスキーマ世代スタンプ（`GRAPH_SCHEMA_ERA`）を持つメタノード。
+    # world ごとのスキーマ世代スタンプ（`GRAPH_SCHEMA_ERA`）を持つメタノード。
     # `:Entity` とは別ラベルのため `load_world`/`delete_world` の `DETACH DELETE (n:Entity ...)` の
     # 対象に入らない（明示的に別途 MERGE/DELETE する）。
     "CREATE CONSTRAINT sherpa_meta_world IF NOT EXISTS FOR (m:SherpaMeta) REQUIRE m.world_id IS UNIQUE",
@@ -46,7 +46,7 @@ WORLD_CONSTRAINTS = [
 
 
 def _compute_graph_schema_era() -> str:
-    """`GRAPH_SCHEMA_ERA` の合成（sha256 先頭12桁・決定的・rv-s3-removal）。
+    """`GRAPH_SCHEMA_ERA` の合成（sha256 先頭12桁・決定的）。
 
     材料: コードアナライザの分類契約版（`analyzers.registry.CODE_ANALYZERS_SCHEMA_VERSION`）・
     アナライザ登録簿の構成署名（`analyzers.registry.config_signature()`）・言及エッジ突合の仕様版
@@ -84,8 +84,8 @@ def _scope_pred(var: str) -> str:
             f"{var}.path IS NOT NULL AND ({var}.path=pref OR {var}.path STARTS WITH pref+'/')))")
 
 
-# secRV 範囲外是正（2026-07-19・影響分析の Neo4j 安全弁＝timeout＋緊急天井・fail-loud＝偽陰性防止・
-# LIMIT不使用がユーザー決定）: 直前に `sherpa/lens_service.py`（近傍探索・補助情報）へ同種の安全弁
+# 影響分析の Neo4j 安全弁（timeout＋緊急天井・fail-loud＝偽陰性防止・LIMIT は使わない）:
+# 直前に `sherpa/lens_service.py`（近傍探索・補助情報）へ同種の安全弁
 # （`_run_capped`）を実装済みだが、**本丸の影響分析（`world_impact`/`resolve_world_entity`・本モジュール）は
 # lens_service を通らない**ため、ここに同じ道具立て（per-query timeout・ストリーム反復・緊急天井・
 # Cypher に LIMIT は入れない＝網羅性維持）を複製する。ただし**縮退の意味は逆**にする:
@@ -119,9 +119,9 @@ GRAPH_OVERLOAD_USER_MESSAGE = (
 )
 
 
-# rv-s3-removal（Codex RV HIGH・縮小形）: K13 語彙撤去後に**再構築前の旧 Neo4j グラフ**を読むと、
+# 語彙撤去後の**再構築前の旧 Neo4j グラフ**を読むと、
 # 「旧 LLM 由来エッジの混入」や「もっともらしい影響なし」を正常応答として返してしまう。
-# 「last_sig 不一致で 503」（Codex 案）は不採用——鏡モデルでは原本変更〜次 sync の署名差は
+# 「last_sig 不一致で 503」は不採用——鏡モデルでは原本変更〜次 sync の署名差は
 # 正常運転（最後に取り込んだ状態で答えるのが契約）。代わりに、グラフを構築した時の
 # スキーマ世代（`GRAPH_SCHEMA_ERA`）を Neo4j 側へ保存し（`load_world`）、現行コードの世代と
 # 異なる場合**だけ**（＝コード側のグラフ内部形式が変わったのに再取り込みが済んでいない場合だけ）
@@ -152,7 +152,7 @@ GRAPH_SCHEMA_ERA_USER_MESSAGE = (
 
 
 def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
-    """world の保存済みスキーマ世代を確認する（fail-loud・rv-s3-removal）。
+    """world の保存済みスキーマ世代を確認する（fail-loud）。
 
     グラフに実データ（`world_id` を持つ `:Entity`）が無い world は対象外——ゲートは
     「**旧世代の実データがある**」場合だけ発動し、未投入 world の既存の空応答/既存エラーは
@@ -164,13 +164,13 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     `graph_admin.graph_search`）がそれぞれ1回呼ぶ——per-query の追加ラウンドトリップにはなるが
     1クエリで完結させており（count と meta を同一クエリで取得）、20人規模の運用では
     最適化不要（過剰最適化しない・タスク前提）。呼び出し位置は各関数の**主クエリの後**（本関数自体は
-    `GraphQueryOverloadError` を扱わない・下記参照）。存在確認は `LIMIT 1`（RV是正・rv-periphery
-    #9・2026-09-05）——`count(n)` の値自体は真偽判定にしか使わないため、`world_id` 一致ノードが
+    `GraphQueryOverloadError` を扱わない・下記参照）。存在確認は `LIMIT 1`
+    ——`count(n)` の値自体は真偽判定にしか使わないため、`world_id` 一致ノードが
     大量にある world でも全件を数え上げる必要が無い（1件見つかった時点で打ち切る）。
 
     世代プローブ自体が失敗（timeout/接続断等の `Neo4jError`）した場合は、警告ログを残したうえで
-    そのまま re-raise する（RV是正・rv-periphery #9）——旧実装は黙って戻っており、この安全弁
-    （旧世代グラフの検知）自体が Neo4j の一時的な不調のたびに無条件で無効化されてしまっていた
+    そのまま re-raise する——黙って戻ると、この安全弁
+    （旧世代グラフの検知）自体が Neo4j の一時的な不調のたびに無条件で無効化されてしまう
     （fail-open は本来の目的＝旧世代データの読み取り防止に反する）。呼び出し元
     （`routers/impact.py`・`routers/graph.py`・`chat_service.py`・`graph_admin.ask_graph`・
     `search_service._search_graph`）は他の `Neo4jError` と同じ経路（既存の broad except・
@@ -230,8 +230,8 @@ _NEO4J_MAX_ROWS = _env_int("SHERPA_NEO4J_MAX_ROWS", 10000, 100, 1_000_000)
 # 広げたときだけ上限も広がる・下げる方向には動かさない）。
 IMPACT_MAX_DEPTH = _env_int("SHERPA_IMPACT_MAX_DEPTH", 8, 1, 64)
 
-# GRAPH-MEM（2026-09-04・机上見積もり=目標規模20〜50万ノード同オーダーのエッジ）: `load_world` の
-# ノード/エッジ投入を UNWIND バッチへ分割する行数。既定5000・[1,1000000] にクランプ。
+# `load_world` の
+# ノード/エッジ投入を UNWIND バッチへ分割する行数（机上見積もり=目標規模20〜50万ノード同オーダーのエッジ）。既定5000・[1,1000000] にクランプ。
 # 根拠: 1行（ノード/エッジ1件）のプロパティは高々数百バイト＝5000行で数百KB〜数MB程度。UNWIND の
 # パラメータはドライバ側で Bolt PackStream へ直列化される際に一時的に元の Python オブジェクトと
 # 直列化後バイト列が両方メモリに乗る（同量の一時的な二重化）——バッチを割らず全ノード/全エッジを
@@ -273,7 +273,7 @@ def _run_read_capped(session, cypher: str, *, world: str, **params) -> list[dict
     （`resolve_world_entity`/`presumed_impact`）では未参照パラメータとして無害に無視される＝Neo4j は
     Cypher が参照しない余分なパラメータをエラーにしない）。
 
-    secRV 範囲外是正 追補（2026-07-19・RV指摘 HIGH-1）: `lens_service._run_capped` と同じ理由で、
+    `lens_service._run_capped` と同じ理由で、
     天井到達時は raise する**前**に `result.consume()` を呼び、未消費の Result を残さない（neo4j
     driver 6.2.0 は同じ session で次の `session.run()` を呼ぶと前の未消費 Result の残りを全件
     fetch/buffer するため、raise 後に呼び出し元が同一 session で別クエリを流すと安全弁が逆流する）。
@@ -299,7 +299,7 @@ def _run_read_capped(session, cypher: str, *, world: str, **params) -> list[dict
 
 
 def _sources_json(sources) -> str | None:
-    """D3（2026-09-02-RAG表現の全形式展開と文脈保持.md §5.2）: entity/relation の出所
+    """（2026-09-02-RAG表現の全形式展開と文脈保持.md §5.2）: entity/relation の出所
     （`chunk_id`/`locator`/`logical_record_id` を持つ dict のリスト）を Neo4j プロパティへ持てる形に
     直列化する。Neo4j のプロパティ値はプリミティブ/プリミティブ配列限定で、マップの配列は直接
     持てない——リストごと1本の JSON 文字列にする。空/無ければ None（プロパティを立てない）。"""
@@ -343,15 +343,15 @@ def _edge_row(e: dict) -> dict:
 def load_world(nodes, edges, world_id, uri, user, password):
     """world グラフ（dict）を Neo4j に**クリーン rebuild**（当該 world を削除→全ロードを1 write tx で原子化）。
 
-    削除と再ロードを同一 tx にして、途中失敗で live グラフを空/部分にしない（neo4j_load.reload と同方針・RV High）。
+    削除と再ロードを同一 tx にして、途中失敗で live グラフを空/部分にしない（neo4j_load.reload と同方針）。
     schema コマンドはデータ tx と混ぜられないので先に流す。
 
-    rv-s3-removal: 同じ tx の最後に `GRAPH_SCHEMA_ERA`（`:SherpaMeta{world_id}.schema_era`）を
+    同じ tx の最後に `GRAPH_SCHEMA_ERA`（`:SherpaMeta{world_id}.schema_era`）を
     刻む——グラフを構築した時のスキーマ世代を保存し、読み取り側（`check_schema_era`）が現行
     コードの世代と比較できるようにする（旧世代のまま再取り込みされていない world を fail-loud
     で検知するため）。
 
-    GRAPH-MEM（2026-09-04）: ノード/エッジの投入は `_NEO4J_BATCH_ROWS` 件ずつの **UNWIND バッチ**へ
+    ノード/エッジの投入は `_NEO4J_BATCH_ROWS` 件ずつの **UNWIND バッチ**へ
     分割して送る（ラベル/エッジ型は Cypher に直埋め＝1バッチ=1ラベル or 1エッジ型・許容語彙は事前検証済み）。
     **原子性は変えない**——バッチはすべて同一の明示 write tx（`s.execute_write(_apply)`）の中で送るので、
     途中のバッチが例外を投げれば tx 全体がロールバックされ（neo4j driver の managed transaction の挙動）、
@@ -368,7 +368,7 @@ def load_world(nodes, edges, world_id, uri, user, password):
     """
     from neo4j import GraphDatabase  # 遅延 import（解析だけなら不要）
 
-    # label/edge type は Cypher に直埋めするので、書込 tx の前に**閉じた語彙で検証**（fail-closed・RV Med#1）。
+    # label/edge type は Cypher に直埋めするので、書込 tx の前に**閉じた語彙で検証**（fail-closed）。
     bad_n = {n["label"] for n in nodes if n["label"] not in NODE_LABELS}
     bad_e = {e["type"] for e in edges if e["type"] not in WORLD_EDGE_TYPES}
     if bad_n or bad_e:
@@ -417,7 +417,7 @@ def load_world(nodes, edges, world_id, uri, user, password):
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_edge_row(e) for e in batch]
                         tx.run(edge_cypher, rows=rows, world=world_id)
-                # rv-s3-removal: このロードが作った world グラフのスキーマ世代を刻む
+                # このロードが作った world グラフのスキーマ世代を刻む
                 # （同一 tx＝rebuild と不可分。`:Entity` とは別ラベルなので上の DETACH DELETE の
                 # 対象に入らない——MERGE で世代を上書きするだけでよい）。
                 tx.run("MERGE (m:SherpaMeta {world_id:$w}) SET m.schema_era=$era",
@@ -431,7 +431,7 @@ def load_world(nodes, edges, world_id, uri, user, password):
 def delete_world(world_id, uri, user, password) -> int:
     """その world の全ノード（と接続辺）を削除（rebind/delete の wipe・`world_id` 単位）。
 
-    `SherpaMeta`（スキーマ世代スタンプ・rv-s3-removal）も同じクエリで合わせて削除する——`:Entity`
+    `SherpaMeta`（スキーマ世代スタンプ）も同じクエリで合わせて削除する——`:Entity`
     とは別ラベルのため素の `MATCH (n:Entity ...)` の対象には入らず、放置すると同じ world_id を
     後で再利用したとき古い世代スタンプが残る。戻り値は削除ノード総数（Entity＋あれば SherpaMeta
     1件・呼び出し元は件数を厳密検証しない集計値としてのみ使う）。
@@ -470,7 +470,7 @@ def reconcile(valid_worlds, uri, user, password) -> list:
                 if wid in keep:
                     continue
                 try:
-                    # rv-s3-removal: `SherpaMeta`（スキーマ世代スタンプ）も同じクエリで一緒に消す
+                    # `SherpaMeta`（スキーマ世代スタンプ）も同じクエリで一緒に消す
                     # （`delete_world` と同じ理由・別ラベルなので `n:Entity` 単独の MATCH には入らない）。
                     s.run("MATCH (n) WHERE n.world_id=$w AND (n:Entity OR n:SherpaMeta) "
                          "DETACH DELETE n", w=wid)
@@ -489,14 +489,15 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
     """起点語 → 起点 canonical_id 群（名前一致・範囲内）。
 
     impact_service.resolve_entity の world 版。`scope_prefixes` で起点も範囲に絞る（範囲外の同名は起点にしない）。
-    業務語→コードの橋渡し（旧 REALIZES）は撤去済み（K10）——業務語の入口はクエリ時のエージェントが
+    業務語→コードの橋渡し（旧 REALIZES）は撤去済み——業務語の入口はクエリ時のエージェントが
     文書を grep してコード名を発見する経路に委ねる（§2）。
 
-    rv-s3-removal: 単独では `check_schema_era` を呼ばない（RV是正・rv-periphery #9・2026-09-05で
-    変更）——本関数の唯一の呼び出し元 `run_world_impact` が直後に `world_impact` も呼び、そちらが
-    同じゲートを最終クエリの後に1回だけ確認する（`run_world_impact` docstring 参照）。本関数が
+    単独では `check_schema_era` を呼ばない——本関数の唯一の呼び出し元 `run_world_impact` が直後に
+    `world_impact` も呼び、そちらが同じゲートを最終クエリの後に1回だけ確認する
+    （`run_world_impact` docstring 参照）。本関数が
     別の場所から単独で呼ばれるようになった場合は、その呼び出し元で改めてゲートを追加すること
-    （旧実装は `world_impact` と2回連続で同じ world の世代プローブを重複実行していた）。
+    （本関数がゲートを呼ぶと `run_world_impact` の中で `world_impact` と2回連続で同じ world の
+    世代プローブを実行することになるため、ここでは呼ばない）。
     """
     prefixes = list(scope_prefixes or [])
     rows = _run_read_capped(
@@ -508,7 +509,7 @@ def resolve_world_entity(session, term, world_id, scope_prefixes=None,
         "  n.name AS name, n.path AS path",
         world=world_id, w=world_id, name=term, incl=include_deprecated, prefixes=prefixes,
     )
-    # `path`（RV波1是正）: 同名の起点候補（例: environment-dev/prod 相当の同名 Config キー）を
+    # `path`: 同名の起点候補（例: environment-dev/prod 相当の同名 Config キー）を
     # 呼び出し側が区別できるようにする——既存キー（`canonical_id`/`label`/`name`）は不変・追加のみ。
     return [{"canonical_id": r["cid"], "label": r["label"], "name": r["name"], "path": r["path"]}
            for r in rows]
@@ -520,13 +521,13 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
 
     範囲：start・affected・**経路の全ノード**が `world_id` ＋ `scope_prefixes` 内（in-graph の `subgraph` 同義）。
     骨格エッジ（`_IMPACT_REL`＝COPIES/CONTAINS/INVOKES/ACCESSES）のみを辿る決定的な構造たどり——
-    K12（2026-09-04-グラフのソース正典化.md §4）: 「確実/要確認」の二重クエリ・判定表示は
+    （2026-09-04-グラフのソース正典化.md §4）: 「確実/要確認」の二重クエリ・判定表示は
     機構ごと撤去（全件同格）。1本の Cypher で足りる（旧 all-static 判定クエリは撤去）。
 
-    rv-s3-removal: `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError`
+    `check_schema_era` を呼ぶ（旧世代の実データがある world は `GraphSchemaEraError`
     で fail-loud）。主クエリの**後**に呼ぶ——主クエリ自体の安全弁（`_run_read_capped` の
     timeout/緊急天井＝`GraphQueryOverloadError`）を先に効かせるため（結果を返す直前の最終ゲート）。
-    RV是正（rv-periphery #9・2026-09-05）: 唯一の呼び出し元 `run_world_impact` は本関数の**前**に
+    唯一の呼び出し元 `run_world_impact` は本関数の**前**に
     `resolve_world_entity` も呼ぶが、そちらは単独では同じゲートを呼ばない（`run_world_impact`
     全体を1回だけ守れば足りる・重複ラウンドトリップの解消）。
     """
@@ -573,16 +574,15 @@ def world_impact(session, start_cids, world_id, scope_prefixes=None, depth=IMPAC
 
 
 def _attach_importance(items: list, world_id: str) -> None:
-    """items へ `importance`/`importance_reason`/`importance_mixed` を条件付きで付与する（I2・J3・
-    rv-oom-resume item7・2026-09-05）。
+    """items へ `importance`/`importance_reason`/`importance_mixed` を条件付きで付与する（I2・J3）。
 
     候補＝各 item の `path`（自身の所属文書）∪ `evidence[].doc`（根拠の来歴文書）。**未設定
     （`_重要度.txt` の解決が無い候補）は「中」と同格の順位**（`importance.RANK_UNSET`・
     `importance.rank_of` 参照＝`grep_tool` のヒット優先順位と同じスケール）として最高位計算
-    （どの候補が勝つか）にも `importance_mixed` の判定にも含める——旧実装は未解決の候補を
-    候補集合から単純に除外していたため、「自身は無印（中相当）だが根拠の中にたまたま `低`
+    （どの候補が勝つか）にも `importance_mixed` の判定にも含める——未解決の候補を
+    候補集合から単純に除外すると、「自身は無印（中相当）だが根拠の中にたまたま `低`
     指定の文書が1つ混じっている」ような item が、無印候補の存在を無視して誤って `低` 表示に
-    なる/ならないが候補の順序に左右される穴があった。
+    なる/ならないが候補の順序に左右される穴が生まれる。
 
     ただし**最高位に達した候補の中に実際の `Resolution`（`_重要度.txt` で明示解決された候補）が
     1つも無ければ、`importance`/`importance_reason`/`importance_mixed` のいずれも付けない**——
@@ -635,7 +635,7 @@ def run_world_impact(session, term, world_id, scope_prefixes=None,
 
 def default_neo4j_uri() -> str:
     """Neo4j 接続 URI。NEO4J_URI の明示（別ホスト向け）が最優先、無ければ compose の公開ポート変数
-    SHERPA_NEO4J_BOLT_PORT（docker-compose.yml と共用の 1 変数）に追随する（2026-08-18・ポートは 1 か所で決める）。"""
+    SHERPA_NEO4J_BOLT_PORT（docker-compose.yml と共用の 1 変数）に追随する（ポートは 1 か所で決める）。"""
     uri = os.environ.get("NEO4J_URI")
     if uri:
         return uri

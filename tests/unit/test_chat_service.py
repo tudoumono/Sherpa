@@ -1961,6 +1961,46 @@ def test_finalize_does_not_replace_headline_for_impact_even_when_loosest():
     assert out["headline"] == "「税率」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
 
 
+# ===== STAT-3 T3: `_finalize` が `env["stop_kind"]` を立てる（`sherpa.stop_kind.resolve` の薄い配線
+# 確認・各値の導出ロジック自体は tests/unit/test_stop_kind.py が固定する）=====
+
+def test_finalize_sets_stop_kind_completed_by_default():
+    env = _env(["doc1"], {"scope_paths": [], "layer": "both", "layer_applied": True})
+    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
+    assert out["stop_kind"] == "completed"
+
+
+def test_finalize_sets_stop_kind_budget_for_budget_exhausted_stop_reason():
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True},
+              data={"evidence_packet": {"task_id": "main", "stop_reason": "turns_exhausted"}})
+    env["headline"] = "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"
+    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
+    assert out["stop_kind"] == "budget"
+
+
+def test_finalize_sets_stop_kind_no_evidence_for_evaluation_blocked():
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True},
+              data={"evidence_packet": {"task_id": "main", "stop_reason": "evaluation_blocked"}})
+    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
+    assert out["stop_kind"] == "no_evidence"
+
+
+def test_finalize_sets_stop_kind_codex_partial_for_codex_stopped_early():
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={"citations": []})
+    env["headline"] = "続いて関連ファイルを確認します。"
+    env["codex_stopped_early"] = True
+    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
+    assert out["stop_kind"] == "codex_partial"
+
+
+def test_finalize_sets_stop_kind_codex_silent_for_codex_silent_failure():
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={})
+    env["headline"] = "Codex に接続できませんでした（Codex CLI が応答を返す前に終了しました）。"
+    env["codex_silent_failure"] = True
+    out = CS._finalize(env, {"lens": "qa", "reason": "Codex 未接続"})
+    assert out["stop_kind"] == "codex_silent"
+
+
 # ===== handle_message/stream_message の lens 配線（SC-6b・end-to-end but DB 不要）=====
 
 class _FakeCtxCaptureProvider:
@@ -2210,3 +2250,19 @@ def test_facts_impact_zero_items_carries_limit_lines():
            "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: [graph] X"}
     out = _facts("impact", env)
     assert "計0件" in out and "調査の限界: 調査を上限到達で中断" in out
+
+
+def test_finalize_leaves_stop_kind_unset_for_busy_envelope():
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={})
+    env["headline"] = "同じ会話で別の依頼を実行中です。"
+    env["busy"] = True
+    out = CS._finalize(env, {"lens": "qa", "reason": "Codex 実行中"})
+    assert "stop_kind" not in out
+
+
+def test_finalize_leaves_stop_kind_unset_for_agentic_failure_envelope():
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={})
+    env["headline"] = "下調べAIでの調査がうまくいきませんでした。"
+    env["agentic_failure"] = "error"
+    out = CS._finalize(env, {"lens": "qa", "reason": "下調べAIの失敗"})
+    assert "stop_kind" not in out

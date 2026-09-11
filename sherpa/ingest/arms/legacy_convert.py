@@ -1,4 +1,4 @@
-"""旧形式 Office（.doc/.xls/.ppt）→ 新形式 OOXML の変換バックエンド抽象（起案 docs/archive/proposals/2026-07-08-旧Office変換2系統.md W0）。
+"""旧形式 Office（.doc/.xls/.ppt）→ 新形式 OOXML の変換バックエンド抽象（docs/archive/2026-07-08-旧Office変換2系統.md W0）。
 
 旧バイナリ（CFB）は OOXML ではないため `office_md` の XML 直パースでは読めない（INGEST-MD §5.6・D2）。本モジュールは
 「旧→新（OOXML）の**前段変換器**」を提供し、MD 化自体は既存①OOXML アーム（値の権威・決定的）へ委譲する
@@ -7,14 +7,14 @@
 
 バックエンドの解決順は **system_settings `legacy_backend` > env `SHERPA_LEGACY_BACKEND` > 既定 "none"**
 （2026-07-08-設定分離とUI整備.md S1 の汎用 KV に相乗り）。値は `none` | `libreoffice` | `office_com`。
-env 段は ENV-CLEAN（2026-09-03）でも**撤去しない**——`providers/codex/mcp.py::_mcp_env` が親プロセス
+env 段は ENV-CLEAN でも**撤去しない**——`providers/codex/mcp.py::_mcp_env` が親プロセス
 （DB 接続あり）で解決した実効値を `SHERPA_LEGACY_BACKEND` としてスナップショットし、MCP サブプロセス
 （PG creds 無し）はこの env フォールバックだけで親と同じ実効値に一致する（`SHERPA_LEGACY_EXTS`／
 `SHERPA_VLM_USABLE` と同じ内部 IPC 契約）。管理画面からは system_settings 段が常に優先するため、
 「UI が唯一の真実源」の原則自体は保たれる。
-`office_com`（Windows の本物 Office・忠実変換）は **W1（2026-07-08）で追加**。COM interop は Windows 側の
+`office_com`（Windows の本物 Office・忠実変換）は **W1 で追加**。COM interop は Windows 側の
 `deploy/office-com-worker.ps1` だけが持ち、ここ（WSL コア）は **HTTP か WSL interop の one-shot で呼ぶ**。
-office_com には2つの動作形態がある（**W2'・feedback-batch-2026-07-08 ⑥・2026-07-08**）:
+office_com には2つの動作形態がある（**W2'**）:
   - **direct（既定・同一マシン）**: `SHERPA_OFFICE_COM_URL` 未設定時、WSL interop（`/mnt/c/.../powershell.exe`）で
     ps1 を one-shot 実行する（常駐ワーカー・URL・トークン不要＝Windows 側の事前準備ゼロ）。powershell.exe が
     検出できなければ到達不可（fail-safe）。healthz は ps1 `-Healthz` の JSON を長め TTL でキャッシュする。
@@ -23,7 +23,7 @@ office_com には2つの動作形態がある（**W2'・feedback-batch-2026-07-0
 `SHERPA_OFFICE_COM_URL`（未設定＝direct へ倒す）・`SHERPA_OFFICE_COM_TOKEN`・`SHERPA_POWERSHELL_BIN`（direct の
 powershell.exe 明示パス・未設定は既定パスを探す）。
 `SHERPA_LEGACY_EXTS`（設定時は最優先＝MCP サブプロセス用のスナップショット・office_com の URL/TOKEN を
-持たないサブプロセスに healthz probe をさせず、親の実効値をそのまま信じさせる。W1 RV Med）。
+持たないサブプロセスに healthz probe をさせず、親の実効値をそのまま信じさせる。W1）。
 
 **OFFICE-WIN-001（2026-07-20-調査型RAG詳細修正計画.html §6.5・http モード限定）**: 別ホストのワーカーへ
 原本をどう渡すかは `transfer_mode`（`system_settings` `office_transfer_mode` > env
@@ -58,7 +58,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-# LOG-2（2026-09-03）: 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py`
+# 専用ログ（sherpa.convert.libreoffice）へルーティングする（`sherpa/log_setup.py`
 # の登録表参照）。office_com backend（http/direct）のログも本モジュール内にあるため同じ系統に乗る。
 _log = logging.getLogger("sherpa.convert.libreoffice")
 
@@ -66,7 +66,7 @@ _log = logging.getLogger("sherpa.convert.libreoffice")
 LEGACY_EXT_MAP: dict[str, str] = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
 
 # 拡張子 → office_com ワーカーが使うアプリ名（healthz の versions dict のキーと一致・deploy/office-com-worker.ps1
-# の $script:ExtMap と対応）。RV Med（2026-07-08）: healthz `ok` だけで3拡張子すべてを候補化すると、Word のみ
+# の $script:ExtMap と対応）。healthz `ok` だけで3拡張子すべてを候補化すると、Word のみ
 # 導入環境で .xls が毎回投入されては失敗する（failed に寄る）。アプリ単位でゲートするために使う。
 _EXT_APP: dict[str, str] = {".doc": "word", ".xls": "excel", ".ppt": "powerpoint"}
 
@@ -83,7 +83,7 @@ _VERSION_TIMEOUT_SEC = 15.0           # `soffice --version` のタイムアウ�
 _OFFICE_COM_HEALTH_TIMEOUT = 2.0      # office_com(http) /healthz の短タイムアウト（到達判定・毎回叩かないよう TTL キャッシュ）
 _OFFICE_COM_HEALTH_TTL = 30.0         # http /healthz の結果をプロセス内でキャッシュする秒数（到達可否・versions）
 
-# W2'（direct モード・2026-07-08）: ps1 の one-shot は起動コスト（~1-3s）があるため長め TTL でキャッシュする。
+# W2'（direct モード）: ps1 の one-shot は起動コスト（~1-3s）があるため長め TTL でキャッシュする。
 _OFFICE_COM_DIRECT_HEALTH_TTL = 300.0  # direct `-Healthz` one-shot の結果をキャッシュする秒数
 _DIRECT_HEALTH_TIMEOUT = 15.0          # direct `-Healthz` one-shot 自体のタイムアウト（powershell 起動＋レジストリ参照）
 # WSL 側の変換/レンダ backstop タイムアウト。ps1 内部（-JobTimeoutSec）が先に発火して Office 残骸を Windows 側で
@@ -169,7 +169,7 @@ def _env_backend() -> str:
     """env `SHERPA_LEGACY_BACKEND`（未設定は既定 "none"）。正規化のみ（既知/未知の判定は `_normalize`）。
 
     MCP サブプロセスは `providers/codex/mcp.py::_mcp_env` が親の実効値をここへスナップショットする
-    （モジュール docstring 参照）ため、この env 読みは ENV-CLEAN（2026-09-03）でも維持する。
+    （モジュール docstring 参照）ため、この env 読みは ENV-CLEAN でも維持する。
     """
     return (os.environ.get("SHERPA_LEGACY_BACKEND") or _DEFAULT_BACKEND).strip() or _DEFAULT_BACKEND
 
@@ -547,7 +547,7 @@ def _office_com_available_apps() -> set[str]:
 def office_com_available_exts() -> set[str]:
     """office_com で今変換できる拡張子集合（healthz の versions で検出できたアプリ対応分のみ）。
 
-    RV Med（2026-07-08）: healthz `ok` だけで .doc/.xls/.ppt を丸ごと候補化すると、Word のみ導入環境で
+    healthz `ok` だけで .doc/.xls/.ppt を丸ごと候補化すると、Word のみ導入環境で
     .xls が投入されては毎回失敗する（failed に寄る＝ユーザーに誤った期待を持たせる）。アプリ単位でゲートする。
     """
     apps = _office_com_available_apps()
@@ -783,7 +783,7 @@ def _run_direct_job(
       UNC で渡し、ps1 が WriteAllBytes で書き、こちらが読み返す＝Office は常に Windows ローカルに書く）。
     - 直列実行（`_convert_lock`）・backstop タイムアウト（**ps1 へ渡した整数秒** ＋ `_DIRECT_GRACE_SEC`）。
 
-    RV Med（2026-07-08）: `-JobTimeoutSec` は ps1 側で `$tsec -le 0` のとき既定120秒へフォールバックする
+    `-JobTimeoutSec` は ps1 側で `$tsec -le 0` のとき既定120秒へフォールバックする
     （`Invoke-DirectJob`）。`SHERPA_LEGACY_TIMEOUT` に1秒未満の値（例 0.3）を設定していると、素朴に
     `str(int(inner))` すると "0" になりこのフォールバックを誤って踏む＝ps1 内部は120秒待つのに、WSL 側の
     backstop は元の小さい値（0.3+grace）で先に外側 powershell.exe を kill してしまい、ps1 内部の
@@ -1175,11 +1175,11 @@ def extract_excel_display(src, targets: dict[str, set[str]]) -> dict | None:
 def legacy_exts() -> set[str]:
     """今この環境で旧→新変換できる拡張子集合（.doc/.xls/.ppt）。バックエンド none／バックエンド不達は空集合。
 
-    RV Med（2026-07-08・office_com token 漏洩対策）: env `SHERPA_LEGACY_EXTS` が設定されていれば**最優先で
+    office_com token 漏洩対策: env `SHERPA_LEGACY_EXTS` が設定されていれば**最優先で
     それを信じ、以降のロジック（soffice 検出／office_com healthz 到達）は一切実行しない**。これは MCP サブ
     プロセス（`agents._mcp_env`）が親プロセスの実効値スナップショットをこの env に積んで渡すための入口で、
     MCP は office_com の URL/TOKEN を持たない（Codex sandbox 無効時の fallback 実行環境にシークレットを
-    露出させないため渡さない設計＝W1 RV Med）。カンマ区切り（例 ".doc,.xls,.ppt"）・空文字列は「対象なし」。
+    露出させないため渡さない設計＝W1）。カンマ区切り（例 ".doc,.xls,.ppt"）・空文字列は「対象なし」。
     通常の API プロセス（MCP サブプロセスでない）ではこの env は設定されないため、下の通常ロジックのまま。
 
     ⚠ MD 化は①OOXML アーム経由なので、呼び出し側（`office_md.convertible_exts`）は **ooxml アーム有効時のみ**
@@ -1194,7 +1194,7 @@ def legacy_exts() -> set[str]:
     if backend == "libreoffice" and not soffice_available():
         return set()
     if backend == "office_com":
-        return office_com_available_exts()          # RV Med: アプリ単位でゲート（healthz probe はここでのみ実行）
+        return office_com_available_exts()          # アプリ単位でゲート（healthz probe はここでのみ実行）
     return set(LEGACY_EXT_MAP)
 
 
@@ -1244,7 +1244,7 @@ def convert_to_ooxml(src: Path, target_ext: str) -> bytes | None:
 def _build_convert_cmd(bin_path: str, fmt: str, outdir, profile, src: Path) -> list[str]:
     """soffice の変換コマンド列を組み立てる（実行しない・単体でテスト可能に切り出し）。
 
-    RV Med（2026-07-08）: soffice は `-env:UserInstallation` を URL としてパースするため、パスを
+    soffice は `-env:UserInstallation` を URL としてパースするため、パスを
     そのまま `file://` に埋め込むと空白等を含む場合に誤解釈されうる。`Path.as_uri()` で正規に
     percent-encode する（`tempfile.mkdtemp` は常に絶対パスを返すので `as_uri()` の前提を満たす）。
     """
@@ -1280,7 +1280,7 @@ def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
 def _run_soffice(cmd: list[str], src: Path) -> bool:
     """soffice を実行し成功/失敗を返す。タイムアウト/非0終了/起動失敗はすべて False（fail-safe）。
 
-    RV High（2026-07-08）: `subprocess.run(timeout=)` は直接の子プロセスしか kill しない。soffice は
+    `subprocess.run(timeout=)` は直接の子プロセスしか kill しない。soffice は
     wrapper スクリプト→`soffice.bin` の多段起動のため、タイムアウト時に孫プロセスが生き残り、その後
     `finally` で profile/outdir を rmtree すると、残った soffice が消えたディレクトリを掴んだまま
     残骸プロセスになる。`start_new_session=True`（独立プロセスグループ）＋タイムアウト時
@@ -1346,7 +1346,7 @@ def _source_key(src: Path) -> str:
     （backend を含めないと、W1 で office_com へ切替後も LibreOffice 産キャッシュがヒットし続け、provenance の
     backend 名と実際の変換元が食い違う）。
 
-    RV Med（2026-07-08・W2'）: office_com は backend 名が同じ "office_com" のままでも、動作形態
+    office_com（W2'）は backend 名が同じ "office_com" のままでも、動作形態
     （`office_com_mode()`＝http／direct）が切り替わると実際の変換元（別ホストの Office／同一マシンの Office）が
     変わり、provenance（`office_com_versions=...`）も変わりうる。backend 名だけをキーにすると http→direct
     （またはその逆）の切替後も旧モード産キャッシュがヒットし続けてしまうため、backend が office_com のときだけ

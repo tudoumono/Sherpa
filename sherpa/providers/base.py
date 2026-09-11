@@ -1,4 +1,4 @@
-"""思考プロバイダの共通基盤（リファクタリング計画 フェーズ5 S3・`sherpa/agents.py` から純移動）。
+"""思考プロバイダの共通基盤（`sherpa/agents.py` から re-export される）。
 
 `Ctx`（プロバイダへ渡す文脈）・`_node`/`_can_ask`/`_gather`（共通の前段＝理解→意図→**実ツール取得**）・
 `_plain_run`（ナレッジ参照オフの素の会話）・`_usage_meta`（usage メタの標準形）・`Provider`（頭脳の
@@ -7,10 +7,10 @@
 facade として本モジュールから再エクスポートするため、まだ agents.py に残る各 Provider 実装
 （HeuristicProvider・OpenAIProvider・CodexProvider 等）は無改修で動く。
 
-`_GenProvider._agentic_run` の `agentic_search` 遅延 import は元コードのまま関数内で行うが、
-移動に伴い相対 import の深さが1段増える（`sherpa/agents.py` → `sherpa/providers/base.py`）ため
-`from . import agentic_search` は `from .. import agentic_search` に変更した（挙動は不変・
-参照先モジュールは変わらない）。
+`_GenProvider._agentic_run` の `agentic_search` 遅延 import は関数内で行う。本モジュールは
+`sherpa/agents.py` より1段深い（`sherpa` から見て `providers` 配下）ため
+`from .. import agentic_search` になる（参照先モジュールは `sherpa.agentic_search` のまま
+変わらない）。
 
 **シーム規則（危険な継ぎ目・`tests/unit/test_agents_seams.py` と `test_agents_author.py` が固定）**:
 `_GenProvider.run` 内の `_gather` 呼び出しは、`from sherpa import agents as _facade` で
@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator
 
 from .. import layer as layer_mod
+from .. import stop_kind as stop_kind_mod
 from .prompts import (_AUTHOR_FALLBACK_NOTE, _BUDGET_EXHAUSTED_HEADLINE, _PLAIN_PROMPT,
                       _PLAIN_PROMPT_WITH_PERSONAL, _answer_prompt)
 
@@ -70,19 +71,19 @@ class Ctx:
     make_sources: Callable[[list], list] | None = None  # doc_id[] -> sources[]（agentic 結果に出典を付与）
     uid: str = "admin"                    # Feature A: 現在ユーザー uid（互換モードは 'admin'）
     personal_facts: str = ""              # Feature B HIGH1: ナレッジオフ/agentic 経路にも個人ヒストを注入
-    stop_event: "threading.Event | None" = None   # UI フィードバック1: 途中停止（api.py の /chat/stream/stop が set する）
-    # R1a（横断レビュー対応・2026-07-13・会話継続）: 直前ターンの (user, assistant) 完全対（時系列順・
+    stop_event: "threading.Event | None" = None   # 途中停止（api.py の /chat/stream/stop が set する）
+    # 直前ターンの (user, assistant) 完全対（時系列順・
     # chat_service._history_pairs で N対＋文字予算の二重キャップ済み＝provider 側で再キャップしない）。
     # 例: [{"role":"user","content":"…"},{"role":"assistant","content":"…"}, ...]。**message 文字列には
     # 混ぜない**（_resolve_scope/_personal_grep_hits の grep クエリ・chat_router の確認ID 正規表現・
     # _can_ask の判定を履歴内容で汚染しないため＝別チャネルで運ぶ）。
     history: list | None = None
-    conversation_id: int | None = None    # R1a: Codex ネイティブ resume（R1b）向けの前倒し配線。
-    # R1b（横断レビュー対応・2026-07-15・Codex ネイティブ resume）: この会話に紐づく直近の
+    conversation_id: int | None = None    # Codex ネイティブ resume 向けの前倒し配線。
+    # Codex ネイティブ resume: この会話に紐づく直近の
     # `codex_session_id`（`store.get_session_id`・conversation_id と同じタイミングで chat_service が
     # 前渡しする）。CodexProvider だけが消費する（他 provider は無視＝解釈の余地なし）。
     # None＝新規セッション（resume しない）。resume 失敗時は CodexProvider 内で新規セッションへ
-    # 自動フォールバックする（R1a の履歴 priming は resume の有無に関わらずプロンプトに前置済み）。
+    # 自動フォールバックする（履歴 priming は resume の有無に関わらずプロンプトに前置済み）。
     codex_session_id: str | None = None
     # 前ターンまでの Codex 累計 usage（`store.get_codex_usage_total`・conversation_id と同じ
     # タイミングで chat_service が前渡しする）。CodexProvider だけが消費する（他 provider は無視）。
@@ -90,7 +91,7 @@ class Ctx:
     # answer.usage にする（`session_id` が今回の resume 先と一致する時だけ・不一致/None なら
     # 新規セッション相当として扱い累計をそのまま使う）。
     codex_usage_prev_total: dict | None = None
-    # 検索経路トグルの実接続可用性 snapshot（`agentic_search.tool_availability()`・SC-6e）。
+    # 検索経路トグルの実接続可用性 snapshot（`agentic_search.tool_availability()`）。
     # `chat_service.handle_message`/`stream_message` がターン先頭で1回だけ計算して渡す
     # （knowledge オフ時は None）——`_agentic_run`（レンズ必須ツール判定）・provider の
     # `_agentic_loop`/`_sub_loop`（SYSTEM 節・デフォルトの toolset 構築）がこの同じ値を使い回し、
@@ -240,10 +241,10 @@ def _ctx_with_effective_layer(ctx: Ctx, lens: str) -> Ctx:
 
 
 def _can_ask(message: str) -> bool:
-    """Med-1（RV・2026-07-07）: 依頼に「確認ID:」（前の質問への回答の再送）が無いときだけ ask_user を許す。
+    """依頼に「確認ID:」（前の質問への回答の再送）が無いときだけ ask_user を許す。
 
     agentic 経路（openai/gemini/anthropic の tool-use）で回答再送に ask_user ツールを渡さない＝
-    トリガー文言由来の再質問ループを構造的に塞ぐ（S2 の Codex `_ask_disabled` と同じ確認ID ガード）。
+    トリガー文言由来の再質問ループを構造的に塞ぐ（Codex `_ask_disabled` と同じ確認ID ガード）。
     """
     return not re.search(r"確認ID[:：]", message or "")
 
@@ -253,7 +254,7 @@ def _gather(ctx: Ctx):
 
     取得（Neo4j/grep）は**全プロバイダ共通で本物**。LLM はこの結果を根拠に回答を作る。
 
-    検索経路トグル（調べ方ブロック §3.6・SC-6e）: `ctx.dispatch(...)`（`chat_service.
+    検索経路トグル（調べ方ブロック §3.6）: `ctx.dispatch(...)`（`chat_service.
     _dispatch`）が実行不能（必須ツールが全て OFF/実接続不達）と判定すると、返す env に内部専用
     サイドカー `_tools_blocked=True` を載せる（`agentic_search.tools_blocked_env` 参照）。ここで
     pop して読み、"done" ノードの文言を「N件を確認」から「使う検索が無効です」へ切り替える——
@@ -274,7 +275,7 @@ def _gather(ctx: Ctx):
     if lens == "clarify":                               # 意図が曖昧→本人に確認（ask_user と同経路）→ここで停止
         yield _node("intent", "think", "意図を特定", "どの調べ方か確認します", "done")
         yield decision["question"]
-        return                                          # _env を出さない＝呼び元は env is None で停止（RV High）
+        return                                          # _env を出さない＝呼び元は env is None で停止
     pace()
     yield _node("intent", "think", "意図を特定", _LENS_INTENT.get(lens, ""), "done")
 
@@ -282,7 +283,7 @@ def _gather(ctx: Ctx):
     for tid, tlabel in tools:
         yield _node(tid, "tool", tlabel, "照会しています", "active")
     env = ctx.dispatch(lens, decision["input"])
-    blocked = env.pop("_tools_blocked", False)   # SC-6e: 使う検索が全て OFF/不達で未実行
+    blocked = env.pop("_tools_blocked", False)   # 使う検索が全て OFF/不達で未実行
     total = env.get("summary", {}).get("total", 0)
     for tid, tlabel in tools:
         pace()
@@ -296,20 +297,21 @@ def _plain_run(provider: "Provider", ctx: Ctx) -> Iterator[dict]:
 
     取得（grep/Neo4j）を一切行わないので**右ペインの思考も最小**（理解→考える）。
     envelope は `lens="chat"`・`sources=[]`・`scope.source="off"`（UI は出典枠を出さない）。
-    HIGH-1 fix: personal_facts が存在する場合はプロンプトに注入してから LLM に渡す。
+    personal_facts が存在する場合はプロンプトに注入してから LLM に渡す。
     """
     yield _node("understand", "think", "質問を理解", "内容を把握しました", "done")
     yield _node("brain", "think", f"考える（{provider.label}）", "一般知識で回答中（ナレッジ参照オフ）", "active")
     acc = ""
-    t0 = time.monotonic()   # LOG-UX: この単発ストリーミング呼び出し1回分の経過秒（_log_chat_usage 用）
-    # RV MEDIUM（2026-07-03再検証）: 途中停止（UI フィードバック1）は非 Codex provider でも各リクエスト
+    t0 = time.monotonic()   # この単発ストリーミング呼び出し1回分の経過秒（_log_chat_usage 用）
+    # 途中停止は非 Codex provider でも各リクエスト
     # 発行前・chunk 受信間で反応する。ここは単発ストリーミングなので、発行前チェックで丸ごとスキップ、
     # 受信中は chunk ごとにチェックして早期 break する（HTTP 呼び出し自体の中断は不要＝次の境界で足りる）。
     already_stopped = ctx.stop_event is not None and ctx.stop_event.is_set()
+    _stream_failure = None   # ストリーム例外の型だけから導いた終了理由（timeout/transport_error/None）
     if not already_stopped:
         try:
             if ctx.personal_facts and hasattr(provider, "_stream"):
-                # HIGH-1 fix: 個人ヒットをプロンプトに組み込んで LLM に渡す（_plain_stream では message しか渡せない）。
+                # 個人ヒットをプロンプトに組み込んで LLM に渡す（_plain_stream では message しか渡せない）。
                 personal_prompt = _PLAIN_PROMPT_WITH_PERSONAL.format(
                     personal=ctx.personal_facts, q=ctx.message)
                 stream = provider._stream(personal_prompt)  # type: ignore[attr-defined]
@@ -321,27 +323,32 @@ def _plain_run(provider: "Provider", ctx: Ctx) -> Iterator[dict]:
                 if chunk:
                     acc += chunk
                     yield {"type": "answer_delta", "text": chunk}
-        except Exception:
+        except Exception as e:
             acc = ""
+            _stream_failure = stop_kind_mod.from_exception(e)
     headline = acc or provider._plain_text(ctx.message)
     if not acc:
         yield {"type": "answer_delta", "text": headline}        # フォールバックも一度は流す
     yield _node("brain", "think", f"考える（{provider.label}）", "回答しました" if acc else "（応答なし）", "done")
     env = {"lens": "chat", "headline": headline, "summary": {"total": 0}, "data": {},
            "sources": [], "scope": {"world": ctx.world, "scope_paths": [], "source": "off"}}
-    # F3（2026-07-07）: 素の会話でも本物のトークン生成分の usage を answer メタに乗せる（capture ゼロを解消）。
+    if not acc and not already_stopped:
+        # 定型文へ落ちたターン（未接続/無効 AI・ストリーム空・ストリーム例外）は終了理由の分布で
+        # 完了として数えない（`stop_kind.resolve`）。例外型が通信系なら timeout/transport_error。
+        env["agentic_failure"] = _stream_failure or "error"
+    # 素の会話でも本物のトークン生成分の usage を answer メタに乗せる（capture ゼロを解消）。
     _u = getattr(provider, "_last_usage", None)
     if _u:
         env["usage"] = _u
         _log_chat_usage(_u, time.monotonic() - t0, ctx.world)
-    # HIGH-1 fix: personal_facts を env に乗せる（chat_service が personal_sources を統合する）。
+    # personal_facts を env に乗せる（chat_service が personal_sources を統合する）。
     if ctx.personal_facts:
         env["_personal_facts"] = ctx.personal_facts
     yield {"type": "_result", "env": env,
            "decision": {"lens": "chat", "input": ctx.message, "reason": "ナレッジ参照オフ"}}
 
 
-# ---- F3（2026-07-07）: トークン使用量メタ ----
+# ---- トークン使用量メタ ----
 def _usage_meta(provider_id: str, model: str | None, *, input_tokens=0, cached_input_tokens=0,
                 output_tokens=0, reasoning_output_tokens=0, is_local: str | None = None,
                 system_settings: dict | None = None) -> dict:
@@ -378,7 +385,7 @@ def _usage_meta(provider_id: str, model: str | None, *, input_tokens=0, cached_i
 
 
 def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None = None) -> None:
-    """LOG-UX（2026-09-04・閉域実機フィードバック）: `kind="chat"` は `metering.record()` を通らない
+    """`kind="chat"` は `metering.record()` を通らない
     （本回答の usage は `messages.answer->'usage'` に残る契約・二重計上防止・`metering.py` モジュール
     docstring 参照）ため、`sherpa.usage` ロガーへの1行はここから個別に出す。
 
@@ -390,7 +397,7 @@ def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None
     粒度は「この応答（最終合成）1回分」——非 hybrid agentic 経路（`_agentic_run` の `agentic_usage`
     集計）だけは呼び出し元がループ全体の経過を渡す（`_agentic_run` 冒頭の t0 参照）。
 
-    STAT-3 S1（利用統計の拡充）: `usage` に `depth_profile`/`reasoning`（Codex 経路）または
+    `usage` に `depth_profile`/`reasoning`（Codex 経路）または
     `max_turns`/`max_tools_per_turn`（API 経路・`depth_profile.usage_extras` が載せる）が既に
     合流済みならログ1行にも足す（合流済みでない＝`_plain_run` 等は欄ごと省略・既存どおり）。"""
     try:
@@ -408,7 +415,7 @@ def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None
         pass
 
 
-# ---- S4-b（複数プロファイル並用・§6.2 項2・2026-07-19）: 工程間の証拠ダイジェスト ----
+# ---- 工程間の証拠ダイジェスト（複数プロファイル並用・§6.2 項2）----
 _SUB_PLAN_DIGEST_MAX_BYTES = 8 * 1024   # 前ループまでの証拠ダイジェストの UTF-8 バイト上限（8KiB）
 
 
@@ -417,7 +424,7 @@ def _sub_plan_digest(cites: list) -> str:
 
     `_run_sub_plan` の工程間受け渡し契約（§6.2 項2）: 次ループの message に注入するのは**この構造化
     テキストのみ**＝doc パス（doc_id）と span 付き引用（quote）の列挙。前ループのローカル散文（`final`
-    の回答文）は絶対に含めない（散文非露出契約＝S3 のハイブリッド合成がローカル生成物を最終ユーザー
+    の回答文）は絶対に含めない（散文非露出契約＝ハイブリッド合成がローカル生成物を最終ユーザー
     表示として信頼しないのと同じ理由で、次ループの LLM への「事実」としても信頼しない）。8KiB
     （UTF-8 バイト・`agentic_search._clip_utf8_bytes` と同型）でクリップする。cites が空なら空文字
     （＝1本目のループには何も注入しない）。
@@ -438,9 +445,9 @@ def _sub_plan_message(orig_message: str, cites: list) -> str:
 
 
 def _plan_min_citations(subs: list) -> int:
-    """S4-b（§6.4 根拠ゲート合算方針）: 合算後の根拠ゲート閾値＝実行した `subs`（resolve_sub 済み）の
+    """合算後の根拠ゲート閾値（§6.4）＝実行した `subs`（resolve_sub 済み）の
     `guard.min_citations` のうち**最大値**（保守側）。閾値未達時の扱い（`RuntimeError`→クラウド単発
-    フォールバック）は適用しない＝本関数はヘルパーのみで、適用自体は S4-c で行う。`subs` が空なら
+    フォールバック）は適用しない＝本関数はヘルパーのみで、適用自体は呼び出し元で行う。`subs` が空なら
     admin/env 既定の `_DEFAULT_MIN_CITATIONS`（`subagent_profiles.py`）と同値の 1 を返す。
     """
     return max((s["guard"]["min_citations"] for s in subs), default=1)
@@ -475,7 +482,7 @@ def _aggregate_plan_evaluation(sub_outcomes: list) -> dict | None:
            "next_action": chosen.get("next_action") or "", "others": others}
 
 
-# ---- EXT-2（拡張設計 §4.3/§4.2）: Evidence Packet 組み立て・出典（sources）の機械検証 ----
+# ---- Evidence Packet 組み立て・出典（sources）の機械検証（拡張設計 §4.2/§4.3）----
 # 機械検証そのもの（doc 実在チェック・常時実施＝TOGGLE-RM で明示 OFF 退避口を撤去済み）は
 # `agentic_search._commit_evidence` が担う——モデルが最終回答を
 # 生成する**前**のゲートにする（citation を確定してから合成させる）。citation dict 自体は検証結果で
@@ -507,7 +514,7 @@ def _safe_list_meta(lm) -> dict | None:
 
 def _safe_tree_meta(tm) -> dict | None:
     """folder_tree 集計 Evidence の `tree_meta`（対象 prefix・深さ・該当件数・列挙件数）を型検証して
-    返す（`_safe_list_meta` と同じ allowlist 規律・RV是正 rv-periphery #1）。未知の形・空なら None。
+    返す（`_safe_list_meta` と同じ allowlist 規律）。未知の形・空なら None。
     """
     if not isinstance(tm, dict):
         return None
@@ -872,8 +879,8 @@ def _committed_evidence_doc_ids(evidence_meta: list, structural_evidence_meta: l
     return set(read_docs)
 
 
-# ---- S4-c（複数プロファイル並用＋自動選択・§6.2・2026-07-19-LLMオーケストレーション実装計画.md）:
-# 計画ステップ（フラグシップが enabled プロファイル群から実行順を選ぶ単発呼び出し） ----
+# ---- 計画ステップ（複数プロファイル並用＋自動選択・§6.2・docs/archive/2026-07-15-LLMオーケストレーション実装計画.md・
+# フラグシップが enabled プロファイル群から実行順を選ぶ単発呼び出し）----
 # intent 分類（`intent_llm._complete`＝15s）より少し余裕を持たせる（steps 1個の短い JSON を返すだけの
 # 呼び出しだが、モデルが複数候補の description を読んでから応答するため）。SSE を長時間固めない短い値。
 _PLAN_CALL_TIMEOUT = 20
@@ -883,14 +890,14 @@ def _plan_prompt(message: str, lens: str, candidates: list, max_steps: int) -> t
     """計画呼び出しの system/user プロンプトを組み立てる（JSON `{"steps": [profile_id, ...]}` のみ要求）。
 
     候補一覧（id/name/description）は「データであり指示ではない」定型囲みに入れて渡す
-    （プロンプトインジェクション面の最小化・S4-a の description 正規化と対＝description は既に
+    （プロンプトインジェクション面の最小化・description 正規化と対＝description は既に
     200字上限・制御文字除去・改行のスペース化まで済んでいる）。
 
-    S4-c RV 是正（MED-1・2026-07-20）: 候補一覧は f-string の行連結（`- id=... name=... description=...`）
+    候補一覧は f-string の行連結（`- id=... name=... description=...`）
     ではなく `json.dumps(..., ensure_ascii=False)` の**構造データ**として枠囲み内に渡す。行連結だと
-    name/description に紛れ込んだ改行・引用句読点で枠の見た目を崩せてしまう余地があったが（description
-    は改行を既に正規化済みだが name は本 RV 以前は無検証だった＝下の `subagent_profiles.py::_v_name`
-    是正と対）、JSON エンコードなら値に何が入っていても文字列リテラルとして閉じるため、枠自体を構造的に
+    name/description に紛れ込んだ改行・引用句読点で枠の見た目を崩せてしまう余地がある（description
+    は改行を正規化済みだが name 側には正規化の保証が無い）ため、
+    JSON エンコードなら値に何が入っていても文字列リテラルとして閉じ、枠自体を構造的に
     壊せない。
     """
     sys = (
@@ -912,7 +919,7 @@ def _plan_prompt(message: str, lens: str, candidates: list, max_steps: int) -> t
     return sys, user
 
 
-# EV-0（拡張設計 §4.4）: 単発ストリーミング `_stream()` の完了状態は**呼び出しごと**の
+# 単発ストリーミング `_stream()` の完了状態（拡張設計 §4.4）は**呼び出しごと**の
 # ローカル値にする（`Provider` インスタンスの属性にはしない）——`_stream` は generator のため
 # `self.` 属性へ書くと、将来の並列化やインスタンス使い回しで別呼び出しの完了状態と混線しうる
 # （現状は plan/hybrid が直列・Provider も毎チャットで新規生成なので実害は未確認だが、設計として
@@ -967,10 +974,10 @@ class _CompletionState:
 class Provider:
     """思考イベントを yield する頭脳。`run(ctx)` は node... ＋ 最後に `_result` を返す。"""
     label, model = "頭脳", ""
-    provider_id = ""      # F3: usage メタ・統計の provider 名（AGENT_PROVIDERS と一致）。既定は空＝usage なし。
-    _last_usage = None    # F3: 直近の単発ストリーミング呼び出しの usage（_GenProvider が更新・run() が env へ）。
-    # S3（プロファイル型サブエージェント・2026-07-15-LLMオーケストレーション実装計画.md §5.0・
-    # レビュー是正 major）: 解決済みサブプロファイル（`get_provider` が設定・§5.0 項5）。`_last_usage`
+    provider_id = ""      # usage メタ・統計の provider 名（AGENT_PROVIDERS と一致）。既定は空＝usage なし。
+    _last_usage = None    # 直近の単発ストリーミング呼び出しの usage（_GenProvider が更新・run() が env へ）。
+    # 解決済みサブプロファイル（`get_provider` が設定・§5.0 項5・プロファイル型サブエージェント・
+    # 2026-07-15-LLMオーケストレーション実装計画.md）。`_last_usage`
     # と同型の**クラス属性**（インスタンス代入だけだと `_GenProvider.__init__` を通らない
     # `HeuristicProvider`/`_UnwiredProvider` のような素の `Provider` サブクラスで `p._sub` アクセスが
     # AttributeError になり、`_agentic_run` 内の読み取りが `run()` の素の except で静かにフォールバックへ
@@ -987,12 +994,12 @@ class Provider:
     # 設定されていれば `run()` は honest failure として停止する（`providers/__init__.py::get_provider`
     # が設定・`_sub` と同じ理由でクラス属性のまま残す）。
     _search_helper_error = None
-    # レビュー是正（MED・2026-07-18 Codex RV 1巡目）: `_sub_agentic_loop` がターン単位で更新する
+    # `_sub_agentic_loop` がターン単位で更新する
     # chat-sub 計測アキュムレータ（`{"calls": int, "tokens": dict|None}`）。`_sub` と同じ理由で
     # クラス属性にする（`_agentic_run` の finally が `self._sub is not None` の間だけ参照するため
     # 通常は AttributeError の心配はないが、防御的に既定 None を持たせる）。
     _sub_usage_acc = None
-    # STAT-3 S1（利用統計の拡充）: `_sub_loop` がターンごとに更新する depth 由来の usage 追加キー
+    # 利用統計の拡充: `_sub_loop` がターンごとに更新する depth 由来の usage 追加キー
     # （`depth_profile.usage_extras()` の戻り値）。`_sub`/`_sub_usage_acc` と同じ理由でクラス属性に
     # する（ハイブリッド/計画経路の env["usage"] 組立が `self._sub is None` の素の `Provider` でも
     # 安全に読めるよう既定 None を持たせる）。
@@ -1142,13 +1149,13 @@ class _GenProvider(Provider):
         ループの反復回数自体も `_REVIEW_MAX_READS + 2`（read 上限＋強制確定1回＋余裕1回）で
         機械的に上限化するため、モデルの応答内容に関わらず必ず終了する。
 
-        `state`（省略可・既定 None・C 追加）: 呼び出し元（`_agentic_run`）が持つ1質問1調査状態
+        `state`（省略可・既定 None）: 呼び出し元（`_agentic_run`）が持つ1質問1調査状態
         （`InvestigationState`）。非 None のとき、この査読ループ自身が `read_around`/`list_docs`
         で読み直した結果も `state.add_tool_result` で状態へ足す（下調べ役の結果と同じ状態へ集約
         ＝再調査依頼と一緒に次の下調べへ引き継がれる）。省略時（既存の直接呼び出しテスト等）は
         従来どおり状態を一切更新しない。
 
-        `review_structural_meta`（省略可・既定 None・C RV是正2巡目）: 非 None（呼び出し元が渡す
+        `review_structural_meta`（省略可・既定 None）: 非 None（呼び出し元が渡す
         可変リスト）のとき、`list_docs` で得た構造的根拠（呼び出し単位の集計・`state` へ渡すのと
         同じ形）を**追記**する（返り値の3-tuple 契約は変えない・既存の直接呼び出しテストは
         このキーワード引数を渡さないため無変更のまま）。呼び出し元はこれを正規の
@@ -1237,7 +1244,7 @@ class _GenProvider(Provider):
                             exc_info=True)
                 return None, nodes, _review_usage_folded(calls, tokens, unknown)
             reads_done += 1
-            # C3: 査読自身が読んだ結果も下調べ役と同じ調査状態へ足す（`read_around` は
+            # 査読自身が読んだ結果も下調べ役と同じ調査状態へ足す（`read_around` は
             # `add_tool_result` が kind="read" Evidence として自動処理する・`list_docs` は
             # `openai_style` と同じ「呼び出し単位で集計した1 Evidence」を組んでから渡す）。
             # `state`/`review_structural_meta` のどちらか一方だけが非 None でも動くよう独立に扱う。
@@ -1255,7 +1262,7 @@ class _GenProvider(Provider):
             if state is not None:
                 state.add_tool_result(action, v, result, _cites, _review_structural)
             if review_structural_meta is not None and _review_structural:
-                # RV是正2巡目: 査読が list_docs で得た構造的根拠を正規の `structural_evidence_meta`
+                # 査読が list_docs で得た構造的根拠を正規の `structural_evidence_meta`
                 # へ合流させるための別チャンネル（`state.evidence` は文脈整理・査読入力専用で
                 # Evidence Packet の正式採番には使わない・呼び出し元 docstring 参照）。
                 review_structural_meta.extend(_review_structural)
@@ -1273,7 +1280,7 @@ class _GenProvider(Provider):
         return None, nodes, _review_usage_folded(calls, tokens, unknown)   # 安全弁到達＝fail-open
 
     def _messages(self, prompt: str) -> list:
-        """system プロンプト（あれば）＋ R1a: 直前ターンの履歴（あれば）＋ user の messages を組む（#2）。
+        """system プロンプト（あれば）＋ 直前ターンの履歴（あれば）＋ user の messages を組む（#2）。
 
         `self._history` は上流（Ctx.history・chat_service）で既にキャップ済み＝ここで再キャップしない。
         履歴が空なら従来（system? + user のみ）と完全同一の出力になる。
@@ -1295,7 +1302,7 @@ class _GenProvider(Provider):
     def _sub_loop(self, ctx: Ctx, sub: dict, usage_acc: dict, max_turns_override: int | None = None,
                   shared_budget: dict | None = None,
                   call_budget=None):   # agentic_search._CallBudget | None（同モジュール未 import のため型注釈は付けない）
-        """S4-b（複数プロファイル並用・§6・2026-07-15-LLMオーケストレーション実装計画.md）: `_sub_agentic_loop`
+        """複数プロファイル並用（§6・2026-07-15-LLMオーケストレーション実装計画.md）における `_sub_agentic_loop`
         から一般化した本体。`self._sub` を直接参照せず、解決済みプロファイル辞書は引数 `sub` から、
         chat-sub 計測アキュムレータは引数 `usage_acc` から受け取る（呼び出し元が用意する）。
 
@@ -1307,10 +1314,10 @@ class _GenProvider(Provider):
         `sub["tools"]` で絞り込んでから渡す（実行時に利用可能なツール＝ES/Neo4j 到達可否は
         `agentic_search` 側のゲートを流用し、プロファイル許可との積集合にする）。(b)（run_tool 側の
         許可外拒否）は `openai_style` の `allowed_tools` 引数へ委譲する（本メソッドは注入するだけ）。
-        SC-6e: 会話の検索経路トグル（`ctx.scope_meta["tools"]`）もこの積集合にさらに重ねる
+        会話の検索経路トグル（`ctx.scope_meta["tools"]`）もこの積集合にさらに重ねる
         （通常の `_agentic_loop` と同じ判定・省略時は全 ON＝無変更）。
 
-        レビュー是正（HIGH・2026-07-18 Codex RV 1巡目）: `allowed_tools` には **`toolset` に実際に
+        `allowed_tools` には **`toolset` に実際に
         含めた名前の集合**（`{t["function"]["name"] for t in toolset}`）を渡す。`sub["tools"]`
         の生値をそのまま渡すと、can_ask=False（確認ID 付き再送）で ask_user を定義配列から除いた場合や
         ES/Neo4j 到達不可で es_search/graph_neighbors を除いた場合でも、モデルがそれらを幻覚呼び出し
@@ -1323,18 +1330,18 @@ class _GenProvider(Provider):
         allowlist 外の宛先なら `SsrfBlocked` がここで送出され、呼び出し元の `for ev in
         self._sub_loop(...):` の評価時に伝播する（`_post` は一度も呼ばれない）。
 
-        `max_turns_override`（S4-b・§6・追加引数）: 省略（None）なら `sub["guard"]["max_turns"]`を
+        `max_turns_override`（§6・追加引数）: 省略（None）なら `sub["guard"]["max_turns"]`を
         env フォールバックにした管理画面の基準値編集（`depth_profile.effective_base`）を解決して使う
         （管理者が反復基準値を下げても検索アシスタント有効時だけ外れる、ということがないように、
         通常の `_agentic_loop` と同じ「system_settings→guard/env 既定」の優先順にする）。非 None
         のとき（`_run_sub_plan` が横断予算の残量へ min クリップして渡す値）はそちらを優先し
-        system_settings は見ない。調べる深さ（`ctx.scope_meta["depth_profile"]`・SC-6c §3.2）は、
+        system_settings は見ない。調べる深さ（`ctx.scope_meta["depth_profile"]`・§3.2）は、
         この解決後の `max_turns`（override か基準値解決後の値か問わず）へさらに倍率をかける——
         standard は倍率×1 のため無変化。`max_hits`/`window_cap` も同じ実効基準値で計算し
         `openai_style` へ渡す（`_sub` 用の既存 guard には無い概念のため、通常の `_agentic_loop`
         と同じ env/system_settings 既定値を使う）。
 
-        `shared_budget`（S4-b・§6.2 項1・複数プロファイル横断予算）: 非 None のとき `agentic_search.
+        `shared_budget`（§6.2 項1・複数プロファイル横断予算）: 非 None のとき `agentic_search.
         openai_style` の同名引数へそのまま転送する（`{"tool_bytes_used","tool_bytes_max"}`）。省略（None）
         は既存呼び出し元と byte-identical。
 
@@ -1344,13 +1351,13 @@ class _GenProvider(Provider):
         **同一のオブジェクト**を共有し、`SHERPA_SUB_PLAN_MAX_CALLS` を `_post` の種類を問わず
         一律に守る。省略（None）は無制限。
 
-        レビュー是正（MED・2026-07-18 Codex RV 1巡目・chat-sub 計測の欠落）: `usage_acc`
+        `usage_acc`
         （`{"calls": int, "tokens": dict|None}`）は呼び出し元が例外が起きうる SSRF チョークポイントより
         前に用意して渡す＝`openai_style` の `usage_acc` 引数へそのまま渡す。`openai_style` 側が各ターンの
         `_post` 試行ごとに即時反映するため、呼び出し元の `finally` は "final" イベント到達に関わらず
-        `usage_acc["calls"] > 0` を「サブへ実際に発行した」の正本として使える（旧 `sub_ran` フラグは
-        "final" イベントでしか埋まらない `agentic_usage` 依存で、途中失敗・ask_user 早期 return では
-        calls>0 でも記録が漏れていた）。
+        `usage_acc["calls"] > 0` を「サブへ実際に発行した」の正本として使える（`sub_ran` のような別フラグは
+        "final" イベントでしか埋まらない `agentic_usage` に依存し、途中失敗・ask_user 早期 return では
+        calls>0 でも記録が漏れてしまう）。
 
         `can_ask` は常に False へ構造的に強制する（belt-and-suspenders）。`sub["tools"]` に
         `ask_user` が含まれていても（`sherpa/search_helper.py::TOOLS` は含めないが、`sub` は本メソッド
@@ -1440,10 +1447,10 @@ class _GenProvider(Provider):
             max_hits=max_hits, window_cap=window_cap), usage_acc)
 
     def _sub_agentic_loop(self, ctx: Ctx):
-        """S3（プロファイル型サブエージェント・§5.0）: 解決済み `self._sub` でのツールループ。
+        """プロファイル型サブエージェント（§5.0）: 解決済み `self._sub` でのツールループ。
 
-        S4-b（2026-07-19・§6）で本体を `_sub_loop(ctx, sub, usage_acc, ...)` へ一般化した後の**薄い
-        ラッパ**として温存する（S3 経路の意味論は1ビットも変えない）。`self._sub_usage_acc` の初期化は
+        本体を `_sub_loop(ctx, sub, usage_acc, ...)`（§6）へ一般化した後の**薄い
+        ラッパ**として温存する（既存経路の意味論は1ビットも変えない）。`self._sub_usage_acc` の初期化は
         従来どおり本メソッドの**最初**（例外が起きうる SSRF チョークポイントより前）で行う＝
         `_agentic_run` の `finally` が参照する辞書は必ず存在する。
         """
@@ -1454,9 +1461,10 @@ class _GenProvider(Provider):
         return self._sub_loop(ctx, self._sub, usage_acc)
 
     def _run_sub_plan(self, ctx: Ctx, subs: list):
-        """S4-b（複数プロファイル並用＋自動選択・§6・2026-07-19-LLMオーケストレーション実装計画.md）:
+        """複数プロファイル並用＋自動選択（§6・docs/archive/2026-07-15-LLMオーケストレーション実装計画.md）:
         解決済み `subs`（`resolve_sub` 済み・1〜N・v1 は直列のみ＝§6.4）を順に実行し、証拠を合算する
-        generator。本番経路（`_agentic_run`）からは**まだ呼ばれない**（配線は S4-c）。
+        generator。呼び出しは `_agentic_run`→`_agentic_run_plan` 経由で繋がっているが、
+        `_sub_candidates` を設定する経路が無いため現状は到達しない。
 
         yield する events:
           - `{"node": <node>}`: 各ループの思考ノード。`id` は `sub:{profile_id}:` で名前空間化する
@@ -1532,7 +1540,7 @@ class _GenProvider(Provider):
             step_evaluation = None
             step_has_structural = False
             try:
-                # レビュー是正（MED・S4-b RV 1巡目・broad except の fail-open）: 捕捉するのは
+                # 捕捉するのは
                 # 「サブループ自身の運用例外」（SSRF ブロック＝SsrfBlocked(ValueError派生)・
                 # ネットワーク/タイムアウト＝OSError 系・応答の JSON 破損＝ValueError 系）だけに限定し、
                 # かつ手動 next() で**generator が投げた例外だけ**を捕捉する。証拠マージ・yield 側
@@ -1635,7 +1643,7 @@ class _GenProvider(Provider):
                "call_budget": call_budget}
 
     def _plan_select_subs(self, ctx: Ctx, message: str, lens: str) -> list | None:
-        """S4-c（計画ステップ・§6.2 項1・2026-07-19-LLMオーケストレーション実装計画.md）: フラグシップに
+        """計画ステップ（§6.2 項1・docs/archive/2026-07-15-LLMオーケストレーション実装計画.md）: フラグシップに
         **1回だけ・リトライなし**で計画を立てさせ、`self._sub_candidates`（`get_provider` が解決済み・
         1件以上）の中から実行するプロファイル列（1〜`SHERPA_SUB_PLAN_MAX_STEPS`）を選ばせる。
 
@@ -1647,15 +1655,14 @@ class _GenProvider(Provider):
         自体を発行しない、(b) HTTP/JSON 例外、(c) `steps` が list でない/空、(d) 全要素が未知
         `profile_id`（`self._sub_candidates` に無い id はここで除去する＝実行時ガード・§6.4）。
 
-        S4-c RV 是正（MED-2・2026-07-20・計画呼び出し失敗時の chat-plan 記録漏れ）: 以前は
-        `metering.acc_end()` の `n`（`complete_json` 成功時に内部で `acc_add` された回数）が0の場合
-        （＝HTTP/タイムアウト例外や JSON 破損で `steps` を得られなかった場合）は1行も記録していなかった。
-        `_sub_loop`（chat-sub・`agentic_search.openai_style`）の「`_post` 発行**直前**に calls を
-        インクリメントし、実際に試みた回数を失敗も含めて数える」という意味論と揃え、`complete_json`
-        呼び出し**直前**に `attempted=True` を立てる。`n` が真なら従来どおり `calls=n`・`n` が無くても
-        `attempted` なら「試行したが usage を読めなかった＝失敗」を表す `tokens=None・calls=1` の1行を
-        記録する（stop_event による発行前縮退は `attempted` を立てる前に `return None` するため、
-        従来どおり0行のまま）。
+        計画呼び出し失敗時も chat-plan を記録する: `_sub_loop`（chat-sub・`agentic_search.openai_style`）の
+        「`_post` 発行**直前**に calls をインクリメントし、実際に試みた回数を失敗も含めて数える」
+        という意味論と揃え、`complete_json` 呼び出し**直前**に `attempted=True` を立てる。`n`
+        （`metering.acc_end()` が返す・`complete_json` 成功時に内部で `acc_add` された回数）が真なら
+        `calls=n`・`n` が無くても `attempted` なら「試行したが usage を読めなかった＝失敗」を表す
+        `tokens=None・calls=1` の1行を記録する（HTTP/タイムアウト例外や JSON 破損で `steps` を
+        得られなかった場合も含む。stop_event による発行前縮退は `attempted` を立てる前に
+        `return None` するため0行のまま）。
         """
         candidates = self._sub_candidates
         if ctx.stop_event is not None and ctx.stop_event.is_set():
@@ -1706,18 +1713,18 @@ class _GenProvider(Provider):
         return chosen
 
     def _agentic_run_plan(self, ctx: Ctx, decision: dict, orig_message: str, chosen_subs: list) -> Iterator[dict]:
-        """S4-c（§6・2026-07-19-LLMオーケストレーション実装計画.md）: 計画が選んだ `chosen_subs`
-        （1件以上）を `_run_sub_plan` で直列実行し、証拠を合算してフラグシップが1回だけ合成する。
+        """計画が選んだ `chosen_subs`（§6・docs/archive/2026-07-15-LLMオーケストレーション実装計画.md・1件以上）を
+        `_run_sub_plan` で直列実行し、証拠を合算してフラグシップが1回だけ合成する。
 
         `_agentic_run` から計画成功時（`_plan_select_subs` が None 以外を返した時）だけ呼ばれる
-        （縮退時はこのメソッドを経由せず、呼び出し元が既存の S3 単一／通常ループへフォールスルーする）。
+        （縮退時はこのメソッドを経由せず、呼び出し元が既存の単一下調べ役／通常ループへフォールスルーする）。
 
         可視化（§6.2 項3・受け入れ条件）: 固定書式の計画ノードを1件だけ出す（label「進め方を計画」・
         detail は選ばれたプロファイルの**表示名の列挙のみ**＝モデルの生成散文は出さない）。
 
         合成（§6.2 項7）・サイドカー（§6.2 項8・実行1件なら `usage_sub`／2件以上なら `usage_subs`）・
-        根拠ゲート（§6.2 項6・`_plan_min_citations`）は S3 ハイブリッド（`_agentic_run` 末尾の
-        ハイブリッド分岐）と同じ形にする。chat-sub の計測は `_run_sub_plan` 側（S4-b 済み）で行う＝
+        根拠ゲート（§6.2 項6・`_plan_min_citations`）は既存のハイブリッド（`_agentic_run` 末尾の
+        ハイブリッド分岐）と同じ形にする。chat-sub の計測は `_run_sub_plan` 側で行う＝
         ここで二重記録しない。
         """
         t0 = time.monotonic()   # LOG-UX: このメソッド全体（下調べ複数プロファイル＋最終合成）の経過秒
@@ -1800,7 +1807,7 @@ class _GenProvider(Provider):
         # （下の合成ブロック末尾）。ここでは Packet の他フィールド（件数・stop_reason 等）だけを
         # 先に組む（`evidence`/`sources_verified` は暫定値のまま合成後に上書きする）。
         data = {"citations": citations,
-                # EXT-2（拡張設計 §4.2）: Evidence Packet（Committed Evidence の構造化サマリ）。
+                # Evidence Packet（Committed Evidence の構造化サマリ・拡張設計 §4.2）。
                 "evidence_packet": citations_mod.build_evidence_packet(
                     task_id="plan:" + "+".join(s["profile_id"] for s in chosen_subs),
                     investigation_status=(agg_evaluation["status"] if agg_evaluation is not None
@@ -1990,11 +1997,11 @@ class _GenProvider(Provider):
             from dataclasses import replace as _dc_replace
             ctx = _dc_replace(ctx, message=(
                 f"{ctx.message}\n\n【個人ファイル内ヒット（本人のみ・共有不可）】\n{ctx.personal_facts}"))
-        # S4-c（複数プロファイル並用＋自動選択・§6・2026-07-19-LLMオーケストレーション実装計画.md）:
-        # 3分岐（優先順位: `_sub_candidates` ＞ `_sub`（S3単一）＞ 従来）。計画呼び出し自体が縮退
+        # 複数プロファイル並用＋自動選択（§6・docs/archive/2026-07-15-LLMオーケストレーション実装計画.md）:
+        # 3分岐（優先順位: `_sub_candidates` ＞ `_sub`（単一下調べ役）＞ 従来）。計画呼び出し自体が縮退
         # （stop_event 済み／JSON 破損／候補全滅）した場合は `_plan_select_subs` が `None` を返し、
         # 本メソッドは何もせず下の既存コード（`self._sub` の有無で分岐する2つ目・3つ目の分岐）へ
-        # フォールスルーする（§6.4 多段縮退＝S3単一 or 通常ループ・ここより下は無改修）。
+        # フォールスルーする（§6.4 多段縮退＝単一下調べ役 or 通常ループ・ここより下は無改修）。
         if self._sub_candidates is not None:
             chosen_subs = self._plan_select_subs(ctx, orig_message, lens)
             if chosen_subs is not None:
@@ -2011,9 +2018,8 @@ class _GenProvider(Provider):
         has_structural_evidence = False   # list_docs の実在確認済み一覧／graph の検証済み card（EXT-2）
         structural_evidence_meta: list = []   # 検証済み list entry/card 裏付け doc の内訳
         agentic_usage = None       # F3: agentic_search がターンを跨いで合算した usage（生トークン・"final" 到達時のみ）。
-        # 検索アシスタント（2026-08-15）: 誰が資料を読んでいるかを思考の流れで分かるようにする。
-        # 以前は「資料を検索（語句そのまま）」等のノードがメイン検索時と全く同じで、回答末尾の使用量を
-        # 開くまで区別できなかった（実測での指摘）。
+        # 検索アシスタント: 誰が資料を読んでいるかを思考の流れで分かるようにする——「資料を検索（語句そのまま）」等の
+        # ノードがメイン検索時と同じ文言のままだと、回答末尾の使用量を開くまで区別できない。
         # EXT-4（拡張設計 §10・UI 階層表示）: ハイブリッド（単一下調べ役）の全ノードへ `agent_run_id`
         # （`sub:{profile_id}:1`＝実行が1本のため seq 固定）と `metrics.provider`/`model` を付与する。
         # `agentic_search.py` 側は無改修（この呼び出し元だけがノードを中継する既存の通過点で
@@ -2028,7 +2034,7 @@ class _GenProvider(Provider):
             search_helper_node["agent_run_id"] = hybrid_agent_run_id
             search_helper_node["metrics"] = dict(hybrid_metrics)
             yield search_helper_node
-        # S3 変更点(1): ハイブリッドは self._sub_agentic_loop、通常は従来の self._agentic_loop。
+        # ハイブリッドは self._sub_agentic_loop、通常は従来の self._agentic_loop。
         # 探索専用の ctx（層フィルタが非適用のレンズは both に揃える・_ctx_with_effective_layer
         # docstring 参照）。以降の env["scope"] 構築は元の `ctx`（このメソッド冒頭で受け取ったもの）を
         # 使い続けるので、要求された layer 値自体は失わない。
@@ -2039,7 +2045,7 @@ class _GenProvider(Provider):
         # EXT-2c: 査読（`_sufficiency_verdict`）内の複数回の `_stream` 呼び出し（読み直しを含む）の
         # 消費も、chat-sub と同じく finally で1回だけ metering.record する。
         _review_usage_total = {"calls": 0, "tokens": None, "unknown": False}
-        # C3 RV是正2巡目: 査読が list_docs で得た構造的根拠（呼び出し単位の集計）を正規の
+        # 査読が list_docs で得た構造的根拠（呼び出し単位の集計）を正規の
         # `structural_evidence_meta` へ合流させるための一時蓄積——`_sufficiency_verdict` が
         # 呼び出しごとに追記し、rerun ループを抜けた後に一括で合流させる（既存の
         # `_dedupe_structural_evidence` が下調べ役由来のものと重複排除する）。
@@ -2087,7 +2093,7 @@ class _GenProvider(Provider):
                         evaluation = {"status": ev.get("evaluation_status"),
                                       "reason": ev.get("evaluation_reason"),
                                       "next_action": ev.get("evaluation_next_action")}
-            # EXT-2b（評価フェーズ再起・2026-09-02裁定）: ハイブリッドのみ、清書前にメインが根拠の
+            # ハイブリッドのみ、清書前にメインが根拠の
             # 十分性を査読し、不足なら不足軸を指定して下調べを再実行する（なお不足なら honest
             # failure）。発動は調べる深さに載せる（標準=0回＝従来どおり・深く=再調査1回・最大=2回。
             # 標準への既定適用はキャリブレーション後）——再実行の各ループ自体は既存の反復上限・
@@ -2198,16 +2204,16 @@ class _GenProvider(Provider):
                     if stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS:
                         break
         finally:
-            # S3・§5.0 項6（2026-07-17 強化・2026-07-18 レビュー是正 MED）: 有償プロバイダをサブに
+            # §5.0 項6: 有償プロバイダをサブに
             # 載せられる以上、縮退したターン（根拠ゲート・空合成等）でもサブへ実際に発行した呼び出し分の
             # 消費は落とさず記録する（ループ終了時に成否問わず）。判定は `self._sub_usage_acc["calls"]`
             # （`_sub_agentic_loop` が `openai_style` の `usage_acc` 引数経由でターンごとに更新する）を
-            # 使う＝旧 `sub_ran`/`agentic_usage` は "final" イベント到達時にしか埋まらないため、
+            # 使う——`sub_ran`/`agentic_usage` のような別フラグは "final" イベント到達時にしか埋まらず、
             # 途中失敗・ask_user 早期 return（"final" を経ずに return）では calls>0 でも記録が漏れて
-            # いた。calls=0（stop_event 即時終了・SSRF ブロック等で1回も呼び出しを試みていない）は
+            # しまう。calls=0（stop_event 即時終了・SSRF ブロック等で1回も呼び出しを試みていない）は
             # 記録しない＝「未実行」に誤った1行を残さない。
             if self._sub is not None:
-                # EXT-2b: 最後の実行分（`self._sub_usage_acc`）だけでなく、メイン査読の再調査前に
+                # 最後の実行分（`self._sub_usage_acc`）だけでなく、メイン査読の再調査前に
                 # 退避した消費（`_sub_acc_total`）も合算して1回で記録する。calls は実際に試みた
                 # 総回数を渡す（渡さないと `metering.record` の既定 calls=1 になる既知の穴）。
                 total = _fold_sub_usage(_sub_acc_total, self._sub_usage_acc)
@@ -2216,7 +2222,7 @@ class _GenProvider(Provider):
                     metering.record("chat-sub", self._sub["provider"], self._sub["model"], total["tokens"],
                                     user_id=ctx.uid, world=ctx.world, calls=total["calls"],
                                     elapsed_ms=total.get("elapsed_ms"))
-            # EXT-2c: メイン査読（`_sufficiency_verdict`）が行った `_stream` 呼び出し分は、標準的な
+            # メイン査読（`_sufficiency_verdict`）が行った `_stream` 呼び出し分は、標準的な
             # 回答 usage（answer.usage）にも chat-sub にも乗らない別消費のため、独立の kind で記録する
             # （self は常にフラグシップ側＝self.provider_id/self.model）。calls=0（一度も査読を
             # 発動していない・standard 既定等）は「未実行」として記録しない。
@@ -2225,7 +2231,7 @@ class _GenProvider(Provider):
                 metering.record("chat-review", self.provider_id, self.model, _review_usage_total["tokens"],
                                 user_id=ctx.uid, world=ctx.world, calls=_review_usage_total["calls"],
                                 elapsed_ms=_review_usage_total.get("elapsed_ms"))
-        # RV MEDIUM（2026-07-03再検証）: 途中停止で agentic ループが未応答のまま終わった場合は
+        # 途中停止で agentic ループが未応答のまま終わった場合は
         # 単発 grep へのフォールバックを試みない（呼び元 run() の except節が余分な LLM 呼び出しを
         # 発行してしまい、停止後もしばらく処理が続く無駄が生じるため）。どのみち chat_service 側が
         # stop_event を見て以降のイベントを丸ごと破棄するので、ここで素直に終了するだけでよい。
@@ -2301,12 +2307,12 @@ class _GenProvider(Provider):
         # STOP-1: 予算到達で打ち切られたターンは、証拠が閾値未満でも honest failure（単発 grep
         # フォールバック）へ落とさない——固定文言＋実際に集まった（0件の場合を含む）Evidence
         # Packet をそのまま最終 envelope へ載せる。
-        # RV2巡目#4 是正: `verified`（EXT-2/EV-0・read_around/read_doc/S3b 原本読取5ツールが実際に
-        # 精読した doc_id・`_VERIFIED_READ_TOOLS` 参照）も正当な根拠として認める——以前はここに
-        # 数えられておらず、下調べ OFF の通常経路で `xlsx_range` 等の読取ツールだけが成功しても
-        # （citation を生成する grep/es_search も list_docs/graph_neighbors の構造的根拠も無いため）
-        # 根拠ゲートが「evidence below threshold」で落としていた。read_around/read_doc も同様に
-        # citation を生成しないため、この抜け穴は元々それらにも存在していた（今回まとめて塞ぐ）。
+        # `verified`（EXT-2/EV-0・read_around/read_doc/原本読取5ツールが実際に
+        # 精読した doc_id・`_VERIFIED_READ_TOOLS` 参照）も正当な根拠として認める——read_around/read_doc/
+        # `xlsx_range` 等の読取ツールは citation を生成しないため、これらを数えないと、下調べ OFF の
+        # 通常経路でこれらの読取だけが成功しても（citation を生成する grep/es_search も
+        # list_docs/graph_neighbors の構造的根拠も無いため）根拠ゲートが「evidence below threshold」で
+        # 落としてしまう。
         evidence_meets_gate = len(citations) >= min_citations or has_structural_evidence or bool(verified)
         if budget_exhausted and (not answer or not evidence_meets_gate):
             # 予算例外で両ゲートを迂回できる以上、根拠ゲートを本来通らない未検証の生成本文
@@ -2330,7 +2336,7 @@ class _GenProvider(Provider):
         combined_evidence_meta = evidence_meta + structural_evidence_meta
         from .. import citations as citations_mod   # 重複排除鍵は citations.py と共通（SEARCH-CUT-3 RV）
         data = {"citations": citations,
-                # EXT-2（拡張設計 §4.2）: Evidence Packet（Committed Evidence の構造化サマリ）。
+                # Evidence Packet（Committed Evidence の構造化サマリ・拡張設計 §4.2）。
                 # 評価結果・実測の stop_reason をそのまま伝搬する（固定文言で塗り潰さない）。citation
                 # が無くても has_structural_evidence でゲートを通っていれば sufficient とみなす。
                 "evidence_packet": citations_mod.build_evidence_packet(
@@ -2351,7 +2357,7 @@ class _GenProvider(Provider):
                     candidates_inspected=len(docs), evidence_selected=len(combined_evidence_meta),
                     stop_reason=stop_reason,
                     next_action=(evaluation.get("next_action") or "") if evaluation is not None else "")}
-        if cards and lens == "troubleshoot":  # カードは troubleshoot の envelope 契約に限定（QA に混入させない・RV LOW#2）
+        if cards and lens == "troubleshoot":  # カードは troubleshoot の envelope 契約に限定（QA に混入させない）
             seen_c, uniq = set(), []
             for c in cards:
                 k = (c.get("name"), c.get("label"))
@@ -2365,12 +2371,12 @@ class _GenProvider(Provider):
         env = {"lens": lens, "headline": answer, "summary": {"total": len(citations)},
                "data": data,
                "sources": sources,
-               "sources_verified": sources_verified,   # EXT-2/EV-0（拡張設計 §4.4）: 出典の2区分表示用
+               "sources_verified": sources_verified,   # 出典の2区分表示用（拡張設計 §4.4）
                "scope": sm, "route": {"lens": lens, "reason": decision.get("reason", ""),
                                       "input": decision.get("input", ctx.message)}}
-        # F3（2026-07-07）: agentic ループ（反復ツール検索）で合算した usage を answer メタに乗せる
+        # agentic ループ（反復ツール検索）で合算した usage を answer メタに乗せる
         #   （メイン回答呼び出し＝ここまでの全ツールターンの合計。intent 分類等の別呼び出しは含めない）。
-        # S3 変更点(4): ハイブリッドはループトークンを usage_sub サイドカーへ（answer.usage は主合成
+        # ハイブリッドはループトークンを usage_sub サイドカーへ（answer.usage は主合成
         #   呼び出し=self.provider_id/self.model の単一オブジェクト契約のまま・下のハイブリッド分岐で設定）。
         if agentic_usage:
             if self._sub is not None:
@@ -2390,7 +2396,7 @@ class _GenProvider(Provider):
                 env["usage"].update(self._last_main_depth_usage or depth_profile_mod.usage_extras(
                     (ctx.scope_meta or {}).get("depth_profile")))
                 _log_chat_usage(env["usage"], time.monotonic() - t0, ctx.world)
-        # HIGH 1 fix: agentic 経路でも personal_facts を env に乗せる。
+        # agentic 経路でも personal_facts を env に乗せる。
         if ctx.personal_facts:
             env["_personal_facts"] = ctx.personal_facts
         if self._sub is None:
@@ -2405,7 +2411,7 @@ class _GenProvider(Provider):
         # ---- ハイブリッド合成（クラウド単発フォールバック・ローカル散文は破棄） ----
         yield _node("brain", "think", f"考える（{self.label}）", "集めた根拠から回答を作成しています", "active")
         self._last_usage = None
-        # レビュー是正（S3・stop_event 事前ガード）: 既存フォールバック（本クラス run() 末尾）と同じく
+        # stop_event 事前ガード: 既存フォールバック（本クラス run() 末尾）と同じく
         # 発行前チェックを持つ（:277-278 相当のチェック通過後・合成呼び出し発行前に stop が来る
         # 小さな窓でクラウド呼び出しが無駄に1回発生するのを防ぐ）。
         # 拡張設計 §4.4: ストリームは常に byte-identical（受信した chunk をそのまま逐次配信・保留
@@ -2417,7 +2423,7 @@ class _GenProvider(Provider):
         # Provider 固有の allowlist を明示的に渡す（4方言の和集合ではない）——状態オブジェクト
         # 自体は従来どおり呼び出しごとに新規生成する。
         completion = _CompletionState(self._natural_completion_reasons)
-        # EXT-2b: 清書プロンプトは QA citation の先頭数件しか読まないため、再調査の新規根拠を
+        # 清書プロンプトは QA citation の先頭数件しか読まないため、再調査の新規根拠を
         # 先頭に置いたビューで組む（公開 env の citation 順は不変・プロンプト構築のみに使う）。
         _synth_cites = _synth_citation_view(citations, _rerun_raw_cite_ids)
         _synth_env = (env if _synth_cites is citations
@@ -2427,10 +2433,10 @@ class _GenProvider(Provider):
         # ev-N 採番は `combined_evidence_meta`（この直前までに組んだ結合済み list）基準——
         # `_synth_cites` の並び替えはプロンプト表示専用のビューのため、ここでは元の
         # `citations`/`combined_evidence_meta` の対応（添字が1対1の契約）をそのまま使う。
-        # C3: 下調べ役・査読が実際に read_around/read_doc で読んだ本文（`state` の kind="read"
+        # 下調べ役・査読が実際に read_around/read_doc で読んだ本文（`state` の kind="read"
         # Evidence）を「精読: doc_id 行a-b「本文」」として引用・構造的根拠に続けて渡す——検索
         # 引用が概要止まりでも、実際に読んだ本文にある条件・例外を清書が見落とさないようにする
-        # （Evidence Packet／`data.citations` には出さない内部専用チャンネル）。RV是正2巡目:
+        # （Evidence Packet／`data.citations` には出さない内部専用チャンネル）。
         # `state.gaps`（検索0件／打ち切り／未確認）も「調査の限界: …」として続けて渡す——list_docs
         # の集計事実は既に上で正規の `combined_evidence_meta` へ合流済みのため、ここでは gaps だけ
         # 追加する（`build_synthesis_digest` 側が件数・文字数上限を適用する）。
@@ -2528,6 +2534,7 @@ class _GenProvider(Provider):
                 yield _node("search-helper-invalid", "think", "下調べ設定を確認してください", msg, "done")
                 yield {"type": "answer_delta", "text": msg}
                 env = {"lens": "qa", "headline": msg, "summary": {"total": 0}, "data": {}, "sources": [],
+                      "agentic_failure": "error",   # 終了理由の分布で完了扱いにしない（`stop_kind.resolve`）
                       "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens="qa")}
                 yield {"type": "_result", "env": env,
                       "decision": {"lens": "qa", "input": ctx.message, "reason": "下調べ設定の不正"}}
@@ -2536,8 +2543,8 @@ class _GenProvider(Provider):
             if decision.get("lens") == "clarify":              # 意図が曖昧→本人に確認→停止（agentic 前に）
                 yield decision["question"]
                 return
-            # 影響分析（impact）も反復ツール検索の対象にする（2026-08-15）。従来は Neo4j を1回引くだけで、
-            # グラフが 0 件だと「根拠なし」で終わっていた（Codex は自前 grep を続けるため差が出ていた）。
+            # 影響分析（impact）も反復ツール検索の対象にする——Neo4j を1回引くだけだと
+            # グラフが 0 件のとき「根拠なし」で終わってしまう（Codex は自前 grep を続けるため差が出る）。
             # agentic_search のツール一覧にはグラフ照会（graph_neighbors/find_paths）も含まれるため、
             # グラフが使える環境では従来の情報を取りつつ、0 件でも grep/ES で調べ続けられる。
             if decision.get("lens") != "author":               # P1-a: author は agentic_search 未対応ツール＝単発取得へ
@@ -2546,7 +2553,7 @@ class _GenProvider(Provider):
                     yield from self._agentic_run(ctx, decision)
                     return
                 except GraphSchemaEraError:
-                    # RV是正（rv-periphery #11・2026-09-05）: `graph_neighbors` ツール経由で上がる
+                    # `graph_neighbors` ツール経由で上がる
                     # 専用例外は、下調べ役の技術的失敗と同じ広い except で黙って generic フォール
                     # バック文言へ丸めない——そのまま re-raise し、この呼び出し元（`_gather`
                     # 経由の provider.run() 全体）を包む `chat_service._degrade_overload` に
@@ -2582,6 +2589,11 @@ class _GenProvider(Provider):
                         yield {"type": "answer_delta", "text": msg}
                         env = {"lens": decision.get("lens", "qa"), "headline": msg,
                               "summary": {"total": 0}, "data": {}, "sources": [],
+                              # 終了理由の印（`stop_kind.resolve`）: 査読の根拠不足は no_evidence・
+                              # それ以外の失敗は型を運べないため完了扱いにせず NULL に落とす。
+                              "agentic_failure": ("insufficient"
+                                                  if isinstance(agentic_exc, _MainReviewInsufficient)
+                                                  else "error"),
                               "scope": layer_mod.scope_with_layer(
                                   ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
                         yield {"type": "_result", "env": env,
@@ -2598,7 +2610,7 @@ class _GenProvider(Provider):
                 decision, env = ev["decision"], ev["env"]
             else:
                 yield ev
-        if env is None:                                # _gather が clarify question を出して停止＝確認待ち（RV High）
+        if env is None:                                # _gather が clarify question を出して停止＝確認待ち
             return
         is_author = decision.get("lens") == "author"    # P1-a: 他頭脳は資料を作らず下書き案内を前置（ライブ表示にも反映）
         if is_author:
@@ -2620,8 +2632,13 @@ class _GenProvider(Provider):
                         yield {"type": "answer_delta", "text": chunk}   # 本物のトークン・ストリーミング
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
                         break
-            except Exception:
+            except Exception as e:
                 failed = True   # 従来どおり例外時は部分応答も採用しない（acc="" のまま）
+                # 通信系の例外型なら終了理由の印（`_plain_run` と同型）。tools_blocked 経路の
+                # 既存の印は上書きしない・型を特定できない例外は決定的回答＝完了のまま。
+                _k = stop_kind_mod.from_exception(e)
+                if _k:
+                    env.setdefault("agentic_failure", _k)
         if failed:
             acc = ""
         if acc:

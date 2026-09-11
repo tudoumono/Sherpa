@@ -4,23 +4,22 @@
 INGEST-MD §5.6 の「① OOXML 直（値の権威）」。変換ロジック自体は `office_md`／本モジュール（決定的・
 LLM 不使用）に残し、本アームは受理判定と来歴メタ（method/confidence/notes）の付与を担う。
 
-DOC-IR-001（docs/archive/proposals/2026-07-20-調査型RAG詳細修正計画.html §6.1・外部レビューの契約修正＝DOC-IR-001.5
-で表の格納方式を修正済）: DOCX に限り document-ir-v1（文書標準構造）を構築し `ArmResult.document` に
+DOC-IR-001（表の格納方式は DOC-IR-001.5 で定義）: DOCX に限り document-ir-v1（文書標準構造）を構築し `ArmResult.document` に
 載せる。IR 構築（`_build_docx_ir`）は `word/document.xml` を歩く。xlsx は今回（DOC-IR-003 時点）も
 対象外（`document=None`・DOC-IR-004 以降）。pptx は DOC-IR-003（下記）で対象化済み。
 
-DOC-IR-002（同提案書 §7 フェーズ2「Word」）: 隠し文字・削除本文（変更履歴）・ハイパーリンク先・
+DOC-IR-002（フェーズ2「Word」）: 隠し文字・削除本文（変更履歴）・ハイパーリンク先・
 テキストボックス・脚注・コメント・ヘッダ/フッタ・ネスト表を要素化する。新規抽出（MD が表示しない情報）は
 `sherpa/ingest/ooxml/word.py`（共通生抽出層）に一度だけ実装し、本モジュールはそれを消費して IR 要素を
 組み立てるだけ（`_build_docx_ir` docstring に採番/order/rels 解決の設計判断を記す）。
 
-DOC-IR-003（同提案書 §7 フェーズ2「PowerPoint」）: PPTX にも document-ir-v2 を並行構築する。スライド／
+DOC-IR-003（フェーズ2「PowerPoint」）: PPTX にも document-ir-v2 を並行構築する。スライド／
 shape（テキストを持つもののみ要素化）／発表者ノートを要素化し、既存の A5 幾何オクルージョン判定
 （`office_md.py` の `_pptx_bbox` 等）を `sherpa/ingest/ooxml/powerpoint.py` 経由で再利用して
 `visibility`/`visibility_reason`/`source_map` へ構造化する（`_build_pptx_ir` docstring 参照）。pptx は
 H2（下記）の対象外のため、MD 生成（`office_md._pptx_md`）とは引き続き独立（並行構築のまま）。
 
-DOC-IR-004（同提案書 §7 フェーズ2「Excel」）: XLSX にも document-ir-v2 を構築する。シート／連続領域
+DOC-IR-004（フェーズ2「Excel」）: XLSX にも document-ir-v2 を構築する。シート／連続領域
 （非空セルの4連結成分＝「表」）／数式／名前付き範囲／コメント／ハイパーリンク／外部ブック参照を要素化する。
 共通生抽出層 `sherpa/ingest/ooxml/excel.py`（openpyxl・値/数式の2回ロード・cap 付き走査）を消費して IR を
 組み立てる。
@@ -103,7 +102,7 @@ def _document_ir_failure_detail(p: Path, exc: Exception) -> str:
 _PARTIAL_XLSX_MIN_DECLARED_ROWS = 100     # これ未満の宣言行数は比率のブレが大きく誤検知しやすいため対象外
 _PARTIAL_XLSX_MAX_EXTRACTED_RATIO = 0.05  # 抽出行/宣言行がこの比率未満なら疑い
 
-# DOC-IR-001.5（修正2・契約修正 High#2）: JSON 形式の版（`document_ir.DOCUMENT_IR_SCHEMA_VERSION`）と、この
+# DOC-IR-001.5: JSON 形式の版（`document_ir.DOCUMENT_IR_SCHEMA_VERSION`）と、この
 # アームの抽出処理自体の版を分離する。抽出対象（要素種別・採番規則・表の座標解決規則等）を増やしたら
 # こちらを上げる＝JSON 形式（schema_version）を変えずとも派生が再生成される。
 # DOC-IR-002 で v2 へ bump（隠し文字/削除本文/ハイパーリンク/テキストボックス/脚注/コメント/ヘッダ・フッタ/
@@ -176,8 +175,8 @@ class OoxmlArm:
         if ext not in _EXTS:
             return None
         # docx/xlsx（H2）: document-ir を1回だけ構築し、人間向け MD 生成と `ArmResult.document` の
-        # 両方に使い回す（旧実装は MD 生成と IR 構築を独立に行っており、xlsx は2回ロードをさらに
-        # 倍払っていた）。IR 構築に失敗すれば docx/xlsx はそのまま未対応（fail-safe＝MD だけ生き残る
+        # 両方に使い回す（MD 生成と IR 構築を独立に行うと、xlsx は2回ロードをさらに
+        # 倍払うことになる）。IR 構築に失敗すれば docx/xlsx はそのまま未対応（fail-safe＝MD だけ生き残る
         # 経路は無い＝旧来の「IR 失敗は MD に影響しない」契約は docx/xlsx について終わった）。
         notes = []
         try:
@@ -204,7 +203,7 @@ class OoxmlArm:
                 notes.append(f"xlsx_uncached_formulas:{uncached}")
             truncated_sheets = sum(1 for e in document.elements
                                    if e.type == "sheet" and e.source_map.get("truncated"))
-            if truncated_sheets:                              # RV Med #2: cap 打切りの黙認防止（来歴にも残す）
+            if truncated_sheets:                              # cap 打切りの黙認防止（来歴にも残す）
                 notes.append(f"xlsx_truncated_sheets:{truncated_sheets}")
         elif ext == ".docx":
             # `_docx_table_walk` が付けた flags（列/行 span のクランプ・vMerge 継続セルの
@@ -332,7 +331,7 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
     def _append_paragraph_extras(p_el, host_id, para_idx, cell_map=None) -> None:
         """段落付随要素（hidden/deleted/link/textbox）を出現順（種別ごとにまとめた固定順）で追加する。
 
-        `cell_map` 指定時＝**表セル内の段落**（RV High #1: セル内の削除本文/リンク先も失わない）:
+        `cell_map` 指定時＝**表セル内の段落**（セル内の削除本文/リンク先も失わない）:
         `source_map` は `{"table_index", "row", "column", "cell_paragraph_index"}`（row/column は cells と
         同じグリッド座標）になり、`host_id` にはホスト表の `element_id`（`table:N`）が入る。
         """
@@ -391,7 +390,7 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
         """1つの `w:tbl`（トップレベル/ネスト共通）を `table:N` として追加し、ネスト表を再帰的に追加する。
 
         セル内の段落付随要素（hidden/deleted/link/textbox）も `_append_paragraph_extras` の `cell_map` 経由で
-        要素化する（RV High #1: 表セル内の削除本文・リンク先が完全に失われていた）。`parent_id` はこの表の
+        要素化する（表セル内の削除本文・リンク先を取りこぼさないため）。`parent_id` はこの表の
         `element_id`・座標は cells と同じグリッド位置（継続セルの `w:tc` 内も対象＝取りこぼさない）。
         """
         nonlocal table_seq
@@ -407,7 +406,7 @@ def _build_docx_ir(p: Path) -> document_ir.DocumentIR | None:
             source_map=table_sm,
             extraction=document_ir.Extraction(method="ooxml", confidence=1.0)))
         table_index_value = base_source_map.get("table_index")
-        for row, col, p_els in cell_paras:                 # RV High #1: セル内段落の付随要素も要素化
+        for row, col, p_els in cell_paras:                 # セル内段落の付随要素も要素化
             for p_i, p_el in enumerate(p_els):
                 _append_paragraph_extras(p_el, tid, None, cell_map={
                     "table_index": table_index_value, "row": row, "column": col,
@@ -637,7 +636,7 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
             def _own_state(i, entry):
                 """entry 自身の隠れ状態（off_slide → occluded の優先順・covered_by_text は含まない）。
 
-                RV Med #1: `covered_by_text` の参照可否判定にも使うため、要素組み立てとは独立に前計算する
+                `covered_by_text` の参照可否判定にも使うため、要素組み立てとは独立に前計算する
                 （前面文字 shape 自身が隠れている＝利用者に見えていないなら「可視の上書き」ではない）。
                 """
                 bbox = entry["bbox"]
@@ -676,7 +675,7 @@ def _build_pptx_ir(p: Path) -> document_ir.DocumentIR | None:
                         other = entries[j]
                         if not other["has_text"] or other["bbox"] is None:
                             continue
-                        if states[j][0] != "visible":       # RV Med #1: 自身が隠れている前面文字は参照しない
+                        if states[j][0] != "visible":       # 自身が隠れている前面文字は参照しない
                             continue
                         if office_md._bbox_intersection_ratio(bbox, other["bbox"]) >= office_md._OCCLUSION_RATIO:
                             sm["covered_by_text"] = entry_ids[j]
@@ -748,13 +747,13 @@ def _docx_table_walk(tbl_el) -> tuple[list[document_ir.Cell], list[tuple[int, in
       検知したら `flags` に `"docx_row_span_clamped"` を追加する）。`w:vMerge` の無い通常セルに出会った
       列位置は縦マージ連鎖を打ち切る。ある行にその列位置の `w:tc` が現れなかった場合も連鎖を打ち切る
       （穴あき/不整形な表への fail-safe）。**孤児継続セル**（起点 restart が無い列位置での継続＝不整形）は
-      黙って捨てず、通常セルとして `cells` へ出す（RV High #1: セルを一切失わない契約の維持・連鎖には
+      黙って捨てず、通常セルとして `cells` へ出す（セルを一切失わない契約の維持・連鎖には
       登録しない）。
     - **継続セル自身の可視本文**: `w:vMerge` 継続セル（内容を持たない想定）が実際には
       `<w:t>` を持つ不整形な OOXML の場合、その本文を起点セルの `text` へ改行連結する（起点セルは
       `cells` に要素があるため、値をどこにも出さず捨てる silent-drop を避ける）。連結が発生したら
       `flags` に `"docx_vmerge_text_merged"` を追加する。
-    - 行頭の省略列 `w:trPr/w:gridBefore` は列開始位置に反映する（RV Med #3: 無視すると座標がずれ、
+    - 行頭の省略列 `w:trPr/w:gridBefore` は列開始位置に反映する（無視すると座標がずれ、
       縦マージ連鎖を誤った列位置で数える）。
     - `role` は全セル `"unknown"`（ヘッダ判定は検索用表現生成層の責務）。
     - セルの出現順（≒ `cells` の並び順）は原本の行→列の走査順（row-major）をそのまま保つ（継続セルは
@@ -768,7 +767,7 @@ def _docx_table_walk(tbl_el) -> tuple[list[document_ir.Cell], list[tuple[int, in
     from .. import office_md
     cells: list[document_ir.Cell] = []
     nested: list[tuple[int, int, object]] = []
-    # `(row, col, [直下の w:p ...])`＝セル内段落の付随要素抽出用（RV High #1）。継続セルの `w:tc` も含める
+    # `(row, col, [直下の w:p ...])`＝セル内段落の付随要素抽出用。継続セルの `w:tc` も含める
     # （cells には出さない一方、その tc が段落を持つ不整形でも削除本文等を取りこぼさない）。
     cell_paras: list[tuple[int, int, list]] = []
     flags: list[str] = []
@@ -836,7 +835,7 @@ def _docx_table_walk(tbl_el) -> tuple[list[document_ir.Cell], list[tuple[int, in
                         flags.append("docx_vmerge_text_merged")
             else:
                 # 通常セル・restart・**孤児継続**（起点無しの continue＝不整形）のいずれもセルとして出す
-                # （RV High #1: 孤児継続を捨てると本文つきセルが黙って消える）。
+                # （孤児継続を捨てると本文つきセルが黙って消える）。
                 text = " ".join(office_md._para_text(pp).strip()
                                  for pp in tc.findall(f"{office_md._W}p")).strip()
                 cell = document_ir.Cell(row=row_idx, column=col_start, text=text,
@@ -848,7 +847,7 @@ def _docx_table_walk(tbl_el) -> tuple[list[document_ir.Cell], list[tuple[int, in
                     active_vmerge.pop(col_start, None)      # 通常セル＝この列位置の縦マージ連鎖を打ち切る
             for nested_tbl in tc.findall(f"{office_md._W}tbl"):    # DOC-IR-002: 直下のネスト表を位置付きで収集
                 nested.append((row_idx, col_start, nested_tbl))
-            p_els = tc.findall(f"{office_md._W}p")          # RV High #1: セル内段落（付随要素の抽出対象）
+            p_els = tc.findall(f"{office_md._W}p")          # セル内段落（付随要素の抽出対象）
             if p_els:
                 cell_paras.append((row_idx, col_start, p_els))
             col += raw_span
@@ -921,7 +920,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
       として扱うか、精度が落ちる旨を注記した上で表示すること（値そのもの・セル座標の完全性は
       `cells` により通常どおり保たれる＝silent-drop はしない）。
     - `formula:N`（シートをまたいだグローバル連番・`=` で始まるセルごと）。`text=<数式文字列>`・
-      `parent_id`＝**そのセル座標を所有する領域**（`Region.cells` 基準・RV Med #1＝bbox 重複時の誤親子化
+      `parent_id`＝**そのセル座標を所有する領域**（`Region.cells` 基準＝bbox 重複時の誤親子化
       防止）の `table:N` を最優先。所有領域が無い場合（未計算式でキャッシュ値が無く非占有等）は外接矩形
       包含（`regions()` の返却順＝`(min_row, min_col)` 順で最初に一致・決定的なタイブレーク）→ それも
       無ければ `sheet:N` へ縮退。`order`＝**ホスト
@@ -1042,7 +1041,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
             truncated = excel.sheet_truncated(grid, cap_rows, excel.DEFAULT_CAP_COLS,
                                               sheet_max_row=ws_v.max_row or 1, sheet_max_col=ws_v.max_column or 1)
             if truncated:
-                sheet_sm["truncated"] = True                      # RV Med #2: cap 外だけの領域も黙認しない（申告範囲基準）
+                sheet_sm["truncated"] = True                      # cap 外だけの領域も黙認しない（申告範囲基準）
             declared_rows = ws_v.max_row or 0
             if declared_rows >= _PARTIAL_XLSX_MIN_DECLARED_ROWS and not truncated:
                 # cap 打切り（自己申告＝正常）とは独立の整合チェック: `grid` は declared_rows まで
@@ -1067,7 +1066,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
                 status="active", text=None, cells=None,
                 source_map=sheet_sm, extraction=extraction))
 
-            # RV Med #1: 座標→所有領域。外接矩形どうしが重なっても、非空セルは所有領域の table にだけ出す。
+            # 座標→所有領域。外接矩形どうしが重なっても、非空セルは所有領域の table にだけ出す。
             owner: dict[tuple[int, int], int] = {}
             for ri, rg in enumerate(sheet_regions):
                 for coord in rg.cells:
@@ -1083,7 +1082,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
                     for c in range(rg.min_col, rg.max_col + 1):
                         own = owner.get((r, c))
                         if own is not None and sheet_regions[own] is not rg:
-                            continue                              # 他領域が所有する非空セルは重複出力しない（RV Med #1）
+                            continue                              # 他領域が所有する非空セルは重複出力しない
                         info = merges.get((r, c))
                         if info is not None and info["anchor"] != (r, c):
                             continue                              # 非anchor継続セルは出さない
@@ -1115,7 +1114,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
             for f in excel.formulas(ws_f, ws_v):
                 formula_seq += 1
                 coord = (f["row"], f["column"])
-                # RV Med #1: 親解決は**所有領域を最優先**（bbox 重複時の先着 bbox への誤親子化を防ぐ）。
+                # 親解決は**所有領域を最優先**（bbox 重複時の先着 bbox への誤親子化を防ぐ）。
                 # 未計算式（キャッシュ無し＝非占有）はどの領域にも属さないため bbox 包含 → sheet の順で縮退。
                 own = owner.get(coord)
                 if own is not None:

@@ -1,4 +1,4 @@
-"""チャット・オーケストレーション（M8/M9・04-画面の原則.md §2/§3）。
+"""チャット・オーケストレーション（04-画面の原則.md §2/§3）。
 
 会話メッセージ → ルーティング（chat_router）→ 既存レンズ（run_impact/run_troubleshoot/run_qa）
 → **答えエンベロープ**（見出し＝答え＋するべきこと／本体／**出典フッター＝原本DL**）→ 会話に永続（store）。
@@ -21,6 +21,7 @@ from urllib.parse import quote
 from . import agent_constructs, agentic_search, exec_event, intent_llm, scope, store, worlds
 from . import depth_profile as depth_profile_mod
 from . import layer as layer_mod
+from . import stop_kind as stop_kind_mod
 from . import tools_pref as tools_pref_mod
 from .ingest import importance, text_kind
 from .agents import AGENT_PROVIDERS, Ctx, get_provider
@@ -46,7 +47,7 @@ from .lens_service import (
     run_troubleshoot,
 )
 
-# 調べる深さ（探索反復・grep/ES ヒット上限。SC-6c §3.2）: qa レンズの run_qa が直接 grep する経路
+# 調べる深さ（探索反復・grep/ES ヒット上限。§3.2）: qa レンズの run_qa が直接 grep する経路
 # 固有の既定値（`agentic_search.MAX_HITS` とは別の定数・§1.6）。ここに1箇所だけ持ち、
 # `_dispatch()`／管理画面基準値（`sherpa/routers/system_extras.py::_admin_settings_view`）の
 # 両方が参照する（`run_qa(max_hits=20)` という既存のハードコード既定と同じ値）。
@@ -56,7 +57,7 @@ _log = logging.getLogger("sherpa")
 
 _LENSES = ("impact", "troubleshoot", "qa", "author")
 
-# S3 trace 保存の上限（RV MEDIUM・2026-07）: エージェントループの反復回数に構造的な上限が無い
+# trace 保存の上限: エージェントループの反復回数に構造的な上限が無い
 # （MAX_TURNS はあるが、ask_user 再開や troubleshoot の複数ツール呼びで1ターンあたりのノード数は
 # 理論上増え得る）ため、1ターンに保存する trace が無制限に肥大化しないよう保険の上限を設ける。
 # 120 は通常の qa/troubleshoot（数個〜十数ノード）に対して十分な余裕を持たせた値。
@@ -79,12 +80,12 @@ _MAX_TRACE_BYTES = 1_000_000
 # 超過分は件数だけ metrics.omitted_evidence_count に残す。
 _MAX_TRACE_AGGREGATE_EVIDENCE_IDS = 20
 
-# ---- R1a（横断レビュー対応・2026-07-13）: 会話継続＝履歴 priming ----
+# ---- 会話継続＝履歴 priming ----
 # 「追質問が前ターンを理解しない」を解消するため、直近ターンの (user, assistant) 完全対を
 # Ctx.history（chat_service.py 内で構築・providers/base.py 参照）として全 provider に注入する
-# （Codex ネイティブ resume は別スライス R1b＝ここではやらない）。二重キャップ（対数＋文字予算）の
-# 根拠は提案 R1a-3。トークン計測ツールは repo に無い（tiktoken 未導入・調査済み）ため、文字数ベースの
-# 予算で近似する（「実装時に計測して決定」の帰結＝正確なトークン数ではなく安全側の近似値）。
+# （Codex ネイティブ resume は別経路＝ここではやらない）。トークン計測ツールは repo に無い
+# （tiktoken 未導入）ため、二重キャップ（対数＋文字予算）で文字数ベースの近似予算とする
+# （正確なトークン数ではなく安全側の近似値）。
 _HISTORY_TURNS = int(os.environ.get("SHERPA_HISTORY_TURNS", "6"))              # 直近 N 対（対数キャップ）
 _HISTORY_MSG_CHARS = int(os.environ.get("SHERPA_HISTORY_MSG_CHARS", "1200"))   # 1メッセージの上限文字数
 _HISTORY_CHAR_BUDGET = int(os.environ.get("SHERPA_HISTORY_CHAR_BUDGET", "6000"))  # 履歴全体の文字予算
@@ -387,7 +388,7 @@ def _audit_search_helper(settings: dict) -> str | None:
 
 def _audit_chat_turn(uid, conversation_id, settings, *, lens, user_msg_id,
                      assistant_msg_id, world, scope_paths, personal, stopped: bool = False) -> None:
-    """S5: 1ターン完了時に監査へ記録する（ユーザー要望「プロンプトと回答も追えるように」の土台）。
+    """1ターン完了時に監査へ記録する（ユーザー要望「プロンプトと回答も追えるように」の土台）。
 
     detail に**本文は入れない**（hash-chain 行の肥大化防止・画面のシンプルさ維持）。id とメタだけ持たせ、
     本文は必要な時だけエクスポート（`GET /admin/audit/export?include_chat_content=1`）で
@@ -396,11 +397,11 @@ def _audit_chat_turn(uid, conversation_id, settings, *, lens, user_msg_id,
     `_sweep_expired_announcements` の背景処理と同じ「監査は最善努力」の扱い＝ここは admin の同期操作
     ではなくチャット応答そのものなので、fail-closed でユーザーの回答を握り潰すのは本末転倒）。
 
-    `stopped=True`（RV MEDIUM・2026-07-03再検証）: UI フィードバック1（途中停止）で assistant 未保存の
-    まま打ち切ったターンも clarify と同格に記録する（`assistant_msg_id=None`・detail に `stopped:true`）。
-    停止前は空でなければ監査から丸ごと消えていた＝「誰が何を聞いて途中で止めたか」が追えない欠落だった。
+    `stopped=True`: 途中停止で assistant 未保存のまま打ち切ったターンも clarify と同格に記録する
+    （`assistant_msg_id=None`・detail に `stopped:true`）——「誰が何を聞いて途中で止めたか」を
+    監査から追えるようにするため。
     """
-    # RV HIGH（2026-07-03）: settings["agent"]/SHERPA_AGENT は自由文字列（バリデーション経路を通らず
+    # settings["agent"]/SHERPA_AGENT は自由文字列（バリデーション経路を通らず
     # DB に直接入り得る・過去の env 誤設定等）。監査 detail に生値をそのまま入れず allowlist で正規化する
     # （検索/集計対象になる監査ログに任意文字列を持ち込まない）。
     provider_saved = (settings.get("agent") or agent_constructs.default_agent()).lower()
@@ -417,7 +418,7 @@ def _audit_chat_turn(uid, conversation_id, settings, *, lens, user_msg_id,
                            "scope_paths": len(scope_paths or []), "personal": bool(personal),
                            "provider": provider, "provider_saved": provider_saved,
                            "stopped": bool(stopped),
-                           # 検索アシスタント（2026-08-15）: 資料を読んだのが誰かを監査からも追える
+                           # 検索アシスタント: 資料を読んだのが誰かを監査からも追える
                            # ようにする（費用の内訳・「安いモデルにしたのに高い」の切り分け）。
                            # 未設定は None＝従来どおりメインが読んだターン。
                            "search_helper": _audit_search_helper(settings)},
@@ -427,14 +428,14 @@ def _audit_chat_turn(uid, conversation_id, settings, *, lens, user_msg_id,
 
 
 def _resolve_lens(lens, message):
-    """調べ方の明示指定を解決する（SC-6b §3.1）。優先順位: スラッシュ接頭辞（1回限り）＞
+    """調べ方の明示指定を解決する（§3.1）。優先順位: スラッシュ接頭辞（1回限り）＞
     `ChatReq.lens`（調べ方ブロックの明示選択）＞自動（既存の Tier1〜3）。
 
     返り値 `(explicit_lens, lens_source, lens_block, message)`。`explicit_lens` は `_build_router()`
     へそのまま渡す値（`None`＝自動判定に委ねる）。スラッシュ接頭辞が見つかれば本文から取り除いた
     `message` を返す（保存される質問・起点語抽出のいずれからも接頭辞のノイズを除く）。`lens` は
-    `None`／`"auto"` のどちらも「ブロックが自動のまま」を表す（裁定3・既定は省略送信）。
-    `lens_block`（RV1 #2）: `lens`（ブロックの継続設定）を正規化しただけの値（`None`/`"auto"` は
+    `None`／`"auto"` のどちらも「ブロックが自動のまま」を表す（既定は省略送信）。
+    `lens_block`: `lens`（ブロックの継続設定）を正規化しただけの値（`None`/`"auto"` は
     `None`）——スラッシュで `explicit_lens` が上書きされても、ブロック自体の継続設定は別途
     `_resolve_scope()` の `lens_block` として持ち越す（会話を開き直したときの復元用）。
     """
@@ -451,14 +452,14 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
     """hybrid intent ルータ（§3）。heuristic 確信→（曖昧）LLM 分類→（なお曖昧）clarify or qa fallback。
 
     **per-turn memoize**＝同一ターンで route が複数回呼ばれても（_GenProvider が route 後に _gather で再 route）
-    LLM 分類を二重実行しない（Codex RV Med）。`can_ask`＝ストリーミングのみ True（非対話は qa fallback）。
-    `user_id`（S1）は intent 分類の利用量計測（`kind='intent'`）に渡すだけ＝ルーティングの判断には使わない。
+    LLM 分類を二重実行しない。`can_ask`＝ストリーミングのみ True（非対話は qa fallback）。
+    `user_id` は intent 分類の利用量計測（`kind='intent'`）に渡すだけ＝ルーティングの判断には使わない。
 
-    `explicit_lens`（調べ方ブロックの明示指定・スラッシュ接頭辞含む＝SC-6b §3.1・裁定10）: 非 None
+    `explicit_lens`（調べ方ブロックの明示指定・スラッシュ接頭辞含む＝§3.1）: 非 None
     のときは Tier1〜3（heuristic／LLM分類／確認カード）を全て飛ばし `chat_router.decision_for()` で
     直接 decision を組み立てる。「確認してから進めて」（`_wants_confirm_first`）は明示指定より優先
     する例外——調べ方が決まっていても対象の絞り込みを確認したい場合があるため。
-    `scope_meta`（RV1 #3・RV2 #1・SC-6e）: 確認カードの payload へ解決済みの探す対象・範囲・
+    `scope_meta`: 確認カードの payload へ解決済みの探す対象・範囲・
     `lens_source`／`lens_block`／`tools`（検索経路トグル）を載せる（`_resolve_scope` の返り値・
     knowledge オフ時は `None`）——確認カードの再送時に1回だけ既存の `ChatReq.lens`／scope／`tools`
     経路へ戻す（`lens_source=="slash"` はフロントが接頭辞を復元する）ための情報で、判定ロジック
@@ -469,9 +470,9 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
     def _route(message):
         if message in cache:
             return cache[message]
-        # High-2（F2-2）: 「確認してから進めて」指定は provider/dispatch 到達前に確認カードを出す決定的
-        #   ガード（プロンプト遵守任せ＝agents 側 F2 では「必ず」を保証できないため）。既存 clarify と同経路
-        #   （lens="clarify" の decision → provider が question を emit → S1 の永続化に乗る）。確認ID 付き
+        # 「確認してから進めて」指定は provider/dispatch 到達前に確認カードを出す決定的
+        #   ガード（プロンプト遵守任せでは「必ず」を保証できないため）。既存 clarify と同経路
+        #   （lens="clarify" の decision → provider が question を emit → 永続化に乗る）。確認ID 付き
         #   （回答の再送）では発動しない＝ループ防止。can_ask=False（非対話）は質問できないので通常判定へ委ねる。
         if can_ask and _wants_confirm_first(message):
             sm = scope_meta or {}
@@ -481,7 +482,7 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
                                         tools=sm.get("tools"))
             cache[message] = d
             return d
-        if explicit_lens:                                        # 調べ方の明示指定＝Tier1〜3 を飛ばす（裁定10）
+        if explicit_lens:                                        # 調べ方の明示指定＝Tier1〜3 を飛ばす
             d = _decision_for(explicit_lens, message, known, reason="明示指定")
             cache[message] = d
             return d
@@ -499,10 +500,10 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
 
     return _route
 
-# 経路チップ（R2）：レンズ→使った経路。**専門用語を出さない**（04-画面の原則.md §5/§6・ui-rv2 Med#6）。
+# 経路チップ：レンズ→使った経路。**専門用語を出さない**（04-画面の原則.md §5/§6）。
 _ROUTE_PATH = {"impact": ["関係を確認"], "troubleshoot": ["関連を確認", "文書を検索"], "qa": ["文書を検索"],
                "author": ["文書を検索", "資料を作成"]}
-# 出典に出さない内部来歴マーカー（DL できる文書ではない）。scope と共有（単一定義・RV Med#2）。
+# 出典に出さない内部来歴マーカー（DL できる文書ではない）。scope と共有（単一定義）。
 _NON_DOC = scope.NON_DOC
 _SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
@@ -523,9 +524,8 @@ def emit_pace() -> float:
 def _known_terms(session, world) -> list:
     """起点語抽出のヒント＝world内の全ノード名（データ由来・テーマ非依存）。
 
-    secRV 範囲外是正 追補（2026-07-19・RV指摘 HIGH-2）: 以前は `.data()` で無制限に全件展開しており、
     knowledge=true の全チャット（impact/troubleshoot/qa すべて）がここを通るため、`lens_service`/
-    `world_neo4j` に実装した Neo4j 安全弁（timeout・緊急天井）が本関数だけ迂回されていた。
+    `world_neo4j` に実装した Neo4j 安全弁（timeout・緊急天井）を経由する必要がある。
     `lens_service._run_capped`（ソフト縮退＝timeout→空リスト・天井到達→cap 内の部分リストへの
     warning 付き縮退）を再利用する。`_run_capped` は private だが、chat_service は既に
     `lens_service`（run_qa/run_troubleshoot）と関わる層で import 方向も lens_service→chat_service
@@ -543,9 +543,9 @@ def _known_terms(session, world) -> list:
 def _src_url(doc: str, world: str, res: "importance.Resolution | None" = None) -> dict:
     """出典1件 → 原本DLリンク（原本・パス基準＝doc は rel_path・slash を含むので query で渡す）。
 
-    `res`（省略可・I2・2026-09-05）: 登録者が `_重要度.txt` で付けた重要度の解決結果。あれば
-    `importance`/`importance_reason` を条件付きで追加する（`importance_source` は出典には出さない・
-    J4）。無ければ（省略時含む）従来どおり2キーのまま——受け入れ条件（重要度制御ファイルの無い
+    `res`（省略可）: 登録者が `_重要度.txt` で付けた重要度の解決結果。あれば
+    `importance`/`importance_reason` を条件付きで追加する（`importance_source` は出典には出さない）。
+    無ければ（省略時含む）従来どおり2キーのまま——受け入れ条件（重要度制御ファイルの無い
     world で出典の出力完全不変）はこの引数を渡さない限り自動的に満たされる。
     """
     return {"doc_id": doc,
@@ -560,11 +560,11 @@ def _sources(docs, world) -> list:
                 and not importance.is_importance_control_path(d)):   # 重要度設定ファイル自体は出典に出さない（§5）
             seen.add(d)
             filtered.append(d)
-    # I2: world 全体を1回だけ解決し（`resolve_many`）、対象の doc だけ引く（`_src_url` へ渡す）。
+    # world 全体を1回だけ解決し（`resolve_many`）、対象の doc だけ引く（`_src_url` へ渡す）。
     # 未登録 world（`worlds.world_dir` が None）は解決しない＝従来どおり2キーのまま。
     wd = worlds.world_dir(world)
     sig = None
-    # RV是正（rv-i2-importance #3・2026-09）: `sig` 省略時 `resolve_for_world` は
+    # `sig` 省略時 `resolve_for_world` は
     # `worker.world_signature_of_root(wd)` で world 全体をもう一度全木走査する（`grep_tool` と
     # 同じ理由・§該当箇所参照）。出典（この関数）は1チャット応答につき1回だけの呼び出しだが、
     # registry の `last_sig`（狭い1行 SELECT・`store.get_world_status_row`）を渡せば同じだけ省ける。
@@ -598,10 +598,9 @@ def _truncation_headline_suffix(result) -> str:
 
 
 def _answer_impact(result, world):
-    """K12（2026-09-04-グラフのソース正典化.md §4）: 「確実/要確認」の2値判定表示は機構ごと撤去。
-
-    `items` は全件同格（構造的な影響として同じ扱い）。presumed（grep 共起の推定）だけは別枠のまま残す。
-    起点の自動橋渡し注記（`starts[].via`）は REALIZES 撤去（K10）に伴い供給源が無くなったため撤去。
+    """`items` は全件同格（構造的な影響として同じ扱い・「確実/要確認」の2値判定表示はしない）。
+    presumed（grep 共起の推定）だけは別枠のまま残す。起点の自動橋渡し注記（`starts[].via`）は
+    供給源が無いため出さない。
     """
     items = result["items"]
     start = result["start"]
@@ -615,7 +614,7 @@ def _answer_impact(result, world):
                     f"**関連の可能性**が {len(presumed)}件（推定・要確認）: {names} など。")
     else:
         headline = f"「{start}」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
-    if code_silent:                                    # 次の一手＝検索へ素直に誘導（フォルダ起因と断定しない・RV Low）
+    if code_silent:                                    # 次の一手＝検索へ素直に誘導（フォルダ起因と断定しない）
         headline += "　▶ 資料の検索（仕様問い合わせ・トラブルシュート）で仕様/運用の記述を確認できます。"
     docs = [e["doc"] for it in items for e in it.get("evidence", []) if e.get("doc")]
     docs += [e.get("doc") for p in presumed for e in p.get("evidence", []) if e.get("doc")]
@@ -660,25 +659,25 @@ def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", 
     省略（`None`）のときだけ `"both"` に正規化する。不正な内部値（HTTP 入口の pydantic Literal を
     経ていない値）は `layer.normalize_layer` が `ValueError` を送出する（fail-loud・黙って both へ
     丸めない）。
-    `lens_source`（調べ方の明示指定元・SC-6b §3.1）: `auto`｜`explicit`｜`slash`。既定 `"auto"`。
-    `lens_block`（RV1 #2）: `ChatReq.lens`（ブロックの継続設定・自動は `None`）そのもの——
+    `lens_source`（調べ方の明示指定元・§3.1）: `auto`｜`explicit`｜`slash`。既定 `"auto"`。
+    `lens_block`: `ChatReq.lens`（ブロックの継続設定・自動は `None`）そのもの——
     スラッシュ接頭辞（1回限りの明示）で `lens_source="slash"` になった場合でも、ブロックが
     継続して持っていた値を別途保持する。スラッシュは実効レンズ（`answer.lens`）だけを1回上書きし
     ブロックの選択状態は変えない契約（§3.1）のため、会話を開き直したときの復元は
     `lens_source=="slash"` ならこの `lens_block` を、`"explicit"` なら実効レンズを、`"auto"` なら
     自動を使う（`web/chat/scope.js::applyConversationScope` 参照）。
-    `web_search`（WEB-1・既定 False）: このチャットで Web 検索を希望したか（`ChatReq.web_search`）。
+    `web_search`（既定 False）: このチャットで Web 検索を希望したか（`ChatReq.web_search`）。
     実際に Codex へ反映されるかは管理者許可・接続先（Azure 等では常に無効）に依る
     （`sherpa/providers/codex/sandbox.py::_web_search_disabled_value` が唯一の判定点）——ここでは
     復元用に希望値をそのまま記録するだけ。
-    `depth_profile`（調べる深さ・調べ方ブロック §3.2・SC-6c）: 省略（`None`）は `"standard"` に
+    `depth_profile`（調べる深さ・調べ方ブロック §3.2）: 省略（`None`）は `"standard"` に
     正規化する（`depth_profile_mod.normalize_depth_profile`）。不正な内部値は同様に `ValueError`
     （fail-loud）。
-    `tools`（検索経路トグル・調べ方ブロック §3.6・SC-6e）: 省略（`None`）は全 ON に正規化する
+    `tools`（検索経路トグル・調べ方ブロック §3.6）: 省略（`None`）は全 ON に正規化する
     （`tools_pref_mod.normalize_tools_pref`）。不正な内部値は同様に `ValueError`（fail-loud）。
     `layer_mod.scope_with_layer` がこの dict をそのままコピーするため `answer.scope.lens_source`／
-    `lens_block`／`web_search`／`depth_profile`／`tools` へそのまま伝わる（会話保存の互換は §4.3・
-    裁定4＝旧回答は `"auto"`／`None`／`False`／`"standard"`／全 ON 扱い）。
+    `lens_block`／`web_search`／`depth_profile`／`tools` へそのまま伝わる（会話保存の互換は §4.3＝
+    旧回答は `"auto"`／`None`／`False`／`"standard"`／全 ON 扱い）。
     """
     explicit = scope.normalize_scope_paths(scope_paths)   # strip/空除去/重複排除
     return {"world": world, "scope_paths": explicit, "source": "explicit" if explicit else "all",
@@ -691,15 +690,15 @@ def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", 
 def _es_hits(world, query, sp, k=8, redact=False, layer=None):
     """ES（BM25）上位ヒットを、現 world に実在する doc だけに絞って返す。
 
-    facts 統合では **BM25 のみ**（vector=False＝qa ごとのクエリ埋め込みコストを避ける・RV Low）。
-    現 world の実在集合は1回だけ作る（古い ES 索引由来の 404/別内容リンクを出さない・RV High）。
+    facts 統合では **BM25 のみ**（vector=False＝qa ごとのクエリ埋め込みコストを避ける）。
+    現 world の実在集合は1回だけ作る（古い ES 索引由来の 404/別内容リンクを出さない）。
     `layer`（省略可・既定 `None`＝`"both"`）: 呼び出し元が qa 補完のときだけ渡す
     （troubleshoot 補完＝`_es_troubleshoot_cards` は渡さない＝§3.5 非適用）。
     """
     try:
         from . import documents, es_index
         valid = documents.world_rel_set(world)
-        # `es_index.search()` は (hits, reason) タプル（RV2）。BM25 実クエリ失敗（es_query_failed）
+        # `es_index.search()` は (hits, reason) タプル。BM25 実クエリ失敗（es_query_failed）
         # もありうるが、この経路（facts 統合）には degraded 報告の仕組みが無いため意図的に捨てる
         # （構造化された degraded 集計が要る呼び出し元は `search_service._search_keyword()` 参照）。
         hits, _reason = es_index.search(world, query, scope_paths=sp, k=k, vector=False, layer=layer)
@@ -708,7 +707,7 @@ def _es_hits(world, query, sp, k=8, redact=False, layer=None):
     out = []
     for h in hits:
         doc = h.get("doc_id")
-        # 秘匿名（更新前に索引化された `credentials.xlsx` 等）は facts/カードへ出さない（台帳 #85〜#88）。
+        # 秘匿名（更新前に索引化された `credentials.xlsx` 等）は facts/カードへ出さない。
         if doc and doc in valid and scope.in_scope(doc, sp) and not text_kind.is_sensitive_doc_id(doc):
             if redact:
                 h = {**h, "text": _redact(h.get("text", ""))[:500]}
@@ -719,7 +718,7 @@ def _es_hits(world, query, sp, k=8, redact=False, layer=None):
 def _es_citations(world, query, sp, k=8, layer=None):
     """ES（BM25）上位ヒットを citation 形に（Codex/非agentic も ES を参照できるよう facts に混ぜる）。
 
-    H3（SC-4 接続・CITE-1）: rag_parent_return（P3/P2/chunk・§3.3/§3.4 の非agentic 展開）で本文の
+    rag_parent_return（P3/P2/chunk・§3.3/§3.4 の非agentic 展開）で本文の
     完全性を上げたうえで、excerpts.display_quote（利用者向け引用を人間向け MD の該当節へ引き直す・
     §9）で quote を差し替える。検索対象（ES ヒット選定）自体は変えない——ここは返す直前の後処理のみ。
     """
@@ -745,7 +744,7 @@ def _merge_qa_with_es(result, world, query, sp, layer=None):
     from . import citations
     grep = list(result.get("citations", []))
     es = _es_citations(world, query, sp, layer=layer)
-    merged = citations.dedupe_round_robin_by_doc_span(grep, es)   # round-robin で先頭付近に ES も来る（RV Med）
+    merged = citations.dedupe_round_robin_by_doc_span(grep, es)   # round-robin で先頭付近に ES も来る
     return {**result, "citations": merged, "answered": bool(merged)}
 
 
@@ -780,14 +779,14 @@ def _dedupe_round_robin_cards(*groups) -> list:
 
 
 def _es_troubleshoot_cards(world, query, sp, k=8) -> list:
-    """H3（SC-4 接続・CITE-1）: evidence.grep の `text` も excerpts.display_quote で人間向け MD の
+    """evidence.grep の `text` も excerpts.display_quote で人間向け MD の
     該当節へ引き直す（カードの UX 上限＝500字クリップは維持——`_es_hits(redact=True)` が既に
     redact+clip 済みの `text` を fallback として渡すため、`excerpt_source=="rag"` のときは無変更。
     `"human_md"` のときだけ新しい本文へ redact+clip をかけ直す）。親返し（サイズ拡張）は非適用
     （troubleshoot カードは終始「近傍1件＝1カード」の一覧・簡潔さが目的で、qa の引用とは UX が異なる）。
     """
     from . import excerpts
-    by_doc, order = {}, []                                  # doc ごとに1カード・複数 span は evidence.grep に集約（name dedupe で別 span を落とさない・RV Med）
+    by_doc, order = {}, []                                  # doc ごとに1カード・複数 span は evidence.grep に集約（name dedupe で別 span を落とさない）
     for h in _es_hits(world, query, sp, k=k, redact=True):
         doc, line = h["doc_id"], h.get("line")
         disp = excerpts.display_quote(world, doc, h.get("text", ""), chunk_id=h.get("chunk_id"),
@@ -817,8 +816,8 @@ def _merge_troubleshoot_with_es(result, world, query, sp):
     return {**result, "candidates": _dedupe_round_robin_cards(base, es_cards)}
 
 
-# 検索経路トグル（調べ方ブロック §3.6・SC-6e）の honest-failure envelope は
-# `agentic_search.tools_blocked_env`（SC-6e）が単一の真実源——非agentic（`_dispatch`）・
+# 検索経路トグル（調べ方ブロック §3.6）の honest-failure envelope は
+# `agentic_search.tools_blocked_env` が単一の真実源——非agentic（`_dispatch`）・
 # agentic（`providers/base._agentic_run`）の両経路が同じ固定文言・サイドカー契約を共有する。
 
 
@@ -828,10 +827,10 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
 
     層フィルタ（探す対象・調べ方ブロック §3.4）は qa（author も qa 分岐に落ちる）にのみ適用する。
     impact／troubleshoot は言及エッジ（DOCUMENTS via=mention）が Document とコードを木を跨いで
-    繋ぐため受け取っても適用しない（§3.5・§8 裁定論点1）——`env["scope"]["layer_applied"]` で
+    繋ぐため受け取っても適用しない（§3.5）——`env["scope"]["layer_applied"]` で
     黙って無視せず明示する。
 
-    調べる深さ（`depth_profile`・調べ方ブロック §3.2・SC-6c）: `run_impact`/`run_troubleshoot` の
+    調べる深さ（`depth_profile`・調べ方ブロック §3.2）: `run_impact`/`run_troubleshoot` の
     `depth`・`run_qa` の `max_hits` へ倍率をかけた値を渡す（`sherpa.depth_profile` の乗数表）。
     倍率は「実効基準値」（管理画面の基準値編集＝`system_settings` → env → コード既定、の解決結果）
     に掛ける——基準値そのものは書き換えない。`system_settings`（省略可・既定 `None`）は呼び出し元
@@ -843,12 +842,12 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     編集（Field 上限まで）＋調べる深さ「最大」の組み合わせでも、倍率適用後の値が既存の絶対上限を
     超えないようにする。
 
-    検索経路トグル（`scope_meta["tools"]`・調べ方ブロック §3.6・SC-6e）: `agentic_search.
+    検索経路トグル（`scope_meta["tools"]`・調べ方ブロック §3.6）: `agentic_search.
     dispatch_tools_for_lens` で実効ツール集合と実行可否を判定する。必須ツールが全て OFF/実接続
     不達なら OFF になったツールへ黙ってフォールバックせず `agentic_search.tools_blocked_env` の
     明示エラーを返す（heuristic 経路・author・agentic 失敗時の単発フォールバックがいずれもこの
     `_dispatch` を経由するため、非agentic 経路全体で同じゲートになる。agentic 経路自体も
-    `providers/base._agentic_run` が同じ判定・同じ envelope を使う＝SC-6e）。qa/author は grep（`run_qa`）と
+    `providers/base._agentic_run` が同じ判定・同じ envelope を使う）。qa/author は grep（`run_qa`）と
     fulltext（ES 補完）のどちらか一方だけでも実行し、troubleshoot はグラフ必須（内部の運用手順
     grep はグラフ候補カードの enrichment に組み込まれておりこの1軸では分離しない）で fulltext
     補完のみを追加で切り替える。`tools_availability`（省略可・既定 `None`＝全て利用可能扱い）は
@@ -893,13 +892,13 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     return env
 
 
-# SC-6d（出典0件時の案内・§5）: 「絞られている軸だけ」を範囲→探す対象の順で1つの案内にまとめる
-# （既に最も緩い設定の軸は含めない・§8 裁定5）。
+# 出典0件時の案内（§5）: 「絞られている軸だけ」を範囲→探す対象の順で1つの案内にまとめる
+# （既に最も緩い設定の軸は含めない）。
 _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE = "範囲・種類を変えても見つかりませんでした（確証なし）。"
 
 
 def _no_genuine_results(env: dict) -> bool:
-    """出典0件で、かつ通常の検索結果 envelope か（RV1 #6）。
+    """出典0件で、かつ通常の検索結果 envelope か。
 
     AI未接続・busy（Codex直列化）・下調べ設定不正・下調べ失敗・層を強制できない構成・Neo4j 安全弁
     （timeout/緊急天井）はいずれも honest failure として `data: {}`（空 dict）で返す
@@ -920,11 +919,11 @@ def _retry_hints(env: dict) -> list:
 
     層（探す対象）は `layer_applied`（このレンズで層フィルタが実効したか＝§3.5）が真のときだけ
     案内に含める——impact/troubleshoot は層を受け取っても適用しないため、層を広げても結果は
-    変わらない（黙って無視ではなく、そもそも案内自体を出さない）。調べる深さ（SC-6c）は既に
+    変わらない（黙って無視ではなく、そもそも案内自体を出さない）。調べる深さは既に
     「最大」でなければ（絞られていれば）案内に含める——標準/深くから直接「最大」へ1回で広げる
     （範囲/層の「全体」/「両方」と同じ「最も緩い設定へ1回で戻す」設計・§5）。呼び出し前に
-    `_no_genuine_results(env)` を確認する（`_finalize` 参照）。表示順は §8 裁定5（範囲→探す対象→
-    調べる深さ）。
+    `_no_genuine_results(env)` を確認する（`_finalize` 参照）。表示順は範囲→探す対象→調べる深さ
+    （§5）。
     """
     sm = env.get("scope") or {}
     hints = []
@@ -938,7 +937,7 @@ def _retry_hints(env: dict) -> list:
     if depth in _DEPTH_PROFILE_LABEL:                              # "max"（既に最も緩い）は対象外
         hints.append({"kind": "depth", "label": f"調べる深さを上げて探す（今は{_DEPTH_PROFILE_LABEL[depth]}）",
                       "action": {"depth_profile": "max"}})
-    tools = sm.get("tools")                                        # SC-6e: 検索経路トグルが非既定のときだけ
+    tools = sm.get("tools")                                        # 検索経路トグルが非既定のときだけ
     if tools and not tools_pref_mod.is_default(tools):
         hints.append({"kind": "tools", "label": "OFF にした検索を戻す",
                       "action": {"tools": dict(tools_pref_mod.DEFAULT_TOOLS_PREF)}})
@@ -946,7 +945,7 @@ def _retry_hints(env: dict) -> list:
 
 
 def _is_budget_exhausted(env: dict) -> bool:
-    """STOP-1: `providers/base.py::_agentic_run` が調査予算到達（turns_exhausted/
+    """`providers/base.py::_agentic_run` が調査予算到達（turns_exhausted/
     budget_exceeded/tools_per_turn_exceeded）で既に固定 headline を据えているターンかどうか。
     出典0件（`_no_genuine_results`）と重なっても、予算切れは「探しても恒久的に見つからない」とは
     別の状態のため、この関数が真を返す場合は `_finalize` の「見つからない」断定で headline を
@@ -976,6 +975,14 @@ def _finalize(env, decision):
     env["lens"] = decision["lens"]
     env["route"] = {"lens": decision["lens"], "reason": decision["reason"],
                     "path": _ROUTE_PATH.get(decision["lens"], [])}
+    # STAT-3 T3: 終了理由を閉じた語彙（8値）へ正規化して `messages.answer.stop_kind` に残す
+    # （利用統計の終了理由分布の唯一の真実源＝`stop_kind_mod.resolve` 参照）。利用者の明示停止
+    # （`stopped_by_user`）はこの関数を経由しない別分岐（assistant 未保存）のためここでは出ない。
+    # `resolve` が None（busy／型を特定できない honest failure）のときは立てない＝NULL のまま
+    # 集計側の `unknown` に落とす（失敗を `completed` として数えない）。
+    _stop_kind = stop_kind_mod.resolve(env)
+    if _stop_kind is not None:
+        env["stop_kind"] = _stop_kind
     _codex_stopped_early = _is_codex_stopped_early(env)
     if _no_genuine_results(env):
         hints = _retry_hints(env)
@@ -984,13 +991,13 @@ def _finalize(env, decision):
         elif (decision["lens"] in ("qa", "author") and not _is_budget_exhausted(env)
               and not _codex_stopped_early):
             # 全軸が既に最も緩い設定（全体・資料＋コード・最大）でなお0件＝これ以上緩める軸が無い
-            # （§5・RV1 #9・SC-6c で調べる深さの軸を追加）。予算到達の途中結果（STOP-1）・Codex
+            # （§5）。予算到達の途中結果・Codex
             # 作業宣言止まりの途中結果はいずれも「見つからなかった」ではないため上書きしない。
             # impact/troubleshoot は層の概念が無く既存の headline が十分具体的なため対象外にする
             # （`_answer_impact`/`_answer_troubleshoot` は変更しない）。
             env["headline"] = _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
     if _codex_stopped_early:
-        # SC-6d と同じボタン機構（retry_hints・data-retry-kind）に載せる——0件案内の hints とは
+        # 出典0件時の案内と同じボタン機構（retry_hints・data-retry-kind）に載せる——0件案内の hints とは
         # 独立に常に追加する（0件でも中身があっても「続きから調べ直せる」こと自体は変わらない）。
         # クリック時の送信は kind="resume" 専用分岐（web/chat.js）が扱う＝直前の質問を広げて
         # 再送する他の kind とは別系統（固定文言をそのまま送るだけ・resume は codex_session_id
@@ -1014,7 +1021,7 @@ def _pop_evidence_committed(env: dict, trace_nodes: dict):
     return node
 
 
-# secRV 範囲外是正（2026-07-19・影響分析の Neo4j 安全弁＝timeout＋緊急天井・fail-loud＝偽陰性防止）:
+# 影響分析の Neo4j 安全弁＝timeout＋緊急天井・fail-loud＝偽陰性防止:
 # `_dispatch` の impact 分岐（`run_impact`→`ingest.world_neo4j`）が `GraphQueryOverloadError` を
 # raise した場合、**LLM 合成を一切経由させず**固定文言の `_result` へ差し替える。impact レンズだけが
 # world_neo4j.world_impact/resolve_world_entity を通る（troubleshoot は lens_service 独自の安全弁で
@@ -1028,7 +1035,7 @@ def _impact_overload_result(message: str, world: str, scope_meta: dict | None) -
                               message, world, scope_meta)
 
 
-# rv-s3-removal（Codex RV HIGH）: `GraphQueryOverloadError` と同じ理由（LLM 合成を経由させず固定
+# `GraphQueryOverloadError` と同じ理由（LLM 合成を経由させず固定
 # 文言で終端）で `GraphSchemaEraError` も扱う。ただし**発生元は impact に限らない**——
 # `world_impact`/`resolve_world_entity`（impact レンズ・直接 dispatch）に加え、`lens_service.
 # neo4j_related`（troubleshoot レンズ・直接 dispatch、または agentic ツール `graph_neighbors`
@@ -1043,6 +1050,7 @@ def _fixed_lens_result(lens: str, headline: str, reason: str, message: str, worl
     sm = layer_mod.scope_with_layer(scope_meta, world=world, lens=lens)
     env = {"lens": lens, "headline": headline, "summary": {"total": 0},
            "data": {}, "sources": [], "scope": sm,
+           "agentic_failure": "error",   # 固定文言の縮退＝終了理由の分布で完了扱いにしない
            "route": {"lens": lens, "reason": reason, "path": _ROUTE_PATH.get(lens, [])}}
     decision = {"lens": lens, "input": message, "reason": reason}
     return {"env": env, "decision": decision}
@@ -1074,7 +1082,7 @@ def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None):
 
 
 def _clip_history_msg(text: str) -> str:
-    """履歴の1メッセージを上限文字数で切り詰める（先頭を残し末尾を落とす・R1a）。"""
+    """履歴の1メッセージを上限文字数で切り詰める（先頭を残し末尾を落とす）。"""
     t = text or ""
     if len(t) <= _HISTORY_MSG_CHARS:
         return t
@@ -1082,7 +1090,7 @@ def _clip_history_msg(text: str) -> str:
 
 
 def _history_pairs(conversation_id) -> list[dict]:
-    """直近ターンの (user, assistant) 完全対を Ctx.history 形式で返す（R1a）。
+    """直近ターンの (user, assistant) 完全対を Ctx.history 形式で返す。
 
     会話は交互とは限らない（途中停止＝assistant 未保存・clarify・crash 補填）ため、user 行の
     直後（id 順で次）が assistant 行のときだけ対として採用する（不対行は捨てる＝anthropic の交互
@@ -1143,7 +1151,7 @@ def _ensure_conversation(conversation_id, message, world, user_id):
     return conversation_id
 
 
-# Feature B: 個人ファイル参照の許可拡張子（workspace upload 許可と同じ集合・api.py _WORKSPACE_SEARCHABLE_EXT と同義）。
+# 個人ファイル参照の許可拡張子（workspace upload 許可と同じ集合・api.py _WORKSPACE_SEARCHABLE_EXT と同義）。
 # ここで重複定義するのは chat_service が api.py に依存しないようにするため。個人領域は共有 KB の
 # アナライザ登録簿とは別の独立集合（grep のみ・RAG/グラフ非対象）だが、コード分は和集合に含める
 # （登録簿を上書きはしない＝ここでしか使わない .sql/.py/.sh/.bat 等はそのまま残す・§2.4）。
@@ -1154,7 +1162,7 @@ _PERSONAL_SEARCHABLE_EXT = {
 
 
 def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
-    """ユーザーの個人 workspace を台帳基準で grep し、ヒット一覧を返す（Feature B）。
+    """ユーザーの個人 workspace を台帳基準で grep し、ヒット一覧を返す。
 
     不変条件:
     - 検索は personal_workspace_files 台帳上の status='uploaded' ファイルのみ（FS 残骸を拒否）。
@@ -1166,7 +1174,7 @@ def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
     q = query.strip()
     q_lower = q.lower()
     files_dir = (Path(users_dir).resolve() / user_id / "workspace" / "files")
-    # BLOCKER 2 fix: files/ ディレクトリ自体が symlink の場合は拒否（confinement 破壊防止）。
+    # files/ ディレクトリ自体が symlink の場合は拒否（confinement 破壊防止）。
     if files_dir.is_symlink() or not files_dir.is_dir():
         return []
     live_paths = store.live_workspace_rel_paths(user_id)
@@ -1215,7 +1223,7 @@ def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
 
 
 def _personal_facts(hits: list[dict], query: str) -> str:
-    """個人ファイルのヒットを LLM への事実テキストに整形（Feature B）。
+    """個人ファイルのヒットを LLM への事実テキストに整形。
 
     不変条件: このテキストは AI への入力のみ。ES/Neo4j には書かない。
     """
@@ -1228,7 +1236,7 @@ def _personal_facts(hits: list[dict], query: str) -> str:
 
 
 def _personal_citations(hits: list[dict]) -> list[dict]:
-    """個人ファイルのヒットを citation 形式に変換（Feature B）。
+    """個人ファイルのヒットを citation 形式に変換。
 
     不変条件: `source` フィールドで共有 KB citation と区別。DL リンクなし（個人 workspace 専用）。
     """
@@ -1259,20 +1267,20 @@ def handle_message(session, message, world="v1",
     `knowledge=False`（既定）＝ナレッジ参照オフ＝検索せず素の会話。`True` で社内資料を参照（レンズ＋出典）。
     `scope_paths`（版内パスの集合）を渡すと、検索/分析を**その範囲（＋共通領域）に絞る**（C・knowledge時のみ）。
     `layer`（省略可・既定 `None`＝`"both"`・knowledge時のみ）: 探す対象（調べ方ブロック §3.4）。
-    `lens`（省略可・既定 `None`＝自動・knowledge時のみ）: 調べ方ブロックの明示指定（SC-6b §3.1）。
+    `lens`（省略可・既定 `None`＝自動・knowledge時のみ）: 調べ方ブロックの明示指定（§3.1）。
     メッセージ先頭のスラッシュ接頭辞（1回限りの明示）はこの値より優先する（`_resolve_lens` 参照）。
-    `personal=True`（Feature B）＝共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。
+    `personal=True`＝共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。
     不変条件: 個人ファイルは ES/Neo4j に入れない。本人のみ参照可。OFF 時は従来どおり。
-    `web_search=False`（既定・WEB-1）: このチャットで Codex の Web 検索を希望するか
+    `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか
     （`ChatReq.web_search`）。保存済みの個人設定 `codex_web_search` 列は実行には使わず、この
     引数だけを見る（`settings["codex_web_search"]` をこの値で上書きしてから provider を選ぶ）。
-    `depth_profile`（省略可・既定 `None`＝`"standard"`・knowledge時のみ・SC-6c §3.2）: 調べる深さ
+    `depth_profile`（省略可・既定 `None`＝`"standard"`・knowledge時のみ・§3.2）: 調べる深さ
     （調べ方ブロック）。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く。
-    `tools`（省略可・既定 `None`＝全 ON・knowledge時のみ・SC-6e §3.6）: 検索経路トグル
+    `tools`（省略可・既定 `None`＝全 ON・knowledge時のみ・§3.6）: 検索経路トグル
     （`ChatReq.tools`）。エージェント探索（LLM の tool-use）が提示する grep/es_search/graph_neighbors
     を絞る。Codex 頭脳は自前でシェルを実行するため対象外（`sherpa/providers/codex/provider.py` は
     無改修）。
-    `tools_availability`（省略可・既定 `None`＝本関数が自分で計算・SC-6e）: 呼び出し元
+    `tools_availability`（省略可・既定 `None`＝本関数が自分で計算）: 呼び出し元
     （`routers/chat.py`）がこのターンの受付時422判定（`_validate_tools_availability`）と同時に
     計算した可用性 snapshot。渡された場合はそちらを使い、本関数では再計算しない——別々に
     取得すると TTL キャッシュの境界を挟んで受付時と実行時の可用性が食い違い得るため。省略時
@@ -1291,15 +1299,15 @@ def handle_message(session, message, world="v1",
     _t0 = time.monotonic()   # 1ターンの所要時間の起点（answer.duration_ms へ埋め込む）。
     explicit_lens, lens_source, lens_block, message = _resolve_lens(lens, message)
     conversation_id = _ensure_conversation(conversation_id, message, world, user_id)
-    # R1a: 履歴は**現在の質問を保存する前**に取得する（in-flight の質問を履歴に含めない）。
+    # 履歴は**現在の質問を保存する前**に取得する（in-flight の質問を履歴に含めない）。
     history = _history_pairs(conversation_id)
-    # R1b（Codex ネイティブ resume）: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に
+    # Codex ネイティブ resume: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に
     # 渡す（resume 判定用・他 provider は無視）。history と同じく質問保存より前に読む。
     codex_session_id = store.get_session_id(conversation_id)
     # 直近 assistant メッセージが記録した Codex 累計 usage（resume ターンの usage をターン差分に
     # するための前ターン値・CodexProvider だけが消費する）。
     codex_usage_prev_total = store.get_codex_usage_total(conversation_id)
-    # RV BLOCKER: トグル ON のターンは、**保存時点で**質問を個人扱いにし、**provider 実行前に**会話も個人扱いにする
+    # トグル ON のターンは、**保存時点で**質問を個人扱いにし、**provider 実行前に**会話も個人扱いにする
     #   （in-flight で共有されても質問が漏れない／clarify で _result に至らなくても未マークにならない）。
     _user_msg = store.add_message(conversation_id, "user", message, personal=personal)
     if personal:
@@ -1308,34 +1316,34 @@ def handle_message(session, message, world="v1",
     scope_meta = (_resolve_scope(message, world, scope_paths, layer, lens_source, lens_block, web_search,
                                  depth_profile, tools)
                  if knowledge else None)  # 明示＞推定＞全体（D）
-    # SC-6e: settings/sys_settings は呼び出し元（routers/chat.py）が受付段階で既に読んだ
+    # settings/sys_settings は呼び出し元（routers/chat.py）が受付段階で既に読んだ
     # スナップショットをそのまま使う（省略時のみここで読む・単体テスト等の後方互換）。
     settings = settings if settings is not None else store.get_settings(user_id)
-    # WEB-1: 実行に使う web_search は保存済み個人設定でなくこのチャットの希望のみ（ローカル複製
+    # 実行に使う web_search は保存済み個人設定でなくこのチャットの希望のみ（ローカル複製
     # だけを上書き・DB へは書き戻さない＝`_select_provider` の `s.get("codex_web_search")` 読み取り
     # 経路をそのまま再利用する）。呼び出し元が既に同じ上書きを済ませた settings を渡していても
     # 冪等（同じ値を重ねて上書きするだけ）。
     settings = {**settings, "codex_web_search": bool(web_search)}
-    # WEB-1 の唯一の読取点（get_provider）と同じ fresh snapshot を _dispatch（調べる深さ・
-    # SC-6c §3.2）へも共有する: 決定的レンズと agentic 経路が別世代の system_settings を
+    # get_provider と同じ fresh snapshot を _dispatch（調べる深さ・
+    # §3.2）へも共有する: 決定的レンズと agentic 経路が別世代の system_settings を
     # 見ないようにする。読み取り失敗はそのまま例外として伝播し、このターンを fail-closed にする
-    # （WEB-1 の既存契約と同じ・env フォールバックへは広げない）。
+    # （env フォールバックへは広げない）。
     sys_settings = sys_settings if sys_settings is not None else store._read_system_settings_fresh()
-    # SC-6e: 非agentic経路（_dispatch/_gather）が使う実効ツール判定用の可用性スナップショット。
+    # 非agentic経路（_dispatch/_gather）が使う実効ツール判定用の可用性スナップショット。
     # 引数で渡されていれば（呼び出し元が受付時422判定と同時に計算済み）それを使い、無ければ
     # ここで1回だけ計算する（`_dispatch` 自体は DB/ネットワーク非依存の単体テスト対象のまま
     # 維持する）。knowledge オフは不要。
     if tools_availability is None:
         tools_availability = agentic_search.tool_availability() if knowledge else None
 
-    # Feature B: 個人ファイルを grep して事実テキスト/citation を準備（ON かつファイルが存在する場合）。
+    # 個人ファイルを grep して事実テキスト/citation を準備（ON かつファイルが存在する場合）。
     # 不変条件: grep は本人 uid の workspace 配下のみ。ES/Neo4j には書かない。
     personal_hits: list[dict] = []
     if personal:
         personal_hits = _personal_grep_hits(user_id, message, users_dir)
 
     def _dispatch_with_personal(lens, inp):
-        """共有 KB dispatch の結果に個人ヒットを注入する（Feature B）。"""
+        """共有 KB dispatch の結果に個人ヒットを注入する。"""
         env = _dispatch(session, lens, inp, world, scope_meta, sys_settings, tools_availability)
         if personal_hits:
             # 個人ヒットを facts に追記（AI への入力のみ・非永続化）。
@@ -1354,18 +1362,18 @@ def handle_message(session, message, world="v1",
               scope_meta=scope_meta,
               make_sources=((lambda docs: _sources(docs, world)) if knowledge else None),
               uid=user_id,
-              # HIGH 1 fix: agentic/plain 経路にも個人ヒットを伝搬（_dispatch_with_personal が呼ばれない経路用）。
+              # agentic/plain 経路にも個人ヒットを伝搬（_dispatch_with_personal が呼ばれない経路用）。
               personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
-              # R1a: 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。
-              # R1b: conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
+              # 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。
+              # conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
               history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
               codex_usage_prev_total=codex_usage_prev_total,
-              # SC-6e: ターン先頭で1回だけ計算した可用性 snapshot を provider まで渡す。
+              # ターン先頭で1回だけ計算した可用性 snapshot を provider まで渡す。
               tools_availability=tools_availability)
-    # S3: stream_message と同じく node を id で dedup 蓄積し、trace として保存する（非ストリーミング経路の対称）。
+    # stream_message と同じく node を id で dedup 蓄積し、trace として保存する（非ストリーミング経路の対称）。
     trace_nodes: dict = {}
     result = None
-    # SC-6e: 呼び出し元が既に組み立てた Provider（受付段階で _agentic_target_check→
+    # 呼び出し元が既に組み立てた Provider（受付段階で _agentic_target_check→
     # tool_availability を済ませた同一インスタンス）があればそれを使う——ここで改めて
     # get_provider() を呼ぶと、受付時と実行時で（admin 保存が挟まった場合）別世代の
     # settings/sys_settings から別の Provider を構築しうる。
@@ -1388,7 +1396,7 @@ def handle_message(session, message, world="v1",
     _pop_evidence_committed(env, trace_nodes)   # _result のサイドカーを trace へ折り込む（孤児イベント防止）
     env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない
     env["trace_version"] = 2
-    # R1b: CodexProvider が捕捉/更新した session id を返してきたら会話に永続化する（次ターンの resume 用）。
+    # CodexProvider が捕捉/更新した session id を返してきたら会話に永続化する（次ターンの resume 用）。
     # fail-open（保存に失敗しても本ターンの回答自体は成立させる＝次回は resume 不可のまま priming に委ねる）。
     _codex_sid = env.get("codex_session_id")
     if _codex_sid:
@@ -1397,23 +1405,23 @@ def handle_message(session, message, world="v1",
         except Exception as e:
             _log.warning("codex session id 保存に失敗（fail-open・次回は resume 不可で priming 継続）: %s", e)
 
-    # Feature B: 個人 citation を answer envelope に統合（「個人ファイル内ヒット」ラベル付き）。
-    # RV r2 MEDIUM: busy 応答（Codex 直列化で実行しなかったターン）には添付しない＝
+    # 個人 citation を answer envelope に統合（「個人ファイル内ヒット」ラベル付き）。
+    # busy 応答（Codex 直列化で実行しなかったターン）には添付しない＝
     # 実行していない回答に個人ファイル抜粋を永続・表示しない（personal トグルの個人扱い自体は下で維持）。
     _used_personal = False
     if personal_hits and not env.get("busy"):
         env["personal_sources"] = _personal_citations(personal_hits)
         _used_personal = True
 
-    # Feature C: Codex がファイルを書いた場合も contains_personal_workspace を立てる。
+    # Codex がファイルを書いた場合も contains_personal_workspace を立てる。
     if env.get("codex_wrote_files"):
         _used_personal = True
-    # RV: 個人参照トグル ON のターンは、hit が無くても質問にファイル名等が残り得るため個人扱いにする
+    # 個人参照トグル ON のターンは、hit が無くても質問にファイル名等が残り得るため個人扱いにする
     #   （toggle ON no-hit の漏洩を塞ぐ・sanitized で伏字＋通常共有をブロック）。
     if personal:
         _used_personal = True
 
-    # BLOCKER-1 fix: 個人コンテンツを使った場合は assistant message 保存の BEFORE にフラグを立てる。
+    # 個人コンテンツを使った場合は assistant message 保存の BEFORE にフラグを立てる。
     # フラグ書き込みに失敗したら例外を再 raise（fail-closed）し、個人内容を含む回答を保存しない。
     if _used_personal:
         store.set_contains_personal_workspace(conversation_id)
@@ -1442,15 +1450,15 @@ def stream_message(session, message, world="v1",
     本関数は会話の用意・永続だけを担い、`_result` を `answer` イベントに変換して返す（agents.py 参照）。
     `knowledge=False`（既定）＝検索せず素の会話。`True` で社内資料を参照（C: `scope_paths` で範囲を絞る）。
     `layer`（省略可・既定 `None`＝`"both"`・knowledge時のみ）: 探す対象（調べ方ブロック §3.4）。
-    `lens`（省略可・既定 `None`＝自動・knowledge時のみ）: 調べ方ブロックの明示指定（SC-6b §3.1）。
+    `lens`（省略可・既定 `None`＝自動・knowledge時のみ）: 調べ方ブロックの明示指定（§3.1）。
     メッセージ先頭のスラッシュ接頭辞（1回限りの明示）はこの値より優先する（`_resolve_lens` 参照）。
-    `personal=True`（Feature B）＝本人の個人ファイルも grep して事実+引用に含める。
+    `personal=True`＝本人の個人ファイルも grep して事実+引用に含める。
     不変条件: 個人ファイルは ES/Neo4j に入れない。本人のみ参照可。OFF 時は従来どおり。
-    `web_search=False`（既定・WEB-1）: このチャットで Codex の Web 検索を希望するか（`handle_message`
+    `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか（`handle_message`
     と同じ契約・保存済み個人設定 `codex_web_search` 列は実行には使わない）。
-    `depth_profile`（省略可・既定 `None`＝`"standard"`・knowledge時のみ・SC-6c §3.2）:
+    `depth_profile`（省略可・既定 `None`＝`"standard"`・knowledge時のみ・§3.2）:
     `handle_message` と同じ契約（調べる深さ）。
-    `tools`（省略可・既定 `None`＝全 ON・knowledge時のみ・SC-6e §3.6）: `handle_message` と同じ契約
+    `tools`（省略可・既定 `None`＝全 ON・knowledge時のみ・§3.6）: `handle_message` と同じ契約
     （検索経路トグル）。
     `tools_availability`（省略可・既定 `None`）: `handle_message` と同じ契約——省略時のみ本関数が
     自分で `agentic_search.tool_availability()` を計算する。
@@ -1471,15 +1479,15 @@ def stream_message(session, message, world="v1",
     _t0 = time.monotonic()   # 1ターンの所要時間の起点（answer.duration_ms へ埋め込む・途中停止は未保存＝計測対象外）。
     explicit_lens, lens_source, lens_block, message = _resolve_lens(lens, message)
     conversation_id = _ensure_conversation(conversation_id, message, world, user_id)
-    # R1a: 履歴は**現在の質問を保存する前**に取得する（in-flight の質問を履歴に含めない）。
+    # 履歴は**現在の質問を保存する前**に取得する（in-flight の質問を履歴に含めない）。
     history = _history_pairs(conversation_id)
-    # R1b（Codex ネイティブ resume）: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に
+    # Codex ネイティブ resume: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に
     # 渡す（resume 判定用・他 provider は無視）。history と同じく質問保存より前に読む。
     codex_session_id = store.get_session_id(conversation_id)
     # 直近 assistant メッセージが記録した Codex 累計 usage（resume ターンの usage をターン差分に
     # するための前ターン値・CodexProvider だけが消費する）。
     codex_usage_prev_total = store.get_codex_usage_total(conversation_id)
-    # RV BLOCKER: トグル ON のターンは、**保存時点で**質問を個人扱いにし、**provider 実行前に**会話も個人扱いにする
+    # トグル ON のターンは、**保存時点で**質問を個人扱いにし、**provider 実行前に**会話も個人扱いにする
     #   （in-flight で共有されても質問が漏れない／clarify で _result に至らなくても未マークにならない）。
     _user_msg = store.add_message(conversation_id, "user", message, personal=personal)
     if on_user_saved is not None:
@@ -1501,32 +1509,32 @@ def stream_message(session, message, world="v1",
     scope_meta = (_resolve_scope(message, world, scope_paths, layer, lens_source, lens_block, web_search,
                                  depth_profile, tools)
                  if knowledge else None)  # 明示＞推定＞全体（D）
-    # SC-6e: settings/sys_settings は呼び出し元（routers/chat.py）が受付段階で既に読んだ
+    # settings/sys_settings は呼び出し元（routers/chat.py）が受付段階で既に読んだ
     # スナップショットをそのまま使う（省略時のみここで読む・単体テスト等の後方互換）。
     settings = settings if settings is not None else store.get_settings(user_id)
-    # WEB-1: 実行に使う web_search は保存済み個人設定でなくこのチャットの希望のみ（ローカル複製
+    # 実行に使う web_search は保存済み個人設定でなくこのチャットの希望のみ（ローカル複製
     # だけを上書き・DB へは書き戻さない＝`_select_provider` の `s.get("codex_web_search")` 読み取り
     # 経路をそのまま再利用する）。呼び出し元が既に同じ上書きを済ませた settings を渡していても
     # 冪等（同じ値を重ねて上書きするだけ）。
     settings = {**settings, "codex_web_search": bool(web_search)}
-    # WEB-1 の唯一の読取点（get_provider）と同じ fresh snapshot を _dispatch（調べる深さ・
-    # SC-6c §3.2）へも共有する: 決定的レンズと agentic 経路が別世代の system_settings を
+    # get_provider と同じ fresh snapshot を _dispatch（調べる深さ・
+    # §3.2）へも共有する: 決定的レンズと agentic 経路が別世代の system_settings を
     # 見ないようにする。読み取り失敗はそのまま例外として伝播し、このターンを fail-closed にする
-    # （WEB-1 の既存契約と同じ・env フォールバックへは広げない）。
+    # （env フォールバックへは広げない）。
     sys_settings = sys_settings if sys_settings is not None else store._read_system_settings_fresh()
-    # SC-6e: 非agentic経路（_dispatch/_gather）が使う実効ツール判定用の可用性スナップショット
+    # 非agentic経路（_dispatch/_gather）が使う実効ツール判定用の可用性スナップショット
     # （`handle_message` と同じ契約——引数で渡されていればそれを使い、無ければここで計算する）。
     if tools_availability is None:
         tools_availability = agentic_search.tool_availability() if knowledge else None
 
-    # Feature B: 個人ファイルを grep して事実テキスト/citation を準備（ON かつファイルが存在する場合）。
+    # 個人ファイルを grep して事実テキスト/citation を準備（ON かつファイルが存在する場合）。
     # 不変条件: grep は本人 uid の workspace 配下のみ。ES/Neo4j には書かない。
     personal_hits: list[dict] = []
     if personal:
         personal_hits = _personal_grep_hits(user_id, message, users_dir)
 
     def _dispatch_with_personal(lens, inp):
-        """共有 KB dispatch の結果に個人ヒットを注入する（Feature B）。"""
+        """共有 KB dispatch の結果に個人ヒットを注入する。"""
         env = _dispatch(session, lens, inp, world, scope_meta, sys_settings, tools_availability)
         if personal_hits:
             env["_personal_facts"] = _personal_facts(personal_hits, inp)
@@ -1543,29 +1551,29 @@ def stream_message(session, message, world="v1",
         scope_meta=scope_meta,
         make_sources=((lambda docs: _sources(docs, world)) if knowledge else None),
         uid=user_id,
-        # HIGH 1 fix: agentic/plain 経路にも個人ヒットを伝搬。
+        # agentic/plain 経路にも個人ヒットを伝搬。
         personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
         stop_event=stop_event,
-        # R1a: 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。
-        # R1b: conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
+        # 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。
+        # conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
         history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
         codex_usage_prev_total=codex_usage_prev_total,
-        # SC-6e: ターン先頭で1回だけ計算した可用性 snapshot を provider まで渡す。
+        # ターン先頭で1回だけ計算した可用性 snapshot を provider まで渡す。
         tools_availability=tools_availability,
     )
-    # S3: 「思考の流れ」を messages.trace に保存し、会話ロード時に右ペインへ静的復元できるようにする
+    # 「思考の流れ」を messages.trace に保存し、会話ロード時に右ペインへ静的復元できるようにする
     #   （node は id 単位で複数回更新され得るので id で dedup・最終状態のみ保持＝dict は挿入順を保つので
     #   初出順のまま最新状態で並ぶ）。question は #flow の対象外（別カードで表示）なので trace に含めない。
     trace_nodes: dict = {}
-    # SC-6e: 呼び出し元が既に組み立てた Provider（受付段階で _agentic_target_check→
+    # 呼び出し元が既に組み立てた Provider（受付段階で _agentic_target_check→
     # tool_availability を済ませた同一インスタンス）があればそれを使う（handle_message と同じ理由）。
     _provider = provider if provider is not None else get_provider(settings, system_settings=sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set():
             # provider が停止要求を受けて（CodexProvider は購読プロセスを kill・他は次の yield で気づく）
             # 何らかのイベント（_result 含む）を返してきても、それは保存しない＝assistant は永続しない。
-            # RV MEDIUM（2026-07-03再検証）: clarify と同格に監査へ残す（assistant 未保存＝message_id_assistant=None・
-            # stopped:true）。停止前は監査から丸ごと消えていた＝「誰が何を聞いて途中で止めたか」が追えなかった。
+            # clarify と同格に監査へ残す（assistant 未保存＝message_id_assistant=None・
+            # stopped:true）——「誰が何を聞いて途中で止めたか」を監査から追えるようにするため。
             _audit_chat_turn(user_id, conversation_id, settings, lens="stopped",
                              user_msg_id=_user_msg["id"], assistant_msg_id=None, world=world,
                              scope_paths=(scope_meta or {}).get("scope_paths"), personal=personal,
@@ -1578,7 +1586,7 @@ def stream_message(session, message, world="v1",
             _ev_committed_node = _pop_evidence_committed(env, trace_nodes)
             env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない
             env["trace_version"] = 2
-            # R1b: CodexProvider が捕捉/更新した session id を会話に永続化する（次ターンの resume 用）。
+            # CodexProvider が捕捉/更新した session id を会話に永続化する（次ターンの resume 用）。
             # fail-open（保存に失敗しても本ターンの回答自体は成立させる＝次回は resume 不可のまま priming に委ねる）。
             _codex_sid = env.get("codex_session_id")
             if _codex_sid:
@@ -1587,21 +1595,21 @@ def stream_message(session, message, world="v1",
                 except Exception as e:
                     _log.warning("codex session id 保存に失敗（fail-open・次回は resume 不可で priming 継続）: %s", e)
 
-            # Feature B: 個人 citation を answer envelope に統合。
-            # RV r2 MEDIUM: busy 応答には添付しない（非ストリーミング側と対・理由はそちらのコメント参照）。
+            # 個人 citation を answer envelope に統合。
+            # busy 応答には添付しない（非ストリーミング側と対・理由はそちらのコメント参照）。
             _used_personal = False
             if personal_hits and not env.get("busy"):
                 env["personal_sources"] = _personal_citations(personal_hits)
                 _used_personal = True
 
-            # Feature C: Codex がファイルを書いた場合も contains_personal_workspace を立てる。
+            # Codex がファイルを書いた場合も contains_personal_workspace を立てる。
             if env.get("codex_wrote_files"):
                 _used_personal = True
-            # RV: 個人参照トグル ON のターンは hit が無くても質問にファイル名等が残り得るため個人扱い。
+            # 個人参照トグル ON のターンは hit が無くても質問にファイル名等が残り得るため個人扱い。
             if personal:
                 _used_personal = True
 
-            # BLOCKER-1 fix: 個人コンテンツを使った場合は assistant message 保存の BEFORE にフラグを立てる。
+            # 個人コンテンツを使った場合は assistant message 保存の BEFORE にフラグを立てる。
             # フラグ書き込みに失敗したら例外を再 raise（fail-closed）し、個人内容を含む回答を保存しない。
             if _used_personal:
                 store.set_contains_personal_workspace(conversation_id)
@@ -1622,9 +1630,8 @@ def stream_message(session, message, world="v1",
                 yield _ev_committed_node
             yield {"type": "answer", "conversation_id": conversation_id, "message": msg}
         elif ev["type"] == "question":
-            # S1（ask_user-improvements.md）: 確認カードを assistant メッセージとして**永続化**する
-            #   ＝ページを離れて履歴を開き直しても後から答えられる（従来は監査記録＋素通しのみで、
-            #   自分の質問文だけ残り確認カードは消えていた）。content=prompt / answer に question payload /
+            # 確認カードを assistant メッセージとして**永続化**する
+            #   ＝ページを離れて履歴を開き直しても後から答えられる。content=prompt / answer に question payload /
             #   trace はここまでに溜めた思考ノード（clarify ターンでも「思考の流れ」を右ペインへ静的復元
             #   できる副産物）。両経路（通常 /chat/stream・背景 /chat/turns=覗き窓のバッファ経由）とも
             #   本関数 stream_message を通るため、ここ1箇所の保存で両方に効く。

@@ -30,7 +30,7 @@ EMBEDDING_INPUT_ALGORITHM_ID = "utf8-window-mean-l2-v2"
 _MODELS = {"openai": ("text-embedding-3-small", 1536),
            "gemini": ("gemini-embedding-001", 1536),
            "ollama": ("nomic-embed-text", 768)}
-# LOG-2（2026-09-03）: 専用ログ（sherpa.embed）へルーティングする（`sherpa/log_setup.py` の登録表参照）。
+# 専用ログ（sherpa.embed）へルーティングする（`sherpa/log_setup.py` の登録表参照）。
 _log = logging.getLogger("sherpa.embed")
 
 
@@ -45,7 +45,7 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None) ->
     プロバイダを変更すると `_chunk_key`/`_meta` 不一致→`needs_reindex` が次回 sync で索引を
     作り直す（既存機構・`es_index.py:328-352`）。`_MODELS` 次元表は無変更。
 
-    `system_settings`（省略可）: RV2（FBK-1・2026-09-01）呼び出し側が既に読んだスナップショットを
+    `system_settings`（省略可）: 呼び出し側が既に読んだスナップショットを
     渡すと、それをそのまま使う（省略時だけ自分で読む）。`es_index.py` は本関数と
     `cloud_selected_but_unavailable()` を同じスナップショットで呼ぶ——別々に読むと、その間の
     admin 更新で「解決できた（旧鍵）が理由判定は不可用（新状態）」のような食い違いが起こりうる。
@@ -55,7 +55,7 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None) ->
     # key/model の解決に使うのと同じ system_settings スナップショットを `select_provider()` へ
     # 明示的に渡し、O() クロージャからも参照できるようにする（openai だけは送信時
     # （`_embed_batch`）にも同じ値を使って接続先を解決するため cfg に含めて持ち出す）。
-    # RV1（FBK-1・2026-09-01）: 読取失敗を `{}` へ縮退させない——`{}` は「cloud_provider 未選択」に
+    # 読取失敗を `{}` へ縮退させない——`{}` は「cloud_provider 未選択」に
     # 化け、`llm.select_provider` の auto 解決が Ollama fallback（`llm.resolve_auto_provider` 参照）
     # を復活させてしまう（読取不能と未選択は別状態）。`graph_extract.available`/`intent_llm._cfg`
     # と同じく、ここでも例外はそのまま呼び出し元へ伝播させる（`sherpa/ingest/worker.py` の
@@ -107,7 +107,7 @@ def cloud_selected_but_unavailable(system_settings: dict | None = None) -> bool:
     """`cfg()` が None を返した理由が「クラウドを一度も選んでいない（通常の埋め込み未設定＝
     BM25 のみで良い）」でなく「A7 で明示選択したクラウドが解決できない」ことを示すか。
 
-    RV1（FBK-1・2026-09-01）: `es_index.py` はこれで両者を区別し、後者のときは再索引を失敗させる
+    `es_index.py` はこれで両者を区別し、後者のときは再索引を失敗させる
     （既存索引を BM25-only で上書きしない）・検索は構造化された明示エラーを返す——`cfg() is None`
     だけでは「クラウド未選択」と「選択済みだが認証/接続不可」の区別が付かず、後者を通常の
     graceful degrade（BM25-only）に紛れ込ませてしまう。
@@ -285,7 +285,7 @@ def _embed_batch(texts: list, c: dict) -> list | None:
 def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None = None) -> list | None:
     """テキスト群 → ベクトル群（順序対応）。**一部でも失敗したら None**（ベクトル無効＝BM25 へ）。
 
-    S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: バッチループ全体を
+    バッチループ全体を
     `metering.acc_begin()`/`acc_end()` で囲み、`kind='embed'` で1回の呼び出しにつき1行記録する
     （calls＝HTTP が応答を返したバッチの数・None を返す場合でも記録する＝トークンは消費済み）。
     """

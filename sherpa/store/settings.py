@@ -1,8 +1,7 @@
 """ユーザー設定＋全体設定（system_settings・キャッシュ含む）。
 
-フェーズ4 S7（2026-07-02-リファクタリング計画.md）: `sherpa/store/__init__.py` から純移動。
 `set_system_settings` 内の `_audit_insert` 呼び出しは facade 属性経由の実行時解決（詳細は
-同関数の docstring 参照・計画の「危険な継ぎ目 (a)-3」方式(i)）。
+同関数の docstring 参照）。
 """
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "資料を根拠に答え、根拠は資料のパス（必要なら箇所）で示してください。"
     "資料に無いことを補うときは『推定』と明示し、確定した事実と分けて書いてください。"
 )
-# 旧既定文（2026-09-10 以前）。「既定に戻す」や無編集保存で DB に永続化された行がこれと完全一致する
+# 旧既定文。「既定に戻す」や無編集保存で DB に永続化された行がこれと完全一致する
 # ときだけ、読取時に現行の既定へ読み替える（DB は書き換えない・独自文と空文字はそのまま）。
 _LEGACY_DEFAULT_SYSTEM_PROMPTS = frozenset({
     "憶測で回答しないでください。不明な点は不明と伝えてください。"
@@ -29,11 +28,11 @@ _LEGACY_DEFAULT_SYSTEM_PROMPTS = frozenset({
 })
 
 # 設定の既定値（行が無いときに使う）。agent=None＝未設定→呼び出し側が env SHERPA_AGENT にフォールバック。
-# RV MED（2026-07-16 Codex RV 1巡目 F1/F4/F6 是正）: `bedrock_verified_models` はここに**含めない**
+# `bedrock_verified_models` はここに**含めない**
 # （`user_settings` の列でも `_SETTINGS_FIELDS` の一員でもない＝専用テーブル `bedrock_verified_models`
 # に分離した・詳細は `add_bedrock_verified_models` の docstring と sherpa/store/db.py の該当 DDL コメント
 # 参照）。`update_settings(uid, bedrock_verified_models=[...])` は素通りせず単に無視される
-# （`_SETTINGS_FIELDS` に無い kwarg は upd に入らない）＝F6 の不変条件（記録は verify/列挙成功のみ）が
+# （`_SETTINGS_FIELDS` に無い kwarg は upd に入らない）＝この不変条件（記録は verify/列挙成功のみ）が
 # コードの構造そのもので保証される。
 # openai_model/gemini_model/ollama_model/codex_model/ollama_url の既定は空文字（未設定）。理由は
 # `agent` フィールドと同じ罠（`update_settings` の docstring 参照）: ハードコード既定を
@@ -56,24 +55,23 @@ _SETTINGS_DEFAULT = {"agent": None, "codex_reasoning": "low", "codex_model": "",
                      "system_prompt": DEFAULT_SYSTEM_PROMPT}
 _SETTINGS_FIELDS = tuple(_SETTINGS_DEFAULT)
 
-# RV MED（F3・2026-07-16再検証）: bedrock_verified_models の上限（無制限成長を防ぐ）。実アカウントの
+# bedrock_verified_models の上限（無制限成長を防ぐ）。実アカウントの
 # anthropic 推論プロファイル数の一桁上に取り、1回の列挙（GET /settings/bedrock-models）が cap を
 # 超えて「取得できたのに保存できない」ID が出る現実的な可能性を消す。
-# RV MED（N3・2026-07-16 Codex RV 3巡目再検証）: それでも cap を超えるケースはゼロではない
+# それでも cap を超えるケースはゼロではない
 # （AWS `ListInferenceProfiles` は API 仕様上 `maxResults` に最大 1000 を指定でき、本実装は
 # ページングをせず1回の応答をそのまま使うため、大きなアカウントでは1回の列挙だけで cap=200 を
 # 超えうる）。cap 値をいくつに取っても原理的に再発しうるため、根治は cap の調整ではなく
 # `add_bedrock_verified_models` の返り値（実際に保持された ID）で応答/キャッシュ側を
 # フィルタすること（呼び出し側＝sherpa/routers/system.py 参照）。
-# RV MED（R4-1・2026-07-16 Codex RV 4巡目再検証・最重要）: 当初は cap 超過時に「古い方（LRU）から
-# 捨てる」方式だったが、それだと**一度「保存可能」と返した ID を後から取り消しうる**実害が実際に
-# 成立した（repro: cap ちょうど満杯の状態で新規 verify V が成功→最も古い1件 L1 が evict されて V が
-# 記録される→次のキャッシュヒット再記録で「列挙キャッシュに残っている旧 L1..L200」が再送され、
-# それらが「最近」側へ寄ることで今度は V が押し出される→直前に verify 成功した V の PUT が 422 になる）。
-# 「返した ID は必ず保存できる」という中核契約への直接違反であり、cap 値をどこに置いても原理的に
-# 再発しうる（LRU 方式そのものが問題の根）。是正: **単調（monotonic）保持**に変更する＝既存 ID は
-# 絶対に evict しない・新規 ID は容量に空きがある分だけ追加する（順序も「追加された順」のまま・
-# 再確認（列挙のキャッシュヒット再記録等）による並び替えはしない＝実質 LRU を廃止）。per-user 200件は
+# cap 超過時に「古い方（LRU）から捨てる」方式だと、**一度「保存可能」と返した ID を後から
+# 取り消しうる**実害が起きる（repro: cap ちょうど満杯の状態で新規 verify V が成功→最も古い1件 L1 が
+# evict されて V が記録される→次のキャッシュヒット再記録で「列挙キャッシュに残っている旧 L1..L200」が
+# 再送され、それらが「最近」側へ寄ることで今度は V が押し出される→直前に verify 成功した V の PUT が
+# 422 になる）。「返した ID は必ず保存できる」という中核契約への直接違反であり、cap 値をどこに置いても
+# 原理的に再発しうる（LRU 方式そのものが問題の根）。そのため **単調（monotonic）保持**にしてある＝
+# 既存 ID は絶対に evict しない・新規 ID は容量に空きがある分だけ追加する（順序も「追加された順」の
+# まま・再確認（列挙のキャッシュヒット再記録等）による並び替えはしない）。per-user 200件は
 # 実アカウントの anthropic 推論プロファイル数から見て実運用で到達し得ない上限だが、万一満杯になっても
 # 新規 verify は ok:false（保存枠不足）で正直に失敗する（`_bedrock_model_id_valid` の正本を偽らない）。
 _BEDROCK_VERIFIED_MODELS_MAX = 200
@@ -104,10 +102,9 @@ def _bedrock_key_fingerprint(key: str | None) -> str:
     """キー値そのものを持たない fingerprint（sha256 先頭16桁）。キャッシュ/記録 entry が
     どのキーに対する結果かを識別するためだけに使う（値の復元は不可能・十分な衝突耐性）。
 
-    RV MED（N1・2026-07-16 Codex RV 3巡目再検証）: `sherpa/routers/system.py` から本モジュールへ
-    移設（`add_bedrock_verified_models` が同一トランザクション内で使う必要があるため・facade
+    `add_bedrock_verified_models` が同一トランザクション内で使う。facade
     経由で `sherpa.store._bedrock_key_fingerprint`／`sherpa.routers.system._bedrock_key_fingerprint`
-    としても引き続き参照できる＝既存 import・テストの互換を保つ）。
+    としても参照できる（既存 import・テストとの互換を保つ）。
     """
     return hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:16]
 
@@ -116,7 +113,7 @@ def get_settings(user_id="admin") -> dict:
     """ユーザの頭脳/モデル/キー設定（行が無ければ既定）。**キーも含む＝サーバ内部用**。
 
     `bedrock_verified_models`（実在確認済み Bedrock モデルID一覧）は専用テーブルへの追加 SELECT で
-    合成する（`user_settings` には列を持たない・F1/F4/F6 是正・`add_bedrock_verified_models` 参照）。
+    合成する（`user_settings` には列を持たない・`add_bedrock_verified_models` 参照）。
     呼び出し側 API（返り値に `bedrock_verified_models` キーが入ること）は不変。
     """
     _ensure()
@@ -150,23 +147,21 @@ def update_settings(user_id="admin", **fields) -> dict:
     SET から除外すれば、この保存が実際に何を書くかはそもそもタイミングに依存しない。
 
     `bedrock_verified_models` は `_SETTINGS_FIELDS` に無い＝`fields` に渡しても無視される（専用テーブル
-    は `add_bedrock_verified_models` だけが書く・F6 是正）。"""
+    は `add_bedrock_verified_models` だけが書く）。"""
     cur = get_settings(user_id)
     upd = {k: v for k, v in fields.items() if k in _SETTINGS_FIELDS and v is not None}
-    # 空文字＝クリア指示（openai/gemini/bedrock は書込専用キー・intent_model は既定モデルに戻す＝S0）
+    # 空文字＝クリア指示（openai/gemini/bedrock は書込専用キー・intent_model は既定モデルに戻す）
     for k in ("openai_api_key", "gemini_api_key", "bedrock_api_key", "intent_model"):
         if k in fields and fields[k] == "":
             upd[k] = None
     merged = {**cur, **upd}
-    # RV HIGH（2026-08-18 Codex RV 2巡目 指摘1）: 以前は未設定（行が無い＝agent=None）のまま `agent` を
-    # 含まない PUT /settings を1回でも踏むと、無条件で "heuristic" が永続化されていた（RV1是正）。
-    # 続く RV1是正の `merged["agent"] or agent_constructs.default_agent()` は "heuristic" 直書きより
-    # マシだが、**その瞬間の PATH/env に依存する値を DB へ焼き付ける**問題は残る＝実引き金は
+    # `agent` を含まない PUT /settings を無条件に "heuristic" や
+    # `merged["agent"] or agent_constructs.default_agent()`（その瞬間の PATH/env に依存する値）で
+    # 埋めると、DB へ**その瞬間の解決結果**を焼き付けてしまう＝実引き金は
     # `web/chat/menus.js::saveModel()` が `{codex_model: v}` だけを PUT すること（利用者は頭脳を
     # 選んでいないのに保存のたびに `agent` が確定してしまう）。後から Codex CLI が消えた／
     # OPENAI_API_KEY を入れた／起動方法で PATH が変わった、といった環境変化があっても、DB に
-    # 焼き付いた古い選択がそのまま使われ続ける（症状の形は違うが RV1是正が塞ごうとしたものと同じ
-    # 「一度書き込まれると抜けられない」問題が値を変えて再発する）。
+    # 焼き付いた古い選択がそのまま使われ続ける（「一度書き込まれると抜けられない」問題）。
     #
     # 直し方: `agent` は**明示された値**（今回の `fields` に含まれていた、または既存行に既に
     # 入っていた）だけを保存し、一度も選ばれていないなら DB 上も「未設定」のままにする。列は
@@ -250,16 +245,16 @@ def add_bedrock_verified_models(user_id: str, ids: list[str],
     """検証（`POST /settings/bedrock-models/verify`）や列挙（`GET /settings/bedrock-models`）で
     実在確認できたモデルIDを専用テーブル `bedrock_verified_models` へ記録する。
 
-    RV MED（2026-07-15→2026-07-16再検証）: `_bedrock_model_id_valid`（sherpa/routers/system.py）の
+    `_bedrock_model_id_valid`（sherpa/routers/system.py）の
     membership 判定の正本＝ここに記録が無ければ、形式が正しいだけの ID は `PUT /settings` で保存
-    できない（BEDROCK_MODEL_ID_RE.fullmatch のみで許可していた旧実装の穴を塞ぐ）。
+    できない（BEDROCK_MODEL_ID_RE.fullmatch だけでは架空 ID を許可してしまう穴を塞ぐ）。
 
-    **`user_settings` には一切触れない**（F1/F4/F6 是正・db.py の該当 DDL コメント参照）。
+    **`user_settings` には一切触れない**（db.py の該当 DDL コメント参照）。
     「INSERT ... ON CONFLICT DO NOTHING で行確保 → SELECT ... FOR UPDATE → （fingerprint 確認）→
     （容量が空いている分だけ）UPDATE」の流れで完全直列化する:
       1. まず空配列で行を確保する（無ければ作る・あれば no-op）。
       2. 直後の `SELECT ... FOR UPDATE` は、1で行の存在が保証されているため**必ず行をロックできる**
-         （F1 是正のかなめ＝行が無い状態で `FOR UPDATE` しても何もロックできず、2並行の初回呼び出しが
+         （行が無い状態で `FOR UPDATE` しても何もロックできず、2並行の初回呼び出しが
          両方 `[]` を読んで後勝ちで片方の記録が消える、という競合を防ぐ）。
       3. ロックした状態で読み→（`expected_key_fp` 指定時のみ）現在の `bedrock_api_key` を
          同一トランザクション内で再読取して fingerprint 比較→重複除去→**単調追加**（既存 ID は
@@ -267,14 +262,14 @@ def add_bedrock_verified_models(user_id: str, ids: list[str],
          `UPDATE` 自体を省略）。
     この間、他の並行呼び出しは 2 の `FOR UPDATE` でブロックされ、1の `commit` 後に自分の読み取りへ
     進む＝直列化される。重複は除く。上限 `_BEDROCK_VERIFIED_MODELS_MAX` 件（超過分の新規 ID は
-    **追加しない**＝単調保持・`_BEDROCK_VERIFIED_MODELS_MAX` のコメントの R4-1 参照。既存 ID を
-    evict する LRU 方式は「一度『保存可能』と返した ID を後から取り消しうる」実害があったため廃止した）。
+    **追加しない**＝単調保持・`_BEDROCK_VERIFIED_MODELS_MAX` のコメント参照。既存 ID を
+    evict する LRU 方式は「一度『保存可能』と返した ID を後から取り消しうる」実害があるため採らない）。
 
-    `expected_key_fp`（RV MED N1・2026-07-16 Codex RV 3巡目再検証）: 呼び出し側が「検証/列挙を
+    `expected_key_fp`: 呼び出し側が「検証/列挙を
     開始した時点」で観測した `bedrock_api_key` の fingerprint（`_bedrock_key_fingerprint`）。
     行ロック取得**後**・書込実行**前**に、同一トランザクション内で現在の `bedrock_api_key` を
-    読み直して比較する（呼び出し側で「開始前 fp」と「完了後に別途 SELECT した fp」を比べる旧方式は、
-    比較後・記録前の間に別トランザクションのキー変更がコミットされる TOCTOU を埋め切れなかった＝
+    読み直して比較する（呼び出し側で「開始前 fp」と「完了後に別途 SELECT した fp」を比べるだけでは、
+    比較後・記録前の間に別トランザクションのキー変更がコミットされる TOCTOU を埋め切れない＝
     ここでの再読取が「実際に記録する」操作に最も近く、これより後に長時間ブロックする処理が無いため
     実質的に原子的とみなせる）。不一致なら**何も記録せず** `None` を返す。`expected_key_fp=None`
     （既定）なら fingerprint 検証をスキップする（内部/テスト用途・従来どおり無条件で記録する）。
@@ -282,7 +277,7 @@ def add_bedrock_verified_models(user_id: str, ids: list[str],
     fingerprint("") 同士の比較になり常に一致する＝従来どおり素通りする（env はランタイム中に
     変わらない前提）。
 
-    返り値（RV MED N3・2026-07-16 Codex RV 3巡目再検証→R4-1・4巡目再検証で単調保持に対応）: `ids`
+    返り値: `ids`
     のうち、この呼び出し後にテーブルへ実際に存在する ID のサブセット（既存分は無条件でここに含まれる
     ＝単調保持なので消えることが無い。新規分は容量に空きがあって実際に追加できた分だけ含まれる）。
     `None` は fingerprint 不一致で何も記録していない場合。呼び出し側（sherpa/routers/system.py）は
@@ -308,7 +303,7 @@ def add_bedrock_verified_models(user_id: str, ids: list[str],
                 return None
         current = list(row["ids"] or []) if row else []
         current_set = set(current)
-        # RV MED（R4-1）: 単調保持。既存 ID には一切触れない（evict しない・並び替えない）。新規
+        # 単調保持。既存 ID には一切触れない（evict しない・並び替えない）。新規
         # ID のみ、容量（cap - 既存件数）に収まる分だけ末尾に追加する。容量が無ければ追加しない
         # （evict して押し込むのではなく、素直に「入らない」として retained から除外する）。
         room = _BEDROCK_VERIFIED_MODELS_MAX - len(current)
@@ -325,7 +320,7 @@ def add_bedrock_verified_models(user_id: str, ids: list[str],
 
 
 # ==== 全体設定（system_settings・admin 書込のみ・監査つき）====
-# docs/proposals/2026-07-08-設定分離とUI整備.md S1。全ユーザーに効くシステム全体設定。
+# 全ユーザーに効くシステム全体設定。
 # 優先順は system_settings > env > コード既定（呼び出し側＝arms/api 層で解決する）。
 # 認可（admin）は呼び出し側（api.py の `_require_admin`）で済ませてから set_system_settings を呼ぶ前提。
 
@@ -576,16 +571,16 @@ def set_system_settings(uid, updates: dict, secret_keys: frozenset | None = None
     成立し得る。新しい `in_txn` フックを追加する時は、この順序契約（lock→更新→監査）を
     崩さないこと。
 
-    2026-07-08 RV High 対応: 設定変更（before スナップショット→適用）と監査行 INSERT を**同一トランザクション**
-    で実行する（旧: commit→別接続 audit→失敗時に compensate で復元、という方式は (a) commit〜復元の間に
+    設定変更（before スナップショット→適用）と監査行 INSERT を**同一トランザクション**
+    で実行する（commit→別接続 audit→失敗時に compensate で復元、という方式だと (a) commit〜復元の間に
     未監査の値が `/config` 等から見える (b) その間のプロセスが落ちると未監査変更が残留する (c) 並行更新を
-    補償復元が上書きする、という3つの穴を抱えていた）。`_audit_insert` の例外は `with _connect()` を抜ける際に
+    補償復元が上書きする、という3つの穴が残る）。`_audit_insert` の例外は `with _connect()` を抜ける際に
     psycopg のトランザクション契約に従い自動 rollback される＝設定変更もまとめて取り消される（fail-closed を
     「補償」ではなく「原子性」で実現＝announcement CRUD の compensate 方式とは異なる）。監査失敗はそのまま
     呼び出し側（api.py）へ例外として伝播し、500 に変換される。返り値は適用した updates（失敗時は返らない）。
     キャッシュ無効化は commit 成功後（with を抜けた後）に1回だけ行う。
 
-    フェーズ4 S7（2026-07-02-リファクタリング計画.md「危険な継ぎ目 (a)-3」方式(i)）: 直下の `_audit_insert`
+    直下の `_audit_insert`
     呼び出しは `from .audit import _audit_insert` のようなモジュールレベル import を**使わず**、
     facade（`sherpa.store` パッケージ）の属性 `_facade._audit_insert` 経由で**実行時解決**する。
     理由: tests/api/test_system_settings.py（:295/:318 付近）が
@@ -603,7 +598,7 @@ def set_system_settings(uid, updates: dict, secret_keys: frozenset | None = None
     _ensure()
     from sherpa import store as _facade   # 上記 docstring 参照: 実行時解決（monkeypatch シーム維持）
     with _connect() as c:
-        # RV 是正（4巡目 #3）: `_ENV_SEED_LOCK` を env シード・追いつき移行と共有する（上の定数の
+        # `_ENV_SEED_LOCK` を env シード・追いつき移行と共有する（上の定数の
         # docstring 参照）。system_settings への複数行書込みを直列化し、`ollama_url`/
         # `ollama_allowlist` の行ロック取得順序が経路ごとに異なっていてもデッドロックしない。
         c.execute("SELECT pg_advisory_xact_lock(%s)", (_ENV_SEED_LOCK,))
@@ -638,7 +633,7 @@ def set_system_settings(uid, updates: dict, secret_keys: frozenset | None = None
 
 
 # 固定 advisory lock key（"SEED"）＝env→system_settings シード試行の直列化（`_AUDIT_CHAIN_LOCK` と同型）。
-# RV 是正（4巡目 #3）: 当初は「無くても安全な最適化」だったが、`ollama_url`/`ollama_allowlist` の
+# ロックが無いと、`ollama_url`/`ollama_allowlist` の
 # 2行にまたがる読み書き（seed の `ollama_allowlist_merge`・catch-up）が admin の
 # `set_system_settings`（`ollama_allowlist`→`ollama_url` の順で書く・`system_extras.py`
 # `admin_settings_put` 参照）と異なる順序（`ollama_url`→`ollama_allowlist`）で行ロックを取得すると
@@ -713,10 +708,10 @@ def seed_system_settings_once(updates: dict, guard_key: str,
     文字列）を `ollama_allowlist` の**現在値へ追記**する（`SELECT ... FOR UPDATE` で最新値を読み、
     追記して upsert・admin が既に登録した他のホストは失わない）。`updates` 自体に `ollama_allowlist`
     を含めてはならない（この経路が唯一の書込み元になる・呼び出し側は含めた場合 `ValueError`）。
-    RV 是正: 以前は `ollama_allowlist` を候補 dict の1キーとして独立に `ON CONFLICT DO NOTHING`
-    していたため、「allowlist 行だけ既存なら env URL は挿入されても allowlist 追記だけ競合で
+    `ollama_allowlist` を候補 dict の1キーとして独立に `ON CONFLICT DO NOTHING`
+    すると、「allowlist 行だけ既存なら env URL は挿入されても allowlist 追記だけ競合で
     落ちる」「URL 行だけ既存なら env URL は無視される一方、使われない host だけが認可される」という
-    非原子的な組合せが起こり得た。ここでは URL の実際の挿入結果を見てから allowlist を扱うため、
+    非原子的な組合せが起こり得る。ここでは URL の実際の挿入結果を見てから allowlist を扱うため、
     この2つは常にペアとして確定する（advisory xact lock が既にトランザクション全体を直列化して
     いるため、行ロックは主に読み取り一貫性のための防御）。
 
@@ -750,7 +745,7 @@ def seed_system_settings_once(updates: dict, guard_key: str,
         if ollama_allowlist_merge is not None:
             url_key, host_entry = ollama_allowlist_merge
             if url_key in applied and host_entry:
-                # RV 是正（4巡目 #3）: 先に行を確保（ON CONFLICT DO NOTHING）してから `FOR UPDATE` する。
+                # 先に行を確保（ON CONFLICT DO NOTHING）してから `FOR UPDATE` する。
                 # 行が未作成のまま `FOR UPDATE` しても何もロックできず、並行した admin の初回 INSERT を
                 # 古い（空配列前提の）値で上書きしてしまい得た（`add_bedrock_verified_models` と同じ
                 # 「確保→ロック」の型）。
@@ -791,9 +786,9 @@ def seed_system_settings_once(updates: dict, guard_key: str,
 
 def catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key: str) -> str:
     """既に env シード済みの環境（`seed_system_settings_once` の `ollama_allowlist_merge` 是正
-    より前に一度でも起動した環境）向けの、一度きりの追いつき評価（v2・簡素化裁定・RV 4巡目）。
+    より前に一度でも起動した環境）向けの、一度きりの追いつき評価（v2）。
 
-    裁定（4巡目コーディネータ）: この救済は「このセッション以前に旧版 seed を踏んだ既存展開」
+    この救済は「このセッション以前に旧版 seed を踏んだ既存展開」
     のための一度きりのもので、対象は実質 dev 環境のみ。複雑化するより **fail-closed** に倒す。
     v1（値一致だけを provenance とみなす方式）は、admin が URL を変えずに allowlist からその
     host だけを削除した操作を復活させてしまう穴があった（値の一致は「env 由来のまま」の証明に
@@ -826,7 +821,7 @@ def catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key: str) -> str:
             return "already_present"   # 既に評価済み（このトランザクションでは何も書いていない）
 
         # 証明の材料: system_settings に対する env シード／admin 更新の監査を全件見る。
-        # 重大バグ是正（RV 5巡目 #2）: `created_at` は「トランザクション**開始**時刻」
+        # `created_at` は「トランザクション**開始**時刻」
         # （db.py の `DEFAULT now()`）であり、確定（advisory lock 解放＝commit）の順序とは限らない。
         # advisory lock を先に取ったが後に開始した（＝created_at が新しい）トランザクションが先に
         # commit することはあり得ないが、逆に「先に開始したが lock 待ちで後から commit した」
@@ -873,7 +868,7 @@ def catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key: str) -> str:
             cur_row = c.execute(
                 "SELECT value FROM system_settings WHERE key='ollama_url' FOR UPDATE").fetchone()
             cur_url = str((cur_row["value"] if cur_row else None) or "")
-            # 重大バグ是正（RV 5巡目 #2）: 「以降に admin 更新が無い」ことの証明だけでは、audit を
+            # 「以降に admin 更新が無い」ことの証明だけでは、audit を
             # 経由しない書込み経路が将来増えた場合に穴になる（二重の安全網）。現在の `ollama_url`
             # の指紋が seed 監査に記録された指紋と一致することも必須にする（同じ接続先を指して
             # いれば表記ゆれ＝ポート省略の有無等があっても一致する・生 URL の文字列一致ではない）。

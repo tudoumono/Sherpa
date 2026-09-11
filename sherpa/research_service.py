@@ -1,4 +1,4 @@
-"""AI 下調べ検索（PART-4・`docs/proposals/2026-08-24-部品API設計.md` §「PART-4」・§8）。
+"""AI 下調べ検索（`docs/proposals/2026-08-24-部品API設計.md` §「PART-4」・§8）。
 
 チャットを介さない部品として、既存のチャット内 agentic search（`sherpa/agentic_search.py`）を
 直接呼ぶだけの薄い層。`graph_admin.ask_graph`（管理グラフ質問・agentic_search を直接使う既存の

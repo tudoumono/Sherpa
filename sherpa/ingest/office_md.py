@@ -6,7 +6,7 @@
 - .pptx: `ppt/slides/slideN.xml` のテキストを slide 順に。外部ライブラリ不要。
 - .xlsx: openpyxl（導入済）で document-ir 経由・シート内の表候補（`regions()`）ごとに値の表
   （`human_md.render_xlsx`）。
-- .pdf: テキスト層を抽出（バックエンド pypdf・requirements.txt に同梱既定・2026-07-08）。到達不可なら None＝「未対応」。
+- .pdf: テキスト層を抽出（バックエンド pypdf・requirements.txt に同梱既定）。到達不可なら None＝「未対応」。
 - .doc/.xls/.ppt（旧バイナリ）: `to_markdown` は直接は扱わない（None）。build_derived が legacy_backend（W0・
   LibreOffice 等）で先に OOXML へ前段変換し、MD 化は①OOXML へ委譲する（`arms/legacy_convert.py`）。
 
@@ -30,7 +30,7 @@ from xml.etree import ElementTree as ET
 from .. import json_io
 from . import text_kind
 
-# LOG-2（2026-09-03）: MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
+# MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
 # （`sherpa/log_setup.py` の登録表参照・worker.py と合流させ1系統にする）。
 _log = logging.getLogger("sherpa.ingest.convert")
 
@@ -43,9 +43,9 @@ RASTER_EVIDENCE_EXT = frozenset({".png", ".jpg", ".jpeg"})    # OCRなしで存�
 LEGACY_OFFICE_EXT = frozenset({".doc", ".xls", ".ppt"})
 EVIDENCE_EXT = frozenset({".xlsx", ".docx", ".pptx", ".pdf"}) | RASTER_EVIDENCE_EXT | LEGACY_OFFICE_EXT
 PDF_EXT = {".pdf"}                                            # PDF はテキスト層を抽出（同梱既定バックエンド pypdf）
-# ラスタ画像（視覚読み取りアーム `vision`＝VLM の対象・tesseract の `ocr` アームは撤去済 2026-07-08）。
-# **vision 有効 かつ VLM 実効可時のみ** MD化候補になる（既定 ooxml,pdf_text では画像は従来どおり
-# grep 専用の素ファイル＝挙動不変）。
+# ラスタ画像（視覚読み取りアーム `vision`＝VLM の対象。tesseract ベースの `ocr` アームは存在しない）。
+# **vision 有効 かつ VLM 実効可時のみ** MD化候補になる（既定 ooxml,pdf_text では画像は
+# grep 専用の素ファイル）。
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
 OFFICE_EXT = CONVERTIBLE_EXT | PDF_EXT | set(LEGACY_OFFICE_EXT)   # Office/PDF 一括（未対応含む）
 
@@ -63,7 +63,7 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     return v if lo <= v <= hi else default
 
 
-# Office/PDF 取り込みの入口サイズガード（MEM-1・2026-09-03・実環境 OOM 障害対応）。openpyxl は
+# Office/PDF 取り込みの入口サイズガード（実環境 OOM 障害対応）。openpyxl は
 # read_only=False で全ブックをオブジェクトツリーとして展開するため、原本サイズに対しピークメモリが
 # 数倍〜数十倍に達しうる（セル書式・共有文字列・結合セル等の付帯構造が展開されるため）。この上限は
 # 「変換を試みる前に諦める」安全弁であり、変換アルゴリズム自体のメモリ効率とは独立（項目2参照）。
@@ -86,7 +86,7 @@ def _office_size_exceeded(rp: Path, ext: str) -> bool:
         return False
 
 
-# xlsx セル数ガード（MEM-2・2026-09-04・閉域実機の実測対応）: `SHERPA_OFFICE_FILE_CAP_BYTES` は
+# xlsx セル数ガード（閉域実機の実測対応）: `SHERPA_OFFICE_FILE_CAP_BYTES` は
 # 原本の圧縮後（zip）サイズを見るため、xlsx は圧縮率が高く（共有文字列/繰り返し値が多い）実測
 # 13MB のファイルが st_size ガードを素通りし、python RSS 6.6GB・20分超に達した。この上限は
 # openpyxl を一切開かない段階で効かせる安全弁（1セル≈数百B〜数KBのオブジェクト化で数百万セル→
@@ -224,7 +224,7 @@ _PARTIAL_SIZE_MAX_MD_BYTES = 512
 def _pdf_backend() -> str | None:
     """利用可能な PDF テキスト抽出バックエンド名（優先順 pypdf > pdfminer.six）。無ければ None。
 
-    `pypdf` は `requirements.txt` に**同梱既定**（2026-07-08）＝箱出しで PDF が読める。pdfminer.six は
+    `pypdf` は `requirements.txt` に**同梱既定**＝箱出しで PDF が読める。pdfminer.six は
     任意の追加バックエンド。PyMuPDF は製品経路に採用しない。いずれも到達不可なら PDF は
     「未対応」と正直表示（fail-safe）。テキスト層のみ＝スキャン画像（視覚読み取りは vision）は対象外。
     """
@@ -253,7 +253,7 @@ def convertible_exts() -> set:
     Office（.docx/.xlsx/.pptx）は① OOXML 有効時だけ対象にする。PDF は `pdf_text`（テキスト層）または
     `vision`（テキスト層ゼロのPDFをVLMで視覚読み取り）のいずれかが到達可なら変換候補（担当は
     `pdf_escalation_target` が決める）。ラスタ画像は **vision（VLM 実効可）のときのみ**（`_image_convertible` と一致）
-    ＝それ以外は従来どおり未対応（正直表示）。tesseract 直の `ocr` アームは撤去済み（2026-07-08）。
+    ＝それ以外は未対応（正直表示）。tesseract 直の `ocr` アームは存在しない。
     """
     from . import arms as _arms
     from .arms import legacy_convert
@@ -323,7 +323,7 @@ def _arms_sig(arm_names, backend: str | None, legacy: str | None = None,
     `worker._refresh_derived_representations` が IR 再生成後に evidence/rag（さらに RAG_ES 有効時は
     ES 索引）まで連鎖再生成する契約（`worker.sync` 参照）。
 
-    **`;md=` と `;ocr=` 成分は撤去した**（MarkItDown不採用およびtesseractの `ocr` アーム撤去に伴う署名変更）。
+    **`;md=` と `;ocr=` 成分は含めない**（MarkItDown 不採用・`ocr` アーム不在のため）。
     既存の派生 dir が持つ旧マーカー（`;md=...` / `;ocr=...` を含む形式）は新フォーマットと文字列が一致しなくなる
     ため、次回 sync で `arms_sig_drift` が True になり**派生の再ビルドが1回だけ**走る（想定内・正しい挙動）。
     """
@@ -356,11 +356,11 @@ def arms_sig_drift(derived_md_dir) -> bool:
     """派生MD を作った時と**今**でアーム構成（有効アーム＋PDF バックエンド）が変わったか。
 
     True なら sync が署名同一でも派生を作り直すべき（アーム後付け導入で PDF/新形式を検索対象化／除去後の
-    残骸を一掃・RV High）。旧 `.pdf_backend` マーカーしか無い派生 dir は「既定アーム構成で書かれたもの」と
+    残骸を一掃）。旧 `.pdf_backend` マーカーしか無い派生 dir は「既定アーム構成で書かれたもの」と
     **読み替えて**比較する（後方互換）。マーカー皆無は既定アーム＋バックエンド無しを基準に判定する
     （旧 `pdf_backend_drift` の recorded="none" 相当・marker 書込失敗時の無限ループを避ける）。
 
-    RV Med（Codex gpt-5.5/xhigh・2026-07-08 R1）: `.arms_sig` marker が**在る**が今の署名と不一致
+    `.arms_sig` marker が**在る**が今の署名と不一致
     （例: 旧 `;ocr=...` 付きフォーマットの marker が本撤去の署名フォーマット変更で不一致になるケース）でも、
     dir が**書けない**場合は書込不能 probe（`_dir_writable`）で据え置く（no-marker ケースと同じ fail-safe）。
     これが無いと、再ビルドで marker を更新できない dir は毎 sync で drift=True を返し続けフルリビルドの
@@ -388,8 +388,8 @@ def arms_sig_drift(derived_md_dir) -> bool:
             return True
         return _arms_sig(_arms.DEFAULT_ARMS, backend, "none") != cur   # 旧マーカーは W0 前＝legacy=none 基準
     # マーカー皆無＝既定構成・バックエンド無しを基準に判定（旧 pdf_backend_drift の recorded="none" 相当）。
-    # RV Med（Codex 2026-07-08）: marker が**書けない** dir で True を返し続けると、再ビルドしても marker を
-    # 永続できず毎 sync フルリビルドのループになる（旧実装から潜在）。書込可否を probe し、書けない dir では
+    # marker が**書けない** dir で True を返し続けると、再ビルドしても marker を
+    # 永続できず毎 sync フルリビルドのループになる。書込可否を probe し、書けない dir では
     # 警告して据え置く（fail-safe＝dir を直せば次の sync で必要な再ビルドが走る）。
     drift = _arms_sig(_arms.DEFAULT_ARMS, "none", "none") != cur
     if drift and not _dir_writable(d):
@@ -1070,9 +1070,9 @@ def _build_source_failure_evidence(source_path: Path, *, detail: dict | None = N
     )
 
 
-# ---- 安全な差し替え（2026-08-16 決定・簡易版の世代公開） ----
-# 旧実装は公開中の派生ディレクトリを**先に全消し**してから1件ずつ作り直していた。数十秒〜分かかる
-# 変換の間ずっと検索対象が欠け、途中で失敗するとその中途半端な状態が次の同期まで残っていた。
+# ---- 安全な差し替え（簡易版の世代公開） ----
+# 公開中の派生ディレクトリを**先に全消し**してから1件ずつ作り直すと、数十秒〜分かかる
+# 変換の間ずっと検索対象が欠け、途中で失敗するとその中途半端な状態が次の同期まで残る。
 # 別ディレクトリへ作り切ってから**改名2回で差し替える**（改名は一瞬）。失敗時はステージングを
 # 捨てるだけで公開中の内容は無傷のまま残る。
 # フル世代管理（世代ID・active ポインタ・世代マニフェスト・coverage台帳）は将来の課題として保留。
@@ -1080,7 +1080,7 @@ _STAGING_SUFFIX = ".staging"
 _RETIRED_SUFFIX = ".retired"
 
 
-# ---- フォルダ三分割（§8.1・2026-09-03 裁定）----------------------------------------------------
+# ---- フォルダ三分割（§8.1）----------------------------------------------------
 # 派生物は md（人間用）／rag（RAG 正本＋証跡）／ir（中間表現）の3層に物理分離する。呼び出し元
 # （worker.py 等）は従来どおり `derived_md_dir(world)` だけを渡し続け、rag/ir はここで**その兄弟**
 # （同じ derived root 配下）として導出する——呼び出し側のシグネチャを変えずに済む。
@@ -1128,7 +1128,7 @@ _OCR_ENABLED_ENV = "SHERPA_OCR_ENABLED"
 
 
 def ocr_enabled() -> bool:
-    """OCR 観測が有効か。**既定 ON**（決定 2026-08-16「初期から組み込む」）。
+    """OCR 観測が有効か。**既定 ON**（「初期から組み込む」設計）。
 
     ここで有効なのは取り込み側の**ルート生成**（どのラスタを読むかを決めるだけ・実測4.1秒/52文書）。
     読み取り本体は隔離ワーカーが行うため、ワーカーが動いていなければ指示が溜まるだけで、
@@ -1227,7 +1227,7 @@ def _publish_staging(staging: Path, target: Path) -> None:
 
 def _proc_rss_gib() -> float | None:
     """自プロセスの RSS（GiB）。/proc/self/status の VmRSS を読む（Linux 専用・読めなければ None）。
-    重い変換の前後で実メモリをログへ出すため（閉域実機の OOM 観測 2026-09-04）。"""
+    重い変換の前後で実メモリをログへ出すため（閉域実機の OOM 観測対応）。"""
     try:
         with open("/proc/self/status", encoding="ascii", errors="replace") as f:
             for line in f:
@@ -1239,7 +1239,7 @@ def _proc_rss_gib() -> float | None:
 
 def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = None,
                   world_sig: str | None = None, world: str | None = None) -> dict:
-    """公開中の派生物を壊さずに作り直す薄いラッパ（2026-08-16）。
+    """公開中の派生物を壊さずに作り直す薄いラッパ。
 
     実体は `_build_derived_into_staging`。途中で例外が起きてもステージングを残さない
     （残骸が次回の `rmtree` まで容量を占めるのを避ける）。公開中の内容には触れないため、
@@ -1370,9 +1370,9 @@ def _check_partial_extraction(rp: Path, md: str, rel: str, document, out: list[d
                 return
 
 
-# ---- per-file 変換結果キャッシュ（CONV-CACHE・2026-09-03・実環境障害対応の最終柱）--------------------
-# 実環境（10,000ファイル・1件30秒級）では `_build_derived_into_staging` の途中死が再実行を毎回0から
-# 始めさせていた（ステージングは全件成功時だけ公開する契約＝正しいが、途中死は進捗を全損する）。
+# ---- per-file 変換結果キャッシュ（実環境障害対応の最終柱）--------------------
+# 実環境（10,000ファイル・1件30秒級）では `_build_derived_into_staging` の途中死は再実行を毎回0から
+# 始めさせる（ステージングは全件成功時だけ公開する契約＝正しいが、途中死は進捗を全損する）。
 # 旧形式変換だけが持っていた「再ビルドを跨ぐキャッシュ」（`legacy_convert.cache_root_for`）と同じ型を
 # 変換本体（①アーム実行＋Evidence/RAG 生成）へ拡張する。キー＝(原本の resolved path・st_size・
 # st_mtime_ns・変換パイプライン署名)。ヒットしたら実変換（アーム実行・evidence 生成・LLM/VLM 呼び出し）
@@ -1594,11 +1594,11 @@ def _build_derived_into_staging(
     観測は「今の原本から見て文書ごとに古くなっていないか」を `source_content_hash` で
     個別に再検証してから使う（`_load_ocr_observation_sets` 参照）。
 
-    2026-08-16: 書き込み先は公開中ではなく**ステージング**（`{derived}.staging`）で、作り切ってから
+    書き込み先は公開中ではなく**ステージング**（`{derived}.staging`）で、作り切ってから
     改名2回で差し替える（`_publish_staging`）。取り込み中も公開中の派生物が生き続け、失敗しても
     壊れた状態が残らない。
 
-    CONV-CACHE（2026-09-03）: per-file ループの各 rel は、原本 mtime/size と変換パイプライン署名が
+    per-file ループの各 rel は、原本 mtime/size と変換パイプライン署名が
     前回成功時と一致すれば `_conv_cache_root_for(dr)` のキャッシュから復元するだけで済ませ、
     実変換（①アーム実行・Evidence/RAG 生成）をスキップする。ステージング自体は毎回まるごと
     作り直す（鏡モデルは不変）が、**per-file の変換結果はステージングの再作成を跨いで再利用**
@@ -1616,8 +1616,8 @@ def _build_derived_into_staging(
     （`[{"doc": rel, "reason": "legacy_conversion_failed"}]`）＝`failed` のうち旧形式（.doc/.xls/.ppt）の
     前段変換自体が失敗した rel（`document_ir_failures` 等と異なり、原因コードは常に固定文字列——
     前段変換の失敗理由そのものは呼び出し元に返らないため）。**例外は投げない**（best-effort・fail-safe）:
-    派生先がソース配下と重なる/セットアップ失敗時は `error` を立てて何も書かずに返す（READ-ONLY source 保護・RV High#2）。
-    **1ファイル分の変換処理は try/except で包む**（A2/A3 RV High #1）: PDF/VLM抽出由来の想定外例外で
+    派生先がソース配下と重なる/セットアップ失敗時は `error` を立てて何も書かずに返す（READ-ONLY source 保護）。
+    **1ファイル分の変換処理は try/except で包む**: PDF/VLM抽出由来の想定外例外で
     1件が失敗しても他ファイルの変換は継続する（failed 計上のみ・全体を止めない）。
 
     `document_ir_*`（DOC-IR-001.5・修正4）: document.json の書込失敗は握りつぶさず `document_ir_failed`／
@@ -1636,7 +1636,7 @@ def _build_derived_into_staging(
     旧MDが空になる画像だけのXLSXでも、この新しいRAG表現は生成する。
     """
     from .. import scope_infer as si
-    # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（RV Low #5: レポート契約の一貫性）。
+    # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（レポート契約の一貫性）。
     rep = {"converted": 0, "published_notice_count": 0, "failed": 0, "unsupported": 0,
            "unhandled_failed": 0, "unhandled_failures": [], "by_ext": {},
            "legacy_converted": 0, "legacy_conversion_failures": [], "conversion_failures": [],
@@ -1954,7 +1954,7 @@ def _build_derived_into_staging(
             continue
         by[ext] += 1
         conv_cache_seen_rels.add(rel)        # 剪定用「今回の原本一覧」（成否問わず候補に入った rel すべて）
-        # RV High #1（belt-and-braces）: `accepts()`/`convert()` は各アーム実装（PDF/vision の
+        # belt-and-braces: `accepts()`/`convert()` は各アーム実装（PDF/vision の
         # 抽出処理）由来の想定外例外を投げうる。ファイル1件の失敗が for ループ全体を止めて他ファイルの変換まで
         # 巻き込むことがないよう、1ファイル分の処理をまるごと try/except で包む（fail-safe・failed 計上のみ）。
         rel_unhandled = False               # 下の except（想定外の例外）で True にする
@@ -2207,7 +2207,7 @@ def _build_derived_into_staging(
                 human_md_sig_for_rel = _current_human_md_sig()
             _write_provenance(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
-            # B1（RV Med）: IR は**原本が素の .docx/.pptx/.xlsx のときだけ**書く。旧 .doc/.ppt/.xls は前段変換
+            # IR は**原本が素の .docx/.pptx/.xlsx のときだけ**書く。旧 .doc/.ppt/.xls は前段変換
             # （legacy_convert）で materialized .docx/.pptx/.xlsx になっており、OoxmlArm は渡された OOXML の
             # suffix しか見ないため IR 自体は生成できてしまう。しかしそれを書き出すと doc_id/source.path=rel
             # （例 "old.doc"）なのに file_type="docx"・content_hash=変換後キャッシュファイルの hash という
@@ -2372,7 +2372,7 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     except OSError:
         dr = Path(derived)
     dr_ir = _sibling_layer_dir(dr, "ir")           # `.document.json` は ir 層（§8.1 三階層）
-    # `build_derived` と同じ重なりガード（RV High #2）: derived がソース配下と重なる/同一だと、ソース木への
+    # `build_derived` と同じ重なりガード: derived がソース配下と重なる/同一だと、ソース木への
     # `.document.json` 書込と stale 一掃 unlink がそのまま READ-ONLY source の汚染・削除になる。書く前に拒否。
     if _within(dr, wd) or _within(wd, dr) or _within(dr_ir, wd) or _within(wd, dr_ir):
         return {"document_ir_generated": 0, "document_ir_failed": 0, "document_ir_failures": [],
@@ -3069,8 +3069,8 @@ def _pptx_md(p: Path) -> str | None:
 
 # ---- A5: 幾何オクルージョン（覆い図形の座標判定・pptx v1・§5.5 の簡略版）----
 #
-# 現行契約 docs/11-Office変換.md §5.5／起案経緯 docs/archive/proposals/2026-07-07-MD化多アーム統合.md A5。
-# 2026-07-12 ユーザー決定＝簡略版: 人手確認UI（A17）は作らず、覆い図形に隠されたテキストへ
+# 現行契約 docs/11-Office変換.md §5.5。
+# 簡略版: 人手確認UI（A17）は作らず、覆い図形に隠されたテキストへ
 # MD本文に直接マーカー行を自動出力するだけ（メタタグ `status=hidden_candidate` 方式ではない・
 # D3=自動公開の原則と整合）。対象は .pptx のみ（座標が EMU で明確）。属性ベースの隠し
 # （w:vanish・veryHidden シート・非表示スライド等）は今回は対象外（未実装の残課題）。
@@ -3333,7 +3333,7 @@ def _pdf_text_min_chars() -> int:
         return _DEFAULT_PDF_TEXT_MIN_CHARS
 
 
-# 品質判定のメモ化（RV Med #4）: `accepts()` は pdf_text/vision の複数アームから同一 PDF に
+# 品質判定のメモ化: `accepts()` は pdf_text/vision の複数アームから同一 PDF に
 # 対して繰り返し呼ばれる（`_convert_with_arms` が最初に受理したアームを探すため最大アーム数回呼ぶ）ため、抽出
 # （`_pdf_pages`）を毎回やり直すと PDF 1件あたり複数回の全文抽出が走ってしまう。`(resolved path,size,mtime_ns)`
 # キーでプロセス内メモ化し、1ファイル1回に抑える。上限超過は全消し（シンプルさ優先・LRU化はしない）。
@@ -3354,7 +3354,7 @@ def _pdf_quality_cache_key(p: Path) -> tuple[str, int, int] | None:
 def _pdf_quality_and_avg(p) -> tuple[str, float]:
     """PDF テキスト層の品質（good/sparse/empty）とページ平均抽出文字数を計算する（メモ化・fail-safe）。
 
-    **fail-safe（RV High #1）**: `_pdf_pages`（壊れた PDF 等で例外を投げうる）を例外安全に包み、失敗時は
+    **fail-safe**: `_pdf_pages`（壊れた PDF 等で例外を投げうる）を例外安全に包み、失敗時は
     `("empty", 0.0)` を返す。ここで例外を握らないと `accepts()` 経由で `build_derived` の1ファイルループ全体が
     中断し、1件の壊れた PDF が他ファイルの変換まで巻き込んで取り込み全体を止めてしまう。
     """
@@ -3406,8 +3406,8 @@ def pdf_escalation_target(p) -> str | None:
     - sparse（少ないが有る）→ None（原本に存在するテキスト層を決定的に抽出し、AI解釈を足さない）
     - empty（テキスト層ゼロまたは抽出不能）→ visionが実効利用可能なら `"vision"`、無ければ None
 
-    既定（`ooxml,pdf_text`）では vision が無効＝常に None を返す（＝pdf_text が全 PDF を担当・従来どおり）。
-    tesseract 直の `ocr` アームは撤去した（2026-07-08・視覚読み取りは vision に一本化）。
+    既定（`ooxml,pdf_text`）では vision が無効＝常に None を返す（＝pdf_text が全 PDF を担当）。
+    tesseract 直の `ocr` アームは存在しない（視覚読み取りは vision に一本化）。
     """
     if Path(p).suffix.lower() != ".pdf":
         return None

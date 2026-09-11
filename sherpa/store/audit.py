@@ -1,6 +1,5 @@
-"""監査ログ（2026-07-01-監査ログ強化.md §3・§4 MVP・hash-chain §Phase2）。
+"""監査ログ（hash-chain 含む）。
 
-フェーズ4 S6（2026-07-02-リファクタリング計画.md）: `sherpa/store/__init__.py` から純移動。
 チェーン一式（redaction・insert・verify・hash 計算）は不可分のため1モジュールにまとめる
 （insert と verify が `_AUDIT_CHAIN_LOCK`・`_AUDIT_CANON_FIELDS`・`_audit_canonical`・
 `_audit_entry_hash` を共有する）。
@@ -22,10 +21,10 @@ from psycopg.types.json import Json
 
 from .db import _connect, _ensure
 
-# ---- 監査ログ（2026-07-01-監査ログ強化.md §3・§4 MVP）----
+# ---- 監査ログ ----
 
 # redaction: これらのキーは detail/before_state/after_state に平文・hash いずれも保存しない。
-# bedrock_api_key は 2026-07-13-横断レビュー対応.md R2b で追加（保護境界の補修・欠落していた）。
+# bedrock_api_key も保護境界に含める（欠落していた穴を塞ぐ）。
 _REDACT_KEYS = frozenset({
     "password", "password_hash", "new_password", "old_password", "plaintext",
     "token", "token_hash", "session_token", "share_token",
@@ -98,13 +97,13 @@ def list_audit(
 
 
 def get_messages_by_ids(ids: list) -> dict:
-    """id → {content, personal, conv_deleted} の辞書を返す（S5・監査エクスポートの本文 join 専用）。
+    """id → {content, personal, conv_deleted} の辞書を返す（監査エクスポートの本文 join 専用）。
 
     N+1 を避けるため呼び出し側で id を一括収集し、1回の `= ANY(%s)` で取得する。
     存在しない id（会話ごと物理削除・メッセージも FK CASCADE で消滅）は結果に含まれない＝
     呼出側で「（削除済み）」に落とす。
 
-    RV HIGH（2026-07-03）: 受領共有ラッパーが生きている会話の `delete_conversation` は
+    受領共有ラッパーが生きている会話の `delete_conversation` は
     **soft delete**（`conversations.deleted_at` のみ・messages 行は物理的に残る＝受領側が
     引き続き読めるようにするため）に留まる。そのため「存在しない id」だけでは削除済みを
     判定できず、本文が export に漏れる。conversations を join し `deleted_at IS NOT NULL` を
@@ -145,9 +144,9 @@ def _audit_insert(
 
     `audit()` はこれを自前接続で呼ぶ薄いラッパー（既存呼び出し互換）。**同一トランザクションで
     先行の更新と一緒に監査を記録したい呼び出し側**（例: `set_system_settings`）はこの関数を直接、
-    自分の `with _connect() as c:` 内で呼ぶ（2026-07-08 RV High 対応: commit 後の別接続 audit＋
-    失敗時 compensate 方式は (a) commit〜補償の間に未監査値が見える (b) その間のプロセス停止で
-    未監査変更が残留 (c) 並行更新を補償が上書き、の3穴を抱えていた。同一トランザクション化で
+    自分の `with _connect() as c:` 内で呼ぶ（commit 後の別接続 audit＋
+    失敗時 compensate 方式だと (a) commit〜補償の間に未監査値が見える (b) その間のプロセス停止で
+    未監査変更が残留 (c) 並行更新を補償が上書き、の3穴が残る。同一トランザクション化で
     「設定変更と監査は両方成功か両方失敗」の原子性に置き換え、穴を構造的に閉じる）。
     detail/before_state/after_state は redaction を通す（呼出側＋store 層の二重）。
     §Phase2: hash-chain（entry_hash = SHA256(prev_hash || canonical_json(row)))で改ざん検知。
@@ -160,11 +159,11 @@ def _audit_insert(
     _ua = (user_agent or "")[:512] if user_agent else None
     # hash-chain の順序を直列化（xact lock は commit/rollback で自動解放）。
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (_AUDIT_CHAIN_LOCK,))
-    # prev_hash は head アンカーから取る（生の末尾行でなく＝NULL 尾行で新セグメントが始まる問題を回避・RV MEDIUM）。
+    # prev_hash は head アンカーから取る（生の末尾行でなく＝NULL 尾行で新セグメントが始まる問題を回避）。
     head = conn.execute("SELECT last_hash, cnt FROM audit_chain_head WHERE singleton").fetchone()
     prev_hash = head["last_hash"] if head else None
     cnt = head["cnt"] if head else 0
-    # RV HIGH: ハッシュは **DB 格納後の値**（created_at=DB now()・JSONB round-trip）で計算するため、
+    # ハッシュは **DB 格納後の値**（created_at=DB now()・JSONB round-trip）で計算するため、
     #   INSERT ... RETURNING で確定値を受け取り、その値でハッシュして UPDATE する（verify との一致を保証）。
     row = conn.execute(
         "INSERT INTO audit_log (actor_user_id, action, resource_type, resource_id, detail, "
@@ -211,15 +210,15 @@ def audit(
     before_state=None,
     after_state=None,
 ) -> None:
-    """監査ログを1行 insert（2026-07-01-監査ログ強化.md §4 推奨 helper）。自前接続で `_audit_insert` を呼ぶ薄いラッパー
+    """監査ログを1行 insert。自前接続で `_audit_insert` を呼ぶ薄いラッパー
     （既存呼び出し互換）。同一トランザクションで先行の変更と一緒に監査したい場合は `_audit_insert` を
     直接呼ぶこと（`set_system_settings` 参照）。
 
-    RV HIGH（Codex 2026-07-13 フェーズ4）: `_audit_insert` は同一モジュール内の直接束縛では**なく**
-    facade（`sherpa.store` パッケージ）属性経由で実行時解決する。旧 monolith では
-    `monkeypatch.setattr(store, "_audit_insert", …)` が本関数経由の insert にも効いた（モジュール
-    グローバル＝patch 先が同一名前空間）が、分割後にローカル束縛のまま呼ぶとテストの patch が
-    素通りして実 DB に書き込んでしまう。`settings.set_system_settings` と同じ方式
+    `_audit_insert` は同一モジュール内の直接束縛では**なく**
+    facade（`sherpa.store` パッケージ）属性経由で実行時解決する。ローカル束縛のまま呼ぶと、
+    `monkeypatch.setattr(store, "_audit_insert", …)` によるテストの patch が本関数経由の insert には
+    効かず、素通りして実 DB に書き込んでしまう（patch はモジュールグローバル＝facade の名前空間を
+    差し替える形でしか効かない）。`settings.set_system_settings` と同じ方式
     （settings.py の docstring 参照・関数内 import は初期化循環回避）。
     """
     _ensure()
@@ -231,7 +230,7 @@ def audit(
                       before_state=before_state, after_state=after_state)
 
 
-# ==== 監査ログ hash-chain（2026-07-01-監査ログ強化.md §Phase2・改ざん検知）====
+# ==== 監査ログ hash-chain（改ざん検知）====
 _AUDIT_CHAIN_LOCK = 0x53485241            # 固定 advisory lock key（"SHRA"）＝audit insert の直列化
 # hash 対象の論理フィールド（順序・集合とも insert/verify で完全一致させる）。
 _AUDIT_CANON_FIELDS = (
@@ -260,13 +259,12 @@ def _audit_entry_hash(prev_hash, vals: dict) -> str:
 def verify_audit_chain() -> dict:
     """audit_log の hash-chain を検証。改ざん・欠落・並べ替え・**末尾削除(truncation)** を検出する。
     移行前の legacy 行（entry_hash IS NULL）は chain 対象外＝スキップ。末尾は head アンカーと照合する。
-    ※head アンカー自体も同一 DB 内なので、DB superuser への完全防御には外部への head 署名/エクスポートが別途必要
-      （2026-07-01-監査ログ強化.md §6・follow-up）。
+    ※head アンカー自体も同一 DB 内なので、DB superuser への完全防御には外部への head 署名/エクスポートが別途必要。
     returns {"ok": bool, "checked": int, "broken_at": id|None, "reason": str|None}
     """
     _ensure()
     with _connect() as c:
-        # RV HIGH: audit() と同じ advisory lock を取ってから head/rows を1トランザクションで読む
+        # audit() と同じ advisory lock を取ってから head/rows を1トランザクションで読む
         #   （head 読取と rows 読取の間に concurrent audit() が commit して count_mismatch 誤検知するのを防ぐ）。
         c.execute("SELECT pg_advisory_xact_lock(%s)", (_AUDIT_CHAIN_LOCK,))
         head = c.execute(
@@ -277,7 +275,7 @@ def verify_audit_chain() -> dict:
             "  after_state, created_at, prev_hash, entry_hash FROM audit_log "
             "WHERE entry_hash IS NOT NULL ORDER BY id ASC"
         ).fetchall()
-        # RV HIGH: chain 開始後（id>=chain_start_id）の総行数。hashed 行数(cnt)と一致しなければ
+        # chain 開始後（id>=chain_start_id）の総行数。hashed 行数(cnt)と一致しなければ
         #   NULL-hash 偽行が chain の後ろに注入されている（legacy skip は移行前行だけに限定）。
         total_after_start = None
         if head and head["chain_start_id"] is not None:
@@ -299,7 +297,7 @@ def verify_audit_chain() -> dict:
         prev_hash = r["entry_hash"]
         last_id, last_hash = r["id"], r["entry_hash"]
         checked += 1
-    # head アンカー照合（RV HIGH: 末尾削除／head 欠落・cnt=0 バイパス／NULL 注入 を検出）。
+    # head アンカー照合（末尾削除／head 欠落・cnt=0 バイパス／NULL 注入 を検出）。
     if checked > 0 and not head:
         return broken(last_id, "missing_head")           # hashed 行があるのに anchor が無い＝anchor 削除
     if head:

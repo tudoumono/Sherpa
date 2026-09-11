@@ -52,8 +52,8 @@ def _header_secret(headers: dict) -> str | None:
 
 MAX_TURNS = int(os.environ.get("SHERPA_AGENTIC_MAX_TURNS", "12"))  # 反復上限（コスト/レイテンシ境界）
 # 上限に達したときに「集めた材料だけで答えさせる」最終合成の指示（ツールを渡さずに1回だけ呼ぶ）。
-# 以前は上限到達で空回答を返し、呼び出し元がそれまでの資料・引用を全部捨てて単発 grep へ落ちていた
-# （実測 2026-08-15: 6ターン検索した結果を破棄し、入力 353 tokens で回答していた）。
+# 空回答で打ち切ると、呼び出し元がそれまでの資料・引用を全部捨てて単発 grep へ落ちてしまう
+# （集めた材料を活かせないまま入力が小さいだけの回答になる）。
 _FINAL_SYNTHESIS = (
     "調査の上限に達しました。**これ以上ツールは使えません**。"
     "ここまでに取得した内容だけを根拠に、日本語で回答してください（長さは絞らない・集めた内容は削らない）。"
@@ -72,7 +72,7 @@ _FINAL_SYNTHESIS_SUFFICIENT = (
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（secRV FIX-W・2026-07-19・負値/巨大値対策）。
+    """security-limit 系 env の整数解析（負値/巨大値対策）。
 
     負値をそのままスライス上限に使うと `calls[:-1]`／`b[:-1]` のように**反転**して
     「末尾1件を除いて全部通す」＝上限の実質無効化になる（`SHERPA_AGENTIC_MAX_TOOLS_PER_TURN=-1`
@@ -90,11 +90,11 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     except ValueError:
         return default
     return v if lo <= v <= hi else default
-# secRV MED-3（2026-07-18・DoS/コスト増幅）: `MAX_TURNS` は LLM 応答ラウンド数だけを制限し、1応答内で
-# モデルが返す tool_calls の**個数**は無制限に実行していた（no-hit grep は毎回 world 全走査＝
-# 1応答に大量のツール呼び出しを積むだけで実処理量を増幅できた）。1応答あたりの実行数上限を独立に
+# `MAX_TURNS` は LLM 応答ラウンド数だけを制限し、1応答内で
+# モデルが返す tool_calls の**個数**を制限しなければ無制限に実行できてしまう（no-hit grep は毎回 world 全走査＝
+# 1応答に大量のツール呼び出しを積むだけで実処理量を増幅できる）。1応答あたりの実行数上限を独立に
 # 設ける（既定16は通常のツール呼び出し数を十分上回るため正常系には影響しない）。
-# FIX-W: 負値でスライスが反転し上限が無効化されるため `_env_int` で範囲検証（hard cap 256）。
+# 負値でスライスが反転し上限が無効化されるため `_env_int` で範囲検証する（hard cap 256）。
 MAX_TOOLS_PER_TURN = _env_int("SHERPA_AGENTIC_MAX_TOOLS_PER_TURN", 16, 1, 256)
 
 
@@ -134,12 +134,12 @@ READ_WINDOW_ABS_MAX = 400
 _OFFICE_MD = {".docx", ".xlsx", ".pptx", ".pdf", ".doc", ".xls", ".ppt",
               # ラスタ画像（A3・OCR アーム）も本文は派生MD側（`image.png.md`）にある。OCR 無効なら derived に
               # 画像 .md は存在しないので、加えても実害はなく grep_search（derived md/ を直接見る）と read_around
-              # が一致する（office_md.IMAGE_EXT が真実源・W0 RV High の非対称を画像でも防ぐ）。
+              # が一致する（office_md.IMAGE_EXT が真実源・grep と read_around の非対称を画像でも防ぐ）。
               ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}   # 本文は派生MD側にある
 # ⚠ 旧形式（.doc/.xls/.ppt）は legacy_backend（W0）が前段変換した OOXML を①アームが MD化する。
 # 解決規約は新形式と同じ **原本 rel + ".md"**（office_md.build_derived が出力名を原本 rel に揃えている）ので
 # ここでの分岐は不要＝ _OFFICE_MD に加えるだけで grep_search（derived md/ を直接見る）と read_around が一致する
-# （W0 RV High: 追加前は grep はヒットするが read_around が拒否＝精読不可という非対称があった）。
+# （追加しないと grep はヒットするが read_around が拒否＝精読不可という非対称が生じる）。
 # read_around で読める本文種別だけ（.env 等の秘匿ファイルを LLM に読ませない・RV BLOCKER）。
 # ソース原文（コード）分はアナライザ登録簿が単一の真実源（§2.4）。
 # 軽量テキスト枠（`ingest.text_kind`）の第1段拡張子マップ（CODE_EXT/DOCUMENT_EXT）も対象に含める
@@ -147,11 +147,11 @@ _OFFICE_MD = {".docx", ".xlsx", ".pptx", ".pdf", ".doc", ".xls", ".ppt",
 # `classify_document()`（下の `_safe_doc_path`）が最終判定でも秘匿ファイル・意味層内部制御ファイル
 # （`worlds.is_semantic_control_path`）を対象外へ倒すため、ここに加えても RV BLOCKER の意図は
 # 破らない。grep_search（`grep_tool._TEXT_EXT` も同じ集合を追加済み）と read_around の対称性を保つ
-# （追加しないと「grep はヒットするが read_around が拒否」という W0 RV High と同型の非対称が生じる）。
+# （追加しないと「grep はヒットするが read_around が拒否」という同型の非対称が生じる）。
 _READABLE_EXT = ({".md", ".markdown", ".txt"} | _analyzer_registry.registered_extensions() | _OFFICE_MD
                 | text_kind.CODE_EXT | text_kind.DOCUMENT_EXT)
 
-# tool result（外部 LLM へ渡る）から明らかな秘密を伏せる（RV HIGH・多層防御）。
+# tool result（外部 LLM へ渡る）から明らかな秘密を伏せる（多層防御）。
 _SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
     r"|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}"
@@ -200,27 +200,27 @@ def _redact_deep(obj):
     return _walk_redact(obj, redact_keys.KeyBlockRedactor(_redact))
 
 
-# secRV MED-B（2026-07-18・DoS/メモリ増幅対策）: `read_around` は window（行数）でしか出力を絞らず、
+# `read_around` は window（行数）でしか出力を絞らず、
 # 単一行が巨大（例: 10MB の1行だけの文書）だと行数上限が実質無意味＝返却バイト量が無制限になる
 # （1ターン内で `SHERPA_AGENTIC_MAX_TOOLS_PER_TURN` 回呼ばれると履歴/SSE/次ターンの LLM 要求へ
 # 複製される総量が跳ね上がる）。(a) 返却テキストの UTF-8 バイト上限で切り詰める（既存の
 # grep ヒットクリップ `[:500]` と同じ流儀）。(b) `Path.read_text()`（ファイル全体を
 # 一括ロード）ではなく、生バイトを `_READ_AROUND_FILE_CAP_BYTES` までに制限して読む（巨大な単一行
 # ファイルでも読み込み自体が無制限に増幅しない）。
-# FIX-W: 負値でクリップが反転するため `_env_int` で範囲検証（hard cap はディスク読み上限と同じ 8MiB）。
-# BUDGET-1（§3.4・2026-09-03 裁定）: 既定は精度優先（憲法1条「アプリは性能を黙って下げない」）——
-# 旧既定 65536/1048576 は secRV のサーバメモリ対策の名残で、read 側のストリーミング化により
-# 役目を終えた。管理画面（`agentic_budget.per_result`）へ昇格済み（UI(DB)が唯一の真実源）のため
-# env フォールバックは持たない（ENV-CLEAN・2026-09-03）——ここでの値はコード既定として
-# `resolve_tool_result_budgets()` の settings 未設定時フォールバックにそのまま使う（settings 段は
-# 下の resolver が1段重ねる）。
+# (b) の `_READ_AROUND_FILE_CAP_BYTES` は負値でクリップが反転するため `_env_int` で [64KiB, 64MiB] に
+# 範囲検証する（per-call 予算の検証は settings 側の `_clamped_setting_int` が [1KiB, 8MiB] で行う）。
+# BUDGET-1（§3.4）: 既定は精度優先（憲法1条「アプリは性能を黙って下げない」）——サーバメモリ対策
+# としての制約は read 側のストリーミング化により役目を終えている。管理画面（`agentic_budget.per_result`）
+# へ昇格済み（UI(DB)が唯一の真実源）のため env フォールバックは持たない——ここでの値は
+# コード既定として `resolve_tool_result_budgets()` の settings 未設定時フォールバックに
+# そのまま使う（settings 段は下の resolver が1段重ねる）。
 TOOL_RESULT_MAX_BYTES = 262144
 # 1 run（1回の agentic ループ全体＝`openai_style`/`gemini`/`anthropic_style` の1呼び出し）で許容する
-# tool-result 累計バイト上限（secRV MED-B (c)・3 dialect 全てで使う）。超過時は固定エラーで run を
+# tool-result 累計バイト上限（3 dialect 全てで使う）。超過時は固定エラーで run を
 # 打ち切る（fail-closed）。
-# BUDGET-1: 既定は per-call 既定の16倍（旧既定と同じ比率をコード既定として固定するだけで、settings で
+# BUDGET-1: 既定は per-call 既定の16倍（同じ比率をコード既定として固定するだけで、settings で
 # per-call だけ変えても total には連動しない——2キーは独立に解決する。§3.4「即時」段の値と一致）。
-# 管理画面（`agentic_budget.total`）へ昇格済みのため env フォールバックは持たない（ENV-CLEAN）。
+# 管理画面（`agentic_budget.total`）へ昇格済みのため env フォールバックは持たない。
 TOOL_RESULT_MAX_TOTAL_BYTES = 4 * 1024 * 1024
 
 
@@ -238,7 +238,7 @@ def _clamped_setting_int(raw, lo: int, hi: int) -> int | None:
 
 def _window_derived_min(base: int, system_settings: dict | None, provider: str | None,
                         model: str | None, ollama_base_url: str | None, anthropic_client) -> int:
-    """BUDGET-2（§3.4・2026-09-03 裁定・min() 方式）: `base`（BUDGET-1 の解決値）と「選択中モデルの
+    """BUDGET-2（§3.4・min() 方式）: `base`（BUDGET-1 の解決値）と「選択中モデルの
     窓由来の上限」の小さい方を返す。`provider`/`model` 省略（既定 None）時は窓連動を一切行わず
     `base` をそのまま返す＝既存呼び出し元（`provider`/`model` を渡さない）は byte-identical。
     窓が不明（登録値/API/シードのどれにも無い）なときも同様に `base` のまま
@@ -327,14 +327,14 @@ def resolve_tool_result_budgets(system_settings: dict | None = None, *, provider
             effective_tool_result_max_total_bytes(system_settings, provider=provider, model=model,
                                                   ollama_base_url=ollama_base_url,
                                                   anthropic_client=anthropic_client))
-# read_around/read_doc/doc_outline/verify_citation がディスクから読む生バイト数の上限
-# （secRV MED-B (b)）。`grep_tool._GREP_FILE_CAP_BYTES` と同じ役割（1ファイルにかける読み取り
-# コストの安全弁）——env で個別に変更できるが、既定は grep 側の cap（既定64MiB・2026-09に
-# ストリーミング化してメモリ非比例になった際に引き上げ済み）と揃える。揃えないと「grep が
+# read_around/read_doc/doc_outline/verify_citation がディスクから読む生バイト数の上限。
+# `grep_tool._GREP_FILE_CAP_BYTES` と同じ役割（1ファイルにかける読み取り
+# コストの安全弁）——env で個別に変更できるが、既定は grep 側の cap（既定64MiB・ストリーミング化して
+# メモリ非比例になっているため引き上げてある）と揃える。揃えないと「grep が
 # cap より後ろでヒットを見つけたのに read_doc/read_around がそこを読めない」という食い違いが
 # 生まれる（grep 側は行単位のストリーミングでメモリを頭打ちにするが、read_around 側は
 # 「1ヒット周辺だけを読む」用途で全量ロードのままでも実害が薄いため、ここでは cap を揃えるだけに
-# 留める＝ストリーミング化は本スライスのスコープ外）。
+# 留める＝read 側自体のストリーミング化は別契約）。
 _READ_AROUND_FILE_CAP_BYTES = _env_int(
     "SHERPA_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
 # read 側（read_around/read_doc/doc_outline）の単一巨大行への安全弁（2026-09・grep_tool の
@@ -347,12 +347,12 @@ _READ_LINE_MAX_BYTES = _env_int("SHERPA_READ_LINE_MAX_BYTES", 2 * 1024 * 1024, 6
 # バイト予算（`TOOL_RESULT_MAX_BYTES`）を圧迫しないための安全弁——LLM には「打切りが起きている」
 # 事実と代表例が伝われば十分で、全件列挙は要らない（`read_doc` で個別に読みに行ける）。
 _TRUNCATED_DOCS_MAX = 20
-# 許可外ツール拒否結果に埋める（モデル生成の）ツール名の上限バイト数（secRV FIX-1・2026-07-19）。
+# 許可外ツール拒否結果に埋める（モデル生成の）ツール名の上限バイト数。
 # 拒否理由がどのツール名かをモデルへ伝える最小限の情報量で十分＝短い固定長で足りる。
 _REJECTED_TOOL_NAME_MAX_BYTES = 32
 # 親返し（L4c・§3.3/§3.4）: es_search のヒットを doc_id で束ね、予算内なら rag.md 全文(P3)／
-# 領域(P2)を返す。常時 ON（TOGGLE-RM・2026-09-03 でグローバルな系統切替トグル
-# `SHERPA_ES_PARENT_RETURN` を撤去）。
+# 領域(P2)を返す。常時 ON（グローバルな系統切替トグル
+# `SHERPA_ES_PARENT_RETURN` は撤去済み・復活させない）。
 # P2（領域）の対象チャンク集合を ES から引く際の1クエリあたりの取得上限（`es_index.
 # chunk_ids_for_parent` の `limit`）。region はどのみち byte_cap（予算）で頭打ちになるため、
 # ここは「1回のクエリで返す chunk_id の個数」自体の安全弁——ES の既定 `max_result_window`
@@ -361,14 +361,14 @@ _PARENT_RETURN_REGION_CHUNKS_MAX = 5000
 
 
 def _parent_return_enabled() -> bool:
-    """常時 True（TOGGLE-RM・2026-09-03: グローバルな系統切替トグル `SHERPA_ES_PARENT_RETURN` を
-    撤去し常時ONへ固定・`grep_tool.rag_grep_enabled`/`es_index.rag_es_enabled` と同じ扱い）。既存の
+    """常時 True（グローバルな系統切替トグル `SHERPA_ES_PARENT_RETURN` は撤去済み・復活させない・
+    `grep_tool.rag_grep_enabled`/`es_index.rag_es_enabled` と同じ扱い）。既存の
     呼び出し形（`run_tool` の `parent_return_on` 判定）を変えない最小変更として関数自体は残す。"""
     return True
 
 
 def _clip_utf8_bytes(s: str, max_bytes: int) -> str:
-    """UTF-8 エンコード後のバイト数が `max_bytes` を超えないよう `s` を切り詰める（secRV MED-B (a)）。
+    """UTF-8 エンコード後のバイト数が `max_bytes` を超えないよう `s` を切り詰める。
 
     マルチバイト文字の境界で分割されても壊れた文字が残らないよう `errors="ignore"` で再デコードする。
     """
@@ -378,25 +378,23 @@ def _clip_utf8_bytes(s: str, max_bytes: int) -> str:
     return b[:max_bytes].decode("utf-8", errors="ignore")
 
 
-# 直列化不能時のフォールバック値（secRV FIX-M2・2026-07-19）。実運用のどんな上限設定
-# （既定 64KiB/1MiB）よりも確実に大きい値にし、「測定不能＝上限超過扱い」を機械的に保証する。
+# 直列化不能時のフォールバック値。実運用のどんな上限設定
+# （既定 256KiB/4MiB）よりも確実に大きい値にし、「測定不能＝上限超過扱い」を機械的に保証する。
 _UNMEASURABLE_SIZE = 1 << 40
 
 
 def _result_byte_size(result) -> int:
-    """JSON 化した際の概算 UTF-8 バイト数（secRV MED-B (c)・1 run 累計上限の判定に使う）。
+    """JSON 化した際の概算 UTF-8 バイト数（1 run 累計上限の判定に使う）。
 
     `run_tool` の戻り値の1つ目（tool result dict）だけでなく、4つ目（`cards` サイドカー・
-    `list[dict]`）にも同じ関数を使う（FIX-2・secRV・2026-07-19）。
+    `list[dict]`）にも同じ関数を使う。
 
-    レビュー是正（FIX-M2・secRV・2026-07-19・直列化失敗の 0 扱い fail-open）: 以前は
-    シリアライズできない要素（bytes・非JSON型・不正 Unicode 等）に対して `0`（無料）を返しており、
-    個別上限（`_clip_cards` の `max_bytes`）・累計上限（`TOOL_RESULT_MAX_TOTAL_BYTES`）の両方を
-    無条件にすり抜けられた（実測: 1MiB の非JSON値カードが 100 byte 上限で 30 件そのまま採用）。
-    是正: 測定不能は「特大（`_UNMEASURABLE_SIZE`）」として扱う（fail-closed）。呼び出し側の上限
-    判定（`_clip_cards` の候補リスト全体サイズ判定・3 dialect の累計判定）はこの大きな値を受けて
-    必ず「上限超過」と判断する＝直列化不能な要素は個別クリップでは弾かれ、累計判定では run が
-    打ち切られる。
+    測定不能（シリアライズできない要素＝bytes・非JSON型・不正 Unicode 等）は「特大
+    （`_UNMEASURABLE_SIZE`）」として扱う（fail-closed）——`0`（無料）として扱うと、個別上限
+    （`_clip_cards` の `max_bytes`）・累計上限（`TOOL_RESULT_MAX_TOTAL_BYTES`）の両方を無条件に
+    すり抜けてしまう。呼び出し側の上限判定（`_clip_cards` の候補リスト全体サイズ判定・3 dialect
+    の累計判定）はこの大きな値を受けて必ず「上限超過」と判断する＝直列化不能な要素は個別クリップ
+    では弾かれ、累計判定では run が打ち切られる。
     """
     try:
         return len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
@@ -422,7 +420,7 @@ def _read_evidence_payload(state: "investigation_state.InvestigationState") -> l
     S3b 原本読取ツールの精読結果）だけを抜き出し、`final` payload の `read_evidence` キー用に
     薄く写す（`Evidence` データクラス自体は payload に出さない＝内部専用の実装詳細を漏らさない）。
 
-    RV2巡目#9 是正: `locator`（S3b・span=None のときだけ持つ＝"Sheet1!A1:D20" 等）を `text` へ
+    `locator`（原本読取ツール・span=None のときだけ持つ＝"Sheet1!A1:D20" 等）を `text` へ
     前置する——清書（`build_synthesis_digest` の `read_evidence` 引数）は `doc_id`/`span`/`text`
     しか読まないため、`locator` を別キーで足すだけでは清書側に伝わらない。同じ doc_id で
     複数エントリ（別シート等）になった場合に、どの箇所の精読かを清書入力の上でも区別できる
@@ -474,7 +472,7 @@ def _tool_bytes_over_budget(total_tool_bytes: int, shared_budget: dict | None,
     呼び出し元は無変更・BUDGET-1 §3.4）: 呼び出し元が run 開始時に1回だけ
     `resolve_tool_result_budgets()` で解決した実効値。
 
-    レビュー是正（LOW・S4-b RV 1巡目・予算 dict の入口検証）: 形が不正（キー欠損・非数値・
+    形が不正（キー欠損・非数値・
     used が負・max<=0）な shared_budget は「判定不能」として **over-budget 扱い＝fail-closed**。
     直アクセス（KeyError）や負値 used による予算の実質増加を防ぐ。"""
     limit = max_total_bytes if max_total_bytes is not None else TOOL_RESULT_MAX_TOTAL_BYTES
@@ -482,7 +480,7 @@ def _tool_bytes_over_budget(total_tool_bytes: int, shared_budget: dict | None,
         return True
     if shared_budget is None:
         return False
-    # RV 2巡目是正: 片側キー欠損（例 {"tool_bytes_max": 100}）も「形が不正＝判定不能」として
+    # 片側キー欠損（例 {"tool_bytes_max": 100}）も「形が不正＝判定不能」として
     # fail-closed（.get の既定値で正常形に見せない）。
     if "tool_bytes_used" not in shared_budget or "tool_bytes_max" not in shared_budget:
         return True
@@ -504,7 +502,7 @@ _GRAPH_CARDS_MAX = 30
 
 def _clip_cards(cards: list, max_count: int = _GRAPH_CARDS_MAX, max_bytes: int = TOOL_RESULT_MAX_BYTES) -> list:
     """`cards`（`graph_neighbors` のカード・troubleshoot UI 用サイドカー）を件数＋直列化バイト上限で
-    切り詰める（secRV FIX-2・2026-07-19・cards サイドカーのバイト迂回）。
+    切り詰める（cards サイドカーのバイト迂回を防ぐ）。
 
     LLM 向け `view` は元から `cards[:_GRAPH_CARDS_MAX]` で件数制限していたが、4つ目の戻り値（呼び出し元の
     3 dialect が `cards += cd` で蓄積し最終的に troubleshoot の `data.candidates` へ載るサイドカー）
@@ -512,13 +510,10 @@ def _clip_cards(cards: list, max_count: int = _GRAPH_CARDS_MAX, max_bytes: int =
     到達、または直列化バイト上限に達した時点で打ち切る（超過分は捨てる・fail-closed）。Neo4j 側の
     取得件数上限（`lens_service`）は範囲外のため触らず、ここで受け取った後にクリップする。
 
-    レビュー是正（FIX-M1・secRV・2026-07-19・単一巨大カードが個別上限を迂回）: 以前は
-    `if out and total + size > max_bytes` という条件のため、`out` が空（先頭カード）だと左辺が
-    False になり右辺のサイズ判定自体が評価されず、先頭カードは常に無条件で追加されていた
-    （実測: 単一 10,030 byte カードが 100 byte 上限でも必ず1件通っていた）。是正後は先頭を
-    特別扱いせず、各カード（先頭含む）を仮に追加した**候補リスト全体**の実直列化バイト数
+    先頭カードを特別扱いせず、各カード（先頭含む）を仮に追加した**候補リスト全体**の実直列化バイト数
     （`[`/`]`/`,` 等の区切り込み・個別要素バイトの単純合計ではない）が `max_bytes` を超えるなら、
-    そのカードを追加せず打ち切る（`out` が空のままでも巨大な単一カードは弾く）。
+    そのカードを追加せず打ち切る（`out` が空のままでも巨大な単一カードは弾く——`out` が空のときだけ
+    判定をスキップすると、単一の巨大カードが常に無条件で通ってしまう）。
     """
     out: list = []
     for c in cards[:max_count]:
@@ -675,7 +670,7 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
 
 
 # 原本読取ツール（S3b・`doc_readers.py`）専用の doc_id 解決に許す拡張子（小文字・ドット付き）。
-# RV#9 是正: `.xlsm` は台帳（`corpus_docs.classify_document`）が文書種別として扱わない拡張子
+# `.xlsm` は台帳（`corpus_docs.classify_document`）が文書種別として扱わない拡張子
 # ＝`verify_doc_exists` が常に False を返し、事前フィルタで通しても後続の確定判定で必ず落ちる
 # （入口で通す意味が無い・利用者に「読めるはず」と誤解させるだけ）ため対象外とする。`.xlsx` のみ。
 _XLSX_KINDS = frozenset({".xlsx"})
@@ -704,7 +699,7 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
     無効/範囲外/拡張子不一致/秘匿名/重要度制御/traversal/symlink/非regular/未実在/doctype不明は
     すべて `None`。
 
-    RV#1 是正: 戻り値の4つ目 `stat` は検査完了直後にこの関数自身が取った `rp.stat()`——呼び出し元
+    戻り値の4つ目 `stat` は検査完了直後にこの関数自身が取った `rp.stat()`——呼び出し元
     （`run_tool`）はこの後 `open()` するまでの間に `rp` が symlink 等に差し替えられていないかを
     `os.fstat` の (st_dev, st_ino) と突き合わせて確認する（検査後の再オープンで封じ込めを破る
     TOCTOU 対策・`_open_verified_original` 参照）。
@@ -757,16 +752,16 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
 
 
 def _open_verified_original(root: Path, doc_id: str, expected_st) -> tuple:
-    """RV#1 是正・RV2巡目#1 是正: `_safe_original_path` が検査した `doc_id` を、`root`（world root・
+    """`_safe_original_path` が検査した `doc_id` を、`root`（world root・
     信頼済みアンカー）から `_open_file_nofollow_walk`（read_around/read_doc と共有・各階層を
     `O_DIRECTORY|O_NOFOLLOW` で1段ずつ辿る）で再度 open してから、検査直後に取った `expected_st`
     （`os.stat_result`）とデバイス/inode が一致することを確認する。
 
     検査（symlink 拒否・封じ込め・秘匿名等）と実際の `open()` の間には常に TOCTOU の隙間がある。
-    以前の実装は検査済みの**最終パス要素だけ**を `os.O_NOFOLLOW` で単発 open していたため、その
-    隙間で祖先ディレクトリ（`root/doc_id` の途中の階層）が KB 外への symlink に差し替えられると、
+    検査済みの**最終パス要素だけ**を `os.O_NOFOLLOW` で単発 open するだけでは、その
+    隙間で祖先ディレクトリ（`root/doc_id` の途中の階層）が KB 外への symlink に差し替えられたとき、
     `stat`（検査時）と `open`（単発 open）が同じ差し替え後の外部 inode を指したまま一致してしまい
-    封じ込めを破れた——単発 `O_NOFOLLOW` は最終要素にしか効かない（POSIX 仕様）。`root` から
+    封じ込めを破られる——単発 `O_NOFOLLOW` は最終要素にしか効かない（POSIX 仕様）。`root` から
     `doc_id` の各要素を個別に `O_NOFOLLOW` で辿る本関数は、途中のどの段が symlink に差し替えられて
     いても `OSError` で検出する（祖先差し替えも拒否）。fstat 突合は仕上げの二重の安全弁として残す。
 
@@ -818,10 +813,9 @@ def _open_doc_stream(world: str, doc_id: str, sp, layer) -> tuple:
     走査の間じゅう開いたままにする必要があるため `with` に入れずそのまま返す）。失敗時
     `(None, {"error": ...})`。
 
-    2026-09（本丸・ストリーミング化）: 旧実装は `f.read(cap)` で全文を一括ロードしていた（cap の
-    既定を 64MiB へ引き上げた際、1回の呼び出しが最大 64MB を一括でメモリに載せる懸念が再燃した・
-    grep 側と同じ secRV MED-B 型）。以後は `grep_tool._CappedStreamReader`/`_logical_lines`
-    （2026-09 に grep をストリーミング化した際の実装をそのまま再利用・二重実装しない）で
+    `f.read(cap)` で全文を一括ロードすると、cap の既定 64MiB を1回の呼び出しで丸ごと
+    メモリに載せる懸念がある（grep 側と同種の懸念）。`grep_tool._CappedStreamReader`/`_logical_lines`
+    （grep のストリーミング走査の実装をそのまま再利用・二重実装しない）で
     bounded chunk 走査にし、呼び出し元（`_stream_doc_lines` 参照）が必要な窓だけ保持する。
     """
     if not scope_mod.in_scope(doc_id, sp):          # 範囲外は読まない（MIRROR §3）
@@ -1464,7 +1458,7 @@ def _desc_graph(with_grep: bool) -> str:
 
 def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool = True,
                  with_grep: bool = True) -> list:
-    # Med-1（RV・2026-07-07）: can_ask=False（回答の再送＝依頼に「確認ID:」を含む実行）では ask_user
+    # can_ask=False（回答の再送＝依頼に「確認ID:」を含む実行）では ask_user
     #   ツール自体を渡さない＝再質問ループを構造的に塞ぐ（S2 の SHERPA_MCP_ASK_DISABLED と同思想）。
     # SC-6e: `with_grep`（既定 True）は検索経路トグルの grep 軸。list_docs/doc_outline/read_doc/
     #   read_around は土台系のため対象外＝常に含める。glob_search（ファイル名/パスのグロブ検索）も
@@ -1501,7 +1495,7 @@ def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
 
 def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool = True,
                  with_grep: bool = True) -> list:
-    # Med-1（RV・2026-07-07）: can_ask=False（確認ID 付き再送）では ask_user を渡さない（openai_tools と同じ）。
+    # can_ask=False（確認ID 付き再送）では ask_user を渡さない（openai_tools と同じ）。
     # SC-6e: with_grep は openai_tools と同じ意味（既定 True）。glob_search も同じく grep 軸に同居する。
     fns = [{"name": "list_docs", "description": _DESC_LIST_DOCS, "parameters": _PARAMS_LIST_DOCS}]
     # K6: openai_tools と同じ理由で常に含める。
@@ -1550,7 +1544,7 @@ def graph_gemini_tools() -> list:
 # `read_evidence`（`InvestigationState`）に載せるための `doc_id`/`text`/`locator` はここ
 # （`run_tool` の 6 分岐だけが doc_id を知っている）で合成する。
 
-# ツール名→(切り詰め対象フィールド, なければ None＝クリップ不要) の対応（RV#7）。
+# ツール名→(切り詰め対象フィールド, なければ None＝クリップ不要) の対応。
 _READER_CLIP_FIELD = {
     "xlsx_sheets": "sheets", "xlsx_range": "rows", "docx_paragraphs": "paragraphs",
     "pptx_slides": "slides", "pdf_pages": "pages", "file_head": "text",
@@ -1565,7 +1559,7 @@ def _row_start_from_a1_range(range_a1: str) -> int | None:
 
 
 def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str | None]:
-    """RV#5 是正: S3b 原本読取ツール（6本）の結果から `read_evidence`/根拠ゲートに載せる
+    """原本読取ツール（6本）の結果から `read_evidence`/根拠ゲートに載せる
     `text`（rows/paragraphs/slides/pages を1本の本文に連結・位置情報を行頭に付ける）と
     `locator` を組む。エラー/中身なしは `(None, None)`（呼び出し元は doc_id/text/locator を
     足さない＝空の read evidence を作らない）。
@@ -1600,8 +1594,8 @@ def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str |
             lines.append(f"{no}: " + "\t".join(str(c) for c in cells))
         return "\n".join(lines), locator
     if name == "docx_paragraphs":
-        # RV2巡目#8: 表（`tables`）も本文合成の対象にする——以前は段落だけを見ていたため、表しか
-        # 無い docx（段落0件）は read_evidence が常に空になっていた。
+        # 表（`tables`）も本文合成の対象にする——段落だけを見ると、表しか
+        # 無い docx（段落0件）は read_evidence が常に空になる。
         paras = [p for p in (result.get("paragraphs") or []) if isinstance(p, dict)]
         tables = [t for t in (result.get("tables") or []) if isinstance(t, dict)]
         if not paras and not tables:
@@ -1635,8 +1629,8 @@ def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str |
         locator = ";".join(parts) if parts else "paragraphs"
         return (text or None), locator
     if name == "pptx_slides":
-        # RV2巡目#8: 表・ノートも本文合成の対象にする（段落と同じ理由・スライドはテキストのみ
-        # だと表の内容やノートの補足が read_evidence から丸ごと落ちていた）。
+        # 表・ノートも本文合成の対象にする（段落と同じ理由・スライドはテキストのみ
+        # だと表の内容やノートの補足が read_evidence から丸ごと落ちる）。
         slides = [s for s in (result.get("slides") or []) if isinstance(s, dict)]
         if not slides:
             return None, None
@@ -1673,10 +1667,10 @@ def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str |
 
 
 def _shrink_xlsx_range_field(orig_range: str | None, n_rows: int) -> str | None:
-    """RV2巡目#7 是正: `orig_range`（doc_readers.xlsx_range が返した実際の A1 レンジ）を、行が
-    `n_rows` 行へバイト予算で削減された場合の実際の範囲に更新する（列は不変・終了行だけ詰める）。
-    以前は行を減らしても `range`（延いては `locator`）が元の（削る前の）範囲のまま食い違って
-    残っていた。解析できなければ元の値のまま返す（fail-safe・致命的ではない）。
+    """`orig_range`（doc_readers.xlsx_range が返した実際の A1 レンジ）を、行が
+    `n_rows` 行へバイト予算で削減された場合の実際の範囲に更新する（列は不変・終了行だけ詰める）——
+    更新しないと、行を減らしても `range`（延いては `locator`）が元の（削る前の）範囲のまま
+    食い違って残る。解析できなければ元の値のまま返す（fail-safe・致命的ではない）。
     """
     if not orig_range or n_rows <= 0:
         return orig_range
@@ -1689,16 +1683,16 @@ def _shrink_xlsx_range_field(orig_range: str | None, n_rows: int) -> str | None:
         return orig_range
 
 
-# RV2巡目#6 是正: 二分探索で1件も残せない場合に「先頭1件の text を切り詰めて残す」対応を
+# 二分探索で1件も残せない場合に「先頭1件の text を切り詰めて残す」対応を
 # 実装済みのツール（dict 要素が str の `text` フィールドを持つ形）。xlsx_range（行=セルのリスト）・
 # pptx_slides（要素は `texts`/`tables`/`notes`・単一の text フィールドが無い）は対象外——
-# 1件も入らなければ従来どおり空のまま返す（本 RV で確認・要求された再現ケースの範囲で対応）。
+# 1件も入らなければ従来どおり空のまま返す。
 _SINGLE_ITEM_TEXT_FIELDS = frozenset({"pdf_pages"})
 
 
 def _shrink_single_item_result(name: str, result: dict, doc_id: str, field: str,
                                item, tr_max_bytes: int) -> dict | None:
-    """RV2巡目#6 是正: 1件も残せないとき、先頭1件だけを予算内へ切り詰めて `text_truncated: true`
+    """1件も残せないとき、先頭1件だけを予算内へ切り詰めて `text_truncated: true`
     を立てて残す（番号（`no`/`i`）と locator は保つ）——全消滅より情報量を残す。
     """
     if not isinstance(item, dict):
@@ -1731,7 +1725,7 @@ def _shrink_single_item_result(name: str, result: dict, doc_id: str, field: str,
 
 
 def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int) -> dict:
-    """RV2巡目#5 是正: `docx_paragraphs` 専用の仕上げ——段落だけでなく表（`tables`・表→行）も
+    """`docx_paragraphs` 専用の仕上げ——段落だけでなく表（`tables`・表→行）も
     バイト予算の削減対象にする。予算超過時は**段落を先に確保**（表 0 行で段落数を二分探索）し、
     余った予算で表の行を先頭の表から順に埋める（行単位でフラット化・途中で打ち切ると
     `row_truncated`）——表を満量のまま段落を削ると大きな表の文書で段落が 1 件も返らない。
@@ -1854,14 +1848,14 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
 
 
 def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: int) -> dict:
-    """S3b 6ツール共通の仕上げ（`_redact_deep` の後に呼ぶ）: RV#5 の `doc_id`/`text`/`locator`
-    合成と RV#7 のバイト上限クリップを同時に行う——`text` は `result[field]`（rows/paragraphs/
+    """原本読取ツール6本共通の仕上げ（`_redact_deep` の後に呼ぶ）: `doc_id`/`text`/`locator`
+    合成とバイト上限クリップを同時に行う——`text` は `result[field]`（rows/paragraphs/
     slides/pages/sheets）から毎回作り直すため、クリップで `field` を削っても `text` が古い
     （削る前の）内容のまま残って予算を超えたり、構造と食い違ったりしない。二分探索は
     `doc_id`/`text`/`locator` を含めた最終形の JSON バイト数（`_result_byte_size`）で判定する。
     エラー結果はそのまま。
 
-    `docx_paragraphs` は表も削減対象にする必要がある（RV2巡目#5）ため専用の
+    `docx_paragraphs` は表も削減対象にする必要があるため専用の
     `_finish_docx_paragraphs_result` に委譲する。
     """
     if not (isinstance(result, dict) and not result.get("error")):
@@ -1875,7 +1869,7 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
         if field is not None and seq is not None:
             r[field] = seq
             if name == "xlsx_range":
-                # RV2巡目#7: 行を削った分だけ `range`（延いては locator）も実際の範囲へ合わせる。
+                # 行を削った分だけ `range`（延いては locator）も実際の範囲へ合わせる。
                 r["range"] = _shrink_xlsx_range_field(result.get("range"), len(seq))
         # 合成元の rows/paragraphs/slides/pages/sheets は既に `_redact_deep` を
         # 通過済み（呼び出し元・run_tool）——合成後に鍵ブロックの補完伏せ字を掛け直す必要はない。
@@ -1897,7 +1891,7 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
             lo = mid + 1
         else:
             hi = mid - 1
-    # RV2巡目#6: 1件も残せない（best のフィールドが空）場合、先頭1件だけ text を予算内へ切り詰めて
+    # 1件も残せない（best のフィールドが空）場合、先頭1件だけ text を予算内へ切り詰めて
     # 残す（対応済みツールのみ・`_SINGLE_ITEM_TEXT_FIELDS` 参照）。
     if (isinstance(full_seq, list) and full_seq and name in _SINGLE_ITEM_TEXT_FIELDS
             and not (best.get(field) if field is not None else None)):
@@ -2046,10 +2040,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         cap_reached = False                             # ヒット上限に達した（母集団の一部しか見ていない）
         if name == "es_search":
             from . import documents                       # ES ヒットは現 world に**実在する doc** だけ採用
-            # 古い ES 索引由来の 404／別内容リンクを引用/出典に出さない（非agentic の _es_citations と同じ実在チェック・rv-full2 #4）。
+            # 古い ES 索引由来の 404／別内容リンクを引用/出典に出さない（非agentic の _es_citations と同じ実在チェック）。
             # 実在集合は**1回だけ**作る（per-hit のツリー走査を避ける・rv MED）。
             valid = documents.world_rel_set(world, deadline=deadline)
-            # RV2（FBK-1・2026-09-01）: `es_index.search()` は (hits, degrade_reason) を返す
+            # `es_index.search()` は (hits, degrade_reason) を返す
             # （BM25 継続時の縮退理由・`embedding_cloud_unavailable`/`query_embed_failed` 等）。
             # ここではまだ tool result に生値のまま載せる（呼び出し元＝各 dialect のループが
             # `_degrade_result_node()` で既知語彙だけを思考ノードへ変換する）。
@@ -2092,10 +2086,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         # あり）は doc_id ごとに束ねて `_resolve_parent_return` へ渡し、legacy ヒット（`chunk_id`
         # 無し・40行チャンク由来）は従来どおり素通しする（`out` へ直接積む）。
         #
-        # 順位保持（RV是正・rv-i2-importance #6・2026-09）: `hits` は ES ヒットのスコア降順のまま
-        # 渡ってくる（`es_index.search`）。旧実装は legacy ヒットを先に全部積み、rag 文書の集約結果を
-        # 末尾へ `extend` していたため、rag 文書のスコアが legacy ヒットより高くても常に後方へ回る
-        # （検索結果全体のスコア降順という契約を後処理が壊していた）。`rag_slot_index` で各 doc の
+        # 順位保持: `hits` は ES ヒットのスコア降順のまま
+        # 渡ってくる（`es_index.search`）。legacy ヒットを先に全部積み、rag 文書の集約結果を
+        # 末尾へ `extend` すると、rag 文書のスコアが legacy ヒットより高くても常に後方へ回ってしまう
+        # （検索結果全体のスコア降順という契約を崩す）。`rag_slot_index` で各 doc の
         # **最初に出現した（＝最高スコアの）ヒットの位置**を `out` 内に予約し、legacy ヒットはその場で
         # 確定させる二段構えにする——`_resolve_parent_return`（budget 計算後にしか結果が出ない）の
         # 完了を待たずに全体の並びを一度の走査で確定できる。
@@ -2109,7 +2103,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # rag_chunks 由来（locator あり）は位置ヒントを LLM への text にだけ添える（SEARCH-CUT-3）。
             # citation の quote は hint 抜きのまま（redaction/500字上限は従来どおり適用済み・出典
             # フッターは doc_id リンクのみで locator は出さない・docs/04 契約は不変）。
-            # hint は本文と結合してから redaction・上限を通す（RV MED-3: 先に切ってから足すと
+            # hint は本文と結合してから redaction・上限を通す（先に切ってから足すと
             # 双方のガードを迂回する＝結合後にもう一度まとめて掛け直す）。`locator_hint` 自体も
             # 型検証・改行除去・長さ上限済みだが、ここでの redaction は本文と同じ扱いにする。
             hint = citations.locator_hint(h.get("locator"))
@@ -2143,7 +2137,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 # （上の `continue` で除外済み）＝ここに来るのは展開されず _HIT_TEXT_MAX_CHARS で
                 # 切られたヒットだけ。理由が無ければキー自体を作らない既存の流儀（`file_truncated` と同じ）。
                 hit_view["text_truncated"] = True
-            # I2（2026-09-05）: grep（`ripgrep_search`）ヒットが持つ登録者重要度（`grep_tool.
+            # grep（`ripgrep_search`）ヒットが持つ登録者重要度（`grep_tool.
             # grep_search` が条件付きで付ける）を LLM 向け tool result にも転送する——重要文書を
             # 優先的に精読（read_around）できるようにする。es_search 側の `h` はこのキーを
             # 持たない（付けていない）ため、この条件付き追加は自然に ripgrep_search 限定になる。
@@ -2163,7 +2157,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if rag_groups:
             # legacy ヒット分（`out` に既に積んだ分・予約枠の `None` は除く）を先に差し引いた残りが
             # rag doc 群の予算（§3.4「全文書ぶんの最低保証」は legacy を含めた tool result 全体の
-            # 予算から見る＝旧実装と同じ計算）。
+            # 予算から見る）。
             legacy_bytes = sum(len(hv["text"].encode("utf-8")) for hv in out if hv is not None)
             budget_for_rag = max(0, tr_max_bytes - legacy_bytes)
             resolved = _resolve_parent_return(world, rag_groups, sp, layer, budget_for_rag)
@@ -2175,7 +2169,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         # （続きを取る引数は無い＝モデルは範囲を絞る・別の語で探す・未確認として扱う）。
         if cap_reached or len(hits) >= (max_hits or MAX_HITS):
             view["truncated"] = True
-        if degrade_reason:                              # es_search のみ・BM25 継続時の縮退理由（RV2）
+        if degrade_reason:                              # es_search のみ・BM25 継続時の縮退理由
             view["degrade_reason"] = degrade_reason
         if truncated_docs:                              # ripgrep_search のみ・打切りで探せていない文書
             view["truncated_docs"] = truncated_docs[:_TRUNCATED_DOCS_MAX]
@@ -2191,7 +2185,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         from . import lens_service                       # 遅延 import（循環回避）
         term = str(args.get("name") or "")
         raw_cards = lens_service.neighbor_cards(world, term, sp) if term else []
-        # レビュー是正（FIX-2・secRV・2026-07-19・cards サイドカーのバイト迂回）: LLM 向け `view` は
+        # LLM 向け `view` は
         # 従来から `cards[:_GRAPH_CARDS_MAX]` で件数制限していたが、4つ目の戻り値（呼び出し元 3 dialect が
         # `cards += cd` で蓄積し、troubleshoot の `data.candidates` へ最終的に載るサイドカー）は
         # それとは独立に無制限で返しており、`total_tool_bytes`（1 run 累計バイト上限）の計測対象にも
@@ -2248,13 +2242,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         f, err = _open_doc_stream(world, doc_id, sp, layer)
         if err is not None:
             return (err, docs, cites, cards)
-        # ストリーミング窓抽出（本丸・2026-09）: `line` は既知なので、窓の外まで読む必要が無い
+        # ストリーミング窓抽出: `line` は既知なので、窓の外まで読む必要が無い
         # （目標の終端 `e_target` に達したら即座に打ち切る＝ファイル全体を保持しない）。総行数
-        # （`total_lines`）は read_around の結果に含まれないため、旧実装の `min(len(lines), ...)`
-        # と違い、ここでは`e_target` を総行数へクランプする必要も無い——EOF が `e_target` より
-        # 先に来れば、そこまでの内容が自然にそのまま結果になる（旧実装と同じ挙動）。
-        s = max(0, line - 1 - window)              # 0-based 窓の開始（旧実装の `s` と同じ式）
-        e_target = line - 1 + window + 1            # 0-based 窓の終端（排他・旧実装の `e` の式と同じ）
+        # （`total_lines`）は read_around の結果に含まれないため、`e_target` を総行数へ
+        # クランプする必要も無い——EOF が `e_target` より
+        # 先に来れば、そこまでの内容が自然にそのまま結果になる。
+        s = max(0, line - 1 - window)              # 0-based 窓の開始
+        e_target = line - 1 + window + 1            # 0-based 窓の終端（排他）
         collected: list[tuple[int, str]] = []
         try:
             _reader, it = _stream_doc_lines(f)
@@ -2266,7 +2260,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         finally:
             f.close()
         text = _redact("\n".join(f"{i}: {t}" for i, t in collected))
-        # secRV MED-B (a): 返却テキストの UTF-8 バイト数を上限で切り詰める（単一行が巨大な文書でも、
+        # 返却テキストの UTF-8 バイト数を上限で切り詰める（単一行が巨大な文書でも、
         # 履歴/SSE/次ターンの LLM 要求へ複製される量を bound する）。上限で実際に短くなった時だけ
         # `text_truncated` を明示する（read_doc/doc_outline の `text_truncated`/`file_truncated` と
         # 同じ語彙＝精読が黙って取りこぼさない）。
@@ -2419,7 +2413,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if resolved is None:
             return ({"error": "doc_id が無効、または読み取り対象外です"}, docs, cites, cards)
         _root, _resolved_doc_id, rp, st = resolved
-        f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # RV#1・RV2巡目#1
+        f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # TOCTOU 再検証
         if open_err is not None:
             return (open_err, docs, cites, cards)
         from . import doc_readers
@@ -2470,7 +2464,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         if resolved is None:
             return ({"error": "doc_id が無効、または読み取り対象外です"}, docs, cites, cards)
         _root, _resolved_doc_id, rp, st = resolved
-        f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # RV#1・RV2巡目#1
+        f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # TOCTOU 再検証
         if open_err is not None:
             return (open_err, docs, cites, cards)
         from . import doc_readers
@@ -2580,7 +2574,7 @@ def _tool_node(name: str, args: dict) -> dict:
     return _node(name, "")
 
 
-# S3b（原本読取ツール）: ツール名→表示ラベル。RV#11 是正: `xlsx_sheets`（シート名・大きさだけを
+# 原本読取ツール: ツール名→表示ラベル。`xlsx_sheets`（シート名・大きさだけを
 # 見る＝本文精読ではない）は `xlsx_range`（セルの中身そのものを読む）と別ラベルに分ける——
 # 同じ「原本を読む（Excel）」に丸めていると、シート一覧を確認しただけのターンも改善ログの
 # `files_read`（本文を実際に読んだ数）に誤って数えられてしまう。Codex 側
@@ -2596,7 +2590,7 @@ _ORIGINAL_READ_LABELS = {
 }
 
 
-# ツール名 → (label, detail) の固定文言（引数を一切埋め込まない・secRV MED-2 参照）。
+# ツール名 → (label, detail) の固定文言（引数を一切埋め込まない）。
 _SUB_TOOL_FIXED_WORDING = {
     "list_docs": ("資料の一覧を確認", "資料の一覧を確認しています"),
     "folder_tree": ("フォルダ構成を確認", "フォルダ構成を確認しています"),
@@ -2619,7 +2613,7 @@ _SUB_TOOL_FIXED_WORDING = {
 
 
 def _tool_node_sub(name: str) -> dict:
-    """サブ経路専用のツールノード（secRV MED-2・2026-07-18・ローカルサブの生成物が公式 UI/trace に露出）。
+    """サブ経路専用のツールノード（ローカルサブの生成物が公式 UI/trace に露出するのを防ぐ）。
 
     `_tool_node` はモデル生成の引数（query/doc_id/path/prompt 等）をそのままノードの detail に
     埋め込む。サブ経路（`allowed_tools is not None`＝`_sub_agentic_loop` 経由）では、`name` 自体は
@@ -2633,9 +2627,9 @@ def _tool_node_sub(name: str) -> dict:
     return _node(label, detail)
 
 
-# `es_search` の tool result に載る `degrade_reason`（`es_index.search()` の reason・RV2 参照）→
+# `es_search` の tool result に載る `degrade_reason`（`es_index.search()` の reason）→
 # 固定文言。BM25（キーワード一致）の結果は継続利用しつつ、精度が一部落ちていることを
-# 「思考の流れ」に決定的に表示する（サーバログの warning だけでは利用者に届かない・RV2 是正）。
+# 「思考の流れ」に決定的に表示する（サーバログの warning だけでは利用者に届かない）。
 # 語彙は `es_query_failed`（hits 自体が空になる BM25 自体の失敗）を含まない——BM25 の結果を
 # そのまま使えている場合（hits が空でない）だけを対象にする（`es_index.search()` docstring 参照）。
 _ES_DEGRADE_WORDING = {
@@ -2643,7 +2637,7 @@ _ES_DEGRADE_WORDING = {
                                     "選択中の AI での意味検索が使えないため、キーワード一致のみで探しています"),
     "query_embed_failed": ("検索の精度が一部低下しています",
                            "検索語の変換が一時的に失敗したため、キーワード一致のみで探しています"),
-    # RV3（FBK-1・2026-09-01）: hybrid クエリ自体の失敗（次元不一致/未ベクトル索引等）で
+    # hybrid クエリ自体の失敗（次元不一致/未ベクトル索引等）で
     # BM25 のみへ降格した場合＝`query_embed_failed`（クエリ埋め込み自体が失敗）とは別原因だが、
     # 利用者向けの案内文は同じでよい（どちらも「意味検索は使えず、キーワード一致のみ」という
     # 結果は同じ）。
@@ -2777,7 +2771,7 @@ def _hit_summary_dict(label: str, detail: str) -> dict:
 def _hit_summary_node(name: str, args: dict, result: dict) -> dict | None:
     """メイン経路（`allowed_tools is None`）向け: 検索語＋ヒット件数を1行にまとめた追加ノード
     （無ければ None）。`_tool_node` と同じく引数（query/name/doc_id 等）をそのまま detail に
-    埋め込む＝メイン経路の既存の豊かな表示方針のまま（secRV MED-2 の対象外）。長い query は
+    埋め込む＝メイン経路の既存の豊かな表示方針のまま。長い query は
     `_clip` で60字に丸める（UI 側の折返し/幅対策）。
     """
     n = _tool_hit_count(name, result)
@@ -2792,7 +2786,7 @@ def _hit_summary_node(name: str, args: dict, result: dict) -> dict | None:
         return _hit_summary_dict(label, f"「{_clip(args.get('pattern'), 60)}」→ {n}件")
     if name == "es_search":
         # 縮退表示自体は `_degrade_result_node`（既存・別ノード）が変わらず担う——ここでは
-        # 「実際に使われた検索方式」を短く添えるだけ（RV2/RV3 の degrade_reason は BM25 継続時の
+        # 「実際に使われた検索方式」を短く添えるだけ（degrade_reason は BM25 継続時の
         # 縮退理由＝立っていれば必ずキーワード一致のみになっている）。
         mode = "キーワード一致のみ" if result.get("degrade_reason") else "全文/意味検索"
         tail = "・上限で打ち切り" if result.get("truncated") else ""
@@ -2825,7 +2819,7 @@ def _hit_summary_node(name: str, args: dict, result: dict) -> dict | None:
 
 def _hit_summary_node_sub(name: str, result: dict) -> dict | None:
     """サブ経路（`allowed_tools is not None`）向け: `_tool_node_sub` と同じく、モデル生成の
-    引数（query/doc_id 等）は一切使わない固定文言＋件数のみ（secRV MED-2 参照）。件数は
+    引数（query/doc_id 等）は一切使わない固定文言＋件数のみ。件数は
     run_tool の結果から数えた整数であり、モデル生成の自由文字列ではないため安全に出せる。
     """
     n = _tool_hit_count(name, result)
@@ -2835,7 +2829,7 @@ def _hit_summary_node_sub(name: str, result: dict) -> dict | None:
     if name == "read_around":
         detail = f"{n}行読み込みました"
     elif name == "read_doc":
-        # secRV MED-2 の流儀（固定文言＋数値のみ）: start_line/end_line/total_lines は
+        # 固定文言＋数値のみ: start_line/end_line/total_lines は
         # モデル生成の自由文字列ではなく run_tool が検証・算出した整数のため安全に出せる。
         detail = f"{result.get('start_line')}〜{result.get('end_line')}行を読了（全{result.get('total_lines')}行）"
     elif name == "doc_outline":
@@ -2975,7 +2969,7 @@ def _post(url: str, headers: dict, body: dict, timeout: int = 90) -> dict:
     return llm.post_json(url, headers, body, timeout)
 
 
-# ---- F3（2026-07-07）: トークン使用量の合算（ツールループの全ターン分＝メイン回答呼び出し合計） ----
+# ---- トークン使用量の合算（ツールループの全ターン分＝メイン回答呼び出し合計） ----
 # 生トークンだけを合算し、provider/model の付与は呼び元（agents._agentic_run）が行う（この層は
 # provider を知らない設計）。`final` イベントに `usage` を載せる（無ければ None）。
 def _new_usage_acc() -> dict:
@@ -3035,9 +3029,9 @@ _GRAPH_AVAILABLE_TIMEOUT = float(os.environ.get("SHERPA_GRAPH_AVAILABLE_TIMEOUT"
 def _graph_available() -> bool:
     """関係グラフ(Neo4j)ツール `graph_neighbors` を AI に提示するか。
 
-    `es_index.available()` と対称に**実接続**を確認する（SC-6e）。以前は URI の有無だけを
-    見ており、`world_neo4j.default_neo4j_uri()` が未設定時も `bolt://localhost:7687` へフォール
-    バックして常に非空文字列を返すため、Neo4j 未起動でも常に True になっていた
+    `es_index.available()` と対称に**実接続**を確認する（SC-6e）——URI の有無だけを見ると、
+    `world_neo4j.default_neo4j_uri()` が未設定時も `bolt://localhost:7687` へフォール
+    バックして常に非空文字列を返すため、Neo4j 未起動でも常に True になってしまう
     （`health._ping_neo4j` と同じ接続確認＝`GraphDatabase.driver(...).verify_connectivity()`）。
     """
     try:
@@ -3177,7 +3171,8 @@ def tools_blocked_env(lens: str) -> dict:
     """
     headline = _TOOLS_BLOCKED_HEADLINE.get(lens, _TOOLS_BLOCKED_HEADLINE_DEFAULT)
     return {"headline": headline, "summary": {"total": 0}, "data": {}, "sources": [],
-           "_tools_blocked": True}
+            "agentic_failure": "error",   # 実行できなかったターン＝終了理由の分布で完了扱いにしない
+            "_tools_blocked": True}
 
 
 def unavailable_explicit_tools(tools_raw: dict | None, availability: dict | None = None) -> list:
@@ -3604,7 +3599,7 @@ def _card_structural_evidence(cards: list) -> list:
 # サーバー側で doc_id へ逆引きする。失敗・不正な応答・タイムアウト・call 予算切れはすべて空集合
 # （read_around のみへ縮退）——リトライしない（帰属の失敗は「申告なし」として扱ってよい）。
 #
-# digest／帰属用回答コピーは**ツール結果と同じ露出**で組む（設計簡素化・2026-08-24）——生 doc_id・
+# digest／帰属用回答コピーは**ツール結果と同じ露出**で組む（設計簡素化）——生 doc_id・
 # 実パス・list_docs の検索条件・graph の対象名/経路/裏付け doc（CID を含む）はそのまま載せる。
 # 帰属呼び出しの送信先は回答合成と同じクラウド LLM で、ツール結果として既にこれらの原文を
 # 受け取っている（閉域 LAN 前提・CLAUDE.md）ため、digest だけを別名化しても秘匿性は増えず、
@@ -3729,7 +3724,7 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
                 fact = (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
                        f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else ""))
             elif "tree_meta" in m:
-                # RV是正（rv-periphery #1）: folder_tree の構造 Evidence（`matched_doc_ids` は常に
+                # folder_tree の構造 Evidence（`matched_doc_ids` は常に
                 # 空・裏付け doc 無し）。list_docs と同じ「条件＋件数」の事実整形。
                 tm = m.get("tree_meta") or {}
                 cond_text = f"（path_prefix={_digest_clean(tm['prefix'])}）" if tm.get("prefix") else ""
@@ -3880,7 +3875,7 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
     出さない内部専用行のため `ev_map` には登録しない（`ev-N` を割り当てない＝攻撃的な幻覚 ev-N
     と衝突しない）。
 
-    `gaps`（省略可・既定 None＝空・C RV是正2巡目）: `InvestigationState.gaps`（検索0件／打ち切り／
+    `gaps`（省略可・既定 None＝空）: `InvestigationState.gaps`（検索0件／打ち切り／
     未確認という調査の限界・機械生成の文字列列）。引用・構造行より前（先頭）に「調査の限界: …」行を
     末尾優先 `_SYNTHESIS_GAPS_MAX_ITEMS`（20）件（重複除去）・各 `_SYNTHESIS_GAP_CAP`（200字）まで追加する——
     同じ `max_bytes` 予算・打ち切り注記を共有し、`ev_map` には登録しない（`read_evidence` と同じ
@@ -4082,8 +4077,9 @@ STOP_REASONS = frozenset({
 # STOP-1: 調査予算（ターン数／呼び出し予算／1応答あたりの調べる操作の回数）到達で
 # 打ち切られた3値——`providers/base.py::_agentic_run` がこの3値を「一般的な失敗」（空回答→単発
 # grep フォールバック）から分離し、固定文言の headline と既存 Evidence Packet を最終 envelope へ
-# 載せる根拠に使う（`web/chat/render.js::BUDGET_EXHAUSTED_STOP_REASONS` と同じ分類・そちらは表示側
-# の注記表示可否の判定に使う独立実装＝値は必ず両方揃えて更新する）。
+# 載せる根拠に使う（`web/chat/render.js::BUDGET_EXHAUSTED_STOP_REASONS`＝表示側の注記表示可否・
+# `stop_kind._BUDGET_STOP_REASONS`＝終了理由の分布、と同じ分類の独立実装が 2 つある＝値は必ず
+# 3 箇所揃えて更新する）。
 _BUDGET_EXHAUSTED_STOP_REASONS = frozenset({"turns_exhausted", "budget_exceeded", "tools_per_turn_exceeded"})
 # EV-0（拡張設計 §4.4）: main の3方言・クリーン再合成が帰属呼び出しへ進んでよい「自然完了」の
 # 完了理由 allowlist（方言別）——理由欠落・`content_filter`・`SAFETY`・打ち切り（openai/ollama
@@ -4593,7 +4589,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     「試みた」として計上される（失敗の中身が「タイムアウト値の型エラー」という無意味なものになる）
     ため、転送経路すべてで解決を徹底する。
 
-    `stop_event`（UI フィードバック1「途中停止」の RV MEDIUM 再検証・2026-07-03）: 各ターンの
+    `stop_event`（UI フィードバック1「途中停止」）: 各ターンの
     リクエスト発行前に確認し、立っていれば以降のリクエストを一切発行せず終了する（HTTP 呼び出し
     自体の中断は不要＝次のターン境界で止まれば足りる、という設計）。`final` を yield せずに
     `return` するだけ＝呼び元（`agents._agentic_run`）は「未応答」として扱い、fallback を試みない
@@ -4615,17 +4611,16 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     ツール結果でループを継続する（例外にしない・ask_user も対象＝ツール定義配列を絞る (a) をすり抜けて
     モデルが未提示のツール名を呼んだ場合の多層防御）。既定 None は無制限（既存呼び出し元は無変更）。
     非 None＝サブ経路の合図でもある: 許可済みツール呼び出しのノードは `_tool_node`（args を含む豊かな
-    表示）ではなく `_tool_node_sub`（args を含まない固定文言）になる（secRV MED-2・2026-07-18）。
+    表示）ではなく `_tool_node_sub`（args を含まない固定文言）になる。
 
-    `MAX_TOOLS_PER_TURN`（secRV MED-3・2026-07-18・DoS 対策）: 1 応答内の tool_calls 実行数を独立に
-    上限する（`max_turns` は応答ラウンド数だけを制限し、1 応答内の呼び出し数は無制限だった）。超過分は
+    `MAX_TOOLS_PER_TURN`（DoS 対策）: 1 応答内の tool_calls 実行数を独立に
+    上限する（`max_turns` は応答ラウンド数だけを制限し、1 応答内の呼び出し数自体は制限しない）。超過分は
     `run_tool` を呼ばずに打ち切り、`stop_event` も各ツール実行の直前に確認する（メイン/サブ経路の
     両方に適用＝`allowed_tools` の有無に関わらず一律）。
 
-    レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分（例: 1応答に10万件の tool_calls）に対して
-    「上限」ノードを超過件数と同数（99,984件）生成し SSE/trace を肥大化させていた。是正後は
-    `calls[:max_tools_per_turn]` だけを処理し、超過があればループ終了後に**固定ノード1件だけ**生成
-    して打ち切る。
+    超過分（例: 1応答に10万件の tool_calls）に対して超過件数と同数の「上限」ノードを
+    生成すると SSE/trace が肥大化する。`calls[:max_tools_per_turn]` だけを処理し、超過があれば
+    ループ終了後に**固定ノード1件だけ**生成して打ち切る。
 
     `SHERPA_TOOL_PARALLEL`（D1・ツール並列）: 1 応答内の呼び出しが2本以上・ask_user を含まない
     ときだけ `ThreadPoolExecutor(max_workers=SHERPA_TOOL_PARALLEL)` で同時実行する（同一応答内の
@@ -4637,21 +4632,21 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     確認し、投入済みの完了は待ってから（未投入分は実行せず）既存の停止契約（final を出さない）に
     従う。
 
-    レビュー是正（LOW-E・secRV・2026-07-18 再検証）: ツールノードを yield した直後（generator が
-    一時停止し、呼び出し元がノードを処理してから再開される窓）に停止要求が来ても、再開後は
-    stop_event を再確認せず ask_user 分岐/`run_tool` を1件実行してしまっていた。是正後はノード yield
+    ツールノードを yield した直後（generator が
+    一時停止し、呼び出し元がノードを処理してから再開される窓）に停止要求が来ても、再開後に
+    stop_event を再確認しなければ ask_user 分岐/`run_tool` を1件実行してしまう。ノード yield
     直後・ask_user 分岐/`run_tool` の直前にも stop_event を再確認する。
 
-    レビュー是正（MED-B (c)・secRV・2026-07-18）: `run_tool` の戻り値（tool result）の累計バイト量
+    `run_tool` の戻り値（tool result）の累計バイト量
     （1 run＝本関数の1呼び出し全体）が `TOOL_RESULT_MAX_TOTAL_BYTES` を超えたら、固定エラーの node を
     1件流して run を打ち切る（fail-closed。read_around 等の tool-result が (a)(b) で個別に上限化
     されていても、多数回の呼び出しが積み重なる総量までは抑えられないため）。
 
-    レビュー是正（FIX-H・secRV・2026-07-19・実行 allowlist の非対称）: 拒否分岐（`allowed_tools`）は
-    従来サブ経路（`allowed_tools` 明示指定）でのみ働き、メイン経路（`allowed_tools=None`）は
-    提示していないツール名をモデルが呼んでも `run_tool` を実行しうる非対称があった（現状は
-    `tools` がフル提示のため実害は無いが、提示 toolset と実行可否が独立＝将来の呼び出し元の
-    footgun）。是正: ループ冒頭で実際に提示した `tools` からツール名集合 `offered_names` を導出し、
+    拒否分岐を `allowed_tools` の有無でサブ経路（明示指定）だけに限ると、メイン経路
+    （`allowed_tools=None`）では提示していないツール名をモデルが呼んでも `run_tool` を実行しうる
+    非対称が残る（現状は `tools` がフル提示のため実害は無いが、提示 toolset と実行可否が独立だと
+    将来の呼び出し元の footgun になる）。そのためループ冒頭で実際に提示した `tools` からツール名集合
+    `offered_names` を導出し、
     `effective_allowed = allowed_tools if allowed_tools is not None else offered_names` を実行
     allowlist として使う（＝提示していないツール名は常に拒否・メイン/サブ経路で対称）。メイン経路の
     正常系は不変: `tools` は元々 `openai_tools(...)`／`toolset` の**そのもの**から `offered_names`
@@ -4661,8 +4656,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     （対称化）。ノード表示の豊かさ（`_tool_node` vs `_tool_node_sub`）はこの allowlist とは別の
     軸のまま＝引き続き `allowed_tools is not None`（真のサブ経路かどうか）で判定する。
 
-    `usage_acc`（S3・chat-sub 計測の欠落是正・2026-07-18 Codex RV 1巡目 MED・2巡目 MED で計数方式を
-    再是正）: 非 None のとき、`{"calls": int, "tokens": dict|None}` 形の呼び出し元アキュムレータを更新する。
+    `usage_acc`（S3・chat-sub 計測の欠落是正）: 非 None のとき、`{"calls": int, "tokens": dict|None}` 形の呼び出し元アキュムレータを更新する。
     `calls` は stop/SSRF ガード通過後・**`_post` 発行直前**に+1する（＝実際に試みた回数。`_post`
     自体が HTTP エラー/タイムアウト/不正応答で失敗しても、その試行は calls に含まれる＝
     「1回も試みていない」との誤認を防ぐ）。`tokens` は各ターンの `_post` が**成功した直後**
@@ -4775,7 +4769,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         tools = openai_tools(
             with_es=_avail["fulltext"] and _tp["fulltext"], with_graph=_avail["graph"] and _tp["graph"],
             can_ask=can_ask, with_grep=_tp["grep"])
-    # secRV FIX-H（2026-07-19・実行 allowlist の非対称）: 実際に提示した `tools` からツール名集合を
+    # 実際に提示した `tools` からツール名集合を
     # 導出し、`allowed_tools` 未指定（メイン経路）でも「提示していないツール名は拒否」を強制する。
     offered_names = frozenset(t["function"]["name"] for t in tools)
     effective_allowed = allowed_tools if allowed_tools is not None else offered_names
@@ -4795,7 +4789,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         from . import store
         system_settings = store.get_system_settings()
     max_tools_per_turn = effective_max_tools_per_turn(system_settings)
-    total_tool_bytes = 0                        # secRV MED-B (c): 1 run 累計の tool-result バイト量
+    total_tool_bytes = 0                        # 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
     # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: メイン頭脳の provider/model を渡し、
     # 窓由来の上限との min() を取る（`resolve_tool_result_budgets` docstring 参照）。Ollama の場合
@@ -4822,7 +4816,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             body["stream"] = False
             body["options"] = {"temperature": 0.2}
         # OpenAI へは temperature を送らない（bedrock/Claude と同じ扱い）。gpt-5.5 系は既定値(1)以外を
-        # 拒否し 400 `unsupported_value` を返すため、送るとツールループが丸ごと失敗する（2026-08-15 実測）。
+        # 拒否し 400 `unsupported_value` を返すため、送るとツールループが丸ごと失敗する。
         # 非ストリーミング＝usage は既定で resp に含まれる。呼び出し予算の消費・usage_acc への
         # 加算・OpenAI 送信ガードの確認は `_send` が物理送信ごとに自分で行う（本関数側では
         # 事前に消費・加算しない・`_send` docstring 参照）。
@@ -4894,7 +4888,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             break   # 共通の tail（Committed Evidence 化ゲート＋必要なら再合成）へ合流する
         searched = True
         msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
-        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `_pending_calls`
+        # 超過分は `_pending_calls`
         # （`calls[:max_tools_per_turn]`）で単純に切り捨てる（超過件数分のノードを生成しない＝
         # 下のループ後にまとめて固定ノード1件だけ流す）。
         _pending_calls = calls[:max_tools_per_turn]
@@ -5045,7 +5039,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     tmsg["tool_call_id"] = tc["id"]
                 msgs.append(tmsg)
         for tc in ([] if _use_parallel else _pending_calls):
-            # secRV MED-3 (b): 各ツール実行の直前に stop_event を確認する（1応答内に大量の tool_calls
+            # 各ツール実行の直前に stop_event を確認する（1応答内に大量の tool_calls
             # が積まれていても、途中停止が反映されないまま実行し続けることを防ぐ）。
             if stop_event is not None and stop_event.is_set():
                 return
@@ -5055,20 +5049,20 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             if name not in effective_allowed:
                 # S3・二重強制の(b): ツール定義配列を絞っていても（モデルの逸脱/幻覚呼び出しに備え）
                 # run_tool を呼ばずに拒否結果を返し、ループは継続する（例外にしない）。
-                # レビュー是正（MED・2026-07-18 Codex RV 2巡目・拒否ツールの生成文漏洩）: 許可判定を
-                # `_tool_node(name, args)` の**前**に行う。以前は判定より先にノードを yield して
-                # いたため、除外済み ask_user 等をモデルが幻覚呼び出しすると、モデル生成の引数
-                # （ask_user の "prompt" 等）が思考ノード/trace に漏れて表示・保存されてしまっていた。
-                # レビュー是正（MED・2026-07-18 Codex RV 3巡目・ツール名も生成文）: `name` 自体も
+                # 許可判定を
+                # `_tool_node(name, args)` の**前**に行う——判定より先にノードを yield すると、
+                # 除外済み ask_user 等をモデルが幻覚呼び出ししたとき、モデル生成の引数
+                # （ask_user の "prompt" 等）が思考ノード/trace に漏れて表示・保存されてしまう。
+                # `name` 自体も
                 # モデル生成値（未知名なら任意の長文になり得る）＝label にも使わず、node は**完全固定文言**
                 # にする。モデルへの是正フィードバック（tmsg・LLM 会話内のみ＝UI/trace に出ない）にだけ
                 # name を残す（どのツール名が拒否されたかをモデルが自己修正するために必要）。
-                # レビュー是正（FIX-1・secRV・2026-07-19・拒否ツール結果のバイト迂回）: `name` は
+                # `name` は
                 # モデル生成値で長さ無制限のため (a) `_REJECTED_TOOL_NAME_MAX_BYTES` で固定長へ
                 # クリップし、(b) この tool-result も他の tool-result と同じ `total_tool_bytes`
-                # 累計へ必ず計上する（以前は計上されず、この経路だけ 1 run 累計バイト上限をすり
-                # 抜けられた）。
-                # レビュー是正（FIX-H・secRV・2026-07-19・実行 allowlist の非対称）: 判定を
+                # 累計へ必ず計上する（計上しないと、この経路だけ 1 run 累計バイト上限を
+                # すり抜けられる）。
+                # 判定を
                 # `effective_allowed`（サブ経路は `allowed_tools`・メイン経路は `offered_names`）へ
                 # 統一し、メイン経路でも提示していないツール名の実行を拒否する（対称化）。
                 yield {"node": _node("許可外のツール呼び出し", "許可されていないため拒否しました")}
@@ -5076,7 +5070,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 result = {"error": f"ツール {safe_name} は使用できません"}
                 _sz = _result_byte_size(result)
                 total_tool_bytes += _sz
-                # S4-b（§6.2 項1）: 横断予算にも同じ増分を計上する（RV 3巡目是正: 不正な形は修復せず
+                # S4-b（§6.2 項1）: 横断予算にも同じ増分を計上する（不正な形は修復せず
                 # 未加算のまま直後の判定で fail-closed・詳細は下の同型サイトのコメント参照）。
                 if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
                     shared_budget["tool_bytes_used"] += _sz
@@ -5093,12 +5087,12 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     tmsg["tool_call_id"] = tc["id"]
                 msgs.append(tmsg)
                 continue
-            # レビュー是正（MED-2・secRV・2026-07-18）: サブ経路（`allowed_tools is not None`＝
+            # サブ経路（`allowed_tools is not None`＝
             # `_sub_agentic_loop` 経由）はモデル生成の引数（query/doc_id/path 等）を思考ノードに
             # 埋め込まない固定文言ノードにする（`_tool_node_sub` 参照）。メイン経路（allowed_tools
             # は None）は既存の `_tool_node`（豊かな表示）のまま＝byte-identical。
             yield {"node": (_tool_node_sub(name) if allowed_tools is not None else _tool_node(name, args))}
-            # レビュー是正（LOW-E・secRV・2026-07-18 再検証）: ノード yield 直後（generator 再開後）
+            # ノード yield 直後（generator 再開後）
             # にも stop_event を再確認する（ノードを流した直後に停止要求が来ても、再開後 ask_user
             # 分岐/run_tool を1件実行してしまう窓を塞ぐ）。
             if stop_event is not None and stop_event.is_set():
@@ -5122,7 +5116,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                        else _hit_summary_node(name, args, result))
             if hit_node:
                 yield {"node": hit_node}
-            # RV2（FBK-1・2026-09-01）: es_search が BM25 のみへ縮退した場合、その理由を「思考の
+            # es_search が BM25 のみへ縮退した場合、その理由を「思考の
             # 流れ」へも表示する（サーバログの warning だけでは利用者に届かない・`_degrade_result_
             # node` 参照）。
             degrade_node = _degrade_result_node(result)
@@ -5133,14 +5127,14 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             truncated_node = _truncated_docs_node(result)
             if truncated_node:
                 yield {"node": truncated_node}
-            # レビュー是正（MED-B (c)・secRV・2026-07-18）: 1 run 累計の tool-result バイト量が
+            # 1 run 累計の tool-result バイト量が
             # 上限を超えたら、この結果は破棄し固定エラーで run を打ち切る（fail-closed）。
-            # レビュー是正（FIX-2・secRV・2026-07-19）: `cd`（cards サイドカー・`run_tool` 側で
+            # `cd`（cards サイドカー・`run_tool` 側で
             # 既に件数＋バイト上限クリップ済み＝`_clip_cards` 参照）の直列化バイトも累計へ計上する
-            # （以前は `result` のみを計測しており、cards はこの計測経路をすり抜けていた）。
+            # （`result` のみを計測すると、cards はこの計測経路をすり抜けてしまう）。
             _sz = _result_byte_size(result) + _result_byte_size(cd)
             total_tool_bytes += _sz
-            # S4-b（§6.2 項1）: 横断予算にも同じ増分を計上する。RV 3巡目是正: 形が不正な dict は
+            # S4-b（§6.2 項1）: 横断予算にも同じ増分を計上する。形が不正な dict は
             # **修復しない**（.get 既定や int 化で正常形に見せると片側キー欠損が helper をすり抜ける）。
             # 正常形（helper が total=0 で False を返す形）のときだけ加算し、不正なら未加算のまま
             # 直後の `_tool_bytes_over_budget` が True（fail-closed）で打ち切る。
@@ -5184,7 +5178,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                                   "state": str(args.get("state") or "").strip()},
                     "matched_doc_ids": _matched})
             if name == "folder_tree" and "error" not in result:
-                # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
+                # folder_tree（K6・doc_ledger 走査による決定的集計・LLM
                 # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
                 # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
                 # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
@@ -5214,7 +5208,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         if over_limit:
             # レビュー是正（LOW-D）: 超過件数に関わらず固定ノード1件だけ生成する。
             yield {"node": _node("ツール呼び出し上限", "1回の応答あたりの実行数上限に達したため打ち切りました")}
-            # secRV MED-3 (c): この応答は上限超過＝以降のターンへは進まず、ここで打ち切る。
+            # この応答は上限超過＝以降のターンへは進まず、ここで打ち切る。
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
@@ -5501,14 +5495,14 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     `client` は SDK クライアント（`.messages.create` を持つ）または遅延生成する factory（callable）。
     ツールは OpenAI 形式（`openai_tools`/`graph_openai_tools`）を `input_schema` 形式に変換して渡す。
     **temperature/top_p/top_k/thinking は送らない**（例: jp.anthropic.claude-haiku-4-5 系では 400）・プレフィル無し・`max_tokens` 必須。
-    `stop_event`（UI フィードバック1「途中停止」の RV MEDIUM 再検証・2026-07-03）: `openai_style` と
+    `stop_event`（UI フィードバック1「途中停止」）: `openai_style` と
     同じ意味論＝各ターンのリクエスト発行前に確認し、立っていれば以降のリクエストを発行せず終了する。
     `history`（R1a・会話継続）: 直前ターンの (user, assistant) 対（時系列順・交互保証済み・
     上流でキャップ済み）。現在の user メッセージの前にそのまま並べる（system は kwargs のまま別）。
     省略/空なら従来と完全同一の初期 messages になる。`graph_admin.ask_graph` は位置引数で呼ぶため
     本引数に触れない＝既定 None（空）で後方互換。
 
-    レビュー是正（FIX-H・secRV・2026-07-19・実行 allowlist の非対称）: 実際に提示した `tools` から
+    実際に提示した `tools` から
     ツール名集合 `offered_names` を導出し、モデルが提示していないツール名を呼んでも `run_tool` を
     実行せず拒否する（`openai_style`/`gemini` と同じ対称化。Anthropic 経路も元々 `allowed_tools`
     引数を持たない＝常に `offered_names` を allowlist として使う）。
@@ -5545,7 +5539,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     from . import store
     system_settings = store.get_system_settings()
     max_tools_per_turn = effective_max_tools_per_turn(system_settings)
-    total_tool_bytes = 0                              # secRV MED-B (c): 1 run 累計の tool-result バイト量
+    total_tool_bytes = 0                              # 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
     # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: provider="bedrock"（本アプリの
     # `anthropic_style` 唯一の呼び出し元）＋`client`（`.models.retrieve()` 照会用・現状
@@ -5615,9 +5609,9 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
         searched = True
         messages.append({"role": "assistant", "content": resp.content})   # ブロックはそのまま履歴へ戻す
         results = []                                     # 全ツール結果を **1つの** user メッセージで返す
-        # secRV MED-3（2026-07-18・DoS/コスト増幅）: openai_style と同じ上限を適用する（`MAX_TURNS` は
-        # 応答ラウンド数だけを制限し、1応答内の tool_use 実行数は無制限だった）。
-        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `_pending_calls`
+        # openai_style と同じ上限を適用する（`MAX_TURNS` は
+        # 応答ラウンド数だけを制限し、1応答内の tool_use 実行数自体は制限しない）。
+        # 超過分は `_pending_calls`
         # （`tool_uses[:max_tools_per_turn]`）で単純に切り捨てる（超過件数分のノードを生成しない＝
         # 下のループ後に固定ノード1件だけ流す）。
         _pending_calls = tool_uses[:max_tools_per_turn]
@@ -5756,7 +5750,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
                                 "content": json.dumps(result, ensure_ascii=False)})
         for tu in ([] if _use_parallel else _pending_calls):
-            # secRV MED-3 (b): 各ツール実行の直前に stop_event を確認する。
+            # 各ツール実行の直前に stop_event を確認する。
             if stop_event is not None and stop_event.is_set():
                 return
             name = getattr(tu, "name", None)
@@ -5764,7 +5758,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             if not isinstance(args, dict):
                 args = {}
             if name not in offered_names:
-                # レビュー是正（FIX-H・secRV・2026-07-19・実行 allowlist の非対称）: 提示していない
+                # 提示していない
                 # ツール名の実行は拒否する（openai_style/gemini と同じ固定文言・safe_name クリップ・
                 # total_tool_bytes 累計計上）。
                 yield {"node": _node("許可外のツール呼び出し", "許可されていないため拒否しました")}
@@ -5783,7 +5777,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                 "content": json.dumps(result, ensure_ascii=False)})
                 continue
             yield {"node": _tool_node(name, args)}
-            # レビュー是正（LOW-E・secRV・2026-07-18 再検証）: ノード yield 直後にも stop_event を
+            # ノード yield 直後にも stop_event を
             # 再確認する（generator 再開後に ask_user 分岐/run_tool を1件実行してしまう窓を塞ぐ）。
             if stop_event is not None and stop_event.is_set():
                 return
@@ -5806,7 +5800,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             hit_node = _hit_summary_node(name, args, result)
             if hit_node:
                 yield {"node": hit_node}
-            # RV2（FBK-1・2026-09-01）: es_search が BM25 のみへ縮退した場合、その理由を「思考の
+            # es_search が BM25 のみへ縮退した場合、その理由を「思考の
             # 流れ」へも表示する（サーバログの warning だけでは利用者に届かない・`_degrade_result_
             # node` 参照）。
             degrade_node = _degrade_result_node(result)
@@ -5817,11 +5811,11 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             truncated_node = _truncated_docs_node(result)
             if truncated_node:
                 yield {"node": truncated_node}
-            # レビュー是正（MED-B (c)・secRV・2026-07-18）: 1 run 累計の tool-result バイト量が
+            # 1 run 累計の tool-result バイト量が
             # 上限を超えたら、この結果は破棄し固定エラーで run を打ち切る（fail-closed）。
-            # レビュー是正（FIX-2・secRV・2026-07-19）: `cd`（cards サイドカー・`run_tool` 側で
+            # `cd`（cards サイドカー・`run_tool` 側で
             # 既に件数＋バイト上限クリップ済み＝`_clip_cards` 参照）の直列化バイトも累計へ計上する
-            # （以前は `result` のみを計測しており、cards はこの計測経路をすり抜けていた）。
+            # （`result` のみを計測すると、cards はこの計測経路をすり抜けてしまう）。
             total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
             if total_tool_bytes > tool_result_max_total_bytes:
                 yield {"node": _node("ツール結果の合計サイズ上限",
@@ -5858,7 +5852,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                   "state": str(args.get("state") or "").strip()},
                     "matched_doc_ids": _matched})
             if name == "folder_tree" and "error" not in result:
-                # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
+                # folder_tree（K6・doc_ledger 走査による決定的集計・LLM
                 # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
                 # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
                 # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
@@ -5884,7 +5878,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
         if over_limit:
             # レビュー是正（LOW-D）: 超過件数に関わらず固定ノード1件だけ生成する。
             yield {"node": _node("ツール呼び出し上限", "1回の応答あたりの実行数上限に達したため打ち切りました")}
-            # secRV MED-3 (c): 上限超過＝以降のターンへは進まず、ここで打ち切る（未処理分の
+            # 上限超過＝以降のターンへは進まず、ここで打ち切る（未処理分の
             # tool_result が欠けたまま Anthropic API へ送り返さない＝プロトコル違反も避けられる）。
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
@@ -5924,14 +5918,14 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     `tools_pref`/`tools_availability`（省略可・既定 `None`・SC-6e）: `openai_style` と
     同じ検索経路トグル／可用性 snapshot（`toolset` 明示指定時はどちらも無視される）。
 
-    `stop_event`（UI フィードバック1「途中停止」の RV MEDIUM 再検証・2026-07-03）: `openai_style` と
+    `stop_event`（UI フィードバック1「途中停止」）: `openai_style` と
     同じ意味論＝各ターンのリクエスト発行前に確認し、立っていれば以降のリクエストを発行せず終了する。
     `history`（R1a・会話継続）: 直前ターンの (user, assistant) 対（時系列順・上流でキャップ済み）。
     Gemini の role（assistant→model）にマップして現在の user の前に並べる。省略/空なら従来と完全
     同一の初期 contents になる。`graph_admin.ask_graph` は位置引数で呼ぶため本引数に触れない
     ＝既定 None（空）で後方互換。
 
-    レビュー是正（FIX-H・secRV・2026-07-19・実行 allowlist の非対称）: 実際に提示した `tools` から
+    実際に提示した `tools` から
     ツール名集合 `offered_names` を導出し、モデルが提示していないツール名を呼んでも `run_tool` を
     実行せず拒否する（`openai_style` と同じ対称化。Gemini は元々 `allowed_tools` 引数を持たない＝
     常に `offered_names` を allowlist として使う）。
@@ -5969,7 +5963,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     from . import store
     system_settings = store.get_system_settings()
     max_tools_per_turn = effective_max_tools_per_turn(system_settings)
-    total_tool_bytes = 0                        # secRV MED-B (c): 1 run 累計の tool-result バイト量
+    total_tool_bytes = 0                        # 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
     # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: provider="gemini"（現状ライブ窓照会も
     # シード表も対象外＝登録値/不明のみを通る・管理画面の登録欄で上書き可能）。
@@ -6027,8 +6021,8 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
         searched = True
         contents.append({"role": "model", "parts": parts})
         resp_parts = []
-        # secRV MED-3（2026-07-18・DoS/コスト増幅）: openai_style/anthropic_style と同じ上限を適用する。
-        # レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過分は `_pending_calls`
+        # openai_style/anthropic_style と同じ上限を適用する。
+        # 超過分は `_pending_calls`
         # （`calls[:max_tools_per_turn]`）で単純に切り捨てる（超過件数分のノードを生成しない＝
         # 下のループ後に固定ノード1件だけ流す）。
         _pending_calls = calls[:max_tools_per_turn]
@@ -6164,13 +6158,13 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 state.add_tool_result(name, args, result, c, _call_structural)
                 resp_parts.append({"functionResponse": {"name": name, "response": result}})
         for fc in ([] if _use_parallel else _pending_calls):
-            # secRV MED-3 (b): 各ツール実行の直前に stop_event を確認する。
+            # 各ツール実行の直前に stop_event を確認する。
             if stop_event is not None and stop_event.is_set():
                 return
             name = fc.get("name")
             args = fc.get("args") or {}
             if name not in offered_names:
-                # レビュー是正（FIX-H・secRV・2026-07-19・実行 allowlist の非対称）: 提示していない
+                # 提示していない
                 # ツール名の実行は拒否する（openai_style と同じ固定文言・safe_name クリップ・
                 # total_tool_bytes 累計計上）。
                 yield {"node": _node("許可外のツール呼び出し", "許可されていないため拒否しました")}
@@ -6188,7 +6182,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 resp_parts.append({"functionResponse": {"name": name, "response": result}})
                 continue
             yield {"node": _tool_node(name, args)}
-            # レビュー是正（LOW-E・secRV・2026-07-18 再検証）: ノード yield 直後にも stop_event を
+            # ノード yield 直後にも stop_event を
             # 再確認する（generator 再開後に ask_user 分岐/run_tool を1件実行してしまう窓を塞ぐ）。
             if stop_event is not None and stop_event.is_set():
                 return
@@ -6208,7 +6202,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
             hit_node = _hit_summary_node(name, args, result)
             if hit_node:
                 yield {"node": hit_node}
-            # RV2（FBK-1・2026-09-01）: es_search が BM25 のみへ縮退した場合、その理由を「思考の
+            # es_search が BM25 のみへ縮退した場合、その理由を「思考の
             # 流れ」へも表示する（サーバログの warning だけでは利用者に届かない・`_degrade_result_
             # node` 参照）。
             degrade_node = _degrade_result_node(result)
@@ -6219,11 +6213,11 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
             truncated_node = _truncated_docs_node(result)
             if truncated_node:
                 yield {"node": truncated_node}
-            # レビュー是正（MED-B (c)・secRV・2026-07-18）: 1 run 累計の tool-result バイト量が
+            # 1 run 累計の tool-result バイト量が
             # 上限を超えたら、この結果は破棄し固定エラーで run を打ち切る（fail-closed）。
-            # レビュー是正（FIX-2・secRV・2026-07-19）: `cd`（cards サイドカー・`run_tool` 側で
+            # `cd`（cards サイドカー・`run_tool` 側で
             # 既に件数＋バイト上限クリップ済み＝`_clip_cards` 参照）の直列化バイトも累計へ計上する
-            # （以前は `result` のみを計測しており、cards はこの計測経路をすり抜けていた）。
+            # （`result` のみを計測すると、cards はこの計測経路をすり抜けてしまう）。
             total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
             if total_tool_bytes > tool_result_max_total_bytes:
                 yield {"node": _node("ツール結果の合計サイズ上限",
@@ -6260,7 +6254,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                                   "state": str(args.get("state") or "").strip()},
                     "matched_doc_ids": _matched})
             if name == "folder_tree" and "error" not in result:
-                # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
+                # folder_tree（K6・doc_ledger 走査による決定的集計・LLM
                 # 不使用）も list_docs と同じ「呼び出し単位で集計した1 Evidence」として構造 Evidence
                 # 化する。フォルダは doc ではない（`run_tool` 参照＝`docs` 集合には何も足さない）ため
                 # `matched_doc_ids` は常に空リスト——裏付け doc の代わりに集計事実そのものが根拠。
@@ -6285,7 +6279,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
         if over_limit:
             # レビュー是正（LOW-D）: 超過件数に関わらず固定ノード1件だけ生成する。
             yield {"node": _node("ツール呼び出し上限", "1回の応答あたりの実行数上限に達したため打ち切りました")}
-            # secRV MED-3 (c): 上限超過＝以降のターンへは進まず、ここで打ち切る。
+            # 上限超過＝以降のターンへは進まず、ここで打ち切る。
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,

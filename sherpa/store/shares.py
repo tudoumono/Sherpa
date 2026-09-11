@@ -1,6 +1,6 @@
-"""会話共有・sanitized snapshot（2026-07-01-認証と共有の提案.md MVP／§Phase2）。
+"""会話共有・sanitized snapshot。
 
-`sherpa/store/__init__.py` から純移動（フェーズ4 S10）。sanitized snapshot（`create_sanitized_snapshot`
+sanitized snapshot（`create_sanitized_snapshot`
 → `_safe_share_answer`）は allowlist 再構築、通常の受領共有の読取（`get_conversation_for_read`
 → `_strip_shared_message`）は denylist（他は素通し）——契約が異なる2経路だが、重要度設定ファイル
 （`_重要度.txt`）自体への参照の除外（`sources`/`sources_verified`/`data.citations`/
@@ -10,7 +10,7 @@
 `SELECT ... FOR UPDATE` でロックすることで競合を直列化する契約がある（両関数の docstring 参照）。
 この2関数はモジュールをまたぐが、Python の関数呼び出しで結合しているわけではなく、どちらも
 同じ Postgres トランザクション機構（行ロック）を経由して直列化されるため、モジュール間の
-import は不要（純移動でこの契約は変わらない）。
+import は不要。
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from .feedback import get_feedback_by_message_ids_for_user
 
 
 def _share_lock_key(share_id) -> int:
-    """`accept_share`/`refresh_sanitized_share` 共通の advisory lock key（是正3・2026-09-05）。
+    """`accept_share`/`refresh_sanitized_share` 共通の advisory lock key。
 
     両関数は同じ2種の行（共有元/対象 conversation 行・conversation_shares 行）を**逆順**で
     ロックする（`accept_share`: conversation→share／`refresh_sanitized_share`: share→conversation・
@@ -162,20 +162,20 @@ def _strip_shared_message(m: dict) -> dict:
     """受領共有の read path で内部情報を落とす（route/trace は常に NULL・answer 内の question/route/trace も除去）。
     所有者本人の read には使わない（呼び出し側で origin='received_share' のときだけ適用する）。
 
-    RV HIGH（Codex 2026-07-07）: トップレベル messages.route/trace 列だけを NULL 化しても、
+    トップレベル messages.route/trace 列だけを NULL 化しても、
     `chat_service._finalize` がレンズ・reason・path を含む `env["route"]` を answer envelope
-    自身にも埋め込む（`add_message(..., answer=env, ...)`）ため、answer.route は素通しで受領共有の
-    読者に届いていた（web/chat.js の route チップ描画に使われる＝ポリシー違反）。S1 以前からの
-    既存バグだが、同じ関数を触ったのでここで併せて塞ぐ（trace も同じ扱いで多層防御しておく）。
+    自身にも埋め込む（`add_message(..., answer=env, ...)`）ため、answer.route も明示的に除去しないと
+    受領共有の読者に届いてしまう（web/chat.js の route チップ描画に使われる＝ポリシー違反）。
+    trace も同じ扱いで多層防御しておく。
     """
     out = {**m, "route": None, "trace": None}
     a = out.get("answer")
-    # F3（2026-07-07）: usage（トークン使用量）も内部情報として受領共有では伏せる
+    # usage（トークン使用量）も内部情報として受領共有では伏せる
     #   （route/trace/question と同格。sanitized snapshot 側は _safe_share_answer の allowlist に usage が
     #   無いため自動で落ちる＝そちらは無改修。通常の受領共有は元会話の answer をそのまま読むため明示除去）。
-    # S3（2026-07-15-LLMオーケストレーション実装計画.md §5.0）: usage_sub（サブループのトークン
+    # usage_sub（サブループのトークン
     # サイドカー）も usage と同格の内部情報＝受領共有の読者に見せない。
-    # S4-b（同計画 §6.3）: usage_subs（複数プロファイル並用時の複数形サイドカー）も同格＝同一コミットで
+    # usage_subs（複数プロファイル並用時の複数形サイドカー）も同格＝
     # usage_sub の隣に並べる（漏洩防止）。
     # codex_usage_total（Codex のセッション累計 usage）も同格の内部専用メタ（次ターンの差分計算にしか
     # 使わない）＝usage と同じ扱いで受領共有の読者に見せない。
@@ -255,19 +255,19 @@ def get_conversation_for_read(uid, cid) -> dict | None:
     # `route`/`trace` と同じ既存の流儀（キーは常に存在し、無ければ null）に揃える。
     msgs = [{**m, "feedback": fb_map.get(m["id"])} for m in msgs]
     if conv["origin"] == "received_share":
-        # RV HIGH fix: 受領共有は答え/出典だけ見せる（sanitized と同じ posture）。route/trace は
+        # 受領共有は答え/出典だけ見せる（sanitized と同じ posture）。route/trace は
         # grep クエリ・doc_id・Codex 実コマンド detail 等の内部情報を含むため、共有元がそのまま
         # 見えてしまわないよう常に落とす（sanitized snapshot は最初から trace/route=NULL で保存
         # 済みだが、非 sanitize の通常共有は元会話をそのまま読むので明示的に伏せる必要がある）。
-        # S1（ask_user-improvements.md）: 確認カード（answer.question）も interaction_id・options 等の
+        # 確認カード（answer.question）も interaction_id・options 等の
         # 内部情報を含み、読み取り専用の共有会話に対話カードを出す意味も無いため、同じ posture で
         # 落とす（sanitized snapshot 側は _safe_share_answer の allowlist に question が無く既に伏字）。
         msgs = [_strip_shared_message(m) for m in msgs]
     return {"conversation": conv, "messages": msgs}
 
 
-# ==== sanitized share snapshot（2026-07-01-認証と共有の提案.md §Phase2・個人部分を除いた共有）====
-# RV(DO-NOT-SHIP)反映: denylist コピーでなく **allowlist 再構築**＋**per-turn 個人フラグ**で作る。
+# ==== sanitized share snapshot（個人部分を除いた共有）====
+# denylist コピーでなく **allowlist 再構築**＋**per-turn 個人フラグ**で作る。
 # title/lens/route/trace/未知 answer キーからの漏洩を塞ぐ。個人ターン（messages.personal）は Q/A とも伏字。
 _REDACTED_TEXT = "（個人ファイルを参照した回答のため、共有では非表示にしています）"
 _SANITIZED_TITLE = "共有用（サニタイズ済み会話）"
@@ -462,11 +462,12 @@ def _safe_share_answer(answer):
     """非個人ターンの answer を **allowlist で再構築**（未知キー・個人由来・route/trace を持ち込まない）。
     共有可能なのは KB 由来の headline/data/summary/scope と、個人ヒットを除いた sources のみ。
 
-    RV Med（Codex 2026-07-07）: 確認カード（`answer={"lens":"clarify","question":{...}}`）は
-    `_SHARE_SAFE_LENS` に clarify が無かったため lens も丸ごと落ち、chat.js の
-    `m.answer.lens === 'clarify'` プレースホルダ分岐に入れず空白/崩れ表示になっていた。
-    clarify は他レンズと違って**専用の最小形のみ**を返す（question・prompt・options 等は
-    一切持ち込まない＝一般 allowlist を通さない・将来 answer に新キーが増えても自動で漏れない）。
+    確認カード（`answer={"lens":"clarify","question":{...}}`）は冒頭の早期 return で
+    `{"lens":"clarify"}` の**専用の最小形のみ**を返す（question・prompt・options 等は一切
+    持ち込まない＝一般 allowlist を通さない・将来 answer に新キーが増えても自動で漏れない）。
+    これが chat.js の `m.answer.lens === 'clarify'` プレースホルダ分岐が空白/崩れ表示にならない根拠。
+    `_SHARE_SAFE_LENS` に clarify を含めるのは、`create_sanitized_snapshot` が複製する
+    `messages.lens` 列を NULL に落とさないため。
     """
     if not isinstance(answer, dict):
         return None
@@ -483,7 +484,7 @@ def _safe_share_answer(answer):
         # 重要度設定ファイル自体は共有 snapshot の出典にも出さない（§5・独立入口として再チェック・
         # `_strip_shared_message` と共有する実装）。
         importance_filtered = _filter_importance_from_citations(non_personal)
-        # I2（2026-09-05）: `importance`/`importance_reason`（登録者重要度の表示値・J4）も allowlist へ
+        # `importance`/`importance_reason`（登録者重要度の表示値）も allowlist へ
         # 追加する——`_strip_shared_message`（denylist・他は素通し）側は既に自然に通るため、両経路が
         # 一致する（`test_...` 参照）。`importance_source`（由来監査情報）はここでも出さない。
         out["sources"] = [{k: s[k] for k in ("doc_id", "quote", "source", "title", "path",
@@ -611,12 +612,12 @@ def is_invited(share_id, uid) -> bool:
 def accept_share(share_id, uid) -> int:
     """クリックした uid の履歴に受領ラッパー行を作る（同 uid×share は1行・冪等）。wrapper id を返す。
 
-    RV HIGH: `delete_conversation` との競合防止。新規 wrapper を作る前に共有元 conversation 行を
+    `delete_conversation` との競合防止。新規 wrapper を作る前に共有元 conversation 行を
     `SELECT ... FOR UPDATE OF c` でロックする（delete_conversation 側も同じ行をロックするため直列化）。
     ロックを取った時点で共有元が既に無ければ（同時に物理削除された等）ValueError を送出する
     （壊れた wrapper: source_conversation_id が実体の無い/後で消える id を指す状態を作らない）。
 
-    是正3（2026-09-05）: `refresh_sanitized_share` と共有 conversation 行／share 行を**逆順**で
+    `refresh_sanitized_share` と共有 conversation 行／share 行を**逆順**で
     ロックするため、関数の先頭（下の行ロックより前）で `_share_lock_key` の advisory lock を
     取って直列化する（`_share_lock_key` の docstring 参照）。
     """
@@ -657,7 +658,7 @@ def revoke_share(share_id, owner_uid) -> bool:
     return n > 0
 
 
-# ==== SH-1: フォーク（「この会話を引き継いで質問」・2026-08-23-共有フォーク.md）====
+# ==== フォーク（「この会話を引き継いで質問」）====
 
 class ForkNotAllowedError(Exception):
     """フォーク不可（403 相当）。`args[0]` に reason（監査 detail・エラーメッセージ用）を持つ:
@@ -666,7 +667,7 @@ class ForkNotAllowedError(Exception):
 
 
 def _fork_title(conv: dict, messages: list) -> str:
-    """フォーク先タイトル（是正5・2026-09-05）。
+    """フォーク先タイトル。
 
     通常共有（ライブ参照）からのフォークは元 title をそのまま複製する（従来どおり）。
     サニタイズ共有（title が固定文言 `_SANITIZED_TITLE`）からのフォークは、固定文言のままだと
@@ -687,7 +688,7 @@ def _fork_title(conv: dict, messages: list) -> str:
 
 
 def fork_received_share(uid, wid, *, ip_hash=None, user_agent=None) -> int:
-    """受領共有ラッパー `wid` を、`uid` 自身の新しい会話として複製する（SH-1）。
+    """受領共有ラッパー `wid` を、`uid` 自身の新しい会話として複製する。
 
     複製元は「読者に見えている形」＝`get_conversation_for_read(uid, wid)` と**同じ検証・
     同じ本文**（伏字済み・route/trace 除去済み・確認カード payload 除去済み）。元スナップショット/
@@ -696,7 +697,7 @@ def fork_received_share(uid, wid, *, ip_hash=None, user_agent=None) -> int:
     `forked_from_share_id`/`forked_from_user_id`/`forked_at` を持つ。同じラッパーから
     何度でもフォークできる（冪等にしない＝呼ぶたびに新しい会話ができる）。
 
-    RV 是正1（2026-09-05）: 複製（会話＋messages の INSERT）と監査（`share.forked`）を
+    複製（会話＋messages の INSERT）と監査（`share.forked`）を
     **同一トランザクション**で書く（`settings.set_system_settings` と同じ方式）。監査 INSERT の
     例外は psycopg のトランザクション契約に従い `with _connect()` を抜ける際に自動 rollback される
     ため、複製もまとめて取り消される（呼び出し側で別接続の再読取・補償削除は不要）。
@@ -741,14 +742,14 @@ def fork_received_share(uid, wid, *, ip_hash=None, user_agent=None) -> int:
         return new_cid
 
 
-# ==== SH-2: 再共有（「スナップショットを更新」・2026-08-23-共有フォーク.md）====
+# ==== 再共有（「スナップショットを更新」）====
 
 class ShareNotSanitizedError(Exception):
     """通常共有（元会話をライブ参照＝更新の概念が無い）への refresh 要求（409 相当）。"""
 
 
 def refresh_sanitized_share(owner_uid, share_id) -> dict:
-    """サニタイズ共有のスナップショットを最新の内容へ取り直す（SH-2）。リンク・招待・期限は不変。
+    """サニタイズ共有のスナップショットを最新の内容へ取り直す。リンク・招待・期限は不変。
 
     対象は **サニタイズ共有だけ**（`conversation_shares.conversation_id` が
     `origin='sanitized_snapshot'` の会話）。通常共有（元会話をライブ参照）には
@@ -770,7 +771,7 @@ def refresh_sanitized_share(owner_uid, share_id) -> dict:
 
     returns `{"share_id", "old_snapshot_id", "new_snapshot_id", "source_conversation_id", "refreshed_at"}`。
 
-    是正3（2026-09-05）: `accept_share` と share 行／共有 conversation 行を**逆順**でロックするため、
+    `accept_share` と share 行／共有 conversation 行を**逆順**でロックするため、
     関数の先頭（下の `FOR UPDATE` より前）で `_share_lock_key` の advisory lock を取って直列化する
     （`_share_lock_key` の docstring 参照）。
     """

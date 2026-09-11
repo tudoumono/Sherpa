@@ -41,7 +41,7 @@ _GRAPH_SYSTEM = (
     "出典の偏り、追加取り込み候補などのナレッジベース状態に限定します。"
     "通常の業務仕様質問としては答えず、read-only の提案だけを返してください。"
     "利用できるグラフ情報源は graph_neighbors ツールで取得した関係グラフだけです。"
-    "必要に応じて graph_neighbors を呼び、返ったノード名・関係・経路と提示された集計だけを根拠に日本語で簡潔に答えてください。"
+    "必要に応じて graph_neighbors を呼び、返ったノード名・関係・経路と提示された集計だけを根拠に日本語で答えてください（長さは絞らず、該当する経路は省略しない）。"
     "グラフや集計に無いことは推測しないでください。"
 )
 
@@ -127,7 +127,7 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
                  include_deprecated: bool = False, limit: int = 200) -> dict:
     """関係種別/属性条件で world グラフを検索し、可視化と同じ nodes/edges 形で返す。
 
-    rv-s3-removal: 主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
+    主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
     `GraphSchemaEraError`・呼び出し元 `routers/graph.py::graph_search` が 503 へ変換する）。
     """
     rels = [str(r).strip().upper() for r in (relationship_types or []) if str(r).strip()]
@@ -280,7 +280,7 @@ def ask_graph(question: str, world: str, scope_paths=None, settings: dict | None
               status_summary: dict | None = None, user_id: str | None = None) -> dict:
     """管理グラフへの自然言語質問。既存 agentic_search の graph_neighbors だけを使う。
 
-    S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: `_collect` が成功した呼び出しにつき、
+    （2026-07-15-LLMオーケストレーション実装計画.md §3）: `_collect` が成功した呼び出しにつき、
     `kind='graph_ask'` で1行記録する（計測有効時のみ・llm_unavailable の早期return／except→failed の
     失敗パスは記録しない）。
 
@@ -387,7 +387,7 @@ def ask_graph(question: str, world: str, scope_paths=None, settings: dict | None
         from . import metering
         metering.record("graph_ask", prov, mod, usage, user_id=user_id, world=world)
     except GraphSchemaEraError as e:
-        # RV是正（rv-periphery #12・2026-09-05）: `graph_neighbors` ツール経由で上がる専用例外を
+        # `graph_neighbors` ツール経由で上がる専用例外を
         # 下の generic except（"failed"）へ丸めず、閉じた理由 `graph_reingest_required` を返す
         # （`ask_graph` は例外を投げず常に status dict を返す既存契約——`routers/graph.py::
         # graph_ask` はこの戻り値をそのまま返すだけで済む・503 化はしない）。

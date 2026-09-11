@@ -1,4 +1,4 @@
-"""システム系エンドポイント（フェーズ3スライス1・純移動）。
+"""システム系エンドポイント。
 
 `/healthz`・`/`（ルート）・`/config`・`/settings*`（ユーザー設定系）を api.py から抽出する。
 ロジックは変更しない（コード移動のみ）。ルート表 golden の定義順を保つため、api.py 側は
@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, StrictBool
 
 from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, search_helper, store
-# RV MED（N1・2026-07-16 Codex RV 3巡目再検証）: `_bedrock_key_fingerprint` は `sherpa/store/settings.py`
+# `_bedrock_key_fingerprint` は `sherpa/store/settings.py`
 # へ移設した（`add_bedrock_verified_models` が同一トランザクション内で使う必要があるため）。ここでは
 # store facade から re-export する（`sherpa.routers.system._bedrock_key_fingerprint`／
 # `sherpa.api._bedrock_key_fingerprint` の既存参照・テスト互換を保つ・ロジックは無い純粋関数なので
@@ -65,9 +65,9 @@ class SettingsReq(BaseModel):
     として黙って無視される（pydantic 既定の extra="ignore"）＝送っても 422 にはならず、
     保存もされない。`bedrock_model` は例外（実在確認済みモデルの専用機構のため個人設定に残す）。"""
     agent: str | None = None
-    # 4構成（2026-08-15）: Codex CLI が接続するモデル提供元（openai / ollama）。Codex 構成のみ有効。
+    # 4構成: Codex CLI が接続するモデル提供元（openai / ollama）。Codex 構成のみ有効。
     codex_model_provider: str | None = None
-    # RV LOW（2026-07-03）: web_search はネット到達可否を左右するフラグ＝"1"/"true" 等の緩い型強制を
+    # web_search はネット到達可否を左右するフラグ＝"1"/"true" 等の緩い型強制を
     # 受理せず、JSON の真偽値のみ許可する（StrictBool）。既存 SettingsReq の他フィールドは文字列/
     # 未使用の bool のみで security-relevant な on/off フラグはこれが唯一＝他フィールドとの整合が
     # 問題になる箇所は無い（ChatReq.knowledge 等の UI トグルは非セキュリティ的で対象外・変更なし）。
@@ -77,17 +77,17 @@ class SettingsReq(BaseModel):
     gemini_api_key: str | None = None
     bedrock_model: str | None = None
     bedrock_api_key: str | None = None
-    # 検索アシスタント（2026-08-15・`sherpa/search_helper.py`）: 下調べだけを安いモデルへ任せる
+    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べだけを安いモデルへ任せる
     # 利用者ごとの設定。''＝使わない／'ollama'／'openai'。モデルは管理者のカタログ既定を使う。
     search_helper: str | None = None
     system_prompt: str | None = None
 
 
 # Bedrock モデル選択の allowlist（単一の真実源は sherpa/agents.py の BEDROCK_MODEL_CHOICES）。
-# 誤設定によるモデル指定ミスを防ぐため PUT /settings で検証する（2026-07 決定）。
-# RV MED（2026-07-15）: 当初は静的選択肢 ∪ `BEDROCK_MODEL_ID_RE` の**形式一致のみ**で許可していたが、
-# それだと `jp.anthropic.not-a-real-model-v999:999` のような形だけ正しい架空 ID が verify を経ずに
-# 保存でき、チャット/グラフQA/グラフ抽出が Bedrock 4xx で全滅する実害があった（Codex RV 指摘）。
+# 誤設定によるモデル指定ミスを防ぐため PUT /settings で検証する。
+# 静的選択肢 ∪ `BEDROCK_MODEL_ID_RE` の**形式一致のみ**で許可すると、
+# `jp.anthropic.not-a-real-model-v999:999` のような形だけ正しい架空 ID が verify を経ずに
+# 保存でき、チャット/グラフQA/グラフ抽出が Bedrock 4xx で全滅する実害が起きる。
 # 「保存できるのは実在確認済みIDだけ」に締める＝静的 choices ∪ そのユーザーが verify/列挙で実在
 # 確認済みの ID（`store.add_bedrock_verified_models`）∪ 現在保存中の値（grandfather・no-op 再保存を
 # 422 にしない）の membership 判定のみとし、正規表現単独では許可しない（形式チェックは
@@ -169,10 +169,10 @@ def _ollama_url_choice(s: dict, system_settings: dict | None = None) -> dict:
     scheme 不明な allowlist から `http://` を補って合成したエントリが、既に分かっている https を
     上書きしない）。
 
-    重大バグ是正（RV 3巡目 #8）: 同一 host:port の実 URL 同士（例: 中央既定が `http://host:443`・
-    利用者の現在値が `https://host:443`）が衝突する場合、以前は「先勝ち」で中央（http）が個人の
+    同一 host:port の実 URL 同士（例: 中央既定が `http://host:443`・
+    利用者の現在値が `https://host:443`）が衝突する場合、単純な「先勝ち」だと中央（http）が個人の
     https を隠してしまい、policy-valid な https 現在値が `allowed` にも `legacy` にも現れず
-    UI で「一覧外」と誤表示していた。ここでは同一 host:port が既にある場合、後から来た URL が
+    UI で「一覧外」と誤表示する。ここでは同一 host:port が既にある場合、後から来た URL が
     `https://` かつ既存が `https://` でなければ**置換**する（scheme 不明な allowlist からの
     `http://` 合成エントリが正しい https を上書きすることはない＝合成分は必ず最後に追加される
     ため、常に「他の実 URL が既に埋めた枠」を尊重する）。
@@ -226,7 +226,7 @@ def _model_choice_table_by_provider(system_settings: dict | None = None) -> dict
     （`FIELD_CELLS` の中で複数プロバイダを跨ぐもの）について、プロバイダごとの選択肢を全パターン
     事前に返す（`{field: {provider: {"allowed": [...], "default": "..."}}}`）。個人設定画面
     （`web/settings.js`）が intent_provider／search_helper のセレクタを変更した瞬間に、サーバへ
-    再往復せずモデル欄の選択肢を再描画できるようにするため（RV 是正）。保存済みの実効プロバイダに
+    再往復せずモデル欄の選択肢を再描画できるようにするため。保存済みの実効プロバイダに
     基づく `model_catalog[field]`（`_public_settings` 参照）とは別に、**選べる全プロバイダ**を返す
     （未保存の「見込み」選択に追従するため）。
 
@@ -264,8 +264,8 @@ def _public_settings(s: dict) -> dict:
             # 残すが実行経路では読まない）。
             "web_search_available": _web_search_admin_allowed(sys_s),
             "codex_web_search": bool(s.get("codex_web_search")),
-            # RV MED（2026-08-18 Codex RV 2巡目 指摘3）: 真偽値のみだとプレースホルダでも「設定済み」と
-            # 表示し得た。判定を provider 選択・health と同じ `agent_constructs.is_real_api_key` に揃える
+            # 真偽値のみだとプレースホルダでも「設定済み」と
+            # 表示しうる。判定を provider 選択・health と同じ `agent_constructs.is_real_api_key` に揃える
             # （利用者が設定画面で入れた実キーの扱いは変えない＝プレースホルダ文字列と一致しない限り真）。
             "openai_key_set": agent_constructs.is_real_api_key(openai_key),
             # 接続先の種類（openai/azure/custom）とホスト名のみ（キー・パスは出さない）。
@@ -276,14 +276,14 @@ def _public_settings(s: dict) -> dict:
             "gemini_key_set": bool(gemini_key),
             "bedrock_model": bedrock_model,
             "bedrock_key_set": bool(bedrock_key),
-            # RV MED（2026-07-15）: フロント（web/settings.js）が「旧設定（legacy）」表示と検証済み
+            # フロント（web/settings.js）が「旧設定（legacy）」表示と検証済み
             # 表示を区別するための情報。known=true なら静的 choices か verified 済み＝正当な値。
             "bedrock_model_known": bedrock_known,
             "bedrock_model_label": _bedrock_profile_label(bedrock_model, ""),
-            # 4構成（2026-08-15・agent_constructs）: 現在の構成と、この環境で選べる構成の一覧。
+            # 4構成（agent_constructs）: 現在の構成と、この環境で選べる構成の一覧。
             # 画面はこの一覧だけを描画する＝env で無効な AI は選択肢にも入力欄にも出さない。
             "codex_model_provider": s.get("codex_model_provider") or "",
-            # 検索アシスタント（2026-08-15）: 下調べを安いモデルへ任せる利用者ごとの設定。
+            # 検索アシスタント: 下調べを安いモデルへ任せる利用者ごとの設定。
             "search_helper": s.get("search_helper") or "",
             # 旧・個人上書き時代のモデル指定（個人設定に入力欄は無い・保存もされない）。実行時には
             # もう使われないが、以前この画面で選んだ値が DB に残っている利用者へ「もう使われて
@@ -336,10 +336,10 @@ def settings_get(request: Request):
     return _public_settings(store.get_settings(u["uid"]))
 
 
-# S6（2026-07-03）: `GET /settings/bedrock-models` の per-user 結果キャッシュ（プロセス内 dict・TTL 付き）。
+# `GET /settings/bedrock-models` の per-user 結果キャッシュ（プロセス内 dict・TTL 付き）。
 # 設定画面を開くたびに control-plane を叩かないため。過剰設計しない＝これで十分（複数ワーカー構成では
 # ワーカーごとに独立したキャッシュになるが、TTL が短いため実害は小さい）。
-# RV MEDIUM（2026-07-03）: entry は「どのキーで取得したか」の fingerprint（値そのものは持たない・
+# entry は「どのキーで取得したか」の fingerprint（値そのものは持たない・
 # sha256 先頭16桁）を持ち、read/write のどちらでも**その時点の現在キー**と不一致なら破棄する。
 # 素朴な dict[uid]=(...) だけだと、GET が古いキーで control-plane 呼び出し中に PUT でキーが変わった
 # 場合、GET 完了時に古い結果を書き戻してしまい、以後 TTL（5分）はそのユーザーに新キーの結果が
@@ -349,7 +349,7 @@ _BEDROCK_MODELS_CACHE: dict[str, tuple[float, str, list, str | None]] = {}
 _BEDROCK_MODELS_CACHE_TTL = 300.0   # 5分
 _BEDROCK_MODELS_CACHE_LOCK = threading.Lock()
 
-# RV LOW（R4-2・2026-07-16 Codex RV 4巡目再検証）: per-uid キャッシュ世代カウンタ。fp の再確認
+# per-uid キャッシュ世代カウンタ。fp の再確認
 # （ロック外・低速な記録処理を挟む）から実際のキャッシュ書込（ロック内）までの間に、別リクエストが
 # キーを変更（`settings_put` がキャッシュを pop する箇所）すると、その"別リクエスト"自身の新しい
 # fetch＋書込が先に完了していた場合、この"古いリクエスト"の遅延書込がそれを上書きしてしまう
@@ -364,16 +364,16 @@ _BEDROCK_MODELS_CACHE_GEN: dict[str, int] = {}
 def _bedrock_record_and_filter(uid: str, models: list, fp: str) -> list | None:
     """`models`（列挙/キャッシュヒット結果・`[{"id","label"}]`）のうち動的な ID だけを実在確認済み
     テーブルへ記録し、応答を「記録に成功した動的 ID ∪ 静的 choices」へ絞り込む。`None` は
-    fingerprint 不一致（キー変更中）で何も記録していない場合（呼び出し側は N2 のエラー応答を返す）。
+    fingerprint 不一致（キー変更中）で何も記録していない場合（呼び出し側はエラー応答を返す）。
 
-    RV LOW（L2・2026-07-16 Codex RV 5巡目再検証）: 静的 choices（`_BEDROCK_MODEL_IDS`）は
+    静的 choices（`_BEDROCK_MODEL_IDS`）は
     `_bedrock_model_id_valid` が無条件で受理するため、実在確認済みテーブルへ記録する必要が無い。
     記録すると動的分の容量（`_BEDROCK_VERIFIED_MODELS_MAX`）を無駄に消費し、満杯時に「静的なのに
-    保存枠不足」という誤ったエラーを招く実害があった（Codex RV 指摘）。渡す ids からあらかじめ
+    保存枠不足」という誤ったエラーを招く。渡す ids からあらかじめ
     静的分を除外する（store 層は「静的」という概念を知らない汎用のまま・フィルタはこのルータ層だけで
     行う）。応答フィルタの `keep` は既存どおり `∪ _BEDROCK_MODEL_IDS` で静的を無条件に含める。
 
-    RV LOW（C1・2026-07-16 Codex RV 6巡目再検証）: 動的分が無い（全て静的＝`dynamic_ids` が空）場合、
+    動的分が無い（全て静的＝`dynamic_ids` が空）場合、
     記録処理自体を丸ごとスキップするだけだと fingerprint 再確認も素通りしてしまう。静的 choices は
     `PUT /settings` が無条件で受理するため保存契約自体は破れないが、非静的経路（キー変更中は
     「設定が変更されました」で正直に失敗を伝える）と意味論を揃えるため、この場合も現在の
@@ -394,51 +394,49 @@ def _bedrock_record_and_filter(uid: str, models: list, fp: str) -> list | None:
 
 @settings_router.get("/settings/bedrock-models", tags=["設定"], response_model=BedrockModelsResponse)
 def settings_bedrock_models(request: Request):
-    """現在ユーザーの Bedrock 設定でアカウントが実際に使える推論プロファイルを取得する（S6）。
+    """現在ユーザーの Bedrock 設定でアカウントが実際に使える推論プロファイルを取得する。
 
     admin 限定にしない（自分の頭脳選択のための情報・他人の設定は見えない）。ログイン中ユーザーの
     保存済み `bedrock_api_key`（未設定ならサーバ側 env）で control-plane を叩き、ACTIVE な anthropic
     系のみを返す。キー自体は応答に含めない。失敗（キー無し/403/ネットワーク）でも 200 のまま
     `{"models": [], "error": "<短い理由>"}` を返す（設定画面の UX を壊さない）。per-user 5分キャッシュ
-    （key の fingerprint が変わっていれば期限内でも破棄・上の RV MEDIUM 参照）。
+    （key の fingerprint が変わっていれば期限内でも破棄・上のキャッシュ entry 構造の説明参照）。
 
-    中核契約（Codex RV 3巡目）:「この応答に含まれる ID は必ず `PUT /settings` で保存できる」。
-      - RV MED（N1・2026-07-16再検証）: 取得できた ID 群の記録は `store.add_bedrock_verified_models`
+    中核契約:「この応答に含まれる ID は必ず `PUT /settings` で保存できる」。
+      - 取得できた ID 群の記録は `store.add_bedrock_verified_models`
         の `expected_key_fp` に開始時点の fingerprint を渡し、**行ロック取得後・DB 書込直前に
         同一トランザクション内で**現在の `bedrock_api_key` と再照合させる（呼び出し側でスナップ
-        ショットを取って別途比較する旧方式は、比較〜記録の間に別リクエストのキー変更がコミット
-        される TOCTOU を埋め切れなかった）。不一致（`None` が返る）なら記録していない。
-      - RV MED（N2・2026-07-16再検証）: 不一致時は verify と同じ意味論に統一し、その場の応答も
+        ショットを取って別途比較する方式だと、比較〜記録の間に別リクエストのキー変更がコミット
+        される TOCTOU を埋め切れない）。不一致（`None` が返る）なら記録していない。
+      - 不一致時は verify と同じ意味論に統一し、その場の応答も
         `{"models": [], "error": "設定が変更されました。もう一度お試しください"}` にする
         （models をそのまま返すと「表示はされたが保存すると 422」という握りつぶしの変種になるため）。
-      - RV MED（N3・2026-07-16再検証）: `add_bedrock_verified_models` の返り値（cap 適用後も実際に
+      - `add_bedrock_verified_models` の返り値（cap 適用後も実際に
         残った ID のサブセット）で応答を「保持セット ∪ 静的 choices」にフィルタする（`_bedrock_
         record_and_filter` 参照）。cap（`_BEDROCK_VERIFIED_MODELS_MAX`）値に依らず、返す ID は必ず
         保存可能というのが構造的に保証される（AWS `ListInferenceProfiles` は1回の応答が cap を
         超えうる・同定数のコメント参照）。
-      - RV LOW（L2・2026-07-16 Codex RV 5巡目再検証）: 記録対象（`add_bedrock_verified_models` へ
+      - 記録対象（`add_bedrock_verified_models` へ
         渡す ids）からは静的 choices を除外する（`_bedrock_record_and_filter` 参照）。静的は無条件で
         受理されるため記録不要＝動的分の容量を無駄に消費しない（満杯時に静的まで「保存枠不足」に
         なる誤りを防ぐ）。
-      - キャッシュヒット早期 return 側でも記録は毎回行う（F3: 記録は冪等・ボタン押下時のみの経路
+      - キャッシュヒット早期 return 側でも記録は毎回行う（記録は冪等・ボタン押下時のみの経路
         なので DB 1往復は許容・cap 溢れで store 側から evict された ID がキャッシュには残っているのに
         保存不能になる、という穴を塞ぐ）。models が空（失敗結果）の場合は記録は不要（何も無いため）
         だが、キャッシュ書込自体は取得完了後に世代（`_BEDROCK_MODELS_CACHE_GEN`）が変わっていない
-        時だけ行う（RV MEDIUM 3・キー変更中の stale write 対策・R4-2 で fp 再確認から世代カウンタへ
-        統一）。
-      - RV LOW（R4-2・2026-07-16 Codex RV 4巡目再検証）: 記録成功後・実際のキャッシュ書込までの間に
+        時だけ行う（キー変更中の stale write 対策）。
+      - 記録成功後・実際のキャッシュ書込までの間に
         別リクエストがキーを変更し、かつその別リクエストの新しい fetch＋書込が先に完了していると、
         この（古い）リクエストの遅延書込がその有効な entry を潰しうる（stale 提供にはならないが
         無用な control-plane 再呼び出しを招く）。`_BEDROCK_MODELS_CACHE_GEN`（per-uid 世代カウンタ・
         `settings_put` のキー変更時 pop と同時に increment）をこのリクエスト開始時点で記憶しておき、
         書込直前（ロック内）に世代が変わっていないか確認してから書く。
-      - RV LOW（L1・2026-07-16 Codex RV 5巡目再検証）: 上の世代の捕捉は**関数の最初**（`key` の
+      - 上の世代の捕捉は**関数の最初**（`key` の
         読取より前）で行う。捕捉がキー読取の後だと、「このリクエストがキーを読んだ直後・まだ世代を
         捕捉する前」に別リクエストが世代を進めた場合、このリクエストは既に進んだ後の世代を自分の
-        基準として捕捉してしまい、古いキーの結果を書込直前チェックが「変化無し」と誤認する
-        （R4-2 の是正が不完全だった穴）。
+        基準として捕捉してしまい、古いキーの結果を書込直前チェックが「変化無し」と誤認する。
 
-    RV MED（親検収・2026-07-16）: `_BEDROCK_MODELS_CACHE_LOCK` は「低速 I/O はロック外」が既存設計
+    `_BEDROCK_MODELS_CACHE_LOCK` は「低速 I/O はロック外」が既存設計
     原則（列挙の外向き通信をロック外にしているのと同じ理由）。キャッシュヒット側の記録
     （`store.add_bedrock_verified_models` の DB 書込・FOR UPDATE 待ちを含みうる）をロックを握ったまま
     呼ぶと、同一ユーザーの並行 verify が行ロックを握っている間、その待ちで**全ユーザー**の列挙
@@ -448,9 +446,9 @@ def settings_bedrock_models(request: Request):
     """
     u = _current_user(request)
     uid = u["uid"]
-    # RV LOW（L1・2026-07-16 Codex RV 5巡目再検証）: 世代の捕捉は**このリクエストの最初**（キー読取
-    # より前）で行う。以前はキー読取の後に捕捉していたため、「このリクエストがキーを読んだ直後・
-    # まだ世代を捕捉する前」に別リクエストが PUT でキーを変更（世代 increment）すると、この
+    # 世代の捕捉は**このリクエストの最初**（キー読取
+    # より前）で行う——キー読取の後に捕捉すると、「このリクエストがキーを読んだ直後・
+    # まだ世代を捕捉する前」に別リクエストが PUT でキーを変更（世代 increment）した場合、この
     # リクエストは（古いキーで処理を続けているにもかかわらず）既に進んだ後の世代を自分の基準として
     # 捕捉してしまい、その後の書込直前チェックが「何も変わっていない」と誤認してしまう（結果、
     # 別の正当なリクエストが書いた新しい有効なキャッシュ entry を、この（古いキーの）リクエストが
@@ -475,7 +473,7 @@ def settings_bedrock_models(request: Request):
         models = _bedrock_record_and_filter(uid, models, fp)
         if models is None:
             return {"models": [], "error": "設定が変更されました。もう一度お試しください"}
-        # R4-2: 記録が終わった今この瞬間でも、世代が変わっていなければ書く（変わっていれば、別
+        # 記録が終わった今この瞬間でも、世代が変わっていなければ書く（変わっていれば、別
         # リクエストの新しい有効な entry を古い fp で潰さないようスキップする）。応答自体は
         # models/error をそのまま返す（stale 提供の心配は無い＝この応答は「このリクエスト自身が
         # 今取得した」内容そのもの）。
@@ -484,7 +482,7 @@ def settings_bedrock_models(request: Request):
                 _BEDROCK_MODELS_CACHE[uid] = (now, fp, models, error)
         return {"models": models, "error": error}
     # models が空（失敗）: 記録するものが無いが、取得中にキーが変わっていた場合の stale なキャッシュ
-    # 書込（RV MEDIUM 3→R4-2 で世代カウンタに統一）は models の有無に関係なく起こりうるため、
+    # 書込は models の有無に関係なく起こりうるため、
     # ここでも世代が変わっていないか確認してから書く。
     with _BEDROCK_MODELS_CACHE_LOCK:
         if _BEDROCK_MODELS_CACHE_GEN.get(uid, 0) == gen:
@@ -492,7 +490,7 @@ def settings_bedrock_models(request: Request):
     return {"models": models, "error": error}
 
 
-# バッチ2・1番（2026-07-03）: 実環境で「接続テストOK・モデル取得は失敗（既定選択肢のまま）」の報告。
+# 実環境では「接続テストOK・モデル取得は失敗（既定選択肢のまま）」ということが起こりうる。
 # 容疑は Bedrock API キー（Bearer）が runtime（InvokeModel）専用で control-plane（ListInferenceProfiles）
 # 権限が無いケース＝`GET /settings/bedrock-models` の動的列挙が使えない。列挙に頼らず、ユーザーが
 # 分かっているモデルID（推論プロファイルID）を**実際に1回叩いて検証**してから追加できる経路を用意する。
@@ -531,11 +529,11 @@ def settings_bedrock_models_verify(req: BedrockVerifyReq, request: Request):
     api_key = settings.get("bedrock_api_key")
     if not _bedrock_auth_available(api_key):
         return {"ok": False, "error": "Bedrock の API キー/AWS 認証情報が未設定です"}
-    # RV MED（F2・2026-07-15→N1・2026-07-16再検証）: probe（実 I/O・時間がかかりうる）の**前**に
+    # probe（実 I/O・時間がかかりうる）の**前**に
     # このユーザーのキーの fingerprint を取っておく。記録は `store.add_bedrock_verified_models` の
     # `expected_key_fp` に渡し、行ロック取得後・DB 書込直前に**同一トランザクション内で**再照合させる
-    # （probe 後にここで別途 SELECT して比較する旧方式は、比較〜記録の間に別リクエストのキー変更が
-    # コミットされる TOCTOU を埋め切れなかった）。不一致（`None` が返る）なら記録しない＝ok:true の
+    # （probe 後にここで別途 SELECT して比較する方式だと、比較〜記録の間に別リクエストのキー変更が
+    # コミットされる TOCTOU を埋め切れない）。不一致（`None` が返る）なら記録しない＝ok:true の
     # まま未記録だと、選択肢には追加されたのに保存が 422 になる、握りつぶしの変種を作ってしまうため、
     # ここは ok:false で理由を返す。
     fp_before = _bedrock_key_fingerprint(api_key)
@@ -549,13 +547,13 @@ def settings_bedrock_models_verify(req: BedrockVerifyReq, request: Request):
         # 二重適用は無害）。
         return {"ok": False, "error": _redact_bedrock_secret(detail, api_key) or "接続に失敗しました"}
 
-    # RV LOW（L2・2026-07-16 Codex RV 5巡目再検証）: 静的 choices（`_BEDROCK_MODEL_IDS`）は
+    # 静的 choices（`_BEDROCK_MODEL_IDS`）は
     # `_bedrock_model_id_valid` が無条件で受理するため、実在確認済みテーブルへの記録は不要。
     # probe には意味がある（このユーザーの実際の AWS 権限で本当に呼べるかを確認できる）ので probe
     # 自体は通常どおり行うが、記録はスキップして直接 ok:true を返す（動的分の容量が満杯でも、静的
     # ID の verify が「保存枠不足」という誤ったエラーになる実害を防ぐ）。
     if model_id in _BEDROCK_MODEL_IDS:
-        # RV LOW（C1・2026-07-16 Codex RV 6巡目再検証）: 記録処理自体をスキップするこのファストパス
+        # 記録処理自体をスキップするこのファストパス
         # でも、probe 完了後に現在キーの fingerprint を再確認する。静的 choices は PUT /settings が
         # 無条件で受理するため保存契約自体は破れないが、非静的経路（キー変更中は「設定が変更され
         # ました」で正直に失敗を伝える）と体験を揃える。
@@ -568,7 +566,7 @@ def settings_bedrock_models_verify(req: BedrockVerifyReq, request: Request):
     retained = store.add_bedrock_verified_models(uid, [model_id], expected_key_fp=fp_before)
     if retained is None:
         return {"ok": False, "error": "設定が変更されました。もう一度お試しください"}
-    # RV MED（R4-1・2026-07-16 Codex RV 4巡目再検証）: 単調保持（monotonic）への是正により、cap
+    # 単調保持（monotonic）とする——cap
     # （`_BEDROCK_VERIFIED_MODELS_MAX`）が満杯だと新規 ID は記録されない（evict して押し込むことは
     # しない＝既存 ID を後から取り消さないため）。probe 自体は成功していても ok:true で「選択肢には
     # 追加されたのに保存できない」握りつぶしを作らないよう、専用のエラーで正直に失敗を返す。
@@ -627,14 +625,14 @@ def settings_put(req: SettingsReq, request: Request):
 
     `bedrock_model` は allowlist 検証する（空文字/未指定＝既定を許可・静的選択肢／このユーザーが
     verify・列挙で実在確認済みの ID／現在保存中の値（grandfather）のいずれかでなければ 422）。
-    RV MED（2026-07-15）: 以前は `BEDROCK_MODEL_ID_RE` の**形式一致だけ**でも許可していたため、
-    形だけ正しい架空 ID が verify を経ずに保存できてしまう穴があった（Codex RV 指摘・実害）。
+    `BEDROCK_MODEL_ID_RE` の**形式一致だけ**で許可すると、
+    形だけ正しい架空 ID が verify を経ずに保存できてしまう。
     正規表現単独では通さない＝`store.add_bedrock_verified_models` に記録済みの ID だけを許可する
-    （2026-07 決定・BEDROCK_MODEL_CHOICES 参照）。`agent` も同様に allowlist 検証する
-    （RV HIGH・2026-07-03: 監査ログに任意文字列が入るのを防ぐため。単一の真実源は
+    （BEDROCK_MODEL_CHOICES 参照）。`agent` も同様に allowlist 検証する
+    （監査ログに任意文字列が入るのを防ぐため。単一の真実源は
     `sherpa.agents.AGENT_PROVIDERS`）。
 
-    R2a-S2（2026-07-13 横断レビュー対応）: `ollama_url` は保存前に `llm.assert_ollama_url_allowed`
+    `ollama_url` は保存前に `llm.assert_ollama_url_allowed`
     で宛先ポリシー（loopback／admin allowlist）を検証する。ブロック時は汎用メッセージの 422 のみ返す
     （到達可否の詳細は返さない＝到達オラクル対策・詳細は POST /settings/test 側で丸める）。
 
@@ -668,7 +666,7 @@ def settings_put(req: SettingsReq, request: Request):
             raise HTTPException(422, "bedrock_model は選択肢から選ぶか、モデル取得/検証済みのIDを指定してください")
     if req.agent and req.agent not in AGENT_PROVIDERS:
         raise HTTPException(422, "agent は heuristic / codex / openai / ollama / gemini / bedrock のいずれか")
-    # 標準MVPは4構成だけを見せる（決定 2026-08-15）。env で有効化していない外部AIは保存させない
+    # 標準MVPは4構成だけを見せる。env で有効化していない外部AIは保存させない
     # ＝画面から消えているのに設定だけ残る状態を作らない（`agent_constructs` 参照）。
     if req.agent and agent_constructs.runtime_blocked(req.agent):
         raise HTTPException(422, "この AI はこの環境では利用できません（管理者が有効化していません）")
@@ -682,7 +680,7 @@ def settings_put(req: SettingsReq, request: Request):
     if req.search_helper is not None and req.search_helper not in search_helper.CHOICES:
         raise HTTPException(422, "search_helper は空（使わない）/ ollama / openai のいずれか")
     if req.search_helper == search_helper.OLLAMA:
-        # 保存時に実際へ届くか確かめる（決定 2026-08-15）＝「選んだのに黙って効かない」を避ける。
+        # 保存時に実際へ届くか確かめる＝「選んだのに黙って効かない」を避ける。
         # 宛先ポリシー（loopback/allowlist）→ 実 probe の順（settings_test と同じ流儀）。
         # `keys.resolve_ollama_url(pending)` を使う（`req.ollama_url or ...` という truthy 判定は、
         # UI が送る明示的な ""（個人 override をクリア＝中央既定を使う指示）を「未指定」として扱い、
@@ -715,10 +713,10 @@ def settings_put(req: SettingsReq, request: Request):
         # （store.update_settings が同一トランザクションで再確認し fail-closed した）。
         raise HTTPException(422, "個人 API キーは無効化されています（管理者が中央設定でキーを管理します）")
     if "bedrock_api_key" in fields:
-        # キーを変えたら古いキーでの列挙結果を次回取得まで持ち越さない（S6・過度な TTL 待ちを避ける）。
+        # キーを変えたら古いキーでの列挙結果を次回取得まで持ち越さない（過度な TTL 待ちを避ける）。
         # GET 側と同じロックで保護する（dict 操作自体は GIL で原子的だが、GET の
-        # read-check→write の複合操作と時系列を揃えるため同じロックを使う・RV MEDIUM）。
-        # R4-2: 世代カウンタも同時に increment する（GET 側が「記録直後・キャッシュ書込直前」に
+        # read-check→write の複合操作と時系列を揃えるため同じロックを使う）。
+        # 世代カウンタも同時に increment する（GET 側が「記録直後・キャッシュ書込直前」に
         # 世代の変化を検知し、この pop の後に別の GET が新しい有効な entry を書いても、それより
         # 前に開始していた古い GET の遅延書込がそれを潰さないようにするため）。
         with _BEDROCK_MODELS_CACHE_LOCK:
@@ -793,7 +791,7 @@ def settings_test(req: TestReq, request: Request):
 
     返値 `{ok, provider, model, detail}`。ok=False の detail に実エラー（401=認証/429=クォータ/モデル不明 等）を載せる。
 
-    R2a-S2（2026-07-13 横断レビュー対応）: provider=ollama は宛先ポリシー（loopback／admin
+    provider=ollama は宛先ポリシー（loopback／admin
     allowlist）を probe 前に検証し、ブロック時は probe せず汎用メッセージの 422 を返す。probe した
     上での失敗は Connection refused/timeout/reset/DNS の区別を出さず丸める（`_round_ollama_probe_detail`
     参照・到達可否の詳細を返す到達オラクルを避ける。401 相当の認証失敗だけは区別を残す）。
@@ -829,12 +827,12 @@ def settings_test(req: TestReq, request: Request):
                     "detail": "モデル名の形式が不正です（使える文字: 英数字 . _ / - ・64文字以内）"}
         if not shutil.which("codex"):
             return {"ok": False, "provider": "codex", "model": model, "detail": "codex CLI が見つかりません（インストール/PATH を確認）"}
-        # MED-4（2026-08-18 Codex RV）: 接続先が Azure 等（`openai_endpoint_kind() != "openai"`）の
+        # 接続先が Azure 等（`openai_endpoint_kind() != "openai"`）の
         # Codex(OpenAI) 構成は `codex login status`（auth.json のログイン状態）が実際に動くかと無関係
-        # （env のキーで接続する設計・`sandbox.py::_codex_clean_env` 参照）。以前はこの分岐が無く
+        # （env のキーで接続する設計・`sandbox.py::_codex_clean_env` 参照）。この分岐が無いと
         # 「CLI あり＋ログイン済み」であれば ok=True を返してしまい、実際には `_select_provider` が
         # `_UnwiredProvider` を返す（実キー/デプロイ名/サンドボックス/base URL のいずれか不足）
-        # 構成でも接続テストだけ緑になる不整合があった。`_select_provider` と判定ロジックを共有する
+        # 構成でも接続テストだけ緑になる不整合が起きる。`_select_provider` と判定ロジックを共有する
         # （重複実装しない）ため `providers._codex_openai_compat_block_reason` を呼ぶ。入力中の未保存の
         # キー（`req.openai_api_key`）も試せるよう明示 override として渡す（モデル名は個人上書きが
         # 無いため明示指定しない）。
@@ -934,7 +932,7 @@ def settings_test(req: TestReq, request: Request):
             openai_key = req.openai_api_key or keys.resolve_api_key("openai", s, system_settings=sys_s, strict=True)
         except keys.InvalidCloudProviderConfigError as e:
             return {"ok": False, "provider": "openai", "model": model, "detail": str(e)}
-        # RV MED（2026-08-18 Codex RV 2巡目 指摘3）: env の OPENAI_API_KEY がプレースホルダのままだと、
+        # env の OPENAI_API_KEY がプレースホルダのままだと、
         # 真偽値だけの判定は「キーあり」と誤認して実 API へ probe しに行き、分かりにくい 401 になる。
         # 他の消費箇所（provider 選択・health・設定済み表示）と同じ `is_real_api_key` で早期に弾く
         # （下の `not cfg.get("key")` 判定が `keys.NO_CENTRAL_KEY_MESSAGE` を返す・利用者が入力した
@@ -975,7 +973,7 @@ def settings_test(req: TestReq, request: Request):
 # router に tags を持たせない（settings_router と同じ理由・タグ二重化を避ける）。
 healthz_router = APIRouter()
 
-# R5 RV LOW（2026-07-15）: 未 ready 中に未認証 /healthz が重なると、全リクエストが advisory lock に
+# 未 ready 中に未認証 /healthz が重なると、全リクエストが advisory lock に
 # 並んで各自 DDL 全文を実行し、接続/スレッドが滞留し得る。再初期化はプロセス内 single-flight
 # （非ブロッキング）にし、進行中なら試行せず即 503 を返す（sync エンドポイントは threadpool で
 # 並行実行されるため lock が要る）。

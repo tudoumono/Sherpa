@@ -2568,6 +2568,27 @@ def test_index_world_partial_batch_item_errors_wipes_index_and_returns_bulk_erro
     assert delete_calls == ["w", "w"]
 
 
+def test_index_world_no_chunks_returns_error_and_skips_content_sig_confirm(monkeypatch):
+    """文書はあるのに全文書のチャンクが0件の場合、`error == "no_chunks"` を返し
+    `_confirm_content_sig` を呼ばない（次回 sync が必ず再索引を試みる）。索引自体は
+    元々空なので `delete_world` の wipe は不要。"""
+    _setup_index_world_multi_chunk_docs(monkeypatch, 3)
+    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+
+    def fake_iter(world, d, derived, rag_exts, res_map=None):
+        return iter([]), None                          # 文書は数えるがチャンクは1件も出さない
+
+    monkeypatch.setattr(es_index, "_iter_doc_chunk_records", fake_iter)
+    confirmed = []
+    monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig: confirmed.append(sig))
+    monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
+
+    r = es_index.index_world("w", content_sig="sig-x")
+    assert r["error"] == "no_chunks"
+    assert r["indexed"] == 3 and r["chunks"] == 0
+    assert confirmed == []
+
+
 def test_index_world_single_batch_default_thresholds_still_refreshes(monkeypatch):
     """既定の閾値では少数チャンクの world は従来どおり1バッチで送られ、そのバッチに
     `refresh=true` が付く（回帰防止・バッチ化前の単発 bulk と外形が変わらないこと）。"""

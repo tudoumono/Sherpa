@@ -119,8 +119,9 @@ def codex_reasoning_for(base_reasoning: str, profile) -> str:
 def effective_max_turns(system_settings: dict | None, env_default: int, profile) -> int:
     """反復上限の実効値＝ `effective_base(...,"max_turns",env_default)` → `scaled_turns(...)` の合成。
 
-    OpenAI/Ollama の `_agentic_loop` と下調べ役がループへ渡す値の単一の真実源（記録側は再計算せず、
-    ループが実際に渡した値を `_last_main_depth_usage`／`_last_sub_depth_usage` から読む）。"""
+    OpenAI/Ollama の `_agentic_loop` がループへ渡す値の単一の真実源（記録側は再計算せず、ループが
+    実際に渡した値を `_last_main_depth_usage` から読む）。下調べ役（`_sub_loop`）はプロファイル固有の
+    guard 値と横断予算の上書きがあるため同じ合成を自前で持ち、`_last_sub_depth_usage` に実値を残す。"""
     return scaled_turns(effective_base(system_settings, "max_turns", env_default), profile)
 
 

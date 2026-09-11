@@ -1,12 +1,11 @@
-"""store の基盤: DSN / 接続 / advisory lock / スキーマ初期化（フェーズ4 S1・純移動）。
+"""store の基盤: DSN / 接続 / advisory lock / スキーマ初期化。
 
-`sherpa/store.py` から `_KB_ID`・`_SCHEMA`（DDL・当時97文）・`_inited`・`_dsn`・`_connect`・
-`init_schema`・`_ensure`・`world_lock`・`workspace_file_lock` を純移動したもの。ロジックは
-一切変更していない（`tests/unit/test_store_surface.py` の `_SCHEMA` 内容ハッシュ golden で
-純移動であることを担保）。`_inited` の global 管理はこのモジュール内で完結する。
+`_KB_ID`・`_SCHEMA`（DDL）・`_inited`・`_dsn`・`_connect`・`init_schema`・`_ensure`・
+`world_lock`・`workspace_file_lock` を持つ。`_SCHEMA` の内容は `tests/unit/test_store_surface.py`
+の golden ハッシュで固定されている。`_inited` の global 管理はこのモジュール内で完結する。
 
-R5（2026-07-13-横断レビュー対応.md §3）で `init_schema` を `pg_advisory_lock` で直列化し、
-記録専用の `schema_version` 表＋`schema_ready()`（readiness 判定用）を追加した。
+`init_schema` は `pg_advisory_lock` で直列化されており、記録専用の `schema_version` 表と
+`schema_ready()`（readiness 判定用）を持つ。
 """
 from __future__ import annotations
 
@@ -75,9 +74,9 @@ _SCHEMA = [
         UNIQUE (kb_id, version, name)
     )""",
     "CREATE INDEX IF NOT EXISTS doc_ver ON documents(kb_id, version)",
-    # RV1是正#2（2026-09-01）: `GET /documents` の台帳高速経路（`doc_ledger.public_documents_page`）が
-    # 実走査せずに重要度を返せるよう、ingest 時（`ingest/worker.py::_ledger_rows`）に1回だけ解決して
-    # materialize する列（`_重要度.txt` 由来・§2 truth table＝無ければ3列とも NULL）。
+    # `GET /documents` の台帳高速経路（`doc_ledger.public_documents_page`）が実走査せずに重要度を
+    # 返せるよう、ingest 時（`ingest/worker.py::_ledger_rows`）に1回だけ解決して materialize する
+    # 列（`_重要度.txt` 由来・§2 truth table＝無ければ3列とも NULL）。
     "ALTER TABLE documents ADD COLUMN IF NOT EXISTS importance TEXT",
     "ALTER TABLE documents ADD COLUMN IF NOT EXISTS importance_reason TEXT",
     "ALTER TABLE documents ADD COLUMN IF NOT EXISTS importance_source TEXT",
@@ -203,27 +202,27 @@ _SCHEMA = [
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bedrock_model TEXT NOT NULL "
     "DEFAULT 'jp.anthropic.claude-haiku-4-5-20251001-v1:0'",
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS bedrock_api_key TEXT",
-    # S0（2026-07-15 設定分離）: intent 分類（intent_llm）に使うモデル名。NULL＝未設定＝各プロバイダの既定モデル。
+    # intent 分類（intent_llm）に使うモデル名。NULL＝未設定＝各プロバイダの既定モデル。
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS intent_model TEXT",
-    # S2（extract_provider 分割・2026-07-15）: 機能別プロバイダ。空文字＝未設定＝extract_provider に従う。
+    # 機能別プロバイダ。空文字＝未設定＝extract_provider に従う。
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS graph_provider TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS intent_provider TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS embed_provider TEXT NOT NULL DEFAULT ''",
-    # S3（プロファイル型サブエージェント・2026-07-15-LLMオーケストレーション実装計画.md §5.0）: 資料の
-    # 検索・下調べを任せるサブエージェント・プロファイル id。''＝OFF（既定・現行と byte-identical）。
+    # プロファイル型サブエージェント: 資料の
+    # 検索・下調べを任せるサブエージェント・プロファイル id。''＝OFF（既定）。
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS sub_profile TEXT NOT NULL DEFAULT ''",
-    # S4-c（複数プロファイル並用＋自動選択・§6.3）: フラグシップが enabled プロファイルの中から
-    # 1〜3個を自動で選び直列実行する「計画」ステップの ON/OFF。''＝OFF（既定・現行と byte-identical）・
+    # 複数プロファイル並用＋自動選択: フラグシップが enabled プロファイルの中から
+    # 1〜3個を自動で選び直列実行する「計画」ステップの ON/OFF。''＝OFF（既定）・
     # 許可値は 'auto' のみ（routers/system.py::settings_put が検証）。
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS sub_planner TEXT NOT NULL DEFAULT ''",
-    # 4構成（2026-08-15・`sherpa/agent_constructs.py`）: Codex CLI がどのモデル提供元へ接続するか
+    # 4構成（`sherpa/agent_constructs.py`）: Codex CLI がどのモデル提供元へ接続するか
     # （openai / ollama）。Codex 構成のときだけ意味を持つ。''＝未設定＝openai として扱う。
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS codex_model_provider TEXT NOT NULL DEFAULT ''",
-    # 検索アシスタント（2026-08-15・`sherpa/search_helper.py`）: 資料の検索・精読だけを安いモデルへ
+    # 検索アシスタント（`sherpa/search_helper.py`）: 資料の検索・精読だけを安いモデルへ
     # 任せる利用者ごとの設定。''＝使わない（メインのAIが検索する）／'ollama'／'openai'。
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS search_helper TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS search_helper_model TEXT NOT NULL DEFAULT ''",
-    # 2026-08-16: 新規利用者の既定を `heuristic`（簡易・AIなし）から既定構成へ変える。
+    # 新規利用者の既定は `heuristic`（簡易・AIなし）ではなく既定構成にする。
     # `CREATE TABLE IF NOT EXISTS` は既存 DB の DEFAULT を書き換えないため、ここで明示的に直す。
     # **既存行は書き換えない**: `SHERPA_EXTRA_AGENTS=heuristic` で「AIなし」を意図的に選んだ利用者を、
     # 黙って AI が答える状態へ移してしまうため（選び直しは画面のAI選択から1クリックでできる）。
@@ -239,7 +238,7 @@ _SCHEMA = [
     "ALTER TABLE user_settings ALTER COLUMN ollama_model SET DEFAULT ''",
     "ALTER TABLE user_settings ALTER COLUMN ollama_url SET DEFAULT ''",
     "ALTER TABLE user_settings ALTER COLUMN codex_model SET DEFAULT ''",
-    # OCR（任意の視覚観測・2026-08-16 移植）: 取り込みとは独立したジョブキュー。
+    # OCR（任意の視覚観測）: 取り込みとは独立したジョブキュー。
     # `canonical_generation_id` は上流（フル世代管理）の列名をそのまま使い、この branch では
     # **World署名（worlds.last_sig）**を入れる（原本内容が変わればキーも変わる＝キャッシュの意味は同じ）。
     # 将来フル世代管理へ寄せるときは、入れる値を世代IDへ替えるだけで済む。
@@ -344,17 +343,16 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS ocr_worker_heartbeats_profile_seen "
     "ON ocr_worker_heartbeats(engine_profile_hash, last_seen_at DESC)",
 
-    # RV MED（2026-07-16 Codex RV 1巡目 F1/F4/F6 是正）: 保存できる bedrock_model を「実在確認済みID」に
-    # 限定するための正本（sherpa/routers/system.py::_bedrock_model_id_valid 参照）。形が正しいだけの
+    # 保存できる bedrock_model を「実在確認済みID」に限定するための正本
+    # （sherpa/routers/system.py::_bedrock_model_id_valid 参照）。形が正しいだけの
     # 架空IDが保存できてしまう穴（BEDROCK_MODEL_ID_RE.fullmatch だけの許可）を塞ぐため、verify 成功時／
-    # 列挙成功時に実際に確認できた ID をここへ記録する。当初は `user_settings.bedrock_verified_models`
-    # 列だったが、以下3点の実害が見つかったため**専用テーブルへ分離**した（`user_settings` には一切
-    # 触れない）:
-    #   F1: 行が無いユーザーの `SELECT ... FOR UPDATE` は何もロックできない＝初回の verify/列挙が
+    # 列挙成功時に実際に確認できた ID をここへ記録する。`user_settings` の列ではなく**専用テーブル**
+    # にしているのは、以下3点の実害を避けるため（`user_settings` には一切触れない）:
+    #   行が無いユーザーの `SELECT ... FOR UPDATE` は何もロックできない＝初回の verify/列挙が
     #       2並行すると両方 `[]` を読み、後勝ちで先の記録が消える。
-    #   F4: 行なしユーザーへの記録が `user_settings` に行を実体化させ、`agent` 列既定 'heuristic' が
+    #   行なしユーザーへの記録が `user_settings` に行を実体化させ、`agent` 列既定（`'codex'`）が
     #       入る＝`SHERPA_AGENT=bedrock` 環境で「列挙しただけでエージェントが変わる」regression。
-    #   F6: 列が `_SETTINGS_FIELDS` にある限り `update_settings(uid, bedrock_verified_models=[...])`
+    #   列が `_SETTINGS_FIELDS` にある限り `update_settings(uid, bedrock_verified_models=[...])`
     #       が行なし時に素通りしうる＝「記録は verify/列挙成功のみ」という不変条件と矛盾。
     # `add_bedrock_verified_models`（sherpa/store/settings.py）はこのテーブルに対して
     # 「INSERT ... ON CONFLICT DO NOTHING で行確保 → SELECT ... FOR UPDATE → UPDATE」の3文で完全直列化する。
@@ -366,11 +364,11 @@ _SCHEMA = [
     # 旧モデル名（提供終了）を現行へ寄せる（gpt-4o→gpt-5.5／gemini-2.0-flash→gemini-2.5-flash）。
     "UPDATE user_settings SET openai_model='gpt-5.5' WHERE openai_model='gpt-4o'",
     "UPDATE user_settings SET gemini_model='gemini-2.5-flash' WHERE gemini_model IN ('gemini-2.0-flash','gemini-1.5-flash')",
-    # Bedrock 旧 Mantle 短縮 ID → JP 推論プロファイルへ移行（runtime 切替 2026-07-03・旧 ID は runtime で 400＝全ユーザーで無効）。
+    # Bedrock 旧 Mantle 短縮 ID → JP 推論プロファイルへ移行（旧 ID は runtime で 400＝全ユーザーで無効）。
     # **既知の旧3値のみ**対象（NOT IN 方式にすると将来 BEDROCK_MODEL_CHOICES へ追加した新 ID を起動時に潰すため不可）。
     "UPDATE user_settings SET bedrock_model='jp.anthropic.claude-haiku-4-5-20251001-v1:0' "
     "WHERE bedrock_model IN ('anthropic.claude-opus-4-8','anthropic.claude-sonnet-5','anthropic.claude-haiku-4-5')",
-    # ---- 認証・ユーザー管理・会話共有（docs/proposals/2026-07-01-認証と共有の提案.md MVP）----
+    # ---- 認証・ユーザー管理・会話共有 ----
     # users＝アプリの正本。uid（文字列キー）が conversations/user_settings.user_id と接続する。
     """CREATE TABLE IF NOT EXISTS users (
         id BIGSERIAL PRIMARY KEY,
@@ -444,17 +442,17 @@ _SCHEMA = [
     # 同じユーザー・同じ share は履歴に1行だけ（受領ラッパーの冪等キー）。
     "CREATE UNIQUE INDEX IF NOT EXISTS conv_received_share_once ON conversations(user_id, share_id) "
     "WHERE origin='received_share' AND share_id IS NOT NULL AND deleted_at IS NULL",
-    # SH-1（2026-08-23-共有フォーク.md）: 受領共有ラッパーを自分の会話として複製した出所（フォーク元）。
+    # 受領共有ラッパーを自分の会話として複製した出所（フォーク元）。
     # `forked_from_share_id` は共有そのものが後で取消されても孤児化しないよう SET NULL
     # （出所表示は「編集不可の履歴情報」であり、共有の生死とは独立に残す）。
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_from_share_id BIGINT "
     "REFERENCES conversation_shares(id) ON DELETE SET NULL",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_from_user_id TEXT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS forked_at TIMESTAMPTZ",
-    # SH-2（2026-08-23-共有フォーク.md）: サニタイズ共有の再共有（スナップショット更新）で最後に
+    # サニタイズ共有の再共有（スナップショット更新）で最後に
     # 取り直した時刻。NULL＝一度も refresh していない（発行直後の状態）。
     "ALTER TABLE conversation_shares ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMPTZ",
-    # W3: uid スラッグ形式を DB レベルで強制（多層防御）。
+    # uid スラッグ形式を DB レベルで強制（多層防御）。
     # NULL uid も拒否する（Postgres の CHECK は NULL/UNKNOWN を通してしまうため IS NOT NULL を含む）。
     # 冪等化: 古い（NULL を許した）制約が存在すれば先に DROP し、正しい定義で再追加する。
     # seed admin の uid='admin' バックフィル（上の UPDATE）は _SCHEMA の先に実行済みなので
@@ -492,7 +490,7 @@ _SCHEMA = [
         detail JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
-    # audit_log 強化（2026-07-01-監査ログ強化.md §3・冪等 ALTER）。既存行は DEFAULT で埋まる。
+    # audit_log 強化（冪等 ALTER）。既存行は DEFAULT で埋まる。
     "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS outcome TEXT NOT NULL DEFAULT 'success'",
     "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS reason TEXT",
     "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'info'",
@@ -508,11 +506,11 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS audit_log_resource_time ON audit_log(resource_type, resource_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS audit_log_outcome_time ON audit_log(outcome, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS audit_log_request ON audit_log(request_id)",
-    # 2026-07-01-監査ログ強化.md §Phase2: 改ざん検知の hash-chain（entry_hash = SHA256(prev_hash || canonical_json(row)))。
+    # 改ざん検知の hash-chain（entry_hash = SHA256(prev_hash || canonical_json(row)))。
     "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT",
     "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT",
     # chain head アンカー（単一行）＝末尾行の truncation/欠落を検出するための last_id/last_hash/cnt。
-    # audit() が同一 tx で更新。verify() が末尾行と照合する（RV BLOCKER: 末尾削除検出）。
+    # audit() が同一 tx で更新。verify() が末尾行と照合する（末尾削除検出）。
     """CREATE TABLE IF NOT EXISTS audit_chain_head (
         singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
         last_id BIGINT,
@@ -521,11 +519,11 @@ _SCHEMA = [
     )""",
     # chain_start_id: 最初の hashed 行 id（一度だけ set）。chain 開始後の NULL-hash 偽行注入を検出する基準。
     "ALTER TABLE audit_chain_head ADD COLUMN IF NOT EXISTS chain_start_id BIGINT",
-    # RV: 列追加前から chain がある既存 head に idempotent backfill（最初の hashed 行 id を埋める）。
+    # 列追加前から chain がある既存 head に idempotent backfill（最初の hashed 行 id を埋める）。
     "UPDATE audit_chain_head SET chain_start_id="
     "  (SELECT MIN(id) FROM audit_log WHERE entry_hash IS NOT NULL) "
     "  WHERE chain_start_id IS NULL AND cnt > 0",
-    # ---- 個人 workspace 台帳（2026-07-01-認証と共有の提案.md §5）----
+    # ---- 個人 workspace 台帳 ----
     # このテーブルは grep 専用の台帳。ES/Neo4j の共有インデックス取り込み対象に**絶対含めない**。
     # es_index.py や world_graph.py はこのテーブルを参照してはならない（RAG 非索引の不変条件）。
     """CREATE TABLE IF NOT EXISTS personal_workspace_files (
@@ -543,7 +541,7 @@ _SCHEMA = [
         UNIQUE (user_id, rel_path)
     )""",
     "CREATE INDEX IF NOT EXISTS pwf_user ON personal_workspace_files(user_id, status)",
-    # ---- 運営掲示板（2026-07-02-利用統計とホーム掲示板.md Feature 2・トップ画面のお知らせ）----
+    # ---- 運営掲示板（トップ画面のお知らせ）----
     """CREATE TABLE IF NOT EXISTS announcements (
         id SERIAL PRIMARY KEY,
         author_uid TEXT NOT NULL,
@@ -556,10 +554,10 @@ _SCHEMA = [
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     "CREATE INDEX IF NOT EXISTS announcements_pub_order ON announcements(published, pinned DESC, created_at DESC)",
-    # 掲示板の公開/削除タイマー（S4・2026-07）: publish_at=NULL は即時公開扱い、expire_at=NULL は無期限掲載。
+    # 掲示板の公開/削除タイマー: publish_at=NULL は即時公開扱い、expire_at=NULL は無期限掲載。
     "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS publish_at TIMESTAMPTZ",
     "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS expire_at TIMESTAMPTZ",
-    # RV1（2026-07・S4 再検証）: publish_at > expire_at を DB レベルでも禁止する（最後の砦）。
+    # publish_at > expire_at を DB レベルでも禁止する（最後の砦）。
     # アプリ層は PATCH を SELECT...FOR UPDATE で直列化して防ぐが、CHECK 制約も併置する
     # （直接 SQL 操作や将来のコードパス漏れに対する多層防御・冪等 DO $$ + NOT VALID→VALIDATE の2段）。
     """DO $$ BEGIN
@@ -579,8 +577,7 @@ _SCHEMA = [
         ALTER TABLE announcements VALIDATE CONSTRAINT announcements_publish_before_expire;
       END IF;
     END $$""",
-    # ---- 会話共有: 無期限オプション＋共有元削除で共有先が消えない仕様
-    #      （docs/proposals/2026-07-02-共有の無期限と永続化.md）----
+    # ---- 会話共有: 無期限オプション＋共有元削除で共有先が消えない仕様 ----
     # NULL = 無期限。既存行（NOT NULL 制約下で作られた）は全て非NULLのまま残るため後方互換。
     "ALTER TABLE conversation_shares ALTER COLUMN expires_at DROP NOT NULL",
     # conversations.source_conversation_id の FK を CASCADE → SET NULL へ冪等移行。
@@ -601,17 +598,17 @@ _SCHEMA = [
       END IF;
     END $$""",
     # ---- 全体設定（system_settings・admin 書込のみ・監査つき）----
-    #      docs/proposals/2026-07-08-設定分離とUI整備.md S1。per-user の `user_settings` とは別に、
+    #      per-user の `user_settings` とは別に、
     #      全ユーザーに効くシステム全体設定を保持する汎用 KV（value=JSONB）。優先順は
     #      system_settings > env > コード既定（per-user settings の既存優先順は変えない）。
-    #      任意キーを保存できる（初期キー: arms_enabled・W0 で legacy_backend 追加）。
+    #      任意キーを保存できる（初期キー: arms_enabled・legacy_backend も追加）。
     """CREATE TABLE IF NOT EXISTS system_settings (
         key TEXT PRIMARY KEY,
         value JSONB,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_by TEXT
     )""",
-    # ---- 外部連携 API キー（docs/proposals/2026-07-07-外部API化とDify.md E1）----
+    # ---- 外部連携 API キー ----
     # ハッシュのみ保存（プレーンキーは発行レスポンスで1度だけ返し、DB には残さない）。
     # 失効は soft（revoked_at）＝監査追跡可能。行削除はしない。
     """CREATE TABLE IF NOT EXISTS api_keys (
@@ -638,9 +635,9 @@ _SCHEMA = [
     # `ext_self_key_recover`・store の `revoke_unconfirmed_key_by_client_op_id`）がこの値を
     # 認証主体・所有条件と同一SQLの WHERE 句で照合して自動失効できるようにする。
     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS client_op_id TEXT",
-    # PART-6（2026-09-05-Webhook通知.md W2）: キー1本につき Webhook 宛先1本（オプトイン・NULL=無効）。
+    # キー1本につき Webhook 宛先1本（オプトイン・NULL=無効）。
     # `webhook_secret` は署名生成（HMAC-SHA256）に平文が必須のためハッシュでなく平文保管する
-    # （閉域LAN・DB は管理境界内として受容・W4）。応答/一覧には secret を出さない
+    # （閉域LAN・DB は管理境界内として受容）。応答/一覧には secret を出さない
     # （発行応答でのみ1度返す・`system_extras.py::_key_created_out`）。
     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS webhook_url TEXT",
     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS webhook_secret TEXT",
@@ -687,7 +684,7 @@ _SCHEMA = [
         ALTER TABLE api_keys VALIDATE CONSTRAINT api_keys_daily_quota_range;
       END IF;
     END $$""",
-    # ---- R5: schema バージョンの記録専用スタンプ（2026-07-13-横断レビュー対応.md §3）----
+    # ---- schema バージョンの記録専用スタンプ ----
     # DDL 適用の可否判断には使わない（DDL は毎起動・全文冪等実行を継続＝自己修復性を保つ・§2）。
     # 読み手は運用者のみ（コードのどこからも読まない／分岐しない）。
     """CREATE TABLE IF NOT EXISTS schema_version (
@@ -695,11 +692,10 @@ _SCHEMA = [
         schema_hash TEXT NOT NULL,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
-    # ---- S1（2026-07-15-LLMオーケストレーション実装計画.md）: チャット以外の LLM 呼び出しの計測 ----
+    # ---- チャット以外の LLM 呼び出しの計測 ----
     #      チャット本回答の usage は引き続き messages.answer->'usage' に残る（二重書き込みなし）。ここは
     #      intent 分類・グラフ抽出・概念候補提案・埋め込み・admin グラフ質問・VLM 視覚読み取りの計測専用。
-    #      記録は常時（TOGGLE-RM・2026-09-03 で system_settings.usage_metering の ON/OFF トグルを撤去済み・
-    #      sherpa/metering.py）。suppress() 中（A/B ハーネス等の読み取り専用経路）だけ記録しない。
+    #      記録は常時（`sherpa/metering.py`）。suppress() 中（A/B ハーネス等の読み取り専用経路）だけ記録しない。
     #      トークン列は NULLABLE が設計（NULL＝呼び出しはあったがプロバイダが usage を返さなかった
     #      「報告不能」マーカー、0＝プロバイダがゼロと報告）。
     """CREATE TABLE IF NOT EXISTS usage_events (
@@ -716,7 +712,7 @@ _SCHEMA = [
         user_id TEXT,
         world TEXT
     )""",
-    # STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: LLM 呼び出しの所要時間。NULL＝計測スコープ
+    # LLM 呼び出しの所要時間。NULL＝計測スコープ
     # （`metering.acc_begin`/`acc_end`）の外で記録された行（例: kind='graph_ask'）＝所要時間が取れない。
     "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS elapsed_ms BIGINT",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events (ts)",
@@ -871,14 +867,14 @@ def _ensure_messages_created_at_index_background() -> None:
                      name="sherpa-idx-messages-created-at").start()
 
 
-# R5: コード側スキーマの内容ハッシュ（`schema_version` スタンプに使う・記録専用）。
+# コード側スキーマの内容ハッシュ（`schema_version` スタンプに使う・記録専用）。
 # tests/unit/test_store_surface.py の golden 算出式（sha256("\n".join(_SCHEMA))）と同一式。
 _SCHEMA_HASH = hashlib.sha256("\n".join(_SCHEMA).encode("utf-8")).hexdigest()
 
 
 _inited = False
 
-# R5 RV HIGH（2026-07-15）: init_schema の接続確立タイムアウト（秒）。lifespan 起動時と
+# init_schema の接続確立タイムアウト（秒）。lifespan 起動時と
 # /healthz の readiness リトライの双方から呼ばれるため、PG 不達で分級ブロックしない上限を置く。
 _INIT_CONNECT_TIMEOUT = 5
 
@@ -890,7 +886,7 @@ def _dsn() -> str:
     database_url = os.environ.get("DATABASE_URL")
     if database_url:
         return database_url
-    # フォールバックの password は PGPASSWORD ＞ POSTGRES_PASSWORD ＞ 既定（2026-08-18）。docker-compose.yml が
+    # フォールバックの password は PGPASSWORD ＞ POSTGRES_PASSWORD ＞ 既定。docker-compose.yml が
     # PG のパスワードを POSTGRES_PASSWORD から取るため、同じ 1 変数で compose とアプリが揃う
     # （DATABASE_URL に焼き込まなくてよい＝ポート/パスワードは各 1 か所）。
     return "host={h} port={p} dbname={d} user={u} password={pw}".format(
@@ -1074,7 +1070,7 @@ def world_lock(world_id, *, timeout_ms: int | None = None):
     """world 単位の Postgres advisory lock（**排他**・取り込み/削除/rebind を直列化）。
 
     ポーリング・手動 refresh・register/rebind/delete が同じ world に同時実行しても、Neo4j の delete+load と
-    台帳入替が別々のスナップショットで混ざらないようにする（RV High#1）。複数 worker/プロセスでも有効。
+    台帳入替が別々のスナップショットで混ざらないようにする。複数 worker/プロセスでも有効。
     `world_lock_shared`（読み取り専用処理向け・共有ロック）と同じ鍵を使うため、この排他ロックは
     保持中の共有ロック全てが解放されるまで（＝共有ロックの全保持者も、この排他ロックが解放される
     まで）互いに待ち合う——PostgreSQL の advisory lock は同一キーで排他/共有の両モードを提供する。
@@ -1094,7 +1090,7 @@ def world_lock(world_id, *, timeout_ms: int | None = None):
         conn.execute("SELECT pg_advisory_lock(%s)", (key,))
         yield
     finally:
-        # RV HIGH（2026-07-14 R3）: unlock は **best-effort**。PG 断で unlock が例外を投げると、それが
+        # unlock は **best-effort**。PG 断で unlock が例外を投げると、それが
         # `with` 本体の元例外を置換して隠す。session-level advisory lock は**接続 close で必ず解放される**
         # ため、unlock 失敗を握り潰しても lock は残らない（close が確実に効く）。
         try:
@@ -1406,7 +1402,7 @@ def _migrate_client_op_id_unique_index(conn) -> list[str]:
 def init_schema(*, connect_timeout: float | None = None) -> None:
     """会話/メッセージ表を冪等作成（初回のみ実行）。
 
-    R5（2026-07-13-横断レビュー対応.md §3）: 複数プロセス同時起動時の DDL 競合（deadlock の
+    複数プロセス同時起動時の DDL 競合（deadlock の
     蓋然性源）を防ぐため、DDL 全文実行を `pg_advisory_lock` で直列化する（`world_lock` と同型＝
     固定キー・別 autocommit 接続・unlock は best-effort。session-level advisory lock は接続 close
     で必ず解放されるため unlock 失敗を握り潰しても lock は残らない）。
@@ -1419,7 +1415,7 @@ def init_schema(*, connect_timeout: float | None = None) -> None:
     再起動毎に行が増え続けない）。
 
     `connect_timeout`（省略可・既定 None＝`_INIT_CONNECT_TIMEOUT`＝固定5秒を使う・既存呼び出し元は
-    無変更）: `_ensure()` 経由で呼び出し元（PART-4 の `get_world`/`get_system_settings`/
+    無変更）: `_ensure()` 経由で呼び出し元（`get_world`/`get_system_settings`/
     `add_usage_event` 等・残り時間ベースで渡す）が独自の接続タイムアウトを要求する場合に使う——
     未初期化（`_inited=False`）のまま呼ばれると、本来 bound したい接続確立の前に本関数の
     schema 初期化（advisory lock 待ち・DDL 全文実行）が挟まり、呼び出し元の予算を丸ごと迂回して
@@ -1440,7 +1436,7 @@ def init_schema(*, connect_timeout: float | None = None) -> None:
     ct = max(1, math.ceil(connect_timeout)) if connect_timeout is not None else _INIT_CONNECT_TIMEOUT
     key = int.from_bytes(hashlib.sha1(f"schema:{_KB_ID}".encode("utf-8")).digest()[:8],
                          "big", signed=True)
-    # RV HIGH（2026-07-15）: PG がブラックホール（SYN timeout・DNS stall）だと接続待ちが分級になり、
+    # PG がブラックホール（SYN timeout・DNS stall）だと接続待ちが分級になり、
     # lifespan は try/except に入る前にブロック＝「DB 不達でも起動を止めない」が実効を失う。未認証の
     # /healthz からも呼ばれるため接続確立にのみ上限を付ける（health.py の _ping_postgres と同方針。
     # statement_timeout は付けない＝DDL 全文実行は遅いディスクで正当に時間がかかりうる）。

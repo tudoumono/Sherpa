@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Agent（Claude Code のサブエージェント）用 worktree の基点をローカル main に揃える。
+#
+# 背景: Agent の worktree 隔離は `origin/main` を基点に作られる。内部 main を push していないと
+# 基点が数百コミット古くなり、レーンが古いコードに対して実装してしまう。`git worktree add` の
+# 初回チェックアウト（post-checkout・$3=1）で、対象が `.claude/worktrees/agent-*` かつ HEAD が
+# ローカル main の祖先なら、その場で main へ揃える（新規 worktree はクリーンなので安全）。
+# 有効化: `git config core.hooksPath scripts/git-hooks`（`make hooks`）。
+set -u
+[ "${3:-0}" = "1" ] || exit 0
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+case "$top" in
+  */.claude/worktrees/agent-*) ;;
+  *) exit 0 ;;
+esac
+main="$(git rev-parse --verify -q main)" || exit 0
+head="$(git rev-parse --verify -q HEAD)" || exit 0
+[ "$head" = "$main" ] && exit 0
+# `git checkout -b` でも $3=1 で発火する。未コミット変更（staged/unstaged/未追跡）がある作業ツリーを
+# hard reset すると実装中の変更が消えるため、clean な時だけ揃える（新規 worktree は常に clean）。
+if [ -n "$(git status --porcelain --untracked-files=all 2>/dev/null)" ]; then
+  echo "post-checkout: 未コミット変更があるため agent worktree の基点合わせをスキップしました（手動で git rebase main）" >&2
+  exit 0
+fi
+if git merge-base --is-ancestor "$head" "$main"; then
+  behind="$(git rev-list --count "$head".."$main")"
+  git reset -q --hard "$main" && echo "post-checkout: agent worktree の基点を main（${behind} コミット先）へ揃えました" >&2
+fi
+exit 0

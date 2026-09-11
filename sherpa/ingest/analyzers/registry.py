@@ -41,7 +41,7 @@ from .xml_config import XmlConfigAnalyzer
 from .yaml_config import YamlConfigAnalyzer
 
 # 優先順＝この並び順（§7 裁定2）。JavaAnalyzer は拡張子 `.java` が他アナライザと衝突しない
-# ため末尾に追加（CODE-1d＝新言語1つでの手順検証・docs/proposals/2026-08-29 §4.2）。
+# ため末尾に追加（新言語1つでの手順検証・docs/proposals/2026-08-29-コード解析層のコンポーネント化.md §4.2）。
 # Properties/YamlConfig/XmlConfig（アナライザ拡張 S3b・A6/A7）・SqlDdlAnalyzer（S2・A1/A10）も
 # 拡張子が他アナライザと衝突しないため末尾に追加——新規アナライザの追加自体は `config_signature()`
 # の `_ANALYZERS` タプル材料が自動的に変わるため `CODE_ANALYZERS_SCHEMA_VERSION` の据え置きでよい
@@ -280,28 +280,28 @@ _ANALYZERS: tuple[Analyzer, ...] = _UPSTREAM_ANALYZERS + discover_extension_anal
 # まま台帳・ES に載らなかった）。登録簿自体（`_ANALYZERS`/`extensions`）は無変更のため、この
 # 版を上げないと `content_sig`/ES `analyzer_config_sig` が drift を検知できず、既存 world が
 # 次回 sync/reindex まで新しい分類を反映しない。
-CODE_ANALYZERS_SCHEMA_VERSION = 10   # v3（2026-09-05）: _CALL/_COPY の前方語境界是正（偽参照の除去）
-# v4（rv-s2-mention #5・2026-09-05）: COPY/CALL 抽出前に引用文字列の中身／行末インラインコメント
+CODE_ANALYZERS_SCHEMA_VERSION = 10   # v3: _CALL/_COPY の前方語境界是正（偽参照の除去）
+# v4: COPY/CALL 抽出前に引用文字列の中身／行末インラインコメント
 # （`*>` 以降）を除去する前処理を追加（COBOL の引用/コメント誤検知の是正）＋ `CALL "PGM"`
 # （二重引用符）も INVOKES として受理するよう `_CALL` を拡張。
 # v5: `NODE_LABELS` へ `Config` を追加（A6・設定ファイルアナライザの受け皿）。共通層の契約拡張
 # （`RefCandidate.reverse`／qualified 名の2段解決／エッジ集約・KNOWN_VIA の Config 系 via 追加）も
 # 本版に含む。
-# v6（アナライザ拡張 S2・2026-09-06）: 既存 `CobolAnalyzer` の `extract_refs` へ `EXEC SQL`→
+# v6（アナライザ拡張）: 既存 `CobolAnalyzer` の `extract_refs` へ `EXEC SQL`→
 # `Table`/`ACCESSES(via=exec_sql)` 抽出を追加（同一構成のまま抽出結果が変わる変更・§6 版管理表）。
 # `SqlDdlAnalyzer` の新規登録自体は上記の理由により版を上げない。`DefResult.extras`（A10・DDL の
 # 複数 `CREATE TABLE` 用）の共通層契約拡張も本版に含む（既存アナライザは `extras` 既定空で無変更）。
-# v7（アナライザ拡張 波2・2026-09-06）: `CAnalyzer`/`CSharpAnalyzer` の新規登録（S6/S7）＋
+# v7（アナライザ拡張 波2）: `CAnalyzer`/`CSharpAnalyzer` の新規登録（S6/S7）＋
 # 既存 `CobolAnalyzer` の `EXEC CICS XCTL/LINK` 抽出（S5b）をまとめて1回で版上げする——新規登録
 # 単独では `config_signature()` が自動的に構成差分を検知するため版据え置きでもよい前例（S3b）が
 # あるが、波2は既存アナライザの抽出結果が変わる変更（S5b）を同時に含むため、対象を1つずつ切り
 # 分けず波全体で1回に統一する。
-# v8（アナライザ拡張 S3' 残課題・2026-09-06）: 既存 `XmlConfigAnalyzer` の `collect_defs` へ
+# v8（アナライザ拡張 S3' 残課題）: 既存 `XmlConfigAnalyzer` の `collect_defs` へ
 # キー単位 `Config` children（Spring `<bean>`/`<property>`/`<alias>`・MyBatis 文 id/`<resultMap>`・
 # Struts `<action>`/`<constant>`）を追加し、既存 `JavaAnalyzer` の設定キー参照抽出へ
 # `getBean`/`@Qualifier`/`@Named`/`@Resource(name=...)` を追加した（同一構成のまま抽出結果が
 # 変わる変更・§6 版管理表）。
-# v9（アナライザ拡張 波3 統合・2026-09-06）: `JspAnalyzer`/`HtmlTemplateAnalyzer`/`JsAnalyzer`/
+# v9（アナライザ拡張 波3 統合）: `JspAnalyzer`/`HtmlTemplateAnalyzer`/`JsAnalyzer`/
 # `CssAnalyzer`（レーンA・画面テンプレート/JS/CSS）・`ShellBatchAnalyzer`（レーンB・シェル/バッチ）・
 # `VbAnalyzer`（レーンC・VB.NET/VB6/VBA/VBScript）を新規登録し、`text_kind.CODE_EXT` から
 # `.js`/`.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb`（専用アナライザに移管した拡張子）を外した——
@@ -318,7 +318,7 @@ CODE_ANALYZERS_SCHEMA_VERSION = 10   # v3（2026-09-05）: _CALL/_COPY の前方
 # 無変更のまま抽出結果・cid が変わるため明示的に版を上げる。
 
 # docs/05-グラフ語彙.md のクローズド語彙（アナライザが返してよいラベル/エッジ型の上限・§7 裁定5）。
-# K13（2026-09-04-グラフのソース正典化.md §4）確定リスト＋A6（`Config` 追加）。刈った型は復活させない
+# （2026-09-04-グラフのソース正典化.md §4）確定リスト＋A6（`Config` 追加）。刈った型は復活させない
 # （`ingest.model.NODE_LABELS`/`EDGE_TYPES` と同じ集合＝`world_neo4j.WORLD_EDGE_TYPES` が
 # `CORRESPONDS_TO` を別途加算する）。
 NODE_LABELS = frozenset({"Module", "Copybook", "Batch", "DataItem", "Table", "Document", "Config"})

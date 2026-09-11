@@ -6,8 +6,7 @@
 ソース＋Office派生MD）を行チャンク化。doc_id=rel_path、`scopes`（祖先フォルダ prefix 群）で範囲フィルタ。
 常時、Office/PDF の `{rel}.rag.md`（Evidence IR 由来・RAG 正本＝D1）をアンカー分割した本文を
 索引ソースにする（`{rel}.rag_chunks.jsonl` は citation/locator 等を運ぶ証跡サイドカー・
-`rag_es_enabled`／`index_world`／`_validate_rag_chunks` 参照。グローバルな系統切替トグル
-`SHERPA_SEARCH_RAG_ES` は TOGGLE-RM・2026-09-03 で撤去済み・rag_chunks 破損時の per-file
+`rag_es_enabled`／`index_world`／`_validate_rag_chunks` 参照。rag_chunks 破損時の per-file
 legacy 縮退は別契約として残る）。
 """
 from __future__ import annotations
@@ -81,9 +80,8 @@ ES_MAPPING_VERSION = "7"                            # マッピング/チャン�
 # v5: `branch` フィールド追加（層フィルタ（`layer.es_filter`）を ext membership から
 # classify_document 確定値（`branch=="source"`）へ切替・grep/agentic と揃える）。
 # v6: rag チャンクの隣接キー（`previous_chunk_id`/`next_chunk_id`/`parent_id`/`logical_record_id`/
-# `section_path`）を追加（B1・出所メタの passthrough。`parent_id` は `agentic_search` の親返し
-# （L4c）が読む。文脈拡張として辿って連結する B2 は撤去済み＝2026-09-03・CLEAN-2 item f）。
-# v7（I2・2026-09-05・重要度の経路別反映）: `importance`（keyword）/`importance_reason`
+# `section_path`）を追加（出所メタの passthrough。`parent_id` は `agentic_search` の親返しが読む）。
+# v7: `importance`（keyword）/`importance_reason`
 # （keyword・index:false＝表示専用で検索対象にしない）を追加。`_重要度.txt` の無い world の文書は
 # どちらも索引に持たない（`_iter_doc_chunk_records` の meta 組み立てが条件付きで焼き込む）——
 # 検索クエリ側の重要度ブースト（`search()`/`search_knn_only()`）はこのフィールドへの `term` filter
@@ -97,28 +95,28 @@ ES_MAPPING_VERSION = "7"                            # マッピング/チャン�
 # （バッチ分割）が別途境界を持つため、ここは「壊れた/巨大すぎる1文書を拾わない」判定に専念する。
 _RAG_CHUNKS_FILE_CAP_BYTES = _env_int(                # 1ファイルの読み取り上限バイト（超過は無効）
     "SHERPA_ES_RAG_CHUNKS_FILE_CAP_BYTES", 32 * 1024 * 1024, 1024, 1024 * 1024 * 1024)
-# 既定は 20000 から大幅に緩和（2026-09-02）: 旧既定はレコード単位チャンク（xlsx の行・docx の段落等）
-# の正常なファイル1本（例: 2.5万行）すら拒否しうる、ファイル単位に誤って掛かった境界だった
-# （world 全体の bulk 送信量はバッチ分割が別途守る＝ここを world 単位の上限として使う必要がなくなった）。
+# レコード単位チャンク（xlsx の行・docx の段落等）の正常なファイル1本（例: 2.5万行）を拒否しない
+# よう緩和してある（world 全体の bulk 送信量はバッチ分割が別途守る＝ここを world 単位の上限として
+# 使う必要はない）。
 _RAG_CHUNKS_MAX_ROWS = _env_int(                      # 1ファイルが持てるチャンク行数の上限（超過は無効）
     "SHERPA_ES_RAG_CHUNKS_MAX_ROWS", 200000, 100, 2_000_000)
 _RAG_CHUNK_SEARCH_TEXT_MAX_CHARS = _env_int(          # 1チャンクの索引本文（rag.mdアンカー間）文字数上限（超過は無効）
     "SHERPA_ES_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS", 20000, 100, 1_000_000)
-# bulk 送信のバッチ境界（2026-09-02・本レーン）。world 全体を1本の `_bulk` リクエストへ詰めていた
-# 旧実装は、world のチャンク総数に比例してリクエストボディ・ES 側のバッチ処理メモリが際限なく
+# bulk 送信のバッチ境界。world 全体を1本の `_bulk` リクエストへ詰めると、
+# world のチャンク総数に比例してリクエストボディ・ES 側のバッチ処理メモリが際限なく
 # 増える（大規模 world で実メモリを圧迫しうる）——チャンクサイズがばらつくため件数だけでは
 # 有界にならず、件数とバイト数の両方で境界を決める（`_bulk_batches` 参照）。
 _ES_BULK_BATCH_MAX_DOCS = _env_int("SHERPA_ES_BULK_BATCH_MAX_DOCS", 2000, 1, 100000)
 _ES_BULK_BATCH_MAX_BYTES = _env_int(
     "SHERPA_ES_BULK_BATCH_MAX_BYTES", 8 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024)
-# 埋め込みのフラッシュ単位（2026-09-03・EMBED-2、EMBED-3 で用途を拡張）: `_embed_cached()` 1回分の
+# 埋め込みのフラッシュ単位: `_embed_cached()` 1回分の
 # 不足分（`need`）を1本の `embeddings.embed()` 呼び出しへ渡すと、返り値の全ベクトル（各 1536 次元級）を
 # 一括でメモリに保持することになり、大規模 world（実測: 15GB RAM 環境で 20万チャンク級）で OOM を
 # 起こす。`need` をこの件数単位のバッチへ割り、バッチ成功ごとにシャード（`_embed_cache_dir`）へ
 # **即時フラッシュ**することで、①1回に保持するベクトル量を有界化し、②プロセスが OOM/kill で
 # 落ちてもフラッシュ済み分は次回 sync がキャッシュヒットで即スキップできる（＝再開性の本体・
-# `_embed_cached` docstring 参照）。**EMBED-3（doc単位ストリーミング化）で `index_world()` 自身の
-# doc グループ化バッチサイズにも兼用**する（`_iter_doc_chunk_records`/`_flush_doc_group` 参照）——
+# `_embed_cached` docstring 参照）。`index_world()` 自身の
+# doc グループ化バッチサイズにも兼用する（`_iter_doc_chunk_records`/`_flush_doc_group` 参照）——
 # 「embed の HTTP バッチングは件数単位で有界」という既存契約と、「一度に保持するチャンク量」を
 # 同じ1つの env で揃え、チューニングつまみを増やさない。件数のみ（`_ES_BULK_BATCH_MAX_DOCS` と
 # 違いバイト数は見ない）＝チャンク本文の長さは埋め込み対象（自然文）でばらつきが小さく、
@@ -126,7 +124,7 @@ _ES_BULK_BATCH_MAX_BYTES = _env_int(
 _EMBED_FLUSH_CHUNKS = _env_int("SHERPA_EMBED_FLUSH_CHUNKS", 500, 1, 100000)
 _embed_log = logging.getLogger("sherpa.embed")     # 埋め込み進捗はここへ（log_setup.py の embed.log 行き）
 
-# 重要度スコアブースト（I2・J2・2026-09-05）: `高`/`低` それぞれの function_score 係数。
+# 重要度スコアブースト: `高`/`低` それぞれの function_score 係数。
 # 既定は控えめ（`高`=1.2倍・`低`=0.85倍）。範囲クランプ・env で調整可（`_env_float` 参照）。
 # `中`/未設定はどちらの function にも一致せず等倍（1.0）のまま——`_重要度.txt` の無い world は
 # 全文書がこの等倍のまま＝スコア完全不変（受け入れ条件）。
@@ -137,8 +135,7 @@ _ES_IMPORTANCE_BOOST_LOW = _env_float("SHERPA_ES_IMPORTANCE_BOOST_LOW", 0.85, 0.
 def rag_es_enabled() -> bool:
     """ES 索引ソースが rag チャンク（`{rel}.rag_chunks.jsonl`）を使うか。
 
-    常時 True（TOGGLE-RM・2026-09-03: グローバルな系統切替トグル `SHERPA_SEARCH_RAG_ES` を撤去し
-    常時ONへ固定）。既存の呼び出し形（`_search_chunk_mode`／`index_world`／`needs_reindex` 等）を
+    常時 True。既存の呼び出し形（`_search_chunk_mode`／`index_world`／`needs_reindex` 等）を
     変えない最小変更として関数自体は残す——`_search_chunk_mode()` は旧世代インデックス（`_meta` に
     `search_chunk_mode` フィールド自体が無い・古い legacy 索引）を検知して一度だけ reindex させる
     移行安全弁として引き続き機能する。rag_chunks 破損時の per-file legacy 縮退は別契約として残る。
@@ -181,17 +178,16 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
         # 取得はできる。検索/絞り込みの対象にはしない）。
         "chunk_id": {"type": "keyword"},
         "locator": {"type": "object", "enabled": False},
-        # B1: 隣接キー（v6・rag チャンクのみ持つ）。前後チャンク（`previous_chunk_id`/`next_chunk_id`）・
-        # 所属領域（`parent_id`＝context-region・`agentic_search` の親返し L4c が読む）・レコード単位の
+        # 隣接キー（v6・rag チャンクのみ持つ）。前後チャンク（`previous_chunk_id`/`next_chunk_id`）・
+        # 所属領域（`parent_id`＝context-region・`agentic_search` の親返しが読む）・レコード単位の
         # 識別子（`logical_record_id`）・見出し経路（`section_path`・配列）を持つ。全て keyword
-        # （フィルタ/集約用途で十分・全文検索対象ではない）。文脈拡張として辿って連結する B2 は撤去済み
-        # （2026-09-03・CLEAN-2 item f）。
+        # （フィルタ/集約用途で十分・全文検索対象ではない）。
         "previous_chunk_id": {"type": "keyword"},
         "next_chunk_id": {"type": "keyword"},
         "parent_id": {"type": "keyword"},
         "logical_record_id": {"type": "keyword"},
         "section_path": {"type": "keyword"},
-        # I2（v7）: 登録者が `_重要度.txt` で付けた文書の重要度（`ingest.importance`）。`importance`
+        # v7: 登録者が `_重要度.txt` で付けた文書の重要度（`ingest.importance`）。`importance`
         # はスコアブースト（function_score の term filter）とフィルタ/表示の両方に使うため keyword。
         # `importance_reason` は表示専用（`index: False`＝検索対象にしない・理由文の全文検索は不要）。
         "importance": {"type": "keyword"},
@@ -199,7 +195,7 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
     }
     if dim:
         props["embedding"] = {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"}
-    # rv-oom-resume item3（2026-09-05）: `index_world()` はクリーン再索引（delete→create→bulk）
+    # `index_world()` はクリーン再索引（delete→create→bulk）
     # のため、作成直後の新しい index は空——ES の既定 `refresh_interval`（"1s"）のままだと、
     # bulk が中間バッチ（`refresh=false`）を送っている**最中**でも背景の周期リフレッシュにより
     # 部分的に投入済みのチャンクだけが検索から見えてしまう（大規模 world では bulk が数時間かかる
@@ -237,8 +233,8 @@ def _settings(s):
 
 def _embed_system_settings_snapshot() -> dict | None:
     """`embeddings.cfg()`/`cloud_selected_but_unavailable()` へ渡す system_settings スナップ
-    ショットを1回だけ読む（同じ判定に使い回す・RV2 参照）——ただし `SHERPA_DISABLE_EMBED`
-    （テスト用 kill-switch）が有効な間は読まずに `None` を返す（RV3・FBK-1・2026-09-01）。
+    ショットを1回だけ読む（同じ判定に使い回す）——ただし `SHERPA_DISABLE_EMBED`
+    （テスト用 kill-switch）が有効な間は読まずに `None` を返す。
     両 helper とも kill-switch を system_settings 参照より先にチェックして即座に返す契約
     （`embeddings.py` 参照）のため、`None` を渡しても実害は無い一方、ここで無条件に読むと
     kill-switch が有効なテスト環境でも設定 DB 障害でこの読み取り自体が例外を出してしまい、
@@ -260,7 +256,7 @@ def _url() -> str:
 
 
 def _index(world: str) -> str:
-    """ES index 名（必ず小文字＝ES 規約）。world_id の**大小文字違いで衝突しない**よう厳密ハッシュを付す（RV High）。"""
+    """ES index 名（必ず小文字＝ES 規約）。world_id の**大小文字違いで衝突しない**よう厳密ハッシュを付す。"""
     slug = re.sub(r"[^a-z0-9._-]", "-", world.lower())[:40].strip("-._") or "w"
     return f"sherpa-kb-{slug}-{hashlib.sha1(world.encode('utf-8')).hexdigest()[:10]}"
 
@@ -287,7 +283,7 @@ def available() -> bool:
 
     timeout は短め（既定1秒・`SHERPA_ES_AVAILABLE_TIMEOUT` で上書き可）にする（不達時にこの
     呼び出しを待つ全経路——`agentic_search.tool_availability` の single-flight lock 内含む——の
-    待ち時間上限になるため。閉域の遅い環境で誤って不達判定（SC-6e の 422・索引の no-op）に
+    待ち時間上限になるため。閉域の遅い環境で誤って不達判定（422・索引の no-op）に
     倒れる場合は env で引き上げる。健全時の挙動には影響しない）。
     """
     try:
@@ -298,7 +294,7 @@ def available() -> bool:
 
 
 def _scopes(rel: str) -> list:
-    return scope_infer.ancestor_scopes(rel)   # 祖先 prefix（導出は scope_infer に集約・rv-full B3）
+    return scope_infer.ancestor_scopes(rel)   # 祖先 prefix（導出は scope_infer に集約）
 
 
 def _provenance_meta(d: dict) -> dict:
@@ -330,7 +326,7 @@ def _provenance_meta(d: dict) -> dict:
 def _arms_config_sig() -> str | None:
     """今の office_md アーム構成署名（`office_md._current_arms_sig()`）。取得失敗は None（fail-safe）。
 
-    `needs_reindex` の drift 判定に使う（RV Med）: アーム構成（例 OCR 有効/無効）が変わると派生MD の中身
+    `needs_reindex` の drift 判定に使う: アーム構成（例 OCR 有効/無効）が変わると派生MD の中身
     （画像 first-class 化の有無・extraction_method 等）が変わりうるが、ソースファイル自体の
     `content_sig`（rel/mtime/ctime/size のみ）は変化しないため、この署名が無いと `needs_reindex` の
     「unchanged」判定（`sync()` の no-op 分岐）が ES 索引の古い中身を見逃す。
@@ -372,7 +368,7 @@ def _human_md_config_sig(world: str) -> str | None:
     **RAG_ES の ON/OFF に関わらず常に評価する**: `rag_chunks` が無効/劣化（symlink・破損・上限超過等）
     な文書は40行チャンクへ縮退する（`index_world` の `rag_result is None` フォールバック参照）。
     縮退先の実体は `md_path`＝`corpus_docs.iter_world_documents(include_rag=True)` が返すファイルで、
-    **rag.md があればそれ・無ければ legacy `{rel}.md`（`human_md` 生成）**（2026-09-02 §8 D1 の
+    **rag.md があればそれ・無ければ legacy `{rel}.md`（`human_md` 生成）**（
     「grep/ES/グラフが同じ物理ファイルを見る」に従う）。したがって human_md 版は RAG_ES=OFF の索引本体と、
     ON でも rag.md を持たない文書の縮退先に効き続ける——RAG_ES=ON だからといって無条件に無視してはいけない。
 
@@ -470,7 +466,7 @@ def _confirm_content_sig(world: str, content_sig) -> None:
 
 
 def _restore_refresh_interval(world: str) -> None:
-    """`_mapping()` が索引作成時に立てた `refresh_interval:-1`（rv-oom-resume item3）を、bulk
+    """`_mapping()` が索引作成時に立てた `refresh_interval:-1` を、bulk
     全件成功後にクラスタ既定（"1s"）へ戻す（PUT `_settings` へ `null` を渡すと既定に復帰する
     ＝ES の仕様）。この復帰自体が失敗しても索引の完全性には影響しない——直前の最終バッチが
     `refresh=true` で既に全件可視化を終えている（`_StreamingBulkSender.finish()`）。復帰できな
@@ -562,9 +558,9 @@ def ensure_index(world: str, dim=None, emeta=None) -> bool:
     return False
 
 
-# 埋め込みキャッシュのシャーディング（2026-09-03・EMBED-3）: 旧形式（`embed_cache.json` 単一ファイル・
-# EMBED-2 以前）は world 全体のベクトルを1つの dict へ読み込む設計そのものが、大規模 world
-# （実測: 15GB RAM 環境で 20万チャンク級）で OOM の主因だった——Python の float リストはベクトル1本
+# 埋め込みキャッシュのシャーディング: 単一ファイル（`embed_cache.json`）へ
+# world 全体のベクトルを1つの dict として読み込む設計は、大規模 world
+# （実測: 15GB RAM 環境で 20万チャンク級）で OOM の主因になる——Python の float リストはベクトル1本
 # あたり dense_vector の理論サイズよりはるかに大きいオブジェクト表現になる。キー（SHA1）の先頭
 # `_EMBED_CACHE_SHARD_HEX` 桁でシャーディングし、常に**シャード単位**（world 全体ではなく）で読み書き
 # する——ある瞬間に保持するベクトル量が世界規模ではなく「1シャード＋1フラッシュバッチ」に
@@ -576,9 +572,9 @@ _EMBED_CACHE_SHARD_HEX = 2   # 16^2=256 シャード
 def _embed_cache_dir(world: str) -> Path:
     """world の埋め込みキャッシュ（シャード群）ディレクトリ。
 
-    EMBED-3 以前の旧・単一 JSON キャッシュ（`embed_cache.json`・実測で数GB級になり得る）は
+    旧・単一 JSON キャッシュ（`embed_cache.json`・実測で数GB級になり得る）は
     シャード化以降どこからも読まれない＝残しても機能影響ゼロだが、**誰も消さないと閉域機の
-    ディスクを恒久占有する**（2026-09-05 横並び精査 R2）。ここで見つけ次第1回だけ削除する
+    ディスクを恒久占有する**。ここで見つけ次第1回だけ削除する
     （失敗は無視＝掃除はベストエフォート）。"""
     d = worlds.semantic_dir(world) / "embed_cache"
     legacy = d.parent / "embed_cache.json"
@@ -587,7 +583,7 @@ def _embed_cache_dir(world: str) -> Path:
             legacy.unlink()
         except OSError:
             # 掃除はベストエフォート（旧ファイルはどこからも読まれず機能影響ゼロ）——ただし
-            # 消せない事実自体は運用が気付けるよう警告ログに残す（2026-09-05・rv-oom-resume item2）。
+            # 消せない事実自体は運用が気付けるよう警告ログに残す。
             _embed_log.warning("es_index: 旧単一embedキャッシュの削除に失敗（world=%s・%s）",
                                world, legacy)
     return d
@@ -605,7 +601,7 @@ def _read_embed_cache_shard(world: str, shard_id: str) -> dict:
 
 def _write_embed_cache_shard(world: str, shard_id: str, vectors: dict) -> None:
     """シャードへ書き込む。**新規ベクトルの書込失敗（OSError＝ENOSPC 等）は呼び出し元へ伝播する**
-    （2026-09-05・rv-oom-resume item2）——ここで握り潰すと、実際にはディスクへ永続化されなかった
+    ——ここで握り潰すと、実際にはディスクへ永続化されなかった
     バッチを「flush 成功」として扱ってしまい（`_embed_cached()` はこの後 in-memory の `filled` を
     返すため、この呼び出し自体は成功したように見える）、後続の Pass2（別途ディスクから読み直す
     `_embed_cache_lookup_batch`）がキャッシュ miss を起こして embedding 無しでチャンクを送る
@@ -660,9 +656,9 @@ def _prune_embed_cache(world: str, valid_keys: set) -> None:
     """**world 全体の doc ストリームを一巡し、全チャンクの embed が完了した直後にだけ**呼ぶ最終剪定:
     現存キー（`valid_keys`）以外を消す（鏡・サイズ有界・削除/プロバイダ変更で旧エントリ消滅）。
 
-    シャードを1つずつ処理する（world 全体を一括ロードしない＝EMBED-3 の主眼）。`valid_keys` が
-    空なら（対象チャンクが無い world）ディレクトリごと削除する（`_delete_embed_cache` と同じ・
-    RV Med 相当）。`index_world()` から**1回だけ**呼ぶ契約——`_embed_cached()` は EMBED-3 で
+    シャードを1つずつ処理する（world 全体を一括ロードしない）。`valid_keys` が
+    空なら（対象チャンクが無い world）ディレクトリごと削除する（`_delete_embed_cache` と同じ）。
+    `index_world()` から**1回だけ**呼ぶ契約——`_embed_cached()` は doc 単位ストリーミングにより
     複数回（doc グループごと）呼ばれるため、呼ぶたびに剪定すると前のグループ分を消してしまう。
     """
     if not valid_keys:
@@ -704,10 +700,10 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
     そのまま残る・後述）。重複チャンクは1回だけ embed。キャッシュ済ベクトルも形状（list かつ
     次元一致）を検証し、壊れ/型ズレは miss 扱いで再 embed する（毒ベクトルを使わない）。
 
-    **`texts` は呼び出し元が有界なバッチへ分けて渡す契約**（2026-09-03・EMBED-3・doc単位
-    ストリーミング化）: `index_world()` はもう world 全体の texts を1回では渡さない——doc 単位で
+    **`texts` は呼び出し元が有界なバッチへ分けて渡す契約**: `index_world()` は world 全体の
+    texts を1回では渡さない——doc 単位で
     `_EMBED_FLUSH_CHUNKS` 件程度ずつ束ねて本関数を**複数回**呼ぶ（`index_world` docstring 参照）。
-    そのため本関数は**このバッチのキーだけを ADD/UPDATE するのみ**——旧版（EMBED-2 以前）にあった
+    そのため本関数は**このバッチのキーだけを ADD/UPDATE するのみ**——
     「現存チャンクだけへ剪定する」最終仕上げはここでは行わない（複数回呼ばれるため、呼ぶたびに
     剪定すると前のバッチの分を消してしまう）。剪定は `_prune_embed_cache()` を、world 全体の doc
     ストリームを一巡し終えた**呼び出し元側で1回だけ**呼ぶ契約に切り出した。埋め込み無効
@@ -715,9 +711,9 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
     削除も呼び出し元の責務——`_delete_embed_cache`/`_prune_embed_cache` 参照）。
 
     キャッシュ本体はシャード化（`_embed_cache_lookup_batch`/`_embed_cache_write_batch`）——
-    world 全体のベクトルを1つの dict へロードしない（EMBED-3 の主眼＝メモリ有界化）。
+    world 全体のベクトルを1つの dict へロードしない（メモリ有界化）。
     不足分（`need`）はさらに `_EMBED_FLUSH_CHUNKS` 件単位のバッチへ分割し、バッチが成功するたびに
-    シャードへ即座にフラッシュする（EMBED-2 由来の再開性の本体：後続バッチの失敗やプロセス自体の
+    シャードへ即座にフラッシュする（再開性の本体：後続バッチの失敗やプロセス自体の
     OOM/kill で今回の呼び出しが完走できなくても、フラッシュ済み分は次回呼び出しでキャッシュヒットし
     即スキップできる＝再実行が0から始まらない）。
     """
@@ -745,7 +741,7 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
             try:
                 _embed_cache_write_batch(world, new_map)   # 成功したバッチだけ即座に永続化（シャード単位・アトミック）
             except OSError:
-                # 2026-09-05・rv-oom-resume item2: シャード書込障害（ENOSPC 等）を「flush 成功」
+                # シャード書込障害（ENOSPC 等）を「flush 成功」
                 # として扱わない——このバッチは実際にはディスクへ永続化されていない。embed API 呼び
                 # 出し自体の失敗と同じ扱い（呼び出し元は BM25 のみへ降格・既存キャッシュは壊さない）
                 # にして fail-loud にする。
@@ -915,7 +911,7 @@ def _chunk_context_meta(chunk: dict) -> dict:
 def _load_rag_md_anchors(md_path: Path | None) -> tuple:
     """`{rel}.rag.md`（D1正本）を読み、アンカー辞書 `(anchors, reason)` を返す。`reason` が付けば
     `anchors` は None（`_validate_rag_chunks` 冒頭の md 側ロジックを、jsonl 側の検証（軽量な
-    `_rag_chunks_validate`）と独立に再利用できるよう切り出したもの・2026-09-05・rv-oom-resume item1）。
+    `_rag_chunks_validate`）と独立に再利用できるよう切り出したもの）。
     """
     if md_path is None:
         return None, "rag_md_missing"
@@ -937,8 +933,8 @@ def _load_rag_md_anchors(md_path: Path | None) -> tuple:
 
 
 def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
-    """`{rel}.rag_chunks.jsonl` を検証**のみ**行う（本文/メタは一切保持しない・
-    2026-09-05・rv-oom-resume item1）。1文書のチャンク数が大きくても（`_RAG_CHUNKS_MAX_ROWS`
+    """`{rel}.rag_chunks.jsonl` を検証**のみ**行う（本文/メタは一切保持しない）。
+    1文書のチャンク数が大きくても（`_RAG_CHUNKS_MAX_ROWS`
     既定20万）保持するのは `chunk_id` 文字列の集合だけ——チャンク本文（`_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS`
     既定2万文字/チャンク）を1件も溜めないため、検証だけならメモリは1文書のチャンク総数に
     比例しない（旧 `_validate_rag_chunks` は検証と同時に ids/bodies/texts を全件蓄積していた
@@ -993,7 +989,7 @@ def _rag_chunks_validate(rag_path: Path, anchors: dict, rel: str) -> tuple:
 
 def _iter_rag_chunk_entries(rag_path: Path, rel: str, anchors: dict, base_meta: dict):
     """**事前に `_rag_chunks_validate()` が `reason=None` を返した** `rag_path` をもう一度走査し、
-    `(id, body, text)` を1件ずつ yield する（2026-09-05・rv-oom-resume item1）。ファイルを2回
+    `(id, body, text)` を1件ずつ yield する。ファイルを2回
     読む代わりに、1文書のチャンク総数（大きければ20万件級）に関係なく常に1件分だけをメモリに
     持つ——呼び出し元（`index_world` の Pass1/Pass2）が `_EMBED_FLUSH_CHUNKS` 件ごとに
     flush できる。検証は繰り返さない（呼び出し契約: 検証成功を確認済みの `rag_path`/`anchors`
@@ -1107,15 +1103,13 @@ def _bulk_batches(ids: list, bodies: list, vec_by_idx: dict) -> list:
 def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts: frozenset,
                             res_map: dict | None = None) -> tuple:
     """1文書分のチャンクを `(id, body, text, no_embed)` を1件ずつ返すジェネレータへ組み立てる
-    （2026-09-03・EMBED-3・doc単位ストリーミング化／2026-09-05・rv-oom-resume item1でさらに
-    チャンク単位へ細分）。
+    （doc単位ストリーミング化を、さらにチャンク単位へ細分したもの）。
 
-    `index_world()` の元の単一ループ本体（world 全体の ids/bodies/texts を一括蓄積していた箇所）を
-    doc 単位へ切り出したのが EMBED-3 の `_doc_chunk_bundle()` だったが、**1文書自体が大量チャンク**
-    （rag_chunks 経路の record 単位チャンク・`_RAG_CHUNKS_MAX_ROWS` 既定20万まで許容）を持つ場合、
-    旧実装は1文書分の ids/bodies/texts を丸ごと1つのリストとして返していたため、呼び出し側の
-    flush 判定（`len(g_ids) >= _EMBED_FLUSH_CHUNKS`）が効く前に1文書ぶん（最大20万チャンク×
-    埋め込み込み）がまるごとメモリに乗ってしまっていた（実測: 20万チャンクでベクトルだけ約10GB）。
+    `index_world()` は world 全体の ids/bodies/texts を一括蓄積せず doc 単位で処理するが、
+    **1文書自体が大量チャンク**（rag_chunks 経路の record 単位チャンク・`_RAG_CHUNKS_MAX_ROWS`
+    既定20万まで許容）を持つ場合、1文書分の ids/bodies/texts を丸ごと1つのリストとして返すと、
+    呼び出し側の flush 判定（`len(g_ids) >= _EMBED_FLUSH_CHUNKS`）が効く前に1文書ぶん（最大20万
+    チャンク×埋め込み込み）がまるごとメモリに乗ってしまう（実測: 20万チャンクでベクトルだけ約10GB）。
     本関数はチャンクを1件ずつ yield するジェネレータにし、呼び出し元（`index_world` の Pass1/Pass2）が
     1件ごとに flush 判定できるようにする——**doc 単位の原子性契約は維持**する: rag_chunks 経路は
     yield を始める**前**に `_rag_chunks_validate()` で jsonl 全体を検証し終える（本文/メタは保持せず
@@ -1126,7 +1120,7 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
     チャンク総数に関係なく常に O(1)〜O(`_EMBED_FLUSH_CHUNKS`) のメモリで済む（world 全体を
     2回走査する既存の Pass1/Pass2 設計と同じトレードオフ・`index_world` docstring 参照）。
 
-    `res_map`（省略可・I2・2026-09-05）: `importance.resolve_for_world()` の結果（world 全体を
+    `res_map`（省略可）: `importance.resolve_for_world()` の結果（world 全体を
     `index_world()` が1回だけ解決して渡す）。あれば `body`（この文書の全チャンクへ passthrough）へ
     `importance`/`importance_reason` を条件付きで焼き込む（無ければキー自体を持たない・§2 truth
     table）。省略時（Pass1 の埋め込み専用パス等）は従来どおり付けない。
@@ -1182,14 +1176,14 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
                 seen = None
                 if reason is None:
                     seen, reason = _rag_chunks_validate(rag_path, anchors, rel)
-                if reason is None and seen:      # 有効かつ1件以上（旧実装の `invalid_reason is None and r_ids` と同じ判定）
+                if reason is None and seen:      # 有効かつ1件以上
                     def _rag_chunk_iter(rag_path=rag_path, anchors=anchors, meta=meta, no_embed=no_embed):
                         for cid_key, body, text in _iter_rag_chunk_entries(rag_path, rel, anchors, meta):
                             yield cid_key, body, text, no_embed
                     return _rag_chunk_iter(), None
                 if reason is not None:
                     degraded_entry = {"doc": rel, "reason": reason}
-                # reason is None かつ seen が空集合（0件チャンク）の場合は旧実装と同じく degraded に
+                # reason is None かつ seen が空集合（0件チャンク）の場合は degraded に
                 # せず、そのまま legacy 縮退へ黙って続行する（rag_chunks が「正しく空」なケース）。
     text = doc_text.read_world_doc_text(world, d)   # ソース/テキスト、または rag_chunks の無い/無効な Office/PDF
     if text is None:
@@ -1208,13 +1202,13 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
 
 class _StreamingBulkSender:
     """`index_world()` Pass2 が doc グループ単位で積むチャンクを、bulk 送信の境界（`_bulk_batches` と
-    同じ件数/バイト数の閾値）に達し次第 ES へ流す（world 全体を先に1本のリストへ溜めない・EMBED-3）。
+    同じ件数/バイト数の閾値）に達し次第 ES へ流す（world 全体を先に1本のリストへ溜めない）。
 
     `refresh=true` は**最後の送信だけ**に付けたいが、ストリーミングでは「これが最後の送信か」は
     全 doc を処理し終えるまで分からない——直前に確定した1バッチを `_pending` として1つだけ
     持ち越す（lag-by-one）: 次のバッチが確定した時点で「まだ後続がある＝直前の持ち越し分は最後
     ではない」と確定してから送る。`finish()` で最後に残った `_pending` を refresh 付きで送る
-    （`_bulk_batches()` を丸ごと事前計算していた旧実装と、doc/バイト数境界での分割・
+    （`_bulk_batches()`（一括事前計算版）と、doc/バイト数境界での分割・
     refresh のタイミングとも完全に等価——境界がどこにあっても最後の1バッチだけが refresh 付きになる）。
     """
 
@@ -1276,11 +1270,11 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
     キャッシュ参照は `embed_feature_applies` が真の時だけ（Pass1 が全チャンクの embed を
     完了させている前提——グループ内の対象チャンクだけを束ねて1回のシャード参照で引く）。
 
-    **埋め込み対象キーの miss は fail-loud にする**（2026-09-05・rv-oom-resume item2）:
+    **埋め込み対象キーの miss は fail-loud にする**:
     `embed_feature_applies` が真＝ Pass1 が world 全体の embed 対象キーを既にシャードへ flush
     済みのはず（`_embed_cached` docstring 参照）。にもかかわらずここで miss が起きるのは、
     シャード破損・並行削除・ディスク書込障害等の異常事態——miss したチャンクだけ embedding
-    無しで黙って送る（旧実装）と、同じ world 内で一部だけベクトル付き/無しが混在する非一様な
+    無しで黙って送ると、同じ world 内で一部だけベクトル付き/無しが混在する非一様な
     索引になる（`test_index_world_embed_partial_failure_degrades_uniformly_no_doc_mixing` が
     守る不変条件の破れ）。miss を検知したら bulk 送信ごと中止する（`sender.failed` を立てる——
     既存の「途中バッチ失敗＝ world を wipe」経路にそのまま乗る）。"""
@@ -1303,15 +1297,15 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                 progress: Callable[[int, int], None] | None = None) -> dict:
     """world を**クリーン再索引**（delete→create→bulk）。埋め込み設定があればベクトルも付与（kNN 用）。
 
-    失敗は古い索引を残さず error を返す（RV Med）。埋め込みを一度も選んでいない構成（BM25 のみで
+    失敗は古い索引を残さず error を返す。埋め込みを一度も選んでいない構成（BM25 のみで
     良い）は従来どおり graceful に BM25 のみで索引する。**A7 で明示選択したクラウドの埋め込みが
-    解決できない場合は削除の前に失敗する**（RV1・FBK-1・2026-09-01）——`embeddings.cfg()` の
+    解決できない場合は削除の前に失敗する**——`embeddings.cfg()` の
     None を通常の埋め込み未設定と区別できないまま索引を作り直すと、既存の（正しい）ベクトル付き
     索引が黙って BM25-only に置き換わり、クラウド側の障害に気付けない。**`cfg()` は成功しても
-    実際の embed API 呼び出しが失敗する場合も同様に保護する**（RV2・2026-09-01）——文書列挙と
+    実際の embed API 呼び出しが失敗する場合も同様に保護する**——文書列挙と
     埋め込み生成を delete の**前**に完了させ、選択済みクラウドで生成が実際に失敗（`_embed_cached`
     が `None` を返す）したら delete せず打ち切る。
-    `content_sig`＝索引時のフォルダ署名（_meta に保存・古い索引の検知＝鮮度修復に使う・RV High）。
+    `content_sig`＝索引時のフォルダ署名（_meta に保存・古い索引の検知＝鮮度修復に使う）。
     埋め込みは**内容ハッシュキャッシュ**経由（`_embed_cached`）で未変更チャンクの再 embed を省く（コスト最適化）。
     `rag_es_enabled()` 時は Office/PDF（`{rel}.rag_chunks.jsonl` を持つ）をレコード単位チャンクで索引し、
     それ以外（ソース/テキスト文書、rag_chunks が無い/検証に失敗した Office/PDF）は従来どおり40行チャンク。
@@ -1322,20 +1316,20 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     除外する（コード分の embed コストを避ける・BM25 は全チャンクに効く＝ハイブリッド検索は
     embedding 欠落チャンクでも壊れない）。
 
-    **bulk 送信はバッチ分割する**（2026-09-02）: world 全体を1本の `_bulk` リクエストへ詰めると
-    リクエストボディ・ES 側の処理メモリが world のチャンク総数に比例して際限なく増える（旧実装の
-    欠陥——`_RAG_CHUNKS_MAX_ROWS` 等の1文書単位の上限を守っていても、複数文書の合算で同じ問題が
-    起きる）。`_bulk_batches()` が件数・バイト数の両方で有界なバッチへ分割し、`refresh=true` は
+    **bulk 送信はバッチ分割する**: world 全体を1本の `_bulk` リクエストへ詰めると
+    リクエストボディ・ES 側の処理メモリが world のチャンク総数に比例して際限なく増える
+    ——`_RAG_CHUNKS_MAX_ROWS` 等の1文書単位の上限を守っていても、複数文書の合算で同じ問題が
+    起きる。`_bulk_batches()` が件数・バイト数の両方で有界なバッチへ分割し、`refresh=true` は
     **最後のバッチだけ**に付ける（毎バッチ refresh すると著しく遅い）。**途中のバッチが失敗したら
     `delete_world()` して world を空へ戻し、error を返す**（既存の「失敗＝空の索引・次回 sync が
     全部やり直す」という全部か無しかのセマンティクスを、複数バッチに分けても保つ——一部だけ入った
     索引は利用者から見て「検索したのに出てこない」というサイレントな取りこぼしになるため）。
 
-    **doc 単位ストリーミング化（2026-09-03・EMBED-3）**: 実環境（1万ファイル・数十万チャンク級）で
+    **doc 単位ストリーミング化**: 実環境（1万ファイル・数十万チャンク級）で
     world 全体の ids/bodies/texts をリストへ一括蓄積し、返り値の全ベクトルを filled dict/vec_by_idx
-    に保持する旧実装は、メモリが world サイズに比例して OOM を起こしていた（EMBED-2 のバッチ確定
-    フラッシュだけでは埋め込みキャッシュ dict 自体が world 規模のまま残っていた）。本関数は**2パス**
-    構成にする（ユーザー裁定「doc単位パイプライン化」）:
+    に保持すると、メモリが world サイズに比例して OOM を起こす（バッチ確定
+    フラッシュだけでは埋め込みキャッシュ dict 自体が world 規模のまま残ってしまう）。本関数は**2パス**
+    構成にする:
 
     - **Pass1（埋め込みのみ）**: `_iter_doc_chunk_records()` で doc ごとにチャンクを1件ずつ
       受け取り、embed 対象テキストだけを `_EMBED_FLUSH_CHUNKS` 件程度のバッファへ束ね、閾値に
@@ -1347,11 +1341,11 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
       グループの対象チャンクだけキャッシュから引いて（`_embed_cache_lookup_batch`）body へ付与し、
       `_StreamingBulkSender` で ES へ流す。
 
-    **rv-oom-resume item1（2026-09-05）**: EMBED-3 は世界規模の doc リストをグループ単位
-    （`_EMBED_FLUSH_CHUNKS`）へ束ねたが、**1文書自体が大量チャンク**（rag_chunks 経路の record
-    単位チャンク・`_RAG_CHUNKS_MAX_ROWS` 既定20万まで許容）を持つと、flush 判定より前に1文書分
-    まるごとがメモリに乗ってしまっていた（旧 `_doc_chunk_bundle()` は1文書分の ids/bodies/texts
-    を丸ごと1つのリストとして返していたため）。`_iter_doc_chunk_records()` はチャンクを1件ずつ
+    doc単位ストリーミング化はグループ単位
+    （`_EMBED_FLUSH_CHUNKS`）へ束ねるが、**1文書自体が大量チャンク**（rag_chunks 経路の record
+    単位チャンク・`_RAG_CHUNKS_MAX_ROWS` 既定20万まで許容）を持つ場合、doc 単位で1文書分の
+    ids/bodies/texts を丸ごと1つのリストとして返すと、flush 判定より前に1文書分まるごとが
+    メモリに乗ってしまう。`_iter_doc_chunk_records()` はチャンクを1件ずつ
     yield するジェネレータにし、Pass1/Pass2 の両方が**チャンク単位**（doc 境界をまたいでも）で
     flush 判定できるようにした——1文書の内部チャンク数に関係なく、常に高々
     `_EMBED_FLUSH_CHUNKS` 件分のメモリで済む。doc 単位の原子性契約（rag_chunks が壊れている
@@ -1373,11 +1367,10 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     ための追加走査はしない）。実環境（数時間かかる最長段）で最長時間 done/total が動かない
     まま止まって見える問題への対処（office_md 段の `_office_progress` と同じ役割）。呼び出し
     頻度の間引きは呼び出し元（`ingest/worker.py` の `_progress`）の責務——ここでは flush 単位
-    （`_EMBED_FLUSH_CHUNKS` チャンクごと）でそのまま呼ぶ。**Pass1（埋め込み・rv-oom-resume
-    item6）も文書1件処理し終えるたび同じ `progress(done_docs, total_docs)` を呼ぶ**——冷キャッシュ
+    （`_EMBED_FLUSH_CHUNKS` チャンクごと）でそのまま呼ぶ。**Pass1（埋め込み）も文書1件処理し終えるたび同じ `progress(done_docs, total_docs)` を呼ぶ**——冷キャッシュ
     時は実 embed API 呼び出しを伴う Pass1 が最長段になりうるため。Pass1/Pass2 は同じ目盛り
     （`docs` の長さ）を共有し別カウンタとしては合成しない——Pass2 開始時に `progress(0,
-    total_docs)` を明示的に1回呼んでから開始する（rv-periphery #3・2026-09-05）——間引き
+    total_docs)` を明示的に1回呼んでから開始する——間引き
     ラッパー（`_es_progress`）は「直近との差分」で書込みを間引くため、明示の0通知が無いと
     Pass1 完走時の高い done 値のまま何十件も進むまで画面が更新されない窓ができる。Pass2 の
     done（`docs_done`）は**対象外（チャンク0件）文書も1件として数える**——`n_docs`（戻り値
@@ -1387,7 +1380,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     """
     if not available():
         return {"available": False, "indexed": 0, "chunks": 0}
-    # RV2/RV3: cfg() と cloud_selected_but_unavailable() を同じ system_settings スナップショット
+    # cfg() と cloud_selected_but_unavailable() を同じ system_settings スナップショット
     # で呼ぶ（別々に読むと、その間の admin 更新で「解決できた（旧鍵）が理由判定は不可用（新状態）」
     # のような食い違いが起こりうる）。埋め込み生成が実際に失敗した場合の再判定（下記）でも同じ
     # スナップショットを使い回す。kill-switch 有効時は読まない（`_embed_system_settings_snapshot`）。
@@ -1402,7 +1395,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     rag_exts = _rag_chunk_source_exts() if use_rag else frozenset()
     docs = corpus_docs.world_documents(world, include_rag=True) if use_rag else corpus_docs.world_documents(world)
     total_docs = len(docs)                             # 進捗表示の total（既に materialize 済みの一覧の長さ・追加走査なし）
-    # I2（2026-09-05）: 重要度は world 全体を1回だけ解決し（`res_map`）、各文書のチャンク組み立て
+    # 重要度は world 全体を1回だけ解決し（`res_map`）、各文書のチャンク組み立て
     # （`_iter_doc_chunk_records`）へ使い回す。`world_documents()` 呼び出しは既存テスト（`world_documents`
     # を単一引数 `lambda w: docs` で差し替える広範な既存スタブ群）と互換な形（`root=` を渡さない）
     # のまま維持し、重要度解決だけ独立に `world_dir()` を呼ぶ（`doc_ledger.public_documents` ほど
@@ -1416,7 +1409,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     valid_keys: set = set()
     reused_total = 0
     embedded_total = 0
-    embed_elapsed_ms = 0.0    # STAT-3 S5: `_embed_cached()` 呼び出し（Pass1・実 embed API を含みうる）の合計所要時間
+    embed_elapsed_ms = 0.0    # `_embed_cached()` 呼び出し（Pass1・実 embed API を含みうる）の合計所要時間
     embed_calls_made = False  # 0（呼んだが瞬時）と未計測（一度も呼んでいない）を区別する
     if ec is not None:
         buf: list = []
@@ -1446,9 +1439,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                 break
             pass1_docs_done += 1
             if progress is not None:
-                # rv-oom-resume item6（2026-09-05）: 冷キャッシュ時は Pass1（実 embed API 呼び出し）が
-                # 最長段になりうるのに、従来は Pass2 が flush するまで progress が一切動かず「止まって
-                # 見える」空白があった。Pass1/Pass2 は同じ (done_docs, total_docs) 目盛りを共有する
+                # 冷キャッシュ時は Pass1（実 embed API 呼び出し）が
+                # 最長段になりうる——Pass2 が flush するまで progress を呼ばないと「止まって
+                # 見える」空白ができる。Pass1/Pass2 は同じ (done_docs, total_docs) 目盛りを共有する
                 # ため、Pass2 開始時に done が一旦小さく戻る（Pass1 は完走目盛り→Pass2 は0から再カウント）
                 # ——2つの目盛りを合成する複雑さより、「数時間 何も動かない」より「動くが一度戻る」を
                 # 選ぶ（docstring 参照）。
@@ -1464,7 +1457,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                 embed_ok = False
 
     if ec is not None and had_embed_eligible and not embed_ok:
-        # RV2（高1）: `cfg()` は解決できたが実際の embed API 呼び出しが失敗した（`_embed_cached`
+        # `cfg()` は解決できたが実際の embed API 呼び出しが失敗した（`_embed_cached`
         # が `None` を返した＝`not ec or not texts` ではなく実送信の失敗・docstring 参照）。
         if embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
             # まだ `delete_world()` を呼んでいない＝既存索引（ベクトル付きかもしれない）はそのまま残る。
@@ -1475,16 +1468,16 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # クラウドを一度も選んでいない構成の実失敗は従来どおり graceful に BM25-only へ降格して続行する。
 
     # 埋め込みキャッシュの最終剪定/削除は**世界全体の doc ストリームを一巡し終えた直後**（ES 操作の前）に
-    # 一度だけ行う——`_embed_cached()` は EMBED-3 で複数回（doc グループごと）呼ばれるため、
+    # 一度だけ行う——`_embed_cached()` は複数回（doc グループごと）呼ばれるため、
     # もう自前で剪定しない（`_embed_cached` docstring 参照）。embed_ok が False（真の失敗）の間は
-    # キャッシュへ触れない——フラッシュ済みの部分成功分を温存する（旧実装と同じ契約）。
+    # キャッシュへ触れない——フラッシュ済みの部分成功分を温存する。
     if ec is None:
         _delete_embed_cache(world)
     elif embed_ok:
         try:
             _prune_embed_cache(world, valid_keys)
         except OSError:
-            # 2026-09-05・rv-oom-resume item2: シャード書込障害（ENOSPC 等）を「成功扱い」せず
+            # シャード書込障害（ENOSPC 等）を「成功扱い」せず
             # delete_world() の前に打ち切る——既存索引（ベクトル付きかもしれない）はまだ残る。
             _embed_log.warning("es_index: embed キャッシュ剪定の書込に失敗（world=%s）"
                                "——索引の delete 前に中止する", world)
@@ -1511,9 +1504,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # `office_md.confirm_human_md_es_sig` でマーカーを確定するまで pending のまま）。
         human_md_sig = None
     emeta = {"world_id": world,                        # 帰属を索引自身に刻む（孤児リコンサイルの厳密な所有者判定）
-             "mapping_version": ES_MAPPING_VERSION,     # RV Low: マッピング/チャンクメタの版（変わったら reindex）
+             "mapping_version": ES_MAPPING_VERSION,     # マッピング/チャンクメタの版（変わったら reindex）
              "search_chunk_mode": _search_chunk_mode(), # rag/legacy の索引ソース方針（旧世代索引の一度きり reindex 検知用）
-             "arms_sig": _arms_config_sig(),             # RV Med: アーム構成（変わったら reindex・fail-safe で None もありうる）
+             "arms_sig": _arms_config_sig(),             # アーム構成（変わったら reindex・fail-safe で None もありうる）
              "human_md_sig": human_md_sig,              # H2: human_md 版（RAG_ES の設定に関わらず評価・pending は書かない）
              "analyzer_config_sig": _analyzer_config_sig()}  # コード解析アナライザの有効構成（変わったら reindex）
     if _CHUNK_LINES != _CHUNK_LINES_DEFAULT:            # 既定(40)時は書かない＝索引 meta を最小限に保つ
@@ -1530,8 +1523,8 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
 
     # ---- Pass2: チャンク単位で1件ずつ受け取り、`_EMBED_FLUSH_CHUNKS` 件ごとにグループ化して
-    # bulk 送信する（world 全体はもちろん、1文書分すら先に1本のリストへ溜めない・rv-oom-resume
-    # item1・vec_by_idx もグループ内ローカル）----
+    # bulk 送信する（world 全体はもちろん、1文書分すら先に1本のリストへ溜めない・
+    # vec_by_idx もグループ内ローカル）----
     n_docs = 0
     total_chunks = 0
     rag_degraded = 0
@@ -1541,11 +1534,11 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     g_bodies: list = []
     g_texts: list = []
     g_no_embed: list = []
-    # RV是正（rv-periphery #3・2026-09-05）: `docs_done` は Pass2 が見終えた文書数（対象外＝
-    # チャンク0件の文書も含む・`n_docs`＝実際に索引した文書数とは別に持つ）。旧実装は `n_docs`
-    # だけを progress の done に使っており、対象外文書が連続する world では実際には進んでいる
+    # `docs_done` は Pass2 が見終えた文書数（対象外＝
+    # チャンク0件の文書も含む・`n_docs`＝実際に索引した文書数とは別に持つ）。`n_docs`
+    # だけを progress の done に使うと、対象外文書が連続する world では実際には進んでいる
     # のに done が長時間動かず「止まって見える」（対象外文書は total_docs の目盛りでは「見終えた」
-    # 1件のはずなのに数えていなかった）。
+    # 1件のはずなのに数えなくなる）。
     docs_done = 0
     if progress is not None:
         # Pass1→Pass2 の切替では、間引きラッパー（`ingest/worker.py::_es_progress`）が既に
@@ -1602,7 +1595,15 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         if embed_calls_made:
             out["embed_elapsed_ms"] = round(embed_elapsed_ms)
         return out
-    _restore_refresh_interval(world)                   # item3: 全バッチ成功＝最終refreshで可視化済み・背景リフレッシュを通常へ戻す
+    if n_docs > 0 and total_chunks == 0:
+        # 文書はあるのにチャンク0件は索引の異常として扱い content_sig を確定させない＝
+        # 次回 sync が再索引する。索引は元々空なので wipe は不要。空 world（n_docs==0）は対象外。
+        _restore_refresh_interval(world)                # 索引自体は作成済み（refresh_interval=-1 のまま）
+        out = {"available": True, "indexed": n_docs, "chunks": total_chunks, "error": "no_chunks", **rag_report}
+        if embed_calls_made:
+            out["embed_elapsed_ms"] = round(embed_elapsed_ms)
+        return out
+    _restore_refresh_interval(world)                   # 全バッチ成功＝最終refreshで可視化済み・背景リフレッシュを通常（"1s"）へ戻す
     _confirm_content_sig(world, content_sig)           # 全バッチ成功後にだけ鮮度署名を確定する
     out = {"available": True, "indexed": n_docs, "chunks": total_chunks,
           "vectors": bool(embed_feature_applies and had_embed_eligible),
@@ -1623,8 +1624,8 @@ def count(world: str) -> int | None:
 
 
 def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool:
-    """ES 索引の張り直しが要るか（ES 稼働時のみ）。空 / 内容署名ズレ / **アーム構成ズレ**（RV Med） /
-    **マッピング版ズレ**（RV Low） / **索引ソース方針(rag/legacy)ズレ** / **チャンク粒度ズレ** /
+    """ES 索引の張り直しが要るか（ES 稼働時のみ）。空 / 内容署名ズレ / **アーム構成ズレ** /
+    **マッピング版ズレ** / **索引ソース方針(rag/legacy)ズレ** / **チャンク粒度ズレ** /
     **人間向け MD 版ズレ**（H2・RAG_ES の設定に関わらず評価） / **アナライザ構成ズレ** /
     **埋め込み素性(provider/model/dim)ズレ** で True。
 
@@ -1698,7 +1699,7 @@ def _parse_hits(res: dict) -> list:
 
 def _importance_boost_query(bool_query: dict) -> dict:
     """`bool_query`（`{"bool": {...}}`）を function_score で包み、`importance` フィールドに応じて
-    スコアを乗算する（I2・J2・2026-09-05）。
+    スコアを乗算する。
 
     `高`＝`_ES_IMPORTANCE_BOOST_HIGH` 倍・`低`＝`_ES_IMPORTANCE_BOOST_LOW` 倍。`importance` フィールド
     自体を持たない文書（`_重要度.txt` の無い world・`中`/未設定）はどちらの `term` filter にも
@@ -1755,7 +1756,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     `_ES_SEARCH_K_MAX` 自体の既存契約（`SHERPA_GREP_MAX_HITS` 未設定時は 50 を下回らない等・
     `tests/unit/test_es_index_meta.py` 参照）はこの引数を渡さない既存呼び出し元でそのまま残る。
 
-    返値 `(hits, degrade_reason|None)`（RV2・FBK-1・2026-09-01・`search_knn_only()` と同じ形へ統一）。
+    返値 `(hits, degrade_reason|None)`（`search_knn_only()` と同じ形へ統一）。
     `search_knn_only()` と違い、本関数は degrade 時も **BM25 の hits をそのまま返す**（reason は
     「hybrid でなく BM25 だけになった理由」の注記であって、hits を空にする合図ではない）。
     `es_unavailable`／クエリ空はこれまでどおり `[]` を返す。
@@ -1772,7 +1773,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
 
     呼び出し元（`agentic_search.py` の `es_search` ツール）はこの reason を tool result 経由で
     trace ノードへ搬送し、UI（思考の流れ）へ表示する——サーバログの warning だけでは利用者/
-    運用者以外の窓口（チャット画面）に届かず、静かな縮退のままになる（RV2 是正）。
+    運用者以外の窓口（チャット画面）に届かず、静かな縮退のままになる。
     """
     q = (query or "").strip()
     if not q:
@@ -1790,7 +1791,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     hl = {"fields": {"text": {"fragment_size": 240, "number_of_fragments": 1}}}
     bm25 = {"size": k, "query": _importance_boost_query({"bool": {"must": [{"match": {"text": q}}], "filter": flt}}),
            "highlight": hl}
-    # RV2/RV3: cfg() と cloud_selected_but_unavailable() を同じ system_settings スナップショットで
+    # cfg() と cloud_selected_but_unavailable() を同じ system_settings スナップショットで
     # 呼ぶ（別々に読むと、その間の admin 更新で判定が食い違いうる）。kill-switch 有効時は読まない
     # （`_embed_system_settings_snapshot`）。
     sys_s = _embed_system_settings_snapshot() if vector else None
@@ -1820,26 +1821,26 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
             if _HYBRID_WEIGHT != 0.5:
                 match_clause = {"match": {"text": {"query": q, "boost": _HYBRID_WEIGHT * 2.0}}}
                 knn_clause["knn"]["boost"] = (1.0 - _HYBRID_WEIGHT) * 2.0
-            # RV是正（rv-i2-importance #4・2026-09）: 重要度ブーストは合成スコア（BM25+kNN）**全体へ
-            # 一度だけ**掛ける。旧実装は top-level `query`＋top-level `knn` を並記していた——ES 8系は
+            # 重要度ブーストは合成スコア（BM25+kNN）**全体へ
+            # 一度だけ**掛ける。`knn` を top-level パラメータとして `query` と並記すると、ES 8系は
             # この2つを「両者のスコアを加算」で合成するため、function_score を `query` 側だけに巻くと
             # 掛かるのは BM25 成分だけで、kNN 成分（通常 BM25 より絶対値が大きい）には一切効かず、
-            # 重要度による押し上げ/押し下げが合成スコアのごく一部にしか反映されなかった（実 ES で
+            # 重要度による押し上げ/押し下げが合成スコアのごく一部にしか反映されない（実 ES で
             # 高=1.2倍を指定しても合成スコアの上昇幅が数%に希釈されることを確認済み）。
-            # ES 8.9+ で `knn` を**top-level パラメータではなく query 節の中身**（`bool`/`dis_max` の
+            # そこで ES 8.9+ の `knn` を**top-level パラメータではなく query 節の中身**（`bool`/`dis_max` の
             # 1要素）として書ける形式を使い、match/knn を同一 `bool.should` に並べてから
             # `_importance_boost_query`（function_score）で1回だけ包む——bool の合成スコア
-            # （=match_score+knn_score・`should` の既定の加算合成）に対して掛かるため、旧実装の
-            # 「top-level query+knn の加算」と同じ合成値へ、重要度の乗数がちょうど1回だけ効く。
+            # （=match_score+knn_score・`should` の既定の加算合成）に対して掛かるため、
+            # 重要度の乗数がちょうど1回だけ効く。
             # union（どちらか一方だけに一致した文書も出る）・重要度なし world でのスコア完全不変も
             # 実 ES（8.19・docker/elasticsearch）で確認済み（`_重要度.txt` の無い world は
-            # function_score の全 function が不一致→乗数1.0→合成スコアは旧実装と bit 単位で同一）。
+            # function_score の全 function が不一致→乗数1.0→合成スコアは不変のまま）。
             combined = {"bool": {"should": [match_clause, knn_clause], "filter": flt}}
             hybrid = {"size": k, "highlight": hl, "query": _importance_boost_query(combined)}
             try:
                 return _parse_hits(_req("POST", f"/{_index(world)}/_search", hybrid)), None
             except Exception:
-                # RV3（FBK-1・2026-09-01）: hybrid 自体の失敗（次元不一致/未ベクトル索引等）は
+                # hybrid 自体の失敗（次元不一致/未ベクトル索引等）は
                 # BM25 が成功すれば hits が空にならない＝`es_query_failed`（hits が空になる
                 # BM25 自体の失敗）とは別の reason にする。`_degrade_result_node()` はこの区別で
                 # 「BM25 は返っているが hybrid だけ失敗した」ケースも思考ノード対象にできる。
@@ -1861,7 +1862,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     返値 `(hits, degrade_reason|None)`。hits は `_parse_hits` 形 `{doc_id, line, text, score, ext}`。
     degrade_reason 語彙: es_unavailable / embedding_not_configured / embedding_cloud_unavailable /
     vector_feature_mismatch / query_embed_failed / es_query_failed（search_service.py の
-    DEGRADE_REASONS と同一・増やすときは両方直す）。`embedding_cloud_unavailable`（RV1・FBK-1）は
+    DEGRADE_REASONS と同一・増やすときは両方直す）。`embedding_cloud_unavailable` は
     A7 で明示選択したクラウドの埋め込みが解決できない場合＝`embedding_not_configured`（クラウドを
     一度も選んでいない通常の未設定）と区別し、呼び出し側が「設定すれば直る」のか「選択済みクラウド
     が壊れている」のかを利用者へ正直に伝えられるようにする。
@@ -1873,7 +1874,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     if not available():
         return [], "es_unavailable"
     k = max(1, min(k, 50))
-    # RV2/RV3: cfg() と cloud_selected_but_unavailable() を同じ system_settings スナップショットで
+    # cfg() と cloud_selected_but_unavailable() を同じ system_settings スナップショットで
     # 呼ぶ（別々に読むと、その間の admin 更新で判定が食い違いうる・`search()` と同じ理由）。
     # kill-switch 有効時は読まない（`_embed_system_settings_snapshot`）。
     sys_s = _embed_system_settings_snapshot()
@@ -1896,10 +1897,9 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     lfilt = layer_mod.es_filter(layer)
     if lfilt:
         flt.append(lfilt)
-    # RV是正（rv-i2-importance #5・2026-09）: 旧実装は ES から**ちょうど `k` 件**（生コサイン類似度の
-    # 上位）だけ取ってから `_rerank_knn_by_importance` で並べ替えていた——生スコアで `k` 件に入らな
-    # かった「高」重要度ヒットは、取得された時点で既に落選しているため、並べ替えでも決して浮上
-    # できない（grep の旧・早期打切りと同じ「切ってから補正」の構造的欠陥）。ES へは有界の
+    # 生コサイン類似度の上位**ちょうど `k` 件**だけ取ってから重要度で並べ替えると、生スコアで
+    # `k` 件に入らなかった「高」重要度ヒットは、取得された時点で既に落選しているため、並べ替えでも
+    # 決して浮上できない（「切ってから補正」の構造的欠陥）。ES へは有界の
     # overfetch（`k*3`・上限 `k+50`・小さく抑える＝ES 側コストを際限なく増やさない）で少し多めに
     # 取り、重要度補正・再ソートの**後**に `k` 件へ切り詰める——`_重要度.txt` の無い world は
     # 補正が no-op（乗数1.0）のまま先頭 `k` 件を返すため、受け入れ条件（スコア/順序完全不変）は

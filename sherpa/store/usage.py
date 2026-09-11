@@ -1,10 +1,11 @@
-"""利用統計（2026-07-02-利用統計とホーム掲示板.md Feature 1・admin 専用）。
+"""利用統計（admin 専用）。
 
-`sherpa/store/__init__.py` から純移動（フェーズ4 S3）。ロジックは一切変更していない。
 不変条件: メッセージ本文・会話タイトルは一切 SELECT しない（件数・日時・種別のみ集計）。
 """
 from __future__ import annotations
 
+import math
+import statistics
 from datetime import datetime, timedelta, timezone
 
 from .db import _connect, _ensure
@@ -12,7 +13,7 @@ from .db import _connect, _ensure
 _USAGE_AUDIT_ACTIONS = ("auth.login", "document.downloaded", "workspace.file_uploaded", "share.created")
 _JST = timezone(timedelta(hours=9))
 
-# RV バッチ3再検証（2026-07-03）MEDIUM: chat.turn 監査の detail.provider は書込側
+# chat.turn 監査の detail.provider は書込側
 # （`chat_service._audit_chat_turn`・`sherpa.agents.AGENT_PROVIDERS`）で allowlist 正規化済みのはずだが、
 # 過去の保存済み不正値（env 誤設定等）が残っている可能性があるため、集計（読み出し）側でも
 # 同じ allowlist で畳み込む二重防御。store.py は他の sherpa.* を import しない設計
@@ -23,16 +24,16 @@ _USAGE_KNOWN_PROVIDERS = ("heuristic", "codex", "openai", "gemini", "bedrock", "
 
 def _usage_period_bounds(days: int):
     """JST の「(今日 − (days−1)) の日初」〜「明日の日初（排他的上限）」を期間として返す
-    （RV ラウンド3 MEDIUM 対応・RV バッチ3再検証 MEDIUM: 上限も追加して全クエリで統一）。
+    （上限も含めて全クエリで統一）。
 
     daily・users・totals・audit 由来集計の**全てが同じ境界**を使うことで、表（users）とグラフ（daily）の
-    合計が常に一致するようにする（以前は `now() - make_interval(days)` のローリング境界で、
-    フロントの「JST 暦日で days 個分」描画と食い違い、最古日の部分バケットが暗黙に drop されていた）。
+    合計が常に一致するようにする（`now() - make_interval(days)` のようなローリング境界だと、
+    フロントの「JST 暦日で days 個分」描画と食い違い、最古日の部分バケットが暗黙に drop される）。
     アプリサーバの UTC 時刻（`datetime.now(timezone.utc)`）から計算するため DB セッション timezone に
-    依存しない（RV ラウンド1 MEDIUM と同じ理由）。
+    依存しない。
 
     下限のみで上限が無いと、クロックスキューやテスト由来の未来時刻行（`created_at` が「今日」より
-    先）が「期間内」に混入してしまう（RV バッチ3再検証 MEDIUM）。`end_exclusive_ts`（「明日」の
+    先）が「期間内」に混入してしまう。`end_exclusive_ts`（「明日」の
     JST 00:00:00・排他的上限）を全クエリの `WHERE ... < %s` に使うことで、期間は常に
     `[start_ts, end_exclusive_ts)` という半開区間に固定する。
 
@@ -50,12 +51,12 @@ def _usage_period_bounds(days: int):
     return start_ts, start_date, today_jst, end_exclusive_ts
 
 
-# lens 内訳の対応付け（RV ラウンド3 MEDIUM 対応）: 「conversation 内で各 user メッセージの直後に来る
+# lens 内訳の対応付け: 「conversation 内で各 user メッセージの直後に来る
 # 最初の assistant メッセージ」だけをその user ターンの返答として数える。assistant 単独行（対応する
 # user メッセージが無い・または既に他の user メッセージの返答として数えられた2件目以降の assistant 行）は
 # lens 内訳に混入させない。turn_no は「その行より前（自分を含む）に何件の user メッセージがあったか」の
 # 累積カウントで、user 行と直後の assistant 行が同じ turn_no を持つことを利用してペアリングする。
-# バッチ3（2026-07-03）: `answer`（JSONB）もペアリングして持ち回る＝ゼロヒット率（lens != 'chat' の
+# `answer`（JSONB）もペアリングして持ち回る＝ゼロヒット率（lens != 'chat' の
 # ターンで assistant answer.sources が空）を同じターン対応付けロジックで計算するため。
 # PERF-1（台帳#17）: `numbered` の基点スキャンを「期間内にメッセージを1件でも持つ会話」に絞る。
 # `touched`（DISTINCT conversation_id・期間の WHERE 条件のみ）への明示 JOIN として書く（呼び出し側は
@@ -110,7 +111,7 @@ _USAGE_TURN_CTE = (
 )
 
 
-# F3（2026-07-07）: messages.answer->'usage' からトークン使用量を集計する SQL 断片。
+# messages.answer->'usage' からトークン使用量を集計する SQL 断片。
 # answer->'usage' は `{provider, model, input_tokens, cached_input_tokens, output_tokens,
 # reasoning_output_tokens}`（agents._usage_meta）。想定外データ（非数値・欠落）は 0 に畳む
 # （`~ '^[0-9]+$'` を先に確認してから ::bigint・zero_hit の非配列ガードと同じ防御思想）。
@@ -134,7 +135,7 @@ _USAGE_TOKEN_WHERE = " AND jsonb_typeof(answer->'usage')='object' "
 
 def _compute_retention(week_user_rows) -> dict:
     """定着指標（JST 週次アクティブユーザー推移＋再訪率）を `week_user_rows`
-    （`{"uid", "week_start"}` の行・`week_start` は `date`）から計算する（バッチ3・2026-07-03）。
+    （`{"uid", "week_start"}` の行・`week_start` は `date`）から計算する。
 
     純粋関数として切り出す＝DB を介さず単体テストできる（`usage_stats` 本体は共有 dev DB の
     既存データに引きずられて再訪率の期待値を精密に検証しづらいため、ロジックはここで確定させる）。
@@ -162,42 +163,81 @@ def _compute_retention(week_user_rows) -> dict:
     return {"weekly": weekly, "revisit_rate": revisit_rate}
 
 
+def _percentile(sorted_values: list[int], pct: float) -> float:
+    """最近傍順位法（線形補間なし）で百分位を計算する。
+
+    昇順配列の `ceil(pct * n)` 番目（1始まり）の値を返す＝浮動小数の補間誤差を持ち込まない
+    決定的な定義。呼び出し側は空配列で呼ばないこと（`n=0` は割当不能＝呼び出し側で None 分岐）。
+    """
+    n = len(sorted_values)
+    idx = max(0, min(n - 1, math.ceil(pct * n) - 1))
+    return float(sorted_values[idx])
+
+
+def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | None]:
+    """会話あたりの user ターン数分布と resume_rate を計算する。
+
+    `conversation_rows` は「期間内に発言のあった会話（origin='own'・deleted_at IS NULL）」に絞った
+    `{"user_turns", "codex_session_id"}` の行（1会話1行）。`user_turns` は**その会話の全履歴**の
+    user メッセージ数（期間内に限定しない）＝「セッションの長さ」を見る指標のため、期間はどの会話を
+    集計対象にするかの絞り込みにのみ使う（他の period 系集計とは異なり、値そのものは期間で切らない）。
+
+    resume_rate: user ターン数2以上（＝2ターン目以降が有り得る）の会話のうち、
+    `codex_session_id` が設定されている割合。分母（該当会話数）が0なら None（推定しない）。
+    """
+    counts = sorted((r["user_turns"] or 0) for r in conversation_rows)
+    if counts:
+        conversation_turns = {
+            "avg": sum(counts) / len(counts),
+            "median": float(statistics.median(counts)),
+            "max": counts[-1],
+            "p90": _percentile(counts, 0.9),
+        }
+    else:
+        conversation_turns = {"avg": None, "median": None, "max": None, "p90": None}
+    eligible = [r for r in conversation_rows if (r["user_turns"] or 0) >= 2]
+    denom = len(eligible)
+    resumed = sum(1 for r in eligible if r["codex_session_id"] is not None)
+    resume_rate = (resumed / denom) if denom > 0 else None
+    return conversation_turns, resume_rate
+
+
 def usage_stats(days: int = 30) -> dict:
     """期間内の利用統計を集計する（本文/タイトルは含めない）。
 
     users: ターン数（role='user' メッセージ数）降順。totals: 期間合計。
-    daily: 日別ターン数＋日別アクティブユーザー数（2026-07-02-利用統計とホーム掲示板.md Part2-A）。
+    daily: 日別ターン数＋日別アクティブユーザー数。
     period: 集計対象の JST 暦日範囲（start/end・フロントの日別チャートはこの範囲でゼロ埋め描画する）。
 
     lens 内訳・personal 利用ターン数は「各 user ターンに対応する最初の assistant 返答」だけを数える
-    （_USAGE_TURN_CTE 参照・RV ラウンド3 MEDIUM: assistant 単独行の混入防止）。
+    （_USAGE_TURN_CTE 参照・assistant 単独行の混入防止）。
 
     active_days・daily の日付境界は **user メッセージのみ**を **JST（Asia/Tokyo）**で区切り、
     **`_usage_period_bounds` で計算した固定の JST 暦日下限**を users/daily/audit すべてに使う
-    （RV ラウンド3 MEDIUM: 表とグラフの合計を一致させる）。
+    （表とグラフの合計を一致させる）。
 
-    RV ラウンド2 対応:
+    集計の前提:
       - `c.origin='own'` に限定（sanitized_snapshot は本文コピー済みの内部成果物で、同じ owner の
         別 conversation として messages が二重に存在するため、含めると owner の turns/daily/active_days
         が水増しされる。received_share は自分名義の messages を持たないため実害は無いが明示的に除外）。
       - `conversations`/`active_days`/`last_active` は role='user' 基準に統一し、
         `HAVING` で「期間内に user turn が 0 件」の行（assistant のみ該当した見せかけの活動）を除外する。
 
-    バッチ3（2026-07-03）で追加した「利用の傾向」指標（既存の境界/origin/turn 規約を再利用・N+1 は
+    「利用の傾向」指標（既存の境界/origin/turn 規約を再利用・N+1 は
     避けるが単一クエリ主義ではない＝固定本数の追加クエリ）:
       - `zero_hit`（全体）／各 user 行の `knowledge_turns`/`zero_hit_turns`/`zero_hit_rate`:
         ナレッジ参照オンのターン（lens != 'chat'）のうち assistant answer.sources が空の割合
         （_USAGE_TURN_CTE の `answer` を使い、既存の user_rows 集計に FILTER 列を追加するだけ＝新規クエリ無し）。
         `answer->'sources'` が NULL・欠落・非配列（想定外データ）でも 500 にしない
         （`jsonb_typeof(...)='array'` を先に確認してから `jsonb_array_length` を呼ぶ・
-        RV バッチ3再検証 MEDIUM: 素朴な `COALESCE(jsonb_array_length(...), 0)` は非配列で例外になる）。
+        素朴な `COALESCE(jsonb_array_length(...), 0)` は非配列で例外になる）。
       - `heatmap`: user メッセージ数を JST 曜日(0=日〜6=土)×時間帯(0-23)で集計（sparse・0 件のセルは
         返さない＝フロントでゼロ埋め）。
       - `worlds`: `turns`（conversations.version）別ターン数の内訳（world が1つでも正直に1行返す）。
-      - `providers`: `chat.turn` 監査の `detail->>'provider'` 別ターン数。書込側（S5・`AGENT_PROVIDERS`）で
+      - `providers`: `chat.turn` 監査の `detail->>'provider'` 別ターン数。書込側（`AGENT_PROVIDERS`）で
         allowlist 正規化済みのはずだが、集計（読み出し）側でも同じ allowlist で畳み込む二重防御
-        （`_USAGE_KNOWN_PROVIDERS`・RV バッチ3再検証 MEDIUM: Python 側の `or "unknown"` は NULL しか
-        拾えず、allowlist 外の異なる不正値が別行のまま残ってしまっていた）。stopped ターンも
+        （`_USAGE_KNOWN_PROVIDERS`・Python 側の `or "unknown"` では NULL しか
+        拾えず、allowlist 外の異なる不正値が別行のまま残ってしまう）。stopped ターンも
         `detail.stopped` に関わらず母数に含む（画面側で注記）。
       - `retention`: JST 週（Postgres `date_trunc('week', ...)` ＝月曜始まり）ごとのアクティブユーザー数の
         推移と、**連続する**週ペア（7日差のペアのみ・間が空いた週は「前週」として扱わない）をプールした
@@ -206,9 +246,24 @@ def usage_stats(days: int = 30) -> dict:
       - `downloads`: `document.downloaded` 監査の期間合計＋日別内訳（「出典クリック数」計測基盤が無いため
         原本DL数で代替＝新規テレメトリは追加しない）。
 
+    会話セッション指標:
+      - `conversation_turns`: 期間内に発言のあった会話について、会話あたりの user ターン数
+        （その会話の全履歴・期間内に限定しない）の avg／median／max／p90。対象会話が無ければ全て None。
+      - `resume_rate`: user ターン数2以上の会話のうち `conversations.codex_session_id` が設定されている
+        割合。対象会話が無ければ None（推定しない）。`_compute_conversation_turn_stats` 参照。
+
+    ターンの終了理由:
+      - `stop_kinds`: `messages.answer->>'stop_kind'`（`sherpa/stop_kind.py` の閉じた8値・
+        `chat_service._finalize` が保存）の分布。確認カード（`lens='clarify'`）は母数から外す。
+        NULL は `'unknown'` へ畳み込む（allowlist 外を集約する `providers_usage` と同じ思想）——
+        未計測経路・過去データのほか、busy（Codex 直列化で実行していないターン）と API 経路の
+        honest failure（型を特定できない失敗）も NULL＝完了としては数えない。
+      - `stopped_turns`: 利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の件数——
+        停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない別集計。
+
     全クエリは `_usage_period_bounds` の `[start_ts, end_exclusive_ts)` という同じ半開区間で絞る
-    （RV バッチ3再検証 MEDIUM: 以前は下限のみで、クロックスキュー/テスト由来の未来時刻行が
-    「期間内」に混入し得た。DL/provider/heatmap/retention/world/user/daily すべて同じ上下限）。
+    （下限のみだと、クロックスキュー/テスト由来の未来時刻行が
+    「期間内」に混入し得る。DL/provider/heatmap/retention/world/user/daily すべて同じ上下限）。
     """
     _ensure()
     start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
@@ -268,6 +323,29 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY provider ORDER BY n DESC",
             (list(_USAGE_KNOWN_PROVIDERS), start_ts, end_exclusive_ts),
         ).fetchall()
+        # STAT-3 S3（T3・T6の一部）: 終了理由（messages.answer->>'stop_kind'・`stop_kind.py` の
+        # 8値・`chat_service._finalize` が保存）の分布。過去データ/未計測経路は NULL のまま＝
+        # 'unknown' へ畳み込む（遡及しない・既存の provider_rows の allowlist 畳み込みと同じ思想）。
+        # assistant 行のみが対象（stop_kind は assistant 側 envelope にしか無い）。確認カード
+        # （lens='clarify'＝意図確認の一時停止・終了理由を持たない正常な行）は母数から外す。
+        stop_kind_rows = c.execute(
+            "SELECT COALESCE(m.answer->>'stop_kind', 'unknown') AS stop_kind, COUNT(*) AS n "
+            "FROM messages m JOIN conversations c ON c.id=m.conversation_id "
+            "WHERE m.created_at >= %s AND m.created_at < %s AND c.deleted_at IS NULL "
+            "  AND m.role='assistant' AND c.origin='own' "
+            "  AND m.lens IS DISTINCT FROM 'clarify' "
+            "GROUP BY stop_kind ORDER BY n DESC",
+            (start_ts, end_exclusive_ts),
+        ).fetchall()
+        # 利用者停止（`stopped_by_user`）は assistant を保存しないため上の分布には出ない
+        # （`chat_service.py::stream_message`/`handle_message` の stopped 分岐参照）——監査
+        # `chat.turn`（`detail.stopped=true`）から別途数える。
+        stopped_turns_row = c.execute(
+            "SELECT COUNT(*) AS n FROM audit_log "
+            "WHERE created_at >= %s AND created_at < %s AND action='chat.turn' "
+            "  AND detail->>'stopped' = 'true'",
+            (start_ts, end_exclusive_ts),
+        ).fetchone()
         heatmap_rows = c.execute(
             "SELECT EXTRACT(DOW FROM (m.created_at AT TIME ZONE 'Asia/Tokyo'))::int AS weekday, "
             "  EXTRACT(HOUR FROM (m.created_at AT TIME ZONE 'Asia/Tokyo'))::int AS hour, "
@@ -291,8 +369,8 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY date ORDER BY date",
             (start_ts, end_exclusive_ts),
         ).fetchall()
-        # F3（2026-07-07）: トークン使用量（answer->'usage'）を provider/model 別・上位ユーザー別・日別で集計。
-        #   入力/出力トークン数のみ集計する（金額換算は撤去・2026-07-08 フィードバック⑦）。
+        # トークン使用量（answer->'usage'）を provider/model 別・上位ユーザー別・日別で集計。
+        #   入力/出力トークン数のみ集計する（金額換算はしない）。
         #   usage を持たないターン（heuristic・停止・旧データ）は自然に除外。
         token_model_rows = c.execute(
             _USAGE_TURN_CTE + " "
@@ -318,10 +396,10 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY date ORDER BY date",
             (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
-        # S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: チャット以外の LLM 呼び出し（intent 分類・
+        # チャット以外の LLM 呼び出し（intent 分類・
         # グラフ抽出・概念候補提案・埋め込み・admin グラフ質問・VLM）を kind 別に集計。usage_events は
         # kind='chat' を含まない（chat は token_model_rows 由来で別途合成する・二重計上なし）。
-        # STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: elapsed_ms は計測スコープ外の行（NULL）を
+        # elapsed_ms は計測スコープ外の行（NULL）を
         # 自然に除いて集計する（SUM/AVG は NULL を無視・COUNT(列) は非 NULL 行数＝`elapsed_n`）。
         usage_event_rows = c.execute(
             "SELECT kind, provider, model, SUM(calls) AS calls, "
@@ -331,6 +409,20 @@ def usage_stats(days: int = 30) -> dict:
             "  COUNT(elapsed_ms) AS elapsed_n "
             "FROM usage_events WHERE ts >= %s AND ts < %s "
             "GROUP BY kind, provider, model ORDER BY kind, input DESC NULLS LAST",
+            (start_ts, end_exclusive_ts),
+        ).fetchall()
+        # 会話あたりの user ターン数分布・resume_rate。「期間内に発言のあった会話」
+        # （touched・origin='own'・deleted_at IS NULL）に絞った上で、ターン数自体は会話の全履歴を
+        # 数える（`c.id` で GROUP BY＝主キーへの関数従属により `codex_session_id` を非集約のまま選べる）。
+        conversation_turn_rows = c.execute(
+            "WITH touched AS ("
+            "  SELECT DISTINCT conversation_id FROM messages WHERE created_at >= %s AND created_at < %s"
+            ") "
+            "SELECT c.id AS cid, c.codex_session_id, COUNT(m.id) AS user_turns "
+            "FROM touched t JOIN conversations c ON c.id = t.conversation_id "
+            "JOIN messages m ON m.conversation_id = c.id AND m.role='user' "
+            "WHERE c.deleted_at IS NULL AND c.origin='own' "
+            "GROUP BY c.id",
             (start_ts, end_exclusive_ts),
         ).fetchall()
 
@@ -396,10 +488,13 @@ def usage_stats(days: int = 30) -> dict:
         "rate": (total_zero_hit_turns / total_knowledge_turns) if total_knowledge_turns > 0 else None,
     }
     worlds_usage = [{"world": r["world"], "turns": r["turns"] or 0} for r in world_rows]
-    # RV バッチ3再検証（2026-07-03）MEDIUM: allowlist 外/NULL の畳み込みは SQL 側（CASE式・GROUP BY）で
+    # allowlist 外/NULL の畳み込みは SQL 側（CASE式・GROUP BY）で
     # 完結している＝同じ 'unknown' に集約された複数の元値が別行として残ることはない（二重集計の防止）。
     providers_usage = [{"provider": r["provider"], "turns": r["n"] or 0} for r in provider_rows]
     heatmap = [{"weekday": r["weekday"], "hour": r["hour"], "count": r["n"] or 0} for r in heatmap_rows]
+    # STAT-3 S3: 終了理由の分布＋利用者停止の件数（`stop_kind.py` の8値・'unknown' は畳み込み済み）。
+    stop_kinds = [{"stop_kind": r["stop_kind"], "turns": r["n"] or 0} for r in stop_kind_rows]
+    stopped_turns = (stopped_turns_row["n"] or 0) if stopped_turns_row else 0
 
     # 定着指標: JST 週（月曜始まり）ごとのアクティブユーザー集合→週次人数の推移＋連続週ペアの再訪率。
     retention = _compute_retention(week_user_rows)
@@ -407,7 +502,7 @@ def usage_stats(days: int = 30) -> dict:
     download_daily = [{"date": str(r["date"]), "count": r["n"] or 0} for r in download_daily_rows]
     downloads = {"total": sum(r["count"] for r in download_daily), "daily": download_daily}
 
-    # F3: トークン使用量（provider/model 別・上位ユーザー別・日別）。金額換算はしない（2026-07-08 撤去）。
+    # トークン使用量（provider/model 別・上位ユーザー別・日別）。金額換算はしない。
     token_by_model = [{"provider": r["provider"] or "unknown", "model": r["model"] or "",
                        "turns": r["turns"] or 0, "input": int(r["input"] or 0),
                        "cached_input": int(r["cached_input"] or 0), "output": int(r["output"] or 0),
@@ -455,8 +550,13 @@ def usage_stats(days: int = 30) -> dict:
         "by_kind": token_by_kind,
     }
 
+    # 会話あたりの user ターン数分布（avg/median/max/p90）と resume_rate。
+    conversation_turns, resume_rate = _compute_conversation_turn_stats(conversation_turn_rows)
+
     return {
         "users": users, "totals": totals, "daily": daily, "period": period,
         "zero_hit": zero_hit, "worlds": worlds_usage, "providers": providers_usage,
         "heatmap": heatmap, "retention": retention, "downloads": downloads, "tokens": tokens,
+        "conversation_turns": conversation_turns, "resume_rate": resume_rate,
+        "stop_kinds": stop_kinds, "stopped_turns": stopped_turns,
     }

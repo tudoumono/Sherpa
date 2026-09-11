@@ -102,22 +102,22 @@ class SystemSettingsReq(BaseModel):
     """
     arms_enabled: list[str] | None = None      # 有効アーム名（既知名のみ）・空/未指定は env/既定へ
     legacy_backend: str | None = None          # 旧形式変換バックエンド（W0）: none|libreoffice・null は env/既定へ
-    # L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）: rag.md の LLM 成形トグル。
-    # on|off・null は既定 off へフォールバック（2026-09-05 裁定・`legacy_backend` と同型）。
+    # rag.md の LLM 成形トグル（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）。
+    # on|off・null は既定 off へフォールバック（`legacy_backend` と同型）。
     rag_llm_render: str | None = None
     vlm: dict | None = None                    # 視覚読み取り（⑤ vision）の VLM 設定: {provider,model,cloud_allowed}・null は既定へ
-    # R2a-S2（2026-07-13 横断レビュー対応）: Ollama 接続先の SSRF allowlist（host:port の配列）。
+    # Ollama 接続先の SSRF allowlist（host:port の配列）。
     # 既定（未設定=None）は loopback のみ許可（`llm.assert_ollama_url_allowed`）・null は未設定へ戻す。
     ollama_allowlist: list[str] | None = None
-    # PART-6（2026-09-05-Webhook通知.md W3・RV是正#1）: Webhook 宛先の SSRF allowlist（host:port の
+    # Webhook 宛先の SSRF allowlist（host:port の
     # 配列・`ollama_allowlist` と同じ形だが loopback を例外にしない点が異なる）。既定（未設定=None）は
     # 全拒否——loopback（このサーバー自身）も明示登録が必須（`webhooks.assert_webhook_url_allowed`）・
     # null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
-    # R1b（2026-07-13 横断レビュー対応・Codex ネイティブ resume・決定5）: 会話ごとの Codex resume
+    # 会話ごとの Codex resume
     # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は 0＝無制限
     # （`api._sweep_expired_codex_sessions` 参照）。null は未設定へ戻す（＝無制限に戻る）。
-    # RV再検証 LOW-5: 素の `int` は pydantic の緩い型強制で `true`→1・`"14"`→14 のように暗黙変換
+    # 素の `int` は pydantic の緩い型強制で `true`→1・`"14"`→14 のように暗黙変換
     # されてしまう（bool は int のサブクラス）。`StrictInt` で bool/文字列からの暗黙変換を拒否する
     # （`codex_web_search` に `StrictBool` を使っているのと同じ理由）。
     codex_session_retention_days: StrictInt | None = None
@@ -188,15 +188,15 @@ class SystemSettingsReq(BaseModel):
     # null は未設定へ戻す（env/既定へフォールバック）。
     chat_max_turns_per_user: StrictInt | None = Field(default=None, ge=1, le=16)
     chat_max_turns_global: StrictInt | None = Field(default=None, ge=1, le=64)
-    # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の
-    # tool-result バイト予算を管理者設定へ昇格（SET-2「運用ポリシーは UI が唯一の持ち主」・
-    # env フォールバックは ENV-CLEAN で撤去済み）。既定（未指定=None）はコード既定（精度優先・
+    # agentic search の
+    # tool-result バイト予算を管理者設定へ昇格（「運用ポリシーは UI が唯一の持ち主」・
+    # env フォールバックは撤去済み）。既定（未指定=None）はコード既定（精度優先・
     # §3.4 憲法1条＝262144/4194304）への フォールバック（`agentic_search.resolve_tool_result_
     # budgets()` が唯一の解決点）。範囲は元の env 側検証と同一（1件あたり=1024〜8MiB・
     # 1 run 累計=4096〜64MiB）。null は未設定へ戻す。
     agentic_budget_per_result: StrictInt | None = Field(default=None, ge=1024, le=8 * 1024 * 1024)
     agentic_budget_total: StrictInt | None = Field(default=None, ge=4096, le=64 * 1024 * 1024)
-    # BUDGET-2（§3.4・2026-09-03 裁定）: モデル名→窓 tokens の管理者登録（"provider:model" キー・
+    # モデル名→窓 tokens の管理者登録（"provider:model" キー・
     # 追加/上書き/削除）。意味検証は `sherpa.model_windows.validate_model_windows`（`_validate_
     # model_windows` が 422 へ変換）。null は未設定へ戻す（以後はプロバイダAPI/シード表/不明段のみ）。
     model_context_windows: dict[str, StrictInt] | None = None
@@ -345,7 +345,7 @@ def admin_health(request: Request, refresh: bool = False):
     admin 確認自体が Postgres に依存するため、認証DB到達不可時は admin かどうか
     判定できない＝詳細（DSN 等が漏れうる情報）は返さず 503 のみ返す。
 
-    UI フィードバック4（2026-07-03）: AI（openai/gemini/bedrock/ollama/codex）は状態ドット用の
+    UI フィードバック4: AI（openai/gemini/bedrock/ollama/codex）は状態ドット用の
     軽量チェック（env の有無/バイナリ有無だけ・per-user キーは見ない）ではなく、**この管理者本人が
     設定画面で入れた API キーも含めて実際に1回だけ接続確認**した結果に差し替える
     （`health.ai_snapshot`・per-uid キャッシュ＝自動ポーリングで実 API 呼び出しを連発しない）。
@@ -384,7 +384,7 @@ def notifications_list(request: Request):
     return {"notifications": notifications.list_notifications(is_admin=u.get("role") == "admin")}
 
 
-# ===== 運営掲示板（2026-07-02-利用統計とホーム掲示板.md Feature 2・S4 公開/削除タイマー） =====
+# ===== 運営掲示板（2026-07-02-利用統計とホーム掲示板.md Feature 2・公開/削除タイマー） =====
 
 def _parse_announcement_dt(value: str | None, field_label: str) -> datetime | None:
     """publish_at/expire_at の入力（ISO 8601 文字列）をパースする。空/未指定は None。
@@ -406,7 +406,7 @@ def _parse_announcement_dt(value: str | None, field_label: str) -> datetime | No
 def _announcement_status(row: dict, now: datetime) -> str:
     """admin 向けの状態バッジ用（S4）: unpublished / scheduled（予約公開待ち）/ expired（掲載終了）/ active（公開中）。
 
-    RV3（2026-07）: `now` は呼び出し側で1回だけ計算して渡す（行ごとに `datetime.now()` を呼ぶと、
+    `now` は呼び出し側で1回だけ計算して渡す（行ごとに `datetime.now()` を呼ぶと、
     応答生成の途中で時刻が進んで境界付近の行だけ判定がドリフトし得るため・一覧は必ず同一 now で揃える）。
     """
     if not row["published"]:
@@ -441,7 +441,7 @@ def announcements_list(request: Request, limit: int = Query(20, ge=1, le=100), o
     if include_unpublished:
         _require_admin(u)
     rows = store.list_announcements(limit=limit, offset=offset, published_only=not include_unpublished)
-    now = datetime.now(timezone.utc)   # RV3: 全行で同一の now を使う（行ごとのドリフト防止）
+    now = datetime.now(timezone.utc)   # 全行で同一の now を使う（行ごとのドリフト防止）
     return {"announcements": [_announcement_out(r, now) for r in rows]}
 
 
@@ -508,7 +508,7 @@ def announcement_patch(id: int, req: AnnouncementPatchReq, request: Request):
         dt_kwargs["publish_at"] = _parse_announcement_dt(req.publish_at, "公開日時")
     if req.expire_at is not None:
         dt_kwargs["expire_at"] = _parse_announcement_dt(req.expire_at, "掲載終了日時")
-    # RV1（2026-07・並行更新対策）: publish_at/expire_at の順序検証は `before`（この時点で既に古いかも
+    # publish_at/expire_at の順序検証は `before`（この時点で既に古いかも
     # しれないスナップショット）ではなく、update_announcement 内の SELECT...FOR UPDATE で取得した
     # ロック済みの現在値に対して行う（2並行 PATCH が別々のフィールドを更新して単体検証をすり抜け、
     # 矛盾した状態が永続化される競合を防ぐ）。ここでは呼ばずに store 層へ委譲する。
@@ -569,7 +569,7 @@ def announcement_delete(id: int, request: Request):
     return {"ok": True}
 
 
-# ===== 全体設定（system_settings・admin のみ・S1・2026-07-08-設定分離とUI整備.md）=====
+# ===== 全体設定（system_settings・admin のみ・2026-07-08-設定分離とUI整備.md）=====
 
 _ENDPOINT_TEST_TIMEOUT_S = 10   # 接続テスト専用の短いタイムアウト（秒）。到達不能を素早く申告する
 
@@ -663,7 +663,7 @@ def _admin_settings_view() -> dict:
         # 選べる値の一覧（画面はこれで <select> を描画する）。
         "cloud": {
             "provider": keys.selected_cloud_provider(sysset),
-            # FBK-1 RV1: 生の保存値（未選択＝一度も PUT されていなければ None）。UI はこれで
+            # 生の保存値（未選択＝一度も PUT されていなければ None）。UI はこれで
             # 「admin が実際にラジオを操作したか」を判別する（`provider` は既定込みの実効値のため、
             # 初期表示の既定 openai と明示選択した openai を区別できない）。
             "provider_raw": keys.cloud_provider_raw(sysset),
@@ -754,7 +754,7 @@ def _admin_settings_view() -> dict:
                 "available": legacy_convert.soffice_available(),  # soffice 検出の有無
                 "version": legacy_convert.soffice_version(),      # 検出時のバージョン（未検出は None）
             },
-            # W1/W2'（2026-07-08-旧Office変換2系統.md・feedback-batch-2026-07-08 ⑥）: office_com の到達性と動作形態。
+            # office_com の到達性と動作形態（2026-07-08-旧Office変換2系統.md）。
             #   mode="direct"（同一マシン・URL 未設定かつ powershell 検出＝既定）｜"http"（別ホストのワーカー・
             #   URL 設定済み）｜"unavailable"（どちらも無し）。powershell は direct の検出状態（同一マシンで
             #   すぐ使えるか）。configured_url で「URL 未設定」と「設定済みだが不達」を UI が区別できる。
@@ -767,15 +767,15 @@ def _admin_settings_view() -> dict:
                 "versions": (legacy_convert.office_com_healthz() or {}).get("versions"),
             },
         },
-        # L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）: rag.md の LLM 成形トグル。
-        # 既定 off（2026-09-05 裁定＝実測で文体整形のみ・コスト不釣合）。ON でも規則版と両立・既存の成形版は残る。
+        # rag.md の LLM 成形トグル（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）。
+        # 既定 off（実測で文体整形のみ・コスト不釣合）。ON でも規則版と両立・既存の成形版は残る。
         "rag_llm_render": {
             "configured": sysset.get("rag_llm_render"),           # 生値（未設定=None＝既定に従う）
             "effective": llm_render.rag_llm_render_enabled(),     # system>既定（bool）
             "default": llm_render.env_default_enabled(),          # 未設定に戻したときの実効（コード既定）
             "options": ["on", "off"],
         },
-        # ⑤（feedback-batch-2026-07-08）: 視覚読み取り（vision）の VLM 設定。既定＝ローカル（Ollama）・
+        # 視覚読み取り（vision）の VLM 設定。既定＝ローカル（Ollama）・
         # クラウド（OpenAI）は cloud_allowed=true（管理者が明示許可）のときだけ有効（INGEST-MD 決定3）。
         "vlm": {
             "configured": sysset.get("vlm"),                     # 生値（未設定=None＝既定へ）
@@ -787,7 +787,7 @@ def _admin_settings_view() -> dict:
             "providers": list(vision_arm._KNOWN_PROVIDERS),   # ローカル(ollama)/クラウド(openai)
             "openai_key_present": bool(vision_arm._openai_key()),   # クラウド選択時のキー未設定案内用
         },
-        # R2a-S2（2026-07-13 横断レビュー対応）: Ollama 接続先の SSRF allowlist。loopback（localhost・
+        # Ollama 接続先の SSRF allowlist。loopback（localhost・
         # 127.0.0.0/8・::1）は allowlist の有無に関わらず常に暗黙許可されるため、ここに出るのは
         # それ以外（RFC1918 含む非 loopback）の許可先のみ（`llm.assert_ollama_url_allowed` 参照）。
         "ollama_allowlist": {
@@ -888,14 +888,14 @@ def _admin_settings_view() -> dict:
                 "default": chat_turns.MAX_TURNS_GLOBAL,
             },
         },
-        # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の
-        # tool-result バイト予算を管理者設定へ昇格（env フォールバックは撤去済み・ENV-CLEAN）。
+        # agentic search の
+        # tool-result バイト予算を管理者設定へ昇格（env フォールバックは撤去済み）。
         # `effective` は `agentic_search.resolve_tool_result_budgets()`（settings > コード既定→
-        # BUDGET-2 の窓由来上限との min()）の解決結果、`default` はコード既定（未設定に戻したときの
-        # 実効値・窓連動を含まない）。既定は精度優先（憲法1条）。
-        # BUDGET-2（§3.4・2026-09-03 裁定）: `effective` は「現在のモデル」（`_current_chat_
+        # 窓由来上限との min()）の解決結果、`default` はコード既定（未設定に戻したときの
+        # 実効値・窓連動を含まない）。既定は精度優先（憲法1条・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）。
+        # `effective` は「現在のモデル」（`_current_chat_
         # provider_model`）を渡して解決するため、窓が判明していれば min() 済みの値になる
-        # （窓が不明なら BUDGET-1 のみの値のまま＝退行しない）。
+        # （窓が不明なら上のみの値のまま＝退行しない）。
         "agentic_budget": {
             "per_result": {
                 "configured": sysset.get("agentic_budget_per_result"),
@@ -1054,7 +1054,7 @@ def _validate_ollama_allowlist(value):
         if not isinstance(entry, str):
             raise HTTPException(422, "ollama_allowlist の各要素は host:port（文字列）で指定してください")
         e = entry.strip()
-        # RV Low（2026-07-14）: userinfo（@）・path（/）・query（?）・fragment（#）を拒否する。
+        # userinfo（@）・path（/）・query（?）・fragment（#）を拒否する。
         # `_canonical_host_port` は hostname だけ取り出すため `127.0.0.1@evil:11434` を `evil:11434` に
         # 黙って丸めてしまい、admin の誤登録（別ホストを allowlist に入れる）を誘発する。SSRF 迂回では
         # ないが、host:port 形式を厳密化して入力ミスを 422 で弾く。
@@ -1399,14 +1399,14 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     `sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。chat_max_turns_per_user/
     chat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field
     で範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/
-    agentic_budget_total（BUDGET-1・§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・
-    累計=4096〜64MiB・範囲外は422）。model_context_windows（BUDGET-2・§3.4）は "provider:model" →
+    agentic_budget_total（§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・
+    累計=4096〜64MiB・範囲外は422）。model_context_windows（§3.4）は "provider:model" →
     tokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。
     chat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・
     `sherpa.chat_examples.validate` が意味検証・不正は422）。
     監査 INSERT の失敗は
-    `store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（2026-07-08
-    RV High: commit 後の別接続 audit＋失敗時 compensate 方式は穴があったため、原子性で置き換えた・
+    `store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（
+    commit 後の別接続 audit＋失敗時 compensate 方式では穴が残るため、原子性で置き換えた・
     announcement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。
     """
     u = _current_user(request)
@@ -1539,7 +1539,7 @@ class OpenaiEndpointTestReq(BaseModel):
     """管理画面「接続先」欄の接続テスト（admin 専用・`POST /admin/settings/openai-endpoint-test`）。
 
     タイムアウトは接続テスト専用に短くする（`_ENDPOINT_TEST_TIMEOUT_S`）: `_probe` の既定（抽出用90秒）の
-    ままだと、パケットが破棄される閉域網で画面のスピナーが数分止まらない（閉域実機 2026-09-04）。
+    ままだと、パケットが破棄される閉域網で画面のスピナーが数分止まらない（閉域実機で観測）。
     テストの目的は疎通確認なので、10秒で「到達できません」を返すのが正しい申告。
 
     保存前の入力中の値でその場だけ試す。DB は書かない・秘密は保存も監査もしない。個人設定用の

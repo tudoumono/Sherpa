@@ -117,12 +117,12 @@ def documents_list(request: Request, world: str | None = Query(None, pattern=_WO
     """文書台帳（doc_id＝rel_path＋フォルダ由来の範囲メタ）。**物理パスは出さない**。
 
     ページング（`limit`/`offset`・上限 1000・`sherpa/routers/graph.py` の近傍検索と同じ上限値）は
-    **明示指定時のみ**有効にする（RV1是正#1）——`limit`/`offset` を省略した従来どおりの呼び出しは
+    **明示指定時のみ**有効にする——`limit`/`offset` を省略した従来どおりの呼び出しは
     **全件**を返す（既定 200 件で黙って切らない＝旧クライアント互換を壊さない）。応答は後方互換
     （既存の `world`/`documents` フィールドはそのまま）で `total`/`has_more` を常に追加し、
     `limit`/`offset` を指定した時だけその実効値も追加する（無指定時は省略）。
 
-    定数時間化（S工事②・2026-09-01）: 台帳（`store.documents`）に行があれば、そこへの狭い
+    定数時間化: 台帳（`store.documents`）に行があれば、そこへの狭い
     SELECT（`doc_ledger.public_documents_page` 参照）だけで応答する——2TB 級 world でもフォルダを
     歩かない。台帳が空（未登録の dev fixture 等）の world だけ、既存の実走査へフォールバックする
     （後方互換）。
@@ -152,7 +152,7 @@ def _admin_es_search_endpoint(request: Request,
     sp = validated_scope(w, scope_paths) or None
     valid = documents.world_rel_set(w)
     hits = []
-    # `es_index.search()` は (hits, reason) タプル（RV2）。BM25 実クエリ失敗（es_query_failed）も
+    # `es_index.search()` は (hits, reason) タプル。BM25 実クエリ失敗（es_query_failed）も
     # ありうるが、この管理者向け read-only 検索には degraded 報告の仕組みが無いため意図的に捨てる
     # （構造化された degraded 集計が要る呼び出し元は `search_service._search_keyword()` 参照）。
     es_hits, _reason = es_index.search(w, query, scope_paths=sp, k=k, vector=False)

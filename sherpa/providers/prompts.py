@@ -40,21 +40,21 @@ def _facts(lens: str, env: dict) -> str:
     引用ダイジェストをそのまま渡さず、限界行だけ `_digest_limit_lines` で連結する。
     """
     d = env.get("data", {})
-    # 影響調査（impact）も反復ツール検索の対象になった（2026-08-15）。その経路の env は
-    # グラフ由来の items/start ではなく**引用（citations）**を持つため、グラフ用の文面を当てると
-    # 「起点『None』の影響は計0件」のように、利用者に見せない内部値がそのまま出てしまう（実測）。
+    # 影響調査（impact）は反復ツール検索の結果を経由することがあり、その場合の env は
+    # グラフ由来の items/start ではなく**引用（citations）**を持つ。グラフ用の文面をそのまま当てると
+    # 「起点『None』の影響は計0件」のように、利用者に見せない内部値がそのまま出てしまうため、
     # データの形で判断し、グラフ結果が無ければ引用ベースの整形（qa と同じ）へ倒す。
     if lens == "impact" and not d.get("items") and not d.get("presumed") and d.get("citations"):
         lens = "qa"
     if lens == "impact":
         items = d.get("items", [])
         s = env.get("summary", {})
-        # 起点が解決できなかった場合に `None` をそのまま文面へ出さない（実測 2026-08-15）。
+        # 起点が解決できなかった場合に `None` をそのまま文面へ出さない。
         # 起点なしの言い回しへ切り替える（利用者に内部値を見せない）。
         _start = d.get("start")
         origin = f"起点『{_start}』の" if _start else "変更対象の"
-        # 構造的な影響が0＝この起点ではコード波及なし→検索へ誘導（フォルダにコードが無いと断定しない・RV Low）。
-        # F1（2026-07-07）: 症状語を追わず、変更対象（起点）と影響先の「接続（経路）」の確認へ誘導する。
+        # 構造的な影響が0＝この起点ではコード波及なし→検索へ誘導する（フォルダにコードが無いと断定しない）。
+        # 症状語を追わず、変更対象（起点）と影響先の「接続（経路）」の確認へ誘導する。
         steer = ("。この起点では構造的なコードの波及は無い＝**変更対象（起点）と影響先の接続"
                  "（COPY/CALL/参照の経路）が辿れるか**を、資料の検索（仕様問い合わせ・トラブルシュート）や"
                  "関係グラフで確認するよう勧めること（症状語をそのまま探さない・フォルダにコードが無いとは断定しない）。")
@@ -63,7 +63,7 @@ def _facts(lens: str, env: dict) -> str:
             rest = f"（先頭12件・残り {len(items) - 12} 件は未提示）" if len(items) > 12 else ""
             base = f"{origin}影響: 計{s.get('total', 0)}件。対象: {names}{rest}"
         else:
-            presumed = d.get("presumed", [])               # 構造的な影響0件でも資料からの関連推定があれば必ず伝える（0で突き放さない・RV High）
+            presumed = d.get("presumed", [])               # 構造的な影響0件でも資料からの関連推定があれば必ず伝える（0で突き放さない）
             if presumed:
                 pn = "、".join(f"{p['name']}({p['category']})" for p in presumed[:12])
                 pn += f"（先頭12件・残り {len(presumed) - 12} 件は未提示）" if len(presumed) > 12 else ""
@@ -73,7 +73,7 @@ def _facts(lens: str, env: dict) -> str:
                 base = f"{origin}影響: 計0件（該当なし）" + steer
         return base + _digest_limit_lines(env) + (env.get("_personal_facts") or "")
     if lens == "troubleshoot":
-        from ..agentic_search import _redact            # grep 根拠本文も秘匿（ES は redact 済み・base grep の password/api_key 等を外部LLMへ流さない・RV High）
+        from ..agentic_search import _redact            # grep 根拠本文も秘匿（ES は redact 済み・base grep の password/api_key 等を外部LLMへ流さない）
         cs = d.get("candidates", [])
         parts = []
         for c in cs[:8]:
@@ -110,7 +110,7 @@ def _answer_prompt(message, lens, env):
 
 
 def _kb_hint(world: str) -> str:
-    from .. import worlds                                       # fixtures 案内は **_fixtures() ゲートに統一**（"0"/"false" を誤って truthy にしない・RV High）
+    from .. import worlds                                       # fixtures 案内は **_fixtures() ゲートに統一**（"0"/"false" を誤って truthy にしない）
     base = f"fixtures/corpus/{world}" if worlds._fixtures() else f"data/kb/*/{world}"
     return f"{base}/md（設計書・仕様の決定的MD）と {base}/src（COBOL/JCL/コピーブック原文）"
 

@@ -44,7 +44,7 @@ _WORLD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")   # fullmatch 専用�
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`agentic_search._env_int` と同型・secRV 範囲外是正・2026-07-19）。
+    """security-limit 系 env の整数解析（`agentic_search._env_int` と同型）。
 
     `agentic_search` は本モジュールを import する側（`from . import ... grep_tool ...`）のため、
     ここで `agentic_search` を import すると循環 import になる。同じ検証ロジック（範囲外・非整数・
@@ -61,20 +61,13 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     return v if lo <= v <= hi else default
 
 
-# secRV 範囲外是正（2026-07-19・grep 全量ロード OOM）: `grep_search` は対象ファイルを
-# `Path.read_text()` で一括ロードしていたため、共有フォルダ（world 鏡）に巨大テキスト（数GB）を
-# 置ける主体が、以後の全検索でメモリ枯渇（この機のボトルネックは 7.7GB）→最悪プロセス停止を
-# 誘発できた。
-#
-# 是正 追補（2026-09・ストリーミング走査）: 上の是正は「メモリを守る」ことと「1ファイルにつき
-# cap より後ろを検索できない」ことを同じ1つの定数へ束ねていた——cap を超える派生 MD（10MB〜100MB
-# 級の大きな Excel 由来）は cap より後ろが恒久的に無音になっていた。以後の実装（`_CappedStreamReader`
-# 参照）は1ファイルを bounded chunk（`_SCAN_CHUNK_BYTES`）でストリーミング走査し、保持するメモリは
+# `_GREP_FILE_CAP_BYTES`（1ファイルの走査上限）: `grep_search` は1ファイルを bounded chunk
+# （`_SCAN_CHUNK_BYTES`）で`_CappedStreamReader`によりストリーミング走査し、保持するメモリは
 # 「現在の窓」と「ヒット節を復元する最小限の状態」（MD なら直近の見出し行とその行番号・その節の
-# 引用テキストは `_GREP_HIT_TEXT_MAX_BYTES` で頭打ち）だけに限定する——`_GREP_FILE_CAP_BYTES` の
-# 大きさにもファイル実サイズにも比例しない。この定数自体は残る（1ファイルにかける走査コスト・
-# 時間の安全弁として）が、もはやメモリ安全弁ではないため、既定値を範囲上限まで引き上げた
-# （実運用の 10MB〜100MB 級文書をできるだけ cap 無しで検索できるようにする）。
+# 引用テキストは `_GREP_HIT_TEXT_MAX_BYTES` で頭打ち）だけに限定される——`_GREP_FILE_CAP_BYTES` の
+# 大きさにもファイル実サイズにも比例しない。この定数自体はメモリ安全弁ではなく、1ファイルに
+# かける走査コスト・時間の安全弁として残る。既定値は範囲上限まで引き上げてあり、実運用の
+# 10MB〜100MB 級文書をできるだけ cap 無しで検索できるようにする。
 _GREP_FILE_CAP_BYTES = _env_int("SHERPA_GREP_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
 # MD の見出し節引用は `_section()` が節全体を返すため、見出しのない巨大 MD だと1ヒットが文書全体に
 # なり得る（`max_hits` との掛け算でヒットリスト自体も肥大）。ヒット1件あたりの引用テキストを
@@ -98,7 +91,7 @@ def _clip_utf8_bytes(s: str, max_bytes: int) -> str:
 # 改行区切りの行を順に yield するリーダー。境界セマンティクス（1 byte 余分に読んで「ちょうど cap」
 # と「cap 超過」を区別する・cap で切れた中途行は破棄する）は旧 `f.read(cap + 1)` 一括ロードと同じ。
 _SCAN_CHUNK_BYTES = 64 * 1024
-# 改行が来ないまま伸び続ける単一行（secRV MED-B 型の懸念＝`agentic_search` の単一行対策と同種）で
+# 改行が来ないまま伸び続ける単一行（`agentic_search` の単一行対策と同種の懸念）で
 # 保持バイト数が増え続けないための、1行あたりの保持上限。cap 内であっても、この上限を超えた行は
 # 内容の一部を破棄しつつ次の改行まで読み進める（行番号の同期は保つ）。
 #
@@ -110,7 +103,7 @@ _SCAN_CHUNK_BYTES = 64 * 1024
 # 呼び出し元から差し込める（省略時だけこの既定を使う）。
 _GREP_LINE_MAX_BYTES = _env_int("SHERPA_GREP_LINE_MAX_BYTES", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024)
 
-# RV是正（rv-i2-importance #1・2026-09）: 隣接ヒット窓の重複排除（`grep_search` 内 `seen`）に
+# 隣接ヒット窓の重複排除（`grep_search` 内 `seen`）に
 # 使う小さな有界窓。衝突が起こり得るのは常に直近の窓どうしだけ（`grep_search` 内コメント参照）
 # のため、ファイル内の全ヒット数に比例させる必要が無い——固定サイズの小さな `deque` で十分。
 _SEEN_RECENT_MAX = 16
@@ -125,8 +118,8 @@ class _CappedStreamReader:
 
     属性は列挙の進行に伴って逐次更新され、呼び出し元は列挙の途中でも参照できる:
     - `total_read`: これまでに読んだ総バイト数。
-    - `truncated`: `total_read > cap` になった時点で True（旧実装の「1 byte 余分に読んで
-      ちょうど cap のファイルを誤って truncated 扱いしない」トリックと同じ境界）。
+    - `truncated`: `total_read > cap` になった時点で True（ちょうど cap のファイルを誤って
+      truncated 扱いしないための境界）。
     - `line_overflowed`: 1行が `line_max_bytes`（既定 `_GREP_LINE_MAX_BYTES`）を超えて改行が
       来ず、内容の一部を破棄したら True（探せていない範囲がある＝呼び出し元は打切りとして扱う）。
     """
@@ -185,7 +178,7 @@ class _CappedStreamReader:
 def _logical_lines(reader, cap: int):
     """ストリーム読みの生バイト行（`\n` 区切り）→ **`str.splitlines()` と同一の論理行**の列。
 
-    行番号の定義は旧実装（全体 decode → `splitlines()`）であり、read_around/read_doc も同じ
+    行番号の定義は `str.splitlines()`（全体 decode → `splitlines()`）であり、read_around/read_doc も同じ
     `splitlines()` で行を数える（`agentic_search.run_tool` の read_around/read_doc/doc_outline
     分岐——`_stream_doc_lines` 経由で本関数を再利用する）。grep 側だけ `\n` 限定で
     数えると、`\r` 単独・`\f`（改ページ＝COBOL/JCL リストに実在する）・`\x85`（NEL＝EBCDIC 変換由来）・
@@ -213,8 +206,8 @@ def valid_world(v: str) -> bool:
 def rag_grep_enabled() -> bool:
     """grep の検索対象・read_around の精読対象の双方が rag 表現（`{rel}.rag.md`）を優先するか。
 
-    常時 True（TOGGLE-RM・2026-09-03: グローバルな系統切替トグル `SHERPA_SEARCH_RAG_GREP` を撤去
-    し常時ONへ固定）。呼び出し元は本関数の戻り値を経由せず直接 `preferred_derived_name` の
+    常時 True（グローバルな系統切替トグル `SHERPA_SEARCH_RAG_GREP` は撤去済み・復活させない）。
+    呼び出し元は本関数の戻り値を経由せず直接 `preferred_derived_name` の
     ファイル実在チェックへ委ねてよいが、既存の呼び出し形を変えない最小変更として関数自体は残す。
     rag ファイルがその文書について実在しない場合の per-file legacy フォールバック（`{rel}.md` を
     使う）はこの関数と無関係の別契約として維持する（`preferred_derived_name` 参照）。
@@ -273,22 +266,22 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
 
     各ヒット: `{doc_id(=rel_path), path(内部用・API非露出), ext, line, span:[start,end], text, match}`
     ＋登録者が `_重要度.txt`（`ingest.importance`）で付けた重要度があれば `importance`/
-    `importance_reason` を条件付きで追加（無ければキー自体を持たない・I2・2026-09-05）。
+    `importance_reason` を条件付きで追加（無ければキー自体を持たない）。
     MD は**該当見出し節**を `text`/`span`（qa の引用）、ソースは該当行＋前後数行。同一 (doc, 節) は1集約。
     `scope_paths`（フォルダ prefix）を渡すと、**その範囲の文書だけ** grep する（範囲外は読まない・MIRROR §3）。
 
-    **ヒットの選抜（I2・二経路化＝rv-i2-importance #2・コーディネータ裁定2026-09-05再判定）**:
-    返すのは上限 `max_hits` 件の **top-K**——優先度は `(重要度rank降順, 発見順昇順)`（重要度＝
+    **ヒットの選抜**: 返すのは上限 `max_hits` 件の **top-K**——優先度は `(重要度rank降順, 発見順昇順)`（重要度＝
     `高`>`中`/未設定>`低`・同 rank は先に見つかった方を残す）。`_重要度.txt` が無い world（または
     `roots` 明示指定の呼び出し）は `imp_map` が空＝全ヒットの rank が揃う。この場合、ヒープが
     `max_hits` で満杯になった時点で**以後どのヒットも数学的に二度と採用され得ない**
     （min-heap のキー `(rank, -seq)` は rank 一様なら新エントリの `-seq` が既存最小値より必ず
-    小さくなるため、`entry > heap[0]` が恒に False になる）——この事実を使い、旧実装（I2以前）と
-    同じ2つの打切り点で走査を早期終了する: **ファイル内**（行走査ループの各行の後・MD 最終節／
-    未確定 pending 行の flush は行わない＝旧実装と同じ取りこぼし挙動）と**ファイル境界**
-    （1ファイルを終えるたびに判定・満たせば以後のファイル・root を一切開かない）。結果として
-    選抜は「発見順で先頭 `max_hits` 件」＝早期打切りしていた旧実装と完全に同じ集合・同じ順序に
-    なり、`deadline` の消費（`_check_deadline` の呼び出し頻度）も旧実装の水準に戻る。
+    小さくなるため、`entry > heap[0]` が恒に False になる）——この事実を使い、2つの打切り点で
+    走査を早期終了する: **ファイル内**（行走査ループの各行の後・MD 最終節／
+    未確定 pending 行の flush は行わない——早期終了した run だけが最終節／未確定 pending 行を
+    取りこぼすが、この時点でヒープは満杯＝以後どのヒットも採用され得ないため最終出力は変わらない）と
+    **ファイル境界**（1ファイルを終えるたびに判定・満たせば以後のファイル・root を一切開かない）。
+    早期終了しても選抜結果は「発見順で先頭 `max_hits` 件」のまま変わらず、`deadline` の消費
+    （`_check_deadline` の呼び出し頻度）は全量走査より減る。
     一方、`_重要度.txt` がある world（`imp_map` が非空）は、後から見つかった `高` 文書が現在の
     ヒープ最下位を上書きしうるため、この早期終了条件は成立せず**常に全量走査**する（`max_hits`
     到達後も走査を続けるぶん `deadline` 消費は増える——既存の周期チェックが引き続き効くことで
@@ -304,8 +297,9 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
       **ヒットを1件も出さなかった打切り文書もここに載る**——ヒット経由の申告だけでは「cap より
       後ろにしか一致が無い文書」が完全に無音になる（＝『検索したのに出てこない』の正体）。
       呼び出し元がリストを渡さなければ何もしない（既存呼び出し元は無変更）。ただし上記の早期終了
-      （`imp_map` が空かつヒープ満杯）が発生した場合、そこから先は文書を一切開かないため、その
-      時点より後にある打切り文書は報告されない——旧実装（I2以前）と同じ意味論に戻るだけであり、
+      （`imp_map` が空かつヒープ満杯）が発生した場合、早期終了したファイル自身（cap 到達前に
+      読むのをやめる）と、そこから先の文書（一切開かない）の打切りは報告されない——早期終了に
+      固有の限定であり、
       `_重要度.txt` がある world（常に全量走査）ではこの限定は無い。
 
     軽量テキスト枠（`ingest.text_kind`＝未登録拡張子のテキストファイル）だけは、台帳/ES と同じ基準
@@ -366,10 +360,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
         # AI観測レコードとして`.rag.md`自体に含まれるため、ここで観測専用ツリー
         # （`worlds.observation_current_dir`・`{rel}.rag_observations.md`）を別途歩く必要はない
         # （二重ヒットを作らない）。観測ツリー自体は generation GC の対象として引き続き存在しうる。
-        # I2（2026-09-05）: ヒットの優先順位付け（`_offer` 参照）用に world の重要度を1回だけ解決する
+        # ヒットの優先順位付け（`_offer` 参照）用に world の重要度を1回だけ解決する
         # （`_重要度.txt` が無い world は空 dict＝以下のヒープ処理が rank 均一のまま完全にno-op化する）。
         if wd:
-            # RV是正（rv-i2-importance #3・2026-09）: `sig` を渡さないと `resolve_for_world` は
+            # `sig` を渡さないと `resolve_for_world` は
             # `worker.world_signature_of_root(wd)` で world 全体をもう一度全木走査してキャッシュ
             # キー用の署名を作ってしまう（`_read_all_control_contents` 自身の走査とは別の、もう1回の
             # 走査）。grep は1回のチャット往復（agentic ループ）で何度も呼ばれうるため、この二重
@@ -394,8 +388,8 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     # 追い出す——メモリは常に高々 `max_hits` 件。`seq` は全ルート・全ファイルを通した発見順の
     # 単調増加カウンタ（同一 rank 内の tie-break・heapq の比較がタプル要素だけで完結する保証にも使う
     # ＝dict である hit 本体同士の比較には決して落ちない）。`imp_map` が空なら全ヒット rank が
-    # `importance.RANK_UNSET` で揃うため、選抜結果は「発見順で先頭 max_hits 件」＝旧実装と完全に
-    # 同じ集合・同じ順序になる（受け入れ条件＝`_重要度.txt` の無い world で出力不変）。
+    # `importance.RANK_UNSET` で揃うため、選抜結果は「発見順で先頭 max_hits 件」になる
+    # （受け入れ条件＝`_重要度.txt` の無い world で出力不変）。
     heap: list[tuple[int, int, dict]] = []
     seq = 0
 
@@ -413,7 +407,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
         elif entry > heap[0]:
             heapq.heapreplace(heap, entry)
 
-    stop_scan = False   # コーディネータ裁定（rv-i2-importance #2・2026-09-05・再判定・ファイル境界の打切り点）
+    stop_scan = False   # ファイル境界の打切り点
     for root, is_derived in roots_spec:
         _check_deadline()
         if not root.is_dir():
@@ -522,17 +516,17 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             except OSError:
                 continue
             try:
-                # 「ファイル読込直後（全文走査に入る前）」の確認（旧実装からの位置は保つ——
+                # 「ファイル読込直後（全文走査に入る前）」の確認——
                 # ストリーミングでは巨大 decode は起きないが、open 直後〜走査開始前の境界として
-                # 引き続き確認する）。
+                # 引き続き確認する。
                 _check_deadline()
                 reader = _CappedStreamReader(f)
                 is_md = is_derived or ext in _MD_EXT
                 out_ext = Path(rel).suffix.lower()      # doc_id（元ファイル）の拡張子で表示
-                # RV是正（rv-i2-importance #1・2026-09）: `seen`（隣接ヒット窓の同一 span 重複排除）を
+                # `seen`（隣接ヒット窓の同一 span 重複排除）を
                 # ファイル内の全ヒット数に比例して肥大する `set` のまま持たない——1ファイルに
-                # マッチが大量にある病的ケース（secRV 2026-07-19 が対策した「共有フォルダに巨大
-                # テキストを置ける主体」と同種の攻撃面）では、この1ファイル内だけで `seen` が
+                # マッチが大量にある病的ケース（共有フォルダに巨大テキストを置ける主体と
+                # 同種の攻撃面）では、この1ファイル内だけで `seen` が
                 # ヒット総数ぶん際限なく増える。重複が起こり得るのは常に**直近**の窓どうし
                 # （非MD: `pending` は「まだ2行分の確認猶予中」のヒットしか保持しない設計のため
                 # 定常時は高々2〜3件・MD: セクション境界は単調増加するため遠く離れた節どうしが
@@ -557,8 +551,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     if key in seen:
                         return
                     seen.append(key)
-                    # RV是正（rv-i2-importance #1）: ファイル単位のバッファ（旧 `file_hits`）へ溜めず、
-                    # 見つけ次第すぐ世界全体の top-K ヒープへ供せる（`_offer` は既に有界＝高々
+                    # 見つけ次第すぐ世界全体の top-K ヒープへ供する（`_offer` は既に有界＝高々
                     # `max_hits` 件しか保持しない）。`file_truncated` の付与（この1ファイルの走査を
                     # 終えるまで確定しない）は、ヒープに残っている（このファイル由来の）エントリを
                     # 事後に見つけて付与する形にする（下の該当箇所参照・ヒープは有界なのでこの事後
@@ -584,7 +577,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     _add_hit(section_hit_line, section_start, end_line, text)
                     section_has_hit = False
 
-                hit_limit_reached = False   # コーディネータ裁定（rv-i2-importance #2・2026-09-05・再判定）
+                hit_limit_reached = False   # ファイル内でヒット数上限に達したか（達したら flush を省く）
                 try:
                     for t in _logical_lines(reader, _GREP_FILE_CAP_BYTES):
                         if (deadline is not None and line_i > 0 and line_i % _DEADLINE_CHECK_LINES == 0
@@ -618,13 +611,14 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                                 text = "\n".join(txt for (ln, txt) in recent if s <= ln <= e)
                                 _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
                         line_i += 1
-                        # RV是正 再判定（rv-i2-importance #2・コーディネータ裁定2026-09-05）: `imp_map`
+                        # `imp_map`
                         # が空（rank一様）でヒープが `max_hits` で満杯なら、以後どのファイル・どの行の
                         # ヒットも数学的に二度とヒープへ採用されない（min-heap の比較キー `(rank, -seq)`
                         # は rank が一様なとき新エントリの `-seq` が既存最小値より必ず小さくなるため
                         # `entry > heap[0]` が恒に False になる証明・モジュール docstring 参照）。
-                        # ファイル内break＝旧実装と同じ打切り点（この時点で MD 最終節／未確定 pending
-                        # 行の flush は**行わない**＝旧実装の取りこぼし挙動を再現する）。
+                        # ファイル内break（この時点で MD 最終節／未確定 pending
+                        # 行の flush は**行わない**——ヒープは満杯＝以後どのヒットも採用され得ないため
+                        # 最終出力は変わらない）。
                         if not imp_map and len(heap) >= max_hits:
                             hit_limit_reached = True
                             break
@@ -656,10 +650,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                         h["file_truncated"] = True
                 if truncated_docs is not None and rel not in truncated_docs:
                     truncated_docs.append(rel)
-            # RV是正 再判定（rv-i2-importance #2・コーディネータ裁定2026-09-05）: ファイル境界の
-            # 打切り点（旧実装と同じ「ヒット数到達時の return」の意味論）——`imp_map` が空（rank一様）
+            # ファイル境界の
+            # 打切り点（「ヒット数到達時の return」の意味論）——`imp_map` が空（rank一様）
             # でヒープが `max_hits` で満杯なら、以後のファイル・root を一切開かない（`_check_deadline()`
-            # を含む以降の周期チェックも実行されない＝旧実装の deadline 消費水準に戻る）。
+            # を含む以降の周期チェックも実行されない）。
             if not imp_map and len(heap) >= max_hits:
                 stop_scan = True
                 break

@@ -44,15 +44,15 @@ _KNOWN_STOP_REASONS = frozenset(HONEST_FAILURE_STOP_REASONS) | frozenset(INCOMPL
 # いずれかのプロバイダ側でラベルが変わればここも追随させる必要がある。
 # 「資料を検索（grep）」は `ripgrep_search` の旧ラベル（現行は「資料を検索（語句そのまま）」）——
 # 過去に保存済みの `messages.trace`（履歴データ）を読む集計は現行コードが生成しなくなった旧ラベルも
-# 数え続ける必要がある（`_V1_TRACE_OMITTED_NODE_ID` と同じ後方互換の理由・RV是正 rv-periphery #7）。
+# 数え続ける必要がある（`_V1_TRACE_OMITTED_NODE_ID` と同じ後方互換の理由）。
 _TOOL_CALL_LABELS = frozenset({
     "資料の一覧を確認", "資料を検索（語句そのまま）", "資料を検索（全文/日本語）", "資料を検索（全文）",
     "資料を検索（grep）",
     "ファイル名で検索", "フォルダ構成を確認",
     "該当箇所を精読", "文書を通読", "見出し構造を確認", "関係グラフをたどる", "世代間の差分を比較",
-    # S3b（原本読取ツール・`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
+    # 原本読取ツール（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
     # `agentic_search._ORIGINAL_READ_LABELS`/`providers/codex/provider.py` の tlabel 辞書と同じ文言。
-    # 「原本のシート一覧を確認」（xlsx_sheets・RV#11）はツール呼び出しとしては数えるが、シート名・
+    # 「原本のシート一覧を確認」（xlsx_sheets）はツール呼び出しとしては数えるが、シート名・
     # 大きさを見るだけで本文は読んでいないため `_FILES_READ_LABEL` には含めない（下記参照）。
     "原本のシート一覧を確認",
     "原本を読む（Excel）", "原本を読む（Word）", "原本を読む（PowerPoint）", "原本を読む（PDF）",
@@ -60,15 +60,15 @@ _TOOL_CALL_LABELS = frozenset({
     "ユーザに確認",
 })
 # 本文を実際に読んだ（精読/通読した）とみなすラベル集合。「見出し構造を確認」（doc_outline）・
-# 「原本のシート一覧を確認」（xlsx_sheets・RV#11）は構造/一覧を見るだけで本文を読んだことには
+# 「原本のシート一覧を確認」（xlsx_sheets）は構造/一覧を見るだけで本文を読んだことには
 # ならないため対象外——`files_read` に含めるのは `read_around`/`read_doc` 相当の2ラベルと、
-# S3b の原本読取ツールのうち実際にセル/段落/スライド/ページの中身を返す5本（xlsx_sheets を除く）。
+# 原本読取ツールのうち実際にセル/段落/スライド/ページの中身を返す5本（xlsx_sheets を除く）。
 _FILES_READ_LABEL = frozenset({
     "該当箇所を精読", "文書を通読",
     "原本を読む（Excel）", "原本を読む（Word）", "原本を読む（PowerPoint）", "原本を読む（PDF）",
     "原本を読む（先頭）",
 })
-# v1 trace 上限（旧 `chat_service._cap_trace`・撤去済み・TOGGLE-RM 2026-09-03）到達時に先頭へ置かれた
+# v1 trace 上限（旧 `chat_service._cap_trace`・撤去済み）到達時に先頭へ置かれた
 # 要約ノードの id。生成コード自体は撤去済みだが、v1 形式で既に保存済みの過去メッセージ（`messages.trace`）
 # を読む本関数はこの id を読み続ける必要がある（履歴データの後方互換読み取り）。
 _V1_TRACE_OMITTED_NODE_ID = "trace-omitted"

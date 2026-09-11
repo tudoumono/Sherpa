@@ -24,14 +24,14 @@ from .ingest.world_neo4j import GraphSchemaEraError, _scope_pred, check_schema_e
 
 _log = logging.getLogger("sherpa")
 
-# 近傍たどりのエッジ＝実効語彙（K13・2026-09-04-グラフのソース正典化.md §4）。
+# 近傍たどりのエッジ＝実効語彙（2026-09-04-グラフのソース正典化.md §4）。
 _RELATED_REL = "COPIES|CONTAINS|INVOKES|ACCESSES|DOCUMENTS|CORRESPONDS_TO"
 
 _ROLE = {"Document": "関連文書", "Module": "実装", "Batch": "ジョブ"}
 _ROLE_RANK = {"Document": 1, "Batch": 2, "Module": 3}
 
 
-# secRV 範囲外是正（2026-07-19・Neo4j 安全弁＝timeout＋緊急天井・LIMITは入れない＝網羅性の原則維持がユーザー決定）:
+# Neo4j 安全弁＝timeout＋緊急天井・LIMITは入れない＝網羅性の原則維持がユーザー決定:
 # 影響検索（近傍探索）は網羅性が本質のため Cypher に LIMIT は入れない。密なグラフ（ハブノード）で
 # 深さ3の可変長パス展開が数千〜数万件になり得ることへは、代わりに (1) per-query タイムアウト、
 # (2) 結果カーソルをストリーム反復して行数に緊急天井（正当な結果では届かない値＝フィルタではない）
@@ -59,7 +59,7 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     return v if lo <= v <= hi else default
 
 
-# per-query タイムアウト（秒）。既定30・[1,600] にクランプ（secRV 範囲外是正・2026-07-19）。
+# per-query タイムアウト（秒）。既定30・[1,600] にクランプ。
 _NEO4J_QUERY_TIMEOUT_S = _env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 # ストリーム反復の緊急天井（行数）。既定10000・[100,1000000] にクランプ（同上）。
 _NEO4J_MAX_ROWS = _env_int("SHERPA_NEO4J_MAX_ROWS", 10000, 100, 1_000_000)
@@ -83,7 +83,7 @@ def _is_query_timeout(exc: Neo4jError) -> bool:
 
 
 def _run_capped(session, cypher: str, *, log_world: str, **params) -> list[dict]:
-    """読み取り専用 Cypher を安全弁つきで実行する（secRV 範囲外是正・2026-07-19）。
+    """読み取り専用 Cypher を安全弁つきで実行する。
 
     - `neo4j.Query(cypher, timeout=...)` で **per-query タイムアウト**を付与する。サーバがタイムアウトで
       クエリを打ち切ると `Neo4jError` が上がるが、ここで捕捉して黙殺せず `log.warning`（world とタイムアウト
@@ -96,7 +96,7 @@ def _run_capped(session, cypher: str, *, log_world: str, **params) -> list[dict]
       そのまま返す。
     - Cypher 本文に LIMIT は入れない（影響検索の網羅性を落とさない＝ユーザー決定）。
 
-    secRV 範囲外是正 追補（2026-07-19・RV指摘 HIGH-1）: 天井到達で `break` した時点では `Result`
+    天井到達で `break` した時点では `Result`
     カーソルがまだ未消費（残りレコードが手元に残っている）。neo4j driver 6.2.0 は**同じ session**で
     次の `session.run()` を呼ぶと、前の未消費 `Result` の残りを**全件 fetch/buffer してしまう**
     （`run_troubleshoot` が `resolve_anchor` 直後に同一 session で `neo4j_related` を呼ぶ経路では、
@@ -197,16 +197,16 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
     向き＝`startNode`/`endNode` の `name`）。呼び出し元が
     「A が B を COPY している」を向き付きで根拠にできるようにする。
 
-    rv-s3-removal: 主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
+    主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
     `GraphSchemaEraError` で fail-loud・`world_neo4j` 参照）。`lens="troubleshoot"`——直接 dispatch
     （troubleshoot レンズ）経由の呼び出しを想定した既定値。agentic ツール `graph_neighbors`
     （`neighbor_cards` 経由・qa/author レンズからも呼ばれ得る）でも同じ既定値のまま返す（呼び出し元
     のチャットレンズまでは本関数から見えないため・新規のレンズ追跡機構は作らない＝縮小形の方針）。
 
-    RV是正（rv-periphery #10・2026-09-05）: `anchors` が空（症状文にグラフ上のノード名が1つも
-    見当たらなかった）でも `check_schema_era` は呼ぶ——旧実装は主クエリごと丸々スキップして早期
-    `return []` していたため、旧世代グラフ（例えば旧スキーマではノード名の一致自体が起きず
-    anchors が常に空になる）を「近傍0件」という平常の結果と区別できなかった（再取り込みが必要な
+    `anchors` が空（症状文にグラフ上のノード名が1つも
+    見当たらなかった）でも `check_schema_era` は呼ぶ——ここを主クエリごとスキップして早期
+    `return []` すると、旧世代グラフ（例えば旧スキーマではノード名の一致自体が起きず
+    anchors が常に空になる）を「近傍0件」という平常の結果と区別できなくなる（再取り込みが必要な
     world が沈黙して見える穴）。
     """
     if not anchors:
@@ -327,7 +327,7 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
     card をそのまま返す（agentic_search 側の構造 Evidence 生成が使う・公開経路には出さない）。
     Neo4j 不可・未解決はグレースフルに `[]`（agentic はツール結果が空でも他の道具で続行できる）。
 
-    rv-s3-removal: **`GraphSchemaEraError` だけは再送出**する（`impact_service.presumed_impact` の
+    **`GraphSchemaEraError` だけは再送出**する（`impact_service.presumed_impact` の
     `GraphQueryOverloadError` 特別扱いと同じ流儀）——旧世代の実データを黙って空カードへ縮退させると
     「見つからなかった」（本当に0件）と「読めない世代のグラフ」を区別できず、チャット側
     （`chat_service._degrade_overload`）が honest failure を出す機会を失う。

@@ -57,6 +57,7 @@ class _UnwiredProvider(Provider):
         yield _node("connect", "think", f"{self.label} に接続", self.howto, "active")
         env = {"lens": "qa", "headline": f"{self.label} はまだ接続されていません。{self.howto}",
                "summary": {"total": 0}, "data": {}, "sources": [],
+               "agentic_failure": "error",   # 終了理由の分布で完了扱いにしない（`stop_kind.resolve`）
                "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens="qa")}
         yield _node("connect", "think", f"{self.label} に接続", "未接続", "done")
         yield {"type": "answer_delta", "text": env["headline"]}
@@ -93,6 +94,7 @@ class _DisabledProvider(Provider):
         if not ctx.knowledge:
             yield from _plain_run(self, ctx); return
         env = {"lens": "qa", "headline": self.howto, "summary": {"total": 0}, "data": {}, "sources": [],
+              "agentic_failure": "error",   # 終了理由の分布で完了扱いにしない（`stop_kind.resolve`）
               "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens="qa")}
         yield _node("disabled", "think", "利用できないAI", "設定を確認してください", "done")
         yield {"type": "answer_delta", "text": env["headline"]}

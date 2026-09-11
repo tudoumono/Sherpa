@@ -33,6 +33,7 @@ _audit_canonical
 _audit_entry_hash
 _audit_insert
 _bedrock_key_fingerprint
+_compute_conversation_turn_stats
 _compute_retention
 _connect
 _create_sanitized_snapshot_tx
@@ -40,6 +41,7 @@ _dsn
 _ensure
 _inited
 _invalidate_system_settings_cache
+_percentile
 _read_system_settings_fresh
 _redact
 _safe_evidence_item

@@ -231,9 +231,12 @@ def test_zero_output_failure_clears_data_when_sources_empty(tmp_path, monkeypatc
     env = _result_env(_run(prov, ctx))
     assert "接続できません" in env["headline"]
     assert env["data"] == {}, f"honest failure なのに data が実検索結果のまま: {env!r}"
+    assert env["codex_silent_failure"] is True, (
+        "STAT-3 T3: 利用統計の終了理由分布が判定できるよう codex_silent_failure を立てる契約")
 
     from sherpa import chat_service as CS
     assert CS._no_genuine_results(env) is False
     finalized = CS._finalize(dict(env), {"lens": "qa", "reason": "Codex 未接続"})
     assert "retry_hints" not in finalized
     assert finalized["headline"] == env["headline"], "headline が確定文言へ誤って置換されている"
+    assert finalized["stop_kind"] == "codex_silent"

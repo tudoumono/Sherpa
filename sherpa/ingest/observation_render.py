@@ -1,6 +1,6 @@
 """隔離OCR workerが書くOCR補助観測Setを、Canonical RAG成果物とは別のgenerationへ永続化する。
 
-O1（2026-09-03・§8.1一本化）で検索用途の描画（Markdown/chunkJSONL）は撤去した——OCR観測は
+O1（§8.1一本化）で検索用途の描画（Markdown/chunkJSONL）は撤去した——OCR観測は
 VLMと合流してrag.md（正本）へ「AI観測」レコードとして統合される経路（`office_md._build_observation_set`）
 に一本化されており、grepもこの別木を直接走査しない（`grep_tool.grep_search`参照）。
 このmoduleが今も持つのは、`office_md._load_ocr_observation_sets`がその合流のために読む

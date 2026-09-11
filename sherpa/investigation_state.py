@@ -52,7 +52,7 @@ _GAP_MESSAGE_CAP = 200
 _TOOL_ERROR_CAP = 80
 
 # kind="read"（精読）扱いにするツール名——read_around/read_doc（土台系）と原本読取ツール 5 本（xlsx_sheets を除く＝シート一覧のみで本文を読んでいない）
-# （RV#5・`agentic_search._doc_reader_text_locator` が結果へ `doc_id`/`text` を合成する）。
+# （`agentic_search._doc_reader_text_locator` が結果へ `doc_id`/`text` を合成する）。
 _READ_KIND_TOOL_NAMES = frozenset({
     "read_around", "read_doc",
     "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head",
@@ -83,7 +83,7 @@ class Evidence:
     source_tool: str
     verification: str     # "verified" | "span_unmatched" | "structural" | "unverified"
     extra_quotes: list[str] = field(default_factory=list)
-    # RV2巡目#9 是正: S3b 原本読取ツール（xlsx_range 等）の kind="read" は `span` が常に None
+    # 原本読取ツール（xlsx_range 等）の kind="read" は `span` が常に None
     # （行番号ではなく "Sheet1!A1:D20" 等の文字列位置のため）——`locator`（`agentic_search.
     # _doc_reader_text_locator` が組む値）を同一性・表示の両方へ足すことで、同じ doc_id の
     # 別シート/別ページ読み取りが `span=None` 同士で1件に潰れないようにする（`_find` 参照）。
@@ -247,7 +247,7 @@ class InvestigationState:
         本文が違っても常に1件に統合する（`_upsert` 参照）。doc_id/span が常に None の集計事実
         （list/graph/compare）だけは text も鍵に含める（さもないと条件の異なる集計が1件に潰れる）。
 
-        RV2巡目#9 是正: kind="read" かつ `span is None`（S3b 原本読取ツールの精読＝行番号でなく
+        kind="read" かつ `span is None`（原本読取ツールの精読＝行番号でなく
         `locator` 文字列で位置を表す）は `locator` も鍵に含める——さもないと同じ doc_id への
         別シート/別ページの読み取りが `(doc_id, span=None)` だけで同一とみなされ1件に潰れる。
         `span` が数値範囲を持つ場合（read_around/read_doc）は locator を鍵に含めない（既存契約を
@@ -452,7 +452,7 @@ class InvestigationState:
                     # 消えたことに誰も気づけない。
                     self._add_gap(f"{name} doc {doc_id}{_span_loc(span)}: 保存時に本文を "
                                   f"{len(cleaned)} 字で切断（末尾は清書に渡らない）")
-                # RV2巡目#9: S3b 6ツールの `locator`（read_around/read_doc は常に None）を同一性の
+                # 原本読取ツール6本の `locator`（read_around/read_doc は常に None）を同一性の
                 # 鍵にも表示にも渡す（`_upsert`/`_find` 参照）。
                 self._upsert(kind="read", doc_id=doc_id, span=span, text=cleaned,
                             source_tool=name, verification="structural",
@@ -517,7 +517,7 @@ class InvestigationState:
     def _fmt_evidence(self, e: Evidence) -> str:
         if e.kind in ("citation", "read"):
             loc = _span_loc(e.span)
-            # RV2巡目#9: `locator`（S3b 原本読取ツール・span=None のときだけ持つ）を本文へ前置する
+            # `locator`（原本読取ツール・span=None のときだけ持つ）を本文へ前置する
             # ——同じ doc_id で複数エントリになった場合（別シート等）に、どの箇所の精読かを
             # 表示の上でも区別できるようにする（同一性は `_find` 側で既に区別済み）。
             # 精読本文の保存上限は清書予算に合わせて大きい（`_READ_TEXT_CAP_BYTES`）が、render は

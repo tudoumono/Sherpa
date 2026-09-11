@@ -1,35 +1,21 @@
-"""Codex authoring 用サンドボックス機構（リファクタリング計画 フェーズ5 S8・`sherpa/agents.py` から
-純移動）。
+"""Codex authoring 用サンドボックス機構（permission profile 方式の読取封じ込め＋Marp レンダ用バイナリ
+検出＋web_search 既定 OFF ポリシー）。docs/08-実行権限と隔離.md / memory
+`codex-sandbox-permission-profile` と対応付け。`sherpa/agents.py` が facade として本モジュールを
+再エクスポートする（`CodexProvider` は `codex/provider.py`・`_select_provider` は
+`providers/__init__.py` にあり、本モジュールの利用者はどちらも providers パッケージ内の兄弟）。
 
-Feature A（permission profile 方式の読取封じ込め・2026-07-01 実機実証）＋ Marp レンダ用バイナリ検出＋
-web_search 既定 OFF ポリシー（Codex 強化計画 Phase0・§5-1）をまとめる。docs/08-実行権限と隔離.md /
-memory `codex-sandbox-permission-profile` と対応付け。`sherpa/agents.py` が facade として本モジュール
-から再エクスポートする（S10 で `CodexProvider` は `codex/provider.py` へ・S11 で `_select_provider` は
-`providers/__init__.py` へ移動済み＝本モジュールの利用者はどちらも providers パッケージ内の兄弟）。
-
-移動した10名: `_codex_sandbox_enabled`・`_kb_read_roots`・`_codex_clean_env`・`_marp_bin`・
-`_detect_chrome_path`・`_web_search_admin_allowed`・`_web_search_disabled_value`・
-`_web_search_c_args`・`_write_codex_authoring_config`・`_safe_workspace_authoring`。
-
-**明示変更（3箇所・計画書 S8 指示どおり）**: `Path(__file__).resolve().parents[1]`
-（`sherpa/agents.py` 基準＝repo root）は、本モジュール（`sherpa/providers/codex/sandbox.py`）が
-2階層深い（providers→codex）ため `parents[3]` に修正した（`_kb_read_roots`・`_marp_bin`・
-`_write_codex_authoring_config` 内の MCP サブプロセス PYTHONPATH の3箇所）。
+本モジュール（`sherpa/providers/codex/sandbox.py`）は `sherpa/agents.py` より2階層深い
+（providers→codex）ため、repo root 基準のパスは `Path(__file__).resolve().parents[3]`
+（`_kb_read_roots`・`_marp_bin`・`_write_codex_authoring_config` 内の MCP サブプロセス
+PYTHONPATH）、相対 import は `from ... import worlds` になる（参照先は変わらず `sherpa.worlds`）。
 `tests/unit/test_agents_surface.py` の pin テストは `pathlib.Path(sherpa.agents.__file__)
 .resolve().parents[1]`（facade は常に `sherpa/agents.py` を指す）と比較するため、両者が同じ
 実パス（repo root）を指すことで担保される。
 
-**相対 import の深さ調整（純移動の範囲内・S5〜S7 と同じ判断）**: `_kb_read_roots` 内の
-`from . import worlds` は、本モジュールが `sherpa` から2階層深い（providers→codex）ため
-`from ... import worlds` に変更した（参照先は変わらず `sherpa.worlds`）。
-
-**`_mcp_env`・`_toml_str` は兄弟モジュール `.mcp` から直接 import する**（S9 で移動済み・
-一方向 sandbox→mcp なので循環なし）。S8 時点では両名がまだ `sherpa/agents.py` 側に残っていた
-ため facade 実行時解決（関数内 `from sherpa import agents as _facade`）で凌いでいたが、
-S9 完了後は不要になったので RV（2026-07-14・LOW）の指摘どおり直接 import に戻した。
-どちらもテストが facade attribute を **patch する**名前ではない（facade 経由の直接**呼び出し**のみ）
-ことを確認済み＝patch 素通りの懸念なし（「危険な継ぎ目」リストは `_gather`／`BedrockProvider`／
-`_bedrock_auth_available` のみ）。
+`_mcp_env`・`_toml_str` は兄弟モジュール `.mcp` から直接 import する（一方向 sandbox→mcp
+なので循環なし）。どちらもテストが facade attribute を **patch する**名前ではない（facade 経由の
+直接**呼び出し**のみ）ため patch 素通りの懸念はない（「危険な継ぎ目」リストは `_gather`／
+`BedrockProvider`／`_bedrock_auth_available` のみ）。
 """
 from __future__ import annotations
 
@@ -46,8 +32,8 @@ from ..base import _log
 from .mcp import _mcp_env, _toml_str
 
 
-# ---- Feature A: Codex authoring の permission-profile サンドボックス（読取封じ込め・2026-07-01 実機実証）----
-# `-s workspace-write` は書込を cwd に封じるが**読取が FS 全開**＝他人 workspace・秘密が読める（RV BLOCKER①②）。
+# ---- Codex authoring の permission-profile サンドボックス（読取封じ込め）----
+# `-s workspace-write` は書込を cwd に封じるが**読取が FS 全開**＝他人 workspace・秘密が読める。
 # Codex 0.139 の permission profile（default_permissions）で**読取も KB(RO)＋authoring(RW) に封じ込める**。
 # 検証・落とし穴は docs/notes/2026-07-01-codex-authoring-sandbox.md / memory codex-sandbox-permission-profile。
 def _codex_sandbox_enabled() -> bool:
@@ -292,7 +278,7 @@ def _codex_clean_env(codex_home: Path, authoring: Path, tmpdir: Path,
     creds が要る MCP サブプロセスへは config ファイル(mcp_servers.sherpa.env)経由で渡す（プロセス env に置かない）。
     例外はプロキシ/CA の経路設定（`_CODEX_PASSTHROUGH_ENV`）で、親環境に**あるときだけ**そのまま渡す。
 
-    `openai_api_key`（S2・Azure OpenAI 対応・2026-08-18）: **既定 None＝従来どおり渡さない**（回帰ゼロ・
+    `openai_api_key`（Azure OpenAI 対応）: **既定 None＝従来どおり渡さない**（回帰ゼロ・
     `test_codex_clean_env_has_no_secrets`／`test_codex_clean_env_passes_proxy_and_ca_only_when_set`
     は引数省略で呼び、親環境に `OPENAI_API_KEY` があっても env に出ないことを固定している）。
 
@@ -326,8 +312,8 @@ def _codex_clean_env(codex_home: Path, authoring: Path, tmpdir: Path,
     return env
 
 
-# ---- Marp（スライド作成スキル）レンダ用のバイナリ検出（M3 案2・2026-07-12・
-#      RUNTIME-SANDBOX §9 の M1 実証結果 / §10.3 の未解決問題を踏まえた設計変更）----
+# ---- Marp（スライド作成スキル）レンダ用のバイナリ検出（RUNTIME-SANDBOX §9 の実証結果 / §10.3 の
+#      未解決問題を踏まえた設計）----
 # Codex は sandbox 内で .md を書くだけ（marp CLI を直接呼ばない）。レンダ（HTML/PDF/PPTX）は
 # Codex 完了後に Sherpa 本体プロセスが marp_render.py 経由でこの marp CLI・Chromium を使って
 # 実行する（sandbox の外＝permission profile の read root に marp/Chromium を足す必要が無い）。
@@ -336,12 +322,12 @@ def _marp_bin() -> str | None:
     未解決なら None＝marp_render.render_outputs() は何もしない（.md のみが成果物）。"""
     override = os.environ.get("SHERPA_MARP_BIN")
     if override:
-        # RV Med（2026-07-08）: 相対パスのまま子プロセスへ渡すと Popen(cwd=authoring) 側で
-        # authoring 相対に誤解釈される。expanduser＋絶対化して渡す（abspath＝symlink は辿らない）。
+        # 相対パスのまま子プロセスへ渡すと Popen(cwd=authoring) 側で
+        # authoring 相対に誤解釈されるため、expanduser＋絶対化して渡す（abspath＝symlink は辿らない）。
         p = Path(os.path.abspath(os.path.expanduser(override)))
         return str(p) if (p.is_file() and os.access(str(p), os.X_OK)) else None
     # repo_root は絶対（__file__.resolve()）。`.bin/marp` は npm が張る symlink（→ marp-cli.js）。
-    # RUNTIME-SANDBOX §9 / M1 実証がこの `.bin/marp` パスをそのまま使うため resolve せず返す
+    # RUNTIME-SANDBOX §9 の実証がこの `.bin/marp` パスをそのまま使うため resolve せず返す
     # （リポジトリ管理の開発ツールで、authoring 配下の user データではない＝symlink 封じ込め対象外）。
     repo_root = Path(__file__).resolve().parents[3]
     cand = repo_root / "tools" / "marp" / "node_modules" / ".bin" / "marp"
@@ -352,13 +338,13 @@ def _marp_bin() -> str | None:
 
 def _detect_chrome_path() -> str | None:
     """CHROME_PATH（PDF/PPTX レンダに必須の Chromium）。既存 env（CHROME_PATH/CHROMIUM_PATH）を
-    尊重し、無ければ Playwright の既存 chromium を自動検出（新規 DL なし・M1 実証で流用実績）。
+    尊重し、無ければ Playwright の既存 chromium を自動検出する（新規 DL しない・既存インストールを流用する）。
     見つからなければ None＝marp_render.render_outputs() は HTML のみ生成する。"""
     for k in ("CHROME_PATH", "CHROMIUM_PATH"):
         v = os.environ.get(k)
         if v:
-            # RV Med（2026-07-08）: 絶対化＋実行ビット確認（非実行ファイルを渡すと Puppeteer が
-            # EACCES でレンダ失敗）。相対パスは Popen(cwd=authoring) で誤解釈されるため絶対化。
+            # 絶対化＋実行ビット確認する（非実行ファイルを渡すと Puppeteer が
+            # EACCES でレンダ失敗する。相対パスは Popen(cwd=authoring) で誤解釈されるため絶対化する）。
             p = Path(os.path.abspath(os.path.expanduser(v)))
             if p.is_file() and os.access(str(p), os.X_OK):
                 return str(p)
@@ -375,7 +361,7 @@ def _detect_chrome_path() -> str | None:
     return str(latest) if latest else None
 
 
-# ---- WEB-1: web_search は既定 OFF。Codex CLI は web_search が既定 ON（OpenAI 管理インデックスの
+# ---- web_search は既定 OFF。Codex CLI は web_search が既定 ON（OpenAI 管理インデックスの
 # キャッシュ）で、社内資料接地の原則（04-画面の原則.md §4）と不整合のため、管理者が管理画面
 # （system_settings.web_search_allowed）で明示許可した場合のみ、チャットごとの希望を尊重する。----
 def _web_search_admin_allowed(system_settings: dict | None = None) -> bool:
@@ -399,7 +385,7 @@ def _web_search_disabled_value(user_enabled: bool, endpoint_kind: str = "openai"
     `None`（＝config へ何も書かない・Codex 既定の ON に委ねる）。それ以外は常に `"disabled"`。
     管理者未許可の間は、`user_enabled=True`（このチャットで希望）が渡されても無視する。
 
-    `endpoint_kind`（S2・Azure OpenAI 対応・2026-08-18）: Codex(OpenAI) 構成の実際の接続先
+    `endpoint_kind`（Azure OpenAI 対応）: Codex(OpenAI) 構成の実際の接続先
     （`sherpa.llm.openai_endpoint_kind()` の値）。`"openai"`（既定・省略時もこれ）以外＝Azure 等の
     代替エンドポイントのときは、admin 許可・ユーザー設定に**関わらず常に無効化**する（Codex の
     web_search は OpenAI がホストする管理インデックスの機能。Azure OpenAI Responses API 自体は
@@ -423,7 +409,7 @@ def _web_search_disabled_value(user_enabled: bool, endpoint_kind: str = "openai"
 
 def _web_search_endpoint_note(user_enabled: bool, endpoint_kind: str,
                               system_settings: dict | None = None) -> str | None:
-    """S2: 接続先が既定(OpenAI)以外（Azure 等）のせいで web_search が強制 OFF になっている時だけ、
+    """接続先が既定(OpenAI)以外（Azure 等）のせいで web_search が強制 OFF になっている時だけ、
     ユーザー向けの一言を返す（それ以外は None＝何も表示しない）。
 
     `_web_search_disabled_value` と条件を二重管理しない: admin 許可 or このチャットでの希望の
@@ -442,7 +428,7 @@ def _web_search_c_args(user_enabled: bool, system_settings: dict | None = None) 
     （単一の真実源は `_web_search_disabled_value`・sandbox/fallback 間の判定ロジック重複を防ぐ）。
     disabled 相当なら `["-c", 'web_search="disabled"']`・有効相当なら `[]`（Codex 既定 ON に委ねる）。
 
-    S2（Azure OpenAI 対応）: `endpoint_kind` を渡さない＝常に既定 "openai" 扱い。この emergency
+    `endpoint_kind` を渡さない＝常に既定 "openai" 扱い。この emergency
     fallback 経路（`SHERPA_CODEX_SANDBOX=0`）はそもそも Azure 等へのリダイレクト自体が未対応
     （`_write_codex_authoring_config` の `ollama_base_url`/`_openai_compat_provider_lines` 分岐は
     sandbox モードのみ。Codex(Ollama) 構成は `_select_provider` がサンドボックス無効時に honest
@@ -484,10 +470,8 @@ _OLLAMA_PROVIDER_ID = "sherpa-ollama"
 _OPENAI_COMPAT_PROVIDER_ID = "sherpa-openai-compat"
 
 
-# S2（Azure OpenAI 対応・2026-08-18）: `sherpa.llm` の `openai_endpoint_kind()`/`openai_base_url()`
-# を呼ぶ単一の真実源。作業開始当初は S1（`sherpa.llm`）と並行実装中だったため
-# `getattr(..., None)` で欠落を防御していたが、S1 は着地済み＝LOW-1（2026-08-18 Codex RV）で
-# 直接呼びに戻した（欠落を隠す防御は「関数が消えても気づかない」逆効果になるため撤去）。
+# `sherpa.llm` の `openai_endpoint_kind()`/`openai_base_url()` を呼ぶ単一の真実源。直接呼びにする
+# （`getattr(..., None)` 等の欠落防御はしない＝関数が消えても気づかない逆効果になるため）。
 def _openai_endpoint_kind(system_settings: dict | None = None) -> str:
     """`sherpa.llm.openai_endpoint_kind()` を呼ぶ（"openai" | "azure" | "custom"）。
     `system_settings`（省略可）は `CodexProvider` が保持するスナップショットをそのまま渡す
@@ -497,7 +481,7 @@ def _openai_endpoint_kind(system_settings: dict | None = None) -> str:
 
 
 def _openai_compat_base_url(system_settings: dict | None = None) -> str:
-    """`sherpa.llm.openai_base_url()` を呼び、HIGH-1（2026-08-18 Codex RV）として base URL の
+    """`sherpa.llm.openai_base_url()` を呼び、base URL の
     妥当性（`llm.assert_openai_base_url_allowed`）も検証する。
 
     呼ばれるのは呼び出し側（`_write_codex_authoring_config`）が既に `_openai_endpoint_kind() !=
@@ -506,7 +490,7 @@ def _openai_compat_base_url(system_settings: dict | None = None) -> str:
     にキーを渡す**直前**の最終防衛線（`_select_provider` の判定を迂回する経路があっても、不正な
     base URL がそのまま書かれてキーが誤った宛先へ渡ることを防ぐ）。不正なら `ValueError` を送出し、
     呼び出し元（`provider.py` の実行ループ）の既存 broad except に乗って安全に degrade する
-    （S1 docstring 参照）。`system_settings`（省略可）は `_openai_endpoint_kind` と同じ理由。"""
+    （`_openai_endpoint_kind` 冒頭のコメント参照）。`system_settings`（省略可）は `_openai_endpoint_kind` と同じ理由。"""
     from ... import llm as _llm
     base = _llm.openai_base_url(system_settings)
     _llm.assert_openai_base_url_allowed(base)
@@ -519,7 +503,7 @@ def _openai_compat_provider_lines(base_url: str, *, api_version: str | None, aut
     `_write_codex_authoring_config` が「Codex(OpenAI) 構成で、接続先が既定(api.openai.com)以外」と
     判定した時だけ＝既定のときは**この関数自体が呼ばれない**＝回帰ゼロ。
 
-    実装根拠（Codex `config-advanced` 公式ドキュメント確認済み・2026-08-18・codex-cli 0.144.1）:
+    実装根拠（Codex `config-advanced` 公式ドキュメント確認済み・codex-cli 0.144.1）:
       - Azure 公式サンプルはそのまま `[model_providers.azure]` に `env_key`＋`query_params`
         （`api-version`）＋`wire_api = "responses"` を書く。`openai_base_url`（トップレベル・組込み
         `openai` provider の base_url だけを差し替える簡易版）は `wire_api`/`query_params`/`env_key`
@@ -597,7 +581,7 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     常に read で足す（裁定）。"""
     codex_home.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(codex_home, 0o700)                 # RV HIGH: creds を含む CODEX_HOME を同ホスト他プロセス/ユーザから守る
+        os.chmod(codex_home, 0o700)                 # creds を含む CODEX_HOME を同ホスト他プロセス/ユーザから守る
     except OSError:
         pass
     # Codex(OpenAI) 構成（`ollama_base_url` なし）だけ、auth.json（実 home の OpenAI 資格情報）を
@@ -621,17 +605,16 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
         'approval_policy = "never"',
     ]
     # Codex(OpenAI) 構成のときだけ、実際の接続先（`sherpa.llm.openai_endpoint_kind()`）が既定
-    # (api.openai.com) 以外かを見る＝既定なら "openai" が返り、以降の判定・分岐は全部素通り
-    # （S1 未実装/未マージの間の防御的フォールバックも同じ "openai" を返す＝回帰ゼロ）。Azure/custom
-    # 分岐（下の `elif`）は `ollama_base_url` が無い時だけ通るため、Ollama 構成側の値には無関係。
+    # (api.openai.com) 以外かを見る＝既定なら "openai" が返り、以降の判定・分岐は全部素通り。
+    # Azure/custom 分岐（下の `elif`）は `ollama_base_url` が無い時だけ通るため、Ollama 構成側の値には無関係。
     _endpoint_kind = "openai" if ollama_base_url else _openai_endpoint_kind(system_settings)
-    # WEB-1: web_search（OpenAI がホストする管理インデックス）は Codex(Ollama) 構成では原理的に
+    # web_search（OpenAI がホストする管理インデックス）は Codex(Ollama) 構成では原理的に
     # 使えない——`_endpoint_kind` を Azure/custom 判定用に "openai" のまま保つのとは別に、
     # web_search の可否判定にだけ "ollama"（openai 以外）を渡し、管理者許可・ユーザー希望に
     # 関わらず常に無効化する（`_web_search_disabled_value` の endpoint_kind != "openai" 分岐）。
     _web_search_endpoint_kind = "ollama" if ollama_base_url else _endpoint_kind
     _ws_value = _web_search_disabled_value(web_search_enabled, _web_search_endpoint_kind, system_settings)
-    if _ws_value is not None:                        # Phase0・§5-1: 既定は必ず disabled を明示的に書く
+    if _ws_value is not None:                        # 既定は必ず disabled を明示的に書く
         lines.append(f'web_search = {_toml_str(_ws_value)}')
     if ollama_base_url:                              # Codex(Ollama) 構成のときだけ接続先を差し替える
         lines += _ollama_provider_lines(ollama_base_url)
@@ -707,9 +690,9 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
             f'env = {env_toml}',
         ]
     cfg = codex_home / "config.toml"
-    # RV HIGH: creds(mcp env) を含むため symlink/race を避けて 0600 で書く（O_CREAT|O_EXCL|O_NOFOLLOW）。
+    # creds(mcp env) を含むため symlink/race を避けて 0600 で書く（O_CREAT|O_EXCL|O_NOFOLLOW）。
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    # RV MEDIUM: 既存 config が居たら **fail-closed**（握り潰さず raise）＝古い/細工された config での起動を防ぐ。
+    # 既存 config が居たら **fail-closed**（握り潰さず raise）＝古い/細工された config での起動を防ぐ。
     fd = os.open(str(cfg), flags, 0o600)
     try:
         os.write(fd, ("\n".join(lines) + "\n").encode("utf-8"))
@@ -896,8 +879,8 @@ def _safe_run_authoring(users_dir: Path, uid: str) -> "Path | None":
 
 
 def _safe_codex_sessions_home(users_dir: Path, uid: str, conversation_id) -> "Path | None":
-    """R1b（会話継続・Codex ネイティブ resume・RV再検証 MEDIUM-3）: 会話ごとの永続 CODEX_HOME
-    （`workspace/.codex-sessions/{cid}`）の安全確認。`_safe_workspace_authoring` と同じ契約
+    """会話ごとの永続 CODEX_HOME（`workspace/.codex-sessions/{cid}`）の安全確認（Codex ネイティブ
+    resume による会話継続用）。`_safe_workspace_authoring` と同じ契約
     （symlink混入・非ディレクトリ・workspace 外逸脱は fail-closed で None を返す＝呼び出し側は
     Codex を起動しない）。
 

@@ -10,7 +10,7 @@ SDK 非依存（urllib）。OpenAI/Gemini へは**本文テキストのみ**送�
   各モジュールに残し、本体（URL/ヘッダ/HTTP）だけここへ委譲する。
 - `post_json` は HTTP エラー時に `urllib.error.HTTPError` を送出する（呼び元の 429 バックオフ等が依存）。
 
-R2a（SSRF 封じ・2026-07-13 横断レビュー対応）: `ollama_url()` が**単一チョークポイント**＝
+SSRF 封じ: `ollama_url()` が**単一チョークポイント**＝
 embeddings/graph_extract/graph_admin/providers.ollama（agentic＋stream）は全部ここで URL を組み立てる
 ため、ここで宛先ポリシーを検証すれば全シンクに効く。既定許可＝loopback のみ（単一ボックス構成の既定
 Ollama を保護）。それ以外（RFC1918 含む）は admin が `system_settings` に登録した allowlist
@@ -19,11 +19,11 @@ Ollama を保護）。それ以外（RFC1918 含む）は admin が `system_sett
 既存の broad `except Exception` に自然に乗って degrade する（embeddings→None／intent→None／
 ask_graph→failed／agentic 失敗→単発 grep フォールバック等・呼び出し側の変更は不要）。
 
-R2a 追加是正（2026-07-14 横断レビュー対応・Codex RV HIGH×3）:
-  #1 ポート省略時、旧実装は無条件で Ollama の正規ポート（11434）を補っていたため、admin が
-     `host:11434` を allowlist に登録すると省略ポートの `http://host`（wire port は実際には 80）が
-     誤って一致し許可されてしまっていた。`_canonical_host_port` は**scheme の既定ポート**
-     （http=80・https=443）を補うよう修正（明示ポートはそのまま）。
+SSRF allowlist は以下の点にも対応する:
+  #1 ポート省略時に Ollama の正規ポート（11434）を無条件で補ってしまうと、admin が
+     `host:11434` を allowlist に登録した場合、省略ポートの `http://host`（wire port は実際には 80）が
+     誤って一致し許可されてしまう。`_canonical_host_port` は**scheme の既定ポート**
+     （http=80・https=443）を補う（明示ポートはそのまま）。
   #2 `base`（`ollama_url()`/`assert_ollama_url_allowed()` に渡す接続先）に path/query/fragment が
      混入すると、`ollama_url(base, path)` の `base + path` 連結で呼び出し側が意図した path
      （`"/api/chat"` 等）が上書き/追加され、任意パスへ到達できてしまう（fragment 混入時は urlopen が
@@ -103,14 +103,14 @@ def _canonical_host_port(url: str) -> tuple[str, int] | None:
     None を返す（呼び出し側は不正な接続先として拒否する）。ここでは末尾ドット
     （`example.com.`）の除去だけ追加する。scheme は http/https のみ許可（それ以外は不正として None）。
 
-    R2a #2（2026-07-14）: path が空/`"/"` 以外、または query/fragment を含む URL は解釈不能として
+    path が空/`"/"` 以外、または query/fragment を含む URL は解釈不能として
     None を返す（`base` は接続先の起点＝host:port のみを表すべきという契約・詳細はモジュール docstring）。
 
-    R2a #1（2026-07-14）: ポートは明示指定を優先し、無指定なら **scheme の既定ポート**
+    ポートは明示指定を優先し、無指定なら **scheme の既定ポート**
     （http=80・https=443）を補う（allowlist エントリ・接続先 URL の双方に同じ正規化を適用するため
-    両者に同時に効く）。旧実装は無条件で Ollama の正規ポート（11434）を補っており、admin が
-    `host:11434` を allowlist に登録すると省略ポートの `http://host`（wire port は実際には 80）が
-    誤って一致してしまっていた（詳細はモジュール docstring）。
+    両者に同時に効く）。Ollama の正規ポート（11434）を無条件で補ってしまうと、admin が
+    `host:11434` を allowlist に登録した場合、省略ポートの `http://host`（wire port は実際には 80）が
+    誤って一致してしまう（詳細はモジュール docstring）。
     """
     try:
         p = urlparse(url or "")
@@ -137,7 +137,7 @@ def _canonical_host_port(url: str) -> tuple[str, int] | None:
 def format_host_port(host: str, port: int) -> str:
     """`(host, port)` を **再パース可能な** `host:port` 文字列へ整形する。
     IPv6（`:` を含む host）は角括弧で囲む（`[2001:db8::1]:11434`）＝そうしないと `_allowlisted_hosts()` の
-    `http://<entry>` 再パースでホスト/ポート境界が曖昧になり round-trip しない（RV Medium・2026-07-14）。
+    `http://<entry>` 再パースでホスト/ポート境界が曖昧になり round-trip しない。
     """
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
@@ -794,7 +794,7 @@ def ollama_url(base: str, path: str, *, extra_allowed: set[tuple[str, int]] | No
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """3xx（redirect）を追跡しない（R2a #3・2026-07-14 横断レビュー対応・HIGH）。
+    """3xx（redirect）を追跡しない。
 
     既定の `urlopen` は `Location` ヘッダを自動追跡するため、`assert_ollama_url_allowed` を通過した
     宛先からの応答が redirect 経由で allowlist 外／任意パスへ誘導されうる（allowlist は接続開始時の
@@ -917,7 +917,7 @@ _EXPLICIT_PROVIDER_NAMES = frozenset({"openai", "gemini", "ollama", "bedrock"})
 def pick_provider_selector(*values: str | None) -> str:
     """`values` を順に見て、最初の非空文字列（strip・小文字化）を返す。全て空なら `"auto"`。
 
-    重大バグ是正（RV 3巡目 #2）: 「機能別 provider（例 intent_provider）が明示的に `"auto"`」と
+    「機能別 provider（例 intent_provider）が明示的に `"auto"`」と
     「機能別 provider が未設定（空文字/None）で `extract_provider` へ継承する」は**別の状態**だが、
     どちらも「このセルの値」だけを見て次点（`extract_provider`）へフォールバックするかどうかを
     決める、という一段のロジックである点は同じ＝`values` に **既に決まった優先順位の生値**
@@ -947,7 +947,7 @@ def resolve_auto_provider(settings: dict | None, *, bedrock_capable: bool = Fals
     できなければ None。bedrock はキー有無に関わらず「試す」対象に含める（認証解決可否の判定自体は
     呼び出し側の factory に委ねる）。
 
-    FBK-1（2026-09-01・fail-loud）: `cloud_provider`（A7）を admin が**明示的に選んでいる**
+    `cloud_provider`（A7）を admin が**明示的に選んでいる**
     （`_keys.cloud_provider_explicitly_selected`）ときは、その選択が解決できなくても Ollama へは
     倒さない（黙って別プロバイダへ縮退すると、選んだクラウド側の障害なのか切り分けられなくなる
     ため）＝ None のまま呼び出し元へ返し、`llm_unavailable`／ベクトル無効等の既存の未接続扱いに

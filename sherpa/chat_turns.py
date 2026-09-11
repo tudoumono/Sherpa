@@ -135,7 +135,7 @@ class TurnBuffer:
     def wait_for_more(self, cursor: int, timeout: float) -> bool:
         """cursor より後のイベントが既にあるか完了済みなら即 True で返る。無ければ新規追記/完了まで
         待ち、その間に進展があれば True・タイムアウトで何も進展が無いまま戻る場合は False を返す
-        （MEDIUM・Codex RV: 呼び出し側＝`iter_sse` がこの False を「keepalive を1つ流して切断検知の
+        （呼び出し側＝`iter_sse` がこの False を「keepalive を1つ流して切断検知の
         機会を作る」合図として使う）。"""
         with self._cond:
             if self.done or any(e.seq > cursor for e in self._events):
@@ -149,7 +149,7 @@ class TurnRecord:
     turn_id: str
     uid: str
     stop_event: threading.Event
-    # MEDIUM（Codex RV）: 予約方式（`start_turn` 参照）のため、レジストリ登録の瞬間は会話がまだ
+    # 予約方式（`start_turn` 参照）のため、レジストリ登録の瞬間は会話がまだ
     # 確定していない（None）ことがある。確定後に `start_turn` が直接代入する。
     conversation_id: int | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -163,7 +163,7 @@ _REGISTRY_LOCK = threading.Lock()
 def _sweep_expired_locked() -> None:
     """完了後 TTL を過ぎたターンをレジストリから外す（呼び出し側で `_REGISTRY_LOCK` 保持済み前提）。
 
-    調査全体を経過時間だけで打ち切らない契約（TIMEOUT-1）——終了は run_fn の完了・利用者の
+    調査全体を経過時間だけで打ち切らない契約——終了は run_fn の完了・利用者の
     `stop_turn`・例外（`_run` の except→mark_done）だけで、経過時間による協調停止要求／強制
     `mark_done()` は行わない。DB 永続済みのため、完了ターンをレジストリから外しても会話履歴は
     失われない（覗き窓の在庫整理）。専用の背景スレッドは持たず、レジストリに触れるたびの遅延掃除で
@@ -223,7 +223,7 @@ def _raise_if_over_limit_locked(uid: str, max_per_user: int, max_global: int) ->
     引きずられて待たされる。ここでは渡された値をそのまま使うだけで、DB には一切触れない）。
 
     conversation_id が未確定（予約中）のレコードも「未完了」として数える＝予約フェーズも
-    ちゃんと枠を消費する（MEDIUM・Codex RV: これが無いと予約の意味が無くなる）。
+    ちゃんと枠を消費する（これが無いと予約の意味が無くなる）。
     """
     running = [r for r in _REGISTRY.values() if not r.buffer.done]
     if len(running) >= max_global:
@@ -253,11 +253,10 @@ def start_turn(*, uid: str,
               run_fn_factory: Callable[[int], Callable[[threading.Event, Callable[[dict], None]], None]],
               known_conversation_id: int | None = None,
               ) -> TurnRecord:
-    """新規ターンを background thread で開始する（予約方式・MEDIUM Codex RV 修正）。
+    """新規ターンを background thread で開始する（予約方式）。
 
-    以前は「呼び出し側が会話を確定 → start_turn が上限判定＋登録」の順だったため、上限超過（429）で
-    弾かれるリクエストでも**会話だけは既に作られてしまう**という副作用があった。ここでは順序を
-    逆にする:
+    上限超過（429）で弾かれるリクエストで**会話だけは作られてしまう**副作用を避けるため、会話確定
+    より先に枠を予約する:
       1) `_REGISTRY_LOCK` の中で枠を**予約**する（上限判定と登録を同一ロックで atomic に行う・
          この時点では `conversation_id` は未確定＝None）。
       2) lock の**外**で `conversation_factory()` を呼んで会話を確定する（DB I/O をロック保持中に
@@ -305,7 +304,7 @@ def start_turn(*, uid: str,
         raise
 
     rec.conversation_id = conversation_id
-    # 経過時間による予約の強制解放（reaper）は撤去済み（TIMEOUT-1）——`rec` はここまで
+    # 経過時間による予約の強制解放（reaper）は無い——`rec` はここまで
     # `_REGISTRY` から取り除かれず `buffer.done` も立たない（`mark_done()` を呼ぶのは
     # 下の `_run()` 自身の finally だけで、それはこの後の thread 起動より後にしか起きない）。
     try:
@@ -319,9 +318,9 @@ def start_turn(*, uid: str,
         try:
             run_fn(rec.stop_event, rec.buffer.append)
         except Exception:
-            # RV想定: provider 側は既に自己防御的にフォールバックする作りだが、万一未捕捉の例外が
+            # provider 側は既に自己防御的にフォールバックする作りだが、万一未捕捉の例外が
             # ここまで来ても「実行中のまま残り続けて枠を占有する」事故だけは避ける（多層防御）。
-            # HIGH（Codex RV）: DB への best-effort 永続（user/assistant メッセージ・監査）は
+            # DB への best-effort 永続（user/assistant メッセージ・監査）は
             # 呼び出し側（api.py の run_fn 自体）の責務にした＝本モジュールは chat_service を
             # 知らないため、ここでは「buffer にエラーを積んで枠を解放する」ことだけを担う。
             _log.exception("chat turn crashed: turn_id=%s uid=%s", turn_id, uid)
@@ -350,7 +349,7 @@ def list_running(uid: str, *, all_users: bool = False) -> list[TurnRecord]:
     turn_id を知る手段が要る・呼び出し側で管理者判定済みのときだけ True）。
 
     conversation_id が未確定（予約中＝`start_turn` が conversation_factory を実行している最中）の
-    レコードは skip する（MEDIUM・Codex RV: 外部にはまだ存在しない会話IDを見せない・そもそも
+    レコードは skip する（外部にはまだ存在しない会話IDを見せない・そもそも
     turn_id 自体もこの瞬間は呼び出し元にまだ返っていないため実害は無いが、契約として明記する）。
     """
     with _REGISTRY_LOCK:
@@ -378,7 +377,7 @@ def iter_sse(turn_id: str, uid: str, cursor: int, *, wait_timeout: float = 15.0)
     StreamingResponse は generator 生成時点では中身を評価しないため、認可エラーを 404 として
     即座に返せるよう呼び出し側で `get_turn` を使う設計にした・本関数はレコード確定後のみ呼ばれる）。
 
-    MEDIUM（Codex RV）: `wait_for_more` がタイムアウトで（新規イベントも完了も無いまま）戻ったときは
+    `wait_for_more` がタイムアウトで（新規イベントも完了も無いまま）戻ったときは
     SSE コメント行（`: keepalive`）を1つ yield する。何も yield しないと、クライアントが切断した後も
     この generator（StreamingResponse の threadpool worker）が次の進展まで居座り続け、切断を検知
     できない。コメント行は EventSource 仕様上クライアントには無視される（画面に影響しない）が、

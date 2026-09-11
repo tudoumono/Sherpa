@@ -16,7 +16,7 @@
 LLM 生成は**レコード本文の内容ハッシュでキャッシュ**する（`ir/` 層の world 単位 JSON・
 `es_index._embed_cached` と同じ「現存分だけに剪定する鏡」の流儀）。同一内容の再取込は LLM を
 呼ばない。プロバイダ選定・送信は `graph_extract.available()`/`complete_json()` をそのまま再利用する
-——`available()` は GRAPH-SRC（2026-09-04）で旧・意味層フル抽出が撤去された後の、取り込み
+——`available()` は GRAPH-SRC で旧・意味層フル抽出が撤去された後の、取り込み
 パイプライン向け LLM 呼び出しの共通配管として残る。model_catalog の独立用途セル `render` を使う
 （「設定駆動・テキストのみ送信」経路・OpenAI へファイルは送らない）。
 """
@@ -38,7 +38,7 @@ _log = logging.getLogger("sherpa")
 # ---- トグル解決（system_settings > 既定 on・`legacy_convert.py` の流儀と同型・
 #      env フォールバックは UI 昇格に伴い ENV-CLEAN で撤去済み）--------------------------------
 
-# 既定 OFF（2026-09-05 裁定）: test2 実測で成形の実効果が「です・ます化・空行削除・ラッパー剥がし」の
+# 既定 OFF: test2 実測で成形の実効果が「です・ます化・空行削除・ラッパー剥がし」の
 # 文体整形のみと判明（情報の追加ゼロ・値の欠落ゼロ）。1ファイル約3.5円/38秒＝1万ファイル外挿で
 # 3.5万円/直列100時間級はコストに見合わない。実文書で構造回復の実益が実測できたら再裁定する。
 _DEFAULT_ON = "off"
@@ -88,7 +88,7 @@ def available(settings: dict | None = None) -> dict | None:
     （`strict=False`＝管理者が明示選択したプロバイダの構成不備でも例外化しない。本処理は背景処理で
     利用者への即時エラー通知が不要なため、常に「自然に何も起きない」側へ倒す）。
 
-    `usage="render"`（model_catalog の独立カタログ用途・L5 残課題の是正／GRAPH-SRC 2026-09-04 で
+    `usage="render"`（model_catalog の独立カタログ用途・L5 残課題の是正／GRAPH-SRC で
     `USAGES` の一級市民に）: 旧・意味層フル抽出（`extract` 用途）を撤去した後もモデル解決が壊れない
     よう、`render` 未設定の環境は `model_catalog._USAGE_FALLBACK` の後方互換読み取りで旧 `extract`
     セルの解決結果をそのまま使い続ける（管理者が明示的に `render` を設定すればそちらに従う）。
@@ -395,11 +395,11 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
     ES への反映（`.rag_sig` の無効化・再索引・確定）は呼び出し元（`worker.py`）が
     `changed_rels` を見て行う——本関数はファイル書込までの責務に留める。
 
-    **世代競合の是正**（2026-09-05・rv-oom-resume item5）: 本関数は LLM 呼び出しを含み長時間
+    **世代競合対策**: 本関数は LLM 呼び出しを含み長時間
     （実測 1ファイル約38秒）かかりうるため `store.world_lock` を通し取りしない（ファイル書込ごとに
     握る・docstring 下部参照）——その間に rebind/削除/register で world の世代（`last_sig`）が
     変わると、パス開始時点で読んだ（古い世代の）本文から成形した結果を、既に別世代になった
-    `derived_rag_dir` へ書き戻してしまう穴があった。パス開始時点の `last_sig` を保存し、
+    `derived_rag_dir` へ書き戻してしまう恐れがある。パス開始時点の `last_sig` を保存し、
     **書込直前**に `store.world_lock` 内で現行 `last_sig` と再照合する——不一致ならその書込を
     破棄し、以降の書込も同じ理由で無効になりうるためパス自体を打ち切る（キャッシュ剪定＝
     `_save_cache` も呼ばない——`visited` が新世代に対して不完全なまま保存すると、まだ見ていない

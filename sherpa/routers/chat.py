@@ -1,19 +1,19 @@
-"""チャット系エンドポイント（フェーズ3スライス7・純移動）。
+"""チャット系エンドポイント。
 
 `chat_router`（`GET /chat/tools-availability`・`POST /chat`・`GET /chat/stream`・
 `POST /chat/stream/stop`・`POST /chat/turns`・`GET /chat/turns/{turn_id}/stream`・
 `GET /chat/turns/running`・`POST /chat/turns/{turn_id}/stop`）の8ルート。golden の定義順で
 連続しているため router は1本で足りる。api.py 側は
-`app.include_router(chat.chat_router)` を旧位置（`app.include_router(impact.impact_router)` の
-直後・`app.include_router(system.settings_router)` の直前）に置く。
+`app.include_router(chat.chat_router)` を `app.include_router(impact.impact_router)` の
+直後・`app.include_router(system.settings_router)` の直前に置く（route 順序を golden と
+一致させるため）。
 
 途中停止レジストリ `_STREAM_STOP_LOCK`/`_STREAM_STOP_EVENTS`/`_STREAM_ID_PATTERN`、および
 背景実行（覗き窓方式）ヘルパ `_persist_turn_crash`/`_turn_run_fn`（docs/proposals/
-2026-07-03-チャット背景実行.md 正典）もこのモジュールへ純移動する。api.py 側は
+2026-07-03-チャット背景実行.md 正典）も本モジュールに置く。api.py は
 `from sherpa.routers.chat import ChatReq, _STREAM_STOP_EVENTS, _STREAM_STOP_LOCK, _persist_turn_crash`
-で再エクスポートし、`tests/api/test_chat_m8.py` の `api._STREAM_STOP_EVENTS[...]` / `test_chat_turns.py`
-の `api._persist_turn_crash(...)` は同一オブジェクトの参照として互換のまま動く。ロジックは変更しない
-（コード移動のみ）。
+で再エクスポートする契約——`tests/api/test_chat_m8.py` の `api._STREAM_STOP_EVENTS[...]` /
+`test_chat_turns.py` の `api._persist_turn_crash(...)` は同一オブジェクトの参照として動く。
 
 このモジュールは `sherpa.api` を import しない（循環回避）。
 """
@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, StrictBool, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from sherpa import agent_constructs, agentic_search, chat_turns, llm, store
+from sherpa import stop_kind as stop_kind_mod
 from sherpa import tools_pref as tools_pref_mod
 from sherpa.agents import get_provider
 from sherpa.chat_router import extract_slash_lens as _extract_slash_lens
@@ -56,19 +57,19 @@ class ChatReq(BaseModel):
     # 探す対象（調べ方ブロック §3.4）。既定 both＝フィルタなし（既存挙動と完全同一）。
     layer: Literal["docs", "code", "both"] = "both"
     # 調べ方の明示指定（調べ方ブロック §3.1）。既定 None（省略）＝自動（既存の Tier1〜3 判定）。
-    # 正典の値は4値＋省略のみ（RV1 #12）："auto" は非正典の互換値のため受理しない（UI も既に省略）。
+    # 正典の値は4値＋省略のみ："auto" は非正典の互換値のため受理しない（UI も既に省略）。
     lens: Literal["impact", "troubleshoot", "qa", "author"] | None = None
-    # 調べる深さ（調べ方ブロック §3.2・SC-6c）。既定 "standard"＝既存の挙動（env 既定値）と完全同一。
+    # 調べる深さ（調べ方ブロック §3.2）。既定 "standard"＝既存の挙動（env 既定値）と完全同一。
     depth_profile: Literal["standard", "deep", "max"] = "standard"
-    personal: bool = False    # Feature B: 個人ファイル参照トグル（既定OFF）
-    # WEB-1: Codex の Web 検索をこのチャットで希望するか（既定OFF）。管理者許可・
+    personal: bool = False    # 個人ファイル参照トグル（既定OFF）
+    # Codex の Web 検索をこのチャットで希望するか（既定OFF）。管理者許可・
     # 頭脳が Codex（Azure 等でないこと）が揃わなければ、サーバ側で常に無効化される
     # （`sherpa/providers/codex/sandbox.py::_web_search_disabled_value` が唯一の判定点）。
     web_search: bool = False
-    # 検索経路トグル（調べ方ブロック §3.6・SC-6e）。既定/省略/null は全 ON＝既存挙動と完全同一。
+    # 検索経路トグル（調べ方ブロック §3.6）。既定/省略/null は全 ON＝既存挙動と完全同一。
     # grep/fulltext（ES・全文＋ベクトル）/graph の3経路のみが対象（list_docs/read_around/ask_user
     # は常時ON）。3つとも false は 422。
-    # SC-6e: キーを `Literal["grep","fulltext","graph"]`・値を `StrictBool` にする——
+    # キーを `Literal["grep","fulltext","graph"]`・値を `StrictBool` にする——
     # 素の `dict[str, bool]` は pydantic の型強制（coercion）がバリデータより先に走り、
     # `"false"`/`0`/`"yes"` のような非 bool 値を静かに bool へ変換してしまう
     # （`tools_pref.normalize_tools_pref` の「bool 以外は不正」という契約と食い違う）。
@@ -79,7 +80,7 @@ class ChatReq(BaseModel):
     @field_validator("tools")
     @classmethod
     def _v_tools(cls, v):
-        # SC-6e: 欠落キーを埋めずに生の dict をそのまま保持する（`normalize_tools_pref` は
+        # 欠落キーを埋めずに生の dict をそのまま保持する（`normalize_tools_pref` は
         # 構造検証（未知キー・非bool・3つとも false）だけに使い、戻り値は捨てる）——欠落キーを
         # 埋めてしまうと「明示的に true と指定したか」が失われ、後段の可用性 422 判定
         # （`unavailable_explicit_tools`）が省略キーまで誤検知してしまう。
@@ -145,7 +146,7 @@ def _check_chat_write(user: dict, conversation_id: int | None) -> None:
 def _validate_tools_availability(tools: dict | None, availability: dict | None = None) -> None:
     """検索経路トグルで明示的に ON 指定したツールが実接続で到達不可なら 422（ツール名つき）。
 
-    省略/False のキーは対象外（可用分だけを黙って使う既存契約のまま・SC-6e）。
+    省略/False のキーは対象外（可用分だけを黙って使う既存契約のまま）。
     `validated_scope` と同じ「response 作成前に弾く」位置（各エンドポイントの `if knowledge:`
     分岐内）で呼ぶ。
 
@@ -162,7 +163,7 @@ def _validate_tools_availability(tools: dict | None, availability: dict | None =
 
 
 def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: bool):
-    """3つの実HTTP入口（`/chat`・`/chat/stream`・`/chat/turns`）が共有する準備手順（SC-6e）。
+    """3つの実HTTP入口（`/chat`・`/chat/stream`・`/chat/turns`）が共有する準備手順。
 
     ユーザ設定を一度だけ読み、knowledge の実効値（`_knowledge_for_settings`・Codex構成は常時ON）
     と Provider 構築の両方へ**同じスナップショット**を渡す——呼び出し元が別途 `_knowledge_for`
@@ -207,7 +208,7 @@ def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: b
     knowledge = _knowledge_for_settings(settings, requested_knowledge)
     if not knowledge:
         return False, None, None, None, None
-    # WEB-1: `handle_message`/`stream_message` と同じ上書き（実行時にもう一度同じ値で
+    # `handle_message`/`stream_message` と同じ上書き（実行時にもう一度同じ値で
     # 冪等に上書きされる）。
     settings = {**settings, "codex_web_search": bool(web_search)}
     sys_settings = store._read_system_settings_fresh()
@@ -222,7 +223,7 @@ def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: b
 
 @chat_router.get("/chat/tools-availability", tags=["チャット"])
 def chat_tools_availability(request: Request):
-    """検索経路3種（grep／全文・ベクトル(ES)／グラフ）の実接続可用性（SC-6e）。
+    """検索経路3種（grep／全文・ベクトル(ES)／グラフ）の実接続可用性。
 
     調べ方ブロックの「詳細」チップが、到達不可なツールを表示・選択させないために使う唯一の
     真実源——実行側（デフォルトツール構築・非agentic `_dispatch`/`_gather`）と同じ
@@ -239,7 +240,7 @@ def chat(req: ChatSyncReq, request: Request):
     _check_chat_write(u, req.conversation_id)
     uid = u["uid"]
     w = _resolve_world(req.world)
-    # SC-6e: settings を一度だけ読み、knowledge の実効値（Codex構成は常にON・多層防御）と
+    # settings を一度だけ読み、knowledge の実効値（Codex構成は常にON・多層防御）と
     # Provider を同じスナップショットから準備する。接続先検証（I/O-free）→可用性チェック
     # （ES/Neo4j）の順で行い、受付（422判定）と実行本体（handle_message）へ同じ
     # Provider/settings/snapshot を渡す——別々に取得すると knowledge 判定・可用性判定の
@@ -248,7 +249,7 @@ def chat(req: ChatSyncReq, request: Request):
         uid, req.knowledge, req.web_search)
     if knowledge:
         validated_scope(w, req.scope_paths)            # ナレッジ参照は実在 world のみ＋scope 検証（正規化は handle_message 側）
-        _validate_tools_availability(req.tools, availability=tools_availability)   # SC-6e: 明示ON指定の不達ツールは422（ツール名つき）
+        _validate_tools_availability(req.tools, availability=tools_availability)   # 明示ON指定の不達ツールは422（ツール名つき）
     stop_event = threading.Event()
     with _STREAM_STOP_LOCK:
         if req.stream_id in _STREAM_STOP_EVENTS:
@@ -278,7 +279,7 @@ def chat(req: ChatSyncReq, request: Request):
             _STREAM_STOP_EVENTS.pop(req.stream_id, None)
 
 
-# UI フィードバック1（途中停止・2026-07-03）: EventSource.close() はクライアント側の接続を閉じるだけで、
+# 途中停止: EventSource.close() はクライアント側の接続を閉じるだけで、
 # サーバ側の StreamingResponse（sync generator）は次のチャンク送信を試みるまで切断に気づけない
 # （starlette は ASGI spec>=2.4 では disconnect を能動的に監視しない・iterate_in_threadpool は generator の
 # next() をスレッドプールへ都度投げるだけで、ブロッキング呼び出し中はキャンセルできない＝調査済）。
@@ -287,7 +288,7 @@ def chat(req: ChatSyncReq, request: Request):
 # `/chat/stream/stop` から明示的に set する（CodexProvider 側は set を検知して即 _killpg・詳細は agents.py）。
 _STREAM_STOP_LOCK = threading.Lock()
 _STREAM_STOP_EVENTS: dict[str, tuple[str, threading.Event]] = {}   # stream_id -> (uid, Event)
-# RV MEDIUM（2026-07-03再検証）: stream_id はクライアント生成の相関IDのため、UUID相当（十分なエントロピー・
+# stream_id はクライアント生成の相関IDのため、UUID相当（十分なエントロピー・
 # ログ/URLに安全な文字集合）に形式を制約する（無制限文字列を受理しない）。crypto.randomUUID() 由来（36桁）と、
 # それが使えない古いブラウザ向けの chat.js フォールバック（`${Date.now()}-${random.toString(36)}`）の両方を通す。
 
@@ -296,28 +297,28 @@ _STREAM_STOP_EVENTS: dict[str, tuple[str, threading.Event]] = {}   # stream_id -
 def chat_stream(request: Request, message: str = Query(...),
                 world: str | None = Query(None, pattern=_WORLD_PATTERN),
                 conversation_id: int | None = None, knowledge: bool = False,
-                personal: bool = False,                       # Feature B: 個人ファイル参照トグル
+                personal: bool = False,                       # 個人ファイル参照トグル
                 scope_paths: list[str] = Query(default_factory=list),
                 # 探す対象（調べ方ブロック §3.4）。既定 both＝フィルタなし（既存挙動と完全同一）。
                 layer: Literal["docs", "code", "both"] = "both",
-                # 調べ方の明示指定（調べ方ブロック §3.1）。既定 None（省略）＝自動（RV1 #12・"auto" は非受理）。
+                # 調べ方の明示指定（調べ方ブロック §3.1）。既定 None（省略）＝自動（"auto" は非受理）。
                 lens: Literal["impact", "troubleshoot", "qa", "author"] | None = Query(None),
-                # 調べる深さ（調べ方ブロック §3.2・SC-6c）。既定 "standard"＝既存の挙動と完全同一。
+                # 調べる深さ（調べ方ブロック §3.2）。既定 "standard"＝既存の挙動と完全同一。
                 depth_profile: Literal["standard", "deep", "max"] = "standard",
-                # WEB-1: Codex の Web 検索をこのチャットで希望するか（既定OFF・`ChatReq.web_search` と同じ契約）。
+                # Codex の Web 検索をこのチャットで希望するか（既定OFF・`ChatReq.web_search` と同じ契約）。
                 web_search: bool = False,
-                # 検索経路トグル（調べ方ブロック §3.6・SC-6e）。`ChatReq.tools` の各キーを個別 query
+                # 検索経路トグル（調べ方ブロック §3.6）。`ChatReq.tools` の各キーを個別 query
                 # param に分解したもの（GET はネスト構造を持てないため）。既定 None＝省略（全ON）。
-                # `bool = True` ではなく `bool | None = None` にする（SC-6e）: 「省略」と
+                # `bool = True` ではなく `bool | None = None` にする: 「省略」と
                 # 「明示的に true」を区別できないと、可用性 422 判定（`unavailable_explicit_tools`）が
                 # 省略キーまで誤って対象にしてしまう（`ChatReq.tools` の生 dict 保持と同じ理由）。
                 tools_grep: bool | None = None, tools_fulltext: bool | None = None,
                 tools_graph: bool | None = None,
-                # UI フィードバック1: 途中停止用の相関ID（クライアント生成・UUID相当に形式制約＝RV MEDIUM）
+                # 途中停止用の相関ID（クライアント生成・UUID相当に形式制約）
                 stream_id: str = Query(..., pattern=_STREAM_ID_PATTERN)):
     """チャットの SSE ストリーミング版（`/chat` と同じ意味論・逐次イベントで返す）。"""
     u = _current_user(request)
-    # 実行を経過時間で打ち切らない（TIMEOUT-1）ため、途中停止の導線（`/chat/stream/stop`）を
+    # 実行を経過時間で打ち切らないため、途中停止の導線（`/chat/stream/stop`）を
     # 持たないストリームは受け付けない——stream_id 無しで起動した Codex は、固まっても止める手段が
     # 無い（sync generator は次の yield まで切断に気づけない）。
     _check_chat_write(u, conversation_id)
@@ -331,7 +332,7 @@ def chat_stream(request: Request, message: str = Query(...),
         tools_pref_mod.normalize_tools_pref(tools_raw)   # 構造検証のみ（3つとも false 等）・戻り値は使わない
     except ValueError as e:
         raise HTTPException(422, str(e))
-    # SC-6e: settings を一度だけ読み、knowledge の実効値（Codex構成は常にON・多層防御）と
+    # settings を一度だけ読み、knowledge の実効値（Codex構成は常にON・多層防御）と
     # Provider を同じスナップショットから準備する。接続先検証（I/O-free）→可用性チェック
     # （ES/Neo4j）の順で行い、受付（422判定）と実行本体（stream_message・SSE closure）へ同じ
     # Provider/settings/snapshot を渡す——別々に取得すると knowledge 判定・可用性判定の
@@ -340,7 +341,7 @@ def chat_stream(request: Request, message: str = Query(...),
         uid, knowledge, web_search)
     if knowledge:
         validated_scope(w, scope_paths)               # 実在 world のみ＋scope 検証（response 作成前に弾く）
-        _validate_tools_availability(tools_raw, availability=tools_availability)   # SC-6e: 明示ON指定の不達ツールは422（ツール名つき）
+        _validate_tools_availability(tools_raw, availability=tools_availability)   # 明示ON指定の不達ツールは422（ツール名つき）
     stop_event = threading.Event()
     with _STREAM_STOP_LOCK:
         # 同じ stream_id が既に使用中なら後勝ちで上書きせず拒否する（上書きすると先勝ちストリームの
@@ -373,7 +374,7 @@ def chat_stream(request: Request, message: str = Query(...),
                     yield f"data: {json.dumps(evt, ensure_ascii=False, default=str)}\n\n"
         finally:
             with _STREAM_STOP_LOCK:
-                # RV MEDIUM（2026-07-03再検証）: 登録されている Event が「自分がここで作った Event と
+                # 登録されている Event が「自分がここで作った Event と
                 # 同一オブジェクト」の場合のみ pop する（`is` で同一性判定）。上の重複拒否で通常は
                 # あり得ないが、念のための多層防御＝万一何らかの経路で再登録が起きていても、
                 # 無条件 pop で「他人（後発）の登録」を巻き添えに消して停止不能にする事故を防ぐ。
@@ -391,7 +392,7 @@ class ChatStreamStopReq(BaseModel):
 
 @chat_router.post("/chat/stream/stop", tags=["チャット"])
 def chat_stream_stop(req: ChatStreamStopReq, request: Request):
-    """UI フィードバック1: ストリーミング中のチャットを途中停止する（本人のストリームのみ）。
+    """ストリーミング中のチャットを途中停止する（本人のストリームのみ）。
 
     対応する `stream_id` が見つからない/既に完了している/他人のストリームの場合も `{"ok": false}` を
     返すだけでエラーにしない（クリック競合・二重送信・タイミングのずれで普通に起こり得るため）。
@@ -471,6 +472,13 @@ def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str
     try:
         headline = f"エラーが発生しました（{type(exc).__name__}）。もう一度お試しください。"
         env = {"lens": "chat", "headline": headline, "summary": {"total": 0}, "data": {}, "sources": []}
+        # STAT-3 T3: provider.run() が通信例外で落ちてこの honest failure 文言になった経路——
+        # 例外の型だけで timeout／transport_error を判別する（`_finalize` を経由しない独立した
+        # envelope のため `stop_kind_mod.resolve` ではなく `from_exception` を直接使う）。それ以外の
+        # 例外型は `stop_kind` を立てず NULL のままにする（過去データと同じ「欠落は許容」の扱い）。
+        _crash_stop_kind = stop_kind_mod.from_exception(exc)
+        if _crash_stop_kind:
+            env["stop_kind"] = _crash_stop_kind
         saved_assistant = store.add_message(conversation_id, "assistant", headline, lens="chat",
                                             answer=env, personal=user_msg_personal)
         assistant_msg_id = saved_assistant["id"]
@@ -495,18 +503,18 @@ def _turn_run_fn(message: str, world: str, uid: str,
                  depth_profile: str = "standard", tools: dict | None = None,
                  tools_availability: dict | None = None,
                  provider=None, settings: dict | None = None, sys_settings: dict | None = None):
-    """バックグラウンド実行本体を作る（conversation_id 確定後に呼ばれるファクトリ・MEDIUM Codex RV
-    修正で予約方式になったため、`chat_turns.start_turn` の `run_fn_factory` として渡す）。
+    """バックグラウンド実行本体を作る（conversation_id 確定後に呼ばれるファクトリ・予約方式のため
+    `chat_turns.start_turn` の `run_fn_factory` として渡す）。
     `/chat/stream` の `gen()` と**同一の呼び分け**（knowledge の有無で neo4j_session の要否が変わる）
     をそのまま踏襲する。
-    `web_search`（WEB-1・既定 False）は `ChatReq.web_search` をそのまま転送する。
-    `depth_profile`（SC-6c・既定 "standard"）は `ChatReq.depth_profile` をそのまま転送する。
-    `tools`（SC-6e・既定 None＝全ON）は `ChatReq.tools` をそのまま転送する。
-    `tools_availability`（SC-6e・既定 `None`）: 呼び出し元（`chat_turns_start`）が受付時の422判定
+    `web_search`（既定 False）は `ChatReq.web_search` をそのまま転送する。
+    `depth_profile`（既定 "standard"）は `ChatReq.depth_profile` をそのまま転送する。
+    `tools`（既定 None＝全ON）は `ChatReq.tools` をそのまま転送する。
+    `tools_availability`（既定 `None`）: 呼び出し元（`chat_turns_start`）が受付時の422判定
     （`_validate_tools_availability`）と同時に計算した snapshot をそのまま転送する——背景実行は
     `POST /chat/turns` 応答後さらに時間が空きうるため、ここで独自に再取得すると受付時からの
     可用性の変化を拾ってしまい、明示 ON のツールが黙って無効化される窓が広がる。
-    `provider`/`settings`/`sys_settings`（SC-6e・既定 `None`）: 呼び出し元（`chat_turns_start`）が
+    `provider`/`settings`/`sys_settings`（既定 `None`）: 呼び出し元（`chat_turns_start`）が
     受付段階（`_prepare_agentic_snapshot`）で組み立てた同一の Provider/設定スナップショットを
     そのまま `stream_message` へ転送する（`tools_availability` と同じ理由）。
     """
@@ -565,14 +573,14 @@ def chat_turns_start(req: ChatReq, request: Request):
     （途中からでも cursor で replay→追従）。同時実行数の上限（既定 1ユーザー2・全体8＝`SHERPA_CHAT_MAX_TURNS_PER_USER`／`SHERPA_CHAT_MAX_TURNS_GLOBAL`・
     管理画面「システム管理」の「同時実行の上限」で上書き可＝`chat_turns.effective_limits()` が
     ターン受付のたびに解決する）を超えると 429
-    （MEDIUM・Codex RV 修正: 予約方式＝上限判定と枠の登録が atomic なので、429 のときは会話が
+    （予約方式＝上限判定と枠の登録が atomic なので、429 のときは会話が
     一切作られない）。
     """
     u = _current_user(request)
     _check_chat_write(u, req.conversation_id)
     uid = u["uid"]
     w = _resolve_world(req.world)
-    # SC-6e: settings を一度だけ読み、knowledge の実効値（Codex構成は常にON・多層防御）と
+    # settings を一度だけ読み、knowledge の実効値（Codex構成は常にON・多層防御）と
     # Provider を同じスナップショットから準備する。接続先検証（I/O-free）→可用性チェック
     # （ES/Neo4j）の順で行い、受付（422判定）と背景実行本体（_turn_run_fn）へ同じ
     # Provider/settings/snapshot を渡す——背景実行は POST 応答後さらに時間が空きうるため、
@@ -582,13 +590,13 @@ def chat_turns_start(req: ChatReq, request: Request):
         uid, req.knowledge, req.web_search)
     if knowledge:
         validated_scope(w, req.scope_paths)               # 実在 world のみ＋scope 検証（開始前に弾く）
-        _validate_tools_availability(req.tools, availability=tools_availability)   # SC-6e: 明示ON指定の不達ツールは422（ツール名つき）
+        _validate_tools_availability(req.tools, availability=tools_availability)   # 明示ON指定の不達ツールは422（ツール名つき）
 
     def _make_conversation() -> int:
         # `chat_turns.start_turn` が枠を予約した**後**・lock の**外**で呼ばれる（DB I/O をロック
         # 保持中に行わない）。`_ensure_conversation` は chat_service の既存ヘルパーそのもの
         # （挙動・実装ともに変更なし）。会話タイトルはスラッシュ接頭辞除去後の本文を使う
-        # （RV1 #10・`/chat`・`/chat/stream` は `stream_message`/`handle_message` 内の
+        # （`/chat`・`/chat/stream` は `stream_message`/`handle_message` 内の
         # `_resolve_lens` が既に除去済みの本文でタイトルを作るため、ここだけ raw な
         # `req.message` を使うと `/影響 ...` がそのままタイトルに残ってしまっていた）。
         _, title_message = _extract_slash_lens(req.message)

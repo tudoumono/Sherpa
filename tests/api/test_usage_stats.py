@@ -660,6 +660,73 @@ def test_usage_stats_providers_usage_from_chat_turn_audit_includes_stopped():
     assert after - before == 3, "stopped ターンが母数から漏れている、または集計が誤り"
 
 
+def _turn_with_stop_kind(cid, user_text: str, *, lens: str, stop_kind: str | None):
+    """STAT-3 S3: assistant answer.stop_kind を明示指定する（`stop_kind=None` は列自体を持たない
+    旧データ/未計測経路を模す＝集計側で 'unknown' に畳み込まれることを確認する用）。"""
+    store.add_message(cid, "user", user_text)
+    answer = {"stop_kind": stop_kind} if stop_kind is not None else {}
+    store.add_message(cid, "assistant", f"({lens})への回答", lens=lens, answer=answer)
+
+
+def test_usage_stats_stop_kinds_distribution_and_unknown_fallback():
+    """STAT-3 S3: `messages.answer.stop_kind`（`sherpa/stop_kind.py` の閉じた8値）の分布。
+    NULL（未計測経路・過去データ）は 'unknown' に畳み込む。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgskadm{sfx}", f"UsageSkAdm{sfx}"
+    uid, pw = f"usgsk{sfx}", f"UsageSk{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"statsworldsk{sfx}"
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _stop_kinds_map():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return {row["stop_kind"]: row["turns"] for row in r.json()["stop_kinds"]}
+
+    before = _stop_kinds_map()
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"stopkind-{sfx}")
+    _turn_with_stop_kind(conv["id"], "q1", lens="qa", stop_kind="completed")
+    _turn_with_stop_kind(conv["id"], "q2", lens="qa", stop_kind="budget")
+    _turn_with_stop_kind(conv["id"], "q3", lens="qa", stop_kind="timeout")
+    _turn_with_stop_kind(conv["id"], "q4", lens="qa", stop_kind=None)   # 未計測経路→ unknown
+
+    after = _stop_kinds_map()
+    assert after.get("completed", 0) - before.get("completed", 0) == 1
+    assert after.get("budget", 0) - before.get("budget", 0) == 1
+    assert after.get("timeout", 0) - before.get("timeout", 0) == 1
+    assert after.get("unknown", 0) - before.get("unknown", 0) == 1
+
+
+def test_usage_stats_stopped_turns_counts_chat_turn_audit_with_stopped_true():
+    """STAT-3 S3: `stopped_turns` は利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の
+    件数——停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない（別集計）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgstadm{sfx}", f"UsageStAdm{sfx}"
+    uid, pw = f"usgst{sfx}", f"UsageSt{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _stopped_turns():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return r.json()["stopped_turns"]
+
+    before = _stopped_turns()
+    store.audit(uid, "chat.turn", "conversation", "conv:1", detail={"stopped": True}, outcome="success")
+    store.audit(uid, "chat.turn", "conversation", "conv:1", detail={"stopped": False}, outcome="success")
+    after = _stopped_turns()
+    assert after - before == 1
+
+
 def test_usage_stats_downloads_total_and_daily_from_audit():
     """6. 原本DL数: document.downloaded の期間合計＋日別内訳。delta で確認する。"""
     if not _try_init():
@@ -1196,3 +1263,71 @@ def test_usage_stats_conversation_level_filter_reduces_windowagg_input_rows():
         # dead tuple・古い統計（ANALYZE で書き換えた分布）を後続テストに残さない。
         with psycopg.connect(store._dsn(), autocommit=True) as c:
             c.execute("VACUUM ANALYZE messages")
+
+
+def test_usage_stats_conversation_turns_and_resume_rate():
+    """S4（2026-09-11-利用統計の拡充.md T4）: 会話セッション統計。
+
+    会話3件（user ターン数 1・2・5）を作り、conversation_turns の avg/median/max/p90 と
+    resume_rate（user ターン2回以上×codex_session_id 設定済み÷user ターン2回以上）が
+    期待どおりに算出されることを確認する（分布の定義は store._compute_conversation_turn_stats・
+    tests/unit/test_usage_conversation_turns.py と同じ）。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgadm6{sfx}", f"UsageAdmin6{sfx}"
+    uid, pw = f"usgconv{sfx}", f"UsageConv{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"convworld{sfx}"
+
+    # 1 ターンの会話（resume_rate の分母には入らない）。
+    c1 = store.create_conversation(user_id=uid, world=world)
+    _turn(c1["id"], "1ターン目", lens="chat")
+
+    # 2 ターンの会話・codex_session_id あり（resume_rate の分子に入る）。
+    c2 = store.create_conversation(user_id=uid, world=world)
+    _turn(c2["id"], "2ターン会話-1", lens="chat")
+    _turn(c2["id"], "2ターン会話-2", lens="chat")
+    store.set_session_id(c2["id"], f"sess-{sfx}")
+
+    # 5 ターンの会話・codex_session_id なし（分母に入るが分子には入らない）。
+    c3 = store.create_conversation(user_id=uid, world=world)
+    for i in range(5):
+        _turn(c3["id"], f"5ターン会話-{i}", lens="chat")
+
+    admin = _login(admin_uid, admin_pw)
+    r = admin.get("/admin/usage/stats?days=30")
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    ct = data["conversation_turns"]
+    assert ct["max"] >= 5, "この3会話のうち最大ターン数5が反映されていない"
+    # avg/median/resume_rate は共有 dev DB の残留会話込みの全体集計のため厳密な期待値を固定できない
+    # （他テストが並行して同じ DB に会話を作るため・厳密な avg/median/max/p90/resume_rate の分子分母は
+    # DB 抜きで固定できる tests/unit/test_usage_conversation_turns.py が担当する）。ここでは配線
+    # （3会話が集計に反映され、応答の形が壊れていないこと）だけを確認する。
+    assert ct["avg"] is not None and ct["median"] is not None and ct["p90"] is not None
+    assert data["resume_rate"] is not None
+
+    # 期間外（10日前）に巻き戻した専用会話が days=1 の `users` 集計に混入しないことの配線確認
+    # （`conversation_turns`/`resume_rate` の期間境界は共有 DB では固定できないため
+    # tests/unit/test_usage_conversation_turns.py の純粋関数側で担保する）。
+    admin_uid2, admin_pw2 = f"usgadm7{sfx}", f"UsageAdmin7{sfx}"
+    _mk_user(admin_uid2, admin_pw2, role="admin")
+    stale_uid, stale_pw = f"usgconvstale{sfx}", f"UsageConvStale{sfx}"
+    _mk_user(stale_uid, stale_pw, role="user")
+    c4 = store.create_conversation(user_id=stale_uid, world=world)
+    _turn(c4["id"], "期間外1ターン目", lens="chat")
+    _turn(c4["id"], "期間外2ターン目", lens="chat")
+    store.set_session_id(c4["id"], f"sess-stale-{sfx}")
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET created_at = now() - interval '10 days' "
+                  "WHERE conversation_id=%s", (c4["id"],))
+
+    admin2 = _login(admin_uid2, admin_pw2)
+    r_short = admin2.get("/admin/usage/stats?days=1")
+    assert r_short.status_code == 200, r_short.text
+    users_short = {u["uid"] for u in r_short.json()["users"]}
+    assert stale_uid not in users_short, "10日前の会話が days=1 の集計対象に混入した"

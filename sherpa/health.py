@@ -72,8 +72,8 @@ def _ping_codex() -> None:
 
 
 def _ping_openai() -> None:
-    # RV MED（2026-08-18 Codex RV 2巡目 指摘3）: 以前は `"REPLACE_ME" in key`（部分一致）で、
-    # たまたま "REPLACE_ME" という文字列を含む実キーまで誤って未設定扱いにし得た。判定は
+    # `"REPLACE_ME" in key`（部分一致）だと、
+    # たまたま "REPLACE_ME" という文字列を含む実キーまで誤って未設定扱いにし得る。判定は
     # `agent_constructs.is_real_api_key`（完全一致ベース・provider 選択と共有）に揃える。
     # env を直接読まず `sherpa.keys.resolve_api_key`（中央設定・A7 排他込み）を経由する。
     from . import agent_constructs, keys
@@ -86,7 +86,7 @@ def _aws_credentials_file() -> Path:
 
 
 class _NotApplicable(RuntimeError):
-    """「対象外（未設定/未選択）」の申告用（2026-09-04 実利用フィードバック）。
+    """「対象外（未設定/未選択）」の申告用。
 
     失敗（WARNING・状態画面で赤）と区別する: 使っていないプロバイダを毎回の health check で
     WARNING ログに流すのはノイズで、実障害の行が埋もれる。`_check_one` はこれを ok=True・
@@ -96,7 +96,7 @@ class _NotApplicable(RuntimeError):
 def _ping_bedrock() -> None:
     """**ネットワークに一切出ない**軽量チェック: 中央キー、または SigV4 の静的な手掛かりの**存在**だけを見る。
 
-    Codex RV 指摘（2026-07-02）: 旧実装は `boto3.session.Session().get_credentials()` を呼んでいたが、
+    `boto3.session.Session().get_credentials()` を呼ぶと、
     環境によっては EC2/ECS の instance metadata service（IMDS）への外向き通信を伴いうる＝
     「ネットワークに出ない」の約束を破る。boto3 は一切 import/呼び出しせず、キーの有無と
     `~/.aws/credentials` の存在確認のみに留める（実際に資格情報として有効かどうかまでは確認しない
@@ -107,7 +107,7 @@ def _ping_bedrock() -> None:
     端末に AWS 認証情報が残っているだけで「利用可能」と誤判定しない。
     """
     from . import keys, store
-    # RV 4巡目 #7: A7 判定とキー解決を同じスナップショットで行う（別々に読み直すと、途中の
+    # A7 判定とキー解決を同じスナップショットで行う（別々に読み直すと、途中の
     # admin 更新で「選択中」と「キーあり」の判定が食い違う窓ができる）。
     sys_s = store.get_system_settings()
     if keys.selected_cloud_provider(sys_s) != "bedrock":
@@ -125,10 +125,10 @@ def _ping_bedrock() -> None:
 def _ping_ollama() -> None:
     # urllib の timeout は socket（接続＋読み取り）単位。read 全体の deadline ではないが、
     # tags 一覧は小さい応答なので実用上十分。
-    # R2a: 直 urlopen ではなく `llm.ollama_url` 経由で URL を組み立てる＝SSRF 宛先ポリシー
+    # 直 urlopen ではなく `llm.ollama_url` 経由で URL を組み立てる＝SSRF 宛先ポリシー
     # （`llm.assert_ollama_url_allowed`）を通す。ブロック時は `SsrfBlocked`（ValueError 派生）が
     # 上がり、`_check_one` の既存 broad except で ok=False の degrade に乗る（例外は落ちない）。
-    # R2a #3（2026-07-14）: `llm.urlopen_no_redirect` 経由にする＝allowlist 通過後の応答が 3xx
+    # `llm.urlopen_no_redirect` 経由にする＝allowlist 通過後の応答が 3xx
     # redirect で allowlist 外へ誘導されても追跡しない（llm.py docstring 参照）。
     # env `OLLAMA_URL` は直接読まない（`sherpa.keys.resolve_ollama_url` が中央設定を見る）。
     from . import keys, llm, store
@@ -279,20 +279,20 @@ def summary(force: bool = False) -> dict:
     return {"status": s["status"], "checked_at": s["checked_at"]}
 
 
-# ---- 管理者の「システム状態」画面専用（AI・実接続確認・2026-07-03） ----
+# ---- 管理者の「システム状態」画面専用（AI・実接続確認） ----
 # 上の _ping_openai/_ping_bedrock/_ping_ollama/_ping_codex は状態ドット（全ページ・全ユーザーから
 # 15秒キャッシュでポーリング）向けの**軽量チェック**（env の有無/バイナリ有無だけ・実際には AI へ
-# 繋がない・per-user 設定のキーは見ない＝上のコメント参照）。この per-user キー未参照が、ユーザーが
-# 設定画面で入れた API キーを使っているのに「システム状態」では未設定/停止に見える原因になっていた
-# （UIフィードバック4「AI チェックが走らない／動いているか分からない」）。ここでは管理者の「再チェック」
-# ボタン専用に、**ログイン中の管理者本人の設定（user_settings）も含めて実際に1回だけ AI へ接続する**
-# （/settings/test と同じ probe を再利用）。gemini は元の COMPONENTS に無かった（実装漏れ）ので追加する。
+# 繋がない・per-user 設定のキーは見ない＝上のコメント参照）。この per-user キー未参照だと、ユーザーが
+# 設定画面で入れた API キーを使っているのに「システム状態」では未設定/停止に見えてしまう。ここでは
+# 管理者の「再チェック」ボタン専用に、**ログイン中の管理者本人の設定（user_settings）も含めて実際に
+# 1回だけ AI へ接続する**（/settings/test と同じ probe を再利用）。gemini は軽量チェックの `COMPONENTS`
+# には無く、この実接続確認の `_AI_COMPONENTS` にだけ含める。
 # 実 API 呼び出しを伴うため、ナビの状態ドット（summary/snapshot）には一切混ぜず、per-uid の別キャッシュ
 # （既定60秒）を持たせて自動ポーリング（30秒間隔）中に実 API 呼び出しを連発しないようにする。
 _AI_TTL = float(os.environ.get("SHERPA_HEALTH_AI_TTL", "60"))
-# RV HIGH（2026-07-03）: 各プローブは実 API 呼び出しのため、複数プロバイダの誰か1つが遅い/無応答だと
+# 各プローブは実 API 呼び出しのため、複数プロバイダの誰か1つが遅い/無応答だと
 # _probe/BedrockProvider.probe の既定タイムアウト（抽出用90s・SDK既定は数分オーダー）まで待たされ、
-# 直列実行だと /admin/health 全体が最悪数分ブロックしていた。ここは「再チェック」ボタンの応答性が
+# 直列実行だと /admin/health 全体が最悪数分ブロックする。ここは「再チェック」ボタンの応答性が
 # 最優先＝短いタイムアウトを明示で渡し、かつ ai_snapshot() 側で全プローブを並列実行＋全体 deadline を設ける。
 _AI_TIMEOUT = float(os.environ.get("SHERPA_HEALTH_AI_TIMEOUT", "8"))
 _AI_DEADLINE = _AI_TIMEOUT + 4.0   # 並列実行のスケジューリング余裕（各プローブは _AI_TIMEOUT で自ら終わるはず）
@@ -306,7 +306,7 @@ def _ai_check_openai(settings: dict, system_settings: dict | None = None) -> Non
     # strict=True: 実 API 呼び出し（課金）を伴う経路のため、`cloud_provider`（A7）が非空の
     # 不正値のとき黙って既定（openai）へ倒れたキーで実送信しない（意図しない課金の是正）。
     key = keys.resolve_api_key("openai", settings, system_settings=system_settings, strict=True)
-    # RV MED（2026-08-18 指摘3）: プレースホルダのまま（.env.example を無編集で有効化した env 等）だと
+    # プレースホルダのまま（.env.example を無編集で有効化した env 等）だと
     # 実 API 呼び出しへ進んで分かりにくい 401 になる。同じ判定を先に通し、正直な文言で早期に返す。
     if not agent_constructs.is_real_api_key(key):
         raise RuntimeError(keys.NO_CENTRAL_KEY_MESSAGE)
@@ -334,9 +334,9 @@ def _ai_check_gemini(settings: dict, system_settings: dict | None = None) -> Non
 
 
 def _ai_check_ollama(settings: dict, system_settings: dict | None = None) -> None:
-    # R2a: per-user 設定の ollama_url も `llm.ollama_url` 経由で構築＝直 urlopen バイパスを閉じる
+    # per-user 設定の ollama_url も `llm.ollama_url` 経由で構築＝直 urlopen バイパスを閉じる
     # （`_ping_ollama` と同じ理由・degrade も同様に既存の broad except に乗る）。
-    # R2a #3（2026-07-14）: `llm.urlopen_no_redirect` 経由にする（`_ping_ollama` と同じ理由）。
+    # `llm.urlopen_no_redirect` 経由にする（`_ping_ollama` と同じ理由）。
     # env `OLLAMA_URL` は直接読まない（`sherpa.keys.resolve_ollama_url` が中央設定を見る）。
     from . import keys, llm
     base = keys.resolve_ollama_url(settings, system_settings=system_settings)
@@ -377,7 +377,7 @@ def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None
     # OPENAI_API_KEY（`keys.resolve_api_key("openai")` で解決したキー）で認証する
     # （`providers/codex/sandbox._write_codex_authoring_config` の独自 provider・env_key 方式）。
     # この構成で `codex login status` を判定に使うと常に「未ログイン」＝チャットでは動くのに
-    # テスト画面だけ未接続になる（実環境指摘 2026-09-02）。チャットと同じ認証材料で判定する。
+    # テスト画面だけ未接続になる。チャットと同じ認証材料で判定する。
     from . import llm as _llm
     if _llm.openai_endpoint_kind(system_settings) != "openai":
         if keys.resolve_api_key("openai", settings, system_settings=system_settings):
@@ -409,7 +409,7 @@ def ai_snapshot(uid: str, settings: dict, force: bool = False) -> list[dict]:
     """管理者本人の設定を使って AI 各プロバイダへ実接続確認する（システム状態ページの
     「再チェック」専用）。per-uid キャッシュ（既定60秒）＝自動ポーリング中は実 API 呼び出しをしない。
 
-    RV HIGH（2026-07-03）: 直列実行だと遅い/無応答なプロバイダ1つで全体が最悪数分ブロックしていた。
+    直列実行だと遅い/無応答なプロバイダ1つで全体が最悪数分ブロックする。
     ここでは各プローブを ThreadPoolExecutor で並列実行し、全体 deadline（`_AI_DEADLINE`）を超えた
     プローブは「確認できませんでした（タイムアウト）」として打ち切る（各プローブ自身も `_AI_TIMEOUT`
     で自ら終わるはずなので deadline は二重の安全網＝スレッドがハングしてもレスポンス自体は遅延しない）。

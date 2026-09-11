@@ -655,6 +655,47 @@ def test_persist_turn_crash_sets_personal_flag_when_user_row_not_yet_saved():
     assert msgs[1]["personal"] is True
 
 
+def test_persist_turn_crash_sets_stop_kind_timeout_for_timeout_error():
+    """STAT-3 T3: `TimeoutError` で落ちたクラッシュ永続は `answer.stop_kind == "timeout"`
+    （型だけで判定・メッセージ本文は見ない・`stop_kind.from_exception` 参照）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-stop-kind-timeout")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "timeout-q", "admin", V, False, TimeoutError("deadline exceeded"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["answer"]["stop_kind"] == "timeout"
+
+
+def test_persist_turn_crash_sets_stop_kind_transport_error_for_os_error():
+    """STAT-3 T3: `OSError`（接続断等）は `stop_kind == "transport_error"`。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-stop-kind-transport")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "transport-q", "admin", V, False, ConnectionResetError("reset"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["answer"]["stop_kind"] == "transport_error"
+
+
+def test_persist_turn_crash_leaves_stop_kind_unset_for_other_exceptions():
+    """STAT-3 T3: timeout/transport_error のいずれでもない例外（`RuntimeError` 等）は
+    `stop_kind` を立てない（NULL のまま＝利用統計側で 'unknown' に畳み込む契約）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-stop-kind-unset")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "other-q", "admin", V, False, RuntimeError("boom"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert "stop_kind" not in assistant["answer"]
+
+
 def test_persist_turn_crash_without_saved_user_id_ignores_stale_same_text_turn():
     """`saved_user_id` が無い（`stream_message` が user 行保存**前**にクラッシュした＝
     on_user_saved が一度も呼ばれなかった）場合、この run は user 行を保存していないことが

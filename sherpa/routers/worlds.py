@@ -55,7 +55,7 @@ from sherpa.grep_tool import valid_world
 from sherpa.ingest import background, failure_reasons
 from sherpa.ingest import worker as ingest_worker
 from sherpa.preview_service import build_preview
-from sherpa.routers.graph import _GRAPH_UNAVAILABLE_MESSAGE   # /ingest/preview も同じ固定文言で503化（RV1是正#6）
+from sherpa.routers.graph import _GRAPH_UNAVAILABLE_MESSAGE   # /ingest/preview も同じ固定文言で503化
 from sherpa.schemas import (
     FsListResponse,
     WorldDiffResponse,
@@ -155,7 +155,7 @@ def _dispatch(wid: str, op: str, fingerprint: str, work_fn, *,
     責務（`_run_locked`／各 `_run_*_background` の `finish_ingest_run` 系）だが、それすら
     果たされなかった想定外のケースは `background.start_or_join` 自身の CAS セーフティネット
     （`store.fail_close_if_extracting`）が拾う——ここでの二重の best-effort 記録は
-    不要になった（旧実装の一発 INSERT フォールバックは撤去）。
+    不要になった。
 
     実行中の run と `op`/`fingerprint` が不一致なら 409（「別の処理が実行中」の平文）。
     シャットダウン処理中（`background.stop_accepting()` 済み）は 503。
@@ -189,7 +189,7 @@ def ingest_preview(request: Request, world: str | None = Query(None, pattern=_WO
     `build_preview` は world 世代のプローブ（`store.get_world_status_row`）をキャッシュの鍵として
     読む（`preview_service._get_graph_bundle`・`/graph` の `graph_view` と共有する仕組み）——ここが
     失敗（DB 不調等）した場合は握り潰さずログ付き 503 にする（`/graph` と同じ固定文言・silent
-    degradation なしの家風どおり・RV1是正#6・`sherpa/routers/graph.py::graph_get` 参照）。
+    degradation なしの家風どおり・`sherpa/routers/graph.py::graph_get` 参照）。
     """
     _require_admin(_current_user(request))
     wid = _resolve_world(world)
@@ -345,7 +345,7 @@ def _ingest_summary(wid: str, row: dict) -> dict:
         counts_as_of = None
     last = store.get_latest_run_summary(wid)
     snap = (last or {}).get("extraction_snapshot")
-    snap = snap if isinstance(snap, dict) else {}    # JSONB は dict 以外もありうる（RV Low・500 にしない）
+    snap = snap if isinstance(snap, dict) else {}    # JSONB は dict 以外もありうる（500 にしない）
     flags_all = snap.get("flags") or []
     flags_total = len(flags_all)
     flags_truncated = flags_total > _STATUS_FLAGS_LIMIT
@@ -932,7 +932,7 @@ def world_delete(wid: str, request: Request):
         world_admin_service.ensure_registered(wid)   # 監査を書く前に 404/422 を確定させる
     except world_admin_service.WorldAdminError as exc:
         raise _world_admin_http_error(exc) from exc
-    # RV HIGH: 破壊的削除は fail-closed の pre-event を先に記録（記録できなければ削除しない）。
+    # 破壊的削除は fail-closed の pre-event を先に記録（記録できなければ削除しない）。
     try:
         store.audit(u["uid"] if u else None, "world.delete_requested", "world", f"world:{wid}",
                     outcome="success", severity="critical")

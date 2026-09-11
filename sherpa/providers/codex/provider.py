@@ -1,65 +1,44 @@
-"""`CodexProvider`（リファクタリング計画 フェーズ5 S10・`sherpa/agents.py` から純移動・exec 核）。
+"""`CodexProvider`（`sherpa/agents.py` から re-export される exec 核）。
 
 Codex CLI サブプロセスの起動・思考イベントへの変換・実行ごとの作業領域管理・headline/progress 判定など、
 Codex(gpt-5.5) を頭脳にする実行本体一式をまとめる。`sherpa/agents.py` が facade として本モジュール
 から再エクスポートするため、まだ agents.py に残る `_select_provider`/`get_provider`/`provider_info`
 （`AGENT_PROVIDERS`・`_UnwiredProvider` も同様）は無改修で動く。
 
-移動した13名: `_humanize_cmd`・`_usage_from_turn_completed`・`_killpg`・`_spawn_stop_watcher`・
-`_LAST_MESSAGE_MAX_BYTES`・`_read_last_message_fallback`・`_PROGRESS_VERBS`・`_PROGRESS_END_RE`・
-`_PROGRESS_MARKERS`・`_is_progress_only`・`_trim_trailing_progress`・`_pick_codex_headline`・
-`CodexProvider`。
+**同時実行は uid 単位で直列化しない**: 実行ごとに専用の作業領域（`sandbox._safe_run_authoring` の
+`authoring/run-<乱数>`）を割り当てるため、同一 uid の複数実行が snapshot・files/ move・
+`.agents` rebuild で交差する心配が無い。同時実行数はチャットの受付上限（`chat_turns` 側・別契約）
+だけで決まる。
 
-**同一 uid 直列化 lock の撤去**: `_AUTHORING_LOCKS`・`_AUTHORING_LOCKS_GUARD`・`_authoring_lock`・
-`CodexProvider._busy_run`（S10 純移動時点では存在した）は、実行ごとに専用の作業領域
-（`sandbox._safe_run_authoring` の `authoring/run-<乱数>`）を割り当てる方式に置き換えたため撤去した
-（同一 uid の複数実行が snapshot・files/ move・`.agents` rebuild で交差する心配が無くなり、
-直列化 lock 自体が不要になった）。同時実行数はチャットの受付上限（`chat_turns` 側・別契約）だけで決まる。
+**`CodexProvider.run`/`_run_authoring` は分割しない**: SSE 生成器の try/finally が唯一の
+クリーンアップ保証（`run_dir` 後始末＝`_run_authoring` 本体を包む frame・attempt ループの finally＝
+`_killpg`→`proc.wait(5)`・その外側の finally＝非永続セッションのみ `shutil.rmtree(codex_home)`／
+永続セッションは `config.toml`・`auth.json` の削除）のため、関数を丸ごと移し生成器フレームを
+分割するヘルパ抽出はしない。`'ws_authoring' in dir()`（台帳登録ゲート・フレーム内省が必要）、
+last-message tempfile の `unlink` 2箇所（ask_user 早期 return・通常経路）もこの制約に従う。
 
-**危険地雷2〜5（計画書フェーズ5節）を1コミットで解消**: `CodexProvider.run`/`_run_authoring` は
-SSE 生成器の try/finally が唯一のクリーンアップ保証（`run_dir` 後始末＝`_run_authoring` 本体を包む
-frame・Popen ループの finally＝`_killpg`→`proc.wait(5)`→`shutil.rmtree(codex_home)`）
-のため、関数を丸ごと移し生成器フレームを分割するヘルパ抽出は行っていない。
-`'ws_authoring' in dir()`（台帳登録ゲート・フレーム内省なので無改修で移す必要がある）、
-last-message tempfile の `unlink` 2箇所（ask_user 早期 return・通常経路）も元コードのまま保持した。
+**本モジュールは `sherpa` から2階層深い（providers→codex）**ため、パスの `parents[N]` は
+agents.py 基準の N から +2 する（`sherpa/` 配下基準＝`parents[2]`・`_SKILLS_BASE`／repo root 基準＝
+`parents[3]`・`sandbox.py` docstring 参照）。相対 import も
+`from ... import marp_render`／`from ... import store as _store`／
+`from ... import codex_agents_md, codex_skills` になる（参照先は変わらず
+`sherpa.marp_render`/`sherpa.store`/`sherpa.codex_agents_md`/`sherpa.codex_skills`）。
 
-**相対 import の深さ調整（純移動の範囲内・S3〜S9 と同じ判断）**: `_plain_text` 内の
-`from . import chat_router`・`_run_authoring` 内の `from . import marp_render`・
-`from . import store as _store` は、本モジュールが `sherpa` から2階層深い（providers→codex）ため
-`from ... import chat_router`／`from ... import marp_render`／`from ... import store as _store` に
-変更した（参照先は変わらず `sherpa.chat_router`/`sherpa.marp_render`/`sherpa.store`）。
-`codex_agents_md`/`codex_skills`（`_run_authoring` 内で `codex_agents_md.write_agents_md(...)`・
-`codex_skills.deploy_skills(...)` として使う module import）は `from ... import codex_agents_md,
-codex_skills` として移した。
-
-**明示変更(a)：`skills_base`（危険地雷1の5番目・`tests/unit/test_agents_surface.py` が S1 時点で
-pin を保留していた最後の1値）**: `_run_authoring` 内の marp テーマ探索が使っていた
-`Path(__file__).resolve().parent`（agents.py 基準＝`<repo>/sherpa` を指す）は、本モジュールへの
-移動で黙って `<repo>/sherpa/providers/codex` を指してしまう（`.resolve().parent` は「1段上」
-＝`parents[0]` であり、`parents[N]` のような index 表記ではないため見落としやすい）。
-モジュール定数 `_SKILLS_BASE = Path(__file__).resolve().parents[2] / "skills_base"` を新設し
-（本モジュールは `sherpa` から2階層深いため `parents[2]` で `<repo>/sherpa/skills_base` に戻る＝
-他の4値が `parents[1]`→`parents[3]` になったのと同じ「+2」シフト）、`_run_authoring` はこの
-定数を参照するだけに直した。`tests/unit/test_agents_surface.py` に `_SKILLS_BASE` の pin テストを
-追加した（S1 で「`_run_authoring` の巨大な生成器フレーム内でしか評価できず単体で pin できない」
-としていた除外を、定数化により回収）。
-
-**明示変更(b)：`_gather` の facade 実行時解決（危険な継ぎ目・計画書「危険な継ぎ目」節）**:
-`tests/unit/test_agents_seams.py`・`tests/unit/test_agents_author.py::
+**`_gather` は `_run_authoring` 内でのみ遅延 import する**（危険な継ぎ目）: `tests/unit/
+test_agents_seams.py`・`tests/unit/test_agents_author.py::
 test_gather_seam_intercepted_by_codex_provider` 等が `agents._gather` を monkeypatch して
 `CodexProvider().run()`（→`_run_authoring`）経由の介入を検証する。本モジュールは agents.py が
 facade re-export のためモジュールレベルで import するため、逆にモジュールレベルで
-`from sherpa import agents` すると循環 import になる（base.py の `_gather` 継ぎ目・S8 の
-`_mcp_env`/`_toml_str` と同じ理由）。そのため `_run_authoring` 内でのみ関数内 遅延 import
-`from sherpa import agents as _facade` して `_facade._gather(ctx)` と実行時解決する。
+`from sherpa import agents` すると循環 import になる。そのため `_run_authoring` 内でのみ関数内
+遅延 import `from sherpa import agents as _facade` して `_facade._gather(ctx)` と実行時解決する。
 `CodexProvider.run`/`_run_authoring` が呼ぶ `_plain_run`・`_node`・`.sandbox` の各関数等、本モジュール内の
 他の呼び出しは直接（`_plain_run`/`_node`/`_usage_meta`は base.py から直接 import）でよい
-（危険な継ぎ目リストに無い・S3〜S9 の教訓と同じ判断）。
+（危険な継ぎ目リストに無い）。
 
 依存: `..base`（`Provider`/`Ctx`/`_log`/`_node`/`_plain_run`/`_usage_meta`）・`..prompts`
 （`_facts`/`_kb_hint_abs`）・同一パッケージの `.sandbox`（サンドボックス/Marp バイナリ検出/
 web_search 引数/authoring config 書込み）・`.mcp`（MCP env/config/neighbors/ask_user 変換）は
-兄弟モジュールとして直接 import する（危険な継ぎ目リストに無い＝S3〜S9 の教訓#7・#12 と同じ判断）。
+兄弟モジュールとして直接 import する（危険な継ぎ目リストに無い）。
 """
 from __future__ import annotations
 
@@ -154,7 +133,7 @@ def _masked_run_dir_path(fp: str, run_dir: Path) -> str:
 
 def _usage_from_turn_completed(event: dict, model: str | None, *, codex_model_provider: str | None = None,
                                system_settings: dict | None = None) -> dict | None:
-    """Codex `codex exec --json` の `turn.completed` イベントから usage を取り出す（F3）。
+    """Codex `codex exec --json` の `turn.completed` イベントから usage を取り出す。
 
     実ログ形: `{"type":"turn.completed","usage":{"input_tokens":..,"cached_input_tokens":..,
     "output_tokens":..,"reasoning_output_tokens":..}}`。usage が無い/型不正なら None（best-effort）。
@@ -191,7 +170,7 @@ def _accumulate_codex_usage(prev: dict | None, new: dict | None) -> dict | None:
 
 
 def _killpg(proc) -> None:
-    """RV MEDIUM: MCP subprocess / shell child まで確実に殺す（creds env の寿命を延ばさない）。"""
+    """MCP subprocess / shell child まで確実に殺す（creds env の寿命を延ばさない）。"""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except Exception:
@@ -202,7 +181,7 @@ def _killpg(proc) -> None:
 
 
 def _spawn_stop_watcher(proc, stop_event) -> "threading.Thread":
-    """UI フィードバック1（途中停止・2026-07-03）: `for line in proc.stdout` はブロッキング read のため、
+    """途中停止: `for line in proc.stdout` はブロッキング read のため、
     `stop_event` を単にチェックするだけでは（次の行が来るまで）反応できない。別スレッドで stop_event を
     監視し、立ったら即 `_killpg` で子プロセスごと殺す＝stdout を EOF にしてブロック中の read を
     即座に解放する（サブプロセスを安全に打ち切る唯一の確実な方法・EventSource.close() はサーバ側の
@@ -222,15 +201,15 @@ def _spawn_stop_watcher(proc, stop_event) -> "threading.Thread":
     return t
 
 
-_LAST_MESSAGE_MAX_BYTES = 256 * 1024   # RV MEDIUM: 最終メッセージの保険読取は上限付き（256KB）
+_LAST_MESSAGE_MAX_BYTES = 256 * 1024   # 最終メッセージの保険読取は上限付き（256KB）
 
 
 def _read_last_message_fallback(path: Path) -> str | None:
-    """Phase0・§3: `-o <path>` で Codex が書く最終メッセージファイルを読む（`--json` の
+    """§3: `-o <path>` で Codex が書く最終メッセージファイルを読む（`--json` の
     `agent_message` 抽出が空だった時の保険）。無い/空/読取失敗は None（呼び出し側は既存の
     決定的回答フォールバックへ委ねる）。ファイルの削除は呼び出し側の責務（ここでは行わない）。
 
-    RV MEDIUM（2026-07-03）: `.tmp/` は authoring 配下（Codex の書込対象）＝サブプロセスや将来の
+    `.tmp/` は authoring 配下（Codex の書込対象）＝サブプロセスや将来の
     変更で symlink が紛れ込む余地を否定できないため、`O_NOFOLLOW` で symlink を拒否（TOCTOU の無い
     アトミックな判定）・通常ファイルのみ・サイズ上限つきで読む（巨大ファイル/デバイスファイル等を
     誤って answer に取り込まない）。
@@ -253,7 +232,7 @@ def _read_last_message_fallback(path: Path) -> str | None:
     return txt or None
 
 
-# ---- F4（2026-07-07）: 回答 headline の選び方（進行中の作業宣言を見出しにしない）----
+# ---- 回答 headline の選び方（進行中の作業宣言を見出しにしない）----
 # Codex は調査中に「これから〜する」という進行形の作業宣言を agent_message として複数回出すことがあり、
 # run が途中終了すると **最後に届いた作業宣言**（実例:「…根拠の有無を切り分けます」）が
 # env["headline"] になってしまう（結論でなく本文途中の一文が見出しに出る）。LLM を使わず決定的に、
@@ -268,7 +247,7 @@ _PROGRESS_VERBS = (
 )
 _PROGRESS_END_RE = re.compile(
     "(?:" + "|".join(map(re.escape, _PROGRESS_VERBS)) + r")[。.!！\s]*$")
-# High-1（RV・2026-07-07）: 語尾が作業宣言でも「単文の事実記述」（例:「NIGHTLY は税率マスタを起動時に
+# 語尾が作業宣言でも「単文の事実記述」（例:「NIGHTLY は税率マスタを起動時に
 # 確認します。」）を progress と誤判定して結論を捨てないよう、判定を絞る。手順マーカー（これから何をやる、
 # という順序表現）で始まる文は明確に作業宣言。
 _PROGRESS_MARKERS = (
@@ -323,7 +302,7 @@ def _trim_trailing_progress(text: str) -> str:
 
 
 def _pick_codex_headline(completed: list[str], partial: str = "") -> str:
-    """F4: 集めた複数の agent_message から headline を決定的に選ぶ（LLM 不使用）。
+    """集めた複数の agent_message から headline を決定的に選ぶ（LLM 不使用）。
 
     ①結論を含む最後の message を優先（末尾が作業宣言でも、その中の結論／それ以前の結論を拾う）。
     ②その message の末尾に連なる作業宣言文は落とす（`_trim_trailing_progress`）。
@@ -494,7 +473,7 @@ class CodexProvider(Provider):
     Codex の **実コマンド実行（grep 等）・推論・回答**を `--json` から拾い **1つずつ思考ノードに流す**
     （ユーザは Codex の作業を逐次見られる）。失敗/未導入は決定的回答にフォールバック。
     既定 reasoning=low（`SHERPA_CODEX_REASONING` で変更可。RV依頼の xhigh とは別運用）。
-    調べる深さ（調べ方ブロック §3.2・SC-6c）が「深く」「最大」のとき、ターンごとに high/xhigh へ
+    調べる深さ（調べ方ブロック §3.2）が「深く」「最大」のとき、ターンごとに high/xhigh へ
     per-turn 上書きする（`_prompt_mcp`/`_prompt` 呼び出し直前の `_reason` 計算箇所を参照）。
     """
     label, model = "Codex", "gpt-5.5"
@@ -508,7 +487,7 @@ class CodexProvider(Provider):
         # 先頭ハイフン/空白/制御文字/過大長は弾く（flag 混同・不正値の防止）。
         # `model_catalog.CODEX_MODEL_NAME_RE` を使う（`sherpa/model_catalog.py::validate_catalog` が
         # 管理者カタログへ課す文法と同じパターン＝管理画面で保存できるモデル名と揃える）。
-        # 重大バグ是正（RV 3巡目 #9）: 未指定（None/空文字）だけを既定 "gpt-5.5" へ解決する。
+        # 未指定（None/空文字）だけを既定 "gpt-5.5" へ解決する。
         # **不正な非空値**（grandfather された旧値・破損 DB・接続確認の直接入力等）は黙って
         # 別モデルへ置換しない＝ honest failure として `InvalidModelNameError`（`ValueError` の
         # サブクラス）を送出する（呼び出し側 `sherpa/providers/__init__.py::_select_provider` が
@@ -517,7 +496,7 @@ class CodexProvider(Provider):
         if model and not model_catalog.CODEX_MODEL_NAME_RE.fullmatch(model):
             raise model_catalog.InvalidModelNameError(f"不正な Codex モデル名です: {model!r}")
         self.model = model or "gpt-5.5"
-        # Phase0・§5-1: ユーザーの希望（設定 codex_web_search）。実際に効くかは管理者フラグ次第
+        # §5-1: ユーザーの希望（設定 codex_web_search）。実際に効くかは管理者フラグ次第
         # （_web_search_disabled_value が admin 許可と AND する）。
         self._web_search = bool(web_search)
         # Codex(Ollama) 構成（`agent_constructs`）のとき、Codex CLI を Ollama へ向ける接続先。
@@ -525,7 +504,7 @@ class CodexProvider(Provider):
         # 値は `providers/__init__.py::_select_provider` が SSRF ガード（llm.assert_ollama_url_allowed）
         # を通してから渡す＝ここでは検証済みの前提。
         self._ollama_base_url = ollama_base_url or None
-        # S2（Azure OpenAI 対応・2026-08-18）: Codex(OpenAI) 構成で、接続先が既定(api.openai.com)以外
+        # Codex(OpenAI) 構成で、接続先が既定(api.openai.com)以外
         # （Azure 等）にリダイレクトされている時**だけ** `_select_provider` が解決して渡す（それ以外は
         # 常に None のまま＝既定の Codex(OpenAI)・Codex(Ollama) は無改修・回帰ゼロ）。カスタム
         # model_provider（`sandbox._openai_compat_provider_lines`）は `env_key` で子プロセスの env から
@@ -537,12 +516,12 @@ class CodexProvider(Provider):
         # （`_web_search_endpoint_note`）へもそのまま渡す。省略時（`None`）は従来どおり呼び出しごとに
         # `llm.py` が都度読み直す。
         self._system_settings = system_settings
-        # R1a: 既定は空（`run()` を経由せず `_prompt`/`_prompt_mcp` を直接叩くテスト向けの安全な
+        # 既定は空（`run()` を経由せず `_prompt`/`_prompt_mcp` を直接叩くテスト向けの安全な
         # フォールバック・`_history` は `run()` 冒頭で `ctx.history` から設定し直される）。
         self._history: list = []
 
     def _history_block(self) -> str:
-        """R1a（会話継続）: 直前ターンの履歴を Codex プロンプトへ前置するテキスト。
+        """直前ターンの履歴を Codex プロンプトへ前置するテキスト（会話継続）。
 
         `self._history` が空なら空文字列を返す＝呼び出し側の出力は従来と完全同一になる。
         """
@@ -554,9 +533,9 @@ class CodexProvider(Provider):
 
     def _prompt(self, message, lens, env, world):
         sys = (self.system_prompt + "\n\n") if self.system_prompt else ""   # 回答方針（#2）を前置
-        # MEDIUM-1 fix: cwd が workspace/authoring/ のため KB パスは絶対パスで渡す。
-        # Phase0・§2: 出典列挙/文体等の共通ルールは AGENTS.md へ移した（質問固有部分のみここに残す）。
-        # RV HIGH（2026-07-03）: ただし containment/grounding（KB 以外を読まない・確定と推定を分ける）は
+        # cwd が workspace/authoring/ のため KB パスは絶対パスで渡す。
+        # §2: 出典列挙/文体等の共通ルールは AGENTS.md へ移した（質問固有部分のみここに残す）。
+        # ただし containment/grounding（KB 以外を読まない・確定と推定を分ける）は
         # AGENTS.md 書込失敗時（fail-open）でも消えないよう、短縮形をここにも常置する（多層防御・
         # AGENTS.md と重複しても害はない＝独立性を優先）。
         # 探す対象（層フィルタ）が限定されているターンは、この直接 grep 経路（MCP 無効時）自体を
@@ -570,7 +549,7 @@ class CodexProvider(Provider):
             "**指定資料フォルダ以外は読まない。確定した事実と推定は分けて書く**（詳細ルールは AGENTS.md）。"
             "**途中経過だけの応答（「次に〜を調べます」など）で終えない。調査を最後まで進めてから、"
             "結論と根拠を最終回答として書く。**"
-            # S2（提案書 Codex原本直読 §2-5）: この経路（MCP 無効・直接 grep/ファイル参照）で読んだ資料も
+            # この経路（MCP 無効・直接 grep/ファイル参照）で読んだ資料も
             # 同様に、回答末尾の固定書式で Sherpa（citations.parse_referenced_doc_lines）に出典（原本DL）へ
             # 変換させる。
             "回答の最後に『参照した資料:』の行を置き、実際に開いて根拠にした資料を1行1件、"
@@ -578,25 +557,25 @@ class CodexProvider(Provider):
             "Sherpaがこれを出典（原本ダウンロード）に変換する。"
         )
         if lens == "author":
-            # P1-c（Codex 強化計画 Phase1）: author は回答でなく成果物ファイルを作る。
+            # author は回答でなく成果物ファイルを作る。
             return sys + base + (
                 "調べた内容を根拠に、**成果物ファイルをこのディレクトリ（authoring 直下）に作成してください**。"
                 "Excel/Word/PowerPoint 等を作る場合は `.agents/skills` 配下のスキル（xlsx/docx/pptx の"
                 " SKILL.md）を確認して活用する。下の『参考（構造化済みの事実）』は補助に使ってよいが、"
-                "件数・対象名は事実のまま。最後に**作成したファイル名**と**内容の要約（2〜4文）**を"
+                "件数・対象名は事実のまま。最後に**作成したファイル名**と**内容の要約**を"
                 "日本語で報告してください。\n\n"
-                # R1a: 履歴があれば【依頼】の前に前置（空文字なら従来と完全同一の出力）。
+                # 履歴があれば【依頼】の前に前置（空文字なら従来と完全同一の出力）。
                 f"{self._history_block()}【依頼】{message}\n【参考（構造化済みの事実）】{_facts(lens, env)}")
         return sys + base + (
             "ユーザの質問に答えてください。"
             "下の『参考（構造化済みの事実）』は補助に使ってよいが、件数・対象名は事実のまま。\n\n"
-            # R1a: 履歴があれば【質問】の前に前置（空文字なら従来と完全同一の出力）。
+            # 履歴があれば【質問】の前に前置（空文字なら従来と完全同一の出力）。
             f"{self._history_block()}【質問】{message}\n【参考（構造化済みの事実）】{_facts(lens, env)}")
 
     def _prompt_mcp(self, message, lens, world, direct_read: bool = True, layer=None):
-        """MCP 版プロンプト（Phase2b）。事実を前渡しせず、Codex に MCP ツールで自律調査させる。
-        Phase0・§2: 出典列挙/文体等の共通ルールは AGENTS.md へ移した（ここは MCP ツール固有の使い分け
-        ＋ RV HIGH: containment/grounding の短縮形を常置＝AGENTS.md 書込失敗時の多層防御）。
+        """MCP 版プロンプト。事実を前渡しせず、Codex に MCP ツールで自律調査させる。
+        §2: 出典列挙/文体等の共通ルールは AGENTS.md へ移した（ここは MCP ツール固有の使い分け
+        ＋ containment/grounding の短縮形を常置＝AGENTS.md 書込失敗時の多層防御）。
 
         `direct_read`（既定 True・提案書 2026-09-10-Codex原本直読と調査スキル §2-4）: 原本直読
         （permission profile で KB／派生ルートを read し、範囲は兄弟 deny・秘匿は個別 deny で表したうえで
@@ -607,7 +586,7 @@ class CodexProvider(Provider):
         _read_block = (
             "**原本は直接読んでよい（読取専用・指定された資料フォルダと派生フォルダの中だけ・"
             "秘匿名のファイル（.env／鍵／credentials 等）は読まない）。"
-            # S3b（提案書2026-09-10 §2-9）: 主従は決めない——「まず読取ツールで原本を読む→
+            # 主従は決めない——「まず読取ツールで原本を読む→
             # 突合・集計など定型外だけ Python」の順。毎回 Python を書かせない＝トークンと
             # 実行時間を削り、再現性を上げる。
             "まず読取ツール（xlsx_sheets／xlsx_range／docx_paragraphs／pptx_slides／"
@@ -615,13 +594,13 @@ class CodexProvider(Provider):
             "だけ Python（openpyxl・python-docx・python-pptx・pdfplumber。集計は pandas）"
             "で開く。テキスト・コードはそのまま読んでよい。"
             "派生 MD／rag.md は補助。台帳・検索・グラフ・出典の確定は MCP ツールで行う。"
-            # S2（提案書 Codex原本直読 §2-5）: 直読した資料は MCP の結果に載らず出典（原本DL）に
+            # 直読した資料は MCP の結果に載らず出典（原本DL）に
             # 自動では出ない——回答末尾に固定書式の行を書かせ、Sherpa（citations.parse_referenced_doc_lines）
             # が台帳で実在確認したものだけ出典へ昇格する。
             "回答の最後に『参照した資料:』の行を置き、実際に開いて根拠にした資料を1行1件、"
             "資料フォルダからの相対パス（例 `4期更改/02_設計/xxx.xlsx`）で列挙する。"
             "Sherpaがこれを出典（原本ダウンロード）に変換する。派生MD／rag.mdを見た場合も原本のパスで書く。**"
-            # S3（提案書 Codex原本直読 §2-6）: 質問の型に合う調査スキルへ誘導する（「まずツールで
+            # 質問の型に合う調査スキルへ誘導する（「まずツールで
             # 当たりを付ける→原本の中身を確かめる」の順を具体化した手順書。読ませても直読不許可の
             # ターン（direct_read=False）ではノイズ＝else 側には入れない）。
             "**質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う"
@@ -663,7 +642,7 @@ class CodexProvider(Provider):
             "中断（利用者停止・通信エラー・予算到達）のときは確認済み／未確認／理由を分けて書き、"
             "部分結果を「全件」と断定しない。"
             "原因の手がかりや関連部品（呼び出し/コピー/参照/関連文書）をたどるときは graph_neighbors を使う。"
-            # F1（2026-07-07）: 影響を問う質問の分解の型。表層の症状語で検索を乱発させず、変更対象と
+            # 影響を問う質問の分解の型。表層の症状語で検索を乱発させず、変更対象と
             # 影響先の「接続（経路）」の有無を根拠に答えさせる。
             "**影響を問う質問（「〜を変えたら」「〜に影響ある？」「〜が落ちる？」など）では、"
             "①変更対象（例: 税率）に依存する部品・記述を特定 → ②影響先（例: 夜間バッチ＝JCL/ジョブ）を特定 → "
@@ -677,8 +656,8 @@ class CodexProvider(Provider):
             "内部のエッジ名は本文に出さない）。"
             "質問中の症状表現（落ちる/止まる/エラー/停止 等）をそのまま検索語にしない**"
             "（原因調査＝トラブルシュートだと明示された時のみ症状語で探してよい）。"
-            # S2: ask_user の使用条件（agentic と同じ制約）＋乱用ガード（確認ID 付きは再質問しない・1回まで）。
-            # F2（2026-07-07）: 発動基準を具体化（lens 別の例）＋ユーザー主導の確認要求を確実な発動手段にする。
+            # ask_user の使用条件（agentic と同じ制約）＋乱用ガード（確認ID 付きは再質問しない・1回まで）。
+            # 発動基準を具体化（lens 別の例）＋ユーザー主導の確認要求を確実な発動手段にする。
             "調査範囲・目的・選択肢が曖昧で、確認しないと結果が大きく変わる場合だけ ask_user でユーザに確認する"
             "（例: 影響分析で起点や影響先が複数候補に割れるとき、確実な波及が0件で要確認だけになったときは、"
             "対象の絞り込みを ask_user で確認してよい）。"
@@ -686,21 +665,21 @@ class CodexProvider(Provider):
             "調査より先に必ず ask_user で要件を確認してから進める**"
             "（通常はシステムが先に確認カードを出すので、届いた依頼にこの句が残っていて「確認ID:」が"
             "無いときだけ自分で ask_user する）。"
-            "（質問は1実行につき1回まで・質問後は追加調査をせず現状を簡潔に要約して終了する）。"
+            "（質問は1実行につき1回まで・質問後は追加調査をせず、ここまでに確認できたことをまとめて終了する）。"
             "**ただし依頼に「確認ID:」が含まれる場合は前の質問への回答なので、上の指示より再質問禁止を優先し、"
             "ask_user は使わずその回答に従って進める**（同じことを再度聞かない＝再質問ループ防止）。"
             "**途中経過だけの応答（「次に〜を調べます」など）で終えない。調査を最後まで進めてから、"
             "結論と根拠を最終回答として書く。**"
         )
         if lens == "author":
-            # P1-c: author は MCP ツールで根拠を集めたうえで成果物ファイルを authoring 直下に作る。
-            # S2: author は列構成・粒度など仕様が曖昧な場面が多い＝着手前の確認が「作ってから直す」より安い。
+            # author は MCP ツールで根拠を集めたうえで成果物ファイルを authoring 直下に作る。
+            # author は列構成・粒度など仕様が曖昧な場面が多い＝着手前の確認が「作ってから直す」より安い。
             return sysp + base + (
                 " 調べた内容を根拠に、**成果物ファイルをこのディレクトリ（authoring 直下）に作成してください**。"
                 "**仕様（列構成・粒度・対象範囲など）が曖昧で結果が大きく変わる場合は、着手前に ask_user で確認する**。"
                 "Excel/Word/PowerPoint 等を作る場合は `.agents/skills` 配下のスキル（xlsx/docx/pptx の"
                 " SKILL.md）を確認して活用する。"
-                # M3 案2: スライド/プレゼンは既定 Marp（見た目重視）・後で PowerPoint 編集なら python-pptx。
+                # スライド/プレゼンは既定 Marp（見た目重視）・後で PowerPoint 編集なら python-pptx。
                 # Codex は marp の .md を書くだけでよい（レンダは Sherpa 側が完了後に自動実行するので、
                 # marp CLI の有無をここで判断する必要は無い）。
                 "**スライド・プレゼン資料は見た目重視の marp スキル（HTML/PDF/PPTX）を既定で使う**。"
@@ -708,24 +687,24 @@ class CodexProvider(Provider):
                 "この作業の完了後に Sherpa 側が自動で行う（自分でレンダコマンドを実行する必要は無い）。"
                 "「あとで PowerPoint で編集したい」と明示された場合だけ、"
                 "marp を使わず pptx スキル（python-pptx）で作る。"
-                "最後に**作成したファイル名**と**内容の要約（2〜4文）**を"
+                "最後に**作成したファイル名**と**内容の要約**を"
                 "日本語で報告してください。\n\n"
-                # R1a: 履歴があれば【依頼】の前に前置（空文字なら従来と完全同一の出力）。
+                # 履歴があれば【依頼】の前に前置（空文字なら従来と完全同一の出力）。
                 f"{self._history_block()}【依頼】{message}")
         # R1a: 履歴があれば【質問】の前に前置（空文字なら従来と完全同一の出力）。
         return sysp + base + f"\n\n{self._history_block()}【質問】{message}"
 
     def _plain_text(self, message: str = "") -> str:
         # ナレッジ参照オフでは Codex CLI を起動しない（read-only でも grep/ファイル読取が可能で
-        # KB を覗けてしまうため・RV High）。
-        # 2026-08-15 決定: Codex 構成は資料参照ON固定になったため、通常この経路には来ない
+        # KB を覗けてしまうため）。
+        # Codex 構成は資料参照ON固定になったため、通常この経路には来ない
         # （画面はトグルをON固定・`routers/chat.py::_knowledge_for` がサーバ側でも強制）。
         # 内部経路や古いクライアントが knowledge=False で呼んだ場合の安全網としてだけ残す。
         return ("Codex は常に社内資料を参照して回答します。"
                 "資料を参照しない雑談は OpenAI／ローカルLLM を選んでください。")
 
     def run(self, ctx: Ctx) -> Iterator[dict]:
-        # R1a: `_GenProvider.run()` と同じく分岐前に確定させる（`_prompt`/`_prompt_mcp` が
+        # `_GenProvider.run()` と同じく分岐前に確定させる（`_prompt`/`_prompt_mcp` が
         # `_run_authoring` から参照する）。
         self._history = list(ctx.history or [])
         if not ctx.knowledge:                          # ナレッジ参照オフ＝素の会話（Codex を grep なしで・authoring 不使用）
@@ -745,14 +724,14 @@ class CodexProvider(Provider):
                 decision, env = ev["decision"], ev["env"]
             else:
                 yield ev
-        if env is None:                                # _gather が clarify question を出して停止＝確認待ち（RV High）
+        if env is None:                                # _gather が clarify question を出して停止＝確認待ち
             return
 
         yield _node("codex", "think", "Codex が調べる", "資料を調べています", "active")
         answer, ran = None, False
-        # T2（2026-08-18・実機報告⑥の隣接ケース）: 閉域キットが Codex CLI を同梱するようになり
-        # （scripts/install_offline_kit.sh 7b）、「CLI はあるが認証が無い」状態が現実的になった。
-        # このとき codex exec は即座に非ゼロ終了・stdout に JSON を1行も出さない（実測 T1）。
+        # 閉域キットが Codex CLI を同梱している場合（scripts/install_offline_kit.sh 7b）、
+        # 「CLI はあるが認証が無い」状態が起こりうる。
+        # このとき codex exec は即座に非ゼロ終了・stdout に JSON を1行も出さない（実測）。
         # 起動前ガード（shutil.which 不在・config書込み例外・.codex-sessions symlink 等）で
         # 一度も codex exec を起動していないケースと区別するため、if ブロック内でだけ True にする
         # （if ブロックが丸ごとスキップされた経路ではこの既定値 False のまま＝既存の決定的回答
@@ -762,23 +741,23 @@ class CodexProvider(Provider):
         # `env["codex_stopped_early"]` 判定用フラグも既定 False にしておく——`_agent_msgs` 等が
         # 存在するのは if ブロック内だけのため、実測値への上書きもそこでだけ行う。
         _codex_stopped_early = False
-        codex_question = None                                    # S2: ask_user 由来の question（出たら env/_result を出さずターン終了）
-        codex_usage = None                                       # F3: turn.completed の usage（best-effort・出なければ None）
+        codex_question = None                                    # ask_user 由来の question（出たら env/_result を出さずターン終了）
+        codex_usage = None                                       # turn.completed の usage（best-effort・出なければ None）
         # resume 試行が失敗し新規セッションへ切り替わったら True にする（if ブロックが丸ごと
         # スキップされる経路もあるためここで既定 False・usage のターン差分判定に使う）。
         _resume_fallback_happened = False
-        # RV是正（rv-periphery #11・2026-09-05）: `graph_neighbors` の mcp_tool_call item が旧世代
+        # `graph_neighbors` の mcp_tool_call item が旧世代
         # グラフの構造化エラー（`_graph_schema_era_from_item`）を運んできたら、ここへ捕まえておく。
         # `for line in proc.stdout:` を包む2重の `except Exception:`（_attempt 自身・呼び出し元の
         # `_run_authoring`）は技術的失敗を `_stream_error` へ丸めてしまうため、その中で直接 raise
         # しても握り潰される——両方の try/except/finally を抜けた後（下の `if codex_question is
         # not None:` の直前）でこのフラグを見て改めて raise する。
         _graph_schema_era_error = None
-        # S2 ガード②: 確認ID 付き再送（前の質問への回答）では ask_user を無視＝再質問ループ防止
+        # ガード: 確認ID 付き再送（前の質問への回答）では ask_user を無視＝再質問ループ防止
         # （chat.js が回答再送に `確認ID: {interaction_id}` を必ず含める・chat_router の marker と同流儀）。
         _ask_disabled = bool(re.search(r"確認ID[:：]", ctx.message or ""))
-        mcp_neighbors: list = []                                 # A2: Codex が graph_neighbors で引いた近傍（UI カードに反映）
-        # S2（提案書 Codex原本直読 §2-5）: MCP の read 系ツール（read_doc/read_around/
+        mcp_neighbors: list = []                                 # Codex が graph_neighbors で引いた近傍（UI カードに反映）
+        # MCP の read 系ツール（read_doc/read_around/
         # doc_outline/compare_documents）の引数から集めた doc_id。attempt をまたいで合算する（自動継続の
         # 複数 codex exec プロセスにまたがるため）。最終 answer の「参照した資料:」ブロックの解析結果に
         # 合流させ、機械検証してから env["sources"] へ足す（原本直読は MCP の結果に載らず出典に出ない穴の
@@ -796,14 +775,14 @@ class CodexProvider(Provider):
         # 別プロセスの同名 id を同一呼び出しと誤認し、総数を過少計上する。attempt は逐次実行（同時に
         # 走らない）ため、`max_in_flight` は attempt ごとの最大値の**最大**（合計ではない）を取る。
         _mcp_calls = {"total": 0, "max_in_flight": 0}
-        codex_created_files: list[str] = []                      # Feature A: 実行後に台帳登録する新規ファイルの絶対パス
-        _any_new_ws = False                                       # MEDIUM-2 fix: codex 未インストール時の NameError 防止
-        _created_file_rows: list[dict] = []                       # P1-c: 台帳登録に成功した行（env["created_files"] 用）
+        codex_created_files: list[str] = []                      # 実行後に台帳登録する新規ファイルの絶対パス
+        _any_new_ws = False                                       # codex 未インストール時の NameError 防止
+        _created_file_rows: list[dict] = []                       # 台帳登録に成功した行（env["created_files"] 用）
         # move／台帳登録が1件でも失敗したら True（run_dir を消さず回収用に残す・
         # 回答本文へ注記を足す判定に使う）。
         _created_files_failed = False
-        # Feature A: 専用 authoring ディレクトリを cwd に。BLOCKER-2: 個人アップロード(files/)から分離。
-        # MEDIUM-1: KB は絶対パスでプロンプトに渡す。RV BLOCKER: authoring/workspace に symlink が
+        # 専用 authoring ディレクトリを cwd に。個人アップロード(files/)から分離。
+        # KB は絶対パスでプロンプトに渡す。authoring/workspace に symlink が
         #   混入していると封じ込めが崩れるため、_safe_workspace_authoring で symlink 拒否＋fail-closed。
         users_dir = Path(os.environ.get("SHERPA_USERS_DIR", "data/users")).resolve()
         uid = ctx.uid or "admin"
@@ -825,18 +804,18 @@ class CodexProvider(Provider):
         # （途中で解放すると、同じ会話の次ターンが古い `codex_session_id`／履歴のまま
         # 割り込める窓ができる）。
         try:
-            # R1b（会話継続・Codex ネイティブ resume）: conversation_id があるターンだけセッションを
+            # 会話継続（Codex ネイティブ resume）: conversation_id があるターンだけセッションを
             # 永続化する（chat_service 経由のチャット呼び出しは常に有り。conversation_id 無しの直接呼出し
             # ＝既存テスト等は従来どおり per-request 使い捨て CODEX_HOME＋`--ephemeral` のまま・無改修）。
             _persist_session = ctx.conversation_id is not None
             resume_sid = ctx.codex_session_id if _persist_session else None
-            thread_id = None   # R1b: 捕捉した Codex session/thread id（_session_persistence_enabled の時だけ env に載せる）
-            # RV再検証 MEDIUM-2（2026-07-15）: `SHERPA_CODEX_SANDBOX=0`（緊急避難経路）は常に `--ephemeral`
+            thread_id = None   # 捕捉した Codex session/thread id（_session_persistence_enabled の時だけ env に載せる）
+            # `SHERPA_CODEX_SANDBOX=0`（緊急避難経路）は常に `--ephemeral`
             # 実行のため、そこで捕捉した thread_id は resume 不能（ディスクに残らない）。この専用フラグで
             # 「DB へ永続化してよいか」を判定する（`_persist_session` 単独だと fallback 経路の使い捨て
             # thread_id まで DB に保存し、サンドボックス復帰後の resume が永久に失敗し続ける穴があった）。
             _session_persistence_enabled = _persist_session and _codex_sandbox_enabled()
-            # RV再検証 MEDIUM-3（2026-07-15）: 永続 CODEX_HOME（`.codex-sessions/{cid}`）は固定パスのため、
+            # 永続 CODEX_HOME（`.codex-sessions/{cid}`）は固定パスのため、
             # 事前に symlink を仕込まれると（未検証のまま書込むと）封じ込めが崩れる。`ws_authoring` と
             # 同じ fail-closed 契約＝安全確認できなければ Codex を起動しない（このターンは決定的回答へ）。
             _safe_persistent_codex_home = None
@@ -863,12 +842,12 @@ class CodexProvider(Provider):
                                   "reason": "同一会話の Codex 実行が進行中"}}
                 return
             if shutil.which("codex") and ws_authoring is not None and run_dir is not None and _codex_home_ok:
-                # F4（2026-07-07）: agent_message は run 中に複数届く（作業宣言＋結論）。最後の1件を鵜呑みに
+                # agent_message は run 中に複数届く（作業宣言＋結論）。最後の1件を鵜呑みに
                 # せず全部集めて後で結論を選ぶ（`_pick_codex_headline`）。try の外で初期化＝Popen 失敗の
                 # except 経路でも NameError にしない。
                 _agent_msgs: list[str] = []
                 _agent_partial = ""
-                # Med-2（RV・2026-07-07）: stream 読取が途中例外で終わったか。例外時は集めた _agent_msgs が
+                # stream 読取が途中例外で終わったか。例外時は集めた _agent_msgs が
                 # 進行中の作業宣言だけの可能性があるため、完全版が入り得る `-o` 最終メッセージファイルを先に試す。
                 _stream_error = False
                 # 出力スキーマ有効時（`_schema_on`）だけ使う状態（§2-3）: `_latest_structured` は最新
@@ -876,7 +855,7 @@ class CodexProvider(Provider):
                 # は attempt をまたいで合格した dict を積む（見出し選択・§2-5 用）。
                 _latest_structured: dict | None = None
                 _structured_answers: list[dict] = []
-                mcp = _codex_mcp_enabled()                          # Phase2b: MCP ツールで自律調査（既定ON）
+                mcp = _codex_mcp_enabled()                          # MCP ツールで自律調査（既定ON）
                 sp = (ctx.scope_meta or {}).get("scope_paths")
                 # Codex 自身の追加探索（MCP／直接grep）への層フィルタは qa レンズだけに渡す（探す対象）。
                 # author は Codex の追加探索が正典 §1.8 の既知の非対称性（agentic_search.run_tool を
@@ -897,6 +876,7 @@ class CodexProvider(Provider):
                     yield {"type": "answer_delta", "text": msg}
                     env = {"lens": decision["lens"], "headline": msg, "summary": {"total": 0},
                           "data": {}, "sources": [],
+                          "agentic_failure": "error",   # 実行していないターン＝完了として数えない
                           "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world,
                                                               lens=decision["lens"])}
                     _reason = ("MCP 無効時は探す対象の限定に対応できません" if not mcp
@@ -918,10 +898,10 @@ class CodexProvider(Provider):
                 if ws_files is not None and ws_files.is_dir():
                     _before_ledger_files = set(ws_files.iterdir())
                 if run_dir.is_dir():
-                    # P1-b: `.agents`（配備したスキル）配下も `.tmp` 同様に台帳登録スキャン対象外。
+                    # `.agents`（配備したスキル）配下も `.tmp` 同様に台帳登録スキャン対象外。
                     # ルート直下の AGENTS.md も対象外: スナップショット後に write_agents_md() が書くため、
                     # 除外しないと初回実行で「新規ファイル」誤認 → files/ へ move（run_dir から消える）→
-                    # 次回また書かれて再検出…と毎回 AGENTS_N.md が台帳に蓄積する（P1-b RV 前修正）。
+                    # 次回また書かれて再検出…と毎回 AGENTS_N.md が台帳に蓄積する。
                     _before_ws_files = {
                         p for p in run_dir.rglob("*")
                         if p.is_file() and not p.is_symlink()
@@ -929,10 +909,10 @@ class CodexProvider(Provider):
                         and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
                     }
                 # reasoning=minimal は image_gen/web_search と非互換で API 400 になる（実証済）→ low へ引き上げ。
-                # P1-a: author（作成）のときは intent 連動パラメータ `SHERPA_CODEX_REASONING_AUTHOR`
+                # author（作成）のときは intent 連動パラメータ `SHERPA_CODEX_REASONING_AUTHOR`
                 # （既定 medium）を使う。通常レンズは現行のまま（低負荷優先）。
                 _is_author = decision["lens"] == "author"
-                # 調べる深さ（調べ方ブロック §3.2・SC-6c）: 通常レンズの基準値だけ管理画面の基準値編集
+                # 調べる深さ（調べ方ブロック §3.2）: 通常レンズの基準値だけ管理画面の基準値編集
                 # （system_settings）を反映する（author 専用の env は別軸のため対象外・§1.6 の
                 # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。標準=基準値のまま・深く=high・
                 # 最大=xhigh の per-turn 上書きは author を含む全レンズに一律適用する。
@@ -942,7 +922,7 @@ class CodexProvider(Provider):
                 _reason_raw = depth_profile_mod.codex_reasoning_for(
                     _base_reason, (ctx.scope_meta or {}).get("depth_profile"))
                 _reason = "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
-                # STAT-3 S1（利用統計の拡充）: usage メタへ足す「実際に codex exec へ渡した
+                # 利用統計の拡充: usage メタへ足す「実際に codex exec へ渡した
                 # model_reasoning_effort」（`_reason`）と、深さ倍率の上書き前の基準値
                 # （`_base_reason`）。一致（標準プロファイルの通常ケース）なら `reasoning_base` は
                 # 省略する（`usage_reasoning_extras` の契約）。
@@ -973,6 +953,7 @@ class CodexProvider(Provider):
                     yield {"type": "answer_delta", "text": msg}
                     env = {"lens": decision["lens"], "headline": msg, "summary": {"total": 0},
                           "data": {}, "sources": [],
+                          "agentic_failure": "error",   # 実行していないターン＝完了として数えない
                           "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world,
                                                               lens=decision["lens"])}
                     yield {"type": "_result", "env": env,
@@ -989,9 +970,9 @@ class CodexProvider(Provider):
                                               direct_read=_direct_read_ok, layer=_layer)
                 else:
                     prompt = self._prompt(ctx.message, decision["lens"], env, ctx.world)
-                # Phase0・§3: --ephemeral（セッションをディスクに残さない）と -o（最終メッセージのファイル
+                # §3: --ephemeral（セッションをディスクに残さない）と -o（最終メッセージのファイル
                 # 出力＝JSON 抽出が空だった時の保険）は sandbox/fallback どちらでも共通。.tmp/ は既存の
-                # run_dir 新規ファイル走査（台帳登録スキャン）から除外済みのディレクトリ（RV 済み挙動を流用）。
+                # run_dir 新規ファイル走査（台帳登録スキャン）から除外済みのディレクトリ（既存の挙動を流用）。
                 # 正典 §3.4「範囲と同じ硬いフィルタ」: run_dir は実行ごとの新規作成（`mkdir(exist_ok=False)`）
                 # のため前ターンの残存はあり得ないが、symlink にすり替わっていた場合は rmtree が
                 # 例外を送出する＝fail-closed のまま残す（多層防御）。
@@ -1004,12 +985,12 @@ class CodexProvider(Provider):
                 if _codex_sandbox_enabled():
                     # 検証済 recipe: permission profile で読取を KB(RO)＋authoring(RW) に封じ込め＋env 洗浄。
                     # CODEX_HOME は authoring の外（workspace 直下・`:root=deny` で shell から不可視）。
-                    # R1b（Codex強化計画 決定5）: conversation_id があるターンは会話ごとの固定ディレクトリ
+                    # conversation_id があるターンは会話ごとの固定ディレクトリ
                     # （`workspace/.codex-sessions/{cid}`）を CODEX_HOME にして毎ターン再利用する
                     # （`sessions/` 配下の JSONL が resume の実体＝下の finally では削除しない）。
                     # 無い場合（conversation_id 無しの直接呼出し・既存テスト等）は従来どおり per-request
                     # 使い捨て（実行後 rmtree・`--ephemeral`）のまま無改修。
-                    # RV再検証 MEDIUM-3: `_safe_persistent_codex_home` は外側で既に symlink/workspace外
+                    # `_safe_persistent_codex_home` は外側で既に symlink/workspace外
                     # 逸脱を検証済み（ここで再計算しない＝検証と使用の間で別パスを組み立てて TOCTOU を
                     # 生まない）。ここに来ている時点で `_session_persistence_enabled` かつ `_codex_home_ok`
                     # （＝`_safe_persistent_codex_home is not None`）は保証済み。
@@ -1024,21 +1005,21 @@ class CodexProvider(Provider):
                                 "-c", f"model_reasoning_effort={_reason}"]
                     if not _session_persistence_enabled:
                         argv_base.append("--ephemeral")
-                    # S2: `self._openai_api_key` は Codex(OpenAI) 構成で接続先が Azure 等の時だけ
+                    # `self._openai_api_key` は Codex(OpenAI) 構成で接続先が Azure 等の時だけ
                     # `_select_provider` が解決して渡す（それ以外は常に None＝在来どおり env に渡さない）。
                     popen_env = _codex_clean_env(codex_home, run_dir, _tmp,
                                                  openai_api_key=self._openai_api_key)
                 else:
                     # フォールバック（SHERPA_CODEX_SANDBOX=0）＝旧 `-s workspace-write`（読取全開・多層防御は OS ユーザ分離に依存）。
-                    # R1b: この緊急避難経路は対象外＝resume 非対応のまま（既存どおり常に使い捨て）。
-                    # RV再検証 MEDIUM-2: `_session_persistence_enabled` は既に False（サンドボックス無効
+                    # この緊急避難経路は対象外＝resume 非対応のまま（既存どおり常に使い捨て）。
+                    # `_session_persistence_enabled` は既に False（サンドボックス無効
                     # なので）＝ここで捕捉する thread_id は env に載らない（下の env 組立部分を参照）。
                     resume_sid = None
                     argv_base = ["codex", "exec", "--json", "--skip-git-repo-check",
                                 "--ephemeral", "-o", str(_last_message_path),
                                 "-s", "workspace-write", "-C", str(run_dir),
                                 "-m", self.model, "-c", f"model_reasoning_effort={_reason}"]
-                    # Phase0・§5-1: --strict-config が無い経路（config.toml でなく -c）なので同等をここで足す。
+                    # §5-1: --strict-config が無い経路（config.toml でなく -c）なので同等をここで足す。
                     argv_base += _web_search_c_args(self._web_search, self._system_settings)
                     if mcp:
                         argv_base += _mcp_config_args(ctx.world, sp, _ask_disabled, layer=_layer)
@@ -1053,7 +1034,7 @@ class CodexProvider(Provider):
                     argv_base += ["--output-schema", str(_OUTPUT_SCHEMA_PATH)]
 
                 def _build_argv(use_resume: bool, prompt_text: str | None = None) -> list:
-                    """R1b: resume 分岐は `codex exec resume [SESSION_ID] [PROMPT]` の位置引数どおり、
+                    """resume 分岐は `codex exec resume [SESSION_ID] [PROMPT]` の位置引数どおり、
                     exec 共通オプションの後・末尾プロンプトの前に `resume <sid>` を挿む。resume 先 id は
                     `thread_id`（`thread.started` で捕捉した最新値）を優先し、未捕捉なら呼び出し時点の
                     `resume_sid` に落ちる（自動継続はフレッシュ実行で捕捉した thread_id で resume する）。
@@ -1066,8 +1047,8 @@ class CodexProvider(Provider):
                     av.append(prompt if prompt_text is None else prompt_text)
                     return av
 
-                got_any_line = False   # R1b: resume 試行で1行も --json イベントを受け取れなければ resume 失敗とみなす
-                attempt_returncode = None   # RV再検証 LOW-4: fallback 判定の将来耐性（下の呼出側コメント参照）
+                got_any_line = False   # resume 試行で1行も --json イベントを受け取れなければ resume 失敗とみなす
+                attempt_returncode = None   # fallback 判定の将来耐性（下の呼出側コメント参照）
                 # 自動継続がツール未実行のまま宣言だけを繰り返す（正常な手順説明相手に無駄打ちする）のを
                 # 打ち切るための per-attempt フラグ（attempt 開始ごとに False へ戻す）。
                 _attempt_ran_tools = False
@@ -1122,7 +1103,7 @@ class CodexProvider(Provider):
                     # このプロセス（1回の codex exec）内だけで完結する id 集合（run-level `_mcp_calls`
                     # への合算は finally で行う）。
                     _attempt_mcp_seen: set = set()
-                    _mcp_read_done: set = set()      # S2: 収集済み item id（同じ item の再送で二重に数えない・
+                    _mcp_read_done: set = set()      # 収集済み item id（同じ item の再送で二重に数えない・
                                                      # item id は attempt（codex exec プロセス）ごとに振り直される）
                     _attempt_mcp_open: set = set()
                     _attempt_mcp_max_in_flight = 0
@@ -1136,13 +1117,13 @@ class CodexProvider(Provider):
                         if self._ollama_base_url is None:
                             from ... import llm
                             llm.assert_openai_io_allowed()
-                        # RV MEDIUM: start_new_session で独立プロセスグループにし、停止/後始末で
+                        # start_new_session で独立プロセスグループにし、停止/後始末で
                         #   MCP subprocess / shell child まで group ごと確実に殺す（creds env の寿命を延ばさない）。
                         proc = subprocess.Popen(
                             argv, env=popen_env, cwd=str(run_dir), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                             start_new_session=True)
-                        if ctx.stop_event is not None:                # UI フィードバック1: 途中停止（_spawn_stop_watcher 参照）
+                        if ctx.stop_event is not None:                # 途中停止（_spawn_stop_watcher 参照）
                             _spawn_stop_watcher(proc, ctx.stop_event)
                         node_n = 0
                         for line in proc.stdout:
@@ -1154,10 +1135,10 @@ class CodexProvider(Provider):
                             except ValueError:
                                 continue
                             got_any_line = True
-                            if e.get("type") == "thread.started":       # R1b: session/thread id 捕捉（resume 先の id）
+                            if e.get("type") == "thread.started":       # session/thread id 捕捉（resume 先の id）
                                 thread_id = e.get("thread_id") or thread_id
                                 continue
-                            if e.get("type") == "turn.completed":            # F3: ターンのトークン使用量（item ではない）
+                            if e.get("type") == "turn.completed":            # ターンのトークン使用量（item ではない）
                                 _u = _usage_from_turn_completed(
                                     e, self.model,
                                     codex_model_provider="ollama" if self._ollama_base_url is not None else "openai",
@@ -1177,7 +1158,7 @@ class CodexProvider(Provider):
                             item = e.get("item") or {}
                             it = item.get("type")
                             iid = item.get("id")
-                            if not iid:                                      # id 無し item でも node を上書き衝突させない（RV LOW）
+                            if not iid:                                      # id 無し item でも node を上書き衝突させない
                                 iid = f"cx-auto-{node_n}"
                                 node_n += 1
                             if _attempt_no > 1:                               # 2回目以降の attempt は id 空間を分離（前 attempt のノードを上書きしない）
@@ -1194,11 +1175,11 @@ class CodexProvider(Provider):
                                                 detail + (f"  → exit {ec}" if ec is not None else ""), "done")
                                 else:
                                     yield _node(f"cx-{iid}", "tool", label, detail, "active")
-                            elif it == "mcp_tool_call":                          # A2: Codex の MCP ツール呼びを可視化＋近傍を収集
+                            elif it == "mcp_tool_call":                          # Codex の MCP ツール呼びを可視化＋近傍を収集
                                 ran = True
                                 _attempt_ran_tools = True
                                 tool = item.get("tool", "")
-                                a = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}  # 非 dict 引数で落とさない（RV LOW）
+                                a = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}  # 非 dict 引数で落とさない
                                 done = e.get("type") == "item.completed" or item.get("status") in ("completed", "failed")
                                 # 並走計測（このプロセス内のみ・run 全体への合算は _attempt の finally）。
                                 # id が無い item は開始/完了を対応付けられないため対象外。初見かつ未完了の
@@ -1206,7 +1187,7 @@ class CodexProvider(Provider):
                                 # 数えるが in-flight 幅には寄与しない）。2回目以降の見た目（例: item.updated
                                 # の再送）は seen 済みなので無視され、二重に数えない。
                                 _mcp_id = item.get("id")
-                                # S2: read 系ツールの引数から実際に読んだ資料の doc_id を集める（「参照した
+                                # read 系ツールの引数から実際に読んだ資料の doc_id を集める（「参照した
                                 # 資料:」の記載漏れの補完）。**読取が成功して完了した** item だけ（失敗・
                                 # エラー結果・進行中は読めていない＝出典にも「根拠」にも載せない）。
                                 _read_ok = (e.get("type") == "item.completed"
@@ -1216,7 +1197,7 @@ class CodexProvider(Provider):
                                 if _read_ok and (not _mcp_id or _mcp_id not in _mcp_read_done):
                                     if _mcp_id:
                                         _mcp_read_done.add(_mcp_id)
-                                    # RV#6 是正: S3b 原本読取ツール（xlsx_range/docx_paragraphs/
+                                    # 原本読取ツール（xlsx_range/docx_paragraphs/
                                     # pptx_slides/pdf_pages/file_head）も doc_id 引数を取る読取
                                     # ツール——これらを収集対象に含めないと、Codex が MCP 経由で
                                     # 原本を直接読んでも出典収集から漏れる。
@@ -1249,12 +1230,12 @@ class CodexProvider(Provider):
                                 elif _mcp_id and done:
                                     _attempt_mcp_open.discard(_mcp_id)
                                 if tool == "ask_user":
-                                    # S2: ask_user は question 優先（agentic の {"question":..}→return と同じ意味論）。
+                                    # ask_user は question 優先（agentic の {"question":..}→return と同じ意味論）。
                                     # ガード②確認ID 付き再送では無視／③1実行1回（codex_question is None で enforce）。
                                     # 質問を捕まえたらループを抜け、finally で proc を後始末してから emit → ターン終了する。
                                     if codex_question is None:
                                         codex_question = _codex_ask_capture(item, _ask_disabled)
-                                    # RV Low-2（2026-07-07）: 捕捉して break する場合は item.completed を待たずに
+                                    # 捕捉して break する場合は item.completed を待たずに
                                     # ループを抜けるため、実際の done フラグに関わらずノードを "done" で確定表示する
                                     # （さもないと「ユーザに確認」が実行中表示のまま履歴保存される）。
                                     node_done = done or (codex_question is not None)
@@ -1264,19 +1245,18 @@ class CodexProvider(Provider):
                                     if codex_question is not None:
                                         break
                                     continue
-                                # RV是正（rv-periphery #7）: folder_tree/compare_documents は MCP 経由で
-                                # Codex にも公開済み（`mcp_server.py::_tool_defs`）だが、この表示用ラベル
-                                # 辞書に対応が無く「その他の処理」の汎用ラベルに丸まっていた
-                                # （`improvement_log._TOOL_CALL_LABELS` の集計対象からも漏れる）。
+                                # folder_tree/compare_documents は MCP 経由で
+                                # Codex にも公開済み（`mcp_server.py::_tool_defs`）のため、この表示用ラベル
+                                # 辞書にも対応を持たせる（`improvement_log._TOOL_CALL_LABELS` の集計対象でもある）。
                                 tlabel = {"graph_neighbors": "関係グラフをたどる", "ripgrep_search": "資料を検索（語句そのまま）",
                                           "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
                                           "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認",
                                           "compare_documents": "世代間の差分を比較",
                                           "read_doc": "文書を通読", "doc_outline": "見出し構造を確認",
                                           "glob_search": "ファイル名で検索",
-                                          # S3b（原本読取ツール・提案書2026-09-10 §2-9）: agentic_search
+                                          # agentic_search
                                           # の `_ORIGINAL_READ_LABELS`／改善ログの `_TOOL_CALL_LABELS` と
-                                          # 同じ文言（RV#11: `xlsx_sheets` はシート一覧のみ＝本文精読の
+                                          # 同じ文言（`xlsx_sheets` はシート一覧のみ＝本文精読の
                                           # `xlsx_range` とは別ラベル・`_FILES_READ_LABEL` からも外れる）。
                                           "xlsx_sheets": "原本のシート一覧を確認", "xlsx_range": "原本を読む（Excel）",
                                           "docx_paragraphs": "原本を読む（Word）",
@@ -1286,7 +1266,7 @@ class CodexProvider(Provider):
                                 detail = (a.get("name") or a.get("query") or a.get("doc_id")
                                          or a.get("path_prefix") or a.get("name_pattern") or a.get("pattern") or "")
                                 if done and tool == "graph_neighbors" and item.get("status") == "completed":
-                                    # RV是正（rv-periphery #11）: 旧世代グラフの構造化エラー
+                                    # 旧世代グラフの構造化エラー
                                     # （`mcp_server.py::handle` が isError で返す）を先に見る——
                                     # 検知したら `_mcp_neighbors_from` は呼ばない（近傍データではない）。
                                     _era_err = _graph_schema_era_from_item(
@@ -1305,7 +1285,7 @@ class CodexProvider(Provider):
                                 if txt:
                                     yield _node(f"cx-{iid}", "think", "考える", txt[-1][:80], "done")
                             elif it == "agent_message" and e.get("type") in ("item.completed", "item.updated"):
-                                # F4: 最後の1件で上書きせず集める（完了分はリストへ・未完分は partial に保持）。
+                                # 最後の1件で上書きせず集める（完了分はリストへ・未完分は partial に保持）。
                                 # 結論の選択は loop 後に `_pick_codex_headline` で決定的に行う。
                                 _txt = (item.get("text") or "").strip()
                                 if e.get("type") == "item.completed":
@@ -1413,24 +1393,24 @@ class CodexProvider(Provider):
 
                 try:
                     # AGENTS.md はベストエフォート（書けなくても Codex 実行自体は継続・fail-open）。
-                    # RV HIGH: fail-open でも気づけるよう warning は残す（containment/grounding の短縮形は
+                    # fail-open でも気づけるよう warning は残す（containment/grounding の短縮形は
                     # _prompt/_prompt_mcp に常置済みなので、書込失敗時も丸裸にはならない＝多層防御）。
                     try:
                         codex_agents_md.write_agents_md(run_dir, output_schema=_schema_on,
                                                         direct_read=_direct_read_ok)
                     except Exception as e:
                         _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
-                    # P1-b: スキル配備（案A′ ベース＋個人オーバーレイ）も同じくベストエフォート（fail-open）。
+                    # スキル配備（案A′ ベース＋個人オーバーレイ）も同じくベストエフォート（fail-open）。
                     # knowledge=ON の Codex 実行全部で配備する（author レンズに限定しない・progressive disclosure）。
                     try:
                         codex_skills.deploy_skills(run_dir, uid, users_dir)
                     except Exception as e:
                         _log.warning("skills deploy failed (fail-open): %s", e)
-                    # profile config はここで書く（RV MEDIUM: FileExistsError 等は fail-closed で
+                    # profile config はここで書く（FileExistsError 等は fail-closed で
                     #   例外→except で answer=None→finally で CODEX_HOME 削除→決定的回答へ。古い config での起動を防ぐ）。
-                    # M3（2026-07-12）: marp/Chromium を read root に追加する必要は無くなった
+                    # marp/Chromium を read root に追加する必要は無い
                     # （Codex は .md を書くだけ・レンダは Sherpa 本体側で行う。marp_render.py 参照）。
-                    # R1b: 会話ごとの CODEX_HOME は毎ターン再利用するため、前ターンの config.toml
+                    # 会話ごとの CODEX_HOME は毎ターン再利用するため、前ターンの config.toml
                     #   （creds を含む・毎ターン即時削除している＝下の finally 参照）が残骸として
                     #   居ないことをまず確認してから書く（`_write_codex_authoring_config` 自体の
                     #   O_EXCL fail-closed は変更しない＝正規のターン跨ぎ再利用のための cleanup）。
@@ -1445,7 +1425,7 @@ class CodexProvider(Provider):
                             ollama_base_url=self._ollama_base_url, system_settings=self._system_settings,
                             layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny,
                             deny_roots=_deny_roots)
-                        # S2（Azure OpenAI 対応）: 接続先が Azure 等へリダイレクトされていて、そのせいで
+                        # Azure OpenAI 対応: 接続先が Azure 等へリダイレクトされていて、そのせいで
                         # web_search が強制 OFF になっている時だけ、理由を1回（このターンにつき1回・
                         # `_write_codex_authoring_config` 呼び出しはこの1箇所だけで resume 再試行でも
                         # 再呼出されない）伝える。Codex(Ollama) 構成（`_ollama_base_url` あり）は対象外。
@@ -1458,7 +1438,7 @@ class CodexProvider(Provider):
                     yield from _attempt(bool(resume_sid))
                     _absorb_last_message_fallback()
                     _update_structured_state()
-                    # R1b: resume を試みて1行も --json イベントが出なかった（＝セッション消失等で resume
+                    # resume を試みて1行も --json イベントが出なかった（＝セッション消失等で resume
                     # 失敗・実機確認済み: `codex exec resume <消失id>` は空 stdout・exit 1）場合、
                     # R1a 履歴 priming（プロンプトには self._history が既に前置済み）で新規セッションへ
                     # 即座にフォールバックする。ask_user 確認で終了した/途中停止されたターンは再試行しない。
@@ -1519,10 +1499,10 @@ class CodexProvider(Provider):
                 finally:
                     if codex_home is not None:
                         if _persist_session:
-                            # R1b（決定5）: セッション実体（`sessions/` の JSONL）は次ターンの resume の
+                            # セッション実体（`sessions/` の JSONL）は次ターンの resume の
                             # ために保持する。creds を含む config.toml だけ即時削除し露出窓を1ターン分に
                             # 限定する（retention のスイープはディレクトリ全体を対象にする＝別途 api.py）。
-                            # RV再検証 HIGH-1（2026-07-15）: `auth.json`（実 `~/.codex/auth.json` への
+                            # `auth.json`（実 `~/.codex/auth.json` への
                             # symlink・`_write_codex_authoring_config` が張る）も同じ理由で毎ターン削除する
                             # （放置すると永続 CODEX_HOME に無期限残存＝次ターンは `_write_codex_authoring_config`
                             # が `dst.exists()` を見て再作成するので消しても実害は無い）。
@@ -1547,20 +1527,20 @@ class CodexProvider(Provider):
                 _log.info("codex mcp calls: total=%d max_in_flight=%d conv=%s uid=%s",
                           _mcp_calls["total"], _mcp_calls["max_in_flight"], ctx.conversation_id, uid)
                 if _graph_schema_era_error is not None:
-                    # RV是正（rv-periphery #11・2026-09-05）: 検知した専用例外を、それを飲み込む2重の
+                    # 検知した専用例外を、それを飲み込む2重の
                     # try/except（`_attempt` 自身・この呼び出し元）を両方抜けた後でようやく re-raise
                     # する——`run()` から uncaught のまま伝播させ、`chat_service._degrade_overload`
                     # （provider.run() 全体を包む既存の縮退）に固定文言（再取り込み案内）への変換を
                     # 委ねる（`GraphQueryOverloadError` と同じ既存の fail-loud 経路）。
                     raise _graph_schema_era_error
-                # S2: ask_user が出たターンは question 優先＝env/_result・成果物台帳登録を出さずここで終了する
+                # ask_user が出たターンは question 優先＝env/_result・成果物台帳登録を出さずここで終了する
                 # （agentic の {"question":..}→return と同じ意味論・回答は chat.js の整形再送＝新 codex exec で拾う）。
-                # proc は直上の finally で後始末済み。chat_service はこの question を answer.question として保存する（S1）。
+                # proc は直上の finally で後始末済み。chat_service はこの question を answer.question として保存する。
                 if codex_question is not None:
-                    # RV Low-2: 親ノード（"Codex が調べる"）も冒頭で "active" のまま止まっているので、
+                    # 親ノード（"Codex が調べる"）も冒頭で "active" のまま止まっているので、
                     # 通常経路の完了 yield（下の if answer/else ブロック）と同様にここで "done" に確定させる。
                     yield _node("codex", "think", "Codex が調べる", "ユーザに確認するため終了しました", "done")
-                    # RV Low-1（2026-07-07）: 早期 return が `-o` 一時ファイル（last-message-*.txt）の削除を
+                    # 早期 return が `-o` 一時ファイル（last-message-*.txt）の削除を
                     # バイパスして .tmp/ に蓄積し得た。通常経路（下の unlink）と同じ best-effort で先に消す。
                     try:
                         _last_message_path.unlink(missing_ok=True)
@@ -1569,17 +1549,17 @@ class CodexProvider(Provider):
                     yield codex_question
                     return
                 # §2-3/5: `_schema_on` は構造化 message から見出しを選ぶ（生 JSON をそのまま出さない・
-                # 平文ヒューリスティックへは戻さない）。無効時は現行どおり F4（2026-07-07）の選び方。
+                # 平文ヒューリスティックへは戻さない）。無効時は現行どおりの選び方（下記）。
                 if _schema_on:
                     answer = _pick_structured_headline()
                 else:
-                    # F4（2026-07-07）: 集めた agent_message から結論を優先して headline を選ぶ
+                    # 集めた agent_message から結論を優先して headline を選ぶ
                     # （進行中の作業宣言を見出しにしない・最後の1件を鵜呑みにしない）。
                     _picked = _pick_codex_headline(_agent_msgs, _agent_partial) or None
-                    # Phase0・§3: -o は保険。--json の agent_message から拾えなかった時だけ最終メッセージ
+                    # §3: -o は保険。--json の agent_message から拾えなかった時だけ最終メッセージ
                     # ファイルを読む（既存の JSON 経路が主）。読んでも読まなくても使い終わったら必ず削除する
                     # （.tmp/ は台帳登録スキャン対象外＝放置すると溜まり続けるため）。
-                    # Med-2（RV・2026-07-07）: 途中例外時は集めた _agent_msgs が進行中の作業宣言だけの可能性が
+                    # 途中例外時は集めた _agent_msgs が進行中の作業宣言だけの可能性が
                     # あるため、完全版が入り得る `-o` 最終メッセージを**先に**試し、空/無いときだけ pick に委ねる。
                     # 正常終了時は現行どおり pick が主・`-o` は従（fallback）。
                     if _stream_error:
@@ -1590,7 +1570,7 @@ class CodexProvider(Provider):
                     _last_message_path.unlink(missing_ok=True)
                 except Exception:
                     pass
-                # T2: codex exec を実際に起動した（attempt_returncode is not None＝Popen が完走した）
+                # codex exec を実際に起動した（attempt_returncode is not None＝Popen が完走した）
                 # にもかかわらず stdout に JSON を1行も出さず（got_any_line=False）、answer も得られない
                 # 場合だけ「正直に伝える」文言へ切り替える対象とする。ユーザーの stop_event による打ち切り
                 # は失敗ではないため対象外（途中で殺しただけで agent_message が無いのは想定内の挙動）。
@@ -1624,7 +1604,7 @@ class CodexProvider(Provider):
                 # 台帳登録: run_dir の新規ファイルを personal_workspace_files に登録（ES/Neo4j には一切書かない）。
                 if run_dir.is_dir():
                     # `.tmp`（TMPDIR）配下は Codex の一時ファイル＝台帳登録しない（成果物のみ登録）。
-                    # P1-b: `.agents`（配備したスキル）配下も同様に対象外（スキルコピーが
+                    # `.agents`（配備したスキル）配下も同様に対象外（スキルコピーが
                     # 成果物として files/ に誤って登録されないように・毎回作り直しなので前後で常に差分が出る）。
                     # ルート直下の AGENTS.md も対象外（before 側と対・理由はそちらのコメント参照）。
                     _after_ws_files = {
@@ -1637,7 +1617,7 @@ class CodexProvider(Provider):
                     for fp in new_authoring:
                         codex_created_files.append(str(fp))
                     _any_new_ws = bool(new_authoring)
-                    # M3 案2（2026-07-12）: Marp レンダは sandbox の外＝Sherpa 本体が network 隔離
+                    # Marp レンダは sandbox の外＝Sherpa 本体が network 隔離
                     # （unshare）下で実行する。Codex は .md を書くだけ（sandbox から marp/Chromium を
                     # 見せる必要が無くなり攻撃面も縮小・RUNTIME-SANDBOX §10.3 の未解決問題を回避）。
                     # ベストエフォート（fail-open）: 失敗しても .md 自体は既に台帳登録対象に入っている。
@@ -1649,13 +1629,13 @@ class CodexProvider(Provider):
                             marp_bin=_marp_bin(), chrome_path=_detect_chrome_path(),
                             theme_dirs=[run_dir / ".agents" / "skills" / "marp" / "themes",
                                         _SKILLS_BASE / "marp" / "themes"],
-                            containment_root=run_dir)   # RV BLOCKER: 入出力を run_dir 内実体に強制
+                            containment_root=run_dir)   # 入出力を run_dir 内実体に強制
                         codex_created_files.extend(str(p) for p in _rendered)
                         _any_new_ws = _any_new_ws or bool(_rendered)
                     except Exception as e:
                         _log.warning("marp_render: レンダ処理が例外で終了（fail-open）: %s", e)
-            # Feature A: 台帳登録（Codex が authoring/ に置いたファイルを files/ に移動して台帳登録）。
-            # HIGH fix: Codex 生成物を authoring/ → files/ に移動することで、既存の grep/delete/TTL 機構をそのまま使う。
+            # 台帳登録（Codex が authoring/ に置いたファイルを files/ に移動して台帳登録）。
+            # Codex 生成物を authoring/ → files/ に移動することで、既存の grep/delete/TTL 機構をそのまま使う。
             # authoring/ に中間生成物が残らないため、次回 Codex 実行時も個人ファイルは見えない。
             if codex_created_files and 'ws_authoring' in dir():
                 try:
@@ -1685,7 +1665,7 @@ class CodexProvider(Provider):
                                 if not _p.is_file():
                                     continue
                                 _stem, _suf = _p.stem, _p.suffix
-                                # RV HIGH: 同名回避の**名前確定も lock 内**で行う（並行 HTTP upload と衝突して
+                                # 同名回避の**名前確定も lock 内**で行う（並行 HTTP upload と衝突して
                                 #   live ファイルを move で上書きするのを防ぐ）。候補名ごとに lock を取り、
                                 #   lock 内で「物理未存在かつ生きた台帳なし」を確認できた名前にだけ move+登録する。
                                 _i = 0
@@ -1774,13 +1754,13 @@ class CodexProvider(Provider):
                         is_local=codex_usage.get("is_local"))
                 else:
                     env["usage"] = codex_usage
-                # STAT-3 S1: 差分計算／累計そのものの両方に同じ深さメタを載せる
+                # 差分計算／累計そのものの両方に同じ深さメタを載せる
                 # （`_usage_depth_extra` はこのターンの `_reason`/`_base_reason` 確定時に計算済み）。
                 env["usage"].update(_usage_depth_extra)
                 # Codex 経路も `sherpa.usage` ログ 1 行（kind=chat・深さ・推論レベル付き）を出す。
                 _log_chat_usage(env["usage"], time.monotonic() - _turn_t0, ctx.world)
-            # R1b: 捕捉した session/thread id を env に載せる（chat_service が `store.set_session_id` で永続化・
-            # 次ターンの resume 判定に使う）。RV再検証 MEDIUM-2: ゲートは `_persist_session` 単独ではなく
+            # 捕捉した session/thread id を env に載せる（chat_service が `store.set_session_id` で永続化・
+            # 次ターンの resume 判定に使う）。ゲートは `_persist_session` 単独ではなく
             # `_session_persistence_enabled`（=conversation_id あり **かつ** サンドボックス有効）を使う。
             # `SHERPA_CODEX_SANDBOX=0`（緊急避難経路）は常に `--ephemeral` 実行＝ディスクに残らない使い捨て
             # thread_id なので、ここで DB に保存すると次回サンドボックス復帰後の resume が必ず失敗する
@@ -1799,7 +1779,7 @@ class CodexProvider(Provider):
                     for r in _created_file_rows
                 ]
             if answer:
-                # S2（提案書 Codex原本直読 §2-5）: 直読した資料は MCP の結果に載らず
+                # 直読した資料は MCP の結果に載らず
                 # env["sources"] に反映されない——回答末尾の「参照した資料:」ブロックを解析し、read 系
                 # MCP ツール引数から拾った doc_id（参照ブロックの記載漏れの補完・出現順で後ろに合流）と
                 # 合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の
@@ -1843,7 +1823,7 @@ class CodexProvider(Provider):
                 env["headline"] = _body if (_verified_refs and _body.strip()) else answer   # 空本文には差し替えない
                 # 自動継続を尽くしてもなお進行中の宣言文（「次に○○します」等）がそのまま headline に
                 # 残ったターン——本文は書き換えない（`answer` は既存どおりそのまま使う）。`_codex_stopped_early`
-                # だけを根拠に envelope へ印を付け、chat_service._finalize が STOP-1/SC-6d と同形式
+                # だけを根拠に envelope へ印を付け、chat_service._finalize が予算到達時の途中結果・出典0件時の案内と同形式
                 # （headline 直下の独立注記＋案内ボタン）で UI に出す（`stop_reason` の閉じた語彙とは
                 # 無関係の別マーカー＝Codex CLI はここを経由しない agentic_search とは別の実行系のため）。
                 if _codex_stopped_early:
@@ -1851,15 +1831,18 @@ class CodexProvider(Provider):
                 yield _node("codex", "think", "Codex が調べる",
                             "調べて回答をまとめました" if ran else "回答をまとめました", "done")
             elif _codex_silent_failure:
-                # T2: `_gather` が組み立てた決定的回答をそのまま返さない＝利用者に「AI が答えていない」
+                # STAT-3 T3: 利用統計の終了理由分布（`stop_kind_mod.resolve`）がこの分岐を
+                # `codex_silent` と判定できるよう印を立てる（値の意味づけは chat_service 側）。
+                env["codex_silent_failure"] = True
+                # `_gather` が組み立てた決定的回答をそのまま返さない＝利用者に「AI が答えていない」
                 # ことが伝わるよう `_UnwiredProvider` と同じ文体の正直な文言に上書きする
                 # （summary/sources は `_gather` の実結果のまま残すが、sources が空なら data も
                 # `{}` へ揃える＝`chat_service._no_genuine_results` の honest failure 規約と一致させ、
-                # 通常の0件検索結果と誤認されて retry_hints・確定文言が付かないようにする・RV2 #2）。
-                # RV MED（2026-08-18 Codex RV 指摘4）: 以前は「認証されていない可能性があります」と
-                # 断定していたが、同じ無出力失敗はプロキシ/CA 証明書の不備・sandbox の起動失敗・
-                # CLI 自体のクラッシュでも起きる。閉域ではむしろプロキシ/ネットワーク要因の方が
-                # 現実的で、認証と決め打つと現場を誤誘導する。観測事実（応答を返す前に終了）を
+                # 通常の0件検索結果と誤認されて retry_hints・確定文言が付かないようにする）。
+                # 同じ無出力失敗はプロキシ/CA 証明書の不備・sandbox の起動失敗・
+                # CLI 自体のクラッシュでも起きるため、認証だけに断定しない（閉域ではむしろ
+                # プロキシ/ネットワーク要因の方が現実的で、認証と決め打つと現場を誤誘導する）。
+                # 観測事実（応答を返す前に終了）を
                 # 述べたうえで、考えられる原因を複数挙げる（断定しない）。判別材料（returncode）は
                 # 意味が伝わらない利用者向け本文には出さず、ログにだけ残す。stderr は現状 DEVNULL で破棄
                 # している（先頭行を出すには stdout/stderr 同時 PIPE 読み取りが要り、デッドロック回避の

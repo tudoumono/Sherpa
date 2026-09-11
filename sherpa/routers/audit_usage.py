@@ -145,11 +145,11 @@ _CHAT_CONTENT_PERSONAL_PLACEHOLDER = "（個人ファイル参照ターン・本
 def _chat_content_for_export(msg: dict | None, *, turn_personal: bool = False) -> str | None:
     """メッセージ1件をエクスポート用の文字列に落とす（削除済み/個人参照ターンはプレースホルダ）。
 
-    RV HIGH（2026-07-03）: `msg` が存在しても、所属会話が soft-delete 済み（受領共有ラッパーが
+    `msg` が存在しても、所属会話が soft-delete 済み（受領共有ラッパーが
     生きているため messages 行自体は物理的に残っている＝`store.get_messages_by_ids` の
     `conv_deleted` フラグ）なら削除済み扱いにする（存在しない id と同じプレースホルダに統一）。
 
-    RV MEDIUM（2026-07-03）: personal 判定は message 個々の flag だけでなく、呼出元が渡す
+    personal 判定は message 個々の flag だけでなく、呼出元が渡す
     `turn_personal`（chat.turn.detail.personal＝ターン全体の記録時点の判定）との OR にする。
     片方の flag だけが立って片方が欠けても（例: 個人参照ターンの assistant 側だけ personal が
     立ち loss/クリア等で user 側が立っていない等）両側ともプレースホルダに落とす。
@@ -329,7 +329,7 @@ _USAGE_CHAT_REQUEST_BODY_SCHEMA = {
                 "properties": {
                     "role": {
                         "type": "string",
-                        # 決定（RV9 #3）: enum は「正規化後（サーバが受理・比較に使う）値」を表す
+                        # 決定: enum は「正規化後（サーバが受理・比較に使う）値」を表す
                         # ものとして維持する（JSON Schema には enum を保ったまま「大小文字・前後
                         # 空白を無視する」ことを移植可能な形で表現する標準的な手段が無いため、
                         # pattern で近似するより description で明示する方が正確）。ワイヤ上の

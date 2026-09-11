@@ -431,10 +431,10 @@ def _parse_page_spec(spec: str | None, total: int, max_count: int) -> tuple[list
     `spec` 省略/空文字は先頭から `max_count` 件。戻り値は `(ページ番号一覧, truncated)`——
     `truncated` は指定範囲が `max_count` を超えて切り詰めたか（1回の呼び出しの上限）。
 
-    RV#4 是正: 範囲指定（`"1-10**12"` 等）は列挙前に `[1, total]` へ切ってから走査し、
-    `max_count` を超えた時点で列挙自体を打ち切る——以前は `total` を超える巨大な `hi` を
-    そのまま `range(lo, hi+1)` に渡していたため、`total=1` でも `"1-1000000000000"` の
-    ような指定で長時間占有した（実害: 1回のツール呼び出しが返らなくなる）。
+    範囲指定（`"1-10**12"` 等）は列挙前に `[1, total]` へ切ってから走査し、
+    `max_count` を超えた時点で列挙自体を打ち切る——`total` を超える巨大な `hi` を
+    そのまま `range(lo, hi+1)` に渡すと、`total=1` でも `"1-1000000000000"` の
+    ような指定で長時間占有し、1回のツール呼び出しが返らなくなるため。
     """
     spec = (spec or "").strip()
     if not spec:
@@ -457,7 +457,7 @@ def _parse_page_spec(spec: str | None, total: int, max_count: int) -> tuple[list
                 continue
             if lo > hi:
                 lo, hi = hi, lo
-            lo = max(lo, 1)          # total 範囲外を列挙前に切る（RV#4）
+            lo = max(lo, 1)          # total 範囲外を列挙前に切る
             hi = min(hi, total)
             for p in range(lo, hi + 1):
                 if p not in seen:
@@ -491,7 +491,7 @@ def _cell_str(v, clean: Callable[[str], str] | None) -> str:
         return ""
     s = str(v)
     if clean is not None:
-        s = clean(s)             # 伏せ字→切り詰めの順（RV#2）
+        s = clean(s)             # 伏せ字→切り詰めの順
     return s[:_CELL_MAX_CHARS]
 
 
@@ -545,11 +545,11 @@ def xlsx_range(f, sheet: str, range_a1: str | None = None,
     """セル範囲を表で返す（`range_a1` 省略時は先頭から `max_rows`×`max_cols`）。
 
     セル値は文字列化し1セル `_CELL_MAX_CHARS` 文字で切る（`None` は空文字）。`clean`
-    （省略可・`agentic_search._redact` 相当）は切り詰める**前**に適用する（RV#2）——`clean` が
+    （省略可・`agentic_search._redact` 相当）は切り詰める**前**に適用する——`clean` が
     渡された場合は `redact_keys.KeyBlockRedactor(clean)` でラップし、行優先（`ws.iter_rows` の
     並び＝原本の出現順）で1つのインスタンスを使い回す。秘密鍵ブロックが複数セルにまたがっても
     （BEGIN を含むセルが200字切り詰めで途中欠けても）状態を持ち越して伏せ続ける。要求範囲・
-    `max_rows`/`max_cols` 引数は 1〜既定値の範囲にクランプする（RV#10・引数で無制限に広げさせない）。
+    `max_rows`/`max_cols` 引数は 1〜既定値の範囲にクランプする（引数で無制限に広げさせない）。
     実効上限を超えたら切り詰めて `truncated: true`（`range` は実際に返した範囲）。`clean` がある
     場合、行の走査自体はシート先頭行（1行目）から選択範囲の最終行まで（行全体・実データの全列）行う——選択外の行は
     セルをクリーナーに通すだけで出力には残さない（先頭から辿らないと選択範囲より前で始まった
@@ -569,7 +569,7 @@ def xlsx_range(f, sheet: str, range_a1: str | None = None,
         max_rows = int(max_rows) if max_rows is not None else 200
     except (TypeError, ValueError):
         max_rows = 200
-    max_rows = min(max(max_rows, 1), 200)              # RV#10: 上限もクランプ（下限だけでなく）
+    max_rows = min(max(max_rows, 1), 200)              # 上限もクランプ（下限だけでなく）
     try:
         max_cols = int(max_cols) if max_cols is not None else 50
     except (TypeError, ValueError):
@@ -649,7 +649,7 @@ def docx_paragraphs(f, start: int = 0, count: int = 200,
     呼び直す（段落の `start`/`count` と同じ規律・上限で読めない表を作らない）。
 
     `clean`（省略可）は段落・表セルのテキストへ適用する（`doc_readers` 共通の「伏せ字してから
-    使う」契約を xlsx/pdf と揃える・RV#2）。`doc.paragraphs`/`doc.tables` は別々のフラットな
+    使う」契約を xlsx/pdf と揃える）。`doc.paragraphs`/`doc.tables` は別々のフラットな
     リストで、段落と表が本文でどう混ざって並んでいたか（出現順）を保たない——秘密鍵ブロックが
     「段落→表のセル→次の段落」のように**構造をまたいで**現れると、独立に処理したのでは状態を
     引き継げず取りこぼす。そのため `clean` が渡された場合は `redact_keys.KeyBlockRedactor(clean)`
@@ -785,7 +785,7 @@ _PPTX_SLIDES_MAX = 20
 def pptx_slides(f, pages: str | None = "1-10",
                clean: Callable[[str], str] | None = None) -> dict:
     """スライドのテキスト・表・ノートを返す（1回20枚まで）。`clean`（省略可）はテキスト・表・
-    ノートへ適用する（RV#2・切り詰めは無いが xlsx/pdf と契約を揃える）。`clean` が渡された場合は
+    ノートへ適用する（切り詰めは無いが xlsx/pdf と契約を揃える）。`clean` が渡された場合は
     `redact_keys.KeyBlockRedactor(clean)` を1個作り、スライド→shape 順（表・ノート含む・原本の
     出現順）で使い回す——秘密鍵ブロックが shape をまたいでも状態を持ち越して伏せ続ける。
     走査自体は選択範囲（`pages`）の `_KEY_LOOKBACK_PAGES` 枚前から最終スライドまで行う——選択外の
@@ -853,7 +853,7 @@ _PDF_PAGE_TEXT_MAX_CHARS = 20000
 def pdf_pages(f, pages: str | None = "1-5",
              clean: Callable[[str], str] | None = None) -> dict:
     """ページのテキストを返す（1回10ページ・1ページ20,000文字まで）。`clean`（省略可）は
-    `_PDF_PAGE_TEXT_MAX_CHARS` で切る**前**に適用する（RV#2）。`clean` が渡された場合は
+    `_PDF_PAGE_TEXT_MAX_CHARS` で切る**前**に適用する。`clean` が渡された場合は
     `redact_keys.KeyBlockRedactor(clean)` を1個作り、ページ順（原本の出現順）で使い回す——
     秘密鍵ブロックがページをまたいでも状態を持ち越して伏せ続ける。走査自体は選択ページの `_KEY_LOOKBACK_PAGES` ページ前から
     選択範囲（`pages`）の最終ページまで行う——選択外のページもクリーナーへ通すだけで出力には
