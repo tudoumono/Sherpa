@@ -114,3 +114,37 @@ def codex_reasoning_for(base_reasoning: str, profile) -> str:
     """Codex 推論レベルの per-turn 上書き。標準=基準値のまま・深く=`"high"`・最大=`"xhigh"`。"""
     override = _REASONING_OVERRIDE[normalize_depth_profile(profile)]
     return override if override is not None else base_reasoning
+
+
+def effective_max_turns(system_settings: dict | None, env_default: int, profile) -> int:
+    """反復上限の実効値＝ `effective_base(...,"max_turns",env_default)` → `scaled_turns(...)` の合成。
+
+    OpenAI/Ollama の `_agentic_loop` と下調べ役がループへ渡す値の単一の真実源（記録側は再計算せず、
+    ループが実際に渡した値を `_last_main_depth_usage`／`_last_sub_depth_usage` から読む）。"""
+    return scaled_turns(effective_base(system_settings, "max_turns", env_default), profile)
+
+
+def usage_extras(profile, *, max_turns: int | None = None, max_tools_per_turn: int | None = None) -> dict:
+    """usage メタ（`messages.answer.usage`）へ足す depth 由来のキー（API 経路・STAT-3 S1）。
+
+    `depth_profile` は常に入れる（欠落は `"standard"`）。`max_turns`/`max_tools_per_turn`
+    （その深さで実際に使った実効上限・呼び出し元が計算済みの値をそのまま渡す契約）は両方揃っている
+    ときだけ足す（過去データ遡及なし＝欠落は欄ごと省略の流儀を usage dict でも踏襲する）。"""
+    out = {"depth_profile": normalize_depth_profile(profile)}
+    if max_turns is not None and max_tools_per_turn is not None:
+        out["max_turns"] = int(max_turns)
+        out["max_tools_per_turn"] = int(max_tools_per_turn)
+    return out
+
+
+def usage_reasoning_extras(profile, base_reasoning: str, effective_reasoning: str) -> dict:
+    """usage メタへ足す depth 由来のキー（Codex 経路・STAT-3 S1）。
+
+    `reasoning` は実際に `codex exec -c model_reasoning_effort=...` へ渡した値。基準値
+    （`base_reasoning`＝構成の `codex_reasoning`／author 用の env）と上書き後の値が異なるときだけ
+    `reasoning_base` も足す（一致時は省略＝標準プロファイルで基準値どおりのケースがほとんどのため
+    冗長なキーを増やさない）。"""
+    out = {"depth_profile": normalize_depth_profile(profile), "reasoning": effective_reasoning}
+    if base_reasoning != effective_reasoning:
+        out["reasoning_base"] = base_reasoning
+    return out

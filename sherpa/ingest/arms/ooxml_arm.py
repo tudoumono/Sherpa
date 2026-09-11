@@ -756,7 +756,7 @@ def _docx_table_walk(tbl_el) -> tuple[list[document_ir.Cell], list[tuple[int, in
       `flags` に `"docx_vmerge_text_merged"` を追加する。
     - 行頭の省略列 `w:trPr/w:gridBefore` は列開始位置に反映する（RV Med #3: 無視すると座標がずれ、
       縦マージ連鎖を誤った列位置で数える）。
-    - `role` は全セル `"unknown"`（ヘッダ判定は検索用表現側＝`table_semantics.py` の責務）。
+    - `role` は全セル `"unknown"`（ヘッダ判定は検索用表現生成層の責務）。
     - セルの出現順（≒ `cells` の並び順）は原本の行→列の走査順（row-major）をそのまま保つ（継続セルは
       要素を作らないため出力に混じらない）。
     - ネスト表（DOC-IR-002）: 各 `w:tc` 直下の `w:tbl`（`tc.findall` の直接子＝1段目のみ検出。孫以降は

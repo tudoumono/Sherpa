@@ -24,11 +24,12 @@
 場合は検知しない（`.txt` 直行の既存経路と同じ残余リスク・受容記録はバックログ参照）。
 
 このモジュールは `corpus_docs`／`grep_tool` 等どこからでも安全に import できる葉ノードとして保つ
-（`re` 以外の標準ライブラリのみ・sherpa 内の他モジュールを import しない）。
+（`re`/`pathlib` 以外の標準ライブラリのみ・sherpa 内の他モジュールを import しない）。
 """
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # ---- 第1段: 拡張子マップ（固定表）----------------------------------------------------------
 # 一般言語＋設定ファイル系＝固定でコード側。既存の言語アナライザ登録簿（cobol/copybook/jcl・
@@ -87,8 +88,13 @@ SENSITIVE_EXT = frozenset({".key", ".pem", ".ppk", ".env"})
 #   `credentials`（ini形式）・`.netrc`／`.npmrc`／`.git-credentials`）。
 # ファイル名は **小文字化してから** 比較する（`.ENV`／`.Env.production` 等の大文字表記も
 # バイパスさせないため）。
-_SENSITIVE_NAME_EXACT = frozenset({".env", "credentials", ".netrc", ".npmrc", ".git-credentials"})
-_SENSITIVE_NAME_PREFIXES = (".env.", "id_rsa")
+_SENSITIVE_NAME_EXACT = frozenset({".env", ".netrc", ".npmrc", ".git-credentials"})
+# `credentials` は `id_rsa` と同様プレフィックス扱い: 拡張子無しの慣習名
+# （AWS/gcloud の ini 形式）だけでなく、`credentials.xlsx`／`credentials_2024.csv` のように
+# 秘匿情報を Office/表形式へ書き出した命名も捕まえる——完全一致のままだと拡張子が付いた
+# 途端に秘匿判定を素通りしてしまう（`"credentials".startswith("credentials")` は真のため、
+# 拡張子無しの従来挙動はそのまま保たれる）。
+_SENSITIVE_NAME_PREFIXES = (".env.", "id_rsa", "credentials")
 
 # 一時ファイルの前綴り（例: Office のロックファイル `~$foo.docx`）。
 NOISE_NAME_PREFIXES = ("~$",)
@@ -124,6 +130,18 @@ def is_sensitive(name: str, ext: str) -> bool:
         return True
     name_l = name.lower()
     return name_l in _SENSITIVE_NAME_EXACT or name_l.startswith(_SENSITIVE_NAME_PREFIXES)
+
+
+def is_sensitive_doc_id(doc_id: str) -> bool:
+    """`doc_id`（rel_path 文字列）から `is_sensitive` を呼ぶ薄いラッパー。
+
+    呼び出し側の多くは実ファイルの `Path` ではなく doc_id 文字列（ES ヒットの `doc_id`・
+    ledger の `rel` 等）しか持たない——`Path(doc_id).name`／`.suffix.lower()` の組み立てが
+    複数箇所に散っていた（台帳 #85〜#88）ため、判定の集約点としてここへ寄せる。挙動は
+    `is_sensitive(Path(doc_id).name, Path(doc_id).suffix.lower())` と完全に同一。
+    """
+    p = Path(doc_id)
+    return is_sensitive(p.name, p.suffix.lower())
 
 
 def classify_ext(ext: str) -> str | None:

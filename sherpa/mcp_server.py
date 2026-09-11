@@ -66,7 +66,24 @@ def _tool_defs() -> list:
         # 土台系ツール（read_around 等と同じ扱い）＝常に公開する。
         {"name": "compare_documents", "description": agentic_search._DESC_COMPARE,
          "inputSchema": agentic_search._PARAMS_COMPARE},
+        # S3b（原本読取ツール・`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
+        # `file_head`（テキスト・コード）は層に関係なく常に公開する（`run_tool` 側が層で個別に
+        # 絞る）。Office/PDF の5本（下）は探す対象がソースに限定されている間は外す（Office/PDF は
+        # 常に docs 側扱いのため・`run_tool` 側の拒否と多層防御）。
+        {"name": "file_head", "description": agentic_search._DESC_FILE_HEAD,
+         "inputSchema": agentic_search._PARAMS_FILE_HEAD},
     ]
+    if _layer() != "code":
+        defs.append({"name": "xlsx_sheets", "description": agentic_search._DESC_XLSX_SHEETS,
+                     "inputSchema": agentic_search._PARAMS_XLSX_SHEETS})
+        defs.append({"name": "xlsx_range", "description": agentic_search._DESC_XLSX_RANGE,
+                     "inputSchema": agentic_search._PARAMS_XLSX_RANGE})
+        defs.append({"name": "docx_paragraphs", "description": agentic_search._DESC_DOCX_PARAGRAPHS,
+                     "inputSchema": agentic_search._PARAMS_DOCX_PARAGRAPHS})
+        defs.append({"name": "pptx_slides", "description": agentic_search._DESC_PPTX_SLIDES,
+                     "inputSchema": agentic_search._PARAMS_PPTX_SLIDES})
+        defs.append({"name": "pdf_pages", "description": agentic_search._DESC_PDF_PAGES,
+                     "inputSchema": agentic_search._PARAMS_PDF_PAGES})
     if _layer() in (None, "both"):
         defs.append({"name": "graph_neighbors", "description": agentic_search._DESC_GRAPH,
                      "inputSchema": agentic_search._PARAMS_GRAPH})

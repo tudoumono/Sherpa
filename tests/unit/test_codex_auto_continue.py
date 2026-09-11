@@ -7,15 +7,17 @@
 結論に届かなかった。`providers/codex/provider.py::CodexProvider._run_authoring` は、正常終了・
 作業宣言だけ・セッション永続ありの条件がそろうとき、Codex セッションの続き（resume）を
 `SHERPA_CODEX_AUTO_CONTINUE`（既定3・0で無効）回まで自動で呼ぶ。尽くしてもなお結論に届かない
-ときは `env["codex_stopped_early"]` を立て、`chat_service._finalize` が timeout
-（`codex_timed_out`）と同じ形（headline は書き換えない・retry_hints に kind="resume" を追加）で
-案内する（`web/chat/render.js::codexStoppedEarlyNoteHTML` が本文直下に注記を出す）。
+ときは `env["codex_stopped_early"]` を立て、`chat_service._finalize` が STOP-1/SC-6d と同じ形
+（headline は書き換えない・retry_hints に kind="resume" を追加）で案内する
+（`web/chat/render.js::codexStoppedEarlyNoteHTML` が本文直下に注記を出す）。TIMEOUT-1
+（2026-09-11）で経過時間だけの打ち切り（旧 `codex_timed_out`）は撤去済み——利用者の明示停止
+（stop_event）は `codex_stopped_early` と別扱いのまま残る。
 
-既存 tests/unit/test_codex_resume.py・test_codex_timeout_continue_note.py と同じ「偽 codex
-実行ファイルを PATH に差し込む」流儀（実 codex は一切呼ばない）。ただし本ファイルの偽 codex は
-呼び出しごとに異なる応答（作業宣言→結論、作業宣言の連続、timeout 等）を返す必要があるため、
-呼び出し回数ごとの応答計画を JSON ファイルで渡す独自の偽 codex を使う（他ファイルの固定応答スクリプトは
-再利用しない・呼び出し回数は argv_log の行数で数える＝どちらのファイルとも同じ考え方）。
+既存 tests/unit/test_codex_resume.py と同じ「偽 codex 実行ファイルを PATH に差し込む」流儀
+（実 codex は一切呼ばない）。ただし本ファイルの偽 codex は呼び出しごとに異なる応答（作業宣言→
+結論、作業宣言の連続、無出力異常終了等）を返す必要があるため、呼び出し回数ごとの応答計画を JSON
+ファイルで渡す独自の偽 codex を使う（他ファイルの固定応答スクリプトは再利用しない・呼び出し回数は
+argv_log の行数で数える）。
 """
 from __future__ import annotations
 
@@ -23,12 +25,13 @@ import json
 import os
 import stat
 import threading
+import time
 
 import pytest
 from pathlib import Path
 
-# test_codex_resume.py / test_codex_timeout_continue_note.py と同じ流儀（setdefault のみ・
-# モジュールレベル直書きは pytest 一括収集時にプロセス全体へ漏れるため禁止）。
+# test_codex_resume.py と同じ流儀（setdefault のみ・モジュールレベル直書きは pytest 一括収集時に
+# プロセス全体へ漏れるため禁止）。
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
 from sherpa import agents as A  # noqa: E402
@@ -102,7 +105,7 @@ def _write_fake_codex(bin_dir: Path, argv_log: Path, plan_path: Path) -> None:
     script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str, timeout: str = "30") -> Path:
+def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str) -> Path:
     """偽 codex を PATH に差し込み、呼び出しごとの応答計画（steps）を JSON で渡す。戻り値は argv_log。
 
     本ファイルの偽 codex は平文（JSON でない）agent_message を返す（語尾ヒューリスティックの検証が
@@ -119,7 +122,6 @@ def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str, timeout
     _write_fake_codex(bin_dir, argv_log, plan_path)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", timeout)
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     return argv_log
 
@@ -298,17 +300,21 @@ def test_no_continuation_when_conclusion_arrives_on_first_attempt(tmp_path, monk
     assert env["headline"] == "確認した結果、影響はありません。"
 
 
-# ===== 6. 継続中に timeout =====
+# ===== 6. 継続中に利用者が明示停止 =====
 
-def test_timeout_during_continuation_sets_timed_out_not_stopped_early(tmp_path, monkeypatch):
+def test_user_stop_during_continuation_does_not_set_stopped_early(tmp_path, monkeypatch):
+    """TIMEOUT-1: 経過時間だけの打ち切り（旧 timeout）は撤去済み——継続 attempt の途中で利用者が
+    明示停止（stop_event）した場合は、「AI が自力で途中終了した」ことを示す `codex_stopped_early`
+    を立てない（`_stopped_final` が除外する・別の終了理由として扱う）。"""
     steps = [
-        {"thread_id": "TH-TO", "agent_messages": ["まず資料を確認します。"], "usage": _usage()},
-        {"thread_id": "TH-TO", "agent_messages": ["次に影響範囲を確認します。"], "sleep": 30},
+        {"thread_id": "TH-STOP", "agent_messages": ["まず資料を確認します。"], "usage": _usage()},
+        {"thread_id": "TH-STOP", "agent_messages": ["次に影響範囲を確認します。"], "sleep": 30},
     ]
-    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_continue_timeout",
-                      timeout="1.0")
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_continue_stop")
     prov = A.CodexProvider()
-    ctx = _ctx(uid="auto-continue-timeout", conversation_id=905)
+    stop_event = threading.Event()
+    ctx = _ctx(uid="auto-continue-stop", conversation_id=905)
+    ctx.stop_event = stop_event
 
     events: list = []
 
@@ -318,14 +324,20 @@ def test_timeout_during_continuation_sets_timed_out_not_stopped_early(tmp_path, 
 
     th = threading.Thread(target=_drive, daemon=True)
     th.start()
-    th.join(timeout=20)
-    assert not th.is_alive(), "timeout 経路が想定時間内に完走しない（Timer→_killpg が効いていない疑い）"
+
+    # 継続 attempt（2回目・sleep 30 の偽 codex）が起動するまで待ってから停止要求する
+    # （argv_log の行数＝これまでの呼び出し回数）。
+    deadline = time.time() + 10
+    while time.time() < deadline and len(_read_argv_log(argv_log)) < 2:
+        time.sleep(0.05)
+    assert len(_read_argv_log(argv_log)) >= 2, "継続 attempt が始まらない（テスト前提が崩れている）"
+    stop_event.set()
+
+    th.join(timeout=10)
+    assert not th.is_alive(), "stop_event 経路が想定時間内に完走しない（_spawn_stop_watcher が効いていない疑い）"
 
     env = _result_env(events)
-    calls = _read_argv_log(argv_log)
-    assert len(calls) == 2, f"継続 attempt が timeout するまでは2回のはず: {calls!r}"
-    assert env.get("codex_timed_out") is True
-    assert not env.get("codex_stopped_early"), "timeout 側の注記に譲るはずが両方立っている"
+    assert not env.get("codex_stopped_early"), "利用者の明示停止なのに codex_stopped_early が立っている"
 
 
 # ===== 7. 継続 attempt が無出力・異常終了（resume 失敗や CLI のクラッシュ） =====
@@ -349,7 +361,6 @@ def test_continuation_attempt_without_output_marks_stopped_early(tmp_path, monke
     assert "resume" in calls[1] and calls[1][-1] == A._CONTINUE_PROMPT
     assert env["headline"] == "まず資料を確認します。"     # 本文は書き換えない
     assert env.get("codex_stopped_early") is True
-    assert not env.get("codex_timed_out")
     finalized = CS._finalize(dict(env), {"lens": "qa", "reason": "既定（検索）"})
     assert len([h for h in finalized.get("retry_hints", []) if h["kind"] == "resume"]) == 1
 
@@ -666,3 +677,24 @@ def test_report_back_with_saigo_ni_marker_is_a_conclusion():
     conclusion = "最後に、影響は夜間バッチのみであることを共有します。"
     assert A._pick_codex_headline(["影響は日中 API にもあります。", conclusion]) == conclusion
     assert not A._needs_continuation([conclusion])
+
+
+def test_mcp_read_docs_collected_across_attempts_even_when_item_ids_repeat(tmp_path, monkeypatch):
+    """S2: 自動継続（別 codex exec プロセス）では item id が振り直される＝同じ id の read_doc でも
+    継続側の別資料を取りこぼさない（収集済み id の記憶は attempt ごと）。"""
+    def _read(doc):
+        return {"type": "item.completed", "item": {"id": "item_0", "type": "mcp_tool_call", "tool": "read_doc",
+                                                    "status": "completed", "arguments": {"doc_id": doc}}}
+    steps = [
+        {"thread_id": "TH-S2", "agent_messages": ["まず資料を確認します。"],
+         "extra_events": [_read("4期/02_設計/01_基本設計/税計算仕様書.md")], "usage": _usage(10, 2, 5, 1)},
+        {"thread_id": "TH-S2", "agent_messages": ["確認した結果、消費税率は10%です。"],
+         "extra_events": [_read("4期/01_標準/消費税法.md")], "usage": _usage(30, 2, 13, 3)},
+    ]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_s2_attempts")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="s2-attempts", conversation_id=902)
+    ctx.make_sources = lambda docs: [{"doc_id": d, "download_url": f"/dl?rel={d}"} for d in docs]
+    env = _result_env(_run(prov, ctx))
+    assert env["codex_referenced_docs"]["listed"] == 2
+    assert {s["doc_id"] for s in env["sources"]} >= {"4期/02_設計/01_基本設計/税計算仕様書.md", "4期/01_標準/消費税法.md"}

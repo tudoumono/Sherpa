@@ -471,3 +471,14 @@ RTO の絶対値は環境依存のため、**初回のリストア演習で実�
 - `ls -lh data/run/api.log`（肥大していたら空にする）。
 - `ls "$SHERPA_BACKUP_DIR"`（未設定なら `ls data/backups/`）— バックアップが**今日も増えているか**（取れているつもりで止まっているのが最悪パターン）。
 - 取り込み一覧に「※ …失敗しました」の注意が出ていないか（[20-管理-取り込み](20-管理-取り込み.md)）。
+
+## 公開 export とタグ
+
+内部リポで開発し、公開リポ（フォーク元）はリリースの区切りだけ更新します（毎コミット同期はしません）。
+
+1. `CHANGELOG.md` の `[Unreleased]` を対象リリースの版へ確定する。
+2. `scripts/export_public.sh <公開 checkout のパス>` を実行する（allowlist に基づいて公開 checkout の
+   中身を入れ替え、内部専用パスの混入を検査する。検査に失敗したら公開しない）。
+3. 公開 checkout 側で `git status`/`git diff` を確認し、意図した差分だけになっていることを見る。
+4. 公開 checkout で commit/push し、`vX.Y.Z` のタグを打って `git push origin vX.Y.Z` で push する
+   （release.yml はタグ push で起動する。手順の正典は [20-開発ハーネス.md](../20-開発ハーネス.md) §9）。

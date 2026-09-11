@@ -91,9 +91,16 @@ def _clamp_str(v, limit: int = _MAX_STR_FIELD_LEN):
 
 
 def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
-          connect_timeout: float | None = None, statement_timeout_ms: int | None = None) -> None:
+          connect_timeout: float | None = None, statement_timeout_ms: int | None = None,
+          elapsed_ms: float | None = None) -> None:
     """1行記録（`suppress()` 中は no-op）。`usage` は `acc_end()` が返す形、または生の usage 辞書の
     どちらでもよい。
+
+    `elapsed_ms`（STAT-3 S2・2026-09-11-利用統計の拡充.md T2）: 省略時は `acc_begin()`/`acc_end()`
+    のスコープがあれば `acc_elapsed()` の経過秒をミリ秒へ丸めて使う（呼び出し元の変更は不要）。
+    スコープの無い呼び出し元（例: `kind="graph_ask"`）で独自に計測した経過秒を渡したい場合だけ
+    明示的に渡す（`acc_elapsed()` 由来の値より優先する）。どちらも無ければ `usage_events.elapsed_ms`
+    は NULL のまま（所要時間が取れない呼び出し）。
 
     `usage` が None なら全トークン列を None にする（NULL 行＝プロバイダが usage を報告しなかった
     「報告不能」マーカー）。辞書なら欠落サブフィールドは 0 に補正する（`_usage_meta` のクランプ意味論と
@@ -121,12 +128,15 @@ def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
         else:
             tokens = dict.fromkeys(_TOKEN_FIELDS)   # usage が None（または辞書でない）＝報告不能マーカー
         prov_c, model_c, world_c = _clamp_str(provider), _clamp_str(model), _clamp_str(world)
+        elapsed_ms_val = (round(elapsed_ms) if elapsed_ms is not None
+                         else (round(elapsed * 1000) if elapsed is not None else None))
         _ue.add_usage_event(kind=kind, provider=prov_c, model=model_c,
                             input_tokens=tokens["input_tokens"],
                             cached_input_tokens=tokens["cached_input_tokens"],
                             output_tokens=tokens["output_tokens"],
                             reasoning_output_tokens=tokens["reasoning_output_tokens"],
                             calls=calls, user_id=_clamp_str(user_id), world=world_c,
+                            elapsed_ms=elapsed_ms_val,
                             connect_timeout=connect_timeout, statement_timeout_ms=statement_timeout_ms)
         log_usage_line(kind, prov_c, model_c, tokens, calls, world_c, elapsed)
     except Exception as e:
@@ -141,16 +151,21 @@ def _fmt_tok(v) -> str:
     return "?" if v is None else str(v)   # tokens が None＝報告不能マーカー（record() の docstring 参照）
 
 
-def log_usage_line(kind, provider, model, tokens: dict, calls, world, elapsed: float | None) -> None:
+def log_usage_line(kind, provider, model, tokens: dict, calls, world, elapsed: float | None,
+                   *, depth: str | None = None, reasoning: str | None = None) -> None:
     """`sherpa.usage` ロガーへの INFO 1行（LOG-UX・2026-09-04）。`record()` が成功パスから呼ぶほか、
     `kind="chat"`（`record()` を通らない・本モジュール docstring 参照）は
-    `providers/base.py::_log_chat_usage` が直接呼ぶ——公開関数（アンダースコアなし）なのはこの
+    `providers/base.py::_log_chat_usage` が直接渡す——公開関数（アンダースコアなし）なのはこの
     モジュール外からの呼び出しを想定しているため。
 
     例: `kind=embed provider=openai model=text-embedding-3-small in=52340 cached=0 out=0 calls=3
-    elapsed=12.4s world=test2`。`elapsed`/`world` は値が無ければ欄ごと省略する。`user_id` は載せない。
-    呼び出し元の縮退契約と独立に自衛する（例外を外へ出さない・ログ出力の失敗が呼び出し元の成否に
-    影響してはならない）。
+    elapsed=12.4s world=test2`。`elapsed`/`world`/`depth`/`reasoning` は値が無ければ欄ごと省略する。
+    `user_id` は載せない。呼び出し元の縮退契約と独立に自衛する（例外を外へ出さない・ログ出力の失敗が
+    呼び出し元の成否に影響してはならない）。
+
+    `depth`（STAT-3 S1・調べる深さ＝`"standard"/"deep"/"max"`）・`reasoning`（Codex 経路: 実際に渡した
+    `model_reasoning_effort`。API 経路: `_log_chat_usage` が `"turns=<N>/tools=<N>"` の形で渡す）は
+    `record()` 経由の呼び出し（`kind="chat-sub"`等）では渡さない＝S1 の対象は `kind="chat"` のみ。
     """
     try:
         parts = [f"kind={kind}", f"provider={provider}", f"model={model}",
@@ -162,6 +177,10 @@ def log_usage_line(kind, provider, model, tokens: dict, calls, world, elapsed: f
             parts.append(f"elapsed={elapsed:.1f}s")
         if world:
             parts.append(f"world={world}")
+        if depth:
+            parts.append(f"depth={depth}")
+        if reasoning:
+            parts.append(f"reasoning={reasoning}")
         _usage_log.info(" ".join(parts))
     except Exception:
         pass

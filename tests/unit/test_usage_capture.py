@@ -533,10 +533,13 @@ def test_agentic_run_wraps_usage_with_provider_and_model(monkeypatch):
               scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
               make_sources=lambda docs: [{"doc_id": d} for d in docs])
     result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
+    # STAT-3 S1: 非ハイブリッドの反復ツール検索は「実際に使った実効上限」（depth_profile 省略＝
+    # standard・system_settings={}＝env 既定のまま）も usage へ足す。
     assert result["env"]["usage"] == {"provider": "openai", "model": "gpt-5.5",
                                       "input_tokens": 150, "cached_input_tokens": 0,
                                       "output_tokens": 30, "reasoning_output_tokens": 0,
-                                      "is_local": "cloud"}
+                                      "is_local": "cloud", "depth_profile": "standard",
+                                      "max_turns": AS.MAX_TURNS, "max_tools_per_turn": AS.MAX_TOOLS_PER_TURN}
 
 
 # ---- Codex turn.completed（純粋ヘルパ） ----

@@ -357,15 +357,18 @@ def test_budget_limit_truncate_converges_bytes_even_when_count_truncation_is_not
 def test_budget_limit_truncate_converges_to_minimal_kept_set_under_extreme_bloat():
     """既定のバイト上限（100万バイト）に対して、巨大ノード（1件50KB）ばかりでも収束は必ずバイト
     上限内で止まる（極端な入力でも kept を大幅に削って収束する挙動そのものを固定する）。
-    このケースは既定の上限では marker 単独までは到達しない（19件が生き残る＝実測）——
-    marker 単独への到達自体は
+    このケースは既定の上限では marker 単独までは到達しない（19件が生き残る＝実測・開始件数を
+    450→60 に減らしても収束後の残存件数はバイト上限のみで決まるため変わらない――
+    `_budget_limit_truncate` は1件ずつ削るループのため、開始件数を大きくしても検証する収束の
+    仕組み自体は変わらず、450件は単に毎ノード50KBの JSON 再シリアライズを余計な回数繰り返して
+    実行時間だけを押し上げていた）。marker 単独への到達自体は
     `test_budget_limit_truncate_falls_back_to_marker_alone_when_byte_budget_is_extremely_tight` で
     バイト上限を絞って別途固定する。
     """
     nodes = {f"n{i}": EE.build_event(f"n{i}", "tool", f"l{i}", "d", "done", metrics={"blob": "x" * 50_000})
-             for i in range(450)}
+             for i in range(60)}
     age = {nid: i for i, nid in enumerate(nodes)}
-    out = CS._budget_limit_truncate(nodes, age, original_total=450)
+    out = CS._budget_limit_truncate(nodes, age, original_total=60)
     assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES
     assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID
     assert len(out) > 1                                              # marker 単独ではなく複数ノード残しで収束する
@@ -784,6 +787,22 @@ def test_stream_message_stopped_before_result_saves_no_duration(monkeypatch):
     list(CS.stream_message(None, "duration stop テスト", world="v1", conversation_id=999,
                            user_id="admin", knowledge=False, stop_event=stop_event))
     # user メッセージのみ保存（assistant は保存されない＝duration_ms を持つ行が無い）。
+    assert all(r["role"] != "assistant" for r in saved)
+
+
+def test_handle_message_stopped_saves_no_assistant_and_returns_stopped(monkeypatch):
+    """同期経路（POST /chat）も停止時は stream_message と同じ契約: assistant を保存せず
+    `{"type": "stopped"}` を返す（停止後に provider が返す _result を回答として永続化しない）。"""
+    saved = _mock_store_no_db(monkeypatch)
+    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
+            "detail": "内容を把握しました", "status": "done"}
+    events = [node, _fixed_result("到達しないはずの回答")]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = CS.handle_message(None, "sync stop テスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, stop_event=stop_event)
+    assert out == {"type": "stopped", "conversation_id": 999}
     assert all(r["role"] != "assistant" for r in saved)
 
 
@@ -1917,6 +1936,22 @@ def test_finalize_replaces_headline_for_hybrid_sub_task_id_even_with_budget_stop
     assert out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
 
 
+def test_finalize_keeps_partial_headline_when_codex_stopped_early_even_with_zero_sources():
+    """TIMEOUT-1: Codex が自動継続を尽くしてもなお結論に届かなかった途中結果
+    （`codex_stopped_early`）は、出典0件・全軸最も緩い設定でも「見つからなかった」確定文言
+    （`_NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE`）へ置換しない（STOP-1 と同型の保護）。resume 案内も
+    0件案内の hints とは独立に必ず付く（`test_codex_auto_continue.py` が provider 側で立てる
+    `codex_stopped_early` の実測込みで resume hint 付与を確認する・こちらは `_finalize` 単体の
+    契約として最小限を固定する）。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={"citations": []})
+    env["headline"] = "続いて関連ファイルを確認します。"
+    env["codex_stopped_early"] = True
+    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
+    assert out["headline"] == "続いて関連ファイルを確認します。"
+    assert out["headline"] != CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+    assert any(h["kind"] == "resume" for h in out["retry_hints"])
+
+
 def test_finalize_does_not_replace_headline_for_impact_even_when_loosest():
     """impact/troubleshoot には層の概念が無く既存 headline が十分具体的なため対象外（RV1 #9）。"""
     env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": False})
@@ -2140,3 +2175,38 @@ def test_troubleshoot_and_impact_headlines_carry_truncation_note():
     assert note in ts["headline"]
     im = CS._answer_impact({"items": [], "start": "契約", "notes": [note]}, "w")
     assert note in im["headline"]
+
+
+# ===== 秘匿名（更新前に索引化された credentials.xlsx 等）は facts へ出さない（台帳 #85〜#88） =====
+
+def test_es_hits_excludes_sensitive_doc_ids(monkeypatch):
+    from sherpa import documents as documents_mod
+    from sherpa import es_index as es_index_mod
+
+    monkeypatch.setattr(documents_mod, "world_rel_set",
+                        lambda world: {"a/credentials.xlsx", "a/report.xlsx"})
+    monkeypatch.setattr(es_index_mod, "search", lambda world, query, scope_paths=None, k=8,
+                        vector=False, layer=None: (
+                            [{"doc_id": "a/credentials.xlsx", "text": "secret"},
+                             {"doc_id": "a/report.xlsx", "text": "ok"}], None))
+    out = CS._es_hits("w", "q", None)
+    doc_ids = [h["doc_id"] for h in out]
+    assert "a/credentials.xlsx" not in doc_ids
+    assert doc_ids == ["a/report.xlsx"]
+
+
+def test_facts_troubleshoot_carries_limits_and_candidate_overflow_note():
+    from sherpa.providers.prompts import _facts
+    cs = [{"name": f"P{i}", "role": "prog", "evidence": {}} for i in range(12)]
+    env = {"data": {"candidates": cs},
+           "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: x.md「本文」"}
+    out = _facts("troubleshoot", env)
+    assert "残り 4 件は未提示" in out and "調査の限界: 調査を上限到達で中断" in out and "ev-1" not in out
+
+
+def test_facts_impact_zero_items_carries_limit_lines():
+    from sherpa.providers.prompts import _facts
+    env = {"data": {"citations": [], "items": []},
+           "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: [graph] X"}
+    out = _facts("impact", env)
+    assert "計0件" in out and "調査の限界: 調査を上限到達で中断" in out

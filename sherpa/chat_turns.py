@@ -66,15 +66,6 @@ MAX_BUFFER_BYTES = 2_000_000
 # 完了ターンの buffer 保持時間（秒）。DB へ永続済みのため、再接続（画面遷移して戻る）の猶予だけ持たせる。
 COMPLETED_TTL_SECONDS = 600
 
-# 固まった provider（Bedrock/Codex 等の SDK 呼び出しが返らない）でターン枠が永久に埋まるのを防ぐ
-# reaper の閾値（HIGH・Codex RV 指摘）。段階的解放は `_sweep_expired_locked` 参照。
-# MAX_TURN_SECONDS: Codex author 系の実行 timeout（`SHERPA_CODEX_TIMEOUT_AUTHOR` 既定 600s・
-# agents.py 参照）に十分な余裕を足した値。FORCE_DONE_GRACE_SECONDS: 協調停止要求
-# （stop_event.set）から強制解放までの猶予（provider がチェックポイントに辿り着く時間を見込む）。
-MAX_TURN_SECONDS = 900
-FORCE_DONE_GRACE_SECONDS = 120
-
-
 class TurnLimitError(Exception):
     """同時実行数の上限超過（呼び出し側で 429 に変換する）。"""
 
@@ -102,8 +93,7 @@ class TurnBuffer:
         self.completed_at: float | None = None
 
     def append(self, payload: dict) -> None:
-        """イベントを追記する（完了後の追記は無視＝安全側。reaper の強制 mark_done 後に run_fn が
-        なお動き続けて emit してきても、ここで黙って捨てられる＝多層防御）。"""
+        """イベントを追記する（完了後の追記は無視＝安全側・多層防御）。"""
         raw = json.dumps(payload, ensure_ascii=False, default=str)
         nbytes = len(raw.encode("utf-8"))
         with self._cond:
@@ -171,37 +161,20 @@ _REGISTRY_LOCK = threading.Lock()
 
 
 def _sweep_expired_locked() -> None:
-    """完了後 TTL を過ぎたターンをレジストリから外す＋固まった実行中ターンを段階的に解放する
-    （呼び出し側で `_REGISTRY_LOCK` 保持済み前提）。
+    """完了後 TTL を過ぎたターンをレジストリから外す（呼び出し側で `_REGISTRY_LOCK` 保持済み前提）。
 
-    HIGH（Codex RV）: run_fn が返らない限り mark_done は呼ばれず、reaper が無いと SDK 呼び出しの
-    ハング（Bedrock stream 等）でターン枠が 429 のまま永久に埋まる。ここで2段階の解放を行う:
-      1) 経過 > MAX_TURN_SECONDS: `stop_event.set()`（協調停止の要求。idempotent なので毎回呼んでも
-         無害＝以後のスイープでも繰り返し set されるだけ）。既存の `stream_message(stop_event=...)`
-         機構がチェックポイントで気づける可能性に賭ける。
-      2) 経過 > MAX_TURN_SECONDS + FORCE_DONE_GRACE_SECONDS でまだ未完了: buffer にタイムアウトの
-         error イベントを積んで `mark_done()`（枠を強制解放）。daemon thread 自体は残り得るが、
-         `TurnBuffer.append` は done 後の追記を無視する多層防御があるため安全（後から run_fn が
-         completeしても buffer には何も残らない・DB永続は run_fn 側＝chat_service の話でここは関与しない）。
-    DB 永続済みのため、完了ターンをレジストリから外しても会話履歴は失われない（覗き窓の在庫整理）。
-    専用の背景スレッドは持たず、レジストリに触れるたびの遅延掃除で足りる（in-memory のみ・
-    `_sweep_expired_workspace` のような別スレッド定期実行は過剰）。
+    調査全体を経過時間だけで打ち切らない契約（TIMEOUT-1）——終了は run_fn の完了・利用者の
+    `stop_turn`・例外（`_run` の except→mark_done）だけで、経過時間による協調停止要求／強制
+    `mark_done()` は行わない。DB 永続済みのため、完了ターンをレジストリから外しても会話履歴は
+    失われない（覗き窓の在庫整理）。専用の背景スレッドは持たず、レジストリに触れるたびの遅延掃除で
+    足りる（in-memory のみ・`_sweep_expired_workspace` のような別スレッド定期実行は過剰）。
     """
     now = time.time()
-    now_dt = datetime.now(timezone.utc)
     expired: list[str] = []
     for tid, rec in _REGISTRY.items():
         if rec.buffer.done:
             if rec.buffer.completed_at is not None and (now - rec.buffer.completed_at) > COMPLETED_TTL_SECONDS:
                 expired.append(tid)
-            continue
-        elapsed = (now_dt - rec.started_at).total_seconds()
-        if elapsed > MAX_TURN_SECONDS:
-            rec.stop_event.set()
-        if elapsed > MAX_TURN_SECONDS + FORCE_DONE_GRACE_SECONDS:
-            rec.buffer.append({"type": "error",
-                               "message": "応答がタイムアウトしました。もう一度お試しください。"})
-            rec.buffer.mark_done()
     for tid in expired:
         _REGISTRY.pop(tid, None)
 
@@ -332,19 +305,15 @@ def start_turn(*, uid: str,
         raise
 
     rec.conversation_id = conversation_id
-    # RV r2 MEDIUM: factory が固まっている間（> MAX+GRACE）に reaper が予約を強制解放
-    # （force-done ないし TTL で除去）していたら、実処理は起動しない。無条件に spawn すると
-    # limit/running/stop の**管理外**で LLM 実行が走る（枠外実行）。done 済みの rec を返せば、
-    # 購読側はタイムアウトの error イベント replay で完結する（graceful degradation）。
-    # この確認と thread 起動の間に reaper が done にする微小な競合は残るが、その場合も
-    # buffer.append が done 後を無視する既存の多層防御で「窓に何も出ない」だけに収まる。
-    with _REGISTRY_LOCK:
-        alive = _REGISTRY.get(turn_id) is rec and not rec.buffer.done
-    if not alive:
-        _log.warning("chat turn reservation expired before spawn (factory too slow): turn_id=%s uid=%s",
-                     turn_id, uid)
-        return rec
-    run_fn = run_fn_factory(conversation_id)
+    # 経過時間による予約の強制解放（reaper）は撤去済み（TIMEOUT-1）——`rec` はここまで
+    # `_REGISTRY` から取り除かれず `buffer.done` も立たない（`mark_done()` を呼ぶのは
+    # 下の `_run()` 自身の finally だけで、それはこの後の thread 起動より後にしか起きない）。
+    try:
+        run_fn = run_fn_factory(conversation_id)
+    except Exception:
+        with _REGISTRY_LOCK:
+            _REGISTRY.pop(turn_id, None)   # 予約取消（`_run` が起動しなければ `mark_done` は誰も呼ばない）
+        raise
 
     def _run():
         try:
@@ -360,7 +329,12 @@ def start_turn(*, uid: str,
         finally:
             rec.buffer.mark_done()
 
-    threading.Thread(target=_run, daemon=True, name=f"sherpa-turn-{turn_id[:8]}").start()
+    try:
+        threading.Thread(target=_run, daemon=True, name=f"sherpa-turn-{turn_id[:8]}").start()
+    except Exception:
+        with _REGISTRY_LOCK:
+            _REGISTRY.pop(turn_id, None)   # 同上（スレッド起動失敗＝枠を占有したまま残さない）
+        raise
     return rec
 
 
@@ -370,8 +344,10 @@ def get_turn(turn_id: str) -> TurnRecord | None:
         return _REGISTRY.get(turn_id)
 
 
-def list_running(uid: str) -> list[TurnRecord]:
+def list_running(uid: str, *, all_users: bool = False) -> list[TurnRecord]:
     """指定ユーザーの実行中（未完了）ターン一覧（トップバーの表示・会話再訪時の自動再購読に使う）。
+    `all_users` は管理者向け＝全員分を返す（固まったターンを `stop_turn(is_admin=True)` で解放するには
+    turn_id を知る手段が要る・呼び出し側で管理者判定済みのときだけ True）。
 
     conversation_id が未確定（予約中＝`start_turn` が conversation_factory を実行している最中）の
     レコードは skip する（MEDIUM・Codex RV: 外部にはまだ存在しない会話IDを見せない・そもそも
@@ -380,14 +356,15 @@ def list_running(uid: str) -> list[TurnRecord]:
     with _REGISTRY_LOCK:
         _sweep_expired_locked()
         return [r for r in _REGISTRY.values()
-                if r.uid == uid and not r.buffer.done and r.conversation_id is not None]
+                if (all_users or r.uid == uid) and not r.buffer.done and r.conversation_id is not None]
 
 
-def stop_turn(turn_id: str, uid: str) -> bool:
+def stop_turn(turn_id: str, uid: str, *, is_admin: bool = False) -> bool:
     """本人の実行中ターンのみ停止できる（存在しない/他人/完了済みはすべて False＝既存 `/chat/stream/stop`
-    と同じ「存在有無を教えない」非公開ポリシー）。"""
+    と同じ「存在有無を教えない」非公開ポリシー）。`is_admin` は本人一致の条件を外す——実行を経過時間で
+    打ち切らないため、本人が止めない固まったターンを枠から解放できる主体が管理者にも要る。"""
     rec = get_turn(turn_id)
-    if rec is None or rec.uid != uid or rec.buffer.done:
+    if rec is None or (rec.uid != uid and not is_admin) or rec.buffer.done:
         return False
     rec.stop_event.set()
     return True

@@ -105,7 +105,12 @@ def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff
       `doctype` は `_NONCODE_DOCTYPE` にあればその値、無ければ `None`（呼び出し側が
       Office/画像/未対応へ倒す）。`had_code_candidates`＝この拡張子を要求する登録済み
       アナライザが1つ以上あったか（`accepts()` 全滅で資料の枠へ落ちたことを可視化するのに使う・
-      裁定10「その旨を内訳へ」）。
+      裁定10「その旨を内訳へ」）。**秘匿名（`text_kind.is_sensitive`）で早期returnした場合だけ
+      `"sensitive": True` を追加で持つ**——`doctype=None`／`had_code_candidates=False` という
+      形は「真に未分類（Office/画像として再採用してよい）」の場合とも一致してしまうため、
+      呼び出し側（`_doctype_for_count`/`iter_world_documents`/`scan_report`）が Office/画像の
+      拡張子分類へ**再度**倒して秘匿ファイルを本文付きで台帳・変換・精読へ通してしまわないよう、
+      この旗で明示的に区別する。
     - `{"kind": "unreadable", "had_code_candidates": True}` — 内容判定が必要だったが
       読み取れなかった。次点アナライザへは進まず（誤配属しない）ここで判定を打ち切る。
 
@@ -134,6 +139,13 @@ def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff
     モックした単体テストで `store.get_world()` の返り値不足により落ちた・2026-09-02）。
     `scan_report`/`iter_world_documents`（どのみち全木を歩く経路）は既定 True のまま。
     """
+    # 秘匿ファイル（.env 系・id_rsa 系・credentials 等＝名前規約を含む）は担当アナライザの有無に
+    # よらず分類経路から外す。拡張アナライザが `.old`/`.local` のような拡張子を担当宣言しても、
+    # 秘匿除外が無効化されて本文が台帳・grep・精読（外部送信）へ流れないための不変条件。
+    # `sensitive: True`＝呼び出し側が Office/画像の拡張子分類へ再度倒して秘匿ファイルを
+    # 台帳・変換対象へ再採用しないための明示的な旗（上のdocstring参照）。
+    if text_kind.is_sensitive(Path(rel_path).name, ext):
+        return {"kind": "document", "doctype": None, "had_code_candidates": False, "sensitive": True}
     candidates = _analyzer_registry.candidates(rel_path)
     if not candidates:
         doctype = _NONCODE_DOCTYPE.get(ext)
@@ -342,7 +354,15 @@ def _doctype_for_count(result: dict, ext: str) -> str | None:
     """`classify_document()` の戻り値 `result` から集計用 doctype を導く（`status_document_doctype`
     の判定そのもの・`manifest_doctype_count`/`manifest_doctype_count_from_root`/`scan_report` の
     `document_count` が全て共有する単一の判定——`result` を再計算せず呼び出し元がキャッシュを渡せる
-    ようにして重複 I/O を避ける）。"""
+    ようにして重複 I/O を避ける）。
+
+    `result["sensitive"]`（秘匿名で早期returnした印・`classify_document` docstring参照）は
+    Office/画像の拡張子分類へ**再度**倒さず無条件で `None`（対象外・件数に入れない）——
+    そうしないと `.env.png`/`credentials.xlsx` 等が「担当なし＝資料として Office/画像 doctype」に
+    再採用されてしまう。
+    """
+    if result.get("sensitive"):
+        return None
     if result["kind"] == "unreadable":
         return _UNREADABLE_DOCTYPE_LABEL
     if result["kind"] == "code" or result["doctype"] is not None:
@@ -419,6 +439,8 @@ def status_document_requires_coverage(rel_path: str, world: str) -> bool:
     result = classify_document(
         rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
         allow_content_sniff=False)
+    if result.get("sensitive"):          # 秘匿名は Office/画像へ再採用しない（`_doctype_for_count` と同じ理由）
+        return False
     if result["kind"] in ("code", "unreadable") or result["doctype"] is not None:
         return False
     if ext in _OFFICE_DOCTYPE:
@@ -673,6 +695,9 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             return cache[size]
 
         result = classify_document(rel, ext, _cached_read_head)
+        if result.get("sensitive"):          # 秘匿名: 台帳にも件数にも入れない
+            _log.warning("scan_report: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
+            continue
         # `document_count`（`/ext/v1/capabilities` の doc_count が使う値）: `manifest_doctype_count`/
         # `status_document_doctype` と同一の判定（`allow_content_sniff=False`）を、本ループが既に
         # 読んだ head を `_cached_read_head` 経由で再利用して求める——`registry` の登録済みアナライザ
@@ -804,6 +829,9 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
         # （常に真）のアナライザしか候補に無ければ内容を読まない＝列挙コストは増やさない・§7 裁定10）。
         # scan_report/status_document_doctype と同じ classify_document() を共有する。
         result = classify_document(rel, ext, lambda rp=rp, size=4096: _read_head(rp, size))
+        if result.get("sensitive"):          # 秘匿名: 台帳に載せない・Office/画像へ再採用しない
+            _log.warning("iter_world_documents: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
+            continue
         if result["kind"] == "unreadable":
             # 内容判定が必要だったが読み取れない＝次点アナライザへ誤配属せず判定を打ち切り、
             # 明示の失敗状態として出す。

@@ -204,6 +204,18 @@ def test_is_query_timeout_matches_known_code_shapes():
     assert not ls._is_query_timeout(_other_error())
 
 
+# ---- S3c（裁定2026-09-11）: edges に辺ごとの向き（from/to）を含める ----------
+
+def test_neo4j_related_cypher_returns_directed_edges():
+    """探索自体は無向のまま（辿り漏れを防ぐ）だが、代表経路の `edges` は各辺の実際の向きを
+    `startNode(e).name`/`endNode(e).name` として持ち帰る（`from`/`to`）。"""
+    s = _FakeSession(rows=[_related_row("c1", "NODE")])
+    ls.neo4j_related(s, ["root"], "w1")
+    query, _params = s.calls[0]
+    assert "startNode(e).name" in str(query)
+    assert "endNode(e).name" in str(query)
+
+
 # ---- 正常系回帰: 返却形状は不変 ---------------------------------------------
 
 def test_neo4j_related_shape_unchanged():

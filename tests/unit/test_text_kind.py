@@ -115,6 +115,17 @@ def test_h1_private_key_pem_header_vetoes_content_regardless_of_name():
     assert text_kind.sniff_content(renamed_key) == "binary"
 
 
+def test_is_sensitive_doc_id_matches_is_sensitive_on_name_and_suffix():
+    """`is_sensitive_doc_id`（doc_id/rel_path 文字列を受ける薄いラッパー、台帳 #85〜#88）は
+    `is_sensitive(Path(doc_id).name, Path(doc_id).suffix.lower())` と完全に同じ判定になる。"""
+    assert text_kind.is_sensitive_doc_id("a/b/credentials.xlsx")
+    assert text_kind.is_sensitive_doc_id("a/b/id_rsa")
+    assert text_kind.is_sensitive_doc_id(".env")
+    assert text_kind.is_sensitive_doc_id("server.pem")
+    assert not text_kind.is_sensitive_doc_id("a/b/report.xlsx")
+    assert not text_kind.is_sensitive_doc_id("readme.md")
+
+
 def test_classify_ext_document_side():
     for ext in (".csv", ".tsv", ".rtf", ".log"):
         assert text_kind.classify_ext(ext) == "document", ext
@@ -128,7 +139,8 @@ def test_classify_ext_unknown_returns_none():
 def test_code_and_document_ext_do_not_overlap_registered_analyzers():
     """text_kind の拡張子集合は既存の言語アナライザ登録簿と重複しない（既存が常に優先・要件）。"""
     from sherpa.ingest.analyzers import registry
-    reg = registry.registered_extensions()
+    # 上流アナライザだけと比べる（フォークが正規の拡張で .ts 等を担当するのは契約上許される）。
+    reg = frozenset().union(*(a.extensions for a in registry._UPSTREAM_ANALYZERS))
     assert not (text_kind.CODE_EXT & reg)
     assert not (text_kind.DOCUMENT_EXT & reg)
 

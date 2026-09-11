@@ -475,6 +475,34 @@ def test_run_world_pass_end_to_end_writes_and_prunes_cache(monkeypatch, tmp_path
     assert result2.changed_rels == []
 
 
+def test_run_world_pass_skips_sensitive_original_name(monkeypatch, tmp_path):
+    """秘匿名（`credentials.xlsx`）は `is_sensitive` 導入前に生成された rag.md が残っていても
+    LLM（外部API）へ本文を送らない（`text_kind.is_sensitive_doc_id`・台帳 #85〜#88）。"""
+    world = _isolate(monkeypatch, tmp_path)
+    cfg = {"provider": "openai", "model": "gpt-5.5"}
+    monkeypatch.setattr(llm_render, "available", lambda settings=None: cfg)
+
+    body = "出所: 原本「credentials.xlsx」\n本文: 「秘密の値」"
+    md = llm_render.stamp_rule_only(
+        _build_markdown([("ca", ("文書「credentials.xlsx」",), None, body, None)]))
+    rag_dir = worlds.derived_rag_dir(world)
+    rag_dir.mkdir(parents=True)
+    (rag_dir / "credentials.xlsx.rag.md").write_text(md, encoding="utf-8")
+
+    calls: list = []
+
+    def _fake_complete(system, user, cfg_arg, timeout=None):
+        calls.append(user)
+        return json.dumps({"text": "改変後テキスト"})
+
+    monkeypatch.setattr(graph_extract, "complete_json", _fake_complete)
+    result = llm_render.run_world_pass(world)
+    assert calls == []                                # complete_json（LLM呼び出し）自体が発生しない
+    assert result.changed_rels == []
+    assert result.docs_scanned == 0                    # スキャン対象からも外れる
+    assert (rag_dir / "credentials.xlsx.rag.md").read_text(encoding="utf-8") == md   # 不変
+
+
 def test_clear_cache_removes_file(monkeypatch, tmp_path):
     world = _isolate(monkeypatch, tmp_path)
     path = llm_render._cache_path(world)

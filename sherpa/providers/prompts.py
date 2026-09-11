@@ -20,6 +20,14 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _digest_limit_lines(env: dict) -> str:
+    """清書ダイジェストの「調査の限界」行だけを取り出す（impact／troubleshoot の分岐は引用ダイジェストを
+    そのまま渡さないため、限界（0件・打ち切り・保存時切断・上限到達で中断）だけは別途連結する）。"""
+    digest = env.get("_synthesis_digest") or ""
+    limits = [ln for ln in digest.splitlines() if ln.startswith("調査の限界: ")]
+    return ("\n" + "\n".join(limits)) if limits else ""
+
+
 def _facts(lens: str, env: dict) -> str:
     """取得済みRAGの事実を LLM への根拠として簡潔に整形（ここに無いことは書かせない）。
 
@@ -29,7 +37,7 @@ def _facts(lens: str, env: dict) -> str:
     （`agentic_search.build_synthesis_digest` の全件ダイジェスト）があればそれをそのまま使う——
     無ければ従来どおり先頭4引用×60字に整形する（ハイブリッド以外の呼び出し元は
     `_synthesis_digest` を持たないため挙動は不変）。troubleshoot／構造データありの impact は
-    このキーを見ない。
+    引用ダイジェストをそのまま渡さず、限界行だけ `_digest_limit_lines` で連結する。
     """
     d = env.get("data", {})
     # 影響調査（impact）も反復ツール検索の対象になった（2026-08-15）。その経路の env は
@@ -52,16 +60,18 @@ def _facts(lens: str, env: dict) -> str:
                  "関係グラフで確認するよう勧めること（症状語をそのまま探さない・フォルダにコードが無いとは断定しない）。")
         if items:
             names = "、".join(f"{i['name']}({i['category']})" for i in items[:12])
-            base = f"{origin}影響: 計{s.get('total', 0)}件。対象: {names}"
+            rest = f"（先頭12件・残り {len(items) - 12} 件は未提示）" if len(items) > 12 else ""
+            base = f"{origin}影響: 計{s.get('total', 0)}件。対象: {names}{rest}"
         else:
             presumed = d.get("presumed", [])               # 構造的な影響0件でも資料からの関連推定があれば必ず伝える（0で突き放さない・RV High）
             if presumed:
                 pn = "、".join(f"{p['name']}({p['category']})" for p in presumed[:12])
+                pn += f"（先頭12件・残り {len(presumed) - 12} 件は未提示）" if len(presumed) > 12 else ""
                 base = (f"{origin}確実な依存は見つからなかったが、資料からの関連（推定・要確認）が{len(presumed)}件: {pn}。"
                         "これらは推定であり確実ではない旨を明記すること" + steer)
             else:
                 base = f"{origin}影響: 計0件（該当なし）" + steer
-        return base + (env.get("_personal_facts") or "")
+        return base + _digest_limit_lines(env) + (env.get("_personal_facts") or "")
     if lens == "troubleshoot":
         from ..agentic_search import _redact            # grep 根拠本文も秘匿（ES は redact 済み・base grep の password/api_key 等を外部LLMへ流さない・RV High）
         cs = d.get("candidates", [])
@@ -71,7 +81,9 @@ def _facts(lens: str, env: dict) -> str:
             qs = [_redact(g.get("text", ""))[:80] for g in ev.get("grep", [])[:2] if g.get("text")]
             parts.append(f"{c['name']}({c.get('role', '')})" + (f" 根拠「{' / '.join(qs)}」" if qs else ""))
         base = "原因候補: " + "、".join(parts) if parts else "原因候補なし"
-        return base + (env.get("_personal_facts") or "")
+        if len(cs) > 8:
+            base += f"（先頭8件・残り {len(cs) - 8} 件は未提示）"
+        return base + _digest_limit_lines(env) + (env.get("_personal_facts") or "")
     digest = env.get("_synthesis_digest")
     if digest:
         return digest + (env.get("_personal_facts") or "")
@@ -82,8 +94,17 @@ def _facts(lens: str, env: dict) -> str:
 
 def _answer_prompt(message, lens, env):
     return ("あなたは社内ナレッジの回答アシスタントです。以下の『取得済みの事実』だけを根拠に、"
-            "日本語で簡潔に（2〜4文）回答してください。事実に無いことは書かない（推測しない）。"
-            "件数や対象名は事実のまま。出典の列挙は不要（別途付与）。"
+            "日本語で回答してください（長さは絞らない＝取得済みの事実は削らず、事実に載っている項目は"
+            "パス付きで省略せず列挙する。要約や代表例化で項目を落とさない。事実に無いパス・対象名は補わない）。"
+            "表を指定されたら指定列を守り、項目と行・値の対応を保つ。取得できなかった値は推測で埋めず"
+            "『未取得』と書く。取得済みの事実に無いことを補うときは『推定』と明示し、確定した事実と分けて書く。"
+            "『調査の限界』行のうち対象範囲に関わるもの（本文の切断・未取得・未確認の範囲）があれば"
+            "回答で未確認範囲として明示し『全件』『すべて』とは断定しない（一覧の取得総数が件数と一致して"
+            "いれば、その一覧は全件として書いてよい。同じ条件の一覧行が複数あるとき（ページ送り）は列挙の合計と"
+            "該当を比べ、合計が該当に満たないときだけ未取得分の件数を明示して『全件』と書かない。"
+            "パスが未提示の一覧行（『他 N 件のパスは未提示』）があれば、その一覧は全件として書かず未提示の件数を示す。"
+            "途中の空振り検索の『0件』は一覧の完了を否定しない）。"
+            "件数や対象名は事実のまま。出典（原本 DL）は Sherpa が付与するが、本文中でも根拠のパスを示してよい。"
             "回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。"
             f"\n\n【質問】{message}\n【取得済みの事実】{_facts(lens, env)}\n\n回答のみ:")
 
@@ -116,14 +137,15 @@ def _kb_hint_abs(world: str) -> str:
 
 # 社内資料参照オフのときの素のプロンプト（検索結果＝事実を渡さない＝出典なしの一般回答）。
 _PLAIN_PROMPT = ("あなたは親切な日本語アシスタントです。社内資料は参照していません。"
-                 "一般的な知識の範囲で簡潔に答えてください。**出典・社内資料・ファイル名・引用に基づくとは言わない**。"
+                 "一般的な知識の範囲で答えてください。**出典・社内資料・ファイル名・引用に基づくとは言わない**。"
                  "資料に基づく確認が必要なら『社内資料をオンにしてください』と促す。\n\n【質問】{q}\n回答:")
 
 # HIGH-1 fix: 個人ファイルのヒットを plain プロンプトに注入するテンプレート。
 _PLAIN_PROMPT_WITH_PERSONAL = (
     "あなたは親切な日本語アシスタントです。社内資料は参照していませんが、"
-    "ユーザー本人がアップロードした個人ファイルのヒットが以下にあります。これを根拠に簡潔に答えてください。"
-    "**他のユーザーには共有されない個人データです**。出典の列挙は不要（別途付与）。\n\n"
+    "ユーザー本人がアップロードした個人ファイルのヒットが以下にあります。これを根拠に答えてください（長さは絞らない）。"
+    "**他のユーザーには共有されない個人データです**。個人ファイルは出典として一覧に出さない"
+    "（共有 RAG の引用元とは別扱い）。\n\n"
     "【個人ファイル内ヒット（本人のみ参照可・共有不可）】\n{personal}\n\n【質問】{q}\n回答:")
 
 # P1-a（Codex 強化計画 Phase1）: author 判定でも実行頭脳が Codex でない場合はファイルを作らず、

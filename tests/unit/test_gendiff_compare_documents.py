@@ -233,3 +233,23 @@ def test_registered_in_mcp_tool_defs(monkeypatch):
 
 def test_system_prompt_mentions_compare_documents():
     assert "compare_documents" in agentic_search.SYSTEM
+
+
+# ---- 秘匿名は rag.md が物理的に残っていても比較材料にしない（台帳 #85〜#88）----
+
+def test_sensitive_named_pair_is_unsupported_even_if_rag_md_exists(monkeypatch, tmp_path):
+    """`is_sensitive` 導入前に生成された `credentials.xlsx.rag.md` が残っている想定
+    （build_derived を経由せず直接 rag.md を置き、あえて「既存ファイルがある」状態を作る）。
+    `_rag_md_path` は doc_id 形式検査の直後で `text_kind.is_sensitive_doc_id` により None を
+    返すため、ファイルが実在していても diff 材料に使わず `status="unsupported"` に落ちる。
+    """
+    world = "gendiff-sensitive-test"
+    monkeypatch.setenv("SHERPA_DERIVED_DIR", str(tmp_path / "derived"))
+    rag_dir = worlds.derived_rag_dir(world)
+    for gen in ("4期", "5期"):
+        p = rag_dir / gen / "credentials.xlsx.rag.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("原本SHA-256: dummy\n本文\n", encoding="utf-8")
+    result = compare_docs.compare(world, {
+        "left_doc_id": "4期/credentials.xlsx", "right_doc_id": "5期/credentials.xlsx"})
+    assert result["status"] == "unsupported"

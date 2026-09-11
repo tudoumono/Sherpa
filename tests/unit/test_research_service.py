@@ -828,6 +828,12 @@ def test_host_and_network_unreachable_and_tls_errors_get_connection_message(monk
     import errno
     import ssl
 
+    # これらは全て OSError 系＝`_retryable_post_error` が再試行対象と判定し、`_send` が実際に
+    # 指数バックオフで待つ（`time.sleep`）。本テストの主張は「例外の種類→メッセージ」の分類
+    # だけでリトライの待ち時間そのものは対象外のため、待機だけを境界でモックする
+    # （既存の `test_agentic_search_post_retry.py`/`test_sub_loop.py` と同じ流儀）。
+    monkeypatch.setattr(A.time, "sleep", lambda sec: None)
+
     cases = [
         OSError(errno.EHOSTUNREACH, "No route to host"),
         OSError(errno.ENETUNREACH, "Network is unreachable"),

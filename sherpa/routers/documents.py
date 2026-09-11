@@ -32,6 +32,7 @@ from sherpa import doc_ledger, safe_open, store, worlds
 from sherpa import scope as scope_mod
 from sherpa.deps import _DEFAULT_WORLD, _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, validated_scope
 from sherpa.fd_response import FdFileResponse, FdOwner, content_disposition
+from sherpa.ingest import text_kind
 from sherpa.store.db import world_lock_shared
 
 _log = logging.getLogger("sherpa")
@@ -66,10 +67,16 @@ def doc_download(request: Request, rel: str = Query(...), world: str = Query(_DE
     （TOCTOU）。fstat 完了後（fd 自体は inode を掴んでおり以後のパス変化と無関係）にロックを
     解放してから監査・配信に進む——配信（大きなファイルだと時間がかかる）の間 rebind/delete を
     ブロックし続けない。
+
+    秘匿名（`text_kind.is_sensitive`）は台帳確認の直後・実体確認より前で塞ぐ——`is_sensitive`
+    導入前に取り込まれ台帳に残っている行（`credentials.xlsx` 等）が実体確認まで進んでしまうと
+    素通しで配信されるため（台帳 #81）。存在を明かさない既存の「見つからない」応答と同じ形にする。
     """
     u = _current_user(request)
     with world_lock_shared(world):
         if not store.document_exists(world, rel):
+            raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
+        if text_kind.is_sensitive_doc_id(rel):
             raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
         root = worlds.world_dir(world)
         if not root:
@@ -152,6 +159,9 @@ def _admin_es_search_endpoint(request: Request,
     for h in es_hits:
         doc = h.get("doc_id")
         if not doc or doc not in valid or not scope_mod.in_scope(doc, sp):
+            continue
+        # 更新前に索引化された秘匿名（credentials.xlsx 等）の本文を管理者検索でも返さない。
+        if text_kind.is_sensitive_doc_id(doc):
             continue
         hit = {"doc_id": doc, "line": h.get("line"), "snippet": h.get("text", ""),
                "score": h.get("score"), "ext": h.get("ext")}

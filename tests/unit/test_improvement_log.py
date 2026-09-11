@@ -141,6 +141,33 @@ def test_trace_tool_stats_counts_read_doc_as_files_read():
     assert truncated is False
 
 
+def test_trace_tool_stats_counts_original_read_tools_as_files_read():
+    """S3b（原本読取ツール・提案書2026-09-10 §2-9）: 「原本を読む（Excel/Word/PowerPoint/PDF/先頭）」の
+    5ラベルは tool_calls と files_read の両方に数える（原本の本文そのものを返すため read_around/
+    read_doc と同格）。"""
+    trace = [
+        {"id": "n1", "kind": "tool", "label": "原本を読む（Excel）", "detail": "a.xlsx", "status": "done"},
+        {"id": "n2", "kind": "tool", "label": "原本を読む（Word）", "detail": "b.docx", "status": "done"},
+        {"id": "n3", "kind": "tool", "label": "原本を読む（PowerPoint）", "detail": "c.pptx", "status": "done"},
+        {"id": "n4", "kind": "tool", "label": "原本を読む（PDF）", "detail": "d.pdf", "status": "done"},
+        {"id": "n5", "kind": "tool", "label": "原本を読む（先頭）", "detail": "e.py", "status": "done"},
+    ]
+    tool_calls, files_read, truncated = IL.trace_tool_stats(trace)
+    assert tool_calls == 5
+    assert files_read == 5
+    assert truncated is False
+
+
+def test_trace_tool_stats_counts_xlsx_sheets_as_tool_call_but_not_files_read():
+    """RV#11 是正: 「原本のシート一覧を確認」（xlsx_sheets）はシート名・大きさを見るだけで本文を
+    読んでいないため、tool_calls には数えるが files_read には数えない（doc_outline と同格）。"""
+    trace = [{"id": "n1", "kind": "tool", "label": "原本のシート一覧を確認", "detail": "a.xlsx", "status": "done"}]
+    tool_calls, files_read, truncated = IL.trace_tool_stats(trace)
+    assert tool_calls == 1
+    assert files_read == 0
+    assert truncated is False
+
+
 def test_trace_tool_stats_counts_doc_outline_as_tool_call_but_not_files_read():
     """TOOLREAD: doc_outline（「見出し構造を確認」）は tool_calls には数えるが、本文を読んで
     いない（構造の確認のみ）ため files_read には数えない。"""

@@ -6,13 +6,15 @@
 （`inspect.getsource` で argv/env の形を確認するだけ）で「実 codex CLI 起動は対象外」と明言して
 いるが、本ファイルはその明言されたギャップ（kill/timeout の実プロセス管理）を埋める。
 
-検証する3経路（いずれも sherpa/ 本体は無改修＝偽実行ファイルを PATH 経由で差し込むだけ）:
-  (a) SHERPA_CODEX_TIMEOUT を極小にして threading.Timer → `_killpg` が実際にプロセス「群」
-      （偽 codex 本体＋その子）を殺すこと。殺した後も fail-open で `_result` を返す（クラッシュしない）。
+検証する2経路（いずれも sherpa/ 本体は無改修＝偽実行ファイルを PATH 経由で差し込むだけ）:
   (b) ctx.stop_event セット → `_spawn_stop_watcher` が同じ `_killpg` でプロセス群を殺すこと。
   (c) generator の途中 close（クライアント切断相当）→ `_run_authoring` の finally
-      （`killer.cancel()` → `_killpg` → `proc.wait(5)` → `shutil.rmtree(codex_home)`）で
+      （`_killpg` → `proc.wait(5)` → `shutil.rmtree(codex_home)`）で
       プロセス残骸・CODEX_HOME 残骸がゼロになること。
+
+TIMEOUT-1（2026-09-11）: 調査全体を経過時間だけで打ち切らない契約に変更したため、旧 (a)
+（`SHERPA_CODEX_TIMEOUT` を極小にして `threading.Timer` の kill を確認するテスト）は撤去した
+（`threading.Timer`/`SHERPA_CODEX_TIMEOUT` はコードから撤去済み）。
 
 「codex コマンド解決」の差し替え点（sherpa/ 本体は無改修・実装を読んで特定）:
   起動ゲート `shutil.which("codex")` と `subprocess.Popen(argv, env=popen_env, ...)` の
@@ -130,49 +132,10 @@ def _setup(tmp_path: Path, monkeypatch, users_dirname: str = "users") -> tuple[P
     return bin_dir, sentinel_dir
 
 
-# ===== (a) SHERPA_CODEX_TIMEOUT 極小 → Timer → _killpg が実際にプロセス群を殺す =====
-
-def test_timeout_timer_kills_process_group_and_fails_open(tmp_path, monkeypatch):
-    _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch)
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "1.0")   # 極小（既定180秒に対して）だが起動猶予は確保
-
-    prov = A.CodexProvider()
-    ctx = _ctx(uid="killtimeout-u1")
-
-    events: list = []
-
-    def _drive():
-        for ev in prov.run(ctx):
-            events.append(ev)
-
-    th = threading.Thread(target=_drive, daemon=True)
-    th.start()
-    th.join(timeout=20)
-    assert not th.is_alive(), "timeout 経路が想定時間内に完走しない（Timer→_killpg が効いていない疑い）"
-
-    pid_file = sentinel_dir / "codex.pid"
-    child_pid_file = sentinel_dir / "child.pid"
-    assert pid_file.exists() and pid_file.read_text().strip(), "偽 codex プロセスが起動した形跡が無い（テスト前提が崩れている）"
-    assert child_pid_file.exists() and child_pid_file.read_text().strip(), "偽 codex の子プロセスが起動した形跡が無い"
-    pid = _read_pid(pid_file)
-    child_pid = _read_pid(child_pid_file)
-
-    # _killpg はプロセス「グループ」ごと殺す（MCP subprocess 等の子まで確実に殺す設計）。
-    assert not _pid_alive(pid), f"timeout 後も偽 codex 本体(pid={pid})が生きている（_killpg が効いていない）"
-    assert not _pid_alive(child_pid), f"timeout 後もプロセスグループ内の子(pid={child_pid})が生きている（グループ kill が効いていない）"
-
-    # fail-open: 落ちずに _result を返す（部分的に受け取った agent_message からの見出しでもよい）。
-    results = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"]
-    assert len(results) == 1, f"timeout 後に _result が出ていない（fail-open 経路が壊れている）events={events!r}"
-    assert results[0]["env"].get("headline"), "fail-open の headline が空"
-
-
 # ===== (b) stop_event セット → _spawn_stop_watcher による kill =====
 
 def test_stop_event_triggers_watcher_kill(tmp_path, monkeypatch):
     _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_stop")
-    # Timer が先に発火して stop_event 経路の検証を汚染しないよう、timeout は十分大きくしておく。
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "120")
 
     prov = A.CodexProvider()
     stop_event = threading.Event()
@@ -211,7 +174,6 @@ def test_stop_event_triggers_watcher_kill(tmp_path, monkeypatch):
 
 def test_generator_close_kills_process_and_removes_codex_home(tmp_path, monkeypatch):
     _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_close")
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "120")   # Timer が先に発火しないよう十分大きく
 
     prov = A.CodexProvider()
     uid = "killclose-u1"
@@ -252,7 +214,7 @@ def test_generator_close_kills_process_and_removes_codex_home(tmp_path, monkeypa
     assert len(run_dirs_before) == 1, f"run dir が想定どおり1個作られていない: {run_dirs_before!r}"
     run_dir = run_dirs_before[0]
 
-    gen.close()   # クライアント切断相当（finally: killer.cancel→_killpg→proc.wait(5)→rmtree(codex_home)）
+    gen.close()   # クライアント切断相当（finally: _killpg→proc.wait(5)→rmtree(codex_home)）
 
     assert not _pid_alive(pid), f"close() 後も偽 codex 本体(pid={pid})が生きている（finally の _killpg が効いていない）"
     assert not _pid_alive(child_pid), f"close() 後もプロセスグループ内の子(pid={child_pid})が生きている"
@@ -268,7 +230,6 @@ def test_generator_close_releases_conversation_lock(tmp_path, monkeypatch):
     from sherpa.providers.codex import provider as PV
 
     _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_close_conv")
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "120")
 
     prov = A.CodexProvider()
     uid = "killclose-conv-u1"

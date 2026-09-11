@@ -7,12 +7,25 @@ symlink は一切追従しない（fail-closed）。台帳スナップショッ�
 """
 from __future__ import annotations
 
+import ast
 import os
 import pathlib
+import re
 import tempfile
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 from sherpa import codex_skills as S  # noqa: E402
+
+# S3（提案書 2026-09-10-Codex原本直読と調査スキル §2-6）: 調査スキル5本。frontmatter の name は
+# ディレクトリ名と一致（investigate-list/investigate-spec/investigate-impact/investigate-cause/
+# investigate-compare）。各スキルで「必ず含む1句」を1つ決めて固定する（本文の骨格が崩れていないかの目印）。
+_INVESTIGATE_SKILLS = {
+    "investigate-list": "list_docs",
+    "investigate-spec": "read_only=True",
+    "investigate-impact": "graph_neighbors",
+    "investigate-cause": "仮説",
+    "investigate-compare": "compare_documents",
+}
 
 
 def _mk(d: pathlib.Path) -> pathlib.Path:
@@ -43,6 +56,52 @@ def test_base_skills_mention_correct_library_and_common_rules():
             assert phrase in txt, f"{name}/SKILL.md に共通ルール文言が無い: {phrase!r}"
 
 
+# ===== 調査スキル5本（S3・investigate-*）: frontmatter・必須句・Python コード片の構文 =====
+
+def test_investigate_skills_exist_with_frontmatter_name_matches_dir():
+    for name in _INVESTIGATE_SKILLS:
+        p = S.BASE_SKILLS_DIR / name / "SKILL.md"
+        assert p.is_file(), f"{name}/SKILL.md が無い"
+        txt = p.read_text(encoding="utf-8")
+        assert txt.startswith("---\n"), f"{name}/SKILL.md に frontmatter が無い"
+        lines = txt.splitlines()
+        assert lines[1] == f"name: {name}", f"{name}/SKILL.md の frontmatter name がディレクトリ名と不一致"
+
+
+def test_investigate_skills_description_nonempty_and_ends_with_使う():
+    for name in _INVESTIGATE_SKILLS:
+        txt = (S.BASE_SKILLS_DIR / name / "SKILL.md").read_text(encoding="utf-8")
+        desc_line = next(l for l in txt.splitlines()[:6] if l.startswith("description:"))
+        desc = desc_line[len("description:"):].strip()
+        assert desc, f"{name}/SKILL.md の description が空"
+        assert desc.endswith("使う。"), f"{name}/SKILL.md の description が「使う」で終わっていない: {desc!r}"
+
+
+def test_investigate_skills_have_required_phrase_and_common_structure():
+    for name, required_phrase in _INVESTIGATE_SKILLS.items():
+        txt = (S.BASE_SKILLS_DIR / name / "SKILL.md").read_text(encoding="utf-8")
+        assert required_phrase in txt, f"{name}/SKILL.md に必須句が無い: {required_phrase!r}"
+        # 共通骨格: 4節（最初に開くもの／中身の確認／完了条件と中断／回答の形）＋回答末尾の固定書式。
+        for phrase in ("最初に開くもの", "完了条件と中断", "回答の形", "参照した資料:"):
+            assert phrase in txt, f"{name}/SKILL.md に共通骨格の文言が無い: {phrase!r}"
+        line_count = len(txt.splitlines())
+        assert 60 <= line_count <= 160, f"{name}/SKILL.md の行数が想定範囲外: {line_count}"
+
+
+def test_investigate_skills_python_code_blocks_are_syntactically_valid():
+    """各スキルの ```python コード片は実際に ast.parse できる（API 名の初歩的な誤りを防ぐ）。"""
+    fence = re.compile(r"```python\n(.*?)```", re.S)
+    for name in _INVESTIGATE_SKILLS:
+        txt = (S.BASE_SKILLS_DIR / name / "SKILL.md").read_text(encoding="utf-8")
+        blocks = fence.findall(txt)
+        assert blocks, f"{name}/SKILL.md に python コードブロックが無い"
+        for i, block in enumerate(blocks):
+            try:
+                ast.parse(block)
+            except SyntaxError as e:
+                raise AssertionError(f"{name}/SKILL.md のコードブロック{i}が構文エラー: {e}") from e
+
+
 # ===== deploy_skills: base 配備・個人オーバーレイ・毎回作り直し =====
 
 def test_deploy_skills_copies_all_three_base_skills():
@@ -52,6 +111,17 @@ def test_deploy_skills_copies_all_three_base_skills():
         S.deploy_skills(authoring, "u1", users_dir)
         dest = authoring / ".agents" / "skills"
         for name in ("xlsx", "docx", "pptx"):
+            assert (dest / name / "SKILL.md").is_file(), f"{name} が配備されていない"
+
+
+def test_deploy_skills_copies_all_nine_base_skills_including_investigate():
+    """S3: ベーススキルは9本（既存4＝xlsx/docx/pptx/marp＋新5＝investigate-*）全てが配備される。"""
+    with tempfile.TemporaryDirectory() as td:
+        authoring = _mk(pathlib.Path(td) / "authoring")
+        users_dir = _mk(pathlib.Path(td) / "users")
+        S.deploy_skills(authoring, "u1", users_dir)
+        dest = authoring / ".agents" / "skills"
+        for name in ("xlsx", "docx", "pptx", "marp", *_INVESTIGATE_SKILLS):
             assert (dest / name / "SKILL.md").is_file(), f"{name} が配備されていない"
 
 

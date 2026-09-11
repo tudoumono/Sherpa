@@ -649,6 +649,9 @@ def test_index_world_fails_before_delete_when_real_embed_call_fails(monkeypatch)
     monkeypatch.setattr(es_index, "_embed_cached", _fake_embed_cached)
     monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: True)
     r = es_index.index_world("w")
+    # STAT-3 S5: `_embed_cached()` を実際に呼んだ（`embed_cached_calls` 参照）ので `embed_elapsed_ms`
+    # も返る（0 と欠落を区別する契約・値は計測時間のため非負であることだけ確認する）。
+    assert r.pop("embed_elapsed_ms") >= 0
     assert r == {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
     assert delete_calls == []
     assert embed_cached_calls and embed_cached_calls[0], "texts が空のまま _embed_cached が呼ばれた（列挙が先に終わっていない）"

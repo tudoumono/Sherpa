@@ -16,11 +16,17 @@ from .db import _connect, _ensure
 
 # 既定のシステムプロンプト（回答方針・テーマ非依存）。行が無いときはこれを使う。
 DEFAULT_SYSTEM_PROMPT = (
+    "資料を根拠に答え、根拠は資料のパス（必要なら箇所）で示してください。"
+    "資料に無いことを補うときは『推定』と明示し、確定した事実と分けて書いてください。"
+)
+# 旧既定文（2026-09-10 以前）。「既定に戻す」や無編集保存で DB に永続化された行がこれと完全一致する
+# ときだけ、読取時に現行の既定へ読み替える（DB は書き換えない・独自文と空文字はそのまま）。
+_LEGACY_DEFAULT_SYSTEM_PROMPTS = frozenset({
     "憶測で回答しないでください。不明な点は不明と伝えてください。"
     "根拠のある情報と推測を明確に分けてください。"
     "事実確認が必要な内容については、確認できた情報をもとに回答してください。"
-    "回答では、結論・理由・補足を分かりやすく整理してください。"
-)
+    "回答では、結論・理由・補足を分かりやすく整理してください。",
+})
 
 # 設定の既定値（行が無いときに使う）。agent=None＝未設定→呼び出し側が env SHERPA_AGENT にフォールバック。
 # RV MED（2026-07-16 Codex RV 1巡目 F1/F4/F6 是正）: `bedrock_verified_models` はここに**含めない**
@@ -128,6 +134,8 @@ def get_settings(user_id="admin") -> dict:
     s["bedrock_verified_models"] = list(verified_row["ids"]) if verified_row and verified_row["ids"] else []
     if s.get("system_prompt") is None:                 # 未設定(NULL)＝既定を使う（空文字""はユーザが消した＝そのまま）
         s["system_prompt"] = DEFAULT_SYSTEM_PROMPT
+    elif s["system_prompt"] in _LEGACY_DEFAULT_SYSTEM_PROMPTS:   # 保存された旧既定文＝現行既定に読み替え
+        s["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     return s
 
 
@@ -203,6 +211,10 @@ def update_settings(user_id="admin", **fields) -> dict:
     set_fragments += [f"{k}=EXCLUDED.{k}" for k in _key_cols if _key_touched[k]]
     set_fragments.append("updated_at=now()")
     set_sql = ", ".join(set_fragments)
+    # 回答方針が既定文（現行・旧）と同文なら NULL（＝既定に追随）で保存する。既定文そのものを行に
+    # 焼き付けると、以後の既定変更が届かない（`agent` 列で踏んだ罠と同型）。
+    if merged["system_prompt"] == DEFAULT_SYSTEM_PROMPT or merged["system_prompt"] in _LEGACY_DEFAULT_SYSTEM_PROMPTS:
+        merged["system_prompt"] = None
     with _connect() as c:
         if _writing_personal_key:
             c.execute("SELECT pg_advisory_xact_lock(%s)", (_PERSONAL_KEY_LOCK,))

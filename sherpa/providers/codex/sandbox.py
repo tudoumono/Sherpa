@@ -76,6 +76,204 @@ def _kb_read_roots(world: str) -> list:
     return roots
 
 
+def _direct_read_roots(world: str, scope_paths=None) -> list:
+    """原本直読（Codex がコードインタープリターで直接開く）で permission profile に read を許す
+    絶対パスの一覧＝KB root（`_kb_read_roots`）＋派生ルート（`derived_md_dir`／`derived_rag_dir`・
+    存在するもののみ）。正典＝docs/proposals/2026-09-10-Codex原本直読と調査スキル.md §2-1/§2-2。
+
+    範囲（scope）の限定は read root を狭めるのではなく、`_scope_deny_entries` が「範囲の経路上に
+    ない兄弟（フォルダ・ファイル）」を個別 deny することで実現する——Codex サンドボックス
+    （bubblewrap）では親フォルダの deny が子フォルダの read に勝ち、部分木だけを read にしても
+    辿れない（実測 2026-09-10）。`scope_paths` は互換のため受けるが本関数では使わない。
+    """
+    from ... import worlds
+
+    roots = list(_kb_read_roots(world))
+    for fn in (worlds.derived_md_dir, worlds.derived_rag_dir):
+        try:
+            d = fn(world)
+            if d.exists():
+                roots.append(str(d.resolve()))
+        except OSError:
+            continue
+    return roots
+
+
+def _scope_deny_entries(roots: list, scope_paths, *, max_entries: int = 2000) -> list:
+    """範囲（scope）を permission profile で硬く効かせるための deny 一覧（絶対パス）。
+
+    各 root について、選択された scope パスの経路上にある各フォルダを開き、**経路上でも選択先
+    でもない兄弟エントリ**を deny にする（root 自体は read のまま＝サンドボックスは親の deny が
+    子の read に勝つため、部分木の read ではなく兄弟の deny で範囲を表す）。symlink は deny に
+    書かない（bubblewrap は symlink への deny マスクを作れず起動に失敗する。symlink の実体が
+    範囲外なら実体側の deny で読めない・root 外なら `:root=deny` で読めない）。
+    選択された scope が root 配下に 1 つも存在しない root は、root 自体を deny にする。
+    scope が空（範囲なし）なら空リスト。deny 件数が `max_entries` を超えたら `RuntimeError`
+    （fail-closed＝直読を許可しない）。走査中の OSError も同じく `RuntimeError`（種別のみ）。
+    """
+    from ...scope import normalize_scope_paths
+
+    sel = normalize_scope_paths(scope_paths)
+    if not sel:
+        return []
+    out: list = []
+
+    def _fail(reason: str) -> None:
+        raise RuntimeError(f"scope_enum_failed:{reason}")
+
+    for root_s in roots:
+        root = Path(root_s)
+        try:
+            root_r = root.resolve()
+        except OSError as e:
+            _fail(type(e).__name__)
+        keep: list = []                                  # root 配下に実在する scope（相対の PurePath）
+        for sp in sel:
+            cand = root_r / sp
+            try:
+                cand_r = cand.resolve()
+                cand_r.relative_to(root_r)              # `..`／symlink 脱出は捨てる
+            except (OSError, ValueError):
+                continue
+            if cand.exists() and not cand.is_symlink():
+                keep.append(Path(sp))
+        if not keep:
+            out.append(str(root_r))                      # 範囲がこの root に無い＝root ごと deny
+            continue
+        # 親子で選ばれた scope（A と A/sub）は親だけ残す＝A 配下は全部範囲内（A/other を deny しない）
+        keep = [k for k in keep if not any(a != k and a in k.parents for a in keep)]
+        # 経路上のフォルダ（root, root/a, root/a/b, ...）を重複なく列挙する
+        chain_dirs: list = [Path()]
+        for k in keep:
+            for anc in reversed(k.parents):
+                if anc != Path() and anc not in chain_dirs:
+                    chain_dirs.append(anc)
+        for rel_dir in chain_dirs:
+            d = root_r / rel_dir
+            if d.is_symlink():
+                _fail("symlink_dir")                     # 経路上の symlink を跨ぐ deny は起動失敗になる
+            try:
+                entries = sorted(os.listdir(d))
+            except OSError as e:
+                _fail(type(e).__name__)
+            for name in entries:
+                rel = rel_dir / name
+                if any(rel == k or rel in k.parents for k in keep):
+                    continue                             # 選択先そのもの、または経路上
+                if (d / name).is_symlink():
+                    continue
+                out.append(str(d / name))
+                if len(out) > max_entries:
+                    _fail("max_entries_exceeded")
+    return out
+
+
+def _venv_root() -> Path | None:
+    """app の Python 実行環境（`.venv`）の絶対パス。`sys.prefix != sys.base_prefix` のとき、
+    その venv を Codex へ read で見せる（Office ライブラリを Codex から使わせる）。
+    venv 内で実行されていない（システム python 等）ときは None——read 行も PATH 補完も足さない。"""
+    if sys.prefix != sys.base_prefix:
+        try:
+            return Path(sys.prefix).resolve()     # symlink 配備でも実体パス（profile は symlink を跨ぐ行で起動失敗する）
+        except OSError:
+            return None
+    return None
+
+
+def _enumerate_sensitive(roots: list, *, max_hits: int = 200, max_files: int = 200_000) -> list:
+    """`roots` 配下（再帰）の秘匿名ファイルを絶対パスで列挙する（fail-closed）。秘匿の定義は
+    `text_kind.is_sensitive` に一本化（判定を複数箇所に散らさない）。通常は数件・上限超過は直読を諦める。
+    app の `.venv` も同じ関数で再帰する（実測 1.8 万ファイルで 0.1 秒・ライブラリ内の
+    `credentials.py`／`cacert.pem` が数件 deny になるが、Codex が Office を開くのに要らない）。
+
+    symlink は `followlinks=False` によりディレクトリとしては辿らない。symlink 自体が秘匿名なら、
+    **実体**が `roots` のどれかの配下にある通常ファイルのときだけ実体のパスを deny に入れる
+    （bubblewrap は symlink への deny マスクを作れず起動に失敗する・実体が root 外なら
+    `:root=deny` で読めない・dangling なら読めない）。戻り値は重複なし・ソート済み。
+
+    上限超過（`max_hits` を超える秘匿ファイル、または `max_files` を超える走査ファイル数）、または
+    走査中の OSError（PermissionError 等・アクセス不能ディレクトリ）は `RuntimeError` を送出する——
+    呼び出し元はこれを捕捉して直読を許可しない（MCP のみへ縮退）。例外メッセージは種別のみ
+    （`sensitive_enum_failed:<種別>`）＝パス・内容はログに出さない契約。
+    """
+    from ...ingest import text_kind
+
+    out: set = set()
+    scanned = 0
+    root_paths: list = []
+    for r in roots:
+        try:
+            root_paths.append(Path(r).resolve())
+        except OSError as e:
+            raise RuntimeError(f"sensitive_enum_failed:{type(e).__name__}")
+
+    def _fail(reason: str) -> None:
+        raise RuntimeError(f"sensitive_enum_failed:{reason}")
+
+    def _on_walk_error(exc: OSError) -> None:
+        _fail(type(exc).__name__)
+
+    def _inside_roots(p: Path) -> bool:
+        for rp in root_paths:
+            try:
+                p.relative_to(rp)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    for root in root_paths:
+        if not root.exists():
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False, onerror=_on_walk_error):
+            for name in filenames:
+                scanned += 1
+                if scanned > max_files:
+                    _fail("max_files_exceeded")
+                if not text_kind.is_sensitive(name, Path(name).suffix.lower()):
+                    continue
+                p = Path(dirpath) / name
+                if p.is_symlink():
+                    try:
+                        target = p.resolve(strict=True)
+                    except OSError:
+                        continue                          # dangling＝読めない
+                    if not (target.is_file() and _inside_roots(target)):
+                        continue                          # root 外＝`:root=deny` で読めない
+                    p = target
+                out.add(str(p))
+                if len(out) > max_hits:
+                    _fail("max_hits_exceeded")
+    return sorted(out)
+
+
+def _prune_deny_paths(deny: list, read_roots: list) -> list:
+    """permission profile に書く deny 行を整える: 重複を除き、read 対象（root）の配下に無いもの・
+    実在しないもの・symlink を落とし、既に deny されるフォルダの配下にある deny を落とす
+    （bubblewrap は deny 済みフォルダ内や symlink・不在パスへの deny マスクで起動に失敗する）。
+    read root そのものへの deny（直読不許可・範囲が root に無い）は残す。"""
+    roots: list = []
+    for r in read_roots:
+        try:
+            roots.append(Path(r).resolve())
+        except OSError:
+            continue
+    cands: list = []
+    for d in sorted(set(deny)):
+        p = Path(d)
+        if p.is_symlink() or not p.exists():
+            continue
+        if not any(p == rp or rp in p.parents for rp in roots):
+            continue
+        cands.append(p)
+    out: list = []
+    for p in cands:                                       # ソート済み＝親が先に来る
+        if any(kept in p.parents for kept in out):
+            continue
+        out.append(p)
+    return [str(p) for p in out]
+
+
 # 親環境に**設定されているときだけ** Codex へ透過する変数（閉域実機の是正・2026-08-18）。
 # プロキシ経由でしか外へ出られない閉域では、これが届かないと Codex（と web 検索）が OpenAI に到達できない。
 # MITM 型プロキシなら社内 CA も要る。いずれも**接続経路の設定であって creds（DB/ES/KB/API キー）ではない**
@@ -105,9 +303,15 @@ def _codex_clean_env(codex_home: Path, authoring: Path, tmpdir: Path,
     明示した provider だけが使う別経路で、本カスタム provider はそれを設定していない）。一方、既定
     （OpenAI 直結・組込み `openai` provider）は引き続き `auth.json`（実 home からの symlink）経由の
     ままで、この関数に env として渡す必要が無い＝呼び出し元（provider.py）はこの構成の時だけ
-    `openai_api_key` を渡す（他の全呼び出しは省略＝この docstring 追記だけでは何も変わらない）。"""
+    `openai_api_key` を渡す（他の全呼び出しは省略＝この docstring 追記だけでは何も変わらない）。
+
+    裁定: app の `.venv`（`_venv_root()`）で動いているときだけ、
+    PATH の**先頭**に `<venv>/bin` を足す（Office ライブラリ入りの python を Codex が優先して
+    掴む・venv が無ければ従来どおり）。"""
+    _venv = _venv_root()
+    _base_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PATH": f"{_venv / 'bin'}:{_base_path}" if _venv is not None else _base_path,
         "HOME": str(authoring),
         "CODEX_HOME": str(codex_home),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
@@ -360,17 +564,37 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
                                   ask_disabled: bool = False,
                                   ollama_base_url: str | None = None,
                                   system_settings: dict | None = None,
-                                  layer=None) -> None:
+                                  layer=None,
+                                  direct_read_roots: list | None = None,
+                                  sensitive_deny: list | None = None,
+                                  deny_roots: list | None = None) -> None:
     """per-request CODEX_HOME に permission profile（＋任意で MCP 設定）を書く。
     **creds は config ファイル内に閉じる**（`:root=deny` 下では model-shell から CODEX_HOME 不可視・
     コマンドライン `-c` に creds を出さない＝`/proc/<pid>/cmdline` 漏洩も無い）。auth.json は実 home から symlink。
 
     `layer`（省略可・既定 `None`＝both）: `_mcp_env` へそのまま転送する（探す対象・MCP サーバ側の
-    フィルタ）と同時に、`mcp=True` かつ `"docs"/"code"` に限定されているときは、解決済み KB ルート
-    それぞれへ permission profile 上で明示的な `deny` を書く（下記参照・正典 §3.4「範囲と同じ
-    硬いフィルタ」）——`":minimal"`（/usr,/bin,libs 等）配下に KB root が来る配置でも読めないよう、
-    読取許可の省略ではなく明示 deny にする。呼び出し元は qa レンズのときだけ実値を渡し、それ以外は
-    `None`（both）のまま呼ぶ契約。"""
+    フィルタ）だけに使う。裁定: **Codex は層の指定を強制しない**——
+    直読（この関数が書く permission profile の read）は層に関係なく許可し、層のフィルタは MCP
+    ツール側（`run_tool`・`_mcp_env` の `SHERPA_MCP_LAYER`）だけが担う。旧: `mcp=True` かつ層限定
+    のときに KB ルートを明示 `deny` していた挙動は撤去した（契約変更・
+    `test_codex_authoring_config_keeps_kb_root_read_even_when_layer_restricted` 参照）。
+
+    `direct_read_roots`（省略可・既定 `None`）: 渡されたとき、read するのは `kb_roots` ではなく
+    こちら（KB root／派生ルート＝`_direct_read_roots` の戻り値。範囲は `sensitive_deny` 側の兄弟 deny で
+    表す）。**明示的な空リスト `[]` は `None` と区別**——秘匿列挙／範囲の解決に失敗、または範囲が
+    どの root にも無いときに呼び出し元が「直読は許可しない（MCP のみ）」を表すために渡す。省略時
+    （既存呼び出し・単体テスト）は従来どおり `kb_roots` を read する＝回帰ゼロ。
+
+    `sensitive_deny`（省略可）: 個別 `deny` にする絶対パス一覧（`_enumerate_sensitive` の秘匿ファイル
+    と `_scope_deny_entries` の範囲外エントリ）。read 行より**後**に書く（具体パスほど優先）。
+    `_prune_deny_paths` で整形してから書く（symlink・不在・deny 済みフォルダ配下への deny は
+    bubblewrap の起動失敗になる＝実測）。
+
+    `deny_roots`（省略可）: `direct_read_roots == []` のときに KB root と併せて明示 deny する
+    root（派生ルート等）。
+
+    Python 実行環境（`_venv_root()`）は、渡された read 対象とは独立に、venv で動いているときだけ
+    常に read で足す（裁定）。"""
     codex_home.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(codex_home, 0o700)                 # RV HIGH: creds を含む CODEX_HOME を同ホスト他プロセス/ユーザから守る
@@ -429,21 +653,36 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
         '":root" = "deny"',       # FS 全体の読取を遮断（他人領域・秘密が見えない）
         '":minimal" = "read"',    # /usr,/bin,libs 等 実行最小限
     ]
-    # 正典 §3.4「範囲と同じ硬いフィルタ」: 層（探す対象）が限定されたターンは、KB への直接
-    # ファイル読み取りを許可せず MCP ツール経由の検索だけに構造的に限定する（MCP サーバ
-    # ＝`sherpa/mcp_server.py` の `run_tool` が層を実際にフィルタする）。both／未指定は
-    # 従来どおり KB を直接読取許可する（scope_paths と同じくプロンプト指示止まりで足りる）。
-    if mcp and layer not in (None, "both"):
-        # 読取許可を省略するだけでは足りない——world_admin_service は KB root の配置場所を
-        # 制限しないため、KB root が `":minimal"`（/usr,/bin,libs 等・実行最小限として無条件で
-        # read 許可）の配下に来る構成があり得る。省略はより広い許可の下で読めてしまうので、
-        # 解決済みの KB root ごとに明示的な deny 行を足す（具体パスほど優先される profile 解決に
-        # 頼らず、意図を明文化する）。
-        for r in kb_roots:
+    # 裁定: Codex は層の指定を強制しない——直読は層に関係なく read（旧: mcp=True
+    # かつ層限定のとき KB ルートを明示 deny していたが撤去。層のフィルタは MCP ツール側のみ）。
+    # `direct_read_roots is not None` のときは `kb_roots` の代わりにそちらを read する
+    # （空リスト `[]` は「秘匿列挙が失敗し直読を許可しない」の明示・docstring 参照）。
+    _read_roots = list(kb_roots) if direct_read_roots is None else list(direct_read_roots)
+    _venv = _venv_root()
+    if direct_read_roots == []:
+        # 直読不許可（秘匿列挙の失敗など）: KB root・派生 root・venv を明示 deny する（`":minimal"`
+        # 配下に来る配置でも読めないよう、read 行の省略ではなく deny を書く）。
+        _deny = list(kb_roots) + list(deny_roots or []) + ([str(_venv)] if _venv is not None else [])
+        _kept: list = []
+        for r in sorted(set(_deny)):                      # 親が deny 済みの root は書かない（deny 済み配下の deny 行は起動失敗）
+            rp = Path(r)
+            if not rp.exists() or rp.is_symlink():        # 不在・symlink への deny 行も起動失敗（読めない場所＝落として境界は緩まない）
+                continue
+            if any(Path(k) in rp.parents for k in _kept):
+                continue
+            _kept.append(r)
             lines.append(f'{_toml_str(r)} = "deny"')
     else:
-        for r in kb_roots:            # KB は読取専用
-            lines.append(f'{_toml_str(r)} = "read"')
+        _all_roots = _read_roots + ([str(_venv)] if _venv is not None else [])
+        # read 行より後＝範囲外の兄弟・秘匿ファイルは個別 deny（具体パスほど優先）。
+        # 整形（重複・symlink・不在・deny 済みフォルダ配下の除去）は `_prune_deny_paths`。
+        _deny_lines = _prune_deny_paths(list(sensitive_deny or []), _all_roots)
+        _deny_set = set(_deny_lines)
+        for r in _all_roots:                  # root ごと deny する root（範囲が無い等）には read 行を書かない（同一キー重複）
+            if r not in _deny_set:
+                lines.append(f'{_toml_str(r)} = "read"')
+        for p in _deny_lines:
+            lines.append(f'{_toml_str(p)} = "deny"')
     lines += [
         '',
         '[permissions.sherpa-authoring.filesystem.":workspace_roots"]',

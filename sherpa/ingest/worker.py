@@ -102,6 +102,35 @@ def _office_md_stage_summary(drep: dict) -> dict:
             "unsupported": drep.get("unsupported", 0)}
 
 
+def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict | None, rows: list) -> dict:
+    """STAT-3 S5: `extraction_snapshot["counts"]`（走査/対象/変換/索引/埋め込みの件数・時間）。
+
+    取れない項目はキー自体を付けない（0 と欠落を区別する契約）。`_record`／PG replace 失敗パスの
+    両方から呼ぶ（`_office_md_stage_summary`/`_failed_files_summary` と同じ共通片の役割）。
+    
+    `legacy_converted`／`legacy_failed` は「この run で実際に前段変換（LibreOffice／COM）した件数」＝変換キャッシュ
+    （CONV-CACHE）から復元した分は含まない（再同期では 0 になり得る・`converted` と `by_ext` には含まれる）。
+    """
+    c: dict = {}
+    if manifest is not None:
+        c["scanned"] = len(manifest)              # 走査で見つけたファイル数（world 未解決時は manifest も None）
+    c["targeted"] = len(rows)                      # 取り込み対象＝台帳に載せた数（rows は常に list）
+    if drep is not None:
+        c["converted"] = drep.get("converted", 0)
+        c["failed"] = drep.get("failed", 0)
+        c["unsupported"] = drep.get("unsupported", 0)
+        c["legacy_converted"] = drep.get("legacy_converted", 0)
+        c["legacy_failed"] = len(drep.get("legacy_conversion_failures") or [])
+    if es_summary is not None:
+        if es_summary.get("indexed") is not None:
+            c["es_indexed"] = es_summary["indexed"]
+        if es_summary.get("embedded") is not None:
+            c["embedded_chunks"] = es_summary["embedded"]
+        if es_summary.get("embed_elapsed_ms") is not None:
+            c["embed_elapsed_ms"] = es_summary["embed_elapsed_ms"]
+    return c
+
+
 def _failed_files_summary(drep: dict) -> dict:
     """`office_md.build_derived()` の各段 `*_failures` を1つの一覧へまとめる（rel＋stage＋閉じた理由コード）。
 
@@ -251,7 +280,28 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
     if on_run_id is not None:
         on_run_id(run_id)
 
+    # STAT-3 S5: 段ごとの開始・終了時刻（`_progress` の段遷移で確定・monotonic 差の ms と UTC ISO）。
+    # `_current_stage`＝今開いている段（同じ段への連続呼び出しでは開始時刻を更新しない）。段の終了は
+    # 次の段への遷移時、または run 終端（`_record`／pg_replace 失敗パス）で `_close_stage_timing()` を
+    # 呼んで確定する——失敗した run でも、そこまでに開いた段の時刻は残す。
+    stage_timings: dict = {}
+    _stage_mono: dict = {}
+    _current_stage = [None]
+
+    def _close_stage_timing() -> None:
+        stage = _current_stage[0]
+        if stage is None or stage_timings.get(stage, {}).get("finished_at") is not None:
+            return
+        stage_timings[stage]["finished_at"] = datetime.now(timezone.utc).isoformat()
+        stage_timings[stage]["elapsed_ms"] = round((time.monotonic() - _stage_mono[stage]) * 1000)
+
     def _progress(stage, done=None, total=None):
+        if stage != _current_stage[0]:
+            _close_stage_timing()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            stage_timings[stage] = {"started_at": now_iso, "finished_at": None, "elapsed_ms": None}
+            _stage_mono[stage] = time.monotonic()
+            _current_stage[0] = stage
         try:
             store.update_ingest_run_progress(run_id, {
                 "stage": stage, "stage_label": STAGE_LABELS.get(stage, stage),
@@ -284,6 +334,14 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
             snap["es"] = es_summary
         if neo4j_summary is not None:
             snap["neo4j"] = neo4j_summary
+        # STAT-3 S5: run 終端（この `_record` 呼び出し）で今開いている段を閉じてから記録する
+        # （失敗した run もそこまでの段の時刻を残す）。
+        _close_stage_timing()
+        if stage_timings:
+            snap["stage_timings"] = {k: dict(v) for k, v in stage_timings.items()}
+        counts = _counts_summary(drep, es_summary, manifest, rows)
+        if counts:
+            snap["counts"] = counts
         pending = {"status": status, "extraction_snapshot": snap, "published_snapshot": reflected,
                   "source_doc_ids": [r["name"] for r in rows], "confirm_sig": confirm_sig,
                   "confirm_manifest": confirm_manifest, "confirm_doc_count": confirm_doc_count,
@@ -410,6 +468,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         # 伴わない）ため、run 自体は `failed` のままでも「今実際に Neo4j にある内容」は
         # 新世代（n/m）。省略すると `get_latest_published_run_summary` が旧 run の件数を
         # 返し続け、status の graph_nodes/graph_edges が実態より古いまま止まる。
+        _close_stage_timing()   # STAT-3 S5: pg_replace 段は graph_build 完了後・es_index 段より前に失敗するため段の時刻はここで確定
         pending = {"status": "failed", "source_doc_ids": [r["name"] for r in rows],
                   "extraction_snapshot": {"docs": len(rows), "nodes": len(nodes), "edges": len(edges),
                                           "flags": list(flags), "degraded": True,
@@ -419,7 +478,9 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                                           "partial_extraction_suspected":
                                               _partial_extraction_summary(drep),
                                           "neo4j": {"nodes": n, "edges": m,
-                                                   "duration_sec": round(neo4j_duration_sec, 3)}},
+                                                   "duration_sec": round(neo4j_duration_sec, 3)},
+                                          "stage_timings": {k: dict(v) for k, v in stage_timings.items()},
+                                          "counts": _counts_summary(drep, None, manifest, rows)},
                   "published_snapshot": {"nodes": n, "edges": m},
                   "confirm_sig": None, "confirm_manifest": None, "confirm_doc_count": None,
                   "confirm_scan_report": None}
@@ -502,7 +563,13 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
     # 食い違いうる・無用な ES 往復を増やさない）。
     es_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
                  "error": esr.get("error") if isinstance(esr, dict) else None,
-                 "chunks": esr.get("chunks") if isinstance(esr, dict) else None}
+                 "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
+                 # STAT-3 S5: counts（es_indexed／embedded_chunks／embed_elapsed_ms）の元データ。
+                 # `esr` に無ければ触れない（`.get()` は未取得時 None のまま＝`_counts` 側が欠落と
+                 # 0 を区別する）。
+                 "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
+                 "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+                 "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
     neo4j_summary = {"nodes": n, "edges": m, "duration_sec": round(neo4j_duration_sec, 3)}
     # 既知の残余（secRV 再RV round-4・2026-07-14・ライブ鏡の本質的 TOCTOU）: この確定は**冒頭スキャン時点**の
     # 署名であり、取り込み各段（派生MD/グラフ/台帳/ES）が実際に読んだ内容と原子的に一致する保証は無い。

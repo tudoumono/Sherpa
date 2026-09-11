@@ -4,6 +4,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import Analyzer, DefItem, DefResult, RefCandidate, RefResult
 from sherpa.ingest.analyzers.cobol import CobolAnalyzer
@@ -11,22 +13,32 @@ from sherpa.ingest.analyzers.copybook import CopybookAnalyzer
 from sherpa.ingest.analyzers.jcl import JclAnalyzer
 
 
-def test_known_analyzers_are_cobol_copybook_jcl_java_in_priority_order():
+def test_known_analyzers_are_upstream_priority_order_then_extensions_by_name():
+    """優先順＝`_UPSTREAM_ANALYZERS` の並び（固定）＋拡張アナライザ（`<prefix>_*.py`・名前順で末尾）。
+    拡張の一覧は固定しない（フォークが正規の拡張を足しても本テストは緑のまま＝拡張の契約）。"""
     names = [a.name for a in registry.known_analyzers()]
-    assert names == ["cobol", "copybook", "jcl", "java", "properties", "yaml_config", "xml_config", "sql",
-                     "c", "csharp", "jsp", "html", "js", "css", "shell", "vb"]
+    upstream = [a.name for a in registry._UPSTREAM_ANALYZERS]
+    assert upstream == ["cobol", "copybook", "jcl", "java", "properties", "yaml_config", "xml_config", "sql",
+                        "c", "csharp", "jsp", "html", "js", "css", "shell", "vb"]
+    assert names[:len(upstream)] == upstream
+    ext_names = names[len(upstream):]
+    assert ext_names == sorted(ext_names) and all(":" in n for n in ext_names)
+    assert "sample_ext:dummy" in ext_names            # S4 受け入れ用サンプル（常駐）
 
 
 def test_registered_extensions_is_union_of_known_analyzers():
     expected = frozenset().union(*(a.extensions for a in registry.known_analyzers()))
     assert registry.registered_extensions() == expected
-    assert registry.registered_extensions() == {".cbl", ".cob", ".cobol", ".cpy", ".copybook", ".jcl", ".java",
-                                                 ".properties", ".yaml", ".yml", ".xml", ".sql",
-                                                 ".c", ".h", ".cs",
-                                                 ".jsp", ".jspx", ".jspf", ".tag", ".tagx",
-                                                 ".html", ".htm", ".xhtml", ".js", ".mjs", ".css",
-                                                 ".sh", ".bash", ".ksh", ".zsh", ".bat", ".cmd",
-                                                 ".vb", ".bas", ".cls", ".frm", ".ctl", ".vbs"}
+    upstream_ext = frozenset().union(*(a.extensions for a in registry._UPSTREAM_ANALYZERS))
+    assert upstream_ext == {".cbl", ".cob", ".cobol", ".cpy", ".copybook", ".jcl", ".java",
+                            ".properties", ".yaml", ".yml", ".xml", ".sql",
+                            ".c", ".h", ".cs",
+                            ".jsp", ".jspx", ".jspf", ".tag", ".tagx",
+                            ".html", ".htm", ".xhtml", ".js", ".mjs", ".css",
+                            ".sh", ".bash", ".ksh", ".zsh", ".bat", ".cmd",
+                            ".vb", ".bas", ".cls", ".frm", ".ctl", ".vbs"}
+    assert upstream_ext <= registry.registered_extensions()
+    assert ".sampleext" in registry.registered_extensions()
 
 
 # ---- config_signature（world 署名・ES 設定署名の材料） ----
@@ -85,6 +97,7 @@ def test_config_signature_unchanged_when_configuration_unchanged(monkeypatch):
     assert sig1 == sig2
 
 
+@pytest.mark.usefixtures("upstream_only_registry")
 def test_config_signature_changes_when_java_analyzer_is_registered(monkeypatch):
     """CODE-1d（新言語追加の実地検証）: `JavaAnalyzer` の登録そのものが `config_signature()` を
     変える——専用の移行機構を持たず、通常の署名不一致→reindex 経路（`es_index.needs_reindex`）に
@@ -105,11 +118,20 @@ def test_resolve_picks_analyzer_by_extension():
     assert isinstance(registry.resolve("x.java"), JavaAnalyzer)
 
 
+def _unregistered_ext() -> str:
+    """どのアナライザ（フォークの拡張を含む）にも登録されていない拡張子を選ぶ（固定の `.md` 決め打ちは
+    フォークが正規に登録すると赤になる）。"""
+    for ext in (".md", ".txt", ".zz-unregistered"):
+        if ext not in registry.registered_extensions():
+            return ext
+    raise AssertionError("未登録の拡張子が見つからない")
+
+
 def test_resolve_returns_none_for_unregistered_extension():
-    assert registry.resolve("x.md") is None
-    assert registry.resolve("x.txt") is None
+    ext = _unregistered_ext()
+    assert registry.resolve(f"x{ext}") is None
     assert registry.resolve("noext") is None            # 拡張子なし
-    assert registry.candidates("x.md") == ()
+    assert registry.candidates(f"x{ext}") == ()
 
 
 def test_ext_matches_path_suffix_semantics_for_dotfiles():
@@ -121,8 +143,14 @@ def test_ext_matches_path_suffix_semantics_for_dotfiles():
     assert registry.resolve(".cbl") is None             # dotfile はどのアナライザにも解決されない
 
 
+@pytest.mark.usefixtures("upstream_only_registry")
 def test_resolve_lazy_skips_read_head_when_all_candidates_use_default_accepts():
-    """既定の `accepts`（常に真）しか候補が無ければ `read_head` を一度も呼ばない（内容を読まない・§7 裁定10）。"""
+    """既定の `accepts`（常に真）しか候補が無ければ `read_head` を一度も呼ばない（内容を読まない・§7 裁定10）。
+
+    上流限定固定（`upstream_only_registry`）——フォークが `.cbl` を `overrides` で共有し `accepts`
+    を上書きする拡張アナライザを登録すると、`.cbl` の候補に上書き実装が混ざり本テストの前提
+    （全候補が既定 accepts）が崩れるため（開発ハーネス S4・敵対 RV 是正）。
+    """
     calls = []
 
     def read_head():
@@ -170,7 +198,7 @@ def test_resolve_lazy_reads_head_only_when_a_candidate_overrides_accepts(monkeyp
 def test_resolve_lazy_returns_none_when_no_candidates_without_reading():
     """拡張子がどのアナライザにも一致しなければ `read_head` を呼ばず即 None（§7 裁定10）。"""
     calls = []
-    assert registry.resolve_lazy("x.md", lambda: calls.append(1) or "x") is None
+    assert registry.resolve_lazy(f"x{_unregistered_ext()}", lambda: calls.append(1) or "x") is None
     assert calls == []
 
 
@@ -210,8 +238,14 @@ def test_accepts_gate_skips_non_accepting_candidate(monkeypatch):
     assert registry.resolve("x.zz") is None
 
 
+@pytest.mark.usefixtures("upstream_only_registry")
 def test_unregistered_extension_file_is_silently_skipped_by_build_world():
-    """未担当拡張子＝資料として扱う（グラフに乗らない・例外なし・§7 裁定4/10）。"""
+    """未担当拡張子＝資料として扱う（グラフに乗らない・例外なし・§7 裁定4/10）。
+
+    上流限定固定（`upstream_only_registry`）——`.txt` は上流アナライザの担当外だが、フォークが
+    `.txt` を正規に担当する拡張アナライザを登録すると本テストの前提（`note.txt` は未担当のまま）が
+    崩れるため（開発ハーネス S4・敵対 RV 是正）。
+    """
     from sherpa.ingest import world_graph
     with tempfile.TemporaryDirectory() as d:
         base = Path(d) / "案件A"
@@ -378,3 +412,39 @@ def test_unreadable_registered_code_file_produces_blocked_flag(monkeypatch):
         assert nodes == [] and edges == []
         blocked = [f for f in flags if f.get("action") == "blocked"]
         assert blocked == [{"doc": "案件A/BADPROG.cbl", "reason": "unreadable_code_file", "action": "blocked"}]
+
+
+def test_resolve_lazy_passes_each_candidate_its_own_head_bytes(monkeypatch):
+    """候補ごとに自分の head_bytes 分だけを渡す（大きい head の候補の読み取りを小さい head の候補に
+    使い回さない＝world_graph の Pass1 と同じ判定材料）。"""
+    from sherpa.ingest.analyzers._base import Analyzer, DefResult, RefResult
+
+    class Big(Analyzer):
+        name = "t:big"; extensions = frozenset({".tt"}); head_bytes = 64 * 1024
+        def accepts(self, rel_path, head_text=""):
+            return "MARK" in head_text
+        def collect_defs(self, text, rel_path): return DefResult()
+        def extract_refs(self, text, rel_path): return RefResult()
+
+    class Small(Analyzer):
+        name = "t:small"; extensions = frozenset({".tt"}); head_bytes = 4096
+        def accepts(self, rel_path, head_text=""):
+            return "MARK" in head_text
+        def collect_defs(self, text, rel_path): return DefResult()
+        def extract_refs(self, text, rel_path): return RefResult()
+
+    monkeypatch.setattr(registry, "_ANALYZERS", (Big(), Small()))
+    sizes = []
+    def read_head(*, size):
+        sizes.append(size)
+        return ("x" * 5000 + "MARK") if size >= 5004 else "x" * min(size, 5000)
+    assert isinstance(registry.resolve_lazy("a.tt", read_head), Big)
+    assert sizes == [64 * 1024]
+    # Big が拒否（MARK 無し）なら Small は自分の 4096 で判定し、それも拒否＝None
+    def read_head2(*, size):
+        sizes.append(size)
+        return "x" * min(size, 100)
+    sizes.clear()
+    assert registry.resolve_lazy("a.tt", read_head2) is None
+    assert sizes == [64 * 1024, 4096]
+

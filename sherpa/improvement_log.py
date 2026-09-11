@@ -50,12 +50,24 @@ _TOOL_CALL_LABELS = frozenset({
     "資料を検索（grep）",
     "ファイル名で検索", "フォルダ構成を確認",
     "該当箇所を精読", "文書を通読", "見出し構造を確認", "関係グラフをたどる", "世代間の差分を比較",
+    # S3b（原本読取ツール・`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
+    # `agentic_search._ORIGINAL_READ_LABELS`/`providers/codex/provider.py` の tlabel 辞書と同じ文言。
+    # 「原本のシート一覧を確認」（xlsx_sheets・RV#11）はツール呼び出しとしては数えるが、シート名・
+    # 大きさを見るだけで本文は読んでいないため `_FILES_READ_LABEL` には含めない（下記参照）。
+    "原本のシート一覧を確認",
+    "原本を読む（Excel）", "原本を読む（Word）", "原本を読む（PowerPoint）", "原本を読む（PDF）",
+    "原本を読む（先頭）",
     "ユーザに確認",
 })
-# 本文を実際に読んだ（精読/通読した）とみなすラベル集合。「見出し構造を確認」（doc_outline）は
-# 構造を見るだけで本文を読んだことにはならないため対象外——`files_read` に含めるのは
-# `read_around`/`read_doc` 相当の2ラベルのみ。
-_FILES_READ_LABEL = frozenset({"該当箇所を精読", "文書を通読"})
+# 本文を実際に読んだ（精読/通読した）とみなすラベル集合。「見出し構造を確認」（doc_outline）・
+# 「原本のシート一覧を確認」（xlsx_sheets・RV#11）は構造/一覧を見るだけで本文を読んだことには
+# ならないため対象外——`files_read` に含めるのは `read_around`/`read_doc` 相当の2ラベルと、
+# S3b の原本読取ツールのうち実際にセル/段落/スライド/ページの中身を返す5本（xlsx_sheets を除く）。
+_FILES_READ_LABEL = frozenset({
+    "該当箇所を精読", "文書を通読",
+    "原本を読む（Excel）", "原本を読む（Word）", "原本を読む（PowerPoint）", "原本を読む（PDF）",
+    "原本を読む（先頭）",
+})
 # v1 trace 上限（旧 `chat_service._cap_trace`・撤去済み・TOGGLE-RM 2026-09-03）到達時に先頭へ置かれた
 # 要約ノードの id。生成コード自体は撤去済みだが、v1 形式で既に保存済みの過去メッセージ（`messages.trace`）
 # を読む本関数はこの id を読み続ける必要がある（履歴データの後方互換読み取り）。

@@ -337,32 +337,6 @@ def test_codex_provider_rejects_invalid_nonempty_model_name_as_honest_failure():
         CodexProvider(model="gpt-5.5:latest")
 
 
-def test_codex_provider_invalid_model_exception_does_not_shadow_unrelated_value_error(monkeypatch):
-    """重大バグ是正（RV 4巡目 #9・5巡目 #12 で docstring を実態に是正）: このテストが直接
-    確認するのは `CodexProvider.__init__` 自身の挙動だけ——`SHERPA_CODEX_TIMEOUT` のような
-    無関係な env 値が壊れて `float()` 変換が失敗した場合、送出されるのは無印の `ValueError`
-    であって `model_catalog.InvalidModelNameError` ではないこと（モデル名には有効な値を渡して
-    いる）。これにより、`sherpa/providers/__init__.py::_select_provider` の
-    `except model_catalog.InvalidModelNameError`（この型だけを狭く捕捉する設計）が、この種の
-    無関係な `ValueError` を誤って「モデル名が不正」の `_UnwiredProvider` に化けさせない前提
-    条件が成り立つ。`_select_provider` 自体を通した結合テストは
-    `tests/unit/test_codex_azure_provider.py::test_select_provider_narrows_exception_catch_to_invalid_model_name_only`
-    が担う。"""
-    import pytest
-
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "not-a-number")
-    from sherpa.providers.codex.provider import CodexProvider
-    with pytest.raises(ValueError):
-        CodexProvider(model="gpt-5.4-mini")
-    # モデル名文法の例外ではない（`float()` の変換失敗）ことを確認する。
-    try:
-        CodexProvider(model="gpt-5.4-mini")
-    except model_catalog.InvalidModelNameError:
-        pytest.fail("モデル名は有効なのに InvalidModelNameError が送出された")
-    except ValueError:
-        pass
-
-
 def test_codex_provider_resolves_none_or_empty_model_to_default():
     """未指定（None／空文字）だけが既定 `gpt-5.5` へ解決される（不正な非空値との違いを固定する）。"""
     from sherpa.providers.codex.provider import CodexProvider

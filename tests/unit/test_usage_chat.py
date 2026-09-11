@@ -702,6 +702,9 @@ def test_answer_usage_question_returns_endpoint_kind_from_cfg(monkeypatch):
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test", "endpoint_kind": "azure"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    # improvement_log.compact_summary が内部で呼ぶ DB 境界（未 mock だと共有テスト DB へ実接続し、
+    # 蓄積された行を実際にページングして数秒待つ＝test_answer_usage_question_success と同じ流儀）。
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
     monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": "回答"}))
     result = U.answer_usage_question("質問", [], system_settings={})
     assert result["endpoint_kind"] == "azure"
@@ -716,6 +719,9 @@ def test_answer_usage_question_forwards_provider_override(monkeypatch):
         return {"provider": "ollama", "url": "http://localhost:11434", "model": "m"}
     monkeypatch.setattr(U, "_resolve_cfg", _capture)
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    # improvement_log.compact_summary が内部で呼ぶ DB 境界（未 mock だと共有テスト DB へ実接続し、
+    # 蓄積された行を実際にページングして数秒待つ＝test_answer_usage_question_success と同じ流儀）。
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
     monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": "回答"}))
     U.answer_usage_question("質問", [], system_settings={}, provider_override="ollama")
     assert seen["provider_override"] == "ollama"

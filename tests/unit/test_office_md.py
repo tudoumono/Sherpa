@@ -222,6 +222,25 @@ def test_build_derived_pdf_buckets():
         office_md._pdf_backend, office_md._pdf_pages = o_b, o_p
 
 
+def test_build_derived_skips_sensitive_original_name_no_derived_md_written(tmp_path):
+    """秘匿名（`text_kind.is_sensitive`）の Office 原本（`id_rsa.docx`）は
+    `convertible_exts()` の候補集合には入るが、変換ループが `office_md.build_derived` の時点で
+    弾き、派生 `.md`（＝本文が読める形）を一切作らない。既存の非秘匿 Office は従来どおり変換される
+    ことも同時に確認する。"""
+    d = tmp_path
+    src = d / "src"; src.mkdir()
+    der = d / "derived"
+    _zip(src / "id_rsa.docx", {"word/document.xml": _DOCX_XML})
+    _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})
+
+    rep = office_md.build_derived(src, der)
+
+    assert rep["converted"] == 1                       # normal.docx のみ
+    assert not (der / "id_rsa.docx.md").exists()
+    assert (der / "normal.docx.md").exists()
+    assert "タイトル見出し" in (der / "normal.docx.md").read_text(encoding="utf-8")
+
+
 def test_check_partial_extraction_flags_large_source_with_tiny_md(tmp_path):
     """ING-1: 原本サイズが十分大きい（1MiB超）のに生成MDが極端に小さければ疑いに計上する
     （docx/pdf 等にも効く粗い網・拡張子は問わない）。"""
@@ -854,6 +873,27 @@ def test_rag_sidecars_missing_asset_directory_deletion_detected():
     assert office_md.rag_sidecars_missing(src, der) is True
 
 
+def test_rag_sidecars_missing_sensitive_original_name_not_flagged_as_missing(tmp_path):
+    """秘匿名（`id_rsa.docx`）は変換ループ（`_build_derived_into_staging`）が最初から
+    マニフェスト（`{rel}.derived.json`）を書かない契約（`_is_sensitive_original`）。これを
+    `rag_sidecars_missing` が「欠落」として誤検知すると、`worker.py` の `needs_full_run` が
+    毎 sync で真になり続け、world 全体の全再構築が無限に繰り返される。2回連続で
+    `build_derived` した後も欠落と判定されないことを確認する（無限ループ化しない回帰確認）。
+    非秘匿の `normal.docx` は従来どおり判定対象に含まれることも同時に確認する。"""
+    src = tmp_path / "src"; src.mkdir()
+    der = tmp_path / "derived"
+    _zip(src / "id_rsa.docx", {"word/document.xml": _DOCX_XML})
+    _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})
+
+    office_md.build_derived(src, der)
+    assert not (der.parent / "ir" / "id_rsa.docx.derived.json").exists()
+    assert (der.parent / "ir" / "normal.docx.derived.json").exists()
+    assert office_md.rag_sidecars_missing(src, der) is False
+
+    office_md.build_derived(src, der)          # 2回目も安定（全再構築ループにならない回帰確認）
+    assert office_md.rag_sidecars_missing(src, der) is False
+
+
 def test_refresh_evidence_ir_regenerates_empty_ooxml_instead_of_deleting():
     """空 OOXML（legacy `.md` を持たない正当なケース）の `.evidence.json`/`.rag.md`/
     `.rag_chunks.jsonl`/manifest は、`refresh_evidence_ir()` を呼んでも「対象外」として
@@ -881,6 +921,65 @@ def test_refresh_evidence_ir_regenerates_empty_ooxml_instead_of_deleting():
     rep3 = office_md.refresh_evidence_ir(src, der)                            # 2回目も安定して再生成
     assert rep3["evidence_ir_failed"] == 0 and rep3["rag_failed"] == 0
     assert (der.parent / "ir" / "empty.docx.evidence.json").is_file()
+
+
+def test_refresh_evidence_ir_skips_sensitive_original_name(tmp_path):
+    """秘匿名（`id_rsa.pdf`）は evidence_ir/rag の軽量再生成対象から除外する
+    （`_is_sensitive_original`）。PDF は image-only でも `.md` 欠落だけでは対象外にならない経路
+    （`elif ext == ".pdf"` 分岐は `pdf_available()` のみで判定・`.md` の有無を見ない）があり、
+    除外しないと `.md` を一度も持たない秘匿名の原本からでも秘匿本文が `.evidence.json`/
+    `.rag.md` へ平文で書き出されてしまう。非秘匿の `note.pdf` は従来どおり生成
+    されることも同時に確認する。"""
+    src = tmp_path / "src"; src.mkdir()
+    der = tmp_path / "derived"
+    der.mkdir()
+    _blank_pdf(src / "id_rsa.pdf")
+    _blank_pdf(src / "note.pdf")
+    o_b, o_p = office_md._pdf_backend, office_md._pdf_pages
+    try:
+        office_md._pdf_backend = lambda: "pypdf"
+        office_md._pdf_pages = lambda p: ["秘密の本文テキスト"]
+        rep = office_md.refresh_evidence_ir(src, der)
+    finally:
+        office_md._pdf_backend, office_md._pdf_pages = o_b, o_p
+
+    assert rep["evidence_ir_failed"] == 0 and rep["rag_failed"] == 0
+    assert rep["evidence_ir_generated"] == 1 and rep["rag_generated"] == 1     # note.pdf のみ
+    assert not (der.parent / "ir" / "id_rsa.pdf.evidence.json").exists()
+    assert not (der.parent / "rag" / "id_rsa.pdf.rag.md").exists()
+    assert not (der.parent / "ir" / "id_rsa.pdf.derived.json").exists()
+    assert (der.parent / "ir" / "note.pdf.evidence.json").exists()
+    assert (der.parent / "rag" / "note.pdf.rag.md").exists()
+
+
+def test_refresh_rag_skips_sensitive_original_with_stale_evidence_json(tmp_path):
+    """`is_sensitive` 導入前に生成された `id_rsa.docx.evidence.json`/`.rag.md`/`.rag_chunks.jsonl`
+    が残っている想定（`build_derived`/`refresh_evidence_ir` は既に秘匿名を除外済みのため、ここでは
+    「過去に生成され残存している」状態を直接ファイルを置いて再現する）。`refresh_rag` はこの rel を
+    `seen` に加えないため、既存の evidence.json から再生成せず、残っていた `.rag.md`/
+    `.rag_chunks.jsonl` を cleanup で削除する（台帳 #85〜#88）。非秘匿の `normal.docx` は
+    従来どおり再生成されることも同時に確認する。"""
+    src = tmp_path / "src"; src.mkdir()
+    der = tmp_path / "derived"
+    _zip(src / "id_rsa.docx", {"word/document.xml": _DOCX_XML})
+    _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})
+
+    office_md.build_derived(src, der)
+    ir_dir = der.parent / "ir"
+    rag_dir = der.parent / "rag"
+    assert not (ir_dir / "id_rsa.docx.evidence.json").exists()      # build_derived は最初から除外
+
+    # 過去（is_sensitive 導入前）に生成され残存している状態を直接作って再現する。
+    shutil.copyfile(ir_dir / "normal.docx.evidence.json", ir_dir / "id_rsa.docx.evidence.json")
+    shutil.copyfile(rag_dir / "normal.docx.rag.md", rag_dir / "id_rsa.docx.rag.md")
+    shutil.copyfile(rag_dir / "normal.docx.rag_chunks.jsonl", rag_dir / "id_rsa.docx.rag_chunks.jsonl")
+
+    rep = office_md.refresh_rag(src, der)
+    assert rep["rag_failed"] == 0
+    assert rep["rag_generated"] == 1                                # normal.docx のみ再生成
+    assert not (rag_dir / "id_rsa.docx.rag.md").exists()            # 再生成せず削除された
+    assert not (rag_dir / "id_rsa.docx.rag_chunks.jsonl").exists()
+    assert (rag_dir / "normal.docx.rag.md").exists()
 
 
 def test_human_md_sig_drift_and_refresh_touch_only_the_md_asset(monkeypatch):
@@ -986,6 +1085,76 @@ def test_human_md_sig_drift_and_refresh_are_noop_when_ooxml_arm_disabled(monkeyp
     assert office_md.human_md_sig_drift(src, der) is True
     rep = office_md.refresh_human_md(src, der)
     assert rep["human_md_generated"] == 1 and rep["human_md_failed"] == 0
+
+
+def test_human_md_sig_drift_ignores_sensitive_original_name(tmp_path):
+    """秘匿名（`id_rsa.docx`）は `{rel}.derived.json` マニフェストを一切持たない契約
+    （`_is_sensitive_original`）——これを除外しないと `recorded` が常に None のため
+    drift が恒常 True になり、生成物を持たない rel の再構築（ひいては ES 再索引）が
+    毎回反復する（台帳 #85〜#88）。非秘匿の `normal.docx` は追随済みなら drift しない
+    ことも同時に確認する（無限ループ化しない回帰確認）。"""
+    src = tmp_path / "src"; src.mkdir()
+    der = tmp_path / "derived"
+    _zip(src / "id_rsa.docx", {"word/document.xml": _DOCX_XML})
+    _zip(src / "normal.docx", {"word/document.xml": _DOCX_XML})
+
+    office_md.build_derived(src, der)
+    assert not (der.parent / "ir" / "id_rsa.docx.derived.json").exists()
+    assert (der.parent / "ir" / "normal.docx.derived.json").exists()
+
+    assert office_md.human_md_sig_drift(src, der) is False
+    office_md.build_derived(src, der)          # 2回目も安定（恒常 drift にならない回帰確認）
+    assert office_md.human_md_sig_drift(src, der) is False
+
+
+def test_refresh_human_md_skips_sensitive_original_name(tmp_path):
+    """秘匿名（`id_rsa.xlsx`）は human_md の軽量再生成対象から除外する（`_is_sensitive_original`）。
+    除外しないと、秘匿本文が IR 経由で `{rel}.md` へ平文で書き出されてしまう。
+    非秘匿の `a.xlsx` は従来どおり生成されることも同時に確認する。"""
+    import openpyxl
+
+    src = tmp_path / "src"; src.mkdir()
+    der = tmp_path / "derived"
+    der.mkdir()
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "秘密の値"
+    wb.save(src / "id_rsa.xlsx")
+    wb2 = openpyxl.Workbook()
+    wb2.active["A1"] = "通常の値"
+    wb2.save(src / "a.xlsx")
+
+    rep = office_md.refresh_human_md(src, der)
+    assert rep["human_md_generated"] == 1 and rep["human_md_failed"] == 0   # a.xlsx のみ
+    assert not (der / "id_rsa.xlsx.md").exists()
+    assert not (der.parent / "ir" / "id_rsa.xlsx.derived.json").exists()
+    assert (der / "a.xlsx.md").exists()
+
+
+def test_refresh_document_ir_skips_sensitive_original_name(tmp_path):
+    """秘匿名（`id_rsa.xlsx`）は、rename 等で derived 側に旧 `.md` が残っていても document_ir の
+    軽量再生成対象から除外する（`_is_sensitive_original`）。`.md` の有無に頼った暗黙のガード
+    （`if not md_path.is_file(): continue`）だけでは、名前変更前の stale な旧 `.md` 経由で秘匿
+    本文が `.document.json` へ書き出されうる。非秘匿の `a.xlsx` は従来どおり
+    生成されることも同時に確認する。"""
+    import openpyxl
+
+    src = tmp_path / "src"; src.mkdir()
+    der = tmp_path / "derived"
+    der.mkdir()
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "秘密の値"
+    wb.save(src / "id_rsa.xlsx")
+    wb2 = openpyxl.Workbook()
+    wb2.active["A1"] = "通常の値"
+    wb2.save(src / "a.xlsx")
+    (der / "id_rsa.xlsx.md").write_text("stale leftover", encoding="utf-8")   # rename前の残骸を模す
+    (der / "a.xlsx.md").write_text("placeholder", encoding="utf-8")
+
+    rep = office_md.refresh_document_ir(src, der)
+    assert rep["document_ir_failed"] == 0
+    assert rep["document_ir_generated"] == 1                                  # a.xlsx のみ
+    assert not (der.parent / "ir" / "id_rsa.xlsx.document.json").exists()
+    assert (der.parent / "ir" / "a.xlsx.document.json").exists()
 
 
 def test_human_md_partial_failure_keeps_es_meta_pending_until_fixed(monkeypatch, tmp_path):

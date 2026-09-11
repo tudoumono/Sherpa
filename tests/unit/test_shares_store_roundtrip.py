@@ -832,3 +832,9 @@ def test_troubleshoot_answer_round_trip_has_no_cid_in_saved_read_or_shared_data(
     snap = store.get_conversation_for_read(owner, snap_cid)
     shared_data = snap["messages"][-1]["answer"]["data"]
     assert shared_data["candidates"] and "cid" not in shared_data["candidates"][0]
+
+
+def test_share_card_meta_allowlist_keeps_directed_edges():
+    from sherpa.store.shares import _safe_share_card_meta
+    out = _safe_share_card_meta({"name": "B", "path": ["A", "B"], "edges": ["A →COPIES→ B（未確認）"], "cid": "m:B"})
+    assert out == {"name": "B", "path": ["A", "B"], "edges": ["A →COPIES→ B（未確認）"]}

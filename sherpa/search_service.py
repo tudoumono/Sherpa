@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from . import documents, es_index, rag_parent_return
 from . import scope as scope_mod
 from .impact_service import IMPACT_MAX_DEPTH, run_impact
+from .ingest import text_kind
 
 ENGINES = ("keyword", "vector", "graph")
 DEFAULT_ENGINES = ("keyword", "vector")     # 決定済み: 既定は ES 1往復系のみ・graph は明示 opt-in
@@ -131,16 +132,37 @@ def _search_keyword(world, query, sp, k, settings, layer=None):
         return [], "es_unavailable"
     hits, reason = es_index.search(world, query, scope_paths=sp, k=k, settings=settings, vector=False,
                                    layer=layer)
+    hits = _exclude_sensitive(hits)
     hits = rag_parent_return.apply_to_hits(world, hits)
-    return [_es_hit(h) for h in hits], reason
+    return _parse_hits(hits), reason
 
 
 def _search_vector(world, query, sp, k, settings, layer=None):
     """ES 純 kNN（BM25 を混ぜない・es_index.search_knn_only を使う）。"""
     hits, reason = es_index.search_knn_only(world, query, scope_paths=sp, k=k, settings=settings,
                                             layer=layer)
+    hits = _exclude_sensitive(hits)
     hits = rag_parent_return.apply_to_hits(world, hits)
-    return [_es_hit(h) for h in hits], reason
+    return _parse_hits(hits), reason
+
+
+def _exclude_sensitive(hits) -> list:
+    """秘匿名（`text_kind.is_sensitive_doc_id`）を `rag_parent_return.apply_to_hits` の**前**で
+    落とす（主除外点・台帳 #92/#93）。`apply_to_hits` は rag.md 全文を読んで返却予算を消費する
+    ため、`_parse_hits` の後段除外だけでは更新前に索引化された `credentials.xlsx` 等の秘匿本文を
+    一度読んでしまう（親返しが読む→捨てる、では遅い）。
+    """
+    return [h for h in hits if not text_kind.is_sensitive_doc_id(h["doc_id"])]
+
+
+def _parse_hits(hits) -> list[dict]:
+    """ES ヒット list → 共通ヒット中間形の list（`_search_keyword`/`_search_vector` の共有変換点）。
+
+    秘匿名の主除外は `_exclude_sensitive`（`apply_to_hits` の前段）が担う。ここでの除外は
+    保険（呼び出し元が万一 `_exclude_sensitive` を経由し損ねても snippet/親返し本文を外部へ
+    出さない・台帳 #85〜#88/#92/#93）。
+    """
+    return [_es_hit(h) for h in hits if not text_kind.is_sensitive_doc_id(h["doc_id"])]
 
 
 def _es_hit(h) -> dict:

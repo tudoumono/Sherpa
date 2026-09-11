@@ -75,7 +75,7 @@ def test_chat_persists_and_answers_answer_first():
     ensure_v1()
     c = _client()
     # 既定はナレッジ参照オフ（素の会話）。社内資料に基づく回答は knowledge=True で要求する。
-    r = c.post("/chat", json={"message": "TAX-RATE を変えたい。影響は？", "world": V, "knowledge": True}).json()
+    r = c.post("/chat", json={"message": "TAX-RATE を変えたい。影響は？", "world": V, "knowledge": True, "stream_id": "m8-00780"}).json()
     cid = r["conversation_id"]
     ans = r["message"]["answer"]
     assert ans["lens"] == "impact"
@@ -85,7 +85,7 @@ def test_chat_persists_and_answers_answer_first():
 
     # 同じ会話を継続（別レンズ）→ 会話に積み上がる
     r2 = c.post("/chat", json={"message": "端数処理の仕様は？", "world": V,
-                               "conversation_id": cid, "knowledge": True}).json()
+                               "conversation_id": cid, "knowledge": True, "stream_id": "m8-00870"}).json()
     assert r2["conversation_id"] == cid and r2["message"]["answer"]["lens"] == "qa"
 
     conv = c.get(f"/conversations/{cid}").json()
@@ -97,7 +97,7 @@ def test_chat_routes_troubleshoot():
     ensure_v1()
     c = _client()
     r = c.post("/chat", json={"message": "夜間バッチ NIGHTLY が ABEND。原因候補は？",
-                              "world": V, "knowledge": True}).json()
+                              "world": V, "knowledge": True, "stream_id": "m8-00990"}).json()
     ans = r["message"]["answer"]
     assert ans["lens"] == "troubleshoot" and ans["summary"]["total"] >= 1
 
@@ -105,14 +105,15 @@ def test_chat_routes_troubleshoot():
 def test_knowledge_off_is_plain_chat():
     """既定（ナレッジ参照オフ）＝検索せず素の会話。レンズ=chat・出典なし・範囲=off。"""
     c = _client()
-    ans = c.post("/chat", json={"message": "こんにちは", "world": V}).json()["message"]["answer"]
+    ans = c.post("/chat", json={"message": "こんにちは", "world": V, "stream_id": "m8-01080"}).json()["message"]["answer"]
     assert ans["lens"] == "chat" and ans["sources"] == [] and ans["scope"]["source"] == "off"
 
 
 def _stream(c, message, knowledge=True):
     import json
+    import uuid
     nodes, ans = [], None
-    params = {"message": message, "world": V, "knowledge": "true" if knowledge else "false"}
+    params = {"message": message, "world": V, "knowledge": "true" if knowledge else "false", "stream_id": uuid.uuid4().hex}
     with c.stream("GET", "/chat/stream", params=params) as s:
         for line in s.iter_lines():
             if line and line.startswith("data: "):
@@ -168,7 +169,7 @@ def test_chat_non_streaming_knowledge_on_saves_trace():
     """POST /chat（非ストリーミング）・ナレッジ参照ON。"""
     ensure_v1()
     c = _client()
-    r = c.post("/chat", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True}).json()
+    r = c.post("/chat", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True, "stream_id": "m8-01720"}).json()
     trace = r["message"].get("trace")
     assert trace, "非ストリーミング・knowledge=True で trace が保存されていない"
     assert any(n["id"] == "understand" for n in trace)
@@ -177,7 +178,7 @@ def test_chat_non_streaming_knowledge_on_saves_trace():
 def test_chat_non_streaming_knowledge_off_saves_trace():
     """POST /chat（非ストリーミング）・ナレッジ参照OFF（素の会話・_plain_run 経路）。"""
     c = _client()
-    r = c.post("/chat", json={"message": "こんにちは", "world": V}).json()
+    r = c.post("/chat", json={"message": "こんにちは", "world": V, "stream_id": "m8-01810"}).json()
     trace = r["message"].get("trace")
     assert trace, "非ストリーミング・knowledge=False（_plain_run）で trace が保存されていない"
     assert any(n["id"] == "brain" for n in trace)
@@ -203,8 +204,9 @@ def test_chat_stream_clarify_persists_question_card_as_assistant_message():
     orig = intent_llm.classify
     intent_llm.classify = lambda *a, **k: None   # Tier2 未接続化（[[feedback_intent_tier2_shared_dev_key_leak]]）
     try:
+        import uuid
         c = _client()
-        params = {"message": "税率を変えたら夜間バッチが落ちる？", "world": V, "knowledge": "true"}
+        params = {"message": "税率を変えたら夜間バッチが落ちる？", "world": V, "knowledge": "true", "stream_id": uuid.uuid4().hex}
         events = []
         with c.stream("GET", "/chat/stream", params=params) as s:
             for line in s.iter_lines():
@@ -394,11 +396,11 @@ def test_chat_history_primes_next_turn_via_db_after_provider_reinstantiation():
     c = _client()
     try:
         chat_service.get_provider = lambda settings, **kw: _FakeProviderTurn1()
-        r1 = c.post("/chat", json={"message": "最初の質問です", "world": V}).json()
+        r1 = c.post("/chat", json={"message": "最初の質問です", "world": V, "stream_id": "m8-03990"}).json()
         cid = r1["conversation_id"]
 
         chat_service.get_provider = lambda settings, **kw: _FakeProviderTurn2()
-        r2 = c.post("/chat", json={"message": "続けて教えて", "world": V, "conversation_id": cid}).json()
+        r2 = c.post("/chat", json={"message": "続けて教えて", "world": V, "conversation_id": cid, "stream_id": "m8-04030"}).json()
         assert r2["conversation_id"] == cid
     finally:
         chat_service.get_provider = orig
@@ -466,7 +468,7 @@ def test_created_files_persisted_in_answer_and_triggers_personal_flag():
     chat_routes.get_provider = lambda settings, **kw: _FakeCodexProvider()
     try:
         c = _client()
-        r = c.post("/chat", json={"message": "消費税率の一覧をExcelにまとめて", "world": V, "knowledge": True}).json()
+        r = c.post("/chat", json={"message": "消費税率の一覧をExcelにまとめて", "world": V, "knowledge": True, "stream_id": "m8-04710"}).json()
         ans = r["message"]["answer"]
         assert ans["created_files"] == [
             {"name": "消費税率一覧.xlsx", "download_url": "/workspace/files/123/download"}]
@@ -486,7 +488,7 @@ def test_created_files_persisted_in_answer_and_triggers_personal_flag():
 def test_conversation_pin_and_delete():
     """#8 ピン止め（一覧で pinned/上部）・タイトル変更・#6 削除（404化・連鎖）。"""
     c = _client()
-    cid = c.post("/chat", json={"message": "x", "world": V}).json()["conversation_id"]
+    cid = c.post("/chat", json={"message": "x", "world": V, "stream_id": "m8-04910"}).json()["conversation_id"]
     assert c.patch(f"/conversations/{cid}", json={"title": "新しい名前"}).json()["title"] == "新しい名前"
     assert c.get(f"/conversations/{cid}").json()["conversation"]["title"] == "新しい名前"
     assert c.patch(f"/conversations/{cid}", json={"title": "   "}).status_code == 422   # 空は拒否
@@ -572,8 +574,8 @@ def test_settings_codex_web_search_rejects_loosely_coercible_values():
 def test_guards_version_and_conversation():
     """版IDのパストラバーサル拒否（422）と不正会話IDの 404（500にしない）。"""
     c = _client()
-    assert c.post("/chat", json={"message": "x", "world": "../../etc"}).status_code == 422
-    assert c.post("/chat", json={"message": "x", "conversation_id": 99999999}).status_code == 404
+    assert c.post("/chat", json={"message": "x", "world": "../../etc", "stream_id": "m8-05770"}).status_code == 422
+    assert c.post("/chat", json={"message": "x", "conversation_id": 99999999, "stream_id": "m8-05780"}).status_code == 404
 
 
 def test_chat_turn_audit_recorded_without_body():
@@ -583,7 +585,7 @@ def test_chat_turn_audit_recorded_without_body():
     ensure_v1()
     c = _client()
     r = c.post("/chat", json={"message": "消費税率を変えたい。影響は？",
-                              "world": V, "knowledge": True}).json()
+                              "world": V, "knowledge": True, "stream_id": "m8-05870"}).json()
     cid = r["conversation_id"]
     user_msg_id = next(m["id"] for m in c.get(f"/conversations/{cid}").json()["messages"]
                        if m["role"] == "user")
@@ -616,7 +618,7 @@ def test_chat_turn_audit_normalizes_unknown_provider():
         ensure_v1()
         c = _client()
         r = c.post("/chat", json={"message": "消費税率を変えたい。影響は？",
-                                  "world": V, "knowledge": True}).json()
+                                  "world": V, "knowledge": True, "stream_id": "m8-06200"}).json()
         cid = r["conversation_id"]
         rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
         assert rows, "chat.turn が記録されていない"
@@ -652,7 +654,7 @@ def test_chat_turn_audit_records_effective_provider_not_saved_when_a7_mismatches
         ensure_v1()
         c = _client()
         r = c.post("/chat", json={"message": "消費税率を変えたい。影響は？",
-                                  "world": V, "knowledge": True}).json()
+                                  "world": V, "knowledge": True, "stream_id": "m8-06560"}).json()
         cid = r["conversation_id"]
         rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
         assert rows, "chat.turn が記録されていない"
@@ -676,8 +678,9 @@ def test_chat_turn_audit_clarify_records_persisted_question_message(monkeypatch)
     from sherpa import intent_llm, store
     monkeypatch.setattr(intent_llm, "classify", lambda *a, **k: None)
     ensure_v1()
+    import uuid
     c = _client()
-    params = {"message": "税率を変えたら夜間バッチが落ちる？", "world": V, "knowledge": "true"}
+    params = {"message": "税率を変えたら夜間バッチが落ちる？", "world": V, "knowledge": "true", "stream_id": uuid.uuid4().hex}
     question_ev = None
     with c.stream("GET", "/chat/stream", params=params) as s:
         for line in s.iter_lines():

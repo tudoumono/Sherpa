@@ -3,9 +3,8 @@ name: release
 # タグ（v*）を push したら配布物 tarball を作り、GitHub Release に添付する。
 #   例:  git tag v0.1.0 && git push origin v0.1.0
 #
-# CI テストゲート（test.yml）は 2026-09-02 に撤去（ユーザー裁定）——ストア無し環境で恒常的に
-# failure（直近100 push 全て赤）となり形骸化していたため。品質ゲートはローカルの
-# scripts/gate-lane.sh（実ストア込み）＋レーンごとの RV 運用が担う。
+# push/PR ごとの CI は ci.yml（make gate-ci＝ruff＋単体＋契約・Postgres service）。結合・ブラウザ結合は
+# ローカルの make gate-merge／gate-release（scripts/gate-lane.sh 等の実ストア込み）が担う。
 on:
   push:
     tags:

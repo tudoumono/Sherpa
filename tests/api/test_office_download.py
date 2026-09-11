@@ -215,6 +215,27 @@ def test_download_endpoint_rejects_rel_missing_from_ledger():
         store.replace_documents(W, worker._ledger_rows(W))             # 後続テストへ影響しないよう復元
 
 
+def test_download_endpoint_rejects_sensitive_named_rel_even_if_ledger_has_it():
+    """台帳 #81: `text_kind.is_sensitive` 導入前に取り込まれ台帳に残っている秘匿名の行
+    （`credentials.xlsx` 等）は、実体確認（`doc_ledger.original_path`）へ進む前に 404 で塞ぐ
+    ——存在を明かさない既存の「見つからない」応答と同じ形。実ファイルを物理配置してある
+    （物理ファイルが無いと `doc_ledger.original_path` 側の実体不在だけで 404 になり、is_sensitive
+    ガード自体を通っているかを固定できないため）。"""
+    rel = "4期保守/credentials.xlsx"
+    path = pathlib.Path(_KB) / W / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"PK\x03\x04FAKE")
+    rows = worker._ledger_rows(W) + [{"name": rel}]   # test_download_endpoint_rejects_rel_missing_from_ledger と同じ流儀
+    store.replace_documents(W, rows)
+    try:
+        assert doc_ledger.original_path(rel, W) is not None   # 実体は確かに在る（is_sensitive ガードだけを固定する前提）
+        r = _CLIENT.get("/documents/download", params={"rel": rel, "world": W})
+        assert r.status_code == 404
+    finally:
+        store.replace_documents(W, worker._ledger_rows(W))   # 後続テストへ影響しないよう復元
+        path.unlink(missing_ok=True)
+
+
 def test_download_rejects_traversal_and_missing():
     assert _CLIENT.get("/documents/download", params={"rel": "../etc/passwd", "world": W}).status_code == 404
     assert _CLIENT.get("/documents/download", params={"rel": "4期保守/NOPE.xlsx", "world": W}).status_code == 404

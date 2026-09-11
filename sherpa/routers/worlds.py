@@ -327,7 +327,9 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     キャッシュが無い（一度も成功同期していない）world は全ゼロ＋`counts_as_of=None`（「未集計」・
     呼び出し元は自動では歩かず、利用者が「再集計」を押すまで待つ）。
     ING-1: `failed_files`／`partial_extraction_suspected`／`stage_summary` は最新 run の
-    `extraction_snapshot` 由来（run 自体が無い/該当データが無ければ None）。`failure_reason_catalog`／
+    `extraction_snapshot` 由来（run 自体が無い/該当データが無ければ None）。`stage_summary` の
+    `stage_timings`／`counts`（STAT-3 S5）も同じ由来——段ごとの開始・終了・所要 ms と、
+    走査/対象/変換/索引/埋め込みの件数（取れない項目はキー自体が無い）。`failure_reason_catalog`／
     `partial_extraction_advice` は常時同じ静的な辞書（`sherpa.ingest.failure_reasons` が単一の
     真実源・利用者向け平文の原因＋対処）。
 
@@ -356,12 +358,18 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     failed_files = snap.get("failed_files")
     partial = snap.get("partial_extraction_suspected")
     office_md_stage, es_stage, neo4j_stage = snap.get("office_md"), snap.get("es"), snap.get("neo4j")
+    # STAT-3 S5: `stage_timings`（段ごとの開始・終了・所要 ms）と `counts`（scanned〜embed_elapsed_ms）
+    # も同じ最新 run の extraction_snapshot 由来（既存キーは不変・追加のみ）。
+    stage_timings, counts = snap.get("stage_timings"), snap.get("counts")
     stage_summary = None
-    if isinstance(office_md_stage, dict) or isinstance(es_stage, dict) or isinstance(neo4j_stage, dict):
+    if (isinstance(office_md_stage, dict) or isinstance(es_stage, dict) or isinstance(neo4j_stage, dict)
+            or isinstance(stage_timings, dict) or isinstance(counts, dict)):
         stage_summary = {
             "office_md": office_md_stage if isinstance(office_md_stage, dict) else None,
             "es": es_stage if isinstance(es_stage, dict) else None,
             "neo4j": neo4j_stage if isinstance(neo4j_stage, dict) else None,
+            "stage_timings": stage_timings if isinstance(stage_timings, dict) else None,
+            "counts": counts if isinstance(counts, dict) else None,
         }
     published = store.get_latest_published_run_summary(wid)
     graph_nodes = graph_edges = 0

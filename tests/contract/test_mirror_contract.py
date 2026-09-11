@@ -17,9 +17,16 @@ from __future__ import annotations
 import os
 import pathlib
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 os.chdir(ROOT)
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
+
+# 本モジュールは `fixtures/mirror`・`fixtures/corpus/v1` の実コーパス（`.md`＝資料・`.cbl`/`.cpy`＝
+# コード）の固定分類・golden を前提にする——フォークが正規の拡張アナライザを登録していても赤に
+# ならないよう、登録簿を上流限定に固定する（開発ハーネス S4・敵対 RV 是正・docs/21-拡張の契約.md）。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
 MIRROR = ROOT / "fixtures/mirror"
 GENS = ("4期更改", "5期更改")

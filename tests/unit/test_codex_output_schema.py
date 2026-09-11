@@ -36,7 +36,7 @@ def _sj(status: str, answer: str, next_step: str | None = None) -> str:
     return json.dumps({"status": status, "answer": answer, "next_step": next_step}, ensure_ascii=False)
 
 
-def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str, timeout: str = "30",
+def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str,
           schema_env: str | None = None) -> Path:
     """`helper._setup` と同じ偽 codex 方式だが、出力スキーマは既定 ON のまま呼び出す（本ファイルは
     スキーマ契約そのものの検証が目的のため、`helper._setup` の env 0 固定は使わない）。`schema_env`
@@ -49,7 +49,6 @@ def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str, timeout
     helper._write_fake_codex(bin_dir, argv_log, plan_path)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", timeout)
     if schema_env is not None:
         monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", schema_env)
     return argv_log

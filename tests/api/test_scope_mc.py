@@ -145,7 +145,7 @@ def test_api_rejects_unknown_scope():
         from sherpa.api import app
         c = TestClient(app)
         r = c.post("/chat", json={"message": "x", "world": V,
-                                  "knowledge": True, "scope_paths": ["存在しない/フォルダ"]})
+                                  "knowledge": True, "scope_paths": ["存在しない/フォルダ"], "stream_id": "mc-01420"})
     except Exception as e:
         return _skip(f"infra down: {e}")
     assert r.status_code == 422
@@ -171,8 +171,18 @@ def test_chatreq_rejects_invalid_layer_422():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "layer": "bogus"})
+    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "layer": "bogus", "stream_id": "mc-01740"})
     assert r.status_code == 422
+
+
+def test_chat_post_requires_stream_id():
+    """stream_id が必須フィールドのため、無いと 422（本文に "stream_id" を含む）。"""
+    from fastapi.testclient import TestClient
+    from sherpa.api import app
+    c = TestClient(app)
+    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False})
+    assert r.status_code == 422
+    assert "stream_id" in r.text
 
 
 def test_chat_stream_rejects_invalid_layer_422():
@@ -181,7 +191,7 @@ def test_chat_stream_rejects_invalid_layer_422():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "layer": "bogus"})
+    r = c.get("/chat/stream", params={"message": "x", "world": V, "layer": "bogus", "stream_id": "mc-01780"})
     assert r.status_code == 422
 
 
@@ -202,7 +212,7 @@ def test_chatreq_rejects_invalid_lens_422():
     from sherpa.api import app
     c = TestClient(app)
     for bad in ("bogus", "auto"):
-        r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "lens": bad})
+        r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "lens": bad, "stream_id": "mc-02050"})
         assert r.status_code == 422
 
 
@@ -211,7 +221,7 @@ def test_chat_stream_rejects_invalid_lens_422():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "lens": "bogus"})
+    r = c.get("/chat/stream", params={"message": "x", "world": V, "lens": "bogus", "stream_id": "mc-02090"})
     assert r.status_code == 422
 
 
@@ -230,7 +240,7 @@ def test_chatreq_rejects_invalid_depth_profile_422():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "depth_profile": "bogus"})
+    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False, "depth_profile": "bogus", "stream_id": "mc-02330"})
     assert r.status_code == 422
 
 
@@ -239,7 +249,7 @@ def test_chat_stream_rejects_invalid_depth_profile_422():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "depth_profile": "bogus"})
+    r = c.get("/chat/stream", params={"message": "x", "world": V, "depth_profile": "bogus", "stream_id": "mc-02370"})
     assert r.status_code == 422
 
 
@@ -278,7 +288,7 @@ def test_chatreq_rejects_unknown_tools_key_422():
     from sherpa.api import app
     c = TestClient(app)
     r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False,
-                              "tools": {"bogus": True}})
+                              "tools": {"bogus": True}, "stream_id": "mc-02800"})
     assert r.status_code == 422
 
 
@@ -291,7 +301,7 @@ def test_chatreq_rejects_non_boolean_tools_value_422(bad_value):
     from sherpa.api import app
     c = TestClient(app)
     r = c.post("/chat", json={"message": "x", "world": V, "knowledge": False,
-                              "tools": {"grep": bad_value}})
+                              "tools": {"grep": bad_value}, "stream_id": "mc-02930"})
     assert r.status_code == 422
 
 
@@ -301,7 +311,7 @@ def test_chat_stream_rejects_all_tools_off_422():
     from sherpa.api import app
     c = TestClient(app)
     r = c.get("/chat/stream", params={"message": "x", "world": V,
-                                      "tools_grep": False, "tools_fulltext": False, "tools_graph": False})
+                                      "tools_grep": False, "tools_fulltext": False, "tools_graph": False, "stream_id": "mc-02980"})
     assert r.status_code == 422
 
 
@@ -310,7 +320,7 @@ def test_chat_stream_tools_query_params_default_true():
     from fastapi.testclient import TestClient
     from sherpa.api import app
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": False})
+    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": False, "stream_id": "mc-03130"})
     assert r.status_code == 200
 
 
@@ -342,7 +352,7 @@ def test_chatreq_rejects_explicit_on_unavailable_tool_422(monkeypatch):
     monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
     c = TestClient(app)
     r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True,
-                              "tools": {"graph": True}})
+                              "tools": {"graph": True}, "stream_id": "mc-03440"})
     assert r.status_code == 422
     assert "graph" in r.json()["detail"]
 
@@ -357,7 +367,7 @@ def test_chatreq_omitted_or_off_tool_silently_uses_available_only(monkeypatch):
     monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
     c = TestClient(app)
     r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True,
-                              "tools": {"graph": False}})
+                              "tools": {"graph": False}, "stream_id": "mc-03590"})
     assert r.status_code != 422
 
 
@@ -370,7 +380,7 @@ def test_chat_stream_rejects_explicit_on_unavailable_tool_422(monkeypatch):
     monkeypatch.setattr(agentic_search, "tool_availability", lambda: _unavailable(graph=False))
     c = TestClient(app)
     r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": True,
-                                      "tools_graph": True})
+                                      "tools_graph": True, "stream_id": "mc-03720"})
     assert r.status_code == 422
     assert "graph" in r.json()["detail"]
 
@@ -412,7 +422,7 @@ def test_chat_computes_tool_availability_snapshot_exactly_once(monkeypatch):
     ensure_v1()
     calls = _counting_tool_availability(monkeypatch)
     c = TestClient(app)
-    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True})
+    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-04150"})
     assert r.status_code != 422
     assert len(calls) == 1
 
@@ -424,7 +434,7 @@ def test_chat_stream_computes_tool_availability_snapshot_exactly_once(monkeypatc
     ensure_v1()
     calls = _counting_tool_availability(monkeypatch)
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "消費税率とは？", "world": V, "knowledge": True})
+    r = c.get("/chat/stream", params={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-04270"})
     assert r.status_code != 422
     assert len(calls) == 1
 
@@ -490,7 +500,7 @@ def test_chat_shares_single_provider_snapshot_with_execution(monkeypatch):
 
     monkeypatch.setattr(chat_router_mod, "handle_message", _fake_handle_message)
     c = TestClient(app)
-    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True})
+    r = c.post("/chat", json={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-04930"})
     assert r.status_code == 200
     assert calls["get_provider"] == 1
     assert order == ["target_check", "tool_availability"]
@@ -513,7 +523,7 @@ def test_chat_stream_shares_single_provider_snapshot_with_execution(monkeypatch)
 
     monkeypatch.setattr(chat_router_mod, "stream_message", _fake_stream_message)
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "消費税率とは？", "world": V, "knowledge": True})
+    r = c.get("/chat/stream", params={"message": "消費税率とは？", "world": V, "knowledge": True, "stream_id": "mc-05160"})
     assert r.status_code == 200
     assert calls["get_provider"] == 1
     assert order == ["target_check", "tool_availability"]
@@ -574,7 +584,7 @@ def test_chat_target_check_rejection_is_422_json_not_500(monkeypatch):
     monkeypatch.setattr(chat_router_mod, "get_provider",
                         lambda settings, **kw: _TargetCheckRejectingProvider())
     c = TestClient(app)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True})
+    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True, "stream_id": "mc-05770"})
     assert r.status_code == 422
     assert r.headers["content-type"].startswith("application/json")
     detail = r.json()["detail"]
@@ -591,7 +601,7 @@ def test_chat_stream_target_check_rejection_is_422_json_not_500(monkeypatch):
     monkeypatch.setattr(chat_router_mod, "get_provider",
                         lambda settings, **kw: _TargetCheckRejectingProvider())
     c = TestClient(app)
-    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": True})
+    r = c.get("/chat/stream", params={"message": "x", "world": V, "knowledge": True, "stream_id": "mc-05940"})
     assert r.status_code == 422
     assert r.headers["content-type"].startswith("application/json")
     detail = r.json()["detail"]
@@ -644,7 +654,7 @@ def test_chat_settings_read_failure_propagates_as_500_not_swallowed(monkeypatch)
 
     monkeypatch.setattr(store, "get_settings", _fails_once_then_recovers)
     c = TestClient(app, raise_server_exceptions=False)
-    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True})
+    r = c.post("/chat", json={"message": "x", "world": V, "knowledge": True, "stream_id": "mc-06470"})
     assert r.status_code == 500
     assert calls["n"] == 1
 
@@ -656,11 +666,11 @@ def test_impact_scoped_narrows():
         from fastapi.testclient import TestClient
         from sherpa.api import app
         c = TestClient(app)
-        q = {"message": "TAX-RATE を変えたい。影響は？", "world": V, "knowledge": True}
+        q = {"message": "TAX-RATE を変えたい。影響は？", "world": V, "knowledge": True, "stream_id": "mc-06600"}
         full = c.post("/chat", json=q)
         if full.status_code != 200:
             return _skip("infra down (Neo4j/PG 未起動)")
-        scoped = c.post("/chat", json={**q, "scope_paths": [S_DESIGN]})
+        scoped = c.post("/chat", json={**q, "scope_paths": [S_DESIGN], "stream_id": "mc-06630"})
     except Exception as e:
         return _skip(f"infra down: {e}")
     ans = scoped.json()["message"]["answer"]

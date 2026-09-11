@@ -22,7 +22,7 @@ from . import agent_constructs, agentic_search, exec_event, intent_llm, scope, s
 from . import depth_profile as depth_profile_mod
 from . import layer as layer_mod
 from . import tools_pref as tools_pref_mod
-from .ingest import importance
+from .ingest import importance, text_kind
 from .agents import AGENT_PROVIDERS, Ctx, get_provider
 from .chat_router import clarify_decision as _clarify_decision
 from .chat_router import confirm_first_decision as _confirm_first_decision
@@ -708,7 +708,8 @@ def _es_hits(world, query, sp, k=8, redact=False, layer=None):
     out = []
     for h in hits:
         doc = h.get("doc_id")
-        if doc and doc in valid and scope.in_scope(doc, sp):
+        # 秘匿名（更新前に索引化された `credentials.xlsx` 等）は facts/カードへ出さない（台帳 #85〜#88）。
+        if doc and doc in valid and scope.in_scope(doc, sp) and not text_kind.is_sensitive_doc_id(doc):
             if redact:
                 h = {**h, "text": _redact(h.get("text", ""))[:500]}
             out.append(h)
@@ -959,28 +960,15 @@ def _is_budget_exhausted(env: dict) -> bool:
            and packet.get("stop_reason") in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS)
 
 
-def _is_codex_timed_out_partial(env: dict) -> bool:
-    """Codex CLI 実行がタイムアウト（threading.Timer による kill・機械的事実のみが根拠）で
-    打ち切られたターンかどうか——進行中の宣言文がそのまま headline に残った場合に限らず、
-    結論の agent_message が無いまま打ち切られ headline が `_gather` の決定的回答のままの
-    場合も含む（本文の有無に関わらない・`providers/codex/provider.py::_run_authoring` が
-    直接立てる `env["codex_timed_out"]`）。
+def _is_codex_stopped_early(env: dict) -> bool:
+    """Codex CLI が正常終了したにもかかわらず、自動継続を尽くしてもなお agent_message が
+    作業宣言だけ（結論に届かなかった）で終わったターンかどうか
+    （`providers/codex/provider.py::_run_authoring` が直接立てる `env["codex_stopped_early"]`）。
 
     `_is_budget_exhausted` と同型のガード——Codex CLI は agentic_search を経由しない別の実行系
     のため、`evidence_packet.stop_reason` の閉じた語彙（`agentic_search.STOP_REASONS`）は流用せず
     独立したフラグにする。出典0件と重なっても「恒久的に見つからない」とは違うため、`_finalize` の
     断定文言で headline を上書きしない。"""
-    return bool(env.get("codex_timed_out"))
-
-
-def _is_codex_stopped_early(env: dict) -> bool:
-    """Codex CLI が正常終了（timeout ではない）したにもかかわらず、自動継続を尽くしてもなお
-    agent_message が作業宣言だけ（結論に届かなかった）で終わったターンかどうか
-    （`providers/codex/provider.py::_run_authoring` が直接立てる `env["codex_stopped_early"]`）。
-
-    `_is_codex_timed_out_partial` と同型のガード（timeout とは別の切り口の「途中結果」・両者が
-    同時に立つことは無い）。出典0件と重なっても「恒久的に見つからない」とは違うため、`_finalize`
-    の断定文言で headline を上書きしない。"""
     return bool(env.get("codex_stopped_early"))
 
 
@@ -988,26 +976,25 @@ def _finalize(env, decision):
     env["lens"] = decision["lens"]
     env["route"] = {"lens": decision["lens"], "reason": decision["reason"],
                     "path": _ROUTE_PATH.get(decision["lens"], [])}
-    _codex_timed_out = _is_codex_timed_out_partial(env)
     _codex_stopped_early = _is_codex_stopped_early(env)
     if _no_genuine_results(env):
         hints = _retry_hints(env)
         if hints:
             env["retry_hints"] = hints
         elif (decision["lens"] in ("qa", "author") and not _is_budget_exhausted(env)
-              and not _codex_timed_out and not _codex_stopped_early):
+              and not _codex_stopped_early):
             # 全軸が既に最も緩い設定（全体・資料＋コード・最大）でなお0件＝これ以上緩める軸が無い
             # （§5・RV1 #9・SC-6c で調べる深さの軸を追加）。予算到達の途中結果（STOP-1）・Codex
-            # タイムアウト／作業宣言止まりの途中結果はいずれも「見つからなかった」ではないため
-            # 上書きしない。impact/troubleshoot は層の概念が無く既存の headline が十分具体的なため
-            # 対象外にする（`_answer_impact`/`_answer_troubleshoot` は変更しない）。
+            # 作業宣言止まりの途中結果はいずれも「見つからなかった」ではないため上書きしない。
+            # impact/troubleshoot は層の概念が無く既存の headline が十分具体的なため対象外にする
+            # （`_answer_impact`/`_answer_troubleshoot` は変更しない）。
             env["headline"] = _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
-    if _codex_timed_out or _codex_stopped_early:
+    if _codex_stopped_early:
         # SC-6d と同じボタン機構（retry_hints・data-retry-kind）に載せる——0件案内の hints とは
         # 独立に常に追加する（0件でも中身があっても「続きから調べ直せる」こと自体は変わらない）。
         # クリック時の送信は kind="resume" 専用分岐（web/chat.js）が扱う＝直前の質問を広げて
         # 再送する他の kind とは別系統（固定文言をそのまま送るだけ・resume は codex_session_id
-        # 継続に委ねる）。両フラグが同時に立つことは無いが、立っていても hint は1件だけ（or で束ねる）。
+        # 継続に委ねる）。
         env.setdefault("retry_hints", []).append(
             {"kind": "resume", "label": "続きを調べる", "action": {"message": "続きを調べて"}})
     return env
@@ -1263,8 +1250,11 @@ def handle_message(session, message, world="v1",
                    conversation_id=None, user_id="admin", scope_paths=None, layer=None, lens=None,
                    knowledge=False, personal=False, users_dir="data/users", web_search=False,
                    depth_profile=None, tools=None, tools_availability=None,
-                   provider=None, settings=None, sys_settings=None) -> dict:
+                   provider=None, settings=None, sys_settings=None, stop_event=None) -> dict:
     """1ターン処理（非ストリーミング）: 会話を用意→保存→振り分け→実行→答えを保存して返す。
+
+    `stop_event`（省略可）: 利用者の途中停止（`/chat/stream/stop`）を provider へ通す Event。実行は
+    経過時間で打ち切らないため、HTTP 入口はこれを必ず渡す（Codex の子プロセスを止める唯一の導線）。
 
     `knowledge=False`（既定）＝ナレッジ参照オフ＝検索せず素の会話。`True` で社内資料を参照（レンズ＋出典）。
     `scope_paths`（版内パスの集合）を渡すと、検索/分析を**その範囲（＋共通領域）に絞る**（C・knowledge時のみ）。
@@ -1355,6 +1345,7 @@ def handle_message(session, message, world="v1",
         return env
 
     ctx = Ctx(message=message, world=world, pace=0, knowledge=knowledge,  # 非ストリーミングは間を置かない
+              stop_event=stop_event,
               route=_build_router(known, world, settings, can_ask=False, user_id=user_id,
                                   explicit_lens=explicit_lens, scope_meta=scope_meta),   # 非対話＝clarify 不可→qa fallback
               dispatch=_dispatch_with_personal if personal else
@@ -1380,6 +1371,14 @@ def handle_message(session, message, world="v1",
     # settings/sys_settings から別の Provider を構築しうる。
     _provider = provider if provider is not None else get_provider(settings, system_settings=sys_settings)
     for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
+        if stop_event is not None and stop_event.is_set():
+            # `stream_message` と同じ契約: 停止後に provider が返すもの（_result 含む）は保存しない＝
+            # assistant は永続せず、停止を clarify と同格に監査へ残す（経路で結果が変わらない）。
+            _audit_chat_turn(user_id, conversation_id, settings, lens="stopped",
+                             user_msg_id=_user_msg["id"], assistant_msg_id=None, world=world,
+                             scope_paths=(scope_meta or {}).get("scope_paths"), personal=personal,
+                             stopped=True)
+            return {"type": "stopped", "conversation_id": conversation_id}
         if ev["type"] == "_result":
             result = ev
             break

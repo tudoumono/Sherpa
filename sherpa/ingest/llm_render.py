@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable
 
 from .. import json_io, worlds
+from . import text_kind
 
 _log = logging.getLogger("sherpa")
 
@@ -448,6 +449,11 @@ def run_world_pass(world: str, *, settings: dict | None = None) -> RunResult:
         for rag_path in sorted(rag_dir.rglob("*.rag.md")):
             try:
                 rel = rag_path.relative_to(rag_dir).as_posix()[: -len(".rag.md")]
+                if text_kind.is_sensitive_doc_id(rel):
+                    # 秘匿名は rag.md を一切持たない契約（`office_md._is_sensitive_original` 参照）
+                    # ——更新前に生成済みの `credentials.xlsx.rag.md` が残っていても LLM（外部API）
+                    # へ送らない（台帳 #85〜#88）。
+                    continue
                 text = rag_path.read_text(encoding="utf-8")
             except OSError:
                 continue

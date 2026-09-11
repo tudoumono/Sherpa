@@ -27,7 +27,7 @@ import os
 import posixpath
 import re
 import stat as stat_mod
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .. import corpus_docs, doc_text, grep_tool, scope_infer, worlds
 from . import importance, text_kind
@@ -437,8 +437,12 @@ def build_world(world_dir, world_id: str, *, files=None):
     参照）。省略時は従来どおりここで直接歩く。
     """
     entries = files if files is not None else scope_infer.safe_files(world_dir)
+    # 秘匿ファイル（.env 系・id_rsa 系・credentials 等＝名前規約を含む）はグラフ取り込みでも読まない。
+    # 台帳・grep・精読は classify_document で外れるが、Pass1 は拡張子で候補を引くため別に塞ぐ
+    # （上流構成でも `.env.yaml`／`.env.sh` は YAML／shell アナライザの候補になる）。
     files = [(rp, rel) for rp, rel in entries
-             if not importance.is_importance_control_path(rel)]
+             if not importance.is_importance_control_path(rel)
+             and not text_kind.is_sensitive(PurePosixPath(rel).name, PurePosixPath(rel).suffix.lower())]
 
     defs: dict = {}            # (label, NAME) -> [rel, ...]
     qualified_defs: dict = {}  # (label, cid_key) -> [(rel, 実名), ...]（RV2-4・cid_key が付く定義は常時登録）

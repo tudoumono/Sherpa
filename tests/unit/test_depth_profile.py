@@ -151,3 +151,36 @@ def test_scaled_depth_abs_max_does_not_affect_values_already_within_bound():
 
 def test_scaled_depth_abs_max_omitted_keeps_existing_behavior():
     assert D.scaled_depth(64, "max") == 68
+
+
+# ===== STAT-3 S1（利用統計の拡充）: usage メタへ足す depth 由来のキー =====
+
+@pytest.mark.parametrize("profile,expected", [("standard", 12), ("deep", 24), ("max", 36)])
+def test_effective_max_turns_composes_effective_base_and_scaled_turns(profile, expected):
+    """`effective_base(...,"max_turns",12)` → `scaled_turns(...)` と同じ結果（単一の真実源）。"""
+    assert D.effective_max_turns(None, 12, profile) == expected
+    assert D.effective_max_turns({"depth_base_max_turns": 12}, 1, profile) == expected
+
+
+def test_usage_extras_always_includes_depth_profile_defaulting_to_standard():
+    assert D.usage_extras(None) == {"depth_profile": "standard"}
+    assert D.usage_extras("deep") == {"depth_profile": "deep"}
+
+
+def test_usage_extras_omits_limits_unless_both_given():
+    """max_turns/max_tools_per_turn は両方揃ったときだけ足す（欠落は欄ごと省略）。"""
+    assert D.usage_extras("standard", max_turns=12) == {"depth_profile": "standard"}
+    assert D.usage_extras("standard", max_tools_per_turn=16) == {"depth_profile": "standard"}
+    assert D.usage_extras("deep", max_turns=24, max_tools_per_turn=16) == {
+        "depth_profile": "deep", "max_turns": 24, "max_tools_per_turn": 16}
+
+
+def test_usage_reasoning_extras_omits_base_when_unchanged():
+    assert D.usage_reasoning_extras("standard", "medium", "medium") == {
+        "depth_profile": "standard", "reasoning": "medium"}
+
+
+def test_usage_reasoning_extras_includes_base_when_overridden():
+    """深く/最大は基準値を上書きする＝`reasoning_base` も残す（実効値と基準値の両方が分かる）。"""
+    assert D.usage_reasoning_extras("deep", "medium", "high") == {
+        "depth_profile": "deep", "reasoning": "high", "reasoning_base": "medium"}

@@ -920,6 +920,129 @@
         "title": "ChatStreamStopReq",
         "type": "object"
       },
+      "ChatSyncReq": {
+        "description": "同期 `POST /chat` の本文。途中停止用の相関ID（`/chat/stream/stop` で使う）が必須——実行を\n経過時間で打ち切らないため、停止導線の無い実行は受け付けない（Codex が固まっても止められない\n実行を作らない）。背景ターン `POST /chat/turns` は `turn_id` の停止導線を持つため `ChatReq` のまま。",
+        "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id"
+          },
+          "depth_profile": {
+            "default": "standard",
+            "enum": [
+              "standard",
+              "deep",
+              "max"
+            ],
+            "title": "Depth Profile",
+            "type": "string"
+          },
+          "knowledge": {
+            "default": false,
+            "title": "Knowledge",
+            "type": "boolean"
+          },
+          "layer": {
+            "default": "both",
+            "enum": [
+              "docs",
+              "code",
+              "both"
+            ],
+            "title": "Layer",
+            "type": "string"
+          },
+          "lens": {
+            "anyOf": [
+              {
+                "enum": [
+                  "impact",
+                  "troubleshoot",
+                  "qa",
+                  "author"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lens"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "personal": {
+            "default": false,
+            "title": "Personal",
+            "type": "boolean"
+          },
+          "scope_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scope Paths",
+            "type": "array"
+          },
+          "stream_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$",
+            "title": "Stream Id",
+            "type": "string"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "propertyNames": {
+                  "enum": [
+                    "grep",
+                    "fulltext",
+                    "graph"
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          },
+          "web_search": {
+            "default": false,
+            "title": "Web Search",
+            "type": "boolean"
+          },
+          "world": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World"
+          }
+        },
+        "required": [
+          "message",
+          "stream_id"
+        ],
+        "title": "ChatSyncReq",
+        "type": "object"
+      },
       "ChatTurnRunning": {
         "description": "`GET /chat/turns/running` の1要素。`started_at` はハンドラが `.isoformat()` 済み＝ str 型のまま。",
         "properties": {
@@ -934,6 +1057,17 @@
           "turn_id": {
             "title": "Turn Id",
             "type": "string"
+          },
+          "uid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uid"
           }
         },
         "required": [
@@ -4344,6 +4478,19 @@
             ],
             "title": "Agentic Budget Total"
           },
+          "agentic_max_tools_per_turn": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agentic Max Tools Per Turn"
+          },
           "arms_enabled": {
             "anyOf": [
               {
@@ -5099,7 +5246,7 @@
         "type": "object"
       },
       "UsageTokenByKind": {
-        "description": "S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 用途別（kind）内訳。\n\nchat 行は messages.answer->'usage' 由来（トークン列は常に int）。それ以外の kind（`metering.KINDS`\n参照・intent/embed/graph_ask/vlm 等）は usage_events 由来で、プロバイダが usage を報告しなかった\n行はトークン列が None（「報告不能」マーカー・0 に丸めない）。",
+        "description": "S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 用途別（kind）内訳。\n\nchat 行は messages.answer->'usage' 由来（トークン列は常に int）。それ以外の kind（`metering.KINDS`\n参照・intent/embed/graph_ask/vlm 等）は usage_events 由来で、プロバイダが usage を報告しなかった\n行はトークン列が None（「報告不能」マーカー・0 に丸めない）。\n\n`elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n`（STAT-3 S2・2026-09-11-利用統計の拡充.md T2）:\nusage_events.elapsed_ms（計測スコープの無い呼び出しは NULL）の合計・平均（NULL 行を除く）・\n計測ありの行数。chat 行は対象外（別契約）＝常に total/avg=None・n=0。",
         "properties": {
           "cached_input": {
             "anyOf": [
@@ -5114,6 +5261,32 @@
           },
           "calls": {
             "title": "Calls",
+            "type": "integer"
+          },
+          "elapsed_ms_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Avg"
+          },
+          "elapsed_ms_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Total"
+          },
+          "elapsed_n": {
+            "title": "Elapsed N",
             "type": "integer"
           },
           "input": {
@@ -5170,7 +5343,10 @@
           "input",
           "cached_input",
           "output",
-          "reasoning_output"
+          "reasoning_output",
+          "elapsed_ms_total",
+          "elapsed_ms_avg",
+          "elapsed_n"
         ],
         "title": "UsageTokenByKind",
         "type": "object"
@@ -8098,7 +8274,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ChatReq"
+                "$ref": "#/components/schemas/ChatSyncReq"
               }
             }
           },
@@ -8322,18 +8498,11 @@
           {
             "in": "query",
             "name": "stream_id",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Stream Id"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$",
+              "title": "Stream Id",
+              "type": "string"
             }
           }
         ],
@@ -8467,8 +8636,20 @@
     },
     "/chat/turns/running": {
       "get": {
-        "description": "現在ユーザーが実行中（未完了）のターン一覧。トップバーの「回答作成中」表示・会話を開いた際の\n自動再購読の両方で使う（サーバ再起動でレジストリが空になれば自然に「実行中なし」に戻る）。",
+        "description": "現在ユーザーが実行中（未完了）のターン一覧。トップバーの「回答作成中」表示・会話を開いた際の\n自動再購読の両方で使う（サーバ再起動でレジストリが空になれば自然に「実行中なし」に戻る）。\n`all=true` は管理者専用（それ以外は 403）＝全員分を `uid` 付きで返す（既定は本人分のみ・`uid` は null）。実行を経過時間で打ち切らない\nため、固まったターンを管理者が `/chat/turns/{turn_id}/stop` で解放する導線に使う。",
         "operationId": "chat_turns_running_chat_turns_running_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -8479,6 +8660,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Chat Turns Running",
@@ -8489,7 +8680,7 @@
     },
     "/chat/turns/{turn_id}/stop": {
       "post": {
-        "description": "実行中ターンを停止する（本人のターンのみ）。既存 `/chat/stream/stop` と同じ挙動（stop_event を\nset するだけ＝assistant は保存されず、停止も clarify と同格に監査へ記録される・chat_service 側）。\n存在しない/他人/完了済みはすべて `{\"ok\": false}`（存在有無を教えない）。",
+        "description": "実行中ターンを停止する（本人のターン・管理者は全員のターン）。既存 `/chat/stream/stop` と同じ挙動\n（stop_event を set するだけ＝assistant は保存されず、停止も clarify と同格に監査へ記録される・\nchat_service 側）。存在しない/他人/完了済みはすべて `{\"ok\": false}`（存在有無を教えない）。",
         "operationId": "chat_turns_stop_chat_turns__turn_id__stop_post",
         "parameters": [
           {
@@ -9238,7 +9429,7 @@
     },
     "/documents/download": {
       "get": {
-        "description": "根拠の原本DL（R6）。doc_id＝**rel_path**（world root 相対）をパス基準で解決（root 確認）。\n\n検証は3段、`world_lock_shared`（読み取り専用の共有ロック・rebind/delete の排他ロックと\n直列化）を**台帳確認の直前から fd の fstat 完了まで**保持したまま行う——ロックを取った\n**後**に一度だけ `worlds.world_dir()` で root を解決し（`pin_world_root` で固定）、以降の\n台帳整合の検証と safe_open の両方に**同じ** root を渡す（世代が違う root を跨いで検証・\n配信してしまう＝rebind と競合する窓を無くす）。\n(1) 文書台帳（`store.document_exists`）に `rel` が**完全一致**で載っているかを索引付き1行\nSELECT で確認する——台帳の name は safe_files 由来の正準表記なので、大文字小文字違い・\n8.3 短縮名等の別名や、列挙不能なディレクトリ内の（生成物にしか現れない）ファイル名はここで\n落ちる（`sherpa.documents.resolve` 自体は filesystem のみで完結し DB を要らないため、この\n確認は DB が常に使える本エンドポイント側で行う）。台帳は取り込み成功時に書かれる\n（`ingest/worker.py`）ため、一度も取り込みが完了していない world は常に 404。\n(2) `doc_ledger.original_path`（root からの直接 lstat 降下・symlink 拒否・封じ込め）で実体を\n確認する。(3) 検証と実配信を別操作にしない：検証済みの `rel` を改めて\n`safe_open.open_file_nofollow_walk`（`/ext/v1/doc` と同じ実装）で O_NOFOLLOW walk して\n得た fd 1本だけを fstat〜配信まで使う——検証で得た `Path` をそのまま `FileResponse` に渡すと、\n検証〜実際の open の間隔で中間ディレクトリが symlink に差し替えられた場合に追跡してしまう\n（TOCTOU）。fstat 完了後（fd 自体は inode を掴んでおり以後のパス変化と無関係）にロックを\n解放してから監査・配信に進む——配信（大きなファイルだと時間がかかる）の間 rebind/delete を\nブロックし続けない。",
+        "description": "根拠の原本DL（R6）。doc_id＝**rel_path**（world root 相対）をパス基準で解決（root 確認）。\n\n検証は3段、`world_lock_shared`（読み取り専用の共有ロック・rebind/delete の排他ロックと\n直列化）を**台帳確認の直前から fd の fstat 完了まで**保持したまま行う——ロックを取った\n**後**に一度だけ `worlds.world_dir()` で root を解決し（`pin_world_root` で固定）、以降の\n台帳整合の検証と safe_open の両方に**同じ** root を渡す（世代が違う root を跨いで検証・\n配信してしまう＝rebind と競合する窓を無くす）。\n(1) 文書台帳（`store.document_exists`）に `rel` が**完全一致**で載っているかを索引付き1行\nSELECT で確認する——台帳の name は safe_files 由来の正準表記なので、大文字小文字違い・\n8.3 短縮名等の別名や、列挙不能なディレクトリ内の（生成物にしか現れない）ファイル名はここで\n落ちる（`sherpa.documents.resolve` 自体は filesystem のみで完結し DB を要らないため、この\n確認は DB が常に使える本エンドポイント側で行う）。台帳は取り込み成功時に書かれる\n（`ingest/worker.py`）ため、一度も取り込みが完了していない world は常に 404。\n(2) `doc_ledger.original_path`（root からの直接 lstat 降下・symlink 拒否・封じ込め）で実体を\n確認する。(3) 検証と実配信を別操作にしない：検証済みの `rel` を改めて\n`safe_open.open_file_nofollow_walk`（`/ext/v1/doc` と同じ実装）で O_NOFOLLOW walk して\n得た fd 1本だけを fstat〜配信まで使う——検証で得た `Path` をそのまま `FileResponse` に渡すと、\n検証〜実際の open の間隔で中間ディレクトリが symlink に差し替えられた場合に追跡してしまう\n（TOCTOU）。fstat 完了後（fd 自体は inode を掴んでおり以後のパス変化と無関係）にロックを\n解放してから監査・配信に進む——配信（大きなファイルだと時間がかかる）の間 rebind/delete を\nブロックし続けない。\n\n秘匿名（`text_kind.is_sensitive`）は台帳確認の直後・実体確認より前で塞ぐ——`is_sensitive`\n導入前に取り込まれ台帳に残っている行（`credentials.xlsx` 等）が実体確認まで進んでしまうと\n素通しで配信されるため（台帳 #81）。存在を明かさない既存の「見つからない」応答と同じ形にする。",
         "operationId": "doc_download_documents_download_get",
         "parameters": [
           {

@@ -16,6 +16,7 @@ Private Link 等でこの preflight の実行元から到達できない構成�
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,23 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECK_PRODUCTION = ROOT / "scripts" / "check-production.sh"
 
 
+def _closed_local_port() -> int:
+    """どのプロセスも listen していないローカルポート番号を1つ返す（一時的に bind して即 close
+    ＝小さな race はあるが、テスト実行中に他プロセスがこの高番ポートを奪う可能性は無視できる）。
+
+    到達不能アドレス（TEST-NET-1 のようなブラックホール）宛の TCP connect は OS の
+    connect_timeout をフルに待つ（`check_production_openai_probe.py::_CONNECT_TIMEOUT`＝3秒・
+    `scripts/check-production.sh::_check_openai_endpoint_host` の `timeout 3`）が、ループバックの
+    「誰も listen していない」ポートへの接続は ECONNREFUSED でほぼ即座に失敗する。「到達できない」
+    という判定結果自体は同じため（検査対象の contract は変えない）、待ち時間だけを高速化できる。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def _run_check_production(tmp_path: Path, *, openai_base_url: str | None,
                            fake_getent: str | None = None,
                            force_db_unreachable: bool = True) -> subprocess.CompletedProcess:
@@ -34,11 +52,12 @@ def _run_check_production(tmp_path: Path, *, openai_base_url: str | None,
     差し替える（実 DNS に依存させないため）。env ファイルは意図的に存在しないパスにする
     （この検査より前の項目は失敗するが、`fail()` は非0終了しない実装のため、後続の検査まで進む）。
 
-    `force_db_unreachable`（既定 True）: `PGHOST`/`SHERPA_PG_DSN` を TEST-NET-1
-    （RFC 5737・到達不能想定・他の疎通テストと同じ手法）へ強制し、system_settings 実効値モードの
-    判定を確実に「DB 未到達」へ倒す（env 候補モードを検査する本ファイルの大半のテストを、pytest
-    プロセスの ambient な DB 接続先（他のテストが `openai_endpoint_seed_version` マーカーを既に
-    立てている可能性があり、テスト実行順に応じて結果が変わりうる＝共有 DB へは触れない方針）から
+    `force_db_unreachable`（既定 True）: `PGHOST`/`SHERPA_PG_DSN` を「誰も listen していない
+    ローカルポート」（`_closed_local_port`・ECONNREFUSED で即座に失敗＝到達不能という判定結果は
+    TEST-NET-1 と同じだが待たない）へ強制し、system_settings 実効値モードの判定を確実に
+    「DB 未到達」へ倒す（env 候補モードを検査する本ファイルの大半のテストを、pytest プロセスの
+    ambient な DB 接続先（他のテストが `openai_endpoint_seed_version` マーカーを既に立てている
+    可能性があり、テスト実行順に応じて結果が変わりうる＝共有 DB へは触れない方針）から
     切り離すため。DB モード自体を検査するテストだけ明示的に `False` を渡す）。
     """
     fake_bin = tmp_path / "bin"
@@ -56,8 +75,8 @@ def _run_check_production(tmp_path: Path, *, openai_base_url: str | None,
     if force_db_unreachable:
         env.pop("SHERPA_PG_DSN", None)
         env.pop("DATABASE_URL", None)
-        env["PGHOST"] = "192.0.2.1"
-        env["PGPORT"] = "5"
+        env["PGHOST"] = "127.0.0.1"
+        env["PGPORT"] = str(_closed_local_port())
     return subprocess.run([str(CHECK_PRODUCTION)], cwd=ROOT, env=env,
                            capture_output=True, text=True, timeout=120)
 
@@ -195,10 +214,12 @@ def test_mode_env_candidate_still_rejects_http_when_db_unreachable(tmp_path: Pat
 
 
 def test_tcp_unreachable_is_warn_not_fail(tmp_path: Path):
-    """Private Link 等でこの preflight の実行元から到達できない構成を想定し、TEST-NET アドレス
-    （RFC 5737・到達不能想定）への TCP 接続失敗は warn 止まりであること（fail にしない）。"""
+    """TEST-NET-1（ブラックホール）宛の TCP 疎通は `timeout 3` で打ち切られ warn（fail ではない）。
+    このテストだけは実接続の上限ガードを担保するためブラックホール宛を維持する（所要約 3 秒）。"""
     r = _run_check_production(
         tmp_path,
+        # この 1 本だけはブラックホール宛（TEST-NET-1）を維持する: `timeout 3` の上限ガードが外れると
+        # SYN 再送で subprocess の timeout を超えて赤になる＝時間上限の契約を担保する唯一のテスト（所要約 3 秒）。
         openai_base_url="https://192.0.2.1/v1",
         fake_getent="#!/usr/bin/env bash\necho ok\nexit 0\n",
     )

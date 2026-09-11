@@ -8,6 +8,8 @@ import io
 import json
 import os
 
+import pytest
+
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
 os.environ["SHERPA_MCP_WORLD"] = "v1"
@@ -246,9 +248,14 @@ def test_tools_call_forwards_layer_to_run_tool(monkeypatch):
     assert captured.get("layer") == "docs"
 
 
+@pytest.mark.usefixtures("upstream_only_registry")
 def test_tools_call_ripgrep_respects_layer_on_fixtures():
     """実 fixtures 上で layer=code を渡すと資料（.md）ヒットが除外される
-    （"TAX-RATE" は .md と .cbl/.cpy の両方に実在する語・test_agentic_search.py と同じ前提）。"""
+    （"TAX-RATE" は .md と .cbl/.cpy の両方に実在する語・test_agentic_search.py と同じ前提）。
+
+    上流限定固定（`upstream_only_registry`）——フォークが `.md` を担当する拡張アナライザを登録すると
+    `.md` が資料（office）ではなくコード（source）判定になり、layer=code から除外される前提
+    （§ 開発ハーネス S4・敵対 RV 是正）が崩れるため。"""
     os.environ["SHERPA_MCP_LAYER"] = "code"
     try:
         resp = M.handle({"jsonrpc": "2.0", "id": 31, "method": "tools/call",
@@ -318,3 +325,45 @@ def test_serve_loop_roundtrip():
     responses = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
     assert [r["id"] for r in responses] == [1, 2]          # 通知には応答が無い＝2件だけ
     assert any(t["name"] == "ripgrep_search" for t in responses[1]["result"]["tools"])
+
+
+# ===== S3b: 原本読取ツール（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
+
+def test_tools_list_exposes_original_read_tools():
+    """原本読取ツール6本が tools/list に出る（schema/description は agentic_search と共通）。"""
+    resp = M.handle({"jsonrpc": "2.0", "id": 50, "method": "tools/list"})
+    tools = resp["result"]["tools"]
+    names = {t["name"] for t in tools}
+    assert {"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head"} <= names
+    from sherpa import agentic_search
+    byname = {t["name"]: t for t in tools}
+    assert byname["xlsx_range"]["description"] == agentic_search._DESC_XLSX_RANGE
+    assert byname["xlsx_range"]["inputSchema"] == agentic_search._PARAMS_XLSX_RANGE
+    assert byname["file_head"]["description"] == agentic_search._DESC_FILE_HEAD
+    assert byname["file_head"]["inputSchema"] == agentic_search._PARAMS_FILE_HEAD
+
+
+def test_tools_list_hides_office_read_tools_when_layer_code_but_keeps_file_head():
+    """探す対象がソースに限定されている間は Office/PDF の5本を隠す（Office は常に docs 側扱い）。
+    `file_head`（テキスト・コード）は層に関係なく公開したまま（`run_tool` 側が個別に絞る）。"""
+    os.environ["SHERPA_MCP_LAYER"] = "code"
+    try:
+        resp = M.handle({"jsonrpc": "2.0", "id": 51, "method": "tools/list"})
+        names = {t["name"] for t in resp["result"]["tools"]}
+    finally:
+        os.environ.pop("SHERPA_MCP_LAYER", None)
+    for hidden in ("xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"):
+        assert hidden not in names, hidden
+    assert "file_head" in names
+
+
+def test_tools_list_keeps_office_read_tools_when_layer_docs_both_or_unset():
+    for lyr in (None, "both", "docs"):
+        if lyr is not None:
+            os.environ["SHERPA_MCP_LAYER"] = lyr
+        try:
+            resp = M.handle({"jsonrpc": "2.0", "id": 52, "method": "tools/list"})
+            names = {t["name"] for t in resp["result"]["tools"]}
+        finally:
+            os.environ.pop("SHERPA_MCP_LAYER", None)
+        assert {"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"} <= names, lyr

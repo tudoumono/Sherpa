@@ -5,8 +5,9 @@
 'use strict';
 const $ = Sherpa.$;                       // 共通ユーティリティ（nav.js・RV DRY）
 
-const DEFAULT_SYS = '憶測で回答しないでください。不明な点は不明と伝えてください。根拠のある情報と推測を明確に分けてください。'
-  + '事実確認が必要な内容については、確認できた情報をもとに回答してください。回答では、結論・理由・補足を分かりやすく整理してください。';
+// 既定文は sherpa/store/settings.py の DEFAULT_SYSTEM_PROMPT と同文（単体テストで同期を検証）。
+const DEFAULT_SYS = '資料を根拠に答え、根拠は資料のパス（必要なら箇所）で示してください。'
+  + '資料に無いことを補うときは『推定』と明示し、確定した事実と分けて書いてください。';
 
 // RV MED（F5・2026-07-16再検証）: ページ初期化時点（fetch/verify/load 実行前）の HTML そのままの
 // <option>（静的 choices＝バックエンドの BEDROCK_MODEL_CHOICES と一致）を捕捉しておく。これらは

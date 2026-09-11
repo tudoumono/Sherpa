@@ -18,6 +18,11 @@ import pytest
 
 from sherpa import grep_tool as G
 
+# 本モジュールは `.md`/`.txt`/`.cbl` 等の拡張子ごとの固定分類（コード/資料の層判定・サイズ上限の
+# 適用対象）を前提にする——フォークが正規の拡張アナライザを登録していても赤にならないよう、登録簿を
+# 上流限定に固定する（開発ハーネス S4・敵対 RV 是正・docs/21-拡張の契約.md）。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
+
 
 def _write(tmp_path: pathlib.Path, name: str, content) -> pathlib.Path:
     p = tmp_path / name
@@ -328,6 +333,22 @@ def test_grep_search_prefers_rag_over_legacy_when_enabled(monkeypatch, tmp_path)
     h = hits[0]
     assert h["doc_id"] == "report.docx" and h["ext"] == ".docx"
     assert "rag NEEDLE" in h["text"] and "legacy NEEDLE" not in h["text"]
+
+
+def test_grep_search_excludes_derived_md_with_sensitive_original_name(monkeypatch, tmp_path):
+    """派生MDの走査（`is_derived`）は `corpus_docs.classify_document` を経由しない
+    ため、原本名（`strip_derived_suffix` で復元した `origin_rel`）が秘匿名（`credentials.xlsx`・
+    `id_rsa.docx`）なら、派生MDが実在してもヒットさせない。非秘匿の派生MDは従来どおりヒットする。"""
+    world_root = tmp_path / "world"
+    world_root.mkdir()
+    der = tmp_path / "derived" / "md"
+    _write(der, "credentials.xlsx.md", "SECRET NEEDLE body\n")
+    _write(der, "id_rsa.docx.md", "SECRET NEEDLE body\n")
+    _write(der, "normal.docx.md", "normal NEEDLE body\n")
+    _isolate_derived_world(monkeypatch, world_root, der)
+
+    hits = G.grep_search("NEEDLE", world="anyworld")
+    assert [h["doc_id"] for h in hits] == ["normal.docx"]
 
 
 def test_grep_search_falls_back_to_legacy_when_rag_missing_even_if_enabled(monkeypatch, tmp_path):

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from . import corpus_docs, documents, scope_infer as si, store, worlds
-from .ingest import importance
+from .ingest import importance, text_kind
 from .store.db import world_lock_shared
 
 
@@ -189,8 +189,15 @@ def public_documents_page(world: str, *, limit: int | None, offset: int = 0) -> 
             rows = (store.list_documents(world) if limit is None
                    else store.list_documents_page(world, limit=limit, offset=offset))
             rows = _reconcile_ledger_blocked(rows, corpus_docs.last_run_blocked_docs(world))
+            # 秘匿名（`is_sensitive` 導入前に台帳へ入った `credentials.xlsx` 等）は行が残っていても
+            # 一覧に出さない（`text_kind.is_sensitive_doc_id`・台帳 #85〜#88）。`limit=None`（全件
+            # 取得済み）の時だけ件数もこの場で正確に再計算する——`total`（COUNT(*)）は秘匿名を含む
+            # 生の行数のため、ページング指定時は既存の高速 COUNT をそのまま使う（残っている秘匿名の
+            # 台帳行は稀な過渡状態＝次回 sync の全置換で消える・`has_more` がわずかに過大でも
+            # 一覧・本文は漏れない）。
+            rows = [r for r in rows if not text_kind.is_sensitive_doc_id(r["name"])]
             docs = [_ledger_row_to_public(r) for r in rows]
-            return docs, total
+            return docs, (len(docs) if limit is None else total)
     all_docs = public_documents(world)
     if limit is None:
         return all_docs, len(all_docs)

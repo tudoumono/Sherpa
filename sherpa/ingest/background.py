@@ -89,11 +89,6 @@ def start_accepting() -> None:
         _accepting = True
 
 
-def is_accepting() -> bool:
-    with _REGISTRY_LOCK:
-        return _accepting
-
-
 def drain(timeout: float = 30.0) -> None:
     """レジストリが空になる（実行中の背景スレッドが無くなる）まで待つ（lifespan shutdown 専用・
     graceful drain）。daemon thread のためプロセス終了自体はこれを待たなくても安全だが、

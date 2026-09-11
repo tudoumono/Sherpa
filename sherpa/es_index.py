@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -1415,6 +1416,8 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     valid_keys: set = set()
     reused_total = 0
     embedded_total = 0
+    embed_elapsed_ms = 0.0    # STAT-3 S5: `_embed_cached()` 呼び出し（Pass1・実 embed API を含みうる）の合計所要時間
+    embed_calls_made = False  # 0（呼んだが瞬時）と未計測（一度も呼んでいない）を区別する
     if ec is not None:
         buf: list = []
         pass1_docs_done = 0
@@ -1429,7 +1432,10 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                 valid_keys.add(_chunk_key(ec, t))
                 buf.append(t)
                 if len(buf) >= _EMBED_FLUSH_CHUNKS:
+                    _t0 = time.monotonic()
                     vecs, reused, embedded = _embed_cached(world, buf, ec)
+                    embed_elapsed_ms += (time.monotonic() - _t0) * 1000
+                    embed_calls_made = True
                     reused_total += reused
                     embedded_total += embedded
                     buf = []
@@ -1448,7 +1454,10 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
                 # 選ぶ（docstring 参照）。
                 progress(pass1_docs_done, total_docs)
         if embed_ok and buf:
+            _t0 = time.monotonic()
             vecs, reused, embedded = _embed_cached(world, buf, ec)
+            embed_elapsed_ms += (time.monotonic() - _t0) * 1000
+            embed_calls_made = True
             reused_total += reused
             embedded_total += embedded
             if vecs is None:
@@ -1459,7 +1468,10 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # が `None` を返した＝`not ec or not texts` ではなく実送信の失敗・docstring 参照）。
         if embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
             # まだ `delete_world()` を呼んでいない＝既存索引（ベクトル付きかもしれない）はそのまま残る。
-            return {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
+            out = {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
+            if embed_calls_made:
+                out["embed_elapsed_ms"] = round(embed_elapsed_ms)
+            return out
         # クラウドを一度も選んでいない構成の実失敗は従来どおり graceful に BM25-only へ降格して続行する。
 
     # 埋め込みキャッシュの最終剪定/削除は**世界全体の doc ストリームを一巡し終えた直後**（ES 操作の前）に
@@ -1586,12 +1598,21 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # 案a（全部か無しか）: 途中バッチの失敗は world を空へ戻す——一部だけ入った索引は
         # 利用者から見て「検索したのに出てこない」というサイレントな取りこぼしになるため。
         _wipe_after_bulk_failure(world)
-        return {"available": True, "indexed": 0, "chunks": 0, "error": sender.error, **rag_report}
+        out = {"available": True, "indexed": 0, "chunks": 0, "error": sender.error, **rag_report}
+        if embed_calls_made:
+            out["embed_elapsed_ms"] = round(embed_elapsed_ms)
+        return out
     _restore_refresh_interval(world)                   # item3: 全バッチ成功＝最終refreshで可視化済み・背景リフレッシュを通常へ戻す
     _confirm_content_sig(world, content_sig)           # 全バッチ成功後にだけ鮮度署名を確定する
-    return {"available": True, "indexed": n_docs, "chunks": total_chunks,
-            "vectors": bool(embed_feature_applies and had_embed_eligible),
-            "embedded": embedded_total, "reused": reused_total, **rag_report}
+    out = {"available": True, "indexed": n_docs, "chunks": total_chunks,
+          "vectors": bool(embed_feature_applies and had_embed_eligible),
+          "embedded": embedded_total, "reused": reused_total, **rag_report}
+    if embed_calls_made:
+        # STAT-3 S5: `_embed_cached()` 呼び出し（実 embed API を含みうる）の合計所要時間。
+        # 埋め込み対象チャンクが無い/未設定の world は一度も呼んでいない＝キーを付けない
+        # （0 と欠落を区別する契約・呼び出し元 `worker.py` の counts 集約が引き継ぐ）。
+        out["embed_elapsed_ms"] = round(embed_elapsed_ms)
+    return out
 
 
 def count(world: str) -> int | None:
@@ -1599,11 +1620,6 @@ def count(world: str) -> int | None:
         return _req("GET", f"/{_index(world)}/_count").get("count")
     except Exception:
         return None
-
-
-def indexed_sig(world: str) -> str | None:
-    """ES index に記録した content_sig（鮮度判定用）。無ければ None。"""
-    return _index_meta(world).get("content_sig")
 
 
 def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool:

@@ -8,12 +8,18 @@
 """
 from __future__ import annotations
 
+import pytest
 import json
 
 from sherpa import agentic_search as A
 from sherpa import corpus_docs, es_index, grep_tool, layer as layer_mod, worlds
 from sherpa.ingest import text_kind
 from sherpa.ingest.failure_reasons import REASON_CATALOG
+
+# 本モジュールは上流構成の固定値（`.py`＝登録アナライザなし・コード側等）を前提にする——
+# フォークが正規の拡張アナライザを登録していても赤にならないよう、登録簿を上流限定に固定する
+# （開発ハーネス S4・敵対 RV 是正・docs/21-拡張の契約.md）。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
 
 def _world(monkeypatch, tmp_path):
@@ -38,7 +44,7 @@ def test_stage1_code_extension_is_branch_source(monkeypatch, tmp_path):
     d = docs[0]
     assert d["doctype"] == text_kind.CODE_DOCTYPE_LABEL
     assert d["branch"] == "source"
-    assert d["analyzer"] is None                    # 登録アナライザは無い
+    assert d["analyzer"] is None                    # 登録アナライザは無い（本モジュールは上流限定固定＝upstream_only_registry）
     assert d["state"] == "ready"
 
     rep = corpus_docs.scan_report("w")
@@ -164,6 +170,34 @@ def test_sensitive_extension_key_is_not_classified_as_document(monkeypatch, tmp_
     docs = corpus_docs.world_documents("w")
     assert docs == []
     assert corpus_docs.status_document_doctype("config.key", "w") is None
+
+
+def test_sensitive_office_original_name_is_not_reclassified_as_office(monkeypatch, tmp_path):
+    """`classify_document()` は秘匿名（`credentials.xlsx`・`id_rsa.docx`）を
+    `document/None` で早期returnするが、`_doctype_for_count`/`iter_world_documents` が
+    Office 拡張子分類（`_OFFICE_DOCTYPE`）へ**再度**倒すと、担当アナライザ不在の未知拡張子と
+    見分けが付かず Office として台帳・件数へ再採用されてしまっていた。派生MDが既に存在しても
+    （旧世代で変換済みだった想定）台帳には載らない——次回 sync の削除伝播に任せる。"""
+    wd, der = _world(monkeypatch, tmp_path)
+    (wd / "credentials.xlsx").write_bytes(b"xlsx fixture")
+    (wd / "id_rsa.docx").write_bytes(b"docx fixture")
+    (wd / "normal.docx").write_bytes(b"docx fixture")
+    (der / "credentials.xlsx.md").write_text("SECRET", encoding="utf-8")
+    (der / "id_rsa.docx.md").write_text("SECRET", encoding="utf-8")
+    (der / "normal.docx.md").write_text("普通の中身", encoding="utf-8")
+
+    docs = corpus_docs.world_documents("w")
+    assert [d["name"] for d in docs] == ["normal.docx"]
+
+    assert corpus_docs.status_document_doctype("credentials.xlsx", "w") is None
+    assert corpus_docs.status_document_doctype("id_rsa.docx", "w") is None
+    assert corpus_docs.status_document_requires_coverage("credentials.xlsx", "w") is False
+    assert corpus_docs.status_document_requires_coverage("id_rsa.docx", "w") is False
+
+    rep = corpus_docs.scan_report("w")
+    assert rep["by_doctype"] == {"Word": 1}                # normal.docx のみ（Excel は0件）
+    assert rep["document_count"] == 1
+    assert rep["skipped_other"] == 0 and rep["analyzer_declined"] == 0
 
 
 # ---- 意味層の内部制御ファイル（旧・`worlds.semantic_paths()` の world配下フォールバック位置・

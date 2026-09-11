@@ -1790,3 +1790,25 @@ def test_parse_attribution_ids_rejects_non_string_element():
 def test_parse_attribution_ids_rejects_non_dict_args():
     assert A._parse_attribution_ids(["ev-1"], {"ev-1": ["4期/a.md"]}) is None
     assert A._parse_attribution_ids(None, {"ev-1": ["4期/a.md"]}) is None
+
+
+def test_build_evidence_digest_graph_card_shows_directed_edges():
+    """graph カードの digest 行に辺の種類と向き（A →COPIES→ B）が出る＝逆向きのカードと同一文にならない。"""
+    from sherpa import agentic_search as A
+    def _meta(edges):
+        return [{"doc_id": None, "span": None, "verification_method": "graph_verified", "source_type": "graph",
+                 "matched_doc_ids": ["a.cbl"],
+                 "card_meta": {"name": "B", "role": "実装", "category": "プログラム", "path": ["A", "B"], "edges": edges}}]
+    d1, _ = A.build_evidence_digest([], _meta(["A →INVOKES→ B"]))
+    d2, _ = A.build_evidence_digest([], _meta(["B →INVOKES→ A"]))
+    assert "辺=A →INVOKES→ B" in d1 and d1 != d2
+
+
+def test_evidence_packet_card_meta_keeps_directed_edges_with_unverified_mark():
+    """graph カードの `card_meta.edges`（辺の向き・未確認印）は Packet の allowlist を通って残る
+    （向きと未確認状態を保存・監査できる）。文字列以外の要素が混ざれば落とす。"""
+    from sherpa.providers.base import _safe_card_meta
+    out = _safe_card_meta({"name": "B", "role": "実装", "category": "プログラム", "path": ["A", "B"],
+                           "edges": ["A →COPIES→ B", "B →INVOKES→ C（未確認）"], "label": "Module"})
+    assert out["edges"] == ["A →COPIES→ B", "B →INVOKES→ C（未確認）"] and "label" not in out
+    assert "edges" not in _safe_card_meta({"name": "B", "edges": ["ok", 1]})

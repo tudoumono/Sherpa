@@ -152,7 +152,6 @@ _PROCESS_PROBES = {
 }
 _LOG_PROBES = {
     "app-log",
-    "author-error",
     "ingest-error",
     "ingest-log",
     "ocr-worker-log",
@@ -221,7 +220,6 @@ _WORKSPACE_PROBES = {
     "workspace-files",
 }
 _CHAT_PROBES = {
-    "author-duration",
     "author-trace",
     "bedrock-probe",
     "chat-answer",
@@ -254,7 +252,6 @@ _CHAT_PROBES = {
     "trace",
     "trace-result-size",
     "trace-total-size",
-    "turn-duration",
     "turn-slot-release",
     "ui-trace",
     "ui-trace-order",

@@ -11,6 +11,7 @@ import os
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
 
+import sherpa.investigation_state as IS  # noqa: E402
 from sherpa.investigation_state import Evidence, InvestigationState, ToolCall  # noqa: E402
 
 
@@ -180,14 +181,80 @@ def test_read_doc_evidence_uses_start_end_line_directly():
     assert ev.span == (5, 40)
 
 
-def test_read_evidence_capped_at_800_chars():
+def test_read_evidence_capped_at_synthesis_budget_quarter_bytes():
+    """保存上限は清書ダイジェスト予算（env `SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES`・既定 256KiB）の 1/4
+    （`_READ_TEXT_CAP_BYTES`）——固定800字ではなく清書予算と同期した値であることを固定する。"""
+    from sherpa import agentic_search as A
+    assert IS._READ_TEXT_CAP_BYTES == A._SYNTHESIS_MAX_BYTES // 4
+    assert IS._RENDER_READ_TEXT_CAP == 800   # 表示上限は保存上限に連動させない
+    long_text = "あ" * (IS._READ_TEXT_CAP_BYTES // 3 + 1000)   # 保存上限を超える
     s = _state()
-    long_text = "\n".join(f"{i}: {'x' * 50}" for i in range(1, 40))
-    assert len(long_text) > 800
     s.add_tool_result("read_around", {"doc_id": "a.md", "line": 20}, {"doc_id": "a.md", "text": long_text},
                       [], None)
     ev = next(e for e in s.evidence if e.kind == "read")
-    assert len(ev.text) <= 800
+    assert len(ev.text.encode("utf-8")) <= IS._READ_TEXT_CAP_BYTES
+
+
+# ===== C6: 保存時切断（清書予算に合わせた保存上限を超えたときの text_truncated/gaps/注記） =====
+
+def test_read_evidence_retains_trailing_special_case_after_cap_increase(monkeypatch):
+    """900字超の精読本文の末尾に
+    ある「特例税率0%」は、旧800字固定上限では保存時に切り落とされ清書へ渡らなかった——新しい
+    保存上限（清書予算1/4）では全文がそのまま残り、`text_truncated` も立たない。"""
+    monkeypatch.setattr(IS, "_READ_TEXT_CAP_BYTES", 6144)   # 予算の実効値に依存せず「800 字超でも残る」を検査
+    tail = "特例税率0%が適用される場合がある"
+    body = "税率の一般規定について説明する。" * 60 + tail
+    assert len(body) > 900   # 旧800字上限なら tail が確実に切り落とされる長さ
+    s = _state()
+    s.add_tool_result("read_around", {"doc_id": "a.md", "line": 1},
+                      {"doc_id": "a.md", "text": f"1: {body}"}, [], None)
+    ev = next(e for e in s.evidence if e.kind == "read")
+    assert tail in ev.text
+    assert ev.text_truncated is False
+    assert s.gaps == []
+
+    from sherpa import agentic_search as A
+    payload = A._read_evidence_payload(s)
+    assert any(tail in (p.get("text") or "") for p in payload)
+    digest, _ = A.build_synthesis_digest([], [], read_evidence=payload)
+    assert tail in digest
+    assert "保存時に切断" not in digest
+
+
+def test_read_evidence_exceeding_save_cap_sets_truncated_flag_gap_and_digest_notice(monkeypatch):
+    """保存上限（`_READ_TEXT_CAP_BYTES`）を実際に超える本文は (a) `Evidence.text_truncated`、
+    (b) 専用の gap（"保存時に本文をN字で切断"）、(c) `build_synthesis_digest` の精読行末尾への
+    注記、の3か所すべてに切断の事実が残る——黙って末尾を落とさない。"""
+    monkeypatch.setattr(IS, "_READ_TEXT_CAP_BYTES", 6144)   # 保存上限を超える経路を小さな本文で再現
+    monkeypatch.setattr(IS, "_RENDER_READ_TEXT_CAP", 800)
+    huge = "あ" * 5000   # UTF-8で15000バイト・保存上限を大きく超える
+    s = _state()
+    s.add_tool_result("read_around", {"doc_id": "a.md", "line": 1},
+                      {"doc_id": "a.md", "text": f"1: {huge}"}, [], None)
+    ev = next(e for e in s.evidence if e.kind == "read")
+    assert ev.text_truncated is True
+    assert any("保存時に本文を" in g and "切断" in g and "a.md" in g for g in s.gaps)
+
+    from sherpa import agentic_search as A
+    payload = A._read_evidence_payload(s)
+    assert any(p.get("text_truncated") for p in payload)
+    digest, _ = A.build_synthesis_digest([], [], read_evidence=payload)
+    assert "（末尾未保持）" in digest
+
+
+def test_xlsx_range_exceeding_save_cap_sets_truncated_flag_with_locator_kept(monkeypatch):
+    """S3b 原本読取ツール（span=None・`locator` で同一性を決める）でも保存時切断の扱いは
+    read_around/read_doc と同じ——`locator` は失わない。"""
+    monkeypatch.setattr(IS, "_READ_TEXT_CAP_BYTES", 6144)   # 保存上限を超える経路を小さな本文で再現
+    monkeypatch.setattr(IS, "_RENDER_READ_TEXT_CAP", 800)
+    huge = "あ" * 5000
+    result = {"sheet": "Sheet1", "range": "A1:D20", "rows": [["a"]], "truncated": False,
+             "doc_id": "a.xlsx", "locator": "Sheet1!A1:D20", "text": huge}
+    s = _state()
+    s.add_tool_result("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet1"}, result, [], None)
+    ev = next(e for e in s.evidence if e.kind == "read")
+    assert ev.text_truncated is True
+    assert ev.locator == "Sheet1!A1:D20"
 
 
 def test_read_evidence_dedupes_same_doc_and_range_to_one_entry():
@@ -204,6 +271,74 @@ def test_read_evidence_appears_in_render_with_precise_label():
                       {"doc_id": "a.md", "text": "5: 適用除外あり"}, [], None)
     out = s.render(max_bytes=4096)
     assert "精読: a.md 行 5-5「5: 適用除外あり」" in out
+
+
+# ===== RV#5: S3b 原本読取ツール6本も kind="read" として read_evidence に載る ==================
+# `agentic_search.run_tool` が合成する結果の形（`doc_id`/`text`/`locator` を持つ）を模す
+# （`_doc_reader_text_locator` 参照）。
+
+def test_xlsx_range_result_becomes_one_read_evidence_entry():
+    s = _state()
+    result = {"sheet": "Sheet1", "range": "A1:D20", "rows": [["a", "b"]], "truncated": False,
+             "doc_id": "a.xlsx", "locator": "Sheet1!A1:D20", "text": "1: a\tb"}
+    s.add_tool_result("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet1"}, result, [], None)
+    reads = [e for e in s.evidence if e.kind == "read"]
+    assert len(reads) == 1
+    assert reads[0].doc_id == "a.xlsx"
+    assert "a" in reads[0].text
+
+
+def test_file_head_result_becomes_read_evidence():
+    s = _state()
+    result = {"size": 5, "text": "hello", "truncated": False, "doc_id": "note.txt", "locator": "head"}
+    s.add_tool_result("file_head", {"doc_id": "note.txt"}, result, [], None)
+    reads = [e for e in s.evidence if e.kind == "read"]
+    assert len(reads) == 1
+    assert reads[0].doc_id == "note.txt"
+    assert reads[0].text == "hello"
+
+
+# RV2巡目#9: xlsx_range は span=None のため doc_id だけでは同一性が決まらない——別シートの
+# 読み取りが locator（"Sheet1!..." 等）まで含めて区別されず1件に潰れていた（是正後は2件残る）。
+
+def test_xlsx_range_different_sheets_same_doc_stay_as_two_entries():
+    s = _state()
+    r1 = {"sheet": "Sheet1", "range": "A1:B1", "rows": [["a", "b"]], "truncated": False,
+         "doc_id": "a.xlsx", "locator": "Sheet1!A1:B1", "text": "1: a\tb"}
+    r2 = {"sheet": "Sheet2", "range": "A1:B1", "rows": [["c", "d"]], "truncated": False,
+         "doc_id": "a.xlsx", "locator": "Sheet2!A1:B1", "text": "1: c\td"}
+    s.add_tool_result("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet1"}, r1, [], None)
+    s.add_tool_result("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet2"}, r2, [], None)
+    reads = [e for e in s.evidence if e.kind == "read" and e.doc_id == "a.xlsx"]
+    assert len(reads) == 2
+    texts = {e.text for e in reads}
+    assert texts == {"1: a b", "1: c d"}
+    # 清書引き継ぎ（read_evidence）にも locator が前置され、どちらのシートか区別できる。
+    from sherpa import agentic_search
+    payload = agentic_search._read_evidence_payload(s)
+    payload_texts = {p["text"] for p in payload if p["doc_id"] == "a.xlsx"}
+    assert payload_texts == {"Sheet1!A1:B1: 1: a b", "Sheet2!A1:B1: 1: c d"}
+
+
+def test_docx_paragraphs_pptx_slides_pdf_pages_become_read_evidence_but_xlsx_sheets_does_not():
+    """本文を返す読取ツールは精読 Evidence。シート一覧だけの xlsx_sheets は精読にしない（根拠の偽装防止）。"""
+    s = _state()
+    cases = [
+        ("xlsx_sheets", {"sheets": [{"name": "Sheet1", "max_row": 1, "max_col": 1}],
+                        "doc_id": "a.xlsx", "locator": "sheets", "text": "Sheet1: 1行×1列"}),
+        ("docx_paragraphs", {"paragraphs": [{"i": 0, "style": "Normal", "text": "hi"}], "tables": [],
+                            "truncated": False, "doc_id": "b.docx", "locator": "paragraphs[0-0]",
+                            "text": "段落0: hi"}),
+        ("pptx_slides", {"slides": [{"no": 1, "texts": ["t"], "tables": [], "notes": None}],
+                        "truncated": False, "doc_id": "c.pptx", "locator": "slides[1]",
+                        "text": "スライド1: t"}),
+        ("pdf_pages", {"pages": [{"no": 1, "text": "p1"}], "truncated": False,
+                      "doc_id": "d.pdf", "locator": "pages[1]", "text": "ページ1: p1"}),
+    ]
+    for name, result in cases:
+        s.add_tool_result(name, {"doc_id": result["doc_id"]}, result, [], None)
+    reads = {e.doc_id for e in s.evidence if e.kind == "read"}
+    assert reads == {"b.docx", "c.pptx", "d.pdf"}
 
 
 # ===== 構造的根拠（list_docs/graph_neighbors）=====
@@ -609,3 +744,207 @@ def test_list_docs_with_different_conditions_still_stay_separate_after_rv4():
     s.add_tool_result("list_docs", {"path_prefix": "A"}, {"count": 1, "docs": [{"rel_path": "a.md"}]}, [], meta_a)
     s.add_tool_result("list_docs", {"path_prefix": "B"}, {"count": 2, "docs": [{"rel_path": "b.md"}]}, [], meta_b)
     assert len([e for e in s.evidence if e.kind == "list"]) == 2
+
+
+# ===== RV 是正: list_docs のページ境界は限界ではない・同一 gap は 1 本・render の精読表示は短く =====
+
+def test_list_docs_page_truncated_does_not_add_body_truncation_gap():
+    s = _state()
+    s.add_tool_result("list_docs", {"path_prefix": "4期"},
+                      {"count": 300, "offset": 0, "docs": [{"rel_path": "a.md"}], "truncated": True,
+                       "next_offset": 200}, None, [])
+    assert not any("切断" in g for g in s.gaps)
+    assert s.tool_log[-1].truncated is True       # 呼び出し記録の打ち切り印は残す
+
+
+def test_args_summary_uses_doctype_and_state_filters():
+    assert IS._args_summary({"doctype": "Excel"}, lambda x: x) == "Excel"
+    assert IS._args_summary({"state": "unreadable"}, lambda x: x) == "unreadable"
+
+
+def test_same_read_truncation_gap_is_recorded_once_across_reingest():
+    s = _state()
+    for _ in range(3):
+        s.add_tool_result("read_doc", {"doc_id": "a.md"},
+                          {"doc_id": "a.md", "text": "本文", "text_truncated": True}, [], None)
+    assert s.gaps.count("read_doc doc a.md: 本文が上限で切断") == 1
+
+
+def test_render_keeps_gaps_section_when_read_texts_are_long(monkeypatch):
+    """既定の表示上限（固定 800 字）で、長い精読が並んでも【限界】が render から落ちない。"""
+    monkeypatch.setattr(IS, "_READ_TEXT_CAP_BYTES", 6144)   # 保存上限の実効値（env）に依存しない
+    s = _state()
+    for i in range(8):
+        s.add_tool_result("read_around", {"doc_id": f"d{i}.md", "line": 1},
+                          {"doc_id": f"d{i}.md", "text": f"{i}: " + "あ" * 1500}, [], None)
+    s.add_tool_result("ripgrep_search", {"query": "特例"}, {"hits": []}, [], None)
+    out = s.render(max_bytes=32 * 1024)
+    assert "0件" in out and "…" in out
+
+
+# ===== RV 2巡目: 再取り込みは偽の 0件・切断 gap を作らない =====
+
+def test_reingest_of_locator_read_does_not_add_zero_or_duplicate_truncation_gaps(monkeypatch):
+    monkeypatch.setattr(IS, "_READ_TEXT_CAP_BYTES", 6144)   # 保存上限を超える経路を小さな本文で再現
+    from sherpa import agentic_search as A
+    from sherpa.providers.base import _ingest_sub_final_into_state
+    child = _state()
+    child.add_tool_result("xlsx_range", {"doc_id": "d1"},
+                          {"doc_id": "d1", "locator": "Sheet1!A1:D20", "text": "い" * 3000}, [], None)
+    assert any("保存時に本文を" in g for g in child.gaps)
+    payload = A._read_evidence_payload(child)
+    parent = _state()
+    _ingest_sub_final_into_state(parent, {"read_evidence": payload, "gaps": list(child.gaps)})
+    _ingest_sub_final_into_state(parent, {"read_evidence": payload, "gaps": list(child.gaps)})
+    assert not any("0件" in g for g in parent.gaps)
+    assert all(t.hits != 0 for t in parent.tool_log if t.name == "read_doc")   # 呼び出し記録も 0件にしない
+    assert [g for g in parent.gaps if "切断" in g] == [g for g in child.gaps if "切断" in g]
+    ev = next(e for e in parent.evidence if e.kind == "read")
+    assert ev.text_truncated and ev.locator == "Sheet1!A1:D20" and not ev.text.startswith("Sheet1")
+
+
+def test_graph_neighbors_truncation_gap_names_partial_neighbors_not_body():
+    s = _state()
+    s.add_tool_result("graph_neighbors", {"name": "TAXRATE"},
+                      {"neighbors": [{"name": "A"}], "truncated": True, "count": 500}, [], None)
+    assert any("近傍が上限で打ち切り" in g and "500" in g for g in s.gaps)
+    assert not any("本文" in g for g in s.gaps)
+
+
+def test_render_clips_read_extra_quotes_to_display_cap(monkeypatch):
+    monkeypatch.setattr(IS, "_READ_TEXT_CAP_BYTES", 6144)   # 保存上限を超える経路を小さな本文で再現
+    monkeypatch.setattr(IS, "_RENDER_READ_TEXT_CAP", 800)
+    s = _state()
+    s.add_tool_result("file_head", {"doc_id": "X"}, {"doc_id": "X", "text": "あ" * 2000, "locator": "head"}, [], None)
+    s.add_tool_result("file_head", {"doc_id": "X"}, {"doc_id": "X", "text": "い" * 1500, "locator": "head"}, [], None)
+    ev = next(e for e in s.evidence if e.kind == "read")
+    assert ev.extra_quotes                      # 短い方は退避されている
+    line = s._fmt_evidence(ev)
+    assert len(line) < 2 * IS._RENDER_READ_TEXT_CAP + 200 and "い" * 801 not in line
+
+
+def test_glob_and_outline_truncation_gap_is_a_list_cutoff_not_body():
+    s = _state()
+    s.add_tool_result("glob_search", {"pattern": "*.xlsx"}, {"count": 350, "paths": ["a.xlsx"], "truncated": True}, [], None)
+    s.add_tool_result("doc_outline", {"doc_id": "x.md"}, {"doc_id": "x.md", "count": 900, "headings": [], "truncated": True}, [], None)
+    assert sum("一覧が上限で打ち切り" in g for g in s.gaps) == 2
+    assert not any("本文" in g for g in s.gaps)
+
+
+def test_doc_outline_file_truncated_only_is_not_reported_as_list_cutoff():
+    s = _state()
+    s.add_tool_result("doc_outline", {"doc_id": "big.md"},
+                      {"doc_id": "big.md", "count": 7, "headings": [], "truncated": False, "file_truncated": True}, [], None)
+    assert any("読み切れていない" in g and "過小" in g for g in s.gaps)
+    assert not any("一覧が上限で打ち切り" in g for g in s.gaps)
+
+
+def test_structural_fact_marks_omitted_paths_so_summary_cannot_claim_all():
+    meta = [{"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+             "list_meta": {"count": 30, "shown": 30, "prefix": "4期", "pattern": ""},
+             "matched_doc_ids": [f"4期/{i}.md" for i in range(30)]}]
+    s = _state()
+    s.add_tool_result("list_docs", {"path_prefix": "4期"}, {"count": 30, "docs": []}, [], meta)
+    ev = next(e for e in s.evidence if e.kind == "list")
+    assert "他 20 件のパスは未提示＝この一覧は全件として書かない" in ev.text
+
+
+def test_read_evidence_payload_carries_glob_outline_compare_facts_and_reingests():
+    from sherpa import agentic_search as A
+    from sherpa.providers.base import _ingest_sub_final_into_state
+    child = _state()
+    child.add_tool_result("glob_search", {"pattern": "*.xlsx"},
+                          {"count": 2, "paths": ["a.xlsx", "b.xlsx"], "truncated": False}, [], None)
+    payload = A._read_evidence_payload(child)
+    assert any(p.get("kind") == "list" and p.get("source_tool") == "glob_search" and "a.xlsx" in p["text"] for p in payload)
+    digest, _ = A.build_synthesis_digest([], [], read_evidence=payload)
+    assert "a.xlsx" in digest
+    parent = _state()
+    _ingest_sub_final_into_state(parent, {"read_evidence": payload})
+    assert any(e.kind == "list" and e.source_tool == "glob_search" for e in parent.evidence)
+    assert not any("0件" in g for g in parent.gaps)
+
+
+def test_glob_outline_compare_facts_mark_omitted_items():
+    s = _state()
+    s.add_tool_result("glob_search", {"pattern": "*.xlsx"},
+                      {"count": 30, "paths": [f"p{i}.xlsx" for i in range(30)], "truncated": False}, [], None)
+    s.add_tool_result("doc_outline", {"doc_id": "x.md"},
+                      {"doc_id": "x.md", "count": 25, "headings": [{"title": f"h{i}", "line": i} for i in range(25)],
+                       "truncated": False}, [], None)
+    diff = "--- a\n+++ b\n" + "".join(f"+l{i}\n" for i in range(15))
+    s.add_tool_result("compare_documents", {"left_doc_id": "a", "right_doc_id": "b"},
+                      {"status": "comparable", "compare_conditions": {"left": {"doc_id": "a"}, "right": {"doc_id": "b"}},
+                       "diff": diff}, [], None)
+    texts = [e.text for e in s.evidence]
+    assert any("他 10 件のパスは未提示＝この一覧は全件として書かない" in t for t in texts)
+    assert any("他 5 件の見出しは未提示" in t for t in texts)
+    assert any("他 5 行は未提示" in t for t in texts)
+
+
+def test_omission_note_survives_structural_fact_cap():
+    long = "4期/業務システム/販売管理/仕様書/画面設計/注文入力画面仕様書_第%02d版.xlsx"
+    s = _state()
+    s.add_tool_result("glob_search", {"pattern": "*.xlsx"},
+                      {"count": 30, "paths": [long % i for i in range(30)], "truncated": False}, [], None)
+    ev = next(e for e in s.evidence if e.kind == "list")
+    assert len(ev.text) <= IS._STRUCTURAL_FACT_CAP
+    assert ev.text.endswith("この一覧は全件として書かない）")
+    shown = sum(1 for i in range(30) if (long % i) in ev.text)
+    assert shown < 30 and f"他 {30 - shown} 件のパスは未提示" in ev.text   # 途中で切れたパスは載せず件数は正確
+
+
+def test_items_dropped_by_char_cap_are_counted_in_omission_note():
+    long = "4期/業務システム/販売管理/仕様書/画面設計/注文入力画面仕様書_第%02d版_%s.xlsx"
+    paths = [long % (i, "x" * 30) for i in range(20)]   # 20 件＝件数上限内だが 800 字に収まらない
+    s = _state()
+    s.add_tool_result("glob_search", {"pattern": "*.xlsx"}, {"count": 20, "paths": paths, "truncated": False}, [], None)
+    ev = next(e for e in s.evidence if e.kind == "list")
+    assert len(ev.text) <= IS._STRUCTURAL_FACT_CAP
+    shown = sum(1 for p in paths if p in ev.text)
+    assert shown < 20 and f"他 {20 - shown} 件のパスは未提示" in ev.text
+
+
+def test_structural_fact_stays_within_cap_even_with_long_head():
+    s = _state()
+    s.add_tool_result("glob_search", {"pattern": "*" + "あ" * 1500 + "*.xlsx"},
+                      {"count": 3, "paths": ["a.xlsx", "b.xlsx", "c.xlsx"], "truncated": False}, [], None)
+    ev = next(e for e in s.evidence if e.kind == "list")
+    assert len(ev.text) <= IS._STRUCTURAL_FACT_CAP and "未提示" in ev.text
+
+
+def test_folder_tree_folders_truncated_is_a_cutoff_limit():
+    s = _state()
+    s.add_tool_result("folder_tree", {"path_prefix": "4期"},
+                      {"count": 700, "folders": [], "folders_truncated": True}, [], None)
+    assert any("フォルダ一覧が上限で打ち切り" in g and "700" in g for g in s.gaps)
+    assert s.tool_log[-1].truncated is True
+
+
+def test_xlsx_sheets_truncation_gap_is_a_list_cutoff_not_body():
+    s = _state()
+    s.add_tool_result("xlsx_sheets", {"doc_id": "x.xlsx"},
+                      {"doc_id": "x.xlsx", "sheets": [{"name": "S1"}], "truncated": True}, [], None)
+    assert any("シート一覧が上限で打ち切り" in g for g in s.gaps) and not any("本文" in g for g in s.gaps)
+
+
+def test_compare_unsupported_leaves_a_limit_line():
+    s = _state()
+    s.add_tool_result("compare_documents", {"left_doc_id": "a", "right_doc_id": "b"},
+                      {"status": "unsupported", "reason": "片方以上に RAG 正本が無い文書です"}, [], None)
+    assert any("機械的な突合せができず未確認" in g and "RAG 正本" in g for g in s.gaps)
+
+
+def test_search_hit_cap_is_a_population_cutoff_not_body():
+    s = _state()
+    s.add_tool_result("ripgrep_search", {"query": "税率"},
+                      {"hits": [{"doc_id": f"d{i}.md", "line": 1, "text": "x"} for i in range(30)], "truncated": True}, [], None)
+    assert any("検索ヒットが上限で打ち切り" in g for g in s.gaps) and not any("本文" in g for g in s.gaps)
+
+
+def test_search_hit_cap_gap_survives_alongside_body_truncation():
+    s = _state()
+    s.add_tool_result("ripgrep_search", {"query": "税率"},
+                      {"hits": [{"doc_id": "a.md", "line": 1, "text": "x"}], "truncated": True,
+                       "truncated_docs": ["big.md"]}, [], None)
+    assert any("検索ヒットが上限で打ち切り" in g for g in s.gaps) and any("本文が上限で切断" in g for g in s.gaps)

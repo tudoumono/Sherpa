@@ -50,7 +50,7 @@ class Cell:
     `row_span`/`column_span` は結合の**起点セル**にのみ 2 以上が入る（結合の継続セル＝内容を持たない
     merged 継続セルは要素自体を作らない＝起点セルの span で表現する。採番規則は `arms/ooxml_arm.py` の
     `_docx_table_cells` docstring 参照）。`role` は意味付け（ヘッダ/データ等）。**IR は原本忠実**＝常に
-    `"unknown"`（ヘッダ判定は検索用表現生成側＝`table_semantics.py`＝RAG-REP-001 の責務）。
+    `"unknown"`（ヘッダ判定は検索用表現生成層＝RAG-REP-001 の責務）。
     """
     row: int
     column: int

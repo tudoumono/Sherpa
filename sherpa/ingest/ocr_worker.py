@@ -27,7 +27,7 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable, Protocol
 
-from . import ai_observation, evidence_ir, observation_render, ocr_router
+from . import ai_observation, evidence_ir, observation_render, ocr_router, text_kind
 from ..store import ocr_jobs
 from ..store.db import world_lock
 
@@ -872,6 +872,16 @@ def run_once(
         decision = ocr_router.OCRRouteDecision(**job["route_input"])
         if decision.status != "selected":
             raise OCRBindingError("leased route is not selected")
+        # 更新前に投入された秘匿名ジョブを本文読み取り前に対象外化する（`load_ir`／`prepare_input`
+        # は本文を読む——`text_kind.is_sensitive_doc_id` 集約点・台帳 #92）。再試行せず、
+        # 失敗件数にも数えない。
+        if text_kind.is_sensitive_doc_id(job["source_rel_path"]):
+            _log.warning(
+                "ocr_worker: 秘匿名のためOCRジョブを対象外にしました（ext=%s）",
+                Path(job["source_rel_path"]).suffix.lower(),
+            )
+            ocr_jobs.mark_stale(job_id, lease_token, reason="sensitive_source_excluded")
+            return WorkerResult(status="excluded_sensitive", job_id=job_id)
         ir = load_ir(job)
         prepared = prepare_input(
             job, decision, source_path=resolve_source(job), asset_root=resolve_asset_root(job),
@@ -1065,6 +1075,15 @@ def run_refresh_once(
         for relative, route_path in _route_manifest_paths(root, after=cursor, on_directory=tick):
             tick()
             source_rel_path = relative[: -len(".ocr_route.json")]
+            if text_kind.is_sensitive_doc_id(source_rel_path):
+                # 更新前に投入された秘匿名の Evidence を読まずに除外する（`load_ir` 相当の
+                # 本文読み取り前・台帳 #92）。再投入しない——cursorは進めず、次回呼び出しでも
+                # 同じ判定で除外し続ける（安全側・害はない）。
+                _log.warning(
+                    "ocr_worker: 秘匿名のためEvidenceを対象外にしました（ext=%s）",
+                    Path(source_rel_path).suffix.lower(),
+                )
+                continue
             evidence_path = root.joinpath(*Path(source_rel_path + ".evidence.json").parts)
             if evidence_path.is_symlink() or not evidence_path.is_file():
                 raise OCRBindingError(f"Evidence missing for route manifest: {source_rel_path}")
@@ -1228,6 +1247,12 @@ def build_standard_publish_callback(
             current_ir: evidence_ir.EvidenceIR | None = None
             for row in ocr_jobs.iter_succeeded_results(world, canonical_generation_id):
                 source_rel = str(row["source_rel_path"])
+                # 更新前に成功した秘匿名ジョブ（credentials.png 等）の再公開経路。Evidence を読み直して
+                # 観測を保存しない（run_once の終端化を通らない succeeded 行はここでだけ除外できる）。
+                if text_kind.is_sensitive_doc_id(source_rel):
+                    _log.warning("ocr publish: 秘匿名のため再公開を対象外にしました（ext=%s）",
+                                 Path(source_rel).suffix.lower())
+                    continue
                 if source_rel != previous_source:
                     current_ir = load_ir(row)
                     previous_source = source_rel

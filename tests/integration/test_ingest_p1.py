@@ -76,6 +76,32 @@ def test_run_reflects_to_neo4j_when_available():
     assert res["ledger"] > 0                              # 反映可否によらず台帳は確定
 
 
+def test_run_records_stage_timings_and_counts_with_real_corpus():
+    """STAT-3 S5: fixtures での実取り込みで `stage_timings`（全段・elapsed_ms>=0）と
+    `counts`（scanned>=targeted>=converted+failed+unsupported）が埋まる（受入条件）。"""
+    if not _pg_up():
+        pytest.skip("PG 未起動")
+    res = worker.run(V)
+    assert res["status"] in ("auto_published", "auto_published_with_flags", "failed")
+    snap = res["run"]["extraction_snapshot"]
+
+    st = snap["stage_timings"]
+    for stage in ("scanning", "office_md", "graph_build"):
+        assert stage in st, f"stage_timings に {stage} が無い"
+        assert st[stage]["started_at"] and st[stage]["finished_at"]
+        assert st[stage]["elapsed_ms"] >= 0
+    if res["status"] != "failed":
+        # Neo4j 未起動なら graph_build/es_index/finalize の途中で failed になり得る
+        # （`_pg_up` は PG のみ確認・Neo4j 到達不能ならここから先は skip 相当）。
+        for stage in ("es_index", "finalize"):
+            assert stage in st and st[stage]["finished_at"] and st[stage]["elapsed_ms"] >= 0
+
+    counts = snap["counts"]
+    assert counts["scanned"] >= counts["targeted"]
+    assert counts["targeted"] >= counts["converted"] + counts["failed"] + counts["unsupported"]
+    assert counts["legacy_converted"] >= 0 and counts["legacy_failed"] >= 0
+
+
 def test_rerun_endpoint_and_runs(auth_disabled):
     """ING-3: `/ingest/rerun` は即受付（run_id・joined）。完了状況は `/ingest/runs` の
     該当 run（`run_id` で照合）をポーリングして確認する（`GET /worlds/{wid}/status` は

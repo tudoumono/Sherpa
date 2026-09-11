@@ -355,7 +355,7 @@ def _safe_share_list_meta(lm) -> dict | None:
         v = lm.get(k)
         if isinstance(v, int) and not isinstance(v, bool):
             out[k] = v
-    for k in ("prefix", "pattern"):
+    for k in ("prefix", "pattern", "doctype", "state"):
         v = lm.get(k)
         if isinstance(v, str):
             out[k] = v
@@ -376,6 +376,9 @@ def _safe_share_card_meta(cm) -> dict | None:
     path = cm.get("path")
     if isinstance(path, list) and all(isinstance(p, str) for p in path):
         out["path"] = list(path)
+    edges = cm.get("edges")                       # 辺の向き（「A →COPIES→ B（未確認）」の文字列列）も監査できるよう残す
+    if isinstance(edges, list) and all(isinstance(e, str) for e in edges):
+        out["edges"] = list(edges)
     return out or None
 
 

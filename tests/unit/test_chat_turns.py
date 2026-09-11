@@ -118,3 +118,41 @@ def test_turn_buffer_eviction_degenerate_two_events_stops_safely():
     buf.append(huge)
     out = [e.payload for e in buf.replay_from(0)]
     assert out == [first, huge]
+
+
+def test_start_turn_releases_reservation_when_thread_start_fails(monkeypatch):
+    """スレッド起動に失敗したら予約を取り消す（`_run` が動かないと `mark_done` を呼ぶ者がいない＝
+    枠と会話 busy が恒久占有される）。"""
+    import threading
+    import pytest
+    import sherpa.chat_turns as CT
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading, "Thread", _Boom)
+    with pytest.raises(RuntimeError):
+        CT.start_turn(uid="u1", conversation_factory=lambda: 1,
+                      run_fn_factory=lambda cid: (lambda stop, emit: None))
+    with CT._REGISTRY_LOCK:
+        assert not [r for r in CT._REGISTRY.values() if r.uid == "u1" and not r.buffer.done]
+
+
+def test_admin_can_stop_other_users_turn_but_plain_user_cannot():
+    import threading
+    import sherpa.chat_turns as CT
+    gate = threading.Event()
+    rec = CT.start_turn(uid="u-owner", conversation_factory=lambda: 7,
+                        run_fn_factory=lambda cid: (lambda stop, emit: stop.wait(5)))
+    try:
+        assert CT.stop_turn(rec.turn_id, "u-other") is False
+        assert not rec.stop_event.is_set()
+        assert CT.stop_turn(rec.turn_id, "u-admin", is_admin=True) is True
+        assert rec.stop_event.is_set()
+    finally:
+        rec.stop_event.set()
+        gate.set()

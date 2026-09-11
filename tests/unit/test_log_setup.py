@@ -8,9 +8,9 @@
 """
 from __future__ import annotations
 
+import types
 import io
 import logging
-import time
 
 import pytest
 
@@ -144,15 +144,32 @@ def test_rotate_and_prune_archives_nonempty_and_leaves_empty_alone(tmp_path):
     assert [p for p in tmp_path.iterdir() if p.name not in ("embed.log", "convert.log")] == archives
 
 
-def test_rotate_and_prune_keeps_only_newest_n_and_ignores_unrelated_files(tmp_path):
+def test_rotate_and_prune_keeps_only_newest_n_and_ignores_unrelated_files(tmp_path, monkeypatch):
     path = tmp_path / "libreoffice.log"
     unrelated = tmp_path / "libreoffice-notes.log"
     unrelated.write_text("触らないで", encoding="utf-8")
 
+    # 退避ファイル名は `log_setup._dt.datetime.now()`（秒精度）に依存する——実時間で1秒以上
+    # sleep して秒境界をまたぐ代わりに、呼び出しごとに1秒進むフェイクへ差し替える（並び順・
+    # 命名規約という検証対象の契約は変えない）。
+    import datetime as _dt_real
+
+    class _FakeDateTime(_dt_real.datetime):
+        _current = _dt_real.datetime(2026, 1, 1, 0, 0, 0)
+
+        @classmethod
+        def now(cls, tz=None):
+            value = cls._current
+            cls._current += _dt_real.timedelta(seconds=1)
+            return value
+
+    # モジュール属性 `_dt` ごと差し替える（`log_setup._dt` は stdlib の datetime モジュールそのもの＝
+    # その中の `datetime` を差し替えるとプロセス全体に波及し、他のテストの aware/naive が食い違う）。
+    monkeypatch.setattr(log_setup, "_dt", types.SimpleNamespace(datetime=_FakeDateTime, timedelta=_dt_real.timedelta))
+
     for i in range(4):
         path.write_text(f"run {i}\n", encoding="utf-8")
         log_setup.rotate_and_prune(path, keep=2)
-        time.sleep(1.1)   # タイムスタンプ（秒精度）衝突回避
 
     archives = sorted(p for p in tmp_path.iterdir() if p.name not in ("libreoffice.log", "libreoffice-notes.log"))
     assert len(archives) == 2

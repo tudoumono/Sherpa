@@ -220,6 +220,21 @@ class Analyzer:
     #: `world_graph.build_world`）はこの値に従って読む/切り出す量を決める。
     head_bytes: int = 4096
 
+    #: 部品ごとの版番号（拡張の契約 S4・docs/21-拡張の契約.md）。1以上必須。`registry.config_
+    #: signature()` の材料に `(name, version, extensions)` として畳み込まれる——核の版
+    #: （`CODE_ANALYZERS_SCHEMA_VERSION`）と分離することで、上流の核や他部品の版上げがこの部品の
+    #: 署名部分を変えない（保証範囲は署名の独立まで・世代署名全体は他部品の変更でも変わるため
+    #: world 全体の再構築は現行どおり起きる＝解析キャッシュ／部分再構築は別スライス）。既存の上流
+    #: アナライザは全部既定の 1 のまま。
+    version: int = 1
+
+    #: 拡張アナライザ（`registry.discover_extension_analyzers()`）が上流アナライザと拡張子を意図的に
+    #: 共有する場合にだけ明示する拡張子集合。ここに載っていない拡張子で上流と衝突したら発見時に
+    #: 例外（黙って落とさない・アナライザ増設5箇条）。優先順は登録順のまま変えない——拡張アナライザは
+    #: 末尾に追加されるため、共有拡張子は上流の `accepts()` が拒否したときだけ拡張側に回る
+    #: （`resolve()`/`resolve_lazy()` の既存規則そのまま・優先度の並び替えはしない）。
+    overrides: frozenset = frozenset()
+
     def accepts(self, rel_path: str, head_text: str = "") -> bool:
         """このアナライザが `rel_path` を担当してよいか（拡張子は既に一致している前提・§7 裁定10）。
 

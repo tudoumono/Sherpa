@@ -17,12 +17,15 @@ from .db import _connect, _ensure
 
 def add_usage_event(*, kind, provider, model=None, input_tokens=None, cached_input_tokens=None,
                     output_tokens=None, reasoning_output_tokens=None, calls=1,
-                    user_id=None, world=None, ts=None,
+                    user_id=None, world=None, ts=None, elapsed_ms: int | None = None,
                     connect_timeout: float | None = None,
                     statement_timeout_ms: int | None = None) -> None:
     """1行 INSERT。トークン列は NULLABLE（NULL＝プロバイダが usage を返さなかった「報告不能」マーカー）。
 
     `ts` はテスト用（期間外の行を仕込むため）。None なら DB 側の既定（`now()`）を使う。
+
+    `elapsed_ms`（STAT-3 S2・2026-09-11-利用統計の拡充.md T2）: 呼び出しの所要時間（ミリ秒）。
+    None＝計測スコープ外（`metering.py` docstring 参照）で取れない・記録しない。
 
     `connect_timeout`/`statement_timeout_ms`（両方省略可・既定 None＝無期限＝既存呼び出し元は
     無変更）: `sherpa.metering.record()` がそのまま転送する（PART-4 は「記録は失敗しても構わない
@@ -47,8 +50,8 @@ def add_usage_event(*, kind, provider, model=None, input_tokens=None, cached_inp
         connect_kwargs["connect_timeout"] = max(1, math.ceil(remaining))
     with _connect(**connect_kwargs) as c:
         if statement_timeout_ms is not None:
-            elapsed_ms = (time.monotonic() - budget_started) * 1000
-            remaining_ms = max(1, int(statement_timeout_ms - elapsed_ms))
+            budget_elapsed_ms = (time.monotonic() - budget_started) * 1000
+            remaining_ms = max(1, int(statement_timeout_ms - budget_elapsed_ms))
             # SET LOCAL（session-level ではなく）: プール導入後（性能台帳#17 QW2）、この
             # with ブロック＝単一トランザクションの間だけ有効にし、返却後の接続に
             # statement_timeout が残らないようにする（GUC 汚染防止・commit/rollback で自動消滅）。
@@ -56,17 +59,17 @@ def add_usage_event(*, kind, provider, model=None, input_tokens=None, cached_inp
         if ts is not None:
             c.execute(
                 "INSERT INTO usage_events (ts, kind, provider, model, input_tokens, cached_input_tokens, "
-                "  output_tokens, reasoning_output_tokens, calls, user_id, world) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "  output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (ts, kind, provider, model, input_tokens, cached_input_tokens,
-                 output_tokens, reasoning_output_tokens, calls, user_id, world))
+                 output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms))
         else:
             c.execute(
                 "INSERT INTO usage_events (kind, provider, model, input_tokens, cached_input_tokens, "
-                "  output_tokens, reasoning_output_tokens, calls, user_id, world) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "  output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (kind, provider, model, input_tokens, cached_input_tokens,
-                 output_tokens, reasoning_output_tokens, calls, user_id, world))
+                 output_tokens, reasoning_output_tokens, calls, user_id, world, elapsed_ms))
 
 
 def list_recent_events(kind: str, *, limit: int = 200) -> list:

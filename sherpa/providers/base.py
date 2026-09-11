@@ -111,6 +111,16 @@ class _MainReviewInsufficient(RuntimeError):
     """
 
 
+def _timed_usage(gen, usage_acc: dict):
+    """下調べ役のイベント列を素通ししつつ、消費した壁時計（ms）を `usage_acc["elapsed_ms"]` へ積む
+    （`metering.record("chat-sub", elapsed_ms=)` と利用統計の工程別所要時間の材料）。"""
+    t0 = time.monotonic()
+    try:
+        yield from gen
+    finally:
+        usage_acc["elapsed_ms"] = (usage_acc.get("elapsed_ms") or 0) + round((time.monotonic() - t0) * 1000)
+
+
 def _fold_sub_usage(total: dict, acc: dict | None) -> dict:
     """EXT-2b: 複数回の `_sub_agentic_loop` 実行（初回＋メイン査読の再調査）の chat-sub 消費を
     1回の metering 記録へ合算する。tokens はどれか1回でも不明（None）なら合計も None のまま
@@ -118,14 +128,16 @@ def _fold_sub_usage(total: dict, acc: dict | None) -> dict:
     if not acc or not acc.get("calls"):
         return total
     calls = total.get("calls", 0) + acc["calls"]
+    # 所要時間（`elapsed_ms`・実行の壁時計）は tokens の不明とは独立に合算する（統計の材料）。
+    elapsed = (total.get("elapsed_ms") or 0) + (acc.get("elapsed_ms") or 0)
     if total.get("unknown") or acc.get("tokens") is None:
-        return {"calls": calls, "tokens": None, "unknown": True}
+        return {"calls": calls, "tokens": None, "unknown": True, "elapsed_ms": elapsed}
     if total.get("tokens") is None:
-        return {"calls": calls, "tokens": dict(acc["tokens"]), "unknown": False}
+        return {"calls": calls, "tokens": dict(acc["tokens"]), "unknown": False, "elapsed_ms": elapsed}
     t = dict(total["tokens"])
     for k, v in acc["tokens"].items():
         t[k] = (t.get(k) or 0) + v if isinstance(v, (int, float)) else v
-    return {"calls": calls, "tokens": t, "unknown": False}
+    return {"calls": calls, "tokens": t, "unknown": False, "elapsed_ms": elapsed}
 
 
 def _synth_citation_view(citations: list, rerun_ids: set) -> list:
@@ -151,10 +163,15 @@ def _ingest_sub_final_into_state(state, ev: dict) -> None:
 
     `cites`/`evidence_meta`+`structural_evidence_meta` は既存の `combined_evidence_meta` 契約
     （citation 由来の meta が先頭 `len(cites)` 件・以降が構造的根拠）とそのまま同じ形で
-    `InvestigationState.add_tool_result` へ渡せる。`read_evidence`（read_around/read_doc の精読
-    本文・`agentic_search._read_evidence_payload` が作る `{"doc_id","span","text"}`）は
-    `add_tool_result` の read_doc 分岐（`start_line`/`end_line` を直接読む）を借りて再構成する——
-    本文は既に `_redact`・800字上限で切り詰め済みのため、ここで再度読み直す必要はない。
+    `InvestigationState.add_tool_result` へ渡せる。`read_evidence`（read_around/read_doc・S3b
+    原本読取ツールの精読本文・`agentic_search._read_evidence_payload` が作る
+    `{"doc_id","span","text","locator","text_truncated"}`・glob_search／doc_outline／compare_documents の
+    要約行は `kind`／`source_tool` 付きで混じり同種の Evidence としてそのまま引き継ぐ）は `add_tool_result` の read_doc 分岐
+    （`start_line`/`end_line` を直接読む）を借りて再構成する——本文は既に `_redact`・保存上限
+    （`investigation_state._READ_TEXT_CAP_BYTES`）で切り詰め済みのため、ここで再度読み直す必要は
+    ない。`text_truncated` が立っていれば `synthetic` にも引き継ぐ——下調べ役の
+    `InvestigationState` で既に保存時切断が起きていた事実を、親 `state` 側の Evidence でも黙って
+    失わない。
     `gaps`（sub ループ自身のローカル `InvestigationState.gaps`・`agentic_search._build_final_payload`
     経由で final payload に載る）は sub ループの外（この呼び出し1回限り）では失われるため、
     重複を避けて親 `state.gaps` へ合流する（`dropped_citations` と同じ「素の文字列を直接追記」
@@ -163,15 +180,33 @@ def _ingest_sub_final_into_state(state, ev: dict) -> None:
     citation・`{"doc_id","reason"}`）は根拠ではなく「確認できなかった」事実そのものなので、
     `state.gaps` へ直接足す（未確認・調査の限界を機械的に記録する契約・`InvestigationState.gaps`
     は素の `list[str]` で `add_tool_result` を介さない直接追記も許容する）。
+
+    `locator`（`span` が None のとき同一性の鍵になる・S3b 原本読取ツール）も `synthetic` へ
+    そのまま引き継ぐ——欠くと親 `InvestigationState.add_tool_result` の read 分岐が常に `None`
+    を受け取り、複数エントリ（別シート/別ページ等）が親側で1件に潰れる。
     """
     if state is None:
         return
     state.add_tool_result("sub_loop", {}, {}, ev.get("cites") or [],
                           (ev.get("evidence_meta") or []) + (ev.get("structural_evidence_meta") or []))
     for r in (ev.get("read_evidence") or []):
-        if not isinstance(r, dict) or not r.get("doc_id"):
+        if not isinstance(r, dict):
             continue
-        synthetic = {"doc_id": r.get("doc_id"), "text": r.get("text")}
+        if r.get("kind") in ("list", "outline", "compare") and r.get("text"):
+            # glob_search／doc_outline／compare_documents の要約行はそのまま同種の Evidence として引き継ぐ。
+            state._upsert(kind=r["kind"], doc_id=r.get("doc_id"), span=None, text=str(r["text"]),
+                          source_tool=str(r.get("source_tool") or "sub_loop"), verification="structural")
+            continue
+        if not r.get("doc_id"):
+            continue
+        text, locator = r.get("text"), r.get("locator")
+        # `_read_evidence_payload` は清書向けに `locator` を本文へ前置する——再取り込みでは剥がす
+        # （親側の保存上限判定と表示で二重に前置しない・子で上限内だった本文を親で切り直さない）。
+        if locator and isinstance(text, str) and text.startswith(f"{locator}: "):
+            text = text[len(locator) + 2:]
+        synthetic = {"doc_id": r.get("doc_id"), "text": text, "locator": locator, "reingested": True}
+        if r.get("text_truncated"):
+            synthetic["text_truncated"] = True
         span = r.get("span")
         if isinstance(span, (list, tuple)) and len(span) == 2:
             synthetic["start_line"], synthetic["end_line"] = span[0], span[1]
@@ -353,14 +388,22 @@ def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None
     済み・ここで拾うと二重/誤ラベルになる）。
 
     粒度は「この応答（最終合成）1回分」——非 hybrid agentic 経路（`_agentic_run` の `agentic_usage`
-    集計）だけは呼び出し元がループ全体の経過を渡す（`_agentic_run` 冒頭の t0 参照）。"""
+    集計）だけは呼び出し元がループ全体の経過を渡す（`_agentic_run` 冒頭の t0 参照）。
+
+    STAT-3 S1（利用統計の拡充）: `usage` に `depth_profile`/`reasoning`（Codex 経路）または
+    `max_turns`/`max_tools_per_turn`（API 経路・`depth_profile.usage_extras` が載せる）が既に
+    合流済みならログ1行にも足す（合流済みでない＝`_plain_run` 等は欄ごと省略・既存どおり）。"""
     try:
         from .. import metering
         tokens = {"input_tokens": usage.get("input_tokens"),
                   "cached_input_tokens": usage.get("cached_input_tokens"),
                   "output_tokens": usage.get("output_tokens")}
+        reasoning = usage.get("reasoning")
+        if reasoning is None and usage.get("max_turns") is not None \
+                and usage.get("max_tools_per_turn") is not None:
+            reasoning = f"turns={usage['max_turns']}/tools={usage['max_tools_per_turn']}"
         metering.log_usage_line("chat", usage.get("provider"), usage.get("model"), tokens,
-                                1, world, elapsed)
+                                1, world, elapsed, depth=usage.get("depth_profile"), reasoning=reasoning)
     except Exception:
         pass
 
@@ -455,7 +498,7 @@ def _safe_list_meta(lm) -> dict | None:
         v = lm.get(k)
         if isinstance(v, int) and not isinstance(v, bool):
             out[k] = v
-    for k in ("prefix", "pattern"):
+    for k in ("prefix", "pattern", "doctype", "state"):
         v = lm.get(k)
         if isinstance(v, str):
             out[k] = v
@@ -481,7 +524,7 @@ def _safe_tree_meta(tm) -> dict | None:
 
 def _safe_card_meta(cm) -> dict | None:
     """graph カード Evidence の `card_meta`（対象名・関係・カテゴリ・経路）を型検証して返す
-    （`_safe_list_meta` と同じ allowlist 規律）。`path` は文字列のリストのときだけ通す。
+    （`_safe_list_meta` と同じ allowlist 規律）。`path`・`edges` は文字列のリストのときだけ通す。
     """
     if not isinstance(cm, dict):
         return None
@@ -493,6 +536,9 @@ def _safe_card_meta(cm) -> dict | None:
     path = cm.get("path")
     if isinstance(path, list) and all(isinstance(p, str) for p in path):
         out["path"] = list(path)
+    edges = cm.get("edges")                       # 辺の向き（「A →COPIES→ B（未確認）」の文字列列）も監査できるよう残す
+    if isinstance(edges, list) and all(isinstance(e, str) for e in edges):
+        out["edges"] = list(edges)
     return out or None
 
 
@@ -672,9 +718,10 @@ def _dedupe_structural_evidence(items: list) -> list:
         key = (m.get("doc_id"), m.get("verification_method"),
               tuple(sorted(m.get("matched_doc_ids") or [])),
               lm.get("count"), lm.get("shown"), lm.get("prefix"), lm.get("pattern"),
+              lm.get("doctype"), lm.get("state"),
               tm.get("count"), tm.get("shown"), tm.get("prefix"), tm.get("depth"),
               cm.get("name"), cm.get("role"), cm.get("category"),
-              tuple(cm.get("path") or []))
+              tuple(cm.get("path") or []), tuple(cm.get("edges") or []))   # 辺の向き違いを1本化しない
         if key in seen:
             continue
         seen.add(key)
@@ -748,6 +795,16 @@ def _sub_agent_completed_node(sub: dict, agent_run_id: str, system_settings: dic
     node["metrics"] = _sub_agent_metrics(sub, system_settings)
     return node
 
+
+
+# 下調べ役が予算到達で中断した事実を清書入力へ渡す限界行（ハイブリッド・計画経路で共通）。
+_BUDGET_GAP = "調査を上限到達で中断（未確認の範囲あり・全件性を主張しない）"
+
+
+def _add_plan_gap(gaps: list, gap: str) -> None:
+    """計画経路の限界行（重複は 1 本）。"""
+    if gap not in gaps:
+        gaps.append(gap)
 
 
 def _hybrid_reclassified_stop_reason(stop_reason: str, provider_id: str, completion) -> str:
@@ -935,6 +992,14 @@ class Provider:
     # クラス属性にする（`_agentic_run` の finally が `self._sub is not None` の間だけ参照するため
     # 通常は AttributeError の心配はないが、防御的に既定 None を持たせる）。
     _sub_usage_acc = None
+    # STAT-3 S1（利用統計の拡充）: `_sub_loop` がターンごとに更新する depth 由来の usage 追加キー
+    # （`depth_profile.usage_extras()` の戻り値）。`_sub`/`_sub_usage_acc` と同じ理由でクラス属性に
+    # する（ハイブリッド/計画経路の env["usage"] 組立が `self._sub is None` の素の `Provider` でも
+    # 安全に読めるよう既定 None を持たせる）。
+    _last_sub_depth_usage = None
+    # 非ハイブリッドの `_agentic_loop` が実際に渡した上限（OpenAI/Ollama が設定・Gemini/Bedrock は
+    # 上限を渡さないため None＝usage には depth_profile だけを載せ、使っていない上限を記録しない）。
+    _last_main_depth_usage = None
     system_prompt = ""    # ユーザ設定の回答方針（#2）。LLM 系は system メッセージとして前置する。
 
     def run(self, ctx: Ctx) -> Iterator[dict]:
@@ -1183,7 +1248,9 @@ class _GenProvider(Provider):
                 _review_structural = [{
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
-                                  "prefix": str(v.get("path_prefix") or "").strip(), "pattern": ""},
+                                  "prefix": str(v.get("path_prefix") or "").strip(), "pattern": "",
+                                  "doctype": str(v.get("doctype") or "").strip(),
+                                  "state": str(v.get("state") or "").strip()},
                     "matched_doc_ids": _matched}]
             if state is not None:
                 state.add_tool_result(action, v, result, _cites, _review_structural)
@@ -1347,13 +1414,19 @@ class _GenProvider(Provider):
         # コード既定）を使う。
         profile = (ctx.scope_meta or {}).get("depth_profile")
         max_turns = depth_profile_mod.scaled_turns(max_turns, profile)
+        # STAT-3 S1: この呼び出しが実際にツールループへ渡す実効上限を、呼び出し元（`_agentic_run`/
+        # `_agentic_run_plan` の env["usage"] 組立）が読めるようクラス属性へ残す（複数ステップの
+        # `_run_sub_plan` では最後に呼ばれた `_sub_loop` の値になる＝1本の usage dict に1値の制約）。
+        self._last_sub_depth_usage = depth_profile_mod.usage_extras(
+            profile, max_turns=max_turns,
+            max_tools_per_turn=agentic_search.effective_max_tools_per_turn(self._system_settings or {}))
         max_hits = depth_profile_mod.scaled_ratio(
             depth_profile_mod.effective_base(self._system_settings, "grep_max_hits", agentic_search.MAX_HITS),
             profile, abs_max=agentic_search.MAX_HITS_ABS_MAX)
         window_cap = depth_profile_mod.scaled_ratio(
             depth_profile_mod.effective_base(self._system_settings, "read_window", agentic_search.READ_WINDOW),
             profile, abs_max=agentic_search.READ_WINDOW_ABS_MAX)
-        return agentic_search.openai_style(
+        return _timed_usage(agentic_search.openai_style(
             endpoint, headers, sub["model"], sys, ctx.message, ctx.world,
             (ctx.scope_meta or {}).get("scope_paths"), ollama=ollama, toolset=toolset,
             stop_event=ctx.stop_event, can_ask=can_ask, history=ctx.history or [],
@@ -1364,7 +1437,7 @@ class _GenProvider(Provider):
             # 発行しない（1回分の呼び出しが丸ごと無駄になるため）。
             final_synthesis=False, layer=(ctx.scope_meta or {}).get("layer"),
             system_settings=self._system_settings,
-            max_hits=max_hits, window_cap=window_cap)
+            max_hits=max_hits, window_cap=window_cap), usage_acc)
 
     def _sub_agentic_loop(self, ctx: Ctx):
         """S3（プロファイル型サブエージェント・§5.0）: 解決済み `self._sub` でのツールループ。
@@ -1442,13 +1515,17 @@ class _GenProvider(Provider):
         total_calls = 0
         verified: set = set()   # EXT-2/EV-0: 各ステップの read_around/read_doc 精読 doc_id を合算
         has_structural_evidence = False   # 各ステップの list_docs/graph_neighbors 根拠を OR で合算
+        read_evidence: list = []
+        gaps: list = []
         structural_evidence_meta: list = []   # 検証済み list entry/card 裏付け doc の内訳
         sub_outcomes: list = []   # EXT-3/EXT-2: 各ステップの実測 stop_reason/evaluation（§6.2 項6の根拠ゲートが参照）
         for sub in subs:
             if ctx.stop_event is not None and ctx.stop_event.is_set():
                 return
             if call_budget.remaining <= 0:
-                break   # 横断予算超過＝残ステップをスキップし、合算済み証拠で終える
+                # 横断予算超過＝残ステップをスキップし、合算済み証拠で終える（未実行の事実は限界行に残す）。
+                _add_plan_gap(gaps, f"下調べ（{sub['profile_id']}）は予算到達で未実行＝未確認の範囲あり")
+                break
             step_ctx = ctx if not cites else _dc_replace(ctx, message=_sub_plan_message(ctx.message, cites))
             usage_acc = {"calls": 0, "tokens": None}
             step_stop_reason = None
@@ -1470,6 +1547,7 @@ class _GenProvider(Provider):
                     # 挙動（続行）は変えず、ログ＋実行トレースの両方へ可視化する（握り潰さない）。
                     _log.warning("sub-plan: profile=%s の起動に失敗しました（続行・証拠は他ステップのみ）: %s",
                                 sub["profile_id"], e)
+                    _add_plan_gap(gaps, f"下調べ（{sub['profile_id']}）は失敗して未完了＝未確認の範囲あり")
                     yield {"node": _node(f"sub:{sub['profile_id']}:step-failed", "think",
                                         "下調べの一部が失敗しました", f"{sub['profile_id']}（続行します）",
                                         "done")}
@@ -1482,6 +1560,7 @@ class _GenProvider(Provider):
                         # 挙動は変えない（続行）が、握り潰さず可視化する（上と同じ理由）。
                         _log.warning("sub-plan: profile=%s が実行中に失敗しました（続行・証拠は他ステップのみ）: %s",
                                     sub["profile_id"], e)
+                        _add_plan_gap(gaps, f"下調べ（{sub['profile_id']}）は失敗して未完了＝未確認の範囲あり")
                         yield {"node": _node(f"sub:{sub['profile_id']}:step-failed", "think",
                                             "下調べの一部が失敗しました", f"{sub['profile_id']}（続行します）",
                                             "done")}
@@ -1496,6 +1575,15 @@ class _GenProvider(Provider):
                         verified |= ev.get("verified_docs") or set()
                         dropped_citations += ev.get("dropped_citations") or []
                         structural_evidence_meta += ev.get("structural_evidence_meta") or []
+                        # 精読本文と限界は清書入力（build_synthesis_digest）へ渡すために合算する
+                        # （無いと保存時切断・0件・中断がこの経路の清書に届かない）。
+                        read_evidence += [r for r in (ev.get("read_evidence") or []) if isinstance(r, dict)]
+                        for g in (ev.get("gaps") or []):
+                            if isinstance(g, str) and g not in gaps:
+                                gaps.append(g)
+                        if (ev.get("stop_reason") in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS
+                                and _BUDGET_GAP not in gaps):
+                            gaps.append(_BUDGET_GAP)
                         step_stop_reason = ev.get("stop_reason") or "unknown"
                         step_has_structural = ev.get("has_structural_evidence", False)
                         has_structural_evidence = has_structural_evidence or step_has_structural
@@ -1525,7 +1613,8 @@ class _GenProvider(Provider):
                 if usage_acc["calls"] > 0:
                     from .. import metering
                     metering.record("chat-sub", sub["provider"], sub["model"], usage_acc["tokens"],
-                                    user_id=ctx.uid, world=ctx.world, calls=usage_acc["calls"])
+                                    user_id=ctx.uid, world=ctx.world, calls=usage_acc["calls"],
+                                    elapsed_ms=usage_acc.get("elapsed_ms"))
                     entry = _usage_meta(sub["provider"], sub["model"], **(usage_acc["tokens"] or {}))
                     entry["profile"] = sub["profile_id"]
                     usage_subs.append(entry)
@@ -1539,6 +1628,7 @@ class _GenProvider(Provider):
                "usage_subs": usage_subs, "verified_docs": verified, "evidence_meta": evidence_meta,
                "dropped_citations": dropped_citations, "has_structural_evidence": has_structural_evidence,
                "structural_evidence_meta": structural_evidence_meta, "sub_outcomes": sub_outcomes,
+               "read_evidence": read_evidence, "gaps": gaps,
                # EV-0（拡張設計 §4.4）: 呼び出し元（`_agentic_run_plan`）の帰属呼び出し（1回）も
                # 全ステップと同じ横断予算を消費させる——サブループ側で使い切っていれば帰属も自動的に
                # 省略される（`agentic_search._consume_call` が False を返す）。
@@ -1638,6 +1728,8 @@ class _GenProvider(Provider):
         evidence_meta: list = []
         dropped_citations: list = []
         has_structural_evidence = False
+        plan_read_evidence: list = []
+        plan_gaps: list = []
         structural_evidence_meta: list = []
         sub_outcomes: list = []
         call_budget = None   # EV-0（拡張設計 §4.4）: 帰属呼び出し1回もこの横断予算を共有する
@@ -1659,6 +1751,8 @@ class _GenProvider(Provider):
                 structural_evidence_meta = ev.get("structural_evidence_meta") or []
                 sub_outcomes = ev.get("sub_outcomes") or []
                 call_budget = ev.get("call_budget")
+                plan_read_evidence = ev.get("read_evidence") or []
+                plan_gaps = ev.get("gaps") or []
         if ctx.stop_event is not None and ctx.stop_event.is_set():
             return
         if not searched:
@@ -1672,6 +1766,11 @@ class _GenProvider(Provider):
         citations, evidence_meta, merge_dropped = _dedupe_citations_and_evidence(
             cites, evidence_meta, ctx.world)
         dropped_citations = dropped_citations + merge_dropped
+        # 機械検証で除外した citation は清書入力の限界行にも出す（ハイブリッドの
+        # `_ingest_sub_final_into_state` と同じ文面・同じ run でも経路で限界が消えないように）。
+        for d in dropped_citations:
+            if isinstance(d, dict):
+                _add_plan_gap(plan_gaps, f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）")
         structural_evidence_meta = _dedupe_structural_evidence(structural_evidence_meta)
         # main/plan/sub 共通の根拠ゲート: world 不達等で候補が全滅していれば（citation が既に空＝
         # 各 sub-loop 側で機械検証により除外済み）ここで honest failure にする。has_structural_evidence
@@ -1679,7 +1778,7 @@ class _GenProvider(Provider):
         # `cards` の存在だけを troubleshoot 限定でゲート例外にはしない——裏付け（doc または Neo4j の
         # 実在ノード）を伴わない candidate は has_structural_evidence 側で弾かれる（agentic_search.py
         # の graph_neighbors 分岐参照）。cards 自体は根拠ゲートと無関係に data.candidates へ残る。
-        if len(citations) < _plan_min_citations(chosen_subs) and not has_structural_evidence:
+        if len(citations) < _plan_min_citations(chosen_subs) and not has_structural_evidence and not verified:
             raise RuntimeError("plan sub loop evidence below threshold")
         # 実測の stop_reason を各ステップから集約する（固定文言 "plan_completed" で塗り潰さない）。
         # 評価結果は重大度順（blocked > conflicting > insufficient > sufficient）で1件を代表に選び、
@@ -1743,6 +1842,7 @@ class _GenProvider(Provider):
         yield _node("brain", "think", f"考える（{self.label}）", "集めた根拠から回答を作成しています", "active")
         self._last_usage = None
         from .. import agentic_search
+        from .. import depth_profile as depth_profile_mod
         # 拡張設計 §4.4: ストリームは常に byte-identical（受信した chunk をそのまま逐次配信・保留
         # しない）——停止＝その時点までに配信した本文がそのまま headline になる（追加の確定処理は
         # 無い）。根拠の帰属は本文とは別に、合成完了後の非ストリーム呼び出し1回で判定する（後述）。
@@ -1754,7 +1854,8 @@ class _GenProvider(Provider):
         completion = _CompletionState(self._natural_completion_reasons)
         # 清書へ確定根拠の全件ダイジェストを渡す（`_personal_facts` と同じ「合成専用の
         # 非公開キー」の流儀）。公開 answer には残さない＝chat_service 側で env から pop する。
-        _synthesis_digest, _ = agentic_search.build_synthesis_digest(citations, combined_evidence_meta)
+        _synthesis_digest, _ = agentic_search.build_synthesis_digest(
+            citations, combined_evidence_meta, read_evidence=plan_read_evidence, gaps=plan_gaps)
         env["_synthesis_digest"] = _synthesis_digest
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
@@ -1774,8 +1875,13 @@ class _GenProvider(Provider):
         # デルタを1個以上 yield した後は絶対に再 raise しない（S3 と同じ規律）。
         env["headline"] = acc
         if self._last_usage:
-            env["usage"] = self._last_usage
-            _log_chat_usage(self._last_usage, time.monotonic() - t0, ctx.world)
+            # STAT-3 S1: `_sub_loop`（このステップ束の各ステップが呼ぶ）が最後に残した実効上限を
+            # 合流する（`_last_sub_depth_usage` が空＝`_sub_loop` を一度も通らなかった場合は
+            # depth_profile だけの既定形にフォールバック）。
+            env["usage"] = {**self._last_usage,
+                            **(self._last_sub_depth_usage or depth_profile_mod.usage_extras(
+                                (ctx.scope_meta or {}).get("depth_profile")))}
+            _log_chat_usage(env["usage"], time.monotonic() - t0, ctx.world)
         # EV-0（拡張設計 §4.4）: 帰属は確定した回答本文＋Evidence digest を渡す回答完了後の非
         # ストリーム呼び出し1回（`self._attribute`）で判定する——停止／例外／打ち切り完了
         # （`completion.truncated`＝終端フレーム未観測・取得失敗・自然完了 allowlist 外）で本文が
@@ -1832,6 +1938,8 @@ class _GenProvider(Provider):
         必ず上書きしてから yield する（失敗時は `_result` 自体を yield しない）。
         """
         from .. import agentic_search, investigation_state
+        from .. import depth_profile as depth_profile_mod
+        self._last_main_depth_usage = None   # このターンの `_agentic_loop` が設定し直す
         t0 = time.monotonic()   # LOG-UX: このメソッド全体（反復ツール検索＋最終合成）の経過秒
         lens = decision["lens"]
         yield _node("understand", "think", "質問を理解", "内容を把握しました", "done")
@@ -2001,9 +2109,10 @@ class _GenProvider(Provider):
                     # `_review_meta`）はもう要らない——render() 自体が「予算超過時は古い根拠から
                     # 落とす」ため、新規根拠（直近に追加された分）は自然に残る（`InvestigationState.
                     # render` docstring 参照）。
-                    _digest = state.render(max_bytes=32 * 1024)
+                    _digest = state.render(max_bytes=agentic_search._SYNTHESIS_MAX_BYTES // 2)   # 査読入力＝清書予算の 1/2
                     # EXT-2c: 査読フェーズの限定ツール精読（read_around/list_docs）は下調べ役と
                     # 同じ範囲制約（search_ctx 相当の world/scope_paths/layer）で行う。
+                    _review_t0 = time.monotonic()
                     verdict, _review_nodes, _review_usage = self._sufficiency_verdict(
                         orig_message, lens, _digest, ctx.world,
                         scope_paths=(search_ctx.scope_meta or {}).get("scope_paths"),
@@ -2011,6 +2120,8 @@ class _GenProvider(Provider):
                         stop_event=ctx.stop_event, state=state,
                         review_structural_meta=_review_structural_meta)
                     yield from _review_nodes
+                    if isinstance(_review_usage, dict) and _review_usage.get("calls"):
+                        _review_usage["elapsed_ms"] = round((time.monotonic() - _review_t0) * 1000)
                     _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
                         return
@@ -2103,7 +2214,8 @@ class _GenProvider(Provider):
                 if total["calls"] > 0:
                     from .. import metering
                     metering.record("chat-sub", self._sub["provider"], self._sub["model"], total["tokens"],
-                                    user_id=ctx.uid, world=ctx.world, calls=total["calls"])
+                                    user_id=ctx.uid, world=ctx.world, calls=total["calls"],
+                                    elapsed_ms=total.get("elapsed_ms"))
             # EXT-2c: メイン査読（`_sufficiency_verdict`）が行った `_stream` 呼び出し分は、標準的な
             # 回答 usage（answer.usage）にも chat-sub にも乗らない別消費のため、独立の kind で記録する
             # （self は常にフラグシップ側＝self.provider_id/self.model）。calls=0（一度も査読を
@@ -2111,7 +2223,8 @@ class _GenProvider(Provider):
             if _review_usage_total["calls"] > 0:
                 from .. import metering
                 metering.record("chat-review", self.provider_id, self.model, _review_usage_total["tokens"],
-                                user_id=ctx.uid, world=ctx.world, calls=_review_usage_total["calls"])
+                                user_id=ctx.uid, world=ctx.world, calls=_review_usage_total["calls"],
+                                elapsed_ms=_review_usage_total.get("elapsed_ms"))
         # RV MEDIUM（2026-07-03再検証）: 途中停止で agentic ループが未応答のまま終わった場合は
         # 単発 grep へのフォールバックを試みない（呼び元 run() の except節が余分な LLM 呼び出しを
         # 発行してしまい、停止後もしばらく処理が続く無駄が生じるため）。どのみち chat_service 側が
@@ -2143,6 +2256,11 @@ class _GenProvider(Provider):
         citations, evidence_meta, merge_dropped = _dedupe_citations_and_evidence(
             cites, evidence_meta, ctx.world)
         dropped_citations = dropped_citations + merge_dropped
+        if state is not None:
+            # 統合 span の再検証で落ちた citation も清書入力の限界行へ（計画経路と同じ文面）。
+            for d in merge_dropped:
+                if isinstance(d, dict):
+                    _add_plan_gap(state.gaps, f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）")
         # 査読（`_sufficiency_verdict`）が list_docs で得た構造的根拠を、下調べ役由来のものと同じ
         # 正規の list へ合流させてから重複排除する（非ハイブリッドや査読未発動時は常に空リストの
         # ため無変化）。
@@ -2183,7 +2301,13 @@ class _GenProvider(Provider):
         # STOP-1: 予算到達で打ち切られたターンは、証拠が閾値未満でも honest failure（単発 grep
         # フォールバック）へ落とさない——固定文言＋実際に集まった（0件の場合を含む）Evidence
         # Packet をそのまま最終 envelope へ載せる。
-        evidence_meets_gate = len(citations) >= min_citations or has_structural_evidence
+        # RV2巡目#4 是正: `verified`（EXT-2/EV-0・read_around/read_doc/S3b 原本読取5ツールが実際に
+        # 精読した doc_id・`_VERIFIED_READ_TOOLS` 参照）も正当な根拠として認める——以前はここに
+        # 数えられておらず、下調べ OFF の通常経路で `xlsx_range` 等の読取ツールだけが成功しても
+        # （citation を生成する grep/es_search も list_docs/graph_neighbors の構造的根拠も無いため）
+        # 根拠ゲートが「evidence below threshold」で落としていた。read_around/read_doc も同様に
+        # citation を生成しないため、この抜け穴は元々それらにも存在していた（今回まとめて塞ぐ）。
+        evidence_meets_gate = len(citations) >= min_citations or has_structural_evidence or bool(verified)
         if budget_exhausted and (not answer or not evidence_meets_gate):
             # 予算例外で両ゲートを迂回できる以上、根拠ゲートを本来通らない未検証の生成本文
             # （例: turns_exhausted の末尾合成が根拠0件のまま断定文を生成した場合）がそのまま
@@ -2260,6 +2384,11 @@ class _GenProvider(Provider):
             else:
                 env["usage"] = _usage_meta(self.provider_id, self.model, **agentic_usage,
                                            system_settings=self._system_settings)
+                # 非ハイブリッドの反復ツール検索が実際に渡した上限（`_last_main_depth_usage`・
+                # OpenAI/Ollama の `_agentic_loop` が設定）。渡していない実装（Gemini/Bedrock）では
+                # depth_profile だけを載せ、使っていない上限を「実効値」として記録しない。
+                env["usage"].update(self._last_main_depth_usage or depth_profile_mod.usage_extras(
+                    (ctx.scope_meta or {}).get("depth_profile")))
                 _log_chat_usage(env["usage"], time.monotonic() - t0, ctx.world)
         # HIGH 1 fix: agentic 経路でも personal_facts を env に乗せる。
         if ctx.personal_facts:
@@ -2305,6 +2434,10 @@ class _GenProvider(Provider):
         # `state.gaps`（検索0件／打ち切り／未確認）も「調査の限界: …」として続けて渡す——list_docs
         # の集計事実は既に上で正規の `combined_evidence_meta` へ合流済みのため、ここでは gaps だけ
         # 追加する（`build_synthesis_digest` 側が件数・文字数上限を適用する）。
+        # 下調べ役が予算到達で中断したなら、その事実を限界行として清書へ渡す（ツール単位の gaps だけでは
+        # 「調査が最後まで終わっていない」ことが清書に伝わらず、部分結果を全件と書き得る）。
+        if stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS and _BUDGET_GAP not in state.gaps:
+            state.gaps.append(_BUDGET_GAP)
         _synthesis_digest, _ = agentic_search.build_synthesis_digest(
             citations, combined_evidence_meta, read_evidence=agentic_search._read_evidence_payload(state),
             gaps=state.gaps)
@@ -2327,8 +2460,12 @@ class _GenProvider(Provider):
         # デルタを1個以上 yield した後は絶対に再 raise しない（二重作業/二重 emission の回避）。
         env["headline"] = acc
         if self._last_usage:
-            env["usage"] = self._last_usage
-            _log_chat_usage(self._last_usage, time.monotonic() - t0, ctx.world)
+            # STAT-3 S1: `_sub_loop`（`_sub_agentic_loop` が呼ぶ）が残した実効上限を合流する
+            # （`_agentic_run_plan` の同形処理と同じ契約・`_last_sub_depth_usage` docstring 参照）。
+            env["usage"] = {**self._last_usage,
+                            **(self._last_sub_depth_usage or depth_profile_mod.usage_extras(
+                                (ctx.scope_meta or {}).get("depth_profile")))}
+            _log_chat_usage(env["usage"], time.monotonic() - t0, ctx.world)
         # サブループ（下調べ役）が確定した stop_reason は、実際に画面へ表示する本文を生成した
         # **その後のクラウド最終合成**（直前の `_stream`）の完了理由を反映していない——最終合成が
         # 出力上限／内容フィルタで打ち切られていれば、サブループの調査結果に関わらず表示本文は

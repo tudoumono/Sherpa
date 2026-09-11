@@ -66,7 +66,7 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
     ("POST", "/conversations/{cid}/shares"): {
         "invitee_user_ids": ["x"], "expires_at": "2999-01-01T00:00:00+00:00"},
     ("POST", "/impact/run"): {"start": "x"},
-    ("POST", "/chat"): {"message": "x"},
+    ("POST", "/chat"): {"message": "x", "stream_id": "x1234567"},
     # RV MEDIUM（2026-07-03再検証）: stream_id は UUID相当の形式制約（最短8文字）を持つため、
     # 1文字の "x" では body validation（422）で止まってしまい認証チェックまで届かない。
     ("POST", "/chat/stream/stop"): {"stream_id": "x1234567"},
@@ -93,7 +93,7 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
 
 # GET の追加必須 query（共通ダミー `query`/`q`/`rel` だけでは満たせないルート専用）。
 _EXTRA_QUERY: dict[tuple[str, str], dict] = {
-    ("GET", "/chat/stream"): {"message": "x"},
+    ("GET", "/chat/stream"): {"message": "x", "stream_id": "x1234567"},
     ("GET", "/ext/v1/doc"): {"world": "x", "path": "x"},
 }
 

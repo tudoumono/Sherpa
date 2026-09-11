@@ -545,10 +545,6 @@ def generation_state(world: str, canonical_generation_id: str) -> dict[str, int 
     }
 
 
-def generation_terminal(world: str, canonical_generation_id: str) -> bool:
-    return bool(generation_state(world, canonical_generation_id)["terminal"])
-
-
 def generation_ready_for_publication(world: str, canonical_generation_id: str) -> bool:
     state = generation_state(world, canonical_generation_id)
     return bool(state["terminal"] and state["unpublished_jobs"])
@@ -719,22 +715,6 @@ def list_unpublished_generations(*, limit: int = 100) -> list[dict[str, Any]]:
             "GROUP BY candidate.world, candidate.canonical_generation_id ORDER BY updated_at DESC LIMIT %s",
             (limit,),
         ).fetchall()
-
-
-def mark_artifacts_published(job_ids: list[int]) -> int:
-    """実際にsnapshotへ含めたjobだけを公開済みにする（並行完了jobの誤mark防止）。"""
-    normalized = sorted({int(value) for value in job_ids if int(value) > 0})
-    if not normalized:
-        return 0
-    _ensure()
-    with _connect() as connection:
-        cursor = connection.execute(
-            "UPDATE ocr_jobs SET artifact_published=true, updated_at=now() "
-            "WHERE id = ANY(%s) AND status='succeeded' AND artifact_published=false",
-            (normalized,),
-        )
-        affected = int(cursor.rowcount)
-    return affected
 
 
 def mark_snapshot_artifacts_published(

@@ -15,11 +15,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from sherpa import corpus_docs, worlds
 from sherpa.ingest import worker
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import Analyzer, DefResult, RefResult
 from sherpa.ingest.analyzers.html import HtmlTemplateAnalyzer
+
+# 本モジュールは各テストが `registry._ANALYZERS` を自前のフェイクへ差し替える前提だが、その多くが
+# `registry.known_analyzers()`（差し替え前の現在値）を読んで組み立てる——フォークが正規の拡張
+# アナライザを登録していても、差し替え前の現在値に紛れ込まないよう登録簿を上流限定に固定する
+# （開発ハーネス S4・敵対 RV 是正・docs/21-拡張の契約.md）。各テスト本体の `monkeypatch.setattr(
+# registry, "_ANALYZERS", ...)` は本 fixture の後に実行されるため、そのまま上書きが効く。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
 
 def _world(monkeypatch, tmp_path):

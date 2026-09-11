@@ -251,6 +251,45 @@ def test_ingest_sub_final_into_state_merges_gaps_from_final_payload():
     assert "ripgrep_search『存在しない語』: 0件" in state.gaps
 
 
+def test_ingest_sub_final_into_state_keeps_locator_so_two_sheets_stay_as_two_entries():
+    """`read_evidence`（`agentic_search._read_evidence_payload` が作る
+    `{"doc_id","span","text","locator"}`）の `locator` は、以前は `_ingest_sub_final_into_state`
+    が `synthetic` へ引き継いでいなかったため、親 `InvestigationState` 側では S3b 原本読取ツール
+    （span=None）の複数エントリが `(doc_id, span=None, locator=None)` で同一視され1件に潰れて
+    いた——Sheet1/Sheet2 の2件が下調べループのローカル state では2件のまま（`_read_evidence_payload`
+    が保証済み）でも、親 state へ合流させると1件になっていた。`locator` を独立フィールドとして
+    渡すことで親 state でも2件のまま残る。"""
+    from sherpa.investigation_state import InvestigationState
+    from sherpa.providers.base import _ingest_sub_final_into_state
+
+    state = InvestigationState(question="q", scope={})
+    ev = {"cites": [], "evidence_meta": [], "structural_evidence_meta": [],
+         "read_evidence": [
+             {"doc_id": "a.xlsx", "span": None, "text": "Sheet1!A1:B1: 1: a\tb", "locator": "Sheet1!A1:B1"},
+             {"doc_id": "a.xlsx", "span": None, "text": "Sheet2!A1:B1: 1: c\td", "locator": "Sheet2!A1:B1"},
+         ]}
+    _ingest_sub_final_into_state(state, ev)
+    reads = [e for e in state.evidence if e.kind == "read" and e.doc_id == "a.xlsx"]
+    assert len(reads) == 2
+    assert {e.locator for e in reads} == {"Sheet1!A1:B1", "Sheet2!A1:B1"}
+
+
+def test_ingest_sub_final_into_state_propagates_read_text_truncated():
+    """C6: 下調べ役の `InvestigationState` で精読本文が保存時に切られた（`text_truncated`）
+    場合、`agentic_search._read_evidence_payload` が作る `read_evidence` 経由で親 `state` の
+    Evidence へも引き継がれる——親側で「切断していない」ことに黙って戻さない。"""
+    from sherpa.investigation_state import InvestigationState
+    from sherpa.providers.base import _ingest_sub_final_into_state
+
+    state = InvestigationState(question="q", scope={})
+    ev = {"cites": [], "evidence_meta": [], "structural_evidence_meta": [],
+         "read_evidence": [{"doc_id": "a.md", "span": [1, 5], "text": "本文",
+                            "text_truncated": True}]}
+    _ingest_sub_final_into_state(state, ev)
+    read_ev = next(e for e in state.evidence if e.kind == "read")
+    assert read_ev.text_truncated is True
+
+
 def test_sub_loop_gaps_reach_parent_state_and_synthesis_digest_via_final_payload():
     """下調べループ自身の gaps（list_docs 成功後、後続 ripgrep_search が0件）は、final payload
     （`_build_final_payload`/`_finalize_payload` の `gaps`）経由でハイブリッドの親 `state.gaps`
@@ -296,6 +335,32 @@ def test_sub_loop_gaps_reach_parent_state_and_synthesis_digest_via_final_payload
         A.run_tool = orig_run_tool
 
 
+def test_sub_loop_budget_exhausted_adds_interruption_gap_to_synthesis_digest():
+    """下調べ役が予算到達（max_turns）で中断したときは、清書入力に「調査を上限到達で中断」の限界行が入る
+    ——ツール単位の 0件／打ち切りだけでは調査が終わっていないことが清書に伝わらず、部分結果を全件と書き得る。"""
+    doc = "4期/01_標準/消費税法.md"
+
+    def fake_post(url, headers, body, timeout=90):
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "list_docs", "arguments": '{"path_prefix":"4期"}'}}]}}]}
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        return ({"count": 1, "docs": [{"rel_path": doc, "doctype": "md", "state": "ready"}]}, {doc}, [], [])
+
+    orig_post, orig_run_tool = A._post, A.run_tool
+    A._post, A.run_tool = fake_post, fake_run_tool
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = {**_SUB, "guard": {"min_citations": 1, "max_turns": 1, "llm_timeout": 60}}
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        assert any(e.get("type") == "_result" for e in events)
+        synth_prompt = p._synth_prompts[-1]
+        assert "調査を上限到達で中断" in synth_prompt
+    finally:
+        A._post, A.run_tool = orig_post, orig_run_tool
+
+
 def test_usage_sub_profile_prefers_display_name_over_internal_slug():
     """`usage_sub.profile` は render.js::usageSubMetaHTML がそのまま画面に出す表示名
     （専門用語ゼロ）——`name`（`search_helper.resolve()` が
@@ -336,7 +401,11 @@ def test_on_loop_synthesis_usage_present_when_stream_sets_last_usage():
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["usage"] == p._synth_usage
+        # STAT-3 S1: env["usage"] は合成呼び出し本体（_synth_usage）＋ `_sub_loop` が残した
+        # 深さ由来のキー（scope_meta に depth_profile 無し＝standard・guard.max_turns=6 のまま）。
+        assert result["env"]["usage"] == {**p._synth_usage, "depth_profile": "standard",
+                                          "max_turns": _SUB["guard"]["max_turns"],
+                                          "max_tools_per_turn": A.MAX_TOOLS_PER_TURN}
         assert result["env"]["usage_sub"]["provider"] == "ollama"
     finally:
         _restore_post(orig)
@@ -448,6 +517,67 @@ def test_gate_claimless_graph_card_without_cid_does_not_pass(monkeypatch):
         ctx = _ctx()
         with pytest.raises(RuntimeError, match="evidence below threshold"):
             list(p._agentic_run(ctx, {"lens": "troubleshoot", "input": ctx.message, "reason": "test"}))
+    finally:
+        _restore_post(orig)
+
+
+def test_gate_xlsx_range_only_passes_via_verified_docs_no_sub(monkeypatch):
+    """RV2巡目#4 是正: 下調べ OFF の通常経路（`p._sub` 未設定＝`self._agentic_loop` を直接使う）で
+    `xlsx_range`（S3b 原本読取ツール）だけが成功しても、citation を生成する grep/es_search も
+    `has_structural_evidence`（list_docs/graph_neighbors）も無いため、以前は根拠ゲートが
+    citation 0件のまま "evidence below threshold" で落としていた。`verified_docs`
+    （`_VERIFIED_READ_TOOLS` に含まれる読取ツールが実際に読んだ doc）が1件以上あれば根拠として
+    認め、ゲートを通す。"""
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "xlsx_range",
+             "arguments": '{"doc_id":"a.xlsx","sheet":"Sheet1"}'}}]}}]},
+        {"choices": [{"message": {"content": "セルを確認しました。"}}]},
+    ]
+    orig = _install_post(seq)
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        if name == "xlsx_range":
+            return ({"sheet": "Sheet1", "range": "A1:A1", "rows": [["hello"]], "truncated": False,
+                    "doc_id": "a.xlsx", "locator": "Sheet1!A1:A1", "text": "1: hello"},
+                   {"a.xlsx"}, [], [])
+        return ({"error": f"unexpected tool {name}"}, set(), [], [])
+
+    monkeypatch.setattr(A, "run_tool", fake_run_tool)
+    monkeypatch.setattr(A, "verify_doc_exists", lambda doc_id, world, scope_paths=None: doc_id == "a.xlsx")
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")   # p._sub は未設定＝None（下調べ OFF）
+        ctx = _ctx()
+        # 下調べ OFF は合成も同じループ内（`_stream` は使わない）——ゲートを通れば RuntimeError が
+        # 出ず、モデル自身の最終メッセージがそのまま headline になる。
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "セルを確認しました。"   # ゲートを通り最終回答まで到達
+        assert "a.xlsx" in {s["doc_id"] for s in result["env"]["sources"]}
+    finally:
+        _restore_post(orig)
+
+
+def test_gate_xlsx_range_only_without_read_still_fails(monkeypatch):
+    """対照: 読取ツールが1件も成功しなければ（citation も structural evidence も無い）、
+    従来どおり根拠ゲートで落ちる——本 RV の是正が根拠ゲートを無条件で緩めていないことの確認。
+    """
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"NO-SUCH-HIT-XYZ"}'}}]}}]},
+        {"choices": [{"message": {"content": "summary with no citations"}}]},
+    ]
+    orig = _install_post(seq)
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        return ({"hits": []}, set(), [], [])
+
+    monkeypatch.setattr(A, "run_tool", fake_run_tool)
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        ctx = _ctx()
+        with pytest.raises(RuntimeError, match="evidence below threshold"):
+            list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
     finally:
         _restore_post(orig)
 
@@ -1540,6 +1670,19 @@ def test_sub_loop_scales_max_turns_hits_window_with_depth_profile(monkeypatch):
         assert captured.get("window_cap") == D.scaled_ratio(A.READ_WINDOW, profile), profile
 
 
+def test_sub_loop_stashes_effective_limits_for_usage_meta(monkeypatch):
+    """STAT-3 S1: `_sub_loop` は実際にツールループへ渡した実効上限
+    （`depth_profile.usage_extras` の形）を `self._last_sub_depth_usage` へ残す
+    （`_agentic_run`/`_agentic_run_plan` の env["usage"] 組立がここから読む）。"""
+    monkeypatch.setattr(A, "openai_style", lambda *a, **kw: iter([]))
+    p = _FakeSynth("sk-dummy", "gpt-5.5")
+    p._sub = dict(_SUB)   # guard.max_turns = 6
+    ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"})
+    list(p._sub_agentic_loop(ctx))
+    assert p._last_sub_depth_usage == {"depth_profile": "deep", "max_turns": 12,
+                                       "max_tools_per_turn": A.MAX_TOOLS_PER_TURN}
+
+
 def test_sub_loop_max_turns_prefers_admin_base_over_guard_when_set(monkeypatch):
     """system_settings に depth_base_max_turns があれば guard["max_turns"] より優先する
     （管理者が反復基準値を下げても検索アシスタント有効時だけ外れる、ということがないように）。
@@ -1686,7 +1829,7 @@ def test_metering_records_chat_sub_on_gate_fail(monkeypatch):
     orig = _install_post(seq)
     recorded = []
 
-    def spy_record(kind, provider, model, usage, *, user_id=None, world=None, calls=1):
+    def spy_record(kind, provider, model, usage, *, user_id=None, world=None, calls=1, elapsed_ms=None):
         recorded.append((kind, provider, model, usage, user_id, world))
 
     monkeypatch.setattr("sherpa.metering.record", spy_record)
@@ -1953,6 +2096,7 @@ def test_run_sub_plan_step_init_failure_is_logged_and_traced_but_plan_continues(
     assert any(n["id"] == "sub:broken:step-failed" for n in nodes), nodes
     final = next(e for e in events if "final" in e)
     assert final["docs"] == {"doc-ok"}   # 続行して sub_ok の証拠は合算される（挙動不変）
+    assert any("broken" in g and "未完了" in g for g in final["gaps"])   # 未完了の事実は清書入力の限界行へ
     assert any("broken" in r.message for r in caplog.records), caplog.records
 
 
@@ -2135,3 +2279,47 @@ def test_agentic_run_plan_passes_through_real_layer_for_qa_lens(monkeypatch):
     sub = {**_SUB, "profile_id": "worker"}
     list(p._agentic_run_plan(ctx, decision, ctx.message, [sub]))
     assert captured["layer"] == "code"
+
+
+def test_budget_exit_payload_carries_state_gaps(monkeypatch):
+    """予算到達で早期終了する final payload も `gaps` を運ぶ（子の「保存時に切断」等が親へ届く）。"""
+    import re
+    import sherpa.agentic_search as A
+    src = open(A.__file__, encoding="utf-8").read()
+    calls = re.findall(r"_build_final_payload\((?:[^()]|\([^()]*\))*\)", src, flags=re.S)
+    assert calls and all("gaps=" in c for c in calls if "read_evidence=" in c)
+
+
+def test_run_sub_plan_aggregates_read_evidence_and_gaps_and_budget_stop(monkeypatch):
+    """計画経路（複数下調べ役）の final にも各ステップの精読本文・限界・予算到達の中断が載る
+    （清書入力へ渡す材料＝無いとこの経路だけ保存時切断・0件・中断が清書に届かない）。"""
+    p = _FakeSynth("sk-dummy", "gpt-5.5")
+    ctx = _ctx()
+    subs = [{**_SUB, "profile_id": "s1"}, {**_SUB, "profile_id": "s2"}]
+
+    def fake_sub_loop(step_ctx, sub, usage_acc, **kw):
+        def _gen():
+            if sub["profile_id"] == "s1":
+                yield {"final": "", "docs": {"a.md"}, "searched": True, "cites": [], "cards": [],
+                       "read_evidence": [{"doc_id": "a.md", "span": [1, 2], "text": "本文", "locator": None}],
+                       "gaps": ["ripgrep_search『q』: 0件"], "stop_reason": "budget_exceeded"}
+            else:
+                yield {"final": "", "docs": set(), "searched": True, "cites": [], "cards": [],
+                       "gaps": ["ripgrep_search『q』: 0件"], "stop_reason": "no_tool_calls"}
+        return _gen()
+
+    monkeypatch.setattr(p, "_sub_loop", fake_sub_loop)
+    final = next(e for e in p._run_sub_plan(ctx, subs) if "final" in e)
+    assert final["read_evidence"] == [{"doc_id": "a.md", "span": [1, 2], "text": "本文", "locator": None}]
+    assert final["gaps"].count("ripgrep_search『q』: 0件") == 1          # 重複は 1 本
+    assert any("上限到達で中断" in g for g in final["gaps"])
+
+
+def test_fold_sub_usage_sums_elapsed_independently_of_unknown_tokens():
+    from sherpa.providers.base import _fold_sub_usage, _timed_usage
+    t = _fold_sub_usage({"calls": 0, "tokens": None, "unknown": False}, {"calls": 1, "tokens": None, "elapsed_ms": 40})
+    t = _fold_sub_usage(t, {"calls": 2, "tokens": {"input_tokens": 3}, "elapsed_ms": 60})
+    assert t["calls"] == 3 and t["tokens"] is None and t["elapsed_ms"] == 100
+    acc = {"calls": 0, "tokens": None}
+    list(_timed_usage(iter([{"node": 1}, {"final": ""}]), acc))
+    assert isinstance(acc.get("elapsed_ms"), int) and acc["elapsed_ms"] >= 0

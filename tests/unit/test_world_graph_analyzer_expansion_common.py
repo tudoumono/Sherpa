@@ -19,6 +19,8 @@ import json
 import pathlib
 from collections import Counter
 
+import pytest
+
 from sherpa.ingest import world_graph
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import (Analyzer, DefItem, DefResult,
@@ -615,8 +617,13 @@ def _write_goldens() -> None:
     JAVA1_GOLDEN.write_text(json.dumps(java1, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+@pytest.mark.usefixtures("upstream_only_registry")
 def test_v1_fixture_graph_matches_golden_snapshot():
-    """v1（COBOL/JCL/コピーブック）の nodes/edges/flags を golden で丸ごとピン留めする。"""
+    """v1（COBOL/JCL/コピーブック）の nodes/edges/flags を golden で丸ごとピン留めする。
+
+    上流限定固定（`upstream_only_registry`）——フォークが `.md`/`.cbl` 等を担当する拡張アナライザを
+    登録すると実 fixture（`fixtures/corpus/v1`）のグラフ構造自体が変わり golden と一致しなくなる
+    ため（開発ハーネス S4・敵対 RV 是正）。"""
     actual = _snapshot(ROOT / "fixtures" / "corpus" / "v1", V1_WORLD_ID)
     assert actual == _load_golden(V1_GOLDEN)
 

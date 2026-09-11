@@ -15,18 +15,48 @@
 """
 from __future__ import annotations
 
+import os
+
 import re
 from dataclasses import dataclass, field
 
 _CITATION_QUOTE_CAP = 400   # B の `_SYNTHESIS_QUOTE_CAP` と同じ（citation/構造事実の既定切り詰め長）
-_READ_TEXT_CAP = 800        # 精読（read_around/read_doc）本文の切り詰め長（citation より長め＝
-                            # 精読は要約ではなく原文の窓のため、条件・例外を落としにくくする）
+# 精読（read_around/read_doc・S3b 原本読取ツール）本文の保存上限（UTF-8 バイト）——清書ダイジェスト
+# 予算（`agentic_search._SYNTHESIS_MAX_BYTES`・env `SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES`）の 1/4。
+# 1件の精読本文だけで清書予算の大半を専有しないための上限で、複数件の精読が同時に清書へ渡っても
+# 他の根拠・gaps に予算が残る。circular import 回避のため `agentic_search` の定数は参照できず、同じ
+# env を同じ既定・同じクランプで読む（`_SYNTHESIS_MAX_BYTES` の解決と一致することをテストが固定）。
+
+
+def _synthesis_budget_bytes() -> int:
+    raw = os.environ.get("SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES")
+    default, lo, hi = 256 * 1024, 8 * 1024, 4 * 1024 * 1024
+    try:
+        v = int(str(raw).strip()) if raw not in (None, "") else default
+    except ValueError:
+        v = default
+    return default if not (lo <= v <= hi) else v
+
+
+_READ_TEXT_CAP_BYTES = _synthesis_budget_bytes() // 4
+# render()（査読・文脈整理の入力）に載せる精読本文 1 件の表示上限（文字・固定）。render の予算は呼び出し元
+# ごとに小さい（文脈整理＝48KiB・査読＝清書予算の 1/2）ため、保存上限に連動させると精読 2〜6 件で
+# 【限界】が無通知で落ちる。保存本文は `_READ_TEXT_CAP_BYTES` まで持ち、清書入力にはそのまま渡す。
+_RENDER_READ_TEXT_CAP = 800
 _STRUCTURAL_FACT_CAP = 800  # glob_search/doc_outline/compare_documents の実質的結果（パス一覧・
                             # 見出し一覧・差分要点）の切り詰め長——件数だけでなく内容そのものを
-                            # 文脈整理後も残すための上限（read_around と同じ長さ）。
+                            # 文脈整理後も残すための上限（精読本文の保存上限＝`_READ_TEXT_CAP_BYTES`
+                            # とは別契約・目的が違うため揃えない）。
 _ARGS_SUMMARY_CAP = 120
 _GAP_MESSAGE_CAP = 200
 _TOOL_ERROR_CAP = 80
+
+# kind="read"（精読）扱いにするツール名——read_around/read_doc（土台系）と原本読取ツール 5 本（xlsx_sheets を除く＝シート一覧のみで本文を読んでいない）
+# （RV#5・`agentic_search._doc_reader_text_locator` が結果へ `doc_id`/`text` を合成する）。
+_READ_KIND_TOOL_NAMES = frozenset({
+    "read_around", "read_doc",
+    "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head",
+})
 
 _LINE_PREFIX_RE = re.compile(r"^(\d+):")   # read_around の "123: 本文" 形式から行番号を復元する
 
@@ -53,6 +83,16 @@ class Evidence:
     source_tool: str
     verification: str     # "verified" | "span_unmatched" | "structural" | "unverified"
     extra_quotes: list[str] = field(default_factory=list)
+    # RV2巡目#9 是正: S3b 原本読取ツール（xlsx_range 等）の kind="read" は `span` が常に None
+    # （行番号ではなく "Sheet1!A1:D20" 等の文字列位置のため）——`locator`（`agentic_search.
+    # _doc_reader_text_locator` が組む値）を同一性・表示の両方へ足すことで、同じ doc_id の
+    # 別シート/別ページ読み取りが `span=None` 同士で1件に潰れないようにする（`_find` 参照）。
+    locator: str | None = None
+    # kind="read" だけが意味を持つ（他 kind は既定 False のまま）: `text` が `_READ_TEXT_CAP_BYTES`
+    # で保存時に切られた（または上流の読取ツール自体が既に打ち切っていた）ため、末尾が清書
+    # ダイジェストへ渡らないことを示す。`_upsert` は「長い方を主本文」に統合する際、主本文として
+    # 採用した側の値をそのまま引き継ぐ（切られていない本文へ更新されれば False に戻る）。
+    text_truncated: bool = False
 
 
 @dataclass
@@ -90,13 +130,39 @@ def _read_span_from_text(text: str) -> tuple[int, int] | None:
     return (int(m0.group(1)), int(m1.group(1)))
 
 
+def _capped_fact(head: str, items: list, total: int, sep: str, note_fmt, clean,
+                 max_items: int) -> str:
+    """要約行を `_STRUCTURAL_FACT_CAP` に収める。項目は先頭から `max_items` 件まで、かつ予算内に
+    収まる件数だけ載せ、載せられなかった件数（項目数上限と文字数上限の両方の理由）を必ず
+    `note_fmt(n)` の注記で残す——「該当＝列挙」だけが残って全件と書けないようにする。"""
+    head = clean(head)
+    # head（条件文字列＝モデル生成の pattern 等を含む）も上限内に収める——1 件も載らない run で
+    # 要約行が上限を超えて膨らみ、render で【限界】を押し出さないため。
+    head_room = max(0, _STRUCTURAL_FACT_CAP - len(clean(note_fmt(total)) if total > 0 else ""))
+    if len(head) > head_room:
+        head = head[:max(0, head_room - 1)] + "…"
+    shown: list = []
+    cur = head
+    for it in items[:max_items]:
+        piece = clean(str(it))
+        cand = cur + (": " if not shown else sep) + piece
+        remaining = total - (len(shown) + 1)
+        note = clean(note_fmt(remaining)) if remaining > 0 else ""
+        if len(cand) + len(note) > _STRUCTURAL_FACT_CAP:
+            break
+        shown.append(piece)
+        cur = cand
+    omitted = total - len(shown)
+    return cur + (clean(note_fmt(omitted)) if omitted > 0 else "")
+
+
 def _args_summary(args: dict | None, clean) -> str:
     """`clean`（`agentic_search._digest_clean`）は生値全体に先に適用してから `_ARGS_SUMMARY_CAP`
     で切る——先に切ってから clean すると、秘密パターンが切断境界をまたいだ場合に断片化して
     `_redact` の正規表現にマッチしなくなり、境界の位置次第で redaction をすり抜けてしまう。
     """
     args = args or {}
-    for key in ("query", "doc_id", "path_prefix", "name_pattern", "pattern", "prompt"):
+    for key in ("query", "doc_id", "path_prefix", "name_pattern", "doctype", "state", "pattern", "prompt"):
         v = args.get(key)
         if v:
             return clean(str(v).strip())[:_ARGS_SUMMARY_CAP]
@@ -108,7 +174,8 @@ def _structural_kind(m: dict) -> str:
 
 
 def _structural_fact(m: dict, clean) -> str:
-    """`agentic_search.build_synthesis_digest` と同じ表現の集計・カード要約1行を組む
+    """`agentic_search.build_synthesis_digest` と同じ体裁の集計・カード要約1行を組む（ただしパスは
+    先頭10件＝探索ループの文脈整理用の別上限・清書ダイジェストの予算内連結とは異なる）
     （`clean` は呼び出し元が渡す `agentic_search._digest_clean`）。
 
     複数項目の列挙区切りは空白付き（`_LIST_SEP`/`_EXCERPT_SEP`）にする——呼び出し元は
@@ -120,13 +187,18 @@ def _structural_fact(m: dict, clean) -> str:
     if "list_meta" in m:
         lm = m.get("list_meta") or {}
         cond_parts = [f"path_prefix={clean(lm['prefix'])}" if lm.get("prefix") else None,
-                     f"name_pattern={clean(lm['pattern'])}" if lm.get("pattern") else None]
+                     f"name_pattern={clean(lm['pattern'])}" if lm.get("pattern") else None,
+                     f"doctype={clean(lm['doctype'])}" if lm.get("doctype") else None,
+                     f"state={clean(lm['state'])}" if lm.get("state") else None]
         cond = _LIST_SEP.join(c for c in cond_parts if c)
         cond_text = f"（条件: {cond}）" if cond else ""
         matched = m.get("matched_doc_ids") or []
         paths = _LIST_SEP.join(clean(d) for d in matched[:10])
+        # 要約はパスを先頭 10 件で切る（文脈整理・査読の入力）。切った事実は清書入力と同じ注記で残す＝
+        # 「該当＝列挙」だけを見て全件と書けないようにする。
+        rest = f"（他 {len(matched) - 10} 件のパスは未提示＝この一覧は全件として書かない）" if len(matched) > 10 else ""
         return (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
-               f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else ""))
+               f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else "") + rest)
     if "tree_meta" in m:
         tm = m.get("tree_meta") or {}
         cond_text = f"（path_prefix={clean(tm['prefix'])}）" if tm.get("prefix") else ""
@@ -139,7 +211,8 @@ def _structural_fact(m: dict, clean) -> str:
         return (f"[graph] {clean(cm.get('name', ''))}"
                f"（{clean(cm.get('role', ''))}"
                f"{'・' + clean(cm['category']) if cm.get('category') else ''}"
-               f"・経路={clean(str(cm.get('path') or ''))}）"
+               f"・経路={clean(str(cm.get('path') or ''))}"
+               f"{'・辺=' + clean('、'.join(cm['edges'])) if cm.get('edges') else ''}）"
                + (f"／裏付け: {docs_text}" if docs_text else ""))
     return ""
 
@@ -169,13 +242,21 @@ class InvestigationState:
     tool_log: list[ToolCall] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
-    def _find(self, kind: str, doc_id, span, text: str) -> Evidence | None:
+    def _find(self, kind: str, doc_id, span, text: str, locator: str | None = None) -> Evidence | None:
         """重複排除の鍵は kind＋doc_id＋span（citation/read）——同じ doc/span への複数回の取得は
         本文が違っても常に1件に統合する（`_upsert` 参照）。doc_id/span が常に None の集計事実
         （list/graph/compare）だけは text も鍵に含める（さもないと条件の異なる集計が1件に潰れる）。
+
+        RV2巡目#9 是正: kind="read" かつ `span is None`（S3b 原本読取ツールの精読＝行番号でなく
+        `locator` 文字列で位置を表す）は `locator` も鍵に含める——さもないと同じ doc_id への
+        別シート/別ページの読み取りが `(doc_id, span=None)` だけで同一とみなされ1件に潰れる。
+        `span` が数値範囲を持つ場合（read_around/read_doc）は locator を鍵に含めない（既存契約を
+        変えない・そちらは常に locator=None）。
         """
         for e in self.evidence:
             if e.kind != kind or e.doc_id != doc_id or e.span != span:
+                continue
+            if kind == "read" and span is None and e.locator != locator:
                 continue
             if kind in _TEXT_KEYED_DEDUPE_KINDS and e.text != text:
                 continue
@@ -183,19 +264,30 @@ class InvestigationState:
         return None
 
     def _upsert(self, *, kind: str, doc_id, span, text: str, source_tool: str,
-               verification: str, extra_quotes: list[str] | None = None) -> None:
+               verification: str, extra_quotes: list[str] | None = None,
+               locator: str | None = None, text_truncated: bool = False) -> None:
         if not text and doc_id is None:
             return   # 中身の無いエントリは記録しない（例: 精読が空文字を返した等）
-        existing = self._find(kind, doc_id, span, text)
+        existing = self._find(kind, doc_id, span, text, locator=locator)
         if existing is not None:
             # 同 doc/span の再取得——ev_id は変えない。本文が食い違う場合（citation/read のみ
             # 起こりうる・list/graph/compare は text も鍵のため常に一致）は長い方を主本文として
-            # 残し、短い方は事実を黙って捨てず extra_quotes へ退避する。
+            # 残し、短い方は事実を黙って捨てず extra_quotes へ退避する。`text_truncated` は
+            # 採用した側（主本文になった方）の値を引き継ぐ——切られていない長い本文に更新
+            # されれば False に戻り、逆に長い方が切断済みならそのまま True になる。
             if existing.text != text:
-                longer, shorter = (text, existing.text) if len(text) > len(existing.text) else (existing.text, text)
+                if len(text) > len(existing.text):
+                    longer, shorter, longer_truncated = text, existing.text, text_truncated
+                else:
+                    longer, shorter, longer_truncated = existing.text, text, existing.text_truncated
                 existing.text = longer
+                existing.text_truncated = longer_truncated
                 if shorter and shorter not in existing.extra_quotes:
                     existing.extra_quotes.append(shorter)
+            else:
+                # 本文が同一（例: 再取り込み経路で同じ切り詰め済みテキストが戻ってきた）——切断の
+                # 事実を黙って消さないよう、どちらかが切断済みなら真のまま保つ（OR・降格しない）。
+                existing.text_truncated = existing.text_truncated or text_truncated
             # 検証状態は格上げのみ許す（"verified"/"span_unmatched" が確定した後に "unverified" で
             # 上書きして退行させない・同格以上のときだけ新しい値を採用）。
             if _VERIFICATION_RANK.get(verification, 0) >= _VERIFICATION_RANK.get(existing.verification, 0):
@@ -206,7 +298,14 @@ class InvestigationState:
             return
         self.evidence.append(Evidence(
             ev_id=f"ev-{len(self.evidence) + 1}", kind=kind, doc_id=doc_id, span=span, text=text,
-            source_tool=source_tool, verification=verification, extra_quotes=list(extra_quotes or [])))
+            source_tool=source_tool, verification=verification, extra_quotes=list(extra_quotes or []),
+            locator=locator, text_truncated=text_truncated))
+
+    def _add_gap(self, gap: str) -> None:
+        """同じ文面の限界は1本だけ持つ（同じ doc の精読を再取り込みするたびに同一行が増えて、
+        清書入力の限界枠（先頭 20 件）を埋め尽くさないようにする）。"""
+        if gap not in self.gaps:
+            self.gaps.append(gap)
 
     def add_tool_result(self, name: str, args: dict, result, cites: list | None,
                         evidence_meta: list | None) -> None:
@@ -232,8 +331,20 @@ class InvestigationState:
         # 上限の異なる2箇所（gaps は200字・`_fmt_tool` は80字）が同じ安全な生値を切るようにする。
         error = _as._digest_clean(result_dict["error"]) if has_error else None
         hits = _as._tool_hit_count(name, result_dict) if not has_error else None
+        if hits == 0 and name in _READ_KIND_TOOL_NAMES and result_dict.get("text"):
+            # 精読の結果に本文があれば「0件」ではない（行番号を持たない再取り込み結果は行数を
+            # 数えられない）——gaps と呼び出し記録の両方から偽の 0 件を消す。
+            hits = None
         truncated = bool(result_dict.get("text_truncated") or result_dict.get("truncated_docs")
-                        or result_dict.get("file_truncated") or result_dict.get("truncated"))
+                        or result_dict.get("file_truncated") or result_dict.get("truncated")
+                        or result_dict.get("folders_truncated"))
+        # list_docs の `truncated` は「一覧に次ページがある」（本文の切断ではない）。続きを取れば
+        # 解消する事実で、取らなかった不足は list_meta（該当 N 件／列挙 M 件）に残るため、
+        # 消せない gaps には積まない（呼び出し記録の打ち切り印は残す）。
+        page_truncated = name == "list_docs" and truncated
+        # 下調べ役の精読を親へ再取り込みする経路（`reingested`）: 切断の事実は子の gaps と
+        # `text_truncated` で既に伝わっているため、親側で切断 gap を作り直さない（文面違いの重複を防ぐ）。
+        reingested = bool(result_dict.get("reingested"))
         args_summary = _args_summary(args, _as._digest_clean)
         self.tool_log.append(ToolCall(name=name, args_summary=args_summary, hits=hits,
                                       truncated=truncated, error=error))
@@ -246,9 +357,40 @@ class InvestigationState:
             self.gaps.append(f"{label}: 0件")
         elif hits is None and result_dict.get("degrade_reason"):
             self.gaps.append(f"{name}: 索引なし（キーワード一致のみ）")
-        if truncated:
-            doc_part = f" doc {result_dict.get('doc_id')}" if result_dict.get("doc_id") else ""
-            self.gaps.append(f"{name}{doc_part}: 本文が上限で切断")
+        elif (name == "compare_documents"
+              and result_dict.get("status") in ("unsupported", "needs_disambiguation")):
+            # 比較できなかった事実は限界として残す（error キーを持たない正常応答のため上の分岐に入らない）。
+            reason = _as._digest_clean(str(result_dict.get("reason") or result_dict.get("status")))[:_GAP_MESSAGE_CAP]
+            self._add_gap(f"{label}: 機械的な突合せができず未確認（{reason}）")
+        if (name in ("ripgrep_search", "es_search") and result_dict.get("truncated") and not reingested
+                and (result_dict.get("text_truncated") or result_dict.get("truncated_docs")
+                     or result_dict.get("file_truncated"))):
+            # 本文の切断と併発したときもヒット上限の事実は独立に残す（下の elif 連鎖は本文側を選ぶ）。
+            self._add_gap(f"{label}: 検索ヒットが上限で打ち切り（全件ではない・範囲を絞るか別の語で）")
+        if truncated and not page_truncated and not reingested:
+            if name == "graph_neighbors":
+                # 近傍一覧の打ち切り（本文の切断ではない）＝総数と一部しか返っていない事実を残す。
+                self._add_gap(f"{label}: 近傍が上限で打ち切り（全 {result_dict.get('count')} 件中の一部）")
+            elif name in ("ripgrep_search", "es_search") and not result_dict.get("text_truncated") \
+                    and not result_dict.get("truncated_docs") and not result_dict.get("file_truncated"):
+                # ヒット数上限の打ち切りだけ（本文の切断ではない）＝母集団の一部しか見ていない事実を残す。
+                self._add_gap(f"{label}: 検索ヒットが上限で打ち切り（全件ではない・範囲を絞るか別の語で）")
+            elif name == "xlsx_sheets":
+                # シート一覧の打ち切り（本文は返さないツール・続きを取る引数は無い）。
+                self._add_gap(f"{label}: シート一覧が上限で打ち切り（全件ではない）")
+            elif name == "folder_tree" and result_dict.get("folders_truncated"):
+                # フォルダ一覧の打ち切り（続きを取る引数は無い）＝総数と一部しか返っていない事実を残す。
+                self._add_gap(f"{label}: フォルダ一覧が上限で打ち切り（全 {result_dict.get('count')} 件中の一部）")
+            elif name in ("glob_search", "doc_outline") and result_dict.get("truncated"):
+                # パス一覧／見出し一覧の打ち切り。doc_outline で `file_truncated` も立つときは総数も過小。
+                under = "・総数も過小" if result_dict.get("file_truncated") else ""
+                self._add_gap(f"{label}: 一覧が上限で打ち切り（全 {result_dict.get('count')} 件中の一部{under}）")
+            elif name == "doc_outline":
+                # `file_truncated` だけ＝文書が大きく読み切れていない（見出し件数・総行数は過小）。
+                self._add_gap(f"{label}: 文書が大きく見出しを読み切れていない（件数・総行数は過小）")
+            else:
+                doc_part = f" doc {result_dict.get('doc_id')}" if result_dict.get("doc_id") else ""
+                self._add_gap(f"{name}{doc_part}: 本文が上限で切断")
 
         # 構造的根拠（list_docs/folder_tree/graph_neighbors の集計・カード要約）。
         for m in evidence_meta:
@@ -277,19 +419,45 @@ class InvestigationState:
             self._upsert(kind="citation", doc_id=doc_id, span=span, text=quote,
                         source_tool=name, verification=verification)
 
-        # 精読（read_around/read_doc）: 本文は既に run_tool 側で `_redact` 済み——ここでは制御文字
-        # 除去（改行を1行の要約行へ畳む）と長さ上限だけ追加で適用する。
-        if name in ("read_around", "read_doc") and not error:
+        # 精読（read_around/read_doc・S3b 原本読取ツール6本）: 本文は既に run_tool 側で `_redact`
+        # 済み——ここでは制御文字除去（改行を1行の要約行へ畳む）と保存上限（`_READ_TEXT_CAP_BYTES`）
+        # だけ追加で適用する。原本読取ツール（xlsx_range/docx_paragraphs/pptx_slides/pdf_pages/
+        # file_head・本文を返す 5 本）は結果に `doc_id`/`text`（run_tool が合成・
+        # `_doc_reader_text_locator` 参照）を持つため、read_around/read_doc と同じ経路で
+        # read_evidence（`InvestigationState`・根拠ゲート）に載せる。xlsx_sheets（シート一覧のみ・
+        # 本文を読んでいない）は精読にしない。
+        if name in _READ_KIND_TOOL_NAMES and not error:
             text = result_dict.get("text")
             if text:
-                cleaned = _as._digest_clean(text)[:_READ_TEXT_CAP]
+                cleaned_full = _as._digest_clean(text)
+                # 保存時にここで新たに切ったか（読取ツール自体が既に打ち切っていた場合＝上の
+                # `truncated` とは独立に判定する——`truncated` が False でも、精読本文がこの
+                # 保存上限を超えていれば末尾が清書ダイジェストから欠落する）。
+                save_truncated = len(cleaned_full.encode("utf-8")) > _READ_TEXT_CAP_BYTES
+                cleaned = (_as._clip_utf8_bytes(cleaned_full, _READ_TEXT_CAP_BYTES)
+                          if save_truncated else cleaned_full)
                 if name == "read_doc":
                     sl, el = result_dict.get("start_line"), result_dict.get("end_line")
                     span = _span_tuple((sl, el)) if isinstance(sl, int) and isinstance(el, int) else None
-                else:
+                elif name == "read_around":
                     span = _read_span_from_text(text)
-                self._upsert(kind="read", doc_id=result_dict.get("doc_id"), span=span, text=cleaned,
-                            source_tool=name, verification="structural")
+                else:
+                    # S3b 6ツール: 位置情報は text 本文の行頭表記（"Sheet1!A1:D20"・"段落3" 等・
+                    # `locator` フィールド）に残す——read_around の行番号のような単純な数値span化はしない。
+                    span = None
+                doc_id = result_dict.get("doc_id")
+                if save_truncated and not reingested:
+                    # `truncated`（読取ツール自体の打ち切り）とは別の、保存時の切断だけを表す専用
+                    # gap——黙って行うと `build_synthesis_digest` の清書入力から末尾の条件・例外が
+                    # 消えたことに誰も気づけない。
+                    self._add_gap(f"{name} doc {doc_id}{_span_loc(span)}: 保存時に本文を "
+                                  f"{len(cleaned)} 字で切断（末尾は清書に渡らない）")
+                # RV2巡目#9: S3b 6ツールの `locator`（read_around/read_doc は常に None）を同一性の
+                # 鍵にも表示にも渡す（`_upsert`/`_find` 参照）。
+                self._upsert(kind="read", doc_id=doc_id, span=span, text=cleaned,
+                            source_tool=name, verification="structural",
+                            locator=result_dict.get("locator") if span is None else None,
+                            text_truncated=truncated or save_truncated)
 
         # ファイル名検索（glob_search）: 見つけたパス一覧そのものを保存する（件数だけでは文脈整理後
         # に「何を見つけたか」が失われる）。doc_id/span は複数 doc 横断のため常に None——同じ
@@ -299,12 +467,12 @@ class InvestigationState:
             count = result_dict.get("count", 0)
             if paths or count:
                 pattern = str((args or {}).get("pattern") or "").strip()
-                paths_text = _LIST_SEP.join(_as._digest_clean(p) for p in paths[:20])
                 cond_text = f"（パターン: {_as._digest_clean(pattern)}）" if pattern else ""
-                fact = (f"[glob_search] 該当 {count} 件{cond_text}／列挙 {len(paths)} 件"
-                       + (f": {paths_text}" if paths_text else ""))
+                head = f"[glob_search] 該当 {count} 件{cond_text}／列挙 {len(paths)} 件"
                 self._upsert(kind="list", doc_id=None, span=None,
-                            text=_as._digest_clean(fact)[:_STRUCTURAL_FACT_CAP],
+                            text=_capped_fact(head, paths, len(paths), _LIST_SEP,
+                                              lambda n: f"（他 {n} 件のパスは未提示＝この一覧は全件として書かない）",
+                                              _as._digest_clean, 20),
                             source_tool=name, verification="structural")
 
         # 見出し構造（doc_outline）: 見出し一覧そのものを保存する（`headings[]["title"]` は
@@ -313,11 +481,13 @@ class InvestigationState:
         if name == "doc_outline" and not error:
             headings = [h for h in (result_dict.get("headings") or []) if isinstance(h, dict)]
             if headings:
-                heads_text = _LIST_SEP.join(_as._digest_clean(str(h.get("title") or "")) for h in headings[:20])
-                fact = (f"[doc_outline] {_as._digest_clean(result_dict.get('doc_id'))}: "
-                       f"見出し {result_dict.get('count', 0)} 件／列挙 {len(headings)} 件: {heads_text}")
+                head = (f"[doc_outline] {_as._digest_clean(result_dict.get('doc_id'))}: "
+                        f"見出し {result_dict.get('count', 0)} 件／列挙 {len(headings)} 件")
                 self._upsert(kind="outline", doc_id=result_dict.get("doc_id"), span=None,
-                            text=_as._digest_clean(fact)[:_STRUCTURAL_FACT_CAP],
+                            text=_capped_fact(head, [str(h.get("title") or "") for h in headings], len(headings),
+                                              _LIST_SEP,
+                                              lambda n: f"（他 {n} 件の見出しは未提示＝この一覧は全件として書かない）",
+                                              _as._digest_clean, 20),
                             source_tool=name, verification="structural")
 
         # 比較（compare_documents）: 差分の要点行（+/- 行の抜粋）まで保存する——件数だけでは
@@ -337,21 +507,36 @@ class InvestigationState:
             body_lines = diff_lines[2:] if len(diff_lines) >= 2 else []
             diff_change_lines = [ln for ln in body_lines if ln.startswith("+") or ln.startswith("-")]
             if left or right:
-                excerpt = _EXCERPT_SEP.join(_as._digest_clean(ln) for ln in diff_change_lines[:10])
-                fact = f"[compare] {left} vs {right}: 差分 {len(diff_change_lines)} 行"
-                if excerpt:
-                    fact += f": {excerpt}"
+                head = f"[compare] {left} vs {right}: 差分 {len(diff_change_lines)} 行"
                 self._upsert(kind="compare", doc_id=None, span=None,
-                            text=_as._digest_clean(fact)[:_STRUCTURAL_FACT_CAP],
+                            text=_capped_fact(head, diff_change_lines, len(diff_change_lines), _EXCERPT_SEP,
+                                              lambda n: f"（他 {n} 行は未提示＝この差分は全件として書かない）",
+                                              _as._digest_clean, 10),
                             source_tool=name, verification="structural")
 
     def _fmt_evidence(self, e: Evidence) -> str:
         if e.kind in ("citation", "read"):
             loc = _span_loc(e.span)
-            core = f"{e.doc_id}{loc}「{e.text}」" if e.text else f"{e.doc_id}{loc}"
+            # RV2巡目#9: `locator`（S3b 原本読取ツール・span=None のときだけ持つ）を本文へ前置する
+            # ——同じ doc_id で複数エントリになった場合（別シート等）に、どの箇所の精読かを
+            # 表示の上でも区別できるようにする（同一性は `_find` 側で既に区別済み）。
+            # 精読本文の保存上限は清書予算に合わせて大きい（`_READ_TEXT_CAP_BYTES`）が、render は
+            # 査読・文脈整理の入力＝根拠を最優先に配分するため、精読1件が長いと【限界】が無通知で
+            # 落ちる。表示は旧来の長さ（`_RENDER_READ_TEXT_CAP`）に切り、全文は清書入力にだけ渡す。
+            body_text = e.text
+            if e.kind == "read" and len(body_text) > _RENDER_READ_TEXT_CAP:
+                body_text = body_text[:_RENDER_READ_TEXT_CAP] + "…"
+            text = f"{e.locator}: {body_text}" if (e.kind == "read" and e.locator and body_text) else body_text
+            core = f"{e.doc_id}{loc}「{text}」" if text else f"{e.doc_id}{loc}"
             body = f"精読: {core}" if e.kind == "read" else core
             if e.extra_quotes:
-                extras = _LIST_SEP.join(f"「{q}」" for q in e.extra_quotes)
+                # 精読の退避本文も表示上限を掛ける（保存本文は `_READ_TEXT_CAP_BYTES` まで持つため、
+                # 素通しにすると render の1行が再び数千字に膨らんで【限界】を押し出す）。
+                def _q(q: str) -> str:
+                    if e.kind == "read" and len(q) > _RENDER_READ_TEXT_CAP:
+                        return q[:_RENDER_READ_TEXT_CAP] + "…"
+                    return q
+                extras = _LIST_SEP.join(f"「{_q(q)}」" for q in e.extra_quotes)
                 body += f"／別の一致: {extras}"
         else:
             body = e.text

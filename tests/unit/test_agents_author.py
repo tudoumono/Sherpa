@@ -6,8 +6,8 @@ lens='author' の前提条件ゲート:
     従来 qa 相当の下書きで回答する（headline 冒頭に案内を前置）。
   - Codex＋ナレッジ OFF は「資料に基づいて作成するため、ナレッジ参照をオンにしてください」と正直に返す
     （作成系の語を含まない素の雑談は従来どおりの汎用案内のまま）。
-  - CodexProvider は author のとき reasoning/timeout を SHERPA_CODEX_REASONING_AUTHOR／
-    SHERPA_CODEX_TIMEOUT_AUTHOR（既定 medium/600秒）に切り替える。通常レンズは現行のまま。
+  - CodexProvider は author のとき reasoning を SHERPA_CODEX_REASONING_AUTHOR（既定 medium）に
+    切り替える。通常レンズは現行のまま。
 
 subprocess を起動する CodexProvider.run() の分岐は、既存 test_codex_workspace_authoring.py と
 同じ「ソース検査」方式で確認する（実 codex CLI 起動は対象外・E2E はコーディネーターが後で実施）。
@@ -163,40 +163,36 @@ def test_plain_run_passes_ctx_message_to_plain_text():
     assert "provider._plain_text(ctx.message)" in src
 
 
-# ===== CodexProvider: author のときだけ reasoning/timeout を切り替える（ソース検査） =====
+# ===== CodexProvider: author のときだけ reasoning を切り替える（ソース検査） =====
 
-def test_codex_run_has_author_reasoning_timeout_branch():
+def test_codex_run_has_author_reasoning_branch():
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
     assert 'decision["lens"] == "author"' in src, "author 判定の分岐が run() に無い"
     assert "SHERPA_CODEX_REASONING_AUTHOR" in src, "author 専用 reasoning env が無い"
-    assert "SHERPA_CODEX_TIMEOUT_AUTHOR" in src, "author 専用 timeout env が無い"
-    # threading.Timer は切り替え後の _timeout（self._timeout ではない）を使うこと。
-    assert "threading.Timer(_timeout," in src, "Timer が author 分岐後の _timeout を使っていない"
+    # TIMEOUT-1: 経過時間だけの打ち切りは撤去済み（threading.Timer/SHERPA_CODEX_TIMEOUT_AUTHOR は
+    # コードから撤去済み・復活していないことをコードで保証する）。
+    assert "threading.Timer" not in src, "threading.Timer が復活している（TIMEOUT-1 の契約違反）"
+    assert "SHERPA_CODEX_TIMEOUT_AUTHOR" not in src, "SHERPA_CODEX_TIMEOUT_AUTHOR が復活している"
 
 
 def test_codex_reasoning_author_env_default_and_override(monkeypatch):
     """env 未設定時は既定 'medium'・設定時はその値を使う（実際の分岐ロジックを直接評価）。"""
     import os as _os
     monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
-    monkeypatch.delenv("SHERPA_CODEX_TIMEOUT_AUTHOR", raising=False)
 
-    def _compute(is_author, self_reason, self_timeout):
+    def _compute(is_author, self_reason):
         _reason_raw = (_os.environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium")
                       if is_author else self_reason)
-        _reason = "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
-        _timeout = (float(_os.environ.get("SHERPA_CODEX_TIMEOUT_AUTHOR", "600"))
-                   if is_author else self_timeout)
-        return _reason, _timeout
+        return "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
 
-    # author=True・env 未設定 → 既定 medium/600。
-    assert _compute(True, "low", 180.0) == ("medium", 600.0)
+    # author=True・env 未設定 → 既定 medium。
+    assert _compute(True, "low") == "medium"
     # author=True・env 設定あり → その値。
     monkeypatch.setenv("SHERPA_CODEX_REASONING_AUTHOR", "high")
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT_AUTHOR", "900")
-    assert _compute(True, "low", 180.0) == ("high", 900.0)
-    # author=False（通常レンズ） → 従来どおり self._reason/self._timeout のまま。
-    assert _compute(False, "low", 180.0) == ("low", 180.0)
+    assert _compute(True, "low") == "high"
+    # author=False（通常レンズ） → 従来どおり self._reason のまま。
+    assert _compute(False, "low") == "low"
 
 
 # ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: Codex reasoning の per-turn 上書き =====
@@ -246,8 +242,10 @@ def test_prompt_fs_author_instructs_file_creation_and_skills():
     assert "作成したファイル名" in prompt and "内容の要約" in prompt, "完了報告の指示が無い"
     assert "消費税率の一覧をExcelにまとめて" in prompt
     # containment/grounding の短縮形は author でも維持される（多層防御）。
+    # 契約変更（2026-09-10・回答の簡素化対処）: 「推測しない」は「確定した事実と推定は分けて書く」に置換。
     assert "指定資料フォルダ以外は読まない" in prompt
-    assert "推測しない" in prompt
+    assert "確定した事実と推定は分けて書く" in prompt
+    assert "推測しない" not in prompt
 
 
 def test_prompt_fs_non_author_unchanged_shape():
@@ -270,17 +268,44 @@ def test_prompt_mcp_author_instructs_file_creation_and_skills():
     # MCP ツール活用の案内（list_docs/graph_neighbors 等）は author でも維持される。
     assert "graph_neighbors" in prompt
     assert "list_docs" in prompt
-    assert "MCP ツール以外でのファイル直接読み取りは禁止" in prompt
-    assert "推測しない" in prompt
+    # 契約変更（2026-09-10・Codex原本直読と調査スキル §2-4）: 「MCP ツール以外でのファイル直接読み取りは
+    # 禁止」は既定 direct_read=True の下で「原本は直接読んでよい（指定フォルダの中だけ）」の肯定形に、
+    # 「推測しない」は「確定した事実と推定は分けて書く」に置換。
+    assert "原本は直接読んでよい" in prompt
+    assert "確定した事実と推定は分けて書く" in prompt
+    assert "推測しない" not in prompt
 
 
 def test_prompt_mcp_non_author_unchanged_shape():
+    """契約変更（2026-09-10・Codex原本直読と調査スキル §2-6・S3）: investigate-* スキルへの誘導
+    （`.agents/skills` の investigate-* を読んで手順どおり進める）は共通部に入り全レンズへ出るように
+    なった——author 専用なのは xlsx/docx/pptx（成果物作成）スキルの案内のほうなので、そちらだけを
+    非混入として検査する。"""
     p = A.CodexProvider()
     for lens in ("qa", "impact", "troubleshoot"):
         prompt = p._prompt_mcp("消費税率を変えたい", lens, "v1")
         assert "authoring 直下に作成してください" not in prompt, f"{lens} に作成指示が混入した"
-        assert ".agents/skills" not in prompt, f"{lens} にスキル案内が混入した"
+        assert "配下のスキル（xlsx/docx/pptx の" not in prompt, f"{lens} に作成系スキル案内が混入した"
+        assert "investigate-" in prompt, f"{lens} に investigate-* スキル誘導が無い"
         assert "graph_neighbors" in prompt   # 既存の MCP ツール案内は健在
+
+
+def test_prompt_mcp_referenced_docs_instruction_only_when_direct_read():
+    """S2（2026-09-10・Codex原本直読と調査スキル §2-5）: 「参照した資料:」の案内は direct_read=True
+    のときだけ入る（direct_read=False は MCP のみへ縮退＝MCP の結果がそのまま出典になる従来どおり）。"""
+    p = A.CodexProvider()
+    prompt_on = p._prompt_mcp("消費税率を変えたい", "qa", "v1", direct_read=True)
+    prompt_off = p._prompt_mcp("消費税率を変えたい", "qa", "v1", direct_read=False)
+    assert "参照した資料" in prompt_on
+    assert "参照した資料" not in prompt_off
+
+
+def test_prompt_fs_always_includes_referenced_docs_instruction():
+    """`_prompt`（MCP 無効経路）は直読が唯一の手段＝常に「参照した資料:」の案内を含む。"""
+    p = A.CodexProvider()
+    for lens in ("qa", "impact", "troubleshoot", "author"):
+        prompt = p._prompt("消費税率を変えたい", lens, {"data": {}}, "v1")
+        assert "参照した資料" in prompt, f"{lens} に参照した資料の案内が無い"
 
 
 # ===== 実行ごとの作業領域（run_dir）: 同一 uid の並走（直列化 lock 撤去の置き換え） =====

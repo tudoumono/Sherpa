@@ -105,9 +105,11 @@ class OpenAIProvider(_GenProvider):
         # 調べる深さ（調べ方ブロック §3.2・SC-6c）: 実効基準値（system_settings→env→コード既定）に
         # 倍率をかけた値を openai_style/run_tool へ渡す（既定 "standard" は倍率×1＝挙動不変）。
         profile = (ctx.scope_meta or {}).get("depth_profile")
-        max_turns = depth_profile_mod.scaled_turns(
-            depth_profile_mod.effective_base(self._system_settings, "max_turns", agentic_search.MAX_TURNS),
-            profile)
+        max_turns = depth_profile_mod.effective_max_turns(self._system_settings, agentic_search.MAX_TURNS, profile)
+        # 利用統計（answer.usage）へ「実際にループへ渡した上限」を残す（再計算せず同じ値を記録する）。
+        self._last_main_depth_usage = depth_profile_mod.usage_extras(
+            profile, max_turns=max_turns,
+            max_tools_per_turn=agentic_search.effective_max_tools_per_turn(self._system_settings or {}))
         max_hits = depth_profile_mod.scaled_ratio(
             depth_profile_mod.effective_base(self._system_settings, "grep_max_hits", agentic_search.MAX_HITS),
             profile, abs_max=agentic_search.MAX_HITS_ABS_MAX)

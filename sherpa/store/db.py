@@ -716,6 +716,9 @@ _SCHEMA = [
         user_id TEXT,
         world TEXT
     )""",
+    # STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: LLM 呼び出しの所要時間。NULL＝計測スコープ
+    # （`metering.acc_begin`/`acc_end`）の外で記録された行（例: kind='graph_ask'）＝所要時間が取れない。
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS elapsed_ms BIGINT",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events (ts)",
     # 回答ごとの利用者フィードバック（👍/👎＋定型タグ＋任意の一言）。1利用者×1メッセージにつき
     # 最新1件のみ（再送は上書き）。本文（質問/回答）は複製せず message_id で messages を参照する

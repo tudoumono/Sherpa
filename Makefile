@@ -2,10 +2,11 @@
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
 .PHONY: help start stop restart status check-ports up down ps logs bootstrap demo mirror install-docker ocr-models \
-        graph-load graph-verify graph api serve prod-check verify-kit dist nuke notice notice-check \
+        graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
-        test-db-reset screenshots backup restore azure-smoke doctor
+        test-db-reset screenshots backup restore azure-smoke doctor \
+        gate-slice gate-merge gate-release gate-ci test-inventory test-durations
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
 .DEFAULT_GOAL := help
@@ -15,6 +16,14 @@ SHERPA_VERSION := $(shell git describe --tags --exact-match 2>/dev/null || print
 
 # テスト系ターゲットの Python。開発は .venv を正とする（無ければ python3 にフォールバック）。
 PY ?= $(shell test -x .venv/bin/python && echo .venv/bin/python || echo python3)
+
+# 開発ハーネスのゲート系ターゲットが比較する基点 ref（docs/20-開発ハーネス.md §5）。
+BASE ?= main
+# 単体+契約テストの壁時計予算（秒・確定値5分・docs/20-開発ハーネス.md §6）。環境変数で上書き可。
+SHERPA_UNIT_BUDGET_SEC ?= 300
+# make の変数代入（?= 含む）は既定では recipe のシェルへ自動で渡らない（コマンドライン代入や
+# 元から環境変数だった場合を除く）。scripts/lib/gate_budget.sh は環境変数として読むため export する。
+export SHERPA_UNIT_BUDGET_SEC
 
 help:             ## このコマンド一覧を表示
 	@echo "Sherpa — make の使い方"
@@ -136,6 +145,53 @@ screenshots:        ## マニュアル用画像を再生成（モックAPI＋Pla
 
 test: test-unit test-api test-contract test-integration  ## 単体＋API＋契約＋結合（ブラウザ系は含まない→test-e2e / test-e2e-live）
 
+# --- 開発ハーネスのゲート（段階表は docs/20-開発ハーネス.md §5） ------------------------------
+
+gate-slice:         ## 変更ファイルから該当テストを自動選択して実行（BASE=<ref> 既定 main）
+	$(PY) scripts/gate_slice.py --base $(BASE)
+
+gate-merge: SHELL := /usr/bin/bash
+gate-merge:         ## マージ前ゲート（単体全件+契約＋変更領域の必須スイート。BASE=<ref> 既定 main）
+	set -euo pipefail; \
+	. scripts/lib/gate_budget.sh; \
+	ruff check . ; \
+	gate_run_unit_contract_budgeted "$(PY)" ; \
+	areas_out=$$($(PY) scripts/gate_slice.py --base $(BASE) --areas-only) ; \
+	echo "$$areas_out" ; \
+	if echo "$$areas_out" | grep -q '^AREA:e2e$$'; then $(MAKE) test-e2e; fi ; \
+	if echo "$$areas_out" | grep -q '^AREA:integration$$'; then $(MAKE) test-integration; fi ; \
+	if echo "$$areas_out" | grep -q '^AREA:api$$'; then $(MAKE) test-api; fi
+
+# gate-merge の「基本セット」は tests/unit tests/contract（DB不要）とし、tests/api は変更領域が
+# api（sherpa/routers/** 変更）のときだけ追加実行する（tests/api 自体は Neo4j/Postgres を使う
+# テストを含む＝DB 要否を機械的に仕分ける仕組みは無いため、DB が使える手元環境での運用に委ねる。
+# routers/** を変更しない限り gate-merge は API 層を要求しない）。
+
+gate-release: SHELL := /usr/bin/bash
+gate-release:       ## リリース前フルゲート（結合+ブラウザ結合+本番前チェック。VERIFY_KIT=1で追加）
+	set -euo pipefail; \
+	$(MAKE) test; \
+	$(MAKE) test-e2e; \
+	$(MAKE) prod-check; \
+	if [ "$(VERIFY_KIT)" = "1" ]; then $(MAKE) verify-kit; fi
+
+gate-ci: SHELL := /usr/bin/bash
+gate-ci:            ## CI用（ruff+単体全件+契約・予算チェック込み・Postgres serviceのみ前提）
+	set -euo pipefail; \
+	. scripts/lib/gate_budget.sh; \
+	ruff check . ; \
+	gate_run_unit_contract_budgeted "$(PY)"
+
+test-inventory: SHELL := /usr/bin/bash
+test-inventory:     ## テスト件数表（ディレクトリ別）＋遅い20本（test-durations 呼び出し）
+	set -euo pipefail; \
+	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/unit tests/contract --collect-only -q \
+		| grep -oE '^tests/[^/]+/' | sort | uniq -c | sort -rn
+	$(MAKE) test-durations
+
+test-durations:     ## 単体+契約を --durations=20 で実行し遅い20本を表示
+	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/unit tests/contract -q --durations=20
+
 test-db-reset:      ## テスト専用 DB sherpa_test を作り直す（DROP→CREATE・無ければ CREATE のみ）
 	$(PY) scripts/test_db_reset.py
 
@@ -150,6 +206,9 @@ prod-check:        ## 本番 env/依存関係の軽い事前点検（SHERPA_ENV_
 
 verify-kit:        ## オフラインキットの出荷ゲート（docker必須・搬入先相当ホストへ--network noneで実導入。ARGSでキットのパス指定可・既定dist/offline-kit）
 	./scripts/verify_offline_kit_apt.sh $(ARGS)
+
+verify-extension:  ## 拡張の契約検査（アナライザ／頭脳provider／変換アーム／MCPツール・docs/21-拡張の契約.md）
+	$(PY) scripts/verify_extension.py
 
 dist: notice       ## 配布物 tarball を生成（版名＋sha256＋NOTICE/SBOM・fixtures/tests/mockups 非同梱）
 	@mkdir -p dist

@@ -4,7 +4,7 @@
 > `@version` 表記・`version` フィルタは**`world_id + scope_prefixes` ＋ パス修飾 ID へ置換済**（DL は rel_path 基準）。矛盾時は [03-鏡モデル.md](03-鏡モデル.md) を優先。
 > **⚠ 2026-09-04 グラフのソース正典化（K9-K13）で `REALIZES` 橋・`Parameter`/`Function` 等のラベル・
 > 影響結果の `confidence`(sure/review) 判定は撤去済み**。本書のツール契約例に残る言及は当時の MVP 設計の
-> 記録であり、現行の語彙は [03-鏡モデル.md](03-鏡モデル.md) §2.1／[proposals/2026-09-04-グラフのソース正典化.md](proposals/2026-09-04-グラフのソース正典化.md) を優先する。
+> 記録であり、現行の語彙は [03-鏡モデル.md](03-鏡モデル.md) §2.1／提案書「グラフのソース正典化」（2026-09-04）を優先する。
 
 > FastAPI と Codex CLI のセッション管理の実装詳細。**DB を基準**に Codex CLI をヘッドレス駆動し、
 > 実行トレース（調査ログ）を SSE 配信、結果を `analyses`/`analysis_items` に落とす。

@@ -130,3 +130,30 @@ def test_admin_es_search_rejects_unknown_scope(auth_disabled):
             assert r.status_code == 422, r.text
         finally:
             worlds.world_dir, es_index.search = old_world_dir, old_search
+
+
+def test_admin_es_search_hides_sensitive_named_hits(auth_disabled):
+    """更新前に索引化された秘匿名（credentials.xlsx）のヒットは管理者検索でも snippet ごと返さない。"""
+    from sherpa import es_index, worlds
+    old_world_dir, old_search = worlds.world_dir, es_index.search
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        (root / "docs").mkdir()
+        (root / "docs" / "a.md").write_text("hit", encoding="utf-8")
+        (root / "docs" / "credentials.xlsx").write_text("x", encoding="utf-8")
+        worlds.world_dir = lambda w: root if w == W else old_world_dir(w)
+
+        def fake_search(world, query, scope_paths=None, k=20, settings=None, vector=True):
+            return [{"doc_id": "docs/credentials.xlsx", "line": 1, "text": "SECRET=1", "score": 2.0, "ext": ".xlsx"},
+                    {"doc_id": "docs/a.md", "line": 1, "text": "hit", "score": 1.0, "ext": ".md"}], None
+
+        es_index.search = fake_search
+        try:
+            c = TestClient(app, raise_server_exceptions=False)
+            r = c.get("/admin/es/search", params={"world": W, "query": "hit", "k": 20})
+            assert r.status_code == 200, r.text
+            assert [h["doc_id"] for h in r.json()["hits"]] == ["docs/a.md"]
+            assert "SECRET" not in r.text
+        finally:
+            worlds.world_dir, es_index.search = old_world_dir, old_search
+

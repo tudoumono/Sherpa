@@ -32,6 +32,32 @@ def test_unknown_world_is_empty():
     assert doc_ledger.documents_for("nope") == []
 
 
+def test_public_documents_page_hides_sensitive_ledger_rows_and_count():
+    """台帳（`store.documents`）に秘匿名（`credentials.xlsx`・`is_sensitive` 導入前に入った行を
+    想定）が残っていても、`GET /documents` の一覧・件数の共通の出所である
+    `doc_ledger.public_documents_page`（DB 台帳を直接読む高速経路）はそれを出さない
+    （`text_kind.is_sensitive_doc_id`・台帳 #85〜#88）。`limit=None`（全件取得）なら件数も
+    フィルタ後の実件数と一致する。"""
+    from sherpa import store
+
+    w = "docpage-sensitive-test"
+    rows = [
+        {"name": "credentials.xlsx", "layer": "version", "scope_path": None, "doctype": "表計算",
+         "branch": "office", "original_path": None, "md_path": None, "status": "indexed"},
+        {"name": "report.xlsx", "layer": "version", "scope_path": None, "doctype": "表計算",
+         "branch": "office", "original_path": None, "md_path": None, "status": "indexed"},
+    ]
+    store.replace_documents(w, rows)
+    try:
+        docs, total = doc_ledger.public_documents_page(w, limit=None)
+        names = [d["name"] for d in docs]
+        assert "credentials.xlsx" not in names
+        assert names == ["report.xlsx"]
+        assert total == 1
+    finally:
+        store.replace_documents(w, [])
+
+
 def test_dl_is_path_based():
     """原本DL はパス基準: 実在ソースは DL 可／実在しない設計書 rel・トラバーサルは None。"""
     assert doc_ledger.original_path(TAXCALC, V) is not None

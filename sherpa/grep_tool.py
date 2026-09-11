@@ -8,6 +8,7 @@ world（登録ディレクトリ）の**1つのフォルダ木**を行単位で�
 from __future__ import annotations
 
 import heapq
+import logging
 import os
 import re
 import time
@@ -17,6 +18,8 @@ from pathlib import Path
 from . import layer as layer_mod
 from .doc_kinds import CODE_EXT
 from .ingest import text_kind
+
+_log = logging.getLogger("sherpa")
 
 # 決定的MD（Office/PDF 由来）とソース原文（cobol/jcl/copybook）。grep は両方を対象にする。
 _MD_EXT = {".md", ".markdown"}
@@ -447,6 +450,15 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 if preferred_derived_name(der_rag, origin_rel) != rel:
                     continue
                 rel = origin_rel
+                # 秘匿名: 派生MDの物理名から復元した**原本名**で判定する
+                # （`ok_ext`／`_MD_EXT` は派生ファイルの拡張子=`.md`/`.rag.md` を見るだけなので、
+                # ここで通さないと `credentials.xlsx`/`.env.png` 等の派生MDが原本の秘匿名を
+                # 素通りして grep 対象になる＝`corpus_docs.classify_document` の秘匿除外は
+                # 派生ツリーの走査（`is_derived`）には掛からない）。
+                if text_kind.is_sensitive_doc_id(origin_rel):
+                    _log.warning("grep_search: 秘匿名のため派生MDを対象外にしました（ext=%s）",
+                                Path(origin_rel).suffix.lower())
+                    continue
             if not scope.in_scope(rel, scope_paths):  # 範囲外の文書はそもそも読まない
                 continue
             is_code = False

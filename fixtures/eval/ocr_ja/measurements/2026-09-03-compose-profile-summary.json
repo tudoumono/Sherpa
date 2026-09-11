@@ -6,8 +6,8 @@
  "profile": "ocr",
  "environment_file_loaded": false,
  "note": "O2（RV是正）: 2026-08-16実測の再実測。前回はrequirements.txt/constraints.txt/docker-compose.ymlを丸ごとハッシュしていたため、性能台帳#17 QW2（psycopg_poolの core requirements.txt 追加）のようなOCR無関係な依存追加でも赤くなっていた。束縛を絞り込み（compute_ocr_implementation_bindingを参照）、psycopg関連行とocr-workerサービス定義のみを対象にした上で、67d3b4a8（O1: OCR観測をrag.mdへ統合）とbac1d024/722c139e（QW2: PGプール化）を反映した現行実装に対して再測定した。単発のmount/network静的チェックだけでなく、raster_evidence→ocr_router.build_manifest→ocr_jobs.enqueue_manifest_jobsで実際にjobを積み、隔離ワーカー（起動中コンテナ）に実PaddleOCR推論をさせてrag_observation_chunksが得られること（『廃止』の実認識）まで確認した。",
- "files_updated_at": "2026-09-03T00:00:00Z",
- "files_updated_note": "CLEAN-2 item a/e: `implementation.files` のみを機械的に更新した（フル O2 手順の再実測ではない）。(1) item a で `sherpa/ingest/observation_render.py` から検索専用描画（Markdown/chunk JSONL 生成）を撤去し、`.ai_observations.jsonl`（office_md._load_ocr_observation_sets が読む Observation Set 本体）の永続化・世代管理だけを残した＝ファイル内容が変わったためハッシュ更新。(2) item e で `sherpa/store/db.py` の束縛を全文ハッシュから `sherpa/store/db.py:ocr-relevant`（`world_lock`/`_connect`/`_ensure`/PG プール一式・OCR関連テーブルのDDLだけを抽出）へ絞り込んだ＝会話/監査等の無関係テーブル変更で赤くならないようにする是正（`compute_ocr_implementation_binding`/`_db_ocr_relevant_source` 参照）。Dockerfile/docker-compose.yml/requirements-ocr.txt/constraints-ocr.txt/ocr-models.lock.json はいずれも無変更のため、`image`/`runtime`/`mount_checks`/`network_checks`/`image_inventory`（`python_package_inventory_sha256` 等）の実測値はこの更新の対象外＝直前の実測（2026-09-02T23:57:30Z・上記 note 参照）をそのまま維持する。フルの隔離 compose 実行による再実測（image.id の更新等）は本レーンのスコープ外として次回に持ち越す。",
+ "files_updated_at": "2026-09-09T00:00:00Z",
+ "files_updated_note": "CLEAN-2 item a/e: `implementation.files` のみを機械的に更新した（フル O2 手順の再実測ではない）。(1) item a で `sherpa/ingest/observation_render.py` から検索専用描画（Markdown/chunk JSONL 生成）を撤去し、`.ai_observations.jsonl`（office_md._load_ocr_observation_sets が読む Observation Set 本体）の永続化・世代管理だけを残した＝ファイル内容が変わったためハッシュ更新。(2) item e で `sherpa/store/db.py` の束縛を全文ハッシュから `sherpa/store/db.py:ocr-relevant`（`world_lock`/`_connect`/`_ensure`/PG プール一式・OCR関連テーブルのDDLだけを抽出）へ絞り込んだ＝会話/監査等の無関係テーブル変更で赤くならないようにする是正（`compute_ocr_implementation_binding`/`_db_ocr_relevant_source` 参照）。Dockerfile/docker-compose.yml/requirements-ocr.txt/constraints-ocr.txt/ocr-models.lock.json はいずれも無変更のため、`image`/`runtime`/`mount_checks`/`network_checks`/`image_inventory`（`python_package_inventory_sha256` 等）の実測値はこの更新の対象外＝直前の実測（2026-09-02T23:57:30Z・上記 note 参照）をそのまま維持する。フルの隔離 compose 実行による再実測（image.id の更新等）は本レーンのスコープ外として次回に持ち越す。 ／ 2026-09-09: `sherpa/ingest/ocr_worker.py` のハッシュのみ更新（秘匿名の原本＝text_kind.is_sensitive_doc_id を run_once・run_refresh_once・再公開 records() の各入口で読み取り前に除外する是正）。エンジン profile・画像・compose・依存は無変更＝image/runtime/mount_checks/network_checks/image_inventory の実測値は 2026-09-02T23:57:30Z のまま維持。フル再実測は次回に持ち越す（前例 CLEAN-2 と同じ扱い）。",
  "input": {
   "kind": "synthetic_fixture",
   "source": "fixtures/eval/excel_ja/assets/廃止スタンプ.png",
@@ -19,8 +19,23 @@
  "job_processing": {
   "note": "raster_evidence.extract→ocr_router.build_manifest→ocr_jobs.enqueue_manifest_jobsで実job（world=ocrverify20260903・synthetic registry行のみ・production worldは未使用）を積み、常駐中の隔離ワーカーに実PaddleOCRで処理させた。",
   "canonical_generation_id": "d10bcd913eedb7556561b0fdb8c0de6ec8fea2b5cccd45faa6dc9623830f1060",
-  "status_summary": {"targets": 1, "processed": 1, "cached": 0, "empty": 0, "failed": 0, "pending": 0,
-   "counts": {"queued": 0, "leased": 0, "succeeded": 1, "failed": 0, "stale": 0, "cancelled": 0}, "total": 1},
+  "status_summary": {
+   "targets": 1,
+   "processed": 1,
+   "cached": 0,
+   "empty": 0,
+   "failed": 0,
+   "pending": 0,
+   "counts": {
+    "queued": 0,
+    "leased": 0,
+    "succeeded": 1,
+    "failed": 0,
+    "stale": 0,
+    "cancelled": 0
+   },
+   "total": 1
+  },
   "recognized_text": "廃止",
   "recognized_confidence": 0.99988,
   "observation_written_under": "SHERPA_OBSERVATION_DIR (writable) のみ・SHERPA_DERIVED_DIR (/derived) は job 完了後もファイル数/mtime とも不変（read-only mount がworkerからの書き込みも防いでいることを確認）",
@@ -43,15 +58,16 @@
    "requirements-ocr.txt": "a9b42ec0d1e4b16779ab618094581bcb993ea9dd124f612a9252afc8d96a57e0",
    "constraints-ocr.txt": "b3d32ad9ed2018402ca7f2f9b46897ca97243921b99a1ed663bb827ae25063bb",
    "docker/ocr-models.lock.json": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
-   "sherpa/ingest/ai_observation.py": "15cebd1a3aff340c63584793fdc53ac9c8362a67408bf490a8087bf275130f75",
-   "sherpa/ingest/ocr_worker.py": "a163ad92ea697c61070939e28adfce45dd91aec9909bff4f3b6d5152b84665bc",
+   "sherpa/ingest/ai_observation.py": "feb6a351bba78a0c96e6f1af5df8c814c61b3894bc710cd7be5a25590c767b79",
+   "sherpa/ingest/ocr_worker.py": "6fa9d25331dc9947cc732eb3b8c2ce7b88dab069d6b67da1598230fa29d95824",
    "sherpa/ingest/ocr_router.py": "26dcd240df907ff417d29fd7ef129b7a8d221216f0f8ab669f3d52344679ee73",
-   "sherpa/ingest/observation_render.py": "486061136c3e863390ce39b545ef5fc29f33bd51b7a09c3957ac803ffd70d4f4",
-   "sherpa/store/ocr_jobs.py": "9938f86735ff6bab161b7fbf8aaf49b5914f4222b8d813e8a4c5159204d4562a",
+   "sherpa/ingest/observation_render.py": "6b003cfa513da0e5069dea2b1c98f78a2867f8f7603f0070b7fa3bb0ab9f4dc2",
+   "sherpa/store/ocr_jobs.py": "2d2fee039f340b02e64b23ad209a09ccdcbe0571c58c6619e513667eaecbdc1f",
    "sherpa/store/db.py:ocr-relevant": "af23d2c5a99a501e5d714d117bc6a70f5d0b2a28ac74b2f989eef37fafa97bf2",
    "requirements.txt+constraints.txt:psycopg-lines": "b8d7d98a99031315f6df04b4f349c609fdc95c223d70a79b4e7eea80b13348e7",
    "docker-compose.yml:services.ocr-worker+networks": "4e27ba3424822bba8ed1058d15e7aea117e7c8e7616190589184e6f2f34c94ff"
-  }
+  },
+  "files_updated_note": "2026-09-11: ai_observation.py・observation_render.py・ocr_jobs.py の未参照関数（searchable_observations／write_bundle_atomic／publish_snapshot／ObservationDocument／generation_terminal／mark_artifacts_published）を削除したのみ＝エンジン profile・画像・compose・依存は無変更、実測値は維持"
  },
  "runtime": {
   "worker_uid": 1000,

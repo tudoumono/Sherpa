@@ -99,6 +99,26 @@ def test_structured_listing_includes_image_only_pdf_with_rag_md(monkeypatch, tmp
     assert docs[0]["label"] == "使えます（RAG MD化）"
 
 
+def test_sensitive_image_original_name_is_not_reclassified_as_image(monkeypatch, tmp_path):
+    """秘匿名の画像（`.env.png`）は `classify_document()` が document/None を返すが、
+    Office 同様に画像拡張子分類（`office_md.IMAGE_EXT`）へ再度倒して台帳・件数へ載せてはいけない
+    （vision 有効＝通常なら画像として first-class 化される構成で確認する）。"""
+    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text,vision")
+    wd, der = _world(monkeypatch, tmp_path)
+    (wd / ".env.png").write_bytes(b"img")
+    (wd / "scan.png").write_bytes(b"img")
+    (der / ".env.png.md").write_text("画像内容は未解釈である。", encoding="utf-8")
+    (der / "scan.png.md").write_text("画像内容は未解釈である。", encoding="utf-8")
+
+    rep = corpus_docs.scan_report("w")
+    assert rep["by_doctype"] == {"画像": 1}                 # scan.png のみ
+    assert rep["document_count"] == 1
+
+    docs = corpus_docs.world_documents("w")
+    assert [d["name"] for d in docs] == ["scan.png"]
+    assert corpus_docs.status_document_doctype(".env.png", "w") is None
+
+
 def test_include_rag_prefers_rag_md_over_legacy_md_when_both_exist(monkeypatch, tmp_path):
     """D1: 両方が存在する場合、include_rag=True は legacy `.md` より `.rag.md` を優先する
     （`grep_tool.preferred_derived_name` と同じ優先順位＝grep/ES/グラフが同じ物理ファイルを見る）。

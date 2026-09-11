@@ -339,17 +339,23 @@ def test_select_provider_azure_invalid_cloud_provider_is_unwired_not_key_leak(sy
     assert "not-a-real-provider" in p.howto
 
 
-def test_select_provider_narrows_exception_catch_to_invalid_model_name_only(monkeypatch):
-    """`_select_provider` の `except model_catalog.InvalidModelNameError` は、この型だけを狭く
-    捕捉して `_UnwiredProvider`（正直な「モデル名が不正」表示）に化ける。`SHERPA_CODEX_TIMEOUT`
-    のような無関係な env 値が壊れて別の `ValueError` が起きた場合は、この except に拾われず
-    そのまま伝播する。"""
-    from sherpa.providers import _select_provider
+def test_select_provider_narrows_exception_catch_to_invalid_model_name_only():
+    """`_select_provider` の Codex 構成分岐は `CodexProvider(...)` の呼び出しを
+    `except model_catalog.InvalidModelNameError` だけで狭く捕捉し、`_UnwiredProvider`（正直な
+    「モデル名が不正」表示）に化ける——`except Exception`／`except ValueError` のような広い捕捉に
+    緩めない不変条件（ソース検査）。TIMEOUT-1（`SHERPA_CODEX_TIMEOUT` 撤去）で
+    `CodexProvider.__init__` から無関係な `ValueError` を誘発する実測トリガーが無くなったため、
+    契約そのもの＝except節の狭さを直接検査する形にした。"""
+    import inspect
 
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "not-a-number")
-    with pytest.raises(ValueError):
-        _select_provider({"agent": "codex", "codex_model_provider": "openai",
-                          "codex_model": "gpt-5.4-mini"})
+    from sherpa.providers import _select_provider
+    src = inspect.getsource(_select_provider)
+    idx = src.index("_facade.CodexProvider(None, codex_model")
+    tail = src[idx:idx + 300]
+    assert "except model_catalog.InvalidModelNameError as e:" in tail, \
+        "Codex 構成の except 節が見つからない（関数の形が変わった疑い）"
+    assert "except Exception" not in tail, "except 節が Exception まで広がっている"
+    assert "except ValueError" not in tail, "except 節が ValueError まで広がっている"
 
 
 def test_select_provider_ollama_construct_ignores_azure_settings(sysset):

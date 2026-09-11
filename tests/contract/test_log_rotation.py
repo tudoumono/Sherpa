@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -20,9 +19,15 @@ ROOT = Path(__file__).resolve().parents[2]
 COMMON = ROOT / "scripts" / "run-common.sh"
 
 
-def _run_rotate(log: Path, *, keep: str | None = None) -> subprocess.CompletedProcess:
+def _run_rotate(log: Path, *, keep: str | None = None,
+                 extra_bin: Path | None = None) -> subprocess.CompletedProcess:
+    """`extra_bin`: このディレクトリを PATH の先頭へ足す（外部コマンド＝`date` をフェイクに
+    差し替えるため・`test_check_production_openai_base_url.py` の `getent` フェイクと同じ手法）。"""
     script = f'ROOT="{ROOT}"; . "{COMMON}"; sherpa_rotate_log "{log}"'
-    env = {"PATH": "/usr/bin:/bin"}
+    path = "/usr/bin:/bin"
+    if extra_bin is not None:
+        path = f"{extra_bin}:{path}"
+    env = {"PATH": path}
     if keep is not None:
         env["SHERPA_LOG_KEEP"] = keep
     return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
@@ -66,11 +71,26 @@ def test_keep_count_prunes_oldest_first(tmp_path: Path):
     stray = tmp_path / "api-notes.log"   # 命名が緩く似ているが退避パターンには一致しない
     stray.write_text("keep me too", encoding="utf-8")
 
+    # 退避ファイル名は `date +%Y%m%d-%H%M%S`（秒精度）に依存する——実時間で1秒以上 sleep して
+    # 秒境界をまたぐ代わりに、`date` を呼び出しごとに単調増加するタイムスタンプを返すフェイクへ
+    # 差し替える（並び順・命名規約という検証対象の契約は変えない）。
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    counter_file = tmp_path / "date_counter"
+    fake_date = fake_bin / "date"
+    fake_date.write_text(
+        "#!/usr/bin/env bash\n"
+        f'n=0; [ -f "{counter_file}" ] && n=$(cat "{counter_file}")\n'
+        "n=$((n + 1))\n"
+        f'echo "$n" > "{counter_file}"\n'
+        'printf "20260101-%06d\\n" "$n"\n',
+        encoding="utf-8")
+    fake_date.chmod(0o755)
+
     for i in range(4):
         log.write_text(f"run {i}\n", encoding="utf-8")
-        r = _run_rotate(log, keep="2")
+        r = _run_rotate(log, keep="2", extra_bin=fake_bin)
         assert r.returncode == 0, r.stderr
-        time.sleep(1.1)   # タイムスタンプ（秒精度）の重複を避ける
 
     archives = _archives(tmp_path)
     assert len(archives) == 2, [p.name for p in archives]

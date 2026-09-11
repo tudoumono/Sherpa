@@ -116,6 +116,44 @@ def test_by_kind_aggregation_roundtrip():
         _delete_usage_events_by_model(models)
 
 
+def test_by_kind_elapsed_ms_aggregation():
+    """STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: kind 別の elapsed_ms 合計/平均/計測件数。
+    NULL 行（計測スコープ外）は平均から除かれ、chat 行は常に対象外（elapsed_n=0）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin, admin_uid = _admin_client()
+    world = f"usgevelapsed{sfx}"
+    m = f"test-model-elapsed-{sfx}"
+    models = [m]
+    try:
+        store.add_usage_event(kind="embed", provider="openai", model=m, input_tokens=10,
+                              cached_input_tokens=0, output_tokens=0, reasoning_output_tokens=0,
+                              calls=1, world=world, elapsed_ms=100)
+        store.add_usage_event(kind="embed", provider="openai", model=m, input_tokens=20,
+                              cached_input_tokens=0, output_tokens=0, reasoning_output_tokens=0,
+                              calls=1, world=world, elapsed_ms=300)
+        # 計測スコープ外の行（NULL）は平均から除外されること。
+        store.add_usage_event(kind="embed", provider="openai", model=m, input_tokens=5,
+                              cached_input_tokens=0, output_tokens=0, reasoning_output_tokens=0,
+                              calls=1, world=world, elapsed_ms=None)
+
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        by_kind = {(row["kind"], row["model"]): row for row in r.json()["tokens"]["by_kind"]}
+        row = by_kind[("embed", m)]
+        assert row["elapsed_ms_total"] == 400
+        assert row["elapsed_ms_avg"] == pytest.approx(200.0)
+        assert row["elapsed_n"] == 2   # NULL 行を含まない
+
+        chat_rows = [r for r in r.json()["tokens"]["by_kind"] if r["kind"] == "chat"]
+        for r_chat in chat_rows:
+            assert r_chat["elapsed_n"] == 0
+            assert r_chat["elapsed_ms_total"] is None and r_chat["elapsed_ms_avg"] is None
+    finally:
+        _delete_usage_events_by_model(models)
+
+
 def test_by_kind_period_bounds():
     if not _try_init():
         pytest.skip("DB down")

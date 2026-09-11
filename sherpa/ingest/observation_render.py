@@ -45,13 +45,6 @@ class ObservationArtifactPaths:
 
 
 @dataclass(frozen=True)
-class ObservationDocument:
-    source_rel_path: str
-    ir: evidence_ir.EvidenceIR
-    observation_sets: list[ai_observation.AIObservationSet]
-
-
-@dataclass(frozen=True)
 class ObservationRecord:
     """DBから1行ずつ渡せる、1資料・1 OCR routeの有界な公開単位。"""
 
@@ -113,17 +106,6 @@ def _write_atomic(path: Path, text: str) -> Path:
         temporary.unlink(missing_ok=True)
         raise
     return path
-
-
-def write_bundle_atomic(
-    paths: ObservationArtifactPaths,
-    observation_sets: list[ai_observation.AIObservationSet],
-) -> ObservationArtifactPaths:
-    """同じ別generation directoryへSet JSONLを原子書込する。"""
-    ordered = sorted(observation_sets, key=lambda item: item.observation_set_hash)
-    set_lines = "".join(ai_observation.to_json_str(item) for item in ordered)
-    _write_atomic(paths.observation_sets_jsonl, set_lines)
-    return paths
 
 
 def _walk_tree_files(root: Path):
@@ -513,38 +495,3 @@ def publish_snapshot_stream(
         raise
 
 
-def publish_snapshot(
-    derived_root: str | Path,
-    *,
-    canonical_generation_id: str,
-    documents: list[ObservationDocument],
-    canonical_is_current: Callable[[], bool],
-    snapshot_is_current: Callable[[], bool] | None = None,
-    publish_guard: Callable[[], ContextManager[Any]] | None = None,
-) -> dict[str, Any]:
-    """従来の文書list API。製品workerは``publish_snapshot_stream``を使用する。"""
-
-    def records() -> Iterable[ObservationRecord]:
-        previous_source: str | None = None
-        for document in sorted(documents, key=lambda item: _relative_source_path(item.source_rel_path)):
-            source_rel_path = _relative_source_path(document.source_rel_path)
-            if source_rel_path == previous_source:
-                raise ValueError("duplicate observation document path")
-            previous_source = source_rel_path
-            if not document.observation_sets:
-                raise ValueError("at least one AI Observation Set is required")
-            for observation_set in sorted(document.observation_sets, key=lambda item: item.observation_set_hash):
-                yield ObservationRecord(
-                    source_rel_path=source_rel_path,
-                    ir=document.ir,
-                    observation_set=observation_set,
-                )
-
-    return publish_snapshot_stream(
-        derived_root,
-        canonical_generation_id=canonical_generation_id,
-        records=records(),
-        canonical_is_current=canonical_is_current,
-        snapshot_is_current=snapshot_is_current,
-        publish_guard=publish_guard,
-    )

@@ -76,7 +76,7 @@ def _write_fake_codex(bin_dir: Path, argv_log: Path, plan_path: Path) -> None:
     script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str, timeout: str = "30") -> Path:
+def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str) -> Path:
     """偽 codex を PATH に差し込み、呼び出しごとの応答計画（steps）を JSON で渡す。戻り値は argv_log。"""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -86,14 +86,13 @@ def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str, timeout
     _write_fake_codex(bin_dir, argv_log, plan_path)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", timeout)
     # 平文の偽 codex で usage 差分の契約を見るテスト＝出力スキーマ（構造化応答）は使わない。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     return argv_log
 
 
 def _ctx(uid: str, conversation_id, codex_session_id=None, codex_usage_prev_total=None,
-        message: str = "usage 差分テスト") -> "A.Ctx":
+        message: str = "usage 差分テスト", scope_meta=None) -> "A.Ctx":
     return A.Ctx(
         message=message,
         world="v1",
@@ -107,6 +106,7 @@ def _ctx(uid: str, conversation_id, codex_session_id=None, codex_usage_prev_tota
         conversation_id=conversation_id,
         codex_session_id=codex_session_id,
         codex_usage_prev_total=codex_usage_prev_total,
+        scope_meta=scope_meta,
     )
 
 
@@ -187,6 +187,43 @@ def test_fresh_session_without_prev_total_uses_raw_accumulated_usage(tmp_path, m
         "output_tokens": 13, "reasoning_output_tokens": 3}
     assert env["usage"]["input_tokens"] == 30, "新規セッションは累計そのまま（差分にしない）"
     assert env["usage"]["output_tokens"] == 13
+
+
+# ===== STAT-3 S1（利用統計の拡充）: env["usage"] へ depth_profile/reasoning を足す =====
+
+def test_deep_depth_profile_overrides_reasoning_to_high_in_usage(tmp_path, monkeypatch):
+    """`scope_meta["depth_profile"]="deep"` は `model_reasoning_effort` を "high" へ per-turn 上書き
+    （`depth_profile.codex_reasoning_for`）し、その実際に渡した値が `env["usage"]["reasoning"]` に
+    載る。基準値（既定 "low"）と異なるため `reasoning_base` も残る。"""
+    steps = [{"thread_id": "SID-DEEP", "agent_messages": ["確認した結果、影響はありません。"],
+              "usage": _usage(30, 2, 13, 3)}]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_delta_deep")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="delta-deep", conversation_id=703, scope_meta={"depth_profile": "deep"})
+
+    env = _result_env(_run(prov, ctx))
+
+    calls = _read_argv_log(argv_log)
+    assert any("model_reasoning_effort=high" in a for a in calls[0]), \
+        f"実際に codex exec へ渡した引数に high が無い: {calls[0]!r}"
+    assert env["usage"]["depth_profile"] == "deep"
+    assert env["usage"]["reasoning"] == "high"
+    assert env["usage"]["reasoning_base"] == "low"
+
+
+def test_standard_depth_profile_omits_reasoning_base_when_unchanged(tmp_path, monkeypatch):
+    """標準プロファイルは基準値のまま上書きしない＝`reasoning_base` は冗長なため省略する。"""
+    steps = [{"thread_id": "SID-STD", "agent_messages": ["確認した結果、影響はありません。"],
+              "usage": _usage(30, 2, 13, 3)}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_delta_standard")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="delta-standard", conversation_id=704, scope_meta={"depth_profile": "standard"})
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["usage"]["depth_profile"] == "standard"
+    assert env["usage"]["reasoning"] == "low"
+    assert "reasoning_base" not in env["usage"]
 
 
 # ===== (c) resume 失敗→フォールバック新規セッション→ prev があっても差分にしない =====

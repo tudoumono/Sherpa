@@ -321,10 +321,14 @@ def usage_stats(days: int = 30) -> dict:
         # S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: チャット以外の LLM 呼び出し（intent 分類・
         # グラフ抽出・概念候補提案・埋め込み・admin グラフ質問・VLM）を kind 別に集計。usage_events は
         # kind='chat' を含まない（chat は token_model_rows 由来で別途合成する・二重計上なし）。
+        # STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: elapsed_ms は計測スコープ外の行（NULL）を
+        # 自然に除いて集計する（SUM/AVG は NULL を無視・COUNT(列) は非 NULL 行数＝`elapsed_n`）。
         usage_event_rows = c.execute(
             "SELECT kind, provider, model, SUM(calls) AS calls, "
             "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
-            "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output "
+            "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
+            "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
+            "  COUNT(elapsed_ms) AS elapsed_n "
             "FROM usage_events WHERE ts >= %s AND ts < %s "
             "GROUP BY kind, provider, model ORDER BY kind, input DESC NULLS LAST",
             (start_ts, end_exclusive_ts),
@@ -419,9 +423,12 @@ def usage_stats(days: int = 30) -> dict:
     # S1: 用途別（kind）内訳。chat 行は token_by_model（messages.answer->'usage' 由来）から合成し、
     # usage_events 由来の行（intent/extract/propose/embed/graph_ask/vlm）と結合する。usage_events 側は
     # 全 NULL 合計（＝報告不能マーカーのみのグループ）をそのまま None として保持する（0 に丸めない）。
+    # STAT-3 S2: chat 行（messages.answer->'usage' 由来）は elapsed_ms を持たない（別契約・T1の
+    # 対象外）＝elapsed_n=0・total/avg は None のまま（「計測なし」と「計測して0だった」を区別）。
     token_by_kind = [{"kind": "chat", "provider": m["provider"], "model": m["model"], "calls": m["turns"],
                       "input": m["input"], "cached_input": m["cached_input"], "output": m["output"],
-                      "reasoning_output": m["reasoning_output"]}
+                      "reasoning_output": m["reasoning_output"],
+                      "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
                      for m in token_by_model]
     token_by_kind += [{"kind": r["kind"], "provider": r["provider"] or "unknown", "model": r["model"] or "",
                        "calls": int(r["calls"] or 0),
@@ -429,7 +436,12 @@ def usage_stats(days: int = 30) -> dict:
                        "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
                        "output": int(r["output"]) if r["output"] is not None else None,
                        "reasoning_output": (int(r["reasoning_output"]) if r["reasoning_output"] is not None
-                                            else None)}
+                                            else None),
+                       "elapsed_ms_total": (int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None
+                                            else None),
+                       "elapsed_ms_avg": (float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None
+                                          else None),
+                       "elapsed_n": int(r["elapsed_n"] or 0)}
                       for r in usage_event_rows]
     tokens = {
         "totals": {

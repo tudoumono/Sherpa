@@ -172,3 +172,43 @@ def _cleanup_test_worlds():
         import warnings
 
         warnings.warn(f"test world cleanup failed for {world_ids}: {e}", stacklevel=2)
+
+
+@pytest.fixture
+def upstream_only_registry(monkeypatch):
+    """`registry._ANALYZERS` を上流の固定既定リスト（`_UPSTREAM_ANALYZERS`）だけに据える
+    （開発ハーネス S4・拡張の契約・敵対 RV 是正・docs/21-拡張の契約.md）。tests/unit・tests/contract
+    の両方から使える最上位 conftest に置く（`test_mirror_contract.py` 等 tests/contract 側のテストも
+    実 fixture コーパス＝`.md`/`.cbl` 等の分類固定値を前提にするため）。
+
+    上流の単体テストは「上流の構成」を検証するもの——フォークが正規の拡張アナライザ
+    （`<prefix>_*.py`）を `sherpa/ingest/analyzers/` 配下に登録しても（`discover_extension_
+    analyzers()` が名前順で `_ANALYZERS` の末尾に足す）、上流構成の固定値を前提にしたテストが
+    赤にならないよう、明示的に opt-in するテストモジュールへ適用する（module-level
+    `pytestmark = [pytest.mark.usefixtures("upstream_only_registry")]`、または個別テストへの
+    `@pytest.mark.usefixtures("upstream_only_registry")`）。
+
+    `registered_extensions()`/`known_analyzers()`/`candidates()`/`resolve()`/`resolve_lazy()`/
+    `config_signature()`（ひいては `corpus_docs.classify_document`・`world_graph.build_world`
+    経由の doctype/branch/グラフ判定全般）はいずれも `_ANALYZERS` を都度参照する実装（キャッシュ
+    なし）のため、これらは `_ANALYZERS` の差し替えだけで追随する。**ただし `sherpa.layer.CODE_EXT`
+    は例外**（`from .doc_kinds import CODE_EXT` でモジュール import 時に1回だけ束縛される
+    「実質キャッシュ」・`doc_kinds.CODE_EXT` 自体は `__getattr__` 経由の都度計算だが、`layer.py` 側の
+    名前は import 時の値のまま固定される）——`_ANALYZERS` の差し替えだけでは `layer.layer_of`/
+    `in_layer` の判定に反映されないため、本 fixture で明示的に上書きし直す。他の同型キャッシュ
+    （`grep_tool._TEXT_EXT`・`scope._CONTENT_EXT`・`agentic_search._READABLE_EXT` 等）は上流拡張子の
+    **上位互換の和集合**（`text_kind`/固定リストとの OR）を作るだけの事前フィルタで、最終判定は
+    `classify_document`（ライブ）に委ねているため、フォークの拡張子が混ざっていても実害のある
+    テスト失敗は今のところ確認されていない——新たに問題になるテストが出てきたら、同じ要領でこの
+    フィクスチャに追加する。
+
+    フォークの拡張が実際に読み込まれることを検証するテスト（`tests/unit/test_analyzer_
+    extensions.py`・`tests/unit/analyzers/test_registry.py` の「上流順＋拡張の名前順」と
+    「サンプル拡張が載る」）はこの fixture を使わない——実登録簿（`discover_extension_
+    analyzers()` が実際に見つけたもの込み）を見る必要があるため。
+    """
+    from sherpa import layer as layer_mod
+    from sherpa.ingest.analyzers import registry
+    monkeypatch.setattr(registry, "_ANALYZERS", registry._UPSTREAM_ANALYZERS)
+    upstream_ext = frozenset().union(*(a.extensions for a in registry._UPSTREAM_ANALYZERS))
+    monkeypatch.setattr(layer_mod, "CODE_EXT", upstream_ext)

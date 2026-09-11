@@ -403,11 +403,6 @@ def answer_observations(observation_set: AIObservationSet) -> list[AIObservation
     ]
 
 
-def searchable_observations(observation_set: AIObservationSet) -> list[AIObservation]:
-    """検索用の別観測artifactへ搬送する観測を、回答採否とは独立して返す。"""
-    return [item for item in observation_set.observations if item.searchable]
-
-
 def to_json_str(observation_set: AIObservationSet) -> str:
     errors = validation_errors(observation_set)
     if errors:

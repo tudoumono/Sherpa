@@ -176,11 +176,6 @@ def _public_grep(world, hits):
     return out
 
 
-def _name_of(cid: str) -> str:
-    """canonical_id → 表示名（`...#NAME` / DataItem は修飾名の末端）。"""
-    return cid.rsplit("#", 1)[-1].split(".")[-1]
-
-
 def resolve_anchor(session, text, world, scope_prefixes=None):
     """症状文 → グラフ上のアンカー `[(cid, name)]`（**入力に現れるノード名**で素朴に同定・範囲内）。"""
     rows = _run_capped(
@@ -195,7 +190,12 @@ def resolve_anchor(session, text, world, scope_prefixes=None):
 
 
 def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False):
-    """アンカー近傍（**厳密な影響ではない**）。各近傍への最短経路を代表に返す（範囲内・無向・全エッジ型）。
+    """アンカー近傍（**厳密な影響ではない**）。各近傍への最短経路を代表に返す（範囲内・無向探索・全エッジ型）。
+
+    探索自体は無向（`-[r]-`）のまま——辿り漏れを防ぐため向きで絞らない。ただし戻り値の `edges`
+    （代表経路の辺の列）は各辺を `{type, from, to, doc}` で返す（`from`/`to` はグラフ上の実際の
+    向き＝`startNode`/`endNode` の `name`）。呼び出し元が
+    「A が B を COPY している」を向き付きで根拠にできるようにする。
 
     rv-s3-removal: 主クエリの**後**に `check_schema_era` を呼ぶ（旧世代の実データがある world は
     `GraphSchemaEraError` で fail-loud・`world_neo4j` 参照）。`lens="troubleshoot"`——直接 dispatch
@@ -226,7 +226,7 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
         "  coalesce(nb.extraction_method,'static') AS em, "
         "  coalesce(nb.status,'active') AS status, "
         "  [n IN nodes(path) | n.name] AS path_names, "
-        "  [e IN relationships(path) | {type:type(e), doc:e.doc}] AS edges, "
+        "  [e IN relationships(path) | {type:type(e), from:startNode(e).name, to:endNode(e).name, doc:e.doc}] AS edges, "
         "  length(path) AS dist"
     ) % {"d": int(depth)}
     out = []

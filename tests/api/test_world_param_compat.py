@@ -84,7 +84,7 @@ def test_chat_body_ignores_legacy_version_uses_default(client, monkeypatch):
     # /chat は sherpa/routers/chat.py（フェーズ3スライス7）へ移動済み＝ハンドラは router 束縛の
     # handle_message を参照する（monkeypatch.setattr(api, ...) はもう届かない）。
     monkeypatch.setattr(chat_routes, "handle_message", _fake_handle)
-    r = client.post("/chat", json={"message": "hello", "version": "v9"})
+    r = client.post("/chat", json={"message": "hello", "version": "v9", "stream_id": "compat-00870"})
     assert r.status_code == 200, r.text
     assert seen["world"] == "v1"             # version は body の未宣言フィールドとして無視される
 
@@ -98,7 +98,7 @@ def test_chat_body_world_param_still_works(client, monkeypatch):
         return {"conversation_id": 1, "message": {"answer": {"lens": "chat"}}}
 
     monkeypatch.setattr(chat_routes, "handle_message", _fake_handle)
-    r = client.post("/chat", json={"message": "hello", "world": "wA", "version": "wB"})
+    r = client.post("/chat", json={"message": "hello", "world": "wA", "version": "wB", "stream_id": "compat-01010"})
     assert r.status_code == 200, r.text
     assert seen["world"] == "wA"             # world が使われ version は無視される
 

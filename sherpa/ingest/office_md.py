@@ -28,6 +28,7 @@ from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
 from .. import json_io
+from . import text_kind
 
 # LOG-2（2026-09-03）: MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
 # （`sherpa/log_setup.py` の登録表参照・worker.py と合流させ1系統にする）。
@@ -520,12 +521,30 @@ def human_md_sig_drift(wd, derived) -> bool:
     for rp, rel in si.safe_files(wd):
         if rp.suffix.lower() not in (".docx", ".xlsx"):
             continue
+        if _is_sensitive_original(rp, rp.suffix.lower()):
+            # 秘匿名は `{rel}.derived.json` マニフェストを一切持たない契約（`_is_sensitive_original`
+            # 参照）——ここで除外しないと `recorded` が常に None のため drift が恒常 True になり、
+            # 生成物を持たない rel の再構築が毎回反復する（台帳 #85〜#88）。
+            continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         versions = manifest.get("asset_versions") if isinstance(manifest, dict) else None
         recorded = versions.get("human_md") if isinstance(versions, dict) else None
         if recorded != current:
             return True
     return False
+
+
+def _is_sensitive_original(rp: Path, ext: str) -> bool:
+    """秘匿名（`text_kind.is_sensitive`）の原本かどうかを判定する唯一の入口。
+
+    変換ループ（`_build_derived_into_staging`）・欠落検知（`rag_sidecars_missing`）・軽量再生成
+    3本（`refresh_human_md`/`refresh_document_ir`/`refresh_evidence_ir`）は**全て**この関数経由で
+    同じ判定を使う——判定が分散すると、どこか1箇所だけ判定漏れが起きた時に秘匿本文が派生ツリーへ
+    平文で書き出される。秘匿名の原本は派生 MD/IR/Evidence/RAG を一切持たない
+    契約（`corpus_docs.classify_document` の秘匿名無条件対象外と同型）であり、派生マニフェスト
+    (`{rel}.derived.json`) も持たないため `rag_sidecars_missing` の欠落判定からも除外する。
+    """
+    return text_kind.is_sensitive(rp.name, ext)
 
 
 def refresh_human_md(wd, derived) -> dict:
@@ -577,6 +596,10 @@ def refresh_human_md(wd, derived) -> dict:
     for rp, rel in si.safe_files(wd):
         ext = rp.suffix.lower()
         if ext not in (".docx", ".xlsx"):
+            continue
+        if _is_sensitive_original(rp, ext):
+            # 秘匿名は human_md を一切持たない契約（`_is_sensitive_original` 参照）。除外しないと
+            # 秘匿本文が IR 経由で `{rel}.md` へ平文で書き出されうる。
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         versions = manifest.get("asset_versions") if isinstance(manifest, dict) else None
@@ -1583,11 +1606,13 @@ def _build_derived_into_staging(
     参照）。失敗（notice へ縮退したもの）はキャッシュ対象外——次回 sync が必ず再試行する現行契約を
     保つ。
 
-    返値 `{converted, failed, unsupported, by_ext, legacy_conversion_failures, document_ir_generated,
+    返値 `{converted, failed, unsupported, by_ext, legacy_converted, legacy_conversion_failures, document_ir_generated,
     document_ir_failed, document_ir_failures, evidence_ir_generated, evidence_ir_failed,
     evidence_ir_failures, rag_generated, rag_failed, rag_failures, error?}`
     （status 表示用）。ソース（wd）には一切書かない。
-    `failed`＝変換失敗（壊れ等）、`unsupported`＝PDF/旧バイナリ（MVP 未対応）。`legacy_conversion_failures`
+    `failed`＝変換失敗（壊れ等）、`unsupported`＝PDF/旧バイナリ（MVP 未対応）。`legacy_converted`＝
+    旧形式（.doc/.xls/.ppt）の前段変換（LibreOffice 等）自体が成功した件数（後続の MD 化成否とは
+    独立・失敗数は `len(legacy_conversion_failures)`）。`legacy_conversion_failures`
     （`[{"doc": rel, "reason": "legacy_conversion_failed"}]`）＝`failed` のうち旧形式（.doc/.xls/.ppt）の
     前段変換自体が失敗した rel（`document_ir_failures` 等と異なり、原因コードは常に固定文字列——
     前段変換の失敗理由そのものは呼び出し元に返らないため）。**例外は投げない**（best-effort・fail-safe）:
@@ -1614,7 +1639,7 @@ def _build_derived_into_staging(
     # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（RV Low #5: レポート契約の一貫性）。
     rep = {"converted": 0, "published_notice_count": 0, "failed": 0, "unsupported": 0,
            "unhandled_failed": 0, "unhandled_failures": [], "by_ext": {},
-           "legacy_conversion_failures": [], "conversion_failures": [],
+           "legacy_converted": 0, "legacy_conversion_failures": [], "conversion_failures": [],
            "partial_extraction_suspected": [],
            "document_ir_generated": 0, "document_ir_failed": 0, "document_ir_failures": [],
            "evidence_ir_generated": 0, "evidence_ir_failed": 0, "evidence_ir_failures": [],
@@ -1656,6 +1681,7 @@ def _build_derived_into_staging(
     from .arms import legacy_convert
     from .arms import ooxml_arm
     converted = published_notice_count = failed = unsupported = unhandled_failed = 0
+    legacy_converted = 0   # STAT-3 S5: 旧形式（.doc/.xls/.ppt）の前段変換（LibreOffice 等）成功数
     unhandled_failures: list[dict] = []
     legacy_conversion_failures: list[dict] = []
     conversion_failures: list[dict] = []
@@ -1920,6 +1946,12 @@ def _build_derived_into_staging(
         ext = rp.suffix.lower()
         if ext not in candidate:
             continue
+        if _is_sensitive_original(rp, ext):
+            # 秘匿名: `corpus_docs.classify_document` は秘匿名を無条件で対象外に
+            # 倒すが、ここ（変換ループ）は拡張子だけの `candidate` 集合で候補を引くため別途塞ぐ
+            # （`ingest.world_graph.build_world` の Pass1 と同型の理由・派生 MD を一切作らない）。
+            _log.warning("MD化をスキップします（秘匿名のため対象外・ext=%s）", ext)
+            continue
         by[ext] += 1
         conv_cache_seen_rels.add(rel)        # 剪定用「今回の原本一覧」（成否問わず候補に入った rel すべて）
         # RV High #1（belt-and-braces）: `accepts()`/`convert()` は各アーム実装（PDF/vision の
@@ -2068,6 +2100,7 @@ def _build_derived_into_staging(
                     continue
                 conv_path, extra_notes = materialized        # 以降は変換済み OOXML を①アームへ渡す
                 legacy_conversion = legacy_provenance.build(rp, conv_path, extra_notes)
+                legacy_converted += 1   # 前段変換（旧→新）自体は成功（後続の MD 化成否とは独立に数える）
                 # 非圧縮サイズガード（MEM-2）: 旧形式変換後の materialized OOXML にも同じ上限を適用
                 # する（原本 .doc/.xls/.ppt の入口サイズ判定は上の `_office_size_exceeded` が既に
                 # 通した後・小さい旧形式が展開後に巨大な OOXML へ変換されるケースへの備え）。
@@ -2289,6 +2322,7 @@ def _build_derived_into_staging(
     rep.update(converted=converted, published_notice_count=published_notice_count,
                failed=failed, unsupported=unsupported, unhandled_failed=unhandled_failed,
                unhandled_failures=unhandled_failures, by_ext=dict(by),
+               legacy_converted=legacy_converted,
                legacy_conversion_failures=legacy_conversion_failures,
                conversion_failures=conversion_failures,
                partial_extraction_suspected=partial_extraction_suspected,
@@ -2349,6 +2383,11 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     for rp, rel in si.safe_files(wd):
         ext = rp.suffix.lower()
         if ext not in ooxml_arm._IR_EXTS:
+            continue
+        if _is_sensitive_original(rp, ext):
+            # 秘匿名は document_ir を一切持たない契約（`_is_sensitive_original` 参照）。MD 自体が
+            # 無い時点で下の `md_path.is_file()` ガードにも自然に落ちるが、名前変更などで stale な
+            # 旧 `.md` が残っていた場合の再生成を確実に塞ぐため明示的に除外する。
             continue
         md_path = dr / (rel + ".md")
         if not md_path.is_file():                            # MD 自体が無い（未対応/未変換）は対象外
@@ -2502,7 +2541,13 @@ def rag_sidecars_missing(wd, derived) -> bool:
     # 設計書/ソースコード等は最初からマニフェストを持たない対象外であり、無いことは欠落ではない）。
     manifest_candidates = OFFICE_EXT | RASTER_EVIDENCE_EXT | convertible_exts()
     for rp, rel in si.safe_files(wd):
-        if rp.suffix.lower() not in manifest_candidates:
+        ext = rp.suffix.lower()
+        if ext not in manifest_candidates:
+            continue
+        if _is_sensitive_original(rp, ext):
+            # 秘匿名は変換ループ（`_build_derived_into_staging`）が最初から MD/派生を作らず
+            # マニフェストも書かない——「欠落」ではなく「対象外」（`_is_sensitive_original` 参照）。
+            # ここを塞がないと毎 sync で欠落判定→全再構築ループが無限に続く。
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         if (not isinstance(manifest, dict)
@@ -2591,6 +2636,11 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
         if rp.suffix.lower() not in EVIDENCE_EXT:
             continue
         ext = rp.suffix.lower()
+        if _is_sensitive_original(rp, ext):
+            # 秘匿名は evidence_ir/rag を一切持たない契約（`_is_sensitive_original` 参照）。PDF は
+            # image-only でも `.md` 欠落だけでは対象外にならない経路があるため、ここで明示的に
+            # 塞がないと秘匿本文が `.evidence.json`/`.rag.md` へ平文で書き出されうる。
+            continue
         md_path = dr / (rel + ".md")
         meta = json_io.read_json(dr / (rel + ".md.meta.json"), default=None)
         source_failure_notice = _is_source_failure_notice(meta)
@@ -2774,6 +2824,11 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
         if source_path is None:
             failed += 1
             failures.append({"doc": rel, "reason": "source_missing"})
+            continue
+        if _is_sensitive_original(source_path, source_path.suffix.lower()):
+            # 秘匿名は rag を一切持たない契約（`_is_sensitive_original` 参照）——`seen` へ加えない
+            # ため、更新前に生成済みの `credentials.xlsx.evidence.json` から `.rag.md`/chunks を
+            # 再生成せず、下の cleanup ループで既存の生成物があれば削除される（台帳 #85〜#88）。
             continue
         seen.add(rel)
         rel_ok = True

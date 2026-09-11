@@ -335,8 +335,8 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
         # 管理者のカタログ設定に不整合が生じた直後の一時的な値でありうる。
         # `CodexProvider.__init__` の `InvalidModelNameError`（不正な非空モデル名）だけを狭く拾い、
         # 想定外の構成でも honest failure として `_UnwiredProvider` で正直に失敗を返す
-        # （`SHERPA_CODEX_TIMEOUT` の数値パース失敗等、無関係な `ValueError` は素通りさせて
-        # 呼び出し元へ伝播させる＝誤って「モデル名が不正」と表示しない）。
+        # （無関係な `ValueError` は素通りさせて呼び出し元へ伝播させる＝誤って「モデル名が不正」と
+        # 表示しない）。
         # `reasoning` は個人設定を読まない＝env（`SHERPA_CODEX_REASONING`）/組み込み既定のみ
         # （`_facade.CodexProvider.__init__` 参照）。
         try:

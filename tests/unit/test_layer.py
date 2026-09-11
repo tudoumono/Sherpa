@@ -5,8 +5,17 @@ DB/ES/Neo4j 不要（純関数のみ）。
 """
 from __future__ import annotations
 
+import pytest
+
 from sherpa import layer as L
-from sherpa.doc_kinds import CODE_EXT
+
+# `CODE_EXT`（`registry.registered_extensions()` が単一の真実源）の固定値（`.md` は非コード等）を
+# 前提にする——フォークが正規の拡張アナライザを登録していても赤にならないよう、登録簿を上流限定に
+# 固定する（開発ハーネス S4・敵対 RV 是正・docs/21-拡張の契約.md）。`sherpa.doc_kinds` から
+# `CODE_EXT` を別途 import すると、本モジュールの import 時点（`upstream_only_registry` 適用前）の
+# 値で固定されてしまい `L.CODE_EXT`（fixture が上書きする本体側の名前）と食い違う——`L.CODE_EXT`
+# を直接参照することで、テストと本体が同じ束縛を見るようにする。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
 
 # ===== normalize_layer（既定・不正値・旧回答は both） =====
@@ -39,7 +48,7 @@ def test_normalize_layer_case_and_whitespace_insensitive():
 # ===== layer_of / in_layer（CODE_EXT が単一の真実源） =====
 
 def test_layer_of_code_extensions():
-    for ext in CODE_EXT:
+    for ext in L.CODE_EXT:
         assert L.layer_of(f"src/PROG{ext}") == "code", ext
 
 

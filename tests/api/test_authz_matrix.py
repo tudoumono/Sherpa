@@ -197,7 +197,7 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/chat/stream/stop"): "login",
     ("POST", "/chat/turns"): "login",
     ("GET", "/chat/turns/{turn_id}/stream"): "login",
-    ("GET", "/chat/turns/running"): "login",
+    ("GET", "/chat/turns/running"): "login",   # 条件付き admin（all=true）は別テストで検証
     ("POST", "/chat/turns/{turn_id}/stop"): "login",
     ("POST", "/chat/{conversation_id}/messages/{message_id}/feedback"): "login",
     ("GET", "/config"): "login",
@@ -275,7 +275,7 @@ ALLOW_PROBE_BODY: dict[tuple[str, str], dict] = {
     # 通信前 422」の安全な body を明示する（admin 認可の ALLOW 確認自体は 200/404/422 いずれでも
     # 401/403 でなければ成立するため、実通信を避けつつ認可判定だけを固定できる）。
     ("POST", "/admin/settings/openai-endpoint-test"): {"provider": "__authz_probe__"},
-    ("POST", "/chat"): {"message": "authz-probe", "conversation_id": 999999999},
+    ("POST", "/chat"): {"message": "authz-probe", "conversation_id": 999999999, "stream_id": "authzprobe0001"},
     ("POST", "/chat/turns"): {"message": "authz-probe", "conversation_id": 999999999},
 }
 
@@ -454,6 +454,21 @@ def test_ext_key_routes_reject_all_cookie_sessions():
             if got != 401:
                 mismatches.append(f"{label} {method} {path}: 期待 401 実測 {got}")
     assert not mismatches, "ext_key ゲート（X-API-Key必須）が cookie で迂回できている:\n" + "\n".join(mismatches)
+
+
+def test_chat_turns_running_all_requires_admin():
+    """条件付き認可: `GET /chat/turns/running?all=true`（全員分・uid 付き）は admin のみ（user は403）。"""
+    if not _try_init():
+        pytest.skip("infra down")
+    anon = _client()
+    user = _fresh_user("user")
+    admin = _fresh_user("admin")
+    assert anon.get("/chat/turns/running", params={"all": "true"}).status_code == 401
+    r = user.get("/chat/turns/running", params={"all": "true"})
+    assert r.status_code == 403, f"user: 期待403 実測{r.status_code}（all=true は admin 限定のはず）"
+    r = admin.get("/chat/turns/running", params={"all": "true"})
+    assert r.status_code == 200
+    assert user.get("/chat/turns/running").status_code == 200   # 本人分は user でも可
 
 
 def test_announcements_include_unpublished_requires_admin():

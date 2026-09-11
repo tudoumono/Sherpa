@@ -82,8 +82,9 @@ def test_synthesis_digest_no_truncation_notice_when_everything_fits():
 
 
 def test_synthesis_digest_includes_list_docs_and_graph_structural_evidence():
-    """list_docs 集計・graph カードは `build_evidence_digest` と同じ表現（文書パス先頭10件・
-    裏付け doc 先頭5件のまま）で全件ダイジェストにも入る——引用が無くても『該当なし』にしない。"""
+    """list_docs 集計・graph カードは `build_evidence_digest` と同じ表現で全件ダイジェストにも入る
+    ——引用が無くても『該当なし』にしない。list_docs のパスは先頭 10 件で打ち切らず予算内で全件
+    （清書が「全件パス付き列挙」を満たすため・裏付け doc 先頭 5 件は不変）。"""
     shown = [f"4期/{i}.md" for i in range(20)]
     doc = "4期/設計/請求.md"
     meta = [
@@ -97,7 +98,7 @@ def test_synthesis_digest_includes_list_docs_and_graph_structural_evidence():
     ]
     digest, ev_map = A.build_synthesis_digest([], meta)
     assert "[list_docs]" in digest and "該当 1000 件" in digest
-    assert all(p in digest for p in shown[:10])   # 既存どおり先頭10件まで
+    assert all(p in digest for p in shown)        # 20 件全部（先頭 10 件で切らない）
     assert "[graph]" in digest and "BILLINGJOB" in digest and "請求処理" in digest
     assert ev_map["ev-1"] == shown
     assert ev_map["ev-2"] == [doc]
@@ -192,24 +193,37 @@ def test_synthesis_digest_redacts_secrets_and_strips_control_chars():
 
 
 def test_synthesis_digest_default_constants_match_documented_contract():
-    """既定の `quote_cap`/`max_bytes` は仕様どおり400字／24KiB（呼び出し元が指定しない場合の値）。"""
+    """既定の `quote_cap` は400字、`max_bytes` は env `SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES`（既定 256KiB・
+    8KiB〜4MiB にクランプ）。精読の保存上限（`investigation_state`）は同じ env を同じ既定・クランプで読む。"""
+    import sherpa.investigation_state as IS
     assert A._SYNTHESIS_QUOTE_CAP == 400
-    assert A._SYNTHESIS_MAX_BYTES == 24 * 1024
+    assert A._SYNTHESIS_MAX_BYTES == IS._synthesis_budget_bytes()
+    assert A._env_int("SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES", 256 * 1024, 8 * 1024, 4 * 1024 * 1024) == A._SYNTHESIS_MAX_BYTES
 
 
 # ===== C RV是正2巡目: `gaps` 引数（調査の限界を清書入力へ続けて渡す）=====
 
-def test_synthesis_digest_gaps_appended_after_citations_and_read_evidence():
+def test_synthesis_digest_gaps_precede_read_evidence_after_citations():
+    """限界（gaps）は精読行より前（予算は末尾から切るため、長い精読本文で限界が落ちない）。"""
     cites = [{"doc_id": "4期/a.md", "span": [1, 1], "quote": "本文"}]
     meta = [{"doc_id": "4期/a.md", "span": [1, 1], "verification_method": "span_verified"}]
     digest, ev_map = A.build_synthesis_digest(
         cites, meta, read_evidence=[{"doc_id": "4期/b.md", "span": [1, 2], "text": "精読本文"}],
         gaps=["ripgrep_search『税率』: 0件"])
     lines = digest.splitlines()
-    assert lines[0].startswith("ev-1:")             # citation が先頭
-    assert lines[1].startswith("精読:")              # read_evidence が続く
-    assert lines[2] == "調査の限界: ripgrep_search『税率』: 0件"   # gaps が末尾に続く
+    assert lines[0] == "調査の限界: ripgrep_search『税率』: 0件"   # gaps が先頭（予算で最後まで残る側）
+    assert lines[1].startswith("ev-1:")             # citation
+    assert lines[2].startswith("精読:")              # read_evidence は末尾（予算で先に落ちる側）
     assert set(ev_map.keys()) == {"ev-1"}            # gaps 行は ev_map に登録されない
+
+
+def test_synthesis_digest_marks_truncated_read_evidence():
+    """C6: `read_evidence` の `text_truncated` が真なら精読行末尾に注記を付け、保存時に
+    本文の末尾が落ちた事実を清書入力自体へ明示する（黙って全件性を主張しない）。"""
+    digest, _ = A.build_synthesis_digest(
+        [], [], read_evidence=[{"doc_id": "4期/b.md", "span": [1, 2], "text": "本文",
+                               "text_truncated": True}])
+    assert "精読: 4期/b.md 行 1-2「本文」（末尾未保持）" in digest
 
 
 def test_synthesis_digest_gaps_capped_at_20_items():
@@ -217,8 +231,8 @@ def test_synthesis_digest_gaps_capped_at_20_items():
     digest, _ = A.build_synthesis_digest([], [], gaps=gaps)
     gap_lines = [ln for ln in digest.splitlines() if ln.startswith("調査の限界: ")]
     assert len(gap_lines) == A._SYNTHESIS_GAPS_MAX_ITEMS == 20
-    assert "gap-19" in digest
-    assert "gap-20" not in digest   # 20件を超えた分は渡さない（先頭優先）
+    assert "gap-24" in digest and "gap-5" in digest
+    assert "gap-4" not in digest    # 20件を超えた分は古い方から落とす（末尾優先＝後半の中断・切断を残す）
 
 
 def test_synthesis_digest_gap_capped_at_200_chars():
@@ -249,3 +263,124 @@ def test_synthesis_digest_gaps_are_redacted():
     digest, _ = A.build_synthesis_digest([], [], gaps=["config: api_key=sk-ABCDEFGHIJKLMNOP1234"])
     assert "sk-ABCDEFGHIJKLMNOP1234" not in digest
     assert "[REDACTED]" in digest
+
+
+def test_synthesis_digest_list_docs_paths_capped_by_half_budget_and_keep_count_and_condition():
+    """500 件の長いパス（連結で 24KB 超）でも一覧行は落ちない: 件数・条件・予算の半分までのパスを残し、
+    省略したパス数を明示する（全件連結で行ごと落ちて『他 1 件は省略』だけになる実害の再現）。"""
+    shown = [f"4期/設計/請求管理/帳票/請求明細_{i:03}.md" for i in range(500)]
+    meta = [{"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+             "list_meta": {"count": 500, "shown": 500, "prefix": "4期", "pattern": ""},
+             "matched_doc_ids": shown}]
+    digest, ev_map = A.build_synthesis_digest([], meta, max_bytes=24 * 1024)
+    assert "[list_docs] 該当 500 件（条件: path_prefix=4期）／列挙 500 件: " in digest
+    assert shown[0] in digest and shown[-1] not in digest
+    assert "件のパスは未提示＝この一覧は全件として書かない）" in digest
+    assert len(digest.encode("utf-8")) <= 24 * 1024
+    assert "（他 1 件は省略）" not in digest                     # 行ごと落ちていない
+    assert ev_map["ev-1"] == shown                              # 帰属用の doc 集合は全件のまま
+
+
+def test_synthesis_digest_multiple_list_docs_rows_share_path_budget_and_keep_later_evidence():
+    """一覧行が複数（path_prefix 違い）でもパス予算は全行で共有＝2 行目の件数・条件と、後続の精読・
+    調査の限界が落ちない（各行が独立に半分予算を使うと合計で予算超過し 2 行目以降が消える実害の再現）。"""
+    rows = []
+    for gen in ("4期", "5期"):
+        shown = [f"{gen}/設計/請求管理/帳票/請求明細_{i:03}.md" for i in range(500)]
+        rows.append({"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                     "list_meta": {"count": 500, "shown": 500, "prefix": gen, "pattern": ""},
+                     "matched_doc_ids": shown})
+    digest, _ = A.build_synthesis_digest(
+        [], rows, read_evidence=[{"doc_id": "4期/設計/請求.md", "span": None, "text": "請求は月次で処理する"}],
+        gaps=["6期は未確認"], max_bytes=24 * 1024)
+    assert "（条件: path_prefix=4期）／列挙 500 件: " in digest
+    assert "（条件: path_prefix=5期）／列挙 500 件" in digest
+    assert "精読: 4期/設計/請求.md" in digest and "調査の限界: 6期は未確認" in digest
+    assert "（他 " in digest and "件は省略）" not in digest.replace("件のパスは未提示＝この一覧は全件として書かない）", "")   # 行ごとの省略なし
+    assert len(digest.encode("utf-8")) <= 24 * 1024
+
+
+def test_synthesis_digest_path_budget_is_shared_fairly_across_list_rows():
+    """一覧行が 3 本（各 500 パス）のとき、先着の 1 行が予算を独占せず各行にパスが載る（公平配分）。"""
+    rows = []
+    for gen in ("4期", "5期", "6期"):
+        shown = [f"{gen}/設計/請求管理/帳票/請求明細_{i:03}.md" for i in range(500)]
+        rows.append({"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                     "list_meta": {"count": 500, "shown": 500, "prefix": gen, "pattern": ""},
+                     "matched_doc_ids": shown})
+    digest, _ = A.build_synthesis_digest([], rows, max_bytes=24 * 1024)
+    for gen in ("4期", "5期", "6期"):
+        assert f"{gen}/設計/請求管理/帳票/請求明細_000.md" in digest      # 各行に少なくとも先頭パスが載る
+        assert f"path_prefix={gen}）／列挙 500 件: " in digest
+    assert len(digest.encode("utf-8")) <= 24 * 1024
+
+
+def test_synthesis_digest_small_later_row_does_not_starve_large_earlier_row():
+    """大きい一覧行（500 パス）の後に小さい一覧行（1 パス）が来ても、合計が予算の半分に収まるなら
+    全パスが載る（等分の固定枠で先頭行の予算内パスまで落ちる回帰の再現）。"""
+    big = [f"4期/{i:03}.md" for i in range(500)]
+    rows = [{"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+             "list_meta": {"count": 500, "shown": 500, "prefix": "4期", "pattern": ""}, "matched_doc_ids": big},
+            {"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+             "list_meta": {"count": 1, "shown": 1, "prefix": "5期", "pattern": ""}, "matched_doc_ids": ["5期/a.md"]}]
+    digest, _ = A.build_synthesis_digest([], rows, max_bytes=24 * 1024)
+    assert all(pth in digest for pth in big) and "5期/a.md" in digest
+    assert "パスは省略" not in digest
+
+
+def test_gaps_survive_when_long_read_texts_exhaust_budget():
+    from sherpa import agentic_search as A
+    reads = [{"doc_id": f"d{i}.md", "span": None, "text": "い" * 2048, "locator": None} for i in range(4)]
+    digest, _ = A.build_synthesis_digest([], [], read_evidence=reads,
+                                         gaps=["ripgrep_search『特例』: 0件", "a.md: 検証で除外（x）"], max_bytes=24 * 1024)
+    assert "調査の限界: ripgrep_search『特例』: 0件" in digest and "検証で除外" in digest
+    assert "件は省略" in digest
+
+
+def test_gaps_survive_when_citations_exhaust_budget_and_latest_gaps_win():
+    cites = [{"doc_id": f"4期/{i}.md", "span": [1, 1], "quote": "x" * 400} for i in range(80)]
+    meta = [{"doc_id": f"4期/{i}.md", "span": [1, 1], "verification_method": "span_verified"} for i in range(80)]
+    old = [f"ripgrep_search『q{i}』: 0件" for i in range(25)]
+    digest, _ = A.build_synthesis_digest(cites, meta, gaps=old + ["調査を上限到達で中断（未確認の範囲あり）"], max_bytes=24 * 1024)
+    assert "上限到達で中断" in digest                   # 後半に積まれた限界が件数上限で落ちない
+    assert digest.count("調査の限界") == A._SYNTHESIS_GAPS_MAX_ITEMS
+    assert "件は省略" in digest                         # 省略されたのは引用側
+
+
+def test_committed_evidence_digest_includes_structural_facts_and_limits():
+    """クリーン再合成の根拠一覧にも、検証済みの構造的根拠（list_docs 集計）と調査の限界が入る
+    （citation だけだと再合成指示の「確認できなかった範囲」「一覧の項目」に材料が無い）。"""
+    committed = [{"doc_id": "4期/a.md", "span": [1, 1], "quote": "本文"}]
+    meta = [{"doc_id": "4期/a.md", "span": [1, 1], "verification_method": "span_verified"}]
+    structural = [{"doc_id": None, "span": None, "verification_method": "list_docs_verified",
+                   "list_meta": {"count": 3, "shown": 3, "prefix": "4期", "pattern": ""},
+                   "matched_doc_ids": ["4期/a.md", "4期/b.md", "4期/c.md"]}]
+    out = A._committed_evidence_digest(committed, meta, structural, ["ripgrep_search『q』: 0件"])
+    assert "[list_docs] 該当 3 件" in out and "調査の限界: ripgrep_search『q』: 0件" in out and "4期/a.md" in out
+    assert A._committed_evidence_digest(committed) == "- 4期/a.md（span=[1, 1]）: 本文"   # 旧形式は不変
+    assert A._committed_evidence_digest([], meta, [], ["x: 0件"]) == ""                  # 根拠が無ければ空
+
+
+def test_excluded_citations_are_folded_so_real_cutoff_limits_survive():
+    gaps = ["doc_outline『a』: 一覧が上限で打ち切り（全 500 件中の一部）"] + \
+           [f"d{i}.md: 検証で除外（span_unmatched）" for i in range(25)]
+    digest, _ = A.build_synthesis_digest([], [], gaps=gaps)
+    assert "一覧が上限で打ち切り" in digest
+    assert "検証で除外した引用 25 件" in digest and digest.count("検証で除外") == 1
+
+
+def test_committed_evidence_digest_carries_read_evidence():
+    committed = [{"doc_id": "4期/a.md", "span": [1, 1], "quote": "本文"}]
+    meta = [{"doc_id": "4期/a.md", "span": [1, 1], "verification_method": "span_verified"}]
+    reads = [{"doc_id": "4期/b.xlsx", "span": None, "text": "Sheet1!A1:B2: 特例税率0%", "locator": "Sheet1!A1:B2",
+              "text_truncated": False}]
+    out = A._committed_evidence_digest(committed, meta, [], [], reads)
+    assert "精読: 4期/b.xlsx" in out and "特例税率0%" in out
+
+
+def test_note_dropped_citations_adds_dedup_gap_lines():
+    import sherpa.investigation_state as IS
+    st = IS.InvestigationState(question="q", scope={"world": "v1"})
+    A._note_dropped_citations(st, [{"doc_id": "a.md", "reason": "doc_missing"}, {"doc_id": "a.md", "reason": "doc_missing"}])
+    assert st.gaps == ["a.md: 検証で除外（doc_missing）"]
+    A._note_dropped_citations(None, [{"doc_id": "b.md", "reason": "x"}])   # state 無しでも落ちない

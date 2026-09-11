@@ -44,7 +44,6 @@ from ui_automation.support.live_api import LiveApi
 
 
 _CHAT_PROBES = {
-    "author-duration",
     "author-trace",
     "bedrock-probe",
     "chat-error",
@@ -68,7 +67,6 @@ _CHAT_PROBES = {
     "tool-nodes",
     "trace-result-size",
     "trace-total-size",
-    "turn-duration",
     "turn-slot-release",
     "ui-trace-order",
 }
@@ -135,7 +133,6 @@ DIRECT_PROBE_VARIABLES: dict[str, frozenset[str]] = {
 }
 
 _PROBE_VARIABLES: dict[str, frozenset[str]] = {
-    "author-duration": frozenset({"SHERPA_CODEX_TIMEOUT_AUTHOR"}),
     "author-trace": frozenset({"SHERPA_CODEX_REASONING_AUTHOR", "SHERPA_MARP_BIN"}),
     "bedrock-probe": frozenset(),
     "chat-error": frozenset(
@@ -144,7 +141,6 @@ _PROBE_VARIABLES: dict[str, frozenset[str]] = {
             "SHERPA_AGENTIC_MAX_TURNS",
             "SHERPA_AGENTIC_MAX_TOOLS_PER_TURN",
             "SHERPA_SUB_PLAN_MAX_CALLS",
-            "SHERPA_CODEX_TIMEOUT",
         }
     ),
     "container-group": frozenset({"SHERPA_OCR_GID"}),
@@ -210,8 +206,7 @@ _PROBE_VARIABLES: dict[str, frozenset[str]] = {
     "trace-result-size": frozenset({"SHERPA_AGENTIC_MAX_TOOL_RESULT_BYTES"}),
     "trace-total-size": frozenset({"SHERPA_AGENTIC_MAX_TOTAL_TOOL_RESULT_BYTES"}),
     "truncated-flag": frozenset({"SHERPA_GRAPH_NODE_LIMIT", "SHERPA_NEO4J_MAX_ROWS"}),
-    "turn-duration": frozenset({"SHERPA_CODEX_TIMEOUT"}),
-    "turn-slot-release": frozenset({"SHERPA_CODEX_TIMEOUT"}),
+    "turn-slot-release": frozenset(),
     "ui-trace-order": frozenset({"SHERPA_STREAM_PACE"}),
     "upload-rejection": frozenset({"SHERPA_VLM_MAX_IMAGE_MB"}),
     "upload-result": frozenset({"SHERPA_WORKSPACE_MAX_BYTES", "SHERPA_EXT_CONVERT_MAX_BYTES"}),
@@ -481,7 +476,7 @@ def _chat_prompt(variable: str) -> str:
         # between; whole-turn duration or answer-token cadence would measure a
         # different concern and can falsely pass because of provider latency.
         return "SHERPA-LIVE-REFERENCE-314 の障害原因を関係グラフと運用手順の両方の実ツールで調べ、夜間運用時刻を答えてください。"
-    if variable in {"SHERPA_CODEX_REASONING_AUTHOR", "SHERPA_CODEX_TIMEOUT_AUTHOR", "SHERPA_MARP_BIN"}:
+    if variable in {"SHERPA_CODEX_REASONING_AUTHOR", "SHERPA_MARP_BIN"}:
         return (
             "取り込んだ資料だけを根拠に、SHERPA-LIVE-REFERENCE-314 の運用時刻を説明する"
             "短いMarkdown資料を個人ワークスペースへ実際に作成してください。"
@@ -1357,9 +1352,9 @@ def _chat_semantics(ctx, probe_id: str) -> dict:
                 "the real plan did not reach SHERPA_SUB_PLAN_MAX_STEPS; a lower count does not demonstrate the step ceiling"
             )
             observed = {**observed, "effective_step_cap": cap, "limit_reached": True}
-    if probe_id in {"provider-duration", "turn-duration"}:
-        timeout_name = "SHERPA_CODEX_TIMEOUT" if variable == "SHERPA_CODEX_TIMEOUT" else "SHERPA_LLM_TIMEOUT"
-        default_timeout = 180.0 if "CODEX" in timeout_name else 60.0
+    if probe_id == "provider-duration":
+        timeout_name = "SHERPA_LLM_TIMEOUT"
+        default_timeout = 60.0
         raw_timeout = os.environ.get(timeout_name)
         timeout_seconds = float(raw_timeout) if raw_timeout not in {None, ""} else default_timeout
         timeout_ms = int(timeout_seconds * 1000)
@@ -1370,16 +1365,6 @@ def _chat_semantics(ctx, probe_id: str) -> dict:
                 f"the real provider finished in {observed['elapsed_ms']}ms without reaching "
                 f"the configured {timeout_ms}ms {timeout_name} boundary; an ordinary success "
                 "cannot demonstrate timeout enforcement"
-            )
-    if probe_id == "author-duration":
-        raw_timeout = os.environ.get("SHERPA_CODEX_TIMEOUT_AUTHOR")
-        timeout_ms = int((float(raw_timeout) if raw_timeout not in {None, ""} else 600.0) * 1000)
-        assert observed["structured_error"] or observed["elapsed_ms"] <= timeout_ms + 15000
-        observed = {**observed, "effective_timeout_ms": timeout_ms}
-        if not observed["structured_error"]:
-            raise AssertionError(
-                "the real author turn completed without reaching SHERPA_CODEX_TIMEOUT_AUTHOR; "
-                "ordinary duration below the budget does not demonstrate timeout enforcement"
             )
     if probe_id == "sse-timing":
         pace = float(os.environ.get("SHERPA_STREAM_PACE", "0.35") or 0)
@@ -1469,13 +1454,9 @@ def _chat_semantics(ctx, probe_id: str) -> dict:
         )
     if probe_id == "turn-slot-release":
         assert observed["turn_slot_released"] is True
-        if variable == "SHERPA_CODEX_TIMEOUT" and not observed["structured_error"]:
-            raise AssertionError("the slot was released after a normal turn, but the configured Codex timeout was not triggered")
     if probe_id == "chat-error":
         timeout_variable = variable in {
             "SHERPA_LLM_TIMEOUT",
-            "SHERPA_CODEX_TIMEOUT",
-            "SHERPA_CODEX_TIMEOUT_AUTHOR",
         }
         if timeout_variable:
             assert observed["structured_error"], (

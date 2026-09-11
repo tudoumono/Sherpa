@@ -175,6 +175,9 @@ def test_embed_records_and_gemini_null_marker(monkeypatch):
     assert c["input_tokens"] == 50 * 3 + 50 * 3 + 20 * 3
     assert c["output_tokens"] == 0
     assert c["world"] == "v1" and c["user_id"] is None
+    # STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: embed() は acc_begin/acc_end で囲まれているため
+    # 呼び出し元の変更なしに elapsed_ms（ミリ秒）が自動で乗る。
+    assert isinstance(c["elapsed_ms"], int) and c["elapsed_ms"] >= 0
     calls.clear()
 
     # gemini: batchEmbedContents に usage フィールドが無い＝報告不能マーカー（全 None）。

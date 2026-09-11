@@ -16,6 +16,10 @@
 - test_settings_keys_documented: `PUT /settings`（個人設定・`SettingsReq`）／`PUT /admin/settings`
   （全体設定・`SystemSettingsReq`）のフィールド名が `docs/manual/25-設定リファレンス.md` に
   バックティック表記（`` `key_name` ``）で記載されているか検査する（MANUAL-2・一方向のみ）。
+- test_harness_make_targets_and_workflows_exist: `docs/20-開発ハーネス.md`・`tests/README.md`・
+  `.claude/skills/rv/SKILL.md` が本文中に書く `make <target>` が `Makefile` の実在ターゲットか、
+  本文中の `*.yml` 言及が `.github/workflows/` の実在ファイルかを検査する（開発ハーネス S3・
+  一方向のみ）。
 """
 from __future__ import annotations
 
@@ -216,3 +220,51 @@ def test_settings_keys_documented():
         "未文書化の設定キー（docs/manual/25-設定リファレンス.md にバックティック表記で追記が必要）:\n"
         + "\n".join(missing)
     )
+
+
+# 開発ハーネス S3: docs/20・tests/README・rv SKILL が言及する `make <target>` と workflow ファイル名
+# が実在することの検査（架空のターゲット・存在しない workflow への言及が docs に残ることを防ぐ）。
+_HARNESS_DOC_TARGETS = (
+    DOCS / "20-開発ハーネス.md",
+    ROOT / "tests" / "README.md",
+    ROOT / ".claude" / "skills" / "rv" / "SKILL.md",
+)
+_MAKE_TARGET_MENTION_RE = re.compile(r"\bmake ([a-zA-Z0-9_-]+)")
+_YML_MENTION_RE = re.compile(r"\b([a-zA-Z0-9_-]+\.yml)\b")
+
+
+def _makefile_targets() -> set[str]:
+    text = (ROOT / "Makefile").read_text(encoding="utf-8")
+    targets: set[str] = set()
+    for line in text.splitlines():
+        m = re.match(r"^([a-zA-Z0-9_-]+):", line)
+        if m:
+            targets.add(m.group(1))
+    return targets
+
+
+def test_harness_make_targets_and_workflows_exist():
+    """docs/20・tests/README・rv SKILL が言及する `make <target>` と `*.yml` が実在すること。"""
+    makefile_targets = _makefile_targets()
+    workflow_dir = ROOT / ".github" / "workflows"
+
+    missing_targets: list[str] = []
+    missing_workflows: list[str] = []
+    for path in _HARNESS_DOC_TARGETS:
+        if not path.exists():
+            continue
+        rel = path.relative_to(ROOT)
+        text = path.read_text(encoding="utf-8")
+        for m in _MAKE_TARGET_MENTION_RE.finditer(text):
+            target = m.group(1)
+            if target.endswith("-"):
+                continue   # 「make test-*」のような prose 中のワイルドカード表記は対象外
+            if target not in makefile_targets:
+                missing_targets.append(f"{rel}: make {target}")
+        for m in _YML_MENTION_RE.finditer(text):
+            name = m.group(1)
+            if not (workflow_dir / name).exists():
+                missing_workflows.append(f"{rel}: {name}")
+
+    assert not missing_targets, "存在しない make ターゲットへの言及:\n" + "\n".join(missing_targets)
+    assert not missing_workflows, "存在しない workflow ファイルへの言及:\n" + "\n".join(missing_workflows)

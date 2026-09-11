@@ -133,6 +133,50 @@ def test_record_gating_and_safety(monkeypatch):
     metering.record("intent", "openai", "gpt-4o-mini", {"input_tokens": 1}, calls=1)   # raise しないこと
 
 
+# ---- STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: elapsed_ms ----
+
+def test_record_passes_elapsed_ms_from_acc_scope(monkeypatch):
+    """`acc_begin()`/`acc_end()` のスコープがあれば `acc_elapsed()`（秒）由来の `elapsed_ms`
+    （ミリ秒に丸め）が `add_usage_event` まで渡ること（呼び出し元は変更不要）。"""
+    from sherpa.store import usage_events as ue
+
+    monkeypatch.setattr(metering, "record", _real_record)
+    calls = []
+    monkeypatch.setattr(ue, "add_usage_event", lambda **kwargs: calls.append(kwargs))
+
+    metering.acc_begin()
+    metering.acc_add({"input_tokens": 10})
+    tokens, n = metering.acc_end()
+    metering.record("embed", "openai", "m", tokens, calls=n)
+    assert len(calls) == 1
+    assert isinstance(calls[0]["elapsed_ms"], int) and calls[0]["elapsed_ms"] >= 0
+
+
+def test_record_elapsed_ms_none_without_scope_or_explicit_value(monkeypatch):
+    """acc スコープが無く、明示的な `elapsed_ms` も渡さない呼び出し（例: kind="graph_ask"）は
+    `elapsed_ms=None`（NULL）のまま——所要時間が取れない、という事実を正直に伝える。"""
+    from sherpa.store import usage_events as ue
+
+    monkeypatch.setattr(metering, "record", _real_record)
+    calls = []
+    monkeypatch.setattr(ue, "add_usage_event", lambda **kwargs: calls.append(kwargs))
+
+    metering.record("graph_ask", "bedrock", "claude", {"input_tokens": 1}, calls=1)
+    assert calls[0]["elapsed_ms"] is None
+
+
+def test_record_explicit_elapsed_ms_overrides_acc_scope(monkeypatch):
+    """明示的な `elapsed_ms=` 引数（新設）は `acc_elapsed()` 由来の値より優先される。"""
+    from sherpa.store import usage_events as ue
+
+    monkeypatch.setattr(metering, "record", _real_record)
+    calls = []
+    monkeypatch.setattr(ue, "add_usage_event", lambda **kwargs: calls.append(kwargs))
+
+    metering.record("research", "openai", "m", {"input_tokens": 1}, calls=1, elapsed_ms=1234.6)
+    assert calls[0]["elapsed_ms"] == 1235   # round() で丸める
+
+
 def test_record_clamps_oversized_string_fields(monkeypatch):
     """secRV MED-4是正: 巨大 ollama_model（数MB級の自由文字列。`routers/system.py::settings_put` の
     形式検証や `subagent_profiles.resolve_sub` の防御的検証を経ずに旧データ等から届いた想定）を
@@ -282,6 +326,25 @@ def test_record_usage_log_never_raises_even_if_logger_broken(monkeypatch, caplog
     monkeypatch.setattr(metering._usage_log, "info", boom)
     metering.record("intent", "openai", "m", {"input_tokens": 1}, calls=1)   # raise しないこと
     assert len(calls) == 1   # DB 記録自体は行われている
+
+
+# ---- STAT-3 S1（利用統計の拡充）: log_usage_line の depth=/reasoning= 欄 ----
+
+def test_log_usage_line_includes_depth_and_reasoning_when_given(caplog):
+    with caplog.at_level("INFO", logger="sherpa.usage"):
+        metering.log_usage_line("chat", "codex", "gpt-5", {"input_tokens": 1}, 1, None, None,
+                                depth="deep", reasoning="high")
+    msg = caplog.records[0].message
+    assert "depth=deep" in msg and "reasoning=high" in msg
+
+
+def test_log_usage_line_omits_depth_and_reasoning_when_absent(caplog):
+    """値が無ければ欄ごと省略（`elapsed`/`world` と同じ流儀）。"""
+    with caplog.at_level("INFO", logger="sherpa.usage"):
+        metering.log_usage_line("embed", "openai", "text-embedding-3-small",
+                                {"input_tokens": 1}, 1, None, None)
+    msg = caplog.records[0].message
+    assert "depth=" not in msg and "reasoning=" not in msg
 
 
 def test_acc_elapsed_is_none_without_scope():

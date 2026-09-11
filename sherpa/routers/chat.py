@@ -44,6 +44,9 @@ _log = logging.getLogger("sherpa")
 chat_router = APIRouter()
 
 
+_STREAM_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$"
+
+
 class ChatReq(BaseModel):
     message: str
     world: str | None = _WorldField
@@ -83,6 +86,13 @@ class ChatReq(BaseModel):
         if v is not None:
             tools_pref_mod.normalize_tools_pref(v)
         return v
+
+
+class ChatSyncReq(ChatReq):
+    """同期 `POST /chat` の本文。途中停止用の相関ID（`/chat/stream/stop` で使う）が必須——実行を
+    経過時間で打ち切らないため、停止導線の無い実行は受け付けない（Codex が固まっても止められない
+    実行を作らない）。背景ターン `POST /chat/turns` は `turn_id` の停止導線を持つため `ChatReq` のまま。"""
+    stream_id: str = Field(pattern=_STREAM_ID_PATTERN)
 
 
 def _knowledge_for_settings(settings: dict, requested: bool) -> bool:
@@ -223,7 +233,7 @@ def chat_tools_availability(request: Request):
 
 
 @chat_router.post("/chat", tags=["チャット"])
-def chat(req: ChatReq, request: Request):
+def chat(req: ChatSyncReq, request: Request):
     """同期チャット。knowledge=true でナレッジグラフ／検索を使う回答、false は素の対話。"""
     u = _current_user(request)
     _check_chat_write(u, req.conversation_id)
@@ -236,24 +246,36 @@ def chat(req: ChatReq, request: Request):
     # いずれも admin 更新を挟んで食い違い得る。
     knowledge, provider, settings, sys_settings, tools_availability = _prepare_agentic_snapshot(
         uid, req.knowledge, req.web_search)
-    if not knowledge:
-        return handle_message(None, req.message, w,
-                              conversation_id=req.conversation_id, knowledge=False,
-                              user_id=uid, personal=req.personal,
-                              users_dir=str(_USERS_DIR), web_search=req.web_search,
-                              tools_availability=tools_availability,
-                              provider=provider, settings=settings, sys_settings=sys_settings)
-    validated_scope(w, req.scope_paths)            # ナレッジ参照は実在 world のみ＋scope 検証（正規化は handle_message 側）
-    _validate_tools_availability(req.tools, availability=tools_availability)   # SC-6e: 明示ON指定の不達ツールは422（ツール名つき）
-    with neo4j_session() as s:
-        return handle_message(s, req.message, w,
-                              conversation_id=req.conversation_id,
-                              scope_paths=req.scope_paths, layer=req.layer, lens=req.lens, knowledge=True,
-                              user_id=uid, personal=req.personal,
-                              users_dir=str(_USERS_DIR), web_search=req.web_search,
-                              depth_profile=req.depth_profile, tools=req.tools,
-                              tools_availability=tools_availability,
-                              provider=provider, settings=settings, sys_settings=sys_settings)
+    if knowledge:
+        validated_scope(w, req.scope_paths)            # ナレッジ参照は実在 world のみ＋scope 検証（正規化は handle_message 側）
+        _validate_tools_availability(req.tools, availability=tools_availability)   # SC-6e: 明示ON指定の不達ツールは422（ツール名つき）
+    stop_event = threading.Event()
+    with _STREAM_STOP_LOCK:
+        if req.stream_id in _STREAM_STOP_EVENTS:
+            raise HTTPException(409, "この stream_id は既に使用中です")
+        _STREAM_STOP_EVENTS[req.stream_id] = (uid, stop_event)
+    try:
+        if not knowledge:
+            return handle_message(None, req.message, w,
+                                  conversation_id=req.conversation_id, knowledge=False,
+                                  user_id=uid, personal=req.personal,
+                                  users_dir=str(_USERS_DIR), web_search=req.web_search,
+                                  tools_availability=tools_availability,
+                                  provider=provider, settings=settings, sys_settings=sys_settings,
+                                  stop_event=stop_event)
+        with neo4j_session() as s:
+            return handle_message(s, req.message, w,
+                                  conversation_id=req.conversation_id,
+                                  scope_paths=req.scope_paths, layer=req.layer, lens=req.lens, knowledge=True,
+                                  user_id=uid, personal=req.personal,
+                                  users_dir=str(_USERS_DIR), web_search=req.web_search,
+                                  depth_profile=req.depth_profile, tools=req.tools,
+                                  tools_availability=tools_availability,
+                                  provider=provider, settings=settings, sys_settings=sys_settings,
+                                  stop_event=stop_event)
+    finally:
+        with _STREAM_STOP_LOCK:
+            _STREAM_STOP_EVENTS.pop(req.stream_id, None)
 
 
 # UI フィードバック1（途中停止・2026-07-03）: EventSource.close() はクライアント側の接続を閉じるだけで、
@@ -268,7 +290,6 @@ _STREAM_STOP_EVENTS: dict[str, tuple[str, threading.Event]] = {}   # stream_id -
 # RV MEDIUM（2026-07-03再検証）: stream_id はクライアント生成の相関IDのため、UUID相当（十分なエントロピー・
 # ログ/URLに安全な文字集合）に形式を制約する（無制限文字列を受理しない）。crypto.randomUUID() 由来（36桁）と、
 # それが使えない古いブラウザ向けの chat.js フォールバック（`${Date.now()}-${random.toString(36)}`）の両方を通す。
-_STREAM_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$"
 
 
 @chat_router.get("/chat/stream", tags=["チャット"])
@@ -293,9 +314,12 @@ def chat_stream(request: Request, message: str = Query(...),
                 tools_grep: bool | None = None, tools_fulltext: bool | None = None,
                 tools_graph: bool | None = None,
                 # UI フィードバック1: 途中停止用の相関ID（クライアント生成・UUID相当に形式制約＝RV MEDIUM）
-                stream_id: str | None = Query(None, pattern=_STREAM_ID_PATTERN)):
+                stream_id: str = Query(..., pattern=_STREAM_ID_PATTERN)):
     """チャットの SSE ストリーミング版（`/chat` と同じ意味論・逐次イベントで返す）。"""
     u = _current_user(request)
+    # 実行を経過時間で打ち切らない（TIMEOUT-1）ため、途中停止の導線（`/chat/stream/stop`）を
+    # 持たないストリームは受け付けない——stream_id 無しで起動した Codex は、固まっても止める手段が
+    # 無い（sync generator は次の yield まで切断に気づけない）。
     _check_chat_write(u, conversation_id)
     w = _resolve_world(world)
     uid = u["uid"]
@@ -317,17 +341,14 @@ def chat_stream(request: Request, message: str = Query(...),
     if knowledge:
         validated_scope(w, scope_paths)               # 実在 world のみ＋scope 検証（response 作成前に弾く）
         _validate_tools_availability(tools_raw, availability=tools_availability)   # SC-6e: 明示ON指定の不達ツールは422（ツール名つき）
-    stop_event = None
-    if stream_id:
-        stop_event = threading.Event()
-        with _STREAM_STOP_LOCK:
-            # RV MEDIUM（2026-07-03再検証）: 同じ stream_id が既に使用中なら後勝ちで上書きせず拒否する
-            # （上書きすると、先勝ちストリームの Event 参照が失われ、`/chat/stream/stop` から止められなく
-            # なる＝停止不能バグ）。クライアント生成の相関IDが衝突するのは通常起こらないはずなので
-            # 409 は素直な異常系応答（クライアントは新しい stream_id で再試行すればよい）。
-            if stream_id in _STREAM_STOP_EVENTS:
-                raise HTTPException(409, "この stream_id は既に使用中です")
-            _STREAM_STOP_EVENTS[stream_id] = (uid, stop_event)
+    stop_event = threading.Event()
+    with _STREAM_STOP_LOCK:
+        # 同じ stream_id が既に使用中なら後勝ちで上書きせず拒否する（上書きすると先勝ちストリームの
+        # Event 参照が失われ `/chat/stream/stop` から止められなくなる）。クライアント生成の相関IDの
+        # 衝突は通常起こらないため 409 は素直な異常系応答（新しい stream_id で再試行すればよい）。
+        if stream_id in _STREAM_STOP_EVENTS:
+            raise HTTPException(409, "この stream_id は既に使用中です")
+        _STREAM_STOP_EVENTS[stream_id] = (uid, stop_event)
 
     def gen():
         try:
@@ -351,15 +372,14 @@ def chat_stream(request: Request, message: str = Query(...),
                                           provider=provider, settings=settings, sys_settings=sys_settings):
                     yield f"data: {json.dumps(evt, ensure_ascii=False, default=str)}\n\n"
         finally:
-            if stream_id:
-                with _STREAM_STOP_LOCK:
-                    # RV MEDIUM（2026-07-03再検証）: 登録されている Event が「自分がここで作った Event と
-                    # 同一オブジェクト」の場合のみ pop する（`is` で同一性判定）。上の重複拒否で通常は
-                    # あり得ないが、念のための多層防御＝万一何らかの経路で再登録が起きていても、
-                    # 無条件 pop で「他人（後発）の登録」を巻き添えに消して停止不能にする事故を防ぐ。
-                    entry = _STREAM_STOP_EVENTS.get(stream_id)
-                    if entry is not None and entry[1] is stop_event:
-                        _STREAM_STOP_EVENTS.pop(stream_id, None)
+            with _STREAM_STOP_LOCK:
+                # RV MEDIUM（2026-07-03再検証）: 登録されている Event が「自分がここで作った Event と
+                # 同一オブジェクト」の場合のみ pop する（`is` で同一性判定）。上の重複拒否で通常は
+                # あり得ないが、念のための多層防御＝万一何らかの経路で再登録が起きていても、
+                # 無条件 pop で「他人（後発）の登録」を巻き添えに消して停止不能にする事故を防ぐ。
+                entry = _STREAM_STOP_EVENTS.get(stream_id)
+                if entry is not None and entry[1] is stop_event:
+                    _STREAM_STOP_EVENTS.pop(stream_id, None)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -392,7 +412,7 @@ def chat_stream_stop(req: ChatStreamStopReq, request: Request):
 # ===== チャットターンのバックグラウンド実行（覗き窓方式・docs/proposals/2026-07-03-チャット背景実行.md 正典）=====
 # 送信＝サーバ側 background thread としてターンを起動し、HTTP 接続（SSE 購読）の有無と無関係に必ず
 # 完走・DB永続する。`/chat`・`/chat/stream`（＋ `/chat/stream/stop`）は後方互換のため残置（フロントは
-# こちらの新方式へ全面移行するが、API としての退役はしない＝挙動もテストも変更しない）。
+# こちらの新方式へ全面移行するが、API としての退役はしない。停止導線 `stream_id` の必須化を除き挙動は残置）。
 
 
 def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str,
@@ -609,22 +629,27 @@ def chat_turns_stream(turn_id: str, request: Request, cursor: int = Query(0, ge=
 
 
 @chat_router.get("/chat/turns/running", tags=["チャット"], response_model=ChatTurnsRunningResponse)
-def chat_turns_running(request: Request):
+def chat_turns_running(request: Request, all: bool = Query(False)):
     """現在ユーザーが実行中（未完了）のターン一覧。トップバーの「回答作成中」表示・会話を開いた際の
-    自動再購読の両方で使う（サーバ再起動でレジストリが空になれば自然に「実行中なし」に戻る）。"""
+    自動再購読の両方で使う（サーバ再起動でレジストリが空になれば自然に「実行中なし」に戻る）。
+    `all=true` は管理者専用（それ以外は 403）＝全員分を `uid` 付きで返す（既定は本人分のみ・`uid` は null）。実行を経過時間で打ち切らない
+    ため、固まったターンを管理者が `/chat/turns/{turn_id}/stop` で解放する導線に使う。"""
     u = _current_user(request)
-    recs = chat_turns.list_running(u["uid"])
+    if all and u.get("role") != "admin":
+        raise HTTPException(403, "管理者のみ")
+    recs = chat_turns.list_running(u["uid"], all_users=all)
     return {"turns": [{"turn_id": r.turn_id, "conversation_id": r.conversation_id,
-                       "started_at": r.started_at.isoformat()} for r in recs]}
+                       "started_at": r.started_at.isoformat(), **({"uid": r.uid} if all else {})}
+                      for r in recs]}
 
 
 @chat_router.post("/chat/turns/{turn_id}/stop", tags=["チャット"], response_model=ChatTurnStopResponse)
 def chat_turns_stop(turn_id: str, request: Request):
-    """実行中ターンを停止する（本人のターンのみ）。既存 `/chat/stream/stop` と同じ挙動（stop_event を
-    set するだけ＝assistant は保存されず、停止も clarify と同格に監査へ記録される・chat_service 側）。
-    存在しない/他人/完了済みはすべて `{"ok": false}`（存在有無を教えない）。"""
+    """実行中ターンを停止する（本人のターン・管理者は全員のターン）。既存 `/chat/stream/stop` と同じ挙動
+    （stop_event を set するだけ＝assistant は保存されず、停止も clarify と同格に監査へ記録される・
+    chat_service 側）。存在しない/他人/完了済みはすべて `{"ok": false}`（存在有無を教えない）。"""
     u = _current_user(request)
-    return {"ok": chat_turns.stop_turn(turn_id, u["uid"])}
+    return {"ok": chat_turns.stop_turn(turn_id, u["uid"], is_admin=u.get("role") == "admin")}
 
 
 # ===== 回答ごとの利用者フィードバック =====

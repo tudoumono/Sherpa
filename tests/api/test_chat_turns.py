@@ -231,9 +231,20 @@ def test_turn_stream_and_stop_reject_other_users_turn():
         r = c.get(f"/chat/turns/{rec.turn_id}/stream", params={"cursor": 0})
         assert r.status_code == 404
 
-        sr = c.post(f"/chat/turns/{rec.turn_id}/stop")
-        assert sr.json() == {"ok": False}
+        # 他人のターンの停止: 一般利用者は不可・管理者は可（実行を時間で打ち切らないため、固まった
+        # ターンを枠から解放できる主体が管理者にも要る）。compat モードの client は admin なので
+        # 一般利用者の判定は chat_turns.stop_turn を直接呼んで固定する。
+        assert chat_turns.stop_turn(rec.turn_id, "another-plain-user") is False
         assert not rec.stop_event.is_set(), "他人のターンなのに停止イベントが立ってしまった"
+        # 管理者は all=true で全員分（uid 付き）を見て turn_id を知り、停止できる。
+        lr = c.get("/chat/turns/running", params={"all": "true"}).json()["turns"]
+        assert any(t["turn_id"] == rec.turn_id and t["uid"] == "someone-else" for t in lr)
+        # 既定（本人分）では他人のターンは出ず、uid は値を持たない。
+        mine = c.get("/chat/turns/running").json()["turns"]
+        assert all(t["turn_id"] != rec.turn_id and t.get("uid") is None for t in mine)
+        sr = c.post(f"/chat/turns/{rec.turn_id}/stop")
+        assert sr.json() == {"ok": True}
+        assert rec.stop_event.is_set(), "管理者の停止が効いていない"
     finally:
         gate.set()
         _wait_turn_done(rec.turn_id)
@@ -523,57 +534,40 @@ def test_chat_turns_start_429_does_not_create_orphaned_conversation():
             _wait_turn_done(rec.turn_id)
 
 
-# ===== HIGH（Codex RV）: 固まった provider の reaper（2段階解放） =====
+# ===== TIMEOUT-1: 経過時間だけでは終了しない（旧 reaper 撤去）・停止は stop_turn 経由のみ =====
 
-def test_sweep_reaper_two_phase_stop_then_force_done_frees_slot():
-    """固まった provider（stop_event を一切見ない run_fn）は、started_at を過去に差し替えて
-    レジストリへ触れる（sweep が走る）と、まず MAX_TURN_SECONDS 超過で stop_event.set()
-    （協調停止要求・まだ未完了＝枠は埋まったまま）、さらに +FORCE_DONE_GRACE_SECONDS 超過で
-    buffer にタイムアウト error を積んで強制 mark_done（枠解放）される。解放後は同じユーザーの
-    新規ターンが上限に引っかからず通ることまで確認する。"""
+def test_no_time_based_termination_and_stop_turn_frees_slot():
+    """調査全体を経過時間だけで終了させない契約（TIMEOUT-1）——`started_at` を過去へ大きく倒して
+    （制御した時計）レジストリへ触れて（sweep が走る）も、`stop_event` は立たず `buffer.done` にも
+    ならない（旧 reaper の MAX_TURN_SECONDS／FORCE_DONE_GRACE_SECONDS は撤去済み・復活していないこと
+    のコードでの保証）。終了は利用者の明示停止（`stop_turn`）を run_fn 自身が検知して終える経路
+    だけで、枠の解放（`buffer.done`）は `_run()` の finally が呼ぶ `mark_done()` が行う。"""
     from datetime import datetime, timedelta, timezone
 
     from sherpa import chat_turns
-    gate = threading.Event()
+    stop_seen = threading.Event()
 
-    def _wedged_run(stop_event, emit):
-        gate.wait(timeout=15)   # stop_event を一切見ない＝協調停止に応じない「固まった」provider を模す
+    def _run_fn(stop_event, emit):
+        # 通常の provider と同じ流儀（stop_event を検知したら終える）。「固まった」provider
+        # （stop_event を一切見ない）は本テストの対象外＝旧 reaper 前提の別契約だった。
+        if stop_event.wait(timeout=15):
+            stop_seen.set()
 
-    uid = "reaper-test-user"
-    rec = _start(uid, 900101, _wedged_run)
-    fillers: list = []
-    filler_gate = threading.Event()
+    uid = "no-reaper-test-user"
+    rec = _start(uid, 900101, _run_fn)
     try:
-        # フェーズ1: MAX_TURN_SECONDS は超えたが GRACE 内 → 協調停止要求のみ（まだ未完了）。
-        rec.started_at = datetime.now(timezone.utc) - timedelta(seconds=chat_turns.MAX_TURN_SECONDS + 1)
+        rec.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
         chat_turns.list_running(uid)   # レジストリに触れる＝sweep が走る
-        assert rec.stop_event.is_set(), "MAX_TURN_SECONDS 超過で stop_event が立っていない"
-        assert not rec.buffer.done, "GRACE 期間内なのに既に強制終了されている"
+        assert not rec.stop_event.is_set(), "経過時間だけで stop_event が立っている（reaper が復活していないか）"
+        assert not rec.buffer.done, "経過時間だけで強制終了されている（reaper が復活していないか）"
 
-        # この時点で枠はまだ埋まったまま（このターンは未完了のカウントに入る）＝残り枠を埋めると
-        # 同ユーザーの新規ターンは弾かれることを確認（reaper 前と挙動が変わっていないことの確認）。
-        for i in range(chat_turns.MAX_TURNS_PER_USER - 1):
-            fillers.append(_start(uid, 900110 + i, lambda se, em: filler_gate.wait(timeout=5)))
-        with pytest.raises(chat_turns.TurnLimitError):
-            _start(uid, 900199, lambda se, em: None)
-
-        # フェーズ2: MAX_TURN_SECONDS + GRACE も超えた → 強制 done（枠解放）。
-        rec.started_at = datetime.now(timezone.utc) - timedelta(
-            seconds=chat_turns.MAX_TURN_SECONDS + chat_turns.FORCE_DONE_GRACE_SECONDS + 1)
-        chat_turns.list_running(uid)
-        assert rec.buffer.done, "GRACE も超えたのに強制終了されていない"
-        events = [e.payload for e in rec.buffer.replay_from(0)]
-        assert events and events[-1]["type"] == "error", f"タイムアウト error イベントが積まれていない: {events}"
-
-        # 枠が解放されたので、新規ターンが通る。
-        new_rec = _start(uid, 900198, lambda se, em: None)
-        _wait_turn_done(new_rec.turn_id)
-    finally:
-        gate.set()
-        filler_gate.set()
+        assert chat_turns.stop_turn(rec.turn_id, uid) is True
         _wait_turn_done(rec.turn_id, timeout=5)
-        for r in fillers:
-            _wait_turn_done(r.turn_id, timeout=5)
+        assert stop_seen.is_set(), "run_fn が stop_event を検知していない"
+        assert rec.buffer.done, "stop_turn 後に枠（buffer.done）が解放されていない"
+    finally:
+        rec.stop_event.set()
+        _wait_turn_done(rec.turn_id, timeout=5)
 
 
 # ===== HIGH（Codex RV）: background thread の例外時も best-effort で永続する =====
@@ -840,31 +834,3 @@ def test_turn_crash_via_background_run_ignores_stale_same_text_turn(monkeypatch)
     assert audit_rows
     assert audit_rows[0]["detail"]["message_id_user"] == new_user["id"]
     assert audit_rows[0]["detail"]["message_id_user"] != stale_user["id"]
-
-
-def test_start_turn_skips_spawn_when_reservation_force_done_during_factory():
-    """RV r2 MEDIUM: conversation_factory の実行中（予約が枠を持っている間）に reaper が予約を
-    強制解放（force-done）した場合、factory 復帰後に実処理 thread を起動しない
-    （起動すると limit/running/stop の管理外で LLM 実行が走る「枠外実行」になる）。"""
-    from sherpa import chat_turns
-    uid = "expired-res-user"
-    spawned: list[int] = []
-
-    def factory() -> int:
-        # factory が固まっている間に reaper が動いたことを、予約レコードの force-done で模す。
-        rec = next(r for r in chat_turns._REGISTRY.values() if r.uid == uid)
-        rec.buffer.append({"type": "error", "message": "応答がタイムアウトしました。もう一度お試しください。"})
-        rec.buffer.mark_done()
-        return 900901
-
-    def run_fn_factory(cid: int):
-        spawned.append(cid)
-        def run(stop_event, emit):
-            emit({"type": "node"})
-        return run
-
-    rec = chat_turns.start_turn(uid=uid, conversation_factory=factory, run_fn_factory=run_fn_factory)
-    assert rec.buffer.done is True
-    assert spawned == [], "予約が強制解放済みなのに実処理が起動された（枠外実行）"
-    # 購読側はタイムアウトの error イベント replay で完結できる（graceful degradation）。
-    assert any(e.payload.get("type") == "error" for e in rec.buffer.replay_from(0))

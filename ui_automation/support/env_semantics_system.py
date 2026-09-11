@@ -77,7 +77,6 @@ _PROBE_VARIABLES: dict[str, frozenset[str]] = {
     "artifact-file": frozenset({"SHERPA_MARP_BIN"}),
     "artifact-render": frozenset({"CHROME_PATH", "CHROMIUM_PATH"}),
     "audit-ip-hash": frozenset({"SHERPA_AUDIT_IP_SALT"}),
-    "author-error": frozenset({"SHERPA_CODEX_TIMEOUT_AUTHOR"}),
     "bedrock-auth-kind": frozenset({"AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_SECRET_ACCESS_KEY"}),
     "bedrock-region": frozenset({"AWS_REGION"}),
     "codex-invocation-summary": frozenset({"SHERPA_CODEX_SANDBOX"}),
@@ -1945,35 +1944,6 @@ def _log_probe(ctx: Any, probe_id: str, contract: dict[str, Any]) -> dict[str, A
             model_cache_read_only=True,
         )
 
-    if probe_id == "author-error":
-        raw_timeout = os.environ.get("SHERPA_CODEX_TIMEOUT_AUTHOR")
-        try:
-            timeout_seconds = float(raw_timeout) if raw_timeout not in {None, ""} else 600.0
-        except ValueError:
-            timeout_seconds = -1.0
-        if timeout_seconds <= 0:
-            turn = _exercise_author_turn(ctx, expect_error=True)
-            expected_error = True
-        else:
-            turn = _exercise_author_turn(ctx, expect_error=False)
-            expected_error = False
-        combined, names = _combined_log_tail(paths)
-        text = combined.decode("utf-8", errors="replace")
-        matches = len(re.findall(r"author|timeout|timed out|タイムアウト", text, re.IGNORECASE))
-        if expected_error:
-            assert matches > 0
-        return _result(
-            probe_id,
-            contract,
-            "real Codex author turn selected by the configured author timeout and application log",
-            turn=turn,
-            configured_timeout_seconds=timeout_seconds,
-            expected_error=expected_error,
-            matching_error_line_count=matches,
-            log_files=names,
-            log_sha256=_sha256_bytes(combined),
-        )
-
     if probe_id in {"ingest-error", "ingest-log"}:
         world_id = _real_world(ctx)
         runs = _db_rows(
@@ -3541,7 +3511,7 @@ _HEALTH = frozenset(
         "status-output",
     }
 )
-_LOGS = frozenset({"app-log", "author-error", "ingest-error", "ingest-log", "ocr-worker-log", "preflight-log", "proxy-log"})
+_LOGS = frozenset({"app-log", "ingest-error", "ingest-log", "ocr-worker-log", "preflight-log", "proxy-log"})
 _PROCESS = frozenset(
     {
         "codex-invocation-summary",

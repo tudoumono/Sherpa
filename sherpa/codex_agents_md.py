@@ -1,7 +1,7 @@
 """Codex authoring 実行前に authoring ディレクトリへ書き出す AGENTS.md（Codex 強化計画 Phase0・§2）。
 
 `agents.py` の `CodexProvider._prompt`/`_prompt_mcp` に埋め込んでいた**共通ルール**（KB 以外を読まない・
-根拠ベースで推測しない・成果物は authoring 直下・出典列挙不要 等）をここへ切り出し、プロンプト側は
+根拠ベースで答える・成果物は authoring 直下 等）をここへ切り出し、プロンプト側は
 質問固有の部分だけに痩せさせる（docs/proposals/2026-07-02-Codex強化計画.md §5-1 決定）。
 
 Codex CLI は cwd 直下（＝ authoring/）の AGENTS.md を実行時に自動的に読み込む（公式仕様）。per-request で
@@ -16,10 +16,15 @@ from pathlib import Path
 AGENTS_MD = """\
 # Sherpa 共通ルール（Codex 実行時）
 
-- 資料の参照は、指定された経路（grep・ファイル参照、または MCP ツール）に限る。指定された資料フォルダ
-  （KB）以外（このディレクトリの外・ユーザー workspace 等）は絶対に読まない。
-- 回答は根拠ベースで作る。ツール・ファイル参照で最低1回は裏取りしてから答え、事実に無いことは書かない
-  （推測しない）。
+- 原本は直接読んでよい（読取専用）。指定された資料フォルダ（KB）・派生フォルダ以外（このディレクトリの外・
+  ユーザー workspace・秘匿名のファイル（.env／鍵／credentials 等）等）は絶対に読まない。
+  まず読取ツール（xlsx_sheets／xlsx_range／docx_paragraphs／pptx_slides／pdf_pages／file_head）で
+  原本を読む。複数ファイルの突合・集計など定型外の作業だけ Python（openpyxl・python-docx・
+  python-pptx・pdfplumber。集計は pandas）で開く。
+  台帳・検索・グラフ・出典の確定は MCP ツールで行う。
+- 回答は根拠ベースで作る。ツール・ファイル参照で最低 1 回は裏取りしてから答える。根拠は資料のパス
+  （Python で開いた場合はシート名／セル範囲・段落・ページ番号も添える）で示す。資料に無いことを補うときは
+  『推定』と明示する。
 - 成果物（生成ファイル）を作る場合は、必ずこのディレクトリ（authoring 直下）に作成する。
 - スライド・プレゼン資料は、見た目重視の marp スキル（HTML/PDF/PPTX）を既定で使う。marp スキルでは
   Marp 形式の `.md` を書くだけでよく、レンダ（HTML/PDF/PPTX への変換）は完了後に Sherpa 側が自動で行う
@@ -27,7 +32,25 @@ AGENTS_MD = """\
   場合だけ、marp ではなく pptx スキル（python-pptx）を使う（marp の PPTX は画像ベースで本文編集ができない）。
 - 調査の途中経過（「次に〜を調べます」等の作業宣言）だけで終えない。調査を最後まで進めてから、
   結論と根拠を最終回答として書く。
-- 最後は日本語で簡潔に回答する。出典の列挙は不要（Sherpa 側で別途付与する）。
+- 「全件」「一覧」「すべて」「網羅」の依頼は、検索3回・根拠1件・件数だけの取得・代表例の発見では
+  完了としない。対象範囲（ファイル一覧なら台帳・本文中の項目一覧なら対象資料のシート/段落/ページ総数）
+  の確認を終え、該当項目が回答にそろってから完了とする。`truncated`／`text_truncated`／`file_truncated`／
+  `total > start+count` は続きを取得する。続きを取得する手段が無い打ち切り（`file_truncated`・
+  pdf_pages の `text_truncated`・compare_documents／graph_neighbors／glob_search／doc_outline の `truncated`・folder_tree の `folders_truncated`・xlsx_sheets／ripgrep_search／es_search の `truncated`＝ヒット数上限）は、その範囲を未確認として明示し全件性を主張しない。
+  利用者停止・通信エラー・既存の反復／情報量予算への到達で
+  中断するときは、確認済みの結果・未確認の範囲・理由を分けて書き、部分結果を「全件」「すべて」
+  「該当なし」と断定しない。
+- 最後は日本語で答える。長さを絞らない＝集めた情報は削らず、一覧を求められたら該当する全件を各項目の
+  パス付きで列挙する（『など』で省略しない・件数と一致させる・要約や代表例化で項目を落とさない）。
+  list_docs は count（全件数）と docs（rel_path 昇順・limit 件）を返す＝truncated:true なら next_offset
+  から続きを取り（path_prefix や name_pattern での分割は補助）、取得した総数を count と照合する。
+  表を指定されたら指定列を守り、項目と行・値の対応を保つ。取得できなかった値は推測で埋めず
+  「未取得」と書く。確定した事実と推定は分けて書き、推定には『推定』と明示する。
+  本文の中に出典の一覧は書かない（出典は Sherpa が末尾の『参照した資料:』から付与する。一覧の依頼に
+  対する各項目のパス列挙は答えそのものであり、ここで言う出典の一覧ではない）。根拠の箇所（パス・
+  シート名・セル範囲・段落・ページ）は本文で示してよい。回答の最後に『参照した資料:』の行を置き、
+  実際に開いて根拠にした資料を1行1件、資料フォルダからの相対パス（例 `4期更改/02_設計/xxx.xlsx`）で
+  列挙する。派生MD／rag.mdを見た場合も原本のパスで書く。
 - 回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。
 - 件数を答えるときは list_docs の path_prefix でフォルダを確定してから数え、どのフォルダを数えたかを
   回答に明示する（曖昧なら候補フォルダ別の内訳で答える）。
@@ -41,27 +64,37 @@ AGENTS_MD = """\
   （同じことを再度聞かない）。
 """
 
+# 原本直読が許可されたターンだけ足す段落（調査スキルは原本を Python で開く前提＝直読不許可のターンでは
+# 達成不能な手順書へ誘導しない）。
+_INVESTIGATE_SKILLS_PARAGRAPH = """\
+- 質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う `.agents/skills` の
+  investigate-* スキルを読んで、その手順（ツールで当たり→原本の中身を確かめる→答える）どおりに進める。
+"""
+
 # `--output-schema`（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3）有効時だけ付け足す段落。
 # スキーマ無効時にこの構造化応答の要求を出すと、Codex が実際には守れない形式を約束させられるだけで
 # 実害がある（`--output-schema` が無ければ CLI 側の強制も無い）ため、`write_agents_md` の
 # `output_schema` 引数が真のときだけ本文に足す。
 _STRUCTURED_RESPONSE_PARAGRAPH = """\
-- 最終応答は `status`／`answer`／`next_step` の3項目で返す。`status` が `final` になるのは、結論と根拠が
-  揃ったときだけ。調べる作業がまだ残っているなら、同じ応答内で続けて調査するか、`in_progress` にして
-  `next_step` へ次に何を調べるかを書く（`final` のときの `next_step` は null）。手順や計画の説明を
-  求められた依頼は、その説明を書き終えた時点で `final`。
+- 最終応答は `status`／`answer`／`next_step` の3項目で返す。`status` が `final` になるのは、依頼の調査が
+  完了した（全件要求なら対象範囲の確認を終え、該当項目が answer にそろった）ときだけ。調べる作業が
+  まだ残っているなら、同じ応答内で続けて調査するか、`in_progress` にして `next_step` へ次に何を調べる
+  かを書く（`final` のときの `next_step` は null）。手順や計画の説明を求められた依頼は、その説明を
+  書き終えた時点で `final`。利用者停止・通信エラー・既存の予算到達で中断した状態のまま応答を返すときは、
+  `answer` に確認済みの結果・未確認の範囲・中断理由を分けて書く（新しい `status` 値は使わない）。
 """
 
 
-def write_agents_md(authoring: Path, output_schema: bool = False) -> None:
+def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: bool = True) -> None:
     """authoring 直下へ AGENTS.md を書く（per-request・冪等・上書き）。
 
     呼び出し側で try/except すること（AGENTS.md はあくまで補助・書込に失敗しても Codex 実行自体は
     継続してよい＝fail-open。プロンプト側には containment/grounding の短縮形を常置してあるので、
     失敗時もプロンプトの質問固有部分＋短縮ルールだけで動くことを前提にする）。
 
-    `output_schema`（既定 False）が真のときだけ、構造化最終応答（`status`／`answer`／`next_step`）を
-    求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
+    `direct_read`（既定 True）が偽のとき＝原本直読を許可しないターンは、調査スキル（原本を Python で
+    開く前提）への誘導段落を落とす。`output_schema`（既定 False）が真のときだけ、構造化最終応答
+    （`status`／`answer`／`next_step`）を求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
 
     RV MEDIUM（2026-07-03）: 単純な `Path.write_text()` は既存の `AGENTS.md` が symlink だった場合に
     その**指す先へ**書き込んでしまう（authoring 配下の想定外の場所を書き換え得る）。
@@ -69,7 +102,8 @@ def write_agents_md(authoring: Path, output_schema: bool = False) -> None:
     （`rename`/`replace` はディレクトリエントリの張替えでシンボリックリンクを一切追従しない＝
     既存 AGENTS.md が symlink でも安全に「通常ファイルの AGENTS.md」へ置き換わる）。
     """
-    content = AGENTS_MD + (_STRUCTURED_RESPONSE_PARAGRAPH if output_schema else "")
+    content = (AGENTS_MD + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
+               + (_STRUCTURED_RESPONSE_PARAGRAPH if output_schema else ""))
     target = authoring / "AGENTS.md"
     tmp = authoring / f".AGENTS.md.tmp-{os.urandom(6).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)

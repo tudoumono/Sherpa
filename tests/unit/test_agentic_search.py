@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")   # es_search が実埋め込みを叩かない（BM25）
@@ -18,6 +19,11 @@ from sherpa import agentic_search as A   # noqa: E402
 from sherpa import store   # noqa: E402   # BUDGET-1: system_settings > コード既定のテスト用
 import _corpus_expect as CE   # noqa: E402   # フィクスチャ実走査ベースの list_docs 期待値（フェーズ7 S1）
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
+
+# 本モジュールは fixtures/corpus/v1 の実コーパス（`.md`＝資料・`.cbl`/`.cpy`＝コード）の固定分類を
+# 前提にする——フォークが正規の拡張アナライザを登録していても赤にならないよう、登録簿を上流限定に
+# 固定する（開発ハーネス S4・敵対 RV 是正・docs/21-拡張の契約.md）。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
 
 def test_run_tool_search_read_and_scope():
@@ -657,6 +663,23 @@ def test_list_docs_count_independent_of_limit():
     assert res["count"] == CE.count_under("4期") and len(res["docs"]) == 5   # 4期配下の全件数・一覧は5件だけ
 
 
+def test_list_docs_offset_pages_through_all_rows_without_gap_or_overlap():
+    """offset で続きを取れる（RV 2026-09-10 #4: 単一フォルダに上限 500 超があると分割では取り切れない）。
+    limit ずつ offset を進めた和集合が全件と一致し、重複も欠落もない。範囲外 offset は空一覧・count 不変。"""
+    total = CE.count_under("4期")
+    seen: list = []
+    for off in range(0, total, 3):
+        res, _, _, _ = A.run_tool("list_docs", {"path_prefix": "4期", "limit": 3, "offset": off}, "v1", None)
+        assert res["count"] == total and res["offset"] == off
+        seen += [d["rel_path"] for d in res["docs"]]
+    full, _, _, _ = A.run_tool("list_docs", {"path_prefix": "4期", "limit": 500}, "v1", None)
+    assert seen == [d["rel_path"] for d in full["docs"]]
+    res, _, _, _ = A.run_tool("list_docs", {"path_prefix": "4期", "offset": total + 10}, "v1", None)
+    assert res["count"] == total and res["docs"] == []
+    res, _, _, _ = A.run_tool("list_docs", {"path_prefix": "4期", "offset": "x"}, "v1", None)
+    assert res["offset"] == 0                                        # 不正値は既定 0（落とさない）
+
+
 def test_list_docs_respects_session_scope_and_unknown_world():
     """scope_paths（セッション範囲）で絞られ、未登録 world は 0 件（例外にならない）。"""
     res, docs, _, _ = A.run_tool("list_docs", {}, "v1", ["4期/03_開発"])
@@ -665,7 +688,7 @@ def test_list_docs_respects_session_scope_and_unknown_world():
     assert docs and docs == {d["rel_path"] for d in res["docs"]}
 
     res2, docs2, _, _ = A.run_tool("list_docs", {}, "no-such-world-xyz", None)
-    assert res2 == {"count": 0, "docs": []} and docs2 == set()
+    assert res2 == {"count": 0, "offset": 0, "docs": [], "truncated": False, "next_offset": None} and docs2 == set()
 
 
 def test_list_docs_layer_code_and_docs_partition_the_prefix():
@@ -691,6 +714,74 @@ def test_list_docs_layer_code_and_docs_partition_the_prefix():
     assert {d["rel_path"] for d in res_both["docs"]} == all_rels   # 既定 both は現状の挙動と完全同一
 
 
+def test_list_docs_pagination_covers_all_without_gaps_or_dupes(monkeypatch):
+    """S4: 並びは常に rel_path 昇順固定——offset を進めた複数ページの和が全件と一致し、重複も欠落も
+    無い（以前は走査順依存＝ページ跨ぎで重複/欠落し得た）。"""
+    from sherpa import doc_ledger as DL
+
+    names = [f"p/{n}.md" for n in ["c", "a", "e", "b", "d", "g", "f"]]
+    rows = [{"name": n, "branch": "docs", "doctype": "設計書"} for n in names]
+    monkeypatch.setattr(DL, "documents_for", lambda world, **kw: rows)
+
+    collected: list[str] = []
+    offset = 0
+    for _ in range(10):   # 全件を確実に踏破できる十分な上限（無限ループ防止のガード）
+        res, _, _, _ = A.run_tool("list_docs", {"path_prefix": "p", "limit": 3, "offset": offset}, "v1", None)
+        collected.extend(d["rel_path"] for d in res["docs"])
+        if not res["truncated"]:
+            assert res["next_offset"] is None
+            break
+        offset = res["next_offset"]
+    assert collected == sorted(names)                       # 昇順固定・重複/欠落なし
+    assert len(collected) == len(set(collected)) == len(names)
+
+
+def test_list_docs_doctype_and_state_filters_are_case_insensitive_exact_match(monkeypatch):
+    """doctype/state は台帳の値との完全一致・大文字小文字は無視（部分一致にしない）。"""
+    from sherpa import doc_ledger as DL
+
+    rows = [
+        {"name": "p/a.cbl", "branch": "source", "doctype": "cobol", "state": "ready"},
+        {"name": "p/b.cbl", "branch": "source", "doctype": "cobol", "state": "unreadable"},
+        {"name": "p/c.md", "branch": "docs", "doctype": "設計書", "state": "ready"},
+    ]
+    monkeypatch.setattr(DL, "documents_for", lambda world, **kw: rows)
+
+    res, _, _, _ = A.run_tool("list_docs", {"doctype": "COBOL"}, "v1", None)
+    assert {d["rel_path"] for d in res["docs"]} == {"p/a.cbl", "p/b.cbl"}
+
+    res2, _, _, _ = A.run_tool("list_docs", {"state": "READY"}, "v1", None)
+    assert {d["rel_path"] for d in res2["docs"]} == {"p/a.cbl", "p/c.md"}
+
+    res3, _, _, _ = A.run_tool("list_docs", {"doctype": "cobol", "state": "unreadable"}, "v1", None)
+    assert {d["rel_path"] for d in res3["docs"]} == {"p/b.cbl"}
+
+    res4, _, _, _ = A.run_tool("list_docs", {"doctype": "excel"}, "v1", None)   # 該当なし＝0件（例外にしない）
+    assert res4["docs"] == [] and res4["count"] == 0
+
+
+def test_list_docs_truncated_and_next_offset_at_boundaries(monkeypatch):
+    """truncated = offset + len(docs) < count・next_offset = offset + len(docs)（truncated のときだけ）。"""
+    from sherpa import doc_ledger as DL
+
+    names = [f"p/{i:02d}.md" for i in range(5)]
+    rows = [{"name": n, "branch": "docs", "doctype": "設計書"} for n in names]
+    monkeypatch.setattr(DL, "documents_for", lambda world, **kw: rows)
+
+    # ちょうど全件に届く（limit==count）: 打ち切りなし
+    res, _, _, _ = A.run_tool("list_docs", {"path_prefix": "p", "limit": 5}, "v1", None)
+    assert res["count"] == 5 and res["truncated"] is False and res["next_offset"] is None
+
+    # 1件だけ超える（limit<count）: 打ち切りあり・next_offset は返した件数分進む
+    res2, _, _, _ = A.run_tool("list_docs", {"path_prefix": "p", "limit": 4}, "v1", None)
+    assert len(res2["docs"]) == 4 and res2["truncated"] is True and res2["next_offset"] == 4
+
+    # next_offset をそのまま渡すと残り1件で打ち切りが解消する
+    res3, _, _, _ = A.run_tool("list_docs", {"path_prefix": "p", "limit": 5, "offset": res2["next_offset"]},
+                               "v1", None)
+    assert len(res3["docs"]) == 1 and res3["truncated"] is False and res3["next_offset"] is None
+
+
 def test_es_search_filters_stale_hits():
     """rv-full2 #4: agentic es_search は現 world に**実在する doc** だけ採用（古い ES ヒットを除外）。"""
     from sherpa import documents, es_index
@@ -704,6 +795,25 @@ def test_es_search_filters_stale_hits():
         res, docs, cites, _ = A.run_tool("es_search", {"query": "q"}, "v1", None)
         ids = {h["doc_id"] for h in res["hits"]}
         assert ids == {"real.md"} and "stale.md" not in docs        # 実在のみ＝古いヒットは出さない
+        assert all(c["doc_id"] == "real.md" for c in cites)
+    finally:
+        es_index.search, documents.world_rel_set = o_search, o_relset
+
+
+def test_es_search_filters_sensitive_named_hits():
+    """台帳 #80: 秘匿名（`text_kind.is_sensitive`）導入前に索引化された ES ヒットを、実在チェックを
+    通っていても本文付きで返さない・件数（`docs`/`hits`）からも外す（`credentials.xlsx` の名前規約）。"""
+    from sherpa import documents, es_index
+    o_search, o_relset = es_index.search, documents.world_rel_set
+    es_index.search = lambda world, q, scope_paths=None, k=20, layer=None, **kw: ([
+        {"doc_id": "real.md", "line": 1, "text": "x", "span": [1, 1], "ext": ".md"},
+        {"doc_id": "credentials.xlsx", "line": 2, "text": "secret", "span": [2, 2], "ext": ".xlsx"}], None)
+    documents.world_rel_set = lambda world, **kw: {"real.md", "credentials.xlsx"}   # 両方とも実在（除外は秘匿名のみが理由）
+    try:
+        res, docs, cites, _ = A.run_tool("es_search", {"query": "q"}, "v1", None)
+        ids = {h["doc_id"] for h in res["hits"]}
+        assert ids == {"real.md"} and "credentials.xlsx" not in docs
+        assert len(res["hits"]) == 1
         assert all(c["doc_id"] == "real.md" for c in cites)
     finally:
         es_index.search, documents.world_rel_set = o_search, o_relset
@@ -824,6 +934,37 @@ def test_graph_neighbors_tool_returns_cards(monkeypatch):
         assert cards[0]["_verified_doc_ids"] == ["4期/設計/請求.md"]
         assert res["neighbors"][0]["name"] == "BILLINGJOB" and res["neighbors"][0]["role"] == "実装"
         assert "4期/設計/請求.md" in docs                           # 根拠 doc は出典付与のため docs に
+    finally:
+        lens_service.neighbor_cards = orig
+
+
+def test_graph_neighbors_tool_view_includes_directed_edges(monkeypatch):
+    """S3c（裁定2026-09-11）: `view` の各近傍は `evidence.edges`（`lens_service.neo4j_related` が
+    返す `{type, from, to, doc}`）を素通しする。`doc` が無い辺は `doc` キー自体を省く（`_card_edges_view`
+    は既知キーだけ・値がある物だけ写す）。edges が無い/空のカードでも `edges: []` で落ちない。"""
+    monkeypatch.setattr(A, "verify_doc_exists", lambda doc_id, world, scope_paths=None: True)
+    from sherpa import lens_service
+    fake = [
+        {"name": "BILLINGJOB", "label": "Module", "category": "プログラム", "role": "実装",
+         "distance": 1, "path": ["請求処理", "BILLINGJOB"],
+         "evidence": {"edges": [
+             {"type": "COPIES", "from": "請求処理", "to": "BILLINGJOB", "doc": "4期/src/請求処理.cbl"},
+             {"type": "INVOKES", "from": "BILLINGJOB", "to": "SUBRTN1"},   # doc 無し（言及以外の辺は doc を持たないこともある）
+         ], "grep": []}},
+        {"name": "no-edges", "label": "Module", "category": "プログラム", "role": "実装",
+         "distance": 1, "path": [], "evidence": {"edges": [], "grep": []}},
+    ]
+    orig = lens_service.neighbor_cards
+    lens_service.neighbor_cards = lambda world, term, sp=None: list(fake)
+    try:
+        res, docs, cites, cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+        by_name = {n["name"]: n for n in res["neighbors"]}
+        assert by_name["BILLINGJOB"]["edges"] == [
+            {"type": "COPIES", "from": "請求処理", "to": "BILLINGJOB", "doc": "4期/src/請求処理.cbl"},
+            {"type": "INVOKES", "from": "BILLINGJOB", "to": "SUBRTN1"},
+        ]
+        assert by_name["no-edges"]["edges"] == []
+        assert by_name["BILLINGJOB"]["path"] == ["請求処理", "BILLINGJOB"]   # path は従来どおり残る
     finally:
         lens_service.neighbor_cards = orig
 
@@ -1429,6 +1570,20 @@ def test_graph_neighbors_cards_sidecar_clipped_to_graph_cards_max():
         res, docs, cites, cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
         assert len(cards) == A._GRAPH_CARDS_MAX == 30
         assert len(res["neighbors"]) == A._GRAPH_CARDS_MAX == 30
+        assert res["truncated"] is True and res["count"] == 1000   # 部分集合であることと総数を返す
+    finally:
+        lens_service.neighbor_cards = orig
+
+
+def test_graph_neighbors_not_truncated_when_within_limit():
+    from sherpa import lens_service
+    fake = [{"name": f"c{i}", "role": "実装", "category": "プログラム", "distance": 1,
+            "path": [], "evidence": {}} for i in range(3)]
+    orig = lens_service.neighbor_cards
+    lens_service.neighbor_cards = lambda world, term, sp=None: list(fake)
+    try:
+        res, *_ = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+        assert "truncated" not in res and "count" not in res
     finally:
         lens_service.neighbor_cards = orig
 
@@ -4230,6 +4385,26 @@ def test_safe_doc_path_falls_back_to_legacy_when_rag_missing(monkeypatch, tmp_pa
     assert lexical_rel == "onlylegacy.xlsx.md" and p.name == "onlylegacy.xlsx.md"
 
 
+def test_safe_doc_path_rejects_sensitive_office_original_name(monkeypatch, tmp_path):
+    """Office/画像（`is_office` 分岐）は `classify_document` を経由しないため、
+    `credentials.xlsx`/`id_rsa.docx` のような秘匿名は派生MDが実在しても read_around で開けない
+    （`_safe_doc_path` が doc_id そのもの＝原本名で `text_kind.is_sensitive` を独立に判定する）。
+    非秘匿の Office は従来どおり開ける。"""
+    der = tmp_path / "md"
+    der.mkdir(parents=True, exist_ok=True)
+    (der / "credentials.xlsx.md").write_text("SECRET", encoding="utf-8")
+    (der / "id_rsa.docx.md").write_text("SECRET", encoding="utf-8")
+    (der / "normal.docx.md").write_text("normal", encoding="utf-8")
+    monkeypatch.setattr(A.worlds, "derived_md_dir", lambda w: der)
+    monkeypatch.setattr(A.worlds, "derived_rag_dir", lambda w: tmp_path / "rag-empty")
+
+    assert A._safe_doc_path("w", "credentials.xlsx") is None
+    assert A._safe_doc_path("w", "id_rsa.docx") is None
+    resolved = A._safe_doc_path("w", "normal.docx")
+    assert resolved is not None
+    assert resolved[2].name == "normal.docx.md"
+
+
 def test_safe_doc_path_ignores_rag_when_disabled(monkeypatch, tmp_path):
     """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・env では OFF にできない。
     `grep_tool.rag_grep_enabled` は今も内部シームとして残るため、直接差し替えて False 分岐
@@ -4580,20 +4755,23 @@ def test_openai_tools_with_grep_false_omits_ripgrep_but_keeps_base_tools():
     t = A.openai_tools(with_es=True, with_graph=True, with_grep=False)
     names = [x["function"]["name"] for x in t]
     assert names == ["list_docs", "folder_tree", "graph_neighbors", "es_search", "doc_outline", "read_doc",
-                     "read_around", "compare_documents", "ask_user"]
+                     "read_around", "compare_documents", "xlsx_sheets", "xlsx_range", "docx_paragraphs",
+                     "pptx_slides", "pdf_pages", "file_head", "ask_user"]
     # 既定（省略）は従来どおり grep（＋同居する glob_search）を含み、正準順（list_docs→
     # folder_tree→ripgrep_search→glob_search→graph_neighbors→es_search→doc_outline→read_doc→
-    # read_around→compare_documents→ask_user）のまま。
+    # read_around→compare_documents→原本読取ツール6本(S3b)→ask_user）のまま。
     assert [x["function"]["name"] for x in A.openai_tools(with_es=True, with_graph=True)] == [
         "list_docs", "folder_tree", "ripgrep_search", "glob_search", "graph_neighbors", "es_search",
-        "doc_outline", "read_doc", "read_around", "compare_documents", "ask_user"]
+        "doc_outline", "read_doc", "read_around", "compare_documents", "xlsx_sheets", "xlsx_range",
+        "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head", "ask_user"]
 
 
 def test_gemini_tools_with_grep_false_omits_ripgrep_but_keeps_base_tools():
     fns = A.gemini_tools(with_es=True, with_graph=True, with_grep=False)[0]["functionDeclarations"]
     names = [f["name"] for f in fns]
     assert names == ["list_docs", "folder_tree", "graph_neighbors", "es_search", "doc_outline", "read_doc",
-                     "read_around", "compare_documents", "ask_user"]
+                     "read_around", "compare_documents", "xlsx_sheets", "xlsx_range", "docx_paragraphs",
+                     "pptx_slides", "pdf_pages", "file_head", "ask_user"]
 
 
 def test_openai_style_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
@@ -4612,7 +4790,8 @@ def test_openai_style_tools_pref_default_toolset_excludes_off_tools(monkeypatch)
     list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
                         tools_pref={"grep": False, "fulltext": True, "graph": True}))
     assert captured["names"] == ["list_docs", "folder_tree", "graph_neighbors", "es_search", "doc_outline",
-                                 "read_doc", "read_around", "compare_documents", "ask_user"]
+                                 "read_doc", "read_around", "compare_documents", "xlsx_sheets", "xlsx_range",
+                                 "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head", "ask_user"]
 
 
 def test_openai_style_tools_pref_none_keeps_existing_default_behavior(monkeypatch):
@@ -4631,7 +4810,8 @@ def test_openai_style_tools_pref_none_keeps_existing_default_behavior(monkeypatc
     list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
     assert captured["names"] == ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "graph_neighbors",
                                  "es_search", "doc_outline", "read_doc", "read_around",
-                                 "compare_documents", "ask_user"]
+                                 "compare_documents", "xlsx_sheets", "xlsx_range", "docx_paragraphs",
+                                 "pptx_slides", "pdf_pages", "file_head", "ask_user"]
 
 
 def test_gemini_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
@@ -4648,7 +4828,9 @@ def test_gemini_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
     list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None,
                   tools_pref={"grep": True, "fulltext": False, "graph": True}))
     assert captured["names"] == ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "graph_neighbors",
-                                 "doc_outline", "read_doc", "read_around", "compare_documents", "ask_user"]
+                                 "doc_outline", "read_doc", "read_around", "compare_documents",
+                                 "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
+                                 "pdf_pages", "file_head", "ask_user"]
 
 
 def test_anthropic_style_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
@@ -4671,7 +4853,9 @@ def test_anthropic_style_tools_pref_default_toolset_excludes_off_tools(monkeypat
     list(A.anthropic_style(FakeClient(), "m", A.SYSTEM, "質問", "v1", None,
                            tools_pref={"grep": True, "fulltext": True, "graph": False}))
     assert captured["names"] == ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "es_search",
-                                 "doc_outline", "read_doc", "read_around", "compare_documents", "ask_user"]
+                                 "doc_outline", "read_doc", "read_around", "compare_documents",
+                                 "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
+                                 "pdf_pages", "file_head", "ask_user"]
 
 
 def test_openai_style_explicit_toolset_skips_availability_check(monkeypatch):
@@ -4974,12 +5158,18 @@ def test_dispatch_tools_for_lens_availability_omitted_means_fully_available():
 # `_SYSTEM_GOLDEN_*` は現在の SYSTEM の中身（glob_search の使いどころ・「語句そのまま検索」表記を
 # 含む）に対する固定値——中身を変えたらここも更新する（golden の意図は「意図しない変化を検知
 # する」ことであって、特定の過去の値に固定し続けることではない）。
-_SYSTEM_GOLDEN_BYTES = 3924
-_SYSTEM_GOLDEN_SHA256 = "b57968b29f7f3792650b0954130cfe157d8b77390be39793061765a3a00bb364"
-_DESC_ES_GOLDEN_BYTES = 449
-_DESC_ES_GOLDEN_SHA256 = "453247ab3710f36a9da0986e071bda2378b56c530d21bff4984921cee88d48e0"
-_DESC_GRAPH_GOLDEN_BYTES = 553
-_DESC_GRAPH_GOLDEN_SHA256 = "8a039ffdb660f76dd3d976aef666ee68eec716b666549dc5861fb9d090f52820"
+# 契約変更（2026-09-10・API 経路も絞らない方針へ）: 回答を「簡潔（2〜4文）」に絞る指示を撤去し、
+# 「長さは絞らない／一覧は全件パス付き／確定と推定を分けて推定を明示する」へ置換したため golden 更新。
+# 契約変更（COVERAGE-1・2026-09-11）: list_docs の offset 案内を truncated/next_offset に置換し、
+# 全件・一覧の完了条件と中断時の書き方を明記したため golden 更新。
+_SYSTEM_GOLDEN_BYTES = 5025
+_SYSTEM_GOLDEN_SHA256 = "53a8b3c61adef925e3cfea57a889996dd88d503563c6b69dc7f7ddac8c63cde1"
+_DESC_ES_GOLDEN_BYTES = 647
+_DESC_ES_GOLDEN_SHA256 = "9bf6098dca7c695e63f41db30fcaa46bb31fe2861f9f3aafa6b0c518a9df9e00"
+# 契約変更（S3c・裁定2026-09-11・graph_neighbors の近傍に辺ごとの種類と向きを追加したのに伴い
+# description へ「経路は辺ごとの種類と向き（from→to）付き」を追記）したため golden 更新。
+_DESC_GRAPH_GOLDEN_BYTES = 1190
+_DESC_GRAPH_GOLDEN_SHA256 = "6906fe828fda4729af11a6cd5064dc8e8b6226be0183262814bb08320d10c53a"
 
 
 def _sha256_utf8(s: str) -> str:
@@ -6964,3 +7154,581 @@ def test_parent_return_chunk_degrade_bounded_memory_for_large_rag_md(monkeypatch
     assert res["hits"][0]["tier"] == "chunk"
     assert res["hits"][0]["text"] == "本文"
     assert peak < 10 * 1024 * 1024
+
+
+def test_graph_neighbors_view_marks_edges_backed_by_unverified_docs(monkeypatch):
+    """検証で落ちた文書（実在しない等）を裏付けとする辺は doc を落として unverified を立てる（辺を消すと
+    経路が繋がって見えて確定根拠に化ける）。doc を持たない辺と、検証済み doc の辺はそのまま。"""
+    monkeypatch.setattr(A, "verify_doc_exists", lambda doc_id, world, scope_paths=None: doc_id == "ok.cbl")
+    from sherpa import lens_service
+    fake = [{"name": "PGM", "label": "Module", "category": "プログラム", "role": "実装", "distance": 1,
+             "path": ["X", "PGM"], "cid": "m:PGM",
+             "evidence": {"edges": [{"type": "COPIES", "from": "X", "to": "PGM", "doc": "ok.cbl"},
+                                    {"type": "INVOKES", "from": "PGM", "to": "Y", "doc": "gone.cbl"},
+                                    {"type": "CONTAINS", "from": "PGM", "to": "Z"}], "grep": []}}]
+    orig = lens_service.neighbor_cards
+    lens_service.neighbor_cards = lambda world, term, sp=None: list(fake)
+    try:
+        res, docs, _, cards = A.run_tool("graph_neighbors", {"name": "X"}, "v1", None)
+        edges = res["neighbors"][0]["edges"]
+        assert edges == [{"type": "COPIES", "from": "X", "to": "PGM", "doc": "ok.cbl"},
+                         {"type": "INVOKES", "from": "PGM", "to": "Y", "unverified": True},
+                         {"type": "CONTAINS", "from": "PGM", "to": "Z"}]
+        assert docs == {"ok.cbl"}
+        # API 経路の構造 Evidence（card_meta）にも辺の向きと未確認の印が引き継がれ、逆向きと区別される
+        ev = A._card_structural_evidence(cards)
+        assert ev[0]["card_meta"]["edges"] == ["X →COPIES→ PGM", "PGM →INVOKES→ Y（未確認）", "PGM →CONTAINS→ Z"]
+        from sherpa.providers.base import _dedupe_structural_evidence
+        rev = {**ev[0], "card_meta": {**ev[0]["card_meta"], "edges": ["PGM →COPIES→ X"]}}
+        assert len(_dedupe_structural_evidence([ev[0], rev])) == 2   # 向き違いは別 Evidence
+    finally:
+        lens_service.neighbor_cards = orig
+
+
+# ===== S3b: 原本読取ツール（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
+# `_safe_original_path` の封じ込め（`_safe_doc_path` と同じ検査項目を Office/PDF は世界 root の
+# 原本へ解決する版で共有）と、`run_tool` への配線（xlsx/docx/pptx/pdf/file_head）を検証する。
+# `doc_readers.py` 自体の入出力契約は tests/unit/test_doc_readers.py が担う——ここでは
+# 「doc_id→実パス解決」と「run_tool 経由の docs/redaction/layer」だけを見る。
+
+def _write_xlsx(path: pathlib.Path, cell_value: str = "hello") -> None:
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = cell_value
+    wb.save(path)
+
+
+def test_safe_original_path_confinement_rejects_traversal_absolute_and_missing(monkeypatch, tmp_path):
+    world = "s3b-confine"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"a.xlsx": b""})
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: tmp_path / "kb" / world)
+    for bad in ("../../../etc/passwd", "/etc/passwd", "a/../../etc/hosts", ""):
+        assert A._safe_original_path(world, bad, None, kinds=A._XLSX_KINDS) is None, bad
+    # 実在しないファイル・拡張子不一致（kinds 外）も None。
+    assert A._safe_original_path(world, "missing.xlsx", None, kinds=A._XLSX_KINDS) is None
+    assert A._safe_original_path(world, "a.xlsx", None, kinds=A._DOCX_KINDS) is None
+
+
+def test_safe_original_path_rejects_sensitive_name_and_importance_control_file(monkeypatch, tmp_path):
+    world = "s3b-sensitive"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        "credentials.xlsx": b"",
+        "_重要度.txt": "*.xlsx: 高\n",
+    })
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: tmp_path / "kb" / world)
+    assert A._safe_original_path(world, "credentials.xlsx", None, kinds=A._XLSX_KINDS) is None
+    assert A._safe_original_path(world, "_重要度.txt", None, kinds=A._FILE_HEAD_KINDS) is None
+
+
+def test_safe_original_path_rejects_symlink_escape(monkeypatch, tmp_path):
+    world = "s3b-symlink"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {})
+    wd = tmp_path / "kb" / world
+    wd.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside.xlsx"
+    _write_xlsx(outside)
+    (wd / "link.xlsx").symlink_to(outside)
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: wd)
+    assert A._safe_original_path(world, "link.xlsx", None, kinds=A._XLSX_KINDS) is None
+
+
+def test_safe_original_path_rejects_out_of_scope(monkeypatch, tmp_path):
+    world = "s3b-scope"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"4期/a.xlsx": b""})
+    wd = tmp_path / "kb" / world
+    _write_xlsx(wd / "4期" / "a.xlsx")
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: wd)
+    assert A._safe_original_path(world, "4期/a.xlsx", ["5期"], kinds=A._XLSX_KINDS) is None
+    resolved = A._safe_original_path(world, "4期/a.xlsx", ["4期"], kinds=A._XLSX_KINDS)
+    assert resolved is not None
+    root, doc_id, rp, st = resolved   # RV#1: 4つ目に検査直後の stat（TOCTOU 突合用）を返す契約に変更
+    assert doc_id == "4期/a.xlsx"
+    assert rp == (wd / "4期" / "a.xlsx").resolve()
+    assert st.st_ino == rp.stat().st_ino
+
+
+def test_safe_original_path_rejects_xlsm_extension(monkeypatch, tmp_path):
+    """RV#9 是正: `.xlsm` は台帳（`corpus_docs.classify_document`）が文書種別として扱わない拡張子
+    ＝事前フィルタで通しても `verify_doc_exists` で必ず落ちるため、入口の `kinds` からも外す。"""
+    world = "s3b-xlsm"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"a.xlsm": b""})
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: tmp_path / "kb" / world)
+    assert A._safe_original_path(world, "a.xlsm", None, kinds=A._XLSX_KINDS) is None
+
+
+def test_safe_original_path_resolves_to_world_root_original_not_derived_md(monkeypatch, tmp_path):
+    """`_safe_doc_path` は Office を派生 MD へ解決するが、`_safe_original_path` は原本読取ツール専用
+    ＝world root の原本そのものへ解決する（派生 MD が無くても・古くても関係ない）。"""
+    world = "s3b-original-root"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"a.xlsx": b""})
+    wd = tmp_path / "kb" / world
+    _write_xlsx(wd / "a.xlsx")
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: wd)
+    resolved = A._safe_original_path(world, "a.xlsx", None, kinds=A._XLSX_KINDS)
+    assert resolved is not None
+    root, _doc_id, rp, _st = resolved   # RV#1: 4つ目は stat（TOCTOU 突合用）
+    assert root == wd
+    assert rp == (wd / "a.xlsx").resolve()
+
+
+def _setup_office_world(monkeypatch, tmp_path, world: str):
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"note.py": "print('hi')\n", "note.txt": "hello\n"})
+    wd = tmp_path / "kb" / world
+    _write_xlsx(wd / "a.xlsx", cell_value="秘密: sk-ABCDEFGHIJKLMNOPQRSTUVWX")
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: wd)
+    return wd
+
+
+def test_run_tool_xlsx_sheets_and_range_add_docs_and_redact(monkeypatch, tmp_path):
+    world = "s3b-run-xlsx"
+    _setup_office_world(monkeypatch, tmp_path, world)
+
+    r, docs, _cites, _cards = A.run_tool("xlsx_sheets", {"doc_id": "a.xlsx"}, world, None)
+    assert r["sheets"] == [{"name": "Sheet1", "max_row": 1, "max_col": 1}]
+    # RV#5: read_evidence 用に doc_id/text/locator を合成して足す（本体の "sheets" は不変）。
+    assert r["doc_id"] == "a.xlsx"
+    assert r["locator"] == "sheets"
+    assert "Sheet1" in r["text"]
+    assert docs == {"a.xlsx"}
+
+    r2, docs2, _, _ = A.run_tool("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet1"}, world, None)
+    assert docs2 == {"a.xlsx"}
+    assert r2["rows"] == [["秘密: [REDACTED]"]]           # _redact_deep が本文の秘密を伏せる
+    # RV#5: read_evidence 用の text も伏せ字済みの内容から合成される（漏れない）。
+    assert r2["doc_id"] == "a.xlsx"
+    assert r2["locator"] == "Sheet1!A1:A1"
+    assert "[REDACTED]" in r2["text"]
+    assert "秘密: sk-" not in r2["text"]
+
+    # sheet 省略はエラー（doc は出典に載らない＝失敗時は docs に足さない）。
+    r3, docs3, _, _ = A.run_tool("xlsx_range", {"doc_id": "a.xlsx"}, world, None)
+    assert r3 == {"error": "sheet が必要です"}
+    assert docs3 == set()
+
+
+def test_run_tool_file_head_reads_text_and_redacts(monkeypatch, tmp_path):
+    world = "s3b-run-filehead"
+    _setup_office_world(monkeypatch, tmp_path, world)
+    r, docs, _, _ = A.run_tool("file_head", {"doc_id": "note.txt"}, world, None)
+    assert r["size"] == 6
+    assert r["text"] == "hello\n"
+    assert r["truncated"] is False
+    # RV#5: read_evidence 用に doc_id/locator を足す（text は既存のまま・二重化しない）。
+    assert r["doc_id"] == "note.txt"
+    assert r["locator"] == "head"
+    assert docs == {"note.txt"}
+
+
+def test_run_tool_office_tools_error_when_layer_restricted_to_code(monkeypatch, tmp_path):
+    world = "s3b-run-layer"
+    _setup_office_world(monkeypatch, tmp_path, world)
+    for name, args in (("xlsx_sheets", {"doc_id": "a.xlsx"}),
+                       ("xlsx_range", {"doc_id": "a.xlsx", "sheet": "Sheet1"}),
+                       ("docx_paragraphs", {"doc_id": "a.xlsx"}),
+                       ("pptx_slides", {"doc_id": "a.xlsx"}),
+                       ("pdf_pages", {"doc_id": "a.xlsx"})):
+        r, docs, _, _ = A.run_tool(name, args, world, None, layer="code")
+        assert r == {"error": "探す対象がソースに限定されています"}, name
+        assert docs == set()
+
+
+def test_run_tool_file_head_respects_layer_filter(monkeypatch, tmp_path):
+    world = "s3b-run-filehead-layer"
+    _setup_office_world(monkeypatch, tmp_path, world)
+    # note.py はコード判定＝layer="docs" では読めない・layer="code" では読める。
+    r_docs, _, _, _ = A.run_tool("file_head", {"doc_id": "note.py"}, world, None, layer="docs")
+    assert r_docs == {"error": "doc_id が無効、または読み取り対象外です"}
+    r_code, docs_code, _, _ = A.run_tool("file_head", {"doc_id": "note.py"}, world, None, layer="code")
+    assert docs_code == {"note.py"}
+    assert "print" in r_code["text"]
+
+
+def test_run_tool_file_head_respects_tool_result_max_bytes(monkeypatch, tmp_path):
+    """RV#7 是正: `tool_result_max_bytes` を無視して大きな text をそのまま返さない——`_finish_reader_result`
+    が JSON 全体のバイト数（doc_id/text/locator 込み）を予算内に収める。"""
+    world = "s3b-run-filehead-budget"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"big.txt": "x" * 100_000})
+    res, docs, _, _ = A.run_tool("file_head", {"doc_id": "big.txt"}, world, None,
+                                 tool_result_max_bytes=16384)
+    assert "error" not in res, res
+    assert res["truncated"] is True
+    assert len(json.dumps(res, ensure_ascii=False).encode("utf-8")) <= 16384
+    assert docs == {"big.txt"}
+
+
+def test_run_tool_file_head_redacts_private_key_truncated_by_max_bytes(monkeypatch, tmp_path):
+    """RV2巡目#3 是正: `file_head` の `max_bytes` で PEM 鍵ブロックの END 側が切り落とされても、
+    鍵本文の断片が残らない——`_redact`（`_SECRET_RE`）は BEGIN/END が対で揃わないとマッチしない
+    ため、切断で END が失われると以前は鍵の断片がそのまま外部 LLM へ渡っていた
+    （`_finish_reader_result` の未終端鍵ブロック補完伏せ字＝`_redact_unterminated_key_tail` で救う）。
+    """
+    world = "s3b-filehead-key-redact"
+    key_body = "A" * 500
+    content = f"prefix\n-----BEGIN RSA PRIVATE KEY-----\n{key_body}\n-----END RSA PRIVATE KEY-----\nsuffix\n"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"secret.txt": content})
+    cut = content.index(key_body) + 50   # BEGIN の後・END に届く前で切る
+    res, docs, _, _ = A.run_tool("file_head", {"doc_id": "secret.txt", "max_bytes": cut}, world, None)
+    assert "error" not in res, res
+    assert "-----END" not in res["text"]
+    assert "AAAA" not in res["text"]
+    assert "[REDACTED]" in res["text"]
+    assert "prefix" in res["text"]
+    assert docs == {"secret.txt"}
+
+
+def test_run_tool_toctou_rejects_path_swapped_to_symlink_after_check(monkeypatch, tmp_path):
+    """RV#1 是正: `_safe_original_path` の検査後、実際に open するまでの間に検査済みパスが
+    KB 外への symlink に差し替えられても読めない（検査済みパス文字列をそのまま再 open していた
+    以前の実装の TOCTOU 穴の再現）。`_safe_original_path` の戻りを固定した上でファイルを
+    symlink に置換し、`run_tool` がそれでも読めないことを確認する。"""
+    world = "s3b-toctou"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"note.txt": "hello\n"})
+    wd = tmp_path / "kb" / world
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: wd)
+
+    real_resolved = A._safe_original_path(world, "note.txt", None, kinds=A._FILE_HEAD_KINDS)
+    assert real_resolved is not None
+    monkeypatch.setattr(A, "_safe_original_path", lambda *a, **kw: real_resolved)
+
+    # 検査「後」に実体を KB 外への symlink へ差し替える（TOCTOU の隙間を模す）。
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret outside kb\n", encoding="utf-8")
+    rp = real_resolved[2]
+    rp.unlink()
+    rp.symlink_to(outside)
+
+    res, docs, _, _ = A.run_tool("file_head", {"doc_id": "note.txt"}, world, None)
+    assert res == {"error": "読み取りに失敗しました"}
+    assert docs == set()
+
+
+def test_run_tool_ancestor_dir_symlink_swap_after_check_is_rejected(monkeypatch, tmp_path):
+    """RV2巡目#1 是正: `_safe_original_path` の検査後、実際に open するまでの間に doc_id の
+    **祖先ディレクトリ**（最終要素ではなく）が KB 外への symlink に差し替えられても読めない。
+
+    以前の実装（`_open_verified_original` が最終要素だけ `O_NOFOLLOW` で単発 open・fstat 突合）は
+    差し替え先の外部ディレクトリに元ファイルと同じ inode をハードリンクしておけば fstat 突合を
+    すり抜けた——fstat は一致する（同じ inode）が、実際の open は KB 外のディレクトリを経由して
+    いる＝封じ込めが壊れている（`_open_file_nofollow_walk` に切り替える前の実装ではここで読めて
+    しまっていた）。新しい実装は途中の `sub` が symlink に差し替わっている時点で `ELOOP` になり、
+    fstat 突合を待たずに拒否する。
+    """
+    world = "s3b-ancestor-toctou"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"sub/note.txt": "hello\n"})
+    wd = tmp_path / "kb" / world
+    monkeypatch.setattr(A.worlds, "world_dir", lambda w: wd)
+
+    real_resolved = A._safe_original_path(world, "sub/note.txt", None, kinds=A._FILE_HEAD_KINDS)
+    assert real_resolved is not None
+    monkeypatch.setattr(A, "_safe_original_path", lambda *a, **kw: real_resolved)
+
+    # 検査「後」に祖先ディレクトリ（最終要素ではなく sub/ 自体）を KB 外への symlink に差し替える。
+    # 差し替え先には元ファイルと同じ inode をハードリンクしておく（fstat 突合だけでは検出できない
+    # ことを実証する目的）。
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    sub_dir = wd / "sub"
+    os.link(str(sub_dir / "note.txt"), str(outside / "note.txt"))
+    shutil.rmtree(sub_dir)
+    sub_dir.symlink_to(outside)
+
+    res, docs, _, _ = A.run_tool("file_head", {"doc_id": "sub/note.txt"}, world, None)
+    assert res == {"error": "読み取りに失敗しました"}
+    assert docs == set()
+
+
+# ===== `_redact_deep` は文書順の状態付き走査（構造をまたぐ PEM 鍵ブロック）=====================
+# 以下は `_redact_deep`（`sherpa/agentic_search.py`）自体の直接テスト。
+# 以前は `_redact_unterminated_key_tail` が「合成した1本の text」にしか効かず、`paragraphs[].text`
+# ／`rows`／`pages[].text`／`notes` 等の**構造そのもの**に残る、要素をまたいだ鍵ブロックの断片は
+# 伏せ字にならなかった（`doc_readers` が返す形を模した dict で直接検証する・上の慣例と同じ）。
+
+def test_redact_deep_docx_paragraphs_redacts_pem_key_spanning_multiple_paragraphs():
+    result = {"paragraphs": [
+        {"i": 0, "style": "Normal", "text": "prefix -----BEGIN RSA PRIVATE KEY-----"},
+        {"i": 1, "style": "Normal", "text": "A" * 200},
+        {"i": 2, "style": "Normal", "text": "-----END RSA PRIVATE KEY----- suffix"},
+    ], "tables": []}
+    out = A._redact_deep(result)
+    texts = [p["text"] for p in out["paragraphs"]]
+    assert "prefix" in texts[0] and "BEGIN" not in texts[0] and "[REDACTED]" in texts[0]
+    assert texts[1] == "[REDACTED]"                       # 中間の段落（鍵本文のみ）は丸ごと伏せる
+    assert "suffix" in texts[2] and "END" not in texts[2] and "[REDACTED]" in texts[2]
+
+
+def test_redact_deep_xlsx_rows_redacts_pem_key_spanning_multiple_cells():
+    result = {"sheet": "Sheet1", "range": "A1:A3", "truncated": False,
+             "rows": [["prefix -----BEGIN RSA PRIVATE KEY-----"], ["A" * 200],
+                      ["-----END RSA PRIVATE KEY----- suffix"]]}
+    out = A._redact_deep(result)
+    r0, r1, r2 = out["rows"]
+    assert "prefix" in r0[0] and "BEGIN" not in r0[0] and "[REDACTED]" in r0[0]
+    assert r1[0] == "[REDACTED]"
+    assert "suffix" in r2[0] and "END" not in r2[0] and "[REDACTED]" in r2[0]
+
+
+def test_redact_deep_pdf_pages_redacts_pem_key_spanning_multiple_pages():
+    result = {"truncated": False, "pages": [
+        {"no": 1, "text": "prefix -----BEGIN RSA PRIVATE KEY-----"},
+        {"no": 2, "text": "A" * 200},
+        {"no": 3, "text": "-----END RSA PRIVATE KEY----- suffix"},
+    ]}
+    out = A._redact_deep(result)
+    p0, p1, p2 = out["pages"]
+    assert "prefix" in p0["text"] and "BEGIN" not in p0["text"] and "[REDACTED]" in p0["text"]
+    assert p1["text"] == "[REDACTED]"
+    assert "suffix" in p2["text"] and "END" not in p2["text"] and "[REDACTED]" in p2["text"]
+
+
+# ===== RV2巡目 #5/#6/#7/#8: `_finish_reader_result`/`_doc_reader_text_locator` の仕上げ ==========
+# これらは `doc_readers` の出力を受け取る純関数（world/scope/実ファイルを知らない）なので、
+# 実際のファイルではなく `doc_readers` が返す形を模した dict で直接検証する
+# （`tests/unit/test_doc_readers.py` の実際の出力例と同じ形＝`i`/`row_start`/`total_rows`/`rows` 等）。
+
+def test_finish_reader_result_pdf_single_page_too_big_keeps_truncated_text():
+    """RV2巡目#6 是正: 1ページ（1件）だけでもバイト予算を超える場合、以前は二分探索の結果
+    `pages` が空（0件）になり本文が丸ごと消えていた。先頭1件を予算内へ切り詰めて
+    `text_truncated: true` を立てて残す（番号・locator は保つ）。"""
+    text = "あ" * 3000   # 日本語3,000字（UTF-8で1文字3バイト＝素の text だけで9,000バイト超）
+    result = {"total": 1, "pages": [{"no": 1, "text": text}], "truncated": False}
+    out = A._finish_reader_result("pdf_pages", result, "big.pdf", 16384)
+    assert "error" not in out
+    assert len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 16384
+    assert out["truncated"] is True
+    assert len(out["pages"]) == 1
+    assert out["pages"][0]["no"] == 1
+    assert out["pages"][0]["text_truncated"] is True
+    assert out["pages"][0]["text"]                 # 空にはしない
+    assert out["locator"] == "pages[1]"
+
+
+def test_finish_reader_result_docx_single_paragraph_too_big_keeps_truncated_text():
+    """1段落（1件）だけでもバイト予算を超える場合、以前は二分探索の結果
+    `paragraphs` が空（0件）になり本文が丸ごと消えていた（`pdf_pages` の RV2巡目#6 と同じ穴が
+    `docx_paragraphs` に残っていた）。先頭1段落を予算内へ切り詰めて `text_truncated: true` を
+    立てて残す。"""
+    text = "あ" * 3000   # 日本語3,000字（UTF-8で1文字3バイト＝素の text だけで9,000バイト超）
+    result = {"total": 1, "total_tables": 0, "paragraphs": [{"i": 0, "style": "Normal", "text": text}],
+             "tables": [], "truncated": False}
+    out = A._finish_reader_result("docx_paragraphs", result, "big.docx", 16384)
+    assert "error" not in out
+    assert len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 16384
+    assert out["truncated"] is True
+    assert len(out["paragraphs"]) == 1
+    assert out["paragraphs"][0]["i"] == 0
+    assert out["paragraphs"][0]["text_truncated"] is True
+    assert out["paragraphs"][0]["text"]                 # 空にはしない
+
+
+def test_finish_reader_result_docx_tables_are_clipped_to_budget():
+    """RV2巡目#5 是正: 表（`tables`）もバイト予算の削減対象にする——以前は段落だけを二分探索し、
+    表は丸ごと残っていたため大きな表があると予算を超え得た（50×8 の表）。"""
+    rows = [[f"r{r}c{c}" * 20 for c in range(8)] for r in range(50)]
+    result = {"paragraphs": [], "tables": [{"i": 0, "row_start": 0, "total_rows": 50, "rows": rows}],
+             "truncated": False}
+    out = A._finish_reader_result("docx_paragraphs", result, "big.docx", 65536)
+    assert "error" not in out
+    assert len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 65536
+    assert out["truncated"] is True
+    assert len(out["tables"]) == 1
+    assert 0 < len(out["tables"][0]["rows"]) < 50
+    assert out["tables"][0]["row_truncated"] is True
+
+
+def test_finish_reader_result_xlsx_range_updates_range_and_locator_after_row_clip():
+    """RV2巡目#7 是正: 行がバイト予算で削られたら `range`（延いては `locator`）も実際に返した
+    行数へ更新する——以前は行を減らしても `range` が元の（削る前の）範囲のまま食い違って残った。
+    """
+    rows = [[f"v{r}" * 100] for r in range(50)]
+    result = {"sheet": "Sheet1", "range": "A1:A50", "rows": rows, "truncated": False}
+    out = A._finish_reader_result("xlsx_range", result, "big.xlsx", 8192)
+    assert "error" not in out
+    assert len(json.dumps(out, ensure_ascii=False).encode("utf-8")) <= 8192
+    assert out["truncated"] is True
+    n = len(out["rows"])
+    assert 0 < n < 50
+    assert out["range"] == f"A1:A{n}"
+    assert out["locator"] == f"Sheet1!A1:A{n}"
+
+
+def test_doc_reader_text_locator_docx_table_only_produces_nonempty_text():
+    """RV2巡目#8 是正: 段落が無く表だけの docx でも本文合成の対象にする——以前は段落だけを見て
+    いたため、表しか無い docx の read_evidence の text が常に空になっていた。
+
+    locator は表の「表番号の範囲」だけでなく実際に返した行範囲
+    （`row_start`〜`row_start+len(rows)-1`）も含む（`paragraphs[s-e];tables[ts-te]rows[rs-re]`
+    の形・段落が無いのでここは tables 部分だけになる）——表ページングの区別に使う。"""
+    result = {"paragraphs": [], "tables": [{"i": 0, "row_start": 0, "total_rows": 2,
+                                           "rows": [["h1", "h2"], ["v1", "v2"]]}]}
+    text, locator = A._doc_reader_text_locator("docx_paragraphs", result)
+    assert text
+    assert "表0行0" in text
+    assert "h1" in text and "v2" in text
+    assert locator == "tables[0-0]rows[0-1]"
+
+
+def test_doc_reader_text_locator_pptx_includes_tables_and_notes():
+    """RV2巡目#8 是正: pptx の表・ノートも本文合成の対象にする（テキストだけだと表の内容や
+    ノートの補足が read_evidence から丸ごと落ちていた）。"""
+    result = {"slides": [{"no": 1, "texts": ["title"], "tables": [[["a", "b"]]], "notes": "memo"}]}
+    text, locator = A._doc_reader_text_locator("pptx_slides", result)
+    assert "title" in text
+    assert "a" in text and "b" in text
+    assert "memo" in text
+    assert locator == "slides[1]"
+
+
+def test_doc_reader_text_locator_docx_table_row_paging_distinguishes_locator():
+    """表だけを `table_row_start` を進めて呼び直した（行のページング）2回の
+    結果は、段落の locator（`paragraphs[s-e]`）が同じでも表の行範囲が異なる——以前は段落側の
+    範囲だけを locator にしていたため2回とも同じ locator に潰れ、`InvestigationState` で
+    別読み取りとして区別できなかった（`_find` は kind="read"／span=None のとき locator も
+    鍵に含める）。"""
+    from sherpa.investigation_state import InvestigationState
+
+    def _page(row_start: int) -> dict:
+        return {"paragraphs": [{"i": 0, "style": "Normal", "text": "見出し"}],
+                "tables": [{"i": 0, "row_start": row_start, "total_rows": 60,
+                           "rows": [[f"T{row_start + i}"] for i in range(50)]}],
+                "truncated": True}
+
+    r0, r50 = _page(0), _page(50)
+    _, locator0 = A._doc_reader_text_locator("docx_paragraphs", r0)
+    _, locator50 = A._doc_reader_text_locator("docx_paragraphs", r50)
+    assert locator0 != locator50
+    assert locator0 == "paragraphs[0-0];tables[0-0]rows[0-49]"
+    assert locator50 == "paragraphs[0-0];tables[0-0]rows[50-99]"
+
+    state = InvestigationState(question="q", scope={})
+    for row_start, r in ((0, r0), (50, r50)):
+        text, locator = A._doc_reader_text_locator("docx_paragraphs", r)
+        synthetic = {**r, "doc_id": "big.docx", "text": text, "locator": locator}
+        state.add_tool_result("docx_paragraphs", {"doc_id": "big.docx", "table_row_start": row_start},
+                              synthetic, [], None)
+    reads = [e for e in state.evidence if e.kind == "read" and e.doc_id == "big.docx"]
+    assert len(reads) == 2
+
+
+def test_run_tool_original_read_tools_registered_in_openai_and_gemini_and_mcp():
+    from sherpa import mcp_server
+    names_openai = {t["function"]["name"] for t in A.openai_tools(with_es=True, with_graph=True)}
+    names_gemini = {f["name"] for f in A.gemini_tools(with_es=True, with_graph=True)[0]["functionDeclarations"]}
+    names_mcp = {d["name"] for d in mcp_server._tool_defs()}
+    for name in ("xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head"):
+        assert name in names_openai, name
+        assert name in names_gemini, name
+        assert name in names_mcp, name
+
+
+def test_finish_docx_paragraphs_result_keeps_paragraphs_before_big_tables():
+    """大きな表を持つ docx でも段落が先に確保され、余った予算で表の行が入る（段落 0 件にならない）。"""
+    paras = [{"i": i, "style": "Normal", "text": f"段落{i} " + "あ" * 50} for i in range(30)]
+    tables = [{"i": t, "row_start": 0, "total_rows": 50, "rows": [["セル" * 40] * 8 for _ in range(50)]} for t in range(20)]
+    result = {"total": 30, "total_tables": 20, "paragraphs": paras, "tables": tables, "truncated": False}
+    r = A._finish_docx_paragraphs_result(result, "big.docx", 262144)
+    assert len(r["paragraphs"]) == 30 and r["truncated"] is True
+    assert sum(len(t["rows"]) for t in r["tables"]) > 0
+    assert A._result_byte_size(r) <= 262144
+
+
+def test_finish_docx_paragraphs_result_rescues_paragraph_even_with_small_table():
+    """RV是正: 小さな表が1行でもあると、以前は「表1行だけなら丸ごと入る」（`best_n_rows > 0`）
+    が先に成立して即座に返ってしまい、長い段落の救済（`_shrink_single_item_result`）へ
+    絶対に到達しなかった（段落が全部消え、表1行だけが残る）。段落0件のときは表があっても
+    必ず救済を経由し、先頭段落を予算内へ切り詰めて（`text_truncated`）確保した上で、表の行も
+    一緒に残す。"""
+    text = "あ" * 3000   # 日本語3,000字（合成 text と二重化されるため単体でも budget を超える）
+    result = {"total": 1, "total_tables": 1,
+             "paragraphs": [{"i": 0, "style": "Normal", "text": text}],
+             "tables": [{"i": 0, "row_start": 0, "total_rows": 1, "rows": [["r1c1"]]}],
+             "truncated": False}
+    r = A._finish_docx_paragraphs_result(result, "big.docx", 16384)
+    assert "error" not in r
+    assert len(json.dumps(r, ensure_ascii=False).encode("utf-8")) <= 16384
+    assert r["truncated"] is True
+    assert len(r["paragraphs"]) == 1
+    assert r["paragraphs"][0]["text_truncated"] is True
+    assert r["paragraphs"][0]["text"]                       # 空にはしない
+    assert len(r["tables"]) == 1 and r["tables"][0]["rows"] == [["r1c1"]]   # 表の行も残る
+
+
+def test_finish_docx_paragraphs_result_rescue_secures_paragraph_before_big_table_row():
+    """段落が1件も丸ごと入らず、かつ表の1行がそれ自体で予算の大半を占めるほど大きい場合——
+    以前は「段落0件を前提にした行数」の表をまず確保してから段落を切り詰めていたため、表が
+    予算をほぼ使い切り、救済した段落の text が空文字になり、しかも合計サイズが予算を
+    超えてしまっていた（空の段落を足しても表側の見積もりが更新されないため）。表を0行にした
+    状態で先に段落を救済してから、残り予算で表の行数を決める順序に直すと、段落本文が非空の
+    まま、合計サイズも予算内に収まる。"""
+    text = "あ" * 3000                      # 単体でも合成 text と二重化されて budget を超える
+    result = {"total": 1, "total_tables": 1,
+             "paragraphs": [{"i": 0, "style": "Normal", "text": text}],
+             "tables": [{"i": 0, "row_start": 0, "total_rows": 1, "rows": [["x" * 8050]]}],
+             "truncated": False}
+    r = A._finish_docx_paragraphs_result(result, "big.docx", 16384)
+    assert "error" not in r
+    assert len(json.dumps(r, ensure_ascii=False).encode("utf-8")) <= 16384
+    assert r["truncated"] is True
+    assert len(r["paragraphs"]) == 1
+    assert r["paragraphs"][0]["text_truncated"] is True
+    assert r["paragraphs"][0]["text"]                       # 空にはしない（以前は "" になっていた）
+
+
+def test_hit_summary_node_list_docs_shows_doctype_state_filters_not_whole():
+    node = A._hit_summary_node("list_docs", {"doctype": "Excel"}, {"count": 12, "docs": []})
+    assert "「全体」" not in node["detail"] and "種別=Excel" in node["detail"] and "12件" in node["detail"]
+    node = A._hit_summary_node("list_docs", {"path_prefix": "4期", "state": "ready"}, {"count": 3, "docs": []})
+    assert "4期（状態=ready）" in node["detail"]
+    assert A._tool_node("list_docs", {})["detail"] == "「全体」"
+
+
+def test_hit_summary_node_graph_neighbors_shows_truncation_and_total():
+    node = A._hit_summary_node("graph_neighbors", {"name": "TAXRATE"},
+                               {"neighbors": [{"name": "A"}] * 30, "truncated": True, "count": 500})
+    assert "30件" in node["detail"] and "全 500 件" in node["detail"]
+
+
+def test_hit_summary_node_sub_graph_neighbors_shows_truncation():
+    node = A._hit_summary_node_sub("graph_neighbors",
+                                   {"neighbors": [{"name": "A"}] * 30, "truncated": True, "count": 500})
+    assert "全 500 件" in node["detail"]
+
+
+def test_hit_summary_nodes_mark_compare_truncation():
+    res = {"status": "comparable", "diff": "--- a\n+++ b\n+a\n-b\n", "truncated": True}
+    assert "上限で打ち切り" in A._hit_summary_node("compare_documents", {"left_doc_id": "a", "right_doc_id": "b"}, res)["detail"]
+    assert "上限で打ち切り" in A._hit_summary_node_sub("compare_documents", res)["detail"]
+
+
+def test_hit_summary_nodes_mark_outline_file_truncation():
+    res = {"doc_id": "x.md", "count": 25, "headings": [], "truncated": False, "file_truncated": True}
+    assert "件数は過小" in A._hit_summary_node("doc_outline", {"doc_id": "x.md"}, res)["detail"]
+    assert "件数は過小" in A._hit_summary_node_sub("doc_outline", res)["detail"]
+
+
+def test_search_results_mark_truncated_when_hit_cap_reached(monkeypatch):
+    from sherpa import grep_tool
+    fake = [{"doc_id": f"d{i}.md", "line": 1, "text": "x", "span": [1, 1]} for i in range(3)]
+    monkeypatch.setattr(grep_tool, "grep_search", lambda *a, **k: list(fake))
+    res, *_ = A.run_tool("ripgrep_search", {"query": "x"}, "v1", None, max_hits=3)
+    assert res.get("truncated") is True
+    monkeypatch.setattr(grep_tool, "grep_search", lambda *a, **k: list(fake[:2]))
+    res, *_ = A.run_tool("ripgrep_search", {"query": "x"}, "v1", None, max_hits=3)
+    assert "truncated" not in res
+
+
+def test_hit_summary_nodes_mark_search_hit_cap():
+    res = {"hits": [{"doc_id": "a.md"}] * 30, "truncated": True}
+    assert "上限で打ち切り" in A._hit_summary_node("ripgrep_search", {"query": "q"}, res)["detail"]
+    assert "上限で打ち切り" in A._hit_summary_node_sub("ripgrep_search", res)["detail"]
+    assert "上限で打ち切り" in A._hit_summary_node_sub("es_search", res)["detail"]
+
+
+def test_es_search_cap_is_judged_on_raw_hits_before_filtering(monkeypatch):
+    from sherpa import es_index, documents
+    raw = [{"doc_id": f"d{i}.md", "line": 1, "text": "x", "score": 1.0, "span": [1, 1]} for i in range(3)]
+    monkeypatch.setattr(es_index, "search", lambda *a, **k: (list(raw), None))
+    monkeypatch.setattr(documents, "world_rel_set", lambda *a, **k: {"d0.md", "d1.md"})   # 1 件は実在せず落ちる
+    res, *_ = A.run_tool("es_search", {"query": "x"}, "v1", None, max_hits=3)
+    assert res.get("truncated") is True and len(res["hits"]) <= 2

@@ -36,7 +36,6 @@ def _setup(tmp_path: Path, monkeypatch, users_dirname: str = "users") -> Path:
     bin_dir.mkdir()
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "30")
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")   # 平文の偽 codex＝構造化応答は使わない
     return bin_dir
 
@@ -233,7 +232,6 @@ def test_same_item_id_across_auto_continue_attempts_counts_total_two(tmp_path, m
     _write_fake_codex_multi(bin_dir, argv_log, plan_path, plan)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users_mcp_continue"))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "30")
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")   # 平文の偽 codex＝構造化応答は使わない
     prov = A.CodexProvider()
     ctx = A.Ctx(

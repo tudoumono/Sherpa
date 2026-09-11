@@ -816,6 +816,10 @@ class UsageTokenByKind(BaseModel):
     chat 行は messages.answer->'usage' 由来（トークン列は常に int）。それ以外の kind（`metering.KINDS`
     参照・intent/embed/graph_ask/vlm 等）は usage_events 由来で、プロバイダが usage を報告しなかった
     行はトークン列が None（「報告不能」マーカー・0 に丸めない）。
+
+    `elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n`（STAT-3 S2・2026-09-11-利用統計の拡充.md T2）:
+    usage_events.elapsed_ms（計測スコープの無い呼び出しは NULL）の合計・平均（NULL 行を除く）・
+    計測ありの行数。chat 行は対象外（別契約）＝常に total/avg=None・n=0。
     """
     kind: str
     provider: str
@@ -825,6 +829,9 @@ class UsageTokenByKind(BaseModel):
     cached_input: int | None
     output: int | None
     reasoning_output: int | None
+    elapsed_ms_total: int | None
+    elapsed_ms_avg: float | None
+    elapsed_n: int
 
 
 class UsageTokens(BaseModel):
@@ -1469,6 +1476,7 @@ class ChatTurnRunning(BaseModel):
     turn_id: str
     conversation_id: int
     started_at: str
+    uid: str | None = None   # `all=true`（管理者）のときだけ値が入る（それ以外は null）
 
 
 class ChatTurnsRunningResponse(BaseModel):

@@ -281,6 +281,27 @@ def test_worker_marks_job_stale_before_reading_source(monkeypatch):
     assert calls and calls[0][0] == (9, "token")
 
 
+def test_worker_excludes_sensitive_source_before_reading_body(monkeypatch, tmp_path):
+    """更新前に投入された秘匿名（`credentials.png` 等）ジョブは `load_ir`（本文＝画像読み取り）へ
+    到達する前に対象外化する（`text_kind.is_sensitive_doc_id`・台帳 #92）。再試行させない
+    （`mark_stale` で終端化）・失敗件数に数えない（`status="excluded_sensitive"`≠failed）。"""
+    ir, asset_root, _decision, job = _picture_route(tmp_path)
+    del ir, asset_root
+    job = {**job, "source_rel_path": "credentials.png"}
+    calls = []
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_stale", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    result = ocr_worker.run_once(
+        "worker-1", engine=FakeEngine(), canonical_is_current=lambda world, generation: True,
+        load_ir=lambda leased: (_ for _ in ()).throw(AssertionError("must not load sensitive body")),
+        resolve_source=lambda leased: Path("unreachable"), resolve_asset_root=lambda leased: Path("unreachable"),
+    )
+    assert result.status == "excluded_sensitive"
+    assert calls and calls[0][0] == (job["id"], job["lease_token"])
+
+
 def test_fake_engine_protocol_still_supports_successful_non_cached_unit_run(monkeypatch, tmp_path):
     ir, asset_root, _decision, job = _picture_route(tmp_path)
     engine = FakeEngine()
@@ -698,6 +719,55 @@ def test_refresh_worker_streams_manifests_and_persists_cursor(monkeypatch, tmp_p
     assert progress[0]["cursor_rel_path"].endswith(".ocr_route.json")
 
 
+def test_refresh_worker_excludes_sensitive_evidence_and_does_not_reenqueue(monkeypatch, tmp_path):
+    """`run_refresh_once` は秘匿名（`credentials.png` 等）の Evidence を読まずに除外し、
+    再投入しない（`text_kind.is_sensitive_doc_id`・台帳 #92）——`evidence_ir.from_json_str` へ
+    到達させない・`enqueue_manifest_jobs` を呼ばない。"""
+    ir, asset_root, _decision, _job = _picture_route(tmp_path)
+    del asset_root
+    generation_root = tmp_path / "canonical"
+    sensitive_rel = "credentials.png"
+    route_path = generation_root / f"{sensitive_rel}.ocr_route.json"
+    evidence_path = generation_root / f"{sensitive_rel}.evidence.json"
+    route_path.parent.mkdir(parents=True)
+    source_manifest = ocr_router.build_manifest(ir, source_rel_path=sensitive_rel, assets=[])
+    route_path.write_text(ocr_router.to_json_str(source_manifest), encoding="utf-8")
+    evidence_path.write_text(evidence_ir.to_json_str(ir), encoding="utf-8")
+    refresh = {
+        "id": 8, "world": "world-a", "canonical_generation_id": GENERATION_ID,
+        "engine_profile_hash": ocr_worker.profile_hash(), "lease_token": "refresh-token",
+        "cursor_rel_path": None,
+    }
+    enqueue_calls = []
+    progress = []
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_refresh_run", lambda *args, **kwargs: refresh)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_refresh_run", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        ocr_worker.ocr_jobs, "enqueue_manifest_jobs",
+        lambda *args, **kwargs: enqueue_calls.append(args) or [{"id": 1}],
+    )
+    monkeypatch.setattr(
+        ocr_worker.ocr_jobs, "update_refresh_run_progress",
+        lambda *args, **kwargs: progress.append(kwargs) or True,
+    )
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_refresh_run", lambda *args, **kwargs: refresh)
+    monkeypatch.setattr(
+        ocr_worker.evidence_ir, "from_json_str",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not read sensitive evidence")),
+    )
+
+    result = ocr_worker.run_refresh_once(
+        "worker-1", engine_profile_hash=ocr_worker.profile_hash(),
+        canonical_is_current=lambda world, generation: True,
+        resolve_generation_root=lambda world, generation: generation_root,
+    )
+
+    assert result.status == "refresh_completed"
+    assert result.manifests_processed == 0 and result.jobs_enqueued == 0
+    assert enqueue_calls == []
+    assert progress == []
+
+
 def test_observation_generation_gc_keeps_pointer_current_and_previous(tmp_path):
     active = "a" * 64
     old_canonical = "b" * 64
@@ -770,3 +840,34 @@ def test_sigterm_sets_stop_flag_and_records_stopping_heartbeat(monkeypatch, tmp_
 
     assert ocr_worker.main(["--worker-id", "test-worker", "--poll-seconds", "0.01"]) == 0
     assert heartbeat_statuses[-1] == "stopping"
+
+
+def test_standard_publisher_skips_sensitive_succeeded_rows_without_loading_ir(monkeypatch, tmp_path):
+    """更新前に成功した秘匿名ジョブ（credentials.png）は再公開経路でも Evidence を読み直さない。"""
+    events = []
+    loaded = []
+    snapshot = {"row_count": 1, "min_id": 1, "max_id": 1, "id_sum": 1}
+    rows = [{"source_rel_path": "img/credentials.png", "result_payload": {}, "result_observation_set_hash": "x"}]
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(rows))
+    captured = {}
+
+    def fake_publish_snapshot_stream(*args, **kwargs):
+        # records（generator）を消費して、秘匿行が yield されない（＝load_ir も呼ばれない）ことを確かめる
+        captured["n"] = sum(1 for _ in kwargs["records"])
+        return {"status": "published"}
+
+    monkeypatch.setattr(ocr_worker.observation_render, "publish_snapshot_stream", fake_publish_snapshot_stream)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
+                        lambda world, generation, selected: events.append("marked"))
+    monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
+    publisher = ocr_worker.build_standard_publish_callback(
+        resolve_derived_root=lambda world: tmp_path,
+        canonical_is_current=lambda world, generation: True,
+        load_ir=lambda row: loaded.append(row) or object(),
+        on_published=lambda world, generation: events.append("reindexed"),
+    )
+    publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
+    assert loaded == []                 # 秘匿行では load_ir を呼ばない
+    assert captured.get("n") == 0       # 秘匿行は records から出ない
+

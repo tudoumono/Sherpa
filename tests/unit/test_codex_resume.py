@@ -228,7 +228,6 @@ def _setup(tmp_path: Path, monkeypatch, users_dirname: str = "users") -> tuple[P
     _write_fake_codex(bin_dir, argv_log)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "30")
     # 偽 codex は平文 agent_message を返す（resume 配線の検証が目的で出力スキーマは対象外）。
     # `--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため無効化する
     # （docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
@@ -541,7 +540,6 @@ def test_resume_retry_skipped_when_stopped_mid_attempt(tmp_path, monkeypatch):
     import threading
 
     _bin_dir, argv_log = _setup(tmp_path, monkeypatch, users_dirname="users_stop_resume")
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "120")   # Timer が先に発火して停止経路の検証を汚染しないよう大きく
     prov = A.CodexProvider()
     stop_event = threading.Event()
     ctx = _ctx(uid="r1b-stop", conversation_id=404, codex_session_id="SID-STALL")

@@ -54,7 +54,6 @@ def _setup(tmp_path: Path, monkeypatch, users_dirname: str = "users") -> Path:
     bin_dir.mkdir()
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "30")
     return bin_dir
 
 
@@ -112,7 +111,6 @@ def test_stopped_before_any_output_keeps_deterministic_fallback(tmp_path, monkey
     """ユーザーが即座に停止した場合、codex が無応答でも「認証エラーらしき」文言は出さない
     （stop は失敗ではないため・既存の決定的回答フォールバックのまま）。"""
     bin_dir = _setup(tmp_path, monkeypatch, users_dirname="users_stopped")
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "120")   # timeout が先に発火しないよう十分大きく
     # stdout には何も書かず、stop 監視スレッドに検知される前に少し待ってから終了する
     # （_spawn_stop_watcher は 0.3秒間隔でポーリング）。
     _write_fake_codex(bin_dir, "#!/bin/bash\nsleep 5\n")
@@ -141,31 +139,6 @@ def test_stopped_before_any_output_keeps_deterministic_fallback(tmp_path, monkey
 
 
 # ===== (3) 一部出力はあるが agent_message が無いまま失敗 → 既存の決定的回答フォールバックのまま =====
-
-# ===== (2.5) timeout kill による無出力失敗 → 文言に「タイムアウトしました」が反映される =====
-# RV MED（2026-08-18 Codex RV 指摘4）: 以前は無出力失敗を一律「認証されていない可能性」と断定していたが、
-# timeout kill・プロキシ/CA 不備・sandbox 起動失敗・CLI クラッシュのいずれでも同じ経路に来る（閉域では
-# むしろプロキシ/ネットワーク要因の方が現実的）。判別できる材料（killer が実際に発火したか）は反映する。
-
-def test_timeout_kill_with_no_output_mentions_timeout_not_auth_only(tmp_path, monkeypatch):
-    """test_codex_kill_timeout.py と同じ「小さい SHERPA_CODEX_TIMEOUT ＋ 長時間 sleep する偽 codex」
-    方式だが、こちらは stdout に**一切出力しない**版（got_any_line=False のまま）で無出力失敗の
-    判定条件（(1)と同じ）を満たしつつ、原因が「即終了」ではなく「timeout」であることを区別する。"""
-    bin_dir = _setup(tmp_path, monkeypatch, users_dirname="users_timeout")
-    monkeypatch.setenv("SHERPA_CODEX_TIMEOUT", "1")   # _setup の既定(30)を上書き＝すぐ timeout させる
-    _write_fake_codex(bin_dir, "#!/bin/bash\nsleep 30\n")   # 何も出力せず timeout まで待つだけ
-
-    prov = A.CodexProvider()
-    ctx = _ctx(uid="timeout-u1")
-
-    env = _result_env(_run(prov, ctx))
-    assert "接続できません" in env["headline"], f"未接続だと分かる文言になっていない: {env!r}"
-    assert "タイムアウトしました" in env["headline"], (
-        f"timeout kill 経路なのに区別が文言に反映されていない: {env!r}")
-    # 認証だけを原因と決め打ちしない（複数の可能性を挙げる・原因は断定しない）。
-    assert "可能性があります" not in env["headline"], (
-        f"以前の断定的な文言（認証されていない可能性があります）が残っている: {env!r}")
-
 
 def test_partial_tool_output_then_failure_keeps_deterministic_fallback(tmp_path, monkeypatch):
     """got_any_line=True（何らかの JSON は出た）だが agent_message が無いまま非ゼロ終了する場合は、

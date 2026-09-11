@@ -73,7 +73,8 @@ def _upload(filename: str, content: bytes) -> dict:
 
 def _chat_personal(message: str, personal: bool = True, cid: int | None = None) -> dict:
     """personal フラグ付きで /chat (POST) を呼ぶ（ナレッジ参照 OFF・personal 指定）。"""
-    body: dict = {"message": message, "personal": personal, "knowledge": False}
+    import uuid
+    body: dict = {"message": message, "personal": personal, "knowledge": False, "stream_id": uuid.uuid4().hex}
     if cid is not None:
         body["conversation_id"] = cid
     r = client.post("/chat", json=body)
@@ -368,11 +369,12 @@ def test_blocker1_flag_failure_prevents_answer_save():
 
     server_error_raised = False
     try:
+        import uuid
         with patch("sherpa.store.set_contains_personal_workspace",
                    side_effect=RuntimeError("DB write failure")), \
              patch("sherpa.store.add_message", side_effect=_tracking_add):
             r = client.post("/chat", json={
-                "message": "BLOCKER1_FAIL_TEST", "personal": True, "knowledge": False})
+                "message": "BLOCKER1_FAIL_TEST", "personal": True, "knowledge": False, "stream_id": uuid.uuid4().hex})
         # raise_server_exceptions=False 相当で 500 を受け取った場合。
         assert r.status_code >= 400, \
             f"BLOCKER-1: flag write 失敗でも 200 が返った（{r.status_code}）"

@@ -9,9 +9,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from sherpa import corpus_docs, doc_ledger, documents, es_index, preview_service, scope, store, worlds
 from sherpa.ingest import importance as imp
 from sherpa.ingest import worker
+
+# `.md`＝「設計書」等の固定 doctype を前提にする箇所がある——フォークが正規の拡張アナライザを
+# 登録していても赤にならないよう、登録簿を上流限定に固定する（開発ハーネス S4・敵対 RV 是正・
+# docs/21-拡張の契約.md）。
+pytestmark = pytest.mark.usefixtures("upstream_only_registry")
 
 
 def _write(p: Path, text: str) -> None:

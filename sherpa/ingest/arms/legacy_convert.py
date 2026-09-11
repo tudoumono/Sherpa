@@ -353,11 +353,6 @@ def office_com_mode() -> str:
     return "unavailable"
 
 
-def excel_display_available() -> bool:
-    """Office-native表示補完に必要なMicrosoft Excelがworker profile上で利用可能か。"""
-    return "excel" in _office_com_available_apps()
-
-
 # ---- office_com（http: Windows 側ワーカーへの HTTP・W1）----
 
 def _office_com_url() -> str | None:
@@ -393,12 +388,6 @@ def office_com_configured_url() -> str | None:
     「保存済み」URL。現状は env `SHERPA_OFFICE_COM_URL` のみ（system_settings には url/token を持たない・
     転送方式（`office_transfer_mode`）だけが system_settings 対応・今回のスコープ外）。未設定は None。"""
     return _office_com_url()
-
-
-def office_com_configured_token() -> str | None:
-    """`office_com_configured_url` と対の「保存済み」トークン（env `SHERPA_OFFICE_COM_TOKEN`）。
-    **値そのものを HTTP 応答へ含めないこと**（呼び出し側の責務・secrets 漏洩防止・W1 RV Med と同じ方針）。"""
-    return _office_com_token()
 
 
 def _fetch_healthz(url: str) -> dict | None:

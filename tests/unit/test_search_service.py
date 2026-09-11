@@ -398,6 +398,45 @@ def test_search_keyword_and_vector_tolerate_es_hit_without_line():
                                    "judgement": None, "paths": None}
 
 
+def test_search_keyword_and_vector_exclude_sensitive_doc_ids(monkeypatch):
+    """秘匿名（更新前に索引化された `credentials.xlsx` 等）は `_parse_hits`（共有変換点）で
+    一律除外する——`/ext/v1/search` の snippet／親返し本文へ本文を返さない（台帳 #85〜#88）。"""
+    from sherpa import es_index
+    hits = [{"doc_id": "credentials.xlsx", "text": "secret", "score": 1.0, "ext": ".xlsx"},
+            {"doc_id": "report.xlsx", "text": "ok", "score": 0.5, "ext": ".xlsx"}]
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "search", lambda *a, **kw: (list(hits), None))
+    monkeypatch.setattr(es_index, "search_knn_only", lambda *a, **kw: (list(hits), None))
+    hits_k, _ = ss._search_keyword("w", "q", None, 10, None)
+    hits_v, _ = ss._search_vector("w", "q", None, 10, None)
+    assert [h["doc_id"] for h in hits_k] == ["report.xlsx"]
+    assert [h["doc_id"] for h in hits_v] == ["report.xlsx"]
+
+
+def test_search_keyword_and_vector_exclude_sensitive_before_parent_return(monkeypatch):
+    """秘匿名ヒットは `rag_parent_return.apply_to_hits`（親返し＝rag.md 全文読み）へ渡す前に
+    落とす（台帳 #92/#93）——後段の `_parse_hits` 除外だけだと、更新前に索引化された
+    `credentials.xlsx` 等の秘匿本文を親返しが一度読んで返却予算を消費してしまう。"""
+    from sherpa import es_index
+    hits = [{"doc_id": "credentials.xlsx", "text": "secret", "score": 1.0, "ext": ".xlsx"},
+            {"doc_id": "report.xlsx", "text": "ok", "score": 0.5, "ext": ".xlsx"}]
+    seen: list = []
+
+    def _spy_apply(world, given_hits):
+        seen.append([h["doc_id"] for h in given_hits])
+        return given_hits
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "search", lambda *a, **kw: (list(hits), None))
+    monkeypatch.setattr(es_index, "search_knn_only", lambda *a, **kw: (list(hits), None))
+    monkeypatch.setattr(ss.rag_parent_return, "apply_to_hits", _spy_apply)
+
+    ss._search_keyword("w", "q", None, 10, None)
+    ss._search_vector("w", "q", None, 10, None)
+
+    assert seen == [["report.xlsx"], ["report.xlsx"]]
+
+
 def test_search_keyword_and_vector_engines_tolerate_missing_line(monkeypatch):
     from sherpa import es_index
     rag_hit = {"doc_id": "a.docx", "text": "本文", "score": 1.0, "ext": ".docx", "chunk_id": "rc1"}

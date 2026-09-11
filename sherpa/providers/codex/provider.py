@@ -18,11 +18,10 @@ Codex(gpt-5.5) を頭脳にする実行本体一式をまとめる。`sherpa/age
 
 **危険地雷2〜5（計画書フェーズ5節）を1コミットで解消**: `CodexProvider.run`/`_run_authoring` は
 SSE 生成器の try/finally が唯一のクリーンアップ保証（`run_dir` 後始末＝`_run_authoring` 本体を包む
-frame・Popen ループの finally＝`killer.cancel()`→`_killpg`→`proc.wait(5)`→`shutil.rmtree(codex_home)`）
-のため、関数を丸ごと移し生成器フレームを分割するヘルパ抽出は行っていない。`threading.Timer` と
-`killer.cancel()` の対、`'ws_authoring' in dir()`（台帳登録ゲート・フレーム内省なので無改修で
-移す必要がある）、last-message tempfile の `unlink` 2箇所（ask_user 早期 return・通常経路）も
-元コードのまま保持した。
+frame・Popen ループの finally＝`_killpg`→`proc.wait(5)`→`shutil.rmtree(codex_home)`）
+のため、関数を丸ごと移し生成器フレームを分割するヘルパ抽出は行っていない。
+`'ws_authoring' in dir()`（台帳登録ゲート・フレーム内省なので無改修で移す必要がある）、
+last-message tempfile の `unlink` 2箇所（ask_user 早期 return・通常経路）も元コードのまま保持した。
 
 **相対 import の深さ調整（純移動の範囲内・S3〜S9 と同じ判断）**: `_plain_text` 内の
 `from . import chat_router`・`_run_authoring` 内の `from . import marp_render`・
@@ -72,6 +71,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import time
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -79,8 +79,9 @@ from typing import Iterator
 from ... import codex_agents_md, codex_skills, model_catalog
 from ... import depth_profile as depth_profile_mod
 from ... import layer as layer_mod
-from ..base import Ctx, Provider, _log, _node, _plain_run, _usage_meta
+from ..base import Ctx, Provider, _log, _log_chat_usage, _node, _plain_run, _usage_meta, _verified_sources
 from ..prompts import _facts, _kb_hint_abs
+from .citations import parse_referenced_doc_lines, verified_referenced_docs
 from .mcp import (
     _apply_codex_neighbors,
     _codex_ask_capture,
@@ -94,6 +95,8 @@ from .sandbox import (
     _codex_clean_env,
     _codex_sandbox_enabled,
     _detect_chrome_path,
+    _direct_read_roots,
+    _enumerate_sensitive,
     _kb_read_roots,
     _marp_bin,
     _openai_endpoint_kind,
@@ -102,6 +105,8 @@ from .sandbox import (
     _safe_codex_sessions_home,
     _safe_run_authoring,
     _safe_workspace_authoring,
+    _scope_deny_entries,
+    _venv_root,
     _web_search_c_args,
     _web_search_endpoint_note,
     _write_codex_authoring_config,
@@ -250,7 +255,7 @@ def _read_last_message_fallback(path: Path) -> str | None:
 
 # ---- F4（2026-07-07）: 回答 headline の選び方（進行中の作業宣言を見出しにしない）----
 # Codex は調査中に「これから〜する」という進行形の作業宣言を agent_message として複数回出すことがあり、
-# run が timeout/stop で途中終了すると **最後に届いた作業宣言**（実例:「…根拠の有無を切り分けます」）が
+# run が途中終了すると **最後に届いた作業宣言**（実例:「…根拠の有無を切り分けます」）が
 # env["headline"] になってしまう（結論でなく本文途中の一文が見出しに出る）。LLM を使わず決定的に、
 # 「結論を含む最後の agent_message」を優先し、末尾の作業宣言を落として選ぶ。
 # 注: 語尾は「これから調べる」という**次アクション動詞**に限定する（curated list）。汎用の「〜します」
@@ -323,7 +328,7 @@ def _pick_codex_headline(completed: list[str], partial: str = "") -> str:
     ①結論を含む最後の message を優先（末尾が作業宣言でも、その中の結論／それ以前の結論を拾う）。
     ②その message の末尾に連なる作業宣言文は落とす（`_trim_trailing_progress`）。
     ③どの message も作業宣言だけなら、最後の message をそのまま返す（本文先頭＝best effort）。
-    `partial`＝item.updated だけ来て item.completed が来なかった未完 message（timeout 時の保険）。
+    `partial`＝item.updated だけ来て item.completed が来なかった未完 message（打ち切り時の保険）。
     """
     msgs = [m.strip() for m in [*completed, partial] if m and m.strip()]
     if not msgs:
@@ -402,7 +407,8 @@ _CONTINUE_PROMPT = (
 # `next_step`）を求めているのはスキーマ有効時だけなので、継続の催促もその語彙に合わせる（§2-3）。
 _CONTINUE_PROMPT_SCHEMA = (
     "続けてください。途中経過の報告ではなく、調査を最後まで進めて `status` を `final` にした"
-    "最終回答（結論と根拠）を書いてください。"
+    "最終回答（結論と根拠）を書いてください。ただし全件・一覧・すべての依頼で対象範囲の確認が"
+    "終わっていなければ `final` にせず、`in_progress` のまま `next_step` に残りを書いてください。"
 )
 
 # ---- 出力スキーマ（`--output-schema`・docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3）----
@@ -486,7 +492,7 @@ class CodexProvider(Provider):
 
     取得（Neo4j/grep）は本物のツールで実行しつつ、**Codex 自身も原文を grep/参照で裏取り**する。
     Codex の **実コマンド実行（grep 等）・推論・回答**を `--json` から拾い **1つずつ思考ノードに流す**
-    （ユーザは Codex の作業を逐次見られる）。失敗/未導入/タイムアウトは決定的回答にフォールバック。
+    （ユーザは Codex の作業を逐次見られる）。失敗/未導入は決定的回答にフォールバック。
     既定 reasoning=low（`SHERPA_CODEX_REASONING` で変更可。RV依頼の xhigh とは別運用）。
     調べる深さ（調べ方ブロック §3.2・SC-6c）が「深く」「最大」のとき、ターンごとに high/xhigh へ
     per-turn 上書きする（`_prompt_mcp`/`_prompt` 呼び出し直前の `_reason` 計算箇所を参照）。
@@ -506,13 +512,11 @@ class CodexProvider(Provider):
         # **不正な非空値**（grandfather された旧値・破損 DB・接続確認の直接入力等）は黙って
         # 別モデルへ置換しない＝ honest failure として `InvalidModelNameError`（`ValueError` の
         # サブクラス）を送出する（呼び出し側 `sherpa/providers/__init__.py::_select_provider` が
-        # モデル名専用のこの型だけを捕捉し `_UnwiredProvider` として正直に失敗を伝える。他の理由
-        # （下記 `SHERPA_CODEX_TIMEOUT` の数値パース失敗等）の `ValueError` と混同しない）。
+        # モデル名専用のこの型だけを捕捉し `_UnwiredProvider` として正直に失敗を伝える）。
         # 表示したモデルと実行モデルが食い違う事故を防ぐ。
         if model and not model_catalog.CODEX_MODEL_NAME_RE.fullmatch(model):
             raise model_catalog.InvalidModelNameError(f"不正な Codex モデル名です: {model!r}")
         self.model = model or "gpt-5.5"
-        self._timeout = float(os.environ.get("SHERPA_CODEX_TIMEOUT", "180"))
         # Phase0・§5-1: ユーザーの希望（設定 codex_web_search）。実際に効くかは管理者フラグ次第
         # （_web_search_disabled_value が admin 許可と AND する）。
         self._web_search = bool(web_search)
@@ -552,7 +556,7 @@ class CodexProvider(Provider):
         sys = (self.system_prompt + "\n\n") if self.system_prompt else ""   # 回答方針（#2）を前置
         # MEDIUM-1 fix: cwd が workspace/authoring/ のため KB パスは絶対パスで渡す。
         # Phase0・§2: 出典列挙/文体等の共通ルールは AGENTS.md へ移した（質問固有部分のみここに残す）。
-        # RV HIGH（2026-07-03）: ただし containment/grounding（KB 以外を読まない・推測しない）は
+        # RV HIGH（2026-07-03）: ただし containment/grounding（KB 以外を読まない・確定と推定を分ける）は
         # AGENTS.md 書込失敗時（fail-open）でも消えないよう、短縮形をここにも常置する（多層防御・
         # AGENTS.md と重複しても害はない＝独立性を優先）。
         # 探す対象（層フィルタ）が限定されているターンは、この直接 grep 経路（MCP 無効時）自体を
@@ -561,9 +565,17 @@ class CodexProvider(Provider):
         base = (
             "あなたは社内ナレッジ調査エージェントです。以下の資料フォルダ"
             f"（{_kb_hint_abs(world)}）を **grep やファイル参照で実際に調べてください**。"
-            "**指定資料フォルダ以外は読まない。事実に無いことは書かない（推測しない）**（詳細ルールは AGENTS.md）。"
+            "Excel/Word/PowerPoint/PDF は Python（openpyxl・python-docx・python-pptx・pdfplumber）で"
+            "開いて読んでよい。"
+            "**指定資料フォルダ以外は読まない。確定した事実と推定は分けて書く**（詳細ルールは AGENTS.md）。"
             "**途中経過だけの応答（「次に〜を調べます」など）で終えない。調査を最後まで進めてから、"
             "結論と根拠を最終回答として書く。**"
+            # S2（提案書 Codex原本直読 §2-5）: この経路（MCP 無効・直接 grep/ファイル参照）で読んだ資料も
+            # 同様に、回答末尾の固定書式で Sherpa（citations.parse_referenced_doc_lines）に出典（原本DL）へ
+            # 変換させる。
+            "回答の最後に『参照した資料:』の行を置き、実際に開いて根拠にした資料を1行1件、"
+            "資料フォルダからの相対パス（例 `4期更改/02_設計/xxx.xlsx`）で列挙する。"
+            "Sherpaがこれを出典（原本ダウンロード）に変換する。"
         )
         if lens == "author":
             # P1-c（Codex 強化計画 Phase1）: author は回答でなく成果物ファイルを作る。
@@ -581,34 +593,89 @@ class CodexProvider(Provider):
             # R1a: 履歴があれば【質問】の前に前置（空文字なら従来と完全同一の出力）。
             f"{self._history_block()}【質問】{message}\n【参考（構造化済みの事実）】{_facts(lens, env)}")
 
-    def _prompt_mcp(self, message, lens, world):
+    def _prompt_mcp(self, message, lens, world, direct_read: bool = True, layer=None):
         """MCP 版プロンプト（Phase2b）。事実を前渡しせず、Codex に MCP ツールで自律調査させる。
         Phase0・§2: 出典列挙/文体等の共通ルールは AGENTS.md へ移した（ここは MCP ツール固有の使い分け
-        ＋ RV HIGH: containment/grounding の短縮形を常置＝AGENTS.md 書込失敗時の多層防御）。"""
+        ＋ RV HIGH: containment/grounding の短縮形を常置＝AGENTS.md 書込失敗時の多層防御）。
+
+        `direct_read`（既定 True・提案書 2026-09-10-Codex原本直読と調査スキル §2-4）: 原本直読
+        （permission profile で KB／派生ルートを read し、範囲は兄弟 deny・秘匿は個別 deny で表したうえで
+        コードインタープリターで直接開く）の可否。`_run_authoring` が秘匿列挙と範囲（`_scope_deny_entries`）
+        の成否から計算して渡す——失敗した（fail-closed）ターンだけ False（MCP のみへ縮退）。省略時
+        （既存呼び出し・単体テスト）は True＝現行の主経路（直読可）を案内する。"""
         sysp = (self.system_prompt + "\n\n") if self.system_prompt else ""
+        _read_block = (
+            "**原本は直接読んでよい（読取専用・指定された資料フォルダと派生フォルダの中だけ・"
+            "秘匿名のファイル（.env／鍵／credentials 等）は読まない）。"
+            # S3b（提案書2026-09-10 §2-9）: 主従は決めない——「まず読取ツールで原本を読む→
+            # 突合・集計など定型外だけ Python」の順。毎回 Python を書かせない＝トークンと
+            # 実行時間を削り、再現性を上げる。
+            "まず読取ツール（xlsx_sheets／xlsx_range／docx_paragraphs／pptx_slides／"
+            "pdf_pages／file_head）で原本を読む。複数ファイルの突合・集計など定型外の作業"
+            "だけ Python（openpyxl・python-docx・python-pptx・pdfplumber。集計は pandas）"
+            "で開く。テキスト・コードはそのまま読んでよい。"
+            "派生 MD／rag.md は補助。台帳・検索・グラフ・出典の確定は MCP ツールで行う。"
+            # S2（提案書 Codex原本直読 §2-5）: 直読した資料は MCP の結果に載らず出典（原本DL）に
+            # 自動では出ない——回答末尾に固定書式の行を書かせ、Sherpa（citations.parse_referenced_doc_lines）
+            # が台帳で実在確認したものだけ出典へ昇格する。
+            "回答の最後に『参照した資料:』の行を置き、実際に開いて根拠にした資料を1行1件、"
+            "資料フォルダからの相対パス（例 `4期更改/02_設計/xxx.xlsx`）で列挙する。"
+            "Sherpaがこれを出典（原本ダウンロード）に変換する。派生MD／rag.mdを見た場合も原本のパスで書く。**"
+            # S3（提案書 Codex原本直読 §2-6）: 質問の型に合う調査スキルへ誘導する（「まずツールで
+            # 当たりを付ける→原本の中身を確かめる」の順を具体化した手順書。読ませても直読不許可の
+            # ターン（direct_read=False）ではノイズ＝else 側には入れない）。
+            "**質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う"
+            " `.agents/skills` の investigate-* スキルを読んで、その手順（ツールで当たり→"
+            "原本の中身を確かめる→答える）どおりに進める。**"
+            if direct_read else
+            "**今回は原本の直接読み取りは使えない。資料の本文は MCP のツールで読む（KB 外は読まない）。**"
+        )
+        # 層（探す対象）は Codex に強制しない（直読は層に関係なく read）——限定されたターンだけ案内する。
+        _layer_block = {
+            "docs": "探す対象として資料（設計書・仕様書などのドキュメント）が指定されている＝直読でも資料を優先して見る。",
+            "code": "探す対象としてソース（プログラム・JCL・コピーブック）が指定されている＝直読でもソースを優先して見る。",
+        }.get(layer, "")
         base = (
             "あなたは社内ナレッジ調査エージェントです。MCP サーバ『sherpa』のツール"
             "（list_docs＝文書台帳の一覧/件数／ripgrep_search＝全文grep／glob_search＝ファイル名パターン／"
             "doc_outline＝見出し構造／read_doc＝通読（続きは start_line）／read_around＝周辺精読／"
-            "graph_neighbors＝関係グラフの関連部品／es_search＝日本語全文検索）を使って、"
+            "graph_neighbors＝関係グラフの関連部品／es_search＝日本語全文検索／"
+            "xlsx_sheets＝Excelのシート一覧／xlsx_range＝Excelのセル範囲／"
+            "docx_paragraphs＝Wordの段落・表／pptx_slides＝PowerPointのスライド／"
+            "pdf_pages＝PDFのページ／file_head＝テキスト・コードの先頭）を使って、"
             f"資料（{_kb_hint_abs(world)}）と関係グラフを**自分で調べてください**。"
-            "**MCP ツール以外でのファイル直接読み取りは禁止。事実に無いことは書かない（推測しない）**"
-            "（詳細ルールは AGENTS.md）。"
+            f"{_read_block}"
+            "まずツール（台帳・全文検索・グラフ）で当たりを付けてから、原本の中身を確かめて答える。"
+            f"{_layer_block}"
+            "確定した事実と推定は分けて書く（詳細ルールは AGENTS.md）。"
             "検索ヒットや精読結果に text_truncated が付いていたら、その本文は途中で切れている。"
-            "結論を出す前に read_around か read_doc で続きを読む。"
+            "結論を出す前に read_around か read_doc で続きを読む。続きを取得する手段が無い打ち切り"
+            "（file_truncated・pdf_pages の text_truncated・compare_documents／graph_neighbors／glob_search／doc_outline の truncated・folder_tree の folders_truncated・xlsx_sheets／ripgrep_search／es_search の truncated＝ヒット数上限）は"
+            "その範囲を未確認として明示し、全件性を主張しない。"
             "**ドキュメント数・一覧・どんな資料があるか・フォルダ構成といった台帳質問は、まず list_docs を使う**"
             "（grep は本文中の一致しか探せず件数/一覧には答えられない）。フォルダ名・ファイル名はパスに含まれる"
             "ので、名前の部分一致は list_docs の name_pattern で当てる（grep で本文からは探さない）。"
             "表記が揺れそうな語は短い部分語で試す（例:「4期更改」がヒットしなければ「4期」）。"
             "**件数を答えるときは list_docs の path_prefix でフォルダを確定してから数え、どのフォルダを数えたかを"
             "回答に明示する**（曖昧なら『4期更改』と『4期保守』のように候補フォルダ別の内訳で答える）。"
+            "**一覧を求められたら該当する全件を各項目のパス付きで列挙する（省略しない・件数と一致させる）。**"
+            "全件・一覧の完了は対象範囲の確認を終えてからで、検索3回や件数だけの取得では完了とせず、"
+            "中断（利用者停止・通信エラー・予算到達）のときは確認済み／未確認／理由を分けて書き、"
+            "部分結果を「全件」と断定しない。"
             "原因の手がかりや関連部品（呼び出し/コピー/参照/関連文書）をたどるときは graph_neighbors を使う。"
             # F1（2026-07-07）: 影響を問う質問の分解の型。表層の症状語で検索を乱発させず、変更対象と
             # 影響先の「接続（経路）」の有無を根拠に答えさせる。
             "**影響を問う質問（「〜を変えたら」「〜に影響ある？」「〜が落ちる？」など）では、"
             "①変更対象（例: 税率）に依存する部品・記述を特定 → ②影響先（例: 夜間バッチ＝JCL/ジョブ）を特定 → "
-            "③両者の接続（COPY/CALL/REFERENCES の経路）を graph_neighbors で最優先に調べ、経路の有無を"
-            "根拠として答える。質問中の症状表現（落ちる/止まる/エラー/停止 等）をそのまま検索語にしない**"
+            "③両者の接続（COPIES／INVOKES／ACCESSES／CONTAINS＝構造的な依存の経路）を graph_neighbors で"
+            "当たる。graph_neighbors は近傍ごとに辺の種類と向き（from→to）を返す——COPIES／INVOKES／"
+            "ACCESSES／CONTAINS だけで構成された経路は根拠にしてよい。影響は矢印をさかのぼる（A →COPIES→ B は"
+            "B を変えると A が影響を受ける・変更対象から出ていく矢印の先は影響先ではない）。経路に DOCUMENTS"
+            "（言及）・CORRESPONDS_TO の辺や unverified の辺（裏付け原本が実在確認できない）が 1 本でも含まれる"
+            "近傍は候補どまり＝原本で確認する。経路の先の"
+            "実際の記述を引用したいときだけ原本を開き、接続の有無を根拠として答える（向きは平易語で・"
+            "内部のエッジ名は本文に出さない）。"
+            "質問中の症状表現（落ちる/止まる/エラー/停止 等）をそのまま検索語にしない**"
             "（原因調査＝トラブルシュートだと明示された時のみ症状語で探してよい）。"
             # S2: ask_user の使用条件（agentic と同じ制約）＋乱用ガード（確認ID 付きは再質問しない・1回まで）。
             # F2（2026-07-07）: 発動基準を具体化（lens 別の例）＋ユーザー主導の確認要求を確実な発動手段にする。
@@ -667,6 +734,7 @@ class CodexProvider(Provider):
 
     def _run_authoring(self, ctx: Ctx) -> Iterator[dict]:
         decision = env = None
+        _turn_t0 = time.monotonic()   # `sherpa.usage` ログ 1 行の elapsed（このターン全体）
         # シーム規則（モジュール docstring 参照）: `_gather` は「危険な継ぎ目」（複数テストが
         # `agents._gather` を monkeypatch して介入を検証する）。本モジュールは agents.py（facade）
         # からモジュールレベルで import されるため、逆にモジュールレベルで `from sherpa import agents`
@@ -690,10 +758,6 @@ class CodexProvider(Provider):
         # （if ブロックが丸ごとスキップされた経路ではこの既定値 False のまま＝既存の決定的回答
         # フォールバックを維持・tests/unit/test_codex_resume.py の pinned "dispatch-headline" と非衝突）。
         _codex_silent_failure = False
-        # 同じ理由（起動前ガードで下の if ブロックが丸ごとスキップされる経路がある）で、
-        # `env["codex_timed_out"]` を立てる判定用フラグもここで既定 False にしておく——
-        # if ブロック内（実際に codex exec を起動できた経路）でだけ実測値へ上書きする。
-        _codex_timeout_confirmed = False
         # 同じ理由（if ブロックが丸ごとスキップされる経路がある）で、自動継続の
         # `env["codex_stopped_early"]` 判定用フラグも既定 False にしておく——`_agent_msgs` 等が
         # 存在するのは if ブロック内だけのため、実測値への上書きもそこでだけ行う。
@@ -714,6 +778,16 @@ class CodexProvider(Provider):
         # （chat.js が回答再送に `確認ID: {interaction_id}` を必ず含める・chat_router の marker と同流儀）。
         _ask_disabled = bool(re.search(r"確認ID[:：]", ctx.message or ""))
         mcp_neighbors: list = []                                 # A2: Codex が graph_neighbors で引いた近傍（UI カードに反映）
+        # S2（提案書 Codex原本直読 §2-5）: MCP の read 系ツール（read_doc/read_around/
+        # doc_outline/compare_documents）の引数から集めた doc_id。attempt をまたいで合算する（自動継続の
+        # 複数 codex exec プロセスにまたがるため）。最終 answer の「参照した資料:」ブロックの解析結果に
+        # 合流させ、機械検証してから env["sources"] へ足す（原本直読は MCP の結果に載らず出典に出ない穴の
+        # 補完）。
+        _mcp_read_docs: list = []
+        # `xlsx_sheets`（シート一覧のみ・本文は読んでいない）は上と分けて集める——
+        # sources（参照候補）には合流させるが、根拠ゲート（sources_verified）には数えない
+        # （`xlsx_sheets` の呼び出しだけを根拠に「精読済み」を偽装させない）。
+        _mcp_listed_docs: list = []
         # MCP ツール呼び出しの並走計測（run 全体の合算値）。item id は codex exec プロセスごとに
         # 振り直される（`item_0` 等が採番し直される）ため、id の集合（`seen`/`open`）は `_attempt`
         # （1プロセス=1回の codex exec）内のローカル変数として毎回作り直し、attempt 終了時（finally）
@@ -744,7 +818,7 @@ class CodexProvider(Provider):
         # 他者が保持するロックを誤って解放しない）。
         _conv_lock = None
         _conv_lock_acquired = False
-        # 台帳登録（files/ move）まで完了した後で必ず削除する（正常終了・停止・例外・timeout の
+        # 台帳登録（files/ move）まで完了した後で必ず削除する（正常終了・停止・例外の
         # いずれでも同様＝GeneratorExit（クライアント切断相当の generator.close()）が本体のどの
         # yield 点で飛んできても finally は必ず実行される）。会話ロックの解放もこの finally で行い、
         # 成果物の move／台帳登録・最終回答（`_result`）の送出までロックを保持する
@@ -810,10 +884,9 @@ class CodexProvider(Provider):
                 # 同じ結論だが author も除外するためここでは共通ヘルパーを使わず明示判定する）。
                 _layer = (ctx.scope_meta or {}).get("layer") if decision["lens"] == "qa" else None
                 _layer_restricted = _layer not in (None, "both")
-                # 層を技術的に強制できるのは「MCP 有効（run_tool が層を検証する）」かつ「sandbox 有効
-                # （permission profile から KB ルートを外せる・`_write_codex_authoring_config` 参照）」の
-                # 組み合わせだけ——sandbox 無効時の fallback（`-s workspace-write`）は読取全開で、MCP を
-                # 有効にしていても直接ファイル参照で層を迂回できる（正典 §3.4「範囲と同じ硬いフィルタ」）。
+                # 層のフィルタは MCP ツール側（run_tool）だけが担う（直読は層に関係なく read・Codex に層は
+                # 強制しない）。MCP 無効・sandbox 無効の構成では層の指定をツールに渡す経路が無いため、
+                # 黙って無視せず実行前に正直に失敗する。
                 _layer_enforcement_ready = mcp and _codex_sandbox_enabled()
                 if _layer_restricted and not _layer_enforcement_ready:
                     # 黙って層を無視した回答を返さず、実行せず正直に失敗を伝える（未計測＝Codex CLI を
@@ -856,8 +929,8 @@ class CodexProvider(Provider):
                         and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
                     }
                 # reasoning=minimal は image_gen/web_search と非互換で API 400 になる（実証済）→ low へ引き上げ。
-                # P1-a: author（作成）のときは intent 連動パラメータ `SHERPA_CODEX_REASONING_AUTHOR`／
-                # `SHERPA_CODEX_TIMEOUT_AUTHOR`（既定 medium／600秒）を使う。通常レンズは現行のまま（低負荷優先）。
+                # P1-a: author（作成）のときは intent 連動パラメータ `SHERPA_CODEX_REASONING_AUTHOR`
+                # （既定 medium）を使う。通常レンズは現行のまま（低負荷優先）。
                 _is_author = decision["lens"] == "author"
                 # 調べる深さ（調べ方ブロック §3.2・SC-6c）: 通常レンズの基準値だけ管理画面の基準値編集
                 # （system_settings）を反映する（author 専用の env は別軸のため対象外・§1.6 の
@@ -869,15 +942,51 @@ class CodexProvider(Provider):
                 _reason_raw = depth_profile_mod.codex_reasoning_for(
                     _base_reason, (ctx.scope_meta or {}).get("depth_profile"))
                 _reason = "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
-                _timeout = (float(os.environ.get("SHERPA_CODEX_TIMEOUT_AUTHOR", "600"))
-                           if _is_author else self._timeout)
+                # STAT-3 S1（利用統計の拡充）: usage メタへ足す「実際に codex exec へ渡した
+                # model_reasoning_effort」（`_reason`）と、深さ倍率の上書き前の基準値
+                # （`_base_reason`）。一致（標準プロファイルの通常ケース）なら `reasoning_base` は
+                # 省略する（`usage_reasoning_extras` の契約）。
+                _usage_depth_extra = depth_profile_mod.usage_reasoning_extras(
+                    (ctx.scope_meta or {}).get("depth_profile"), _base_reason, _reason)
+                # 原本直読の read root と秘匿 deny の列挙は、プロンプトの文言（direct_read フラグ）と
+                # permission profile（_write_codex_authoring_config・後段）の両方が使うため、
+                # プロンプト組立の前に1回だけ計算する（提案書 2026-09-10-Codex原本直読と調査スキル）。列挙失敗（RuntimeError＝fail-closed）時は両方とも
+                # 「直読不可」に揃える——プロンプトだけ楽観的、profile だけ悲観的、という食い違いを防ぐ。
+                _base_roots = _direct_read_roots(ctx.world)
+                _direct_roots, _deny_roots = _base_roots, []
+                _venv_for_deny = _venv_root()
+                try:
+                    _scope_deny = _scope_deny_entries(_base_roots, sp)
+                    if _base_roots and all(r in _scope_deny for r in _base_roots):
+                        raise RuntimeError("scope_enum_failed:no_scope_in_roots")   # 範囲がどの root にも無い
+                    _sensitive_deny = _scope_deny + _enumerate_sensitive(
+                        _base_roots + ([str(_venv_for_deny)] if _venv_for_deny else []))
+                    _direct_read_ok = True
+                except RuntimeError as e:
+                    _direct_roots, _deny_roots, _sensitive_deny, _direct_read_ok = [], _base_roots, [], False
+                    _log.warning("codex direct read disabled: %s", e)
+                if not _direct_read_ok and not mcp:
+                    # MCP 無効の構成は直接参照だけが調べる手段＝直読を許可しないと何も調べられない。
+                    # 黙って空振りの回答を返さず、実行前に正直に失敗する（利用者向け文言は専門用語ゼロ）。
+                    msg = "この資料フォルダは今回読み取りの準備ができませんでした。管理者に確認を依頼してください。"
+                    yield _node("codex", "think", "Codex が調べる", "資料の読み取り準備に失敗", "done")
+                    yield {"type": "answer_delta", "text": msg}
+                    env = {"lens": decision["lens"], "headline": msg, "summary": {"total": 0},
+                          "data": {}, "sources": [],
+                          "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world,
+                                                              lens=decision["lens"])}
+                    yield {"type": "_result", "env": env,
+                          "decision": {"lens": decision["lens"], "input": ctx.message,
+                                       "reason": "MCP 無効の構成で直読の準備（秘匿ファイル列挙／範囲）に失敗"}}
+                    return
                 # MCP でも FS でも同じプロンプト組み立て（personal_facts を注入）。
                 if mcp:
                     _codex_msg = ctx.message
                     if ctx.personal_facts:
                         _codex_msg = (f"{ctx.message}\n\n"
                                       f"【個人ファイル内ヒット（本人のみ・共有不可）】\n{ctx.personal_facts}")
-                    prompt = self._prompt_mcp(_codex_msg, decision["lens"], ctx.world)
+                    prompt = self._prompt_mcp(_codex_msg, decision["lens"], ctx.world,
+                                              direct_read=_direct_read_ok, layer=_layer)
                 else:
                     prompt = self._prompt(ctx.message, decision["lens"], env, ctx.world)
                 # Phase0・§3: --ephemeral（セッションをディスクに残さない）と -o（最終メッセージのファイル
@@ -959,10 +1068,6 @@ class CodexProvider(Provider):
 
                 got_any_line = False   # R1b: resume 試行で1行も --json イベントを受け取れなければ resume 失敗とみなす
                 attempt_returncode = None   # RV再検証 LOW-4: fallback 判定の将来耐性（下の呼出側コメント参照）
-                # RV MED（2026-08-18 Codex RV 指摘4）: 無出力失敗の文言を「認証」に決め打ちしないための判別材料。
-                # killer（threading.Timer）が実際に発火して group を殺したかどうかを区別する
-                # （timeout/kill と CLI の即時異常終了は別の障害系統＝閉域ではプロキシ/CA 不備の方が現実的）。
-                _codex_timed_out = False
                 # 自動継続がツール未実行のまま宣言だけを繰り返す（正常な手順説明相手に無駄打ちする）のを
                 # 打ち切るための per-attempt フラグ（attempt 開始ごとに False へ戻す）。
                 _attempt_ran_tools = False
@@ -984,16 +1089,15 @@ class CodexProvider(Provider):
                 _turn_failed_code = None
 
                 def _attempt(use_resume: bool, prompt_text: str | None = None):
-                    """1回分の codex exec 実行（node/answer_delta を yield）。proc/killer はこの1回限りの
+                    """1回分の codex exec 実行（node/answer_delta を yield）。proc はこの1回限りの
                     ローカル状態（呼出側は再試行のたびに新しい Popen を張るだけでよい）。`prompt_text` は
                     自動継続用（省略時は通常プロンプト）。"""
                     nonlocal got_any_line, ran, codex_question, codex_usage, thread_id, attempt_returncode
-                    nonlocal _agent_partial, _stream_error, _codex_timed_out, _graph_schema_era_error
+                    nonlocal _agent_partial, _stream_error, _graph_schema_era_error
                     nonlocal _attempt_ran_tools, _attempt_no, _attempt_msgs_start, _stale_last_message
                     nonlocal _turn_failed, _turn_failed_code
                     got_any_line = False
                     attempt_returncode = None
-                    _codex_timed_out = False
                     _attempt_ran_tools = False
                     _turn_failed = False
                     _turn_failed_code = None
@@ -1018,10 +1122,12 @@ class CodexProvider(Provider):
                     # このプロセス（1回の codex exec）内だけで完結する id 集合（run-level `_mcp_calls`
                     # への合算は finally で行う）。
                     _attempt_mcp_seen: set = set()
+                    _mcp_read_done: set = set()      # S2: 収集済み item id（同じ item の再送で二重に数えない・
+                                                     # item id は attempt（codex exec プロセス）ごとに振り直される）
                     _attempt_mcp_open: set = set()
                     _attempt_mcp_max_in_flight = 0
                     argv = _build_argv(use_resume, prompt_text)
-                    proc = killer = None
+                    proc = None
                     try:
                         # Popen 直前の最終防衛線（`_select_provider` の選択時チェックを迂回する経路が
                         # あっても、実際にプロセスを起動する直前でもう一度確認する・多層防御）。
@@ -1030,18 +1136,12 @@ class CodexProvider(Provider):
                         if self._ollama_base_url is None:
                             from ... import llm
                             llm.assert_openai_io_allowed()
-                        # RV MEDIUM: start_new_session で独立プロセスグループにし、timeout/後始末で
+                        # RV MEDIUM: start_new_session で独立プロセスグループにし、停止/後始末で
                         #   MCP subprocess / shell child まで group ごと確実に殺す（creds env の寿命を延ばさない）。
                         proc = subprocess.Popen(
                             argv, env=popen_env, cwd=str(run_dir), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                             start_new_session=True)
-                        def _on_timeout():                          # RV MED 指摘4: 発火＝実際に timeout kill したことの記録
-                            nonlocal _codex_timed_out
-                            _codex_timed_out = True
-                            _killpg(proc)
-                        killer = threading.Timer(_timeout, _on_timeout)  # 固まっても group ごと打ち切る
-                        killer.start()
                         if ctx.stop_event is not None:                # UI フィードバック1: 途中停止（_spawn_stop_watcher 参照）
                             _spawn_stop_watcher(proc, ctx.stop_event)
                         node_n = 0
@@ -1106,6 +1206,40 @@ class CodexProvider(Provider):
                                 # 数えるが in-flight 幅には寄与しない）。2回目以降の見た目（例: item.updated
                                 # の再送）は seen 済みなので無視され、二重に数えない。
                                 _mcp_id = item.get("id")
+                                # S2: read 系ツールの引数から実際に読んだ資料の doc_id を集める（「参照した
+                                # 資料:」の記載漏れの補完）。**読取が成功して完了した** item だけ（失敗・
+                                # エラー結果・進行中は読めていない＝出典にも「根拠」にも載せない）。
+                                _read_ok = (e.get("type") == "item.completed"
+                                            and item.get("status") not in ("failed", "error")
+                                            and not (isinstance(item.get("result"), dict) and item["result"].get("isError"))
+                                            and not item.get("error"))
+                                if _read_ok and (not _mcp_id or _mcp_id not in _mcp_read_done):
+                                    if _mcp_id:
+                                        _mcp_read_done.add(_mcp_id)
+                                    # RV#6 是正: S3b 原本読取ツール（xlsx_range/docx_paragraphs/
+                                    # pptx_slides/pdf_pages/file_head）も doc_id 引数を取る読取
+                                    # ツール——これらを収集対象に含めないと、Codex が MCP 経由で
+                                    # 原本を直接読んでも出典収集から漏れる。
+                                    # `xlsx_sheets` はシート一覧を返すだけで本文を
+                                    # 読んでいない——本文精読ツールと同じ扱いにすると「シート一覧を
+                                    # 見ただけ」で `sources_verified`（根拠ゲート）へ数えられて
+                                    # しまうため、`_mcp_listed_docs`（sources には合流するが
+                                    # sources_verified には数えない）へ分ける。
+                                    if tool in ("read_doc", "read_around", "doc_outline",
+                                               "xlsx_range", "docx_paragraphs",
+                                               "pptx_slides", "pdf_pages", "file_head"):
+                                        _d = a.get("doc_id")
+                                        if isinstance(_d, str) and _d:
+                                            _mcp_read_docs.append(_d)
+                                    elif tool == "xlsx_sheets":
+                                        _d = a.get("doc_id")
+                                        if isinstance(_d, str) and _d:
+                                            _mcp_listed_docs.append(_d)
+                                    elif tool == "compare_documents":
+                                        for _k in ("left_doc_id", "right_doc_id", "source_doc_id"):
+                                            _d = a.get(_k)
+                                            if isinstance(_d, str) and _d:
+                                                _mcp_read_docs.append(_d)
                                 if _mcp_id and _mcp_id not in _attempt_mcp_seen:
                                     _attempt_mcp_seen.add(_mcp_id)
                                     if not done:
@@ -1139,7 +1273,16 @@ class CodexProvider(Provider):
                                           "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認",
                                           "compare_documents": "世代間の差分を比較",
                                           "read_doc": "文書を通読", "doc_outline": "見出し構造を確認",
-                                          "glob_search": "ファイル名で検索"}.get(tool, "その他の処理")
+                                          "glob_search": "ファイル名で検索",
+                                          # S3b（原本読取ツール・提案書2026-09-10 §2-9）: agentic_search
+                                          # の `_ORIGINAL_READ_LABELS`／改善ログの `_TOOL_CALL_LABELS` と
+                                          # 同じ文言（RV#11: `xlsx_sheets` はシート一覧のみ＝本文精読の
+                                          # `xlsx_range` とは別ラベル・`_FILES_READ_LABEL` からも外れる）。
+                                          "xlsx_sheets": "原本のシート一覧を確認", "xlsx_range": "原本を読む（Excel）",
+                                          "docx_paragraphs": "原本を読む（Word）",
+                                          "pptx_slides": "原本を読む（PowerPoint）",
+                                          "pdf_pages": "原本を読む（PDF）",
+                                          "file_head": "原本を読む（先頭）"}.get(tool, "その他の処理")
                                 detail = (a.get("name") or a.get("query") or a.get("doc_id")
                                          or a.get("path_prefix") or a.get("name_pattern") or a.get("pattern") or "")
                                 if done and tool == "graph_neighbors" and item.get("status") == "completed":
@@ -1169,7 +1312,7 @@ class CodexProvider(Provider):
                                     if _txt:
                                         _agent_msgs.append(_txt)
                                     _agent_partial = ""
-                                else:                                    # item.updated＝成長中の未完 message（timeout 保険）
+                                else:                                    # item.updated＝成長中の未完 message（打ち切り保険）
                                     _agent_partial = _txt
                     except Exception:
                         _stream_error = True
@@ -1178,8 +1321,6 @@ class CodexProvider(Provider):
                         # それまでに実際に見えていた分は計測に残す）。
                         _mcp_calls["total"] += len(_attempt_mcp_seen)
                         _mcp_calls["max_in_flight"] = max(_mcp_calls["max_in_flight"], _attempt_mcp_max_in_flight)
-                        if killer:
-                            killer.cancel()
                         if proc:
                             try:
                                 _killpg(proc)                        # group ごと（MCP child 含む）確実に後始末
@@ -1275,7 +1416,8 @@ class CodexProvider(Provider):
                     # RV HIGH: fail-open でも気づけるよう warning は残す（containment/grounding の短縮形は
                     # _prompt/_prompt_mcp に常置済みなので、書込失敗時も丸裸にはならない＝多層防御）。
                     try:
-                        codex_agents_md.write_agents_md(run_dir, output_schema=_schema_on)
+                        codex_agents_md.write_agents_md(run_dir, output_schema=_schema_on,
+                                                        direct_read=_direct_read_ok)
                     except Exception as e:
                         _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
                     # P1-b: スキル配備（案A′ ベース＋個人オーバーレイ）も同じくベストエフォート（fail-open）。
@@ -1301,7 +1443,8 @@ class CodexProvider(Provider):
                             codex_home, _kb_read_roots(ctx.world), _reason,
                             mcp, ctx.world, sp, self._web_search, _ask_disabled,
                             ollama_base_url=self._ollama_base_url, system_settings=self._system_settings,
-                            layer=_layer)
+                            layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny,
+                            deny_roots=_deny_roots)
                         # S2（Azure OpenAI 対応）: 接続先が Azure 等へリダイレクトされていて、そのせいで
                         # web_search が強制 OFF になっている時だけ、理由を1回（このターンにつき1回・
                         # `_write_codex_authoring_config` 呼び出しはこの1箇所だけで resume 再試行でも
@@ -1349,7 +1492,7 @@ class CodexProvider(Provider):
                     # 自動継続: 正常終了（returncode 0）で agent_message が「作業宣言だけ」（結論文が
                     # 1つも無い＝_pick_codex_headline が規則③に落ちる）なら、Codex セッションの続きを
                     # 自動で呼ぶ（利用者の「続けて」連投をシステム側で肩代わりする）。ask_user 確認待ち・
-                    # 利用者の明示停止・timeout・前 attempt の無出力・セッション非永続のいずれかなら
+                    # 利用者の明示停止・前 attempt の無出力・セッション非永続のいずれかなら
                     # 回さない（それぞれ後段の既存処理に委ねる）。`got_any_line` を要求するのは、継続
                     # attempt 自身が無出力で終わった場合に古い（蓄積済みの）作業宣言だけを根拠に
                     # 空振りを繰り返さないため。判定は `_continuation_msgs()`＝**直前の attempt の
@@ -1358,7 +1501,7 @@ class CodexProvider(Provider):
                     for n in range(1, _continue_limit + 1):
                         _stopped_for_continue = ctx.stop_event is not None and ctx.stop_event.is_set()
                         if not (codex_question is None and not _stopped_for_continue
-                               and not _codex_timed_out and attempt_returncode == 0 and got_any_line
+                               and attempt_returncode == 0 and got_any_line
                                and _continuation_pending()
                                and _session_persistence_enabled and (thread_id or resume_sid)):
                             break
@@ -1469,22 +1612,13 @@ class CodexProvider(Provider):
                 if (not answer and (not got_any_line or _turn_failed) and attempt_returncode is not None
                         and not _stopped_final):
                     _codex_silent_failure = True
-                # `_codex_timed_out` 単独では、stdout の for ループが EOF で自然終了した直後・
-                # `killer.cancel()` が呼ばれる前のわずかな窓で Timer が発火した場合（プロセスは
-                # 既に正常終了済み・`_killpg` は既に居ないプロセスへの no-op）も「タイムアウトした」
-                # と誤検知しうる。正常終了ならほぼ常に `attempt_returncode == 0`・強制 kill なら
-                # 通常非0（Unix ではシグナル由来の負値）になることを併せて要求し、この競合を除外する。
-                # 利用者の明示停止（`_stopped_final`）は「時間切れ」ではないため、これも重ねて除外する
-                # （if/else 両分岐が参照する唯一の判定値としてここで一度だけ計算する）。
-                _codex_timeout_confirmed = (
-                    _codex_timed_out and attempt_returncode != 0 and not _stopped_final)
                 # 自動継続を尽くしてもなお（上限0・セッション非永続で1回も継続できなかった場合・継続
                 # attempt が無出力/異常終了で終わった場合を含む）作業宣言だけなら、本文（headline）は
-                # 書き換えず印だけ立てる＝「途中までの結果」と伝えて続きを促す。timeout は
-                # `_codex_timed_out` 側の注記に譲り、利用者の明示停止は途中結果として扱わない。
+                # 書き換えず印だけ立てる＝「途中までの結果」と伝えて続きを促す。利用者の明示停止は
+                # 途中結果として扱わない。
                 _codex_stopped_early = (
                     _continuation_pending()
-                    and not _codex_timed_out and not _stopped_final and not _turn_failed_no_new_message)
+                    and not _stopped_final and not _turn_failed_no_new_message)
                 # Feature A: run_dir の新規ファイルを検出して台帳登録する。
                 # Codex の cwd = run_dir のため、personal アップロード（files/）は読み取り・書き込み不可。
                 # 台帳登録: run_dir の新規ファイルを personal_workspace_files に登録（ES/Neo4j には一切書かない）。
@@ -1640,6 +1774,11 @@ class CodexProvider(Provider):
                         is_local=codex_usage.get("is_local"))
                 else:
                     env["usage"] = codex_usage
+                # STAT-3 S1: 差分計算／累計そのものの両方に同じ深さメタを載せる
+                # （`_usage_depth_extra` はこのターンの `_reason`/`_base_reason` 確定時に計算済み）。
+                env["usage"].update(_usage_depth_extra)
+                # Codex 経路も `sherpa.usage` ログ 1 行（kind=chat・深さ・推論レベル付き）を出す。
+                _log_chat_usage(env["usage"], time.monotonic() - _turn_t0, ctx.world)
             # R1b: 捕捉した session/thread id を env に載せる（chat_service が `store.set_session_id` で永続化・
             # 次ターンの resume 判定に使う）。RV再検証 MEDIUM-2: ゲートは `_persist_session` 単独ではなく
             # `_session_persistence_enabled`（=conversation_id あり **かつ** サンドボックス有効）を使う。
@@ -1660,15 +1799,53 @@ class CodexProvider(Provider):
                     for r in _created_file_rows
                 ]
             if answer:
-                env["headline"] = answer
-                # タイムアウトで kill され、進行中の宣言文（「次に○○します」等）がそのまま headline に
-                # 残ったターン——本文は書き換えない（`answer` は既存どおりそのまま使う）。`_codex_timed_out`
-                # （threading.Timer が実際に発火したかという機械的事実・文面マッチはしない）だけを根拠に
-                # envelope へ印を付け、chat_service._finalize が STOP-1/SC-6d と同形式（headline 直下の
-                # 独立注記＋案内ボタン）で UI に出す（`stop_reason` の閉じた語彙とは無関係の別マーカー
-                # ＝Codex CLI はここを経由しない agentic_search とは別の実行系のため）。
-                if _codex_timeout_confirmed:
-                    env["codex_timed_out"] = True
+                # S2（提案書 Codex原本直読 §2-5）: 直読した資料は MCP の結果に載らず
+                # env["sources"] に反映されない——回答末尾の「参照した資料:」ブロックを解析し、read 系
+                # MCP ツール引数から拾った doc_id（参照ブロックの記載漏れの補完・出現順で後ろに合流）と
+                # 合わせて機械検証（実在・文書種別・scope・秘匿名除外）を通ったものだけを sources の
+                # 先頭へ足す（`_gather` 由来の既存 sources は後ろに残す・doc_id 重複は除外）。
+                # verified が0件なら参照ブロックの記載を消しても出典が何も出ない＝本文はそのまま残す
+                # （記載が消えて何も出典に出ないより、本文に根拠パスが残るほうを優先）。
+                _body, _listed_lines = parse_referenced_doc_lines(answer)
+                _ref_candidates: list = list(_listed_lines)
+                _ref_seen: set[str] = set()
+                for _r in _mcp_read_docs:
+                    if _r and _r not in _ref_seen:
+                        _ref_seen.add(_r)
+                        _ref_candidates.append(_r)
+                # `xlsx_sheets`（シート一覧のみ）の doc_id も参照候補（sources）
+                # には合流させる——実在する資料を出典から隠す理由はない。ただし「参照した資料:」
+                # にも書かれておらず、本文精読ツール（`_mcp_read_docs`）でも読まれていない doc_id
+                # は、シート一覧を見ただけで根拠ゲート（sources_verified）に数えない——ここまでの
+                # 候補（参照ブロック＋本文精読ツール）だけで確定する「精読済み」集合を先に確定させ、
+                # `xlsx_sheets` を足した後の verified との差分（`_listed_only_ids`）として区別する。
+                _verified_before_listed = set(verified_referenced_docs(_ref_candidates, ctx.world, sp))
+                for _r in _mcp_listed_docs:
+                    if _r and _r not in _ref_seen:
+                        _ref_seen.add(_r)
+                        _ref_candidates.append(_r)
+                _verified_refs = verified_referenced_docs(_ref_candidates, ctx.world, sp)
+                _listed_only_ids = set(_verified_refs) - _verified_before_listed
+                if _verified_refs and ctx.make_sources:
+                    _ref_sources, _ = _verified_sources(ctx.make_sources, set(_verified_refs), ctx.world, sp)
+                    # 参照ブロックの記載順（→ MCP 引数の順）に並べ直し、既存（_gather 由来）と重複する
+                    # 資料は先頭側（参照した資料）を残す。
+                    _order = {d: i for i, d in enumerate(_verified_refs)}
+                    _ref_sources = sorted(_ref_sources, key=lambda s: _order.get(s.get("doc_id"), len(_order)))
+                    _ref_ids = {s.get("doc_id") for s in _ref_sources}
+                    env["sources"] = _ref_sources + [s for s in (env.get("sources") or [])
+                                                     if s.get("doc_id") not in _ref_ids]
+                    # 実際に開いて根拠にした資料＝API 経路の「精読済み」と同じ意味＝出典の 2 区分
+                    # （根拠／参考）に載せる（画面・共有・改善ログは既存の sources_verified の扱いのまま）。
+                    # `xlsx_sheets` だけで到達した doc_id（`_listed_only_ids`）は除く。
+                    env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
+                env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
+                env["headline"] = _body if (_verified_refs and _body.strip()) else answer   # 空本文には差し替えない
+                # 自動継続を尽くしてもなお進行中の宣言文（「次に○○します」等）がそのまま headline に
+                # 残ったターン——本文は書き換えない（`answer` は既存どおりそのまま使う）。`_codex_stopped_early`
+                # だけを根拠に envelope へ印を付け、chat_service._finalize が STOP-1/SC-6d と同形式
+                # （headline 直下の独立注記＋案内ボタン）で UI に出す（`stop_reason` の閉じた語彙とは
+                # 無関係の別マーカー＝Codex CLI はここを経由しない agentic_search とは別の実行系のため）。
                 if _codex_stopped_early:
                     env["codex_stopped_early"] = True
                 yield _node("codex", "think", "Codex が調べる",
@@ -1680,19 +1857,18 @@ class CodexProvider(Provider):
                 # `{}` へ揃える＝`chat_service._no_genuine_results` の honest failure 規約と一致させ、
                 # 通常の0件検索結果と誤認されて retry_hints・確定文言が付かないようにする・RV2 #2）。
                 # RV MED（2026-08-18 Codex RV 指摘4）: 以前は「認証されていない可能性があります」と
-                # 断定していたが、同じ無出力失敗は timeout kill・プロキシ/CA 証明書の不備・sandbox の
-                # 起動失敗・CLI 自体のクラッシュでも起きる。閉域ではむしろプロキシ/ネットワーク要因の方が
-                # 現実的で、認証と決め打つと現場を誤誘導する。観測事実（応答を返す前に終了／timeout）を
-                # 述べたうえで、考えられる原因を複数挙げる（断定しない）。判別材料（timeout・returncode）は
+                # 断定していたが、同じ無出力失敗はプロキシ/CA 証明書の不備・sandbox の起動失敗・
+                # CLI 自体のクラッシュでも起きる。閉域ではむしろプロキシ/ネットワーク要因の方が
+                # 現実的で、認証と決め打つと現場を誤誘導する。観測事実（応答を返す前に終了）を
+                # 述べたうえで、考えられる原因を複数挙げる（断定しない）。判別材料（returncode）は
                 # 意味が伝わらない利用者向け本文には出さず、ログにだけ残す。stderr は現状 DEVNULL で破棄
                 # している（先頭行を出すには stdout/stderr 同時 PIPE 読み取りが要り、デッドロック回避の
                 # 追加実装が必要になるため今回のスコープでは見送り＝秘密が混ざり得る文言を利用者へ出さない
                 # という制約自体は満たしたまま）。
-                # §2-10: `turn.failed`／`error` で閉じた attempt（agent_message 無し）は timeout でも
-                # 無い限り「回答を返せずに終了しました」——認証/ネットワーク以外にスキーマ違反
+                # §2-10: `turn.failed`／`error` で閉じた attempt（agent_message 無し）は
+                # 「回答を返せずに終了しました」——認証/ネットワーク以外にスキーマ違反
                 # （`invalid_json_schema` 等）も原因になり得るため、既存の無出力失敗と文言を分ける。
-                _reason = ("タイムアウトしました" if _codex_timed_out
-                          else "回答を返せずに終了しました" if _turn_failed
+                _reason = ("回答を返せずに終了しました" if _turn_failed
                           else "応答を返す前に終了しました")
                 env["headline"] = (
                     f"Codex に接続できませんでした（Codex CLI が{_reason}）。考えられる原因はいくつかあります: "
@@ -1703,20 +1879,17 @@ class CodexProvider(Provider):
                 if not env.get("sources"):
                     env["data"] = {}
                 _log.warning(
-                    "codex silent failure: timed_out=%s returncode=%s turn_failed=%s code=%s conv=%s uid=%s",
-                    _codex_timed_out, attempt_returncode, _turn_failed, _turn_failed_code,
+                    "codex silent failure: returncode=%s turn_failed=%s code=%s conv=%s uid=%s",
+                    attempt_returncode, _turn_failed, _turn_failed_code,
                     ctx.conversation_id, uid)
                 yield _node("codex", "think", "Codex が調べる",
                             "応答がありませんでした（原因未特定・決定的回答は使いません）", "done")
             else:
                 # 本文（answer）は空だが、上の `_codex_silent_failure`（応答を1行も返さない完全な
                 # 沈黙）には該当しないケース——command_execution 等は実行できたが結論の
-                # agent_message が無いままタイムアウトで打ち切られた。silent failure 分岐は headline
-                # 自体で「Codex に接続できませんでした」と既に告知しているため対象外のまま、
-                # ここは env["headline"] が `_gather` の決定的回答のままの場合にも注記を出す
-                # （`_codex_timeout_confirmed` は明示停止・returncode 0 競合を既に除外済み）。
-                if _codex_timeout_confirmed:
-                    env["codex_timed_out"] = True
+                # agent_message が無いまま（利用者の明示停止等で）打ち切られた。silent failure 分岐は
+                # headline 自体で「Codex に接続できませんでした」と既に告知しているため対象外のまま、
+                # ここは env["headline"] が `_gather` の決定的回答のままの場合にも注記を出す。
                 if _codex_stopped_early:
                     env["codex_stopped_early"] = True
                 yield _node("codex", "think", "Codex が調べる", "（未応答のため決定的回答に切替）", "done")

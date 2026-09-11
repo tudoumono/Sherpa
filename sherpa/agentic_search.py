@@ -26,7 +26,7 @@ import time
 import urllib.error
 from pathlib import Path
 
-from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, worlds
+from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, redact_keys, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
 from . import tools_pref as tools_pref_mod
@@ -56,17 +56,18 @@ MAX_TURNS = int(os.environ.get("SHERPA_AGENTIC_MAX_TURNS", "12"))  # 反復上�
 # （実測 2026-08-15: 6ターン検索した結果を破棄し、入力 353 tokens で回答していた）。
 _FINAL_SYNTHESIS = (
     "調査の上限に達しました。**これ以上ツールは使えません**。"
-    "ここまでに取得した内容だけを根拠に、日本語で簡潔（2〜4文）に回答してください。"
-    "確認できたことと、確認できなかったことを分けて書く。"
-    "取得した内容に無いことは書かない（推測しない）。"
+    "ここまでに取得した内容だけを根拠に、日本語で回答してください（長さは絞らない・集めた内容は削らない）。"
+    "確認できたこと（確定）と確認できなかったことを分けて書き、"
+    "取得した内容に無いことを補うときは『推定』と明示する。"
 )
 # EXT-3（拡張設計 §3.5）: 評価フェーズが sufficient と判定したときの最終合成指示。上限到達時の
 # `_FINAL_SYNTHESIS`（「上限に達した」）とは意味が異なるため文言を分ける（sufficient を上限到達と
 # 誤表示しない）。
 _FINAL_SYNTHESIS_SUFFICIENT = (
-    "十分な根拠が集まりました。ここまでに取得した内容だけを根拠に、日本語で簡潔（2〜4文）に"
-    "回答してください。確認できたことと、確認できなかったことを分けて書く。"
-    "取得した内容に無いことは書かない（推測しない）。"
+    "十分な根拠が集まりました。ここまでに取得した内容だけを根拠に、日本語で"
+    "回答してください（長さは絞らない・集めた内容は削らない）。"
+    "確認できたこと（確定）と確認できなかったことを分けて書き、"
+    "取得した内容に無いことを補うときは『推定』と明示する。"
 )
 
 
@@ -157,10 +158,46 @@ _SECRET_RE = re.compile(
     r"|-----BEGIN[^-]+PRIVATE KEY-----[\s\S]*?-----END[^-]+PRIVATE KEY-----)")
 _KV_SECRET_RE = re.compile(r"(?i)\b(pass(?:word|wd)?|secret|api[_-]?key|token|authorization)\b(\s*[=:]\s*)(\S+)")
 
+# `_SECRET_RE` の PRIVATE KEY ブロックは BEGIN/END が対で揃って初めてマッチする——
+# `doc_readers.file_head` の `max_bytes` 切断（先頭バイトだけを OS 読み取り自体の上限で切る・
+# clean はその後にしか掛からない）や `_finish_reader_result` の二分探索クリップ（file_head の
+# `text` は文字列そのものが対象＝途中で切れる）で END 側が失われると、`_SECRET_RE` は対応する
+# END が見当たらないため一切マッチせず、鍵の断片がそのまま外部 LLM の tool 結果へ残ってしまう
+# （切断前に丸ごと読めていない箇所は元々救えないが、読めた範囲に残った断片自体は伏せる）。
+# 実際の状態付き伏せ字（鍵ブロックの内側にいるかを次の要素へ持ち越す）は `redact_keys.
+# KeyBlockRedactor` が担う（`doc_readers` が切り詰める前に一次適用し、下の `_redact_deep` は
+# 結果全体を辿る多層防御としてこれを再利用する）。
+
 
 def _redact(text: str) -> str:
     t = _SECRET_RE.sub("[REDACTED]", text or "")
     return _KV_SECRET_RE.sub(r"\1\2[REDACTED]", t)
+
+
+def _walk_redact(obj, redactor):
+    if isinstance(obj, str):
+        return redactor(obj)
+    if isinstance(obj, list):
+        return [_walk_redact(v, redactor) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _walk_redact(v, redactor) for k, v in obj.items()}
+    return obj
+
+
+def _redact_deep(obj):
+    """`_redact` を dict/list を再帰的に辿って全ての文字列値へ適用する（S3b・原本読取ツール専用）。
+
+    `doc_readers` の各関数はセル/段落/スライド/ページの本文をネスト構造（list of list・
+    list of dict 等）でそのまま返すため、`_redact`（文字列専用）を個々のツールごとに手で
+    辿るより一箇所に集約する。数値/真偽値/None は素通し（対象外）。
+
+    走査自体は `redact_keys.KeyBlockRedactor`（`_redact` を土台にした使い捨てインスタンス）に
+    委譲し、辞書/リストの出現順（＝ `doc_readers` が構造を作った順＝文書順）を1本の状態付き
+    スキャンとして扱う——PEM 秘密鍵の BEGIN/END が別要素（別段落・別セル・別ページ）にまたがっても
+    取りこぼさない。`doc_readers` は既にこの伏せ字を切り詰める前の段階で適用済みのため、ここは
+    その後の多層防御（同じ状態機械をもう一段掛けるだけで、既に伏せられた文字列は素通りする）。
+    """
+    return _walk_redact(obj, redact_keys.KeyBlockRedactor(_redact))
 
 
 # secRV MED-B（2026-07-18・DoS/メモリ増幅対策）: `read_around` は window（行数）でしか出力を絞らず、
@@ -381,12 +418,49 @@ def _messages_byte_size(msgs: list) -> int:
 
 
 def _read_evidence_payload(state: "investigation_state.InvestigationState") -> list:
-    """C2/C3: 探索ループのローカル `InvestigationState` から kind="read"（read_around/read_doc の
-    精読結果）だけを抜き出し、`final` payload の `read_evidence` キー用に薄く写す（`Evidence`
-    データクラス自体は payload に出さない＝内部専用の実装詳細を漏らさない）。
+    """C2/C3: 探索ループのローカル `InvestigationState` から kind="read"（read_around/read_doc・
+    S3b 原本読取ツールの精読結果）だけを抜き出し、`final` payload の `read_evidence` キー用に
+    薄く写す（`Evidence` データクラス自体は payload に出さない＝内部専用の実装詳細を漏らさない）。
+
+    RV2巡目#9 是正: `locator`（S3b・span=None のときだけ持つ＝"Sheet1!A1:D20" 等）を `text` へ
+    前置する——清書（`build_synthesis_digest` の `read_evidence` 引数）は `doc_id`/`span`/`text`
+    しか読まないため、`locator` を別キーで足すだけでは清書側に伝わらない。同じ doc_id で
+    複数エントリ（別シート等）になった場合に、どの箇所の精読かを清書入力の上でも区別できる
+    ようにする。
+
+    `locator` を独立フィールドとしても持つ（`text` への前置はそのまま残す）——
+    ハイブリッド（`providers/base.py::_ingest_sub_final_into_state`）が下調べ役の `final` から
+    親 `InvestigationState` へこの payload を再取り込みする際、`text` の前置文字列だけでは
+    `locator` を復元できず、親側の `InvestigationState._find`（kind="read"／span=None は
+    `locator` も同一性の鍵に使う）が別シート/別ページの読み取りを区別できずに1件へ潰していた。
+
+    `text_truncated` も添える——`InvestigationState._READ_TEXT_CAP_BYTES` の保存上限で
+    本文の末尾が落ちているかを `build_synthesis_digest` が清書入力の精読行へ注記できるように
+    する（`_ingest_sub_final_into_state` が親 `InvestigationState` へ再取り込みする際にも同じ
+    キーを引き継ぐ）。
+    
+    加えて glob_search／doc_outline／compare_documents の確定事実（kind="list"/"outline"/"compare"・`kind`
+    と `source_tool` を持ち `doc_id` は無いことがある）も同じ列に載せる（清書はその要約行をそのまま使い、
+    再取り込みは同種の Evidence として引き継ぐ）。
     """
-    return [{"doc_id": e.doc_id, "span": list(e.span) if e.span else None, "text": e.text}
-           for e in state.evidence if e.kind == "read"]
+    out = []
+    for e in state.evidence:
+        if e.kind in ("list", "outline", "compare") and e.source_tool in _STATE_FACT_TOOLS:
+            # glob_search／doc_outline／compare_documents の確定事実は `combined_evidence_meta` に載らない
+            # （list_docs／folder_tree／graph_neighbors だけが載る）ため、同じ内部専用チャンネルで清書へ渡す。
+            out.append({"kind": e.kind, "source_tool": e.source_tool, "doc_id": e.doc_id, "span": None,
+                        "text": e.text, "locator": None, "text_truncated": False})
+            continue
+        if e.kind != "read":
+            continue
+        text = f"{e.locator}: {e.text}" if (e.locator and e.text) else e.text
+        out.append({"doc_id": e.doc_id, "span": list(e.span) if e.span else None, "text": text,
+                   "locator": e.locator, "text_truncated": e.text_truncated})
+    return out
+
+
+# 清書へ内部専用行として渡す構造的事実の出どころ（`combined_evidence_meta` に載らないツール）。
+_STATE_FACT_TOOLS = frozenset({"glob_search", "doc_outline", "compare_documents"})
 
 
 def _tool_bytes_over_budget(total_tool_bytes: int, shared_budget: dict | None,
@@ -554,6 +628,13 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
         return None
     if importance.is_importance_control_path(doc_id):   # 重要度設定ファイル自体は精読対象外（§5）
         return None
+    if text_kind.is_sensitive(Path(doc_id).name, ext):
+        # 秘匿名: Office/画像（`is_office` 分岐）は下の `classify_document` を
+        # 一切通らないため、ここで先に塞がないと `credentials.xlsx`/`id_rsa.docx` 等の派生MDが
+        # 実在確認だけで精読（外部 LLM 送信）まで到達してしまう。非Office拡張子は
+        # `classify_document` 側でも同じ判定に落ちるが、意図を明示するためここでも一律に弾く。
+        _log.warning("read_around: 秘匿名のため対象外にしました（ext=%s）", ext)
+        return None
     is_office = ext in _OFFICE_MD
     if is_office:
         # rag（RAG 正本）／md（人間用・legacy 縮退）は§8.1 三階層のフォルダ分離で別ディレクトリ。
@@ -591,6 +672,139 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
     if layer is not None and not layer_mod.in_layer_code(is_code, layer):
         return None
     return root, lexical_rel, rp
+
+
+# 原本読取ツール（S3b・`doc_readers.py`）専用の doc_id 解決に許す拡張子（小文字・ドット付き）。
+# RV#9 是正: `.xlsm` は台帳（`corpus_docs.classify_document`）が文書種別として扱わない拡張子
+# ＝`verify_doc_exists` が常に False を返し、事前フィルタで通しても後続の確定判定で必ず落ちる
+# （入口で通す意味が無い・利用者に「読めるはず」と誤解させるだけ）ため対象外とする。`.xlsx` のみ。
+_XLSX_KINDS = frozenset({".xlsx"})
+_DOCX_KINDS = frozenset({".docx"})
+_PPTX_KINDS = frozenset({".pptx"})
+_PDF_KINDS = frozenset({".pdf"})
+# file_head はテキスト・コードのみ（Office/PDF/画像は専用ツールに任せる・_READABLE_EXT から
+# それらを引いた集合＝`grep_search`/`read_around` が読める本文種別と同じ土台）。
+_FILE_HEAD_KINDS = frozenset(_READABLE_EXT - _OFFICE_MD)
+
+
+def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozenset, layer=None):
+    """原本読取ツール（xlsx/docx/pptx/pdf/file_head）専用の doc_id→`(root, doc_id, 実パス, stat)` 解決。
+
+    `_safe_doc_path` と同じ検査項目（トラバーサル拒否・拡張子の事前フィルタ・重要度制御ファイル
+    除外・秘匿名除外・realpath 封じ込め・symlink 拒否・regular file）を共有するが、Office/PDF に
+    ついても**派生 MD ではなく world root の原本**へ解決する——`_safe_doc_path` は Office/PDF を
+    常に派生 MD 側へ解決するため兼用できない（原本読取ツールの目的そのものが原本を読むこと）。
+
+    実在・文書種別・scope の確認は `verify_doc_exists`（台帳と同じ確定判定）をそのまま再利用する
+    （二重実装しない）。`kinds`（必須・キーワード専用）はこのツールが扱える拡張子集合。`layer`
+    （省略可）は file_head 専用——指定時は `classify_document` 確定判定（`layer_mod.in_layer_code`）
+    で層一致も見る（Office/PDF の5ツールは呼び出し側 `run_tool` が層で分岐済み＝常に docs 側扱い
+    のため `layer` を渡さない）。
+
+    無効/範囲外/拡張子不一致/秘匿名/重要度制御/traversal/symlink/非regular/未実在/doctype不明は
+    すべて `None`。
+
+    RV#1 是正: 戻り値の4つ目 `stat` は検査完了直後にこの関数自身が取った `rp.stat()`——呼び出し元
+    （`run_tool`）はこの後 `open()` するまでの間に `rp` が symlink 等に差し替えられていないかを
+    `os.fstat` の (st_dev, st_ino) と突き合わせて確認する（検査後の再オープンで封じ込めを破る
+    TOCTOU 対策・`_open_verified_original` 参照）。
+    """
+    if not doc_id or doc_id.startswith("/") or "\\" in doc_id or "\x00" in doc_id:
+        return None
+    parts = doc_id.split("/")
+    if ".." in parts or "" in parts:
+        return None
+    ext = Path(doc_id).suffix.lower()
+    if ext not in kinds:
+        return None
+    if importance.is_importance_control_path(doc_id):
+        return None
+    if text_kind.is_sensitive(Path(doc_id).name, ext):
+        _log.warning("read_original: 秘匿名のため対象外にしました（ext=%s）", ext)
+        return None
+    if not scope_mod.in_scope(doc_id, scope_paths):
+        return None
+    root = worlds.world_dir(world)
+    if not root:
+        return None
+    root = Path(root)
+    cand = root / doc_id
+    try:
+        rr = root.resolve()
+        rp = cand.resolve()
+        if not (rp == rr or rp.is_relative_to(rr)):
+            return None
+        if rp != rr / doc_id:            # 字面パスと不一致＝経路上のどこかに symlink があった
+            return None
+        if not rp.is_file():             # FIFO/ソケット等の非 regular も拒否
+            return None
+    except OSError:
+        return None
+    if not verify_doc_exists(doc_id, world, scope_paths):   # 実在・文書種別・scope の確定判定を共有
+        return None
+    if layer is not None:
+        from . import corpus_docs
+        verdict = corpus_docs.classify_document(
+            doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size))
+        is_code = verdict["kind"] == "code"
+        if not layer_mod.in_layer_code(is_code, layer):
+            return None
+    try:
+        st = rp.stat()
+    except OSError:
+        return None
+    return root, doc_id, rp, st
+
+
+def _open_verified_original(root: Path, doc_id: str, expected_st) -> tuple:
+    """RV#1 是正・RV2巡目#1 是正: `_safe_original_path` が検査した `doc_id` を、`root`（world root・
+    信頼済みアンカー）から `_open_file_nofollow_walk`（read_around/read_doc と共有・各階層を
+    `O_DIRECTORY|O_NOFOLLOW` で1段ずつ辿る）で再度 open してから、検査直後に取った `expected_st`
+    （`os.stat_result`）とデバイス/inode が一致することを確認する。
+
+    検査（symlink 拒否・封じ込め・秘匿名等）と実際の `open()` の間には常に TOCTOU の隙間がある。
+    以前の実装は検査済みの**最終パス要素だけ**を `os.O_NOFOLLOW` で単発 open していたため、その
+    隙間で祖先ディレクトリ（`root/doc_id` の途中の階層）が KB 外への symlink に差し替えられると、
+    `stat`（検査時）と `open`（単発 open）が同じ差し替え後の外部 inode を指したまま一致してしまい
+    封じ込めを破れた——単発 `O_NOFOLLOW` は最終要素にしか効かない（POSIX 仕様）。`root` から
+    `doc_id` の各要素を個別に `O_NOFOLLOW` で辿る本関数は、途中のどの段が symlink に差し替えられて
+    いても `OSError` で検出する（祖先差し替えも拒否）。fstat 突合は仕上げの二重の安全弁として残す。
+
+    戻り値 `(f, error)`。成功時 `f` は open 済みバイナリファイル——所有権は呼び出し先
+    （`doc_readers` の各関数、モジュール docstring参照）へ引き継がれる。失敗時 `(None, {"error": ...})`。
+    """
+    rel_parts = Path(doc_id).parts
+    if not rel_parts:
+        return None, {"error": "読み取りに失敗しました"}
+    try:
+        fd = _open_file_nofollow_walk(root, rel_parts)
+    except OSError:
+        return None, {"error": "読み取りに失敗しました"}
+    try:
+        post = os.fstat(fd)
+        if not stat.S_ISREG(post.st_mode):
+            os.close(fd)
+            return None, {"error": "読み取りに失敗しました"}
+        if (post.st_dev, post.st_ino) != (expected_st.st_dev, expected_st.st_ino):
+            os.close(fd)
+            return None, {"error": "読み取りに失敗しました"}
+        f = os.fdopen(fd, "rb")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, {"error": "読み取りに失敗しました"}
+    return f, None
+
+
+def _close_quiet_local(f) -> None:
+    """`_open_verified_original` が開いたが結局 `doc_readers` へ渡さずに終わる分岐
+    （例: `xlsx_range` の `sheet` 引数欠落）で fd を漏らさず閉じる。"""
+    try:
+        f.close()
+    except OSError:
+        pass
 
 
 def _open_doc_stream(world: str, doc_id: str, sp, layer) -> tuple:
@@ -916,13 +1130,18 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
 # `grep` キーは不変（表記のみの統一）。
 _SYS_INTRO_AND_LIST_DOCS = (
     "あなたは社内資料を調べて答えるアシスタントです。事前の索引はありません。"
-    "ツールで資料を実際に検索して、**根拠のある事実だけ**で日本語で簡潔（2〜4文）に答えてください。\n"
+    "ツールで資料を実際に検索して、資料を根拠に日本語で答えてください。"
+    "**長さは絞らない＝集めた情報は削らない**。\n"
     "**ドキュメント数・一覧・どんな資料があるか・フォルダ構成といった台帳質問は、まず list_docs を使う**"
     "（語句そのまま検索は本文中の一致しか探せず件数/一覧には答えられない）。フォルダ名・ファイル名はパスに含まれるので、"
     "名前の部分一致は list_docs の name_pattern で当てる（語句そのまま検索で本文からは探さない）。"
     "表記が揺れそうな語（送り仮名・略し方など）は短い部分語で試す（例:「4期更改」がヒットしなければ「4期」）。\n"
     "**件数を答えるときは list_docs の path_prefix でフォルダを確定してから数え、どのフォルダを数えたかを"
     "回答に明示する**（曖昧なら『4期更改』と『4期保守』のように候補フォルダ別の内訳で答える）。\n"
+    "**一覧を求められたら該当する全件を各項目のパス付きで列挙する（『など』で省略しない・件数と一致させる・"
+    "truncated:true なら next_offset で続きを取る）。全件・一覧の完了は対象範囲の確認を終えてからで、"
+    "検索3回や件数だけの取得では完了とせず、中断（利用者停止・通信エラー・予算到達）のときは"
+    "確認済み／未確認／理由を分けて書き、部分結果を『全件』と断定しない。**\n"
     "**大規模な範囲でフォルダの階層構造そのものを俯瞰したいとき**（list_docs のフラット一覧では"
     "形が掴めないとき）は folder_tree で深さ上限つきのフォルダ木（フォルダごとの件数つき）を確認する。\n"
     "文書の**構造を先に掴みたいとき**は doc_outline で見出し一覧（行番号つき）を確認し、"
@@ -968,9 +1187,14 @@ _SYS_COMPARE_STEP = (
     "（対応文書が一意に決まらないときは candidates から利用者に確認してから比較する）。"
 )
 _SYS_OUTRO = (
-    "**本文・グラフに無いことは書かない（推測しない）**。"
+    "**確定した事実と推定は分けて書き、推定には『推定』と明示する**"
+    "（本文・グラフに無いことを補うときは推定として書く）。"
     "調査範囲・目的・選択肢が曖昧で、確認しないと結果が大きく変わる場合だけ ask_user でユーザに確認してください。"
-    "十分な根拠が集まったらツールを呼ばず最終回答だけを返す。出典の列挙は不要（別途付与）。"
+    "特定の値を確かめる質問は根拠が揃ったらツールを呼ばず最終回答だけを返す。全件・一覧・すべての依頼は"
+    "対象範囲の確認を終え、該当項目が回答にそろってから最終回答を返す（検索3回・根拠1件・代表例の発見では"
+    "返さない）。中断（利用者停止・通信エラー・予算到達）のときは確認済みの結果・未確認の範囲・理由を"
+    "分けて書き、部分結果を断定しない。"
+    "出典（原本 DL）は Sherpa が付与するが、本文中でも根拠のパスを示してよい。"
     "回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。"
 )
 SYSTEM = (_SYS_INTRO_AND_LIST_DOCS + _SYS_GREP_STEP + _SYS_GLOB_STEP + _SYS_ES_FOLLOWUP + _SYS_GRAPH_STEP
@@ -1019,7 +1243,16 @@ _PARAMS_LIST_DOCS = {"type": "object", "properties": {
                     "description": "フォルダで絞る（rel_path の先頭一致・例: '4期保守'）。省略可＝範囲全体"},
     "name_pattern": {"type": "string",
                      "description": "パス（フォルダ名/ファイル名どちらでも）の部分一致で絞る（例: '4期'）。省略可"},
-    "limit": {"type": "integer", "description": "一覧に含める最大件数（既定50）。件数(count)は limit と無関係に全件を返す"}},
+    "doctype": {"type": "string",
+               "description": "文書種別の完全一致で絞る（大文字小文字は無視。値は docs[].doctype の表示名と同じ・"
+                              "例: 'Excel'・'cobol'・'設計書'。旧形式は 'Excel(旧)'／'Word(旧)'／'PowerPoint(旧)' の別値＝"
+                              "'Excel' では .xls を含まない。値が不明なら doctype なしで1回呼んで確認する）。省略可"},
+    "state": {"type": "string",
+             "description": "状態の完全一致で絞る（'ready'=使える・'unreadable'=読み取れない・"
+                            "'unknown'=直近確認が未実施）。省略可"},
+    "limit": {"type": "integer", "description": "一覧に含める最大件数（既定200・上限500）。件数(count)は limit/offset と無関係に全件を返す"},
+    "offset": {"type": "integer",
+              "description": "一覧の開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"}},
     "required": []}
 _PARAMS_FOLDER_TREE = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
@@ -1054,7 +1287,8 @@ _PARAMS_ASK = {"type": "object", "properties": {
 _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id と行番号つきのヒットを返す）。完全一致・固有名詞に強い。"
                 "file_truncated が付くヒットは、その文書がまだ検索し切れていない可能性がある——"
                 "read_doc で続きを確認する。text_truncated が付くヒットは本文が途中で切れている——"
-                "read_around（周辺）か read_doc（続き）で読む。")
+                "read_around（周辺）か read_doc（続き）で読む。"
+                "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。")
 _DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
              "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。")
 _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・全文を一度には読まない）。"
@@ -1066,11 +1300,16 @@ _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・�
 _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・派生MDの表/シート見出しを含む）を"
                  "行番号つきで返す。read_doc/read_around で読む箇所の当たりを付けるのに使う。"
                  "見出しが無い文書は総行数だけを返す。file_truncated が付くときは文書自体が"
-                 "大きすぎて total_lines/見出し一覧が過小申告の可能性がある。")
+                 "大きすぎて total_lines/見出し一覧が過小申告の可能性がある。"
+                 "見出しが上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。")
 _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まない・grep しない）。"
                    "「ドキュメント数」「どんな資料があるか」「フォルダ構成」等の台帳質問はこれで答える。"
                    "path_prefix でフォルダ配下に絞り、name_pattern でパス（フォルダ名/ファイル名）の部分一致に絞れる。"
-                   "count は絞り込み後の全件数（limit と無関係）、docs は limit 件までの一覧（rel_path と doctype）。")
+                   "doctype（種別の完全一致・大文字小文字は無視）・state（'ready'/'unreadable'/'unknown' の"
+                   "完全一致）でも絞れる。docs は常に rel_path の昇順で並ぶ（offset を進めても順序は変わらない）。"
+                   "count は絞り込み後の全件数（limit/offset と無関係）、docs は offset から limit 件までの"
+                   "一覧（rel_path/doctype/state）。truncated:true なら残りがある——次回呼び出しの offset に"
+                   "next_offset をそのまま渡して続きを取る。")
 # K6（`docs/proposals/2026-09-04-グラフのソース正典化.md` §3・§4b S1）: list_docs（ls 相当・フラット
 # 一覧）に対する tree 相当。フォルダ名の意味解釈はしない（クエリ時にこのツールの呼び出し元＝LLM が
 # 解釈する・K6・§5「フォルダ意味ノードの事前計算はしない」）。
@@ -1079,12 +1318,13 @@ _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フ�
                      "大規模な範囲で使う）。path_prefix でフォルダ配下に絞り、depth（既定3）で列挙する深さを決める。"
                      "フォルダごとに直下ファイル数・配下（再帰）ファイル数・直下サブフォルダ数を返す。"
                      "深さ上限でまだ配下があるフォルダは truncated:true（depth を上げて掘り下げる）。"
-                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）。")
+                     "フォルダ件数自体が多すぎるときは folders_truncated:true（count が打ち切り前の総数）＝続きは取れないので、その範囲は未確認として扱う。")
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
             "ripgrep_search が0件/空振りのときはまずこれを試す。doc_id と抜粋を関連度順で返す。"
             "text_truncated が付くヒットは本文が途中で切れている——read_around（周辺）か "
-            "read_doc（続き）で読む。")
+            "read_doc（続き）で読む。"
+            "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。")
 _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する。結果が大きく変わる曖昧さがある場合だけ使う。"
              "例: 影響分析で起点や影響先が複数候補に割れるとき、確実な波及が0件で要確認だけになったときは、"
              "対象の絞り込みを確認してよい。依頼に「確認してから進めて」とあるときは調査より先に確認する。"
@@ -1092,16 +1332,28 @@ _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する
              "選択肢はラジオボタンまたはチェックボックスとして表示される。")
 _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の**関連部品**をたどる"
                "（コピー・呼び出し・参照・関連文書（言及）などの近傍を、つながりの経路つきで返す）。"
+               "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS だけの"
+               "経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: A →COPIES→ B は B を変えると A が"
+               "影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）を含む経路や `unverified` の辺（裏付け原本が"
+               "実在確認できない）を含む経路は候補＝原本で確認する。"
                "名前が一つでも判明したら、その関連の広がりは grep を反復するより先にこれで辿るほうが早い。"
-               "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。")
+               "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。"
+               "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。")
 # grep OFF/不達で es_search/graph_neighbors だけが提示されるときの代替 description（SC-6e）。
 # `_DESC_ES`/`_DESC_GRAPH` はいずれも grep（ripgrep_search）への言及を含むため、提示していない
 # ツールへの言及・推奨をそのまま残さない（無駄なターン/上限到達を防ぐ）。
 _DESC_ES_NO_GREP = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
-                    "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。doc_id と抜粋を関連度順で返す。")
+                    "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。doc_id と抜粋を関連度順で返す。"
+                    "text_truncated が付くヒットは本文が途中で切れている——read_around（周辺）か read_doc（続き）で読む。"
+                    "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。")
 _DESC_GRAPH_NO_GREP = ("関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の**関連部品**をたどる"
                        "（コピー・呼び出し・参照・関連文書（言及）などの近傍を、つながりの経路つきで返す）。"
-                       "原因の手がかり集め（トラブルシュート）に有効。")
+                       "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS"
+                       "だけの経路は構造的な依存＝根拠にしてよい（影響は矢印をさかのぼる: A →COPIES→ B は B を"
+                       "変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO を含む経路や `unverified` の辺を含む経路は候補＝原本で"
+                       "確認する。"
+                       "原因の手がかり集め（トラブルシュート）に有効。"
+                       "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。")
 _PARAMS_GRAPH = {"type": "object", "properties": {
     "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"}},
     "required": ["name"]}
@@ -1112,7 +1364,8 @@ _PARAMS_GLOB = {"type": "object", "properties": {
                                "どの階層でも探す（例: '*.jcl'・'*請求書*.xlsx'・'**/障害対応/*.md'）")}},
     "required": ["pattern"]}
 _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲内のファイルを列挙する（中身は読まない・パスのみ）。"
-             "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り）。"
+             "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り＝truncated:true。"
+             "続きは取れないので、その範囲は未確認として扱い count との差を全件と断定しない）。"
              "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。")
 # GEN-DIFF（世代間diff比較・`docs/proposals/2026-09-03-世代間diff比較.md`）: grep と同格の素朴な
 # 決定的ツール——2文書のRAG正本（.rag.md）の unified diff を返すだけで、レコード同定・業務キー
@@ -1125,7 +1378,8 @@ _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追
                  "対応する文書を自動発見する。世代を除いた相対パスが完全一致すれば1件に決まる。"
                  "決まらないときは status: needs_disambiguation と candidates（doc_id 一覧）を返すので、"
                  "会話で利用者にどちらか確認してから left_doc_id/right_doc_id で呼び直す。"
-                 "片方以上が rag.md を持たない文書（コード原文等）のときは status: unsupported を返す。")
+                 "片方以上が rag.md を持たない文書（コード原文等）のときは status: unsupported を返す。"
+                 "diff が上限で切られたときは truncated:true が付く＝続きは取れないので、その範囲は未確認として扱う。")
 _PARAMS_COMPARE = {"type": "object", "properties": {
     "left_doc_id": {"type": "string", "description": "比較する片方の doc_id（省略時は right_doc_id も無視される）"},
     "right_doc_id": {"type": "string", "description": "比較するもう片方の doc_id（left_doc_id とセットで指定）"},
@@ -1133,6 +1387,69 @@ _PARAMS_COMPARE = {"type": "object", "properties": {
     "target_generation": {"type": "string",
                           "description": "比べたい世代（トップフォルダ名・例 '5期'）。source_doc_id とセットで指定"}},
     "required": []}
+
+# 本文を実際に読んだツール＝出典の「根拠（精読済み）」区分（`verified_docs`）に載せる（シート一覧だけの
+# `xlsx_sheets`・見出しだけの `doc_outline` は含めない）。
+_VERIFIED_READ_TOOLS = frozenset({"read_around", "read_doc", "xlsx_range", "docx_paragraphs",
+                                  "pptx_slides", "pdf_pages", "file_head"})
+
+
+# ---- 原本読取ツール（S3b・`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）----
+# Codex（MCP 経由）と API 経路の頭脳（このモジュールの function-calling）が**同じ関数**
+# （`doc_readers.py`）で原本の中身を読む。毎回 Python を書かせない＝トークンと実行時間を削り、
+# 再現性を上げる（突合・集計など定型外の作業だけ Python に任せる）。
+_DESC_XLSX_SHEETS = ("Excel（.xlsx）原本のシート一覧と大きさを返す（原本を直接読む・派生ではない）。"
+                    "doc_id はシート名・行数・列数を先に確認してから xlsx_range で読む範囲を絞るのに使う。"
+                    "大きすぎて時間内に数えられないシートは dims_estimated=true で、大きさは記録値（推定）か不明。"
+                    "シート一覧が上限で切られたときは truncated:true＝続きは取れないので、その範囲（残りのシート）は未確認として扱う。")
+_PARAMS_XLSX_SHEETS = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"}},
+    "required": ["doc_id"]}
+_DESC_XLSX_RANGE = ("Excel（.xlsx）原本のセル範囲を表で返す（原本を直接読む・派生ではない）。"
+                    "range 省略時は先頭から max_rows×max_cols（既定200行×50列）。"
+                    "範囲が上限を超えたら切り詰めて truncated:true（range は実際に返した範囲）。"
+                    "引用するときはシート名とセル範囲（例 'Sheet1!B3:D10'）で示す。")
+_PARAMS_XLSX_RANGE = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .xlsx）"},
+    "sheet": {"type": "string", "description": "シート名（xlsx_sheets が返す name）"},
+    "range": {"type": "string", "description": "セル範囲（A1形式・例 'B3:D10'）。省略可＝先頭から既定サイズ"},
+    "max_rows": {"type": "integer", "description": "返す最大行数（既定200）"},
+    "max_cols": {"type": "integer", "description": "返す最大列数（既定50）"}},
+    "required": ["doc_id", "sheet"]}
+_DESC_DOCX_PARAGRAPHS = ("Word（.docx）原本の段落と表を返す（原本を直接読む・派生ではない）。"
+                        "start（既定0）・count（既定200）で段落をページングする。表は先頭20表・各50行まで。"
+                        "表が大きく結果が予算を超える場合は表の行も削られる（row_truncated:true）。"
+                        "引用するときは段落番号（i）・見出し（style）、表なら表番号・行で示す。")
+_PARAMS_DOCX_PARAGRAPHS = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .docx）"},
+    "start": {"type": "integer", "description": "読み始める段落インデックス（既定0）"},
+    "count": {"type": "integer", "description": "読む段落数（既定200）"},
+    "table_start": {"type": "integer", "description": "表の開始インデックス（既定0・1回20表）。tables が total_tables に足りなければ進めて呼び直す"},
+    "table_row_start": {"type": "integer", "description": "各表の開始行（既定0・1回50行）。rows が total_rows に足りなければ進めて呼び直す"}},
+    "required": ["doc_id"]}
+_DESC_PPTX_SLIDES = ("PowerPoint（.pptx）原本のスライドのテキスト・表・ノートを返す"
+                    "（原本を直接読む・派生ではない）。pages（例 '3'・'2-5'・'1,3,5'・既定 '1-10'）で"
+                    "スライドを指定する（1回20枚まで）。引用するときはスライド番号（no）で示す。")
+_PARAMS_PPTX_SLIDES = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .pptx）"},
+    "pages": {"type": "string", "description": "スライド指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-10'"}},
+    "required": ["doc_id"]}
+_DESC_PDF_PAGES = ("PDF 原本のページのテキストを返す（原本を直接読む・派生ではない）。"
+                  "pages（例 '3'・'2-5'・'1,3,5'・既定 '1-5'）でページを指定する（1回10ページまで）。"
+                  "1ページの文字量だけで結果が予算を超える場合でもページ自体は残し、本文を"
+                  "切り詰めて text_truncated:true にする（ページ番号は保つ）。"
+                  "引用するときはページ番号（no）で示す。")
+_PARAMS_PDF_PAGES = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（拡張子 .pdf）"},
+    "pages": {"type": "string", "description": "ページ指定（例 '3'・'2-5'・'1,3,5'）。省略時 '1-5'"}},
+    "required": ["doc_id"]}
+_DESC_FILE_HEAD = ("テキスト・コード原本の先頭バイトをそのまま返す（原本を直接読む・派生ではない・"
+                  "Office/PDF は対象外＝xlsx_sheets/docx_paragraphs/pptx_slides/pdf_pages を使う）。"
+                  "max_bytes（既定65536）まで読み、上限で切れていたら truncated:true。")
+_PARAMS_FILE_HEAD = {"type": "object", "properties": {
+    "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（テキスト・コード）"},
+    "max_bytes": {"type": "integer", "description": "読む最大バイト数（既定65536）"}},
+    "required": ["doc_id"]}
 
 
 def _desc_es(with_grep: bool) -> str:
@@ -1169,6 +1486,14 @@ def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
         t.insert(insert_at, {"type": "function", "function": {"name": "graph_neighbors", "description": _desc_graph(with_grep), "parameters": _PARAMS_GRAPH}})
     # GEN-DIFF: ES/graph の可用性に依存しない土台系ツール（read_around 等と同じ扱い）＝常に含める。
     t.append({"type": "function", "function": {"name": "compare_documents", "description": _DESC_COMPARE, "parameters": _PARAMS_COMPARE}})
+    # S3b: 原本読取ツールも ES/graph/grep トグルと無関係の土台系＝常に含める（layer=="code" のターン
+    # では Office/PDF 5本は run_tool 側が error を返す・file_head は層に応じて対象を絞る）。
+    t.append({"type": "function", "function": {"name": "xlsx_sheets", "description": _DESC_XLSX_SHEETS, "parameters": _PARAMS_XLSX_SHEETS}})
+    t.append({"type": "function", "function": {"name": "xlsx_range", "description": _DESC_XLSX_RANGE, "parameters": _PARAMS_XLSX_RANGE}})
+    t.append({"type": "function", "function": {"name": "docx_paragraphs", "description": _DESC_DOCX_PARAGRAPHS, "parameters": _PARAMS_DOCX_PARAGRAPHS}})
+    t.append({"type": "function", "function": {"name": "pptx_slides", "description": _DESC_PPTX_SLIDES, "parameters": _PARAMS_PPTX_SLIDES}})
+    t.append({"type": "function", "function": {"name": "pdf_pages", "description": _DESC_PDF_PAGES, "parameters": _PARAMS_PDF_PAGES}})
+    t.append({"type": "function", "function": {"name": "file_head", "description": _DESC_FILE_HEAD, "parameters": _PARAMS_FILE_HEAD}})
     if can_ask:
         t.append({"type": "function", "function": {"name": "ask_user", "description": _DESC_ASK, "parameters": _PARAMS_ASK}})
     return t
@@ -1194,6 +1519,13 @@ def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
         fns.insert(insert_at, {"name": "graph_neighbors", "description": _desc_graph(with_grep), "parameters": _PARAMS_GRAPH})
     # GEN-DIFF: ES/graph の可用性に依存しない土台系ツール（read_around 等と同じ扱い）＝常に含める。
     fns.append({"name": "compare_documents", "description": _DESC_COMPARE, "parameters": _PARAMS_COMPARE})
+    # S3b: 原本読取ツールも土台系＝常に含める（openai_tools と同じ理由）。
+    fns.append({"name": "xlsx_sheets", "description": _DESC_XLSX_SHEETS, "parameters": _PARAMS_XLSX_SHEETS})
+    fns.append({"name": "xlsx_range", "description": _DESC_XLSX_RANGE, "parameters": _PARAMS_XLSX_RANGE})
+    fns.append({"name": "docx_paragraphs", "description": _DESC_DOCX_PARAGRAPHS, "parameters": _PARAMS_DOCX_PARAGRAPHS})
+    fns.append({"name": "pptx_slides", "description": _DESC_PPTX_SLIDES, "parameters": _PARAMS_PPTX_SLIDES})
+    fns.append({"name": "pdf_pages", "description": _DESC_PDF_PAGES, "parameters": _PARAMS_PDF_PAGES})
+    fns.append({"name": "file_head", "description": _DESC_FILE_HEAD, "parameters": _PARAMS_FILE_HEAD})
     if can_ask:
         fns.append({"name": "ask_user", "description": _DESC_ASK, "parameters": _PARAMS_ASK})
     return [{"functionDeclarations": fns}]
@@ -1211,6 +1543,370 @@ def graph_gemini_tools() -> list:
     return [{"functionDeclarations": [
         {"name": "graph_neighbors", "description": _DESC_GRAPH, "parameters": _PARAMS_GRAPH}
     ]}]
+
+
+# ---- S3b 原本読取ツール（6本）共通の後処理: バイト上限クリップ・read_evidence 用の text 合成 ----
+# `doc_readers.py` は world/scope/doc_id を一切知らない純関数（モジュール docstring 参照）ため、
+# `read_evidence`（`InvestigationState`）に載せるための `doc_id`/`text`/`locator` はここ
+# （`run_tool` の 6 分岐だけが doc_id を知っている）で合成する。
+
+# ツール名→(切り詰め対象フィールド, なければ None＝クリップ不要) の対応（RV#7）。
+_READER_CLIP_FIELD = {
+    "xlsx_sheets": "sheets", "xlsx_range": "rows", "docx_paragraphs": "paragraphs",
+    "pptx_slides": "slides", "pdf_pages": "pages", "file_head": "text",
+}
+
+
+def _row_start_from_a1_range(range_a1: str) -> int | None:
+    """`"B3:D10"` 等の A1 range 文字列から開始行番号（3）を取り出す（xlsx_range の行番号復元用）。
+    解析できなければ None（呼び出し元は 0 起点の連番へフォールバックする）。"""
+    m = re.match(r"^[A-Za-z]+(\d+)", (range_a1 or "").split(":")[0])
+    return int(m.group(1)) if m else None
+
+
+def _doc_reader_text_locator(name: str, result: dict) -> tuple[str | None, str | None]:
+    """RV#5 是正: S3b 原本読取ツール（6本）の結果から `read_evidence`/根拠ゲートに載せる
+    `text`（rows/paragraphs/slides/pages を1本の本文に連結・位置情報を行頭に付ける）と
+    `locator` を組む。エラー/中身なしは `(None, None)`（呼び出し元は doc_id/text/locator を
+    足さない＝空の read evidence を作らない）。
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return None, None
+    if name == "xlsx_sheets":
+        sheets = result.get("sheets") or []
+        if not sheets:
+            return None, None
+        def _dims(s):
+            if s.get("dims_estimated"):
+                if s.get("max_row") is None or s.get("max_col") is None:
+                    return "大きさ不明（時間内に数えられず）"
+                return f"約{s.get('max_row')}行×{s.get('max_col')}列（記録値・推定）"
+            return f"{s.get('max_row', 0)}行×{s.get('max_col', 0)}列"
+        text = "\n".join(f"{s.get('name')}: {_dims(s)}"
+                         for s in sheets if isinstance(s, dict))
+        return (text or None), "sheets"
+    if name == "xlsx_range":
+        rows = result.get("rows") or []
+        if not rows:
+            return None, None
+        sheet = result.get("sheet") or ""
+        rng = result.get("range") or ""
+        locator = f"{sheet}!{rng}" if sheet else (rng or "range")
+        start_row = _row_start_from_a1_range(rng)
+        lines = []
+        for i, row in enumerate(rows):
+            no = start_row + i if start_row is not None else i
+            cells = row if isinstance(row, list) else []
+            lines.append(f"{no}: " + "\t".join(str(c) for c in cells))
+        return "\n".join(lines), locator
+    if name == "docx_paragraphs":
+        # RV2巡目#8: 表（`tables`）も本文合成の対象にする——以前は段落だけを見ていたため、表しか
+        # 無い docx（段落0件）は read_evidence が常に空になっていた。
+        paras = [p for p in (result.get("paragraphs") or []) if isinstance(p, dict)]
+        tables = [t for t in (result.get("tables") or []) if isinstance(t, dict)]
+        if not paras and not tables:
+            return None, None
+        lines = [f"段落{p.get('i')}: {p.get('text', '')}" for p in paras]
+        for t in tables:
+            ti = t.get("i")
+            row_start = t.get("row_start") or 0
+            for ri, row in enumerate(t.get("rows") or []):
+                cells = row if isinstance(row, list) else []
+                lines.append(f"表{ti}行{row_start + ri}: " + "\t".join(str(c) for c in cells))
+        text = "\n".join(lines)
+        # 段落の範囲だけを locator にすると、段落側は同じでも表側のページング
+        # （`table_row_start` を進めて呼び直す）が違う2回の呼び出しが同じ locator に潰れる——
+        # `InvestigationState._find` の同一性判定は locator 文字列そのものなので、表の行範囲も
+        # locator に含めて「実際に返した範囲」を表す（`paragraphs[s-e];tables[ts-te]rows[rs-re]`）。
+        ids = [p.get("i") for p in paras]
+        parts = []
+        if ids:
+            parts.append(f"paragraphs[{ids[0]}-{ids[-1]}]")
+        if tables:
+            t_ids = [t.get("i") for t in tables if isinstance(t.get("i"), int)]
+            row_ranges = [(t.get("row_start"), len(t.get("rows") or [])) for t in tables]
+            row_lo = [rs for rs, n in row_ranges if isinstance(rs, int) and n > 0]
+            row_hi = [rs + n - 1 for rs, n in row_ranges if isinstance(rs, int) and n > 0]
+            if t_ids:
+                tables_part = f"tables[{min(t_ids)}-{max(t_ids)}]"
+                if row_lo and row_hi:
+                    tables_part += f"rows[{min(row_lo)}-{max(row_hi)}]"
+                parts.append(tables_part)
+        locator = ";".join(parts) if parts else "paragraphs"
+        return (text or None), locator
+    if name == "pptx_slides":
+        # RV2巡目#8: 表・ノートも本文合成の対象にする（段落と同じ理由・スライドはテキストのみ
+        # だと表の内容やノートの補足が read_evidence から丸ごと落ちていた）。
+        slides = [s for s in (result.get("slides") or []) if isinstance(s, dict)]
+        if not slides:
+            return None, None
+        lines = []
+        for s in slides:
+            no = s.get("no")
+            parts = [f"スライド{no}: " + " / ".join(s.get('texts') or [])]
+            for ti, table in enumerate(s.get("tables") or []):
+                for ri, row in enumerate(table if isinstance(table, list) else []):
+                    cells = row if isinstance(row, list) else []
+                    parts.append(f"スライド{no}表{ti}行{ri}: " + "\t".join(str(c) for c in cells))
+            notes = s.get("notes")
+            if notes:
+                parts.append(f"スライド{no}ノート: {notes}")
+            lines.append("\n".join(parts))
+        text = "\n".join(lines)
+        nos = [s.get("no") for s in slides]
+        locator = f"slides[{','.join(str(n) for n in nos)}]" if nos else "slides"
+        return text, locator
+    if name == "pdf_pages":
+        pages = [p for p in (result.get("pages") or []) if isinstance(p, dict)]
+        if not pages:
+            return None, None
+        text = "\n".join(f"ページ{p.get('no')}: {p.get('text', '')}" for p in pages)
+        nos = [p.get("no") for p in pages]
+        locator = f"pages[{','.join(str(n) for n in nos)}]" if nos else "pages"
+        return text, locator
+    if name == "file_head":
+        text = result.get("text")
+        if not text:
+            return None, None
+        return text, "head"
+    return None, None
+
+
+def _shrink_xlsx_range_field(orig_range: str | None, n_rows: int) -> str | None:
+    """RV2巡目#7 是正: `orig_range`（doc_readers.xlsx_range が返した実際の A1 レンジ）を、行が
+    `n_rows` 行へバイト予算で削減された場合の実際の範囲に更新する（列は不変・終了行だけ詰める）。
+    以前は行を減らしても `range`（延いては `locator`）が元の（削る前の）範囲のまま食い違って
+    残っていた。解析できなければ元の値のまま返す（fail-safe・致命的ではない）。
+    """
+    if not orig_range or n_rows <= 0:
+        return orig_range
+    try:
+        from openpyxl.utils.cell import range_boundaries
+        from openpyxl.utils import get_column_letter
+        min_col, min_row, max_col, _max_row = range_boundaries(orig_range)
+        return f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{min_row + n_rows - 1}"
+    except Exception:
+        return orig_range
+
+
+# RV2巡目#6 是正: 二分探索で1件も残せない場合に「先頭1件の text を切り詰めて残す」対応を
+# 実装済みのツール（dict 要素が str の `text` フィールドを持つ形）。xlsx_range（行=セルのリスト）・
+# pptx_slides（要素は `texts`/`tables`/`notes`・単一の text フィールドが無い）は対象外——
+# 1件も入らなければ従来どおり空のまま返す（本 RV で確認・要求された再現ケースの範囲で対応）。
+_SINGLE_ITEM_TEXT_FIELDS = frozenset({"pdf_pages"})
+
+
+def _shrink_single_item_result(name: str, result: dict, doc_id: str, field: str,
+                               item, tr_max_bytes: int) -> dict | None:
+    """RV2巡目#6 是正: 1件も残せないとき、先頭1件だけを予算内へ切り詰めて `text_truncated: true`
+    を立てて残す（番号（`no`/`i`）と locator は保つ）——全消滅より情報量を残す。
+    """
+    if not isinstance(item, dict):
+        return None
+    text0 = item.get("text")
+    if not isinstance(text0, str) or not text0:
+        return None
+
+    def _build_one(txt: str) -> dict:
+        it = {**item, "text": txt, "text_truncated": True}
+        r = dict(result)
+        r[field] = [it]
+        # 鍵ブロックの補完伏せ字は `_redact_deep`（呼び出し元・run_tool）が構造の
+        # 全フィールドへ既に文書順で適用済み——ここで合成する text はその済みのフィールドから
+        # 組むだけなので、合成後に改めて伏せ字を掛け直す必要はない。
+        text, locator = _doc_reader_text_locator(name, r)
+        if text:
+            r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
+        return r
+
+    lo, hi, best_text = 0, len(text0), ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _result_byte_size(_build_one(text0[:mid])) <= tr_max_bytes:
+            best_text = text0[:mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return _build_one(best_text)
+
+
+def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int) -> dict:
+    """RV2巡目#5 是正: `docx_paragraphs` 専用の仕上げ——段落だけでなく表（`tables`・表→行）も
+    バイト予算の削減対象にする。予算超過時は**段落を先に確保**（表 0 行で段落数を二分探索）し、
+    余った予算で表の行を先頭の表から順に埋める（行単位でフラット化・途中で打ち切ると
+    `row_truncated`）——表を満量のまま段落を削ると大きな表の文書で段落が 1 件も返らない。
+    段落が丸ごと1件も入らない場合の救済も、まず表を `best_n_rows` に固定したまま先頭1段落を
+    切り詰めて試す（表が小さければこれで非空の段落と表の両方が残る）。表がそれ自体で予算の
+    大半を占めるほど大きく、段落が空文字になる・予算を超えるいずれかに終わる場合だけ、表を
+    0行にした状態で段落を切り詰め直してから、残り予算で表の行数を改めて決める。
+    """
+    paras = [p for p in (result.get("paragraphs") or []) if isinstance(p, dict)]
+    tables_orig = [t for t in (result.get("tables") or []) if isinstance(t, dict)]
+    flat_rows: list[tuple[int, object]] = []
+    for ti, t in enumerate(tables_orig):
+        for row in (t.get("rows") or []):
+            flat_rows.append((ti, row))
+
+    def _tables_for(n_rows_keep: int) -> list[dict]:
+        if n_rows_keep <= 0:
+            return []
+        counts: dict[int, int] = {}
+        for ti, _row in flat_rows[:n_rows_keep]:
+            counts[ti] = counts.get(ti, 0) + 1
+        out = []
+        for ti, t in enumerate(tables_orig):
+            n = counts.get(ti, 0)
+            if n <= 0:
+                continue
+            orig_rows = t.get("rows") or []
+            nt = {**t, "rows": orig_rows[:n]}
+            if n < len(orig_rows):
+                nt["row_truncated"] = True
+            out.append(nt)
+        return out
+
+    def _build(n_paras: int, n_rows_keep: int) -> dict:
+        r = dict(result)
+        r["paragraphs"] = paras[:n_paras]
+        r["tables"] = _tables_for(n_rows_keep)
+        # 合成元の paragraphs/tables は既に `_redact_deep` を通過済み（呼び出し元・
+        # run_tool）——合成後に鍵ブロックの補完伏せ字を掛け直す必要はない。
+        text, locator = _doc_reader_text_locator("docx_paragraphs", r)
+        if text:
+            r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
+        return r
+
+    full = _build(len(paras), len(flat_rows))
+    if _result_byte_size(full) <= tr_max_bytes:
+        return full
+
+    # 段落を先に確保する（表 0 行で段落数を二分探索）→ 余った予算で表の行を埋める。
+    # 表を満量のまま段落を削ると、大きな表を持つ文書で段落が 1 件も返らず、段落のページング
+    # （start/count）でも回収できなくなる。
+    lo, hi, best_n_paras = 0, len(paras), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _result_byte_size(_build(mid, 0)) <= tr_max_bytes:
+            best_n_paras = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    lo, hi, best_n_rows = 0, len(flat_rows), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _result_byte_size(_build(best_n_paras, mid)) <= tr_max_bytes:
+            best_n_rows = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best_n_paras > 0:
+        r = _build(best_n_paras, best_n_rows)
+        r["truncated"] = True
+        return r
+
+    # 段落が1件も丸ごと入らない場合——小さな表が1行でも入る（`best_n_rows > 0`）からといって
+    # ここで早期に返してしまうと、段落の救済（下）へ絶対に到達しない（表さえあれば長い段落が
+    # 丸ごと消える）。表しか無い docx（`paras` が空）はこの救済の対象外——表は1行単位でしか
+    # 縮められず、単一の `text` フィールドを持たないため。
+    if paras:
+        # まず表を `best_n_rows`（段落0件を前提に決めた行数）に固定したまま段落を救済する
+        # （表が小さければ従来どおりここで非空の段落と表の両方を確保できる）。表がそれ自体で
+        # 予算の大半を占めるほど大きい場合はこの救済が「段落が空文字」または「予算超過」に
+        # 終わる——その場合だけ表を**0行にした状態で**段落を救済し直す（表を先に含めると、
+        # 表だけで予算をほぼ使い切り段落本文が空になりうる）。
+        fixed_tables_base = dict(result)
+        fixed_tables_base["tables"] = _tables_for(best_n_rows)
+        shrunk = _shrink_single_item_result("docx_paragraphs", fixed_tables_base, doc_id,
+                                            "paragraphs", paras[0], tr_max_bytes)
+        shrunk_ok = (shrunk is not None and (shrunk.get("paragraphs") or [{}])[0].get("text")
+                    and _result_byte_size(shrunk) <= tr_max_bytes)
+        if not shrunk_ok:
+            zero_tables_base = dict(result)
+            zero_tables_base["tables"] = []
+            shrunk = _shrink_single_item_result("docx_paragraphs", zero_tables_base, doc_id,
+                                                "paragraphs", paras[0], tr_max_bytes)
+        if shrunk is not None:
+            # 救済した段落を固定した上で、表の行数を残り予算に合わせて改めて二分探索する
+            # （`fixed_tables_base` 経由で救済できた場合も、この再探索は同じ `best_n_rows` に
+            # 収束する——表の行を増やすほど段落に残せる文字数が単調に減るため）。
+            def _with_tables(n_rows_keep: int) -> dict:
+                r = dict(shrunk)
+                r["tables"] = _tables_for(n_rows_keep)
+                text, locator = _doc_reader_text_locator("docx_paragraphs", r)
+                if text:
+                    r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
+                return r
+
+            lo, hi, rescued_n_rows = 0, len(flat_rows), 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if _result_byte_size(_with_tables(mid)) <= tr_max_bytes:
+                    rescued_n_rows = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            final = _with_tables(rescued_n_rows)
+            final["truncated"] = True
+            return final
+    r = _build(0, best_n_rows)
+    r["truncated"] = True
+    return r
+
+
+def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: int) -> dict:
+    """S3b 6ツール共通の仕上げ（`_redact_deep` の後に呼ぶ）: RV#5 の `doc_id`/`text`/`locator`
+    合成と RV#7 のバイト上限クリップを同時に行う——`text` は `result[field]`（rows/paragraphs/
+    slides/pages/sheets）から毎回作り直すため、クリップで `field` を削っても `text` が古い
+    （削る前の）内容のまま残って予算を超えたり、構造と食い違ったりしない。二分探索は
+    `doc_id`/`text`/`locator` を含めた最終形の JSON バイト数（`_result_byte_size`）で判定する。
+    エラー結果はそのまま。
+
+    `docx_paragraphs` は表も削減対象にする必要がある（RV2巡目#5）ため専用の
+    `_finish_docx_paragraphs_result` に委譲する。
+    """
+    if not (isinstance(result, dict) and not result.get("error")):
+        return result
+    if name == "docx_paragraphs":
+        return _finish_docx_paragraphs_result(result, doc_id, tr_max_bytes)
+    field = _READER_CLIP_FIELD.get(name)
+
+    def _build(seq):
+        r = dict(result)
+        if field is not None and seq is not None:
+            r[field] = seq
+            if name == "xlsx_range":
+                # RV2巡目#7: 行を削った分だけ `range`（延いては locator）も実際の範囲へ合わせる。
+                r["range"] = _shrink_xlsx_range_field(result.get("range"), len(seq))
+        # 合成元の rows/paragraphs/slides/pages/sheets は既に `_redact_deep` を
+        # 通過済み（呼び出し元・run_tool）——合成後に鍵ブロックの補完伏せ字を掛け直す必要はない。
+        text, locator = _doc_reader_text_locator(name, r)
+        if text:
+            r = {**r, "doc_id": doc_id, "text": text, "locator": locator}
+        return r
+
+    full_seq = result.get(field) if field is not None else None
+    full = _build(full_seq)
+    if field is None or not isinstance(full_seq, (list, str)) or _result_byte_size(full) <= tr_max_bytes:
+        return full
+    lo, hi, best = 0, len(full_seq), _build(full_seq[:0])
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = _build(full_seq[:mid])
+        if _result_byte_size(cand) <= tr_max_bytes:
+            best = cand
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    # RV2巡目#6: 1件も残せない（best のフィールドが空）場合、先頭1件だけ text を予算内へ切り詰めて
+    # 残す（対応済みツールのみ・`_SINGLE_ITEM_TEXT_FIELDS` 参照）。
+    if (isinstance(full_seq, list) and full_seq and name in _SINGLE_ITEM_TEXT_FIELDS
+            and not (best.get(field) if field is not None else None)):
+        shrunk = _shrink_single_item_result(name, result, doc_id, field, full_seq[0], tr_max_bytes)
+        if shrunk is not None:
+            shrunk["truncated"] = True
+            return shrunk
+    best["truncated"] = True
+    return best
 
 
 # ---- ツール実行（read-only・world＋scope に限定）----
@@ -1283,11 +1979,18 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         from . import doc_ledger                          # 台帳＝world のフォルダ木を走査（鏡モデル・常に live）
         prefix = str(args.get("path_prefix") or "").strip().strip("/")
         pattern = str(args.get("name_pattern") or "").strip().lower()
+        doctype_filter = str(args.get("doctype") or "").strip().lower()
+        state_filter = str(args.get("state") or "").strip().lower()
         try:
-            limit = int(args.get("limit") or 50)
+            limit = int(args.get("limit") or 200)
         except (TypeError, ValueError):
-            limit = 50
+            limit = 200
         limit = max(1, min(limit, 500))                    # read_around の window と同じ流儀でクランプ
+        try:
+            offset = int(args.get("offset") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        offset = max(0, offset)
         # 層判定は `doc_ledger`（`classify_document` 確定済み・§7 裁定10）の `branch=="source"` を
         # 使う（`layer_mod.in_layer`＝拡張子だけの近似は使わない・grep/ES と同じ確定判定に揃える）。
         rows = [r for r in doc_ledger.documents_for(world, deadline=deadline)
@@ -1297,12 +2000,21 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             rows = [r for r in rows if scope_mod.in_scope(r["name"], [prefix])]   # 同じ prefix 一致ロジックを再利用
         if pattern:
             rows = [r for r in rows if pattern in r["name"].lower()]
-        # state（"ready"/"unreadable" 等）も通す——読み取り不可な文書を「使える」文書と同列に見せない。
+        if doctype_filter:
+            rows = [r for r in rows if str(r.get("doctype") or "").lower() == doctype_filter]
+        # state（"ready"/"unreadable"/"unknown"）も通す——読み取り不可な文書を「使える」文書と同列に見せない。
+        if state_filter:
+            rows = [r for r in rows if str(r.get("state", "ready")).lower() == state_filter]
+        rows.sort(key=lambda r: r["name"])                 # rel_path 昇順固定（同条件なら offset が安定する）
+        page = rows[offset:offset + limit]
         out = [{"rel_path": r["name"], "doctype": r.get("doctype"), "state": r.get("state", "ready")}
-              for r in rows[:limit]]
+              for r in page]
         for d in out:
             docs.add(d["rel_path"])                        # 一覧に出した分だけ出典（sources）に載せる
-        return ({"count": len(rows), "docs": out}, docs, cites, cards)
+        shown_end = offset + len(out)
+        truncated = shown_end < len(rows)
+        return ({"count": len(rows), "offset": offset, "docs": out, "truncated": truncated,
+                "next_offset": shown_end if truncated else None}, docs, cites, cards)
     if name == "folder_tree":
         # K6: フォルダはドキュメントではない（`docs`＝doc_id 集合には何も足さない・出典/引用の対象外
         # ——list_docs/glob_search が返す実ファイル rel_path とは異なる）。
@@ -1331,6 +2043,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         q = str(args.get("query") or "")
         degrade_reason = None
         truncated_docs: list = []                       # ripgrep_search のみ（es_search は空のまま）
+        cap_reached = False                             # ヒット上限に達した（母集団の一部しか見ていない）
         if name == "es_search":
             from . import documents                       # ES ヒットは現 world に**実在する doc** だけ採用
             # 古い ES 索引由来の 404／別内容リンクを引用/出典に出さない（非agentic の _es_citations と同じ実在チェック・rv-full2 #4）。
@@ -1345,14 +2058,29 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             es_hits, degrade_reason = es_index.search(world, q, scope_paths=sp,
                                                       k=(max_hits or MAX_HITS), layer=layer,
                                                       k_ceiling=MAX_HITS_ABS_MAX)
+            # 上限到達は実在チェック・秘匿名除外の前（生ヒット数）で判定する——後で落ちた分で
+            # 件数が減っても「上限まで返っていた＝母集団の一部」という事実は変わらない。
+            cap_reached = len(es_hits) >= (max_hits or MAX_HITS)
+            # 秘匿名文書（`is_sensitive` 導入前に索引化された既存 ES ヒット）は実在チェックの後、
+            # ここで一律に弾く——`_safe_doc_path` の秘匿名ガードは read_around（精読）専用で
+            # es_search は通らないため、ここで塞がないと `credentials.xlsx` 等の本文が MCP/外部
+            # 検索 API へそのまま返る（台帳 #80）。件数（`count`/`docs`）にも含めない。
+            valid_es_hits = []
+            for h in es_hits:
+                did = h.get("doc_id")
+                if not did or did not in valid:
+                    continue
+                if text_kind.is_sensitive_doc_id(did):
+                    _log.warning("es_search: 秘匿名のため対象外にしました（ext=%s）", Path(did).suffix.lower())
+                    continue
+                valid_es_hits.append(h)
             hits = [{"doc_id": h["doc_id"], "line": h.get("line"), "text": h.get("text", ""),
                      "span": [h.get("line"), h.get("line")], "ext": h.get("ext"),
                      "score": h.get("score"),                       # 親返し（L4c）の並び順にのみ使う・LLM 出力へは出さない
                      **({"locator": h["locator"]} if h.get("locator") is not None else {}),
                      **({"chunk_id": h["chunk_id"]} if h.get("chunk_id") is not None else {}),
                      **({"parent_id": h["parent_id"]} if h.get("parent_id") is not None else {})}
-                    for h in es_hits
-                    if h.get("doc_id") and h["doc_id"] in valid]
+                    for h in valid_es_hits]
         else:
             # `truncated_docs`: `_GREP_FILE_CAP_BYTES` で打ち切られた文書の doc_id。**ヒット0件の
             # 打切り文書もここに載る**ため、ヒット経由の `file_truncated` では無音になるケース
@@ -1443,6 +2171,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             for doc_id, idx in rag_slot_index.items():
                 out[idx] = resolved_by_doc[doc_id]   # 予約した代表位置へ集約結果を差し戻す（§順位保持）
         view = {"hits": out}
+        # ヒット上限（max_hits）に達した検索は母集団の一部しか返していない＝打ち切りの印を返す
+        # （続きを取る引数は無い＝モデルは範囲を絞る・別の語で探す・未確認として扱う）。
+        if cap_reached or len(hits) >= (max_hits or MAX_HITS):
+            view["truncated"] = True
         if degrade_reason:                              # es_search のみ・BM25 継続時の縮退理由（RV2）
             view["degrade_reason"] = degrade_reason
         if truncated_docs:                              # ripgrep_search のみ・打切りで探せていない文書
@@ -1488,8 +2220,15 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             c = {**c, "_verified_doc_ids": sorted(verified_ids)}
             cards.append(c)
         view = [{"name": c["name"], "role": c.get("role", ""), "category": c.get("category", ""),
-                 "path": c.get("path", []), "distance": c.get("distance")} for c in cards]
-        return ({"neighbors": view}, docs, cites, cards)
+                 "path": c.get("path", []), "distance": c.get("distance"),
+                 "edges": _card_edges_view(c)} for c in cards]
+        result = {"neighbors": view}
+        if len(clipped) < len(raw_cards):
+            # 件数／バイト上限で捨てた分がある＝返した近傍は部分集合。続きを取る引数は無いため、
+            # 呼び出し側（モデル）が「すべて」と断定しないよう打ち切りの事実と総数を返す。
+            result["truncated"] = True
+            result["count"] = len(raw_cards)
+        return (result, docs, cites, cards)
     if name == "read_around":
         doc_id = str(args.get("doc_id") or "")
         try:
@@ -1666,6 +2405,83 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             if src:
                 docs.add(src)
         return (result, docs, cites, cards)
+    if name in ("xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"):
+        # S3b（原本読取ツール・`doc_readers.py`）: Office/PDF は常に docs 側扱い——探す対象（層）が
+        # ソースに限定されたターンではこのツール自体を使わせない（file_head は下の別分岐で
+        # テキスト・コードの層判定＝`_safe_original_path` の layer 引数を通す）。
+        if layer == "code":
+            return ({"error": "探す対象がソースに限定されています"}, docs, cites, cards)
+        doc_id = str(args.get("doc_id") or "")
+        kinds = {"xlsx_sheets": _XLSX_KINDS, "xlsx_range": _XLSX_KINDS,
+                 "docx_paragraphs": _DOCX_KINDS, "pptx_slides": _PPTX_KINDS,
+                 "pdf_pages": _PDF_KINDS}[name]
+        resolved = _safe_original_path(world, doc_id, sp, kinds=kinds)
+        if resolved is None:
+            return ({"error": "doc_id が無効、または読み取り対象外です"}, docs, cites, cards)
+        _root, _resolved_doc_id, rp, st = resolved
+        f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # RV#1・RV2巡目#1
+        if open_err is not None:
+            return (open_err, docs, cites, cards)
+        from . import doc_readers
+        if name == "xlsx_sheets":
+            result = doc_readers.xlsx_sheets(f)
+        elif name == "xlsx_range":
+            sheet = str(args.get("sheet") or "")
+            if not sheet:
+                _close_quiet_local(f)
+                return ({"error": "sheet が必要です"}, docs, cites, cards)
+            kwargs = {"clean": _redact}
+            if args.get("range"):
+                kwargs["range_a1"] = str(args["range"])
+            if args.get("max_rows") is not None:
+                kwargs["max_rows"] = args["max_rows"]
+            if args.get("max_cols") is not None:
+                kwargs["max_cols"] = args["max_cols"]
+            result = doc_readers.xlsx_range(f, sheet, **kwargs)
+        elif name == "docx_paragraphs":
+            kwargs = {"clean": _redact}
+            if args.get("start") is not None:
+                kwargs["start"] = args["start"]
+            if args.get("count") is not None:
+                kwargs["count"] = args["count"]
+            if args.get("table_start") is not None:
+                kwargs["table_start"] = args["table_start"]
+            if args.get("table_row_start") is not None:
+                kwargs["table_row_start"] = args["table_row_start"]
+            result = doc_readers.docx_paragraphs(f, **kwargs)
+        elif name == "pptx_slides":
+            kwargs = {"clean": _redact}
+            if args.get("pages"):
+                kwargs["pages"] = str(args["pages"])
+            result = doc_readers.pptx_slides(f, **kwargs)
+        else:                                                       # pdf_pages
+            kwargs = {"clean": _redact}
+            if args.get("pages"):
+                kwargs["pages"] = str(args["pages"])
+            result = doc_readers.pdf_pages(f, **kwargs)
+        result = _redact_deep(result)
+        if not (isinstance(result, dict) and result.get("error")):
+            docs.add(doc_id)                                        # 成功時だけ出典（sources）に載せる
+            result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
+        return (result, docs, cites, cards)
+    if name == "file_head":
+        doc_id = str(args.get("doc_id") or "")
+        resolved = _safe_original_path(world, doc_id, sp, kinds=_FILE_HEAD_KINDS, layer=layer)
+        if resolved is None:
+            return ({"error": "doc_id が無効、または読み取り対象外です"}, docs, cites, cards)
+        _root, _resolved_doc_id, rp, st = resolved
+        f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # RV#1・RV2巡目#1
+        if open_err is not None:
+            return (open_err, docs, cites, cards)
+        from . import doc_readers
+        kwargs = {"clean": _redact}
+        if args.get("max_bytes") is not None:
+            kwargs["max_bytes"] = args["max_bytes"]
+        result = _redact_deep(doc_readers.file_head(f, **kwargs))
+        if not (isinstance(result, dict) and result.get("error")):
+            docs.add(doc_id)
+            result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
+        return (result, docs, cites, cards)
     return ({"error": f"unknown tool: {name}"}, docs, cites, cards)
 
 
@@ -1718,11 +2534,23 @@ def _question_from_args(args: dict) -> dict:
             "options": options, "allow_free_text": bool(args.get("allow_free_text"))}
 
 
+def _list_docs_target(args: dict | None) -> str:
+    """list_docs の思考ノード表示用の対象名。絞り込み軸（path_prefix/name_pattern/doctype/state）が
+    1つでも立っていればそれを併記し、無条件のときだけ「全体」にする（絞り込み後の件数を
+    範囲全体の件数として見せない）。"""
+    a = args or {}
+    base = _clip(a.get("path_prefix") or a.get("name_pattern"), 60)
+    conds = [f"種別={_clip(a.get('doctype'), 30)}" if a.get("doctype") else None,
+             f"状態={_clip(a.get('state'), 30)}" if a.get("state") else None]
+    conds = [c for c in conds if c]
+    if base:
+        return f"{base}（{'・'.join(conds)}）" if conds else base
+    return f"全体（{'・'.join(conds)}）" if conds else "全体"
+
+
 def _tool_node(name: str, args: dict) -> dict:
     if name == "list_docs":
-        a = args or {}
-        target = a.get("path_prefix") or a.get("name_pattern") or "全体"
-        return _node("資料の一覧を確認", f"「{target}」")
+        return _node("資料の一覧を確認", f"「{_list_docs_target(args)}」")
     if name == "folder_tree":
         a = args or {}
         return _node("フォルダ構成を確認", f"「{a.get('path_prefix') or '全体'}」")
@@ -1745,9 +2573,27 @@ def _tool_node(name: str, args: dict) -> dict:
         target = f"{a.get('left_doc_id', '')} / {a.get('right_doc_id', '')}" if a.get("left_doc_id") \
             else f"{a.get('source_doc_id', '')} → {a.get('target_generation', '')}"
         return _node("世代間の差分を比較", target)
+    if name in _ORIGINAL_READ_LABELS:
+        return _node(_ORIGINAL_READ_LABELS[name], f"{(args or {}).get('doc_id', '')}")
     if name == "ask_user":
         return _node("ユーザに確認", (args or {}).get("prompt", "確認が必要です"))
     return _node(name, "")
+
+
+# S3b（原本読取ツール）: ツール名→表示ラベル。RV#11 是正: `xlsx_sheets`（シート名・大きさだけを
+# 見る＝本文精読ではない）は `xlsx_range`（セルの中身そのものを読む）と別ラベルに分ける——
+# 同じ「原本を読む（Excel）」に丸めていると、シート一覧を確認しただけのターンも改善ログの
+# `files_read`（本文を実際に読んだ数）に誤って数えられてしまう。Codex 側
+# （`providers/codex/provider.py` の tlabel 辞書）・改善ログ（`improvement_log._TOOL_CALL_LABELS`/
+# `_FILES_READ_LABEL`）と同じ文言を共有する。
+_ORIGINAL_READ_LABELS = {
+    "xlsx_sheets": "原本のシート一覧を確認",
+    "xlsx_range": "原本を読む（Excel）",
+    "docx_paragraphs": "原本を読む（Word）",
+    "pptx_slides": "原本を読む（PowerPoint）",
+    "pdf_pages": "原本を読む（PDF）",
+    "file_head": "原本を読む（先頭）",
+}
 
 
 # ツール名 → (label, detail) の固定文言（引数を一切埋め込まない・secRV MED-2 参照）。
@@ -1762,6 +2608,12 @@ _SUB_TOOL_FIXED_WORDING = {
     "doc_outline": ("見出し構造を確認", "見出し構造を確認しています"),
     "graph_neighbors": ("関係グラフをたどる", "関連部品をたどっています"),
     "compare_documents": ("世代間の差分を比較", "世代間の差分を比較しています"),
+    "xlsx_sheets": ("原本のシート一覧を確認", "原本（Excel）のシート一覧を確認しています"),
+    "xlsx_range": ("原本を読む（Excel）", "原本（Excel）を読んでいます"),
+    "docx_paragraphs": ("原本を読む（Word）", "原本（Word）を読んでいます"),
+    "pptx_slides": ("原本を読む（PowerPoint）", "原本（PowerPoint）を読んでいます"),
+    "pdf_pages": ("原本を読む（PDF）", "原本（PDF）を読んでいます"),
+    "file_head": ("原本を読む（先頭）", "原本（先頭）を読んでいます"),
     "ask_user": ("ユーザに確認", "確認しています"),
 }
 
@@ -1934,7 +2786,8 @@ def _hit_summary_node(name: str, args: dict, result: dict) -> dict | None:
         return None
     args = args or {}
     if name == "ripgrep_search":
-        return _hit_summary_dict(label, f"「{_clip(args.get('query'), 60)}」→ {n}件")
+        tail = "（上限で打ち切り・全件ではない）" if result.get("truncated") else ""
+        return _hit_summary_dict(label, f"「{_clip(args.get('query'), 60)}」→ {n}件{tail}")
     if name == "glob_search":
         return _hit_summary_dict(label, f"「{_clip(args.get('pattern'), 60)}」→ {n}件")
     if name == "es_search":
@@ -1942,12 +2795,13 @@ def _hit_summary_node(name: str, args: dict, result: dict) -> dict | None:
         # 「実際に使われた検索方式」を短く添えるだけ（RV2/RV3 の degrade_reason は BM25 継続時の
         # 縮退理由＝立っていれば必ずキーワード一致のみになっている）。
         mode = "キーワード一致のみ" if result.get("degrade_reason") else "全文/意味検索"
-        return _hit_summary_dict(label, f"「{_clip(args.get('query'), 60)}」→ {n}件（{mode}）")
+        tail = "・上限で打ち切り" if result.get("truncated") else ""
+        return _hit_summary_dict(label, f"「{_clip(args.get('query'), 60)}」→ {n}件（{mode}{tail}）")
     if name == "graph_neighbors":
-        return _hit_summary_dict(label, f"「{_clip(args.get('name'), 60)}」の関連部品 → {n}件")
+        tail = (f"（上限で打ち切り・全 {result.get('count')} 件）" if result.get("truncated") else "")
+        return _hit_summary_dict(label, f"「{_clip(args.get('name'), 60)}」の関連部品 → {n}件{tail}")
     if name == "list_docs":
-        target = _clip(args.get("path_prefix") or args.get("name_pattern"), 60) or "全体"
-        return _hit_summary_dict(label, f"「{target}」→ {n}件")
+        return _hit_summary_dict(label, f"「{_list_docs_target(args)}」→ {n}件")
     if name == "folder_tree":
         target = _clip(args.get("path_prefix"), 60) or "全体"
         return _hit_summary_dict(label, f"「{target}」→ フォルダ{n}件")
@@ -1958,11 +2812,14 @@ def _hit_summary_node(name: str, args: dict, result: dict) -> dict | None:
                                         f"{result.get('start_line')}〜{result.get('end_line')}行を読了"
                                         f"（全{result.get('total_lines')}行）")
     if name == "doc_outline":
-        return _hit_summary_dict(label, f"{_clip(args.get('doc_id'), 60)} → 見出し{n}件")
+        tail = ("（読み切れていない・件数は過小）" if result.get("file_truncated")
+                else "（上限で打ち切り・一部）" if result.get("truncated") else "")
+        return _hit_summary_dict(label, f"{_clip(args.get('doc_id'), 60)} → 見出し{n}件{tail}")
     if name == "compare_documents":
         left = args.get("left_doc_id") or args.get("source_doc_id")
         right = args.get("right_doc_id") or args.get("target_generation")
-        return _hit_summary_dict(label, f"{_clip(left, 60)} / {_clip(right, 60)} → 変更{n}行")
+        tail = "（上限で打ち切り・一部）" if result.get("truncated") else ""
+        return _hit_summary_dict(label, f"{_clip(left, 60)} / {_clip(right, 60)} → 変更{n}行{tail}")
     return None
 
 
@@ -1982,9 +2839,14 @@ def _hit_summary_node_sub(name: str, result: dict) -> dict | None:
         # モデル生成の自由文字列ではなく run_tool が検証・算出した整数のため安全に出せる。
         detail = f"{result.get('start_line')}〜{result.get('end_line')}行を読了（全{result.get('total_lines')}行）"
     elif name == "doc_outline":
-        detail = f"見出し{n}件"
+        detail = f"見出し{n}件" + ("（読み切れていない・件数は過小）" if result.get("file_truncated")
+                                 else "（上限で打ち切り・一部）" if result.get("truncated") else "")
     elif name == "compare_documents":
-        detail = f"変更{n}行を確認しました"
+        detail = f"変更{n}行を確認しました" + ("（上限で打ち切り・一部）" if result.get("truncated") else "")
+    elif name == "graph_neighbors" and result.get("truncated"):
+        detail = f"{n}件ヒットしました（上限で打ち切り・全 {result.get('count')} 件）"
+    elif name in ("ripgrep_search", "es_search") and result.get("truncated"):
+        detail = f"{n}件ヒットしました（上限で打ち切り・全件ではない）"
     else:
         detail = f"{n}件ヒットしました"
     return _hit_summary_dict(label, detail)
@@ -2616,6 +3478,39 @@ def verify_doc_exists(doc_id: str, world: str, scope_paths=None) -> bool:
         return False
 
 
+def _card_edges_view(card: dict) -> list:
+    """1件の `graph_neighbors` card が持つ代表経路の辺（`evidence.edges`・`lens_service.neo4j_related`
+    が返す `{type, from, to, doc}`）を、LLM 向け `view` 用に既知キーだけ写して返す。`doc` は検証済み集合にある KB 内 rel_path だけ出す
+    （個人 workspace は RAG/グラフの対象外のためここに来ない）。壊れた・古い形（`from`/`to` 無し）の
+    辺があっても落とさず、あるキーだけ拾う。
+    """
+    ev = card.get("evidence", {}) or {}
+    verified = card.get("_verified_doc_ids")
+    out = []
+    for e in ev.get("edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        item = {k: e[k] for k in ("type", "from", "to", "doc") if e.get(k)}
+        # 裏付け doc を主張する辺で、検証済み集合（実在・文書種別・範囲）に無い doc の辺は、doc を
+        # 落として `unverified` を立てる（辺そのものを消すと経路が繋がって見えて確定根拠に化ける・
+        # 実在しない原本は名指しさせない）。
+        if item.get("doc") and verified is not None and item["doc"] not in set(verified):
+            item.pop("doc", None)
+            item["unverified"] = True
+        if item:
+            out.append(item)
+    return out
+
+
+def _edges_text(edges: list) -> list[str]:
+    """辺の列 → 「from →TYPE→ to」の文字列列（Evidence digest・探索状態の要約用）。"""
+    out = []
+    for e in edges or []:
+        if isinstance(e, dict) and e.get("type") and e.get("from") and e.get("to"):
+            out.append(f"{e['from']} →{e['type']}→ {e['to']}" + ("（未確認）" if e.get("unverified") else ""))
+    return out
+
+
 def _card_claimed_doc_ids(card: dict) -> set:
     """1件の `graph_neighbors` card（troubleshoot 原因候補）が根拠として**主張する**（未検証・raw）
     doc（`evidence.grep[].doc_id`／`evidence.edges[].doc`）の集合を返す。
@@ -2675,14 +3570,16 @@ def _card_structural_evidence(cards: list) -> list:
     （`_troubleshoot_cards` が付与する生の Neo4j ラベル、例 "Program"）は、外部 API
     （`sherpa/research_service.py`）が内部 cid（`_card_graph_node_id`）を外部応答から除去した
     代わりに一意で追跡可能な表現（label+world+path）を組むために必要——`providers/base.py::
-    _safe_card_meta` の allowlist（name/role/category/path）には含まれないため、chat 側の
+    _safe_card_meta` の allowlist（name/role/category/path/edges）には含まれないため、chat 側の
     公開経路（`data.candidates`）には出ない。
     """
     out = []
     for c in cards:
         card_meta = {"name": c.get("name", ""), "role": c.get("role", ""),
                     "category": c.get("category", ""), "path": c.get("path", []),
-                    "label": c.get("label", "")}
+                    "label": c.get("label", ""),
+                    # 辺の種類と向き（検証落ちの doc は落として「（未確認）」付き・A→INVOKES→B と逆向きを区別して要約へ引き継ぐ）
+                    "edges": _edges_text(_card_edges_view(c))}
         verified_ids = c.get("_verified_doc_ids")
         if verified_ids:
             out.append({"doc_id": None, "span": None, "verification_method": "graph_verified",
@@ -2823,7 +3720,9 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
             if "list_meta" in m:
                 lm = m.get("list_meta") or {}
                 cond_parts = [f"path_prefix={_digest_clean(lm['prefix'])}" if lm.get("prefix") else None,
-                             f"name_pattern={_digest_clean(lm['pattern'])}" if lm.get("pattern") else None]
+                             f"name_pattern={_digest_clean(lm['pattern'])}" if lm.get("pattern") else None,
+                             f"doctype={_digest_clean(lm['doctype'])}" if lm.get("doctype") else None,
+                             f"state={_digest_clean(lm['state'])}" if lm.get("state") else None]
                 cond = _LIST_SEP.join(c for c in cond_parts if c)
                 cond_text = f"（条件: {cond}）" if cond else ""
                 paths = _LIST_SEP.join(_digest_clean(d) for d in matched[:10])
@@ -2842,7 +3741,8 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
                 fact = (f"[graph] {_digest_clean(cm.get('name', ''))}"
                        f"（{_digest_clean(cm.get('role', ''))}"
                        f"{'・' + _digest_clean(cm['category']) if cm.get('category') else ''}"
-                       f"・経路={_digest_clean(str(cm.get('path') or ''))}）"
+                       f"・経路={_digest_clean(str(cm.get('path') or ''))}"
+                       f"{'・辺=' + _digest_clean('、'.join(cm['edges'])) if cm.get('edges') else ''}）"
                        + (f"／裏付け: {docs_text}" if docs_text else ""))
             _add(ev_id, _digest_clean(f"{ev_id}: {fact}"), list(matched))
             continue
@@ -2881,7 +3781,11 @@ def build_evidence_digest(citations: list, combined_evidence_meta: list) -> tupl
 # 別関数（`build_evidence_digest` 自体はここでは変更しない）——ev-N の採番・入力順だけを揃える。
 
 _SYNTHESIS_QUOTE_CAP = 400            # 清書ダイジェストの quote 切り詰め長（帰属用 digest の60字とは別契約）
-_SYNTHESIS_MAX_BYTES = 24 * 1024      # 清書ダイジェスト全体のバイト数上限（最終 UTF-8 列で厳密判定）
+# 清書ダイジェスト全体のバイト数上限（最終 UTF-8 列で厳密判定）。メイン＝クラウド GPT を前提に既定 256KiB
+# （日本語約 8.7 万字・6〜9 万トークン）。精読 1 件の保存上限（`investigation_state._READ_TEXT_CAP_BYTES`
+# ＝この 1/4）と査読入力（`providers/base.py`＝この 1/2）はここから比例する。メインをローカル LLM に
+# する構成では運用側が下げる（`SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES`）。
+_SYNTHESIS_MAX_BYTES = _env_int("SHERPA_AGENTIC_SYNTHESIS_BUDGET_BYTES", 256 * 1024, 8 * 1024, 4 * 1024 * 1024)
 _SYNTHESIS_TRUNCATION_NOTICE_TMPL = "（他 {n} 件は省略）"
 _SYNTHESIS_GAPS_MAX_ITEMS = 20         # 清書ダイジェストへ渡す「調査の限界」の件数上限（先頭優先）
 _SYNTHESIS_GAP_CAP = 200              # 「調査の限界」1件あたりの切り詰め長
@@ -2907,6 +3811,41 @@ def _synthesis_span_loc(span) -> str:
     return ""
 
 
+def _synthesis_list_path_budgets(rows: dict, total_bytes: int) -> dict:
+    """一覧行ごとのパス予算を公平配分する（{行index: 予算バイト}）。
+
+    各行の必要量（全パスを連結した UTF-8 バイト）を昇順に見て、残り予算を残り行数で等分した枠に
+    収まる行は必要量だけ与え、収まらない行は枠を与える（余りは次の行の枠に回る）。合計は
+    `total_bytes` 以内。"""
+    sep = len(_LIST_SEP.encode("utf-8"))
+    need = {}
+    for i, matched in rows.items():
+        pieces = [len(_digest_clean(d).encode("utf-8", errors="replace")) for d in matched]
+        need[i] = sum(pieces) + sep * max(0, len(pieces) - 1)
+    budgets: dict = {}
+    remaining = max(0, total_bytes)
+    order = sorted(need, key=lambda i: need[i])
+    for k, i in enumerate(order):
+        share = remaining // (len(order) - k)
+        budgets[i] = min(need[i], share)
+        remaining -= budgets[i]
+    return budgets
+
+
+def _synthesis_list_paths(matched: list, budget_bytes: int) -> tuple[str, int]:
+    """list_docs のパス一覧を UTF-8 で `budget_bytes` 以内に収まるところまで連結し、省略した件数を返す。"""
+    out: list = []
+    used = 0
+    for d in matched:
+        piece = _digest_clean(d)
+        cost = len(piece.encode("utf-8", errors="replace")) + (len(_LIST_SEP.encode("utf-8")) if out else 0)
+        if used + cost > budget_bytes:
+            break
+        out.append(piece)
+        used += cost
+    return _LIST_SEP.join(out), len(matched) - len(out)
+
+
 def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
                            quote_cap: int = _SYNTHESIS_QUOTE_CAP,
                            max_bytes: int = _SYNTHESIS_MAX_BYTES,
@@ -2921,21 +3860,29 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
     citation エントリは `ev-N: doc_id 行 a-b「quote」`（`quote_cap` 文字まで・超過時は「…」で
     明示）。統合で消えなかった別の一致（`evidence_meta[i]["extra_quotes"]`・
     `citations.merge_overlapping_citations` が積む）があれば「／別の一致: 「…」」を追記する。
-    list_docs 集計・graph カードのエントリは `build_evidence_digest` と**同じ表現**（文書パス
-    先頭10件・裏付け doc 先頭5件のまま——`quote_cap` はこれらには適用しない）。
+    list_docs 集計・graph カードのエントリは `build_evidence_digest` と同じ体裁。ただし文書パスは
+    清書側だけ全件（`max_bytes` の半分を全一覧行で公平配分した予算まで・超過分は「他 n 件のパスは
+    省略」と明示。帰属用の
+    `build_evidence_digest` は先頭10件のまま）・裏付け doc 先頭5件は共通——`quote_cap` はこれらには適用しない。
 
     `read_evidence`（省略可・既定 None＝空・C 追加）: ハイブリッドの下調べ役／査読が実際に
-    read_around／read_doc で読んだ本文（`InvestigationState` の kind="read" Evidence・
-    `{"doc_id","span","text"}` の辞書列・本文は呼び出し元が既に `_redact`・800字まで切り詰め
-    済み）。citation／構造的根拠のダイジェスト行に**続けて**「精読: doc_id 行 a-b「本文」」行を
-    追加する——`quote_cap` は適用しない（精読本文は既に800字上限で切り詰め済みで、citation の
-    400字上限とは別契約のため二重に切り詰めない）。**同じ `max_bytes` 予算・同じ打ち切り注記**
-    （件数へ合算）を共有するが、Evidence Packet／`data.citations` には出さない内部専用行のため
-    `ev_map` には登録しない（`ev-N` を割り当てない＝攻撃的な幻覚 ev-N と衝突しない）。
+    read_around／read_doc・S3b 原本読取ツールで読んだ本文（`InvestigationState` の kind="read"
+    Evidence・`{"doc_id","span","text","locator","text_truncated"}` の辞書列。glob_search／doc_outline／
+    compare_documents の要約行（`kind`＝"list"/"outline"/"compare"・`source_tool` 付き・`doc_id` 無しあり）も
+    同じ列に混じり、そのまま 1 行の内部専用行になる。精読本文は呼び出し元が
+    既に `_redact`・`investigation_state._READ_TEXT_CAP_BYTES`（清書ダイジェスト予算
+    `_SYNTHESIS_MAX_BYTES` の1/4）まで切り詰め済み）。citation／構造的根拠のダイジェスト行に
+    **続けて**「精読: doc_id 行 a-b「本文」」行を追加する——`quote_cap` は適用しない（精読本文は
+    既に保存側の上限で切り詰め済みで、citation の400字上限とは別契約のため二重に切り詰めない）。
+    `text_truncated` が真の行は末尾に「（末尾未保持）」を付け、保存時点で本文の
+    末尾が落ちた事実を清書入力自体に明示する（黙って全件性を主張しない）。**同じ `max_bytes`
+    予算・同じ打ち切り注記**（件数へ合算）を共有するが、Evidence Packet／`data.citations` には
+    出さない内部専用行のため `ev_map` には登録しない（`ev-N` を割り当てない＝攻撃的な幻覚 ev-N
+    と衝突しない）。
 
     `gaps`（省略可・既定 None＝空・C RV是正2巡目）: `InvestigationState.gaps`（検索0件／打ち切り／
-    未確認という調査の限界・機械生成の文字列列）。`read_evidence` に続けて「調査の限界: …」行を
-    先頭 `_SYNTHESIS_GAPS_MAX_ITEMS`（20）件・各 `_SYNTHESIS_GAP_CAP`（200字）まで追加する——
+    未確認という調査の限界・機械生成の文字列列）。引用・構造行より前（先頭）に「調査の限界: …」行を
+    末尾優先 `_SYNTHESIS_GAPS_MAX_ITEMS`（20）件（重複除去）・各 `_SYNTHESIS_GAP_CAP`（200字）まで追加する——
     同じ `max_bytes` 予算・打ち切り注記を共有し、`ev_map` には登録しない（`read_evidence` と同じ
     内部専用行）。gap の文字列自体は呼び出し元が既に `_digest_clean` 済みの前提だが、ここでも
     `_digest_clean` を通す（二重適用は無害・唯一の redaction 境界を貫く）。
@@ -2952,6 +3899,37 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
     # 行は `ev_id=None`（Evidence Packet／帰属に使わない内部専用行の印・下の2ループが `ev_map` へ
     # 触れない条件として使う）。
     candidates: list = []
+    # 限界（gaps）は先頭に積む——予算は末尾から切るため、引用や精読本文が長いターンでも
+    # 「0件」「検証で除外」「保存時に切断」「上限到達で中断」が清書入力から落ちない。件数上限は
+    # 末尾優先（後半の run で積まれる中断・切断ほど清書に要る・重複は落とす）。
+    # 「検証で除外」（citation 単位・件数が多い）は 1 行に畳み、打ち切り・中断・0件などの限界に枠を
+    # 譲る——一括で末尾に積まれる除外行が 20 件枠を占有して本物の打ち切り限界を押し出さないため。
+    _seen_gaps: set = set()
+    _gap_lines: list = []
+    _excluded: list = []
+    for g in reversed(list(gaps or [])):
+        gap_text = _digest_clean(str(g or ""))[:_SYNTHESIS_GAP_CAP]
+        if not gap_text or gap_text in _seen_gaps:
+            continue
+        _seen_gaps.add(gap_text)
+        if ": 検証で除外（" in gap_text:
+            _excluded.append(gap_text)
+            continue
+        _gap_lines.append(gap_text)
+    if _excluded:
+        # 文書名は載せない——清書・クリーン再合成の入力に落ちた根拠の名前を持ち込むと、その資料を
+        # 引用する誘因になる（クリーンな合成コンテキストの契約）。件数と扱いだけを伝える。
+        _gap_lines = _gap_lines[:_SYNTHESIS_GAPS_MAX_ITEMS - 1]
+        _gap_lines.insert(0, f"検証で除外した引用 {len(_excluded)} 件（原本で確認できなかった＝根拠にしない）")
+    else:
+        _gap_lines = _gap_lines[:_SYNTHESIS_GAPS_MAX_ITEMS]
+    for gap_text in reversed(_gap_lines):
+        candidates.append((None, _digest_clean(f"調査の限界: {gap_text}"), None))
+    # 一覧行のパスに使える予算＝max_bytes の半分を全一覧行で公平配分（必要量の少ない行は全部載せ、
+    # 余りを残りの行で等分＝先着独占も後続の余りの取りこぼしも無い）。残り半分は他の根拠に残す。
+    path_budgets = _synthesis_list_path_budgets(
+        {i: m.get("matched_doc_ids") for i, m in enumerate(combined_evidence_meta)
+         if m.get("matched_doc_ids") is not None and "list_meta" in m}, max_bytes // 2)
     for i, m in enumerate(combined_evidence_meta):
         ev_id = f"ev-{i + 1}"
         matched = m.get("matched_doc_ids")
@@ -2959,12 +3937,18 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
             if "list_meta" in m:
                 lm = m.get("list_meta") or {}
                 cond_parts = [f"path_prefix={_digest_clean(lm['prefix'])}" if lm.get("prefix") else None,
-                             f"name_pattern={_digest_clean(lm['pattern'])}" if lm.get("pattern") else None]
+                             f"name_pattern={_digest_clean(lm['pattern'])}" if lm.get("pattern") else None,
+                             f"doctype={_digest_clean(lm['doctype'])}" if lm.get("doctype") else None,
+                             f"state={_digest_clean(lm['state'])}" if lm.get("state") else None]
                 cond = _LIST_SEP.join(c for c in cond_parts if c)
                 cond_text = f"（条件: {cond}）" if cond else ""
-                paths = _LIST_SEP.join(_digest_clean(d) for d in matched[:10])
+                # 清書入力は全件を載せる（先頭 10 件の打ち切りは帰属用 digest だけ）。ただし一覧行だけで
+                # 予算を食い潰すと件数・条件ごと落ちるため、パスは行の取り分（等分＋繰り越し）までで
+                # 打ち切り、省略数を明示する。
+                paths, n_omitted = _synthesis_list_paths(matched, path_budgets.get(i, 0))
                 fact = (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
-                       f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else ""))
+                       f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else "")
+                       + (f"（他 {n_omitted} 件のパスは未提示＝この一覧は全件として書かない）" if n_omitted else ""))
             elif "tree_meta" in m:
                 tm = m.get("tree_meta") or {}
                 cond_text = f"（path_prefix={_digest_clean(tm['prefix'])}）" if tm.get("prefix") else ""
@@ -2976,7 +3960,8 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
                 fact = (f"[graph] {_digest_clean(cm.get('name', ''))}"
                        f"（{_digest_clean(cm.get('role', ''))}"
                        f"{'・' + _digest_clean(cm['category']) if cm.get('category') else ''}"
-                       f"・経路={_digest_clean(str(cm.get('path') or ''))}）"
+                       f"・経路={_digest_clean(str(cm.get('path') or ''))}"
+                       f"{'・辺=' + _digest_clean('、'.join(cm['edges'])) if cm.get('edges') else ''}）"
                        + (f"／裏付け: {docs_text}" if docs_text else ""))
             candidates.append((ev_id, _digest_clean(f"{ev_id}: {fact}"), list(matched)))
             continue
@@ -2996,8 +3981,15 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
             fact = _digest_clean(doc_id)
         candidates.append((ev_id, _digest_clean(f"{ev_id}: {fact}"), [doc_id]))
 
+
     for r in (read_evidence or []):
         if not isinstance(r, dict):
+            continue
+        if r.get("kind") in ("list", "outline", "compare"):
+            # glob_search／doc_outline／compare_documents の確定事実（`InvestigationState` の要約行）。
+            text = _digest_clean(str(r.get("text") or ""))
+            if text:
+                candidates.append((None, text, None))
             continue
         doc_id = r.get("doc_id")
         if not doc_id:
@@ -3005,13 +3997,9 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
         loc = _synthesis_span_loc(r.get("span"))
         text = _digest_clean(str(r.get("text") or ""))
         fact = f"精読: {_digest_clean(doc_id)}{loc}「{text}」" if text else f"精読: {_digest_clean(doc_id)}{loc}"
+        if r.get("text_truncated"):
+            fact += "（末尾未保持）"
         candidates.append((None, _digest_clean(fact), None))
-
-    for g in list(gaps or [])[:_SYNTHESIS_GAPS_MAX_ITEMS]:
-        gap_text = _digest_clean(str(g or ""))[:_SYNTHESIS_GAP_CAP]
-        if not gap_text:
-            continue
-        candidates.append((None, _digest_clean(f"調査の限界: {gap_text}"), None))
 
     lines: list = []
     costs: list = []
@@ -3341,26 +4329,56 @@ def attribute_gemini(url: str, headers: dict, answer_text: str, digest: str, ev_
 
 
 _RESYNTH_INSTRUCTION = (
-    "次の依頼について、以下の根拠だけを使って、日本語で簡潔（2〜4文）に回答してください。"
-    "確認できたことと確認できなかったことを分けて書き、根拠に無いことは書かない（推測しない）。\n\n"
+    "次の依頼について、以下の根拠だけを使って、日本語で回答してください（長さは絞らない・集めた内容は削らない・"
+    "取得済みの対象項目を要約や代表例化で落とさない。表を指定されたら指定列を守り、項目と行・値の対応を保つ）。"
+    "確認できたこと（確定）と確認できなかったことを分けて書き、"
+    "根拠に無いことを補うときは『推定』と明示する（取得できなかった値は推測で埋めず『未取得』と書く）。\n\n"
     "【依頼】\n{question}\n\n"
     "【確認できた根拠】\n{digest}"
 )
 
 
-def _committed_evidence_digest(committed: list) -> str:
-    """Committed Evidence（doc_id/span/quote）だけから再合成用の根拠一覧テキストを組む。
+def _note_dropped_citations(state, dropped: list) -> None:
+    """機械検証で除外した citation を調査状態の限界へ残す（清書・クリーン再合成の入力に
+    「検証で除外」が届くように・計画経路／ハイブリッドと同じ文面・重複は 1 本）。"""
+    if state is None:
+        return
+    for d in dropped or []:
+        if isinstance(d, dict):
+            gap = f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）"
+            if gap not in state.gaps:
+                state.gaps.append(gap)
+
+
+def _committed_evidence_digest(committed: list, evidence_meta: list | None = None,
+                               structural_evidence_meta: list | None = None,
+                               gaps: list | None = None, read_evidence: list | None = None) -> str:
+    """Committed Evidence（doc_id/span/quote）と検証済みの構造的根拠（list_docs 集計・graph カード）、
+    調査の限界（gaps）から再合成用の根拠一覧テキストを組む（`build_synthesis_digest` と同じ体裁）。
 
     ツール呼び出し履歴・落とした citation・モデルの前回ドラフト回答は一切含めない
     （クリーンな再合成コンテキスト＝落ちた根拠に基づく主張を新しい回答へ持ち越さないため）。
+    構造的根拠と限界行を含めるのは、再合成の指示（確認できた／できなかったを分ける・一覧の項目を
+    落とさない・未取得を明示）に材料が無いと達成不能になるため。committed も構造的根拠も無ければ空文字列。
     """
-    lines = [f"- {c.get('doc_id')}（span={c.get('span')}）: {c.get('quote', '')}"
-            for c in committed if c.get("doc_id")]
-    return "\n".join(lines)
+    if evidence_meta is None and not structural_evidence_meta and not gaps and not read_evidence:
+        lines = [f"- {c.get('doc_id')}（span={c.get('span')}）: {c.get('quote', '')}"
+                for c in committed if c.get("doc_id")]
+        return "\n".join(lines)
+    meta = list(evidence_meta or [])
+    if len(meta) < len(committed):
+        meta += [{"doc_id": c.get("doc_id"), "span": c.get("span")} for c in committed[len(meta):]]
+    if not committed and not structural_evidence_meta and not read_evidence:
+        return ""
+    digest, _ = build_synthesis_digest(committed, meta[:len(committed)] + list(structural_evidence_meta or []),
+                                       read_evidence=read_evidence, gaps=gaps)
+    return digest
 
 
 def _clean_resynthesis_anthropic(client, model: str, system: str, question: str,
-                                 mt: int, committed: list, usage: dict) -> tuple[str, str | None]:
+                                 mt: int, committed: list, usage: dict, *,
+                                 evidence_meta: list | None = None, structural_evidence_meta: list | None = None,
+                                 gaps: list | None = None, read_evidence: list | None = None) -> tuple[str, str | None]:
     """Anthropic 経由のクリーン再合成——入力は **system＋現在の質問＋Committed Evidence digest**
     だけ（tools 無し）。通常の会話履歴（`history`）・ツール呼び出し履歴・モデルの前回ドラフトは
     一切渡さない（過去ターンの文脈や落ちた根拠に基づく主張を新しい回答へ持ち越さない）。
@@ -3369,7 +4387,7 @@ def _clean_resynthesis_anthropic(client, model: str, system: str, question: str,
     戻り値は `(text, stop_reason)`——EV-0（拡張設計 §4.4）: この再合成コール自体が `max_tokens` で
     打ち切られた場合も、呼び出し元が帰属をスキップできるよう完了理由を一緒に返す。
     """
-    digest = _committed_evidence_digest(committed)
+    digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, gaps, read_evidence)
     if not digest:
         return "", None
     messages = [{"role": "user", "content": _RESYNTH_INSTRUCTION.format(question=question, digest=digest)}]
@@ -3388,11 +4406,13 @@ def _clean_resynthesis_anthropic(client, model: str, system: str, question: str,
 
 
 def _clean_resynthesis_gemini(url: str, headers: dict, system: str, question: str,
-                              committed: list, usage: dict) -> tuple[str, str | None]:
+                              committed: list, usage: dict, *,
+                              evidence_meta: list | None = None, structural_evidence_meta: list | None = None,
+                              gaps: list | None = None, read_evidence: list | None = None) -> tuple[str, str | None]:
     """Gemini 経由のクリーン再合成（`_clean_resynthesis_anthropic` と同じ最小コンテキスト方針・
     system＋現在の質問＋digest だけ・`history` は渡さない）。戻り値は `(text, finishReason)`。
     """
-    digest = _committed_evidence_digest(committed)
+    digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, gaps, read_evidence)
     if not digest:
         return "", None
     contents = [{"role": "user",
@@ -3457,7 +4477,7 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
 
     `read_evidence`（省略可・既定 None＝空・C 追加）: この run 中に read_around/read_doc で実際に
     読んだ本文（`InvestigationState` の kind="read" Evidence を `{"doc_id","span","text"}` へ薄く
-    写したもの・本文は既に `_redact`・800字上限で切り詰め済み）。ハイブリッド
+    写したもの・本文は既に `_redact`・`investigation_state._READ_TEXT_CAP_BYTES`（清書予算の 1/4）まで切り詰め済み）。ハイブリッド
     （`providers/base.py::_agentic_run`）が清書入力（`build_synthesis_digest` の `read_evidence`
     引数）へ引き継ぐための内部専用チャンネル——citation でも構造 Evidence でもない（Evidence
     Packet／`data.citations` には出さない）。
@@ -3946,7 +4966,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state))
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                         return
                     tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                     if tc.get("id"):
@@ -3990,12 +5010,12 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state))
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 docs |= d
                 cites += c
                 cards += cd
-                if name in ("read_around", "read_doc") and "error" not in result:
+                if name in _VERIFIED_READ_TOOLS and "error" not in result:
                     verified_docs |= d
                 _call_structural: list = []
                 if name == "list_docs" and "error" not in result:
@@ -4005,7 +5025,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                         "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                         "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                       "prefix": str(args.get("path_prefix") or "").strip(),
-                                      "pattern": str(args.get("name_pattern") or "").strip()},
+                                      "pattern": str(args.get("name_pattern") or "").strip(),
+                                      "doctype": str(args.get("doctype") or "").strip(),
+                                      "state": str(args.get("state") or "").strip()},
                         "matched_doc_ids": _matched})
                 if name == "folder_tree" and "error" not in result:
                     _call_structural.append({
@@ -4138,7 +5160,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             # EXT-2/EV-0（拡張設計 §4.4）: 「精読済み」タグは read_around/read_doc を実際に呼んだ
             # doc_id のみ（エラー応答は精読が成立していないため除外）。grep/es_search のヒットのみの
             # doc は `verified_docs` に入らない＝出典フッターで「根拠」と「参考」を分ける最小ロジック。
-            if name in ("read_around", "read_doc") and "error" not in result:
+            if name in _VERIFIED_READ_TOOLS and "error" not in result:
                 verified_docs |= d
             # list_docs（doc_ledger の live 走査＝実在確認済み）／graph_neighbors（Neo4j 検証済み
             # card/edge）は citation を生成しないが、具体的な検証済みエントリがあれば根拠として正当。
@@ -4157,7 +5179,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                   "prefix": str(args.get("path_prefix") or "").strip(),
-                                  "pattern": str(args.get("name_pattern") or "").strip()},
+                                  "pattern": str(args.get("name_pattern") or "").strip(),
+                                  "doctype": str(args.get("doctype") or "").strip(),
+                                  "state": str(args.get("state") or "").strip()},
                     "matched_doc_ids": _matched})
             if name == "folder_tree" and "error" not in result:
                 # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
@@ -4276,6 +5300,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         return
 
     committed, evidence_meta, dropped = _commit_evidence(cites, world)
+    _note_dropped_citations(state, dropped)
     _finish_reason: str | None = None       # EV-0（拡張設計 §4.4）: この turn の完了理由（帰属直前に再判定）
     # PART-4（sherpa/research_service.py）向け: 最終合成/再合成の HTTP 呼び出しそのものが例外で
     # 失敗し `candidate_text` が強制的に空文字へ縮退した場合だけ True にする（digest 欠落・
@@ -4296,7 +5321,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         # ドラフトは一切渡さず、クリーンな最終合成コンテキストを再構築して1回だけ合成する。
         # 再合成できなければ本文を返さない（honest failure・壊れた根拠に基づく主張を持ち越さない）。
         candidate_text = ""
-        digest = _committed_evidence_digest(committed)
+        digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, state.gaps,
+                                            _read_evidence_payload(state))
         # 呼び出し予算の消費・usage_acc への加算・OpenAI 送信ガードの確認は `_send` が物理送信
         # ごとに自分で行う（`_send` docstring 参照）。ガード失敗・予算切れはこの再合成の
         # 「候補なし」への既存の degrade（`except Exception: candidate_text = ""`）と同じ扱いに
@@ -4455,7 +5481,7 @@ def anthropic_tools_from_openai(tools: list) -> list:
 
 # 安全上の理由でモデルが回答を控えた（stop_reason=="refusal"）ときの最終回答。
 _ANTHROPIC_REFUSAL = "安全上の理由で回答を控えました。別の表現や範囲でお試しください。"
-_ANTHROPIC_MAX_TOKENS = 16000              # ツールループの各応答の上限（最終回答は 2〜4 文＝十分な余裕）
+_ANTHROPIC_MAX_TOKENS = 16000              # ツールループの各応答の上限（最終回答は長さを絞らない方針＝余裕をもった値）
 
 
 def anthropic_style(client, model: str, system: str, user: str, world: str, scope_paths,
@@ -4553,13 +5579,16 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             text = "".join(getattr(b, "text", "") for b in blocks
                            if getattr(b, "type", None) == "text").strip()
             committed, evidence_meta, dropped = _commit_evidence(cites, world)
+            _note_dropped_citations(state, dropped)
             if dropped:
                 # 一部 citation が検証で落ちた: 通常の会話履歴・ツール履歴・落とした draft は使わず、
                 # system＋現在の質問＋Committed Evidence digest だけでクリーンな最終合成コンテキストを
                 # 再構築する（`openai_style` と同じ方針）。再合成できなければ本文を返さない
                 # （honest failure）。
                 candidate_text, _finish_reason = _clean_resynthesis_anthropic(
-                    client, model, system, user, mt, committed, usage)
+                    client, model, system, user, mt, committed, usage, evidence_meta=evidence_meta,
+                    structural_evidence_meta=structural_evidence_meta, gaps=state.gaps,
+                    read_evidence=_read_evidence_payload(state))
             else:
                 candidate_text = text
                 _finish_reason = stop
@@ -4656,7 +5685,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state))
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                         return
                     results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
                                     "content": json.dumps(result, ensure_ascii=False)})
@@ -4694,12 +5723,12 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state))
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 docs |= d
                 cites += c
                 cards += cd
-                if name in ("read_around", "read_doc") and "error" not in result:
+                if name in _VERIFIED_READ_TOOLS and "error" not in result:
                     verified_docs |= d
                 _call_structural: list = []
                 if name == "list_docs" and "error" not in result:
@@ -4709,7 +5738,9 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                         "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                         "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                       "prefix": str(args.get("path_prefix") or "").strip(),
-                                      "pattern": str(args.get("name_pattern") or "").strip()},
+                                      "pattern": str(args.get("name_pattern") or "").strip(),
+                                      "doctype": str(args.get("doctype") or "").strip(),
+                                      "state": str(args.get("state") or "").strip()},
                         "matched_doc_ids": _matched})
                 if name == "folder_tree" and "error" not in result:
                     _call_structural.append({
@@ -4805,7 +5836,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             cards += cd
             # EXT-2/EV-0（拡張設計 §4.4）: read_around/read_doc を実際に呼んだ doc_id だけを
             # 「精読済み」にタグ付ける（`openai_style` と同じ規則）。
-            if name in ("read_around", "read_doc") and "error" not in result:
+            if name in _VERIFIED_READ_TOOLS and "error" not in result:
                 verified_docs |= d
             # list_docs／graph_neighbors は citation を生成しないが、それ自体が根拠として正当
             # （`openai_style` と同じ規則・§1 参照）。
@@ -4822,7 +5853,9 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                   "prefix": str(args.get("path_prefix") or "").strip(),
-                                  "pattern": str(args.get("name_pattern") or "").strip()},
+                                  "pattern": str(args.get("name_pattern") or "").strip(),
+                                  "doctype": str(args.get("doctype") or "").strip(),
+                                  "state": str(args.get("state") or "").strip()},
                     "matched_doc_ids": _matched})
             if name == "folder_tree" and "error" not in result:
                 # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM
@@ -4959,13 +5992,16 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
         if not calls:
             text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
             committed, evidence_meta, dropped = _commit_evidence(cites, world)
+            _note_dropped_citations(state, dropped)
             if dropped:
                 # 一部 citation が検証で落ちた: 通常の会話履歴・ツール履歴・落とした draft は使わず、
                 # system＋現在の質問＋Committed Evidence digest だけでクリーンな最終合成コンテキストを
                 # 再構築する（`openai_style` と同じ方針）。再合成できなければ本文を返さない
                 # （honest failure）。
-                candidate_text, _finish_reason = _clean_resynthesis_gemini(url, headers, system, user,
-                                                                           committed, usage)
+                candidate_text, _finish_reason = _clean_resynthesis_gemini(
+                    url, headers, system, user, committed, usage, evidence_meta=evidence_meta,
+                    structural_evidence_meta=structural_evidence_meta, gaps=state.gaps,
+                    read_evidence=_read_evidence_payload(state))
             else:
                 candidate_text = text
                 _finish_reason = cand0.get("finishReason")
@@ -5059,7 +6095,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state))
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                         return
                     resp_parts.append({"functionResponse": {"name": name, "response": result}})
                     continue
@@ -5096,12 +6132,12 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state))
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
                     return
                 docs |= d
                 cites += c
                 cards += cd
-                if name in ("read_around", "read_doc") and "error" not in result:
+                if name in _VERIFIED_READ_TOOLS and "error" not in result:
                     verified_docs |= d
                 _call_structural: list = []
                 if name == "list_docs" and "error" not in result:
@@ -5111,7 +6147,9 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                         "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                         "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                       "prefix": str(args.get("path_prefix") or "").strip(),
-                                      "pattern": str(args.get("name_pattern") or "").strip()},
+                                      "pattern": str(args.get("name_pattern") or "").strip(),
+                                      "doctype": str(args.get("doctype") or "").strip(),
+                                      "state": str(args.get("state") or "").strip()},
                         "matched_doc_ids": _matched})
                 if name == "folder_tree" and "error" not in result:
                     _call_structural.append({
@@ -5200,7 +6238,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
             cards += cd
             # EXT-2/EV-0（拡張設計 §4.4）: read_around/read_doc を実際に呼んだ doc_id だけを
             # 「精読済み」にタグ付ける（`openai_style` と同じ規則）。
-            if name in ("read_around", "read_doc") and "error" not in result:
+            if name in _VERIFIED_READ_TOOLS and "error" not in result:
                 verified_docs |= d
             # list_docs／graph_neighbors は citation を生成しないが、それ自体が根拠として正当
             # （`openai_style` と同じ規則・§1 参照）。
@@ -5217,7 +6255,9 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                     "doc_id": None, "span": None, "verification_method": "list_docs_verified",
                     "list_meta": {"count": result.get("count", 0), "shown": len(_matched),
                                   "prefix": str(args.get("path_prefix") or "").strip(),
-                                  "pattern": str(args.get("name_pattern") or "").strip()},
+                                  "pattern": str(args.get("name_pattern") or "").strip(),
+                                  "doctype": str(args.get("doctype") or "").strip(),
+                                  "state": str(args.get("state") or "").strip()},
                     "matched_doc_ids": _matched})
             if name == "folder_tree" and "error" not in result:
                 # RV是正（rv-periphery #1）: folder_tree（K6・doc_ledger 走査による決定的集計・LLM

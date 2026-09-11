@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 
 from . import corpus_docs, doc_ledger, documents, scope as scope_mod, worlds
-from .ingest import evidence_render
+from .ingest import evidence_render, text_kind
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -61,6 +61,10 @@ def _rag_md_path(world: str, doc_id: str) -> Path | None:
         return None
     parts = doc_id.split("/")
     if ".." in parts or "" in parts:
+        return None
+    if text_kind.is_sensitive_doc_id(doc_id):
+        # 秘匿名は rag.md を一切持たない契約（`office_md._is_sensitive_original` 参照）——
+        # 更新前に生成済みの `.rag.md` が残っていても diff 材料として使わない（台帳 #85〜#88）。
         return None
     root = worlds.derived_rag_dir(world)
     if not root:

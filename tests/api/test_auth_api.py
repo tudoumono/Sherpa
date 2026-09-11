@@ -288,8 +288,9 @@ def test_share_create_click_wrapper_and_read():
     assert len(msgs) == 2
 
     # received_share への追記は 403
+    import uuid
     append_r = client.post("/chat",
-                           json={"message": "追記", "world": "v1", "conversation_id": wid},
+                           json={"message": "追記", "world": "v1", "conversation_id": wid, "stream_id": uuid.uuid4().hex},
                            cookies=inv_cookies)
     assert append_r.status_code == 403, f"append to received_share should be 403, got {append_r.status_code}"
 

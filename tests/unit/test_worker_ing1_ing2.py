@@ -208,6 +208,76 @@ def test_run_locked_es_progress_dedupes_consecutive_same_value(monkeypatch, _stu
     assert [(p["done"], p["total"]) for p in es_stage_calls] == [(0, 10), (10, 10)]
 
 
+def test_run_locked_success_records_stage_timings_and_counts(monkeypatch, _stub_pipeline):
+    """STAT-3 S5: 成功パスは `stage_timings`（scanning〜finalize・開始/終了/elapsed_ms>=0）と
+    `counts`（scanned/targeted/converted/failed/unsupported/legacy_*/es_indexed）を
+    `extraction_snapshot` へ記録する。`counts` の `scanned >= targeted >= converted+failed+unsupported`
+    が成り立つ（受入条件）。"""
+    captured = {}
+
+    def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
+                                 published_snapshot=None, source_doc_ids=None,
+                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+        captured["extraction_snapshot"] = extraction_snapshot
+        return {"id": run_id, "status": status}
+    monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
+
+    res = worker.run("w")
+    assert res["status"] == "auto_published"
+    snap = captured["extraction_snapshot"]
+
+    st = snap["stage_timings"]
+    for stage in ("scanning", "office_md", "graph_build", "es_index", "finalize"):
+        assert stage in st, f"stage_timings に {stage} が無い"
+        assert st[stage]["started_at"] and st[stage]["finished_at"]
+        assert st[stage]["elapsed_ms"] >= 0
+
+    # `_stub_pipeline` は `_ledger_rows`（targeted）と `_build_derived`（converted）を独立に
+    # スタブしており両者の大小関係は固定できない——scanned>=targeted>=converted+failed+unsupported
+    # の受入条件は実データで確認する（`tests/integration/test_ingest_p1.py` 側）。ここでは各値が
+    # スタブ通りに機械的に転記されることだけを確認する。
+    counts = snap["counts"]
+    assert counts["scanned"] == 1        # world_state のスタブ manifest={"a": [1,2,3]}
+    assert counts["targeted"] == 0       # _ledger_rows のスタブは []
+    assert counts["converted"] == 1 and counts["failed"] == 0 and counts["unsupported"] == 0
+    assert counts["legacy_converted"] == 0 and counts["legacy_failed"] == 0
+    assert counts["es_indexed"] == 0     # index_world のスタブ indexed=0
+
+
+def test_run_locked_failure_keeps_partial_stage_timings(monkeypatch, _stub_pipeline):
+    """STAT-3 S5: 失敗した run でも、そこまでに開いた段の時刻は残る（graph_build で blocked 終了＝
+    es_index/finalize には到達しない）。"""
+    monkeypatch.setattr(worker, "build_world_graph",
+                        lambda world: ([], [], [{"doc": None, "action": "blocked",
+                                                 "reason": "unreadable_code_file"}]))
+    res = worker.run("w")
+    assert res["status"] == "failed"
+    snap = res["run"]["extraction_snapshot"]
+    st = snap["stage_timings"]
+    for stage in ("scanning", "office_md", "graph_build"):
+        assert stage in st and st[stage]["finished_at"] and st[stage]["elapsed_ms"] >= 0
+    assert "es_index" not in st and "finalize" not in st
+
+
+def test_counts_summary_legacy_matches_by_ext_and_failures():
+    """STAT-3 S5: `legacy_converted`/`legacy_failed` は `office_md.build_derived()` の
+    `legacy_converted`／`legacy_conversion_failures` から機械的に導く（値の一致を固定）。"""
+    drep = {"converted": 3, "failed": 1, "unsupported": 0, "by_ext": {".doc": 2, ".docx": 1},
+           "legacy_converted": 2,
+           "legacy_conversion_failures": [{"doc": "a.doc", "reason": "legacy_conversion_failed"}]}
+    counts = worker._counts_summary(drep, None, {"a": 1, "b": 1}, [{"name": "a"}, {"name": "b"}])
+    assert counts["legacy_converted"] == drep["legacy_converted"] == 2
+    assert counts["legacy_failed"] == len(drep["legacy_conversion_failures"]) == 1
+    assert counts["scanned"] == 2 and counts["targeted"] == 2
+
+
+def test_counts_summary_omits_unavailable_keys():
+    """取れない項目（drep/es_summary 無し・manifest 無し）はキー自体を付けない（0 と欠落を区別）。"""
+    counts = worker._counts_summary(None, None, None, [])
+    assert counts == {"targeted": 0}
+    assert "scanned" not in counts and "converted" not in counts and "es_indexed" not in counts
+
+
 def test_run_locked_sig_confirm_write_failure_propagates(monkeypatch, _stub_pipeline):
     """run 完了と sig/doc_count/scan_report 確定は同一トランザクション
     （`finish_ingest_run_and_confirm_world`）——その書込自体が失敗すれば（PG断等）例外がそのまま

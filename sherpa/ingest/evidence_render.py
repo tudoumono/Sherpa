@@ -2047,10 +2047,6 @@ def render(
     return result
 
 
-def chunks_to_jsonl(chunks: list[dict]) -> str:
-    return "".join(json.dumps(chunk, ensure_ascii=False, sort_keys=True) + "\n" for chunk in chunks)
-
-
 def write_chunks_atomic(path: str | Path, chunks: list[dict]) -> Path:
     """chunk配列を巨大な中間文字列へ複製せず、1件ずつJSONLへ原子書込する。"""
     target = Path(path)
