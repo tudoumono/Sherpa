@@ -847,14 +847,31 @@ USAGE_STATS_DEFAULT = {
         # embed 行は Gemini（batchEmbedContents は usage を返さない）＝全トークン null で
         # 「—」描画（fmtTokOrDash）を実演する。
         "by_kind": [
+            # chat 行は messages.answer->'usage' 由来で所要時間を持たない（API 契約＝常に None/None/0）
             {"kind": "chat", "provider": "codex", "model": "gpt-5.5", "calls": 4, "input": 10000,
              "cached_input": 3000, "output": 1500, "reasoning_output": 900,
-             "elapsed_ms_total": 48000, "elapsed_ms_avg": 12000.0, "elapsed_n": 4},
+             "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
+            {"kind": "chat", "provider": "gemini", "model": "gemini-2.5-flash", "calls": 2, "input": 2000,
+             "cached_input": 0, "output": 300, "reasoning_output": 0,
+             "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
             {"kind": "intent", "provider": "openai", "model": "gpt-4o-mini", "calls": 3,
              "input": 450, "cached_input": 0, "output": 60, "reasoning_output": 0,
              "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
             {"kind": "embed", "provider": "gemini", "model": "gemini-embedding-001", "calls": 2,
              "input": None, "cached_input": None, "output": None, "reasoning_output": None,
+             "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
+        ],
+        # ユーザー別 × 用途別内訳。chat 行は by_user と同じ材料（admin は by_user と一致させる）。
+        # user_id の無い呼び出しは含まれないため、同一 kind の合計は by_kind 以下になりうる。
+        "by_user_kind": [
+            {"uid": "admin", "display_name": "管理者", "kind": "chat", "calls": 5, "input": 11000,
+             "cached_input": 3000, "output": 1600, "reasoning_output": 900,
+             "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
+            {"uid": "admin", "display_name": "管理者", "kind": "intent", "calls": 3, "input": 450,
+             "cached_input": 0, "output": 60, "reasoning_output": 0,
+             "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
+            {"uid": "sato", "display_name": "佐藤 太郎", "kind": "chat", "calls": 1, "input": 1000,
+             "cached_input": 0, "output": 200, "reasoning_output": 0,
              "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
         ],
     },
@@ -868,6 +885,32 @@ USAGE_STATS_DEFAULT = {
         {"stop_kind": "unknown", "turns": 1},
     ],
     "stopped_turns": 1,
+    # STAT-4 U1: 回答時間（duration_ms）の分布。全体＋経路（provider）別。
+    "response_time": {
+        "overall": {"provider": None, "avg": 4200.0, "median": 3800.0, "max": 9000, "p90": 9000.0, "n": 6},
+        "by_provider": [
+            {"provider": "codex", "avg": 4500.0, "median": 4000.0, "max": 9000, "p90": 9000.0, "n": 4},
+            {"provider": "gemini", "avg": 3500.0, "median": 3500.0, "max": 4000, "p90": 4000.0, "n": 2},
+        ],
+    },
+    # 2026-09-12-利用統計の拡充2.md §2 (b): 会話ごとの補助 AI 使用量
+    # （トークン合計降順で上位20件・タイトル/本文は含まない）。
+    "conversations_top": [
+        {"conversation_id": 501, "uid": "admin", "display_name": "管理者", "world": "test",
+         "user_turns": 3, "response_time_avg_ms": 4500.0,
+         "kinds": [
+             {"kind": "chat", "calls": 3, "input": 8000, "cached_input": 2000, "output": 1200,
+              "reasoning_output": 900, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
+             {"kind": "intent", "calls": 3, "input": 450, "cached_input": 0, "output": 60,
+              "reasoning_output": 0, "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
+         ]},
+        {"conversation_id": 502, "uid": "sato", "display_name": "佐藤 太郎", "world": "test",
+         "user_turns": 1, "response_time_avg_ms": 3500.0,
+         "kinds": [
+             {"kind": "chat", "calls": 1, "input": 1000, "cached_input": 0, "output": 200,
+              "reasoning_output": 0, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
+         ]},
+    ],
 }
 
 

@@ -1622,7 +1622,8 @@ class _GenProvider(Provider):
                     from .. import metering
                     metering.record("chat-sub", sub["provider"], sub["model"], usage_acc["tokens"],
                                     user_id=ctx.uid, world=ctx.world, calls=usage_acc["calls"],
-                                    elapsed_ms=usage_acc.get("elapsed_ms"))
+                                    elapsed_ms=usage_acc.get("elapsed_ms"),
+                                    conversation_id=ctx.conversation_id)
                     entry = _usage_meta(sub["provider"], sub["model"], **(usage_acc["tokens"] or {}))
                     entry["profile"] = sub["profile_id"]
                     usage_subs.append(entry)
@@ -1691,11 +1692,13 @@ class _GenProvider(Provider):
             tokens, n = metering.acc_end()
             if n:
                 metering.record("chat-plan", "openai", self.model, tokens,
-                                user_id=ctx.uid, world=ctx.world, calls=n)
+                                user_id=ctx.uid, world=ctx.world, calls=n,
+                                conversation_id=ctx.conversation_id)
             elif attempted:
                 # MED-2 是正: 試行したが usage を読めなかった（例外/破損応答）＝tokens NULL で1行。
                 metering.record("chat-plan", "openai", self.model, None,
-                                user_id=ctx.uid, world=ctx.world, calls=1)
+                                user_id=ctx.uid, world=ctx.world, calls=1,
+                                conversation_id=ctx.conversation_id)
         if not steps:
             _log.info("sub_planner: 計画呼び出しが失敗/空のため縮退します")
             return None
@@ -2224,7 +2227,8 @@ class _GenProvider(Provider):
                     from .. import metering
                     metering.record("chat-sub", self._sub["provider"], self._sub["model"], total["tokens"],
                                     user_id=ctx.uid, world=ctx.world, calls=total["calls"],
-                                    elapsed_ms=total.get("elapsed_ms"))
+                                    elapsed_ms=total.get("elapsed_ms"),
+                                    conversation_id=ctx.conversation_id)
             # メイン査読（`_sufficiency_verdict`）が行った `_stream` 呼び出し分は、標準的な
             # 回答 usage（answer.usage）にも chat-sub にも乗らない別消費のため、独立の kind で記録する
             # （self は常にフラグシップ側＝self.provider_id/self.model）。calls=0（一度も査読を
@@ -2233,7 +2237,8 @@ class _GenProvider(Provider):
                 from .. import metering
                 metering.record("chat-review", self.provider_id, self.model, _review_usage_total["tokens"],
                                 user_id=ctx.uid, world=ctx.world, calls=_review_usage_total["calls"],
-                                elapsed_ms=_review_usage_total.get("elapsed_ms"))
+                                elapsed_ms=_review_usage_total.get("elapsed_ms"),
+                                conversation_id=ctx.conversation_id)
         # 途中停止で agentic ループが未応答のまま終わった場合は
         # 単発 grep へのフォールバックを試みない（呼び元 run() の except節が余分な LLM 呼び出しを
         # 発行してしまい、停止後もしばらく処理が続く無駄が生じるため）。どのみち chat_service 側が

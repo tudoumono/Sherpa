@@ -29,6 +29,17 @@ const PROVIDER_COLOR = {
   bedrock: 'var(--danger)', ollama: 'var(--accent-ink)', unknown: 'var(--border)',
 };
 
+// （docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: ターンの終了理由（`sherpa/stop_kind.py` の
+// 閉じた8値＋'unknown'）の平文ラベル。未知の値は生の値をそのまま表示する（fail-safe・KIND_LABEL と同じ流儀）。
+const STOP_KIND_LABEL = {
+  completed: '完了', stopped_by_user: '利用者が停止', budget: '調査の上限', no_evidence: '根拠不足',
+  transport_error: '通信エラー', timeout: 'タイムアウト', codex_silent: 'Codex 無応答',
+  codex_partial: 'Codex 途中終了', unknown: '不明',
+};
+const STOP_KIND_ORDER = ['completed', 'stopped_by_user', 'budget', 'no_evidence',
+  'transport_error', 'timeout', 'codex_silent', 'codex_partial', 'unknown'];
+function stopKindLabel(k) { return STOP_KIND_LABEL[k] || k; }
+
 let _days = 30;
 let _sortKey = 'turns';
 let _sortDir = 'desc';
@@ -439,6 +450,72 @@ function renderProviderBar(providers) {
   ).join('');
 }
 
+// ターンの終了理由の分布（`sherpa/stop_kind.py` の閉じた語彙・単色バー＝各行が
+// 既に自分のラベルを持つため頭脳別のような凡例配色は要らない・フォルダ別利用量と同じ折衷）。
+// 停止数（`stopped_turns`）は回答を保存しないため分布には現れない別集計＝バッジで併記する。
+function renderStopKinds(stopKinds, stoppedTurns) {
+  const byKind = new Map((stopKinds || []).map((r) => [r.stop_kind, r.turns || 0]));
+  const items = STOP_KIND_ORDER
+    .filter((k) => byKind.has(k))
+    .map((k) => ({ label: stopKindLabel(k), value: byKind.get(k), color: 'var(--accent)' }));
+  // allowlist 外の値（未知の stop_kind）が来ても取りこぼさない（fail-safe）。
+  (stopKinds || []).forEach((r) => {
+    if (!STOP_KIND_ORDER.includes(r.stop_kind)) {
+      items.push({ label: stopKindLabel(r.stop_kind), value: r.turns || 0, color: 'var(--accent)' });
+    }
+  });
+  renderBarChart($('chart-stopkind-svg'), $('chart-stopkind-empty'), $('chart-stopkind-tip'),
+    $('chart-stopkind-wrap'), items, { unit: '件', title: 'ターンの終了理由' });
+  $('stopkind-total-badge').textContent = `利用者停止 ${(stoppedTurns || 0).toLocaleString('ja-JP')}件`;
+}
+
+// ミリ秒を秒表記へ（null は「—」）。回答時間・所要時間の各テーブル/カードで共用。
+function fmtSecOrDash(ms) {
+  if (ms === null || ms === undefined) return '—';
+  return `${(Number(ms) / 1000).toFixed(1)}秒`;
+}
+// 件数（会話あたりのやり取り回数の avg/median/p90 等）の小数表示（null は「—」）。
+function fmtNumOrDash(v, digits) {
+  if (v === null || v === undefined) return '—';
+  return Number(v).toFixed(digits === undefined ? 1 : digits);
+}
+// 割合（0〜1）を%表示へ（null は「—」・renderZeroHitTile と同じ丸め方）。
+function fmtPctOrDash(v) {
+  if (v === null || v === undefined) return '—';
+  return `${Math.round(v * 100)}%`;
+}
+
+// 会話あたりのやり取り回数（avg/median/max/p90）と resume 率。対象会話が無ければ全て「—」
+// （タイル系カードは token-kind-card と違いカードごと隠さない＝サマリタイルと同じ流儀）。
+function renderConversationTurns(turns, resumeRate) {
+  const t = turns || {};
+  $('t-turns-avg').textContent = fmtNumOrDash(t.avg);
+  $('t-turns-median').textContent = fmtNumOrDash(t.median);
+  $('t-turns-p90').textContent = fmtNumOrDash(t.p90);
+  $('t-turns-max').textContent = (t.max === null || t.max === undefined)
+    ? '—' : Number(t.max).toLocaleString('ja-JP');
+  $('t-resume-rate').textContent = fmtPctOrDash(resumeRate);
+}
+
+// 回答時間の分布（全体＋経路別）。`overall` は API 契約上つねに存在する行（対象0件でも
+// avg/median/p90/max=null・n=0）＝カードは隠さず「全体」行だけの表として描画する。
+function renderResponseTime(rt) {
+  const tb = $('response-time-tbody');
+  if (!tb) return;
+  const overall = (rt && rt.overall) || {};
+  const byProvider = (rt && rt.by_provider) || [];
+  const rows = [{ label: '全体', row: overall }]
+    .concat(byProvider.map((r) => ({ label: providerLabel(r.provider), row: r })));
+  tb.innerHTML = rows.map(({ label, row }) => `<tr>
+    <td>${esc(label)}</td>
+    <td class="num">${fmtSecOrDash(row.avg)}</td>
+    <td class="num">${fmtSecOrDash(row.median)}</td>
+    <td class="num">${fmtSecOrDash(row.p90)}</td>
+    <td class="num">${fmtSecOrDash(row.max)}</td>
+    <td class="num">${(row.n || 0).toLocaleString('ja-JP')}</td>
+  </tr>`).join('');
+}
+
 function renderWeeklyAndRetention(retention) {
   const weekly = (retention && retention.weekly) || [];
   renderTrendChart(
@@ -507,8 +584,36 @@ function renderTokenKindTable(rows) {
       <td class="num">${fmtTokOrDash(r.cached_input)}</td>
       <td class="num">${fmtTokOrDash(r.output)}</td>
       <td class="num">${fmtTokOrDash(r.reasoning_output)}</td>
+      <td class="num">${fmtSecOrDash(r.elapsed_ms_total)}</td>
+      <td class="num">${fmtSecOrDash(r.elapsed_ms_avg)}</td>
+      <td class="num">${(r.elapsed_n || 0).toLocaleString('ja-JP')}</td>
     </tr>`;
   }).join('');
+}
+
+// ユーザー別 × 用途別内訳（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (a)）。利用者に紐付かない
+// 呼び出しを含まないため、同一 kind の合計は token-kind-tbody の当該行以下になりうる。空/不在ならカードごと隠す
+// （token-kind-card と同じ流儀）。
+function renderTokenUserKindTable(rows) {
+  const card = $('token-user-kind-card');
+  const tb = $('token-user-kind-tbody');
+  if (!tb) return;
+  if (!rows || !rows.length) {
+    if (card) card.hidden = true;
+    return;
+  }
+  if (card) card.hidden = false;
+  tb.innerHTML = rows.map((r) => `<tr>
+    <td><div class="user-name">${esc(r.display_name || r.uid)}</div><div class="user-uid">${esc(r.uid)}</div></td>
+    <td>${esc(kindLabel(r.kind))}</td>
+    <td class="num">${(r.calls || 0).toLocaleString('ja-JP')}</td>
+    <td class="num">${fmtTokOrDash(r.input)}</td>
+    <td class="num">${fmtTokOrDash(r.cached_input)}</td>
+    <td class="num">${fmtTokOrDash(r.output)}</td>
+    <td class="num">${fmtTokOrDash(r.reasoning_output)}</td>
+    <td class="num">${fmtSecOrDash(r.elapsed_ms_total)}</td>
+    <td class="num">${fmtSecOrDash(r.elapsed_ms_avg)}</td>
+  </tr>`).join('');
 }
 function renderTokenModelTable(rows) {
   const tb = $('token-model-tbody');
@@ -565,6 +670,40 @@ function renderTokens(tokens, period) {
   renderTokenModelTable(t.by_model || []);
   renderTokenUserTable(t.by_user || []);
   renderTokenKindTable(t.by_kind || []);
+  renderTokenUserKindTable(t.by_user_kind || []);
+}
+
+// 会話ごとの補助 AI 使用量（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
+// 降順で上位20件・タイトル/本文は含まない。「用途別」列は用途ごとに回数・トークン・所要時間を1行ずつ
+// 積む（`UsageConversationKindRow` の null の意味は用途別テーブルと同じ）。会話 id はテキスト表示のみ
+// （リンクにしない）。
+function conversationKindsSummaryHTML(kinds) {
+  return `<ul class="convkinds">${(kinds || []).map((k) => {
+    // 入力/出力のどちらかが null（報告不能マーカー・token-kind-tbody と同じ意味）なら合算しない。
+    const hasTokens = k.input !== null && k.input !== undefined && k.output !== null && k.output !== undefined;
+    const tokTotal = hasTokens ? (k.input + k.output) : null;
+    return `<li><b>${esc(kindLabel(k.kind))}</b> ${(k.calls || 0).toLocaleString('ja-JP')}回`
+      + `・トークン計${fmtTokOrDash(tokTotal)}`
+      + `・所要時間${fmtSecOrDash(k.elapsed_ms_total)}</li>`;
+  }).join('')}</ul>`;
+}
+function renderConversationsTop(rows) {
+  const card = $('conversations-top-card');
+  const tb = $('conversations-top-tbody');
+  if (!tb) return;
+  if (!rows || !rows.length) {
+    if (card) card.hidden = true;
+    return;
+  }
+  if (card) card.hidden = false;
+  tb.innerHTML = rows.map((r) => `<tr>
+    <td>#${esc(String(r.conversation_id))}</td>
+    <td><div class="user-name">${esc(r.display_name || r.uid)}</div><div class="user-uid">${esc(r.uid)}</div></td>
+    <td>${r.world ? esc(r.world) : '<span style="color:var(--ink-3)">—</span>'}</td>
+    <td class="num">${(r.user_turns || 0).toLocaleString('ja-JP')}</td>
+    <td>${conversationKindsSummaryHTML(r.kinds)}</td>
+    <td class="num">${fmtSecOrDash(r.response_time_avg_ms)}</td>
+  </tr>`).join('');
 }
 
 function detailHTML(u) {
@@ -666,7 +805,11 @@ async function load(days) {
     renderProviderBar(d.providers || []);
     renderWeeklyAndRetention(d.retention || {});
     renderDownloadsChart(d.downloads || {}, d.period);
+    renderStopKinds(d.stop_kinds || [], d.stopped_turns);
+    renderConversationTurns(d.conversation_turns || {}, d.resume_rate);
+    renderResponseTime(d.response_time || {});
     renderTokens(d.tokens || {}, d.period);
+    renderConversationsTop(d.conversations_top || []);
     _users = d.users || [];
     applySortAndRender();
   } catch (e) {

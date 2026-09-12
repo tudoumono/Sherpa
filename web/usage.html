@@ -94,6 +94,13 @@
   .chart-total{font-size:var(--text-caption);font-weight:400;color:var(--ink-3);margin-left:4px;font-variant-numeric:tabular-nums}
   .zhr-cell{cursor:help}
 
+  /* （docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: 会話別上位の「用途別」列＝用途ごとの
+     回数・トークン・所要時間を1行ずつ積む小さな内訳リスト。 */
+  .convkinds{margin:0;padding:0;list-style:none;font-size:var(--text-caption)}
+  .convkinds li{white-space:nowrap}
+  .convkinds li + li{margin-top:2px}
+  .convkinds b{color:var(--ink-2)}
+
   /* 利用統計チャット（自然言語で統計を質問する）。メッセージ本体は既存の .msg/.bubble-user/
      .a-row/.a-avatar/.a-body/.headline をそのまま流用（app.css は編集しない）。 */
   #usage-chat-messages{max-height:380px;overflow-y:auto;padding:2px}
@@ -286,6 +293,56 @@
         </div>
       </div>
 
+      <!-- ターンの傾向（docs/proposals/2026-09-12-利用統計の拡充2.md §2）: 終了理由の分布・会話あたりの
+           やり取り回数と resume 率・回答時間の分布。 -->
+      <div class="pagehead" style="margin-top:28px">
+        <div><h2 style="font-size:var(--text-body);margin:0">ターンの傾向</h2></div>
+      </div>
+
+      <div class="card chart-card" style="margin-bottom:14px">
+        <div class="chart-title">ターンの終了理由
+          <span class="chart-total" id="stopkind-total-badge"></span>
+          <span class="info-dot" tabindex="0" title="回答を最後まで作れた終了理由と、途中で終わった理由の内訳です。利用者が明示的に停止したターンは回答を保存しないためこの分布には含まれず、右のバッジで別に数えています。">ⓘ</span>
+        </div>
+        <div class="barchart-wrap" id="chart-stopkind-wrap">
+          <div class="chart-empty" id="chart-stopkind-empty" hidden>まだ利用がありません</div>
+          <svg id="chart-stopkind-svg" class="barchart"></svg>
+          <div class="chart-tooltip" id="chart-stopkind-tip" hidden></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:14px">
+        <div class="chart-title">会話あたりのやり取り回数
+          <span class="info-dot" tabindex="0" title="期間内にやり取りが1回以上あった会話について、利用者の発言回数の分布です。resume率は2回以上やり取りした会話のうち、Codex の会話セッションが記録された（次のターンを前回の続きから実行できる）会話の割合です。Codex を使わない会話は分母に入ったまま数えられます。">ⓘ</span>
+        </div>
+        <div class="summary" id="turns-tiles">
+          <div class="sumcell"><div class="n" id="t-turns-avg">—</div><div class="l">平均</div></div>
+          <div class="sumcell"><div class="n" id="t-turns-median">—</div><div class="l">中央値</div></div>
+          <div class="sumcell"><div class="n" id="t-turns-p90">—</div><div class="l">90%目安</div></div>
+          <div class="sumcell"><div class="n" id="t-turns-max">—</div><div class="l">最大</div></div>
+          <div class="sumcell"><div class="n" id="t-resume-rate">—</div><div class="l">resume率</div></div>
+        </div>
+      </div>
+
+      <div class="card" style="overflow-x:auto;margin-bottom:14px">
+        <div class="chart-title">回答時間の分布
+          <span class="info-dot" tabindex="0" title="質問を受け付けてから最終回答が確定するまでの時間です（下調べ・査読・清書を含む）。利用者が明示的に停止した場合は含みません。">ⓘ</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>経路</th>
+              <th class="num">平均</th>
+              <th class="num">中央値</th>
+              <th class="num">90%目安</th>
+              <th class="num">最大</th>
+              <th class="num">件数</th>
+            </tr>
+          </thead>
+          <tbody id="response-time-tbody"></tbody>
+        </table>
+      </div>
+
       <!-- トークン（F3・2026-07-07／2026-07-08 金額表示は撤去） -->
       <div class="pagehead" style="margin-top:28px">
         <div><h2 style="font-size:var(--text-body);margin:0">トークン</h2>
@@ -349,12 +406,36 @@
               <th class="num">うちキャッシュ</th>
               <th class="num">出力</th>
               <th class="num">うち推論</th>
+              <th class="num">所要時間(合計)</th>
+              <th class="num">所要時間(平均)</th>
+              <th class="num">計測件数</th>
             </tr>
           </thead>
           <tbody id="token-kind-tbody"></tbody>
         </table>
       </div>
-      <div class="card" style="overflow-x:auto">
+      <!-- ユーザー別 × 用途別内訳（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (a)）。
+           tokens.by_user_kind が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
+      <div class="card" id="token-user-kind-card" style="overflow-x:auto;margin-bottom:14px" hidden>
+        <div class="chart-title">ユーザー別×用途別</div>
+        <table>
+          <thead>
+            <tr>
+              <th>ユーザー</th>
+              <th>用途</th>
+              <th class="num">回数</th>
+              <th class="num">入力</th>
+              <th class="num">うちキャッシュ</th>
+              <th class="num">出力</th>
+              <th class="num">うち推論</th>
+              <th class="num">所要時間(合計)</th>
+              <th class="num">所要時間(平均)</th>
+            </tr>
+          </thead>
+          <tbody id="token-user-kind-tbody"></tbody>
+        </table>
+      </div>
+      <div class="card" style="overflow-x:auto;margin-bottom:14px">
         <div class="chart-title">トークン利用の多いユーザー</div>
         <table>
           <thead>
@@ -367,6 +448,25 @@
             </tr>
           </thead>
           <tbody id="token-user-tbody"></tbody>
+        </table>
+      </div>
+      <!-- 会話ごとの補助 AI 使用量（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
+           上位20件。タイトル・本文は表示しない＝会話 id はテキストのみ（リンクにしない）。
+           conversations_top が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
+      <div class="card" id="conversations-top-card" style="overflow-x:auto" hidden>
+        <div class="chart-title">会話別上位（トークン合計）</div>
+        <table>
+          <thead>
+            <tr>
+              <th>会話</th>
+              <th>ユーザー</th>
+              <th>資料フォルダ</th>
+              <th class="num">やり取り回数</th>
+              <th>用途別（回数・トークン・所要時間）</th>
+              <th class="num">回答時間平均</th>
+            </tr>
+          </thead>
+          <tbody id="conversations-top-tbody"></tbody>
         </table>
       </div>
     </div>

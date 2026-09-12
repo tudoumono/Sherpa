@@ -842,12 +842,31 @@ class UsageTokenByKind(BaseModel):
     elapsed_n: int
 
 
+class UsageTokenByUserKind(BaseModel):
+    """ユーザー別 × 用途別（kind）内訳。`UsageTokenByKind` の内訳をユーザーごとに分けたもの。
+    利用者に紐付かない呼び出し（取り込み時の埋め込み・画像読み取り・rag_render 等）は含まれないため、
+    同一 kind の合計は対応する `UsageTokenByKind` 行以下になりうる。null の意味・chat 行の
+    elapsed 扱いは `UsageTokenByKind` と同じ。"""
+    uid: str
+    display_name: str
+    kind: str
+    calls: int
+    input: int | None
+    cached_input: int | None
+    output: int | None
+    reasoning_output: int | None
+    elapsed_ms_total: int | None
+    elapsed_ms_avg: float | None
+    elapsed_n: int
+
+
 class UsageTokens(BaseModel):
     totals: UsageTokenTotals
     by_model: list[UsageTokenByModel]
     by_user: list[UsageTokenByUser]
     daily: list[UsageTokenDaily]
     by_kind: list[UsageTokenByKind]
+    by_user_kind: list[UsageTokenByUserKind]
 
 
 class UsageConversationTurns(BaseModel):
@@ -860,6 +879,63 @@ class UsageConversationTurns(BaseModel):
     median: float | None
     max: int | None
     p90: float | None
+
+
+class UsageResponseTimeRow(BaseModel):
+    """回答時間（ミリ秒・`messages.answer->>'duration_ms'`）の分布統計（1グループ分）。
+
+    `provider` は経路別行（`response_time.by_provider`）でのみ設定され、全体行
+    （`response_time.overall`）では常に `None`。対象0件なら `avg`/`median`/`max`/`p90` は
+    `None`（`n`=0）——`_compute_response_time_stats` 参照。
+    """
+    provider: str | None
+    avg: float | None
+    median: float | None
+    max: int | None
+    p90: float | None
+    n: int
+
+
+class UsageResponseTime(BaseModel):
+    """回答時間の分布：全体（`overall`）と経路（`provider`）別（`by_provider`）。
+
+    対象は期間内の assistant 行のうち `duration_ms` が保存されている行のみ（利用者の明示停止・
+    実行中のターンは assistant 自体を保存しないため対象外）。確認カード（`lens='clarify'`＝回答前の
+    一時停止）も含めない。
+    """
+    overall: UsageResponseTimeRow
+    by_provider: list[UsageResponseTimeRow]
+
+
+class UsageConversationKindRow(BaseModel):
+    """会話ごとの用途別（kind）内訳（`conversations_top[].kinds` の1行）。null の意味・chat 行の
+    elapsed 扱いは `UsageTokenByKind` と同じ。"""
+    kind: str
+    calls: int
+    input: int | None
+    cached_input: int | None
+    output: int | None
+    reasoning_output: int | None
+    elapsed_ms_total: int | None
+    elapsed_ms_avg: float | None
+    elapsed_n: int
+
+
+class UsageConversationRow(BaseModel):
+    """会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。
+
+    トークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で
+    切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。
+    `response_time_avg_ms` は `duration_ms` が保存された assistant 行のみの平均（0件なら None）。
+    タイトル・本文は含まない。
+    """
+    conversation_id: int
+    uid: str
+    display_name: str
+    world: str | None
+    user_turns: int
+    kinds: list[UsageConversationKindRow]
+    response_time_avg_ms: float | None
 
 
 class AdminUsageStatsResponse(BaseModel):
@@ -879,6 +955,8 @@ class AdminUsageStatsResponse(BaseModel):
     resume_rate: float | None
     stop_kinds: list[UsageStopKindRow]
     stopped_turns: int
+    response_time: UsageResponseTime
+    conversations_top: list[UsageConversationRow]
 
 
 class UsageChatResponse(BaseModel):

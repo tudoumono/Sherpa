@@ -1873,22 +1873,24 @@ def test_metering_records_chat_sub_on_gate_fail(monkeypatch):
     orig = _install_post(seq)
     recorded = []
 
-    def spy_record(kind, provider, model, usage, *, user_id=None, world=None, calls=1, elapsed_ms=None):
-        recorded.append((kind, provider, model, usage, user_id, world))
+    def spy_record(kind, provider, model, usage, *, user_id=None, world=None, calls=1, elapsed_ms=None,
+                  conversation_id=None):
+        recorded.append((kind, provider, model, usage, user_id, world, conversation_id))
 
     monkeypatch.setattr("sherpa.metering.record", spy_record)
     try:
         p = _FakeSynth("sk-dummy", "gpt-5.5")
         p._sub = dict(_SUB)
-        ctx = _ctx(uid="u1")
+        ctx = _ctx(uid="u1", conversation_id=77)
         with pytest.raises(RuntimeError):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert len(recorded) == 1
-        kind, provider, model, usage, uid, world = recorded[0]
+        kind, provider, model, usage, uid, world, conversation_id = recorded[0]
         assert kind == "chat-sub" and provider == "ollama" and model == "qwen2.5"
         assert usage == {"input_tokens": 7, "cached_input_tokens": 0, "output_tokens": 2,
                          "reasoning_output_tokens": 0}
         assert uid == "u1" and world == "v1"
+        assert conversation_id == 77   # STAT-4 U2: ctx.conversation_id が record まで渡る
     finally:
         _restore_post(orig)
 

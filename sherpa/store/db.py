@@ -716,6 +716,10 @@ _SCHEMA = [
     # （`metering.acc_begin`/`acc_end`）の外で記録された行（例: kind='graph_ask'）＝所要時間が取れない。
     "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS elapsed_ms BIGINT",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events (ts)",
+    # 会話ごとの補助 AI 使用量の集計キー。NULL＝会話 id が確定していない経路（新規会話の初回等）
+    # または過去データ（遡及なし）。
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS conversation_id BIGINT",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_conversation_id ON usage_events (conversation_id)",
     # 回答ごとの利用者フィードバック（👍/👎＋定型タグ＋任意の一言）。1利用者×1メッセージにつき
     # 最新1件のみ（再送は上書き）。本文（質問/回答）は複製せず message_id で messages を参照する
     # だけ（会話削除に CASCADE で追従）。

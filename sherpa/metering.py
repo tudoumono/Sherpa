@@ -89,7 +89,7 @@ def _clamp_str(v, limit: int = _MAX_STR_FIELD_LEN):
 
 def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
           connect_timeout: float | None = None, statement_timeout_ms: int | None = None,
-          elapsed_ms: float | None = None) -> None:
+          elapsed_ms: float | None = None, conversation_id: int | None = None) -> None:
     """1行記録（`suppress()` 中は no-op）。`usage` は `acc_end()` が返す形、または生の usage 辞書の
     どちらでもよい。
 
@@ -98,6 +98,9 @@ def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
     スコープの無い呼び出し元（例: `kind="graph_ask"`）で独自に計測した経過秒を渡したい場合だけ
     明示的に渡す（`acc_elapsed()` 由来の値より優先する）。どちらも無ければ `usage_events.elapsed_ms`
     は NULL のまま（所要時間が取れない呼び出し）。
+
+    `conversation_id`: 会話別集計キー。省略時（既定 None）は
+    `usage_events.conversation_id` が NULL のまま（会話 id が未確定の経路・既存呼び出し元は無変更）。
 
     `usage` が None なら全トークン列を None にする（NULL 行＝プロバイダが usage を報告しなかった
     「報告不能」マーカー）。辞書なら欠落サブフィールドは 0 に補正する（`_usage_meta` のクランプ意味論と
@@ -132,7 +135,7 @@ def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
                             output_tokens=tokens["output_tokens"],
                             reasoning_output_tokens=tokens["reasoning_output_tokens"],
                             calls=calls, user_id=_clamp_str(user_id), world=world_c,
-                            elapsed_ms=elapsed_ms_val,
+                            elapsed_ms=elapsed_ms_val, conversation_id=conversation_id,
                             connect_timeout=connect_timeout, statement_timeout_ms=statement_timeout_ms)
         log_usage_line(kind, prov_c, model_c, tokens, calls, world_c, elapsed)
     except Exception as e:

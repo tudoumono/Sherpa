@@ -202,6 +202,27 @@ def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | N
     return conversation_turns, resume_rate
 
 
+def _compute_response_time_stats(durations: list[int]) -> dict:
+    """回答時間（ミリ秒）の分布統計（avg/median/max/p90・件数）を計算する。
+
+    `durations` は空でもよい（0件なら avg/median/max/p90=None・n=0・`_compute_conversation_turn_stats`
+    の空入力時と同じ扱い）。`_percentile`（最近傍順位法）を使い、分布統計の計算方式を
+    他の集計（`_compute_conversation_turn_stats`）と揃える。呼び出し側で `provider` キーを
+    追加してから返す（本関数は provider を持たない・全体/経路別のどちらにも使う共通ロジック）。
+    """
+    n = len(durations)
+    if n == 0:
+        return {"avg": None, "median": None, "max": None, "p90": None, "n": 0}
+    sorted_vals = sorted(durations)
+    return {
+        "avg": sum(sorted_vals) / n,
+        "median": float(statistics.median(sorted_vals)),
+        "max": sorted_vals[-1],
+        "p90": _percentile(sorted_vals, 0.9),
+        "n": n,
+    }
+
+
 def usage_stats(days: int = 30) -> dict:
     """期間内の利用統計を集計する（本文/タイトルは含めない）。
 
@@ -252,6 +273,30 @@ def usage_stats(days: int = 30) -> dict:
         会話の全履歴ではない）。対象会話が無ければ全て None。
       - `resume_rate`: user ターン数2以上の会話のうち `conversations.codex_session_id` が設定されている
         割合。対象会話が無ければ None（推定しない）。`_compute_conversation_turn_stats` 参照。
+
+    `docs/proposals/2026-09-12-利用統計の拡充2.md` §2/§3:
+      - `tokens.by_user_kind`: ユーザー別 × 用途別（kind）の calls/tokens/elapsed_ms（`tokens.by_kind`
+        と同じ材料・同じ扱い）。chat 行（`messages.answer->'usage'` 由来）は `token_by_user`
+        （`user_rows` と同じ `turns` CTE 集計）から `kind='chat'` として合流し、それ以外の kind は
+        `usage_events`（`user_id IS NOT NULL` のみ＝集計できない匿名呼び出しは含めない）を
+        `user_id, kind` で集計する。`by_kind` と同じ内訳を利用者ごとに分けた形だが、user_id が
+        NULL の行（取り込み時の埋め込み・画像読み取り・rag_render 等の利用者に紐付かない呼び出し）は
+        含まれないため、同一 kind の合計は `by_kind` の当該行**以下**になりうる。並びは `(uid, kind)`。
+      - `response_time`: 期間内の assistant 行（`c.origin='own'・deleted_at IS NULL`＝他の集計と
+        同じ母集団）の `answer->>'duration_ms'`（1ターンの壁時計所要時間・`chat_service.py` が
+        埋め込む）から、全体（`overall`）と経路別（`by_provider`＝`answer->'usage'->>'provider'`・
+        取れなければ `'unknown'`）の avg/median/p90/max/件数を計算する（`_compute_response_time_stats`・
+        最近傍順位法は `_percentile` と共通）。利用者の明示停止・実行中のターンは assistant を
+        保存しないため対象に含まれず、duration が保存されなかった行（想定外データ）も
+        `~ '^[0-9]+$'` で弾いて除外する（0件なら avg/median/p90/max=None・n=0）。
+      - `conversations_top`: 期間内に user ターンが1件以上ある会話（`conversation_turns`/`resume_rate`
+        と同じ母集団）について、会話 id・uid・world・user ターン数・用途別（kind）内訳
+        （`kinds`＝chat は `turns` の `answer->'usage'` 合計・他は `usage_events` を
+        `conversation_id` で集計・null の意味は `tokens.by_kind` と同じ）・回答時間の平均
+        （`duration_ms` が無い行は除外）を、トークン合計（`kinds` 内の input+output の合算・
+        報告不能＝None は合算時のみ0扱い）の降順で上位20件。`usage_events.conversation_id` が
+        NULL の行（列追加前の過去データ・遡及なし）はどの会話にも合流しない
+        （`conversation_id = ANY(%s)` の対象会話 id 一覧に含まれないため）。タイトル・本文は含まない。
 
     ターンの終了理由:
       - `stop_kinds`: `messages.answer->>'stop_kind'`（`sherpa/stop_kind.py` の閉じた8値・
@@ -430,6 +475,32 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY kind, provider, model ORDER BY kind, input DESC NULLS LAST",
             (start_ts, end_exclusive_ts),
         ).fetchall()
+        # ユーザー別 × 用途別（kind）内訳（usage_events 側）。`user_id IS NOT NULL` で
+        # 絞る——匿名呼び出し（ext:等ユーザー本人以外・世界単位のバックグラウンド処理）は
+        # どの利用者にも属さないため by_user_kind には出せない（by_kind 側では引き続き集計対象）。
+        usage_event_user_kind_rows = c.execute(
+            "SELECT user_id AS uid, kind, SUM(calls) AS calls, "
+            "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+            "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
+            "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
+            "  COUNT(elapsed_ms) AS elapsed_n "
+            "FROM usage_events WHERE ts >= %s AND ts < %s AND user_id IS NOT NULL "
+            "GROUP BY user_id, kind ORDER BY user_id, kind",
+            (start_ts, end_exclusive_ts),
+        ).fetchall()
+        # 回答時間（`answer->>'duration_ms'`・chat_service.py が埋め込む1ターンの壁時計）。
+        # 対象は他の集計と同じ母集団（origin='own'・deleted_at IS NULL）の assistant 行のみ。
+        # 停止/実行中のターンは assistant 自体が無く、duration_ms が数値でない行（想定外データ）は
+        # 正規表現で弾く——`_usage_tok` と同じ防御思想（非数値/欠落は集計対象から静かに除く）。
+        response_time_rows = c.execute(
+            "SELECT answer->'usage'->>'provider' AS provider, (answer->>'duration_ms')::bigint AS duration_ms "
+            "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+            "WHERE m.created_at >= %s AND m.created_at < %s AND m.role='assistant' "
+            "  AND c.deleted_at IS NULL AND c.origin='own' "
+            "  AND m.lens IS DISTINCT FROM 'clarify' "   # 確認カードは回答前の一時停止＝回答時間ではない
+            "  AND answer->>'duration_ms' ~ '^[0-9]+$'",
+            (start_ts, end_exclusive_ts),
+        ).fetchall()
         # 会話あたりの user ターン数分布・resume_rate。`turns`（`_USAGE_TURN_CTE`）由来にすることで、
         # `totals.conversations`／`users[].conversations`（`user_rows`）と同じ母集団（期間内の
         # `turn_created_at`・origin='own'・deleted_at IS NULL）に揃える——ここで数える user_turns は
@@ -443,6 +514,45 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY c.id",
             (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
+        # 会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。対象は
+        # 「期間内に user ターンが1件以上ある会話」（他の会話系集計と同じ母集団）——1行=1会話。
+        # chat（messages.answer->'usage'）の合計と回答時間平均（duration_ms・欠落行は AVG が自然に除外）
+        # をここで集計し、それ以外の kind（usage_events 由来）は下の conv_kind_rows で別途取得して
+        # Python 側で合流する（`tokens.by_kind`/`by_user_kind` と同じ「chat は turns 由来・他は
+        # usage_events 由来」という合成方針）。
+        conv_turn_rows = c.execute(
+            _USAGE_TURN_CTE + " "
+            "SELECT conversation_id AS cid, user_id AS uid, version AS world, "
+            "  COUNT(*) AS user_turns, "
+            "  COUNT(*) FILTER (WHERE jsonb_typeof(answer->'usage')='object') AS chat_calls, "
+            f"  SUM({_usage_tok('input_tokens')}) AS chat_input, "
+            f"  SUM({_usage_tok('cached_input_tokens')}) AS chat_cached_input, "
+            f"  SUM({_usage_tok('output_tokens')}) AS chat_output, "
+            f"  SUM({_usage_tok('reasoning_output_tokens')}) AS chat_reasoning_output, "
+            "  AVG(CASE WHEN lens IS DISTINCT FROM 'clarify' AND answer->>'duration_ms' ~ '^[0-9]+$' "
+            "    THEN (answer->>'duration_ms')::bigint END) AS avg_response_time_ms "
+            "FROM turns "
+            "WHERE turn_created_at >= %s AND turn_created_at < %s "
+            "GROUP BY conversation_id, user_id, version",
+            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+        ).fetchall()
+        _conv_cids = [r["cid"] for r in conv_turn_rows]
+        # usage_events は明示的に `conv_turn_rows` が返した会話 id（=期間内に user ターンがある会話）に
+        # 限定して JOIN する——`conversation_id IS NULL` の行（列追加前の過去データ・遡及なし契約）は
+        # この ANY(%s) にどのみち一致しないため自然に除外される（どの会話にも混ざらない）。
+        conv_kind_rows = (
+            c.execute(
+                "SELECT conversation_id AS cid, kind, SUM(calls) AS calls, "
+                "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+                "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
+                "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
+                "  COUNT(elapsed_ms) AS elapsed_n "
+                "FROM usage_events WHERE ts >= %s AND ts < %s AND conversation_id = ANY(%s) "
+                "GROUP BY conversation_id, kind",
+                (start_ts, end_exclusive_ts, _conv_cids),
+            ).fetchall()
+            if _conv_cids else []
+        )
 
     display_names = {r["uid"]: r["display_name"] for r in name_rows}
     _aux_key = {"auth.login": "logins", "document.downloaded": "downloads",
@@ -556,6 +666,30 @@ def usage_stats(days: int = 30) -> dict:
                                           else None),
                        "elapsed_n": int(r["elapsed_n"] or 0)}
                       for r in usage_event_rows]
+    # ユーザー別 × 用途別（kind）内訳。token_by_kind と同じ合成（chat 行は token_by_user
+    # と同じ材料から kind='chat' として合流・それ以外は usage_event_user_kind_rows 由来）——
+    # user_id が NULL の行（取り込み時の埋め込み・画像読み取り等）を含まないため、同一 kind の
+    # 合計は token_by_kind の当該行以下になりうる。
+    token_by_user_kind = [{"uid": r["uid"], "display_name": display_names.get(r["uid"]) or r["uid"],
+                          "kind": "chat", "calls": r["turns"] or 0, "input": int(r["input"] or 0),
+                          "cached_input": int(r["cached_input"] or 0), "output": int(r["output"] or 0),
+                          "reasoning_output": int(r["reasoning_output"] or 0),
+                          "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
+                         for r in token_user_rows]
+    token_by_user_kind += [{"uid": r["uid"], "display_name": display_names.get(r["uid"]) or r["uid"],
+                           "kind": r["kind"], "calls": int(r["calls"] or 0),
+                           "input": int(r["input"]) if r["input"] is not None else None,
+                           "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+                           "output": int(r["output"]) if r["output"] is not None else None,
+                           "reasoning_output": (int(r["reasoning_output"]) if r["reasoning_output"] is not None
+                                                else None),
+                           "elapsed_ms_total": (int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None
+                                                else None),
+                           "elapsed_ms_avg": (float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None
+                                              else None),
+                           "elapsed_n": int(r["elapsed_n"] or 0)}
+                          for r in usage_event_user_kind_rows]
+    token_by_user_kind.sort(key=lambda row: (row["uid"], row["kind"]))
     tokens = {
         "totals": {
             "turns": sum(r["turns"] for r in token_by_model),
@@ -565,11 +699,79 @@ def usage_stats(days: int = 30) -> dict:
             "reasoning_output": sum(r["reasoning_output"] for r in token_by_model),
         },
         "by_model": token_by_model, "by_user": token_by_user, "daily": token_daily,
-        "by_kind": token_by_kind,
+        "by_kind": token_by_kind, "by_user_kind": token_by_user_kind,
     }
 
     # 会話あたりの user ターン数分布（avg/median/max/p90）と resume_rate。
     conversation_turns, resume_rate = _compute_conversation_turn_stats(conversation_turn_rows)
+
+    # 回答時間（duration_ms）の分布。全体＋経路（provider）別。
+    all_durations: list[int] = []
+    durations_by_provider: dict[str, list[int]] = {}
+    for r in response_time_rows:
+        d = int(r["duration_ms"])
+        all_durations.append(d)
+        durations_by_provider.setdefault(r["provider"] or "unknown", []).append(d)
+    overall_response_time = _compute_response_time_stats(all_durations)
+    overall_response_time["provider"] = None
+    by_provider_response_time = []
+    for p in sorted(durations_by_provider, key=lambda k: (-len(durations_by_provider[k]), k)):
+        row = _compute_response_time_stats(durations_by_provider[p])
+        row["provider"] = p
+        by_provider_response_time.append(row)
+    response_time = {"overall": overall_response_time, "by_provider": by_provider_response_time}
+
+    # 会話ごとの補助 AI 使用量（`conversations_top`）。chat 行（conv_turn_rows）を土台に、
+    # usage_events 由来の kind 行（conv_kind_rows・conv_turn_rows が返した会話 id に限定済み）を
+    # 合流し、トークン合計（chat の input+output と usage_events の input+output の合算・
+    # 報告不能＝None は 0 として加算＝並び順専用の内部値であり応答の各行 input/output はそのまま
+    # None を保つ）の降順で上位20件へ切り詰める。
+    conv_map: dict[int, dict] = {}
+    conv_token_total: dict[int, int] = {}
+    for r in conv_turn_rows:
+        cid = r["cid"]
+        chat_input = int(r["chat_input"] or 0)
+        chat_output = int(r["chat_output"] or 0)
+        kinds: list[dict] = []
+        if (r["chat_calls"] or 0) > 0:
+            kinds.append({
+                "kind": "chat", "calls": int(r["chat_calls"] or 0),
+                "input": chat_input, "cached_input": int(r["chat_cached_input"] or 0),
+                "output": chat_output, "reasoning_output": int(r["chat_reasoning_output"] or 0),
+                "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0,
+            })
+        conv_map[cid] = {
+            "conversation_id": cid,
+            "uid": r["uid"],
+            "display_name": display_names.get(r["uid"]) or r["uid"],
+            "world": r["world"],
+            "user_turns": r["user_turns"] or 0,
+            "kinds": kinds,
+            "response_time_avg_ms": (float(r["avg_response_time_ms"])
+                                     if r["avg_response_time_ms"] is not None else None),
+        }
+        conv_token_total[cid] = chat_input + chat_output
+    for r in conv_kind_rows:
+        entry = conv_map.get(r["cid"])
+        if entry is None:
+            continue   # conv_turn_rows に無い会話 id（安全側・実際には ANY(%s) 済みで起こらない）
+        entry["kinds"].append({
+            "kind": r["kind"], "calls": int(r["calls"] or 0),
+            "input": int(r["input"]) if r["input"] is not None else None,
+            "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+            "output": int(r["output"]) if r["output"] is not None else None,
+            "reasoning_output": int(r["reasoning_output"]) if r["reasoning_output"] is not None else None,
+            "elapsed_ms_total": int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None else None,
+            "elapsed_ms_avg": float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None else None,
+            "elapsed_n": int(r["elapsed_n"] or 0),
+        })
+        conv_token_total[r["cid"]] += (r["input"] or 0) + (r["output"] or 0)
+    for entry in conv_map.values():
+        entry["kinds"].sort(key=lambda k: k["kind"])
+    conversations_top = sorted(
+        conv_map.values(),
+        key=lambda e: (-conv_token_total[e["conversation_id"]], e["conversation_id"]),
+    )[:20]
 
     return {
         "users": users, "totals": totals, "daily": daily, "period": period,
@@ -577,4 +779,6 @@ def usage_stats(days: int = 30) -> dict:
         "heatmap": heatmap, "retention": retention, "downloads": downloads, "tokens": tokens,
         "conversation_turns": conversation_turns, "resume_rate": resume_rate,
         "stop_kinds": stop_kinds, "stopped_turns": stopped_turns,
+        "response_time": response_time,
+        "conversations_top": conversations_top,
     }

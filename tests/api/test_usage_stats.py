@@ -1504,3 +1504,271 @@ def test_usage_stats_conversation_turns_and_resume_rate():
     assert r_short.status_code == 200, r_short.text
     users_short = {u["uid"] for u in r_short.json()["users"]}
     assert stale_uid not in users_short, "10日前の会話が days=1 の集計対象に混入した"
+
+
+def _delete_usage_events_by_model(models: list) -> None:
+    """このテストが仕込んだ usage_events 行を model 名で回収する（unique 名なので他テストと
+    衝突しない・usage_events は users への FK が無く `_test_users.cleanup_users` の対象外・
+    tests/api/test_usage_events.py の同名ヘルパーと同型）。"""
+    try:
+        with psycopg.connect(store._dsn()) as c:
+            c.execute("DELETE FROM usage_events WHERE model = ANY(%s)", (models,))
+    except Exception:
+        pass
+
+
+def test_usage_stats_by_user_kind_splits_rows_and_matches_by_kind_totals():
+    """STAT-4 U1（2026-09-12-利用統計の拡充2.md §2/§3）: `tokens.by_user_kind` はユーザー別 ×
+    用途別（kind）に行が分かれ、同一 kind の合計は `tokens.by_kind` の当該行と一致する。
+
+    2ユーザーが別々の kind（chat-sub と intent）を使う——unique な model 名で他テスト/共有 dev DB の
+    既存行と衝突しないようにする（tests/api/test_usage_events.py の by_kind テストと同じ手法）。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgukadm{sfx}", f"UsageUkAdm{sfx}"
+    uid_a, pw_a = f"usguka{sfx}", f"UsageUkA{sfx}"
+    uid_b, pw_b = f"usgukb{sfx}", f"UsageUkB{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid_a, pw_a, role="user")
+    _mk_user(uid_b, pw_b, role="user")
+    world = f"ukworld{sfx}"
+    m_a = f"test-model-uk-chatsub-{sfx}"
+    m_b = f"test-model-uk-intent-{sfx}"
+    models = [m_a, m_b]
+    try:
+        store.add_usage_event(kind="chat-sub", provider="openai", model=m_a,
+                              input_tokens=100, cached_input_tokens=10, output_tokens=20,
+                              reasoning_output_tokens=0, calls=2, user_id=uid_a, world=world)
+        store.add_usage_event(kind="intent", provider="openai", model=m_b,
+                              input_tokens=30, cached_input_tokens=0, output_tokens=5,
+                              reasoning_output_tokens=0, calls=1, user_id=uid_b, world=world)
+
+        admin = _login(admin_uid, admin_pw)
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        tokens = r.json()["tokens"]
+
+        by_kind_chatsub = next(row for row in tokens["by_kind"]
+                               if row["kind"] == "chat-sub" and row["model"] == m_a)
+        by_kind_intent = next(row for row in tokens["by_kind"]
+                              if row["kind"] == "intent" and row["model"] == m_b)
+
+        by_user_kind = {(row["uid"], row["kind"]): row for row in tokens["by_user_kind"]}
+        row_a = by_user_kind[(uid_a, "chat-sub")]
+        row_b = by_user_kind[(uid_b, "intent")]
+
+        # 行が分かれる: uid_a は chat-sub にしか出ず、uid_b は intent にしか出ない。
+        assert (uid_a, "intent") not in by_user_kind
+        assert (uid_b, "chat-sub") not in by_user_kind
+
+        # 合計が by_kind と一致する（unique model 名で他行と分離済みのため厳密一致で固定できる）。
+        for col in ("calls", "input", "cached_input", "output", "reasoning_output"):
+            assert row_a[col] == by_kind_chatsub[col], f"chat-sub の{col}が by_kind と不一致"
+            assert row_b[col] == by_kind_intent[col], f"intent の{col}が by_kind と不一致"
+        assert row_a["calls"] == 2 and row_a["input"] == 100
+        assert row_b["calls"] == 1 and row_b["input"] == 30
+    finally:
+        _delete_usage_events_by_model(models)
+
+
+def test_usage_stats_response_time_distribution_excludes_rows_without_duration():
+    """STAT-4 U1: `response_time.by_provider` は `answer->>'duration_ms'` を持つ assistant 行だけを
+    対象に avg/median/p90/max/n を計算し、duration の無い行（利用者停止・実行中・想定外データ）は
+    除外する。provider 名を本テスト専用の unique 値にすることで、共有 dev DB の既存行と混ざらず
+    厳密な期待値で固定できる（token 系の unique model 名と同じ分離手法）。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgrtadm{sfx}", f"UsageRtAdm{sfx}"
+    uid, pw = f"usgrt{sfx}", f"UsageRt{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"rtworld{sfx}"
+    prov_a = f"rt-prov-a-{sfx}"
+    prov_b = f"rt-prov-b-{sfx}"
+
+    conv = store.create_conversation(user_id=uid, world=world)
+    store.add_message(conv["id"], "assistant", "回答1", lens="chat",
+                       answer={"usage": {"provider": prov_a}, "duration_ms": 1000})
+    store.add_message(conv["id"], "assistant", "回答2", lens="chat",
+                       answer={"usage": {"provider": prov_a}, "duration_ms": 3000})
+    store.add_message(conv["id"], "assistant", "回答3", lens="chat",
+                       answer={"usage": {"provider": prov_b}, "duration_ms": 5000})
+    # duration_ms の無い行（利用者停止/実行中相当）: 除外されるはず。
+    store.add_message(conv["id"], "assistant", "回答4(duration無し)", lens="chat",
+                       answer={"usage": {"provider": prov_a}})
+
+    admin = _login(admin_uid, admin_pw)
+    r = admin.get("/admin/usage/stats?days=30")
+    assert r.status_code == 200, r.text
+    by_provider = {row["provider"]: row for row in r.json()["response_time"]["by_provider"]}
+
+    row_a = by_provider[prov_a]
+    assert row_a == {"provider": prov_a, "avg": 2000.0, "median": 2000.0, "max": 3000,
+                     "p90": 3000.0, "n": 2}, "duration の無い行が混入した、または分布計算が不一致"
+
+    row_b = by_provider[prov_b]
+    assert row_b == {"provider": prov_b, "avg": 5000.0, "median": 5000.0, "max": 5000,
+                     "p90": 5000.0, "n": 1}
+
+
+def test_usage_stats_conversations_top_splits_by_conversation_and_excludes_null_conversation_id():
+    """2026-09-12-利用統計の拡充2.md §2 (b): `conversations_top` の各行の
+    `kinds` は会話ごとに分かれ、`conversation_id` が NULL の usage_events 行（列追加前の過去データ・
+    遡及なし）はどの会話にも混ざらない。unique な model 名で他テスト/共有 dev DB の既存行と
+    衝突しないようにする（`by_user_kind` テストと同じ手法）。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgctadm{sfx}", f"UsageCtAdm{sfx}"
+    uid, pw = f"usgct{sfx}", f"UsageCt{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"ctworld{sfx}"
+    m_hi = f"test-model-ct-hi-{sfx}"
+    m_lo = f"test-model-ct-lo-{sfx}"
+    m_null = f"test-model-ct-null-{sfx}"
+    models = [m_hi, m_lo, m_null]
+
+    conv_hi = store.create_conversation(user_id=uid, world=world)
+    _turn(conv_hi["id"], "会話1-1ターン目", lens="chat")
+    conv_lo = store.create_conversation(user_id=uid, world=world)
+    _turn(conv_lo["id"], "会話2-1ターン目", lens="chat")
+
+    try:
+        # 会話ごとに分かれた chat-sub usage_events。conv_hi の方がトークン合計が大きい。
+        store.add_usage_event(kind="chat-sub", provider="openai", model=m_hi,
+                              input_tokens=10 ** 12, cached_input_tokens=0, output_tokens=5 * 10 ** 11,
+                              reasoning_output_tokens=0, calls=2, user_id=uid, world=world,
+                              conversation_id=conv_hi["id"])
+        store.add_usage_event(kind="chat-sub", provider="openai", model=m_lo,
+                              input_tokens=10 ** 11, cached_input_tokens=0, output_tokens=5 * 10 ** 10,
+                              reasoning_output_tokens=0, calls=1, user_id=uid, world=world,
+                              conversation_id=conv_lo["id"])
+        # conversation_id が NULL の行（遡及なし・過去データ相当）はどちらの会話にも混ざらない。
+        store.add_usage_event(kind="chat-sub", provider="openai", model=m_null,
+                              input_tokens=99999, cached_input_tokens=0, output_tokens=99999,
+                              reasoning_output_tokens=0, calls=9, user_id=uid, world=world,
+                              conversation_id=None)
+
+        admin = _login(admin_uid, admin_pw)
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        conversations_top = r.json()["conversations_top"]
+
+        by_cid = {row["conversation_id"]: row for row in conversations_top}
+        assert conv_hi["id"] in by_cid
+        assert conv_lo["id"] in by_cid
+
+        row_hi = by_cid[conv_hi["id"]]
+        row_lo = by_cid[conv_lo["id"]]
+
+        kinds_hi = {k["kind"]: k for k in row_hi["kinds"]}
+        kinds_lo = {k["kind"]: k for k in row_lo["kinds"]}
+        assert kinds_hi["chat-sub"]["calls"] == 2
+        assert kinds_hi["chat-sub"]["input"] == 10 ** 12
+        assert kinds_hi["chat-sub"]["output"] == 5 * 10 ** 11
+        assert kinds_lo["chat-sub"]["calls"] == 1
+        assert kinds_lo["chat-sub"]["input"] == 10 ** 11
+        assert kinds_lo["chat-sub"]["output"] == 5 * 10 ** 10
+        # NULL 行（m_null・巨大なトークン数）がどちらの kinds にも現れない
+        # ＝conversation_id が NULL の行が混入していないことの確認。
+        for k in row_hi["kinds"] + row_lo["kinds"]:
+            assert k["input"] != 99999 and k["output"] != 99999
+
+        assert row_hi["user_turns"] == 1
+        assert row_lo["user_turns"] == 1
+        assert row_hi["uid"] == uid and row_lo["uid"] == uid
+        assert row_hi["world"] == world and row_lo["world"] == world
+
+        # トークン合計（input+output）降順: conv_hi（1.5×10^12）が conv_lo（1.5×10^11）より先に出る。
+        idx_hi = next(i for i, row in enumerate(conversations_top) if row["conversation_id"] == conv_hi["id"])
+        idx_lo = next(i for i, row in enumerate(conversations_top) if row["conversation_id"] == conv_lo["id"])
+        assert idx_hi < idx_lo
+    finally:
+        _delete_usage_events_by_model(models)
+
+
+def test_usage_stats_conversations_top_truncates_to_20_ordered_desc_by_tokens():
+    """2026-09-12-利用統計の拡充2.md §2 (b): 上位20件で打ち切り、トークン合計（usage_events の
+    input+output）降順で並ぶ。
+
+    25会話に単調増加する巨大トークン量（他テスト/共有 dev DB の既存データを圧倒する桁）を仕込み、
+    返る20件が「トークン量の大きい方から20件（=25件中、最小5件は除外）」の順であることを固定する。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgcttadm{sfx}", f"UsageCttAdm{sfx}"
+    uid, pw = f"usgctt{sfx}", f"UsageCtt{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"cttworld{sfx}"
+    n = 25
+    models: list[str] = []
+    conv_ids_asc: list[int] = []   # index 0 = 最小トークン, index n-1 = 最大トークン
+    try:
+        for i in range(n):
+            conv = store.create_conversation(user_id=uid, world=world)
+            _turn(conv["id"], f"会話{i}-1ターン目", lens="chat")
+            model = f"test-model-cttop-{i}-{sfx}"
+            models.append(model)
+            # 他データ（既存の共有 dev DB のトークン量は高々数万〜数十万）を圧倒する桁で、
+            # かつ i に応じ厳密に単調増加させる。
+            tokens = 10**12 + i * 10**9
+            store.add_usage_event(kind="chat-sub", provider="openai", model=model,
+                                  input_tokens=tokens, cached_input_tokens=0, output_tokens=0,
+                                  reasoning_output_tokens=0, calls=1, user_id=uid, world=world,
+                                  conversation_id=conv["id"])
+            conv_ids_asc.append(conv["id"])
+
+        expected_top20_cids = list(reversed(conv_ids_asc))[:20]   # i=24..5（トークン量の大きい順）
+
+        admin = _login(admin_uid, admin_pw)
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        conversations_top = r.json()["conversations_top"]
+        assert len(conversations_top) == 20, "上位20件で打ち切られていない"
+
+        returned_cids = [row["conversation_id"] for row in conversations_top]
+        assert returned_cids == expected_top20_cids, "並び順（トークン合計降順）または打ち切り対象が一致しない"
+    finally:
+        _delete_usage_events_by_model(models)
+
+
+def test_usage_stats_response_time_excludes_clarify_cards():
+    """確認カード（lens='clarify'・回答前の一時停止）は `duration_ms` を持つが回答時間の母集団に
+    入れない（`response_time` と `conversations_top.avg_response_time_ms` の両方）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgrtcadm{sfx}", f"UsageRtcAdm{sfx}"
+    uid, pw = f"usgrtc{sfx}", f"UsageRtc{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"rtcworld{sfx}"
+    prov = f"rtc-prov-{sfx}"
+    conv = store.create_conversation(user_id=uid, world=world)
+    _turn(conv["id"], "質問1", lens="chat")
+    store.add_message(conv["id"], "assistant", "確認カード", lens="clarify",
+                      answer={"lens": "clarify", "question": {"text": "どれ？"}, "duration_ms": 50})
+    # 確認カードへの返事（新しい user ターン）→ 本回答（実運用と同じ並び）
+    store.add_message(conv["id"], "user", "A のほう", lens="chat")
+    store.add_message(conv["id"], "assistant", "回答", lens="chat",
+                      # 共有 dev DB の他会話（上位 20 件テストの 10^12 級）より上に来る桁で入れる
+                      answer={"usage": {"provider": prov, "input_tokens": 10 ** 14, "output_tokens": 5},
+                              "duration_ms": 4000})
+    admin = _login(admin_uid, admin_pw)
+    r = admin.get("/admin/usage/stats?days=30")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    by_provider = {row["provider"]: row for row in body["response_time"]["by_provider"]}
+    assert prov in by_provider and by_provider[prov]["n"] == 1 and by_provider[prov]["max"] == 4000
+    assert "unknown" not in by_provider or all(
+        row["max"] != 50 for row in body["response_time"]["by_provider"] if row["provider"] == "unknown")
+    rows = [c for c in body["conversations_top"] if c["conversation_id"] == conv["id"]]
+    assert rows and rows[0]["response_time_avg_ms"] == 4000.0

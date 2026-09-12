@@ -448,12 +448,14 @@ def _resolve_lens(lens, message):
     return None, "auto", lens_block, message
 
 
-def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=None, scope_meta=None):
+def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=None, scope_meta=None,
+                  conversation_id=None):
     """hybrid intent ルータ（§3）。heuristic 確信→（曖昧）LLM 分類→（なお曖昧）clarify or qa fallback。
 
     **per-turn memoize**＝同一ターンで route が複数回呼ばれても（_GenProvider が route 後に _gather で再 route）
     LLM 分類を二重実行しない。`can_ask`＝ストリーミングのみ True（非対話は qa fallback）。
-    `user_id` は intent 分類の利用量計測（`kind='intent'`）に渡すだけ＝ルーティングの判断には使わない。
+    `user_id`/`conversation_id` は intent 分類の利用量計測（`kind='intent'`）に渡すだけ＝
+    ルーティングの判断には使わない。
 
     `explicit_lens`（調べ方ブロックの明示指定・スラッシュ接頭辞含む＝§3.1）: 非 None
     のときは Tier1〜3（heuristic／LLM分類／確認カード）を全て飛ばし `chat_router.decision_for()` で
@@ -488,7 +490,8 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
             return d
         d = _heuristic_route(message, world, known_terms=known)
         if not d.get("confident"):                              # 曖昧時だけ Tier2/3（コスト最小・大半は無料）
-            c = intent_llm.classify(message, settings, user_id=user_id, world=world)  # Tier2: 安価 LLM 分類（未接続/失敗は None）
+            c = intent_llm.classify(message, settings, user_id=user_id, world=world,
+                                    conversation_id=conversation_id)  # Tier2: 安価 LLM 分類（未接続/失敗は None）
             if c and c.get("lens") in _LENSES and c.get("confident", True):
                 d = _decision_for(c["lens"], message, known, reason="AI判定（意図分類）")
             elif can_ask:
@@ -1356,7 +1359,8 @@ def handle_message(session, message, world="v1",
     ctx = Ctx(message=message, world=world, pace=0, knowledge=knowledge,  # 非ストリーミングは間を置かない
               stop_event=stop_event,
               route=_build_router(known, world, settings, can_ask=False, user_id=user_id,
-                                  explicit_lens=explicit_lens, scope_meta=scope_meta),   # 非対話＝clarify 不可→qa fallback
+                                  explicit_lens=explicit_lens, scope_meta=scope_meta,
+                                  conversation_id=conversation_id),   # 非対話＝clarify 不可→qa fallback
               dispatch=_dispatch_with_personal if personal else
                        (lambda lens, inp: _dispatch(session, lens, inp, world, scope_meta, sys_settings,
                                                     tools_availability)),
@@ -1545,7 +1549,8 @@ def stream_message(session, message, world="v1",
     ctx = Ctx(
         message=message, world=world, pace=emit_pace(), knowledge=knowledge,
         route=_build_router(known, world, settings, can_ask=True, user_id=user_id,
-                            explicit_lens=explicit_lens, scope_meta=scope_meta),   # ストリーミング＝曖昧なら clarify で確認
+                            explicit_lens=explicit_lens, scope_meta=scope_meta,
+                            conversation_id=conversation_id),   # ストリーミング＝曖昧なら clarify で確認
         dispatch=_dispatch_with_personal if personal else
                  (lambda lens, inp: _dispatch(session, lens, inp, world, scope_meta, sys_settings,
                                               tools_availability)),

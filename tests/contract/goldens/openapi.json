@@ -38,6 +38,13 @@
           "conversation_turns": {
             "$ref": "#/components/schemas/UsageConversationTurns"
           },
+          "conversations_top": {
+            "items": {
+              "$ref": "#/components/schemas/UsageConversationRow"
+            },
+            "title": "Conversations Top",
+            "type": "array"
+          },
           "daily": {
             "items": {
               "$ref": "#/components/schemas/UsageDailyPoint"
@@ -64,6 +71,9 @@
             },
             "title": "Providers",
             "type": "array"
+          },
+          "response_time": {
+            "$ref": "#/components/schemas/UsageResponseTime"
           },
           "resume_rate": {
             "anyOf": [
@@ -129,7 +139,9 @@
           "conversation_turns",
           "resume_rate",
           "stop_kinds",
-          "stopped_turns"
+          "stopped_turns",
+          "response_time",
+          "conversations_top"
         ],
         "title": "AdminUsageStatsResponse",
         "type": "object"
@@ -5074,6 +5086,163 @@
         "title": "UsageChatResponse",
         "type": "object"
       },
+      "UsageConversationKindRow": {
+        "description": "会話ごとの用途別（kind）内訳（`conversations_top[].kinds` の1行）。null の意味・chat 行の\nelapsed 扱いは `UsageTokenByKind` と同じ。",
+        "properties": {
+          "cached_input": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Input"
+          },
+          "calls": {
+            "title": "Calls",
+            "type": "integer"
+          },
+          "elapsed_ms_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Avg"
+          },
+          "elapsed_ms_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Total"
+          },
+          "elapsed_n": {
+            "title": "Elapsed N",
+            "type": "integer"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "reasoning_output": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Output"
+          }
+        },
+        "required": [
+          "kind",
+          "calls",
+          "input",
+          "cached_input",
+          "output",
+          "reasoning_output",
+          "elapsed_ms_total",
+          "elapsed_ms_avg",
+          "elapsed_n"
+        ],
+        "title": "UsageConversationKindRow",
+        "type": "object"
+      },
+      "UsageConversationRow": {
+        "description": "会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。\n\nトークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で\n切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。\n`response_time_avg_ms` は `duration_ms` が保存された assistant 行のみの平均（0件なら None）。\nタイトル・本文は含まない。",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "integer"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "kinds": {
+            "items": {
+              "$ref": "#/components/schemas/UsageConversationKindRow"
+            },
+            "title": "Kinds",
+            "type": "array"
+          },
+          "response_time_avg_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Time Avg Ms"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          },
+          "user_turns": {
+            "title": "User Turns",
+            "type": "integer"
+          },
+          "world": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "World"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "uid",
+          "display_name",
+          "world",
+          "user_turns",
+          "kinds",
+          "response_time_avg_ms"
+        ],
+        "title": "UsageConversationRow",
+        "type": "object"
+      },
       "UsageConversationTurns": {
         "description": "会話あたりの user ターン数分布。\n\n値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に\nuser ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ全て None。",
         "properties": {
@@ -5283,6 +5452,101 @@
           "turns"
         ],
         "title": "UsageProviderRow",
+        "type": "object"
+      },
+      "UsageResponseTime": {
+        "description": "回答時間の分布：全体（`overall`）と経路（`provider`）別（`by_provider`）。\n\n対象は期間内の assistant 行のうち `duration_ms` が保存されている行のみ（利用者の明示停止・\n実行中のターンは assistant 自体を保存しないため対象外）。確認カード（`lens='clarify'`＝回答前の\n一時停止）も含めない。",
+        "properties": {
+          "by_provider": {
+            "items": {
+              "$ref": "#/components/schemas/UsageResponseTimeRow"
+            },
+            "title": "By Provider",
+            "type": "array"
+          },
+          "overall": {
+            "$ref": "#/components/schemas/UsageResponseTimeRow"
+          }
+        },
+        "required": [
+          "overall",
+          "by_provider"
+        ],
+        "title": "UsageResponseTime",
+        "type": "object"
+      },
+      "UsageResponseTimeRow": {
+        "description": "回答時間（ミリ秒・`messages.answer->>'duration_ms'`）の分布統計（1グループ分）。\n\n`provider` は経路別行（`response_time.by_provider`）でのみ設定され、全体行\n（`response_time.overall`）では常に `None`。対象0件なら `avg`/`median`/`max`/`p90` は\n`None`（`n`=0）——`_compute_response_time_stats` 参照。",
+        "properties": {
+          "avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max"
+          },
+          "median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median"
+          },
+          "n": {
+            "title": "N",
+            "type": "integer"
+          },
+          "p90": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P90"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "avg",
+          "median",
+          "max",
+          "p90",
+          "n"
+        ],
+        "title": "UsageResponseTimeRow",
         "type": "object"
       },
       "UsageRetention": {
@@ -5542,6 +5806,112 @@
         "title": "UsageTokenByUser",
         "type": "object"
       },
+      "UsageTokenByUserKind": {
+        "description": "ユーザー別 × 用途別（kind）内訳。`UsageTokenByKind` の内訳をユーザーごとに分けたもの。\n利用者に紐付かない呼び出し（取り込み時の埋め込み・画像読み取り・rag_render 等）は含まれないため、\n同一 kind の合計は対応する `UsageTokenByKind` 行以下になりうる。null の意味・chat 行の\nelapsed 扱いは `UsageTokenByKind` と同じ。",
+        "properties": {
+          "cached_input": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Input"
+          },
+          "calls": {
+            "title": "Calls",
+            "type": "integer"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "elapsed_ms_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Avg"
+          },
+          "elapsed_ms_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Total"
+          },
+          "elapsed_n": {
+            "title": "Elapsed N",
+            "type": "integer"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "reasoning_output": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Output"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "display_name",
+          "kind",
+          "calls",
+          "input",
+          "cached_input",
+          "output",
+          "reasoning_output",
+          "elapsed_ms_total",
+          "elapsed_ms_avg",
+          "elapsed_n"
+        ],
+        "title": "UsageTokenByUserKind",
+        "type": "object"
+      },
       "UsageTokenDaily": {
         "properties": {
           "date": {
@@ -5621,6 +5991,13 @@
             "title": "By User",
             "type": "array"
           },
+          "by_user_kind": {
+            "items": {
+              "$ref": "#/components/schemas/UsageTokenByUserKind"
+            },
+            "title": "By User Kind",
+            "type": "array"
+          },
           "daily": {
             "items": {
               "$ref": "#/components/schemas/UsageTokenDaily"
@@ -5637,7 +6014,8 @@
           "by_model",
           "by_user",
           "daily",
-          "by_kind"
+          "by_kind",
+          "by_user_kind"
         ],
         "title": "UsageTokens",
         "type": "object"

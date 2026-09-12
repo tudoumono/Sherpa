@@ -157,6 +157,17 @@ def _stats_projection(stats: dict, *, limit_users: int, limit_tok_users: int, li
     """`usage_stats()` の結果から質問応答に使う部分だけを抜き出す（内訳リストは上位 `limit_*` 件）。
 
     ヒートマップ（曜日×時間帯168マス）は本用途（誰が多いか・期間比較）への寄与が薄いため含めない。
+
+    `tokens.by_user_kind`（ユーザー別 × 用途別）は `limit_tok_users` を流用して間引く
+    （`by_user` と同じ「ユーザー数上限があればそれに揃える」考え方・行数は uid×kind の積で
+    `by_user` より多くなりうるが専用の上限は設けない）。`response_time`（全体＋経路別の
+    avg/median/p90/max・件数）は本文/タイトルを含まない集計のみなのでそのまま含める。
+
+    `conversations_top`（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）も
+    `limit_tok_users` を流用して間引き（`usage_stats` 側で既に上位20件へ切り詰め済み・ここでは
+    文脈サイズが超過した場合の追加間引き）、`kinds` は `kind`/`calls`/`input`/`output` だけの
+    要約にする（`cached_input`/`reasoning_output`/`elapsed_ms_*` は本用途（誰のどの会話が重いか）
+    への寄与が薄いため省く）。
     """
     tokens = stats.get("tokens") or {}
     return {
@@ -172,6 +183,7 @@ def _stats_projection(stats: dict, *, limit_users: int, limit_tok_users: int, li
         "stopped_turns": stats.get("stopped_turns"),
         "conversation_turns": stats.get("conversation_turns"),
         "resume_rate": stats.get("resume_rate"),
+        "response_time": stats.get("response_time"),
         "users": (stats.get("users") or [])[:limit_users],
         "tokens": {
             "totals": tokens.get("totals"),
@@ -179,7 +191,23 @@ def _stats_projection(stats: dict, *, limit_users: int, limit_tok_users: int, li
             "by_kind": tokens.get("by_kind"),
             "by_model": (tokens.get("by_model") or [])[:limit_tok_models],
             "by_user": (tokens.get("by_user") or [])[:limit_tok_users],
+            # 上位 N 件は利用量の多い順（uid 順で切ると重い利用者の内訳が落ちる）
+            "by_user_kind": sorted(tokens.get("by_user_kind") or [],
+                                   key=lambda r: -((r.get("input") or 0) + (r.get("output") or 0)))[:limit_tok_users],
         },
+        "conversations_top": [
+            {
+                "conversation_id": conv.get("conversation_id"),
+                "uid": conv.get("uid"),
+                "world": conv.get("world"),
+                "user_turns": conv.get("user_turns"),
+                "response_time_avg_ms": conv.get("response_time_avg_ms"),
+                "kinds": [{"kind": k.get("kind"), "calls": k.get("calls"),
+                          "input": k.get("input"), "output": k.get("output")}
+                         for k in (conv.get("kinds") or [])],
+            }
+            for conv in (stats.get("conversations_top") or [])[:limit_tok_users]
+        ],
     }
 
 
@@ -195,7 +223,9 @@ def _compact_stats_context(stats: dict) -> tuple[str, bool]:
         tokens = stats.get("tokens") or {}
         return (len(stats.get("users") or []) > limits[0]
                 or len(tokens.get("by_user") or []) > limits[1]
-                or len(tokens.get("by_model") or []) > limits[2])
+                or len(tokens.get("by_user_kind") or []) > limits[1]
+                or len(tokens.get("by_model") or []) > limits[2]
+                or len(stats.get("conversations_top") or []) > limits[1])
 
     text = ""
     for limits in ((500, 500, 200), (100, 100, 100), (30, 30, 50), (10, 10, 20)):

@@ -149,6 +149,60 @@ def test_stats_projection_includes_stop_kind_and_session_fields():
     assert out["resume_rate"] == 0.25
 
 
+def test_stats_projection_includes_by_user_kind_and_response_time():
+    """STAT-4 U1（2026-09-12-利用統計の拡充2.md §2/§3）: `tokens.by_user_kind`（上位 limit_tok_users
+    件）と `response_time`（全体＋経路別）を `_stats_projection` の戻り値に含める。"""
+    stats = json.loads(json.dumps(_EMPTY_STATS))   # 深いコピー（tokens サブ辞書を書き換えるため）
+    stats["tokens"]["by_user_kind"] = [
+        {"uid": "u1", "display_name": "一郎", "kind": "chat", "calls": 3, "input": 100,
+         "cached_input": 0, "output": 20, "reasoning_output": 0,
+         "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
+        {"uid": "u2", "display_name": "二郎", "kind": "intent", "calls": 1, "input": 10,
+         "cached_input": 0, "output": 2, "reasoning_output": 0,
+         "elapsed_ms_total": 50, "elapsed_ms_avg": 50.0, "elapsed_n": 1},
+    ]
+    stats["response_time"] = {
+        "overall": {"provider": None, "avg": 1500.0, "median": 1200.0, "max": 3000, "p90": 3000.0, "n": 3},
+        "by_provider": [{"provider": "openai", "avg": 1500.0, "median": 1200.0, "max": 3000,
+                         "p90": 3000.0, "n": 3}],
+    }
+    out = U._stats_projection(stats, limit_users=500, limit_tok_users=1, limit_tok_models=200)
+    # limit_tok_users=1: by_user（既存）と同じ考え方で by_user_kind も上位1件へ間引かれる。
+    assert out["tokens"]["by_user_kind"] == stats["tokens"]["by_user_kind"][:1]
+    assert out["response_time"] == stats["response_time"]
+
+
+def test_stats_projection_includes_conversations_top_summarized_and_limited():
+    """2026-09-12-利用統計の拡充2.md §2 (b): `conversations_top` を
+    `limit_tok_users` で間引き（`by_user_kind` と同じ考え方）、各行の `kinds` は
+    `kind`/`calls`/`input`/`output` だけの要約にする
+    （`cached_input`/`reasoning_output`/`elapsed_ms_*` は落とす）。"""
+    stats = dict(_EMPTY_STATS)
+    stats["conversations_top"] = [
+        {"conversation_id": 1, "uid": "u1", "display_name": "一郎", "world": "w1", "user_turns": 3,
+         "response_time_avg_ms": 1500.0,
+         "kinds": [{"kind": "chat", "calls": 3, "input": 100, "cached_input": 10, "output": 20,
+                   "reasoning_output": 5, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}]},
+        {"conversation_id": 2, "uid": "u2", "display_name": "二郎", "world": "w1", "user_turns": 1,
+         "response_time_avg_ms": None,
+         "kinds": [{"kind": "intent", "calls": 1, "input": 10, "cached_input": 0, "output": 2,
+                   "reasoning_output": 0, "elapsed_ms_total": 50, "elapsed_ms_avg": 50.0, "elapsed_n": 1}]},
+    ]
+    out = U._stats_projection(stats, limit_users=500, limit_tok_users=1, limit_tok_models=200)
+    # limit_tok_users=1: 上位1件（トークン合計降順は usage_stats 側で確定済み・ここでは先頭切り詰めのみ）。
+    assert len(out["conversations_top"]) == 1
+    conv = out["conversations_top"][0]
+    assert conv["conversation_id"] == 1
+    assert conv["uid"] == "u1"
+    assert conv["world"] == "w1"
+    assert conv["user_turns"] == 3
+    assert conv["response_time_avg_ms"] == 1500.0
+    # display_name は含めない（uid で users 一覧と突き合わせられるため冗長）。
+    assert "display_name" not in conv
+    # kinds は kind/calls/input/output のみの要約（cached_input/reasoning_output/elapsed_ms_* を落とす）。
+    assert conv["kinds"] == [{"kind": "chat", "calls": 3, "input": 100, "output": 20}]
+
+
 # ===== _compact_stats_context =====
 
 def test_compact_stats_context_small_stats_not_truncated():
@@ -879,3 +933,13 @@ def test_answer_usage_question_empty_answer_raises_call_failed(monkeypatch):
     monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": "   "}))
     with pytest.raises(U.LLMCallFailedError):
         U.answer_usage_question("質問", [], system_settings={})
+
+
+def test_stats_projection_by_user_kind_keeps_heaviest_rows_when_truncated():
+    """上位 N 件への間引きは利用量（input+output）の多い順＝uid の辞書順で先頭を切らない。"""
+    stats = {"tokens": {"by_user_kind": [
+        {"uid": "aaa", "kind": "chat-sub", "calls": 1, "input": 10, "output": 5},
+        {"uid": "zzz", "kind": "chat", "calls": 9, "input": 9000, "output": 500},
+    ]}}
+    out = U._stats_projection(stats, limit_users=5, limit_tok_users=1, limit_tok_models=5)
+    assert [r["uid"] for r in out["tokens"]["by_user_kind"]] == ["zzz"]

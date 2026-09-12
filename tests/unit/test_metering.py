@@ -177,6 +177,32 @@ def test_record_explicit_elapsed_ms_overrides_acc_scope(monkeypatch):
     assert calls[0]["elapsed_ms"] == 1235   # round() で丸める
 
 
+# ---- STAT-4 U2（2026-09-12-利用統計の拡充2.md §2 (b)）: conversation_id ----
+
+def test_record_passes_conversation_id_through_to_add_usage_event(monkeypatch):
+    """`record(conversation_id=42)` は `usage_events.conversation_id` へ 42 をそのまま渡す。"""
+    from sherpa.store import usage_events as ue
+
+    monkeypatch.setattr(metering, "record", _real_record)
+    calls = []
+    monkeypatch.setattr(ue, "add_usage_event", lambda **kwargs: calls.append(kwargs))
+
+    metering.record("chat-sub", "openai", "m", {"input_tokens": 1}, calls=1, conversation_id=42)
+    assert calls[0]["conversation_id"] == 42
+
+
+def test_record_conversation_id_defaults_to_none(monkeypatch):
+    """`conversation_id` 省略時は NULL のまま(会話 id が未確定の呼び出し元・既存呼び出し元は無変更)。"""
+    from sherpa.store import usage_events as ue
+
+    monkeypatch.setattr(metering, "record", _real_record)
+    calls = []
+    monkeypatch.setattr(ue, "add_usage_event", lambda **kwargs: calls.append(kwargs))
+
+    metering.record("intent", "openai", "m", {"input_tokens": 1}, calls=1)
+    assert calls[0]["conversation_id"] is None
+
+
 def test_record_clamps_oversized_string_fields(monkeypatch):
     """secRV MED-4是正: 巨大 ollama_model（数MB級の自由文字列。`routers/system.py::settings_put` の
     形式検証や `subagent_profiles.resolve_sub` の防御的検証を経ずに旧データ等から届いた想定）を

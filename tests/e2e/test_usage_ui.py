@@ -90,6 +90,83 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
     expect(page.locator("#chart-tokin-empty")).to_be_visible()
     expect(page.locator("#token-model-tbody .empty-row")).to_be_visible()
 
+    # 新6項目も、対応するキーが応答に全く無くても（旧 API 応答/計測前）壊れない。
+    # (1)(4) 用途別・ユーザー別×用途別＝空/不在ならカードごと隠す（token-kind-card と同じ流儀）。
+    expect(page.locator("#token-kind-card")).to_be_hidden()
+    expect(page.locator("#token-user-kind-card")).to_be_hidden()
+    # (2) 終了理由の分布＝既存の頭脳別/world別バーと同じ空状態表示・停止数バッジは0件表示。
+    expect(page.locator("#chart-stopkind-empty")).to_be_visible()
+    expect(page.locator("#stopkind-total-badge")).to_have_text("利用者停止 0件")
+    # (3) 会話あたりのやり取り回数・resume率＝サマリタイルと同じ「—」表示（カードは隠さない）。
+    expect(page.locator("#t-turns-avg")).to_have_text("—")
+    expect(page.locator("#t-turns-max")).to_have_text("—")
+    expect(page.locator("#t-resume-rate")).to_have_text("—")
+    # (6) 回答時間の分布＝`overall` 行はつねに存在する契約なので「全体」行だけ「—」で描画される。
+    rt_tbody = page.locator("#response-time-tbody")
+    expect(rt_tbody).to_contain_text("全体")
+    expect(rt_tbody).to_contain_text("—")
+    # (5) 会話別上位＝空/不在ならカードごと隠す。
+    expect(page.locator("#conversations-top-card")).to_be_hidden()
+
+
+def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
+    """（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: 見えていなかった6項目が
+    USAGE_STATS_DEFAULT の値どおりに描画される。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html")
+
+    # (1) 用途別（kind）表に所要時間の列（合計・平均・件数）。
+    kind_tbody = page.locator("#token-kind-tbody")
+    chat_row = kind_tbody.locator("tr", has_text="会話").first
+    expect(chat_row).to_contain_text("—")        # chat 行は所要時間を持たない（API 契約＝None）
+    expect(chat_row).not_to_contain_text("秒")
+    embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")
+    expect(embed_row).to_contain_text("—")       # elapsed_ms_total=None（報告不能マーカー）
+
+    # (2) 終了理由の分布（平文ラベル）と停止数のバッジ。
+    stopkind_svg = page.locator("#chart-stopkind-svg")
+    expect(page.locator("#chart-stopkind-empty")).to_be_hidden()
+    expect(stopkind_svg).to_contain_text("完了")
+    expect(stopkind_svg).to_contain_text("14")
+    expect(stopkind_svg).to_contain_text("調査の上限")
+    expect(stopkind_svg).to_contain_text("不明")
+    expect(page.locator("#stopkind-total-badge")).to_have_text("利用者停止 1件")
+
+    # (3) 会話あたりのやり取り回数（avg/median/max/p90）と resume 率。
+    expect(page.locator("#t-turns-avg")).to_have_text("3.0")
+    expect(page.locator("#t-turns-median")).to_have_text("2.0")
+    expect(page.locator("#t-turns-p90")).to_have_text("5.0")
+    expect(page.locator("#t-turns-max")).to_have_text("6")
+    expect(page.locator("#t-resume-rate")).to_have_text("50%")
+
+    # (4) ユーザー別×用途別内訳。
+    expect(page.locator("#token-user-kind-card")).to_be_visible()
+    ukind_tbody = page.locator("#token-user-kind-tbody")
+    admin_intent_row = ukind_tbody.locator("tr", has_text="依頼の仕分け").first
+    expect(admin_intent_row).to_contain_text("管理者")
+    expect(admin_intent_row).to_contain_text("0.9秒")   # elapsed_ms_total=900
+    expect(admin_intent_row).to_contain_text("0.3秒")   # elapsed_ms_avg=300.0
+
+    # (5) 会話別上位（トークン合計降順・1行目は admin の会話501）。会話 id はテキストのみ（リンクではない）。
+    expect(page.locator("#conversations-top-card")).to_be_visible()
+    top_rows = page.locator("#conversations-top-tbody tr")
+    first_row = top_rows.first
+    expect(first_row).to_contain_text("#501")
+    expect(first_row).to_contain_text("管理者")
+    expect(first_row).to_contain_text("test")
+    expect(first_row).to_contain_text("4.5秒")   # response_time_avg_ms=4500.0
+    expect(first_row.locator("a")).to_have_count(0)   # 会話 id はリンクにしない
+
+    # (6) 回答時間の分布（全体＋経路別）。
+    rt_tbody = page.locator("#response-time-tbody")
+    expect(rt_tbody).to_contain_text("全体")
+    overall_row = rt_tbody.locator("tr", has_text="全体")
+    expect(overall_row).to_contain_text("9.0秒")   # p90=9000.0
+    codex_row = rt_tbody.locator("tr", has_text="Codex")
+    expect(codex_row).to_contain_text("4.5秒")   # avg=4500.0
+
 
 def test_usage_chat_notice_uses_plain_language_not_jargon(page, web_base_url):
     """統計チャットの案内文は honest_failure 等の専門語を使わず、平文（「見つからないと正直に
@@ -132,7 +209,7 @@ def test_token_kind_table_renders(page, web_base_url):
     usage を報告しないプロバイダ（Gemini の embed）の null トークンに対する「—」表示を確認する。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)   # USAGE_STATS_DEFAULT（tokens.by_kind に chat/intent/embed の3行を含む）
+    install_api_mocks(page)   # USAGE_STATS_DEFAULT（tokens.by_kind に chat×2（codex/gemini）/intent/embed の 4 行を含む）
     page.goto(f"{web_base_url}/usage.html")
 
     kind_tbody = page.locator("#token-kind-tbody")

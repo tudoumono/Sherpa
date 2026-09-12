@@ -83,7 +83,8 @@ def _complete(system: str, user: str, cfg: dict) -> str:
 
 def classify(message: str, settings: dict | None, *,
             user_id: str | None = None, world: str | None = None,
-            system_settings: dict | None = None) -> dict | None:
+            system_settings: dict | None = None,
+            conversation_id: int | None = None) -> dict | None:
     """曖昧メッセージ → {"lens","confident"} | None（未接続/失敗/不正は None＝clarify へ）。
 
     S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: `_complete` 呼び出しを
@@ -93,6 +94,9 @@ def classify(message: str, settings: dict | None, *,
 
     `system_settings`（省略可）: 呼び出し側が既に読んだスナップショットがあれば渡す（省略時は
     `_cfg` がこの呼び出し内で1回だけ読む）。
+
+    `conversation_id`（省略可）: 会話別集計キー。省略時は `usage_events.conversation_id`
+    が NULL のまま(会話 id が未確定の呼び出し元向け)。
 
     RV1（FBK-1・境界回帰#6・2026-09-01）: `_cfg()` 自体が送出する例外（`InvalidCloudProviderConfigError`
     以外・例えば `store.get_system_settings()` の DB 一時障害）もここで捕捉し None に丸める——
@@ -129,4 +133,5 @@ def classify(message: str, settings: dict | None, *,
         tokens, n = metering.acc_end()
         if n:
             metering.record("intent", cfg["provider"], cfg["model"], tokens,
-                            user_id=user_id, world=world, calls=n)
+                            user_id=user_id, world=world, calls=n,
+                            conversation_id=conversation_id)
