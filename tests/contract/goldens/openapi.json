@@ -5049,7 +5049,7 @@
         "type": "object"
       },
       "UsageChatResponse": {
-        "description": "POST /admin/usage/chat（sherpa/usage_chat.py::answer_usage_question）。\n\n`provider_used`/`endpoint_kind`: 実際に使われた AI（\"openai\"|\"ollama\"）と、openai 使用時\nの接続先種別（\"openai\"|\"azure\"|\"custom\"・ollama 使用時は `None`）。画面は「今回だけ」トグルを使わない送信の送信先表示を、送信前の予定表示ではなく\nこの確定値で更新する（GET /admin/settings とこの POST の間に他セッションが専用設定を\n変更した場合の食い違いを、応答時点の値で吸収する）。\n\n`notes`: 画面へそのまま見せる注記（改善ログの要約が取得できなかった場合の告知など・\n通常は空リスト）。",
+        "description": "POST /admin/usage/chat（sherpa/usage_chat.py::answer_usage_question）。\n\n`provider_used`/`endpoint_kind`: 実際に使われた AI（\"openai\"|\"ollama\"）と、openai 使用時\nの接続先種別（\"openai\"|\"azure\"|\"custom\"・ollama 使用時は `None`）。画面は「今回だけ」トグルを使わない送信の送信先表示を、送信前の予定表示ではなく\nこの確定値で更新する（GET /admin/settings とこの POST の間に他セッションが専用設定を\n変更した場合の食い違いを、応答時点の値で吸収する）。\n\n`notes`: 画面へそのまま見せる注記（改善ログの要約が取得できなかった場合の告知など・\n通常は空リスト）。\n\n`tool_calls`: 今回の質問応答で実際に呼んだ調査ツール（`usage_overview`等7つ・\n`agentic_search.usage_openai_tools()`）の名前と引数。渡された統計データだけで答えた場合は\n空リスト。",
         "properties": {
           "answer": {
             "title": "Answer",
@@ -5077,6 +5077,14 @@
           "provider_used": {
             "title": "Provider Used",
             "type": "string"
+          },
+          "tool_calls": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/UsageChatToolCall"
+            },
+            "title": "Tool Calls",
+            "type": "array"
           }
         },
         "required": [
@@ -5084,6 +5092,26 @@
           "provider_used"
         ],
         "title": "UsageChatResponse",
+        "type": "object"
+      },
+      "UsageChatToolCall": {
+        "description": "`UsageChatResponse.tool_calls` の1件。呼んだ調査ツールの名前と引数\n（数値と id のみ・本文/タイトル/鍵は一切含まない）。",
+        "properties": {
+          "args": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Args",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "UsageChatToolCall",
         "type": "object"
       },
       "UsageConversationKindRow": {
@@ -8297,7 +8325,7 @@
     },
     "/admin/usage/chat": {
       "post": {
-        "description": "利用統計チャット（管理者のみ）。直近の利用統計（件数・日時・トークン量のみ）と改善ログの\n要約（フィードバック件数・タグ分布・stop_reason 分布・honest_failure 率・所要時間の分布のみ。\n質問/一言コメントは👎が付いたものだけ先頭100字に切り詰めて含まれることがある）を根拠に、\n自然言語の質問へ AI が回答する（会話本文・会話タイトルを丸ごとコンテキストに含めることはない）。\n\nリクエスト body の型は固定しない（`_USAGE_CHAT_REQUEST_BODY_SCHEMA` 参照）——固定すると\n型不正な値・トップレベルがオブジェクトでない body（配列・文字列・`null` 等）がハンドラに\n到達する前に FastAPI/pydantic の自動 422 で弾かれ、「入力検証を含む全経路を監査する」契約\n（下記 `_audit`）を経由しない盲点になる。トップレベルがオブジェクトでない場合も含め、\n型不正はすべてここ（認証チェック後）で 400（監査あり）として拒否する（値そのものは\n反射しない）。唯一の例外が `history` の件数上限超過（`_HISTORY_HARD_CAP`）と本文サイズ\n超過（`_USAGE_CHAT_BODY_MAX_BYTES`）: どちらも意図的に監査を経由しない\n422/413（DoS 対策の防御的な上限）のまま拒否する。\n\nプロバイダ失敗時は別プロバイダへ自動フォールバックしない（明示エラー・503/502）。\n成功/失敗（入力検証エラー・想定外の例外を含む）の全経路で admin.usage_chat_asked を監査する\n（fail-closed・盲点を作らない）。入力検証段階で終わる経路は1行（400/500）。実送信\n（`answer_usage_question`）まで進む経路は2行（送信前の pending 行＋結果行〔成功/503/502/500〕・\n下記 `_audit`/`request_token` 参照）。監査の書き込みは同期 DB 呼び出しのため\n`run_in_threadpool` 経由で行う（下記参照）。\n\n非同期ハンドラ内の同期呼び出しについて: このハンドラは本文読み込み（`_read_capped_json_body`）\n以外は全て同期の DB/LLM 呼び出しである。`def`（同期）ハンドラなら FastAPI が自動的に\nthreadpool 実行してくれるが、本文のチャンク読みに `await request.stream()` が要るため\n`async def` にしている＝この関数自身は自動 threadpool の対象外になる。そのため、認証\n（`_current_user`/`_require_admin`）・監査（`_audit`）・本処理（`answer_usage_question`。\n設定取得を含め最大60秒の LLM 呼び出しを伴う）を明示的に `run_in_threadpool` へ委譲する\n（単一 worker プロセス構成のため、これを怠ると1回の利用統計チャット呼び出し中、他の全\nAPI・healthz が応答不能になる）。`answer_usage_question` は `metering.acc_begin()`/\n`acc_add()`/`acc_end()` という thread-local な累積カウンタを1回の呼び出し内で使い切る契約\n（`metering.py` 参照）のため、設定取得も含めて丸ごと1回の `run_in_threadpool` 呼び出しに\n収める（`_run_answer` 参照）——`acc_begin`/`acc_end` を別々の `run_in_threadpool` 呼び出しに\n分けると、それぞれ異なるスレッドで実行されうるため thread-local が別物になり集計が壊れる。",
+        "description": "利用統計チャット（管理者のみ）。直近の利用統計（件数・日時・トークン量のみ）と改善ログの\n要約（フィードバック件数・タグ分布・stop_reason 分布・honest_failure 率・所要時間の分布のみ。\n質問/一言コメントは👎が付いたものだけ先頭100字に切り詰めて含まれることがある）を根拠に、\n自然言語の質問へ AI が回答する（会話本文・会話タイトルを丸ごとコンテキストに含めることはない）。\n\nリクエスト body の型は固定しない（`_USAGE_CHAT_REQUEST_BODY_SCHEMA` 参照）——固定すると\n型不正な値・トップレベルがオブジェクトでない body（配列・文字列・`null` 等）がハンドラに\n到達する前に FastAPI/pydantic の自動 422 で弾かれ、「入力検証を含む全経路を監査する」契約\n（下記 `_audit`）を経由しない盲点になる。トップレベルがオブジェクトでない場合も含め、\n型不正はすべてここ（認証チェック後）で 400（監査あり）として拒否する（値そのものは\n反射しない）。唯一の例外が `history` の件数上限超過（`_HISTORY_HARD_CAP`）と本文サイズ\n超過（`_USAGE_CHAT_BODY_MAX_BYTES`）: どちらも意図的に監査を経由しない\n422/413（DoS 対策の防御的な上限）のまま拒否する。\n\nプロバイダ失敗時は別プロバイダへ自動フォールバックしない（明示エラー・503/502）。\n成功/失敗（入力検証エラー・想定外の例外を含む）の全経路で admin.usage_chat_asked を監査する\n（fail-closed・盲点を作らない）。入力検証段階で終わる経路は1行（400/500）。実送信\n（`answer_usage_question`）まで進む経路は2行（送信前の pending 行＋結果行〔成功/503/502/500〕・\n下記 `_audit`/`request_token` 参照）。監査の書き込みは同期 DB 呼び出しのため\n`run_in_threadpool` 経由で行う（下記参照）。\n\n非同期ハンドラ内の同期呼び出しについて: このハンドラは本文読み込み（`_read_capped_json_body`）\n以外は全て同期の DB/LLM 呼び出しである。`def`（同期）ハンドラなら FastAPI が自動的に\nthreadpool 実行してくれるが、本文のチャンク読みに `await request.stream()` が要るため\n`async def` にしている＝この関数自身は自動 threadpool の対象外になる。そのため、認証\n（`_current_user`/`_require_admin`）・監査（`_audit`）・本処理（`answer_usage_question`。\nツール反復ループ＝最大 `agentic_search.MAX_TURNS` ターン × `usage_chat._ANSWER_TIMEOUT` 秒の\n同期 LLM 呼び出しを伴う）を明示的に `run_in_threadpool` へ委譲する（単一 worker プロセス構成の\nため、これを怠ると1回の利用統計チャット呼び出し中、他の全 API・healthz が応答不能になる）。\n設定取得も含めて丸ごと1回の `run_in_threadpool` 呼び出しに収める（`_run_answer` 参照）。",
         "operationId": "admin_usage_chat_admin_usage_chat_post",
         "requestBody": {
           "content": {

@@ -397,6 +397,271 @@ def test_run_tool_window_cap_raises_read_around_ceiling(monkeypatch, tmp_path):
     assert res_wide["text"].splitlines()[0] == "1: line 1"         # 先頭行までレンジが伸びる
 
 
+# ===== docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツール =====
+# world/scope_paths とは無関係（引数検証・dispatch・cards サイドカーだけを固定する・DB は monkeypatch
+# で切り離す＝本ファイルの他の run_tool テストと同じ「実埋め込み/実DBを叩かない」流儀）。
+
+def test_usage_openai_tools_and_gemini_tools_expose_exactly_seven_tools():
+    """裁定（2026-09-12）: ツールは7つのみ（world別/モデル別は足さない）。"""
+    names = {"usage_overview", "usage_by_user", "usage_conversations", "usage_conversation_detail",
+            "usage_response_time", "usage_daily", "usage_stop_kinds"}
+    openai_tools = A.usage_openai_tools()
+    assert {t["function"]["name"] for t in openai_tools} == names
+    assert all(t["type"] == "function" and t["function"]["parameters"] for t in openai_tools)
+    gemini_fns = A.usage_gemini_tools()[0]["functionDeclarations"]
+    assert {f["name"] for f in gemini_fns} == names
+
+
+@pytest.mark.parametrize("tool_name,store_fn,expected_args", [
+    ("usage_overview", "usage_overview", (30,)),
+    ("usage_response_time", "usage_response_time", (30,)),
+    ("usage_daily", "usage_daily", (30,)),
+    ("usage_stop_kinds", "usage_stop_kinds", (30,)),
+])
+def test_run_tool_usage_dispatch_uses_default_days_when_omitted(monkeypatch, tool_name, store_fn,
+                                                                expected_args):
+    """days 省略時はツールごとの既定日数（overview/response_time/daily/stop_kinds は30日）で
+    対応する `store.usage_*` 関数へ委譲する。"""
+    captured = {}
+
+    def _fake(*a, **kw):
+        captured["args"], captured["kwargs"] = a, kw
+        return {"ok": True}
+
+    monkeypatch.setattr(store, store_fn, _fake)
+    result, docs, cites, cards = A.run_tool(tool_name, {}, "v1", None)
+    assert result == {"ok": True} and docs == set() and cites == []
+    assert captured["args"][0] == expected_args[0]
+    assert cards == [{"tool": tool_name, "args": {}}]   # 引数省略＝echo する既知キーも空
+
+
+def test_run_tool_usage_by_user_default_days_is_seven_and_forwards_uid_kind(monkeypatch):
+    """`usage_by_user` の既定日数は7日（他は30日）・uid/kind をそのまま転送する。"""
+    captured = {}
+
+    def _fake(days, uid=None, kind=None):
+        captured.update(days=days, uid=uid, kind=kind)
+        return {"rows": []}
+
+    monkeypatch.setattr(store, "usage_by_user", _fake)
+    result, _, _, cards = A.run_tool("usage_by_user", {"uid": "alice"}, "v1", None)
+    assert result == {"rows": []}
+    assert captured == {"days": 7, "uid": "alice", "kind": None}
+    assert cards == [{"tool": "usage_by_user", "args": {"uid": "alice"}}]
+
+
+def test_run_tool_usage_by_user_forwards_days_and_kind(monkeypatch):
+    captured = {}
+
+    def _fake(days, uid=None, kind=None):
+        captured.update(days=days, uid=uid, kind=kind)
+        return {"rows": []}
+
+    monkeypatch.setattr(store, "usage_by_user", _fake)
+    A.run_tool("usage_by_user", {"days": 14, "kind": "intent"}, "v1", None)
+    assert captured == {"days": 14, "uid": None, "kind": "intent"}
+
+
+def test_run_tool_usage_conversations_forwards_uid_limit_sort(monkeypatch):
+    captured = {}
+
+    def _fake(days, uid=None, limit=20, sort="tokens"):
+        captured.update(days=days, uid=uid, limit=limit, sort=sort)
+        return {"conversations": []}
+
+    monkeypatch.setattr(store, "usage_conversations", _fake)
+    result, _, _, cards = A.run_tool(
+        "usage_conversations", {"days": 60, "uid": "bob", "limit": 100, "sort": "turns"}, "v1", None)
+    assert result == {"conversations": []}
+    assert captured == {"days": 60, "uid": "bob", "limit": 100, "sort": "turns"}
+    assert cards == [{"tool": "usage_conversations",
+                      "args": {"days": 60, "uid": "bob", "limit": 100, "sort": "turns"}}]
+
+
+def test_run_tool_usage_conversations_default_limit_and_sort(monkeypatch):
+    captured = {}
+
+    def _fake(days, uid=None, limit=20, sort="tokens"):
+        captured.update(days=days, uid=uid, limit=limit, sort=sort)
+        return {"conversations": []}
+
+    monkeypatch.setattr(store, "usage_conversations", _fake)
+    A.run_tool("usage_conversations", {}, "v1", None)
+    assert captured == {"days": 30, "uid": None, "limit": 20, "sort": "tokens"}
+
+
+def test_run_tool_usage_conversation_detail_forwards_conversation_id(monkeypatch):
+    captured = {}
+
+    def _fake(cid):
+        captured["cid"] = cid
+        return {"conversation_id": cid, "user_turns": 0, "kinds": [], "response_time_series": []}
+
+    monkeypatch.setattr(store, "usage_conversation_detail", _fake)
+    result, _, _, cards = A.run_tool("usage_conversation_detail", {"conversation_id": 501}, "v1", None)
+    assert captured["cid"] == 501
+    assert result["conversation_id"] == 501
+    assert cards == [{"tool": "usage_conversation_detail", "args": {"conversation_id": 501}}]
+
+
+def test_run_tool_usage_conversation_detail_passes_through_store_error(monkeypatch):
+    """`usage_conversation_detail` 自体の「存在しない会話」判定は `store` 側の責務
+    （`run_tool` は結果をそのまま通す）。"""
+    monkeypatch.setattr(store, "usage_conversation_detail",
+                        lambda cid: {"error": "指定した会話が見つかりません"})
+    result, _, _, _ = A.run_tool("usage_conversation_detail", {"conversation_id": 999999}, "v1", None)
+    assert result == {"error": "指定した会話が見つかりません"}
+    assert "answer" not in result and "title" not in result
+
+
+def test_run_tool_usage_response_time_forwards_provider(monkeypatch):
+    captured = {}
+
+    def _fake(days, provider=None):
+        captured.update(days=days, provider=provider)
+        return {"avg": None, "n": 0}
+
+    monkeypatch.setattr(store, "usage_response_time", _fake)
+    A.run_tool("usage_response_time", {"days": 90, "provider": "openai"}, "v1", None)
+    assert captured == {"days": 90, "provider": "openai"}
+
+
+@pytest.mark.parametrize("bad_days", [-1, 0, "not-a-number"])
+def test_run_tool_usage_tools_reject_negative_or_invalid_days(monkeypatch, bad_days):
+    """負/0/非数値の days はどの usage_* ツールでも error 辞書になり、`store` 側へは進まない。"""
+    def _must_not_call(*a, **kw):
+        raise AssertionError("不正な days なのに store 関数へ進んでしまった")
+
+    monkeypatch.setattr(store, "usage_overview", _must_not_call)
+    result, docs, cites, cards = A.run_tool("usage_overview", {"days": bad_days}, "v1", None)
+    assert "error" in result and docs == set() and cites == [] and cards == []
+
+
+def test_run_tool_usage_daily_rejects_invalid_metric(monkeypatch):
+    def _must_not_call(*a, **kw):
+        raise AssertionError("不正な metric なのに store 関数へ進んでしまった")
+
+    monkeypatch.setattr(store, "usage_daily", _must_not_call)
+    result, _, _, cards = A.run_tool("usage_daily", {"metric": "bogus"}, "v1", None)
+    assert "error" in result and cards == []
+
+
+def test_run_tool_usage_daily_accepts_each_known_metric(monkeypatch):
+    captured = []
+    monkeypatch.setattr(store, "usage_daily",
+                        lambda days, metric="turns": (captured.append(metric), {"series": []})[1])
+    for m in ("turns", "tokens", "response_time"):
+        result, _, _, _ = A.run_tool("usage_daily", {"metric": m}, "v1", None)
+        assert "error" not in result
+    assert captured == ["turns", "tokens", "response_time"]
+
+
+def test_run_tool_usage_conversations_rejects_invalid_sort(monkeypatch):
+    def _must_not_call(*a, **kw):
+        raise AssertionError("不正な sort なのに store 関数へ進んでしまった")
+
+    monkeypatch.setattr(store, "usage_conversations", _must_not_call)
+    result, _, _, cards = A.run_tool("usage_conversations", {"sort": "bogus"}, "v1", None)
+    assert "error" in result and cards == []
+
+
+def test_run_tool_usage_conversation_detail_bad_id_does_not_call_store(monkeypatch):
+    """`conversation_id` の型検証自体は `store.usage_conversation_detail` の責務——本テストは
+    `run_tool` が引数をそのまま転送するだけで、勝手に別のエラーへ丸めないことを確認する。"""
+    monkeypatch.setattr(store, "usage_conversation_detail",
+                        lambda cid: {"error": "conversation_id は整数で指定してください"})
+    result, _, _, _ = A.run_tool("usage_conversation_detail", {"conversation_id": "not-an-int"}, "v1", None)
+    assert result == {"error": "conversation_id は整数で指定してください"}
+
+
+# ===== STAT-4 U4 RV是正 #13: usage 系ツール結果もバイト予算内にクリップされる =====
+# `tool_result_max_bytes` は他ツール（read_around 等）と同じ `run_tool` の引数で、usage 分岐にも
+# `_fit_usage_result` 経由で効く（`usage_chat._compact_stats_context` と同じ段階縮小の流儀）。
+
+def _big_usage_by_user_rows(n: int) -> dict:
+    return {"period": {"start": "2026-01-01", "end": "2026-02-01", "days": 30}, "uid": None, "kind": None,
+           "rows": [{"uid": f"user{i:04d}", "kind": "chat", "calls": i, "input": i * 100,
+                    "cached_input": 0, "output": i * 50, "reasoning_output": 0,
+                    "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
+                   for i in range(n)]}
+
+
+def test_run_tool_usage_by_user_shrinks_to_budget_and_marks_truncated(monkeypatch):
+    """予算（1024バイト）を超える大きな `rows` は間引かれ、`_result_byte_size <= 1024` かつ
+    `truncated: true` が付く。"""
+    monkeypatch.setattr(store, "usage_by_user", lambda *a, **kw: _big_usage_by_user_rows(500))
+    result, _, _, _ = A.run_tool("usage_by_user", {}, "v1", None, tool_result_max_bytes=1024)
+    assert A._result_byte_size(result) <= 1024
+    assert result.get("truncated") is True
+
+
+def test_run_tool_usage_by_user_not_truncated_when_budget_is_sufficient(monkeypatch):
+    """予算が十分なとき（既定の大きな予算）は間引かれず、`truncated` キーも付かない。"""
+    monkeypatch.setattr(store, "usage_by_user", lambda *a, **kw: _big_usage_by_user_rows(50))
+    result, _, _, _ = A.run_tool("usage_by_user", {}, "v1", None)
+    assert result["rows"] and len(result["rows"]) == 50
+    assert "truncated" not in result
+
+
+def _big_usage_overview() -> dict:
+    users = [{"uid": f"u{i:04d}", "turns": i, "conversations": i, "active_days": 1,
+             "last_active": "2026-01-01T00:00:00+09:00", "lens": {"impact": 0, "qa": i, "troubleshoot": 0,
+             "chat": 0}, "personal_turns": 0, "worlds": ["v1"], "logins": 0, "downloads": 0, "uploads": 0,
+             "shares": 0, "knowledge_turns": i, "zero_hit_turns": 0, "zero_hit_rate": None}
+            for i in range(200)]
+    daily = [{"date": f"2026-01-{d:02d}", "turns": d, "active_users": 1} for d in range(1, 32)]
+    return {
+        "period": {"start": "2026-01-01", "end": "2026-02-01", "days": 30},
+        "totals": {"turns": 1000, "active_users": 200, "conversations": 500}, "zero_hit": {"knowledge_turns": 0,
+        "zero_hit_turns": 0, "rate": None}, "worlds": [{"world": "v1", "turns": 100}],
+        "providers": [{"provider": "openai", "turns": 100}], "retention": {"weekly": [], "revisit_rate": None},
+        "downloads": {"total": 0, "daily": []}, "daily": daily, "stop_kinds": [], "stopped_turns": 0,
+        "conversation_turns": {"avg": 1.0, "median": 1.0, "max": 5, "p90": 3.0}, "resume_rate": None,
+        "response_time": {"overall": {"avg": 100.0, "median": 90.0, "max": 500, "p90": 300.0, "n": 10,
+                          "provider": None}, "by_provider": []},
+        "users": users,
+        "tokens": {"totals": {"turns": 0, "input": 0, "cached_input": 0, "output": 0, "reasoning_output": 0},
+                  "daily": [], "by_kind": [], "by_model": [], "by_user": users, "by_user_kind": []},
+        "conversations_top": [{"conversation_id": i, "uid": f"u{i:04d}", "world": "v1", "user_turns": i,
+                              "response_time_avg_ms": None, "kinds": []} for i in range(50)],
+    }
+
+
+def test_run_tool_usage_overview_shrinks_to_budget_and_marks_truncated(monkeypatch):
+    """`usage_overview` も同じ予算・同じ間引きの流儀を通る（内訳リストが多いほど厳しい段まで
+    間引かれるが、最終的には `_usage_counts_only` に落ちてでも予算内へ収まる）。"""
+    monkeypatch.setattr(store, "usage_overview", lambda *a, **kw: _big_usage_overview())
+    result, _, _, _ = A.run_tool("usage_overview", {}, "v1", None, tool_result_max_bytes=1024)
+    assert A._result_byte_size(result) <= 1024
+    assert result.get("truncated") is True
+
+
+def test_run_tool_usage_overview_not_truncated_when_budget_is_sufficient(monkeypatch):
+    monkeypatch.setattr(store, "usage_overview", lambda *a, **kw: _big_usage_overview())
+    result, _, _, _ = A.run_tool("usage_overview", {}, "v1", None)
+    assert len(result["users"]) == 200
+    assert "truncated" not in result
+
+
+def test_fit_usage_result_never_returns_empty_final_at_extreme_budget():
+    """最小段でも収まらない極端な予算でも `_usage_counts_only` の要約（件数のみ）へ落ち、
+    空の dict にはならない（`period` 等のスカラーは残る）。"""
+    result = A._fit_usage_result(_big_usage_overview(), 32)
+    assert result != {} and result.get("truncated") is True
+    assert result["period"] == {"start": "2026-01-01", "end": "2026-02-01", "days": 30}
+    assert result["users"] == {"count": 200}
+
+
+def test_run_tool_usage_conversation_detail_error_result_is_not_shrunk(monkeypatch):
+    """`store.usage_conversation_detail` の error 辞書は `_fit_usage_result` を素通りする
+    （間引き対象の内訳リストが無い＝バイト予算判定自体が不要）。"""
+    monkeypatch.setattr(store, "usage_conversation_detail",
+                        lambda cid: {"error": "指定した会話が見つかりません"})
+    result, _, _, _ = A.run_tool(
+        "usage_conversation_detail", {"conversation_id": 1}, "v1", None, tool_result_max_bytes=1)
+    assert result == {"error": "指定した会話が見つかりません"}
+
+
 def test_run_tool_read_around_default_window_scales_with_window_cap(monkeypatch, tmp_path):
     """LLM が `window` 引数を省略したときの既定値にも `window_cap`（調べる深さが計算した実効値）を
     使う。標準/深く/最大（40/60/80）と PROF-1 相当の `READ_WINDOW=60`（60/90/120）の両方で、
@@ -7732,3 +7997,12 @@ def test_es_search_cap_is_judged_on_raw_hits_before_filtering(monkeypatch):
     monkeypatch.setattr(documents, "world_rel_set", lambda *a, **k: {"d0.md", "d1.md"})   # 1 件は実在せず落ちる
     res, *_ = A.run_tool("es_search", {"query": "x"}, "v1", None, max_hits=3)
     assert res.get("truncated") is True and len(res["hits"]) <= 2
+
+
+def test_usage_shrink_keeps_latest_for_date_series_and_heaviest_for_rows():
+    from sherpa import agentic_search as A
+    daily = [{"date": f"2026-08-{d:02d}", "turns": d} for d in range(1, 31)]
+    rows = [{"uid": f"u{i}", "input": 100 - i} for i in range(30)]
+    out = A._usage_shrink_lists({"daily": daily, "rows": rows}, 5)
+    assert [x["date"] for x in out["daily"]] == [f"2026-08-{d:02d}" for d in range(26, 31)]   # 直近側
+    assert [x["uid"] for x in out["rows"]] == ["u0", "u1", "u2", "u3", "u4"]                  # 重い側

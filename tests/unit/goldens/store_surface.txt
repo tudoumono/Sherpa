@@ -175,7 +175,14 @@ update_settings
 upsert_message_feedback
 upsert_user
 upsert_world
+usage_by_user
+usage_conversation_detail
+usage_conversations
+usage_daily
+usage_overview
+usage_response_time
 usage_stats
+usage_stop_kinds
 verify_audit_chain
 workspace_file_lock
 world_by_root

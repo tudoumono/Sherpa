@@ -465,13 +465,10 @@ async def admin_usage_chat(request: Request):
     threadpool 実行してくれるが、本文のチャンク読みに `await request.stream()` が要るため
     `async def` にしている＝この関数自身は自動 threadpool の対象外になる。そのため、認証
     （`_current_user`/`_require_admin`）・監査（`_audit`）・本処理（`answer_usage_question`。
-    設定取得を含め最大60秒の LLM 呼び出しを伴う）を明示的に `run_in_threadpool` へ委譲する
-    （単一 worker プロセス構成のため、これを怠ると1回の利用統計チャット呼び出し中、他の全
-    API・healthz が応答不能になる）。`answer_usage_question` は `metering.acc_begin()`/
-    `acc_add()`/`acc_end()` という thread-local な累積カウンタを1回の呼び出し内で使い切る契約
-    （`metering.py` 参照）のため、設定取得も含めて丸ごと1回の `run_in_threadpool` 呼び出しに
-    収める（`_run_answer` 参照）——`acc_begin`/`acc_end` を別々の `run_in_threadpool` 呼び出しに
-    分けると、それぞれ異なるスレッドで実行されうるため thread-local が別物になり集計が壊れる。
+    ツール反復ループ＝最大 `agentic_search.MAX_TURNS` ターン × `usage_chat._ANSWER_TIMEOUT` 秒の
+    同期 LLM 呼び出しを伴う）を明示的に `run_in_threadpool` へ委譲する（単一 worker プロセス構成の
+    ため、これを怠ると1回の利用統計チャット呼び出し中、他の全 API・healthz が応答不能になる）。
+    設定取得も含めて丸ごと1回の `run_in_threadpool` 呼び出しに収める（`_run_answer` 参照）。
     """
     def _authn() -> dict:
         u = _current_user(request)
@@ -582,8 +579,8 @@ async def admin_usage_chat(request: Request):
     await _audit_async("pending", None, None, pre_send=True)
 
     def _run_answer() -> dict:
-        # 設定取得（DB）〜 answer_usage_question（DB usage_stats・最大60秒の LLM 呼び出し）まで
-        # 丸ごと1回の `run_in_threadpool` 呼び出しに収める（関数 docstring の metering 契約参照）。
+        # 設定取得（DB）〜 answer_usage_question（DB 集計・ツール反復の同期 LLM 呼び出し）まで
+        # 丸ごと1回の `run_in_threadpool` 呼び出しに収める（関数 docstring 参照）。
         # STAT-2: 利用者の個人設定（`store.get_settings`）は使わない＝実行構成に依存しない契約。
         return usage_chat.answer_usage_question(
             question, history, system_settings=store.get_system_settings(), user_id=u["uid"],
@@ -631,4 +628,4 @@ async def admin_usage_chat(request: Request):
     notes = result["notes"]
     await _audit_async("success", 200, pre_send=False, improvement_log_failed=bool(notes))
     return {"answer": result["answer"], "provider_used": provider_used, "endpoint_kind": endpoint_kind_used,
-            "notes": notes}
+            "notes": notes, "tool_calls": result.get("tool_calls", [])}

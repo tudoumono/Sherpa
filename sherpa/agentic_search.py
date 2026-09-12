@@ -1539,6 +1539,65 @@ def graph_gemini_tools() -> list:
     ]}]
 
 
+# ---- 利用統計チャット用ツール定義 ----
+# 裁定（2026-09-12）: ツールは以下の7つのみ（world 別/モデル別は足さない）・期間上限365日・
+# 返却上限50件・会話 id は返してよい。自由 SQL は与えない（閉じた引数のみ）。
+_USAGE_TOOLS_SPEC = [
+    ("usage_overview", "直近の利用統計の概要（用途別・ユーザー別・トークン量・回答時間・終了理由等）を"
+                       "days日分まとめて取得する。画面に出ている集計と同じ材料。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"}}}),
+    ("usage_by_user", "ユーザー別×用途別（kind）の呼び出し回数・トークン量・所要時間を取得する。"
+                      "uid/kind で絞り込める。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時7）"},
+         "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"},
+         "kind": {"type": "string", "description": "絞り込む用途（kind・省略可・例: chat/intent/embed）"}}}),
+    ("usage_conversations", "会話別の利用量上位表を取得する（会話 id・uid・world・user ターン数・"
+                           "用途別内訳・回答時間平均）。本文・タイトルは含まない。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
+         "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"},
+         "limit": {"type": "integer", "description": "返す件数上限（1〜50・省略時20）"},
+         "sort": {"type": "string", "enum": ["tokens", "turns", "elapsed"],
+                  "description": "並び順（省略時 tokens）"}}}),
+    ("usage_conversation_detail", "指定した1会話の内訳（user ターン数・用途別 calls/tokens・"
+                                  "回答時間の系列）を取得する。本文・タイトルは含まない。",
+     {"type": "object", "properties": {
+         "conversation_id": {"type": "integer", "description": "会話 id"}},
+      "required": ["conversation_id"]}),
+    ("usage_response_time", "回答時間（受付〜最終回答の壁時計）の分布（avg/median/p90/max・件数）を"
+                           "取得する。provider で絞り込める。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
+         "provider": {"type": "string", "description": "絞り込む経路（省略可・例: openai/ollama/codex）"}}}),
+    ("usage_daily", "日別の系列（turns=ターン数・tokens=入出力トークン・response_time=回答時間平均）を"
+                   "取得する。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
+         "metric": {"type": "string", "enum": ["turns", "tokens", "response_time"],
+                    "description": "取得する系列（省略時 turns）"}}}),
+    ("usage_stop_kinds", "終了理由（正常完了・停止・予算超過等）の分布と利用者による明示停止の件数を"
+                        "取得する。uid で絞り込める。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
+         "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"}}}),
+]
+
+
+def usage_openai_tools() -> list:
+    """利用統計チャット専用: 上記7ツールだけを OpenAI/Ollama 形式で LLM に渡す。"""
+    return [{"type": "function", "function": {"name": n, "description": d, "parameters": p}}
+           for n, d, p in _USAGE_TOOLS_SPEC]
+
+
+def usage_gemini_tools() -> list:
+    """利用統計チャット専用: 上記7ツールだけを Gemini 形式で LLM に渡す。"""
+    return [{"functionDeclarations": [
+        {"name": n, "description": d, "parameters": p} for n, d, p in _USAGE_TOOLS_SPEC
+    ]}]
+
+
 # ---- S3b 原本読取ツール（6本）共通の後処理: バイト上限クリップ・read_evidence 用の text 合成 ----
 # `doc_readers.py` は world/scope/doc_id を一切知らない純関数（モジュール docstring 参照）ため、
 # `read_evidence`（`InvestigationState`）に載せるための `doc_id`/`text`/`locator` はここ
@@ -2476,7 +2535,167 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             docs.add(doc_id)
             result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
         return (result, docs, cites, cards)
+    if name in _USAGE_TOOL_ARG_KEYS:
+        return _run_usage_tool(name, args, tr_max_bytes)
     return ({"error": f"unknown tool: {name}"}, docs, cites, cards)
+
+
+# ---- 利用統計チャットの調査ツール（docs/proposals/2026-09-12-利用統計の拡充2.md §3b）----
+# world/scope_paths とは無関係（管理者向け利用統計は KB world を持たない）。docs/cites は常に
+# 空（引用機構を使わない）——「調べた内容」の記録は `cards` サイドカーに `{"tool","args"}` として積む
+# （`graph_neighbors` が `cards` を候補カードのサイドカーとして使うのと同じ「run_tool の4つ目の
+# 戻り値＝LLM には見せない呼び出し元専用の記録」という仕組みを転用。`usage_chat.py` はこれを集めて
+# 応答の `tool_calls` にする）。戻り値は件数・時刻・種別・トークン・所要時間・会話 id・uid・world の
+# みで、本文・会話タイトル・鍵・display_name は一切含めない（`sherpa/store/usage.py` の不変条件）。
+_USAGE_TOOL_ARG_KEYS = {
+    "usage_overview": ("days",),
+    "usage_by_user": ("days", "uid", "kind"),
+    "usage_conversations": ("days", "uid", "limit", "sort"),
+    "usage_conversation_detail": ("conversation_id",),
+    "usage_response_time": ("days", "provider"),
+    "usage_daily": ("days", "metric"),
+    "usage_stop_kinds": ("days", "uid"),
+}
+_USAGE_METRIC_VALUES = ("turns", "tokens", "response_time")
+_USAGE_SORT_VALUES = ("tokens", "turns", "elapsed")
+
+
+def _usage_days_arg(args: dict, default: int = 30):
+    """`days` 引数を検証する。省略時は `default`。整数化できない、または0以下は
+    説明付きの error 辞書を返す（正の整数以外は自由 SQL 的な誤用を早期に拒否する）。"""
+    raw = args.get("days")
+    if raw is None:
+        return default
+    try:
+        d = int(raw)
+    except (TypeError, ValueError):
+        return {"error": "days は整数で指定してください"}
+    if d <= 0:
+        return {"error": "days は1以上で指定してください"}
+    return d
+
+
+def _usage_tool_call_card(name: str, args: dict) -> dict:
+    """`args` のうち、そのツールが受け付ける既知キーだけを（値が None でなければ）echo する
+    ——数値と id のみ（本文/タイトルを渡す引数は存在しない）。"""
+    known = _USAGE_TOOL_ARG_KEYS.get(name, ())
+    return {"tool": name, "args": {k: args[k] for k in known if args.get(k) is not None}}
+
+
+# usage 系ツール結果のバイト予算クリップ（`_clip_utf8_bytes`/`_clip_cards`/`_finish_reader_result` が
+# 他ツールで使う `tr_max_bytes` と同じ予算・`usage_chat._compact_stats_context` と同じ段階縮小の
+# 流儀）。usage_* の戻り値は本文/タイトル/鍵/display_name を持たない（`sherpa/store/usage.py` の
+# 不変条件）ため、間引き対象は内訳リスト（daily 系・users・by_*・conversations・detail の系列）
+# だけでよく、ネストの深さや各ツールごとのキー名を問わない汎用の再帰間引きで足りる。
+_USAGE_SHRINK_STAGES = (50, 20, 10, 5, 2, 1)
+
+
+_USAGE_SERIES_KEYS = ("date", "week_start", "turn")
+
+
+def _usage_is_series(items: list) -> bool:
+    """日付/週/ターン順の時系列リストか（要素が `date`/`week_start`/`turn` キーを持つ dict）。"""
+    return bool(items) and all(isinstance(x, dict) and any(k in x for k in _USAGE_SERIES_KEYS) for x in items)
+
+
+def _usage_shrink_lists(value, limit: int):
+    """`value` 内の全ての list を（辞書のネストを辿りながら）`limit` 件へ間引く。
+    利用量順のリスト（by_*・rows・conversations）は先頭＝重い側を残し、時系列（日別・週別・
+    ターン系列＝昇順で返る）は末尾＝直近側を残す（先頭切りだと古い期間だけが残り「最近の推移」を
+    古いデータで答えてしまう）。"""
+    if isinstance(value, dict):
+        return {k: _usage_shrink_lists(v, limit) for k, v in value.items()}
+    if isinstance(value, list):
+        kept = value[-limit:] if _usage_is_series(value) else value[:limit]
+        return [_usage_shrink_lists(v, limit) for v in kept]
+    return value
+
+
+def _usage_counts_only(value):
+    """段階縮小の最小段でも収まらない時の最終手段: 全ての list を件数だけに畳む
+    （スカラー値はそのまま残す＝空の final にはしない・「何件あったか」だけは伝える）。"""
+    if isinstance(value, dict):
+        return {k: _usage_counts_only(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return {"count": len(value)}
+    return value
+
+
+def _fit_usage_result(result: dict, max_bytes: int) -> dict:
+    """usage 系ツール結果を `max_bytes` 以内に収める。予算内ならそのまま返す（`error` 辞書も無変更）。
+    超過時は内訳リストの上限を `_USAGE_SHRINK_STAGES` の順に下げ、収まった段で `truncated: true` を
+    付けて返す。最小段でも収まらなければ `_usage_counts_only` へ落とす（同じく `truncated: true`）。
+    """
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    if _result_byte_size(result) <= max_bytes:
+        return result
+    for limit in _USAGE_SHRINK_STAGES:
+        shrunk = _usage_shrink_lists(result, limit)
+        if _result_byte_size(shrunk) <= max_bytes:
+            shrunk["truncated"] = True
+            return shrunk
+    summary = _usage_counts_only(result)
+    summary["truncated"] = True
+    return summary
+
+
+def _run_usage_tool(name: str, args: dict, tool_result_max_bytes: int) -> tuple[dict, set, list, list]:
+    from . import store
+    args = args or {}
+    card = [_usage_tool_call_card(name, args)]
+    if name == "usage_overview":
+        days = _usage_days_arg(args)
+        if isinstance(days, dict):
+            return (days, set(), [], [])
+        result = _fit_usage_result(store.usage_overview(days), tool_result_max_bytes)
+        return (result, set(), [], card)
+    if name == "usage_by_user":
+        days = _usage_days_arg(args, default=7)
+        if isinstance(days, dict):
+            return (days, set(), [], [])
+        result = _fit_usage_result(
+            store.usage_by_user(days, uid=args.get("uid"), kind=args.get("kind")), tool_result_max_bytes)
+        return (result, set(), [], card)
+    if name == "usage_conversations":
+        days = _usage_days_arg(args)
+        if isinstance(days, dict):
+            return (days, set(), [], [])
+        sort = args.get("sort") or "tokens"
+        if sort not in _USAGE_SORT_VALUES:
+            return ({"error": f"sort は {'/'.join(_USAGE_SORT_VALUES)} のいずれかで指定してください"},
+                    set(), [], [])
+        result = _fit_usage_result(
+            store.usage_conversations(days, uid=args.get("uid"), limit=args.get("limit") or 20, sort=sort),
+            tool_result_max_bytes)
+        return (result, set(), [], card)
+    if name == "usage_conversation_detail":
+        result = _fit_usage_result(
+            store.usage_conversation_detail(args.get("conversation_id")), tool_result_max_bytes)
+        return (result, set(), [], card)
+    if name == "usage_response_time":
+        days = _usage_days_arg(args)
+        if isinstance(days, dict):
+            return (days, set(), [], [])
+        result = _fit_usage_result(
+            store.usage_response_time(days, provider=args.get("provider")), tool_result_max_bytes)
+        return (result, set(), [], card)
+    if name == "usage_daily":
+        days = _usage_days_arg(args)
+        if isinstance(days, dict):
+            return (days, set(), [], [])
+        metric = args.get("metric") or "turns"
+        if metric not in _USAGE_METRIC_VALUES:
+            return ({"error": f"metric は {'/'.join(_USAGE_METRIC_VALUES)} のいずれかで指定してください"},
+                    set(), [], [])
+        result = _fit_usage_result(store.usage_daily(days, metric=metric), tool_result_max_bytes)
+        return (result, set(), [], card)
+    # usage_stop_kinds
+    days = _usage_days_arg(args)
+    if isinstance(days, dict):
+        return (days, set(), [], [])
+    result = _fit_usage_result(store.usage_stop_kinds(days, uid=args.get("uid")), tool_result_max_bytes)
+    return (result, set(), [], card)
 
 
 # ---- 思考ノード（agents.py に依存しない＝循環回避）----

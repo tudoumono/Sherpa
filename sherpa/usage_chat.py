@@ -8,6 +8,13 @@
 改善ログ側は質問/一言コメントを👎が付いたものだけ先頭100字に切り詰めて含むことがある
 （`improvement_log.compact_summary` 参照・会話全文やタイトルを丸ごと渡すことはない）。
 
+docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 上記の一括コンテキストに加え、
+`graph_admin.ask_graph` と同じ調査ループ（`agentic_search.openai_style`）へ専用 toolset
+（`agentic_search.usage_openai_tools()`・7つの `usage_*` 関数）を渡し、渡した統計データだけでは
+答えられない切り口（任意の期間・特定利用者の用途別内訳・特定会話の内訳・回答時間の分布）を
+LLM 自身がツール呼び出しで取得できるようにする。実行したツール呼び出しは応答の `tool_calls`
+（名前と引数=数値/id のみ）に載る。
+
 プロバイダ選択（STAT-2）は利用者の実行構成（`agent`/`agent_constructs.effective_agent`）に
 一切依存しない専用の設定＝管理者全体で1つに統一した `system_settings["usage_chat_provider"]`
 （"openai"|"ollama"）。画面の「今回だけ」トグルによるリクエスト単位の一時上書き（保存しない）
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 _log = logging.getLogger("sherpa")
 
@@ -53,10 +61,17 @@ _SYSTEM_PROMPT = (
     "あなたは社内向け利用統計アシスタントです。渡されたデータ——利用統計（JSON。件数・日時・"
     "トークン量の集計のみで、会話本文やタイトルは一切含まれません）と改善ログの要約（JSON。"
     "フィードバック件数・タグ分布・stop_reason 分布・honest_failure 率・所要時間の分布のみで、"
-    "質問/一言コメントは👎が付いたものだけ先頭100字に切り詰めて含まれることがあります）——"
-    "だけを根拠に、日本語で回答してください（長さは絞らず、読み取れる事実は省略しない）。データから読み取れないことは推測せず、"
-    "わからない旨を答えてください。"
-    '回答は必ず次のJSON形式だけで返してください: {"answer": "回答本文（日本語の平文）"}'
+    "質問/一言コメントは👎が付いたものだけ先頭100字に切り詰めて含まれることがあります）を根拠に、"
+    "日本語で回答してください（長さは絞らず、読み取れる事実は省略しない）。"
+    "渡されたデータは直近の概要（既定90日分）です。指定した期間・特定の利用者の用途別内訳・"
+    "特定の会話の内訳・回答時間の分布など、渡されたデータだけでは答えられない切り口を聞かれたときは、"
+    "提供されたツール（usage_overview/usage_by_user/usage_conversations/"
+    "usage_conversation_detail/usage_response_time/usage_daily/usage_stop_kinds）を呼び出して"
+    "正確な数値を取得してから答えてください。数値を答えるときは憶測せず、渡されたデータかツールの"
+    "結果のどちらかから読み取れる値だけを使ってください。どちらからも読み取れないことは推測せず、"
+    "わからない旨を答えてください。会話の本文・タイトルはどちらの経路からも取得できません——"
+    "それに関する質問には答えられない旨を正直に伝えてください。"
+    "回答は平文（自然文）で返してください（JSON 等の構造化形式にはしないでください）。"
 )
 
 
@@ -334,7 +349,7 @@ def _fit_history_to_prompt_budget(question: str, history: list[dict], context_te
 
     質問自体・統計データ・改善ログ要約だけで既に上限を超えている場合（history を全て落としても
     収まらない）は、それ以上落とせる要素が無いためそのまま返す（この先の実送信の成否は
-    `_complete` 側の責務）。
+    `_consume_usage_chat_loop` 側の責務）。
     """
     hist = list(history)
     while True:
@@ -448,8 +463,9 @@ def _resolve_cfg(system_settings: dict | None, provider_override: str | None = N
     不正な接続先 URL）に加え、`resolve_api_key(..., strict=True)` で A7（`cloud_provider`）の
     不正値も honest failure にする——`strict=False` だと、`cloud_provider` が壊れた値でも
     黙って既定 "openai" のキー解決へ丸められてしまい、admin が実際に選んでいるプロバイダと
-    異なる中央キーで実送信しかねない。送信直前の再確認は `complete_json` 側の権威あるガードに
-    委ねる（`_complete` docstring 参照・分類には使わない）。中央キー・接続先のみを使う
+    異なる中央キーで実送信しかねない。送信直前の再確認は `llm.openai_url()`/`openai_headers()`/
+    `ollama_url()` 側の権威あるガードに委ねる（`_endpoint_for_cfg` docstring 参照・分類には
+    使わない）。中央キー・接続先のみを使う
     （利用者個人の保存キー/接続先は使わない＝`resolve_api_key`/`resolve_ollama_url` に
     `user_settings=None` を渡す）——A7 はそのまま効く点に注意: `usage_chat_provider=openai`
     でも `cloud_provider` が openai 以外なら `resolve_api_key("openai", ...)` は None を返す
@@ -537,29 +553,82 @@ def _resolve_cfg(system_settings: dict | None, provider_override: str | None = N
             "endpoint_kind": None}
 
 
-def _complete(system: str, user: str, cfg: dict) -> str:
-    """1回の補完（テストはこの関数を差し替える・`intent_llm._complete` と同じ seam）。
+def _endpoint_for_cfg(cfg: dict, system_settings: dict | None):
+    """`cfg`（`_resolve_cfg` の戻り値）から `agentic_search.openai_style` へ渡す
+    `(endpoint, headers, ollama)` を組み立てる。
 
-    `complete_json` へそのまま委譲する。実送信直前のガード確認（`llm.assert_openai_io_allowed`/
-    `assert_openai_base_url_allowed`/`assert_ollama_url_allowed`）は、この関数が独自に重複して
-    行うのではなく、`complete_json` 内部が実際に送信する直前（`llm.openai_url()`/
-    `openai_headers()`/`openai_post_json()`/`ollama_url()`）で権威的に行う。これらは拒否時に
-    `llm.PreflightRejected`（`RuntimeError`/`ValueError` 両方の派生）を送出するため、
-    `answer_usage_question` はこの型だけを「未送信」と判定できる（重複した自前チェックを
-    ここに置くと、権威側と型だけでの見分けが付かないタイミングのズレが生まれ、権威側
-    （`complete_json` 内部）が拒否した「本当の未送信」を送信済み扱いに誤分類しかねない）。
+    `llm.openai_url()`/`openai_headers()`/`ollama_url()` は呼び出し時点で権威あるガード
+    （`assert_openai_io_allowed`/`assert_openai_base_url_allowed`/`assert_ollama_url_allowed`）を
+    確認し、拒否時は `llm.PreflightRejected`（`RuntimeError`/`ValueError` 両方の派生）を送出する
+    （`_resolve_cfg` の早期チェックと同じ関数・以前の `complete_json` 内部の送信直前ガードと
+    同じ思想）。本関数自体（本関数の呼び出し）が投げる `PreflightRejected` は常に「未送信」——
+    ここから先のツール反復ループで、後続ターンの物理送信直前に同じ例外型が投げられた場合は、
+    `answer_usage_question` が `usage_acc["calls"]`（既に送信済みかどうか）で改めて判定する
+    （1ターン目より前＝`calls==0` のときだけ「未送信」・既に1回でも送信していれば「送信済み」）。
     """
-    from .ingest.graph_extract import complete_json
-    return complete_json(system, user, cfg, timeout=_ANSWER_TIMEOUT)
+    from . import llm
+    if cfg["provider"] == "openai":
+        override = cfg.get("openai_endpoint_override")
+        return (llm.openai_url("chat/completions", system_settings=override),
+                llm.openai_headers(cfg["key"], system_settings=override), False)
+    return (llm.ollama_url(cfg["url"].rstrip("/"), "/api/chat", system_settings=system_settings),
+            llm.JSON_HEADERS, True)
+
+
+def _consume_usage_chat_loop(cfg: dict, system_settings: dict | None, prompt: str, usage_acc: dict):
+    """`agentic_search.openai_style` のツール反復ループを1回走らせ、
+    `(answer, tool_calls, usage)` を返す。
+
+    `graph_admin.ask_graph` と同じ型——専用 toolset（`usage_openai_tools()`）だけを渡し、
+    `run_tool` の usage_* 分岐が `cards` サイドカーに積んだ `{"tool","args"}` を集めて
+    `tool_calls`（呼んだツール名と引数）に変換する（本文・タイトルを持たない・引用機構は使わない
+    ため `cites`/`docs` は無視する）。`ask_user` は toolset に含めない（`usage_openai_tools()` は
+    最初から ask_user を含まないため `can_ask` は実質無視される）。
+
+    `usage_acc`（呼び出し元が保持する `{"calls": int, "tokens": dict|None}`）をそのまま
+    `agentic_search.openai_style` へ転送する——ツール反復の後続ターンで物理送信直前に
+    `llm.PreflightRejected` が起きても、呼び出し元が `usage_acc["calls"]` を見て
+    「既に送信済みか」を判定できるようにする（`answer_usage_question` 参照）。
+
+    `endpoint`/`headers` の組み立て（`_endpoint_for_cfg`）は本関数の**外**（`_send` が呼ばれる
+    前）で行われる——ここで初めて `llm.PreflightRejected` が起こりうる（1ターン目より前＝
+    `usage_acc["calls"]` がまだ0の段階でしか発生しない）。
+    """
+    from . import agentic_search
+    endpoint, headers, ollama = _endpoint_for_cfg(cfg, system_settings)
+    events = agentic_search.openai_style(
+        endpoint, headers, cfg["model"], _SYSTEM_PROMPT, prompt,
+        _TOOL_WORLD, None, ollama=ollama, toolset=agentic_search.usage_openai_tools(),
+        can_ask=False, timeout=_ANSWER_TIMEOUT, usage_acc=usage_acc, system_settings=system_settings)
+    answer, tool_calls, usage = "", [], None
+    for ev in events:
+        if "final" in ev:
+            answer = (ev.get("final") or "").strip()
+            tool_calls = [{"name": c["tool"], "args": c.get("args") or {}}
+                         for c in (ev.get("cards") or []) if "tool" in c]
+            usage = ev.get("usage")
+    return answer, tool_calls, usage
+
+
+# `agentic_search.openai_style` の `world`/`scope_paths` 引数用のプレースホルダ。利用統計チャットの
+# 調査ツール（usage_* の7つ）はいずれも KB world・grep/ES/graph traversal を使わない（引用/カードは
+# 常に空のまま run_tool へ届く）ため、値そのものに意味は無い（`_commit_evidence` は空の `cites` に
+# 対しては世界名を一切参照しない）。
+_TOOL_WORLD = "__usage_chat__"
 
 
 def answer_usage_question(question: str, history: list[dict], *, system_settings: dict,
                           user_id: str | None = None, provider_override: str | None = None) -> dict:
     """検証済みの質問/履歴 →
-    `{"answer": str, "provider": "openai"|"ollama", "endpoint_kind": str | None, "notes": list[str]}`。
+    `{"answer": str, "provider": "openai"|"ollama", "endpoint_kind": str | None,
+    "notes": list[str], "tool_calls": list[{"name": str, "args": dict}]}`。
 
     `notes` は画面へそのまま見せる注記（改善ログの要約が取得できなかった場合の告知など・
-    通常は空リスト）。
+    通常は空リスト）。`tool_calls`は今回の質問応答で実際に呼んだ調査ツール
+    （`usage_overview`/`usage_by_user`/`usage_conversations`/`usage_conversation_detail`/
+    `usage_response_time`/`usage_daily`/`usage_stop_kinds`）の名前と引数（数値と id のみ・
+    本文/タイトルは含まない）。ツールを1回も呼ばずに（渡された統計データだけで）答えた場合は
+    空リスト。
 
     戻り値に実際に使った `provider`/`endpoint_kind`（`_resolve_cfg` の戻り値・openai 使用時
     のみ "openai"|"azure"|"custom"・ollama 使用時は `None`）を含める。呼び出し元（router）は
@@ -582,6 +651,13 @@ def answer_usage_question(question: str, history: list[dict], *, system_settings
     `provider_override`（省略可・STAT-2）は画面の「今回だけ」トグルの値（`validate_provider_override`
     で検証済み）で `_resolve_cfg` へそのまま渡す。利用者の実行構成（個人設定の `agent` 等）は
     引数として受け取らない＝渡しようがない設計にしてある。
+
+    実送信は `agentic_search.openai_style`（graph_admin と同じ調査ループ）に委譲する——
+    以前の「統計データを1回だけプロンプトに入れて JSON で答えさせる」一発回答から、
+    渡された統計データに加えて調査ツール（usage_* の7つ）を反復呼び出しできる形に変わった
+    （`docs/proposals/2026-09-12-利用統計の拡充2.md` §3b）。history の扱い・プロンプト予算調整
+    （`_fit_history_to_prompt_budget`）・統計データ/改善ログ要約の埋め込みは変えていない
+    （変わったのは「1回の完了で答えさせる」→「ツール反復ループで答えさせる」という送信方式のみ）。
     """
     from . import improvement_log, llm, metering, store
     cfg = _resolve_cfg(system_settings, provider_override)
@@ -608,29 +684,39 @@ def answer_usage_question(question: str, history: list[dict], *, system_settings
                                            improvement_context_text, improvement_truncated,
                                            improvement_log_failed)
 
-    metering.acc_begin()
     attempted = False
+    answer = ""
+    tool_calls: list[dict] = []
+    usage_for_metering = None
+    usage_acc = {"calls": 0, "tokens": None}   # `agentic_search.openai_style` が物理送信ごとに更新する
+    _t0 = time.monotonic()   # 1 回の質問応答の壁時計（ツール反復の全ターンを含む）＝elapsed_ms
     try:
         try:
-            raw = _complete(_SYSTEM_PROMPT, prompt, cfg)
+            answer, tool_calls, usage_for_metering = _consume_usage_chat_loop(
+                cfg, system_settings, prompt, usage_acc)
         except llm.PreflightRejected as e:
-            # `complete_json` 内部の権威あるガード（`llm.openai_url()`/`openai_headers()`/
-            # `openai_post_json()`/`ollama_url()`）が実送信前に拒否した場合だけこの型になる
-            # （モジュール docstring 参照・いずれも実際の urlopen より前に評価される）。実送信
-            # そのものへは一度も出ていないため、`attempted` は立てず（metering 対象外）、
-            # 502（送信を試みたが失敗）でなく 503（未接続）に分類する。`cfg` は既に確定して
-            # いる（＝送信先自体は決まった上での拒否）ため、実際の送信先を `_unavailable()` の
-            # `endpoint_kind` として引き継ぎ、呼び出し元（router）が応答/監査へ載せられるようにする。
-            # 例外を投げると `notes`/`improvement_log_failed` は戻り値として呼び出し元
-            # （router）へ届かない。改善ログの要約取得が既に失敗していた場合、それを監査
-            # detail からも失わせないよう例外自身に載せる（router 側は getattr で読む）。
+            if usage_acc["calls"] > 0:
+                # ツール反復ループの1ターン目より後（＝既に少なくとも1回は物理送信を試みた後）に
+                # 同じ権威あるガードが拒否した場合は「未送信」ではなく「送信済みだが途中で失敗」——
+                # 送信済み分の usage（`usage_acc["tokens"]`）を引き継いで再送出し、外側の
+                # `except Exception` に502（`LLMCallFailedError`・metering 計上あり）へ分類させる。
+                usage_for_metering = usage_acc["tokens"]
+                raise
+            # ここに来るのは1ターン目（＝一度も物理送信を試みていない）の拒否だけ。
+            # `_endpoint_for_cfg`（`llm.openai_url()`/`openai_headers()`/`ollama_url()`）が
+            # 実送信前に拒否した場合だけこの型になる（モジュール docstring 参照・いずれも実際の
+            # urlopen より前に評価される）。実送信そのものへは一度も出ていないため、`attempted` は
+            # 立てず（metering 対象外）、502（送信を試みたが失敗）でなく 503（未接続）に分類する。
+            # `cfg` は既に確定している（＝送信先自体は決まった上での拒否）ため、実際の送信先を
+            # `_unavailable()` の `endpoint_kind` として引き継ぎ、呼び出し元（router）が応答/監査へ
+            # 載せられるようにする。例外を投げると `notes`/`improvement_log_failed` は戻り値として
+            # 呼び出し元（router）へ届かない。改善ログの要約取得が既に失敗していた場合、それを
+            # 監査 detail からも失わせないよう例外自身に載せる（router 側は getattr で読む）。
             unavailable = _unavailable(cfg["provider"], str(e), endpoint_kind=cfg.get("endpoint_kind"))
             unavailable.improvement_log_failed = improvement_log_failed
             raise unavailable from e
         attempted = True   # ここに到達して初めて「実際に送信し応答を受け取った」とみなす
-        data = json.loads(raw)
-        answer = data.get("answer") if isinstance(data, dict) else None
-        if not isinstance(answer, str) or not answer.strip():
+        if not answer:
             raise ValueError("empty or malformed answer")
     except LLMUnavailableError:
         raise
@@ -645,10 +731,14 @@ def answer_usage_question(question: str, history: list[dict], *, system_settings
         call_failed.improvement_log_failed = improvement_log_failed   # 上のコメント参照
         raise call_failed from e
     finally:
-        tokens, n = metering.acc_end()
-        if n:
-            metering.record("usage_chat", cfg["provider"], cfg["model"], tokens, user_id=user_id, calls=n)
-        elif attempted:
-            metering.record("usage_chat", cfg["provider"], cfg["model"], None, user_id=user_id, calls=1)
-    return {"answer": answer.strip(), "provider": cfg["provider"], "endpoint_kind": cfg.get("endpoint_kind"),
-            "notes": notes}
+        # `agentic_search.openai_style` はツール反復の全ターン分の usage を合算した1つの辞書
+        # （無ければ None）を返す——`metering.acc_begin()/acc_end()`（旧・単発 `complete_json` 用の
+        # スコープ集計）はもう使わない。ターン数に関わらず1回の質問応答につき1行だけ記録し、
+        # 物理送信回数（`usage_acc["calls"]`）と所要時間を明示で渡す（渡さないと既定 calls=1・
+        # elapsed NULL になる＝用途別の回数/所要時間が実態とずれる）。
+        if attempted:
+            metering.record("usage_chat", cfg["provider"], cfg["model"], usage_for_metering,
+                            user_id=user_id, calls=max(int(usage_acc.get("calls") or 0), 1),
+                            elapsed_ms=round((time.monotonic() - _t0) * 1000))
+    return {"answer": answer, "provider": cfg["provider"], "endpoint_kind": cfg.get("endpoint_kind"),
+            "notes": notes, "tool_calls": tool_calls}

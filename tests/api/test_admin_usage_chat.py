@@ -29,8 +29,9 @@
 - 本文サイズ上限（1MiB）超過は 413（監査なし）。BOM 付き・UTF-8 として不正・深すぎるネスト
   （`RecursionError`）はいずれも固定文言の 400（監査あり・詳細は反射しない）
 
-LLM 呼び出しは `sherpa.usage_chat._complete`/`_resolve_cfg` をスタブし、実ネットワークへは出ない
-（`tests/unit/test_intent_llm.py`・`tests/unit/test_graph_admin.py` と同じ差し替え流儀）。
+LLM 呼び出しは `sherpa.agentic_search._post`（STAT-4 U4以降の実送信境界）/`usage_chat._resolve_cfg`
+をスタブし、実ネットワークへは出ない（`tests/unit/test_graph_admin.py`・
+`tests/unit/test_agentic_search.py` と同じ差し替え流儀）。
 
 要 Postgres。DB 不可は SKIP。
 """
@@ -58,10 +59,23 @@ def _mk_user(uid: str, password: str, role: str = "user") -> None:
     register_test_uid(uid)
 
 
+def _openai_final(text: str) -> dict:
+    """ツール呼び出し無しで完了する OpenAI chat.completions 風の応答（実送信が
+    `agentic_search.openai_style` 経由になったため、プロバイダ境界は `usage_chat._complete` では
+    なく `agentic_search._post` で差し替える・tests/unit/test_usage_chat.py と同じ流儀）。"""
+    return {"choices": [{"message": {"content": text}}]}
+
+
+def _install_fake_post(monkeypatch, responses: list) -> None:
+    seq = list(responses)
+    monkeypatch.setattr("sherpa.agentic_search._post",
+                        lambda url, headers, body, timeout=90: seq.pop(0))
+
+
 def _stub_ok(monkeypatch, answer: str = "テストの回答です") -> None:
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
-    monkeypatch.setattr(usage_chat, "_complete", lambda system, user, cfg: json.dumps({"answer": answer}))
+    _install_fake_post(monkeypatch, [_openai_final(answer)])
 
 
 def test_usage_chat_requires_admin_and_login():
@@ -95,7 +109,7 @@ def test_usage_chat_success_returns_answer_and_audits(monkeypatch):
     # 応答に実際に使った provider/接続先種別を含める（画面はこの確定値で「送信先」表示を
     # 更新する・_stub_ok の cfg は openai・endpoint_kind 省略＝None）。
     assert r.json() == {"answer": "今月は u1 が最多です", "provider_used": "openai", "endpoint_kind": None,
-                        "notes": []}   # 改善ログ要約の取得に失敗していなければ空
+                        "notes": [], "tool_calls": []}   # 改善ログ要約の取得に失敗していなければ空
 
     rows = store.list_audit(actor=admin_uid, action="admin.usage_chat_asked", limit=5)
     assert rows, "admin.usage_chat_asked was not recorded"
@@ -131,7 +145,7 @@ def test_usage_chat_improvement_log_failure_still_succeeds_with_notes(monkeypatc
 
 
 def test_usage_chat_llm_call_failure_after_improvement_log_failure_still_flags_audit(monkeypatch):
-    """改善ログの要約取得に失敗した直後に実送信（`_complete`）も失敗した場合（502）、
+    """改善ログの要約取得に失敗した直後に実送信も失敗した場合（502）、
     `answer_usage_question` は例外を投げて戻り値の notes が router に届かないが、
     監査 detail の improvement_log_failed は False へ落ちてはいけない（例外側に載せて運ぶ）。"""
     if not _try_init():
@@ -146,9 +160,9 @@ def test_usage_chat_llm_call_failure_after_improvement_log_failure_still_flags_a
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
 
-    def _boom(system, user, cfg):
+    def _boom(url, headers, body, timeout=90):
         raise TimeoutError("upstream timeout")
-    monkeypatch.setattr(usage_chat, "_complete", _boom)
+    monkeypatch.setattr("sherpa.agentic_search._post", _boom)
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 502, r.text
@@ -174,10 +188,10 @@ def test_usage_chat_carries_history_into_prompt(monkeypatch):
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
 
-    def _capture(system, user, cfg):
-        seen["user"] = user
-        return json.dumps({"answer": "続きの回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+    def _capture(url, headers, body, timeout=90):
+        seen["user"] = body["messages"][-1]["content"]
+        return _openai_final("続きの回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     r = admin.post("/admin/usage/chat", json={
         "question": "それを踏まえてどうすべき？",
@@ -215,14 +229,14 @@ def test_usage_chat_provider_override_reaches_resolve_cfg_via_router(monkeypatch
 
     seen = {}
 
-    def _capture(system, user, cfg):
-        seen["provider"] = cfg["provider"]
-        return json.dumps({"answer": "回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+    def _capture(url, headers, body, timeout=90):
+        seen["url"] = url   # ollama 経由なら "http://localhost:11434/api/chat"（openai なら別URL）
+        return _openai_final("回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     r = admin.post("/admin/usage/chat", json={"question": "質問", "provider": "ollama"})
     assert r.status_code == 200, r.text
-    assert seen["provider"] == "ollama"
+    assert seen["url"] == "http://localhost:11434/api/chat"
 
     rows = store.list_audit(actor=admin_uid, action="admin.usage_chat_asked", limit=5)
     assert rows and rows[0]["outcome"] == "success"
@@ -265,10 +279,10 @@ def test_usage_chat_provider_call_failure_returns_502_no_fallback(monkeypatch):
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test", "endpoint_kind": "custom"})
 
-    def _boom(system, user, cfg):
-        calls.append(cfg["provider"])
+    def _boom(url, headers, body, timeout=90):
+        calls.append("openai")   # このスタブは openai 経路でしか呼ばれない（cfg が openai 固定のため）
         raise TimeoutError("upstream timeout")
-    monkeypatch.setattr(usage_chat, "_complete", _boom)
+    monkeypatch.setattr("sherpa.agentic_search._post", _boom)
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 502, r.text
@@ -296,11 +310,12 @@ def test_usage_chat_response_reflects_azure_endpoint_kind(monkeypatch):
 
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "my-deployment", "endpoint_kind": "azure"})
-    monkeypatch.setattr(usage_chat, "_complete", lambda system, user, cfg: json.dumps({"answer": "回答"}))
+    _install_fake_post(monkeypatch, [_openai_final("回答")])
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 200, r.text
-    assert r.json() == {"answer": "回答", "provider_used": "openai", "endpoint_kind": "azure", "notes": []}
+    assert r.json() == {"answer": "回答", "provider_used": "openai", "endpoint_kind": "azure",
+                        "notes": [], "tool_calls": []}
 
     rows = store.list_audit(actor=admin_uid, action="admin.usage_chat_asked", limit=5)
     assert rows and rows[0]["outcome"] == "success"
@@ -308,11 +323,13 @@ def test_usage_chat_response_reflects_azure_endpoint_kind(monkeypatch):
 
 
 def test_usage_chat_late_guard_rejection_inside_complete_is_503_not_502(monkeypatch):
-    """`_resolve_cfg` の事前チェックを通過した後、実送信（`_complete`）自体が
-    `llm.PreflightRejected`（`complete_json` 内部の権威あるガードが実送信前に拒否したことを示す
-    共通の例外基底）を投げた場合も、502（送信を試みたが失敗）に誤分類せず 503（未接続）にする。
-    送信先（cfg）は既に確定しているため、応答/監査の provider_used にはその値が残る
-    （`endpoint_kind` は cfg に無いキーなので `None`）。"""
+    """`_resolve_cfg` の事前チェックを通過した後、実送信直前の接続先組み立て
+    （`_endpoint_for_cfg` 経由の `llm.ollama_url()`）自体が `llm.PreflightRejected`
+    （権威あるガードが実送信前に拒否したことを示す共通の例外基底）を投げた場合も、502（送信を
+    試みたが失敗）に誤分類せず 503（未接続）にする。送信先（cfg）は既に確定しているため、
+    応答/監査の provider_used にはその値が残る（`endpoint_kind` は cfg に無いキーなので `None`）。
+    `http://evil.example:1` は allowlist 外のため、実際に `assert_ollama_url_allowed` が
+    `SsrfBlocked` を送出する（monkeypatch 不要・`_post` が呼ばれないことも直接確認する）。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
@@ -320,14 +337,12 @@ def test_usage_chat_late_guard_rejection_inside_complete_is_503_not_502(monkeypa
     _mk_user(admin_uid, admin_pw, role="admin")
     admin = _login(admin_uid, admin_pw)
 
-    from sherpa import llm as _llm
-
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "ollama", "url": "http://evil.example:1", "model": "m"})
 
-    def _late_reject(system, user, cfg):
-        raise _llm.SsrfBlocked("許可されていない接続先です")
-    monkeypatch.setattr(usage_chat, "_complete", _late_reject)
+    def _must_not_post(*a, **kw):
+        raise AssertionError("PreflightRejected の前に実送信してしまった")
+    monkeypatch.setattr("sherpa.agentic_search._post", _must_not_post)
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 503, r.text
@@ -342,10 +357,10 @@ def test_usage_chat_late_guard_rejection_inside_complete_is_503_not_502(monkeypa
     assert rows[0]["detail"]["endpoint_kind"] is None
 
 
-def test_usage_chat_non_json_response_after_send_is_502_not_503(monkeypatch):
-    """`_complete` が実際に送信した後、応答本文が JSON として解析できない
-    （`JSONDecodeError` は `ValueError` 派生）場合は、実送信直前ガードの拒否（503・未計測）と
-    型だけで混同せず 502（送信を試みたが失敗・計測あり）にする。"""
+def test_usage_chat_empty_answer_after_send_is_502_not_503(monkeypatch):
+    """自然完了応答の本文が空/空白のみの場合（ツール反復ループへ移行し JSON 応答形式では
+    なくなったため、以前の「JSON として解析できない」ケースの新しい相当形）、実送信直前ガードの
+    拒否（503・未計測）と型だけで混同せず 502（送信を試みたが失敗・計測あり）にする。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
@@ -355,7 +370,7 @@ def test_usage_chat_non_json_response_after_send_is_502_not_503(monkeypatch):
 
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
-    monkeypatch.setattr(usage_chat, "_complete", lambda system, user, cfg: "not json at all")
+    _install_fake_post(monkeypatch, [_openai_final("   ")])
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 502, r.text
@@ -370,7 +385,7 @@ def test_usage_chat_non_json_response_after_send_is_502_not_503(monkeypatch):
 
 def test_usage_chat_openai_seed_blocked_returns_503_not_502_and_never_sends(monkeypatch):
     """OpenAI 接続先の起動時 env シードが未確定（`llm.assert_openai_io_allowed` が拒否）な場合、
-    `_complete`（実送信）まで到達させず 503（未接続）にする——502（送信を試みたが失敗）に誤分類
+    実送信まで到達させず 503（未接続）にする——502（送信を試みたが失敗）に誤分類
     しない・未送信の呼び出しを計測しない、の両方を確認する。送信先（openai）は既に確定した
     後の拒否のため、応答/監査の provider_used/endpoint_kind にはその値が残る。"""
     if not _try_init():
@@ -406,8 +421,8 @@ def test_usage_chat_openai_seed_blocked_returns_503_not_502_and_never_sends(monk
         monkeypatch.setattr("sherpa.llm.assert_openai_io_allowed", _blocked)
 
         def _must_not_call(*a, **kw):
-            raise AssertionError("送信前に弾かれるべきで _complete に到達してはいけない")
-        monkeypatch.setattr(usage_chat, "_complete", _must_not_call)
+            raise AssertionError("送信前に弾かれるべきで実送信（_post）に到達してはいけない")
+        monkeypatch.setattr("sherpa.agentic_search._post", _must_not_call)
 
         r = admin.post("/admin/usage/chat", json={"question": "質問"})
         assert r.status_code == 503, r.text
@@ -750,7 +765,7 @@ def test_usage_chat_success_writes_pending_row_before_send(monkeypatch):
 
 def test_usage_chat_pending_audit_write_failure_blocks_send(monkeypatch):
     """fail-closed（外部送信の監査もれ防止）: 実送信前の pending 監査行の書き込みに失敗したら、
-    実送信（`_resolve_cfg`/`_complete`）へは一切到達せず 500 を返す（未監査のまま統計データが
+    `_resolve_cfg`／実送信へは一切到達せず 500 を返す（未監査のまま統計データが
     外部 AI へ渡ることを防ぐ）。
 
     `store.audit` を無条件に失敗させる構成だと、万一 `_resolve_cfg` が誤って呼ばれてしまっても
@@ -791,8 +806,8 @@ def test_usage_chat_pending_audit_write_failure_blocks_send(monkeypatch):
 
 
 def test_usage_chat_pending_row_exists_at_complete_call_time(monkeypatch):
-    """fail-closed の順序性そのものを直接固定する: `_complete`（実送信）が実際に呼ばれる
-    **時点**で、pending 監査行が既に DB にコミット済みで見える（`_complete` 呼び出しの後で
+    """fail-closed の順序性そのものを直接固定する: 実送信（`agentic_search._post`）が実際に
+    呼ばれる**時点**で、pending 監査行が既に DB にコミット済みで見える（実送信呼び出しの後で
     ようやく pending 行が書かれる、といった順序の崩れが無いことの確認・両者とも成功する
     フローでも固定する）。"""
     if not _try_init():
@@ -807,24 +822,25 @@ def test_usage_chat_pending_row_exists_at_complete_call_time(monkeypatch):
 
     seen = {}
 
-    def _capture(system, user, cfg):
+    def _capture(url, headers, body, timeout=90):
         rows = store.list_audit(actor=admin_uid, action="admin.usage_chat_asked", limit=5)
         seen["pending_rows_at_complete_time"] = [row for row in rows if row["outcome"] == "pending"]
-        return json.dumps({"answer": "回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+        return _openai_final("回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 200, r.text
     assert seen.get("pending_rows_at_complete_time"), (
-        "_complete 実行時点で pending 行が DB に見えているべき")
+        "実送信時点で pending 行が DB に見えているべき")
 
 
 def test_usage_chat_offloads_blocking_work_off_the_event_loop_thread(monkeypatch):
-    """認証・監査・本処理（`_run_answer`／`_complete`）は `run_in_threadpool` により event loop の
+    """認証・監査・本処理（`_run_answer`／実送信）は `run_in_threadpool` により event loop の
     スレッドとは別スレッドで実行される（単一 worker 構成で、この呼び出し中に他の API/health が
     応答不能にならないための必須条件）ことを、実行スレッドの比較で直接固定する。認証
-    （`_current_user`）・監査（`store.audit`）・本処理（`_complete`）の3系統それぞれについて
-    固定する（`_run_answer` 一箇所だけでは、他の箇所が event loop 直実行に戻る回帰を検出できない）。"""
+    （`_current_user`）・監査（`store.audit`）・本処理（`agentic_search._post`）の3系統それぞれに
+    ついて固定する（`_run_answer` 一箇所だけでは、他の箇所が event loop 直実行に戻る回帰を
+    検出できない）。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
@@ -863,17 +879,17 @@ def test_usage_chat_offloads_blocking_work_off_the_event_loop_thread(monkeypatch
 
     worker_threads: set = set()
 
-    def _capture(system, user, cfg):
+    def _capture(url, headers, body, timeout=90):
         worker_threads.add(threading.get_ident())
-        return json.dumps({"answer": "回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+        return _openai_final("回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     r = admin.post("/admin/usage/chat", json={"question": "質問"})
     assert r.status_code == 200, r.text
     assert event_loop_thread.get("id") is not None, "_read_capped_json_body が呼ばれていない"
     assert authn_threads, "_current_user が呼ばれていない"
     assert audit_threads, "store.audit が呼ばれていない"
-    assert worker_threads, "_complete が呼ばれていない"
+    assert worker_threads, "実送信（_post）が呼ばれていない"
     assert event_loop_thread["id"] not in authn_threads, (
         "認証が event loop のスレッドで実行された＝run_in_threadpool を経由していない")
     assert event_loop_thread["id"] not in audit_threads, (
@@ -950,10 +966,10 @@ def test_usage_chat_overlong_history_item_is_truncated_not_rejected(monkeypatch)
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
 
-    def _capture(system, user, cfg):
-        seen["user"] = user
-        return json.dumps({"answer": "続きの回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+    def _capture(url, headers, body, timeout=90):
+        seen["user"] = body["messages"][-1]["content"]
+        return _openai_final("続きの回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     long_answer = "あ" * (usage_chat.HISTORY_ITEM_MAX_LEN + 500)
     r = admin.post("/admin/usage/chat", json={
@@ -987,8 +1003,8 @@ def test_usage_chat_consecutive_turns_with_long_answer_do_not_get_stuck(monkeypa
     long_answer = "とても長い回答です。" * 500   # HISTORY_ITEM_MAX_LEN（4000）を超える
     assert len(long_answer) > usage_chat.HISTORY_ITEM_MAX_LEN
     answers = iter([long_answer, "2ターン目の回答"])
-    monkeypatch.setattr(usage_chat, "_complete",
-                        lambda system, user, cfg: json.dumps({"answer": next(answers)}))
+    monkeypatch.setattr("sherpa.agentic_search._post",
+                        lambda url, headers, body, timeout=90: _openai_final(next(answers)))
 
     r1 = admin.post("/admin/usage/chat", json={"question": "1ターン目の質問"})
     assert r1.status_code == 200, r1.text
@@ -1018,8 +1034,7 @@ def test_usage_chat_client_truncated_history_is_flagged_in_audit(monkeypatch):
 
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
-    monkeypatch.setattr(usage_chat, "_complete",
-                        lambda system, user, cfg: json.dumps({"answer": "2ターン目の回答"}))
+    _install_fake_post(monkeypatch, [_openai_final("2ターン目の回答")])
 
     # web/usage.js::ucClip が実際に生成する形を模す（上限ちょうど・末尾に省略印）。
     client_clipped = ("あ" * (usage_chat.HISTORY_ITEM_MAX_LEN - len(usage_chat._TRUNCATION_SUFFIX))
@@ -1056,10 +1071,11 @@ def test_usage_chat_max_accumulated_history_and_large_context_still_succeeds(mon
     monkeypatch.setattr(usage_chat, "_compact_stats_context", lambda stats: ("x" * 40_000, False))
 
     seen = {}
-    def _capture(system, user, cfg):
-        seen["user"] = user
-        return json.dumps({"answer": "回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+
+    def _capture(url, headers, body, timeout=90):
+        seen["user"] = body["messages"][-1]["content"]
+        return _openai_final("回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     # 最大蓄積: HISTORY_MAX_ITEMS 件（10ターン）、各要素はほぼ上限（4000字）まで積む。
     history = []
@@ -1090,10 +1106,10 @@ def test_usage_chat_question_padding_bypass_is_trimmed_before_send(monkeypatch):
     monkeypatch.setattr(usage_chat, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
 
-    def _capture(system, user, cfg):
-        seen["user"] = user
-        return json.dumps({"answer": "回答"})
-    monkeypatch.setattr(usage_chat, "_complete", _capture)
+    def _capture(url, headers, body, timeout=90):
+        seen["user"] = body["messages"][-1]["content"]
+        return _openai_final("回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture)
 
     padded_question = (" " * 100_000) + "短い質問" + (" " * 100_000)
     r = admin.post("/admin/usage/chat", json={"question": padded_question})

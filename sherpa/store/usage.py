@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import math
 import statistics
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 from .. import stop_kind
 from .db import _connect, _ensure
@@ -782,3 +783,459 @@ def usage_stats(days: int = 30) -> dict:
         "response_time": response_time,
         "conversations_top": conversations_top,
     }
+
+
+# ===================================================================================
+# docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツールが
+# 使う、絞り込み付きの集計関数。不変条件は本モジュール冒頭と同じ（本文・会話タイトルは一切
+# SELECT しない）ことに加え、display_name も返さない（ツールの戻り値は件数・時刻・種別・トークン・
+# 所要時間・会話 id・uid・world のみという契約——`usage_stats()` 自体の戻り値は画面表示用のため
+# display_name を含めたまま変えない）。
+#
+# 引数の妥当性判定（不正な metric/sort・負の days 等を error 辞書にする）は呼び出し元
+# （`agentic_search.run_tool`）の責務——ここでは常に何かしらの値を返せるよう防御的にクランプする
+# （他の将来の呼び出し元にも安全な既定を提供する二重防御）。
+# ===================================================================================
+
+_TOOL_LIMIT_UPPER = 50   # 裁定（2026-09-12）: 返却上限は件数系の全ツールで50件。
+
+
+def _clamp_days(days) -> int:
+    """1〜365 日にクランプ（型不正・欠落は既定30日）。"""
+    try:
+        d = int(days)
+    except (TypeError, ValueError):
+        d = 30
+    return max(1, min(d, 365))
+
+
+def _clamp_limit(limit, default: int = 20, upper: int = _TOOL_LIMIT_UPPER) -> int:
+    """1〜upper 件にクランプ（型不正・欠落は既定 `default` 件）。"""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, upper))
+
+
+def _norm_str(value) -> str | None:
+    """絞り込み引数（uid/kind/provider）の正規化: 空文字/空白のみ/None は「絞り込みなし」。"""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _tool_json_projection(value):
+    """usage 系調査ツールの戻り値を JSON ネイティブ型だけに畳む射影（`json.dumps` に `default` を
+    渡さずに直列化できることを保証する）。dict は再帰しつつ `display_name` キーを落とし、list は
+    要素ごとに再帰、`datetime`/`date` は isoformat 文字列へ、`Decimal` は float へ変換し、それ以外は
+    そのまま返す。`usage_stats()` 自体（画面表示用）は display_name を含めたまま変えず、
+    ツール専用のこの射影に一本化する（`usage_overview` に限らず本モジュールの全ツール関数が使う）。
+    """
+    if isinstance(value, dict):
+        return {k: _tool_json_projection(v) for k, v in value.items() if k != "display_name"}
+    if isinstance(value, list):
+        return [_tool_json_projection(v) for v in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def usage_overview(days: int = 30) -> dict:
+    """`usage_stats(days)` の質問応答向け射影（`usage_chat._stats_projection` と概ね同じ形だが、
+    ツールの戻り値契約により display_name は含めない）。内訳リストは上位 `_TOOL_LIMIT_UPPER` 件。
+    """
+    days = _clamp_days(days)
+    stats = usage_stats(days)
+    tokens = stats.get("tokens") or {}
+    limit = _TOOL_LIMIT_UPPER
+    return _tool_json_projection({
+        "period": stats.get("period"), "totals": stats.get("totals"), "zero_hit": stats.get("zero_hit"),
+        "worlds": stats.get("worlds"), "providers": stats.get("providers"),
+        "retention": stats.get("retention"), "downloads": stats.get("downloads"),
+        "daily": stats.get("daily"), "stop_kinds": stats.get("stop_kinds"),
+        "stopped_turns": stats.get("stopped_turns"), "conversation_turns": stats.get("conversation_turns"),
+        "resume_rate": stats.get("resume_rate"), "response_time": stats.get("response_time"),
+        "users": (stats.get("users") or [])[:limit],
+        "tokens": {
+            "totals": tokens.get("totals"), "daily": tokens.get("daily"), "by_kind": tokens.get("by_kind"),
+            "by_model": (tokens.get("by_model") or [])[:limit],
+            "by_user": (tokens.get("by_user") or [])[:limit],
+            "by_user_kind": sorted(tokens.get("by_user_kind") or [],
+                                  key=lambda r: -((r.get("input") or 0) + (r.get("output") or 0)))[:limit],
+        },
+        "conversations_top": [
+            {"conversation_id": conv.get("conversation_id"), "uid": conv.get("uid"),
+             "world": conv.get("world"), "user_turns": conv.get("user_turns"),
+             "response_time_avg_ms": conv.get("response_time_avg_ms"),
+             "kinds": [{"kind": k.get("kind"), "calls": k.get("calls"),
+                       "input": k.get("input"), "output": k.get("output")}
+                      for k in (conv.get("kinds") or [])]}
+            for conv in (stats.get("conversations_top") or [])[:limit]
+        ],
+    })
+
+
+def usage_by_user(days: int = 7, uid: str | None = None, kind: str | None = None) -> dict:
+    """ユーザー別 × 用途別（kind）の calls/tokens/所要時間（期間・uid・kind 絞り込み付き）。
+    `tokens.by_user_kind`（U1）と同じ材料（chat は `messages.answer->'usage'`・他は
+    `usage_events`）を、期間・利用者・用途で絞り込んで返す。display_name は含めない。
+    """
+    _ensure()
+    days = _clamp_days(days)
+    uid = _norm_str(uid)
+    kind = _norm_str(kind)
+    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    rows: list[dict] = []
+    with _connect() as c:
+        if kind is None or kind == "chat":
+            chat_sql = (
+                _USAGE_TURN_CTE + " SELECT user_id AS uid, " + _usage_token_sum_cols() +
+                " FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s" + _USAGE_TOKEN_WHERE
+            )
+            chat_params = [start_ts, end_exclusive_ts, start_ts, end_exclusive_ts]
+            if uid:
+                chat_sql += " AND user_id = %s"
+                chat_params.append(uid)
+            chat_sql += " GROUP BY user_id"
+            for r in c.execute(chat_sql, chat_params).fetchall():
+                rows.append({"uid": r["uid"], "kind": "chat", "calls": r["turns"] or 0,
+                            "input": int(r["input"] or 0), "cached_input": int(r["cached_input"] or 0),
+                            "output": int(r["output"] or 0),
+                            "reasoning_output": int(r["reasoning_output"] or 0),
+                            "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0})
+        if kind != "chat":
+            ev_sql = (
+                "SELECT user_id AS uid, kind, SUM(calls) AS calls, "
+                "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+                "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
+                "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
+                "  COUNT(elapsed_ms) AS elapsed_n "
+                "FROM usage_events WHERE ts >= %s AND ts < %s AND user_id IS NOT NULL"
+            )
+            ev_params = [start_ts, end_exclusive_ts]
+            if uid:
+                ev_sql += " AND user_id = %s"
+                ev_params.append(uid)
+            if kind:
+                ev_sql += " AND kind = %s"
+                ev_params.append(kind)
+            ev_sql += " GROUP BY user_id, kind"
+            for r in c.execute(ev_sql, ev_params).fetchall():
+                rows.append({
+                    "uid": r["uid"], "kind": r["kind"], "calls": int(r["calls"] or 0),
+                    "input": int(r["input"]) if r["input"] is not None else None,
+                    "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+                    "output": int(r["output"]) if r["output"] is not None else None,
+                    "reasoning_output": (int(r["reasoning_output"]) if r["reasoning_output"] is not None
+                                        else None),
+                    "elapsed_ms_total": (int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None
+                                        else None),
+                    "elapsed_ms_avg": (float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None
+                                      else None),
+                    "elapsed_n": int(r["elapsed_n"] or 0),
+                })
+    # 利用量（input+output）の多い順＝予算内への先頭切り（agentic_search の間引き）で重い利用者が残る
+    rows.sort(key=lambda r: (-((r.get("input") or 0) + (r.get("output") or 0)), r["uid"] or "", r["kind"]))
+    return _tool_json_projection({
+        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "uid": uid, "kind": kind, "rows": rows})
+
+
+def usage_conversations(days: int = 30, uid: str | None = None, limit: int = 20,
+                        sort: str = "tokens") -> dict:
+    """会話別の上位表（`conversations_top`＝U2 と同じ材料）を期間・uid で絞り込み、
+    並び順（tokens/turns/elapsed）と件数上限を選べる形にしたもの。タイトル・本文は含めない。
+    """
+    _ensure()
+    days = _clamp_days(days)
+    limit = _clamp_limit(limit, default=20)
+    uid = _norm_str(uid)
+    sort = sort if sort in ("tokens", "turns", "elapsed") else "tokens"
+    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    with _connect() as c:
+        conv_sql = (
+            _USAGE_TURN_CTE + " "
+            "SELECT conversation_id AS cid, user_id AS uid, version AS world, "
+            "  COUNT(*) AS user_turns, "
+            "  COUNT(*) FILTER (WHERE jsonb_typeof(answer->'usage')='object') AS chat_calls, "
+            f"  SUM({_usage_tok('input_tokens')}) AS chat_input, "
+            f"  SUM({_usage_tok('cached_input_tokens')}) AS chat_cached_input, "
+            f"  SUM({_usage_tok('output_tokens')}) AS chat_output, "
+            f"  SUM({_usage_tok('reasoning_output_tokens')}) AS chat_reasoning_output, "
+            "  AVG(CASE WHEN lens IS DISTINCT FROM 'clarify' AND answer->>'duration_ms' ~ '^[0-9]+$' "
+            "    THEN (answer->>'duration_ms')::bigint END) AS avg_response_time_ms "
+            "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s"
+        )
+        conv_params = [start_ts, end_exclusive_ts, start_ts, end_exclusive_ts]
+        if uid:
+            conv_sql += " AND user_id = %s"
+            conv_params.append(uid)
+        conv_sql += " GROUP BY conversation_id, user_id, version"
+        conv_turn_rows = c.execute(conv_sql, conv_params).fetchall()
+        _cids = [r["cid"] for r in conv_turn_rows]
+        conv_kind_rows = (
+            c.execute(
+                "SELECT conversation_id AS cid, kind, SUM(calls) AS calls, "
+                "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+                "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
+                "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
+                "  COUNT(elapsed_ms) AS elapsed_n "
+                "FROM usage_events WHERE ts >= %s AND ts < %s AND conversation_id = ANY(%s) "
+                "GROUP BY conversation_id, kind",
+                (start_ts, end_exclusive_ts, _cids),
+            ).fetchall()
+            if _cids else []
+        )
+    conv_map: dict[int, dict] = {}
+    sort_key: dict[int, dict] = {}
+    for r in conv_turn_rows:
+        cid = r["cid"]
+        chat_input = int(r["chat_input"] or 0)
+        chat_output = int(r["chat_output"] or 0)
+        kinds: list[dict] = []
+        if (r["chat_calls"] or 0) > 0:
+            kinds.append({"kind": "chat", "calls": int(r["chat_calls"] or 0), "input": chat_input,
+                         "cached_input": int(r["chat_cached_input"] or 0), "output": chat_output,
+                         "reasoning_output": int(r["chat_reasoning_output"] or 0),
+                         "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0})
+        conv_map[cid] = {
+            "conversation_id": cid, "uid": r["uid"], "world": r["world"],
+            "user_turns": r["user_turns"] or 0, "kinds": kinds,
+            "response_time_avg_ms": (float(r["avg_response_time_ms"])
+                                    if r["avg_response_time_ms"] is not None else None),
+        }
+        sort_key[cid] = {"tokens": chat_input + chat_output, "turns": r["user_turns"] or 0, "elapsed": 0}
+    for r in conv_kind_rows:
+        entry = conv_map.get(r["cid"])
+        if entry is None:
+            continue   # conv_sql に無い会話 id（安全側・ANY(%s) 済みで実際には起こらない）
+        entry["kinds"].append({
+            "kind": r["kind"], "calls": int(r["calls"] or 0),
+            "input": int(r["input"]) if r["input"] is not None else None,
+            "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+            "output": int(r["output"]) if r["output"] is not None else None,
+            "reasoning_output": int(r["reasoning_output"]) if r["reasoning_output"] is not None else None,
+            "elapsed_ms_total": int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None else None,
+            "elapsed_ms_avg": float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None else None,
+            "elapsed_n": int(r["elapsed_n"] or 0),
+        })
+        sk = sort_key[r["cid"]]
+        sk["tokens"] += (r["input"] or 0) + (r["output"] or 0)
+        sk["elapsed"] += int(r["elapsed_ms_total"] or 0)
+    for entry in conv_map.values():
+        entry["kinds"].sort(key=lambda k: k["kind"])
+    ordered = sorted(conv_map.values(),
+                     key=lambda e: (-sort_key[e["conversation_id"]][sort], e["conversation_id"]))[:limit]
+    return _tool_json_projection({
+        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "uid": uid, "sort": sort, "conversations": ordered})
+
+
+# 会話1件の内訳（`usage_conversation_detail`）専用の turn 対応付け CTE。`_USAGE_TURN_CTE` と同じ
+# 「各 user ターンの直後に来る最初の assistant 応答」だけをペアリングする規則だが、1会話に scope する
+# ため「期間内に触れた会話」への絞り込み（`touched`）は不要。
+_CONV_DETAIL_TURN_CTE = (
+    "WITH numbered AS ("
+    "  SELECT m.id, m.role, m.lens, m.answer, "
+    "    SUM(CASE WHEN m.role='user' THEN 1 ELSE 0 END) "
+    "      OVER (ORDER BY m.id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS turn_no "
+    "  FROM messages m WHERE m.conversation_id = %s"
+    "), assistant_replies AS ("
+    "  SELECT DISTINCT ON (turn_no) turn_no, lens, answer "
+    "  FROM numbered WHERE role='assistant' AND turn_no > 0 "
+    "  ORDER BY turn_no, id"
+    "), turns AS ("
+    "  SELECT n.turn_no, ar.lens, ar.answer "
+    "  FROM numbered n LEFT JOIN assistant_replies ar ON ar.turn_no = n.turn_no "
+    "  WHERE n.role='user'"
+    ")"
+)
+
+
+def usage_conversation_detail(conversation_id) -> dict:
+    """1会話の内訳: user ターン数・用途別（kind）の calls/tokens・回答時間の系列（ターン番号・
+    duration_ms・provider のみ）。本文・タイトルは一切含めない。存在しない/対象外（削除済み・
+    共有受領）の会話 id は本文/タイトルのキーを一切持たない error 辞書を返す。
+    """
+    _ensure()
+    try:
+        cid = int(conversation_id)
+    except (TypeError, ValueError):
+        return {"error": "conversation_id は整数で指定してください"}
+    with _connect() as c:
+        conv_row = c.execute(
+            "SELECT id FROM conversations WHERE id = %s AND deleted_at IS NULL AND origin='own'",
+            (cid,),
+        ).fetchone()
+        if not conv_row:
+            return {"error": "指定した会話が見つかりません"}
+        summary_row = c.execute(
+            _CONV_DETAIL_TURN_CTE + " "
+            "SELECT COUNT(*) AS user_turns, "
+            "  COUNT(*) FILTER (WHERE jsonb_typeof(answer->'usage')='object') AS chat_calls, "
+            f"  SUM({_usage_tok('input_tokens')}) AS chat_input, "
+            f"  SUM({_usage_tok('cached_input_tokens')}) AS chat_cached_input, "
+            f"  SUM({_usage_tok('output_tokens')}) AS chat_output, "
+            f"  SUM({_usage_tok('reasoning_output_tokens')}) AS chat_reasoning_output "
+            "FROM turns",
+            (cid,),
+        ).fetchone()
+        response_rows = c.execute(
+            _CONV_DETAIL_TURN_CTE + " "
+            "SELECT turn_no, (answer->>'duration_ms')::bigint AS duration_ms, "
+            "  answer->'usage'->>'provider' AS provider "
+            "FROM turns WHERE lens IS DISTINCT FROM 'clarify' "
+            "  AND answer->>'duration_ms' ~ '^[0-9]+$' ORDER BY turn_no",
+            (cid,),
+        ).fetchall()
+        kind_rows = c.execute(
+            "SELECT kind, SUM(calls) AS calls, SUM(input_tokens) AS input, "
+            "  SUM(cached_input_tokens) AS cached_input, SUM(output_tokens) AS output, "
+            "  SUM(reasoning_output_tokens) AS reasoning_output, SUM(elapsed_ms) AS elapsed_ms_total, "
+            "  AVG(elapsed_ms) AS elapsed_ms_avg, COUNT(elapsed_ms) AS elapsed_n "
+            "FROM usage_events WHERE conversation_id = %s GROUP BY kind ORDER BY kind",
+            (cid,),
+        ).fetchall()
+    kinds: list[dict] = []
+    chat_calls = summary_row["chat_calls"] or 0
+    if chat_calls > 0:
+        kinds.append({"kind": "chat", "calls": int(chat_calls),
+                      "input": int(summary_row["chat_input"] or 0),
+                      "cached_input": int(summary_row["chat_cached_input"] or 0),
+                      "output": int(summary_row["chat_output"] or 0),
+                      "reasoning_output": int(summary_row["chat_reasoning_output"] or 0),
+                      "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0})
+    for r in kind_rows:
+        kinds.append({
+            "kind": r["kind"], "calls": int(r["calls"] or 0),
+            "input": int(r["input"]) if r["input"] is not None else None,
+            "cached_input": int(r["cached_input"]) if r["cached_input"] is not None else None,
+            "output": int(r["output"]) if r["output"] is not None else None,
+            "reasoning_output": int(r["reasoning_output"]) if r["reasoning_output"] is not None else None,
+            "elapsed_ms_total": int(r["elapsed_ms_total"]) if r["elapsed_ms_total"] is not None else None,
+            "elapsed_ms_avg": float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None else None,
+            "elapsed_n": int(r["elapsed_n"] or 0),
+        })
+    response_time_series = [{"turn": r["turn_no"], "duration_ms": int(r["duration_ms"]),
+                             "provider": r["provider"] or "unknown"} for r in response_rows]
+    return _tool_json_projection({"conversation_id": cid, "user_turns": summary_row["user_turns"] or 0,
+                                  "kinds": kinds, "response_time_series": response_time_series})
+
+
+def usage_response_time(days: int = 30, provider: str | None = None) -> dict:
+    """回答時間（duration_ms）の分布（全体、または指定 provider に絞った avg/median/p90/max・件数）。
+    期間・provider 絞り込み付き（`response_time`＝U1 と同じ材料）。
+    """
+    _ensure()
+    days = _clamp_days(days)
+    provider = _norm_str(provider)
+    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    with _connect() as c:
+        sql = (
+            "SELECT (answer->>'duration_ms')::bigint AS duration_ms "
+            "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+            "WHERE m.created_at >= %s AND m.created_at < %s AND m.role='assistant' "
+            "  AND c.deleted_at IS NULL AND c.origin='own' "
+            "  AND m.lens IS DISTINCT FROM 'clarify' "
+            "  AND answer->>'duration_ms' ~ '^[0-9]+$'"
+        )
+        params = [start_ts, end_exclusive_ts]
+        if provider:
+            sql += " AND coalesce(answer->'usage'->>'provider', 'unknown') = %s"
+            params.append(provider)
+        rows = c.execute(sql, params).fetchall()
+    durations = [int(r["duration_ms"]) for r in rows]
+    stats = _compute_response_time_stats(durations)
+    stats["provider"] = provider
+    return _tool_json_projection(
+        {"period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days}, **stats})
+
+
+def usage_daily(days: int = 30, metric: str = "turns") -> dict:
+    """日別の系列（turns/tokens/response_time のいずれか）。"""
+    _ensure()
+    days = _clamp_days(days)
+    metric = metric if metric in ("turns", "tokens", "response_time") else "turns"
+    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    with _connect() as c:
+        if metric == "turns":
+            rows = c.execute(
+                "SELECT (m.created_at AT TIME ZONE 'Asia/Tokyo')::date AS date, COUNT(*) AS n "
+                "FROM messages m JOIN conversations c ON c.id=m.conversation_id "
+                "WHERE m.created_at >= %s AND m.created_at < %s AND c.deleted_at IS NULL "
+                "  AND m.role='user' AND c.origin='own' "
+                "GROUP BY date ORDER BY date",
+                (start_ts, end_exclusive_ts),
+            ).fetchall()
+            series = [{"date": str(r["date"]), "value": r["n"] or 0} for r in rows]
+        elif metric == "tokens":
+            rows = c.execute(
+                _USAGE_TURN_CTE + " "
+                "SELECT (turn_created_at AT TIME ZONE 'Asia/Tokyo')::date AS date, "
+                f"SUM({_usage_tok('input_tokens')}) AS input, SUM({_usage_tok('output_tokens')}) AS output "
+                "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s" + _USAGE_TOKEN_WHERE +
+                "GROUP BY date ORDER BY date",
+                (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+            ).fetchall()
+            series = [{"date": str(r["date"]), "input": int(r["input"] or 0), "output": int(r["output"] or 0)}
+                     for r in rows]
+        else:   # response_time
+            rows = c.execute(
+                "SELECT (m.created_at AT TIME ZONE 'Asia/Tokyo')::date AS date, "
+                "  AVG((answer->>'duration_ms')::bigint) AS avg_ms, COUNT(*) AS n "
+                "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+                "WHERE m.created_at >= %s AND m.created_at < %s AND m.role='assistant' "
+                "  AND c.deleted_at IS NULL AND c.origin='own' "
+                "  AND m.lens IS DISTINCT FROM 'clarify' AND answer->>'duration_ms' ~ '^[0-9]+$' "
+                "GROUP BY date ORDER BY date",
+                (start_ts, end_exclusive_ts),
+            ).fetchall()
+            series = [{"date": str(r["date"]),
+                      "avg_ms": float(r["avg_ms"]) if r["avg_ms"] is not None else None,
+                      "n": r["n"] or 0} for r in rows]
+    return _tool_json_projection({
+        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "metric": metric, "series": series})
+
+
+def usage_stop_kinds(days: int = 30, uid: str | None = None) -> dict:
+    """終了理由の分布＋利用者停止件数（期間・uid 絞り込み付き・`stop_kinds`＝U1 と同じ材料）。"""
+    _ensure()
+    days = _clamp_days(days)
+    uid = _norm_str(uid)
+    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    with _connect() as c:
+        sql = (
+            _USAGE_TURN_CTE + " "
+            "SELECT CASE WHEN answer->>'stop_kind' = ANY(%s) THEN answer->>'stop_kind' "
+            "  ELSE 'unknown' END AS stop_kind, COUNT(*) AS n "
+            "FROM turns "
+            "WHERE turn_created_at >= %s AND turn_created_at < %s "
+            "  AND answer IS NOT NULL AND lens IS DISTINCT FROM 'clarify'"
+        )
+        params = [start_ts, end_exclusive_ts, list(stop_kind.STOP_KINDS), start_ts, end_exclusive_ts]
+        if uid:
+            sql += " AND user_id = %s"
+            params.append(uid)
+        sql += " GROUP BY stop_kind ORDER BY n DESC"
+        rows = c.execute(sql, params).fetchall()
+        stopped_sql = (
+            "SELECT COUNT(*) AS n FROM audit_log a "
+            "JOIN conversations c ON a.resource_id = 'conv:' || c.id::text "
+            "WHERE a.created_at >= %s AND a.created_at < %s AND a.action='chat.turn' "
+            "  AND a.detail->>'stopped' = 'true' "
+            "  AND c.deleted_at IS NULL AND c.origin='own'"
+        )
+        stopped_params = [start_ts, end_exclusive_ts]
+        if uid:
+            stopped_sql += " AND c.user_id = %s"
+            stopped_params.append(uid)
+        stopped_row = c.execute(stopped_sql, stopped_params).fetchone()
+    return _tool_json_projection({
+        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "uid": uid, "stop_kinds": [{"stop_kind": r["stop_kind"], "turns": r["n"] or 0} for r in rows],
+        "stopped_turns": (stopped_row["n"] or 0) if stopped_row else 0})

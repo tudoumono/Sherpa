@@ -204,6 +204,30 @@ def test_usage_chat_shows_server_notes_as_hints(page, web_base_url):
     expect(messages.locator(".uc-hint")).to_contain_text("改善ログの要約を取得できませんでした。")
 
 
+def test_usage_chat_shows_tool_calls_as_hints(page, web_base_url):
+    """サーバ応答の `tool_calls`（実際に呼んだ調査ツールの名前と引数）は、
+    既存の notes と同じ「調べた内容」ヒント欄に1行ずつ表示する。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html")
+
+    def handle_usage_chat(route):
+        route.fulfill(content_type="application/json", body=json.dumps({
+            "answer": "先週は sato さんが一番多く使っています。",
+            "notes": [],
+            "tool_calls": [{"name": "usage_by_user", "args": {"days": 7, "uid": "sato"}}],
+        }))
+    page.route("**/admin/usage/chat", handle_usage_chat)
+
+    page.locator("#usage-chat-input").fill("先週は誰が一番使った？")
+    page.locator("#usage-chat-send").click()
+
+    messages = page.locator("#usage-chat-messages")
+    expect(messages).to_contain_text("先週は sato さんが一番多く使っています。")
+    expect(messages.locator(".uc-hint")).to_contain_text("調べた内容: usage_by_user(days=7, uid=sato)")
+
+
 def test_token_kind_table_renders(page, web_base_url):
     """S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 「用途別」表に日本語 kind ラベルと、
     usage を報告しないプロバイダ（Gemini の embed）の null トークンに対する「—」表示を確認する。"""
@@ -257,18 +281,20 @@ def test_usage_period_switch_refetches_and_rerenders_trends(page, web_base_url):
 # 方を先にマッチさせるため、install_api_mocks より後に登録すれば共通ハンドラを迂回できる）。
 
 def _handle_usage_chat(sent_bodies, answer="テストの回答です", default_provider_used="openai",
-                       endpoint_kind=None):
-    """応答は実サーバと同じ形（`answer`/`provider_used`/`endpoint_kind`）。
+                       endpoint_kind=None, tool_calls=None):
+    """応答は実サーバと同じ形（`answer`/`provider_used`/`endpoint_kind`/`tool_calls`）。
     `provider_used` はリクエストの `provider`（一時上書き）があればそれを、無ければ
     `default_provider_used`（既定・実サーバの `usage_chat.effective` に相当）を返す——
-    実サーバの「実際に使った provider を返す」契約を素直に模す。"""
+    実サーバの「実際に使った provider を返す」契約を素直に模す。`tool_calls`（
+    省略時は空リスト）は実際に呼んだ調査ツールの名前と引数。"""
     def _handle(route):
         body = json.loads(route.request.post_data or "{}")
         sent_bodies.append(body)
         provider_used = body.get("provider") or default_provider_used
         route.fulfill(status=200, content_type="application/json",
                       body=json.dumps({"answer": answer, "provider_used": provider_used,
-                                       "endpoint_kind": endpoint_kind}))
+                                       "endpoint_kind": endpoint_kind,
+                                       "tool_calls": tool_calls or []}))
     return _handle
 
 

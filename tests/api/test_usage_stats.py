@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 import psycopg
@@ -1772,3 +1773,251 @@ def test_usage_stats_response_time_excludes_clarify_cards():
         row["max"] != 50 for row in body["response_time"]["by_provider"] if row["provider"] == "unknown")
     rows = [c for c in body["conversations_top"] if c["conversation_id"] == conv["id"]]
     assert rows and rows[0]["response_time_avg_ms"] == 4000.0
+
+
+# ===================================================================================
+# docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツールが
+# 使う絞り込み付き集計関数（`sherpa/store/usage.py`）。エンドポイントを持たないため
+# `store.usage_*` を直接呼ぶ（本節のみ HTTP を経由しない）。
+# ===================================================================================
+
+def test_usage_by_user_filters_uid_and_clamps_days_above_365():
+    """`usage_by_user(days=7, uid=X)` は X の行だけを返し、days=400 は365にクランプされる。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid_a, uid_b = f"u4bua{sfx}", f"u4bub{sfx}"
+    _mk_user(uid_a, f"U4buaPw{sfx}")
+    _mk_user(uid_b, f"U4bubPw{sfx}")
+    world = f"u4buworld{sfx}"
+    m_a = f"test-model-u4bu-a-{sfx}"
+    m_b = f"test-model-u4bu-b-{sfx}"
+    try:
+        store.add_usage_event(kind="intent", provider="openai", model=m_a, input_tokens=10,
+                              output_tokens=5, calls=1, user_id=uid_a, world=world)
+        store.add_usage_event(kind="intent", provider="openai", model=m_b, input_tokens=20,
+                              output_tokens=6, calls=1, user_id=uid_b, world=world)
+
+        out = store.usage_by_user(days=400, uid=uid_a)
+        assert out["period"]["days"] == 365, "days=400 は365へクランプされるはず"
+        assert out["uid"] == uid_a
+        uids_seen = {r["uid"] for r in out["rows"]}
+        assert uids_seen == {uid_a}, "uid で絞り込んだのに他ユーザーの行が混入した"
+        assert all("display_name" not in r for r in out["rows"]), "ツールの戻り値に display_name を含めない"
+        row = next(r for r in out["rows"] if r["kind"] == "intent")
+        assert row["calls"] == 1 and row["input"] == 10
+    finally:
+        _delete_usage_events_by_model([m_a, m_b])
+
+
+def test_usage_by_user_filters_kind():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4bk{sfx}"
+    _mk_user(uid, f"U4bkPw{sfx}")
+    world = f"u4bkworld{sfx}"
+    m_intent = f"test-model-u4bk-intent-{sfx}"
+    m_embed = f"test-model-u4bk-embed-{sfx}"
+    try:
+        store.add_usage_event(kind="intent", provider="openai", model=m_intent, input_tokens=1,
+                              calls=1, user_id=uid, world=world)
+        store.add_usage_event(kind="embed", provider="openai", model=m_embed, input_tokens=2,
+                              calls=1, user_id=uid, world=world)
+        out = store.usage_by_user(days=30, uid=uid, kind="embed")
+        assert out["kind"] == "embed"
+        assert {r["kind"] for r in out["rows"]} == {"embed"}
+    finally:
+        _delete_usage_events_by_model([m_intent, m_embed])
+
+
+def test_usage_conversations_limit_clamps_to_50():
+    """`usage_conversations(limit=100)` は50件に丸まる（`conversations_top` の上位20件打ち切り
+    テストと同じ手法＝unique な model 名 55件をトークン量で単調増加させ、返るのが上位50件だけで
+    あることを固定する）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4cvl{sfx}"
+    _mk_user(uid, f"U4cvlPw{sfx}")
+    world = f"u4cvlworld{sfx}"
+    n = 55
+    models: list[str] = []
+    conv_ids_asc: list[int] = []
+    try:
+        for i in range(n):
+            conv = store.create_conversation(user_id=uid, world=world)
+            _turn(conv["id"], f"質問{i}", lens="chat")
+            model = f"test-model-u4cvl-{i}-{sfx}"
+            models.append(model)
+            store.add_usage_event(kind="chat-sub", provider="openai", model=model,
+                                  input_tokens=10**12 + i * 10**9, output_tokens=0, calls=1,
+                                  user_id=uid, world=world, conversation_id=conv["id"])
+            conv_ids_asc.append(conv["id"])
+        expected_top50 = list(reversed(conv_ids_asc))[:50]
+
+        out = store.usage_conversations(days=30, uid=uid, limit=100)
+        assert len(out["conversations"]) == 50, "limit=100 は50件に丸まるはず"
+        returned_cids = [c["conversation_id"] for c in out["conversations"]]
+        assert returned_cids == expected_top50
+    finally:
+        _delete_usage_events_by_model(models)
+
+
+def test_usage_conversations_uid_filters_own_conversations_only():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid_a, uid_b = f"u4cva{sfx}", f"u4cvb{sfx}"
+    _mk_user(uid_a, f"U4cvaPw{sfx}")
+    _mk_user(uid_b, f"U4cvbPw{sfx}")
+    world = f"u4cvworld{sfx}"
+    conv_a = store.create_conversation(user_id=uid_a, world=world)
+    _turn(conv_a["id"], "Aの質問", lens="chat")
+    conv_b = store.create_conversation(user_id=uid_b, world=world)
+    _turn(conv_b["id"], "Bの質問", lens="chat")
+
+    out = store.usage_conversations(days=30, uid=uid_a)
+    cids = {c["conversation_id"] for c in out["conversations"]}
+    assert conv_a["id"] in cids
+    assert conv_b["id"] not in cids
+
+
+def test_usage_conversation_detail_missing_id_returns_error_without_body_or_title_keys():
+    """存在しない会話 id は本文/タイトルのキーを一切持たない error 辞書を返す。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    out = store.usage_conversation_detail(999_999_999)
+    assert out == {"error": "指定した会話が見つかりません"}
+    assert "answer" not in out and "title" not in out and "content" not in out
+
+
+def test_usage_conversation_detail_non_integer_id_returns_error():
+    if not _try_init():
+        pytest.skip("DB down")
+    out = store.usage_conversation_detail("not-an-int")
+    assert out == {"error": "conversation_id は整数で指定してください"}
+
+
+def test_usage_conversation_detail_returns_turns_kinds_and_response_time_series():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4cd{sfx}"
+    _mk_user(uid, f"U4cdPw{sfx}")
+    world = f"u4cdworld{sfx}"
+    m = f"test-model-u4cd-{sfx}"
+    conv = store.create_conversation(user_id=uid, world=world)
+    store.add_message(conv["id"], "user", "質問1")
+    store.add_message(conv["id"], "assistant", "回答1", lens="chat",
+                      answer={"usage": {"provider": "openai"}, "duration_ms": 1500})
+    try:
+        store.add_usage_event(kind="intent", provider="openai", model=m, input_tokens=7,
+                              calls=1, user_id=uid, world=world, conversation_id=conv["id"])
+        out = store.usage_conversation_detail(conv["id"])
+        assert out["conversation_id"] == conv["id"]
+        assert out["user_turns"] == 1
+        kinds = {k["kind"] for k in out["kinds"]}
+        assert kinds == {"chat", "intent"}
+        assert out["response_time_series"] == [{"turn": 1, "duration_ms": 1500, "provider": "openai"}]
+        assert "answer" not in out and "title" not in out
+    finally:
+        _delete_usage_events_by_model([m])
+
+
+def test_usage_overview_excludes_display_name():
+    """`usage_overview` は `usage_stats()` と同じ材料の射影だが display_name は含めない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4ov{sfx}"
+    _mk_user(uid, f"U4ovPw{sfx}")
+    world = f"u4ovworld{sfx}"
+    conv = store.create_conversation(user_id=uid, world=world)
+    _turn(conv["id"], "質問1", lens="chat")
+    out = store.usage_overview(days=30)
+    assert out["period"]["days"] == 30
+    assert all("display_name" not in r for r in out["users"])
+    assert all("display_name" not in r for r in out["tokens"]["by_user"])
+    assert all("display_name" not in r for r in out["tokens"]["by_user_kind"])
+    assert all("display_name" not in c for c in out["conversations_top"])
+
+
+def test_usage_overview_users_last_active_is_json_native_and_serializable():
+    """RV是正 #12: `users[].last_active` は DB の `datetime` のまま返さず、`json.dumps`
+    （`default` なし）で直列化できる JSON ネイティブ型（isoformat 文字列）にする——直列化に失敗すると
+    ツール結果の予算判定（`agentic_search._result_byte_size`）が「測定不能＝特大」扱いになり、
+    利用統計チャットが空回答/502 になっていた（`docs/rv/2026-09-12-利用統計の拡充2.md` U4 #12）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4json{sfx}"
+    _mk_user(uid, f"U4jsonPw{sfx}")
+    world = f"u4jsonworld{sfx}"
+    conv = store.create_conversation(user_id=uid, world=world)
+    _turn(conv["id"], "質問1", lens="chat")
+    out = store.usage_overview(days=30)
+    assert any(u["uid"] == uid for u in out["users"])
+    text = json.dumps(out, ensure_ascii=False)   # default= を渡さない＝ネイティブ型のみで通ること
+    assert json.loads(text) == out
+    target = next(u for u in out["users"] if u["uid"] == uid)
+    assert isinstance(target["last_active"], str)
+
+
+def test_usage_response_time_filters_by_provider():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4rt{sfx}"
+    _mk_user(uid, f"U4rtPw{sfx}")
+    world = f"u4rtworld{sfx}"
+    prov = f"u4rt-prov-{sfx}"
+    conv = store.create_conversation(user_id=uid, world=world)
+    store.add_message(conv["id"], "assistant", "回答", lens="chat",
+                      answer={"usage": {"provider": prov}, "duration_ms": 2000})
+    out = store.usage_response_time(days=30, provider=prov)
+    assert out["provider"] == prov
+    assert out["n"] == 1 and out["max"] == 2000
+
+
+def test_usage_daily_returns_series_for_each_metric():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4dl{sfx}"
+    _mk_user(uid, f"U4dlPw{sfx}")
+    world = f"u4dlworld{sfx}"
+    conv = store.create_conversation(user_id=uid, world=world)
+    _turn(conv["id"], "質問1", lens="chat")
+    for metric in ("turns", "tokens", "response_time"):
+        out = store.usage_daily(days=30, metric=metric)
+        assert out["metric"] == metric
+        assert isinstance(out["series"], list)
+
+
+def test_usage_daily_invalid_metric_falls_back_to_turns():
+    if not _try_init():
+        pytest.skip("DB down")
+    out = store.usage_daily(days=30, metric="bogus")
+    assert out["metric"] == "turns"
+
+
+def test_usage_stop_kinds_filters_by_uid():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid_a, uid_b = f"u4ska{sfx}", f"u4skb{sfx}"
+    _mk_user(uid_a, f"U4skaPw{sfx}")
+    _mk_user(uid_b, f"U4skbPw{sfx}")
+    world = f"u4skworld{sfx}"
+    conv_a = store.create_conversation(user_id=uid_a, world=world)
+    store.add_message(conv_a["id"], "user", "質問A")
+    store.add_message(conv_a["id"], "assistant", "回答A", answer={"stop_kind": "completed"})
+    conv_b = store.create_conversation(user_id=uid_b, world=world)
+    store.add_message(conv_b["id"], "user", "質問B")
+    store.add_message(conv_b["id"], "assistant", "回答B", answer={"stop_kind": "completed"})
+
+    out = store.usage_stop_kinds(days=30, uid=uid_a)
+    assert out["uid"] == uid_a
+    total = sum(r["turns"] for r in out["stop_kinds"])
+    assert total == 1, "uid で絞り込んだのに他ユーザーのターンが混入した"

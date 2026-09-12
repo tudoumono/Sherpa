@@ -959,6 +959,13 @@ class AdminUsageStatsResponse(BaseModel):
     conversations_top: list[UsageConversationRow]
 
 
+class UsageChatToolCall(BaseModel):
+    """`UsageChatResponse.tool_calls` の1件。呼んだ調査ツールの名前と引数
+    （数値と id のみ・本文/タイトル/鍵は一切含まない）。"""
+    name: str
+    args: dict = {}
+
+
 class UsageChatResponse(BaseModel):
     """POST /admin/usage/chat（sherpa/usage_chat.py::answer_usage_question）。
 
@@ -968,11 +975,16 @@ class UsageChatResponse(BaseModel):
     変更した場合の食い違いを、応答時点の値で吸収する）。
 
     `notes`: 画面へそのまま見せる注記（改善ログの要約が取得できなかった場合の告知など・
-    通常は空リスト）。"""
+    通常は空リスト）。
+
+    `tool_calls`: 今回の質問応答で実際に呼んだ調査ツール（`usage_overview`等7つ・
+    `agentic_search.usage_openai_tools()`）の名前と引数。渡された統計データだけで答えた場合は
+    空リスト。"""
     answer: str
     provider_used: str
     endpoint_kind: str | None = None
     notes: list[str] = []
+    tool_calls: list[UsageChatToolCall] = []
 
 
 # ===================================================================================

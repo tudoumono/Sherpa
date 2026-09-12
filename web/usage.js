@@ -1156,6 +1156,12 @@ async function ucSend() {
     // サーバ側の notes（例: 改善ログの要約を取得できなかった旨）も同じ枠でそのまま見せる
     // （黙って回答だけ返すと、参照データが欠けていたことに利用者が気付けない）。
     (d.notes || []).forEach((n) => { noteHtml += `<div class="uc-hint">（${esc(n)}）</div>`; });
+    // 実際に呼んだ調査ツール（名前と引数=数値/idのみ）を1行ずつ見せる
+    // （黙って裏で数値を取りに行くと、回答の根拠が画面のどの集計とも一致しない理由が分からない）。
+    (d.tool_calls || []).forEach((t) => {
+      const argsText = Object.entries(t.args || {}).map(([k, v]) => `${k}=${v}`).join(', ');
+      noteHtml += `<div class="uc-hint">（調べた内容: ${esc(t.name)}(${esc(argsText)})）</div>`;
+    });
     if (placeholder) placeholder.querySelector('.a-body').innerHTML = `<div class="headline">${mdLite(d.answer)}</div>${noteHtml}`;
     // 切り詰め済みの本文（省略印付き）をそのまま送る＝サーバ側も省略印の有無を切り詰めの
     // 証拠として扱うため（4000字ちょうどに切った文字列は「超過」ではなくなり、サーバの

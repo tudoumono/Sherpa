@@ -1,5 +1,6 @@
-"""利用統計チャット（sherpa/usage_chat.py）単体テスト。DB/ネットワーク不要（`_complete`/`store.usage_stats`/
-`store.list_export_messages` はスタブ差し替え・`intent_llm`/`graph_admin` の既存テストと同じ流儀）。"""
+"""利用統計チャット（sherpa/usage_chat.py）単体テスト。DB/ネットワーク不要（`agentic_search._post`/
+`store.usage_stats`/`store.list_export_messages` はスタブ差し替え・`intent_llm`/`graph_admin` の
+既存テストと同じ流儀）。"""
 from __future__ import annotations
 
 import json
@@ -320,7 +321,7 @@ def test_fit_history_to_prompt_budget_drops_orphaned_assistant_without_leaving_i
 
 def test_fit_history_to_prompt_budget_never_drops_question_or_context():
     """history を全て落としても質問＋統計データだけで上限を超える極端なケースでも、質問と
-    統計データはそのまま残す（それ以上落とせる要素が無ければ、その先の成否は _complete 側に譲る）。"""
+    統計データはそのまま残す（それ以上落とせる要素が無ければ、その先の成否は実送信側に譲る）。"""
     huge_context = "x" * (U._PROMPT_MAX_CHARS + 10_000)
     prompt = U._fit_history_to_prompt_budget("質問", [], huge_context, truncated=False,
                                               improvement_context_text="{}", improvement_truncated=False, improvement_log_failed=False)
@@ -638,7 +639,7 @@ def test_resolve_cfg_openai_azure_default_model_blocked(monkeypatch):
 
 
 def test_resolve_cfg_openai_seed_blocked_is_unavailable_not_call_failed(monkeypatch):
-    """起動時 env シードが未確定（`llm.assert_openai_io_allowed` が拒否）の場合、`_complete` まで
+    """起動時 env シードが未確定（`llm.assert_openai_io_allowed` が拒否）の場合、実送信まで
     進んで送信を試みてから失敗する（502＝送信を試みたが失敗）のではなく、送信前（未計測）の
     段階で 503（未接続）に落とす。"""
     monkeypatch.setattr("sherpa.keys.resolve_api_key",
@@ -718,7 +719,7 @@ def test_resolve_cfg_openai_corrupted_endpoint_kind_type_is_unavailable_not_500(
 
 def test_resolve_cfg_ollama_disallowed_url_is_unavailable_not_call_failed(monkeypatch):
     """設定済みの Ollama 接続先が SSRF allowlist 外/不正（`llm.assert_ollama_url_allowed` が拒否）
-    な場合、`_complete` まで進んで実際に接続を試みる前に 503（未接続）へ落とす（許可されていない
+    な場合、実送信まで進んで実際に接続を試みる前に 503（未接続）へ落とす（許可されていない
     宛先へ一度も接続しない＝SSRF 対策としても、未送信を 502 に誤分類しない意味でも重要）。"""
     monkeypatch.setattr("sherpa.keys.resolve_ollama_url",
                         lambda s, system_settings=None: "http://evil.example:1234")
@@ -755,17 +756,63 @@ def test_resolve_cfg_ollama_non_string_stored_url_is_unavailable_not_500(monkeyp
 
 
 # ===== answer_usage_question（フォールバック無しでの成功/明示エラーの分岐）=====
-# 戻り値は `{"answer", "provider", "endpoint_kind", "notes"}`。
+# 戻り値は `{"answer", "provider", "endpoint_kind", "notes", "tool_calls"}`。ツール反復ループへの移行後は
+# 実送信が `agentic_search.openai_style`（graph_admin と同じ調査ループ）経由になったため、
+# プロバイダ境界は `_complete` ではなく `agentic_search._post`（+ `run_tool`）で差し替える
+# （tests/unit/test_agentic_search.py の `_post`/`run_tool` 差し替えと同じ流儀）。
 
-def test_answer_usage_question_success(monkeypatch):
+def _openai_final(text: str) -> dict:
+    """ツール呼び出し無しで完了する OpenAI chat.completions 風の応答。"""
+    return {"choices": [{"message": {"content": text}}]}
+
+
+def _openai_tool_call(call_id: str, name: str, args: dict) -> dict:
+    """1件のツール呼び出しを要求する応答（`json.dumps(args)` を `function.arguments` に積む）。"""
+    return {"choices": [{"message": {"content": "", "tool_calls": [
+        {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
+
+
+def _install_fake_post(monkeypatch, responses: list):
+    """`sherpa.agentic_search._post` を差し替える（呼ばれるたびに `responses` の先頭を1件返す）。"""
+    seq = list(responses)
+    monkeypatch.setattr("sherpa.agentic_search._post",
+                        lambda url, headers, body, timeout=90: seq.pop(0))
+
+
+def _install_fake_run_tool(monkeypatch):
+    """`agentic_search.run_tool` を DB に触れない fake へ差し替える——呼ばれた `(name, args)` を
+    そのまま `cards` サイドカーへ echo する（実装（`_run_usage_tool`）と同じ形）。"""
+    def _fake(name, args, world, scope_paths, **kw):
+        return ({"ok": True}, set(), [], [{"tool": name, "args": args or {}}])
+    monkeypatch.setattr("sherpa.agentic_search.run_tool", _fake)
+
+
+def test_answer_usage_question_success_without_tool_call(monkeypatch):
+    """統計データ・改善ログの要約だけで答えられた場合は `tool_calls` が空リストになる。"""
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-    monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": " 今月は u1 が最多です "}))
+    _install_fake_post(monkeypatch, [_openai_final(" 今月は u1 が最多です ")])
     result = U.answer_usage_question("今月一番使っているユーザーは？", [], system_settings={})
     assert result == {"answer": "今月は u1 が最多です", "provider": "openai", "endpoint_kind": None,
-                      "notes": []}
+                      "notes": [], "tool_calls": []}
+
+
+def test_answer_usage_question_reflects_single_tool_call_in_answer_and_tool_calls(monkeypatch):
+    """acceptance (c): 『ツール呼び出し1回→最終回答』の流れが `answer`/`tool_calls` に反映される。"""
+    monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
+        "provider": "openai", "key": "x", "model": "gpt-test"})
+    monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
+    _install_fake_run_tool(monkeypatch)
+    _install_fake_post(monkeypatch, [
+        _openai_tool_call("c1", "usage_by_user", {"days": 7, "uid": "sato"}),
+        _openai_final("先週は sato さんが一番多く使っています。"),
+    ])
+    result = U.answer_usage_question("先週は誰が一番使った？", [], system_settings={})
+    assert result["answer"] == "先週は sato さんが一番多く使っています。"
+    assert result["tool_calls"] == [{"name": "usage_by_user", "args": {"days": 7, "uid": "sato"}}]
 
 
 def test_answer_usage_question_returns_endpoint_kind_from_cfg(monkeypatch):
@@ -774,9 +821,9 @@ def test_answer_usage_question_returns_endpoint_kind_from_cfg(monkeypatch):
         "provider": "openai", "key": "x", "model": "gpt-test", "endpoint_kind": "azure"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     # improvement_log.compact_summary が内部で呼ぶ DB 境界（未 mock だと共有テスト DB へ実接続し、
-    # 蓄積された行を実際にページングして数秒待つ＝test_answer_usage_question_success と同じ流儀）。
+    # 蓄積された行を実際にページングして数秒待つ＝他のテストと同じ流儀）。
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-    monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": "回答"}))
+    _install_fake_post(monkeypatch, [_openai_final("回答")])
     result = U.answer_usage_question("質問", [], system_settings={})
     assert result["endpoint_kind"] == "azure"
 
@@ -791,9 +838,9 @@ def test_answer_usage_question_forwards_provider_override(monkeypatch):
     monkeypatch.setattr(U, "_resolve_cfg", _capture)
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     # improvement_log.compact_summary が内部で呼ぶ DB 境界（未 mock だと共有テスト DB へ実接続し、
-    # 蓄積された行を実際にページングして数秒待つ＝test_answer_usage_question_success と同じ流儀）。
+    # 蓄積された行を実際にページングして数秒待つ＝他のテストと同じ流儀）。
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-    monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": "回答"}))
+    _install_fake_post(monkeypatch, [_openai_final("回答")])
     U.answer_usage_question("質問", [], system_settings={}, provider_override="ollama")
     assert seen["provider_override"] == "ollama"
 
@@ -801,7 +848,8 @@ def test_answer_usage_question_forwards_provider_override(monkeypatch):
 def test_answer_usage_question_improvement_log_failure_is_explicit_not_silent_empty(monkeypatch):
     """改善ログの要約取得（`improvement_log.compact_summary`）が失敗しても質問応答自体は
     成功する（fail-open）が、`{}`（0件データ）として黙って渡さない——`notes` に告知を返し、
-    実際に送信したプロンプトにも同じ告知＋「この情報を使うな」という指示を含める。"""
+    実際に送信したプロンプト（LLM への1通目の user メッセージ）にも同じ告知＋
+    「この情報を使うな」という指示を含める。"""
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
@@ -812,14 +860,15 @@ def test_answer_usage_question_improvement_log_failure_is_explicit_not_silent_em
 
     sent_prompts = []
 
-    def _capture(system, user, cfg):
-        sent_prompts.append(user)
-        return json.dumps({"answer": "今月の集計はこちらです"})
-    monkeypatch.setattr(U, "_complete", _capture)
+    def _capture_post(url, headers, body, timeout=90):
+        sent_prompts.append(body["messages"][-1]["content"])
+        return _openai_final("今月の集計はこちらです")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture_post)
 
     result = U.answer_usage_question("今月は？", [], system_settings={})
     assert result["answer"] == "今月の集計はこちらです"
     assert result["notes"] == [U.IMPROVEMENT_LOG_UNAVAILABLE_NOTE]
+    assert result["tool_calls"] == []
     assert len(sent_prompts) == 1
     assert U.IMPROVEMENT_LOG_UNAVAILABLE_NOTE in sent_prompts[0]
     assert "使わないでください" in sent_prompts[0] or "使うな" in sent_prompts[0] \
@@ -843,28 +892,30 @@ def test_answer_usage_question_provider_call_raises_explicit_error_no_fallback(m
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
 
-    def _boom(system, user, cfg):
+    def _boom(url, headers, body, timeout=90):
         raise TimeoutError("upstream timeout")
-    monkeypatch.setattr(U, "_complete", _boom)
+    monkeypatch.setattr("sherpa.agentic_search._post", _boom)
     with pytest.raises(U.LLMCallFailedError):
         U.answer_usage_question("質問", [], system_settings={})
 
 
-def test_answer_usage_question_malformed_response_raises_call_failed(monkeypatch):
+def test_answer_usage_question_empty_or_malformed_answer_raises_call_failed(monkeypatch):
+    """自然完了応答の本文が空/空白のみの場合、JSON 解析ではなく「回答が空」として
+    LLMCallFailedError にする（ツール反復ループへ移行し JSON 応答形式ではなくなったため）。"""
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-    monkeypatch.setattr(U, "_complete", lambda system, user, cfg: "not json")
+    _install_fake_post(monkeypatch, [_openai_final("   ")])
     with pytest.raises(U.LLMCallFailedError):
         U.answer_usage_question("質問", [], system_settings={})
 
 
 def test_answer_usage_question_late_guard_rejection_is_unavailable_and_unmetered(monkeypatch):
-    """`_resolve_cfg` の事前チェックを通過した後でも、`_complete`（実送信）自体が
-    `llm.PreflightRejected`（`complete_json` 内部の権威あるガードが実送信前に拒否したことを示す
-    共通の例外基底）を投げた場合は、ネットワークへ一度も出ていないとみなして
-    `LLMUnavailableError`（503 相当）に分類し、metering には計上しない
+    """`_resolve_cfg` の事前チェックを通過した後でも、実送信直前の接続先組み立て
+    （`_endpoint_for_cfg` 経由の `llm.ollama_url()`）自体が `llm.PreflightRejected`
+    （権威あるガードが実送信前に拒否したことを示す共通の例外基底）を投げた場合は、ネットワークへ
+    一度も出ていないとみなして `LLMUnavailableError`（503 相当）に分類し、metering には計上しない
     （`LLMCallFailedError`＝502 に誤分類しない）。"""
     from sherpa import llm as _llm
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
@@ -872,9 +923,13 @@ def test_answer_usage_question_late_guard_rejection_is_unavailable_and_unmetered
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
 
-    def _late_reject(system, user, cfg):
+    def _late_reject(base, *, extra_allowed=None, system_settings=None):
         raise _llm.SsrfBlocked("許可されていない接続先です")
-    monkeypatch.setattr(U, "_complete", _late_reject)
+    monkeypatch.setattr("sherpa.llm.assert_ollama_url_allowed", _late_reject)
+
+    def _must_not_post(*a, **kw):
+        raise AssertionError("PreflightRejected の前に実送信してしまった")
+    monkeypatch.setattr("sherpa.agentic_search._post", _must_not_post)
 
     recorded = []
     monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
@@ -883,40 +938,18 @@ def test_answer_usage_question_late_guard_rejection_is_unavailable_and_unmetered
     assert recorded == [], "未送信（実送信直前ガード拒否）は metering に計上してはいけない"
 
 
-def test_answer_usage_question_non_json_response_after_send_is_call_failed_and_metered(monkeypatch):
-    """`_complete`（`complete_json` 経由）が実際に送信した後、応答本文が JSON として
-    解析できない場合（`llm.post_json` の `json.loads()` が投げる `JSONDecodeError` は `ValueError`
-    派生）に、`llm.PreflightRejected`（未送信）と型だけで混同して 503・未計測に誤分類してはいけない
-    ——送信は既に行っているため `LLMCallFailedError`（502）に分類し、metering にも1回計上する。"""
-    monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
-        "provider": "openai", "key": "x", "model": "gpt-test"})
-    monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
-    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-
-    def _non_json_200(system, user, cfg):
-        raise json.JSONDecodeError("Expecting value", "not json", 0)
-    monkeypatch.setattr(U, "_complete", _non_json_200)
-
-    recorded = []
-    monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
-    with pytest.raises(U.LLMCallFailedError):
-        U.answer_usage_question("質問", [], system_settings={})
-    assert len(recorded) == 1, "送信済みの応答解析失敗は metering に1回計上されるべき"
-
-
 def test_answer_usage_question_network_failure_after_send_is_call_failed_and_metered(monkeypatch):
-    """`_complete` が `RuntimeError`/`ValueError` 以外（実際の通信エラー相当）を投げた場合は、
-    従来どおり `LLMCallFailedError`（502）に分類し、試行として metering に計上する
-    （`enabled()` が既定 false のテスト環境でも、`metering.record` が呼ばれたこと自体は
-    monkeypatch で直接観測する）。"""
+    """`_post` が実送信後に例外（実際の通信エラー相当）を投げた場合は、`LLMCallFailedError`
+    （502）に分類し、試行として metering に計上する（`enabled()` が既定 false のテスト環境でも、
+    `metering.record` が呼ばれたこと自体は monkeypatch で直接観測する）。"""
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
 
-    def _boom(system, user, cfg):
+    def _boom(url, headers, body, timeout=90):
         raise TimeoutError("upstream timeout")
-    monkeypatch.setattr(U, "_complete", _boom)
+    monkeypatch.setattr("sherpa.agentic_search._post", _boom)
 
     recorded = []
     monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
@@ -925,14 +958,112 @@ def test_answer_usage_question_network_failure_after_send_is_call_failed_and_met
     assert len(recorded) == 1, "実送信を試みた失敗は metering に1回計上されるべき"
 
 
-def test_answer_usage_question_empty_answer_raises_call_failed(monkeypatch):
+# ===== STAT-4 U4 RV是正 #14: 反復ループ後続ターンでの PreflightRejected は「送信済み」側へ =====
+# `usage_acc["calls"]`（`agentic_search.openai_style` が物理送信ごとに更新する）で、1ターン目より
+# 前（未送信）か後（送信済み）かを判定する。
+
+def test_answer_usage_question_preflight_rejection_after_a_successful_turn_is_call_failed_and_metered(
+        monkeypatch):
+    """ツール反復ループの2ターン目（＝1ターン目は物理送信に成功した後）で `llm.PreflightRejected`
+    が投げられた場合は「送信済み」——502（`LLMCallFailedError`）に分類し、metering にも計上する
+    （1ターン目より前の拒否＝`test_answer_usage_question_late_guard_rejection_is_unavailable_and_unmetered`
+    と対称）。"""
     monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
         "provider": "openai", "key": "x", "model": "gpt-test"})
     monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
     monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-    monkeypatch.setattr(U, "_complete", lambda system, user, cfg: json.dumps({"answer": "   "}))
+    _install_fake_run_tool(monkeypatch)
+
+    # 1回目の `_post`（ツール呼び出し要求）は成功させ、2回目（ツール実行結果を持っての再送信）で
+    # `llm.PreflightRejected` を投げる——`_send` は物理送信直前に `llm.begin_openai_send()` で
+    # `usage_acc["calls"]` を1加算した**後**に `_post` を呼ぶため、1回目が成功した時点で
+    # `usage_acc["calls"]` は既に1（＝送信済み）になっている。
+    calls = {"n": 0}
+
+    def _flaky_post(url, headers, body, timeout=90):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise _llm_mod.PreflightRejected("2回目の送信で拒否")
+        return _openai_tool_call("c1", "usage_overview", {"days": 30})
+    monkeypatch.setattr("sherpa.agentic_search._post", _flaky_post)
+
+    recorded = []
+    monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
     with pytest.raises(U.LLMCallFailedError):
         U.answer_usage_question("質問", [], system_settings={})
+    assert len(recorded) == 1, "送信済みでの拒否は metering に1回計上されるべき"
+
+
+def test_answer_usage_question_preflight_rejection_on_first_turn_is_still_unavailable_and_unmetered(
+        monkeypatch):
+    """1ターン目（＝一度も物理送信を試みていない）で `llm.PreflightRejected` が投げられた場合は
+    従来どおり 503 相当（`LLMUnavailableError`）に分類し、metering には計上しない。"""
+    monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
+        "provider": "openai", "key": "x", "model": "gpt-test"})
+    monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
+
+    def _must_not_post(*a, **kw):
+        raise AssertionError("PreflightRejected の前に実送信してしまった")
+    monkeypatch.setattr("sherpa.agentic_search._post", _must_not_post)
+
+    from sherpa import llm as _llm
+
+    def _reject():
+        raise _llm.PreflightRejected("1ターン目で拒否")
+    monkeypatch.setattr("sherpa.llm.assert_openai_io_allowed", _reject)
+
+    recorded = []
+    monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
+    with pytest.raises(U.LLMUnavailableError):
+        U.answer_usage_question("質問", [], system_settings={})
+    assert recorded == [], "未送信（1ターン目の拒否）は metering に計上してはいけない"
+
+
+def test_answer_usage_question_success_records_usage_once_regardless_of_tool_turns(monkeypatch):
+    """ツール反復ターン数に関わらず、1回の質問応答につき `metering.record` は1回だけ呼ばれる
+    （`graph_admin.ask_graph` と同じ「呼び出し1回=記録1行」・旧 `metering.acc_begin/acc_end`
+    スコープ集計はもう使わない）。"""
+    monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
+        "provider": "openai", "key": "x", "model": "gpt-test"})
+    monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
+    _install_fake_run_tool(monkeypatch)
+    _install_fake_post(monkeypatch, [
+        _openai_tool_call("c1", "usage_overview", {"days": 30}),
+        _openai_tool_call("c2", "usage_response_time", {}),
+        _openai_final("回答です"),
+    ])
+    recorded = []
+    monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
+    result = U.answer_usage_question("質問", [], system_settings={})
+    assert len(result["tool_calls"]) == 2
+    assert len(recorded) == 1, "ツール反復のターン数に関わらず記録は1行だけのはず"
+
+
+def test_answer_usage_question_history_budget_still_drops_oldest_turns_when_oversized(monkeypatch):
+    """acceptance (c): 履歴の予算調整（`_fit_history_to_prompt_budget`）が壊れていないこと——
+    ツール反復ループへの移行後も、送信するプロンプト（LLM への1通目の user メッセージ）は
+    `_PROMPT_MAX_CHARS` に収まるよう、古いターンから落とされる。"""
+    monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
+        "provider": "openai", "key": "x", "model": "gpt-test"})
+    monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
+    history = _full_history(U.HISTORY_MAX_ITEMS // 2)
+
+    sent_prompts = []
+
+    def _capture_post(url, headers, body, timeout=90):
+        sent_prompts.append(body["messages"][-1]["content"])
+        return _openai_final("最後の回答")
+    monkeypatch.setattr("sherpa.agentic_search._post", _capture_post)
+
+    result = U.answer_usage_question("最後の質問", history, system_settings={})
+    assert result["answer"] == "最後の回答"
+    assert len(sent_prompts) == 1
+    assert len(sent_prompts[0]) <= U._PROMPT_MAX_CHARS
+    assert "最後の質問" in sent_prompts[0]
+    assert "turn0:" not in sent_prompts[0], "最も古いターンが落ちていない"
 
 
 def test_stats_projection_by_user_kind_keeps_heaviest_rows_when_truncated():
@@ -943,3 +1074,24 @@ def test_stats_projection_by_user_kind_keeps_heaviest_rows_when_truncated():
     ]}}
     out = U._stats_projection(stats, limit_users=5, limit_tok_users=1, limit_tok_models=5)
     assert [r["uid"] for r in out["tokens"]["by_user_kind"]] == ["zzz"]
+
+
+def test_metering_records_physical_call_count_and_elapsed(monkeypatch):
+    """usage_chat の記録行は物理送信回数（ツール反復の全ターン）と所要時間を持つ（既定 calls=1・
+    elapsed NULL のままだと用途別の回数/所要時間が実態とずれる）。"""
+    rec = {}
+
+    def fake_record(kind, provider, model, usage, **kw):
+        rec.update({"kind": kind, **kw})
+    monkeypatch.setattr("sherpa.metering.record", fake_record)
+
+    def fake_loop(cfg, system_settings, prompt, usage_acc):
+        usage_acc["calls"] = 3
+        usage_acc["tokens"] = {"input_tokens": 1, "output_tokens": 1}
+        return "答え", [], usage_acc["tokens"]
+    monkeypatch.setattr(U, "_consume_usage_chat_loop", fake_loop)
+    monkeypatch.setattr(U, "_resolve_cfg", lambda *a, **k: {"provider": "openai", "model": "m", "endpoint_kind": None})
+    out = U.answer_usage_question("今週の利用は？", [], system_settings={}, user_id="admin")
+    assert out["answer"] == "答え"
+    assert rec["kind"] == "usage_chat" and rec["calls"] == 3
+    assert isinstance(rec["elapsed_ms"], int) and rec["elapsed_ms"] >= 0
