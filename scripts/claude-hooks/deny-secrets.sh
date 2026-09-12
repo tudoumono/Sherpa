@@ -170,11 +170,11 @@ def check_segment(segment: str):
             return None
         if any(is_env_path(t) for t in rest):
             return ".env 系ファイルを grep で表示しようとしている"
-        if not has_subst:
-            return None
+        # 件数表示以外は早期 return しない（リダイレクト直後 `grep KEY <.env` やグロブ
+        # `grep KEY .env*` は先頭引数の完全一致では拾えないため、下の保険判定へ必ず進める）。
 
     if cmd == "sed":
-        if _sed_is_in_place(rest):
+        if _sed_is_in_place(rest) and not has_subst:
             return None
         if any(is_env_path(t) for t in rest):
             return "sed で .env 系ファイルの中身を端末に出そうとしている"

@@ -856,15 +856,43 @@ def _record_es_index_failure(world: str, reason: str, *, run_id: int | None = No
             "ES 反映失敗の ingest_runs 記録に失敗しました: world=%s", world, exc_info=True)
 
 
-def _refresh_derived_representations(world, sig) -> str | None:
+def _merge_es_runs(prev_summary, prev_timing, new_summary, new_timing):
+    """同一 run で ES 再索引が 2 回走ったときの統計の合成。`prev_*` が None なら `new_*` をそのまま返す。
+    所要時間（`elapsed_ms`）と埋め込み（`embedded`・`embed_elapsed_ms`）は累積、`started_at` は初回、
+    `finished_at` は最終、索引件数（`indexed`・`chunks`）と状態（`available`・`error`）は最終回の値。
+    キャッシュ再利用の 2 回目で `embedded=0` になっても初回に実際に埋め込んだ件数は失わない。"""
+    if prev_summary is None and prev_timing is None:
+        return new_summary, new_timing
+    def _add(a, b):
+        if a is None and b is None:
+            return None
+        return (a or 0) + (b or 0)
+    summary = dict(new_summary)
+    if prev_summary:
+        summary["embedded"] = _add(prev_summary.get("embedded"), new_summary.get("embedded"))
+        summary["embed_elapsed_ms"] = _add(prev_summary.get("embed_elapsed_ms"), new_summary.get("embed_elapsed_ms"))
+    timing = dict(new_timing)
+    if prev_timing:
+        timing["started_at"] = prev_timing.get("started_at") or new_timing.get("started_at")
+        timing["elapsed_ms"] = _add(prev_timing.get("elapsed_ms"), new_timing.get("elapsed_ms"))
+    return summary, timing
+
+
+def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | None]:
     """`sync()` の軽量再生成分岐（document_ir/evidence/rag drift のみで、arms drift・force・
     原本変化は無し）。呼び出し元は `store.world_lock` の中でこれを呼ぶ（derived ディレクトリへの
     書込を同一 world の並行 `run()`/`sync()` と競合させないため）。
 
-    戻り値: sidecar 欠落を検知したら `"needs_full_run"`（この関数自身は `run()`/`_run_locked()`
-    を呼ばない＝呼び出し元が同じ `store.world_lock` 区間の中で lock-free 版の `_run_locked()`
-    を直接呼ぶ）。drift が無ければ `None`。それ以外（human_md/document_ir/evidence/rag のいずれか
-    の軽量再生成を実行した・成否問わず）は `"handled"`——ただし呼び出し元（`sync()`）は
+    戻り値: `(status, es_refresh_info)` のタプル。`status`——sidecar 欠落を検知したら
+    `"needs_full_run"`（この関数自身は `run()`/`_run_locked()` を呼ばない＝呼び出し元が同じ
+    `store.world_lock` 区間の中で lock-free 版の `_run_locked()` を直接呼ぶ）。drift が無ければ
+    `None`。それ以外（human_md/document_ir/evidence/rag のいずれかの軽量再生成を実行した・
+    成否問わず）は `"handled"`。`es_refresh_info`——この関数内で実際に ES 再索引
+    （`index_world_with_human_md_holdback`）を実行した場合だけ `{"summary": {...}, "stage_timing":
+    {...}}`（呼び出し元 `_sync_impl` の明示 ES 自己修復と同形）を返し、それ以外は `None`——
+    呼び出し元はこれを自身の `counts`/`stage_timings` へ畳み込む（この再索引の結果は関数内で
+    完結しており、呼び出し元へ返さないと直後の `es_index.needs_reindex` が収束済みと判定して
+    再実行されず、取り込み統計から丸ごと欠落する）。呼び出し元（`sync()`）は
     `"handled"` でも backfill/ES 自己修復をスキップしない（human_md の軽量再生成が書き換える
     legacy `{rel}.md` は ES の索引元になりうる——RAG_ES OFF なら常に、RAG_ES ON でも
     `rag_chunks` が無効/劣化した文書は legacy 縮退で `{rel}.md` を読むため——同じ sync 呼び出し内で
@@ -924,9 +952,9 @@ def _refresh_derived_representations(world, sig) -> str | None:
     wd = worlds.world_dir(world)
     dmd = worlds.derived_md_dir(world)
     if not wd or not dmd.exists():                      # text/code のみの world は評価対象が無い
-        return None
+        return None, None
     if office_md.rag_sidecars_missing(wd, dmd):          # drift の有無によらず常に確認する
-        return "needs_full_run"
+        return "needs_full_run", None
     # human_md drift は document_ir/evidence/rag のいずれとも独立（②のみ・rag/ES には触れない）。
     # 排他分岐の外で必ず確認する＝document_ir 等に drift が無くても human_md だけ古ければ拾う。
     human_md_handled = False
@@ -944,7 +972,7 @@ def _refresh_derived_representations(world, sig) -> str | None:
     # （OCR 完了後の rag.md/ES への「追いつき」は、この既存 drift 連鎖に乗せる・新しい仕組みは作らない）。
     rag_drift = office_md.rag_sig_drift(dmd, world=world)
     if not document_ir_drift and not evidence_drift and not rag_drift:
-        return "handled" if human_md_handled else None
+        return ("handled" if human_md_handled else None), None
     document_ir_ok = True                                # document_ir を経由しない経路では常に真のまま
     if document_ir_drift:
         doc_result = office_md.refresh_document_ir(wd, dmd, write_document_ir_sig_marker=False)
@@ -952,7 +980,7 @@ def _refresh_derived_representations(world, sig) -> str | None:
             _log.warning(
                 "document_ir の軽量再生成に失敗しました（次回 sync で再試行）: world=%s detail=%s",
                 world, doc_result)
-            return "handled"
+            return "handled", None
         if doc_result.get("document_ir_failed", 0):
             document_ir_ok = False                       # world単位マーカー未確定のまま＝今回もevidence/rag連鎖は継続
             _log.warning(
@@ -971,18 +999,41 @@ def _refresh_derived_representations(world, sig) -> str | None:
         _log.warning(
             "RAG/Evidence IR の軽量再生成に失敗しました（次回 sync で再試行）: world=%s detail=%s",
             world, result)
-        return "handled"
+        return "handled", None
     # rag.md が実際に書き換わった（`ok`）ので、ES 反映の成否に関わらずグラフ
     # （言及エッジ）を追いつかせる。呼び出し元（`_sync_impl`）が既に `store.world_lock` を保持中
     # ＝lock-free ヘルパーをそのまま呼ぶ（`_reflect_graph_after_rag_rewrite` docstring 参照）。
     _reflect_graph_after_rag_rewrite(world)
     es_ok = True                                         # holdback対象外（defer=False）なら確定済み扱い
+    es_refresh_info = None                                # ES再索引を実行した場合だけ呼び出し元へ返す
     if defer:
         # human_md は RAG_ES の設定に関わらず ES の索引内容に影響しうる（rag_chunks 無効時の
         # legacy 縮退経路）ため、共通ヘルパが `.human_md_es_sig` の無効化/確定/失敗記録まで
         # 一元的に面倒を見る（`index_world_with_human_md_holdback` docstring 参照）。
+        _es_t0 = time.monotonic()
+        _es_started_at = datetime.now(timezone.utc).isoformat()
         esr = index_world_with_human_md_holdback(world, content_sig=sig)
+        _es_finished_at = datetime.now(timezone.utc).isoformat()
         es_ok = esr.get("available") is True and not esr.get("error")
+        # 呼び出し元（`_sync_impl`）の明示 ES 自己修復（`_counts_summary`/`stage_timings` へ渡す
+        # 組み立て）と同形——この再索引がここで完結してしまうと、直後の呼び出し元の
+        # `es_index.needs_reindex` 判定が既に収束済み（False）を返し、取り込み統計から
+        # 索引件数・埋め込み件数/時間が丸ごと欠落する（呼び出し元が畳み込むための唯一の経路）。
+        es_refresh_info = {
+            "summary": {
+                "available": esr.get("available") if isinstance(esr, dict) else None,
+                "error": esr.get("error") if isinstance(esr, dict) else None,
+                "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
+                "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
+                "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+                "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None,
+            },
+            "stage_timing": {
+                "started_at": _es_started_at,
+                "finished_at": _es_finished_at,
+                "elapsed_ms": round((time.monotonic() - _es_t0) * 1000),
+            },
+        }
         if es_ok:
             office_md.write_rag_sig_marker(dmd, world=world)
         else:
@@ -993,7 +1044,7 @@ def _refresh_derived_representations(world, sig) -> str | None:
     # （上の docstring 参照＝先に確定すると再試行の入口を失う）。
     if document_ir_drift and document_ir_ok and es_ok:
         office_md.write_document_ir_sig_marker(dmd)
-    return "handled"
+    return "handled", es_refresh_info
 
 
 def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: str = "sync") -> dict:
@@ -1046,7 +1097,8 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
     行を残さない）。`on_run_id`＝`run_id` を渡さない代わりに、`_run_locked` 経由の分岐でのみ
     run_id 判明時に呼ばれるコールバック（旧経路・後方互換）。
     """
-    def _finalize_if_unused(status: str, reasons: list[str] | None = None) -> None:
+    def _finalize_if_unused(status: str, reasons: list[str] | None = None,
+                            stage_timings: dict | None = None, counts: dict | None = None) -> None:
         # `_run_locked` を経由しない終了点専用（呼び出し元 run_id が未消化のまま残らないようにする）。
         if run_id is None:
             return
@@ -1054,6 +1106,14 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             snap = {"changed": False}
             if reasons:
                 snap["flags"] = [{"doc": None, "action": "warn", "reason": r} for r in reasons]
+            # C5 是正: 原本不変（unchanged）でも実際に走査/自己修復した工程があれば、その所要時間
+            # （`stage_timings`）と取得できた計数（`counts`・`_counts_summary` と同じ「取れない項目は
+            # キー自体を付けない」契約）を残す——`_run_locked`（全再構築）経由の run と違い、この分岐は
+            # これまで実行した工程を一切 extraction_snapshot に残していなかった。
+            if stage_timings:
+                snap["stage_timings"] = stage_timings
+            if counts:
+                snap["counts"] = counts
             store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap)
         except Exception:
             _log.warning(
@@ -1100,10 +1160,20 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             _last_unchanged_es_progress_done[0] = done
             _progress("es_index", done=done, total=total)
 
+    # C5 是正: unchanged 分岐が実行した工程の所要時間を集める（`_finalize_if_unused` へ渡す・
+    # `_run_locked` 側の `stage_timings` と同じ「実行した段だけ載る」形）。
+    _stage_timings: dict = {}
     _progress("scanning")
+    _t_scan0 = time.monotonic()
+    _scan_started_at = datetime.now(timezone.utc).isoformat()
     sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
+    _stage_timings["scanning"] = {
+        "started_at": _scan_started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_ms": round((time.monotonic() - _t_scan0) * 1000),
+    }
     if sig is None:
-        _finalize_if_unused("failed", ["world_unresolved"])
+        _finalize_if_unused("failed", ["world_unresolved"], stage_timings=_stage_timings)
         return {"world": world, "changed": False, "status": "unavailable"}
     row = store.get_world(world)
     prev = row.get("last_sig") if row else None
@@ -1118,7 +1188,14 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
         # 行わず、同じ lock 区間へ直接畳み込む（`store.world_lock` は session-level advisory
         # lock＝別コネクションでの再入不可・`wipe_world` docstring 参照）。
         with store.world_lock(world):                    # derived への書込を同一worldの並行run/syncと直列化
-            refresh_outcome = _refresh_derived_representations(world, sig)
+            _t_refresh0 = time.monotonic()
+            _refresh_started_at = datetime.now(timezone.utc).isoformat()
+            refresh_outcome, refresh_es_info = _refresh_derived_representations(world, sig)
+            _stage_timings["refresh_derived"] = {
+                "started_at": _refresh_started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": round((time.monotonic() - _t_refresh0) * 1000),
+            }
             if refresh_outcome == "needs_full_run":
                 # 欠落検知→全再構築→`.rag_sig`削除を同一lock区間で行う（lockを一度解放して公開
                 # `run()`を呼ぶと、その間に他のsync/registerが割り込んで全再構築が重複したり、
@@ -1200,22 +1277,51 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             # 別 run を作らず受付 run（`run_id`）自身の終端へ畳み込む——`index_world_with_human_md_holdback`
             # へ `run_id` を渡すことで内部の失敗記録を抑止し、ここで一度だけ terminal 化する。
             es_repair_failure = None
+            # C7 是正: `_refresh_derived_representations` が内部で既に ES 再索引を実行していれば
+            # （RAG_ES 有効時の holdback 分岐）、その結果をここへ引き継ぐ——直後の `needs_reindex`
+            # は収束済み（False）を返しうるため、ここで畳み込まないと索引件数・工程時間が
+            # extraction_snapshot から丸ごと欠落する（未実行時は従来どおりキーごと省略）。
+            es_summary = refresh_es_info["summary"] if refresh_es_info is not None else None
+            if refresh_es_info is not None:
+                _stage_timings["es_index"] = refresh_es_info["stage_timing"]
             try:
                 if es_index.needs_reindex(world, sig):
                     _progress("es_index", done=0, total=None)
+                    _t_es0 = time.monotonic()
+                    _es_started_at = datetime.now(timezone.utc).isoformat()
                     esr = index_world_with_human_md_holdback(
                         world, content_sig=sig, run_id=run_id,
                         progress=_unchanged_es_progress)
+                    _outer_timing = {
+                        "started_at": _es_started_at,
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": round((time.monotonic() - _t_es0) * 1000),
+                    }
                     if not (esr.get("available") is True and not esr.get("error")):
                         es_repair_failure = esr.get("error") or "unavailable"
+                    # `_record`（全再構築経路）の es_summary 組み立てと同形（STAT-3 S5 counts の元データ）。
+                    _outer_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
+                                      "error": esr.get("error") if isinstance(esr, dict) else None,
+                                      "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
+                                      "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
+                                      "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+                                      "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
+                    # 同じ run で内部再索引（refresh_es_info）の後に外側の再索引も走った場合は置換せず
+                    # 合成する（所要時間・埋め込みは累積・開始は初回・終了は最終・索引件数と状態は最終）。
+                    es_summary, _stage_timings["es_index"] = _merge_es_runs(
+                        es_summary, _stage_timings.get("es_index"), _outer_summary, _outer_timing)
             except Exception as e:
                 _log.warning(
                     "ES 自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
                 es_repair_failure = e.__class__.__name__
+            # drep（office_md 段別要約）／rows（台帳）は unchanged 分岐では存在しない——`_counts_summary`
+            # の契約どおりキーごと省略される（manifest の scanned 数と es_summary が実行した分だけ載る）。
+            _counts = _counts_summary(None, es_summary, manifest, None)
             if es_repair_failure is not None:
-                _finalize_if_unused("failed", [f"es_repair_failed:{es_repair_failure}"])
+                _finalize_if_unused("failed", [f"es_repair_failed:{es_repair_failure}"],
+                                    stage_timings=_stage_timings, counts=_counts)
             else:
-                _finalize_if_unused("auto_published")
+                _finalize_if_unused("auto_published", stage_timings=_stage_timings, counts=_counts)
             return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
     # `op` を渡し忘れると `run()` の既定 "sync" に固定され、この呼び出し元が実際には
     # refresh/rerun 等でも Webhook payload の `op` が常に "sync" になってしまう——`op` を配線する。

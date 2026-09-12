@@ -141,6 +141,39 @@ def test_gen_provider_qa_lens_still_uses_agentic_when_available():
         "qa で agentic 経路が試みられていない（フォールバック node が出ていない）"
 
 
+class _FakeGenWithUsage(A._GenProvider):
+    """`_FakeGen` と同じ author 単発経路だが、`_stream` が本物の usage 相当（`_last_usage`）も
+    残す（C6 再現用）。"""
+    label = "FakeGenUsage"
+    provider_id = "openai"
+    model = "gpt-5.5"
+
+    def _stream(self, prompt):
+        from sherpa.providers.base import _usage_meta
+        self._last_usage = _usage_meta(self.provider_id, self.model, input_tokens=10, output_tokens=3,
+                                       system_settings={})   # is_local が DB を叩かないよう固定
+        yield "生成した下書き文。"
+
+    def _agentic_loop(self, ctx):
+        raise AssertionError("author は agentic_run に入ってはいけない（未対応ツール）")
+
+
+def test_gen_provider_author_usage_carries_depth_profile():
+    """C6 是正: API の author 経路（単発・非 agentic）は answer.usage に `depth_profile`
+    （S1 の他経路＝agentic 非ハイブリッド `:2404` 等と同じ `depth_profile.usage_extras` 契約）を
+    載せる——是正前は `env["usage"] = self._last_usage` を素通しするだけで depth_profile が
+    欠落し、`_log_chat_usage` へ渡す usage にも乗らずログからも消えていた。"""
+    ctx = A.Ctx(
+        message="消費税率の一覧をExcelにまとめて", world="v1",
+        route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {"headline": "該当箇所が2件見つかりました。",
+                                     "summary": {"total": 2}, "data": {"citations": []}, "sources": []},
+        knowledge=True, make_sources=lambda docs: [],
+        scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"})
+    result = next(e for e in _FakeGenWithUsage().run(ctx) if e.get("type") == "_result")
+    assert result["env"]["usage"]["depth_profile"] == "deep"
+
+
 # ===== CodexProvider._plain_text: 参照OFFで呼ばれた場合の安全網 =====
 # 2026-08-15 決定: Codex 構成は資料参照ON固定（画面はトグルON固定・`routers/chat.py::_knowledge_for`
 # がサーバ側でも強制）。この経路は内部呼び出しや古いクライアント向けの安全網として残るだけなので、

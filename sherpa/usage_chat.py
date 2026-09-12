@@ -722,6 +722,10 @@ def answer_usage_question(question: str, history: list[dict], *, system_settings
         raise
     except Exception as e:
         attempted = True
+        # ツール反復の2ターン目以降で通常例外（TimeoutError 等）が起きても、直前の物理送信までの
+        # usage（`usage_acc["tokens"]`）を引き継ぐ——`llm.PreflightRejected` 分岐（上）と同じ理由で、
+        # 取得済みの使用量を metering.record へ NULL のまま渡さない。
+        usage_for_metering = usage_acc.get("tokens")
         # 実送信は試みた（cfg は確定済み）ため、実際の送信先を例外へ引き継ぐ
         # （`_unavailable` と同じ理由・router が 502 応答/監査へ載せる）。
         call_failed = LLMCallFailedError(

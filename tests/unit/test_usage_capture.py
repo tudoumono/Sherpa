@@ -423,10 +423,12 @@ def test_run_attaches_usage_to_env(monkeypatch):
               scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
               make_sources=lambda docs: [])
     result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
+    # C6 是正: この単発経路も他経路と同じく選択した深さ（depth_profile）を usage へ合流する
+    # （scope_meta に depth_profile が無い＝既定 "standard"）。
     assert result["env"]["usage"] == {"provider": "openai", "model": "gpt-5.5",
                                       "input_tokens": 42, "cached_input_tokens": 0,
                                       "output_tokens": 7, "reasoning_output_tokens": 0,
-                                      "is_local": "cloud"}
+                                      "is_local": "cloud", "depth_profile": "standard"}
 
 
 def test_run_logs_chat_usage_line(monkeypatch, caplog):

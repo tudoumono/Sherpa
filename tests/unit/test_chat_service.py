@@ -806,6 +806,29 @@ def test_handle_message_stopped_saves_no_assistant_and_returns_stopped(monkeypat
     assert all(r["role"] != "assistant" for r in saved)
 
 
+def test_handle_message_stopped_with_no_events_returns_stopped_not_500(monkeypatch):
+    """C2 是正: provider が停止要求を事前ガードで検知し、追加イベントを一切 yield せずに
+    generator を終える経路がある（`providers/base.py::_agentic_run` の
+    `if ctx.stop_event is not None and ctx.stop_event.is_set(): return` と同型）。この場合
+    for ループ本体が一度も走らないため、ループ内の停止判定を経由せず `result=None` のまま
+    ループを抜ける——是正前は次行 `result["env"]` の添字参照で 500 になり、停止監査も残らな
+    かった。ループ終了後にも停止判定を行い、`stream_message`/従来の途中停止と同じ
+    `{"type": "stopped"}` 応答＋停止監査（`chat.turn` detail の `stopped=true`）を返す契約を
+    固定する。"""
+    saved = _mock_store_no_db(monkeypatch)
+    audits = []
+    monkeypatch.setattr(store, "audit",
+                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([]))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = CS.handle_message(None, "sync stop 追加イベント無し テスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, stop_event=stop_event)
+    assert out == {"type": "stopped", "conversation_id": 999}   # 500 にならず stopped 応答
+    assert all(r["role"] != "assistant" for r in saved)          # assistant は保存しない
+    assert audits and audits[-1]["stopped"] is True              # 停止監査が残る
+
+
 # ---- EXT-2: evidence_committed は `_result.env` のサイドカー（独立イベントとして yield しない）----
 # providers/base.py が `_result` へ同梱し、chat_service._pop_evidence_committed が永続化と同じ
 # 呼び出しの中で trace へ折り込む契約（孤児イベント防止）を PG 不要（store フェイク）で固定する。
@@ -2244,12 +2267,29 @@ def test_facts_troubleshoot_carries_limits_and_candidate_overflow_note():
     assert "残り 4 件は未提示" in out and "調査の限界: 調査を上限到達で中断" in out and "ev-1" not in out
 
 
-def test_facts_impact_zero_items_carries_limit_lines():
+def test_facts_impact_zero_items_uses_synthesis_digest_not_zero_count():
+    """C1 是正: items/presumed が無くても `_synthesis_digest`（グラフ確認済みの構造的根拠を含む
+    全件ダイジェスト）があれば、それをそのまま清書入力として使う——「計0件」に丸めて digest
+    （グラフ確認済みの影響先）を捨てない。"""
     from sherpa.providers.prompts import _facts
     env = {"data": {"citations": [], "items": []},
            "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: [graph] X"}
     out = _facts("impact", env)
-    assert "計0件" in out and "調査の限界: 調査を上限到達で中断" in out
+    assert "計0件" not in out
+    assert "調査の限界: 調査を上限到達で中断" in out and "[graph] X" in out
+
+
+def test_answer_prompt_list_docs_completion_uses_set_match_not_sum():
+    """C3 是正: list_docs の全件確認の完了条件を「列挙件数の単純合計」ではなく「同条件で取得した
+    パスの重複除去した集合の件数と総数の照合」に変える（提案書
+    docs/proposals/2026-09-11-全件調査の完了条件と中断時の回答.md の C4「件数一致だけで、欠落と
+    重複が相殺された状態を合格にしない」が正典）。重複ページの列挙件数が単純合計されると、
+    実際には一部ページが欠落していても合計値だけは総数と一致し得る——集合照合ならその欠落を
+    見逃さない。"""
+    from sherpa.providers.prompts import _answer_prompt
+    text = _answer_prompt("一覧を確認して", "qa", {"data": {}})
+    assert "列挙の合計" not in text and "列挙件数の単純合計" in text   # 単純合計はしない、とだけ言い切る
+    assert "重複除去した集合の件数と総数を照合" in text
 
 
 def test_finalize_leaves_stop_kind_unset_for_busy_envelope():

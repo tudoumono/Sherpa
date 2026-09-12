@@ -994,6 +994,38 @@ def test_answer_usage_question_preflight_rejection_after_a_successful_turn_is_ca
     assert len(recorded) == 1, "送信済みでの拒否は metering に1回計上されるべき"
 
 
+def test_answer_usage_question_timeout_after_a_successful_turn_carries_usage_to_metering(monkeypatch):
+    """STAT-4 C1是正: ツール反復ループの2ターン目以降で通常例外（`TimeoutError` 等・
+    `llm.PreflightRejected` ではない）が起きても、1ターン目で取得済みの usage
+    （`usage_acc["tokens"]`）を `metering.record` に引き継ぐ（NULL のまま渡さない）——
+    `llm.PreflightRejected` 分岐（上のテスト）と対称の契約。"""
+    monkeypatch.setattr(U, "_resolve_cfg", lambda system_settings, provider_override=None: {
+        "provider": "openai", "key": "x", "model": "gpt-test"})
+    monkeypatch.setattr("sherpa.store.usage_stats", lambda days: _EMPTY_STATS)
+    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
+    _install_fake_run_tool(monkeypatch)
+
+    calls = {"n": 0}
+
+    def _flaky_post(url, headers, body, timeout=90):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise TimeoutError("2回目の送信でタイムアウト")
+        resp = _openai_tool_call("c1", "usage_overview", {"days": 30})
+        resp["usage"] = {"prompt_tokens": 100, "completion_tokens": 20}
+        return resp
+    monkeypatch.setattr("sherpa.agentic_search._post", _flaky_post)
+
+    recorded = []
+    monkeypatch.setattr("sherpa.metering.record", lambda *a, **kw: recorded.append((a, kw)))
+    with pytest.raises(U.LLMCallFailedError):
+        U.answer_usage_question("質問", [], system_settings={})
+    assert len(recorded) == 1, "送信済みでの通常例外は metering に1回計上されるべき"
+    usage_arg = recorded[0][0][3]
+    assert usage_arg is not None, "1ターン目で取得済みの usage が metering.record に引き継がれていない"
+    assert usage_arg["input_tokens"] == 100
+
+
 def test_answer_usage_question_preflight_rejection_on_first_turn_is_still_unavailable_and_unmetered(
         monkeypatch):
     """1ターン目（＝一度も物理送信を試みていない）で `llm.PreflightRejected` が投げられた場合は

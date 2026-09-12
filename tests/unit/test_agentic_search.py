@@ -662,6 +662,52 @@ def test_run_tool_usage_conversation_detail_error_result_is_not_shrunk(monkeypat
     assert result == {"error": "指定した会話が見つかりません"}
 
 
+# ===== STAT-4 C3是正: 返却上限（50件）はバイト予算より先に適用する =====
+# `usage_daily` の `series` と `usage_conversation_detail` の `response_time_series` は
+# `store.py` 側に上限が無く、件数がバイト予算内に収まっていれば（RV 指摘: 60日分の
+# usage_daily 等）バイト超過時だけ効く段階縮小（上のテスト群）を素通りしていた。
+
+def test_run_tool_usage_daily_series_capped_to_50_even_when_under_byte_budget(monkeypatch):
+    """60日分の `series`（バイト予算には十分収まる小ささ）でも、返却上限50件で直近側（末尾）へ
+    間引かれ `truncated: true`・`omitted_count` が付く（バイト超過に依存しない）。"""
+    series = [{"date": f"day-{i:02d}", "value": i} for i in range(60)]
+    monkeypatch.setattr(store, "usage_daily",
+                        lambda *a, **kw: {"period": {"days": 60}, "metric": "turns", "series": series})
+    result, _, _, _ = A.run_tool("usage_daily", {"days": 60}, "v1", None)
+    assert len(result["series"]) == 50
+    assert [s["value"] for s in result["series"]] == list(range(10, 60)), (
+        "時系列の直近側（末尾50件）が残っていない"
+    )
+    assert result.get("truncated") is True
+    assert result.get("omitted_count") == 10
+
+
+def test_run_tool_usage_daily_series_not_truncated_when_50_or_fewer(monkeypatch):
+    """50件ちょうど（境界）は間引かれず `truncated` キーも付かない。"""
+    series = [{"date": f"day-{i:02d}", "value": i} for i in range(50)]
+    monkeypatch.setattr(store, "usage_daily",
+                        lambda *a, **kw: {"period": {"days": 50}, "metric": "turns", "series": series})
+    result, _, _, _ = A.run_tool("usage_daily", {"days": 50}, "v1", None)
+    assert len(result["series"]) == 50
+    assert "truncated" not in result and "omitted_count" not in result
+
+
+def test_run_tool_usage_conversation_detail_response_time_series_capped_to_50(monkeypatch):
+    """会話のターン数が多い（`response_time_series` が50件超）場合も、バイト予算とは無関係に
+    直近50ターンへ間引かれ `truncated: true` が付く。"""
+    series = [{"turn": i, "duration_ms": 100, "provider": "openai"} for i in range(1, 81)]
+    monkeypatch.setattr(
+        store, "usage_conversation_detail",
+        lambda cid: {"conversation_id": cid, "user_turns": 80, "kinds": [], "response_time_series": series})
+    result, _, _, _ = A.run_tool("usage_conversation_detail", {"conversation_id": 1}, "v1", None)
+    assert len(result["response_time_series"]) == 50
+    assert [t["turn"] for t in result["response_time_series"]] == list(range(31, 81)), (
+        "直近50ターンが残っていない"
+    )
+    assert result.get("truncated") is True
+    assert result.get("omitted_count") == 30
+
+
 def test_run_tool_read_around_default_window_scales_with_window_cap(monkeypatch, tmp_path):
     """LLM が `window` 引数を省略したときの既定値にも `window_cap`（調べる深さが計算した実効値）を
     使う。標準/深く/最大（40/60/80）と PROF-1 相当の `READ_WINDOW=60`（60/90/120）の両方で、
@@ -8006,3 +8052,22 @@ def test_usage_shrink_keeps_latest_for_date_series_and_heaviest_for_rows():
     out = A._usage_shrink_lists({"daily": daily, "rows": rows}, 5)
     assert [x["date"] for x in out["daily"]] == [f"2026-08-{d:02d}" for d in range(26, 31)]   # 直近側
     assert [x["uid"] for x in out["rows"]] == ["u0", "u1", "u2", "u3", "u4"]                  # 重い側
+
+
+def test_usage_return_limit_keeps_heaviest_rows():
+    from sherpa import agentic_search as A
+    rows = [{"uid": f"u{i}", "kind": "chat", "input": 1000 - i, "output": 0} for i in range(60)]
+    out = A._usage_apply_return_limit({"rows": rows}, 50)
+    assert len(out["rows"]) == 50 and out["rows"][0]["uid"] == "u0" and out["truncated"] is True
+    assert out["omitted_count"] == 10
+
+
+def test_usage_return_limit_caps_nested_series_in_overview():
+    from sherpa import agentic_search as A
+    daily = [{"date": f"2026-07-{(d % 28) + 1:02d}", "turns": d} for d in range(60)]
+    out = A._usage_apply_return_limit({"daily": list(daily), "tokens": {"daily": list(daily)},
+                                       "users": [{"uid": "u", "turns": 1}]}, 50)
+    assert len(out["daily"]) == 50 and len(out["tokens"]["daily"]) == 50
+    assert out["daily"][-1] == daily[-1]            # 直近側を残す
+    assert out["users"] == [{"uid": "u", "turns": 1}]   # 系列でないリストは触らない
+    assert out["truncated"] is True and out["omitted_count"] == 20

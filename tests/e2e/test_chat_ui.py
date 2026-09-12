@@ -2973,6 +2973,13 @@ def test_mdlite_emphasis_and_link_span_code_spans(page, web_base_url):
                       'rel="noopener noreferrer"><code>README.md</code></a></p>')
 
 
+def test_mdlite_bold_wildcards_do_not_pair_across_tags(page, web_base_url):
+    # 太字処理後の斜体対応付けは `<strong>`/`</strong>` タグ境界を跨がない＝別々の太字内にある
+    # 単発 `*`（COUNT(*) のような SQL ワイルドカード）同士を斜体として対応付けて消さない。
+    html = _md(page, web_base_url, "**COUNT(*)** と **COUNT(*)**")
+    assert html == "<p><strong>COUNT(*)</strong> と <strong>COUNT(*)</strong></p>"
+
+
 def test_mdlite_list_continuation_after_fence_keeps_order(page, web_base_url):
     html = _md(page, web_base_url, "1. 実行:\n   ```\n   cmd\n   ```\n   出力を確認する\n2. 次へ")
     assert html == ('<ol><li>実行:<pre class="md-code"><code>cmd</code></pre><div>出力を確認する</div></li>'

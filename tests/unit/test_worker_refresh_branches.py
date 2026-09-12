@@ -308,6 +308,32 @@ def test_sync_self_heal_success_with_run_id_finalizes_as_auto_published(_stub, m
     assert finished[0]["status"] == "auto_published"
 
 
+def test_sync_unchanged_es_repair_saves_stage_timings_and_counts(_stub, monkeypatch):
+    """C5 是正: 原本不変（unchanged）で ES 自己修復まで走った run でも、`_run_locked`（全再構築）
+    経由の run と同じく実行した工程の所要時間（`stage_timings`）と取得できた計数（`counts`）を
+    `extraction_snapshot` へ残す——是正前は unchanged 分岐がこれらを一切保存しなかった
+    （`snap = {"changed": False}` のみ）。取れない項目（今回 embedded は返さない）はキーごと
+    省略する契約（`_counts_summary` と同じ）は維持する。"""
+    finished: list[dict] = []
+    monkeypatch.setattr(store, "finish_ingest_run",
+                        lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
+    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: True)
+    monkeypatch.setattr(es_index, "index_world",
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
+    monkeypatch.setattr(es_index, "confirm_human_md_meta", lambda world: True)
+
+    res = worker.sync("w", run_id=999)
+    assert res["status"] == "unchanged"
+    snap = finished[0]["extraction_snapshot"]
+    # 実行した工程（走査・ES 自己修復）の所要時間が載る。
+    assert "scanning" in snap["stage_timings"] and "es_index" in snap["stage_timings"]
+    assert snap["stage_timings"]["scanning"]["elapsed_ms"] >= 0
+    # ES 索引の計数（`index_world` の戻り値由来）が載るが、返していない `embedded` はキーごと無い。
+    assert snap["counts"]["es_indexed"] == 1
+    assert snap["counts"]["scanned"] == 0                   # `world_state` フェイクの manifest={} 由来
+    assert "embedded_chunks" not in snap["counts"]
+
+
 def test_index_world_holdback_drops_marker_before_reindex_prevents_stale_confirmation(_stub, monkeypatch):
     """二段階更新の穴: 以前の成功で `.human_md_es_sig` が既に確定済みの状態から、（human_md とは
     無関係な別次元の変化などで）別の再索引が走り、その bulk が部分失敗しても、再索引前に
@@ -445,6 +471,39 @@ def test_sync_refresh_success_with_rag_es_confirms_marker(_stub, monkeypatch):
     # でも `.human_md_es_sig` を確定する（render 側は fixture の世界が既に追随済み）。
     assert (dmd / ".human_md_es_sig").is_file()
     assert (dmd / ".human_md_es_sig").read_text(encoding="utf-8").strip() == office_md._current_human_md_sig()
+
+
+def test_sync_rag_drift_with_rag_es_folds_internal_reindex_into_same_run_stats(_stub, monkeypatch):
+    """C7 是正（Codex RV 2巡目）: RAG_ES 有効時、rag drift を検知した
+    `_refresh_derived_representations` が内部で実行する ES 再索引（holdback 分岐）の結果を、
+    同じ run の `extraction_snapshot` へ畳み込む——是正前は直後の `es_index.needs_reindex`
+    が（既に索引済みのため）`_stub` の既定どおり False を返し、`es_summary=None` のまま
+    索引件数・工程時間が丸ごと欠落していた。stage_timings の各段（scanning/refresh_derived/
+    es_index）に started_at/finished_at/elapsed_ms が揃うことも合わせて固定する（C8）。"""
+    dmd = _stub["dmd"]
+    _bump_marker(dmd, ".rag_sig")
+    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
+
+    finished: list[dict] = []
+    monkeypatch.setattr(store, "finish_ingest_run",
+                        lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
+
+    res = worker.sync("w", run_id=999)
+    assert res["status"] == "unchanged"
+    assert _stub["calls"]["index_world"] == ["sig"]            # 内部（refresh_derived）で1回だけ再索引した
+    assert _stub["calls"]["needs_reindex"] == ["sig"]          # 外側の明示チェックは走るが False＝再索引しない
+    assert len(finished) == 1
+    snap = finished[0]["extraction_snapshot"]
+
+    st = snap["stage_timings"]
+    for stage in ("scanning", "refresh_derived", "es_index"):
+        assert stage in st, f"stage_timings に {stage} が無い"
+        assert st[stage]["started_at"] and st[stage]["finished_at"]
+        assert st[stage]["elapsed_ms"] >= 0
+
+    # 内部再索引（`index_world` の戻り値 indexed=1/chunks=1）由来の計数が載る。
+    assert snap["counts"]["es_indexed"] == 1
+    assert "embedded_chunks" not in snap["counts"]             # 返していない項目はキーごと省略
 
 
 def test_sync_index_world_failure_leaves_marker_unconfirmed_then_retries(_stub, monkeypatch):
@@ -626,3 +685,17 @@ def test_sidecar_missing_detected_even_without_version_drift(_stub):
     res = worker.sync("w")
     assert _stub["calls"]["run"] == [{"reflect": True}]
     assert res["changed"] is True
+
+
+def test_merge_es_runs_accumulates_embedding_and_elapsed_and_keeps_first_start():
+    from sherpa.ingest import worker as W
+    prev_s = {"available": True, "error": None, "chunks": 10, "indexed": 3, "embedded": 7, "embed_elapsed_ms": 500}
+    prev_t = {"started_at": "2026-09-13T00:00:00+00:00", "finished_at": "2026-09-13T00:00:01+00:00", "elapsed_ms": 1000}
+    new_s = {"available": True, "error": None, "chunks": 10, "indexed": 3, "embedded": 0, "embed_elapsed_ms": 0}
+    new_t = {"started_at": "2026-09-13T00:00:02+00:00", "finished_at": "2026-09-13T00:00:03+00:00", "elapsed_ms": 800}
+    s, t = W._merge_es_runs(prev_s, prev_t, new_s, new_t)
+    assert s["embedded"] == 7 and s["embed_elapsed_ms"] == 500 and s["indexed"] == 3
+    assert t["started_at"] == prev_t["started_at"] and t["finished_at"] == new_t["finished_at"]
+    assert t["elapsed_ms"] == 1800
+    # 初回が無ければ新しい値をそのまま
+    assert W._merge_es_runs(None, None, new_s, new_t) == (new_s, new_t)

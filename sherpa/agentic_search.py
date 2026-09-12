@@ -2621,13 +2621,72 @@ def _usage_counts_only(value):
     return value
 
 
+# 裁定（2026-09-12・返却上限は件数系の全ツールで50件・`store._TOOL_LIMIT_UPPER` と同値）。多くの
+# usage_* の内訳リスト（`usage_overview` の users/by_model/conversations_top、`usage_conversations`
+# の conversations 等）は既に `store.py` 側の構築時点で上位50件へ切ってある——バイト予算超過時だけ
+# 効く `_USAGE_SHRINK_STAGES` に任せて構わない。一方 `usage_daily` の系列（`series`）と
+# `usage_conversation_detail` の `response_time_series` は store.py 側に上限が無く、期間や
+# 会話のターン数によっては50件を超えたままバイト予算内に収まってしまい、この段では素通りする
+# （例: 60日分の usage_daily）。この2つのキーだけ、バイト予算より先に無条件で50件（直近側）へ
+# 間引く。
+_USAGE_RETURN_LIMIT = _USAGE_SHRINK_STAGES[0]
+_USAGE_UNBOUNDED_SERIES_KEYS = ("series", "response_time_series")
+# 利用量順（降順で返る）のトップレベル一覧＝上限超過は先頭（重い側）を残す。
+_USAGE_UNBOUNDED_ROW_KEYS = ("rows",)
+
+
+def _usage_limit_nested_series(value, limit: int, counter: list):
+    """ネストした辞書の中の時系列リスト（`_usage_is_series`＝date/week_start/turn を持つ要素）を
+    直近 `limit` 件へ間引く（概要ツールの daily／tokens.daily／downloads.daily／retention.weekly
+    のように深い位置にある系列も返却上限の対象にする）。省略件数は `counter[0]` に加算する。"""
+    if isinstance(value, dict):
+        return {k: _usage_limit_nested_series(v, limit, counter) for k, v in value.items()}
+    if isinstance(value, list) and _usage_is_series(value) and len(value) > limit:
+        counter[0] += len(value) - limit
+        return value[-limit:]
+    return value
+
+
+def _usage_apply_return_limit(result: dict, limit: int) -> dict:
+    """時系列（トップレベルの `_USAGE_UNBOUNDED_SERIES_KEYS` と、ネストした date/week_start/turn
+    系列＝直近側を残す）と利用量順の一覧（`_USAGE_UNBOUNDED_ROW_KEYS`＝先頭を残す）を `limit` 件へ
+    間引く。該当リストが無い、またはどれも `limit` 件以下ならそのまま返す（`truncated`/
+    `omitted_count` は付けない）。"""
+    omitted = 0
+    out = dict(result)
+    for key in _USAGE_UNBOUNDED_SERIES_KEYS:
+        items = out.get(key)
+        if isinstance(items, list) and len(items) > limit:
+            omitted += len(items) - limit
+            out[key] = items[-limit:]
+    for key in _USAGE_UNBOUNDED_ROW_KEYS:
+        items = out.get(key)
+        if isinstance(items, list) and len(items) > limit:
+            omitted += len(items) - limit
+            out[key] = items[:limit]
+    counter = [0]
+    out = _usage_limit_nested_series(out, limit, counter)
+    omitted += counter[0]
+    if omitted:
+        out["truncated"] = True
+        out["omitted_count"] = omitted
+    return out
+
+
 def _fit_usage_result(result: dict, max_bytes: int) -> dict:
     """usage 系ツール結果を `max_bytes` 以内に収める。予算内ならそのまま返す（`error` 辞書も無変更）。
-    超過時は内訳リストの上限を `_USAGE_SHRINK_STAGES` の順に下げ、収まった段で `truncated: true` を
-    付けて返す。最小段でも収まらなければ `_usage_counts_only` へ落とす（同じく `truncated: true`）。
+
+    まず返却上限（`_USAGE_RETURN_LIMIT`=50件）を、store.py 側にまだ上限が無い時系列
+    （`_usage_apply_return_limit` 参照）にバイト予算とは無関係に適用し、超えていれば
+    `truncated: true` と省略件数（`omitted_count`）を明示する。
+    その上でなおバイト予算を超える場合は、全内訳リストの上限を `_USAGE_SHRINK_STAGES` の順に下げ、
+    収まった段で `truncated: true` を付けて返す（`omitted_count` は返却上限の超過分のみを表す・
+    さらにバイト予算で追加間引きされた分はこの件数に含まない）。最小段でも収まらなければ
+    `_usage_counts_only` へ落とす（同じく `truncated: true`）。
     """
     if not isinstance(result, dict) or "error" in result:
         return result
+    result = _usage_apply_return_limit(result, _USAGE_RETURN_LIMIT)
     if _result_byte_size(result) <= max_bytes:
         return result
     for limit in _USAGE_SHRINK_STAGES:

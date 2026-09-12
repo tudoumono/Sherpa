@@ -194,3 +194,26 @@ def test_denies_command_substitution_inside_allowlisted_commands():
     # 置換を含まない正当操作は従来どおり
     assert _run("cp .env /tmp/x").returncode == 0
     assert _run("ls $(pwd)").returncode == 0
+
+
+def test_denies_grep_env_via_redirect_or_glob():
+    # grep は件数表示（-c 系）以外で早期 return しない＝入力リダイレクト直後
+    # （先頭引数の完全一致では `.env` と認識できない `<.env`）やグロブ（`.env*`）も
+    # 保険判定（セグメント全体の `.env` 言及走査）まで届いて拒否される。
+    assert _run("grep KEY <.env").returncode == 2
+    assert _run("grep KEY .env*").returncode == 2
+
+
+def test_denies_sed_in_place_with_command_substitution():
+    # -i／--in-place の許可は、引数のコマンド置換で中身が展開される形には及ばない。
+    assert _run('sed -i s/a/b/ "$(cat .env)"').returncode == 2
+
+
+def test_allows_grep_recursive_without_env():
+    r = _run("grep -r KEY .")
+    assert r.returncode == 0
+
+
+def test_allows_sed_in_place_on_plain_file():
+    r = _run("sed -i s/a/b/ notes.txt")
+    assert r.returncode == 0

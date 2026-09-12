@@ -1397,6 +1397,19 @@ def handle_message(session, message, world="v1",
             break
         if ev.get("type") == "node" and ev.get("id"):
             trace_nodes[ev["id"]] = ev
+    if result is None:
+        # provider が停止要求を事前ガードで検知し、追加イベントを一切 yield せず generator を
+        # 終える経路がある（例: `providers/base.py::_agentic_run` の `ctx.stop_event.is_set()`
+        # 早期 return）——この場合 for ループ本体が一度も走らず、上のループ内 stop 判定を経由しない
+        # まま result=None でループを抜ける。ここでも同じ停止監査・停止応答を返す
+        # （result=None の添字参照で 500 にしない）。
+        if stop_event is not None and stop_event.is_set():
+            _audit_chat_turn(user_id, conversation_id, settings, lens="stopped",
+                             user_msg_id=_user_msg["id"], assistant_msg_id=None, world=world,
+                             scope_paths=(scope_meta or {}).get("scope_paths"), personal=personal,
+                             stopped=True)
+            return {"type": "stopped", "conversation_id": conversation_id}
+        raise RuntimeError("provider did not yield a _result event")
     env = _finalize(result["env"], result["decision"])
     _pop_evidence_committed(env, trace_nodes)   # _result のサイドカーを trace へ折り込む（孤児イベント防止）
     env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない

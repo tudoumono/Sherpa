@@ -2657,8 +2657,13 @@ class _GenProvider(Provider):
         if acc:
             env["headline"] = acc
         if self._last_usage:                          # F3: メイン回答呼び出し分の usage を answer メタへ
+            from .. import depth_profile as depth_profile_mod
             env["usage"] = self._last_usage
-            _log_chat_usage(self._last_usage, time.monotonic() - t0, ctx.world)
+            # C6 是正: この単発経路（author を含む・非 agentic）も、他経路（:2404 の非ハイブリッド
+            # agentic）と同じく選択した深さ（depth_profile）を usage/ログへ載せる——本経路はループ
+            # 上限を渡さない（`_last_main_depth_usage` を持たない）ため常に `usage_extras` で組む。
+            env["usage"].update(depth_profile_mod.usage_extras((ctx.scope_meta or {}).get("depth_profile")))
+            _log_chat_usage(env["usage"], time.monotonic() - t0, ctx.world)
         if is_author:
             env["headline"] = _AUTHOR_FALLBACK_NOTE + env.get("headline", "")
         yield _node("brain", "think", f"考える（{self.label}）",

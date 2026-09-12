@@ -123,6 +123,34 @@ def _usage_tok(field: str) -> str:
             f"THEN (answer->'usage'->>'{field}')::bigint ELSE 0 END")
 
 
+# 会話の `kinds`（用途別内訳）の並び順: input+output（報告不能=None は 0）の降順・同値は kind 名。
+# バイト予算内へ間引く側（agentic_search）は先頭から残すため、この順にしておかないと
+# 間引きで最も重い用途が落ちうる（`usage_by_user`/`usage_conversations` の行ソートと同じ思想）。
+def _kind_sort_key(k: dict) -> tuple:
+    return (-((k.get("input") or 0) + (k.get("output") or 0)), k.get("kind") or "")
+
+
+# 利用者停止（`chat.turn` 監査の `detail.stopped=true`）を数える SQL。`detail.message_id_user`
+# （停止時の user 発言の message id・`chat_service._audit_chat_turn` が常に書く）で `messages` に
+# 結合し、その `created_at` を `turns`/`stop_kinds` と同じ `turn_created_at` 境界として使う——
+# 期間境界の直前に始まり直後に停止したターンが、監査時刻基準では「期間内の停止」に誤って
+# 数えられる食い違いを無くす。過去行（列追加前＝ detail に message_id_user が無い、または
+# 数値でない）は結合が成立せず `a.created_at`（従来どおり監査時刻）へフォールバックする
+# （遡及しない）。呼び出し側は境界2引数の後に `AND c.user_id = %s` 等を追加できる。
+def _stopped_turns_sql() -> str:
+    return (
+        "SELECT COUNT(*) AS n FROM audit_log a "
+        "JOIN conversations c ON a.resource_id = 'conv:' || c.id::text "
+        "LEFT JOIN messages um ON um.conversation_id = c.id "
+        "  AND um.id = CASE WHEN a.detail->>'message_id_user' ~ '^[0-9]+$' "
+        "    THEN (a.detail->>'message_id_user')::bigint END "
+        "WHERE a.action='chat.turn' AND a.detail->>'stopped' = 'true' "
+        "  AND c.deleted_at IS NULL AND c.origin='own' "
+        "  AND COALESCE(um.created_at, a.created_at) >= %s "
+        "  AND COALESCE(um.created_at, a.created_at) < %s"
+    )
+
+
 def _usage_token_sum_cols() -> str:
     return ("COUNT(*) AS turns, "
             f"SUM({_usage_tok('input_tokens')}) AS input, "
@@ -309,7 +337,9 @@ def usage_stats(days: int = 30) -> dict:
         未計測経路・過去データのほか、busy（Codex 直列化で実行していないターン）と API 経路の
         honest failure（型を特定できない失敗）も対象。
       - `stopped_turns`: 利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の件数——
-        停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない別集計。
+        停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない別集計。境界は
+        `turns`/`stop_kinds` と同じ `turn_created_at`（`detail.message_id_user` で結合した
+        user 発言の created_at・`_stopped_turns_sql` 参照）。
 
     全クエリは `_usage_period_bounds` の `[start_ts, end_exclusive_ts)` という同じ半開区間で絞る
     （下限のみだと、クロックスキュー/テスト由来の未来時刻行が
@@ -397,19 +427,15 @@ def usage_stats(days: int = 30) -> dict:
         ).fetchall()
         # 利用者停止（`stopped_by_user`）は assistant を保存しないため上の分布には出ない
         # （`chat_service.py::stream_message`/`handle_message` の stopped 分岐参照）——監査
-        # `chat.turn`（`detail.stopped=true`）から別途数える。`audit_log` は削除伝播の対象外
+        # `chat.turn`（`detail.stopped=true`）から別途数える（`_stopped_turns_sql` 参照・
+        # `turns`/`stop_kinds` と同じ `turn_created_at` 境界）。`audit_log` は削除伝播の対象外
         # （台帳の削除伝播は原本/MD/ES/Neo4j までで、監査ログは残置する契約）のため、
         # `conversations` と JOIN して `turns`/`stop_kinds` と同じ population（`deleted_at IS NULL
         # AND origin='own'`）に絞る——会話が後で削除されたり共有受領（origin != 'own'）だったりする分を
         # 母数から外す。`resource_id` は `chat.turn` 監査の書込側（`chat_service.py`／`routers/chat.py`）
         # が常に `f"conv:{conversation_id}"` 形式で書く契約。
         stopped_turns_row = c.execute(
-            "SELECT COUNT(*) AS n FROM audit_log a "
-            "JOIN conversations c ON a.resource_id = 'conv:' || c.id::text "
-            "WHERE a.created_at >= %s AND a.created_at < %s AND a.action='chat.turn' "
-            "  AND a.detail->>'stopped' = 'true' "
-            "  AND c.deleted_at IS NULL AND c.origin='own'",
-            (start_ts, end_exclusive_ts),
+            _stopped_turns_sql(), (start_ts, end_exclusive_ts)
         ).fetchone()
         heatmap_rows = c.execute(
             "SELECT EXTRACT(DOW FROM (m.created_at AT TIME ZONE 'Asia/Tokyo'))::int AS weekday, "
@@ -768,7 +794,7 @@ def usage_stats(days: int = 30) -> dict:
         })
         conv_token_total[r["cid"]] += (r["input"] or 0) + (r["output"] or 0)
     for entry in conv_map.values():
-        entry["kinds"].sort(key=lambda k: k["kind"])
+        entry["kinds"].sort(key=_kind_sort_key)
     conversations_top = sorted(
         conv_map.values(),
         key=lambda e: (-conv_token_total[e["conversation_id"]], e["conversation_id"]),
@@ -1027,7 +1053,7 @@ def usage_conversations(days: int = 30, uid: str | None = None, limit: int = 20,
         sk["tokens"] += (r["input"] or 0) + (r["output"] or 0)
         sk["elapsed"] += int(r["elapsed_ms_total"] or 0)
     for entry in conv_map.values():
-        entry["kinds"].sort(key=lambda k: k["kind"])
+        entry["kinds"].sort(key=_kind_sort_key)
     ordered = sorted(conv_map.values(),
                      key=lambda e: (-sort_key[e["conversation_id"]][sort], e["conversation_id"]))[:limit]
     return _tool_json_projection({
@@ -1120,6 +1146,7 @@ def usage_conversation_detail(conversation_id) -> dict:
             "elapsed_ms_avg": float(r["elapsed_ms_avg"]) if r["elapsed_ms_avg"] is not None else None,
             "elapsed_n": int(r["elapsed_n"] or 0),
         })
+    kinds.sort(key=_kind_sort_key)
     response_time_series = [{"turn": r["turn_no"], "duration_ms": int(r["duration_ms"]),
                              "provider": r["provider"] or "unknown"} for r in response_rows]
     return _tool_json_projection({"conversation_id": cid, "user_turns": summary_row["user_turns"] or 0,
@@ -1223,13 +1250,7 @@ def usage_stop_kinds(days: int = 30, uid: str | None = None) -> dict:
             params.append(uid)
         sql += " GROUP BY stop_kind ORDER BY n DESC"
         rows = c.execute(sql, params).fetchall()
-        stopped_sql = (
-            "SELECT COUNT(*) AS n FROM audit_log a "
-            "JOIN conversations c ON a.resource_id = 'conv:' || c.id::text "
-            "WHERE a.created_at >= %s AND a.created_at < %s AND a.action='chat.turn' "
-            "  AND a.detail->>'stopped' = 'true' "
-            "  AND c.deleted_at IS NULL AND c.origin='own'"
-        )
+        stopped_sql = _stopped_turns_sql()
         stopped_params = [start_ts, end_exclusive_ts]
         if uid:
             stopped_sql += " AND c.user_id = %s"

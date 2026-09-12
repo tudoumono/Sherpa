@@ -493,6 +493,44 @@ def test_gate_claimless_graph_card_passes_via_graph_node_evidence(monkeypatch):
         _restore_post(orig)
 
 
+def test_impact_graph_card_evidence_reaches_synthesis_prompt_not_zero(monkeypatch):
+    """C1 是正: impact レンズは agentic ループ経由だと `impact_service`（決定的グラフ集計）専用の
+    `items`/`presumed` を持たず、citations／`_synthesis_digest` だけを持つ。graph_neighbors card
+    （citation 0件・items/presumed 無し）だけで根拠ゲートを通った場合でも、清書入力（`_facts`）が
+    `_synthesis_digest`（グラフ確認済みの構造的根拠を含む全件ダイジェスト）を捨てて
+    「起点の影響: 計0件」に丸めてはならない（`providers/prompts.py::_facts` 参照）。"""
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"x"}'}}]}}]},
+        {"choices": [{"message": {"content": "グラフから確認しました。"}}]},
+    ]
+    orig = _install_post(seq)
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        if name == "graph_neighbors":
+            return ({"nodes": []}, set(), [],
+                   [{"name": "TAXCALC", "label": "Module", "category": "プログラム",
+                     "evidence": {"edges": [], "grep": []},
+                     "cid": "module:v1:04_運用/taxcalc.cob#TAXCALC"}])
+        return ({"error": f"unexpected tool {name}"}, set(), [], [])
+
+    monkeypatch.setattr(A, "run_tool", fake_run_tool)
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "impact", "input": ctx.message, "reason": "test"}))
+        assert p._synth_prompts, "合成プロンプトが一度も記録されなかった"
+        prompt = p._synth_prompts[-1]
+        # 「計0件」に丸めず、graph_neighbors card の構造的根拠を含む digest をそのまま清書へ渡す。
+        assert "計0件" not in prompt
+        assert "[graph]" in prompt and "TAXCALC" in prompt
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"   # ゲートを通り合成まで到達
+    finally:
+        _restore_post(orig)
+
+
 def test_gate_claimless_graph_card_without_cid_does_not_pass(monkeypatch):
     """機械検証（常時実施）では、裏付け doc も cid も無い card を非一意な `label:name` で昇格させず
     根拠ゲートを通さない（サブループ経路）。"""

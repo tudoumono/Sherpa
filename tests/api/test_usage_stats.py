@@ -901,6 +901,59 @@ def test_usage_stats_turns_and_stop_kinds_agree_across_period_boundary():
     )
 
 
+def test_usage_stats_stopped_turns_use_user_message_time_not_audit_write_time_for_boundary():
+    """CR-1 ⑪是正（Codex 節 C3）: `stopped_turns` は監査行自体の `created_at` ではなく、
+    `detail.message_id_user`（`_audit_chat_turn` が常に書く）で結合した user 発言の created_at
+    （`turns`/`stop_kinds` と同じ `turn_created_at` 境界）で期間を絞る。
+
+    期間開始の直前に始まったターン（user 発言 = start_ts - 1秒 = 期間外）が、監査への書き込みが
+    期間開始の直後にずれ込んだ（= start_ts + 1秒・API/DB のわずかな遅延を模す）だけで
+    「期間内の停止」に誤って数えられないことを固定する（是正前は監査の created_at だけを見ており、
+    この食い違いが起きていた）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from datetime import timedelta
+
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgstbadm{sfx}", f"UsageStbAdm{sfx}"
+    uid, pw = f"usgstb{sfx}", f"UsageStb{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    admin = _login(admin_uid, admin_pw)
+
+    days = 30
+    start_ts, _start_date, _end_date, _end_exclusive_ts = store._usage_period_bounds(days)
+
+    def _stopped_turns():
+        r = admin.get(f"/admin/usage/stats?days={days}")
+        assert r.status_code == 200, r.text
+        return r.json()["stopped_turns"]
+
+    before = _stopped_turns()
+
+    conv = store.create_conversation(user_id=uid, world=f"stbworld{sfx}")
+    msg = store.add_message(conv["id"], "user", "止めて（期間開始の直前に始まったターン）")
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET created_at = %s WHERE id=%s",
+                  (start_ts - timedelta(seconds=1), msg["id"]))
+
+    store.audit(uid, "chat.turn", "conversation", f"conv:{conv['id']}",
+               detail={"stopped": True, "message_id_user": msg["id"]}, outcome="success")
+    with psycopg.connect(store._dsn()) as c:
+        c.execute(
+            "UPDATE audit_log SET created_at = %s WHERE id = ("
+            "  SELECT id FROM audit_log WHERE actor_user_id=%s AND action='chat.turn' "
+            "  ORDER BY id DESC LIMIT 1)",
+            (start_ts + timedelta(seconds=1), uid),
+        )
+
+    after = _stopped_turns()
+    assert after - before == 0, (
+        "期間開始の直前に始まったターンが、監査行の書き込み時刻（期間開始の直後）だけで"
+        "stopped_turns に数えられている（turn_created_at 境界と食い違う）"
+    )
+
+
 def test_usage_stats_downloads_total_and_daily_from_audit():
     """6. 原本DL数: document.downloaded の期間合計＋日別内訳。delta で確認する。"""
     if not _try_init():
@@ -1692,6 +1745,49 @@ def test_usage_stats_conversations_top_splits_by_conversation_and_excludes_null_
         assert idx_hi < idx_lo
     finally:
         _delete_usage_events_by_model(models)
+
+
+def test_usage_stats_conversations_top_kinds_ordered_by_usage_desc_not_by_name():
+    """STAT-4 C2是正: `conversations_top` の各行の `kinds` は用途名のアルファベット順ではなく
+    input+output 降順（同値は kind 名）で並ぶ——バイト予算超過時の間引き（先頭優先）で、最も
+    重い用途が落ちないようにするため。`chat`（軽量）と `embed`（重量）を同じ会話へ仕込み、
+    名前順なら `chat` が先（'c' < 'e'）だが、使用量順では `embed` が先に出ることを固定する。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgckadm{sfx}", f"UsageCkAdm{sfx}"
+    uid, pw = f"usgck{sfx}", f"UsageCk{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"ckworld{sfx}"
+    m_embed = f"test-model-ck-embed-{sfx}"
+
+    conv = store.create_conversation(user_id=uid, world=world)
+    # chat: 軽量（1ターン・小さいトークン量）。
+    store.add_message(conv["id"], "user", "会話-1ターン目")
+    store.add_message(conv["id"], "assistant", "(chat)への回答", lens="chat",
+                      answer={"usage": {"provider": "openai", "model": f"gpt-ck-{sfx}",
+                                        "input_tokens": 1, "cached_input_tokens": 0,
+                                        "output_tokens": 1, "reasoning_output_tokens": 0}})
+    try:
+        # embed: 重量（chat よりはるかに大きいトークン量）。'embed' > 'chat' はアルファベット順では
+        # 後（e > c）だが、使用量では embed が圧倒的に大きい。
+        store.add_usage_event(kind="embed", provider="openai", model=m_embed,
+                              input_tokens=10 ** 9, cached_input_tokens=0, output_tokens=10 ** 9,
+                              reasoning_output_tokens=0, calls=1, user_id=uid, world=world,
+                              conversation_id=conv["id"])
+
+        admin = _login(admin_uid, admin_pw)
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        conversations_top = r.json()["conversations_top"]
+        row = next(x for x in conversations_top if x["conversation_id"] == conv["id"])
+        kind_names = [k["kind"] for k in row["kinds"]]
+        assert kind_names == ["embed", "chat"], (
+            f"kinds の並びが使用量降順になっていない（名前順のままなら chat が先に出る）: {kind_names}"
+        )
+    finally:
+        _delete_usage_events_by_model([m_embed])
 
 
 def test_usage_stats_conversations_top_truncates_to_20_ordered_desc_by_tokens():
