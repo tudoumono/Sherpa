@@ -582,6 +582,9 @@ class AdminSettingsView(BaseModel):
     depth_profile: DepthProfileAdminInfo
     chat_max_turns: ChatMaxTurnsAdminInfo
     agentic_budget: AgenticBudgetAdminInfo
+    # API 経路の 1 応答あたりのツール実行上限（`agentic_search.effective_max_tools_per_turn`）。
+    # `DepthProfileBaseInfo` と同型（configured=管理者の生値・effective=解決結果・default=コード既定）。
+    agentic_tool_limit: DepthProfileBaseInfo
     chat_examples: ChatExamplesAdminInfo
 
 
@@ -747,7 +750,7 @@ class UsageProviderRow(BaseModel):
 
 
 class UsageStopKindRow(BaseModel):
-    """STAT-3 S3（2026-09-11-利用統計の拡充.md T3）: `sherpa/stop_kind.py` の閉じた8値
+    """`sherpa/stop_kind.py` の閉じた8値
     （`completed`/`stopped_by_user`/`budget`/`no_evidence`/`transport_error`/`timeout`/
     `codex_silent`/`codex_partial`）またはそのいずれにも該当しない過去データ/未計測経路の
     `unknown` のいずれか。"""
@@ -850,8 +853,8 @@ class UsageTokens(BaseModel):
 class UsageConversationTurns(BaseModel):
     """会話あたりの user ターン数分布。
 
-    値は期間内に発言のあった会話に絞った上で、その会話の全履歴の user ターン数を集計したもの
-    （期間内のターンだけに限定しない）。対象会話が無ければ全て None。
+    値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に
+    user ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ全て None。
     """
     avg: float | None
     median: float | None

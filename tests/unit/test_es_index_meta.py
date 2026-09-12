@@ -2568,25 +2568,34 @@ def test_index_world_partial_batch_item_errors_wipes_index_and_returns_bulk_erro
     assert delete_calls == ["w", "w"]
 
 
-def test_index_world_no_chunks_returns_error_and_skips_content_sig_confirm(monkeypatch):
-    """文書はあるのに全文書のチャンクが0件の場合、`error == "no_chunks"` を返し
-    `_confirm_content_sig` を呼ばない（次回 sync が必ず再索引を試みる）。索引自体は
-    元々空なので `delete_world` の wipe は不要。"""
-    _setup_index_world_multi_chunk_docs(monkeypatch, 3)
-    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
+def test_index_world_empty_text_only_world_converges_without_no_chunks(monkeypatch, tmp_path):
+    """本文が空白のみの文書だけで構成される world は `_iter_doc_chunk_records` が
+    `(None, {"reason": "empty_text"})` を返して処理対象外にする（この文書を数えない）ため、
+    `n_docs == 0` となり `no_chunks` ガード（`n_docs > 0 and total_chunks == 0`）の対象外になる。
+    実ファイルを置いた derived 木に対して `index_world()` を連続2回呼び、どちらも `error` が
+    立たず `content_sig` が確定することを固定する（`_req`/`_confirm_content_sig` の ES 境界だけ
+    monkeypatch し、`_iter_doc_chunk_records` 自体は本物を通す）。"""
+    wd = tmp_path / "root"
+    wd.mkdir()
+    (wd / "a.md").write_text("   \n\t\n", encoding="utf-8")   # 空白のみ
+    (wd / "b.md").write_text("", encoding="utf-8")            # 空ファイル
 
-    def fake_iter(world, d, derived, rag_exts, res_map=None):
-        return iter([]), None                          # 文書は数えるがチャンクは1件も出さない
+    monkeypatch.setattr(es_index.worlds, "world_dir", lambda w: wd)
+    monkeypatch.setattr(es_index.worlds, "derived_md_dir", lambda w: tmp_path / "derived" / "md")
+    monkeypatch.setattr(es_index.worlds, "derived_rag_dir", lambda w: tmp_path / "derived" / "rag")
 
-    monkeypatch.setattr(es_index, "_iter_doc_chunk_records", fake_iter)
     confirmed = []
     monkeypatch.setattr(es_index, "_confirm_content_sig", lambda w, sig: confirmed.append(sig))
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {})
 
-    r = es_index.index_world("w", content_sig="sig-x")
-    assert r["error"] == "no_chunks"
-    assert r["indexed"] == 3 and r["chunks"] == 0
-    assert confirmed == []
+    for _ in range(2):                                 # 2回連続で呼んでも収束したまま（再索引ループにならない）
+        r = es_index.index_world("w", content_sig="sig-x")
+        assert r.get("error") is None
+        assert r["indexed"] == 0 and r["chunks"] == 0
+        assert r["rag_degraded"] == 2                  # 空白のみ2文書とも「処理対象外」として計数される
+        assert {d["reason"] for d in r["rag_degraded_docs"]} == {"empty_text"}
+
+    assert confirmed == ["sig-x", "sig-x"]
 
 
 def test_index_world_single_batch_default_thresholds_still_refreshes(monkeypatch):

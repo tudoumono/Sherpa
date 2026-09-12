@@ -741,6 +741,10 @@ class CodexProvider(Provider):
         # `env["codex_stopped_early"]` 判定用フラグも既定 False にしておく——`_agent_msgs` 等が
         # 存在するのは if ブロック内だけのため、実測値への上書きもそこでだけ行う。
         _codex_stopped_early = False
+        # if ブロックが丸ごとスキップされる経路（`ws_authoring`/`run_dir` が None・shutil.which 不在等）
+        # では Popen 自体を試みていない＝技術的失敗ではないため既定 False（第3分岐で参照するため
+        # ここで定義しておく必要がある・if ブロック内だけで代入すると NameError になる）。
+        _stream_error = False
         codex_question = None                                    # ask_user 由来の question（出たら env/_result を出さずターン終了）
         codex_usage = None                                       # turn.completed の usage（best-effort・出なければ None）
         # resume 試行が失敗し新規セッションへ切り替わったら True にする（if ブロックが丸ごと
@@ -1821,6 +1825,10 @@ class CodexProvider(Provider):
                     env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
                 env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
                 env["headline"] = _body if (_verified_refs and _body.strip()) else answer   # 空本文には差し替えない
+                # 実際に回答を生成できたターン＝`_dispatch` がツール遮断時に立てた
+                # `agentic_failure`（`agentic_search.tools_blocked_env`）が残っていれば消す
+                # （Codex は遮断状態を見ずに調査を続行し得るため、結果が出た後の事実で上書きする）。
+                env.pop("agentic_failure", None)
                 # 自動継続を尽くしてもなお進行中の宣言文（「次に○○します」等）がそのまま headline に
                 # 残ったターン——本文は書き換えない（`answer` は既存どおりそのまま使う）。`_codex_stopped_early`
                 # だけを根拠に envelope へ印を付け、chat_service._finalize が予算到達時の途中結果・出典0件時の案内と同形式
@@ -1831,7 +1839,7 @@ class CodexProvider(Provider):
                 yield _node("codex", "think", "Codex が調べる",
                             "調べて回答をまとめました" if ran else "回答をまとめました", "done")
             elif _codex_silent_failure:
-                # STAT-3 T3: 利用統計の終了理由分布（`stop_kind_mod.resolve`）がこの分岐を
+                # 利用統計の終了理由分布（`stop_kind_mod.resolve`）がこの分岐を
                 # `codex_silent` と判定できるよう印を立てる（値の意味づけは chat_service 側）。
                 env["codex_silent_failure"] = True
                 # `_gather` が組み立てた決定的回答をそのまま返さない＝利用者に「AI が答えていない」
@@ -1873,6 +1881,11 @@ class CodexProvider(Provider):
                 # agent_message が無いまま（利用者の明示停止等で）打ち切られた。silent failure 分岐は
                 # headline 自体で「Codex に接続できませんでした」と既に告知しているため対象外のまま、
                 # ここは env["headline"] が `_gather` の決定的回答のままの場合にも注記を出す。
+                # `_stream_error` は Popen 完走前（authoring 設定書き込み等）の例外でも立つため、
+                # `attempt_returncode is None` のまま `_codex_silent_failure` が計算されずここに落ちても
+                # 終了理由の分布から漏らさない（`stop_kind.resolve` の codex_silent 判定に必要な印）。
+                if _stream_error:
+                    env["codex_silent_failure"] = True
                 if _codex_stopped_early:
                     env["codex_stopped_early"] = True
                 yield _node("codex", "think", "Codex が調べる", "（未応答のため決定的回答に切替）", "done")

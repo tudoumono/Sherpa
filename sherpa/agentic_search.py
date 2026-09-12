@@ -26,7 +26,7 @@ import time
 import urllib.error
 from pathlib import Path
 
-from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, redact_keys, worlds
+from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, redact_keys, stop_kind, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
 from . import tools_pref as tools_pref_mod
@@ -2862,13 +2862,11 @@ _MIN_SEND_TIMEOUT_SEC = 1.0       # 待機後にこれ未満しか送信時間�
 
 
 def _is_timeout_error(exc: Exception) -> bool:
-    """応答タイムアウトか（`TimeoutError` 直接、または `URLError` が timeout を reason に包んだ形の
-    どちらも見る）。タイムアウトは上流（プロバイダ側）で処理/課金が既に進んでいる可能性があり、
+    """応答タイムアウトか（判定の実装は `stop_kind.is_timeout_exc` を唯一の真実源として使う）。
+    タイムアウトは上流（プロバイダ側）で処理/課金が既に進んでいる可能性があり、
     再試行すると二重送信・二重課金になり得るため非リトライの全体契約とする（`_retryable_post_error`・
-    `_run_evaluation` の両方が本関数を単一の真実源として使う）。"""
-    if isinstance(exc, TimeoutError):
-        return True
-    return isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
+    `_run_evaluation` の両方が本関数を使う）。"""
+    return stop_kind.is_timeout_exc(exc)
 
 
 _CONNECTION_FAILURE_ERRNOS = frozenset({errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN})
@@ -4077,10 +4075,10 @@ STOP_REASONS = frozenset({
 # STOP-1: 調査予算（ターン数／呼び出し予算／1応答あたりの調べる操作の回数）到達で
 # 打ち切られた3値——`providers/base.py::_agentic_run` がこの3値を「一般的な失敗」（空回答→単発
 # grep フォールバック）から分離し、固定文言の headline と既存 Evidence Packet を最終 envelope へ
-# 載せる根拠に使う（`web/chat/render.js::BUDGET_EXHAUSTED_STOP_REASONS`＝表示側の注記表示可否・
-# `stop_kind._BUDGET_STOP_REASONS`＝終了理由の分布、と同じ分類の独立実装が 2 つある＝値は必ず
-# 3 箇所揃えて更新する）。
-_BUDGET_EXHAUSTED_STOP_REASONS = frozenset({"turns_exhausted", "budget_exceeded", "tools_per_turn_exceeded"})
+# 載せる根拠に使う。値の実装は `stop_kind._BUDGET_STOP_REASONS` を唯一の真実源として参照する
+# （`web/chat/render.js::BUDGET_EXHAUSTED_STOP_REASONS` は表示側の別実装のまま＝そちらを変える
+# 場合は別途揃える）。
+_BUDGET_EXHAUSTED_STOP_REASONS = stop_kind._BUDGET_STOP_REASONS
 # EV-0（拡張設計 §4.4）: main の3方言・クリーン再合成が帰属呼び出しへ進んでよい「自然完了」の
 # 完了理由 allowlist（方言別）——理由欠落・`content_filter`・`SAFETY`・打ち切り（openai/ollama
 # 互換="length"・anthropic/bedrock="max_tokens"）等の未知/非自然な理由はすべて対象外（帰属を

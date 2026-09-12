@@ -168,6 +168,10 @@ def _stats_projection(stats: dict, *, limit_users: int, limit_tok_users: int, li
         "retention": stats.get("retention"),
         "downloads": stats.get("downloads"),
         "daily": stats.get("daily"),
+        "stop_kinds": stats.get("stop_kinds"),
+        "stopped_turns": stats.get("stopped_turns"),
+        "conversation_turns": stats.get("conversation_turns"),
+        "resume_rate": stats.get("resume_rate"),
         "users": (stats.get("users") or [])[:limit_users],
         "tokens": {
             "totals": tokens.get("totals"),

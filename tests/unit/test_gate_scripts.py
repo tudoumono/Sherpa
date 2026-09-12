@@ -368,3 +368,32 @@ def test_register_or_rerun_rejects_pytest_namespace_world_id(monkeypatch, tmp_pa
 
     with pytest.raises(was.WorldAdminValidationError):
         was.register_or_rerun(str(root), world_id="pytest-shouldnotregister")
+
+
+# ===== scripts/check_comment_only.py: 削除済みファイルでもクラッシュしない ======================
+
+def test_check_comment_only_reports_deleted_file_without_traceback(tmp_path):
+    """base には存在し作業ツリーから削除された `.py` ファイルを渡しても、`FileNotFoundError` の
+    トレースバックで落ちずに `bad` へ積んで `checked N files` の要約まで出す（CR-1 ⑩）。
+    スクラッチ git リポで base コミット→削除を再現し、実リポの履歴に依存しない。"""
+    repo = tmp_path / "scratch_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+    target = repo / "gone.py"
+    target.write_text("def f():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "add", "gone.py"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=str(repo), check=True)
+    base_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True,
+                               text=True, check=True).stdout.strip()
+    target.unlink()
+
+    proc = subprocess.run(
+        [PY, str(ROOT / "scripts" / "check_comment_only.py"), base_sha, "gone.py"],
+        cwd=str(repo), capture_output=True, text=True, timeout=30,
+    )
+    assert "Traceback" not in proc.stderr
+    assert "作業ツリーに無い" in proc.stderr
+    assert "checked 1 files" in proc.stdout
+    assert proc.returncode == 1

@@ -950,12 +950,13 @@ def _is_budget_exhausted(env: dict) -> bool:
     出典0件（`_no_genuine_results`）と重なっても、予算切れは「探しても恒久的に見つからない」とは
     別の状態のため、この関数が真を返す場合は `_finalize` の「見つからない」断定で headline を
     上書きしない。`task_id == "main"`（`citations.build_evidence_packet` の呼び出し元・
-    `providers/base.py::_agentic_run` が `self._sub is None` のときだけ渡す値）に限定する——
-    ハイブリッド（`task_id == "sub:{profile_id}"`）は provider 側の budget_exhausted ガード自体が
-    `self._sub is None` に限定されており固定 headline を据えていないため、ここでも従来どおり
-    0件時の断定文言（`_NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE`）を適用する対象のまま揃える。"""
+    `providers/base.py::_agentic_run` が `self._sub is None` のときだけ渡す値）に限定する
+    （`stop_kind_mod.is_main_task` と共有する述語）——ハイブリッド（`task_id == "sub:{profile_id}"`）
+    は provider 側の budget_exhausted ガード自体が `self._sub is None` に限定されており固定
+    headline を据えていないため、ここでも従来どおり 0件時の断定文言
+    （`_NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE`）を適用する対象のまま揃える。"""
     packet = (env.get("data") or {}).get("evidence_packet") or {}
-    return (packet.get("task_id") == "main"
+    return (stop_kind_mod.is_main_task(packet)
            and packet.get("stop_reason") in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS)
 
 
@@ -975,7 +976,7 @@ def _finalize(env, decision):
     env["lens"] = decision["lens"]
     env["route"] = {"lens": decision["lens"], "reason": decision["reason"],
                     "path": _ROUTE_PATH.get(decision["lens"], [])}
-    # STAT-3 T3: 終了理由を閉じた語彙（8値）へ正規化して `messages.answer.stop_kind` に残す
+    # 終了理由を閉じた語彙（8値）へ正規化して `messages.answer.stop_kind` に残す
     # （利用統計の終了理由分布の唯一の真実源＝`stop_kind_mod.resolve` 参照）。利用者の明示停止
     # （`stopped_by_user`）はこの関数を経由しない別分岐（assistant 未保存）のためここでは出ない。
     # `resolve` が None（busy／型を特定できない honest failure）のときは立てない＝NULL のまま

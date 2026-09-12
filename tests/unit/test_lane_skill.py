@@ -102,3 +102,39 @@ def test_lane_status_sh_emits_one_line_for_a_worktree(tmp_path):
     assert str(wt) in r.stdout
     # main 本体（repo 自身）は表に出ない。
     assert str(repo) + " |" not in r.stdout
+
+
+def test_lane_status_sh_merge_tree_check_does_not_write_to_real_object_store(tmp_path):
+    """CR-1 ⑯: 「読み取り専用」を謳う本スクリプトが `merge-tree --write-tree` の副作用で
+    本体のオブジェクトストアへ書き込まないことを、実行前後の loose object 数で固定する
+    （衝突なしレーン＝「ゲート待ち」の分岐で merge-tree が実際に呼ばれる状況を作る）。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    wt = tmp_path / "wt-sample"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "topic/sample2", str(wt), "main"],
+                    cwd=repo, check=True, capture_output=True, text=True)
+    (wt / "b.txt").write_text("y", encoding="utf-8")
+    subprocess.run(["git", "add", "b.txt"], cwd=wt, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "topic change"], cwd=wt, check=True)
+
+    def _loose_object_count() -> int:
+        out = subprocess.run(["git", "count-objects", "-v"], cwd=repo, capture_output=True,
+                              text=True, check=True).stdout
+        for line in out.splitlines():
+            if line.startswith("count:"):
+                return int(line.split(":")[1].strip())
+        raise AssertionError(f"count-objects の出力に count: が無い: {out}")
+
+    before = _loose_object_count()
+    r = subprocess.run(["bash", str(LANE_STATUS)], cwd=repo, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "ゲート待ち" in r.stdout, r.stdout   # merge-tree が実際に呼ばれた分岐であることの確認
+    after = _loose_object_count()
+    assert after == before, f"merge-tree の write-tree が本体オブジェクトストアを汚した: {before} -> {after}"

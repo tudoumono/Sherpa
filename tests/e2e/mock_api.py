@@ -848,13 +848,26 @@ USAGE_STATS_DEFAULT = {
         # 「—」描画（fmtTokOrDash）を実演する。
         "by_kind": [
             {"kind": "chat", "provider": "codex", "model": "gpt-5.5", "calls": 4, "input": 10000,
-             "cached_input": 3000, "output": 1500, "reasoning_output": 900},
+             "cached_input": 3000, "output": 1500, "reasoning_output": 900,
+             "elapsed_ms_total": 48000, "elapsed_ms_avg": 12000.0, "elapsed_n": 4},
             {"kind": "intent", "provider": "openai", "model": "gpt-4o-mini", "calls": 3,
-             "input": 450, "cached_input": 0, "output": 60, "reasoning_output": 0},
+             "input": 450, "cached_input": 0, "output": 60, "reasoning_output": 0,
+             "elapsed_ms_total": 900, "elapsed_ms_avg": 300.0, "elapsed_n": 3},
             {"kind": "embed", "provider": "gemini", "model": "gemini-embedding-001", "calls": 2,
-             "input": None, "cached_input": None, "output": None, "reasoning_output": None},
+             "input": None, "cached_input": None, "output": None, "reasoning_output": None,
+             "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
         ],
     },
+    # 会話あたりの user ターン数（avg/median/max/p90）と Codex resume 継続率
+    "conversation_turns": {"avg": 3.0, "median": 2.0, "max": 6, "p90": 5.0},
+    "resume_rate": 0.5,
+    # ターンの終了理由の分布（`sherpa/stop_kind.py` の 8 値＋'unknown'）と利用者の明示停止数
+    "stop_kinds": [
+        {"stop_kind": "completed", "turns": 14},
+        {"stop_kind": "budget", "turns": 2},
+        {"stop_kind": "unknown", "turns": 1},
+    ],
+    "stopped_turns": 1,
 }
 
 

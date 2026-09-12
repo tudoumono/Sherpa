@@ -2841,3 +2841,174 @@ def test_web_search_new_conversation_always_starts_off(page, web_base_url):
     page.locator("#newbtn").click()
     expect(page.locator("#websearchtoggle")).to_be_visible()
     expect(page.locator("#websearchtoggle")).not_to_have_class(re.compile(r"\bon\b"))
+
+
+# ===== mdLite の拡張記法（表・リンク・入れ子リスト・引用・水平線・####）=====
+# 描画関数そのものを page.evaluate で呼ぶ（ストリーム配線は上の既存テストが担保）。
+
+def _md(page, web_base_url, text):
+    page.goto(f"{web_base_url}/login.html")
+    return page.evaluate("(t) => Sherpa.mdLite(t)", text)
+
+
+def test_mdlite_renders_table_with_alignment(page, web_base_url):
+    html = _md(page, web_base_url, "| 項目 | 件数 |\n|---|--:|\n| A | 1 |\n| B | 2 |")
+    assert html.startswith('<table class="md-table"><thead><tr><th>項目</th><th class="md-al-right">件数</th></tr></thead>')
+    assert '<tr><td>B</td><td class="md-al-right">2</td></tr>' in html
+
+
+def test_mdlite_links_only_http_https_and_open_in_new_tab(page, web_base_url):
+    html = _md(page, web_base_url,
+               "[資料](https://example.com/a?x=1&y=2) [危険](javascript:alert(1)) [d](data:text/html,x)")
+    assert '<a href="https://example.com/a?x=1&amp;y=2" target="_blank" rel="noopener noreferrer">資料</a>' in html
+    assert "<a" in html and html.count("<a ") == 1          # javascript:/data: はリンクにならない
+    assert "[危険](javascript:alert(1))" in html
+
+
+def test_mdlite_nested_lists_and_alt_bullets(page, web_base_url):
+    html = _md(page, web_base_url, "* 一\n  - 一の子\n  1. 番号の子\n+ 二")
+    assert html == "<ul><li>一<ul><li>一の子</li></ul><ol><li>番号の子</li></ol></li><li>二</li></ul>"
+
+
+def test_mdlite_blockquote_hr_and_deep_headings(page, web_base_url):
+    html = _md(page, web_base_url, "> 引用 **強調**\n> 続き\n\n---\n\n#### 見出し4")
+    assert html == ("<blockquote><p>引用 <strong>強調</strong><br>続き</p></blockquote>"
+                    "<hr><p><strong>見出し4</strong></p>")
+
+
+def test_mdlite_table_cells_and_quotes_stay_escaped(page, web_base_url):
+    html = _md(page, web_base_url, "| <b>x</b> |\n|---|\n| <img src=x onerror=window.__xss=1> |\n\n> <script>1</script>")
+    assert "<b>" not in html and "<img" not in html and "<script>" not in html
+    assert "&lt;img src=x onerror=window.__xss=1&gt;" in html
+
+
+# ===== CR-2 §3 ①〜⑨（回答表示の精度是正）=====
+# 各テストは提案書の「再現」入力を _mdLite に直接通し、期待どおりに直ることを固定する。
+
+def test_mdlite_italic_flanking_ignores_bare_asterisks(page, web_base_url):
+    # ①: 斜体はフランキング判定（開き直後・閉じ直前の空白を禁止）で、SQL のワイルドカードや
+    # COBOL の乗算演算子のような単発の `*` を誤って強調にしない。
+    html = _md(page, web_base_url, "SELECT * FROM T WHERE a * b > 0")
+    assert html == "<p>SELECT * FROM T WHERE a * b &gt; 0</p>"
+    html2 = _md(page, web_base_url, "*.cbl と *.cpy を対象")
+    assert html2 == "<p>*.cbl と *.cpy を対象</p>"
+
+
+def test_mdlite_table_cell_split_respects_escape_and_code_span(page, web_base_url):
+    # ②: 表セルはバッククォート区間の外・直前が \ でない | だけで分割し、残った \| は | へ戻す。
+    # コードスパン内の | もセルの継ぎ目にしない。
+    html = _md(page, web_base_url, "| 条件 | 意味 |\n|---|---|\n| A \\| B | A または B |")
+    assert ("<table class=\"md-table\"><thead><tr><th>条件</th><th>意味</th></tr></thead>"
+            "<tbody><tr><td>A | B</td><td>A または B</td></tr></tbody></table>") == html
+
+    html2 = _md(page, web_base_url, "| コード | 意味 |\n|---|---|\n| `a|b` | aまたはb |")
+    assert ("<table class=\"md-table\"><thead><tr><th>コード</th><th>意味</th></tr></thead>"
+            "<tbody><tr><td><code>a|b</code></td><td>aまたはb</td></tr></tbody></table>") == html2
+
+
+def test_mdlite_quote_requires_boundary_after_gt(page, web_base_url):
+    # ③: 行頭の `>` は直後が空白または行末のときだけ引用にする（`>=` を引用と誤認識しない）。
+    html = _md(page, web_base_url, "残高 >= 0 の場合\n>= 0 なら継続")
+    assert html == "<p>残高 &gt;= 0 の場合<br>&gt;= 0 なら継続</p>"
+
+
+def test_mdlite_fence_info_string_allows_space(page, web_base_url):
+    # ④: 開き fence は3連バッククォートと info string の間の空白を許す。誤って以降の全文を
+    # コードブロックに飲み込まない。
+    html = _md(page, web_base_url, "``` sql\nSELECT 1\n```\n\n次の段落 **太字**")
+    assert html == "<pre class=\"md-code\"><code>SELECT 1</code></pre><p>次の段落 <strong>太字</strong></p>"
+
+
+def test_mdlite_list_indented_fence_becomes_code_block(page, web_base_url):
+    # ⑤: リスト内の字下げされたコードフェンスを認識し、字下げを剥がして <pre><code> にする
+    # （リストも分断しない）。
+    html = _md(page, web_base_url, "1. 実行:\n   ```sql\n   SELECT 1\n   ```\n2. 完了")
+    assert html == "<ol><li>実行:<pre class=\"md-code\"><code>SELECT 1</code></pre></li><li>完了</li></ol>"
+
+
+def test_mdlite_ordered_list_start_and_loose_continuation(page, web_base_url):
+    # ⑥: 番号付きリストは先頭番号から <ol start=N> を出し、項目間の空行1行・字下げ継続行は
+    # リストを打ち切らない。
+    html = _md(page, web_base_url, "1. 手順A\n\n2. 手順B\n\n3. 手順C")
+    assert html == "<ol><li>手順A</li><li>手順B</li><li>手順C</li></ol>"
+
+    html2 = _md(page, web_base_url, "1. 手順A\n   詳細A\n2. 手順B")
+    assert html2 == "<ol><li>手順A<br>詳細A</li><li>手順B</li></ol>"
+
+    html3 = _md(page, web_base_url, "3. 三\n4. 四")
+    assert html3 == '<ol start="3"><li>三</li><li>四</li></ol>'
+
+
+def test_mdlite_link_url_allows_one_level_of_parens(page, web_base_url):
+    # ⑦: リンク URL は1段の対応括弧を許し、括弧付き URL（Wikipedia 等）の href を途中で切らない。
+    html = _md(page, web_base_url, "[wiki](https://ja.wikipedia.org/wiki/COBOL_(言語)) を参照")
+    assert html == ('<p><a href="https://ja.wikipedia.org/wiki/COBOL_(言語)" '
+                     'target="_blank" rel="noopener noreferrer">wiki</a> を参照</p>')
+
+
+def test_mdlite_table_row_detection_unified_structure(page, web_base_url):
+    # ⑧: ヘッダ・区切り・本体行の判定を「外側の | は任意・2セル以上」の同一構造判定に統一する
+    # （区切り行とヘッダのセル数不一致は表として検出しない）。外側パイプの無い表・末尾パイプを
+    # 欠く本体行のいずれも表が途中で終わらない。
+    html = _md(page, web_base_url, "| a | b |\n|---|---|\n| 1 | 2\n| 3 | 4 |")
+    assert ("<table class=\"md-table\"><thead><tr><th>a</th><th>b</th></tr></thead>"
+            "<tbody><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr></tbody></table>") == html
+
+    html2 = _md(page, web_base_url, "項目 | 件数\n--- | ---\nA | 1")
+    assert ("<table class=\"md-table\"><thead><tr><th>項目</th><th>件数</th></tr></thead>"
+            "<tbody><tr><td>A</td><td>1</td></tr></tbody></table>") == html2
+
+
+def test_mdlite_emphasis_and_link_span_code_spans(page, web_base_url):
+    # ⑨: コードスパンをプレースホルダへ退避して結合済み文字列に太字/斜体/リンクを適用し、最後に
+    # 復元する。コードスパンをまたぐ太字・`*` を含む太字・コードスパンを含むリンクのいずれも通る。
+    html = _md(page, web_base_url, "**`MOVE`** 文は転記")
+    assert html == "<p><strong><code>MOVE</code></strong> 文は転記</p>"
+
+    html2 = _md(page, web_base_url, "**COUNT(*)** は **NULL** を数えない")
+    assert html2 == "<p><strong>COUNT(*)</strong> は <strong>NULL</strong> を数えない</p>"
+
+    html3 = _md(page, web_base_url, "[`README.md`](https://x/README.md)")
+    assert html3 == ('<p><a href="https://x/README.md" target="_blank" '
+                      'rel="noopener noreferrer"><code>README.md</code></a></p>')
+
+
+def test_mdlite_list_continuation_after_fence_keeps_order(page, web_base_url):
+    html = _md(page, web_base_url, "1. 実行:\n   ```\n   cmd\n   ```\n   出力を確認する\n2. 次へ")
+    assert html == ('<ol><li>実行:<pre class="md-code"><code>cmd</code></pre><div>出力を確認する</div></li>'
+                    '<li>次へ</li></ol>')
+
+
+def test_mdlite_table_row_with_unclosed_backtick_still_splits(page, web_base_url):
+    html = _md(page, web_base_url, "| a | b |\n|---|---|\n| 1 | 2 |\n| `x | 3 |\n| 4 | 5 |")
+    assert html.count("<tr>") == 4          # ヘッダ 1 行＋本体 3 行
+    assert "<td>`x</td><td>3</td>" in html
+
+
+def test_mdlite_four_backtick_fence_is_not_closed_by_three(page, web_base_url):
+    html = _md(page, web_base_url, "````\n```\nx\n```\n````")
+    assert html == '<pre class="md-code"><code>```\nx\n```</code></pre>'
+
+
+def test_mdlite_trailing_blank_after_list_does_not_throw(page, web_base_url):
+    assert _md(page, web_base_url, "- a\n") == "<ul><li>a</li></ul>"
+    assert _md(page, web_base_url, "テキスト\n- a\n- b\n") == "<p>テキスト</p><ul><li>a</li><li>b</li></ul>"
+
+
+def test_mdlite_table_row_with_extra_cells_keeps_content_and_following_rows(page, web_base_url):
+    html = _md(page, web_base_url, "| a | b |\n|---|---|\n| 1 | 2 | 3 |\n| 4 | 5 |")
+    assert "<td>2 | 3</td>" in html            # 余剰セルは最後のセルへ連結（消さない）
+    assert "<td>4</td><td>5</td>" in html      # 後続の正常行も表に残る
+    assert "<p>" not in html
+
+
+def test_mdlite_indented_table_and_quote_after_list_item_are_blocks(page, web_base_url):
+    html = _md(page, web_base_url, "1. 手順\n\n   | A | B |\n   |---|---|\n   | 1 | 2 |")
+    assert html.startswith("<ol><li>手順</li></ol><table")
+    html2 = _md(page, web_base_url, "- 項目\n\n  > 引用文")
+    assert html2 == "<ul><li>項目</li></ul><blockquote><p>引用文</p></blockquote>"
+
+
+def test_mdlite_fence_in_second_level_list_is_recognized(page, web_base_url):
+    html = _md(page, web_base_url, "1. 親\n   1. 子\n      ```\n      SELECT 1\n      ```")
+    assert html == '<ol><li>親<ol><li>子<pre class="md-code"><code>SELECT 1</code></pre></li></ol></li></ol>'

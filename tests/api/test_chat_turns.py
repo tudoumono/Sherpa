@@ -696,6 +696,117 @@ def test_persist_turn_crash_leaves_stop_kind_unset_for_other_exceptions():
     assert "stop_kind" not in assistant["answer"]
 
 
+def test_persist_turn_crash_stores_decided_lens_when_knowledge_on():
+    """`knowledge=True`（ナレッジ参照ターン）でクラッシュした場合、決定済みの lens
+    （調べ方の明示指定・例えば "qa"）で保存される（`lens="chat"` 固定だと `knowledge_turns`／
+    zero-hit の分母から漏れる・`sherpa/store/usage.py` の集計契約）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-knowledge-qa")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "qa-lens-q", "admin", V, False, RuntimeError("boom"),
+                            knowledge=True, lens="qa")
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "qa"
+    assert assistant["answer"]["lens"] == "qa"
+
+
+def test_persist_turn_crash_stores_none_lens_when_knowledge_on_but_undecided():
+    """`knowledge=True` でも lens が未決定（自動判定に入る前でクラッシュ・`lens=None`）
+    なら、"chat" で偽装せず `None` のまま保存する（意図判定前という正確な欠落を許容する）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-knowledge-none")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "auto-lens-q", "admin", V, False, RuntimeError("boom"),
+                            knowledge=True, lens=None)
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] is None
+    assert assistant["answer"]["lens"] is None
+
+
+def test_persist_turn_crash_keeps_chat_lens_when_knowledge_off():
+    """`knowledge=False`（ナレッジ参照なし＝素の会話）は "chat" が実際に正しい値のまま
+    （回帰確認・`lens` 引数が渡っていても knowledge オフの経路では使わない）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-knowledge-off")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "chat-lens-q", "admin", V, False, RuntimeError("boom"),
+                            knowledge=False, lens="qa")
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "chat"
+
+
+def test_persist_turn_crash_defaults_to_chat_lens_when_knowledge_kwargs_omitted():
+    """呼び出し側が `knowledge`/`lens` を渡さない既存呼び出し（このファイルの他のテスト・
+    将来の直接呼び出し）は従来どおり "chat" になる（既定値の後方互換）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-defaults")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "default-lens-q", "admin", V, False, RuntimeError("boom"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "chat"
+
+
+def test_turn_crash_via_background_run_stores_decided_lens_not_chat(monkeypatch):
+    """`POST /chat/turns`（`_turn_run_fn.make_run` 経由の実背景実行）で、`with
+    neo4j_session() as s:` 自体がナレッジ参照ターン中に例外を投げても、保存される assistant 行の
+    lens は明示指定した "qa"（`req.lens`）のまま——`_turn_run_fn.make_run` のクロージャから
+    `_persist_turn_crash` へ実際に `knowledge`/`lens` が配線されていることを確認する。"""
+    from sherpa import store
+    from sherpa.routers import chat as chat_routes
+
+    def _boom_neo4j(*a, **k):
+        raise RuntimeError("boom-neo4j-session")
+    monkeypatch.setattr(chat_routes, "neo4j_session", _boom_neo4j)
+
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "crash-lens-qa-bg-unique", "world": V,
+                                    "knowledge": True, "lens": "qa"})
+    assert r.status_code == 200, r.text
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+    _wait_turn_done(tid)
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "qa", f"決定済み lens で保存されていない: {assistant['lens']!r}"
+
+
+def test_turn_crash_via_background_run_stores_none_lens_when_undecided(monkeypatch):
+    """`lens` を明示指定せず（自動判定＝`req.lens is None`）ナレッジ参照ターンが
+    `neo4j_session()` 自体で落ちた場合、保存される assistant 行の lens は "chat" ではなく
+    `None`（自動判定はこの関数から見えない位置で確定するため、意図判定前を正直に表す）。"""
+    from sherpa import store
+    from sherpa.routers import chat as chat_routes
+
+    def _boom_neo4j(*a, **k):
+        raise RuntimeError("boom-neo4j-session-auto")
+    monkeypatch.setattr(chat_routes, "neo4j_session", _boom_neo4j)
+
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "crash-lens-auto-bg-unique", "world": V,
+                                    "knowledge": True})
+    assert r.status_code == 200, r.text
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+    _wait_turn_done(tid)
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] is None, f"意図判定前なのに lens が埋まっている: {assistant['lens']!r}"
+
+
 def test_persist_turn_crash_without_saved_user_id_ignores_stale_same_text_turn():
     """`saved_user_id` が無い（`stream_message` が user 行保存**前**にクラッシュした＝
     on_user_saved が一度も呼ばれなかった）場合、この run は user 行を保存していないことが

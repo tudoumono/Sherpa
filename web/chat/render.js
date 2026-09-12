@@ -930,7 +930,9 @@ function answerHTML(answer, trace, feedback) {
       + '<button class="copybtn" data-copy>⧉ コピー</button><button class="copybtn" data-export>⬇ 書き出し</button>'
       + feedbackHtml;
   }
-  const chip = `<div class="chips"><span class="chip">${esc(LENS_LABEL[answer.lens] || answer.lens)}</span>`
+  // レンズ未決定（意図判定前のクラッシュ保存＝lens が null）のときは空のチップを出さない。
+  const lensLabel = LENS_LABEL[answer.lens] || answer.lens;
+  const chip = `<div class="chips">${lensLabel ? `<span class="chip">${esc(lensLabel)}</span>` : ''}`
     + _scopeChipsHTML(answer.scope)
     + ((answer.route && answer.route.path) || []).map((p) => `<span class="chip">${esc(p)}</span>`).join('')
     + _depthHeaderHTML(answer.scope, answer.duration_ms) + '</div>';

@@ -1864,6 +1864,7 @@ class _GenProvider(Provider):
         _synthesis_digest, _ = agentic_search.build_synthesis_digest(
             citations, combined_evidence_meta, read_evidence=plan_read_evidence, gaps=plan_gaps)
         env["_synthesis_digest"] = _synthesis_digest
+        _stream_exc: BaseException | None = None
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
                 for chunk in self._stream(_answer_prompt(orig_message, lens, env), completion=completion):
@@ -1873,12 +1874,14 @@ class _GenProvider(Provider):
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
                         stopped = True
                         break
-            except Exception:
+            except Exception as e:
                 failed = True     # 部分本文（`acc`）は破棄しない＝従来どおり部分本文のみ採用
+                _stream_exc = e   # デルタ 0 個で raise するとき `from` に使う（例外型を終了理由へ運ぶ）
+                env.setdefault("agentic_failure", stop_kind_mod.from_exception(e) or "error")
         if not acc:
             if ctx.stop_event is not None and ctx.stop_event.is_set():
                 return   # 停止済み＝node/_result を出さず静かに終了（S3 と同じ）
-            raise RuntimeError("plan synthesis produced no answer")   # デルタ0個＝二重出力の心配なし
+            raise RuntimeError("plan synthesis produced no answer") from _stream_exc   # デルタ0個＝二重出力の心配なし
         # デルタを1個以上 yield した後は絶対に再 raise しない（S3 と同じ規律）。
         env["headline"] = acc
         if self._last_usage:
@@ -2448,6 +2451,7 @@ class _GenProvider(Provider):
             citations, combined_evidence_meta, read_evidence=agentic_search._read_evidence_payload(state),
             gaps=state.gaps)
         _synth_env["_synthesis_digest"] = _synthesis_digest
+        _stream_exc: BaseException | None = None
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
                 for chunk in self._stream(_answer_prompt(orig_message, lens, _synth_env), completion=completion):
@@ -2457,12 +2461,14 @@ class _GenProvider(Provider):
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
                         stopped = True
                         break
-            except Exception:
+            except Exception as e:
                 failed = True     # 部分本文（`acc`）は破棄しない＝従来どおり部分本文のみ採用
+                _stream_exc = e   # except 節を抜けると e は削除される（PEP 3110）ため退避して from に使う
+                env.setdefault("agentic_failure", stop_kind_mod.from_exception(e) or "error")
         if not acc:
             if ctx.stop_event is not None and ctx.stop_event.is_set():
                 return   # 停止済み＝:330-331 と同じくミラー（node/_result を出さず静かに終了）
-            raise RuntimeError("hybrid synthesis produced no answer")   # デルタ0個＝二重出力の心配なし
+            raise RuntimeError("hybrid synthesis produced no answer") from _stream_exc   # デルタ0個＝二重出力の心配なし
         # デルタを1個以上 yield した後は絶対に再 raise しない（二重作業/二重 emission の回避）。
         env["headline"] = acc
         if self._last_usage:
@@ -2589,11 +2595,13 @@ class _GenProvider(Provider):
                         yield {"type": "answer_delta", "text": msg}
                         env = {"lens": decision.get("lens", "qa"), "headline": msg,
                               "summary": {"total": 0}, "data": {}, "sources": [],
-                              # 終了理由の印（`stop_kind.resolve`）: 査読の根拠不足は no_evidence・
-                              # それ以外の失敗は型を運べないため完了扱いにせず NULL に落とす。
-                              "agentic_failure": ("insufficient"
-                                                  if isinstance(agentic_exc, _MainReviewInsufficient)
-                                                  else "error"),
+                              # 終了理由の印（`stop_kind.resolve`）: 型が通信系（timeout/transport_error）
+                              # なら優先してそれを立てる・型が特定できない場合のみ査読の根拠不足は
+                              # no_evidence・それ以外の失敗は error（完了扱いにはしない）。
+                              "agentic_failure": (stop_kind_mod.from_exception(agentic_exc)
+                                                  or ("insufficient"
+                                                      if isinstance(agentic_exc, _MainReviewInsufficient)
+                                                      else "error")),
                               "scope": layer_mod.scope_with_layer(
                                   ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
                         yield {"type": "_result", "env": env,
@@ -2635,10 +2643,10 @@ class _GenProvider(Provider):
             except Exception as e:
                 failed = True   # 従来どおり例外時は部分応答も採用しない（acc="" のまま）
                 # 通信系の例外型なら終了理由の印（`_plain_run` と同型）。tools_blocked 経路の
-                # 既存の印は上書きしない・型を特定できない例外は決定的回答＝完了のまま。
+                # 既存の印は上書きしない。
                 _k = stop_kind_mod.from_exception(e)
-                if _k:
-                    env.setdefault("agentic_failure", _k)
+                # `_plain_run`（:338）と同じ規約: 型が特定できなくても completed 扱いにはしない。
+                env.setdefault("agentic_failure", _k or "error")
         if failed:
             acc = ""
         if acc:

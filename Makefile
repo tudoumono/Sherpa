@@ -1,7 +1,7 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help start stop restart status check-ports up down ps logs bootstrap demo mirror install-docker ocr-models \
+.PHONY: help hooks start stop restart status check-ports up down ps logs bootstrap demo mirror install-docker ocr-models \
         graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \

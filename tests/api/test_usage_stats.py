@@ -702,14 +702,83 @@ def test_usage_stats_stop_kinds_distribution_and_unknown_fallback():
     assert after.get("unknown", 0) - before.get("unknown", 0) == 1
 
 
+def test_usage_stats_stop_kind_folds_out_of_vocabulary_values_into_unknown():
+    """⑳: allowlist（`stop_kind.STOP_KINDS`）外の非 NULL な文字列も 'unknown' へ畳み込む
+    （是正前は NULL しか畳まず、語彙外の値がそのまま9値目として出ていた）。バグ/env 誤設定等で
+    書き込まれる状況を模すため、正規の値で保存した行を直接 UPDATE で語彙外の値に書き換える。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgskvadm{sfx}", f"UsageSkvAdm{sfx}"
+    uid, pw = f"usgskv{sfx}", f"UsageSkv{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"statsworldskv{sfx}"
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _stop_kinds_map():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return {row["stop_kind"]: row["turns"] for row in r.json()["stop_kinds"]}
+
+    before = _stop_kinds_map()
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"stopkindvocab-{sfx}")
+    store.add_message(conv["id"], "user", "q1")
+    reply = store.add_message(conv["id"], "assistant", "(qa)への回答", lens="qa",
+                              answer={"stop_kind": "completed"})
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET answer = jsonb_set(answer, '{stop_kind}', "
+                  "'\"not_a_real_stop_kind\"') WHERE id=%s", (reply["id"],))
+
+    after = _stop_kinds_map()
+    assert after.get("not_a_real_stop_kind", 0) - before.get("not_a_real_stop_kind", 0) == 0, (
+        "allowlist 外の stop_kind 文字列がそのまま独立した分類として出てしまった"
+    )
+    assert after.get("unknown", 0) - before.get("unknown", 0) == 1, (
+        "allowlist 外の stop_kind 文字列が unknown に畳み込まれていない"
+    )
+
+
 def test_usage_stats_stopped_turns_counts_chat_turn_audit_with_stopped_true():
     """STAT-3 S3: `stopped_turns` は利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の
-    件数——停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない（別集計）。"""
+    件数——停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない（別集計）。
+    `stopped_turns` は `conversations` と JOIN する（⑰）ため、実在する会話に対する監査を使う。"""
     if not _try_init():
         pytest.skip("DB down")
     sfx = _sfx()
     admin_uid, admin_pw = f"usgstadm{sfx}", f"UsageStAdm{sfx}"
     uid, pw = f"usgst{sfx}", f"UsageSt{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    conv = store.create_conversation(user_id=uid, world=f"stworld{sfx}")
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _stopped_turns():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return r.json()["stopped_turns"]
+
+    before = _stopped_turns()
+    store.audit(uid, "chat.turn", "conversation", f"conv:{conv['id']}",
+               detail={"stopped": True}, outcome="success")
+    store.audit(uid, "chat.turn", "conversation", f"conv:{conv['id']}",
+               detail={"stopped": False}, outcome="success")
+    after = _stopped_turns()
+    assert after - before == 1
+
+
+def test_usage_stats_stopped_turns_excludes_deleted_conversation():
+    """⑰: `stopped_turns` は `stop_kinds`/`turns` と同じ母集団（`conversations` と JOIN し
+    `deleted_at IS NULL AND origin='own'`）を使う——会話を削除すると、その会話の停止ターンは
+    `stopped_turns` から外れる（`audit_log` 行自体は監査ログとして残る契約と対照的）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgstdadm{sfx}", f"UsageStdAdm{sfx}"
+    uid, pw = f"usgstd{sfx}", f"UsageStd{sfx}"
     _mk_user(admin_uid, admin_pw, role="admin")
     _mk_user(uid, pw, role="user")
 
@@ -721,10 +790,114 @@ def test_usage_stats_stopped_turns_counts_chat_turn_audit_with_stopped_true():
         return r.json()["stopped_turns"]
 
     before = _stopped_turns()
-    store.audit(uid, "chat.turn", "conversation", "conv:1", detail={"stopped": True}, outcome="success")
-    store.audit(uid, "chat.turn", "conversation", "conv:1", detail={"stopped": False}, outcome="success")
-    after = _stopped_turns()
-    assert after - before == 1
+
+    conv = store.create_conversation(user_id=uid, world=f"stdworld{sfx}")
+    store.audit(uid, "chat.turn", "conversation", f"conv:{conv['id']}",
+               detail={"stopped": True}, outcome="success")
+
+    with_stop = _stopped_turns()
+    assert with_stop - before == 1, "実在する会話の停止ターンが数えられていない"
+
+    assert store.delete_conversation(conv["id"], user_id=uid)
+
+    after_delete = _stopped_turns()
+    assert after_delete - before == 0, "削除済み会話の停止ターンが stopped_turns に数え続けられている"
+
+
+def test_usage_stats_stopped_turns_do_not_appear_in_stop_kinds_distribution():
+    """明示停止（assistant 未保存・`chat_service.py` の stopped 分岐を模す）は `stop_kinds` の
+    分布に現れず、`stopped_turns` 側だけで数えられる（二重計上しない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgsknoadm{sfx}", f"UsageSknoAdm{sfx}"
+    uid, pw = f"usgskno{sfx}", f"UsageSkno{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"stopkindnoworld{sfx}"
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _stop_kinds_total():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return sum(row["turns"] for row in r.json()["stop_kinds"])
+
+    def _stopped_turns():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return r.json()["stopped_turns"]
+
+    before_total = _stop_kinds_total()
+    before_stopped = _stopped_turns()
+
+    # 明示停止したターン: user メッセージのみ保存し assistant は保存しない（stopped 分岐の実際の形）。
+    conv = store.create_conversation(user_id=uid, world=world)
+    store.add_message(conv["id"], "user", "止めて")
+    store.audit(uid, "chat.turn", "conversation", f"conv:{conv['id']}",
+               detail={"stopped": True}, outcome="success")
+
+    after_total = _stop_kinds_total()
+    after_stopped = _stopped_turns()
+
+    assert after_total - before_total == 0, "assistant 未保存の停止ターンが stop_kinds の分布に混入した"
+    assert after_stopped - before_stopped == 1, "停止ターンが stopped_turns に数えられていない"
+
+
+def test_usage_stats_turns_and_stop_kinds_agree_across_period_boundary():
+    """CR-1 ⑪: 期間境界を跨ぐターン（user 行が期間内・assistant 行が期間外＝数分/数時間かかる
+    ターンが日境界を越えるケース）でも `turns` と `stop_kinds` が同じ側（今回の期間）に計上される。
+    是正前は `stop_kinds` が assistant 行自身の created_at を境界に使っており、この turn が
+    turns には数えられるのに stop_kinds には現れない食い違いが起きていた。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgxbadm{sfx}", f"UsageXbAdm{sfx}"
+    uid, pw = f"usgxb{sfx}", f"UsageXb{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    admin = _login(admin_uid, admin_pw)
+
+    days = 7
+    r0 = admin.get(f"/admin/usage/stats?days={days}")
+    assert r0.status_code == 200, r0.text
+    period = r0.json()["period"]
+
+    def _stop_kinds_map():
+        r = admin.get(f"/admin/usage/stats?days={days}")
+        assert r.status_code == 200, r.text
+        return {row["stop_kind"]: row["turns"] for row in r.json()["stop_kinds"]}
+
+    def _uid_turns():
+        r = admin.get(f"/admin/usage/stats?days={days}")
+        assert r.status_code == 200, r.text
+        row = next((u for u in r.json()["users"] if u["uid"] == uid), None)
+        return row["turns"] if row else 0
+
+    before_turns = _uid_turns()
+    before_stop_kinds = _stop_kinds_map()
+
+    conv = store.create_conversation(user_id=uid, world=f"xboundworld{sfx}")
+    user_msg = store.add_message(conv["id"], "user", "境界を跨ぐターン")
+    assistant_msg = store.add_message(conv["id"], "assistant", "回答", lens="qa",
+                                      answer={"stop_kind": "completed"})
+
+    # user 行＝period.end（今回の期間の最終暦日）の JST 23:59:00＝期間内。
+    # assistant 行＝period.end の翌日（=期間の排他的上限のさらに1時間後）＝期間外
+    # （このターンだけで数時間かかり日境界を越えた状況を再現）。
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET created_at = (%s || ' 23:59:00+09:00')::timestamptz "
+                  "WHERE id=%s", (period["end"], user_msg["id"]))
+        c.execute("UPDATE messages SET created_at = (%s || ' 00:00:00+09:00')::timestamptz "
+                  "+ interval '1 day 1 hour' WHERE id=%s", (period["end"], assistant_msg["id"]))
+
+    after_turns = _uid_turns()
+    after_stop_kinds = _stop_kinds_map()
+
+    assert after_turns - before_turns == 1, "user 行が期間内なのに turns に数えられていない"
+    assert after_stop_kinds.get("completed", 0) - before_stop_kinds.get("completed", 0) == 1, (
+        "assistant 行が期間外（日境界を跨いだ）ため stop_kinds から漏れている＝turns と食い違う"
+    )
 
 
 def test_usage_stats_downloads_total_and_daily_from_audit():

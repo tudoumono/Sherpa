@@ -1126,7 +1126,8 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
     table）。省略時（Pass1 の埋め込み専用パス等）は従来どおり付けない。
 
     返値 `(chunk_iter, degraded_entry)`。
-    - `chunk_iter`＝None: この文書はスキップ（unreadable／軽量テキスト第2段／テキスト抽出失敗）。
+    - `chunk_iter`＝None: この文書はスキップ（unreadable／軽量テキスト第2段／テキスト抽出失敗／
+      本文が空白のみ）。
     - `chunk_iter`＝`(id, body, text, no_embed)` を yield するジェネレータ（0件チャンクもありうる——
       "この文書は処理対象だった" ことと "チャンクが1件以上ある" ことは独立）。
     - `degraded_entry`＝None または {"doc": rel, "reason": ...}（rag_chunks はあるが使えなかった場合のみ・
@@ -1188,6 +1189,12 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
     text = doc_text.read_world_doc_text(world, d)   # ソース/テキスト、または rag_chunks の無い/無効な Office/PDF
     if text is None:
         return None, degraded_entry
+    if text.strip() == "":
+        # 本文が空白のみ（空ファイル/空派生MD）は「チャンクが1件も無い有効な文書」ではなく
+        # 「処理対象外」に分類する——`unreadable`/軽量テキスト第2段と同じ n_docs に数えない扱いに
+        # 揃えることで、空文書だけの world が index_world() の no_chunks ガード
+        # （n_docs > 0 and total_chunks == 0）に恒常的に該当し続けることを防ぐ。
+        return None, {"doc": rel, "reason": "empty_text"}
 
     def _legacy_chunk_iter(text=text, meta=meta, no_embed=no_embed):
         rows = text.splitlines()
@@ -1309,8 +1316,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     埋め込みは**内容ハッシュキャッシュ**経由（`_embed_cached`）で未変更チャンクの再 embed を省く（コスト最適化）。
     `rag_es_enabled()` 時は Office/PDF（`{rel}.rag_chunks.jsonl` を持つ）をレコード単位チャンクで索引し、
     それ以外（ソース/テキスト文書、rag_chunks が無い/検証に失敗した Office/PDF）は従来どおり40行チャンク。
-    rag_chunks が存在するのに使えなかった（symlink・sidecar 取り違え・破損・上限超過等）文書数は、
-    戻り値の `rag_degraded`（件数）・`rag_degraded_docs`（内訳、無ければ省略）で報告する（`rag_es_enabled()`
+    rag_chunks が存在するのに使えなかった（symlink・sidecar 取り違え・破損・上限超過等）文書、
+    および本文が空白のみで処理対象外にした文書（reason="empty_text"）は、戻り値の
+    `rag_degraded`（件数）・`rag_degraded_docs`（内訳、無ければ省略）で報告する（`rag_es_enabled()`
     が False の間はこの2キー自体を返さない＝挙動は完全に不変）。
     `branch=="source"`（登録コード＋軽量テキスト枠の汎用コード）のチャンクは埋め込み対象から
     除外する（コード分の embed コストを避ける・BM25 は全チャンクに効く＝ハイブリッド検索は
@@ -1599,7 +1607,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # 文書はあるのにチャンク0件は索引の異常として扱い content_sig を確定させない＝
         # 次回 sync が再索引する。索引は元々空なので wipe は不要。空 world（n_docs==0）は対象外。
         _restore_refresh_interval(world)                # 索引自体は作成済み（refresh_interval=-1 のまま）
-        out = {"available": True, "indexed": n_docs, "chunks": total_chunks, "error": "no_chunks", **rag_report}
+        out = {"available": True, "indexed": 0, "chunks": total_chunks, "error": "no_chunks", **rag_report}
         if embed_calls_made:
             out["embed_elapsed_ms"] = round(embed_elapsed_ms)
         return out

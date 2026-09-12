@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
@@ -36,6 +37,10 @@ def main(argv: list[str]) -> int:
     if not paths:
         out = subprocess.run(["git", "diff", "--name-only", base, "--", "*.py"], capture_output=True, text=True, check=True)
         paths = [p for p in out.stdout.split() if p.endswith(".py")]
+    # git diff/show が返すパスはリポジトリ root 相対のため、cwd がサブディレクトリでも
+    # 作業ツリー側の実ファイルへ正しく解決できるよう root を基準にする。
+    toplevel = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
+    root = Path(toplevel)
     bad = []
     for p in paths:
         try:
@@ -43,7 +48,11 @@ def main(argv: list[str]) -> int:
         except subprocess.CalledProcessError:
             bad.append(f"{p}: base に存在しない（新規ファイル＝コメント整理の対象外）")
             continue
-        new = open(p, encoding="utf-8").read()
+        target = root / p
+        if not target.exists():
+            bad.append(f"{p}: 作業ツリーに無い（削除/リネーム済み）")
+            continue
+        new = target.read_text(encoding="utf-8")
         if _dump(old) != _dump(new):
             bad.append(f"{p}: AST が一致しない（コード変更が混ざっている）")
     for b in bad:

@@ -145,34 +145,107 @@ const _sherpaVisibilityInterval = (fn, ms) => {
   return { stop: () => { stop(); document.removeEventListener('visibilitychange', onVisibility); } };
 };
 
-// UIフィードバック（2026-07-03・AI回答のMarkdown表示）: 外部ライブラリ非依存の安全サブセット・
-// レンダラ。**必ず esc() で全文エスケープしてからパターン変換する**＝変換元に <script> 等の実タグは
-// 一切存在しない状態でのみ正規表現を当てるため、構造的に XSS が起こり得ない（`<img onerror=...>` も
-// `[text](javascript:...)` もエスケープ済みの見えるだけの文字列にしかならない＝リンク構文は
-// 意図的に未対応＝自動リンク化しない）。
-// 対応: **太字**・*斜体*・`インラインコード`・```コードブロック```・箇条書き（- のみ／1. 等の番号付き）・
-// 見出し（# 〜 ### は太字段落程度の控えめな表現）・改行。それ以外は素の段落として通す。
+// AI回答の Markdown 表示: 外部ライブラリ非依存の安全サブセット・レンダラ。
+// **必ず esc() で全文エスケープしてからパターン変換する**＝変換元に <script> 等の実タグは
+// 一切存在しない状態でのみ正規表現を当てるため、構造的に XSS が起こり得ない（`<img onerror=...>` は
+// エスケープ済みの見えるだけの文字列にしかならない）。リンクは `[text](http(s)://…)` だけを
+// `<a>` にする（`javascript:`・`data:` 等の他スキームと裸の URL は文字のまま＝自動リンク化しない）。
+// 対応: **太字**・*斜体*・`インラインコード`・```コードブロック```・[text](http(s)://…)・
+// 箇条書き（-／*／+）・番号付き（1.）・入れ子リスト（行頭の字下げ 2 桁以上／タブ）・
+// 見出し（# 〜 ###### は太字段落程度の控えめな表現）・表（| a | b | ＋ 区切り行）・引用（>）・
+// 水平線（---／***／___）・改行。それ以外は素の段落として通す。CommonMark/GFM 全体の再実装では
+// なく実害の出やすい形だけを狙う安全サブセットのため、意図的に非対応のままの箇所がある
+// （バックスラッシュエスケープ全般・パイプで囲んだ1行の直後に来る水平線との衝突）。
 function _mdInlineSafe(escaped) {
-  // escaped は esc() 済み文字列。バッククォート区間で split すると奇数インデックスに中身が入る
-  // （String#split の capture-group 仕様）ので、コード区間だけ bold/italic の再処理から外せる
-  // （`**not bold**` のようにコード内の記号をそのまま見せる。プレースホルダ文字列は使わない＝
-  // 元テキストにたまたま似た文字列があっても衝突しない）。
-  const parts = escaped.split(/`([^`]+?)`/);
-  return parts.map((part, idx) => (idx % 2 === 1 ? `<code>${part}</code>` : part
-    .replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')        // 太字（*斜体*より先に処理）
-    .replace(/(^|[^*])\*([^*]+?)\*(?!\*)/g, '$1<em>$2</em>')    // 斜体
-  )).join('');
+  // escaped は esc() 済み文字列。コードスパンをまたぐ強調やコードスパンを含むリンクにも対応する
+  // ため、バッククォート区間で断片に分割してから個別に処理するのではなく、コードスパンを
+  // 制御文字のプレースホルダへ退避 → 結合済み文字列に太字/斜体/リンクを適用 → 最後にコードスパンを
+  // 復元する（プレースホルダは esc() 済みテキストに現れない制御文字を使うため元テキストと衝突しない）。
+  const codeSpans = [];
+  const withPlaceholders = escaped.replace(/`([^`]+?)`/g, (_, code) => {
+    codeSpans.push(code);
+    return `\x00${codeSpans.length - 1}\x00`;
+  });
+  const inline = withPlaceholders
+    // 太字（*斜体*より先に処理）。中身は「連続する **」を含まないことだけを要求し、単独の `*`
+    // （`**COUNT(*)**` 等）は許す。
+    .replace(/\*\*((?:(?!\*\*)[\s\S])+?)\*\*/g, '<strong>$1</strong>')
+    // 斜体: 開き `*` の直後・閉じ `*` の直前の空白を禁止する（CommonMark のフランキング規則の実用形）。
+    // SQL のワイルドカード・COBOL の乗算演算子・glob の `*` のような単発の記号を誤って強調にしない。
+    .replace(/(^|[^*])\*(?!\s)([^*]+?)(?<!\s)\*(?!\*)/g, '$1<em>$2</em>')
+    // リンク: URL は http(s) のみ・空白を含まない範囲＋1段の対応括弧を許す（esc 済みなので
+    // " ' < > は入り得ない）。太字/斜体の後に処理するため、リンク文字列側に <strong> 等が
+    // 入っていてもそのまま包める。
+    .replace(/\[([^\]]+?)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return inline.replace(/\x00(\d+)\x00/g, (_, idx) => `<code>${codeSpans[Number(idx)]}</code>`);
 }
-function _mdLite(raw) {
-  const escaped = _sherpaEsc(String(raw ?? '').replace(/\r\n/g, '\n'));
-  const lines = escaped.split('\n');
+// 表・リスト項目・コードフェンスで共通に使う行パターン。
+const _MD_ITEM_RE = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+// 開き fence: 3連バッククォートの前後（インデント最大4桁＝リスト内の字下げも兼ねる・info string
+// との間・info string の後）に空白を許す。info string 自体の内容は使わない（言語名クラスを
+// 付けない）ため中身は問わない。
+const _MD_FENCE_OPEN = /^(\s{0,4})(`{3,})[ \t]*[^`\s]*[ \t]*$/;
+// 閉じ fence: 開きと同数以上のバッククォートのみの行（info string 不可）。開きの本数を捕捉して
+// 判定する＝4 連で開いたフェンスは内側の 3 連では閉じない（フェンス自体を見せる書き方）。
+function _mdFenceClose(n) { return new RegExp('^\\s{0,4}`{' + n + ',}\\s*$'); }
+// 引用: `>` の直後が空白または行末のときだけ（`>=` のような比較演算子を引用と誤認識しない）。
+const _MD_QUOTE_RE = /^\s*&gt;(?:\s|$)/;
+function _mdStripIndent(line, n) {
+  if (n <= 0) return line;
+  const lead = line.match(/^\s*/)[0];
+  return line.slice(Math.min(lead.length, n));
+}
+function _mdTableCells(line) {
+  // バッククォート区間の外・かつ直前が `\` でない `|` だけで分割する（コードスパン内の `|` や
+  // GFM エスケープ `\|` をセルの継ぎ目にしない）。外側の `|` は任意＝境界の空セルは捨てる。
+  // 残った `\|` は表示直前に `|` へ戻す。
+  const src = line.trim();
+  const cells = [];
+  let buf = '';
+  // 行内で閉じないバッククォート（奇数個）はコードスパンではなく通常文字として扱う＝
+  // 区切りの `|` を取りこぼして本体行の取り込みが途切れないようにする。
+  const codeAware = (src.match(/`/g) || []).length % 2 === 0;
+  let inCode = false;
+  for (let idx = 0; idx < src.length; idx++) {
+    const ch = src[idx];
+    if (ch === '`' && codeAware) { inCode = !inCode; buf += ch; continue; }
+    if (ch === '|' && !inCode && src[idx - 1] !== '\\') { cells.push(buf); buf = ''; continue; }
+    buf += ch;
+  }
+  cells.push(buf);
+  if (cells.length > 1 && cells[0].trim() === '') cells.shift();
+  if (cells.length > 1 && cells[cells.length - 1].trim() === '') cells.pop();
+  return cells.map((c) => c.trim().replace(/\\\|/g, '|'));
+}
+// 表行の構造判定: 外側の `|` は任意・2セル以上（ヘッダ・区切り・本体で共通の1つの判定）。
+// 1セルしか無い行（パイプで囲んだだけの1行文など）は表として扱わない＝偽の1列表も防ぐ。
+function _mdIsTableRow(line) {
+  return _mdTableCells(line).length >= 2;
+}
+function _mdIsTableSep(line) {
+  return _mdIsTableRow(line) && _mdTableCells(line).every((c) => /^:?-+:?$/.test(c));
+}
+function _mdTableAlign(sepLine) {
+  return _mdTableCells(sepLine).map((c) => {
+    const l = c.startsWith(':'), r = c.endsWith(':');
+    return l && r ? 'center' : r ? 'right' : l ? 'left' : '';
+  });
+}
+function _mdRenderList(list) {
+  // list = {type, items:[{text, children:[list…], extraHtml:[...]}], start}。
+  // extraHtml はリスト項目内の字下げコードフェンスなど、テキストと同列に描画するがインライン
+  // 処理には通さない（既に組み立て済みの）ブロック HTML。start は先頭項目の番号（<ol> のみ・
+  // 1 のときは省略）。
+  const startAttr = list.type === 'ol' && list.start && list.start !== 1 ? ` start="${list.start}"` : '';
+  const items = list.items.map((it) => (
+    `<li>${_mdInlineSafe(it.text)}${(it.extraHtml || []).join('')}${it.children.map(_mdRenderList).join('')}</li>`
+  )).join('');
+  return `<${list.type}${startAttr}>${items}</${list.type}>`;
+}
+function _mdBlocks(lines) {
+  // lines は esc() 済み行の配列（引用の中身を再帰的に処理するため、生文字列ではなく行列を受ける）。
   const out = [];
-  let listBuf = null;   // {type:'ul'|'ol', items:[]}
-  const flushList = () => {
-    if (!listBuf) return;
-    out.push(`<${listBuf.type}>${listBuf.items.map((it) => `<li>${_mdInlineSafe(it)}</li>`).join('')}</${listBuf.type}>`);
-    listBuf = null;
-  };
   let paraBuf = [];
   const flushPara = () => {
     if (!paraBuf.length) return;
@@ -182,43 +255,162 @@ function _mdLite(raw) {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    const fence = /^```\S*\s*$/.test(line);          // esc() はバッククォートを変換しないのでそのまま判定可
-    if (fence) {
-      flushPara(); flushList();
+    const fenceOpen = line.match(_MD_FENCE_OPEN);   // esc() はバッククォートを変換しないのでそのまま判定可
+    if (fenceOpen) {
+      flushPara();
+      const stripN = fenceOpen[1].replace(/\t/g, '  ').length;
+      const closeRe = _mdFenceClose(fenceOpen[2].length);
       const codeLines = [];
       i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i])) { codeLines.push(lines[i]); i++; }
+      while (i < lines.length && !closeRe.test(lines[i])) { codeLines.push(_mdStripIndent(lines[i], stripN)); i++; }
       i++;   // 閉じフェンスをスキップ（無ければ末尾まで＝寛容に扱う）
       out.push(`<pre class="md-code"><code>${codeLines.join('\n')}</code></pre>`);
       continue;
     }
-    const heading = line.match(/^#{1,3}\s+(.*)$/);
+    // 水平線（箇条書き `- ` や表の区切り行より先に判定。`- - -` の形は水平線として扱う）
+    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      flushPara(); out.push('<hr>'); i++; continue;
+    }
+    const heading = line.match(/^#{1,6}\s+(.*)$/);
     if (heading) {
-      flushPara(); flushList();
+      flushPara();
       out.push(`<p><strong>${_mdInlineSafe(heading[1])}</strong></p>`);
       i++; continue;
     }
-    const ulItem = line.match(/^-\s+(.*)$/);
-    if (ulItem) {
+    // 引用: `>` は esc() で &gt; になっている。連続する引用行をまとめ、中身を再帰的に処理する。
+    if (_MD_QUOTE_RE.test(line)) {
       flushPara();
-      if (!listBuf || listBuf.type !== 'ul') { flushList(); listBuf = { type: 'ul', items: [] }; }
-      listBuf.items.push(ulItem[1]);
-      i++; continue;
+      const inner = [];
+      while (i < lines.length && _MD_QUOTE_RE.test(lines[i])) {
+        inner.push(lines[i].replace(/^\s*&gt;\s?/, ''));
+        i++;
+      }
+      out.push(`<blockquote>${_mdBlocks(inner)}</blockquote>`);
+      continue;
     }
-    const olItem = line.match(/^\d+\.\s+(.*)$/);
-    if (olItem) {
+    // 表: ヘッダ行＋区切り行が揃い、かつセル数が一致したときだけ。以降の行を本体行として取り込む。
+    if (_mdIsTableRow(line) && i + 1 < lines.length && _mdIsTableSep(lines[i + 1]) &&
+        _mdTableCells(lines[i + 1]).length === _mdTableCells(line).length) {
       flushPara();
-      if (!listBuf || listBuf.type !== 'ol') { flushList(); listBuf = { type: 'ol', items: [] }; }
-      listBuf.items.push(olItem[1]);
-      i++; continue;
+      const header = _mdTableCells(line);
+      const align = _mdTableAlign(lines[i + 1]);
+      const td = (cell, k, tag) => {
+        const a = align[k] ? ` class="md-al-${align[k]}"` : '';
+        return `<${tag}${a}>${_mdInlineSafe(cell)}</${tag}>`;
+      };
+      const thead = `<thead><tr>${header.map((c, k) => td(c, k, 'th')).join('')}</tr></thead>`;
+      const rows = [];
+      i += 2;
+      // ヘッダの列数を超えるセルは最後のセルへ `|` で連結して 1 行として描画する（余剰セルを
+      // 消さず、後続の正常な本体行も表に残す）。
+      while (i < lines.length && _mdIsTableRow(lines[i])) {
+        let cells = _mdTableCells(lines[i]);
+        if (cells.length > header.length) {
+          cells = cells.slice(0, header.length - 1).concat([cells.slice(header.length - 1).join(' | ')]);
+        }
+        rows.push(`<tr>${header.map((_, k) => td(cells[k] ?? '', k, 'td')).join('')}</tr>`);
+        i++;
+      }
+      out.push(`<table class="md-table">${thead}<tbody>${rows.join('')}</tbody></table>`);
+      continue;
     }
-    flushList();
+    // リスト（- * + ／ 1.）: 連続する項目行を集め、字下げ幅で入れ子にする。項目間の空行1行・
+    // 項目の内容列以上の字下げが付いた継続行（コードフェンスならブロックとして、それ以外は
+    // 現在の項目のテキストへ連結）はリストを打ち切らない。
+    const item = line.match(_MD_ITEM_RE);
+    if (item) {
+      flushPara();
+      // root は「項目」と同じ形（children にトップレベルのリストが並ぶ）にして扱いを揃える。
+      const root = { children: [] };
+      const stack = [{ indent: -1, items: [root] }];   // 番兵: root を唯一の項目に持つ疑似リスト
+      const openList = (type, indent, start) => {
+        const parentList = stack[stack.length - 1];
+        const parentItem = parentList.items[parentList.items.length - 1];
+        const list = { type, items: [], indent, start };
+        parentItem.children.push(list);
+        stack.push(list);
+        return list;
+      };
+      let lastItem = null;
+      let lastItemCol = 0;
+      while (i < lines.length) {
+        const raw = lines[i];
+        if (raw.trim() === '') {
+          // 空行1行はリスト継続。次行が項目、または現在の項目への継続行なら打ち切らない
+          // （2連続の空行・無関係な内容が続く場合はここで終了し、外側ループに処理を戻す）。
+          const next = lines[i + 1] ?? '';   // 末尾の空行（次行なし）は空行扱い＝ここでリスト終了
+          const nextBlank = next.trim() === '';
+          const nextIsItem = _MD_ITEM_RE.test(next);
+          const nextIndent = next.match(/^(\s*)/)[1].replace(/\t/g, '  ').length;
+          const nextIsContinuation = !nextBlank && !nextIsItem && lastItem !== null &&
+            next.trim() !== '' && nextIndent >= lastItemCol;
+          if (!nextBlank && (nextIsItem || nextIsContinuation)) { i++; continue; }
+          break;
+        }
+        const m = raw.match(_MD_ITEM_RE);
+        if (!m) {
+          const indent = raw.match(/^(\s*)/)[1].replace(/\t/g, '  ').length;
+          if (lastItem !== null && indent >= lastItemCol) {
+            // 字下げされた表の開始行・引用行は項目テキストへ連結せず、リストを閉じて外側の
+            // ブロック処理に返す（表・引用として描画される＝行はそのまま残す）。
+            if (_MD_QUOTE_RE.test(raw) ||
+                (_mdIsTableRow(raw) && i + 1 < lines.length && _mdIsTableSep(lines[i + 1]))) break;
+            // fence は項目の内容列を基準に判定する（2 段目以降の入れ子でも字下げ 4 桁超で認識する）。
+            const fm = _mdStripIndent(raw, lastItemCol).match(_MD_FENCE_OPEN);
+            if (fm) {
+              const stripN = lastItemCol + fm[1].replace(/\t/g, '  ').length;
+              const closeRe = _mdFenceClose(fm[2].length);
+              const codeLines = [];
+              i++;
+              // 閉じ fence も項目の内容列を剥がしてから判定する（開きと同じ字下げ規則）
+              while (i < lines.length && !closeRe.test(_mdStripIndent(lines[i], lastItemCol))) { codeLines.push(_mdStripIndent(lines[i], stripN)); i++; }
+              i++;   // 閉じフェンスをスキップ（無ければ末尾まで＝寛容に扱う）
+              (lastItem.extraHtml = lastItem.extraHtml || []).push(
+                `<pre class="md-code"><code>${codeLines.join('\n')}</code></pre>`);
+              continue;
+            }
+            if (lastItem.extraHtml && lastItem.extraHtml.length) {
+              // フェンスより後ろの継続行は出現順を保つため text ではなくブロック列の末尾へ足す
+              lastItem.extraHtml.push(`<div>${_mdInlineSafe(raw.trim())}</div>`);
+              i++;
+              continue;
+            }
+            lastItem.text += `<br>${raw.trim()}`;
+            i++;
+            continue;
+          }
+          break;
+        }
+        const indent = m[1].replace(/\t/g, '  ').length;
+        const type = /^\d+\.$/.test(m[2]) ? 'ol' : 'ul';
+        const start = type === 'ol' ? Number.parseInt(m[2], 10) : undefined;
+        while (stack.length > 1 && indent < stack[stack.length - 1].indent) stack.pop();
+        let cur = stack[stack.length - 1];
+        if (stack.length === 1 || indent > cur.indent) {
+          cur = openList(type, indent, start);      // 新しい階層（トップ、またはひとつ前の項目の子）
+        } else if (cur.type !== type) {
+          stack.pop();                              // 同じ階層で種類が変わった＝別リストを兄弟として続ける
+          cur = openList(type, indent, start);
+        }
+        const newItem = { text: m[3], children: [] };
+        cur.items.push(newItem);
+        lastItem = newItem;
+        lastItemCol = m[0].length - m[3].length;
+        i++;
+      }
+      out.push(root.children.map(_mdRenderList).join(''));
+      continue;
+    }
     if (line.trim() === '') { flushPara(); i++; continue; }
     paraBuf.push(line);
     i++;
   }
-  flushPara(); flushList();
+  flushPara();
   return out.join('');
+}
+function _mdLite(raw) {
+  const escaped = _sherpaEsc(String(raw ?? '').replace(/\r\n/g, '\n'));
+  return _mdBlocks(escaped.split('\n'));
 }
 
 // 担当アナライザの来歴表示（§7 裁定2の受入条件＝取り込み画面と影響分析の根拠表示で参照できる

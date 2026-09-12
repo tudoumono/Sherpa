@@ -8,6 +8,7 @@ import math
 import statistics
 from datetime import datetime, timedelta, timezone
 
+from .. import stop_kind
 from .db import _connect, _ensure
 
 _USAGE_AUDIT_ACTIONS = ("auth.login", "document.downloaded", "workspace.file_uploaded", "share.created")
@@ -177,10 +178,9 @@ def _percentile(sorted_values: list[int], pct: float) -> float:
 def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | None]:
     """会話あたりの user ターン数分布と resume_rate を計算する。
 
-    `conversation_rows` は「期間内に発言のあった会話（origin='own'・deleted_at IS NULL）」に絞った
-    `{"user_turns", "codex_session_id"}` の行（1会話1行）。`user_turns` は**その会話の全履歴**の
-    user メッセージ数（期間内に限定しない）＝「セッションの長さ」を見る指標のため、期間はどの会話を
-    集計対象にするかの絞り込みにのみ使う（他の period 系集計とは異なり、値そのものは期間で切らない）。
+    `conversation_rows` は「期間内に user ターンが1件以上ある会話（origin='own'・deleted_at IS NULL）」
+    に絞った `{"user_turns", "codex_session_id"}` の行（1会話1行）。`user_turns` は**期間内**の
+    user メッセージ数（他の period 系集計と同じ境界）。
 
     resume_rate: user ターン数2以上（＝2ターン目以降が有り得る）の会話のうち、
     `codex_session_id` が設定されている割合。分母（該当会話数）が0なら None（推定しない）。
@@ -247,17 +247,21 @@ def usage_stats(days: int = 30) -> dict:
         原本DL数で代替＝新規テレメトリは追加しない）。
 
     会話セッション指標:
-      - `conversation_turns`: 期間内に発言のあった会話について、会話あたりの user ターン数
-        （その会話の全履歴・期間内に限定しない）の avg／median／max／p90。対象会話が無ければ全て None。
+      - `conversation_turns`: 期間内の user ターン数（`turn_created_at` が期間内）について、
+        会話あたりの件数の avg／median／max／p90（対象は「期間内に user ターンが1件以上ある会話」・
+        会話の全履歴ではない）。対象会話が無ければ全て None。
       - `resume_rate`: user ターン数2以上の会話のうち `conversations.codex_session_id` が設定されている
         割合。対象会話が無ければ None（推定しない）。`_compute_conversation_turn_stats` 参照。
 
     ターンの終了理由:
       - `stop_kinds`: `messages.answer->>'stop_kind'`（`sherpa/stop_kind.py` の閉じた8値・
-        `chat_service._finalize` が保存）の分布。確認カード（`lens='clarify'`）は母数から外す。
-        NULL は `'unknown'` へ畳み込む（allowlist 外を集約する `providers_usage` と同じ思想）——
+        `chat_service._finalize` が保存）の分布。assistant 返答が存在するターン（`answer IS NOT NULL`）
+        のみを対象にする——利用者の明示停止・実行中のターンは assistant を保存しないため `answer` が
+        無く、`stopped_turns` 側だけで数える（二重計上しない）。確認カード（`lens='clarify'`）も
+        母数から外す。allowlist（`stop_kind.STOP_KINDS`）外の値（NULL・語彙外の不正値のいずれも）は
+        `'unknown'` へ畳み込む（allowlist 外を集約する `providers_usage` と同じ思想）——
         未計測経路・過去データのほか、busy（Codex 直列化で実行していないターン）と API 経路の
-        honest failure（型を特定できない失敗）も NULL＝完了としては数えない。
+        honest failure（型を特定できない失敗）も対象。
       - `stopped_turns`: 利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の件数——
         停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない別集計。
 
@@ -323,27 +327,42 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY provider ORDER BY n DESC",
             (list(_USAGE_KNOWN_PROVIDERS), start_ts, end_exclusive_ts),
         ).fetchall()
-        # STAT-3 S3（T3・T6の一部）: 終了理由（messages.answer->>'stop_kind'・`stop_kind.py` の
-        # 8値・`chat_service._finalize` が保存）の分布。過去データ/未計測経路は NULL のまま＝
-        # 'unknown' へ畳み込む（遡及しない・既存の provider_rows の allowlist 畳み込みと同じ思想）。
-        # assistant 行のみが対象（stop_kind は assistant 側 envelope にしか無い）。確認カード
+        # 終了理由（`turns.answer->>'stop_kind'`・`stop_kind.py` の8値）の分布。`turns`（`_USAGE_TURN_CTE`）
+        # 経由にすることで、`turns`/`stopped_turns` と同じ `turn_created_at`（user 行の created_at）を
+        # 境界に使う——期間境界を跨ぐターン（user 行が期間内・assistant 行が期間外）でも
+        # turns 側と同じ側に計上され、両者の合計が食い違わない。`answer IS NOT NULL` で
+        # 「assistant 返答が存在するターン」だけに絞る——利用者の明示停止・実行中のターンは
+        # assistant を保存しないため `answer` が無く（LEFT JOIN の不一致）、絞りが無いと
+        # allowlist 外の畳み込みで 'unknown' に混入し `stopped_turns` と二重計上になる
+        # （停止ターンは `stopped_turns` 側だけで数える契約）。allowlist（`stop_kind.STOP_KINDS`）
+        # 外の値（語彙外の不正値・想定されない NULL のいずれも）は 'unknown' へ畳み込む
+        # （既存の provider_rows の allowlist 畳み込みと同じ思想）。確認カード
         # （lens='clarify'＝意図確認の一時停止・終了理由を持たない正常な行）は母数から外す。
         stop_kind_rows = c.execute(
-            "SELECT COALESCE(m.answer->>'stop_kind', 'unknown') AS stop_kind, COUNT(*) AS n "
-            "FROM messages m JOIN conversations c ON c.id=m.conversation_id "
-            "WHERE m.created_at >= %s AND m.created_at < %s AND c.deleted_at IS NULL "
-            "  AND m.role='assistant' AND c.origin='own' "
-            "  AND m.lens IS DISTINCT FROM 'clarify' "
+            _USAGE_TURN_CTE + " "
+            "SELECT CASE WHEN answer->>'stop_kind' = ANY(%s) THEN answer->>'stop_kind' "
+            "  ELSE 'unknown' END AS stop_kind, COUNT(*) AS n "
+            "FROM turns "
+            "WHERE turn_created_at >= %s AND turn_created_at < %s "
+            "  AND answer IS NOT NULL "
+            "  AND lens IS DISTINCT FROM 'clarify' "
             "GROUP BY stop_kind ORDER BY n DESC",
-            (start_ts, end_exclusive_ts),
+            (start_ts, end_exclusive_ts, list(stop_kind.STOP_KINDS), start_ts, end_exclusive_ts),
         ).fetchall()
         # 利用者停止（`stopped_by_user`）は assistant を保存しないため上の分布には出ない
         # （`chat_service.py::stream_message`/`handle_message` の stopped 分岐参照）——監査
-        # `chat.turn`（`detail.stopped=true`）から別途数える。
+        # `chat.turn`（`detail.stopped=true`）から別途数える。`audit_log` は削除伝播の対象外
+        # （台帳の削除伝播は原本/MD/ES/Neo4j までで、監査ログは残置する契約）のため、
+        # `conversations` と JOIN して `turns`/`stop_kinds` と同じ population（`deleted_at IS NULL
+        # AND origin='own'`）に絞る——会話が後で削除されたり共有受領（origin != 'own'）だったりする分を
+        # 母数から外す。`resource_id` は `chat.turn` 監査の書込側（`chat_service.py`／`routers/chat.py`）
+        # が常に `f"conv:{conversation_id}"` 形式で書く契約。
         stopped_turns_row = c.execute(
-            "SELECT COUNT(*) AS n FROM audit_log "
-            "WHERE created_at >= %s AND created_at < %s AND action='chat.turn' "
-            "  AND detail->>'stopped' = 'true'",
+            "SELECT COUNT(*) AS n FROM audit_log a "
+            "JOIN conversations c ON a.resource_id = 'conv:' || c.id::text "
+            "WHERE a.created_at >= %s AND a.created_at < %s AND a.action='chat.turn' "
+            "  AND a.detail->>'stopped' = 'true' "
+            "  AND c.deleted_at IS NULL AND c.origin='own'",
             (start_ts, end_exclusive_ts),
         ).fetchone()
         heatmap_rows = c.execute(
@@ -411,19 +430,18 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY kind, provider, model ORDER BY kind, input DESC NULLS LAST",
             (start_ts, end_exclusive_ts),
         ).fetchall()
-        # 会話あたりの user ターン数分布・resume_rate。「期間内に発言のあった会話」
-        # （touched・origin='own'・deleted_at IS NULL）に絞った上で、ターン数自体は会話の全履歴を
-        # 数える（`c.id` で GROUP BY＝主キーへの関数従属により `codex_session_id` を非集約のまま選べる）。
+        # 会話あたりの user ターン数分布・resume_rate。`turns`（`_USAGE_TURN_CTE`）由来にすることで、
+        # `totals.conversations`／`users[].conversations`（`user_rows`）と同じ母集団（期間内の
+        # `turn_created_at`・origin='own'・deleted_at IS NULL）に揃える——ここで数える user_turns は
+        # 「期間内の user ターン数」であり、会話の全履歴ではない（`c.id` で GROUP BY＝主キーへの
+        # 関数従属により `codex_session_id` を非集約のまま選べる）。
         conversation_turn_rows = c.execute(
-            "WITH touched AS ("
-            "  SELECT DISTINCT conversation_id FROM messages WHERE created_at >= %s AND created_at < %s"
-            ") "
-            "SELECT c.id AS cid, c.codex_session_id, COUNT(m.id) AS user_turns "
-            "FROM touched t JOIN conversations c ON c.id = t.conversation_id "
-            "JOIN messages m ON m.conversation_id = c.id AND m.role='user' "
-            "WHERE c.deleted_at IS NULL AND c.origin='own' "
+            _USAGE_TURN_CTE + " "
+            "SELECT c.id AS cid, c.codex_session_id, COUNT(*) AS user_turns "
+            "FROM turns JOIN conversations c ON c.id = turns.conversation_id "
+            "WHERE turn_created_at >= %s AND turn_created_at < %s "
             "GROUP BY c.id",
-            (start_ts, end_exclusive_ts),
+            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
 
     display_names = {r["uid"]: r["display_name"] for r in name_rows}
@@ -492,7 +510,7 @@ def usage_stats(days: int = 30) -> dict:
     # 完結している＝同じ 'unknown' に集約された複数の元値が別行として残ることはない（二重集計の防止）。
     providers_usage = [{"provider": r["provider"], "turns": r["n"] or 0} for r in provider_rows]
     heatmap = [{"weekday": r["weekday"], "hour": r["hour"], "count": r["n"] or 0} for r in heatmap_rows]
-    # STAT-3 S3: 終了理由の分布＋利用者停止の件数（`stop_kind.py` の8値・'unknown' は畳み込み済み）。
+    # 終了理由の分布＋利用者停止の件数（`stop_kind.py` の8値・'unknown' は畳み込み済み）。
     stop_kinds = [{"stop_kind": r["stop_kind"], "turns": r["n"] or 0} for r in stop_kind_rows]
     stopped_turns = (stopped_turns_row["n"] or 0) if stopped_turns_row else 0
 

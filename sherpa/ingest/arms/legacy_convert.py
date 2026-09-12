@@ -125,12 +125,12 @@ def take_conversion_failure_reason() -> str | None:
 
 
 def _is_timeout_error(e: Exception) -> bool:
-    """`urllib`/`socket` 由来の例外が実質タイムアウトかを判定する（`URLError` は原因を `.reason` に包む・
-    `urlopen(timeout=...)` 発火時は素の `socket.timeout`＝Python 3.10+ では `TimeoutError` のことが多い）。
+    """`urllib`/`socket` 由来の例外が実質タイムアウトかを判定する。判定の実装は
+    `stop_kind.is_timeout_exc` を唯一の真実源として使う（遅延 import はこのモジュールの
+    既存の流儀＝`from sherpa import store` と同じ）。
     """
-    if isinstance(e, TimeoutError):
-        return True
-    return isinstance(getattr(e, "reason", None), TimeoutError)
+    from sherpa import stop_kind
+    return stop_kind.is_timeout_exc(e)
 
 # `soffice --version` の結果を bin パス毎にキャッシュ（毎ファイルの provenance でサブプロセスを増やさない）。
 _version_cache: dict[str, str | None] = {}

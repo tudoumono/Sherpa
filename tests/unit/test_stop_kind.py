@@ -9,6 +9,8 @@ import http.client
 import socket
 import urllib.error
 
+import pytest
+
 from sherpa import stop_kind
 
 
@@ -38,13 +40,13 @@ def test_resolve_codex_stopped_early_maps_to_codex_partial():
 
 def test_resolve_budget_stop_reasons():
     for reason in ("turns_exhausted", "budget_exceeded", "tools_per_turn_exceeded"):
-        env = {"data": {"evidence_packet": {"stop_reason": reason}}}
+        env = {"data": {"evidence_packet": {"task_id": "main", "stop_reason": reason}}}
         assert stop_kind.resolve(env) == "budget", reason
 
 
 def test_resolve_no_evidence_stop_reasons():
     for reason in ("evaluation_blocked", "evidence_verification_failed"):
-        env = {"data": {"evidence_packet": {"stop_reason": reason}}}
+        env = {"data": {"evidence_packet": {"task_id": "main", "stop_reason": reason}}}
         assert stop_kind.resolve(env) == "no_evidence", reason
 
 
@@ -53,8 +55,37 @@ def test_resolve_other_stop_reasons_stay_completed():
     別扱いにしない（既存の stop_reason 自体が answer に残るため分布はそちらで見分けられる）。"""
     for reason in ("no_tool_calls", "evaluation_sufficient", "truncated",
                   "content_filtered", "refusal", "unknown"):
-        env = {"data": {"evidence_packet": {"stop_reason": reason}}}
+        env = {"data": {"evidence_packet": {"task_id": "main", "stop_reason": reason}}}
         assert stop_kind.resolve(env) == "completed", reason
+
+
+# ===== task_id ガード（ハイブリッド下調べ・プラン経路の budget/no_evidence を main と混同しない） =====
+
+def test_resolve_budget_stop_reason_skipped_for_sub_task_id():
+    env = {"data": {"evidence_packet": {"task_id": "sub:worker", "stop_reason": "turns_exhausted"}}}
+    assert stop_kind.resolve(env) == "completed"
+
+
+def test_resolve_budget_stop_reason_skipped_for_plan_task_id():
+    env = {"data": {"evidence_packet": {"task_id": "plan:a+b", "stop_reason": "budget_exceeded"}}}
+    assert stop_kind.resolve(env) == "completed"
+
+
+def test_resolve_no_evidence_stop_reason_skipped_for_sub_task_id():
+    env = {"data": {"evidence_packet": {"task_id": "sub:worker", "stop_reason": "evaluation_blocked"}}}
+    assert stop_kind.resolve(env) == "completed"
+
+
+def test_resolve_budget_stop_reason_applies_for_main_task_id():
+    env = {"data": {"evidence_packet": {"task_id": "main", "stop_reason": "turns_exhausted"}}}
+    assert stop_kind.resolve(env) == "budget"
+
+
+def test_is_main_task_predicate():
+    assert stop_kind.is_main_task({"task_id": "main"}) is True
+    assert stop_kind.is_main_task({"task_id": "sub:worker"}) is False
+    assert stop_kind.is_main_task({"task_id": "plan:a+b"}) is False
+    assert stop_kind.is_main_task({}) is False
 
 
 def test_resolve_missing_evidence_packet_defaults_to_completed():
@@ -84,8 +115,23 @@ def test_from_exception_urlerror_wrapping_other_reason_is_transport_error():
     assert stop_kind.from_exception(exc) == "transport_error"
 
 
-def test_from_exception_os_error_is_transport_error():
-    assert stop_kind.from_exception(OSError("network unreachable")) == "transport_error"
+def test_from_exception_connection_error_is_transport_error():
+    assert stop_kind.from_exception(ConnectionError("network unreachable")) == "transport_error"
+
+
+def test_from_exception_socket_gaierror_is_transport_error():
+    assert stop_kind.from_exception(socket.gaierror("name resolution failed")) == "transport_error"
+
+
+def test_from_exception_permission_error_is_not_transport_error():
+    # PermissionError/FileNotFoundError/OSError(ENOSPC) 等のローカル I/O 障害は OSError のサブクラス
+    # だが通信障害ではない——`OSError` 全体を対象にすると「ワークスペースの権限エラー」が
+    # 「通信障害」と誤記録される。型を特定できないため None（NULL→unknown）。
+    assert stop_kind.from_exception(PermissionError("workspace not writable")) is None
+
+
+def test_from_exception_file_not_found_error_is_not_transport_error():
+    assert stop_kind.from_exception(FileNotFoundError("missing")) is None
 
 
 def test_from_exception_http_client_exception_is_transport_error():
@@ -175,3 +221,91 @@ def test_from_exception_http_error_response_is_not_transport_error():
     # 401/429/5xx は応答が返っている＝通信障害ではない（型だけでは原因を区別できないため None）
     exc = urllib.error.HTTPError("http://x", 429, "Too Many Requests", {}, None)
     assert stop_kind.from_exception(exc) is None
+
+
+# ===== resolve() は STOP_KINDS 外の値を返さない（自己検査） =====
+
+def test_resolve_raises_for_value_outside_stop_kinds(monkeypatch):
+    """`_resolve_kind` が万一 `STOP_KINDS` に無い値を返しても `resolve()` が例外にする
+    （語彙外の値が `messages.answer.stop_kind` に漏れない自己検査）。"""
+    monkeypatch.setattr(stop_kind, "_resolve_kind", lambda env: "not_a_real_stop_kind")
+    with pytest.raises(ValueError):
+        stop_kind.resolve({})
+
+
+def test_resolve_none_still_passes_through_the_check():
+    assert stop_kind.resolve({"busy": True}) is None
+
+
+# ===== 下調べ役 catch-all は例外の型（timeout/transport_error）を優先して立てる =====
+# 従来は `agentic_failure` を "insufficient"/"error" に固定し `from_exception` を一度も呼ばず、
+# 下調べ役（Ollama 等）の read timeout が固定値 "error" に丸められていた。
+
+def test_agentic_run_catchall_marks_timeout_from_sub_loop_exception():
+    from sherpa.providers.base import Ctx, _GenProvider
+
+    class _P(_GenProvider):
+        label, model, provider_id = "T", "m", "openai"
+
+        def _sub_agentic_loop(self, ctx):
+            raise TimeoutError("下調べ役が応答しない")
+            yield {}   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
+
+    p = _P()
+    p._sub = {"provider": "openai", "key": "sk-x", "url": None, "model": "gpt-5.4-mini",
+              "tools": frozenset({"ripgrep_search"}), "guard": {"min_citations": 1, "max_turns": 6,
+                                                                "llm_timeout": 60},
+              "profile_id": "search-helper-openai", "description": "", "name": "下調べ役"}
+    ctx = Ctx(message="バッチ停止の記録は？", world="v1", knowledge=True,
+              route=lambda m: {"lens": "qa", "reason": "t", "input": m},
+              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
+              make_sources=lambda docs: [{"doc_id": d} for d in docs])
+    events = list(p.run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert env["agentic_failure"] == "timeout", (
+        f"下調べ役のタイムアウトが固定値 'error' に丸められている: {env!r}")
+    assert stop_kind.resolve(env) == "timeout"
+
+
+# ===== 単発清書フォールバックは型が特定できない例外でも completed 扱いにしない =====
+# 従来は `stop_kind.from_exception` が None を返す例外（HTTPError の 401/429/5xx・JSON デコード
+# エラー等）は無印のまま `resolve()` に渡り "completed" として数えられていた。
+
+def test_single_shot_fallback_marks_unclassified_stream_exception_as_error():
+    from sherpa.providers.base import Ctx, _GenProvider
+
+    class _P(_GenProvider):
+        label, model, provider_id = "T", "m", "openai"
+
+        def _stream(self, prompt, completion=None):
+            raise ValueError("型を特定できないストリーム例外")
+            yield ""   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
+
+    p = _P()
+    ctx = Ctx(message="こんにちは", world="v1", knowledge=True,
+              route=lambda m: {"lens": "author", "reason": "t", "input": m},
+              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
+              make_sources=lambda docs: [{"doc_id": d} for d in docs])
+    events = list(p.run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert env["agentic_failure"] == "error", (
+        f"型を特定できない例外が無印のまま completed に落ちている: {env!r}")
+    assert stop_kind.resolve(env) is None
+
+
+def test_from_exception_follows_one_level_of_cause():
+    try:
+        try:
+            raise TimeoutError("timed out")
+        except TimeoutError as e:
+            raise RuntimeError("hybrid synthesis produced no answer") from e
+    except RuntimeError as wrapped:
+        assert stop_kind.from_exception(wrapped) == "timeout"
+    # 型を特定できない原因は None のまま
+    try:
+        try:
+            raise ValueError("x")
+        except ValueError as e:
+            raise RuntimeError("wrapped") from e
+    except RuntimeError as wrapped:
+        assert stop_kind.from_exception(wrapped) is None

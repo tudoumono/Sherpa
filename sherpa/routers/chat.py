@@ -418,6 +418,7 @@ def chat_stream_stop(req: ChatStreamStopReq, request: Request):
 
 def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str,
                         personal: bool, exc: Exception, *,
+                        knowledge: bool = False, lens: str | None = None,
                         saved_user_id: int | None = None, saved_user_personal: bool | None = None) -> None:
     """background thread が `stream_message` へ辿り着く前/途中で例外を投げると、
     `POST /chat/turns` の応答で返した conversation_id なのに会話が空のまま（user メッセージすら
@@ -437,6 +438,12 @@ def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str
     確定している——本文一致で他ターンの行を探すと、同一利用者が同文で2ターンを並走させた場合
     （`chat_turns.py` は同一利用者の複数ターン並走を許す）に他方の行（personal 値・ID とも別物）
     を誤って対応付けてしまうため、探索はせず新規に保存する。
+
+    `knowledge`/`lens`（呼び出し元のクロージャがそのまま持つ値）: assistant 行に保存する lens は
+    `knowledge` が False なら実際に "chat"（ナレッジ参照なし）で正しいが、True の場合は `lens` を
+    そのまま使う——`lens` は調べ方の明示指定（`ChatReq.lens`）のみを表し、自動判定は
+    `stream_message` 内部（`_build_router`）でこの関数から見えない位置まで進んでから確定するため、
+    明示指定が無い（`None`）ときは「意図判定前で不明」を "chat" で偽装せず `None` のまま保存する。
     """
     user_msg_id = None
     user_msg_personal = personal
@@ -471,15 +478,16 @@ def _persist_turn_crash(conversation_id: int, message: str, uid: str, world: str
     # (b) assistant 側にエラーの最小 envelope を保存する（busy 応答と同じ最小形）。
     try:
         headline = f"エラーが発生しました（{type(exc).__name__}）。もう一度お試しください。"
-        env = {"lens": "chat", "headline": headline, "summary": {"total": 0}, "data": {}, "sources": []}
-        # STAT-3 T3: provider.run() が通信例外で落ちてこの honest failure 文言になった経路——
+        crash_lens = lens if knowledge else "chat"
+        env = {"lens": crash_lens, "headline": headline, "summary": {"total": 0}, "data": {}, "sources": []}
+        # provider.run() が通信例外で落ちてこの honest failure 文言になった経路——
         # 例外の型だけで timeout／transport_error を判別する（`_finalize` を経由しない独立した
         # envelope のため `stop_kind_mod.resolve` ではなく `from_exception` を直接使う）。それ以外の
         # 例外型は `stop_kind` を立てず NULL のままにする（過去データと同じ「欠落は許容」の扱い）。
         _crash_stop_kind = stop_kind_mod.from_exception(exc)
         if _crash_stop_kind:
             env["stop_kind"] = _crash_stop_kind
-        saved_assistant = store.add_message(conversation_id, "assistant", headline, lens="chat",
+        saved_assistant = store.add_message(conversation_id, "assistant", headline, lens=crash_lens,
                                             answer=env, personal=user_msg_personal)
         assistant_msg_id = saved_assistant["id"]
     except Exception as persist_exc:
@@ -558,6 +566,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
                 # 永続してから re-raise する（chat_turns.start_turn 側の error イベント＋枠解放は
                 # 従来どおり）。
                 _persist_turn_crash(conversation_id, message, uid, world, personal, e,
+                                    knowledge=knowledge, lens=lens,
                                     saved_user_id=saved_user.get("id"),
                                     saved_user_personal=saved_user.get("personal"))
                 raise

@@ -1219,6 +1219,50 @@ def test_hybrid_synthesis_exception_mid_stream_keeps_partial_body_no_attribution
         _restore_post(orig)
 
 
+def test_hybrid_synthesis_mid_stream_timeout_marks_agentic_failure_timeout():
+    """ハイブリッド清書ストリームがデルタ配信後に `TimeoutError` で落ちた場合、部分本文は
+    従来どおり採用しつつ `env["agentic_failure"]` に型から導けた値（`stop_kind.from_exception`
+    経由で `"timeout"`）を立てる（`stop_kind.resolve()` が `"unknown"` へ落とさないように）。"""
+    doc = "4期/04_運用/障害記録.md"
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL"}}]},
+    ]
+    orig = _install_post(seq)
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        if name == "ripgrep_search":
+            return ({"hits": []}, {doc}, [{"doc_id": doc, "span": [1, 1], "quote": "x", "ext": ".md"}], [])
+        return ({"error": f"unexpected tool {name}"}, set(), [], [])
+
+    class _MidTimeout(_FakeSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            yield "回答"
+            raise TimeoutError("timed out mid-stream")
+
+        def _attribute(self, text, digest, ev_map, call_budget=None):
+            raise AssertionError("例外で本文が確定しなかった場合は帰属呼び出しを行わないはず")
+
+    import sherpa.agentic_search as A
+    orig_run_tool = A.run_tool
+    A.run_tool = fake_run_tool
+    try:
+        p = _MidTimeout("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "回答"   # 部分本文は破棄しない
+        assert result["env"]["agentic_failure"] == "timeout"
+        from sherpa import stop_kind
+        assert stop_kind.resolve(result["env"]) == "timeout"
+    finally:
+        A.run_tool = orig_run_tool
+        _restore_post(orig)
+
+
 def test_on_sub_endpoint_error_returns_honest_failure_without_main_ai_retry(monkeypatch):
     """下調べ役（`self._sub`）付きのターンが失敗したら、外してメインAI（高コスト）で黙って
     再実行しない（`_gather`＝単発 grep へのフォールスルーも含めて起きない）＝honest failure

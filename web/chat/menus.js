@@ -266,7 +266,7 @@ function _scopeText(ans) {   // 参照範囲（world/scope/source）を1行に
   return (sc.world ? (S.verLabels[sc.world] || '名称未設定の資料フォルダ') + ' / ' : '') + r;   // 表示は実名(4期)
 }
 function _answerLines(ans, md) {
-  const L = [(md ? '**回答（' : '回答（') + (LENS_FULL[ans.lens] || ans.lens) + (md ? '）**' : '）'),
+  const L = [(md ? '**回答（' : '回答（') + (LENS_FULL[ans.lens] || ans.lens || '未判定') + (md ? '）**' : '）'),   // lens が null（意図判定前のクラッシュ保存）でも null を文字列化しない
     (md ? '_範囲: ' : '範囲: ') + _scopeText(ans) + (md ? '_' : ''), ans.headline || ''];
   const d = ans.data || {};
   if (ans.lens === 'impact') (d.items || []).forEach((it) => L.push(`${md ? '- ' : '・'}${it.category}｜${it.name}`));

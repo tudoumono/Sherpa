@@ -14,6 +14,26 @@ fi
 echo "| レーン(ブランチ) | パス | 基点=main? | ahead/behind main | 変更ファイル数 | 未コミット件数 | 状態 |"
 echo "|---|---|---|---|---|---|---|"
 
+# `merge-tree --write-tree` は名前どおり、実際にマージ結果のツリーオブジェクトを本体の
+# オブジェクトストアへ書き込む（git の仕様）。冒頭のコメントが謳う「読み取り専用」を守るため、
+# 書き込み先を使い捨ての一時ディレクトリへ逃がし（GIT_OBJECT_DIRECTORY）、読み取りは本体の
+# オブジェクトストア（GIT_ALTERNATE_OBJECT_DIRECTORIES）へフォールバックさせる。
+# mktemp 失敗時は判定不能につき「衝突」扱い（⑥の人手確認へ寄せる＝安全側）。
+_merge_tree_no_conflict() {
+  local path="$1" tmp_objdir common_dir rc
+  tmp_objdir="$(mktemp -d)" || return 1
+  common_dir="$(git -C "$path" rev-parse --git-common-dir 2>/dev/null)"
+  case "$common_dir" in
+    /*|"") ;;
+    *) common_dir="$path/$common_dir" ;;
+  esac
+  GIT_OBJECT_DIRECTORY="$tmp_objdir" GIT_ALTERNATE_OBJECT_DIRECTORIES="${common_dir}/objects" \
+    git -C "$path" merge-tree --write-tree main HEAD >/dev/null 2>&1
+  rc=$?
+  rm -rf "$tmp_objdir"
+  return $rc
+}
+
 # porcelain 出力はレコードを空行で区切る。1レコードずつ読み、path/branch を抽出する。
 worktree=""
 branch=""
@@ -28,27 +48,27 @@ _emit() {
 
   local lane_label="${branch:-detached}"
 
-  local merge_base status_baseline behind_from_base baseline_stale
-  merge_base="$(git -C "$path" merge-base main HEAD 2>/dev/null)"
-  if [ -z "$merge_base" ]; then
-    status_baseline="不明"
-    baseline_stale=1
-  elif [ "$merge_base" = "$MAIN_SHA" ]; then
-    status_baseline="ok"
-    baseline_stale=0
-  else
-    behind_from_base="$(git -C "$path" rev-list --count "$merge_base".."$MAIN_SHA" 2>/dev/null)"
-    status_baseline="behind ${behind_from_base:-?}"
-    baseline_stale=1
-  fi
-
-  local lr behind ahead
+  # `main...HEAD`（triple-dot）は内部で merge-base(main,HEAD) を求めた上での対称差分なので、
+  # 左側の behind は「merge-base から main までのコミット数」＝旧実装が別呼び出しで求めていた
+  # 値と同一。merge-base を別途呼ばず、この1回の rev-list から baseline 状態も導く（重複計算の除去）。
+  local lr behind ahead status_baseline baseline_stale
   lr="$(git -C "$path" rev-list --left-right --count main...HEAD 2>/dev/null)"
   behind="$(echo "$lr" | awk '{print $1}')"
   ahead="$(echo "$lr" | awk '{print $2}')"
   [ -z "$behind" ] && behind="?"
   [ -z "$ahead" ] && ahead="?"
   local ahead_behind="+${ahead}/-${behind}"
+
+  if [ "$behind" = "?" ]; then
+    status_baseline="不明"
+    baseline_stale=1
+  elif [ "$behind" = "0" ]; then
+    status_baseline="ok"
+    baseline_stale=0
+  else
+    status_baseline="behind ${behind}"
+    baseline_stale=1
+  fi
 
   local changed_files
   changed_files="$(git -C "$path" diff --name-only main...HEAD 2>/dev/null | wc -l | tr -d ' ')"
@@ -63,7 +83,7 @@ _emit() {
     state="空"
   elif [ "$baseline_stale" = "1" ]; then
     state="要rebase"
-  elif git -C "$path" merge-tree --write-tree main HEAD >/dev/null 2>&1; then
+  elif _merge_tree_no_conflict "$path"; then
     state="ゲート待ち"
   else
     state="衝突"

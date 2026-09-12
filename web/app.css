@@ -355,6 +355,15 @@ tr.hideRow{display:none}
   font-family:var(--font-code,ui-monospace,Menlo,Consolas,monospace);font-size:.92em;
   overflow-x:auto;white-space:pre-wrap;font-weight:400}
 .headline pre.md-code code{background:none;padding:0;border-radius:0}
+.headline a{color:var(--accent,#2563eb);text-decoration:underline;word-break:break-all}
+.headline blockquote{margin:6px 0;padding:4px 12px;border-left:3px solid var(--border,#d0d5dd);color:var(--muted,#555)}
+.headline hr{border:0;border-top:1px solid var(--border,#d0d5dd);margin:10px 0}
+.headline li>ul,.headline li>ol{margin:2px 0 2px}
+.headline table.md-table{border-collapse:collapse;margin:6px 0;font-size:.95em;display:block;max-width:100%;overflow-x:auto}
+.headline table.md-table th,.headline table.md-table td{border:1px solid var(--border,#d0d5dd);padding:4px 8px;text-align:left;vertical-align:top}
+.headline table.md-table th{background:var(--surface-2);font-weight:600}
+.headline table.md-table .md-al-center{text-align:center}
+.headline table.md-table .md-al-right{text-align:right}
 .ilist{list-style:none;margin:6px 0 0;padding:0}
 .ilist li{padding:8px 2px;border-bottom:1px solid var(--border)}
 .ilist .top{display:flex;align-items:center;gap:8px}

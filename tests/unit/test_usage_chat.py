@@ -132,6 +132,23 @@ def test_validate_request_none_question_is_empty_question_error():
         U.validate_request(None, [])
 
 
+# ===== _stats_projection（CR-1 ⑱: STAT-3 の新4項目を LLM 文脈へ含める） =====
+
+def test_stats_projection_includes_stop_kind_and_session_fields():
+    """`usage_stats()` が返す `stop_kinds`/`stopped_turns`/`conversation_turns`/`resume_rate`
+    （件数と割合のみ・本文は含まない）を `_stats_projection` の戻り値に含める。"""
+    stats = dict(_EMPTY_STATS)
+    stats["stop_kinds"] = [{"stop_kind": "completed", "turns": 3}, {"stop_kind": "unknown", "turns": 1}]
+    stats["stopped_turns"] = 2
+    stats["conversation_turns"] = {"avg": 1.5, "median": 1.0, "max": 3, "p90": 3}
+    stats["resume_rate"] = 0.25
+    out = U._stats_projection(stats, limit_users=500, limit_tok_users=500, limit_tok_models=200)
+    assert out["stop_kinds"] == stats["stop_kinds"]
+    assert out["stopped_turns"] == 2
+    assert out["conversation_turns"] == stats["conversation_turns"]
+    assert out["resume_rate"] == 0.25
+
+
 # ===== _compact_stats_context =====
 
 def test_compact_stats_context_small_stats_not_truncated():
