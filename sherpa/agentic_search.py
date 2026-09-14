@@ -203,8 +203,7 @@ def _redact_deep(obj):
 # `read_around` は window（行数）でしか出力を絞らず、
 # 単一行が巨大（例: 10MB の1行だけの文書）だと行数上限が実質無意味＝返却バイト量が無制限になる
 # （1ターン内で `SHERPA_AGENTIC_MAX_TOOLS_PER_TURN` 回呼ばれると履歴/SSE/次ターンの LLM 要求へ
-# 複製される総量が跳ね上がる）。(a) 返却テキストの UTF-8 バイト上限で切り詰める（既存の
-# grep ヒットクリップ `[:500]` と同じ流儀）。(b) `Path.read_text()`（ファイル全体を
+# 複製される総量が跳ね上がる）。(a) 返却テキストの UTF-8 バイト上限で切り詰める。(b) `Path.read_text()`（ファイル全体を
 # 一括ロード）ではなく、生バイトを `_READ_AROUND_FILE_CAP_BYTES` までに制限して読む（巨大な単一行
 # ファイルでも読み込み自体が無制限に増幅しない）。
 # (b) の `_READ_AROUND_FILE_CAP_BYTES` は負値でクリップが反転するため `_env_int` で [64KiB, 64MiB] に
@@ -524,10 +523,6 @@ def _clip_cards(cards: list, max_count: int = _GRAPH_CARDS_MAX, max_bytes: int =
     return out
 
 
-# grep/es ヒットの LLM 向け本文（`text_for_llm`）の文字数上限。テストから monkeypatch できるよう
-# 定数化する——citation の `quote` の 500 字上限（`[:500]` 直書き）とは独立（切り詰め方針が変われば
-# 別々に変えられる・quote 側は変えない契約）。
-_HIT_TEXT_MAX_CHARS = 500
 # glob_search の返却上限（要件: 200件で打ち切り・打ち切りは明示）。grep/es の MAX_HITS とは
 # 独立の固定値（ファイル名だけを返す軽い列挙のため env 化しない）。
 _GLOB_MAX_RESULTS = 200
@@ -973,13 +968,9 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
        残り予算に入るなら P3 全文／領域なら P2／どちらも無理なら chunk（子チャンクの結合）
        のまま——という優先順で使う。
     3. 各 doc は必ず1エントリを返し（消えない）、`tier` を必ず申告する（黙って縮退しない）。
-    4. 予算不足で "chunk" のまま残った doc は、束ねた子チャンクのいずれかが `_HIT_TEXT_MAX_CHARS`
-       で切られていた（`text_truncated`）なら、そのままエントリの `text_truncated: true` に引き継ぐ
-       （"full"/"region" は rag.md 由来の別文字列に置き換わるため対象外＝切れていない）。
 
-    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text",
-    "text_truncated"(省略可)}, ...]}`（`text` は既に redaction/500字クリップ済みの子チャンク本文＝
-    chunk tier の最低保証そのもの）。
+    `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`
+    （`text` は redaction 済みの子チャンク本文＝文字数では切らない＝chunk tier の最低保証そのもの）。
     `budget_for_rag`: この tool result のうち rag doc 群に残っている予算（legacy ヒット分を
     差し引いた残り・呼び出し元が計算する）。
     """
@@ -1023,8 +1014,6 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
                  "chunks": [{"chunk_id": it["chunk_id"],
                              **({"locator": it["locator"]} if it.get("locator") is not None else {})}
                             for it in items]}
-        if tier == "chunk" and any(it.get("text_truncated") for it in items):
-            entry["text_truncated"] = True
         out.append(entry)
     return out
 
@@ -2158,17 +2147,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         for h in hits:
             docs.add(h["doc_id"])
             redacted_text = _redact(h["text"])
-            quote = redacted_text[:500]            # citation の quote は独立の固定上限（_HIT_TEXT_MAX_CHARS とは別・変えない）
-            # rag_chunks 由来（locator あり）は位置ヒントを LLM への text にだけ添える（SEARCH-CUT-3）。
-            # citation の quote は hint 抜きのまま（redaction/500字上限は従来どおり適用済み・出典
-            # フッターは doc_id リンクのみで locator は出さない・docs/04 契約は不変）。
-            # hint は本文と結合してから redaction・上限を通す（先に切ってから足すと
-            # 双方のガードを迂回する＝結合後にもう一度まとめて掛け直す）。`locator_hint` 自体も
-            # 型検証・改行除去・長さ上限済みだが、ここでの redaction は本文と同じ扱いにする。
+            quote = redacted_text[:500]            # citation の quote（出典カードの表示用）だけ固定上限・LLM 向け本文は切らない
+            # rag_chunks 由来（locator あり）は位置ヒントを LLM への text にだけ添える。
+            # citation の quote は hint 抜きのまま（出典フッターは doc_id リンクのみで locator は
+            # 出さない・docs/04 契約は不変）。LLM 向け本文は文字数で切らない（ヒット全文を渡す・
+            # 量の上限は tool result のバイト予算だけ）。hint は本文と結合してから redaction を通す。
             hint = citations.locator_hint(h.get("locator"))
-            text_for_llm_full = _redact(f"{h['text']}（位置: {hint}）") if hint else redacted_text
-            hit_text_truncated = len(text_for_llm_full) > _HIT_TEXT_MAX_CHARS
-            text_for_llm = text_for_llm_full[:_HIT_TEXT_MAX_CHARS]
+            text_for_llm = _redact(f"{h['text']}（位置: {hint}）") if hint else redacted_text
             # 引用（cites）は tier に関わらず**子チャンク単位**のまま（親返しで粒度を落とさない・
             # §3.3「引用の粒度は落とさない」）——doc 単位への束ねは `out`（LLM 向け表示）にだけ効く。
             cites.append(citations.from_grep_hit(h, quote=quote, include_match=False))  # match 無し・整形は citations に集約
@@ -2177,12 +2162,6 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     "chunk_id": h["chunk_id"], "parent_id": h.get("parent_id"),
                     "locator": h.get("locator"), "score": h.get("score"), "text": text_for_llm,
                 }
-                if hit_text_truncated:
-                    # `_resolve_parent_return` へ切断状態を持ち越す——最終的に "full"/"region" へ
-                    # 展開されれば rag.md 由来の別の文字列に置き換わる（切断は解消される）が、
-                    # 予算不足で "chunk" のまま残るとこの子チャンク本文（_HIT_TEXT_MAX_CHARS で
-                    # 既に切られている）がそのまま LLM へ渡るため、印を保つ必要がある。
-                    rag_item["text_truncated"] = True
                 rag_groups.setdefault(h["doc_id"], []).append(rag_item)
                 if h["doc_id"] not in rag_slot_index:
                     # 最初に出現した位置＝ES ヒットのスコア降順の下でその doc の最高スコア
@@ -2191,11 +2170,6 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                     out.append(None)                      # 集約結果が確定するまでの予約枠
                 continue
             hit_view = {"doc_id": h["doc_id"], "line": h["line"], "text": text_for_llm}
-            if hit_text_truncated:
-                # 親返し（`_resolve_parent_return`）で全文/領域へ展開されたヒットはこの分岐を通らない
-                # （上の `continue` で除外済み）＝ここに来るのは展開されず _HIT_TEXT_MAX_CHARS で
-                # 切られたヒットだけ。理由が無ければキー自体を作らない既存の流儀（`file_truncated` と同じ）。
-                hit_view["text_truncated"] = True
             # grep（`ripgrep_search`）ヒットが持つ登録者重要度（`grep_tool.
             # grep_search` が条件付きで付ける）を LLM 向け tool result にも転送する——重要文書を
             # 優先的に精読（read_around）できるようにする。es_search 側の `h` はこのキーを

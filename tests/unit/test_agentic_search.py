@@ -1185,18 +1185,19 @@ def test_es_search_without_locator_text_is_unchanged():
         es_index.search, documents.world_rel_set = o_search, o_relset
 
 
-def test_es_search_locator_hint_combined_text_respects_500_cap():
-    """RV MED-3: hint は本文と結合してから500字上限を通す（結合前に本文だけ切ると合計で上限を超える）。"""
+def test_es_search_locator_hint_combined_text_is_not_clipped():
+    """LLM 向け本文は文字数で切らない: 長い本文＋位置ヒントが丸ごと残る（quote だけ 500 字）。"""
     from sherpa import documents, es_index
     o_search, o_relset = es_index.search, documents.world_rel_set
     es_index.search = lambda world, q, scope_paths=None, k=20, layer=None, **kw: ([
-        {"doc_id": "c.xlsx", "line": None, "text": "あ" * 490, "ext": ".xlsx",
+        {"doc_id": "c.xlsx", "line": None, "text": "あ" * 1490, "ext": ".xlsx",
          "locator": {"sheet": "明細", "cell_range": "B1"}}], None)
     documents.world_rel_set = lambda world, **kw: {"c.xlsx"}
     try:
-        res, _, _, _ = A.run_tool("es_search", {"query": "q"}, "v1", None)
-        # 本文490字＋hint を足すと500字を超えるが、結合後にまとめて[:500]するため上限を超えない。
-        assert len(res["hits"][0]["text"]) <= 500
+        res, _, cites, _ = A.run_tool("es_search", {"query": "q"}, "v1", None)
+        text = res["hits"][0]["text"]
+        assert text.startswith("あ" * 1490) and "明細" in text and "text_truncated" not in res["hits"][0]
+        assert len(cites[0]["quote"]) == 500
     finally:
         es_index.search, documents.world_rel_set = o_search, o_relset
 

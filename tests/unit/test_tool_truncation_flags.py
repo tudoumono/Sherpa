@@ -2,8 +2,8 @@
 （v1 フィクスチャ・Neo4j 不要）。
 
 - read_around: `_clip_utf8_bytes` で実際に短くなったときだけ `text_truncated: True`。
-- grep/es ヒット（`text_for_llm`）: `_HIT_TEXT_MAX_CHARS` で実際に切られたときだけ
-  `hits[i].text_truncated: True`。citation の `quote` は独立の固定 500 字上限のまま変わらない。
+- grep/es ヒット（`text_for_llm`）: 文字数では切らない（ヒット全文を渡す・`text_truncated` は
+  付けない）。citation の `quote` だけ表示用の固定 500 字上限。
 """
 from __future__ import annotations
 
@@ -37,20 +37,19 @@ def test_read_around_omits_text_truncated_when_budget_sufficient():
     assert "text_truncated" not in r
 
 
-# ===== grep/es ヒット本文（text_for_llm）: _HIT_TEXT_MAX_CHARS での切り詰め =====
+# ===== grep/es ヒット本文（text_for_llm）: 文字数で切らない =====
 
-def test_ripgrep_hit_sets_text_truncated_when_monkeypatched_cap_is_small(monkeypatch):
-    monkeypatch.setattr(A, "_HIT_TEXT_MAX_CHARS", 10)
-    long_text = "あ" * 100
+def test_ripgrep_hit_keeps_full_text_and_omits_text_truncated(monkeypatch):
+    long_text = "あ" * 2000
     monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: [
         {"doc_id": "a.md", "line": 1, "span": [1, 1], "text": long_text, "ext": ".md"},
     ])
     res, _, cites, _ = A.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
     h = res["hits"][0]
-    assert h.get("text_truncated") is True
-    assert len(h["text"]) == 10
-    # citation の quote は _HIT_TEXT_MAX_CHARS と独立の固定 500 字上限のまま（変えない契約）。
-    assert len(cites[0]["quote"]) == min(len(long_text), 500)
+    assert "text_truncated" not in h
+    assert h["text"] == long_text
+    # citation の quote（出典カード表示用）だけ固定 500 字上限。
+    assert len(cites[0]["quote"]) == 500
 
 
 def test_ripgrep_hit_omits_text_truncated_for_short_text(monkeypatch):
@@ -62,7 +61,7 @@ def test_ripgrep_hit_omits_text_truncated_for_short_text(monkeypatch):
     assert "text_truncated" not in h
 
 
-def test_es_search_legacy_hit_sets_text_truncated_when_text_exceeds_cap(monkeypatch):
+def test_es_search_legacy_hit_keeps_full_text(monkeypatch):
     """chunk_id 無し（rag_chunks 由来ではない・従来型）ES ヒットは grep と同じ hit_view 経路を通る。"""
     from sherpa import documents, es_index
     long_text = "x" * 600
@@ -71,8 +70,8 @@ def test_es_search_legacy_hit_sets_text_truncated_when_text_exceeds_cap(monkeypa
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
     res, _, cites, _ = A.run_tool("es_search", {"query": "q"}, "v1", None)
     h = res["hits"][0]
-    assert h.get("text_truncated") is True
-    assert len(h["text"]) == 500
+    assert "text_truncated" not in h
+    assert h["text"] == long_text
     assert len(cites[0]["quote"]) == 500
 
 
@@ -93,10 +92,9 @@ def _setup_parent_return_world(monkeypatch, tmp_path, world: str, hits: list, ra
     monkeypatch.setattr(documents, "world_rel_set", lambda w, **kw: {h["doc_id"] for h in hits})
 
 
-def test_es_search_parent_return_chunk_tier_carries_text_truncated_when_not_expanded(monkeypatch, tmp_path):
+def test_es_search_parent_return_chunk_tier_keeps_full_chunk_text(monkeypatch, tmp_path):
     """rag_chunks 由来（chunk_id あり）ヒットが予算/rag.md 不在で "full"/"region" へ展開できず
-    tier="chunk" のまま残ったときは、束ねた子チャンク本文が `_HIT_TEXT_MAX_CHARS` で切られていた
-    なら `text_truncated` を引き継ぐ（chunk tier の本文＝切られた子チャンクそのものだから）。"""
+    tier="chunk" のまま残ったときも、子チャンク本文は文字数で切らず全文を渡す（`text_truncated` なし）。"""
     world = "parent-return-chunk-truncated-world"
     long_text = "y" * 600
     hits = [{"doc_id": "b.docx", "text": long_text, "ext": ".docx",
@@ -106,14 +104,13 @@ def test_es_search_parent_return_chunk_tier_carries_text_truncated_when_not_expa
     res, _, _, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     h = res["hits"][0]
     assert h["tier"] == "chunk"
-    assert h.get("text_truncated") is True
-    assert len(h["text"]) == 500
+    assert "text_truncated" not in h
+    assert h["text"] == long_text
 
 
 def test_es_search_parent_return_full_tier_omits_text_truncated(monkeypatch, tmp_path):
     """同じ長い子チャンク本文でも "full" へ展開できたら `text_truncated` は付かない
-    （最終 text は rag.md 由来の別文字列に置き換わり、_HIT_TEXT_MAX_CHARS のクリップは
-    もう関係しないため）。"""
+    （最終 text は rag.md 由来の別文字列に置き換わる）。"""
     world = "parent-return-full-omits-truncated-world"
     long_text = "z" * 600
     full_md = "<!-- chunk:cf1 -->\n" + "F" * 50 + "\n"   # 予算に余裕で収まる小さな全文
