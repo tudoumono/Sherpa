@@ -2365,6 +2365,87 @@ def test_agentic_run_plan_passes_through_real_layer_for_qa_lens(monkeypatch):
     assert captured["layer"] == "code"
 
 
+def _fake_sub_loop_structural_final(**final_overrides):
+    """`p._sub_loop` を差し替える最小フェイク（1ステップで根拠ゲートを通す structural-only final）。"""
+    def fake_sub_loop(step_ctx, sub, usage_acc, **kw):
+        def _gen():
+            yield {"final": "", "docs": {"doc.md"}, "searched": True, "cites": [], "cards": [],
+                  "has_structural_evidence": True, **final_overrides}
+        return _gen()
+    return fake_sub_loop
+
+
+def test_agentic_run_plan_reclassifies_stop_reason_on_synthesis_truncation(monkeypatch):
+    """プラン清書（`_agentic_run_plan`）は通常ハイブリッド（`_agentic_run`）と同じ stop_reason
+    再分類を受けていなかった——清書呼び出し（`self._stream`）が出力上限で打ち切られても
+    （`completion.reason == "length"`）、Evidence Packet の `stop_reason` はサブループ側が確定した
+    値（例: `plan_completed`）のまま＝画面は「完了」に見えていた。プラン清書の後にも再分類を
+    適用したので、既知の打ち切り（length→truncated）が反映される。"""
+    class _TruncatedSynth(_FakeSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            if completion is not None:
+                completion.terminal_seen = True
+                completion.reason = "length"     # OpenAI 方言の出力上限打ち切り
+            yield "途中まで"
+
+    p = _TruncatedSynth("sk-dummy", "gpt-5.5")
+    monkeypatch.setattr(p, "_sub_loop", _fake_sub_loop_structural_final())
+    ctx = _ctx()
+    decision = {"lens": "qa", "input": ctx.message, "reason": "t"}
+    sub = {**_SUB, "profile_id": "worker"}
+    events = list(p._agentic_run_plan(ctx, decision, ctx.message, [sub]))
+    result = next(e for e in events if e.get("type") == "_result")
+    assert result["env"]["headline"] == "途中まで"                          # 部分本文は破棄しない
+    assert result["env"]["data"]["evidence_packet"]["stop_reason"] == "truncated"
+
+
+def test_agentic_run_plan_stop_reason_unknown_when_synthesis_raises(monkeypatch):
+    """清書がデルタ送出後に例外で落ちても、`completion.reason` は例外前のまま
+    （判別不能）のため再分類が効かず、元の stop_reason（サブループ由来・「完了」に見える値）が
+    保持されていた。`failed` のときは閉じた語彙の `"unknown"` を明示的に入れて「終了理由を確認
+    できない」と分かるようにする。"""
+    class _RaisingSynth(_FakeSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            yield "1デルタ目"
+            raise RuntimeError("synthesis boom")
+
+    p = _RaisingSynth("sk-dummy", "gpt-5.5")
+    monkeypatch.setattr(p, "_sub_loop", _fake_sub_loop_structural_final())
+    ctx = _ctx()
+    decision = {"lens": "qa", "input": ctx.message, "reason": "t"}
+    sub = {**_SUB, "profile_id": "worker"}
+    events = list(p._agentic_run_plan(ctx, decision, ctx.message, [sub]))
+    result = next(e for e in events if e.get("type") == "_result")
+    assert result["env"]["headline"] == "1デルタ目"                          # 部分本文のみ採用
+    assert result["env"]["data"]["evidence_packet"]["stop_reason"] == "unknown"
+
+
+def test_agentic_run_stop_reason_unknown_when_synthesis_raises(monkeypatch):
+    """プランを経由しない単発ハイブリッド（`_agentic_run`）でも
+    同じ規律——清書がデルタ送出後に例外で落ちたら stop_reason は `"unknown"`。"""
+    class _RaisingSynth(_FakeSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            yield "1デルタ目"
+            raise RuntimeError("synthesis boom")
+
+    def fake_sub_agentic_loop(ctx):
+        yield {"final": "LOCAL DRAFT (discarded)", "docs": {"doc.md"}, "searched": True,
+              "cites": [], "cards": [], "has_structural_evidence": True,
+              "stop_reason": "evaluation_sufficient"}
+
+    p = _RaisingSynth("sk-dummy", "gpt-5.5")
+    p._sub = dict(_SUB)
+    monkeypatch.setattr(p, "_sub_agentic_loop", fake_sub_agentic_loop)
+    ctx = _ctx()
+    events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+    result = next(e for e in events if e.get("type") == "_result")
+    assert result["env"]["headline"] == "1デルタ目"
+    assert result["env"]["data"]["evidence_packet"]["stop_reason"] == "unknown"
+
+
 def test_budget_exit_payload_carries_state_gaps(monkeypatch):
     """予算到達で早期終了する final payload も `gaps` を運ぶ（子の「保存時に切断」等が親へ届く）。"""
     import re

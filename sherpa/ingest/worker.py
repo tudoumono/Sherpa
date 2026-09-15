@@ -79,7 +79,14 @@ def _reflect_graph_after_rag_rewrite(world: str) -> None:
     避ける）。失敗は例外のまま呼び出し元へ伝播させる（ここで揉み消さない・best-effort にしない
     ——各呼び出し元は既に `sync()`/`regenerate_rag_rule_only()` の例外伝播契約で受け止める）。
     """
-    nodes, edges, _flags = build_world_graph(world)
+    nodes, edges, flags = build_world_graph(world)
+    blocked = [f for f in flags if f.get("action") == "blocked"]
+    if blocked:
+        # `_run_locked` と同じ fail-closed: 不可読/途中で変わったコードがあるとき部分グラフで
+        # 既存グラフを置換しない（参照エッジの欠けたグラフを確定させない）。例外で呼び出し元へ
+        # 伝播させ、run を失敗として記録させる（次回 sync の全再構築で収束する）。
+        reasons = sorted({str(f.get("reason")) for f in blocked})
+        raise RuntimeError(f"graph reflect blocked: {','.join(reasons)}")
     env = world_neo4j._env()
     world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
 
@@ -529,7 +536,12 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
 
     # ES/reconcile は best-effort だが握りつぶさず flag 化＝半壊状態の可視化（監査#5）。取り込み自体は成功扱いのまま。
     try:
-        esr = es_index.index_world(world, content_sig=world_signature(world),
+        # `content_sig` は冒頭 `world_state()` で確定済みの `sig` をそのまま渡す（再走査しない）
+        # ——ここで `world_signature(world)` を再計算すると SMB 越し 100GB 級 world で全木を
+        # もう一度 stat 走査するうえ、取り込み中に原本が変化して戻った（ABA）場合に別の署名を
+        # 刻んでしまい、PG（`sig`）と ES `_meta` の内容署名が食い違って次回 sync が内容不変の
+        # world を丸ごと再索引する。
+        esr = es_index.index_world(world, content_sig=sig,
                                    progress=_es_progress)   # ES 全文索引（best-effort・署名で鮮度管理・EMBED-3′: doc単位進捗）
         if esr.get("error"):                                # delete/create/bulk 失敗は例外でなく error dict（available=False の未接続は warn しない）
             extra.append({"doc": None, "action": "warn", "reason": f"es_index_failed:{esr['error']}"})
@@ -878,16 +890,18 @@ def _merge_es_runs(prev_summary, prev_timing, new_summary, new_timing):
     return summary, timing
 
 
-def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | None]:
+def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | None, str | None]:
     """`sync()` の軽量再生成分岐（document_ir/evidence/rag drift のみで、arms drift・force・
     原本変化は無し）。呼び出し元は `store.world_lock` の中でこれを呼ぶ（derived ディレクトリへの
     書込を同一 world の並行 `run()`/`sync()` と競合させないため）。
 
-    戻り値: `(status, es_refresh_info)` のタプル。`status`——sidecar 欠落を検知したら
+    戻り値: `(status, es_refresh_info, failure_reason)` の3タプル。`status`——sidecar 欠落を検知したら
     `"needs_full_run"`（この関数自身は `run()`/`_run_locked()` を呼ばない＝呼び出し元が同じ
     `store.world_lock` 区間の中で lock-free 版の `_run_locked()` を直接呼ぶ）。drift が無ければ
-    `None`。それ以外（human_md/document_ir/evidence/rag のいずれかの軽量再生成を実行した・
-    成否問わず）は `"handled"`。`es_refresh_info`——この関数内で実際に ES 再索引
+    `None`。それ以外（human_md/document_ir/evidence/rag のいずれかの軽量再生成を実行した）は
+    `"handled"`（全て成功）または `"rag_failed"`（いずれかの軽量再生成が失敗——`failure_reason` に
+    詳細を積む）。呼び出し元はこれを ES 自己修復の成否と合成して run の終端 status/flags に反映する
+    （黙って `auto_published` にしない——`es_repair_failed` と同じ流儀）。`es_refresh_info`——この関数内で実際に ES 再索引
     （`index_world_with_human_md_holdback`）を実行した場合だけ `{"summary": {...}, "stage_timing":
     {...}}`（呼び出し元 `_sync_impl` の明示 ES 自己修復と同形）を返し、それ以外は `None`——
     呼び出し元はこれを自身の `counts`/`stage_timings` へ畳み込む（この再索引の結果は関数内で
@@ -952,15 +966,18 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
     wd = worlds.world_dir(world)
     dmd = worlds.derived_md_dir(world)
     if not wd or not dmd.exists():                      # text/code のみの world は評価対象が無い
-        return None, None
+        return None, None, None
     if office_md.rag_sidecars_missing(wd, dmd):          # drift の有無によらず常に確認する
-        return "needs_full_run", None
+        return "needs_full_run", None, None
     # human_md drift は document_ir/evidence/rag のいずれとも独立（②のみ・rag/ES には触れない）。
     # 排他分岐の外で必ず確認する＝document_ir 等に drift が無くても human_md だけ古ければ拾う。
     human_md_handled = False
+    human_md_failure_reason = None                       # 失敗しても以降の drift 判定は続行する（連鎖は独立）
     if office_md.human_md_sig_drift(wd, dmd):
         hm_result = office_md.refresh_human_md(wd, dmd)
-        if hm_result.get("human_md_failed", 0):
+        failed = hm_result.get("human_md_failed", 0)
+        if failed:
+            human_md_failure_reason = f"human_md_refresh_failed:{failed}"
             _log.warning(
                 "human_md の軽量再生成で一部の文書が失敗しました（次回 sync で再試行）: "
                 "world=%s detail=%s", world, hm_result)
@@ -972,7 +989,9 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
     # （OCR 完了後の rag.md/ES への「追いつき」は、この既存 drift 連鎖に乗せる・新しい仕組みは作らない）。
     rag_drift = office_md.rag_sig_drift(dmd, world=world)
     if not document_ir_drift and not evidence_drift and not rag_drift:
-        return ("handled" if human_md_handled else None), None
+        if human_md_failure_reason:
+            return "rag_failed", None, human_md_failure_reason
+        return ("handled" if human_md_handled else None), None, None
     document_ir_ok = True                                # document_ir を経由しない経路では常に真のまま
     if document_ir_drift:
         doc_result = office_md.refresh_document_ir(wd, dmd, write_document_ir_sig_marker=False)
@@ -980,9 +999,15 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
             _log.warning(
                 "document_ir の軽量再生成に失敗しました（次回 sync で再試行）: world=%s detail=%s",
                 world, doc_result)
-            return "handled", None
+            reason = f"document_ir_refresh_failed:{doc_result.get('error')}"
+            if human_md_failure_reason:
+                reason = f"{human_md_failure_reason};{reason}"
+            return "rag_failed", None, reason
         if doc_result.get("document_ir_failed", 0):
             document_ir_ok = False                       # world単位マーカー未確定のまま＝今回もevidence/rag連鎖は継続
+            _partial = f"document_ir_refresh_failed:{doc_result.get('document_ir_failed')}"
+            human_md_failure_reason = (f"{human_md_failure_reason};{_partial}"
+                                       if human_md_failure_reason else _partial)   # 部分失敗も run の終端へ引き継ぐ
             _log.warning(
                 "document_ir の軽量再生成で一部の文書が失敗しました（マーカーは world 単位のため"
                 "全 OOXML 文書を対象に次回 sync も再実行されます・今回分の evidence/rag への"
@@ -999,7 +1024,10 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
         _log.warning(
             "RAG/Evidence IR の軽量再生成に失敗しました（次回 sync で再試行）: world=%s detail=%s",
             world, result)
-        return "handled", None
+        reason = f"rag_refresh_failed:{result.get('error') or result.get('rag_failed')}"
+        if human_md_failure_reason:
+            reason = f"{human_md_failure_reason};{reason}"
+        return "rag_failed", None, reason
     # rag.md が実際に書き換わった（`ok`）ので、ES 反映の成否に関わらずグラフ
     # （言及エッジ）を追いつかせる。呼び出し元（`_sync_impl`）が既に `store.world_lock` を保持中
     # ＝lock-free ヘルパーをそのまま呼ぶ（`_reflect_graph_after_rag_rewrite` docstring 参照）。
@@ -1044,7 +1072,9 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
     # （上の docstring 参照＝先に確定すると再試行の入口を失う）。
     if document_ir_drift and document_ir_ok and es_ok:
         office_md.write_document_ir_sig_marker(dmd)
-    return "handled", es_refresh_info
+    if human_md_failure_reason:                          # evidence/rag/ES 自体は成功したが human_md/document_ir の一部が残った
+        return "rag_failed", es_refresh_info, human_md_failure_reason
+    return "handled", es_refresh_info, None
 
 
 def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: str = "sync") -> dict:
@@ -1190,7 +1220,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
         with store.world_lock(world):                    # derived への書込を同一worldの並行run/syncと直列化
             _t_refresh0 = time.monotonic()
             _refresh_started_at = datetime.now(timezone.utc).isoformat()
-            refresh_outcome, refresh_es_info = _refresh_derived_representations(world, sig)
+            refresh_outcome, refresh_es_info, refresh_failure_reason = _refresh_derived_representations(world, sig)
             _stage_timings["refresh_derived"] = {
                 "started_at": _refresh_started_at,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -1317,8 +1347,16 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             # drep（office_md 段別要約）／rows（台帳）は unchanged 分岐では存在しない——`_counts_summary`
             # の契約どおりキーごと省略される（manifest の scanned 数と es_summary が実行した分だけ載る）。
             _counts = _counts_summary(None, es_summary, manifest, None)
+            # `refresh_outcome == "rag_failed"`（軽量再生成自体が失敗）は ES 自己修復の成否と独立に
+            # run を failed へ倒す——ES が unavailable のまま握りつぶすのと同じ理由で、これを見送ると
+            # rag.md/evidence/document_ir が未反映のまま run が `auto_published` として記録される。
+            _finalize_reasons = []
+            if refresh_outcome == "rag_failed":
+                _finalize_reasons.append(f"rag_refresh_failed:{refresh_failure_reason}")
             if es_repair_failure is not None:
-                _finalize_if_unused("failed", [f"es_repair_failed:{es_repair_failure}"],
+                _finalize_reasons.append(f"es_repair_failed:{es_repair_failure}")
+            if _finalize_reasons:
+                _finalize_if_unused("failed", _finalize_reasons,
                                     stage_timings=_stage_timings, counts=_counts)
             else:
                 _finalize_if_unused("auto_published", stage_timings=_stage_timings, counts=_counts)

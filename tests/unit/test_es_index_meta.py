@@ -1478,6 +1478,57 @@ def test_confirm_human_md_meta_refuses_while_still_pending(monkeypatch, tmp_path
     assert put_calls == []
 
 
+def test_confirm_human_md_meta_skips_put_when_meta_get_fails(monkeypatch, tmp_path):
+    """`_index_meta` の GET 失敗（`None`）と `_meta` 未設定（`{}`）は区別する——GET 失敗時に
+    `{}` 扱いして PUT すると、既存の `mapping_version`/`content_sig`/`embed_*` 等を丸ごと消して
+    しまう（Put Mapping API の `_meta` は丸ごと置換）。GET 失敗時は PUT 自体をスキップし、
+    False を返して次回 sync の再試行に委ねる。"""
+    from sherpa import worlds as worlds_mod
+    from sherpa.ingest import office_md
+
+    wd = tmp_path / "world"; wd.mkdir()
+    dmd = tmp_path / "derived"; dmd.mkdir()
+    monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
+    monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
+    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
+    monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vX")
+    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd: False)
+    monkeypatch.setattr(office_md, "human_md_es_sig_drift", lambda dmd: False)
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: None)   # GET 失敗を模す
+
+    put_calls: list[tuple] = []
+    monkeypatch.setattr(es_index, "_req", lambda *a, **kw: put_calls.append(a) or {})
+
+    assert es_index.confirm_human_md_meta("w") is False
+    assert put_calls == []                    # PUT 自体が呼ばれない＝既存 meta を消さない
+
+
+def test_confirm_content_sig_skips_put_when_meta_get_fails(monkeypatch):
+    """`_confirm_content_sig` も同様に GET 失敗時は PUT をスキップする。"""
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: None)
+    put_calls: list[tuple] = []
+    monkeypatch.setattr(es_index, "_req", lambda *a, **kw: put_calls.append(a) or {})
+
+    es_index._confirm_content_sig("w", "sig-A")
+
+    assert put_calls == []
+
+
+def test_wipe_after_bulk_failure_still_drops_content_sig_when_meta_get_fails(monkeypatch):
+    """`_wipe_after_bulk_failure` は delete 失敗＋meta GET 失敗でも PUT して content_sig を落とす
+    （目的は索引の無効化＝見送ると一部だけ入った索引と有効な content_sig が居座り、
+    needs_reindex が永久に False になる）。"""
+    monkeypatch.setattr(es_index, "delete_world", lambda w: False)
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: None)
+    put_calls: list[tuple] = []
+    monkeypatch.setattr(es_index, "_req", lambda *a, **kw: put_calls.append(a) or {})
+
+    es_index._wipe_after_bulk_failure("w")
+
+    assert len(put_calls) == 1 and put_calls[0][0] == "PUT"
+    assert "content_sig" not in put_calls[0][2]["_meta"]
+
+
 def test_index_world_records_search_chunk_mode(monkeypatch):
     """index_world は現在の索引ソース方針（rag/legacy）を _meta に刻む（フラグ反転検知の書き込み側）。"""
     monkeypatch.setattr(es_index.corpus_docs, "world_documents", lambda w, include_rag=False: [])

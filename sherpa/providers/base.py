@@ -1887,6 +1887,17 @@ class _GenProvider(Provider):
             raise RuntimeError("plan synthesis produced no answer") from _stream_exc   # デルタ0個＝二重出力の心配なし
         # デルタを1個以上 yield した後は絶対に再 raise しない（S3 と同じ規律）。
         env["headline"] = acc
+        # 通常ハイブリッド（:_agentic_run の合成ブロック）と同じ再分類をプラン清書にも適用する——
+        # サブループ（各ステップ）が確定した stop_reason は、実際に画面へ表示する本文を生成した
+        # **その後のクラウド最終合成**（直前の `_stream`）の完了理由を反映していない。例外で
+        # 打ち切れた場合は判別不能な完了理由（`completion.reason` が例外前のまま）を再分類に通さず、
+        # 閉じた語彙の `"unknown"` を直接入れる（`_hybrid_reclassified_stop_reason` は reclassified が
+        # "unknown" のとき元の stop_reason を温存する契約のため、通すと打ち切りが見えなくなる）。
+        if failed:
+            env["data"]["evidence_packet"]["stop_reason"] = "unknown"
+        else:
+            env["data"]["evidence_packet"]["stop_reason"] = _hybrid_reclassified_stop_reason(
+                env["data"]["evidence_packet"]["stop_reason"], self.provider_id, completion)
         if self._last_usage:
             # STAT-3 S1: `_sub_loop`（このステップ束の各ステップが呼ぶ）が最後に残した実効上限を
             # 合流する（`_last_sub_depth_usage` が空＝`_sub_loop` を一度も通らなかった場合は
@@ -2487,8 +2498,15 @@ class _GenProvider(Provider):
         # **その後のクラウド最終合成**（直前の `_stream`）の完了理由を反映していない——最終合成が
         # 出力上限／内容フィルタで打ち切られていれば、サブループの調査結果に関わらず表示本文は
         # 途中で終わっている。既知2種と判別できる場合だけ上書きする（未知の完了理由は保持）。
-        env["data"]["evidence_packet"]["stop_reason"] = _hybrid_reclassified_stop_reason(
-            env["data"]["evidence_packet"]["stop_reason"], self.provider_id, completion)
+        # 例外で打ち切れた場合は `completion.reason` が判別材料にならない（例外前のまま）ため
+        # 再分類に通さず、閉じた語彙の `"unknown"` を直接入れる（`_hybrid_reclassified_stop_reason`
+        # は reclassified が "unknown" のとき元の stop_reason を温存する契約のため、通すと
+        # 打ち切りが「完了」として見えたままになる）。
+        if failed:
+            env["data"]["evidence_packet"]["stop_reason"] = "unknown"
+        else:
+            env["data"]["evidence_packet"]["stop_reason"] = _hybrid_reclassified_stop_reason(
+                env["data"]["evidence_packet"]["stop_reason"], self.provider_id, completion)
         # EV-0（拡張設計 §4.4）: ハイブリッド経路は帰属＝確定した回答本文＋Evidence digest を渡す
         # 回答完了後の非ストリーム呼び出し1回（`self._attribute`）で**組み直す**。上の共通ブロックで
         # 一旦組んだ `sources_verified`／Packet の `evidence[]` は、サブループのローカル草稿

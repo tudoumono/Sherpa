@@ -569,9 +569,18 @@ def _mock_store_no_db(monkeypatch):
     # （キャッシュ経由）ではなくこちらを差し替える。
     monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: {})
     monkeypatch.setattr(store, "set_contains_personal_workspace", lambda *a, **k: None)
-    monkeypatch.setattr(store, "set_message_personal", lambda *a, **k: None)
+
+    def fake_set_message_personal(message_id):
+        # 実 DB では UPDATE messages SET personal=TRUE（`_mock_store_no_db` は fake_add_message が
+        # 返した行をそのまま `saved` に保持しているだけなので、ここでその行を書き換えて模す）。
+        for row in saved:
+            if row["id"] == message_id:
+                row["personal"] = True
+
+    monkeypatch.setattr(store, "set_message_personal", fake_set_message_personal)
     monkeypatch.setattr(store, "set_session_id", lambda *a, **k: None)
     monkeypatch.setattr(store, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: False)
     return saved
 
 
@@ -604,6 +613,76 @@ def test_stream_message_mock_store_answer_trace_version(monkeypatch):
                            user_id="admin", knowledge=False))
     assert saved[-1]["role"] == "assistant"
     assert saved[-1]["answer"]["trace_version"] == 2
+
+
+# ===== A1: 一度個人由来になった会話は、以後 personal=False のターンも個人扱いを維持する =====
+
+def test_handle_message_taints_turn_personal_when_conversation_already_personal(monkeypatch):
+    """個人参照 ON のターンの後、次のターンを personal=False で実行しても、会話が既に
+    個人由来（`store.conversation_is_personal_tainted`＝過去ターンで personal ON）なら、
+    このターンの user/assistant 行も `personal=True` で保存する（history 経由で過去の個人
+    回答がモデルへ渡り得るため保守的に個人扱い・sanitized share の伏字漏れを防ぐ）。"""
+    saved = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
+    events = [_fixed_result("非個人のはずの回答")]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    CS.handle_message(None, "2ターン目の質問", world="v1", conversation_id=999,
+                      user_id="admin", knowledge=False, personal=False)
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is True
+    assert assistant_row["personal"] is True
+
+
+def test_handle_message_stays_non_personal_when_conversation_never_personal(monkeypatch):
+    """対照: 会話が一度も個人由来になっていなければ、personal=False のターンは従来どおり
+    非個人のまま保存する（A1 是正が保守化しすぎて常に個人扱いにしていないことの確認）。"""
+    saved = _mock_store_no_db(monkeypatch)   # 既定で conversation_is_personal_tainted=False
+    events = [_fixed_result("非個人の回答")]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    CS.handle_message(None, "質問", world="v1", conversation_id=999,
+                      user_id="admin", knowledge=False, personal=False)
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is False
+    assert assistant_row["personal"] is False
+
+
+def test_stream_message_taints_turn_personal_when_conversation_already_personal(monkeypatch):
+    """handle_message と同じ保守化を確認する。"""
+    saved = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
+    events = [_fixed_result("非個人のはずの回答")]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    list(CS.stream_message(None, "2ターン目の質問", world="v1", conversation_id=999,
+                           user_id="admin", knowledge=False, personal=False))
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is True
+    assert assistant_row["personal"] is True
+
+
+# ===== A3: 非ストリーミング /chat が確認カード（question）で 500 にならない =====
+
+def test_handle_message_saves_clarify_and_returns_instead_of_500(monkeypatch):
+    """provider が question を yield して `_result` を出さずに generator を終える経路
+    （確認カード＝ask_user）で、handle_message は `RuntimeError("provider did not yield a
+    _result event")` を投げていた（500）。stream_message の question 処理と同じ保存・監査
+    （`_save_clarify_message` 共有）を行い、clarify メッセージを正常応答として返す。"""
+    saved = _mock_store_no_db(monkeypatch)
+    events = [_fixed_question()]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    out = CS.handle_message(None, "確認が要る質問", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False)
+    assert out["conversation_id"] == 999
+    assert out["message"] is saved[-1]
+    assert saved[-1]["role"] == "assistant"
+    assert saved[-1]["lens"] == "clarify"
+    assert saved[-1]["answer"]["question"]["interaction_id"] == "q1"
 
 
 # ===== system_settings は1ターン1回の fresh read を _dispatch/get_provider で共有する =====
@@ -2306,3 +2385,35 @@ def test_finalize_leaves_stop_kind_unset_for_agentic_failure_envelope():
     env["agentic_failure"] = "error"
     out = CS._finalize(env, {"lens": "qa", "reason": "下調べAIの失敗"})
     assert "stop_kind" not in out
+
+
+def test_handle_message_clarify_inherits_conversation_personal_taint(monkeypatch):
+    """会話に個人行がある状態で personal=False のターンが確認カードになったとき、確認カードと
+    質問行は個人扱いで保存される（非個人行として伏字共有から漏れない）。"""
+    saved = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
+    marked: list = []
+    monkeypatch.setattr(store, "set_message_personal", lambda mid: marked.append(mid))
+    monkeypatch.setattr(store, "set_contains_personal_workspace", lambda cid: None)
+    events = [_fixed_question()]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    out = CS.handle_message(None, "確認が要る質問", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, personal=False)
+    assert out["message"]["lens"] == "clarify"
+    assert out["message"].get("personal") is True
+    assert marked, "質問行が個人扱いに更新されていない"
+
+
+def test_handle_message_personal_check_failure_falls_closed(monkeypatch):
+    """個人行の有無が読めない（DB 例外）ときは非個人へ倒さず個人扱いで保存する。"""
+    saved = _mock_store_no_db(monkeypatch)
+
+    def _boom(conversation_id):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", _boom)
+    monkeypatch.setattr(store, "set_message_personal", lambda mid: None)
+    monkeypatch.setattr(store, "set_contains_personal_workspace", lambda cid: None)
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([_fixed_result("回答")]))
+    CS.handle_message(None, "質問", world="v1", conversation_id=999, user_id="admin", knowledge=False, personal=False)
+    assert saved[-1]["role"] == "assistant" and saved[-1].get("personal") is True

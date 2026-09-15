@@ -260,6 +260,7 @@ from .conversations import (
     get_conversation,
     get_session_id,
     is_personal_tainted,
+    conversation_is_personal_tainted,
     list_conversations,
     list_export_messages,
     owns_assistant_message,

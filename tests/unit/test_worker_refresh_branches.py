@@ -699,3 +699,43 @@ def test_merge_es_runs_accumulates_embedding_and_elapsed_and_keeps_first_start()
     assert t["elapsed_ms"] == 1800
     # 初回が無ければ新しい値をそのまま
     assert W._merge_es_runs(None, None, new_s, new_t) == (new_s, new_t)
+
+
+def test_sync_rag_refresh_failure_with_run_id_finalizes_as_failed(_stub, monkeypatch):
+    """rag drift の軽量再生成が一部失敗（`rag_failed>0`）したら、受付 run は `auto_published`
+    ではなく `failed`＋理由 flag で終端する（ES/Neo4j 未反映が成功に見えない）。"""
+    finished: list[dict] = []
+    monkeypatch.setattr(store, "finish_ingest_run",
+                         lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
+    monkeypatch.setattr(office_md, "rag_sig_drift", lambda dmd, **kw: True)
+    monkeypatch.setattr(office_md, "refresh_rag",
+                         lambda wd, dmd, **kw: {"rag_failed": 1, "rag_regenerated": 0})
+    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
+
+    res = worker.sync("w", run_id=999)
+    assert res["status"] == "unchanged"
+    assert len(finished) == 1 and finished[0]["run_id"] == 999
+    assert finished[0]["status"] == "failed"
+    reasons = [f.get("reason") for f in finished[0]["extraction_snapshot"].get("flags", [])]
+    assert any(r and r.startswith("rag_refresh_failed") for r in reasons)
+
+
+def test_sync_document_ir_partial_failure_with_run_id_finalizes_as_failed(_stub, monkeypatch):
+    """document_ir の軽量再生成が一部失敗（`document_ir_failed>0`）し、後段の evidence/rag/ES が
+    成功しても、受付 run は `auto_published` ではなく `failed`＋理由 flag で終端する。"""
+    finished: list[dict] = []
+    monkeypatch.setattr(store, "finish_ingest_run",
+                         lambda run_id, **kw: finished.append({"run_id": run_id, **kw}))
+    monkeypatch.setattr(office_md, "document_ir_sig_drift", lambda dmd, **kw: True)
+    monkeypatch.setattr(office_md, "refresh_document_ir",
+                         lambda wd, dmd, **kw: {"document_ir_failed": 1, "document_ir_regenerated": 2})
+    monkeypatch.setattr(office_md, "refresh_evidence_ir",
+                         lambda wd, dmd, **kw: {"evidence_ir_failed": 0, "rag_failed": 0})
+    monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
+
+    res = worker.sync("w", run_id=999)
+    assert res["status"] == "unchanged"
+    assert len(finished) == 1 and finished[0]["run_id"] == 999
+    assert finished[0]["status"] == "failed"
+    reasons = [f.get("reason") for f in finished[0]["extraction_snapshot"].get("flags", [])]
+    assert any(r and "document_ir_refresh_failed" in r for r in reasons)

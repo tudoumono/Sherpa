@@ -22,6 +22,7 @@ Pass3（2026-09-04-グラフのソース正典化.md §2）: Pass1 の定義索�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import posixpath
@@ -614,7 +615,7 @@ def build_world(world_dir, world_id: str, *, files=None):
             continue
         # 受理済み（拡張子一致＋accepts 通過）なら主体の有無に関わらず Pass2 を通す——JOB を持たない
         # JCL PROC ファイルのような「主体なしファイル」も dropped_syntax 検知の対象にする。
-        texts[rel] = (text, analyzer)
+        texts[rel] = (rp, analyzer, hashlib.sha1(raw).hexdigest())   # 本文は保持しない（Pass2 で読み直す＝メモリを有界化）・指紋で同一性を照合
         defres = analyzer.collect_defs(text, rel)
         _flag_dropped(analyzer.name, rel, defres.dropped)
         if defres.primary is None:                        # 構文にマッチせず主体を持たない
@@ -783,7 +784,26 @@ def build_world(world_dir, world_id: str, *, files=None):
         _apply_extra(edge, etype, ref_rel, analyzer_name, extra)
         link_edges.append(edge)
 
-    for rel, (text, analyzer) in texts.items():
+    for rel, (rp, analyzer, raw_sha1) in texts.items():
+        # Pass1 は本文を保持しない（`texts[rel]` は `(rp, analyzer)` のみ）——world 全体のコード
+        # 総量に比例したメモリを Pass1〜Pass2 間で同時保持しない（単一 worker・100GB 級コーパス
+        # 前提）。1 ファイルあたり Pass1 で1回・Pass2 で1回の計2回読む（Pass3 の都度読み直しと
+        # 同じ流儀）。Pass1 で accepts() 済み＝通常は再読取も成功するが、取り込み中の削除/権限変更
+        # 等で失敗しうるため Pass1 と同じ fail-closed（blocked flag・部分グラフを確定しない）で扱う。
+        try:
+            # Pass1 と同じサイズ上限（Pass1〜Pass2 の間に原本側で肥大したファイルを全量読まない）。
+            if rp.stat().st_size > text_kind.MAX_BYTES:
+                flags.append({"doc": rel, "reason": "changed_between_passes", "action": "blocked"})
+                continue
+            text, _raw = corpus_docs.read_full_text_and_raw(rp)
+        except OSError:
+            flags.append({"doc": rel, "reason": "unreadable_code_file", "action": "blocked"})
+            continue
+        if hashlib.sha1(_raw).hexdigest() != raw_sha1:
+            # Pass1 と Pass2 の間に原本が書き換わった＝Pass1 の定義（旧本文）と Pass2 の参照（新本文）を
+            # 混ぜると存在しない依存を作る。黙って通さず blocked（次回 sync で全再構築）。
+            flags.append({"doc": rel, "reason": "changed_between_passes", "action": "blocked"})
+            continue
         ref_result = analyzer.extract_refs(text, rel)
         _flag_dropped(analyzer.name, rel, ref_result.dropped)
         name_pair = rel_name.get(rel)                     # 主体を持たないファイル（例: JOB の無い JCL PROC）は src が無い

@@ -193,3 +193,18 @@ def test_llm_render_pass_skips_reindex_when_nothing_changed(monkeypatch):
     monkeypatch.setattr(worker, "_reindex_after_rag_rewrite", lambda world: calls.append(world))
     worker._llm_render_pass("v1")
     assert calls == []
+
+
+def test_reflect_graph_after_rag_rewrite_refuses_blocked_graph(monkeypatch):
+    """軽量再生成後のグラフ追随は、blocked flag（不可読/途中で変わったコード）があるとき
+    部分グラフで既存グラフを置換しない（例外で呼び出し元へ・次回 sync の全再構築に委ねる）。"""
+    import pytest
+    from sherpa.ingest import worker, world_neo4j
+    monkeypatch.setattr(worker, "build_world_graph",
+                        lambda world: ([], [], [{"doc": "a.cbl", "reason": "changed_between_passes", "action": "blocked"}]))
+    loaded = []
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "u", "user": "x", "pw": "y"})
+    monkeypatch.setattr(world_neo4j, "load_world", lambda *a, **k: loaded.append(a))
+    with pytest.raises(RuntimeError):
+        worker._reflect_graph_after_rag_rewrite("w")
+    assert loaded == []

@@ -324,3 +324,25 @@ def test_build_derived_publish_rename_failure_leaves_sig_unconfirmed_and_retries
     assert len(build_derived_calls) == 2                      # 必ず再試行される
     assert res2["status"] in ("auto_published", "auto_published_with_flags")
     assert db_row["last_sig"] == "sig-B"
+
+
+def test_es_index_world_reuses_scan_sig_not_recomputed(monkeypatch, _stub_pipeline):
+    """(B3) `run()` が ES へ渡す `content_sig` は冒頭 `world_state()` で確定した `sig` を
+    そのまま使う——`world_signature()` を再計算して別の署名を渡さない（全木の二重走査・
+    ABA での PG/ES 署名不一致を防ぐ）。"""
+    monkeypatch.setattr(worker, "world_state",
+                        lambda world, progress=None: ("scan-sig", {"a": [1, 2, 3]}))
+    # `world_signature` が呼ばれてもここで再計算した別署名が使われてはならない。
+    monkeypatch.setattr(worker, "world_signature", lambda world: "recomputed-different-sig")
+
+    captured_content_sig = []
+
+    def _fake_index_world(world, content_sig=None, **kw):
+        captured_content_sig.append(content_sig)
+        return {"available": True, "indexed": 0, "chunks": 0}
+    monkeypatch.setattr(es_index, "index_world", _fake_index_world)
+
+    res = worker.run("w")
+
+    assert res["status"] in ("auto_published", "auto_published_with_flags")
+    assert captured_content_sig == ["scan-sig"]

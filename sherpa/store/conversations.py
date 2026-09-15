@@ -440,6 +440,24 @@ def conversation_has_personal_message(cid) -> bool:
             (cid,)).fetchone())
 
 
+def conversation_is_personal_tainted(cid) -> bool:
+    """会話が個人由来か（後続ターンの個人扱い判定用）。会話フラグ `contains_personal_workspace`・
+    `messages.personal=TRUE`・列導入前の旧行の `answer` マーカー（`is_personal_tainted` と同じ基準）
+    のいずれかで真。`conversation_has_personal_message`（personal 列のみ）より広い＝伏字共有の
+    伏字判定（`is_personal_tainted`）と同じ集合を見る。"""
+    _ensure()
+    with _connect() as c:
+        row = c.execute("SELECT contains_personal_workspace FROM conversations WHERE id=%s",
+                        (cid,)).fetchone()
+        if row and row.get("contains_personal_workspace"):
+            return True
+        rows = c.execute(
+            "SELECT personal, answer FROM messages WHERE conversation_id=%s AND "
+            "(personal=TRUE OR answer ?| array['personal_sources','_personal_facts','codex_wrote_files'])",
+            (cid,)).fetchall()
+    return any(is_personal_tainted(dict(r)) for r in rows)
+
+
 def set_contains_personal_workspace(conversation_id: int) -> None:
     """会話に個人 workspace 参照フラグを立てる（冪等・FALSE→TRUE のみ）。
 

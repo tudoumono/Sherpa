@@ -211,15 +211,21 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
     return m
 
 
-def _index_meta(world: str) -> dict:
-    """index に記録した埋め込み素性（_meta）。無ければ {}。"""
+def _index_meta(world: str) -> dict | None:
+    """index に記録した埋め込み素性（_meta）。**取得失敗**（GET 例外・到達不可等）は `None`、
+    index はあるが `_meta` が付いていない**正当な不在**は `{}`——両者は区別する。`needs_reindex`/
+    `search` 等の判定用途は `None` を `{}` 相当（未設定）として扱ってよいが、既存 `_meta` を
+    読み直してから書き戻す PUT 系（`confirm_human_md_meta`/`_confirm_content_sig`/
+    `_wipe_after_bulk_failure`）は `None` を `{}` と取り違えると、GET の一時失敗のたびに
+    既存の `mapping_version`/`embed_*` 等を丸ごと消してしまう（Put Mapping API の `_meta` は
+    丸ごと置換のため）——それらは `None` を弾いて PUT 自体をスキップする。"""
     try:
         r = _req("GET", f"/{_index(world)}/_mapping")
         for v in r.values():
             return (v.get("mappings") or {}).get("_meta") or {}
-    except Exception:
         return {}
-    return {}
+    except Exception:
+        return None
 
 
 def _settings(s):
@@ -428,8 +434,12 @@ def confirm_human_md_meta(world: str) -> bool:
     sig = _human_md_config_sig(world)
     if sig == _HUMAN_MD_PENDING_SENTINEL:
         return False
+    existing = _index_meta(world)
+    if existing is None:                    # GET 失敗＝既存 meta を消して PUT しない（次回 sync が再試行）
+        _log.warning("es_index: human_md_sig 確定前の meta 取得に失敗しました（次回 sync で再試行）: world=%s", world)
+        return False
     try:
-        meta = dict(_index_meta(world))
+        meta = dict(existing)
         meta["human_md_sig"] = sig
         _req("PUT", f"/{_index(world)}/_mapping", {"_meta": meta})
         return True
@@ -458,8 +468,12 @@ def _confirm_content_sig(world: str, content_sig) -> None:
     """
     if not content_sig:
         return
+    existing = _index_meta(world)
+    if existing is None:                    # GET 失敗＝既存 meta を消して PUT しない（次回 sync が再試行）
+        _log.warning("es_index: content_sig 確定前の meta 取得に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
+        return
     try:
-        meta = dict(_index_meta(world))
+        meta = dict(existing)
         meta["content_sig"] = content_sig
         _req("PUT", f"/{_index(world)}/_mapping", {"_meta": meta})
     except Exception:
@@ -497,8 +511,13 @@ def _wipe_after_bulk_failure(world: str) -> None:
     """
     if delete_world(world):
         return
+    # ここは既存 meta の温存ではなく索引の無効化が目的。GET 失敗（None）でも `{}` として PUT し、
+    # 少なくとも `content_sig` を落とす（他フィールドが消えても次回 sync が張り直すだけで安全側。
+    # 逆に PUT を見送ると「一部だけ入った索引＋有効な content_sig」が居座り needs_reindex が
+    # 永久に False になる）。
+    existing = _index_meta(world) or {}
     try:
-        meta = dict(_index_meta(world))
+        meta = dict(existing)
         meta.pop("content_sig", None)
         _req("PUT", f"/{_index(world)}/_mapping", {"_meta": meta})
     except Exception:
@@ -738,8 +757,9 @@ def _prune_embed_cache(world: str, valid_keys: set) -> None:
         # 失敗する（索引が消えたまま残る）ため、書込失敗と同じく OSError で打ち切らせる。
         raise OSError(f"embed cache DB へ接続できません（world={world}）")
     try:
+        valid_key_set = set(valid_keys)       # 1回だけ set 化して使い回す（呼び出し元が list で渡しても複製しない）
         existing = {row[0] for row in conn.execute("SELECT key FROM kv").fetchall()}
-        missing = len(set(valid_keys) - existing)
+        missing = len(valid_key_set - existing)
         if missing:
             # Pass1 完了時点で現存キーは全て DB にあるはず。無いのは、途中で壊れた DB を
             # 作り直した（それ以前にキャッシュヒットで再利用したベクトルは DB から消えている）等の
@@ -747,7 +767,7 @@ def _prune_embed_cache(world: str, valid_keys: set) -> None:
             # 再構築が中止され索引が消える。OSError で打ち切り、既存索引を残す（次回 sync で
             # 不足キーは再 embed される）。
             raise OSError(f"embed cache に現存キーが不足しています（world={world}・missing={missing}）")
-        to_delete = list(existing - set(valid_keys))
+        to_delete = list(existing - valid_key_set)
         with conn:
             for chunk in _sql_chunks(to_delete):
                 placeholders = ",".join("?" * len(chunk))
@@ -1758,7 +1778,7 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
         return False
     if not count(world):
         return True
-    meta = _index_meta(world)
+    meta = _index_meta(world) or {}           # GET 失敗は未設定相当＝fail-closed で reindex を促す
     if meta.get("content_sig") != content_sig:
         return True
     if meta.get("mapping_version") != ES_MAPPING_VERSION:
@@ -1903,7 +1923,7 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
         reason = "embedding_cloud_unavailable"
         _log.warning("es_index.search: 選択中クラウドの埋め込みが解決できず world=%s は BM25 のみへ降格しました",
                      world)
-    meta = _index_meta(world) if ec else {}
+    meta = (_index_meta(world) or {}) if ec else {}
     same = bool(ec) and (meta.get("embed_provider") == ec["provider"]
                          and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
                          and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID)
@@ -1987,7 +2007,7 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
         if embeddings.cloud_selected_but_unavailable(system_settings=sys_s):
             return [], "embedding_cloud_unavailable"
         return [], "embedding_not_configured"
-    meta = _index_meta(world)
+    meta = _index_meta(world) or {}           # GET 失敗は未設定相当＝ベクトル素性不一致として扱う
     if not (meta.get("embed_provider") == ec["provider"]
             and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
             and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID):

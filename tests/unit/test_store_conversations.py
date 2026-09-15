@@ -41,3 +41,16 @@ def test_is_personal_tainted_false_for_empty_legacy_markers():
     assert is_personal_tainted(
         {"personal": False, "answer": {"personal_sources": [], "_personal_facts": "",
                                        "codex_wrote_files": False}}) is False
+
+
+def test_conversation_is_personal_tainted_sees_legacy_marker_rows():
+    """`personal` 列が FALSE でも旧形式の `answer.personal_sources` を持つ行があれば会話は個人由来
+    （伏字共有の伏字判定と同じ集合）。フラグも個人行も無ければ偽。"""
+    import time as _t
+    from sherpa import store
+    uid = f"taint-{int(_t.time()*1000) % 10**8}"
+    store.upsert_user(uid, uid, "u")
+    cid = store.create_conversation(uid, "v1", "t")["id"]
+    assert store.conversation_is_personal_tainted(cid) is False
+    store.add_message(cid, "assistant", "x", answer={"personal_sources": [{"path": "a"}]}, personal=False)
+    assert store.conversation_is_personal_tainted(cid) is True

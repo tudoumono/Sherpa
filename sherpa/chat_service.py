@@ -1258,6 +1258,44 @@ def _personal_citations(hits: list[dict]) -> list[dict]:
     return cites
 
 
+def _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes, ev,
+                          user_msg_id, personal, world, scope_meta, t0) -> dict:
+    """確認カード（provider が yield する `question` イベント）を assistant メッセージとして永続化する
+    （handle_message／stream_message 共通・両経路とも `_result` に至らず generator を終える契約
+    ＝ここ1箇所の保存で両方に効く）。ページを離れて履歴を開き直しても後から答えられる。
+    content=prompt／answer に question payload／trace はここまでに溜めた思考ノード。
+    personal トグル ON のターンは、質問 prompt に個人ヒットの断片が混ざり得るため個人扱いで保存する
+    （会話フラグ `set_contains_personal_workspace`／`_user_msg` の personal 保存は呼び出し側が
+    ターン先頭で既に済ませている契約）。
+    """
+    # 会話が既に個人由来（過去ターンに個人行がある）なら、このターンが personal=False でも
+    # 確認カードと質問行を個人扱いにする（本回答の `_used_personal` と同じ理由＝履歴/resume 経由で
+    # 個人内容が混ざり得る・非個人扱いの行として伏字共有から漏らさない）。追加読取に失敗したら
+    # 個人扱いへ倒す（fail-closed）。
+    if not personal:
+        try:
+            personal = bool(store.conversation_is_personal_tainted(conversation_id))
+        except Exception:
+            personal = True
+    if personal:
+        store.set_contains_personal_workspace(conversation_id)
+        store.set_message_personal(user_msg_id)
+    question_payload = {k: v for k, v in ev.items() if k != "type"}
+    question_payload.setdefault("original_message", message)   # 再送フォーマット（元の依頼）に使う
+    q_answer = {"lens": "clarify", "question": question_payload, "trace_version": 2}
+    q_answer["duration_ms"] = round((time.monotonic() - t0) * 1000)
+    q_msg = store.add_message(conversation_id, "assistant", ev.get("prompt") or "",
+                              lens="clarify",
+                              answer=q_answer,
+                              trace=_cap_trace_v2(trace_nodes),
+                              personal=personal)
+    # 監査は lens="clarify"。assistant_msg_id は保存した確認カードの message id。
+    _audit_chat_turn(user_id, conversation_id, settings, lens="clarify",
+                     user_msg_id=user_msg_id, assistant_msg_id=q_msg["id"], world=world,
+                     scope_paths=(scope_meta or {}).get("scope_paths"), personal=personal)
+    return q_msg
+
+
 def handle_message(session, message, world="v1",
                    conversation_id=None, user_id="admin", scope_paths=None, layer=None, lens=None,
                    knowledge=False, personal=False, users_dir="data/users", web_search=False,
@@ -1395,6 +1433,14 @@ def handle_message(session, message, world="v1",
         if ev["type"] == "_result":
             result = ev
             break
+        if ev.get("type") == "question":
+            # 非ストリーミング経路は node/_result しか扱わない契約だったため、provider が
+            # question を yield して generator を終える（clarify 相当）と for ループが空振りし、
+            # 下の result=None 分岐（RuntimeError）に落ちて 500 になっていた——ストリーミング側
+            # （`stream_message`）と同じ保存・監査を行い、確認カードを正常応答として返す。
+            q_msg = _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes,
+                                          ev, _user_msg["id"], personal, world, scope_meta, _t0)
+            return {"conversation_id": conversation_id, "message": q_msg}
         if ev.get("type") == "node" and ev.get("id"):
             trace_nodes[ev["id"]] = ev
     if result is None:
@@ -1438,6 +1484,16 @@ def handle_message(session, message, world="v1",
     #   （toggle ON no-hit の漏洩を塞ぐ・sanitized で伏字＋通常共有をブロック）。
     if personal:
         _used_personal = True
+    # 会話が既に個人由来（会話フラグ・個人行・旧形式マーカーのいずれか）なら、今回 personal=False でも個人扱いにする——
+    #   `history`（上で取得した直前ターンの (user, assistant) 対）はモデルへ渡した入力の一部であり、
+    #   過去の個人ターンの回答が含まれていれば今回の回答にもその内容が滲み得る。会話単位で一度
+    #   個人由来になったら以後のターンも保守的に個人扱いにし続ける（`_used_personal=False` のまま
+    #   保存すると、個人ターンの内容が非個人扱いの行として sanitized share の伏字対象から漏れる）。
+    if not _used_personal:
+        try:
+            _used_personal = bool(store.conversation_is_personal_tainted(conversation_id))
+        except Exception:
+            _used_personal = True                       # 判定できなければ個人扱いへ倒す（fail-closed）
 
     # 個人コンテンツを使った場合は assistant message 保存の BEFORE にフラグを立てる。
     # フラグ書き込みに失敗したら例外を再 raise（fail-closed）し、個人内容を含む回答を保存しない。
@@ -1627,6 +1683,14 @@ def stream_message(session, message, world="v1",
             # 個人参照トグル ON のターンは hit が無くても質問にファイル名等が残り得るため個人扱い。
             if personal:
                 _used_personal = True
+            # 会話が既に個人由来（会話フラグ・個人行・旧形式マーカーのいずれか）なら今回 personal=False でも個人扱いに
+            # する（handle_message と同じ理由——`history` に過去の個人ターンの回答が含まれ得る・
+            # 一度個人由来になった会話は以後のターンも保守的に個人扱いし続ける）。
+            if not _used_personal:
+                try:
+                    _used_personal = bool(store.conversation_is_personal_tainted(conversation_id))
+                except Exception:
+                    _used_personal = True               # 判定できなければ個人扱いへ倒す（fail-closed）
 
             # 個人コンテンツを使った場合は assistant message 保存の BEFORE にフラグを立てる。
             # フラグ書き込みに失敗したら例外を再 raise（fail-closed）し、個人内容を含む回答を保存しない。
@@ -1649,27 +1713,11 @@ def stream_message(session, message, world="v1",
                 yield _ev_committed_node
             yield {"type": "answer", "conversation_id": conversation_id, "message": msg}
         elif ev["type"] == "question":
-            # 確認カードを assistant メッセージとして**永続化**する
-            #   ＝ページを離れて履歴を開き直しても後から答えられる。content=prompt / answer に question payload /
-            #   trace はここまでに溜めた思考ノード（clarify ターンでも「思考の流れ」を右ペインへ静的復元
-            #   できる副産物）。両経路（通常 /chat/stream・背景 /chat/turns=覗き窓のバッファ経由）とも
-            #   本関数 stream_message を通るため、ここ1箇所の保存で両方に効く。
-            #   personal トグル ON のターンは、質問 prompt に個人ヒットの断片が混ざり得るため個人扱いで
-            #   保存する（会話フラグ set_contains_personal_workspace は冒頭で設定済み・_user_msg も
-            #   personal=personal で保存済み＝sanitized/通常共有で伏せられる）。
-            question_payload = {k: v for k, v in ev.items() if k != "type"}
-            question_payload.setdefault("original_message", message)   # 再送フォーマット（元の依頼）に使う
-            q_answer = {"lens": "clarify", "question": question_payload, "trace_version": 2}
-            q_answer["duration_ms"] = round((time.monotonic() - _t0) * 1000)
-            q_msg = store.add_message(conversation_id, "assistant", ev.get("prompt") or "",
-                                      lens="clarify",
-                                      answer=q_answer,
-                                      trace=_cap_trace_v2(trace_nodes),
-                                      personal=personal)
-            # 監査は現行どおり lens="clarify"。assistant_msg_id は保存した確認カードの message id に変える。
-            _audit_chat_turn(user_id, conversation_id, settings, lens="clarify",
-                             user_msg_id=_user_msg["id"], assistant_msg_id=q_msg["id"], world=world,
-                             scope_paths=(scope_meta or {}).get("scope_paths"), personal=personal)
+            # 確認カードを assistant メッセージとして永続化する（`_save_clarify_message` 参照・
+            # handle_message と共有）。両経路（通常 /chat/stream・背景 /chat/turns=覗き窓のバッファ
+            # 経由）とも本関数 stream_message を通るため、ここ1箇所の保存で両方に効く。
+            _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes,
+                                  ev, _user_msg["id"], personal, world, scope_meta, _t0)
             yield {**ev, "conversation_id": conversation_id, "original_message": message}
         else:
             if ev.get("type") == "node" and ev.get("id"):
