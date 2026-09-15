@@ -542,7 +542,7 @@ def test_chat_turns_lifecycle(client):
 
     # RV: background thread が完走してから関数を抜ける（そのまま抜けると背景スレッドが後続テストと
     # 並行して DB へ書き込み続け、他テストの並行操作と競合して deadlock を誘発しうる・
-    # tests/api/test_chat_turns.py::_wait_turn_done と同じ流儀＝タイムアウトなら明示的に失敗させる）。
+    # tests/api/test_chat_turns_api.py::_wait_turn_done と同じ流儀＝タイムアウトなら明示的に失敗させる）。
     from sherpa import chat_turns
     deadline = time.time() + 10.0
     while time.time() < deadline:

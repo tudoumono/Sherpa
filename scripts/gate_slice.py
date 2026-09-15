@@ -421,10 +421,11 @@ def select_tests(
     )
 
 
-# tests/ 直下の第1階層＝スイート。同名テストファイルが異なるスイートに共存すると（例:
-# tests/api/test_chat_turns.py と tests/unit/test_chat_turns.py）、1つの pytest プロセスに
-# 両方渡した時点で ImportPathMismatchError（収集エラー）で止まる。スイートごとに別プロセスへ
-# 分けて順次実行することで回避する。順序は固定（docs/20-開発ハーネス.md の段階表に登場する順）。
+# tests/ 直下の第1階層＝スイート。同名テストファイルが異なるスイートに共存すると、1つの pytest
+# プロセスに両方渡した時点で ImportPathMismatchError（収集エラー）で止まる（テストファイル名は
+# スイートを跨いで一意にする規約＝api 側は `_api` 接尾辞）。スイートごとに別プロセスへ分けて
+# 順次実行するのは、DB を使うスイートの env 変更を混ぜないため。順序は固定
+# （docs/20-開発ハーネス.md の段階表に登場する順）。
 _SUITE_ORDER = ["unit", "contract", "api", "integration", "e2e"]
 
 

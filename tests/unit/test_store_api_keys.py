@@ -23,6 +23,11 @@ def _sfx() -> str:
     return str(int(time.time() * 1000))[-8:]
 
 
+# スキーマ/デコイ名はプロセスごとに一意にする（共有テスト DB で並走する別プロセスと
+# CREATE/DROP SCHEMA が衝突しないため）。
+_SFX = _sfx()
+
+
 def _try_init() -> None:
     """接続プローブ（軽量 `SELECT 1`）だけを「DB 到達不能」の skip 対象にする。プローブが
     通った後の `store.init_schema()`（DDL 適用・migration を含む本体）はここでは一切 catch
@@ -1290,15 +1295,15 @@ def test_classify_client_op_id_index_correct_with_non_default_search_path():
     _try_init()
     with store._connect() as c:
         assert _db_mod._classify_client_op_id_index(c) == "current"   # 前提を確認しておく。
-        c.execute("CREATE SCHEMA IF NOT EXISTS _empty_schema_for_search_path_test")
+        c.execute(f"CREATE SCHEMA IF NOT EXISTS _empty_schema_for_search_path_test{_SFX}")
         try:
-            c.execute("SET LOCAL search_path TO _empty_schema_for_search_path_test, public")
+            c.execute(f"SET LOCAL search_path TO _empty_schema_for_search_path_test{_SFX}, public")
             shape = _db_mod._classify_client_op_id_index(c)
             assert shape == "current", (
                 f"search_path の先頭に空スキーマがあると誤判定した: {shape}")
         finally:
             c.execute("RESET search_path")
-            c.execute("DROP SCHEMA IF EXISTS _empty_schema_for_search_path_test CASCADE")
+            c.execute(f"DROP SCHEMA IF EXISTS _empty_schema_for_search_path_test{_SFX} CASCADE")
 
 
 def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_current():
@@ -1322,13 +1327,13 @@ def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_curren
     with store._connect() as c:
         assert _db_mod._classify_client_op_id_index(c) == "current"   # 前提を確認しておく。
         target_schema = _db_mod._resolve_api_keys_schema(c)
-        c.execute("CREATE SCHEMA IF NOT EXISTS _decoy_schema_for_client_op_id_test")
-        c.execute("CREATE TABLE _decoy_schema_for_client_op_id_test._decoy_table "
+        c.execute(f"CREATE SCHEMA IF NOT EXISTS _decoy_schema_for_client_op_id_test{_SFX}")
+        c.execute(f"CREATE TABLE _decoy_schema_for_client_op_id_test{_SFX}._decoy_table "
                   "(id BIGSERIAL PRIMARY KEY, client_op_id TEXT)")
         c.execute("CREATE UNIQUE INDEX api_keys_client_op_id_unique "
-                  "ON _decoy_schema_for_client_op_id_test._decoy_table(lower(client_op_id)) "
+                  f"ON _decoy_schema_for_client_op_id_test{_SFX}._decoy_table(lower(client_op_id)) "
                   "WHERE client_op_id IS NOT NULL")
-        c.execute("SET LOCAL search_path TO _decoy_schema_for_client_op_id_test, public")
+        c.execute(f"SET LOCAL search_path TO _decoy_schema_for_client_op_id_test{_SFX}, public")
 
         calls: list[tuple[str, tuple]] = []
         orig_execute = c.execute
@@ -1352,7 +1357,7 @@ def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_curren
                 f"ns.nspname の bind 値が解決済みスキーマと一致しない: {a}")
 
         c.execute("RESET search_path")
-        c.execute("DROP SCHEMA IF EXISTS _decoy_schema_for_client_op_id_test CASCADE")
+        c.execute(f"DROP SCHEMA IF EXISTS _decoy_schema_for_client_op_id_test{_SFX} CASCADE")
 
 
 def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_legacy():
@@ -1376,13 +1381,13 @@ def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_legacy
     sfx = _sfx()
     with store._connect() as c:
         _reset_client_op_id_index_to_legacy(c, sfx, rows=False)
-        c.execute("CREATE SCHEMA IF NOT EXISTS _decoy_schema_for_client_op_id_test2")
-        c.execute("CREATE TABLE _decoy_schema_for_client_op_id_test2._decoy_table "
+        c.execute(f"CREATE SCHEMA IF NOT EXISTS _decoy_schema_for_client_op_id_test2{_SFX}")
+        c.execute(f"CREATE TABLE _decoy_schema_for_client_op_id_test2{_SFX}._decoy_table "
                   "(id BIGSERIAL PRIMARY KEY, client_op_id TEXT)")
         c.execute("CREATE UNIQUE INDEX api_keys_client_op_id_unique "
-                  "ON _decoy_schema_for_client_op_id_test2._decoy_table(lower(client_op_id)) "
+                  f"ON _decoy_schema_for_client_op_id_test2{_SFX}._decoy_table(lower(client_op_id)) "
                   "WHERE client_op_id IS NOT NULL")
-        c.execute("SET LOCAL search_path TO _decoy_schema_for_client_op_id_test2, public")
+        c.execute(f"SET LOCAL search_path TO _decoy_schema_for_client_op_id_test2{_SFX}, public")
 
         shape = _db_mod._classify_client_op_id_index(c)
         assert shape == "legacy", (
@@ -1390,7 +1395,7 @@ def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_legacy
         _db_mod._migrate_client_op_id_unique_index(c)
         # デコイは無傷のまま（別スキーマの別表の索引は移行対象ではない）。
         decoy_still_there = c.execute(
-            "SELECT 1 FROM pg_indexes WHERE schemaname='_decoy_schema_for_client_op_id_test2' "
+            f"SELECT 1 FROM pg_indexes WHERE schemaname='_decoy_schema_for_client_op_id_test2{_SFX}' "
             "AND indexname='api_keys_client_op_id_unique'"
         ).fetchone()
         assert decoy_still_there is not None, (
@@ -1399,7 +1404,7 @@ def test_classify_client_op_id_index_ignores_decoy_in_leading_schema_when_legacy
         assert _db_mod._classify_client_op_id_index(c) == "current"
 
         c.execute("RESET search_path")
-        c.execute("DROP SCHEMA IF EXISTS _decoy_schema_for_client_op_id_test2 CASCADE")
+        c.execute(f"DROP SCHEMA IF EXISTS _decoy_schema_for_client_op_id_test2{_SFX} CASCADE")
 
 
 def test_client_op_id_case_insensitive_conflict_and_recovery_match():

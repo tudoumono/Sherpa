@@ -3097,6 +3097,9 @@ def _install_agentic_post(monkeypatch, seq):
     monkeypatch.setattr(A, "es_index", A.es_index)
     monkeypatch.setattr(A.es_index, "available", lambda: False)
     monkeypatch.setattr(A, "_graph_available", lambda: False)
+    # ツール可用性は短 TTL でプロセス内にキャッシュされる。前のテストが差し替えた可用性が
+    # 残ると、このテストの差し替え（ES あり/なし）が効かず提示ツールが食い違う＝毎回リセットする。
+    monkeypatch.setattr(A, "_tools_availability_cache", {"at": 0.0, "data": None})
     monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
 
 
@@ -3340,6 +3343,7 @@ def test_ext_research_es_search_hit_without_line_number_normalizes_span_to_none(
     monkeypatch.setattr(A, "es_index", A.es_index)
     monkeypatch.setattr(A.es_index, "available", lambda: True)
     monkeypatch.setattr(A, "_graph_available", lambda: False)
+    monkeypatch.setattr(A, "_tools_availability_cache", {"at": 0.0, "data": None})   # 前テストの可用性を持ち越さない
 
     # `es_search`（rag_chunks 由来で行番号を持たない想定）が実在 doc への citation を
     # `span=[None, None]` で返すケースを再現する（`agentic_search.run_tool` の es_search 分岐が

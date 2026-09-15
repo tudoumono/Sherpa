@@ -2,7 +2,7 @@
 
 送信→画面遷移→戻る、というシナリオそのものを確認する。トップバーのバッジ単体の確認は
 test_topbar_ui.py（全ページ共通の見え方）、購読ゼロ完走・cursor replay 等のサーバ挙動は
-tests/api/test_chat_turns.py が担当する。
+tests/api/test_chat_turns_api.py が担当する。
 """
 from __future__ import annotations
 
