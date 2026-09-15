@@ -5,7 +5,6 @@ index→search→範囲フィルタ→delete の往復と、agentic の es_searc
 """
 from __future__ import annotations
 
-import json
 import pathlib
 
 import pytest
@@ -20,6 +19,25 @@ def test_scopes_pure():
     assert es._scopes("4期/02_設計/01_基本設計/税計算仕様書.md") == \
         ["4期", "4期/02_設計", "4期/02_設計/01_基本設計"]
     assert es._scopes("a.md") == []
+
+
+def test_chunk_key_changes_with_embedding_input_algorithm_id(monkeypatch):
+    """`_chunk_key` は provider/model/dim が同じでも前処理アルゴリズム版
+    （`embeddings.EMBEDDING_INPUT_ALGORITHM_ID`）が変われば別キーになる——window分割/pooling方式を
+    変えると同じ provider/model/dim でもベクトルが別物になるため（`_chunk_key` docstring 参照）。"""
+    from sherpa import embeddings
+    ec = {"provider": "p", "model": "m", "dim": 4}
+    o_algo = embeddings.EMBEDDING_INPUT_ALGORITHM_ID
+    try:
+        monkeypatch.setattr(embeddings, "EMBEDDING_INPUT_ALGORITHM_ID", "algo-v1")
+        k1 = es._chunk_key(ec, "text")
+        monkeypatch.setattr(embeddings, "EMBEDDING_INPUT_ALGORITHM_ID", "algo-v2")
+        k2 = es._chunk_key(ec, "text")
+        assert k1 != k2
+        monkeypatch.setattr(embeddings, "EMBEDDING_INPUT_ALGORITHM_ID", "algo-v1")
+        assert es._chunk_key(ec, "text") == k1                 # 同じ版に戻せば同じキー
+    finally:
+        embeddings.EMBEDDING_INPUT_ALGORITHM_ID = o_algo
 
 
 def test_es_roundtrip_if_available():
@@ -133,7 +151,7 @@ def test_delete_missing_is_ok():
 def test_embed_cache_reuse():
     """差分embed: 内容ハッシュキャッシュで未変更チャンクは再 embed しない（コスト最適化）。
 
-    EMBED-3: キャッシュはシャード化（`_embed_cache_dir`）＝`_embed_cached` はもう剪定/削除を
+    キャッシュ本体は SQLite 1ファイル（`_embed_cache_db_path`）＝`_embed_cached` はもう剪定/削除を
     自動で行わない（`index_world` が doc グループごとに複数回呼ぶため、呼ぶたびに剪定/削除すると
     前のグループの分を消してしまう・`_embed_cached` docstring 参照）。剪定・削除は
     `_prune_embed_cache`/`_delete_embed_cache` を明示的に呼ぶ（`index_world` が world 全体の
@@ -148,7 +166,7 @@ def test_embed_cache_reuse():
     es.worlds.derived_dir = lambda w: pathlib.Path(tmp) / w
     ec = {"provider": "p", "model": "m", "dim": 4}
     w = "embcache_test"
-    cache_dir = pathlib.Path(tmp) / w / "semantic" / "embed_cache"
+    db_path = pathlib.Path(tmp) / w / "semantic" / "embed_cache.sqlite3"
     try:
         # 初回: distinct {a,b}（重複 b は1回だけ）→ 2件 embed・3ベクトル返る
         vecs, reused, embedded = es._embed_cached(w, ["a", "b", "b"], ec)
@@ -162,31 +180,38 @@ def test_embed_cache_reuse():
         assert (reused, embedded) == (1, 0) and len(calls) == n
         # 剪定は明示呼び出し（`_prune_embed_cache`）でのみ起きる＝現存（a だけ）に縮む
         es._prune_embed_cache(w, {es._chunk_key(ec, "a")})
-        assert _all_cache_keys(cache_dir) == {es._chunk_key(ec, "a")}
+        assert _all_cache_keys(w) == {es._chunk_key(ec, "a")}
         # 素性変更（モデル違い）→ キー別＝再 embed
         es._embed_cached(w, ["a"], {**ec, "model": "m2"})
         assert calls[-1] == ["a"]
+        # 素性変更（前処理アルゴリズム版違い）→ provider/model/dim が同じでもキー別＝再 embed
+        o_algo = embeddings.EMBEDDING_INPUT_ALGORITHM_ID
+        embeddings.EMBEDDING_INPUT_ALGORITHM_ID = "algo-v-next"
+        try:
+            es._embed_cached(w, ["a"], ec)
+        finally:
+            embeddings.EMBEDDING_INPUT_ALGORITHM_ID = o_algo
+        assert calls[-1] == ["a"]
         # embed 失敗（None）→ BM25 降格・キャッシュは壊さない（このバッチ分は何も書き込まれない）
-        before = {f.name: f.read_text() for f in cache_dir.glob("*.json")}
+        before = _all_cache_rows(w)
         embeddings.embed = lambda texts, c, **kw: None
         assert es._embed_cached(w, ["zzz-new"], ec) == (None, 0, 0)
-        after = {f.name: f.read_text() for f in cache_dir.glob("*.json")}
-        assert after == before
+        assert _all_cache_rows(w) == before
         # `_embed_cached` 自体は現存チャンク無し/埋め込み無効でもキャッシュへ一切触れない（ADD-only）
-        # ——削除は呼び出し元（`_delete_embed_cache`）の責務（RV Med 相当・削除残骸を残さない・鏡）。
+        # ——削除は呼び出し元（`_delete_embed_cache`）の責務（削除残骸を残さない・鏡）。
         embeddings.embed = lambda texts, c, **kw: (calls.append(list(texts)) or [[0.0] * c["dim"] for _ in texts])
         es._embed_cached(w, ["k1", "k2"], ec)
-        assert cache_dir.is_dir() and list(cache_dir.glob("*.json"))
+        assert db_path.is_file() and _all_cache_keys(w)
         assert es._embed_cached(w, [], ec) == (None, 0, 0)
-        assert cache_dir.is_dir() and list(cache_dir.glob("*.json"))    # 空呼び出しでは自動では消えない
+        assert db_path.is_file() and _all_cache_keys(w)         # 空呼び出しでは自動では消えない
         es._delete_embed_cache(w)
-        assert not cache_dir.exists()                                   # 明示削除で消える
+        assert not db_path.exists()                              # 明示削除で消える
         es._embed_cached(w, ["k1"], ec)
-        assert cache_dir.is_dir()
+        assert db_path.is_file()
         assert es._embed_cached(w, ["k1"], None) == (None, 0, 0)
-        assert cache_dir.is_dir()                                       # ec=None でも自動では消えない
+        assert db_path.is_file()                                  # ec=None でも自動では消えない
         es._delete_embed_cache(w)
-        assert not cache_dir.exists()
+        assert not db_path.exists()
         # RV Low: 壊れた（次元不一致の）キャッシュは miss 扱いで再 embed（毒ベクトルを使わない）
         es._embed_cache_write_batch(w, {es._chunk_key(ec, "k9"): [0.0, 0.0]})   # dim=2≠4
         m = len(calls)
@@ -197,17 +222,26 @@ def test_embed_cache_reuse():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _all_cache_keys(cache_dir):
-    """テスト用: シャード化キャッシュ（`es._embed_cache_dir`）配下の全シャードから現存キーを集める。"""
-    keys = set()
-    for f in cache_dir.glob("*.json"):
-        keys.update(json.loads(f.read_text())["vectors"].keys())
-    return keys
+def _all_cache_keys(world):
+    """テスト用: SQLite キャッシュ（`es._embed_cache_db_path`）に現存する全キーを集める。"""
+    return set(_all_cache_rows(world))
+
+
+def _all_cache_rows(world):
+    """テスト用: SQLite キャッシュの全 (key -> vec JSON文字列) を集める（未変更検証に使う）。
+    DB 自体が無ければ空 dict（`_embed_cache_lookup_batch`/`_delete_embed_cache` と同じ fail-safe）。"""
+    conn = es._embed_cache_connect(world, create=False)
+    if conn is None:
+        return {}
+    try:
+        return dict(conn.execute("SELECT key, vec FROM kv").fetchall())
+    finally:
+        conn.close()
 
 
 def test_embed_cache_streaming_flush_and_resume():
     """EMBED-2/EMBED-3: 不足分（`need`）を `_EMBED_FLUSH_CHUNKS` バッチへ分割し、バッチ成功ごとに即
-    シャード（`es._embed_cache_dir`）へフラッシュする（メモリ有界化＋再開性）。ES 不要・stub。
+    キャッシュ DB（`es._embed_cache_db_path`）へフラッシュする（メモリ有界化＋再開性）。ES 不要・stub。
 
     EMBED-3: `_embed_cached` はもう「現存分だけへ剪定」しない（`index_world` が doc グループごとに
     複数回呼ぶため・`_embed_cached` docstring 参照）——このテストの (c) は元々「全成功後に自動で
@@ -236,25 +270,23 @@ def test_embed_cache_streaming_flush_and_resume():
         # フラッシュ単位=2件・distinct 4件（a,b,c,d）→ 2バッチに分かれる
         es._EMBED_FLUSH_CHUNKS = 2
         w = "embcache_stream_test"
-        cache_dir = pathlib.Path(tmp) / w / "semantic" / "embed_cache"
         vecs, reused, embedded = es._embed_cached(w, ["a", "b", "c", "d"], ec)
         assert (reused, embedded) == (0, 4)
         assert [len(c) for c in calls] == [2, 2]                          # 2件ずつ2バッチで embed が呼ばれた
         assert vecs == [vec_for(t, 4) for t in ["a", "b", "c", "d"]]      # (d) 順序・値が従来（単発呼び）と同一
-        assert _all_cache_keys(cache_dir) == {es._chunk_key(ec, t) for t in "abcd"}   # フラッシュ済み
+        assert _all_cache_keys(w) == {es._chunk_key(ec, t) for t in "abcd"}   # フラッシュ済み
         # (c) 剪定は呼び出し元が明示的に行う（`index_world` が Pass1 完了後に1回だけ呼ぶのと同じ契約）。
         es._prune_embed_cache(w, {es._chunk_key(ec, "a")})
-        assert _all_cache_keys(cache_dir) == {es._chunk_key(ec, "a")}     # 現存分（a だけ）に縮む
+        assert _all_cache_keys(w) == {es._chunk_key(ec, "a")}     # 現存分（a だけ）に縮む
 
         # (a) 途中バッチ失敗: need=[a,b,c,d,FAIL]（flush=2）→ [a,b]・[c,d] は成功して flush 済み、
         # 最後の [FAIL] だけが失敗する。成功済みバッチの分はキャッシュに残る。
         calls.clear()
         w2 = "embcache_stream_fail_test"
-        cache_dir2 = pathlib.Path(tmp) / w2 / "semantic" / "embed_cache"
         vecs, reused, embedded = es._embed_cached(w2, ["a", "b", "c", "d", "FAIL"], ec)
         assert (vecs, reused, embedded) == (None, 0, 0)                   # 呼び出し全体としては失敗＝BM25 縮退
         assert [len(c) for c in calls] == [2, 2, 1]
-        kept = _all_cache_keys(cache_dir2)
+        kept = _all_cache_keys(w2)
         assert kept == {es._chunk_key(ec, t) for t in "abcd"}             # a,b,c,d は flush 済みのまま残る
         assert es._chunk_key(ec, "FAIL") not in kept                      # 失敗したバッチ分は入らない
 

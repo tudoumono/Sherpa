@@ -11,6 +11,7 @@ CONV-CACHE 行）。`_build_derived_into_staging` は per-file ループの各 r
 """
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from pathlib import Path
@@ -118,6 +119,39 @@ def test_source_change_invalidates_only_that_file(monkeypatch, tmp_path):
 
     office_md.build_derived(source, dmd, world_sig="s1")
     assert calls == ["b.xlsx"]               # a.xlsx/c.xlsx はキャッシュヒットで実変換されない
+
+
+def test_ctime_change_with_unchanged_size_and_mtime_invalidates_cache(monkeypatch, tmp_path):
+    """size・mtime が同一のまま ctime だけ進んだ原本（同一 size・mtime を保持したまま中身を
+    上書きされたケースの再現）は、`_conv_cache_source_key` が ctime も材料に含めるため
+    キャッシュミスになる（size・mtime だけのキーだと見逃す穴の固定）。"""
+    world_id = "convcache-ctime-change"
+    source = _new_world(tmp_path, monkeypatch, world_id)
+    _write_fixture_files(source, ["a.xlsx", "b.xlsx"])
+    dmd = worlds.derived_md_dir(world_id)
+    calls = _wrap_convert_with_arms(monkeypatch)
+
+    office_md.build_derived(source, dmd, world_sig="s1")
+    calls.clear()
+
+    target = source / "b.xlsx"
+    real_stat = Path.stat
+    base = real_stat(target)
+
+    def fake_stat(self, *a, **kw):
+        if self == target:
+            # size・mtime は実物のまま・ctime だけ+1秒進める（size/mtime 不変のまま中身だけ
+            # 書き換えられた原本のスタブ）。
+            seq = (base.st_mode, base.st_ino, base.st_dev, base.st_nlink, base.st_uid, base.st_gid,
+                   base.st_size, int(base.st_atime), int(base.st_mtime), int(base.st_ctime) + 1)
+            extra = {"st_atime_ns": base.st_atime_ns, "st_mtime_ns": base.st_mtime_ns,
+                     "st_ctime_ns": base.st_ctime_ns + 1_000_000_000}
+            return os.stat_result(seq, extra)
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    office_md.build_derived(source, dmd, world_sig="s1")
+    assert calls == ["b.xlsx"]               # size・mtime 不変でも ctime 差分だけでキャッシュミスする
 
 
 def test_pipeline_sig_change_invalidates_all_files(monkeypatch, tmp_path):

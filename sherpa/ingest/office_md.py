@@ -1421,7 +1421,13 @@ def _current_conv_cache_pipeline_sig(*, ocr_observation_marker: str | None) -> s
 
 
 def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
-    """キャッシュキー（原本の resolved path・st_size・st_mtime_ns・パイプライン署名）。
+    """キャッシュキー（原本の resolved path・st_size・st_mtime_ns・st_ctime_ns・パイプライン署名）。
+
+    `st_ctime_ns` も材料に含める（`ingest/worker.py::_scan_dir`/`_sig` の world 署名と同じ材料）。
+    size・mtime だけでは、同じ size・mtime を保持したまま中身を上書きされた原本（一部の
+    コピー/SMB 経路で起きうる）を旧成果物のまま確定してしまう穴がある。ctime は中身書き換えで
+    ほぼ必ず動くので、この穴を実用上塞ぐ。全ファイルハッシュ（SHA 等）までは踏み込まない
+    （10k ファイル級 × SMB 越しで走査コストが跳ねるため・世界署名も同じ判断で size/mtime/ctime 止まり）。
 
     `rp.resolve()`/`rp.stat()` が失敗（消失・権限・race）したらキャッシュ対象外として None
     （呼び出し元は通常の実変換へフォールバックする＝fail-safe）。
@@ -1431,7 +1437,7 @@ def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
         st = rp.stat()
     except OSError:
         return None
-    return f"{resolved}|{st.st_size}|{st.st_mtime_ns}|{pipeline_sig}"
+    return f"{resolved}|{st.st_size}|{st.st_mtime_ns}|{st.st_ctime_ns}|{pipeline_sig}"
 
 
 def _conv_cache_slot(cache_root: Path, rel: str) -> tuple[Path, Path]:

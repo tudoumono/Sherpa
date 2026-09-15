@@ -19,7 +19,7 @@ from .grep_tool import valid_world   # 識別子の許容文字（パストラ�
 
 
 def semantic_dir(world_id: str) -> Path:
-    """派生 `semantic/` ディレクトリ（`es_index.py` の埋め込みキャッシュ〔`embed_cache/` シャード群〕の
+    """派生 `semantic/` ディレクトリ（`es_index.py` の埋め込みキャッシュ〔SQLite・`embed_cache.sqlite3`〕の
     置き場）。旧・意味層フル抽出/対応橋（`concepts.json`/`l_extract.json` 等）一式は
     撤去済み（`SemanticFiles`/`semantic_files()` も同時撤去・復活させない）。"""
     return derived_dir(world_id) / "semantic"
@@ -45,7 +45,7 @@ def _kb() -> Path:
 
 def derived_dir(world_id: str) -> Path:
     """world の派生領域ルート（**READ-ONLY のソースには書かず** WSL 側に持つ）。配下: `md/`（人間用）／
-    `rag/`（RAG 正本＋証跡）／`ir/`（中間表現）／`semantic/`（ES 埋め込みキャッシュ＝`embed_cache`。
+    `rag/`（RAG 正本＋証跡）／`ir/`（中間表現）／`semantic/`（ES 埋め込みキャッシュ＝`embed_cache.sqlite3`。
     旧・意味層フル抽出 l_extract は撤去済み）。delete 時はこの木ごと消す。"""
     v = os.environ.get("SHERPA_DERIVED_DIR")
     base = Path(v) if v else _repo_root() / "data" / "derived"

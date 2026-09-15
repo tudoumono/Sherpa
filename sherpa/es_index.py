@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import time
 import urllib.error
 import urllib.request
@@ -112,7 +113,7 @@ _ES_BULK_BATCH_MAX_BYTES = _env_int(
 # 埋め込みのフラッシュ単位: `_embed_cached()` 1回分の
 # 不足分（`need`）を1本の `embeddings.embed()` 呼び出しへ渡すと、返り値の全ベクトル（各 1536 次元級）を
 # 一括でメモリに保持することになり、大規模 world（実測: 15GB RAM 環境で 20万チャンク級）で OOM を
-# 起こす。`need` をこの件数単位のバッチへ割り、バッチ成功ごとにシャード（`_embed_cache_dir`）へ
+# 起こす。`need` をこの件数単位のバッチへ割り、バッチ成功ごとにキャッシュ DB（`_embed_cache_db_path`）へ
 # **即時フラッシュ**することで、①1回に保持するベクトル量を有界化し、②プロセスが OOM/kill で
 # 落ちてもフラッシュ済み分は次回 sync がキャッシュヒットで即スキップできる（＝再開性の本体・
 # `_embed_cached` docstring 参照）。`index_world()` 自身の
@@ -206,7 +207,7 @@ def _mapping(dim, analyzer: str, emeta=None) -> dict:
     # 増えていく」ではなく「見えない→完全に見える」の二値にする。
     m = {"settings": {"index": {"refresh_interval": "-1"}}, "mappings": {"properties": props}}
     if emeta:
-        m["mappings"]["_meta"] = emeta              # {embed_provider, embed_model, dim}（検索時の素性照合用）
+        m["mappings"]["_meta"] = emeta              # {embed_provider, embed_model, dim, embed_algo}（検索時の素性照合用）
     return m
 
 
@@ -558,138 +559,230 @@ def ensure_index(world: str, dim=None, emeta=None) -> bool:
     return False
 
 
-# 埋め込みキャッシュのシャーディング: 単一ファイル（`embed_cache.json`）へ
-# world 全体のベクトルを1つの dict として読み込む設計は、大規模 world
-# （実測: 15GB RAM 環境で 20万チャンク級）で OOM の主因になる——Python の float リストはベクトル1本
-# あたり dense_vector の理論サイズよりはるかに大きいオブジェクト表現になる。キー（SHA1）の先頭
-# `_EMBED_CACHE_SHARD_HEX` 桁でシャーディングし、常に**シャード単位**（world 全体ではなく）で読み書き
-# する——ある瞬間に保持するベクトル量が世界規模ではなく「1シャード＋1フラッシュバッチ」に
-# 有界化される。旧単一ファイルはもう読まない（キー体系は同じ＝miss 扱いで自然に再 embed される・
+# 埋め込みキャッシュのストア（SQLite KV 1ファイル）: world 全体のベクトルを1つの dict として
+# 読み込む設計は、大規模 world（実測: 15GB RAM 環境で 20万チャンク級）で OOM の主因になる——
+# Python の float リストはベクトル1本あたり dense_vector の理論サイズよりはるかに大きい
+# オブジェクト表現になる。旧シャード方式（キー（SHA1）先頭2桁で256ファイルへ分割した JSON 群）は
+# メモリ有界化は達成したが、SHA1 の一様分布により1回のフラッシュ（既定500キー）が実測で
+# ~220/256 シャードへ1〜数件ずつ散り、フラッシュのたびにその大半のシャード**全体**を
+# JSON parse→再書込みする read-modify-write 増幅を起こす（シャード1個のサイズとは無関係に、
+# 触れるシャード**数**に比例して I/O が増える）。SQLite の単一 KV テーブルへ一本化し、フラッシュに
+# 含まれるキーだけを SELECT/INSERT で読み書きする——1回のフラッシュあたりの I/O がそのフラッシュの
+# キー数そのものに比例する（メモリ有界化は維持: 接続はキー単位のクエリだけ発行し、world 全体の
+# ベクトルを Python 側の dict へ読み込まない）。旧・単一 JSON（`embed_cache.json`）と旧・シャード群
+# （`embed_cache/`）はどちらからも読まない（キー体系が変わる＝miss 扱いで自然に再 embed される・
 # 実害なし・移行コード不要）。
-_EMBED_CACHE_SHARD_HEX = 2   # 16^2=256 シャード
+_EMBED_CACHE_DB_NAME = "embed_cache.sqlite3"
+_EMBED_CACHE_SQL_CHUNK = 500   # 1回の IN 節に含める上限（SQLite の既定変数上限=999への安全マージン）
 
 
-def _embed_cache_dir(world: str) -> Path:
-    """world の埋め込みキャッシュ（シャード群）ディレクトリ。
+def _embed_cache_db_path(world: str) -> Path:
+    """world の埋め込みキャッシュ（SQLite・1ファイル）の場所。
 
-    旧・単一 JSON キャッシュ（`embed_cache.json`・実測で数GB級になり得る）は
-    シャード化以降どこからも読まれない＝残しても機能影響ゼロだが、**誰も消さないと閉域機の
-    ディスクを恒久占有する**。ここで見つけ次第1回だけ削除する
-    （失敗は無視＝掃除はベストエフォート）。"""
-    d = worlds.semantic_dir(world) / "embed_cache"
-    legacy = d.parent / "embed_cache.json"
-    if legacy.exists():
-        try:
-            legacy.unlink()
-        except OSError:
-            # 掃除はベストエフォート（旧ファイルはどこからも読まれず機能影響ゼロ）——ただし
-            # 消せない事実自体は運用が気付けるよう警告ログに残す。
-            _embed_log.warning("es_index: 旧単一embedキャッシュの削除に失敗（world=%s・%s）",
-                               world, legacy)
-    return d
-
-
-def _embed_cache_shard_path(world: str, shard_id: str) -> Path:
-    return _embed_cache_dir(world) / f"{shard_id}.json"
-
-
-def _read_embed_cache_shard(world: str, shard_id: str) -> dict:
-    raw = json_io.read_json(_embed_cache_shard_path(world, shard_id))    # 無い/壊れは None
-    v = raw.get("vectors") if isinstance(raw, dict) else None
-    return v if isinstance(v, dict) else {}
-
-
-def _write_embed_cache_shard(world: str, shard_id: str, vectors: dict) -> None:
-    """シャードへ書き込む。**新規ベクトルの書込失敗（OSError＝ENOSPC 等）は呼び出し元へ伝播する**
-    ——ここで握り潰すと、実際にはディスクへ永続化されなかった
-    バッチを「flush 成功」として扱ってしまい（`_embed_cached()` はこの後 in-memory の `filled` を
-    返すため、この呼び出し自体は成功したように見える）、後続の Pass2（別途ディスクから読み直す
-    `_embed_cache_lookup_batch`）がキャッシュ miss を起こして embedding 無しでチャンクを送る
-    黙認に繋がる（ENOSPC を「成功扱い」しない）。空シャードの削除（既存キーが無くなった、鏡として
-    ファイル自体を消す）は失敗してもデータ損失ではない（stale ファイルが残るだけ）ためベストエフォートのまま。
+    旧形式（単一 JSON `embed_cache.json`・シャード群ディレクトリ `embed_cache/`）はどちらも
+    どこからも読まれない＝残しても機能影響ゼロだが、**誰も消さないと閉域機のディスクを恒久
+    占有する**。見つけ次第ベストエフォートで削除する（失敗は運用が気付けるよう警告ログに残す）。
     """
-    p = _embed_cache_shard_path(world, shard_id)
-    if not vectors:                                    # このシャードに現存キーが無い＝ファイル自体を消す（鏡）
+    d = worlds.semantic_dir(world)
+    legacy_json = d / "embed_cache.json"
+    if legacy_json.exists():
         try:
-            p.unlink()
+            legacy_json.unlink()
         except OSError:
-            pass
-        return
-    json_io.write_json_atomic(p, {"vectors": vectors})  # OSError は呼び出し元へ伝播（fail-loud）
+            _embed_log.warning("es_index: 旧単一embedキャッシュの削除に失敗（world=%s・%s）",
+                               world, legacy_json)
+    legacy_shard_dir = d / "embed_cache"
+    if legacy_shard_dir.is_dir():
+        try:
+            shutil.rmtree(legacy_shard_dir)
+        except OSError:
+            _embed_log.warning("es_index: 旧シャード群embedキャッシュの削除に失敗（world=%s・%s）",
+                               world, legacy_shard_dir)
+    return d / _EMBED_CACHE_DB_NAME
+
+
+def _embed_cache_connect(world: str, *, create: bool) -> sqlite3.Connection | None:
+    """埋め込みキャッシュ DB へ接続する。`create=False`（読み取り専用の呼び出し）で DB ファイル自体が
+    まだ無ければ接続せず None を返す（キャッシュ皆無の world で空 DB を作らない）。WAL を有効化する
+    （書込トランザクション中も読み取りをブロックしない）。接続/初期化自体の失敗（権限等）は None
+    （fail-safe——呼び出し元は miss 扱い/書込失敗として扱う）。"""
+    p = _embed_cache_db_path(world)
+    if not create and not p.exists():
+        return None
+    for attempt in (0, 1):
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(p), timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, vec TEXT NOT NULL)")
+            except sqlite3.Error:
+                conn.close()
+                raise
+            return conn
+        except sqlite3.DatabaseError as exc:
+            # 壊れた DB ファイル（"file is not a database" 等）は放置すると誰も消さず、書込側が
+            # 毎回 OSError → embed 失敗 → _meta に素性が書かれない → 次回 sync も full reindex、
+            # を有料 embed 込みで無限に繰り返す。書込側（create=True）だけは本体と WAL/SHM を
+            # 1 回だけ捨てて作り直す（キャッシュは再 embed で戻る＝データ損失ではない）。
+            # 読取側は miss 扱いのまま（消すのは書込側の責務・剪定は fail-loud）。
+            if create and attempt == 0 and not isinstance(exc, sqlite3.OperationalError):
+                _embed_log.warning("es_index: embed キャッシュDBが壊れているため作り直す（world=%s・%s）",
+                                   world, type(exc).__name__)
+                _delete_embed_cache(world)
+                continue
+            return None
+        except sqlite3.Error:
+            return None
+    return None
+
+
+def _sql_chunks(items: list, size: int = _EMBED_CACHE_SQL_CHUNK):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def _embed_cache_lookup_batch(world: str, keys: list, dim: int) -> dict:
     """`keys` のうちキャッシュ済み・形状検証OK（list かつ次元一致・壊れ/型ズレは miss 扱い）のものだけ
-    返す。関与するシャードだけを1つずつ読み（world 全体を一括ロードしない＝有界）、読み終えた
-    シャードの dict はその場で手放す。"""
-    by_shard: dict = {}
-    for k in keys:
-        by_shard.setdefault(k[:_EMBED_CACHE_SHARD_HEX], []).append(k)
+    返す。`keys` を `_EMBED_CACHE_SQL_CHUNK` 件ずつの `SELECT ... WHERE key IN (...)` へ分けて引く
+    （world 全体を一括ロードしない）。DB 接続/クエリ自体の失敗も miss 扱い（fail-safe・呼び出し元は
+    再 embed へフォールバックする）。"""
+    if not keys:
+        return {}
+    conn = _embed_cache_connect(world, create=False)
+    if conn is None:
+        return {}
     out: dict = {}
-    for shard_id, shard_keys in by_shard.items():
-        cache = _read_embed_cache_shard(world, shard_id)
-        for k in shard_keys:
-            v = cache.get(k)
-            if isinstance(v, list) and len(v) == dim:
-                out[k] = v
+    try:
+        for chunk in _sql_chunks(keys):
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(f"SELECT key, vec FROM kv WHERE key IN ({placeholders})", chunk).fetchall()
+            for k, raw in rows:
+                try:
+                    v = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(v, list) and len(v) == dim:
+                    out[k] = v
+    except sqlite3.Error:
+        pass                                            # ここまでに読めた分は活かす（fail-safe・毒データではない）
+    finally:
+        conn.close()
     return out
 
 
 def _embed_cache_write_batch(world: str, new_vectors: dict) -> None:
-    """新規ベクトルをシャードへマージ書き込みする（シャード単位の read-modify-write・
-    有界＝1回に保持するのは1シャード分＋この呼び出しの新規分だけ）。"""
-    by_shard: dict = {}
-    for k, v in new_vectors.items():
-        by_shard.setdefault(k[:_EMBED_CACHE_SHARD_HEX], {})[k] = v
-    for shard_id, updates in by_shard.items():
-        cache = _read_embed_cache_shard(world, shard_id)
-        cache.update(updates)
-        _write_embed_cache_shard(world, shard_id, cache)
+    """新規ベクトルを DB へ upsert する（1トランザクション・呼び出しごとに commit）——クラッシュ後の
+    再開性は、フラッシュ済み分がそのまま次回呼び出しでキャッシュヒットすることで担保する
+    （`_embed_cached` docstring 参照）。**新規ベクトルの書込失敗（OSError＝ENOSPC 等・DB 接続不能も
+    含む）は呼び出し元へ伝播する**——ここで握り潰すと、実際にはディスクへ永続化されなかった
+    バッチを「flush 成功」として扱ってしまい、後続の Pass2（別途 DB から読み直す
+    `_embed_cache_lookup_batch`）がキャッシュ miss を起こして embedding 無しでチャンクを送る
+    黙認に繋がる（ENOSPC を「成功扱い」しない）。"""
+    if not new_vectors:
+        return
+    rows = [(k, json.dumps(v)) for k, v in new_vectors.items()]
+    for attempt in (0, 1):
+        conn = _embed_cache_connect(world, create=True)
+        if conn is None:
+            raise OSError(f"embed cache DB へ接続できません（world={world}）")
+        try:
+            with conn:
+                conn.executemany("INSERT OR REPLACE INTO kv(key, vec) VALUES (?, ?)", rows)
+            return
+        except sqlite3.DatabaseError as exc:
+            # ページ破損（"database disk image is malformed"）は接続/DDL では発覚せず書込で初めて
+            # 出る。`_embed_cache_connect` のヘッダ破損と同じく、放置すると毎 sync の full reindex が
+            # 無限化するため書込側が 1 回だけ作り直す。OperationalError（ENOSPC・ロック・権限）は
+            # 破損ではないので消さずに伝播する。
+            if attempt == 0 and not isinstance(exc, sqlite3.OperationalError):
+                conn.close()
+                _embed_log.warning("es_index: embed キャッシュDBが壊れているため作り直す（world=%s・%s）",
+                                   world, type(exc).__name__)
+                _delete_embed_cache(world)
+                continue
+            raise OSError(str(exc)) from exc
+        except sqlite3.Error as exc:
+            raise OSError(str(exc)) from exc
+        finally:
+            conn.close()
 
 
 def _delete_embed_cache(world: str) -> None:
-    """埋め込み無効/現存チャンク無し時のキャッシュ全消去（削除残骸を残さない・鏡）。"""
-    shutil.rmtree(_embed_cache_dir(world), ignore_errors=True)
+    """埋め込み無効/現存チャンク無し時のキャッシュ全消去（削除残骸を残さない・鏡）。DB 本体＋
+    WAL/SHM のサイドカーごと消す（失敗はベストエフォート——削除できなくてもデータ破損ではない）。"""
+    p = _embed_cache_db_path(world)
+    for f in (p, p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
+        try:
+            f.unlink()
+        except OSError:
+            pass
 
 
 def _prune_embed_cache(world: str, valid_keys: set) -> None:
     """**world 全体の doc ストリームを一巡し、全チャンクの embed が完了した直後にだけ**呼ぶ最終剪定:
-    現存キー（`valid_keys`）以外を消す（鏡・サイズ有界・削除/プロバイダ変更で旧エントリ消滅）。
-
-    シャードを1つずつ処理する（world 全体を一括ロードしない）。`valid_keys` が
-    空なら（対象チャンクが無い world）ディレクトリごと削除する（`_delete_embed_cache` と同じ）。
-    `index_world()` から**1回だけ**呼ぶ契約——`_embed_cached()` は doc 単位ストリーミングにより
-    複数回（doc グループごと）呼ばれるため、呼ぶたびに剪定すると前のグループ分を消してしまう。
-    """
+    現存キー（`valid_keys`）以外を消す（鏡・サイズ有界・削除/プロバイダ変更で旧エントリ消滅）。`valid_keys` が
+    空なら（対象チャンクが無い world）DB ごと削除する（`_delete_embed_cache` と同じ）。`index_world()`
+    から**1回だけ**呼ぶ契約——`_embed_cached()` は doc 単位ストリーミングにより複数回（doc グループごと）
+    呼ばれるため、呼ぶたびに剪定すると前のグループ分を消してしまう。**削除失敗は呼び出し元へ伝播する**
+    （`_embed_cache_write_batch` と同じ fail-loud 契約）。"""
     if not valid_keys:
         _delete_embed_cache(world)
         return
-    d = _embed_cache_dir(world)
-    if not d.is_dir():
-        return
-    valid_by_shard: dict = {}
-    for k in valid_keys:
-        valid_by_shard.setdefault(k[:_EMBED_CACHE_SHARD_HEX], set()).add(k)
+    if not _embed_cache_db_path(world).exists():
+        return                                          # キャッシュ自体が無い＝剪定するものが無い
+    conn = _embed_cache_connect(world, create=False)
+    if conn is None:
+        # DB は存在するのに接続できない（権限・ロック・破損）＝「キャッシュ無し」ではなく障害。
+        # 黙って戻ると呼び出し元が既存索引の delete へ進み、Pass2 のキャッシュ miss で再構築も
+        # 失敗する（索引が消えたまま残る）ため、書込失敗と同じく OSError で打ち切らせる。
+        raise OSError(f"embed cache DB へ接続できません（world={world}）")
     try:
-        shard_files = list(d.glob("*.json"))
-    except OSError:
-        return
-    for shard_file in shard_files:
-        shard_id = shard_file.stem
-        keep = valid_by_shard.get(shard_id) or set()
-        if not keep:
-            try:
-                shard_file.unlink()
-            except OSError:
-                pass
-            continue
-        cache = _read_embed_cache_shard(world, shard_id)
-        _write_embed_cache_shard(world, shard_id, {k: v for k, v in cache.items() if k in keep})
+        existing = {row[0] for row in conn.execute("SELECT key FROM kv").fetchall()}
+        missing = len(set(valid_keys) - existing)
+        if missing:
+            # Pass1 完了時点で現存キーは全て DB にあるはず。無いのは、途中で壊れた DB を
+            # 作り直した（それ以前にキャッシュヒットで再利用したベクトルは DB から消えている）等の
+            # 異常事態。ここで成功扱いにすると呼び出し元が既存索引の delete へ進み、Pass2 の miss で
+            # 再構築が中止され索引が消える。OSError で打ち切り、既存索引を残す（次回 sync で
+            # 不足キーは再 embed される）。
+            raise OSError(f"embed cache に現存キーが不足しています（world={world}・missing={missing}）")
+        to_delete = list(existing - set(valid_keys))
+        with conn:
+            for chunk in _sql_chunks(to_delete):
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(f"DELETE FROM kv WHERE key IN ({placeholders})", chunk)
+    except sqlite3.Error as exc:
+        raise OSError(str(exc)) from exc
+    else:
+        # DELETE だけでは空きページがファイル内に残り、文書の大量削除後もディスク占有が
+        # 縮まない（鏡＝サイズ有界の契約）。剪定は sync ごとに 1 回なので VACUUM で返す。
+        # 条件は「今回の削除件数」ではなく空きページの有無（`freelist_count`）にする——前回の
+        # VACUUM が失敗していると DELETE は commit 済みで次回は to_delete が空になるため。
+        # VACUUM は DB とほぼ同サイズの一時領域を要る＝ENOSPC で最も落ちやすいが、剪定（DELETE）は
+        # commit 済みで整合性は保たれているので、失敗は警告に留めて sync を止めない（次回の
+        # freelist_count 判定で再試行される）。
+        try:
+            if conn.execute("PRAGMA freelist_count").fetchone()[0] > 0:
+                conn.execute("VACUUM")
+        except sqlite3.Error as exc:
+            _embed_log.warning("es_index: embed キャッシュの VACUUM に失敗（world=%s・%s）——次回 sync で再試行",
+                               world, type(exc).__name__)
+    finally:
+        conn.close()
 
 
 def _chunk_key(ec: dict, text: str) -> str:
-    """埋め込みキャッシュのキー＝(プロバイダ|モデル|次元|本文) の SHA1。**素性が変われば別キー**＝自動で再 embed。"""
-    return hashlib.sha1(f"{ec['provider']}|{ec['model']}|{ec['dim']}|{text}".encode("utf-8")).hexdigest()
+    """埋め込みキャッシュのキー＝(プロバイダ|モデル|次元|前処理アルゴリズム版|本文) の SHA1。
+    **素性が変われば別キー**＝自動で再 embed。前処理アルゴリズム版（`embeddings.EMBEDDING_INPUT_ALGORITHM_ID`
+    ＝window分割/mean-pooling/正規化の実装版）は provider/model/dim が同じでも中身が変わりうる
+    （長文の分割・プーリング方式を変えると同じ provider/model でもベクトルが別物になる）ため、
+    別枠のフィールドとしてキーに含める——欠けると版上げ後も旧アルゴリズムのベクトルを
+    誤って再利用し続ける。"""
+    return hashlib.sha1(
+        f"{ec['provider']}|{ec['model']}|{ec['dim']}|{embeddings.EMBEDDING_INPUT_ALGORITHM_ID}|{text}"
+        .encode("utf-8")
+    ).hexdigest()
 
 
 def _embed_cached(world: str, texts: list, ec) -> tuple:
@@ -710,10 +803,10 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
     （`ec` が None）/このバッチが空（`texts` が空）は `(None,0,0)`（キャッシュには一切触れない・
     削除も呼び出し元の責務——`_delete_embed_cache`/`_prune_embed_cache` 参照）。
 
-    キャッシュ本体はシャード化（`_embed_cache_lookup_batch`/`_embed_cache_write_batch`）——
-    world 全体のベクトルを1つの dict へロードしない（メモリ有界化）。
-    不足分（`need`）はさらに `_EMBED_FLUSH_CHUNKS` 件単位のバッチへ分割し、バッチが成功するたびに
-    シャードへ即座にフラッシュする（再開性の本体：後続バッチの失敗やプロセス自体の
+    キャッシュ本体は SQLite KV 1ファイル（`_embed_cache_lookup_batch`/`_embed_cache_write_batch`）——
+    world 全体のベクトルを1つの dict へロードせず、必要なキーだけを SELECT/INSERT する
+    （メモリ有界化）。不足分（`need`）はさらに `_EMBED_FLUSH_CHUNKS` 件単位のバッチへ分割し、
+    バッチが成功するたびに DB へ即座にフラッシュする（再開性の本体：後続バッチの失敗やプロセス自体の
     OOM/kill で今回の呼び出しが完走できなくても、フラッシュ済み分は次回呼び出しでキャッシュヒットし
     即スキップできる＝再実行が0から始まらない）。
     """
@@ -739,14 +832,13 @@ def _embed_cached(world: str, texts: list, ec) -> tuple:
                 filled[k] = vec
                 new_map[k] = vec
             try:
-                _embed_cache_write_batch(world, new_map)   # 成功したバッチだけ即座に永続化（シャード単位・アトミック）
+                _embed_cache_write_batch(world, new_map)   # 成功したバッチだけ即座に永続化（1トランザクション）
             except OSError:
-                # シャード書込障害（ENOSPC 等）を「flush 成功」
-                # として扱わない——このバッチは実際にはディスクへ永続化されていない。embed API 呼び
-                # 出し自体の失敗と同じ扱い（呼び出し元は BM25 のみへ降格・既存キャッシュは壊さない）
-                # にして fail-loud にする。
+                # DB 書込障害（ENOSPC 等）を「flush 成功」として扱わない——このバッチは実際には
+                # ディスクへ永続化されていない。embed API 呼び出し自体の失敗と同じ扱い（呼び出し元は
+                # BM25 のみへ降格・既存キャッシュは壊さない）にして fail-loud にする。
                 _embed_log.warning(
-                    "es_index: embed キャッシュのシャード書込に失敗（world=%s・ENOSPC等）"
+                    "es_index: embed キャッシュDBの書込に失敗（world=%s・ENOSPC等）"
                     "——このバッチを embed 失敗として扱う", world)
                 return None, 0, 0
             if bi == 0 or bi == n_batches - 1 or (bi + 1) % 10 == 0:   # 間引いて進捗を残す（無言の長時間実行を無くす）
@@ -1275,12 +1367,12 @@ def _flush_doc_group(sender: _StreamingBulkSender, world: str, ids: list, bodies
     """Pass2 の1グループ（doc数件・チャンク`_EMBED_FLUSH_CHUNKS`件程度に有界）を、必要なら
     埋め込みキャッシュから embedding を引いて bulk 送信する（`sender.send_group` へ委譲）。
     キャッシュ参照は `embed_feature_applies` が真の時だけ（Pass1 が全チャンクの embed を
-    完了させている前提——グループ内の対象チャンクだけを束ねて1回のシャード参照で引く）。
+    完了させている前提——グループ内の対象チャンクだけを束ねて1回の DB クエリで引く）。
 
     **埋め込み対象キーの miss は fail-loud にする**:
-    `embed_feature_applies` が真＝ Pass1 が world 全体の embed 対象キーを既にシャードへ flush
+    `embed_feature_applies` が真＝ Pass1 が world 全体の embed 対象キーを既に DB へ flush
     済みのはず（`_embed_cached` docstring 参照）。にもかかわらずここで miss が起きるのは、
-    シャード破損・並行削除・ディスク書込障害等の異常事態——miss したチャンクだけ embedding
+    DB 破損・並行削除・ディスク書込障害等の異常事態——miss したチャンクだけ embedding
     無しで黙って送ると、同じ world 内で一部だけベクトル付き/無しが混在する非一様な
     索引になる（`test_index_world_embed_partial_failure_degrades_uniformly_no_doc_mixing` が
     守る不変条件の破れ）。miss を検知したら bulk 送信ごと中止する（`sender.failed` を立てる——
@@ -1364,8 +1456,8 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     自然に守る**: Pass1 が world 全体の embed 完了（成功/失敗）を確定させてから Pass2 が始まる
     ため、Pass2 の時点で「この world は embed 済みか否か」は既に一様に決まっている
     （`embed_feature_applies` 参照）——doc の処理順序によって前半だけベクトル付きになるような
-    早期実行は起きない。埋め込みキャッシュ自体もシャード化（`_embed_cache_dir` 系関数）し、
-    一度に保持するベクトル量を「1シャード＋1フラッシュバッチ」へ有界化した（world 全体を
+    早期実行は起きない。埋め込みキャッシュ自体も SQLite KV（`_embed_cache_db_path` 系関数）にし、
+    一度に保持するベクトル量を「1クエリ分＋1フラッシュバッチ」へ有界化した（world 全体を
     1つの dict へロードしない）。剪定（現存チャンクだけへ縮める）は Pass1 が成功した直後
     （ES 操作より前）に `_prune_embed_cache()` で1回だけ行う——`_embed_cached()` は複数回
     呼ばれるためもう自前で剪定しない（`_embed_cached` docstring 参照）。
@@ -1485,8 +1577,8 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         try:
             _prune_embed_cache(world, valid_keys)
         except OSError:
-            # シャード書込障害（ENOSPC 等）を「成功扱い」せず
-            # delete_world() の前に打ち切る——既存索引（ベクトル付きかもしれない）はまだ残る。
+            # DB 書込障害（ENOSPC 等）を「成功扱い」せず delete_world() の前に打ち切る——
+            # 既存索引（ベクトル付きかもしれない）はまだ残る。
             _embed_log.warning("es_index: embed キャッシュ剪定の書込に失敗（world=%s）"
                                "——索引の delete 前に中止する", world)
             return {"available": True, "indexed": 0, "chunks": 0, "error": "embed_cache_write_failed"}
@@ -1526,7 +1618,8 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
     # 索引中の時間窓が伸びたぶんこの窓は無視できない。後書きなら、途中でどう落ちても
     # content_sig が無い＝次回 sync が必ず張り直す（fail-closed）。
     if embed_feature_applies:                          # had_embed_eligible が偽でも ec 由来の素性を書く（上のコメント参照）
-        emeta.update({"embed_provider": ec["provider"], "embed_model": ec["model"], "dim": ec["dim"]})
+        emeta.update({"embed_provider": ec["provider"], "embed_model": ec["model"], "dim": ec["dim"],
+                      "embed_algo": embeddings.EMBEDDING_INPUT_ALGORITHM_ID})  # 前処理アルゴリズム版（_chunk_key と同じ材料）
     if not ensure_index(world, dim=dim, emeta=(emeta or None)):
         return {"available": True, "indexed": 0, "chunks": 0, "error": "create_failed"}
 
@@ -1635,7 +1728,7 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     """ES 索引の張り直しが要るか（ES 稼働時のみ）。空 / 内容署名ズレ / **アーム構成ズレ** /
     **マッピング版ズレ** / **索引ソース方針(rag/legacy)ズレ** / **チャンク粒度ズレ** /
     **人間向け MD 版ズレ**（H2・RAG_ES の設定に関わらず評価） / **アナライザ構成ズレ** /
-    **埋め込み素性(provider/model/dim)ズレ** で True。
+    **埋め込み素性(provider/model/dim/前処理アルゴリズム版)ズレ** で True。
 
     ＝内容（ソースファイル自体）が変わらなくても、(a) 取り込みアーム構成（例 OCR 有効/無効・vision
     有効/無効）を切り替えた、(b) このプロセスのマッピング/チャンクメタ仕様（`ES_MAPPING_VERSION`）が
@@ -1648,7 +1741,8 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     持つ文書の縮退先は rag.md へ変わった**（`corpus_docs.iter_world_documents(include_rag=True)`）ので、
     その経路の鮮度は human_md_sig ではなく worker の `.rag_sig` holdback が担保する）、(f) コード解析アナライザの有効構成（登録順・拡張子集合・
     分類契約版＝`analyzer_registry.config_signature()`）を変えた（新規アナライザ追加・CODE-1b の
-    有効/無効・並び替え）、(g) 埋め込みプロバイダ/モデルを切り替えた、のいずれかが
+    有効/無効・並び替え）、(g) 埋め込みプロバイダ/モデル/前処理アルゴリズム版（`embeddings.EMBEDDING_INPUT_ALGORITHM_ID`・
+    provider/model/dim が同じでも window分割/pooling方式が変われば別ベクトル空間になる）を切り替えた、のいずれかが
     あれば次回 `sync()` で確実に張り直す（管理UI 不要・更新で修復）。`content_sig`（ソースファイルの
     rel/mtime/ctime/size のみ）はこれらを検知できないため、この署名を別途比較する。索引済みメタに
     該当フィールド自体が無い旧索引は、mapping_version/search_chunk_mode/arms_sig/analyzer_config_sig
@@ -1680,8 +1774,8 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     if meta.get("analyzer_config_sig") != _analyzer_config_sig():
         return True
     ec = embeddings.cfg(_settings(settings))
-    want = (ec["provider"], ec["model"], ec["dim"]) if ec else (None, None, None)
-    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"))
+    want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID) if ec else (None, None, None, None)
+    have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
     return want != have
 
 
@@ -1811,12 +1905,14 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
                      world)
     meta = _index_meta(world) if ec else {}
     same = bool(ec) and (meta.get("embed_provider") == ec["provider"]
-                         and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"])
+                         and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
+                         and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID)
     if ec and not same:
-        # 索引のベクトル素性（provider/model/dim）が現在の埋め込み設定と合わない＝再索引待ちの
-        # 世代ズレ。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない（無駄な費用）。
-        # 理由を返さないと利用者にはハイブリッド成功に見える（静かな縮退）＝`search_knn_only()`
-        # と同じ語彙で注記する。`vector=False`／埋め込み未設定（ec None）はこの分岐に入らない。
+        # 索引のベクトル素性（provider/model/dim/前処理アルゴリズム版）が現在の埋め込み設定と合わない
+        # ＝再索引待ちの世代ズレ。kNN は打てないので BM25 のみへ縮退し、クエリ埋め込みも呼ばない
+        # （無駄な費用）。理由を返さないと利用者にはハイブリッド成功に見える（静かな縮退）＝
+        # `search_knn_only()` と同じ語彙で注記する。`vector=False`／埋め込み未設定（ec None）は
+        # この分岐に入らない。
         reason = "vector_feature_mismatch"
     if same:                                          # 索引のベクトル素性が一致する時だけ kNN
         qv = embeddings.embed([q], ec, world=world)
@@ -1893,7 +1989,8 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
         return [], "embedding_not_configured"
     meta = _index_meta(world)
     if not (meta.get("embed_provider") == ec["provider"]
-            and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]):
+            and meta.get("embed_model") == ec["model"] and meta.get("dim") == ec["dim"]
+            and meta.get("embed_algo") == embeddings.EMBEDDING_INPUT_ALGORITHM_ID):
         return [], "vector_feature_mismatch"      # 索引素性ズレ（provider/model/dim いずれか）
     qv = embeddings.embed([q], ec, world=world)
     if not qv:

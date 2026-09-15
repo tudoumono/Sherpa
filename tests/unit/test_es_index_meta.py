@@ -691,6 +691,30 @@ def test_search_knn_only_distinguishes_cloud_unavailable_from_not_configured(mon
     assert hits == [] and reason == "embedding_not_configured"
 
 
+def test_search_knn_only_reacts_to_embed_algo_mismatch(monkeypatch):
+    """`search_knn_only()` は provider/model/dim が一致していても `embed_algo`（前処理アルゴリズム版）
+    が索引と食い違えば `vector_feature_mismatch` で kNN を諦める——同じ provider/model/dim でも
+    window分割/pooling方式が違えばベクトル空間が別物になるため、search 時にも provider/model/dim
+    と同じ扱いで照合する。"""
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
+        "provider": "openai", "model": "m", "dim": 3})
+    # 索引側の embed_algo が現行版と一致＝kNN が使われる（embed() まで到達する）。
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
+        "embed_provider": "openai", "embed_model": "m", "dim": 3,
+        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
+    monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
+    monkeypatch.setattr(es_index, "_req", lambda *a, **k: {"hits": {"hits": []}})
+    hits, reason = es_index.search_knn_only("w", "query")
+    assert reason is None
+    # 索引側の embed_algo が旧版のまま（provider/model/dim は不変）＝ vector_feature_mismatch。
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
+        "embed_provider": "openai", "embed_model": "m", "dim": 3, "embed_algo": "old-algo-v0"})
+    hits, reason = es_index.search_knn_only("w", "query")
+    assert hits == [] and reason == "vector_feature_mismatch"
+
+
 def _spy_system_settings_snapshot(monkeypatch, sentinel):
     """`store.get_system_settings()` を1回だけ読ませ、以後の呼び出しは全て同じ `sentinel` を
     返す（RV2・境界回帰#3・2026-09-01: `cfg()`/`cloud_selected_but_unavailable()` が同じ
@@ -771,7 +795,9 @@ def test_search_hybrid_failure_with_bm25_success_is_hybrid_query_failed(monkeypa
 
     def _fake_req(method, path, body=None, **kw):
         if method == "GET" and path.endswith("/_mapping"):
-            return {"idx": {"mappings": {"_meta": {"embed_provider": "openai", "embed_model": "m", "dim": 3}}}}
+            return {"idx": {"mappings": {"_meta": {
+                "embed_provider": "openai", "embed_model": "m", "dim": 3,
+                "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID}}}}
         if method == "POST" and path.endswith("/_search"):
             # RV是正（rv-i2-importance #4）: hybrid（vector=True・knn 併用）は `bool.should` に
             # match/knn の2節を並べる形（`es_index.search` 参照）——BM25-only 本文（`bool.must`
@@ -1198,6 +1224,33 @@ def test_needs_reindex_reacts_to_arms_config_drift(monkeypatch):
         "analyzer_config_sig": "acfg-A"})   # chunk_lines は既定時は書かない
     assert es_index.needs_reindex("w", "c1") is False           # 全一致＝不要
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-B")   # アーム構成が変わった
+    assert es_index.needs_reindex("w", "c1") is True
+
+
+def test_needs_reindex_reacts_to_embed_algo_drift(monkeypatch):
+    """埋め込み前処理アルゴリズム版（`embeddings.EMBEDDING_INPUT_ALGORITHM_ID`）が変わった＝
+    provider/model/dim が同じでも `embed_algo` 不一致で reindex 要（旧索引は別ベクトル空間のまま
+    居座らない）。"""
+    monkeypatch.setattr(es_index, "available", lambda: True)
+    monkeypatch.setattr(es_index, "count", lambda w: 5)
+    monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
+    monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)
+    monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
+    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
+    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
+        "provider": "openai", "model": "m", "dim": 3})
+    base_meta = {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
+                 "search_chunk_mode": "legacy", "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A",
+                 "embed_provider": "openai", "embed_model": "m", "dim": 3}
+    # 旧索引（embed_algo フィールド自体が無い）＝1回だけ reindex される。
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(base_meta))
+    assert es_index.needs_reindex("w", "c1") is True
+    # embed_algo が現行版と一致＝不要。
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(
+        base_meta, embed_algo=es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID))
+    assert es_index.needs_reindex("w", "c1") is False
+    # embed_algo が旧版のまま（provider/model/dim は不変）＝ reindex 要。
+    monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(base_meta, embed_algo="old-algo-v0"))
     assert es_index.needs_reindex("w", "c1") is True
 
 
@@ -2267,7 +2320,8 @@ def test_search_hybrid_query_omits_boost_at_default_weight_for_byte_identical_bo
     monkeypatch.setattr(es_index, "_HYBRID_WEIGHT", 0.5)
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        "embed_provider": "openai", "embed_model": "m", "dim": 3})
+        "embed_provider": "openai", "embed_model": "m", "dim": 3,
+        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
         "provider": "openai", "model": "m", "dim": 3})
     monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
@@ -2293,7 +2347,8 @@ def test_search_hybrid_query_weight_skews_boost_toward_keyword(monkeypatch):
     monkeypatch.setattr(es_index, "_HYBRID_WEIGHT", 0.8)
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        "embed_provider": "openai", "embed_model": "m", "dim": 3})
+        "embed_provider": "openai", "embed_model": "m", "dim": 3,
+        "embed_algo": es_index.embeddings.EMBEDDING_INPUT_ALGORITHM_ID})
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
         "provider": "openai", "model": "m", "dim": 3})
     monkeypatch.setattr(es_index.embeddings, "embed", lambda qs, ec, world=None: [[0.1, 0.2, 0.3]])
@@ -2846,3 +2901,118 @@ def test_chunk_ids_for_parent_best_effort_on_query_failure(monkeypatch):
 
     monkeypatch.setattr(es_index, "_req", boom)
     assert es_index.chunk_ids_for_parent("w", "a.docx", ["p1"]) == []
+
+
+# ===== 埋め込みキャッシュ（SQLite）の剪定: 接続障害の fail-loud と容量回収 =====
+
+def _seed_cache(monkeypatch, tmp_path, world: str, n: int) -> "Path":
+    from pathlib import Path
+    monkeypatch.setattr(es_index.worlds, "semantic_dir", lambda w: tmp_path / w / "semantic")
+    es_index._embed_cache_write_batch(world, {f"k{i:05d}": [0.5] * 1536 for i in range(n)})
+    p = es_index._embed_cache_db_path(world)
+    assert p.exists()
+    return Path(p)
+
+
+def test_prune_embed_cache_raises_when_existing_db_cannot_be_opened(monkeypatch, tmp_path):
+    """DB は存在するのに接続できない（権限・ロック・破損）とき「キャッシュ無し」扱いで黙って戻ると、
+    index_world は既存索引の delete へ進み Pass2 の miss で再構築も失敗する＝OSError で打ち切らせる。"""
+    import sqlite3
+    world = "prune-conn-fail"
+    _seed_cache(monkeypatch, tmp_path, world, 3)
+    real_connect = sqlite3.connect
+
+    def broken_connect(*a, **k):
+        raise sqlite3.OperationalError("unable to open database file")
+    monkeypatch.setattr(sqlite3, "connect", broken_connect)
+    with pytest.raises(OSError):
+        es_index._prune_embed_cache(world, {"k00000"})
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    # DB が無いときは従来どおり何もしない（剪定するものが無い）
+    es_index._delete_embed_cache(world)
+    es_index._prune_embed_cache(world, {"k00000"})
+
+
+def test_prune_embed_cache_reclaims_disk_after_mass_delete(monkeypatch, tmp_path):
+    """文書の大量削除で行が消えても DELETE だけではファイルが縮まない＝剪定後に空きページを返す。"""
+    world = "prune-vacuum"
+    p = _seed_cache(monkeypatch, tmp_path, world, 1000)
+    before = p.stat().st_size
+    es_index._prune_embed_cache(world, {"k00000"})
+    after = p.stat().st_size
+    assert after < before / 10, (before, after)
+    assert es_index._embed_cache_lookup_batch(world, ["k00000", "k00001"], 1536).keys() == {"k00000"}
+
+
+def test_embed_cache_write_recreates_corrupt_db_file(monkeypatch, tmp_path):
+    """非 DB データが `embed_cache.sqlite3` に居座ると、書込が毎回失敗→embed 失敗→_meta 未記録→
+    毎 sync full reindex（有料 embed 込み）が無限に続く。書込側は壊れた本体を 1 回だけ捨てて作り直す。"""
+    world = "corrupt-db"
+    monkeypatch.setattr(es_index.worlds, "semantic_dir", lambda w: tmp_path / w / "semantic")
+    p = es_index._embed_cache_db_path(world)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"this is not a sqlite database, just junk bytes long enough to fail header check")
+    # 読取側は miss 扱いで壊れたファイルを消さない
+    assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {}
+    assert p.read_bytes().startswith(b"this is not")
+    # 書込側は作り直して永続化できる
+    es_index._embed_cache_write_batch(world, {"k1": [0.1, 0.2, 0.3, 0.4]})
+    assert es_index._embed_cache_lookup_batch(world, ["k1"], 4) == {"k1": [0.1, 0.2, 0.3, 0.4]}
+
+
+def test_prune_embed_cache_reclaims_free_pages_left_by_failed_vacuum(monkeypatch, tmp_path):
+    """前回の VACUUM が失敗していると DELETE は commit 済みで次回は削除件数 0＝未回収分が永久に残る。
+    VACUUM の条件は空きページの有無にする。"""
+    import sqlite3
+    world = "prune-vacuum-retry"
+    p = _seed_cache(monkeypatch, tmp_path, world, 1000)
+    before = p.stat().st_size
+    real_connect = sqlite3.connect
+
+    class _Conn:
+        def __init__(self, inner):
+            self._c = inner
+        def execute(self, sql, *a):
+            if sql.strip().upper() == "VACUUM":
+                raise sqlite3.OperationalError("database or disk is full")
+            return self._c.execute(sql, *a)
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+        def __enter__(self):
+            return self._c.__enter__()
+        def __exit__(self, *a):
+            return self._c.__exit__(*a)
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: _Conn(real_connect(*a, **k)))
+    es_index._prune_embed_cache(world, {"k00000"})    # VACUUM 失敗は警告のみ（剪定は commit 済み・sync を止めない）
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    assert es_index._embed_cache_lookup_batch(world, ["k00001"], 1536) == {}   # DELETE は効いている
+    assert p.stat().st_size >= before * 0.9            # 未回収のまま
+    es_index._prune_embed_cache(world, {"k00000"})    # 次回: 削除件数 0 でも回収する
+    assert p.stat().st_size < before / 10
+
+
+def test_embed_cache_write_recreates_page_corrupt_db(monkeypatch, tmp_path):
+    """ページ破損（ヘッダは正常）は接続/DDL を通り executemany で初めて malformed になる。
+    書込側が 1 回だけ作り直さないと毎 sync の full reindex が無限化する。"""
+    world = "corrupt-pages"
+    p = _seed_cache(monkeypatch, tmp_path, world, 2000)
+    raw = bytearray(p.read_bytes())
+    for i in range(4096, len(raw)):
+        raw[i] = 0xFF
+    p.write_bytes(bytes(raw))
+    for f in (p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
+        f.unlink(missing_ok=True)
+    es_index._embed_cache_write_batch(world, {"z1": [0.1] * 1536})
+    assert es_index._embed_cache_lookup_batch(world, ["z1"], 1536) == {"z1": [0.1] * 1536}
+
+
+def test_prune_embed_cache_raises_when_valid_keys_are_missing_from_db(monkeypatch, tmp_path):
+    """Pass1 の途中で DB を作り直すと、それ以前にキャッシュヒットで再利用したベクトルが DB から消える。
+    剪定が成功扱いで戻ると既存索引の delete → Pass2 の miss で索引消失。不足キーがあれば打ち切る。"""
+    world = "prune-missing-keys"
+    _seed_cache(monkeypatch, tmp_path, world, 5)
+    with pytest.raises(OSError):
+        es_index._prune_embed_cache(world, {"k00000", "k00001", "not-in-db"})
+    # 不足が無ければ従来どおり剪定する
+    es_index._prune_embed_cache(world, {"k00000", "k00001"})
+    assert es_index._embed_cache_lookup_batch(world, ["k00002"], 1536) == {}
