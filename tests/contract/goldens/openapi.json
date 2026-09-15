@@ -4706,6 +4706,19 @@
             ],
             "title": "Depth Base Troubleshoot Depth"
           },
+          "embed_parallel": {
+            "anyOf": [
+              {
+                "maximum": 16.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embed Parallel"
+          },
           "gemini_api_key": {
             "anyOf": [
               {

@@ -176,6 +176,7 @@ let _depthProfileBaseline = {};    // put キー -> 文字列化した configure
 // 他の6項目と同じく configured を基準にする（''=未設定＝「環境設定の既定に従う」の空選択肢）。
 let _depthReasoningBaseline = '';
 let _agenticToolLimitBaseline = '';
+let _embedParallelBaseline = '';   // 埋め込みの同時送信数
 
 // 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
 // （GET 応答は `view.chat_max_turns.<view>`・PUT は `body.<put>`）。
@@ -1443,10 +1444,20 @@ function renderResearchTab(view) {
   $('agentic-max-tools-per-turn-hint').textContent = limit.configured == null
     ? `未設定です（環境設定の既定 ${limit.effective} 件が適用されます）。`
     : `この値で固定中です（環境設定の既定: ${limit.default} 件）。`;
+  const parallel = view.embed_parallel;
+  _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
+  $('embed-parallel').value = _embedParallelBaseline;
+  $('embed-parallel-hint').textContent = parallel.configured == null
+    ? `未設定です（既定 ${parallel.effective} 件が適用されます）。`
+    : `この値で固定中です（既定: ${parallel.default} 件）。`;
 }
 
 function agenticToolLimitChanged() {
   return $('agentic-max-tools-per-turn').value.trim() !== _agenticToolLimitBaseline;
+}
+
+function embedParallelChanged() {
+  return $('embed-parallel').value.trim() !== _embedParallelBaseline;
 }
 
 // 調べる深さの基準値（標準時の値）。表示上は適用先ごとに分け、保存済みのキーを引き継ぐ。
@@ -1829,7 +1840,7 @@ function renderExtKeysTab(view) {
 }
 
 function render(view) {
-  if (!view.agentic_tool_limit) {
+  if (!view.agentic_tool_limit || !view.embed_parallel) {
     throw new Error('設定項目が不足しています。サーバーを更新・再起動してから、画面を再読み込みしてください。');
   }
   _view = view;
@@ -1935,6 +1946,8 @@ async function save() {
     .concat(modelWindowsErrors);
   const toolLimit = $('agentic-max-tools-per-turn');
   if (!toolLimit.checkValidity()) rangeErrors.push('ツール実行数の上限は1〜256の整数で指定してください');
+  const embedParallel = $('embed-parallel');
+  if (!embedParallel.checkValidity()) rangeErrors.push('埋め込みの同時送信数は1〜16の整数で指定してください');
   if (rangeErrors.length) {
     $('msg').innerHTML = `<span class="danger">${esc(rangeErrors.join('／'))}</span>`;
     return;
@@ -2015,6 +2028,9 @@ async function save() {
   collectDepthProfile(body);   // SC-6c: 調べる深さの基準値（変わった項目だけ送る）
   if (agenticToolLimitChanged()) {
     body.agentic_max_tools_per_turn = toolLimit.value === '' ? null : Number(toolLimit.value);
+  }
+  if (embedParallelChanged()) {
+    body.embed_parallel = embedParallel.value === '' ? null : Number(embedParallel.value);
   }
   collectChatMaxTurns(body);   // 同時実行の上限（変わった項目だけ送る）
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
@@ -2127,6 +2143,7 @@ async function resetResearchTab() {
   const body = Object.fromEntries(_DEPTH_BASE_FIELDS.map(({ put }) => [put, null]));
   body.depth_base_codex_reasoning = null;
   body.agentic_max_tools_per_turn = null;
+  body.embed_parallel = null;
   body.agentic_budget_per_result = null;
   body.agentic_budget_total = null;
   let view;
@@ -2293,7 +2310,7 @@ const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
     || openaiEndpointChanged() || mcEmbedChanged()
     || chatMaxTurnsChanged() || chatExamplesChanged(),
-  research: () => depthProfileChanged() || agenticToolLimitChanged()
+  research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged()
     || agenticBudgetChanged(),
   models: () => mcCatalogChangedExcludingEmbed() || modelWindowsTableChanged(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
@@ -2355,6 +2372,7 @@ function applyConfigChangedHighlights(view) {
   const reasoning = dp.codex_reasoning || {};
   mark($('depth-base-codex-reasoning'), reasoning.effective !== reasoning.default);
   mark($('agentic-max-tools-per-turn'), view.agentic_tool_limit.effective !== view.agentic_tool_limit.default);
+  mark($('embed-parallel'), view.embed_parallel.effective !== view.embed_parallel.default);
   // 同時実行の上限。
   const cmt = view.chat_max_turns || {};
   _CHAT_MAX_TURNS_FIELDS.forEach(({ view: vk, id }) => {

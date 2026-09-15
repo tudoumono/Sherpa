@@ -399,6 +399,13 @@
               <div class="hint" id="agentic-max-tools-per-turn-hint" style="margin:-8px 0 6px"></div>
               <p class="hint">OpenAI・Ollama・Gemini・Bedrock 用（Codex は対象外）。1質問の累計ではなく、1応答ごとの上限です。
                 超過時は上限まで実行して調査を打ち切ります。「深く」「最大」でも固定です。</p>
+
+              <label class="vlm-field"><span class="vlm-l">埋め込みの同時送信数</span>
+                <input type="number" id="embed-parallel" min="1" max="16" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="embed-parallel-hint" style="margin:-8px 0 6px"></div>
+              <p class="hint">資料の取り込み時に、埋め込み API へ同時に送るリクエスト数です。大きくすると取り込みが速くなりますが、
+                プロバイダ側の同時実行/レート制限に早く当たることがあります。保存した値は次に開始する取り込みから反映されます。</p>
             </div>
           </div>
           <!-- BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: AI が検索で1回に読み込む

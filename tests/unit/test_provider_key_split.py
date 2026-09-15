@@ -121,7 +121,7 @@ def test_embeddings_cfg_ignores_embed_provider_uses_auto(monkeypatch):
                 "ollama_url": "http://localhost:11434"}
     cfg = embeddings.cfg(settings)
     assert cfg == {"provider": "ollama", "url": "http://localhost:11434",
-                   "model": "nomic-embed-text", "dim": 768}
+                   "model": "nomic-embed-text", "dim": 768, "parallel": 4}
 
 
 def test_embeddings_cfg_openai_default_model_unchanged(monkeypatch):
@@ -132,9 +132,10 @@ def test_embeddings_cfg_openai_default_model_unchanged(monkeypatch):
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     cfg = embeddings.cfg({"extract_provider": "openai", "openai_api_key": "o"})
     # `system_settings`（`_embed_batch` の送信時接続先解決へ引き継ぐスナップショット）を除いた
-    # 本体は従来どおり。
+    # 本体は従来どおり（`parallel` は未設定なら既定 4）。
     assert {k: v for k, v in cfg.items() if k != "system_settings"} == \
-        {"provider": "openai", "key": "o", "model": "text-embedding-3-small", "dim": 1536}
+        {"provider": "openai", "key": "o", "model": "text-embedding-3-small", "dim": 1536,
+         "parallel": 4}
 
 
 def test_embeddings_cfg_openai_embed_model_catalog_override(monkeypatch):
@@ -150,7 +151,8 @@ def test_embeddings_cfg_openai_embed_model_catalog_override(monkeypatch):
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     cfg = embeddings.cfg({"extract_provider": "openai", "openai_api_key": "o"})
     assert {k: v for k, v in cfg.items() if k != "system_settings"} == \
-        {"provider": "openai", "key": "o", "model": "my-embed-deployment", "dim": 1536}
+        {"provider": "openai", "key": "o", "model": "my-embed-deployment", "dim": 1536,
+         "parallel": 4}
 
 
 def test_embeddings_cfg_openai_embed_model_defaults_without_catalog(monkeypatch):
@@ -174,7 +176,8 @@ def test_embeddings_cfg_gemini_embed_model_catalog_override(monkeypatch):
                                                 "default": "my-gemini-embed"}}}})
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     cfg = embeddings.cfg({"extract_provider": "gemini", "gemini_api_key": "g"})
-    assert cfg == {"provider": "gemini", "key": "g", "model": "my-gemini-embed", "dim": 1536}
+    assert cfg == {"provider": "gemini", "key": "g", "model": "my-gemini-embed", "dim": 1536,
+                   "parallel": 4}
 
 
 def test_embeddings_cfg_ollama_embed_model_catalog_override(monkeypatch):
@@ -187,4 +190,4 @@ def test_embeddings_cfg_ollama_embed_model_catalog_override(monkeypatch):
     monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
     cfg = embeddings.cfg({"extract_provider": "ollama", "ollama_url": "http://localhost:11434"})
     assert cfg == {"provider": "ollama", "url": "http://localhost:11434",
-                   "model": "my-ollama-embed", "dim": 768}
+                   "model": "my-ollama-embed", "dim": 768, "parallel": 4}

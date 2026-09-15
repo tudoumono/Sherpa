@@ -183,6 +183,9 @@ class SystemSettingsReq(BaseModel):
     depth_base_codex_reasoning: str | None = None
     # API の1応答内のツール実行数。調べる深さの倍率を掛けず、全 API 方言に適用する。
     agentic_max_tools_per_turn: StrictInt | None = Field(default=None, ge=1, le=256)
+    # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。
+    # 既定（未指定=None）は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
+    embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
     # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
     # 既定（未指定=None）は env 既定値（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。
     # null は未設定へ戻す（env/既定へフォールバック）。
@@ -609,7 +612,7 @@ def _admin_settings_view() -> dict:
     UI は実効値でチェック/表を描画し、`configured`（生値・未設定なら null）で「既定に従っているか」を判別し、
     `env_default`/`default` で「未設定に戻したら何になるか」を示す（プレースホルダ表示）。
     """
-    from sherpa import agentic_search, chat_service, chat_turns, impact_service, keys, lens_service, llm
+    from sherpa import agentic_search, chat_service, chat_turns, embeddings, impact_service, keys, lens_service, llm
     from sherpa.ingest import arms as ingest_arms
     from sherpa.ingest import llm_render
     from sherpa.ingest.arms import legacy_convert, vision_arm
@@ -871,6 +874,13 @@ def _admin_settings_view() -> dict:
             "configured": sysset.get("agentic_max_tools_per_turn"),
             "effective": agentic_search.effective_max_tools_per_turn(sysset),
             "default": agentic_search.MAX_TOOLS_PER_TURN,
+        },
+        # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_provider_batches` を
+        # 束ねて並列送信する本数）。env フォールバックは持たない（設定は UI(DB) が唯一の持ち主）。
+        "embed_parallel": {
+            "configured": sysset.get("embed_parallel"),
+            "effective": embeddings.effective_embed_parallel(sysset),
+            "default": embeddings.EMBED_PARALLEL_DEFAULT,
         },
         # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
         # `effective` は実際にターン受付が使う値そのもの（`effective_limits()` を直接呼ぶ・
@@ -1458,6 +1468,9 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
             provided["depth_base_codex_reasoning"])
     if "agentic_max_tools_per_turn" in provided:
         updates["agentic_max_tools_per_turn"] = provided["agentic_max_tools_per_turn"]
+    if "embed_parallel" in provided:
+        # StrictInt・範囲（1〜16）は pydantic Field が型検証済み。
+        updates["embed_parallel"] = provided["embed_parallel"]
     # チャット同時実行の上限（2項目とも StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
     for _k in ("chat_max_turns_per_user", "chat_max_turns_global"):
         if _k in provided:

@@ -3458,7 +3458,7 @@ def test_research_reset_preserves_provider_draft(page, web_base_url):
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 10 and all(value is None for value in body.values())
+    assert len(body) == 11 and all(value is None for value in body.values())
     assert 'openai_api_key' not in body and 'cloud_provider' not in body
     expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')
     expect(page.locator('#tab-dot-research')).to_be_hidden()
@@ -3504,6 +3504,42 @@ def test_research_tool_limit_rejects_out_of_range_and_can_clear(page, web_base_u
     page.locator('#save').click()
     expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('未設定')
     assert records['admin_settings_put'][-1] == {'agentic_max_tools_per_turn': None}
+
+
+# ===== 埋め込みの同時送信数（`agentic-max-tools-per-turn` と同じ型） =====
+
+def test_research_tab_saves_embed_parallel(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    page.locator('#embed-parallel').fill('8')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'embed_parallel': 8}
+    page.reload()
+    expect(page.locator('#embed-parallel')).to_have_value('8')
+    expect(page.locator('#embed-parallel-hint')).to_contain_text('固定中')
+
+
+def test_research_embed_parallel_rejects_out_of_range_and_can_clear(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    page.locator('#embed-parallel').fill('17')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('1〜16')
+    assert not records['admin_settings_put']
+    page.locator('#embed-parallel').fill('2')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    page.locator('#embed-parallel').fill('')
+    page.locator('#save').click()
+    expect(page.locator('#embed-parallel-hint')).to_contain_text('未設定')
+    assert records['admin_settings_put'][-1] == {'embed_parallel': None}
+
 
 def test_depth_profile_card_renders_unset_state(page, web_base_url):
     """未設定（既定モック）は全欄が空欄・ヒントは組み込み既定を案内する。Codex 推論レベルは

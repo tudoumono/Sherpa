@@ -585,6 +585,9 @@ class AdminSettingsView(BaseModel):
     # API 経路の 1 応答あたりのツール実行上限（`agentic_search.effective_max_tools_per_turn`）。
     # `DepthProfileBaseInfo` と同型（configured=管理者の生値・effective=解決結果・default=コード既定）。
     agentic_tool_limit: DepthProfileBaseInfo
+    # 埋め込み HTTP の同時送信数（`embeddings.effective_embed_parallel`）。
+    # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=EMBED_PARALLEL_DEFAULT）。
+    embed_parallel: DepthProfileBaseInfo
     chat_examples: ChatExamplesAdminInfo
 
 

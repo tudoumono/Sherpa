@@ -2230,6 +2230,34 @@ def test_admin_settings_agentic_tool_limit_rejects_invalid_values(bad):
     assert "agentic_max_tools_per_turn" not in store.get_system_settings()
 
 
+def test_admin_settings_embed_parallel_roundtrip():
+    """埋め込み HTTP の同時送信数（`agentic_tool_limit` と同型）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"embed_parallel": 8})
+    assert response.status_code == 200, response.text
+    assert response.json()["embed_parallel"]["effective"] == 8
+    assert store.get_system_settings()["embed_parallel"] == 8
+    # 他の項目の部分更新で保存値が消えない。
+    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
+    assert response.json()["embed_parallel"]["configured"] == 8
+    response = admin.put("/admin/settings", json={"embed_parallel": None})
+    assert response.status_code == 200, response.text
+    parallel = response.json()["embed_parallel"]
+    assert parallel["configured"] is None and parallel["effective"] == parallel["default"] == 4
+
+
+@pytest.mark.parametrize("bad", [0, -1, 17, True, "3", 1.5])
+def test_admin_settings_embed_parallel_rejects_invalid_values(bad):
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"embed_parallel": bad})
+    assert response.status_code == 422, response.text
+    assert "embed_parallel" not in store.get_system_settings()
+
+
 @pytest.mark.parametrize("field,bad", [
     ("depth_base_max_turns", 0), ("depth_base_max_turns", 500),
     ("depth_base_grep_max_hits", 0), ("depth_base_read_window", 5),

@@ -268,6 +268,32 @@ def acc_end() -> tuple:
         return None, 0
 
 
+def acc_merge(tokens: dict | None, calls: int) -> None:
+    """他スレッドで `acc_begin()`/`acc_end()` して得た `(tokens, calls)` を直近のスコープへ合算する。
+
+    `acc_add()` は 1 回の HTTP 応答を直接受け取る前提（`threading.local` のスタックは
+    呼び出しスレッド専有）——並列ワーカースレッドは自スレッドの `acc_begin`/`acc_end` で
+    バッチ分を閉じてから、その結果をこの関数で主スレッドの frame へ合算する。`suppress()` 中は
+    `acc_add()` と同じく合算しない。calls が 0 なら no-op（何も送信していないワーカー分は
+    frame を汚さない）。
+    """
+    try:
+        if not calls or getattr(_local, "suppress", False):
+            return
+        st = _stack()
+        if not st:
+            return
+        frame = st[-1]
+        frame["calls"] += calls
+        if isinstance(tokens, dict):
+            if frame["tokens"] is None:
+                frame["tokens"] = dict.fromkeys(_TOKEN_FIELDS, 0)
+            for f in _TOKEN_FIELDS:
+                frame["tokens"][f] += _clamp_int(tokens.get(f))
+    except Exception:
+        pass
+
+
 _ELAPSED_FRESHNESS_SEC = 5.0   # acc_elapsed() が拾える猶予（下記 docstring 参照）
 
 

@@ -8,11 +8,15 @@ Gemini対応は旧呼出し元のために残すが、RAG v2 profileとしては
 """
 from __future__ import annotations
 
+import concurrent.futures
+import contextvars
 import json
 import logging
 import math
 import os
 import re
+import socket
+import time
 import urllib.error
 
 from . import llm
@@ -22,6 +26,18 @@ _ITEM_MAX_UTF8_BYTES = 8_000
 _BATCH_MAX_UTF8_BYTES = 240_000
 _TIMEOUT = 60
 _SAFE_REMOTE_ERROR_FIELD = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+# 並列度（システム設定 `embed_parallel`）の既定・範囲。env フォールバックは持たない
+# （設定は UI(DB) が唯一の持ち主・env はシード専用という運用契約に合わせる）。
+EMBED_PARALLEL_DEFAULT = 4
+EMBED_PARALLEL_MIN = 1
+EMBED_PARALLEL_MAX = 16
+# 429/5xx の再送。urlopen 経由の一時的な通信エラーも対象——4xx（429 以外）は設定/入力側の
+# 不備である可能性が高く再送しない。
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRY_MAX_RETRIES = 5   # 最初の送信を含めない再送回数（バックオフ表と同数）
+_RETRY_BACKOFF_SCHEDULE = (1, 2, 4, 8, 16)
+_RETRY_MAX_TOTAL_SECONDS = 300
+_RETRY_AFTER_MAX_SECONDS = 60
 # World profileの検索本文契約。providerに依存しない同じwindow/poolingをOllama/OpenAIへ
 # 適用し、cache/indexの互換性はprofileにも格納するalgorithm IDで管理する。
 EMBEDDING_PREPROCESSING_PROFILE = "evidence-search-text-v1"
@@ -32,6 +48,20 @@ _MODELS = {"openai": ("text-embedding-3-small", 1536),
            "ollama": ("nomic-embed-text", 768)}
 # 専用ログ（sherpa.embed）へルーティングする（`sherpa/log_setup.py` の登録表参照）。
 _log = logging.getLogger("sherpa.embed")
+
+
+def effective_embed_parallel(system_settings: dict | None) -> int:
+    """埋め込み HTTP 送信の並列度（`embed()` が `_provider_batches` を束ねて送る本数）。
+
+    システム設定 `embed_parallel`（管理画面・1〜16）が優先。未設定/範囲外/非整数は既定 4 へ
+    フォールバックする（保存側の pydantic Field(ge=1,le=16) で通常は範囲外の値が DB に入らないが、
+    読み取り側でも独立に検証する＝fail-safe）。"""
+    configured = system_settings.get("embed_parallel") if isinstance(system_settings, dict) else None
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        return EMBED_PARALLEL_DEFAULT
+    if configured < EMBED_PARALLEL_MIN or configured > EMBED_PARALLEL_MAX:
+        return EMBED_PARALLEL_DEFAULT
+    return configured
 
 
 def cfg(settings: dict | None = None, *, system_settings: dict | None = None) -> dict | None:
@@ -62,12 +92,13 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None) ->
     # `es_index.index_world()` 呼び出しは既に broad except で拾い、削除より前に失敗させる）。
     from . import store
     sys_s = system_settings if system_settings is not None else store.get_system_settings()
+    parallel = effective_embed_parallel(sys_s)
 
     def G(key):
         m, d = _MODELS["gemini"]
         from . import model_catalog
         model = model_catalog.resolve_model("gemini", "embed", None, system_settings=sys_s) or m
-        return {"provider": "gemini", "key": key, "model": model, "dim": d}
+        return {"provider": "gemini", "key": key, "model": model, "dim": d, "parallel": parallel}
 
     def O(key):
         m, d = _MODELS["openai"]
@@ -80,14 +111,14 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None) ->
         # デプロイを使うと ES 側の kNN mapping と不一致になるが、これは admin の設定ミス側の責務）。
         from . import model_catalog
         model = model_catalog.resolve_model("openai", "embed", None, system_settings=sys_s) or m
-        return {"provider": "openai", "key": key, "model": model, "dim": d,
+        return {"provider": "openai", "key": key, "model": model, "dim": d, "parallel": parallel,
                 "system_settings": sys_s}   # `_embed_batch` の接続先解決へそのまま引き継ぐ
 
     def L(url):
         m, d = _MODELS["ollama"]
         from . import model_catalog
         model = model_catalog.resolve_model("ollama", "embed", None, system_settings=sys_s) or m
-        return {"provider": "ollama", "url": url, "model": model, "dim": d}
+        return {"provider": "ollama", "url": url, "model": model, "dim": d, "parallel": parallel}
 
     # `cloud_provider`（A7）が非空の不正値（env 誤記・旧データ等）のときは、黙って既定（openai）
     # へ倒れたキーで埋め込みを送信しない（fail-closed）。埋め込みは既存の graceful 契約
@@ -150,6 +181,46 @@ def _log_embed_failure(c: dict, exc: Exception) -> None:
         "embedding request failed: provider=%s status=%s error_type=%s error_code=%s",
         c.get("provider"), status, error_type, error_code,
     )
+
+
+def _sleep(seconds: float) -> None:
+    """`time.sleep` のモジュール関数越し呼び出し（テストが `monkeypatch.setattr(embeddings,
+    "_sleep", ...)` で差し替えて実待機を避けられるようにする）。"""
+    time.sleep(seconds)
+
+
+def _retryable_http_status(exc: Exception) -> bool:
+    """429/5xx のみ再送対象（429 以外の 4xx は設定/入力側の不備の可能性が高く再送しない）。"""
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in _RETRY_STATUSES
+
+
+def _retryable_transport_error(exc: Exception) -> bool:
+    """一時的な通信エラー（`HTTPError` は `URLError` のサブクラスだが上の HTTP status 判定で
+    別扱いするため、ここでは非 HTTPError の `URLError`/timeout/接続エラーだけを見る）。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (urllib.error.URLError, socket.timeout, ConnectionError))
+
+
+def _is_retryable(exc: Exception) -> bool:
+    return _retryable_http_status(exc) or _retryable_transport_error(exc)
+
+
+def _retry_after_seconds(exc: Exception) -> int | None:
+    """`Retry-After` ヘッダ（整数秒のみ・上限 `_RETRY_AFTER_MAX_SECONDS`）。無い/整数でない/HTTPError
+    でなければ None（呼び出し元は指数バックオフへ切り替える）。"""
+    if not isinstance(exc, urllib.error.HTTPError) or exc.headers is None:
+        return None
+    raw = exc.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, _RETRY_AFTER_MAX_SECONDS)
 
 
 def _utf8_windows(text: str, *, max_bytes: int = _ITEM_MAX_UTF8_BYTES) -> list[str]:
@@ -235,51 +306,178 @@ def _mean_l2(vectors: list[list], dimension: int) -> list[float] | None:
     return pooled if is_valid_vector(pooled, dimension) else None
 
 
-def _embed_batch(texts: list, c: dict) -> list | None:
+def _embed_batch_once(texts: list, c: dict, timeout: int = _TIMEOUT) -> list | None:
+    """1回分の HTTP 送信（再送なし）。ネットワーク/HTTP 例外はそのまま送出する
+    （`_embed_batch` の再送ループが分類する）。応答の形が壊れている（開発ミス・プロバイダ側の
+    契約違反）場合は例外にせず None を返す＝再送しても直らないため対象外。"""
     from . import metering
-    try:
-        if c["provider"] == "openai":
-            # `cfg()` が渡した snapshot（`c["system_settings"]`）で接続先を解決する（省略時 None は
-            # `llm.py` が都度読み直す従来どおりの挙動）。送信は `llm.openai_post_json`（OpenAI 専用の
-            # 送信直前ガード付き・`post_json` は Gemini/Ollama とも共用のため一律遮断しない）。
-            _sys_s = c.get("system_settings")
-            r = llm.openai_post_json(llm.openai_url("embeddings", system_settings=_sys_s),
-                              llm.openai_headers(c["key"], system_settings=_sys_s),
-                              {"model": c["model"], "input": texts, "dimensions": c["dim"]}, _TIMEOUT)
-            metering.acc_add(metering.usage_from_openai_embed(r))
-            data = r.get("data", [])
-            if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
-                return None
-            # OpenAIの応答は各vectorに入力位置 ``index`` を持つ。HTTP応答順へ暗黙依存すると、
-            # 順序が入れ替わった場合に別本文のvectorをchunkへ結び付けてしまうため、indexで復元する。
-            # 古いmock/provider互換として全件index無しだけは受信順を維持し、一部だけ欠ける応答は拒否する。
-            indices = [item.get("index") for item in data]
-            if all(isinstance(index, int) and not isinstance(index, bool) for index in indices):
-                if sorted(indices) != list(range(len(texts))):
-                    return None
-                data = sorted(data, key=lambda item: item["index"])
-            elif any(index is not None for index in indices):
-                return None
-            return [d["embedding"] for d in data]
-        if c["provider"] == "gemini":
-            reqs = [{"model": f"models/{c['model']}", "content": {"parts": [{"text": t}]},
-                     "outputDimensionality": c["dim"]} for t in texts]
-            r = llm.post_json(llm.gemini_url(c["model"], "batchEmbedContents"),
-                              llm.gemini_headers(c["key"]), {"requests": reqs}, _TIMEOUT)
-            metering.acc_add(None)   # batchEmbedContents は usage フィールドを返さない＝報告不能マーカー
+    if c["provider"] == "openai":
+        # `cfg()` が渡した snapshot（`c["system_settings"]`）で接続先を解決する（省略時 None は
+        # `llm.py` が都度読み直す従来どおりの挙動）。送信は `llm.openai_post_json`（OpenAI 専用の
+        # 送信直前ガード付き・`post_json` は Gemini/Ollama とも共用のため一律遮断しない）。
+        _sys_s = c.get("system_settings")
+        r = llm.openai_post_json(llm.openai_url("embeddings", system_settings=_sys_s),
+                          llm.openai_headers(c["key"], system_settings=_sys_s),
+                          {"model": c["model"], "input": texts, "dimensions": c["dim"]}, timeout)
+        metering.acc_add(metering.usage_from_openai_embed(r))
+        # ここから先は応答の解析＝HTTP は計上済み。壊れた応答は例外にせず None を返す（呼び出し元の
+        # 再送ループが「送信の失敗」として二重に計上したり再送したりしないため）。
+        return _parse_openai_embeddings(r, len(texts))
+    if c["provider"] == "gemini":
+        reqs = [{"model": f"models/{c['model']}", "content": {"parts": [{"text": t}]},
+                 "outputDimensionality": c["dim"]} for t in texts]
+        r = llm.post_json(llm.gemini_url(c["model"], "batchEmbedContents"),
+                          llm.gemini_headers(c["key"]), {"requests": reqs}, timeout)
+        metering.acc_add(None)   # batchEmbedContents は usage フィールドを返さない＝報告不能マーカー
+        try:
             return [e["values"] for e in r.get("embeddings", [])]
-        if c["provider"] == "ollama":
-            # ローカル/allowlist済みOllamaの文書・質問をambient HTTP(S)_PROXYへ渡さない。
-            # OpenAI/Geminiは通常の企業proxy利用を維持する。
-            with llm.no_proxy_requests():
-                r = llm.post_json(llm.ollama_url(c["url"], "/api/embed"), llm.JSON_HEADERS,
-                                  {"model": c["model"], "input": texts}, _TIMEOUT)
-            metering.acc_add(metering.usage_from_ollama_embed(r))
-            return r.get("embeddings")
+        except (TypeError, KeyError, AttributeError):
+            return None
+    if c["provider"] == "ollama":
+        # ローカル/allowlist済みOllamaの文書・質問をambient HTTP(S)_PROXYへ渡さない。
+        # OpenAI/Geminiは通常の企業proxy利用を維持する。
+        with llm.no_proxy_requests():
+            r = llm.post_json(llm.ollama_url(c["url"], "/api/embed"), llm.JSON_HEADERS,
+                              {"model": c["model"], "input": texts}, timeout)
+        metering.acc_add(metering.usage_from_ollama_embed(r))
+        return r.get("embeddings") if isinstance(r, dict) else None
+    return None
+
+
+def _parse_openai_embeddings(r, n: int) -> list | None:
+    """OpenAI 応答からベクトル列を取り出す（壊れた応答は None）。
+    OpenAIの応答は各vectorに入力位置 ``index`` を持つ。HTTP応答順へ暗黙依存すると、
+    順序が入れ替わった場合に別本文のvectorをchunkへ結び付けてしまうため、indexで復元する。
+    古いmock/provider互換として全件index無しだけは受信順を維持し、一部だけ欠ける応答は拒否する。"""
+    try:
+        data = r.get("data", [])
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            return None
+        indices = [item.get("index") for item in data]
+        if all(isinstance(index, int) and not isinstance(index, bool) for index in indices):
+            if sorted(indices) != list(range(n)):
+                return None
+            data = sorted(data, key=lambda item: item["index"])
+        elif any(index is not None for index in indices):
+            return None
+        return [d["embedding"] for d in data]
+    except (TypeError, KeyError, AttributeError):
         return None
-    except Exception as exc:
-        _log_embed_failure(c, exc)
-        return None
+
+
+def _embed_batch(texts: list, c: dict) -> list | None:
+    """1バッチ分の送信＋429/5xx・一時的通信エラーの再送（`Retry-After` 優先・無ければ指数
+    バックオフ・最大 `_RETRY_MAX_RETRIES` 回・合計 `_RETRY_MAX_TOTAL_SECONDS` 秒で打ち切り None）。
+    並列度に関わらずこの関数単体で完結する（並列ワーカーからも直列 embed() からも同じ再送契約）。"""
+    from . import metering
+    start = time.monotonic()
+    retries = 0
+    while True:
+        # 合計上限は「待ち時間」だけでなく HTTP の応答待ちも含めて守る——再送時は残り時間を
+        # HTTP timeout の上限にする（初回は通常の `_TIMEOUT`）。残りが無ければ送らずに諦める。
+        timeout = _TIMEOUT
+        if retries:
+            remaining = _RETRY_MAX_TOTAL_SECONDS - (time.monotonic() - start)
+            if remaining < 1:
+                return None                       # 1 秒未満では送らない（丸め上げで上限を超えない）
+            timeout = min(_TIMEOUT, int(remaining))
+        try:
+            return _embed_batch_once(texts, c, timeout)
+        except Exception as exc:
+            # 失敗した試行も物理送信（`record()` の `calls`）に数える——429/5xx はもちろん、応答待ちの
+            # timeout も要求自体は送られている（送信後に落ちたか手前で落ちたかは区別できない）ため、
+            # 「送った回数」は試行数で数える。usage（トークン数）は不明なので `acc_add(None)` の
+            # 報告不能マーカーで calls だけ進める。送信前ガードの拒否（`llm.PreflightRejected`＝
+            # 接続先/URL の検証で urllib に到達していない）は送っていないので数えない。
+            if not isinstance(exc, llm.PreflightRejected):
+                metering.acc_add(None)
+            if not _is_retryable(exc) or retries >= _RETRY_MAX_RETRIES:
+                _log_embed_failure(c, exc)
+                return None
+            wait = _retry_after_seconds(exc)
+            if wait is None:
+                wait = _RETRY_BACKOFF_SCHEDULE[min(retries, len(_RETRY_BACKOFF_SCHEDULE) - 1)]
+            if time.monotonic() - start + wait > _RETRY_MAX_TOTAL_SECONDS:
+                _log_embed_failure(c, exc)
+                return None
+            retries += 1
+            status, error_type, _error_code = _safe_failure_fields(exc)
+            _log.warning(
+                "embedding request retry: provider=%s attempt=%s status=%s error_type=%s wait=%.1fs",
+                c.get("provider"), retries, status, error_type, wait,
+            )
+            _sleep(wait)
+
+
+def _embed_batch_worker(batch: list, c: dict) -> tuple[list | None, dict | None, int]:
+    """スレッドプールのワーカー本体。`metering.acc_add` は `threading.local` のスタック（呼び出し
+    スレッド専有）へ積むため、ワーカー自身の `acc_begin`/`acc_end` で1バッチ分を閉じ、戻り値
+    `(vectors, tokens, calls)` で主スレッドへ渡す（主スレッドは `metering.acc_merge()` で合算する）。
+    """
+    from . import metering
+    metering.acc_begin()
+    vecs = _embed_batch(batch, c)
+    tokens, calls = metering.acc_end()
+    return vecs, tokens, calls
+
+
+def _embed_batches_parallel(batches: list[tuple[list, list]], c: dict, parallel: int) -> list[list] | None:
+    """有界スレッドプールで複数バッチを並列送信する（`origins` による順序復元は呼び出し元の責務）。
+
+    契約は直列版と同じ——**一部でも失敗したら None**。ただし早期に打ち切るときも、既に走り始めた
+    バッチは完了を待ってから判定する（未着手のバッチだけ cancel し、実行中のスレッドへ割り込まない
+    ＝ HTTP リクエストの半端な中断を避ける）。各ワーカーは `contextvars.copy_context().run()` 経由で
+    起動する——Ollama 分岐の `llm.no_proxy_requests()` は `contextvars.ContextVar` 制御のため、
+    そのままではワーカースレッドへ伝播しない。
+    """
+    from . import metering
+    results: list[list | None] = [None] * len(batches)
+    failed = False
+    merged: set = set()
+    future_to_index: dict = {}
+
+    def _merge(future) -> tuple:
+        """完了した future の計測を 1 回だけ主スレッドへ合算し、戻り値を返す。"""
+        vecs, tokens, calls = future.result()
+        if future not in merged:
+            merged.add(future)
+            if calls:
+                metering.acc_merge(tokens, calls)
+        return vecs, tokens, calls
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(parallel, len(batches)))
+    try:
+        for index, (_origins, batch) in enumerate(batches):
+            ctx = contextvars.copy_context()
+            future = executor.submit(ctx.run, _embed_batch_worker, batch, c)
+            future_to_index[future] = index
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                vecs, _tokens, _calls = _merge(future)
+            except concurrent.futures.CancelledError:
+                failed = True                 # 結果の無いバッチ＝「一部でも失敗したら None」
+                break
+            batch = batches[index][1]
+            if not isinstance(vecs, list) or len(vecs) != len(batch):
+                failed = True
+                # 以降の完了は待たない——`finally` の `shutdown(cancel_futures=True)` が
+                # 未着手を cancel し、既に走り始めた分だけ待つ。`shutdown()` は1回だけ呼ぶ
+                # （複数回呼ぶと「poison pill」の再投入と cancel-drain が絡み、ワーカー終了の
+                # タイミングが崩れうる）。
+                break
+            results[index] = vecs
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        # 早期打ち切り後に完了した実行中バッチの計測（物理送信・トークン）も記録に載せる
+        # （cancel された未着手分は future.result() が CancelledError＝合算しない）。
+        for future in future_to_index:
+            if future.done() and not future.cancelled():
+                try:
+                    _merge(future)
+                except Exception:
+                    pass
+    return None if failed else results
 
 
 def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None = None) -> list | None:
@@ -300,7 +498,22 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
     try:
         grouped: list[list[list]] = [[] for _text in texts]
         try:
-            batches = _provider_batches(texts, provider)
+            batches = list(_provider_batches(texts, provider))
+        except (TypeError, UnicodeError, ValueError):
+            return None
+        parallel = c.get("parallel")
+        if not isinstance(parallel, int) or isinstance(parallel, bool) or parallel < 1:
+            parallel = 1
+        if len(batches) >= 2 and parallel > 1:
+            results = _embed_batches_parallel(batches, c, parallel)
+            if results is None:
+                return None
+            for (origins, _batch), vecs in zip(batches, results):
+                for origin, vector in zip(origins, vecs):
+                    if not is_valid_vector(vector, dimension):
+                        return None
+                    grouped[origin].append(vector)
+        else:
             for origins, batch in batches:
                 vecs = _embed_batch(batch, c)
                 if not isinstance(vecs, list) or len(vecs) != len(batch):
@@ -309,8 +522,6 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
                     if not is_valid_vector(vector, dimension):
                         return None
                     grouped[origin].append(vector)
-        except (TypeError, UnicodeError, ValueError):
-            return None
         out: list = []
         for vectors in grouped:
             if not vectors:

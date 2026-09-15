@@ -1064,6 +1064,9 @@ SYSTEM_SETTINGS_VIEW = {
     # チャット同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。既定（未設定）は env 既定値
     # （`MAX_TURNS_PER_USER`=2／`MAX_TURNS_GLOBAL`=8）。depth_profile の各項目と同型。
     "agentic_tool_limit": {"configured": None, "effective": 16, "default": 16},
+    # 埋め込み HTTP の同時送信数。既定（未設定）は
+    # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
+    "embed_parallel": {"configured": None, "effective": 4, "default": 4},
     "chat_max_turns": {
         "per_user": {"configured": None, "effective": 2, "default": 2},
         "global": {"configured": None, "effective": 8, "default": 8},
@@ -1428,6 +1431,7 @@ def _mock_validate_openai_endpoint_cross(kind: str, base_url: str) -> str | None
 # と同じ範囲）。整数以外・bool・範囲外はすべて 422（実 API の pydantic 検証を模す）。
 _DEPTH_BASE_INT_BOUNDS = {
     "agentic_max_tools_per_turn": (1, 256),
+    "embed_parallel": (1, 16),
     "depth_base_max_turns": (1, 200),
     "depth_base_grep_max_hits": (1, 1000),
     "depth_base_qa_max_hits": (1, 1000),
@@ -1872,6 +1876,11 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 limit = view["agentic_tool_limit"]
                 limit["configured"] = value
                 limit["effective"] = value if value is not None else limit["default"]
+            if "embed_parallel" in body:
+                value = body["embed_parallel"]
+                parallel = view["embed_parallel"]
+                parallel["configured"] = value
+                parallel["effective"] = value if value is not None else parallel["default"]
             # 同時実行の上限（簡易反映・null は default へ戻す・depth_profile と同型）。
             if "chat_max_turns" in view:
                 for _key, _put in (("per_user", "chat_max_turns_per_user"),
