@@ -516,6 +516,28 @@ function renderResponseTime(rt) {
   </tr>`).join('');
 }
 
+// 「打ち切りの内訳」（`InvestigationState.limits`・制限そのものは変えない計測専用）。
+// 行=経路（provider）・列=各項目の「対象ターン数のうち当たったターン数」（回数系は「n件（合計m回）」・
+// bool系は件数のみ）——`stats.limits.by_provider` が空（対象ターンが1件も無い期間）なら空表のまま。
+function renderLimits(limits) {
+  const tb = $('limits-tbody');
+  if (!tb) return;
+  const rows = (limits && limits.by_provider) || [];
+  const cnt = (turns, total) => (total === undefined
+    ? `${(turns || 0).toLocaleString('ja-JP')}件`
+    : `${(turns || 0).toLocaleString('ja-JP')}件（計${(total || 0).toLocaleString('ja-JP')}回）`);
+  tb.innerHTML = rows.map((r) => `<tr>
+    <td>${esc(providerLabel(r.provider))}</td>
+    <td class="num">${(r.turns || 0).toLocaleString('ja-JP')}</td>
+    <td class="num">${cnt(r.tool_result_clipped_turns, r.tool_result_clipped_total)}</td>
+    <td class="num">${cnt(r.total_budget_hit_turns)}</td>
+    <td class="num">${cnt(r.context_compactions_turns, r.context_compactions_total)}</td>
+    <td class="num">${cnt(r.synthesis_truncated_turns)}</td>
+    <td class="num">${cnt(r.search_truncated_turns, r.search_truncated_total)}</td>
+    <td class="num">${cnt(r.auto_continues_turns, r.auto_continues_total)}</td>
+  </tr>`).join('');
+}
+
 function renderWeeklyAndRetention(retention) {
   const weekly = (retention && retention.weekly) || [];
   renderTrendChart(
@@ -808,6 +830,7 @@ async function load(days) {
     renderStopKinds(d.stop_kinds || [], d.stopped_turns);
     renderConversationTurns(d.conversation_turns || {}, d.resume_rate);
     renderResponseTime(d.response_time || {});
+    renderLimits(d.limits || {});
     renderTokens(d.tokens || {}, d.period);
     renderConversationsTop(d.conversations_top || []);
     _users = d.users || [];

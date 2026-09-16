@@ -146,6 +146,30 @@ def test_openai_style_compaction_keeps_recent_rounds_and_single_summary(monkeypa
     assert last_messages[1] == {"role": "user", "content": "質問"}
 
 
+def test_openai_style_compaction_counted_in_final_limits(monkeypatch):
+    """利用統計「打ち切りの内訳」計測: 文脈整理が発火した回数だけ最終 payload の
+    `limits["context_compactions"]` に載る（`InvestigationState.limits`・制限自体は変えない）。"""
+    monkeypatch.setattr(A, "SHERPA_AGENTIC_CONTEXT_BUDGET_BYTES", 1500)
+    monkeypatch.setattr(A, "SHERPA_AGENTIC_KEEP_RECENT_TOOLS", 2)
+    n_rounds = 8
+    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
+               {"id": f"c{i}", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
+          for i in range(n_rounds)]
+    seq.append({"choices": [{"message": {"content": "final answer"}}]})
+
+    orig_post, orig_run_tool = A._post, A.run_tool
+    A._post, A.run_tool = (lambda url, headers, body, timeout=90: seq.pop(0)), _fake_run_tool
+    try:
+        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
+    finally:
+        A._post, A.run_tool = orig_post, orig_run_tool
+    compaction_count = sum(1 for ev in events if ev.get("node", {}).get("label") == "調査の文脈を整理")
+    assert compaction_count >= 1
+    final_events = [ev for ev in events if "final" in ev]
+    assert final_events
+    assert final_events[-1]["limits"]["context_compactions"] == compaction_count
+
+
 def test_openai_style_compaction_summary_reflects_investigation_state(monkeypatch):
     """置換後の要約は生の JSON ではなく `InvestigationState.render()` の整形済み文面（見つけた
     根拠・呼び出し記録）——古い tool 結果を無言で消すのではなく、何を調べたかを引き継ぐ。"""

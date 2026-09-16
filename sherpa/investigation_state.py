@@ -241,6 +241,20 @@ class InvestigationState:
     evidence: list[Evidence] = field(default_factory=list)
     tool_log: list[ToolCall] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
+    # limits: この run 中に実際に当たった内部制限のカウンタ（緩める/強めるための値ではなく計測専用
+    # ・利用統計の「打ち切りの内訳」の元データ）。回数系（*_clipped/*_compactions/auto_continues）は
+    # int・当たったか系（total_budget_hit/synthesis_truncated）は bool。
+    limits: dict = field(default_factory=lambda: {
+        "tool_result_clipped": 0, "total_budget_hit": False, "context_compactions": 0,
+        "synthesis_truncated": False, "search_truncated": 0, "auto_continues": 0})
+
+    def bump_limit(self, key: str, n: int = 1) -> None:
+        """回数系カウンタを加算する（キーは固定語彙＝呼び出し側が `limits` の既定キーだけを渡す）。"""
+        self.limits[key] = self.limits.get(key, 0) + n
+
+    def mark_limit(self, key: str) -> None:
+        """当たったか系（bool）を真にする（一度真になったら run 内で戻さない）。"""
+        self.limits[key] = True
 
     def _find(self, kind: str, doc_id, span, text: str, locator: str | None = None) -> Evidence | None:
         """重複排除の鍵は kind＋doc_id＋span（citation/read）——同じ doc/span への複数回の取得は

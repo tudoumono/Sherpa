@@ -216,7 +216,7 @@ def test_read_evidence_retains_trailing_special_case_after_cap_increase(monkeypa
     from sherpa import agentic_search as A
     payload = A._read_evidence_payload(s)
     assert any(tail in (p.get("text") or "") for p in payload)
-    digest, _ = A.build_synthesis_digest([], [], read_evidence=payload)
+    digest, _, _ = A.build_synthesis_digest([], [], read_evidence=payload)
     assert tail in digest
     assert "保存時に切断" not in digest
 
@@ -238,7 +238,7 @@ def test_read_evidence_exceeding_save_cap_sets_truncated_flag_gap_and_digest_not
     from sherpa import agentic_search as A
     payload = A._read_evidence_payload(s)
     assert any(p.get("text_truncated") for p in payload)
-    digest, _ = A.build_synthesis_digest([], [], read_evidence=payload)
+    digest, _, _ = A.build_synthesis_digest([], [], read_evidence=payload)
     assert "（末尾未保持）" in digest
 
 
@@ -857,7 +857,7 @@ def test_read_evidence_payload_carries_glob_outline_compare_facts_and_reingests(
                           {"count": 2, "paths": ["a.xlsx", "b.xlsx"], "truncated": False}, [], None)
     payload = A._read_evidence_payload(child)
     assert any(p.get("kind") == "list" and p.get("source_tool") == "glob_search" and "a.xlsx" in p["text"] for p in payload)
-    digest, _ = A.build_synthesis_digest([], [], read_evidence=payload)
+    digest, _, _ = A.build_synthesis_digest([], [], read_evidence=payload)
     assert "a.xlsx" in digest
     parent = _state()
     _ingest_sub_final_into_state(parent, {"read_evidence": payload})

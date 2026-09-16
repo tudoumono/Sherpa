@@ -107,6 +107,8 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
     expect(rt_tbody).to_contain_text("—")
     # (5) 会話別上位＝空/不在ならカードごと隠す。
     expect(page.locator("#conversations-top-card")).to_be_hidden()
+    # 打ち切りの内訳＝limits キーが応答に無くても表は空のまま（クラッシュしない）。
+    expect(page.locator("#limits-tbody tr")).to_have_count(0)
 
 
 def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
@@ -166,6 +168,25 @@ def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
     expect(overall_row).to_contain_text("9.0秒")   # p90=9000.0
     codex_row = rt_tbody.locator("tr", has_text="Codex")
     expect(codex_row).to_contain_text("4.5秒")   # avg=4500.0
+
+
+def test_usage_limits_table_renders_by_provider(page, web_base_url):
+    """打ち切りの内訳（`InvestigationState.limits`・経路別）が USAGE_STATS_DEFAULT の値どおりに描画される。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html")
+
+    limits_tbody = page.locator("#limits-tbody")
+    codex_row = limits_tbody.locator("tr", has_text="Codex")
+    expect(codex_row).to_contain_text("10")     # turns
+    expect(codex_row).to_contain_text("3件（計5回）")     # tool_result_clipped
+    expect(codex_row).to_contain_text("1件")              # total_budget_hit（bool 系・合計は出さない）
+    expect(codex_row).to_contain_text("2件（計4回）")     # context_compactions
+    expect(codex_row).to_contain_text("4件（計9回）")     # search_truncated
+    expect(codex_row).to_contain_text("2件（計3回）")     # auto_continues
+    openai_row = limits_tbody.locator("tr", has_text="OpenAI")
+    expect(openai_row).to_contain_text("0件（計0回）")    # tool_result_clipped=0
 
 
 def test_usage_chat_notice_uses_plain_language_not_jargon(page, web_base_url):

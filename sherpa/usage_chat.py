@@ -199,6 +199,9 @@ def _stats_projection(stats: dict, *, limit_users: int, limit_tok_users: int, li
         "conversation_turns": stats.get("conversation_turns"),
         "resume_rate": stats.get("resume_rate"),
         "response_time": stats.get("response_time"),
+        # limits（「打ち切りの内訳」・経路別）: 行数は provider 種別数（数件）程度で上限不要
+        # （`stop_kinds`/`response_time` と同じくそのまま含める）。
+        "limits": stats.get("limits"),
         "users": (stats.get("users") or [])[:limit_users],
         "tokens": {
             "totals": tokens.get("totals"),

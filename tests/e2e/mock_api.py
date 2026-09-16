@@ -911,6 +911,25 @@ USAGE_STATS_DEFAULT = {
               "reasoning_output": 0, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0},
          ]},
     ],
+    # 内部制限の打ち切り分布（`InvestigationState.limits`・経路別・制限そのものは変えない計測専用）。
+    "limits": {
+        "by_provider": [
+            {"provider": "codex", "turns": 10,
+             "tool_result_clipped_turns": 3, "tool_result_clipped_total": 5,
+             "total_budget_hit_turns": 1,
+             "context_compactions_turns": 2, "context_compactions_total": 4,
+             "synthesis_truncated_turns": 0,
+             "search_truncated_turns": 4, "search_truncated_total": 9,
+             "auto_continues_turns": 2, "auto_continues_total": 3},
+            {"provider": "openai", "turns": 6,
+             "tool_result_clipped_turns": 0, "tool_result_clipped_total": 0,
+             "total_budget_hit_turns": 0,
+             "context_compactions_turns": 1, "context_compactions_total": 1,
+             "synthesis_truncated_turns": 1,
+             "search_truncated_turns": 0, "search_truncated_total": 0,
+             "auto_continues_turns": 0, "auto_continues_total": 0},
+        ],
+    },
 }
 
 

@@ -219,6 +219,8 @@ def test_continues_once_and_headline_becomes_the_conclusion(tmp_path, monkeypatc
 
     think_ids = [e.get("id") for e in events if isinstance(e, dict) and e.get("type") == "node"]
     assert "cx-continue-1" in think_ids
+    # 利用統計「打ち切りの内訳」計測: 自動継続を1回発行したターンは limits.auto_continues == 1。
+    assert env["limits"]["auto_continues"] == 1
 
 
 # ===== 2. 上限まで作業宣言のまま =====
@@ -298,6 +300,8 @@ def test_no_continuation_when_conclusion_arrives_on_first_attempt(tmp_path, monk
     assert len(calls) == 1, f"最初から結論が出れば継続しないはず: {calls!r}"
     assert not env.get("codex_stopped_early")
     assert env["headline"] == "確認した結果、影響はありません。"
+    # 自動継続が1回も発行されないターンは limits キー自体を作らない（旧行=0件と同じ集計に乗る）。
+    assert "limits" not in env
 
 
 # ===== 6. 継続中に利用者が明示停止 =====

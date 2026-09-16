@@ -1772,6 +1772,11 @@ def _shrink_single_item_result(name: str, result: dict, doc_id: str, field: str,
     return _build_one(best_text)
 
 
+# バイト予算で切ったことを申告する印 `"byte_clipped": true` の JSON 上の増分（計測用・件数上限と
+# 区別する）。切り詰め後に印を足しても予算内に収まるよう、切り詰め側は先にこの分を差し引く。
+_BYTE_CLIP_MARK_BYTES = len(', "byte_clipped": true')
+
+
 def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int) -> dict:
     """`docx_paragraphs` 専用の仕上げ——段落だけでなく表（`tables`・表→行）も
     バイト予算の削減対象にする。予算超過時は**段落を先に確保**（表 0 行で段落数を二分探索）し、
@@ -1821,6 +1826,7 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
     full = _build(len(paras), len(flat_rows))
     if _result_byte_size(full) <= tr_max_bytes:
         return full
+    tr_max_bytes = max(1, tr_max_bytes - _BYTE_CLIP_MARK_BYTES)   # 計測用の印の分を予算から先に引く
 
     # 段落を先に確保する（表 0 行で段落数を二分探索）→ 余った予算で表の行を埋める。
     # 表を満量のまま段落を削ると、大きな表を持つ文書で段落が 1 件も返らず、段落のページング
@@ -1844,6 +1850,7 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
     if best_n_paras > 0:
         r = _build(best_n_paras, best_n_rows)
         r["truncated"] = True
+        r["byte_clipped"] = True                     # バイト予算由来（計測用の印）
         return r
 
     # 段落が1件も丸ごと入らない場合——小さな表が1行でも入る（`best_n_rows > 0`）からといって
@@ -1889,9 +1896,11 @@ def _finish_docx_paragraphs_result(result: dict, doc_id: str, tr_max_bytes: int)
                     hi = mid - 1
             final = _with_tables(rescued_n_rows)
             final["truncated"] = True
+            final["byte_clipped"] = True                 # バイト予算由来（件数上限と区別する計測用の印）
             return final
     r = _build(0, best_n_rows)
     r["truncated"] = True
+    r["byte_clipped"] = True
     return r
 
 
@@ -1930,6 +1939,7 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
     full = _build(full_seq)
     if field is None or not isinstance(full_seq, (list, str)) or _result_byte_size(full) <= tr_max_bytes:
         return full
+    tr_max_bytes = max(1, tr_max_bytes - _BYTE_CLIP_MARK_BYTES)   # 計測用の印の分を予算から先に引く（印を足しても予算内）
     lo, hi, best = 0, len(full_seq), _build(full_seq[:0])
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -1946,8 +1956,10 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
         shrunk = _shrink_single_item_result(name, result, doc_id, field, full_seq[0], tr_max_bytes)
         if shrunk is not None:
             shrunk["truncated"] = True
+            shrunk["byte_clipped"] = True                # バイト予算由来（件数上限と区別する計測用の印）
             return shrunk
     best["truncated"] = True
+    best["byte_clipped"] = True
     return best
 
 
@@ -2419,9 +2431,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 if doc_id:
                     docs.add(doc_id)
             diff_text = result.get("diff") or ""
-            clipped = _clip_utf8_bytes(diff_text, tr_max_bytes)
-            if clipped != diff_text:
-                result = {**result, "diff": clipped, "truncated": True}
+            if len(diff_text.encode("utf-8")) > tr_max_bytes:   # 予算超過のときだけ印の分を先に引いて切る
+                clipped = _clip_utf8_bytes(diff_text, max(1, tr_max_bytes - _BYTE_CLIP_MARK_BYTES))
+                result = {**result, "diff": clipped, "truncated": True, "byte_clipped": True}
         elif status == "unsupported":
             for key in ("left_doc_id", "right_doc_id"):
                 doc_id = result.get(key)
@@ -3003,6 +3015,31 @@ def _tool_hit_count(name: str, result: dict) -> int | None:
         body_lines = diff_lines[2:] if len(diff_lines) >= 2 else []
         return sum(1 for ln in body_lines if ln.startswith("+") or ln.startswith("-"))
     return None
+
+
+# search_truncated（利用統計「打ち切りの内訳」対象）: 検索系ツール（探す経路・列挙系）が母集団の
+# 一部しか返さなかった呼び出し。`result["truncated"]`（各ツールの既存語彙・ヒット上限／件数上限/
+# 見出し上限で打ち切り）をそのまま数える——制限そのものは変えない・計測のみ。
+_SEARCH_TRUNCATED_TOOLS = frozenset({
+    "ripgrep_search", "es_search", "glob_search", "graph_neighbors", "list_docs", "doc_outline"})
+# tool_result_clipped（同）: 1 件あたりのバイト予算で本文が切り詰められた呼び出し。判定キーは
+# `text_truncated`（read_around/read_doc の逐次クリップ）と `byte_clipped`（`_finish_reader_result`
+# の原本読取ツール・compare_documents の diff がバイト予算で切ったときだけ立てる印）。読取ツールの
+# `truncated` は行数/ページ数の上限でも立つため使わない。件数上限の doc_outline/graph_neighbors/
+# 検索系は `search_truncated` で数える。
+_BYTE_CLIP_TOOLS = frozenset({
+    "read_around", "read_doc", "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
+    "pdf_pages", "file_head", "compare_documents"})
+
+
+def _record_run_tool_limits(state: "investigation_state.InvestigationState", name: str, result) -> None:
+    """`run_tool()` 直後に1回呼ぶ（3 dialect 共通）。制限そのものは一切変えない・計測のみ。"""
+    if not isinstance(result, dict):
+        return
+    if name in _SEARCH_TRUNCATED_TOOLS and result.get("truncated"):
+        state.bump_limit("search_truncated")
+    if name in _BYTE_CLIP_TOOLS and (result.get("text_truncated") or result.get("byte_clipped")):
+        state.bump_limit("tool_result_clipped")
 
 
 # EXT-4 v2（`web/chat/render.js::_updateLaneStats`）は `event_type` が無い kind:"tool" ノードを
@@ -4095,8 +4132,11 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
                            quote_cap: int = _SYNTHESIS_QUOTE_CAP,
                            max_bytes: int = _SYNTHESIS_MAX_BYTES,
                            read_evidence: list | None = None,
-                           gaps: list | None = None) -> tuple[str, dict]:
+                           gaps: list | None = None) -> tuple[str, dict, bool]:
     """清書（`_answer_prompt` → `providers/prompts.py::_facts`）専用の**確定根拠の全件ダイジェスト**。
+
+    戻り値の3つ目（`synthesis_truncated`）: `max_bytes` 予算を超えて候補（citation/構造的根拠/精読
+    本文/gaps 行）を1件以上省略したら True（利用統計「打ち切りの内訳」計測専用・予算自体は変えない）。
 
     `build_evidence_digest` と**同じ ev-N 採番・同じ入力順**（`combined_evidence_meta` の
     添字＋1）を使う——同じ入力を渡せば同じエントリに同じ ev-N が付く（両関数の唯一の共通契約。
@@ -4175,6 +4215,7 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
     path_budgets = _synthesis_list_path_budgets(
         {i: m.get("matched_doc_ids") for i, m in enumerate(combined_evidence_meta)
          if m.get("matched_doc_ids") is not None and "list_meta" in m}, max_bytes // 2)
+    paths_omitted = False                            # 一覧のパスが予算で未提示になったか（計測用）
     for i, m in enumerate(combined_evidence_meta):
         ev_id = f"ev-{i + 1}"
         matched = m.get("matched_doc_ids")
@@ -4191,6 +4232,8 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
                 # 予算を食い潰すと件数・条件ごと落ちるため、パスは行の取り分（等分＋繰り越し）までで
                 # 打ち切り、省略数を明示する。
                 paths, n_omitted = _synthesis_list_paths(matched, path_budgets.get(i, 0))
+                if n_omitted:
+                    paths_omitted = True            # パス一覧の未提示も清書入力の打ち切り（計測用）
                 fact = (f"[list_docs] 該当 {lm.get('count', 0)} 件{cond_text}／列挙 "
                        f"{lm.get('shown', 0)} 件" + (f": {paths}" if paths else "")
                        + (f"（他 {n_omitted} 件のパスは未提示＝この一覧は全件として書かない）" if n_omitted else ""))
@@ -4284,7 +4327,7 @@ def build_synthesis_digest(citations: list, combined_evidence_meta: list, *,
             notice = _SYNTHESIS_TRUNCATION_NOTICE_TMPL.format(n=omitted)
         total_bytes += _marginal_cost(notice)
         lines.append(notice)
-    return "\n".join(lines), ev_map
+    return "\n".join(lines), ev_map, (omitted > 0 or paths_omitted)
 
 
 def resolve_attributed_doc_ids(attributed_ev_ids, ev_map: dict) -> set:
@@ -4598,7 +4641,7 @@ def _note_dropped_citations(state, dropped: list) -> None:
 
 def _committed_evidence_digest(committed: list, evidence_meta: list | None = None,
                                structural_evidence_meta: list | None = None,
-                               gaps: list | None = None, read_evidence: list | None = None) -> str:
+                               gaps: list | None = None, read_evidence: list | None = None, limits: dict | None = None) -> str:
     """Committed Evidence（doc_id/span/quote）と検証済みの構造的根拠（list_docs 集計・graph カード）、
     調査の限界（gaps）から再合成用の根拠一覧テキストを組む（`build_synthesis_digest` と同じ体裁）。
 
@@ -4616,15 +4659,18 @@ def _committed_evidence_digest(committed: list, evidence_meta: list | None = Non
         meta += [{"doc_id": c.get("doc_id"), "span": c.get("span")} for c in committed[len(meta):]]
     if not committed and not structural_evidence_meta and not read_evidence:
         return ""
-    digest, _ = build_synthesis_digest(committed, meta[:len(committed)] + list(structural_evidence_meta or []),
-                                       read_evidence=read_evidence, gaps=gaps)
+    digest, _, truncated = build_synthesis_digest(committed, meta[:len(committed)] + list(structural_evidence_meta or []),
+                                                  read_evidence=read_evidence, gaps=gaps)
+    if truncated and limits is not None:
+        limits["synthesis_truncated"] = True          # 再合成入力の打ち切りも計測に載せる（予算自体は不変）
     return digest
 
 
 def _clean_resynthesis_anthropic(client, model: str, system: str, question: str,
                                  mt: int, committed: list, usage: dict, *,
                                  evidence_meta: list | None = None, structural_evidence_meta: list | None = None,
-                                 gaps: list | None = None, read_evidence: list | None = None) -> tuple[str, str | None]:
+                                 gaps: list | None = None, read_evidence: list | None = None,
+                                 limits: dict | None = None) -> tuple[str, str | None]:
     """Anthropic 経由のクリーン再合成——入力は **system＋現在の質問＋Committed Evidence digest**
     だけ（tools 無し）。通常の会話履歴（`history`）・ツール呼び出し履歴・モデルの前回ドラフトは
     一切渡さない（過去ターンの文脈や落ちた根拠に基づく主張を新しい回答へ持ち越さない）。
@@ -4633,7 +4679,8 @@ def _clean_resynthesis_anthropic(client, model: str, system: str, question: str,
     戻り値は `(text, stop_reason)`——EV-0（拡張設計 §4.4）: この再合成コール自体が `max_tokens` で
     打ち切られた場合も、呼び出し元が帰属をスキップできるよう完了理由を一緒に返す。
     """
-    digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, gaps, read_evidence)
+    digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, gaps, read_evidence,
+                                        limits=limits)
     if not digest:
         return "", None
     messages = [{"role": "user", "content": _RESYNTH_INSTRUCTION.format(question=question, digest=digest)}]
@@ -4654,11 +4701,13 @@ def _clean_resynthesis_anthropic(client, model: str, system: str, question: str,
 def _clean_resynthesis_gemini(url: str, headers: dict, system: str, question: str,
                               committed: list, usage: dict, *,
                               evidence_meta: list | None = None, structural_evidence_meta: list | None = None,
-                              gaps: list | None = None, read_evidence: list | None = None) -> tuple[str, str | None]:
+                              gaps: list | None = None, read_evidence: list | None = None,
+                              limits: dict | None = None) -> tuple[str, str | None]:
     """Gemini 経由のクリーン再合成（`_clean_resynthesis_anthropic` と同じ最小コンテキスト方針・
     system＋現在の質問＋digest だけ・`history` は渡さない）。戻り値は `(text, finishReason)`。
     """
-    digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, gaps, read_evidence)
+    digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, gaps, read_evidence,
+                                        limits=limits)
     if not digest:
         return "", None
     contents = [{"role": "user",
@@ -4686,7 +4735,8 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
                       attribution_eligible: bool = False,
                       failure_kind: str | None = None,
                       read_evidence: list | None = None,
-                      gaps: list | None = None) -> dict:
+                      gaps: list | None = None,
+                      limits: dict | None = None) -> dict:
     """`{"final": ...}` イベントの共通組み立て（Committed Evidence 化は呼び出し元が済ませた状態で
     受け取る）。候補があったのに全滅した場合は `stop_reason` を `evidence_verification_failed` へ
     上書きする（honest failure）。
@@ -4764,6 +4814,12 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
               "failure_kind": failure_kind,
               "read_evidence": read_evidence or [],
               "gaps": gaps or []}
+    # limits（1ターンで実際に当たった内部制限のカウンタ・`InvestigationState.limits`）: 値が
+    # 全て既定（0/False）なら制限に当たっていないターン＝キー自体を作らず既存 payload と
+    # byte-identical のままにする（利用統計側は「キー無し＝未計測」ではなく「キー無し＝
+    # 制限0件」と解釈する・`store/usage.py::usage_stats` の `limits` 集計参照）。
+    if limits and any(limits.values()):
+        payload["limits"] = dict(limits)
     if evaluation is not None:
         payload["evaluation_status"] = evaluation.get("status")
         payload["evaluation_reason"] = evaluation.get("reason")
@@ -4778,7 +4834,8 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
                          used_evidence_docs: set | None = None,
                          attributed_ev_ids: set | None = None,
                          read_evidence: list | None = None,
-                         gaps: list | None = None) -> dict:
+                         gaps: list | None = None,
+                         limits: dict | None = None) -> dict:
     """`_finalize_payload` の薄いラッパー。citation 列（Candidate のまま）を受け取り、ここで
     `_commit_evidence` を1回だけ実行してから共通組み立てへ渡す（緊急打ち切り経路でも未検証
     citation を外へ出さない）。
@@ -4787,7 +4844,7 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
     return _finalize_payload(text, docs, searched, committed, evidence_meta, dropped, cards, usage,
                              verified_docs, stop_reason, evaluation, structural_evidence_meta,
                              used_evidence_docs, attributed_ev_ids, read_evidence=read_evidence,
-                             gaps=gaps)
+                             gaps=gaps, limits=limits)
 
 
 # ---- 反復ループ（OpenAI 形式＝OpenAI/Ollama 共用 ／ Gemini 形式）----
@@ -5079,7 +5136,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "budget_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         _acc_openai_usage(usage, resp, ollama)
         if usage_acc is not None:
@@ -5103,7 +5160,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world, verdict,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 if verdict["status"] in ("insufficient", "conflicting"):
                     if verdict["status"] == "conflicting":
@@ -5205,12 +5262,13 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
                         shared_budget["tool_bytes_used"] += _sz
                     if _tool_bytes_over_budget(total_tool_bytes, shared_budget, tool_result_max_total_bytes):
+                        state.mark_limit("total_budget_hit")
                         yield {"node": _node("ツール結果の合計サイズ上限",
                                              "この会話で取得した量が多すぎるため打ち切りました")}
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                         return
                     tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                     if tc.get("id"):
@@ -5234,6 +5292,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e,
                                           _header_secret(headers))
                     result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
+                _record_run_tool_limits(state, name, result)     # 並列経路も直列と同じ計測
                 hit_node = (_hit_summary_node_sub(name, result) if allowed_tools is not None
                            else _hit_summary_node(name, args, result))
                 if hit_node:
@@ -5249,12 +5308,13 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
                     shared_budget["tool_bytes_used"] += _sz
                 if _tool_bytes_over_budget(total_tool_bytes, shared_budget, tool_result_max_total_bytes):
+                    state.mark_limit("total_budget_hit")
                     yield {"node": _node("ツール結果の合計サイズ上限",
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 docs |= d
                 cites += c
@@ -5325,12 +5385,13 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
                     shared_budget["tool_bytes_used"] += _sz
                 if _tool_bytes_over_budget(total_tool_bytes, shared_budget, tool_result_max_total_bytes):
+                    state.mark_limit("total_budget_hit")
                     yield {"node": _node("ツール結果の合計サイズ上限",
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                 if tc.get("id"):
@@ -5359,6 +5420,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             result, d, c, cd = run_tool(name, args, world, scope_paths, deadline=tool_deadline,
                                         layer=layer, max_hits=max_hits, window_cap=window_cap,
                                         tool_result_max_bytes=tool_result_max_bytes)
+            _record_run_tool_limits(state, name, result)
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node`/`_tool_node_sub` は
             # 結果が出る前のノードのため件数を書けない・`_hit_summary_node`/`_hit_summary_node_sub`
             # 参照）。
@@ -5391,12 +5453,13 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             if shared_budget is not None and not _tool_bytes_over_budget(0, shared_budget, tool_result_max_total_bytes):
                 shared_budget["tool_bytes_used"] += _sz
             if _tool_bytes_over_budget(total_tool_bytes, shared_budget, tool_result_max_total_bytes):
+                state.mark_limit("total_budget_hit")
                 yield {"node": _node("ツール結果の合計サイズ上限",
                                      "この会話で取得した量が多すぎるため打ち切りました")}
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                 return
             docs |= d
             cites += c
@@ -5462,7 +5525,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         _round_bounds.append((_round_start, len(msgs)))
         # 探索ループの文脈整理: `msgs` が予算を超えたら、最新 `SHERPA_AGENTIC_KEEP_RECENT_TOOLS`
@@ -5481,6 +5544,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 {"role": "user", "content": f"【ここまでの調査状態】\n{_summary}"}]
             _shift = (_cutoff - _prefix_len) - 1   # 置換前の範囲長 → 置換後は1通ぶんだけ
             _round_bounds = [(s - _shift, e - _shift) for s, e in _round_bounds[_collapsed_rounds:]]
+            state.bump_limit("context_compactions")
             yield {"node": _context_compacted_node(_collapsed_rounds)}
         # EXT-3（拡張設計 §3.2/§3.3）: Research Cycle 境界（`RESEARCH_CYCLE_TURNS` ターンごと）で
         # 構造化評価を1回挟む。`depth`（既定 "light"）が Medium/Deep でないときは `eval_active=False`
@@ -5497,7 +5561,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world, verdict,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                 return
             if verdict["status"] == "sufficient":
                 # §3.2: sufficient → Candidate/Verified から Committed Evidence へ（tail で確定）。
@@ -5540,7 +5604,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                    verified_docs, stop_reason, world, evaluation,
                                    structural_evidence_meta=structural_evidence_meta,
-                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
         return
 
     committed, evidence_meta, dropped = _commit_evidence(cites, world)
@@ -5566,7 +5630,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         # 再合成できなければ本文を返さない（honest failure・壊れた根拠に基づく主張を持ち越さない）。
         candidate_text = ""
         digest = _committed_evidence_digest(committed, evidence_meta, structural_evidence_meta, state.gaps,
-                                            _read_evidence_payload(state))
+                                            _read_evidence_payload(state), limits=state.limits)
         # 呼び出し予算の消費・usage_acc への加算・OpenAI 送信ガードの確認は `_send` が物理送信
         # ごとに自分で行う（`_send` docstring 参照）。ガード失敗・予算切れはこの再合成の
         # 「候補なし」への既存の degrade（`except Exception: candidate_text = ""`）と同じ扱いに
@@ -5706,7 +5770,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                             used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
                             attributed_ev_ids=_attributed,
                             synthesis_failed=_synthesis_failed, attribution_eligible=_eligible,
-                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
 
 
 def anthropic_tools_from_openai(tools: list) -> list:
@@ -5816,7 +5880,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             yield _build_final_payload(_ANTHROPIC_REFUSAL, docs, searched, cites, cards,
                                        _usage_or_none(usage), verified_docs, "refusal", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         tool_uses = [b for b in blocks if getattr(b, "type", None) == "tool_use"]
         if not tool_uses or stop == "max_tokens":        # ツール要求なし／打ち切り＝集めたテキストを最終回答に
@@ -5832,7 +5896,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 candidate_text, _finish_reason = _clean_resynthesis_anthropic(
                     client, model, system, user, mt, committed, usage, evidence_meta=evidence_meta,
                     structural_evidence_meta=structural_evidence_meta, gaps=state.gaps,
-                    read_evidence=_read_evidence_payload(state))
+                    read_evidence=_read_evidence_payload(state), limits=state.limits)
             else:
                 candidate_text = text
                 _finish_reason = stop
@@ -5854,7 +5918,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                                     structural_evidence_meta=structural_evidence_meta,
                                     used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
                                     attributed_ev_ids=_attributed,
-                                    read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                    read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         searched = True
         messages.append({"role": "assistant", "content": resp.content})   # ブロックはそのまま履歴へ戻す
@@ -5924,12 +5988,13 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                     result = {"error": f"ツール {safe_name} は使用できません"}
                     total_tool_bytes += _result_byte_size(result)
                     if total_tool_bytes > tool_result_max_total_bytes:
+                        state.mark_limit("total_budget_hit")
                         yield {"node": _node("ツール結果の合計サイズ上限",
                                              "この会話で取得した量が多すぎるため打ち切りました")}
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                         return
                     results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
                                     "content": json.dumps(result, ensure_ascii=False)})
@@ -5951,6 +6016,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                     from .ingest.graph_extract import _log_masked_exception
                     _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e, None)
                     result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
+                _record_run_tool_limits(state, name, result)     # 並列経路も直列と同じ計測
                 hit_node = _hit_summary_node(name, args, result)
                 if hit_node:
                     yield {"node": hit_node}
@@ -5962,12 +6028,13 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                     yield {"node": truncated_node}
                 total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
                 if total_tool_bytes > tool_result_max_total_bytes:
+                    state.mark_limit("total_budget_hit")
                     yield {"node": _node("ツール結果の合計サイズ上限",
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 docs |= d
                 cites += c
@@ -6016,12 +6083,13 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 result = {"error": f"ツール {safe_name} は使用できません"}
                 total_tool_bytes += _result_byte_size(result)
                 if total_tool_bytes > tool_result_max_total_bytes:
+                    state.mark_limit("total_budget_hit")
                     yield {"node": _node("ツール結果の合計サイズ上限",
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 results.append({"type": "tool_result", "tool_use_id": getattr(tu, "id", None),
                                 "content": json.dumps(result, ensure_ascii=False)})
@@ -6044,6 +6112,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 return
             result, d, c, cd = run_tool(name, args, world, scope_paths, layer=layer,
                                         tool_result_max_bytes=tool_result_max_bytes)
+            _record_run_tool_limits(state, name, result)
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node` は結果が出る前のノード
             # のため件数を書けない・`_hit_summary_node` 参照）。`anthropic_style` に
             # `allowed_tools`/サブ経路は無い＝常にメイン経路の表示。
@@ -6068,12 +6137,13 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             # （`result` のみを計測すると、cards はこの計測経路をすり抜けてしまう）。
             total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
             if total_tool_bytes > tool_result_max_total_bytes:
+                state.mark_limit("total_budget_hit")
                 yield {"node": _node("ツール結果の合計サイズ上限",
                                      "この会話で取得した量が多すぎるため打ち切りました")}
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                 return
             docs |= d
             cites += c
@@ -6133,7 +6203,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         messages.append({"role": "user", "content": results})
         _round_bounds.append((_round_start, len(messages)))
@@ -6149,11 +6219,12 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                 {"role": "user", "content": f"【ここまでの調査状態】\n{_summary}"}]
             _shift = (_cutoff - _prefix_len) - 1
             _round_bounds = [(s - _shift, e - _shift) for s, e in _round_bounds[_collapsed_rounds:]]
+            state.bump_limit("context_compactions")
             yield {"node": _context_compacted_node(_collapsed_rounds)}
     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                verified_docs, "turns_exhausted", world,
                                structural_evidence_meta=structural_evidence_meta,
-                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
 
 
 def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_paths,
@@ -6245,7 +6316,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 candidate_text, _finish_reason = _clean_resynthesis_gemini(
                     url, headers, system, user, committed, usage, evidence_meta=evidence_meta,
                     structural_evidence_meta=structural_evidence_meta, gaps=state.gaps,
-                    read_evidence=_read_evidence_payload(state))
+                    read_evidence=_read_evidence_payload(state), limits=state.limits)
             else:
                 candidate_text = text
                 _finish_reason = cand0.get("finishReason")
@@ -6266,7 +6337,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                                     structural_evidence_meta=structural_evidence_meta,
                                     used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
                                     attributed_ev_ids=_attributed,
-                                    read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                    read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         searched = True
         contents.append({"role": "model", "parts": parts})
@@ -6334,12 +6405,13 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                     result = {"error": f"ツール {safe_name} は使用できません"}
                     total_tool_bytes += _result_byte_size(result)
                     if total_tool_bytes > tool_result_max_total_bytes:
+                        state.mark_limit("total_budget_hit")
                         yield {"node": _node("ツール結果の合計サイズ上限",
                                              "この会話で取得した量が多すぎるため打ち切りました")}
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                         return
                     resp_parts.append({"functionResponse": {"name": name, "response": result}})
                     continue
@@ -6360,6 +6432,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                     from .ingest.graph_extract import _log_masked_exception
                     _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e, api_key)
                     result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
+                _record_run_tool_limits(state, name, result)     # 並列経路も直列と同じ計測
                 hit_node = _hit_summary_node(name, args, result)
                 if hit_node:
                     yield {"node": hit_node}
@@ -6371,12 +6444,13 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                     yield {"node": truncated_node}
                 total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
                 if total_tool_bytes > tool_result_max_total_bytes:
+                    state.mark_limit("total_budget_hit")
                     yield {"node": _node("ツール結果の合計サイズ上限",
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 docs |= d
                 cites += c
@@ -6422,12 +6496,13 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 result = {"error": f"ツール {safe_name} は使用できません"}
                 total_tool_bytes += _result_byte_size(result)
                 if total_tool_bytes > tool_result_max_total_bytes:
+                    state.mark_limit("total_budget_hit")
                     yield {"node": _node("ツール結果の合計サイズ上限",
                                          "この会話で取得した量が多すぎるため打ち切りました")}
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                     return
                 resp_parts.append({"functionResponse": {"name": name, "response": result}})
                 continue
@@ -6446,6 +6521,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 return
             result, d, c, cd = run_tool(name, args, world, scope_paths, layer=layer,
                                         tool_result_max_bytes=tool_result_max_bytes)
+            _record_run_tool_limits(state, name, result)
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node` は結果が出る前のノード
             # のため件数を書けない・`_hit_summary_node` 参照）。`gemini` に `allowed_tools`/
             # サブ経路は無い＝常にメイン経路の表示。
@@ -6470,12 +6546,13 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
             # （`result` のみを計測すると、cards はこの計測経路をすり抜けてしまう）。
             total_tool_bytes += _result_byte_size(result) + _result_byte_size(cd)
             if total_tool_bytes > tool_result_max_total_bytes:
+                state.mark_limit("total_budget_hit")
                 yield {"node": _node("ツール結果の合計サイズ上限",
                                      "この会話で取得した量が多すぎるため打ち切りました")}
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
                 return
             docs |= d
             cites += c
@@ -6533,7 +6610,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
             return
         contents.append({"role": "user", "parts": resp_parts})
         _round_bounds.append((_round_start, len(contents)))
@@ -6549,8 +6626,9 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                 {"role": "user", "parts": [{"text": f"【ここまでの調査状態】\n{_summary}"}]}]
             _shift = (_cutoff - _prefix_len) - 1
             _round_bounds = [(s - _shift, e - _shift) for s, e in _round_bounds[_collapsed_rounds:]]
+            state.bump_limit("context_compactions")
             yield {"node": _context_compacted_node(_collapsed_rounds)}
     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                verified_docs, "turns_exhausted", world,
                                structural_evidence_meta=structural_evidence_meta,
-                               read_evidence=_read_evidence_payload(state), gaps=state.gaps)
+                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)

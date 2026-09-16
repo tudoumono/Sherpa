@@ -151,6 +151,35 @@ def _stopped_turns_sql() -> str:
     )
 
 
+# limits（`answer->'limits'`・agentic_search.InvestigationState.limits・利用統計「打ち切りの
+# 内訳」専用の計測カウンタ）の SQL 抽出。旧行（キー自体が無い）は NULL のまま拾い FILTER で
+# 除外される＝0件として集計に混じる（`docs/notes`「限定/計測」契約・制限そのものは変えない）。
+# `_usage_tok` と同じ「非数値/欠落は無視」防御（bool は 'true'/'false' 文字列のみ真偽扱い）。
+_USAGE_LIMIT_INT_FIELDS = ("tool_result_clipped", "context_compactions", "search_truncated",
+                           "auto_continues")
+_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated")
+
+
+def _usage_limit_int(field: str) -> str:
+    return (f"CASE WHEN (answer->'limits'->>'{field}') ~ '^[0-9]+$' "
+            f"THEN (answer->'limits'->>'{field}')::bigint ELSE 0 END")
+
+
+def _usage_limit_bool(field: str) -> str:
+    return f"(answer->'limits'->>'{field}') = 'true'"
+
+
+def _usage_limits_select_cols() -> str:
+    cols = []
+    for f in _USAGE_LIMIT_INT_FIELDS:
+        expr = _usage_limit_int(f)
+        cols.append(f"COUNT(*) FILTER (WHERE {expr} > 0) AS {f}_turns")
+        cols.append(f"COALESCE(SUM({expr}), 0) AS {f}_total")
+    for f in _USAGE_LIMIT_BOOL_FIELDS:
+        cols.append(f"COUNT(*) FILTER (WHERE {_usage_limit_bool(f)}) AS {f}_turns")
+    return ", ".join(cols)
+
+
 def _usage_token_sum_cols() -> str:
     return ("COUNT(*) AS turns, "
             f"SUM({_usage_tok('input_tokens')}) AS input, "
@@ -425,6 +454,20 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY stop_kind ORDER BY n DESC",
             (start_ts, end_exclusive_ts, list(stop_kind.STOP_KINDS), start_ts, end_exclusive_ts),
         ).fetchall()
+        # limits（「打ち切りの内訳」・経路別）: `stop_kind_rows` と同じ population（turn_created_at
+        # 境界・answer IS NOT NULL・clarify 除外）に `answer->'usage'->>'provider'` 別の集計を足す
+        # （`token_by_model` と同じ provider 抽出キー・専用フィールドは持たない＝重複させない）。
+        limits_rows = c.execute(
+            _USAGE_TURN_CTE + " "
+            "SELECT COALESCE(answer->'usage'->>'provider', 'unknown') AS provider, "
+            "  COUNT(*) AS turns, " + _usage_limits_select_cols() + " "
+            "FROM turns "
+            "WHERE turn_created_at >= %s AND turn_created_at < %s "
+            "  AND answer IS NOT NULL "
+            "  AND lens IS DISTINCT FROM 'clarify' "
+            "GROUP BY provider ORDER BY turns DESC",
+            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+        ).fetchall()
         # 利用者停止（`stopped_by_user`）は assistant を保存しないため上の分布には出ない
         # （`chat_service.py::stream_message`/`handle_message` の stopped 分岐参照）——監査
         # `chat.turn`（`detail.stopped=true`）から別途数える（`_stopped_turns_sql` 参照・
@@ -651,6 +694,17 @@ def usage_stats(days: int = 30) -> dict:
     stop_kinds = [{"stop_kind": r["stop_kind"], "turns": r["n"] or 0} for r in stop_kind_rows]
     stopped_turns = (stopped_turns_row["n"] or 0) if stopped_turns_row else 0
 
+    # limits（「打ち切りの内訳」・経路別・利用統計 U 系と同じ形＝行=provider の list）。
+    # `*_turns`＝回数系は1回以上・bool系は真だったターン数、`*_total`＝回数系の合計回数。
+    by_provider_limits = [
+        {"provider": r["provider"], "turns": r["turns"] or 0,
+         **{f"{f}_turns": r[f"{f}_turns"] or 0 for f in _USAGE_LIMIT_INT_FIELDS},
+         **{f"{f}_total": int(r[f"{f}_total"] or 0) for f in _USAGE_LIMIT_INT_FIELDS},
+         **{f"{f}_turns": r[f"{f}_turns"] or 0 for f in _USAGE_LIMIT_BOOL_FIELDS}}
+        for r in limits_rows
+    ]
+    limits_stats = {"by_provider": by_provider_limits}
+
     # 定着指標: JST 週（月曜始まり）ごとのアクティブユーザー集合→週次人数の推移＋連続週ペアの再訪率。
     retention = _compute_retention(week_user_rows)
 
@@ -806,7 +860,7 @@ def usage_stats(days: int = 30) -> dict:
         "heatmap": heatmap, "retention": retention, "downloads": downloads, "tokens": tokens,
         "conversation_turns": conversation_turns, "resume_rate": resume_rate,
         "stop_kinds": stop_kinds, "stopped_turns": stopped_turns,
-        "response_time": response_time,
+        "response_time": response_time, "limits": limits_stats,
         "conversations_top": conversations_top,
     }
 

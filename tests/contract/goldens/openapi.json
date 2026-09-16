@@ -62,6 +62,9 @@
             "title": "Heatmap",
             "type": "array"
           },
+          "limits": {
+            "$ref": "#/components/schemas/UsageLimits"
+          },
           "period": {
             "$ref": "#/components/schemas/UsagePeriod"
           },
@@ -141,7 +144,8 @@
           "stop_kinds",
           "stopped_turns",
           "response_time",
-          "conversations_top"
+          "conversations_top",
+          "limits"
         ],
         "title": "AdminUsageStatsResponse",
         "type": "object"
@@ -5452,6 +5456,92 @@
           "chat"
         ],
         "title": "UsageLens",
+        "type": "object"
+      },
+      "UsageLimits": {
+        "description": "内部制限の打ち切り分布（`usage_stats()[\"limits\"]`）。",
+        "properties": {
+          "by_provider": {
+            "items": {
+              "$ref": "#/components/schemas/UsageLimitsByProviderRow"
+            },
+            "title": "By Provider",
+            "type": "array"
+          }
+        },
+        "required": [
+          "by_provider"
+        ],
+        "title": "UsageLimits",
+        "type": "object"
+      },
+      "UsageLimitsByProviderRow": {
+        "description": "経路（provider）別の「打ち切りの内訳」（`InvestigationState.limits`・制限そのものは\n変えない計測専用）。\n\n`turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系\nキーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。旧行\n（`answer.limits` キー自体が無い）は全項目0として母数（`turns`）にだけ数える。",
+        "properties": {
+          "auto_continues_total": {
+            "title": "Auto Continues Total",
+            "type": "integer"
+          },
+          "auto_continues_turns": {
+            "title": "Auto Continues Turns",
+            "type": "integer"
+          },
+          "context_compactions_total": {
+            "title": "Context Compactions Total",
+            "type": "integer"
+          },
+          "context_compactions_turns": {
+            "title": "Context Compactions Turns",
+            "type": "integer"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "search_truncated_total": {
+            "title": "Search Truncated Total",
+            "type": "integer"
+          },
+          "search_truncated_turns": {
+            "title": "Search Truncated Turns",
+            "type": "integer"
+          },
+          "synthesis_truncated_turns": {
+            "title": "Synthesis Truncated Turns",
+            "type": "integer"
+          },
+          "tool_result_clipped_total": {
+            "title": "Tool Result Clipped Total",
+            "type": "integer"
+          },
+          "tool_result_clipped_turns": {
+            "title": "Tool Result Clipped Turns",
+            "type": "integer"
+          },
+          "total_budget_hit_turns": {
+            "title": "Total Budget Hit Turns",
+            "type": "integer"
+          },
+          "turns": {
+            "title": "Turns",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider",
+          "turns",
+          "tool_result_clipped_turns",
+          "tool_result_clipped_total",
+          "total_budget_hit_turns",
+          "context_compactions_turns",
+          "context_compactions_total",
+          "synthesis_truncated_turns",
+          "search_truncated_turns",
+          "search_truncated_total",
+          "auto_continues_turns",
+          "auto_continues_total"
+        ],
+        "title": "UsageLimitsByProviderRow",
         "type": "object"
       },
       "UsagePeriod": {

@@ -343,6 +343,27 @@
         </table>
       </div>
 
+      <div class="card" style="overflow-x:auto;margin-bottom:14px">
+        <div class="chart-title">打ち切りの内訳
+          <span class="info-dot" tabindex="0" title="1回の調査〜回答で、内部の制限（1件あたりの結果量・累計の結果量・会話履歴の整理・清書入力・検索結果の件数上限・Codexの自動継続）に実際に当たった回数です。制限そのものはここでは変えていません。Codex 経路は自動継続だけを数え、他の列は API 経路（OpenAI・Ollama・Gemini・Bedrock）のみ計測しています。">ⓘ</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>経路</th>
+              <th class="num">対象ターン数</th>
+              <th class="num">結果切り詰め</th>
+              <th class="num">累計上限到達</th>
+              <th class="num">履歴の整理</th>
+              <th class="num">清書の打ち切り</th>
+              <th class="num">検索の打ち切り</th>
+              <th class="num">自動継続</th>
+            </tr>
+          </thead>
+          <tbody id="limits-tbody"></tbody>
+        </table>
+      </div>
+
       <!-- トークン（F3・2026-07-07／2026-07-08 金額表示は撤去） -->
       <div class="pagehead" style="margin-top:28px">
         <div><h2 style="font-size:var(--text-body);margin:0">トークン</h2>

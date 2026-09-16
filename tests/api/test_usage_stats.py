@@ -703,6 +703,70 @@ def test_usage_stats_stop_kinds_distribution_and_unknown_fallback():
     assert after.get("unknown", 0) - before.get("unknown", 0) == 1
 
 
+def _turn_with_limits(cid, user_text: str, *, lens: str, provider: str | None,
+                      limits: dict | None):
+    """内部制限「打ち切りの内訳」（`InvestigationState.limits`）テスト用の1ターン。`provider` は
+    `answer.usage.provider`（実際の書込は `agents._usage_meta` 経由・ここではテスト用に直書き）・
+    `limits=None` は旧行（キー自体が無い）を模す。"""
+    store.add_message(cid, "user", user_text)
+    answer: dict = {}
+    if provider is not None:
+        answer["usage"] = {"provider": provider}
+    if limits is not None:
+        answer["limits"] = limits
+    store.add_message(cid, "assistant", f"({lens})への回答", lens=lens, answer=answer)
+
+
+def test_usage_stats_limits_aggregates_by_provider_and_ignores_legacy_rows_without_key():
+    """`answer.limits`（内部制限の打ち切り計測・制限そのものは変えない）を provider 別に集計する。
+    キー自体が無い旧行は分母（turns）にだけ数え、各項目は0のまま集計を壊さない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usglmadm{sfx}", f"UsageLmAdm{sfx}"
+    uid, pw = f"usglm{sfx}", f"UsageLm{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"statsworldlm{sfx}"
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _limits_map():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return {row["provider"]: row for row in r.json()["limits"]["by_provider"]}
+
+    before = _limits_map()
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"limits-{sfx}")
+    _turn_with_limits(conv["id"], "q1", lens="qa", provider="codex", limits={
+        "tool_result_clipped": 2, "total_budget_hit": False, "context_compactions": 1,
+        "synthesis_truncated": False, "search_truncated": 3, "auto_continues": 1})
+    _turn_with_limits(conv["id"], "q2", lens="qa", provider="codex", limits={
+        "tool_result_clipped": 0, "total_budget_hit": True, "context_compactions": 0,
+        "synthesis_truncated": True, "search_truncated": 0, "auto_continues": 0})
+    _turn_with_limits(conv["id"], "q3", lens="qa", provider="codex", limits=None)   # 旧行（キー無し）
+
+    after = _limits_map()
+    before_codex = before.get("codex", {})
+    after_codex = after["codex"]
+
+    def _delta(key):
+        return (after_codex.get(key) or 0) - (before_codex.get(key) or 0)
+
+    assert _delta("turns") == 3                        # 旧行も母数には入る
+    assert _delta("tool_result_clipped_turns") == 1     # 1回以上だったターン数（q1のみ）
+    assert _delta("tool_result_clipped_total") == 2     # 合計回数
+    assert _delta("total_budget_hit_turns") == 1        # bool 系（q2のみ）
+    assert _delta("context_compactions_turns") == 1
+    assert _delta("context_compactions_total") == 1
+    assert _delta("synthesis_truncated_turns") == 1
+    assert _delta("search_truncated_turns") == 1
+    assert _delta("search_truncated_total") == 3
+    assert _delta("auto_continues_turns") == 1
+    assert _delta("auto_continues_total") == 1
+
+
 def test_usage_stats_stop_kind_folds_out_of_vocabulary_values_into_unknown():
     """⑳: allowlist（`stop_kind.STOP_KINDS`）外の非 NULL な文字列も 'unknown' へ畳み込む
     （是正前は NULL しか畳まず、語彙外の値がそのまま9値目として出ていた）。バグ/env 誤設定等で

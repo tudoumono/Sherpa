@@ -941,6 +941,33 @@ class UsageConversationRow(BaseModel):
     response_time_avg_ms: float | None
 
 
+class UsageLimitsByProviderRow(BaseModel):
+    """経路（provider）別の「打ち切りの内訳」（`InvestigationState.limits`・制限そのものは
+    変えない計測専用）。
+
+    `turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系
+    キーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。旧行
+    （`answer.limits` キー自体が無い）は全項目0として母数（`turns`）にだけ数える。
+    """
+    provider: str
+    turns: int
+    tool_result_clipped_turns: int
+    tool_result_clipped_total: int
+    total_budget_hit_turns: int
+    context_compactions_turns: int
+    context_compactions_total: int
+    synthesis_truncated_turns: int
+    search_truncated_turns: int
+    search_truncated_total: int
+    auto_continues_turns: int
+    auto_continues_total: int
+
+
+class UsageLimits(BaseModel):
+    """内部制限の打ち切り分布（`usage_stats()["limits"]`）。"""
+    by_provider: list[UsageLimitsByProviderRow]
+
+
 class AdminUsageStatsResponse(BaseModel):
     """GET /admin/usage/stats（store/usage.py::usage_stats）。"""
     users: list[UsageUserRow]
@@ -960,6 +987,7 @@ class AdminUsageStatsResponse(BaseModel):
     stopped_turns: int
     response_time: UsageResponseTime
     conversations_top: list[UsageConversationRow]
+    limits: UsageLimits
 
 
 class UsageChatToolCall(BaseModel):

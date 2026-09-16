@@ -173,6 +173,21 @@ def test_stats_projection_includes_by_user_kind_and_response_time():
     assert out["response_time"] == stats["response_time"]
 
 
+def test_stats_projection_includes_limits():
+    """`usage_stats()["limits"]`（内部制限の打ち切り分布・経路別）をそのまま含める
+    （行数は provider 種別数程度＝`response_time` と同じく上限を設けない）。"""
+    stats = dict(_EMPTY_STATS)
+    stats["limits"] = {"by_provider": [
+        {"provider": "codex", "turns": 5, "tool_result_clipped_turns": 1,
+         "tool_result_clipped_total": 2, "total_budget_hit_turns": 0,
+         "context_compactions_turns": 0, "context_compactions_total": 0,
+         "synthesis_truncated_turns": 0, "search_truncated_turns": 0,
+         "search_truncated_total": 0, "auto_continues_turns": 1, "auto_continues_total": 1},
+    ]}
+    out = U._stats_projection(stats, limit_users=500, limit_tok_users=500, limit_tok_models=200)
+    assert out["limits"] == stats["limits"]
+
+
 def test_stats_projection_includes_conversations_top_summarized_and_limited():
     """2026-09-12-利用統計の拡充2.md §2 (b): `conversations_top` を
     `limit_tok_users` で間引き（`by_user_kind` と同じ考え方）、各行の `kinds` は

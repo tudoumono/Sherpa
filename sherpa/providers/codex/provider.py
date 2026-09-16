@@ -845,6 +845,7 @@ class CodexProvider(Provider):
                       "decision": {"lens": decision["lens"], "input": ctx.message,
                                   "reason": "同一会話の Codex 実行が進行中"}}
                 return
+            _auto_continue_count = 0   # limits（利用統計計測）: Codex を起動しない経路でも参照するため起動条件の外で初期化
             if shutil.which("codex") and ws_authoring is not None and run_dir is not None and _codex_home_ok:
                 # agent_message は run 中に複数届く（作業宣言＋結論）。最後の1件を鵜呑みに
                 # せず全部集めて後で結論を選ぶ（`_pick_codex_headline`）。try の外で初期化＝Popen 失敗の
@@ -1489,6 +1490,10 @@ class CodexProvider(Provider):
                                and _continuation_pending()
                                and _session_persistence_enabled and (thread_id or resume_sid)):
                             break
+                        # limits（利用統計「打ち切りの内訳」計測・制限自体は変えない）: この if を
+                        # 通過＝実際に continuation attempt を1回発行する（`n` は break 前にも
+                        # 束縛されるため、通過した回数だけを別カウンタで数える）。
+                        _auto_continue_count += 1
                         yield _node(f"cx-continue-{n}", "think", "続きを実行",
                                    f"途中経過で止まったため続きを調べます（{n}/{_continue_limit}）", "done")
                         yield from _attempt(
@@ -1724,6 +1729,12 @@ class CodexProvider(Provider):
                     _created_files_failed = True
                     _log.warning("codex created files registration setup failed (run_dir=%s): %s",
                                 run_dir.name, e)
+            # limits（利用統計「打ち切りの内訳」計測・制限自体は変えない）: Codex 経路は MCP 結果を
+            # プロセス内で消費するため探す経路の truncated（search_truncated）はここでは数えない
+            # （API 経路＝agentic_search.py の 3 dialect ループのみ計測・提案書参照）。自動継続だけは
+            # この `run()` 自身が判定しているため数えられる。
+            if _auto_continue_count and isinstance(env, dict):
+                env["limits"] = {**(env.get("limits") or {}), "auto_continues": _auto_continue_count}
             # A2: troubleshoot は Codex が実際に引いた近傍を UI カードにする（_gather 由来を Codex 実調査由来で上書き）。
             _apply_codex_neighbors(env, mcp_neighbors, decision.get("lens") if decision else None)
             # turn.completed から拾った usage は Codex CLI の契約でセッション累計

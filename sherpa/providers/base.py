@@ -103,6 +103,16 @@ def _node(id, kind, label, detail, status):
     return {"type": "node", "id": id, "kind": kind, "label": label, "detail": detail, "status": status}
 
 
+def _prune_empty_limits(env: dict) -> None:
+    """`env["limits"]`（利用統計「打ち切りの内訳」計測用カウンタ）が全項目既定（0/False）のままなら
+    キー自体を落とす——`env["limits"]` はハイブリッド経路では `InvestigationState.limits` への
+    生参照のため、env 組み立て時点ではまだ空でも、この後の清書ダイジェスト呼び出し（
+    synthesis_truncated）で埋まる場合がある。`_result` を yield する直前に1回だけ呼ぶ。"""
+    lim = env.get("limits")
+    if lim is not None and not any(lim.values()):
+        del env["limits"]
+
+
 class _MainReviewInsufficient(RuntimeError):
     """EXT-2b: メイン査読が再調査後もなお根拠不足と判定した honest failure。
 
@@ -221,6 +231,17 @@ def _ingest_sub_final_into_state(state, ev: dict) -> None:
         gap = f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）"
         if gap not in state.gaps:
             state.gaps.append(gap)
+    # limits（利用統計「打ち切りの内訳」計測）: sub ループのローカル `InvestigationState.limits` は
+    # この呼び出し1回限りでしか見えない（`gaps`/`read_evidence` と同じ理由）——回数系は加算・
+    # 当たったか系は OR で親 `state.limits` へ合流する。
+    _sub_limits = ev.get("limits") or {}
+    for _k, _v in _sub_limits.items():
+        if isinstance(_v, bool):
+            if _v:
+                state.mark_limit(_k)
+        elif isinstance(_v, int):
+            if _v:
+                state.bump_limit(_k, _v)
 
 
 def _ctx_with_effective_layer(ctx: Ctx, lens: str) -> Ctx:
@@ -1261,6 +1282,7 @@ class _GenProvider(Provider):
                     "matched_doc_ids": _matched}]
             if state is not None:
                 state.add_tool_result(action, v, result, _cites, _review_structural)
+                agentic_search._record_run_tool_limits(state, action, result)   # 査読の精読も同じ計測
             if review_structural_meta is not None and _review_structural:
                 # 査読が list_docs で得た構造的根拠を正規の `structural_evidence_meta`
                 # へ合流させるための別チャンネル（`state.evidence` は文脈整理・査読入力専用で
@@ -1740,6 +1762,7 @@ class _GenProvider(Provider):
         has_structural_evidence = False
         plan_read_evidence: list = []
         plan_gaps: list = []
+        plan_limits: dict = {}
         structural_evidence_meta: list = []
         sub_outcomes: list = []
         call_budget = None   # EV-0（拡張設計 §4.4）: 帰属呼び出し1回もこの横断予算を共有する
@@ -1763,6 +1786,7 @@ class _GenProvider(Provider):
                 call_budget = ev.get("call_budget")
                 plan_read_evidence = ev.get("read_evidence") or []
                 plan_gaps = ev.get("gaps") or []
+                plan_limits = ev.get("limits") or {}
         if ctx.stop_event is not None and ctx.stop_event.is_set():
             return
         if not searched:
@@ -1864,8 +1888,15 @@ class _GenProvider(Provider):
         completion = _CompletionState(self._natural_completion_reasons)
         # 清書へ確定根拠の全件ダイジェストを渡す（`_personal_facts` と同じ「合成専用の
         # 非公開キー」の流儀）。公開 answer には残さない＝chat_service 側で env から pop する。
-        _synthesis_digest, _ = agentic_search.build_synthesis_digest(
+        _synthesis_digest, _, _synth_truncated = agentic_search.build_synthesis_digest(
             citations, combined_evidence_meta, read_evidence=plan_read_evidence, gaps=plan_gaps)
+        if _synth_truncated:
+            plan_limits = {**plan_limits, "synthesis_truncated": True}
+        # limits（利用統計「打ち切りの内訳」計測・制限自体は変えない）: 各ステップ（sub loop）の
+        # `InvestigationState.limits` は `_run_sub_plan` の集約済み final でしか見えないため、
+        # ここで env へ写す（値が全て既定なら公開 answer にキー自体を作らない）。
+        if plan_limits and any(plan_limits.values()):
+            env["limits"] = dict(plan_limits)
         env["_synthesis_digest"] = _synthesis_digest
         _stream_exc: BaseException | None = None
         if ctx.stop_event is None or not ctx.stop_event.is_set():
@@ -2035,6 +2066,7 @@ class _GenProvider(Provider):
         has_structural_evidence = False   # list_docs の実在確認済み一覧／graph の検証済み card（EXT-2）
         structural_evidence_meta: list = []   # 検証済み list entry/card 裏付け doc の内訳
         agentic_usage = None       # F3: agentic_search がターンを跨いで合算した usage（生トークン・"final" 到達時のみ）。
+        _run_limits: dict = {}    # 非ハイブリッド用スナップショット（"final" 未到達なら既定のまま＝制限0件）。
         # 検索アシスタント: 誰が資料を読んでいるかを思考の流れで分かるようにする——「資料を検索（語句そのまま）」等の
         # ノードがメイン検索時と同じ文言のままだと、回答末尾の使用量を開くまで区別できない。
         # EXT-4（拡張設計 §10・UI 階層表示）: ハイブリッド（単一下調べ役）の全ノードへ `agent_run_id`
@@ -2075,6 +2107,9 @@ class _GenProvider(Provider):
         # どちらもこの状態を使わないため作らない（既存の通常経路は無改修のまま）。
         state = (investigation_state.InvestigationState(question=orig_message, scope={"world": ctx.world})
                 if self._sub is not None else None)
+        # 失敗経路（run() の except が組む honest failure の env）へも当たった制限を渡すための控え
+        # （同じ dict への参照＝以降の加算が自動で見える）。
+        self._last_run_limits = state.limits if state is not None else None
         try:
             for ev in (self._sub_agentic_loop(search_ctx) if self._sub is not None
                       else self._agentic_loop(search_ctx)):
@@ -2105,6 +2140,10 @@ class _GenProvider(Provider):
                     stop_reason = ev.get("stop_reason") or "unknown"
                     has_structural_evidence = ev.get("has_structural_evidence", False)
                     structural_evidence_meta = ev.get("structural_evidence_meta") or []
+                    # 非ハイブリッド（state is None）はこの1回の final がそのまま run 全体の結果
+                    # ＝集約不要でそのまま使う。ハイブリッドは `_ingest_sub_final_into_state` が
+                    # `state.limits` へ合流するのでここでは読み捨てる（`state.limits` を後で使う）。
+                    _run_limits = ev.get("limits") or {}
                     _ingest_sub_final_into_state(state, ev)
                     if ev.get("evaluation_status") is not None:
                         evaluation = {"status": ev.get("evaluation_status"),
@@ -2393,6 +2432,13 @@ class _GenProvider(Provider):
                "sources_verified": sources_verified,   # 出典の2区分表示用（拡張設計 §4.4）
                "scope": sm, "route": {"lens": lens, "reason": decision.get("reason", ""),
                                       "input": decision.get("input", ctx.message)}}
+        # limits（利用統計「打ち切りの内訳」計測・制限自体は変えない）: ハイブリッド（state有り）は
+        # 下調べ役・査読・再調査の全ステップを合流済みの `state.limits`——**同じ dict オブジェクトへの
+        # 参照**を持たせる（この後の清書ダイジェスト呼び出しが synthesis_truncated を追記しても
+        # env 側が自動的に追随する）。非ハイブリッドはこの run 唯一の final が持つ値をそのまま使う。
+        # `_prune_empty_limits`（この後の各 `yield {"type": "_result", ...}` 直前）が、最終的に
+        # 全項目が既定のままならキー自体を落とす。
+        env["limits"] = state.limits if state is not None else dict(_run_limits)
         # agentic ループ（反復ツール検索）で合算した usage を answer メタに乗せる
         #   （メイン回答呼び出し＝ここまでの全ツールターンの合計。intent 分類等の別呼び出しは含めない）。
         # ハイブリッドはループトークンを usage_sub サイドカーへ（answer.usage は主合成
@@ -2424,6 +2470,7 @@ class _GenProvider(Provider):
             ev_node = _evidence_committed_node(combined_evidence_meta)
             if ev_node is not None:
                 env["_evidence_committed"] = ev_node
+            _prune_empty_limits(env)
             yield {"type": "answer_delta", "text": answer}
             yield {"type": "_result", "env": env, "decision": decision}
             return
@@ -2463,9 +2510,11 @@ class _GenProvider(Provider):
         # 「調査が最後まで終わっていない」ことが清書に伝わらず、部分結果を全件と書き得る）。
         if stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS and _BUDGET_GAP not in state.gaps:
             state.gaps.append(_BUDGET_GAP)
-        _synthesis_digest, _ = agentic_search.build_synthesis_digest(
+        _synthesis_digest, _, _synth_truncated = agentic_search.build_synthesis_digest(
             citations, combined_evidence_meta, read_evidence=agentic_search._read_evidence_payload(state),
             gaps=state.gaps)
+        if _synth_truncated:
+            state.mark_limit("synthesis_truncated")
         _synth_env["_synthesis_digest"] = _synthesis_digest
         _stream_exc: BaseException | None = None
         if ctx.stop_event is None or not ctx.stop_event.is_set():
@@ -2548,6 +2597,7 @@ class _GenProvider(Provider):
         ev_node = _evidence_committed_node(combined_evidence_meta, adopted_ev_ids)
         if ev_node is not None:
             env["_evidence_committed"] = ev_node
+        _prune_empty_limits(env)
         yield _node("brain", "think", f"考える（{self.label}）", "回答しました", "done")
         yield {"type": "_result", "env": env, "decision": decision}
 
@@ -2627,6 +2677,9 @@ class _GenProvider(Provider):
                                                       else "error")),
                               "scope": layer_mod.scope_with_layer(
                                   ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
+                        _lim = getattr(self, "_last_run_limits", None)
+                        if _lim and any(_lim.values()):
+                            env["limits"] = dict(_lim)     # 失敗ターンも当たった制限を計測に載せる
                         yield {"type": "_result", "env": env,
                               "decision": {"lens": decision.get("lens", "qa"), "input": ctx.message,
                                           "reason": "下調べAIの失敗"}}
