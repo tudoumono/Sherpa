@@ -240,5 +240,8 @@ azure-smoke:        ## Azure OpenAI（等の OpenAI 互換接続先）への実�
 doctor:            ## 導入先の統合セットアップ検査（ストア疎通/ES版+kuromoji/設定/LLM最小プローブ/Codex経路・読み取り専用）。PROBE_CLOUD=1 で課金プロバイダの実接続も確認
 	PROBE_CLOUD="$(PROBE_CLOUD)" ./scripts/doctor.sh
 
+diag:              ## 解析用のログ回収バンドルを作る（機密を含めない・dist/diag/）。ARGS で --days/--out 等を渡せる
+	./scripts/diag.sh $(ARGS)
+
 nuke:              ## 完全初期化（ストア＋派生物＋個人領域＋OCR観測を消去。資料フォルダと .env は残す。YES=1 で確認省略）
 	YES="$(YES)" ./scripts/nuke.sh

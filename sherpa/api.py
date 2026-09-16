@@ -1126,7 +1126,7 @@ def _start_poller():
                     except (background.ConflictError, background.ShuttingDownError):
                         continue                          # 他の操作が実行中/終了処理中＝今回はスキップ
                     except Exception as e:
-                        log.warning("poll sync failed for %s: %s", wid, e)
+                        log.warning("poll sync failed: world=%s err=%s", wid, e)
             except Exception as e:
                 log.warning("poll loop error: %s", e)
             # W4: 個人 workspace の TTL 掃除＋孤児 GC も定期実行（起動時のみ→定期化）。

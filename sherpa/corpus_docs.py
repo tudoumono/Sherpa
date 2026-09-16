@@ -472,13 +472,13 @@ def last_run_flags(world: str, *, deadline: float | None = None) -> list | None:
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _log.warning("last_run_flags(%s): 呼び出し時点で既に期限切れのため直近 run を確認しません", world)
+            _log.warning("last_run_flags: world=%s 呼び出し時点で既に期限切れのため直近 run を確認しません", world)
             return None
         kwargs = {"connect_timeout": remaining, "statement_timeout_ms": max(1, int(remaining * 1000))}
     try:
         last = store.get_latest_run_summary(world, **kwargs)
     except Exception as e:
-        _log.warning("last_run_flags(%s): 直近 ingest run の取得に失敗しました: %s", world, e)
+        _log.warning("last_run_flags: world=%s 直近 ingest run の取得に失敗しました: %s", world, e)
         return None
     snap = (last or {}).get("extraction_snapshot")
     snap = snap if isinstance(snap, dict) else {}
