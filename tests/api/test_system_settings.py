@@ -2258,6 +2258,35 @@ def test_admin_settings_embed_parallel_rejects_invalid_values(bad):
     assert "embed_parallel" not in store.get_system_settings()
 
 
+def test_admin_settings_max_review_rounds_roundtrip():
+    """DEPTH-2 S5: 「最大」の深さが許す査読の巡数（設定は 1 項目だけ・既定 7・`embed_parallel`
+    と同型）。標準 0・深く 2 はコード固定のため設定に現れない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"max_review_rounds": 3})
+    assert response.status_code == 200, response.text
+    assert response.json()["max_review_rounds"]["effective"] == 3
+    assert store.get_system_settings()["max_review_rounds"] == 3
+    # 他の項目の部分更新で保存値が消えない。
+    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
+    assert response.json()["max_review_rounds"]["configured"] == 3
+    response = admin.put("/admin/settings", json={"max_review_rounds": None})
+    assert response.status_code == 200, response.text
+    rounds = response.json()["max_review_rounds"]
+    assert rounds["configured"] is None and rounds["effective"] == rounds["default"] == 7
+
+
+@pytest.mark.parametrize("bad", [0, -1, 33, True, "3", 1.5])
+def test_admin_settings_max_review_rounds_rejects_invalid_values(bad):
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"max_review_rounds": bad})
+    assert response.status_code == 422, response.text
+    assert "max_review_rounds" not in store.get_system_settings()
+
+
 @pytest.mark.parametrize("field,bad", [
     ("depth_base_max_turns", 0), ("depth_base_max_turns", 500),
     ("depth_base_grep_max_hits", 0), ("depth_base_read_window", 5),

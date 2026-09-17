@@ -94,17 +94,24 @@ def _install_post(seq, bodies=None):
 
 
 def _sub_run_seq():
-    """下調べ1周分の _post 応答（list_docs → 散文終了＝構造 Evidence で根拠ゲートを通す）。"""
+    """下調べ1周分の _post 応答（list_docs → 散文終了＝構造 Evidence で根拠ゲートを通す →
+    DEPTH-2 S4b: 一次判断の要求に空の `claims` を返す＝呼び出し回数だけ整合させ `state.claims` へは
+    何も伝播しない・下の個別テストの `_synth_prompts`/`data["claims"]` 期待を変えない）。"""
     return [
         {"choices": [{"message": {"content": "", "tool_calls": [
             {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
         {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]},
+        {"choices": [{"message": {"content": '{"claims": []}'}}]},
     ]
 
 
-def _mk(responses):
+def _mk(responses, max_review_rounds=None):
+    """`max_review_rounds`（省略可）: 「最大」プロファイルの巡数（system_settings の 1 項目・
+    既定 7）をテスト用に短くする。標準／深くは深さ側で固定のため渡さない。"""
     p = _ReviewSynth("sk-dummy", "gpt-5.5", responses=responses)
     p._sub = dict(_SUB)
+    if max_review_rounds is not None:
+        p._system_settings = {"max_review_rounds": max_review_rounds}
     return p
 
 
@@ -118,7 +125,7 @@ def test_standard_profile_skips_review():
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
         assert len(p._synth_prompts) == 1
-        assert not any(e.get("id") == "main-review" for e in events)
+        assert not any(str(e.get("id") or "").startswith("main-review") for e in events)
     finally:
         A._post = orig
 
@@ -138,12 +145,12 @@ def test_deep_insufficient_once_reruns_with_missing_axes():
         assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
         # 査読2回＋合成1回
         assert len(p._synth_prompts) == 3
-        assert "査読者" in p._synth_prompts[0]
+        assert "評価役" in p._synth_prompts[0] and "統括役" in p._synth_prompts[0]
         # 再実行の下調べへ不足軸が伝わる
         rerun_payload = str(bodies[2:])
         assert "前回の調査で不足していた観点" in rerun_payload
         assert "税率の適用開始日" in rerun_payload
-        reviews = [e for e in events if e.get("id") == "main-review"]
+        reviews = [e for e in events if str(e.get("id") or "").startswith("main-review")]
         assert any("調べ直します" in (e.get("detail") or "") for e in reviews)
         assert any("答えられる" in (e.get("detail") or "") for e in reviews)
     finally:
@@ -170,7 +177,7 @@ def test_deep_missing_axes_truncated_at_2000_chars_with_notice():
         rerun_payload = str(bodies[2:])
         assert expected_missing in rerun_payload
         assert long_missing not in rerun_payload   # 全文はそのまま渡さない（無言切断ではなく明示された2,000字）
-        reviews = [e for e in events if e.get("id") == "main-review"]
+        reviews = [e for e in events if str(e.get("id") or "").startswith("main-review")]
         assert any(expected_missing in (e.get("detail") or "") for e in reviews)
     finally:
         A._post = orig
@@ -239,13 +246,16 @@ def test_metering_records_initial_and_rerun_runs(monkeypatch):
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
                                "depth_profile": "deep"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
-        # M-2是正: dict 集約（後勝ち）だけだと同じ kind の二重記録を見逃す——record 呼び出し自体が
-        # ちょうど2回（chat-sub 1回＋chat-review 1回）であることも独立に確認する。
-        assert len(recorded) == 2
-        by_kind = {a[0]: kw for a, kw in recorded}
+        # M-2是正: dict 集約（後勝ち）だけだと同じ kind の二重記録を見逃す——正本の kind
+        # （chat-sub／chat-review）がちょうど1行ずつであることも独立に確認する。
+        # DEPTH-2 S5: 巡別記録（chat-round・表示用）は巡ごとに別途1行ずつ増える。
+        _canon = [(a, kw) for a, kw in recorded if a[0] != "chat-round"]
+        assert len(_canon) == 2
+        by_kind = {a[0]: kw for a, kw in _canon}
         assert set(by_kind) == {"chat-sub", "chat-review"}
-        # 初回2 POST＋再調査2 POST＝総4 calls（最後の実行分だけだと2になる）
-        assert by_kind["chat-sub"]["calls"] == 4
+        # 初回3 POST（list_docs＋散文＋DEPTH-2 S4b 一次判断）＋再調査3 POST＝総6 calls
+        # （最後の実行分だけだと3になる）
+        assert by_kind["chat-sub"]["calls"] == 6
         # 査読は不足→再調査で2回発動（初回査読＋再査読）。
         assert by_kind["chat-review"]["calls"] == 2
     finally:
@@ -253,7 +263,8 @@ def test_metering_records_initial_and_rerun_runs(monkeypatch):
 
 
 def test_stop_during_review_aborts_without_synthesis():
-    """M3: 査読ストリーム中の停止要求で清書へ進まない（_result も出さない）。"""
+    """M3/DEPTH-2 S5: 査読ストリーム中の停止要求で清書へ進まない。停止終端（`TERMINALS` の
+    "stopped"）として、追加の LLM 呼び出しをせずコードで組んだ未完了回答の `_result` を返す。"""
     import threading
     stop = threading.Event()
 
@@ -275,7 +286,10 @@ def test_stop_during_review_aborts_without_synthesis():
                                "depth_profile": "deep"},
                    stop_event=stop)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
-        assert not any(e.get("type") == "_result" for e in events)
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["_terminal"] == "stopped"
+        assert result["env"]["stopped_by_user"] is True
+        assert "打ち切りました" in result["env"]["headline"]
         assert not any(e.get("type") == "answer_delta" for e in events)
         assert len(p._synth_prompts) == 1   # 査読1回のみ・合成は発行しない
     finally:
@@ -287,12 +301,12 @@ def test_budget_exhausted_rerun_stops_review_loop():
     # 再調査はツール呼び出しだけを guard["max_turns"]=6 回返して turns_exhausted で終わる
     rerun_exhaust = [{"choices": [{"message": {"content": "", "tool_calls": [
         {"id": f"c{i}", "function": {"name": "list_docs", "arguments": "{}"}}]}}]}
-        for i in range(20)]   # max profile は max_turns が 6×3=18 へ倍率適用される（SC-6c）＋余裕
+        for i in range(20)]
     orig = _install_post(_sub_run_seq() + rerun_exhaust)
     try:
         p = _mk(['{"sufficient": false, "missing": "適用範囲"}', "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "max"})   # max=2回許容でも予算打ち切りで1回で止まる
+                               "depth_profile": "max"})   # max=複数巡でも予算打ち切りで1巡で止まる
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
@@ -461,7 +475,7 @@ def test_review_read_around_feeds_result_into_final_verdict():
         '{"sufficient": true, "missing": ""}'])
     verdict, nodes, usage = p._sufficiency_verdict(
         "TAX-RATEは?", "qa", "(なし)", "v1", scope_paths=[], layer=None)
-    assert verdict == {"sufficient": True, "missing": ""}
+    assert verdict == {"verdict": "sufficient", "sufficient": True, "missing": "", "missing_codes": [], "findings": None}
     assert len(nodes) == 1
     assert nodes[0]["detail"] == f"原文を確かめています: {_REVIEW_DOC}"
     assert len(p._synth_prompts) == 2
@@ -469,7 +483,9 @@ def test_review_read_around_feeds_result_into_final_verdict():
     # ため、本文専用の文字列（ファイル3行目）でアサートする。
     assert "ツール結果" in p._synth_prompts[1] and "税率に関する法令上の規約" in p._synth_prompts[1]
     assert "省略" not in p._synth_prompts[1]   # 上限（8,000字）未満なので打ち切り注記を付けない
-    assert usage == {"calls": 2, "tokens": None}   # スタブは _last_usage を更新しない＝報告不能扱い
+    # スタブは _last_usage を更新しない＝報告不能扱い。`roles` は巡別記録（chat-round）専用の内訳。
+    assert {k: v for k, v in usage.items() if k != "roles"} == {"calls": 2, "tokens": None}
+    assert set(usage["roles"]) == {"orchestrator", "evaluator"}
 
 
 def test_review_read_result_truncated_at_8000_chars_with_notice(monkeypatch):
@@ -482,7 +498,7 @@ def test_review_read_result_truncated_at_8000_chars_with_notice(monkeypatch):
         '{"sufficient": true, "missing": ""}'])
     verdict, nodes, usage = p._sufficiency_verdict(
         "TAX-RATEは?", "qa", "(なし)", "v1", scope_paths=[], layer=None)
-    assert verdict == {"sufficient": True, "missing": ""}
+    assert verdict == {"verdict": "sufficient", "sufficient": True, "missing": "", "missing_codes": [], "findings": None}
     full_result_text = json.dumps(big_result, ensure_ascii=False)
     omitted = len(full_result_text) - PB._REVIEW_READ_MAX_CHARS
     expected_tail = full_result_text[:PB._REVIEW_READ_MAX_CHARS] + f"（以降 {omitted} 字省略）"
@@ -498,11 +514,12 @@ def test_review_read_cap_forces_verdict():
     p = _ReviewSynth("sk-dummy", "gpt-5.5", responses=responses)
     verdict, nodes, usage = p._sufficiency_verdict(
         "TAX-RATEは?", "qa", "(なし)", "v1", scope_paths=[], layer=None)
-    assert verdict == {"sufficient": False, "missing": "適用範囲"}
+    assert verdict == {"verdict": "insufficient", "sufficient": False, "missing": "適用範囲",
+                       "missing_codes": [], "findings": None}
     assert len(nodes) == 4                       # 実際にツールを呼んだのは上限の4回だけ
     assert len(p._synth_prompts) == 6            # 4読み取り＋超過要求1回＋強制確定1回
     assert "これ以上は読み取れません" in p._synth_prompts[5]
-    assert usage == {"calls": 6, "tokens": None}
+    assert {k: v for k, v in usage.items() if k != "roles"} == {"calls": 6, "tokens": None}
 
 
 def test_review_read_cap_exceeded_twice_fails_open():
@@ -530,7 +547,7 @@ def test_review_tool_execution_failure_fails_open(monkeypatch):
         "TAX-RATEは?", "qa", "(なし)", "v1", scope_paths=[], layer=None)
     assert verdict is None
     assert nodes == []
-    assert usage == {"calls": 1, "tokens": None}
+    assert {k: v for k, v in usage.items() if k != "roles"} == {"calls": 1, "tokens": None}
 
 
 def test_review_usage_recorded_via_metering(monkeypatch):
@@ -564,6 +581,171 @@ def test_review_usage_recorded_via_metering(monkeypatch):
         A._post = orig
 
 
+# ---- DEPTH-2 S1（主張構造での部分回答・docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5） ----
+
+def test_claims_synthesis_preserves_partial_answer_after_reruns_exhausted():
+    """再調査を尽くしてもなお不足のとき、確定/不明が混在する主張構造が得られれば、固定文言では
+    なく通常の清書（構造から書く）へ進む——headline は清書結果のまま・envelope に区分と
+    理由コードが残る。"""
+    bodies = []
+    orig = _install_post(_sub_run_seq() + _sub_run_seq() + _sub_run_seq(), bodies)
+    try:
+        claims_json = json.dumps({"claims": [
+            {"id": "c1", "status": "confirmed", "text": "標準税率は10%です。",
+             "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""},
+            {"id": "c2", "status": "unknown", "text": "軽減税率の適用開始日は資料からは確認できません。",
+             "evidence_refs": [], "reason": "", "reason_code": "not_found_in_scope"},
+        ]}, ensure_ascii=False)
+        p = _mk([
+            '{"sufficient": false, "missing": "適用範囲その1"}',
+            '{"sufficient": false, "missing": "適用範囲その2"}',
+            '{"sufficient": false, "missing": "適用範囲その3"}',
+            claims_json,
+            "PARTIAL ANSWER WITH CONFIRMED AND UNKNOWN CLAIMS",
+        ], max_review_rounds=3)
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "max"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "PARTIAL ANSWER WITH CONFIRMED AND UNKNOWN CLAIMS"
+        assert "十分な根拠を確認できませんでした" not in result["env"]["headline"]
+        claims = result["env"]["data"]["claims"]
+        assert {c["status"] for c in claims} == {"confirmed", "unknown"}
+        unknown = next(c for c in claims if c["status"] == "unknown")
+        assert unknown["reason_code"] == "not_found_in_scope"
+        # 清書プロンプトにも主張構造が渡る（構造から書く・§2.5）。
+        assert "主張の構造" in p._synth_prompts[-1]
+        reviews = [e for e in events if str(e.get("id") or "").startswith("main-review")]
+        assert any("部分回答を構成" in (e.get("label") or "") for e in reviews)
+        assert any("答えられる部分だけを構造化" in (e.get("detail") or "") for e in reviews)
+    finally:
+        A._post = orig
+
+
+def test_claims_confirmed_referencing_only_unmappable_evidence_is_honest_failure():
+    """RV是正2巡目 指摘(1): confirmed の evidence_refs が `state.evidence` 内では実在する ID
+    （`set_claims` を通る）でも、それが read（原本精読・Evidence Packet に写像先が無い種別）
+    しか指していなければ、`resolve_claim_evidence_ids` 変換後に evidence_refs=[] になる——
+    このまま清書・共有へ渡ると「確定（根拠参照なし）」になるため、claims 全体を不正として
+    honest failure（`_MainReviewInsufficient`）へ戻す（inferred/unknown は対象外・別テストで確認）。
+
+    再現: 査読自身の read_around（round1）が state に kind="read" の証拠を1件だけ足す
+    （ev-2・sub 側 list_docs の ev-1 は構造的根拠なので写像できるが参照しない）。主張構造の
+    生成が ev-2 だけを参照する confirmed を返す——`set_claims` は ev-2 が state 内に実在するため
+    受理するが、Evidence Packet への変換で refs が空になる。"""
+    bodies = []
+    orig = _install_post(_sub_run_seq() + _sub_run_seq(), bodies)
+    try:
+        claims_json = json.dumps({"claims": [
+            {"id": "c1", "status": "confirmed", "text": "精読した本文にある記述です。",
+             "evidence_refs": ["ev-2"], "reason": "", "reason_code": ""},
+        ]}, ensure_ascii=False)
+        p = _mk([
+            f'{{"action": "read_around", "doc_id": "{_REVIEW_DOC}", "line": 3}}',
+            '{"sufficient": false, "missing": "適用範囲その1"}',
+            '{"sufficient": false, "missing": "適用範囲その2"}',
+            claims_json,
+        ])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        with pytest.raises(PB._MainReviewInsufficient):
+            list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+    finally:
+        A._post = orig
+
+
+def test_claims_synthesis_call_counted_in_chat_review_metering():
+    """主張構造の生成呼び出しも `_sufficiency_verdict` と同じ chat-review 種別へ合算される
+    （新しい usage 種別は作らない・既存の usage 計上を変えない）。"""
+    from sherpa import metering
+    recorded = []
+
+    def _record(*a, **kw):
+        recorded.append((a, kw))
+    orig_record = metering.record
+    metering.record = _record
+    orig = _install_post(_sub_run_seq() + _sub_run_seq() + _sub_run_seq())
+    try:
+        claims_json = json.dumps({"claims": [
+            {"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+             "reason": "", "reason_code": ""}]}, ensure_ascii=False)
+        p = _mk([
+            '{"sufficient": false, "missing": "a"}',
+            '{"sufficient": false, "missing": "b"}',
+            '{"sufficient": false, "missing": "c"}',
+            claims_json,
+            "PARTIAL ANSWER",
+        ], max_review_rounds=3)
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "max"})
+        list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        by_kind = {a[0]: kw for a, kw in recorded}
+        assert set(by_kind) == {"chat-sub", "chat-review", "chat-round"}   # chat-round＝巡別記録（表示用）
+        # 査読3回（不足×3）＋主張構造の生成1回＝4。
+        assert by_kind["chat-review"]["calls"] == 4
+    finally:
+        A._post = orig
+        metering.record = orig_record
+
+
+def test_claims_synthesis_truncated_json_is_not_success():
+    """途中で切れた（不正な）JSON は成功扱いにしない（`_claims_synthesis` 単体）。"""
+    p = _ReviewSynth("sk-dummy", "gpt-5.5",
+                     responses=['{"claims": [{"id": "c1", "status": "confirmed", "text": "t"}'])
+    claims, usage = p._claims_synthesis("質問", "digest")
+    assert claims is None
+    assert {k: v for k, v in usage.items() if k != "roles"} == {"calls": 1, "tokens": None}
+
+
+# ===== RV C6（docs/rv/2026-09-17-DEPTH-2.md）: `_claims_synthesis` の停止窓 =====
+
+def test_claims_synthesis_skips_call_when_already_stopped():
+    """停止済みなら `_stream` を1回も発行しない（単一 worker で他利用者を待たせない・
+    `_sufficiency_verdict` と同じ発行前チェック）。"""
+    import threading
+    stop = threading.Event()
+    stop.set()
+    p = _ReviewSynth("sk-dummy", "gpt-5.5", responses=['{"claims": []}'])
+    claims, usage = p._claims_synthesis("質問", "digest", stop_event=stop)
+    assert claims is None and usage is None
+    assert p._synth_prompts == []   # 発行していない
+
+
+def test_claims_synthesis_aborts_mid_stream_on_stop_event():
+    """chunk 受信中に停止要求が来たら、残りの chunk を待たずに打ち切る。"""
+    import threading
+    stop = threading.Event()
+
+    class _StopMidStream(_ReviewSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            yield '{"claims": '
+            stop.set()
+            yield '[]}'   # 打ち切り後は読まれないはず
+
+    p = _StopMidStream("sk-dummy", "gpt-5.5")
+    claims, usage = p._claims_synthesis("質問", "digest", stop_event=stop)
+    assert claims is None
+    assert {k: v for k, v in usage.items() if k != "roles"} == {"calls": 1, "tokens": None}
+
+
+def test_deep_still_insufficient_with_broken_claims_json_stays_honest_failure():
+    """再調査を尽くし、主張構造の生成も不正な JSON で失敗すれば、従来どおり固定文言の
+    honest failure（`_MainReviewInsufficient`）に落ちる——途中で切れた JSON を部分回答の
+    採用条件として通さない。"""
+    orig = _install_post(_sub_run_seq() + _sub_run_seq())
+    try:
+        p = _mk(['{"sufficient": false, "missing": "適用範囲"}',
+                 '{"sufficient": false, "missing": "適用範囲"}',
+                 '{"claims": [{"id": "c1", "status": "confirmed", "text": "t"}'])   # 途中で切れた主張JSON
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        with pytest.raises(RuntimeError, match="insufficient"):
+            list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+    finally:
+        A._post = orig
+
+
 def test_review_stop_event_during_read_loop_aborts_immediately(monkeypatch):
     """(e) stop_event はループ先頭でも観測する＝読み取り後の次呼び出しへは進まない。"""
     import threading
@@ -585,3 +767,912 @@ def test_review_stop_event_during_read_loop_aborts_immediately(monkeypatch):
     assert verdict is None
     assert len(nodes) == 1              # 読み取りは1回だけ実行された
     assert len(p._synth_prompts) == 1   # 2回目の _stream（確定判定の消費）は発行されない
+
+
+# ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
+# worker（下調べ役）の一次判断 =====
+
+def test_worker_primary_judgment_not_exposed_in_standard_depth_without_claims():
+    """標準（既定・evaluator の巡は 0）で下調べ役が一次判断を返さなければ、確認は行われず
+    （`main-review` ノードも無し）、data["claims"] にも清書のダイジェストにも主張は出ない——
+    根拠（citations／構造的根拠）は従来どおり通常に渡る。"""
+    orig = _install_post(_sub_run_seq())   # 一次判断は空の `claims`
+    try:
+        p = _mk(["CLOUD SYNTH ANSWER"])   # standard（既定）
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert "claims" not in result["env"]["data"]
+        assert len(p._synth_prompts) == 1   # 確認は発行されない＝清書1回だけ
+        assert "【主張の構造（確定/推定/不明）】" not in p._synth_prompts[-1]
+        assert "対象文書は34件です。" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_worker_primary_judgment_discarded_on_review_fail_open():
+    """C15/#25 是正: 査読が fail-open（応答が JSON でない等で verdict=None）で終わったターンは、
+    査読の判定を一度も得ていない——`_review_ran` は真にならず、worker の一次判断は清書・公開へ
+    渡らない（根拠だけで清書は通常どおり進む）。"""
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk(["これは JSON ではありません", "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert "claims" not in result["env"]["data"]
+        assert "標準税率は10%です。" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_worker_primary_judgment_discarded_when_rerun_claims_unreviewed_before_budget_stop():
+    """C16 是正: 初回査読が不足と判定し、再調査で worker の一次判断が更新されるが、再調査自体が
+    調査予算（turns_exhausted）で打ち切られて次の査読へ進まない——更新後の一次判断は一度も
+    判定を通っていないため、清書・公開へ渡らない（前回の査読実績を使い回さない）。"""
+    _SUB_MAX_TURNS = _SUB["guard"]["max_turns"]
+    rerun_exhaust = [{"choices": [{"message": {"content": "", "tool_calls": [
+        {"id": f"c{i}", "function": {"name": "list_docs", "arguments": "{}"}}]}}]}
+        for i in range(_SUB_MAX_TURNS)]
+    rerun_claims_json = json.dumps({"claims": [
+        {"id": "c1", "status": "confirmed", "text": "標準税率は11%に改定されました。",
+         "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}]}, ensure_ascii=False)
+    orig = _install_post(
+        _sub_run_claims_seq("標準税率は10%です。")
+        + rerun_exhaust + [{"choices": [{"message": {"content": rerun_claims_json}}]}])
+    try:
+        p = _mk(['{"sufficient": false, "missing": "税率の適用開始日"}', "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert "claims" not in result["env"]["data"]
+        assert "標準税率は10%です。" not in p._synth_prompts[-1]
+        assert "標準税率は11%に改定されました。" not in p._synth_prompts[-1]
+        assert len(p._synth_prompts) == 2   # 査読1回（不足判定）＋合成1回（再査読なし）
+    finally:
+        A._post = orig
+
+
+def test_worker_claims_truncated_json_stays_empty_and_proceeds():
+    """(2) 主張 JSON が途中で切れた/不正なら claims は空のまま、根拠（list_docs の構造的根拠）
+    だけで従来どおり進む（失敗に倒れない・headline は通常どおり清書結果になる）。"""
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]},
+        # 途中で切れた JSON（`_claims_synthesis`/`_claims_truncated` 系テストと同型の壊れ方）。
+        {"choices": [{"message": {"content": '{"claims": [{"id": "c1", "status": "confirmed", "text": "t"}'}}]},
+    ]
+    orig = _install_post(seq)
+    try:
+        p = _mk(["CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert "claims" not in result["env"]["data"]
+        # 【主張の構造（確定/推定/不明）】節（`_claims_digest` 非空のときだけ付加）が出ていない
+        # ことを確認する（固定の指示文自体には「主張の構造」という語が含まれるため見出し全体で見る）。
+        assert "【主張の構造（確定/推定/不明）】" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_main_review_prompt_includes_worker_primary_judgment():
+    """(3) メイン査読の入力に worker の一次判断が含まれる（プロンプト文字列で確認・
+    鵜呑みにせず必要箇所は自分で確認する指示も併記される）。"""
+    from sherpa import investigation_state as IS
+    state = IS.InvestigationState(question="TAX-RATEは?", scope={"world": "v1"})
+    state.add_tool_result("ripgrep_search", {"query": "a"}, {"hits": [{"doc_id": "a.md"}]},
+                          [{"doc_id": "a.md", "span": [1, 1], "quote": "A"}], None)
+    assert state.set_claims(
+        [{"id": "c1", "status": "confirmed", "text": "標準税率は10%です。",
+          "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}], origin="worker") is True
+    assert state.claims[0].origin == "worker"
+
+    p = _ReviewSynth("sk-dummy", "gpt-5.5", responses=['{"sufficient": true, "missing": ""}'])
+    verdict, nodes, usage = p._sufficiency_verdict(
+        "TAX-RATEは?", "qa", "(なし)", "v1", scope_paths=[], layer=None, state=state)
+    assert verdict == {"verdict": "sufficient", "sufficient": True, "missing": "", "missing_codes": [], "findings": None}
+    assert "下調べ役の一次判断" in p._synth_prompts[0]
+    assert "標準税率は10%です。" in p._synth_prompts[0]
+    assert "鵜呑みにせず" in p._synth_prompts[0]
+
+
+def test_worker_claims_call_counted_as_extra_chat_sub_call_when_review_runs(monkeypatch):
+    """#26 是正: 査読が走る深さ（deep）では下調べ役の一次判断の要求も chat-sub の呼び出し回数に
+    含まれる（黙って増えない）。"""
+    from sherpa import metering
+    recorded = []
+    monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]},
+        {"choices": [{"message": {"content": '{"claims": []}'}}]},
+    ]
+    orig = _install_post(seq)
+    try:
+        p = _mk(['{"sufficient": true, "missing": ""}', "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        by_kind = {a[0]: kw for a, kw in recorded}
+        # list_docs（1）＋散文終了（2）＋一次判断の要求（3）＝3。
+        assert by_kind["chat-sub"]["calls"] == 3
+    finally:
+        A._post = orig
+
+
+def test_worker_claims_call_issued_in_standard_depth(monkeypatch):
+    """標準（巡 0）でも下調べ役は一次判断を返す（orchestrator の確認 1 回を通して清書へ渡る
+    ため）＝chat-sub は list_docs＋散文終了＋一次判断の要求の3回になる。"""
+    from sherpa import metering
+    recorded = []
+    monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
+    orig = _install_post(_sub_run_seq())
+    try:
+        p = _mk(["CLOUD SYNTH ANSWER"])
+        ctx = _ctx()   # 既定＝standard
+        list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        by_kind = {a[0]: kw for a, kw in recorded}
+        assert by_kind["chat-sub"]["calls"] == 3
+    finally:
+        A._post = orig
+
+
+# ===== S4b 敵対 RV 1 巡目 是正（docs/rv/2026-09-17-DEPTH-2.md C13/C14） =====
+
+def _sub_run_claims_seq(claim_text: str):
+    """`_sub_run_seq()` と同型だが一次判断の要求に list_docs 由来の構造的根拠（ev-1）を参照する
+    有効な confirmed 主張を返す（C13/C14 是正テスト用）。"""
+    return _sub_run_claims_seq_ids([("c1", claim_text)])
+
+
+def _sub_run_claims_seq_ids(id_text_pairs: list[tuple[str, str]]):
+    """`_sub_run_claims_seq` の複数主張版——1回の一次判断要求が複数 id の confirmed を返す
+    （#24 是正テスト用: 同じ id は置換・別 id は追記の検証に使う）。"""
+    claims_json = json.dumps({"claims": [
+        {"id": cid, "status": "confirmed", "text": text,
+         "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}
+        for cid, text in id_text_pairs]}, ensure_ascii=False)
+    return [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]},
+        {"choices": [{"message": {"content": claims_json}}]},
+    ]
+
+
+def test_worker_primary_judgment_replaces_same_id_and_appends_new_axis():
+    """#24 是正: 再調査（deep=1回・査読を通す）で worker が返す一次判断のうち、初回分と**同じ
+    元 id**（"c1"）は再調査分の内容へ置換し（言い直しを新旧そろって confirmed で残さない）、
+    初回にしか無い別軸（"c2"）はそのまま維持したうえで再調査分を追記する。"""
+    bodies = []
+    orig = _install_post(
+        _sub_run_claims_seq_ids([("c1", "標準税率は10%です。"), ("c2", "軽減税率は8%です。")])
+        + _sub_run_claims_seq_ids([("c1", "標準税率は11%に改定されました。")]), bodies)
+    try:
+        p = _mk([
+            '{"sufficient": false, "missing": "税率の適用開始日"}',
+            '{"sufficient": true, "missing": ""}',
+            "CLOUD SYNTH ANSWER",
+        ])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        claims = result["env"]["data"]["claims"]
+        assert len(claims) == 2   # c1（置換後）＋c2（別軸・維持）
+        ids = [c["id"] for c in claims]
+        assert len(ids) == len(set(ids))   # id が衝突しない
+        texts = {c["text"] for c in claims}
+        # 同じ id（c1）の言い直しは最新（11%）だけが残り、初回分（10%）は残らない。
+        assert texts == {"標準税率は11%に改定されました。", "軽減税率は8%です。"}
+        assert all(c["evidence_refs"] for c in claims)
+        assert "標準税率は11%に改定されました。" in p._synth_prompts[-1]
+        assert "軽減税率は8%です。" in p._synth_prompts[-1]
+        assert "標準税率は10%です。" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_worker_primary_judgment_kept_when_reinvestigation_claims_invalid():
+    """RV #18 是正: 初回は有効な worker 一次判断（10%）を返すが、再調査では途中で切れた不正な
+    JSON を返す——今回（不正）の回は取り込まず、初回分（10%）をそのまま維持して清書へ渡る
+    （旧い一次判断を居残らせないためと言って、不正な回のせいで有効な既存分まで消さない）。"""
+    bodies = []
+    seq = _sub_run_claims_seq("標準税率は10%です。") + [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]},
+        {"choices": [{"message": {"content": '{"claims": [{"id": "c1", "status": "confirmed", "text": "t"}'}}]},
+    ]
+    orig = _install_post(seq, bodies)
+    try:
+        p = _mk([
+            '{"sufficient": false, "missing": "税率の適用開始日"}',
+            '{"sufficient": true, "missing": ""}',
+            "CLOUD SYNTH ANSWER",
+        ])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        claims = result["env"]["data"]["claims"]
+        assert len(claims) == 1
+        assert claims[0]["text"] == "標準税率は10%です。"
+        assert "標準税率は10%です。" in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_worker_confirmed_referencing_only_unmappable_evidence_is_dropped_not_honest_failure():
+    """C14 是正: worker（下調べ役）が read_around 精読だけを参照する confirmed を返すと、
+    Evidence Packet への変換後に evidence_refs=[] になるのは synthesis 由来のケース
+    （`test_claims_confirmed_referencing_only_unmappable_evidence_is_honest_failure`）と同じだが、
+    worker 由来は「入力側」なので honest failure に倒さず、主張構造ごと不採用（claims 空）にして
+    根拠（読み取った本文そのもの）だけで清書まで進む。"""
+    claims_json = json.dumps({"claims": [
+        {"id": "c1", "status": "confirmed", "text": "精読した本文にある記述です。",
+         "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}]}, ensure_ascii=False)
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "read_around",
+             "arguments": json.dumps({"doc_id": _REVIEW_DOC, "line": 3})}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]},
+        {"choices": [{"message": {"content": claims_json}}]},
+    ]
+    orig = _install_post(seq)
+    try:
+        # standard（既定）＝確認1回（十分と判定）を通った一次判断でも、Evidence Packet へ
+        # 写像できない根拠だけを参照する confirmed は不採用になる。
+        p = _mk(['{"verdict": "sufficient", "missing": "", "findings": []}', "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert "claims" not in result["env"]["data"]
+        assert "【主張の構造（確定/推定/不明）】" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+# ===== S4b 敵対 RV 4 巡目 是正（docs/rv/2026-09-17-DEPTH-2.md C18） =====
+
+def test_reinvestigation_claims_prompt_includes_existing_worker_claims_and_replaces_same_id():
+    """C18 是正: 再調査（2回目以降）の一次判断要求プロンプトに、直前までの worker 由来の
+    主張（id・本文のみ）が渡る——渡さないと再調査の worker は毎回 "c1" から採番し直し、
+    置換処理（`_ingest_sub_final_into_state`）が別論点の既存主張まで消しうる。初回は c1（本題）
+    のみ、再調査は c1（更新）＋c2（新論点）を返すと、最終 `state.claims` は c1（更新後の内容）
+    と c2 の2件（新旧の言い直しが両方残らない）。"""
+    bodies = []
+    orig = _install_post(
+        _sub_run_claims_seq_ids([("c1", "標準税率は10%です。")])
+        + _sub_run_claims_seq_ids([("c1", "標準税率は11%に改定されました。"),
+                                   ("c2", "軽減税率は8%です。")]), bodies)
+    try:
+        p = _mk([
+            '{"sufficient": false, "missing": "軽減税率の扱い"}',
+            '{"sufficient": true, "missing": ""}',
+            "CLOUD SYNTH ANSWER",
+        ])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        claims = result["env"]["data"]["claims"]
+        assert len(claims) == 2
+        by_id = {c["id"]: c["text"] for c in claims}
+        assert by_id == {"c1": "標準税率は11%に改定されました。", "c2": "軽減税率は8%です。"}
+        # 再調査の一次判断要求（この2回目の sub run の3件目の _post）に直前の主張（c1・10%）が渡る。
+        rerun_claims_prompt = bodies[-1]["messages"][1]["content"]
+        assert "[c1] confirmed: 標準税率は10%です。" in rerun_claims_prompt
+        # 初回の一次判断要求（既存主張が無い）には「前回までの主張」節が付かない。
+        first_claims_prompt = bodies[2]["messages"][1]["content"]
+        assert "前回までの主張" not in first_claims_prompt
+    finally:
+        A._post = orig
+
+
+# ===== DEPTH-2 S5: 巡ループ（深さ＝evaluator の巡数・§2.4）=====
+
+def _round_ids(events) -> list:
+    return sorted({e["id"] for e in events
+                   if e.get("type") == "node" and str(e.get("id") or "").startswith("main-review-r")})
+
+
+def test_deep_runs_two_evaluator_rounds_with_round_scoped_node_ids():
+    """受け入れ条件(2)(7): 深く＝2巡。「1巡目不足→2巡目で終了」で evaluator が2回走り、
+    思考ノードの id が巡ごとに分かれる（再読込後も巡が区別できる）。"""
+    orig = _install_post(_sub_run_seq() + _sub_run_seq())
+    try:
+        p = _mk(['{"verdict": "insufficient", "missing": "税率の適用開始日", "findings": []}',
+                 '{"verdict": "sufficient", "missing": "", "findings": []}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        assert len(p._synth_prompts) == 3         # 査読2回＋清書1回
+        assert _round_ids(events) == ["main-review-r1", "main-review-r2"]
+        assert "2巡中の1巡目" in p._synth_prompts[0]
+        assert "2巡中の2巡目" in p._synth_prompts[1]
+        # 巡ごとに worker の agent_run_id も分かれる（前巡の実行履歴が上書きで消えない）。
+        assert {e.get("agent_run_id") for e in events if e.get("agent_run_id")} == {
+            "sub:worker:1", "sub:worker:2"}
+    finally:
+        A._post = orig
+
+
+def test_undecidable_verdict_ends_rounds_without_further_worker_or_evaluator():
+    """受け入れ条件(2): 判定不能は不足に丸めず、その巡で終える（以後の worker/evaluator を
+    呼ばない）。清書は通常どおり1回行う。"""
+    orig = _install_post(_sub_run_seq())   # 下調べは初回の1周分しか用意しない
+    try:
+        p = _mk(['{"verdict": "undecidable", "missing": "", "findings": []}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert len(p._synth_prompts) == 2          # 査読1回＋清書1回（2巡目は走らない）
+        assert _round_ids(events) == ["main-review-r1"]
+        assert any("判断できません" in (e.get("detail") or "") for e in events)
+    finally:
+        A._post = orig
+
+
+def test_sufficient_first_round_skips_remaining_rounds():
+    """受け入れ条件(2): 十分と判定されたら以後の worker/evaluator を呼ばない。"""
+    orig = _install_post(_sub_run_seq())
+    try:
+        p = _mk(['{"verdict": "sufficient", "missing": "", "findings": []}', "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        assert len(p._synth_prompts) == 2
+        assert _round_ids(events) == ["main-review-r1"]
+    finally:
+        A._post = orig
+
+
+def test_max_profile_round_count_follows_max_review_rounds_setting():
+    """受け入れ条件(3): 「最大」の巡数は設定（`max_review_rounds`）で変わる。
+    1 に絞れば 1 巡で終わり、2 にすれば 2 巡走る（同じ応答列・同じ深さで比較する）。"""
+    for rounds, expected_reviews in ((1, 1), (2, 2)):
+        orig = _install_post(_sub_run_seq() * (rounds + 1))
+        try:
+            claims_json = json.dumps({"claims": [
+                {"id": "c1", "status": "unknown", "text": "確認できません。", "evidence_refs": [],
+                 "reason": "", "reason_code": "not_found_in_scope"}]}, ensure_ascii=False)
+            p = _mk(['{"verdict": "insufficient", "missing": "軸", "findings": []}'] * rounds
+                    + [claims_json, "PARTIAL"], max_review_rounds=rounds)
+            ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                                   "depth_profile": "max"})
+            events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+            assert next(e for e in events if e.get("type") == "_result")["env"]["headline"] == "PARTIAL"
+            # 査読 `expected_reviews` 回＋主張構造1回＋清書1回
+            assert len(p._synth_prompts) == expected_reviews + 2
+        finally:
+            A._post = orig
+
+
+def test_no_intermediate_body_is_streamed_or_returned():
+    """受け入れ条件(4): 中間巡の本文は SSE に流さない——`answer_delta` は最終清書のぶんだけで、
+    下調べ役のローカル散文も査読の JSON も一切混ざらない。"""
+    orig = _install_post(_sub_run_seq() + _sub_run_seq())
+    try:
+        p = _mk(['{"verdict": "insufficient", "missing": "軸", "findings": []}',
+                 '{"verdict": "sufficient", "missing": "", "findings": []}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
+        assert "".join(deltas) == "CLOUD SYNTH ANSWER"
+        blob = json.dumps(events, ensure_ascii=False, default=str)
+        assert "LOCAL DRAFT (discarded)" not in blob
+        # 査読応答の生 JSON（中間巡の出力そのもの）がイベント列のどこにも出ない。
+        assert '"verdict": "insufficient"' not in blob and '"findings"' not in blob
+    finally:
+        A._post = orig
+
+
+def test_stop_after_final_round_does_not_return_refuted_claims():
+    """受け入れ条件(5): 最終巡直後に停止しても、反証された主張（採用不可）は未完了回答に
+    含まれない。追加の LLM 呼び出しもしない。"""
+    import threading
+    stop = threading.Event()
+
+    class _StopOnSecondReview(_ReviewSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            if completion is not None:
+                completion.terminal_seen = True
+                completion.reason = "stop"
+            if len(self._synth_prompts) == 2:
+                stop.set()   # 2巡目（最終巡）の査読応答中に停止要求が来る
+            yield self._responses.pop(0)
+
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]) + _sub_run_seq())
+    try:
+        p = _StopOnSecondReview("sk-dummy", "gpt-5.5", responses=[
+            json.dumps({"verdict": "insufficient", "missing": "適用開始日",
+                        "findings": [{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                                      "refutes": True}]}, ensure_ascii=False),
+            '{"verdict": "sufficient", "missing": "", "findings": []}',
+            "SHOULD NOT SYNTH"])
+        p._sub = dict(_SUB)
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"}, stop_event=stop)
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["_terminal"] == "stopped"
+        assert "標準税率は10%です。" not in result["env"]["headline"]   # 反証済み＝採用不可
+        assert "2巡目で打ち切りました" in result["env"]["headline"]
+        assert len(p._synth_prompts) == 2   # 査読2回だけ＝未完了回答の生成に LLM を使わない
+        assert not any(e.get("type") == "answer_delta" for e in events)
+    finally:
+        A._post = orig
+
+
+def test_chat_round_recorded_per_round_and_canonical_usage_once(monkeypatch):
+    """受け入れ条件(6): 巡ごとに `chat-round` が1行ずつ記録され（表示用）、正本の使用量
+    （chat-sub／chat-review）は1行ずつのまま二重に増えない。"""
+    from sherpa import metering
+    recorded = []
+    monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
+    orig = _install_post(_sub_run_seq() + _sub_run_seq())
+    try:
+        p = _mk(['{"verdict": "insufficient", "missing": "税率の適用開始日", "findings": []}',
+                 '{"verdict": "sufficient", "missing": "", "findings": []}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        rounds = [kw for a, kw in recorded if a[0] == "chat-round"]
+        assert [kw["meta"]["round"] for kw in rounds] == [1, 2]
+        assert [kw["meta"]["verdict"] for kw in rounds] == ["insufficient", "sufficient"]
+        # 不足軸の自由文は meta に載せない（資料名・本文相当の語を台帳に残さない）。
+        assert "missing" not in rounds[0]["meta"]
+        assert rounds[1]["meta"]["stop"] == "sufficient"
+        assert all("worker" in kw["meta"]["roles"] for kw in rounds)
+        assert all(kw["calls"] == 1 for kw in rounds)
+        # 正本は kind ごとに1行のまま（巡別記録で二重に足さない）。
+        assert [a[0] for a, kw in recorded].count("chat-sub") == 1
+        assert [a[0] for a, kw in recorded].count("chat-review") == 1
+    finally:
+        A._post = orig
+
+
+def test_limits_delta_reports_only_the_increment_within_a_round():
+    """受け入れ条件(6): 巡別記録の `limits` は巡内の増分だけ（累積スナップショットを足さない）。"""
+    before = {"tool_result_clipped": 2, "total_budget_hit": False, "context_compactions": 0}
+    after = {"tool_result_clipped": 5, "total_budget_hit": True, "context_compactions": 0}
+    assert PB._limits_delta(before, after) == {"tool_result_clipped": 3, "total_budget_hit": True}
+    assert PB._limits_delta(after, after) == {}   # 変化なし＝空（既定のままの項目は出さない）
+
+
+def test_incomplete_headline_excludes_unknown_and_names_the_round():
+    """停止・失敗の未完了回答は採用可（確定/推定）の主張だけを並べ、打ち切りの巡と理由を明示する。"""
+    from sherpa import investigation_state as IS
+    claims = [IS.Claim(id="c1", status="confirmed", text="確定した内容", evidence_refs=["ev-1"]),
+              IS.Claim(id="c2", status="inferred", text="推定の内容", reason="根拠が薄い"),
+              IS.Claim(id="c3", status="unknown", text="反証された内容", reason_code="conflict")]
+    out = PB._incomplete_headline(claims, 3, "user_stop")
+    assert "3巡目で打ち切りました（利用者の操作で停止したため）" in out
+    assert "確定した内容" in out and "推定の内容（推定）" in out
+    assert "反証された内容" not in out
+    assert "確定できた内容はありません" in PB._incomplete_headline([], 1, "budget")
+
+
+# ===== DEPTH-2 S5 是正（巡ループの終端・反証の保持・下調べ役なしの巡）=====
+
+def test_final_round_synthesis_does_not_readopt_refuted_claim():
+    """最終巡で反証された主張は、指摘を渡さない主張構造の生成（`_claims_synthesis`）が同じ id を
+    確定として返し直しても採用不可（不明・conflict）のまま——清書にも公開 envelope にも確定として
+    出ない。"""
+    claims_json = json.dumps({"claims": [
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%です。",
+         "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}]}, ensure_ascii=False)
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]) + _sub_run_seq())
+    try:
+        p = _mk([json.dumps({"verdict": "insufficient", "missing": "適用開始日",
+                             "findings": [{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                                           "refutes": True}]}, ensure_ascii=False),
+                 '{"verdict": "insufficient", "missing": "適用開始日", "findings": []}',
+                 claims_json, "PARTIAL"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        claims = {c["id"]: c for c in result["env"]["data"]["claims"]}
+        assert claims["c1"]["status"] == "unknown" and claims["c1"]["reason_code"] == "conflict"
+    finally:
+        A._post = orig
+
+
+def test_stopped_terminal_excludes_unreviewed_worker_claims():
+    """停止終端の未完了回答は「査読を通した採用可の主張」だけから組む——査読が fail-open
+    （verdict=None＝未査読）のまま停止したターンでは worker の一次判断を確定として出さない。"""
+    import threading
+    stop = threading.Event()
+
+    class _StopOnReview(_ReviewSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            if completion is not None:
+                completion.terminal_seen = True
+                completion.reason = "stop"
+            stop.set()
+            yield self._responses.pop(0)
+
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]))
+    try:
+        p = _StopOnReview("sk-dummy", "gpt-5.5",
+                          responses=["NOT JSON AT ALL", "SHOULD NOT SYNTH"])
+        p._sub = dict(_SUB)
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"}, stop_event=stop)
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["_terminal"] == "stopped"
+        assert "標準税率は10%です。" not in result["env"]["headline"]
+        assert "確定できた内容はありません" in result["env"]["headline"]
+        assert len(p._synth_prompts) == 1   # 未完了回答の生成に LLM を使わない
+    finally:
+        A._post = orig
+
+
+def test_stopped_terminal_precedes_review_nodes(monkeypatch):
+    """査読中に停止したら、停止終端（`_result`）を読取ノードより先に返す——consumer は停止後の
+    最初のイベントで打ち切るため、ノードが先だと未完了回答が保存されない。"""
+    import threading
+    stop = threading.Event()
+    orig_run_tool = A.run_tool
+
+    def _run_tool_then_stop(name, *a, **kw):
+        result = orig_run_tool(name, *a, **kw)
+        if name == "read_around":   # 査読自身の精読の直後に停止要求が来た状況を模す
+            stop.set()
+        return result
+
+    monkeypatch.setattr(A, "run_tool", _run_tool_then_stop)
+    orig = _install_post(_sub_run_seq())
+    try:
+        p = _mk([f'{{"action": "read_around", "doc_id": "{_REVIEW_DOC}", "line": 1}}',
+                 '{"verdict": "sufficient", "missing": "", "findings": []}'])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"}, stop_event=stop)
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result_at = next(i for i, e in enumerate(events) if e.get("type") == "_result")
+        assert events[result_at]["env"]["_terminal"] == "stopped"
+        # 停止終端より前に査読の読取ノードを出さない（出すと consumer がそこで打ち切る）。
+        assert not [e for e in events[:result_at]
+                    if e.get("type") == "node" and (e.get("id") or "").startswith("main-review")]
+    finally:
+        A._post = orig
+
+
+def test_standard_depth_stop_does_not_save_incomplete_answer():
+    """標準（0 巡）は巡ループを回さない＝停止しても未完了回答（`_terminal="stopped"`）を
+    返さない（従来どおり assistant 未保存のまま終える）。"""
+    import threading
+    stop = threading.Event()
+
+    class _StopOnSynth(_ReviewSynth):
+        def _stream(self, prompt, completion=None):
+            self._synth_prompts.append(prompt)
+            stop.set()
+            if completion is not None:
+                completion.terminal_seen = True
+                completion.reason = "stop"
+            yield ""
+
+    orig = _install_post(_sub_run_seq())
+    try:
+        p = _StopOnSynth("sk-dummy", "gpt-5.5", responses=[""])
+        p._sub = dict(_SUB)
+        ctx = _ctx(stop_event=stop)   # standard（既定）
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        assert not [e for e in events if e.get("type") == "_result"]
+    finally:
+        A._post = orig
+
+
+def test_unreadable_findings_keep_the_round_unreviewed():
+    """指摘の形が不正で反証を取り込めなかった巡は「未査読」として扱う——判定は得ていても
+    worker の一次判断を確定として公開へ渡さない。"""
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]))
+    try:
+        p = _mk(['{"verdict": "sufficient", "missing": "", "findings": [{"claim_id": "c1"}]}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert "claims" not in result["env"]["data"]
+        assert "標準税率は10%です。" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_failed_terminal_keeps_confirmed_claims_and_round(monkeypatch):
+    """失敗終端でも、巡ループで確認済みの主張と巡番号を調査状態から組み直して返す
+    （追加の LLM 呼び出しはしない・固定の設定確認文だけにしない）。"""
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]))
+    try:
+        p = _mk(['{"verdict": "insufficient", "missing": "適用開始日", "findings": []}'])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        _calls = {"n": 0}
+        _real = p._sub_agentic_loop
+
+        def _fail_second(*a, **kw):
+            _calls["n"] += 1
+            if _calls["n"] == 1:
+                return _real(*a, **kw)
+            raise TimeoutError("sub loop timed out")
+
+        monkeypatch.setattr(p, "_sub_agentic_loop", _fail_second)
+        events = list(p.run(ctx))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["_terminal"] == "failed"
+        assert "2巡目で打ち切りました" in result["env"]["headline"]
+        assert "標準税率は10%です。" in result["env"]["headline"]
+    finally:
+        A._post = orig
+
+
+# ===== DEPTH-2 S5 敵対 RV 2 巡目 是正（docs/rv/2026-09-17-DEPTH-2.md C44〜C47・#48〜#52）=====
+
+def _main_run_seq(answer: str = "MAIN ANSWER"):
+    """下調べ役なし（`self._sub is None`）の1ターン分の `_post` 応答（list_docs → 回答）。"""
+    return [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "t1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": answer}}]},
+    ]
+
+
+def test_claims_synthesis_prompt_carries_existing_ids_and_open_refutations():
+    """C44: 最終巡の主張構造の生成へ、既存の主張（id・状態・本文）と未解決の反証を渡す——
+    渡さないと id が振り直され、ID 基準の反証の再適用が別論点を不明化して反証対象を再採用する。"""
+    claims_json = json.dumps({"claims": [
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%です。",
+         "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}]}, ensure_ascii=False)
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]) + _sub_run_seq())
+    try:
+        p = _mk([json.dumps({"verdict": "insufficient", "missing": "適用開始日",
+                             "findings": [{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                                           "refutes": True}]}, ensure_ascii=False),
+                 '{"verdict": "insufficient", "missing": "適用開始日", "findings": []}',
+                 claims_json, "PARTIAL"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        claims_prompt = p._synth_prompts[2]
+        assert "【前回までの主張" in claims_prompt and "[c1]" in claims_prompt
+        assert "別資料と矛盾" in claims_prompt and "（反証）" in claims_prompt
+    finally:
+        A._post = orig
+
+
+def test_review_prompt_carries_finding_ids_and_reuse_rule():
+    """C45: 次巡の査読へ既存指摘の id を渡し、同じ指摘は id 維持・別指摘は新規採番を要求する
+    ——id の対応が無いと、査読が別の指摘へ同じ id を返したときに旧い反証が消える。"""
+    orig = _install_post(_sub_run_claims_seq_ids([("c1", "標準税率は10%です。")]) + _sub_run_seq())
+    try:
+        p = _mk([json.dumps({"verdict": "insufficient", "missing": "適用開始日",
+                             "findings": [{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                                           "refutes": True}]}, ensure_ascii=False),
+                 '{"verdict": "sufficient", "missing": "", "findings": []}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        second_review = p._synth_prompts[1]
+        assert "(f1)" in second_review
+        assert "同じ id をそのまま使い" in second_review
+    finally:
+        A._post = orig
+
+
+def test_failed_terminal_drops_confirmed_claims_that_lost_evidence_refs():
+    """C47/#48: 失敗終端の未完了本文にも根拠ゲートを適用する——ID 変換で evidence_refs を
+    失った confirmed を「ここまでに確認できた範囲」として保存・公開しない。"""
+    claims_json = json.dumps({"claims": [
+        {"id": "c1", "status": "confirmed", "text": "精読した本文にある記述です。",
+         "evidence_refs": ["ev-2"], "reason": "", "reason_code": ""}]}, ensure_ascii=False)
+    orig = _install_post(_sub_run_seq() + _sub_run_seq())
+    try:
+        p = _mk([f'{{"action": "read_around", "doc_id": "{_REVIEW_DOC}", "line": 3}}',
+                 '{"verdict": "insufficient", "missing": "適用範囲その1", "findings": []}',
+                 '{"verdict": "insufficient", "missing": "適用範囲その2", "findings": []}',
+                 claims_json])
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                               "depth_profile": "deep"})
+        events = list(p.run(ctx))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["_terminal"] == "failed"
+        assert "精読した本文にある記述です。" not in result["env"]["headline"]
+        assert "十分な根拠を確認できませんでした" in result["env"]["headline"]
+    finally:
+        A._post = orig
+
+
+# ===== DEPTH-2 S5b（§2.2）: 標準（巡 0）でも orchestrator の確認を 1 回行う =====
+
+def test_standard_depth_confirmed_claims_reach_synthesis_and_envelope(monkeypatch):
+    """標準・下調べ役ありでは、worker の一次判断を orchestrator が 1 回だけ確認し、確認を
+    通した主張が清書プロンプト（主張の構造）と envelope の data["claims"] に入る。確認は
+    強いモデルの追加呼び出し1回＝chat-review に、一次判断の要求は chat-sub に計上される。"""
+    from sherpa import metering
+    recorded = []
+    monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk(['{"verdict": "sufficient", "missing": "", "findings": []}', "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()   # 既定＝standard（巡 0）
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert [c["text"] for c in result["env"]["data"]["claims"]] == ["標準税率は10%です。"]
+        assert len(p._synth_prompts) == 2   # 確認1回＋清書1回（再調査には入らない）
+        assert "標準税率は10%です。" in p._synth_prompts[-1]
+        by_kind = {a[0]: kw for a, kw in recorded}
+        assert by_kind["chat-review"]["calls"] == 1
+        assert by_kind["chat-sub"]["calls"] == 3
+        rounds = [kw for a, kw in recorded if a[0] == "chat-round"]
+        assert len(rounds) == 1 and rounds[0]["meta"]["round"] == 0
+        assert rounds[0]["meta"]["verdict"] == "sufficient"
+    finally:
+        A._post = orig
+
+
+def test_standard_depth_insufficient_confirmation_does_not_reinvestigate():
+    """標準の確認は「確認」だけ＝不足と判定しても再調査（下調べ役の再実行）には入らず、
+    確認を通った一次判断のまま通常どおり清書へ進む。"""
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk(['{"verdict": "insufficient", "missing": "適用開始日", "findings": []}',
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert [c["text"] for c in result["env"]["data"]["claims"]] == ["標準税率は10%です。"]
+        assert len(p._synth_prompts) == 2   # 確認1回＋清書1回（再査読も再調査も無い）
+    finally:
+        A._post = orig
+
+
+def test_standard_depth_claims_discarded_on_confirmation_fail_open():
+    """標準の確認が fail-open（応答が JSON でない＝verdict=None）で終わったターンは、確認を
+    一度も通していない——worker の一次判断は清書・公開へ渡らない（根拠だけで清書は進む）。"""
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk(["これは JSON ではありません", "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert "claims" not in result["env"]["data"]
+        assert "標準税率は10%です。" not in p._synth_prompts[-1]
+    finally:
+        A._post = orig
+
+
+def test_standard_depth_refuted_claim_falls_to_unknown_conflict():
+    """標準の確認が反証（`refutes`）を返した主張は、同じ規律で不明（理由コード conflict）へ
+    落ちる＝確定として清書・公開へ渡らない。"""
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk([json.dumps({"verdict": "sufficient", "missing": "",
+                             "findings": [{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                                           "refutes": True}]}, ensure_ascii=False),
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        claims = result["env"]["data"]["claims"]
+        assert [(c["status"], c["reason_code"]) for c in claims] == [("unknown", "conflict")]
+    finally:
+        A._post = orig
+
+
+def test_standard_confirm_apply_findings_failure_records_review_failed(monkeypatch):
+    """C61 是正: 標準の確認で判定（verdict）は得られても `findings` の形が不正で
+    `apply_findings` が False を返した回は、chat-round の stop を実際の状態（未査読）に
+    合わせて `review_failed` として記録する——`sufficient` のまま記録すると、一次判断を
+    確認済みであるかのように見せてしまう（巡ループ側は `apply_findings` を経ない
+    `verdict is None` の回だけを `review_failed` にする規律とは別に、標準の確認は
+    `apply_findings` の成否そのものが「確認できたか」を意味するため区別する）。"""
+    from sherpa import metering
+    recorded = []
+    monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk([json.dumps({"verdict": "sufficient", "missing": "", "findings": "bad-shape"},
+                            ensure_ascii=False),
+                 "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert "claims" not in result["env"]["data"]   # 未査読のまま公開しない（既存規律）
+        rounds = [kw for a, kw in recorded if a[0] == "chat-round"]
+        assert len(rounds) == 1
+        assert rounds[0]["meta"]["stop"] == "review_failed"
+    finally:
+        A._post = orig
+
+
+def test_standard_confirm_usage_role_is_orchestrator_not_evaluator(monkeypatch):
+    """C62 是正: 標準の確認（判定のみ・再調査なし）は evaluator の巡という語彙が成立しない
+    ため、chat-round の役割別内訳を orchestrator に集約して記録する（正本の chat-review
+    合計は変わらない・表示用の内訳だけの区別）。"""
+    from sherpa import metering
+    recorded = []
+    monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _mk(['{"verdict": "sufficient", "missing": "", "findings": []}', "CLOUD SYNTH ANSWER"])
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        list(events)
+        by_kind = {a[0]: kw for a, kw in recorded if a[0] == "chat-review"}
+        assert by_kind["chat-review"]["calls"] == 1
+        rounds = [kw for a, kw in recorded if a[0] == "chat-round"]
+        assert len(rounds) == 1
+        roles = rounds[0]["meta"]["roles"]
+        assert roles.get("orchestrator", {}).get("calls") == 1
+        assert "evaluator" not in roles
+    finally:
+        A._post = orig
+
+
+class _FailAtSynth(_ReviewSynth):
+    """`fail_at` 番目の `_stream` 呼び出しで通信失敗を模す stub（清書失敗の終端を再現する）。"""
+
+    def __init__(self, *a, fail_at=None, **kw):
+        super().__init__(*a, **kw)
+        self._fail_at = fail_at
+
+    def _stream(self, prompt, completion=None):
+        n = len(self._synth_prompts)
+        self._synth_prompts.append(prompt)
+        if completion is not None:
+            completion.terminal_seen = True
+            completion.reason = "stop"
+        if self._fail_at == n:
+            raise RuntimeError("upstream transport error")
+        yield self._responses.pop(0)
+
+
+def test_standard_confirmed_synthesis_failure_omits_round_loop_wording():
+    """#64 是正: 標準（巡0）で確認が通っても、直後の清書失敗の未完了本文は巡ループの
+    「N巡目で打ち切りました」という語彙を使わない（標準に巡という概念は無いため）——
+    `_incomplete_terminal_body` を `_review_rounds > 0` のときだけにする（停止終端が
+    既に持つ同じガードと揃える）。固定文言だけが本文になる。"""
+    orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
+    try:
+        p = _FailAtSynth(
+            "sk-dummy", "gpt-5.5",
+            responses=['{"verdict": "sufficient", "missing": "", "findings": []}'],
+            fail_at=1)
+        p._sub = dict(_SUB)
+        ctx = _ctx()
+        events = list(p.run(ctx))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["_terminal"] == "failed"
+        assert "巡目で打ち切りました" not in result["env"]["headline"]
+        assert "下調べAIでの調査がうまくいきませんでした" in result["env"]["headline"]
+    finally:
+        A._post = orig

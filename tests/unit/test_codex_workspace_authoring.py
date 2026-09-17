@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 
 import pytest
 
@@ -801,6 +802,220 @@ def test_codex_mcp_creds_in_config_file_not_cmdline():
     assert "creds_here" in cfg, "MCP creds が config ファイルに無い（サブプロセスが繋げない）"
     assert "PYTHONPATH" in cfg, "クリーン env 下で -m sherpa.mcp_server を解決する PYTHONPATH が無い"
     os.environ.pop("NEO4J_PASSWORD", None)
+
+
+def test_codex_authoring_config_forwards_sidecar_path_to_mcp_env():
+    """DEPTH-2 S3b: `sidecar_path` を渡すと config.toml の mcp_servers.sherpa.env に
+    SHERPA_MCP_SIDECAR が乗る（子エージェント・親のどちらの MCP プロセスも同じサイドカーへ書く
+    ため、per-thread ではなく config 全体に1つだけ載る）。省略時は既存どおり出ない。"""
+    from sherpa import agents as A
+    import pathlib, tempfile
+    ch_none = pathlib.Path(tempfile.mkdtemp()) / "ch"
+    A._write_codex_authoring_config(ch_none, ["/kb"], "low", True, "test", None)
+    assert "SHERPA_MCP_SIDECAR" not in (ch_none / "config.toml").read_text()
+
+    ch_sc = pathlib.Path(tempfile.mkdtemp()) / "ch"
+    A._write_codex_authoring_config(ch_sc, ["/kb"], "low", True, "test", None,
+                                    sidecar_path="/tmp/run-x/.mcp_sidecar.jsonl")
+    assert "/tmp/run-x/.mcp_sidecar.jsonl" in (ch_sc / "config.toml").read_text()
+
+
+def test_codex_authoring_config_sidecar_ignored_when_mcp_disabled():
+    """`mcp=False` のときは `sidecar_path` を渡しても MCP 設定自体が無い＝当然出ない。"""
+    from sherpa import agents as A
+    import pathlib, tempfile
+    ch = pathlib.Path(tempfile.mkdtemp()) / "ch"
+    A._write_codex_authoring_config(ch, ["/kb"], "low", False, "test", None,
+                                    sidecar_path="/tmp/run-x/.mcp_sidecar.jsonl")
+    cfg = (ch / "config.toml").read_text()
+    assert "mcp_servers" not in cfg and "SHERPA_MCP_SIDECAR" not in cfg
+
+
+# ===== DEPTH-2 S6（§2.6）: multi_agent の [agents]/[agents.worker]/[agents.evaluator] =====
+
+def test_codex_authoring_config_writes_agents_sections_when_multi_agent(tmp_path):
+    """`multi_agent=True` のとき config.toml に `[agents]`/`[agents.worker]`/`[agents.evaluator]`
+    が入り、子 config_file は codex_home 配下（model-shell 不可視＝`":root" = "deny"` の外側）に
+    生成される。省略時（既定 False）は一切出ない（回帰確認）。"""
+    from sherpa import agents as A
+    from sherpa.providers.codex import sandbox as CS
+
+    ch_off = tmp_path / "ch-off"
+    A._write_codex_authoring_config(ch_off, ["/kb"], "low", True, "test", None)
+    cfg_off = (ch_off / "config.toml").read_text()
+    assert "[agents]" not in cfg_off and "[agents.worker]" not in cfg_off
+
+    ch_on = tmp_path / "ch-on"
+    A._write_codex_authoring_config(ch_on, ["/kb"], "low", True, "test", None,
+                                    multi_agent=True, orchestrator_model="gpt-5.5")
+    cfg_on = (ch_on / "config.toml").read_text()
+    assert "[agents]" in cfg_on
+    assert "[agents.worker]" in cfg_on and "[agents.evaluator]" in cfg_on
+    assert f'default_subagent_model = "{CS._CODEX_WORKER_MODEL_FALLBACK}"' in cfg_on
+    assert "max_concurrent_threads_per_session" in cfg_on
+
+    worker_path = ch_on / "agents" / "worker.toml"
+    evaluator_path = ch_on / "agents" / "evaluator.toml"
+    assert f'config_file = "{worker_path}"' in cfg_on
+    assert f'config_file = "{evaluator_path}"' in cfg_on
+    assert worker_path.is_file() and evaluator_path.is_file()
+    # 子の config_file は codex_home 直下（model-shell から不可視＝`":root" = "deny"` の外側）で、
+    # authoring/run_dir（":workspace_roots" の write 対象）配下ではない。
+    assert ch_on.resolve() in worker_path.resolve().parents
+
+    worker_toml = worker_path.read_text()
+    assert f'model = "{CS._CODEX_WORKER_MODEL_FALLBACK}"' in worker_toml
+    evaluator_toml = evaluator_path.read_text()
+    assert 'model = "gpt-5.5"' in evaluator_toml   # 本体と同じモデル
+    assert 'model_reasoning_effort = "low"' in evaluator_toml   # 呼び出し元の reason をそのまま使う
+
+    import tomllib
+    parsed = tomllib.loads(cfg_on)
+    assert parsed["agents"]["default_subagent_model"] == CS._CODEX_WORKER_MODEL_FALLBACK
+    assert parsed["agents"]["worker"]["config_file"] == str(worker_path)
+    assert parsed["agents"]["evaluator"]["config_file"] == str(evaluator_path)
+
+
+def test_codex_authoring_config_evaluator_falls_back_to_worker_model_without_orchestrator_model():
+    """`orchestrator_model` を渡さない呼び出し（既存の直接呼び出し規約）でも config 生成自体は
+    壊れず、evaluator は worker と同じモデルへ倒れる。"""
+    from sherpa import agents as A
+    from sherpa.providers.codex import sandbox as CS
+    import pathlib, tempfile
+    ch = pathlib.Path(tempfile.mkdtemp()) / "ch"
+    A._write_codex_authoring_config(ch, ["/kb"], "low", True, "test", None, multi_agent=True)
+    evaluator_toml = (ch / "agents" / "evaluator.toml").read_text()
+    assert f'model = "{CS._CODEX_WORKER_MODEL_FALLBACK}"' in evaluator_toml
+
+
+def test_write_agents_md_multi_agent_round_count_standard_disables_evaluator(tmp_path):
+    """標準（`review_rounds=0`）は evaluator を使わないことが本文に明示される。
+    `multi_agent=False`（既定）は役割段落自体が出ない（回帰確認）。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring-std"
+    d.mkdir()
+    codex_agents_md.write_agents_md(d)   # multi_agent 既定 False
+    txt_off = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "spawn_agent(worker)" not in txt_off
+
+    codex_agents_md.write_agents_md(d, multi_agent=True, review_rounds=0)
+    txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "spawn_agent(worker)" in txt
+    assert "0 回＝evaluator は使わない" in txt
+    assert "spawn_agent(evaluator) は" not in txt   # 標準は evaluator の spawn 指示自体を出さない
+
+
+def test_write_agents_md_multi_agent_round_count_deep_and_max(tmp_path):
+    """深く（2）・最大（管理画面の設定値）で見直しの回数がそのまま本文に埋め込まれる。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring-deep"
+    d.mkdir()
+    codex_agents_md.write_agents_md(d, multi_agent=True, review_rounds=2)
+    txt_deep = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "見直しの回数は 2 回まで" in txt_deep
+    assert "0 回＝evaluator は使わない" not in txt_deep
+
+    codex_agents_md.write_agents_md(d, multi_agent=True, review_rounds=7)
+    txt_max = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "見直しの回数は 7 回まで" in txt_max
+
+
+def test_codex_run_argv_includes_multi_agent_flag_for_openai_codex(tmp_path, monkeypatch):
+    """本体ターンの argv に `-c features.multi_agent=true` が入る（Codex(OpenAI) 構成・§2.6の
+    「起動時に明示する」・実行そのものは偽 codex で代替）。"""
+    import stat
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    script = bin_dir / "codex"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path(r'{argv_log}').open('a', encoding='utf-8').write(repr(sys.argv[1:]) + chr(10))\n"
+        'print(json.dumps({"type": "item.completed", "item": {"id": "m0", "type": "agent_message", '
+        '"text": "確認しました。"}}))\n'
+        'print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, '
+        '"cached_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0}}))\n'
+        "sys.exit(0)\n")
+    mode = script.stat().st_mode
+    script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users_multi_agent_argv"))
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+
+    ctx = A.Ctx(
+        message="multi_agent argv テスト", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {"lens": lens_, "headline": "dispatch-headline",
+                                     "summary": {"total": 0}, "data": {}, "sources": []},
+        knowledge=True, uid="multi-agent-argv-u1")
+    events = list(A.CodexProvider().run(ctx))
+
+    calls = [eval(line) for line in argv_log.read_text().splitlines() if line.strip()]
+    assert len(calls) == 1
+    assert "features.multi_agent=true" in calls[0]
+    # C64/#73: 深さ案内（chat_service._depth_actually_helps）が使う env["codex_multi_agent"] は、
+    # multi_agent が実際に有効化された構成（既定 OpenAI＋サンドボックス有効）でだけ真になる。
+    res = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"][0]
+    assert res["env"]["codex_multi_agent"] is True
+
+
+def test_codex_run_argv_disables_multi_agent_on_sandbox_fallback(tmp_path, monkeypatch):
+    """RV #67 是正: `SHERPA_CODEX_SANDBOX=0`（フォールバック経路）は config.toml 自体を書かない
+    （`[agents.*]` の層が無い）ため、argv は `features.multi_agent=false` を明示し、AGENTS.md にも
+    役割段落（`spawn_agent(worker)`）が出ない——有効なフリだけして spawn が毎ターン失敗するのを防ぐ。"""
+    import stat
+    from sherpa import agents as A
+    from sherpa import codex_agents_md
+    from sherpa.providers.codex import provider as PV
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    script = bin_dir / "codex"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path(r'{argv_log}').open('a', encoding='utf-8').write(repr(sys.argv[1:]) + chr(10))\n"
+        'print(json.dumps({"type": "item.completed", "item": {"id": "m0", "type": "agent_message", '
+        '"text": "確認しました。"}}))\n'
+        'print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, '
+        '"cached_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0}}))\n'
+        "sys.exit(0)\n")
+    mode = script.stat().st_mode
+    script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users_multi_agent_fallback"))
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+    monkeypatch.setenv("SHERPA_CODEX_SANDBOX", "0")
+
+    captured: dict = {}
+    orig_write = codex_agents_md.write_agents_md
+
+    def _spy(authoring, **kw):
+        captured.update(kw)
+        return orig_write(authoring, **kw)
+    monkeypatch.setattr(PV.codex_agents_md, "write_agents_md", _spy)
+
+    ctx = A.Ctx(
+        message="multi_agent fallback argv テスト", world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {"lens": lens_, "headline": "dispatch-headline",
+                                     "summary": {"total": 0}, "data": {}, "sources": []},
+        knowledge=True, uid="multi-agent-fallback-u1")
+    events = list(A.CodexProvider().run(ctx))
+
+    calls = [eval(line) for line in argv_log.read_text().splitlines() if line.strip()]
+    assert len(calls) == 1
+    assert "features.multi_agent=true" not in calls[0]
+    assert "features.multi_agent=false" in calls[0]
+    assert captured.get("multi_agent") is False
+    # C64/#73: サンドボックス無効（フォールバック）は env["codex_multi_agent"] も偽——
+    # _depth_actually_helps がこの構成で「深さを上げて探す」を出さないようにする受け渡し口。
+    res = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"][0]
+    assert res["env"]["codex_multi_agent"] is False
 
 
 def test_codex_authoring_config_forwards_layer_to_mcp_env():
@@ -2123,3 +2338,304 @@ def test_run_authoring_failed_mcp_read_is_not_a_source(tmp_path, monkeypatch):
 
     assert env["codex_referenced_docs"] == {"listed": 0, "verified": 0}
     assert not env.get("sources") and "sources_verified" not in env
+
+
+# ===== DEPTH-2 S3b: サイドカー（子エージェントの観測）=====
+# `docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(2)(3)(6)。
+# s3b-fix2: サイドカーは run_dir（model-shell の書込許可領域＝ `":workspace_roots"` `"." = "write"`）
+# の外・codex_home 配下に置く契約（#22 是正）。偽 codex は `CODEX_HOME` env（`_codex_clean_env` が
+# 設定）から codex_home の実パスを読み取れる（実際の MCP サーバの代わりに直接書く＝
+# 「子だけが読んだ」状況を最小コストで再現する）。
+
+def _sidecar_write_snippet(entries: list) -> str:
+    """`.mcp_sidecar.jsonl`（codex_home 配下＝`CODEX_HOME` env）へ JSONL を書く偽 codex 用 python 断片。"""
+    import json as _json
+    lines_expr = ", ".join(_json.dumps(_json.dumps(e, ensure_ascii=False)) for e in entries)
+    return ("import os, pathlib\n"
+            "(pathlib.Path(os.environ['CODEX_HOME']) / '.mcp_sidecar.jsonl')"
+            f".write_text(chr(10).join([{lines_expr}]) + chr(10))\n")
+
+
+def test_run_authoring_sidecar_read_doc_promoted_to_sources_verified_without_duplication(tmp_path, monkeypatch):
+    """子（サイドカー）だけが読んだ doc_id が sources_verified に入り、親自身が MCP item で観測した
+    doc_id と重複しない（受け入れ条件(2)）。"""
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    child_only_doc = "4期/01_標準/消費税法.md"
+    parent_doc = "4期/02_設計/01_基本設計/税計算仕様書.md"
+    script = ("#!/usr/bin/env python3\n"
+              + _sidecar_write_snippet([{"kind": "read", "tool": "read_doc",
+                                         "doc_id": child_only_doc, "ts": 1.0}])
+              + "".join([
+                  _emit_citation({"type": "item.completed", "item": {
+                      "id": "t1", "type": "mcp_tool_call", "tool": "read_doc", "status": "completed",
+                      "arguments": {"doc_id": parent_doc}}}),
+                  _emit_citation({"type": "item.completed", "item": {
+                      "id": "2", "type": "agent_message", "text": "消費税率は10%です。"}}),
+              ]))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-read-u1", make_sources=_fake_make_sources)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env["codex_referenced_docs"] == {"listed": 2, "verified": 2}
+    verified = env["sources_verified"]
+    assert sorted(verified) == sorted([child_only_doc, parent_doc])
+    assert len(verified) == len(set(verified)), "重複していない"
+    doc_ids = [s["doc_id"] for s in env["sources"]]
+    assert doc_ids.count(child_only_doc) == 1 and doc_ids.count(parent_doc) == 1
+
+
+def test_run_authoring_sidecar_duplicate_doc_id_not_double_counted(tmp_path, monkeypatch):
+    """親自身が観測した doc_id とサイドカーの doc_id が同じ資料でも二重に数えない。"""
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    doc = "4期/02_設計/01_基本設計/税計算仕様書.md"
+    script = ("#!/usr/bin/env python3\n"
+              + _sidecar_write_snippet([{"kind": "read", "tool": "read_doc", "doc_id": doc, "ts": 1.0}])
+              + "".join([
+                  _emit_citation({"type": "item.completed", "item": {
+                      "id": "t1", "type": "mcp_tool_call", "tool": "read_doc", "status": "completed",
+                      "arguments": {"doc_id": doc}}}),
+                  _emit_citation({"type": "item.completed", "item": {
+                      "id": "2", "type": "agent_message", "text": "消費税率は10%です。"}}),
+              ]))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-dup-u1", make_sources=_fake_make_sources)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env["codex_referenced_docs"] == {"listed": 1, "verified": 1}
+    assert env["sources_verified"] == [doc]
+
+
+def test_run_authoring_sidecar_ask_user_becomes_confirmation_card_once(tmp_path, monkeypatch):
+    """子だけが呼んだ ask_user（親自身の --json には現れない）は、run 終了後にサイドカーから
+    確認カード（question イベント）を一度だけ生成する。回答は _result として保存されない
+    （既存の ask_user 経路と同じ envelope・受け入れ条件(3)）。"""
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    question = {"type": "question", "interaction_id": "child-q1", "mode": "single",
+               "prompt": "この資料で合っていますか", "allow_free_text": False,
+               "options": [{"id": "yes", "label": "はい", "description": ""},
+                           {"id": "no", "label": "いいえ", "description": ""}]}
+    script = ("#!/usr/bin/env python3\n"
+              + _sidecar_write_snippet([{"kind": "ask_user", "ts": 1.0, "question": question}])
+              + _emit_citation({"type": "item.completed", "item": {
+                  "id": "1", "type": "agent_message", "text": "確認した結果、影響はありません。"}}))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-ask-u1", make_sources=_fake_make_sources)
+    events = list(A.CodexProvider().run(ctx))
+
+    questions = [e for e in events if isinstance(e, dict) and e.get("type") == "question"]
+    assert len(questions) == 1, f"確認カードは一度だけのはず: {events!r}"
+    assert questions[0]["interaction_id"] == "child-q1"
+    assert questions[0]["prompt"] == "この資料で合っていますか"
+    assert [e for e in events if isinstance(e, dict) and e.get("type") == "_result"] == [], \
+        "ask_user ターンは回答（_result）を保存しない"
+
+
+def test_run_authoring_sidecar_missing_is_fail_open(tmp_path, monkeypatch):
+    """サイドカーが存在しない（子が1つも MCP を呼ばなかった／multi_agent 無効）ときは、
+    既存の親のみ観測にそのまま落ちる（受け入れ条件(6)）。"""
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    script = "#!/usr/bin/env python3\n" + _emit_citation(
+        {"type": "item.completed", "item": {"id": "1", "type": "agent_message", "text": "消費税率は10%です。"}})
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-missing-u1", make_sources=_fake_make_sources)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env["headline"] == "消費税率は10%です。"
+    assert not env.get("sources") and "sources_verified" not in env
+
+
+def test_run_authoring_sidecar_forged_in_run_dir_is_not_absorbed(tmp_path, monkeypatch):
+    """#22 是正: サイドカーは model-shell の書込許可領域（run_dir・`":workspace_roots"` `"." = "write"`）
+    の外（codex_home 配下）にある契約——同じファイル名を run_dir 直下（model-shell が書ける場所＝
+    偽 codex がここに書くのは model-shell によるサイドカー偽装のシミュレーション）に置いても、
+    provider は codex_home 側だけを読むため取り込まれない。取り込まれれば、未読資料が
+    sources_verified（根拠ゲート）を偽って通ってしまう（提案書 §2.6/§9.1・RV #22）。"""
+    import json
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    forged_doc = "4期/01_標準/消費税法.md"   # 実際には誰も読んでいない資料
+    forged_line = json.dumps({"kind": "read", "tool": "read_doc", "doc_id": forged_doc, "ts": 1.0},
+                             ensure_ascii=False)
+    script = ("#!/usr/bin/env python3\n"
+              "import pathlib\n"
+              f"pathlib.Path('.mcp_sidecar.jsonl').write_text({json.dumps(forged_line)} + '\\n')\n"
+              + _emit_citation({"type": "item.completed", "item": {
+                  "id": "1", "type": "agent_message", "text": "消費税率は10%です。"}}))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-forged-run-dir-u1", make_sources=_fake_make_sources)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env["headline"] == "消費税率は10%です。"
+    assert not env.get("sources") and "sources_verified" not in env, \
+        f"run_dir 直下への偽装サイドカーが取り込まれた: {env!r}"
+
+
+def test_sidecar_path_not_within_codex_write_permitted_roots(tmp_path):
+    """#22 是正・受け入れ条件(a): 生成される permission profile（`":workspace_roots"` `"." = "write"`＝
+    cwd=run_dir が唯一の書込許可ルート）の下で、provider.py が実際に組み立てるサイドカーのパス
+    （`codex_home / _MCP_SIDECAR_NAME`）が run_dir と包含関係を持たない（run_dir 配下でも run_dir
+    自身の親でもない）ことをパスの包含判定で固定する。"""
+    from pathlib import Path
+
+    from sherpa import agents as A
+    from sherpa.providers.codex.provider import _MCP_SIDECAR_NAME
+
+    run_dir = tmp_path / "users" / "u1" / "workspace" / "authoring" / "run-deadbeef"
+    run_dir.mkdir(parents=True)
+    codex_home = tmp_path / "users" / "u1" / "workspace" / ".codexhome-deadbeef"
+    sidecar_path = codex_home / _MCP_SIDECAR_NAME   # provider.py と同じ組み立て式
+
+    A._write_codex_authoring_config(codex_home, ["/kb"], "low", True, "test", None,
+                                    sidecar_path=str(sidecar_path))
+    cfg = (codex_home / "config.toml").read_text()
+    assert '"." = "write"' in cfg, "cwd（run_dir）だけが書込許可ルートのはず"
+    assert str(sidecar_path) in cfg, "サイドカーの env が config に無い"
+
+    with pytest.raises(ValueError):
+        sidecar_path.resolve().relative_to(run_dir.resolve())   # サイドカーは run_dir 配下ではない
+    with pytest.raises(ValueError):
+        run_dir.resolve().relative_to(sidecar_path.parent.resolve())   # run_dir もサイドカーの下ではない
+
+
+def test_run_authoring_sidecar_corrupt_lines_are_skipped_fail_open(tmp_path, monkeypatch):
+    """壊れた行（不正 JSON・非 dict）があっても、正しい行はそのまま拾う（fail-open・受け入れ条件(6)）。"""
+    import json
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    doc = "4期/01_標準/消費税法.md"
+    good_line = json.dumps({"kind": "read", "tool": "read_doc", "doc_id": doc, "ts": 1.0}, ensure_ascii=False)
+    script = ("#!/usr/bin/env python3\n"
+              "import os, pathlib\n"
+              "(pathlib.Path(os.environ['CODEX_HOME']) / '.mcp_sidecar.jsonl')"
+              f".write_text('not-json\\n' + {json.dumps(good_line)} "
+              "+ '\\n' + '[]\\n')\n"
+              + _emit_citation({"type": "item.completed", "item": {
+                  "id": "1", "type": "agent_message", "text": "消費税率は10%です。"}}))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-corrupt-u1", make_sources=_fake_make_sources)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env["codex_referenced_docs"] == {"listed": 1, "verified": 1}
+    assert env["sources_verified"] == [doc]
+
+
+def test_run_authoring_sidecar_itself_is_not_registered_as_a_created_file(tmp_path, monkeypatch):
+    """C9 是正: `.mcp_sidecar.jsonl`（子の観測サイドカー）が生成されても、共有 KB だけを読む会話は
+    成果物走査の対象にならない（台帳登録なし・`codex_wrote_files` が立たない）——サイドカーは
+    codex_home 配下（run_dir の外・s3b-fix2）に置くため run_dir スキャンには自然に現れないが、
+    フォールバック経路向けの除外（`_MCP_SIDECAR_NAME`）が正しく効いていることも併せて確認する
+    （提案書 §2.6/§9.1・RV C9）。"""
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    doc = "4期/01_標準/消費税法.md"
+    script = ("#!/usr/bin/env python3\n"
+              + _sidecar_write_snippet([{"kind": "read", "tool": "read_doc", "doc_id": doc, "ts": 1.0}])
+              + _emit_citation({"type": "item.completed", "item": {
+                  "id": "1", "type": "agent_message", "text": "消費税率は10%です。"}}))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("sidecar-not-created-file-u1", make_sources=_fake_make_sources)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert not env.get("codex_wrote_files"), \
+        f"サイドカーだけで codex_wrote_files が立った: {env.get('codex_wrote_files')!r}"
+    assert not env.get("created_files")
+
+
+def test_read_mcp_sidecar_invalid_utf8_bytes_is_fail_open(tmp_path):
+    """C12 是正: サイドカーに不正 UTF-8 バイト列（`for line in f` の読取自体で
+    `UnicodeDecodeError` が起きる）が含まれていても、`_read_mcp_sidecar` は例外を投げず
+    fail-open（既存の「親の --json だけを見る」観測に落ちる）で終える——捕捉していないと
+    回答処理そのものが例外終了する（提案書 §2.6/§9.1・RV C12）。"""
+    from sherpa.providers.codex import provider as P
+
+    path = tmp_path / ".mcp_sidecar.jsonl"
+    path.write_bytes(b"\xff\n")
+
+    reads, listed, ask = P._read_mcp_sidecar(path)
+
+    assert reads == [] and listed == [] and ask is None
+
+
+# ===== DEPTH-2 S6（§2.6・受け入れ条件(4)(5)）: 巡（1 codex exec 内の内部段階）をまたいだ
+# 書込の個人由来フラグ累積・成果物登録は最終版1回 =====
+# Codex の「巡」は Sherpa 側から見た外側ループではなく1回の `codex exec` プロセス内部（本体の
+# spawn_agent 判断）で完結するため、実行後の run_dir 全体スキャン（Feature A）が自然に
+# 「前段だけ書込→後段で失敗」でも書込の事実を拾う（新規コードは足していない・既存契約の確認）。
+
+def test_early_write_then_turn_failure_still_flags_codex_wrote_files(tmp_path, monkeypatch):
+    """内部の前段階だけがファイルを書き、後段（`turn.failed`・agent_message 無し＝失敗保存相当）で
+    終わっても、`env["codex_wrote_files"]` は立つ（受け入れ条件(4)前半）。"""
+    from sherpa import agents as A
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    script = ("#!/usr/bin/env python3\n"
+              "import pathlib\n"
+              "pathlib.Path('draft.md').write_text('前段の下書き')\n"
+              + _emit_citation({"type": "turn.failed", "error": {"code": "boom"}}))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx("early-write-then-fail-u1")
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env.get("codex_silent_failure") is True
+    assert env.get("codex_wrote_files"), \
+        f"前段の書込があるのに失敗終端で codex_wrote_files が立たなかった: {env!r}"
+
+
+def test_repeated_write_across_internal_stages_registers_final_version_once(tmp_path, monkeypatch):
+    """同じファイルを内部の複数段階で書き直しても（最後に上書きした内容が残る）、
+    成果物登録は最終版1本だけ（受け入れ条件(5)）。要 Postgres（台帳登録＝FK 制約で実ユーザーが
+    要る・DB down は skip）。"""
+    from sherpa import agents as A
+    from sherpa import store
+
+    try:
+        store.init_schema()
+    except Exception as e:
+        pytest.skip(f"DB down: {e}")
+    uid = f"unit-depth2s6-{int(time.time() * 1000) % 100000000}"
+    store.upsert_user(uid, display_name="D2S6", password_hash="x", status="active")
+
+    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    _citation_setup(bin_dir, monkeypatch, tmp_path)
+    script = ("#!/usr/bin/env python3\n"
+              "import pathlib\n"
+              "pathlib.Path('report.md').write_text('下書き')\n"
+              "pathlib.Path('report.md').write_text('最終版')\n"
+              + _emit_citation({"type": "item.completed", "item": {
+                  "id": "1", "type": "agent_message", "text": "最終版を作成しました。"}}))
+    _citation_write_fake_codex(bin_dir, script)
+
+    ctx = _citation_ctx(uid)
+    env = _citation_result_env(list(A.CodexProvider().run(ctx)))
+
+    assert env.get("codex_wrote_files")
+    created = env.get("created_files") or []
+    assert len(created) == 1, f"同名ファイルの巡内上書きで複数回登録された: {created!r}"
+    assert created[0]["name"] == "report.md"

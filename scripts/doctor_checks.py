@@ -29,9 +29,10 @@
   - `sherpa.agents._bedrock_auth_available()`: Bedrock の認証手掛かり（中央キーまたは AWS SigV4）
   - `sherpa.providers._codex_openai_compat_block_reason()`: Codex(Azure/custom) 構成の可否判定
     （`POST /settings/test` の Codex 分岐と同じ判定部品）
-  - `sherpa.search_helper.resolve()`: 検索ヘルパー（下調べ役）が実際にどの provider/URL/モデルを
-    使うかの解決（`user_settings.search_helper` 経由の Ollama 利用を見落とさないための再利用。
-    実行時に配線されるのは主頭脳が openai のときだけ＝`sherpa/providers/__init__.py::get_provider`
+  - `sherpa.search_helper.resolve()`: 検索ヘルパー（下調べ役＝worker）が実際にどの provider/URL/
+    モデルを使うかの解決（`user_settings.search_helper` 経由の Ollama 利用を見落とさないための再利用。
+    設定が空／無視のときは頭脳自身が worker になる（`search_helper.self_worker`）。
+    実行時に配線されるのは主頭脳が openai または ollama のときだけ（ollama 頭脳の openai 下調べ役は無視される）＝`sherpa/providers/__init__.py::get_provider`
     と同じゲートを合わせる）
   - `sherpa.model_catalog.resolve_model()`: プロバイダ／用途ごとの実効モデル名
   - `sherpa.store.db._connect()`: Postgres 接続（DSN／`row_factory` の唯一の真実源。ただし
@@ -1349,6 +1350,61 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
     return out
 
 
+def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | None) -> CheckResult:
+    """Codex(OpenAI 系) 構成が使われているとき、multi_agent（`[agents.worker]`/`[agents.evaluator]`・
+    S6）の worker モデルが Codex 自身のモデルカタログにある値のままであること（判定のみ・実
+    codex は呼ばない・値そのものは detail に出さない）。
+
+    実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は接続先が既定 OpenAI
+    （`llm.openai_endpoint_kind() == "openai"`）以外（Azure・独自エンドポイント）のとき multi_agent
+    自体を無効化して worker spawn の失敗を防ぐ——この構成は worker モデル不整合が実際には起こり
+    得ない想定内の組合せのため、理由付き `skip` にする（`ng` にしない）。この検査は接続先種別
+    だけを独立に確認する（サンドボックス無効・Codex(Ollama) の無効化は本番側の判定
+    `codex_multi_agent_enabled` に委ね、ここでは見ない）。接続先設定を読めない異常時を除き
+    `ok`／`skip` を返す。
+    """
+    cid, label = "codex_multi_agent_worker_model", "Codex multi_agent（worker/evaluator）モデル整合"
+    if sys_s is None:
+        return CheckResult(cid, label, "skip", "system_settings を読み取れないため確認できません")
+    from sherpa import agent_constructs, llm
+
+    def _is_codex_openai_family(eff, cmp) -> bool:
+        return eff == "codex" and cmp != "ollama"
+
+    used = False
+    try:
+        if _is_codex_openai_family(agent_constructs.effective_agent(None, system_settings=sys_s),
+                                   agent_constructs.codex_model_provider(None)):
+            used = True
+    except Exception:
+        used = True   # 判定不能＝安全側で「使われている」扱い
+    if rows is None:
+        used = True   # user_settings 未読なら安全側で「使われている」扱い
+    else:
+        for row in rows:
+            settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
+            try:
+                eff = agent_constructs.effective_agent(settings, system_settings=sys_s)
+                cmp = agent_constructs.codex_model_provider(settings)
+            except Exception:
+                used = True
+                continue
+            if _is_codex_openai_family(eff, cmp):
+                used = True
+    if not used:
+        return CheckResult(cid, label, "skip", "Codex(OpenAI 系) 構成が使われていません")
+    try:
+        endpoint_kind = llm.openai_endpoint_kind(sys_s)
+    except Exception as e:
+        return CheckResult(cid, label, "ng", f"接続先設定が壊れているため確認できません（{type(e).__name__}）")
+    if endpoint_kind != "openai":
+        return CheckResult(cid, label, "skip",
+                    "Codex(OpenAI 系) 構成の接続先が既定の OpenAI 以外（Azure・独自エンドポイント）のため、"
+                    "この接続先では multi_agent（worker/evaluator）を自動的に無効にしています"
+                    "（worker モデルのデプロイ名解決が不要になるため確認対象外です）")
+    return CheckResult(cid, label, "ok", "worker モデルは確認済みカタログ値のままです")
+
+
 def _codex_required(sys_s: dict | None, rows: list[dict] | None) -> tuple[bool, bool, str]:
     """Codex CLI が現在の構成で**必須**かどうか、かつ OpenAI/Azure 側の認証確認
     （`codex login status`／`_codex_openai_compat_block_reason`）が必要かどうかを判定する。
@@ -1471,11 +1527,16 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
             _add(url, chat_model, "チャット（利用者設定）")
         elif eff == "codex" and row.get("codex_model_provider") == "ollama":
             _add(url, codex_model, "Codex(Ollama) 実行モデル")
-        # 検索ヘルパーは主頭脳が openai（`provider_id == "openai"`）のときだけ実際に配線される
-        # （`sherpa/providers/__init__.py::get_provider` 参照）。主頭脳が codex/ollama 等の利用者の
-        # `search_helper` 列は runtime では一切評価されないため、ここでも `eff == "openai"` の
-        # ときだけ解決する（残存設定を誤って「使っている」扱いにしない）。
-        if eff == "openai":
+        # worker（下調べ役）が配線されるのは主頭脳が openai／ollama のときだけ（`sherpa/providers/
+        # __init__.py::get_provider` 参照・頭脳 × search_helper の組合せ表は提案書
+        # docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。主頭脳が codex 等の
+        # 利用者の `search_helper` 列は runtime では一切評価されないため、ここでも `eff` が
+        # openai／ollama のときだけ解決する（残存設定を誤って「使っている」扱いにしない）。
+        # Ollama 頭脳には openai の下調べ役は付かない（クラウド1社の方針で無視）ため、
+        # `sh.get("provider") == "ollama"` の絞り込みだけで両頭脳とも組合せ表どおりになる。
+        # 「下調べ役なし」は無い＝`search_helper` が空／無視のときは頭脳自身が worker になるので、
+        # Ollama 頭脳ならチャットと同じ URL/モデルに下調べの用途が増える（`self_worker`）。
+        if eff in ("openai", "ollama"):
             try:
                 sh = search_helper.resolve(row_settings, system_settings=sys_s)
             except Exception:
@@ -1486,6 +1547,8 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
                 sh = None
             if sh and sh.get("provider") == "ollama":
                 _add(sh.get("url"), sh.get("model"), "検索ヘルパー（下調べ）")
+            elif eff == "ollama" and not type_error:
+                _add(url, chat_model, "検索ヘルパー（下調べ）")
 
     if type_error:
         return None
@@ -1918,6 +1981,7 @@ def run_all(*, probe_cloud: bool) -> list[CheckResult]:
         results.extend(check_ollama_probes(sys_s, rows))
         results.extend(check_codex(llm_sys_s, rows, codex_required, codex_needs_openai_auth,
                                     codex_note, probe_cloud, indeterminate=codex_indeterminate))
+        results.append(check_codex_multi_agent_worker_model(sys_s, rows))
 
         return results
 

@@ -164,6 +164,39 @@ def test_azure_endpoint_with_api_version_and_api_key_header(tmp_path, sysset):
             assert "sk-" not in line, f"キーらしき文字列が config に出ている: {line!r}"
 
 
+# ===== RV #66 是正: Azure/独自エンドポイントは multi_agent の対象外 =====
+
+def test_codex_multi_agent_enabled_true_for_default_openai_endpoint():
+    """回帰確認: 接続先が既定(OpenAI 本家)・サンドボックス有効・Codex(OpenAI) 構成では従来どおり有効。"""
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is True
+
+
+def test_codex_multi_agent_enabled_false_for_azure_endpoint(sysset):
+    """Codex(OpenAI) 構成でも接続先が Azure/独自エンドポイントなら multi_agent は無効——
+    worker/evaluator の `model` は OpenAI カタログ固定値で、Azure のデプロイ名としては存在せず
+    spawn が毎ターン失敗する（実機確認済み）。"""
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    _azure(sysset)
+    assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is False
+
+
+def test_azure_endpoint_multi_agent_disabled_writes_no_agents_sections(tmp_path, sysset):
+    """Azure 構成で `codex_multi_agent_enabled()` の判定どおりに `multi_agent` を渡すと、
+    config.toml に `[agents]`/`[agents.worker]`/`[agents.evaluator]` が一切書かれない。"""
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    _azure(sysset)
+    enabled = codex_multi_agent_enabled(ollama_base_url=None, system_settings=None)
+    assert enabled is False
+    txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="gpt-5.5")
+    assert "[agents]" not in txt
+    assert "[agents.worker]" not in txt
+    assert "[agents.evaluator]" not in txt
+
+
 def test_ollama_construct_ignores_azure_settings(tmp_path, sysset):
     """Codex(Ollama) 構成（`ollama_base_url` あり）は接続先設定と無関係＝従来どおり ollama 行だけ。"""
     _azure(sysset)

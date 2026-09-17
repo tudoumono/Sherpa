@@ -247,7 +247,7 @@ def test_agentic_run_catchall_marks_timeout_from_sub_loop_exception():
     class _P(_GenProvider):
         label, model, provider_id = "T", "m", "openai"
 
-        def _sub_agentic_loop(self, ctx):
+        def _sub_agentic_loop(self, ctx, request_claims=True):
             raise TimeoutError("下調べ役が応答しない")
             yield {}   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
 

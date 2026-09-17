@@ -59,7 +59,7 @@ _usage_log = logging.getLogger("sherpa.usage")   # 専用ファイル（usage.lo
 # 'chat-round': 査読の巡ごとの記録。表示・分析用の別イベントで、消費の正本
 # （清書＝`answer.usage`／worker＝'chat-sub'／evaluator・orchestrator＝'chat-review'）とは二重に
 # 足さない（`store/usage.py` の集計はこの kind を除外する）。巡番号・判定・不足の軸・引用件数の
-# 増分・巡内の limits 増分・主張の区分内訳・役割別の内訳は `meta` へ入れる。
+# 増分・巡内の limits 増分・主張の区分内訳・役割別の内訳は `meta` へ入れる。失敗巡も記録する。
 KINDS = ("intent", "embed", "graph_ask", "vlm", "chat-sub", "chat-plan",
         "usage_chat", "research", "chat-review", "chat-round", "rag_render")
 

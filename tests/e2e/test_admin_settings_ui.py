@@ -3432,6 +3432,10 @@ def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html#research")
     expect(page.locator('#tabpanel-provider [id^="depth-base-"]')).to_have_count(0)
+    expect(page.locator('#max-review-rounds')).to_have_value('')
+    expect(page.locator('#max-review-rounds-hint')).to_contain_text('現在の適用値: 7 回。既定: 7 回。')
+    expect(page.locator('#search-investigation-card #depth-base-grep-max-hits')).to_be_visible()
+    expect(page.locator('#search-investigation-card #depth-base-read-window')).to_be_visible()
     expect(page.locator('#codex-investigation-card #depth-base-codex-reasoning')).to_be_visible()
     expect(page.locator('#api-investigation-card #depth-base-max-turns')).to_be_visible()
     expect(page.locator('#search-investigation-card #depth-base-impact-depth')).to_have_count(1)
@@ -3458,7 +3462,13 @@ def test_research_reset_preserves_provider_draft(page, web_base_url):
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 11 and all(value is None for value in body.values())
+    assert len(body) == 12 and all(value is None for value in body.values())
+    assert set(body) == {
+        'depth_base_max_turns', 'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
+        'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
+        'depth_base_codex_reasoning', 'agentic_max_tools_per_turn', 'embed_parallel',
+        'max_review_rounds', 'agentic_budget_per_result', 'agentic_budget_total',
+    }
     assert 'openai_api_key' not in body and 'cloud_provider' not in body
     expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')
     expect(page.locator('#tab-dot-research')).to_be_hidden()
@@ -3659,8 +3669,8 @@ def test_depth_profile_card_reset_tab_nulls_all_seven_fields(page, web_base_url)
     body = records["admin_settings_put"][-1]
     for key in ("depth_base_max_turns", "depth_base_grep_max_hits", "depth_base_qa_max_hits",
                "depth_base_read_window", "depth_base_impact_depth", "depth_base_troubleshoot_depth",
-               "depth_base_codex_reasoning"):
-        assert body.get(key) is None, key
+               "depth_base_codex_reasoning", "max_review_rounds"):
+        assert key in body and body[key] is None, key
 
 
 def test_mock_validate_depth_base_rejects_negative_zero_and_upper_plus_one():

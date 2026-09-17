@@ -170,10 +170,10 @@ class SystemSettingsReq(BaseModel):
     # 戻す（既定は固定値ではなく A7・`cloud_provider` 連動＝`usage_chat._default_provider` 参照）。
     # 空文字は明示的に 422（未設定へ戻すのは null のみ）。
     usage_chat_provider: str | None = None
-    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 標準時の基準値。既定（未指定=None）は各モジュールの
+    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）に依らず一定で使う
+    # 実効基準値（DEPTH-2 S7 以降、倍率・加算は撤去済み）。既定（未指定=None）は各モジュールの
     # env 既定値（`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は
-    # 未設定へ戻す（env/既定へフォールバック）。倍率表自体（標準/深く/最大）は固定でここでは
-    # 編集しない——編集できるのは「標準」が指す基準値のみ。
+    # 未設定へ戻す（env/既定へフォールバック）。
     depth_base_max_turns: StrictInt | None = Field(default=None, ge=1, le=200)
     depth_base_grep_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
     depth_base_qa_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
@@ -181,11 +181,16 @@ class SystemSettingsReq(BaseModel):
     depth_base_impact_depth: StrictInt | None = Field(default=None, ge=1, le=64)
     depth_base_troubleshoot_depth: StrictInt | None = Field(default=None, ge=1, le=16)
     depth_base_codex_reasoning: str | None = None
-    # API の1応答内のツール実行数。調べる深さの倍率を掛けず、全 API 方言に適用する。
+    # API の1応答内のツール実行数の絶対上限。調べる深さに依らず一定で、全 API 方言に適用する。
     agentic_max_tools_per_turn: StrictInt | None = Field(default=None, ge=1, le=256)
     # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。
     # 既定（未指定=None）は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
+    # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。標準 0・深く 2 は固定で、
+    # 設定はこの 1 項目だけ。既定（未指定=None）は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。
+    # null は未設定へ戻す。
+    max_review_rounds: StrictInt | None = Field(
+        default=None, ge=depth_profile.MAX_REVIEW_ROUNDS_MIN, le=depth_profile.MAX_REVIEW_ROUNDS_MAX)
     # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
     # 既定（未指定=None）は env 既定値（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。
     # null は未設定へ戻す（env/既定へフォールバック）。
@@ -824,10 +829,10 @@ def _admin_settings_view() -> dict:
             "default": usage_chat._default_provider(sysset),
             "providers": list(usage_chat._USAGE_CHAT_PROVIDERS),
         },
-        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 「標準」が指す基準値。`effective` は
+        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）に依らず一定で
+        # 使う実効基準値（DEPTH-2 S7 以降、倍率・加算は撤去済み）。`effective` は
         # `depth_profile.effective_base()`（system_settings→env→コード既定）の解決結果、
-        # `default` は env/コード既定（未設定に戻したときの実効値）。倍率表自体（標準/深く/最大）は
-        # 固定で管理画面に出さない（§9・編集できるのは基準値のみ）。
+        # `default` は env/コード既定（未設定に戻したときの実効値）。
         "depth_profile": {
             "max_turns": {
                 "configured": sysset.get("depth_base_max_turns"),
@@ -881,6 +886,13 @@ def _admin_settings_view() -> dict:
             "configured": sysset.get("embed_parallel"),
             "effective": embeddings.effective_embed_parallel(sysset),
             "default": embeddings.EMBED_PARALLEL_DEFAULT,
+        },
+        # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。標準 0・深く 2 は
+        # コード固定のため、設定はこの 1 項目だけ（env フォールバックは持たない）。
+        "max_review_rounds": {
+            "configured": sysset.get("max_review_rounds"),
+            "effective": depth_profile.effective_max_review_rounds(sysset),
+            "default": depth_profile.MAX_REVIEW_ROUNDS_DEFAULT,
         },
         # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
         # `effective` は実際にターン受付が使う値そのもの（`effective_limits()` を直接呼ぶ・
@@ -1471,6 +1483,9 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "embed_parallel" in provided:
         # StrictInt・範囲（1〜16）は pydantic Field が型検証済み。
         updates["embed_parallel"] = provided["embed_parallel"]
+    if "max_review_rounds" in provided:
+        # StrictInt・範囲は pydantic Field が型検証済み。
+        updates["max_review_rounds"] = provided["max_review_rounds"]
     # チャット同時実行の上限（2項目とも StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
     for _k in ("chat_max_turns_per_user", "chat_max_turns_global"):
         if _k in provided:

@@ -138,8 +138,10 @@ def _assert_sub_shape(sub: dict) -> None:
     assert isinstance(guard["llm_timeout"], int)
 
 
-def test_wired_only_for_openai_construct(monkeypatch):
-    """メインが OpenAI 直結のときだけ効く（Codex は自分でツールを回すため介在しない）。
+def test_wired_only_for_openai_or_ollama_construct(monkeypatch):
+    """メインが OpenAI 直結または Ollama のときだけ効く（Codex は自分でツールを回すため
+    介在しない）。頭脳 ollama × search_helper の組合せは `test_ollama_brain_*` 群が別途固定する
+    （§2.1 組合せ表）——ここは openai 分岐（従来どおり）と codex（対象外）の不変を確認する。
 
     `_sub` は `is not None` だけでなく、`_sub_loop` が実際に参照する形（`_assert_sub_shape`）を
     満たすことまで固定する（手組みの辞書ではなく `get_provider()` が組み立てた実物で確認する
@@ -155,8 +157,129 @@ def test_wired_only_for_openai_construct(monkeypatch):
     assert sub is not None
     _assert_sub_shape(sub)
 
-    for other in ({**s, "agent": "codex"}, {**s, "agent": "ollama"}):
-        assert get_provider(other)._sub is None
+    assert get_provider({**s, "agent": "codex"})._sub is None
+
+
+def test_ollama_brain_wires_ollama_search_helper(monkeypatch):
+    """(1) 頭脳 ollama × search_helper=ollama で `provider._sub` が Ollama の下調べ役として
+    付く（provider='ollama'・url が `resolve_ollama_url` の値・§2.1 組合せ表）。"""
+    from sherpa.providers import get_provider
+
+    monkeypatch.setattr("sherpa.store._read_system_settings_fresh", lambda: {"personal_api_keys_allowed": True})
+    s = {"agent": "ollama", "ollama_url": "http://localhost:11434", "search_helper": "ollama"}
+    p = get_provider(s)
+    sub = p._sub
+    assert sub is not None
+    _assert_sub_shape(sub)
+    assert sub["provider"] == "ollama"
+    assert sub["url"] == "http://localhost:11434"
+    assert p._search_helper_error is None
+
+
+def test_ollama_brain_ignores_openai_search_helper(monkeypatch):
+    """(2) 頭脳 ollama × search_helper=openai は**無視**する（クラウド1社の方針・§2.1）。
+    無視しても「下調べ役なし」にはせず、頭脳自身（同じ URL・同じモデル）が worker になる。
+    honest failure にもしない（`_search_helper_error` は None）——無視した事実は監査側
+    （`chat_service._audit_search_helper_ignored_reason`）が別フィールドに残す。"""
+    from sherpa.providers import get_provider
+
+    monkeypatch.setattr("sherpa.store._read_system_settings_fresh", lambda: {"personal_api_keys_allowed": True})
+    s = {"agent": "ollama", "ollama_url": "http://localhost:11434", "ollama_model": "qwen2.5",
+         "search_helper": "openai", "openai_api_key": "sk-x"}
+    p = get_provider(s)
+    sub = p._sub
+    assert sub is not None
+    _assert_sub_shape(sub)
+    assert sub["provider"] == "ollama"          # クラウドの worker は付けない
+    assert sub["url"] == "http://localhost:11434"
+    assert sub["model"] == p.model              # 頭脳と同じモデル
+    assert p._search_helper_error is None
+
+
+def test_ollama_brain_empty_search_helper_uses_self_worker(monkeypatch):
+    """(3) 頭脳 ollama × search_helper='' は頭脳自身が worker（下調べ役なしの選択肢は無い）。"""
+    from sherpa.providers import get_provider
+
+    monkeypatch.setattr("sherpa.store._read_system_settings_fresh", lambda: {"personal_api_keys_allowed": True})
+    s = {"agent": "ollama", "ollama_url": "http://localhost:11434", "ollama_model": "qwen2.5",
+         "search_helper": ""}
+    p = get_provider(s)
+    sub = p._sub
+    assert sub is not None
+    _assert_sub_shape(sub)
+    assert (sub["provider"], sub["url"], sub["model"]) == ("ollama", "http://localhost:11434", p.model)
+    assert p._search_helper_error is None
+
+
+def test_openai_brain_empty_search_helper_uses_self_worker(monkeypatch):
+    """頭脳 openai × search_helper='' も頭脳自身が worker（同じ鍵・同じモデル）。"""
+    from sherpa.providers import get_provider
+
+    monkeypatch.setattr("sherpa.store._read_system_settings_fresh", lambda: {"personal_api_keys_allowed": True})
+    p = get_provider({"agent": "openai", "openai_api_key": "sk-x", "search_helper": ""})
+    sub = p._sub
+    assert sub is not None
+    _assert_sub_shape(sub)
+    assert sub["provider"] == "openai"
+    assert sub["model"] == p.model
+    assert p._search_helper_error is None
+
+
+def test_ollama_brain_invalid_search_helper_is_honest_failure(monkeypatch):
+    """解決失敗（非空の不正値）は頭脳が ollama でも honest failure のまま（今と同じ・§2.1）。"""
+    from sherpa.providers import get_provider
+
+    monkeypatch.setattr("sherpa.store._read_system_settings_fresh", lambda: {"personal_api_keys_allowed": True})
+    s = {"agent": "ollama", "ollama_url": "http://localhost:11434", "search_helper": "gemini"}
+    p = get_provider(s)
+    assert p._sub is None
+    assert p._search_helper_error is not None
+    assert "gemini" in p._search_helper_error
+
+
+def test_ollama_brain_hybrid_branch_runs_with_mocked_llm(monkeypatch):
+    """(5) Ollama 経路で `_sub` が付いたとき、既存の `_agentic_run` のハイブリッド分岐（下調べ役
+    ループ→清書→帰属）が Ollama の頭脳で実際に動く（LLM はモック・分岐が通ることを確認する。
+    標準の調べる深さ＝再調査0回のため査読の巡は発動しない・§2.4）。"""
+    import sherpa.agentic_search as A
+    from sherpa.providers.base import Ctx
+    from sherpa.providers.ollama import OllamaProvider
+
+    class _FakeOllamaSynth(OllamaProvider):
+        """`_stream`（清書）だけ差し替える（`tests/unit/test_sub_loop.py::_FakeSynth` と同型の
+        Ollama 版）。下調べ役のツールループ・帰属は `A._post` 経由で実物のまま動かす。"""
+
+        def _stream(self, prompt, completion=None):
+            if completion is not None:
+                completion.terminal_seen = True
+                completion.reason = "stop"
+            yield "OLLAMA SYNTH ANSWER"
+
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    sub = SH.resolve({"search_helper": "ollama", "ollama_url": "http://localhost:11434"})
+    assert sub is not None and sub["provider"] == "ollama"
+
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
+        {"choices": [{"message": {"content": "LOCAL"}}], "prompt_eval_count": 1, "eval_count": 1},
+    ]
+    orig = A._post
+    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
+    try:
+        p = _FakeOllamaSynth("http://localhost:11434", "qwen2.5")
+        p._sub = sub
+        ctx = Ctx(message="TAX-RATEは?", world="v1", knowledge=True,
+                  route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
+                  dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}, "sources": []},
+                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
+                  make_sources=lambda docs: [{"doc_id": d} for d in docs])
+        events = list(p.run(ctx))
+        assert any(e.get("type") == "node" and e.get("id") == "search-helper" for e in events)
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["usage_sub"]["provider"] == "ollama"
+    finally:
+        A._post = orig
 
 
 def test_wired_invalid_search_helper_sets_error_not_silent_off(monkeypatch):
@@ -232,7 +355,7 @@ def test_sub_failure_returns_honest_failure_without_main_agentic_retry():
     class _P(_GenProvider):
         label, model, provider_id = "T", "m", "openai"
 
-        def _sub_agentic_loop(self, ctx):
+        def _sub_agentic_loop(self, ctx, request_claims=True):
             ran.append("sub")
             yield {"final": "", "docs": set(), "searched": True, "cites": [], "cards": []}   # 引用0件
 
@@ -285,6 +408,59 @@ def test_audit_records_who_read_the_documents(monkeypatch):
     # search_helper_model はもう読まれない＝壊れた値を送っても管理者のカタログ既定のまま監査に出る。
     assert _audit_search_helper({**base, "search_helper": "openai",
                                  "search_helper_model": "bad model"}) == "openai/gpt-5.4-mini"
+
+
+def test_audit_records_ollama_brain_with_ollama_search_helper(monkeypatch):
+    """Ollama 頭脳 × search_helper=ollama も監査に「誰が読んだか」が出る（§2.1 組合せ表・
+    実際に使われた組合せ）。無視された理由は当然 None。"""
+    from sherpa.chat_service import _audit_search_helper, _audit_search_helper_ignored_reason
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    base = {"agent": "ollama", "ollama_url": "http://localhost:11434", "search_helper": "ollama"}
+    assert _audit_search_helper(base) == "ollama/qwen2.5"
+    assert _audit_search_helper_ignored_reason(base) is None
+
+
+def test_audit_ignored_reason_for_ollama_brain_with_openai_search_helper(monkeypatch):
+    """(2) 頭脳 ollama × search_helper=openai は監査 detail で「使った」扱いにせず
+    （`_audit_search_helper` は None のまま・誤読させない）、無視した理由を別フィールドへ残す
+    （`search_helper_ignored='cloud_helper_on_local_brain'`・§2.1 組合せ表）。"""
+    from sherpa.chat_service import _audit_search_helper, _audit_search_helper_ignored_reason
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    base = {"agent": "ollama", "ollama_url": "http://localhost:11434",
+           "search_helper": "openai", "openai_api_key": "sk-x"}
+    assert _audit_search_helper(base) is None
+    assert _audit_search_helper_ignored_reason(base) == "cloud_helper_on_local_brain"
+
+
+def test_audit_ignored_reason_for_ollama_brain_with_openai_search_helper_no_key(monkeypatch):
+    """(C5・RV採用) 頭脳 ollama × search_helper=openai で OpenAI 鍵が**無くても**、無視理由は
+    正規化した設定値だけで判定するため 'cloud_helper_on_local_brain' が残る（`resolve()` は
+    鍵が無いと None を返すため、それで判定すると理由が消えてしまう食い違いだった）。"""
+    from sherpa.chat_service import _audit_search_helper, _audit_search_helper_ignored_reason
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    base = {"agent": "ollama", "ollama_url": "http://localhost:11434", "search_helper": "openai"}
+    assert _audit_search_helper(base) is None
+    assert _audit_search_helper_ignored_reason(base) == "cloud_helper_on_local_brain"
+
+
+def test_audit_ignored_reason_is_none_when_not_ignored(monkeypatch):
+    """無視される組合せでない場合（頭脳 ollama × 未設定／頭脳 openai・実際に使われた場合）は
+    常に None（無視の理由が誤って残らない）。"""
+    from sherpa.chat_service import _audit_search_helper_ignored_reason
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    assert _audit_search_helper_ignored_reason({"agent": "ollama", "search_helper": ""}) is None
+    assert _audit_search_helper_ignored_reason(
+        {"agent": "openai", "openai_api_key": "sk-x", "search_helper": "openai"}) is None
+    assert _audit_search_helper_ignored_reason(
+        {"agent": "ollama", "ollama_url": "http://localhost:11434", "search_helper": "ollama"}) is None
 
 
 def test_audit_search_helper_uses_effective_agent_not_saved_when_a7_mismatches(monkeypatch):

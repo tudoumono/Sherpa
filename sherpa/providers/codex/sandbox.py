@@ -41,6 +41,77 @@ def _codex_sandbox_enabled() -> bool:
     return os.environ.get("SHERPA_CODEX_SANDBOX", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 
+# DEPTH-2 S3b（実機確認・§9.1）: `[agents.worker]` の `model` は Codex CLI 自身のモデルカタログ
+# （`codex debug models`）にある値でなければ spawn_agent が解決エラーになる。Sherpa の
+# `model_catalog.py` 既定（subsearch 用途＝`gpt-5.4-mini`）はこのカタログに無く使えないことを
+# 実機で確認済み（`gpt-5.6-sol` は使えた）。S6 で `_write_codex_authoring_config(multi_agent=True)`
+# がこの値を worker の config_file（`_write_codex_agent_role_configs`）へ書く。
+_CODEX_WORKER_MODEL_FALLBACK = "gpt-5.6-sol"
+
+# S6（§2.6）: `[agents].max_concurrent_threads_per_session`。新規設定は増やさない
+# （提案書「設定は増やさない」）——worker/evaluator の同時起動を抑える固定値で、会話単位ロック
+# （1会話1 codex exec）の内側にとどまる保守的な既定（提案書の「既定 2〜3」の下限）。
+_CODEX_MAX_CONCURRENT_SUBAGENTS = 2
+
+
+def codex_multi_agent_enabled(*, ollama_base_url: str | None, system_settings: dict | None = None) -> bool:
+    """`[agents.worker]`/`[agents.evaluator]`（S6・§2.6）を有効にするかどうかの唯一の判定。
+    `_write_codex_authoring_config` の `multi_agent` 引数・argv の `-c features.multi_agent=true`・
+    `write_agents_md` の役割段落は全てこの関数を呼び、独立に条件式を複製しない（契約が食い違うと
+    Azure/フォールバック経路で実在しない worker モデルの spawn が失敗し続ける・実機確認済み）。
+    doctor（`check_codex_multi_agent_worker_model`）は接続先種別だけを独自に確認する。
+
+    真になるのは次の3条件を全て満たすときだけ:
+      - Codex(Ollama) 構成でない（`ollama_base_url is None`）: worker/evaluator の `model` は
+        Codex 自身の OpenAI カタログ値（`_codex_worker_model()`）固定で、Ollama 側では解決できない。
+      - サンドボックス（permission profile）が有効（`_codex_sandbox_enabled()`）: `[agents.*]` は
+        `codex_home`（サンドボックス有効時だけ作られる per-request CODEX_HOME）配下の config.toml に
+        書く。フォールバック経路（`SHERPA_CODEX_SANDBOX=0`）は config.toml 自体を書かないため、
+        `-c features.multi_agent=true` だけを渡しても spawn 先の層が無い。
+      - 接続先が既定の OpenAI（`_openai_endpoint_kind() == "openai"`）: Azure/独自エンドポイントは
+        worker モデルの固定値がデプロイ名として存在せず、spawn が毎ターン失敗する（実機確認済み）。
+    """
+    if ollama_base_url is not None:
+        return False
+    if not _codex_sandbox_enabled():
+        return False
+    return _openai_endpoint_kind(system_settings) == "openai"
+
+
+def _codex_worker_model(system_settings: dict | None = None) -> str:
+    """`[agents.worker]` の `model` に使う値（S6 で `[agents.*]` を生成するときに呼ぶ）。
+
+    Sherpa 側の下調べ役（subsearch）既定モデルは Codex 自身のモデルカタログに存在しない前提で
+    使えないため参照しない——常に `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）を返す。
+    `system_settings` は将来 admin 側で Codex worker 専用のモデル選択肢を持たせる拡張点として
+    受け取るだけ（現状は無視・未使用引数を明示するため受け口だけ用意）。
+    """
+    return _CODEX_WORKER_MODEL_FALLBACK
+
+
+def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, worker_reasoning: str,
+                                    evaluator_model: str, evaluator_reasoning: str) -> tuple[str, str]:
+    """`[agents.worker]`/`[agents.evaluator]` の `config_file` 実体（役割ごとの層＝モデル・推論
+    レベルだけを持つ最小 TOML）を `codex_home/agents/` 配下に書く（S6・§2.6）。
+
+    `codex_home` は permission profile 上 `":root" = "deny"` の外側＝model-shell から不可視
+    （呼び出し元 `_write_codex_authoring_config` の docstring・`sidecar_path` と同じ理由）。
+    Codex CLI 自身（サンドボックスの対象外プロセス）がこのパスを直接開くだけで、model-shell が
+    書き換えたり読んだりする経路には無い。戻り値は (worker の絶対パス, evaluator の絶対パス)。
+    """
+    d = codex_home / "agents"
+    d.mkdir(parents=True, exist_ok=True)
+    worker_path = d / "worker.toml"
+    evaluator_path = d / "evaluator.toml"
+    worker_path.write_text(
+        f'model = {_toml_str(worker_model)}\n'
+        f'model_reasoning_effort = {_toml_str(worker_reasoning)}\n', encoding="utf-8")
+    evaluator_path.write_text(
+        f'model = {_toml_str(evaluator_model)}\n'
+        f'model_reasoning_effort = {_toml_str(evaluator_reasoning)}\n', encoding="utf-8")
+    return str(worker_path), str(evaluator_path)
+
+
 def _kb_read_roots(world: str) -> list:
     """permission profile に read を許す KB の絶対パス（fixtures か実 world root・無ければ data/kb 全体）。"""
     from ... import worlds
@@ -551,7 +622,10 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
                                   layer=None,
                                   direct_read_roots: list | None = None,
                                   sensitive_deny: list | None = None,
-                                  deny_roots: list | None = None) -> None:
+                                  deny_roots: list | None = None,
+                                  sidecar_path: str | None = None,
+                                  multi_agent: bool = False,
+                                  orchestrator_model: str | None = None) -> None:
     """per-request CODEX_HOME に permission profile（＋任意で MCP 設定）を書く。
     **creds は config ファイル内に閉じる**（`:root=deny` 下では model-shell から CODEX_HOME 不可視・
     コマンドライン `-c` に creds を出さない＝`/proc/<pid>/cmdline` 漏洩も無い）。auth.json は実 home から symlink。
@@ -577,8 +651,29 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     `deny_roots`（省略可）: `direct_read_roots == []` のときに KB root と併せて明示 deny する
     root（派生ルート等）。
 
+    `sidecar_path`（省略可・DEPTH-2 S3b）: 渡されたとき、MCP サーバ env に `SHERPA_MCP_SIDECAR` を
+    足す（`mcp` が偽なら無視される＝MCP 自体を起動しないので意味が無い）。子エージェント
+    （`spawn_agent`）が読んだ doc_id・ask_user の質問をこのファイルへ本文なしで記録させる——
+    子の MCP 呼出は親の `--json` に構造化イベントとして現れないため
+    （`docs/notes/2026-09-17-DEPTH-2-S3-Codex-multi_agent-実機確認.md` (d)(e)）、唯一の観測経路。
+    呼び出し元（provider.py）は codex_home 配下（この関数が書く permission profile 上
+    `":root" = "deny"` の外側＝model-shell から不可視・"." の workspace_write の外）にこのパスを
+    置く契約——run_dir 直下（`":workspace_roots"` `"." = "write"`）に置くと Codex の shell ツールが
+    偽の読取／ask_user 行を追記できてしまう。
+
     Python 実行環境（`_venv_root()`）は、渡された read 対象とは独立に、venv で動いているときだけ
-    常に read で足す（裁定）。"""
+    常に read で足す（裁定）。
+
+    `multi_agent`（省略可・既定 `False`・S6・§2.6）: 真のとき `[agents]`／`[agents.worker]`／
+    `[agents.evaluator]` を config.toml へ足す。`-c features.multi_agent=true` 自体は呼び出し元
+    （provider.py の argv）が付ける——ここでは CLI 機能フラグではなくサブエージェントの層
+    （モデル・推論レベル・同時実行数）だけを書く。worker の `model` は常に `_codex_worker_model()`
+    （Codex 自身のカタログにある安価枠）。evaluator の `model` は `orchestrator_model`（省略時は
+    worker と同じモデルへ倒す＝本体のモデル名が取れない呼び出し元でも config 生成自体は壊さない）
+    ・推論レベルは `reason`（本体へ実際に渡す `model_reasoning_effort` と同じ基準値）。
+    role ごとの層の実体（`config_file` が指す TOML）は `_write_codex_agent_role_configs`
+    （codex_home 配下＝model-shell 不可視）に書く。
+    """
     codex_home.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(codex_home, 0o700)                 # creds を含む CODEX_HOME を同ホスト他プロセス/ユーザから守る
@@ -677,6 +772,10 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     if mcp:
         py = sys.executable or "python3"
         menv = _mcp_env(world, scope_paths, ask_disabled, layer=layer)
+        if sidecar_path:
+            # DEPTH-2 S3b: 子エージェント（同じ config.toml の mcp_servers.sherpa を継承する）も
+            # 同じサイドカーへ書く——サイドカーは caller（親/子いずれの MCP プロセスか）を区別しない。
+            menv["SHERPA_MCP_SIDECAR"] = str(sidecar_path)
         # クリーン env 下でも MCP サブプロセス（python -m sherpa.mcp_server）が動くよう PATH/PYTHONPATH を補う。
         menv.setdefault("PATH", os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
         menv.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[3]))
@@ -688,6 +787,26 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
             'args = ["-m", "sherpa.mcp_server"]',
             'default_tools_approval_mode = "approve"',
             f'env = {env_toml}',
+        ]
+    if multi_agent:
+        _worker_model = _codex_worker_model(system_settings)
+        _worker_path, _evaluator_path = _write_codex_agent_role_configs(
+            codex_home, worker_model=_worker_model, worker_reasoning="low",
+            evaluator_model=orchestrator_model or _worker_model, evaluator_reasoning=reason)
+        lines += [
+            '',
+            '[agents]',
+            f'default_subagent_model = {_toml_str(_worker_model)}',
+            'default_subagent_reasoning_effort = "low"',
+            f'max_concurrent_threads_per_session = {_CODEX_MAX_CONCURRENT_SUBAGENTS}',
+            '',
+            '[agents.worker]',
+            'description = "資料の検索・精読と一次判断だけを担当。最終回答は書かない。"',
+            f'config_file = {_toml_str(_worker_path)}',
+            '',
+            '[agents.evaluator]',
+            'description = "根拠と一次判断を別観点で査読し、反証・条件例外・回答漏れ・未探索の範囲を返す。書き直さない。"',
+            f'config_file = {_toml_str(_evaluator_path)}',
         ]
     cfg = codex_home / "config.toml"
     # creds(mcp env) を含むため symlink/race を避けて 0600 で書く（O_CREAT|O_EXCL|O_NOFOLLOW）。

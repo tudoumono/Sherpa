@@ -548,3 +548,249 @@ def test_empty_final_answer_falls_to_fixed_message_not_dispatch(tmp_path, monkey
     assert len(helper._read_argv_log(argv_log)) == 1
     assert env["headline"] == "回答を取り出せませんでした。もう一度お試しください。"
     assert env["headline"] != "dispatch-headline"
+
+
+# ===== DEPTH-2 S1（出力スキーマ v2・主張配列・docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5） =====
+
+def _sj2(status: str, answer: str, claims: list, next_step: str | None = None) -> str:
+    return json.dumps({"status": status, "answer": answer, "next_step": next_step, "claims": claims},
+                      ensure_ascii=False)
+
+
+def test_parse_structured_v2_reads_claims_array():
+    payload = _sj2("final", "回答", [
+        {"id": "c1", "status": "confirmed", "text": "t1", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "unknown", "text": "t2", "evidence_refs": [],
+         "reason": "", "reason_code": "budget"}])
+    parsed = PV._parse_structured_v2(payload)
+    assert parsed is not None
+    assert parsed["answer"] == "回答"
+    assert len(parsed["claims"]) == 2
+    assert parsed["claims"][1]["reason_code"] == "budget"
+
+
+def test_parse_structured_v2_backward_compatible_with_v1_three_keys():
+    """v1 の3キー形（`claims` 無し）も後方互換で読める——`claims` は空配列を補う。"""
+    payload = json.dumps({"status": "final", "answer": "回答", "next_step": None})
+    assert PV._parse_structured_v2(payload) == {
+        "status": "final", "answer": "回答", "next_step": None, "claims": []}
+
+
+def test_parse_structured_v2_rejects_truncated_json():
+    truncated = '{"status":"final","answer":"回答","next_step":null,"claims":[{"id":"c1"'
+    assert PV._parse_structured_v2(truncated) is None
+
+
+def test_parse_structured_v2_falls_back_to_empty_claims_on_invalid_claim_reason_code():
+    """不正な主張要素は主張構造だけを不採用にする——`status`/`answer` は保持し `claims` を
+    空にする（RV #15: 応答全体を捨てて固定文言に落とさない）。"""
+    payload = _sj2("final", "回答", [{"id": "c1", "status": "unknown", "text": "t",
+                                     "evidence_refs": [], "reason": "", "reason_code": "not_a_real_code"}])
+    parsed = PV._parse_structured_v2(payload)
+    assert parsed == {"status": "final", "answer": "回答", "next_step": None, "claims": []}
+
+
+def test_parse_structured_v2_falls_back_to_empty_claims_on_extra_claim_key():
+    payload = _sj2("final", "回答", [{"id": "c1", "status": "confirmed", "text": "t",
+                                     "evidence_refs": [], "reason": "", "reason_code": "", "extra": 1}])
+    parsed = PV._parse_structured_v2(payload)
+    assert parsed == {"status": "final", "answer": "回答", "next_step": None, "claims": []}
+
+
+def test_env_2_selects_v2_schema_file_and_surfaces_claims(tmp_path, monkeypatch):
+    """env `SHERPA_CODEX_OUTPUT_SCHEMA=2` は v2 スキーマファイルを argv に付け、応答の `claims`
+    が envelope（`data.claims`）へ現れる。"""
+    steps = [{"thread_id": "TH-SCHEMA-V2",
+             "agent_messages": [_sj2("final", "確認した結果、標準税率は10%です。", [
+                 {"id": "c1", "status": "confirmed", "text": "標準税率は10%。",
+                  "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""},
+                 {"id": "c2", "status": "unknown", "text": "軽減税率の適用開始日は不明。",
+                  "evidence_refs": [], "reason": "", "reason_code": "unexplored"}])],
+             "usage": helper._usage()}]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_v2", schema_env="2")
+    prov = A.CodexProvider()
+    ctx = helper._ctx(uid="schema-v2", conversation_id=20700)
+
+    env = helper._result_env(helper._run(prov, ctx))
+
+    assert env["headline"] == "確認した結果、標準税率は10%です。"
+    claims = env["data"]["claims"]
+    assert {c["status"] for c in claims} == {"confirmed", "unknown"}
+    unknown = next(c for c in claims if c["status"] == "unknown")
+    assert unknown["reason_code"] == "unexplored"
+    calls = helper._read_argv_log(argv_log)
+    argv = calls[0]
+    schema_path = argv[argv.index("--output-schema") + 1]
+    assert schema_path.endswith("output_schema_v2.json")
+
+
+def test_env_1_default_still_uses_v1_schema_file_without_claims():
+    """既定（env 未設定＝1）は従来どおり v1 スキーマ——`data.claims` は付かない
+    （既存テスト7番と同じ argv 契約・回帰確認）。"""
+    assert PV._env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 1, 0, 2) == 1
+
+
+# ===== RV C1/C4（docs/rv/2026-09-17-DEPTH-2.md）: `_parse_claim` の裏付け・理由必須 =====
+
+def test_parse_claim_rejects_confirmed_with_empty_evidence_refs():
+    """Codex は state の ev_id を持たないため実在チェックまではできないが、confirmed が
+    根拠参照を1件も挙げない（裏付けゼロの確定）主張は拒否する。"""
+    item = {"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [],
+            "reason": "", "reason_code": ""}
+    assert PV._parse_claim(item) is None
+
+
+def test_parse_claim_rejects_confirmed_with_whitespace_only_evidence_refs():
+    """`evidence_refs` が空白のみの文字列だけだと、非空リストでも裏付けゼロ扱いで拒否する
+    （API 経路 `investigation_state.InvestigationState.set_claims` と同じ規約）。"""
+    item = {"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [""],
+            "reason": "", "reason_code": ""}
+    assert PV._parse_claim(item) is None
+
+
+def test_parse_claim_accepts_confirmed_with_evidence_refs():
+    item = {"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["4期/01_標準/消費税法.md"],
+            "reason": "", "reason_code": ""}
+    assert PV._parse_claim(item) == item
+
+
+def test_parse_claim_rejects_inferred_with_empty_reason():
+    item = {"id": "c1", "status": "inferred", "text": "t", "evidence_refs": [],
+            "reason": "", "reason_code": ""}
+    assert PV._parse_claim(item) is None
+
+
+def test_parse_claim_rejects_inferred_with_whitespace_only_reason():
+    item = {"id": "c1", "status": "inferred", "text": "t", "evidence_refs": [],
+            "reason": "   ", "reason_code": ""}
+    assert PV._parse_claim(item) is None
+
+
+def test_parse_structured_v2_falls_back_to_empty_claims_on_confirmed_without_evidence_refs():
+    """`_parse_structured_v2` は `claims` の各要素を `_parse_claim` で検証する——1件でも
+    裏付けゼロの confirmed があれば主張配列だけを空にし、`status`/`answer` は保持する。"""
+    payload = _sj2("final", "回答", [{"id": "c1", "status": "confirmed", "text": "t",
+                                     "evidence_refs": [], "reason": "", "reason_code": ""}])
+    parsed = PV._parse_structured_v2(payload)
+    assert parsed == {"status": "final", "answer": "回答", "next_step": None, "claims": []}
+
+
+def test_env_2_invalid_claim_keeps_final_answer_without_extra_continuation(tmp_path, monkeypatch):
+    """RV #15: status=final・answer 有りの応答で claims に不正要素が1件混じっていても、
+    answer/status は保持されて claims だけが空になり、不要な continuation attempt を消費せず
+    固定文言「回答を取り出せませんでした」にも落ちない。"""
+    steps = [{"thread_id": "TH-SCHEMA-V2-BADCLAIM",
+             "agent_messages": [_sj2("final", "確認した結果、標準税率は10%です。", [
+                 {"id": "c1", "status": "unknown", "text": "軽減税率の適用開始日は不明。",
+                  "evidence_refs": [], "reason_code": "not_a_real_code"}])],
+             "usage": helper._usage()}]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_v2_badclaim", schema_env="2")
+    prov = A.CodexProvider()
+    ctx = helper._ctx(uid="schema-v2-badclaim", conversation_id=20701)
+
+    env = helper._result_env(helper._run(prov, ctx))
+
+    assert env["headline"] == "確認した結果、標準税率は10%です。"
+    assert "回答を取り出せませんでした" not in env["headline"]
+    assert not env.get("data", {}).get("claims")
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 1, f"不正な claims 要素だけで応答全体が捨てられ継続してしまっている: {calls!r}"
+
+
+# ===== RV C5: v2 選択時は AGENTS.md に claims の意味・区分・理由コード語彙を伝える =====
+
+def test_write_agents_md_v2_paragraph_has_claims_vocabulary_only_when_schema_v2(tmp_path):
+    """`output_schema_v2=True` のときだけ `claims`／confirmed/inferred/unknown の語彙を含む
+    4項目段落を書く。`output_schema_v2=False`（既定）は従来どおり3項目段落のまま。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring"
+    d.mkdir()
+    codex_agents_md.write_agents_md(d, output_schema=True, output_schema_v2=False)
+    v1_txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "claims" not in v1_txt, "output_schema_v2=False なのに claims の段落が混入している"
+
+    codex_agents_md.write_agents_md(d, output_schema=True, output_schema_v2=True)
+    v2_txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "claims" in v2_txt and "confirmed" in v2_txt and "inferred" in v2_txt and "unknown" in v2_txt
+    assert "not_found_in_scope" in v2_txt   # 閉じた理由コード語彙も明示する
+
+
+def test_write_agents_md_v2_paragraph_has_final_in_progress_wording(tmp_path):
+    """RV是正2巡目 指摘(2): v2 段落は元々「3項目版と同じ意味」と v1 段落を参照していたが、
+    output_schema_v2=True のときは v1 段落自体が出力されず参照先が無かった——v2 段落自身に
+    final／in_progress／next_step の意味と中断時（全件確認前・予算到達）の記述条件が明記され、
+    v1 段落の該当記述は変わらないことを確認する。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring"
+    d.mkdir()
+
+    codex_agents_md.write_agents_md(d, output_schema=True, output_schema_v2=False)
+    v1_txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert codex_agents_md._STATUS_FIELD_MEANING in v1_txt
+
+    codex_agents_md.write_agents_md(d, output_schema=True, output_schema_v2=True)
+    v2_txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert codex_agents_md._STATUS_FIELD_MEANING in v2_txt, (
+        "v2 段落に final/in_progress/next_step と中断時の記述条件が明記されていない")
+    assert "final" in v2_txt and "in_progress" in v2_txt and "next_step" in v2_txt
+    assert "予算到達" in v2_txt   # 中断条件（全件確認前・予算到達）が v2 段落自身に残っている
+
+
+def test_write_agents_md_v2_paragraph_requires_output_schema_on(tmp_path):
+    """`output_schema=False` なら `output_schema_v2=True` を渡しても段落を足さない
+    （`--output-schema` 自体が無効なターンへ CLI が強制しない構造化応答を約束させない）。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring"
+    d.mkdir()
+    codex_agents_md.write_agents_md(d, output_schema=False, output_schema_v2=True)
+    txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "claims" not in txt and "next_step" not in txt
+
+
+def test_env_2_run_writes_v2_agents_md_paragraph(tmp_path, monkeypatch):
+    """`SHERPA_CODEX_OUTPUT_SCHEMA=2` の実行は、実際に生成した run_dir の AGENTS.md へ
+    v2 段落（claims の意味・区分・理由コード語彙）を書く——スキーマだけ v2 を選んでも
+    Codex 側への指示が3項目のままだと `data.claims` が無言で空になる、という実害の再現。"""
+    from sherpa import codex_agents_md
+    captured: dict = {}
+    orig_write = codex_agents_md.write_agents_md
+
+    def _spy(authoring, output_schema=False, direct_read=True, output_schema_v2=False, **kw):
+        captured["output_schema_v2"] = output_schema_v2
+        return orig_write(authoring, output_schema=output_schema, direct_read=direct_read,
+                          output_schema_v2=output_schema_v2, **kw)
+    monkeypatch.setattr(PV.codex_agents_md, "write_agents_md", _spy)
+
+    steps = [{"thread_id": "TH-SCHEMA-V2-AGENTS",
+             "agent_messages": [_sj2("final", "確認しました。", [])], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_v2_agents", schema_env="2")
+    prov = A.CodexProvider()
+    ctx = helper._ctx(uid="schema-v2-agents", conversation_id=20701)
+
+    helper._run(prov, ctx)
+
+    assert captured.get("output_schema_v2") is True
+
+
+def test_env_1_run_writes_v1_agents_md_paragraph(tmp_path, monkeypatch):
+    """既定（env 未設定＝v1）の実行は v2 段落を渡さない（回帰確認）。"""
+    from sherpa import codex_agents_md
+    captured: dict = {}
+    orig_write = codex_agents_md.write_agents_md
+
+    def _spy(authoring, output_schema=False, direct_read=True, output_schema_v2=False, **kw):
+        captured["output_schema_v2"] = output_schema_v2
+        return orig_write(authoring, output_schema=output_schema, direct_read=direct_read,
+                          output_schema_v2=output_schema_v2, **kw)
+    monkeypatch.setattr(PV.codex_agents_md, "write_agents_md", _spy)
+
+    steps = [{"thread_id": "TH-SCHEMA-V1-AGENTS",
+             "agent_messages": [_sj("final", "確認しました。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_v1_agents")
+    prov = A.CodexProvider()
+    ctx = helper._ctx(uid="schema-v1-agents", conversation_id=20702)
+
+    helper._run(prov, ctx)
+
+    assert captured.get("output_schema_v2") is False

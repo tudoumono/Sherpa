@@ -665,6 +665,110 @@ def test_stream_message_taints_turn_personal_when_conversation_already_personal(
     assert assistant_row["personal"] is True
 
 
+# ===== DEPTH-2 S2（§2.7）: API/Ollama の write_output_file が書込みを発生させたターンも
+# Codex の codex_wrote_files と同じく個人由来として扱う（`env["wrote_files"]`）=====
+
+def test_handle_message_marks_personal_when_env_has_wrote_files(monkeypatch):
+    """`write_output_file` が台帳登録に成功したターン（`env["wrote_files"]` が立つ）は、
+    Codex の created files ターンと同じく質問・回答の両行を personal=True で保存する
+    （sanitized share で本文を伏せる判定に含める・§2.7 の (d)）。"""
+    saved = _mock_store_no_db(monkeypatch)
+    env = {"headline": "一覧.md を作成しました。", "summary": {}, "data": {}, "sources": [],
+          "scope": {"world": "v1", "scope_paths": [], "source": "all"},
+          "wrote_files": ["一覧.md"],
+          "created_files": [{"name": "一覧.md", "download_url": "/workspace/files/1/download"}]}
+    events = [{"type": "_result", "env": env, "decision": {"lens": "author", "input": "q", "reason": "t"}}]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    CS.handle_message(None, "消費税率の一覧をExcelにまとめて", world="v1", conversation_id=999,
+                      user_id="admin", knowledge=False, personal=False)
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is True
+    assert assistant_row["personal"] is True
+
+
+def test_handle_message_stays_non_personal_without_wrote_files(monkeypatch):
+    """対照: `wrote_files` が立たない通常ターンは従来どおり非個人のまま
+    （書込みの有無だけを判定に使っていることの確認・作成物カードの有無自体は判定に使わない）。"""
+    saved = _mock_store_no_db(monkeypatch)
+    events = [_fixed_result("検索結果です（ファイルは作成していません）")]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    CS.handle_message(None, "税率を教えて", world="v1", conversation_id=999,
+                      user_id="admin", knowledge=False, personal=False)
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is False
+    assert assistant_row["personal"] is False
+
+
+def test_stream_message_marks_personal_when_env_has_wrote_files(monkeypatch):
+    """handle_message と同じ判定を stream_message（保存サイト2/3）でも確認する。"""
+    saved = _mock_store_no_db(monkeypatch)
+    env = {"headline": "一覧.md を作成しました。", "summary": {}, "data": {}, "sources": [],
+          "scope": {"world": "v1", "scope_paths": [], "source": "all"},
+          "wrote_files": True}
+    events = [{"type": "_result", "env": env, "decision": {"lens": "author", "input": "q", "reason": "t"}}]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    list(CS.stream_message(None, "消費税率の一覧をExcelにまとめて", world="v1", conversation_id=999,
+                           user_id="admin", knowledge=False, personal=False))
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is True
+    assert assistant_row["personal"] is True
+
+
+# ===== C40/#46: GraphSchemaEraError の固定文言失敗保存も、直前の write_output_file 成功を
+# 個人由来として引き継ぐ =====
+
+class _FakeGraphSchemaEraProvider:
+    """`_last_created_files`（このターンで `write_output_file` が既に台帳登録した成果物）を
+    持ったまま、イテレーション途中で `GraphSchemaEraError` を送出するフェイク。"""
+
+    def __init__(self, created_files):
+        self._last_created_files = created_files
+
+    def run(self, ctx):
+        from sherpa.ingest.world_neo4j import GraphSchemaEraError
+
+        def _gen():
+            yield {"type": "node", "id": "tool-graph"}
+            raise GraphSchemaEraError("v1", "v0", lens="qa")
+        return _gen()
+
+
+def test_handle_message_graph_schema_era_failure_after_write_stays_personal(monkeypatch):
+    """C40/#46 是正: `write_output_file` の書込みが既に成功した直後に `GraphSchemaEraError` で
+    固定文言へ縮退しても（`_degrade_overload`）、書込みは実在する以上そのターンは個人由来のまま
+    保存する——是正前は固定文言 env に wrote_files/created_files が無く、personal=False のまま
+    保存されていた。"""
+    saved = _mock_store_no_db(monkeypatch)
+    created = [{"rel_path": "一覧.md", "download_url": "/workspace/files/1/download"}]
+    monkeypatch.setattr(CS, "get_provider",
+                        lambda settings, **kw: _FakeGraphSchemaEraProvider(created))
+
+    CS.handle_message(None, "資料の影響範囲を教えて", world="v1", conversation_id=999,
+                      user_id="admin", knowledge=False, personal=False)
+    user_row = next(r for r in saved if r["role"] == "user")
+    assistant_row = next(r for r in saved if r["role"] == "assistant")
+    assert user_row["personal"] is True
+    assert assistant_row["personal"] is True
+
+
+def test_degrade_overload_carries_created_files_into_fixed_lens_result():
+    """`_degrade_overload` 単体: `provider._last_created_files` が非空なら、固定文言 env にも
+    `wrote_files`/`created_files` を補う（C40/#46）。"""
+    created = [{"rel_path": "一覧.md", "download_url": "/workspace/files/1/download"}]
+    provider = _FakeGraphSchemaEraProvider(created)
+    out = list(CS._degrade_overload(provider.run(None), "m", "w1", None, provider=provider))
+    result = next(e for e in out if e["type"] == "_result")
+    assert result["env"].get("wrote_files")
+    assert result["env"].get("created_files") == [
+        {"name": "一覧.md", "download_url": "/workspace/files/1/download"}]
+
+
 # ===== A3: 非ストリーミング /chat が確認カード（question）で 500 にならない =====
 
 def test_handle_message_saves_clarify_and_returns_instead_of_500(monkeypatch):
@@ -906,6 +1010,157 @@ def test_handle_message_stopped_with_no_events_returns_stopped_not_500(monkeypat
     assert out == {"type": "stopped", "conversation_id": 999}   # 500 にならず stopped 応答
     assert all(r["role"] != "assistant" for r in saved)          # assistant は保存しない
     assert audits and audits[-1]["stopped"] is True              # 停止監査が残る
+
+
+# ---- DEPTH-2 S5: 巡ループの終端 4 種と consumer（§2.4・providers/base.py::TERMINALS）----
+
+def _stopped_terminal_result(headline="1巡目で打ち切りました（利用者の操作で停止したため）。"):
+    """巡ループの停止終端（`_terminal="stopped"`）の `_result`＝追加の LLM 呼び出しをせず
+    コードで組んだ未完了回答。"""
+    ev = _fixed_result(headline)
+    ev["env"]["_terminal"] = "stopped"
+    ev["env"]["stopped_by_user"] = True
+    return ev
+
+
+def test_stream_message_stopped_terminal_saves_incomplete_answer_and_audits_stopped(monkeypatch):
+    """停止終端だけは保存する（従来の「停止後の `_result` は捨てる」の例外）。監査も
+    assistant を保存した形＝`stopped=true` で一致させる。"""
+    saved = _mock_store_no_db(monkeypatch)
+    audits = []
+    monkeypatch.setattr(store, "audit",
+                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    events = [_stopped_terminal_result()]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = list(CS.stream_message(None, "停止終端 テスト", world="v1", conversation_id=999,
+                                 user_id="admin", knowledge=False, stop_event=stop_event))
+    assistant = [r for r in saved if r["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert "打ち切りました" in assistant[0]["content"]
+    assert assistant[0]["answer"]["stop_kind"] == "stopped_by_user"   # 完了として数えない
+    assert "_terminal" not in assistant[0]["answer"]                  # 内部キーは保存しない
+    assert audits[-1]["stopped"] is True and audits[-1]["lens"] == "stopped"
+    assert audits[-1]["message_id_assistant"] == assistant[0]["id"]   # 監査と保存が一致
+    assert any(e.get("type") == "answer" for e in out)
+
+
+def test_handle_message_stopped_terminal_saves_incomplete_answer(monkeypatch):
+    """同期経路（POST /chat）も同じ契約＝停止終端は保存し、監査も停止として残す。"""
+    saved = _mock_store_no_db(monkeypatch)
+    audits = []
+    monkeypatch.setattr(store, "audit",
+                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    monkeypatch.setattr(CS, "get_provider",
+                        lambda settings, **kw: _FakeExecEventProvider([_stopped_terminal_result()]))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = CS.handle_message(None, "停止終端 同期 テスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, stop_event=stop_event)
+    assert out["message"]["role"] == "assistant"
+    assert [r["role"] for r in saved].count("assistant") == 1
+    assert audits[-1]["stopped"] is True and audits[-1]["lens"] == "stopped"
+
+
+def test_stopped_terminal_is_the_only_saved_result_after_stop(monkeypatch):
+    """停止後に provider が返す**通常**の `_result` は従来どおり保存しない（例外は停止終端だけ）。"""
+    saved = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(CS, "get_provider",
+                        lambda settings, **kw: _FakeExecEventProvider([_fixed_result("通常の回答")]))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = CS.handle_message(None, "停止後の通常 result テスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, stop_event=stop_event)
+    assert out == {"type": "stopped", "conversation_id": 999}
+    assert all(r["role"] != "assistant" for r in saved)
+
+
+def test_stream_message_keeps_draining_until_stopped_terminal(monkeypatch):
+    """停止検知後に provider がノードを先に返しても、停止終端まで受け取って未完了回答を保存する
+    （最初のイベントで打ち切ると終端が保存されない）。途中イベントは配信も保存もしない。"""
+    saved = _mock_store_no_db(monkeypatch)
+    audits = []
+    monkeypatch.setattr(store, "audit",
+                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    events = [{"type": "node", "id": "main-review-r1", "kind": "think", "label": "査読",
+               "detail": "読んでいます", "status": "done"},
+              _stopped_terminal_result()]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = list(CS.stream_message(None, "停止終端 ノード先行 テスト", world="v1", conversation_id=999,
+                                 user_id="admin", knowledge=False, stop_event=stop_event))
+    assistant = [r for r in saved if r["role"] == "assistant"]
+    assert len(assistant) == 1 and "打ち切りました" in assistant[0]["content"]
+    assert [d["stopped"] for d in audits] == [True]           # 停止監査は1回だけ
+    assert not [e for e in out if e.get("type") == "node"]    # 停止後の途中ノードは配信しない
+    assert not [e for e in out if e.get("type") == "stopped"]
+
+
+def test_handle_message_keeps_draining_until_stopped_terminal(monkeypatch):
+    """同期経路も同じ＝停止後のノードを捨てつつ停止終端まで受け取り、未完了回答を保存する。"""
+    saved = _mock_store_no_db(monkeypatch)
+    audits = []
+    monkeypatch.setattr(store, "audit",
+                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    events = [{"type": "node", "id": "main-review-r1", "kind": "think", "label": "査読",
+               "detail": "読んでいます", "status": "done"},
+              _stopped_terminal_result()]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = CS.handle_message(None, "停止終端 同期 ノード先行 テスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, stop_event=stop_event)
+    assert out["message"]["role"] == "assistant"
+    assert [r["role"] for r in saved].count("assistant") == 1
+    assert [d["stopped"] for d in audits] == [True]
+
+
+def test_stream_message_without_stopped_terminal_still_audits_stop_once(monkeypatch):
+    """停止終端が来ないまま provider が終えた従来経路は、assistant を保存せず停止監査と
+    `stopped` 応答を1回だけ返す。"""
+    saved = _mock_store_no_db(monkeypatch)
+    audits = []
+    monkeypatch.setattr(store, "audit",
+                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    events = [{"type": "node", "id": "n1", "kind": "think", "label": "x", "detail": "y",
+               "status": "done"},
+              _fixed_result("通常の回答")]
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+    stop_event = threading.Event()
+    stop_event.set()
+    out = list(CS.stream_message(None, "停止 未保存 テスト", world="v1", conversation_id=999,
+                                 user_id="admin", knowledge=False, stop_event=stop_event))
+    assert all(r["role"] != "assistant" for r in saved)
+    assert [e.get("type") for e in out].count("stopped") == 1
+    assert [d["stopped"] for d in audits] == [True]
+
+def test_round_personal_flag_marks_answer_personal_and_is_not_saved(monkeypatch):
+    """§2.7: 巡ループが全巡で累積した個人由来／書込フラグ（`_personal_rounds`）は、
+    最終巡に無くても回答を個人扱いにする。内部キー自体は保存しない。"""
+    saved = _mock_store_no_db(monkeypatch)
+    ev = _fixed_result("巡の途中で個人 workspace へ書いた回答")
+    ev["env"]["_personal_rounds"] = True
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([ev]))
+    out = CS.handle_message(None, "個人由来 累積 テスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False, personal=False)
+    assert out["message"]["personal"] is True
+    assert "_personal_rounds" not in out["message"]["answer"]
+
+
+def test_round_personal_flag_marks_clarify_card_personal_and_is_not_saved(monkeypatch):
+    """確認カード終端（`TERMINALS` の "question"）にも同じ累積を渡す＝個人扱いで一度だけ保存し、
+    内部キーは question payload・配信イベントのどちらにも残さない。"""
+    saved = _mock_store_no_db(monkeypatch)
+    q = {**_fixed_question(), "_personal_rounds": True}
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([q]))
+    out = list(CS.stream_message(None, "確認カード 個人由来 テスト", world="v1", conversation_id=999,
+                                 user_id="admin", knowledge=False))
+    clarify = [r for r in saved if r["role"] == "assistant"]
+    assert len(clarify) == 1 and clarify[0]["personal"] is True
+    assert "_personal_rounds" not in clarify[0]["answer"]
+    assert all("_personal_rounds" not in e for e in out)
 
 
 # ---- EXT-2: evidence_committed は `_result.env` のサイドカー（独立イベントとして yield しない）----
@@ -1334,9 +1589,9 @@ def _sm(depth_profile=None, **extra):
            "depth_profile": depth_profile, **extra}
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 8), ("standard", 8), ("deep", 10), ("max", 12)])
+@pytest.mark.parametrize("profile,expected_depth", [(None, 8), ("standard", 8), ("deep", 8), ("max", 8)])
 def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expected_depth):
-    """§3.2 の表: 影響たどりの深さ（既定 8）は標準+0・深く+2・最大+4。"""
+    """DEPTH-2 S7: 影響たどりの深さ（既定 8）は深さに依らず基準値をそのまま使う（加算は撤去）。"""
     captured = {}
 
     def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
@@ -1348,9 +1603,9 @@ def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expecte
     assert captured["depth"] == expected_depth
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 3), ("standard", 3), ("deep", 5), ("max", 7)])
+@pytest.mark.parametrize("profile,expected_depth", [(None, 3), ("standard", 3), ("deep", 3), ("max", 3)])
 def test_dispatch_troubleshoot_depth_scales_with_profile(monkeypatch, profile, expected_depth):
-    """§3.2 の表: トラブルシュート近傍の深さ（既定 3）は標準+0・深く+2・最大+4。"""
+    """DEPTH-2 S7: トラブルシュート近傍の深さ（既定 3）は深さに依らず基準値のまま（加算は撤去）。"""
     captured = {}
 
     def fake_run_troubleshoot(session, symptom, world, scope_paths=None, depth=None):
@@ -1364,9 +1619,9 @@ def test_dispatch_troubleshoot_depth_scales_with_profile(monkeypatch, profile, e
     assert captured["depth"] == expected_depth
 
 
-@pytest.mark.parametrize("profile,expected_hits", [(None, 20), ("standard", 20), ("deep", 30), ("max", 40)])
+@pytest.mark.parametrize("profile,expected_hits", [(None, 20), ("standard", 20), ("deep", 20), ("max", 20)])
 def test_dispatch_qa_max_hits_scales_with_profile(monkeypatch, profile, expected_hits):
-    """§3.2 の表: run_qa の max_hits（既定 20）は標準×1・深く×1.5・最大×2。"""
+    """DEPTH-2 S7: run_qa の max_hits（既定 20）は深さに依らず基準値のまま（倍率は撤去）。"""
     captured = {}
 
     def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
@@ -1380,7 +1635,8 @@ def test_dispatch_qa_max_hits_scales_with_profile(monkeypatch, profile, expected
 
 
 def test_dispatch_depth_profile_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（system_settings）が env 既定より優先される（実効基準値）。"""
+    """管理画面の基準値編集（system_settings）が env 既定より優先される（実効基準値）。
+    DEPTH-2 S7 以降、深さ（"deep"）は基準値に効かない（受け入れ条件(4)）。"""
     captured = {}
 
     def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
@@ -1390,11 +1646,12 @@ def test_dispatch_depth_profile_honors_system_settings_base_override(monkeypatch
     monkeypatch.setattr(CS, "run_impact", fake_run_impact)
     CS._dispatch(None, "impact", "消費税率", "w1", _sm("deep"),
                 system_settings={"depth_base_impact_depth": 20})
-    assert captured["depth"] == 22   # 20（基準値上書き）+2（深く）
+    assert captured["depth"] == 20   # 20（基準値上書き）のみ・深くによる加算は無し
 
 
 def test_dispatch_depth_profile_system_settings_none_uses_env_default(monkeypatch):
-    """`system_settings=None`（呼び出し元省略・後方互換）は env 既定値のまま動く。"""
+    """`system_settings=None`（呼び出し元省略・後方互換）は env 既定値のまま動く。
+    DEPTH-2 S7 以降、深さ（"max"）は倍率に効かない。"""
     captured = {}
 
     def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
@@ -1404,16 +1661,16 @@ def test_dispatch_depth_profile_system_settings_none_uses_env_default(monkeypatc
     monkeypatch.setattr(CS, "run_qa", fake_run_qa)
     monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
     CS._dispatch(None, "qa", "消費税率とは", "w1", _sm("max"), system_settings=None)
-    assert captured["max_hits"] == 40   # QA_MAX_HITS_DEFAULT(20) の env 既定 ×2
+    assert captured["max_hits"] == 20   # QA_MAX_HITS_DEFAULT(20) の env 既定のまま（倍率撤去）
 
 
 # ===== _dispatch の絶対上限（SC-6c §8）=====
-# 管理画面の基準値編集が Field 上限いっぱいの値を許しても、調べる深さ「最大」との組み合わせで
-# 各モジュールの env-parse hi 引数（＝既存の絶対上限）を超えない。
+# DEPTH-2 S7 で倍率は撤去したが、管理画面の基準値編集が各モジュールの env-parse hi 引数
+# （＝既存の絶対上限）を超える値を許しても、最終的にその絶対上限でクランプされる（安全弁は残す）。
 
-def test_dispatch_impact_depth_abs_max_clamps_admin_base_times_multiplier(monkeypatch):
-    """admin が impact_depth の基準値を Field 上限（64）に設定していても、「最大」（+4）で
-    68 まで伸びず、`IMPACT_MAX_DEPTH_ABS_MAX`（64）でクランプされる。"""
+def test_dispatch_impact_depth_abs_max_clamps_admin_base_over_limit(monkeypatch):
+    """admin が impact_depth の基準値を絶対上限超え（68）に設定していても、
+    `IMPACT_MAX_DEPTH_ABS_MAX`（64）でクランプされる（倍率撤去後も絶対上限は効く）。"""
     captured = {}
 
     def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
@@ -1422,12 +1679,12 @@ def test_dispatch_impact_depth_abs_max_clamps_admin_base_times_multiplier(monkey
 
     monkeypatch.setattr(CS, "run_impact", fake_run_impact)
     CS._dispatch(None, "impact", "消費税率", "w1", _sm("max"),
-                system_settings={"depth_base_impact_depth": 64})
+                system_settings={"depth_base_impact_depth": 68})
     assert captured["depth"] == 64   # 68 ではなく 64（絶対上限）
 
 
-def test_dispatch_troubleshoot_depth_abs_max_clamps_admin_base_times_multiplier(monkeypatch):
-    """troubleshoot_depth も同様（Field 上限16・最大+4=20 だが絶対上限16でクランプ）。"""
+def test_dispatch_troubleshoot_depth_abs_max_clamps_admin_base_over_limit(monkeypatch):
+    """troubleshoot_depth も同様（基準値20が絶対上限16でクランプ）。"""
     captured = {}
 
     def fake_run_troubleshoot(session, symptom, world, scope_paths=None, depth=None):
@@ -1438,12 +1695,12 @@ def test_dispatch_troubleshoot_depth_abs_max_clamps_admin_base_times_multiplier(
     monkeypatch.setattr(CS, "run_troubleshoot", fake_run_troubleshoot)
     monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", lambda result, world, query, sp: result)
     CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", _sm("max"),
-                system_settings={"depth_base_troubleshoot_depth": 16})
+                system_settings={"depth_base_troubleshoot_depth": 20})
     assert captured["depth"] == 16   # 20 ではなく 16（絶対上限）
 
 
-def test_dispatch_qa_max_hits_abs_max_clamps_admin_base_times_multiplier(monkeypatch):
-    """qa の max_hits も同様（Field 上限1000・最大×2=2000 だが絶対上限1000でクランプ）。"""
+def test_dispatch_qa_max_hits_abs_max_clamps_admin_base_over_limit(monkeypatch):
+    """qa の max_hits も同様（基準値2000が絶対上限1000でクランプ）。"""
     captured = {}
 
     def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
@@ -1453,7 +1710,7 @@ def test_dispatch_qa_max_hits_abs_max_clamps_admin_base_times_multiplier(monkeyp
     monkeypatch.setattr(CS, "run_qa", fake_run_qa)
     monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
     CS._dispatch(None, "qa", "消費税率とは", "w1", _sm("max"),
-                system_settings={"depth_base_qa_max_hits": 1000})
+                system_settings={"depth_base_qa_max_hits": 2000})
     assert captured["max_hits"] == 1000   # 2000 ではなく 1000（絶対上限）
 
 
@@ -1919,35 +2176,107 @@ def test_retry_hints_layer_not_suggested_when_not_applied():
     assert [h["kind"] for h in hints] == ["scope"]
 
 
-# ===== _retry_hints の調べる深さの軸（SC-6c・§3.2・§8 裁定5）=====
+# ===== _retry_hints の調べる深さの軸（SC-6c・§3.2・§8 裁定5・DEPTH-2 §2.3）=====
+# 深さは下調べ役あり構成（`evidence_packet.task_id` が "sub:"/"plan:" 接頭）か、Codex(OpenAI 系)
+# 構成（`usage.provider == "codex"` かつ `env["codex_multi_agent"]` が真・S6）でだけ実際に効くため、
+# 深さ hint を検証するテストは task_id か usage.provider/env["codex_multi_agent"] を明示する（§2.3）。
+
+_SUB_TASK_DATA = {"evidence_packet": {"task_id": "sub:profile-1"}}
+
 
 def test_retry_hints_depth_standard_suggests_max():
-    """標準/深くは既に最も緩い（max）ではないため案内に含める。1回で「最大」へ広げる。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
+    """標準/深くは既に最も緩い（max）ではないため案内に含める。1回で「最大」へ広げる（下調べ役あり）。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"},
+              data=_SUB_TASK_DATA)
     hints = CS._retry_hints(env)
     assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は標準）",
                       "action": {"depth_profile": "max"}}]
 
 
 def test_retry_hints_depth_deep_suggests_max():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "deep"})
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "deep"},
+              data=_SUB_TASK_DATA)
     hints = CS._retry_hints(env)
     assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は深く）",
                       "action": {"depth_profile": "max"}}]
 
 
 def test_retry_hints_depth_max_not_suggested():
-    """調べる深さが既に「最大」なら案内に含めない（絞られていない軸は見せない）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "max"})
+    """調べる深さが既に「最大」なら案内に含めない（絞られていない軸は見せない・下調べ役あり）。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "max"},
+              data=_SUB_TASK_DATA)
     assert CS._retry_hints(env) == []
 
 
 def test_retry_hints_order_scope_then_layer_then_depth():
-    """§8 裁定5: 範囲→探す対象→調べる深さの順。"""
+    """§8 裁定5: 範囲→探す対象→調べる深さの順（下調べ役あり）。"""
     env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": True,
-                    "depth_profile": "deep"})
+                    "depth_profile": "deep"}, data=_SUB_TASK_DATA)
     hints = CS._retry_hints(env)
     assert [h["kind"] for h in hints] == ["scope", "layer", "depth"]
+
+
+def test_retry_hints_depth_not_suggested_without_search_helper():
+    """下調べ役なし（`provider._sub is None`）構成では深さの設定を変えても evaluator 巡数が
+    発生しないため、深さ hint を出さない（`task_id` が "main"＝通常の OpenAI 単独経路）。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"},
+              data={"evidence_packet": {"task_id": "main"}})
+    assert CS._retry_hints(env) == []
+
+
+def test_retry_hints_depth_not_suggested_when_no_evidence_packet():
+    """`evidence_packet` も `usage.provider` も無い経路（Ollama 頭脳の下調べ役なし構成等）は
+    深さ hint を出さない。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "deep"})
+    assert CS._retry_hints(env) == []
+
+
+def test_depth_actually_helps_true_for_codex_openai_backing():
+    """既定 OpenAI 接続＋サンドボックス有効（`codex_multi_agent_enabled` が真）なら深さが実際に効く。"""
+    assert CS._depth_actually_helps(
+        {"usage": {"provider": "codex", "is_local": "cloud"}, "codex_multi_agent": True}) is True
+
+
+def test_depth_actually_helps_false_for_codex_ollama_backing():
+    """Codex(Ollama) 構成（`is_local == "local"`）は multi_agent が無効＝深さは効かない。"""
+    assert CS._depth_actually_helps(
+        {"usage": {"provider": "codex", "is_local": "local"}, "codex_multi_agent": False}) is False
+
+
+def test_depth_actually_helps_false_for_codex_azure_backing():
+    """Azure/独自エンドポイント（本番側で multi_agent を自動無効化）は `is_local` が既定 OpenAI と
+    同じ `"cloud"` でも `codex_multi_agent` が偽なら深さは効かない。"""
+    assert CS._depth_actually_helps(
+        {"usage": {"provider": "codex", "is_local": "cloud"}, "codex_multi_agent": False}) is False
+
+
+def test_retry_hints_depth_suggested_for_codex_openai_backing():
+    """既定 OpenAI 接続＋サンドボックス有効（`env["codex_multi_agent"]` が真）なら、
+    `evidence_packet` を持たなくても深さ hint を出す。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
+    env["usage"] = {"provider": "codex", "is_local": "cloud"}
+    env["codex_multi_agent"] = True
+    hints = CS._retry_hints(env)
+    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は標準）",
+                      "action": {"depth_profile": "max"}}]
+
+
+def test_retry_hints_depth_not_suggested_for_codex_ollama_backing():
+    """Codex(Ollama) 構成（`is_local == "local"`）は multi_agent が無効（`codex_multi_agent` 偽）
+    のため、従来どおり深さ hint を出さない。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
+    env["usage"] = {"provider": "codex", "is_local": "local"}
+    env["codex_multi_agent"] = False
+    assert CS._retry_hints(env) == []
+
+
+def test_retry_hints_depth_not_suggested_for_codex_azure_backing():
+    """Azure/独自エンドポイント（本番側で multi_agent を自動無効化）は `usage.is_local` が既定
+    OpenAI と同じ `"cloud"` でも `codex_multi_agent` が偽なら深さ hint を出さない。"""
+    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
+    env["usage"] = {"provider": "codex", "is_local": "cloud"}
+    env["codex_multi_agent"] = False
+    assert CS._retry_hints(env) == []
 
 
 # ===== _retry_hints の検索経路トグルの軸（SC-6e・調べ方ブロック §3.6）=====
@@ -1974,9 +2303,10 @@ def test_retry_hints_tools_missing_key_not_suggested():
 
 
 def test_retry_hints_order_scope_then_layer_then_depth_then_tools():
-    """範囲→探す対象→調べる深さ→ツールの順（末尾）。"""
+    """範囲→探す対象→調べる深さ→ツールの順（末尾・下調べ役あり）。"""
     env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": True,
-                    "depth_profile": "deep", "tools": {"grep": False, "fulltext": True, "graph": True}})
+                    "depth_profile": "deep", "tools": {"grep": False, "fulltext": True, "graph": True}},
+              data=_SUB_TASK_DATA)
     hints = CS._retry_hints(env)
     assert [h["kind"] for h in hints] == ["scope", "layer", "depth", "tools"]
 
@@ -2344,6 +2674,26 @@ def test_facts_troubleshoot_carries_limits_and_candidate_overflow_note():
            "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: x.md「本文」"}
     out = _facts("troubleshoot", env)
     assert "残り 4 件は未提示" in out and "調査の限界: 調査を上限到達で中断" in out and "ev-1" not in out
+
+
+def test_facts_troubleshoot_carries_claims_digest():
+    """RV C3: troubleshoot は `_facts` の早期 return（レンズ別分岐）のため主張構造
+    （`_claims_digest`）が清書プロンプトに入らなかった——レンズに関わらず必ず付加する。"""
+    from sherpa.providers.prompts import _facts
+    env = {"data": {"candidates": []},
+           "_synthesis_digest": "調査の限界: なし",
+           "_claims_digest": "[c1] 確定: 障害の原因はXです。（根拠: ev-1）"}
+    out = _facts("troubleshoot", env)
+    assert "【主張の構造（確定/推定/不明）】" in out and "[c1] 確定: 障害の原因はXです。" in out
+
+
+def test_facts_impact_carries_claims_digest():
+    """troubleshoot と同じ理由で impact も早期 return する分岐——同様に主張構造を落とさない。"""
+    from sherpa.providers.prompts import _facts
+    env = {"data": {"items": [{"name": "X", "category": "program"}]}, "summary": {"total": 1},
+           "_claims_digest": "[c1] 不明: 影響範囲は資料からは確認できません。（理由コード: unexplored）"}
+    out = _facts("impact", env)
+    assert "【主張の構造（確定/推定/不明）】" in out and "unexplored" in out
 
 
 def test_facts_impact_zero_items_uses_synthesis_digest_not_zero_count():

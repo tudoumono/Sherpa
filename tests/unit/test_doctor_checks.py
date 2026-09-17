@@ -2071,6 +2071,71 @@ def test_codex_required_does_not_expose_user_ids(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 3b. check_codex_multi_agent_worker_model（RV #66 是正）
+# ---------------------------------------------------------------------------
+
+def test_check_codex_multi_agent_worker_model_skip_when_settings_unavailable():
+    r = doctor_checks.check_codex_multi_agent_worker_model(None, [])
+    assert r.status == "skip"
+
+
+def test_check_codex_multi_agent_worker_model_skip_when_codex_not_used(monkeypatch):
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "ollama")
+    r = doctor_checks.check_codex_multi_agent_worker_model({}, [])
+    assert r.status == "skip"
+
+
+def test_check_codex_multi_agent_worker_model_ok_for_default_openai_endpoint(monkeypatch):
+    """Codex(OpenAI 系) 構成で接続先が既定(OpenAI 本家)なら worker モデルの整合は問題なし。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    r = doctor_checks.check_codex_multi_agent_worker_model({}, [])
+    assert r.status == "ok"
+
+
+def test_check_codex_multi_agent_worker_model_skip_for_azure_endpoint(monkeypatch):
+    """C65/#72: Codex(OpenAI 系) 構成で接続先が Azure（既定 OpenAI 以外）＝本番側
+    （`codex_multi_agent_enabled`）が multi_agent を自動的に無効化する想定内の構成のため、
+    worker モデルのデプロイ名解決は不要＝理由付き skip（ng にしない）。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    sys_s = {"openai_endpoint_kind": "azure",
+             "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "skip"
+    assert "Azure" in r.detail
+
+
+def test_check_codex_multi_agent_worker_model_ok_when_only_ollama_backing(monkeypatch):
+    """Codex(Ollama) 構成だけの環境は multi_agent 自体の対象外＝ Azure 接続先設定が残っていても無関係。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "ollama")
+    sys_s = {"openai_endpoint_kind": "azure",
+             "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "skip"
+
+
+def test_check_codex_multi_agent_worker_model_detects_active_user_row(monkeypatch):
+    """システム既定は Codex を使っていなくても、有効な利用者のいずれかが Codex(OpenAI 系) を
+    使っていれば検査対象に含める。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent",
+                        lambda settings, **k: (settings or {}).get("agent") or "ollama")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider",
+                        lambda settings, **k: (settings or {}).get("codex_model_provider") or "openai")
+    sys_s = {"openai_endpoint_kind": "azure",
+             "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
+    rows = [{"agent": "codex", "codex_model_provider": "openai"}]
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, rows)
+    assert r.status == "skip"
+
+
+# ---------------------------------------------------------------------------
 # 3c. Ollama の用途別プローブ（実効URL・用途・モデル単位）
 # ---------------------------------------------------------------------------
 
@@ -2235,6 +2300,52 @@ def test_resolve_ollama_usages_search_helper_ignored_when_main_agent_not_openai(
     assert usages == []
 
 
+def test_resolve_ollama_usages_search_helper_when_main_agent_is_ollama(monkeypatch):
+    """(C6・RV採用) Ollama 頭脳 × search_helper=ollama の下調べ役（subsearch モデル）も
+    用途一覧に含める（§2.1 組合せ表どおり。以前は `eff == "openai"` の行だけしか解決せず、
+    この組合せが検査対象から漏れていた＝未導入でも doctor が検出できない実害だった）。"""
+    from sherpa import agent_constructs, keys, model_catalog, search_helper
+    monkeypatch.setattr(agent_constructs, "effective_agent",
+                         lambda settings, **k: (settings or {}).get("agent") or "openai")
+    monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
+    monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: "chat-model")
+    monkeypatch.setattr(search_helper, "resolve",
+                         lambda settings, **k: {"provider": "ollama", "url": "http://localhost:11434",
+                                               "model": "qwen2.5-subsearch"})
+    rows = [{"agent": "ollama", "codex_model_provider": None, "ollama_url": "http://localhost:11434",
+             "search_helper": "ollama"}]
+    usages = doctor_checks._resolve_ollama_usages({}, rows)
+    by_model = {u["model"]: u for u in usages}
+    assert "qwen2.5-subsearch" in by_model
+    assert "検索ヘルパー" in by_model["qwen2.5-subsearch"]["purposes"][0]
+    assert "chat-model" in by_model   # 頭脳自身（チャット）の用途も引き続き含まれる
+
+
+def test_check_ollama_probes_ng_for_missing_ollama_subsearch_model_when_brain_is_ollama(monkeypatch):
+    """(C6・受け入れ条件) Ollama 頭脳 × search_helper=ollama の subsearch モデルが未導入
+    （`_probe_ollama_usage` が False を返す）と、その用途が ng として報告される
+    （`_resolve_ollama_usages` は実装のまま使い、探索結果だけ確認する）。"""
+    from sherpa import agent_constructs, keys, model_catalog, search_helper
+    monkeypatch.setattr(agent_constructs, "effective_agent",
+                         lambda settings, **k: (settings or {}).get("agent") or "openai")
+    monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
+    monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: "chat-model")
+    monkeypatch.setattr(search_helper, "resolve",
+                         lambda settings, **k: {"provider": "ollama", "url": "http://localhost:11434",
+                                               "model": "qwen2.5-subsearch"})
+
+    def _fake_probe(url, model, sys_s):
+        return (model != "qwen2.5-subsearch", "ok" if model != "qwen2.5-subsearch" else "not found")
+    monkeypatch.setattr(doctor_checks, "_probe_ollama_usage", _fake_probe)
+    rows = [{"agent": "ollama", "codex_model_provider": None, "ollama_url": "http://localhost:11434",
+             "search_helper": "ollama"}]
+    results = doctor_checks.check_ollama_probes({}, rows)
+    by_status = {r.status for r in results}
+    assert "ng" in by_status
+    ng_results = [r for r in results if r.status == "ng"]
+    assert any("not found" in (r.detail or "") for r in ng_results)
+
+
 def test_resolve_ollama_usages_none_when_search_helper_resolve_raises(monkeypatch):
     """`search_helper.resolve()` は本番では例外を捕捉しない（呼び出し元が壊れた設定をそのまま
     検出する契約）。この行が「検索ヘルパーは使っていない」に丸められて黙って SKIP に落ちないよう、
@@ -2259,7 +2370,8 @@ def test_resolve_ollama_usages_dedupes_same_url_and_model(monkeypatch):
             {"agent": "ollama", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
     usages = doctor_checks._resolve_ollama_usages({}, rows)
     assert len(usages) == 1
-    assert len(usages[0]["purposes"]) == 1   # 用途ラベルも重複しない
+    # 用途ラベルも重複しない（2 行あっても 2 用途まで＝チャットと、頭脳自身が worker の下調べ）。
+    assert usages[0]["purposes"] == ["チャット（利用者設定）", "検索ヘルパー（下調べ）"]
 
 
 # ---------------------------------------------------------------------------

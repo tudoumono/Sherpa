@@ -6,8 +6,12 @@
 **設定は1項目**（利用者ごとの選択のみ・admin の一元管理はしない＝Ollama を使いたくない人はそのまま
 使える）。実行機構は既存のサブループ（`providers/base.py::_sub_loop`）をそのまま使う。
 
-制約: **メインが OpenAI 直結構成のときだけ効く**。Codex 構成は Codex CLI が自分でツールを回すため、
-Sherpa 側のサブループが介在しない。
+制約: **メインが OpenAI 直結構成または Ollama 構成のときだけ効く**（頭脳 × 本設定の組合せ表は
+`sherpa/providers/__init__.py::get_provider` docstring・提案書
+docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。`resolve()` 自体は頭脳の種類を
+見ない（設定1項目から下調べ役の形を組み立てるだけ）——どの頭脳でどの選択を実際に使うか／無視するか
+の判断は呼び出し側（`get_provider`）が組合せ表に従って行う。Codex 構成は Codex CLI が自分でツールを
+回すため、Sherpa 側のサブループが介在しない。
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ import re
 
 _log = logging.getLogger("sherpa")
 
-# 設定値（`user_settings.search_helper`）。'' ＝ 使わない（メインと同じ AI が検索する）。
+# 設定値（`user_settings.search_helper`）。'' ＝ 安いモデルを使わない（頭脳自身が下調べする）。
 NONE = ""
 OLLAMA = "ollama"
 OPENAI = "openai"
@@ -33,6 +37,10 @@ TOOLS = frozenset({"list_docs", "ripgrep_search", "glob_search", "doc_outline", 
 _MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\-]{0,127}")
 
 _DEFAULT_MIN_CITATIONS = 1
+
+# 頭脳自身を worker に据えたプロファイルの識別子（`self_worker()`）。`providers/base.py` が
+# 「worker が頭脳自身か」を判定する唯一の基準。
+SELF_PROFILE_ID = "search-helper-self"
 
 
 def _default_max_turns() -> int:
@@ -72,8 +80,9 @@ class InvalidSearchHelperConfigError(ValueError):
 def resolve(user_settings: dict, *, system_settings: dict | None = None) -> dict | None:
     """`get_provider` から呼ぶ: 設定1項目から `Provider._sub` の形を組み立てる。
 
-    I/O なし。未設定（空文字）・鍵未設定（A6/A7 により未接続）は正当な「使わない」状態として
-    None を返す＝メインの AI が従来どおり自分で検索する（チャットは必ず動く）。
+    I/O なし。未設定（空文字）・鍵未設定（A6/A7 により未接続）は「安いモデルを使わない」状態として
+    None を返す——呼び出し元（`get_provider`）はこのとき `self_worker()`（頭脳と同じ接続・同じ
+    モデルの worker）を据える＝下調べ役なしの経路にはしない。
 
     非空の不正値（未知の選択肢・解決先の管理者モデル設定が壊れている）は `InvalidSearchHelperConfigError`
     を送出する（黙ってメインAIの高コスト経路へ倒さない＝意図しない課金の是正。呼び出し元
@@ -114,6 +123,26 @@ def resolve(user_settings: dict, *, system_settings: dict | None = None) -> dict
     return {**base, "provider": "openai", "key": key, "url": None, "model": model}
 
 
+def self_worker(provider: str, model: str, *, key: str | None = None,
+                url: str | None = None) -> dict:
+    """頭脳自身を worker（下調べ役）にした解決済みプロファイル（`resolve()` と同じ形）。
+
+    `search_helper` が空（使わない）、または組合せ表で無視される選択（Ollama 頭脳 × openai）の
+    ときに `get_provider` がこれを `_sub` に据える＝**下調べ役なしの経路は無い**（API/Ollama は
+    常に「worker ＋ orchestrator/evaluator」のハイブリッド1経路）。接続先・鍵・モデルは頭脳と
+    同じで、違いは「安いモデルを使わない」ことだけ。
+
+    許すツールは `TOOLS`（回答は書かせない）に `ask_user` を足したもの——`TOOLS` が
+    `ask_user` を外すのは「安いモデル／別モデルの生成文を公式の確認カードとして出さない」ため
+    であり、頭脳自身が worker のときはその理由が当たらない（通常経路と同じ AI が質問する）。
+    出力ファイルのツールは worker には配線しない（成果物の登録は orchestrator ＝清書側の契約）。
+    """
+    return {"tools": TOOLS | {"ask_user"}, "guard": _resolve_guard(), "profile_id": SELF_PROFILE_ID,
+            "description": "資料の検索・精読だけを担当する（回答はこの後の清書で作る）",
+            "name": "メインのAI（下調べ）", "provider": provider, "model": model,
+            "key": key, "url": url}
+
+
 def label(user_settings: dict) -> str:
     """UI/監査向けの短い表示名（未設定は空文字）。"""
     choice = str(user_settings.get("search_helper") or NONE).strip().lower()
@@ -122,3 +151,17 @@ def label(user_settings: dict) -> str:
     if choice == OPENAI:
         return "OpenAI（低コストモデル）"
     return ""
+
+
+def is_cloud_helper_ignored(agent: str, user_settings: dict) -> bool:
+    """Ollama 頭脳に openai の下調べ役設定が付いているか（頭脳 × `search_helper` の組合せ表・
+    §2.1 で無視される組合せ）。`get_provider`（実際に付けるか）と監査の無視理由の両方が
+    この1関数を基準にする＝判定基準を1箇所に集約する。
+
+    **正規化した設定値**（`search_helper` の文字列）だけで判定し、`resolve()` は呼ばない
+    （OpenAI 鍵の有無に左右されない＝鍵が無くても「無視した」事実は変わらない）。
+    """
+    if agent != "ollama":
+        return False
+    choice = str(user_settings.get("search_helper") or NONE).strip().lower()
+    return choice == OPENAI

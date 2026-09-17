@@ -1,6 +1,9 @@
-"""調べる深さ（`sherpa.depth_profile`）の単体テスト（調べ方ブロック §3.2・SC-6c）。
+"""調べる深さ（`sherpa.depth_profile`）の単体テスト（調べ方ブロック §3.2・SC-6c。倍率撤去は
+DEPTH-2 S7・`docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.3・§5）。
 
-- 倍率表（標準/深く/最大）が依頼の初期案どおりの値を返すこと。
+- `scaled_turns`/`scaled_ratio`/`scaled_depth`/`codex_reasoning_for`: DEPTH-2 S7 以降は
+  深さ（standard/deep/max）に依らず基準値をそのまま返す（倍率・加算・推論レベル上書きは撤去）。
+  `abs_max` の絶対上限は引き続き効く。不正な depth_profile は fail-loud のまま。
 - `effective_base`: system_settings の基準値編集が env 既定値より優先されること・
   無効値（0以下・非数値）は env 既定へ fail-open すること。
 - `normalize_depth_profile`: 省略は standard・不正値は ValueError（fail-loud）。
@@ -26,36 +29,38 @@ def test_normalize_depth_profile_invalid_raises():
         D.normalize_depth_profile("bogus")
 
 
-# ===== §3.2 の倍率表 =====
+# ===== DEPTH-2 S7: 倍率撤去＝深さに依らず基準値をそのまま返す =====
 
-@pytest.mark.parametrize("profile,expected", [("standard", 12), ("deep", 24), ("max", 36)])
-def test_scaled_turns_matches_table(profile, expected):
-    assert D.scaled_turns(12, profile) == expected
-
-
-@pytest.mark.parametrize("profile,expected", [("standard", 30), ("deep", 45), ("max", 60)])
-def test_scaled_ratio_matches_table_grep_hits(profile, expected):
-    assert D.scaled_ratio(30, profile) == expected
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_scaled_turns_returns_base_regardless_of_depth(profile):
+    """深く/最大でも上限が変わらない（倍率撤去・受け入れ条件(1)）。"""
+    assert D.scaled_turns(12, profile) == 12
 
 
-@pytest.mark.parametrize("profile,expected", [("standard", 40), ("deep", 60), ("max", 80)])
-def test_scaled_ratio_matches_table_read_window(profile, expected):
-    assert D.scaled_ratio(40, profile) == expected
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_scaled_ratio_returns_base_regardless_of_depth_grep_hits(profile):
+    assert D.scaled_ratio(30, profile) == 30
 
 
-@pytest.mark.parametrize("profile,expected", [("standard", 8), ("deep", 10), ("max", 12)])
-def test_scaled_depth_matches_table_impact(profile, expected):
-    assert D.scaled_depth(8, profile) == expected
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_scaled_ratio_returns_base_regardless_of_depth_read_window(profile):
+    assert D.scaled_ratio(40, profile) == 40
 
 
-@pytest.mark.parametrize("profile,expected", [("standard", 3), ("deep", 5), ("max", 7)])
-def test_scaled_depth_matches_table_troubleshoot(profile, expected):
-    assert D.scaled_depth(3, profile) == expected
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_scaled_depth_returns_base_regardless_of_depth_impact(profile):
+    assert D.scaled_depth(8, profile) == 8
 
 
-@pytest.mark.parametrize("profile,expected", [("standard", "low"), ("deep", "high"), ("max", "xhigh")])
-def test_codex_reasoning_for_matches_table(profile, expected):
-    assert D.codex_reasoning_for("low", profile) == expected
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_scaled_depth_returns_base_regardless_of_depth_troubleshoot(profile):
+    assert D.scaled_depth(3, profile) == 3
+
+
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_codex_reasoning_for_returns_base_regardless_of_depth(profile):
+    """深く=high／最大=xhigh への per-turn 上書きは撤去——常に基準値を返す（受け入れ条件(2)）。"""
+    assert D.codex_reasoning_for("low", profile) == "low"
 
 
 def test_codex_reasoning_for_standard_keeps_arbitrary_base():
@@ -63,9 +68,10 @@ def test_codex_reasoning_for_standard_keeps_arbitrary_base():
     assert D.codex_reasoning_for("medium", "standard") == "medium"
 
 
-def test_ratio_truncates_fractional_result():
-    """×1.5 の切り捨て（例: 奇数の基準値）。"""
-    assert D.scaled_ratio(15, "deep") == 22   # 15*1.5=22.5 -> 22
+def test_scaled_ratio_invalid_profile_still_raises():
+    """基準値パススルーになっても depth_profile 自体の妥当性検証（fail-loud）は残す。"""
+    with pytest.raises(ValueError):
+        D.scaled_ratio(15, "bogus")
 
 
 # ===== effective_base: system_settings（管理画面の基準値編集）→ env 既定 =====
@@ -112,54 +118,53 @@ def test_base_settings_keys_cover_all_seven_knobs():
     }
 
 
-# ===== abs_max（倍率適用後の絶対上限）=====
+# ===== abs_max（絶対上限。倍率は撤去したが abs_max のクランプ自体は引き続き効く）=====
 
-def test_scaled_ratio_abs_max_clamps_after_multiplication():
-    """管理APIのbase上限（例: grepヒット上限1000）×最大倍率(×2)=2000 のような組み合わせでも、
-    abs_max を渡せば一度だけ最終値をクランプできる。"""
-    assert D.scaled_ratio(1000, "max", abs_max=1000) == 1000   # 2000 -> 1000 にクランプ
-    assert D.scaled_ratio(1000, "deep", abs_max=1000) == 1000  # 1500 -> 1000 にクランプ
-    assert D.scaled_ratio(1000, "standard", abs_max=1000) == 1000   # 1000 のまま（クランプ不要）
+def test_scaled_ratio_abs_max_clamps_base_over_limit():
+    """倍率が無くなった後も、基準値そのものが abs_max を超える構成（管理画面での手動設定）は
+    最終的に abs_max へクランプされる（深さに依らない・受け入れ条件(1)）。"""
+    assert D.scaled_ratio(2000, "max", abs_max=1000) == 1000
+    assert D.scaled_ratio(2000, "deep", abs_max=1000) == 1000
+    assert D.scaled_ratio(2000, "standard", abs_max=1000) == 1000
 
 
 def test_scaled_ratio_abs_max_does_not_affect_values_already_within_bound():
-    """既定の基準値（env 既定）では abs_max=1000 を渡しても標準/深く/最大とも従来の値のまま
-    （通常構成ではクランプが一切効かない・既存挙動を壊さない）。"""
+    """基準値が abs_max 以内なら深さに依らず基準値のまま。"""
     assert D.scaled_ratio(30, "standard", abs_max=1000) == 30
-    assert D.scaled_ratio(30, "deep", abs_max=1000) == 45
-    assert D.scaled_ratio(30, "max", abs_max=1000) == 60
+    assert D.scaled_ratio(30, "deep", abs_max=1000) == 30
+    assert D.scaled_ratio(30, "max", abs_max=1000) == 30
 
 
 def test_scaled_ratio_abs_max_omitted_keeps_existing_behavior():
-    """abs_max 省略（既定 None）は従来どおりクランプなし（既存呼び出し元は無変更）。"""
-    assert D.scaled_ratio(1000, "max") == 2000
+    """abs_max 省略（既定 None）はクランプなし（既存呼び出し元は無変更）。"""
+    assert D.scaled_ratio(2000, "max") == 2000
 
 
-def test_scaled_depth_abs_max_clamps_after_addition():
-    """管理APIのbase上限（例: 影響深さ64）＋最大の加算(+4)=68 のような組み合わせでも、abs_max を
-    渡せば一度だけ最終値をクランプできる。"""
-    assert D.scaled_depth(64, "max", abs_max=64) == 64   # 68 -> 64 にクランプ
-    assert D.scaled_depth(64, "deep", abs_max=64) == 64  # 66 -> 64 にクランプ
-    assert D.scaled_depth(60, "max", abs_max=64) == 64   # 64 ちょうど（クランプ境界）
+def test_scaled_depth_abs_max_clamps_base_over_limit():
+    assert D.scaled_depth(68, "max", abs_max=64) == 64
+    assert D.scaled_depth(68, "deep", abs_max=64) == 64
+    assert D.scaled_depth(64, "max", abs_max=64) == 64   # 64 ちょうど（クランプ境界）
 
 
 def test_scaled_depth_abs_max_does_not_affect_values_already_within_bound():
     assert D.scaled_depth(8, "standard", abs_max=64) == 8
-    assert D.scaled_depth(8, "deep", abs_max=64) == 10
-    assert D.scaled_depth(8, "max", abs_max=64) == 12
+    assert D.scaled_depth(8, "deep", abs_max=64) == 8
+    assert D.scaled_depth(8, "max", abs_max=64) == 8
 
 
 def test_scaled_depth_abs_max_omitted_keeps_existing_behavior():
-    assert D.scaled_depth(64, "max") == 68
+    assert D.scaled_depth(68, "max") == 68
 
 
 # ===== STAT-3 S1（利用統計の拡充）: usage メタへ足す depth 由来のキー =====
 
-@pytest.mark.parametrize("profile,expected", [("standard", 12), ("deep", 24), ("max", 36)])
-def test_effective_max_turns_composes_effective_base_and_scaled_turns(profile, expected):
-    """`effective_base(...,"max_turns",12)` → `scaled_turns(...)` と同じ結果（単一の真実源）。"""
-    assert D.effective_max_turns(None, 12, profile) == expected
-    assert D.effective_max_turns({"depth_base_max_turns": 12}, 1, profile) == expected
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_effective_max_turns_composes_effective_base_and_scaled_turns(profile):
+    """`effective_base(...,"max_turns",12)` → `scaled_turns(...)` と同じ結果（単一の真実源）。
+    DEPTH-2 S7 以降、深さに依らず基準値が素通りする（受け入れ条件(4)＝管理画面の基準値編集は
+    引き続き効く）。"""
+    assert D.effective_max_turns(None, 12, profile) == 12
+    assert D.effective_max_turns({"depth_base_max_turns": 20}, 1, profile) == 20
 
 
 def test_usage_extras_always_includes_depth_profile_defaulting_to_standard():
@@ -180,7 +185,53 @@ def test_usage_reasoning_extras_omits_base_when_unchanged():
         "depth_profile": "standard", "reasoning": "medium"}
 
 
-def test_usage_reasoning_extras_includes_base_when_overridden():
-    """深く/最大は基準値を上書きする＝`reasoning_base` も残す（実効値と基準値の両方が分かる）。"""
+def test_usage_reasoning_extras_includes_base_when_caller_values_differ():
+    """`usage_reasoning_extras` 自体は与えられた2値の比較のみを行う（呼び出し元契約）。
+    DEPTH-2 S7 以降、実際の呼び出し元（`codex_reasoning_for`）は常に基準値を返すため、
+    深さに依らず `reasoning == reasoning_base` になり `reasoning_base` は省略される
+    （受け入れ条件(3)）——本テストは関数自体の比較ロジックが差異を検出できることの確認。"""
     assert D.usage_reasoning_extras("deep", "medium", "high") == {
         "depth_profile": "deep", "reasoning": "high", "reasoning_base": "medium"}
+
+
+def test_usage_reasoning_extras_omits_base_for_all_depths_via_codex_reasoning_for():
+    """実際の呼び出し経路（`codex_reasoning_for` の戻り値を渡す）では、深さに依らず
+    `reasoning_base` が出ない（受け入れ条件(3)＝reasoning と reasoning_base の値が矛盾しない）。"""
+    for profile in ("standard", "deep", "max"):
+        base = "medium"
+        effective = D.codex_reasoning_for(base, profile)
+        assert D.usage_reasoning_extras(profile, base, effective) == {
+            "depth_profile": profile, "reasoning": "medium"}
+
+
+# ---- DEPTH-2 S5: 深さ＝evaluator（査読）の巡数（§2.3）----
+
+def test_review_rounds_standard_is_zero_and_deep_is_two():
+    """標準は 0 巡（査読を一度も発動しない＝従来の標準と同じ）・深くは 2 巡（固定）。"""
+    assert D.review_rounds_for("standard") == 0
+    assert D.review_rounds_for(None) == 0          # 欠落は standard
+    assert D.review_rounds_for("deep") == 2        # 設定に依らず固定
+    assert D.review_rounds_for("deep", {"max_review_rounds": 3}) == 2
+
+
+def test_review_rounds_max_follows_system_setting_with_default_seven():
+    """最大は管理画面の共通上限（system_settings `max_review_rounds`・既定 7）。"""
+    assert D.review_rounds_for("max") == D.MAX_REVIEW_ROUNDS_DEFAULT == 7
+    assert D.review_rounds_for("max", {"max_review_rounds": 3}) == 3
+    assert (D.review_rounds_for("max", {"max_review_rounds": D.MAX_REVIEW_ROUNDS_MAX})
+            == D.MAX_REVIEW_ROUNDS_MAX)
+
+
+def test_effective_max_review_rounds_falls_back_on_invalid_values():
+    """未設定・非整数・bool・範囲外はいずれも既定へ倒す（読み取り側でも独立に検証・fail-safe）。"""
+    for bad in (None, "3", 3.5, True, 0, -1, D.MAX_REVIEW_ROUNDS_MAX + 1):
+        assert (D.effective_max_review_rounds({"max_review_rounds": bad})
+                == D.MAX_REVIEW_ROUNDS_DEFAULT)
+    assert D.effective_max_review_rounds(None) == D.MAX_REVIEW_ROUNDS_DEFAULT
+    assert D.effective_max_review_rounds({}) == D.MAX_REVIEW_ROUNDS_DEFAULT
+
+
+def test_review_rounds_rejects_invalid_profile():
+    """不正な深さは `normalize_depth_profile` と同じ fail-loud。"""
+    with pytest.raises(ValueError):
+        D.review_rounds_for("deeper")

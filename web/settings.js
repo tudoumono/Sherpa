@@ -692,7 +692,7 @@ if (_extKeysList) _extKeysList.addEventListener('click', async (e) => {
 
 // `search_helper` の保存値が既知の選択肢（''/ollama/openai）のどれとも一致しない場合、
 // <select> は暗黙に先頭 option（''）を選んだことになり、後続の無関係な保存でその不正値が
-// 黙って ''（使わない）へ上書きされてしまう（黙った上書きを防ぐ・Bedrock モデル select の
+// 黙って ''（頭脳自身が調べる）へ上書きされてしまう（黙った上書きを防ぐ・Bedrock モデル select の
 // legacy option と同じ手当て・`ensureBedrockModelOption` 参照）。
 function ensureSearchHelperOption(value) {
   const sel = $('search_helper');

@@ -58,6 +58,7 @@ from typing import Iterator
 from ... import codex_agents_md, codex_skills, model_catalog
 from ... import depth_profile as depth_profile_mod
 from ... import layer as layer_mod
+from ...mcp_server import COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
 from ..base import Ctx, Provider, _log, _log_chat_usage, _node, _plain_run, _usage_meta, _verified_sources
 from ..prompts import _facts, _kb_hint_abs
 from .citations import parse_referenced_doc_lines, verified_referenced_docs
@@ -89,6 +90,7 @@ from .sandbox import (
     _web_search_c_args,
     _web_search_endpoint_note,
     _write_codex_authoring_config,
+    codex_multi_agent_enabled,
 )
 
 # 明示変更(a): skills_base（危険地雷1の5番目）。本モジュールは `sherpa` から2階層深い
@@ -97,8 +99,11 @@ from .sandbox import (
 _SKILLS_BASE = Path(__file__).resolve().parents[2] / "skills_base"
 
 # `--output-schema` に渡す固定スキーマファイル（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-1）。
-# パッケージ内に同梱（本モジュールと同じディレクトリ）。
+# パッケージ内に同梱（本モジュールと同じディレクトリ）。v2（DEPTH-2 S1・
+# docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5）は v1 の3キーに `claims`
+# （確定/推定/不明の主張配列）を足した版——`SHERPA_CODEX_OUTPUT_SCHEMA` の値で選ぶ。
 _OUTPUT_SCHEMA_PATH = Path(__file__).resolve().parent / "output_schema.json"
+_OUTPUT_SCHEMA_PATH_V2 = Path(__file__).resolve().parent / "output_schema_v2.json"
 
 
 def _humanize_cmd(command: str):
@@ -117,6 +122,9 @@ def _humanize_cmd(command: str):
     else:
         label = "コマンド実行"
     return label, inner.strip()[:140]
+
+
+_MCP_SIDECAR_NAME = ".mcp_sidecar.jsonl"   # DEPTH-2 S3b: sandbox 有効時は codex_home 配下（run_dir の外）
 
 
 def _masked_run_dir_path(fp: str, run_dir: Path) -> str:
@@ -167,6 +175,117 @@ def _accumulate_codex_usage(prev: dict | None, new: dict | None) -> dict | None:
     前 attempt の分を既に含むため、足すと二重計上になる。`None`（usage 無し）の attempt は無視する。
     """
     return prev if new is None else new
+
+
+def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None]:
+    """DEPTH-2 S3b: `sherpa/mcp_server.py` が書いたサイドカー（子エージェント＝`spawn_agent`
+    された worker/evaluator が読んだ doc_id・ask_user の質問）を読む。呼び出し元は sandbox 有効時
+    （model-shell の書込許可領域の外＝通常は codex_home 配下）にあるパスだけを渡す——sandbox 無効
+    の経路では呼び出し元が本関数を呼ばない（`_absorb_mcp_sidecar` の `codex_home is None` ガード）。
+    子の MCP 呼出は
+    親の `--json` に構造化イベントとして現れない（実機確認済み・`docs/notes/
+    2026-09-17-DEPTH-2-S3-Codex-multi_agent-実機確認.md` (d)(e)）ため、これが唯一の観測経路。
+
+    サイドカーが無い／壊れている（存在しない・行が壊れた JSON・型不正・不正 UTF-8 バイト列）ときは
+    **fail-open**（既存の「親の --json だけを見る」観測にそのまま落ちる＝空リスト／None を返すだけで
+    例外は出さない・回答処理を例外終了させない）。
+
+    戻り値: `(read_doc_ids, listed_doc_ids, ask_user_question_or_none)`。`ask_user_question` は
+    最初の1件だけ（1実行1回＝`mcp_server.py` 側の既存ガードと同じ数え方）。
+    """
+    reads: list = []
+    listed: list = []
+    ask: dict | None = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                kind = entry.get("kind")
+                if kind == "read":
+                    d = entry.get("doc_id")
+                    if isinstance(d, str) and d:
+                        reads.append(d)
+                elif kind == "listed":
+                    d = entry.get("doc_id")
+                    if isinstance(d, str) and d:
+                        listed.append(d)
+                elif kind == "ask_user" and ask is None:
+                    q = entry.get("question")
+                    if isinstance(q, dict):
+                        ask = q
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError は `for line in f` の読取自体（`json.loads` の外）で起きうる
+        # （不正 UTF-8 バイト列を含む行）。ここまでに集めた分は返す（部分的な fail-open）。
+        pass
+    return reads, listed, ask
+
+
+_CHILD_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+
+
+def _collect_child_token_usage(codex_home: Path, child_thread_ids: set) -> tuple[dict, int, int]:
+    """DEPTH-2 S3b: `spawn_agent` した子スレッドの usage を、子ごとの session JSONL
+    （`codex_home/sessions/**/*.jsonl`・先頭行 `session_meta` の `payload.id` が子の thread id と
+    一致するもの）から集める。親の `turn.completed.usage` には子の分が含まれない契約
+    （実機確認・約33%の過小計上・`docs/notes/2026-09-17-DEPTH-2-S3-Codex-multi_agent-実機確認.md` (g)）。
+
+    各ファイルの**最後**の `token_count` イベント（`payload.info.total_token_usage`＝そのスレッドの
+    セッション累計）を1子につき1回だけ合算する。同じ子 id のファイルが複数（mtime 新しい方を優先）
+    見つかっても二重に数えない。見つからない子は `missing` の件数だけに残す（**推定で埋めない**）。
+    壊れた JSONL・欠損フィールド・存在しない codex_home はすべて fail-open（例外を出さず
+    「見つからなかった」扱いにする）。
+    """
+    totals = {k: 0 for k in _CHILD_USAGE_KEYS}
+    if not child_thread_ids:
+        return totals, 0, 0
+    found_ids: set = set()
+    try:
+        cands = sorted(codex_home.glob("sessions/**/*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        cands = []
+    for path in cands:
+        remaining = child_thread_ids - found_ids
+        if not remaining:
+            break
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                first = f.readline()
+                meta = json.loads(first)
+                payload = meta.get("payload") if isinstance(meta, dict) else None
+                tid = payload.get("id") if isinstance(payload, dict) else None
+                if tid not in remaining:
+                    continue
+                last_usage = None
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    ep = e.get("payload") if isinstance(e, dict) else None
+                    if isinstance(ep, dict) and ep.get("type") == "token_count":
+                        info = ep.get("info")
+                        u = info.get("total_token_usage") if isinstance(info, dict) else None
+                        if isinstance(u, dict):
+                            last_usage = u
+                if last_usage is not None:
+                    found_ids.add(tid)
+                    for k in _CHILD_USAGE_KEYS:
+                        totals[k] += int(last_usage.get(k) or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return totals, len(found_ids), len(child_thread_ids) - len(found_ids)
 
 
 def _killpg(proc) -> None:
@@ -394,6 +513,12 @@ _CONTINUE_PROMPT_SCHEMA = (
 # `_OUTPUT_SCHEMA_PATH` の3キーちょうど（strict・additionalProperties: false）と対応させる。
 _STRUCTURED_KEYS = {"status", "answer", "next_step"}
 _STRUCTURED_STATUSES = {"final", "in_progress"}
+# v2（DEPTH-2 S1・output_schema_v2.json）の4キーちょうど・主張1件の閉じたキー集合と語彙。
+_STRUCTURED_KEYS_V2 = _STRUCTURED_KEYS | {"claims"}
+_CLAIM_KEYS = {"id", "status", "text", "evidence_refs", "reason", "reason_code"}
+_CLAIM_STATUSES = {"confirmed", "inferred", "unknown"}
+_CLAIM_UNKNOWN_REASON_CODES = {
+    "not_found_in_scope", "unexplored", "insufficient", "conflict", "budget", "unreadable"}
 
 
 def _parse_structured(text: str | None) -> dict | None:
@@ -423,6 +548,95 @@ def _parse_structured(text: str | None) -> dict | None:
     if _next is not None and not isinstance(_next, str):
         return None
     return obj
+
+
+def _parse_claim(item) -> dict | None:
+    """v2 の主張1件（DEPTH-2 S1・§2.2/§2.5）を検証する（`investigation_state.parse_claims` と
+    同じ規約——キー集合の完全一致・`status` の閉じた語彙・`unknown` だけ `reason_code` を閉じた
+    語彙から要求）。不正なら None（呼び出し元は主張配列全体を無効として扱う）。
+
+    RV C1（confirmed の裏付け）: Codex の `evidence_refs` は `investigation_state.Evidence.ev_id`
+    のような機械的に検証できる調査内 ID を持たない（Codex 自身が MCP で読んだ資料集合を、この
+    純関数からは参照できない）——参照の実在チェックまでは行わず、confirmed には**非空**の
+    `evidence_refs` だけを要求する（空＝裏付けを一つも挙げない確定主張を拒否する・API/Ollama 側
+    の `investigation_state.parse_claims`+`InvestigationState.set_claims` と揃える範囲）。
+    RV C4: inferred は空白のみでない `reason` を必須にする（理由の無い推定を拒否する）。
+    """
+    if not isinstance(item, dict) or set(item.keys()) != _CLAIM_KEYS:
+        return None
+    cid, status, text = item.get("id"), item.get("status"), item.get("text")
+    if not isinstance(cid, str) or not cid.strip():
+        return None
+    if not isinstance(status, str) or status not in _CLAIM_STATUSES:
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    refs = item.get("evidence_refs")
+    if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
+        return None
+    reason = item.get("reason")
+    if not isinstance(reason, str):
+        return None
+    reason_code = item.get("reason_code")
+    if not isinstance(reason_code, str):
+        return None
+    if status == "unknown":
+        if reason_code not in _CLAIM_UNKNOWN_REASON_CODES:
+            return None
+    elif reason_code:
+        return None
+    if status == "confirmed" and not any(r.strip() for r in refs):
+        return None
+    if status == "inferred" and not reason.strip():
+        return None
+    return item
+
+
+def _parse_structured_v2(text: str | None) -> dict | None:
+    """v2 出力スキーマ（`claims` を持つ4キー）を検証する。v1 の3キー形（`claims` 無し）も
+    後方互換で読める——その場合は `_parse_structured` と同じ検証をそのまま使い、返す dict に
+    `claims: []` を補う（呼び出し側は常に `.get("claims", [])` で読める）。
+
+    v2 の4キー形は主張配列の各要素も `_parse_claim` で検証する——1件でも不正なら**主張構造だけ**
+    `claims: []` に落とし、`status`/`answer`/`next_step` は正規の値としてそのまま返す（崩れた
+    主張を成功扱いにしないのは主張構造の話であって、完成した回答本文まで巻き添えで捨てて
+    継続判定・見出しの固定文言化を誘発してはならない・§2.5）。
+    """
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if set(obj.keys()) == _STRUCTURED_KEYS:
+        v1 = _parse_structured(text)
+        if v1 is None:
+            return None
+        return {**v1, "claims": []}
+    if set(obj.keys()) != _STRUCTURED_KEYS_V2:
+        return None
+    _status = obj.get("status")
+    if not isinstance(_status, str) or _status not in _STRUCTURED_STATUSES:
+        return None
+    if not isinstance(obj.get("answer"), str):
+        return None
+    _next = obj.get("next_step")
+    if _next is not None and not isinstance(_next, str):
+        return None
+    claims = obj.get("claims")
+    if not isinstance(claims, list):
+        return None
+    parsed_claims = []
+    for item in claims:
+        parsed = _parse_claim(item)
+        if parsed is None:
+            # 不正な主張構造は本文を巻き添えにせず主張だけを捨てる。無言の縮退にしない。
+            _log.warning("codex v2: invalid claim dropped (claims emptied, answer kept)")
+            return {**obj, "claims": []}
+        parsed_claims.append(parsed)
+    return {**obj, "claims": parsed_claims}
 
 # 成果物の move／台帳登録に1件でも失敗したとき、回答本文の末尾に付ける固定文
 # （`_created_files_failed` 判定・headline がどの分岐で組み立てられていても一律に付く）。
@@ -473,8 +687,7 @@ class CodexProvider(Provider):
     Codex の **実コマンド実行（grep 等）・推論・回答**を `--json` から拾い **1つずつ思考ノードに流す**
     （ユーザは Codex の作業を逐次見られる）。失敗/未導入は決定的回答にフォールバック。
     既定 reasoning=low（`SHERPA_CODEX_REASONING` で変更可。RV依頼の xhigh とは別運用）。
-    調べる深さ（調べ方ブロック §3.2）が「深く」「最大」のとき、ターンごとに high/xhigh へ
-    per-turn 上書きする（`_prompt_mcp`/`_prompt` 呼び出し直前の `_reason` 計算箇所を参照）。
+    推論レベルは基準値で固定（深さでは変わらない）。
     """
     label, model = "Codex", "gpt-5.5"
     provider_id = "codex"
@@ -750,6 +963,10 @@ class CodexProvider(Provider):
         # resume 試行が失敗し新規セッションへ切り替わったら True にする（if ブロックが丸ごと
         # スキップされる経路もあるためここで既定 False・usage のターン差分判定に使う）。
         _resume_fallback_happened = False
+        # このターンの事前 unlink・設定生成が両方成功した時だけ `_absorb_mcp_sidecar` の
+        # 吸収を許可する（既定 False＝`if` ブロックが丸ごとスキップされる経路や、設定生成の
+        # 例外で `_attempt` を一度も呼ばなかった経路では finally の無条件呼び出しを無効化する）。
+        _sidecar_init_ok = False
         # `graph_neighbors` の mcp_tool_call item が旧世代
         # グラフの構造化エラー（`_graph_schema_era_from_item`）を運んできたら、ここへ捕まえておく。
         # `for line in proc.stdout:` を包む2重の `except Exception:`（_attempt 自身・呼び出し元の
@@ -779,6 +996,13 @@ class CodexProvider(Provider):
         # 別プロセスの同名 id を同一呼び出しと誤認し、総数を過少計上する。attempt は逐次実行（同時に
         # 走らない）ため、`max_in_flight` は attempt ごとの最大値の**最大**（合計ではない）を取る。
         _mcp_calls = {"total": 0, "max_in_flight": 0}
+        # DEPTH-2 S3b/S6: `spawn_agent` した子スレッドの id（`collab_tool_call` item から捕捉・run 全体で
+        # 合算＝attempt をまたいでも良い＝多重 spawn/継続でも同じ子を重複して数えない set）。
+        # Codex(Ollama) 構成（multi_agent 無効）では `collab_tool_call` item 自体が出ないため常に空のまま。
+        _child_thread_ids: set = set()
+        _child_usage_totals = {k: 0 for k in _CHILD_USAGE_KEYS}
+        _child_usage_found = 0
+        _child_usage_missing = 0
         codex_created_files: list[str] = []                      # 実行後に台帳登録する新規ファイルの絶対パス
         _any_new_ws = False                                       # codex 未インストール時の NameError 防止
         _created_file_rows: list[dict] = []                       # 台帳登録に成功した行（env["created_files"] 用）
@@ -846,6 +1070,7 @@ class CodexProvider(Provider):
                                   "reason": "同一会話の Codex 実行が進行中"}}
                 return
             _auto_continue_count = 0   # limits（利用統計計測）: Codex を起動しない経路でも参照するため起動条件の外で初期化
+            _multi_agent_enabled = False   # env["codex_multi_agent"] 用: Codex を起動しない経路では常に偽
             if shutil.which("codex") and ws_authoring is not None and run_dir is not None and _codex_home_ok:
                 # agent_message は run 中に複数届く（作業宣言＋結論）。最後の1件を鵜呑みに
                 # せず全部集めて後で結論を選ぶ（`_pick_codex_headline`）。try の外で初期化＝Popen 失敗の
@@ -907,10 +1132,14 @@ class CodexProvider(Provider):
                     # ルート直下の AGENTS.md も対象外: スナップショット後に write_agents_md() が書くため、
                     # 除外しないと初回実行で「新規ファイル」誤認 → files/ へ move（run_dir から消える）→
                     # 次回また書かれて再検出…と毎回 AGENTS_N.md が台帳に蓄積する。
+                    # `.mcp_sidecar.jsonl` も同様に対象外——sandbox 有効時は codex_home 配下に置くため
+                    # ここには現れないが、フォールバック（`SHERPA_CODEX_SANDBOX=0`）で run_dir 直下に
+                    # 残る場合に備えた保険（除外しないと成果物台帳登録・`codex_wrote_files` が立ち、
+                    # 共有 KB だけを読む会話でも個人由来扱いになって通常共有を阻害する）。
                     _before_ws_files = {
                         p for p in run_dir.rglob("*")
                         if p.is_file() and not p.is_symlink()
-                        and p.relative_to(run_dir) != Path("AGENTS.md")
+                        and p.relative_to(run_dir) not in (Path("AGENTS.md"), Path(_MCP_SIDECAR_NAME))
                         and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
                     }
                 # reasoning=minimal は image_gen/web_search と非互換で API 400 になる（実証済）→ low へ引き上げ。
@@ -919,8 +1148,9 @@ class CodexProvider(Provider):
                 _is_author = decision["lens"] == "author"
                 # 調べる深さ（調べ方ブロック §3.2）: 通常レンズの基準値だけ管理画面の基準値編集
                 # （system_settings）を反映する（author 専用の env は別軸のため対象外・§1.6 の
-                # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。標準=基準値のまま・深く=high・
-                # 最大=xhigh の per-turn 上書きは author を含む全レンズに一律適用する。
+                # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。DEPTH-2 S7 以降、深さに依らず
+                # 基準値をそのまま使う（推論レベルの per-turn 上書きは撤去・`docs/proposals/
+                # 2026-09-17-深さの再定義とレビュー巡.md` §2.3）。
                 _base_reason = (os.environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium") if _is_author
                                else depth_profile_mod.effective_base(
                                    self._system_settings, "codex_reasoning", self._reason))
@@ -928,11 +1158,24 @@ class CodexProvider(Provider):
                     _base_reason, (ctx.scope_meta or {}).get("depth_profile"))
                 _reason = "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
                 # 利用統計の拡充: usage メタへ足す「実際に codex exec へ渡した
-                # model_reasoning_effort」（`_reason`）と、深さ倍率の上書き前の基準値
+                # model_reasoning_effort」（`_reason`）と、基準値（minimal→low の丸め前）
                 # （`_base_reason`）。一致（標準プロファイルの通常ケース）なら `reasoning_base` は
                 # 省略する（`usage_reasoning_extras` の契約）。
                 _usage_depth_extra = depth_profile_mod.usage_reasoning_extras(
                     (ctx.scope_meta or {}).get("depth_profile"), _base_reason, _reason)
+                # DEPTH-2 S6（§2.6・§5 S6）: multi_agent は既定で常時有効にする（深さに関わらず・
+                # 「本体が worker を兼ねる」縮退は採らない裁定）。判定は `codex_multi_agent_enabled`
+                # （sandbox.py・唯一の真実源＝doctor と条件式を共有し食い違いを防ぐ）に委ねる:
+                # Codex(Ollama) 構成／サンドボックス無効（フォールバック経路）／接続先が既定 OpenAI
+                # 以外（Azure・独自エンドポイント）はいずれも対象外——worker/evaluator の `model` は
+                # Codex 自身の OpenAI カタログ値（`_codex_worker_model`）固定で、これらの構成では
+                # 解決できない（実機確認済み）。`_review_rounds` は AGENTS.md へ埋め込む見直しの回数
+                # （標準 0／深く 2／最大は管理画面の設定値）——Codex 自身はこの回数を強制されない
+                # （spawn_agent の呼出上限を Sherpa 側が数えて止める仕組みは無い・指示のみ）。
+                _multi_agent_enabled = codex_multi_agent_enabled(
+                    ollama_base_url=self._ollama_base_url, system_settings=self._system_settings)
+                _review_rounds = depth_profile_mod.review_rounds_for(
+                    (ctx.scope_meta or {}).get("depth_profile"), self._system_settings)
                 # 原本直読の read root と秘匿 deny の列挙は、プロンプトの文言（direct_read フラグ）と
                 # permission profile（_write_codex_authoring_config・後段）の両方が使うため、
                 # プロンプト組立の前に1回だけ計算する（提案書 2026-09-10-Codex原本直読と調査スキル）。列挙失敗（RuntimeError＝fail-closed）時は両方とも
@@ -1008,6 +1251,12 @@ class CodexProvider(Provider):
                                 "-o", str(_last_message_path),
                                 "-C", str(run_dir), "-m", self.model,
                                 "-c", f"model_reasoning_effort={_reason}"]
+                    # 管理者環境の既定値に依存させない明示指定（提案書 §2.6・CLI 0.153.4 は
+                    # 既定 enabled だが将来/別環境の既定変更に頼らない）。無効時（Ollama／
+                    # Azure・独自エンドポイント）も明示的に false にする——`[agents.*]` の層を
+                    # 書かない構成で true のまま CLI 既定に委ねると、worker/evaluator の解決先が
+                    # 無いまま機能だけが有効という食い違いが起きる。
+                    argv_base += ["-c", f"features.multi_agent={'true' if _multi_agent_enabled else 'false'}"]
                     if not _session_persistence_enabled:
                         argv_base.append("--ephemeral")
                     # `self._openai_api_key` は Codex(OpenAI) 構成で接続先が Azure 等の時だけ
@@ -1024,6 +1273,12 @@ class CodexProvider(Provider):
                                 "--ephemeral", "-o", str(_last_message_path),
                                 "-s", "workspace-write", "-C", str(run_dir),
                                 "-m", self.model, "-c", f"model_reasoning_effort={_reason}"]
+                    # このフォールバック経路は常にサンドボックス無効
+                    # （`codex_multi_agent_enabled` が常に False を返す＝`_multi_agent_enabled` は
+                    # ここで常に偽）——config.toml 自体を書かない経路のため `[agents.*]` の層が無く、
+                    # 管理者環境の既定値に依存させず明示的に無効化する（有効なフリだけして spawn が
+                    # 毎ターン失敗するのを防ぐ）。
+                    argv_base += ["-c", "features.multi_agent=false"]
                     # §5-1: --strict-config が無い経路（config.toml でなく -c）なので同等をここで足す。
                     argv_base += _web_search_c_args(self._web_search, self._system_settings)
                     if mcp:
@@ -1031,12 +1286,27 @@ class CodexProvider(Provider):
                         popen_env = {**os.environ, **_mcp_env(ctx.world, sp, _ask_disabled, layer=_layer)}
                     else:
                         popen_env = None
+                # DEPTH-2 S3b是正: サイドカーは model-shell の書込許可領域
+                # （`":workspace_roots"` `"." = "write"` ＝ run_dir）の**外**に置く——run_dir 直下だと
+                # Codex の shell ツールが偽の `{"kind":"read",...}`/`{"kind":"ask_user",...}` 行を追記でき、
+                # 未読資料を根拠ゲート（sources_verified）へ通したり任意文面の確認カードでターンを
+                # 潰せてしまう。sandbox 有効時は codex_home（permission profile 上 `:root deny`＝
+                # model-shell から不可視・MCP サーバは profile 外の別プロセスなので書ける）配下に置く。
+                # フォールバック（`SHERPA_CODEX_SANDBOX=0`・読取全開＝ codex_home が無い）は
+                # `_mcp_env` にサイドカーの env を渡していない＝そもそも誰も書かない run_dir 上の
+                # パスのままで実害は無い（この経路自体が既に多層防御＝OS ユーザ分離に依存する緊急避難口）。
+                _sidecar_path = (codex_home / _MCP_SIDECAR_NAME) if codex_home is not None \
+                    else (run_dir / _MCP_SIDECAR_NAME)
                 # 出力スキーマ（§2-1）: OpenAI 系構成のみ（Codex(Ollama) は未確認のため対象外）・
-                # 退避口 env `SHERPA_CODEX_OUTPUT_SCHEMA=0` で無効化できる（既定 ON）。
-                _schema_on = (self._ollama_base_url is None
-                             and _env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 1, 0, 1) == 1)
+                # 退避口 env `SHERPA_CODEX_OUTPUT_SCHEMA=0` で無効化できる（既定 1＝v1）。
+                # DEPTH-2 S1（§2.5）: 同じ env の値 2 で v2（`claims` 付き）へ切り替える——
+                # 既定は 1 のまま（既存テストの argv/schema_path 契約を変えない）。
+                _schema_level = _env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 1, 0, 2)
+                _schema_on = self._ollama_base_url is None and _schema_level >= 1
+                _schema_v2 = _schema_on and _schema_level == 2
                 if _schema_on:
-                    argv_base += ["--output-schema", str(_OUTPUT_SCHEMA_PATH)]
+                    argv_base += ["--output-schema",
+                                 str(_OUTPUT_SCHEMA_PATH_V2 if _schema_v2 else _OUTPUT_SCHEMA_PATH)]
 
                 def _build_argv(use_resume: bool, prompt_text: str | None = None) -> list:
                     """resume 分岐は `codex exec resume [SESSION_ID] [PROMPT]` の位置引数どおり、
@@ -1211,18 +1481,16 @@ class CodexProvider(Provider):
                                     # 見ただけ」で `sources_verified`（根拠ゲート）へ数えられて
                                     # しまうため、`_mcp_listed_docs`（sources には合流するが
                                     # sources_verified には数えない）へ分ける。
-                                    if tool in ("read_doc", "read_around", "doc_outline",
-                                               "xlsx_range", "docx_paragraphs",
-                                               "pptx_slides", "pdf_pages", "file_head"):
+                                    if tool in READ_DOC_TOOLS:
                                         _d = a.get("doc_id")
                                         if isinstance(_d, str) and _d:
                                             _mcp_read_docs.append(_d)
-                                    elif tool == "xlsx_sheets":
+                                    elif tool in LISTED_DOC_TOOLS:
                                         _d = a.get("doc_id")
                                         if isinstance(_d, str) and _d:
                                             _mcp_listed_docs.append(_d)
                                     elif tool == "compare_documents":
-                                        for _k in ("left_doc_id", "right_doc_id", "source_doc_id"):
+                                        for _k in COMPARE_DOC_ID_ARGS:
                                             _d = a.get(_k)
                                             if isinstance(_d, str) and _d:
                                                 _mcp_read_docs.append(_d)
@@ -1285,6 +1553,15 @@ class CodexProvider(Provider):
                                     # 検知後は以降の Codex 自身の調査を待たない（このターンの答えは
                                     # どのみち `_degrade_overload` の固定文言に置き換わるため）。
                                     break
+                            elif (it == "collab_tool_call" and e.get("type") == "item.completed"
+                                  and item.get("tool") == "spawn_agent"):
+                                # DEPTH-2 S3b/S6: 子スレッド id の捕捉のみ（表示ノードは追加しない・
+                                # 巡ごとの右ペイン表示は対象外＝§2.8「Codex は巡境界イベントが無い」
+                                # ため用意していない）。Codex(Ollama) 構成（multi_agent 無効）では
+                                # このイベント自体が出ないため素通りする。
+                                for _tid in item.get("receiver_thread_ids") or []:
+                                    if isinstance(_tid, str) and _tid:
+                                        _child_thread_ids.add(_tid)
                             elif it == "reasoning" and e.get("type") == "item.completed":
                                 txt = (item.get("text") or "").strip().splitlines()
                                 if txt:
@@ -1356,9 +1633,10 @@ class CodexProvider(Provider):
                     nonlocal _latest_structured
                     if not _schema_on:
                         return
+                    _parse_fn = _parse_structured_v2 if _schema_v2 else _parse_structured
                     _latest_msgs = _agent_msgs[_attempt_msgs_start:]
                     for _m in _latest_msgs:
-                        _parsed = _parse_structured(_m)
+                        _parsed = _parse_fn(_m)
                         if _parsed is not None:
                             _structured_answers.append(_parsed)
                     _fb = _read_last_message_fallback(_last_message_path)
@@ -1366,7 +1644,7 @@ class CodexProvider(Provider):
                         _fb = None   # `_absorb_last_message_fallback` と同じ staleness 規則
                     _last_msg = _latest_msgs[-1] if _latest_msgs else None
                     _final_text = _fb or _last_msg
-                    _latest_structured = _parse_structured(_final_text) if _final_text else None
+                    _latest_structured = _parse_fn(_final_text) if _final_text else None
                     if _latest_structured is not None and _final_text != _last_msg:
                         _structured_answers.append(_latest_structured)
 
@@ -1396,13 +1674,62 @@ class CodexProvider(Provider):
                         return _empty
                     return None
 
+                def _absorb_mcp_sidecar() -> None:
+                    """DEPTH-2 S3b是正: 子（`spawn_agent` された worker/evaluator）のサイドカーを
+                    **毎 attempt 終了直後**（自動継続の判定より前）に取り込む。ここで読まずに
+                    ループの外（このターンの最後）まで待つと、子の `ask_user` があっても
+                    親は in_progress のまま自動継続を回してしまう（親自身の item stream には
+                    出ない＝`codex_question` が立たないまま次 attempt へ進む）。読んだ doc_id は
+                    `_mcp_read_docs`/`_mcp_listed_docs` へ重複なく合流させる（親自身の観測と同じ
+                    集合＝二重計上にならない）。
+
+                    `codex_home is None`（sandbox 無効のフォールバック経路）では吸収しない——この
+                    経路は run_dir が model-shell から書込全開（多層防御は OS ユーザ分離のみ）で、
+                    `_mcp_env` にサイドカーの env を渡していない＝MCP サーバは書かないため、
+                    run_dir 直下の `_sidecar_path` は shell ツールが偽装できてしまう
+                    （未読 doc_id を sources_verified に通す・任意文面の確認カードでターンを潰す）。
+
+                    `_sidecar_init_ok`（このターンの事前 unlink・設定生成が両方成功した時だけ True）が
+                    立っていなければ吸収しない——前ターンの残骸 unlink が失敗した場合や、
+                    設定生成自体が失敗して `_attempt` を一度も呼んでいない場合に、finally の
+                    無条件呼び出しが前ターンの残骸や存在しないサイドカーを読んでしまうのを防ぐ。
+                    """
+                    nonlocal codex_question
+                    if codex_home is None or not _sidecar_init_ok:
+                        return
+                    _sc_reads, _sc_listed, _sc_ask = _read_mcp_sidecar(_sidecar_path)
+                    for _d in _sc_reads:
+                        if _d not in _mcp_read_docs:
+                            _mcp_read_docs.append(_d)
+                    for _d in _sc_listed:
+                        if _d not in _mcp_listed_docs and _d not in _mcp_read_docs:
+                            _mcp_listed_docs.append(_d)
+                    if codex_question is None and _sc_ask is not None:
+                        codex_question = _sc_ask
+
+                def _pick_structured_claims() -> list[dict]:
+                    """DEPTH-2 S1（§2.5）: `_pick_structured_headline` と同じ選び方（`final` を
+                    優先・無ければ最後の構造化 message）で、その message が持つ `claims` を返す
+                    （v1 形・`_schema_v2` 無効時は常に空リスト）。"""
+                    if not _schema_v2:
+                        return []
+                    for s in reversed(_structured_answers):
+                        if s.get("status") == "final":
+                            return s.get("claims") or []
+                    if _structured_answers:
+                        return _structured_answers[-1].get("claims") or []
+                    return []
+
                 try:
                     # AGENTS.md はベストエフォート（書けなくても Codex 実行自体は継続・fail-open）。
                     # fail-open でも気づけるよう warning は残す（containment/grounding の短縮形は
                     # _prompt/_prompt_mcp に常置済みなので、書込失敗時も丸裸にはならない＝多層防御）。
                     try:
                         codex_agents_md.write_agents_md(run_dir, output_schema=_schema_on,
-                                                        direct_read=_direct_read_ok)
+                                                        direct_read=_direct_read_ok,
+                                                        output_schema_v2=_schema_v2,
+                                                        multi_agent=_multi_agent_enabled,
+                                                        review_rounds=_review_rounds)
                     except Exception as e:
                         _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
                     # スキル配備（案A′ ベース＋個人オーバーレイ）も同じくベストエフォート（fail-open）。
@@ -1424,12 +1751,36 @@ class CodexProvider(Provider):
                             (codex_home / "config.toml").unlink(missing_ok=True)
                         except Exception:
                             pass
+                        # 永続 CODEX_HOME は毎ターン再利用するため、前ターンのサイドカー残骸
+                        #   （finally が走らない終了・unlink 失敗等で残った場合）を吸収してしまうと
+                        #   未読 doc_id が根拠ゲートを通ったり前ターンの ask_user で今ターンが潰れる。
+                        #   config.toml と同じくここで空から始める（非永続の使い捨て codex_home では
+                        #   新規ディレクトリのため無害＝missing_ok=True）。unlink 自体が失敗した場合
+                        #   （権限等）は残骸が居るか分からない＝このターンは `_absorb_mcp_sidecar` を
+                        #   無効のままにする（`_sidecar_init_ok` を立てない・fail-open で親の観測のみ続行）。
+                        #   本文・パスは伏せ、例外型と errno だけ warning に残す。
+                        try:
+                            _sidecar_path.unlink(missing_ok=True)
+                            _sidecar_unlink_ok = True
+                        except Exception as e:
+                            _sidecar_unlink_ok = False
+                            _log.warning(
+                                "mcp sidecar pre-unlink failed (sidecar absorb disabled this turn): %s errno=%s",
+                                type(e).__name__, getattr(e, "errno", None))
                         _write_codex_authoring_config(
                             codex_home, _kb_read_roots(ctx.world), _reason,
                             mcp, ctx.world, sp, self._web_search, _ask_disabled,
                             ollama_base_url=self._ollama_base_url, system_settings=self._system_settings,
                             layer=_layer, direct_read_roots=_direct_roots, sensitive_deny=_sensitive_deny,
-                            deny_roots=_deny_roots)
+                            sidecar_path=str(_sidecar_path) if mcp else None,
+                            deny_roots=_deny_roots,
+                            multi_agent=_multi_agent_enabled, orchestrator_model=self.model)
+                        # ここまで（事前 unlink・設定生成）が両方例外を出さずに終わって初めて、
+                        # このターンのサイドカー吸収を許可する（`_write_codex_authoring_config` が
+                        # 例外を投げたら outer except へ抜けるため下の行は実行されない＝
+                        # フラグは既定 False のまま・finally の `_absorb_mcp_sidecar` は無効化される）。
+                        if _sidecar_unlink_ok:
+                            _sidecar_init_ok = True
                         # Azure OpenAI 対応: 接続先が Azure 等へリダイレクトされていて、そのせいで
                         # web_search が強制 OFF になっている時だけ、理由を1回（このターンにつき1回・
                         # `_write_codex_authoring_config` 呼び出しはこの1箇所だけで resume 再試行でも
@@ -1443,6 +1794,7 @@ class CodexProvider(Provider):
                     yield from _attempt(bool(resume_sid))
                     _absorb_last_message_fallback()
                     _update_structured_state()
+                    _absorb_mcp_sidecar()
                     # resume を試みて1行も --json イベントが出なかった（＝セッション消失等で resume
                     # 失敗・実機確認済み: `codex exec resume <消失id>` は空 stdout・exit 1）場合、
                     # R1a 履歴 priming（プロンプトには self._history が既に前置済み）で新規セッションへ
@@ -1474,6 +1826,7 @@ class CodexProvider(Provider):
                         yield from _attempt(False)
                         _absorb_last_message_fallback()
                         _update_structured_state()
+                        _absorb_mcp_sidecar()
                     # 自動継続: 正常終了（returncode 0）で agent_message が「作業宣言だけ」（結論文が
                     # 1つも無い＝_pick_codex_headline が規則③に落ちる）なら、Codex セッションの続きを
                     # 自動で呼ぶ（利用者の「続けて」連投をシステム側で肩代わりする）。ask_user 確認待ち・
@@ -1500,13 +1853,28 @@ class CodexProvider(Provider):
                             True, prompt_text=_CONTINUE_PROMPT_SCHEMA if _schema_on else _CONTINUE_PROMPT)
                         _absorb_last_message_fallback()
                         _update_structured_state()
+                        _absorb_mcp_sidecar()
                         if not _attempt_ran_tools:                # ツールを1つも呼ばずに終わった continuation は打ち切る（同じ宣言の空振りを繰り返さない）
                             break
                 except Exception:
                     answer = None
                     _stream_error = True
                 finally:
+                    # DEPTH-2 S3b是正: サイドカーは codex_home の削除・後始末より**前**に必ず一度
+                    # 吸収する（例外が `_attempt()` の途中で起きて、ループ内の毎 attempt 分の
+                    # `_absorb_mcp_sidecar()` 呼出まで届かなかった経路の取りこぼし防止・fail-open）。
+                    _absorb_mcp_sidecar()
                     if codex_home is not None:
+                        if _child_thread_ids:
+                            # DEPTH-2 S3b: 子の session JSONL（`sessions/**`）は非永続セッションだと
+                            # 直後の rmtree で消える——読むのは削除より**前**（この if ブロックの中の
+                            # どちらの分岐よりも前）でなければならない。読めなくても fail-open
+                            # （本体ターンの正常終了を妨げない）。
+                            try:
+                                _child_usage_totals, _child_usage_found, _child_usage_missing = (
+                                    _collect_child_token_usage(codex_home, _child_thread_ids))
+                            except Exception:
+                                pass
                         if _persist_session:
                             # セッション実体（`sessions/` の JSONL）は次ターンの resume の
                             # ために保持する。creds を含む config.toml だけ即時削除し露出窓を1ターン分に
@@ -1514,7 +1882,9 @@ class CodexProvider(Provider):
                             # `auth.json`（実 `~/.codex/auth.json` への
                             # symlink・`_write_codex_authoring_config` が張る）も同じ理由で毎ターン削除する
                             # （放置すると永続 CODEX_HOME に無期限残存＝次ターンは `_write_codex_authoring_config`
-                            # が `dst.exists()` を見て再作成するので消しても実害は無い）。
+                            # が `dst.exists()` を見て再作成するので消しても実害は無い）。サイドカーも同じ
+                            # 理由で毎ターン削除する（codex_home 自体は resume のため残るので rmtree では
+                            # 消えない＝前ターンの読取記録を次ターンへ持ち越さない）。
                             try:
                                 (codex_home / "config.toml").unlink(missing_ok=True)
                             except Exception:
@@ -1523,8 +1893,13 @@ class CodexProvider(Provider):
                                 (codex_home / "auth.json").unlink(missing_ok=True)
                             except Exception:
                                 pass
+                            try:
+                                _sidecar_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                         else:
-                            # per-request CODEX_HOME（profile＋auth symlink）を後始末（symlink target は消えない）。
+                            # per-request CODEX_HOME（profile＋auth symlink）を後始末（symlink target は
+                            # 消えない）。サイドカーはこの codex_home 配下＝rmtree で併せて消える。
                             try:
                                 shutil.rmtree(codex_home, ignore_errors=True)
                             except Exception:
@@ -1615,11 +1990,11 @@ class CodexProvider(Provider):
                     # `.tmp`（TMPDIR）配下は Codex の一時ファイル＝台帳登録しない（成果物のみ登録）。
                     # `.agents`（配備したスキル）配下も同様に対象外（スキルコピーが
                     # 成果物として files/ に誤って登録されないように・毎回作り直しなので前後で常に差分が出る）。
-                    # ルート直下の AGENTS.md も対象外（before 側と対・理由はそちらのコメント参照）。
+                    # ルート直下の AGENTS.md・`.mcp_sidecar.jsonl` も対象外（before 側と対・理由はそちらのコメント参照）。
                     _after_ws_files = {
                         p for p in run_dir.rglob("*")
                         if p.is_file() and not p.is_symlink()
-                        and p.relative_to(run_dir) != Path("AGENTS.md")
+                        and p.relative_to(run_dir) not in (Path("AGENTS.md"), Path(_MCP_SIDECAR_NAME))
                         and not ({".tmp", ".agents"} & set(p.relative_to(run_dir).parts))
                     }
                     new_authoring = sorted(_after_ws_files - _before_ws_files)
@@ -1735,6 +2110,12 @@ class CodexProvider(Provider):
             # この `run()` 自身が判定しているため数えられる。
             if _auto_continue_count and isinstance(env, dict):
                 env["limits"] = {**(env.get("limits") or {}), "auto_continues": _auto_continue_count}
+            # 深さ案内（chat_service._depth_actually_helps・§2.3）が本体と同じ判定を使うための
+            # 唯一の受け渡し口。`codex_multi_agent_enabled`（sandbox.py）の結果を usage の
+            # is_local から再現できない（Azure も既定 OpenAI と同じ "cloud"）ため、ここで結果
+            # そのものを渡す。
+            if isinstance(env, dict):
+                env["codex_multi_agent"] = _multi_agent_enabled
             # A2: troubleshoot は Codex が実際に引いた近傍を UI カードにする（_gather 由来を Codex 実調査由来で上書き）。
             _apply_codex_neighbors(env, mcp_neighbors, decision.get("lens") if decision else None)
             # turn.completed から拾った usage は Codex CLI の契約でセッション累計
@@ -1772,6 +2153,34 @@ class CodexProvider(Provider):
                 # 差分計算／累計そのものの両方に同じ深さメタを載せる
                 # （`_usage_depth_extra` はこのターンの `_reason`/`_base_reason` 確定時に計算済み）。
                 env["usage"].update(_usage_depth_extra)
+                # DEPTH-2 S3b/S6: 子スレッド（`spawn_agent`）の usage を加算する。`env["codex_usage_total"]`
+                # （次ターンの差分計算の元）は**親のスナップショットのまま変えない**——子の usage は
+                # 子スレッドのセッション累計であって親の累計とは別系統のため、ここへ混ぜると次ターンの
+                # 差分計算が破綻する。合算は `env["usage"]`（このターンの表示・計上値）だけに行い、
+                # 内訳（親／子／未取得件数）を別途残す。multi_agent 無効（Codex(Ollama) 構成・
+                # `collab_tool_call` が一度も出ない実行）は `_child_usage_found`/`_child_usage_missing`
+                # が両方 0 のまま＝このブロックは素通りする。
+                # 計測の正本＝§2.8: 本体ターン（`turn.completed`）は境界イベントが無く巡（worker/
+                # evaluator の spawn 単位）ごとの内訳を取れないため、巡別の `chat-round` は記録しない
+                # （API/Ollama 経路の巡ループ・`providers/base.py::_agentic_run` とは異なる）——ここで
+                # 合算する親＋子の usage 合計だけを、このターンの正本として `env["usage"]`/`sherpa.usage`
+                # ログに残す。
+                if _child_usage_found or _child_usage_missing:
+                    # DEPTH-2 S3b是正: 親分の内訳は `codex_usage`（セッション累計）ではなく
+                    # `env["usage"]`（直前の分岐で resume 差分 or 累計そのものに確定済みの
+                    # このターンの計上値）から作る——resume ターンでは `codex_usage` に前ターン分が
+                    # 混入しており、そのまま使うと内訳の親分だけ合計より過大になる。
+                    _parent_only = {k: env["usage"].get(k) or 0 for k in _CHILD_USAGE_KEYS}
+                    env["codex_usage_children"] = {
+                        "found": _child_usage_found, "missing": _child_usage_missing,
+                        **_child_usage_totals,
+                    }
+                    env["usage"]["codex_usage_breakdown"] = {
+                        "parent": _parent_only, "children": dict(_child_usage_totals),
+                        "children_found": _child_usage_found, "children_missing": _child_usage_missing,
+                    }
+                    for _k in _CHILD_USAGE_KEYS:
+                        env["usage"][_k] = (env["usage"].get(_k) or 0) + _child_usage_totals.get(_k, 0)
                 # Codex 経路も `sherpa.usage` ログ 1 行（kind=chat・深さ・推論レベル付き）を出す。
                 _log_chat_usage(env["usage"], time.monotonic() - _turn_t0, ctx.world)
             # 捕捉した session/thread id を env に載せる（chat_service が `store.set_session_id` で永続化・
@@ -1836,6 +2245,14 @@ class CodexProvider(Provider):
                     env["sources_verified"] = sorted(_ref_ids - _listed_only_ids)
                 env["codex_referenced_docs"] = {"listed": len(_ref_candidates), "verified": len(_verified_refs)}
                 env["headline"] = _body if (_verified_refs and _body.strip()) else answer   # 空本文には差し替えない
+                if _schema_on:
+                    # DEPTH-2 S1（§2.5）: v2 のときだけ主張配列を持つ（v1 は常に空リスト＝
+                    # `_pick_structured_claims` が既に `_schema_v2` で分岐済み）。区分と理由コードを
+                    # envelope にも載せる——共有（sanitized share）・監査で消えないようにする
+                    # （`sherpa/store/shares.py::_safe_claim` が既知フィールドのみで再構築する）。
+                    _claims = _pick_structured_claims()
+                    if _claims:
+                        env.setdefault("data", {})["claims"] = _claims
                 # 実際に回答を生成できたターン＝`_dispatch` がツール遮断時に立てた
                 # `agentic_failure`（`agentic_search.tools_blocked_env`）が残っていれば消す
                 # （Codex は遮断状態を見ずに調査を続行し得るため、結果が出た後の事実で上書きする）。

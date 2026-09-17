@@ -65,8 +65,9 @@ _NEO4J_QUERY_TIMEOUT_S = _env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 _NEO4J_MAX_ROWS = _env_int("SHERPA_NEO4J_MAX_ROWS", 10000, 100, 1_000_000)
 # トラブルシュート/近傍探索（neo4j_related）の既定深さ。範囲外・不正値は既定3へ復帰（[1,16]）。
 TROUBLESHOOT_GRAPH_DEPTH = _env_int("SHERPA_TROUBLESHOOT_GRAPH_DEPTH", 3, 1, 16)
-# env-parse hi 引数と同じ値。調べる深さ（`depth_profile.scaled_depth`）が加算適用後に一度だけ
-# 適用する絶対上限として使う（`impact_service.IMPACT_MAX_DEPTH_ABS_MAX` と同じ理由）。
+# env-parse hi 引数と同じ値。調べる深さに依らず一定の実効基準値（`depth_profile.scaled_depth`・
+# DEPTH-2 S7 以降は加算無し）に対して一度だけ適用する絶対上限として使う
+# （`impact_service.IMPACT_MAX_DEPTH_ABS_MAX` と同じ理由）。
 TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX = 16
 
 # タイムアウト由来のサーバエラーコードを緩く判定する（専用の例外クラスが無いため）。実例:

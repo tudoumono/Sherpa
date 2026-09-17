@@ -1324,6 +1324,11 @@ def _sweep_expired_codex_sessions() -> dict:
     - symlink は触らない（is_symlink() 事前チェック）。
     - 削除は `.codex-sessions/{cid}` ディレクトリ配下に閉じ込め確認（relative_to）してから行う。
     - 共有 RAG（ES/Neo4j）・conversations 行には一切触れない（セッション実体のみ）。
+
+    DEPTH-2 S3b: `spawn_agent` した子エージェントの rollout も同じ CODEX_HOME
+    （`{cid}/sessions/**/*.jsonl`）配下に書かれる（親と別ファイル・同じディレクトリ木）ため、
+    `shutil.rmtree(cdir)` は子の分も一括で削除する——個別の回収コードは不要（対象を親スレッドだけに
+    限定していない）。
     """
     try:
         retention_days = int(store.get_system_settings().get("codex_session_retention_days") or 0)

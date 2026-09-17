@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 
 import re
@@ -103,6 +104,228 @@ class ToolCall:
     hits: int | None
     truncated: bool
     error: str | None
+
+
+# DEPTH-2 S1（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2/§2.5）: メイン査読が
+# 再調査後もなお不足と判定したとき、全回答を固定文言へ置き換える代わりに主張単位で
+# 確定/推定/不明を持たせ、裏付けのある部分を残す。理由コードは閉じた語彙（unknown 限定）。
+_CLAIM_STATUSES = frozenset({"confirmed", "inferred", "unknown"})
+_CLAIM_UNKNOWN_REASON_CODES = frozenset({
+    "not_found_in_scope", "unexplored", "insufficient", "conflict", "budget", "unreadable"})
+_CLAIM_KEYS = frozenset({"id", "status", "text", "evidence_refs", "reason", "reason_code"})
+
+
+@dataclass
+class Claim:
+    """査読後の清書が扱う主張1件。`status` は確定（`evidence_refs` で裏付け）／推定
+    （`reason` に理由）／不明（`reason_code` を閉じた語彙から）。`evidence_refs` は
+    `Evidence.ev_id`（この調査状態内の採番）を指す文字列。
+
+    `origin`（DEPTH-2 S4b）: 主張の出所——`"synthesis"`（査読後の最終手段・
+    `providers/base.py::_claims_synthesis`）／`"worker"`（下調べ役の一次判断・
+    `agentic_search.openai_style` の `final_synthesis=False` 経路）。LLM が出す JSON
+    （`_CLAIM_KEYS`）のキーではなく、呼び出し元（`parse_claims`/`set_claims` の `origin`
+    引数）が代入する内部メタデータ——`claim_to_dict` の出力には含めない（公開
+    envelope・共有・既存テストの形を変えない）。"""
+    id: str
+    status: str
+    text: str
+    evidence_refs: list[str] = field(default_factory=list)
+    reason: str = ""
+    reason_code: str = ""
+    origin: str = "synthesis"
+
+
+def claim_to_dict(c: Claim) -> dict:
+    return {"id": c.id, "status": c.status, "text": c.text,
+            "evidence_refs": list(c.evidence_refs), "reason": c.reason, "reason_code": c.reason_code}
+
+
+def extract_claims_json(acc: str) -> list | None:
+    """`{"claims": [...]}` 1個だけの応答本文から生の主張配列を取り出す（構造検証は `parse_claims`
+    が別途行う・本関数は JSON 抽出だけの純関数）。JSON でない・`claims` 以外のキーを含む・配列で
+    ない場合はいずれも `None`（追記で継ぎ足さない＝失敗として扱う・§2.5「途中で切れた JSON は
+    失敗」）。`providers/base.py::_claims_synthesis`（査読後の最終手段）と `agentic_search.
+    openai_style` の worker 一次判断（`final_synthesis=False` 経路）が共通で使う。"""
+    m = re.search(r"\{.*\}", acc, re.S)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not isinstance(parsed, dict) or set(parsed.keys()) != {"claims"}:
+        return None
+    return parsed.get("claims")
+
+
+def parse_claims(raw, origin: str = "synthesis") -> list[Claim] | None:
+    """構造化出力（JSON の `claims` 配列）を検証して `Claim` のリストへ変換する（純関数）。
+
+    キー集合が `_CLAIM_KEYS` の部分集合かつ `id`/`status`/`text` を持つこと・`status` が閉じた
+    語彙であること・`status == "unknown"` のときだけ `reason_code` が閉じた語彙を持つこと（他の
+    区分では reason_code を持たない）・`id` の重複が無いことを全て満たさなければ `None`
+    （呼び出し元はこれを「失敗」として扱う——追記で継ぎ足したり部分的に採用したりしない・
+    §2.5「途中で切れた JSON は失敗」）。
+
+    `origin`（省略可・既定 `"synthesis"`）: 生成した Claim 全件へ付ける出所（`Claim.origin`
+    docstring 参照）。`raw` 自体のキーとは無関係（LLM 出力の語彙を広げない）。
+    """
+    if not isinstance(raw, list):
+        return None
+    claims: list[Claim] = []
+    seen_ids: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        keys = set(item.keys())
+        if not keys <= _CLAIM_KEYS or not {"id", "status", "text"} <= keys:
+            return None
+        cid, status, text = item.get("id"), item.get("status"), item.get("text")
+        if not isinstance(cid, str) or not cid.strip() or cid in seen_ids:
+            return None
+        if not isinstance(status, str) or status not in _CLAIM_STATUSES:
+            return None
+        if not isinstance(text, str) or not text.strip():
+            return None
+        evidence_refs = item.get("evidence_refs", [])
+        if not isinstance(evidence_refs, list) or not all(isinstance(r, str) for r in evidence_refs):
+            return None
+        reason = item.get("reason", "")
+        if not isinstance(reason, str):
+            return None
+        reason_code = item.get("reason_code", "")
+        if not isinstance(reason_code, str):
+            return None
+        if status == "unknown":
+            if reason_code not in _CLAIM_UNKNOWN_REASON_CODES:
+                return None
+        elif reason_code:
+            return None   # reason_code は unknown 限定（他区分に紛れ込ませない）
+        if status == "inferred" and not reason.strip():
+            return None   # 推定は理由必須（空白のみも不可・提案書 §2.5「推定（理由）」）
+        seen_ids.add(cid)
+        claims.append(Claim(id=cid, status=status, text=text.strip(),
+                            evidence_refs=list(evidence_refs), reason=reason, reason_code=reason_code,
+                            origin=origin))
+    return claims
+
+
+# DEPTH-2 S5（§2.4）: evaluator の指摘（不足の軸・主張 ID 単位の反証）の状態。
+# 「未解決」＝次巡の指示に載る／「解決」＝次巡で根拠が足され orchestrator が確定した／
+# 「撤回」＝evaluator 自身が取り下げた。どちらの遷移も orchestrator（`providers/base.py::
+# _agentic_run` の巡ループ）が確定する——evaluator は指摘を出すだけで状態を書き換えない。
+FINDING_STATES = frozenset({"open", "resolved", "withdrawn"})
+_FINDING_KEYS = frozenset({"id", "claim_id", "text", "refutes", "state"})
+
+
+@dataclass
+class Finding:
+    """evaluator の指摘 1 件。`round_no` は指摘が出た巡（1 始まり）——右ペインの思考ノードと
+    巡別計測（`chat-round`）が巡を区別するために持つ。`claim_id` は対象の主張 ID（空＝主張に
+    紐づかない全体的な不足）。`refutes` が真なら対象の主張はその巡の中で採用不可へ落ちる
+    （`InvestigationState.apply_findings`）。"""
+    id: str
+    round_no: int
+    claim_id: str = ""
+    text: str = ""
+    refutes: bool = False
+    state: str = "open"
+    # 指摘を出した時点の対象主張の根拠参照数と区分。次巡で「根拠が足されたか／確定へ戻ったか」を
+    # 判定する基準点＝`apply_findings` が代入する内部メタデータ（LLM 出力のキーではないため
+    # `_FINDING_KEYS`・`finding_to_dict` には含めない）。
+    ev_count: int = 0
+    claim_status: str = ""
+
+
+def finding_to_dict(f: Finding) -> dict:
+    return {"id": f.id, "round_no": f.round_no, "claim_id": f.claim_id, "text": f.text,
+            "refutes": f.refutes, "state": f.state}
+
+
+def parse_findings(raw, round_no: int) -> list[Finding] | None:
+    """evaluator 応答の `findings` 配列を検証して `Finding` へ変換する（純関数）。
+
+    `None`（キー自体が無い）は「指摘なし」＝空リストとして扱えるよう、呼び出し元が区別できる
+    `None` ではなく空リストを返す。形が不正（配列でない・未知のキー・`id` 欠落/重複・`state` が
+    閉じた語彙でない）なら `None`——呼び出し元はこれを「指摘を読めなかった」として扱い、主張の
+    採否は変更しない（部分採用しない・`parse_claims` と同じ規律）。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return None
+    out: list[Finding] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        keys = set(item.keys())
+        if not keys <= _FINDING_KEYS or "id" not in keys:
+            return None
+        fid = item.get("id")
+        if not isinstance(fid, str) or not fid.strip() or fid in seen:
+            return None
+        claim_id = item.get("claim_id", "")
+        text = item.get("text", "")
+        if not isinstance(claim_id, str) or not isinstance(text, str):
+            return None
+        refutes = item.get("refutes", False)
+        if not isinstance(refutes, bool):
+            return None
+        st = item.get("state", "open")
+        if not isinstance(st, str) or st not in FINDING_STATES:
+            return None
+        seen.add(fid)
+        out.append(Finding(id=fid.strip(), round_no=int(round_no), claim_id=claim_id.strip(),
+                           text=text.strip(), refutes=refutes, state=st))
+    return out
+
+
+def render_findings(findings: list[Finding]) -> str:
+    """次巡の指示・右ペインの思考ノードへ渡す未解決の指摘だけの整形（解決済み・撤回は落とす）。
+
+    先頭に指摘 ID を出す——査読は同じ指摘を同じ ID で返し直し、別の指摘には未使用の ID を
+    付ける契約（`providers/prompts.py::review_prompt`）で、ID を別の指摘へ使い回されると
+    `apply_findings` の既存行更新が別の未解決の反証を消してしまうため。
+    """
+    lines = []
+    for f in findings:
+        if f.state != "open":
+            continue
+        target = f"[{f.claim_id}] " if f.claim_id else ""
+        lines.append(f"- ({f.id}) {target}{f.text}" + ("（反証）" if f.refutes else ""))
+    return "\n".join(lines)
+
+
+def adoptable_claims(claims: list[Claim]) -> list[Claim]:
+    """停止・失敗・時間切れの未完了回答へ載せてよい主張（§2.4）＝確定/推定のうち反証されて
+    いないもの。反証された主張は `apply_findings` が `unknown`（`reason_code="conflict"`）へ
+    落とし済みのため、区分で判定できる。
+
+    確定（`confirmed`）はさらに根拠参照を持つものに限る——根拠 ID の公開採番への変換
+    （`resolve_claim_evidence_ids`）で `evidence_refs` が空になった確定は裏付けを示せない
+    ため、未完了回答（停止・失敗）にも載せない（grounded QA の根拠ゲートと同じ規律）。
+    """
+    return [c for c in claims
+            if c.status == "inferred" or (c.status == "confirmed" and c.evidence_refs)]
+
+
+def render_claims(claims: list[Claim]) -> str:
+    """清書プロンプトへ渡す主張構造の整形（`InvestigationState.render()` とは別の専用ビュー
+    ——根拠 digest とは独立に「どの主張を確定／推定／不明として書くか」だけを伝える）。"""
+    if not claims:
+        return ""
+    lines = []
+    for c in claims:
+        if c.status == "confirmed":
+            refs = "、".join(c.evidence_refs) if c.evidence_refs else "(根拠参照なし)"
+            lines.append(f"[{c.id}] 確定: {c.text}（根拠: {refs}）")
+        elif c.status == "inferred":
+            lines.append(f"[{c.id}] 推定: {c.text}（理由: {c.reason or '根拠が薄い'}）")
+        else:
+            lines.append(f"[{c.id}] 不明: {c.text}（理由コード: {c.reason_code}）")
+    return "\n".join(lines)
 
 
 def _span_tuple(span) -> tuple[int, int] | None:
@@ -217,6 +440,113 @@ def _structural_fact(m: dict, clean) -> str:
     return ""
 
 
+def resolve_claim_evidence_ids(claims: list[Claim], evidence: list[Evidence],
+                               combined_evidence_meta: list) -> list[Claim]:
+    """DEPTH-2 S1 是正（RV C2）: `claims[].evidence_refs` は `set_claims` 時点では `self.evidence`
+    （この調査状態内で安定した採番・並べ替え/重複排除で変わらない）の `ev_id` を指す。清書ダイジェスト
+    （`agentic_search.build_synthesis_digest`）と Evidence Packet（`_evidence_packet_evidence`）は
+    `combined_evidence_meta`（citation の重複排除・span 統合、構造的根拠の重複排除を経た別の list）を
+    `ev-{i+1}` で**別採番**するため、再調査を挟んで両 list の並び・件数がずれると同じ "ev-N" 文字列が
+    別の根拠を指しうる。この関数は根拠の同一性（citation は doc_id と span の一致／包含、構造的根拠は
+    整形済み事実テキストの一致）で参照を `combined_evidence_meta` 側の ev-N へ書き換える——呼び出し元
+    は書き換え後の `claims` を `data["claims"]`（envelope・共有）・`render_claims`（清書入力）の
+    両方に使う（同じ ID を指す契約）。対応する Packet エントリが無い参照（read/outline/compare 等、
+    Evidence Packet に現れない種別、または `combined_evidence_meta` から重複排除で消えた根拠）は
+    黙って落とす——存在しない ev-N を清書・共有へ残さないため（confirmed が結果として空の
+    `evidence_refs` になり得る＝この関数の後段では検証し直さない・呼び出し元の責務）。
+    """
+    from . import agentic_search as _as
+    clean = _as._digest_clean
+    by_id = {e.ev_id: e for e in evidence}
+
+    def _target_ev_id(ev: Evidence) -> str | None:
+        if ev.kind == "citation":
+            fallback = None
+            for i, m in enumerate(combined_evidence_meta):
+                if not isinstance(m, dict) or m.get("matched_doc_ids") is not None:
+                    continue   # 構造的根拠エントリ（citation とは別枠）
+                if m.get("doc_id") != ev.doc_id:
+                    continue
+                m_span = _span_tuple(m.get("span"))
+                if ev.span is not None and m_span is not None:
+                    if m_span[0] <= ev.span[0] and m_span[1] >= ev.span[1]:
+                        return f"ev-{i + 1}"   # span 統合後の範囲が元の span を包含＝同一根拠
+                    continue
+                if fallback is None:
+                    fallback = i   # span 無し同士・または比較不能＝同一 doc の先頭候補
+            return f"ev-{fallback + 1}" if fallback is not None else None
+        if ev.kind in ("list", "graph"):
+            for i, m in enumerate(combined_evidence_meta):
+                if not isinstance(m, dict) or m.get("matched_doc_ids") is None:
+                    continue   # citation エントリ（構造的根拠とは別枠）
+                if clean(_structural_fact(m, clean)) == ev.text:
+                    return f"ev-{i + 1}"
+            return None
+        return None   # read/outline/compare は Evidence Packet に現れない種別＝写像先が無い
+
+    out: list[Claim] = []
+    for c in claims:
+        new_refs: list[str] = []
+        for r in c.evidence_refs:
+            ev = by_id.get(r)
+            target = _target_ev_id(ev) if ev is not None else None
+            if target is not None and target not in new_refs:
+                new_refs.append(target)
+        out.append(Claim(id=c.id, status=c.status, text=c.text, evidence_refs=new_refs,
+                         reason=c.reason, reason_code=c.reason_code, origin=c.origin))
+    return out
+
+
+def remap_claim_refs_to_evidence(claims: list[Claim], source_evidence: list[Evidence],
+                                 target_evidence: list[Evidence]) -> list[Claim]:
+    """DEPTH-2 S4b: worker（下調べ役・`agentic_search.openai_style` の `final_synthesis=False`
+    経路）が自分専用のローカル `InvestigationState.evidence`（`source_evidence`）基準で組んだ
+    主張の `evidence_refs` を、親 `InvestigationState`（`providers/base.py::
+    _ingest_sub_final_into_state` が同じ根拠を既に `add_tool_result` で取り込み済みの
+    `target_evidence`）の実際の ev_id へ書き換える。
+
+    `resolve_claim_evidence_ids`（citation は doc_id＋span、structural はテキストの一致で
+    `combined_evidence_meta`—辞書の list—へ書き換える）と役割は同じだが、こちらは両側とも
+    `Evidence` オブジェクト同士の内容一致（citation/read は kind＋doc_id＋span［＋read の
+    locator］、list/graph/compare は kind＋text）で突き合わせる——worker のローカル状態は
+    Evidence Packet 化前（`_commit_evidence`/`combined_evidence_meta` を経ていない）のため、
+    辞書形ではなく親の `state.evidence` を直接の突き合わせ先にする。対応する親 Evidence が
+    見つからない参照（内容一致しない・親側の重複排除で消えた・read/outline 等その他の種別で
+    未対応）は黙って落とす（`resolve_claim_evidence_ids` と同じ「存在しない ev-N を残さない」
+    契約——confirmed が結果として空の `evidence_refs` になり得る・呼び出し元の
+    `InvestigationState.set_claims` が最終検証する）。`origin` は書き換えない（呼び出し元が
+    `set_claims(..., origin=...)` で明示的に付け直す）。
+    """
+    by_id = {e.ev_id: e for e in source_evidence}
+
+    def _target(ev: Evidence) -> Evidence | None:
+        for t in target_evidence:
+            if t.kind != ev.kind:
+                continue
+            if ev.kind in _TEXT_KEYED_DEDUPE_KINDS:
+                if t.text == ev.text:
+                    return t
+                continue
+            if t.doc_id != ev.doc_id or t.span != ev.span:
+                continue
+            if ev.kind == "read" and ev.span is None and t.locator != ev.locator:
+                continue
+            return t
+        return None
+
+    out: list[Claim] = []
+    for c in claims:
+        new_refs: list[str] = []
+        for r in c.evidence_refs:
+            src = by_id.get(r)
+            tgt = _target(src) if src is not None else None
+            if tgt is not None and tgt.ev_id not in new_refs:
+                new_refs.append(tgt.ev_id)
+        out.append(Claim(id=c.id, status=c.status, text=c.text, evidence_refs=new_refs,
+                         reason=c.reason, reason_code=c.reason_code, origin=c.origin))
+    return out
+
+
 _RENDER_TRUNCATION_NOTICE_TMPL = "（古い根拠 {n} 件は省略・直近を優先）"
 
 # list（list_docs/glob_search の集計）・graph・compare の事実は doc_id/span が常に None のため、
@@ -247,6 +577,103 @@ class InvestigationState:
     limits: dict = field(default_factory=lambda: {
         "tool_result_clipped": 0, "total_budget_hit": False, "context_compactions": 0,
         "synthesis_truncated": False, "search_truncated": 0, "auto_continues": 0})
+    # DEPTH-2 S1: 主張と採否の状態（`set_claims` が検証済みのものだけを保持する・既定は空＝
+    # 査読の全回答破棄をこの状態で置き換えていない通常のターンでは触らないまま）。
+    claims: list = field(default_factory=list)
+    # DEPTH-2 S5: evaluator の指摘（`Finding`）。巡ループが `apply_findings` 経由でのみ追記する。
+    findings: list = field(default_factory=list)
+    # DEPTH-2 S2（§2.7）: `write_output_file` ツールが台帳登録に成功するたびに1件追記する
+    # （`{"rel_path","download_url",...}`・Codex の created_files カードと同じ形）。既定は空＝
+    # このツールを一度も呼ばなかった/一度も成功しなかったターンでは触らないまま。
+    created_files: list = field(default_factory=list)
+
+    def apply_findings(self, raw, round_no: int, verdict: str | None = None) -> bool:
+        """この巡の evaluator の指摘を取り込み、反証された主張を同じ巡の中で採用不可へ落とす。
+
+        未解決から「解決」へ遷移させるのは、**根拠が進んだ**（対象主張の `evidence_refs` が
+        指摘時点より増えた、または区分が確定へ戻った）かつ **orchestrator が確認した**（この巡の
+        判定が `sufficient`、または当該指摘が再指摘されなかった）の両方が成立した指摘だけ——
+        再指摘が無いことだけでは解決にしない（未解決のまま次巡の指示に残す・§2.4）。
+
+        同じ `id` の指摘は既存の行を更新する（撤回＝`state="withdrawn"` もこの更新で反映され、
+        次巡の指示から落ちる）。形が不正（`parse_findings` が `None`）なら何も変更せず
+        `False`——主張の採否を推測で動かさない。
+        """
+        parsed = parse_findings(raw, round_no)
+        if parsed is None:
+            return False
+        by_claim = {c.id: c for c in self.claims}
+        reraised = {f.id for f in parsed}
+        for old in self.findings:
+            if old.state != "open" or not old.claim_id:
+                continue
+            c = by_claim.get(old.claim_id)
+            if c is None:
+                continue
+            progressed = (len(c.evidence_refs) > old.ev_count
+                          or (c.status == "confirmed" and old.claim_status != "confirmed"))
+            if progressed and (verdict == "sufficient" or old.id not in reraised):
+                old.state = "resolved"
+        existing = {f.id: f for f in self.findings}
+        for f in parsed:
+            c = by_claim.get(f.claim_id)
+            f.ev_count = len(c.evidence_refs) if c is not None else 0
+            f.claim_status = c.status if c is not None else ""
+            old = existing.get(f.id)
+            if old is not None:
+                # 同じ指摘の再送・撤回は既存行を更新する（旧 open 行を残して次巡に持ち越さない）。
+                (old.round_no, old.claim_id, old.text, old.refutes, old.state,
+                 old.ev_count, old.claim_status) = (f.round_no, f.claim_id, f.text, f.refutes,
+                                                    f.state, f.ev_count, f.claim_status)
+            else:
+                self.findings.append(f)
+        self._apply_open_refutations()
+        return True
+
+    def _apply_open_refutations(self) -> None:
+        """未解決の反証を主張へ反映する（反証＝その時点で採用不可）。閉じた語彙
+        （`_CLAIM_UNKNOWN_REASON_CODES`）の `conflict` を付けて不明へ落とす——清書・未完了回答・
+        公開 envelope の全てから外れる。`set_claims` からも呼ぶ＝後から生成・再取得された主張が
+        未解決の反証を上書きして再採用されることはない。"""
+        by_id = {c.id: c for c in self.claims}
+        for f in self.findings:
+            if not (f.refutes and f.state == "open"):
+                continue
+            c = by_id.get(f.claim_id)
+            if c is None or c.status == "unknown":
+                continue
+            c.status = "unknown"
+            c.reason_code = "conflict"
+            c.reason = f.text or c.reason
+
+    def set_claims(self, raw, origin: str = "synthesis") -> bool:
+        """`parse_claims` で検証した主張配列を採否状態として保持する。空リスト・不正な形は
+        何も変更せず False を返す（呼び出し元は既存の honest failure へ落とす・§2.5）。
+
+        `parse_claims` は構造（キー・閉じた語彙）だけを見る純関数のため、`status == "confirmed"`
+        の `evidence_refs` がこの調査で実在する根拠を指すかはここで検証する（`self.evidence` を
+        持つのは `InvestigationState` だけ）。confirmed が `evidence_refs` を持たない、または
+        存在しない `ev_id` を含む場合は claims 全体を不正として扱い、何も変更せず False を返す
+        （RV C1: 裏付けの無い主張を確定として清書へ渡さない・worker 由来（DEPTH-2 S4b）でも
+        同じ規律を適用する）。
+
+        `origin`（省略可・既定 `"synthesis"`）: `Claim.origin` 参照。呼び出し元が
+        `"worker"`（下調べ役の一次判断）を明示できる。
+
+        保持した直後に未解決の反証を再適用する（`_apply_open_refutations`）——反証済みの ID を
+        同じ内容で返し直しても再採用されない。
+        """
+        parsed = parse_claims(raw, origin=origin)
+        if not parsed:
+            return False
+        valid_ids = {e.ev_id for e in self.evidence}
+        for c in parsed:
+            if c.status == "confirmed" and (
+                    not c.evidence_refs or not all(r in valid_ids for r in c.evidence_refs)):
+                return False
+        self.claims = parsed
+        self._apply_open_refutations()
+        return True
 
     def bump_limit(self, key: str, n: int = 1) -> None:
         """回数系カウンタを加算する（キーは固定語彙＝呼び出し側が `limits` の既定キーだけを渡す）。"""

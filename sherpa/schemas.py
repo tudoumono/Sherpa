@@ -208,8 +208,9 @@ class SettingsResponse(BaseModel):
     # （openai_only / ollama_only / codex_openai / codex_ollama）。`constructs_available` は
     # この環境で選べるものだけ（env `SHERPA_EXTRA_AGENTS` で追加AIを有効化したら増える）。
     codex_model_provider: str
-    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べだけを安いモデルへ任せる
-    # 利用者ごとの設定（''＝使わない／'ollama'／'openai'）。モデル名は管理者のカタログ既定に従う。
+    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べ（worker）だけを安いモデルへ任せる
+    # 利用者ごとの設定（''＝安いモデルを使わず頭脳自身が worker／'ollama'／'openai'）。
+    # モデル名は管理者のカタログ既定に従う。
     search_helper: str
     # 旧・個人上書き時代のモデル指定（読み取り専用・注記表示のみ）。
     search_helper_model: str
@@ -505,8 +506,8 @@ class DepthProfileCodexReasoningInfo(BaseModel):
 
 class DepthProfileAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `depth_profile`（SC-6c・`sherpa/depth_profile.py`・
-    system_extras.py::_admin_settings_view）。調べる深さ（標準/深く/最大）が掛ける倍率の
-    **基準値**（標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。"""
+    system_extras.py::_admin_settings_view）。調べる深さ（標準/深く/最大）に依らず一定で使う
+    **実効基準値**のみを持つ——深さによる倍率・加算は撤去済み（絶対上限だけが最終的に効く）。"""
     max_turns: DepthProfileBaseInfo
     grep_max_hits: DepthProfileBaseInfo
     qa_max_hits: DepthProfileBaseInfo
@@ -588,6 +589,9 @@ class AdminSettingsView(BaseModel):
     # 埋め込み HTTP の同時送信数（`embeddings.effective_embed_parallel`）。
     # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=EMBED_PARALLEL_DEFAULT）。
     embed_parallel: DepthProfileBaseInfo
+    # 「最大」の深さが許す査読の巡数（`depth_profile.effective_max_review_rounds`）。
+    # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=MAX_REVIEW_ROUNDS_DEFAULT）。
+    max_review_rounds: DepthProfileBaseInfo
     chat_examples: ChatExamplesAdminInfo
 
 

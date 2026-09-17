@@ -75,17 +75,79 @@ _INVESTIGATE_SKILLS_PARAGRAPH = """\
 # スキーマ無効時にこの構造化応答の要求を出すと、Codex が実際には守れない形式を約束させられるだけで
 # 実害がある（`--output-schema` が無ければ CLI 側の強制も無い）ため、`write_agents_md` の
 # `output_schema` 引数が真のときだけ本文に足す。
-_STRUCTURED_RESPONSE_PARAGRAPH = """\
-- 最終応答は `status`／`answer`／`next_step` の3項目で返す。`status` が `final` になるのは、依頼の調査が
-  完了した（全件要求なら対象範囲の確認を終え、該当項目が answer にそろった）ときだけ。調べる作業が
-  まだ残っているなら、同じ応答内で続けて調査するか、`in_progress` にして `next_step` へ次に何を調べる
-  かを書く（`final` のときの `next_step` は null）。手順や計画の説明を求められた依頼は、その説明を
-  書き終えた時点で `final`。利用者停止・通信エラー・既存の予算到達で中断した状態のまま応答を返すときは、
-  `answer` に確認済みの結果・未確認の範囲・中断理由を分けて書く（新しい `status` 値は使わない）。
+# `status`／`in_progress`／`next_step`／中断時の記述の意味（v1・v2 共通）。v2 段落は元々「3項目版と
+# 同じ意味」と v1 段落を参照する形だったが、`output_schema_v2=True` のときは v1 段落自体が出力され
+# ず参照先が無い（下の `structured_paragraph` 選択が排他のため）——`providers/codex/provider.py` の
+# 自動継続（`_STRUCTURED_STATUSES`・全件確認前は `in_progress` にする・`final` を受けると継続を
+# 終了する）の前提となるこの記述を1か所に括り出し、両段落から使う。
+_STATUS_FIELD_MEANING = (
+    "`status` が `final` になるのは、依頼の調査が完了した（全件要求なら対象範囲の確認を終え、"
+    "該当項目が answer にそろった）ときだけ。調べる作業がまだ残っているなら、同じ応答内で続けて"
+    "調査するか、`in_progress` にして `next_step` へ次に何を調べるかを書く（`final` のときの "
+    "`next_step` は null）。手順や計画の説明を求められた依頼は、その説明を書き終えた時点で "
+    "`final`。利用者停止・通信エラー・既存の予算到達で中断した状態のまま応答を返すときは、"
+    "`answer` に確認済みの結果・未確認の範囲・中断理由を分けて書く（新しい `status` 値は使わない）。"
+)
+
+_STRUCTURED_RESPONSE_PARAGRAPH = f"""\
+- 最終応答は `status`／`answer`／`next_step` の3項目で返す。{_STATUS_FIELD_MEANING}
+"""
+
+# RV C5（DEPTH-2 S1・output_schema_v2.json）: `SHERPA_CODEX_OUTPUT_SCHEMA=2` のときだけ足す段落。
+# `_STRUCTURED_RESPONSE_PARAGRAPH`（3項目）の代わりに使う——v2 は `claims` を4件目のキーとして
+# 追加するため、Codex 自身に「4項目で返す・claims の意味と閉じた語彙」を伝えないと、CLI 側の
+# スキーマ強制があっても Codex は3項目のつもりのまま埋めた形式的な claims しか返さず（または
+# 常に空のまま）、`data.claims` が無言で空になる（`provider.py::_parse_claim` が空の confirmed を
+# 拒否するため、実際には「claims 無し」より「主張構造の恩恵が一切効かない」形で顕在化する）。
+_STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
+- 最終応答は `status`／`answer`／`next_step`／`claims` の4項目で返す。{_STATUS_FIELD_MEANING}
+  `claims` は回答の主張を1件ずつ構造化した配列（`id`／`status`／`text`／
+  `evidence_refs`／`reason`／`reason_code` の6キーちょうど）で、`status` は次の3種のどれか:
+  `confirmed`（確定・裏付けとなる資料の根拠を最低1件 `evidence_refs` に書く。裏付けが無いなら
+  confirmed にしない）／`inferred`（推定・断定できる根拠が無いが妥当と考える理由を `reason` に
+  空でなく書く）／`unknown`（不明・`reason_code` を `not_found_in_scope`／`unexplored`／
+  `insufficient`／`conflict`／`budget`／`unreadable` のどれか1つにする。該当なしと未探索を
+  区別する）。`reason_code` は `unknown` のときだけ使う（他の `status` では空文字にする）。
+  答えられる部分と不明な部分が混在する依頼は、全体を `unknown` でひとまとめにせず、答えられる
+  主張は `confirmed`／`inferred` のまま個別に残す。
+"""
+
+# S6（§2.6）: multi_agent 有効時に本体（orchestrator）へ役割の使い方を伝える段落。`review_rounds`
+# は選ばれた深さが許す evaluator の巡数（`depth_profile.review_rounds_for` の戻り値＝標準 0／
+# 深く 2／最大は管理画面の設定値）——0 のときは evaluator を使わないことを明示する（標準は今までの
+# 挙動と同じ・巡を増やさない）。何体をどう使うか自体は Codex の判断のまま固定の手順にはしない。
+def _multi_agent_role_paragraph(review_rounds: int) -> str:
+    if review_rounds <= 0:
+        rounds_note = ("今回の見直しの回数は 0 回＝evaluator は使わない。worker の一次判断と、"
+                       "必要な箇所だけ自分で行う確認だけで最終回答をまとめる。")
+    else:
+        rounds_note = (f"今回の見直しの回数は {review_rounds} 回まで。spawn_agent(evaluator) は"
+                       f"最大 {review_rounds} 回までとし、十分と判定できたらそれ以上は呼ばない。")
+    return f"""\
+- worker（資料の検索・精読と一次判断だけを担当し、最終回答は書かない）と evaluator（根拠と
+  一次判断を別観点で査読し、反証・条件例外・回答漏れ・未探索の範囲を指摘する。書き直さない）の
+  サブエージェントが使える。観点に分解して調べる観点ごとに spawn_agent(worker) で調査させ、
+  一次判断（確定／推定／不明の主張）を受け取る。一次判断を鵜呑みにせず、必要な箇所だけ自分で
+  MCP ツールを使って確認する。{rounds_note}
+  evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。何体をどう使うか（観点の
+  分け方・worker の数）はあなた自身の判断でよい。最後に全体を統合し、指定された出力形式で
+  最終回答を返す（成果物は各巡では作らず、最後に一度だけ作る）。
 """
 
 
-def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: bool = True) -> None:
+# resume 直後は名前付きロール（worker/evaluator）での spawn_agent が
+# "Full-history forked agents inherit the parent agent type" エラーで失敗しうる。`multi_agent`
+# 有効時だけ足す段落（`write_agents_md` の `multi_agent` 引数は既定 False で本文に現れない）。
+_MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH = """\
+- サブエージェント（worker／evaluator）を spawn するとき、このセッションを resume した直後に
+  指定したロールでの spawn が失敗したら、ロールを指定しない spawn に切り替えて続ける
+  （resume 直後は名前付きロールの委任が失敗することがある既知の制約）。
+"""
+
+
+def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: bool = True,
+                    output_schema_v2: bool = False, multi_agent: bool = False,
+                    review_rounds: int = 0) -> None:
     """authoring 直下へ AGENTS.md を書く（per-request・冪等・上書き）。
 
     呼び出し側で try/except すること（AGENTS.md はあくまで補助・書込に失敗しても Codex 実行自体は
@@ -95,6 +157,16 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
     `direct_read`（既定 True）が偽のとき＝原本直読を許可しないターンは、調査スキル（原本を Python で
     開く前提）への誘導段落を落とす。`output_schema`（既定 False）が真のときだけ、構造化最終応答
     （`status`／`answer`／`next_step`）を求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
+    `output_schema_v2`（既定 False）が真のときは3項目版の代わりに4項目版
+    （`_STRUCTURED_RESPONSE_PARAGRAPH_V2`・`claims` の意味と閉じた語彙を含む）を使う——
+    `output_schema` が偽なら `output_schema_v2` が真でも段落を足さない（`--output-schema`
+    自体が無効なターンへ、CLI が強制しない構造化応答を約束させない・既存の `output_schema` 契約と
+    同じ理由）。呼び出し側は `_schema_v2`（`_schema_on and _schema_level == 2`）をそのまま渡す。
+    `multi_agent`（既定 False）が真のときだけ、役割の使い方（worker／evaluator・`review_rounds`
+    が埋め込む見直しの回数）と resume 直後の名前付きロール spawn 失敗へのフォールバック指示を
+    付け足す（`features.multi_agent` を明示有効化する側で使う・既定では本文に現れない）。
+    `review_rounds`（既定 0）は `multi_agent=True` のときだけ意味を持つ（`depth_profile.
+    review_rounds_for` の戻り値をそのまま渡す契約・`multi_agent=False` なら無視される）。
 
     単純な `Path.write_text()` は既存の `AGENTS.md` が symlink だった場合にその**指す先へ**書き込んで
     しまう（authoring 配下の想定外の場所を書き換え得る）ため、一時ファイルを
@@ -102,8 +174,14 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
     （`rename`/`replace` はディレクトリエントリの張替えでシンボリックリンクを一切追従しない＝
     既存 AGENTS.md が symlink でも安全に「通常ファイルの AGENTS.md」へ置き換わる）。
     """
+    structured_paragraph = ""
+    if output_schema:
+        structured_paragraph = (_STRUCTURED_RESPONSE_PARAGRAPH_V2 if output_schema_v2
+                                else _STRUCTURED_RESPONSE_PARAGRAPH)
     content = (AGENTS_MD + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
-               + (_STRUCTURED_RESPONSE_PARAGRAPH if output_schema else ""))
+               + structured_paragraph
+               + (_multi_agent_role_paragraph(review_rounds) if multi_agent else "")
+               + (_MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH if multi_agent else ""))
     target = authoring / "AGENTS.md"
     tmp = authoring / f".AGENTS.md.tmp-{os.urandom(6).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)

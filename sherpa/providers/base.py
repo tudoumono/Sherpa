@@ -40,9 +40,14 @@ from dataclasses import dataclass
 from typing import Callable, Iterator
 
 from .. import layer as layer_mod
+from .. import search_helper as _sh_mod
 from .. import stop_kind as stop_kind_mod
-from .prompts import (_AUTHOR_FALLBACK_NOTE, _BUDGET_EXHAUSTED_HEADLINE, _PLAIN_PROMPT,
-                      _PLAIN_PROMPT_WITH_PERSONAL, _answer_prompt)
+from .prompts import (_AUTHOR_FALLBACK_NOTE, _AUTHOR_OUTPUT_FILENAME_DEFAULT,
+                      _BUDGET_EXHAUSTED_HEADLINE, _PLAIN_PROMPT,
+                      _PLAIN_PROMPT_WITH_PERSONAL, _answer_prompt, author_output_prompt,
+                      _AUTHOR_NO_EVIDENCE_HEADLINE,
+                      author_save_failed_note, _continuation_prompt,
+                      claims_prompt, rerun_instruction, review_prompt)
 
 _log = logging.getLogger("sherpa")
 
@@ -242,6 +247,40 @@ def _ingest_sub_final_into_state(state, ev: dict) -> None:
         elif isinstance(_v, int):
             if _v:
                 state.bump_limit(_k, _v)
+    # DEPTH-2 S4b（§2.2）: worker（下調べ役）の一次判断——`agentic_search.openai_style` が自分の
+    # ローカル `InvestigationState` 基準で組んだ主張（`claims_raw`）と、その根拠一覧
+    # （`claims_evidence`・内部専用チャンネル・上の `add_tool_result` が同じ根拠を親
+    # `state.evidence` へ取り込み済み）を、内容一致で親の ev_id へ書き換えてから、通常の検証
+    # （`InvestigationState.set_claims`・RV C1: confirmed は根拠参照必須）へそのまま通す——worker
+    # 由来だからといって裏付けの規律を緩めない。
+    #
+    # 再調査ごとに毎回この関数が呼ばれる。再調査の worker は新しいローカル `InvestigationState`
+    # ＋不足軸だけの質問で動くため、今回の `claims_raw` の id は毎回 "c1" から採番し直される
+    # （既存分との衝突＝同じ論点の言い直し、非衝突＝別軸の新規主張のどちらもありうる）——既存の
+    # worker 由来の主張（`origin == "worker"`）のうち、今回と同じ id を持つものは**今回の内容で
+    # 置換**し（言い直しを両方 confirmed のまま残さない）、それ以外（別軸）はそのまま維持した上で
+    # 今回分を**追記**する。メイン査読自身が確定した主張（`origin == "synthesis"`・
+    # `_claims_synthesis`）は worker 由来で上書きしない——査読は worker の一次判断を鵜呑みにせず
+    # 必要箇所を自分で確認した結果なので、後から来る worker 側の値で消してはいけない。
+    if state.claims and any(c.origin == "synthesis" for c in state.claims):
+        return
+    _raw_worker_claims = ev.get("claims_raw")
+    _worker_claims_evidence = ev.get("claims_evidence")
+    if _raw_worker_claims and _worker_claims_evidence is not None:
+        from .. import investigation_state as _inv_mod
+        _remapped = _inv_mod.remap_claim_refs_to_evidence(
+            _raw_worker_claims, _worker_claims_evidence, state.evidence)
+        if _remapped:
+            _existing_worker = [c for c in state.claims if c.origin == "worker"]
+            _new_dicts = [_inv_mod.claim_to_dict(c) for c in _remapped]
+            _new_ids = {d["id"] for d in _new_dicts}
+            _kept = [_inv_mod.claim_to_dict(c) for c in _existing_worker if c.id not in _new_ids]
+            _merged = _kept + _new_dicts
+            state.set_claims(_merged, origin="worker")
+            # 今回の呼び出しが不正（`_remapped` は得られたが結合後の検証が通らない）なら、
+            # `set_claims` は state.claims を変更しない——既存分をそのまま維持する。
+    # `_remapped` が空（生成失敗・検証不合格・今回は評価対象の根拠が無かった等）でも同様に
+    # 既存分を維持する（旧い worker 由来の判断を消さない）。
 
 
 def _ctx_with_effective_layer(ctx: Ctx, lens: str) -> Ctx:
@@ -403,6 +442,26 @@ def _usage_meta(provider_id: str, model: str | None, *, input_tokens=0, cached_i
             "input_tokens": _i(input_tokens), "cached_input_tokens": _i(cached_input_tokens),
             "output_tokens": _i(output_tokens), "reasoning_output_tokens": _i(reasoning_output_tokens),
             "is_local": is_local}
+
+
+_USAGE_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+
+
+def _merge_usage_meta(base: dict | None, delta: dict | None) -> dict | None:
+    """C27/#34/#35 是正: 同一呼び出し（本体清書＋自動継続の各ラウンド）にまたがる usage を
+    トークン欄だけ合算する（`provider`/`model`/`is_local` は `base` を優先・無ければ `delta`）。
+    `_stream` 実装が `self._last_usage` をラウンドごとに**上書き**する契約（前回分を持ち越さない・
+    モジュール内の他呼び出し元と同じ）のため、呼び出し元がラウンドをまたいで自前で足し込む
+    必要がある——ここへ集約して二重実装しない。`base`/`delta` どちらか片方が None でも
+    もう片方をそのまま返す（1回も usage を拾えなければ None のまま）。"""
+    if base is None:
+        return delta
+    if delta is None:
+        return base
+    merged = dict(base)
+    for k in _USAGE_TOKEN_FIELDS:
+        merged[k] = int(base.get(k) or 0) + int(delta.get(k) or 0)
+    return merged
 
 
 def _log_chat_usage(usage: dict, elapsed: float | None = None, world: str | None = None) -> None:
@@ -858,6 +917,17 @@ def _hybrid_reclassified_stop_reason(stop_reason: str, provider_id: str, complet
         completion.reason, truncated=truncated, content_filtered=content_filtered)
     return stop_reason if reclassified == "unknown" else reclassified
 
+
+def _is_length_truncated(provider_id: str, completion: "_CompletionState") -> bool:
+    """DEPTH-2 S2（§2.7）: `completion` が**出力上限による打ち切り（"length" 系）**かどうかを
+    方言別 allowlist で判定する（`completion.truncated`＝「自然完了ではない」全般とは違い、
+    content_filtered・未知の理由・終端フレーム未観測は対象外——それらへ追記継続を試みても
+    無意味/危険なため）。`_hybrid_reclassified_stop_reason` と同じ方言別 truncated 集合を使い、
+    再分類結果が "truncated" のときだけ True（"content_filtered"／変化なしは False）。
+    """
+    return _hybrid_reclassified_stop_reason("unknown", provider_id, completion) == "truncated"
+
+
 def _verified_sources(make_sources, docs: set, world: str, scope_paths=None) -> tuple[list, list]:
     """`docs`（run_tool が触れた doc_id の raw 集合）を機械検証で絞ってから `sources`（出典フッター・
     原本 DL リンク）を組む——citation とは別経路で集まる `docs`/`sources` にも同じ実在チェック
@@ -1068,16 +1138,210 @@ _REVIEW_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", 
 _RERUN_MISSING_MAX_CHARS = 2000   # 査読が不足と判定したとき、再調査依頼へ引き継ぐ不足観点の文字数上限
 
 
-def _review_usage_folded(calls: int, tokens: dict | None, unknown: bool) -> dict | None:
+def _single_stream_usage(u: dict | None) -> dict | None:
+    """1回だけ `_stream` を発行したメソッド（`_claims_synthesis`）の
+    `self._last_usage` を `chat-review` 合算と同じ `{"calls","tokens"}` 形へまとめる。
+    usage を観測できなければ `tokens=None`（部分合計を実測値と偽らない）。"""
+    tokens = None
+    unknown = True
+    if u:
+        tokens = {f: int(u.get(f) or 0) for f in _REVIEW_TOKEN_FIELDS}
+        unknown = False
+    return _review_usage_folded(1, tokens, unknown)
+
+
+def _review_usage_folded(calls: int, tokens: dict | None, unknown: bool,
+                         roles: dict | None = None) -> dict | None:
     """`_sufficiency_verdict` 内で行った複数回の `_stream` 呼び出し分を、`_fold_sub_usage` が
     合算できる `{"calls","tokens"}` 形へまとめる。`calls` が0（1回も `_stream` を試みていない＝
     ループ先頭の stop_event 検知等）なら `None`（`_fold_sub_usage` はこれを no-op として扱う）。
     `unknown`（1回でも usage を観測できなかった呼び出しがある）なら `tokens=None`
     （部分合計を実測値と偽らない・`_fold_sub_usage` の None 契約と同じ）。
+
+    `roles`（省略可・DEPTH-2 S5 §2.8）: 役割（orchestrator の確認／evaluator の判定）別の
+    `{"calls","tokens"}` 内訳。巡別記録（`chat-round`）の表示用で、`_fold_sub_usage` は
+    このキーを読まない（正本の `chat-review` 合算は calls/tokens だけで行う）。
     """
     if calls <= 0:
         return None
-    return {"calls": calls, "tokens": None if unknown else tokens}
+    out = {"calls": calls, "tokens": None if unknown else tokens}
+    if roles:
+        out["roles"] = roles
+    return out
+
+
+# DEPTH-2 S5（§2.4）: 巡ループの終端 4 種。ここが「返す本文・保存するか・監査の lens・終端
+# イベント」の固定表で、`_agentic_run` と consumer（`chat_service`）の両方がこの語彙で動く。
+# - normal   : 清書済みの回答。保存する。監査 lens＝依頼のレンズ。終端イベント＝`_result`。
+#              `evidence_committed`（保存確定）はこの終端だけに付く。
+# - question : 確認カード（`ask_user`）。保存する（一度だけ）。監査 lens＝clarify。
+#              終端イベント＝`question`（外側の巡ループもここで終了する）。
+# - stopped  : 利用者の停止。**追加の LLM 呼び出しをせず**、その時点で採用可の主張だけから
+#              コードで組んだ未完了回答を保存する。監査 lens＝stopped（`stopped=True`）。
+#              終端イベント＝`_result`（`env["_terminal"]=="stopped"`）。
+# - failed   : 調査・査読の失敗（根拠不足を含む）。**追加の LLM 呼び出しをせず**、巡ループで
+#              確認済みの採用可の主張があればそれを未完了回答として固定文言の前に置いて保存する
+#              （無ければ固定文言だけ）。監査 lens＝依頼のレンズ。
+#              終端イベント＝`_result`（`env["agentic_failure"]` が立つ）。
+TERMINALS = ("normal", "question", "stopped", "failed")
+
+# 巡を止める条件（§2.4 の6つ）の表示文言。未完了回答の本文（`_incomplete_headline`）と
+# 巡別記録（`chat-round` の `meta.stop`）が同じ語彙を使う。
+_ROUND_STOP_LABELS = {
+    "rounds_exhausted": "見直しの回数に達したため",
+    "sufficient": "根拠が十分と判定したため",
+    "undecidable": "十分とも不足とも判断できなかったため",
+    "budget": "調査の上限に達したため",
+    "user_stop": "利用者の操作で停止したため",
+    "ask_user": "確認が必要になったため",
+    "review_failed": "査読を完了できなかったため",
+}
+_INCOMPLETE_CLAIM_MAX = 10   # 未完了回答へ並べる主張の件数上限（本文を短く保つ）
+
+
+def _offloaded_body_excerpt(answer: str) -> str:
+    """清書予算を超えてファイルへ退避した本文の表示用（先頭の抜粋＋ダウンロードへの誘導）。"""
+    return (answer[:2000]
+            + "\n\n…（回答が長いためファイルに保存しました。全文は下のダウンロードから確認してください）")
+
+
+def _personal_inputs_accumulator(ctx) -> dict:
+    """DEPTH-2 S5（§2.7）: 個人由来／書込の有無を全巡で累積するための入れ物。
+
+    初期値はこのターンの既存の personal 判定の入力（個人ファイルのヒット本文が
+    プロンプトへ入ったか）。巡ごとに `_merge_personal_inputs` で入力を足していく——
+    API/Ollama の出力ファイルツール（S2）が合流したら、その `wrote_files`/`created_files`
+    をここへ接続する（累積と全終端への伝搬の規約はそのままで入力だけ増える）。
+    """
+    return {"personal_facts": bool(getattr(ctx, "personal_facts", "")), "wrote_files": False}
+
+
+def _merge_personal_inputs(acc: dict, *, wrote_files=None, created_files=None) -> None:
+    """1巡分の個人由来／書込の入力を累積へ足す（真になったら run 内で戻さない）。"""
+    if wrote_files:
+        acc["wrote_files"] = True
+    if created_files:
+        acc["wrote_files"] = True
+
+
+def _personal_flag(acc: dict) -> bool:
+    return bool(acc.get("personal_facts") or acc.get("wrote_files"))
+
+
+def _apply_personal_flag(target: dict, acc: dict) -> None:
+    """全終端（通常・確認カード・停止・失敗）へ累積結果を渡す内部キー。consumer
+    （`chat_service`）が個人扱いの判定へ OR し、保存前に取り除く。"""
+    if _personal_flag(acc):
+        target["_personal_rounds"] = True
+
+
+def _review_node_label(provider_label: str, round_no: int) -> str:
+    return (f"根拠を査読（{provider_label}・{round_no}巡目）" if round_no
+            else f"根拠を査読（{provider_label}）")
+
+
+def _incomplete_headline(claims: list, round_no: int, reason: str) -> str:
+    """停止・失敗・時間切れで清書に至らなかったときの未完了回答（§2.4）。
+
+    **追加の LLM 呼び出しをしない**——採用可（確定/推定で反証されておらず、確定は根拠参照を
+    持つ）の主張だけをコードで並べ、「N 巡目で打ち切り（理由）」を明示する（成功として
+    見せない）。反証済み・採用不可（不明）・根拠参照を失った確定は含めない
+    （`investigation_state.adoptable_claims`）。
+
+    """
+    from .. import investigation_state as _inv
+    why = _ROUND_STOP_LABELS.get(reason, "処理を続けられなかったため")
+    head = f"{round_no}巡目で打ち切りました（{why}）。回答は未完了です。"
+    adopted = _inv.adoptable_claims(list(claims or []))[:_INCOMPLETE_CLAIM_MAX]
+    if not adopted:
+        return head + "\n\nここまでに確定できた内容はありません。"
+    lines = [("・" + c.text + ("" if c.status == "confirmed" else "（推定）")) for c in adopted]
+    return head + "\n\nここまでに確認できた範囲:\n" + "\n".join(lines)
+
+
+def _claims_breakdown(claims: list) -> dict:
+    """巡別記録（`chat-round`）用の主張の区分内訳（確定/推定/不明＋不明の理由コード別）。"""
+    out = {"confirmed": 0, "inferred": 0, "unknown": 0, "reason_codes": {}}
+    for c in claims or []:
+        if c.status in out:
+            out[c.status] += 1
+        if c.status == "unknown" and c.reason_code:
+            out["reason_codes"][c.reason_code] = out["reason_codes"].get(c.reason_code, 0) + 1
+    return out
+
+
+def _limits_delta(before: dict, after: dict) -> dict:
+    """巡内の `limits` 増分（§2.8: 累積スナップショットを足さない）。回数系は差分、
+    当たったか系（bool）はこの巡で偽→真になったものだけ真で載せる。既定のままの項目は省く。"""
+    out = {}
+    for k, v in (after or {}).items():
+        b = (before or {}).get(k)
+        if isinstance(v, bool):
+            if v and not b:
+                out[k] = True
+        elif isinstance(v, (int, float)):
+            d = v - (b or 0)
+            if d:
+                out[k] = d
+    return out
+
+
+_VERDICTS = ("sufficient", "insufficient", "undecidable")
+
+# 不足軸の閉じた分類（集計用・本文を持たない）。`investigation_state._CLAIM_UNKNOWN_REASON_CODES`
+# と同じ語彙——usage.py と同様、leaf モジュール原則のためここで複製する（値は同期させる）。
+_MISSING_CODES = frozenset({
+    "not_found_in_scope", "unexplored", "insufficient", "conflict", "budget", "unreadable"})
+
+
+def _normalized_verdict(v: dict) -> dict | None:
+    """evaluator 応答 JSON を判定 dict へ正規化する（判定でない応答＝読み直し指示なら `None`）。
+
+    受理する形は `{"verdict": …}`（DEPTH-2 S5 の語彙・判定不能を含む）と、後方互換の
+    `{"sufficient": bool}`。`sufficient` は `verdict == "sufficient"` の bool 射影で、
+    呼び出し元の既存分岐（十分なら清書へ）がそのまま使える。
+
+    `missing_codes`（任意）: `missing`（自由文）の分類——`_MISSING_CODES` の閉集合に無い値・
+    文字列でない要素は黙って落とす（集計側に自由文が紛れ込まないようにする）。重複は除く。
+    """
+    raw = v.get("verdict")
+    if isinstance(raw, str) and raw in _VERDICTS:
+        verdict = raw
+    elif isinstance(v.get("sufficient"), bool):
+        verdict = "sufficient" if v["sufficient"] else "insufficient"
+    else:
+        return None
+    codes_raw = v.get("missing_codes")
+    missing_codes = (sorted({c for c in codes_raw if isinstance(c, str) and c in _MISSING_CODES})
+                     if isinstance(codes_raw, list) else [])
+    return {"verdict": verdict, "sufficient": verdict == "sufficient",
+            "missing": str(v.get("missing") or ""), "missing_codes": missing_codes,
+            "findings": v.get("findings")}
+
+
+def _role_bucket() -> dict:
+    """`_sufficiency_verdict` が役割別に積む usage バケツ（`_review_usage_folded` の `roles`）。"""
+    return {"calls": 0, "tokens": None, "unknown": False}
+
+
+def _role_add(bucket: dict, usage: dict | None) -> None:
+    bucket["calls"] += 1
+    if not usage:
+        bucket["unknown"] = True
+        return
+    if bucket["tokens"] is None:
+        bucket["tokens"] = dict.fromkeys(_REVIEW_TOKEN_FIELDS, 0)
+    for f in _REVIEW_TOKEN_FIELDS:
+        bucket["tokens"][f] += int(usage.get(f) or 0)
+
+
+def _roles_out(*pairs) -> dict:
+    """`(name, bucket)` の並びから、呼び出しが1回以上あった役割だけの内訳 dict を組む。"""
+    out = {}
+    for name, b in pairs:
+        if b["calls"] > 0:
+            out[name] = {"calls": b["calls"], "tokens": None if b["unknown"] else b["tokens"]}
+    return out
 
 
 class _GenProvider(Provider):
@@ -1139,10 +1403,177 @@ class _GenProvider(Provider):
                         exc_info=True)
             return set()
 
+    def _maybe_offload_long_answer(self, uid: str | None, answer: str) -> tuple[str, list]:
+        """清書予算（`agentic_search._SYNTHESIS_MAX_BYTES`・新設定は増やさず既存の予算値を流用）を
+        超えた確定本文を `write_output_file` と同じ台帳・カード（`store.record_workspace_file`・
+        個人 workspace の files/）へ登録してダウンロード導線を出す（本文は先頭だけの抜粋にし
+        全文はファイルへ誘導する）。予算内の本文は登録しない。
+
+        `uid` が無い（登録先が特定できない）・登録自体が失敗した場合は fail-open で元の本文を
+        そのまま返す（このターンをファイル化できないだけで、回答自体は失敗させない）。
+        戻り値: `(表示する本文, write_output_file と同形の created_files エントリ list)`——
+        後者は呼び出し元が `_created_files_ev` へ合流させる契約。
+        """
+        from .. import agentic_search
+        if not uid or len(answer.encode("utf-8")) <= agentic_search._SYNTHESIS_MAX_BYTES:
+            return answer, []
+        result = agentic_search._run_write_output_file(
+            {"filename": _AUTHOR_OUTPUT_FILENAME_DEFAULT, "content": answer}, uid)
+        if "error" in result:
+            return answer, []   # fail-open: 保存できなければ従来どおり本文をそのまま出す
+        return (_offloaded_body_excerpt(answer),
+                [{"rel_path": result["rel_path"], "download_url": result.get("download_url")}])
+
+    def _offload_long_answer_into_env(self, ctx: "Ctx", env: dict, acc: str) -> str:
+        """`_maybe_offload_long_answer` を清書本文の確定箇所（ハイブリッド／計画経路）へ接続する
+        共通ヘルパー。§2.1 の対象外の頭脳（Gemini/Bedrock）の単独ループはこの経路を経由しない
+        専用処理を既に持つため呼ばない。
+
+        `env["headline"]` と `env["created_files"]`/`env["wrote_files"]`（個人由来フラグ・
+        `chat_service` の sanitized share 判定が見る）を書き換えたうえで、表示用の本文
+        （オフロードされていれば抜粋、されていなければそのまま）を返す。
+        """
+        answer, created = self._maybe_offload_long_answer(ctx.uid, acc)
+        env["headline"] = answer
+        if created:
+            env["created_files"] = [
+                {"name": f.get("rel_path"), "download_url": f.get("download_url")}
+                for f in created if f.get("rel_path")]
+            env["wrote_files"] = [f.get("rel_path") for f in created if f.get("rel_path")] or True
+        return answer
+
+    def _author_output_args(self, orig_message: str, body: str) -> dict:
+        """作成系（author）の成果物の `filename`／`marp` を清書側（orchestrator）の LLM 呼び出し
+        1 回で決めさせる（`write_output_file` へ渡す引数のうち content 以外）。
+
+        `_claims_synthesis` と同じ4方言非依存の自前 JSON プロトコル（`self._stream` の応答を
+        「1個の JSON」として解釈する）。呼び出し失敗・JSON 不正・使えないファイル名のときは
+        既定（`回答.md`・marp なし）へ倒す——ファイル名を決められないことで成果物の登録自体を
+        落とさない（登録の成否は呼び出し元が終端に反映する）。
+        """
+        from .. import agentic_search
+        args = {"filename": _AUTHOR_OUTPUT_FILENAME_DEFAULT, "marp": False}
+        self._last_usage = None   # この1回の消費だけを呼び出し元が計上できるようにする
+        acc = ""
+        try:
+            for chunk in self._stream(author_output_prompt(
+                    orig_message, body, agentic_search._SYNTHESIS_MAX_BYTES // 4)):
+                if chunk:
+                    acc += chunk
+        except Exception:
+            _log.warning("成果物のファイル名の決定に失敗しました（既定のファイル名で保存します）",
+                        exc_info=True)
+            return args
+        m = re.search(r"\{.*\}", acc, re.S)
+        if not m:
+            return args
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            return args
+        if not isinstance(parsed, dict):
+            return args
+        name = str(parsed.get("filename") or "").strip()
+        if name and agentic_search._SAFE_OUTPUT_FILENAME_RE.match(name) and "/" not in name \
+                and "\\" not in name and name not in (".", ".."):
+            args["filename"] = name
+        args["marp"] = bool(parsed.get("marp"))
+        return args
+
+    def _continue_truncated_headline(self, ctx: Ctx, orig_message: str, lens: str, env: dict,
+                                     acc: str, truncated: bool) -> Iterator[dict]:
+        """DEPTH-2 S2（§2.7）: 清書本文が `length`（出力上限）で打ち切られたとき、続きを**追記**で
+        自動生成する（前と重複させない）。対象は清書本文（自由文の最終回答）だけ——主張構造
+        （claims JSON・§2.5）はこの継続の対象外で、別メソッド（`_generate_claims` 相当）が
+        1回の呼び出しで完結させる契約のまま変えない。
+
+        回数上限は新しい設定を増やさず、Codex 経路の自動継続と同じ既存値
+        （`SHERPA_CODEX_AUTO_CONTINUE`・既定3・0〜5）を流用する。各ラウンドは前回の完了状態
+        （`_CompletionState`）を見て打ち切りが続く限りだけ発行し、途中の明示停止・例外・空応答は
+        fail-open（それまでの本文を採用してそこで打ち切る＝ループ全体は落とさない）。
+
+        戻り値（`yield from` で受け取る）: `(連結後の本文, 最終ラウンドの _CompletionState または
+        1度も継続しなかった場合は None, 実際に発行した継続ラウンド数, 継続分の合算 usage または
+        1回も usage を拾えなければ None)`。呼び出し元は `completion is not None` のときだけ
+        自分の `completion` 変数を差し替える契約（1度も継続していなければ最初の
+        `_CompletionState` をそのまま使い続ける）。
+
+        C27/#34/#35 是正: `self._last_usage` は `_stream` 呼び出しのたびに**その回だけ**の値へ
+        上書きされる（前回分を持ち越さない契約・モジュール内の他呼び出し元と同じ）ため、本体清書
+        呼び出しの usage を保持したまま各継続ラウンドの usage をここで合算して返す——呼び出し元が
+        `self._last_usage` をそのまま `env["usage"]` へ採用すると、最後の継続ラウンド（または
+        0ラウンドなら本体清書）の usage だけが残り、間の呼び出し分が計上漏れになる。
+        """
+        from .. import agentic_search
+        last_completion: "_CompletionState | None" = None
+        rounds = 0
+        usage_totals = {"input_tokens": 0, "cached_input_tokens": 0,
+                        "output_tokens": 0, "reasoning_output_tokens": 0}
+        usage_meta_base: dict | None = None   # provider/model/is_local（最初に拾えた回のものを流用）
+        usage_seen = False
+
+        def _merge_round_usage() -> None:
+            nonlocal usage_meta_base, usage_seen
+            u = self._last_usage
+            if not u:
+                return
+            usage_seen = True
+            if usage_meta_base is None:
+                usage_meta_base = u
+            for k in usage_totals:
+                usage_totals[k] += int(u.get(k) or 0)
+
+        if not truncated:
+            return acc, last_completion, rounds, None
+        max_rounds = agentic_search._env_int("SHERPA_CODEX_AUTO_CONTINUE", 3, 0, 5)
+        while truncated and rounds < max_rounds:
+            if ctx.stop_event is not None and ctx.stop_event.is_set():
+                break
+            rounds += 1
+            prompt = _continuation_prompt(orig_message, lens, env, acc[-1200:])
+            completion = _CompletionState(self._natural_completion_reasons)
+            self._last_usage = None   # この回のトークンだけを拾う（前回分を持ち越さない）
+            piece = ""
+            try:
+                for chunk in self._stream(prompt, completion=completion):
+                    if chunk:
+                        piece += chunk
+                        yield {"type": "answer_delta", "text": chunk}
+                    if ctx.stop_event is not None and ctx.stop_event.is_set():
+                        break
+            except Exception:
+                # 継続呼び出し1回分の技術的失敗＝fail-open（それまでの本文はそのまま採用してループを終える）。
+                # C25 是正: 例外発生前に配信済みの chunk（`piece`・利用者には既に answer_delta で
+                # 見えている）は `acc` へ合流させてから打ち切る——ここで捨てると、配信済みの本文と
+                # 最終保存された headline がずれる（利用者が見た文が消える）。
+                _log.warning("清書本文の追記継続に失敗しました（それまでの本文を採用します）", exc_info=True)
+                if piece:
+                    acc += piece
+                _merge_round_usage()   # 例外前に usage フレームまで届いていれば計上する
+                break
+            _merge_round_usage()
+            if not piece:
+                # 空応答＝これ以上続けても増えない。C24 是正: この回の `completion`（finish_reason が
+                # 自然完了 allowlist 内＝`truncated=False` に見えることがある）を `last_completion` へ
+                # 昇格させない——本文は1文字も増えていない以上、直前（無ければ未着手＝None）の未完了
+                # 状態のまま返す。ここで昇格させると、呼び出し元（:2760/:2897 付近）が「継続が自然完了
+                # した」と誤って再分類し、実際には打ち切られたままの本文を完成扱いで保存してしまう。
+                break
+            last_completion = completion
+            acc += piece
+            # `completion.truncated`（自然完了ではない全般）ではなく、方言別の "length" 系だけを
+            # 継続条件にする（content_filtered・未知の理由での際限ない再試行を避ける）。
+            truncated = _is_length_truncated(self.provider_id, completion)
+        usage_delta = ({**usage_meta_base, **usage_totals} if usage_seen else None)
+        return acc, last_completion, rounds, usage_delta
+
     def _sufficiency_verdict(self, orig_message: str, lens: str, digest: str, world: str,
                              scope_paths=None, layer=None,
                              stop_event=None, state=None,
-                             review_structural_meta: list | None = None) -> tuple[dict | None, list, dict | None]:
+                             review_structural_meta: list | None = None,
+                             round_no: int = 0,
+                             total_rounds: int = 1,
+                             role_all_orchestrator: bool = False) -> tuple[dict | None, list, dict | None]:
         """EXT-2b/EXT-2c（評価フェーズ再起・メイン査読＋限定ツール精読）: 清書前にメイン LLM が
         根拠の十分性を判定する。判定前に、引用箇所（doc_id・行）の前後原文を自分で確かめたければ
         `read_around`／文書一覧を確かめたければ `list_docs`（どちらも `agentic_search.run_tool` を
@@ -1152,8 +1583,11 @@ class _GenProvider(Provider):
         "read_around"/"list_docs", ...}` で読む、または `{"sufficient":…,"missing":…}` で確定する。
 
         戻り値は3-tuple `(verdict, nodes, usage)`。
-        - `verdict`: `{"sufficient": bool, "missing": str}` か `None`（判定不能＝fail-open で
-          清書へ進む）。
+        - `verdict`: `{"verdict": "sufficient"|"insufficient"|"undecidable", "sufficient": bool,
+          "missing": str, "findings": list}` か `None`（査読自体が成立しなかった＝fail-open で
+          清書へ進む）。`"undecidable"` は evaluator 自身が「判断できない」と返した場合で、
+          `None`（呼び出しの失敗）とは区別する——不足にも十分にも丸めない（§2.4）。
+          `"sufficient"` は後方互換のための bool 射影（`verdict == "sufficient"`）。
         - `nodes`: 実際に読んだ回だけ積む think ノード（`_node` 形）——本メソッドはジェネレータでは
           ないため、呼び出し元（`_agentic_run`）がまとめて `yield from` する。
         - `usage`: 本メソッド内の全 `_stream` 呼び出し分を `_fold_sub_usage` が合算できる形
@@ -1176,6 +1610,11 @@ class _GenProvider(Provider):
         ＝再調査依頼と一緒に次の下調べへ引き継がれる）。省略時（既存の直接呼び出しテスト等）は
         従来どおり状態を一切更新しない。
 
+        `role_all_orchestrator`（省略可・既定 False・§2.8）: 真のとき、判定確定の呼び出しも
+        `evaluator` ではなく `orchestrator` バケツへ積む——標準（巡ループを回さない・判定のみの
+        確認1回）では evaluator の巡という語彙自体が成立しないため、内訳を orchestrator に
+        集約する（正本の `chat-review` 合算は変わらない・表示用の役割別内訳だけの区別）。
+
         `review_structural_meta`（省略可・既定 None）: 非 None（呼び出し元が渡す
         可変リスト）のとき、`list_docs` で得た構造的根拠（呼び出し単位の集計・`state` へ渡すのと
         同じ形）を**追記**する（返り値の3-tuple 契約は変えない・既存の直接呼び出しテストは
@@ -1184,29 +1623,39 @@ class _GenProvider(Provider):
         由来の集計と重複排除する——`state.evidence` は文脈整理・査読入力専用の集約先で、Evidence
         Packet の正式な採番・ゲート判定には使わないため、こちらの別チャンネルで運ぶ。
         """
-        from .. import agentic_search
-        prompt = (
-            "あなたは調査結果の査読者です。以下の質問に対し、収集済みの根拠だけで"
-            "正確に回答できるかを判定してください。回答本文は書かないこと。\n"
-            f"【質問】\n{orig_message}\n\n【収集済みの根拠（digest）】\n{digest or '(なし)'}\n\n"
-            "引用箇所の前後の原文を自分で確かめたい場合は、次のどちらかの JSON を1個だけ"
-            "出力してください（他の文章を書かない）:\n"
-            '{"action": "read_around", "doc_id": "…", "line": 行番号}\n'
-            '{"action": "list_docs", "path_prefix": "…"}\n'
-            "判定を確定できるときは、次の JSON 1個だけを出力してください（他の文章を書かない）:\n"
-            '{"sufficient": true/false, "missing": "不足している観点を具体的に（十分なら空文字）"}')
+        from .. import agentic_search, investigation_state
+        # DEPTH-2 S4b/S5（§2.2/§2.4）: worker の一次判断（確定/推定/不明）と前巡までの未解決の
+        # 指摘を査読の入力に含める——頭脳はこれを鵜呑みにせず、read_around/list_docs
+        # （`_REVIEW_MAX_READS` 回まで＝orchestrator の確認枠）で必要な箇所だけ自分で確認してから
+        # evaluator として判定する。過去巡の全文は積まない（毎巡ここで組み直す）。
+        prompt = review_prompt(
+            orig_message, digest,
+            claims_text=(investigation_state.render_claims(state.claims)
+                         if state is not None and state.claims else ""),
+            findings_text=(investigation_state.render_findings(state.findings)
+                           if state is not None and state.findings else ""),
+            round_no=max(round_no, 1), total_rounds=max(total_rounds, 1))
         nodes: list = []
+        node_id = f"main-review-r{round_no}" if round_no else "main-review"
         reads_done = 0
         forced = False
         calls = 0
         tokens: dict | None = None
         unknown = False
+        # 役割別の内訳（§2.8）: 読み直しを指示した呼び出し＝orchestrator の確認、判定 JSON を
+        # 返した（または手順から外れて打ち切られた）呼び出し＝evaluator の判定。
+        orch_b, eval_b = _role_bucket(), _role_bucket()
+        _judge_b = orch_b if role_all_orchestrator else eval_b
+
+        def _folded():
+            return _review_usage_folded(calls, tokens, unknown,
+                                        _roles_out(("orchestrator", orch_b), ("evaluator", eval_b)))
         for _ in range(_REVIEW_MAX_READS + 2):
             # 単一 worker のため、停止済みターンの査読応答を待ち切ると他の利用者まで待たせる——
             # ループ先頭（次の _stream 発行前）と chunk 間の両方で停止要求を観測する
             # （既存の停止窓契約を維持）。
             if stop_event is not None and stop_event.is_set():
-                return None, nodes, _review_usage_folded(calls, tokens, unknown)
+                return None, nodes, _folded()
             self._last_usage = None   # このループ1回分の usage だけを拾う（前回分を持ち越さない）
             acc = ""
             # chat-sub（`openai_style` の usage_acc）と同じ「発行を試みた分は成否問わず計上する」
@@ -1217,14 +1666,14 @@ class _GenProvider(Provider):
                 for chunk in self._stream(prompt):
                     if stop_event is not None and stop_event.is_set():
                         unknown = True
-                        return None, nodes, _review_usage_folded(calls, tokens, unknown)
+                        return None, nodes, _folded()
                     if chunk:
                         acc += chunk
             except Exception:
                 _log.warning("メイン査読の呼び出しに失敗しました（査読を省略して清書へ進みます）",
                             exc_info=True)
                 unknown = True
-                return None, nodes, _review_usage_folded(calls, tokens, unknown)
+                return None, nodes, _folded()
             u = self._last_usage
             if u:
                 if tokens is None:
@@ -1243,16 +1692,21 @@ class _GenProvider(Provider):
                 except Exception:
                     v = None
             if v is None:
-                return None, nodes, _review_usage_folded(calls, tokens, unknown)   # パース不能→fail-open
-            if isinstance(v.get("sufficient"), bool):
-                return ({"sufficient": v["sufficient"], "missing": str(v.get("missing") or "")},
-                        nodes, _review_usage_folded(calls, tokens, unknown))
+                _role_add(_judge_b, u)
+                return None, nodes, _folded()   # パース不能→fail-open
+            _verdict = _normalized_verdict(v)
+            if _verdict is not None:
+                _role_add(_judge_b, u)
+                return _verdict, nodes, _folded()
             action = v.get("action")
             if action not in ("read_around", "list_docs"):
-                return None, nodes, _review_usage_folded(calls, tokens, unknown)   # 未知の形→fail-open
+                _role_add(_judge_b, u)
+                return None, nodes, _folded()   # 未知の形→fail-open
             if forced:
                 # 強制確定を指示してもなお読もうとした＝手順に従わない応答として fail-open。
-                return None, nodes, _review_usage_folded(calls, tokens, unknown)
+                _role_add(_judge_b, u)
+                return None, nodes, _folded()
+            _role_add(orch_b, u)   # 読み直しを指示した回＝orchestrator の確認
             if reads_done >= _REVIEW_MAX_READS:
                 forced = True
                 prompt += "\n\n【これ以上は読み取れません。ここまでの内容だけで判定を確定してください】"
@@ -1263,7 +1717,7 @@ class _GenProvider(Provider):
             except Exception:
                 _log.warning("メイン査読の精読ツール呼び出しに失敗しました（査読を省略して清書へ進みます）",
                             exc_info=True)
-                return None, nodes, _review_usage_folded(calls, tokens, unknown)
+                return None, nodes, _folded()
             reads_done += 1
             # 査読自身が読んだ結果も下調べ役と同じ調査状態へ足す（`read_around` は
             # `add_tool_result` が kind="read" Evidence として自動処理する・`list_docs` は
@@ -1289,7 +1743,7 @@ class _GenProvider(Provider):
                 # Evidence Packet の正式採番には使わない・呼び出し元 docstring 参照）。
                 review_structural_meta.extend(_review_structural)
             label = str(v.get("doc_id") or v.get("path_prefix") or "").strip() or "(全体)"
-            nodes.append(_node("main-review", "think", f"根拠を査読（{self.label}）",
+            nodes.append(_node(node_id, "think", _review_node_label(self.label, round_no),
                                f"原文を確かめています: {label}", "done"))
             try:
                 result_text = json.dumps(result, ensure_ascii=False)
@@ -1299,7 +1753,58 @@ class _GenProvider(Provider):
                 omitted_chars = len(result_text) - _REVIEW_READ_MAX_CHARS
                 result_text = result_text[:_REVIEW_READ_MAX_CHARS] + f"（以降 {omitted_chars} 字省略）"
             prompt += f"\n\n【ツール結果】\n{result_text}"
-        return None, nodes, _review_usage_folded(calls, tokens, unknown)   # 安全弁到達＝fail-open
+        return None, nodes, _folded()   # 安全弁到達＝fail-open
+
+    def _claims_synthesis(self, orig_message: str, digest: str,
+                          stop_event=None, existing_claims: list | None = None,
+                          findings_text: str = "") -> tuple[list | None, dict | None]:
+        """DEPTH-2 S1（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2/§2.5）: 再調査後も
+        なお不足と査読が判定したとき、全回答を固定文言に置き換える前に、確定/推定/不明で構造化した
+        主張配列を**1回の呼び出しで**生成する（`_sufficiency_verdict` と同じ4方言非依存の自前
+        JSON プロトコル・ツール呼び出しは行わない）。
+
+        戻り値は2-tuple `(claims, usage)`。
+        - `claims`: 生の `claims` 配列（`investigation_state.parse_claims` はまだ通していない——
+          検証・`Claim` への変換は呼び出し元（`InvestigationState.set_claims`）に委ねる）。呼び出し
+          自体の失敗・JSON 構文エラー・途中で切れた JSON は `None`（追記で継がない＝失敗として
+          扱う・§2.5）。
+        - `usage`: `_review_usage_folded` と同形（`{"calls","tokens"}`）——呼び出し元がメイン査読
+          （`_sufficiency_verdict`）と同じ `chat-review` 計測へ合算する（新しい usage 種別は作らない）。
+
+        `stop_event`（省略可・既定 None・RV C6）: `_sufficiency_verdict` と同じ停止窓契約——
+        発行前（次の `_stream` を呼ぶ前）と chunk 受信中の両方で観測する。停止済みなら `_stream`
+        を発行せず（または受信を打ち切り）`(None, None)` を返す（単一 worker のため、停止後も
+        クラウドへの呼び出しを完走させて他の利用者を待たせない）。
+
+        `existing_claims`（省略可・既定 None）: この時点の主張（`investigation_state.
+        claim_to_dict` の list）。id の再利用規約（同じ論点は既存 id・別論点は未使用 id）を
+        プロンプトへ渡す——渡さないと id が振り直され、未解決の反証の再適用（ID 基準）が
+        別論点を不明化し反証対象を再採用してしまう。
+        `findings_text`（省略可・既定空文字）: 未解決の指摘（`investigation_state.
+        render_findings`）——反証済みの論点を確定として書き直させない。
+        """
+        if stop_event is not None and stop_event.is_set():
+            return None, None
+        from .. import agentic_search as _as_mod
+        prompt = claims_prompt(
+            orig_message, digest,
+            _as_mod._render_existing_claims_for_prompt(
+                existing_claims, _as_mod._SYNTHESIS_MAX_BYTES // 4),
+            findings_text)
+        self._last_usage = None
+        acc = ""
+        try:
+            for chunk in self._stream(prompt):
+                if stop_event is not None and stop_event.is_set():
+                    return None, _review_usage_folded(1, None, True)
+                if chunk:
+                    acc += chunk
+        except Exception:
+            _log.warning("主張構造の生成に失敗しました（既存の根拠不足の扱いへ落とします）", exc_info=True)
+            return None, _review_usage_folded(1, None, True)
+        usage = _single_stream_usage(self._last_usage)
+        from .. import investigation_state
+        return investigation_state.extract_claims_json(acc), usage
 
     def _messages(self, prompt: str) -> list:
         """system プロンプト（あれば）＋ 直前ターンの履歴（あれば）＋ user の messages を組む（#2）。
@@ -1323,7 +1828,8 @@ class _GenProvider(Provider):
 
     def _sub_loop(self, ctx: Ctx, sub: dict, usage_acc: dict, max_turns_override: int | None = None,
                   shared_budget: dict | None = None,
-                  call_budget=None):   # agentic_search._CallBudget | None（同モジュール未 import のため型注釈は付けない）
+                  call_budget=None,   # agentic_search._CallBudget | None（同モジュール未 import のため型注釈は付けない）
+                  request_claims: bool = True, existing_claims: list | None = None):
         """複数プロファイル並用（§6・2026-07-15-LLMオーケストレーション実装計画.md）における `_sub_agentic_loop`
         から一般化した本体。`self._sub` を直接参照せず、解決済みプロファイル辞書は引数 `sub` から、
         chat-sub 計測アキュムレータは引数 `usage_acc` から受け取る（呼び出し元が用意する）。
@@ -1357,11 +1863,10 @@ class _GenProvider(Provider):
         （管理者が反復基準値を下げても検索アシスタント有効時だけ外れる、ということがないように、
         通常の `_agentic_loop` と同じ「system_settings→guard/env 既定」の優先順にする）。非 None
         のとき（`_run_sub_plan` が横断予算の残量へ min クリップして渡す値）はそちらを優先し
-        system_settings は見ない。調べる深さ（`ctx.scope_meta["depth_profile"]`・§3.2）は、
-        この解決後の `max_turns`（override か基準値解決後の値か問わず）へさらに倍率をかける——
-        standard は倍率×1 のため無変化。`max_hits`/`window_cap` も同じ実効基準値で計算し
-        `openai_style` へ渡す（`_sub` 用の既存 guard には無い概念のため、通常の `_agentic_loop`
-        と同じ env/system_settings 既定値を使う）。
+        system_settings は見ない。この解決後の `max_turns`（override か基準値解決後の値か問わず）
+        は調べる深さに依らず一定（DEPTH-2 S7 以降、倍率は撤去済み）。`max_hits`/`window_cap` も
+        同じ実効基準値で計算し `openai_style` へ渡す（`_sub` 用の既存 guard には無い概念のため、
+        通常の `_agentic_loop` と同じ env/system_settings 既定値を使う）。
 
         `shared_budget`（§6.2 項1・複数プロファイル横断予算）: 非 None のとき `agentic_search.
         openai_style` の同名引数へそのまま転送する（`{"tool_bytes_used","tool_bytes_max"}`）。省略（None）
@@ -1381,16 +1886,25 @@ class _GenProvider(Provider):
         "final" イベントでしか埋まらない `agentic_usage` に依存し、途中失敗・ask_user 早期 return では
         calls>0 でも記録が漏れてしまう）。
 
-        `can_ask` は常に False へ構造的に強制する（belt-and-suspenders）。`sub["tools"]` に
-        `ask_user` が含まれていても（`sherpa/search_helper.py::TOOLS` は含めないが、`sub` は本メソッド
-        にとって任意の呼び出し元が渡す汎用の辞書のため、将来 ask_user を含む値が渡る可能性を構造的に
-        塞ぐ）、サブ経路（索引なし・ローカル LLM を含みうる・`agentic_search._question_from_args` が
-        組み立てる prompt/options がそのまま公式の確認カードとして表示・DB 永続化される）では
-        モデル生成の質問を信頼できるユーザー向け UI として絶対に出さない。ask_user はツール定義配列
-        （`all_tools`）に載らなくなり、モデルが幻覚呼び出しすれば `allowed_tools` の (b) 拒否で固定
-        文言のツール結果としてループ継続する（既存の許可外ツール拒否経路と同じ）。ask_user 自体が
-        使えないため、`_can_ask(ctx.message)`（確認ID 付き再送の判定）はサブ経路では意味を持たない
-        ＝呼ばない。
+        `can_ask` は worker が**頭脳自身**（`search_helper.SELF_PROFILE_ID`）のときだけ
+        `_can_ask(ctx.message)`（確認ID 付き再送では False）で、それ以外の worker は常に False へ
+        構造的に強制する（belt-and-suspenders）。別モデルの worker（安いモデル・ローカル LLM を
+        含みうる）では `agentic_search._question_from_args` が組み立てる prompt/options がそのまま
+        公式の確認カードとして表示・DB 永続化されるため、その生成文を信頼できるユーザー向け UI
+        として出さない——この理由は「通常経路と同じ AI が質問する」頭脳自身の worker には当たらず、
+        ここで False に固定すると確認カードの終端（`TERMINALS` の "question"）が API/Ollama で
+        到達不能になる。False のときの ask_user はツール定義配列（`all_tools`）に載らず、モデルが
+        幻覚呼び出しすれば `allowed_tools` の (b) 拒否で固定文言のツール結果としてループ継続する
+        （既存の許可外ツール拒否経路と同じ）。
+
+        `request_claims`（省略可・既定 `True`）: `agentic_search.openai_style` の同名引数へ
+        そのまま転送する——呼び出し元がこのターンで査読（orchestrator の確認）を発動しないと
+        分かっている場合に `False` を渡し、worker の一次判断要求（主張 JSON の追加呼び出し）
+        自体を発行させない。
+
+        `existing_claims`（省略可・既定 `None`）: `agentic_search.openai_style` の同名引数へ
+        そのまま転送する——再調査（このターンで既に確定している worker 由来の主張がある場合）
+        で呼び出し元が渡す。
         """
         from .. import agentic_search, llm
         from .. import depth_profile as depth_profile_mod
@@ -1401,9 +1915,10 @@ class _GenProvider(Provider):
         _eff_tools = agentic_search.effective_tools_pref(_tools_pref, ctx.tools_availability)
         sys = (self.system_prompt + "\n\n" if self.system_prompt else "") + \
             agentic_search.system_prompt(_eff_tools)
-        # MED-2 是正: サブ経路は ask_user を構造的に無効化する（プロファイルの許可有無・確認ID 付き
-        # 再送かどうかに関わらず常に False）。
-        can_ask = False
+        # 別モデルの worker は ask_user を構造的に無効化する（プロファイルの許可有無・確認ID 付き
+        # 再送かどうかに関わらず常に False）。頭脳自身が worker のときだけ通常経路と同じ判定にする。
+        can_ask = (_can_ask(ctx.message) if sub.get("profile_id") == _sh_mod.SELF_PROFILE_ID
+                   else False)
         # SC-6e: 検索経路トグル（会話の `ctx.scope_meta["tools"]`）を可用性ゲートへ AND で重ねる
         # （通常の `_agentic_loop` と同じ判定・§3.6）。可用性は `ctx.tools_availability`（ターン
         # 先頭の snapshot・SC-6e）を優先し、省略時のみ `tool_availability()` を都度呼ぶ。
@@ -1436,11 +1951,10 @@ class _GenProvider(Provider):
         max_turns = max_turns_override if max_turns_override is not None else \
             depth_profile_mod.effective_base(self._system_settings, "max_turns", sub["guard"]["max_turns"])
         # 調べる深さ（調べ方ブロック §3.2・SC-6c）: 検索アシスタント（_sub）有効時は通常の
-        # _agentic_loop を経由しないため、ここで倍率を適用しないと deep/max を選んでも探索部分が
-        # standard のまま欠落する。standard は倍率×1＝上の max_turns（基準値解決後の値または
-        # max_turns_override）を変えない。hits/window は _sub 用の既存 guard 概念が無いため、
-        # OpenAIProvider/OllamaProvider._agentic_loop と同じ実効基準値（system_settings→env→
-        # コード既定）を使う。
+        # _agentic_loop を経由しないため、`scaled_turns`/`scaled_ratio` を通す（DEPTH-2 S7 以降は
+        # 倍率無しの恒等関数・abs_max のクランプだけが効く）。hits/window は _sub 用の既存 guard
+        # 概念が無いため、OpenAIProvider/OllamaProvider._agentic_loop と同じ実効基準値
+        # （system_settings→env→コード既定）を使う。
         profile = (ctx.scope_meta or {}).get("depth_profile")
         max_turns = depth_profile_mod.scaled_turns(max_turns, profile)
         # STAT-3 S1: この呼び出しが実際にツールループへ渡す実効上限を、呼び出し元（`_agentic_run`/
@@ -1466,21 +1980,29 @@ class _GenProvider(Provider):
             # 発行しない（1回分の呼び出しが丸ごと無駄になるため）。
             final_synthesis=False, layer=(ctx.scope_meta or {}).get("layer"),
             system_settings=self._system_settings,
-            max_hits=max_hits, window_cap=window_cap), usage_acc)
+            max_hits=max_hits, window_cap=window_cap, request_claims=request_claims,
+            existing_claims=existing_claims), usage_acc)
 
-    def _sub_agentic_loop(self, ctx: Ctx):
+    def _sub_agentic_loop(self, ctx: Ctx, request_claims: bool = True, existing_claims: list | None = None):
         """プロファイル型サブエージェント（§5.0）: 解決済み `self._sub` でのツールループ。
 
         本体を `_sub_loop(ctx, sub, usage_acc, ...)`（§6）へ一般化した後の**薄い
         ラッパ**として温存する（既存経路の意味論は1ビットも変えない）。`self._sub_usage_acc` の初期化は
         従来どおり本メソッドの**最初**（例外が起きうる SSRF チョークポイントより前）で行う＝
         `_agentic_run` の `finally` が参照する辞書は必ず存在する。
+
+        `request_claims`（省略可・既定 `True`）: `_sub_loop`/`agentic_search.openai_style` の
+        同名引数へそのまま転送する。
+
+        `existing_claims`（省略可・既定 `None`）: `_sub_loop`/`agentic_search.openai_style` の
+        同名引数へそのまま転送する。
         """
         # 例外（SSRF ブロック等）より前に初期化する＝どのみち calls=0 のまま残るので「未実行」を
         # 正しく表す（`_agentic_run` の finally 側は None ではなく必ずこの辞書を参照できる）。
         usage_acc = {"calls": 0, "tokens": None}
         self._sub_usage_acc = usage_acc
-        return self._sub_loop(ctx, self._sub, usage_acc)
+        return self._sub_loop(ctx, self._sub, usage_acc, request_claims=request_claims,
+                              existing_claims=existing_claims)
 
     def _run_sub_plan(self, ctx: Ctx, subs: list):
         """複数プロファイル並用＋自動選択（§6・docs/archive/2026-07-15-LLMオーケストレーション実装計画.md）:
@@ -1917,6 +2439,20 @@ class _GenProvider(Provider):
                 return   # 停止済み＝node/_result を出さず静かに終了（S3 と同じ）
             raise RuntimeError("plan synthesis produced no answer") from _stream_exc   # デルタ0個＝二重出力の心配なし
         # デルタを1個以上 yield した後は絶対に再 raise しない（S3 と同じ規律）。
+        # DEPTH-2 S2（§2.7）: `length`（出力上限）で切れた清書本文の続きを追記する（重複させない・
+        # claims JSON はこの継続の対象外）。停止／例外時は継続を試みない（`_continue_truncated_headline`
+        # 自身も `truncated=False` で早期 return するが、ここでも明示しておく）。
+        _main_usage = self._last_usage   # C27/#34: 本体清書分を継続の上書きから退避
+        if not stopped and not failed:
+            acc, _cont_completion, _cont_rounds, _cont_usage = yield from self._continue_truncated_headline(
+                ctx, orig_message, lens, env, acc, _is_length_truncated(self.provider_id, completion))
+            if _cont_completion is not None:
+                completion = _cont_completion   # 最終ラウンドの完了状態で以降の再分類・帰属可否を判定する
+            self._last_usage = _merge_usage_meta(_main_usage, _cont_usage)
+            if _cont_rounds:
+                # #36: Codex 経路（`providers/codex/provider.py`）の同名キーと同じ意味
+                # （利用統計「打ち切りの内訳」・自動継続の実行回数）。
+                env["limits"] = {**env.get("limits", {}), "auto_continues": _cont_rounds}
         env["headline"] = acc
         # 通常ハイブリッド（:_agentic_run の合成ブロック）と同じ再分類をプラン清書にも適用する——
         # サブループ（各ステップ）が確定した stop_reason は、実際に画面へ表示する本文を生成した
@@ -1957,6 +2493,12 @@ class _GenProvider(Provider):
             attribution_text = agentic_search._redact(acc)
             attributed_ev_ids = self._attribute_safe(attribution_text, digest, ev_map, call_budget)
             used_doc_ids = agentic_search.resolve_attributed_doc_ids(attributed_ev_ids, ev_map)
+        # C41（DEPTH-2 S2 是正）: オフロードは帰属（`acc` の全文を読む）より**後**に行う——帰属より
+        # 前に `env["headline"]`/`acc` を抜粋へ差し替えると、帰属呼び出しが全文でなく先頭2000字しか
+        # 見られず根拠の見落としが増える。計画経路（`_agentic_run_plan`）は下調べ役ありの
+        # ハイブリッド（`_agentic_run` 側）と同じくここで初めて `write_output_file` と同じ台帳・
+        # カードへ接続する（従来は非ハイブリッドにしか無かった）。
+        self._offload_long_answer_into_env(ctx, env, acc)
         committed_docs = _committed_evidence_doc_ids(evidence_meta, structural_evidence_meta,
                                                       verified, used_doc_ids)
         env["sources_verified"] = sorted(committed_docs & set(verified_source_ids))
@@ -1987,10 +2529,16 @@ class _GenProvider(Provider):
         失敗（未応答/例外）は呼出側が従来の単発 grep にフォールバック。
         HIGH-1 fix: personal_facts がある場合は初回ユーザーメッセージに注入してから LLM に渡す。
 
-        S3（プロファイル型サブエージェント・§5.0）: `self._sub is not None` のときはハイブリッド
-        （サブがツールループを回し、集めた根拠でクラウド頭脳が最終回答を1回だけ合成する）。
-        ローカルの生散文（`answer`）は絶対にユーザーへ出さない＝合成成功時に `env["headline"]` を
-        必ず上書きしてから yield する（失敗時は `_result` 自体を yield しない）。
+        経路は2つ。`self._sub is not None`＝ハイブリッド（worker がツールループを回し、
+        orchestrator が確認し、evaluator が巡を回し、最後に清書を1回だけ行う）。openai/ollama
+        頭脳には `get_provider` が必ず worker を付ける（`search_helper` が空なら頭脳自身が
+        worker・提案書 §2.1）ため、**API/Ollama は常にこちらを通る**。worker の生散文
+        （`answer`）は絶対にユーザーへ出さない＝清書成功時に `env["headline"]` を必ず上書き
+        してから yield する（失敗時は `_result` 自体を yield しない）。
+
+        `self._sub is None` の分岐が残るのは §2.1 の対象外の頭脳（Gemini/Bedrock）のため——
+        これらには worker を付けない契約なので、単独のツールループ＋その最終合成をそのまま
+        回答にする（巡・主張構造・orchestrator の確認は通らない）。
         """
         from .. import agentic_search, investigation_state
         from .. import depth_profile as depth_profile_mod
@@ -2056,6 +2604,11 @@ class _GenProvider(Provider):
                 yield from self._agentic_run_plan(ctx, decision, orig_message, chosen_subs)
                 return
         answer, docs, searched, cites, cards = "", set(), False, [], []
+        _created_files_ev: list = []   # DEPTH-2 S2（§2.7）: "final" が来なければ空のまま（作成物なし）
+        # C26 是正: 非ハイブリッドの追記継続プロンプトが初回生成と同じ根拠（精読本文・調査の限界）を
+        # 見られるようにする控え——ハイブリッドは `state`（InvestigationState）に既にあるため未使用。
+        _final_read_evidence: list = []
+        _final_gaps: list = []
         verified: set = set()      # EXT-2/EV-0: read_around/read_doc で実際に精読した doc_id（"final" 到達時のみ）
         used_evidence_docs: set = set()   # EV-0: 最終合成が申告した使用 doc_id（"final" 到達時のみ）
         attributed_ev_ids: set = set()    # EV-0: 帰属呼び出しが申告した ev-N の生集合（同上）
@@ -2088,6 +2641,12 @@ class _GenProvider(Provider):
         # docstring 参照）。以降の env["scope"] 構築は元の `ctx`（このメソッド冒頭で受け取ったもの）を
         # 使い続けるので、要求された layer 値自体は失わない。
         search_ctx = _ctx_with_effective_layer(ctx, lens)
+        # 深さ＝evaluator（査読）の巡数（§2.3・標準 0＝evaluator の巡は回さない／深く 2／最大＝
+        # 管理画面の `max_review_rounds`）。worker の一次判断要求（`request_claims`）は深さに
+        # 依らず常に発行する——標準でも orchestrator の確認 1 回（下の確認分岐）を通す。
+        from .. import depth_profile as _depth_mod
+        _review_rounds = _depth_mod.review_rounds_for(
+            (ctx.scope_meta or {}).get("depth_profile"), self._system_settings)
         # EXT-2b: メイン査読の再調査で `_sub_agentic_loop` が複数回走るため、実行ごとの
         # `self._sub_usage_acc`（呼ぶたびに新品へ置換される）をここへ合算して finally で1回記録する。
         _sub_acc_total = {"calls": 0, "tokens": None, "unknown": False}
@@ -2103,16 +2662,165 @@ class _GenProvider(Provider):
         # C3（調査結果集約と並列実行の改善方針・§「メインへの入力を最新の調査状態から作る」）:
         # ハイブリッドの1質問1調査状態。下調べ役の各実行（初回＋再調査）が確定した結果・査読自身の
         # 精読結果をここへ集約し、査読の入力（`state.render`）・清書の精読引き継ぎ（後述の
-        # `read_evidence`）を同じ状態から組む。非ハイブリッド（`self._sub is None`）は査読・清書の
-        # どちらもこの状態を使わないため作らない（既存の通常経路は無改修のまま）。
+        # `read_evidence`）を同じ状態から組む。openai/ollama 頭脳には必ず worker が付く（§2.1）
+        # ため、状態を持たないのは §2.1 の対象外の頭脳（Gemini/Bedrock＝`self._sub is None`）だけ。
         state = (investigation_state.InvestigationState(question=orig_message, scope={"world": ctx.world})
                 if self._sub is not None else None)
         # 失敗経路（run() の except が組む honest failure の env）へも当たった制限を渡すための控え
         # （同じ dict への参照＝以降の加算が自動で見える）。
         self._last_run_limits = state.limits if state is not None else None
+        # DEPTH-2 S5（§2.7 高-4）: 個人由来／書込の有無は**全巡で累積**して全終端（通常・確認
+        # カード・停止・失敗）へ渡す——最終巡だけから算出すると、前巡で個人 workspace へ書いた
+        # 事実が共有で落ちる。API/Ollama の出力ファイルツール（S2）の `created_files` も
+        # `_merge_personal_inputs` でここへ足す（累積と全終端への伝搬の規約は変えず入力だけ増える）。
+        _personal_acc = _personal_inputs_accumulator(ctx)
+        # 失敗終端（`run()` の except が組む honest failure の env）からも同じ累積を読めるように
+        # 同一 dict への参照を残す（以降の累積が自動的に見える・`_last_run_limits` と同じ流儀）。
+        self._last_personal_acc = _personal_acc
+        # 「この時点の `state.claims`（worker の一次判断）が実際に査読の判定（verdict）を通ったか」。
+        # 査読を呼んだだけでは真にしない（通信失敗・JSON 不能・指摘を読めなかった回は偽のまま）。
+        # 未査読の主張は停止終端・清書・公開 envelope のいずれへも渡さない（§2.2: 鵜呑みにしない）。
+        _review_ran = False
+        # 失敗終端（`run()` の except が組む honest failure の env）が未完了回答を組むための控え
+        # （下で定義する closure を代入する）。
+        self._last_incomplete_body = None
+        # 巡ごとの計測（`chat-round`）の基準点。巡1の worker＝この直後の初回下調べ。
+        _round_no = 1
+        # 巡ループを抜けた理由（巡別記録・未完了回答が使う）。ループへ入る前・入れなかった場合は
+        # 失敗終端の既定文言（`_ROUND_STOP_LABELS` に無い値＝「処理を続けられなかったため」）。
+        _round_stop = "failed"
+        _round_t0 = time.monotonic()
+        _round_limits_before = dict(state.limits) if state is not None else {}
+        _round_cites_before = 0
+
+        def _round_usage_meta(review_usage: dict | None) -> tuple[dict | None, dict]:
+            """この巡のトークン合計（正本ではなく表示用）と役割別の内訳。"""
+            roles = dict((review_usage or {}).get("roles") or {})
+            worker = self._sub_usage_acc if self._sub is not None else None
+            if worker and worker.get("calls"):
+                roles["worker"] = {"calls": worker["calls"], "tokens": worker.get("tokens")}
+            total = _fold_sub_usage({"calls": 0, "tokens": None, "unknown": False},
+                                    {"calls": (review_usage or {}).get("calls") or 0,
+                                     "tokens": (review_usage or {}).get("tokens")})
+            total = _fold_sub_usage(total, {"calls": (worker or {}).get("calls") or 0,
+                                            "tokens": (worker or {}).get("tokens")}
+                                    if worker and worker.get("calls") else None)
+            return (total["tokens"] if total["calls"] else None), roles
+
+        def _record_round(round_no: int, verdict_name, missing: str, stop: str,
+                          review_usage: dict | None = None,
+                          missing_codes: list | None = None) -> None:
+            """巡1件を `chat-round` として記録する（失敗巡も記録・§2.8）。
+
+            正本（清書＝`answer.usage`／worker＝`chat-sub`／evaluator・orchestrator＝
+            `chat-review`）とは別イベントで、二重に足さない（`store/usage.py` が除外する）。
+            `limits` は巡内の**増分**だけを書く（累積スナップショットを足さない）。
+            `missing_codes`（省略可）: 不足軸の閉じた分類（`_MISSING_CODES`）——集計用の件数分類
+            として載せる。`missing`（自由文）は思考ノードの表示だけに使い、meta には載せない
+            （資料名や本文相当の語が台帳に残らないようにする）。
+            """
+            tokens, roles = _round_usage_meta(review_usage)
+            from .. import metering
+            metering.record(
+                "chat-round", self.provider_id, self.model, tokens,
+                user_id=ctx.uid, world=ctx.world, calls=1,
+                elapsed_ms=round((time.monotonic() - _round_t0) * 1000),
+                conversation_id=ctx.conversation_id,
+                meta={"round": round_no, "verdict": verdict_name,
+                      "missing_codes": list(missing_codes or []),
+                      "stop": stop, "lens": lens,
+                      "citations_delta": len(cites) - _round_cites_before,
+                      "limits": _limits_delta(_round_limits_before,
+                                              state.limits if state is not None else {}),
+                      "claims": _claims_breakdown(state.claims if state is not None else []),
+                      "roles": roles})
+
+        def _reviewed_claims() -> list:
+            """未完了回答（停止・失敗）へ渡してよい主張＝査読の判定を実際に通した回の
+            `state.claims` だけ。未査読（`_review_ran` 偽）のときは空——worker が返した一次判断や、
+            再調査で同じ ID を確定として返し直した主張を、確認を経ないまま確定として公開しない。
+            反証済みの主張は `adoptable_claims` が区分（unknown）で落とす。"""
+            return list(state.claims) if (state is not None and _review_ran) else []
+
+        def _stopped_result(round_no: int, reason: str, *, usage: dict | None = None,
+                            limits_extra: dict | None = None) -> dict:
+            """停止・打ち切りの終端（`TERMINALS` の "stopped"）: 追加の LLM 呼び出しをせず、
+            採用可の主張だけからコードで組んだ未完了回答を `_result` として返す。
+
+            worker の散文（`_sub_agentic_loop` の生成文）は据えない——公開するのは
+            orchestrator の確認を通した主張だけ（§2.2）。
+            """
+            _env = {"lens": lens,
+                    "headline": _incomplete_headline(_reviewed_claims(), round_no, reason),
+                    "summary": {"total": 0},
+                    "data": {},
+                    "sources": [],
+                    "_terminal": "stopped", "stopped_by_user": reason == "user_stop",
+                    "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens=lens),
+                    "route": {"lens": lens, "reason": "巡の途中で停止", "input": ctx.message}}
+            if state is not None and any(state.limits.values()):
+                _env["limits"] = dict(state.limits)
+            if limits_extra:
+                # 清書の追記継続の途中で停止したとき、既に発行した継続回数を落とさない。
+                _env["limits"] = {**_env.get("limits", {}), **limits_extra}
+            if usage:
+                # 停止までに取得済みの usage（清書＋継続の合算）は本回答の正本として残す。
+                _env["usage"] = usage
+            _attach_created_files(_env)
+            _apply_personal_flag(_env, _personal_acc)
+            return {"type": "_result", "env": _env,
+                    "decision": {"lens": lens, "input": ctx.message, "reason": "巡の途中で停止"}}
+
+        def _incomplete_terminal_body() -> str:
+            """失敗・時間切れの終端（`TERMINALS` の "failed"）の未完了回答本文。停止終端と同じく
+            **追加の LLM 呼び出しをせず**、調査状態（採用可の主張・巡番号・抜けた理由）だけから
+            組む。採用可の主張が無ければ空文字＝呼び出し元は従来の固定文言だけを使う。
+
+            根拠ゲート（通常終端の `evidence_meets_gate` と同じ規律）も適用する——この調査で
+            根拠を1件も確定していなければ、主張の見かけに関わらず空文字を返す。
+
+            標準（`_review_rounds == 0`）は巡ループを回さないため「N巡目で打ち切り」という
+            見出しの語彙自体が成立しない——orchestrator の確認1回が通っていても空文字を返し、
+            呼び出し元の固定文言に委ねる（巡ループ経由の失敗終端だけがこの本文を使う）。"""
+            if _review_rounds == 0:
+                return ""
+            if state is None or not state.evidence:
+                return ""
+            if not investigation_state.adoptable_claims(_reviewed_claims()):
+                return ""
+            return _incomplete_headline(_reviewed_claims(), _round_no, _round_stop)
+
+        self._last_incomplete_body = _incomplete_terminal_body
+
+        # DEPTH-2 S2 是正（C21）: `write_output_file` が台帳登録に成功した時点（"final" を待たず）
+        # でターンに記録する——このあと同じループ内で例外が起きて `run()` の honest failure
+        # フォールバックへ落ちても、既に個人 workspace に実在するファイルを非個人由来のまま
+        # 保存してしまわないため（下の for ループ内 `elif "created_files" in ev:` 参照）。
+        self._last_created_files: list = []
+
+        def _note_created_files(files) -> list:
+            """台帳登録に成功した成果物をターンの控えと個人由来の累積へ同時に足す。
+            書込の事実は全終端（通常・確認カード・停止・失敗）が同じ累積から読む（§2.7）。"""
+            files = list(files or [])
+            if files:
+                self._last_created_files = files
+                _merge_personal_inputs(_personal_acc, created_files=files)
+            return files
+
+        def _attach_created_files(target: dict) -> None:
+            """台帳登録した成果物のダウンロード導線（`created_files`）と書込の事実
+            （`wrote_files`・Codex の `codex_wrote_files` と同じ意味）を終端の envelope へ載せる。
+            全終端（通常・確認カード・停止・失敗）が同じ控えから読む（§2.7）。"""
+            files = [f for f in self._last_created_files if f.get("rel_path")]
+            if not files:
+                return
+            target["created_files"] = [{"name": f["rel_path"], "download_url": f.get("download_url")}
+                                       for f in files]
+            target["wrote_files"] = [f["rel_path"] for f in files]
+
         try:
-            for ev in (self._sub_agentic_loop(search_ctx) if self._sub is not None
-                      else self._agentic_loop(search_ctx)):
+            for ev in (self._sub_agentic_loop(search_ctx)
+                      if self._sub is not None else self._agentic_loop(search_ctx)):
                 if "node" in ev:
                     node = ev["node"]
                     if hybrid_agent_run_id is not None:
@@ -2121,11 +2829,28 @@ class _GenProvider(Provider):
                         node["metrics"] = {**(node.get("metrics") or {}), **hybrid_metrics}
                     yield node
                 elif "question" in ev:
-                    yield ev["question"]
+                    # 確認カード（`TERMINALS` の "question"）——巡ループへ入る前でも同じ契約。
+                    # C21/#33: 書込成功が既にあれば question イベントにも運ばれてくる
+                    # （`agentic_search.openai_style` の ask_user 分岐参照）——控えと個人由来の
+                    # 累積を更新してから yield する（`_save_clarify_message` が両方を見る）。
+                    _note_created_files(ev.get("created_files"))
+                    _q = dict(ev["question"])
+                    if self._last_created_files:
+                        _q["created_files"] = list(self._last_created_files)
+                    _apply_personal_flag(_q, _personal_acc)
+                    yield _q
                     return
+                elif "final" not in ev and "created_files" in ev:
+                    # C21: 書込成功時点（"final" を待たず）の控え更新——このあと例外が起きても
+                    # `run()` の honest failure フォールバックが個人由来を見失わないようにする。
+                    # "final" イベント自体も `created_files` キーを同梱する（`_build_final_payload`
+                    # 参照）ため、ここは "final" を持たない単独のサイドカーだけに絞る——絞らないと
+                    # elif の排他性により "final" 分岐（searched/docs/citations 等の本体処理）へ
+                    # 一切到達しなくなる。
+                    _note_created_files(ev["created_files"])
                 elif "final" in ev:
                     # 下調べ役の調査が終わった瞬間を明示する
-                    # （self._sub is None＝下調べ役無しの通常ループには当てはまらない）。
+                    # （`self._sub is None`＝Gemini/Bedrock の単独ループには当てはまらない）。
                     if hybrid_agent_run_id is not None:
                         yield _sub_agent_completed_node(self._sub, hybrid_agent_run_id, self._system_settings)
                     answer, docs = ev["final"], ev["docs"]
@@ -2144,26 +2869,37 @@ class _GenProvider(Provider):
                     # ＝集約不要でそのまま使う。ハイブリッドは `_ingest_sub_final_into_state` が
                     # `state.limits` へ合流するのでここでは読み捨てる（`state.limits` を後で使う）。
                     _run_limits = ev.get("limits") or {}
+                    # DEPTH-2 S2（§2.7）: `write_output_file` が台帳登録に成功した成果物
+                    # （非ハイブリッドのこの1回の final にしか出ない——ハイブリッドの下調べ役
+                    # プロファイルにはこのツールを許可していないため常に空）。
+                    _created_files_ev = ev.get("created_files") or []
+                    _note_created_files(_created_files_ev)
+                    _final_read_evidence = ev.get("read_evidence") or []
+                    _final_gaps = ev.get("gaps") or []
                     _ingest_sub_final_into_state(state, ev)
                     if ev.get("evaluation_status") is not None:
                         evaluation = {"status": ev.get("evaluation_status"),
                                       "reason": ev.get("evaluation_reason"),
                                       "next_action": ev.get("evaluation_next_action")}
-            # ハイブリッドのみ、清書前にメインが根拠の
-            # 十分性を査読し、不足なら不足軸を指定して下調べを再実行する（なお不足なら honest
-            # failure）。発動は調べる深さに載せる（標準=0回＝従来どおり・深く=再調査1回・最大=2回。
-            # 標準への既定適用はキャリブレーション後）——再実行の各ループ自体は既存の反復上限・
-            # 倍率で縛られるため、ここで新しい予算語彙は作らない。この位置（metering の finally 内側）
-            # で再実行することで、再調査分のサブ消費も同じ finally が一括記録する。
-            from .. import depth_profile as _depth_mod
-            _reruns_allowed = {"standard": 0, "deep": 1, "max": 2}[
-                _depth_mod.normalize_depth_profile((ctx.scope_meta or {}).get("depth_profile"))]
+            # ハイブリッドのみ、清書前に巡ループ（§2.4 の形 B）を回す。1巡＝「worker が根拠と
+            # 一次判断を更新 → orchestrator が必要箇所を確認 → evaluator が判定（十分／不足／
+            # 判定不能）と主張 ID 単位の指摘を返す → 次巡の指示（解決済みの指摘は落とす）」で、
+            # 清書は最後に 1 回だけ。巡数は深さ（`_review_rounds`・標準 0／深く 2／最大＝設定）。
+            # 止める条件は6つ（巡数到達／十分／判定不能／予算到達／利用者の停止／確認カード）——
+            # ループはこのいずれかで必ず抜ける。この位置（metering の finally 内側）で回すことで、
+            # 各巡のサブ消費も同じ finally が一括記録する。
             _old_cites = None   # 直前 rerun 前の citation 件数（`_first_rerun_cite_start`／清書ビュー用）
-            if (self._sub is not None and _reruns_allowed > 0 and searched
+            # 標準（`_review_rounds == 0`）は巡ループへは入らず、代わりに下の `elif`（確認 1 回）
+            # で `_review_ran` を決める。再調査で worker の一次判断が更新されたら、次の査読が
+            # その更新分を実際に判定するまで偽へ戻す（下のループ内参照）。
+            if (state is not None and _review_rounds > 0 and searched
                     and not (ctx.stop_event is not None and ctx.stop_event.is_set())
                     and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
-                for _rerun_i in range(_reruns_allowed + 1):
+                for _rerun_i in range(_review_rounds):
+                    _round_no = _rerun_i + 1
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
+                        _record_round(_round_no, None, "", "user_stop")
+                        yield _stopped_result(_round_no, "user_stop")
                         return
                     # C3: 査読の入力は1質問1調査状態の要約（`state.render`）——`state` は下調べ役の
                     # 各実行（初回＋既に終えた再調査）の確定済み結果を ev_id 単位で蓄積済みなので、
@@ -2180,34 +2916,91 @@ class _GenProvider(Provider):
                         scope_paths=(search_ctx.scope_meta or {}).get("scope_paths"),
                         layer=(search_ctx.scope_meta or {}).get("layer"),
                         stop_event=ctx.stop_event, state=state,
-                        review_structural_meta=_review_structural_meta)
-                    yield from _review_nodes
+                        review_structural_meta=_review_structural_meta,
+                        round_no=_round_no, total_rounds=_review_rounds)
+                    if verdict is not None:
+                        # 指摘（主張 ID 単位）を取り込む——反証された主張はこの巡の中で採用不可
+                        # （不明・理由コード conflict）へ落ち、清書にも未完了回答にも出ない。
+                        # 指摘を1件でも読めなかった回は反証が丸ごと落ちるため「査読済み」にしない
+                        # （未査読扱い＝一次判断を公開へ渡さない）。本文は出さない。
+                        if state.apply_findings(verdict.get("findings"), _round_no,
+                                                verdict=verdict["verdict"]):
+                            _review_ran = True   # 判定と指摘の両方を得た回だけ「査読済み」とする
+                        else:
+                            _log.warning("査読の指摘を読み取れませんでした（%d巡目・未査読として扱います）",
+                                         _round_no)
                     if isinstance(_review_usage, dict) and _review_usage.get("calls"):
                         _review_usage["elapsed_ms"] = round((time.monotonic() - _review_t0) * 1000)
                     _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
+                    # 停止判定は読取ノードの配信より先に行う——consumer（`chat_service`）が停止後の
+                    # 最初のイベントで打ち切ると、後ろに続く停止終端が保存されないため。
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
+                        _record_round(_round_no, (verdict or {}).get("verdict"), "", "user_stop",
+                                      _review_usage)
+                        yield _stopped_result(_round_no, "user_stop")
                         return
-                    if verdict is None or verdict["sufficient"]:
+                    yield from _review_nodes
+                    if verdict is None or verdict["verdict"] != "insufficient":
+                        # 十分／判定不能／査読自体が成立しなかった（fail-open）——いずれもここで
+                        # 巡を終える（判定不能を不足に丸めない・§2.4）。清書は通常どおり 1 回行う。
+                        # 判定は得たが指摘の形が不正で採否に反映できなかった回（_review_ran 偽）も
+                        # 「査読不成立」として記録する（成功理由で残さない）。
+                        _round_stop = ("review_failed" if verdict is None or not _review_ran
+                                       else ("sufficient" if verdict["sufficient"] else "undecidable"))
                         if verdict is not None:
-                            yield _node("main-review", "think", f"根拠を査読（{self.label}）",
-                                        "集まった根拠で答えられると判断しました", "done")
+                            yield _node(f"main-review-r{_round_no}", "think",
+                                        _review_node_label(self.label, _round_no),
+                                        ("集まった根拠で答えられると判断しました"
+                                         if verdict["sufficient"]
+                                         else "十分とも不足とも判断できませんでした"), "done")
+                        _record_round(_round_no, (verdict or {}).get("verdict"), "", _round_stop,
+                                      _review_usage,
+                                      missing_codes=(verdict or {}).get("missing_codes"))
                         break
                     _missing_raw = verdict["missing"].strip()
                     missing = (_missing_raw if len(_missing_raw) <= _RERUN_MISSING_MAX_CHARS
                               else _missing_raw[:_RERUN_MISSING_MAX_CHARS] + "（以下省略）")
-                    if _rerun_i >= _reruns_allowed or not missing:
-                        # 再調査してもなお不足（または不足軸を特定できない）＝薄い根拠のまま自信ありげに
-                        # 清書しない。専用例外で run() の honest failure 文言を「設定障害」と区別する。
-                        yield _node("main-review", "think", f"根拠を査読（{self.label}）",
+                    if _rerun_i >= _review_rounds - 1 or not missing:
+                        # 再調査してもなお不足（または不足軸を特定できない）——DEPTH-2 S1（§2.5）:
+                        # 薄い根拠のまま自信ありげに清書しないのは従来どおりだが、全回答を固定文言に
+                        # 置き換える前に、確定/推定/不明で構造化した主張（1回の呼び出しで完結・
+                        # 途中で切れた JSON は失敗）を試み、得られれば裏付けのある部分を残したまま
+                        # 通常の清書（構造から書く）へ進む。主張が得られなければ従来どおり例外で
+                        # run() の honest failure 文言（「設定障害」と区別した専用文言）に落ちる。
+                        yield _node(f"main-review-r{_round_no}", "think",
+                                    _review_node_label(self.label, _round_no),
                                     "再調査でも根拠が不足しています", "done")
+                        _round_stop = "rounds_exhausted"
+                        _claims_digest = state.render(max_bytes=agentic_search._SYNTHESIS_MAX_BYTES // 2)
+                        _raw_claims, _claims_usage = self._claims_synthesis(
+                            orig_message, _claims_digest, stop_event=ctx.stop_event,
+                            existing_claims=[investigation_state.claim_to_dict(c)
+                                             for c in state.claims],
+                            findings_text=investigation_state.render_findings(state.findings))
+                        _review_usage_total = _fold_sub_usage(_review_usage_total, _claims_usage)
+                        _record_round(_round_no, verdict["verdict"], missing, _round_stop,
+                                      _review_usage, missing_codes=verdict.get("missing_codes"))
+                        if _raw_claims is not None and state.set_claims(_raw_claims):
+                            yield _node(f"main-review-r{_round_no}", "think",
+                                        f"部分回答を構成（{self.label}・{_round_no}巡目）",
+                                        "答えられる部分だけを構造化しました", "done")
+                            break
                         raise _MainReviewInsufficient("main review judged evidence insufficient")
-                    yield _node("main-review", "think", f"根拠を査読（{self.label}）",
+                    yield _node(f"main-review-r{_round_no}", "think",
+                                _review_node_label(self.label, _round_no),
                                 f"不足があるため調べ直します: {missing}", "done")
+                    _record_round(_round_no, verdict["verdict"], missing, "rerun", _review_usage,
+                                  missing_codes=verdict.get("missing_codes"))
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
+                        _round_stop = "user_stop"
+                        yield _stopped_result(_round_no, "user_stop")
                         return
                     from dataclasses import replace as _dc_replace
+                    # 次巡の指示は「不足の軸＋未解決の指摘」だけから組み直す（解決済み・撤回は
+                    # 落とす・過去巡の全文は積まない・§2.4）。
                     rerun_ctx = _dc_replace(search_ctx, message=(
-                        f"{search_ctx.message}\n\n【前回の調査で不足していた観点（重点的に調べ直す）】\n{missing}"))
+                        f"{search_ctx.message}\n\n"
+                        + rerun_instruction(missing, investigation_state.render_findings(state.findings))))
                     # `_sub_agentic_loop` は呼ぶたびに `self._sub_usage_acc` を新品へ置換する——
                     # ここまでの消費を先に合算へ退避しないと、下の finally が最後の実行分しか
                     # 記録せず初回下調べの chat-sub 消費が metering から消える。
@@ -2215,7 +3008,28 @@ class _GenProvider(Provider):
                     _old_cites = len(cites)
                     if _first_rerun_cite_start is None:
                         _first_rerun_cite_start = _old_cites
-                    for ev in self._sub_agentic_loop(rerun_ctx):
+                    # `request_claims` は既定 True のまま渡す——予算内で次の査読判定まで到達すれば
+                    # この再調査分の一次判断もそこで改めて判定される。ただしこの再調査自体が調査
+                    # 予算で打ち切られた場合（下の budget_exhausted 分岐）は査読ループへ戻らず
+                    # `_review_ran` は偽のまま残る（未査読のまま公開しない契約は下の state.claims
+                    # 消費箇所が守る）。
+                    # C18 是正: 再調査の worker が id を毎回 "c1" から採番し直すと、置換処理
+                    # （`_ingest_sub_final_into_state`）が別論点の既存主張まで消しうる——直前までに
+                    # 確定した worker 由来の主張（id・status・本文のみ）を渡し、同じ論点は既存 id を
+                    # 使い回す／別論点は未使用の id を付ける契約をプロンプト側に持たせる。
+                    _existing_worker_claims = [investigation_state.claim_to_dict(c)
+                                               for c in state.claims if c.origin == "worker"]
+                    # 次巡の計測基準点をここで取り直す（`limits`/citation は巡内の増分で記録する）。
+                    _round_no = _rerun_i + 2
+                    _round_t0 = time.monotonic()
+                    _round_limits_before = dict(state.limits)
+                    _round_cites_before = len(cites)
+                    # 巡ごとに `agent_run_id` を分ける——同じ id のままだと再読込後の思考ノードが
+                    # 上書きで1巡分に潰れ、どの巡の調査かが分からなくなる。
+                    if hybrid_agent_run_id is not None:
+                        hybrid_agent_run_id = f"sub:{self._sub['profile_id']}:{_round_no}"
+                    for ev in self._sub_agentic_loop(rerun_ctx,
+                                                     existing_claims=_existing_worker_claims):
                         if "node" in ev:
                             node = dict(ev["node"])
                             if hybrid_agent_run_id is not None:
@@ -2223,8 +3037,22 @@ class _GenProvider(Provider):
                                 node["metrics"] = {**(node.get("metrics") or {}), **hybrid_metrics}
                             yield node
                         elif "question" in ev:
-                            yield ev["question"]   # 再調査中の ask_user も初回と同じ契約（早期 return）
+                            # 確認カード（`ask_user`）はどの巡で出ても外側の巡ループごと終了し、
+                            # 確認を一度だけ保存する（§2.4・`TERMINALS` の "question"）。
+                            _round_stop = "ask_user"
+                            _record_round(_round_no, None, "", "ask_user")
+                            _note_created_files(_created_files_ev + list(ev.get("created_files") or []))
+                            _q = dict(ev["question"])
+                            if self._last_created_files:
+                                _q["created_files"] = list(self._last_created_files)
+                            _apply_personal_flag(_q, _personal_acc)
+                            yield _q
                             return
+                        elif "final" not in ev and "created_files" in ev:
+                            # 書込成功時点（"final" を待たず）の控え更新——初回ループと同じ契約。
+                            # イベントはこの巡の累計を運ぶため、過去巡の分（`_created_files_ev`）を
+                            # 前置して足す（巡ごとに調査状態が別なので巡を跨いだ累積はここで行う）。
+                            _note_created_files(_created_files_ev + list(ev["created_files"] or []))
                         elif "final" in ev:
                             answer = ev["final"] or answer
                             docs |= ev["docs"]
@@ -2247,7 +3075,17 @@ class _GenProvider(Provider):
                                                        or ev.get("has_structural_evidence", False))
                             structural_evidence_meta = (structural_evidence_meta
                                                         + (ev.get("structural_evidence_meta") or []))
+                            # 巡ごとに調査状態が別＝この巡の final は当巡分しか運ばない。過去巡の
+                            # 分を失わないよう置換ではなく累積し、全終端が読む控えへ反映する。
+                            _created_files_ev = _created_files_ev + (ev.get("created_files") or [])
+                            _note_created_files(_created_files_ev)
                             _ingest_sub_final_into_state(state, ev)
+                            # この再調査分の取り込みで `state.claims`（worker の一次判断）が
+                            # 更新されうる——直前の査読判定は更新前の内容にしか及んでいないため、
+                            # 「査読済み」を取り消す。ループが次の判定（上のループ先頭）へ戻れば
+                            # 改めて真になる。budget_exhausted で判定を経ずにループを抜けた場合は
+                            # 偽のまま残り、下の消費箇所が未査読の一次判断を公開しない。
+                            _review_ran = False
                             # rerun に evaluation が無いのに初回の古い evaluation（blocked 等）を
                             # 残すと、最新 stop_reason と旧 status が同じ Packet に混在する——
                             # rerun final ごとに無条件で置換する（無ければ None）。
@@ -2255,10 +3093,54 @@ class _GenProvider(Provider):
                                            "reason": ev.get("evaluation_reason"),
                                            "next_action": ev.get("evaluation_next_action")}
                                           if ev.get("evaluation_status") is not None else None)
-                    # rerun 自体が調査予算で打ち切られたら次の査読・再調査へは進まない（入口条件の
-                    # budget 除外と対称にする）——集まった分で清書へ進む。
+                    # 再調査自体が調査予算で打ち切られたら次の巡へは進まない（入口条件の budget
+                    # 除外と対称にする・§2.4 の止める条件「予算到達」）——集まった分で清書へ進む。
                     if stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS:
+                        _round_stop = "budget"
+                        _record_round(_round_no, None, "", "budget")
                         break
+            elif (state is not None and _review_rounds == 0 and state.claims and searched
+                    and not (ctx.stop_event is not None and ctx.stop_event.is_set())
+                    and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
+                # 標準（`_review_rounds == 0`）でも orchestrator の確認を 1 回だけ行う（§2.2）:
+                # worker の一次判断を鵜呑みにせず、`_sufficiency_verdict` の read_around/list_docs
+                # の確認枠で必要な箇所だけ自分で確かめてから判定する。evaluator の巡は回さない
+                # ＝不足と判定しても再調査には入らず、そのまま清書へ進む。確認を通した一次判断
+                # （`_review_ran` が真の回）だけが清書ダイジェスト・`data["claims"]` へ渡る——
+                # 確認が成立しなかった（verdict=None＝fail-open）回・指摘を読み取れなかった回は
+                # 偽のままで、巡ループと同じ規律で公開しない。反証された主張は
+                # `apply_findings` が同じ規律で採用不可（不明・conflict）へ落とす。
+                # 巡別記録（`chat-round`）は巡番号 0 で 1 行だけ残す（1 利用者ターンにつき保存は
+                # 1 回・§2.8 の「標準 0 巡の消費も計上先を明記する」）。
+                _confirm_t0 = time.monotonic()
+                verdict, _review_nodes, _review_usage = self._sufficiency_verdict(
+                    orig_message, lens,
+                    state.render(max_bytes=agentic_search._SYNTHESIS_MAX_BYTES // 2), ctx.world,
+                    scope_paths=(search_ctx.scope_meta or {}).get("scope_paths"),
+                    layer=(search_ctx.scope_meta or {}).get("layer"),
+                    stop_event=ctx.stop_event, state=state,
+                    review_structural_meta=_review_structural_meta,
+                    round_no=0, total_rounds=1, role_all_orchestrator=True)
+                if verdict is not None:
+                    if state.apply_findings(verdict.get("findings"), 0, verdict=verdict["verdict"]):
+                        _review_ran = True
+                    else:
+                        _log.warning("確認の指摘を読み取れませんでした（標準・未確認として扱います）")
+                if isinstance(_review_usage, dict) and _review_usage.get("calls"):
+                    _review_usage["elapsed_ms"] = round((time.monotonic() - _confirm_t0) * 1000)
+                _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
+                _stopped_mid_confirm = ctx.stop_event is not None and ctx.stop_event.is_set()
+                # 判定は得られても指摘を取り込めず `_review_ran` が偽のまま残った回は、巡ループと
+                # 同じ規律で `review_failed` として記録する——一次判断を公開しない回に
+                # 「sufficient」等の誤った停止理由を残さない。
+                _round_stop = ("user_stop" if _stopped_mid_confirm
+                               else "review_failed" if verdict is None or not _review_ran
+                               else "sufficient" if verdict["sufficient"]
+                               else "undecidable" if verdict["verdict"] == "undecidable"
+                               else "rounds_exhausted")
+                _record_round(0, (verdict or {}).get("verdict"), "", _round_stop, _review_usage)
+                if not _stopped_mid_confirm:
+                    yield from _review_nodes
         finally:
             # §5.0 項6: 有償プロバイダをサブに
             # 載せられる以上、縮退したターン（根拠ゲート・空合成等）でもサブへ実際に発行した呼び出し分の
@@ -2272,6 +3154,9 @@ class _GenProvider(Provider):
                 # 最後の実行分（`self._sub_usage_acc`）だけでなく、メイン査読の再調査前に
                 # 退避した消費（`_sub_acc_total`）も合算して1回で記録する。calls は実際に試みた
                 # 総回数を渡す（渡さないと `metering.record` の既定 calls=1 になる既知の穴）。
+                # 計上先の契約: worker の消費は常に `chat-sub`——`search_helper` が空で頭脳自身が
+                # worker のときも同じ（provider/model は頭脳と同じ値になるだけで、役割別の
+                # 計上先は変えない）。清書＝`answer.usage`／evaluator・orchestrator＝`chat-review`。
                 total = _fold_sub_usage(_sub_acc_total, self._sub_usage_acc)
                 if total["calls"] > 0:
                     from .. import metering
@@ -2294,6 +3179,12 @@ class _GenProvider(Provider):
         # 発行してしまい、停止後もしばらく処理が続く無駄が生じるため）。どのみち chat_service 側が
         # stop_event を見て以降のイベントを丸ごと破棄するので、ここで素直に終了するだけでよい。
         if ctx.stop_event is not None and ctx.stop_event.is_set():
+            if state is not None and _review_rounds > 0:
+                # DEPTH-2 S5（§2.4・`TERMINALS` の "stopped"）: 巡を回した経路だけが、追加の LLM
+                # 呼び出しをせずに採用可の主張だけから未完了回答を組んで返す（consumer が保存し、
+                # 監査もこの保存と一致させる）。標準（0 巡）は従来どおり未保存のまま
+                # （`chat_service` の停止分岐が assistant を残さない）。
+                yield _stopped_result(_round_no, "user_stop")
             return
         # STOP-1: 調査予算の3値（turns_exhausted/budget_exceeded/
         # tools_per_turn_exceeded）で打ち切られたターンは、本文が空でも「一般的な失敗」として
@@ -2301,7 +3192,7 @@ class _GenProvider(Provider):
         # （citation/構造 Evidence）も stop_reason も丸ごと失われ、利用者には直前の宣言文等が
         # そのまま回答として見え、異常に気づけない（実環境の実害）。追加の LLM 呼び出しはせず、
         # 固定文言を headline に据えて Evidence Packet だけ最終 envelope へ載せる。ハイブリッド
-        # （`self._sub is not None`）は元々このガードの対象外（既存の伝搬経路のまま・触らない）。
+        # （`self._sub is not None`）は元々このガードの対象外（既存の伝搬経路のまま）。
         budget_exhausted = (self._sub is None
                             and stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS)
         # S3 変更点(2): ハイブリッドはローカル散文を破棄するため、空 answer だけではフォールバックを
@@ -2326,8 +3217,8 @@ class _GenProvider(Provider):
                 if isinstance(d, dict):
                     _add_plan_gap(state.gaps, f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）")
         # 査読（`_sufficiency_verdict`）が list_docs で得た構造的根拠を、下調べ役由来のものと同じ
-        # 正規の list へ合流させてから重複排除する（非ハイブリッドや査読未発動時は常に空リストの
-        # ため無変化）。
+        # 正規の list へ合流させてから重複排除する（査読未発動＝標準 0 巡のときだけ空リストで
+        # 無変化——下調べ役なしでも巡を回す深さでは査読が動くため空とは限らない）。
         structural_evidence_meta = _dedupe_structural_evidence(
             structural_evidence_meta + _review_structural_meta)
         # 査読の list_docs 一致 doc は `_sufficiency_verdict` 内の `run_tool` 戻り値（docs 集合）が
@@ -2371,7 +3262,14 @@ class _GenProvider(Provider):
         # 通常経路でこれらの読取だけが成功しても（citation を生成する grep/es_search も
         # list_docs/graph_neighbors の構造的根拠も無いため）根拠ゲートが「evidence below threshold」で
         # 落としてしまう。
-        evidence_meets_gate = len(citations) >= min_citations or has_structural_evidence or bool(verified)
+        # 作成系（author）は、このターンで**実際に成果物を登録した**場合だけ根拠ゲートの対象外に
+        # する——検索し尽くしても corpus citation が 0件のまま完了することが普通（新規に文書を
+        # 「作る」のであって「引用元を探す」訳ではない）だが、免除をレンズだけで与えると、何も
+        # 作らなかった author のターンが根拠0件のまま通ってしまう。他レンズは従来どおり
+        # （`write_output_file` を1回呼ぶだけで grounded QA 契約を迂回できない）。
+        evidence_meets_gate = (len(citations) >= min_citations or has_structural_evidence
+                               or bool(verified)
+                               or (lens == "author" and bool(self._last_created_files)))
         if budget_exhausted and (not answer or not evidence_meets_gate):
             # 予算例外で両ゲートを迂回できる以上、根拠ゲートを本来通らない未検証の生成本文
             # （例: turns_exhausted の末尾合成が根拠0件のまま断定文を生成した場合）がそのまま
@@ -2379,7 +3277,13 @@ class _GenProvider(Provider):
             # （追加 LLM 呼び出しはしない）。既存ゲートを**自力で**満たす検証済み部分回答
             # （`evidence_meets_gate` が真）だけは、本文が既にあるなら書き換えずそのまま維持する。
             answer = _BUDGET_EXHAUSTED_HEADLINE
-        if not budget_exhausted and not evidence_meets_gate:
+        # ハイブリッド（worker 付き）の作成系は成果物の登録が清書の**後**＝この時点では
+        # `_last_created_files` がまだ空のため、ゲートの最終判定を清書・登録の後まで遅らせる
+        # （登録に成功したターンだけ免除する・登録に至らなければそこで固定文言へ差し替える）。
+        # 非ハイブリッドは登録が反復ツール検索の中＝既に上の式へ反映済みでここでは遅らせない。
+        author_gate_deferred = (lens == "author" and self._sub is not None
+                                and not budget_exhausted and not evidence_meets_gate)
+        if not budget_exhausted and not evidence_meets_gate and not author_gate_deferred:
             raise RuntimeError("evidence below threshold")
         sources, verified_source_ids = _verified_sources(
             ctx.make_sources, docs, ctx.world, (ctx.scope_meta or {}).get("scope_paths"))
@@ -2392,6 +3296,34 @@ class _GenProvider(Provider):
         # Evidence Packet／evidence_committed の双方に citation 由来と構造的根拠由来を**同じ結合済み
         # list** で渡す（ev-* を共通採番するため常にこの list を使う）。
         combined_evidence_meta = evidence_meta + structural_evidence_meta
+        if state is not None and state.claims:
+            # DEPTH-2 S1 是正（RV C2）: `state.claims` の `evidence_refs` はここまで `state.evidence`
+            # （調査内で安定した採番）の ev_id を指す。以降の Evidence Packet／清書ダイジェストは
+            # `combined_evidence_meta` を別採番するため、ここで一度だけ根拠の同一性で書き換える
+            # （`data["claims"]`・清書入力の `_claims_digest` の両方がこの後の `state.claims` を
+            # 読むので、1箇所の書き換えで両方に伝わる）。
+            state.claims = investigation_state.resolve_claim_evidence_ids(
+                state.claims, state.evidence, combined_evidence_meta)
+            # 変換で参照が Evidence Packet 側へ写像できない種別（read/outline/compare 等）だけを
+            # 指していた confirmed は evidence_refs=[] になりうる（`resolve_claim_evidence_ids`
+            # docstring 参照）——根拠参照なしの確定を清書・共有へ渡さない。
+            if any(c.status == "confirmed" and not c.evidence_refs for c in state.claims):
+                if state.claims[0].origin == "worker":
+                    # worker の一次判断は「入力側」の下調べ結果——査読自身が確定した
+                    # 主張（origin=="synthesis"）と違い、これが不正だからといって honest
+                    # failure に倒す理由はない。主張構造ごと不採用にして根拠だけで進む。
+                    state.claims = []
+                else:
+                    raise _MainReviewInsufficient(
+                        "confirmed claim lost all evidence refs after evidence id resolution")
+        if state is not None and state.claims and not _review_ran:
+            # `_review_ran` は「この時点の state.claims を査読の判定（verdict）が実際に通ったか」
+            # ——標準の確認が成立しなかった回・査読の fail-open（通信失敗/JSON不能等で
+            # verdict=None）・再調査で一次判断が更新されたが以後の判定を経ずにループを抜けた場合の
+            # いずれも偽のまま。orchestrator の確認を経ていない主張を、この下の
+            # `data["claims"]`／清書ダイジェストへ渡さない（§2.2: 鵜呑みにしない）。根拠の束
+            # （citations／combined_evidence_meta）は従来どおりそのまま渡る。
+            state.claims = []
         from .. import citations as citations_mod   # 重複排除鍵は citations.py と共通（SEARCH-CUT-3 RV）
         data = {"citations": citations,
                 # Evidence Packet（Committed Evidence の構造化サマリ・拡張設計 §4.2）。
@@ -2426,7 +3358,14 @@ class _GenProvider(Provider):
                     # 変えない契約のため、配信直前に除去する。
                     uniq.append({k2: v2 for k2, v2 in c.items() if k2 != "cid"})
             data["candidates"] = uniq
+        if state is not None and state.claims:
+            # DEPTH-2 S1（§2.5）: 区分（確定/推定/不明）と理由コードを清書本文（下のハイブリッド
+            # 合成入力）だけでなく envelope にも載せる——共有（`sherpa/store/shares.py`）・監査で
+            # 消えないようにする（`investigation_state.claim_to_dict` で純データ化）。
+            from .. import investigation_state as _inv_mod
+            data["claims"] = [_inv_mod.claim_to_dict(c) for c in state.claims]
         env = {"lens": lens, "headline": answer, "summary": {"total": len(citations)},
+               "_terminal": "normal",   # 終端 4 種（`TERMINALS`）——通常＝保存・清書本文・依頼のレンズ
                "data": data,
                "sources": sources,
                "sources_verified": sources_verified,   # 出典の2区分表示用（拡張設計 §4.4）
@@ -2464,14 +3403,71 @@ class _GenProvider(Provider):
         # agentic 経路でも personal_facts を env に乗せる。
         if ctx.personal_facts:
             env["_personal_facts"] = ctx.personal_facts
+        # 全巡で累積した個人由来／書込の有無を全終端へ渡す（§2.7）。
+        _apply_personal_flag(env, _personal_acc)
         if self._sub is None:
+            # §2.1 の対象外の頭脳（Gemini/Bedrock）だけが通る単独ループの終端。worker が付く
+            # openai/ollama 頭脳（巡・主張構造・確認）はここへ来ない＝下のハイブリッド清書を通る。
+            # 元の本文はここまで一度も配信していない（非ハイブリッドの最終合成は非ストリーム＝
+            # `answer` に全文が揃ってから届く）——まず全文を1個の delta として配信してから、
+            # DEPTH-2 S2（§2.7）の追記継続（`length` で切れていれば続きを本物のトークン・
+            # ストリーミングで追加配信）へ進む（表示順を保つ・継続分を先に流さない）。
+            yield {"type": "answer_delta", "text": answer}
+            # `stop_reason` は `_agentic_loop`（`agentic_search.openai_style`）が既に再分類済み
+            # （`_incomplete_stop_reason`）——"truncated" のときだけ続きを発行する。
+            # C26 是正: 初回生成（`openai_style` 内部の最終合成）が使った根拠（精読本文・調査の限界）
+            # と同じダイジェストを `_continuation_prompt`（`_facts`）へ渡す——渡さないと `_facts` は
+            # `env["_synthesis_digest"]` の不在時フォールバック（先頭4引用×60字だけ）に縮退し、
+            # 続きの生成が初回より薄い根拠しか見られなくなる（ハイブリッドの清書は既に
+            # `_synthesis_digest` を渡している・非ハイブリッドだけ抜けていた）。主公開 `env` は
+            # このキーを含まない前提の場所（`_answer_prompt`）では使われない（非ハイブリッドの
+            # 一次回答は `openai_style` が既に生成済みで `_answer_prompt` を経由しないため無害）。
+            # #45/C43 是正: 継続を実際に発行したラウンド（`_cont_rounds > 0`）だけダイジェストの
+            # 打ち切りを `synthesis_truncated` へ計上する。`stop_reason == "truncated"` は継続の
+            # 発行条件（`_continue_truncated_headline` に渡す `truncated` 引数）に過ぎず、
+            # `SHERPA_CODEX_AUTO_CONTINUE=0`（上限0）ではダイジェストを組んでも継続は1回も
+            # 発行されない——その場合まで計上すると、打ち切りの内訳（利用統計）に実際は走って
+            # いない継続の分が偽計上される。
+            _will_continue = env["data"]["evidence_packet"]["stop_reason"] == "truncated"
+            _cont_synth_truncated = False
+            if _will_continue:
+                _cont_digest, _, _cont_synth_truncated = agentic_search.build_synthesis_digest(
+                    citations, combined_evidence_meta,
+                    read_evidence=_final_read_evidence, gaps=_final_gaps)
+                env["_synthesis_digest"] = _cont_digest
+            answer, _cont_completion, _cont_rounds, _cont_usage = yield from self._continue_truncated_headline(
+                ctx, orig_message, lens, env, answer, _will_continue)
+            if _cont_rounds and _cont_synth_truncated:
+                env["limits"] = {**env.get("limits", {}), "synthesis_truncated": True}
+            if _cont_rounds and _cont_completion is not None and not _cont_completion.truncated:
+                # 継続で打ち切りが解消した＝自然完了として再分類する（元の生 finish_reason は
+                # 継続前の呼び出しの内部値で既に失われているため、閉じた語彙のうち「ツール未呼び出しの
+                # 自然完了」＝no_tool_calls に寄せる）。
+                env["data"]["evidence_packet"]["stop_reason"] = "no_tool_calls"
+            if _cont_rounds:
+                # #36: Codex 経路（`providers/codex/provider.py`）の同名キーと同じ意味。
+                env["limits"] = {**env.get("limits", {}), "auto_continues": _cont_rounds}
+            # #35 是正: 非ハイブリッドの `env["usage"]`（:2751 付近・反復ツール検索の合算）は
+            # 継続より前に確定済み——継続ラウンド分のトークンをここで合流させないと計上漏れになる。
+            if _cont_usage and env.get("usage"):
+                env["usage"] = _merge_usage_meta(env["usage"], _cont_usage)
+            # C29: 継続で伸びた本文が清書予算を超えていれば、write_output_file と同じ台帳・カードへ
+            # 逃がす（本文はチャットへ収まる長さの抜粋に差し替え・全文はダウンロード導線）。
+            answer, _offload_created = self._maybe_offload_long_answer(ctx.uid, answer)
+            if _offload_created:
+                _created_files_ev = _created_files_ev + _offload_created
+                _note_created_files(_created_files_ev)
+            env["headline"] = answer
+            # DEPTH-2 S2（§2.7）: 台帳登録した成果物のカードと書込の事実を通常終端へ載せ、
+            # 個人由来の累積（オフロードで増えた分を含む）を改めて全終端の規約で反映する。
+            _attach_created_files(env)
+            _apply_personal_flag(env, _personal_acc)
             # `evidence_committed` は独立イベントとして yield しない（`_result` の env にサイドカーとして
             # 同梱する・理由は下のハイブリッド分岐のコメント参照）。
             ev_node = _evidence_committed_node(combined_evidence_meta)
             if ev_node is not None:
                 env["_evidence_committed"] = ev_node
             _prune_empty_limits(env)
-            yield {"type": "answer_delta", "text": answer}
             yield {"type": "_result", "env": env, "decision": decision}
             return
         # ---- ハイブリッド合成（クラウド単発フォールバック・ローカル散文は破棄） ----
@@ -2516,6 +3512,14 @@ class _GenProvider(Provider):
         if _synth_truncated:
             state.mark_limit("synthesis_truncated")
         _synth_env["_synthesis_digest"] = _synthesis_digest
+        if state.claims:
+            # DEPTH-2 S1/S4b（§2.5・RV #19/#21）: 主張構造があるターン（再調査後もなお不足→
+            # 部分回答へ切替、または査読を通した worker の一次判断）だけ、清書へ「この構造から
+            # 書く」ための専用ビューを渡す（`_personal_facts` と同じ「合成専用の非公開キー」の
+            # 流儀）。査読を一度も通していないターンの worker 一次判断は、この手前で
+            # `state.claims = []` に落とされ済み（RV #19 の分岐参照）——ここへは来ない。
+            from .. import investigation_state as _inv_mod
+            _synth_env["_claims_digest"] = _inv_mod.render_claims(state.claims)
         _stream_exc: BaseException | None = None
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
@@ -2532,9 +3536,39 @@ class _GenProvider(Provider):
                 env.setdefault("agentic_failure", stop_kind_mod.from_exception(e) or "error")
         if not acc:
             if ctx.stop_event is not None and ctx.stop_event.is_set():
-                return   # 停止済み＝:330-331 と同じくミラー（node/_result を出さず静かに終了）
+                # 清書の途中で停止＝本文が1文字も確定していない。追加の LLM 呼び出しをせず、
+                # 採用可の主張だけの未完了回答を返す（`TERMINALS` の "stopped"）。巡を回して
+                # いない標準（0 巡）は従来どおり未保存のまま終える。
+                if _review_rounds > 0:
+                    yield _stopped_result(_round_no, "user_stop")
+                return
             raise RuntimeError("hybrid synthesis produced no answer") from _stream_exc   # デルタ0個＝二重出力の心配なし
         # デルタを1個以上 yield した後は絶対に再 raise しない（二重作業/二重 emission の回避）。
+        # DEPTH-2 S2（§2.7）: `length`（出力上限）で切れた清書本文の続きを追記する（重複させない・
+        # claims JSON はこの継続の対象外）。`_synth_env`（`_synthesis_digest`/`_claims_digest` を
+        # 持つ清書専用ビュー）で `_facts` を組み直す——`env` 自体には digest を持たせない契約のまま。
+        _main_usage = self._last_usage   # C27/#34: 本体清書分を継続の上書きから退避
+        if not stopped and not failed:
+            acc, _cont_completion, _cont_rounds, _cont_usage = yield from self._continue_truncated_headline(
+                ctx, orig_message, lens, _synth_env, acc, _is_length_truncated(self.provider_id, completion))
+            if (ctx.stop_event is not None and ctx.stop_event.is_set()
+                    and _review_rounds > 0):
+                # 継続（ネットワーク呼び出し）の最中に停止要求が来た窓を塞ぐ——停止終端を
+                # 他のイベントより先に返さないと consumer が結果を破棄する。取得済みの
+                # usage（清書＋継続）と継続回数は停止終端へ持ち越す（追加の呼び出しはしない）。
+                yield _stopped_result(
+                    _round_no, "user_stop",
+                    usage=_merge_usage_meta(_main_usage, _cont_usage),
+                    limits_extra=({"auto_continues": _cont_rounds} if _cont_rounds else None))
+                return
+            if _cont_completion is not None:
+                completion = _cont_completion   # 最終ラウンドの完了状態で以降の再分類・帰属可否を判定する
+            self._last_usage = _merge_usage_meta(_main_usage, _cont_usage)
+            if _cont_rounds:
+                # #36: Codex 経路（`providers/codex/provider.py`）の同名キーと同じ意味
+                # （`env["limits"]` は `state.limits` と同一オブジェクトのため、この代入は
+                # 直接キーを足すだけに留める——dict ごと差し替えて参照を切らない）。
+                env["limits"]["auto_continues"] = _cont_rounds
         env["headline"] = acc
         if self._last_usage:
             # STAT-3 S1: `_sub_loop`（`_sub_agentic_loop` が呼ぶ）が残した実効上限を合流する
@@ -2578,6 +3612,70 @@ class _GenProvider(Provider):
             attribution_text = agentic_search._redact(acc)
             attributed_ev_ids = self._attribute_safe(attribution_text, digest, ev_map, None)
             used_doc_ids = agentic_search.resolve_attributed_doc_ids(attributed_ev_ids, ev_map)
+        # 清書本文の台帳・カードへの登録（`write_output_file` と同じ導線）。帰属（`acc` の全文を
+        # 読む）より後に行う——先に本文を抜粋へ差し替えると帰属が先頭2000字しか見られなくなる。
+        _author_save_error = ""
+        if lens == "author":
+            # 作成系の成果物登録は worker ではなく orchestrator ＝清書側で行う（出力ツールは
+            # worker に配線しない）。ファイル名と marp 指定は清書側の LLM 呼び出し1回で決めさせ、
+            # 本文は確定済みのものをそのまま保存する。
+            if ctx.stop_event is not None and ctx.stop_event.is_set():
+                # 個人 workspace への書込の直前に停止を再確認する（帰属呼び出し自体が非ゼロ時間
+                # かかるため、その間に停止要求が来る窓を塞ぐ）——停止後に書込を行って通常終端で
+                # 返すと、利用者が止めたターンの成果物が残る。確定済みの清書 usage は持ち越す。
+                if _review_rounds > 0:
+                    yield _stopped_result(_round_no, "user_stop", usage=env.get("usage"))
+                return
+            _write_args = self._author_output_args(orig_message, acc)
+            _fn_usage = _single_stream_usage(self._last_usage)
+            if _fn_usage:
+                # ファイル名を決める呼び出し1回分は清書（answer.usage）にも chat-sub にも乗らない
+                # 別消費——evaluator/orchestrator と同じ `chat-review` へ1行だけ記録する。
+                from .. import metering
+                metering.record("chat-review", self.provider_id, self.model, _fn_usage["tokens"],
+                                user_id=ctx.uid, world=ctx.world, calls=_fn_usage["calls"],
+                                conversation_id=ctx.conversation_id)
+            if ctx.stop_event is not None and ctx.stop_event.is_set():
+                # ファイル名を決める呼び出し自体が非ゼロ時間かかるため、その最中に停止要求が
+                # 来た窓も塞ぐ（書込の直前に再確認する）。確定済みの清書 usage は停止終端へ持ち越す。
+                if _review_rounds > 0:
+                    yield _stopped_result(_round_no, "user_stop", usage=env.get("usage"))
+                return
+            _write_result = agentic_search._run_write_output_file(
+                {**_write_args, "content": acc}, ctx.uid)
+            if "error" in _write_result:
+                # 成果物そのものが依頼の目的＝保存できなかったターンを正常終端で返さない
+                # （本文は破棄せず、失敗の印と理由の注記を添えて失敗終端にする）。
+                _author_save_error = str(_write_result["error"])
+                if author_gate_deferred:
+                    # 根拠ゲートの免除は登録に成功したターンだけ——登録に至らなければ根拠0件の
+                    # ままのため、未検証の生成本文は回答として残さない。
+                    acc = _AUTHOR_NO_EVIDENCE_HEADLINE
+                env["headline"] = acc = acc + author_save_failed_note(_author_save_error)
+            else:
+                _created = [{"rel_path": _write_result["rel_path"],
+                            "download_url": _write_result.get("download_url")}]
+                # marp:true の Markdown から生成された pdf/pptx も同じ成果物カードへ載せる。
+                _created += [dict(r) for r in (_write_result.get("rendered") or [])]
+                _note_created_files(list(self._last_created_files) + _created)
+                _attach_created_files(env)
+                if len(acc.encode("utf-8")) > agentic_search._SYNTHESIS_MAX_BYTES:
+                    acc = _offloaded_body_excerpt(acc)
+                if _write_result.get("marp_note"):
+                    acc += f"\n\n※ {_write_result['marp_note']}"
+                env["headline"] = acc
+        else:
+            self._offload_long_answer_into_env(ctx, env, acc)
+        if env.get("wrote_files"):
+            # 清書の書込も個人 workspace への書込＝個人由来の累積へ足し、
+            # 全終端の規約（§2.7）で改めて反映する。
+            _merge_personal_inputs(_personal_acc, wrote_files=env["wrote_files"])
+            _apply_personal_flag(env, _personal_acc)
+        if _author_save_error:
+            env["_terminal"] = "failed"          # 終端 4 種（`TERMINALS`）
+            # 終了理由の分布で完了扱いにしない（`stop_kind.resolve`）。清書が通信例外
+            # （timeout/transport_error）で切れていれば既に立っている型を優先する。
+            env.setdefault("agentic_failure", "error")
         committed_docs = _committed_evidence_doc_ids(evidence_meta, structural_evidence_meta,
                                                       verified, used_doc_ids)
         env["sources_verified"] = sorted(committed_docs & set(verified_source_ids))
@@ -2605,6 +3703,10 @@ class _GenProvider(Provider):
         # R1a: knowledge オン/オフどちらの分岐に進む前に確定させる（_plain_run も _messages/_stream を
         # 経由するため、素の会話でも履歴が効く＝「追質問が前ターンを理解しない」を lens 問わず解消）。
         self._history = list(ctx.history or [])
+        # C21: このターンの `_agentic_run` が書込成功を記録する控え（同じインスタンスが次ターンでも
+        # 再利用されるため、ここで毎回リセットする——前ターンの値が今ターンの honest failure
+        # フォールバックへ誤って持ち越されないようにする）。
+        self._last_created_files: list = []
         if not ctx.knowledge:                                  # ナレッジ参照オフ＝素の会話（本物のトークン）
             yield from _plain_run(self, ctx); return
         if ctx.make_sources is not None:                       # ナレッジ参照ON: 反復ツール検索（author だけ単発取得）
@@ -2626,65 +3728,110 @@ class _GenProvider(Provider):
             # グラフが 0 件のとき「根拠なし」で終わってしまう（Codex は自前 grep を続けるため差が出る）。
             # agentic_search のツール一覧にはグラフ照会（graph_neighbors/find_paths）も含まれるため、
             # グラフが使える環境では従来の情報を取りつつ、0 件でも grep/ES で調べ続けられる。
-            if decision.get("lens") != "author":               # P1-a: author は agentic_search 未対応ツール＝単発取得へ
-                from ..ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
-                try:
-                    yield from self._agentic_run(ctx, decision)
+            # author（作成系）も他レンズと同じ調査ループを通る（下書き案内＝旧
+            # `_AUTHOR_FALLBACK_NOTE` へ縮退しない）。成果物の登録（`write_output_file` と同じ
+            # 台帳・カード・Marp 変換）は worker ではなく orchestrator ＝清書側で行う契約。
+            from ..ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
+            _saved_subs = None
+            if (decision.get("lens") == "author" and self._sub is not None
+                    and (self._sub.get("profile_id") != _sh_mod.SELF_PROFILE_ID
+                         or self._sub_candidates is not None)):
+                # 作成系（author）は設定に依らず「頭脳自身を worker にしたハイブリッド」で動かす
+                # ——安いモデルの worker／複数プロファイル並用では、成果物の元になる調査を頭脳が
+                # 直接行えない。このターンだけ差し替え、finally で元の設定へ戻す
+                # （`self._sub is None`＝§2.1 の対象外の頭脳はそのまま単独ループ）。
+                _saved_subs = (self._sub, self._sub_candidates)
+                self._sub = _sh_mod.self_worker(
+                    self.provider_id, self.model,
+                    key=getattr(self, "_key", None), url=getattr(self, "_url", None))
+                self._sub_candidates = None
+            try:
+                yield from self._agentic_run(ctx, decision)
+                return
+            except GraphSchemaEraError:
+                # `graph_neighbors` ツール経由で上がる
+                # 専用例外は、下調べ役の技術的失敗と同じ広い except で黙って generic フォール
+                # バック文言へ丸めない——そのまま re-raise し、この呼び出し元（`_gather`
+                # 経由の provider.run() 全体）を包む `chat_service._degrade_overload` に
+                # 固定文言（再取り込み案内）への変換を委ねる（`GraphQueryOverloadError` と
+                # 同じ既存の fail-loud 経路・`chat_service.py::_degrade_overload` 参照）。
+                raise
+            except Exception as agentic_exc:
+                # 下調べ役（検索アシスタント）付きのターンでは、反復検索の失敗（一時的な通信
+                # 失敗は `agentic_search._post` が既に限定リトライ済み・技術的失敗と根拠ゲート
+                # 「evidence below threshold」の両方を含む）をメインAI（高コスト）で黙って
+                # 肩代わりしない＝利用者が選んでいない高コスト経路への切替は honest failure に
+                # する（設定確認／下調べ OFF は利用者の判断に委ねる・原因の切り分けはログの
+                # exc_info に譲る）。`self._sub is None`（§2.1 の対象外の頭脳＝Gemini/Bedrock）は
+                # 対象外＝下の単発 grep へ縮退する（従来どおり）。
+                if self._sub is not None:
+                    _log.warning(
+                        "下調べ役（%s/%s）でこのターンを完了できなかったため停止します"
+                        "（メインAIへの黙った切替はしない）",
+                        self._sub.get("provider"), self._sub.get("model"), exc_info=True)
+                    # EXT-2b: メイン査読の「再調査後もなお不足」は設定障害ではなく査読が正常に
+                    # 働いた結果——下調べ OFF を勧めると査読の保護そのものを迂回させるため、
+                    # 文言を分ける。
+                    _self_worker = self._sub.get("profile_id") == _sh_mod.SELF_PROFILE_ID
+                    if isinstance(agentic_exc, _MainReviewInsufficient):
+                        msg = ("再調査を行いましたが、回答に十分な根拠を確認できませんでした。"
+                              "範囲を広げるか、質問を具体的にしてもう一度お試しください。")
+                    elif _self_worker:
+                        # 頭脳自身が worker＝OFF にできる「下調べ機能」が無い構成のため、
+                        # 実行できない指示（設定で OFF にする）を案内しない。
+                        msg = ("調査がうまくいきませんでした。"
+                              "範囲を変えるか、質問を具体的にしてもう一度お試しください。")
+                    else:
+                        msg = ("下調べAIでの調査がうまくいきませんでした。"
+                              "設定を確認するか、下調べ機能をOFFにしてください。")
+                    # 失敗終端でも、巡ループで確認済みの主張と巡番号が残っていればそれを
+                    # 先に示す（追加の LLM 呼び出しはしない・`TERMINALS` の "failed"）。
+                    _incomplete = getattr(self, "_last_incomplete_body", None)
+                    _partial = _incomplete() if callable(_incomplete) else ""
+                    if _partial:
+                        msg = f"{_partial}\n\n{msg}"
+                    yield _node("fallback", "think",
+                                ("回答に十分な根拠が集まりませんでした"
+                                 if isinstance(agentic_exc, _MainReviewInsufficient)
+                                 else ("調査がうまくいきませんでした" if _self_worker
+                                       else "下調べAIでの調査がうまくいきませんでした")), msg, "done")
+                    yield {"type": "answer_delta", "text": msg}
+                    env = {"lens": decision.get("lens", "qa"), "headline": msg,
+                          "summary": {"total": 0}, "data": {}, "sources": [],
+                          # 終了理由の印（`stop_kind.resolve`）: 型が通信系（timeout/transport_error）
+                          # なら優先してそれを立てる・型が特定できない場合のみ査読の根拠不足は
+                          # no_evidence・それ以外の失敗は error（完了扱いにはしない）。
+                          "agentic_failure": (stop_kind_mod.from_exception(agentic_exc)
+                                              or ("insufficient"
+                                                  if isinstance(agentic_exc, _MainReviewInsufficient)
+                                                  else "error")),
+                          "_terminal": "failed",   # 終端 4 種（`TERMINALS`）
+                          "scope": layer_mod.scope_with_layer(
+                              ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
+                    # 全巡で累積した個人由来／書込の有無は失敗終端へも渡す（§2.7 高-4）。
+                    # 台帳登録済みの成果物（S2 の `write_output_file`）も同じ終端へ載せる——
+                    # 書込は既に個人 workspace に実在するため、失敗本文でも導線と書込の事実を落とさない。
+                    if self._last_created_files:
+                        env["created_files"] = [
+                            {"name": f.get("rel_path"), "download_url": f.get("download_url")}
+                            for f in self._last_created_files if f.get("rel_path")]
+                        env["wrote_files"] = [f.get("rel_path") for f in self._last_created_files
+                                              if f.get("rel_path")]
+                    _pa = getattr(self, "_last_personal_acc", None)
+                    if _pa:
+                        _apply_personal_flag(env, _pa)
+                    _lim = getattr(self, "_last_run_limits", None)
+                    if _lim and any(_lim.values()):
+                        env["limits"] = dict(_lim)     # 失敗ターンも当たった制限を計測に載せる
+                    yield {"type": "_result", "env": env,
+                          "decision": {"lens": decision.get("lens", "qa"), "input": ctx.message,
+                                      "reason": "下調べAIの失敗"}}
                     return
-                except GraphSchemaEraError:
-                    # `graph_neighbors` ツール経由で上がる
-                    # 専用例外は、下調べ役の技術的失敗と同じ広い except で黙って generic フォール
-                    # バック文言へ丸めない——そのまま re-raise し、この呼び出し元（`_gather`
-                    # 経由の provider.run() 全体）を包む `chat_service._degrade_overload` に
-                    # 固定文言（再取り込み案内）への変換を委ねる（`GraphQueryOverloadError` と
-                    # 同じ既存の fail-loud 経路・`chat_service.py::_degrade_overload` 参照）。
-                    raise
-                except Exception as agentic_exc:
-                    # 下調べ役（検索アシスタント）付きのターンでは、反復検索の失敗（一時的な通信
-                    # 失敗は `agentic_search._post` が既に限定リトライ済み・技術的失敗と根拠ゲート
-                    # 「evidence below threshold」の両方を含む）をメインAI（高コスト）で黙って
-                    # 肩代わりしない＝利用者が選んでいない高コスト経路への切替は honest failure に
-                    # する（設定確認／下調べ OFF は利用者の判断に委ねる・原因の切り分けはログの
-                    # exc_info に譲る）。`self._sub is None`（下調べ役なし）は対象外＝下の単発 grep
-                    # へ縮退する（従来どおり）。
-                    if self._sub is not None:
-                        _log.warning(
-                            "下調べ役（%s/%s）でこのターンを完了できなかったため停止します"
-                            "（メインAIへの黙った切替はしない）",
-                            self._sub.get("provider"), self._sub.get("model"), exc_info=True)
-                        # EXT-2b: メイン査読の「再調査後もなお不足」は設定障害ではなく査読が正常に
-                        # 働いた結果——下調べ OFF を勧めると査読の保護そのものを迂回させるため、
-                        # 文言を分ける。
-                        if isinstance(agentic_exc, _MainReviewInsufficient):
-                            msg = ("再調査を行いましたが、回答に十分な根拠を確認できませんでした。"
-                                  "範囲を広げるか、質問を具体的にしてもう一度お試しください。")
-                        else:
-                            msg = ("下調べAIでの調査がうまくいきませんでした。"
-                                  "設定を確認するか、下調べ機能をOFFにしてください。")
-                        yield _node("fallback", "think",
-                                    ("回答に十分な根拠が集まりませんでした"
-                                     if isinstance(agentic_exc, _MainReviewInsufficient)
-                                     else "下調べAIでの調査がうまくいきませんでした"), msg, "done")
-                        yield {"type": "answer_delta", "text": msg}
-                        env = {"lens": decision.get("lens", "qa"), "headline": msg,
-                              "summary": {"total": 0}, "data": {}, "sources": [],
-                              # 終了理由の印（`stop_kind.resolve`）: 型が通信系（timeout/transport_error）
-                              # なら優先してそれを立てる・型が特定できない場合のみ査読の根拠不足は
-                              # no_evidence・それ以外の失敗は error（完了扱いにはしない）。
-                              "agentic_failure": (stop_kind_mod.from_exception(agentic_exc)
-                                                  or ("insufficient"
-                                                      if isinstance(agentic_exc, _MainReviewInsufficient)
-                                                      else "error")),
-                              "scope": layer_mod.scope_with_layer(
-                                  ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
-                        _lim = getattr(self, "_last_run_limits", None)
-                        if _lim and any(_lim.values()):
-                            env["limits"] = dict(_lim)     # 失敗ターンも当たった制限を計測に載せる
-                        yield {"type": "_result", "env": env,
-                              "decision": {"lens": decision.get("lens", "qa"), "input": ctx.message,
-                                          "reason": "下調べAIの失敗"}}
-                        return
-                    yield _node("fallback", "think", "検索方法を切替", "別の方法で調べ直します", "done")  # 単発 grep へ
+                yield _node("fallback", "think", "検索方法を切替", "別の方法で調べ直します", "done")  # 単発 grep へ
+            finally:
+                if _saved_subs is not None:
+                    # author の差し替えを元へ戻す（他レンズ・次ターンへ漏らさない）。
+                    self._sub, self._sub_candidates = _saved_subs
         # シーム規則（フェーズ5 S3・危険な継ぎ目・モジュール docstring 参照）: `_gather` は facade
         # （`sherpa.agents`）属性経由で実行時解決する（`agents._gather` の monkeypatch を効かせ続けるため）。
         from sherpa import agents as _facade
@@ -2696,7 +3843,12 @@ class _GenProvider(Provider):
                 yield ev
         if env is None:                                # _gather が clarify question を出して停止＝確認待ち
             return
-        is_author = decision.get("lens") == "author"    # P1-a: 他頭脳は資料を作らず下書き案内を前置（ライブ表示にも反映）
+        # is_author: この単発フォールバック（`_agentic_run` 自体が例外で失敗した最後の砦・
+        # `ctx.make_sources is None`＝ナレッジ参照オフの間隙）に限って前置する——C23 で撤去したのは
+        # 検索アシスタント設定時に author が**正常に**この単発経路を選んでいた縮退（`_agentic_run` を
+        # 一度も試みない設計上のショートカット）で、ここは実際に反復ツール検索が失敗した後の
+        # 最後の砦なので、道具が使えなかった旨の案内は引き続き必要。
+        is_author = decision.get("lens") == "author"
         if is_author:
             yield {"type": "answer_delta", "text": _AUTHOR_FALLBACK_NOTE}
         yield _node("brain", "think", f"考える（{self.label}）", "事実に基づいて回答しています", "active")
@@ -2735,6 +3887,15 @@ class _GenProvider(Provider):
             # 上限を渡さない（`_last_main_depth_usage` を持たない）ため常に `usage_extras` で組む。
             env["usage"].update(depth_profile_mod.usage_extras((ctx.scope_meta or {}).get("depth_profile")))
             _log_chat_usage(env["usage"], time.monotonic() - t0, ctx.world)
+        # C21: この単発フォールバックへ落ちる直前（`_agentic_run` の例外経路）に台帳登録済みの
+        # 成果物があれば、通常回答（:2751 付近）と同じ形で載せる——書込は既に個人 workspace に
+        # 実在するため、フォールバック本文が「作成に失敗した」体裁でも個人由来フラグは立てる。
+        if self._last_created_files:
+            env["created_files"] = [
+                {"name": f.get("rel_path"), "download_url": f.get("download_url")}
+                for f in self._last_created_files if f.get("rel_path")]
+            env["wrote_files"] = [f.get("rel_path") for f in self._last_created_files
+                                  if f.get("rel_path")] or True
         if is_author:
             env["headline"] = _AUTHOR_FALLBACK_NOTE + env.get("headline", "")
         yield _node("brain", "think", f"考える（{self.label}）",

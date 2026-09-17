@@ -155,6 +155,11 @@ def _redact_importance_from_answer_data(data):
         out["items"] = _filter_importance_from_impact_items(out["items"])
     if isinstance(out.get("presumed"), list):
         out["presumed"] = _filter_importance_from_impact_items(out["presumed"])
+    if isinstance(out.get("claims"), list):
+        # DEPTH-2 S1（§2.5）: 区分（確定/推定/不明）と理由コードが共有本文でも消えないよう
+        # allowlist で再構築する（重要度設定ファイル自体を指す参照は元々 `evidence_refs` に
+        # doc_id を持たない契約のため、他の filter_importance 系と違い除外処理は不要）。
+        out["claims"] = [x for x in (_safe_claim(c) for c in out["claims"]) if x is not None]
     return out
 
 
@@ -277,6 +282,10 @@ _SHARE_SAFE_LENS = ("qa", "impact", "troubleshoot", "chat", "clarify")
 _EVIDENCE_PACKET_STR_FIELDS = ("task_id", "investigation_status", "summary", "stop_reason", "next_action")
 _EVIDENCE_PACKET_INT_FIELDS = ("candidates_seen", "candidates_inspected", "evidence_selected")
 _EVIDENCE_ITEM_STR_FIELDS = ("evidence_id", "source_type", "source_path", "verification_method")
+# DEPTH-2 S1（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5）: 主張（`data.claims[]`）の
+# 共有用 allowlist フィールド——`evidence_refs` はこの調査内の `ev-N`／provider の evidence_refs
+# 参照文字列のみで、doc_id・原文は含まないため型検証だけで再構築できる。
+_CLAIM_STR_FIELDS = ("id", "status", "text", "reason", "reason_code")
 _LOCATOR_PART_MAX = 200   # part/object_id（str）は zip 内パス等を想定し sheet/cell_range より広め
 
 # bbox の要素上限（citations.py の page/slide 桁上限と同じ値を流用・巨大値での DoS/表示崩れ防止）。
@@ -429,6 +438,24 @@ def _safe_evidence_item(e: dict) -> dict:
         cm = _safe_share_card_meta(e.get("card_meta"))
         if cm is not None:
             out["card_meta"] = cm
+    return out
+
+
+def _safe_claim(c) -> dict | None:
+    """主張1件（DEPTH-2 S1・`data.claims[]`）を**既知フィールド・既知の型のみ**で再構築する
+    （`_safe_evidence_packet`/`_safe_evidence_item` と同じ allowlist 方針）。`id`/`status`/`text`
+    を欠く・型が合わない場合は行ごと落とす（`None`）。"""
+    if not isinstance(c, dict):
+        return None
+    out = {}
+    for k in _CLAIM_STR_FIELDS:
+        if isinstance(c.get(k), str):
+            out[k] = c[k]
+    if not {"id", "status", "text"} <= out.keys():
+        return None
+    refs = c.get("evidence_refs")
+    if isinstance(refs, list) and all(isinstance(r, str) for r in refs):
+        out["evidence_refs"] = refs
     return out
 
 

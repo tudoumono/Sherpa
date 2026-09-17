@@ -1870,11 +1870,11 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     """検索。`vector=True` かつ埋め込み設定があれば **kNN＋BM25 ハイブリッド**、無ければ BM25。範囲フィルタ・graceful。
 
     `k_ceiling`（省略可・既定 `None`＝モジュール既定 `_ES_SEARCH_K_MAX` を使う＝既存呼び出し元は
-    無変更）: 呼び出し元が既に「倍率適用後の絶対上限」まで検証済みの `k` を渡す場合
+    無変更）: 呼び出し元が既に絶対上限まで検証済みの `k` を渡す場合
     （`agentic_search.run_tool` の `es_search` 分岐＝調べる深さが計算した実効値）、`_ES_SEARCH_K_MAX`
     （env `SHERPA_GREP_MAX_HITS` 由来・既定 50 の床）による再クランプを迂回してこちらを使う——
-    `_ES_SEARCH_K_MAX` の既定 50 は grep 側の既定 30 よりヒット数を広めに取る設計のための床であり、
-    調べる深さ「最大」（既定 ×2＝60）のような意図的に大きい値まで潰してしまう。
+    `_ES_SEARCH_K_MAX` の既定 50 は grep 側の既定 30 よりヒット数を広めに取る設計のための床でありつつ、
+    管理画面で基準値を広げた場合のような意図的に大きい値まで許容する。
     `_ES_SEARCH_K_MAX` 自体の既存契約（`SHERPA_GREP_MAX_HITS` 未設定時は 50 を下回らない等・
     `tests/unit/test_es_index_meta.py` 参照）はこの引数を渡さない既存呼び出し元でそのまま残る。
 

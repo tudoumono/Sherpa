@@ -4863,6 +4863,19 @@
             ],
             "title": "Legacy Backend"
           },
+          "max_review_rounds": {
+            "anyOf": [
+              {
+                "maximum": 32.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Review Rounds"
+          },
           "model_catalog": {
             "anyOf": [
               {

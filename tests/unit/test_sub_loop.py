@@ -12,6 +12,7 @@ LLM は stub（`agentic_search._post`/`_stream` を差し替え・コスト0）�
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 
@@ -128,8 +129,12 @@ def test_on_loop_hits_sub_endpoint_and_single_synthesis():
         if len(calls) == 1:
             return {"choices": [{"message": {"content": "", "tool_calls": [
                 {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
-        return {"choices": [{"message": {"content": "LOCAL PROSE (must be discarded)"}}],
-                "prompt_eval_count": 10, "eval_count": 5}
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": "LOCAL PROSE (must be discarded)"}}],
+                    "prompt_eval_count": 10, "eval_count": 5}
+        # 3回目＝一次判断の要求（深さに依らず発行される）、4回目＝帰属呼び出し（下のコメント
+        # 参照）。空 claims 形の応答でも帰属側は空集合へ縮退するだけで失敗しない。
+        return {"choices": [{"message": {"content": '{"claims": []}'}}]}
 
     orig = A._post
     A._post = fake_post
@@ -138,11 +143,12 @@ def test_on_loop_hits_sub_endpoint_and_single_synthesis():
         p._sub = dict(_SUB)
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
-        # サブの tool 呼び出し1回 + no-tool 応答1回。合成自体（_FakeSynth._stream）は _post を
-        # 経由しない（`self._stream` を直接差し替えているため）ので calls には乗らない——帰属は
-        # `OpenAIProvider._attribute`（`llm.openai_url` を叩く openai_style 版）を使うが、
-        # `p` は `_FakeSynth`（`_attribute` は未上書き）なので実際には `A._post` 経由で発火する。
-        assert len(calls) == 3
+        # サブの tool 呼び出し1回 + no-tool 応答1回 + 一次判断の要求1回 + 帰属呼び出し1回。合成自体
+        # （`_FakeSynth._stream`）は _post を経由しない（`self._stream` を直接差し替えているため）
+        # ので calls には乗らない——帰属は `OpenAIProvider._attribute`（`llm.openai_url` を叩く
+        # openai_style 版）を使うが、`p` は `_FakeSynth`（`_attribute` は未上書き）なので実際には
+        # `A._post` 経由で発火する。
+        assert len(calls) == 4
         assert all(u == "http://localhost:11434/api/chat" for u, _, _ in calls[:2])
         assert all(b["model"] == "qwen2.5" for _, b, _ in calls[:2])
         assert all(b.get("stream") is False for _, b, _ in calls[:2])   # ollama=True 形状
@@ -165,6 +171,56 @@ def test_on_loop_hits_sub_endpoint_and_single_synthesis():
             "is_local": "local", "profile": "worker"}   # どのプロファイルの消費かを usage_sub に残す
         # answer.usage は主合成呼び出しの単一オブジェクト契約（_stream が self._last_usage をセットしなければ無し）
         assert "usage" not in result["env"]
+    finally:
+        A._post = orig
+
+
+def test_hybrid_synthesis_long_answer_is_offloaded_to_file_and_card(monkeypatch):
+    """C41 是正: 下調べ役ありのハイブリッド清書でも、清書予算（`agentic_search._SYNTHESIS_MAX_BYTES`）
+    を超える長文は `write_output_file` と同じ台帳・カードへ逃がす（従来はこの接続が非ハイブリッド
+    にしか無く、ハイブリッド／計画経路の清書はダウンロード導線が出なかった）。"""
+    calls = []
+
+    def fake_post(url, headers, body, timeout=90):
+        calls.append((url, dict(body), timeout))
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": "LOCAL PROSE (discarded)"}}],
+                    "prompt_eval_count": 10, "eval_count": 5}
+        return {"choices": [{"message": {"content": '{"claims": []}'}}]}
+
+    orig = A._post
+    A._post = fake_post
+
+    long_text = "回答本文" * 25000   # 12 バイト/回×25000 ≒ 300KB（既定予算 256KiB を確実に超える）
+
+    class _LongSynth(_FakeSynth):
+        _synth_text = long_text
+
+    write_calls = []
+
+    def fake_write(args, uid):
+        write_calls.append((args, uid))
+        return {"rel_path": "回答.md", "download_url": "/workspace/files/9/download"}
+
+    monkeypatch.setattr(A, "_run_write_output_file", fake_write)
+
+    try:
+        p = _LongSynth("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        ctx = _ctx(uid="u-hybrid-offload")
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        env = result["env"]
+        assert write_calls, "write_output_file が呼ばれていない（長文オフロードが未接続）"
+        assert write_calls[0][1] == "u-hybrid-offload"
+        assert env.get("created_files"), f"created_files が無い: {env}"
+        assert env["created_files"][0]["name"] == "回答.md"
+        assert env.get("wrote_files")
+        assert env["headline"] != long_text   # 本文は抜粋に差し替わる
+        assert "回答が長いため" in env["headline"]
     finally:
         A._post = orig
 
@@ -936,7 +992,7 @@ def test_hybrid_synthesis_stop_event_set_immediately_after_stream_completes_skip
         _restore_post(orig)
 
 
-def test_hybrid_synthesis_skips_attribution_when_stream_completion_reason_is_truncated():
+def test_hybrid_synthesis_skips_attribution_when_stream_completion_reason_is_truncated(monkeypatch):
     """`_stream` が正常終了（`stopped`/`failed` は共に False）しても、実装先の Provider が
     `completion`（`_CompletionState`）に終端は観測済み・理由は打ち切り系の値（"length"）を記録
     すれば、本文は headline として採用しつつ帰属呼び出しは省略する（部分本文を確定回答として
@@ -945,7 +1001,10 @@ def test_hybrid_synthesis_skips_attribution_when_stream_completion_reason_is_tru
     ストリームの中で直接模して固定する。サブループ（下調べ役）自身の投稿は自然完了
     （"no_tool_calls"）でも、実際に画面へ出す本文を生成したのは打ち切られたクラウド最終合成の
     ため、Evidence Packet の `stop_reason` は "truncated" へ再分類される（サブループの投稿を
-    そのまま握り続けない）。"""
+    そのまま握り続けない）。DEPTH-2 S2（§2.7）: `length` は追記継続の対象になるため、この
+    テストの関心（帰属スキップ・stop_reason 再分類）と混ざらないよう継続は無効化する
+    （`SHERPA_CODEX_AUTO_CONTINUE=0`・継続そのものは `test_length_truncated_headline_*` 系で別途固定）。"""
+    monkeypatch.setenv("SHERPA_CODEX_AUTO_CONTINUE", "0")
     doc = "4期/04_運用/障害記録.md"
     seq = [
         {"choices": [{"message": {"content": "", "tool_calls": [
@@ -1712,7 +1771,9 @@ def test_guard_max_turns_injected_bounds_loop():
         ctx = _ctx()
         events = list(p._sub_agentic_loop(ctx))
         final = next(e for e in events if "final" in e)
-        assert len(calls) == 1 and final["final"] == ""   # 打ち切り＝最終回答は空
+        # 打ち切り＝最終回答は空。DEPTH-2 S4b: 収集済み根拠（ripgrep ヒット）があれば一次判断を
+        # 1回だけ追加で要求する（この mock は毎回 tool_calls を返す＝claims JSON にならず None）。
+        assert len(calls) == 2 and final["final"] == ""
     finally:
         A._post = orig
 
@@ -1725,15 +1786,16 @@ def test_guard_omitted_equals_env_default():
                         "llm_timeout": int(os.environ.get("SHERPA_LLM_TIMEOUT", "60"))}
 
 
-# ===== 調べる深さ（調べ方ブロック §3.2）: 検索アシスタント（_sub）有効時の倍率配線 =====
+# ===== 調べる深さ（調べ方ブロック §3.2）: 検索アシスタント（_sub）有効時の配線 =====
 # `_sub_loop`（`_sub_agentic_loop` 経由）は通常の `_agentic_loop` を迂回するため、独立して
-# max_turns/max_hits/window_cap への配線を固定する（**admin 未設定時**は standard で guard 値の
-# まま・admin 設定時は管理基準値が優先・deep/max だけ倍率が一度だけ効く）。
+# max_turns/max_hits/window_cap への配線を固定する。DEPTH-2 S7 以降、倍率は撤去——
+# admin 未設定時は guard 値・admin 設定時は管理基準値のまま、深さ（standard/deep/max）に
+# 依らず同じ値が渡る。
 
 def test_sub_loop_scales_max_turns_hits_window_with_depth_profile(monkeypatch):
-    """system_settings に depth_base_max_turns が無ければ guard["max_turns"]（既定 6）が基準値
-    のまま・deep/max だけ倍率が乗る。hits/window は通常の _agentic_loop と同じ実効基準値
-    （system_settings 未設定＝env 既定）を使う。"""
+    """DEPTH-2 S7: system_settings に depth_base_max_turns が無ければ guard["max_turns"]
+    （既定 6）が基準値のまま、深さに依らず変わらない。hits/window も通常の _agentic_loop と
+    同じ実効基準値（system_settings 未設定＝env 既定）をそのまま使う。"""
     from sherpa import depth_profile as D
     captured = {}
 
@@ -1744,7 +1806,7 @@ def test_sub_loop_scales_max_turns_hits_window_with_depth_profile(monkeypatch):
     monkeypatch.setattr(A, "openai_style", fake_openai_style)
     p = _FakeSynth("sk-dummy", "gpt-5.5")
     p._sub = dict(_SUB)   # guard.max_turns = 6
-    for profile, expected_turns in (("standard", 6), ("deep", 12), ("max", 18)):
+    for profile, expected_turns in (("standard", 6), ("deep", 6), ("max", 6)):
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": profile})
         list(p._sub_agentic_loop(ctx))
         assert captured.get("max_turns") == expected_turns, profile
@@ -1761,14 +1823,14 @@ def test_sub_loop_stashes_effective_limits_for_usage_meta(monkeypatch):
     p._sub = dict(_SUB)   # guard.max_turns = 6
     ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"})
     list(p._sub_agentic_loop(ctx))
-    assert p._last_sub_depth_usage == {"depth_profile": "deep", "max_turns": 12,
+    assert p._last_sub_depth_usage == {"depth_profile": "deep", "max_turns": 6,
                                        "max_tools_per_turn": A.MAX_TOOLS_PER_TURN}
 
 
 def test_sub_loop_max_turns_prefers_admin_base_over_guard_when_set(monkeypatch):
     """system_settings に depth_base_max_turns があれば guard["max_turns"] より優先する
     （管理者が反復基準値を下げても検索アシスタント有効時だけ外れる、ということがないように）。
-    倍率は基準値解決後の値へ一度だけ掛ける（guard 値へは掛けない）。"""
+    DEPTH-2 S7 以降、深さは基準値に効かない（受け入れ条件(1)）。"""
     from sherpa import depth_profile as D
     captured = {}
 
@@ -1780,7 +1842,7 @@ def test_sub_loop_max_turns_prefers_admin_base_over_guard_when_set(monkeypatch):
     p = _FakeSynth("sk-dummy", "gpt-5.5")
     p._sub = dict(_SUB)   # guard.max_turns = 6（system_settings 優先時は無視されるべき）
     p._system_settings = {"depth_base_max_turns": 5}
-    for profile, expected_turns in (("standard", 5), ("deep", 10), ("max", 15)):
+    for profile, expected_turns in (("standard", 5), ("deep", 5), ("max", 5)):
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": profile})
         list(p._sub_agentic_loop(ctx))
         assert captured.get("max_turns") == expected_turns, profile
@@ -1805,7 +1867,8 @@ def test_sub_loop_depth_profile_omitted_keeps_guard_max_turns_unchanged():
         ctx = _ctx()   # scope_meta に depth_profile キー無し
         events = list(p._sub_agentic_loop(ctx))
         final = next(e for e in events if "final" in e)
-        assert captured["max_turns_calls"] == 1 and final["final"] == ""   # guard=1 のまま打ち切り
+        # guard=1 のまま打ち切り。DEPTH-2 S4b: 根拠があれば一次判断を1回だけ追加で要求する。
+        assert captured["max_turns_calls"] == 2 and final["final"] == ""
     finally:
         A._post = orig
 
@@ -1859,9 +1922,13 @@ def test_stop_event_already_set_before_tool_loop_skips_everything():
         p._sub = dict(_SUB)
         ctx = _ctx(stop_event=stop_event)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
-        assert [e["id"] for e in events] == ["understand", "intent", "search-helper"]
+        assert [e["id"] for e in events if e.get("type") == "node"] == [
+            "understand", "intent", "search-helper"]
         assert calls == [] and p.stream_called is False
-        assert not any(e.get("type") in ("answer_delta", "_result") for e in events)
+        assert not any(e.get("type") == "answer_delta" for e in events)
+        # DEPTH-2 S5: 標準（0 巡＝巡ループを回さない）の停止は従来どおり未完了回答を返さない
+        # （"stopped" 終端＝保存する未完了回答は巡を回した経路だけ）。
+        assert not [e for e in events if e.get("type") == "_result"]
     finally:
         A._post = orig
 
@@ -1893,7 +1960,8 @@ def test_stop_event_set_between_gate_and_synthesis_skips_stream_call(monkeypatch
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert p.stream_called is False
         assert not any(e.get("type") == "answer_delta" for e in events)
-        assert not any(e.get("type") == "_result" for e in events)   # acc 空・停止済み＝plain return
+        # acc 空・停止済み・標準（0 巡）＝未完了回答は返さない（従来どおり assistant 未保存）。
+        assert not [e for e in events if e.get("type") == "_result"]
     finally:
         _restore_post(orig)
 
@@ -2033,6 +2101,7 @@ def test_metering_records_usage_across_rejected_ask_user_turn(monkeypatch):
              "arguments": '{"prompt":"どちら？","mode":"single","options":[{"label":"A"},{"label":"B"}]}'}}]}}],
          "prompt_eval_count": 3, "eval_count": 1},
         {"choices": [{"message": {"content": "LOCAL"}}]},
+        {"choices": [{"message": {"content": '{"claims": []}'}}]},
     ]
     orig = _install_post(seq)
     recorded = []
@@ -2050,7 +2119,9 @@ def test_metering_records_usage_across_rejected_ask_user_turn(monkeypatch):
         assert kind == "chat-sub" and provider == "ollama"
         assert usage == {"input_tokens": 7, "cached_input_tokens": 0, "output_tokens": 3,
                          "reasoning_output_tokens": 0}
-        assert kw["calls"] == 3   # ripgrep成功 + ask_user拒否（_post自体は成功）+ 最終ターンの3回
+        # ripgrep成功 + ask_user拒否（_post自体は成功）+ 最終ターン + 一次判断の要求（深さに
+        # 依らず発行される）の4回。
+        assert kw["calls"] == 4
     finally:
         _restore_post(orig)
 
@@ -2380,7 +2451,11 @@ def test_agentic_run_plan_reclassifies_stop_reason_on_synthesis_truncation(monke
     再分類を受けていなかった——清書呼び出し（`self._stream`）が出力上限で打ち切られても
     （`completion.reason == "length"`）、Evidence Packet の `stop_reason` はサブループ側が確定した
     値（例: `plan_completed`）のまま＝画面は「完了」に見えていた。プラン清書の後にも再分類を
-    適用したので、既知の打ち切り（length→truncated）が反映される。"""
+    適用したので、既知の打ち切り（length→truncated）が反映される。DEPTH-2 S2（§2.7）: `length` は
+    追記継続の対象になるため、この再分類テストの関心と混ざらないよう継続は無効化する
+    （`SHERPA_CODEX_AUTO_CONTINUE=0`）。"""
+    monkeypatch.setenv("SHERPA_CODEX_AUTO_CONTINUE", "0")
+
     class _TruncatedSynth(_FakeSynth):
         def _stream(self, prompt, completion=None):
             self._synth_prompts.append(prompt)
@@ -2431,7 +2506,7 @@ def test_agentic_run_stop_reason_unknown_when_synthesis_raises(monkeypatch):
             yield "1デルタ目"
             raise RuntimeError("synthesis boom")
 
-    def fake_sub_agentic_loop(ctx):
+    def fake_sub_agentic_loop(ctx, request_claims=True):
         yield {"final": "LOCAL DRAFT (discarded)", "docs": {"doc.md"}, "searched": True,
               "cites": [], "cards": [], "has_structural_evidence": True,
               "stop_reason": "evaluation_sufficient"}
@@ -2488,3 +2563,143 @@ def test_fold_sub_usage_sums_elapsed_independently_of_unknown_tokens():
     acc = {"calls": 0, "tokens": None}
     list(_timed_usage(iter([{"node": 1}, {"final": ""}]), acc))
     assert isinstance(acc.get("elapsed_ms"), int) and acc["elapsed_ms"] >= 0
+
+
+# ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
+# worker の一次判断は final_synthesis=False（下調べ役）経路だけに関わる =====
+
+def test_no_worker_path_output_unchanged_by_depth2_s4b():
+    """(4) 下調べ役なし（標準・`self._sub is None`・通常の `_agentic_loop`・`final_synthesis=True`）の
+    経路は DEPTH-2 S4b で一切変わらない——`_post` 呼び出し回数もそのまま（一次判断の要求は
+    `final_synthesis=False` の下調べ役経路にしか無い）。"""
+    calls = []
+
+    def fake_post(url, headers, body, timeout=90):
+        calls.append(1)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
+        return {"choices": [{"message": {"content": "LOCAL"}}]}
+
+    orig = A._post
+    A._post = fake_post
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        assert p._sub is None
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        result = next(e for e in events if e.get("type") == "_result")
+        assert result["env"]["headline"] == "LOCAL"
+        assert "claims" not in result["env"]["data"]
+        assert len(calls) == 2   # 通常ループのツール呼び出し1回＋自然完了1回のみ（追加呼び出し無し）
+    finally:
+        A._post = orig
+
+
+def test_worker_claims_request_stop_yields_no_final_payload():
+    """RV #20 是正: 一次判断（claims）の要求を送信する直前に停止要求が来ると `_send` が
+    `_SendAborted("stop")` を送出する——他の送信点（最終合成・再合成）と同じ契約で final を
+    一切 yield せず終わる（`claims_raw=None` に倒して payload を出す旧経路は budget_exceeded
+    専用であり、利用者の停止では使わない）。"""
+    stop_event = threading.Event()
+    call_n = [0]
+
+    def fake_post(url, headers, body, timeout=90):
+        call_n[0] += 1
+        if call_n[0] == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]}
+        if call_n[0] == 2:
+            stop_event.set()   # 散文終了の直後・claims 要求の送信前に停止要求が来た、を模す
+            return {"choices": [{"message": {"content": "LOCAL DRAFT (discarded)"}}]}
+        raise AssertionError("停止後は claims 要求を送信してはならない")
+
+    orig = A._post
+    A._post = fake_post
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        ctx = _ctx(stop_event=stop_event)
+        events = list(p._sub_agentic_loop(ctx))
+        assert not any("final" in e for e in events)   # 既存の「停止時は final を出さない」契約と同型
+    finally:
+        A._post = orig
+
+
+# ===== 頭脳自身が worker（`search_helper.self_worker`）のときの確認カード・案内文言 =====
+
+def _self_sub() -> dict:
+    """`get_provider` が `search_helper` 空のときに据えるのと同じ worker（頭脳自身）。"""
+    from sherpa import search_helper
+    return search_helper.self_worker("openai", "gpt-5.5", key="sk-dummy")
+
+
+def test_self_worker_offers_ask_user_and_reaches_question_terminal():
+    """頭脳自身が worker のとき、確認カードの終端（`TERMINALS` の "question"）へ到達できる
+    ——別モデルの worker と違い「サブ経路の生成文を公式カードにしない」理由が当たらないため、
+    ツール定義配列に `ask_user` を載せ `can_ask` も通常経路と同じ判定にする。"""
+    offered = []
+
+    def fake_post(url, headers, body, timeout=90):
+        offered.append([t["function"]["name"] for t in body.get("tools", [])])
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ask_user",
+                                      "arguments": '{"question": "どの期を対象にしますか", "options": ["4期"]}'}}]}}]}
+
+    orig = A._post
+    A._post = fake_post
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        ctx = _ctx()
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+    finally:
+        A._post = orig
+    assert "ask_user" in offered[0], f"ツール定義配列に ask_user が無い: {offered[0]}"
+    questions = [e for e in events if e.get("type") == "question"]
+    assert len(questions) == 1, f"確認カードが1回だけ出ていない: {len(questions)}"
+    assert not any(e.get("type") == "_result" for e in events)
+
+
+def test_self_worker_does_not_offer_ask_user_on_confirm_resend():
+    """確認ID 付きの再送では頭脳自身の worker でも `ask_user` を載せない（再質問ループの
+    構造的ガード＝`_can_ask` と同じ判定を通す）。"""
+    offered = []
+
+    def fake_post(url, headers, body, timeout=90):
+        offered.append([t["function"]["name"] for t in body.get("tools", [])])
+        return {"choices": [{"message": {"content": "LOCAL"}}]}
+
+    orig = A._post
+    A._post = fake_post
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        ctx = _ctx(message="確認ID: abc / 4期でお願いします")
+        with contextlib.suppress(RuntimeError):   # 検索0件で終わる応答＝ツール定義配列だけを見る
+            list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+    finally:
+        A._post = orig
+    assert offered and "ask_user" not in offered[0], f"再送で ask_user が載っている: {offered[0]}"
+
+
+def test_self_worker_failure_note_does_not_tell_user_to_turn_helper_off():
+    """頭脳自身が worker の構成には「OFF にできる下調べ機能」が無い——調査が失敗したときの
+    案内に実行できない指示（下調べ機能を OFF にする）を出さない。"""
+    def fake_post(url, headers, body, timeout=90):
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search",
+                                      "arguments": '{"query":"ZZZ-NO-SUCH-TOKEN-ZZZ"}'}}]}}]}
+
+    orig = A._post
+    A._post = fake_post
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        events = list(p.run(_ctx()))
+    finally:
+        A._post = orig
+    env = next(e for e in events if e.get("type") == "_result")["env"]
+    assert env.get("agentic_failure"), f"失敗の印が無い: {env}"
+    assert "OFF" not in env["headline"], f"実行できない案内が残っている: {env['headline']}"
+    assert "質問を具体的に" in env["headline"], env["headline"]

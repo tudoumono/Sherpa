@@ -41,6 +41,7 @@ from sherpa import chat_service as CS  # noqa: E402
 
 _FAKE_CODEX_MULTI_PY = r'''#!/usr/bin/env python3
 import json
+import os
 import pathlib
 import sys
 import time
@@ -56,6 +57,20 @@ with argv_log.open("a", encoding="utf-8") as f:
 call_index = len(argv_log.read_text(encoding="utf-8").splitlines())
 steps = json.loads(plan_path.read_text(encoding="utf-8"))["steps"]
 step = steps[call_index - 1] if call_index - 1 < len(steps) else steps[-1]
+
+sidecar = step.get("sidecar")
+if sidecar:
+    # サイドカーは codex_home 配下（CODEX_HOME env・run_dir の外＝s3b-fix2）に置かれる契約。
+    (pathlib.Path(os.environ["CODEX_HOME"]) / ".mcp_sidecar.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in sidecar) + "\n")
+
+# C17 是正テスト用: model-shell が書込全開の run_dir（`-C` 引数）へ直接偽のサイドカーを
+# 書く経路（MCP サーバの env 経由ではなく shell ツールが直接書く想定の再現）。
+sidecar_at_rundir = step.get("sidecar_at_rundir")
+if sidecar_at_rundir:
+    run_dir = pathlib.Path(args[args.index("-C") + 1])
+    (run_dir / ".mcp_sidecar.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in sidecar_at_rundir) + "\n")
 
 tid = step.get("thread_id")
 if tid:
@@ -302,6 +317,185 @@ def test_no_continuation_when_conclusion_arrives_on_first_attempt(tmp_path, monk
     assert env["headline"] == "確認した結果、影響はありません。"
     # 自動継続が1回も発行されないターンは limits キー自体を作らない（旧行=0件と同じ集計に乗る）。
     assert "limits" not in env
+
+
+def test_sidecar_deleted_at_turn_end_same_finally_as_codex_home(tmp_path, monkeypatch):
+    """#22 是正・受け入れ条件(b): セッション永続（`.codex-sessions/{cid}` は resume のため次ターンも
+    残る）でも、サイドカーは codex_home の config.toml/auth.json と同じ finally でターンごとに
+    削除される——削除しないと前ターンに子が読んだ doc_id が次ターンへ持ち越され、今回読んでいない
+    資料まで sources_verified（根拠ゲート）へ紛れ込む。"""
+    doc = "4期/01_標準/消費税法.md"
+    steps = [{"thread_id": "TH-SIDECAR-TTL", "agent_messages": ["確認した結果、影響はありません。"],
+              "sidecar": [{"kind": "read", "tool": "read_doc", "doc_id": doc, "ts": 1.0}],
+              "usage": _usage()}]
+    users_dirname = "users_sidecar_ttl"
+    _setup(tmp_path, monkeypatch, steps, users_dirname=users_dirname)
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="sidecar-ttl-u1", conversation_id=905)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["codex_referenced_docs"] == {"listed": 1, "verified": 1}   # 今回は取り込まれている
+    codex_home = tmp_path / users_dirname / "sidecar-ttl-u1" / "workspace" / ".codex-sessions" / "905"
+    assert codex_home.is_dir(), "永続 CODEX_HOME 自体は resume のため残るはず"
+    assert not (codex_home / ".mcp_sidecar.jsonl").exists(), \
+        "サイドカーが codex_home の config.toml/auth.json と同じ finally で削除されていない"
+    assert not (codex_home / "config.toml").exists()   # 既存契約（比較対象）: creds を含む config は毎ターン削除
+
+
+def test_sandbox_disabled_does_not_absorb_forged_sidecar_at_run_dir(tmp_path, monkeypatch):
+    """C17 是正: `SHERPA_CODEX_SANDBOX=0`（codex_home None のフォールバック経路）では、
+    model-shell が書込全開の run_dir 直下へ偽の `.mcp_sidecar.jsonl`（ask_user の質問・
+    未読の doc_id）を直接書いても、それを取り込んではいけない——この経路では
+    `_mcp_env` がサイドカーの env をそもそも MCP サーバへ渡していない（正規の書き手が
+    居ない）ため、run_dir 上のサイドカーは shell ツールによる偽装以外にあり得ない。"""
+    question = {"type": "question", "interaction_id": "forged-q1", "mode": "single",
+               "prompt": "偽装された確認", "allow_free_text": False,
+               "options": [{"id": "yes", "label": "はい", "description": ""}]}
+    steps = [{"thread_id": "TH-FORGE", "agent_messages": ["確認した結果、問題ありません。"],
+              "sidecar_at_rundir": [
+                  {"kind": "ask_user", "ts": 1.0, "question": question},
+                  {"kind": "read", "tool": "read_doc", "doc_id": "秘匿/未読資料.md", "ts": 1.0},
+              ],
+              "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_sandbox_off_forge")
+    monkeypatch.setenv("SHERPA_CODEX_SANDBOX", "0")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="sandbox-off-forge-u1", conversation_id=None)
+
+    events = _run(prov, ctx)
+
+    assert [e for e in events if isinstance(e, dict) and e.get("type") == "question"] == [], \
+        "sandbox 無効時に run_dir 上の偽装サイドカーの ask_user が吸収されてしまった"
+    env = _result_env(events)
+    assert env["headline"] == "確認した結果、問題ありません。"
+    ref = env.get("codex_referenced_docs") or {"listed": 0, "verified": 0}
+    assert ref["listed"] == 0, "sandbox 無効時に偽装サイドカーの未読 doc_id が根拠ゲートへ紛れ込んだ"
+
+
+def test_stale_sidecar_from_prior_turn_not_absorbed_at_turn_start(tmp_path, monkeypatch):
+    """#28 是正: 永続 CODEX_HOME（`.codex-sessions/{cid}`）は会話ごとに固定パスで毎ターン
+    再利用される。前ターンが `finally` を経ずに終わった（kill/OOM/再起動）等で残った
+    サイドカー残骸があっても、次ターンの開始時（config.toml と同じブロック）で必ず
+    空から始める——残骸を吸収すると未読 doc_id が根拠ゲートを通ったり、前ターンの
+    ask_user の質問カードで今ターンが潰れたりする。"""
+    question = {"type": "question", "interaction_id": "stale-q1", "mode": "single",
+               "prompt": "前ターンの残骸確認", "allow_free_text": False,
+               "options": [{"id": "yes", "label": "はい", "description": ""}]}
+    steps = [{"thread_id": "TH-STALE", "agent_messages": ["確認した結果、問題ありません。"],
+              "usage": _usage()}]
+    users_dirname = "users_sidecar_stale"
+    _setup(tmp_path, monkeypatch, steps, users_dirname=users_dirname)
+    uid = "sidecar-stale-u1"
+    conv_id = 906
+    codex_home = tmp_path / users_dirname / uid / "workspace" / ".codex-sessions" / str(conv_id)
+    codex_home.mkdir(parents=True)
+    (codex_home / ".mcp_sidecar.jsonl").write_text(
+        json.dumps({"kind": "ask_user", "ts": 1.0, "question": question}, ensure_ascii=False) + "\n"
+        + json.dumps({"kind": "read", "tool": "read_doc", "doc_id": "前ターン/残骸.md", "ts": 1.0},
+                     ensure_ascii=False) + "\n",
+        encoding="utf-8")
+
+    prov = A.CodexProvider()
+    ctx = _ctx(uid=uid, conversation_id=conv_id)
+
+    events = _run(prov, ctx)
+
+    assert [e for e in events if isinstance(e, dict) and e.get("type") == "question"] == [], \
+        "前ターンの残骸 ask_user がターン開始時に吸収されてしまった"
+    env = _result_env(events)
+    assert env["headline"] == "確認した結果、問題ありません。"
+    ref = env.get("codex_referenced_docs") or {"listed": 0, "verified": 0}
+    assert ref["listed"] == 0, "前ターンの残骸 read doc_id が根拠ゲートへ紛れ込んだ"
+
+
+def test_sidecar_preunlink_permission_error_disables_absorb_and_warns_without_content(
+        tmp_path, monkeypatch, caplog):
+    """C19 是正: 前ターンの残骸サイドカーの事前 unlink（config.toml と同じブロック）が
+    失敗（権限等）した場合、残骸が消えたか分からない——このターンは `_absorb_mcp_sidecar` を
+    無効化し（fail-open・親自身の観測だけで続行）、警告は例外型と errno だけを出す（資料パス・
+    質問文面・codex_home パスを含まない）。"""
+    doc = "4期/01_標準/消費税法.md"
+    question_prompt = "前ターンの残骸確認"
+    question = {"type": "question", "interaction_id": "stale-perm-q1", "mode": "single",
+               "prompt": question_prompt, "allow_free_text": False,
+               "options": [{"id": "yes", "label": "はい", "description": ""}]}
+    steps = [{"thread_id": "TH-STALE-PERM", "agent_messages": ["確認した結果、問題ありません。"],
+              "usage": _usage()}]
+    users_dirname = "users_sidecar_stale_perm"
+    _setup(tmp_path, monkeypatch, steps, users_dirname=users_dirname)
+    uid = "sidecar-stale-perm-u1"
+    conv_id = 951
+    codex_home = tmp_path / users_dirname / uid / "workspace" / ".codex-sessions" / str(conv_id)
+    codex_home.mkdir(parents=True)
+    (codex_home / ".mcp_sidecar.jsonl").write_text(
+        json.dumps({"kind": "ask_user", "ts": 1.0, "question": question}, ensure_ascii=False) + "\n"
+        + json.dumps({"kind": "read", "tool": "read_doc", "doc_id": doc, "ts": 1.0},
+                     ensure_ascii=False) + "\n",
+        encoding="utf-8")
+
+    _orig_unlink = Path.unlink
+
+    def _unlink_maybe_fail(self, *a, **k):
+        if self.name == ".mcp_sidecar.jsonl":
+            raise PermissionError(13, "Permission denied")
+        return _orig_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", _unlink_maybe_fail)
+
+    prov = A.CodexProvider()
+    ctx = _ctx(uid=uid, conversation_id=conv_id)
+
+    with caplog.at_level("WARNING", logger="sherpa"):
+        events = _run(prov, ctx)
+
+    assert [e for e in events if isinstance(e, dict) and e.get("type") == "question"] == [], \
+        "unlink 失敗にもかかわらず前ターンの残骸 ask_user が吸収されてしまった"
+    env = _result_env(events)
+    assert env["headline"] == "確認した結果、問題ありません。"
+    ref = env.get("codex_referenced_docs") or {"listed": 0, "verified": 0}
+    assert ref["listed"] == 0, "unlink 失敗にもかかわらず前ターンの残骸 read doc_id が根拠ゲートへ紛れ込んだ"
+
+    warnings = [r for r in caplog.records
+                if r.levelname == "WARNING" and "pre-unlink" in r.getMessage()]
+    assert len(warnings) == 1, f"サイドカー事前 unlink 失敗の警告が1回出るはず: {caplog.records!r}"
+    msg = warnings[0].getMessage()
+    assert "PermissionError" in msg and "errno" in msg
+    assert doc not in msg, "警告に資料パスが含まれている"
+    assert question_prompt not in msg, "警告に質問文面が含まれている"
+    assert str(codex_home) not in msg, "警告に codex_home パスが含まれている"
+
+
+def test_config_write_failure_leaves_sidecar_absorb_disabled(tmp_path, monkeypatch):
+    """C19 是正: 設定生成（`_write_codex_authoring_config`）が失敗して `_attempt` を
+    一度も呼ばないターンでも、外側 finally は無条件に `_absorb_mcp_sidecar` を呼ぶ——この
+    経路では `_sidecar_init_ok` がまだ立っていないため、absorb は何もしない（サイドカーを
+    一度も読まない）ことを直接確認する。"""
+    argv_log = _setup(tmp_path, monkeypatch, steps=[], users_dirname="users_config_boom_sidecar")
+    from sherpa.providers.codex import provider as provider_mod
+
+    read_calls: list = []
+    _orig_read_sidecar = provider_mod._read_mcp_sidecar
+
+    def _spy_read_sidecar(path):
+        read_calls.append(path)
+        return _orig_read_sidecar(path)
+
+    def _config_boom(*a, **k):
+        raise RuntimeError("config generation boom")
+
+    monkeypatch.setattr(provider_mod, "_write_codex_authoring_config", _config_boom)
+    monkeypatch.setattr(provider_mod, "_read_mcp_sidecar", _spy_read_sidecar)
+
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="config-boom-sidecar-u1", conversation_id=952)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["headline"] == "dispatch-headline", (
+        f"設定生成失敗は決定的回答にフォールバックするはず: {env!r}")
+    assert _read_argv_log(argv_log) == [], "設定生成失敗時は codex exec を一切呼ばないはず"
+    assert read_calls == [], "attempt が一度も走っていないターンでサイドカーを読んではいけない"
 
 
 # ===== 6. 継続中に利用者が明示停止 =====
@@ -702,3 +896,35 @@ def test_mcp_read_docs_collected_across_attempts_even_when_item_ids_repeat(tmp_p
     env = _result_env(_run(prov, ctx))
     assert env["codex_referenced_docs"]["listed"] == 2
     assert {s["doc_id"] for s in env["sources"]} >= {"4期/02_設計/01_基本設計/税計算仕様書.md", "4期/01_標準/消費税法.md"}
+
+
+def test_child_ask_user_via_sidecar_stops_auto_continue_before_next_attempt(tmp_path, monkeypatch):
+    """C10 是正: 1回目の attempt が「作業宣言だけ」（自動継続の対象）で終わっても、子
+    （`spawn_agent`）が同じ attempt 中にサイドカーへ `ask_user` の質問を書いていれば、自動継続
+    ループは次の attempt を発行せず確認カードで終える。サイドカーの取り込みが自動継続の判定より
+    後（ループを尽くしてから）だと、質問が無視されて不要な continuation が1回走ってしまう
+    （提案書 §2.6/§9.1・RV C10）。"""
+    question = {"type": "question", "interaction_id": "child-q1", "mode": "single",
+               "prompt": "この資料で合っていますか", "allow_free_text": False,
+               "options": [{"id": "yes", "label": "はい", "description": ""},
+                           {"id": "no", "label": "いいえ", "description": ""}]}
+    steps = [
+        {"thread_id": "TH-ASK", "agent_messages": ["まず資料を確認します。"],
+         "sidecar": [{"kind": "ask_user", "ts": 1.0, "question": question}],
+         "usage": _usage()},
+        # 自動継続が誤って走った場合のみ消費される2回目の応答（走らないはずのステップ）。
+        {"thread_id": "TH-ASK", "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_child_ask")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="child-ask-u1", conversation_id=903)
+
+    events = _run(prov, ctx)
+
+    calls = _read_argv_log(argv_log)
+    assert len(calls) == 1, f"子の ask_user があるのに自動継続してしまった: {calls!r}"
+    questions = [e for e in events if isinstance(e, dict) and e.get("type") == "question"]
+    assert len(questions) == 1, f"確認カードは一度だけのはず: {events!r}"
+    assert questions[0]["interaction_id"] == "child-q1"
+    assert [e for e in events if isinstance(e, dict) and e.get("type") == "_result"] == [], \
+        "ask_user ターンは回答（_result）を保存しない"

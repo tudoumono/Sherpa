@@ -4,10 +4,11 @@
 `messages.answer.stop_kind` に保存する8値の閉じた語彙と、複数の判定源（API 経路の
 `evidence_packet.stop_reason`・Codex 経路の `codex_stopped_early`/`codex_silent_failure`・
 `provider.run()` が例外で落ちて honest failure 本文になる経路の例外型）からの導出を
-1箇所に集約する（唯一の真実源）。`stopped_by_user` は監査 `chat.turn`（`detail.stopped`）から
-別途集計するだけで、この列挙自体が `messages.answer.stop_kind` に保存されることはない
-（利用者の明示停止は assistant メッセージを保存しない契約・`chat_service.py::stream_message`/
-`handle_message` の stopped 分岐参照）。
+1箇所に集約する（唯一の真実源）。`stopped_by_user` は、巡ループの停止終端（`providers/base.py`
+の "stopped"＝コードで組んだ未完了回答を保存する）のターンだけ `messages.answer.stop_kind` に
+保存される。それ以外の停止は従来どおり assistant を保存せず（`chat_service.py::stream_message`/
+`handle_message` の stopped 分岐）、監査 `chat.turn`（`detail.stopped`）から別途集計する——
+利用統計の分布では二重に数えないよう、`stopped_by_user` は常に停止ターン側だけで数える。
 
 `sherpa.chat_service`（`_finalize` が `resolve()` を呼ぶ）・`sherpa.providers.codex.provider`
 （silent failure 分岐が env に印を立てる・値の解釈はしない）・`sherpa.routers.chat`
@@ -95,6 +96,8 @@ def resolve(env: dict) -> str | None:
     いないターン）・(b) `agentic_failure="error"`（honest failure の定型文で終わったターン＝
     `chat_service._no_genuine_results` が列挙する経路: 未接続/無効 AI・下調べ役の失敗/設定不正・
     Codex の範囲限定不可/直読準備失敗・必須ツール不達・固定文言の縮退・素の会話の定型文。
+    加えて、下調べ役なしの巡で主張構造からの清書が未完了（終端未受信/出力上限）のまま実本文を
+    保存した通常終端も同じ印を立てる＝完了として数えない。
     例外型は `_result` まで運ばれないため通信/その他を区別できない）。`agentic_failure="insufficient"`（メイン査読が根拠不足と判定した honest failure）
     は `no_evidence`、`"timeout"`／`"transport_error"`（素の会話でストリーム例外の型から
     `from_exception` が導けた場合）はその値。
@@ -119,6 +122,10 @@ def resolve(env: dict) -> str | None:
 def _resolve_kind(env: dict) -> str | None:
     if env.get("busy"):
         return None
+    if env.get("stopped_by_user"):
+        # DEPTH-2 S5: 利用者の停止で打ち切った未完了回答（`providers/base.py` の "stopped" 終端）。
+        # 本文はコードで組んだ未完了回答＝完了として数えない。
+        return "stopped_by_user"
     if env.get("codex_silent_failure"):
         return "codex_silent"
     if env.get("codex_stopped_early"):

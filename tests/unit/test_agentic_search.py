@@ -3649,8 +3649,8 @@ def test_gemini_ask_user_stub():
 
 @pytest.mark.parametrize("profile", ["standard", "deep", "max"])
 def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, profile):
-    """`_agentic_loop` は `ctx.scope_meta["depth_profile"]` の倍率を `openai_style` の
-    `max_turns`/`max_hits`/`window_cap` へ渡す（既定 `standard` は倍率×1＝env 既定値のまま）。"""
+    """DEPTH-2 S7: `_agentic_loop` が `openai_style` へ渡す `max_turns`/`max_hits`/`window_cap`
+    は `ctx.scope_meta["depth_profile"]` に依らず基準値のまま（倍率は撤去）。"""
     from sherpa.agents import Ctx, OpenAIProvider
     from sherpa import depth_profile as D
     captured = {}
@@ -3673,7 +3673,8 @@ def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, pro
 
 
 def test_openai_provider_agentic_loop_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）。"""
+    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）。
+    DEPTH-2 S7 以降、深さ（"deep"）は基準値に効かない。"""
     from sherpa.agents import Ctx, OpenAIProvider
     captured = {}
 
@@ -3689,12 +3690,12 @@ def test_openai_provider_agentic_loop_honors_system_settings_base_override(monke
               scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"},
               make_sources=lambda docs: [])
     list(p._agentic_loop(ctx))
-    assert captured.get("max_turns") == 10   # 5（基準値上書き）×2（深く）
+    assert captured.get("max_turns") == 5   # 5（基準値上書き）のみ・深くによる倍率は無し
 
 
-def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_times_multiplier(monkeypatch):
-    """管理画面の基準値編集が Field 上限いっぱい（例: grep ヒット上限1000・読み取り窓400）でも、
-    調べる深さ「最大」との組み合わせで既存の絶対上限を超えない。"""
+def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_over_limit(monkeypatch):
+    """DEPTH-2 S7: 倍率は撤去したが、管理画面の基準値編集が既存の絶対上限を超える値
+    （grep ヒット上限1500・読み取り窓600）でも、最終的に既存の絶対上限でクランプされる。"""
     from sherpa.agents import Ctx, OpenAIProvider
     captured = {}
 
@@ -3704,19 +3705,20 @@ def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_times_multiplier
 
     monkeypatch.setattr(A, "openai_style", fake_openai_style)
     p = OpenAIProvider("sk-dummy", "gpt-5.5", system_settings={
-        "depth_base_grep_max_hits": 1000, "depth_base_read_window": 400})
+        "depth_base_grep_max_hits": 1500, "depth_base_read_window": 600})
     ctx = Ctx(message="質問", world="v1", knowledge=True,
               route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
               dispatch=lambda lens, inp: {},
               scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "max"},
               make_sources=lambda docs: [])
     list(p._agentic_loop(ctx))
-    assert captured.get("max_hits") == A.MAX_HITS_ABS_MAX      # 2000 ではなく 1000
-    assert captured.get("window_cap") == A.READ_WINDOW_ABS_MAX  # 800 ではなく 400
+    assert captured.get("max_hits") == A.MAX_HITS_ABS_MAX      # 1500 ではなく 1000（絶対上限）
+    assert captured.get("window_cap") == A.READ_WINDOW_ABS_MAX  # 600 ではなく 400（絶対上限）
 
 
 def test_ollama_provider_agentic_loop_scales_with_depth_profile(monkeypatch):
-    """`OllamaProvider._agentic_loop` も OpenAIProvider と同じ倍率計算を openai_style へ渡す。"""
+    """DEPTH-2 S7: `OllamaProvider._agentic_loop` も OpenAIProvider と同じく、深さに依らず
+    基準値のまま openai_style へ渡す（倍率は撤去）。"""
     from sherpa.agents import Ctx, OllamaProvider
     from sherpa import depth_profile as D
     captured = {}
@@ -5806,7 +5808,8 @@ def test_impact_lens_uses_agentic_tool_loop():
     従来は `run()` の分岐が impact を除外しており、Neo4j を1回引くだけで終わっていた。
     グラフが 0 件だと「根拠なし」で終わってしまい、自前 grep を続ける Codex と差が出ていた。
     ここでは「impact でも `_agentic_loop` が呼ばれ、引用付きの envelope が返る」ことを固定する
-    （author だけは agentic_search 未対応ツールのため従来どおり単発取得）。
+    （DEPTH-2 S2・§2.7: author も既定構成（検索アシスタント／計画なし）では同じ `_agentic_loop`
+    へ接続される——`write_output_file` ツールがこのループにだけ実装されているため）。
 
     world/doc_id は fixtures/corpus/v1 実在ファイル（EXT-2 機械検証が既定 ON のため、実在しない
     doc を指す citation は Committed Evidence から落ちる。テストの関心はルーティング＝
@@ -5841,7 +5844,7 @@ def test_impact_lens_uses_agentic_tool_loop():
 
     seen.clear()
     list(_P().run(_ctx("author")))
-    assert seen == [], "author は従来どおり単発取得のまま（agentic_search 未対応ツール）"
+    assert seen == ["agentic"], "author も既定構成では反復ツール検索を通るはず（DEPTH-2 S2）"
 
 
 # ===== TOOLREAD: read_doc/doc_outline（土台系・新設） =====
@@ -8124,3 +8127,19 @@ def test_usage_return_limit_caps_nested_series_in_overview():
     assert out["daily"][-1] == daily[-1]            # 直近側を残す
     assert out["users"] == [{"uid": "u", "turns": 1}]   # 系列でないリストは触らない
     assert out["truncated"] is True and out["omitted_count"] == 20
+
+
+def test_render_existing_claims_for_prompt_keeps_all_ids_over_budget():
+    from sherpa import agentic_search as A
+    claims = [
+        {"id": "c1", "status": "confirmed", "text": "x" * 500},
+        {"id": "c2", "status": "inferred", "text": "後続の主張"},
+    ]
+    out = A._render_existing_claims_for_prompt(claims, max_bytes=200)
+    assert len(out.encode("utf-8")) <= 200
+    assert "[c1]" in out and "[c2]" in out                    # 全件の id を保持
+    assert "confirmed" in out and "inferred" in out            # 全件の status を保持
+    lines = out.split("\n")
+    assert any(line.startswith("[c2]") for line in lines)      # c2 行が丸ごと残る（途中で切れない）
+    for line in lines:
+        assert line.count("[") == 0 or "]" in line             # id が途中で切れていない

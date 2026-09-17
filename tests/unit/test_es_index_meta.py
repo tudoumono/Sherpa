@@ -2489,8 +2489,9 @@ def test_es_search_size_stays_50_when_env_set_to_30():
 
 
 # ---- k_ceiling で `_ES_SEARCH_K_MAX`（既定 50）の再クランプを迂回する ----
-# `agentic_search.run_tool` の es_search 分岐が、調べる深さ（depth_profile）で計算した実効値
-# （既定構成でも「最大」は 30×2=60 に達し、50 の床を超えうる）を渡すための経路。
+# `agentic_search.run_tool` の es_search 分岐が、調べる深さ（depth_profile）の実効基準値
+# （管理画面の基準値編集で 50 の床を超える値に設定されうる。DEPTH-2 S7 以降、深さによる
+# 倍率は撤去済みだが基準値自体は超えうる）を渡すための経路。
 
 def _es_size_capture_script_with_k_ceiling(k: int, k_ceiling) -> str:
     return (

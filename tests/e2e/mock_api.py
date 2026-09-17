@@ -1147,6 +1147,8 @@ SYSTEM_SETTINGS_VIEW = {
     # 埋め込み HTTP の同時送信数。既定（未設定）は
     # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
+    # 「最大」の深さが許す査読の巡数（`sherpa/depth_profile.py::MAX_REVIEW_ROUNDS_DEFAULT`＝7）。
+    "max_review_rounds": {"configured": None, "effective": 7, "default": 7},
     "chat_max_turns": {
         "per_user": {"configured": None, "effective": 2, "default": 2},
         "global": {"configured": None, "effective": 8, "default": 8},
@@ -1512,6 +1514,7 @@ def _mock_validate_openai_endpoint_cross(kind: str, base_url: str) -> str | None
 _DEPTH_BASE_INT_BOUNDS = {
     "agentic_max_tools_per_turn": (1, 256),
     "embed_parallel": (1, 16),
+    "max_review_rounds": (1, 32),
     "depth_base_max_turns": (1, 200),
     "depth_base_grep_max_hits": (1, 1000),
     "depth_base_qa_max_hits": (1, 1000),
@@ -1961,6 +1964,11 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 parallel = view["embed_parallel"]
                 parallel["configured"] = value
                 parallel["effective"] = value if value is not None else parallel["default"]
+            if "max_review_rounds" in body:
+                value = body["max_review_rounds"]
+                rounds = view["max_review_rounds"]
+                rounds["configured"] = value
+                rounds["effective"] = value if value is not None else rounds["default"]
             # 同時実行の上限（簡易反映・null は default へ戻す・depth_profile と同型）。
             if "chat_max_turns" in view:
                 for _key, _put in (("per_user", "chat_max_turns_per_user"),

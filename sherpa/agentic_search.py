@@ -120,9 +120,9 @@ SHERPA_AGENTIC_KEEP_RECENT_TOOLS = _env_int("SHERPA_AGENTIC_KEEP_RECENT_TOOLS", 
 # grep/es_search 1回あたりのヒット数上限。精度優先で広げるほど根拠を落としにくくなる代わりに
 # LLM への送信トークンが増える。
 MAX_HITS = _env_int("SHERPA_GREP_MAX_HITS", 30, 1, 1000)
-# `MAX_HITS` の env-parse hi 引数と同じ値。調べる深さ（`depth_profile.scaled_ratio`）が倍率適用後に
-# 一度だけ適用する絶対上限として grep/ES 双方に共有する——管理画面の基準値編集（Field 上限まで）と
-# 調べる深さ「最大」（×2）の組み合わせで無制限に伸びるのを防ぐ。
+# `MAX_HITS` の env-parse hi 引数と同じ値。調べる深さに依らず一定の実効基準値
+# （`depth_profile.scaled_ratio`・DEPTH-2 S7 以降は倍率無し）に対して一度だけ適用する絶対上限として
+# grep/ES 双方に共有する——管理画面の基準値編集（Field 上限まで）でも無制限に伸びるのを防ぐ。
 MAX_HITS_ABS_MAX = 1000
 # read_around の精読窓（行数）。広げるほど1回の読み込みで前後文脈を多く拾える。read_around 本体の
 # LLM 入力窓ハード上限（下記 `window = max(1, min(window, max(200, READ_WINDOW)))`）はこの値が
@@ -1434,6 +1434,223 @@ _PARAMS_FILE_HEAD = {"type": "object", "properties": {
     "max_bytes": {"type": "integer", "description": "読む最大バイト数（既定65536）"}},
     "required": ["doc_id"]}
 
+# ---- 作成系（author）の成果物ファイル: DEPTH-2 S2（§2.7）----
+# 個人 workspace（本人のみ・grep 対象・RAG には索引化しない）へ保存する——共有 KB とは無関係。
+# Codex（`providers/codex/provider.py` の run_dir 差分検出）と同じ台帳（`personal_workspace_files`）
+# 台帳へ登録し、同じ成果物カード（`env["created_files"]`）で見せる。
+_DESC_WRITE_OUTPUT_FILE = (
+    "作成した文書を個人の作業スペースに保存し、ダウンロードできるようにする"
+    "（作成系の依頼でファイルを納品するときに使う。調査・質問の回答には使わない）。"
+    "filename（拡張子つきの単純なファイル名・フォルダ区切り不可）と content（保存する内容の全文）を渡す。"
+    "同名ファイルが既にあれば自動的に別名で保存する（上書きしない）。"
+    "Markdown を marp のスライド形式（先頭に `---\\nmarp: true\\n---` のfront-matter）で書いたときは"
+    "marp:true も渡すと PDF/PowerPoint も自動生成される（それ以外の拡張子・marp 形式でない Markdown では無視）。"
+    "保存できたら rel_path と download_url を返す——最終回答の最後に作成したファイル名と内容の要約を書くこと。"
+    "保存できなかったときは error に理由が入る（内容は保存されていない）。")
+_PARAMS_WRITE_OUTPUT_FILE = {"type": "object", "properties": {
+    "filename": {"type": "string",
+                "description": "保存するファイル名（拡張子つき・フォルダ区切り不可・例 '消費税率一覧.md'）"},
+    "content": {"type": "string", "description": "保存する内容（テキスト全文）"},
+    "marp": {"type": "boolean",
+            "description": "true のとき、この Markdown を marp スライドとして PDF/PowerPoint も生成する（既定false）"}},
+    "required": ["filename", "content"]}
+
+# 保存できる内容の上限（新規ツールの安全弁・DoS 対策。既存の清書予算/回数上限の流用対象ではない
+# ＝§2.7 の「回数上限は既存の清書予算の値を流用」は追記継続の話で、本upperは別の懸念）。
+_WRITE_OUTPUT_FILE_MAX_BYTES = _env_int("SHERPA_WRITE_OUTPUT_FILE_MAX_BYTES", 2_000_000, 1024, 20_000_000)
+_SAFE_OUTPUT_FILENAME_RE = re.compile(r"^[^/\\\x00]{1,200}$")
+
+
+def _open_workspace_dir_fd(parent_fd: int, name: str) -> int:
+    """`parent_fd` 配下の `name` ディレクトリを、無ければ作成したうえで symlink を追わずに開いて
+    dir_fd を返す（C42 是正）。`name` が symlink（この呼び出しの直前に差し替えられた場合を含む）
+    なら `O_NOFOLLOW` で ELOOP となり、呼び出し元へ OSError が伝播する——一度開いた fd は
+    以後その名前がどう差し替えられても最初に開いた実ディレクトリを指し続けるため、後続の
+    階層をこの fd 基準で開けば途中の親の差替え（TOCTOU）に影響されない。
+    """
+    try:
+        os.mkdir(name, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+
+def _run_write_output_file(args: dict, uid: str | None) -> dict:
+    """`write_output_file` ツール本体（DEPTH-2 S2・§2.7）。
+
+    個人 workspace（`{SHERPA_USERS_DIR}/{uid}/workspace/files/`）へ保存し、Codex の created files
+    （`providers/codex/provider.py`）と**同じ台帳**（`store.record_workspace_file`・
+    `personal_workspace_files`）・**同じ TTL**（`SHERPA_WORKSPACE_TTL_DAYS`）へ登録する。
+    `marp: true` の Markdown は同じ `marp_render.render_outputs` 経路で pdf/pptx 化する。
+
+    fail-open/fail-closed の使い分け（Codex 経路と同じ区別を踏襲）: **台帳登録**（`record_workspace_file`）
+    の失敗は明示エラーを返し内容を保存しない（fail-closed 寄り）。**marp 変換**の失敗は注記だけで
+    継続する（.md 自体の保存は成功のまま・fail-open）。呼び出し元（`run_tool`）はどちらの場合も
+    例外を受け取らない契約——想定される失敗は必ず `{"error": ...}` を持つ dict で返し、調査ループ
+    全体（`openai_style`）を落とさない。
+    """
+    if not uid:
+        return {"error": "作成者が特定できないため保存できません（個人領域が未初期化です）"}
+    filename = str(args.get("filename") or "").strip()
+    if (not filename or not _SAFE_OUTPUT_FILENAME_RE.match(filename)
+            or filename in (".", "..") or "/" in filename or "\\" in filename):
+        return {"error": "filename が不正です（フォルダ区切りを含まない単純なファイル名を指定してください）"}
+    content = args.get("content")
+    if not isinstance(content, str):
+        return {"error": "content は文字列で渡してください"}
+    data = content.encode("utf-8")
+    if not data:
+        return {"error": "content が空です"}
+    if len(data) > _WRITE_OUTPUT_FILE_MAX_BYTES:
+        return {"error": f"内容が大きすぎます（上限 {_WRITE_OUTPUT_FILE_MAX_BYTES} バイト）"}
+    marp = bool(args.get("marp"))
+
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    from . import store
+    users_dir = Path(os.environ.get("SHERPA_USERS_DIR", "data/users")).resolve()
+    ws_files = users_dir / uid / "workspace" / "files"   # 表示・record_workspace_file 用（書込み自体は dir_fd 経由）
+
+    # C42（DEPTH-2 S2 是正）: C38 の「各階層が symlink でないか確認してから resolve() で照合する」
+    # 方式は、検査（stat/resolve）と実際の作成（open/write）の間に window があり、その間に
+    # 親（`uid_dir`・`ws_dir`）が他人の workspace への symlink へ差し替えられても検出できない
+    # （TOCTOU）。dir_fd による段階的オープンなら、各階層を「一度開いたら、その fd は以後どんな
+    # 名前差替えが起きても最初に開いた実ディレクトリを指し続ける」性質を使い、以降の名前解決を
+    # 一切パス文字列に頼らずに済ませられる——`uid`・`workspace`・`files` の各コンポーネントを
+    # 直前の fd を親として `O_NOFOLLOW` で個別に開く（symlink ならその場で ELOOP になり、
+    # 以降の階層は一切開かれない）。
+    try:
+        users_dir.mkdir(parents=True, exist_ok=True)   # 信頼済みの設定パス（`SHERPA_USERS_DIR`）自体は既存想定の外
+        fd_users = os.open(str(users_dir), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return {"error": "保存先を準備できませんでした"}
+    fd_uid = fd_ws = fd_files = -1
+    try:
+        fd_uid = _open_workspace_dir_fd(fd_users, uid)
+        fd_ws = _open_workspace_dir_fd(fd_uid, "workspace")
+        fd_files = _open_workspace_dir_fd(fd_ws, "files")
+    except OSError:
+        return {"error": "保存先が利用できません（管理者に確認してください）"}
+    finally:
+        os.close(fd_users)
+        if fd_uid >= 0:
+            os.close(fd_uid)
+        if fd_ws >= 0:
+            os.close(fd_ws)
+
+    try:
+        ttl_days = _env_int("SHERPA_WORKSPACE_TTL_DAYS", 90, 0, 3650)
+        expires = (datetime.now(timezone.utc) + timedelta(days=ttl_days)) if ttl_days > 0 else None
+        stem, suffix = Path(filename).stem or "output", Path(filename).suffix
+
+        def _write_and_register(name: str, raw: bytes) -> dict | None:
+            # `dir_fd=fd_files` の `O_EXCL|O_NOFOLLOW` で排他的に新規作成する——`name` という名前が
+            # 既に何か（通常ファイル・symlink のどちらでも）を指していれば、内容に関わらず作成自体が
+            # 失敗する（TOCTOU を作らない・「存在確認してから書く」の2手順に分けない）。`fd_files`
+            # は既に開いた実ディレクトリを指すため、`files` という名前がこの後どう差し替えられても
+            # 影響しない。
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+                             dir_fd=fd_files)
+            except OSError:
+                return None
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+            except OSError:
+                try:
+                    os.unlink(name, dir_fd=fd_files)
+                except OSError:
+                    pass
+                return None
+            try:
+                sha = hashlib.sha256(raw).hexdigest()
+                return store.record_workspace_file(uid, name, str(ws_files / name), len(raw), sha,
+                                                    expires_at=expires)
+            except Exception:
+                try:
+                    os.unlink(name, dir_fd=fd_files)   # 登録に失敗＝台帳の無い孤児を残さない（Codex 経路と同じ規律）
+                except OSError:
+                    pass
+                return None
+
+        def _name_occupied(name: str) -> bool:
+            # 別名候補選びの事前判定（最終防衛線は上の O_EXCL 作成）。symlink・通常ファイルの
+            # どちらでも「使用中」として次の連番へ回す（無言で上書き先を奪わない）。
+            try:
+                os.stat(name, dir_fd=fd_files, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return True
+            return True
+
+        row = None
+        i = 0
+        while i <= 10000:                            # 無限ループ防止（Codex 経路の同名回避と同じ上限）
+            rel = filename if i == 0 else f"{stem}_{i}{suffix}"
+            with store.workspace_file_lock(uid, rel):
+                if _name_occupied(rel) or not store.no_live_upload_for_path(uid, rel):
+                    i += 1
+                    continue
+                row = _write_and_register(rel, data)
+            break
+    finally:
+        os.close(fd_files)
+    if row is None:
+        return {"error": "保存中に登録へ失敗しました（内容は保存されていません）"}
+
+    result = {"rel_path": row["rel_path"], "download_url": f"/workspace/files/{row['id']}/download",
+              "bytes": len(data)}
+
+    if marp and Path(row["rel_path"]).suffix.lower() == ".md":
+        dst = ws_files / row["rel_path"]
+        try:
+            from . import marp_render
+            from .providers.codex.sandbox import _detect_chrome_path, _marp_bin
+            if not marp_render.is_marp_markdown(dst):
+                result["marp_note"] = ("marp:true が指定されましたが marp 形式"
+                                       "（front-matter の marp: true）ではないため変換しませんでした")
+            else:
+                rendered = marp_render.render_outputs(
+                    [dst], marp_bin=_marp_bin(), chrome_path=_detect_chrome_path(),
+                    theme_dirs=[Path(__file__).resolve().parent / "skills_base" / "marp" / "themes"],
+                    containment_root=ws_files)
+                extra = []
+                for out in rendered:
+                    try:
+                        raw = out.read_bytes()
+                    except OSError:
+                        continue
+                    try:
+                        sha = hashlib.sha256(raw).hexdigest()
+                        with store.workspace_file_lock(uid, out.name):
+                            r_row = store.record_workspace_file(
+                                uid, out.name, str(out), len(raw), sha, expires_at=expires)
+                    except Exception:
+                        continue   # marp 変換自体は成功済み＝この1形式の台帳登録失敗だけ諦める（fail-open）
+                    extra.append({"rel_path": r_row["rel_path"],
+                                 "download_url": f"/workspace/files/{r_row['id']}/download"})
+                if extra:
+                    result["rendered"] = extra
+                # C28 是正: `render_outputs` は形式ごとに fail-open で個別スキップする（例外を出さない・
+                # 未導入/Chromium 不在/ネットワーク隔離不可のいずれも空/部分リストで返る）ため、
+                # 利用者に案内した pdf/pptx（description 参照・html は内部形式で案内していない）が
+                # 実際には1つも登録されなかった／一部だけ欠けた場合に、無言で完了扱いにせず注記する
+                # （生成できても台帳登録に失敗した形式は download_url が無い＝利用者には「無い」のと
+                # 同じなので `extra`＝登録済みの側で確認する）。
+                _registered_suffixes = {Path(e["rel_path"]).suffix.lstrip(".").lower() for e in extra}
+                _missing_formats = [fmt for fmt in ("pdf", "pptx") if fmt not in _registered_suffixes]
+                if _missing_formats:
+                    result["marp_note"] = (
+                        f"{'/'.join(_missing_formats)} の生成に失敗しました"
+                        "（Markdown 自体は保存されています）")
+        except Exception as e:
+            _log.warning("write_output_file: marp レンダ処理が例外で終了（fail-open）: %s", e)
+            result["marp_note"] = "スライド変換（PDF/PowerPoint）に失敗しました。Markdown 自体は保存されています"
+    return result
+
 
 def _desc_es(with_grep: bool) -> str:
     """`with_grep` に応じた es_search の description（全ON相当時は正準文字列 `_DESC_ES` と byte 一致）。"""
@@ -1446,12 +1663,19 @@ def _desc_graph(with_grep: bool) -> str:
 
 
 def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool = True,
-                 with_grep: bool = True) -> list:
+                 with_grep: bool = True, with_write: bool = False) -> list:
     # can_ask=False（回答の再送＝依頼に「確認ID:」を含む実行）では ask_user
     #   ツール自体を渡さない＝再質問ループを構造的に塞ぐ（S2 の SHERPA_MCP_ASK_DISABLED と同思想）。
     # SC-6e: `with_grep`（既定 True）は検索経路トグルの grep 軸。list_docs/doc_outline/read_doc/
     #   read_around は土台系のため対象外＝常に含める。glob_search（ファイル名/パスのグロブ検索）も
     #   grep 軸に同居する。
+    # DEPTH-2 S2（§2.7）: `with_write`（既定 False＝オプトイン）は `write_output_file` の掲出可否——
+    #   呼び出し元（`openai_style` 本体）だけが `uid` の有無で明示的に True を渡す（uid が無ければ
+    #   登録先を特定できないため未掲出）。既定 False にしているのは、`gemini()`/`anthropic_style()`
+    #   （Gemini/Bedrock・DEPTH-2 S2 の対象外）や `_sub_loop`（検索アシスタント・書込み非対応の
+    #   プロファイル）等の**他の呼び出し元を無改修のまま**にするため——既定 True にすると、uid を
+    #   持たないこれらの経路にもツールが掲出され、呼んでも常に失敗する（登録先不明）だけの
+    #   無駄なターンを誘発する。
     t = [{"type": "function", "function": {"name": "list_docs", "description": _DESC_LIST_DOCS, "parameters": _PARAMS_LIST_DOCS}}]
     # K6: folder_tree は list_docs と同じ台帳ベースの土台系ツール（ES/graph/grep トグルと無関係）＝常に含める。
     t.append({"type": "function", "function": {"name": "folder_tree", "description": _DESC_FOLDER_TREE, "parameters": _PARAMS_FOLDER_TREE}})
@@ -1477,13 +1701,17 @@ def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
     t.append({"type": "function", "function": {"name": "pptx_slides", "description": _DESC_PPTX_SLIDES, "parameters": _PARAMS_PPTX_SLIDES}})
     t.append({"type": "function", "function": {"name": "pdf_pages", "description": _DESC_PDF_PAGES, "parameters": _PARAMS_PDF_PAGES}})
     t.append({"type": "function", "function": {"name": "file_head", "description": _DESC_FILE_HEAD, "parameters": _PARAMS_FILE_HEAD}})
+    if with_write:
+        t.append({"type": "function", "function": {"name": "write_output_file",
+                                                   "description": _DESC_WRITE_OUTPUT_FILE,
+                                                   "parameters": _PARAMS_WRITE_OUTPUT_FILE}})
     if can_ask:
         t.append({"type": "function", "function": {"name": "ask_user", "description": _DESC_ASK, "parameters": _PARAMS_ASK}})
     return t
 
 
 def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool = True,
-                 with_grep: bool = True) -> list:
+                 with_grep: bool = True, with_write: bool = False) -> list:
     # can_ask=False（確認ID 付き再送）では ask_user を渡さない（openai_tools と同じ）。
     # SC-6e: with_grep は openai_tools と同じ意味（既定 True）。glob_search も同じく grep 軸に同居する。
     fns = [{"name": "list_docs", "description": _DESC_LIST_DOCS, "parameters": _PARAMS_LIST_DOCS}]
@@ -1509,6 +1737,9 @@ def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
     fns.append({"name": "pptx_slides", "description": _DESC_PPTX_SLIDES, "parameters": _PARAMS_PPTX_SLIDES})
     fns.append({"name": "pdf_pages", "description": _DESC_PDF_PAGES, "parameters": _PARAMS_PDF_PAGES})
     fns.append({"name": "file_head", "description": _DESC_FILE_HEAD, "parameters": _PARAMS_FILE_HEAD})
+    if with_write:
+        fns.append({"name": "write_output_file", "description": _DESC_WRITE_OUTPUT_FILE,
+                    "parameters": _PARAMS_WRITE_OUTPUT_FILE})
     if can_ask:
         fns.append({"name": "ask_user", "description": _DESC_ASK, "parameters": _PARAMS_ASK})
     return [{"functionDeclarations": fns}]
@@ -2003,11 +2234,16 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
 def run_tool(name: str, args: dict, world: str, scope_paths,
             deadline: float | None = None, layer=None,
             max_hits: int | None = None, window_cap: int | None = None,
-            tool_result_max_bytes: int | None = None) -> tuple[dict, set, list, list]:
+            tool_result_max_bytes: int | None = None,
+            uid: str | None = None) -> tuple[dict, set, list, list]:
     """ツールを実行し `(結果, 触れた doc_id 集合, 引用候補, 候補カード)` を返す。範囲外/未解決/秘匿は安全に error。
 
     引用候補＝`{doc_id, span, quote, ext}`（grep/ES ヒット由来・UI/出典用）。候補カード＝`graph_neighbors` 由来の
     原因候補（troubleshoot の UI/エクスポート用）。tool result の本文は **秘密を伏せて**返す。
+
+    `uid`（DEPTH-2 S2・§2.7・省略可・既定 `None`）: `write_output_file`（成果物登録の共通化・個人
+    workspace の files/ へ保存）の書き先ユーザー id。`None`（省略）のときこのツールは実行せず
+    「作成者が特定できません」という error を返す（他のツールは `uid` を使わない）。
 
     `layer`（省略可・`"docs"|"code"|"both"`・既定 `None`＝`"both"`＝フィルタなし＝既存呼び出し元は
     無変更）: 探す対象（調べ方ブロック §3.4）。`scope_paths` と同じ「会話ターン全体にかかる硬い
@@ -2025,7 +2261,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     転送する。`window_cap`（省略可・既定 `None`＝モジュール既定 `READ_WINDOW`）: `read_around` の
     読み取り窓を2箇所で置き換える——① LLM が `window` 引数を省略したときの既定値、② 既存の
     `max(200, READ_WINDOW)` 安全クランプの `READ_WINDOW` 部分（200 の下限は維持）。どちらも
-    呼び出し元（`openai_style`）が既に倍率計算済みの
+    呼び出し元（`openai_style`）が既に実効基準値を解決済みの
     値を渡すだけで、本関数はクランプの形自体は変えない（LLM 自身が指定した値を上回らせない安全弁は
     維持）。`read_doc`（新設・土台系）の1回のページ幅にも `max(200, window_cap or READ_WINDOW)`
     ——read_around と同じ「200行フロア」の流儀を使う（read_doc に window 引数は無く、LLM は
@@ -2556,6 +2792,12 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             docs.add(doc_id)
             result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
         return (result, docs, cites, cards)
+    if name == "write_output_file":
+        # DEPTH-2 S2（§2.7）: docs/cites/cards は空のまま返す——個人 workspace の成果物は
+        # 共有 KB の出典（sources）検証（`_verified_sources`/`verify_doc_exists`）の対象外
+        # （RAG に索引化しない・出典欄には出さない契約）。成果物は別チャンネル
+        # （`InvestigationState.created_files`→ envelope の `created_files`）で運ぶ。
+        return (_run_write_output_file(args, uid), docs, cites, cards)
     if name in _USAGE_TOOL_ARG_KEYS:
         return _run_usage_tool(name, args, tr_max_bytes)
     return ({"error": f"unknown tool: {name}"}, docs, cites, cards)
@@ -4794,10 +5036,17 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
                       failure_kind: str | None = None,
                       read_evidence: list | None = None,
                       gaps: list | None = None,
-                      limits: dict | None = None) -> dict:
+                      limits: dict | None = None,
+                      created_files: list | None = None) -> dict:
     """`{"final": ...}` イベントの共通組み立て（Committed Evidence 化は呼び出し元が済ませた状態で
     受け取る）。候補があったのに全滅した場合は `stop_reason` を `evidence_verification_failed` へ
     上書きする（honest failure）。
+
+    `created_files`（DEPTH-2 S2・§2.7・省略可・既定 None＝空）: `write_output_file` ツールが台帳
+    登録に成功した行（`InvestigationState.created_files`・`{"rel_path","download_url",...}`）。
+    値が空なら `limits` と同じ流儀でキー自体を payload に作らない（既存消費者への無害な後方互換）。
+    非空でも `gaps`/`read_evidence` と同じ内部専用チャンネル——公開 `data.citations`/Evidence Packet
+    には出さない（呼び出し元 base.py が `env["created_files"]`（ダウンロード導線カード）へ写す）。
 
     呼び出し元が `committed`/`dropped` を先に検査してから最終テキスト（自然回答かクリーン再合成か）
     を決めたいケース（no-tool 終了時の Anthropic/Gemini 経路等）向けに、`_commit_evidence` の実行は
@@ -4878,6 +5127,8 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
     # 制限0件」と解釈する・`store/usage.py::usage_stats` の `limits` 集計参照）。
     if limits and any(limits.values()):
         payload["limits"] = dict(limits)
+    if created_files:
+        payload["created_files"] = list(created_files)
     if evaluation is not None:
         payload["evaluation_status"] = evaluation.get("status")
         payload["evaluation_reason"] = evaluation.get("reason")
@@ -4893,7 +5144,8 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
                          attributed_ev_ids: set | None = None,
                          read_evidence: list | None = None,
                          gaps: list | None = None,
-                         limits: dict | None = None) -> dict:
+                         limits: dict | None = None,
+                         created_files: list | None = None) -> dict:
     """`_finalize_payload` の薄いラッパー。citation 列（Candidate のまま）を受け取り、ここで
     `_commit_evidence` を1回だけ実行してから共通組み立てへ渡す（緊急打ち切り経路でも未検証
     citation を外へ出さない）。
@@ -4902,7 +5154,56 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
     return _finalize_payload(text, docs, searched, committed, evidence_meta, dropped, cards, usage,
                              verified_docs, stop_reason, evaluation, structural_evidence_meta,
                              used_evidence_docs, attributed_ev_ids, read_evidence=read_evidence,
-                             gaps=gaps, limits=limits)
+                             gaps=gaps, limits=limits, created_files=created_files)
+
+
+def _render_existing_claims_for_prompt(existing_claims: list[dict] | None, max_bytes: int) -> str:
+    """再調査（2回目以降）の worker 一次判断要求へ渡す既存主張の整形——id・status・本文のみ
+    （`evidence_refs` は今回のローカル調査状態とは別採番のため渡さない・呼び出し元
+    `providers/base.py::_ingest_sub_final_into_state` docstring 参照）。`max_bytes`（
+    `_SYNTHESIS_MAX_BYTES // 4` と同じ「予算の1/4」流用・新設定は増やさない）超過時は、全件の
+    id・status を必ず保持し、本文だけを件ごとに均等配分の残余で切り詰める（入らない分は
+    「(本文省略)」で列挙）。行境界（1件=1行）で切り、id を途中で切らない——後続の `[cN]` 行が
+    丸ごと落ちると、取り込み側の id 置換（同一 id は最新扱い）が別論点の主張を消しうる。
+    """
+    if not existing_claims:
+        return ""
+    items = []
+    for c in existing_claims:
+        cid, status, text = c.get("id"), c.get("status"), c.get("text")
+        if not cid or not status or not text:
+            continue
+        items.append((cid, status, text))
+    if not items:
+        return ""
+
+    def _line(cid, status, text) -> str:
+        return f"[{cid}] {status}: {text}"
+
+    full_out = "\n".join(_line(cid, status, text) for cid, status, text in items)
+    if len(full_out.encode("utf-8")) <= max_bytes:
+        return full_out
+
+    n = len(items)
+    prefixes = [f"[{cid}] {status}: " for cid, status, _ in items]
+    prefix_bytes = [len(p.encode("utf-8")) for p in prefixes]
+    newline_bytes = max(n - 1, 0)
+    budget_for_text = max_bytes - sum(prefix_bytes) - newline_bytes
+    per_item_text_budget = max(budget_for_text // n, 0)
+
+    placeholder = "(本文省略)"
+    lines = []
+    for (cid, status, text), prefix in zip(items, prefixes):
+        if per_item_text_budget <= 0:
+            lines.append(f"{prefix}{placeholder}")
+            continue
+        raw_text = text.encode("utf-8")
+        if len(raw_text) <= per_item_text_budget:
+            lines.append(f"{prefix}{text}")
+        else:
+            truncated = raw_text[:per_item_text_budget].decode("utf-8", errors="ignore")
+            lines.append(f"{prefix}{truncated}" if truncated else f"{prefix}{placeholder}")
+    return "\n".join(lines)
 
 
 # ---- 反復ループ（OpenAI 形式＝OpenAI/Ollama 共用 ／ Gemini 形式）----
@@ -4918,8 +5219,28 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                  tool_deadline: float | None = None, layer=None,
                  max_hits: int | None = None, window_cap: int | None = None,
                  tools_pref: dict | None = None, tools_availability: dict | None = None,
-                 system_settings: dict | None = None):
+                 system_settings: dict | None = None, uid: str | None = None,
+                 request_claims: bool = True,
+                 existing_claims: list[dict] | None = None):
     """OpenAI/Ollama の tool-use を反復。`{"node":..}` を yield しつつ最後に `{"final","docs"}`。
+
+    `uid`（DEPTH-2 S2・§2.7・省略可・既定 `None`）: `write_output_file` ツール（成果物登録の
+    共通化）の書き先（個人 workspace の files/）を決める呼び出し元のユーザー id。`None`（省略・
+    テスト等）のときは `write_output_file` を呼んでも「作成者が特定できません」という error 結果に
+    なる（`run_tool` へそのまま転送・`toolset` を明示指定しても uid は常に転送する）。
+
+    `request_claims`（`final_synthesis=False` 経路限定・既定 `True`）: 偽なら worker の一次判断
+    （確定/推定/不明の主張配列）を要求する追加の LLM 呼び出し自体を発行しない。呼び出し元
+    （`providers/base.py`）がこのターンで主張を査読する見込みが無いと分かっている場合に使う——
+    査読を通らない主張はどのみち清書・公開へ渡らないため、要求すること自体が無駄になる。
+    `final_synthesis=True` のときは無視する。
+
+    `existing_claims`（`request_claims=True` かつ `final_synthesis=False` のときだけ使う・
+    省略可・既定 `None`）: 再調査（このターンで既に確定している worker 由来の主張がある場合）で、
+    `claims_prompt` へ渡す既存主張（`{"id","status","text",...}` の list・`investigation_state.
+    claim_to_dict` の形でよい・`evidence_refs`/`reason`/`reason_code` は無視する）。呼び出し元
+    （`providers/base.py::_agentic_run`）が初回にはこの引数を渡さない（既存の主張がまだ無い）——
+    渡さない場合は id 採番規約を伝えない（初回はどのみち衝突する既存 id が無い）。
 
     `layer`（省略可・既定 `None`＝`"both"`＝既存呼び出し元は無変更）: `scope_paths` と同じく
     `run_tool` へそのまま転送する探す対象フィルタ（調べ方ブロック §3.4）。
@@ -5133,7 +5454,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
         _avail = tools_availability if tools_availability is not None else tool_availability()
         tools = openai_tools(
             with_es=_avail["fulltext"] and _tp["fulltext"], with_graph=_avail["graph"] and _tp["graph"],
-            can_ask=can_ask, with_grep=_tp["grep"])
+            can_ask=can_ask, with_grep=_tp["grep"], with_write=uid is not None)
     # 実際に提示した `tools` からツール名集合を
     # 導出し、`allowed_tools` 未指定（メイン経路）でも「提示していないツール名は拒否」を強制する。
     offered_names = frozenset(t["function"]["name"] for t in tools)
@@ -5194,7 +5515,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "budget_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                       created_files=state.created_files)
             return
         _acc_openai_usage(usage, resp, ollama)
         if usage_acc is not None:
@@ -5218,7 +5540,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world, verdict,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                               created_files=state.created_files)
                     return
                 if verdict["status"] in ("insufficient", "conflicting"):
                     if verdict["status"] == "conflicting":
@@ -5302,7 +5625,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     _ctx = contextvars.copy_context()
                     fut = _executor.submit(_ctx.run, run_tool, name, args, world, scope_paths,
                                            deadline=tool_deadline, layer=layer, max_hits=max_hits,
-                                           window_cap=window_cap, tool_result_max_bytes=tool_result_max_bytes)
+                                           window_cap=window_cap, tool_result_max_bytes=tool_result_max_bytes,
+                                           uid=uid)
                     _futures.append(("run", tc, name, args, fut))
             finally:
                 _executor.shutdown(wait=True)
@@ -5326,7 +5650,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                                   created_files=state.created_files)
                         return
                     tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                     if tc.get("id"):
@@ -5372,7 +5697,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                               created_files=state.created_files)
                     return
                 docs |= d
                 cites += c
@@ -5402,6 +5728,19 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     _call_structural += _card_structural_evidence(cd)
                 structural_evidence_meta += _call_structural
                 state.add_tool_result(name, args, result, c, _call_structural)
+                # DEPTH-2 S2（§2.7）: 台帳登録に成功した回だけ成果物として蓄積する
+                # （`error` があれば失敗＝カードにしない・調査ループはこのまま継続する＝fail-open）。
+                if name == "write_output_file" and isinstance(result, dict) and "error" not in result:
+                    if result.get("rel_path"):
+                        state.created_files.append(
+                            {"rel_path": result["rel_path"], "download_url": result.get("download_url")})
+                    for _r in (result.get("rendered") or []):
+                        state.created_files.append(_r)
+                    # C21: 書込成功時点で呼び出し元（providers/base.py::_agentic_run）へ即時に
+                    # 伝える——このあと同じターン内で例外/ask_user が起きても、既に個人 workspace に
+                    # 実在するファイルの個人由来フラグを見失わない（"final" を待たない・"node" では
+                    # ない独立のサイドカーイベント）。
+                    yield {"created_files": list(state.created_files)}
                 tmsg = {"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)}
                 if tc.get("id"):
                     tmsg["tool_call_id"] = tc["id"]
@@ -5449,7 +5788,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                               created_files=state.created_files)
                     return
                 tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                 if tc.get("id"):
@@ -5473,11 +5813,16 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 # チャット側は env を作らない）。これは意図的: ask_user の回答はフロントが新規メッセージ
                 # として再送し（chat_router の clarify 再開）、次ターンは新しい messages で検索し直す
                 # ＝この時点までの検索状態を持ち越す仕組みが元々無いので、破棄しても実害はない。
-                yield {"question": _question_from_args(args)}
+                # ただし `write_output_file` が既にこのターンで台帳登録に成功していれば
+                # （`state.created_files`）、ファイルは実在し個人 workspace に残ったまま――
+                # `final` を経ずに破棄すると呼び出し元の個人由来フラグ（`env["wrote_files"]`）が
+                # 立たず、確認カード・失敗保存が誤って共有可能（personal=False）のまま保存される
+                # （DEPTH-2 S2 是正）。question イベントに乗せて呼び出し元へ伝える。
+                yield {"question": _question_from_args(args), "created_files": list(state.created_files)}
                 return
             result, d, c, cd = run_tool(name, args, world, scope_paths, deadline=tool_deadline,
                                         layer=layer, max_hits=max_hits, window_cap=window_cap,
-                                        tool_result_max_bytes=tool_result_max_bytes)
+                                        tool_result_max_bytes=tool_result_max_bytes, uid=uid)
             _record_run_tool_limits(state, name, result)
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node`/`_tool_node_sub` は
             # 結果が出る前のノードのため件数を書けない・`_hit_summary_node`/`_hit_summary_node_sub`
@@ -5517,7 +5862,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                           created_files=state.created_files)
                 return
             docs |= d
             cites += c
@@ -5569,6 +5915,14 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             # C2（探索ループの文脈整理）: 既存の docs/cites/cards の収集と並行して調査状態も育てる
             # （検証前の生 citation・確定済みの構造的根拠・精読本文——`add_tool_result` docstring 参照）。
             state.add_tool_result(name, args, result, c, _call_structural)
+            # DEPTH-2 S2（§2.7）: 台帳登録に成功した回だけ成果物として蓄積する（並列経路と同じ判定）。
+            if name == "write_output_file" and isinstance(result, dict) and "error" not in result:
+                if result.get("rel_path"):
+                    state.created_files.append(
+                        {"rel_path": result["rel_path"], "download_url": result.get("download_url")})
+                for _r in (result.get("rendered") or []):
+                    state.created_files.append(_r)
+                yield {"created_files": list(state.created_files)}   # C21: 書込成功時点で即時に伝える（並列経路と同じ理由）
             tmsg = {"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)}
             if tc.get("id"):
                 tmsg["tool_call_id"] = tc["id"]
@@ -5583,7 +5937,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                       created_files=state.created_files)
             return
         _round_bounds.append((_round_start, len(msgs)))
         # 探索ループの文脈整理: `msgs` が予算を超えたら、最新 `SHERPA_AGENTIC_KEEP_RECENT_TOOLS`
@@ -5619,7 +5974,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world, verdict,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                                           created_files=state.created_files)
                 return
             if verdict["status"] == "sufficient":
                 # §3.2: sufficient → Candidate/Verified から Committed Evidence へ（tail で確定）。
@@ -5659,10 +6015,63 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     # 最終回答**（外側クラウド合成 `_answer_prompt`）自身に対する帰属だけを使う契約
     # （`providers/base.py` がストリーム完了後に別途組み立てる）。
     if not final_synthesis:
-        yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
-                                   verified_docs, stop_reason, world, evaluation,
-                                   structural_evidence_meta=structural_evidence_meta,
-                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+        # DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）: 文章を
+        # 破棄する代わりに、収集済み根拠（このループ専用のローカル `state`）から確定/推定/不明の
+        # 主張配列を worker 自身の接続・モデルで**1回だけ**要求する。通信失敗・パース不能・
+        # 途中で切れた JSON・budget_exceeded はいずれも `claims_raw=None`＝根拠だけで従来どおり
+        # 進む（honest failure に倒す既存契約は変えない・失敗に倒れない）。利用者の停止要求
+        # （`_SendAborted(reason="stop")`）だけは他の送信点と同じ契約で final を出さず return
+        # する。`evidence_refs` は worker
+        # 専用のローカル `state.evidence` の ev-N のまま持ち出す——Evidence Packet 化
+        # （`_commit_evidence`）前・親 `InvestigationState` とは別採番のため、ここでは書き換えない
+        # （書き換えは取り込み側 `providers/base.py::_ingest_sub_final_into_state` の責務・
+        # `investigation_state.remap_claim_refs_to_evidence` 参照）。`request_claims` が偽の
+        # ターン（呼び出し元が査読を発動しないと分かっている深さ）ではこの呼び出し自体を
+        # 発行しない——査読を通らない一次判断はどのみち公開されないため。
+        claims_raw = None
+        if request_claims and state.evidence:
+            try:
+                from .providers.prompts import claims_prompt
+                _claims_digest = state.render(max_bytes=_SYNTHESIS_MAX_BYTES // 2)
+                _existing_claims_text = _render_existing_claims_for_prompt(
+                    existing_claims, _SYNTHESIS_MAX_BYTES // 4)
+                _claims_msgs = [{"role": "system", "content": system},
+                                {"role": "user", "content": claims_prompt(
+                                    user, _claims_digest, _existing_claims_text)}]
+                _claims_body = {"model": model, "messages": _claims_msgs}
+                if ollama:
+                    _claims_body["stream"] = False
+                    _claims_body["options"] = {"temperature": 0.2}
+                _claims_resp = _send(endpoint, headers, _claims_body, timeout=_resolve_timeout(timeout))
+                _acc_openai_usage(usage, _claims_resp, ollama)
+                if usage_acc is not None:
+                    usage_acc["tokens"] = _usage_or_none(usage)
+                _claims_msg = ((_claims_resp.get("choices") or [{}])[0].get("message")
+                              if "choices" in _claims_resp else _claims_resp.get("message")) or {}
+                claims_raw = investigation_state.extract_claims_json(_openai_style_text(_claims_msg))
+            except _SendAborted as e:
+                if e.reason == "stop":
+                    return   # 停止時は final を出さない（他の送信点＝5766行付近と同じ契約）
+                claims_raw = None   # budget_exceeded は従来どおり「一次判断なし」で payload を返す
+            except Exception as e:
+                from .ingest.graph_extract import _log_masked_exception
+                _log_masked_exception(_log, "agentic_search: worker 一次判断の生成に失敗", e,
+                                      _header_secret(headers))
+                claims_raw = None
+        payload = _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                       verified_docs, stop_reason, world, evaluation,
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps,
+                                       limits=state.limits, created_files=state.created_files)
+        if claims_raw is not None:
+            parsed_claims = investigation_state.parse_claims(claims_raw, origin="worker")
+            if parsed_claims:
+                # 内部専用チャンネル（`read_evidence`/`gaps` と同じ「公開 payload/Evidence Packet
+                # には出さない」流儀）——in-process の generator 呼び出しのため Evidence オブジェクト
+                # をそのまま持ち出せる（JSON 化しない）。
+                payload["claims_raw"] = parsed_claims
+                payload["claims_evidence"] = list(state.evidence)
+        yield payload
         return
 
     committed, evidence_meta, dropped = _commit_evidence(cites, world)
@@ -5828,7 +6237,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                             used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
                             attributed_ev_ids=_attributed,
                             synthesis_failed=_synthesis_failed, attribution_eligible=_eligible,
-                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits,
+                            created_files=state.created_files)
 
 
 def anthropic_tools_from_openai(tools: list) -> list:

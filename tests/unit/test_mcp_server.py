@@ -367,3 +367,121 @@ def test_tools_list_keeps_office_read_tools_when_layer_docs_both_or_unset():
         finally:
             os.environ.pop("SHERPA_MCP_LAYER", None)
         assert {"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"} <= names, lyr
+
+
+# ===== DEPTH-2 S3b: サイドカー（子エージェントの MCP 呼出・ask_user の観測）=====
+# `docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(1)(3)(6)。
+# `SHERPA_MCP_SIDECAR` が設定されている間だけ、run_dir 配下の JSONL へ doc_id／ツール名／種別／
+# 時刻（と ask_user の質問）だけを追記する（本文は書かない）。未設定時は既存どおり何もしない。
+
+def test_read_doc_writes_sidecar_entry_without_body_when_configured(tmp_path):
+    """read_doc の成功呼出は SHERPA_MCP_SIDECAR へ {kind, tool, doc_id, ts} だけを1行追記する
+    （資料本文＝payload["text"] 相当は一切含まない）。"""
+    sidecar = tmp_path / "sidecar.jsonl"
+    os.environ["SHERPA_MCP_SIDECAR"] = str(sidecar)
+    try:
+        hit_resp = M.handle({"jsonrpc": "2.0", "id": 60, "method": "tools/call",
+                             "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+        doc_id = json.loads(hit_resp["result"]["content"][0]["text"])["hits"][0]["doc_id"]
+
+        resp = M.handle({"jsonrpc": "2.0", "id": 61, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": doc_id}}})
+        assert not resp["result"]["isError"]
+
+        lines = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines() if l.strip()]
+        read_entries = [e for e in lines if e.get("kind") == "read" and e.get("tool") == "read_doc"]
+        assert len(read_entries) == 1
+        entry = read_entries[0]
+        assert entry["doc_id"] == doc_id
+        assert set(entry.keys()) == {"kind", "tool", "doc_id", "ts"}   # 本文フィールドが無い
+        assert isinstance(entry["ts"], (int, float))
+    finally:
+        os.environ.pop("SHERPA_MCP_SIDECAR", None)
+
+
+def test_ripgrep_search_does_not_write_sidecar_entry():
+    """`read_doc`/`doc_outline` 等の doc_id を持つ読取系ツール以外（ripgrep_search）は
+    サイドカーに書かない（読取＝本文を開いた事実だけを記録する契約）。"""
+    with __import__("tempfile").TemporaryDirectory() as d:
+        sidecar = __import__("pathlib").Path(d) / "sidecar.jsonl"
+        os.environ["SHERPA_MCP_SIDECAR"] = str(sidecar)
+        try:
+            M.handle({"jsonrpc": "2.0", "id": 62, "method": "tools/call",
+                     "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+            assert not sidecar.exists()
+        finally:
+            os.environ.pop("SHERPA_MCP_SIDECAR", None)
+
+
+def test_sidecar_not_written_when_env_unset(tmp_path):
+    """`SHERPA_MCP_SIDECAR` 未設定時は既存どおり何も書かない（fail-open・既存動作と同一）。"""
+    os.environ.pop("SHERPA_MCP_SIDECAR", None)
+    marker = tmp_path / "sidecar.jsonl"
+    hit_resp = M.handle({"jsonrpc": "2.0", "id": 63, "method": "tools/call",
+                         "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+    doc_id = json.loads(hit_resp["result"]["content"][0]["text"])["hits"][0]["doc_id"]
+    M.handle({"jsonrpc": "2.0", "id": 64, "method": "tools/call",
+             "params": {"name": "read_doc", "arguments": {"doc_id": doc_id}}})
+    assert not marker.exists()
+
+
+def test_ask_user_first_call_writes_sidecar_question_entry(tmp_path):
+    """初回の ask_user はサイドカーへ質問（`_question_from_args` と同じ形）を書く。2回目以降
+    （既存の「1実行1回」ガード）は追加で書かない——サイドカーの ask_user 件数は増えない。
+    既存の応答文言（`_ASK_RESULT_FIRST`/`_ASK_RESULT_AGAIN`・`isError` False）は変わらない
+    （単一エージェント実行の既存契約を壊さない）。"""
+    sidecar = tmp_path / "sidecar.jsonl"
+    os.environ["SHERPA_MCP_SIDECAR"] = str(sidecar)
+    M._ASK_STATE["count"] = 0
+    args = {"prompt": "対象範囲は？", "mode": "single",
+            "options": [{"label": "A"}, {"label": "B"}]}
+    try:
+        r1 = M.handle({"jsonrpc": "2.0", "id": 65, "method": "tools/call",
+                       "params": {"name": "ask_user", "arguments": args}})
+        r2 = M.handle({"jsonrpc": "2.0", "id": 66, "method": "tools/call",
+                       "params": {"name": "ask_user", "arguments": args}})
+        assert r1["result"]["isError"] is False and r2["result"]["isError"] is False
+        assert M._ASK_RESULT_FIRST in r1["result"]["content"][0]["text"]
+        assert M._ASK_RESULT_AGAIN in r2["result"]["content"][0]["text"]
+
+        lines = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines() if l.strip()]
+        ask_entries = [e for e in lines if e.get("kind") == "ask_user"]
+        assert len(ask_entries) == 1, "1実行1回のガードと同じ数え方＝2回目は書かない"
+        q = ask_entries[0]["question"]
+        assert q["prompt"] == "対象範囲は？" and q["mode"] == "single"
+        assert len(q["options"]) == 2
+    finally:
+        os.environ.pop("SHERPA_MCP_SIDECAR", None)
+        M._ASK_STATE["count"] = 0
+
+
+def test_sidecar_append_write_failure_logs_warning_once_without_body(tmp_path, capsys):
+    """#29 是正: サイドカーへの書込失敗は完全に無言化せず、型と errno だけ（本文・パスは
+    含めない）を stderr へ1回だけ知らせる（fail-open＝ツール呼出自体は成功のまま・
+    2回目以降は再度出さない）。"""
+    # 親ディレクトリが無いパス＝open("a") が FileNotFoundError（OSError 派生）で必ず失敗する。
+    bad_sidecar = tmp_path / "does-not-exist" / "sidecar.jsonl"
+    os.environ["SHERPA_MCP_SIDECAR"] = str(bad_sidecar)
+    M._sidecar_write_failed_once = False
+    try:
+        hit_resp = M.handle({"jsonrpc": "2.0", "id": 70, "method": "tools/call",
+                             "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+        doc_id = json.loads(hit_resp["result"]["content"][0]["text"])["hits"][0]["doc_id"]
+
+        resp = M.handle({"jsonrpc": "2.0", "id": 71, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": doc_id}}})
+        assert not resp["result"]["isError"], "サイドカー書込失敗はツール呼出自体を失敗させない"
+
+        resp2 = M.handle({"jsonrpc": "2.0", "id": 72, "method": "tools/call",
+                          "params": {"name": "read_doc", "arguments": {"doc_id": doc_id}}})
+        assert not resp2["result"]["isError"]
+
+        err = capsys.readouterr().err
+        lines = [l for l in err.splitlines() if "sidecar write failed" in l]
+        assert len(lines) == 1, f"warning は1回だけのはず: {err!r}"
+        assert "FileNotFoundError" in lines[0]
+        assert doc_id not in lines[0] and str(bad_sidecar) not in lines[0], \
+            "本文・パスの中身をログに出してはいけない"
+    finally:
+        os.environ.pop("SHERPA_MCP_SIDECAR", None)
+        M._sidecar_write_failed_once = False

@@ -948,3 +948,417 @@ def test_search_hit_cap_gap_survives_alongside_body_truncation():
                       {"hits": [{"doc_id": "a.md", "line": 1, "text": "x"}], "truncated": True,
                        "truncated_docs": ["big.md"]}, [], None)
     assert any("検索ヒットが上限で打ち切り" in g for g in s.gaps) and any("本文が上限で切断" in g for g in s.gaps)
+
+
+# ===== DEPTH-2 S1: 主張構造（`Claim`/`parse_claims`/`InvestigationState.set_claims`） =====
+
+def test_parse_claims_accepts_confirmed_inferred_unknown_mix():
+    raw = [
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%。", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "inferred", "text": "経過措置が適用される可能性がある。",
+         "evidence_refs": [], "reason": "類似の過去改正から推定", "reason_code": ""},
+        {"id": "c3", "status": "unknown", "text": "適用開始日は資料からは確認できない。",
+         "evidence_refs": [], "reason": "", "reason_code": "not_found_in_scope"},
+    ]
+    claims = IS.parse_claims(raw)
+    assert claims is not None and len(claims) == 3
+    assert [c.status for c in claims] == ["confirmed", "inferred", "unknown"]
+    assert claims[2].reason_code == "not_found_in_scope"
+
+
+def test_parse_claims_rejects_unknown_status_without_closed_reason_code():
+    raw = [{"id": "c1", "status": "unknown", "text": "t", "evidence_refs": [],
+            "reason": "", "reason_code": "not_a_real_code"}]
+    assert IS.parse_claims(raw) is None
+
+
+def test_parse_claims_rejects_reason_code_on_non_unknown_status():
+    """理由コードは unknown 限定——confirmed/inferred に紛れ込ませたら不正として拒否する。"""
+    raw = [{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [],
+            "reason": "", "reason_code": "budget"}]
+    assert IS.parse_claims(raw) is None
+
+
+def test_parse_claims_rejects_duplicate_ids_and_extra_keys():
+    dup = [{"id": "c1", "status": "confirmed", "text": "a", "evidence_refs": [], "reason": "", "reason_code": ""},
+           {"id": "c1", "status": "confirmed", "text": "b", "evidence_refs": [], "reason": "", "reason_code": ""}]
+    assert IS.parse_claims(dup) is None
+    extra = [{"id": "c1", "status": "confirmed", "text": "a", "evidence_refs": [], "reason": "",
+              "reason_code": "", "unexpected": "x"}]
+    assert IS.parse_claims(extra) is None
+
+
+def test_parse_claims_rejects_non_list_and_malformed_items():
+    assert IS.parse_claims({"claims": []}) is None          # 配列でない
+    assert IS.parse_claims(["not a dict"]) is None
+    assert IS.parse_claims([{"id": "c1", "status": "confirmed"}]) is None   # text 欠落
+
+
+def _state_with_citation(doc_id="x.md", span=(1, 1), quote="A") -> InvestigationState:
+    """confirmed の `evidence_refs` が指す実在の ev_id（"ev-1"）を1件持つ状態を作る。"""
+    s = _state()
+    s.add_tool_result("ripgrep_search", {"query": "a"}, {"hits": [{"doc_id": doc_id}]},
+                      [{"doc_id": doc_id, "span": list(span), "quote": quote}], None)
+    return s
+
+
+def test_investigation_state_set_claims_stores_only_valid_parse():
+    s = _state_with_citation()
+    ok = s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+                        "reason": "", "reason_code": ""}])
+    assert ok is True and len(s.claims) == 1
+    assert IS.claim_to_dict(s.claims[0]) == {
+        "id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+        "reason": "", "reason_code": ""}
+
+
+def test_investigation_state_set_claims_rejects_invalid_without_mutating():
+    s = _state_with_citation()
+    s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+                  "reason": "", "reason_code": ""}])
+    ok = s.set_claims([{"id": "bad", "status": "unknown", "text": "t", "evidence_refs": [],
+                        "reason": "", "reason_code": "not_a_real_code"}])
+    assert ok is False
+    assert len(s.claims) == 1 and s.claims[0].id == "c1"   # 不正な再設定で既存の主張を失わない
+
+
+def test_investigation_state_set_claims_empty_list_is_not_success():
+    s = _state()
+    assert s.set_claims([]) is False
+    assert s.claims == []
+
+
+# ===== RV C1（docs/rv/2026-09-17-DEPTH-2.md）: confirmed の evidence_refs は非空かつ実在必須 =====
+
+def test_set_claims_rejects_confirmed_with_empty_evidence_refs():
+    """confirmed が根拠参照を1件も挙げない主張は、裏付けの無い確定として通さない
+    （end-to-end: `set_claims` が False を返し、呼び出し元は既存の根拠不足の固定文言経路へ落ちる）。"""
+    s = _state_with_citation()
+    ok = s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [],
+                        "reason": "", "reason_code": ""}])
+    assert ok is False
+    assert s.claims == []
+
+
+def test_set_claims_rejects_confirmed_with_nonexistent_evidence_id():
+    """confirmed が実在しない ev_id（この調査に無い "ev-999"）を挙げる主張は不正として拒否する。"""
+    s = _state_with_citation()
+    ok = s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-999"],
+                        "reason": "", "reason_code": ""}])
+    assert ok is False
+    assert s.claims == []
+
+
+def test_set_claims_rejects_whole_batch_if_any_confirmed_claim_is_ungrounded():
+    """1件でも不正な confirmed があれば claims 配列全体を不正として扱う（部分採用しない）。"""
+    s = _state_with_citation()
+    ok = s.set_claims([
+        {"id": "c1", "status": "confirmed", "text": "t1", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "confirmed", "text": "t2", "evidence_refs": ["ev-999"],
+         "reason": "", "reason_code": ""},
+    ])
+    assert ok is False
+    assert s.claims == []
+
+
+def test_set_claims_accepts_confirmed_with_real_evidence_id():
+    s = _state_with_citation()
+    assert s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+                          "reason": "", "reason_code": ""}]) is True
+
+
+# ===== RV C4: inferred は空白のみでない reason 必須 =====
+
+def test_parse_claims_rejects_inferred_with_empty_reason():
+    raw = [{"id": "c1", "status": "inferred", "text": "t", "evidence_refs": [],
+            "reason": "", "reason_code": ""}]
+    assert IS.parse_claims(raw) is None
+
+
+def test_parse_claims_rejects_inferred_with_whitespace_only_reason():
+    raw = [{"id": "c1", "status": "inferred", "text": "t", "evidence_refs": [],
+            "reason": "   ", "reason_code": ""}]
+    assert IS.parse_claims(raw) is None
+
+
+def test_parse_claims_accepts_inferred_with_real_reason():
+    raw = [{"id": "c1", "status": "inferred", "text": "t", "evidence_refs": [],
+            "reason": "類似事例からの推定", "reason_code": ""}]
+    claims = IS.parse_claims(raw)
+    assert claims is not None and claims[0].reason == "類似事例からの推定"
+
+
+# ===== RV C2: claims の ev-N を Evidence Packet 側（combined_evidence_meta）へ変換する =====
+
+def test_resolve_claim_evidence_ids_maps_across_differently_ordered_packet_meta():
+    """再調査を挟むと、主張生成のダイジェスト（`state.evidence` の安定採番）と Evidence Packet
+    （`combined_evidence_meta`・重複排除／再調査で並びが変わりうる別採番）の ev-N がずれる
+    （RV C2 再現）——`resolve_claim_evidence_ids` は根拠の同一性（citation は doc_id＋span、
+    構造的根拠は整形済みテキスト）で正しい Packet 側の ev-N へ書き換える。
+
+    再現: 初回に引用 A（a.md）・構造根拠 B（list_docs）を得て、再調査で引用 C（c.md）を得る
+    （state.evidence は挿入順で ev-1=A, ev-2=B, ev-3=C）。Evidence Packet 側の
+    `combined_evidence_meta` は citation の重複排除・並び替えを経て別の順（ここでは C, A の後に
+    構造 B）になる——書き換え前の ID をそのまま使うと ev-1 が A ではなく C を指してしまう
+    （このテストは書き換え前提の `evidence_refs` をそのまま比較すれば失敗する＝赤の再現）。
+    """
+    s = _state()
+    s.add_tool_result("ripgrep_search", {"query": "a"}, {"hits": [{"doc_id": "a.md"}]},
+                      [{"doc_id": "a.md", "span": [1, 1], "quote": "A"}], None)
+    b_meta = {"matched_doc_ids": ["b.md"], "list_meta": {"count": 1, "shown": 1}}
+    s.add_tool_result("list_docs", {}, {}, [], [b_meta])
+    s.add_tool_result("ripgrep_search", {"query": "c"}, {"hits": [{"doc_id": "c.md"}]},
+                      [{"doc_id": "c.md", "span": [5, 5], "quote": "C"}], None)
+    assert [e.ev_id for e in s.evidence] == ["ev-1", "ev-2", "ev-3"]   # A, B, C の挿入順
+
+    ok = s.set_claims([
+        {"id": "c1", "status": "confirmed", "text": "Aの主張", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "confirmed", "text": "Bの主張", "evidence_refs": ["ev-2"],
+         "reason": "", "reason_code": ""},
+        {"id": "c3", "status": "confirmed", "text": "Cの主張", "evidence_refs": ["ev-3"],
+         "reason": "", "reason_code": ""},
+    ])
+    assert ok is True
+
+    # Evidence Packet 側は別採番・別順（citation: C, A ／ structural: B）を模す。
+    combined_evidence_meta = [
+        {"doc_id": "c.md", "span": [5, 5], "verification_method": "span_verified"},   # packet ev-1
+        {"doc_id": "a.md", "span": [1, 1], "verification_method": "span_verified"},   # packet ev-2
+        b_meta,                                                                        # packet ev-3
+    ]
+    resolved = IS.resolve_claim_evidence_ids(s.claims, s.evidence, combined_evidence_meta)
+    by_id = {c.id: c for c in resolved}
+    assert by_id["c1"].evidence_refs == ["ev-2"]   # A -> packet の ev-2
+    assert by_id["c3"].evidence_refs == ["ev-1"]   # C -> packet の ev-1
+    assert by_id["c2"].evidence_refs == ["ev-3"]   # B -> packet の ev-3（構造的根拠はテキスト一致）
+
+
+def test_resolve_claim_evidence_ids_drops_refs_without_packet_counterpart():
+    """read（原本精読）等、Evidence Packet に現れない種別への参照は黙って落とす
+    （存在しない ev-N を清書・共有へ残さない）。"""
+    s = _state()
+    s.add_tool_result("read_doc", {}, {"doc_id": "x.md", "text": "本文", "start_line": 1, "end_line": 2},
+                      [], None)
+    assert s.evidence[0].kind == "read" and s.evidence[0].ev_id == "ev-1"
+    ok = s.set_claims([{"id": "c1", "status": "inferred", "text": "t", "evidence_refs": ["ev-1"],
+                        "reason": "精読のみで確証はない", "reason_code": ""}])
+    assert ok is True
+    resolved = IS.resolve_claim_evidence_ids(s.claims, s.evidence, [])
+    assert resolved[0].evidence_refs == []
+
+
+def test_render_claims_formats_by_status():
+    claims = IS.parse_claims([
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%。", "evidence_refs": ["ev-1", "ev-2"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "inferred", "text": "経過措置が適用される可能性がある。",
+         "evidence_refs": [], "reason": "類似の過去改正から推定", "reason_code": ""},
+        {"id": "c3", "status": "unknown", "text": "適用開始日は資料からは確認できない。",
+         "evidence_refs": [], "reason": "", "reason_code": "not_found_in_scope"},
+    ])
+    text = IS.render_claims(claims)
+    assert "[c1] 確定: 標準税率は10%。（根拠: ev-1、ev-2）" in text
+    assert "[c2] 推定: 経過措置が適用される可能性がある。（理由: 類似の過去改正から推定）" in text
+    assert "[c3] 不明: 適用開始日は資料からは確認できない。（理由コード: not_found_in_scope）" in text
+    assert IS.render_claims([]) == ""
+
+
+# ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2）:
+# worker の一次判断——origin と evidence_refs の親 state への remap =====
+
+def test_parse_claims_defaults_origin_to_synthesis_and_set_claims_accepts_worker_origin():
+    raw = [{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": [],
+            "reason": "", "reason_code": ""}]
+    claims = IS.parse_claims(raw)
+    assert claims[0].origin == "synthesis"   # 既定（`_claims_synthesis` 相当）
+    claims_worker = IS.parse_claims(raw, origin="worker")
+    assert claims_worker[0].origin == "worker"
+
+    s = _state_with_citation()
+    ok = s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+                        "reason": "", "reason_code": ""}], origin="worker")
+    assert ok is True and s.claims[0].origin == "worker"
+
+
+def test_claim_to_dict_does_not_leak_origin():
+    """`origin` は内部メタデータ——公開 envelope／共有の形（既存6キー）を変えない。"""
+    s = _state_with_citation()
+    s.set_claims([{"id": "c1", "status": "confirmed", "text": "t", "evidence_refs": ["ev-1"],
+                  "reason": "", "reason_code": ""}], origin="worker")
+    d = IS.claim_to_dict(s.claims[0])
+    assert set(d.keys()) == {"id", "status", "text", "evidence_refs", "reason", "reason_code"}
+
+
+def test_remap_claim_refs_to_evidence_maps_by_content_and_preserves_origin():
+    """worker（`agentic_search.openai_style` の final_synthesis=False 経路）が自分のローカル
+    `InvestigationState.evidence` 基準で組んだ主張を、親 `InvestigationState.evidence`（同じ根拠を
+    別途取り込み済み）の ev_id へ内容一致（citation は doc_id＋span、structural はテキスト）で
+    書き換える。"""
+    worker_state = _state_with_citation(doc_id="a.md", span=(1, 1), quote="A")
+    b_meta = {"matched_doc_ids": ["b.md"], "list_meta": {"count": 1, "shown": 1}}
+    worker_state.add_tool_result("list_docs", {}, {}, [], [b_meta])
+    assert [e.ev_id for e in worker_state.evidence] == ["ev-1", "ev-2"]
+    ok = worker_state.set_claims([
+        {"id": "c1", "status": "confirmed", "text": "Aの主張", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "confirmed", "text": "Bの主張", "evidence_refs": ["ev-2"],
+         "reason": "", "reason_code": ""},
+    ], origin="worker")
+    assert ok is True
+
+    # 親 state は既存の他根拠を1件持ってから、同じ根拠（a.md citation・b.md structural）を
+    # 別順で取り込む（ev-N が worker 側とずれる状況を再現）。
+    parent = _state()
+    parent.add_tool_result("ripgrep_search", {"query": "z"}, {"hits": [{"doc_id": "z.md"}]},
+                           [{"doc_id": "z.md", "span": [9, 9], "quote": "Z"}], None)
+    parent.add_tool_result("list_docs", {}, {}, [], [b_meta])
+    parent.add_tool_result("ripgrep_search", {"query": "a"}, {"hits": [{"doc_id": "a.md"}]},
+                           [{"doc_id": "a.md", "span": [1, 1], "quote": "A"}], None)
+    assert [e.ev_id for e in parent.evidence] == ["ev-1", "ev-2", "ev-3"]   # Z, B, A の挿入順
+
+    remapped = IS.remap_claim_refs_to_evidence(worker_state.claims, worker_state.evidence, parent.evidence)
+    by_id = {c.id: c for c in remapped}
+    assert by_id["c1"].evidence_refs == ["ev-3"]   # A -> 親の ev-3
+    assert by_id["c2"].evidence_refs == ["ev-2"]   # B -> 親の ev-2（structural はテキスト一致）
+    assert by_id["c1"].origin == "worker" and by_id["c2"].origin == "worker"   # origin は保持
+
+
+def test_remap_claim_refs_to_evidence_drops_refs_without_target_match():
+    """親側に対応する根拠が無い参照（重複排除で消えた等）は黙って落とす
+    （`resolve_claim_evidence_ids` と同じ契約）。"""
+    worker_state = _state_with_citation(doc_id="a.md", span=(1, 1), quote="A")
+    claims = IS.parse_claims([{"id": "c1", "status": "inferred", "text": "t", "evidence_refs": ["ev-1"],
+                              "reason": "根拠は薄い", "reason_code": ""}], origin="worker")
+    remapped = IS.remap_claim_refs_to_evidence(claims, worker_state.evidence, [])
+    assert remapped[0].evidence_refs == []
+    assert remapped[0].origin == "worker"
+
+
+# ---- DEPTH-2 S5: evaluator の指摘（`Finding`）と主張の採否（§2.4）----
+
+def _state_with_two_claims():
+    st = _state_with_citation(doc_id="a.md", span=(1, 1), quote="A")
+    assert st.set_claims([
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "inferred", "text": "経過措置あり", "evidence_refs": [],
+         "reason": "根拠が薄い", "reason_code": ""},
+    ], origin="worker") is True
+    return st
+
+
+def test_apply_findings_refutation_drops_claim_from_adoptable():
+    """反証された主張はその巡の中で採用不可（不明・理由コード conflict）へ落ち、
+    未完了回答に載る `adoptable_claims` から外れる。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                               "refutes": True}], 1) is True
+    by_id = {c.id: c for c in st.claims}
+    assert by_id["c1"].status == "unknown" and by_id["c1"].reason_code == "conflict"
+    assert [c.id for c in IS.adoptable_claims(st.claims)] == ["c2"]
+    assert [f.round_no for f in st.findings] == [1]
+
+
+def test_apply_findings_keeps_prior_finding_open_without_new_evidence():
+    """再指摘が無いだけでは解決にしない——根拠が足されていない指摘は未解決のまま次巡の指示に残る。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c2", "text": "条件が未確認"}], 1) is True
+    assert "条件が未確認" in IS.render_findings(st.findings)
+    assert st.apply_findings([{"id": "f2", "claim_id": "c1", "text": "別の不足"}], 2) is True
+    by_id = {f.id: f for f in st.findings}
+    assert by_id["f1"].state == "open" and by_id["f2"].state == "open"
+    rendered = IS.render_findings(st.findings)
+    assert "条件が未確認" in rendered and "別の不足" in rendered
+
+
+def test_apply_findings_resolves_only_with_added_evidence_and_confirmation():
+    """解決へ遷移するのは「根拠が増えた／確定へ戻った」かつ「orchestrator が確認した
+    （判定 sufficient または再指摘なし）」の両方が成立した指摘だけ。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c2", "text": "条件が未確認"}], 1) is True
+    # 次巡で c2 に根拠が足され確定へ戻る（同じ id は再指摘されない）。
+    assert st.set_claims([
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+        {"id": "c2", "status": "confirmed", "text": "経過措置あり", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""},
+    ], origin="worker") is True
+    assert st.apply_findings([], 2) is True
+    assert {f.id: f.state for f in st.findings} == {"f1": "resolved"}
+    assert IS.render_findings(st.findings) == ""
+
+
+def test_apply_findings_reraised_finding_stays_open_even_with_new_evidence():
+    """根拠が増えても、同じ指摘が再指摘されている間は未解決のまま（判定が sufficient でない限り）。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c2", "text": "条件が未確認"}], 1) is True
+    assert st.set_claims([
+        {"id": "c2", "status": "confirmed", "text": "経過措置あり", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""}], origin="worker") is True
+    assert st.apply_findings([{"id": "f1", "claim_id": "c2", "text": "条件が未確認"}], 2,
+                             verdict="insufficient") is True
+    assert [f.state for f in st.findings] == ["open"]
+    assert "条件が未確認" in IS.render_findings(st.findings)
+
+
+def test_apply_findings_withdrawn_updates_existing_row_and_leaves_next_round():
+    """撤回された指摘は旧 open 行を残さず（id で更新）、次巡の指示から落ちる。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c2", "text": "条件が未確認"}], 1) is True
+    assert st.apply_findings([{"id": "f1", "claim_id": "c2", "text": "条件が未確認",
+                               "state": "withdrawn"}], 2) is True
+    assert [(f.id, f.state) for f in st.findings] == [("f1", "withdrawn")]
+    assert IS.render_findings(st.findings) == ""
+
+
+def test_set_claims_does_not_readopt_refuted_claim():
+    """未解決の反証がある主張 ID は、後から確定として返し直されても採用不可のまま
+    （`_claims_synthesis` の結果でも worker の再調査でも上書きされない）。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                               "refutes": True}], 1) is True
+    assert st.set_claims([
+        {"id": "c1", "status": "confirmed", "text": "標準税率は10%", "evidence_refs": ["ev-1"],
+         "reason": "", "reason_code": ""}]) is True
+    assert st.claims[0].status == "unknown" and st.claims[0].reason_code == "conflict"
+    assert IS.adoptable_claims(st.claims) == []
+
+
+def test_apply_findings_rejects_malformed_without_changing_claims():
+    """形が不正な指摘は何も変更しない（部分採用しない・`parse_claims` と同じ規律）。"""
+    st = _state_with_two_claims()
+    for bad in ("not-a-list", [{"claim_id": "c1"}], [{"id": "f1", "state": "done"}],
+                [{"id": "f1", "refutes": "yes"}], [{"id": "f1"}, {"id": "f1"}]):
+        assert st.apply_findings(bad, 1) is False
+    assert [c.status for c in st.claims] == ["confirmed", "inferred"]
+    assert st.findings == []
+
+
+def test_apply_findings_none_is_no_findings_not_an_error():
+    """`findings` キーが無い応答（`None`）は「指摘なし」＝成功（主張は変わらない）。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings(None, 1) is True
+    assert st.findings == []
+    assert len(IS.adoptable_claims(st.claims)) == 2
+
+
+def test_adoptable_claims_drops_confirmed_without_evidence_refs():
+    """根拠 ID の公開採番への変換で `evidence_refs` を失った確定は、未完了回答（停止・失敗）へ
+    載せない——裏付けを示せない確定を「確認できた範囲」として公開しない。"""
+    claims = [IS.Claim(id="c1", status="confirmed", text="根拠を失った確定", evidence_refs=[]),
+              IS.Claim(id="c2", status="confirmed", text="根拠のある確定", evidence_refs=["ev-1"]),
+              IS.Claim(id="c3", status="inferred", text="推定", reason="根拠が薄い")]
+    assert [c.id for c in IS.adoptable_claims(claims)] == ["c2", "c3"]
+
+
+def test_render_findings_includes_the_finding_id():
+    """未解決の指摘には指摘 ID を付けて渡す——ID の対応が無いと、査読が別の指摘へ同じ ID を
+    返したときに既存行の更新が旧い反証を消す。"""
+    st = _state_with_two_claims()
+    assert st.apply_findings([{"id": "f1", "claim_id": "c1", "text": "別資料と矛盾",
+                               "refutes": True}], 1) is True
+    out = IS.render_findings(st.findings)
+    assert "(f1)" in out and "[c1]" in out and "別資料と矛盾" in out

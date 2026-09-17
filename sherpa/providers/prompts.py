@@ -75,8 +75,8 @@ def _facts(lens: str, env: dict) -> str:
                         "これらは推定であり確実ではない旨を明記すること" + steer)
             else:
                 base = f"{origin}影響: 計0件（該当なし）" + steer
-        return base + _digest_limit_lines(env) + (env.get("_personal_facts") or "")
-    if lens == "troubleshoot":
+        base += _digest_limit_lines(env)
+    elif lens == "troubleshoot":
         from ..agentic_search import _redact            # grep 根拠本文も秘匿（ES は redact 済み・base grep の password/api_key 等を外部LLMへ流さない）
         cs = d.get("candidates", [])
         parts = []
@@ -87,12 +87,20 @@ def _facts(lens: str, env: dict) -> str:
         base = "原因候補: " + "、".join(parts) if parts else "原因候補なし"
         if len(cs) > 8:
             base += f"（先頭8件・残り {len(cs) - 8} 件は未提示）"
-        return base + _digest_limit_lines(env) + (env.get("_personal_facts") or "")
-    digest = env.get("_synthesis_digest")
-    if digest:
-        return digest + (env.get("_personal_facts") or "")
-    cites = d.get("citations", [])
-    base = "該当箇所: " + " / ".join(f"{c['doc_id']}「{(c.get('quote') or '')[:60]}…」" for c in cites[:4]) if cites else "該当なし"
+        base += _digest_limit_lines(env)
+    else:
+        digest = env.get("_synthesis_digest")
+        if digest:
+            base = digest
+        else:
+            cites = d.get("citations", [])
+            base = ("該当箇所: " + " / ".join(f"{c['doc_id']}「{(c.get('quote') or '')[:60]}…」" for c in cites[:4])
+                    if cites else "該当なし")
+    # DEPTH-2 S1（RV C3）: 主張構造はレンズ分岐に関わらず必ず付加する——troubleshoot/impact は
+    # 上の分岐で早期に `base` を確定するため、ここで一箇所にまとめないと清書プロンプトへ渡らない。
+    claims_digest = env.get("_claims_digest")
+    if claims_digest:
+        base += f"\n\n【主張の構造（確定/推定/不明）】\n{claims_digest}"
     return base + (env.get("_personal_facts") or "")
 
 
@@ -110,9 +118,30 @@ def _answer_prompt(message, lens, env):
             "ページの分だけ欠落を相殺してしまうため使わない）。"
             "パスが未提示の一覧行（『他 N 件のパスは未提示』）があれば、その一覧は全件として書かず未提示の件数を示す。"
             "途中の空振り検索の『0件』は一覧の完了を否定しない）。"
+            "『主張の構造（確定/推定/不明）』があれば、それに沿って回答を組み立てる: 確定は断定してよい、"
+            "推定は『推定』と明示して理由を添える、不明はその主張がなぜ答えられないか（理由コード）を"
+            "明示する（不明な部分があるからといって回答全体を『不明』でひとまとめにしない・答えられる"
+            "部分は答える）。"
             "件数や対象名は事実のまま。出典（原本 DL）は Sherpa が付与するが、本文中でも根拠のパスを示してよい。"
             "回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。"
             f"\n\n【質問】{message}\n【取得済みの事実】{_facts(lens, env)}\n\n回答のみ:")
+
+
+def _continuation_prompt(message: str, lens: str, env: dict, tail: str) -> str:
+    """DEPTH-2 S2（§2.7）: 清書本文が `length`（出力上限）で打ち切られたときの追記継続プロンプト。
+
+    `_answer_prompt` と同じ『取得済みの事実』（`_facts`）を渡しつつ、**直前の本文の続きだけ**を
+    書かせる（見出し・前置き・直前までの内容の繰り返しを禁じる）。`tail`（直前の本文の末尾断片）を
+    示して「ここから自然に続ける」よう指示する——全文を往復させない（清書予算と同じ発想）。
+    主張構造（claims JSON・§2.5）はこの関数の対象外（呼び出し元が清書本文にだけ使う契約）。
+    """
+    return ("あなたは社内ナレッジの回答アシスタントです。直前の回答が出力の上限で途中で切れました。"
+            "**直前までに書いた内容を繰り返さず、続きだけ**を日本語で書いてください"
+            "（見出し・前置き・『続きです』のような案内文は付けない）。"
+            "直前の文が体言止め・句読点なしで終わっている等、不完全なまま切れている場合は"
+            "その文を完成させてから続ける。直前の末尾（これより前は省略済み）:"
+            f"\n『…{tail}』\n\n"
+            f"【質問】{message}\n【取得済みの事実】{_facts(lens, env)}\n\n続きのみ:")
 
 
 def _kb_hint(world: str) -> str:
@@ -154,6 +183,108 @@ _PLAIN_PROMPT_WITH_PERSONAL = (
     "（共有 RAG の引用元とは別扱い）。\n\n"
     "【個人ファイル内ヒット（本人のみ参照可・共有不可）】\n{personal}\n\n【質問】{q}\n回答:")
 
+def claims_prompt(question: str, digest: str, existing_claims_text: str = "",
+                  findings_text: str = "") -> str:
+    """DEPTH-2 S1/S4b 共通の主張構造プロンプト——査読後の最終手段（`providers/base.py::
+    _claims_synthesis`）と worker の一次判断（`agentic_search.openai_style` の
+    `final_synthesis=False` 経路）が同じ語彙・同じ出力契約（`investigation_state.parse_claims`
+    が検証する `_CLAIM_KEYS`/`_CLAIM_STATUSES`/`_CLAIM_UNKNOWN_REASON_CODES` と一致）を使う。
+
+    `existing_claims_text`（省略可・既定空文字＝節を付けない）: 再調査（2回目以降の worker 一次判断
+    要求）で、直前までに確定した worker 由来の主張（id・status・本文のみ・根拠参照は含まない——
+    今回のローカル調査状態とは別採番のため）を渡す。id の再利用規約（同じ論点は既存 id を使って
+    内容を更新・別論点は未使用の新しい id を付ける）をあわせて伝える——渡さない（呼び出し元が
+    査読を一度も通していない初回等）場合は毎回 "c1" から採番されても構わない。
+
+    `findings_text`（省略可・既定空文字＝節を付けない）: 未解決の指摘
+    （`investigation_state.render_findings`）。反証された論点を確定として書き直させないために
+    渡す——採否自体は `InvestigationState.set_claims` が反証を再適用して機械的に守る。"""
+    prompt = (
+        "あなたは調査結果から主張を構造化する担当です。以下の質問と収集済みの根拠から、"
+        "回答を構成する主張を1つずつ分解し、次の JSON 1個だけを出力してください"
+        "（他の文章を書かない・コードブロックで囲まない）:\n"
+        '{"claims": [{"id": "c1", "status": "confirmed", "text": "…", '
+        '"evidence_refs": ["ev-1"], "reason": "", "reason_code": ""}]}\n\n'
+        f"【質問】\n{question}\n\n【収集済みの根拠（digest）】\n{digest or '(なし)'}\n\n"
+        "各主張の `status` は次のいずれか: "
+        "`confirmed`（根拠で裏付けられる・`evidence_refs` に該当する ev-N を必ず入れる）／"
+        "`inferred`（根拠は薄いが妥当な推定・`reason` に理由を書く）／"
+        "`unknown`（判断できない・`reason_code` を次の語彙から選ぶ: "
+        "not_found_in_scope=検索した範囲で見つからない、unexplored=未探索の範囲がある、"
+        "insufficient=情報不足、conflict=資料間で矛盾、budget=打ち切り、unreadable=原本を読めない）。"
+        "`reason`/`reason_code` は該当しない区分では空文字にする。")
+    if existing_claims_text:
+        prompt += (
+            "\n\n【前回までの主張（この再調査の前に確定していたもの）】\n"
+            f"{existing_claims_text}\n\n"
+            "同じ論点を今回改めて述べる場合は、上記と同じ id をそのまま使い、内容を今回の内容で"
+            "更新してください（新旧を別々の主張として両方出さない）。今回新たに分かった別の論点は、"
+            "上記に無い未使用の id を付けてください。上記の id を別の論点に使い回さないでください。")
+    if findings_text:
+        prompt += (
+            "\n\n【査読の未解決の指摘（反証を含む）】\n"
+            f"{findings_text}\n\n"
+            "「（反証）」の付いた指摘の対象になっている論点は、`confirmed` として出さないでください"
+            "（`unknown` に `reason_code` を付けるか、根拠が薄い理由を添えて `inferred` にする）。")
+    return prompt
+
+
+def review_prompt(question: str, digest: str, claims_text: str = "",
+                  findings_text: str = "", round_no: int = 1, total_rounds: int = 1) -> str:
+    """DEPTH-2 S5（§2.4）: 1 巡分の査読プロンプト。orchestrator（確認）と evaluator（判定）の
+    役割を文言で分ける——読み直し（`read_around`/`list_docs`）は orchestrator が自分で必要箇所を
+    確認する枠、最後の JSON は evaluator の判定。巡の入力は毎巡ここで組み直す（過去巡の全文は
+    積まない・呼び出し元が最新の調査状態と未解決の指摘だけを渡す）。
+
+    `claims_text`: worker の一次判断（`investigation_state.render_claims`）。
+    `findings_text`: 前巡までの未解決の指摘（`investigation_state.render_findings`）。
+    """
+    prompt = (
+        "あなたは調査の統括役（orchestrator）と評価役（evaluator）を兼ねます。"
+        f"これは{total_rounds}巡中の{round_no}巡目の見直しです。回答本文は書かないこと。\n"
+        f"【質問】\n{question}\n\n【収集済みの根拠（digest）】\n{digest or '(なし)'}\n\n")
+    if claims_text:
+        prompt += (
+            "【下調べ役の一次判断（確定/推定/不明・鵜呑みにせず必要な箇所は自分で確認すること）】\n"
+            f"{claims_text}\n\n")
+    if findings_text:
+        prompt += ("【前巡までの未解決の指摘（解決したものは今回の findings に含めない）】\n"
+                   f"{findings_text}\n\n"
+                   "括弧内が指摘の id です。同じ指摘を今回も出す場合は同じ id をそのまま使い"
+                   "（内容だけ今回の表現へ更新してよい）、別の指摘には上記に無い未使用の id を"
+                   "付けてください。上記の id を別の指摘に使い回さないでください。\n\n")
+    prompt += (
+        "まず統括役として、引用箇所の前後の原文を自分で確かめたい場合は、次のどちらかの JSON を"
+        "1個だけ出力してください（他の文章を書かない）:\n"
+        '{"action": "read_around", "doc_id": "…", "line": 行番号}\n'
+        '{"action": "list_docs", "path_prefix": "…"}\n'
+        "確認を終えたら評価役として、別観点（反証・条件例外・回答漏れ・未探索の範囲）から"
+        "判定し、次の JSON 1個だけを出力してください（他の文章を書かない・書き直しはしない）:\n"
+        '{"verdict": "sufficient" | "insufficient" | "undecidable", '
+        '"missing": "不足している観点を具体的に（十分なら空文字）", '
+        '"missing_codes": ["insufficient"], '
+        '"findings": [{"id": "f1", "claim_id": "c1", "text": "指摘", "refutes": true}]}\n'
+        "`verdict` は `sufficient`（この根拠で正確に回答できる）／`insufficient`（不足がある）／"
+        "`undecidable`（十分とも不足とも判断できない）のいずれか——判断できないものを"
+        "`insufficient` や `sufficient` に丸めないこと。\n"
+        "`missing_codes` は `missing` の分類（集計用・任意）——該当する軸があれば次の語彙から"
+        "1つ以上選ぶ: not_found_in_scope=検索した範囲で見つからない、"
+        "unexplored=未探索の範囲がある、insufficient=情報不足、conflict=資料間で矛盾、"
+        "budget=打ち切り、unreadable=原本を読めない。無ければ空配列にする。\n"
+        "`findings` は主張 ID（`claim_id`）単位の指摘で、根拠と矛盾する主張には `refutes` を true に"
+        "してください（その主張はこの巡で採用不可になります）。主張に紐づかない不足は `claim_id` を"
+        "空文字にします。指摘が無ければ空配列にしてください。")
+    return prompt
+
+
+def rerun_instruction(missing: str, findings_text: str = "") -> str:
+    """次巡の worker への指示（不足の軸＋未解決の指摘だけ・解決済みは呼び出し元が落とす）。"""
+    out = f"【前回の調査で不足していた観点（重点的に調べ直す）】\n{missing}"
+    if findings_text:
+        out += f"\n\n【査読の未解決の指摘】\n{findings_text}"
+    return out
+
+
 # P1-a（Codex 強化計画 Phase1）: author 判定でも実行頭脳が Codex でない場合はファイルを作らず、
 # 従来 qa 相当の下書きで回答する（HeuristicProvider/_GenProvider 共通で headline 冒頭に前置）。
 _AUTHOR_FALLBACK_NOTE = "ファイル作成は頭脳=Codexのみ対応（設定で切替可）。以下は内容の下書きです。\n\n"
@@ -165,3 +296,36 @@ _AUTHOR_FALLBACK_NOTE = "ファイル作成は頭脳=Codexのみ対応（設定�
 # `web/chat/render.js::budgetNoteHTML` が「範囲を絞る／続きを調べて」の案内を独立要素で表示する
 # ため、ここでは事実（途中で打ち切ったこと）だけを述べる。
 _BUDGET_EXHAUSTED_HEADLINE = "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"
+
+# 作成系（author）の根拠ゲート免除は「実際に成果物を登録できたターン」だけ。登録に至らなかった
+# ターンは根拠0件のまま＝未検証の生成本文を回答として残さず、この固定文言へ差し替える
+# （追加 LLM 呼び出しをしない・平文・専門用語ゼロ）。
+_AUTHOR_NO_EVIDENCE_HEADLINE = ("必要な根拠を確認できなかったため、内容をお伝えできません。"
+                                "範囲を変えるか、依頼を具体的にしてもう一度お試しください。")
+
+
+# 作成系（author）の成果物ファイル名と marp 指定を、清書した本文を見て決めさせる 1 回の呼び出し。
+# ツール呼び出しの方言に依存しない自前 JSON プロトコル（`claims_prompt` と同じ流儀）で、
+# `agentic_search.write_output_file`（`_run_write_output_file`）へ渡す引数のうち content 以外
+# （filename・marp）だけを決めさせる＝本文は既に確定しているので作り直させない。
+_AUTHOR_OUTPUT_FILENAME_DEFAULT = "回答.md"
+
+
+def author_output_prompt(question: str, body: str, max_body: int) -> str:
+    """成果物として保存するファイル名と marp 指定を 1 個の JSON で返させるプロンプト。"""
+    return (
+        "あなたは作成の依頼に対する成果物を保存するファイル名を決める担当です。\n"
+        f"【依頼】\n{question}\n\n"
+        f"【保存する本文（先頭のみ）】\n{body[:max_body]}\n\n"
+        "次の JSON 1個だけを出力してください（他の文章を書かない）:\n"
+        '{"filename": "依頼の内容が分かる日本語のファイル名（拡張子つき・フォルダ区切りを含まない）", '
+        '"marp": true か false}\n'
+        "本文が Markdown のスライド形式（先頭に `---` で囲んだ `marp: true` の行がある）のときだけ "
+        "`marp` を true にしてください（PDF と PowerPoint も自動生成されます）。"
+        "それ以外は false にし、拡張子は本文の形式に合うもの（通常は .md）にしてください。")
+
+
+# 作成系（author）の成果物をファイルとして登録できなかったときに本文の末尾へ付ける注記
+# （本文自体は破棄しない・平文・専門用語ゼロ）。
+def author_save_failed_note(reason: str) -> str:
+    return f"\n\n※ 作成した内容をファイルとして保存できませんでした（{reason}）。上の本文はそのままご利用いただけます。"

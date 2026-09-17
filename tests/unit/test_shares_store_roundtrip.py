@@ -838,3 +838,43 @@ def test_share_card_meta_allowlist_keeps_directed_edges():
     from sherpa.store.shares import _safe_share_card_meta
     out = _safe_share_card_meta({"name": "B", "path": ["A", "B"], "edges": ["A →COPIES→ B（未確認）"], "cid": "m:B"})
     assert out == {"name": "B", "path": ["A", "B"], "edges": ["A →COPIES→ B（未確認）"]}
+
+
+# ===== DEPTH-2 S1（主張の区分/理由コードが sanitized share でも消えない・§2.5） =====
+
+def test_safe_share_answer_preserves_claim_status_and_reason_code():
+    out = store._safe_share_answer({
+        "lens": "qa", "headline": "h", "sources": [],
+        "data": {"claims": [
+            {"id": "c1", "status": "confirmed", "text": "標準税率は10%。",
+             "evidence_refs": ["ev-1"], "reason": "", "reason_code": ""},
+            {"id": "c2", "status": "unknown", "text": "適用開始日は不明。",
+             "evidence_refs": [], "reason": "", "reason_code": "unexplored"},
+        ]}})
+    claims = out["data"]["claims"]
+    assert len(claims) == 2
+    assert {c["status"] for c in claims} == {"confirmed", "unknown"}
+    unknown = next(c for c in claims if c["status"] == "unknown")
+    assert unknown["reason_code"] == "unexplored"
+    confirmed = next(c for c in claims if c["status"] == "confirmed")
+    assert confirmed["evidence_refs"] == ["ev-1"]
+
+
+def test_safe_share_answer_drops_claim_with_non_string_id():
+    """型不正（`id` が文字列でない）な主張は行ごと落とす（allowlist・値のすり替えではなく除去）。"""
+    from sherpa.store.shares import _safe_claim
+    assert _safe_claim({"id": 123, "status": "confirmed", "text": "t"}) is None
+    assert _safe_claim("not a dict") is None
+    assert _safe_claim({"status": "confirmed", "text": "t"}) is None   # id 欠落
+
+
+def test_strip_shared_message_preserves_claim_status_and_reason_code():
+    """通常の受領共有（denylist・他はそのまま通す）側でも同じ allowlist（`_safe_claim`）を通す。"""
+    from sherpa.store.shares import _strip_shared_message
+    m = {"role": "assistant", "content": "c", "lens": "qa",
+         "answer": {"lens": "qa", "headline": "h", "sources": [],
+                   "data": {"claims": [{"id": "c1", "status": "unknown", "text": "t",
+                                        "evidence_refs": [], "reason": "", "reason_code": "conflict"}]}}}
+    out = _strip_shared_message(m)
+    assert out["answer"]["data"]["claims"] == [
+        {"id": "c1", "status": "unknown", "text": "t", "evidence_refs": [], "reason": "", "reason_code": "conflict"}]

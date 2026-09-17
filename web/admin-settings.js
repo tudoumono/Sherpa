@@ -69,7 +69,7 @@ const OPENAI_ENDPOINT_KIND_LABELS = {
 // 使えるモデル（model_catalog）。用途名 → 平文の表示名（個人設定ページの既存の言い回しに合わせる）。
 const MC_USAGE_LABELS = {
   chat: 'チャット', intent: '依頼の仕分け',
-  embed: '検索の索引づくり', route: '振り分け', subsearch: '下調べ', codex: 'Codex',
+  embed: '検索の索引づくり', route: '振り分け', subsearch: '下調べ役のモデル（下調べ役に適用）', codex: 'Codex',
   render: '検索用文書の整形',
 };
 const MC_COLUMN_LABELS = { ollama: 'ローカル（Ollama）', codex: 'Codex' };
@@ -176,6 +176,7 @@ let _depthProfileBaseline = {};    // put キー -> 文字列化した configure
 // 他の6項目と同じく configured を基準にする（''=未設定＝「環境設定の既定に従う」の空選択肢）。
 let _depthReasoningBaseline = '';
 let _agenticToolLimitBaseline = '';
+let _maxReviewRoundsBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
 
 // 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
@@ -1444,6 +1445,11 @@ function renderResearchTab(view) {
   $('agentic-max-tools-per-turn-hint').textContent = limit.configured == null
     ? `未設定です（環境設定の既定 ${limit.effective} 件が適用されます）。`
     : `この値で固定中です（環境設定の既定: ${limit.default} 件）。`;
+  const rounds = view.max_review_rounds;
+  _maxReviewRoundsBaseline = rounds.configured == null ? '' : String(rounds.configured);
+  $('max-review-rounds').value = _maxReviewRoundsBaseline;
+  $('max-review-rounds-hint').textContent = `現在の適用値: ${rounds.effective} 回。既定: ${rounds.default} 回。`
+    + (rounds.configured == null ? '未設定です。' : 'この値で固定中です。');
   const parallel = view.embed_parallel;
   _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
   $('embed-parallel').value = _embedParallelBaseline;
@@ -1454,6 +1460,10 @@ function renderResearchTab(view) {
 
 function agenticToolLimitChanged() {
   return $('agentic-max-tools-per-turn').value.trim() !== _agenticToolLimitBaseline;
+}
+
+function maxReviewRoundsChanged() {
+  return $('max-review-rounds').value.trim() !== _maxReviewRoundsBaseline;
 }
 
 function embedParallelChanged() {
@@ -1946,6 +1956,8 @@ async function save() {
     .concat(modelWindowsErrors);
   const toolLimit = $('agentic-max-tools-per-turn');
   if (!toolLimit.checkValidity()) rangeErrors.push('ツール実行数の上限は1〜256の整数で指定してください');
+  const maxReviewRounds = $('max-review-rounds');
+  if (!maxReviewRounds.checkValidity()) rangeErrors.push('最大の見直しの回数は1〜32の整数で指定してください');
   const embedParallel = $('embed-parallel');
   if (!embedParallel.checkValidity()) rangeErrors.push('埋め込みの同時送信数は1〜16の整数で指定してください');
   if (rangeErrors.length) {
@@ -2028,6 +2040,9 @@ async function save() {
   collectDepthProfile(body);   // SC-6c: 調べる深さの基準値（変わった項目だけ送る）
   if (agenticToolLimitChanged()) {
     body.agentic_max_tools_per_turn = toolLimit.value === '' ? null : Number(toolLimit.value);
+  }
+  if (maxReviewRoundsChanged()) {
+    body.max_review_rounds = maxReviewRounds.value === '' ? null : Number(maxReviewRounds.value);
   }
   if (embedParallelChanged()) {
     body.embed_parallel = embedParallel.value === '' ? null : Number(embedParallel.value);
@@ -2144,6 +2159,7 @@ async function resetResearchTab() {
   body.depth_base_codex_reasoning = null;
   body.agentic_max_tools_per_turn = null;
   body.embed_parallel = null;
+  body.max_review_rounds = null;
   body.agentic_budget_per_result = null;
   body.agentic_budget_total = null;
   let view;
@@ -2310,7 +2326,7 @@ const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
     || openaiEndpointChanged() || mcEmbedChanged()
     || chatMaxTurnsChanged() || chatExamplesChanged(),
-  research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged()
+  research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged() || maxReviewRoundsChanged()
     || agenticBudgetChanged(),
   models: () => mcCatalogChangedExcludingEmbed() || modelWindowsTableChanged(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
@@ -2372,6 +2388,7 @@ function applyConfigChangedHighlights(view) {
   const reasoning = dp.codex_reasoning || {};
   mark($('depth-base-codex-reasoning'), reasoning.effective !== reasoning.default);
   mark($('agentic-max-tools-per-turn'), view.agentic_tool_limit.effective !== view.agentic_tool_limit.default);
+  mark($('max-review-rounds'), view.max_review_rounds.effective !== view.max_review_rounds.default);
   mark($('embed-parallel'), view.embed_parallel.effective !== view.embed_parallel.default);
   // 同時実行の上限。
   const cmt = view.chat_max_turns || {};

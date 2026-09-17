@@ -28,6 +28,7 @@ from sherpa import agents as A  # noqa: E402
 # tests/unit/test_codex_auto_continue.py の _FAKE_CODEX_MULTI_PY と同じ流儀（本ファイル専用コピー）。
 _FAKE_CODEX_MULTI_PY = r'''#!/usr/bin/env python3
 import json
+import os
 import pathlib
 import sys
 import time
@@ -47,6 +48,26 @@ tid = step.get("thread_id")
 if tid:
     print(json.dumps({"type": "thread.started", "thread_id": tid}))
     sys.stdout.flush()
+
+# DEPTH-2 S3b: 子スレッドの session JSONL を CODEX_HOME/sessions 配下に書く（`_collect_child_token_usage`
+# が glob する実際のレイアウトを最小限で再現）。`spawn_agent` の collab_tool_call item も出す。
+for spawn in step.get("collab_spawns", []):
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": spawn.get("id", "collab"), "type": "collab_tool_call", "tool": "spawn_agent",
+        "receiver_thread_ids": spawn.get("receiver_thread_ids", [])}}))
+    sys.stdout.flush()
+
+for child in step.get("child_sessions", []):
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        sdir = pathlib.Path(codex_home) / "sessions" / "2026" / "01" / "01"
+        sdir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps({"payload": {"id": child["thread_id"]}}),
+            json.dumps({"payload": {"type": "token_count",
+                                    "info": {"total_token_usage": child["usage"]}}}),
+        ]
+        (sdir / f"rollout-{child['thread_id']}.jsonl").write_text("\n".join(lines) + "\n")
 
 for i, text in enumerate(step.get("agent_messages", [])):
     print(json.dumps({"type": "item.completed",
@@ -191,10 +212,12 @@ def test_fresh_session_without_prev_total_uses_raw_accumulated_usage(tmp_path, m
 
 # ===== STAT-3 S1（利用統計の拡充）: env["usage"] へ depth_profile/reasoning を足す =====
 
-def test_deep_depth_profile_overrides_reasoning_to_high_in_usage(tmp_path, monkeypatch):
-    """`scope_meta["depth_profile"]="deep"` は `model_reasoning_effort` を "high" へ per-turn 上書き
-    （`depth_profile.codex_reasoning_for`）し、その実際に渡した値が `env["usage"]["reasoning"]` に
-    載る。基準値（既定 "low"）と異なるため `reasoning_base` も残る。"""
+def test_deep_depth_profile_keeps_base_reasoning_in_usage(tmp_path, monkeypatch):
+    """DEPTH-2 S7: `scope_meta["depth_profile"]="deep"` は `model_reasoning_effort` の
+    per-turn 上書き（`depth_profile.codex_reasoning_for`）が撤去され、基準値（既定 "low"）が
+    そのまま `model_reasoning_effort` と `env["usage"]["reasoning"]` に載る。
+    `reasoning` と `reasoning_base` は矛盾しない（＝一致するため `reasoning_base` は出ない・
+    受け入れ条件(3)）。"""
     steps = [{"thread_id": "SID-DEEP", "agent_messages": ["確認した結果、影響はありません。"],
               "usage": _usage(30, 2, 13, 3)}]
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_delta_deep")
@@ -204,11 +227,11 @@ def test_deep_depth_profile_overrides_reasoning_to_high_in_usage(tmp_path, monke
     env = _result_env(_run(prov, ctx))
 
     calls = _read_argv_log(argv_log)
-    assert any("model_reasoning_effort=high" in a for a in calls[0]), \
-        f"実際に codex exec へ渡した引数に high が無い: {calls[0]!r}"
+    assert any("model_reasoning_effort=low" in a for a in calls[0]), \
+        f"実際に codex exec へ渡した引数が基準値 low のままでない: {calls[0]!r}"
     assert env["usage"]["depth_profile"] == "deep"
-    assert env["usage"]["reasoning"] == "high"
-    assert env["usage"]["reasoning_base"] == "low"
+    assert env["usage"]["reasoning"] == "low"
+    assert "reasoning_base" not in env["usage"]
 
 
 def test_standard_depth_profile_omits_reasoning_base_when_unchanged(tmp_path, monkeypatch):
@@ -301,3 +324,250 @@ def test_auto_continue_uses_latest_snapshot_for_delta(tmp_path, monkeypatch):
     assert usage["cached_input_tokens"] == 0
     assert usage["output_tokens"] == 8      # 13 - 5
     assert usage["reasoning_output_tokens"] == 2   # 3 - 1
+
+
+# ===== DEPTH-2 S3b: 子スレッド（spawn_agent）の usage 合算 =====
+# `docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(4)。
+
+def test_child_thread_usage_merged_into_answer_usage_with_breakdown(tmp_path, monkeypatch):
+    """親の `turn.completed.usage` に、同ターン中に spawn_agent された子2本の session JSONL
+    （token_count の total_token_usage）を合算する。`env["usage"]` は親＋子の合計になり、内訳
+    （親／子／未取得件数）が別途残る。`env["codex_usage_total"]`（次ターンの差分計算の元）は
+    子の分を混ぜず親のスナップショットのままにする。"""
+    steps = [{
+        "thread_id": "SID-PARENT",
+        "collab_spawns": [
+            {"id": "c1", "receiver_thread_ids": ["CHILD-1"]},
+            {"id": "c2", "receiver_thread_ids": ["CHILD-2"]},
+        ],
+        "child_sessions": [
+            {"thread_id": "CHILD-1",
+             "usage": {"input_tokens": 100, "cached_input_tokens": 0,
+                       "output_tokens": 20, "reasoning_output_tokens": 5}},
+            {"thread_id": "CHILD-2",
+             "usage": {"input_tokens": 50, "cached_input_tokens": 0,
+                       "output_tokens": 10, "reasoning_output_tokens": 2}},
+        ],
+        "agent_messages": ["確認した結果、影響はありません。"],
+        "usage": _usage(30, 2, 13, 3),
+    }]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_child_usage")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="child-usage-u1", conversation_id=801)
+
+    env = _result_env(_run(prov, ctx))
+
+    calls = _read_argv_log(argv_log)
+    assert len(calls) == 1
+
+    # 既存の差分計算の元＝親のみのスナップショットのまま（壊れていない）。
+    assert env["codex_usage_total"] == {
+        "session_id": "SID-PARENT", "input_tokens": 30, "cached_input_tokens": 2,
+        "output_tokens": 13, "reasoning_output_tokens": 3}
+
+    assert env["codex_usage_children"] == {
+        "found": 2, "missing": 0,
+        "input_tokens": 150, "cached_input_tokens": 0,
+        "output_tokens": 30, "reasoning_output_tokens": 7,
+    }
+    usage = env["usage"]
+    # 親(30/2/13/3) + 子(150/0/30/7) を一度だけ合算。
+    assert usage["input_tokens"] == 180
+    assert usage["cached_input_tokens"] == 2
+    assert usage["output_tokens"] == 43
+    assert usage["reasoning_output_tokens"] == 10
+    assert usage["codex_usage_breakdown"] == {
+        "parent": {"input_tokens": 30, "cached_input_tokens": 2,
+                   "output_tokens": 13, "reasoning_output_tokens": 3},
+        "children": {"input_tokens": 150, "cached_input_tokens": 0,
+                     "output_tokens": 30, "reasoning_output_tokens": 7},
+        "children_found": 2, "children_missing": 0,
+    }
+
+
+def test_child_thread_usage_missing_child_counted_without_estimation(tmp_path, monkeypatch):
+    """spawn_agent された子の session JSONL が見つからない（未取得）ときは、推定で埋めず件数だけ
+    `missing` に残す。見つかった分だけ合算する。"""
+    steps = [{
+        "thread_id": "SID-PARENT-2",
+        "collab_spawns": [
+            {"id": "c1", "receiver_thread_ids": ["CHILD-FOUND"]},
+            {"id": "c2", "receiver_thread_ids": ["CHILD-LOST"]},   # session JSONL を書かない＝未取得
+        ],
+        "child_sessions": [
+            {"thread_id": "CHILD-FOUND",
+             "usage": {"input_tokens": 40, "cached_input_tokens": 0,
+                       "output_tokens": 8, "reasoning_output_tokens": 1}},
+        ],
+        "agent_messages": ["確認した結果、影響はありません。"],
+        "usage": _usage(30, 2, 13, 3),
+    }]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_child_usage_missing")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="child-usage-u2", conversation_id=802)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["codex_usage_children"] == {
+        "found": 1, "missing": 1,
+        "input_tokens": 40, "cached_input_tokens": 0,
+        "output_tokens": 8, "reasoning_output_tokens": 1,
+    }
+    usage = env["usage"]
+    assert usage["input_tokens"] == 70    # 30(親) + 40(見つかった子だけ)
+    assert usage["output_tokens"] == 21   # 13 + 8
+
+
+def test_no_child_spawn_keeps_usage_unchanged(tmp_path, monkeypatch):
+    """`collab_tool_call` が一度も出ない（multi_agent 無効の現状の通常実行）ときは
+    `codex_usage_children`/`codex_usage_breakdown` が一切出ない＝既存の usage 計上のまま。"""
+    steps = [{"thread_id": "SID-NOCHILD", "agent_messages": ["確認した結果、影響はありません。"],
+              "usage": _usage(30, 2, 13, 3)}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_no_child")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="no-child-u1", conversation_id=803)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert "codex_usage_children" not in env
+    assert "codex_usage_breakdown" not in env["usage"]
+    assert env["usage"]["input_tokens"] == 30
+
+
+def test_child_thread_usage_breakdown_on_resume_uses_delta_not_cumulative(tmp_path, monkeypatch):
+    """C11 是正: resume ターン（prev_total あり・session_id 一致）で子スレッドが合算されるとき、
+    内訳の「親」分は `codex_usage`（セッション累計・前ターン分を含む）ではなく、既に
+    差分化済みの `env["usage"]`（このターンの計上値）から作る。累計をそのまま使うと、前ターンの
+    分が混入して親分が「合計 usage － 子分」より過大になる（提案書 §2.6/§9.1・RV C11）。"""
+    steps = [{
+        "thread_id": "SID-RESUME-CHILD",
+        "collab_spawns": [{"id": "c1", "receiver_thread_ids": ["CHILD-1"]}],
+        "child_sessions": [
+            {"thread_id": "CHILD-1",
+             "usage": {"input_tokens": 40, "cached_input_tokens": 0,
+                       "output_tokens": 8, "reasoning_output_tokens": 1}},
+        ],
+        "agent_messages": ["確認した結果、影響はありません。"],
+        "usage": _usage(130, 2, 13, 3),   # セッション累計（前ターン分 100 を含む）
+    }]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_resume_child_usage")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="resume-child-usage-u1", conversation_id=804,
+              codex_session_id="SID-RESUME-CHILD",
+              codex_usage_prev_total=_prev_total("SID-RESUME-CHILD", input_tokens=100,
+                                                  cached_input_tokens=2, output_tokens=5,
+                                                  reasoning_output_tokens=1))
+
+    env = _result_env(_run(prov, ctx))
+
+    # このターンの親分の差分計上値（130-100=30・累計 130 をそのまま使うと過大になる）。
+    usage = env["usage"]
+    assert usage["input_tokens"] == 70     # 親差分(30) + 子(40)
+    assert usage["output_tokens"] == 16    # 親差分(8) + 子(8)
+    assert usage["codex_usage_breakdown"]["parent"] == {
+        "input_tokens": 30, "cached_input_tokens": 0,
+        "output_tokens": 8, "reasoning_output_tokens": 2}, \
+        "内訳の親分が累計のまま（前ターン分が混入している）"
+    assert usage["codex_usage_breakdown"]["children"] == {
+        "input_tokens": 40, "cached_input_tokens": 0,
+        "output_tokens": 8, "reasoning_output_tokens": 1}
+
+
+# ===== DEPTH-2 S6（§2.6）: multi_agent 既定有効化・review_rounds の受け渡し =====
+# 提案書 2026-09-17-深さの再定義とレビュー巡.md §2.6・§5 S6・受け入れ条件(1)(3)。
+
+def test_deep_depth_profile_passes_multi_agent_and_two_review_rounds_to_agents_md(tmp_path, monkeypatch):
+    """`scope_meta.depth_profile="deep"` は AGENTS.md 生成へ `multi_agent=True`・
+    `review_rounds=2`（`depth_profile.review_rounds_for` の戻り値）をそのまま渡す。"""
+    from sherpa import codex_agents_md
+    from sherpa.providers.codex import provider as PV
+    captured: dict = {}
+    orig_write = codex_agents_md.write_agents_md
+
+    def _spy(authoring, **kw):
+        captured.update(kw)
+        return orig_write(authoring, **kw)
+    monkeypatch.setattr(PV.codex_agents_md, "write_agents_md", _spy)
+
+    steps = [{"thread_id": "TH-DEEP-AGENTS",
+             "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_deep_agents_md")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="deep-agents-md", conversation_id=901, scope_meta={"depth_profile": "deep"})
+
+    _run(prov, ctx)
+
+    assert captured.get("multi_agent") is True
+    assert captured.get("review_rounds") == 2
+
+
+def test_standard_depth_profile_keeps_multi_agent_on_with_zero_review_rounds(tmp_path, monkeypatch):
+    """標準（§2.6「常時」有効化の裁定）でも `multi_agent=True` のまま、`review_rounds` だけ 0 になる
+    （深さに関わらず multi_agent 自体は常時 on＝Codex(OpenAI) 構成なら常に有効）。"""
+    from sherpa import codex_agents_md
+    from sherpa.providers.codex import provider as PV
+    captured: dict = {}
+    orig_write = codex_agents_md.write_agents_md
+
+    def _spy(authoring, **kw):
+        captured.update(kw)
+        return orig_write(authoring, **kw)
+    monkeypatch.setattr(PV.codex_agents_md, "write_agents_md", _spy)
+
+    steps = [{"thread_id": "TH-STD-AGENTS",
+             "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_standard_agents_md")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="standard-agents-md", conversation_id=902)
+
+    _run(prov, ctx)
+
+    assert captured.get("multi_agent") is True
+    assert captured.get("review_rounds") == 0
+
+
+def test_deep_depth_profile_two_evaluator_spawns_are_captured_as_children(tmp_path, monkeypatch):
+    """深く（見直しの回数 2）で evaluator が2回 spawn される想定を偽 codex で再現する。
+    2本の子スレッド（session JSONL あり）がどちらも見つかった（found）扱いになる——
+    Sherpa 側は spawn 回数を強制しない（指示のみ）ため、この検収は「2回 spawn されたときに
+    正しく数えられる」ことの確認（受け入れ条件(3)前半）。"""
+    steps = [{
+        "thread_id": "SID-DEEP-ROUNDS",
+        "collab_spawns": [
+            {"id": "eval1", "receiver_thread_ids": ["EVAL-1"]},
+            {"id": "eval2", "receiver_thread_ids": ["EVAL-2"]},
+        ],
+        "child_sessions": [
+            {"thread_id": "EVAL-1",
+             "usage": {"input_tokens": 20, "cached_input_tokens": 0,
+                       "output_tokens": 4, "reasoning_output_tokens": 1}},
+            {"thread_id": "EVAL-2",
+             "usage": {"input_tokens": 15, "cached_input_tokens": 0,
+                       "output_tokens": 3, "reasoning_output_tokens": 1}},
+        ],
+        "agent_messages": ["1回目は不足と判定し見直した後、確認した結果、影響はありません。"],
+        "usage": _usage(30, 2, 13, 3),
+    }]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_deep_two_rounds")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="deep-two-rounds", conversation_id=903, scope_meta={"depth_profile": "deep"})
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["codex_usage_children"]["found"] == 2
+    assert env["codex_usage_children"]["missing"] == 0
+
+
+def test_no_evaluator_spawn_when_sufficient_stays_zero_children(tmp_path, monkeypatch):
+    """深く（見直しの回数 2）でも、evaluator を一度も spawn しない実行（十分・確認・予算・停止
+    に相当）は子スレッドが一切記録されない——`collab_tool_call` を Sherpa 側が強制発火しない
+    ことの確認（受け入れ条件(3)後半）。"""
+    steps = [{"thread_id": "SID-DEEP-NOEVAL",
+             "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage(30, 2, 13, 3)}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_deep_no_eval")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="deep-no-eval", conversation_id=904, scope_meta={"depth_profile": "deep"})
+
+    env = _result_env(_run(prov, ctx))
+
+    assert "codex_usage_children" not in env

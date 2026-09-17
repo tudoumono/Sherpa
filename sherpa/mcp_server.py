@@ -16,18 +16,38 @@ MCP がツールを渡す唯一の素直な口（network 不要＝本サーバ�
   **ask_user を tools/list から外す**（呼べる道具を最初から見せない＝最強のガード・RV HIGH 2026-07-07）。
   それでも呼ばれたら（Codex がプロンプト指示に反した場合の防御）初回でも `_ASK_RESULT_AGAIN` を返す
   ＝質問カードを出さないまま調査を打ち切らせない（ラッパー側 `_ask_disabled` と同じフラグを共有）。
+- DEPTH-2 S3b（`docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1）: Codex の
+  multi_agent（`spawn_agent`）で起動された子エージェントの MCP 呼出は、親プロセスの `--json`
+  イベントには構造化イベントとして現れない（実機確認済み）。子・親のどちらから呼ばれたかを
+  本サーバは区別できないため、`SHERPA_MCP_SIDECAR`（JSONL パス・model-shell の書込許可領域の外＝
+  通常は codex_home 配下）が設定されていれば読取系ツールの doc_id と ask_user の質問だけを
+  **本文なしで**そのファイルへ追記する——本サーバ自身は permission profile の外の別プロセスなので
+  書けるが、Codex の shell ツールはそこへ書けない（サイドカーが読取専用の観測経路であり続ける
+  前提はこの書込不可に依る）。呼び出し元
+  （`providers/codex/provider.py`）が codex exec 終了後にこのファイルを読み、子だけが読んだ資料を
+  出典へ・子の ask_user を確認カードへ合流させる。未設定（`SHERPA_MCP_SIDECAR` なし）なら何もしない
+  （既存の単一エージェント実行は無変更）。
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 
 from . import agentic_search, es_index
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "sherpa", "version": "0.1.0"}
+
+# DEPTH-2 S3b: 読取系ツールの分類（provider.py 側の出典収集と同じ区分＝二重管理を避けるため
+# `sherpa/providers/codex/provider.py` がこのタプルを import して使う）。`LISTED_DOC_TOOLS`
+# （シート一覧のみ）は sources_verified には数えない扱いを provider 側が踏襲する。
+READ_DOC_TOOLS = ("read_doc", "read_around", "doc_outline",
+                  "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head")
+LISTED_DOC_TOOLS = ("xlsx_sheets",)
+COMPARE_DOC_ID_ARGS = ("left_doc_id", "right_doc_id", "source_doc_id")
 
 # S2: ask_user は検索ツールではない（run_tool に実装は無い）＝ここでは Codex に返す**ツール結果**だけを持つ。
 # 1実行1回まで（この MCP サーバは codex exec 1回につき1プロセスなので、プロセス寿命＝1実行＝モジュール変数で数える）。
@@ -122,6 +142,34 @@ def _ask_disabled() -> bool:
     return os.environ.get("SHERPA_MCP_ASK_DISABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _sidecar_path() -> str | None:
+    """DEPTH-2 S3b: run ごとのサイドカーファイルパス（`SHERPA_MCP_SIDECAR`・未設定は None＝無効）。"""
+    p = os.environ.get("SHERPA_MCP_SIDECAR", "").strip()
+    return p or None
+
+
+_sidecar_write_failed_once = False   # 書込失敗の warning は1実行につき1回だけ出す（過剰ログ防止）
+
+
+def _sidecar_append(entry: dict) -> None:
+    """サイドカーへ1行（JSON）追記する。**fail-open**（書けなくてもツール呼出自体は失敗させない・
+    ディスク不調やパス消失を検索結果へ波及させない）。呼び出し元は doc_id／ツール名／種別／時刻
+    （と ask_user の質問）だけを渡すこと——資料本文・回答本文は一切書かない契約。書込失敗は
+    完全に無言にはせず、型と errno だけ（本文・パスは出さない）を stderr へ1回だけ知らせる。"""
+    global _sidecar_write_failed_once
+    path = _sidecar_path()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        if not _sidecar_write_failed_once:
+            _sidecar_write_failed_once = True
+            print(f"[sherpa-mcp] sidecar write failed: {type(e).__name__} errno={e.errno}",
+                  file=sys.stderr)
+
+
 def _ok(rid, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
@@ -155,7 +203,18 @@ def handle(req: dict) -> dict | None:
             if _ask_disabled():
                 return _ok(rid, {"content": [{"type": "text", "text": _ASK_RESULT_AGAIN}], "isError": False})
             _ASK_STATE["count"] += 1
-            text = _ASK_RESULT_FIRST if _ASK_STATE["count"] == 1 else _ASK_RESULT_AGAIN
+            if _ASK_STATE["count"] == 1:
+                text = _ASK_RESULT_FIRST
+                # DEPTH-2 S3b: 子（spawn_agent された worker/evaluator）の ask_user は親の `--json` に
+                # 現れない（実機確認済み）——本サーバは呼び出し元が親か子か区別できないため、初回の
+                # 質問は常にサイドカーへも書く（親が直接呼んだ通常実行では、親は同じ質問を自分の
+                # `--json` item から既に見えている＝二重には効かない・provider.py 側が
+                # `codex_question is None` の時だけサイドカー分を使う）。
+                _q = agentic_search._question_from_args(args)
+                if isinstance(_q, dict):
+                    _sidecar_append({"kind": "ask_user", "ts": time.time(), "question": _q})
+            else:
+                text = _ASK_RESULT_AGAIN
             return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": False})
         try:
             result, _docs, _cites, _cards = agentic_search.run_tool(name, args, _world(), _scope(), layer=_layer())
@@ -170,9 +229,27 @@ def handle(req: dict) -> dict | None:
             err_body = {"error": "graph_reingest_required", "world": e.world, "stored_era": e.stored_era}
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                              "isError": True})
+        is_error = bool(isinstance(result, dict) and result.get("error"))
+        if not is_error:
+            # DEPTH-2 S3b: 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
+            # `_sidecar_append` は `SHERPA_MCP_SIDECAR` 未設定なら no-op（既存の単一エージェント実行に
+            # は影響しない）。
+            if name in READ_DOC_TOOLS:
+                d = args.get("doc_id")
+                if isinstance(d, str) and d:
+                    _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
+            elif name in LISTED_DOC_TOOLS:
+                d = args.get("doc_id")
+                if isinstance(d, str) and d:
+                    _sidecar_append({"kind": "listed", "tool": name, "doc_id": d, "ts": time.time()})
+            elif name == "compare_documents":
+                for k in COMPARE_DOC_ID_ARGS:
+                    d = args.get(k)
+                    if isinstance(d, str) and d:
+                        _sidecar_append({"kind": "read", "tool": name, "doc_id": d, "ts": time.time()})
         # MCP 標準＝content[].text。Codex が読む本文＝run_tool の結果（graph_neighbors は compact neighbors）。
         return _ok(rid, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
-                         "isError": bool(isinstance(result, dict) and result.get("error"))})
+                         "isError": is_error})
     if is_notification:                       # notifications/initialized 等＝応答しない
         return None
     return _err(rid, -32601, f"method not found: {method}")
