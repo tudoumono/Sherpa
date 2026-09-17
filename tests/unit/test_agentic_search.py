@@ -401,10 +401,11 @@ def test_run_tool_window_cap_raises_read_around_ceiling(monkeypatch, tmp_path):
 # world/scope_paths とは無関係（引数検証・dispatch・cards サイドカーだけを固定する・DB は monkeypatch
 # で切り離す＝本ファイルの他の run_tool テストと同じ「実埋め込み/実DBを叩かない」流儀）。
 
-def test_usage_openai_tools_and_gemini_tools_expose_exactly_seven_tools():
-    """裁定（2026-09-12）: ツールは7つのみ（world別/モデル別は足さない）。"""
+def test_usage_openai_tools_and_gemini_tools_expose_exactly_eight_tools():
+    """裁定（2026-09-12・巡別記録の分布ツールで1つ追加）: ツールは8つのみ
+    （world別/モデル別は足さない）。"""
     names = {"usage_overview", "usage_by_user", "usage_conversations", "usage_conversation_detail",
-            "usage_response_time", "usage_daily", "usage_stop_kinds"}
+            "usage_response_time", "usage_daily", "usage_stop_kinds", "usage_depth_rounds"}
     openai_tools = A.usage_openai_tools()
     assert {t["function"]["name"] for t in openai_tools} == names
     assert all(t["type"] == "function" and t["function"]["parameters"] for t in openai_tools)
@@ -417,6 +418,7 @@ def test_usage_openai_tools_and_gemini_tools_expose_exactly_seven_tools():
     ("usage_response_time", "usage_response_time", (30,)),
     ("usage_daily", "usage_daily", (30,)),
     ("usage_stop_kinds", "usage_stop_kinds", (30,)),
+    ("usage_depth_rounds", "usage_depth_rounds", (30,)),
 ])
 def test_run_tool_usage_dispatch_uses_default_days_when_omitted(monkeypatch, tool_name, store_fn,
                                                                 expected_args):
@@ -433,6 +435,56 @@ def test_run_tool_usage_dispatch_uses_default_days_when_omitted(monkeypatch, too
     assert result == {"ok": True} and docs == set() and cites == []
     assert captured["args"][0] == expected_args[0]
     assert cards == [{"tool": tool_name, "args": {}}]   # 引数省略＝echo する既知キーも空
+
+
+_FROM_TO_TOOLS = ["usage_overview", "usage_by_user", "usage_conversations", "usage_stop_kinds",
+                  "usage_depth_rounds"]
+
+
+@pytest.mark.parametrize("tool_name", _FROM_TO_TOOLS)
+def test_run_tool_usage_forwards_from_to(monkeypatch, tool_name):
+    """期間を from/to で受けるツールは、値をそのまま `store.usage_*` へ渡す（日数へ丸めない）。
+    呼び出しカードにも from/to が echo される。"""
+    captured = {}
+
+    def _fake(*a, **kw):
+        captured["args"], captured["kwargs"] = a, kw
+        return {"ok": True}
+
+    monkeypatch.setattr(store, tool_name, _fake)
+    args = {"from": "2026-09-18T00:00:00+09:00", "to": "2026-09-19T00:00:00+09:00"}
+    result, _docs, _cites, cards = A.run_tool(tool_name, args, "v1", None)
+    assert result == {"ok": True}
+    assert captured["kwargs"]["time_from"] == args["from"]
+    assert captured["kwargs"]["time_to"] == args["to"]
+    assert cards == [{"tool": tool_name, "args": args}]
+
+
+@pytest.mark.parametrize("tool_name", _FROM_TO_TOOLS)
+def test_run_tool_usage_rejects_days_with_from_to(monkeypatch, tool_name):
+    """`days` と `from`/`to` の併用はエラー（どちらの期間で読んだのか曖昧な結果を返さない）。"""
+    called = []
+    monkeypatch.setattr(store, tool_name, lambda *a, **kw: called.append((a, kw)))
+    result, _docs, _cites, _cards = A.run_tool(
+        tool_name,
+        {"days": 7, "from": "2026-09-18T00:00:00+09:00", "to": "2026-09-19T00:00:00+09:00"},
+        "v1", None)
+    assert "error" in result and called == []
+
+
+@pytest.mark.parametrize("tool_name", _FROM_TO_TOOLS)
+def test_run_tool_usage_reports_period_rule_violation_as_error(monkeypatch, tool_name):
+    """期間規則違反（オフセットなし等）は例外ではなく error 辞書で返す（他のツール引数検証と同じ）。
+
+    判定は store 側（`_usage_period`）——ここは `UsagePeriodError` が error 辞書へ写ることを固定する。
+    """
+    def _raise(*a, **kw):
+        raise store.UsagePeriodError("from にはタイムゾーンオフセットが必要です")
+
+    monkeypatch.setattr(store, tool_name, _raise)
+    result, _docs, _cites, _cards = A.run_tool(
+        tool_name, {"from": "2026-09-18T00:00:00", "to": "2026-09-19T00:00:00"}, "v1", None)
+    assert "error" in result
 
 
 def test_run_tool_usage_by_user_default_days_is_seven_and_forwards_uid_kind(monkeypatch):

@@ -110,14 +110,15 @@ except Exception as e:  # pragma: no cover
     agentic_search = None  # type: ignore[assignment]
 
 
-# ===== POLICY 表（85 ルート・機械的初期値＋条件付き admin は 'login' へ寄せた手動補正）=====
+# ===== POLICY 表（86 ルート・機械的初期値＋条件付き admin は 'login' へ寄せた手動補正）=====
 POLICY: dict[tuple[str, str], str] = {
-    # ---- admin（_require_admin 必須・38）----
+    # ---- admin（_require_admin 必須・39）----
     ("GET", "/admin/audit"): "admin",
     ("GET", "/admin/audit/verify"): "admin",
     ("GET", "/admin/audit/export"): "admin",
     ("GET", "/admin/usage/stats"): "admin",
     ("POST", "/admin/usage/chat"): "admin",
+    ("POST", "/admin/usage/quality-runs"): "admin",
     ("GET", "/admin/improvement-log/export"): "admin",
     ("GET", "/admin/settings"): "admin",
     ("PUT", "/admin/settings"): "admin",
@@ -238,6 +239,9 @@ DENY_ONLY: set[tuple[str, str]] = {
     ("POST", "/impact/run"),
     ("POST", "/graph/ask"),
     ("POST", "/admin/usage/chat"),
+    # DB へ1行 INSERT する（`admin/announcements` と同じ「安全な no-op body が無い create」
+    # パターン・許可側 probe を通すと実データが残る）。
+    ("POST", "/admin/usage/quality-runs"),
     ("POST", "/ingest/rerun"),
     ("POST", "/admin/announcements"),
     ("POST", "/ext/v1/admin/keys"),
@@ -354,7 +358,8 @@ def test_policy_covers_all_routes():
     # admin=GRAPH-SRC（2026-09-04・K9-K11）で旧・意味層フル抽出/対応橋の4ルート（extract・
     # concepts/propose・confirm・disable）を撤去し40。
     # login=SH-1/SH-2（2026-09-05・共有フォーク＋再共有）で3ルート追加（fork・refresh・共有一覧）し49。
-    assert len(ADMIN_ROUTES) == 40
+    # admin=品質採点の入口（POST /admin/usage/quality-runs）1件追加で41。
+    assert len(ADMIN_ROUTES) == 41
     assert len(EXT_KEY_ROUTES) == 6
     assert len(SPECIAL_ROUTES) == 7
     assert len(LOGIN_ROUTES) == 49

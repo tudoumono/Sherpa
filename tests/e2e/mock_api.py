@@ -792,7 +792,8 @@ USAGE_STATS_DEFAULT = {
         {"date": "2026-07-02", "turns": 4, "active_users": 1},
         {"date": "2026-07-03", "turns": 6, "active_users": 2},
     ],
-    "period": {"start": "2026-06-04", "end": "2026-07-03", "days": 30},
+    "period": {"start": "2026-06-04", "end": "2026-07-03", "days": 30,
+               "from": "2026-06-04T00:00:00+09:00", "to": "2026-07-04T00:00:00+09:00"},
     "zero_hit": {"knowledge_turns": 14, "zero_hit_turns": 3, "rate": 0.21428571428571427},
     "worlds": [{"world": "test", "turns": 16}],
     "providers": [
@@ -928,6 +929,66 @@ USAGE_STATS_DEFAULT = {
              "synthesis_truncated_turns": 1,
              "search_truncated_turns": 0, "search_truncated_total": 0,
              "auto_continues_turns": 0, "auto_continues_total": 0},
+        ],
+    },
+    # 巡別記録（chat-round・表示専用）の深さ×経路別/巡番号別の活動量。
+    "rounds": {
+        "by_depth_provider": [
+            {"depth_profile": "deep", "provider": "codex", "rounds": 8,
+             "citations_delta_total": 12.0, "citations_delta_avg": 1.5,
+             "elapsed_ms_total": 9600, "elapsed_ms_avg": 1200.0, "elapsed_n": 8,
+             "input_tokens": 4000, "output_tokens": 800, "tokens_n": 8,
+             "claims": {"confirmed": 5, "inferred": 2, "unknown": 1},
+             "reason_codes": {"budget": 1},
+             "limits": {"tool_result_clipped": 2, "auto_continues": 1},
+             "verdicts": {"insufficient": 4, "sufficient": 4},
+             "stops": {"rerun": 4, "sufficient": 4},
+             "missing_codes": {"unexplored": 3, "insufficient": 1}},
+        ],
+        "by_round": [
+            {"depth_profile": "deep", "provider": "codex", "round_no": 1, "rounds": 4,
+             "citations_delta_total": 5.0, "citations_delta_avg": 1.25,
+             "elapsed_ms_total": 4800, "elapsed_ms_avg": 1200.0, "elapsed_n": 4,
+             "input_tokens": 2000, "output_tokens": 400, "tokens_n": 4,
+             "claims": {"confirmed": 2, "inferred": 1, "unknown": 1},
+             "reason_codes": {"budget": 1},
+             "limits": {"tool_result_clipped": 1},
+             "verdicts": {"insufficient": 4},
+             "stops": {"rerun": 4},
+             "missing_codes": {"unexplored": 2, "insufficient": 1}},
+            {"depth_profile": "deep", "provider": "codex", "round_no": 2, "rounds": 4,
+             "citations_delta_total": 7.0, "citations_delta_avg": 1.75,
+             "elapsed_ms_total": 4800, "elapsed_ms_avg": 1200.0, "elapsed_n": 4,
+             "input_tokens": 2000, "output_tokens": 400, "tokens_n": 4,
+             "claims": {"confirmed": 3, "inferred": 1, "unknown": 0},
+             "reason_codes": {},
+             "limits": {"tool_result_clipped": 1, "auto_continues": 1},
+             "verdicts": {"sufficient": 4},
+             "stops": {"sufficient": 4},
+             "missing_codes": {"unexplored": 1}},
+        ],
+        "round_distribution": [
+            {"depth_profile": "deep", "provider": "codex", "rounds_reached": 2, "turns": 4},
+        ],
+        "unmatched_rounds": 0,
+        "reason_codes": {
+            "final": [
+                {"depth_profile": "deep", "provider": "codex", "reason_code": "budget", "claims": 1},
+            ],
+            "rounds": [
+                {"depth_profile": "deep", "provider": "codex", "reason_code": "budget", "claims": 1},
+            ],
+        },
+    },
+    # 品質採点（1巡 vs 3巡等の正解付き比較）の条件×巡数別集計。
+    "quality_runs": {
+        "period": {"start": "2026-06-04", "end": "2026-07-03", "days": 30,
+                   "from": "2026-06-04T00:00:00+09:00", "to": "2026-07-04T00:00:00+09:00"},
+        "by_rounds": [
+            {"condition": "main", "rounds": 0, "runs": 3, "correct": 2, "wrong_assertion": 1,
+             "missing": 0, "regressed": 0, "unrated": 0, "cost_usd_total": 0.12},
+            {"condition": "depth2-deep", "rounds": 3, "runs": 2, "correct": 2, "wrong_assertion": 0,
+             "missing": 0, "regressed": 0, "unrated": 0, "cost_usd_total": 0.36},
         ],
     },
 }

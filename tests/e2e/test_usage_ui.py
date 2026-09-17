@@ -11,8 +11,24 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     頭脳別・週次アクティブ+再訪率・原本DL数）が実データで表示される。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-standard"
+    stats["quality_runs"]["by_rounds"][1]["rounds"] = 0
+    install_api_mocks(page, usage_stats=stats)
     page.goto(f"{web_base_url}/usage.html")
+
+    review = page.locator("#review-stats")
+    expect(review.locator("table")).to_have_count(3)
+    expect(review.locator("table").nth(0).locator("tbody tr")).to_have_count(1)
+    expect(review.locator("table").nth(1).locator("tbody tr")).to_have_count(2)
+    quality_table = review.locator("table").nth(2)
+    expect(quality_table.locator("tbody tr")).to_have_count(2)
+    expect(quality_table.locator("thead th").first).to_have_text("条件")
+    expect(quality_table).to_contain_text("本番相当")
+    expect(quality_table).to_contain_text("見直しなし")
+    expect(review).to_contain_text("未調査: 3")
+    expect(review).to_contain_text("次の見直しへ: 4")
+    expect(review).to_contain_text("0.36")
 
     # ゼロヒット率タイル（totals.zero_hit.rate=0.2142... → 21%）。
     expect(page.locator("#t-zerohit")).to_have_text("21%")
@@ -72,6 +88,13 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
 
     expect(page.locator("#t-zerohit")).to_have_text("—")
     expect(page.locator("#usage-tbody .empty-row")).to_be_visible()
+    expect(page.locator("#review-stats table")).to_have_count(3)
+    expect(page.locator("#review-stats .hint", has_text="見直しの機能はこの環境では未導入です。")).to_be_visible()
+    expect(page.locator("#review-stats tbody td")).to_have_text([
+        "この期間の記録はありません。",
+        "この期間の記録はありません。",
+        "この期間の記録はありません。",
+    ])
 
     expect(page.locator("#heatmap-empty")).to_be_visible()
     expect(page.locator("#chart-world-empty")).to_be_visible()

@@ -6,9 +6,11 @@ MESSAGE_FEEDBACK_COMMENT_MAX_LEN
 MESSAGE_FEEDBACK_TAGS
 OpenAIEndpointSettingsConflict
 PersonalKeysDisallowedError
+QUALITY_RUN_CONDITIONS
 SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK
 SelfIssuedQuotaExceededError
 ShareNotSanitizedError
+UsagePeriodError
 UserApiKeysDisallowedError
 _ANNOUNCEMENT_FIELDS
 _AUDIT_CANON_FIELDS
@@ -86,6 +88,7 @@ delete_conversation
 delete_expired_announcements
 delete_workspace_file
 delete_world_row
+depth_quality_stats
 dict_row
 document_exists
 downgrade_orphaned_extracting_runs
@@ -140,6 +143,7 @@ owns_assistant_message
 owns_conversation
 purge_personal_api_keys
 recent_messages
+record_depth_quality_run
 record_workspace_file
 refresh_sanitized_share
 rename_conversation
@@ -180,6 +184,7 @@ usage_by_user
 usage_conversation_detail
 usage_conversations
 usage_daily
+usage_depth_rounds
 usage_overview
 usage_response_time
 usage_stats

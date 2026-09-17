@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
-from sherpa import auth, store
+from sherpa import agentic_search, auth, store
 from sherpa.api import app
 
 
@@ -2181,3 +2182,703 @@ def test_usage_stop_kinds_filters_by_uid():
     assert out["uid"] == uid_a
     total = sum(r["turns"] for r in out["stop_kinds"])
     assert total == 1, "uid で絞り込んだのに他ユーザーのターンが混入した"
+
+
+# ===== 巡別記録（chat-round）の集計・期間指定（from/to）・品質採点の入口 =====
+
+def _add_chat_round(cid: int, *, provider: str, model: str, round_no: int,
+                    citations_delta: int, confirmed: int, inferred: int, unknown: int,
+                    reason_codes: dict, world: str, uid: str, ts=None,
+                    input_tokens: int | None = None, output_tokens: int | None = None) -> None:
+    """1巡分の `chat-round` イベントを仕込む（巡ループが実際に書く meta 形と同じキー）。"""
+    store.add_usage_event(
+        kind="chat-round", provider=provider, model=model, calls=1,
+        input_tokens=10 * round_no if input_tokens is None else input_tokens,
+        output_tokens=5 * round_no if output_tokens is None else output_tokens,
+        user_id=uid, world=world, conversation_id=cid, ts=ts,
+        meta={"round": round_no, "verdict": "insufficient", "missing": "", "stop": "",
+              "lens": "qa", "citations_delta": citations_delta,
+              "limits": {}, "claims": {"confirmed": confirmed, "inferred": inferred,
+                                       "unknown": unknown, "reason_codes": reason_codes},
+              "roles": {}})
+
+
+def _delete_quality_runs(run_ids: list) -> None:
+    try:
+        with psycopg.connect(store._dsn()) as c:
+            c.execute("DELETE FROM depth_quality_runs WHERE run_id = ANY(%s)", (run_ids,))
+    except Exception:
+        pass
+
+
+def test_usage_stats_rounds_depth_provider_distribution_and_reason_codes():
+    """chat-round（巡別記録）から深さ×経路別の巡数分布・活動量、最終回答の `data.claims` から
+    不明理由コードの分布を集計する。既存集計（tokens.by_kind/by_user_kind・conversations_top・
+    response_time）は chat-round 行の有無で変わらない（正本と二重に足さない）。
+    本文（質問/回答）は応答のどこにも出ない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgrdadm{sfx}", f"UsgRdAdm{sfx}"
+    uid, pw = f"usgrd{sfx}", f"UsgRd{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"statsworldrd{sfx}"
+    provider = f"testprovrd{sfx}"
+    model = f"test-model-round-{sfx}"
+    secret_q = f"質問本文-秘密{sfx}"
+    secret_a = f"回答本文-非公開{sfx}"
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _get_stats():
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    before = _get_stats()
+    before_by_kind_keys = {(row["kind"], row["model"]) for row in before["tokens"]["by_kind"]}
+    before_conv_n = len(before["conversations_top"])
+    before_rt_n = before["response_time"]["overall"]["n"] or 0
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"rounds-{sfx}")
+    cid = conv["id"]
+    store.add_message(cid, "user", secret_q)
+    _add_chat_round(cid, provider=provider, model=model, round_no=1, citations_delta=2,
+                    confirmed=1, inferred=0, unknown=1, reason_codes={"budget": 1},
+                    world=world, uid=uid)
+    _add_chat_round(cid, provider=provider, model=model, round_no=2, citations_delta=3,
+                    confirmed=2, inferred=0, unknown=0, reason_codes={},
+                    world=world, uid=uid)
+    store.add_message(
+        cid, "assistant", secret_a, lens="qa",
+        answer={"usage": {"provider": provider, "depth_profile": "deep",
+                          "input_tokens": 100, "output_tokens": 50},
+                "duration_ms": 1234, "sources": [],
+                "data": {"claims": [
+                    {"id": "c1", "status": "confirmed", "text": "x", "evidence_refs": [],
+                     "reason": "", "reason_code": ""},
+                    {"id": "c2", "status": "unknown", "text": "y", "evidence_refs": [],
+                     "reason": "", "reason_code": "budget"},
+                ]}})
+
+    try:
+        after = _get_stats()
+        after_by_kind_keys = {(row["kind"], row["model"]) for row in after["tokens"]["by_kind"]}
+        assert ("chat-round", model) not in after_by_kind_keys, "chat-round が課金集計に混入した"
+        # chat-round 由来の kind 名（'chat-round'）はどの by_kind 行にも現れない
+        # （新しく増えた行があるとすれば自会話の 'chat' 行だけ・二重計上の対象外）。
+        new_kind_names = {kind for kind, _ in (after_by_kind_keys - before_by_kind_keys)}
+        assert "chat-round" not in new_kind_names
+        assert all(row["kind"] != "chat-round" for row in after["tokens"]["by_user_kind"])
+
+        # conversations_top/response_time は「新しい会話が1件増える」以外の形が変わらないこと
+        # （chat-round 由来の kind が conv["kinds"] に紛れ込まない）だけを確認する。
+        assert len(after["conversations_top"]) >= before_conv_n
+        conv_entry = next(c for c in after["conversations_top"] if c["conversation_id"] == cid)
+        assert all(k["kind"] != "chat-round" for k in conv_entry["kinds"])
+        assert (after["response_time"]["overall"]["n"] or 0) >= before_rt_n + 1
+
+        rounds = after["rounds"]
+        by_dp = {(r["depth_profile"], r["provider"]): r for r in rounds["by_depth_provider"]}
+        row = by_dp[("deep", provider)]
+        assert row["rounds"] == 2
+        assert row["citations_delta_total"] == 5
+        assert row["input_tokens"] == 10 + 20 and row["output_tokens"] == 5 + 10
+        assert row["claims"] == {"confirmed": 3, "inferred": 0, "unknown": 1}
+        assert row["reason_codes"] == {"budget": 1}
+
+        dist = {(r["depth_profile"], r["provider"], r["rounds_reached"]): r["turns"]
+                for r in rounds["round_distribution"]}
+        assert dist[("deep", provider, 2)] == 1
+
+        final_codes = {(r["depth_profile"], r["provider"], r["reason_code"]): r["claims"]
+                       for r in rounds["reason_codes"]["final"]}
+        assert final_codes[("deep", provider, "budget")] == 1
+
+        round_codes = {(r["depth_profile"], r["provider"], r["reason_code"]): r["claims"]
+                      for r in rounds["reason_codes"]["rounds"]}
+        assert round_codes[("deep", provider, "budget")] == 1
+
+        # 本文（質問/回答）は集計レスポンスのどこにも出ない。
+        body_text = json.dumps(after, ensure_ascii=False)
+        assert secret_q not in body_text and secret_a not in body_text
+    finally:
+        _delete_usage_events_by_model([model])
+
+
+def test_usage_depth_rounds_tool_omits_body():
+    """`usage_depth_rounds`（管理者向け利用統計チャットの調査ツール）は深さ×経路の巡数分布と
+    不明理由コードの分布だけを返し、本文（質問/回答/資料名）を一切含まない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid = f"u4drt{sfx}"
+    _mk_user(uid, f"U4drtPw{sfx}")
+    world = f"u4drtworld{sfx}"
+    provider = f"u4drt-prov-{sfx}"
+    model = f"u4drt-model-{sfx}"
+    secret_q, secret_a = f"秘密の質問{sfx}", f"秘密の回答{sfx}"
+
+    conv = store.create_conversation(user_id=uid, world=world)
+    cid = conv["id"]
+    store.add_message(cid, "user", secret_q)
+    _add_chat_round(cid, provider=provider, model=model, round_no=1, citations_delta=1,
+                    confirmed=0, inferred=0, unknown=1, reason_codes={"conflict": 1},
+                    world=world, uid=uid)
+    store.add_message(cid, "assistant", secret_a, lens="qa",
+                      answer={"usage": {"provider": provider, "depth_profile": "max"},
+                              "sources": [],
+                              "data": {"claims": [
+                                  {"id": "c1", "status": "unknown", "text": "y",
+                                   "evidence_refs": [], "reason": "", "reason_code": "conflict"},
+                              ]}})
+    try:
+        out = store.usage_depth_rounds(days=30)
+        body_text = json.dumps(out, ensure_ascii=False)
+        assert secret_q not in body_text and secret_a not in body_text
+        dist = {(r["depth_profile"], r["provider"], r["rounds_reached"]): r["turns"]
+                for r in out["round_distribution"]}
+        assert dist[("max", provider, 1)] == 1
+        round_codes = {(r["depth_profile"], r["provider"], r["reason_code"]): r["claims"]
+                      for r in out["reason_codes"]["rounds"]}
+        assert round_codes[("max", provider, "conflict")] == 1
+        final_codes = {(r["depth_profile"], r["provider"], r["reason_code"]): r["claims"]
+                       for r in out["reason_codes"]["final"]}
+        assert final_codes[("max", provider, "conflict")] == 1
+    finally:
+        _delete_usage_events_by_model([model])
+
+
+def test_usage_stats_rounds_period_follows_owning_turn_not_round_ts():
+    """巡別記録の期間判定は「巡が属する user ターン」の created_at を使う——巡イベント自身の
+    `ts`（記録時刻）が期間内でも、そのターン（user/assistant）が期間外なら数えない
+    （最終回答由来の集計と母集団を揃える。`turns`/`conv_turn_rows` 等、他の集計と同じ境界）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgrdprd{sfx}", f"UsgRdPrd{sfx}"
+    uid, pw = f"usgprd{sfx}", f"UsgPrd{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"prdworld{sfx}"
+    provider = f"prdprov{sfx}"
+    model = f"prd-model-{sfx}"
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"prd-{sfx}")
+    cid = conv["id"]
+    store.add_message(cid, "user", "10日前の質問")
+    _add_chat_round(cid, provider=provider, model=model, round_no=1, citations_delta=1,
+                    confirmed=0, inferred=0, unknown=0, reason_codes={}, world=world, uid=uid)
+    store.add_message(cid, "assistant", "10日前の回答", lens="qa",
+                      answer={"usage": {"provider": provider, "depth_profile": "deep"}, "sources": []})
+    # user メッセージだけを10日前に巻き戻す（assistant はそのまま「今」＝巡の ts 以降を保つ——
+    # 対応付け LATERAL の「assistant.created_at >= 巡の ts」を壊さない）。chat-round イベント
+    # 自身の ts は「今」のまま（period 判定が「巡が属する user ターン」を見ているかを確認する
+    # ための不整合を作る）。
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET created_at = now() - interval '10 days' "
+                  "WHERE conversation_id=%s AND role='user'", (cid,))
+
+    admin = _login(admin_uid, admin_pw)
+    try:
+        out1d = admin.get("/admin/usage/stats?days=1").json()
+        by_dp_1d = {(r["depth_profile"], r["provider"]): r for r in out1d["rounds"]["by_depth_provider"]}
+        assert ("deep", provider) not in by_dp_1d, (
+            "所属ターンが期間外なのに巡イベント自身の ts（今）で days=1 の集計に混入した")
+
+        out30d = admin.get("/admin/usage/stats?days=30").json()
+        by_dp_30d = {(r["depth_profile"], r["provider"]): r for r in out30d["rounds"]["by_depth_provider"]}
+        assert ("deep", provider) in by_dp_30d, "所属ターンが期間内（30日）なのに巡が集計から漏れた"
+        assert by_dp_30d[("deep", provider)]["rounds"] == 1
+    finally:
+        _delete_usage_events_by_model([model])
+
+
+def test_usage_stats_rounds_do_not_bind_to_next_turns_assistant():
+    """巡→assistant の対応付けは「巡の ts 以降・かつ同会話の次の user メッセージより前」に
+    限定する。このターンの assistant が未保存（利用者の停止等）でも、次ターンの assistant へ
+    誤って結合されて水増しされてはいけない——対応が見つからない巡は unmatched_rounds に落ちる。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgrdunm{sfx}", f"UsgRdUnm{sfx}"
+    uid, pw = f"usgunm{sfx}", f"UsgUnm{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, pw, role="user")
+    world = f"unmworld{sfx}"
+    provider = f"unmprov{sfx}"
+    model = f"unm-model-{sfx}"
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"unm-{sfx}")
+    cid = conv["id"]
+    store.add_message(cid, "user", "turn1（停止・回答未保存）")
+    _add_chat_round(cid, provider=provider, model=model, round_no=1, citations_delta=1,
+                    confirmed=0, inferred=0, unknown=0, reason_codes={}, world=world, uid=uid)
+    # turn1 は利用者の停止等で assistant を保存しないまま turn2 が始まる。
+    store.add_message(cid, "user", "turn2")
+    store.add_message(cid, "assistant", "turn2 回答", lens="qa",
+                      answer={"usage": {"provider": provider, "depth_profile": "max"}, "sources": []})
+
+    admin = _login(admin_uid, admin_pw)
+    try:
+        out = admin.get("/admin/usage/stats?days=30").json()
+        rounds = out["rounds"]
+        dist_max = [r for r in rounds["round_distribution"]
+                    if r["depth_profile"] == "max" and r["provider"] == provider]
+        assert dist_max == [], "turn1 の巡が turn2 の assistant（depth=max）へ誤結合された"
+        by_dp = {(r["depth_profile"], r["provider"]): r for r in rounds["by_depth_provider"]}
+        assert ("max", provider) not in by_dp
+        assert rounds["unmatched_rounds"] >= 1
+    finally:
+        _delete_usage_events_by_model([model])
+
+
+# ----- 期間指定（from/to）-----
+
+def _seed_round_turn(cid: int, *, at, provider: str, model: str, world: str, uid: str,
+                     input_tokens: int, text: str) -> None:
+    """user ターン（`at`）→ 巡（`at`+1分）→ assistant（`at`+2分）を明示時刻で仕込む。
+
+    期間境界のテストは「所属する user ターンの created_at」で判定される（`_round_rows_query`）
+    ため、user メッセージの created_at を直接 UPDATE して境界ちょうどに置く。
+    """
+    store.add_message(cid, "user", text)
+    _add_chat_round(cid, provider=provider, model=model, round_no=1, citations_delta=1,
+                    confirmed=1, inferred=0, unknown=0, reason_codes={}, world=world, uid=uid,
+                    ts=at + timedelta(minutes=1), input_tokens=input_tokens, output_tokens=1)
+    store.add_message(cid, "assistant", f"{text}への回答", lens="qa",
+                      answer={"usage": {"provider": provider, "depth_profile": "deep"},
+                              "sources": []})
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET created_at=%s WHERE id=("
+                  "  SELECT id FROM messages WHERE conversation_id=%s AND role='user' "
+                  "  ORDER BY id DESC LIMIT 1)", (at, cid))
+        c.execute("UPDATE messages SET created_at=%s WHERE id=("
+                  "  SELECT id FROM messages WHERE conversation_id=%s AND role='assistant' "
+                  "  ORDER BY id DESC LIMIT 1)", (at + timedelta(minutes=2), cid))
+
+
+def test_usage_stats_from_to_is_half_open_and_matches_tool():
+    """同じ JST 日の中で from/to を切り替えると、下限は含み上限は含まない（半開区間）。
+    同じ期間なら `GET /admin/usage/stats` の `rounds` と `usage_depth_rounds` ツールの集計が一致し、
+    等価な UTC 表記でも同じ結果になる。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgftadm{sfx}", f"UsgFtAdm{sfx}"
+    uid = f"usgft{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, f"UsgFt{sfx}")
+    world = f"ftworld{sfx}"
+    provider = f"ftprov{sfx}"
+    model = f"ft-model-{sfx}"
+
+    jst = timezone(timedelta(hours=9))
+    base = datetime.now(jst).replace(hour=6, minute=0, second=0, microsecond=0)
+    switch = base + timedelta(hours=6)       # 同じ JST 日の「切替時刻」
+    end = base + timedelta(hours=12)
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"ft-{sfx}")
+    cid = conv["id"]
+    _seed_round_turn(cid, at=base, provider=provider, model=model, world=world, uid=uid,
+                     input_tokens=10, text="切替前の質問")
+    _seed_round_turn(cid, at=switch, provider=provider, model=model, world=world, uid=uid,
+                     input_tokens=20, text="切替後の質問")
+
+    admin = _login(admin_uid, admin_pw)
+
+    def _api_rounds(f, t):
+        r = admin.get("/admin/usage/stats", params={"from": f.isoformat(), "to": t.isoformat()})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    try:
+        # [base, switch): 下限ちょうどの記録を含み、上限ちょうどの記録は含まない。
+        before = _api_rounds(base, switch)
+        by_dp = {(r["depth_profile"], r["provider"]): r for r in before["rounds"]["by_depth_provider"]}
+        assert by_dp[("deep", provider)]["rounds"] == 1
+        assert by_dp[("deep", provider)]["input_tokens"] == 10
+        assert before["period"]["from"] == base.isoformat()
+        assert before["period"]["to"] == switch.isoformat()
+
+        # [switch, end): 上限ちょうどで切られた側がこちらに入る。
+        after = _api_rounds(switch, end)
+        by_dp_after = {(r["depth_profile"], r["provider"]): r
+                       for r in after["rounds"]["by_depth_provider"]}
+        assert by_dp_after[("deep", provider)]["rounds"] == 1
+        assert by_dp_after[("deep", provider)]["input_tokens"] == 20
+
+        # API とツールは同じ期間・同じ集計（U4 ツールが返す2表は API の rounds と一致する）。
+        tool = store.usage_depth_rounds(time_from=base.isoformat(), time_to=switch.isoformat())
+        assert tool["round_distribution"] == before["rounds"]["round_distribution"]
+        assert tool["reason_codes"] == before["rounds"]["reason_codes"]
+        assert tool["unmatched_rounds"] == before["rounds"]["unmatched_rounds"]
+        assert tool["period"]["from"] == base.isoformat()
+
+        # 等価な UTC 表記でも同じ結果（オフセットを解釈している）。
+        utc_same = _api_rounds(base.astimezone(timezone.utc), switch.astimezone(timezone.utc))
+        assert utc_same["rounds"]["by_depth_provider"] == before["rounds"]["by_depth_provider"]
+
+        # 他の調査ツール（agentic_search.run_tool 経由）も同じ規則で同じ期間を読む。
+        def _tool(name, f, t, **extra):
+            out, _docs, _cites, _cards = agentic_search.run_tool(
+                name, {"from": f.isoformat(), "to": t.isoformat(), **extra}, "v1", None)
+            return out
+
+        # usage_conversations: 会話は同じでも user ターン数が期間で変わる（2ターン→1ターン）。
+        conv_wide = _tool("usage_conversations", base, end)
+        conv_narrow = _tool("usage_conversations", base, switch)
+        wide_turns = next(c["user_turns"] for c in conv_wide["conversations"]
+                          if c["conversation_id"] == cid)
+        narrow_turns = next(c["user_turns"] for c in conv_narrow["conversations"]
+                            if c["conversation_id"] == cid)
+        assert wide_turns == 2 and narrow_turns == 1
+        assert conv_narrow["period"]["from"] == base.isoformat()
+        assert conv_narrow["period"]["to"] == switch.isoformat()
+
+        # usage_by_user: chat ターン由来の件数も同じ境界で変わる。
+        by_user_wide = _tool("usage_by_user", base, end, uid=uid, kind="chat")
+        by_user_narrow = _tool("usage_by_user", base, switch, uid=uid, kind="chat")
+        assert sum(r["calls"] for r in by_user_wide["rows"]) == 2
+        assert sum(r["calls"] for r in by_user_narrow["rows"]) == 1
+
+        # usage_stop_kinds: 同じ母集団（answer あり・clarify 除外）を同じ境界で数える。
+        sk_wide = _tool("usage_stop_kinds", base, end, uid=uid)
+        sk_narrow = _tool("usage_stop_kinds", base, switch, uid=uid)
+        assert sum(r["turns"] for r in sk_wide["stop_kinds"]) == 2
+        assert sum(r["turns"] for r in sk_narrow["stop_kinds"]) == 1
+
+        # 不正な期間（オフセットなし・days との併用）はどのツールでも error で返る。
+        for name in ("usage_overview", "usage_by_user", "usage_conversations",
+                     "usage_stop_kinds", "usage_depth_rounds"):
+            bad, _d, _c, _k = agentic_search.run_tool(
+                name, {"from": "2026-09-18T00:00:00", "to": "2026-09-19T00:00:00"}, "v1", None)
+            assert "error" in bad, name
+            both, _d, _c, _k = agentic_search.run_tool(
+                name, {"days": 7, "from": base.isoformat(), "to": switch.isoformat()}, "v1", None)
+            assert "error" in both, name
+    finally:
+        _delete_usage_events_by_model([model])
+
+
+def test_usage_stats_from_to_round_event_may_cross_upper_bound():
+    """巡集計の基準は「所属する user 発言の created_at」——巡イベント自身の `ts` が `to` を
+    越えていても、user 発言が期間内なら数える（`usage_events` 由来の集計が `ts` を基準にするのとは
+    別の基準。最終回答由来の集計と母集団を揃えるため）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgxbadm{sfx}", f"UsgXbAdm{sfx}"
+    uid = f"usgxb{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, f"UsgXb{sfx}")
+    world = f"xbworld{sfx}"
+    provider = f"xbprov{sfx}"
+    model = f"xb-model-{sfx}"
+
+    jst = timezone(timedelta(hours=9))
+    base = datetime.now(jst).replace(hour=6, minute=0, second=0, microsecond=0)
+    switch = base + timedelta(hours=6)
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"xb-{sfx}")
+    cid = conv["id"]
+    # user 発言は境界の1分前（期間内）・巡イベントと assistant は境界の後（期間外の時刻）。
+    store.add_message(cid, "user", "境界直前の質問")
+    _add_chat_round(cid, provider=provider, model=model, round_no=1, citations_delta=1,
+                    confirmed=1, inferred=0, unknown=0, reason_codes={}, world=world, uid=uid,
+                    ts=switch + timedelta(minutes=5), input_tokens=7, output_tokens=1)
+    store.add_message(cid, "assistant", "境界直後の回答", lens="qa",
+                      answer={"usage": {"provider": provider, "depth_profile": "deep"},
+                              "sources": []})
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE messages SET created_at=%s WHERE conversation_id=%s AND role='user'",
+                  (switch - timedelta(minutes=1), cid))
+        c.execute("UPDATE messages SET created_at=%s WHERE conversation_id=%s AND role='assistant'",
+                  (switch + timedelta(minutes=6), cid))
+
+    admin = _login(admin_uid, admin_pw)
+    try:
+        r = admin.get("/admin/usage/stats",
+                      params={"from": base.isoformat(), "to": switch.isoformat()})
+        assert r.status_code == 200, r.text
+        by_dp = {(x["depth_profile"], x["provider"]): x
+                 for x in r.json()["rounds"]["by_depth_provider"]}
+        assert by_dp[("deep", provider)]["rounds"] == 1, (
+            "巡イベントの ts が to を越えたら、所属 user 発言が期間内なのに数えられなくなった")
+        assert by_dp[("deep", provider)]["input_tokens"] == 7
+    finally:
+        _delete_usage_events_by_model([model])
+
+
+def test_usage_stats_from_to_validation_and_days_exclusivity():
+    """`days` の明示指定と `from`/`to` の併用は 422。`from`/`to` は両方必須・オフセット必須・
+    `from < to`・最大365日。`days` 省略時の既定（30日・JST 暦日）は従来どおり。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgfvadm{sfx}", f"UsgFvAdm{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    admin = _login(admin_uid, admin_pw)
+
+    f, t = "2026-09-18T00:00:00+09:00", "2026-09-19T00:00:00+09:00"
+    assert admin.get("/admin/usage/stats", params={"days": 7, "from": f, "to": t}).status_code == 422
+    assert admin.get("/admin/usage/stats", params={"from": f}).status_code == 422
+    assert admin.get("/admin/usage/stats", params={"to": t}).status_code == 422
+    assert admin.get("/admin/usage/stats",
+                     params={"from": "2026-09-18T00:00:00", "to": t}).status_code == 422
+    assert admin.get("/admin/usage/stats", params={"from": t, "to": f}).status_code == 422
+    assert admin.get("/admin/usage/stats",
+                     params={"from": "2026-01-01T00:00:00+09:00",
+                             "to": "2027-01-02T00:00:00+09:00"}).status_code == 422
+
+    # 既定（days 省略）は従来どおり30日・JST 暦日。実際に使った境界も返る。
+    r = admin.get("/admin/usage/stats")
+    assert r.status_code == 200, r.text
+    period = r.json()["period"]
+    b_start, b_start_date, b_end_date, b_end = store._usage_period_bounds(30)
+    assert period["days"] == 30
+    assert period["start"] == b_start_date.isoformat()
+    assert period["end"] == b_end_date.isoformat()
+    assert period["from"] == b_start.isoformat() and period["to"] == b_end.isoformat()
+
+
+def test_usage_overview_forwards_from_to_to_stats_and_quality_runs():
+    """`usage_overview` → `usage_stats` → `depth_quality_stats` の委譲で from/to が落ちない
+    （末端の SQL が同じ期間で照会する＝`period` が指定どおりに返る）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    f, t = "2026-09-18T03:00:00+09:00", "2026-09-18T18:00:00+09:00"
+    overview = store.usage_overview(time_from=f, time_to=t)
+    assert overview["period"]["from"] == f and overview["period"]["to"] == t
+    stats = store.usage_stats(time_from=f, time_to=t)
+    assert stats["period"]["from"] == f and stats["period"]["to"] == t
+    assert stats["quality_runs"]["period"]["from"] == f
+    assert stats["quality_runs"]["period"]["to"] == t
+
+
+# ----- 品質採点の入口（POST /admin/usage/quality-runs）-----
+
+def test_admin_usage_quality_run_records_condition_and_executed_period():
+    """`condition`（閉集合）別に集計され、`rounds=0`（見直しを回さない条件）も受け付ける。
+    母集団は実行期間（`executed_from`/`executed_to`）が照会期間に完全に含まれるランだけ
+    （登録時刻ではない＝後日登録しても元の実行期間で取れる）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgqcadm{sfx}", f"UsgQcAdm{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    admin = _login(admin_uid, admin_pw)
+
+    jst = timezone(timedelta(hours=9))
+    base = datetime.now(jst).replace(hour=6, minute=0, second=0, microsecond=0)
+    switch = base + timedelta(hours=6)
+    end = base + timedelta(hours=12)
+    run_main, run_deep, run_out = f"qr-main-{sfx}", f"qr-deep-{sfx}", f"qr-out-{sfx}"
+
+    def _post(run_id, condition, rounds, ef, et, **extra):
+        body = {"rounds": rounds, "condition": condition, "run_id": run_id,
+                "executed_from": ef.isoformat(), "executed_to": et.isoformat(), **extra}
+        return admin.post("/admin/usage/quality-runs", json=body)
+
+    try:
+        r1 = _post(run_main, "main", 0, base, switch, correct=4, wrong_assertion=1)
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["inserted"] is True
+        # 同じ rounds=0 でも条件が違えば別行に分かれる。
+        r2 = _post(run_deep, "depth2-standard", 0, base, switch, correct=5)
+        assert r2.status_code == 200, r2.text
+        # 実行期間が照会期間からはみ出すランは母集団に入らない。
+        r3 = _post(run_out, "depth2-deep", 3, switch, end + timedelta(hours=1), correct=1)
+        assert r3.status_code == 200, r3.text
+
+        out = store.depth_quality_stats(time_from=base.isoformat(), time_to=end.isoformat())
+        by_cond = {(r["condition"], r["rounds"]): r for r in out["by_rounds"]}
+        assert by_cond[("main", 0)]["correct"] == 4
+        assert by_cond[("main", 0)]["wrong_assertion"] == 1
+        assert by_cond[("depth2-standard", 0)]["correct"] == 5
+        assert ("depth2-deep", 3) not in by_cond, "実行期間が照会期間を超えるランが集計に入った"
+
+        # 実行期間の終端が照会の上限ちょうど（executed_to == to）のランは含む。
+        out_edge = store.depth_quality_stats(time_from=base.isoformat(), time_to=switch.isoformat())
+        by_cond_edge = {(r["condition"], r["rounds"]): r for r in out_edge["by_rounds"]}
+        assert by_cond_edge[("main", 0)]["runs"] == 1
+
+        # 開始が照会の下限より前のランは含まない。
+        out_late = store.depth_quality_stats(
+            time_from=(base + timedelta(minutes=1)).isoformat(), time_to=end.isoformat())
+        assert ("main", 0) not in {(r["condition"], r["rounds"]) for r in out_late["by_rounds"]}
+    finally:
+        _delete_quality_runs([run_main, run_deep, run_out])
+
+
+def test_usage_depth_rounds_includes_quality_by_condition():
+    """`usage_depth_rounds` は品質採点の条件別件数を `quality.by_rounds` として返す
+    （`usage_overview` 側のキーは `quality_runs`）。通常の利用記録（巡）を固定したまま、
+    品質採点だけが包含／非包含になる2期間で返却件数が変わる。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgqdadm{sfx}", f"UsgQdAdm{sfx}"
+    uid = f"usgqd{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    _mk_user(uid, f"UsgQd{sfx}")
+    world = f"qdworld{sfx}"
+    provider = f"qdprov{sfx}"
+    model = f"qd-model-{sfx}"
+    run_id = f"qr-tool-{sfx}"
+
+    jst = timezone(timedelta(hours=9))
+    base = datetime.now(jst).replace(hour=6, minute=0, second=0, microsecond=0)
+    mid = base + timedelta(hours=3)
+    end = base + timedelta(hours=6)
+
+    conv = store.create_conversation(user_id=uid, world=world, title=f"qd-{sfx}")
+    cid = conv["id"]
+    # 巡の記録は両方の期間に入る位置（base+1時間）に1件だけ置く＝差が出るのは品質採点だけ。
+    _seed_round_turn(cid, at=base + timedelta(hours=1), provider=provider, model=model,
+                     world=world, uid=uid, input_tokens=11, text="固定の質問")
+
+    admin = _login(admin_uid, admin_pw)
+    try:
+        # 実行期間 [mid, end) の採点ラン——[base, end) には含まれるが [base, mid) には含まれない。
+        r = admin.post("/admin/usage/quality-runs",
+                       json={"rounds": 0, "condition": "main", "run_id": run_id, "correct": 3,
+                             "executed_from": mid.isoformat(), "executed_to": end.isoformat()})
+        assert r.status_code == 200, r.text
+
+        wide = store.usage_depth_rounds(time_from=base.isoformat(), time_to=end.isoformat())
+        narrow = store.usage_depth_rounds(time_from=base.isoformat(), time_to=mid.isoformat())
+        # 巡の集計は両方で同じ（母集団を固定した）。
+        assert wide["round_distribution"] == narrow["round_distribution"]
+        wide_runs = {(x["condition"], x["rounds"]): x for x in wide["quality"]["by_rounds"]}
+        narrow_runs = {(x["condition"], x["rounds"]): x for x in narrow["quality"]["by_rounds"]}
+        assert wide_runs[("main", 0)]["correct"] == 3
+        assert ("main", 0) not in narrow_runs, "実行期間が照会期間からはみ出すランが含まれた"
+
+        # 利用統計チャットが読む概要（usage_overview）にも同じ品質採点が載る。
+        ov = store.usage_overview(time_from=base.isoformat(), time_to=end.isoformat())
+        ov_runs = {(x["condition"], x["rounds"]): x for x in ov["quality_runs"]["by_rounds"]}
+        assert ov_runs[("main", 0)]["correct"] == 3
+    finally:
+        _delete_usage_events_by_model([model])
+        _delete_quality_runs([run_id])
+
+
+def test_admin_usage_quality_run_rejects_invalid_condition_and_period():
+    """`condition` は閉集合のみ・実行期間はオフセット必須／`from < to`／最大365日。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgqvadm{sfx}", f"UsgQvAdm{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    admin = _login(admin_uid, admin_pw)
+    ok = {"rounds": 1, "condition": "depth2-deep",
+          "executed_from": "2026-09-18T00:00:00+09:00", "executed_to": "2026-09-19T00:00:00+09:00"}
+
+    assert admin.post("/admin/usage/quality-runs",
+                      json={**ok, "condition": "main-ish"}).status_code == 422
+    assert admin.post("/admin/usage/quality-runs",
+                      json={k: v for k, v in ok.items() if k != "condition"}).status_code == 422
+    assert admin.post("/admin/usage/quality-runs",
+                      json={k: v for k, v in ok.items() if k != "executed_from"}).status_code == 422
+    assert admin.post("/admin/usage/quality-runs",
+                      json={**ok, "executed_from": "2026-09-18T00:00:00"}).status_code == 422
+    assert admin.post("/admin/usage/quality-runs",
+                      json={**ok, "executed_from": ok["executed_to"],
+                            "executed_to": ok["executed_from"]}).status_code == 422
+    assert admin.post("/admin/usage/quality-runs",
+                      json={**ok, "executed_from": "2026-01-01T00:00:00+09:00",
+                            "executed_to": "2027-01-02T00:00:00+09:00"}).status_code == 422
+    assert admin.post("/admin/usage/quality-runs",
+                      json={**ok, "rounds": -1}).status_code == 422
+
+
+def test_admin_usage_quality_run_duplicate_run_id_is_idempotent():
+    """同じ `run_id` で `POST /admin/usage/quality-runs` を再送しても2行目を作らない
+    （監査ログ書込み失敗後のリトライでの二重計上対策・登録と監査は同一トランザクション）。
+    衝突時は `inserted=False` で新規登録が無かったことを伝える（`run_id` の値は返さない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgq68{sfx}", f"UsgQ68{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    admin = _login(admin_uid, admin_pw)
+    run_id = f"qr-dup-{sfx}"
+    body = {"rounds": 3, "condition": "depth2-deep", "correct": 2, "wrong_assertion": 0,
+            "missing": 1, "regressed": 0, "unrated": 0, "run_id": run_id,
+            "executed_from": "2026-09-18T00:00:00+09:00",
+            "executed_to": "2026-09-19T00:00:00+09:00"}
+    try:
+        r1 = admin.post("/admin/usage/quality-runs", json=body)
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["inserted"] is True
+        assert "run_id" not in r1.json()
+        r2 = admin.post("/admin/usage/quality-runs", json=body)
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["inserted"] is False, "衝突時も inserted=True のまま（新規登録が無かったことが伝わらない）"
+        with psycopg.connect(store._dsn()) as c:
+            row = c.execute("SELECT COUNT(*) AS n FROM depth_quality_runs WHERE run_id=%s",
+                            (run_id,)).fetchone()
+        assert row[0] == 1, "同じ run_id の再送が2行目を作った（二重計上）"
+    finally:
+        _delete_quality_runs([run_id])
+
+
+def test_admin_usage_quality_run_insert_and_audit_are_atomic():
+    """登録（INSERT）が監査ログと同一トランザクションであること——監査 INSERT が失敗すれば
+    `depth_quality_runs` 側の行もロールバックされる（片方だけ残らない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgq68b{sfx}", f"UsgQ68B{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    admin = _login(admin_uid, admin_pw)
+    run_id = f"qr-atomic-{sfx}"
+
+    def _boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    orig = store._audit_insert
+    store._audit_insert = _boom
+    try:
+        r = admin.post("/admin/usage/quality-runs",
+                       json={"rounds": 1, "condition": "depth2-deep", "correct": 1,
+                             "run_id": run_id,
+                             "executed_from": "2026-09-18T00:00:00+09:00",
+                             "executed_to": "2026-09-19T00:00:00+09:00"})
+        assert r.status_code == 500, r.text
+    finally:
+        store._audit_insert = orig
+    with psycopg.connect(store._dsn()) as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM depth_quality_runs WHERE run_id=%s",
+                        (run_id,)).fetchone()
+    assert row[0] == 0, "監査ログ書込み失敗後も depth_quality_runs に行が残った（非アトミック）"
+
+
+def test_admin_usage_quality_run_rejects_non_finite_cost():
+    """`cost_usd` に inf/nan を登録できると、以後の利用統計（`SUM(cost_usd)`）が壊れて 500 に
+    なる——router 側が `math.isfinite` で保存前に 422 で拒否する（schemas 側に pydantic 制約は
+    付けない・422 ハンドラの 500 化を避けるため）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin_uid, admin_pw = f"usgq69{sfx}", f"UsgQ69{sfx}"
+    _mk_user(admin_uid, admin_pw, role="admin")
+    admin = _login(admin_uid, admin_pw)
+    head = ('{"rounds": 1, "condition": "main", '
+            '"executed_from": "2026-09-18T00:00:00+09:00", '
+            '"executed_to": "2026-09-19T00:00:00+09:00", "cost_usd": ')
+
+    r_inf = admin.post("/admin/usage/quality-runs",
+                       content=(head + "Infinity}").encode(),
+                       headers={"content-type": "application/json"})
+    assert r_inf.status_code == 422, r_inf.text
+    r_nan = admin.post("/admin/usage/quality-runs",
+                       content=(head + "NaN}").encode(),
+                       headers={"content-type": "application/json"})
+    assert r_nan.status_code == 422, r_nan.text
+
+    # 拒否されているので利用統計は壊れない。
+    r_stats = admin.get("/admin/usage/stats?days=1")
+    assert r_stats.status_code == 200, r_stats.text

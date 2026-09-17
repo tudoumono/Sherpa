@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -23,7 +24,13 @@ from starlette.concurrency import run_in_threadpool
 
 from sherpa import store, usage_chat
 from sherpa.deps import _current_user, _require_admin
-from sherpa.schemas import AdminAuditListResponse, AdminUsageStatsResponse, UsageChatResponse
+from sherpa.schemas import (
+    AdminAuditListResponse,
+    AdminUsageQualityRunAck,
+    AdminUsageQualityRunReq,
+    AdminUsageStatsResponse,
+    UsageChatResponse,
+)
 
 _log = logging.getLogger("sherpa")
 
@@ -264,22 +271,69 @@ def admin_audit_export(
 # ===== 管理者: 利用統計 =====
 
 @audit_usage_router.get("/admin/usage/stats", tags=["管理者:利用統計"], response_model=AdminUsageStatsResponse)
-def admin_usage_stats(request: Request, days: int = Query(30, ge=1, le=365)):
+def admin_usage_stats(request: Request, days: int = Query(30, ge=1, le=365),
+                      time_from: str | None = Query(None, alias="from"),
+                      time_to: str | None = Query(None, alias="to")):
     """利用統計（管理者のみ）。よく使うユーザーを見つけてヒアリング候補にするための集計。
 
     メッセージ本文・会話タイトルは一切含めない（プライバシー＝件数・日時・種別のみ）。
     閲覧自体を admin.usage_viewed として記録する（audit.html の慣行に合わせる・fail-closed）。
+
+    期間は `days`（JST 暦日・既定30日）か `from`/`to`（ISO 8601・オフセット必須・半開区間
+    `[from, to)`・両方必須・最大365日）のどちらか。`days` を**明示指定**したうえで `from`/`to` も
+    渡すのは 422（既定値の補完と明示指定は `request.query_params` で区別する——どちらの期間で
+    読んだのかが曖昧な集計を返さない）。応答の `period` には実際に使った境界が入る。
     """
     u = _current_user(request)
     _require_admin(u)
-    result = store.usage_stats(days=days)
+    if (time_from is not None or time_to is not None) and "days" in request.query_params:
+        raise HTTPException(422, "days と from/to は同時に指定できません")
     try:
-        store.audit(u["uid"], "admin.usage_viewed", "usage", None, detail={"days": days},
+        result = store.usage_stats(days=days, time_from=time_from, time_to=time_to)
+    except store.UsagePeriodError as e:
+        raise HTTPException(422, str(e)) from None
+    detail = {"days": days} if time_from is None and time_to is None else {"from": time_from, "to": time_to}
+    try:
+        store.audit(u["uid"], "admin.usage_viewed", "usage", None, detail=detail,
                     outcome="success", severity="info")
     except Exception:
         _log.critical("audit write failed for admin.usage_viewed – fail-closed")
         raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed）")
     return result
+
+
+@audit_usage_router.post("/admin/usage/quality-runs", tags=["管理者:利用統計"],
+                         response_model=AdminUsageQualityRunAck)
+def admin_usage_quality_run_create(request: Request, body: AdminUsageQualityRunReq):
+    """品質採点（1巡 vs 3巡等の正解付き比較）の結果を「集計済みカウント」だけで受け取る入口。
+    採点そのものは既存の実測枠の運用に委ねる——質問文・回答本文はフィールド自体が無く
+    受け付けない（受け取っても保存できない）。
+    """
+    u = _current_user(request)
+    _require_admin(u)
+    # `cost_usd` の有限性チェックはここ（アプリコード）で行い、pydantic の制約違反にはしない——
+    # 制約違反にすると FastAPI の既定 422 ハンドラが違反値（inf/nan）をエラー本文の `input` に
+    # そのまま埋め込もうとし、`JSONResponse`（既定 allow_nan=False）のレンダリングで例外を
+    # 送出して 500 に化ける（schemas.py の docstring 参照）。ここで弾けば detail は生の値を
+    # 含まない定型文字列で安全にレンダリングできる。
+    if body.cost_usd is not None and not (math.isfinite(body.cost_usd) and body.cost_usd >= 0):
+        raise HTTPException(422, "cost_usd は有限の非負数のみ指定できます")
+    # 登録（INSERT）と監査ログは同一トランザクション（`record_depth_quality_run` 内）で書く——
+    # 監査だけが失敗して INSERT が残ると、再送（同じ run_id とは限らない旧来の呼び出し元）で
+    # 二重計上しかねない（fail-closed：登録できたのに監査に残せない状態を作らない）。
+    try:
+        inserted = store.record_depth_quality_run(
+            body.rounds,
+            {"correct": body.correct, "wrong_assertion": body.wrong_assertion, "missing": body.missing,
+             "regressed": body.regressed, "unrated": body.unrated},
+            condition=body.condition, executed_from=body.executed_from, executed_to=body.executed_to,
+            cost_usd=body.cost_usd, run_id=body.run_id, audit_actor=u["uid"])
+    except ValueError as e:   # UsagePeriodError を含む（実行期間・condition の規則違反）
+        raise HTTPException(422, str(e)) from None
+    except Exception:
+        _log.critical("write failed for admin.usage_quality_run_recorded (insert+audit) – fail-closed")
+        raise HTTPException(500, "記録に失敗しました（fail-closed）")
+    return AdminUsageQualityRunAck(ok=True, inserted=inserted)
 
 
 _HISTORY_HARD_CAP = 10_000

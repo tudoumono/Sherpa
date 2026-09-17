@@ -44,7 +44,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, PlainSerializer
+from pydantic import BaseModel, Field, PlainSerializer, StrictInt, StrictStr
 
 # pydantic v2 は response_model 経由だと
 # aware datetime を既定で `2026-07-01T09:10:00Z`（Z サフィックス）に正規化する。response_model
@@ -734,6 +734,12 @@ class UsagePeriod(BaseModel):
     start: str
     end: str
     days: int
+    # 実際に使った半開区間 `[from, to)`（ISO 8601・オフセット付き）。`days` 指定でも `from`/`to`
+    # 指定でも入る（`start`/`end` は従来どおり JST 暦日で `end` は**含む**終了日＝画面の日別
+    # チャートのゼロ埋め範囲。意味を変えないためこちらを別フィールドとして足す）。UsagePeriod を
+    # 返す他の経路（期間指定を持たない集計）では未設定のことがあるため任意。
+    from_: str | None = Field(default=None, alias="from")
+    to: str | None = None
 
 
 class UsageZeroHit(BaseModel):
@@ -968,6 +974,150 @@ class UsageLimits(BaseModel):
     by_provider: list[UsageLimitsByProviderRow]
 
 
+class UsageRoundDepthProviderRow(BaseModel):
+    """深さ×経路別の巡別記録（`chat-round`・表示専用）の活動量（`usage_stats()
+    ["rounds"]["by_depth_provider"]`）。課金の正本ではない（`tokens.*` と二重に数えない）。
+
+    `limits`: 巡内 limits 増分の合算（数値系は合計・当たったか系は真になった巡数）。
+    `verdicts`/`stops`: evaluator の判定・巡を止めた理由の分類別件数（固定語彙のラベルのみ・
+    本文は含まない）。`missing_codes`: 不足軸の閉じた分類別件数（自由文の `missing` は含まない）。"""
+    depth_profile: str
+    provider: str
+    rounds: int
+    citations_delta_total: float
+    citations_delta_avg: float | None
+    elapsed_ms_total: int
+    elapsed_ms_avg: float | None
+    elapsed_n: int
+    input_tokens: int
+    output_tokens: int
+    tokens_n: int
+    claims: dict[str, int]
+    reason_codes: dict[str, int]
+    limits: dict[str, int]
+    verdicts: dict[str, int]
+    stops: dict[str, int]
+    missing_codes: dict[str, int]
+
+
+class UsageRoundByRoundRow(BaseModel):
+    """深さ×経路×**巡番号**別の巡別記録の活動量（`usage_stats()["rounds"]["by_round"]`）。
+    `UsageRoundDepthProviderRow` と同じ集計を巡番号（`meta.round`）単位で分けたもの——
+    「2巡目は1巡目より効くか」の判断に使う。`round_no` が取れない行は `None` に畳み込む。"""
+    depth_profile: str
+    provider: str
+    round_no: int | None
+    rounds: int
+    citations_delta_total: float
+    citations_delta_avg: float | None
+    elapsed_ms_total: int
+    elapsed_ms_avg: float | None
+    elapsed_n: int
+    input_tokens: int
+    output_tokens: int
+    tokens_n: int
+    claims: dict[str, int]
+    reason_codes: dict[str, int]
+    limits: dict[str, int]
+    verdicts: dict[str, int]
+    stops: dict[str, int]
+    missing_codes: dict[str, int]
+
+
+class UsageRoundDistributionRow(BaseModel):
+    """深さ×経路×到達巡数ごとのターン件数（`usage_stats()["rounds"]["round_distribution"]`）。
+    `rounds_reached` はそのターンで実際に到達した巡番号の最大値。"""
+    depth_profile: str
+    provider: str
+    rounds_reached: int
+    turns: int
+
+
+class UsageReasonCodeRow(BaseModel):
+    """不明（`status='unknown'`）の理由コード分布1件（主張単位・深さ×経路別）。"""
+    depth_profile: str
+    provider: str
+    reason_code: str
+    claims: int
+
+
+class UsageRoundReasonCodes(BaseModel):
+    """理由コード分布の2軸: `final`＝最終回答の主張（`answer.data.claims`）、
+    `rounds`＝巡別記録（`chat-round`）の主張内訳を巡単位で合算したもの。"""
+    final: list[UsageReasonCodeRow]
+    rounds: list[UsageReasonCodeRow]
+
+
+class UsageRounds(BaseModel):
+    """巡別記録（`usage_stats()["rounds"]`）。本文は含まない。"""
+    by_depth_provider: list[UsageRoundDepthProviderRow]
+    by_round: list[UsageRoundByRoundRow]
+    round_distribution: list[UsageRoundDistributionRow]
+    unmatched_rounds: int
+    reason_codes: UsageRoundReasonCodes
+
+
+class UsageQualityRunRow(BaseModel):
+    """品質採点の条件×巡数別集計（`usage_stats()["quality_runs"]["by_rounds"]`）。
+    採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。
+
+    `condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは
+    見直しを回さない条件同士（main と depth2-standard・どちらも `rounds=0`）が混ざるため、
+    集計はこの条件別に分ける。"""
+    condition: str | None
+    rounds: int
+    runs: int
+    correct: int
+    wrong_assertion: int
+    missing: int
+    regressed: int
+    unrated: int
+    cost_usd_total: float | None
+
+
+class UsageQualityRuns(BaseModel):
+    period: UsagePeriod
+    by_rounds: list[UsageQualityRunRow]
+
+
+class AdminUsageQualityRunReq(BaseModel):
+    """POST /admin/usage/quality-runs 入力（品質採点の入口）。
+
+    採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。
+    `rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-standard` を登録できる）。
+    `condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。
+    `executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・
+    半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で
+    読める。
+    `cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を
+    付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値
+    （`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定
+    `allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は
+    `routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を
+    埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の
+    二重防御がある）。
+    `run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない
+    （`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。"""
+    rounds: StrictInt = Field(ge=0)
+    condition: Literal["main", "depth2-standard", "depth2-deep", "depth2-max"]
+    executed_from: StrictStr = Field(min_length=1, max_length=64)
+    executed_to: StrictStr = Field(min_length=1, max_length=64)
+    correct: StrictInt = Field(default=0, ge=0)
+    wrong_assertion: StrictInt = Field(default=0, ge=0)
+    missing: StrictInt = Field(default=0, ge=0)
+    regressed: StrictInt = Field(default=0, ge=0)
+    unrated: StrictInt = Field(default=0, ge=0)
+    cost_usd: float | None = Field(default=None)
+    run_id: StrictStr | None = Field(default=None, min_length=1, max_length=200)
+
+
+class AdminUsageQualityRunAck(BaseModel):
+    ok: bool = True
+    # `run_id` 重複で `record_depth_quality_run` が新規行を作らなかった（ON CONFLICT DO NOTHING）
+    # ときは False（`run_id` の値自体はレスポンスに出さない）。
+    inserted: bool = True
+
+
 class AdminUsageStatsResponse(BaseModel):
     """GET /admin/usage/stats（store/usage.py::usage_stats）。"""
     users: list[UsageUserRow]
@@ -988,6 +1138,8 @@ class AdminUsageStatsResponse(BaseModel):
     response_time: UsageResponseTime
     conversations_top: list[UsageConversationRow]
     limits: UsageLimits
+    rounds: UsageRounds
+    quality_runs: UsageQualityRuns
 
 
 class UsageChatToolCall(BaseModel):

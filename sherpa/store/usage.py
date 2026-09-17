@@ -53,6 +53,69 @@ def _usage_period_bounds(days: int):
     return start_ts, start_date, today_jst, end_exclusive_ts
 
 
+class UsagePeriodError(ValueError):
+    """`from`/`to` による期間指定が規則に反するときに送出する（呼び出し側が 422 へ写す）。"""
+
+
+# `from`/`to` で指定できる期間の上限（日数指定の上限＝`_clamp_days`・API の `days` と同じ365日）。
+_USAGE_PERIOD_MAX_DAYS = 365
+
+
+def _parse_period_bound(value, field: str) -> datetime:
+    """ISO 8601 の日時文字列を解釈する。**UTC オフセット必須**（`+09:00`・`Z` 等）——オフセットの
+    無い値は JST か UTC かを推測するしかなく、推測を誤ると期間が9時間ずれた集計を正しい顔で返す。
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise UsagePeriodError(f"{field} は ISO 8601 の日時（オフセット付き）で指定してください")
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError:
+        raise UsagePeriodError(f"{field} は ISO 8601 の日時（オフセット付き）で指定してください") from None
+    if dt.tzinfo is None:
+        raise UsagePeriodError(f"{field} にはタイムゾーンオフセット（例: +09:00）が必要です")
+    return dt
+
+
+def _usage_period(days=None, *, time_from=None, time_to=None):
+    """集計期間を決めて `(start_ts, end_exclusive_ts, period)` を返す。
+
+    既定は `days`（JST 暦日・`_usage_period_bounds` と完全に同じ境界）。`time_from`/`time_to`
+    （ISO 8601・オフセット必須）を渡したときは JST 暦日へ丸めず `[from, to)` をそのまま境界に
+    使う（AP を差し替えて比較するときに切替時刻で期間を分けて読むため）。規則:
+
+      - `from`/`to` は両方必須（片方だけは誤読の元＝エラー）。
+      - 区間は半開 `[from, to)`（`to` ちょうどの記録は含まない）。`from` < `to`。
+      - 期間の長さは最大 `_USAGE_PERIOD_MAX_DAYS` 日（`days` の上限と揃える）。
+
+    `days` との排他は呼び出し側（API/ツール）が「利用者が明示的に指定したか」で判定する
+    （既定値の補完と区別できるのは呼び出し側だけのため）。
+
+    `period` は JST 暦日の `start`/`end`/`days`（既存の形・`end` は**含む**終了日＝画面の日別
+    チャートがこの範囲でゼロ埋め描画する）を変えずに保ったうえで、**実際に使った半開区間**
+    （`from`/`to`・ISO 8601・オフセット付き）を必ず加える。
+    """
+    if time_from is None and time_to is None:
+        start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+        return start_ts, end_exclusive_ts, {
+            "start": start_date.isoformat(), "end": end_date.isoformat(), "days": days,
+            "from": start_ts.isoformat(), "to": end_exclusive_ts.isoformat()}
+    if time_from is None or time_to is None:
+        raise UsagePeriodError("from と to は両方指定してください")
+    start_ts = _parse_period_bound(time_from, "from")
+    end_exclusive_ts = _parse_period_bound(time_to, "to")
+    if start_ts >= end_exclusive_ts:
+        raise UsagePeriodError("from は to より前の日時で指定してください")
+    if end_exclusive_ts - start_ts > timedelta(days=_USAGE_PERIOD_MAX_DAYS):
+        raise UsagePeriodError(f"期間は最大 {_USAGE_PERIOD_MAX_DAYS} 日です")
+    start_date = start_ts.astimezone(_JST).date()
+    # `to` は排他的上限のため、暦日表示の終端は「区間に含まれる最後の瞬間」の JST 暦日。
+    end_date = (end_exclusive_ts - timedelta(microseconds=1)).astimezone(_JST).date()
+    return start_ts, end_exclusive_ts, {
+        "start": start_date.isoformat(), "end": end_date.isoformat(),
+        "days": (end_date - start_date).days + 1,
+        "from": start_ts.isoformat(), "to": end_exclusive_ts.isoformat()}
+
+
 # lens 内訳の対応付け: 「conversation 内で各 user メッセージの直後に来る
 # 最初の assistant メッセージ」だけをその user ターンの返答として数える。assistant 単独行（対応する
 # user メッセージが無い・または既に他の user メッセージの返答として数えられた2件目以降の assistant 行）は
@@ -281,8 +344,274 @@ def _compute_response_time_stats(durations: list[int]) -> dict:
     }
 
 
-def usage_stats(days: int = 30) -> dict:
+# 主張の区分キー（`investigation_state.Claim.status`）。`_compute_round_stats`/
+# `_compute_final_reason_codes` の両方でこの3値だけを合算する（他の値は来ない契約・
+# `investigation_state._CLAIM_STATUSES` と同じ語彙だが usage.py は investigation_state を
+# import しない＝leaf モジュール原則を保つため値を直接持つ）。
+_CLAIM_STATUS_KEYS = ("confirmed", "inferred", "unknown")
+
+
+# 巡内 limits 増分（査読の巡が meta に書く増分）のキー集合。int 系は合算、bool 系は
+# 「この巡で当たった」件数（True の巡数）として合算する（_compute_round_stats/_accumulate_round
+# が共有）。
+_ROUND_LIMIT_KEYS = _USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS
+
+
+def _new_round_bucket(depth: str, provider: str) -> dict:
+    return {
+        "depth_profile": depth, "provider": provider, "rounds": 0,
+        "citations_delta_total": 0, "elapsed_ms_total": 0, "elapsed_n": 0,
+        "input_tokens": 0, "output_tokens": 0, "tokens_n": 0,
+        "claims": {k: 0 for k in _CLAIM_STATUS_KEYS}, "reason_codes": {},
+        "limits": {}, "verdicts": {}, "stops": {}, "missing_codes": {},
+    }
+
+
+def _accumulate_round(agg: dict, r, meta: dict) -> None:
+    """`chat-round` 行1件を集計バケットへ足す（深さ×経路／深さ×経路×巡番号の両方で共有）。"""
+    agg["rounds"] += 1
+    cd = meta.get("citations_delta")
+    if isinstance(cd, (int, float)) and not isinstance(cd, bool):
+        agg["citations_delta_total"] += cd
+    if r["elapsed_ms"] is not None:
+        agg["elapsed_ms_total"] += int(r["elapsed_ms"])
+        agg["elapsed_n"] += 1
+    inp, outp = r["input_tokens"], r["output_tokens"]
+    if inp is not None or outp is not None:
+        agg["input_tokens"] += int(inp or 0)
+        agg["output_tokens"] += int(outp or 0)
+        agg["tokens_n"] += 1
+    claims = meta.get("claims") or {}
+    for status in _CLAIM_STATUS_KEYS:
+        v = claims.get(status)
+        if isinstance(v, int) and not isinstance(v, bool):
+            agg["claims"][status] += v
+    for code, n in (claims.get("reason_codes") or {}).items():
+        if isinstance(n, int) and not isinstance(n, bool):
+            agg["reason_codes"][code] = agg["reason_codes"].get(code, 0) + n
+    # 巡内の limits 増分（記録元が既に「増分/新たに真になった」だけを書いている）を合算。
+    limits = meta.get("limits")
+    if isinstance(limits, dict):
+        for k, v in limits.items():
+            if k not in _ROUND_LIMIT_KEYS:
+                continue
+            if isinstance(v, bool):
+                if v:
+                    agg["limits"][k] = agg["limits"].get(k, 0) + 1
+            elif isinstance(v, (int, float)):
+                agg["limits"][k] = agg["limits"].get(k, 0) + v
+    # 不足軸（本文を含まない分類）: evaluator の判定（verdict）と巡を止めた理由（stop）。
+    # どちらも固定語彙のラベル文字列で自由記述本文ではない。
+    verdict = meta.get("verdict")
+    if isinstance(verdict, str) and verdict:
+        agg["verdicts"][verdict] = agg["verdicts"].get(verdict, 0) + 1
+    stop = meta.get("stop")
+    if isinstance(stop, str) and stop:
+        agg["stops"][stop] = agg["stops"].get(stop, 0) + 1
+    # 不足軸の閉じた分類（本文を含まない）。自由文の `missing` はここでは集計しない
+    # （表示専用の生値のまま）。
+    for code in meta.get("missing_codes") or []:
+        if isinstance(code, str) and code:
+            agg["missing_codes"][code] = agg["missing_codes"].get(code, 0) + 1
+
+
+def _compute_round_stats(round_rows) -> dict:
+    """巡別記録（`chat-round`）の表示専用集計。
+
+    `round_rows` は1行=1巡のイベント（`depth_profile`・`provider`・`input_tokens`/
+    `output_tokens`・`elapsed_ms`・`meta`・`turn_message_id`）。
+
+    返り値:
+      - `by_depth_provider`: 深さ×経路別の活動量（巡数・引用増分合計/平均・所要時間合計/平均・
+        トークン合計・主張の区分内訳・不明理由コードの巡別合算・limits 増分の合算・
+        verdict/stop の分類別件数・不足軸の分類別件数（`missing_codes`・本文なし））。
+      - `by_round`: 深さ×経路×**巡番号**（`meta.round`）別の同じ活動量。「2巡目は1巡目より
+        効くか」を判断するための軸（`round_no` が取れない行は `None` へ畳み込む）。
+      - `round_distribution`: 深さ×経路×「そのターンで到達した巡数」ごとのターン件数
+        （`meta.round` の最大値を1ターンの到達巡数とみなす・`turn_message_id` が取れない行
+        （対応する assistant 返信が見つからない＝母集団に含まれない古い/異常データ）は
+        `unmatched_rounds` へ計上するだけでこの分布には数えない）。
+      - `unmatched_rounds`: 上記の対応付け失敗件数（0 が通常。多ければ join 前提の見直しが要る）。
+
+    `depth_profile`/`provider` の欠落は `"unknown"` へ畳み込む（他の集計の allowlist 畳み込みと
+    同じ思想・不正値で行が消えたり例外になったりしない）。
+    """
+    by_dp: dict[tuple, dict] = {}
+    by_round: dict[tuple, dict] = {}
+    turns: dict[int, dict] = {}
+    unmatched_rounds = 0
+    for r in round_rows:
+        meta = r["meta"] or {}
+        depth = r["depth_profile"] or "unknown"
+        provider = r["provider"] or "unknown"
+
+        agg = by_dp.setdefault((depth, provider), _new_round_bucket(depth, provider))
+        _accumulate_round(agg, r, meta)
+
+        rd = meta.get("round")
+        round_no = rd if isinstance(rd, int) and not isinstance(rd, bool) else None
+        ragg = by_round.setdefault((depth, provider, round_no), _new_round_bucket(depth, provider))
+        ragg["round_no"] = round_no
+        _accumulate_round(ragg, r, meta)
+
+        turn_id = r["turn_message_id"]
+        if turn_id is None:
+            unmatched_rounds += 1
+            continue
+        t = turns.setdefault(turn_id, {"depth_profile": depth, "provider": provider, "max_round": 0})
+        if round_no is not None and round_no > t["max_round"]:
+            t["max_round"] = round_no
+
+    def _finalize(agg: dict) -> dict:
+        return {**agg,
+                "elapsed_ms_avg": (agg["elapsed_ms_total"] / agg["elapsed_n"]) if agg["elapsed_n"] else None,
+                "citations_delta_avg": (agg["citations_delta_total"] / agg["rounds"]) if agg["rounds"] else None}
+
+    by_depth_provider = [
+        _finalize(agg) for agg in sorted(by_dp.values(), key=lambda a: (a["depth_profile"], a["provider"]))
+    ]
+    by_round_list = [
+        _finalize(agg) for agg in sorted(
+            by_round.values(),
+            key=lambda a: (a["depth_profile"], a["provider"], a["round_no"] is None, a["round_no"] or 0))
+    ]
+
+    dist_counter: dict[tuple, dict[int, int]] = {}
+    for t in turns.values():
+        key = (t["depth_profile"], t["provider"])
+        n = t["max_round"] or 1   # 到達巡数が観測できなければ最低1巡とみなす（回が1件はある以上）
+        dist_counter.setdefault(key, {})
+        dist_counter[key][n] = dist_counter[key].get(n, 0) + 1
+    round_distribution = [
+        {"depth_profile": dp, "provider": pv, "rounds_reached": n, "turns": cnt}
+        for (dp, pv), dist in sorted(dist_counter.items())
+        for n, cnt in sorted(dist.items())
+    ]
+
+    return {"by_depth_provider": by_depth_provider, "by_round": by_round_list,
+            "round_distribution": round_distribution, "unmatched_rounds": unmatched_rounds}
+
+
+def _compute_final_reason_codes(final_claims_rows) -> list[dict]:
+    """最終回答の主張（`answer->'data'->'claims'`）のうち不明（`status='unknown'`）の
+    理由コードを、深さ×経路×理由コードで合算する（主張単位）。
+
+    行の `claims` が非配列/欠落（旧データ）は静かにスキップする——
+    `jsonb_typeof(...)='array'` で SQL 側が既に絞っているが、要素自体が非 dict の防御的想定外
+    データも同様にスキップする（他の集計と同じ「非数値/欠落は無視」防御）。
+    """
+    agg: dict[tuple, dict[str, int]] = {}
+    for r in final_claims_rows:
+        depth = r["depth_profile"] or "unknown"
+        provider = r["provider"] or "unknown"
+        bucket = agg.setdefault((depth, provider), {})
+        for claim in (r["claims"] or []):
+            if not isinstance(claim, dict) or claim.get("status") != "unknown":
+                continue
+            code = claim.get("reason_code") or "unknown"
+            if not isinstance(code, str):
+                continue
+            bucket[code] = bucket.get(code, 0) + 1
+    return [
+        {"depth_profile": dp, "provider": pv, "reason_code": code, "claims": n}
+        for (dp, pv), bucket in sorted(agg.items())
+        for code, n in sorted(bucket.items())
+    ]
+
+
+# `usage_stats()`/`usage_depth_rounds()` が共有する `chat-round` 取得 SQL。
+#
+# 期間境界は「巡が属する user ターン」の `created_at`（`_USAGE_TURN_CTE` 等の他集計と同じ境界に
+# 揃える）を使う——巡イベント自身の `ts` で絞ると、同じユーザーターンの巡別記録と最終回答
+# （`turns`/`conv_turn_rows` 系）が異なる期間境界に割れ、両者を突き合わせる集計（例:
+# reason_codes の final/rounds 比較）の母集団がずれる。「所属する user ターン」は
+# 「その巡の ts 以前で最も新しい同会話の user メッセージ」（`user_msgs` の LATERAL）。見つからない
+# （過去データ・想定外の順序）場合は巡自身の `ts` へ後退する＝従来どおり必ず何らかの期間値を持つ。
+#
+# `rounds` CTE は `e.ts >= start_ts`（下限のみ）で事前に絞る——`turn_created_at <= e.ts` が
+# 常に成り立つため、下限は最終 WHERE の `turn_created_at >= start_ts` を満たす行を取りこぼさず、
+# 期間外の巡別記録を全履歴から走査する分を減らせる。上限は付けない（`turn_created_at` は
+# `e.ts` より過去になり得るため、`e.ts < end_exclusive_ts` を先に切ると期間内のターンに属す
+# 巡を落としかねない——最終 WHERE の `turn_created_at < end_exclusive_ts` だけで絞る）。
+#
+# assistant 対応付け（最終 LATERAL）は「巡の ts 以降・かつ同会話の**次の** user メッセージより前」
+# に限定する（上限なしの `m.created_at >= r.ts` だけだと、このターンの assistant が
+# 保存されなかった行＝利用者の停止等で assistant 未保存の巡が、次ターンの assistant に
+# 誤って結合し水増しされる）。範囲内に assistant が無ければ `turn_message_id` は NULL のまま
+# （`_compute_round_stats` 側で `unmatched_rounds` に計上する）。
+def _round_rows_query(c, start_ts, end_exclusive_ts):
+    return c.execute(
+        "WITH rounds AS ("
+        "  SELECT e.id, e.ts, e.provider, e.input_tokens, e.output_tokens, e.elapsed_ms, e.meta, "
+        "    e.conversation_id "
+        "  FROM usage_events e WHERE e.kind = 'chat-round' AND e.ts >= %s"
+        "), touched_convs AS ("
+        "  SELECT DISTINCT conversation_id FROM rounds"
+        "), user_msgs AS ("
+        "  SELECT m.conversation_id, m.created_at, "
+        "    LEAD(m.created_at) OVER (PARTITION BY m.conversation_id ORDER BY m.created_at) "
+        "      AS next_user_created_at "
+        "  FROM messages m JOIN touched_convs t ON t.conversation_id = m.conversation_id "
+        "  WHERE m.role = 'user'"
+        "), owning AS ("
+        "  SELECT r.id AS round_id, r.ts, r.provider, r.input_tokens, r.output_tokens, r.elapsed_ms, "
+        "    r.meta, r.conversation_id, COALESCE(u.created_at, r.ts) AS turn_created_at, "
+        "    u.next_user_created_at "
+        "  FROM rounds r LEFT JOIN LATERAL ("
+        "    SELECT um.created_at, um.next_user_created_at FROM user_msgs um "
+        "    WHERE um.conversation_id = r.conversation_id AND um.created_at <= r.ts "
+        "    ORDER BY um.created_at DESC LIMIT 1"
+        "  ) u ON true"
+        ") "
+        "SELECT o.ts, o.provider, o.input_tokens, o.output_tokens, o.elapsed_ms, o.meta, "
+        "  ta.id AS turn_message_id, ta.answer->'usage'->>'depth_profile' AS depth_profile "
+        "FROM owning o "
+        "JOIN conversations c ON c.id = o.conversation_id "
+        "LEFT JOIN LATERAL ("
+        "  SELECT m.id, m.answer FROM messages m "
+        "  WHERE m.conversation_id = o.conversation_id AND m.role = 'assistant' "
+        "    AND m.created_at >= o.ts "
+        "    AND (o.next_user_created_at IS NULL OR m.created_at < o.next_user_created_at) "
+        "  ORDER BY m.created_at ASC LIMIT 1"
+        ") ta ON true "
+        "WHERE c.deleted_at IS NULL AND c.origin = 'own' "
+        "  AND o.turn_created_at >= %s AND o.turn_created_at < %s",
+        (start_ts, start_ts, end_exclusive_ts),
+    ).fetchall()
+
+
+# 最終回答の主張（`answer->'data'->'claims'`）のうち不明の理由コードを数えるための取得 SQL
+# （`usage_stats()`/`usage_depth_rounds()` が共有）。
+def _final_claims_rows_query(c, start_ts, end_exclusive_ts):
+    return c.execute(
+        _USAGE_TURN_CTE + " "
+        "SELECT answer->'usage'->>'provider' AS provider, "
+        "  answer->'usage'->>'depth_profile' AS depth_profile, "
+        "  answer->'data'->'claims' AS claims "
+        "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s "
+        "  AND jsonb_typeof(answer->'data'->'claims') = 'array'",
+        (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+    ).fetchall()
+
+
+def _round_reason_codes(rounds_stats: dict, final_claims_rows) -> dict:
+    """理由コード分布の2軸（`final`＝最終回答の主張／`rounds`＝巡別記録の主張内訳の合算）。"""
+    return {
+        "final": _compute_final_reason_codes(final_claims_rows),
+        "rounds": [
+            {"depth_profile": a["depth_profile"], "provider": a["provider"],
+             "reason_code": code, "claims": n}
+            for a in rounds_stats["by_depth_provider"]
+            for code, n in sorted(a["reason_codes"].items())
+        ],
+    }
+
+
+def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | None = None) -> dict:
     """期間内の利用統計を集計する（本文/タイトルは含めない）。
+
+    `time_from`/`time_to`（ISO 8601・オフセット必須）を渡すと `days` の代わりに `[from, to)` を
+    期間に使う（`_usage_period` 参照）。規則違反は `UsagePeriodError`。
 
     users: ターン数（role='user' メッセージ数）降順。totals: 期間合計。
     daily: 日別ターン数＋日別アクティブユーザー数。
@@ -359,23 +688,35 @@ def usage_stats(days: int = 30) -> dict:
     ターンの終了理由:
       - `stop_kinds`: `messages.answer->>'stop_kind'`（`sherpa/stop_kind.py` の閉じた8値・
         `chat_service._finalize` が保存）の分布。assistant 返答が存在するターン（`answer IS NOT NULL`）
-        のみを対象にする——利用者の明示停止・実行中のターンは assistant を保存しないため `answer` が
-        無く、`stopped_turns` 側だけで数える（二重計上しない）。確認カード（`lens='clarify'`）も
+        のみを対象にする。利用者の明示停止は `stopped_turns` 側だけで数える（二重計上しない）——
+        巡ループの停止終端は assistant（`stop_kind='stopped_by_user'`）を保存するため、この分布
+        からは明示的に除外する。実行中のターンは `answer` が無い。確認カード（`lens='clarify'`）も
         母数から外す。allowlist（`stop_kind.STOP_KINDS`）外の値（NULL・語彙外の不正値のいずれも）は
         `'unknown'` へ畳み込む（allowlist 外を集約する `providers_usage` と同じ思想）——
         未計測経路・過去データのほか、busy（Codex 直列化で実行していないターン）と API 経路の
         honest failure（型を特定できない失敗）も対象。
       - `stopped_turns`: 利用者の明示停止（`chat.turn` 監査の `detail.stopped=true`）の件数——
-        停止ターンは assistant を保存しないため `stop_kinds` の分布には現れない別集計。境界は
+        `stop_kinds` の分布から `stopped_by_user` を除いてこちらへ一本化した別集計。境界は
         `turns`/`stop_kinds` と同じ `turn_created_at`（`detail.message_id_user` で結合した
         user 発言の created_at・`_stopped_turns_sql` 参照）。
+
+    期間の**基準時刻は指標ごとに違う**（同じ半開区間 `[from, to)` を、各指標が自然に属する時刻へ
+    当てる）:
+      - ターン由来の集計（users/daily/lens/limits/stop_kinds/回答時間ほか）: user 発言の
+        `turn_created_at`。
+      - `usage_events` 由来（chat-sub/chat-review/intent/embed ほか）: イベント自身の `ts`。
+      - 巡集計（`rounds`・kind='chat-round'）: **その巡が属する user 発言の `created_at`**
+        （`_round_rows_query`）——巡イベント自身の `ts` が `to` を越えていても、所属する user 発言が
+        期間内なら数える（最終回答由来の集計と母集団を揃えるため）。
+      - 品質採点（`quality_runs`）: **実行期間（`executed_from`/`executed_to`）の完全包含**
+        （`depth_quality_stats`）——登録時刻では絞らない。
 
     全クエリは `_usage_period_bounds` の `[start_ts, end_exclusive_ts)` という同じ半開区間で絞る
     （下限のみだと、クロックスキュー/テスト由来の未来時刻行が
     「期間内」に混入し得る。DL/provider/heatmap/retention/world/user/daily すべて同じ上下限）。
     """
     _ensure()
-    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
         user_rows = c.execute(
             _USAGE_TURN_CTE + " "
@@ -438,7 +779,8 @@ def usage_stats(days: int = 30) -> dict:
         # turns 側と同じ側に計上され、両者の合計が食い違わない。`answer IS NOT NULL` で
         # 「assistant 返答が存在するターン」だけに絞る——利用者の明示停止・実行中のターンは
         # assistant を保存しないため `answer` が無く（LEFT JOIN の不一致）、絞りが無いと
-        # allowlist 外の畳み込みで 'unknown' に混入し `stopped_turns` と二重計上になる
+        # allowlist 外の畳み込みで 'unknown' に混入し `stopped_turns` と二重計上になる。
+        # 巡ループの停止終端は assistant を保存するため `stopped_by_user` を明示的に除く
         # （停止ターンは `stopped_turns` 側だけで数える契約）。allowlist（`stop_kind.STOP_KINDS`）
         # 外の値（語彙外の不正値・想定されない NULL のいずれも）は 'unknown' へ畳み込む
         # （既存の provider_rows の allowlist 畳み込みと同じ思想）。確認カード
@@ -451,11 +793,14 @@ def usage_stats(days: int = 30) -> dict:
             "WHERE turn_created_at >= %s AND turn_created_at < %s "
             "  AND answer IS NOT NULL "
             "  AND lens IS DISTINCT FROM 'clarify' "
+            "  AND answer->>'stop_kind' IS DISTINCT FROM 'stopped_by_user' "
             "GROUP BY stop_kind ORDER BY n DESC",
             (start_ts, end_exclusive_ts, list(stop_kind.STOP_KINDS), start_ts, end_exclusive_ts),
         ).fetchall()
-        # limits（「打ち切りの内訳」・経路別）: `stop_kind_rows` と同じ population（turn_created_at
-        # 境界・answer IS NOT NULL・clarify 除外）に `answer->'usage'->>'provider'` 別の集計を足す
+        # limits（「打ち切りの内訳」・経路別）: `stop_kind_rows` から `stopped_by_user` の除外だけを
+        # 外した population（turn_created_at 境界・answer IS NOT NULL・clarify 除外——巡ループの
+        # 停止終端が保存した行も含む＝停止ターンで当たった制限も内訳に残す）に
+        # `answer->'usage'->>'provider'` 別の集計を足す
         # （`token_by_model` と同じ provider 抽出キー・専用フィールドは持たない＝重複させない）。
         limits_rows = c.execute(
             _USAGE_TURN_CTE + " "
@@ -468,8 +813,8 @@ def usage_stats(days: int = 30) -> dict:
             "GROUP BY provider ORDER BY turns DESC",
             (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
-        # 利用者停止（`stopped_by_user`）は assistant を保存しないため上の分布には出ない
-        # （`chat_service.py::stream_message`/`handle_message` の stopped 分岐参照）——監査
+        # 利用者停止（`stopped_by_user`）は上の分布から除いてある（assistant 未保存の停止に加え、
+        # 巡ループの停止終端が保存する行も除外する）——監査
         # `chat.turn`（`detail.stopped=true`）から別途数える（`_stopped_turns_sql` 参照・
         # `turns`/`stop_kinds` と同じ `turn_created_at` 境界）。`audit_log` は削除伝播の対象外
         # （台帳の削除伝播は原本/MD/ES/Neo4j までで、監査ログは残置する契約）のため、
@@ -533,6 +878,9 @@ def usage_stats(days: int = 30) -> dict:
         # チャット以外の LLM 呼び出し（intent 分類・
         # グラフ抽出・概念候補提案・埋め込み・admin グラフ質問・VLM）を kind 別に集計。usage_events は
         # kind='chat' を含まない（chat は token_model_rows 由来で別途合成する・二重計上なし）。
+        # kind='chat-round'（査読の巡別記録）も除く——巡の消費は既に
+        # `chat-sub`（worker）・`chat-review`（evaluator/orchestrator）・`answer.usage`（清書）
+        # として正本に載っており、巡別記録は表示・分析用の別イベントで二重に足さない。
         # elapsed_ms は計測スコープ外の行（NULL）を
         # 自然に除いて集計する（SUM/AVG は NULL を無視・COUNT(列) は非 NULL 行数＝`elapsed_n`）。
         usage_event_rows = c.execute(
@@ -541,7 +889,7 @@ def usage_stats(days: int = 30) -> dict:
             "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
             "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
             "  COUNT(elapsed_ms) AS elapsed_n "
-            "FROM usage_events WHERE ts >= %s AND ts < %s "
+            "FROM usage_events WHERE ts >= %s AND ts < %s AND kind <> 'chat-round' "
             "GROUP BY kind, provider, model ORDER BY kind, input DESC NULLS LAST",
             (start_ts, end_exclusive_ts),
         ).fetchall()
@@ -554,7 +902,7 @@ def usage_stats(days: int = 30) -> dict:
             "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
             "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
             "  COUNT(elapsed_ms) AS elapsed_n "
-            "FROM usage_events WHERE ts >= %s AND ts < %s AND user_id IS NOT NULL "
+            "FROM usage_events WHERE ts >= %s AND ts < %s AND user_id IS NOT NULL AND kind <> 'chat-round' "
             "GROUP BY user_id, kind ORDER BY user_id, kind",
             (start_ts, end_exclusive_ts),
         ).fetchall()
@@ -618,11 +966,21 @@ def usage_stats(days: int = 30) -> dict:
                 "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
                 "  COUNT(elapsed_ms) AS elapsed_n "
                 "FROM usage_events WHERE ts >= %s AND ts < %s AND conversation_id = ANY(%s) "
+                "  AND kind <> 'chat-round' "
                 "GROUP BY conversation_id, kind",
                 (start_ts, end_exclusive_ts, _conv_cids),
             ).fetchall()
             if _conv_cids else []
         )
+        # 巡別記録（`chat-round`）の表示専用集計——深さ（`answer->'usage'->>'depth_profile'`）×
+        # 経路（provider）別の巡数分布・活動量（引用増分・所要時間・トークン）・主張の区分/理由
+        # コード内訳。期間境界・assistant 対応付けの規約は `_round_rows_query` 参照（他集計と同じ
+        # 「所属する user ターン」基準の境界に揃える）。
+        round_rows = _round_rows_query(c, start_ts, end_exclusive_ts)
+        # 最終回答の主張のうち不明（`status='unknown'`）の理由コード分布（主張単位）。深さ・経路
+        # （`answer->'usage'`）別に数える——巡別（chat-round）の集計とは別軸（こちらは全巡を経た
+        # 最終回答時点の判定・巡ごとの是正で覆った分は数えない）。
+        final_claims_rows = _final_claims_rows_query(c, start_ts, end_exclusive_ts)
 
     display_names = {r["uid"]: r["display_name"] for r in name_rows}
     _aux_key = {"auth.login": "logins", "document.downloaded": "downloads",
@@ -678,7 +1036,8 @@ def usage_stats(days: int = 30) -> dict:
             for r in daily_rows]
     # フロントの日別チャートはこの範囲でゼロ埋め描画する（クライアント側で「今日」を再計算させない・
     # RV ラウンド3 MEDIUM: サーバ算出の境界とフロント描画範囲を一致させる）。
-    period = {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days}
+    # `period` は `_usage_period` が組み立て済み（`days` 指定でも `from`/`to` 指定でも `start`/`end`
+    # の意味は不変＝JST 暦日・`end` は含む終了日。実際に使った半開区間は `from`/`to`）。
 
     zero_hit = {
         "knowledge_turns": total_knowledge_turns,
@@ -854,6 +1213,12 @@ def usage_stats(days: int = 30) -> dict:
         key=lambda e: (-conv_token_total[e["conversation_id"]], e["conversation_id"]),
     )[:20]
 
+    # 巡別記録（表示専用）の深さ×経路別集計＋理由コードの主張単位分布（巡別＝chat-round の
+    # meta 由来／最終＝最終回答の data.claims 由来。二軸とも課金集計（tokens.*）とは独立＝
+    # 正本に触れない）。
+    rounds_stats = _compute_round_stats(round_rows)
+    rounds_stats["reason_codes"] = _round_reason_codes(rounds_stats, final_claims_rows)
+
     return {
         "users": users, "totals": totals, "daily": daily, "period": period,
         "zero_hit": zero_hit, "worlds": worlds_usage, "providers": providers_usage,
@@ -862,7 +1227,127 @@ def usage_stats(days: int = 30) -> dict:
         "stop_kinds": stop_kinds, "stopped_turns": stopped_turns,
         "response_time": response_time, "limits": limits_stats,
         "conversations_top": conversations_top,
+        "rounds": rounds_stats,
+        "quality_runs": depth_quality_stats(days, time_from=time_from, time_to=time_to),
     }
+
+
+# 品質採点の入口。1巡 vs 3巡等の正解付き比較は既存の実測枠の運用に委ねる——ここは採点結果の
+# **集計済みカウント**だけを受け取って積む/読む（質問文・回答本文はテーブル自体が列を持たない）。
+_QUALITY_COUNT_FIELDS = ("correct", "wrong_assertion", "missing", "regressed", "unrated")
+
+# 採点した条件の閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。`main`＝見直しの無い
+# AP、`depth2-*`＝見直しを持つ AP の深さ別。
+QUALITY_RUN_CONDITIONS = ("main", "depth2-standard", "depth2-deep", "depth2-max")
+
+
+def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
+                             executed_from: str, executed_to: str,
+                             cost_usd: float | None = None,
+                             ts=None, run_id: str | None = None,
+                             audit_actor: str | None = None) -> bool:
+    """1採点ラン分の集計済みカウントを1行 INSERT する。
+
+    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-standard`）は0）。
+    `counts`: `_QUALITY_COUNT_FIELDS` の一部/全部（欠落キーは0・非負整数以外は0に丸める＝壊れた
+    入力で例外にしない）。`condition`: `QUALITY_RUN_CONDITIONS` のいずれか（閉集合外は
+    `UsagePeriodError` ではなく `ValueError`）。`executed_from`/`executed_to`: 質問セットを実行した
+    期間（ISO 8601・オフセット必須・`[from, to)`）——集計はこの実行期間で照会する（登録時刻 `ts`
+    ではない＝後日登録しても元の実行期間で取れる）。`cost_usd`: 任意（費用集計・inf/nan・負値・
+    非数値は登録前に None へ丸める＝以後の集計 SUM が壊れないための防御）。`ts` はテスト用
+    （省略時は DB の `now()`）。
+
+    `run_id`（省略可）: 呼び出し側が指定する冪等キー。`run_id IS NOT NULL` の部分ユニーク索引
+    （`depth_quality_runs.run_id`）により、同じ `run_id` の再送は2行目を作らない
+    （`POST /admin/usage/quality-runs` の監査書込み失敗後の再送で二重計上しないための対策・
+    `run_id` 省略時（None）は従来どおり毎回新規行）。
+
+    `audit_actor`（省略可）: 指定すると、この INSERT と**同一トランザクション**で監査ログ
+    （`admin.usage_quality_run_recorded`）も書く（`_facade._audit_insert`・
+    `store/settings.py::set_system_settings` と同じ「登録と監査を割り離さない」流儀）。監査の
+    INSERT が失敗すれば例外が送出され、`depth_quality_runs` 側の INSERT もロールバックされる
+    （fail-closed：監査に残せない記録を残さない）。`run_id` が重複でスキップされた場合は
+    監査ログも書かない（実際には何も起きていないため）。
+
+    戻り値: 実際に新規行を作ったら True、`run_id` 重複でスキップしたら False。
+    """
+    _ensure()
+    if condition not in QUALITY_RUN_CONDITIONS:
+        raise ValueError(f"condition は {'/'.join(QUALITY_RUN_CONDITIONS)} のいずれかで指定してください")
+    exec_from = _parse_period_bound(executed_from, "executed_from")
+    exec_to = _parse_period_bound(executed_to, "executed_to")
+    if exec_from >= exec_to:
+        raise UsagePeriodError("executed_from は executed_to より前の日時で指定してください")
+    if exec_to - exec_from > timedelta(days=_USAGE_PERIOD_MAX_DAYS):
+        # 照会期間の上限（365日）を超える実行期間は、どの照会からも包含条件を満たせず永久に
+        # 集計へ現れない＝登録させない。
+        raise UsagePeriodError(f"実行期間は最大 {_USAGE_PERIOD_MAX_DAYS} 日です")
+    rounds = int(rounds)
+    if rounds < 0:
+        raise ValueError("rounds は0以上で指定してください")
+    counts = counts if isinstance(counts, dict) else {}
+    vals = {}
+    for f in _QUALITY_COUNT_FIELDS:
+        v = counts.get(f, 0)
+        vals[f] = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0
+    cost_usd = (float(cost_usd)
+                if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool)
+                and math.isfinite(cost_usd) and cost_usd >= 0 else None)
+    cols = ["rounds", "run_id", "condition", "executed_from", "executed_to",
+            "correct", "wrong_assertion", "missing", "regressed", "unrated", "cost_usd"]
+    params = [rounds, run_id, condition, exec_from, exec_to,
+              vals["correct"], vals["wrong_assertion"], vals["missing"],
+              vals["regressed"], vals["unrated"], cost_usd]
+    if ts is not None:
+        cols.insert(0, "ts")
+        params.insert(0, ts)
+    placeholders = ",".join(["%s"] * len(cols))
+    from sherpa import store as _facade   # settings.py と同じ実行時解決（monkeypatch シーム維持）
+    with _connect() as c:
+        row = c.execute(
+            f"INSERT INTO depth_quality_runs ({','.join(cols)}) VALUES ({placeholders}) "
+            "ON CONFLICT (run_id) WHERE run_id IS NOT NULL DO NOTHING RETURNING id",
+            params,
+        ).fetchone()
+        inserted = row is not None
+        if inserted and audit_actor is not None:
+            _facade._audit_insert(
+                c, audit_actor, "admin.usage_quality_run_recorded", "usage", None,
+                detail={"rounds": rounds, "condition": condition}, outcome="success", severity="info")
+        return inserted
+
+
+def depth_quality_stats(days: int = 180, *, time_from: str | None = None,
+                        time_to: str | None = None) -> dict:
+    """`record_depth_quality_run` が積んだ集計済みカウントを条件×巡数別に合算する
+    （既定180日＝他の利用統計より広め・正解付き比較は実施頻度が低い運用のため）。
+
+    母集団は「**実行期間**（`executed_from`/`executed_to`）が照会期間に完全に含まれる採点ラン」
+    ＝`from <= executed_from AND executed_to <= to`（実行期間・照会期間とも半開区間なので、
+    実行の終端が照会の上限ちょうど（`executed_to == to`）のランは含む）——登録時刻（`ts`）では
+    絞らない。採点は実行より後に登録されるのが普通で、登録時刻で絞ると
+    「先週流した質問セットの結果」を先週の期間で読めなくなる。実行期間を持たない行（入口を
+    通らずに入った過去データ）は母集団に入らない。
+    """
+    _ensure()
+    start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
+    with _connect() as c:
+        rows = c.execute(
+            "SELECT condition, rounds, COUNT(*) AS runs, "
+            + ", ".join(f"SUM({f}) AS {f}" for f in _QUALITY_COUNT_FIELDS) + ", "
+            "  SUM(cost_usd) AS cost_usd_total "
+            "FROM depth_quality_runs "
+            "WHERE executed_from >= %s AND executed_to <= %s "
+            "GROUP BY condition, rounds ORDER BY condition, rounds",
+            (start_ts, end_exclusive_ts),
+        ).fetchall()
+    by_rounds = [
+        {"condition": r["condition"], "rounds": r["rounds"], "runs": r["runs"] or 0,
+         **{f: int(r[f] or 0) for f in _QUALITY_COUNT_FIELDS},
+         "cost_usd_total": float(r["cost_usd_total"]) if r["cost_usd_total"] is not None else None}
+        for r in rows
+    ]
+    return {"period": period, "by_rounds": by_rounds}
 
 
 # ===================================================================================
@@ -924,16 +1409,21 @@ def _tool_json_projection(value):
     return value
 
 
-def usage_overview(days: int = 30) -> dict:
+def usage_overview(days: int = 30, *, time_from: str | None = None,
+                   time_to: str | None = None) -> dict:
     """`usage_stats(days)` の質問応答向け射影（`usage_chat._stats_projection` と概ね同じ形だが、
     ツールの戻り値契約により display_name は含めない）。内訳リストは上位 `_TOOL_LIMIT_UPPER` 件。
+
+    期間指定（`days` か `time_from`/`time_to`）はそのまま `usage_stats` へ委譲する。
     """
-    days = _clamp_days(days)
-    stats = usage_stats(days)
+    if time_from is None and time_to is None:
+        days = _clamp_days(days)
+    stats = usage_stats(days, time_from=time_from, time_to=time_to)
     tokens = stats.get("tokens") or {}
     limit = _TOOL_LIMIT_UPPER
     return _tool_json_projection({
         "period": stats.get("period"), "totals": stats.get("totals"), "zero_hit": stats.get("zero_hit"),
+        "quality_runs": stats.get("quality_runs"),
         "worlds": stats.get("worlds"), "providers": stats.get("providers"),
         "retention": stats.get("retention"), "downloads": stats.get("downloads"),
         "daily": stats.get("daily"), "stop_kinds": stats.get("stop_kinds"),
@@ -959,16 +1449,20 @@ def usage_overview(days: int = 30) -> dict:
     })
 
 
-def usage_by_user(days: int = 7, uid: str | None = None, kind: str | None = None) -> dict:
+def usage_by_user(days: int = 7, uid: str | None = None, kind: str | None = None, *,
+                  time_from: str | None = None, time_to: str | None = None) -> dict:
     """ユーザー別 × 用途別（kind）の calls/tokens/所要時間（期間・uid・kind 絞り込み付き）。
     `tokens.by_user_kind`（U1）と同じ材料（chat は `messages.answer->'usage'`・他は
     `usage_events`）を、期間・利用者・用途で絞り込んで返す。display_name は含めない。
+
+    期間は `days` か `time_from`/`time_to`（`_usage_period` の規則・`usage_stats` と同じ）。
     """
     _ensure()
-    days = _clamp_days(days)
+    if time_from is None and time_to is None:
+        days = _clamp_days(days)
     uid = _norm_str(uid)
     kind = _norm_str(kind)
-    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     rows: list[dict] = []
     with _connect() as c:
         if kind is None or kind == "chat":
@@ -988,13 +1482,15 @@ def usage_by_user(days: int = 7, uid: str | None = None, kind: str | None = None
                             "reasoning_output": int(r["reasoning_output"] or 0),
                             "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0})
         if kind != "chat":
+            # `chat-round`（巡別記録＝表示用）は正本と二重に足さないため除く（`usage_stats` と同じ）。
             ev_sql = (
                 "SELECT user_id AS uid, kind, SUM(calls) AS calls, "
                 "  SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
                 "  SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output, "
                 "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
                 "  COUNT(elapsed_ms) AS elapsed_n "
-                "FROM usage_events WHERE ts >= %s AND ts < %s AND user_id IS NOT NULL"
+                "FROM usage_events WHERE ts >= %s AND ts < %s AND user_id IS NOT NULL "
+                "  AND kind <> 'chat-round'"
             )
             ev_params = [start_ts, end_exclusive_ts]
             if uid:
@@ -1021,21 +1517,25 @@ def usage_by_user(days: int = 7, uid: str | None = None, kind: str | None = None
     # 利用量（input+output）の多い順＝予算内への先頭切り（agentic_search の間引き）で重い利用者が残る
     rows.sort(key=lambda r: (-((r.get("input") or 0) + (r.get("output") or 0)), r["uid"] or "", r["kind"]))
     return _tool_json_projection({
-        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "period": period,
         "uid": uid, "kind": kind, "rows": rows})
 
 
 def usage_conversations(days: int = 30, uid: str | None = None, limit: int = 20,
-                        sort: str = "tokens") -> dict:
+                        sort: str = "tokens", *, time_from: str | None = None,
+                        time_to: str | None = None) -> dict:
     """会話別の上位表（`conversations_top`＝U2 と同じ材料）を期間・uid で絞り込み、
     並び順（tokens/turns/elapsed）と件数上限を選べる形にしたもの。タイトル・本文は含めない。
+
+    期間は `days` か `time_from`/`time_to`（`_usage_period` の規則・`usage_stats` と同じ）。
     """
     _ensure()
-    days = _clamp_days(days)
+    if time_from is None and time_to is None:
+        days = _clamp_days(days)
     limit = _clamp_limit(limit, default=20)
     uid = _norm_str(uid)
     sort = sort if sort in ("tokens", "turns", "elapsed") else "tokens"
-    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
         conv_sql = (
             _USAGE_TURN_CTE + " "
@@ -1065,6 +1565,7 @@ def usage_conversations(days: int = 30, uid: str | None = None, limit: int = 20,
                 "  SUM(elapsed_ms) AS elapsed_ms_total, AVG(elapsed_ms) AS elapsed_ms_avg, "
                 "  COUNT(elapsed_ms) AS elapsed_n "
                 "FROM usage_events WHERE ts >= %s AND ts < %s AND conversation_id = ANY(%s) "
+                "  AND kind <> 'chat-round' "
                 "GROUP BY conversation_id, kind",
                 (start_ts, end_exclusive_ts, _cids),
             ).fetchall()
@@ -1111,7 +1612,7 @@ def usage_conversations(days: int = 30, uid: str | None = None, limit: int = 20,
     ordered = sorted(conv_map.values(),
                      key=lambda e: (-sort_key[e["conversation_id"]][sort], e["conversation_id"]))[:limit]
     return _tool_json_projection({
-        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "period": period,
         "uid": uid, "sort": sort, "conversations": ordered})
 
 
@@ -1172,12 +1673,14 @@ def usage_conversation_detail(conversation_id) -> dict:
             "  AND answer->>'duration_ms' ~ '^[0-9]+$' ORDER BY turn_no",
             (cid,),
         ).fetchall()
+        # `chat-round`（巡別記録＝表示用）は正本と二重に足さないため除く（`usage_stats` と同じ）。
         kind_rows = c.execute(
             "SELECT kind, SUM(calls) AS calls, SUM(input_tokens) AS input, "
             "  SUM(cached_input_tokens) AS cached_input, SUM(output_tokens) AS output, "
             "  SUM(reasoning_output_tokens) AS reasoning_output, SUM(elapsed_ms) AS elapsed_ms_total, "
             "  AVG(elapsed_ms) AS elapsed_ms_avg, COUNT(elapsed_ms) AS elapsed_n "
-            "FROM usage_events WHERE conversation_id = %s GROUP BY kind ORDER BY kind",
+            "FROM usage_events WHERE conversation_id = %s AND kind <> 'chat-round' "
+            "GROUP BY kind ORDER BY kind",
             (cid,),
         ).fetchall()
     kinds: list[dict] = []
@@ -1283,12 +1786,17 @@ def usage_daily(days: int = 30, metric: str = "turns") -> dict:
         "metric": metric, "series": series})
 
 
-def usage_stop_kinds(days: int = 30, uid: str | None = None) -> dict:
-    """終了理由の分布＋利用者停止件数（期間・uid 絞り込み付き・`stop_kinds`＝U1 と同じ材料）。"""
+def usage_stop_kinds(days: int = 30, uid: str | None = None, *, time_from: str | None = None,
+                     time_to: str | None = None) -> dict:
+    """終了理由の分布＋利用者停止件数（期間・uid 絞り込み付き・`stop_kinds`＝U1 と同じ材料）。
+
+    期間は `days` か `time_from`/`time_to`（`_usage_period` の規則・`usage_stats` と同じ）。
+    """
     _ensure()
-    days = _clamp_days(days)
+    if time_from is None and time_to is None:
+        days = _clamp_days(days)
     uid = _norm_str(uid)
-    start_ts, start_date, end_date, end_exclusive_ts = _usage_period_bounds(days)
+    start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
         sql = (
             _USAGE_TURN_CTE + " "
@@ -1296,7 +1804,8 @@ def usage_stop_kinds(days: int = 30, uid: str | None = None) -> dict:
             "  ELSE 'unknown' END AS stop_kind, COUNT(*) AS n "
             "FROM turns "
             "WHERE turn_created_at >= %s AND turn_created_at < %s "
-            "  AND answer IS NOT NULL AND lens IS DISTINCT FROM 'clarify'"
+            "  AND answer IS NOT NULL AND lens IS DISTINCT FROM 'clarify' "
+            "  AND answer->>'stop_kind' IS DISTINCT FROM 'stopped_by_user'"
         )
         params = [start_ts, end_exclusive_ts, list(stop_kind.STOP_KINDS), start_ts, end_exclusive_ts]
         if uid:
@@ -1311,6 +1820,37 @@ def usage_stop_kinds(days: int = 30, uid: str | None = None) -> dict:
             stopped_params.append(uid)
         stopped_row = c.execute(stopped_sql, stopped_params).fetchone()
     return _tool_json_projection({
-        "period": {"start": start_date.isoformat(), "end": end_date.isoformat(), "days": days},
+        "period": period,
         "uid": uid, "stop_kinds": [{"stop_kind": r["stop_kind"], "turns": r["n"] or 0} for r in rows],
         "stopped_turns": (stopped_row["n"] or 0) if stopped_row else 0})
+
+
+def usage_depth_rounds(days: int = 30, *, time_from: str | None = None,
+                       time_to: str | None = None) -> dict:
+    """深さ×経路別の巡数分布・不明理由コードの分布・品質採点の条件別件数
+    （`usage_stats()` の `rounds`/`quality_runs` と同じ材料。本関数での品質採点のキーは
+    `quality`＝`quality.by_rounds`）。
+
+    期間は `days`（既定30日）または `time_from`/`time_to`（ISO 8601・オフセット必須・`[from, to)`）
+    ——`usage_stats` と同じ規則・同じ集計なので、同じ期間を指定すれば両者の値は一致する。
+    境界の基準は指標ごとに違う（`usage_stats` の docstring 参照）: 巡集計は**所属する user 発言の
+    `created_at`**、品質採点は**実行期間の完全包含**。
+
+    本文（質問/回答/資料名）は一切含まない——他の usage_* ツールと同じ不変条件
+    （`round_distribution`/`reason_codes`/`quality_runs` はいずれも件数・ラベルのみ）。
+    """
+    _ensure()
+    if time_from is None and time_to is None:
+        days = _clamp_days(days)
+    start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
+    with _connect() as c:
+        round_rows = _round_rows_query(c, start_ts, end_exclusive_ts)
+        final_claims_rows = _final_claims_rows_query(c, start_ts, end_exclusive_ts)
+    rounds_stats = _compute_round_stats(round_rows)
+    return _tool_json_projection({
+        "period": period,
+        "round_distribution": rounds_stats["round_distribution"],
+        "unmatched_rounds": rounds_stats["unmatched_rounds"],
+        "reason_codes": _round_reason_codes(rounds_stats, final_claims_rows),
+        "quality": depth_quality_stats(days, time_from=time_from, time_to=time_to),
+    })

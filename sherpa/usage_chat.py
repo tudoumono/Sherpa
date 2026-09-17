@@ -66,8 +66,12 @@ _SYSTEM_PROMPT = (
     "渡されたデータは直近の概要（既定90日分）です。指定した期間・特定の利用者の用途別内訳・"
     "特定の会話の内訳・回答時間の分布など、渡されたデータだけでは答えられない切り口を聞かれたときは、"
     "提供されたツール（usage_overview/usage_by_user/usage_conversations/"
-    "usage_conversation_detail/usage_response_time/usage_daily/usage_stop_kinds）を呼び出して"
-    "正確な数値を取得してから答えてください。数値を答えるときは憶測せず、渡されたデータかツールの"
+    "usage_conversation_detail/usage_response_time/usage_daily/usage_stop_kinds/"
+    "usage_depth_rounds）を呼び出して"
+    "正確な数値を取得してから答えてください。期間は days（日数）のほか、"
+    "usage_overview/usage_by_user/usage_conversations/usage_stop_kinds/usage_depth_rounds では "
+    "from/to（ISO 8601・タイムゾーンオフセット必須・to の日時は含まない）でも指定できます"
+    "（days との併用は不可）。数値を答えるときは憶測せず、渡されたデータかツールの"
     "結果のどちらかから読み取れる値だけを使ってください。どちらからも読み取れないことは推測せず、"
     "わからない旨を答えてください。会話の本文・タイトルはどちらの経路からも取得できません——"
     "それに関する質問には答えられない旨を正直に伝えてください。"
@@ -629,7 +633,7 @@ def answer_usage_question(question: str, history: list[dict], *, system_settings
     `notes` は画面へそのまま見せる注記（改善ログの要約が取得できなかった場合の告知など・
     通常は空リスト）。`tool_calls`は今回の質問応答で実際に呼んだ調査ツール
     （`usage_overview`/`usage_by_user`/`usage_conversations`/`usage_conversation_detail`/
-    `usage_response_time`/`usage_daily`/`usage_stop_kinds`）の名前と引数（数値と id のみ・
+    `usage_response_time`/`usage_daily`/`usage_stop_kinds`/`usage_depth_rounds`）の名前と引数（数値と id のみ・
     本文/タイトルは含まない）。ツールを1回も呼ばずに（渡された統計データだけで）答えた場合は
     空リスト。
 

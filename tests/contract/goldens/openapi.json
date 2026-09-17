@@ -32,6 +32,116 @@
         "title": "AdminAuditListResponse",
         "type": "object"
       },
+      "AdminUsageQualityRunAck": {
+        "properties": {
+          "inserted": {
+            "default": true,
+            "title": "Inserted",
+            "type": "boolean"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "title": "AdminUsageQualityRunAck",
+        "type": "object"
+      },
+      "AdminUsageQualityRunReq": {
+        "description": "POST /admin/usage/quality-runs 入力（品質採点の入口）。\n\n採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。\n`rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-standard` を登録できる）。\n`condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。\n`executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・\n半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で\n読める。\n`cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を\n付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値\n（`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定\n`allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は\n`routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を\n埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の\n二重防御がある）。\n`run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない\n（`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。",
+        "properties": {
+          "condition": {
+            "enum": [
+              "main",
+              "depth2-standard",
+              "depth2-deep",
+              "depth2-max"
+            ],
+            "title": "Condition",
+            "type": "string"
+          },
+          "correct": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Correct",
+            "type": "integer"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd"
+          },
+          "executed_from": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Executed From",
+            "type": "string"
+          },
+          "executed_to": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Executed To",
+            "type": "string"
+          },
+          "missing": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Missing",
+            "type": "integer"
+          },
+          "regressed": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Regressed",
+            "type": "integer"
+          },
+          "rounds": {
+            "minimum": 0.0,
+            "title": "Rounds",
+            "type": "integer"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "unrated": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unrated",
+            "type": "integer"
+          },
+          "wrong_assertion": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Wrong Assertion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rounds",
+          "condition",
+          "executed_from",
+          "executed_to"
+        ],
+        "title": "AdminUsageQualityRunReq",
+        "type": "object"
+      },
       "AdminUsageStatsResponse": {
         "description": "GET /admin/usage/stats（store/usage.py::usage_stats）。",
         "properties": {
@@ -75,6 +185,9 @@
             "title": "Providers",
             "type": "array"
           },
+          "quality_runs": {
+            "$ref": "#/components/schemas/UsageQualityRuns"
+          },
           "response_time": {
             "$ref": "#/components/schemas/UsageResponseTime"
           },
@@ -91,6 +204,9 @@
           },
           "retention": {
             "$ref": "#/components/schemas/UsageRetention"
+          },
+          "rounds": {
+            "$ref": "#/components/schemas/UsageRounds"
           },
           "stop_kinds": {
             "items": {
@@ -145,7 +261,9 @@
           "stopped_turns",
           "response_time",
           "conversations_top",
-          "limits"
+          "limits",
+          "rounds",
+          "quality_runs"
         ],
         "title": "AdminUsageStatsResponse",
         "type": "object"
@@ -5554,9 +5672,31 @@
             "title": "End",
             "type": "string"
           },
+          "from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From"
+          },
           "start": {
             "title": "Start",
             "type": "string"
+          },
+          "to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To"
           }
         },
         "required": [
@@ -5583,6 +5723,123 @@
           "turns"
         ],
         "title": "UsageProviderRow",
+        "type": "object"
+      },
+      "UsageQualityRunRow": {
+        "description": "品質採点の条件×巡数別集計（`usage_stats()[\"quality_runs\"][\"by_rounds\"]`）。\n採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。\n\n`condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは\n見直しを回さない条件同士（main と depth2-standard・どちらも `rounds=0`）が混ざるため、\n集計はこの条件別に分ける。",
+        "properties": {
+          "condition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Condition"
+          },
+          "correct": {
+            "title": "Correct",
+            "type": "integer"
+          },
+          "cost_usd_total": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd Total"
+          },
+          "missing": {
+            "title": "Missing",
+            "type": "integer"
+          },
+          "regressed": {
+            "title": "Regressed",
+            "type": "integer"
+          },
+          "rounds": {
+            "title": "Rounds",
+            "type": "integer"
+          },
+          "runs": {
+            "title": "Runs",
+            "type": "integer"
+          },
+          "unrated": {
+            "title": "Unrated",
+            "type": "integer"
+          },
+          "wrong_assertion": {
+            "title": "Wrong Assertion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "condition",
+          "rounds",
+          "runs",
+          "correct",
+          "wrong_assertion",
+          "missing",
+          "regressed",
+          "unrated",
+          "cost_usd_total"
+        ],
+        "title": "UsageQualityRunRow",
+        "type": "object"
+      },
+      "UsageQualityRuns": {
+        "properties": {
+          "by_rounds": {
+            "items": {
+              "$ref": "#/components/schemas/UsageQualityRunRow"
+            },
+            "title": "By Rounds",
+            "type": "array"
+          },
+          "period": {
+            "$ref": "#/components/schemas/UsagePeriod"
+          }
+        },
+        "required": [
+          "period",
+          "by_rounds"
+        ],
+        "title": "UsageQualityRuns",
+        "type": "object"
+      },
+      "UsageReasonCodeRow": {
+        "description": "不明（`status='unknown'`）の理由コード分布1件（主張単位・深さ×経路別）。",
+        "properties": {
+          "claims": {
+            "title": "Claims",
+            "type": "integer"
+          },
+          "depth_profile": {
+            "title": "Depth Profile",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "depth_profile",
+          "provider",
+          "reason_code",
+          "claims"
+        ],
+        "title": "UsageReasonCodeRow",
         "type": "object"
       },
       "UsageResponseTime": {
@@ -5724,6 +5981,366 @@
           "active_users"
         ],
         "title": "UsageRetentionWeek",
+        "type": "object"
+      },
+      "UsageRoundByRoundRow": {
+        "description": "深さ×経路×**巡番号**別の巡別記録の活動量（`usage_stats()[\"rounds\"][\"by_round\"]`）。\n`UsageRoundDepthProviderRow` と同じ集計を巡番号（`meta.round`）単位で分けたもの——\n「2巡目は1巡目より効くか」の判断に使う。`round_no` が取れない行は `None` に畳み込む。",
+        "properties": {
+          "citations_delta_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Citations Delta Avg"
+          },
+          "citations_delta_total": {
+            "title": "Citations Delta Total",
+            "type": "number"
+          },
+          "claims": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Claims",
+            "type": "object"
+          },
+          "depth_profile": {
+            "title": "Depth Profile",
+            "type": "string"
+          },
+          "elapsed_ms_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Avg"
+          },
+          "elapsed_ms_total": {
+            "title": "Elapsed Ms Total",
+            "type": "integer"
+          },
+          "elapsed_n": {
+            "title": "Elapsed N",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "limits": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Limits",
+            "type": "object"
+          },
+          "missing_codes": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Missing Codes",
+            "type": "object"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "reason_codes": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Reason Codes",
+            "type": "object"
+          },
+          "round_no": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round No"
+          },
+          "rounds": {
+            "title": "Rounds",
+            "type": "integer"
+          },
+          "stops": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Stops",
+            "type": "object"
+          },
+          "tokens_n": {
+            "title": "Tokens N",
+            "type": "integer"
+          },
+          "verdicts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Verdicts",
+            "type": "object"
+          }
+        },
+        "required": [
+          "depth_profile",
+          "provider",
+          "round_no",
+          "rounds",
+          "citations_delta_total",
+          "citations_delta_avg",
+          "elapsed_ms_total",
+          "elapsed_ms_avg",
+          "elapsed_n",
+          "input_tokens",
+          "output_tokens",
+          "tokens_n",
+          "claims",
+          "reason_codes",
+          "limits",
+          "verdicts",
+          "stops",
+          "missing_codes"
+        ],
+        "title": "UsageRoundByRoundRow",
+        "type": "object"
+      },
+      "UsageRoundDepthProviderRow": {
+        "description": "深さ×経路別の巡別記録（`chat-round`・表示専用）の活動量（`usage_stats()\n[\"rounds\"][\"by_depth_provider\"]`）。課金の正本ではない（`tokens.*` と二重に数えない）。\n\n`limits`: 巡内 limits 増分の合算（数値系は合計・当たったか系は真になった巡数）。\n`verdicts`/`stops`: evaluator の判定・巡を止めた理由の分類別件数（固定語彙のラベルのみ・\n本文は含まない）。`missing_codes`: 不足軸の閉じた分類別件数（自由文の `missing` は含まない）。",
+        "properties": {
+          "citations_delta_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Citations Delta Avg"
+          },
+          "citations_delta_total": {
+            "title": "Citations Delta Total",
+            "type": "number"
+          },
+          "claims": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Claims",
+            "type": "object"
+          },
+          "depth_profile": {
+            "title": "Depth Profile",
+            "type": "string"
+          },
+          "elapsed_ms_avg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Ms Avg"
+          },
+          "elapsed_ms_total": {
+            "title": "Elapsed Ms Total",
+            "type": "integer"
+          },
+          "elapsed_n": {
+            "title": "Elapsed N",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "limits": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Limits",
+            "type": "object"
+          },
+          "missing_codes": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Missing Codes",
+            "type": "object"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "reason_codes": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Reason Codes",
+            "type": "object"
+          },
+          "rounds": {
+            "title": "Rounds",
+            "type": "integer"
+          },
+          "stops": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Stops",
+            "type": "object"
+          },
+          "tokens_n": {
+            "title": "Tokens N",
+            "type": "integer"
+          },
+          "verdicts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Verdicts",
+            "type": "object"
+          }
+        },
+        "required": [
+          "depth_profile",
+          "provider",
+          "rounds",
+          "citations_delta_total",
+          "citations_delta_avg",
+          "elapsed_ms_total",
+          "elapsed_ms_avg",
+          "elapsed_n",
+          "input_tokens",
+          "output_tokens",
+          "tokens_n",
+          "claims",
+          "reason_codes",
+          "limits",
+          "verdicts",
+          "stops",
+          "missing_codes"
+        ],
+        "title": "UsageRoundDepthProviderRow",
+        "type": "object"
+      },
+      "UsageRoundDistributionRow": {
+        "description": "深さ×経路×到達巡数ごとのターン件数（`usage_stats()[\"rounds\"][\"round_distribution\"]`）。\n`rounds_reached` はそのターンで実際に到達した巡番号の最大値。",
+        "properties": {
+          "depth_profile": {
+            "title": "Depth Profile",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "rounds_reached": {
+            "title": "Rounds Reached",
+            "type": "integer"
+          },
+          "turns": {
+            "title": "Turns",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "depth_profile",
+          "provider",
+          "rounds_reached",
+          "turns"
+        ],
+        "title": "UsageRoundDistributionRow",
+        "type": "object"
+      },
+      "UsageRoundReasonCodes": {
+        "description": "理由コード分布の2軸: `final`＝最終回答の主張（`answer.data.claims`）、\n`rounds`＝巡別記録（`chat-round`）の主張内訳を巡単位で合算したもの。",
+        "properties": {
+          "final": {
+            "items": {
+              "$ref": "#/components/schemas/UsageReasonCodeRow"
+            },
+            "title": "Final",
+            "type": "array"
+          },
+          "rounds": {
+            "items": {
+              "$ref": "#/components/schemas/UsageReasonCodeRow"
+            },
+            "title": "Rounds",
+            "type": "array"
+          }
+        },
+        "required": [
+          "final",
+          "rounds"
+        ],
+        "title": "UsageRoundReasonCodes",
+        "type": "object"
+      },
+      "UsageRounds": {
+        "description": "巡別記録（`usage_stats()[\"rounds\"]`）。本文は含まない。",
+        "properties": {
+          "by_depth_provider": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRoundDepthProviderRow"
+            },
+            "title": "By Depth Provider",
+            "type": "array"
+          },
+          "by_round": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRoundByRoundRow"
+            },
+            "title": "By Round",
+            "type": "array"
+          },
+          "reason_codes": {
+            "$ref": "#/components/schemas/UsageRoundReasonCodes"
+          },
+          "round_distribution": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRoundDistributionRow"
+            },
+            "title": "Round Distribution",
+            "type": "array"
+          },
+          "unmatched_rounds": {
+            "title": "Unmatched Rounds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "by_depth_provider",
+          "by_round",
+          "round_distribution",
+          "unmatched_rounds",
+          "reason_codes"
+        ],
+        "title": "UsageRounds",
         "type": "object"
       },
       "UsageStopKindRow": {
@@ -8526,9 +9143,51 @@
         ]
       }
     },
+    "/admin/usage/quality-runs": {
+      "post": {
+        "description": "品質採点（1巡 vs 3巡等の正解付き比較）の結果を「集計済みカウント」だけで受け取る入口。\n採点そのものは既存の実測枠の運用に委ねる——質問文・回答本文はフィールド自体が無く\n受け付けない（受け取っても保存できない）。",
+        "operationId": "admin_usage_quality_run_create_admin_usage_quality_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminUsageQualityRunReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUsageQualityRunAck"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Usage Quality Run Create",
+        "tags": [
+          "管理者:利用統計"
+        ]
+      }
+    },
     "/admin/usage/stats": {
       "get": {
-        "description": "利用統計（管理者のみ）。よく使うユーザーを見つけてヒアリング候補にするための集計。\n\nメッセージ本文・会話タイトルは一切含めない（プライバシー＝件数・日時・種別のみ）。\n閲覧自体を admin.usage_viewed として記録する（audit.html の慣行に合わせる・fail-closed）。",
+        "description": "利用統計（管理者のみ）。よく使うユーザーを見つけてヒアリング候補にするための集計。\n\nメッセージ本文・会話タイトルは一切含めない（プライバシー＝件数・日時・種別のみ）。\n閲覧自体を admin.usage_viewed として記録する（audit.html の慣行に合わせる・fail-closed）。\n\n期間は `days`（JST 暦日・既定30日）か `from`/`to`（ISO 8601・オフセット必須・半開区間\n`[from, to)`・両方必須・最大365日）のどちらか。`days` を**明示指定**したうえで `from`/`to` も\n渡すのは 422（既定値の補完と明示指定は `request.query_params` で区別する——どちらの期間で\n読んだのかが曖昧な集計を返さない）。応答の `period` には実際に使った境界が入る。",
         "operationId": "admin_usage_stats_admin_usage_stats_get",
         "parameters": [
           {
@@ -8541,6 +9200,38 @@
               "minimum": 1,
               "title": "Days",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
             }
           }
         ],

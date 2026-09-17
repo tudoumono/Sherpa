@@ -91,6 +91,8 @@ from .api_keys import (
 # （tests/unit/test_store_surface.py 参照・tests は `store._compute_retention` を直接 monkeypatch する）。
 from .usage import (
     _JST,
+    QUALITY_RUN_CONDITIONS,
+    UsagePeriodError,
     _USAGE_AUDIT_ACTIONS,
     _USAGE_KNOWN_PROVIDERS,
     _USAGE_TOKEN_WHERE,
@@ -101,10 +103,13 @@ from .usage import (
     _usage_period_bounds,
     _usage_tok,
     _usage_token_sum_cols,
+    depth_quality_stats,
+    record_depth_quality_run,
     usage_by_user,
     usage_conversation_detail,
     usage_conversations,
     usage_daily,
+    usage_depth_rounds,
     usage_overview,
     usage_response_time,
     usage_stats,

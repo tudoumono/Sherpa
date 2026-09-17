@@ -1529,19 +1529,31 @@ def graph_gemini_tools() -> list:
 
 
 # ---- 利用統計チャット用ツール定義 ----
-# 裁定（2026-09-12）: ツールは以下の7つのみ（world 別/モデル別は足さない）・期間上限365日・
+# 裁定（2026-09-12）: ツールは以下の8つのみ（world 別/モデル別は足さない）・期間上限365日・
 # 返却上限50件・会話 id は返してよい。自由 SQL は与えない（閉じた引数のみ）。
 _USAGE_TOOLS_SPEC = [
     ("usage_overview", "直近の利用統計の概要（用途別・ユーザー別・トークン量・回答時間・終了理由等）を"
                        "days日分まとめて取得する。画面に出ている集計と同じ材料。",
      {"type": "object", "properties": {
-         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"}}}),
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
+         "from": {"type": "string",
+                  "description": "期間の開始日時（ISO 8601・タイムゾーンオフセット必須・"
+                                 "例 2026-09-18T13:00:00+09:00）。to と対で指定し days とは併用不可"},
+         "to": {"type": "string",
+                "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
+                               "from と対で指定し days とは併用不可"}}}),
     ("usage_by_user", "ユーザー別×用途別（kind）の呼び出し回数・トークン量・所要時間を取得する。"
                       "uid/kind で絞り込める。",
      {"type": "object", "properties": {
          "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時7）"},
          "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"},
-         "kind": {"type": "string", "description": "絞り込む用途（kind・省略可・例: chat/intent/embed）"}}}),
+         "kind": {"type": "string", "description": "絞り込む用途（kind・省略可・例: chat/intent/embed）"},
+         "from": {"type": "string",
+                  "description": "期間の開始日時（ISO 8601・タイムゾーンオフセット必須・"
+                                 "例 2026-09-18T13:00:00+09:00）。to と対で指定し days とは併用不可"},
+         "to": {"type": "string",
+                "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
+                               "from と対で指定し days とは併用不可"}}}),
     ("usage_conversations", "会話別の利用量上位表を取得する（会話 id・uid・world・user ターン数・"
                            "用途別内訳・回答時間平均）。本文・タイトルは含まない。",
      {"type": "object", "properties": {
@@ -1549,7 +1561,13 @@ _USAGE_TOOLS_SPEC = [
          "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"},
          "limit": {"type": "integer", "description": "返す件数上限（1〜50・省略時20）"},
          "sort": {"type": "string", "enum": ["tokens", "turns", "elapsed"],
-                  "description": "並び順（省略時 tokens）"}}}),
+                  "description": "並び順（省略時 tokens）"},
+         "from": {"type": "string",
+                  "description": "期間の開始日時（ISO 8601・タイムゾーンオフセット必須・"
+                                 "例 2026-09-18T13:00:00+09:00）。to と対で指定し days とは併用不可"},
+         "to": {"type": "string",
+                "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
+                               "from と対で指定し days とは併用不可"}}}),
     ("usage_conversation_detail", "指定した1会話の内訳（user ターン数・用途別 calls/tokens・"
                                   "回答時間の系列）を取得する。本文・タイトルは含まない。",
      {"type": "object", "properties": {
@@ -1570,12 +1588,29 @@ _USAGE_TOOLS_SPEC = [
                         "取得する。uid で絞り込める。",
      {"type": "object", "properties": {
          "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
-         "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"}}}),
+         "uid": {"type": "string", "description": "絞り込む利用者 id（省略可）"},
+         "from": {"type": "string",
+                  "description": "期間の開始日時（ISO 8601・タイムゾーンオフセット必須・"
+                                 "例 2026-09-18T13:00:00+09:00）。to と対で指定し days とは併用不可"},
+         "to": {"type": "string",
+                "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
+                               "from と対で指定し days とは併用不可"}}}),
+    ("usage_depth_rounds", "深さ（標準/深く/最大）×経路（provider）別の査読巡数の分布と、"
+                          "不明（未確定）と判定された主張の理由コードの分布を取得する。"
+                          "本文（質問/回答）は含まない。",
+     {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "集計期間（日数・1〜365・省略時30）"},
+         "from": {"type": "string",
+                  "description": "期間の開始日時（ISO 8601・タイムゾーンオフセット必須・"
+                                 "例 2026-09-18T13:00:00+09:00）。to と対で指定し days とは併用不可"},
+         "to": {"type": "string",
+                "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
+                               "from と対で指定し days とは併用不可"}}}),
 ]
 
 
 def usage_openai_tools() -> list:
-    """利用統計チャット専用: 上記7ツールだけを OpenAI/Ollama 形式で LLM に渡す。"""
+    """利用統計チャット専用: 上記8ツールだけを OpenAI/Ollama 形式で LLM に渡す。"""
     return [{"type": "function", "function": {"name": n, "description": d, "parameters": p}}
            for n, d, p in _USAGE_TOOLS_SPEC]
 
@@ -2534,13 +2569,14 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
 # 応答の `tool_calls` にする）。戻り値は件数・時刻・種別・トークン・所要時間・会話 id・uid・world の
 # みで、本文・会話タイトル・鍵・display_name は一切含めない（`sherpa/store/usage.py` の不変条件）。
 _USAGE_TOOL_ARG_KEYS = {
-    "usage_overview": ("days",),
-    "usage_by_user": ("days", "uid", "kind"),
-    "usage_conversations": ("days", "uid", "limit", "sort"),
+    "usage_overview": ("days", "from", "to"),
+    "usage_by_user": ("days", "uid", "kind", "from", "to"),
+    "usage_conversations": ("days", "uid", "limit", "sort", "from", "to"),
     "usage_conversation_detail": ("conversation_id",),
     "usage_response_time": ("days", "provider"),
     "usage_daily": ("days", "metric"),
-    "usage_stop_kinds": ("days", "uid"),
+    "usage_stop_kinds": ("days", "uid", "from", "to"),
+    "usage_depth_rounds": ("days", "from", "to"),
 }
 _USAGE_METRIC_VALUES = ("turns", "tokens", "response_time")
 _USAGE_SORT_VALUES = ("tokens", "turns", "elapsed")
@@ -2685,62 +2721,84 @@ def _fit_usage_result(result: dict, max_bytes: int) -> dict:
     return summary
 
 
+def _usage_period_args(args: dict, default: int = 30):
+    """期間引数（`days` か `from`/`to`）を検証し `(days, time_from, time_to)` を返す。
+
+    規則は管理者 API（`GET /admin/usage/stats`）と同じ: `from`/`to` を渡したときは `days` と排他
+    （明示指定の併用はエラー）・日時の妥当性（オフセット必須・両方必須・順序・上限）は store 側の
+    `_usage_period` が判定する。検証に落ちたら説明付きの error 辞書を返す（他のツール引数検証と同じ形）。
+    """
+    time_from, time_to = args.get("from"), args.get("to")
+    if time_from is None and time_to is None:
+        days = _usage_days_arg(args, default=default)
+        return days if isinstance(days, dict) else (days, None, None)
+    if args.get("days") is not None:
+        return {"error": "days と from/to は同時に指定できません"}
+    return (default, time_from, time_to)
+
+
+def _call_usage_store(fn, *a, **kw) -> dict:
+    """`store.usage_*` を呼び、期間規則違反（`UsagePeriodError`）は error 辞書へ写す。"""
+    from . import store
+    try:
+        return fn(*a, **kw)
+    except store.UsagePeriodError as e:
+        return {"error": str(e)}
+
+
 def _run_usage_tool(name: str, args: dict, tool_result_max_bytes: int) -> tuple[dict, set, list, list]:
     from . import store
     args = args or {}
     card = [_usage_tool_call_card(name, args)]
-    if name == "usage_overview":
-        days = _usage_days_arg(args)
-        if isinstance(days, dict):
-            return (days, set(), [], [])
-        result = _fit_usage_result(store.usage_overview(days), tool_result_max_bytes)
-        return (result, set(), [], card)
-    if name == "usage_by_user":
-        days = _usage_days_arg(args, default=7)
-        if isinstance(days, dict):
-            return (days, set(), [], [])
-        result = _fit_usage_result(
-            store.usage_by_user(days, uid=args.get("uid"), kind=args.get("kind")), tool_result_max_bytes)
-        return (result, set(), [], card)
-    if name == "usage_conversations":
-        days = _usage_days_arg(args)
-        if isinstance(days, dict):
-            return (days, set(), [], [])
-        sort = args.get("sort") or "tokens"
-        if sort not in _USAGE_SORT_VALUES:
-            return ({"error": f"sort は {'/'.join(_USAGE_SORT_VALUES)} のいずれかで指定してください"},
-                    set(), [], [])
-        result = _fit_usage_result(
-            store.usage_conversations(days, uid=args.get("uid"), limit=args.get("limit") or 20, sort=sort),
-            tool_result_max_bytes)
-        return (result, set(), [], card)
+
+    def _done(out: dict) -> tuple[dict, set, list, list]:
+        if "error" in out:
+            return (out, set(), [], [])
+        return (_fit_usage_result(out, tool_result_max_bytes), set(), [], card)
+
     if name == "usage_conversation_detail":
         result = _fit_usage_result(
             store.usage_conversation_detail(args.get("conversation_id")), tool_result_max_bytes)
         return (result, set(), [], card)
-    if name == "usage_response_time":
+    if name in ("usage_response_time", "usage_daily"):
+        # 期間指定は days のみ（`from`/`to` は日別系列・回答時間には足していない）。
         days = _usage_days_arg(args)
         if isinstance(days, dict):
             return (days, set(), [], [])
-        result = _fit_usage_result(
-            store.usage_response_time(days, provider=args.get("provider")), tool_result_max_bytes)
-        return (result, set(), [], card)
-    if name == "usage_daily":
-        days = _usage_days_arg(args)
-        if isinstance(days, dict):
-            return (days, set(), [], [])
+        if name == "usage_response_time":
+            result = _fit_usage_result(
+                store.usage_response_time(days, provider=args.get("provider")), tool_result_max_bytes)
+            return (result, set(), [], card)
         metric = args.get("metric") or "turns"
         if metric not in _USAGE_METRIC_VALUES:
             return ({"error": f"metric は {'/'.join(_USAGE_METRIC_VALUES)} のいずれかで指定してください"},
                     set(), [], [])
         result = _fit_usage_result(store.usage_daily(days, metric=metric), tool_result_max_bytes)
         return (result, set(), [], card)
-    # usage_stop_kinds
-    days = _usage_days_arg(args)
-    if isinstance(days, dict):
-        return (days, set(), [], [])
-    result = _fit_usage_result(store.usage_stop_kinds(days, uid=args.get("uid")), tool_result_max_bytes)
-    return (result, set(), [], card)
+
+    # 以下は期間を days でも from/to でも指定できるツール（規則は管理者 API と同じ）。
+    period = _usage_period_args(args, default=7 if name == "usage_by_user" else 30)
+    if isinstance(period, dict):
+        return (period, set(), [], [])
+    days, time_from, time_to = period
+    # `days` 指定のときは期間キーワードを渡さない（既存呼び出し形のまま＝store 側の既定と同じ）。
+    pkw = {} if time_from is None and time_to is None else {"time_from": time_from, "time_to": time_to}
+    if name == "usage_overview":
+        return _done(_call_usage_store(store.usage_overview, days, **pkw))
+    if name == "usage_by_user":
+        return _done(_call_usage_store(store.usage_by_user, days, uid=args.get("uid"),
+                                       kind=args.get("kind"), **pkw))
+    if name == "usage_conversations":
+        sort = args.get("sort") or "tokens"
+        if sort not in _USAGE_SORT_VALUES:
+            return ({"error": f"sort は {'/'.join(_USAGE_SORT_VALUES)} のいずれかで指定してください"},
+                    set(), [], [])
+        return _done(_call_usage_store(store.usage_conversations, days, uid=args.get("uid"),
+                                       limit=args.get("limit") or 20, sort=sort, **pkw))
+    if name == "usage_stop_kinds":
+        return _done(_call_usage_store(store.usage_stop_kinds, days, uid=args.get("uid"), **pkw))
+    # usage_depth_rounds
+    return _done(_call_usage_store(store.usage_depth_rounds, days, **pkw))
 
 
 # ---- 思考ノード（agents.py に依存しない＝循環回避）----

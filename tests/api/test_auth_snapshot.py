@@ -62,6 +62,7 @@ EXPECTED: dict[tuple[str, str], int] = {
     ("GET", "/admin/audit/export"): 401,
     ("GET", "/admin/usage/stats"): 401,
     ("POST", "/admin/usage/chat"): 401,
+    ("POST", "/admin/usage/quality-runs"): 401,
     ("GET", "/admin/improvement-log/export"): 401,
     ("GET", "/admin/settings"): 401,
     ("PUT", "/admin/settings"): 401,   # 全体設定（S1）・全フィールド optional＝空 body でも認証チェックまで到達

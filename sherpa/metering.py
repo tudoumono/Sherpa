@@ -56,8 +56,12 @@ _usage_log = logging.getLogger("sherpa.usage")   # 専用ファイル（usage.lo
 # record 単位の書き換え）が消費したトークン。`ingest/llm_render.py::run_world_pass` が world 単位の
 # パス1回につき集約1行を記録する（`graph_extract.available()`/`complete_json()` を再利用＝
 # model_catalog の独立用途 `render` を使うが、計測 kind は消費の性質が違うため独立させる）。
+# 'chat-round': 査読の巡ごとの記録。表示・分析用の別イベントで、消費の正本
+# （清書＝`answer.usage`／worker＝'chat-sub'／evaluator・orchestrator＝'chat-review'）とは二重に
+# 足さない（`store/usage.py` の集計はこの kind を除外する）。巡番号・判定・不足の軸・引用件数の
+# 増分・巡内の limits 増分・主張の区分内訳・役割別の内訳は `meta` へ入れる。
 KINDS = ("intent", "embed", "graph_ask", "vlm", "chat-sub", "chat-plan",
-        "usage_chat", "research", "chat-review", "rag_render")
+        "usage_chat", "research", "chat-review", "chat-round", "rag_render")
 
 _TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
 
@@ -89,7 +93,8 @@ def _clamp_str(v, limit: int = _MAX_STR_FIELD_LEN):
 
 def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
           connect_timeout: float | None = None, statement_timeout_ms: int | None = None,
-          elapsed_ms: float | None = None, conversation_id: int | None = None) -> None:
+          elapsed_ms: float | None = None, conversation_id: int | None = None,
+          meta: dict | None = None) -> None:
     """1行記録（`suppress()` 中は no-op）。`usage` は `acc_end()` が返す形、または生の usage 辞書の
     どちらでもよい。
 
@@ -101,6 +106,10 @@ def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
 
     `conversation_id`: 会話別集計キー。省略時（既定 None）は
     `usage_events.conversation_id` が NULL のまま（会話 id が未確定の経路・既存呼び出し元は無変更）。
+
+    `meta`（省略可・既定 None・DEPTH-2 S5）: 表示・分析用の付帯内訳（`usage_events.meta`・JSONB）。
+    課金集計は読まない（`store/usage.py` が kind='chat-round' の行を除外する）＝正本と二重に
+    足さない。
 
     `usage` が None なら全トークン列を None にする（NULL 行＝プロバイダが usage を報告しなかった
     「報告不能」マーカー）。辞書なら欠落サブフィールドは 0 に補正する（`_usage_meta` のクランプ意味論と
@@ -135,7 +144,7 @@ def record(kind, provider, model, usage, *, user_id=None, world=None, calls=1,
                             output_tokens=tokens["output_tokens"],
                             reasoning_output_tokens=tokens["reasoning_output_tokens"],
                             calls=calls, user_id=_clamp_str(user_id), world=world_c,
-                            elapsed_ms=elapsed_ms_val, conversation_id=conversation_id,
+                            elapsed_ms=elapsed_ms_val, conversation_id=conversation_id, meta=meta,
                             connect_timeout=connect_timeout, statement_timeout_ms=statement_timeout_ms)
         log_usage_line(kind, prov_c, model_c, tokens, calls, world_c, elapsed)
     except Exception as e:

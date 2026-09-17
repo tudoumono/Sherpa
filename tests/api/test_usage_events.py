@@ -116,6 +116,35 @@ def test_by_kind_aggregation_roundtrip():
         _delete_usage_events_by_model(models)
 
 
+def test_meta_column_roundtrip():
+    """`meta`（JSONB・省略可）: 渡さない既存経路は NULL のまま書ける・渡すと読み返せる。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    _admin, admin_uid = _admin_client()
+    world = f"usgevmeta{sfx}"
+    m_no_meta = f"test-model-nometa-{sfx}"
+    m_meta = f"test-model-meta-{sfx}"
+    models = [m_no_meta, m_meta]
+    try:
+        store.add_usage_event(kind="embed", provider="openai", model=m_no_meta,
+                              input_tokens=10, cached_input_tokens=0, output_tokens=5,
+                              reasoning_output_tokens=0, calls=1, user_id=admin_uid, world=world)
+        store.add_usage_event(kind="embed", provider="openai", model=m_meta,
+                              input_tokens=11, cached_input_tokens=0, output_tokens=7,
+                              reasoning_output_tokens=0, calls=1, user_id=admin_uid, world=world,
+                              meta={"note": "roundtrip", "count": 2})
+        with store._connect() as c:
+            row_no_meta = c.execute("SELECT meta FROM usage_events WHERE model = %s",
+                                    (m_no_meta,)).fetchone()
+            row_meta = c.execute("SELECT meta FROM usage_events WHERE model = %s",
+                                 (m_meta,)).fetchone()
+        assert row_no_meta["meta"] is None
+        assert row_meta["meta"]["note"] == "roundtrip" and row_meta["meta"]["count"] == 2
+    finally:
+        _delete_usage_events_by_model(models)
+
+
 def test_by_kind_elapsed_ms_aggregation():
     """STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: kind 別の elapsed_ms 合計/平均/計測件数。
     NULL 行（計測スコープ外）は平均から除かれ、chat 行は常に対象外（elapsed_n=0）。"""

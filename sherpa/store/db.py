@@ -720,6 +720,11 @@ _SCHEMA = [
     # または過去データ（遡及なし）。
     "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS conversation_id BIGINT",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_conversation_id ON usage_events (conversation_id)",
+    # 表示・分析用の付帯内訳（DEPTH-2 S5 の kind='chat-round'＝査読の巡別記録が使う: 巡番号・
+    # evaluator の判定と不足の軸・引用件数の増分・巡内の limits 増分・主張の区分内訳・役割別の
+    # トークン）。課金集計（`store/usage.py`）は読まない＝正本（answer.usage／chat-sub／
+    # chat-review）と二重に足さない。NULL＝付帯内訳を持たない行（既存の全 kind）。
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS meta JSONB",
     # 回答ごとの利用者フィードバック（👍/👎＋定型タグ＋任意の一言）。1利用者×1メッセージにつき
     # 最新1件のみ（再送は上書き）。本文（質問/回答）は複製せず message_id で messages を参照する
     # だけ（会話削除に CASCADE で追従）。
@@ -733,6 +738,38 @@ _SCHEMA = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE (message_id, user_id)
     )""",
+    # 品質採点（1巡 vs 3巡等の正解付き比較）を外部（既存の実測枠の運用）で採点した結果の
+    # **集計済みカウント**だけを受け取る。1行＝1採点ラン。質問文・回答本文は列自体を持たない
+    # （受け取っても保存できない）。`rounds` は比較した巡数（0＝見直しを回さない条件）、
+    # `cost_usd` は任意（費用集計・取れなければ NULL）。
+    """CREATE TABLE IF NOT EXISTS depth_quality_runs (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+        rounds INTEGER NOT NULL,
+        correct INTEGER NOT NULL DEFAULT 0,
+        wrong_assertion INTEGER NOT NULL DEFAULT 0,
+        missing INTEGER NOT NULL DEFAULT 0,
+        regressed INTEGER NOT NULL DEFAULT 0,
+        unrated INTEGER NOT NULL DEFAULT 0,
+        cost_usd NUMERIC
+    )""",
+    # 冪等キー（省略可＝既存行/呼び出し元は NULL のまま）。`run_id IS NOT NULL` の部分ユニーク索引
+    # により、同じ run_id の再送（例: 監査ログ書込み失敗後のリトライ）が2行目を作らない
+    # （`record_depth_quality_run` の ON CONFLICT (run_id) が使う）。NULL 同士は複数許容
+    # （PostgreSQL の一意索引は NULL を区別しない値として扱わない＝標準仕様）。
+    "ALTER TABLE depth_quality_runs ADD COLUMN IF NOT EXISTS run_id TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_depth_quality_runs_run_id "
+    "ON depth_quality_runs (run_id) WHERE run_id IS NOT NULL",
+    # 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）と、質問セットを実行した
+    # 期間。集計（`depth_quality_stats`）は登録時刻 `ts` ではなく実行期間で照会するため、
+    # 後日登録しても元の実行期間で読める。入口（`POST /admin/usage/quality-runs`）は3列とも必須
+    # だが、列は NULL 許容にしておく（入口を通らずに入った過去行を ALTER で壊さない）——
+    # 実行期間を持たない行は期間の包含判定に合致せず集計の母集団に入らない。
+    "ALTER TABLE depth_quality_runs ADD COLUMN IF NOT EXISTS condition TEXT",
+    "ALTER TABLE depth_quality_runs ADD COLUMN IF NOT EXISTS executed_from TIMESTAMPTZ",
+    "ALTER TABLE depth_quality_runs ADD COLUMN IF NOT EXISTS executed_to TIMESTAMPTZ",
+    "CREATE INDEX IF NOT EXISTS idx_depth_quality_runs_executed "
+    "ON depth_quality_runs (executed_from, executed_to)",
 ]
 # PERF-1（台帳#17）: usage_stats の期間絞り（`_usage_period_bounds`）が messages.created_at で
 # 索引を使えるようにする。**契約の範囲**: messages 全体に対する線形の物理読取（Seq/Index Scanで

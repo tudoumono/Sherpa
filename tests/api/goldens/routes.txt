@@ -18,6 +18,7 @@ GET	/admin/audit	管理者:監査ログ	admin_audit_list
 GET	/admin/audit/verify	管理者:監査ログ	admin_audit_verify
 GET	/admin/audit/export	管理者:監査ログ	admin_audit_export
 GET	/admin/usage/stats	管理者:利用統計	admin_usage_stats
+POST	/admin/usage/quality-runs	管理者:利用統計	admin_usage_quality_run_create
 POST	/admin/usage/chat	管理者:利用統計	admin_usage_chat
 GET	/admin/improvement-log/export	管理者:改善ログ	admin_improvement_log_export
 GET	/users/suggest	会話共有	users_suggest

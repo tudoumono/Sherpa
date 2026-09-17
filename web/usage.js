@@ -538,6 +538,56 @@ function renderLimits(limits) {
   </tr>`).join('');
 }
 
+const REVIEW_LABELS = {
+  confirmed: '確定', inferred: '推定', unknown: '不明',
+  sufficient: '十分', insufficient: '根拠不足', undecidable: '判定できず',
+  not_found_in_scope: '範囲内で見つからない', unexplored: '未調査', conflict: '食い違い', budget: '調査の上限', unreadable: '読み取り不可',
+  rerun: '次の見直しへ', rounds_exhausted: '見直しの回数に到達',
+  user_stop: '利用者が停止', ask_user: '利用者に確認', review_failed: '確認に失敗', failed: '失敗',
+  tool_result_clipped: '1件の読取量を制限', total_budget_hit: '累計の読取量に到達',
+  context_compactions: '会話履歴を整理', synthesis_truncated: '回答用の情報量を制限',
+  search_truncated: '検索件数を制限', auto_continues: '続きを自動で実行',
+};
+const REVIEW_DEPTH_LABELS = { standard: '標準', deep: '深く', max: '最大' };
+const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-standard': '見直しなし', 'depth2-deep': '見直しあり（深く）', 'depth2-max': '見直しあり（最大）' };
+function reviewCounts(counts) {
+  const totals = new Map();
+  Object.entries(counts).forEach(([key, count]) => {
+    const label = Object.hasOwn(REVIEW_LABELS, key) ? REVIEW_LABELS[key] : 'その他';
+    totals.set(label, (totals.get(label) || 0) + count);
+  });
+  return Array.from(totals, ([label, count]) => `${label}: ${fmtNumOrDash(count, 0)}`)
+    .join('／') || '記録なし';
+}
+function renderReviewStats(rounds, quality) {
+  const table = (heads, rows) => '<table><thead><tr>'
+    + heads.map(h => `<th scope="col">${esc(h)}</th>`).join('') + '</tr></thead><tbody>'
+    + (rows.length ? rows.map(row => '<tr>' + row.map(cell => `<td>${esc(String(cell))}</td>`).join('') + '</tr>').join('')
+      : `<tr><td colspan="${heads.length}">この期間の記録はありません。</td></tr>`)
+    + '</tbody></table>';
+  const roundTable = (rows, byRound) => table([
+    '深さ', '使った AI', ...(byRound ? ['見直しの順番'] : []), '記録数', '増えた出典の合計',
+    '平均所要時間（秒）', '判断の内訳', '制限に当たった回数', '見直しの判定', '終了・継続の理由', '足りなかった点',
+  ], rows.map(r => [
+    REVIEW_DEPTH_LABELS[r.depth_profile] || '不明', providerLabel(r.provider), ...(byRound ? [r.round_no ?? '不明'] : []),
+    r.rounds, fmtNumOrDash(r.citations_delta_total, 0), fmtSecOrDash(r.elapsed_ms_avg),
+    reviewCounts(r.claims), reviewCounts(r.limits), reviewCounts(r.verdicts), reviewCounts(r.stops), reviewCounts(r.missing_codes),
+  ]));
+  $('review-stats').innerHTML = (!(rounds?.by_depth_provider?.length || rounds?.by_round?.length || quality?.by_rounds?.length)
+    ? '<p class="hint">見直しの機能はこの環境では未導入です。</p>' : '')
+    + '<h3>深さ・使った AI ごと</h3>' + roundTable(rounds?.by_depth_provider ?? [], false)
+    + '<h3>何回目の見直しかで比べる</h3>' + roundTable(rounds?.by_round ?? [], true)
+    + '<h3>正解付きの比較</h3>'
+    + (quality?.period
+      ? `<p class="hint">集計期間: ${esc(quality.period.start ?? '不明')} 〜 ${esc(quality.period.end ?? '不明')}。見直しの記録とは別に採点した結果です。</p>`
+      : '')
+    + table(['条件', '見直しの回数', '比較件数', '正解', '誤った断定', '回答漏れ', '以前より悪化', '未採点', '費用合計（米ドル）'],
+      (quality?.by_rounds ?? []).map(r => [
+        Object.hasOwn(REVIEW_CONDITION_LABELS, r.condition) ? REVIEW_CONDITION_LABELS[r.condition] : '不明',
+        r.rounds, r.runs, r.correct, r.wrong_assertion, r.missing, r.regressed, r.unrated,
+        fmtNumOrDash(r.cost_usd_total, 2)]));
+}
+
 function renderWeeklyAndRetention(retention) {
   const weekly = (retention && retention.weekly) || [];
   renderTrendChart(
@@ -813,6 +863,7 @@ async function load(days) {
   const seq = ++_loadSeq;   // このリクエストの連番（連打時、最新以外の描画は破棄する）
   _days = days;
   setLoading();
+  $('review-stats').textContent = '見直しの集計を読み込んでいます…';
   document.querySelectorAll('.period-bar .filterchip').forEach((b) => {
     b.classList.toggle('on', Number(b.dataset.days) === days);
   });
@@ -831,6 +882,7 @@ async function load(days) {
     renderConversationTurns(d.conversation_turns || {}, d.resume_rate);
     renderResponseTime(d.response_time || {});
     renderLimits(d.limits || {});
+    renderReviewStats(d.rounds, d.quality_runs);
     renderTokens(d.tokens || {}, d.period);
     renderConversationsTop(d.conversations_top || []);
     _users = d.users || [];
@@ -839,6 +891,7 @@ async function load(days) {
     if (seq !== _loadSeq) return;
     $('usage-tbody').setAttribute('aria-busy', 'false');
     $('usage-tbody').innerHTML = `<tr><td colspan="8" style="color:var(--danger);padding:16px">読み込みに失敗しました: ${esc(String(e))}</td></tr>`;
+    $('review-stats').textContent = '見直しの集計を読み込めませんでした。';
     toast('利用統計の読み込みに失敗しました');
   }
 }
