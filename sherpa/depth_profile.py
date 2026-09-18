@@ -1,12 +1,18 @@
 """調べる深さ（探索の踏み込み度合い）＝ EXT-5 Depth/Cost/Verification Profile の吸収
-（調べ方ブロック §3.2・`docs/proposals/2026-08-29-調べ方ブロック.md`。倍率連動は
-DEPTH-2 S7（`docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.3・§5）で撤去）。
+（調べ方ブロック §3.2・`docs/proposals/2026-08-29-調べ方ブロック.md`）。
 
-`depth_profile`: `"standard" | "deep" | "max"`（既定 `"standard"`）。DEPTH-2 以降、この値は
-倍率には効かない——`scaled_turns`/`scaled_ratio`/`scaled_depth`/`codex_reasoning_for` は
-基準値（`effective_base` の戻り値）をそのまま返す（`abs_max` の絶対上限はそのまま効く）。
-値自体（`scope_meta.depth_profile`・保存済み会話・usage メタの depth 記録・管理画面の基準値
-編集）は引き続き残る——「深さ＝レビュー巡数」への読み替えは DEPTH-2 S5 で行う。
+`depth_profile`: `"standard" | "deep" | "max"`（既定 `"standard"`＝既存の挙動と完全同一）。
+深さは2つの軸に効く:
+
+- 1回あたりの探索量: 既存の per-call override（`impact_service.run_impact`/
+  `lens_service.run_troubleshoot` の `depth`・`lens_service.run_qa` の `max_hits`・
+  `agentic_search.openai_style` の `max_turns`）と上書き経路（`agentic_search.run_tool` の
+  hits/window 上限・Codex `reasoning` の per-turn 上書き）に、**倍率**として掛ける——基準値
+  そのものは書き換えない（PROF-1 の env 積み増しの上に更に積む・§3.2）。
+- evaluator（査読）の巡数: `review_rounds_for`（標準 0／深く 2／最大＝管理画面の共通上限）。
+
+本体が必要な根拠種別を揃えられないと判断したターンは、上限内で深さを1段だけ自動で引き上げる
+（`escalated_profile`・`providers/base.py` の巡ループが唯一の消費者）。
 
 基準値は「env → system_settings」（`docs/proposals/2026-08-23-設定の責務再設計.md` の SET-2・
 WEB-1 と同じ思想）: 各モジュールの既存定数（`agentic_search.MAX_TURNS` 等）が env フォールバック
@@ -47,6 +53,17 @@ BASE_SETTINGS_KEYS = {
     "troubleshoot_depth": "depth_base_troubleshoot_depth",
     "codex_reasoning": "depth_base_codex_reasoning",
 }
+
+# §3.2 の倍率表（依頼の初期案どおり・裁定論点8で確定）。
+_TURNS_MULT = {"standard": 1, "deep": 2, "max": 3}
+# grep/ES ヒット上限・読み取り窓（`run_tool`/`run_qa`）は同じ倍率を共有する。
+_RATIO_MULT = {"standard": 1.0, "deep": 1.5, "max": 2.0}
+# 影響たどり／トラブルシュート近傍の深さは倍率でなく加算。
+_DEPTH_ADD = {"standard": 0, "deep": 2, "max": 4}
+# Codex 推論レベルの per-turn 上書き（`None`＝基準値のまま・上書きしない）。基準値が既に上なら
+# 下げない（`codex_reasoning_for` が `CODEX_REASONING_LEVELS` の順序で比較する）。
+_REASONING_OVERRIDE = {"standard": None, "deep": "high", "max": "xhigh"}
+
 
 def normalize_depth_profile(v) -> str:
     """欠落（`None`）は `"standard"`。HTTP 入口（`ChatReq.depth_profile`）は pydantic の
@@ -114,39 +131,56 @@ def effective_base(system_settings: dict | None, name: str, env_default):
 
 
 def scaled_turns(base_max_turns: int, profile) -> int:
-    """反復上限（`Main Round 上限`相当・`MAX_TURNS`）。DEPTH-2 S7 以降、深さに依らず基準値を
-    そのまま返す（倍率は撤去・`profile` は妥当性検証のためだけに使う＝不正値は fail-loud）。"""
-    normalize_depth_profile(profile)
-    return int(base_max_turns)
+    """反復上限（`Main Round 上限`相当・`MAX_TURNS`）。標準=×1・深く=×2・最大=×3（切り捨て）。"""
+    return int(base_max_turns * _TURNS_MULT[normalize_depth_profile(profile)])
 
 
 def scaled_ratio(base: int, profile, abs_max: int | None = None) -> int:
     """grep/ES ヒット上限（`MAX_HITS`／`run_qa` の `max_hits`）・読み取り窓（`READ_WINDOW`）。
-    DEPTH-2 S7 以降、深さに依らず基準値をそのまま返す（倍率は撤去）。
+    標準=×1・深く=×1.5・最大=×2（切り捨て）。
 
-    `abs_max`（省略可・既定 `None`＝クランプなし＝既存呼び出し元は無変更）は引き続き効く
-    絶対上限（各モジュールの既存 env 定数の env-parse hi 引数と同じ値を渡す想定・例:
-    `agentic_search.MAX_HITS_ABS_MAX`）——基準値が `abs_max` を超える構成（管理画面での手動設定）
-    でも最終的に一度だけ縛る。"""
-    normalize_depth_profile(profile)
-    v = int(base)
+    `abs_max`（省略可・既定 `None`＝クランプなし＝既存呼び出し元は無変更）: 倍率適用
+    **後に一度だけ**適用する絶対上限（各モジュールの既存 env 定数の env-parse hi 引数と同じ値を
+    渡す想定・例: `agentic_search.MAX_HITS_ABS_MAX`）。管理画面の基準値編集が Field 上限いっぱい
+    （例: grep ヒット上限 1000）を指定し、かつ調べる深さが「最大」（×2）のとき、倍率だけでは
+    2000 まで無制限に伸びてしまう——`abs_max` は「基準値そのものの妥当な範囲」とは独立に、
+    「倍率適用後に実際に外部（grep/ES）へ渡してよい値」を最終的に一度だけ縛る。"""
+    v = int(base * _RATIO_MULT[normalize_depth_profile(profile)])
     return min(v, abs_max) if abs_max is not None else v
 
 
 def scaled_depth(base_depth: int, profile, abs_max: int | None = None) -> int:
     """影響たどり（`IMPACT_MAX_DEPTH`）・トラブルシュート近傍（`TROUBLESHOOT_GRAPH_DEPTH`）の深さ。
-    DEPTH-2 S7 以降、深さに依らず基準値をそのまま返す（加算は撤去）。`abs_max`（省略可・既定
-    `None`）は `scaled_ratio` と同じ契約で引き続き効く絶対上限。"""
-    normalize_depth_profile(profile)
-    v = int(base_depth)
+    標準=+0・深く=+2・最大=+4。`abs_max`（省略可・既定 `None`）は `scaled_ratio` と同じ契約
+    （加算後に一度だけ適用する絶対上限）。"""
+    v = int(base_depth) + _DEPTH_ADD[normalize_depth_profile(profile)]
     return min(v, abs_max) if abs_max is not None else v
 
 
 def codex_reasoning_for(base_reasoning: str, profile) -> str:
-    """Codex 推論レベルの per-turn 上書き。DEPTH-2 S7 以降、深さに依らず基準値をそのまま返す
-    （`"deep"`=`"high"`／`"max"`=`"xhigh"` への上書きは撤去）。"""
-    normalize_depth_profile(profile)
-    return base_reasoning
+    """Codex 推論レベルの per-turn 上書き。標準=基準値のまま・深く=`"high"`・最大=`"xhigh"`。
+
+    深さの指定は基準値（管理画面の `codex_reasoning`）を**下げない**——基準が既に `"xhigh"` の
+    環境で「深く」を選ぶと `"high"` へ落ちる逆転が起きるため、`CODEX_REASONING_LEVELS` の順序で
+    比較して高い方を返す。基準値が未知の語彙（設定の壊れ）なら比較できないので深さの指定を使う。
+    """
+    override = _REASONING_OVERRIDE[normalize_depth_profile(profile)]
+    if override is None:
+        return base_reasoning
+    if base_reasoning not in CODEX_REASONING_LEVELS:
+        return override
+    return (override if CODEX_REASONING_LEVELS.index(override) > CODEX_REASONING_LEVELS.index(base_reasoning)
+            else base_reasoning)
+
+
+def escalated_profile(profile) -> str | None:
+    """1段上の深さ（`"standard"`→`"deep"`→`"max"`）。`"max"` は上限のため `None`。
+
+    本体が必要な根拠種別を揃えられないと判断したときの自動引き上げ（1ターンに1回まで）が
+    唯一の消費者——利用者が選んだ深さ自体は書き換えない（実効値だけが1段上になる）。
+    """
+    i = DEPTH_PROFILES.index(normalize_depth_profile(profile))
+    return DEPTH_PROFILES[i + 1] if i + 1 < len(DEPTH_PROFILES) else None
 
 
 def effective_max_turns(system_settings: dict | None, env_default: int, profile) -> int:

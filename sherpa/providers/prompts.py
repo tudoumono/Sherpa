@@ -20,12 +20,26 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _kind_labels(kinds) -> str:
+    """根拠種別（閉集合）の平文ラベル読み下し（`investigation_state` が唯一の語彙源）。"""
+    from ..investigation_state import evidence_kind_labels
+    return evidence_kind_labels(kinds)
+
+
 def _digest_limit_lines(env: dict) -> str:
     """清書ダイジェストの「調査の限界」行だけを取り出す（impact／troubleshoot の分岐は引用ダイジェストを
     そのまま渡さないため、限界（0件・打ち切り・保存時切断・上限到達で中断）だけは別途連結する）。"""
     digest = env.get("_synthesis_digest") or ""
     limits = [ln for ln in digest.splitlines() if ln.startswith("調査の限界: ")]
     return ("\n" + "\n".join(limits)) if limits else ""
+
+
+# グラフを引けていないターンの影響調査へ渡す指示（0 件は「影響が無い」ではなく「確認できて
+# いない」）。グラフ用の文面と、引用ベースの整形へ倒したときの追記で同じ一文を使う。
+_GRAPH_DEGRADED_IMPACT_STEER = (
+    "。ただし関係のつながり（COPY/CALL/参照）は確認できていないため、"
+    "構造的な影響の有無は不明であり「影響は無い」と断定しないこと"
+    "（資料とソースを直接確認して分かった範囲だけを答える）。")
 
 
 def _facts(lens: str, env: dict) -> str:
@@ -47,7 +61,14 @@ def _facts(lens: str, env: dict) -> str:
     # グラフ確認済みの構造的根拠（digest）まで捨ててしまうため、データの形で判断し、
     # グラフ結果（items/presumed）が無ければ引用ベースの整形（qa と同じ）へ倒す
     # （citations か digest のどちらかがあれば倒す＝どちらも無ければ本当に根拠皆無の "計0件"）。
+    _orig_lens = lens   # qa へ倒した後も「元がどのレンズだったか」で足す指示があるため退避する
     if (lens == "impact" and not d.get("items") and not d.get("presumed")
+            and (d.get("citations") or env.get("_synthesis_digest"))):
+        lens = "qa"
+    # トラブルシュートも同型: グラフ不調で原因候補（candidates）を持たない縮退 env
+    # （`chat_service._qa_fallback_env`）は引用ベースの整形へ倒す——そのまま当てると
+    # 「原因候補なし」に潰れ、grep で拾った該当箇所が清書へ一切渡らない。
+    if (lens == "troubleshoot" and not d.get("candidates")
             and (d.get("citations") or env.get("_synthesis_digest"))):
         lens = "qa"
     if lens == "impact":
@@ -62,6 +83,9 @@ def _facts(lens: str, env: dict) -> str:
         steer = ("。この起点では構造的なコードの波及は無い＝**変更対象（起点）と影響先の接続"
                  "（COPY/CALL/参照の経路）が辿れるか**を、資料の検索（仕様問い合わせ・トラブルシュート）や"
                  "関係グラフで確認するよう勧めること（症状語をそのまま探さない・フォルダにコードが無いとは断定しない）。")
+        if env.get("graph_degraded"):
+            # 関係グラフを引けていないターン——0 件は「影響が無い」ではなく「確認できていない」。
+            steer = _GRAPH_DEGRADED_IMPACT_STEER
         if items:
             names = "、".join(f"{i['name']}({i['category']})" for i in items[:12])
             rest = f"（先頭12件・残り {len(items) - 12} 件は未提示）" if len(items) > 12 else ""
@@ -74,7 +98,9 @@ def _facts(lens: str, env: dict) -> str:
                 base = (f"{origin}確実な依存は見つからなかったが、資料からの関連（推定・要確認）が{len(presumed)}件: {pn}。"
                         "これらは推定であり確実ではない旨を明記すること" + steer)
             else:
-                base = f"{origin}影響: 計0件（該当なし）" + steer
+                base = ((f"{origin}影響: 関係のつながりを確認できていないため件数は不明"
+                        if env.get("graph_degraded") else f"{origin}影響: 計0件（該当なし）")
+                        + steer)
         base += _digest_limit_lines(env)
     elif lens == "troubleshoot":
         from ..agentic_search import _redact            # grep 根拠本文も秘匿（ES は redact 済み・base grep の password/api_key 等を外部LLMへ流さない）
@@ -96,11 +122,20 @@ def _facts(lens: str, env: dict) -> str:
             cites = d.get("citations", [])
             base = ("該当箇所: " + " / ".join(f"{c['doc_id']}「{(c.get('quote') or '')[:60]}…」" for c in cites[:4])
                     if cites else "該当なし")
+    if _orig_lens == "impact" and lens != "impact" and env.get("graph_degraded"):
+        # 該当箇所（citations）を持つ縮退 impact は上で qa の整形へ倒れるため、影響レンズ用の
+        # 「断定しない」指示がそのままでは清書へ渡らない——ここで同じ一文を足す。
+        base += _GRAPH_DEGRADED_IMPACT_STEER
     # DEPTH-2 S1（RV C3）: 主張構造はレンズ分岐に関わらず必ず付加する——troubleshoot/impact は
     # 上の分岐で早期に `base` を確定するため、ここで一箇所にまとめないと清書プロンプトへ渡らない。
     claims_digest = env.get("_claims_digest")
     if claims_digest:
         base += f"\n\n【主張の構造（確定/推定/不明）】\n{claims_digest}"
+    # 必要な根拠の種別が揃わなかったターンの注記（主張構造の有無に関わらず必ず渡す——
+    # 主張構造が無い経路＝主張生成の失敗・単発フォールバックでも断定を抑える唯一の手がかり）。
+    evidence_note = env.get("_evidence_note")
+    if evidence_note:
+        base += f"\n\n【根拠の不足】\n{evidence_note}"
     return base + (env.get("_personal_facts") or "")
 
 
@@ -122,6 +157,9 @@ def _answer_prompt(message, lens, env):
             "推定は『推定』と明示して理由を添える、不明はその主張がなぜ答えられないか（理由コード）を"
             "明示する（不明な部分があるからといって回答全体を『不明』でひとまとめにしない・答えられる"
             "部分は答える）。"
+            "『根拠の不足』があれば、そこに書かれた範囲については言い切らず、確認できていない旨を"
+            "明示する（確定できる根拠が無いことを断定的な書き方で覆い隠さない）。"
+            "設計書とソースの記述が食い違う場合はソースを正とし、食い違いがあったこと自体も書く。"
             "件数や対象名は事実のまま。出典（原本 DL）は Sherpa が付与するが、本文中でも根拠のパスを示してよい。"
             "回答は Markdown（太字・箇条書き・インラインコード）で書いてよい。"
             f"\n\n【質問】{message}\n【取得済みの事実】{_facts(lens, env)}\n\n回答のみ:")
@@ -230,11 +268,23 @@ def claims_prompt(question: str, digest: str, existing_claims_text: str = "",
 
 
 def review_prompt(question: str, digest: str, claims_text: str = "",
-                  findings_text: str = "", round_no: int = 1, total_rounds: int = 1) -> str:
-    """DEPTH-2 S5（§2.4）: 1 巡分の査読プロンプト。orchestrator（確認）と evaluator（判定）の
-    役割を文言で分ける——読み直し（`read_around`/`list_docs`）は orchestrator が自分で必要箇所を
-    確認する枠、最後の JSON は evaluator の判定。巡の入力は毎巡ここで組み直す（過去巡の全文は
-    積まない・呼び出し元が最新の調査状態と未解決の指摘だけを渡す）。
+                  findings_text: str = "", round_no: int = 1, total_rounds: int = 1,
+                  required_kinds: tuple = (), unavailable_kinds: tuple = (),
+                  unreachable_kinds: tuple = (),
+                  require_source_read: bool = False) -> str:
+    """1 巡分の査読プロンプト。orchestrator（確認）と evaluator（判定）の
+    役割を文言で分ける——読み直し（`read_around`/`read_doc`/`list_docs`）は orchestrator が自分で
+    必要箇所を確認する枠、最後の JSON は evaluator の判定。巡の入力は毎巡ここで組み直す（過去巡の
+    全文は積まない・呼び出し元が最新の調査状態と未解決の指摘だけを渡す）。
+
+    判定は根拠の**量**（引用の増分）ではなく、質問の型ごとに必要な根拠の**種別**が揃っているか
+    で行う（`required_kinds`・平文ラベル）。`unavailable_kinds` はそのターンの登録範囲に存在
+    しない種別＝「該当なし」として不足に数えない旨を、`unreachable_kinds` は範囲にはあるが
+    今回の探す対象（層）では読めない種別＝確定させない旨を伝える。
+
+    `require_source_read` が真のとき、判定の前に**必ず**ソース種別のファイル本文を自分で読むよう
+    指示する（一覧取得・設計書の読取・空振りでは成立しない——成立条件は呼び出し元が機械的に
+    判定する）。
 
     `claims_text`: worker の一次判断（`investigation_state.render_claims`）。
     `findings_text`: 前巡までの未解決の指摘（`investigation_state.render_findings`）。
@@ -243,6 +293,23 @@ def review_prompt(question: str, digest: str, claims_text: str = "",
         "あなたは調査の統括役（orchestrator）と評価役（evaluator）を兼ねます。"
         f"これは{total_rounds}巡中の{round_no}巡目の見直しです。回答本文は書かないこと。\n"
         f"【質問】\n{question}\n\n【収集済みの根拠（digest）】\n{digest or '(なし)'}\n\n")
+    if required_kinds:
+        prompt += (
+            "【判定の基準＝必要な根拠の種別】\n"
+            "根拠の件数や引用の増え方では判定しないでください。この質問には次の種別の根拠が"
+            f"揃っている必要があります: {_kind_labels(required_kinds)}。"
+            "設計書とソースが食い違う場合はソースを正とし、その食い違い自体を不足の観点として"
+            "書いてください。\n")
+        if unavailable_kinds:
+            prompt += (
+                f"次の種別は今回の範囲に存在しません: {_kind_labels(unavailable_kinds)}。"
+                "これらは「該当なし」として扱い、不足には数えないでください。\n")
+        if unreachable_kinds:
+            prompt += (
+                f"次の種別は範囲にはありますが、今回の探す対象では読めません: "
+                f"{_kind_labels(unreachable_kinds)}。これらを理由に不足へ倒す必要はありませんが、"
+                "確認できていない以上その点を確定として扱わないでください。\n")
+        prompt += "\n"
     if claims_text:
         prompt += (
             "【下調べ役の一次判断（確定/推定/不明・鵜呑みにせず必要な箇所は自分で確認すること）】\n"
@@ -254,10 +321,19 @@ def review_prompt(question: str, digest: str, claims_text: str = "",
                    "（内容だけ今回の表現へ更新してよい）、別の指摘には上記に無い未使用の id を"
                    "付けてください。上記の id を別の指摘に使い回さないでください。\n\n")
     prompt += (
-        "まず統括役として、引用箇所の前後の原文を自分で確かめたい場合は、次のどちらかの JSON を"
+        "まず統括役として、原文を自分で確かめるために、次のいずれかの JSON を"
         "1個だけ出力してください（他の文章を書かない）:\n"
         '{"action": "read_around", "doc_id": "…", "line": 行番号}\n'
-        '{"action": "list_docs", "path_prefix": "…"}\n'
+        '{"action": "read_doc", "doc_id": "…", "start_line": 行番号}\n'
+        '{"action": "list_docs", "path_prefix": "…"}\n')
+    if require_source_read:
+        prompt += (
+            "この質問は必要な根拠の種別にソースを含みます。判定の前に**必ず** `read_around` か "
+            "`read_doc` でソース種別のファイル（プログラム本体のコード）の本文を読んでください。"
+            "一覧取得（`list_docs`）だけ・設計書だけの読取・行番号が範囲外で本文が空だった読取は"
+            "確認したことになりません。下調べ役の一次判断に既にソースの根拠が付いていても、"
+            "自分で本文を読むまで判定へ進まないでください。\n")
+    prompt += (
         "確認を終えたら評価役として、別観点（反証・条件例外・回答漏れ・未探索の範囲）から"
         "判定し、次の JSON 1個だけを出力してください（他の文章を書かない・書き直しはしない）:\n"
         '{"verdict": "sufficient" | "insufficient" | "undecidable", '
@@ -268,9 +344,13 @@ def review_prompt(question: str, digest: str, claims_text: str = "",
         "`undecidable`（十分とも不足とも判断できない）のいずれか——判断できないものを"
         "`insufficient` や `sufficient` に丸めないこと。\n"
         "`missing_codes` は `missing` の分類（集計用・任意）——該当する軸があれば次の語彙から"
-        "1つ以上選ぶ: not_found_in_scope=検索した範囲で見つからない、"
+        "1つ以上選ぶ: source_missing=ソースを確認できていない、"
+        "spec_missing=設計書を確認できていない、definition_missing=定義を確認できていない、"
+        "log_missing=ログ・設定を確認できていない、callgraph_missing=呼出関係を確認できていない、"
+        "not_found_in_scope=検索した範囲で見つからない、"
         "unexplored=未探索の範囲がある、insufficient=情報不足、conflict=資料間で矛盾、"
-        "budget=打ち切り、unreadable=原本を読めない。無ければ空配列にする。\n"
+        "budget=打ち切り、unreadable=原本を読めない。無ければ空配列にする。"
+        "この語彙以外の語・資料名・自由文は入れないでください。\n"
         "`findings` は主張 ID（`claim_id`）単位の指摘で、根拠と矛盾する主張には `refutes` を true に"
         "してください（その主張はこの巡で採用不可になります）。主張に紐づかない不足は `claim_id` を"
         "空文字にします。指摘が無ければ空配列にしてください。")

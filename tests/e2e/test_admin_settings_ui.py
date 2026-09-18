@@ -3450,6 +3450,58 @@ def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
     expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('固定中')
 
 
+def test_codex_worker_model_renders_default_placeholder_and_saves(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    field = page.locator('#codex-worker-model-card #codex-worker-model')
+    expect(field).to_have_value('')
+    expect(field).to_have_attribute('placeholder', '既定: gpt-5.6-sol')
+    expect(page.locator('#codex-worker-model-hint')).to_contain_text('未設定です（既定 gpt-5.6-sol が適用されます）。')
+    field.fill('gpt-5.6-sol-mini')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'codex_worker_model': 'gpt-5.6-sol-mini'}
+    page.reload()
+    expect(page.locator('#codex-worker-model')).to_have_value('gpt-5.6-sol-mini')
+    expect(page.locator('#codex-worker-model-hint')).to_contain_text('固定中')
+
+
+def test_codex_worker_model_clear_sends_null(page, web_base_url):
+    from playwright.sync_api import expect
+    import mock_api
+
+    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    settings['codex_worker_model'] = {
+        'configured': 'gpt-5.6-sol-mini', 'effective': 'gpt-5.6-sol-mini', 'default': 'gpt-5.6-sol'}
+    records = install_api_mocks(page, system_settings=settings)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    expect(page.locator('#codex-worker-model')).to_have_value('gpt-5.6-sol-mini')
+    page.locator('#codex-worker-model').fill('')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'codex_worker_model': None}
+
+
+def test_codex_worker_model_highlight_differs_from_default(page, web_base_url):
+    """既定から変えた項目だけ強調する（agentic_budget/depth_profile と同型）。"""
+    import re
+
+    from playwright.sync_api import expect
+    import mock_api
+
+    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    settings['codex_worker_model'] = {
+        'configured': 'gpt-5.6-sol-mini', 'effective': 'gpt-5.6-sol-mini', 'default': 'gpt-5.6-sol'}
+    install_api_mocks(page, system_settings=settings)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, 'research')
+
+    expect(page.locator('#codex-worker-model')).to_have_class(re.compile(r'\bcfg-changed\b'))
+
+
 def test_research_reset_preserves_provider_draft(page, web_base_url):
     from playwright.sync_api import expect
 
@@ -3462,12 +3514,12 @@ def test_research_reset_preserves_provider_draft(page, web_base_url):
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 12 and all(value is None for value in body.values())
+    assert len(body) == 13 and all(value is None for value in body.values())
     assert set(body) == {
         'depth_base_max_turns', 'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
         'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
         'depth_base_codex_reasoning', 'agentic_max_tools_per_turn', 'embed_parallel',
-        'max_review_rounds', 'agentic_budget_per_result', 'agentic_budget_total',
+        'max_review_rounds', 'codex_worker_model', 'agentic_budget_per_result', 'agentic_budget_total',
     }
     assert 'openai_api_key' not in body and 'cloud_provider' not in body
     expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')

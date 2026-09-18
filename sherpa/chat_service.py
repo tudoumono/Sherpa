@@ -583,10 +583,20 @@ def _known_terms(session, world) -> list:
     抽出の**ヒント**（ルーティング補助）であり厳密解が必須ではないため、ソフト縮退のままでよい
     （fail-loud にする必要はない）。返却形（name 文字列のリスト）は不変。
     """
-    rows = _run_capped(
-        session, "MATCH (n:Entity {world_id:$v}) RETURN DISTINCT n.name AS name",
-        log_world=world, v=world,
-    )
+    from neo4j.exceptions import DriverError, TransientError
+    try:
+        rows = _run_capped(
+            session, "MATCH (n:Entity {world_id:$v}) RETURN DISTINCT n.name AS name",
+            log_world=world, v=world,
+        )
+    except (DriverError, TransientError) as e:
+        # 接続断・一時障害（`_run_capped` は timeout 以外の `Neo4jError` を再送出し、`DriverError`
+        # 系はそもそも捕捉しない）。ここは**ヒント**の取得なので、ターン全体を落とさず空で続ける
+        # ——落とすとグラフ不調時の縮退（§0(c)）へ一度も到達できない。実行本体（`_dispatch` の
+        # impact/troubleshoot）は同じ障害を別途分類して縮退／honest failure を決める。
+        _log.warning("起点語ヒントの取得に失敗（グラフ接続断・空で続行・world=%s）: %s",
+                    world, type(e).__name__)
+        return []
     return [r["name"] for r in rows if r["name"]]
 
 
@@ -701,7 +711,7 @@ def _answer_qa(result, world):
 
 
 def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", lens_block=None,
-                   web_search=False, depth_profile=None, tools=None):
+                   web_search=False, depth_profile=None, tools=None, tools_explicit=None):
     """有効な範囲を決める（D）。鏡では**明示選択 ＞ world 全体**（auto-scope 推定は撤去・MIRROR §3）。
 
     返り値 `{world, scope_paths, source, layer, lens_source, lens_block, web_search, depth_profile, tools}`。
@@ -725,16 +735,24 @@ def _resolve_scope(message, world, scope_paths, layer=None, lens_source="auto", 
     （fail-loud）。
     `tools`（検索経路トグル・調べ方ブロック §3.6）: 省略（`None`）は全 ON に正規化する
     （`tools_pref_mod.normalize_tools_pref`）。不正な内部値は同様に `ValueError`（fail-loud）。
+    `tools_explicit`（省略可・既定 `None`＝記録なし）: 利用者が実際に切り替えた軸（`tools` の値だけ
+    では「既定のまま ON」と「明示的に ON」を区別できない）。会話を開き直したときに触っていない軸まで
+    明示扱いにして不達で 422 にしないための復元専用の記録——実行には使わない。`None` のときは
+    **キー自体を作らない**（この記録を送らない経路・旧回答と同じ扱い＝復元側は近似へ落ちる）。
     `layer_mod.scope_with_layer` がこの dict をそのままコピーするため `answer.scope.lens_source`／
     `lens_block`／`web_search`／`depth_profile`／`tools` へそのまま伝わる（会話保存の互換は §4.3＝
     旧回答は `"auto"`／`None`／`False`／`"standard"`／全 ON 扱い）。
     """
     explicit = scope.normalize_scope_paths(scope_paths)   # strip/空除去/重複排除
-    return {"world": world, "scope_paths": explicit, "source": "explicit" if explicit else "all",
-            "layer": layer_mod.normalize_layer(layer), "lens_source": lens_source,
-            "lens_block": lens_block, "web_search": bool(web_search),
-            "depth_profile": depth_profile_mod.normalize_depth_profile(depth_profile),
-            "tools": tools_pref_mod.normalize_tools_pref(tools)}
+    sm = {"world": world, "scope_paths": explicit, "source": "explicit" if explicit else "all",
+          "layer": layer_mod.normalize_layer(layer), "lens_source": lens_source,
+          "lens_block": lens_block, "web_search": bool(web_search),
+          "depth_profile": depth_profile_mod.normalize_depth_profile(depth_profile),
+          "tools": tools_pref_mod.normalize_tools_pref(tools)}
+    if tools_explicit is not None:
+        sm["tools_explicit"] = sorted({k for k in tools_explicit
+                                      if k in tools_pref_mod.TOOLS_PREF_KEYS})
+    return sm
 
 
 def _es_hits(world, query, sp, k=8, redact=False, layer=None):
@@ -881,15 +899,16 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     黙って無視せず明示する。
 
     調べる深さ（`depth_profile`・調べ方ブロック §3.2）: `run_impact`/`run_troubleshoot` の
-    `depth`・`run_qa` の `max_hits` へ「実効基準値」（管理画面の基準値編集＝`system_settings` →
-    env → コード既定、の解決結果）をそのまま渡す（`sherpa.depth_profile.scaled_*`・DEPTH-2 S7
-    以降、深さによる倍率・加算は撤去済み）。`system_settings`（省略可・既定 `None`）は呼び出し元
+    `depth`・`run_qa` の `max_hits` へ倍率をかけた値を渡す（`sherpa.depth_profile` の乗数表）。
+    倍率は「実効基準値」（管理画面の基準値編集＝`system_settings` → env → コード既定、の解決結果）
+    に掛ける。`system_settings`（省略可・既定 `None`）は呼び出し元
     （`handle_message`/`stream_message`）が既に読んだスナップショットをそのまま渡す契約——
     ここで `store.get_system_settings()` を呼ばない（`_dispatch` は DB 不要の単体テスト対象の
     ままにする・呼び出し元が DB 不達を fail-open で吸収する）。`None` は「基準値の管理画面上書き
     なし」として扱い、各モジュールの env 由来の既定値（`env_default`）をそのまま使う。
     `abs_max`: 各モジュールの env-parse hi 引数と同じ値を渡し、管理画面の基準値
-    編集（Field 上限まで）でも実効基準値が既存の絶対上限を超えないよう最終的に一度だけ縛る。
+    編集（Field 上限まで）＋調べる深さ「最大」の組み合わせでも、倍率適用後の値が既存の絶対上限を
+    超えないよう最終的に一度だけ縛る。
 
     検索経路トグル（`scope_meta["tools"]`・調べ方ブロック §3.6）: `agentic_search.
     dispatch_tools_for_lens` で実効ツール集合と実行可否を判定する。必須ツールが全て OFF/実接続
@@ -911,31 +930,77 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     sys_settings = system_settings
     eff, blocked = agentic_search.dispatch_tools_for_lens(
         lens, (scope_meta or {}).get("tools"), availability=tools_availability)
-    if blocked:
-        env = agentic_search.tools_blocked_env(lens)
-    elif lens == "impact":
-        base_depth = depth_profile_mod.effective_base(sys_settings, "impact_depth", IMPACT_MAX_DEPTH)
-        depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=IMPACT_MAX_DEPTH_ABS_MAX)
-        result = run_impact(session, payload, world, scope_prefixes=sp, depth=depth)  # 範囲は Cypher で絞る
-        env = _answer_impact(result, world)
-    elif lens == "troubleshoot":
-        base_depth = depth_profile_mod.effective_base(
-            sys_settings, "troubleshoot_depth", TROUBLESHOOT_GRAPH_DEPTH)
-        depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX)
-        res = run_troubleshoot(session, payload, world, depth=depth, scope_paths=sp)
-        res = _merge_troubleshoot_with_es(res, world, payload, sp) if eff["fulltext"] else res
-        env = _answer_troubleshoot(res, world)
-    else:                                              # qa: grep＋ES を統合（Codex/heuristic/非agentic も ES 参照）
+
+    def _qa_fallback_env():
+        """grep（無ければ ES）だけで下地を組む qa 相当の縮退——グラフ不調で impact/troubleshoot の
+        事前検索が実行できないときも、Codex 本体・清書がソースを直接調べる下地を渡す。"""
         base_hits = depth_profile_mod.effective_base(sys_settings, "qa_max_hits", QA_MAX_HITS_DEFAULT)
         max_hits = depth_profile_mod.scaled_ratio(base_hits, profile, abs_max=agentic_search.MAX_HITS_ABS_MAX)
         if eff["grep"]:
             qa_result = run_qa(payload, world, scope_paths=sp, layer=layer, max_hits=max_hits)
             if eff["fulltext"]:
                 qa_result = _merge_qa_with_es(qa_result, world, payload, sp, layer=layer)
-        else:                                          # grep OFF/不達（blocked でない＝fulltext は確定 True）
+        elif eff["fulltext"]:
             es_cites = _es_citations(world, payload, sp, layer=layer)
             qa_result = {"type": "qa", "question": payload, "answered": bool(es_cites), "citations": es_cites}
-        env = _answer_qa(qa_result, world)
+        else:                                          # 資料を探す手段が1つも無い（グラフ縮退時のみ起こりうる）
+            qa_result = {"type": "qa", "question": payload, "answered": False, "citations": []}
+        return _answer_qa(qa_result, world)
+
+    if blocked and lens in agentic_search._DISPATCH_REQUIRES_GRAPH and (eff["grep"] or eff["fulltext"]):
+        # グラフ必須レンズでグラフだけが不達／OFF——明示エラーで終わらせず grep 相当の下地へ縮退する
+        # （`providers/base._agentic_run` の入口ゲートと同じ規律・§0(c)）。Codex 経路は本関数の
+        # 戻り値を下地に自分で調査を続けるため、縮退の印がないと告知だけが消える。
+        env = _qa_fallback_env()
+        # 不達（未構築・接続断）由来なら統計にも残す（`graph_unavailable`＝計数あり）。利用者が
+        # 自分で OFF にした場合は障害ではないので通知だけ（`blocked`＝計数なし）。
+        env["graph_degraded"] = (
+            "graph_unavailable"
+            if ((tools_availability or {}).get("graph") is False
+                and tools_pref_mod.normalize_tools_pref((scope_meta or {}).get("tools"))["graph"])
+            else "blocked")
+    elif blocked:
+        env = agentic_search.tools_blocked_env(lens)
+    elif lens in ("impact", "troubleshoot"):
+        # グラフ不調（世代不一致・接続断）は事前検索を落とさない——例外をここで飲み込み、
+        # grep 相当の下地＋縮退の印で調査を続けさせる（§0(c)・グラフ不調は回答不能の理由にしない）。
+        # 縮退してよいのは**回復可能な障害**だけ（`lens_service.neighbor_cards`・
+        # `agentic_search._is_recoverable_tool_exception` と同じ分類）——接続系（`DriverError`）と
+        # 一時的（`TransientError`）のみで、`ConfigurationError`（設定不備）や `ClientError`
+        # （Cypher のバグ等）は回復不可＝握り潰さずそのまま送出し、従来の honest failure へ委ねる。
+        from neo4j.exceptions import ConfigurationError, DriverError, TransientError
+        try:
+            if lens == "impact":
+                base_depth = depth_profile_mod.effective_base(sys_settings, "impact_depth", IMPACT_MAX_DEPTH)
+                depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=IMPACT_MAX_DEPTH_ABS_MAX)
+                result = run_impact(session, payload, world, scope_prefixes=sp, depth=depth)  # 範囲は Cypher で絞る
+                env = _answer_impact(result, world)
+            else:
+                base_depth = depth_profile_mod.effective_base(
+                    sys_settings, "troubleshoot_depth", TROUBLESHOOT_GRAPH_DEPTH)
+                depth = depth_profile_mod.scaled_depth(base_depth, profile, abs_max=TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX)
+                res = run_troubleshoot(session, payload, world, depth=depth, scope_paths=sp)
+                res = _merge_troubleshoot_with_es(res, world, payload, sp) if eff["fulltext"] else res
+                env = _answer_troubleshoot(res, world)
+        except (GraphSchemaEraError, DriverError, TransientError) as e:
+            if isinstance(e, ConfigurationError):
+                raise                        # 非一時的な設定不備＝縮退しない（`DriverError` の派生だが別枠）
+            _degraded = (agentic_search.GRAPH_REINGEST_ERROR_CODE if isinstance(e, GraphSchemaEraError)
+                         else "graph_unavailable")
+            _log.warning("事前検索がグラフ不調で縮退（lens=%s・world=%s・%s）: %s",
+                        lens, world, _degraded, type(e).__name__)
+            if not (eff["grep"] or eff["fulltext"]):
+                # 資料を探す手段が1つも残っていない＝一度も検索できていない。0 件の検索結果
+                # （`_qa_fallback_env` の answered=False）として完了扱いにせず、入口ゲートと同じ
+                # 明示エラーで終える（`graph_degraded` も付けない＝縮退したのではなく実行不能）。
+                env = agentic_search.tools_blocked_env(lens)
+            else:
+                env = _qa_fallback_env()
+                # 縮退の事実（閉じたコード・本文なし）。呼び出し元（`providers/base.py::_gather`
+                # 経由の各 provider）が通知文言・統計へ反映する。
+                env["graph_degraded"] = _degraded
+    else:                                              # qa: grep＋ES を統合（Codex/heuristic/非agentic も ES 参照）
+        env = _qa_fallback_env()
     # 参照中の範囲（D/監査）＋このレンズで層フィルタが実効したか（UI が非適用の注記を出すための1項目）。
     env["scope"] = layer_mod.scope_with_layer(scope_meta, world=world, lens=lens)
     return env
@@ -1044,6 +1109,32 @@ def _is_codex_stopped_early(env: dict) -> bool:
     return bool(env.get("codex_stopped_early"))
 
 
+# グラフ縮退（`_dispatch` の事前検索・Codex 本体の世代不一致検知）の閉じたコード →
+# `answer.limits` の bool 項目（利用統計「打ち切りの内訳」）。
+_GRAPH_DEGRADED_LIMIT_FIELD = {
+    agentic_search.GRAPH_REINGEST_ERROR_CODE: "graph_reingest_required",
+    "graph_unavailable": "backend_unavailable_graph",
+}
+
+
+def _apply_graph_degraded(env: dict) -> None:
+    """`env["graph_degraded"]`（閉じたコード・本文なし）を利用者向けの冒頭告知と統計フラグへ変換する。
+
+    グラフを使わずに grep／原本直読で調べ切ったターン——固定文言で終端していないので、回答本体は
+    そのまま残し、冒頭に「なぜグラフを使っていないか」の1文だけを足す。反復ツール検索
+    （`providers/base.py::_agentic_run`）は配信時に自分で前置するためこのキーを載せない。
+    """
+    code = env.pop("graph_degraded", None)
+    notice = agentic_search.graph_degraded_notice(code)
+    if not notice:
+        return
+    head = (env.get("headline") or "").strip()
+    env["headline"] = f"{notice}\n\n{head}" if head else notice
+    field = _GRAPH_DEGRADED_LIMIT_FIELD.get(code)
+    if field:
+        env["limits"] = {**(env.get("limits") or {}), field: True}
+
+
 def _finalize(env, decision):
     # DEPTH-2 S1（§2.5）: `env["data"]["claims"]`（主張の区分/理由コード）はここでは一切触らない
     # ——`data` はブランケットでそのまま永続化され、共有時の再構築は `shares.py::_safe_claim` が
@@ -1073,6 +1164,8 @@ def _finalize(env, decision):
             # impact/troubleshoot は層の概念が無く既存の headline が十分具体的なため対象外にする
             # （`_answer_impact`/`_answer_troubleshoot` は変更しない）。
             env["headline"] = _NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+    # 縮退の告知は 0 件案内（headline の**全置換**）より後で前置する——先に付けると置換で消える。
+    _apply_graph_degraded(env)
     if _codex_stopped_early:
         # 出典0件時の案内と同じボタン機構（retry_hints・data-retry-kind）に載せる——0件案内の hints とは
         # 独立に常に追加する（0件でも中身があっても「続きから調べ直せる」こと自体は変わらない）。
@@ -1138,6 +1231,10 @@ def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None, pr
     飛んだら、固定文言の `_result` イベントへ差し替えて終端する（handle_message/stream_message の
     共通ラッパー）。
 
+    `GraphSchemaEraError` については**調査結果が届いた後の保険**——通常は世代不一致を検知した時点で
+    調査を止めない（`_dispatch` は grep 相当の下地へ縮退し、`agentic_search.run_tool` の
+    `graph_neighbors` 分岐と Codex の MCP 経路は機械可読コードのツール結果へ変換して調査を続ける）。
+    ここへ到達するのは、それらの変換を通らずに例外が生成器の境界まで上がった場合だけ。
     例外は `providers/base.py::_gather` 内の `ctx.dispatch(...)`（＝ここでの `_dispatch` の impact/
     troubleshoot 分岐、または agentic ツール `graph_neighbors` の実行）から上がる。
     `_GenProvider.run`/`HeuristicProvider.run` いずれも `_gather` の呼び出しをラップしていない
@@ -1416,7 +1513,7 @@ def _save_clarify_message(conversation_id, user_id, settings, message, trace_nod
 def handle_message(session, message, world="v1",
                    conversation_id=None, user_id="admin", scope_paths=None, layer=None, lens=None,
                    knowledge=False, personal=False, users_dir="data/users", web_search=False,
-                   depth_profile=None, tools=None, tools_availability=None,
+                   depth_profile=None, tools=None, tools_explicit=None, tools_availability=None,
                    provider=None, settings=None, sys_settings=None, stop_event=None) -> dict:
     """1ターン処理（非ストリーミング）: 会話を用意→保存→振り分け→実行→答えを保存して返す。
 
@@ -1434,9 +1531,8 @@ def handle_message(session, message, world="v1",
     （`ChatReq.web_search`）。保存済みの個人設定 `codex_web_search` 列は実行には使わず、この
     引数だけを見る（`settings["codex_web_search"]` をこの値で上書きしてから provider を選ぶ）。
     `depth_profile`（省略可・既定 `None`＝`"standard"`・knowledge時のみ・§3.2）: 調べる深さ
-    （調べ方ブロック）。値自体は保存・usage 記録に使う——`_dispatch()`/agentic 探索の反復・
-    ヒット上限・探索深さ・Codex 推論の実効基準値は深さに依らず一定（DEPTH-2 S7 で倍率・加算を
-    撤去済み）。
+    （調べ方ブロック）。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に
+    倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for` が別に決める）。
     `tools`（省略可・既定 `None`＝全 ON・knowledge時のみ・§3.6）: 検索経路トグル
     （`ChatReq.tools`）。エージェント探索（LLM の tool-use）が提示する grep/es_search/graph_neighbors
     を絞る。Codex 頭脳は自前でシェルを実行するため対象外（`sherpa/providers/codex/provider.py` は
@@ -1475,7 +1571,7 @@ def handle_message(session, message, world="v1",
         store.set_contains_personal_workspace(conversation_id)
     known = _known_terms(session, world) if knowledge else []   # オフ時は Neo4j も触らない
     scope_meta = (_resolve_scope(message, world, scope_paths, layer, lens_source, lens_block, web_search,
-                                 depth_profile, tools)
+                                 depth_profile, tools, tools_explicit)
                  if knowledge else None)  # 明示＞推定＞全体（D）
     # settings/sys_settings は呼び出し元（routers/chat.py）が受付段階で既に読んだ
     # スナップショットをそのまま使う（省略時のみここで読む・単体テスト等の後方互換）。
@@ -1578,6 +1674,7 @@ def handle_message(session, message, world="v1",
     _pop_evidence_committed(env, trace_nodes)   # _result のサイドカーを trace へ折り込む（孤児イベント防止）
     env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない
     env.pop("_claims_digest", None)      # DEPTH-2 S1: 主張構造の清書専用ビュー——公開 answer には残さない（data.claims は残す）
+    env.pop("_evidence_note", None)      # 根拠種別の不足注記（清書専用）——告知は headline 側に載る
     # DEPTH-2 S5: 終端 4 種の印と巡の個人由来累積（どちらも内部キー＝保存・共有へは残さない）。
     _terminal = env.pop("_terminal", None)
     _round_personal = _pop_round_personal(env)
@@ -1649,7 +1746,8 @@ def stream_message(session, message, world="v1",
                    conversation_id=None, user_id="admin", scope_paths=None, layer=None, lens=None,
                    knowledge=False, personal=False, users_dir="data/users", stop_event=None,
                    on_user_saved=None, web_search=False, depth_profile=None, tools=None,
-                   tools_availability=None, provider=None, settings=None, sys_settings=None):
+                   tools_explicit=None, tools_availability=None, provider=None, settings=None,
+                   sys_settings=None):
     """思考イベントを逐次 yield（SSE）。**頭脳は provider（差し替え可能）**、UI/プロトコルは不変。
 
     provider（heuristic/codex/openai/ollama）が `node`（動的に何個でも）を流し、最後に内部 `_result`。
@@ -1713,7 +1811,7 @@ def stream_message(session, message, world="v1",
     yield {"type": "trace_meta", "trace_version": 2}
     known = _known_terms(session, world) if knowledge else []   # オフ時は Neo4j も触らない
     scope_meta = (_resolve_scope(message, world, scope_paths, layer, lens_source, lens_block, web_search,
-                                 depth_profile, tools)
+                                 depth_profile, tools, tools_explicit)
                  if knowledge else None)  # 明示＞推定＞全体（D）
     # settings/sys_settings は呼び出し元（routers/chat.py）が受付段階で既に読んだ
     # スナップショットをそのまま使う（省略時のみここで読む・単体テスト等の後方互換）。
@@ -1793,6 +1891,7 @@ def stream_message(session, message, world="v1",
             _ev_committed_node = _pop_evidence_committed(env, trace_nodes)
             env.pop("_synthesis_digest", None)   # 清書専用の合成入力（_answer_prompt 用）——公開 answer には残さない
             env.pop("_claims_digest", None)      # DEPTH-2 S1: 主張構造の清書専用ビュー——公開 answer には残さない（data.claims は残す）
+            env.pop("_evidence_note", None)      # 根拠種別の不足注記（清書専用）——告知は headline 側に載る
             # DEPTH-2 S5: 終端 4 種の印と巡の個人由来累積（どちらも内部キー＝保存・共有へは残さない）。
             _terminal = env.pop("_terminal", None)
             _round_personal = _pop_round_personal(env)

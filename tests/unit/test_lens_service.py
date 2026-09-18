@@ -316,6 +316,62 @@ def test_neighbor_cards_agentic_path_preserves_cid(monkeypatch):
     assert cards and cards[0]["cid"] == "module:w1:a/b#TAXCALC"
 
 
+def test_neighbor_cards_recoverable_failure_returns_error_coded_empty_list(monkeypatch):
+    """`neighbor_cards` が接続系の例外（`DriverError`）を捕捉した場合、戻り値は空リストのままだが
+    `error_code`（"graph_unavailable"＝回復可能）を属性として持つ——`agentic_search.run_tool` の
+    `graph_neighbors` 分岐がこれを拾って `InvestigationState.backend_failures["graph"]` へ反映する
+    （戻り値の `list` 型自体は変えない・既存の全呼び出し元の fake が `list` を返すだけで良い契約を壊さない）。"""
+    import neo4j as neo4j_mod
+    from neo4j.exceptions import ServiceUnavailable
+
+    from sherpa.ingest import world_neo4j
+
+    class _Driver:
+        def session(self):
+            raise ServiceUnavailable("boom")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(neo4j_mod.GraphDatabase, "driver", lambda uri, auth: _Driver())
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+
+    cards = ls.neighbor_cards("w1", "TAXCALC の ABEND")
+    assert cards == []
+    assert getattr(cards, "error_code", None) == "graph_unavailable"
+
+
+def test_neighbor_cards_non_recoverable_failure_returns_error_coded_empty_list(monkeypatch):
+    """プログラムの欠陥を示す例外（`TypeError`）は回復不可＝`"graph_internal_error"`。"""
+    import neo4j as neo4j_mod
+
+    from sherpa.ingest import world_neo4j
+
+    monkeypatch.setattr(ls, "_troubleshoot_cards",
+                        lambda session, term, world, scope_paths=None: (_ for _ in ()).throw(TypeError("bug")))
+
+    class _Sess:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *a):
+            return False
+
+    class _Driver:
+        def session(self):
+            return _Sess()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(neo4j_mod.GraphDatabase, "driver", lambda uri, auth: _Driver())
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+
+    cards = ls.neighbor_cards("w1", "TAXCALC の ABEND")
+    assert cards == []
+    assert getattr(cards, "error_code", None) == "graph_internal_error"
+
+
 # ---- env 検証（_env_int・agentic_search と同一セマンティクス） --------------
 
 def test_env_int_falls_back_on_invalid_values(monkeypatch):

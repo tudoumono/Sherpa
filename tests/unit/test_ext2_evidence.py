@@ -1065,7 +1065,7 @@ def test_empty_list_docs_alone_passes_evidence_gate_as_aggregate_evidence_main_p
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         env = next(e["env"] for e in events if e.get("type") == "_result")
-        assert env["headline"] == "0件でした。"
+        assert env["headline"].endswith("0件でした。")   # 冒頭に根拠不足の告知が付く（本文は不変）
         assert env["data"]["evidence_packet"]["investigation_status"] == "sufficient"
     finally:
         _restore_post(orig)
@@ -1098,7 +1098,7 @@ def test_empty_list_docs_alone_passes_evidence_gate_as_aggregate_evidence_sub_pa
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         env = next(e["env"] for e in events if e.get("type") == "_result")
-        assert env["headline"] == "0件でした。"
+        assert env["headline"].endswith("0件でした。")   # 冒頭に根拠不足の告知が付く（本文は不変）
         assert env["data"]["evidence_packet"]["investigation_status"] == "sufficient"
     finally:
         _restore_post(orig)

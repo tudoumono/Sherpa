@@ -88,7 +88,7 @@ class OllamaProvider(_GenProvider):
         sys = (self.system_prompt + "\n\n" if self.system_prompt else "") + \
             agentic_search.system_prompt(_eff_tools)
         # 調べる深さ（調べ方ブロック §3.2・SC-6c）: OpenAIProvider._agentic_loop と同じ計算
-        # （実効基準値＝system_settings→env→コード既定・深さに依らず一定）。
+        # （実効基準値＝system_settings→env→コード既定に倍率・既定 "standard" は倍率×1＝挙動不変）。
         profile = (ctx.scope_meta or {}).get("depth_profile")
         max_turns = depth_profile_mod.effective_max_turns(self._system_settings, agentic_search.MAX_TURNS, profile)
         # 利用統計（answer.usage）へ「実際にループへ渡した上限」を残す（再計算せず同じ値を記録する）。

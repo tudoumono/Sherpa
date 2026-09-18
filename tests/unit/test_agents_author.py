@@ -242,9 +242,9 @@ def test_codex_run_wires_depth_profile_into_reasoning_branch():
 
 
 def test_codex_reasoning_depth_profile_passthrough_standard_deep_max(monkeypatch):
-    """DEPTH-2 S7: 標準/深く/最大いずれでも、CodexProvider の実際の分岐と同じ式（`_base_reason`
-    の解決 → `codex_reasoning_for`）は基準値をそのまま返す（推論レベルの per-turn 上書きは
-    撤去・受け入れ条件(2)）（純関数の組み合わせ・実 codex CLI 起動は対象外）。"""
+    """CodexProvider の実際の分岐と同じ式（`_base_reason` の解決 → `codex_reasoning_for`）で、
+    深く=high／最大=xhigh の per-turn 上書きが載る（純関数の組み合わせ・実 codex CLI 起動は
+    対象外）。基準値が上書きより高い構成では下げない。"""
     from sherpa import depth_profile as D
 
     def _compute(is_author, self_reason, system_settings, profile):
@@ -254,17 +254,19 @@ def test_codex_reasoning_depth_profile_passthrough_standard_deep_max(monkeypatch
         return "low" if str(reason_raw).lower() == "minimal" else reason_raw
 
     monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
-    # 通常レンズ: 標準/深く/最大いずれも self._reason のまま（上書きは撤去）。
+    # 通常レンズ: 標準は self._reason のまま・深く=high・最大=xhigh。
     assert _compute(False, "low", None, "standard") == "low"
-    assert _compute(False, "low", None, "deep") == "low"
-    assert _compute(False, "low", None, "max") == "low"
-    # 管理画面の基準値編集（system_settings）は標準時と同じく深さに関わらず効く。
+    assert _compute(False, "low", None, "deep") == "high"
+    assert _compute(False, "low", None, "max") == "xhigh"
+    # 管理画面の基準値編集（system_settings）が標準時の基準値になり、深さの上書きはその上に載る。
     assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, "standard") == "medium"
-    assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, "deep") == "medium"
-    # author は基準値が別軸（env）で、深さの上書き自体が撤去されているため常に基準値のまま。
+    assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, "deep") == "high"
+    # 基準値が既に上書きより高い構成では下げない（S2 の注記）。
+    assert _compute(False, "low", {"depth_base_codex_reasoning": "xhigh"}, "deep") == "xhigh"
+    # author は基準値が別軸（env）だが、深さの上書きは同じ規律で載る。
     assert _compute(True, "low", None, "standard") == "medium"   # author 既定
-    assert _compute(True, "low", None, "deep") == "medium"
-    assert _compute(True, "low", None, "max") == "medium"
+    assert _compute(True, "low", None, "deep") == "high"
+    assert _compute(True, "low", None, "max") == "xhigh"
 
 
 # ===== P1-c: author 専用プロンプト（FS 版・MCP 版） =====

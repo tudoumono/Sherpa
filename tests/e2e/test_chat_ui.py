@@ -3019,3 +3019,116 @@ def test_mdlite_indented_table_and_quote_after_list_item_are_blocks(page, web_ba
 def test_mdlite_fence_in_second_level_list_is_recognized(page, web_base_url):
     html = _md(page, web_base_url, "1. 親\n   1. 子\n      ```\n      SELECT 1\n      ```")
     assert html == '<ol><li>親<ol><li>子<pre class="md-code"><code>SELECT 1</code></pre></li></ol></li></ol>'
+
+
+def test_inquiry_restore_only_touched_axis_is_explicit(page, web_base_url):
+    """S4（裁定⑦）: 会話メタに保存した明示状態（`scope.tools_explicit`）だけを明示扱いにする——
+    触っていない軸（ここでは graph・既定のまま ON）は復元後も未操作のままなので、その軸が不達でも
+    送信 body に含まれず 422 にならない。是正前は1軸でも非既定なら3軸すべてを明示扱いにしていたため、
+    無操作の追質問だけで「不達なのに明示 ON」となり 422 になっていた。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
+    page.goto(f"{web_base_url}/chat.html?conv=118")
+    expect(page.locator("#messages")).to_contain_text("消費税率")
+
+    page.locator("#input").fill("影響範囲を教えて")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+    expect(page.locator("#messages")).not_to_contain_text("現在利用できません")
+
+    body = records["turn_starts"][-1]
+    assert "graph" not in body["tools"], "触っていない graph は明示扱いにしない（不達なら省略）"
+    assert body["tools"].get("grep") is False        # 実際に切り替えた軸は復元して送る
+    assert body["tools_explicit"] == ["grep"]        # 明示状態そのものも次ターンへ引き継ぐ
+
+
+def test_confirm_first_resend_does_not_persist_override_as_explicit(page, web_base_url):
+    """S4（裁定⑦）: 確認カードの再送（override）は payload の検索経路トグルを1回限りそのまま送る
+    （全軸を明示扱いにして省略しない）——しかし会話メタへ保存する明示状態（`tools_explicit`）には
+    載せない。載せると以後その会話は触っていない軸まで明示扱いになり、その軸が不達のとき 422 になる。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    calls = {"n": 0}
+
+    def handle_turn_stream(route):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            events = [
+                {"type": "question", "conversation_id": 101, "interaction_id": "confirm-tools2",
+                 "mode": "single",
+                 "prompt": "確認してから進めるよう指定されています。何を確認してから進めますか？",
+                 "options": [{"id": "scope", "label": "対象範囲（どの資料/システムか）",
+                             "description": "どのフォルダ・資料・システムを対象にするか"}],
+                 "allow_free_text": True, "original_message": "原因を確認してから進めて。",
+                 "lens": "qa", "layer": None, "scope_paths": [],
+                 "lens_source": "explicit", "lens_block": None,
+                 "tools": {"grep": True, "fulltext": True, "graph": True}},
+            ]
+        else:
+            events = [{"type": "answer", "conversation_id": 101, "message": {"answer": IMPACT_ANSWER}}]
+        body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events)
+        route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=body)
+
+    records = install_api_mocks(page)
+    page.route("**/chat/turns/*/stream?**", handle_turn_stream)
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#kbtoggle").click()
+
+    page.locator("#input").fill("原因を確認してから進めて。")
+    page.locator("#send").click()
+    expect(page.locator(".askcard")).to_be_visible()
+
+    page.locator("[data-qopt]").first.check()
+    page.locator("[data-ask-submit]").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    resend = records["turn_starts"][1]
+    assert resend.get("tools") == {"grep": True, "fulltext": True, "graph": True}   # 送信は1回限り全軸明示
+    assert "tools_explicit" not in resend, "チップを触っていないのに明示状態として保存してはいけない"
+
+
+_TROUBLE_DEGRADED_ANSWER = {
+    "lens": "troubleshoot",
+    "headline": "関係のつながりをたどる検索が使えないため、資料とソースを直接調べて回答します。\n\n夜間バッチの停止は TAXCALC の異常終了が原因の可能性があります。",
+    "route": {"path": ["文書を検索"]}, "summary": {"total": 1},
+    "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both"},
+    # グラフ不調の縮退は qa 相当の下地（citations・candidates 無し）で返る。
+    "data": {"type": "qa", "citations": [
+        {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [10, 12], "quote": "ABEND-CODE 0C7"}]},
+    "sources": [],
+}
+
+
+def test_troubleshoot_without_candidates_falls_back_to_citation_view(page, web_base_url):
+    """S4: グラフ縮退の troubleshoot は原因候補（candidates）を持たない qa 形の下地で返る——
+    原因候補の表示を選ぶと該当箇所が消えるため、impact と同じく引用表示へ落とす。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": _TROUBLE_DEGRADED_ANSWER}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#kbtoggle").click()
+    page.locator("#input").fill("夜間バッチが止まる")
+    page.locator("#send").click()
+    expect(page.locator("#messages")).to_contain_text("資料とソースを直接調べて回答します")
+    expect(page.locator("#messages")).to_contain_text("該当箇所 (1)")   # 引用表示へ落ちている
+
+
+def test_export_includes_citations_when_troubleshoot_degraded_to_qa_shape(page, web_base_url, tmp_path):
+    """S4: グラフ縮退の troubleshoot（原因候補が無く qa 相当の下地）でも、書き出し・コピーに
+    該当箇所（citations）が入る——画面（render.js）と同じ条件で並べる。"""
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html?conv=119")
+    page.wait_for_selector("#messages .cites")
+
+    page.locator("#exportbtn").click()
+    with page.expect_download() as dl_info:
+        page.locator("#exportmenu [data-exp='txt']").click()
+    txt_path = tmp_path / "export_degraded.txt"
+    dl_info.value.save_as(txt_path)
+    txt = txt_path.read_text(encoding="utf-8")
+    assert "4期/03_開発/01_ソース/TAXCALC.cbl（行10-12）: ABEND-CODE 0C7" in txt

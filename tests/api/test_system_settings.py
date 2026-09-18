@@ -2287,6 +2287,43 @@ def test_admin_settings_max_review_rounds_rejects_invalid_values(bad):
     assert "max_review_rounds" not in store.get_system_settings()
 
 
+def test_admin_settings_codex_worker_model_roundtrip():
+    """multi_agent（S6）の worker モデル（実装ベース探索の回復 S1）。未設定/空文字は None
+    （フォールバックへ戻る）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9-custom"})
+    assert response.status_code == 200, response.text
+    worker = response.json()["codex_worker_model"]
+    assert worker["configured"] == "gpt-5.9-custom" and worker["effective"] == "gpt-5.9-custom"
+    assert store.get_system_settings()["codex_worker_model"] == "gpt-5.9-custom"
+
+    response = admin.put("/admin/settings", json={"codex_worker_model": "  "})
+    assert response.status_code == 200, response.text
+    worker2 = response.json()["codex_worker_model"]
+    assert worker2["configured"] is None and worker2["effective"] == worker2["default"]
+
+    response = admin.put("/admin/settings", json={"codex_worker_model": None})
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_worker_model"]["configured"] is None
+
+
+def test_admin_settings_codex_worker_model_rejects_control_characters():
+    """CR/LF・DEL 等の制御文字混入は 422（`_write_codex_agent_role_configs` が生成する TOML の
+    1行文字列を壊すため）。保存もされない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9\rinjected"})
+    assert response.status_code == 422, response.text
+    assert "codex_worker_model" not in store.get_system_settings()
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9\ninjected"})
+    assert response.status_code == 422, response.text
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9\x7f"})
+    assert response.status_code == 422, response.text
+
+
 @pytest.mark.parametrize("field,bad", [
     ("depth_base_max_turns", 0), ("depth_base_max_turns", 500),
     ("depth_base_grep_max_hits", 0), ("depth_base_read_window", 5),

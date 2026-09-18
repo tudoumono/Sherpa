@@ -220,7 +220,13 @@ def _stopped_turns_sql() -> str:
 # `_usage_tok` と同じ「非数値/欠落は無視」防御（bool は 'true'/'false' 文字列のみ真偽扱い）。
 _USAGE_LIMIT_INT_FIELDS = ("tool_result_clipped", "context_compactions", "search_truncated",
                            "auto_continues")
-_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated")
+# 縮退（バックエンド不調）の計数（`investigation_state._BACKEND_LIMIT_FIELD`／
+# `GRAPH_REINGEST_LIMIT_FIELD` と同じ語彙）。意味論は「このターンで初めて検出されたか」＝
+# 初回検出の計数で、障害が起きた巡の数ではない（`providers/base.py::_limits_delta` が
+# 偽→真になった巡だけ載せるため、同じ障害が続いても2巡目以降は計上されない）。
+_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated", "depth_escalated",
+                            "backend_unavailable_fulltext", "backend_unavailable_graph",
+                            "graph_reingest_required")
 
 
 def _usage_limit_int(field: str) -> str:

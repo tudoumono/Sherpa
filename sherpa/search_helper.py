@@ -30,8 +30,17 @@ CHOICES = frozenset({NONE, OLLAMA, OPENAI})
 # 検索アシスタントに許すツール（回答は書かせない＝資料を探して読むだけ）。agentic_search の実ツール名
 # （既知集合・固定）から `ask_user` を除く: サブ経路のモデル生成文をそのまま公式の確認カードとして
 # 出さない。doc_outline/read_doc（土台系・新設）も list_docs/read_around と同じく含める。
+# **外部 worker（Ollama/OpenAI の安いモデル・`resolve()`）専用**——原本の巨大ファイルを読み切れず
+# 時間・コストが増える懸念があるため、フルセット化は self_worker（頭脳自身）に限る（下記）。
 TOOLS = frozenset({"list_docs", "ripgrep_search", "glob_search", "doc_outline", "read_doc",
                    "read_around", "es_search", "graph_neighbors"})
+
+# self_worker（頭脳自身が worker）専用のフルセット——`agentic_search.openai_tools(with_write=False)`
+# が持つ土台系ツールのうち `TOOLS` に無いもの（原本読取・比較・構造把握）を足す。`write_output_file`
+# は含めない（成果物登録は orchestrator＝清書側の契約・`self_worker()` docstring 参照）。
+_SELF_WORKER_EXTRA_TOOLS = frozenset({"folder_tree", "compare_documents", "xlsx_sheets", "xlsx_range",
+                                      "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head"})
+SELF_WORKER_TOOLS = TOOLS | _SELF_WORKER_EXTRA_TOOLS
 
 # モデル名の形式（`sherpa/routers/system.py::_MODEL_NAME_RE` と同型）。
 _MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\-]{0,127}")
@@ -132,12 +141,14 @@ def self_worker(provider: str, model: str, *, key: str | None = None,
     常に「worker ＋ orchestrator/evaluator」のハイブリッド1経路）。接続先・鍵・モデルは頭脳と
     同じで、違いは「安いモデルを使わない」ことだけ。
 
-    許すツールは `TOOLS`（回答は書かせない）に `ask_user` を足したもの——`TOOLS` が
-    `ask_user` を外すのは「安いモデル／別モデルの生成文を公式の確認カードとして出さない」ため
-    であり、頭脳自身が worker のときはその理由が当たらない（通常経路と同じ AI が質問する）。
+    許すツールは `SELF_WORKER_TOOLS`（`TOOLS` に原本読取・比較・構造把握を足したフルセット・回答は
+    書かせない）に `ask_user` を足したもの——`TOOLS` が `ask_user` を外すのは「安いモデル／別モデルの
+    生成文を公式の確認カードとして出さない」ためであり、頭脳自身が worker のときはその理由が当たらない
+    （通常経路と同じ AI が質問する）。頭脳と同じモデル・同じコストのため、外部 worker と異なりフル
+    ツールを与えても懸念が当たらない（`SELF_WORKER_TOOLS` のコメント参照）。
     出力ファイルのツールは worker には配線しない（成果物の登録は orchestrator ＝清書側の契約）。
     """
-    return {"tools": TOOLS | {"ask_user"}, "guard": _resolve_guard(), "profile_id": SELF_PROFILE_ID,
+    return {"tools": SELF_WORKER_TOOLS | {"ask_user"}, "guard": _resolve_guard(), "profile_id": SELF_PROFILE_ID,
             "description": "資料の検索・精読だけを担当する（回答はこの後の清書で作る）",
             "name": "メインのAI（下調べ）", "provider": provider, "model": model,
             "key": key, "url": url}

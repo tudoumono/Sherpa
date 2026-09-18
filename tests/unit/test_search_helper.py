@@ -113,6 +113,47 @@ def test_never_gets_ask_user_tool():
     assert {"ripgrep_search", "read_around", "list_docs"} <= set(sub["tools"])
 
 
+# ===== S3(a): self_worker のフルツール化・外部 worker（resolve）は据え置き =====
+
+# `agentic_search.openai_tools(with_write=False)` が持つ土台系ツールのうち `SH.TOOLS`（外部 worker
+# の8本）に無いもの（原本読取・比較・構造把握）。S3 提案書の明示列挙と同じ集合。
+_S3_FULL_SET_EXTRA_TOOLS = frozenset({
+    "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head",
+    "compare_documents", "folder_tree"})
+
+
+def test_self_worker_tools_are_full_set_and_never_include_write_output_file():
+    """self_worker（頭脳自身が worker）は `SH.TOOLS`（8本）に原本読取・比較・構造把握を足した
+    フルセットを持つ——`agentic_search.openai_tools(with_write=False)` が返す土台系ツール名の
+    集合（`ask_user`/`write_output_file` を除く）と一致する。`write_output_file` は成果物登録が
+    orchestrator＝清書側の契約のため、self_worker のフルツール化でも絶対に含めない。"""
+    sub = SH.self_worker("openai", "gpt-5.5", key="sk-dummy")
+    tools = set(sub["tools"])
+    assert "write_output_file" not in tools
+    assert "ask_user" in tools   # self_worker だけの例外（通常経路と同じ AI が質問する）
+    assert SH.TOOLS <= tools
+    assert _S3_FULL_SET_EXTRA_TOOLS <= tools
+    # `openai_tools(with_write=False)` の土台系ツール名（ask_user を除く）と過不足なく一致する。
+    from sherpa import agentic_search as A
+    full_defs = A.openai_tools(with_es=True, with_graph=True, can_ask=False, with_write=False)
+    full_names = {t["function"]["name"] for t in full_defs}
+    assert (tools - {"ask_user"}) == full_names
+
+
+def test_external_search_helper_tools_stay_at_eight_after_self_worker_full_toolset(monkeypatch):
+    """外部 worker（Ollama/OpenAI の安いモデル・`resolve()`）は S3(a) の対象外——self_worker の
+    フルツール化後も従来の8本（`SH.TOOLS`）のまま拡張されない（原本の巨大ファイルを読み切れず
+    時間・コストが増える懸念があるための区別・提案書 S3(a) 参照）。"""
+    ollama_sub = SH.resolve({"search_helper": "ollama"})
+    assert set(ollama_sub["tools"]) == set(SH.TOOLS)
+    assert not (_S3_FULL_SET_EXTRA_TOOLS & set(ollama_sub["tools"]))
+
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
+    openai_sub = SH.resolve({"search_helper": "openai", "openai_api_key": "sk-x"})
+    assert set(openai_sub["tools"]) == set(SH.TOOLS)
+    assert not (_S3_FULL_SET_EXTRA_TOOLS & set(openai_sub["tools"]))
+
+
 # `providers/base.py::_sub_loop`（base.py:757-）が実際に参照するキー（`sub["provider"]`・
 # `sub["tools"]`・`sub["url"]`（ollama）／`sub["key"]`（openai）・`sub["model"]`・
 # `sub["guard"]["max_turns"]`・`sub["guard"]["llm_timeout"]`）と、根拠ゲート（`_plan_min_citations`

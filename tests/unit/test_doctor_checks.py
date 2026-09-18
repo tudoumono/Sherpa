@@ -2135,6 +2135,18 @@ def test_check_codex_multi_agent_worker_model_detects_active_user_row(monkeypatc
     assert r.status == "skip"
 
 
+def test_check_codex_multi_agent_worker_model_skip_when_configured_custom(monkeypatch):
+    """worker モデルが管理画面で独自設定（`codex_worker_model`）されているときは、Sherpa 側で
+    カタログ存在を検証できないため skip（実装ベース探索の回復 S1・案 B）。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    sys_s = {"codex_worker_model": "gpt-5.9-custom"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "skip"
+    assert "独自設定" in r.detail
+
+
 # ---------------------------------------------------------------------------
 # 3c. Ollama の用途別プローブ（実効URL・用途・モデル単位）
 # ---------------------------------------------------------------------------

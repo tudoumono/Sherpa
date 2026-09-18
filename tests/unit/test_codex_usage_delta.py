@@ -213,11 +213,9 @@ def test_fresh_session_without_prev_total_uses_raw_accumulated_usage(tmp_path, m
 # ===== STAT-3 S1（利用統計の拡充）: env["usage"] へ depth_profile/reasoning を足す =====
 
 def test_deep_depth_profile_keeps_base_reasoning_in_usage(tmp_path, monkeypatch):
-    """DEPTH-2 S7: `scope_meta["depth_profile"]="deep"` は `model_reasoning_effort` の
-    per-turn 上書き（`depth_profile.codex_reasoning_for`）が撤去され、基準値（既定 "low"）が
-    そのまま `model_reasoning_effort` と `env["usage"]["reasoning"]` に載る。
-    `reasoning` と `reasoning_base` は矛盾しない（＝一致するため `reasoning_base` は出ない・
-    受け入れ条件(3)）。"""
+    """`scope_meta["depth_profile"]="deep"` は `model_reasoning_effort` の per-turn 上書き
+    （`depth_profile.codex_reasoning_for`）で "high" になり、基準値（既定 "low"）は
+    `env["usage"]["reasoning_base"]` に残る（`reasoning` と `reasoning_base` は矛盾しない）。"""
     steps = [{"thread_id": "SID-DEEP", "agent_messages": ["確認した結果、影響はありません。"],
               "usage": _usage(30, 2, 13, 3)}]
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_delta_deep")
@@ -227,11 +225,11 @@ def test_deep_depth_profile_keeps_base_reasoning_in_usage(tmp_path, monkeypatch)
     env = _result_env(_run(prov, ctx))
 
     calls = _read_argv_log(argv_log)
-    assert any("model_reasoning_effort=low" in a for a in calls[0]), \
-        f"実際に codex exec へ渡した引数が基準値 low のままでない: {calls[0]!r}"
+    assert any("model_reasoning_effort=high" in a for a in calls[0]), \
+        f"実際に codex exec へ渡した引数が深さの上書き high になっていない: {calls[0]!r}"
     assert env["usage"]["depth_profile"] == "deep"
-    assert env["usage"]["reasoning"] == "low"
-    assert "reasoning_base" not in env["usage"]
+    assert env["usage"]["reasoning"] == "high"
+    assert env["usage"]["reasoning_base"] == "low"
 
 
 def test_standard_depth_profile_omits_reasoning_base_when_unchanged(tmp_path, monkeypatch):

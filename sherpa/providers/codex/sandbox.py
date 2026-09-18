@@ -81,11 +81,14 @@ def codex_multi_agent_enabled(*, ollama_base_url: str | None, system_settings: d
 def _codex_worker_model(system_settings: dict | None = None) -> str:
     """`[agents.worker]` の `model` に使う値（S6 で `[agents.*]` を生成するときに呼ぶ）。
 
-    Sherpa 側の下調べ役（subsearch）既定モデルは Codex 自身のモデルカタログに存在しない前提で
-    使えないため参照しない——常に `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）を返す。
-    `system_settings` は将来 admin 側で Codex worker 専用のモデル選択肢を持たせる拡張点として
-    受け取るだけ（現状は無視・未使用引数を明示するため受け口だけ用意）。
+    管理画面の system_settings `codex_worker_model`（空／未設定なら `_CODEX_WORKER_MODEL_FALLBACK`＝
+    実機確認済みの安価枠）を返す。Sherpa 側の下調べ役（subsearch）既定モデルは Codex 自身の
+    モデルカタログに存在しない前提で使えないため参照しない。
     """
+    if isinstance(system_settings, dict):
+        configured = system_settings.get("codex_worker_model")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
     return _CODEX_WORKER_MODEL_FALLBACK
 
 
@@ -667,8 +670,9 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     `multi_agent`（省略可・既定 `False`・S6・§2.6）: 真のとき `[agents]`／`[agents.worker]`／
     `[agents.evaluator]` を config.toml へ足す。`-c features.multi_agent=true` 自体は呼び出し元
     （provider.py の argv）が付ける——ここでは CLI 機能フラグではなくサブエージェントの層
-    （モデル・推論レベル・同時実行数）だけを書く。worker の `model` は常に `_codex_worker_model()`
-    （Codex 自身のカタログにある安価枠）。evaluator の `model` は `orchestrator_model`（省略時は
+    （モデル・推論レベル・同時実行数）だけを書く。worker の `model` は `_codex_worker_model()`
+    （system_settings `codex_worker_model` があればその値、無ければ Codex 自身のカタログにある
+    安価枠）。evaluator の `model` は `orchestrator_model`（省略時は
     worker と同じモデルへ倒す＝本体のモデル名が取れない呼び出し元でも config 生成自体は壊さない）
     ・推論レベルは `reason`（本体へ実際に渡す `model_reasoning_effort` と同じ基準値）。
     role ごとの層の実体（`config_file` が指す TOML）は `_write_codex_agent_role_configs`
@@ -791,13 +795,13 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     if multi_agent:
         _worker_model = _codex_worker_model(system_settings)
         _worker_path, _evaluator_path = _write_codex_agent_role_configs(
-            codex_home, worker_model=_worker_model, worker_reasoning="low",
+            codex_home, worker_model=_worker_model, worker_reasoning="medium",
             evaluator_model=orchestrator_model or _worker_model, evaluator_reasoning=reason)
         lines += [
             '',
             '[agents]',
             f'default_subagent_model = {_toml_str(_worker_model)}',
-            'default_subagent_reasoning_effort = "low"',
+            'default_subagent_reasoning_effort = "medium"',
             f'max_concurrent_threads_per_session = {_CODEX_MAX_CONCURRENT_SUBAGENTS}',
             '',
             '[agents.worker]',

@@ -25,7 +25,7 @@ _MAX_PATHS_PER_HIT = 5                        # 同一 key に複数 graph item 
 _JUDGE_RANK = {"sure": 0, "review": 1, "presumed": 2}   # judgement の優劣（小さいほど良い）
 
 DEGRADE_REASONS = frozenset({
-    "es_unavailable", "es_query_failed", "embedding_not_configured",
+    "es_unavailable", "es_query_failed", "es_query_rejected", "embedding_not_configured",
     "embedding_cloud_unavailable",  # RV1（FBK-1）: A7 で明示選択したクラウドの埋め込みが解決できない
     "hybrid_query_failed",  # RV3（FBK-1）: hybrid 自体が失敗し BM25 は成功（hits は空でない）
     "vector_feature_mismatch", "query_embed_failed",

@@ -3649,8 +3649,8 @@ def test_gemini_ask_user_stub():
 
 @pytest.mark.parametrize("profile", ["standard", "deep", "max"])
 def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, profile):
-    """DEPTH-2 S7: `_agentic_loop` が `openai_style` へ渡す `max_turns`/`max_hits`/`window_cap`
-    は `ctx.scope_meta["depth_profile"]` に依らず基準値のまま（倍率は撤去）。"""
+    """`_agentic_loop` が `openai_style` へ渡す `max_turns`/`max_hits`/`window_cap` に、
+    `ctx.scope_meta["depth_profile"]` の倍率が一度だけ効く。"""
     from sherpa.agents import Ctx, OpenAIProvider
     from sherpa import depth_profile as D
     captured = {}
@@ -3673,8 +3673,8 @@ def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, pro
 
 
 def test_openai_provider_agentic_loop_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）。
-    DEPTH-2 S7 以降、深さ（"deep"）は基準値に効かない。"""
+    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）＝
+    深さ（"deep"＝×2）の倍率はその実効基準値に掛かる。"""
     from sherpa.agents import Ctx, OpenAIProvider
     captured = {}
 
@@ -3690,12 +3690,12 @@ def test_openai_provider_agentic_loop_honors_system_settings_base_override(monke
               scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"},
               make_sources=lambda docs: [])
     list(p._agentic_loop(ctx))
-    assert captured.get("max_turns") == 5   # 5（基準値上書き）のみ・深くによる倍率は無し
+    assert captured.get("max_turns") == 10   # 5（基準値上書き）× 2（深く）
 
 
 def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_over_limit(monkeypatch):
-    """DEPTH-2 S7: 倍率は撤去したが、管理画面の基準値編集が既存の絶対上限を超える値
-    （grep ヒット上限1500・読み取り窓600）でも、最終的に既存の絶対上限でクランプされる。"""
+    """管理画面の基準値編集が既存の絶対上限を超える値（grep ヒット上限1500・読み取り窓600）＋
+    深さ「最大」（×2）でも、最終的に既存の絶対上限でクランプされる。"""
     from sherpa.agents import Ctx, OpenAIProvider
     captured = {}
 
@@ -3717,8 +3717,7 @@ def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_over_limit(monke
 
 
 def test_ollama_provider_agentic_loop_scales_with_depth_profile(monkeypatch):
-    """DEPTH-2 S7: `OllamaProvider._agentic_loop` も OpenAIProvider と同じく、深さに依らず
-    基準値のまま openai_style へ渡す（倍率は撤去）。"""
+    """`OllamaProvider._agentic_loop` も OpenAIProvider と同じ倍率を掛けて openai_style へ渡す。"""
     from sherpa.agents import Ctx, OllamaProvider
     from sherpa import depth_profile as D
     captured = {}
@@ -3873,8 +3872,7 @@ def test_provider_run_single_shot_stream_stops_between_chunks_when_stop_event_se
     events = list(p.run(ctx))
     deltas = [e for e in events if e.get("type") == "answer_delta"]
     assert produced == [0, 1], f"停止後も _stream から次のチャンクを引き出し続けている: {produced}"
-    assert deltas == [{"type": "answer_delta", "text": "chunk0"},
-                      {"type": "answer_delta", "text": "chunk1"}], \
+    assert [d["text"] for d in deltas][-2:] == ["chunk0", "chunk1"], \
         f"停止検知までに生成済みのチャンクは両方 yield されるはず: {deltas}"
     result = next(e for e in events if e.get("type") == "_result")
     assert result["env"]["headline"] == "".join(d["text"] for d in deltas)   # headline と配信本文が一致
@@ -3894,8 +3892,12 @@ def test_provider_run_single_shot_headline_byte_identical_to_stream():
               route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
               dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}},
               make_sources=lambda docs: [])
-    result = next(e for e in p.run(ctx) if e.get("type") == "_result")
-    assert result["env"]["headline"] == "影響は3件です。"
+    events = list(p.run(ctx))
+    deltas = [e for e in events if e.get("type") == "answer_delta"]
+    result = next(e for e in events if e.get("type") == "_result")
+    assert result["env"]["headline"].endswith("影響は3件です。")
+    # 根拠の不足の告知も delta として配信される＝保存本文と配信本文は一致したまま。
+    assert result["env"]["headline"] == "".join(d["text"] for d in deltas)
 
 
 def test_provider_run_single_shot_stop_event_headline_is_partial_stream_so_far():
@@ -3919,9 +3921,8 @@ def test_provider_run_single_shot_stop_event_headline_is_partial_stream_so_far()
               make_sources=lambda docs: [], stop_event=stop_event)
     events = list(p.run(ctx))
     deltas = [e for e in events if e.get("type") == "answer_delta"]
-    assert deltas == [{"type": "answer_delta", "text": "回答本文"}]
+    assert [d["text"] for d in deltas][-1:] == ["回答本文"]
     result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"] == "回答本文"
     assert result["env"]["headline"] == "".join(d["text"] for d in deltas)
 
 
@@ -6307,37 +6308,64 @@ class _NeverCallAgenticLoop:
         raise AssertionError("blocked のはずの lens で _agentic_loop が呼ばれた")
 
 
-def test_agentic_run_impact_blocked_when_graph_unavailable():
-    """impact はグラフ必須（`_DISPATCH_REQUIRES_GRAPH`）——不達なら `_agentic_loop` を一切呼ばず
-    honest-failure envelope（`tools_blocked_env`）を返す。"""
+def _degraded_gate_provider(seen):
+    """入口ゲートで縮退したときに `_agentic_loop` が実際に呼ばれることを確かめる provider。"""
+    from sherpa.providers.base import _GenProvider
+
+    class _P(_GenProvider):
+        label, model, provider_id = "T", "m", "openai"
+
+        def _agentic_loop(self, ctx):
+            seen.append("agentic")
+            # has_structural_evidence=True で根拠ゲート（EXT-2）を素直に通す（下の陰性対照と同じ理由）。
+            yield {"final": "回答", "docs": set(), "searched": True, "cites": [], "cards": [],
+                  "has_structural_evidence": True}
+
+    return _P
+
+
+def test_agentic_run_impact_degrades_to_direct_search_when_graph_unavailable():
+    """S4: impact でグラフが不達でも `tools_blocked_env` で終わらせず、grep/原本直読の調査を
+    そのまま続ける（§0(c)）——回答の冒頭にグラフを使わなかった理由を平文で告知する。"""
+    seen = []
+    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert seen == ["agentic"], "調査ループを一度も回さずに終わってはいけない"
+    assert env["lens"] == "impact"
+    assert env["headline"].endswith("回答")
+    # 実接続の不達＝「接続できなかった」側の文言（利用者 OFF の「使えない」とは分ける）。
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["graph_unavailable"])
+    assert "agentic_failure" not in env    # 実行できなかったターン扱いにしない
+
+
+def test_agentic_run_troubleshoot_degrades_when_graph_off_via_pref():
+    """troubleshoot も同じ——実接続は可用でも会話の検索経路トグルで明示 OFF なら、グラフ抜きで
+    調査を続ける（可用性とユーザー希望の AND・`effective_tools_pref` 参照）。"""
+    seen = []
+    ctx = _blocking_gate_ctx("troubleshoot", {"grep": True, "fulltext": True, "graph": True},
+                            tools_pref={"graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert seen == ["agentic"]
+    assert env["lens"] == "troubleshoot"
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["blocked"])
+
+
+def test_agentic_run_impact_still_blocked_when_no_search_tool_remains():
+    """縮退の条件は「資料を探す手段が残っていること」——grep も全文も使えなければ従来どおり
+    honest-failure envelope（`tools_blocked_env`）で終わる。"""
     from sherpa.providers.base import _GenProvider
 
     class _P(_NeverCallAgenticLoop, _GenProvider):
         pass
 
-    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
+    ctx = _blocking_gate_ctx("impact", {"grep": False, "fulltext": False, "graph": False})
     events = list(_P().run(ctx))
     env = next(e["env"] for e in events if e.get("type") == "_result")
     assert env["lens"] == "impact"
     assert env["data"] == {}
     assert env["summary"]["total"] == 0
-    assert "グラフ" in env["headline"]
-
-
-def test_agentic_run_troubleshoot_blocked_when_graph_off_via_pref():
-    """troubleshoot もグラフ必須——実接続は可用でも、会話の検索経路トグルで明示 OFF にしていれば
-    同じく blocked（可用性とユーザー希望の AND・`effective_tools_pref` 参照）。"""
-    from sherpa.providers.base import _GenProvider
-
-    class _P(_NeverCallAgenticLoop, _GenProvider):
-        pass
-
-    ctx = _blocking_gate_ctx("troubleshoot", {"grep": True, "fulltext": True, "graph": True},
-                            tools_pref={"graph": False})
-    events = list(_P().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["lens"] == "troubleshoot"
-    assert env["data"] == {}
 
 
 def test_agentic_run_qa_blocked_when_grep_and_fulltext_both_unavailable():
@@ -7767,7 +7795,7 @@ def test_run_tool_toctou_rejects_path_swapped_to_symlink_after_check(monkeypatch
     rp.symlink_to(outside)
 
     res, docs, _, _ = A.run_tool("file_head", {"doc_id": "note.txt"}, world, None)
-    assert res == {"error": "読み取りに失敗しました"}
+    assert res == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     assert docs == set()
 
 
@@ -7802,7 +7830,7 @@ def test_run_tool_ancestor_dir_symlink_swap_after_check_is_rejected(monkeypatch,
     sub_dir.symlink_to(outside)
 
     res, docs, _, _ = A.run_tool("file_head", {"doc_id": "sub/note.txt"}, world, None)
-    assert res == {"error": "読み取りに失敗しました"}
+    assert res == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     assert docs == set()
 
 
@@ -8143,3 +8171,623 @@ def test_render_existing_claims_for_prompt_keeps_all_ids_over_budget():
     assert any(line.startswith("[c2]") for line in lines)      # c2 行が丸ごと残る（途中で切れない）
     for line in lines:
         assert line.count("[") == 0 or "]" in line             # id が途中で切れていない
+
+
+# ===== S3: 障害種別の分類（`_is_recoverable_tool_exception`/`_tool_backend_kind`/
+# `_record_tool_exception`/`_record_tool_result_error_code`）=====
+
+def test_tool_backend_kind_classifies_by_closed_set():
+    assert A._tool_backend_kind("es_search") == "fulltext"
+    assert A._tool_backend_kind("graph_neighbors") == "graph"
+    assert A._tool_backend_kind("ripgrep_search") == "read_io"
+    assert A._tool_backend_kind("xlsx_sheets") == "read_io"
+    assert A._tool_backend_kind("some_unknown_tool") == "read_io"   # 未知名は read_io へ丸める
+
+
+def test_is_recoverable_tool_exception_covers_os_timeout_and_neo4j_client_errors():
+    """接続断・タイムアウト・読取I/O（ES/Neo4j クライアント例外・`OSError`/`TimeoutError` 系）は
+    回復可能——それ以外（プログラムの欠陥を示す例外）は回復不可。"""
+    from neo4j.exceptions import ServiceUnavailable
+
+    assert A._is_recoverable_tool_exception(OSError("boom")) is True
+    assert A._is_recoverable_tool_exception(TimeoutError("boom")) is True
+    assert A._is_recoverable_tool_exception(ConnectionError("boom")) is True   # OSError のサブクラス
+    assert A._is_recoverable_tool_exception(ServiceUnavailable("boom")) is True
+    assert A._is_recoverable_tool_exception(TypeError("boom")) is False
+    assert A._is_recoverable_tool_exception(KeyError("boom")) is False
+    assert A._is_recoverable_tool_exception(AssertionError("boom")) is False
+
+
+def test_is_recoverable_tool_exception_excludes_neo4j_client_errors():
+    """`Neo4jError` のうち `ClientError` 系（`CypherSyntaxError`/`ConfigurationError` 含む・クエリの
+    バグや設定ミス）は回復不可——`TransientError`（サーバ側の一時的な過負荷等）だけが回復可能。"""
+    from neo4j.exceptions import ConfigurationError, CypherSyntaxError, TransientError
+
+    assert A._is_recoverable_tool_exception(TransientError("boom")) is True
+    assert A._is_recoverable_tool_exception(CypherSyntaxError("boom")) is False
+    assert A._is_recoverable_tool_exception(ConfigurationError("boom")) is False
+
+
+def test_is_recoverable_tool_exception_classifies_http_error_by_status_before_oserror():
+    """`HTTPError` は `OSError` のサブクラスだが、一般 `OSError` 判定より先にステータスコードで
+    分類する——4xx（クライアント起因）は回復不可、5xx・429（一時的）は回復可能。"""
+    import io
+    import urllib.error
+
+    def _http_error(code: int) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(b""))
+
+    assert A._is_recoverable_tool_exception(_http_error(400)) is False
+    assert A._is_recoverable_tool_exception(_http_error(404)) is False
+    assert A._is_recoverable_tool_exception(_http_error(429)) is True
+    assert A._is_recoverable_tool_exception(_http_error(500)) is True
+    assert A._is_recoverable_tool_exception(_http_error(503)) is True
+
+
+def test_record_tool_exception_marks_backend_kind_for_recoverable_and_flag_for_non_recoverable():
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_exception(state, "es_search", OSError("boom"))
+    assert state.backend_failures == {"fulltext": True, "graph": False, "read_io": False}
+    assert state.non_recoverable_failure is False
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_exception(state2, "graph_neighbors", TypeError("boom"))
+    assert state2.backend_failures == {"fulltext": False, "graph": False, "read_io": False}
+    assert state2.non_recoverable_failure is True   # プログラムの欠陥は種別に関わらずこのフラグ
+
+
+def test_record_tool_exception_non_recoverable_persists_alongside_recoverable():
+    """同一ターンで回復可能（接続断）と回復不可（プログラム欠陥）が混在しても、回復不可の
+    フラグは戻らない（一度立てたら run 内で戻さない・単発フォールバック禁止の判定材料）。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_exception(state, "ripgrep_search", OSError("boom"))
+    A._record_tool_exception(state, "es_search", TypeError("boom"))
+    assert state.backend_failures["read_io"] is True
+    assert state.non_recoverable_failure is True
+
+
+def test_record_tool_result_error_code_marks_read_io_only_for_known_code():
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"})
+    assert state.backend_failures["read_io"] is True
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state2, {"error": "範囲外です"})   # error_code 無し＝無反応
+    assert state2.backend_failures == {"fulltext": False, "graph": False, "read_io": False}
+
+
+def test_record_tool_result_error_code_marks_fulltext_for_es_hard_degrade():
+    """`es_search` の `degrade_reason` が `es_unavailable`/`es_query_failed`（BM25 自体も失敗した
+    既知値・`_ES_DEGRADE_WORDING` に含まれない）のとき `backend_failures["fulltext"]` を立てる——
+    BM25 継続時の縮退理由（`query_embed_failed` 等・`_ES_DEGRADE_WORDING` に含まれる既知値）は
+    検索自体は実行できているため対象外のまま。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state, {"hits": [], "degrade_reason": "es_unavailable"}, "es_search")
+    assert state.backend_failures["fulltext"] is True
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state2, {"hits": [], "degrade_reason": "query_embed_failed"}, "es_search")
+    assert state2.backend_failures["fulltext"] is False
+
+
+def test_record_tool_result_error_code_marks_graph_for_neighbor_cards_failure():
+    """`graph_neighbors` の結果に `neighbor_cards` 由来の固定コード（`"graph_unavailable"`＝回復可能／
+    `"graph_internal_error"`＝回復不可）が付いていれば、対応するフラグへ反映する。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state, {"neighbors": [], "error_code": "graph_unavailable"}, "graph_neighbors")
+    assert state.backend_failures["graph"] is True
+    assert state.non_recoverable_failure is False
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state2, {"neighbors": [], "error_code": "graph_internal_error"}, "graph_neighbors")
+    assert state2.backend_failures["graph"] is False
+    assert state2.non_recoverable_failure is True
+
+
+def test_open_doc_stream_open_failure_carries_read_io_error_code(monkeypatch, tmp_path):
+    """`_open_doc_stream` の実際の open 失敗（`OSError`）が固定理由コード `read_io_failed` を
+    結果へ付ける——例外にならず結果化される読取I/O失敗を `run_tool` 呼び出し元が拾える形。"""
+    from sherpa import scope as scope_mod
+
+    def _boom(root, rel_parts):
+        raise OSError("boom")
+
+    monkeypatch.setattr(A, "_open_file_nofollow_walk", _boom)
+    monkeypatch.setattr(A, "_safe_doc_path", lambda world, doc_id, layer=None: (tmp_path, "x.txt", tmp_path / "x.txt"))
+    monkeypatch.setattr(scope_mod, "in_scope", lambda doc_id, sp: True)
+    f, err = A._open_doc_stream("v1", "x.txt", None, None)
+    assert f is None
+    assert err == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
+
+
+def test_finalize_payload_preserves_budget_exhausted_stop_reason_when_citations_all_dropped():
+    """予算到達（turns_exhausted 等）で打ち切られたターンで、集めた引用候補が機械検証で全滅
+    （`committed` 空・`dropped` 非空）しても、`stop_reason` は `evidence_verification_failed` へ
+    上書きされない——上書きされると `providers/base.py::run` の単発フォールバック除外判定
+    （予算到達を縮退対象から除外する規律）が実際の終了理由を読み取れなくなる回帰を防ぐ。"""
+    payload = A._build_final_payload(
+        "", set(), True,
+        [{"doc_id": "ghost-does-not-exist.md", "span": [1, 1], "quote": "x", "ext": ".md"}],
+        [], None, set(), "turns_exhausted", "v1")
+    assert payload["cites"] == []
+    assert payload["dropped_citations"], "citation が全滅していない前提が崩れている"
+    assert payload["stop_reason"] == "turns_exhausted"
+
+
+def test_finalize_payload_still_upgrades_to_evidence_verification_failed_when_not_budget():
+    """予算到達以外（通常の自然完了等）の stop_reason で引用が全滅した場合は、従来どおり
+    `evidence_verification_failed` へ上書きされる（予算到達専用の除外が過剰に広がっていないこと）。"""
+    payload = A._build_final_payload(
+        "", set(), True,
+        [{"doc_id": "ghost-does-not-exist.md", "span": [1, 1], "quote": "x", "ext": ".md"}],
+        [], None, set(), "no_tool_calls", "v1")
+    assert payload["cites"] == []
+    assert payload["dropped_citations"]
+    assert payload["stop_reason"] == "evidence_verification_failed"
+
+
+def test_es_index_search_classifies_http_400_as_rejected_and_5xx_as_failed(monkeypatch):
+    """`es_index.search` の BM25 POST が例外を投げたとき、HTTP ステータスで回復可否を分類する——
+    4xx（クエリ自体の拒否＝構文/設定不備）は `es_query_rejected`（回復不可）、5xx/接続断は
+    従来どおり `es_query_failed`（回復可能）のまま。外部境界（HTTP 通信）にステータスを注入する。"""
+    import urllib.error
+
+    from sherpa import es_index
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_400(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise urllib.error.HTTPError("http://es/_search", 400, "Bad Request", {}, None)
+
+    monkeypatch.setattr(es_index, "_req", boom_400)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_rejected"
+
+    def boom_503(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise urllib.error.HTTPError("http://es/_search", 503, "Service Unavailable", {}, None)
+
+    monkeypatch.setattr(es_index, "_req", boom_503)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_failed"
+
+
+def test_record_tool_result_error_code_es_query_rejected_marks_non_recoverable():
+    """`es_search` の `degrade_reason` が `es_query_rejected`（4xx＝プログラム/設定の欠陥）のときは
+    `backend_failures["fulltext"]` ではなく `non_recoverable_failure` を立てる——単発フォールバック
+    への縮退（回復可能な障害のみが対象）を誤って許さないため。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state, {"hits": [], "degrade_reason": "es_query_rejected"}, "es_search")
+    assert state.backend_failures["fulltext"] is False
+    assert state.non_recoverable_failure is True
+
+
+def test_open_verified_original_open_failure_carries_read_io_error_code(monkeypatch, tmp_path):
+    """`_open_verified_original`（xlsx_sheets 等・原本読取ツールが使う TOCTOU 再検証 open）の
+    失敗が固定理由コード `read_io_failed` を結果へ付ける——`_open_doc_stream` と同じ経路で
+    `InvestigationState.backend_failures["read_io"]` に届くようにする。"""
+    def _boom(root, rel_parts):
+        raise OSError("boom")
+
+    monkeypatch.setattr(A, "_open_file_nofollow_walk", _boom)
+    f, err = A._open_verified_original(tmp_path, "x.txt", None)
+    assert f is None
+    assert err == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
+
+
+def test_compare_documents_read_failure_carries_read_io_error_code(monkeypatch, tmp_path):
+    """`compare_docs.compare` の RAG 正本読み取り失敗（`_read_capped` の `OSError`）が固定理由コード
+    `read_io_failed` を結果へ付ける——`_record_tool_result_error_code` は名前非依存でこれを拾い、
+    原本読取（compare_documents）だけが I/O 失敗したターンでも `backend_failures["read_io"]` に届く。"""
+    from sherpa import compare_docs
+
+    left = tmp_path / "left.rag.md"
+    right = tmp_path / "right.rag.md"
+    left.write_text("left content", encoding="utf-8")
+    right.write_text("right content", encoding="utf-8")
+
+    monkeypatch.setattr(compare_docs, "_in_scope", lambda doc_id, sp: True)
+    monkeypatch.setattr(compare_docs, "_rag_md_path",
+                        lambda world, doc_id: left if doc_id == "left.md" else right)
+
+    def boom_read(path, cap_bytes):
+        if path == right:
+            return None, False           # 読み取り失敗（OSError 相当）
+        return "left content", False
+
+    monkeypatch.setattr(compare_docs, "_read_capped", boom_read)
+    result = compare_docs.compare("v1", {"left_doc_id": "left.md", "right_doc_id": "right.md"})
+    assert result["status"] == "unsupported"
+    assert result["error_code"] == "read_io_failed"
+
+    from sherpa import investigation_state
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, result, "compare_documents")
+    assert state.backend_failures["read_io"] is True
+
+
+def test_es_index_search_keeps_non_raising_contract_for_non_communication_exception(monkeypatch):
+    """`es_index.search` の BM25 クエリで `JSONDecodeError`（非 JSON 応答・通信例外ではない）が
+    発生しても、`search()` の「例外を投げず `(hits, degrade_reason)` を返す」契約は保たれる
+    （`routers/documents.py`・`search_service.py`・`ext_api.py` 等、`run_tool` 境界の型分類に
+    委ねられない非 agentic 経路も同じ関数を呼ぶため）——通信障害と区別し、回復不可の固定コード
+    `es_query_rejected` を返す（`es_query_failed` として回復可能扱いにはしない）。"""
+    import json
+
+    from sherpa import es_index
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_bad_json(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise json.JSONDecodeError("bad json", "not json", 0)
+
+    monkeypatch.setattr(es_index, "_req", boom_bad_json)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_rejected"
+
+
+def test_run_tool_es_search_non_communication_degrade_reason_marks_non_recoverable(monkeypatch):
+    """`run_tool("es_search", ...)` は BM25 クエリのプログラムの欠陥・想定外の応答形
+    （`es_query_rejected`）を tool result の `degrade_reason` として返す（例外を投げない）。
+    `_record_tool_result_error_code` へ渡すと `non_recoverable_failure` が立つ——`fulltext`
+    （回復可能）へ誤って丸めない。"""
+    from sherpa import documents, es_index, investigation_state
+
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: set())
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_bug(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise TypeError("programming bug")
+
+    monkeypatch.setattr(es_index, "_req", boom_bug)
+
+    view, _docs, _cites, _cards = A.run_tool("es_search", {"query": "x"}, "v1", None)
+    assert view["degrade_reason"] == "es_query_rejected"
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, view, "es_search")
+    assert state.backend_failures["fulltext"] is False
+    assert state.non_recoverable_failure is True
+
+
+def test_es_index_search_treats_404_as_recoverable_index_not_yet_created(monkeypatch):
+    """ES の 404（索引未作成＝未取り込み world の常態）は `es_query_rejected`（回復不可）ではなく
+    `es_query_failed`（回復可能）に分類する——4xx を一律回復不可にすると、未取り込み world への
+    問い合わせで grep 縮退が恒久的に塞がれてしまう。"""
+    import urllib.error
+
+    from sherpa import es_index
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_404(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise urllib.error.HTTPError("http://es/_search", 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(es_index, "_req", boom_404)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_failed"
+
+
+def test_record_tool_result_error_code_es_404_marks_recoverable_fulltext():
+    """404（索引未作成）由来の `degrade_reason: "es_query_failed"` は `backend_failures["fulltext"]`
+    （回復可能）を立てる——`non_recoverable_failure` は立たない（未取り込み world での grep 縮退を
+    塞がないための対照テスト）。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, {"hits": [], "degrade_reason": "es_query_failed"}, "es_search")
+    assert state.backend_failures["fulltext"] is True
+    assert state.non_recoverable_failure is False
+
+
+def test_doc_readers_file_head_read_os_error_marks_backend_read_io(tmp_path):
+    """`doc_readers.file_head` の open 後 read 段 `OSError` が付ける `error_code: "read_io_failed"`
+    を `_record_tool_result_error_code` が拾い、`InvestigationState.backend_failures["read_io"]`
+    を立てる——xlsx/docx/pptx/pdf の TOCTOU 再検証 open 失敗（`_open_verified_original`）と同じ
+    経路に file_head 自身の read 失敗も合流する。"""
+    from sherpa import doc_readers, investigation_state
+
+    p = tmp_path / "note.txt"
+    p.write_text("hello\n", encoding="utf-8")
+    f = open(p, "rb")
+
+    def boom_read(n):
+        raise OSError("boom")
+
+    f.read = boom_read
+    result = doc_readers.file_head(f)
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, result, "file_head")
+    assert state.backend_failures["read_io"] is True
+
+
+def test_tool_hit_count_returns_none_for_graph_neighbors_error_code_result():
+    """`graph_neighbors` が `error_code`（`graph_unavailable`/`graph_internal_error`）付きの結果
+    （`{"neighbors": []}`・"error" キーは持たない）を返した場合、`_tool_hit_count` は 0 ではなく
+    None を返す——es_search の degrade と同じ規律で「実行できなかった」を「0件ヒット」と
+    混同しない。"""
+    assert A._tool_hit_count("graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}) is None
+    assert A._tool_hit_count("graph_neighbors", {"neighbors": [], "error_code": "graph_internal_error"}) is None
+    # error_code が無い通常の 0 件応答は従来どおり 0（回帰しないことの対照）。
+    assert A._tool_hit_count("graph_neighbors", {"neighbors": []}) == 0
+
+
+def test_hit_summary_node_sub_suppressed_for_graph_neighbors_error_code():
+    """サブ経路の追加ノード（`_hit_summary_node_sub`）も graph_neighbors の障害結果では
+    ノードを出さない（`None`）——0件ヒットと誤表示しない。"""
+    assert A._hit_summary_node_sub(
+        "graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}) is None
+
+
+def test_investigation_state_add_tool_result_does_not_record_zero_hits_gap_for_graph_error_code():
+    """`InvestigationState.add_tool_result` は graph_neighbors の障害結果（`error_code` 付き・
+    "error" キーは持たない）を「0件」の gap として積まない——`_tool_hit_count` が None を返す
+    ため `hits == 0` 分岐に入らず、誤って「実行できなかった」を「0件ヒット」と記録しない。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    state.add_tool_result("graph_neighbors", {"name": "TAX-RATE"},
+                          {"neighbors": [], "error_code": "graph_unavailable"}, [], [])
+    assert not any("0件" in g for g in state.gaps)
+    assert state.tool_log[-1].hits is None
+
+
+# ===== S4（縮退の可視化と計数）: グラフの3状態（空・世代不一致・接続断）を区別して調査を止めない =====
+# モックは外部境界（Neo4j ドライバ）だけ——`lens_service`/`world_neo4j` の内部関数は差し替えない。
+
+class _FakeRecord(dict):
+    def data(self):
+        return dict(self)
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = [_FakeRecord(r) for r in rows]
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def data(self):
+        return [r.data() for r in self._rows]
+
+    def consume(self):
+        pass
+
+
+class _FakeSession:
+    """世代プローブ（`SherpaMeta`）にだけ実データ有り＋指定世代を返す fake（他クエリは0件）。"""
+
+    def __init__(self, era, raise_exc=None):
+        self.era, self.raise_exc = era, raise_exc
+
+    def run(self, query, **kw):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return _FakeResult([{"c": 1, "era": self.era}] if "SherpaMeta" in str(query) else [])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, session):
+        self._session = session
+
+    def session(self):
+        return self._session
+
+    def close(self):
+        pass
+
+
+def _patch_neo4j_driver(monkeypatch, session):
+    import neo4j
+    monkeypatch.setattr(neo4j.GraphDatabase, "driver",
+                        staticmethod(lambda *a, **kw: _FakeDriver(session)))
+
+
+def test_run_tool_graph_neighbors_schema_era_returns_reingest_code(monkeypatch):
+    """世代不一致（旧世代の実データ）は例外で調査を終端させず、MCP 側と同じ機械可読コードの
+    ツール結果へ変換して返す（`run_tool` は raise しない）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    res, docs, cites, cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+    assert res == {"error": "graph_reingest_required", "world": "v1", "stored_era": "old-era"}
+    assert docs == set() and cites == [] and cards == []
+
+
+def test_run_tool_graph_neighbors_connection_failure_returns_unavailable_code(monkeypatch):
+    """接続断（`ServiceUnavailable`＝`DriverError` 系）は世代不一致とは別コード（回復可能）。"""
+    from neo4j.exceptions import ServiceUnavailable
+    _patch_neo4j_driver(monkeypatch, _FakeSession(None, raise_exc=ServiceUnavailable("down")))
+    res, _docs, _cites, _cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+    assert res["neighbors"] == [] and res["error_code"] == "graph_unavailable"
+    assert "error" not in res
+
+
+def test_run_tool_graph_neighbors_empty_graph_is_not_a_failure(monkeypatch):
+    """空（未構築＝実データ0件）は現状どおり例外にも障害コードにもならない（近傍0件）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession(None))   # c=0 相当（SherpaMeta 以外は0件）
+
+    class _EmptySession(_FakeSession):
+        def run(self, query, **kw):
+            return _FakeResult([{"c": 0, "era": None}] if "SherpaMeta" in str(query) else [])
+
+    _patch_neo4j_driver(monkeypatch, _EmptySession(None))
+    res, _docs, _cites, _cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+    assert res == {"neighbors": []}
+
+
+def test_record_tool_result_error_code_marks_graph_states_separately():
+    """世代不一致・接続断は別々の状態／別々の統計項目（`answer.limits`）になる。"""
+    from sherpa.investigation_state import InvestigationState
+    st = InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(st, {"error": "graph_reingest_required", "world": "v1",
+                                          "stored_era": "old"}, "graph_neighbors")
+    assert st.graph_schema_era_mismatch is True
+    assert st.limits["graph_reingest_required"] is True
+    assert st.backend_failures["graph"] is False           # 接続断とは混同しない
+
+    st2 = InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(st2, {"neighbors": [], "error_code": "graph_unavailable"},
+                                    "graph_neighbors")
+    assert st2.backend_failures["graph"] is True and st2.limits["backend_unavailable_graph"] is True
+    assert st2.graph_schema_era_mismatch is False
+    assert "graph_reingest_required" not in st2.limits
+
+
+def test_es_unavailable_marks_backend_unavailable_fulltext_limit():
+    """全文検索の不調も同じ流儀で `answer.limits` のフラットな bool 項目になる。"""
+    from sherpa.investigation_state import InvestigationState
+    st = InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(st, {"hits": [], "degrade_reason": "es_unavailable"}, "es_search")
+    assert st.limits["backend_unavailable_fulltext"] is True
+
+
+def test_openai_style_continues_with_grep_after_graph_schema_era(monkeypatch):
+    """世代不一致を検知しても調査ループは止まらず、後続の grep 結果で回答し切る
+    （縮退の事実は `limits` に残る）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    calls1 = [{"id": "c0", "function": {"name": "graph_neighbors",
+                                        "arguments": json.dumps({"name": "請求"})}}]
+    calls2 = [{"id": "c1", "function": {"name": "ripgrep_search",
+                                        "arguments": json.dumps({"query": "TAX-RATE"})}}]
+    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls1}}]},
+           {"choices": [{"message": {"content": "", "tool_calls": calls2}}]},
+           {"choices": [{"message": {"content": "税率は 10% です。"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 toolset=A.openai_tools(with_graph=True)))
+    final = next(e for e in events if "final" in e)
+    assert final["final"] == "税率は 10% です。"
+    assert final["docs"], "grep の出典が残る（グラフ不調でも回答を止めない）"
+    assert final["limits"]["graph_reingest_required"] is True
+
+
+# S4（RV3）: 世代不一致の記録は openai 方言だけでなく anthropic／gemini 方言でも行う
+# （`_record_tool_result_error_code` を呼ばないと縮退が無音化し、graph_admin の fail-loud も効かない）。
+
+def test_gemini_records_graph_reingest_required_in_limits(monkeypatch):
+    """gemini 方言でも `graph_neighbors` の世代不一致（結果化された障害）が limits に立つ。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    seq = [
+        {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "graph_neighbors", "args": {"name": "請求"}}}]}}]},
+        {"candidates": [{"content": {"parts": [{"text": "関係は確認できませんでした。"}]}}]},
+    ]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
+                           toolset=A.gemini_tools(with_graph=True)))
+    final = next(ev for ev in events if "final" in ev)
+    assert final["limits"]["graph_reingest_required"] is True
+
+
+def test_anthropic_style_records_graph_reingest_required_in_limits(monkeypatch):
+    """anthropic 方言（Bedrock）でも同じ（方言ごとに記録が抜けない）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    client = _AClient([
+        _AResp([_ABlock("tool_use", name="graph_neighbors", input={"name": "請求"}, id="tu1")],
+               stop_reason="tool_use"),
+        _AResp([_ABlock("text", "関係は確認できませんでした。")], stop_reason="end_turn"),
+    ])
+    events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None,
+                                    toolset=A.graph_openai_tools()))
+    final = next(ev for ev in events if "final" in ev)
+    assert final["limits"]["graph_reingest_required"] is True
+
+
+# S4（RV4）: 最初から不達で「ツール集合に入らなかった」バックエンドも縮退として計数する
+# （実行中に記録される機会が無いため）。利用者が自分で OFF にした場合は障害ではない＝計数しない。
+
+def test_openai_style_counts_fulltext_unavailable_when_es_unreachable(monkeypatch):
+    """ES が実接続で不達なら、es_search を1度も呼べなくても統計に縮退が残る。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_availability={"grep": True, "fulltext": False, "graph": True}))
+    final = next(e for e in events if "final" in e)
+    assert final["limits"]["backend_unavailable_fulltext"] is True
+
+
+def test_openai_style_does_not_count_fulltext_when_user_turned_it_off(monkeypatch):
+    """利用者が全文検索を OFF にしただけのターンは障害ではない（計数しない）。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_pref={"grep": True, "fulltext": False, "graph": True},
+                                 tools_availability={"grep": True, "fulltext": True, "graph": True}))
+    final = next(e for e in events if "final" in e)
+    assert "limits" not in final or "backend_unavailable_fulltext" not in final["limits"]
+
+
+def test_gemini_counts_fulltext_unavailable_when_es_unreachable(monkeypatch):
+    """他の方言でも同じ（判定はツール集合を組む1箇所に集約されている）。"""
+    seq = [{"candidates": [{"content": {"parts": [{"text": "回答"}]}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
+                           tools_availability={"grep": True, "fulltext": False, "graph": True}))
+    final = next(e for e in events if "final" in e)
+    assert final["limits"]["backend_unavailable_fulltext"] is True
+
+
+def test_agentic_run_impact_entry_degrade_counts_graph_unavailable():
+    """入口でグラフが不達のまま縮退したターンも統計に残る（グラフツールは集合から外れるため
+    実行中の記録機会が無い）。"""
+    seen = []
+    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert env["limits"]["backend_unavailable_graph"] is True
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["graph_unavailable"])
+
+
+def test_agentic_run_impact_entry_degrade_user_off_is_not_counted():
+    """利用者がグラフを OFF にしただけのターンは障害ではない＝計数せず、文言も「使えない」側。"""
+    seen = []
+    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": True},
+                            tools_pref={"graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert "backend_unavailable_graph" not in (env.get("limits") or {})
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["blocked"])
+
+
+def test_openai_style_counts_graph_unavailable_for_any_lens(monkeypatch):
+    """S4: グラフ不達はレンズに依らずツール集合を組む時点で1回だけ計上する（全文検索と対称）。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_availability={"grep": True, "fulltext": True, "graph": False}))
+    final = next(e for e in events if "final" in e)
+    assert final["limits"]["backend_unavailable_graph"] is True
+    assert "backend_unavailable_fulltext" not in final["limits"]   # 使えている側は立てない
+
+
+def test_openai_style_does_not_count_graph_when_user_turned_it_off(monkeypatch):
+    """利用者が OFF にした軸は不達でも障害ではない（計数しない）。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_pref={"grep": True, "fulltext": True, "graph": False},
+                                 tools_availability={"grep": True, "fulltext": True, "graph": False}))
+    final = next(e for e in events if "final" in e)
+    assert "limits" not in final or "backend_unavailable_graph" not in final["limits"]

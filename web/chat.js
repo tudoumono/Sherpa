@@ -484,7 +484,7 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
         S.depthProfile = sc.depth_profile || 'standard';   // SC-6c: 同じ後追い経路で調べる深さも復元する
         S.webSearch = !!sc.web_search;   // WEB-1: 同じ後追い経路で Web 検索希望も復元する
         S.tools = sc.tools || { grep: true, fulltext: true, graph: true };   // SC-6e: 同じ後追い経路で検索経路トグルも復元する
-        S.toolsExplicit = toolsExplicitForRestore(S.tools);   // 復元値が非既定なら明示状態にする（scope.js と同じ規則）
+        S.toolsExplicit = toolsExplicitForRestore(S.tools, sc.tools_explicit);   // 触った軸だけ明示扱い（scope.js と同じ規則）
         refreshInquirySummary();
       }
       S.pendingConvWorld = null;                             // 選択肢に無い（削除済み）場合もここで諦める

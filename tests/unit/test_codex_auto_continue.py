@@ -928,3 +928,85 @@ def test_child_ask_user_via_sidecar_stops_auto_continue_before_next_attempt(tmp_
     assert questions[0]["interaction_id"] == "child-q1"
     assert [e for e in events if isinstance(e, dict) and e.get("type") == "_result"] == [], \
         "ask_user ターンは回答（_result）を保存しない"
+
+
+# ===== S4（縮退の可視化と計数）: グラフ不調でも Codex の調査を止めない =====
+
+def test_graph_schema_era_item_does_not_abort_run_and_marks_degraded(tmp_path, monkeypatch):
+    """親が旧世代グラフの構造化エラー（`graph_reingest_required`）を受け取っても、そこで打ち切らず
+    Codex 本体の回答をそのまま返す（固定文言への差し替え＝旧挙動をやめる）。縮退は env の印として
+    残り、`chat_service._finalize` が冒頭告知と統計フラグにする。"""
+    era_body = json.dumps({"error": "graph_reingest_required", "world": "v1", "stored_era": "old-era"})
+    steps = [{"thread_id": "TH-ERA",
+              "extra_events": [
+                  {"type": "item.completed",
+                   "item": {"id": "t1", "type": "mcp_tool_call", "tool": "graph_neighbors",
+                            "status": "completed", "arguments": {"name": "請求"},
+                            "result": {"content": [{"type": "text", "text": era_body}], "isError": True}}},
+              ],
+              "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_graph_era")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="graph-era-u1", conversation_id=906)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["headline"] == "確認した結果、影響はありません。"   # 固定文言で終端しない
+    assert env["graph_degraded"] == "graph_reingest_required"
+    out = CS._finalize(dict(env), {"lens": "qa", "reason": "テスト"})
+    assert out["headline"].startswith("関係のつながりの情報が古いため")
+    assert out["limits"]["graph_reingest_required"] is True
+
+
+def test_child_only_graph_failure_from_sidecar_reaches_parent(tmp_path, monkeypatch):
+    """子（`spawn_agent` された worker/evaluator）だけが障害を受け取ったケース——親の `--json` には
+    現れないため、サイドカーの `kind="error"` 行が唯一の観測経路（S4）。"""
+    steps = [{"thread_id": "TH-CHILD-ERR",
+              "sidecar": [{"kind": "error", "code": "graph_unavailable",
+                           "tool": "graph_neighbors", "ts": 1.0}],
+              "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_child_err")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="child-err-u1", conversation_id=907)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["graph_degraded"] == "graph_unavailable"
+    out = CS._finalize(dict(env), {"lens": "qa", "reason": "テスト"})
+    assert "接続できなかった" in out["headline"]
+    assert out["limits"]["backend_unavailable_graph"] is True
+
+
+def test_child_only_fulltext_failure_from_sidecar_counts_in_limits(tmp_path, monkeypatch):
+    """全文検索の不調（子が受け取った `es_unavailable`）は統計項目だけに載る（グラフとは別項目）。"""
+    steps = [{"thread_id": "TH-CHILD-ES",
+              "sidecar": [{"kind": "error", "code": "es_unavailable", "tool": "es_search", "ts": 1.0}],
+              "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_child_es")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="child-es-u1", conversation_id=908)
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["limits"]["backend_unavailable_fulltext"] is True
+    assert "graph_degraded" not in env
+
+
+def test_dispatch_era_flag_is_not_overwritten_by_child_connection_failure(tmp_path, monkeypatch):
+    """S4: 事前検索（`chat_service._dispatch`）が既に世代不一致を立てているターンで、子が接続断
+    （`graph_unavailable`）を報告しても「再取り込み待ち」を優先する（利用者の次の一手が具体的）。"""
+    steps = [{"thread_id": "TH-ERA-PRIO",
+              "sidecar": [{"kind": "error", "code": "graph_unavailable",
+                           "tool": "graph_neighbors", "ts": 1.0}],
+              "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_era_priority")
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="era-prio-u1", conversation_id=909)
+    # 事前検索が世代不一致で縮退した env（`_dispatch` の戻り値と同じ形）。
+    ctx = __import__("dataclasses").replace(ctx, dispatch=lambda lens_, inp: {
+        "lens": lens_, "headline": "dispatch-headline", "summary": {"total": 0},
+        "data": {}, "sources": [], "graph_degraded": "graph_reingest_required"})
+
+    env = _result_env(_run(prov, ctx))
+
+    assert env["graph_degraded"] == "graph_reingest_required"

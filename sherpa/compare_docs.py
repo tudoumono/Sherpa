@@ -247,8 +247,11 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     left_text, left_trunc = _read_capped(left_path, _RAG_MD_READ_CAP_BYTES)
     right_text, right_trunc = _read_capped(right_path, _RAG_MD_READ_CAP_BYTES)
     if left_text is None or right_text is None:
+        # `_open_doc_stream`/`_open_verified_original` と同じ固定理由コード——呼び出し元
+        # （`agentic_search._record_tool_result_error_code`）が名前非依存で拾い
+        # `InvestigationState.backend_failures["read_io"]` へ反映する。
         return {"status": "unsupported", "left_doc_id": left_doc_id, "right_doc_id": right_doc_id,
-                "reason": "RAG 正本の読み取りに失敗しました"}
+                "reason": "RAG 正本の読み取りに失敗しました", "error_code": "read_io_failed"}
 
     left_meta = _parse_header(left_text)
     right_meta = _parse_header(right_text)

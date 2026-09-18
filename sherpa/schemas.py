@@ -504,10 +504,20 @@ class DepthProfileCodexReasoningInfo(BaseModel):
     options: list[str]
 
 
+class CodexWorkerModelInfo(BaseModel):
+    """multi_agent（`[agents.worker]`）の worker モデル（実装ベース探索の回復 S1・案 B）。
+    `configured` は管理者が保存した生値（未設定なら `None`）、`effective` は
+    `sherpa.providers.codex.sandbox._codex_worker_model` の解決結果、`default` は
+    フォールバック定数（`_CODEX_WORKER_MODEL_FALLBACK`）。"""
+    configured: str | None
+    effective: str
+    default: str
+
+
 class DepthProfileAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `depth_profile`（SC-6c・`sherpa/depth_profile.py`・
-    system_extras.py::_admin_settings_view）。調べる深さ（標準/深く/最大）に依らず一定で使う
-    **実効基準値**のみを持つ——深さによる倍率・加算は撤去済み（絶対上限だけが最終的に効く）。"""
+    system_extras.py::_admin_settings_view）。調べる深さ（標準/深く/最大）が掛ける倍率の
+    **基準値**（標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。"""
     max_turns: DepthProfileBaseInfo
     grep_max_hits: DepthProfileBaseInfo
     qa_max_hits: DepthProfileBaseInfo
@@ -592,6 +602,9 @@ class AdminSettingsView(BaseModel):
     # 「最大」の深さが許す査読の巡数（`depth_profile.effective_max_review_rounds`）。
     # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=MAX_REVIEW_ROUNDS_DEFAULT）。
     max_review_rounds: DepthProfileBaseInfo
+    # multi_agent（S6）の worker モデル（`sandbox._codex_worker_model`）。env フォールバックは
+    # 持たない（default=`_CODEX_WORKER_MODEL_FALLBACK`）。
+    codex_worker_model: CodexWorkerModelInfo
     chat_examples: ChatExamplesAdminInfo
 
 
@@ -967,10 +980,17 @@ class UsageLimitsByProviderRow(BaseModel):
     context_compactions_turns: int
     context_compactions_total: int
     synthesis_truncated_turns: int
+    # 必要な根拠種別が揃わず深さを1段だけ自動で引き上げたターン数（`providers/base.py` の
+    # 巡ループが `limits.depth_escalated` を立てる）。
+    depth_escalated_turns: int
     search_truncated_turns: int
     search_truncated_total: int
     auto_continues_turns: int
     auto_continues_total: int
+    # 縮退（バックエンド不調）の計数——意味論は「このターンで初めて検出されたか」＝初回検出の計数。
+    backend_unavailable_fulltext_turns: int
+    backend_unavailable_graph_turns: int
+    graph_reingest_required_turns: int
 
 
 class UsageLimits(BaseModel):

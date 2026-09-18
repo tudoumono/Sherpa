@@ -76,6 +76,12 @@ class ChatReq(BaseModel):
     # 未知キーも型自体で 422 になる（`normalize_tools_pref` の未知キー検査と二重になるが、
     # GET /chat/stream 側の手組み dict はこの型強制を経ないため、そちらの検査は引き続き必要）。
     tools: dict[Literal["grep", "fulltext", "graph"], StrictBool] | None = None
+    # 利用者が実際に切り替えた軸（画面のチップ操作履歴）。`tools` の値だけでは「既定のまま ON」と
+    # 「明示的に ON」を区別できないため別に受け取り、会話メタ（`answer.scope.tools_explicit`）へ
+    # そのまま残す——会話を開き直したときに触っていない軸まで明示扱いにしないための復元専用の記録で、
+    # 実行にも 422 判定（`unavailable_explicit_tools` は `tools` の生 dict を見る）にも使わない。
+    # 省略（`None`）は「記録なし」＝復元側は旧回答と同じ近似へ落ちる。
+    tools_explicit: list[Literal["grep", "fulltext", "graph"]] | None = None
 
     @field_validator("tools")
     @classmethod
@@ -271,6 +277,7 @@ def chat(req: ChatSyncReq, request: Request):
                                   user_id=uid, personal=req.personal,
                                   users_dir=str(_USERS_DIR), web_search=req.web_search,
                                   depth_profile=req.depth_profile, tools=req.tools,
+                                  tools_explicit=req.tools_explicit,
                                   tools_availability=tools_availability,
                                   provider=provider, settings=settings, sys_settings=sys_settings,
                                   stop_event=stop_event)
@@ -314,6 +321,9 @@ def chat_stream(request: Request, message: str = Query(...),
                 # 省略キーまで誤って対象にしてしまう（`ChatReq.tools` の生 dict 保持と同じ理由）。
                 tools_grep: bool | None = None, tools_fulltext: bool | None = None,
                 tools_graph: bool | None = None,
+                # 利用者が実際に切り替えた軸（`ChatReq.tools_explicit` と同じ契約・復元専用の記録）。
+                # GET はネスト構造を持てないため同名の繰り返しクエリで受ける。空＝省略（記録なし）。
+                tools_explicit: list[Literal["grep", "fulltext", "graph"]] = Query(default_factory=list),
                 # 途中停止用の相関ID（クライアント生成・UUID相当に形式制約）
                 stream_id: str = Query(..., pattern=_STREAM_ID_PATTERN)):
     """チャットの SSE ストリーミング版（`/chat` と同じ意味論・逐次イベントで返す）。"""
@@ -369,7 +379,8 @@ def chat_stream(request: Request, message: str = Query(...),
                                           user_id=uid, personal=personal,
                                           users_dir=str(_USERS_DIR), stop_event=stop_event,
                                           web_search=web_search, depth_profile=depth_profile,
-                                          tools=tools_raw, tools_availability=tools_availability,
+                                          tools=tools_raw, tools_explicit=tools_explicit or None,
+                                          tools_availability=tools_availability,
                                           provider=provider, settings=settings, sys_settings=sys_settings):
                     yield f"data: {json.dumps(evt, ensure_ascii=False, default=str)}\n\n"
         finally:
@@ -509,6 +520,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
                  scope_paths: list, knowledge: bool, personal: bool, layer: str = "both",
                  lens: str | None = None, web_search: bool = False,
                  depth_profile: str = "standard", tools: dict | None = None,
+                 tools_explicit: list | None = None,
                  tools_availability: dict | None = None,
                  provider=None, settings: dict | None = None, sys_settings: dict | None = None):
     """バックグラウンド実行本体を作る（conversation_id 確定後に呼ばれるファクトリ・予約方式のため
@@ -518,6 +530,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
     `web_search`（既定 False）は `ChatReq.web_search` をそのまま転送する。
     `depth_profile`（既定 "standard"）は `ChatReq.depth_profile` をそのまま転送する。
     `tools`（既定 None＝全ON）は `ChatReq.tools` をそのまま転送する。
+    `tools_explicit`（既定 None＝どの軸も未操作）は `ChatReq.tools_explicit` をそのまま転送する。
     `tools_availability`（既定 `None`）: 呼び出し元（`chat_turns_start`）が受付時の422判定
     （`_validate_tools_availability`）と同時に計算した snapshot をそのまま転送する——背景実行は
     `POST /chat/turns` 応答後さらに時間が空きうるため、ここで独自に再取得すると受付時からの
@@ -555,6 +568,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
                                               users_dir=str(_USERS_DIR), stop_event=stop_event,
                                               on_user_saved=_on_user_saved, web_search=web_search,
                                               depth_profile=depth_profile, tools=tools,
+                                              tools_explicit=tools_explicit,
                                               tools_availability=tools_availability,
                                               provider=provider, settings=settings, sys_settings=sys_settings):
                         emit(evt)
@@ -614,6 +628,7 @@ def chat_turns_start(req: ChatReq, request: Request):
     run_fn_factory = _turn_run_fn(req.message, w, uid, req.scope_paths, knowledge, req.personal,
                                   layer=req.layer, lens=req.lens, web_search=req.web_search,
                                   depth_profile=req.depth_profile, tools=req.tools,
+                                  tools_explicit=req.tools_explicit,
                                   tools_availability=tools_availability,
                                   provider=provider, settings=settings, sys_settings=sys_settings)
     try:

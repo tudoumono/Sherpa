@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -458,9 +459,18 @@ def _self_worker_sub() -> dict:
     return search_helper.self_worker("openai", "gpt-test", key="sk-x")
 
 
+# 本体（orchestrator）自身のソース確認が必須になった契約のため、判定の前に必ず 1 回だけ読む
+# ソース種別の実在ファイル（fixtures/corpus/v1）。
+_SRC_DOC = "4期/03_開発/01_ソース/TAXCALC.cbl"
+
+
 class _HybridAuthor(_AuthorOpenAI):
     """頭脳自身を worker にしたハイブリッド（API/Ollama の唯一の経路）。`_stream` は
-    `(本文, 完了理由)` の列を順に返す＝evaluator の判定 → 清書 → 追記継続の順に消費される。"""
+    `(本文, 完了理由)` の列を順に返す＝evaluator の判定 → 清書 → 追記継続の順に消費される。
+
+    必須の「本体自身のソース確認」の回だけは応答列を消費せずソース本文の読取指示を返す
+    （`prompts` にも積まない＝各テストが数えている「判定・清書・追記継続」の並びを保つ）。
+    """
 
     def __init__(self, stream_seq):
         super().__init__()
@@ -469,6 +479,9 @@ class _HybridAuthor(_AuthorOpenAI):
         self.prompts: list = []
 
     def _stream(self, prompt, completion=None):
+        if "ソース種別のファイル" in prompt and "【ツール結果】" not in prompt:
+            yield json.dumps({"action": "read_around", "doc_id": _SRC_DOC, "line": 10})
+            return
         self.prompts.append(prompt)
         text, reason = self._seq.pop(0)
         if completion is not None:
@@ -523,6 +536,10 @@ def test_author_hybrid_self_worker_registers_output_file(tmp_path, monkeypatch):
     assert env.get("_personal_rounds") is True
     rows = store.list_workspace_files(uid)
     assert any(r["rel_path"] == "消費税率一覧.md" for r in rows)
+    # 根拠種別の不足の注記は清書へ渡さない＝成果物の中身にも本文にも入らない（規律は主張単位の
+    # 格下げで効かせる）。`prompts[0]` が清書、`prompts[1]` がファイル名決め。
+    assert "【根拠の不足】" not in provider.prompts[0]
+    assert "確認できていません" not in env["headline"]
 
 
 def test_qa_hybrid_does_not_register_output_file(tmp_path, monkeypatch):

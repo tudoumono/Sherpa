@@ -65,9 +65,8 @@ _NEO4J_QUERY_TIMEOUT_S = _env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 _NEO4J_MAX_ROWS = _env_int("SHERPA_NEO4J_MAX_ROWS", 10000, 100, 1_000_000)
 # トラブルシュート/近傍探索（neo4j_related）の既定深さ。範囲外・不正値は既定3へ復帰（[1,16]）。
 TROUBLESHOOT_GRAPH_DEPTH = _env_int("SHERPA_TROUBLESHOOT_GRAPH_DEPTH", 3, 1, 16)
-# env-parse hi 引数と同じ値。調べる深さに依らず一定の実効基準値（`depth_profile.scaled_depth`・
-# DEPTH-2 S7 以降は加算無し）に対して一度だけ適用する絶対上限として使う
-# （`impact_service.IMPACT_MAX_DEPTH_ABS_MAX` と同じ理由）。
+# env-parse hi 引数と同じ値。調べる深さ（`depth_profile.scaled_depth`）が加算適用後に一度だけ
+# 適用する絶対上限として使う（`impact_service.IMPACT_MAX_DEPTH_ABS_MAX` と同じ理由）。
 TROUBLESHOOT_GRAPH_DEPTH_ABS_MAX = 16
 
 # タイムアウト由来のサーバエラーコードを緩く判定する（専用の例外クラスが無いため）。実例:
@@ -321,6 +320,17 @@ def run_troubleshoot(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, in
     return result
 
 
+class NeighborCardsFailure(list):
+    """`neighbor_cards` が内部で障害を捕捉したときだけ返す `list` のサブクラス（常に空）——戻り値の
+    型（`list`）自体は変えず、呼び出し元（`agentic_search.run_tool`）が `getattr(raw_cards,
+    "error_code", None)` で固定コードを拾えるようにする防御的な実装細部。通常の空リスト
+    （0件ヒット）とは `error_code` 属性の有無で区別できる。"""
+
+    def __init__(self, error_code: str):
+        super().__init__()
+        self.error_code = error_code
+
+
 def neighbor_cards(world, term, scope_paths=None) -> list:
     """関係グラフの**近傍カード**（原因候補）を返す。agentic ツール `graph_neighbors` 専用＝AI が
     「何を調べるか」を決めてグラフを引けるよう、`_troubleshoot_cards` を**自前で Neo4j セッションを
@@ -328,10 +338,17 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
     card をそのまま返す（agentic_search 側の構造 Evidence 生成が使う・公開経路には出さない）。
     Neo4j 不可・未解決はグレースフルに `[]`（agentic はツール結果が空でも他の道具で続行できる）。
 
-    **`GraphSchemaEraError` だけは再送出**する（`impact_service.presumed_impact` の
-    `GraphQueryOverloadError` 特別扱いと同じ流儀）——旧世代の実データを黙って空カードへ縮退させると
-    「見つからなかった」（本当に0件）と「読めない世代のグラフ」を区別できず、チャット側
-    （`chat_service._degrade_overload`）が honest failure を出す機会を失う。
+    捕捉した障害は握りつぶさず `NeighborCardsFailure`（`error_code` 属性を持つ空 `list`）で返す——
+    呼び出し元（`agentic_search.run_tool` の `graph_neighbors` 分岐）はこの属性を見て
+    `InvestigationState.backend_failures["graph"]`/`non_recoverable_failure` へ反映する
+    （`_record_tool_result_error_code` 参照）。接続系（`DriverError`/`TransientError`）は
+    `"graph_unavailable"`（回復可能）、それ以外（プログラムの欠陥・クエリのバグ等）は
+    `"graph_internal_error"`（回復不可）。型名はログに残す（例外の本文・メッセージは残さない）。
+
+    **`GraphSchemaEraError` だけは再送出**する——旧世代の実データを黙って空カードへ縮退させると
+    「見つからなかった」（本当に0件）と「読めない世代のグラフ」を区別できない。呼び出し元
+    （`agentic_search.run_tool` の `graph_neighbors` 分岐）がこの例外を機械可読コード
+    （`graph_reingest_required`）のツール結果へ変換し、調査は grep/原本直読で続く。
     """
     if not (term or "").strip():
         return []
@@ -349,8 +366,14 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
         return cards
     except GraphSchemaEraError:
         raise
-    except Exception:
-        return []
+    except Exception as exc:
+        from neo4j.exceptions import ConfigurationError, DriverError, TransientError
+        # `ConfigurationError` は階層上 `DriverError` のサブクラスだが意味的には非一時的な設定
+        # 不備＝回復不可（`agentic_search._is_recoverable_tool_exception` と同じ分類・別枠で除外）。
+        recoverable = not isinstance(exc, ConfigurationError) and isinstance(exc, (DriverError, TransientError))
+        _log.warning("lens_service: neighbor_cards 取得に失敗（回復%s）: %s errno=%s",
+                    "可" if recoverable else "不可", type(exc).__name__, getattr(exc, "errno", None))
+        return NeighborCardsFailure("graph_unavailable" if recoverable else "graph_internal_error")
     finally:
         if driver is not None:
             try:

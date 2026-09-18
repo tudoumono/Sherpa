@@ -865,6 +865,7 @@ def test_codex_authoring_config_writes_agents_sections_when_multi_agent(tmp_path
 
     worker_toml = worker_path.read_text()
     assert f'model = "{CS._CODEX_WORKER_MODEL_FALLBACK}"' in worker_toml
+    assert 'model_reasoning_effort = "medium"' in worker_toml   # low→medium（実装ベース探索の回復 S1）
     evaluator_toml = evaluator_path.read_text()
     assert 'model = "gpt-5.5"' in evaluator_toml   # 本体と同じモデル
     assert 'model_reasoning_effort = "low"' in evaluator_toml   # 呼び出し元の reason をそのまま使う
@@ -872,8 +873,31 @@ def test_codex_authoring_config_writes_agents_sections_when_multi_agent(tmp_path
     import tomllib
     parsed = tomllib.loads(cfg_on)
     assert parsed["agents"]["default_subagent_model"] == CS._CODEX_WORKER_MODEL_FALLBACK
+    assert parsed["agents"]["default_subagent_reasoning_effort"] == "medium"
     assert parsed["agents"]["worker"]["config_file"] == str(worker_path)
     assert parsed["agents"]["evaluator"]["config_file"] == str(evaluator_path)
+
+
+def test_codex_worker_model_configurable_via_system_settings(tmp_path):
+    """`system_settings["codex_worker_model"]` が設定されていれば `[agents.worker]`/
+    `default_subagent_model` がその値になり、未設定／空文字はフォールバックへ倒れる
+    （実装ベース探索の回復 S1・案 B）。"""
+    from sherpa import agents as A
+    from sherpa.providers.codex import sandbox as CS
+
+    assert CS._codex_worker_model(None) == CS._CODEX_WORKER_MODEL_FALLBACK
+    assert CS._codex_worker_model({}) == CS._CODEX_WORKER_MODEL_FALLBACK
+    assert CS._codex_worker_model({"codex_worker_model": "  "}) == CS._CODEX_WORKER_MODEL_FALLBACK
+    assert CS._codex_worker_model({"codex_worker_model": "gpt-5.9-custom"}) == "gpt-5.9-custom"
+
+    ch = tmp_path / "ch-custom-worker"
+    A._write_codex_authoring_config(ch, ["/kb"], "low", True, "test", None,
+                                    multi_agent=True,
+                                    system_settings={"codex_worker_model": "gpt-5.9-custom"})
+    cfg = (ch / "config.toml").read_text()
+    assert 'default_subagent_model = "gpt-5.9-custom"' in cfg
+    worker_toml = (ch / "agents" / "worker.toml").read_text()
+    assert 'model = "gpt-5.9-custom"' in worker_toml
 
 
 def test_codex_authoring_config_evaluator_falls_back_to_worker_model_without_orchestrator_model():
@@ -918,6 +942,112 @@ def test_write_agents_md_multi_agent_round_count_deep_and_max(tmp_path):
     codex_agents_md.write_agents_md(d, multi_agent=True, review_rounds=7)
     txt_max = (d / "AGENTS.md").read_text(encoding="utf-8")
     assert "見直しの回数は 7 回まで" in txt_max
+
+
+def test_write_agents_md_source_confirmation_required_at_every_depth(tmp_path):
+    """本体が自分でソースを確認する要件（実装ベース探索の回復 §0・S1・裁定④＝毎主張ごとに強制）
+    は深さ（review_rounds=0/2/7＝標準/深く/最大）に関わらず常時 AGENTS.md 本文に含まれる。
+    グラフ・ES 不調時の src/ 直読フォールバック、根拠種別による見直し基準も同様
+    （direct_read=True・既定の文言＝直接読む）。"""
+    from sherpa import codex_agents_md
+    for review_rounds in (0, 2, 7):
+        d = tmp_path / f"authoring-depth-{review_rounds}"
+        d.mkdir()
+        codex_agents_md.write_agents_md(d, multi_agent=True, review_rounds=review_rounds)
+        txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+        assert "自分（本体）が" in txt
+        assert "グラフ" in txt and "ripgrep" in txt and "直接読" in txt
+        assert "根拠の**件数**では判定しない" in txt
+        assert "設計書とソースが" in txt and "ソースを正とし" in txt
+        if review_rounds <= 0:
+            assert "実装に関する主張は必ず自分でソース" in txt
+
+
+def test_source_verification_paragraph_switches_wording_by_direct_read():
+    """本体自身のソース確認要件（RV是正: codex_agents_md.py 旧28,31行）は direct_read の真偽で
+    文言が切り替わる——偽（直読不可ターン）で「直接読む」と指示すると、同じターンの
+    `_prompt`/`_prompt_mcp`（provider.py:823「今回は原本の直接読み取りは使えない」）と矛盾するため、
+    MCP の読取ツールでの確認に言い換える。要件（本体自身の確認・グラフ不調でも止めない）は両分岐で
+    維持する。"""
+    from sherpa import codex_agents_md
+    direct = codex_agents_md._source_verification_paragraph(True)
+    mcp_only = codex_agents_md._source_verification_paragraph(False)
+    assert "直接開いて" in direct and "直接読んで確認する" in direct
+    assert "MCP の読取ツール" in mcp_only and "直接" not in mcp_only
+    # 要件そのものは両分岐にある。
+    for txt in (direct, mcp_only):
+        assert "実装に関する主張は、自分（本体）が" in txt
+        assert "worker" in txt and "ファイル:行" in txt
+        assert "グラフ検索・全文検索（ES）が空・不調・未構築のときは、それを理由に回答を止めない" in txt
+
+
+def test_write_agents_md_direct_read_false_avoids_direct_read_wording(tmp_path):
+    """`direct_read=False` で書いた AGENTS.md 全体（multi_agent 段落含む）に「直接読む」「直接開いて」
+    の指示が残らない（実行不能な手順を指示しない）。ソース確認・グラフ不調フォールバックの要件は
+    残る。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring-mcp-only"
+    d.mkdir()
+    codex_agents_md.write_agents_md(d, direct_read=False, multi_agent=True, review_rounds=2)
+    txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    # 「原本は直接読んでよい」（読取専用の一般許可・base AGENTS_MD 冒頭）は direct_read と無関係に
+    # 常時出るため対象外——ここで無いことを確認するのは、本体自身のソース確認要件（今回のRV是正
+    # 対象）が「直接読む」と指示する具体的な言い回しだけ。
+    assert "直接開いて" not in txt
+    assert "直接読んで確認する" not in txt
+    assert "直接読む" not in txt
+    assert "MCP の読取ツール" in txt
+    assert "spawn_agent(worker)" in txt   # multi_agent 段落自体は direct_read と独立に出る
+    # 調査スキル段落（原本を Python で開く前提）は direct_read=False では落ちる。
+    assert "investigate-*" not in txt
+
+
+def test_write_agents_md_direct_read_and_layer_combinations(tmp_path):
+    """RV是正: direct_read=False かつ layer="docs"（資料のみ）の組合せだけは、MCP の
+    ripgrep_search／read_around が層制限でソース（code 種別）を拒否する（agentic_search.py の
+    in_layer_code）ため「必ずソースを読む」を要求せず、確定不可の告知＋部分回答を指示する
+    （提案書 §3 S1・裁定⑥）。それ以外の3組合せは従来どおりソース確認を要求する。全組合せで
+    常時要件（グラフ不調でも止めない・見直しは根拠種別で判定）は残る。"""
+    from sherpa import codex_agents_md
+    combos = [
+        (True, None), (True, "docs"), (True, "code"),
+        (False, None), (False, "code"), (False, "both"),
+    ]
+    for direct_read, layer in combos:
+        d = tmp_path / f"authoring-{direct_read}-{layer}"
+        d.mkdir()
+        codex_agents_md.write_agents_md(d, direct_read=direct_read, multi_agent=True,
+                                        review_rounds=2, layer=layer)
+        txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+        assert "ソースを確認していないため確定できません" not in txt
+        # グラフ不調でも止めない・見直しは件数でなく根拠種別、は常時要件（base AGENTS_MD）。
+        assert "根拠の**件数**では判定しない" in txt
+        assert "グラフ検索・全文検索（ES）が空・不調・未構築のときは、それを理由に回答を止めない" in txt
+
+    # 唯一の特例: 直読不可 かつ 資料のみ。
+    d2 = tmp_path / "authoring-docs-only-mcp"
+    d2.mkdir()
+    codex_agents_md.write_agents_md(d2, direct_read=False, multi_agent=True,
+                                    review_rounds=2, layer="docs")
+    txt2 = (d2 / "AGENTS.md").read_text(encoding="utf-8")
+    assert "ソースを確認していないため確定できません" in txt2
+    assert "今回の探す対象は資料のみ" in txt2
+    assert "部分回答" in txt2
+    # ソースを読めという指示自体は出ない。
+    assert "実装に関する主張は、自分（本体）が" not in txt2
+    assert "根拠の**件数**では判定しない" in txt2   # 常時要件は特例でも残る
+
+    # RV是正: 標準深さ（review_rounds=0）でも、上の特例（docs_only）段落の rounds_note に
+    # 「必ず自分でソースを確認」が復活しない（同一段落で「ソース裏取りはしない」と矛盾するため）。
+    d3 = tmp_path / "authoring-docs-only-mcp-standard"
+    d3.mkdir()
+    codex_agents_md.write_agents_md(d3, direct_read=False, multi_agent=True,
+                                    review_rounds=0, layer="docs")
+    txt3 = (d3 / "AGENTS.md").read_text(encoding="utf-8")
+    assert "ソースを確認していないため確定できません" in txt3
+    assert "0 回＝evaluator は使わない" in txt3
+    assert "必ず自分でソースを確認" not in txt3
+    assert "実装に関する主張は、自分（本体）が" not in txt3
 
 
 def test_codex_run_argv_includes_multi_agent_flag_for_openai_codex(tmp_path, monkeypatch):
@@ -2576,9 +2706,9 @@ def test_read_mcp_sidecar_invalid_utf8_bytes_is_fail_open(tmp_path):
     path = tmp_path / ".mcp_sidecar.jsonl"
     path.write_bytes(b"\xff\n")
 
-    reads, listed, ask = P._read_mcp_sidecar(path)
+    reads, listed, ask, error_codes = P._read_mcp_sidecar(path)
 
-    assert reads == [] and listed == [] and ask is None
+    assert reads == [] and listed == [] and ask is None and error_codes == []
 
 
 # ===== DEPTH-2 S6（§2.6・受け入れ条件(4)(5)）: 巡（1 codex exec 内の内部段階）をまたいだ

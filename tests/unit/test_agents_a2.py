@@ -110,17 +110,13 @@ def test_graph_schema_era_detection_wired_before_neighbors_extraction():
     assert i_check < i_neighbors, "era 検知が近傍抽出より後に配線されている"
 
 
-def test_graph_schema_era_error_raised_after_swallowing_try_blocks():
-    """RV是正（rv-periphery #11）: 検知した `_graph_schema_era_error` は、mcp_tool_call を処理する
-    `for line in proc.stdout:` を包む2重の `except Exception:`（技術的失敗を `_stream_error` へ
-    丸める・_attempt 自身とこの呼び出し元）を両方抜けた後で re-raise する——そのブロック内で
-    直接 raise すると握り潰されてしまうため。"""
+def test_graph_schema_era_does_not_terminate_run_and_marks_degraded():
+    """S4（縮退の可視化と計数）: 検知した世代不一致で run を終端しない——`raise
+    _graph_schema_era_error` と、検知後にアイテム処理を打ち切る `break` は撤去し、Codex は同じ
+    MCP の grep/原本読取ツールで調査を続ける。縮退は env の印（`graph_degraded`）として残り、
+    `chat_service._finalize` が冒頭告知と統計へ変換する。"""
     src = _src()
+    assert "raise _graph_schema_era_error" not in src, "世代不一致で run を終端してはいけない"
     i_flag_set = src.index("_graph_schema_era_error = _era_err")
-    i_raise = src.index("raise _graph_schema_era_error")
-    assert i_raise > i_flag_set
-    # ask_user の question 優先分岐（`if codex_question is not None:`）と同様、finally の後・
-    # 通常の後処理（成果物台帳登録等）より前で判定する——この文言はループ内（ask_user 捕捉時）
-    # にも1回出るため、最後（final check）の出現位置で比較する。
-    i_question_check = src.rindex("if codex_question is not None:")
-    assert i_raise < i_question_check
+    i_env = src.index('env["graph_degraded"]')
+    assert i_flag_set < i_env, "検知した事実が env の縮退の印へ渡っていない"

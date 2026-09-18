@@ -939,8 +939,11 @@ function answerHTML(answer, trace, feedback) {
   // impact はグラフ由来（items/presumed）と反復ツール検索由来（citations）の2形がある。
   // グラフ結果が無い回答は QA と同じ引用表示へ落とす（本文だけで根拠が見えない状態を作らない）。
   const impactHasGraph = !!(answer.data && ((answer.data.items || []).length || (answer.data.presumed || []).length));
+  // troubleshoot も同型: グラフ不調で原因候補（candidates）が無い回答は qa 形の下地
+  // （citations）で返るため、QA と同じ引用表示へ落とす（該当箇所を消さない）。
+  const troubleHasCandidates = !!(answer.data && (answer.data.candidates || []).length);
   const body = (answer.lens === 'impact' && impactHasGraph) ? renderImpact(answer)
-    : answer.lens === 'troubleshoot' ? renderTrouble(answer) : renderQa(answer);
+    : (answer.lens === 'troubleshoot' && troubleHasCandidates) ? renderTrouble(answer) : renderQa(answer);
   // 検証バッジ（verification_method 別）は trace_version=2 の回答に限定する
   // （v1・version 欠落の回答は従来どおり EV-0 の根拠/参考2区分のみ＝byte-identical を保つ）。
   const evidencePacketForBadges = answer.trace_version === 2 ? (answer.data && answer.data.evidence_packet) : null;

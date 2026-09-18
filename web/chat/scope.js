@@ -86,7 +86,7 @@ export function applyConversationScope(messages) {   // 会話を開いた時、
   S.tools = (sameDir && sc && sc.tools) ? { ...sc.tools } : { grep: true, fulltext: true, graph: true };
   // 復元値が全ON（既定）なら未操作、1軸でもOFFなら明示状態にする
   // （`inquiry.js::toolsExplicitForRestore` 参照・無操作の次送信で非既定値が消えないように）。
-  S.toolsExplicit = toolsExplicitForRestore(S.tools);
+  S.toolsExplicit = toolsExplicitForRestore(S.tools, (sameDir && sc) ? sc.tools_explicit : undefined);
   setToolsDetailsOpen(false);
   if (S.scopeTree) renderScopePanel(S.scopeTree);
   updateScopeHeader(sc);   // setScopeLabel 経由で refreshInquirySummary() も呼ぶ（チップ/要約を追随）

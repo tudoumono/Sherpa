@@ -108,6 +108,19 @@ def _node(id, kind, label, detail, status):
     return {"type": "node", "id": id, "kind": kind, "label": label, "detail": detail, "status": status}
 
 
+def _backend_fallback_message(state) -> str:
+    """単発フォールバック縮退（self_worker・回復可能な障害のみ）の通知文言。`state.backend_failures`
+    が示す原因が一意なら接続系／読取系のニュアンスで分け、複数原因が混在または未記録（防御的な
+    既定）なら原因非依存の固定文言にする（本文・資料名は含めない・専門用語ゼロ）。"""
+    failures = getattr(state, "backend_failures", None) or {}
+    hit = [k for k, v in failures.items() if v]
+    if hit == ["read_io"]:
+        return "資料の読み取りが不安定なため、グラフを使わずゼロから調べ直します"
+    if set(hit) <= {"fulltext", "graph"} and hit:
+        return "検索の接続が不安定なため、グラフを使わずゼロから調べ直します"
+    return "うまく調べられなかったため、グラフを使わずゼロから調べ直します"
+
+
 def _prune_empty_limits(env: dict) -> None:
     """`env["limits"]`（利用統計「打ち切りの内訳」計測用カウンタ）が全項目既定（0/False）のままなら
     キー自体を落とす——`env["limits"]` はハイブリッド経路では `InvestigationState.limits` への
@@ -247,6 +260,20 @@ def _ingest_sub_final_into_state(state, ev: dict) -> None:
         elif isinstance(_v, int):
             if _v:
                 state.bump_limit(_k, _v)
+    # 障害種別（sub ループのローカル `InvestigationState.backend_failures`/
+    # `non_recoverable_failure`）も limits と同じ理由でここでしか親 `state` へ引き継げない
+    # （`run()` の except が単発フォールバックへの縮退可否を判定する材料）。
+    for _k, _v in (ev.get("backend_failures") or {}).items():
+        if _v:
+            state.mark_backend_failure(_k)
+    if ev.get("non_recoverable_failure"):
+        state.mark_non_recoverable_failure()
+    # 世代不一致は sub ループの limits（`graph_reingest_required`）としてだけ渡ってくる——
+    # 上の OR 合流で親の limits には既に載っているが、通知文言の判定は状態フラグを見るため
+    # ここで同じ状態へ揃える。
+    from .. import investigation_state as _inv_state
+    if state.limits.get(_inv_state.GRAPH_REINGEST_LIMIT_FIELD):
+        state.mark_graph_schema_era_mismatch()
     # DEPTH-2 S4b（§2.2）: worker（下調べ役）の一次判断——`agentic_search.openai_style` が自分の
     # ローカル `InvestigationState` 基準で組んだ主張（`claims_raw`）と、その根拠一覧
     # （`claims_evidence`・内部専用チャンネル・上の `add_tool_result` が同じ根拠を親
@@ -1098,10 +1125,24 @@ class Provider:
     # 非ハイブリッドの `_agentic_loop` が実際に渡した上限（OpenAI/Ollama が設定・Gemini/Bedrock は
     # 上限を渡さないため None＝usage には depth_profile だけを載せ、使っていない上限を記録しない）。
     _last_main_depth_usage = None
+    # 自動引き上げ後の実効的な深さ（`depth_profile.escalated_profile` の戻り値・`None`＝引き上げ
+    # なし）。必要な根拠種別が揃わないと判断したターンで `_agentic_run` が1回だけ設定し、以降の
+    # 再調査（`_sub_loop`）が1段上の探索量で走る。利用者が選んだ深さ（`scope_meta`）自体は
+    # 書き換えない。`_sub` と同じ理由でクラス属性にする（ターン開始時に必ず None へ戻す）。
+    _depth_escalation = None
     system_prompt = ""    # ユーザ設定の回答方針（#2）。LLM 系は system メッセージとして前置する。
 
     def run(self, ctx: Ctx) -> Iterator[dict]:
         raise NotImplementedError
+
+    def _effective_depth_profile(self, ctx) -> str | None:
+        """このターンで実際に使う深さ＝自動引き上げ後の値（引き上げていなければ利用者の選択）。
+
+        探索量（反復上限・ヒット上限・読取窓）を決める再調査の呼び出しはこの1箇所を通す——
+        `scope_meta["depth_profile"]`（利用者の選択・保存済み会話・usage 記録の正本）は
+        引き上げでも書き換えない。
+        """
+        return self._depth_escalation or (ctx.scope_meta or {}).get("depth_profile")
 
     def _plain_stream(self, message: str) -> Iterator[str]:
         return iter(())                                         # 既定: ストリームしない（_plain_text を使う）
@@ -1288,10 +1329,13 @@ def _limits_delta(before: dict, after: dict) -> dict:
 
 _VERDICTS = ("sufficient", "insufficient", "undecidable")
 
-# 不足軸の閉じた分類（集計用・本文を持たない）。`investigation_state._CLAIM_UNKNOWN_REASON_CODES`
-# と同じ語彙——usage.py と同様、leaf モジュール原則のためここで複製する（値は同期させる）。
+# 不足軸の閉じた分類（集計用・本文を持たない）。前半は主張の不明理由
+# （`investigation_state._CLAIM_UNKNOWN_REASON_CODES`）と同じ語彙（値は同期させる）、後半は
+# 必要な根拠**種別**の不足（`investigation_state.EVIDENCE_KINDS` に 1 対 1 対応・
+# `missing_code_for_kind` が唯一の変換）。語彙外の値・自由文はここで落ちる。
 _MISSING_CODES = frozenset({
-    "not_found_in_scope", "unexplored", "insufficient", "conflict", "budget", "unreadable"})
+    "not_found_in_scope", "unexplored", "insufficient", "conflict", "budget", "unreadable",
+    "source_missing", "spec_missing", "definition_missing", "log_missing", "callgraph_missing"})
 
 
 def _normalized_verdict(v: dict) -> dict | None:
@@ -1317,6 +1361,214 @@ def _normalized_verdict(v: dict) -> dict | None:
     return {"verdict": verdict, "sufficient": verdict == "sufficient",
             "missing": str(v.get("missing") or ""), "missing_codes": missing_codes,
             "findings": v.get("findings")}
+
+
+# 必要な根拠の種別が揃わなかったターンの告知（平文・専門用語ゼロ）。回答冒頭に前置し、清書
+# プロンプトにも同じ趣旨を渡して断定表現を抑える。
+_EVIDENCE_UNVERIFIED_NOTICE = "この回答は資料やソースの一部を確認できていません。"
+
+# 深さの自動引き上げの理由コード。閉集合＝現在はこの1値だけ（増やすときはここへ足す・
+# 本文は残さない）。`chat-round` の meta へ `depth_escalation` として載せる——引き上げた事実
+# 自体は `limits` の `depth_escalated`（bool）が運び、利用統計の「打ち切りの内訳」に乗る。
+_DEPTH_ESCALATION_EVIDENCE_KINDS = "evidence_type_insufficient"
+
+# 自動引き上げが起きたターンの告知（平文・専門用語ゼロ）。回答冒頭に前置する——どの種別が
+# 欠けていたか等の判断根拠は残さない（理由コードは統計側にだけ残る）。
+_DEPTH_ESCALATED_NOTICE = "必要な裏づけが足りなかったため、もう少し詳しく調べました。"
+
+
+def _eff_tools_pref_wanted(ctx, key: str) -> bool:
+    """利用者がこの検索経路を OFF にしていないか（会話の検索経路トグル・省略は全 ON）。
+
+    「実接続で不達」と「利用者が自分で OFF にした」を区別するための判定——後者は障害ではない
+    ので縮退の計数（`InvestigationState.backend_failures`）に載せない。
+    """
+    from .. import tools_pref as tools_pref_mod
+    return bool(tools_pref_mod.normalize_tools_pref((ctx.scope_meta or {}).get("tools")).get(key))
+
+
+def _graph_degraded_notice(state, entry_degraded: bool = False, limits: dict | None = None,
+                          record_only: bool = False) -> str:
+    """グラフの縮退に対する通知文言を1つ返す（縮退していなければ空文字）。文言は
+    `agentic_search.GRAPH_DEGRADED_NOTICES`（API・Codex・非agentic 共通）が唯一の真実源。
+
+    世代不一致（`graph_schema_era_mismatch`）＞接続できなかった（`backend_failures["graph"]`）＞
+    入口で使えなかった（`entry_degraded`）の順に見る——複数当てはまるターンでも通知は1つに絞る。
+    `limits`（省略可）: `state` を持たない経路（非ハイブリッドの final スナップショット）用の
+    同じ事実の写し（`investigation_state` が limits へ載せた縮退フラグ）。
+    `record_only`（省略可）: このターンの障害記録が**統計のためだけ**のもので、回答の作り方は
+    変わっていない（グラフを必要としないレンズで、ツール自体を一度も提示していない）ことを表す
+    ——利用者にとっては何も起きていないターンなので通知しない。
+    """
+    from .. import agentic_search  # 遅延 import（本モジュールの import 規律・冒頭 docstring 参照）
+    from .. import investigation_state as _inv_state
+    lim = limits or {}
+    if (state is not None and getattr(state, "graph_schema_era_mismatch", False)
+            or lim.get(_inv_state.GRAPH_REINGEST_LIMIT_FIELD)):
+        return agentic_search.graph_degraded_notice(agentic_search.GRAPH_REINGEST_ERROR_CODE)
+    if (not record_only
+            and (state is not None and (state.backend_failures or {}).get("graph")
+                 or lim.get("backend_unavailable_graph"))):
+        # 接続できなかった（入口の不達・実行中の接続断のどちらも同じ事実）。
+        return agentic_search.graph_degraded_notice("graph_unavailable")
+    # 残るのは利用者が自分で OFF にした場合（障害ではない＝統計にも残らない）。
+    return agentic_search.graph_degraded_notice("blocked") if entry_degraded else ""
+
+
+def _turn_evidence_kinds(state, personal_facts: str = "") -> set:
+    """このターンで実際に確認できた根拠種別。
+
+    `personal_facts`（利用者が会話に貼った・アップロードした資料）は共有 KB の台帳にも
+    `state.evidence` にも載らない（個人ファイルは grep のみ・RAG の引用元に出さない契約）——
+    ターン単位で手元にある事実として「ログ・設定」の充足に数える唯一の経路。
+    """
+    from .. import investigation_state as _inv
+    kinds = _inv.evidence_kinds_of(state.evidence) if state is not None else set()
+    if personal_facts:
+        kinds.add("log_config")
+    return kinds
+
+
+def _claim_kind_gap(claim, evidence, required_kinds, seen_kinds) -> list:
+    """主張1件が欠いている必須種別。`_KINDS_OUTSIDE_LEDGER` の種別は主張の `evidence_refs` から
+    原理的に引けないため、ターン単位の充足（`seen_kinds`）をそのまま主張側にも認める。"""
+    from .. import investigation_state as _inv
+    got = _inv.claim_evidence_kinds(claim, evidence)
+    return [k for k in required_kinds
+            if k not in got and not (k in _KINDS_OUTSIDE_LEDGER and k in seen_kinds)]
+
+
+def _demote_claim_for_missing_kinds(claim, lacking) -> None:
+    """必須種別を欠く確定を推定へ落とす（理由は平文・区分の語彙は変えない）。最終ゲートと
+    未完了回答（停止・失敗）の両方がこの1実装だけを使う。"""
+    from .. import investigation_state as _inv
+    claim.status = "inferred"
+    claim.reason = (f"{_inv.evidence_kind_labels(lacking)}を確認できていないため確定できません")
+    claim.reason_code = ""
+
+
+def _require_source_read(required_kinds, unreachable_kinds) -> bool:
+    """本体（orchestrator）自身のソース確認を判定の成立条件にするか。
+
+    層でソースが読めないターン（`unreachable_kinds` に `"source"`）では強制しない——読めない
+    ものを成立条件にすると判定が永久に成立せず、常に fail-open へ倒れてしまう（その場合は
+    最終ゲート側が「ソース未確認のため確定不可」として格上げを止める・裁定⑥）。
+    """
+    return "source" in set(required_kinds) and "source" not in set(unreachable_kinds)
+
+
+def _evidence_gate_note(missing_kinds, unavailable_kinds) -> str:
+    """清書へ渡す「根拠の不足」注記（本文・資料名は含めない・種別の平文ラベルだけ）。
+
+    `missing_kinds`: 必要なのに今回の調査で確認できなかった種別。
+    `unavailable_kinds`: 今回の範囲・探す対象にそもそも存在しない種別（「該当なし」＝不足では
+    ないが、回答で明示する＝§0(b)）。
+    """
+    from .. import investigation_state as _inv
+    parts = []
+    if missing_kinds:
+        parts.append(f"{_inv.evidence_kind_labels(missing_kinds)}を確認できていないため、"
+                     "この点は確定できません。")
+    if unavailable_kinds:
+        parts.append(f"{_inv.evidence_kind_labels(unavailable_kinds)}は今回の範囲にありません"
+                     "（該当なし）。")
+    return "".join(parts)
+
+
+# 範囲内の根拠種別の判定（`_scope_evidence_kinds`）に許す台帳走査の上限秒。ターンごとに必ず1回
+# 走るため、全木走査＋直近 run の DB 参照が長引いてもターン全体を巻き込まないよう、list_docs
+# ツールと同じ `deadline` 契約で打ち切る（超過＝判定不能＝必須種別をそのまま適用する安全側）。
+_SCOPE_KINDS_WALK_SECONDS = float(os.environ.get("SHERPA_SCOPE_KINDS_WALK_SECONDS", "5"))
+
+# 台帳の列挙**だけでは**充足を判定しきれない種別。`log_config`（ログ・設定）は共有 KB の
+# ファイル（`.log`/`.yaml` 等）としても、利用者が会話に貼った・アップロードした資料としても
+# 持ち込まれる——後者は台帳にも `state.evidence` にも載らないため、主張単位のゲート
+# （`_claim_kind_gap`）と層の判定（`_unreachable_kinds`）ではターン単位の充足
+# （`_turn_evidence_kinds`）を認める。範囲の実在判定（`_unavailable_kinds`）からは除外しない
+# ——除外すると、ログも設定も貼り付けも無い world で永久に不足になる。
+_KINDS_OUTSIDE_LEDGER = frozenset({"log_config"})
+
+# 範囲判定（`_scope_evidence_kinds`）のプロセス内キャッシュ。大規模 world では全木走査が重く、
+# 同じ利用者が同じ範囲で続けて質問する間ずっと同じ結果になる——短時間だけ再利用する（鏡は即反映
+# だが、ここで見るのは「その種別のファイルが1つでもあるか」だけなので、この程度の遅れは許容する）。
+# 判定不能（`None`）は保持しない＝次のターンで必ず再試行する。
+_SCOPE_KINDS_CACHE_SECONDS = 60.0
+# 保持する組（world・範囲・層）の上限。範囲は利用者が自由に選べる＝キーの種類は無限に増えうる
+# ため、期限切れを捨てても足りないときは書き込み自体を諦める（キャッシュは最適化であって
+# 正しさには関与しない＝取りこぼしても走査し直すだけ）。
+_SCOPE_KINDS_CACHE_MAX = 64
+_scope_kinds_cache: dict = {}
+_scope_kinds_cache_lock = threading.Lock()
+
+
+def _scope_kinds_cache_key(world: str, scope_paths, layer) -> tuple:
+    return (world, tuple(sorted(scope_paths or ())), layer_mod.normalize_layer(layer))
+
+
+def _scope_evidence_kinds(world: str, scope_paths, layer, *,
+                          deadline: float | None = None) -> tuple[set, set] | None:
+    """このターンの範囲（フォルダ）に**実在する**根拠種別と、そのうち探す対象（層）で実際に
+    読める種別の2つ組 `(範囲内, 層内)`。
+
+    2つを分けるのは裁定⑥のため——「登録範囲にその種別が無い（該当なし＝不足に数えない）」と
+    「範囲にはあるが層で除外されている（＝ソース未確認のため確定不可）」は別の状態で、層を掛けた
+    1つの集合では区別できない。列挙は `list_docs` と同じ台帳の live 走査
+    （`doc_ledger.documents_for`）＋同じ範囲・層フィルタ（`scope.in_scope`／`layer.in_layer_code`）。
+
+    走査に失敗・期限超過したら `None`——呼び出し元は「判定できない」として必須種別を落とさない
+    （該当なしへ倒すと、台帳が読めないだけで不足判定が消える安全でない側になる）。
+
+    結果は `(world, 範囲, 層)` 単位で `_SCOPE_KINDS_CACHE_SECONDS` 秒だけプロセス内に保持する
+    （`None` は保持しない＝判定不能は毎ターン再試行する）。
+    """
+    from .. import doc_ledger, investigation_state as _inv, scope as scope_mod
+    _key = _scope_kinds_cache_key(world, scope_paths, layer)
+    _now = time.monotonic()
+    with _scope_kinds_cache_lock:
+        _hit = _scope_kinds_cache.get(_key)
+        if _hit is not None and _hit[0] <= _now:
+            _scope_kinds_cache.pop(_key, None)   # 期限切れは持ち続けない
+            _hit = None
+    if _hit is not None:
+        return _hit[1]
+    if deadline is None:
+        deadline = time.monotonic() + _SCOPE_KINDS_WALK_SECONDS
+    try:
+        rows = doc_ledger.documents_for(world, deadline=deadline)
+    except Exception:
+        _log.warning("範囲内の根拠種別を判定できませんでした（必須種別はそのまま適用します）",
+                     exc_info=True)
+        return None
+    if not rows:
+        # 0 件は「本当に範囲に何も無い」とも「root を解決できなかった・マウントが切れて
+        # `safe_files` が OSError を握った」とも読める——必須種別を全部「該当なし」へ倒さない。
+        _log.warning("範囲内の文書を1件も列挙できませんでした（必須種別はそのまま適用します）")
+        return None
+    in_scope, in_layer = set(), set()
+    for r in rows:
+        name = r.get("name")
+        if not name or not scope_mod.in_scope(name, scope_paths):
+            continue
+        k = _inv.evidence_kind_of_doc(name)
+        if not k:
+            continue
+        in_scope.add(k)
+        if layer_mod.in_layer_code(r.get("branch") == "source", layer):
+            in_layer.add(k)
+    for acc in (in_scope, in_layer):
+        if "source" in acc:
+            # 呼出関係はグラフが無くてもソースへの呼出し検索（ripgrep）で代替できる＝ソースが
+            # あるなら「該当なし」にはしない（§0(b)・(c)）。
+            acc.add("callgraph")
+    with _scope_kinds_cache_lock:
+        if len(_scope_kinds_cache) >= _SCOPE_KINDS_CACHE_MAX:
+            _now = time.monotonic()
+            for _k in [k for k, v in _scope_kinds_cache.items() if v[0] <= _now]:
+                _scope_kinds_cache.pop(_k, None)
+        if len(_scope_kinds_cache) < _SCOPE_KINDS_CACHE_MAX:
+            _scope_kinds_cache[_key] = (time.monotonic() + _SCOPE_KINDS_CACHE_SECONDS,
+                                        (in_scope, in_layer))
+    return in_scope, in_layer
 
 
 def _role_bucket() -> dict:
@@ -1573,7 +1825,10 @@ class _GenProvider(Provider):
                              review_structural_meta: list | None = None,
                              round_no: int = 0,
                              total_rounds: int = 1,
-                             role_all_orchestrator: bool = False) -> tuple[dict | None, list, dict | None]:
+                             role_all_orchestrator: bool = False,
+                             required_kinds: tuple = (),
+                             unavailable_kinds: tuple = (),
+                             unreachable_kinds: tuple = ()) -> tuple[dict | None, list, dict | None]:
         """EXT-2b/EXT-2c（評価フェーズ再起・メイン査読＋限定ツール精読）: 清書前にメイン LLM が
         根拠の十分性を判定する。判定前に、引用箇所（doc_id・行）の前後原文を自分で確かめたければ
         `read_around`／文書一覧を確かめたければ `list_docs`（どちらも `agentic_search.run_tool` を
@@ -1615,6 +1870,16 @@ class _GenProvider(Provider):
         確認1回）では evaluator の巡という語彙自体が成立しないため、内訳を orchestrator に
         集約する（正本の `chat-review` 合算は変わらない・表示用の役割別内訳だけの区別）。
 
+        `required_kinds`／`unavailable_kinds`／`unreachable_kinds`（省略可・既定空＝従来どおり
+        件数基準の文言）: 判定の基準になる必須の根拠種別／登録範囲に存在しない（＝「該当なし」で
+        不足に数えない）種別／範囲にはあるが今回の探す対象（層）では読めない種別。
+        `required_kinds` に `"source"` が含まれ、かつ層で読めない種別でないときは、
+        本体（orchestrator）自身がソース種別の
+        ファイル本文を**正常に読めた**ことを判定の成立条件にする——読取結果がエラーを含まず、
+        対象 doc_id の種別がソースで、本文が非空のときだけ成立とみなし、成立しないまま判定 JSON が
+        返ったら `None`（fail-open＝査読なしとして清書へ進む）を返す。一覧取得だけ・設計書だけの
+        読取・エラー・空振り（範囲外の行指定）はいずれも不成立（§0(b)・裁定④）。
+
         `review_structural_meta`（省略可・既定 None）: 非 None（呼び出し元が渡す
         可変リスト）のとき、`list_docs` で得た構造的根拠（呼び出し単位の集計・`state` へ渡すのと
         同じ形）を**追記**する（返り値の3-tuple 契約は変えない・既存の直接呼び出しテストは
@@ -1634,8 +1899,13 @@ class _GenProvider(Provider):
                          if state is not None and state.claims else ""),
             findings_text=(investigation_state.render_findings(state.findings)
                            if state is not None and state.findings else ""),
-            round_no=max(round_no, 1), total_rounds=max(total_rounds, 1))
+            round_no=max(round_no, 1), total_rounds=max(total_rounds, 1),
+            required_kinds=tuple(required_kinds), unavailable_kinds=tuple(unavailable_kinds),
+            unreachable_kinds=tuple(unreachable_kinds),
+            require_source_read=_require_source_read(required_kinds, unreachable_kinds))
         nodes: list = []
+        require_source_read = _require_source_read(required_kinds, unreachable_kinds)
+        source_read_ok = False
         node_id = f"main-review-r{round_no}" if round_no else "main-review"
         reads_done = 0
         forced = False
@@ -1697,9 +1967,13 @@ class _GenProvider(Provider):
             _verdict = _normalized_verdict(v)
             if _verdict is not None:
                 _role_add(_judge_b, u)
+                if require_source_read and not source_read_ok:
+                    # 本体自身がソース本文を読んでいない判定は成立させない（裁定④・例外なし）。
+                    _log.warning("ソース本文を確認しないまま判定が返りました（見直しを省略します）")
+                    return None, nodes, _folded()
                 return _verdict, nodes, _folded()
             action = v.get("action")
-            if action not in ("read_around", "list_docs"):
+            if action not in ("read_around", "read_doc", "list_docs"):
                 _role_add(_judge_b, u)
                 return None, nodes, _folded()   # 未知の形→fail-open
             if forced:
@@ -1719,6 +1993,14 @@ class _GenProvider(Provider):
                             exc_info=True)
                 return None, nodes, _folded()
             reads_done += 1
+            # 「本体自身のソース確認」の成立条件（裁定④）: 本文の読取で、(a) エラーを含まず
+            # (b) 対象 doc_id の種別がソースで (c) 本文が非空。一覧取得・設計書の読取・
+            # エラー・範囲外の行指定による空振りはいずれも不成立のまま。
+            if (action in ("read_around", "read_doc") and isinstance(result, dict)
+                    and "error" not in result
+                    and investigation_state.evidence_kind_of_doc(result.get("doc_id")) == "source"
+                    and str(result.get("text") or "").strip()):
+                source_read_ok = True
             # 査読自身が読んだ結果も下調べ役と同じ調査状態へ足す（`read_around` は
             # `add_tool_result` が kind="read" Evidence として自動処理する・`list_docs` は
             # `openai_style` と同じ「呼び出し単位で集計した1 Evidence」を組んでから渡す）。
@@ -1864,7 +2146,7 @@ class _GenProvider(Provider):
         通常の `_agentic_loop` と同じ「system_settings→guard/env 既定」の優先順にする）。非 None
         のとき（`_run_sub_plan` が横断予算の残量へ min クリップして渡す値）はそちらを優先し
         system_settings は見ない。この解決後の `max_turns`（override か基準値解決後の値か問わず）
-        は調べる深さに依らず一定（DEPTH-2 S7 以降、倍率は撤去済み）。`max_hits`/`window_cap` も
+        へさらに深さの倍率をかける——standard は倍率×1 のため無変化。`max_hits`/`window_cap` も
         同じ実効基準値で計算し `openai_style` へ渡す（`_sub` 用の既存 guard には無い概念のため、
         通常の `_agentic_loop` と同じ env/system_settings 既定値を使う）。
 
@@ -1951,17 +2233,21 @@ class _GenProvider(Provider):
         max_turns = max_turns_override if max_turns_override is not None else \
             depth_profile_mod.effective_base(self._system_settings, "max_turns", sub["guard"]["max_turns"])
         # 調べる深さ（調べ方ブロック §3.2・SC-6c）: 検索アシスタント（_sub）有効時は通常の
-        # _agentic_loop を経由しないため、`scaled_turns`/`scaled_ratio` を通す（DEPTH-2 S7 以降は
-        # 倍率無しの恒等関数・abs_max のクランプだけが効く）。hits/window は _sub 用の既存 guard
-        # 概念が無いため、OpenAIProvider/OllamaProvider._agentic_loop と同じ実効基準値
-        # （system_settings→env→コード既定）を使う。
-        profile = (ctx.scope_meta or {}).get("depth_profile")
+        # _agentic_loop を経由しないため、ここで倍率を適用しないと deep/max を選んでも探索部分が
+        # standard のまま欠落する。standard は倍率×1＝上の max_turns と同値。hits/window は _sub 用の
+        # 既存 guard 概念が無いため、OpenAIProvider/OllamaProvider._agentic_loop と同じ実効基準値
+        # （system_settings→env→コード既定）を使う。自動引き上げ後の再調査はここで1段上の深さに
+        # なる（`_effective_depth_profile`）。
+        profile = self._effective_depth_profile(ctx)
         max_turns = depth_profile_mod.scaled_turns(max_turns, profile)
         # STAT-3 S1: この呼び出しが実際にツールループへ渡す実効上限を、呼び出し元（`_agentic_run`/
         # `_agentic_run_plan` の env["usage"] 組立）が読めるようクラス属性へ残す（複数ステップの
         # `_run_sub_plan` では最後に呼ばれた `_sub_loop` の値になる＝1本の usage dict に1値の制約）。
+        # `depth_profile` は**利用者が選んだ深さ**を載せる——自動引き上げ後の値を載せると、標準を
+        # 選んだターンが利用統計の深さ別集計で「深く」に混ざる（引き上げは上限・告知・
+        # `limits.depth_escalated` の側で表す）。上限値だけは実際に渡した実効値を残す。
         self._last_sub_depth_usage = depth_profile_mod.usage_extras(
-            profile, max_turns=max_turns,
+            (ctx.scope_meta or {}).get("depth_profile"), max_turns=max_turns,
             max_tools_per_turn=agentic_search.effective_max_tools_per_turn(self._system_settings or {}))
         max_hits = depth_profile_mod.scaled_ratio(
             depth_profile_mod.effective_base(self._system_settings, "grep_max_hits", agentic_search.MAX_HITS),
@@ -2572,8 +2858,35 @@ class _GenProvider(Provider):
         # でもグラフ不達/OFF のまま `_agentic_loop`/`_sub_agentic_loop` へ直行しており、非agentic
         # 経路だけが `tools_blocked_env` の明示エラーを返す非対称があった（後段の下調べ役
         # 呼び出し・S4-c のプラン選択より前に確認する＝どの分岐へもツールループを一切回さない）。
-        _, _tools_blocked = agentic_search.dispatch_tools_for_lens(
+        _eff_tools, _tools_blocked = agentic_search.dispatch_tools_for_lens(
             lens, (ctx.scope_meta or {}).get("tools"), availability=ctx.tools_availability)
+        # グラフ必須レンズ（impact/troubleshoot）でグラフだけが不達／未構築なら、明示エラーで
+        # 終わらせず grep・原本直読で調査を続ける（§0(c)「グラフ不調は回答不能の理由にしない」）。
+        # 資料を探す手段が1つも残っていない場合だけ従来どおり明示エラーにする。
+        _graph_entry_degraded = False
+        if _tools_blocked and lens in agentic_search._DISPATCH_REQUIRES_GRAPH and (
+                _eff_tools.get("grep") or _eff_tools.get("fulltext")):
+            _graph_entry_degraded = True
+            _tools_blocked = False
+        # 入口で縮退した原因が**実接続の不達**（未構築・接続断）なら統計に残す——このターンは
+        # グラフツール自体がツール集合から外れるため、実行中に記録される機会が無い。利用者が
+        # 自分で OFF にした場合は障害ではないので計数しない（通知だけ出す）。
+        # 不達（未構築・接続断）だけを統計に残す——このターンはツール自体がツール集合から外れる
+        # ため、実行中に記録される機会が無い。利用者が自分で OFF にした場合は障害ではないので
+        # 計数しない（通知だけ出す）。グラフ・全文検索とも同じ規則（レンズにも依らない——qa
+        # 中心の運用でグラフ停止が永久に 0 にならないようにする）。
+        # ハイブリッド（self_worker）経路は `_sub_loop` が `toolset` を明示指定するため
+        # `agentic_search` 側のツール集合構築（`_es_unreachable_at_start` 等）を通らない＝ここが
+        # 唯一の記録点になる。
+        _graph_unreachable_at_entry = ((ctx.tools_availability or {}).get("graph") is False
+                                      and _eff_tools_pref_wanted(ctx, "graph"))
+        _fulltext_unreachable_at_entry = (
+            (ctx.tools_availability or {}).get("fulltext") is False
+            and _eff_tools_pref_wanted(ctx, "fulltext"))
+        # グラフを必要としないレンズ（qa/author）で不達を記録しただけのターンは、回答の作り方が
+        # 何も変わっていない（そもそもグラフツールを提示していない＝実行中に呼ばれることもない）
+        # ——統計にだけ残し、利用者への通知は出さない。
+        _graph_record_only = _graph_unreachable_at_entry and not _graph_entry_degraded
         if _tools_blocked:
             env = agentic_search.tools_blocked_env(lens)
             env.pop("_tools_blocked", None)   # ここでは _gather のような trace ノード調整をしないため不要
@@ -2647,6 +2960,17 @@ class _GenProvider(Provider):
         from .. import depth_profile as _depth_mod
         _review_rounds = _depth_mod.review_rounds_for(
             (ctx.scope_meta or {}).get("depth_profile"), self._system_settings)
+        # 深さの自動引き上げ（§0(b)）: 必要な根拠種別が揃わないと判断したターンだけ、共通上限の
+        # 残り（`max(0, min(1, 上限 − 実行済み巡数))`）がある分だけ巡を足し、その追加の調査を
+        # 1段上の深さ相当の探索量で走らせる。1ターンに1回まで・利用者が「最大」を選んでいれば
+        # 発生しない。
+        self._depth_escalation = None
+        _max_review_rounds = _depth_mod.effective_max_review_rounds(self._system_settings)
+        _rounds_total = _review_rounds     # 実際に回す巡数（引き上げで1つだけ増えうる）
+        _depth_escalated = False           # 巡を足す引き上げが起きたか（告知・統計に残す）
+        _need_rerun = False                # 次の巡の先頭で worker を再調査させるか
+        _rerun_missing = ""                # その再調査へ渡す不足の軸（自由文・本文は持たない）
+        _rerun_i = 0
         # EXT-2b: メイン査読の再調査で `_sub_agentic_loop` が複数回走るため、実行ごとの
         # `self._sub_usage_acc`（呼ぶたびに新品へ置換される）をここへ合算して finally で1回記録する。
         _sub_acc_total = {"calls": 0, "tokens": None, "unknown": False}
@@ -2658,6 +2982,37 @@ class _GenProvider(Provider):
         # 呼び出しごとに追記し、rerun ループを抜けた後に一括で合流させる（既存の
         # `_dedupe_structural_evidence` が下調べ役由来のものと重複排除する）。
         _review_structural_meta: list = []
+        # 必須種別の格下げを最終ゲートで適用済みか。未完了回答（停止・失敗）はゲートを通らない
+        # ことがあるため `_reviewed_claims` が自分で適用するが、ゲート通過後は `evidence_refs` が
+        # Evidence Packet 側の採番へ書き換わっていて種別を引けない＝二重適用すると全部が推定へ
+        # 落ちてしまう。適用済みならそのまま使う。
+        _kind_gate_applied = False
+        # §0(b): 判定の基準になる必須の根拠種別（レンズ別）を、3つの状態へ切り分ける（裁定⑥）:
+        # - `_unavailable_kinds`: 登録範囲にそもそも無い＝「該当なし」＝不足に数えない。
+        # - `_unreachable_kinds`: 範囲にはあるが今回の探す対象（層）では読めない＝不足には
+        #   倒さないが確定もさせない（部分回答＋「確認できていないため確定不可」の明示）。
+        # - 残り＝このターンで実際に確認すべき種別。
+        # 範囲の列挙に失敗したら（None）必須種別をそのまま適用する（該当なしへ倒さない安全側）。
+        # 走査（台帳の live 列挙）は worker が付く経路でしか結果を使わない——§2.1 の対象外の
+        # 頭脳（Gemini/Bedrock＝`self._sub is None`）では巡・主張構造・最終ゲートのどれも通らない
+        # ため、毎ターンの全木走査を発生させない。
+        _required_kinds_all = investigation_state.required_evidence_kinds(lens)
+        _scope_kinds = (_scope_evidence_kinds(
+            ctx.world, (ctx.scope_meta or {}).get("scope_paths"),
+            layer_mod.effective_layer(ctx.scope_meta, lens))
+            if self._sub is not None else None)
+        # 「該当なし」＝台帳走査が成立し、範囲にその種別のファイルが1件も無いこと。
+        # `_KINDS_OUTSIDE_LEDGER` の種別は、利用者が会話に貼った資料でも持ち込まれうるため、
+        # その持ち込みも無いときだけ該当なしにする。
+        _unavailable_kinds = tuple(
+            k for k in _required_kinds_all
+            if _scope_kinds is not None and k not in _scope_kinds[0]
+            and not (k in _KINDS_OUTSIDE_LEDGER and ctx.personal_facts))
+        _required_kinds = tuple(k for k in _required_kinds_all if k not in _unavailable_kinds)
+        _unreachable_kinds = tuple(
+            k for k in _required_kinds
+            if _scope_kinds is not None and k not in _KINDS_OUTSIDE_LEDGER
+            and k in _scope_kinds[0] and k not in _scope_kinds[1])
         _first_rerun_cite_start = None   # EXT-2b: 最初の再調査開始時点の citation 件数（清書ビュー用）
         # C3（調査結果集約と並列実行の改善方針・§「メインへの入力を最新の調査状態から作る」）:
         # ハイブリッドの1質問1調査状態。下調べ役の各実行（初回＋再調査）が確定した結果・査読自身の
@@ -2668,7 +3023,21 @@ class _GenProvider(Provider):
                 if self._sub is not None else None)
         # 失敗経路（run() の except が組む honest failure の env）へも当たった制限を渡すための控え
         # （同じ dict への参照＝以降の加算が自動で見える）。
+        if _graph_unreachable_at_entry and state is not None:
+            state.mark_backend_failure("graph")   # limits の `backend_unavailable_graph` も同時に立つ
+        if _fulltext_unreachable_at_entry and state is not None:
+            # 同じ事実を sub loop 側が重ねて記録しても、`mark_backend_failure` は同じ bool を
+            # 立て直すだけ＝二重計数にはならない（`limits` は当たったか系の bool）。
+            state.mark_backend_failure("fulltext")
         self._last_run_limits = state.limits if state is not None else None
+        # 失敗経路（`run()` の except）が障害種別（`backend_failures`/`non_recoverable_failure`）
+        # を読めるよう state 自体への参照を残す（`state` はこのメソッドのローカル変数のため、
+        # 例外で抜けた後も呼び出し元から参照できるのはこの属性経由だけ）。
+        self._last_investigation_state = state
+        # 失敗経路（`run()` の except）が「予算到達で終端したか」を読めるよう控える——`budget_exhausted`
+        # ローカル変数（下方）は `self._sub is None` 限定の判定式で self_worker では常に False になる
+        # ため、単発フォールバックへの縮退可否判定はこの実際の stop_reason を別途参照する。
+        self._last_stop_reason = None
         # DEPTH-2 S5（§2.7 高-4）: 個人由来／書込の有無は**全巡で累積**して全終端（通常・確認
         # カード・停止・失敗）へ渡す——最終巡だけから算出すると、前巡で個人 workspace へ書いた
         # 事実が共有で落ちる。API/Ollama の出力ファイルツール（S2）の `created_files` も
@@ -2733,14 +3102,82 @@ class _GenProvider(Provider):
                       "limits": _limits_delta(_round_limits_before,
                                               state.limits if state is not None else {}),
                       "claims": _claims_breakdown(state.claims if state is not None else []),
+                      # 深さの自動引き上げが起きた巡だけ、理由コード（閉集合・本文なし）を
+                      # 載せる。引き上げた事実自体は `limits` の `depth_escalated` が運ぶ。
+                      **({"depth_escalation": _DEPTH_ESCALATION_EVIDENCE_KINDS}
+                         if _depth_escalated else {}),
                       "roles": roles})
+
+        def _missing_required_kinds() -> tuple:
+            """この時点で必要なのに確認できていない根拠種別（最終ゲートと同じ判定・§0(b)）。"""
+            if state is None:
+                return ()
+            _seen = _turn_evidence_kinds(state, ctx.personal_facts)
+            return tuple(k for k in _required_kinds if k not in _seen)
+
+        def _escalate_depth(done_rounds: int) -> bool:
+            """必要な根拠種別が揃わないターンの深さ自動引き上げ（§0(b)）。戻り値＝巡を1つ足したか。
+
+            呼び出し側は「evaluator が不足と判定した回」でだけ呼ぶ（判定不能・判定不成立は不足に
+            丸めない）。ここでは残りの条件——必要な根拠種別が実際に欠けているか・上限に余地が
+            あるか——を判定する。
+            追加する巡は `max(0, min(1, 共通上限 − 実行済み巡数))`——足せる巡があるときだけ、
+            以降の再調査の探索量を1段上の深さ相当（`depth_profile.escalated_profile`）へ上げる。
+            共通上限に余地が無ければ何も起こさない（巡も告知も理由コードも増やさない）——探索量
+            だけ上げても、追加の調査が走らない以上どこにも効かないため。1ターンに1回だけ
+            （利用者が既に「最大」を選んでいれば上限に達しているため発生しない）。
+            """
+            nonlocal _rounds_total, _depth_escalated
+            if state is None or self._depth_escalation is not None:
+                return False
+            if not _missing_required_kinds():
+                return False
+            _next = _depth_mod.escalated_profile((ctx.scope_meta or {}).get("depth_profile"))
+            if _next is None:
+                return False
+            if max(0, min(1, _max_review_rounds - done_rounds)) < 1:
+                return False     # 追加できる巡が無い＝引き上げ自体を起こさない（静かに諦める）
+            self._depth_escalation = _next
+            _rounds_total += 1
+            _depth_escalated = True
+            return True
+
+        def _escalation_missing(verdict) -> str:
+            """引き上げ後の再調査へ渡す不足の軸。判定が軸を言えていればそれを、言えていなければ
+            欠けている根拠種別の平文ラベルを使う（資料名・本文は渡さない）。"""
+            _raw = str((verdict or {}).get("missing") or "").strip()
+            if _raw:
+                return (_raw if len(_raw) <= _RERUN_MISSING_MAX_CHARS
+                        else _raw[:_RERUN_MISSING_MAX_CHARS] + "（以下省略）")
+            _lack = _missing_required_kinds()
+            return (f"{investigation_state.evidence_kind_labels(_lack)}を確認できていません"
+                    if _lack else "")
 
         def _reviewed_claims() -> list:
             """未完了回答（停止・失敗）へ渡してよい主張＝査読の判定を実際に通した回の
             `state.claims` だけ。未査読（`_review_ran` 偽）のときは空——worker が返した一次判断や、
             再調査で同じ ID を確定として返し直した主張を、確認を経ないまま確定として公開しない。
-            反証済みの主張は `adoptable_claims` が区分（unknown）で落とす。"""
-            return list(state.claims) if (state is not None and _review_ran) else []
+            反証済みの主張は `adoptable_claims` が区分（unknown）で落とす。
+
+            未完了回答は通常終端の最終ゲートを通らないため、必須種別を欠く確定の格下げはここでも
+            同じ関数で行う（`state.claims` 自体は書き換えず、格下げ済みのコピーを返す）。
+            """
+            if state is None or not _review_ran:
+                return []
+            if _kind_gate_applied:
+                return list(state.claims)
+            from dataclasses import replace as _dc_replace
+            _seen = _turn_evidence_kinds(state, ctx.personal_facts)
+            out = []
+            for c in state.claims:
+                _lack = _claim_kind_gap(c, state.evidence, _required_kinds, _seen)
+                # 根拠参照を持たない確定は `adoptable_claims` が別の規律で落とす——推定へ格下げ
+                # すると採用可になってしまうため、ここでは触らない。
+                if c.status == "confirmed" and _lack and c.evidence_refs:
+                    c = _dc_replace(c)
+                    _demote_claim_for_missing_kinds(c, _lack)
+                out.append(c)
+            return out
 
         def _stopped_result(round_no: int, reason: str, *, usage: dict | None = None,
                             limits_extra: dict | None = None) -> dict:
@@ -2779,10 +3216,10 @@ class _GenProvider(Provider):
             根拠ゲート（通常終端の `evidence_meets_gate` と同じ規律）も適用する——この調査で
             根拠を1件も確定していなければ、主張の見かけに関わらず空文字を返す。
 
-            標準（`_review_rounds == 0`）は巡ループを回さないため「N巡目で打ち切り」という
-            見出しの語彙自体が成立しない——orchestrator の確認1回が通っていても空文字を返し、
-            呼び出し元の固定文言に委ねる（巡ループ経由の失敗終端だけがこの本文を使う）。"""
-            if _review_rounds == 0:
+            巡ループを回していないターン（標準で引き上げも起きなかった＝`_rounds_total == 0`）は
+            「N巡目で打ち切り」という見出しの語彙自体が成立しない——orchestrator の確認1回が
+            通っていても空文字を返し、呼び出し元の固定文言に委ねる。"""
+            if _rounds_total == 0:
                 return ""
             if state is None or not state.evidence:
                 return ""
@@ -2881,22 +3318,192 @@ class _GenProvider(Provider):
                         evaluation = {"status": ev.get("evaluation_status"),
                                       "reason": ev.get("evaluation_reason"),
                                       "next_action": ev.get("evaluation_next_action")}
-            # ハイブリッドのみ、清書前に巡ループ（§2.4 の形 B）を回す。1巡＝「worker が根拠と
-            # 一次判断を更新 → orchestrator が必要箇所を確認 → evaluator が判定（十分／不足／
-            # 判定不能）と主張 ID 単位の指摘を返す → 次巡の指示（解決済みの指摘は落とす）」で、
-            # 清書は最後に 1 回だけ。巡数は深さ（`_review_rounds`・標準 0／深く 2／最大＝設定）。
-            # 止める条件は6つ（巡数到達／十分／判定不能／予算到達／利用者の停止／確認カード）——
-            # ループはこのいずれかで必ず抜ける。この位置（metering の finally 内側）で回すことで、
-            # 各巡のサブ消費も同じ finally が一括記録する。
+            # ハイブリッドのみ、清書前に「確認 1 回（標準）」と巡ループ（§2.4 の形 B）を回す。
+            # 1巡＝「worker が根拠と一次判断を更新 → orchestrator が必要箇所を確認 → evaluator が
+            # 判定（十分／不足／判定不能）と主張 ID 単位の指摘を返す → 次巡の指示（解決済みの
+            # 指摘は落とす）」で、清書は最後に 1 回だけ。巡数は深さ（`_review_rounds`・標準 0／
+            # 深く 2／最大＝設定）に、自動引き上げの追加分（最大 1・共通上限内）を足した
+            # `_rounds_total`。止める条件は6つ（巡数到達／十分／判定不能／予算到達／利用者の停止／
+            # 確認カード）——ループはこのいずれかで必ず抜ける。この位置（metering の finally
+            # 内側）で回すことで、各巡のサブ消費も同じ finally が一括記録する。
             _old_cites = None   # 直前 rerun 前の citation 件数（`_first_rerun_cite_start`／清書ビュー用）
-            # 標準（`_review_rounds == 0`）は巡ループへは入らず、代わりに下の `elif`（確認 1 回）
-            # で `_review_ran` を決める。再調査で worker の一次判断が更新されたら、次の査読が
-            # その更新分を実際に判定するまで偽へ戻す（下のループ内参照）。
-            if (state is not None and _review_rounds > 0 and searched
+            # 標準（`_review_rounds == 0`）は巡ループへ直接は入らず、先に確認 1 回だけを行って
+            # `_review_ran` を決める（必要な根拠種別が揃わなければ引き上げで 1 巡だけ入る）。
+            # 再調査で worker の一次判断が更新されたら、次の査読がその更新分を実際に判定するまで
+            # 偽へ戻す（下のループ内参照）。
+            if (state is not None and _review_rounds == 0 and state.claims and searched
                     and not (ctx.stop_event is not None and ctx.stop_event.is_set())
                     and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
-                for _rerun_i in range(_review_rounds):
+                # 標準（`_review_rounds == 0`）でも orchestrator の確認を 1 回だけ行う（§2.2）:
+                # worker の一次判断を鵜呑みにせず、`_sufficiency_verdict` の read_around/list_docs
+                # の確認枠で必要な箇所だけ自分で確かめてから判定する。evaluator の巡は回さない
+                # ＝不足と判定しても再調査には入らず、そのまま清書へ進む。確認を通した一次判断
+                # （`_review_ran` が真の回）だけが清書ダイジェスト・`data["claims"]` へ渡る——
+                # 確認が成立しなかった（verdict=None＝fail-open）回・指摘を読み取れなかった回は
+                # 偽のままで、巡ループと同じ規律で公開しない。反証された主張は
+                # `apply_findings` が同じ規律で採用不可（不明・conflict）へ落とす。
+                # 巡別記録（`chat-round`）は巡番号 0 で 1 行だけ残す（1 利用者ターンにつき保存は
+                # 1 回・§2.8 の「標準 0 巡の消費も計上先を明記する」）。
+                _confirm_t0 = time.monotonic()
+                verdict, _review_nodes, _review_usage = self._sufficiency_verdict(
+                    orig_message, lens,
+                    state.render(max_bytes=agentic_search._SYNTHESIS_MAX_BYTES // 2), ctx.world,
+                    scope_paths=(search_ctx.scope_meta or {}).get("scope_paths"),
+                    layer=(search_ctx.scope_meta or {}).get("layer"),
+                    stop_event=ctx.stop_event, state=state,
+                    review_structural_meta=_review_structural_meta,
+                    round_no=0, total_rounds=1, role_all_orchestrator=True,
+                    required_kinds=_required_kinds, unavailable_kinds=_unavailable_kinds,
+                    unreachable_kinds=_unreachable_kinds)
+                if verdict is not None:
+                    if state.apply_findings(verdict.get("findings"), 0, verdict=verdict["verdict"]):
+                        _review_ran = True
+                    else:
+                        _log.warning("確認の指摘を読み取れませんでした（標準・未確認として扱います）")
+                if isinstance(_review_usage, dict) and _review_usage.get("calls"):
+                    _review_usage["elapsed_ms"] = round((time.monotonic() - _confirm_t0) * 1000)
+                _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
+                _stopped_mid_confirm = ctx.stop_event is not None and ctx.stop_event.is_set()
+                # 判定は得られても指摘を取り込めず `_review_ran` が偽のまま残った回は、巡ループと
+                # 同じ規律で `review_failed` として記録する——一次判断を公開しない回に
+                # 「sufficient」等の誤った停止理由を残さない。
+                _round_stop = ("user_stop" if _stopped_mid_confirm
+                               else "review_failed" if verdict is None or not _review_ran
+                               else "sufficient" if verdict["sufficient"]
+                               else "undecidable" if verdict["verdict"] == "undecidable"
+                               else "rounds_exhausted")
+                # 確認1回が「不足」と判定し、かつ必要な根拠種別が揃っていなければ、そのターンの
+                # 中で1巡だけ追加する——深く相当の探索量で worker を再実行してから評価する。
+                # 判定不能・fail-open（verdict=None）は不足に丸めないので対象外。巡が実際に増える
+                # 回は「打ち切り」ではなく次へ続く回＝既存語彙の `rerun` で記録する（記録より前に
+                # 判定するのはこのため）。
+                if (not _stopped_mid_confirm
+                        and (verdict or {}).get("verdict") == "insufficient"
+                        and _escalate_depth(0)):
+                    _rerun_missing = _escalation_missing(verdict)
+                    _need_rerun = True
+                    _round_stop = "rerun"
+                _record_round(0, (verdict or {}).get("verdict"), "", _round_stop, _review_usage,
+                              (verdict or {}).get("missing_codes"))
+                if not _stopped_mid_confirm:
+                    yield from _review_nodes
+            if (state is not None and _rounds_total > 0 and searched
+                    and not (ctx.stop_event is not None and ctx.stop_event.is_set())
+                    and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
+                # 1巡＝「（初回以外は）worker が再調査で根拠と一次判断を更新 → orchestrator が
+                # 必要箇所を確認 → evaluator が判定」。`_rounds_total` は自動引き上げで
+                # 1つだけ増えうるため、固定回数の for ではなく while で回す。
+                while _rerun_i < _rounds_total:
                     _round_no = _rerun_i + 1
+                    if _need_rerun:
+                        from dataclasses import replace as _dc_replace
+                        # 次巡の指示は「不足の軸＋未解決の指摘」だけから組み直す（解決済み・撤回は
+                        # 落とす・過去巡の全文は積まない・§2.4）。
+                        rerun_ctx = _dc_replace(search_ctx, message=(
+                            f"{search_ctx.message}\n\n"
+                            + rerun_instruction(_rerun_missing,
+                                                investigation_state.render_findings(state.findings))))
+                        # `_sub_agentic_loop` は呼ぶたびに `self._sub_usage_acc` を新品へ置換する——
+                        # ここまでの消費を先に合算へ退避しないと、下の finally が最後の実行分しか
+                        # 記録せず初回下調べの chat-sub 消費が metering から消える。
+                        _sub_acc_total = _fold_sub_usage(_sub_acc_total, self._sub_usage_acc)
+                        _old_cites = len(cites)
+                        if _first_rerun_cite_start is None:
+                            _first_rerun_cite_start = _old_cites
+                        # `request_claims` は既定 True のまま渡す——予算内で次の査読判定まで到達すれば
+                        # この再調査分の一次判断もそこで改めて判定される。ただしこの再調査自体が調査
+                        # 予算で打ち切られた場合（下の budget_exhausted 分岐）は査読ループへ戻らず
+                        # `_review_ran` は偽のまま残る（未査読のまま公開しない契約は下の state.claims
+                        # 消費箇所が守る）。
+                        # C18 是正: 再調査の worker が id を毎回 "c1" から採番し直すと、置換処理
+                        # （`_ingest_sub_final_into_state`）が別論点の既存主張まで消しうる——直前までに
+                        # 確定した worker 由来の主張（id・status・本文のみ）を渡し、同じ論点は既存 id を
+                        # 使い回す／別論点は未使用の id を付ける契約をプロンプト側に持たせる。
+                        _existing_worker_claims = [investigation_state.claim_to_dict(c)
+                                                   for c in state.claims if c.origin == "worker"]
+                        # この巡の計測基準点をここで取り直す（`limits`/citation は巡内の増分で記録する）。
+                        _round_t0 = time.monotonic()
+                        _round_limits_before = dict(state.limits)
+                        _round_cites_before = len(cites)
+                        if _depth_escalated:
+                            # 引き上げで足した巡の増分として計測に残す（基準点の後に立てる＝
+                            # `_limits_delta` の偽→真がこの巡に載る。2度目以降は増分にならない）。
+                            state.mark_limit("depth_escalated")
+                        # 巡ごとに `agent_run_id` を分ける——同じ id のままだと再読込後の思考ノードが
+                        # 上書きで1巡分に潰れ、どの巡の調査かが分からなくなる。
+                        if hybrid_agent_run_id is not None:
+                            hybrid_agent_run_id = f"sub:{self._sub['profile_id']}:{_round_no}"
+                        for ev in self._sub_agentic_loop(rerun_ctx,
+                                                         existing_claims=_existing_worker_claims):
+                            if "node" in ev:
+                                node = dict(ev["node"])
+                                if hybrid_agent_run_id is not None:
+                                    node["agent_run_id"] = hybrid_agent_run_id
+                                    node["metrics"] = {**(node.get("metrics") or {}), **hybrid_metrics}
+                                yield node
+                            elif "question" in ev:
+                                # 確認カード（`ask_user`）はどの巡で出ても外側の巡ループごと終了し、
+                                # 確認を一度だけ保存する（§2.4・`TERMINALS` の "question"）。
+                                _round_stop = "ask_user"
+                                _record_round(_round_no, None, "", "ask_user")
+                                _note_created_files(_created_files_ev + list(ev.get("created_files") or []))
+                                _q = dict(ev["question"])
+                                if self._last_created_files:
+                                    _q["created_files"] = list(self._last_created_files)
+                                _apply_personal_flag(_q, _personal_acc)
+                                yield _q
+                                return
+                            elif "final" not in ev and "created_files" in ev:
+                                # 書込成功時点（"final" を待たず）の控え更新——初回ループと同じ契約。
+                                # イベントはこの巡の累計を運ぶため、過去巡の分（`_created_files_ev`）を
+                                # 前置して足す（巡ごとに調査状態が別なので巡を跨いだ累積はここで行う）。
+                                _note_created_files(_created_files_ev + list(ev["created_files"] or []))
+                            elif "final" in ev:
+                                answer = ev["final"] or answer
+                                docs |= ev["docs"]
+                                cites = cites + (ev.get("cites") or [])
+                                cards = cards + (ev.get("cards") or [])
+                                _u = ev.get("usage")
+                                if _u:
+                                    agentic_usage = ({k: ((agentic_usage.get(k) or 0) + v
+                                                          if isinstance(v, (int, float)) else v)
+                                                      for k, v in _u.items()}
+                                                     | {k: v for k, v in (agentic_usage or {}).items()
+                                                        if k not in _u}) if agentic_usage else _u
+                                verified |= ev.get("verified_docs") or set()
+                                used_evidence_docs |= ev.get("used_evidence_docs") or set()
+                                attributed_ev_ids |= ev.get("attributed_ev_ids") or set()
+                                evidence_meta = evidence_meta + (ev.get("evidence_meta") or [])
+                                dropped_citations = dropped_citations + (ev.get("dropped_citations") or [])
+                                stop_reason = ev.get("stop_reason") or stop_reason
+                                has_structural_evidence = (has_structural_evidence
+                                                           or ev.get("has_structural_evidence", False))
+                                structural_evidence_meta = (structural_evidence_meta
+                                                            + (ev.get("structural_evidence_meta") or []))
+                                # 巡ごとに調査状態が別＝この巡の final は当巡分しか運ばない。過去巡の
+                                # 分を失わないよう置換ではなく累積し、全終端が読む控えへ反映する。
+                                _created_files_ev = _created_files_ev + (ev.get("created_files") or [])
+                                _note_created_files(_created_files_ev)
+                                _ingest_sub_final_into_state(state, ev)
+                                # この再調査分の取り込みで `state.claims`（worker の一次判断）が
+                                # 更新されうる——直前の査読判定は更新前の内容にしか及んでいないため、
+                                # 「査読済み」を取り消す。ループが次の判定（上のループ先頭）へ戻れば
+                                # 改めて真になる。budget_exhausted で判定を経ずにループを抜けた場合は
+                                # 偽のまま残り、下の消費箇所が未査読の一次判断を公開しない。
+                                _review_ran = False
+                                # rerun に evaluation が無いのに初回の古い evaluation（blocked 等）を
+                                # 残すと、最新 stop_reason と旧 status が同じ Packet に混在する——
+                                # rerun final ごとに無条件で置換する（無ければ None）。
+                                evaluation = ({"status": ev.get("evaluation_status"),
+                                               "reason": ev.get("evaluation_reason"),
+                                               "next_action": ev.get("evaluation_next_action")}
+                                              if ev.get("evaluation_status") is not None else None)
+                        # 再調査自体が調査予算で打ち切られたら次の巡へは進まない（入口条件の budget
+                        # 除外と対称にする・§2.4 の止める条件「予算到達」）——集まった分で清書へ進む。
+                        if stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS:
+                            _round_stop = "budget"
+                            _record_round(_round_no, None, "", "budget")
+                            break
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
                         _record_round(_round_no, None, "", "user_stop")
                         yield _stopped_result(_round_no, "user_stop")
@@ -2917,7 +3524,9 @@ class _GenProvider(Provider):
                         layer=(search_ctx.scope_meta or {}).get("layer"),
                         stop_event=ctx.stop_event, state=state,
                         review_structural_meta=_review_structural_meta,
-                        round_no=_round_no, total_rounds=_review_rounds)
+                        round_no=_round_no, total_rounds=_rounds_total,
+                        required_kinds=_required_kinds, unavailable_kinds=_unavailable_kinds,
+                        unreachable_kinds=_unreachable_kinds)
                     if verdict is not None:
                         # 指摘（主張 ID 単位）を取り込む——反証された主張はこの巡の中で採用不可
                         # （不明・理由コード conflict）へ落ち、清書にも未完了回答にも出ない。
@@ -2960,7 +3569,11 @@ class _GenProvider(Provider):
                     _missing_raw = verdict["missing"].strip()
                     missing = (_missing_raw if len(_missing_raw) <= _RERUN_MISSING_MAX_CHARS
                               else _missing_raw[:_RERUN_MISSING_MAX_CHARS] + "（以下省略）")
-                    if _rerun_i >= _review_rounds - 1 or not missing:
+                    # 最終巡で不足のまま終わるなら、上限内で1段だけ深くして1巡だけ追加する
+                    # （1ターンに1回まで・共通上限に余地が無ければ何も起こさない）。
+                    if _rerun_i >= _rounds_total - 1 and missing:
+                        _escalate_depth(_round_no)
+                    if _rerun_i >= _rounds_total - 1 or not missing:
                         # 再調査してもなお不足（または不足軸を特定できない）——DEPTH-2 S1（§2.5）:
                         # 薄い根拠のまま自信ありげに清書しないのは従来どおりだが、全回答を固定文言に
                         # 置き換える前に、確定/推定/不明で構造化した主張（1回の呼び出しで完結・
@@ -2995,152 +3608,11 @@ class _GenProvider(Provider):
                         _round_stop = "user_stop"
                         yield _stopped_result(_round_no, "user_stop")
                         return
-                    from dataclasses import replace as _dc_replace
-                    # 次巡の指示は「不足の軸＋未解決の指摘」だけから組み直す（解決済み・撤回は
-                    # 落とす・過去巡の全文は積まない・§2.4）。
-                    rerun_ctx = _dc_replace(search_ctx, message=(
-                        f"{search_ctx.message}\n\n"
-                        + rerun_instruction(missing, investigation_state.render_findings(state.findings))))
-                    # `_sub_agentic_loop` は呼ぶたびに `self._sub_usage_acc` を新品へ置換する——
-                    # ここまでの消費を先に合算へ退避しないと、下の finally が最後の実行分しか
-                    # 記録せず初回下調べの chat-sub 消費が metering から消える。
-                    _sub_acc_total = _fold_sub_usage(_sub_acc_total, self._sub_usage_acc)
-                    _old_cites = len(cites)
-                    if _first_rerun_cite_start is None:
-                        _first_rerun_cite_start = _old_cites
-                    # `request_claims` は既定 True のまま渡す——予算内で次の査読判定まで到達すれば
-                    # この再調査分の一次判断もそこで改めて判定される。ただしこの再調査自体が調査
-                    # 予算で打ち切られた場合（下の budget_exhausted 分岐）は査読ループへ戻らず
-                    # `_review_ran` は偽のまま残る（未査読のまま公開しない契約は下の state.claims
-                    # 消費箇所が守る）。
-                    # C18 是正: 再調査の worker が id を毎回 "c1" から採番し直すと、置換処理
-                    # （`_ingest_sub_final_into_state`）が別論点の既存主張まで消しうる——直前までに
-                    # 確定した worker 由来の主張（id・status・本文のみ）を渡し、同じ論点は既存 id を
-                    # 使い回す／別論点は未使用の id を付ける契約をプロンプト側に持たせる。
-                    _existing_worker_claims = [investigation_state.claim_to_dict(c)
-                                               for c in state.claims if c.origin == "worker"]
-                    # 次巡の計測基準点をここで取り直す（`limits`/citation は巡内の増分で記録する）。
-                    _round_no = _rerun_i + 2
-                    _round_t0 = time.monotonic()
-                    _round_limits_before = dict(state.limits)
-                    _round_cites_before = len(cites)
-                    # 巡ごとに `agent_run_id` を分ける——同じ id のままだと再読込後の思考ノードが
-                    # 上書きで1巡分に潰れ、どの巡の調査かが分からなくなる。
-                    if hybrid_agent_run_id is not None:
-                        hybrid_agent_run_id = f"sub:{self._sub['profile_id']}:{_round_no}"
-                    for ev in self._sub_agentic_loop(rerun_ctx,
-                                                     existing_claims=_existing_worker_claims):
-                        if "node" in ev:
-                            node = dict(ev["node"])
-                            if hybrid_agent_run_id is not None:
-                                node["agent_run_id"] = hybrid_agent_run_id
-                                node["metrics"] = {**(node.get("metrics") or {}), **hybrid_metrics}
-                            yield node
-                        elif "question" in ev:
-                            # 確認カード（`ask_user`）はどの巡で出ても外側の巡ループごと終了し、
-                            # 確認を一度だけ保存する（§2.4・`TERMINALS` の "question"）。
-                            _round_stop = "ask_user"
-                            _record_round(_round_no, None, "", "ask_user")
-                            _note_created_files(_created_files_ev + list(ev.get("created_files") or []))
-                            _q = dict(ev["question"])
-                            if self._last_created_files:
-                                _q["created_files"] = list(self._last_created_files)
-                            _apply_personal_flag(_q, _personal_acc)
-                            yield _q
-                            return
-                        elif "final" not in ev and "created_files" in ev:
-                            # 書込成功時点（"final" を待たず）の控え更新——初回ループと同じ契約。
-                            # イベントはこの巡の累計を運ぶため、過去巡の分（`_created_files_ev`）を
-                            # 前置して足す（巡ごとに調査状態が別なので巡を跨いだ累積はここで行う）。
-                            _note_created_files(_created_files_ev + list(ev["created_files"] or []))
-                        elif "final" in ev:
-                            answer = ev["final"] or answer
-                            docs |= ev["docs"]
-                            cites = cites + (ev.get("cites") or [])
-                            cards = cards + (ev.get("cards") or [])
-                            _u = ev.get("usage")
-                            if _u:
-                                agentic_usage = ({k: ((agentic_usage.get(k) or 0) + v
-                                                      if isinstance(v, (int, float)) else v)
-                                                  for k, v in _u.items()}
-                                                 | {k: v for k, v in (agentic_usage or {}).items()
-                                                    if k not in _u}) if agentic_usage else _u
-                            verified |= ev.get("verified_docs") or set()
-                            used_evidence_docs |= ev.get("used_evidence_docs") or set()
-                            attributed_ev_ids |= ev.get("attributed_ev_ids") or set()
-                            evidence_meta = evidence_meta + (ev.get("evidence_meta") or [])
-                            dropped_citations = dropped_citations + (ev.get("dropped_citations") or [])
-                            stop_reason = ev.get("stop_reason") or stop_reason
-                            has_structural_evidence = (has_structural_evidence
-                                                       or ev.get("has_structural_evidence", False))
-                            structural_evidence_meta = (structural_evidence_meta
-                                                        + (ev.get("structural_evidence_meta") or []))
-                            # 巡ごとに調査状態が別＝この巡の final は当巡分しか運ばない。過去巡の
-                            # 分を失わないよう置換ではなく累積し、全終端が読む控えへ反映する。
-                            _created_files_ev = _created_files_ev + (ev.get("created_files") or [])
-                            _note_created_files(_created_files_ev)
-                            _ingest_sub_final_into_state(state, ev)
-                            # この再調査分の取り込みで `state.claims`（worker の一次判断）が
-                            # 更新されうる——直前の査読判定は更新前の内容にしか及んでいないため、
-                            # 「査読済み」を取り消す。ループが次の判定（上のループ先頭）へ戻れば
-                            # 改めて真になる。budget_exhausted で判定を経ずにループを抜けた場合は
-                            # 偽のまま残り、下の消費箇所が未査読の一次判断を公開しない。
-                            _review_ran = False
-                            # rerun に evaluation が無いのに初回の古い evaluation（blocked 等）を
-                            # 残すと、最新 stop_reason と旧 status が同じ Packet に混在する——
-                            # rerun final ごとに無条件で置換する（無ければ None）。
-                            evaluation = ({"status": ev.get("evaluation_status"),
-                                           "reason": ev.get("evaluation_reason"),
-                                           "next_action": ev.get("evaluation_next_action")}
-                                          if ev.get("evaluation_status") is not None else None)
-                    # 再調査自体が調査予算で打ち切られたら次の巡へは進まない（入口条件の budget
-                    # 除外と対称にする・§2.4 の止める条件「予算到達」）——集まった分で清書へ進む。
-                    if stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS:
-                        _round_stop = "budget"
-                        _record_round(_round_no, None, "", "budget")
-                        break
-            elif (state is not None and _review_rounds == 0 and state.claims and searched
-                    and not (ctx.stop_event is not None and ctx.stop_event.is_set())
-                    and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
-                # 標準（`_review_rounds == 0`）でも orchestrator の確認を 1 回だけ行う（§2.2）:
-                # worker の一次判断を鵜呑みにせず、`_sufficiency_verdict` の read_around/list_docs
-                # の確認枠で必要な箇所だけ自分で確かめてから判定する。evaluator の巡は回さない
-                # ＝不足と判定しても再調査には入らず、そのまま清書へ進む。確認を通した一次判断
-                # （`_review_ran` が真の回）だけが清書ダイジェスト・`data["claims"]` へ渡る——
-                # 確認が成立しなかった（verdict=None＝fail-open）回・指摘を読み取れなかった回は
-                # 偽のままで、巡ループと同じ規律で公開しない。反証された主張は
-                # `apply_findings` が同じ規律で採用不可（不明・conflict）へ落とす。
-                # 巡別記録（`chat-round`）は巡番号 0 で 1 行だけ残す（1 利用者ターンにつき保存は
-                # 1 回・§2.8 の「標準 0 巡の消費も計上先を明記する」）。
-                _confirm_t0 = time.monotonic()
-                verdict, _review_nodes, _review_usage = self._sufficiency_verdict(
-                    orig_message, lens,
-                    state.render(max_bytes=agentic_search._SYNTHESIS_MAX_BYTES // 2), ctx.world,
-                    scope_paths=(search_ctx.scope_meta or {}).get("scope_paths"),
-                    layer=(search_ctx.scope_meta or {}).get("layer"),
-                    stop_event=ctx.stop_event, state=state,
-                    review_structural_meta=_review_structural_meta,
-                    round_no=0, total_rounds=1, role_all_orchestrator=True)
-                if verdict is not None:
-                    if state.apply_findings(verdict.get("findings"), 0, verdict=verdict["verdict"]):
-                        _review_ran = True
-                    else:
-                        _log.warning("確認の指摘を読み取れませんでした（標準・未確認として扱います）")
-                if isinstance(_review_usage, dict) and _review_usage.get("calls"):
-                    _review_usage["elapsed_ms"] = round((time.monotonic() - _confirm_t0) * 1000)
-                _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
-                _stopped_mid_confirm = ctx.stop_event is not None and ctx.stop_event.is_set()
-                # 判定は得られても指摘を取り込めず `_review_ran` が偽のまま残った回は、巡ループと
-                # 同じ規律で `review_failed` として記録する——一次判断を公開しない回に
-                # 「sufficient」等の誤った停止理由を残さない。
-                _round_stop = ("user_stop" if _stopped_mid_confirm
-                               else "review_failed" if verdict is None or not _review_ran
-                               else "sufficient" if verdict["sufficient"]
-                               else "undecidable" if verdict["verdict"] == "undecidable"
-                               else "rounds_exhausted")
-                _record_round(0, (verdict or {}).get("verdict"), "", _round_stop, _review_usage)
-                if not _stopped_mid_confirm:
-                    yield from _review_nodes
+                    # 再調査の実行自体は次巡の先頭で行う（不足の軸だけ持ち越す）——「worker の
+                    # 更新 → 確認 → 判定」を1巡として数えるため。
+                    _rerun_missing = missing
+                    _need_rerun = True
+                    _rerun_i += 1
         finally:
             # §5.0 項6: 有償プロバイダをサブに
             # 載せられる以上、縮退したターン（根拠ゲート・空合成等）でもサブへ実際に発行した呼び出し分の
@@ -3179,7 +3651,7 @@ class _GenProvider(Provider):
         # 発行してしまい、停止後もしばらく処理が続く無駄が生じるため）。どのみち chat_service 側が
         # stop_event を見て以降のイベントを丸ごと破棄するので、ここで素直に終了するだけでよい。
         if ctx.stop_event is not None and ctx.stop_event.is_set():
-            if state is not None and _review_rounds > 0:
+            if state is not None and _rounds_total > 0:
                 # DEPTH-2 S5（§2.4・`TERMINALS` の "stopped"）: 巡を回した経路だけが、追加の LLM
                 # 呼び出しをせずに採用可の主張だけから未完了回答を組んで返す（consumer が保存し、
                 # 監査もこの保存と一致させる）。標準（0 巡）は従来どおり未保存のまま
@@ -3195,6 +3667,9 @@ class _GenProvider(Provider):
         # （`self._sub is not None`）は元々このガードの対象外（既存の伝搬経路のまま）。
         budget_exhausted = (self._sub is None
                             and stop_reason in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS)
+        # self_worker（`self._sub is not None`）では上の `budget_exhausted` は常に False になるため、
+        # 単発フォールバックへの縮退可否判定（下の except 節）は実際の stop_reason をこちらで見る。
+        self._last_stop_reason = stop_reason
         # S3 変更点(2): ハイブリッドはローカル散文を破棄するため、空 answer だけではフォールバックを
         # 強制しない（self._sub is None のときだけ answer 必須のまま＝従来と byte-identical）。
         if not budget_exhausted and ((not answer and self._sub is None) or not searched):
@@ -3296,6 +3771,22 @@ class _GenProvider(Provider):
         # Evidence Packet／evidence_committed の双方に citation 由来と構造的根拠由来を**同じ結合済み
         # list** で渡す（ev-* を共通採番するため常にこの list を使う）。
         combined_evidence_meta = evidence_meta + structural_evidence_meta
+        # ---- 根拠種別の最終ゲート（§0(b)・裁定④⑤⑥）--------------------------------------
+        # 必須種別（範囲・層に実在するものだけ）が欠けた主張は「確定」へ格上げしない。判定は
+        # 根拠の件数ではなく種別の充足で行い、標準（確認1回）でも深さに関わらず同じように働く。
+        _seen_kinds = _turn_evidence_kinds(state, ctx.personal_facts)
+        _turn_missing_kinds = tuple(k for k in _required_kinds if k not in _seen_kinds)
+        # 種別は `state.evidence` の採番でしか引けない——この後の `resolve_claim_evidence_ids` が
+        # `evidence_refs` を Evidence Packet 側の採番へ書き換えるため、不足種別だけを先に控えて
+        # おき、既存の根拠参照チェック（裏付けの無い確定＝honest failure／worker 由来は不採用）を
+        # 通した**後**で格下げする（既存の規律を格下げで隠さない）。
+        _claim_lacking_kinds = (
+            {c.id: _claim_kind_gap(c, state.evidence, _required_kinds, _seen_kinds)
+             for c in state.claims}
+            if state is not None and state.claims else {})
+        # 回答へ出す注記（平文・専門用語ゼロ）: 不足している種別と、範囲に無いため確認しなかった
+        # 種別。主張構造が無い経路（主張生成の失敗・単発フォールバック）でも同じ注記で断定を抑える。
+        _evidence_note = _evidence_gate_note(_turn_missing_kinds, _unavailable_kinds)
         if state is not None and state.claims:
             # DEPTH-2 S1 是正（RV C2）: `state.claims` の `evidence_refs` はここまで `state.evidence`
             # （調査内で安定した採番）の ev_id を指す。以降の Evidence Packet／清書ダイジェストは
@@ -3324,6 +3815,11 @@ class _GenProvider(Provider):
             # `data["claims"]`／清書ダイジェストへ渡さない（§2.2: 鵜呑みにしない）。根拠の束
             # （citations／combined_evidence_meta）は従来どおりそのまま渡る。
             state.claims = []
+        for _c in (state.claims if state is not None else []):
+            _lack = _claim_lacking_kinds.get(_c.id) or []
+            if _c.status == "confirmed" and _lack:
+                _demote_claim_for_missing_kinds(_c, _lack)
+        _kind_gate_applied = True
         from .. import citations as citations_mod   # 重複排除鍵は citations.py と共通（SEARCH-CUT-3 RV）
         data = {"citations": citations,
                 # Evidence Packet（Committed Evidence の構造化サマリ・拡張設計 §4.2）。
@@ -3378,6 +3874,11 @@ class _GenProvider(Provider):
         # `_prune_empty_limits`（この後の各 `yield {"type": "_result", ...}` 直前）が、最終的に
         # 全項目が既定のままならキー自体を落とす。
         env["limits"] = state.limits if state is not None else dict(_run_limits)
+        if _graph_unreachable_at_entry and state is None:
+            # state を持たない頭脳（Gemini/Bedrock）はこの final スナップショットだけが記録先
+            # （不達の記録は `agentic_search` 側のツール集合構築でも行うが、`limits` は当たったか系の
+            # bool＝同じ事実を重ねても二重計数にならない）。
+            env["limits"]["backend_unavailable_graph"] = True
         # agentic ループ（反復ツール検索）で合算した usage を answer メタに乗せる
         #   （メイン回答呼び出し＝ここまでの全ツールターンの合計。intent 分類等の別呼び出しは含めない）。
         # ハイブリッドはループトークンを usage_sub サイドカーへ（answer.usage は主合成
@@ -3412,6 +3913,14 @@ class _GenProvider(Provider):
             # `answer` に全文が揃ってから届く）——まず全文を1個の delta として配信してから、
             # DEPTH-2 S2（§2.7）の追記継続（`length` で切れていれば続きを本物のトークン・
             # ストリーミングで追加配信）へ進む（表示順を保つ・継続分を先に流さない）。
+            # グラフの縮退（入口で使えない／世代が古い／途中で接続断）は本文の冒頭で告知する
+            # （通知だけを先に別 delta で流さず、配信内容と headline を一致させる）。
+            _graph_notice = ("" if lens == "author"
+                            else _graph_degraded_notice(state, _graph_entry_degraded,
+                                                        limits=env.get("limits"),
+                                                        record_only=_graph_record_only))
+            if _graph_notice and answer:
+                answer = f"{_graph_notice}\n\n{answer}"
             yield {"type": "answer_delta", "text": answer}
             # `stop_reason` は `_agentic_loop`（`agentic_search.openai_style`）が既に再分類済み
             # （`_incomplete_stop_reason`）——"truncated" のときだけ続きを発行する。
@@ -3512,6 +4021,12 @@ class _GenProvider(Provider):
         if _synth_truncated:
             state.mark_limit("synthesis_truncated")
         _synth_env["_synthesis_digest"] = _synthesis_digest
+        if _evidence_note and lens != "author":
+            # 清書専用の非公開キー（`_synthesis_digest`/`_personal_facts` と同じ流儀・公開 answer
+            # には残さない）——`prompts._facts` が「根拠の不足」節として渡し、断定表現を抑える。
+            # 作成系（author）へは渡さない: 清書本文がそのまま成果物のファイル内容になるため、
+            # 注記が成果物に書き込まれてしまう（規律は主張単位の格下げで効かせる）。
+            _synth_env["_evidence_note"] = _evidence_note
         if state.claims:
             # DEPTH-2 S1/S4b（§2.5・RV #19/#21）: 主張構造があるターン（再調査後もなお不足→
             # 部分回答へ切替、または査読を通した worker の一次判断）だけ、清書へ「この構造から
@@ -3521,10 +4036,31 @@ class _GenProvider(Provider):
             from .. import investigation_state as _inv_mod
             _synth_env["_claims_digest"] = _inv_mod.render_claims(state.claims)
         _stream_exc: BaseException | None = None
+        # 主張構造が無いターン（主張生成の失敗・worker 一次判断の不採用）は主張単位の格上げ抑止が
+        # 働かない——回答冒頭の告知で確認できていない事実を明示する（§0(b)）。配信は**最初の本文
+        # チャンクの直前**に1回だけ行う——先に出すと、清書が1文字も返さなかったターンで
+        # 「delta を1個以上 yield した後は再 raise しない」不変条件（下の `if not acc:`）が破れ、
+        # 二重出力や headline≠配信本文になる。
+        # 作成系（author）は本文そのものが成果物＝`_run_write_output_file` の content になるため
+        # 告知を本文へ混ぜない（保存したファイルの中身に注記が入ってしまう）。必須種別の規律は
+        # 清書プロンプトの注記（`_evidence_note`）と主張単位の格上げ抑止で効かせる。
+        # 告知は「もう少し詳しく調べた（自動引き上げ）」→「グラフを使わずに調べた（縮退）」→
+        # 「根拠の一部を確認できていない」の順で前置する（判断根拠の中身は本文に残さない）。
+        # 作成系（author）は本文がそのまま成果物の中身になるため、いずれの告知も混ぜない。
+        _graph_notice = ("" if lens == "author"
+                        else _graph_degraded_notice(state, _graph_entry_degraded,
+                                                    record_only=_graph_record_only))
+        _notice_prefix = ("" if lens == "author" else
+                          (f"{_DEPTH_ESCALATED_NOTICE}\n\n" if _depth_escalated else "")
+                          + (f"{_graph_notice}\n\n" if _graph_notice else "")
+                          + (f"{_EVIDENCE_UNVERIFIED_NOTICE}\n\n"
+                             if _turn_missing_kinds and not state.claims else ""))
         if ctx.stop_event is None or not ctx.stop_event.is_set():
             try:
                 for chunk in self._stream(_answer_prompt(orig_message, lens, _synth_env), completion=completion):
                     if chunk:
+                        if not acc and _notice_prefix:
+                            yield {"type": "answer_delta", "text": _notice_prefix}
                         acc += chunk
                         yield {"type": "answer_delta", "text": chunk}
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
@@ -3539,10 +4075,13 @@ class _GenProvider(Provider):
                 # 清書の途中で停止＝本文が1文字も確定していない。追加の LLM 呼び出しをせず、
                 # 採用可の主張だけの未完了回答を返す（`TERMINALS` の "stopped"）。巡を回して
                 # いない標準（0 巡）は従来どおり未保存のまま終える。
-                if _review_rounds > 0:
+                if _rounds_total > 0:
                     yield _stopped_result(_round_no, "user_stop")
                 return
             raise RuntimeError("hybrid synthesis produced no answer") from _stream_exc   # デルタ0個＝二重出力の心配なし
+        # 冒頭の告知は既に delta として配信済み——保存する本文の先頭にも同じ文字列を置き、
+        # 配信内容と headline を一致させる（以降の継続・オフロードもこの本文を引き継ぐ）。
+        acc = _notice_prefix + acc
         # デルタを1個以上 yield した後は絶対に再 raise しない（二重作業/二重 emission の回避）。
         # DEPTH-2 S2（§2.7）: `length`（出力上限）で切れた清書本文の続きを追記する（重複させない・
         # claims JSON はこの継続の対象外）。`_synth_env`（`_synthesis_digest`/`_claims_digest` を
@@ -3552,7 +4091,7 @@ class _GenProvider(Provider):
             acc, _cont_completion, _cont_rounds, _cont_usage = yield from self._continue_truncated_headline(
                 ctx, orig_message, lens, _synth_env, acc, _is_length_truncated(self.provider_id, completion))
             if (ctx.stop_event is not None and ctx.stop_event.is_set()
-                    and _review_rounds > 0):
+                    and _rounds_total > 0):
                 # 継続（ネットワーク呼び出し）の最中に停止要求が来た窓を塞ぐ——停止終端を
                 # 他のイベントより先に返さないと consumer が結果を破棄する。取得済みの
                 # usage（清書＋継続）と継続回数は停止終端へ持ち越す（追加の呼び出しはしない）。
@@ -3623,7 +4162,7 @@ class _GenProvider(Provider):
                 # 個人 workspace への書込の直前に停止を再確認する（帰属呼び出し自体が非ゼロ時間
                 # かかるため、その間に停止要求が来る窓を塞ぐ）——停止後に書込を行って通常終端で
                 # 返すと、利用者が止めたターンの成果物が残る。確定済みの清書 usage は持ち越す。
-                if _review_rounds > 0:
+                if _rounds_total > 0:
                     yield _stopped_result(_round_no, "user_stop", usage=env.get("usage"))
                 return
             _write_args = self._author_output_args(orig_message, acc)
@@ -3638,7 +4177,7 @@ class _GenProvider(Provider):
             if ctx.stop_event is not None and ctx.stop_event.is_set():
                 # ファイル名を決める呼び出し自体が非ゼロ時間かかるため、その最中に停止要求が
                 # 来た窓も塞ぐ（書込の直前に再確認する）。確定済みの清書 usage は停止終端へ持ち越す。
-                if _review_rounds > 0:
+                if _rounds_total > 0:
                     yield _stopped_result(_round_no, "user_stop", usage=env.get("usage"))
                 return
             _write_result = agentic_search._run_write_output_file(
@@ -3732,6 +4271,7 @@ class _GenProvider(Provider):
             # `_AUTHOR_FALLBACK_NOTE` へ縮退しない）。成果物の登録（`write_output_file` と同じ
             # 台帳・カード・Marp 変換）は worker ではなく orchestrator ＝清書側で行う契約。
             from ..ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
+            from .. import agentic_search   # 遅延 import（他の遅延 import と同じ理由・下の except 節が使う）
             _saved_subs = None
             if (decision.get("lens") == "author" and self._sub is not None
                     and (self._sub.get("profile_id") != _sh_mod.SELF_PROFILE_ID
@@ -3773,61 +4313,98 @@ class _GenProvider(Provider):
                     # 働いた結果——下調べ OFF を勧めると査読の保護そのものを迂回させるため、
                     # 文言を分ける。
                     _self_worker = self._sub.get("profile_id") == _sh_mod.SELF_PROFILE_ID
-                    if isinstance(agentic_exc, _MainReviewInsufficient):
-                        msg = ("再調査を行いましたが、回答に十分な根拠を確認できませんでした。"
-                              "範囲を広げるか、質問を具体的にしてもう一度お試しください。")
-                    elif _self_worker:
-                        # 頭脳自身が worker＝OFF にできる「下調べ機能」が無い構成のため、
-                        # 実行できない指示（設定で OFF にする）を案内しない。
-                        msg = ("調査がうまくいきませんでした。"
-                              "範囲を変えるか、質問を具体的にしてもう一度お試しください。")
+                    # self_worker（頭脳自身が worker）かつ、記録された障害が回復可能なもの
+                    # （接続断・タイムアウト・読取I/O）だけで、かつ「モデルが自力回復できずに終わった」
+                    # （`not searched`／`evidence below threshold` の RuntimeError）場合に限り、単発
+                    # フォールバックへ縮退する——ask_user（question イベントで別経路 return 済み）・
+                    # 利用者停止（stop_event で別経路 return 済み）・予算到達（budget_exhausted は
+                    # このターンで RuntimeError を送出しない）・根拠不足（`_MainReviewInsufficient`
+                    # ＝査読が正常に働いた結果）は対象外のまま honest failure で終端する。
+                    _state = getattr(self, "_last_investigation_state", None)
+                    _technical_only_failure = (
+                        isinstance(agentic_exc, RuntimeError)
+                        and not isinstance(agentic_exc, _MainReviewInsufficient)
+                        and str(agentic_exc) in ("agentic search did not search or had no answer",
+                                                 "evidence below threshold"))
+                    # 予算到達（turns_exhausted/budget_exceeded/tools_per_turn_exceeded）で終端した
+                    # ターンは、self_worker では `budget_exhausted`（上方）が常に False になり
+                    # 「did not search」/「evidence below threshold」の RuntimeError をそのまま
+                    # 送出してしまう——その場合でも、記録された障害が回復可能なものだけなら誤って
+                    # 単発フォールバックへ縮退しないよう、実際の stop_reason（`_last_stop_reason`）を
+                    # 別途確認する。
+                    _stop_reason_not_budget = (
+                        getattr(self, "_last_stop_reason", None)
+                        not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS)
+                    _recoverable_only = (
+                        _state is not None and any(_state.backend_failures.values())
+                        and not _state.non_recoverable_failure
+                        and _stop_reason_not_budget)
+                    if _self_worker and _technical_only_failure and _recoverable_only:
+                        # 復帰経路はグラフを使わない（qa 相当へ強制）。調査状態（InvestigationState・
+                        # 収集済み根拠）は引き継がず、単発検索をゼロから行う——その旨を通知に含める
+                        # （本文・資料名は含めない）。
+                        yield _node("fallback", "think", "検索方法を切替",
+                                    _backend_fallback_message(_state), "done")
+                        from dataclasses import replace as _dc_replace
+                        ctx = _dc_replace(ctx, route=lambda message: {
+                            "lens": "qa", "input": message, "reason": "backend_recoverable_fallback"})
                     else:
-                        msg = ("下調べAIでの調査がうまくいきませんでした。"
-                              "設定を確認するか、下調べ機能をOFFにしてください。")
-                    # 失敗終端でも、巡ループで確認済みの主張と巡番号が残っていればそれを
-                    # 先に示す（追加の LLM 呼び出しはしない・`TERMINALS` の "failed"）。
-                    _incomplete = getattr(self, "_last_incomplete_body", None)
-                    _partial = _incomplete() if callable(_incomplete) else ""
-                    if _partial:
-                        msg = f"{_partial}\n\n{msg}"
-                    yield _node("fallback", "think",
-                                ("回答に十分な根拠が集まりませんでした"
-                                 if isinstance(agentic_exc, _MainReviewInsufficient)
-                                 else ("調査がうまくいきませんでした" if _self_worker
-                                       else "下調べAIでの調査がうまくいきませんでした")), msg, "done")
-                    yield {"type": "answer_delta", "text": msg}
-                    env = {"lens": decision.get("lens", "qa"), "headline": msg,
-                          "summary": {"total": 0}, "data": {}, "sources": [],
-                          # 終了理由の印（`stop_kind.resolve`）: 型が通信系（timeout/transport_error）
-                          # なら優先してそれを立てる・型が特定できない場合のみ査読の根拠不足は
-                          # no_evidence・それ以外の失敗は error（完了扱いにはしない）。
-                          "agentic_failure": (stop_kind_mod.from_exception(agentic_exc)
-                                              or ("insufficient"
-                                                  if isinstance(agentic_exc, _MainReviewInsufficient)
-                                                  else "error")),
-                          "_terminal": "failed",   # 終端 4 種（`TERMINALS`）
-                          "scope": layer_mod.scope_with_layer(
-                              ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
-                    # 全巡で累積した個人由来／書込の有無は失敗終端へも渡す（§2.7 高-4）。
-                    # 台帳登録済みの成果物（S2 の `write_output_file`）も同じ終端へ載せる——
-                    # 書込は既に個人 workspace に実在するため、失敗本文でも導線と書込の事実を落とさない。
-                    if self._last_created_files:
-                        env["created_files"] = [
-                            {"name": f.get("rel_path"), "download_url": f.get("download_url")}
-                            for f in self._last_created_files if f.get("rel_path")]
-                        env["wrote_files"] = [f.get("rel_path") for f in self._last_created_files
-                                              if f.get("rel_path")]
-                    _pa = getattr(self, "_last_personal_acc", None)
-                    if _pa:
-                        _apply_personal_flag(env, _pa)
-                    _lim = getattr(self, "_last_run_limits", None)
-                    if _lim and any(_lim.values()):
-                        env["limits"] = dict(_lim)     # 失敗ターンも当たった制限を計測に載せる
-                    yield {"type": "_result", "env": env,
-                          "decision": {"lens": decision.get("lens", "qa"), "input": ctx.message,
-                                      "reason": "下調べAIの失敗"}}
-                    return
-                yield _node("fallback", "think", "検索方法を切替", "別の方法で調べ直します", "done")  # 単発 grep へ
+                        if isinstance(agentic_exc, _MainReviewInsufficient):
+                            msg = ("再調査を行いましたが、回答に十分な根拠を確認できませんでした。"
+                                  "範囲を広げるか、質問を具体的にしてもう一度お試しください。")
+                        elif _self_worker:
+                            # 頭脳自身が worker＝OFF にできる「下調べ機能」が無い構成のため、
+                            # 実行できない指示（設定で OFF にする）を案内しない。
+                            msg = ("調査がうまくいきませんでした。"
+                                  "範囲を変えるか、質問を具体的にしてもう一度お試しください。")
+                        else:
+                            msg = ("下調べAIでの調査がうまくいきませんでした。"
+                                  "設定を確認するか、下調べ機能をOFFにしてください。")
+                        # 失敗終端でも、巡ループで確認済みの主張と巡番号が残っていればそれを
+                        # 先に示す（追加の LLM 呼び出しはしない・`TERMINALS` の "failed"）。
+                        _incomplete = getattr(self, "_last_incomplete_body", None)
+                        _partial = _incomplete() if callable(_incomplete) else ""
+                        if _partial:
+                            msg = f"{_partial}\n\n{msg}"
+                        yield _node("fallback", "think",
+                                    ("回答に十分な根拠が集まりませんでした"
+                                     if isinstance(agentic_exc, _MainReviewInsufficient)
+                                     else ("調査がうまくいきませんでした" if _self_worker
+                                           else "下調べAIでの調査がうまくいきませんでした")), msg, "done")
+                        yield {"type": "answer_delta", "text": msg}
+                        env = {"lens": decision.get("lens", "qa"), "headline": msg,
+                              "summary": {"total": 0}, "data": {}, "sources": [],
+                              # 終了理由の印（`stop_kind.resolve`）: 型が通信系（timeout/transport_error）
+                              # なら優先してそれを立てる・型が特定できない場合のみ査読の根拠不足は
+                              # no_evidence・それ以外の失敗は error（完了扱いにはしない）。
+                              "agentic_failure": (stop_kind_mod.from_exception(agentic_exc)
+                                                  or ("insufficient"
+                                                      if isinstance(agentic_exc, _MainReviewInsufficient)
+                                                      else "error")),
+                              "_terminal": "failed",   # 終端 4 種（`TERMINALS`）
+                              "scope": layer_mod.scope_with_layer(
+                                  ctx.scope_meta, world=ctx.world, lens=decision.get("lens", "qa"))}
+                        # 全巡で累積した個人由来／書込の有無は失敗終端へも渡す（§2.7 高-4）。
+                        # 台帳登録済みの成果物（S2 の `write_output_file`）も同じ終端へ載せる——
+                        # 書込は既に個人 workspace に実在するため、失敗本文でも導線と書込の事実を落とさない。
+                        if self._last_created_files:
+                            env["created_files"] = [
+                                {"name": f.get("rel_path"), "download_url": f.get("download_url")}
+                                for f in self._last_created_files if f.get("rel_path")]
+                            env["wrote_files"] = [f.get("rel_path") for f in self._last_created_files
+                                                  if f.get("rel_path")]
+                        _pa = getattr(self, "_last_personal_acc", None)
+                        if _pa:
+                            _apply_personal_flag(env, _pa)
+                        _lim = getattr(self, "_last_run_limits", None)
+                        if _lim and any(_lim.values()):
+                            env["limits"] = dict(_lim)     # 失敗ターンも当たった制限を計測に載せる
+                        yield {"type": "_result", "env": env,
+                              "decision": {"lens": decision.get("lens", "qa"), "input": ctx.message,
+                                          "reason": "下調べAIの失敗"}}
+                        return
+                else:
+                    yield _node("fallback", "think", "検索方法を切替", "別の方法で調べ直します", "done")  # 単発 grep へ
             finally:
                 if _saved_subs is not None:
                     # author の差し替えを元へ戻す（他レンズ・次ターンへ漏らさない）。
@@ -3849,6 +4426,11 @@ class _GenProvider(Provider):
         # 一度も試みない設計上のショートカット）で、ここは実際に反復ツール検索が失敗した後の
         # 最後の砦なので、道具が使えなかった旨の案内は引き続き必要。
         is_author = decision.get("lens") == "author"
+        # 単発フォールバックは Evidence Packet を経由せず、根拠の種別を確かめる術が無い経路——
+        # 主張単位のゲートが働かないため、既定で断定を抑え（清書プロンプト）、告知を前置する
+        # （§0(b)・claims 欠落時と同じ扱い）。
+        env["_evidence_note"] = _evidence_gate_note(("source",), ())
+        _notice_prefix = f"{_EVIDENCE_UNVERIFIED_NOTICE}\n\n"
         if is_author:
             yield {"type": "answer_delta", "text": _AUTHOR_FALLBACK_NOTE}
         yield _node("brain", "think", f"考える（{self.label}）", "事実に基づいて回答しています", "active")
@@ -3864,6 +4446,10 @@ class _GenProvider(Provider):
             try:
                 for chunk in self._stream(_answer_prompt(ctx.message, decision["lens"], env)):
                     if chunk:
+                        if not acc:
+                            # 告知は最初の本文チャンクの直前に1回だけ（本文が1つも来なかった
+                            # ターンへ告知だけを配信しない）。
+                            yield {"type": "answer_delta", "text": _notice_prefix}
                         acc += chunk
                         yield {"type": "answer_delta", "text": chunk}   # 本物のトークン・ストリーミング
                     if ctx.stop_event is not None and ctx.stop_event.is_set():
@@ -3878,7 +4464,10 @@ class _GenProvider(Provider):
         if failed:
             acc = ""
         if acc:
-            env["headline"] = acc
+            # 告知は本文の直前に配信済み——保存する headline も同じ並びにする（author の前置きは
+            # この後に付く＝配信順と一致する）。本文が無い（決定的回答へ落ちた）ターンは告知も
+            # 配信していないため付けない。
+            env["headline"] = _notice_prefix + acc
         if self._last_usage:                          # F3: メイン回答呼び出し分の usage を answer メタへ
             from .. import depth_profile as depth_profile_mod
             env["usage"] = self._last_usage

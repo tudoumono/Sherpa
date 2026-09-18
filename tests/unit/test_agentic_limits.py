@@ -64,6 +64,7 @@ def test_investigation_state_bump_and_mark_limit():
     assert state.limits == {
         "tool_result_clipped": 0, "total_budget_hit": False, "context_compactions": 0,
         "synthesis_truncated": False, "search_truncated": 0, "auto_continues": 0,
+        "depth_escalated": False,
     }
     state.bump_limit("auto_continues")
     state.bump_limit("auto_continues", 2)

@@ -1352,8 +1352,10 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
 
 def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | None) -> CheckResult:
     """Codex(OpenAI 系) 構成が使われているとき、multi_agent（`[agents.worker]`/`[agents.evaluator]`・
-    S6）の worker モデルが Codex 自身のモデルカタログにある値のままであること（判定のみ・実
-    codex は呼ばない・値そのものは detail に出さない）。
+    S6）の worker モデルが確認済みの値のままか、管理画面で独自設定（system_settings
+    `codex_worker_model`・実装ベース探索の回復 S1）されているかを判定する（実 codex は呼ばない・
+    値そのものは detail に出さない）。独自設定時は Codex 自身のモデルカタログに存在するかを
+    Sherpa 側で検証できないため `skip` にする（`ng` にしない＝運用側の確認を促すだけ）。
 
     実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は接続先が既定 OpenAI
     （`llm.openai_endpoint_kind() == "openai"`）以外（Azure・独自エンドポイント）のとき multi_agent
@@ -1402,6 +1404,11 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
                     "Codex(OpenAI 系) 構成の接続先が既定の OpenAI 以外（Azure・独自エンドポイント）のため、"
                     "この接続先では multi_agent（worker/evaluator）を自動的に無効にしています"
                     "（worker モデルのデプロイ名解決が不要になるため確認対象外です）")
+    from sherpa.providers.codex import sandbox as codex_sandbox
+    if codex_sandbox._codex_worker_model(sys_s) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
+        return CheckResult(cid, label, "skip",
+                    "worker モデルが管理画面で独自設定されています"
+                    "（値が Codex 自身のモデルカタログに存在するか運用側で確認してください）")
     return CheckResult(cid, label, "ok", "worker モデルは確認済みカタログ値のままです")
 
 

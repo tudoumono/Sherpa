@@ -25,6 +25,13 @@ AGENTS_MD = """\
 - 回答は根拠ベースで作る。ツール・ファイル参照で最低 1 回は裏取りしてから答える。根拠は資料のパス
   （Python で開いた場合はシート名／セル範囲・段落・ページ番号も添える）で示す。資料に無いことを補うときは
   『推定』と明示する。
+- 見直し（評価）は根拠の**件数**では判定しない。質問の型ごとに必要な**根拠種別**が揃っているかで
+  判定する。種別はソース（`src/` のコード）／設計書（Office・PDF 由来の資料）／定義（DDL・copybook・
+  設定ファイル）／ログ・設定（会話に貼られた・添付された資料）／呼出関係（グラフ、使えなければ grep
+  の呼出し検索で代替）。レンズ別の必須集合: 仕様問い合わせ＝ソース＋設計書／影響調査＝ソース＋
+  呼出関係（＋定義）／トラブルシュート＝ソース＋ログ・設定／作成系＝ソース＋設計書。登録範囲にその
+  種別が存在しない場合は『該当なし』として不足にせず、回答にその旨を明示する。設計書とソースが
+  食い違う場合はソースを正とし、食い違いを回答で報告する。
 - 成果物（生成ファイル）を作る場合は、必ずこのディレクトリ（authoring 直下）に作成する。
 - スライド・プレゼン資料は、見た目重視の marp スキル（HTML/PDF/PPTX）を既定で使う。marp スキルでは
   Marp 形式の `.md` を書くだけでよく、レンダ（HTML/PDF/PPTX への変換）は完了後に Sherpa 側が自動で行う
@@ -69,6 +76,44 @@ AGENTS_MD = """\
 _INVESTIGATE_SKILLS_PARAGRAPH = """\
 - 質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う `.agents/skills` の
   investigate-* スキルを読んで、その手順（ツールで当たり→原本の中身を確かめる→答える）どおりに進める。
+"""
+
+# 本体自身のソース確認要件（実装ベース探索の回復 §0・S1・裁定④＝毎主張ごとに強制・深さに関わらず
+# 常時）。`direct_read`（`_direct_read_ok`・provider.py が秘匿列挙／範囲の解決に失敗したときは偽）
+# で文言を切り替える——直読不可ターンで「直接読む」と指示すると、同じターンの他の指示
+# （`_prompt`/`_prompt_mcp` の「今回は原本の直接読み取りは使えない」）と矛盾し、Codex に実行不能な
+# 手順を指示することになる。要件そのもの（本体自身の確認・グラフ不調でも止めない）は両分岐で同じ。
+#
+# `layer`（探す対象＝`docs`／`code`／`both`／`None`）も見る: 直読不可（MCP 読取のみ）かつ
+# `layer == "docs"` の組合せでは、MCP の `ripgrep_search`/`read_around` 自体が層制限でソース
+# （code 種別）を拒否する（`agentic_search.py::in_layer_code`）——この組合せで「必ずソースを読む」を
+# 要求すると実行不能な指示になる。提案書 §3 S1「必須種別は許可範囲内で解釈」・裁定⑥（部分回答＋
+# 「ソース未確認のため確定不可」）どおり、この組合せだけは読取要求ではなく確定不可の告知を指示する。
+# direct_read=True のときは層に関係なく直読でソース確認する（`sandbox.py:633-638` の裁定＝
+# Codex は層の指定を強制しない・直読は層に関係なく許可）。
+def _source_verification_paragraph(direct_read: bool, layer: str | None = None) -> str:
+    if not direct_read and layer == "docs":
+        return """\
+- 今回の探す対象は資料のみ（ソースは対象外）のため、実装に関する主張のソース裏取りはしない
+  （MCP の読取ツールで `src/` のコードを読もうとしても層制限で拒否される）。実装に関する主張は
+  確定にせず、回答冒頭で『ソースを確認していないため確定できません』と明示したうえで、資料から
+  分かる範囲の部分回答にする。
+- グラフ検索・全文検索（ES）が空・不調・未構築のときは、それを理由に回答を止めない。資料（MCP の
+  読取ツール）で確認できる範囲で答える。
+"""
+    if direct_read:
+        how = "`src/` の原本を直接開いて"
+        graph_fallback = "必ず `src/`・原本を ripgrep／読取ツールで直接読んで確認する。"
+    else:
+        how = "MCP の読取ツール（ripgrep_search／read_around 等）で `src/` のソースを"
+        graph_fallback = "必ず MCP の読取ツール（ripgrep_search／read_around 等）で `src/` を確認する。"
+    return f"""\
+- 実装に関する主張は、自分（本体）が{how}確認してから採る。worker（サブエージェント）を使う場合、
+  worker の一次判断はソースの根拠（ファイル:行）が付いているものだけを採り、確認したファイル:行は
+  最終回答の出典に残す。
+- グラフ検索・全文検索（ES）が空・不調・未構築のときは、それを理由に回答を止めない。{graph_fallback}
+- 必要な根拠の種別（ソース・設計書・定義・ログ/設定・呼出関係）が揃わないと判断したら、次の巡
+  または再調査では調べる量を一段引き上げる（読む範囲・確認するファイルを広げる）。
 """
 
 # `--output-schema`（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3）有効時だけ付け足す段落。
@@ -116,19 +161,51 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
 # は選ばれた深さが許す evaluator の巡数（`depth_profile.review_rounds_for` の戻り値＝標準 0／
 # 深く 2／最大は管理画面の設定値）——0 のときは evaluator を使わないことを明示する（標準は今までの
 # 挙動と同じ・巡を増やさない）。何体をどう使うか自体は Codex の判断のまま固定の手順にはしない。
-def _multi_agent_role_paragraph(review_rounds: int) -> str:
+# `direct_read`／`layer` は `_source_verification_paragraph` と同じ理由・同じ組合せで文言を
+# 切り替える（multi_agent は常時有効のため、直読不可・資料のみターンでもこの段落は出る＝矛盾を
+# 避けるにはどちらも渡す必要がある）。
+def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
+                                layer: str | None = None) -> str:
+    _docs_only = not direct_read and layer == "docs"
     if review_rounds <= 0:
-        rounds_note = ("今回の見直しの回数は 0 回＝evaluator は使わない。worker の一次判断と、"
-                       "必要な箇所だけ自分で行う確認だけで最終回答をまとめる。")
+        # `_docs_only` はこの段落自体が「ソース裏取りはしない」を既に指示しているため、
+        # rounds_note に「必ず自分でソースを確認」を続けると同一段落内で矛盾する
+        # （RV是正: 標準深さでも復活していた実行不能な指示）。巡数の告知だけにする。
+        rounds_note = ("今回の見直しの回数は 0 回＝evaluator は使わない。" if _docs_only else
+                       "今回の見直しの回数は 0 回＝evaluator は使わない。worker の一次判断を鵜呑み"
+                       "にせず、実装に関する主張は必ず自分でソースを確認してから最終回答に含める。")
     else:
         rounds_note = (f"今回の見直しの回数は {review_rounds} 回まで。spawn_agent(evaluator) は"
                        f"最大 {review_rounds} 回までとし、十分と判定できたらそれ以上は呼ばない。")
+    if _docs_only:
+        return f"""\
+- worker（資料の検索・精読と一次判断だけを担当し、最終回答は書かない）と evaluator（根拠と
+  一次判断を別観点で査読し、反証・条件例外・回答漏れ・未探索の範囲を指摘する。書き直さない）の
+  サブエージェントが使える。観点に分解して調べる観点ごとに spawn_agent(worker) で調査させ、
+  一次判断（確定／推定／不明の主張）を受け取る。今回の探す対象は資料のみ（ソースは対象外）のため、
+  worker の一次判断に実装に関する主張が含まれていてもソース裏取りはしない——確定にせず、回答冒頭で
+  『ソースを確認していないため確定できません』と明示したうえで、資料から分かる範囲の部分回答に
+  する。グラフ・ES が空・不調・未構築のときも、それを理由に止めず資料（MCP の読取ツール）で確認
+  できる範囲で答える。{rounds_note}
+  evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。何体をどう使うか（観点の
+  分け方・worker の数）はあなた自身の判断でよい。最後に全体を統合し、指定された出力形式で
+  最終回答を返す（成果物は各巡では作らず、最後に一度だけ作る）。
+"""
+    if direct_read:
+        how = "`src/` の原本を開いて"
+        graph_fallback = "`src/` を ripgrep／読取ツールで直接読む。"
+    else:
+        how = "MCP の読取ツール（ripgrep_search／read_around 等）で"
+        graph_fallback = "MCP の読取ツール（ripgrep_search／read_around 等）で `src/` を確認する。"
     return f"""\
 - worker（資料の検索・精読と一次判断だけを担当し、最終回答は書かない）と evaluator（根拠と
   一次判断を別観点で査読し、反証・条件例外・回答漏れ・未探索の範囲を指摘する。書き直さない）の
   サブエージェントが使える。観点に分解して調べる観点ごとに spawn_agent(worker) で調査させ、
-  一次判断（確定／推定／不明の主張）を受け取る。一次判断を鵜呑みにせず、必要な箇所だけ自分で
-  MCP ツールを使って確認する。{rounds_note}
+  一次判断（確定／推定／不明の主張）を受け取る。worker の一次判断のうち実装に関する主張は、
+  ソースの根拠（ファイル:行）が付いているものだけを採る。根拠が無い、または設計書・資料の根拠
+  しか無い主張は、必ず自分（本体）が{how}確認してから採否を決める——worker が既に十分な根拠を
+  持っているように見えても確認を省略しない。確認したファイル:行は最終回答の出典に残す。
+  グラフ・ES が空・不調・未構築のときも、それを理由に止めず{graph_fallback}{rounds_note}
   evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。何体をどう使うか（観点の
   分け方・worker の数）はあなた自身の判断でよい。最後に全体を統合し、指定された出力形式で
   最終回答を返す（成果物は各巡では作らず、最後に一度だけ作る）。
@@ -147,15 +224,25 @@ _MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH = """\
 
 def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: bool = True,
                     output_schema_v2: bool = False, multi_agent: bool = False,
-                    review_rounds: int = 0) -> None:
+                    review_rounds: int = 0, layer: str | None = None) -> None:
     """authoring 直下へ AGENTS.md を書く（per-request・冪等・上書き）。
 
     呼び出し側で try/except すること（AGENTS.md はあくまで補助・書込に失敗しても Codex 実行自体は
     継続してよい＝fail-open。プロンプト側には containment/grounding の短縮形を常置してあるので、
     失敗時もプロンプトの質問固有部分＋短縮ルールだけで動くことを前提にする）。
 
-    `direct_read`（既定 True）が偽のとき＝原本直読を許可しないターンは、調査スキル（原本を Python で
-    開く前提）への誘導段落を落とす。`output_schema`（既定 False）が真のときだけ、構造化最終応答
+    `direct_read`（既定 True）と `layer`（既定 None＝both・`docs`／`code`／`both`）は、常時付く
+    本体自身のソース確認要件（`_source_verification_paragraph`・`multi_agent` 有効時は
+    `_multi_agent_role_paragraph` にも）の文言を一緒に切り替える——`direct_read=True` なら層に
+    関係なく「原本を直接開いて確認する」（`sandbox.py:633-638` の裁定＝Codex は層の指定を強制
+    しない）、`direct_read=False and layer != "docs"` なら「MCP の読取ツールで確認する」に言い換え
+    る（実行不能な手順を指示しない）。`direct_read=False and layer == "docs"` だけは読取要求ではなく
+    「ソースは対象外・確定不可を告知して部分回答」を指示する——この組合せは MCP の `ripgrep_search`/
+    `read_around` 自体が層制限でソース（code 種別）を拒否するため、ソース裏取りが原理的に不可能
+    （提案書 §3 S1「必須種別は許可範囲内で解釈」・裁定⑥）。要件自体（本体自身の確認・グラフ不調でも
+    止めない）はどの分岐でも維持する。`direct_read` が偽のときは調査スキル（原本を Python で開く
+    前提）への誘導段落も落とす。
+    `output_schema`（既定 False）が真のときだけ、構造化最終応答
     （`status`／`answer`／`next_step`）を求める段落を付け足す（§2-3・呼び出し側は `--output-schema` を付ける判定＝`_schema_on` と同じ値を渡す）。
     `output_schema_v2`（既定 False）が真のときは3項目版の代わりに4項目版
     （`_STRUCTURED_RESPONSE_PARAGRAPH_V2`・`claims` の意味と閉じた語彙を含む）を使う——
@@ -178,9 +265,10 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
     if output_schema:
         structured_paragraph = (_STRUCTURED_RESPONSE_PARAGRAPH_V2 if output_schema_v2
                                 else _STRUCTURED_RESPONSE_PARAGRAPH)
-    content = (AGENTS_MD + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
+    content = (AGENTS_MD + _source_verification_paragraph(direct_read, layer)
+               + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
                + structured_paragraph
-               + (_multi_agent_role_paragraph(review_rounds) if multi_agent else "")
+               + (_multi_agent_role_paragraph(review_rounds, direct_read, layer) if multi_agent else "")
                + (_MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH if multi_agent else ""))
     target = authoring / "AGENTS.md"
     tmp = authoring / f".AGENTS.md.tmp-{os.urandom(6).hex()}"

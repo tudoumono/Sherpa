@@ -170,6 +170,30 @@ def _sidecar_append(entry: dict) -> None:
                   file=sys.stderr)
 
 
+# 子エージェント（`spawn_agent` された worker/evaluator）の障害を親が観測するための閉じたコード。
+# 親の `--json` には子の MCP 呼出が現れないため、サイドカーが唯一の観測経路
+# （`providers/codex/provider.py::_read_mcp_sidecar`）。本文・資料名は書かない。
+_SIDECAR_ERROR_CODES = frozenset({
+    agentic_search.GRAPH_REINGEST_ERROR_CODE, "graph_unavailable",
+    "es_unavailable", "es_query_failed", "es_query_rejected", "read_io_failed"})
+
+
+def _sidecar_error_code(name, result) -> None:
+    """ツール結果が既知の障害コードを持つときだけ `{"kind": "error", ...}` を1行書く。
+
+    コードは `error`（結果そのものが障害＝`isError`）・`error_code`（結果は返るが内部で障害を
+    捕捉した）・`degrade_reason`（`es_search` の縮退）のいずれかに載る——いずれも閉集合に
+    含まれる値のときだけ書き、自由文（`error` の日本語メッセージ等）は書かない。
+    """
+    if not isinstance(result, dict):
+        return
+    for key in ("error", "error_code", "degrade_reason"):
+        code = result.get(key)
+        if isinstance(code, str) and code in _SIDECAR_ERROR_CODES:
+            _sidecar_append({"kind": "error", "code": code, "tool": name, "ts": time.time()})
+            return
+
+
 def _ok(rid, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
@@ -226,10 +250,13 @@ def handle(req: dict) -> dict | None:
             # そのまま載るため（JSON-RPC のプロトコルエラーは Codex 自身の item 表現が保証されて
             # いない）、`providers/codex/mcp.py::_graph_schema_era_from_item` が読み取って
             # `GraphSchemaEraError` を再構成できる。
-            err_body = {"error": "graph_reingest_required", "world": e.world, "stored_era": e.stored_era}
+            err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,
+                        "world": e.world, "stored_era": e.stored_era}
+            _sidecar_error_code(name, err_body)   # 子が受け取った障害も親が観測できるようにする
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                              "isError": True})
         is_error = bool(isinstance(result, dict) and result.get("error"))
+        _sidecar_error_code(name, result)
         if not is_error:
             # DEPTH-2 S3b: 子が読んだ doc_id をサイドカーへ（本文は書かない・失敗した呼出は数えない）。
             # `_sidecar_append` は `SHERPA_MCP_SIDECAR` 未設定なら no-op（既存の単一エージェント実行に

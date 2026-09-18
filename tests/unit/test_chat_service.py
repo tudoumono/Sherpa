@@ -1589,9 +1589,9 @@ def _sm(depth_profile=None, **extra):
            "depth_profile": depth_profile, **extra}
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 8), ("standard", 8), ("deep", 8), ("max", 8)])
+@pytest.mark.parametrize("profile,expected_depth", [(None, 8), ("standard", 8), ("deep", 10), ("max", 12)])
 def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expected_depth):
-    """DEPTH-2 S7: 影響たどりの深さ（既定 8）は深さに依らず基準値をそのまま使う（加算は撤去）。"""
+    """影響たどりの深さ（既定 8）に深さの加算（標準+0／深く+2／最大+4）が載る。"""
     captured = {}
 
     def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
@@ -1603,9 +1603,9 @@ def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expecte
     assert captured["depth"] == expected_depth
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 3), ("standard", 3), ("deep", 3), ("max", 3)])
+@pytest.mark.parametrize("profile,expected_depth", [(None, 3), ("standard", 3), ("deep", 5), ("max", 7)])
 def test_dispatch_troubleshoot_depth_scales_with_profile(monkeypatch, profile, expected_depth):
-    """DEPTH-2 S7: トラブルシュート近傍の深さ（既定 3）は深さに依らず基準値のまま（加算は撤去）。"""
+    """トラブルシュート近傍の深さ（既定 3）にも同じ加算が載る。"""
     captured = {}
 
     def fake_run_troubleshoot(session, symptom, world, scope_paths=None, depth=None):
@@ -1619,9 +1619,9 @@ def test_dispatch_troubleshoot_depth_scales_with_profile(monkeypatch, profile, e
     assert captured["depth"] == expected_depth
 
 
-@pytest.mark.parametrize("profile,expected_hits", [(None, 20), ("standard", 20), ("deep", 20), ("max", 20)])
+@pytest.mark.parametrize("profile,expected_hits", [(None, 20), ("standard", 20), ("deep", 30), ("max", 40)])
 def test_dispatch_qa_max_hits_scales_with_profile(monkeypatch, profile, expected_hits):
-    """DEPTH-2 S7: run_qa の max_hits（既定 20）は深さに依らず基準値のまま（倍率は撤去）。"""
+    """run_qa の max_hits（既定 20）に深さの倍率（×1／×1.5／×2）が載る。"""
     captured = {}
 
     def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
@@ -1635,8 +1635,8 @@ def test_dispatch_qa_max_hits_scales_with_profile(monkeypatch, profile, expected
 
 
 def test_dispatch_depth_profile_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（system_settings）が env 既定より優先される（実効基準値）。
-    DEPTH-2 S7 以降、深さ（"deep"）は基準値に効かない（受け入れ条件(4)）。"""
+    """管理画面の基準値編集（system_settings）が env 既定より優先される（実効基準値）＝
+    深さ（"deep"＝+2）の加算はその実効基準値に載る。"""
     captured = {}
 
     def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
@@ -1646,12 +1646,11 @@ def test_dispatch_depth_profile_honors_system_settings_base_override(monkeypatch
     monkeypatch.setattr(CS, "run_impact", fake_run_impact)
     CS._dispatch(None, "impact", "消費税率", "w1", _sm("deep"),
                 system_settings={"depth_base_impact_depth": 20})
-    assert captured["depth"] == 20   # 20（基準値上書き）のみ・深くによる加算は無し
+    assert captured["depth"] == 22   # 20（基準値上書き）+ 2（深く）
 
 
 def test_dispatch_depth_profile_system_settings_none_uses_env_default(monkeypatch):
-    """`system_settings=None`（呼び出し元省略・後方互換）は env 既定値のまま動く。
-    DEPTH-2 S7 以降、深さ（"max"）は倍率に効かない。"""
+    """`system_settings=None`（呼び出し元省略・後方互換）は env 既定値を基準に倍率だけが載る。"""
     captured = {}
 
     def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
@@ -1661,16 +1660,16 @@ def test_dispatch_depth_profile_system_settings_none_uses_env_default(monkeypatc
     monkeypatch.setattr(CS, "run_qa", fake_run_qa)
     monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
     CS._dispatch(None, "qa", "消費税率とは", "w1", _sm("max"), system_settings=None)
-    assert captured["max_hits"] == 20   # QA_MAX_HITS_DEFAULT(20) の env 既定のまま（倍率撤去）
+    assert captured["max_hits"] == 40   # QA_MAX_HITS_DEFAULT(20) × 2（最大）
 
 
 # ===== _dispatch の絶対上限（SC-6c §8）=====
-# DEPTH-2 S7 で倍率は撤去したが、管理画面の基準値編集が各モジュールの env-parse hi 引数
-# （＝既存の絶対上限）を超える値を許しても、最終的にその絶対上限でクランプされる（安全弁は残す）。
+# 管理画面の基準値編集が各モジュールの env-parse hi 引数（＝既存の絶対上限）を超える値を
+# 許しても、倍率・加算の適用後に最終的にその絶対上限でクランプされる（安全弁）。
 
 def test_dispatch_impact_depth_abs_max_clamps_admin_base_over_limit(monkeypatch):
     """admin が impact_depth の基準値を絶対上限超え（68）に設定していても、
-    `IMPACT_MAX_DEPTH_ABS_MAX`（64）でクランプされる（倍率撤去後も絶対上限は効く）。"""
+    `IMPACT_MAX_DEPTH_ABS_MAX`（64）でクランプされる。"""
     captured = {}
 
     def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
@@ -1720,20 +1719,32 @@ def _raise_if_called(*_a, **_kw):
     raise AssertionError("OFF/不達のツールが呼ばれてしまった（迂回封鎖のはずが実行された）")
 
 
-def test_dispatch_impact_blocked_when_graph_off_returns_honest_failure(monkeypatch):
-    """impact はグラフ必須——OFF なら run_impact を一切呼ばず明示エラーの envelope を返す。"""
+def test_dispatch_impact_degrades_when_graph_off_but_search_remains(monkeypatch):
+    """S4: impact はグラフ必須だが、OFF/不達でも grep か全文が残っていれば明示エラーで終わらせず
+    qa 相当の下地へ縮退する（run_impact は呼ばない・縮退の印を envelope に残す）。"""
     monkeypatch.setattr(CS, "run_impact", _raise_if_called)
     sm = _sm(tools={"grep": True, "fulltext": True, "graph": False})
     env = CS._dispatch(None, "impact", "消費税率", "w1", sm)
-    assert env["data"] == {}
-    assert env["sources"] == []
-    assert "グラフ" in env["headline"]
+    assert env["graph_degraded"] == "blocked"
+    assert env["data"]["type"] == "qa"
 
 
-def test_dispatch_troubleshoot_blocked_when_graph_off_returns_honest_failure(monkeypatch):
+def test_dispatch_troubleshoot_degrades_when_graph_off_but_search_remains(monkeypatch):
     monkeypatch.setattr(CS, "run_troubleshoot", _raise_if_called)
     sm = _sm(tools={"grep": True, "fulltext": True, "graph": False})
     env = CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", sm)
+    assert env["graph_degraded"] == "blocked"
+    assert env["data"]["type"] == "qa"
+
+
+def test_dispatch_impact_blocked_when_no_search_tool_remains(monkeypatch):
+    """縮退の条件は「資料を探す手段が残っていること」——grep も全文も無ければ従来どおり明示エラー。"""
+    monkeypatch.setattr(CS, "run_impact", _raise_if_called)
+    monkeypatch.setattr(CS, "run_qa", _raise_if_called)
+    monkeypatch.setattr(CS, "_es_citations", _raise_if_called)
+    sm = _sm()   # 希望は全ON・実接続が全て不達（3軸 OFF の希望自体は 422 で入口を通らない）
+    env = CS._dispatch(None, "impact", "消費税率", "w1", sm,
+                      tools_availability={"grep": False, "fulltext": False, "graph": False})
     assert env["data"] == {}
     assert env["sources"] == []
     assert "グラフ" in env["headline"]
@@ -1784,12 +1795,13 @@ def test_dispatch_troubleshoot_skips_es_merge_when_fulltext_off(monkeypatch):
 
 def test_dispatch_tools_availability_param_blocks_even_when_pref_is_full_on(monkeypatch):
     """`tools_availability`（呼び出し元がターンに1回だけ計算した実接続結果）だけで判定が変わる——
-    `tools_pref` 省略（全ON希望）でも、グラフが不達なら impact はブロックされる。"""
+    `tools_pref` 省略（全ON希望）でも、グラフが不達なら impact は run_impact へ進まない
+    （S4 以降は明示エラーではなく grep 相当の下地への縮退・印は `graph_degraded`）。"""
     monkeypatch.setattr(CS, "run_impact", _raise_if_called)
     sm = _sm()   # tools 省略＝全ON希望
     env = CS._dispatch(None, "impact", "消費税率", "w1", sm,
                       tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env["data"] == {}
+    assert env["graph_degraded"] == "graph_unavailable"   # 実接続の不達＝統計に残す側のコード
 
 
 def test_dispatch_tools_availability_omitted_defaults_to_fully_available(monkeypatch):
@@ -2767,3 +2779,223 @@ def test_handle_message_personal_check_failure_falls_closed(monkeypatch):
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([_fixed_result("回答")]))
     CS.handle_message(None, "質問", world="v1", conversation_id=999, user_id="admin", knowledge=False, personal=False)
     assert saved[-1]["role"] == "assistant" and saved[-1].get("personal") is True
+
+
+# ===== S4（縮退の可視化と計数）: 事前検索（グラフ）が不調でも調査を止めない =====
+# モックは外部境界（Neo4j セッション）だけ——`run_impact`/`run_troubleshoot` は差し替えない。
+
+_DEGRADE_SCOPE_META = {"world": "v1", "scope_paths": [], "source": "all"}
+_DEGRADE_TOOLS = {"grep": True, "fulltext": False, "graph": True}
+
+
+class _BoomSession:
+    """全クエリで指定の例外を送出する fake Neo4j セッション（外部境界の注入）。"""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def run(self, query, **kw):
+        raise self.exc
+
+
+def test_dispatch_impact_degrades_to_grep_when_graph_connection_fails():
+    """接続断（`ServiceUnavailable`）で事前検索が落ちても例外を伝播させず、grep 相当の下地と
+    縮退コードを返す（Codex 本体・清書がソースを直接調べる下地になる）。"""
+    from neo4j.exceptions import ServiceUnavailable
+    env = CS._dispatch(_BoomSession(ServiceUnavailable("down")), "impact", "消費税率を変えたい", "v1",
+                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
+    assert env["graph_degraded"] == "graph_unavailable"
+    assert env["data"]["type"] == "qa"   # 例外で終わらず qa 相当の下地（grep／全文）へ委譲している
+
+
+def test_dispatch_troubleshoot_degrades_on_graph_schema_era():
+    """世代不一致も同じく縮退する（接続断とは別のコード）。"""
+    from sherpa.ingest.world_neo4j import GraphSchemaEraError
+    env = CS._dispatch(_BoomSession(GraphSchemaEraError("v1", "old-era", lens="troubleshoot")),
+                       "troubleshoot", "請求の不具合", "v1",
+                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
+    assert env["graph_degraded"] == "graph_reingest_required"
+
+
+def test_finalize_turns_graph_degraded_into_notice_and_limit():
+    """縮退コードは利用者向けの冒頭告知（平文）と統計フラグになり、公開 answer には残らない。"""
+    env = {"headline": "該当箇所が 3件見つかりました。", "summary": {"total": 3},
+           "data": {"citations": [{"doc_id": "a.md"}]}, "sources": [],
+           "graph_degraded": "graph_reingest_required"}
+    out = CS._finalize(env, {"lens": "troubleshoot", "reason": "テスト"})
+    assert "graph_degraded" not in out                       # 閉じたコードは公開しない
+    assert out["headline"].startswith("関係のつながりの情報が古いため")
+    assert out["headline"].endswith("該当箇所が 3件見つかりました。")
+    assert out["limits"]["graph_reingest_required"] is True
+
+
+def test_finalize_graph_degraded_notice_differs_by_state():
+    """3状態のうち接続断は「再取り込み待ち」と別の文言・別の統計項目になる。"""
+    env = {"headline": "本文", "summary": {"total": 0}, "data": {"citations": []}, "sources": [],
+           "graph_degraded": "graph_unavailable"}
+    out = CS._finalize(env, {"lens": "impact", "reason": "テスト"})
+    assert "接続できなかった" in out["headline"]
+    assert out["limits"] == {"backend_unavailable_graph": True}
+
+
+def test_finalize_graph_degraded_notice_survives_no_results_headline():
+    """S4: 0 件案内は headline を**全置換**する——縮退の告知をその前に付けると消えるため、
+    案内の後に前置する（グラフを使わずに調べた事実は 0 件でも利用者に伝える）。"""
+    env = {"headline": "該当する記述は見つかりませんでした。", "summary": {"total": 0},
+           "data": {"citations": []}, "sources": [],
+           "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both",
+                     "depth_profile": "max"},   # 全軸が最も緩い＝再検索案内（retry_hints）は出ない
+           "graph_degraded": "graph_unavailable"}
+    out = CS._finalize(env, {"lens": "qa", "reason": "テスト"})
+    assert out["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
+    assert out["headline"].endswith(CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE)
+    assert out["limits"]["backend_unavailable_graph"] is True
+
+
+def test_dispatch_does_not_degrade_on_non_recoverable_graph_error():
+    """S4: 縮退してよいのは回復可能な障害だけ——`ClientError`（Cypher のバグ等）は握り潰さず
+    そのまま送出し、従来の honest failure（`_degrade_overload` 等）へ委ねる。"""
+    from neo4j.exceptions import ClientError
+    with pytest.raises(ClientError):
+        CS._dispatch(_BoomSession(ClientError("bad cypher")), "impact", "消費税率を変えたい", "v1",
+                     scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
+
+
+def test_dispatch_does_not_degrade_on_neo4j_configuration_error():
+    """`ConfigurationError` はクラス階層上は `DriverError` の派生だが、意味は非一時的な設定不備＝
+    回復不可（`lens_service.neighbor_cards` と同じ分類）——縮退しない。"""
+    from neo4j.exceptions import ConfigurationError
+    with pytest.raises(ConfigurationError):
+        CS._dispatch(_BoomSession(ConfigurationError("bad config")), "troubleshoot", "請求の不具合", "v1",
+                     scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
+
+
+def test_dispatch_entry_degrade_counts_graph_unavailable_only_when_unreachable():
+    """S4: 入口でグラフが**実接続で不達**なら統計に残るコード（`graph_unavailable`）で縮退する。
+    利用者が自分で OFF にしただけなら障害ではない＝計数しないコード（`blocked`）。"""
+    sm_off = _sm(tools={"grep": True, "fulltext": True, "graph": False})
+    env_off = CS._dispatch(None, "impact", "消費税率", "w1", sm_off,
+                           tools_availability={"grep": True, "fulltext": True, "graph": True})
+    assert env_off["graph_degraded"] == "blocked"
+    assert CS._GRAPH_DEGRADED_LIMIT_FIELD.get("blocked") is None   # 計数しない
+
+    env_unreachable = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
+                                   tools_availability={"grep": True, "fulltext": True, "graph": False})
+    assert env_unreachable["graph_degraded"] == "graph_unavailable"
+    out = CS._finalize(env_unreachable, {"lens": "impact", "reason": "テスト"})
+    assert out["limits"]["backend_unavailable_graph"] is True
+
+
+def test_dispatch_graph_failure_without_any_search_tool_stays_blocked():
+    """S4: 事前検索がグラフ不調で落ちても、grep も全文も使えないなら**一度も検索していない**——
+    0 件の検索結果（「見つかりませんでした」）として完了扱いにせず、入口ゲートと同じ明示エラーで
+    終える（`graph_degraded` も付けない＝縮退ではなく実行不能）。"""
+    from neo4j.exceptions import ServiceUnavailable
+    env = CS._dispatch(_BoomSession(ServiceUnavailable("down")), "impact", "消費税率を変えたい", "v1",
+                       scope_meta=_DEGRADE_SCOPE_META,
+                       tools_availability={"grep": False, "fulltext": False, "graph": True})
+    assert env["data"] == {}                 # 0 件の qa 結果ではない（honest failure の形）
+    assert "graph_degraded" not in env
+    assert env["agentic_failure"] == "error"
+
+
+# ===== S4（RV6）: グラフ接続断でターン全体が 500 にならず縮退へ進む =====
+
+class _DispatchingProvider:
+    """`providers/base.py::_gather` と同じく `ctx.dispatch` の結果を `_result` にする最小の頭脳。"""
+
+    def run(self, ctx):
+        env = ctx.dispatch("impact", ctx.message)
+        env.setdefault("headline", "回答")
+        yield {"type": "_result", "env": env,
+               "decision": {"lens": "impact", "input": ctx.message, "reason": "テスト"}}
+
+
+def _graph_down_turn(monkeypatch, *, stream: bool):
+    """グラフが接続断の状態で knowledge=True の1ターンを通す（起点語ヒント→事前検索の両方が落ちる）。"""
+    from neo4j.exceptions import ServiceUnavailable
+    saved = _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _DispatchingProvider())
+    session = _BoomSession(ServiceUnavailable("down"))
+    if stream:
+        list(CS.stream_message(session, "消費税率の影響は？", world="v1", conversation_id=999,
+                               user_id="admin", knowledge=True))
+    else:
+        CS.handle_message(session, "消費税率の影響は？", world="v1", conversation_id=999,
+                          user_id="admin", knowledge=True)
+    return saved[-1]
+
+
+def test_handle_message_degrades_instead_of_crashing_when_graph_connection_is_down(monkeypatch):
+    """`_known_terms`（起点語ヒント）はグラフ接続断でも空で続ける——ここで例外を上げると
+    ターンが 500 で終わり、S4 の縮退（grep/原本直読で答える）へ一度も到達できない。"""
+    row = _graph_down_turn(monkeypatch, stream=False)
+    assert row["role"] == "assistant"
+    assert row["answer"]["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
+    assert row["answer"]["limits"]["backend_unavailable_graph"] is True
+
+
+def test_stream_message_degrades_instead_of_crashing_when_graph_connection_is_down(monkeypatch):
+    """ストリーム経路（背景ターン）も同じ（保存される回答に縮退の告知と計数が残る）。"""
+    row = _graph_down_turn(monkeypatch, stream=True)
+    assert row["role"] == "assistant"
+    assert row["answer"]["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
+    assert row["answer"]["limits"]["backend_unavailable_graph"] is True
+
+
+def test_dispatch_entry_degrade_does_not_count_graph_when_user_turned_it_off():
+    """S4: 利用者がグラフを OFF にしたターンは、実接続も不達（同じ状態）でも障害として計上しない
+    ——計数するのは「使いたかったのに使えなかった」場合だけ（全文検索側と同じ規則）。"""
+    sm = _sm(tools={"grep": True, "fulltext": True, "graph": False})
+    env = CS._dispatch(None, "impact", "消費税率", "w1", sm,
+                       tools_availability={"grep": True, "fulltext": True, "graph": False})
+    assert env["graph_degraded"] == "blocked"       # 通知はするが計数しないコード
+    out = CS._finalize(env, {"lens": "impact", "reason": "テスト"})
+    assert "backend_unavailable_graph" not in (out.get("limits") or {})
+
+
+def test_facts_troubleshoot_degraded_uses_citations_not_no_candidates():
+    """S4: グラフ縮退の troubleshoot（原因候補が無く citations だけの下地）は、impact と同型で
+    引用ベースの整形へ倒す——「原因候補なし」に潰すと grep で拾った該当箇所が清書へ渡らない。"""
+    from sherpa.providers.prompts import _facts
+    env = {"lens": "troubleshoot", "graph_degraded": "graph_unavailable",
+           "data": {"type": "qa", "citations": [
+               {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [10, 12],
+                "quote": "ABEND-CODE 0C7"}]}}
+    out = _facts("troubleshoot", env)
+    assert "原因候補なし" not in out
+    assert "TAXCALC.cbl" in out and "ABEND-CODE 0C7" in out
+
+
+def test_facts_impact_degraded_does_not_assert_no_impact():
+    """S4: 関係グラフを引けていないターンの0件は「影響が無い」ではなく「確認できていない」——
+    断定文・誘導文をどちらも不明側へ差し替える（縮退でないターンは従来どおり）。"""
+    from sherpa.providers.prompts import _facts
+    env = {"lens": "impact", "graph_degraded": "graph_unavailable",
+           "data": {"items": [], "presumed": [], "start": "消費税率"}, "summary": {"total": 0}}
+    out = _facts("impact", env)
+    assert "計0件（該当なし）" not in out
+    assert "構造的なコードの波及は無い" not in out
+    assert "構造的な影響の有無は不明" in out
+
+    normal = _facts("impact", {"lens": "impact",
+                               "data": {"items": [], "presumed": [], "start": "消費税率"},
+                               "summary": {"total": 0}})
+    assert "計0件（該当なし）" in normal   # 縮退していないターンの文面は変えない
+
+
+def test_facts_impact_degraded_with_citations_still_gets_no_assertion_steer():
+    """S4: 該当箇所（citations）を持つ縮退 impact は引用ベースの整形（qa と同じ）へ倒れる——
+    そのままでは「影響は無いと断定しない」指示が清書へ渡らないため、倒した後も同じ一文を足す。"""
+    from sherpa.providers.prompts import _facts
+    env = {"lens": "impact", "graph_degraded": "graph_unavailable",
+           "data": {"items": [], "presumed": [], "citations": [
+               {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [1, 2], "quote": "TAX-RATE"}]}}
+    out = _facts("impact", env)
+    assert "TAXCALC.cbl" in out                      # 引用ベースの整形へ倒れている
+    assert "構造的な影響の有無は不明" in out          # それでも断定しない指示は渡る
+
+    normal = _facts("impact", {"lens": "impact",
+                               "data": {"items": [], "presumed": [], "citations": [
+                                   {"doc_id": "a.md", "span": [1, 2], "quote": "x"}]}})
+    assert "構造的な影響の有無は不明" not in normal   # 縮退していないターンには足さない

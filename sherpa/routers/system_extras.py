@@ -43,6 +43,7 @@ from sherpa import (
     worlds,
 )
 from sherpa.agents import _web_search_admin_allowed
+from sherpa.providers.codex import sandbox as codex_sandbox
 from sherpa.deps import _current_user, _require_admin
 from sherpa.schemas import (
     AnnouncementMutateResponse,
@@ -170,10 +171,11 @@ class SystemSettingsReq(BaseModel):
     # 戻す（既定は固定値ではなく A7・`cloud_provider` 連動＝`usage_chat._default_provider` 参照）。
     # 空文字は明示的に 422（未設定へ戻すのは null のみ）。
     usage_chat_provider: str | None = None
-    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）に依らず一定で使う
-    # 実効基準値（DEPTH-2 S7 以降、倍率・加算は撤去済み）。既定（未指定=None）は各モジュールの
-    # env 既定値（`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は
-    # 未設定へ戻す（env/既定へフォールバック）。
+    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）が掛ける倍率の
+    # 基準値（標準時の値）。既定（未指定=None）は各モジュールの env 既定値
+    # （`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は
+    # 未設定へ戻す（env/既定へフォールバック）。倍率表自体（標準/深く/最大）は固定でここでは
+    # 編集しない。
     depth_base_max_turns: StrictInt | None = Field(default=None, ge=1, le=200)
     depth_base_grep_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
     depth_base_qa_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
@@ -191,6 +193,10 @@ class SystemSettingsReq(BaseModel):
     # null は未設定へ戻す。
     max_review_rounds: StrictInt | None = Field(
         default=None, ge=depth_profile.MAX_REVIEW_ROUNDS_MIN, le=depth_profile.MAX_REVIEW_ROUNDS_MAX)
+    # multi_agent（S6）の worker モデル（`sherpa.providers.codex.sandbox._codex_worker_model`）。
+    # 既定（未指定=None）は `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）。空文字・null は
+    # 未設定へ戻す（実装ベース探索の回復 S1・案 B）。
+    codex_worker_model: str | None = None
     # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
     # 既定（未指定=None）は env 既定値（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。
     # null は未設定へ戻す（env/既定へフォールバック）。
@@ -829,10 +835,11 @@ def _admin_settings_view() -> dict:
             "default": usage_chat._default_provider(sysset),
             "providers": list(usage_chat._USAGE_CHAT_PROVIDERS),
         },
-        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）に依らず一定で
-        # 使う実効基準値（DEPTH-2 S7 以降、倍率・加算は撤去済み）。`effective` は
+        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）が掛ける倍率の
+        # 基準値（標準時の値）。`effective` は
         # `depth_profile.effective_base()`（system_settings→env→コード既定）の解決結果、
-        # `default` は env/コード既定（未設定に戻したときの実効値）。
+        # `default` は env/コード既定（未設定に戻したときの実効値）。倍率表自体（標準/深く/最大）は
+        # 固定でここでは編集しない。
         "depth_profile": {
             "max_turns": {
                 "configured": sysset.get("depth_base_max_turns"),
@@ -893,6 +900,13 @@ def _admin_settings_view() -> dict:
             "configured": sysset.get("max_review_rounds"),
             "effective": depth_profile.effective_max_review_rounds(sysset),
             "default": depth_profile.MAX_REVIEW_ROUNDS_DEFAULT,
+        },
+        # multi_agent（S6）の worker モデル（実装ベース探索の回復 S1・案 B）。env フォールバックは
+        # 持たない（設定は UI(DB) が唯一の持ち主）。
+        "codex_worker_model": {
+            "configured": sysset.get("codex_worker_model"),
+            "effective": codex_sandbox._codex_worker_model(sysset),
+            "default": codex_sandbox._CODEX_WORKER_MODEL_FALLBACK,
         },
         # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
         # `effective` は実際にターン受付が使う値そのもの（`effective_limits()` を直接呼ぶ・
@@ -1263,6 +1277,24 @@ def _validate_depth_base_codex_reasoning(value):
     return v
 
 
+def _validate_codex_worker_model(value):
+    """`codex_worker_model`（multi_agent の worker モデル・実装ベース探索の回復 S1）の検証。
+    None は未設定（`_CODEX_WORKER_MODEL_FALLBACK` へフォールバック）。Codex 自身のモデルカタログは
+    Sherpa 側で把握しないため語彙検証はしない（空文字は None と同じ扱い＝未設定へ戻す）。
+    制御文字（CR/LF 等・DEL）を含む値は 422——`_write_codex_agent_role_configs` が TOML の
+    1行文字列としてそのまま書くため、混入すると生成 TOML が構文エラーになる。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(422, "codex_worker_model は文字列で指定してください")
+    v = value.strip()
+    if not v:
+        return None
+    if any(ch < " " or ch == "\x7f" for ch in v):
+        raise HTTPException(422, "codex_worker_model に制御文字は使えません")
+    return v
+
+
 def _assert_research_default_provider_sendable(effective_settings: dict) -> None:
     """`research_default_provider` を "openai" にする PUT は、保存時点で実際に送信できる状態か
     preflight する（`research_service._connect_openai` が実行時に行う判定と全く同じ関数・同じ
@@ -1425,7 +1457,9 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     累計=4096〜64MiB・範囲外は422）。model_context_windows（§3.4）は "provider:model" →
     tokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。
     chat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・
-    `sherpa.chat_examples.validate` が意味検証・不正は422）。
+    `sherpa.chat_examples.validate` が意味検証・不正は422）。codex_worker_model（multi_agent の
+    worker モデル・実装ベース探索の回復 S1）は文字列のみ（Codex 自身のモデルカタログは検証しない・
+    空文字/nullは未設定へ戻す）。
     監査 INSERT の失敗は
     `store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（
     commit 後の別接続 audit＋失敗時 compensate 方式では穴が残るため、原子性で置き換えた・
@@ -1486,6 +1520,8 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "max_review_rounds" in provided:
         # StrictInt・範囲は pydantic Field が型検証済み。
         updates["max_review_rounds"] = provided["max_review_rounds"]
+    if "codex_worker_model" in provided:
+        updates["codex_worker_model"] = _validate_codex_worker_model(provided["codex_worker_model"])
     # チャット同時実行の上限（2項目とも StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
     for _k in ("chat_max_turns_per_user", "chat_max_turns_global"):
         if _k in provided:

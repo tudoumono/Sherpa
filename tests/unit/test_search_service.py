@@ -336,7 +336,7 @@ class _CtxRaise:
 
 def test_degrade_vocabulary():
     assert ss.DEGRADE_REASONS == frozenset({
-        "es_unavailable", "es_query_failed", "embedding_not_configured",
+        "es_unavailable", "es_query_failed", "es_query_rejected", "embedding_not_configured",
         "embedding_cloud_unavailable",
         "hybrid_query_failed",   # RV3（FBK-1）: hybrid 自体が失敗し BM25 は成功（hits は空でない）
         "vector_feature_mismatch", "query_embed_failed",

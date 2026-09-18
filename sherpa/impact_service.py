@@ -30,9 +30,9 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
 # 影響たどりの既定深さ。`ingest.world_neo4j.IMPACT_MAX_DEPTH` と同じ env 変数を共用する
 # （両モジュールは循環 import のため定数を共有できず、同一ロジックを複製して同じ値に揃える）。
 IMPACT_MAX_DEPTH = _env_int("SHERPA_IMPACT_MAX_DEPTH", 8, 1, 64)
-# env-parse hi 引数と同じ値。調べる深さに依らず一定の実効基準値（`depth_profile.scaled_depth`・
-# DEPTH-2 S7 以降は加算無し）に対して一度だけ適用する絶対上限として使う（管理画面の基準値編集が
-# Field 上限まで伸びても env-parse の上限を超えないようにする）。
+# env-parse hi 引数と同じ値。調べる深さ（`depth_profile.scaled_depth`）が加算適用後に一度だけ
+# 適用する絶対上限として使う（管理画面の基準値編集が Field 上限まで伸びても env-parse の上限を
+# 超えないようにする）。
 IMPACT_MAX_DEPTH_ABS_MAX = 64
 
 # 種別ラベル → 結果カテゴリ（MVP-DETAIL §4.2）。world_neo4j/lens_service が再利用する。

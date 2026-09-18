@@ -55,7 +55,7 @@ import threading
 from pathlib import Path
 from typing import Iterator
 
-from ... import codex_agents_md, codex_skills, model_catalog
+from ... import agentic_search, codex_agents_md, codex_skills, model_catalog
 from ... import depth_profile as depth_profile_mod
 from ... import layer as layer_mod
 from ...mcp_server import COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
@@ -177,7 +177,7 @@ def _accumulate_codex_usage(prev: dict | None, new: dict | None) -> dict | None:
     return prev if new is None else new
 
 
-def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None]:
+def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None, list]:
     """DEPTH-2 S3b: `sherpa/mcp_server.py` が書いたサイドカー（子エージェント＝`spawn_agent`
     された worker/evaluator が読んだ doc_id・ask_user の質問）を読む。呼び出し元は sandbox 有効時
     （model-shell の書込許可領域の外＝通常は codex_home 配下）にあるパスだけを渡す——sandbox 無効
@@ -190,12 +190,15 @@ def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None]:
     **fail-open**（既存の「親の --json だけを見る」観測にそのまま落ちる＝空リスト／None を返すだけで
     例外は出さない・回答処理を例外終了させない）。
 
-    戻り値: `(read_doc_ids, listed_doc_ids, ask_user_question_or_none)`。`ask_user_question` は
-    最初の1件だけ（1実行1回＝`mcp_server.py` 側の既存ガードと同じ数え方）。
+    戻り値: `(read_doc_ids, listed_doc_ids, ask_user_question_or_none, error_codes)`。
+    `ask_user_question` は最初の1件だけ（1実行1回＝`mcp_server.py` 側の既存ガードと同じ数え方）。
+    `error_codes` は子が受け取った障害の閉じたコード（`mcp_server._SIDECAR_ERROR_CODES`・出現順・
+    重複なし）——親の調査状態（縮退の通知・統計）へ合流させるための唯一の観測経路。
     """
     reads: list = []
     listed: list = []
     ask: dict | None = None
+    error_codes: list = []
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -221,11 +224,15 @@ def _read_mcp_sidecar(path: Path) -> tuple[list, list, dict | None]:
                     q = entry.get("question")
                     if isinstance(q, dict):
                         ask = q
+                elif kind == "error":
+                    c = entry.get("code")
+                    if isinstance(c, str) and c and c not in error_codes:
+                        error_codes.append(c)
     except (OSError, UnicodeDecodeError):
         # UnicodeDecodeError は `for line in f` の読取自体（`json.loads` の外）で起きうる
         # （不正 UTF-8 バイト列を含む行）。ここまでに集めた分は返す（部分的な fail-open）。
         pass
-    return reads, listed, ask
+    return reads, listed, ask, error_codes
 
 
 _CHILD_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
@@ -687,7 +694,8 @@ class CodexProvider(Provider):
     Codex の **実コマンド実行（grep 等）・推論・回答**を `--json` から拾い **1つずつ思考ノードに流す**
     （ユーザは Codex の作業を逐次見られる）。失敗/未導入は決定的回答にフォールバック。
     既定 reasoning=low（`SHERPA_CODEX_REASONING` で変更可。RV依頼の xhigh とは別運用）。
-    推論レベルは基準値で固定（深さでは変わらない）。
+    調べる深さ（調べ方ブロック §3.2）が「深く」「最大」のとき、ターンごとに high/xhigh へ
+    per-turn 上書きする（`_prompt_mcp`/`_prompt` 呼び出し直前の `_reason` 計算箇所を参照）。
     """
     label, model = "Codex", "gpt-5.5"
     provider_id = "codex"
@@ -969,11 +977,13 @@ class CodexProvider(Provider):
         _sidecar_init_ok = False
         # `graph_neighbors` の mcp_tool_call item が旧世代
         # グラフの構造化エラー（`_graph_schema_era_from_item`）を運んできたら、ここへ捕まえておく。
-        # `for line in proc.stdout:` を包む2重の `except Exception:`（_attempt 自身・呼び出し元の
-        # `_run_authoring`）は技術的失敗を `_stream_error` へ丸めてしまうため、その中で直接 raise
-        # しても握り潰される——両方の try/except/finally を抜けた後（下の `if codex_question is
-        # not None:` の直前）でこのフラグを見て改めて raise する。
+        # 検知しても調査は止めない（§0(c)・グラフ不調は回答不能の理由にしない）——Codex は同じ
+        # MCP から grep/原本読取ツールを引き続き使えるため、このフラグは「縮退した」という印
+        # だけに使い、終了後の env に冒頭告知と統計フラグとして載せる。
         _graph_schema_era_error = None
+        # 子（`spawn_agent` された worker/evaluator）がサイドカー経由で報告した障害コード
+        # （`mcp_server._SIDECAR_ERROR_CODES`・親の `--json` には現れない）。
+        _mcp_error_codes: list = []
         # ガード: 確認ID 付き再送（前の質問への回答）では ask_user を無視＝再質問ループ防止
         # （chat.js が回答再送に `確認ID: {interaction_id}` を必ず含める・chat_router の marker と同流儀）。
         _ask_disabled = bool(re.search(r"確認ID[:：]", ctx.message or ""))
@@ -1148,9 +1158,9 @@ class CodexProvider(Provider):
                 _is_author = decision["lens"] == "author"
                 # 調べる深さ（調べ方ブロック §3.2）: 通常レンズの基準値だけ管理画面の基準値編集
                 # （system_settings）を反映する（author 専用の env は別軸のため対象外・§1.6 の
-                # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。DEPTH-2 S7 以降、深さに依らず
-                # 基準値をそのまま使う（推論レベルの per-turn 上書きは撤去・`docs/proposals/
-                # 2026-09-17-深さの再定義とレビュー巡.md` §2.3）。
+                # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。標準=基準値のまま・深く=high・
+                # 最大=xhigh の per-turn 上書きは author を含む全レンズに一律適用する（基準値が
+                # 既に上なら下げない）。
                 _base_reason = (os.environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium") if _is_author
                                else depth_profile_mod.effective_base(
                                    self._system_settings, "codex_reasoning", self._reason))
@@ -1549,10 +1559,6 @@ class CodexProvider(Provider):
                                     else:
                                         mcp_neighbors.extend(_mcp_neighbors_from(item))
                                 yield _node(f"cx-{iid}", "tool", tlabel, f"「{detail}」", "done" if done else "active")
-                                if _graph_schema_era_error is not None:
-                                    # 検知後は以降の Codex 自身の調査を待たない（このターンの答えは
-                                    # どのみち `_degrade_overload` の固定文言に置き換わるため）。
-                                    break
                             elif (it == "collab_tool_call" and e.get("type") == "item.completed"
                                   and item.get("tool") == "spawn_agent"):
                                 # DEPTH-2 S3b/S6: 子スレッド id の捕捉のみ（表示ノードは追加しない・
@@ -1697,7 +1703,10 @@ class CodexProvider(Provider):
                     nonlocal codex_question
                     if codex_home is None or not _sidecar_init_ok:
                         return
-                    _sc_reads, _sc_listed, _sc_ask = _read_mcp_sidecar(_sidecar_path)
+                    _sc_reads, _sc_listed, _sc_ask, _sc_errors = _read_mcp_sidecar(_sidecar_path)
+                    for _c in _sc_errors:
+                        if _c not in _mcp_error_codes:
+                            _mcp_error_codes.append(_c)
                     for _d in _sc_reads:
                         if _d not in _mcp_read_docs:
                             _mcp_read_docs.append(_d)
@@ -1729,7 +1738,8 @@ class CodexProvider(Provider):
                                                         direct_read=_direct_read_ok,
                                                         output_schema_v2=_schema_v2,
                                                         multi_agent=_multi_agent_enabled,
-                                                        review_rounds=_review_rounds)
+                                                        review_rounds=_review_rounds,
+                                                        layer=_layer)
                     except Exception as e:
                         _log.warning("AGENTS.md write failed (fail-open, prompt still has containment): %s", e)
                     # スキル配備（案A′ ベース＋個人オーバーレイ）も同じくベストエフォート（fail-open）。
@@ -1910,13 +1920,6 @@ class CodexProvider(Provider):
                 # 早期 return より前に置く）。
                 _log.info("codex mcp calls: total=%d max_in_flight=%d conv=%s uid=%s",
                           _mcp_calls["total"], _mcp_calls["max_in_flight"], ctx.conversation_id, uid)
-                if _graph_schema_era_error is not None:
-                    # 検知した専用例外を、それを飲み込む2重の
-                    # try/except（`_attempt` 自身・この呼び出し元）を両方抜けた後でようやく re-raise
-                    # する——`run()` から uncaught のまま伝播させ、`chat_service._degrade_overload`
-                    # （provider.run() 全体を包む既存の縮退）に固定文言（再取り込み案内）への変換を
-                    # 委ねる（`GraphQueryOverloadError` と同じ既存の fail-loud 経路）。
-                    raise _graph_schema_era_error
                 # ask_user が出たターンは question 優先＝env/_result・成果物台帳登録を出さずここで終了する
                 # （agentic の {"question":..}→return と同じ意味論・回答は chat.js の整形再送＝新 codex exec で拾う）。
                 # proc は直上の finally で後始末済み。chat_service はこの question を answer.question として保存する。
@@ -2116,6 +2119,22 @@ class CodexProvider(Provider):
             # そのものを渡す。
             if isinstance(env, dict):
                 env["codex_multi_agent"] = _multi_agent_enabled
+            # グラフ・全文検索の縮退（親が検知した世代不一致＋子がサイドカーで報告した障害コード）を
+            # 1つの印にまとめる。世代不一致が1件でもあれば「再取り込み待ち」を優先する（接続断より
+            # 利用者の次の一手が具体的なため）。通知文言・グラフ側の計数は `chat_service._finalize`
+            # （`_apply_graph_degraded`）が env のこの印から組む。
+            if isinstance(env, dict):
+                # 事前検索（`chat_service._dispatch`）が既に世代不一致を立てていれば、子の接続断で
+                # 上書きしない（「再取り込み待ち」の方が利用者の次の一手が具体的＝優先する）。
+                _era = (_graph_schema_era_error is not None
+                        or agentic_search.GRAPH_REINGEST_ERROR_CODE in _mcp_error_codes
+                        or env.get("graph_degraded") == agentic_search.GRAPH_REINGEST_ERROR_CODE)
+                if _era:
+                    env["graph_degraded"] = agentic_search.GRAPH_REINGEST_ERROR_CODE
+                elif "graph_unavailable" in _mcp_error_codes:
+                    env["graph_degraded"] = "graph_unavailable"
+                if any(c in _mcp_error_codes for c in ("es_unavailable", "es_query_failed")):
+                    env["limits"] = {**(env.get("limits") or {}), "backend_unavailable_fulltext": True}
             # A2: troubleshoot は Codex が実際に引いた近傍を UI カードにする（_gather 由来を Codex 実調査由来で上書き）。
             _apply_codex_neighbors(env, mcp_neighbors, decision.get("lens") if decision else None)
             # turn.completed から拾った usage は Codex CLI の契約でセッション累計

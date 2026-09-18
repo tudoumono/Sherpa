@@ -264,7 +264,7 @@ def test_read_around_result_reaches_synthesis_digest_when_citation_is_summary_on
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
+        assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
         synth_prompt = p._synth_prompts[-1]
         assert "税率の概要" in synth_prompt        # citation 側は要約止まり
         assert "適用除外あり" in synth_prompt       # 精読本文の条件が清書入力に現れる（本テストの主眼）
@@ -382,7 +382,7 @@ def test_sub_loop_gaps_reach_parent_state_and_synthesis_digest_via_final_payload
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"   # citation 0件でも構造的根拠でゲートを通る
+        assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")   # citation 0件でも構造的根拠でゲートを通る
         synth_prompt = p._synth_prompts[-1]
         assert "調査の限界" in synth_prompt
         assert "ripgrep_search" in synth_prompt and "0件" in synth_prompt
@@ -537,7 +537,7 @@ def test_gate_claimless_graph_card_passes_via_graph_node_evidence(monkeypatch):
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "troubleshoot", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"   # ゲートを通り合成まで到達
+        assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")   # ゲートを通り合成まで到達
         packet = result["env"]["data"]["evidence_packet"]
         assert len(packet["evidence"]) == 1
         assert packet["evidence"][0]["source_type"] == "graph"
@@ -582,7 +582,7 @@ def test_impact_graph_card_evidence_reaches_synthesis_prompt_not_zero(monkeypatc
         assert "計0件" not in prompt
         assert "[graph]" in prompt and "TAXCALC" in prompt
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"   # ゲートを通り合成まで到達
+        assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")   # ゲートを通り合成まで到達
     finally:
         _restore_post(orig)
 
@@ -729,11 +729,11 @@ def test_hybrid_synthesis_attribution_digest_surfaces_structural_only_evidence(m
         # プロンプトへ届く——「該当なし」に丸めない（`build_synthesis_digest` の [list_docs] 表現）。
         assert "該当なし" not in prompt
         assert "[list_docs]" in prompt and "該当 1 件" in prompt and doc in prompt
-        assert p.attribution_text == "資料が1件あります。"   # 確定した回答本文を渡す
+        assert p.attribution_text.endswith("資料が1件あります。")   # 確定した回答本文を渡す
         assert "該当 1 件" in p.attribution_digest and "列挙 1 件" in p.attribution_digest
         assert doc in p.attribution_digest   # digest はツール結果と同じ露出＝生 doc_id がそのまま出る
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "資料が1件あります。"
+        assert result["env"]["headline"].endswith("資料が1件あります。")
         assert result["env"]["sources_verified"] == [doc]
         packet = result["env"]["data"]["evidence_packet"]
         assert packet["evidence"][0]["matched_doc_ids"] == [doc]
@@ -794,9 +794,9 @@ def test_attribution_call_drives_sources_verified_not_local_draft(monkeypatch):
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
         assert "used_evidence" not in "".join(deltas).lower()
-        assert p.attribution_text == "手数料改定障害記録.mdをもとに回答します。"   # 帰属コピーは本文そのもの（redact のみ）
+        assert p.attribution_text.endswith("手数料改定障害記録.mdをもとに回答します。")   # 帰属コピーは本文そのもの（redact のみ）
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "手数料改定障害記録.mdをもとに回答します。"   # 表示本文は不変
+        assert result["env"]["headline"].endswith("手数料改定障害記録.mdをもとに回答します。")   # 表示本文は不変
         assert result["env"]["sources_verified"] == [doc_b]        # 帰属した doc_b だけが根拠
         assert doc_a not in result["env"]["sources_verified"]      # 破棄した草稿の内容は無関係
     finally:
@@ -831,7 +831,7 @@ def test_cloud_synthesis_default_no_attribution_still_flushes_full_text(monkeypa
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER without attribution."   # 全文 flush
+        assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER without attribution.")   # 全文 flush
         assert result["env"]["sources_verified"] == []
     finally:
         _restore_post(orig)
@@ -892,7 +892,7 @@ def test_hybrid_synthesis_attribute_exception_keeps_body_and_degrades_to_empty_a
         with caplog.at_level(logging.WARNING, logger="sherpa"):
             events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "CLOUD SYNTH ANSWER."   # 本文は維持される（再raiseしない）
+        assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER.")   # 本文は維持される（再raiseしない）
         assert result["env"]["sources_verified"] == []              # 帰属は空集合へ縮退
         assert any("attribution" in r.getMessage() for r in caplog.records)
     finally:
@@ -937,9 +937,11 @@ def test_hybrid_synthesis_stop_event_headline_is_partial_stream_so_far():
         ctx = _ctx(stop_event=stop_event)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
-        assert deltas == ["回答本文"]
+        # 根拠の種別が揃わないターンは冒頭の告知が1個の delta として前置される——本文の
+        # チャンク自体は受信したまま（byte-identical・保留しない）。
+        assert deltas[-1:] == ["回答本文"]
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "回答本文"
+        assert result["env"]["headline"].endswith("回答本文")
         assert result["env"]["headline"] == "".join(deltas)   # headline と配信本文が一致する
     finally:
         A.run_tool = orig_run_tool
@@ -983,9 +985,11 @@ def test_hybrid_synthesis_stop_event_set_immediately_after_stream_completes_skip
         ctx = _ctx(stop_event=stop_event)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
-        assert deltas == ["回答本文"]
+        # 根拠の種別が揃わないターンは冒頭の告知が1個の delta として前置される——本文の
+        # チャンク自体は受信したまま（byte-identical・保留しない）。
+        assert deltas[-1:] == ["回答本文"]
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "回答本文"
+        assert result["env"]["headline"] == "".join(deltas)
         assert result["env"]["sources_verified"] == []   # 帰属を行っていないので根拠は付かない
     finally:
         A.run_tool = orig_run_tool
@@ -1037,7 +1041,7 @@ def test_hybrid_synthesis_skips_attribution_when_stream_completion_reason_is_tru
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "途中で切れた回答"
+        assert result["env"]["headline"].endswith("途中で切れた回答")
         assert result["env"]["sources_verified"] == []   # 帰属を行っていないので根拠は付かない
         assert result["env"]["data"]["evidence_packet"]["stop_reason"] == "truncated"
     finally:
@@ -1115,7 +1119,7 @@ def test_hybrid_synthesis_skips_attribution_when_stream_ends_without_terminal_fr
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "本文チャンクの後、前触れなく EOF"
+        assert result["env"]["headline"].endswith("本文チャンクの後、前触れなく EOF")
         assert result["env"]["sources_verified"] == []
     finally:
         A.run_tool = orig_run_tool
@@ -1159,7 +1163,7 @@ def test_hybrid_synthesis_skips_attribution_when_completion_reason_is_unknown():
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "壊れた終端理由"
+        assert result["env"]["headline"].endswith("壊れた終端理由")
         assert result["env"]["sources_verified"] == []
     finally:
         A.run_tool = orig_run_tool
@@ -1204,7 +1208,7 @@ def test_hybrid_synthesis_skips_attribution_when_reason_is_valid_for_a_different
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "他方言なら自然完了の理由"
+        assert result["env"]["headline"].endswith("他方言なら自然完了の理由")
         assert result["env"]["sources_verified"] == []
     finally:
         A.run_tool = orig_run_tool
@@ -1307,9 +1311,11 @@ def test_hybrid_synthesis_exception_mid_stream_keeps_partial_body_no_attribution
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
-        assert deltas == ["回答"]
+        # 根拠の種別が揃わないターンは冒頭の告知が1個の delta として前置される——本文の
+        # チャンク自体は受信したまま（byte-identical・保留しない）。
+        assert deltas[-1:] == ["回答"]
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "回答"
+        assert result["env"]["headline"] == "".join(deltas)
         assert result["env"]["sources_verified"] == []   # 帰属なし＝read_around のみへ縮退（今回は0）
     finally:
         A.run_tool = orig_run_tool
@@ -1351,7 +1357,7 @@ def test_hybrid_synthesis_mid_stream_timeout_marks_agentic_failure_timeout():
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
-        assert result["env"]["headline"] == "回答"   # 部分本文は破棄しない
+        assert result["env"]["headline"].endswith("回答")   # 部分本文は破棄しない
         assert result["env"]["agentic_failure"] == "timeout"
         from sherpa import stop_kind
         assert stop_kind.resolve(result["env"]) == "timeout"
@@ -1786,16 +1792,15 @@ def test_guard_omitted_equals_env_default():
                         "llm_timeout": int(os.environ.get("SHERPA_LLM_TIMEOUT", "60"))}
 
 
-# ===== 調べる深さ（調べ方ブロック §3.2）: 検索アシスタント（_sub）有効時の配線 =====
+# ===== 調べる深さ（調べ方ブロック §3.2）: 検索アシスタント（_sub）有効時の倍率配線 =====
 # `_sub_loop`（`_sub_agentic_loop` 経由）は通常の `_agentic_loop` を迂回するため、独立して
-# max_turns/max_hits/window_cap への配線を固定する。DEPTH-2 S7 以降、倍率は撤去——
-# admin 未設定時は guard 値・admin 設定時は管理基準値のまま、深さ（standard/deep/max）に
-# 依らず同じ値が渡る。
+# max_turns/max_hits/window_cap への配線を固定する（**admin 未設定時**は standard で guard 値の
+# まま・admin 設定時は管理基準値が優先・deep/max だけ倍率が一度だけ効く）。
 
 def test_sub_loop_scales_max_turns_hits_window_with_depth_profile(monkeypatch):
-    """DEPTH-2 S7: system_settings に depth_base_max_turns が無ければ guard["max_turns"]
-    （既定 6）が基準値のまま、深さに依らず変わらない。hits/window も通常の _agentic_loop と
-    同じ実効基準値（system_settings 未設定＝env 既定）をそのまま使う。"""
+    """system_settings に depth_base_max_turns が無ければ guard["max_turns"]（既定 6）を基準値
+    として深さの倍率を掛ける。hits/window も通常の _agentic_loop と同じ実効基準値
+    （system_settings 未設定＝env 既定）に同じ倍率を掛ける。"""
     from sherpa import depth_profile as D
     captured = {}
 
@@ -1806,7 +1811,7 @@ def test_sub_loop_scales_max_turns_hits_window_with_depth_profile(monkeypatch):
     monkeypatch.setattr(A, "openai_style", fake_openai_style)
     p = _FakeSynth("sk-dummy", "gpt-5.5")
     p._sub = dict(_SUB)   # guard.max_turns = 6
-    for profile, expected_turns in (("standard", 6), ("deep", 6), ("max", 6)):
+    for profile, expected_turns in (("standard", 6), ("deep", 12), ("max", 18)):
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": profile})
         list(p._sub_agentic_loop(ctx))
         assert captured.get("max_turns") == expected_turns, profile
@@ -1823,14 +1828,14 @@ def test_sub_loop_stashes_effective_limits_for_usage_meta(monkeypatch):
     p._sub = dict(_SUB)   # guard.max_turns = 6
     ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"})
     list(p._sub_agentic_loop(ctx))
-    assert p._last_sub_depth_usage == {"depth_profile": "deep", "max_turns": 6,
+    assert p._last_sub_depth_usage == {"depth_profile": "deep", "max_turns": 12,
                                        "max_tools_per_turn": A.MAX_TOOLS_PER_TURN}
 
 
 def test_sub_loop_max_turns_prefers_admin_base_over_guard_when_set(monkeypatch):
     """system_settings に depth_base_max_turns があれば guard["max_turns"] より優先する
     （管理者が反復基準値を下げても検索アシスタント有効時だけ外れる、ということがないように）。
-    DEPTH-2 S7 以降、深さは基準値に効かない（受け入れ条件(1)）。"""
+    深さの倍率はこの優先解決の**後**に掛かる。"""
     from sherpa import depth_profile as D
     captured = {}
 
@@ -1842,7 +1847,7 @@ def test_sub_loop_max_turns_prefers_admin_base_over_guard_when_set(monkeypatch):
     p = _FakeSynth("sk-dummy", "gpt-5.5")
     p._sub = dict(_SUB)   # guard.max_turns = 6（system_settings 優先時は無視されるべき）
     p._system_settings = {"depth_base_max_turns": 5}
-    for profile, expected_turns in (("standard", 5), ("deep", 5), ("max", 5)):
+    for profile, expected_turns in (("standard", 5), ("deep", 10), ("max", 15)):
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": profile})
         list(p._sub_agentic_loop(ctx))
         assert captured.get("max_turns") == expected_turns, profile
@@ -2517,7 +2522,7 @@ def test_agentic_run_stop_reason_unknown_when_synthesis_raises(monkeypatch):
     ctx = _ctx()
     events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
     result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"] == "1デルタ目"
+    assert result["env"]["headline"].endswith("1デルタ目")
     assert result["env"]["data"]["evidence_packet"]["stop_reason"] == "unknown"
 
 
@@ -2703,3 +2708,245 @@ def test_self_worker_failure_note_does_not_tell_user_to_turn_helper_off():
     assert env.get("agentic_failure"), f"失敗の印が無い: {env}"
     assert "OFF" not in env["headline"], f"実行できない案内が残っている: {env['headline']}"
     assert "質問を具体的に" in env["headline"], env["headline"]
+
+
+# ===== S3(b): self_worker の回復可能な障害のみ→単発フォールバックへ縮退（回復不可・査読不足・
+# 予算到達は除外）=====
+
+def test_self_worker_recoverable_only_failure_degrades_to_fallback_without_graph(monkeypatch):
+    """`ripgrep_search` の実装（`grep_tool.grep_search`・ファイル I/O 境界）が読取I/O失敗
+    （`OSError`・回復可能）を起こし、モデルがそれ以上ツールを呼ばず自然完了（予算到達ではない
+    stop_reason）した場合、honest failure ではなく単発フォールバックへ縮退する——復帰経路は
+    グラフを使わない（qa 相当へ強制する）ことも合わせて確認する。モックは外部境界（ファイル I/O）
+    だけに置く——`run_tool` 自体（試験対象の実行経路）は実物のまま通す（`test_lens_service.py` の
+    `grep_search` モックと同じ境界）。"""
+    _calls = {"n": 0}
+
+    def fake_post(url, headers, body, timeout=90):
+        _calls["n"] += 1
+        if _calls["n"] == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"ZZZ"}'}}]}}]}
+        # 2ターン目は自然完了（tool_calls 無し・finish_reason=stop）——stop_reason は
+        # "no_tool_calls" になり `_BUDGET_EXHAUSTED_STOP_REASONS` に含まれない
+        # （turns_exhausted/budget_exceeded/tools_per_turn_exceeded とは別）。
+        return {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+
+    def boom_grep_search(*a, **kw):
+        raise OSError("boom")
+
+    orig_post, orig_grep = A._post, A.grep_tool.grep_search
+    A._post, A.grep_tool.grep_search = fake_post, boom_grep_search
+    dispatch_calls = []
+
+    def fake_dispatch(lens, inp):
+        dispatch_calls.append(lens)
+        return {"summary": {"total": 0}, "data": {}, "sources": []}
+
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        # impact/troubleshoot 相当（グラフを使うレンズ）から始めても、復帰経路はグラフを使わない
+        # （qa 相当へ強制）ことを確認するため意図的に "impact" にする。
+        ctx = _ctx(route=lambda m: {"lens": "impact", "input": m, "reason": "test"}, dispatch=fake_dispatch)
+        events = list(p.run(ctx))
+    finally:
+        A._post, A.grep_tool.grep_search = orig_post, orig_grep
+    assert dispatch_calls == ["qa"], f"復帰経路がグラフを使っている: {dispatch_calls}"
+    # `providers/base.py::_node` はラップせず `{"type": "node", "id": "fallback", ...}` をそのまま yield する。
+    fallback_nodes = [e for e in events if e.get("type") == "node" and e.get("id") == "fallback"]
+    assert any("ゼロから調べ直します" in n.get("detail", "") for n in fallback_nodes), fallback_nodes
+    # honest failure の固定文言（「調査がうまくいきませんでした」）は出ない——縮退したため。
+    assert not any("調査がうまくいきませんでした" in (e.get("text") or "")
+                  for e in events if e.get("type") == "answer_delta")
+
+
+def test_self_worker_budget_exhausted_with_recoverable_failure_stays_honest_failure(monkeypatch):
+    """予算到達（turns_exhausted）で終端したターンは、記録された障害が回復可能なものだけでも
+    単発フォールバックへ縮退せず、従来どおり honest failure のまま終端する——self_worker は
+    `self._sub is not None` のため `budget_exhausted`（`providers/base.py`）ローカル判定が常に
+    False になり、`_last_stop_reason` を見ない限り誤って縮退してしまう回帰を防ぐ。"""
+    def fake_post(url, headers, body, timeout=90):
+        # 毎ターン tool_calls を返し続け、`_self_sub()` の max_turns（6）に達するまで
+        # ツール呼び出しが続く＝実際の stop_reason は "turns_exhausted"。
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"ZZZ"}'}}]}}]}
+
+    def boom_grep_search(*a, **kw):
+        raise OSError("boom")               # 回復可能（読取I/O）のみ・毎回
+
+    orig_post, orig_grep = A._post, A.grep_tool.grep_search
+    A._post, A.grep_tool.grep_search = fake_post, boom_grep_search
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        events = list(p.run(_ctx()))
+    finally:
+        A._post, A.grep_tool.grep_search = orig_post, orig_grep
+    result = next(e for e in events if e.get("type") == "_result")
+    assert "調査がうまくいきませんでした" in result["env"]["headline"]   # honest failure のまま
+    assert result["env"]["_terminal"] == "failed"
+    # `id="fallback"` の node は honest failure 側（label="調査がうまくいきませんでした"）も
+    # 単発フォールバック縮退側（label="検索方法を切替"）も共有するため、縮退側だけを狙って
+    # 「無いこと」を確認する（`id` だけでは区別できない）。
+    degrade_nodes = [e for e in events if e.get("type") == "node" and e.get("label") == "検索方法を切替"]
+    assert not degrade_nodes, f"予算到達なのに単発フォールバックへ縮退している: {degrade_nodes}"
+
+
+def test_self_worker_budget_exhausted_with_dropped_citations_and_recoverable_failure_stays_honest_failure(
+        monkeypatch):
+    """予算到達（turns_exhausted）＋回復可能な障害（読取I/O）の記録に加え、集めた引用候補が
+    機械検証で全滅（`dropped_citations` 非空）した場合でも、単発フォールバックへ縮退せず
+    honest failure のまま終端する——`_finalize_payload` が「候補全滅」を理由に stop_reason を
+    `evidence_verification_failed` へ上書きすると、`_last_stop_reason` が予算到達を示せなくなり
+    誤って縮退してしまう回帰を防ぐ（外部境界＝`grep_tool.grep_search` だけをモックする）。"""
+    def fake_post(url, headers, body, timeout=90):
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"ZZZ"}'}}]}}]}
+
+    call_count = {"n": 0}
+
+    def flaky_grep_search(*a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("boom")               # 回復可能（読取I/O）を1回だけ記録させる
+        # 以後は存在しない doc への「ヒット」を返す——commit gate（機械検証）で毎回全滅させ、
+        # dropped_citations を非空にし続ける（committed は常に空のまま）。
+        return [{"doc_id": "ghost-does-not-exist.md", "path": "ghost-does-not-exist.md",
+                "ext": ".md", "line": 1, "span": [1, 1], "text": "x"}]
+
+    orig_post, orig_grep = A._post, A.grep_tool.grep_search
+    A._post, A.grep_tool.grep_search = fake_post, flaky_grep_search
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        events = list(p.run(_ctx()))
+    finally:
+        A._post, A.grep_tool.grep_search = orig_post, orig_grep
+    assert call_count["n"] >= 2   # 両方の状況（回復可能な例外・引用全滅）が実際に発生した
+    result = next(e for e in events if e.get("type") == "_result")
+    assert "調査がうまくいきませんでした" in result["env"]["headline"]   # honest failure のまま
+    assert result["env"]["_terminal"] == "failed"
+    degrade_nodes = [e for e in events if e.get("type") == "node" and e.get("label") == "検索方法を切替"]
+    assert not degrade_nodes, f"予算到達なのに単発フォールバックへ縮退している: {degrade_nodes}"
+
+
+def test_self_worker_mixed_recoverable_and_nonrecoverable_failure_stays_honest_failure(monkeypatch):
+    """同一ターンで回復可能（接続断/読取I/O）と回復不可（プログラムの欠陥）が混在する場合は
+    単発フォールバックへ縮退せず、従来どおり honest failure のまま終端する。モックは外部境界
+    （ファイル I/O＝`grep_tool.grep_search`）だけに置く——`run_tool` 自体は実物のまま通す。"""
+    def fake_post(url, headers, body, timeout=90):
+        return {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"ZZZ"}'}}]}}]}
+
+    call_count = {"n": 0}
+
+    def boom_grep_search(*a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("boom")               # 回復可能
+        raise TypeError("programming bug")       # 回復不可（プログラムの欠陥）
+
+    orig_post, orig_grep = A._post, A.grep_tool.grep_search
+    A._post, A.grep_tool.grep_search = fake_post, boom_grep_search
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = _self_sub()
+        events = list(p.run(_ctx()))
+    finally:
+        A._post, A.grep_tool.grep_search = orig_post, orig_grep
+    assert call_count["n"] >= 2   # 実際に両方の障害が発生した
+    result = next(e for e in events if e.get("type") == "_result")
+    assert "調査がうまくいきませんでした" in result["env"]["headline"]   # honest failure のまま
+    assert result["env"]["_terminal"] == "failed"
+
+
+def test_self_worker_main_review_insufficient_excluded_from_degrade_even_with_backend_failures():
+    """`_MainReviewInsufficient`（査読が正常に働いた根拠不足）は、回復可能な障害が記録されていても
+    単発フォールバックへ縮退しない（S3(b) の除外規律）。"""
+    from sherpa import investigation_state
+    from sherpa.providers import base as base_mod
+
+    p = _FakeSynth("sk-dummy", "gpt-5.5")
+    p._sub = _self_sub()
+
+    def fake_agentic_run(ctx, decision):
+        state = investigation_state.InvestigationState(question=ctx.message, scope={})
+        state.mark_backend_failure("read_io")   # 回復可能な障害だけが記録されている状態を模す
+        p._last_investigation_state = state
+        p._last_run_limits = state.limits
+        raise base_mod._MainReviewInsufficient("main review judged evidence insufficient")
+        yield   # pragma: no cover - ジェネレータ化のためだけの到達しない yield
+
+    p._agentic_run = fake_agentic_run
+    events = list(p.run(_ctx()))
+    result = next(e for e in events if e.get("type") == "_result")
+    assert "再調査を行いましたが" in result["env"]["headline"]   # honest failure のまま（縮退しない）
+
+
+# ===== S4（縮退の可視化と計数）: 最初から不達の全文検索も計数する =====
+
+def _run_hybrid_with_availability(availability, tools_pref=None):
+    """ハイブリッド（self_worker）経路を1ターン走らせて `_result` の env を返す。"""
+    calls = []
+
+    def fake_post(url, headers, body, timeout=90):
+        calls.append(1)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": "LOCAL PROSE"}}]}
+        return {"choices": [{"message": {"content": '{"claims": []}'}}]}
+
+    orig = A._post
+    A._post = fake_post
+    try:
+        p = _FakeSynth("sk-dummy", "gpt-5.5")
+        p._sub = dict(_SUB)
+        sm = {"world": "v1", "scope_paths": [], "source": "all"}
+        if tools_pref is not None:
+            sm["tools"] = tools_pref
+        ctx = _ctx(scope_meta=sm, tools_availability=availability)
+        events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
+        return next(e for e in events if e.get("type") == "_result")["env"]
+    finally:
+        A._post = orig
+
+
+def test_hybrid_counts_fulltext_unavailable_at_entry():
+    """self_worker は `_sub_loop` が toolset を明示指定するため `agentic_search` 側の判定を
+    通らない——入口で1回だけ記録する（不達で es_search を提示できなかった事実を落とさない）。"""
+    env = _run_hybrid_with_availability({"grep": True, "fulltext": False, "graph": True})
+    assert env["limits"]["backend_unavailable_fulltext"] is True
+    # 同じ事実を重ねて記録しても bool は1つ＝二重計数にならない。
+    assert env["limits"]["backend_unavailable_fulltext"] is True
+
+
+def test_hybrid_does_not_count_fulltext_when_user_turned_it_off():
+    """利用者が全文検索を OFF にしただけのターンは障害ではない（計数しない）。"""
+    env = _run_hybrid_with_availability({"grep": True, "fulltext": True, "graph": True},
+                                        tools_pref={"grep": True, "fulltext": False, "graph": True})
+    assert "backend_unavailable_fulltext" not in (env.get("limits") or {})
+
+
+def test_hybrid_counts_graph_unavailable_for_any_lens():
+    """S4: グラフ不達はレンズに依らず計上する（qa 中心の運用で Neo4j 停止が永久に 0 にならない）。"""
+    env = _run_hybrid_with_availability({"grep": True, "fulltext": True, "graph": False})
+    assert env["limits"]["backend_unavailable_graph"] is True
+
+
+def test_hybrid_does_not_count_graph_when_user_turned_it_off():
+    """利用者がグラフを OFF にしたターンは、実接続が不達でも障害として計上しない
+    （全文検索側と同じ規則＝希望との AND）。"""
+    env = _run_hybrid_with_availability({"grep": True, "fulltext": True, "graph": False},
+                                        tools_pref={"grep": True, "fulltext": True, "graph": False})
+    assert "backend_unavailable_graph" not in (env.get("limits") or {})
+
+
+def test_hybrid_graph_unavailable_for_qa_counts_without_notice():
+    """S4: グラフを必要としないレンズ（qa）では、不達を統計に残しても回答本文は変えない
+    ——そのターンはグラフツールを一度も提示しておらず、利用者から見て何も起きていない。"""
+    env = _run_hybrid_with_availability({"grep": True, "fulltext": True, "graph": False})
+    assert env["limits"]["backend_unavailable_graph"] is True
+    assert not env["headline"].startswith("関係のつながり")

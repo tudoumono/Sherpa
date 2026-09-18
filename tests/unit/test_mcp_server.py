@@ -485,3 +485,37 @@ def test_sidecar_append_write_failure_logs_warning_once_without_body(tmp_path, c
     finally:
         os.environ.pop("SHERPA_MCP_SIDECAR", None)
         M._sidecar_write_failed_once = False
+
+
+# S4（縮退の可視化と計数）: 子エージェント（spawn_agent された worker/evaluator）の MCP 呼出は親の
+# `--json` に現れないため、障害もサイドカーの新種別 `{"kind": "error", "code", "tool", "ts"}` として
+# 記録する（閉じたコードだけ・本文や資料名は書かない）。
+
+def test_graph_schema_era_writes_sidecar_error_entry_with_code_only(tmp_path, monkeypatch):
+    """旧世代グラフ（`graph_reingest_required`）を子が受け取ったら、親が観測できるよう
+    サイドカーへ閉じたコードだけを1行書く（world/stored_era 等の値は書かない）。"""
+    sidecar = tmp_path / "sidecar.jsonl"
+    monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
+
+    def _boom(name, args, world, scope_paths, **kw):
+        raise M.GraphSchemaEraError(world, "old-era", lens="troubleshoot")
+    monkeypatch.setattr(M.agentic_search, "run_tool", _boom)
+    resp = M.handle({"jsonrpc": "2.0", "id": 80, "method": "tools/call",
+                     "params": {"name": "graph_neighbors", "arguments": {"name": "請求"}}})
+    assert resp["result"]["isError"] is True
+    entries = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "error" and entries[0]["code"] == "graph_reingest_required"
+    assert entries[0]["tool"] == "graph_neighbors"
+    assert set(entries[0].keys()) == {"kind", "code", "tool", "ts"}   # 本文・world・stored_era を書かない
+
+
+def test_tool_error_without_known_code_writes_no_sidecar_entry(tmp_path, monkeypatch):
+    """自由文のツールエラー（閉じたコードを持たない）はサイドカーに書かない——観測できるのは
+    閉集合のコードだけという契約（本文が台帳へ漏れない）。"""
+    sidecar = tmp_path / "sidecar.jsonl"
+    monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
+    resp = M.handle({"jsonrpc": "2.0", "id": 81, "method": "tools/call",
+                     "params": {"name": "read_around", "arguments": {"doc_id": "居ない.md", "line": 1}}})
+    assert resp["result"]["isError"] is True
+    assert not sidecar.exists()

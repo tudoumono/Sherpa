@@ -177,6 +177,7 @@ let _depthProfileBaseline = {};    // put キー -> 文字列化した configure
 let _depthReasoningBaseline = '';
 let _agenticToolLimitBaseline = '';
 let _maxReviewRoundsBaseline = '';
+let _codexWorkerModelBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
 
 // 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
@@ -1450,6 +1451,13 @@ function renderResearchTab(view) {
   $('max-review-rounds').value = _maxReviewRoundsBaseline;
   $('max-review-rounds-hint').textContent = `現在の適用値: ${rounds.effective} 回。既定: ${rounds.default} 回。`
     + (rounds.configured == null ? '未設定です。' : 'この値で固定中です。');
+  const workerModel = view.codex_worker_model;
+  _codexWorkerModelBaseline = workerModel.configured == null ? '' : String(workerModel.configured);
+  $('codex-worker-model').value = _codexWorkerModelBaseline;
+  $('codex-worker-model').placeholder = `既定: ${workerModel.default}`;
+  $('codex-worker-model-hint').textContent = workerModel.configured == null
+    ? `未設定です（既定 ${workerModel.default} が適用されます）。`
+    : `この値で固定中です（既定: ${workerModel.default}）。`;
   const parallel = view.embed_parallel;
   _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
   $('embed-parallel').value = _embedParallelBaseline;
@@ -1464,6 +1472,10 @@ function agenticToolLimitChanged() {
 
 function maxReviewRoundsChanged() {
   return $('max-review-rounds').value.trim() !== _maxReviewRoundsBaseline;
+}
+
+function codexWorkerModelChanged() {
+  return $('codex-worker-model').value.trim() !== _codexWorkerModelBaseline;
 }
 
 function embedParallelChanged() {
@@ -2044,6 +2056,10 @@ async function save() {
   if (maxReviewRoundsChanged()) {
     body.max_review_rounds = maxReviewRounds.value === '' ? null : Number(maxReviewRounds.value);
   }
+  if (codexWorkerModelChanged()) {
+    const v = $('codex-worker-model').value.trim();
+    body.codex_worker_model = v === '' ? null : v;
+  }
   if (embedParallelChanged()) {
     body.embed_parallel = embedParallel.value === '' ? null : Number(embedParallel.value);
   }
@@ -2160,6 +2176,7 @@ async function resetResearchTab() {
   body.agentic_max_tools_per_turn = null;
   body.embed_parallel = null;
   body.max_review_rounds = null;
+  body.codex_worker_model = null;
   body.agentic_budget_per_result = null;
   body.agentic_budget_total = null;
   let view;
@@ -2327,7 +2344,7 @@ const TAB_DIRTY = {
     || openaiEndpointChanged() || mcEmbedChanged()
     || chatMaxTurnsChanged() || chatExamplesChanged(),
   research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged() || maxReviewRoundsChanged()
-    || agenticBudgetChanged(),
+    || codexWorkerModelChanged() || agenticBudgetChanged(),
   models: () => mcCatalogChangedExcludingEmbed() || modelWindowsTableChanged(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
   usage: () => usageChatProviderChanged(),
@@ -2389,6 +2406,7 @@ function applyConfigChangedHighlights(view) {
   mark($('depth-base-codex-reasoning'), reasoning.effective !== reasoning.default);
   mark($('agentic-max-tools-per-turn'), view.agentic_tool_limit.effective !== view.agentic_tool_limit.default);
   mark($('max-review-rounds'), view.max_review_rounds.effective !== view.max_review_rounds.default);
+  mark($('codex-worker-model'), view.codex_worker_model.effective !== view.codex_worker_model.default);
   mark($('embed-parallel'), view.embed_parallel.effective !== view.embed_parallel.default);
   // 同時実行の上限。
   const cmt = view.chat_max_turns || {};

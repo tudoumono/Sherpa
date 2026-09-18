@@ -44,6 +44,13 @@ _READ_TEXT_CAP_BYTES = _synthesis_budget_bytes() // 4
 # ごとに小さい（文脈整理＝48KiB・査読＝清書予算の 1/2）ため、保存上限に連動させると精読 2〜6 件で
 # 【限界】が無通知で落ちる。保存本文は `_READ_TEXT_CAP_BYTES` まで持ち、清書入力にはそのまま渡す。
 _RENDER_READ_TEXT_CAP = 800
+
+# 縮退（バックエンド不調）の計数を `answer.limits` のフラットな bool 項目へ載せるための対応表
+# （`store/usage.py::_USAGE_LIMIT_BOOL_FIELDS` と同じ語彙）。`read_io` は統計項目を持たない
+# （障害先の分類にだけ使う）。集計の意味論は「このターンで初めて検出されたかどうか」＝初回検出の
+# 計数で、障害が起きた巡の数ではない（`providers/base.py::_limits_delta` が偽→真の巡だけ載せる）。
+_BACKEND_LIMIT_FIELD = {"fulltext": "backend_unavailable_fulltext", "graph": "backend_unavailable_graph"}
+GRAPH_REINGEST_LIMIT_FIELD = "graph_reingest_required"
 _STRUCTURAL_FACT_CAP = 800  # glob_search/doc_outline/compare_documents の実質的結果（パス一覧・
                             # 見出し一覧・差分要点）の切り詰め長——件数だけでなく内容そのものを
                             # 文脈整理後も残すための上限（精読本文の保存上限＝`_READ_TEXT_CAP_BYTES`
@@ -573,10 +580,13 @@ class InvestigationState:
     gaps: list[str] = field(default_factory=list)
     # limits: この run 中に実際に当たった内部制限のカウンタ（緩める/強めるための値ではなく計測専用
     # ・利用統計の「打ち切りの内訳」の元データ）。回数系（*_clipped/*_compactions/auto_continues）は
-    # int・当たったか系（total_budget_hit/synthesis_truncated）は bool。
+    # int・当たったか系（total_budget_hit/synthesis_truncated/depth_escalated）は bool。
+    # `depth_escalated`＝必要な根拠種別が揃わず深さを1段だけ自動で引き上げたターン（`providers/
+    # base.py` の巡ループが唯一の書き手）。
     limits: dict = field(default_factory=lambda: {
         "tool_result_clipped": 0, "total_budget_hit": False, "context_compactions": 0,
-        "synthesis_truncated": False, "search_truncated": 0, "auto_continues": 0})
+        "synthesis_truncated": False, "search_truncated": 0, "auto_continues": 0,
+        "depth_escalated": False})
     # DEPTH-2 S1: 主張と採否の状態（`set_claims` が検証済みのものだけを保持する・既定は空＝
     # 査読の全回答破棄をこの状態で置き換えていない通常のターンでは触らないまま）。
     claims: list = field(default_factory=list)
@@ -586,6 +596,35 @@ class InvestigationState:
     # （`{"rel_path","download_url",...}`・Codex の created_files カードと同じ形）。既定は空＝
     # このツールを一度も呼ばなかった/一度も成功しなかったターンでは触らないまま。
     created_files: list = field(default_factory=list)
+    # ツール例外・読取I/O失敗の障害種別（閉じた語彙・回復可能なものだけを個別に記録する）。
+    # 単発フォールバックへの縮退可否判定（`providers/base.py`）が使う——記録があること自体は
+    # 「縮退してよい」の必要条件でしかなく、`non_recoverable_failure` が立っていれば禁止する。
+    backend_failures: dict = field(default_factory=lambda: {
+        "fulltext": False, "graph": False, "read_io": False})
+    # 回復不可な障害（プログラムの欠陥等・接続断/タイムアウト/読取I/O以外の例外）を検知したら真。
+    # 一度立てたら run 内で戻さない——同一ターンに回復可能な障害と混在しても縮退を禁止する側に倒す。
+    non_recoverable_failure: bool = False
+    # グラフのスキーマ世代不一致（`GraphSchemaEraError`）をこのターンで検知したか。接続断
+    # （`backend_failures["graph"]`）とは別状態として持つ——利用者への通知文言（再取り込み待ち／
+    # 接続できない）と統計の項目が別（`graph_reingest_required`／`backend_unavailable_graph`）。
+    graph_schema_era_mismatch: bool = False
+
+    def mark_backend_failure(self, kind: str) -> None:
+        """回復可能な障害（接続断・タイムアウト・読取I/O）を種別ごとに記録する（未知の kind は無視）。"""
+        if kind in self.backend_failures:
+            self.backend_failures[kind] = True
+            field = _BACKEND_LIMIT_FIELD.get(kind)
+            if field:
+                self.mark_limit(field)
+
+    def mark_graph_schema_era_mismatch(self) -> None:
+        """グラフの世代不一致を記録する（一度真になったら run 内で戻さない）。"""
+        self.graph_schema_era_mismatch = True
+        self.mark_limit(GRAPH_REINGEST_LIMIT_FIELD)
+
+    def mark_non_recoverable_failure(self) -> None:
+        """回復不可な障害（プログラムの欠陥等）を記録する。一度真になったら run 内で戻さない。"""
+        self.non_recoverable_failure = True
 
     def apply_findings(self, raw, round_no: int, verdict: str | None = None) -> bool:
         """この巡の evaluator の指摘を取り込み、反証された主張を同じ巡の中で採用不可へ落とす。
@@ -1130,3 +1169,123 @@ class InvestigationState:
         # 打ち切り注記は固定文言（動的値は件数のみ）のため追加の clean は不要（二重に行うと
         # せっかく予算内に収めた計算がまた redaction による伸長リスクを負う＝上の docstring 参照）。
         return "\n".join(body)
+
+
+# ---- 根拠の種別（§0(b) の閉集合）------------------------------------------------------------
+# 評価（見直し）は根拠の**量**ではなく、質問の型ごとに必要な**種別**が揃っているかで判定する。
+# 語彙は閉集合で、統計（`chat-round` の `missing_codes`）・回答の告知で同じ語を使う。
+EVIDENCE_KINDS = ("source", "spec_doc", "definition", "log_config", "callgraph")
+
+# 告知・プロンプトで使う平文ラベル（専門用語ゼロ・画面にそのまま出せる語）。
+EVIDENCE_KIND_LABELS = {
+    "source": "ソース", "spec_doc": "設計書", "definition": "定義",
+    "log_config": "ログ・設定", "callgraph": "呼出関係"}
+
+# レンズ別の必須種別（ソースは常に必須）。影響調査の「定義」は任意（必須には入れない）。
+LENS_REQUIRED_EVIDENCE_KINDS = {
+    "qa": ("source", "spec_doc"),
+    "impact": ("source", "callgraph"),
+    "troubleshoot": ("source", "log_config"),
+    "author": ("source", "spec_doc"),
+}
+
+# 定義（DDL・copybook・データ構造の宣言）。コード層の拡張子だが「実装そのもの」ではないため
+# `source` と分ける。設定ファイルはここではなく `log_config`（下記）。
+_DEFINITION_EXT = frozenset({".sql", ".cpy", ".copybook", ".json", ".xml", ".toml"})
+# ログ・設定（運用ログ・貼り付けた表・アプリの設定ファイル）。トラブルシュートの必須種別は
+# 「ソース＋ログ・設定」で、設定値を読んで初めて症状の条件が確かめられるため、設定ファイル系は
+# `definition` ではなくこちらに置く。
+_LOG_CONFIG_EXT = frozenset({
+    ".log", ".csv", ".tsv",
+    ".properties", ".yaml", ".yml", ".ini", ".cfg", ".conf"})
+# 設計書の原本（決定的MD の元）。派生MD は `{rel}.md`＝原本拡張子を含む名前で持つ
+# （`ingest/office_md.py`）ため、`.md` を剥がした内側の拡張子で判定できる。
+_SPEC_ORIGINAL_EXT = frozenset({".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"})
+_MD_EXT = frozenset({".md", ".markdown"})
+# 素のテキスト資料。設計書が `.txt`/`.rtf` で運用されている world があるため、ログ側ではなく
+# 設計書として扱う（ログ側に置くと、その world で「設計書は範囲に無い」と事実に反する明示が出る）。
+_SPEC_TEXT_EXT = frozenset({".txt", ".rtf"})
+
+# グラフ照会（`graph_neighbors`）は呼出関係そのもの。グラフが無い・不調のときは、ソースに対する
+# 呼出し検索（`ripgrep_search`）が代替になる（§0(b)「無ければ grep の呼出し検索で代替」）。
+_CALLGRAPH_TOOLS = frozenset({"graph_neighbors", "find_paths"})
+_CALLGRAPH_FALLBACK_TOOLS = frozenset({"ripgrep_search"})
+
+
+def evidence_kind_of_doc(doc_id) -> str | None:
+    """doc_id（rel_path）から根拠種別を決める純関数（ファイル本文は読まない）。
+
+    判定できない（doc_id が無い・未対応の付帯物）ときは `None`——不足の判定には数えない。
+    層の近似（`layer.layer_of`＝`CODE_EXT` メンバーシップ）を最後の分岐に使うため、
+    アナライザ登録簿に新しい言語が増えれば自動で `source` 側に載る。
+    """
+    if not isinstance(doc_id, str) or not doc_id.strip():
+        return None
+    from pathlib import PurePosixPath
+    name = PurePosixPath(doc_id.replace("\\", "/")).name.lower()
+    stem, _, ext = name.rpartition(".")
+    ext = f".{ext}" if stem else ""
+    if ext in _MD_EXT:
+        # 派生MD（`{原本名}.md`）は原本の拡張子で種別が決まる。素の `.md`/`.markdown` は
+        # 既存の表示 doctype（`corpus_docs._NONCODE_DOCTYPE`）と同じく設計書として扱う。
+        inner = PurePosixPath(stem).suffix.lower()
+        if inner in _LOG_CONFIG_EXT:
+            return "log_config"
+        if inner in _DEFINITION_EXT:
+            return "definition"
+        return "spec_doc"
+    if ext in _SPEC_ORIGINAL_EXT or ext in _SPEC_TEXT_EXT:
+        return "spec_doc"
+    if ext in _LOG_CONFIG_EXT:
+        return "log_config"
+    if ext in _DEFINITION_EXT:
+        return "definition"
+    from . import layer as layer_mod   # 葉ノードのまま保つための関数内 import
+    return "source" if layer_mod.layer_of(doc_id) == "code" else None
+
+
+def evidence_kind_of(doc_id, source_tool: str = "") -> str | None:
+    """根拠1件の種別。呼出関係だけは doc_id ではなく取得手段（ツール）で決まる——
+    グラフ照会は常に呼出関係、ソースに対する呼出し検索（ripgrep）はグラフが無い環境での代替。
+    """
+    if source_tool in _CALLGRAPH_TOOLS:
+        return "callgraph"
+    kind = evidence_kind_of_doc(doc_id)
+    if kind == "source" and source_tool in _CALLGRAPH_FALLBACK_TOOLS:
+        return "callgraph"
+    return kind
+
+
+def evidence_kinds_of(evidence: list) -> set:
+    """根拠の束が実際に持っている種別の集合。"""
+    out = set()
+    for e in evidence or []:
+        k = evidence_kind_of(e.doc_id, e.source_tool)
+        if k:
+            out.add(k)
+        # 呼出し検索はソースの本文でもある——両方の種別として数える（片方に倒すと、
+        # ripgrep だけで調べたターンの `source` が永久に不足になる）。
+        if k == "callgraph" and e.source_tool in _CALLGRAPH_FALLBACK_TOOLS:
+            out.add("source")
+    return out
+
+
+def claim_evidence_kinds(claim: Claim, evidence: list) -> set:
+    """主張1件が実際に参照している根拠の種別（`evidence_refs` が指す `Evidence` から導く）。"""
+    refs = set(claim.evidence_refs or [])
+    return evidence_kinds_of([e for e in (evidence or []) if e.ev_id in refs])
+
+
+def required_evidence_kinds(lens: str) -> tuple:
+    """レンズ別の必須種別（未知のレンズは仕様問い合わせと同じ扱い）。"""
+    return LENS_REQUIRED_EVIDENCE_KINDS.get(lens, LENS_REQUIRED_EVIDENCE_KINDS["qa"])
+
+
+def missing_code_for_kind(kind: str) -> str:
+    """不足種別 → `missing_codes` の閉じた語彙（本文は持たない）。"""
+    return f"{'spec' if kind == 'spec_doc' else 'log' if kind == 'log_config' else kind}_missing"
+
+
+def evidence_kind_labels(kinds) -> str:
+    """種別の集合を平文ラベルの読み下しにする（告知・プロンプト用・順序は `EVIDENCE_KINDS` 固定）。"""
+    return "・".join(EVIDENCE_KIND_LABELS[k] for k in EVIDENCE_KINDS if k in set(kinds or ()))

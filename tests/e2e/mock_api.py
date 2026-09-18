@@ -919,16 +919,20 @@ USAGE_STATS_DEFAULT = {
              "tool_result_clipped_turns": 3, "tool_result_clipped_total": 5,
              "total_budget_hit_turns": 1,
              "context_compactions_turns": 2, "context_compactions_total": 4,
-             "synthesis_truncated_turns": 0,
+             "synthesis_truncated_turns": 0, "depth_escalated_turns": 2,
              "search_truncated_turns": 4, "search_truncated_total": 9,
-             "auto_continues_turns": 2, "auto_continues_total": 3},
+             "auto_continues_turns": 2, "auto_continues_total": 3,
+             "backend_unavailable_fulltext_turns": 1, "backend_unavailable_graph_turns": 2,
+             "graph_reingest_required_turns": 1},
             {"provider": "openai", "turns": 6,
              "tool_result_clipped_turns": 0, "tool_result_clipped_total": 0,
              "total_budget_hit_turns": 0,
              "context_compactions_turns": 1, "context_compactions_total": 1,
-             "synthesis_truncated_turns": 1,
+             "synthesis_truncated_turns": 1, "depth_escalated_turns": 0,
              "search_truncated_turns": 0, "search_truncated_total": 0,
-             "auto_continues_turns": 0, "auto_continues_total": 0},
+             "auto_continues_turns": 0, "auto_continues_total": 0,
+             "backend_unavailable_fulltext_turns": 0, "backend_unavailable_graph_turns": 0,
+             "graph_reingest_required_turns": 0},
         ],
     },
     # 巡別記録（chat-round・表示専用）の深さ×経路別/巡番号別の活動量。
@@ -943,7 +947,7 @@ USAGE_STATS_DEFAULT = {
              "limits": {"tool_result_clipped": 2, "auto_continues": 1},
              "verdicts": {"insufficient": 4, "sufficient": 4},
              "stops": {"rerun": 4, "sufficient": 4},
-             "missing_codes": {"unexplored": 3, "insufficient": 1}},
+             "missing_codes": {"unexplored": 3, "insufficient": 1, "source_missing": 2}},
         ],
         "by_round": [
             {"depth_profile": "deep", "provider": "codex", "round_no": 1, "rounds": 4,
@@ -1149,6 +1153,8 @@ SYSTEM_SETTINGS_VIEW = {
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
     # 「最大」の深さが許す査読の巡数（`sherpa/depth_profile.py::MAX_REVIEW_ROUNDS_DEFAULT`＝7）。
     "max_review_rounds": {"configured": None, "effective": 7, "default": 7},
+    # multi_agent（S6）の worker モデル（`sherpa/providers/codex/sandbox.py::_CODEX_WORKER_MODEL_FALLBACK`）。
+    "codex_worker_model": {"configured": None, "effective": "gpt-5.6-sol", "default": "gpt-5.6-sol"},
     "chat_max_turns": {
         "per_user": {"configured": None, "effective": 2, "default": 2},
         "global": {"configured": None, "effective": 8, "default": 8},
@@ -1969,6 +1975,14 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 rounds = view["max_review_rounds"]
                 rounds["configured"] = value
                 rounds["effective"] = value if value is not None else rounds["default"]
+            if "codex_worker_model" in body:
+                # 実 API の _validate_codex_worker_model と同じ正規化（空文字は None＝未設定）。
+                _raw = body["codex_worker_model"]
+                _val = _raw.strip() if isinstance(_raw, str) else _raw
+                _val = _val if _val else None
+                worker_model = view["codex_worker_model"]
+                worker_model["configured"] = _val
+                worker_model["effective"] = _val if _val is not None else worker_model["default"]
             # 同時実行の上限（簡易反映・null は default へ戻す・depth_profile と同型）。
             if "chat_max_turns" in view:
                 for _key, _put in (("per_user", "chat_max_turns_per_user"),
@@ -2588,6 +2602,46 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                                           "created_at": "2026-09-01T11:00:00+00:00"},
                                          {"role": "assistant", "answer": tools_answer, "trace": None,
                                           "created_at": "2026-09-01T11:00:10+00:00"},
+                                     ]})
+            if cid_str == "119":
+                # S4: グラフ縮退の troubleshoot（原因候補が無く qa 相当の下地＝citations だけ）。
+                degraded_trouble = {
+                    "lens": "troubleshoot",
+                    "headline": "関係のつながりをたどる検索に接続できなかったため、資料とソースを直接調べた結果で回答します。\n\n夜間バッチの停止は TAXCALC の異常終了が原因の可能性があります。",
+                    "route": {"path": ["文書を検索"]}, "summary": {"total": 1},
+                    "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both"},
+                    "data": {"type": "qa", "citations": [
+                        {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [10, 12],
+                         "quote": "ABEND-CODE 0C7"}]},
+                    "sources": [],
+                }
+                return _json(route, {"conversation": {"id": 119, "title": "グラフ不調で縮退した会話",
+                                                       "origin": "own", "version": "v1",
+                                                       "read_only": False,
+                                                       "contains_personal_workspace": False},
+                                     "messages": [
+                                         {"role": "user", "content": "夜間バッチが止まる",
+                                          "created_at": "2026-09-19T12:00:00+00:00"},
+                                         {"role": "assistant", "answer": degraded_trouble, "trace": None,
+                                          "created_at": "2026-09-19T12:00:10+00:00"},
+                                     ]})
+            if cid_str == "118":
+                # S4（裁定⑦）: 明示状態（利用者が実際に切り替えた軸）を会話メタへ保存した会話。
+                # `tools` は grep OFF だが、触ったのは grep だけ＝graph は「既定のまま ON」。
+                explicit_answer = {**IMPACT_ANSWER, "lens": "qa",
+                                  "scope": {"world": "w1", "scope_paths": [], "source": "all",
+                                            "layer": "both",
+                                            "tools": {"grep": False, "fulltext": True, "graph": True},
+                                            "tools_explicit": ["grep"]}}
+                return _json(route, {"conversation": {"id": 118, "title": "検索経路を1軸だけ操作した会話",
+                                                       "origin": "own", "version": "v1",
+                                                       "read_only": False,
+                                                       "contains_personal_workspace": False},
+                                     "messages": [
+                                         {"role": "user", "content": "消費税率を変えたい",
+                                          "created_at": "2026-09-19T11:00:00+00:00"},
+                                         {"role": "assistant", "answer": explicit_answer, "trace": None,
+                                          "created_at": "2026-09-19T11:00:10+00:00"},
                                      ]})
             if cid_str == "117":
                 # 範囲パネルの折りたたみツリー化（実環境指摘 2026-09-02）: 深い階層（SCOPES の

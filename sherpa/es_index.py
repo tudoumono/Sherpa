@@ -1865,6 +1865,29 @@ def _rerank_knn_by_importance(hits: list) -> list:
     return hits
 
 
+def _classify_query_exception(exc: Exception) -> str:
+    """BM25 クエリ実行時の例外を固定コードへ分類する（呼び出し元の `InvestigationState` 反映が
+    回復可否を区別できるよう、握りつぶす前に一度だけ判定する）。`search()`/`search_knn_only()` の
+    「例外を投げず `(hits, degrade_reason)` を返す」契約は保つ——どの例外もここでは再送出しない
+    （呼び出し元は `routers/documents.py`・`search_service.py`・`ext_api.py` 等の非 agentic 経路も
+    含み、そちらは `run_tool` 境界の型分類に委ねられないため）。
+
+    `HTTPError`（`URLError`/`OSError` のサブクラス）は 404（索引未作成＝未取り込み world の
+    常態）・429・5xx を `es_query_failed`（回復可能＝一時的、または再取り込みで直る障害）、
+    それ以外の 4xx（クエリ自体の拒否＝構文・設定不備）を `es_query_rejected`（回復不可）にする。
+    それ以外の `OSError`（接続断・タイムアウト等・`URLError`/`TimeoutError` 含む）も
+    `es_query_failed`。`JSONDecodeError`/`TypeError`/`KeyError`/`AssertionError` 等の非通信例外
+    （プログラムの欠陥・想定外の応答形を示す）は `es_query_rejected`（回復不可）——通信障害と
+    同じ回復可能扱いにはしない。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return ("es_query_failed" if (exc.code in (404, 429) or 500 <= exc.code <= 599)
+               else "es_query_rejected")
+    if isinstance(exc, OSError):
+        return "es_query_failed"
+    return "es_query_rejected"
+
+
 def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict | None = None,
           vector: bool = True, layer=None, k_ceiling: int | None = None) -> tuple[list, str | None]:
     """検索。`vector=True` かつ埋め込み設定があれば **kNN＋BM25 ハイブリッド**、無ければ BM25。範囲フィルタ・graceful。
@@ -1885,8 +1908,9 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     degrade_reason 語彙: `es_unavailable`／`embedding_cloud_unavailable`／`vector_feature_mismatch`
     （索引の埋め込み素性が現在の設定と不一致＝再索引待ち・クエリ埋め込みは呼ばない）／`query_embed_failed`／
     `hybrid_query_failed`（hybrid 自体が失敗し BM25 は成功＝hits は空でない）／
-    `es_query_failed`（BM25 自体も失敗＝hits は空。`search_service.DEGRADE_REASONS` と同一集合・
-    増やすときは両方直す）。
+    `es_query_failed`（BM25 自体も失敗・接続断/タイムアウト/5xx 等の一時的な障害＝hits は空）／
+    `es_query_rejected`（BM25 自体も失敗・4xx＝クエリの構文/設定不備＝一時的でない＝hits は空）。
+    `search_service.DEGRADE_REASONS` と同一集合・増やすときは両方直す。
     `vector=False`＝BM25 のみ（クエリ埋め込みを呼ばない＝コスト/レイテンシ回避・facts 統合用・
     reason は常に None）。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 `None`＝`"both"`＝フィルタなし＝既存呼び出し元は
@@ -1973,8 +1997,10 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
             reason = "query_embed_failed"            # クエリ埋め込みの実通信失敗 → BM25 へ
     try:
         return _parse_hits(_req("POST", f"/{_index(world)}/_search", bm25)), reason
-    except Exception:
-        return [], "es_query_failed"                 # BM25 自体も失敗＝hits 空を最優先の理由で説明する
+    except Exception as exc:
+        # BM25 自体も失敗＝hits 空を最優先の理由で説明する（回復可否は `_classify_query_exception`
+        # が固定コードへ分類する）。
+        return [], _classify_query_exception(exc)
 
 
 def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
@@ -1985,7 +2011,8 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     engines=["vector"] 単独を表現できない。本関数は top-level `knn` のみのクエリを発行する。
     返値 `(hits, degrade_reason|None)`。hits は `_parse_hits` 形 `{doc_id, line, text, score, ext}`。
     degrade_reason 語彙: es_unavailable / embedding_not_configured / embedding_cloud_unavailable /
-    vector_feature_mismatch / query_embed_failed / es_query_failed（search_service.py の
+    vector_feature_mismatch / query_embed_failed / es_query_failed（一時的な障害）/
+    es_query_rejected（4xx＝クエリの構文/設定不備＝一時的でない）（search_service.py の
     DEGRADE_REASONS と同一・増やすときは両方直す）。`embedding_cloud_unavailable` は
     A7 で明示選択したクラウドの埋め込みが解決できない場合＝`embedding_not_configured`（クラウドを
     一度も選んでいない通常の未設定）と区別し、呼び出し側が「設定すれば直る」のか「選択済みクラウド
@@ -2038,5 +2065,5 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
         # 取得後の再ランクで重要度ブーストを適用する（`_rerank_knn_by_importance` 参照）。
         hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body)))
         return hits[:k], None
-    except Exception:
-        return [], "es_query_failed"
+    except Exception as exc:
+        return [], _classify_query_exception(exc)
