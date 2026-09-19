@@ -3458,7 +3458,7 @@ def test_codex_worker_model_renders_default_placeholder_and_saves(page, web_base
     field = page.locator('#codex-worker-model-card #codex-worker-model')
     expect(field).to_have_value('')
     expect(field).to_have_attribute('placeholder', '既定: gpt-5.6-sol')
-    expect(page.locator('#codex-worker-model-hint')).to_contain_text('未設定です（実際に適用される値: gpt-5.6-sol）。')
+    expect(page.locator('#codex-worker-model-hint')).to_contain_text('未設定です（実際に適用される値: gpt-5.6-sol。')
     field.fill('gpt-5.6-sol-mini')
     expect(page.locator('#tab-dot-research')).to_be_visible()
     page.locator('#save').click()

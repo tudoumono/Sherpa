@@ -1457,8 +1457,10 @@ function renderResearchTab(view) {
   $('codex-worker-model').value = _codexWorkerModelBaseline;
   $('codex-worker-model').placeholder = `既定: ${workerModel.default}`;
   $('codex-worker-model-hint').textContent = workerModel.configured == null
-    ? `未設定です（実際に適用される値: ${workerModel.effective}）。`   // Azure は本体と同じデプロイ名へ倒れる
-    : `この値で固定中です（既定: ${workerModel.default}）。`;
+    // `effective` は Codex(OpenAI 系) の値（Azure は本体と同じデプロイ名へ倒れる）。構成は利用者ごとの
+    // 設定なので、ローカル（Ollama）構成の利用者にはここに出ない「本体と同じモデル名」が使われる。
+    ? `未設定です（実際に適用される値: ${workerModel.effective}。ローカル（Ollama）構成の利用者は本体と同じモデル名）。`
+    : `この値で固定中です（既定: ${workerModel.default}）。この値は全構成に適用されるため、ローカル（Ollama）構成の利用者がいる環境では Ollama 側にも存在するモデル名にしてください。`;
   const retention = view.codex_session_retention_days;
   _codexSessionRetentionDaysBaseline = retention.configured == null ? '' : String(retention.configured);
   $('codex-session-retention-days').value = _codexSessionRetentionDaysBaseline;

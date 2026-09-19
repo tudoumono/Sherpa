@@ -104,6 +104,9 @@ def _effective_codex_worker_model(sysset: dict) -> str:
     自体が 500 になってはいけない（他の壊れた保存値と同じ「表示はベストエフォート・実送信時の
     fail-closed 判定は別の責務」契約・`usage_chat._effective_provider_for_display` と同じ理由）。
     解決できない場合は固定フォールバック（`_CODEX_WORKER_MODEL_FALLBACK`）へ倒す。
+    Codex(Ollama) 構成は利用者ごとの設定（`codex_model_provider`）でシステム側からは判定できない
+    ため、この値は Codex(OpenAI 系) の実効値。Ollama 構成の利用者は本体と同じモデルタグになる
+    （画面の注記で補う）。
     """
     try:
         main_model = model_catalog.resolve_model("codex", "codex", None, system_settings=sysset)

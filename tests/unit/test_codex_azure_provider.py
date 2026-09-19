@@ -234,6 +234,62 @@ def test_ollama_construct_ignores_azure_settings(tmp_path, sysset):
     assert "sherpa-openai-compat" not in txt
 
 
+# ===== S6c: Codex(Ollama) 構成でも multi_agent を有効にする =====
+
+def test_codex_multi_agent_enabled_true_for_ollama_construct():
+    """Codex(Ollama) 構成でも multi_agent は有効（S6c・決定2026-09-19）——worker の `model` 解決を
+    本体と同じローカルモデルタグへ倒すため、Ollama 側で解決できない固定値を spawn しに行く
+    問題が無い（`_codex_worker_model(ollama=True)` 参照）。"""
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    assert codex_multi_agent_enabled(ollama_base_url="http://127.0.0.1:11434", system_settings=None) is True
+
+
+def test_codex_multi_agent_enabled_false_for_ollama_when_sandbox_disabled(monkeypatch):
+    """サンドボックス無効（`SHERPA_CODEX_SANDBOX=0`）では Codex(Ollama) 構成でも multi_agent は無効
+    （config.toml 自体を書かない経路のため `[agents.*]` の層が無い）。"""
+    monkeypatch.setenv("SHERPA_CODEX_SANDBOX", "0")
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    assert codex_multi_agent_enabled(ollama_base_url="http://127.0.0.1:11434", system_settings=None) is False
+
+
+def test_ollama_multi_agent_enabled_writes_agents_sections_with_main_model_as_worker(tmp_path):
+    """Ollama 構成で `codex_multi_agent_enabled()` の判定どおりに `multi_agent` を渡すと、
+    config.toml に `[agents]`/`[agents.worker]`/`[agents.evaluator]` が書かれ、worker/evaluator の
+    role config（子 Codex 用の別プロセス設定）にも親と同じ `sherpa-ollama` provider 行が入り、
+    worker のモデルは（未設定のため）`orchestrator_model`＝本体と同じローカルモデルタグへ倒れる。"""
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    enabled = codex_multi_agent_enabled(ollama_base_url="http://127.0.0.1:11434", system_settings=None)
+    assert enabled is True
+    txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="llama3.1:8b",
+                        ollama_base_url="http://127.0.0.1:11434")
+    assert "[agents]" in txt
+    assert "[agents.worker]" in txt and "[agents.evaluator]" in txt
+    worker_toml = (tmp_path / "ch" / "agents" / "worker.toml").read_text()
+    assert 'model = "llama3.1:8b"' in worker_toml           # 本体と同じローカルモデルタグ
+    assert 'model_provider = "sherpa-ollama"' in worker_toml
+    assert "[model_providers.sherpa-ollama]" in worker_toml
+    evaluator_toml = (tmp_path / "ch" / "agents" / "evaluator.toml").read_text()
+    assert 'model = "llama3.1:8b"' in evaluator_toml
+    assert 'model_provider = "sherpa-ollama"' in evaluator_toml
+
+
+def test_ollama_multi_agent_worker_uses_configured_value_over_main_model(tmp_path, sysset):
+    """Ollama 構成でも `codex_worker_model` が管理画面で明示設定されていれば、そちらが
+    本体モデルタグより優先される（`_codex_worker_model` の優先順位1）。"""
+    sysset["codex_worker_model"] = "gpt-5.9-custom"
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    enabled = codex_multi_agent_enabled(ollama_base_url="http://127.0.0.1:11434", system_settings=None)
+    txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="llama3.1:8b",
+                        ollama_base_url="http://127.0.0.1:11434", system_settings=dict(sysset))
+    assert txt   # config.toml 生成が壊れていないことの前提確認
+    worker_toml = (tmp_path / "ch" / "agents" / "worker.toml").read_text()
+    assert 'model = "gpt-5.9-custom"' in worker_toml
+
+
 # ===== S6a RV是正1巡目 #1: 独自エンドポイント（custom）は worker モデル明示時のみ multi_agent =====
 
 def test_codex_multi_agent_enabled_false_for_custom_endpoint_unconfigured(sysset):

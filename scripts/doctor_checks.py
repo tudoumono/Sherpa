@@ -1351,42 +1351,46 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
 
 
 def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | None) -> CheckResult:
-    """Codex(OpenAI 系) 構成が使われているとき、multi_agent（`[agents.worker]`/`[agents.evaluator]`・
-    S6）の worker モデルが確認済みの値のままか、管理画面で独自設定（system_settings
-    `codex_worker_model`・実装ベース探索の回復 S1）されているかを判定する（実 codex は呼ばない・
-    値そのものは detail に出さない）。独自設定時は Codex 自身のモデルカタログに存在するかを
-    Sherpa 側で検証できないため `skip` にする（`ng` にしない＝運用側の確認を促すだけ）。
+    """Codex 構成（OpenAI 系・Ollama とも）が使われているとき、multi_agent
+    （`[agents.worker]`/`[agents.evaluator]`・S6）の worker モデルが確認済みの値のままか、
+    管理画面で独自設定（system_settings `codex_worker_model`・実装ベース探索の回復 S1）
+    されているかを判定する（実 codex は呼ばない・値そのものは detail に出さない）。独自設定時は
+    Codex 自身のモデルカタログに存在するかを Sherpa 側で検証できないため `skip` にする
+    （`ng` にしない＝運用側の確認を促すだけ）。
 
-    実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は Azure では常に multi_agent
-    を有効にする（決定2026-09-19）。Azure（`llm.openai_endpoint_kind() == "azure"`）は worker
-    未設定時、本体 Codex と同じデプロイ名・接続先設定（`_codex_worker_model(..., main_model=...)`／
-    role config の `model_provider`・`[model_providers.*]`）を使うため、本体が到達できていれば
-    worker も到達できる想定内の組合せとして `ok` にする（独自設定時は他の接続先と同じく `skip`。
-    ただし Azure でのこの経路は実機未検証＝初回は spawn の成功と接続先ログを確認する必要がある・
-    detail に明記）。Azure 以外の独自エンドポイント（custom）は `codex_worker_model` が明示設定
-    されていなければ本番側 `codex_multi_agent_enabled` が multi_agent 自体を無効化する（RV是正：
-    custom は本体のモデル名を流用できる保証が無いため）——この検査でも同じ理由付き `skip` にする。
-    この検査は接続先種別だけを独立に確認する（サンドボックス無効・Codex(Ollama) の無効化は本番側の
-    判定 `codex_multi_agent_enabled` に委ね、ここでは見ない）。接続先設定を読めない異常時を除き
-    `ok`／`skip` を返す。
+    実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は Azure・Ollama では常に
+    multi_agent を有効にする（決定2026-09-19・S6c）。worker 未設定時、Azure は本体 Codex と同じ
+    デプロイ名、Ollama は本体と同じローカルモデルタグ（`_codex_worker_model(...,
+    main_model=..., ollama=...)`／role config の `model_provider`・`[model_providers.*]`）を使う
+    ため、本体が到達できていれば worker も到達できる想定内の組合せとして `ok` にする（どちらも
+    実機未検証＝初回は spawn の成功と接続先ログを確認する必要がある・detail に明記）。Azure 以外の
+    独自エンドポイント（custom）は `codex_worker_model` が明示設定されていなければ本番側
+    `codex_multi_agent_enabled` が multi_agent 自体を無効化する（RV是正：custom は本体のモデル名を
+    流用できる保証が無いため）——この検査でも同じ理由付き `skip` にする。この検査はサンドボックス
+    無効の無効化は見ない（本番側の判定 `codex_multi_agent_enabled` に委ねる）。接続先設定を
+    読めない異常時を除き `ok`／`skip` を返す。
     """
     cid, label = "codex_multi_agent_worker_model", "Codex multi_agent（worker/evaluator）モデル整合"
     if sys_s is None:
         return CheckResult(cid, label, "skip", "system_settings を読み取れないため確認できません")
     from sherpa import agent_constructs, llm
 
-    def _is_codex_openai_family(eff, cmp) -> bool:
-        return eff == "codex" and cmp != "ollama"
-
     used = False
+    openai_used = False    # Codex(OpenAI 系＝ollama 以外) が1箇所でも使われているか
+    ollama_used = False    # Codex(Ollama) が1箇所でも使われているか
     try:
-        if _is_codex_openai_family(agent_constructs.effective_agent(None, system_settings=sys_s),
-                                   agent_constructs.codex_model_provider(None)):
+        eff0 = agent_constructs.effective_agent(None, system_settings=sys_s)
+        cmp0 = agent_constructs.codex_model_provider(None)
+        if eff0 == "codex":
             used = True
+            openai_used = openai_used or cmp0 != "ollama"
+            ollama_used = ollama_used or cmp0 == "ollama"
     except Exception:
-        used = True   # 判定不能＝安全側で「使われている」扱い
+        used = True         # 判定不能＝安全側で「使われている」扱い
+        openai_used = True  # 種別不明時は OpenAI 系の判定（より厳格）を優先
     if rows is None:
-        used = True   # user_settings 未読なら安全側で「使われている」扱い
+        used = True          # user_settings 未読なら安全側で「使われている」扱い
+        openai_used = True
     else:
         for row in rows:
             settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
@@ -1395,16 +1399,28 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
                 cmp = agent_constructs.codex_model_provider(settings)
             except Exception:
                 used = True
+                openai_used = True
                 continue
-            if _is_codex_openai_family(eff, cmp):
+            if eff == "codex":
                 used = True
+                openai_used = openai_used or cmp != "ollama"
+                ollama_used = ollama_used or cmp == "ollama"
     if not used:
-        return CheckResult(cid, label, "skip", "Codex(OpenAI 系) 構成が使われていません")
+        return CheckResult(cid, label, "skip", "Codex 構成が使われていません")
+    from sherpa.providers.codex import sandbox as codex_sandbox
+    if ollama_used and not openai_used:   # OpenAI 系が同時に使われていればそちらの判定を優先
+        if codex_sandbox._codex_worker_model(sys_s, ollama=True) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
+            return CheckResult(cid, label, "skip",
+                        "worker モデルが管理画面で独自設定されています"
+                        "（値が Codex 自身のモデルカタログに存在するか運用側で確認してください）")
+        return CheckResult(cid, label, "ok",
+                    "worker モデルは未設定のため、本体 Codex と同じローカルモデルを使います"
+                    "（本体が到達できていれば worker もそのまま動作するはずですが実機未検証のため、"
+                    "初回は spawn の成功を確認してください）")
     try:
         endpoint_kind = llm.openai_endpoint_kind(sys_s)
     except Exception as e:
         return CheckResult(cid, label, "ng", f"接続先設定が壊れているため確認できません（{type(e).__name__}）")
-    from sherpa.providers.codex import sandbox as codex_sandbox
     if endpoint_kind == "azure":
         if codex_sandbox._codex_worker_model(sys_s) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
             return CheckResult(cid, label, "skip",

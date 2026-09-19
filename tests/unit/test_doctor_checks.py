@@ -2124,14 +2124,15 @@ def test_check_codex_multi_agent_worker_model_skip_for_custom_endpoint(monkeypat
 
 
 def test_check_codex_multi_agent_worker_model_ok_when_only_ollama_backing(monkeypatch):
-    """Codex(Ollama) 構成だけの環境は multi_agent 自体の対象外＝ Azure 接続先設定が残っていても無関係。"""
+    """S6c: Codex(Ollama) 構成だけの環境も multi_agent の対象——worker 未設定なら本体と同じ
+    ローカルモデルへ倒すため ok（Azure 接続先設定が残っていても Ollama 判定には無関係）。"""
     from sherpa import agent_constructs
     monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
     monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "ollama")
     sys_s = {"openai_endpoint_kind": "azure",
              "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
     r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
-    assert r.status == "skip"
+    assert r.status == "ok"
 
 
 def test_check_codex_multi_agent_worker_model_detects_active_user_row(monkeypatch):

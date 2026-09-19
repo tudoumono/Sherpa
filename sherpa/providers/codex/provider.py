@@ -1007,7 +1007,8 @@ class CodexProvider(Provider):
         _mcp_calls = {"total": 0, "max_in_flight": 0}
         # DEPTH-2 S3b/S6: `spawn_agent` した子スレッドの id（`collab_tool_call` item から捕捉・run 全体で
         # 合算＝attempt をまたいでも良い＝多重 spawn/継続でも同じ子を重複して数えない set）。
-        # Codex(Ollama) 構成（multi_agent 無効）では `collab_tool_call` item 自体が出ないため常に空のまま。
+        # multi_agent 無効（サンドボックス無効・OpenAI custom 未設定等）では `collab_tool_call`
+        # item 自体が出ないため常に空のまま。
         _child_thread_ids: set = set()
         _child_usage_totals = {k: 0 for k in _CHILD_USAGE_KEYS}
         _child_usage_found = 0
@@ -1174,9 +1175,9 @@ class CodexProvider(Provider):
                 # DEPTH-2 S6（§2.6・§5 S6）: multi_agent は既定で常時有効にする（深さに関わらず・
                 # 「本体が worker を兼ねる」縮退は採らない裁定）。判定は `codex_multi_agent_enabled`
                 # （sandbox.py・唯一の真実源＝doctor と条件式を共有し食い違いを防ぐ）に委ねる:
-                # Codex(Ollama) 構成／サンドボックス無効（フォールバック経路）は対象外。接続先は
-                # 既定 OpenAI・Azure は常に対象（Azure は worker/evaluator を本体と同じデプロイ名・
-                # 接続先設定へ倒す）。独自エンドポイント（custom）だけ `codex_worker_model` の明示
+                # サンドボックス無効（フォールバック経路）は対象外。接続先は既定 OpenAI・Azure・
+                # Ollama は常に対象（Azure/Ollama は worker/evaluator を本体と同じデプロイ名／
+                # モデルタグへ倒す）。独自エンドポイント（custom）だけ `codex_worker_model` の明示
                 # 設定が無いと対象外——本体のモデル名を流用できる保証が無いため（決定2026-09-19）。
                 # `_review_rounds` は AGENTS.md へ埋め込む見直しの回数
                 # （クイック 0／標準 2／深く 4／最大は管理画面の設定値。固定の段もその設定値で
@@ -1262,8 +1263,8 @@ class CodexProvider(Provider):
                                 "-C", str(run_dir), "-m", self.model,
                                 "-c", f"model_reasoning_effort={_reason}"]
                     # 管理者環境の既定値に依存させない明示指定（提案書 §2.6・CLI 0.153.4 は
-                    # 既定 enabled だが将来/別環境の既定変更に頼らない）。無効時（Ollama／
-                    # Azure・独自エンドポイント）も明示的に false にする——`[agents.*]` の層を
+                    # 既定 enabled だが将来/別環境の既定変更に頼らない）。無効時（`codex_worker_model`
+                    # 未設定の独自エンドポイント等）も明示的に false にする——`[agents.*]` の層を
                     # 書かない構成で true のまま CLI 既定に委ねると、worker/evaluator の解決先が
                     # 無いまま機能だけが有効という食い違いが起きる。
                     argv_base += ["-c", f"features.multi_agent={'true' if _multi_agent_enabled else 'false'}"]
@@ -1564,8 +1565,8 @@ class CodexProvider(Provider):
                                   and item.get("tool") == "spawn_agent"):
                                 # DEPTH-2 S3b/S6: 子スレッド id の捕捉のみ（表示ノードは追加しない・
                                 # 巡ごとの右ペイン表示は対象外＝§2.8「Codex は巡境界イベントが無い」
-                                # ため用意していない）。Codex(Ollama) 構成（multi_agent 無効）では
-                                # このイベント自体が出ないため素通りする。
+                                # ため用意していない）。multi_agent 無効ではこのイベント自体が
+                                # 出ないため素通りする。
                                 for _tid in item.get("receiver_thread_ids") or []:
                                     if isinstance(_tid, str) and _tid:
                                         _child_thread_ids.add(_tid)
@@ -2177,9 +2178,9 @@ class CodexProvider(Provider):
                 # （次ターンの差分計算の元）は**親のスナップショットのまま変えない**——子の usage は
                 # 子スレッドのセッション累計であって親の累計とは別系統のため、ここへ混ぜると次ターンの
                 # 差分計算が破綻する。合算は `env["usage"]`（このターンの表示・計上値）だけに行い、
-                # 内訳（親／子／未取得件数）を別途残す。multi_agent 無効（Codex(Ollama) 構成・
-                # `collab_tool_call` が一度も出ない実行）は `_child_usage_found`/`_child_usage_missing`
-                # が両方 0 のまま＝このブロックは素通りする。
+                # 内訳（親／子／未取得件数）を別途残す。multi_agent 無効（`collab_tool_call` が
+                # 一度も出ない実行）は `_child_usage_found`/`_child_usage_missing` が両方 0 の
+                # まま＝このブロックは素通りする。
                 # 計測の正本＝§2.8: 本体ターン（`turn.completed`）は境界イベントが無く巡（worker/
                 # evaluator の spawn 単位）ごとの内訳を取れないため、巡別の `chat-round` は記録しない
                 # （API/Ollama 経路の巡ループ・`providers/base.py::_agentic_run` とは異なる）——ここで

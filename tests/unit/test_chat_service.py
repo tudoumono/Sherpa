@@ -2250,7 +2250,7 @@ def test_depth_actually_helps_true_for_codex_openai_backing():
 
 
 def test_depth_actually_helps_false_for_codex_ollama_backing():
-    """Codex(Ollama) 構成（`is_local == "local"`）は multi_agent が無効＝深さは効かない。"""
+    """`codex_multi_agent` が偽のときは構成（ここでは `is_local == "local"`）に関わらず深さは効かない。"""
     assert CS._depth_actually_helps(
         {"usage": {"provider": "codex", "is_local": "local"}, "codex_multi_agent": False}) is False
 
@@ -2274,8 +2274,8 @@ def test_retry_hints_depth_suggested_for_codex_openai_backing():
 
 
 def test_retry_hints_depth_not_suggested_for_codex_ollama_backing():
-    """Codex(Ollama) 構成（`is_local == "local"`）は multi_agent が無効（`codex_multi_agent` 偽）
-    のため、従来どおり深さ hint を出さない。"""
+    """`codex_multi_agent` が偽のときは構成（ここでは `is_local == "local"`）に関わらず
+    深さ hint を出さない。"""
     env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
     env["usage"] = {"provider": "codex", "is_local": "local"}
     env["codex_multi_agent"] = False

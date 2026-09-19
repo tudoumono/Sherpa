@@ -1034,15 +1034,17 @@ def _depth_actually_helps(env: dict) -> bool:
     真になるのは次のいずれか:
       - `evidence_packet.task_id` が `"sub:{profile_id}"`／`"plan:..."`（下調べ役
         `provider._sub`／`_sub_candidates` 経由で実行された）——巡ループが実際に走る構成。
-      - このターンが Codex(OpenAI 系) 構成で、かつ `env["codex_multi_agent"]` が真——
+      - このターンが Codex 構成で、かつ `env["codex_multi_agent"]` が真——
         `sherpa.providers.codex.provider` が `codex_multi_agent_enabled`（sandbox.py・唯一の
-        真実源）の判定結果をそのまま env へ渡している。Azure・独自エンドポイント・サンドボックス
-        無効（フォールバック）の各構成はこのフラグが偽になり案内対象外——`usage.is_local`（Azure も
-        既定 OpenAI と同じ `"cloud"`）だけでは区別できないため、判定を env 経由で受け取る。
+        真実源）の判定結果をそのまま env へ渡している。Codex(OpenAI 系)・Codex(Ollama) とも対象
+        （Azure・Ollama は worker/evaluator を本体と同じモデルタグへ倒すため常に有効）。独自
+        エンドポイント（custom）・サンドボックス無効（フォールバック）の構成はこのフラグが偽になり
+        案内対象外——`usage.is_local`（Azure も既定 OpenAI と同じ `"cloud"`）だけでは区別できない
+        ため、判定を env 経由で受け取る。
 
-    `"main"`（worker を付けない §2.1 対象外の頭脳＝Gemini/Bedrock の単独ループ）・
-    Codex(Ollama) 構成はいずれも偽——これらは深さの設定を変えても巡数が発生しないため、同一条件の
-    再実行を勧めることになる。API/Ollama の頭脳は常に worker 付き（`sub:` 接頭）で真になる。
+    `"main"`（worker を付けない §2.1 対象外の頭脳＝Gemini/Bedrock の単独ループ）は偽——
+    深さの設定を変えても巡数が発生しないため、同一条件の再実行を勧めることになる。API/Ollama の
+    頭脳は常に worker 付き（`sub:` 接頭）で真になる。
     """
     task_id = ((env.get("data") or {}).get("evidence_packet") or {}).get("task_id") or ""
     if task_id.startswith("sub:") or task_id.startswith("plan:"):
