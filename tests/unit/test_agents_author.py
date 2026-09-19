@@ -18,6 +18,8 @@ import os
 import shutil
 import subprocess
 
+import pytest
+
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 from sherpa import agents as A  # noqa: E402
 
@@ -228,23 +230,24 @@ def test_codex_reasoning_author_env_default_and_override(monkeypatch):
     assert _compute(False, "low") == "low"
 
 
-# ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: Codex reasoning の per-turn 上書き =====
+# ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: Codex reasoning は深さで変えない =====
 
 def test_codex_run_wires_depth_profile_into_reasoning_branch():
-    """author/通常いずれの基準値にも `depth_profile_mod.codex_reasoning_for()` の上書きが
-    掛かること（ソース検査・実 codex CLI 起動は対象外）。標準の基準値は `effective_base()`
+    """author/通常いずれの基準値も `depth_profile_mod.codex_reasoning_for()` を通ること
+    （ソース検査・実 codex CLI 起動は対象外）。通常レンズの基準値は `effective_base()`
     （system_settings の管理画面編集）を経由すること。"""
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    assert "depth_profile_mod.codex_reasoning_for(" in src, "調べる深さの per-turn 上書きが無い"
+    assert "depth_profile_mod.codex_reasoning_for(" in src, "推論レベルの解決が一元化されていない"
     assert "depth_profile_mod.effective_base(" in src, \
         "通常レンズの基準値が管理画面の基準値編集（system_settings）を経由していない"
 
 
-def test_codex_reasoning_depth_profile_passthrough_standard_deep_max(monkeypatch):
+@pytest.mark.parametrize("profile", ["quick", "standard", "deep", "max"])
+def test_codex_reasoning_is_fixed_by_admin_base_at_every_depth(monkeypatch, profile):
     """CodexProvider の実際の分岐と同じ式（`_base_reason` の解決 → `codex_reasoning_for`）で、
-    深く=high／最大=xhigh の per-turn 上書きが載る（純関数の組み合わせ・実 codex CLI 起動は
-    対象外）。基準値が上書きより高い構成では下げない。"""
+    推論レベルは**どの深さでも管理画面の基準値のまま**（深さは探索量と見直しの巡数にだけ効く・
+    純関数の組み合わせ・実 codex CLI 起動は対象外）。"""
     from sherpa import depth_profile as D
 
     def _compute(is_author, self_reason, system_settings, profile):
@@ -254,19 +257,13 @@ def test_codex_reasoning_depth_profile_passthrough_standard_deep_max(monkeypatch
         return "low" if str(reason_raw).lower() == "minimal" else reason_raw
 
     monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
-    # 通常レンズ: 標準は self._reason のまま・深く=high・最大=xhigh。
-    assert _compute(False, "low", None, "standard") == "low"
-    assert _compute(False, "low", None, "deep") == "high"
-    assert _compute(False, "low", None, "max") == "xhigh"
-    # 管理画面の基準値編集（system_settings）が標準時の基準値になり、深さの上書きはその上に載る。
-    assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, "standard") == "medium"
-    assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, "deep") == "high"
-    # 基準値が既に上書きより高い構成では下げない（S2 の注記）。
-    assert _compute(False, "low", {"depth_base_codex_reasoning": "xhigh"}, "deep") == "xhigh"
-    # author は基準値が別軸（env）だが、深さの上書きは同じ規律で載る。
-    assert _compute(True, "low", None, "standard") == "medium"   # author 既定
-    assert _compute(True, "low", None, "deep") == "high"
-    assert _compute(True, "low", None, "max") == "xhigh"
+    # 通常レンズ: 環境設定の既定（self._reason）のまま。
+    assert _compute(False, "low", None, profile) == "low"
+    # 管理画面の基準値編集（system_settings）があればそれが全深さで使われる。
+    assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, profile) == "medium"
+    assert _compute(False, "low", {"depth_base_codex_reasoning": "xhigh"}, profile) == "xhigh"
+    # author は基準値が別軸（env・既定 medium）だが、深さで変わらない点は同じ。
+    assert _compute(True, "low", None, profile) == "medium"
 
 
 # ===== P1-c: author 専用プロンプト（FS 版・MCP 版） =====

@@ -2,7 +2,7 @@
 
 ハイブリッド（下調べ役あり）の清書前に、メイン LLM が根拠の十分性を査読し、不足なら
 不足軸を指定して下調べを再実行する（なお不足なら honest failure）契約を固定する。
-発動は調べる深さ（standard=0回／deep=1回／max=2回）に載る。harness は
+発動は調べる深さ（quick=0巡／standard=2巡／deep=4巡／max=共通上限）に載る。harness は
 `tests/unit/test_sub_loop.py` と同型（LLM は stub・コスト0・fixtures world）。
 """
 from __future__ import annotations
@@ -27,12 +27,15 @@ _SUB = {"provider": "ollama", "url": "http://localhost:11434", "model": "qwen2.5
         "profile_id": "worker"}
 
 
-def _ctx(**overrides) -> Ctx:
+def _ctx(depth_profile: str = "quick", **overrides) -> Ctx:
+    """既定はクイック（見直し 0 巡＝確認 1 回だけ）。巡ループを回すターンは呼び出し側が
+    `scope_meta` で深さを指定する（標準 2 巡／深く 4 巡／最大＝共通上限）。"""
     base = dict(
         message="TAX-RATEは?", world="v1", knowledge=True,
         route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
         dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}, "sources": []},
-        scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
+        scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                    "depth_profile": depth_profile},
         make_sources=lambda docs: [{"doc_id": d} for d in docs],
     )
     base.update(overrides)
@@ -138,8 +141,8 @@ def _mk(responses, max_review_rounds=None):
     return p
 
 
-def test_standard_profile_skips_review():
-    """standard（既定）は査読を発動しない＝ _stream は最終合成の1回だけ（従来挙動不変）。"""
+def test_quick_profile_skips_review():
+    """クイックは査読を発動しない＝ _stream は最終合成の1回だけ（従来挙動不変）。"""
     orig = _install_post(_sub_run_seq())
     try:
         p = _mk(["CLOUD SYNTH ANSWER"])
@@ -153,8 +156,8 @@ def test_standard_profile_skips_review():
         A._post = orig
 
 
-def test_deep_insufficient_once_reruns_with_missing_axes():
-    """deep: 査読が不足→不足軸つきで下調べを1回再実行→再査読 sufficient→清書。"""
+def test_standard_insufficient_once_reruns_with_missing_axes():
+    """標準（2巡）: 査読が不足→不足軸つきで下調べを1回再実行→再査読 sufficient→清書。"""
     bodies = []
     orig = _install_post(_sub_run_seq() + _sub_run_seq(), bodies)
     try:
@@ -162,7 +165,7 @@ def test_deep_insufficient_once_reruns_with_missing_axes():
                  '{"sufficient": true, "missing": ""}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -180,7 +183,7 @@ def test_deep_insufficient_once_reruns_with_missing_axes():
         A._post = orig
 
 
-def test_deep_missing_axes_truncated_at_2000_chars_with_notice():
+def test_missing_axes_truncated_at_2000_chars_with_notice():
     """査読が返す `missing`（不足観点）が `_RERUN_MISSING_MAX_CHARS`（2,000字）を超えたら
     切り詰めて「（以下省略）」を付けたうえで再調査へ引き継ぐ（打ち切りを無言にしない契約）。"""
     long_missing = "税率の適用開始日と経過措置の詳細" * 200   # 2,000字を優に超える
@@ -192,7 +195,7 @@ def test_deep_missing_axes_truncated_at_2000_chars_with_notice():
                  '{"sufficient": true, "missing": ""}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -206,7 +209,7 @@ def test_deep_missing_axes_truncated_at_2000_chars_with_notice():
         A._post = orig
 
 
-def test_deep_missing_axes_under_new_cap_not_truncated():
+def test_missing_axes_under_new_cap_not_truncated():
     """`_RERUN_MISSING_MAX_CHARS`（2,000字）以内の `missing` は切り詰められず全文が再調査へ渡る。"""
     missing_mid = "税率の適用開始日と経過措置" * 60   # 500字は超えるが2,000字は超えない長さで確認
     assert 500 < len(missing_mid) <= PB._RERUN_MISSING_MAX_CHARS
@@ -217,7 +220,7 @@ def test_deep_missing_axes_under_new_cap_not_truncated():
                  '{"sufficient": true, "missing": ""}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         rerun_payload = str(bodies[2:])
         assert missing_mid in rerun_payload   # 全文がそのまま残る（上限内なので切り詰められない）
@@ -226,8 +229,8 @@ def test_deep_missing_axes_under_new_cap_not_truncated():
         A._post = orig
 
 
-def test_deep_still_insufficient_is_honest_failure():
-    """deep: 再調査してもなお不足→清書せず honest failure（RuntimeError を送出）。
+def test_standard_still_insufficient_is_honest_failure():
+    """標準（2巡）: 再調査してもなお不足→清書せず honest failure（RuntimeError を送出）。
     必要な根拠種別が揃っていないため、最終巡の後に自動引き上げ（S2）で 1 巡だけ追加される。"""
     orig = _install_post(_sub_run_seq() + _sub_run_seq() + _sub_run_seq())
     try:
@@ -235,7 +238,7 @@ def test_deep_still_insufficient_is_honest_failure():
                  '{"sufficient": false, "missing": "適用範囲"}',
                  '{"sufficient": false, "missing": "適用範囲"}'])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         with pytest.raises(RuntimeError, match="insufficient"):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
     finally:
@@ -269,7 +272,7 @@ def test_metering_records_initial_and_rerun_runs(monkeypatch):
                  '{"sufficient": true, "missing": ""}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         # M-2是正: dict 集約（後勝ち）だけだと同じ kind の二重記録を見逃す——正本の kind
         # （chat-sub／chat-review）がちょうど1行ずつであることも独立に確認する。
@@ -309,7 +312,7 @@ def test_stop_during_review_aborts_without_synthesis():
                               responses=['{"sufficient": true, "missing": ""}', "SHOULD NOT SYNTH"])
         p._sub = dict(_SUB)
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"},
+                               "depth_profile": "standard"},
                    stop_event=stop)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
@@ -349,7 +352,7 @@ def test_run_honest_failure_message_distinguishes_insufficient():
                  '{"sufficient": false, "missing": "適用範囲"}',
                  '{"sufficient": false, "missing": "適用範囲"}'])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p.run(ctx))
         result = next(e for e in events if e.get("type") == "_result")
         assert "十分な根拠を確認できませんでした" in result["env"]["headline"]
@@ -370,13 +373,13 @@ def test_synth_citation_view_puts_rerun_evidence_first():
     assert _synth_citation_view(cites, {id(object())}) is cites   # 生存 citation に該当なし＝素通し
 
 
-def test_deep_unparsable_verdict_fails_open():
+def test_unparsable_verdict_fails_open():
     """査読応答が JSON でない＝判定不能→fail-open で従来どおり清書へ進む。"""
     orig = _install_post(_sub_run_seq())
     try:
         p = _mk(["ただの文章で JSON ではない", "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -402,7 +405,7 @@ def test_review_list_docs_evidence_and_gap_reach_synthesis_digest():
             "CLOUD SYNTH ANSWER",
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -454,7 +457,7 @@ def test_sub_zero_evidence_review_list_docs_only_still_passes_gate_and_fills_sou
             "CLOUD SYNTH ANSWER",
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")   # 誤って evidence below threshold にならない
@@ -480,7 +483,7 @@ def test_review_read_around_doc_merges_into_docs_and_verified_sources():
             "CLOUD SYNTH ANSWER",
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
@@ -591,7 +594,7 @@ def test_review_usage_recorded_via_metering(monkeypatch):
             "CLOUD SYNTH ANSWER"])
         p._sub = dict(_SUB)
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         kinds = [a[0] for a, kw in recorded]
         # M-2是正: dict 集約だけでは同じ kind の二重記録（後勝ちで上書き）を見逃す——各 kind が
@@ -677,7 +680,7 @@ def test_claims_confirmed_referencing_only_unmappable_evidence_is_honest_failure
             claims_json,
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         with pytest.raises(PB._MainReviewInsufficient):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
     finally:
@@ -759,7 +762,7 @@ def test_claims_synthesis_aborts_mid_stream_on_stop_event():
     assert {k: v for k, v in usage.items() if k != "roles"} == {"calls": 1, "tokens": None}
 
 
-def test_deep_still_insufficient_with_broken_claims_json_stays_honest_failure():
+def test_standard_still_insufficient_with_broken_claims_json_stays_honest_failure():
     """再調査を尽くし、主張構造の生成も不正な JSON で失敗すれば、従来どおり固定文言の
     honest failure（`_MainReviewInsufficient`）に落ちる——途中で切れた JSON を部分回答の
     採用条件として通さない。"""
@@ -770,7 +773,7 @@ def test_deep_still_insufficient_with_broken_claims_json_stays_honest_failure():
                  '{"sufficient": false, "missing": "適用範囲"}',
                  '{"claims": [{"id": "c1", "status": "confirmed", "text": "t"}'])   # 途中で切れた主張JSON
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         with pytest.raises(RuntimeError, match="insufficient"):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
     finally:
@@ -803,7 +806,7 @@ def test_review_stop_event_during_read_loop_aborts_immediately(monkeypatch):
 # ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
 # worker（下調べ役）の一次判断 =====
 
-def test_worker_primary_judgment_not_exposed_in_standard_depth_without_claims():
+def test_worker_primary_judgment_not_exposed_in_quick_depth_without_claims():
     """標準（既定・evaluator の巡は 0）で下調べ役が一次判断を返さなければ、確認は行われず
     （`main-review` ノードも無し）、data["claims"] にも清書のダイジェストにも主張は出ない——
     根拠（citations／構造的根拠）は従来どおり通常に渡る。"""
@@ -830,7 +833,7 @@ def test_worker_primary_judgment_discarded_on_review_fail_open():
     try:
         p = _mk(["これは JSON ではありません", "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -845,7 +848,7 @@ def test_worker_primary_judgment_discarded_when_rerun_claims_unreviewed_before_b
     調査予算（turns_exhausted）で打ち切られて次の査読へ進まない——更新後の一次判断は一度も
     判定を通っていないため、清書・公開へ渡らない（前回の査読実績を使い回さない）。"""
     from sherpa import depth_profile as D
-    _SUB_MAX_TURNS = D.scaled_turns(_SUB["guard"]["max_turns"], "deep")   # 深く＝基準値×2
+    _SUB_MAX_TURNS = D.scaled_turns(_SUB["guard"]["max_turns"], "standard")
     rerun_exhaust = [{"choices": [{"message": {"content": "", "tool_calls": [
         {"id": f"c{i}", "function": {"name": "list_docs", "arguments": "{}"}}]}}]}
         for i in range(_SUB_MAX_TURNS)]
@@ -858,7 +861,7 @@ def test_worker_primary_judgment_discarded_when_rerun_claims_unreviewed_before_b
     try:
         p = _mk(['{"sufficient": false, "missing": "税率の適用開始日"}', "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -917,7 +920,7 @@ def test_main_review_prompt_includes_worker_primary_judgment():
 
 
 def test_worker_claims_call_counted_as_extra_chat_sub_call_when_review_runs(monkeypatch):
-    """#26 是正: 査読が走る深さ（deep）では下調べ役の一次判断の要求も chat-sub の呼び出し回数に
+    """#26 是正: 査読が走る深さ（標準）では下調べ役の一次判断の要求も chat-sub の呼び出し回数に
     含まれる（黙って増えない）。"""
     from sherpa import metering
     recorded = []
@@ -932,7 +935,7 @@ def test_worker_claims_call_counted_as_extra_chat_sub_call_when_review_runs(monk
     try:
         p = _mk(['{"sufficient": true, "missing": ""}', "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         by_kind = {a[0]: kw for a, kw in recorded}
         # list_docs（1）＋散文終了（2）＋一次判断の要求（3）＝3。
@@ -941,7 +944,7 @@ def test_worker_claims_call_counted_as_extra_chat_sub_call_when_review_runs(monk
         A._post = orig
 
 
-def test_worker_claims_call_issued_in_standard_depth(monkeypatch):
+def test_worker_claims_call_issued_in_quick_depth(monkeypatch):
     """標準（巡 0）でも下調べ役は一次判断を返す（orchestrator の確認 1 回を通して清書へ渡る
     ため）＝chat-sub は list_docs＋散文終了＋一次判断の要求の3回になる。"""
     from sherpa import metering
@@ -982,7 +985,7 @@ def _sub_run_claims_seq_ids(id_text_pairs: list[tuple[str, str]]):
 
 
 def test_worker_primary_judgment_replaces_same_id_and_appends_new_axis():
-    """#24 是正: 再調査（deep=1回・査読を通す）で worker が返す一次判断のうち、初回分と**同じ
+    """#24 是正: 再調査（査読を通す1回）で worker が返す一次判断のうち、初回分と**同じ
     元 id**（"c1"）は再調査分の内容へ置換し（言い直しを新旧そろって confirmed で残さない）、
     初回にしか無い別軸（"c2"）はそのまま維持したうえで再調査分を追記する。"""
     bodies = []
@@ -996,7 +999,7 @@ def test_worker_primary_judgment_replaces_same_id_and_appends_new_axis():
             "CLOUD SYNTH ANSWER",
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         claims = result["env"]["data"]["claims"]
@@ -1033,7 +1036,7 @@ def test_worker_primary_judgment_kept_when_reinvestigation_claims_invalid():
             "CLOUD SYNTH ANSWER",
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"] == "CLOUD SYNTH ANSWER"
@@ -1096,7 +1099,7 @@ def test_reinvestigation_claims_prompt_includes_existing_worker_claims_and_repla
             "CLOUD SYNTH ANSWER",
         ])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         claims = result["env"]["data"]["claims"]
@@ -1120,7 +1123,7 @@ def _round_ids(events) -> list:
                    if e.get("type") == "node" and str(e.get("id") or "").startswith("main-review-r")})
 
 
-def test_deep_runs_two_evaluator_rounds_with_round_scoped_node_ids():
+def test_standard_runs_two_evaluator_rounds_with_round_scoped_node_ids():
     """受け入れ条件(2)(7): 深く＝2巡。「1巡目不足→2巡目で終了」で evaluator が2回走り、
     思考ノードの id が巡ごとに分かれる（再読込後も巡が区別できる）。"""
     orig = _install_post(_sub_run_seq() + _sub_run_seq())
@@ -1129,7 +1132,7 @@ def test_deep_runs_two_evaluator_rounds_with_round_scoped_node_ids():
                  '{"verdict": "sufficient", "missing": "", "findings": []}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert len(p._synth_prompts) == 3         # 査読2回＋清書1回
         assert _round_ids(events) == ["main-review-r1", "main-review-r2"]
@@ -1150,7 +1153,7 @@ def test_undecidable_verdict_ends_rounds_without_further_worker_or_evaluator():
         p = _mk(['{"verdict": "undecidable", "missing": "", "findings": []}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")
@@ -1167,7 +1170,7 @@ def test_sufficient_first_round_skips_remaining_rounds():
     try:
         p = _mk(['{"verdict": "sufficient", "missing": "", "findings": []}', "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert len(p._synth_prompts) == 2
         assert _round_ids(events) == ["main-review-r1"]
@@ -1205,7 +1208,7 @@ def test_no_intermediate_body_is_streamed_or_returned():
                  '{"verdict": "sufficient", "missing": "", "findings": []}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
         # 必要な根拠の種別（設計書）が揃わないターンは冒頭の告知が前置される（§0(b)）——
@@ -1249,7 +1252,7 @@ def test_stop_after_final_round_does_not_return_refuted_claims():
             "SHOULD NOT SYNTH"])
         p._sub = dict(_SUB)
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"}, stop_event=stop)
+                               "depth_profile": "standard"}, stop_event=stop)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["_terminal"] == "stopped"
@@ -1273,7 +1276,7 @@ def test_chat_round_recorded_per_round_and_canonical_usage_once(monkeypatch):
                  '{"verdict": "sufficient", "missing": "", "findings": []}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         rounds = [kw for a, kw in recorded if a[0] == "chat-round"]
         assert [kw["meta"]["round"] for kw in rounds] == [1, 2]
@@ -1330,7 +1333,7 @@ def test_final_round_synthesis_does_not_readopt_refuted_claim():
                  '{"verdict": "insufficient", "missing": "適用開始日", "findings": []}',
                  claims_json, "PARTIAL"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         claims = {c["id"]: c for c in result["env"]["data"]["claims"]}
@@ -1360,7 +1363,7 @@ def test_stopped_terminal_excludes_unreviewed_worker_claims():
                           responses=["NOT JSON AT ALL", "SHOULD NOT SYNTH"])
         p._sub = dict(_SUB)
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"}, stop_event=stop)
+                               "depth_profile": "standard"}, stop_event=stop)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["_terminal"] == "stopped"
@@ -1390,7 +1393,7 @@ def test_stopped_terminal_precedes_review_nodes(monkeypatch):
         p = _mk([f'{{"action": "read_around", "doc_id": "{_REVIEW_DOC}", "line": 1}}',
                  '{"verdict": "sufficient", "missing": "", "findings": []}'])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"}, stop_event=stop)
+                               "depth_profile": "standard"}, stop_event=stop)
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result_at = next(i for i, e in enumerate(events) if e.get("type") == "_result")
         assert events[result_at]["env"]["_terminal"] == "stopped"
@@ -1401,7 +1404,7 @@ def test_stopped_terminal_precedes_review_nodes(monkeypatch):
         A._post = orig
 
 
-def test_standard_depth_stop_does_not_save_incomplete_answer():
+def test_quick_depth_stop_does_not_save_incomplete_answer():
     """標準（0 巡）は巡ループを回さない＝停止しても未完了回答（`_terminal="stopped"`）を
     返さない（従来どおり assistant 未保存のまま終える）。"""
     import threading
@@ -1435,7 +1438,7 @@ def test_unreadable_findings_keep_the_round_unreviewed():
         p = _mk(['{"verdict": "sufficient", "missing": "", "findings": [{"claim_id": "c1"}]}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert "claims" not in result["env"]["data"]
@@ -1451,7 +1454,7 @@ def test_failed_terminal_keeps_confirmed_claims_and_round(monkeypatch):
     try:
         p = _mk(['{"verdict": "insufficient", "missing": "適用開始日", "findings": []}'])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         _calls = {"n": 0}
         _real = p._sub_agentic_loop
 
@@ -1498,7 +1501,7 @@ def test_claims_synthesis_prompt_carries_existing_ids_and_open_refutations():
                  '{"verdict": "insufficient", "missing": "適用開始日", "findings": []}',
                  claims_json, "PARTIAL"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         claims_prompt = p._synth_prompts[-2]   # 主張構造の生成＝最後の清書の1つ前
         assert "【前回までの主張" in claims_prompt and "[c1]" in claims_prompt
@@ -1518,7 +1521,7 @@ def test_review_prompt_carries_finding_ids_and_reuse_rule():
                  '{"verdict": "sufficient", "missing": "", "findings": []}',
                  "CLOUD SYNTH ANSWER"])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         second_review = p._synth_prompts[1]
         assert "(f1)" in second_review
@@ -1540,7 +1543,7 @@ def test_failed_terminal_drops_confirmed_claims_that_lost_evidence_refs():
                  '{"verdict": "insufficient", "missing": "適用範囲その2", "findings": []}',
                  claims_json])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         events = list(p.run(ctx))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["_terminal"] == "failed"
@@ -1552,7 +1555,7 @@ def test_failed_terminal_drops_confirmed_claims_that_lost_evidence_refs():
 
 # ===== DEPTH-2 S5b（§2.2）: 標準（巡 0）でも orchestrator の確認を 1 回行う =====
 
-def test_standard_depth_confirmed_claims_reach_synthesis_and_envelope(monkeypatch):
+def test_quick_depth_confirmed_claims_reach_synthesis_and_envelope(monkeypatch):
     """標準・下調べ役ありでは、worker の一次判断を orchestrator が 1 回だけ確認し、確認を
     通した主張が清書プロンプト（主張の構造）と envelope の data["claims"] に入る。確認は
     強いモデルの追加呼び出し1回＝chat-review に、一次判断の要求は chat-sub に計上される。"""
@@ -1580,9 +1583,10 @@ def test_standard_depth_confirmed_claims_reach_synthesis_and_envelope(monkeypatc
         A._post = orig
 
 
-def test_standard_depth_insufficient_confirmation_escalates_exactly_one_round():
-    """標準の確認が不足と判定し、必要な根拠種別も揃っていない＝自動引き上げ（S2）で 1 巡だけ
-    追加する（深く相当の探索量で再調査→評価）。その巡の判定後は追加の巡を発生させない。"""
+def test_quick_depth_insufficient_confirmation_escalates_exactly_one_round():
+    """クイックの確認が不足と判定し、必要な根拠種別も揃っていない＝自動引き上げで 1 巡だけ
+    追加する（1 段上＝標準相当で再調査→評価。クイック→標準は巡が増えるだけで探索量は同じ）。
+    その巡の判定後は追加の巡を発生させない。"""
     orig = _install_post(_sub_run_claims_seq("標準税率は10%です。") + _sub_run_seq())
     try:
         p = _mk(['{"verdict": "insufficient", "missing": "適用開始日", "findings": []}',
@@ -1597,7 +1601,7 @@ def test_standard_depth_insufficient_confirmation_escalates_exactly_one_round():
         A._post = orig
 
 
-def test_standard_depth_claims_discarded_on_confirmation_fail_open():
+def test_quick_depth_claims_discarded_on_confirmation_fail_open():
     """標準の確認が fail-open（応答が JSON でない＝verdict=None）で終わったターンは、確認を
     一度も通していない——worker の一次判断は清書・公開へ渡らない（根拠だけで清書は進む）。"""
     orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
@@ -1613,7 +1617,7 @@ def test_standard_depth_claims_discarded_on_confirmation_fail_open():
         A._post = orig
 
 
-def test_standard_depth_refuted_claim_falls_to_unknown_conflict():
+def test_quick_depth_refuted_claim_falls_to_unknown_conflict():
     """標準の確認が反証（`refutes`）を返した主張は、同じ規律で不明（理由コード conflict）へ
     落ちる＝確定として清書・公開へ渡らない。"""
     orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
@@ -1631,7 +1635,7 @@ def test_standard_depth_refuted_claim_falls_to_unknown_conflict():
         A._post = orig
 
 
-def test_standard_confirm_apply_findings_failure_records_review_failed(monkeypatch):
+def test_quick_confirm_apply_findings_failure_records_review_failed(monkeypatch):
     """C61 是正: 標準の確認で判定（verdict）は得られても `findings` の形が不正で
     `apply_findings` が False を返した回は、chat-round の stop を実際の状態（未査読）に
     合わせて `review_failed` として記録する——`sufficient` のまま記録すると、一次判断を
@@ -1657,7 +1661,7 @@ def test_standard_confirm_apply_findings_failure_records_review_failed(monkeypat
         A._post = orig
 
 
-def test_standard_confirm_usage_role_is_orchestrator_not_evaluator(monkeypatch):
+def test_quick_confirm_usage_role_is_orchestrator_not_evaluator(monkeypatch):
     """C62 是正: 標準の確認（判定のみ・再調査なし）は evaluator の巡という語彙が成立しない
     ため、chat-round の役割別内訳を orchestrator に集約して記録する（正本の chat-review
     合計は変わらない・表示用の内訳だけの区別）。"""
@@ -1699,7 +1703,7 @@ class _FailAtSynth(_ReviewSynth):
         yield self._responses.pop(0)
 
 
-def test_standard_confirmed_synthesis_failure_omits_round_loop_wording():
+def test_quick_confirmed_synthesis_failure_omits_round_loop_wording():
     """#64 是正: 標準（巡0）で確認が通っても、直後の清書失敗の未完了本文は巡ループの
     「N巡目で打ち切りました」という語彙を使わない（標準に巡という概念は無いため）——
     `_incomplete_terminal_body` を `_review_rounds > 0` のときだけにする（停止終端が
@@ -1828,7 +1832,8 @@ def test_docs_only_layer_keeps_source_required_as_unconfirmable_not_out_of_scope
     orig = _install_post(_sub_run_claims_seq("標準税率は10%です。"))
     try:
         p = _mk([_OK_VERDICT, "CLOUD SYNTH ANSWER"])
-        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "layer": "docs"})
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all", "layer": "docs",
+                               "depth_profile": "quick"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         assert result["env"]["headline"].endswith("CLOUD SYNTH ANSWER")   # 不足で終端しない
@@ -1880,7 +1885,7 @@ def test_claim_evidence_kinds_cover_the_closed_vocabulary():
     assert IS.required_evidence_kinds("troubleshoot") == ("source", "log_config")
 
 
-def test_standard_depth_records_missing_codes_in_chat_round(monkeypatch):
+def test_quick_depth_records_missing_codes_in_chat_round(monkeypatch):
     """標準（巡 0）の確認1回も、正規化済みの `missing_codes`（閉集合・本文なし）を
     `chat-round` へ載せる。"""
     from sherpa import metering
@@ -2088,7 +2093,8 @@ def test_notice_is_not_prefixed_when_only_out_of_range_kinds_are_reported():
     orig = _install_post(_sub_run_ripgrep_seq("消費税"))
     try:
         p = _mk(["CLOUD SYNTH ANSWER"])
-        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": ["4期/01_標準"], "source": "all"})
+        ctx = _ctx(scope_meta={"world": "v1", "scope_paths": ["4期/01_標準"], "source": "all",
+                               "depth_profile": "quick"})
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         env = next(e for e in events if e.get("type") == "_result")["env"]
         assert env["headline"] == "CLOUD SYNTH ANSWER"   # 告知は付かない
@@ -2181,7 +2187,7 @@ def test_incomplete_answer_demotes_claims_missing_required_kinds(monkeypatch):
         # 確認できていない。
         ctx = _ctx(route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
                    scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         _calls = {"n": 0}
         _real = p._sub_agentic_loop
 
@@ -2210,9 +2216,9 @@ def _escalation_rounds(recorded) -> list:
 
 
 def test_escalation_runs_worker_again_with_one_step_deeper_exploration(monkeypatch):
-    """標準で不足→引き上げ: 追加の1巡は「深く」相当の探索量で worker を再実行してから評価する。
-    利用者が選んだ深さは書き換えず、`answer.usage.depth_profile` にも標準のまま載る（利用統計の
-    深さ別集計に「深く」として混ざらない）——引き上げは上限値・告知・`limits` の側で表す。"""
+    """クイックで不足→引き上げ: 追加の1巡は 1 段上（標準）相当の探索量で worker を再実行してから
+    評価する。利用者が選んだ深さは書き換えず、`answer.usage.depth_profile` にもクイックのまま載る
+    （利用統計の深さ別集計に上の段として混ざらない）——引き上げは上限値・告知・`limits` の側で表す。"""
     from sherpa import metering
     recorded = []
     monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
@@ -2227,13 +2233,14 @@ def test_escalation_runs_worker_again_with_one_step_deeper_exploration(monkeypat
         result = next(e for e in events if e.get("type") == "_result")
         # 再調査が実際に走り、不足の軸が worker へ渡る。
         assert "前回の調査で不足していた観点" in str(bodies[3:])
-        # その再調査は 1 段上（深く）の探索量で実行された（実効上限＝基準値×2）。
+        # その再調査は 1 段上（標準）の探索量で実行された。
         from sherpa import depth_profile as D
-        assert p._depth_escalation == "deep"
-        assert p._last_sub_depth_usage["max_turns"] == D.scaled_turns(_SUB["guard"]["max_turns"], "deep")
+        assert p._depth_escalation == "standard"
+        assert (p._last_sub_depth_usage["max_turns"]
+                == D.scaled_turns(_SUB["guard"]["max_turns"], p._depth_escalation))
         # usage の正本（深さ別集計の軸＝`env["usage"]` へそのまま合流する）は利用者の選択のまま。
-        assert p._last_sub_depth_usage["depth_profile"] == "standard"
-        assert (ctx.scope_meta or {}).get("depth_profile") is None    # 利用者の選択は書き換えない
+        assert p._last_sub_depth_usage["depth_profile"] == "quick"
+        assert (ctx.scope_meta or {}).get("depth_profile") == "quick"   # 利用者の選択は書き換えない
         assert result["env"]["limits"]["depth_escalated"] is True
         rounds = _escalation_rounds(recorded)
         assert [r["meta"]["round"] for r in rounds] == [0, 1]
@@ -2270,7 +2277,7 @@ def test_escalation_records_notice_and_reason_code_without_the_reason_body(monke
 
 
 def test_escalation_happens_at_most_once_per_turn(monkeypatch):
-    """深く（2巡）で不足のまま終わっても、引き上げは1回だけ＝3巡目の判定後に4巡目は作らない。"""
+    """標準（2巡）で不足のまま終わっても、引き上げは1回だけ＝3巡目の判定後に4巡目は作らない。"""
     from sherpa import metering
     recorded = []
     monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
@@ -2281,18 +2288,18 @@ def test_escalation_happens_at_most_once_per_turn(monkeypatch):
                  '{"verdict": "insufficient", "missing": "適用範囲", "findings": []}',
                  '{"claims": []}'])
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         with pytest.raises(RuntimeError, match="insufficient"):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert [r["meta"]["round"] for r in _escalation_rounds(recorded)] == [1, 2, 3]
-        assert p._depth_escalation == "max"     # 深く→最大相当の探索量（1段だけ）
+        assert p._depth_escalation == "deep"    # 標準→深く相当の探索量（1段だけ）
     finally:
         A._post = orig
 
 
 def test_escalation_adds_no_round_when_common_cap_leaves_no_room(monkeypatch):
     """共通上限（`max_review_rounds`）に余地が無ければ引き上げ自体が起こらない（巡も告知も
-    理由コードも増えない）。深く(2巡)＋上限2＝追加0。"""
+    理由コードも増えない）。標準(2巡)＋上限2＝追加0。"""
     from sherpa import metering
     recorded = []
     monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
@@ -2302,7 +2309,7 @@ def test_escalation_adds_no_round_when_common_cap_leaves_no_room(monkeypatch):
                  '{"verdict": "insufficient", "missing": "適用範囲", "findings": []}',
                  '{"claims": []}'], max_review_rounds=2)
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         with pytest.raises(RuntimeError, match="insufficient"):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert [r["meta"]["round"] for r in _escalation_rounds(recorded)] == [1, 2]
@@ -2315,7 +2322,7 @@ def test_escalation_adds_no_round_when_common_cap_leaves_no_room(monkeypatch):
 
 
 def test_escalation_adds_one_round_when_common_cap_has_room(monkeypatch):
-    """共通上限3・深く(2巡)＝追加1巡（上限内に収まる分だけ足す）。"""
+    """共通上限3・標準(2巡)＝追加1巡（上限内に収まる分だけ足す＝その巡は1段上の探索量で走る）。"""
     from sherpa import metering
     recorded = []
     monkeypatch.setattr(metering, "record", lambda *a, **kw: recorded.append((a, kw)))
@@ -2326,10 +2333,16 @@ def test_escalation_adds_one_round_when_common_cap_has_room(monkeypatch):
                  '{"verdict": "insufficient", "missing": "適用範囲", "findings": []}',
                  '{"claims": []}'], max_review_rounds=3)
         ctx = _ctx(scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                               "depth_profile": "deep"})
+                               "depth_profile": "standard"})
         with pytest.raises(RuntimeError, match="insufficient"):
             list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         assert [r["meta"]["round"] for r in _escalation_rounds(recorded)] == [1, 2, 3]
+        # 追加の巡は 1 段上（深く）の探索量＝基準値×2 で走る。
+        from sherpa import depth_profile as D
+        assert p._depth_escalation == "deep"
+        assert (p._last_sub_depth_usage["max_turns"]
+                == D.scaled_turns(_SUB["guard"]["max_turns"], "deep")
+                == _SUB["guard"]["max_turns"] * 2)
     finally:
         A._post = orig
 

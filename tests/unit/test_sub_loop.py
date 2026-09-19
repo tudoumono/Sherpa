@@ -26,12 +26,16 @@ from sherpa import agents  # noqa: E402
 from sherpa.agents import Ctx, OpenAIProvider  # noqa: E402
 
 
-def _ctx(**overrides) -> Ctx:
+def _ctx(depth_profile: str | None = "quick", **overrides) -> Ctx:
+    """このモジュールの論点は下調べ役ループと合成——深さの既定はクイック（見直し 0 巡）にして
+    1ターン＝1合成のまま観測する（巡ループの挙動は test_main_review.py が受け持つ）。
+    `depth_profile=None` で scope_meta からキーごと落とす（旧会話・呼び出し互換の検証用）。"""
     base = dict(
         message="TAX-RATEは?", world="v1", knowledge=True,
         route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
         dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}, "sources": []},
-        scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
+        scope_meta={"world": "v1", "scope_paths": [], "source": "all",
+                    **({"depth_profile": depth_profile} if depth_profile else {})},
         make_sources=lambda docs: [{"doc_id": d} for d in docs],
     )
     base.update(overrides)
@@ -458,8 +462,8 @@ def test_on_loop_synthesis_usage_present_when_stream_sets_last_usage():
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         result = next(e for e in events if e.get("type") == "_result")
         # STAT-3 S1: env["usage"] は合成呼び出し本体（_synth_usage）＋ `_sub_loop` が残した
-        # 深さ由来のキー（scope_meta に depth_profile 無し＝standard・guard.max_turns=6 のまま）。
-        assert result["env"]["usage"] == {**p._synth_usage, "depth_profile": "standard",
+        # 深さ由来のキー（クイック＝倍率なし・guard.max_turns=6 のまま）。
+        assert result["env"]["usage"] == {**p._synth_usage, "depth_profile": "quick",
                                           "max_turns": _SUB["guard"]["max_turns"],
                                           "max_tools_per_turn": A.MAX_TOOLS_PER_TURN}
         assert result["env"]["usage_sub"]["provider"] == "ollama"
@@ -1869,7 +1873,7 @@ def test_sub_loop_depth_profile_omitted_keeps_guard_max_turns_unchanged():
     try:
         p = _FakeSynth("sk-dummy", "gpt-5.5")
         p._sub = {**_SUB, "guard": {"min_citations": 1, "max_turns": 1, "llm_timeout": 60}}
-        ctx = _ctx()   # scope_meta に depth_profile キー無し
+        ctx = _ctx(depth_profile=None)   # scope_meta に depth_profile キー無し
         events = list(p._sub_agentic_loop(ctx))
         final = next(e for e in events if "final" in e)
         # guard=1 のまま打ち切り。DEPTH-2 S4b: 根拠があれば一次判断を1回だけ追加で要求する。

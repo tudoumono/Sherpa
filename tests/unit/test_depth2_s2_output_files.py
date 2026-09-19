@@ -490,8 +490,8 @@ class _HybridAuthor(_AuthorOpenAI):
         yield text
 
 
-def _author_ctx_depth(uid, depth=None, stop_event=None, lens="author"):
-    """作成系（author）の Ctx（`depth` 省略＝標準・"deep" で巡ループを回す）。"""
+def _author_ctx_depth(uid, depth="quick", stop_event=None, lens="author"):
+    """作成系（author）の Ctx（`depth` 省略＝クイック＝見直し 0 巡・"standard" で巡ループを回す）。"""
     scope = {"world": "v1", "scope_paths": [], "source": "all"}
     if depth:
         scope["depth_profile"] = depth
@@ -600,7 +600,7 @@ def test_rerun_round_read_evidence_reaches_continuation_prompt(tmp_path, monkeyp
         ('{"sufficient": true, "missing": "", "findings": []}', "stop"),
         ("2巡目の途中まで", "length"),      # 清書が length で切れる
         ("続き", "stop")])
-    list(provider.run(_author_ctx_depth(uid, depth="deep")))
+    list(provider.run(_author_ctx_depth(uid, depth="standard")))
     cont_prompts = provider.prompts[3:]     # 査読2回＋清書1回のあとが追記継続
     assert cont_prompts, "追記継続が発行されていない"
     assert "法令上の規約" in cont_prompts[0], \
@@ -631,7 +631,7 @@ def test_stop_during_continuation_returns_stopped_terminal(tmp_path, monkeypatch
         ('{"sufficient": true, "missing": "", "findings": []}', "stop"),
         ("途中まで", "length"),
         ("続き", "stop")])
-    events = list(provider.run(_author_ctx_depth(uid, depth="deep", stop_event=stop)))
+    events = list(provider.run(_author_ctx_depth(uid, depth="standard", stop_event=stop)))
     env = next(e for e in events if e.get("type") == "_result")["env"]
     assert env.get("_terminal") == "stopped", \
         f"追記継続中の停止が停止終端になっていない: {env.get('_terminal')}"
@@ -750,7 +750,7 @@ def test_author_stop_during_attribution_does_not_register_output(tmp_path, monke
 
     provider = _StopDuringAttribution([('{"verdict": "sufficient", "missing": "", "findings": []}', "stop"),
                                        ("# 消費税率", "stop")])
-    events = list(provider.run(_author_ctx_depth(uid, depth="deep", stop_event=stop)))
+    events = list(provider.run(_author_ctx_depth(uid, depth="standard", stop_event=stop)))
     env = next(e for e in events if e.get("type") == "_result")["env"]
     assert env.get("_terminal") == "stopped", f"停止終端になっていない: {env.get('_terminal')}"
     assert not env.get("created_files")
@@ -825,7 +825,7 @@ def test_author_stop_during_filename_call_does_not_register_output(tmp_path, mon
     provider = _StopDuringFilename([('{"verdict": "sufficient", "missing": "", "findings": []}', "stop"),
                                     ("# 消費税率", "stop"),
                                     ('{"filename": "一覧.md", "marp": false}', "stop")])
-    events = list(provider.run(_author_ctx_depth(uid, depth="deep", stop_event=stop)))
+    events = list(provider.run(_author_ctx_depth(uid, depth="standard", stop_event=stop)))
     env = next(e for e in events if e.get("type") == "_result")["env"]
     assert env.get("_terminal") == "stopped", f"停止終端になっていない: {env.get('_terminal')}"
     assert not env.get("created_files")
@@ -850,7 +850,7 @@ def test_author_filename_call_usage_is_metered_once(tmp_path, monkeypatch):
 
     provider = _HybridAuthor([("# 消費税率", "stop"),
                               ('{"filename": "一覧.md", "marp": false}', "stop")])
-    list(provider.run(_author_ctx_depth(uid)))   # 標準（0 巡）＝evaluator 分の chat-review は無い
+    list(provider.run(_author_ctx_depth(uid)))   # クイック（0 巡）＝evaluator 分の chat-review は無い
     review = [r for r in recorded if r[0] == "chat-review"]
     assert len(review) == 1, f"ファイル名決定の呼び出しが計上されていない: {recorded}"
     assert review[0][1] == 1, review

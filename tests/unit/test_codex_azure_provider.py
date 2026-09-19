@@ -63,6 +63,13 @@ def _azure(sysset, **extra) -> None:
     sysset.update(extra)
 
 
+def _custom(sysset, **extra) -> None:
+    """`sysset` に独自エンドポイント（custom）接続先を書き込む（追加キーは `extra` で上書き）。"""
+    sysset["openai_endpoint_kind"] = "custom"
+    sysset["openai_base_url"] = "https://example.com/v1"
+    sysset.update(extra)
+
+
 # ===== 1. _openai_compat_provider_lines（行生成・単体） =====
 
 def test_openai_compat_provider_lines_bearer_no_api_version():
@@ -164,7 +171,7 @@ def test_azure_endpoint_with_api_version_and_api_key_header(tmp_path, sysset):
             assert "sk-" not in line, f"キーらしき文字列が config に出ている: {line!r}"
 
 
-# ===== RV #66 是正: Azure/独自エンドポイントは multi_agent の対象外 =====
+# ===== 初期構成の既定（2026-09-19）: Azure でも multi_agent を有効にする =====
 
 def test_codex_multi_agent_enabled_true_for_default_openai_endpoint():
     """回帰確認: 接続先が既定(OpenAI 本家)・サンドボックス有効・Codex(OpenAI) 構成では従来どおり有効。"""
@@ -173,28 +180,46 @@ def test_codex_multi_agent_enabled_true_for_default_openai_endpoint():
     assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is True
 
 
-def test_codex_multi_agent_enabled_false_for_azure_endpoint(sysset):
-    """Codex(OpenAI) 構成でも接続先が Azure/独自エンドポイントなら multi_agent は無効——
-    worker/evaluator の `model` は OpenAI カタログ固定値で、Azure のデプロイ名としては存在せず
-    spawn が毎ターン失敗する（実機確認済み）。"""
+def test_codex_multi_agent_enabled_true_for_azure_endpoint(sysset):
+    """Codex(OpenAI) 構成で接続先が Azure でも multi_agent は有効（決定2026-09-19）——
+    worker の `model` 解決を本体 Codex と同じデプロイ名へ倒すことで、Azure のデプロイ名として
+    存在しない固定値を spawn しに行く問題を回避する（`_codex_worker_model` 参照）。"""
     from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
 
     _azure(sysset)
-    assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is False
+    assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is True
 
 
-def test_azure_endpoint_multi_agent_disabled_writes_no_agents_sections(tmp_path, sysset):
+def test_azure_endpoint_multi_agent_enabled_writes_agents_sections_with_main_model_as_worker(tmp_path, sysset):
     """Azure 構成で `codex_multi_agent_enabled()` の判定どおりに `multi_agent` を渡すと、
-    config.toml に `[agents]`/`[agents.worker]`/`[agents.evaluator]` が一切書かれない。"""
+    config.toml に `[agents]`/`[agents.worker]`/`[agents.evaluator]` が書かれ、worker モデルは
+    （未設定のため）`orchestrator_model`＝本体 Codex と同じデプロイ名へ倒れる。"""
     from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
 
     _azure(sysset)
     enabled = codex_multi_agent_enabled(ollama_base_url=None, system_settings=None)
-    assert enabled is False
-    txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="gpt-5.5")
-    assert "[agents]" not in txt
-    assert "[agents.worker]" not in txt
-    assert "[agents.evaluator]" not in txt
+    assert enabled is True
+    txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="my-deployment")
+    assert "[agents]" in txt
+    assert "[agents.worker]" in txt and "[agents.evaluator]" in txt
+    worker_toml = (tmp_path / "ch" / "agents" / "worker.toml").read_text()
+    assert 'model = "my-deployment"' in worker_toml   # 本体と同じデプロイ名
+    evaluator_toml = (tmp_path / "ch" / "agents" / "evaluator.toml").read_text()
+    assert 'model = "my-deployment"' in evaluator_toml
+
+
+def test_azure_endpoint_multi_agent_worker_uses_configured_value_over_main_model(tmp_path, sysset):
+    """Azure 構成でも `codex_worker_model` が管理画面で明示設定されていれば、そちらが
+    本体デプロイ名より優先される（`_codex_worker_model` の優先順位1）。"""
+    _azure(sysset, codex_worker_model="gpt-5.9-custom")
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    enabled = codex_multi_agent_enabled(ollama_base_url=None, system_settings=None)
+    txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="my-deployment",
+                        system_settings=dict(sysset))
+    assert txt   # config.toml 生成が壊れていないことの前提確認
+    worker_toml = (tmp_path / "ch" / "agents" / "worker.toml").read_text()
+    assert 'model = "gpt-5.9-custom"' in worker_toml
 
 
 def test_ollama_construct_ignores_azure_settings(tmp_path, sysset):
@@ -207,6 +232,61 @@ def test_ollama_construct_ignores_azure_settings(tmp_path, sysset):
     txt = (ch / "config.toml").read_text(encoding="utf-8")
     assert 'model_provider = "sherpa-ollama"' in txt
     assert "sherpa-openai-compat" not in txt
+
+
+# ===== S6a RV是正1巡目 #1: 独自エンドポイント（custom）は worker モデル明示時のみ multi_agent =====
+
+def test_codex_multi_agent_enabled_false_for_custom_endpoint_unconfigured(sysset):
+    """custom 接続先で `codex_worker_model` 未設定のまま multi_agent を有効化すると worker は
+    `_CODEX_WORKER_MODEL_FALLBACK`（OpenAI カタログ値）を spawn しに行き、custom 側に
+    そのデプロイ名が存在する保証が無いため毎ターン失敗する——未設定なら無効のまま。"""
+    _custom(sysset)
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is False
+
+
+def test_codex_multi_agent_enabled_true_for_custom_endpoint_when_worker_model_configured(sysset):
+    """custom 接続先でも `codex_worker_model` を明示設定していれば multi_agent は有効になる
+    （運用側がそのデプロイ名の実在を保証した扱い）。"""
+    _custom(sysset, codex_worker_model="my-custom-deployment")
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    assert codex_multi_agent_enabled(ollama_base_url=None, system_settings=None) is True
+
+
+# ===== S6a RV是正1巡目 #2: role config（worker/evaluator）にも親と同じ provider 設定を書く =====
+
+def test_azure_role_configs_include_same_provider_lines_as_parent(tmp_path, sysset):
+    """Azure 構成で multi_agent を有効化すると、`agents/worker.toml`／`agents/evaluator.toml`
+    （役割ごとの config_file）にも親 config.toml と同じ `model_provider`／`[model_providers.*]`
+    が入る——書かないと子 Codex は組み込みの openai provider（本家）へ出てしまい、資料本文が
+    Azure 以外の宛先へ渡る。"""
+    _azure(sysset)
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    enabled = codex_multi_agent_enabled(ollama_base_url=None, system_settings=None)
+    parent_txt = _config_text(tmp_path, multi_agent=enabled, orchestrator_model="my-deployment",
+                              system_settings=dict(sysset))
+    worker_txt = (tmp_path / "ch" / "agents" / "worker.toml").read_text(encoding="utf-8")
+    evaluator_txt = (tmp_path / "ch" / "agents" / "evaluator.toml").read_text(encoding="utf-8")
+    assert 'model_provider = "sherpa-openai-compat"' in parent_txt
+    assert 'model_provider = "sherpa-openai-compat"' in worker_txt
+    assert 'model_provider = "sherpa-openai-compat"' in evaluator_txt
+    assert '[model_providers.sherpa-openai-compat]' in worker_txt
+    assert '[model_providers.sherpa-openai-compat]' in evaluator_txt
+    assert 'base_url = "https://myres.openai.azure.com/openai/v1"' in worker_txt
+    assert 'base_url = "https://myres.openai.azure.com/openai/v1"' in evaluator_txt
+
+
+def test_default_endpoint_role_configs_have_no_provider_lines(tmp_path):
+    """接続先が既定（OpenAI 本家）のときは role config にも provider 行を書かない（回帰ゼロ）。"""
+    from sherpa.providers.codex.sandbox import codex_multi_agent_enabled
+
+    enabled = codex_multi_agent_enabled(ollama_base_url=None, system_settings=None)
+    _config_text(tmp_path, multi_agent=enabled, orchestrator_model="gpt-5.5")
+    worker_txt = (tmp_path / "ch" / "agents" / "worker.toml").read_text(encoding="utf-8")
+    assert "model_provider" not in worker_txt and "model_providers" not in worker_txt
 
 
 # ===== 多層防御: sandbox.py 側でも base URL を検証する =====

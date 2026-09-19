@@ -71,7 +71,8 @@ def test_scopes_default_world_when_omitted(client, monkeypatch):
     assert seen["world"] == "v1"             # 既定 world（default_world・挙動不変）
 
 
-# ---- /chat（リクエストボディ・knowledge=False は handle_message のみ）----
+# ---- /chat（リクエストボディ・knowledge の真偽どちらでも handle_message を呼ぶ・
+# routers/chat.py::chat 参照）----
 
 def test_chat_body_ignores_legacy_version_uses_default(client, monkeypatch):
     from sherpa.routers import chat as chat_routes
@@ -98,7 +99,10 @@ def test_chat_body_world_param_still_works(client, monkeypatch):
         return {"conversation_id": 1, "message": {"answer": {"lens": "chat"}}}
 
     monkeypatch.setattr(chat_routes, "handle_message", _fake_handle)
-    r = client.post("/chat", json={"message": "hello", "world": "wA", "version": "wB", "stream_id": "compat-01010"})
+    # knowledge=False を明示（既定は ON・決定2026-09-19）——本テストの検証対象は world/version の
+    # 互換性のみで、knowledge=True 経路の scope 検証（実在 world 前提）を巻き込まないため。
+    r = client.post("/chat", json={"message": "hello", "world": "wA", "version": "wB",
+                                   "knowledge": False, "stream_id": "compat-01010"})
     assert r.status_code == 200, r.text
     assert seen["world"] == "wA"             # world が使われ version は無視される
 

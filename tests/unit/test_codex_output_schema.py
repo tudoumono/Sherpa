@@ -244,14 +244,36 @@ def test_last_message_file_wins_over_stream_tail_mismatch(tmp_path, monkeypatch)
     assert len(calls) == 1
 
 
-# ===== 7. argv に --output-schema <絶対パス> が付く（OpenAI 系・既定） =====
+# ===== 7. argv に --output-schema <絶対パス> が付く（OpenAI 系・既定＝v2・決定2026-09-19） =====
 
 def test_argv_includes_output_schema_flag_by_default(tmp_path, monkeypatch):
+    """初期構成の既定（決定2026-09-19）: env 未設定は v2 スキーマファイルを付ける
+    （3キー形の `_sj` 応答も `_parse_structured_v2` の後方互換で読める・claims は空配列）。"""
     steps = [{"thread_id": "TH-SCHEMA-ARGV", "agent_messages": [_sj("final", "対象はありません。")],
               "usage": helper._usage()}]
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_argv")
     prov = A.CodexProvider()
     ctx = helper._ctx(uid="schema-argv", conversation_id=20300)
+
+    helper._run(prov, ctx)
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 1
+    argv = calls[0]
+    assert "--output-schema" in argv
+    schema_path = argv[argv.index("--output-schema") + 1]
+    assert schema_path.endswith("output_schema_v2.json")
+    assert Path(schema_path).is_absolute()
+    assert Path(schema_path).is_file()
+
+
+def test_argv_includes_output_schema_v1_flag_when_env_1(tmp_path, monkeypatch):
+    """env `SHERPA_CODEX_OUTPUT_SCHEMA=1` は v1（従来の3キー・逃げ道）を明示選択できる。"""
+    steps = [{"thread_id": "TH-SCHEMA-ARGV-V1", "agent_messages": [_sj("final", "対象はありません。")],
+              "usage": helper._usage()}]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_argv_v1", schema_env="1")
+    prov = A.CodexProvider()
+    ctx = helper._ctx(uid="schema-argv-v1", conversation_id=20301)
 
     helper._run(prov, ctx)
 
@@ -625,10 +647,11 @@ def test_env_2_selects_v2_schema_file_and_surfaces_claims(tmp_path, monkeypatch)
     assert schema_path.endswith("output_schema_v2.json")
 
 
-def test_env_1_default_still_uses_v1_schema_file_without_claims():
-    """既定（env 未設定＝1）は従来どおり v1 スキーマ——`data.claims` は付かない
-    （既存テスト7番と同じ argv 契約・回帰確認）。"""
-    assert PV._env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 1, 0, 2) == 1
+def test_env_default_still_resolves_to_2_matching_provider_default(monkeypatch):
+    """初期構成の既定（決定2026-09-19）: env 未設定時、provider.py が実際に呼ぶのと同じ既定値
+    （2＝v2）へ解決する（既存テスト7番の argv 契約と同じ・回帰確認）。"""
+    monkeypatch.delenv("SHERPA_CODEX_OUTPUT_SCHEMA", raising=False)
+    assert PV._env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2) == 2
 
 
 # ===== RV C1/C4（docs/rv/2026-09-17-DEPTH-2.md）: `_parse_claim` の裏付け・理由必須 =====
@@ -774,7 +797,7 @@ def test_env_2_run_writes_v2_agents_md_paragraph(tmp_path, monkeypatch):
 
 
 def test_env_1_run_writes_v1_agents_md_paragraph(tmp_path, monkeypatch):
-    """既定（env 未設定＝v1）の実行は v2 段落を渡さない（回帰確認）。"""
+    """env `SHERPA_CODEX_OUTPUT_SCHEMA=1`（明示的な逃げ道）の実行は v2 段落を渡さない（回帰確認）。"""
     from sherpa import codex_agents_md
     captured: dict = {}
     orig_write = codex_agents_md.write_agents_md
@@ -787,10 +810,33 @@ def test_env_1_run_writes_v1_agents_md_paragraph(tmp_path, monkeypatch):
 
     steps = [{"thread_id": "TH-SCHEMA-V1-AGENTS",
              "agent_messages": [_sj("final", "確認しました。")], "usage": helper._usage()}]
-    _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_v1_agents")
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_v1_agents", schema_env="1")
     prov = A.CodexProvider()
     ctx = helper._ctx(uid="schema-v1-agents", conversation_id=20702)
 
     helper._run(prov, ctx)
 
     assert captured.get("output_schema_v2") is False
+
+
+def test_env_default_run_writes_v2_agents_md_paragraph(tmp_path, monkeypatch):
+    """初期構成の既定（決定2026-09-19）: env 未設定の実行は v2 段落を渡す（v2 が既定のため）。"""
+    from sherpa import codex_agents_md
+    captured: dict = {}
+    orig_write = codex_agents_md.write_agents_md
+
+    def _spy(authoring, output_schema=False, direct_read=True, output_schema_v2=False, **kw):
+        captured["output_schema_v2"] = output_schema_v2
+        return orig_write(authoring, output_schema=output_schema, direct_read=direct_read,
+                          output_schema_v2=output_schema_v2, **kw)
+    monkeypatch.setattr(PV.codex_agents_md, "write_agents_md", _spy)
+
+    steps = [{"thread_id": "TH-SCHEMA-DEFAULT-AGENTS",
+             "agent_messages": [_sj("final", "確認しました。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_schema_default_agents")
+    prov = A.CodexProvider()
+    ctx = helper._ctx(uid="schema-default-agents", conversation_id=20703)
+
+    helper._run(prov, ctx)
+
+    assert captured.get("output_schema_v2") is True

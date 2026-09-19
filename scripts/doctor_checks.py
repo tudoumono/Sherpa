@@ -1357,12 +1357,17 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
     値そのものは detail に出さない）。独自設定時は Codex 自身のモデルカタログに存在するかを
     Sherpa 側で検証できないため `skip` にする（`ng` にしない＝運用側の確認を促すだけ）。
 
-    実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は接続先が既定 OpenAI
-    （`llm.openai_endpoint_kind() == "openai"`）以外（Azure・独自エンドポイント）のとき multi_agent
-    自体を無効化して worker spawn の失敗を防ぐ——この構成は worker モデル不整合が実際には起こり
-    得ない想定内の組合せのため、理由付き `skip` にする（`ng` にしない）。この検査は接続先種別
-    だけを独立に確認する（サンドボックス無効・Codex(Ollama) の無効化は本番側の判定
-    `codex_multi_agent_enabled` に委ね、ここでは見ない）。接続先設定を読めない異常時を除き
+    実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は Azure では常に multi_agent
+    を有効にする（決定2026-09-19）。Azure（`llm.openai_endpoint_kind() == "azure"`）は worker
+    未設定時、本体 Codex と同じデプロイ名・接続先設定（`_codex_worker_model(..., main_model=...)`／
+    role config の `model_provider`・`[model_providers.*]`）を使うため、本体が到達できていれば
+    worker も到達できる想定内の組合せとして `ok` にする（独自設定時は他の接続先と同じく `skip`。
+    ただし Azure でのこの経路は実機未検証＝初回は spawn の成功と接続先ログを確認する必要がある・
+    detail に明記）。Azure 以外の独自エンドポイント（custom）は `codex_worker_model` が明示設定
+    されていなければ本番側 `codex_multi_agent_enabled` が multi_agent 自体を無効化する（RV是正：
+    custom は本体のモデル名を流用できる保証が無いため）——この検査でも同じ理由付き `skip` にする。
+    この検査は接続先種別だけを独立に確認する（サンドボックス無効・Codex(Ollama) の無効化は本番側の
+    判定 `codex_multi_agent_enabled` に委ね、ここでは見ない）。接続先設定を読めない異常時を除き
     `ok`／`skip` を返す。
     """
     cid, label = "codex_multi_agent_worker_model", "Codex multi_agent（worker/evaluator）モデル整合"
@@ -1399,12 +1404,21 @@ def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | 
         endpoint_kind = llm.openai_endpoint_kind(sys_s)
     except Exception as e:
         return CheckResult(cid, label, "ng", f"接続先設定が壊れているため確認できません（{type(e).__name__}）")
+    from sherpa.providers.codex import sandbox as codex_sandbox
+    if endpoint_kind == "azure":
+        if codex_sandbox._codex_worker_model(sys_s) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
+            return CheckResult(cid, label, "skip",
+                        "worker モデルが管理画面で独自設定されています"
+                        "（値が Codex 自身のモデルカタログに存在するか運用側で確認してください）")
+        return CheckResult(cid, label, "ok",
+                    "worker モデルは未設定のため、本体 Codex と同じデプロイ名・接続先設定を使います"
+                    "（本体が到達できていれば worker もそのまま動作するはずですが実機未検証のため、"
+                    "初回は spawn の成功と接続先ログを確認してください）")
     if endpoint_kind != "openai":
         return CheckResult(cid, label, "skip",
-                    "Codex(OpenAI 系) 構成の接続先が既定の OpenAI 以外（Azure・独自エンドポイント）のため、"
-                    "この接続先では multi_agent（worker/evaluator）を自動的に無効にしています"
-                    "（worker モデルのデプロイ名解決が不要になるため確認対象外です）")
-    from sherpa.providers.codex import sandbox as codex_sandbox
+                    "Codex(OpenAI 系) 構成の接続先が独自エンドポイント（custom）のため、"
+                    "codex_worker_model が未設定なら multi_agent 自体を無効化しています"
+                    "（明示設定すればこの接続先設定で worker/evaluator も動きます）")
     if codex_sandbox._codex_worker_model(sys_s) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
         return CheckResult(cid, label, "skip",
                     "worker モデルが管理画面で独自設定されています"

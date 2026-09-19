@@ -557,8 +557,8 @@ const REVIEW_LABELS = {
   backend_unavailable_fulltext: '全文検索が使えなかった', backend_unavailable_graph: 'グラフが使えなかった',
   graph_reingest_required: 'グラフは再取り込み待ち',
 };
-const REVIEW_DEPTH_LABELS = { standard: '標準', deep: '深く', max: '最大' };
-const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-standard': '見直しなし', 'depth2-deep': '見直しあり（深く）', 'depth2-max': '見直しあり（最大）' };
+const REVIEW_DEPTH_LABELS = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
+const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-quick': '見直しなし', 'depth2-standard': '標準（見直し 2 回）', 'depth2-deep': '深く（4 回）', 'depth2-max': '最大' };
 function reviewCounts(counts) {
   const totals = new Map();
   Object.entries(counts).forEach(([key, count]) => {

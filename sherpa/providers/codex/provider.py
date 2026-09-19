@@ -694,8 +694,7 @@ class CodexProvider(Provider):
     Codex の **実コマンド実行（grep 等）・推論・回答**を `--json` から拾い **1つずつ思考ノードに流す**
     （ユーザは Codex の作業を逐次見られる）。失敗/未導入は決定的回答にフォールバック。
     既定 reasoning=low（`SHERPA_CODEX_REASONING` で変更可。RV依頼の xhigh とは別運用）。
-    調べる深さ（調べ方ブロック §3.2）が「深く」「最大」のとき、ターンごとに high/xhigh へ
-    per-turn 上書きする（`_prompt_mcp`/`_prompt` 呼び出し直前の `_reason` 計算箇所を参照）。
+    推論レベルは調べる深さでは変えない——管理画面の基準値で固定（`depth_profile.codex_reasoning_for`）。
     """
     label, model = "Codex", "gpt-5.5"
     provider_id = "codex"
@@ -1158,9 +1157,8 @@ class CodexProvider(Provider):
                 _is_author = decision["lens"] == "author"
                 # 調べる深さ（調べ方ブロック §3.2）: 通常レンズの基準値だけ管理画面の基準値編集
                 # （system_settings）を反映する（author 専用の env は別軸のため対象外・§1.6 の
-                # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。標準=基準値のまま・深く=high・
-                # 最大=xhigh の per-turn 上書きは author を含む全レンズに一律適用する（基準値が
-                # 既に上なら下げない）。
+                # `SHERPA_CODEX_REASONING` に対応する基準値のみ）。推論レベルは深さでは変えない
+                # ＝どの深さでもこの基準値のまま `codex exec` へ渡す。
                 _base_reason = (os.environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium") if _is_author
                                else depth_profile_mod.effective_base(
                                    self._system_settings, "codex_reasoning", self._reason))
@@ -1169,18 +1167,20 @@ class CodexProvider(Provider):
                 _reason = "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
                 # 利用統計の拡充: usage メタへ足す「実際に codex exec へ渡した
                 # model_reasoning_effort」（`_reason`）と、基準値（minimal→low の丸め前）
-                # （`_base_reason`）。一致（標準プロファイルの通常ケース）なら `reasoning_base` は
+                # （`_base_reason`）。一致（minimal 以外の通常ケース）なら `reasoning_base` は
                 # 省略する（`usage_reasoning_extras` の契約）。
                 _usage_depth_extra = depth_profile_mod.usage_reasoning_extras(
                     (ctx.scope_meta or {}).get("depth_profile"), _base_reason, _reason)
                 # DEPTH-2 S6（§2.6・§5 S6）: multi_agent は既定で常時有効にする（深さに関わらず・
                 # 「本体が worker を兼ねる」縮退は採らない裁定）。判定は `codex_multi_agent_enabled`
                 # （sandbox.py・唯一の真実源＝doctor と条件式を共有し食い違いを防ぐ）に委ねる:
-                # Codex(Ollama) 構成／サンドボックス無効（フォールバック経路）／接続先が既定 OpenAI
-                # 以外（Azure・独自エンドポイント）はいずれも対象外——worker/evaluator の `model` は
-                # Codex 自身の OpenAI カタログ値（`_codex_worker_model`）固定で、これらの構成では
-                # 解決できない（実機確認済み）。`_review_rounds` は AGENTS.md へ埋め込む見直しの回数
-                # （標準 0／深く 2／最大は管理画面の設定値）——Codex 自身はこの回数を強制されない
+                # Codex(Ollama) 構成／サンドボックス無効（フォールバック経路）は対象外。接続先は
+                # 既定 OpenAI・Azure は常に対象（Azure は worker/evaluator を本体と同じデプロイ名・
+                # 接続先設定へ倒す）。独自エンドポイント（custom）だけ `codex_worker_model` の明示
+                # 設定が無いと対象外——本体のモデル名を流用できる保証が無いため（決定2026-09-19）。
+                # `_review_rounds` は AGENTS.md へ埋め込む見直しの回数
+                # （クイック 0／標準 2／深く 4／最大は管理画面の設定値。固定の段もその設定値で
+                # 頭打ち）——Codex 自身はこの回数を強制されない
                 # （spawn_agent の呼出上限を Sherpa 側が数えて止める仕組みは無い・指示のみ）。
                 _multi_agent_enabled = codex_multi_agent_enabled(
                     ollama_base_url=self._ollama_base_url, system_settings=self._system_settings)
@@ -1308,10 +1308,11 @@ class CodexProvider(Provider):
                 _sidecar_path = (codex_home / _MCP_SIDECAR_NAME) if codex_home is not None \
                     else (run_dir / _MCP_SIDECAR_NAME)
                 # 出力スキーマ（§2-1）: OpenAI 系構成のみ（Codex(Ollama) は未確認のため対象外）・
-                # 退避口 env `SHERPA_CODEX_OUTPUT_SCHEMA=0` で無効化できる（既定 1＝v1）。
-                # DEPTH-2 S1（§2.5）: 同じ env の値 2 で v2（`claims` 付き）へ切り替える——
-                # 既定は 1 のまま（既存テストの argv/schema_path 契約を変えない）。
-                _schema_level = _env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 1, 0, 2)
+                # 退避口 env `SHERPA_CODEX_OUTPUT_SCHEMA=0` で無効化・`=1` で v1 に戻せる。
+                # DEPTH-2 S1（§2.5）→ 初期構成の既定（決定2026-09-19）: 既定は v2
+                # （`claims` 付き）——気づかないと効かない既定は初期構成で ON にする方針のため、
+                # 1（v1）は逃げ道として残すだけで既定にはしない。
+                _schema_level = _env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2)
                 _schema_on = self._ollama_base_url is None and _schema_level >= 1
                 _schema_v2 = _schema_on and _schema_level == 2
                 if _schema_on:

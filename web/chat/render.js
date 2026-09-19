@@ -980,7 +980,7 @@ function _scopeChipsHTML(scope) {
 // 回答ヘッダへ1チップで示す。`scope.depth_profile` が無い（SC-6c 導入前の旧回答）ときは何も出さない
 // （`_scopeChipsHTML` の `scope.layer` 欠落時と同じ後方互換の作法）。`duration_ms`（LOG-1a）が
 // 無ければ調べる深さだけを出す。
-const DEPTH_CHIP_LABEL = { standard: '標準', deep: '深く', max: '最大' };
+const DEPTH_CHIP_LABEL = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
 function _fmtDurationJa(ms) {
   const totalSec = Math.round(ms / 1000);
   const m = Math.floor(totalSec / 60), s = totalSec % 60;

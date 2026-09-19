@@ -444,8 +444,12 @@ class WebhookAllowlistInfo(BaseModel):
 
 
 class CodexSessionRetentionInfo(BaseModel):
+    """`configured` は管理者が実際に保存した生値（未設定なら `None`）、`effective` は
+    未設定時のフォールバックを含む実効値、`default` は未設定時に使われる既定日数
+    （初期構成の既定＝30日・決定2026-09-19。`0` は明示設定時のみ「無制限」として扱う）。"""
     configured: int | None
     effective: int
+    default: int
 
 
 class ChatExamplesAdminInfo(BaseModel):
@@ -516,8 +520,9 @@ class CodexWorkerModelInfo(BaseModel):
 
 class DepthProfileAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `depth_profile`（SC-6c・`sherpa/depth_profile.py`・
-    system_extras.py::_admin_settings_view）。調べる深さ（標準/深く/最大）が掛ける倍率の
-    **基準値**（標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。"""
+    system_extras.py::_admin_settings_view）。調べる深さ（クイック/標準/深く/最大）が掛ける倍率の
+    **基準値**（クイック・標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。
+    `codex_reasoning` は深さで変わらない（どの深さでもこの基準値がそのまま使われる）。"""
     max_turns: DepthProfileBaseInfo
     grep_max_hits: DepthProfileBaseInfo
     qa_max_hits: DepthProfileBaseInfo
@@ -1086,7 +1091,7 @@ class UsageQualityRunRow(BaseModel):
     採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。
 
     `condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは
-    見直しを回さない条件同士（main と depth2-standard・どちらも `rounds=0`）が混ざるため、
+    見直しを回さない条件同士（main と depth2-quick・どちらも `rounds=0`）が混ざるため、
     集計はこの条件別に分ける。"""
     condition: str | None
     rounds: int
@@ -1108,7 +1113,7 @@ class AdminUsageQualityRunReq(BaseModel):
     """POST /admin/usage/quality-runs 入力（品質採点の入口）。
 
     採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。
-    `rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-standard` を登録できる）。
+    `rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-quick` を登録できる）。
     `condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。
     `executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・
     半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で
@@ -1123,7 +1128,7 @@ class AdminUsageQualityRunReq(BaseModel):
     `run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない
     （`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。"""
     rounds: StrictInt = Field(ge=0)
-    condition: Literal["main", "depth2-standard", "depth2-deep", "depth2-max"]
+    condition: Literal["main", "depth2-quick", "depth2-standard", "depth2-deep", "depth2-max"]
     executed_from: StrictStr = Field(min_length=1, max_length=64)
     executed_to: StrictStr = Field(min_length=1, max_length=64)
     correct: StrictInt = Field(default=0, ge=0)

@@ -178,6 +178,7 @@ let _depthReasoningBaseline = '';
 let _agenticToolLimitBaseline = '';
 let _maxReviewRoundsBaseline = '';
 let _codexWorkerModelBaseline = '';
+let _codexSessionRetentionDaysBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
 
 // 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
@@ -1456,8 +1457,14 @@ function renderResearchTab(view) {
   $('codex-worker-model').value = _codexWorkerModelBaseline;
   $('codex-worker-model').placeholder = `既定: ${workerModel.default}`;
   $('codex-worker-model-hint').textContent = workerModel.configured == null
-    ? `未設定です（既定 ${workerModel.default} が適用されます）。`
+    ? `未設定です（実際に適用される値: ${workerModel.effective}）。`   // Azure は本体と同じデプロイ名へ倒れる
     : `この値で固定中です（既定: ${workerModel.default}）。`;
+  const retention = view.codex_session_retention_days;
+  _codexSessionRetentionDaysBaseline = retention.configured == null ? '' : String(retention.configured);
+  $('codex-session-retention-days').value = _codexSessionRetentionDaysBaseline;
+  $('codex-session-retention-days-hint').textContent =
+    `現在の適用値: ${retention.effective} 日（0=無制限）。既定: ${retention.default} 日。`
+    + (retention.configured == null ? '未設定です。' : 'この値で固定中です。');
   const parallel = view.embed_parallel;
   _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
   $('embed-parallel').value = _embedParallelBaseline;
@@ -1476,6 +1483,10 @@ function maxReviewRoundsChanged() {
 
 function codexWorkerModelChanged() {
   return $('codex-worker-model').value.trim() !== _codexWorkerModelBaseline;
+}
+
+function codexSessionRetentionDaysChanged() {
+  return $('codex-session-retention-days').value.trim() !== _codexSessionRetentionDaysBaseline;
 }
 
 function embedParallelChanged() {
@@ -1970,6 +1981,8 @@ async function save() {
   if (!toolLimit.checkValidity()) rangeErrors.push('ツール実行数の上限は1〜256の整数で指定してください');
   const maxReviewRounds = $('max-review-rounds');
   if (!maxReviewRounds.checkValidity()) rangeErrors.push('最大の見直しの回数は1〜32の整数で指定してください');
+  const codexSessionRetentionDays = $('codex-session-retention-days');
+  if (!codexSessionRetentionDays.checkValidity()) rangeErrors.push('Codex の会話セッションを保存する日数は0以上の整数で指定してください');
   const embedParallel = $('embed-parallel');
   if (!embedParallel.checkValidity()) rangeErrors.push('埋め込みの同時送信数は1〜16の整数で指定してください');
   if (rangeErrors.length) {
@@ -2059,6 +2072,10 @@ async function save() {
   if (codexWorkerModelChanged()) {
     const v = $('codex-worker-model').value.trim();
     body.codex_worker_model = v === '' ? null : v;
+  }
+  if (codexSessionRetentionDaysChanged()) {
+    body.codex_session_retention_days = codexSessionRetentionDays.value === ''
+      ? null : Number(codexSessionRetentionDays.value);
   }
   if (embedParallelChanged()) {
     body.embed_parallel = embedParallel.value === '' ? null : Number(embedParallel.value);
@@ -2177,6 +2194,7 @@ async function resetResearchTab() {
   body.embed_parallel = null;
   body.max_review_rounds = null;
   body.codex_worker_model = null;
+  body.codex_session_retention_days = null;
   body.agentic_budget_per_result = null;
   body.agentic_budget_total = null;
   let view;
@@ -2344,7 +2362,7 @@ const TAB_DIRTY = {
     || openaiEndpointChanged() || mcEmbedChanged()
     || chatMaxTurnsChanged() || chatExamplesChanged(),
   research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged() || maxReviewRoundsChanged()
-    || codexWorkerModelChanged() || agenticBudgetChanged(),
+    || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged(),
   models: () => mcCatalogChangedExcludingEmbed() || modelWindowsTableChanged(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
   usage: () => usageChatProviderChanged(),
@@ -2407,6 +2425,8 @@ function applyConfigChangedHighlights(view) {
   mark($('agentic-max-tools-per-turn'), view.agentic_tool_limit.effective !== view.agentic_tool_limit.default);
   mark($('max-review-rounds'), view.max_review_rounds.effective !== view.max_review_rounds.default);
   mark($('codex-worker-model'), view.codex_worker_model.effective !== view.codex_worker_model.default);
+  mark($('codex-session-retention-days'),
+    view.codex_session_retention_days.effective !== view.codex_session_retention_days.default);
   mark($('embed-parallel'), view.embed_parallel.effective !== view.embed_parallel.default);
   // 同時実行の上限。
   const cmt = view.chat_max_turns || {};

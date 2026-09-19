@@ -64,6 +64,53 @@ extras_router = APIRouter()
 
 _ANNOUNCEMENT_CATEGORIES = ("maintenance", "case", "notice")
 
+# R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）: 会話ごとの Codex
+# resume セッション保持日数。未設定（None）はこの既定日数へフォールバックする——利用者が
+# 気づかないまま無制限に溜め続けない（初期構成の既定＝気づかなくても効く安全な値）。`0` は
+# 引き続き「無制限」として明示設定できる（未設定と 0 を区別する・`effective_codex_session_retention_days`）。
+CODEX_SESSION_RETENTION_DAYS_DEFAULT = 30
+
+
+def effective_codex_session_retention_days(system_settings: dict | None) -> int:
+    """`codex_session_retention_days` の実効値（`api._sweep_expired_codex_sessions` と
+    管理画面表示 `GET /admin/settings` の両方が呼ぶ唯一の判定）。
+
+    未設定（`None`・キー欠落）は `CODEX_SESSION_RETENTION_DAYS_DEFAULT` へ倒す。明示的に `0` を
+    保存した場合だけ「無制限」（0 を返す）——保存側の pydantic Field でも 0 以上の整数だけを
+    許すが、読み取り側でも壊れた保存値（負値・非 int）を安全側（既定日数）へ倒す。
+    """
+    if not isinstance(system_settings, dict):
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    raw = system_settings.get("codex_session_retention_days")
+    if raw is None:
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    if value < 0:
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    return value
+
+
+def _effective_codex_worker_model(sysset: dict) -> str:
+    """`GET /admin/settings` の `codex_worker_model.effective`（S6a RV是正）。
+
+    `codex_sandbox._codex_worker_model(sysset, main_model=...)` の `main_model` は
+    `model_catalog.resolve_model("codex","codex",...)` で解決するが、この経路は内部で
+    `llm.openai_endpoint_kind()`（`_codex_worker_model` 自身が Azure 判定に呼ぶ）を通り、
+    保存済み `openai_base_url` が壊れた値（falsy な非文字列＝`{}`/`[]`/`0`/`False`）だと
+    `ValueError` を送出する——表示専用のこの経路がそれで丸ごと落ちて `GET /admin/settings`
+    自体が 500 になってはいけない（他の壊れた保存値と同じ「表示はベストエフォート・実送信時の
+    fail-closed 判定は別の責務」契約・`usage_chat._effective_provider_for_display` と同じ理由）。
+    解決できない場合は固定フォールバック（`_CODEX_WORKER_MODEL_FALLBACK`）へ倒す。
+    """
+    try:
+        main_model = model_catalog.resolve_model("codex", "codex", None, system_settings=sysset)
+        return codex_sandbox._codex_worker_model(sysset, main_model=main_model)
+    except (ValueError, TypeError):
+        return codex_sandbox._codex_worker_model(sysset)
+
 
 class AnnouncementCreateReq(BaseModel):
     title: str
@@ -116,8 +163,10 @@ class SystemSettingsReq(BaseModel):
     # null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
     # 会話ごとの Codex resume
-    # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は 0＝無制限
-    # （`api._sweep_expired_codex_sessions` 参照）。null は未設定へ戻す（＝無制限に戻る）。
+    # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は
+    # `CODEX_SESSION_RETENTION_DAYS_DEFAULT`（30日・決定2026-09-19）。明示的な 0 は「無制限」
+    # （`effective_codex_session_retention_days`／`api._sweep_expired_codex_sessions` 参照）。
+    # null は未設定へ戻す（＝既定30日に戻る）。
     # 素の `int` は pydantic の緩い型強制で `true`→1・`"14"`→14 のように暗黙変換
     # されてしまう（bool は int のサブクラス）。`StrictInt` で bool/文字列からの暗黙変換を拒否する
     # （`codex_web_search` に `StrictBool` を使っているのと同じ理由）。
@@ -188,8 +237,8 @@ class SystemSettingsReq(BaseModel):
     # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。
     # 既定（未指定=None）は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
-    # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。標準 0・深く 2 は固定で、
-    # 設定はこの 1 項目だけ。既定（未指定=None）は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。
+    # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
+    # 深く 4 は固定（この上限で頭打ち）で、設定はこの 1 項目だけ。既定（未指定=None）は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。
     # null は未設定へ戻す。
     max_review_rounds: StrictInt | None = Field(
         default=None, ge=depth_profile.MAX_REVIEW_ROUNDS_MIN, le=depth_profile.MAX_REVIEW_ROUNDS_MAX)
@@ -818,11 +867,14 @@ def _admin_settings_view() -> dict:
             "configured": sysset.get("webhook_allowlist"),
             "effective": sorted(f"{h}:{p}" for h, p in webhooks._allowlisted_hosts(sysset)),
         },
-        # R1b（Codex ネイティブ resume・決定5）: 会話ごとの Codex resume セッションの保持日数。
-        # 0（既定・未設定）＝無制限（`api._sweep_expired_codex_sessions` が対象外としてスキップする）。
+        # R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）: 会話ごとの
+        # Codex resume セッションの保持日数。未設定は既定 30 日、明示的な 0 だけが「無制限」
+        # （`effective_codex_session_retention_days`・`api._sweep_expired_codex_sessions` が同じ
+        # 判定を呼ぶ）。
         "codex_session_retention_days": {
-            "configured": sysset.get("codex_session_retention_days"),   # 生値（未設定=None＝無制限）
-            "effective": int(sysset.get("codex_session_retention_days") or 0),
+            "configured": sysset.get("codex_session_retention_days"),   # 生値（未設定=None）
+            "effective": effective_codex_session_retention_days(sysset),
+            "default": CODEX_SESSION_RETENTION_DAYS_DEFAULT,
         },
         # STAT-2: 利用統計チャット専用の AI 選択（利用者の実行構成には依存しない・管理者全体で統一）。
         # `effective`/`default` は A7（`cloud_provider`）連動（`usage_chat._default_provider`/
@@ -894,18 +946,23 @@ def _admin_settings_view() -> dict:
             "effective": embeddings.effective_embed_parallel(sysset),
             "default": embeddings.EMBED_PARALLEL_DEFAULT,
         },
-        # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。標準 0・深く 2 は
-        # コード固定のため、設定はこの 1 項目だけ（env フォールバックは持たない）。
+        # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
+        # 深く 4 はコード固定のため、設定はこの 1 項目だけ（env フォールバックは持たない）。
         "max_review_rounds": {
             "configured": sysset.get("max_review_rounds"),
             "effective": depth_profile.effective_max_review_rounds(sysset),
             "default": depth_profile.MAX_REVIEW_ROUNDS_DEFAULT,
         },
         # multi_agent（S6）の worker モデル（実装ベース探索の回復 S1・案 B）。env フォールバックは
-        # 持たない（設定は UI(DB) が唯一の持ち主）。
+        # 持たない（設定は UI(DB) が唯一の持ち主）。`effective` は本体 Codex が実際に使うモデル名
+        # （カタログの codex/codex 既定値）を Azure 判定に使う——渡さないと Azure かつ未設定のとき
+        # `effective` が実在しないフォールバック固定値（`_CODEX_WORKER_MODEL_FALLBACK`）を表示
+        # してしまい、実際に使われる値（本体デプロイ名）と食い違う（RV是正・2026-09-19）。
+        # 解決自体が壊れた保存値（`_effective_codex_worker_model` docstring 参照）で失敗しても
+        # 表示専用のこの経路は 500 にしない（別の RV是正）。
         "codex_worker_model": {
             "configured": sysset.get("codex_worker_model"),
-            "effective": codex_sandbox._codex_worker_model(sysset),
+            "effective": _effective_codex_worker_model(sysset),
             "default": codex_sandbox._CODEX_WORKER_MODEL_FALLBACK,
         },
         # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
@@ -1407,7 +1464,8 @@ def _validate_chat_examples(value):
 
 
 def _validate_codex_session_retention_days(value):
-    """`codex_session_retention_days`（R1b・決定5）の検証。None は未設定（＝0/無制限へフォールバック）。
+    """`codex_session_retention_days`（R1b・決定5→初期構成の既定・決定2026-09-19）の検証。
+    None は未設定（＝既定30日へフォールバック・`effective_codex_session_retention_days`）。
     0 以上の整数のみ許可（0＝無制限・明示的に保存できる）。負値・非整数は 422。"""
     if value is None:
         return None

@@ -171,7 +171,7 @@ def log_usage_line(kind, provider, model, tokens: dict, calls, world, elapsed: f
     `user_id` は載せない。呼び出し元の縮退契約と独立に自衛する（例外を外へ出さない・ログ出力の失敗が
     呼び出し元の成否に影響してはならない）。
 
-    `depth`（調べる深さ＝`"standard"/"deep"/"max"`）・`reasoning`（Codex 経路: 実際に渡した
+    `depth`（調べる深さ＝`"quick"/"standard"/"deep"/"max"`）・`reasoning`（Codex 経路: 実際に渡した
     `model_reasoning_effort`。API 経路: `_log_chat_usage` が `"turns=<N>/tools=<N>"` の形で渡す）は
     `record()` 経由の呼び出し（`kind="chat-sub"`等）では渡さない＝対象は `kind="chat"` のみ。
     """

@@ -12,7 +12,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     from playwright.sync_api import expect
 
     stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
-    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-standard"
+    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-quick"
     stats["quality_runs"]["by_rounds"][1]["rounds"] = 0
     install_api_mocks(page, usage_stats=stats)
     page.goto(f"{web_base_url}/usage.html")

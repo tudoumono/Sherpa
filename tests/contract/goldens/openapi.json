@@ -49,11 +49,12 @@
         "type": "object"
       },
       "AdminUsageQualityRunReq": {
-        "description": "POST /admin/usage/quality-runs 入力（品質採点の入口）。\n\n採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。\n`rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-standard` を登録できる）。\n`condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。\n`executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・\n半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で\n読める。\n`cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を\n付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値\n（`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定\n`allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は\n`routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を\n埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の\n二重防御がある）。\n`run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない\n（`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。",
+        "description": "POST /admin/usage/quality-runs 入力（品質採点の入口）。\n\n採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。\n`rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-quick` を登録できる）。\n`condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。\n`executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・\n半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で\n読める。\n`cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を\n付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値\n（`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定\n`allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は\n`routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を\n埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の\n二重防御がある）。\n`run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない\n（`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。",
         "properties": {
           "condition": {
             "enum": [
               "main",
+              "depth2-quick",
               "depth2-standard",
               "depth2-deep",
               "depth2-max"
@@ -969,6 +970,7 @@
           "depth_profile": {
             "default": "standard",
             "enum": [
+              "quick",
               "standard",
               "deep",
               "max"
@@ -977,7 +979,7 @@
             "type": "string"
           },
           "knowledge": {
-            "default": false,
+            "default": true,
             "title": "Knowledge",
             "type": "boolean"
           },
@@ -1119,6 +1121,7 @@
           "depth_profile": {
             "default": "standard",
             "enum": [
+              "quick",
               "standard",
               "deep",
               "max"
@@ -1127,7 +1130,7 @@
             "type": "string"
           },
           "knowledge": {
-            "default": false,
+            "default": true,
             "title": "Knowledge",
             "type": "boolean"
           },
@@ -5808,7 +5811,7 @@
         "type": "object"
       },
       "UsageQualityRunRow": {
-        "description": "品質採点の条件×巡数別集計（`usage_stats()[\"quality_runs\"][\"by_rounds\"]`）。\n採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。\n\n`condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは\n見直しを回さない条件同士（main と depth2-standard・どちらも `rounds=0`）が混ざるため、\n集計はこの条件別に分ける。",
+        "description": "品質採点の条件×巡数別集計（`usage_stats()[\"quality_runs\"][\"by_rounds\"]`）。\n採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。\n\n`condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは\n見直しを回さない条件同士（main と depth2-quick・どちらも `rounds=0`）が混ざるため、\n集計はこの条件別に分ける。",
         "properties": {
           "condition": {
             "anyOf": [
@@ -9745,7 +9748,7 @@
             "name": "knowledge",
             "required": false,
             "schema": {
-              "default": false,
+              "default": true,
               "title": "Knowledge",
               "type": "boolean"
             }
@@ -9816,6 +9819,7 @@
             "schema": {
               "default": "standard",
               "enum": [
+                "quick",
                 "standard",
                 "deep",
                 "max"

@@ -3458,7 +3458,7 @@ def test_codex_worker_model_renders_default_placeholder_and_saves(page, web_base
     field = page.locator('#codex-worker-model-card #codex-worker-model')
     expect(field).to_have_value('')
     expect(field).to_have_attribute('placeholder', '既定: gpt-5.6-sol')
-    expect(page.locator('#codex-worker-model-hint')).to_contain_text('未設定です（既定 gpt-5.6-sol が適用されます）。')
+    expect(page.locator('#codex-worker-model-hint')).to_contain_text('未設定です（実際に適用される値: gpt-5.6-sol）。')
     field.fill('gpt-5.6-sol-mini')
     expect(page.locator('#tab-dot-research')).to_be_visible()
     page.locator('#save').click()
@@ -3514,12 +3514,13 @@ def test_research_reset_preserves_provider_draft(page, web_base_url):
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 13 and all(value is None for value in body.values())
+    assert len(body) == 14 and all(value is None for value in body.values())
     assert set(body) == {
         'depth_base_max_turns', 'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
         'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
         'depth_base_codex_reasoning', 'agentic_max_tools_per_turn', 'embed_parallel',
-        'max_review_rounds', 'codex_worker_model', 'agentic_budget_per_result', 'agentic_budget_total',
+        'max_review_rounds', 'codex_worker_model', 'codex_session_retention_days',
+        'agentic_budget_per_result', 'agentic_budget_total',
     }
     assert 'openai_api_key' not in body and 'cloud_provider' not in body
     expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')

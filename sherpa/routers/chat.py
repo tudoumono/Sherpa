@@ -52,15 +52,18 @@ class ChatReq(BaseModel):
     message: str
     world: str | None = _WorldField
     conversation_id: int | None = None
-    knowledge: bool = False
+    # 資料参照トグル。既定 True（初期構成の既定＝利用者が気づかなくても資料参照が効く・
+    # 決定2026-09-19）。復元した過去会話は保存された値をそのまま使う（この既定変更は
+    # 新規会話のみに影響し、既存回答の意味を変えない）。
+    knowledge: bool = True
     scope_paths: list[str] = Field(default_factory=list)
     # 探す対象（調べ方ブロック §3.4）。既定 both＝フィルタなし（既存挙動と完全同一）。
     layer: Literal["docs", "code", "both"] = "both"
     # 調べ方の明示指定（調べ方ブロック §3.1）。既定 None（省略）＝自動（既存の Tier1〜3 判定）。
     # 正典の値は4値＋省略のみ："auto" は非正典の互換値のため受理しない（UI も既に省略）。
     lens: Literal["impact", "troubleshoot", "qa", "author"] | None = None
-    # 調べる深さ（調べ方ブロック §3.2）。既定 "standard"＝既存の挙動（env 既定値）と完全同一。
-    depth_profile: Literal["standard", "deep", "max"] = "standard"
+    # 調べる深さ（調べ方ブロック §3.2）。既定 "standard"＝見直し 2 回（`depth_profile.review_rounds_for`）。
+    depth_profile: Literal["quick", "standard", "deep", "max"] = "standard"
     personal: bool = False    # 個人ファイル参照トグル（既定OFF）
     # Codex の Web 検索をこのチャットで希望するか（既定OFF）。管理者許可・
     # 頭脳が Codex（Azure 等でないこと）が揃わなければ、サーバ側で常に無効化される
@@ -303,15 +306,15 @@ _STREAM_STOP_EVENTS: dict[str, tuple[str, threading.Event]] = {}   # stream_id -
 @chat_router.get("/chat/stream", tags=["チャット"])
 def chat_stream(request: Request, message: str = Query(...),
                 world: str | None = Query(None, pattern=_WORLD_PATTERN),
-                conversation_id: int | None = None, knowledge: bool = False,
+                conversation_id: int | None = None, knowledge: bool = True,
                 personal: bool = False,                       # 個人ファイル参照トグル
                 scope_paths: list[str] = Query(default_factory=list),
                 # 探す対象（調べ方ブロック §3.4）。既定 both＝フィルタなし（既存挙動と完全同一）。
                 layer: Literal["docs", "code", "both"] = "both",
                 # 調べ方の明示指定（調べ方ブロック §3.1）。既定 None（省略）＝自動（"auto" は非受理）。
                 lens: Literal["impact", "troubleshoot", "qa", "author"] | None = Query(None),
-                # 調べる深さ（調べ方ブロック §3.2）。既定 "standard"＝既存の挙動と完全同一。
-                depth_profile: Literal["standard", "deep", "max"] = "standard",
+                # 調べる深さ（調べ方ブロック §3.2）。既定 "standard"＝見直し 2 回。
+                depth_profile: Literal["quick", "standard", "deep", "max"] = "standard",
                 # Codex の Web 検索をこのチャットで希望するか（既定OFF・`ChatReq.web_search` と同じ契約）。
                 web_search: bool = False,
                 # 検索経路トグル（調べ方ブロック §3.6）。`ChatReq.tools` の各キーを個別 query

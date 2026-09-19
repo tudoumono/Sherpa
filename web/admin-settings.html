@@ -353,7 +353,7 @@
         <div class="card sec" id="review-rounds-card">
           <div class="card-head"><span class="title">見直しの回数</span></div>
           <div class="body">
-            <p class="hint">チャットの「調べる深さ」で見直しの回数を選べます。標準＝見直し 0 回（下調べ役の一次判断を確認 1 回）、深く＝見直し 2 回、最大＝下の設定値まで。十分に調べられたときは、途中で終わります。</p>
+            <p class="hint">チャットの「調べる深さ」で見直しの回数を選べます。クイック＝見直しなし（下調べ役の一次判断を確認 1 回だけ）、標準＝見直し 2 回、深く＝見直し 4 回、最大＝下の設定値まで。十分に調べられたときは、途中で終わります。どの段もこの設定値より多くはなりません。</p>
             <label class="vlm-field"><span class="vlm-l">最大の見直しの回数</span>
               <input type="number" id="max-review-rounds" min="1" max="32" step="1" placeholder="既定: 7" style="max-width:160px">
             </label>
@@ -388,6 +388,16 @@
                 <input type="text" id="codex-worker-model" style="max-width:280px">
               </label>
               <div class="hint" id="codex-worker-model-hint" style="margin:-8px 0 6px"></div>
+            </div>
+          </div>
+          <div class="card sec" id="codex-session-retention-card">
+            <div class="card-head"><span class="title">会話セッションの保存日数</span></div>
+            <div class="body">
+              <p class="hint">Codex の会話セッションを保存する日数です。0 で無制限。空欄で保存すると既定に戻ります。</p>
+              <label class="vlm-field"><span class="vlm-l">Codex の会話セッションを保存する日数</span>
+                <input type="number" id="codex-session-retention-days" min="0" step="1" placeholder="既定: 30" style="max-width:160px">
+              </label>
+              <div class="hint" id="codex-session-retention-days-hint" style="margin:-8px 0 6px"></div>
             </div>
           </div>
         </section>

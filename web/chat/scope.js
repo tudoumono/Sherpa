@@ -163,7 +163,7 @@ function updateScopeVisibility() {   // 範囲セレクタは「ナレッジ参�
   $('depth-row').hidden = !S.kb;   // SC-6c: 調べる深さも社内資料を参照するがONのときだけ選べる
   refreshInquirySummary();
 }
-function setKb(on) {                  // ナレッジ参照トグル（既定オフ）。オンで範囲指定が選べる
+export function setKb(on) {           // ナレッジ参照トグル（既定ON・決定2026-09-19）。オンで範囲指定が選べる
   S.kb = S.kbLocked ? true : on;      // Codex構成はON固定（decision 2026-08-15）
   const b = $('kbtoggle'); b.setAttribute('aria-pressed', S.kb ? 'true' : 'false');
   b.classList.toggle('on', S.kb); b.querySelector('b').textContent = S.kb ? 'オン' : 'オフ';

@@ -71,7 +71,7 @@ class Ctx:
     route: Callable[[str], dict]          # message -> {"lens","input","reason"}
     dispatch: Callable[[str, str], dict]  # (lens, input) -> answer envelope（出典つき）
     pace: float = 0.0
-    knowledge: bool = True                # False＝ナレッジ参照オフ＝検索せず素の会話（既定OFFは UI 側）
+    knowledge: bool = True                # False＝ナレッジ参照オフ＝検索せず素の会話（既定ONは UI 側）
     scope_meta: dict | None = None        # 参照中の範囲（world/scope_paths/source）＝agentic 検索の絞り込み用
     make_sources: Callable[[list], list] | None = None  # doc_id[] -> sources[]（agentic 結果に出典を付与）
     uid: str = "admin"                    # Feature A: 現在ユーザー uid（互換モードは 'admin'）
@@ -1866,7 +1866,7 @@ class _GenProvider(Provider):
         従来どおり状態を一切更新しない。
 
         `role_all_orchestrator`（省略可・既定 False・§2.8）: 真のとき、判定確定の呼び出しも
-        `evaluator` ではなく `orchestrator` バケツへ積む——標準（巡ループを回さない・判定のみの
+        `evaluator` ではなく `orchestrator` バケツへ積む——クイック（巡ループを回さない・判定のみの
         確認1回）では evaluator の巡という語彙自体が成立しないため、内訳を orchestrator に
         集約する（正本の `chat-review` 合算は変わらない・表示用の役割別内訳だけの区別）。
 
@@ -2954,9 +2954,9 @@ class _GenProvider(Provider):
         # docstring 参照）。以降の env["scope"] 構築は元の `ctx`（このメソッド冒頭で受け取ったもの）を
         # 使い続けるので、要求された layer 値自体は失わない。
         search_ctx = _ctx_with_effective_layer(ctx, lens)
-        # 深さ＝evaluator（査読）の巡数（§2.3・標準 0＝evaluator の巡は回さない／深く 2／最大＝
-        # 管理画面の `max_review_rounds`）。worker の一次判断要求（`request_claims`）は深さに
-        # 依らず常に発行する——標準でも orchestrator の確認 1 回（下の確認分岐）を通す。
+        # 深さ＝evaluator（査読）の巡数（クイック 0＝evaluator の巡は回さない／標準 2／深く 4／
+        # 最大＝管理画面の `max_review_rounds`）。worker の一次判断要求（`request_claims`）は深さに
+        # 依らず常に発行する——クイックでも orchestrator の確認 1 回（下の確認分岐）を通す。
         from .. import depth_profile as _depth_mod
         _review_rounds = _depth_mod.review_rounds_for(
             (ctx.scope_meta or {}).get("depth_profile"), self._system_settings)
@@ -3216,7 +3216,7 @@ class _GenProvider(Provider):
             根拠ゲート（通常終端の `evidence_meets_gate` と同じ規律）も適用する——この調査で
             根拠を1件も確定していなければ、主張の見かけに関わらず空文字を返す。
 
-            巡ループを回していないターン（標準で引き上げも起きなかった＝`_rounds_total == 0`）は
+            巡ループを回していないターン（クイックで引き上げも起きなかった＝`_rounds_total == 0`）は
             「N巡目で打ち切り」という見出しの語彙自体が成立しない——orchestrator の確認1回が
             通っていても空文字を返し、呼び出し元の固定文言に委ねる。"""
             if _rounds_total == 0:
@@ -3318,23 +3318,23 @@ class _GenProvider(Provider):
                         evaluation = {"status": ev.get("evaluation_status"),
                                       "reason": ev.get("evaluation_reason"),
                                       "next_action": ev.get("evaluation_next_action")}
-            # ハイブリッドのみ、清書前に「確認 1 回（標準）」と巡ループ（§2.4 の形 B）を回す。
+            # ハイブリッドのみ、清書前に「確認 1 回（クイック）」と巡ループ（§2.4 の形 B）を回す。
             # 1巡＝「worker が根拠と一次判断を更新 → orchestrator が必要箇所を確認 → evaluator が
             # 判定（十分／不足／判定不能）と主張 ID 単位の指摘を返す → 次巡の指示（解決済みの
-            # 指摘は落とす）」で、清書は最後に 1 回だけ。巡数は深さ（`_review_rounds`・標準 0／
-            # 深く 2／最大＝設定）に、自動引き上げの追加分（最大 1・共通上限内）を足した
+            # 指摘は落とす）」で、清書は最後に 1 回だけ。巡数は深さ（`_review_rounds`・クイック 0／
+            # 標準 2／深く 4／最大＝設定）に、自動引き上げの追加分（最大 1・共通上限内）を足した
             # `_rounds_total`。止める条件は6つ（巡数到達／十分／判定不能／予算到達／利用者の停止／
             # 確認カード）——ループはこのいずれかで必ず抜ける。この位置（metering の finally
             # 内側）で回すことで、各巡のサブ消費も同じ finally が一括記録する。
             _old_cites = None   # 直前 rerun 前の citation 件数（`_first_rerun_cite_start`／清書ビュー用）
-            # 標準（`_review_rounds == 0`）は巡ループへ直接は入らず、先に確認 1 回だけを行って
+            # クイック（`_review_rounds == 0`）は巡ループへ直接は入らず、先に確認 1 回だけを行って
             # `_review_ran` を決める（必要な根拠種別が揃わなければ引き上げで 1 巡だけ入る）。
             # 再調査で worker の一次判断が更新されたら、次の査読がその更新分を実際に判定するまで
             # 偽へ戻す（下のループ内参照）。
             if (state is not None and _review_rounds == 0 and state.claims and searched
                     and not (ctx.stop_event is not None and ctx.stop_event.is_set())
                     and stop_reason not in agentic_search._BUDGET_EXHAUSTED_STOP_REASONS):
-                # 標準（`_review_rounds == 0`）でも orchestrator の確認を 1 回だけ行う（§2.2）:
+                # クイック（`_review_rounds == 0`）でも orchestrator の確認を 1 回だけ行う（§2.2）:
                 # worker の一次判断を鵜呑みにせず、`_sufficiency_verdict` の read_around/list_docs
                 # の確認枠で必要な箇所だけ自分で確かめてから判定する。evaluator の巡は回さない
                 # ＝不足と判定しても再調査には入らず、そのまま清書へ進む。確認を通した一次判断
@@ -3343,7 +3343,7 @@ class _GenProvider(Provider):
                 # 偽のままで、巡ループと同じ規律で公開しない。反証された主張は
                 # `apply_findings` が同じ規律で採用不可（不明・conflict）へ落とす。
                 # 巡別記録（`chat-round`）は巡番号 0 で 1 行だけ残す（1 利用者ターンにつき保存は
-                # 1 回・§2.8 の「標準 0 巡の消費も計上先を明記する」）。
+                # 1 回・§2.8 の「0 巡の消費も計上先を明記する」）。
                 _confirm_t0 = time.monotonic()
                 verdict, _review_nodes, _review_usage = self._sufficiency_verdict(
                     orig_message, lens,
@@ -3359,7 +3359,7 @@ class _GenProvider(Provider):
                     if state.apply_findings(verdict.get("findings"), 0, verdict=verdict["verdict"]):
                         _review_ran = True
                     else:
-                        _log.warning("確認の指摘を読み取れませんでした（標準・未確認として扱います）")
+                        _log.warning("確認の指摘を読み取れませんでした（クイック・未確認として扱います）")
                 if isinstance(_review_usage, dict) and _review_usage.get("calls"):
                     _review_usage["elapsed_ms"] = round((time.monotonic() - _confirm_t0) * 1000)
                 _review_usage_total = _fold_sub_usage(_review_usage_total, _review_usage)
@@ -3373,7 +3373,8 @@ class _GenProvider(Provider):
                                else "undecidable" if verdict["verdict"] == "undecidable"
                                else "rounds_exhausted")
                 # 確認1回が「不足」と判定し、かつ必要な根拠種別が揃っていなければ、そのターンの
-                # 中で1巡だけ追加する——深く相当の探索量で worker を再実行してから評価する。
+                # 中で1巡だけ追加する——1 段上の深さ相当で worker を再実行してから評価する
+                # （クイック→標準は巡が 1 つ増えるだけで探索量は変わらない）。
                 # 判定不能・fail-open（verdict=None）は不足に丸めないので対象外。巡が実際に増える
                 # 回は「打ち切り」ではなく次へ続く回＝既存語彙の `rerun` で記録する（記録より前に
                 # 判定するのはこのため）。
@@ -3639,7 +3640,7 @@ class _GenProvider(Provider):
             # メイン査読（`_sufficiency_verdict`）が行った `_stream` 呼び出し分は、標準的な
             # 回答 usage（answer.usage）にも chat-sub にも乗らない別消費のため、独立の kind で記録する
             # （self は常にフラグシップ側＝self.provider_id/self.model）。calls=0（一度も査読を
-            # 発動していない・standard 既定等）は「未実行」として記録しない。
+            # 発動していない・クイック等）は「未実行」として記録しない。
             if _review_usage_total["calls"] > 0:
                 from .. import metering
                 metering.record("chat-review", self.provider_id, self.model, _review_usage_total["tokens"],
@@ -3654,7 +3655,7 @@ class _GenProvider(Provider):
             if state is not None and _rounds_total > 0:
                 # DEPTH-2 S5（§2.4・`TERMINALS` の "stopped"）: 巡を回した経路だけが、追加の LLM
                 # 呼び出しをせずに採用可の主張だけから未完了回答を組んで返す（consumer が保存し、
-                # 監査もこの保存と一致させる）。標準（0 巡）は従来どおり未保存のまま
+                # 監査もこの保存と一致させる）。クイック（0 巡）は従来どおり未保存のまま
                 # （`chat_service` の停止分岐が assistant を残さない）。
                 yield _stopped_result(_round_no, "user_stop")
             return
@@ -3692,7 +3693,7 @@ class _GenProvider(Provider):
                 if isinstance(d, dict):
                     _add_plan_gap(state.gaps, f"{d.get('doc_id')}: 検証で除外（{d.get('reason')}）")
         # 査読（`_sufficiency_verdict`）が list_docs で得た構造的根拠を、下調べ役由来のものと同じ
-        # 正規の list へ合流させてから重複排除する（査読未発動＝標準 0 巡のときだけ空リストで
+        # 正規の list へ合流させてから重複排除する（査読未発動＝クイック 0 巡のときだけ空リストで
         # 無変化——下調べ役なしでも巡を回す深さでは査読が動くため空とは限らない）。
         structural_evidence_meta = _dedupe_structural_evidence(
             structural_evidence_meta + _review_structural_meta)
@@ -3773,7 +3774,7 @@ class _GenProvider(Provider):
         combined_evidence_meta = evidence_meta + structural_evidence_meta
         # ---- 根拠種別の最終ゲート（§0(b)・裁定④⑤⑥）--------------------------------------
         # 必須種別（範囲・層に実在するものだけ）が欠けた主張は「確定」へ格上げしない。判定は
-        # 根拠の件数ではなく種別の充足で行い、標準（確認1回）でも深さに関わらず同じように働く。
+        # 根拠の件数ではなく種別の充足で行い、クイック（確認1回）でも深さに関わらず同じように働く。
         _seen_kinds = _turn_evidence_kinds(state, ctx.personal_facts)
         _turn_missing_kinds = tuple(k for k in _required_kinds if k not in _seen_kinds)
         # 種別は `state.evidence` の採番でしか引けない——この後の `resolve_claim_evidence_ids` が
@@ -3809,7 +3810,7 @@ class _GenProvider(Provider):
                         "confirmed claim lost all evidence refs after evidence id resolution")
         if state is not None and state.claims and not _review_ran:
             # `_review_ran` は「この時点の state.claims を査読の判定（verdict）が実際に通ったか」
-            # ——標準の確認が成立しなかった回・査読の fail-open（通信失敗/JSON不能等で
+            # ——クイックの確認が成立しなかった回・査読の fail-open（通信失敗/JSON不能等で
             # verdict=None）・再調査で一次判断が更新されたが以後の判定を経ずにループを抜けた場合の
             # いずれも偽のまま。orchestrator の確認を経ていない主張を、この下の
             # `data["claims"]`／清書ダイジェストへ渡さない（§2.2: 鵜呑みにしない）。根拠の束
@@ -4074,7 +4075,7 @@ class _GenProvider(Provider):
             if ctx.stop_event is not None and ctx.stop_event.is_set():
                 # 清書の途中で停止＝本文が1文字も確定していない。追加の LLM 呼び出しをせず、
                 # 採用可の主張だけの未完了回答を返す（`TERMINALS` の "stopped"）。巡を回して
-                # いない標準（0 巡）は従来どおり未保存のまま終える。
+                # いないクイック（0 巡）は従来どおり未保存のまま終える。
                 if _rounds_total > 0:
                     yield _stopped_result(_round_no, "user_stop")
                 return

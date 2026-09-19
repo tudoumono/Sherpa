@@ -131,10 +131,12 @@ def test_admin_settings_get_shape():
     assert vlm["default"]["cloud_allowed"] is False       # env/既定も cloud は常に false
     assert vlm["providers"] == ["ollama", "openai"]
     assert isinstance(vlm["available"], bool) and isinstance(vlm["openai_key_present"], bool)
-    # R1b（Codex ネイティブ resume・決定5）: 未設定は configured=None・effective=0（無制限）。
+    # R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）:
+    # 未設定は configured=None・effective=default=30日。0（無制限）は明示設定時のみ。
     csr = body["codex_session_retention_days"]
     assert csr["configured"] is None
-    assert csr["effective"] == 0
+    assert csr["effective"] == 30
+    assert csr["default"] == 30
     # STAT-2: 利用統計チャット専用の AI 選択。未設定（configured=None）時の既定は A7
     # （`cloud_provider`）連動——A7 が明示的に openai の時だけ openai・それ以外（この環境の
     # ように A7 も未設定の場合を含む）は ollama。
@@ -405,8 +407,8 @@ def test_put_vlm_reflects_and_resets():
 
 
 def test_put_codex_session_retention_days_reflects_and_resets():
-    """R1b（決定5）: 保持日数は生値が configured/effective に反映され、0（無制限）も明示保存できる。
-    null で未設定（＝0/無制限）へ戻る。"""
+    """R1b（決定5）→ 初期構成の既定（決定2026-09-19）: 保持日数は生値が configured/effective
+    に反映され、0（無制限）も明示保存できる。null で未設定（＝既定30日）へ戻る。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
@@ -421,11 +423,11 @@ def test_put_codex_session_retention_days_reflects_and_resets():
     csr2 = r2.json()["codex_session_retention_days"]
     assert csr2["configured"] == 0 and csr2["effective"] == 0
 
-    # null で未設定へ戻す。
+    # null で未設定へ戻す → 既定30日。
     r3 = admin.put("/admin/settings", json={"codex_session_retention_days": None})
     assert r3.status_code == 200, r3.text
     csr3 = r3.json()["codex_session_retention_days"]
-    assert csr3["configured"] is None and csr3["effective"] == 0
+    assert csr3["configured"] is None and csr3["effective"] == 30
 
 
 # ===== 使えるモデル（model_catalog） =====
@@ -2307,6 +2309,23 @@ def test_admin_settings_codex_worker_model_roundtrip():
     response = admin.put("/admin/settings", json={"codex_worker_model": None})
     assert response.status_code == 200, response.text
     assert response.json()["codex_worker_model"]["configured"] is None
+
+
+def test_admin_settings_codex_worker_model_effective_uses_main_model_for_azure_when_unconfigured():
+    """S6a RV是正3巡目 #2: Azure 接続先で worker 未設定のとき、`effective` は実際に適用される値
+    （本体 Codex のカタログ既定＝`model_catalog.resolve_model("codex","codex",...)`）を返す——
+    実機で spawn されない固定フォールバック値（`_CODEX_WORKER_MODEL_FALLBACK`＝`default`）とは
+    異なる値になる（管理画面の表示が実際の挙動と食い違わない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={
+        "openai_endpoint_kind": "azure", "openai_base_url": "https://myres.openai.azure.com/openai/v1"})
+    assert response.status_code == 200, response.text
+    worker = response.json()["codex_worker_model"]
+    assert worker["configured"] is None
+    assert worker["effective"] == "gpt-5.5"          # model_catalog の codex/codex 既定（本体の値）
+    assert worker["effective"] != worker["default"]  # 固定フォールバック（gpt-5.6-sol）とは異なる
 
 
 def test_admin_settings_codex_worker_model_rejects_control_characters():

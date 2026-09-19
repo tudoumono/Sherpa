@@ -1,7 +1,8 @@
 """R1b（会話継続・Codex ネイティブ resume・決定5）: `api._sweep_expired_codex_sessions` の単体テスト。
 
 会話ごとの Codex resume セッション実体（`workspace/.codex-sessions/{cid}`）を、admin 設定
-`codex_session_retention_days`（system_settings・既定0=無制限）に従って掃除する背景処理。
+`codex_session_retention_days`（system_settings・未設定は既定30日・明示的な0だけ無制限・
+決定2026-09-19＝初期構成の既定）に従って掃除する背景処理。
 既存の workspace TTL sweep（`_sweep_expired_workspace`/`_gc_orphan_workspace_files`）と同じ
 「安全に自動」思想（DB/設定不達なら何もしない・symlink は触らない・base-confined）を検証する。
 
@@ -33,16 +34,20 @@ def _mk_session_dir(users_dir: Path, uid: str, cid: str, age_days: float | None 
     return d
 
 
-def test_sweep_skips_when_retention_unset_default_zero(tmp_path, monkeypatch):
+def test_sweep_uses_default_retention_when_unset(tmp_path, monkeypatch):
+    """初期構成の既定（決定2026-09-19）: `codex_session_retention_days` 未設定は既定30日へ倒れる
+    ため、30日を超えたセッションは削除され、内側のセッションは残る。"""
     users_dir = tmp_path / "users"
-    d = _mk_session_dir(users_dir, "u1", "1", age_days=365)
+    old = _mk_session_dir(users_dir, "u1", "old-conv", age_days=365)
+    fresh = _mk_session_dir(users_dir, "u1", "fresh-conv", age_days=1)
     monkeypatch.setattr(api, "_USERS_DIR", users_dir)
     monkeypatch.setattr(store, "get_system_settings", lambda: {})
 
     result = api._sweep_expired_codex_sessions()
 
-    assert result == {"skipped": "unlimited"}
-    assert d.is_dir(), "既定（未設定=無制限）で削除されてしまった"
+    assert result["deleted"] == 1 and result.get("failed", 0) == 0
+    assert not old.exists(), "既定30日を超えたセッションが削除されていない"
+    assert fresh.is_dir(), "既定30日以内のセッションが誤って削除された"
 
 
 def test_sweep_skips_when_retention_explicitly_zero(tmp_path, monkeypatch):

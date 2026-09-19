@@ -57,43 +57,66 @@ _CODEX_MAX_CONCURRENT_SUBAGENTS = 2
 def codex_multi_agent_enabled(*, ollama_base_url: str | None, system_settings: dict | None = None) -> bool:
     """`[agents.worker]`/`[agents.evaluator]`（S6・§2.6）を有効にするかどうかの唯一の判定。
     `_write_codex_authoring_config` の `multi_agent` 引数・argv の `-c features.multi_agent=true`・
-    `write_agents_md` の役割段落は全てこの関数を呼び、独立に条件式を複製しない（契約が食い違うと
-    Azure/フォールバック経路で実在しない worker モデルの spawn が失敗し続ける・実機確認済み）。
+    `write_agents_md` の役割段落は全てこの関数を呼び、独立に条件式を複製しない。
     doctor（`check_codex_multi_agent_worker_model`）は接続先種別だけを独自に確認する。
 
-    真になるのは次の3条件を全て満たすときだけ:
+    真になるのは次の条件を全て満たすときだけ:
       - Codex(Ollama) 構成でない（`ollama_base_url is None`）: worker/evaluator の `model` は
-        Codex 自身の OpenAI カタログ値（`_codex_worker_model()`）固定で、Ollama 側では解決できない。
+        Codex 自身の OpenAI カタログ値（`_codex_worker_model()`）を使い、Ollama 側では解決できない。
       - サンドボックス（permission profile）が有効（`_codex_sandbox_enabled()`）: `[agents.*]` は
         `codex_home`（サンドボックス有効時だけ作られる per-request CODEX_HOME）配下の config.toml に
         書く。フォールバック経路（`SHERPA_CODEX_SANDBOX=0`）は config.toml 自体を書かないため、
         `-c features.multi_agent=true` だけを渡しても spawn 先の層が無い。
-      - 接続先が既定の OpenAI（`_openai_endpoint_kind() == "openai"`）: Azure/独自エンドポイントは
-        worker モデルの固定値がデプロイ名として存在せず、spawn が毎ターン失敗する（実機確認済み）。
+      - 接続先が既定(OpenAI)／Azure、または独自エンドポイント（custom）でも `codex_worker_model`
+        が明示設定済み（決定2026-09-19＝初期構成の既定＋RV是正）。Azure は `_codex_worker_model()`
+        が未設定時に本体 Codex と同じデプロイ名へ倒すため常に有効だが、custom は本体のモデル名を
+        流用できる保証が無く（custom は任意の OpenAI 互換 API・デプロイ名の規約がまちまち）、
+        未設定のまま有効化すると worker が `_CODEX_WORKER_MODEL_FALLBACK` を spawn しに行き
+        毎ターン失敗する——custom は明示設定を必須条件にする。
     """
     if ollama_base_url is not None:
         return False
     if not _codex_sandbox_enabled():
         return False
-    return _openai_endpoint_kind(system_settings) == "openai"
+    if _openai_endpoint_kind(system_settings) == "custom":
+        # `system_settings` は省略可（呼び出し側のスナップショット省略時は DB から都度読む）——
+        # `_openai_endpoint_kind` と同じ解決規則（`llm._openai_endpoint_settings`）を使う。
+        # `system_settings` の raw None を素朴に isinstance チェックすると、省略呼び出し
+        # （`system_settings=None`）で保存済み `codex_worker_model` を見落として常に False になる。
+        from ... import llm as _llm
+        _resolved = _llm._openai_endpoint_settings(system_settings)
+        return isinstance(_resolved, dict) and bool(
+            str(_resolved.get("codex_worker_model") or "").strip())
+    return True
 
 
-def _codex_worker_model(system_settings: dict | None = None) -> str:
+def _codex_worker_model(system_settings: dict | None = None, *, main_model: str | None = None) -> str:
     """`[agents.worker]` の `model` に使う値（S6 で `[agents.*]` を生成するときに呼ぶ）。
 
-    管理画面の system_settings `codex_worker_model`（空／未設定なら `_CODEX_WORKER_MODEL_FALLBACK`＝
-    実機確認済みの安価枠）を返す。Sherpa 側の下調べ役（subsearch）既定モデルは Codex 自身の
-    モデルカタログに存在しない前提で使えないため参照しない。
+    優先順位:
+      1. 管理画面の system_settings `codex_worker_model`（空／未設定でなければそのまま使う）。
+      2. Azure 接続（`llm.openai_endpoint_kind() == "azure"`）かつ `main_model`（本体 Codex が
+         使うデプロイ名＝呼び出し元の `self.model`）が渡されていれば、それをそのまま使う——
+         Azure のモデル名は管理者が登録したデプロイ名固有で、Sherpa 固定のカタログ値
+         （`_CODEX_WORKER_MODEL_FALLBACK`）がそのデプロイに存在するとは限らない一方、
+         本体 Codex が既に到達できているデプロイ名なら worker からも到達できる。
+      3. それ以外（既定 OpenAI・独自エンドポイント・`main_model` 未指定）は
+         `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）。
     """
     if isinstance(system_settings, dict):
         configured = system_settings.get("codex_worker_model")
         if isinstance(configured, str) and configured.strip():
             return configured.strip()
+    if main_model:
+        from ... import llm as _llm
+        if _llm.openai_endpoint_kind(system_settings) == "azure":
+            return main_model
     return _CODEX_WORKER_MODEL_FALLBACK
 
 
 def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, worker_reasoning: str,
-                                    evaluator_model: str, evaluator_reasoning: str) -> tuple[str, str]:
+                                    evaluator_model: str, evaluator_reasoning: str,
+                                    provider_lines: list | None = None) -> tuple[str, str]:
     """`[agents.worker]`/`[agents.evaluator]` の `config_file` 実体（役割ごとの層＝モデル・推論
     レベルだけを持つ最小 TOML）を `codex_home/agents/` 配下に書く（S6・§2.6）。
 
@@ -101,17 +124,24 @@ def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, work
     （呼び出し元 `_write_codex_authoring_config` の docstring・`sidecar_path` と同じ理由）。
     Codex CLI 自身（サンドボックスの対象外プロセス）がこのパスを直接開くだけで、model-shell が
     書き換えたり読んだりする経路には無い。戻り値は (worker の絶対パス, evaluator の絶対パス)。
+
+    `provider_lines`（省略可・RV是正）: 親 config.toml に書いたのと同じ `model_provider = "…"`／
+    `[model_providers.<name>]` 行（`_openai_compat_provider_lines` の戻り値）。role config は
+    親と**別プロセス**として spawn される子 Codex の設定のため、これを書かないと子は組み込みの
+    `openai` provider（本家 api.openai.com）へ出てしまい、Azure/custom 接続時に資料本文が
+    意図しない宛先（本家 OpenAI）へ渡る。`None`（Codex(Ollama)・既定 OpenAI）は従来どおり書かない。
     """
     d = codex_home / "agents"
     d.mkdir(parents=True, exist_ok=True)
     worker_path = d / "worker.toml"
     evaluator_path = d / "evaluator.toml"
+    _provider_block = ("\n" + "\n".join(provider_lines) + "\n") if provider_lines else ""
     worker_path.write_text(
         f'model = {_toml_str(worker_model)}\n'
-        f'model_reasoning_effort = {_toml_str(worker_reasoning)}\n', encoding="utf-8")
+        f'model_reasoning_effort = {_toml_str(worker_reasoning)}\n' + _provider_block, encoding="utf-8")
     evaluator_path.write_text(
         f'model = {_toml_str(evaluator_model)}\n'
-        f'model_reasoning_effort = {_toml_str(evaluator_reasoning)}\n', encoding="utf-8")
+        f'model_reasoning_effort = {_toml_str(evaluator_reasoning)}\n' + _provider_block, encoding="utf-8")
     return str(worker_path), str(evaluator_path)
 
 
@@ -670,9 +700,11 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     `multi_agent`（省略可・既定 `False`・S6・§2.6）: 真のとき `[agents]`／`[agents.worker]`／
     `[agents.evaluator]` を config.toml へ足す。`-c features.multi_agent=true` 自体は呼び出し元
     （provider.py の argv）が付ける——ここでは CLI 機能フラグではなくサブエージェントの層
-    （モデル・推論レベル・同時実行数）だけを書く。worker の `model` は `_codex_worker_model()`
-    （system_settings `codex_worker_model` があればその値、無ければ Codex 自身のカタログにある
-    安価枠）。evaluator の `model` は `orchestrator_model`（省略時は
+    （モデル・推論レベル・同時実行数）だけを書く。worker の `model` は
+    `_codex_worker_model(system_settings, main_model=orchestrator_model)`（system_settings
+    `codex_worker_model` があればその値、無ければ Azure 接続時は `orchestrator_model`＝本体と
+    同じデプロイ名、それ以外は Codex 自身のカタログにある安価枠）。evaluator の `model` は
+    `orchestrator_model`（省略時は
     worker と同じモデルへ倒す＝本体のモデル名が取れない呼び出し元でも config 生成自体は壊さない）
     ・推論レベルは `reason`（本体へ実際に渡す `model_reasoning_effort` と同じ基準値）。
     role ごとの層の実体（`config_file` が指す TOML）は `_write_codex_agent_role_configs`
@@ -715,6 +747,9 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     _ws_value = _web_search_disabled_value(web_search_enabled, _web_search_endpoint_kind, system_settings)
     if _ws_value is not None:                        # 既定は必ず disabled を明示的に書く
         lines.append(f'web_search = {_toml_str(_ws_value)}')
+    # RV是正(2): role config（worker/evaluator）にも同じ provider 行を書けるよう、ここで
+    # 生成した行を控えておく（`None`＝Codex(Ollama) か既定 OpenAI＝role config 側も何も書かない）。
+    _role_provider_lines: list | None = None
     if ollama_base_url:                              # Codex(Ollama) 構成のときだけ接続先を差し替える
         lines += _ollama_provider_lines(ollama_base_url)
     elif _endpoint_kind != "openai":                 # Codex(OpenAI) 構成で接続先が Azure 等のときだけ
@@ -722,10 +757,11 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
         # kind・base_url・auth_header・api_version をすべて同じ `system_settings` から読む
         # （呼び出しごとに個別へ都度読み直すと、この1回の config.toml 生成の中で admin 保存が
         # 挟まった場合に組が食い違い得る）。
-        lines += _openai_compat_provider_lines(
+        _role_provider_lines = _openai_compat_provider_lines(
             _openai_compat_base_url(system_settings),
             api_version=_llm.openai_api_version(system_settings) or None,
             auth_header=_llm.openai_auth_header_style(system_settings))
+        lines += _role_provider_lines
     lines += [
         '',
         '[permissions.sherpa-authoring]',
@@ -793,10 +829,13 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
             f'env = {env_toml}',
         ]
     if multi_agent:
-        _worker_model = _codex_worker_model(system_settings)
+        # main_model=orchestrator_model: Azure で worker 未設定のとき、本体 Codex と同じ
+        # デプロイ名へ倒す（`_codex_worker_model` docstring 参照）。
+        _worker_model = _codex_worker_model(system_settings, main_model=orchestrator_model)
         _worker_path, _evaluator_path = _write_codex_agent_role_configs(
             codex_home, worker_model=_worker_model, worker_reasoning="medium",
-            evaluator_model=orchestrator_model or _worker_model, evaluator_reasoning=reason)
+            evaluator_model=orchestrator_model or _worker_model, evaluator_reasoning=reason,
+            provider_lines=_role_provider_lines)
         lines += [
             '',
             '[agents]',

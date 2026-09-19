@@ -2698,7 +2698,7 @@ def test_admin_usage_quality_run_records_condition_and_executed_period():
         assert r1.status_code == 200, r1.text
         assert r1.json()["inserted"] is True
         # 同じ rounds=0 でも条件が違えば別行に分かれる。
-        r2 = _post(run_deep, "depth2-standard", 0, base, switch, correct=5)
+        r2 = _post(run_deep, "depth2-quick", 0, base, switch, correct=5)
         assert r2.status_code == 200, r2.text
         # 実行期間が照会期間からはみ出すランは母集団に入らない。
         r3 = _post(run_out, "depth2-deep", 3, switch, end + timedelta(hours=1), correct=1)
@@ -2708,7 +2708,7 @@ def test_admin_usage_quality_run_records_condition_and_executed_period():
         by_cond = {(r["condition"], r["rounds"]): r for r in out["by_rounds"]}
         assert by_cond[("main", 0)]["correct"] == 4
         assert by_cond[("main", 0)]["wrong_assertion"] == 1
-        assert by_cond[("depth2-standard", 0)]["correct"] == 5
+        assert by_cond[("depth2-quick", 0)]["correct"] == 5
         assert ("depth2-deep", 3) not in by_cond, "実行期間が照会期間を超えるランが集計に入った"
 
         # 実行期間の終端が照会の上限ちょうど（executed_to == to）のランは含む。

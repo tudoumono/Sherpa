@@ -1025,7 +1025,7 @@ def _no_genuine_results(env: dict) -> bool:
     return not env.get("sources") and bool(env.get("data"))
 
 
-_DEPTH_PROFILE_LABEL = {"standard": "標準", "deep": "深く"}   # "max" は既に最も緩いため案内対象外
+_DEPTH_PROFILE_LABEL = {"quick": "クイック", "standard": "標準", "deep": "深く"}   # "max" は既に最も緩いため案内対象外
 
 
 def _depth_actually_helps(env: dict) -> bool:
@@ -1033,7 +1033,7 @@ def _depth_actually_helps(env: dict) -> bool:
 
     真になるのは次のいずれか:
       - `evidence_packet.task_id` が `"sub:{profile_id}"`／`"plan:..."`（下調べ役
-        `provider._sub`／`_sub_candidates` 経由で実行された）——深さの設定が推論レベルへ反映される。
+        `provider._sub`／`_sub_candidates` 経由で実行された）——巡ループが実際に走る構成。
       - このターンが Codex(OpenAI 系) 構成で、かつ `env["codex_multi_agent"]` が真——
         `sherpa.providers.codex.provider` が `codex_multi_agent_enabled`（sandbox.py・唯一の
         真実源）の判定結果をそのまま env へ渡している。Azure・独自エンドポイント・サンドボックス

@@ -1,10 +1,11 @@
-"""調べる深さ（`sherpa.depth_profile`）の単体テスト（調べ方ブロック §3.2・SC-6c。深さと探索量の
-再接続は `docs/proposals/2026-09-19-実装ベース探索の回復.md` §3 S2）。
+"""調べる深さ（`sherpa.depth_profile`）の単体テスト（調べ方ブロック §3.2・SC-6c。深さは4段＝
+クイック/標準/深く/最大）。
 
-- `scaled_turns`/`scaled_ratio`/`scaled_depth`/`codex_reasoning_for`: 深さ（standard/deep/max）
-  に応じて探索量を拡大する（ターン数 ×1/×2/×3・ヒット上限と読取窓 ×1/×1.5/×2・たどる深さ
-  +0/+2/+4・Codex 推論は deep=high／max=xhigh）。`codex_reasoning_for` は基準値を**下げない**。
+- `review_rounds_for`: 見直しの巡数（クイック 0／標準 2／深く 4／最大＝管理画面の共通上限）。
+- `scaled_turns`/`scaled_ratio`/`scaled_depth`: 深さに応じて探索量を拡大する（ターン数
+  ×1/×1/×2/×3・ヒット上限と読取窓 ×1/×1/×1.5/×2・たどる深さ +0/+0/+2/+4）。
   `abs_max` の絶対上限は倍率適用後に一度だけ効く。不正な depth_profile は fail-loud のまま。
+- `codex_reasoning_for`: 推論レベルは**深さで変えない**（どの深さでも管理画面の基準値のまま）。
 - `escalated_profile`: 1段上の深さ（最大は上限＝None）。
 - `effective_base`: system_settings の基準値編集が env 既定値より優先されること・
   無効値（0以下・非数値）は env 既定へ fail-open すること。
@@ -21,7 +22,7 @@ def test_normalize_depth_profile_omitted_defaults_to_standard():
     assert D.normalize_depth_profile(None) == "standard"
 
 
-@pytest.mark.parametrize("v", ["standard", "deep", "max"])
+@pytest.mark.parametrize("v", ["quick", "standard", "deep", "max"])
 def test_normalize_depth_profile_valid_passthrough(v):
     assert D.normalize_depth_profile(v) == v
 
@@ -31,66 +32,55 @@ def test_normalize_depth_profile_invalid_raises():
         D.normalize_depth_profile("bogus")
 
 
-# ===== 深さ連動の探索量（期待値表・S2）=====
+# ===== 深さ4段の対応表（巡数・倍率・加算・推論・引き上げ・usage）=====
 
-@pytest.mark.parametrize("profile,expected", [("standard", 12), ("deep", 24), ("max", 36)])
-def test_scaled_turns_scales_with_depth(profile, expected):
-    """反復上限は 標準×1／深く×2／最大×3。"""
-    assert D.scaled_turns(12, profile) == expected
-
-
-@pytest.mark.parametrize("profile,expected", [("standard", 30), ("deep", 45), ("max", 60)])
-def test_scaled_ratio_scales_with_depth_grep_hits(profile, expected):
-    assert D.scaled_ratio(30, profile) == expected
-
-
-@pytest.mark.parametrize("profile,expected", [("standard", 40), ("deep", 60), ("max", 80)])
-def test_scaled_ratio_scales_with_depth_read_window(profile, expected):
-    assert D.scaled_ratio(40, profile) == expected
+# 1行＝1つの深さ。`rounds`（`max_review_rounds` 既定 7 のとき）・反復上限（基準 12）・
+# ヒット上限（基準 30）・読取窓（基準 40）・影響の段数（基準 8）・推論（基準 medium）・
+# 1段上の深さ。深さは推論レベルを変えない＝`reasoning` 列は全段で基準値のまま。
+_DEPTH_MATRIX = [
+    # profile,    rounds, turns, hits, window, depth, reasoning, escalated
+    ("quick",     0,      12,    30,   40,     8,     "medium",  "standard"),
+    ("standard",  2,      12,    30,   40,     8,     "medium",  "deep"),
+    ("deep",      4,      24,    45,   60,     10,    "medium",  "max"),
+    ("max",       7,      36,    60,   80,     12,    "medium",  None),
+]
 
 
-@pytest.mark.parametrize("profile,expected", [("standard", 8), ("deep", 10), ("max", 12)])
-def test_scaled_depth_adds_with_depth_impact(profile, expected):
-    assert D.scaled_depth(8, profile) == expected
+@pytest.mark.parametrize("profile,rounds,turns,hits,window,depth,reasoning,escalated", _DEPTH_MATRIX)
+def test_depth_matrix(profile, rounds, turns, hits, window, depth, reasoning, escalated):
+    """4段（クイック/標準/深く/最大）の期待値表を1本で固定する。"""
+    assert D.review_rounds_for(profile) == rounds
+    assert D.scaled_turns(12, profile) == turns
+    assert D.scaled_ratio(30, profile) == hits
+    assert D.scaled_ratio(40, profile) == window
+    assert D.scaled_depth(8, profile) == depth
+    assert D.codex_reasoning_for("medium", profile) == reasoning
+    assert D.escalated_profile(profile) == escalated
+    assert D.usage_extras(profile)["depth_profile"] == profile
 
 
-@pytest.mark.parametrize("profile,expected", [("standard", 3), ("deep", 5), ("max", 7)])
+@pytest.mark.parametrize("profile,expected", [("quick", 3), ("standard", 3), ("deep", 5), ("max", 7)])
 def test_scaled_depth_adds_with_depth_troubleshoot(profile, expected):
     assert D.scaled_depth(3, profile) == expected
 
 
-# 基準 4通り × 深さ3段の期待値表（S2 の検収）。深さの指定は基準値を**下げない**。
-@pytest.mark.parametrize("base,profile,expected", [
-    ("low", "standard", "low"), ("low", "deep", "high"), ("low", "max", "xhigh"),
-    ("medium", "standard", "medium"), ("medium", "deep", "high"), ("medium", "max", "xhigh"),
-    ("high", "standard", "high"), ("high", "deep", "high"), ("high", "max", "xhigh"),
-    ("xhigh", "standard", "xhigh"), ("xhigh", "deep", "xhigh"), ("xhigh", "max", "xhigh"),
-])
-def test_codex_reasoning_for_expected_matrix(base, profile, expected):
-    assert D.codex_reasoning_for(base, profile) == expected
+@pytest.mark.parametrize("base", ["low", "medium", "high", "xhigh", "bogus"])
+@pytest.mark.parametrize("profile", ["quick", "standard", "deep", "max"])
+def test_codex_reasoning_for_is_fixed_by_configured_base(base, profile):
+    """推論レベルは深さで変えない——どの深さでも管理画面の基準値をそのまま返す
+    （未知の語彙＝設定の壊れもそのまま通す＝深さ由来の上書きは無い）。"""
+    assert D.codex_reasoning_for(base, profile) == base
 
 
-def test_codex_reasoning_for_never_downgrades_configured_base():
-    """基準が既に最上位（xhigh）の環境で「深く」を選んでも high へ落ちない（S2 の注記）。"""
-    assert D.codex_reasoning_for("xhigh", "deep") == "xhigh"
+def test_codex_reasoning_for_rejects_invalid_profile():
+    """推論を変えなくなっても depth_profile 自体の妥当性検証（fail-loud）は残す。"""
+    with pytest.raises(ValueError):
+        D.codex_reasoning_for("medium", "deeper")
 
 
-def test_codex_reasoning_for_unknown_base_uses_depth_override():
-    """基準値が未知の語彙（設定の壊れ）なら比較できない——深さの指定をそのまま使う。"""
-    assert D.codex_reasoning_for("bogus", "deep") == "high"
-    assert D.codex_reasoning_for("bogus", "standard") == "bogus"
+# ===== escalated_profile: 自動引き上げの1段上 =====
 
-
-def test_codex_reasoning_for_standard_keeps_arbitrary_base():
-    """標準は基準値をそのまま返す（author 専用の別 env 既定でも上書きしない）。"""
-    assert D.codex_reasoning_for("medium", "standard") == "medium"
-
-
-# ===== escalated_profile: 自動引き上げの1段上（S2）=====
-
-def test_escalated_profile_steps_up_one_level():
-    assert D.escalated_profile("standard") == "deep"
-    assert D.escalated_profile("deep") == "max"
+def test_escalated_profile_omitted_profile_steps_up_from_standard():
     assert D.escalated_profile(None) == "deep"      # 欠落は standard
 
 
@@ -165,6 +155,7 @@ def test_scaled_ratio_abs_max_clamps_after_multiplier():
 
 def test_scaled_ratio_abs_max_does_not_affect_values_within_bound():
     """倍率適用後も abs_max 以内なら倍率どおりの値。"""
+    assert D.scaled_ratio(30, "quick", abs_max=1000) == 30
     assert D.scaled_ratio(30, "standard", abs_max=1000) == 30
     assert D.scaled_ratio(30, "deep", abs_max=1000) == 45
     assert D.scaled_ratio(30, "max", abs_max=1000) == 60
@@ -193,7 +184,7 @@ def test_scaled_depth_abs_max_omitted_keeps_existing_behavior():
 
 # ===== STAT-3 S1（利用統計の拡充）: usage メタへ足す depth 由来のキー =====
 
-@pytest.mark.parametrize("profile,mult", [("standard", 1), ("deep", 2), ("max", 3)])
+@pytest.mark.parametrize("profile,mult", [("quick", 1), ("standard", 1), ("deep", 2), ("max", 3)])
 def test_effective_max_turns_composes_effective_base_and_scaled_turns(profile, mult):
     """`effective_base(...,"max_turns",12)` → `scaled_turns(...)` と同じ結果（単一の真実源）＝
     管理画面の基準値編集と深さの倍率の両方が効く。"""
@@ -225,25 +216,34 @@ def test_usage_reasoning_extras_includes_base_when_caller_values_differ():
         "depth_profile": "deep", "reasoning": "high", "reasoning_base": "medium"}
 
 
-def test_usage_reasoning_extras_via_codex_reasoning_for_records_override():
-    """実際の呼び出し経路（`codex_reasoning_for` の戻り値を渡す）では、上書きが起きた深さだけ
-    `reasoning_base` が付く（標準は基準値のままなので省略される）。"""
-    assert D.usage_reasoning_extras("standard", "medium", D.codex_reasoning_for("medium", "standard")) == {
-        "depth_profile": "standard", "reasoning": "medium"}
-    assert D.usage_reasoning_extras("deep", "medium", D.codex_reasoning_for("medium", "deep")) == {
-        "depth_profile": "deep", "reasoning": "high", "reasoning_base": "medium"}
-    assert D.usage_reasoning_extras("max", "medium", D.codex_reasoning_for("medium", "max")) == {
-        "depth_profile": "max", "reasoning": "xhigh", "reasoning_base": "medium"}
+@pytest.mark.parametrize("profile", ["quick", "standard", "deep", "max"])
+def test_usage_reasoning_extras_via_codex_reasoning_for_omits_base_at_every_depth(profile):
+    """実際の呼び出し経路（`codex_reasoning_for` の戻り値を渡す）では、深さが推論を変えない
+    ＝どの深さでも `reasoning_base` は付かない。"""
+    assert D.usage_reasoning_extras(profile, "medium", D.codex_reasoning_for("medium", profile)) == {
+        "depth_profile": profile, "reasoning": "medium"}
 
 
-# ---- DEPTH-2 S5: 深さ＝evaluator（査読）の巡数（§2.3）----
+# ---- 深さ＝evaluator（査読）の巡数 ----
 
-def test_review_rounds_standard_is_zero_and_deep_is_two():
-    """標準は 0 巡（査読を一度も発動しない＝従来の標準と同じ）・深くは 2 巡（固定）。"""
-    assert D.review_rounds_for("standard") == 0
-    assert D.review_rounds_for(None) == 0          # 欠落は standard
-    assert D.review_rounds_for("deep") == 2        # 設定に依らず固定
-    assert D.review_rounds_for("deep", {"max_review_rounds": 3}) == 2
+def test_review_rounds_quick_is_zero_and_standard_deep_are_fixed():
+    """クイックは 0 巡（査読を一度も発動しない＝確認 1 回だけ）・標準 2 巡／深く 4 巡（固定）。"""
+    assert D.review_rounds_for("quick") == 0
+    assert D.review_rounds_for(None) == 2          # 欠落は standard＝既定の 2 巡
+    assert D.review_rounds_for("standard", {"max_review_rounds": 3}) == 2   # 上限内なら固定値
+    assert D.review_rounds_for("deep") == 4
+
+
+def test_review_rounds_fixed_tiers_are_clamped_by_the_common_cap():
+    """管理者が共通上限を下げた環境でも、固定の巡数（標準 2・深く 4）が「最大」を超えない。"""
+    assert D.review_rounds_for("deep", {"max_review_rounds": 3}) == 3
+    assert D.review_rounds_for("deep", {"max_review_rounds": 1}) == 1
+    assert D.review_rounds_for("standard", {"max_review_rounds": 1}) == 1
+    # 上限そのもの（「最大」）を下回らない＝どの段も「最大」以下に収まる。
+    for cap in (1, 2, 3, 4, 7):
+        rounds = [D.review_rounds_for(p, {"max_review_rounds": cap})
+                  for p in ("quick", "standard", "deep", "max")]
+        assert rounds == sorted(rounds) and rounds[-1] == cap, cap
 
 
 def test_review_rounds_max_follows_system_setting_with_default_seven():

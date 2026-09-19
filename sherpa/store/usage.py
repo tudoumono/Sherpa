@@ -448,6 +448,9 @@ def _compute_round_stats(round_rows) -> dict:
     unmatched_rounds = 0
     for r in round_rows:
         meta = r["meta"] or {}
+        # 深さは利用者が選んだ語彙そのもの（版の印は付けない）——`"standard"` の意味が 0 巡から
+        # 2 巡へ変わった前後は同じキーに畳まれる。版をまたぐ比較は品質採点の `condition`
+        # （`QUALITY_RUN_CONDITIONS`）側で分ける。
         depth = r["depth_profile"] or "unknown"
         provider = r["provider"] or "unknown"
 
@@ -1243,8 +1246,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
 _QUALITY_COUNT_FIELDS = ("correct", "wrong_assertion", "missing", "regressed", "unrated")
 
 # 採点した条件の閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。`main`＝見直しの無い
-# AP、`depth2-*`＝見直しを持つ AP の深さ別。
-QUALITY_RUN_CONDITIONS = ("main", "depth2-standard", "depth2-deep", "depth2-max")
+# AP、`depth2-*`＝見直しを持つ AP の深さ別（`depth2-quick` が見直し 0 巡・`depth2-standard` は
+# 見直し 2 巡）。
+QUALITY_RUN_CONDITIONS = ("main", "depth2-quick", "depth2-standard", "depth2-deep", "depth2-max")
 
 
 def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
@@ -1254,7 +1258,7 @@ def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
                              audit_actor: str | None = None) -> bool:
     """1採点ラン分の集計済みカウントを1行 INSERT する。
 
-    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-standard`）は0）。
+    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-quick`）は0）。
     `counts`: `_QUALITY_COUNT_FIELDS` の一部/全部（欠落キーは0・非負整数以外は0に丸める＝壊れた
     入力で例外にしない）。`condition`: `QUALITY_RUN_CONDITIONS` のいずれか（閉集合外は
     `UsagePeriodError` ではなく `ValueError`）。`executed_from`/`executed_to`: 質問セットを実行した

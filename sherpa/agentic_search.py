@@ -1828,7 +1828,7 @@ _USAGE_TOOLS_SPEC = [
          "to": {"type": "string",
                 "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
                                "from と対で指定し days とは併用不可"}}}),
-    ("usage_depth_rounds", "深さ（標準/深く/最大）×経路（provider）別の査読巡数の分布と、"
+    ("usage_depth_rounds", "深さ（クイック/標準/深く/最大）×経路（provider）別の査読巡数の分布と、"
                           "不明（未確定）と判定された主張の理由コードの分布を取得する。"
                           "本文（質問/回答）は含まない。",
      {"type": "object", "properties": {

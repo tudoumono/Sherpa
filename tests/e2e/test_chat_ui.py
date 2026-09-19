@@ -18,7 +18,6 @@ def test_chat_streams_answer_with_explicit_scope(page, web_base_url):
     page.goto(f"{web_base_url}/chat.html")
 
     expect(page.locator("#messages")).to_contain_text("気になること")
-    page.locator("#kbtoggle").click()
     expect(page.locator("#scopesel")).to_be_visible()
 
     page.locator("#scopebtn").click()
@@ -52,7 +51,6 @@ def test_scope_panel_tree_collapses_to_top_level_by_default(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#scopebtn").click()
 
     expect(page.locator("#scopepanel [data-scope='4期']")).to_be_visible()
@@ -72,7 +70,6 @@ def test_scope_panel_toggle_click_does_not_change_selection(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#scopebtn").click()
 
     page.locator("#scopepanel [data-toggle='4期']").click()
@@ -103,7 +100,6 @@ def test_scope_panel_filter_narrows_and_selects_then_reverts_to_tree(page, web_b
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#scopebtn").click()
 
     page.locator("#scopefilter").fill("ソース")
@@ -1806,7 +1802,6 @@ def test_chat_sources_stay_single_list_without_sources_verified(page, web_base_u
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率を変えたい。影響は？")
     page.locator("#send").click()
 
@@ -1880,7 +1875,6 @@ def test_inquiry_block_lens_segment_sets_body_lens_and_grays_layer(page, web_bas
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
     expect(page.locator("#messages")).to_contain_text("気になること")
-    page.locator("#kbtoggle").click()
 
     page.locator("#lens-seg [data-lens='impact']").click()
     expect(page.locator("#lens-seg [data-lens='impact']")).to_have_class(re.compile(r"\bon\b"))
@@ -1903,7 +1897,6 @@ def test_inquiry_block_layer_segment_sets_body_layer(page, web_base_url):
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#layer-seg [data-layer='code']").click()
     expect(page.locator("#layer-seg [data-layer='code']")).to_have_class(re.compile(r"\bon\b"))
@@ -1977,7 +1970,7 @@ def test_inquiry_restore_auto_lens_resets_but_layer_persists(page, web_base_url)
     expect(page.locator("#layer-seg [data-layer='code']")).to_have_class(re.compile(r"\bon\b"))
 
 
-# ===== SC-6c: 調べる深さ（標準/深く/最大・調べ方ブロック §3.2）=====
+# ===== SC-6c: 調べる深さ（クイック/標準/深く/最大・調べ方ブロック §3.2）=====
 
 _DEPTH_DEEP_ANSWER = {
     "lens": "qa", "headline": "該当箇所が1件見つかりました。",
@@ -2001,7 +1994,6 @@ def test_inquiry_depth_profile_deep_send_reflects_body_and_header(page, web_base
         {"type": "answer", "conversation_id": 101, "message": {"answer": _DEPTH_DEEP_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#depth-seg [data-depth='deep']").click()
     expect(page.locator("#depth-seg [data-depth='deep']")).to_have_class(re.compile(r"\bon\b"))
@@ -2014,6 +2006,31 @@ def test_inquiry_depth_profile_deep_send_reflects_body_and_header(page, web_base
     body = records["turn_starts"][-1]
     assert body.get("depth_profile") == "deep"
     expect(page.locator("#messages")).to_contain_text("調べる深さ: 深く・所要 4分12秒")
+
+
+def test_inquiry_depth_profile_quick_send_reflects_body_and_header(page, web_base_url):
+    """「クイック」（見直しなし）も他の段と同じく `body.depth_profile` に載り、回答ヘッダに
+    「調べる深さ: クイック」として出る。"""
+    from playwright.sync_api import expect
+
+    answer = {**_DEPTH_DEEP_ANSWER,
+              "scope": {**_DEPTH_DEEP_ANSWER["scope"], "depth_profile": "quick"}}
+    records = install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+
+    page.locator("#depth-seg [data-depth='quick']").click()
+    expect(page.locator("#depth-seg [data-depth='quick']")).to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator("#inquiry-chip-label")).to_contain_text("クイック")
+
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    body = records["turn_starts"][-1]
+    assert body.get("depth_profile") == "quick"
+    expect(page.locator("#messages")).to_contain_text("調べる深さ: クイック・所要 4分12秒")
 
 
 def test_inquiry_restore_depth_profile_from_history(page, web_base_url):
@@ -2078,7 +2095,6 @@ def test_inquiry_tools_graph_only_send_reflects_body_and_hides_grep_fulltext_nod
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TOOLS_GRAPH_ONLY_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-details-body")).to_be_visible()
@@ -2106,7 +2122,6 @@ def test_inquiry_tools_last_one_cannot_be_turned_off(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
 
     page.locator("#tools-seg [data-tool='grep']").click()
@@ -2125,7 +2140,6 @@ def test_inquiry_tools_unavailable_chip_hidden(page, web_base_url):
 
     install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='graph']")).to_be_hidden()
     expect(page.locator("#tools-seg [data-tool='grep']")).to_be_visible()
@@ -2140,7 +2154,6 @@ def test_inquiry_tools_last_one_gating_ignores_unavailable_tool(page, web_base_u
 
     install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     page.locator("#tools-seg [data-tool='grep']").click()
     fulltext_btn = page.locator("#tools-seg [data-tool='fulltext']")
@@ -2158,7 +2171,6 @@ def test_inquiry_tools_unavailable_axis_omitted_from_send_avoids_422(page, web_b
 
     records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='graph']")).to_be_hidden()
 
@@ -2201,7 +2213,6 @@ def test_retry_hint_tools_button_resends_explicit_on_even_if_still_unavailable(p
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TOOLS_RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("OFF にした検索を戻す")
@@ -2239,7 +2250,6 @@ def test_inquiry_tools_toggle_off_then_on_sends_explicit_despite_availability_dr
 
     page.route("**/chat/turns", handle_turn_start)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
 
     graph_btn = page.locator("#tools-seg [data-tool='graph']")
@@ -2262,7 +2272,6 @@ def test_inquiry_tools_last_one_rapid_clicks_stay_on(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     page.locator("#tools-seg [data-tool='grep']").click()
     page.locator("#tools-seg [data-tool='fulltext']").click()
@@ -2283,7 +2292,6 @@ def test_inquiry_tools_chip_keyboard_activation_toggles(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     grep_btn = page.locator("#tools-seg [data-tool='grep']")
     grep_btn.focus()
@@ -2409,7 +2417,6 @@ def test_slash_prefix_message_sent_verbatim_without_body_lens(page, web_base_url
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("/影響 消費税率を変えたい")
     page.locator("#send").click()
@@ -2444,7 +2451,6 @@ def test_retry_hint_button_broadens_scope_and_resends(page, web_base_url):
         {"type": "answer", "conversation_id": 101, "message": {"answer": _RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("範囲を全体に広げる")
@@ -2481,7 +2487,6 @@ def test_retry_hint_button_raises_depth_profile_and_resends(page, web_base_url):
         {"type": "answer", "conversation_id": 101, "message": {"answer": _DEPTH_RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("調べる深さを上げて探す")
@@ -2519,7 +2524,6 @@ def test_codex_timeout_note_and_continue_button_resends_fixed_message(page, web_
         {"type": "answer", "conversation_id": 101, "message": {"answer": _CODEX_TIMEOUT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("次に資料を確認します。")
@@ -2558,7 +2562,6 @@ def test_codex_stopped_early_note_and_continue_button_resends_fixed_message(page
         {"type": "answer", "conversation_id": 101, "message": {"answer": _CODEX_STOPPED_EARLY_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("次に資料を確認します。")
@@ -2633,7 +2636,6 @@ def test_confirm_first_resend_restores_slash_lens_via_question_payload(page, web
     records = install_api_mocks(page)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("/影響 税率表を確認してから進めて。")
     page.locator("#send").click()
@@ -2684,7 +2686,6 @@ def test_confirm_first_resend_restores_tools_from_question_payload(page, web_bas
     records = install_api_mocks(page)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("原因を確認してから進めて。")
     page.locator("#send").click()
@@ -3075,7 +3076,6 @@ def test_confirm_first_resend_does_not_persist_override_as_explicit(page, web_ba
     records = install_api_mocks(page)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("原因を確認してから進めて。")
     page.locator("#send").click()
@@ -3111,7 +3111,6 @@ def test_troubleshoot_without_candidates_falls_back_to_citation_view(page, web_b
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TROUBLE_DEGRADED_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("夜間バッチが止まる")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("資料とソースを直接調べて回答します")
@@ -3132,3 +3131,97 @@ def test_export_includes_citations_when_troubleshoot_degraded_to_qa_shape(page, 
     dl_info.value.save_as(txt_path)
     txt = txt_path.read_text(encoding="utf-8")
     assert "4期/03_開発/01_ソース/TAXCALC.cbl（行10-12）: ABEND-CODE 0C7" in txt
+
+
+# ===== S6a RV是正2巡目 #1/#4: 資料参照の既定ON運用まわり =====
+
+def test_new_conversation_resets_knowledge_toggle_to_on_after_chat_lens_conversation(page, web_base_url):
+    """RV是正#1: lens=chat（資料参照OFF）の会話を開いた直後は `S.kb` が false のままになる
+    （`applyConversationScope` が `ans.lens==='chat'` で setKb(false) するため）。「新しい会話」を
+    始めたら、その OFF を引き継がず既定ON（決定2026-09-19）へ戻り、送信 body の knowledge が
+    true になる。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.route("**/conversations/777", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({
+            "conversation": {"id": 777, "title": "雑談", "origin": "own", "version": "w1",
+                             "read_only": False, "contains_personal_workspace": False},
+            "messages": [
+                {"role": "user", "content": "こんにちは", "created_at": "2026-09-01T00:00:00+00:00"},
+                {"role": "assistant", "content": "こんにちは！", "answer": {"lens": "chat"},
+                 "trace": None, "created_at": "2026-09-01T00:00:05+00:00"},
+            ],
+        }, ensure_ascii=False)))
+    page.goto(f"{web_base_url}/chat.html")
+
+    page.evaluate("(id) => window.__sherpaChatTest.openConversation(id)", 777)
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")   # OFF を引き継いでいる
+
+    page.locator("#newbtn").click()
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")   # 新規会話は既定ONへ戻る
+
+    page.locator("#input").fill("消費税率を変えたい。影響は？")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is True
+
+
+def test_knowledge_toggle_forced_off_when_world_options_empty(page, web_base_url):
+    """RV是正#4: 資料フォルダが1つも登録されていない環境（`GET /world-options` が空）では、
+    既定ON（決定2026-09-19）のままだと素の雑談まで knowledge=True で送って 404 になる——
+    フロントが自発的に OFF へ倒し、送信 body の knowledge は false になる。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, world_options={"worlds": [], "labels": {}})
+    page.goto(f"{web_base_url}/chat.html")
+
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")
+
+    page.locator("#input").fill("こんにちは")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is False
+
+
+def test_new_conversation_stays_off_when_world_options_empty(page, web_base_url):
+    """S6a RV是正3巡目 #1: 資料フォルダ未登録（`GET /world-options` が空）の環境で「新しい会話」を
+    始めても、`newConversation()` の無条件ON復帰（`S.verLabels` を見ない版）が既定ONへ戻して
+    しまうと素の雑談まで 404 になる——選択肢が無いままなら OFF を維持する。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, world_options={"worlds": [], "labels": {}})
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")
+
+    page.locator("#newbtn").click()
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")   # ONへ戻らない
+
+    page.locator("#input").fill("こんにちは")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is False
+
+
+def test_new_conversation_stays_on_when_world_options_fetch_fails(page, web_base_url):
+    """S6a RV是正4巡目: `GET /world-options` が失敗（未確認のまま）した環境では、
+    `S.kbForcedOff` は立たない（`S.verLabels` の空チェックだと「未確認」と「空で確定」を
+    区別できず OFF に倒れてしまっていた）——「新しい会話」を始めても資料参照は既定ON
+    （決定2026-09-19）のまま。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.route("**/world-options", lambda route: route.abort())
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")   # 未確認＝既定ONのまま
+
+    page.locator("#newbtn").click()
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")   # OFFへ誤って倒れない
+
+    page.locator("#input").fill("こんにちは")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is True

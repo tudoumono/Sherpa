@@ -1315,8 +1315,10 @@ def _sweep_expired_codex_sessions() -> dict:
     """R1b（会話継続・Codex ネイティブ resume・決定5）: 会話ごとの Codex resume セッション
     （`workspace/.codex-sessions/{cid}`）の TTL 掃除。
 
-    保持日数は admin 設定 `codex_session_retention_days`（system_settings・既定 0=無制限）。
-    0 以下（未設定含む）ならスイープしない。判定はディレクトリ自体の mtime（`CodexProvider` が
+    保持日数は admin 設定 `codex_session_retention_days`
+    （system_settings・未設定は既定30日・決定2026-09-19・`system_extras.effective_codex_session_retention_days`
+    が唯一の判定＝管理画面表示と同じ関数）。0（明示設定時のみ）ならスイープしない。判定は
+    ディレクトリ自体の mtime（`CodexProvider` が
     毎ターン `config.toml` をこの直下に作り直すため、実行するたびに更新される＝最終利用時刻の
     近似として十分・DB 台帳は持たない＝`_gc_orphan_workspace_files` と同じ「fs 実体が真実源」思想）。
     安全設計（既存 workspace TTL sweep と同一）:
@@ -1331,7 +1333,7 @@ def _sweep_expired_codex_sessions() -> dict:
     限定していない）。
     """
     try:
-        retention_days = int(store.get_system_settings().get("codex_session_retention_days") or 0)
+        retention_days = system_extras.effective_codex_session_retention_days(store.get_system_settings())
     except Exception as e:
         _log.warning("sweep_expired_codex_sessions: system_settings 取得失敗、skip: %s", e)
         return {"skipped": "settings_unreachable"}

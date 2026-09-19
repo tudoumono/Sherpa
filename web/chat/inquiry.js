@@ -20,7 +20,7 @@ const $ = Sherpa.$;
 const LENS_LABEL = { auto: '自動', impact: '影響', troubleshoot: '原因', qa: '内容', author: '作成' };
 const LAYER_LABEL = { both: '資料＋コード', docs: '資料のみ', code: 'コードのみ' };
 // 調べる深さ（調べ方ブロック §3.2・SC-6c）。
-const DEPTH_LABEL = { standard: '標準', deep: '深く', max: '最大' };
+const DEPTH_LABEL = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
 // 検索経路トグル（調べ方ブロック §3.6・SC-6e）。キー順は要約ラベルの表示順にもなる。
 const TOOL_KEYS = ['grep', 'fulltext', 'graph'];
 const TOOL_LABEL = { grep: '語句そのまま検索', fulltext: '意味・表記ゆれも探す', graph: 'グラフ' };

@@ -1120,10 +1120,11 @@ SYSTEM_SETTINGS_VIEW = {
     # PART-6（2026-09-05-Webhook通知.md W3）: Webhook 宛先の SSRF allowlist。`ollama_allowlist` と
     # 同型（既定 loopback のみ許可＝配下 effective は空）。
     "webhook_allowlist": {"configured": None, "effective": []},
-    # R1b（2026-07-13 横断レビュー対応・Codex ネイティブ resume・決定5）: Codex resume セッションの
-    # 保持日数。既定（未設定）は 0＝無制限。フェーズ7-1（response_model 実測）で発見した実ドリフト
+    # R1b（2026-07-13 横断レビュー対応・Codex ネイティブ resume・決定5）→ 初期構成の既定
+    # （決定2026-09-19）: Codex resume セッションの保持日数。既定（未設定）は 30 日
+    # （明示的な 0 だけ無制限）。フェーズ7-1（response_model 実測）で発見した実ドリフト
     # 是正＝旧モックはこのキーを欠いていた（実 GET /admin/settings は常に持つ）。
-    "codex_session_retention_days": {"configured": None, "effective": 0},
+    "codex_session_retention_days": {"configured": None, "effective": 30, "default": 30},
     # STAT-2（2026-08-28-利用統計AIチャット.md 追記）: 利用統計チャット専用の AI 選択。利用者の
     # 実行構成（agent）には依存せず、管理者全体で1つに統一する。未設定時の既定は A7
     # （`cloud`.`provider`・下記）連動——この環境は A7=openai（既定）なので "openai"
@@ -1650,7 +1651,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                       health_components: list | None = None, usage_stats: dict | None = None,
                       system_settings: dict | None = None, settings: dict | None = None,
                       stream_events: list | None = None, extra_users: list | None = None,
-                      tools_availability: dict | None = None, notifications: list | None = None):
+                      tools_availability: dict | None = None, notifications: list | None = None,
+                      world_options: dict | None = None):
     current_user = user or USER_ADMIN
     # GET /admin/users の既定2件（admin/sato）に加え、呼び出し元が `extra_users=` で行を追加
     # できる（例: pending 状態のユーザーなど、既定の POST/PATCH mock 経路では作れない状態を
@@ -1676,6 +1678,10 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # 呼び出し元が渡した dict／モジュール定数 `SETTINGS_RESP` をそのまま参照すると、この install_api_mocks
     # 呼び出し（1テスト）の変更が他テスト・モジュール定数まで汚染してしまう。深いコピーで切り離す。
     settings_resp = json.loads(json.dumps(settings if settings is not None else SETTINGS_RESP))
+    # 初期構成の既定（2026-09-19 RV是正 #4）: GET /world-options の既定応答（呼び出し元が
+    # `world_options={"worlds": [], "labels": {}}` で資料フォルダ未登録を模せる）。
+    world_options_resp = json.loads(json.dumps(
+        world_options if world_options is not None else WORLD_OPTIONS_RESP))
     # S6: GET /settings/bedrock-models の既定応答（呼び出し元が `bedrock_models=` で上書き可・
     # 失敗系フローを試すテストのため）。ユーザー指名の Sonnet 4.6 を含めて動的取得の見た目を再現。
     bedrock_models_resp = bedrock_models if bedrock_models is not None else {"models": [
@@ -1983,6 +1989,11 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 worker_model = view["codex_worker_model"]
                 worker_model["configured"] = _val
                 worker_model["effective"] = _val if _val is not None else worker_model["default"]
+            if "codex_session_retention_days" in body:
+                value = body["codex_session_retention_days"]
+                retention = view["codex_session_retention_days"]
+                retention["configured"] = value
+                retention["effective"] = value if value is not None else retention["default"]
             # 同時実行の上限（簡易反映・null は default へ戻す・depth_profile と同型）。
             if "chat_max_turns" in view:
                 for _key, _put in (("per_user", "chat_max_turns_per_user"),
@@ -2230,7 +2241,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         if method == "GET" and path == "/worlds":
             return _json(route, {"worlds": [WORLD]})
         if method == "GET" and path == "/world-options":
-            return _json(route, WORLD_OPTIONS_RESP)
+            return _json(route, world_options_resp)
         if method == "GET" and path == "/chat/tools-availability":
             return _json(route, tools_availability_resp)
         if method == "GET" and path == "/config":

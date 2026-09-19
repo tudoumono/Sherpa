@@ -2095,18 +2095,32 @@ def test_check_codex_multi_agent_worker_model_ok_for_default_openai_endpoint(mon
     assert r.status == "ok"
 
 
-def test_check_codex_multi_agent_worker_model_skip_for_azure_endpoint(monkeypatch):
-    """C65/#72: Codex(OpenAI 系) 構成で接続先が Azure（既定 OpenAI 以外）＝本番側
-    （`codex_multi_agent_enabled`）が multi_agent を自動的に無効化する想定内の構成のため、
-    worker モデルのデプロイ名解決は不要＝理由付き skip（ng にしない）。"""
+def test_check_codex_multi_agent_worker_model_ok_for_azure_endpoint_unconfigured(monkeypatch):
+    """初期構成の既定（2026-09-19）: Codex(OpenAI 系) 構成で接続先が Azure でも multi_agent は
+    有効（`codex_multi_agent_enabled` が接続先を問わなくなった）。worker モデル未設定時は
+    本体 Codex と同じデプロイ名へ倒すため（`_codex_worker_model(..., main_model=...)`）、
+    本体が到達できていれば worker も動く想定内の組合せ＝ ok。"""
     from sherpa import agent_constructs
     monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
     monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
     sys_s = {"openai_endpoint_kind": "azure",
              "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
     r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "ok"
+    assert "デプロイ名" in r.detail
+
+
+def test_check_codex_multi_agent_worker_model_skip_for_custom_endpoint(monkeypatch):
+    """Azure 以外の独自エンドポイント（custom）は worker モデルの解決を本体デプロイ名に倒して
+    いないため、引き続き理由付き skip（ng にしない）。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    sys_s = {"openai_endpoint_kind": "custom",
+             "openai_base_url": "https://example.com/v1"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
     assert r.status == "skip"
-    assert "Azure" in r.detail
+    assert "custom" in r.detail
 
 
 def test_check_codex_multi_agent_worker_model_ok_when_only_ollama_backing(monkeypatch):
@@ -2132,7 +2146,7 @@ def test_check_codex_multi_agent_worker_model_detects_active_user_row(monkeypatc
              "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
     rows = [{"agent": "codex", "codex_model_provider": "openai"}]
     r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, rows)
-    assert r.status == "skip"
+    assert r.status == "ok"
 
 
 def test_check_codex_multi_agent_worker_model_skip_when_configured_custom(monkeypatch):

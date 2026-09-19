@@ -212,10 +212,10 @@ def test_fresh_session_without_prev_total_uses_raw_accumulated_usage(tmp_path, m
 
 # ===== STAT-3 S1（利用統計の拡充）: env["usage"] へ depth_profile/reasoning を足す =====
 
-def test_deep_depth_profile_keeps_base_reasoning_in_usage(tmp_path, monkeypatch):
-    """`scope_meta["depth_profile"]="deep"` は `model_reasoning_effort` の per-turn 上書き
-    （`depth_profile.codex_reasoning_for`）で "high" になり、基準値（既定 "low"）は
-    `env["usage"]["reasoning_base"]` に残る（`reasoning` と `reasoning_base` は矛盾しない）。"""
+def test_deep_depth_profile_keeps_configured_reasoning_in_usage(tmp_path, monkeypatch):
+    """推論レベルは深さで変えない——「深く」でも `model_reasoning_effort` は基準値（既定 "low"）の
+    まま渡り、`env["usage"]["reasoning"]` もその値になる（上書きが無いので `reasoning_base` は
+    付かない）。"""
     steps = [{"thread_id": "SID-DEEP", "agent_messages": ["確認した結果、影響はありません。"],
               "usage": _usage(30, 2, 13, 3)}]
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_delta_deep")
@@ -225,15 +225,15 @@ def test_deep_depth_profile_keeps_base_reasoning_in_usage(tmp_path, monkeypatch)
     env = _result_env(_run(prov, ctx))
 
     calls = _read_argv_log(argv_log)
-    assert any("model_reasoning_effort=high" in a for a in calls[0]), \
-        f"実際に codex exec へ渡した引数が深さの上書き high になっていない: {calls[0]!r}"
+    assert any("model_reasoning_effort=low" in a for a in calls[0]), \
+        f"実際に codex exec へ渡した引数が基準値 low のままになっていない: {calls[0]!r}"
     assert env["usage"]["depth_profile"] == "deep"
-    assert env["usage"]["reasoning"] == "high"
-    assert env["usage"]["reasoning_base"] == "low"
+    assert env["usage"]["reasoning"] == "low"
+    assert "reasoning_base" not in env["usage"]
 
 
 def test_standard_depth_profile_omits_reasoning_base_when_unchanged(tmp_path, monkeypatch):
-    """標準プロファイルは基準値のまま上書きしない＝`reasoning_base` は冗長なため省略する。"""
+    """基準値のまま渡るターンは `reasoning_base` を冗長なため省略する。"""
     steps = [{"thread_id": "SID-STD", "agent_messages": ["確認した結果、影響はありません。"],
               "usage": _usage(30, 2, 13, 3)}]
     _setup(tmp_path, monkeypatch, steps, users_dirname="users_delta_standard")
@@ -474,9 +474,9 @@ def test_child_thread_usage_breakdown_on_resume_uses_delta_not_cumulative(tmp_pa
 # ===== DEPTH-2 S6（§2.6）: multi_agent 既定有効化・review_rounds の受け渡し =====
 # 提案書 2026-09-17-深さの再定義とレビュー巡.md §2.6・§5 S6・受け入れ条件(1)(3)。
 
-def test_deep_depth_profile_passes_multi_agent_and_two_review_rounds_to_agents_md(tmp_path, monkeypatch):
-    """`scope_meta.depth_profile="deep"` は AGENTS.md 生成へ `multi_agent=True`・
-    `review_rounds=2`（`depth_profile.review_rounds_for` の戻り値）をそのまま渡す。"""
+def test_standard_depth_profile_passes_multi_agent_and_two_review_rounds_to_agents_md(tmp_path, monkeypatch):
+    """既定（標準）は AGENTS.md 生成へ `multi_agent=True`・`review_rounds=2`
+    （`depth_profile.review_rounds_for` の戻り値）をそのまま渡す。"""
     from sherpa import codex_agents_md
     from sherpa.providers.codex import provider as PV
     captured: dict = {}
@@ -491,7 +491,7 @@ def test_deep_depth_profile_passes_multi_agent_and_two_review_rounds_to_agents_m
              "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
     _setup(tmp_path, monkeypatch, steps, users_dirname="users_deep_agents_md")
     prov = A.CodexProvider()
-    ctx = _ctx(uid="deep-agents-md", conversation_id=901, scope_meta={"depth_profile": "deep"})
+    ctx = _ctx(uid="deep-agents-md", conversation_id=901, scope_meta={"depth_profile": "standard"})
 
     _run(prov, ctx)
 
@@ -499,9 +499,9 @@ def test_deep_depth_profile_passes_multi_agent_and_two_review_rounds_to_agents_m
     assert captured.get("review_rounds") == 2
 
 
-def test_standard_depth_profile_keeps_multi_agent_on_with_zero_review_rounds(tmp_path, monkeypatch):
-    """標準（§2.6「常時」有効化の裁定）でも `multi_agent=True` のまま、`review_rounds` だけ 0 になる
-    （深さに関わらず multi_agent 自体は常時 on＝Codex(OpenAI) 構成なら常に有効）。"""
+def test_quick_depth_profile_keeps_multi_agent_on_with_zero_review_rounds(tmp_path, monkeypatch):
+    """クイック（§2.6「常時」有効化の裁定）でも `multi_agent=True` のまま、`review_rounds` だけ 0 に
+    なる（深さに関わらず multi_agent 自体は常時 on＝Codex(OpenAI) 構成なら常に有効）。"""
     from sherpa import codex_agents_md
     from sherpa.providers.codex import provider as PV
     captured: dict = {}
@@ -516,7 +516,8 @@ def test_standard_depth_profile_keeps_multi_agent_on_with_zero_review_rounds(tmp
              "agent_messages": ["確認した結果、影響はありません。"], "usage": _usage()}]
     _setup(tmp_path, monkeypatch, steps, users_dirname="users_standard_agents_md")
     prov = A.CodexProvider()
-    ctx = _ctx(uid="standard-agents-md", conversation_id=902)
+    ctx = _ctx(uid="standard-agents-md", conversation_id=902,
+               scope_meta={"depth_profile": "quick"})
 
     _run(prov, ctx)
 

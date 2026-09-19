@@ -158,9 +158,10 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
 """
 
 # S6（§2.6）: multi_agent 有効時に本体（orchestrator）へ役割の使い方を伝える段落。`review_rounds`
-# は選ばれた深さが許す evaluator の巡数（`depth_profile.review_rounds_for` の戻り値＝標準 0／
-# 深く 2／最大は管理画面の設定値）——0 のときは evaluator を使わないことを明示する（標準は今までの
-# 挙動と同じ・巡を増やさない）。何体をどう使うか自体は Codex の判断のまま固定の手順にはしない。
+# は選ばれた深さが許す evaluator の巡数（`depth_profile.review_rounds_for` の戻り値＝クイック 0／
+# 標準 2／深く 4／最大は管理画面の設定値）——0 のときは evaluator を使わないことを明示する
+# （クイックは確認 1 回だけで答える・巡を増やさない）。何体をどう使うか自体は Codex の判断の
+# まま固定の手順にはしない。
 # `direct_read`／`layer` は `_source_verification_paragraph` と同じ理由・同じ組合せで文言を
 # 切り替える（multi_agent は常時有効のため、直読不可・資料のみターンでもこの段落は出る＝矛盾を
 # 避けるにはどちらも渡す必要がある）。
@@ -169,8 +170,8 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
     _docs_only = not direct_read and layer == "docs"
     if review_rounds <= 0:
         # `_docs_only` はこの段落自体が「ソース裏取りはしない」を既に指示しているため、
-        # rounds_note に「必ず自分でソースを確認」を続けると同一段落内で矛盾する
-        # （RV是正: 標準深さでも復活していた実行不能な指示）。巡数の告知だけにする。
+        # rounds_note に「必ず自分でソースを確認」を続けると同一段落内で矛盾する——
+        # 巡数の告知だけにする。
         rounds_note = ("今回の見直しの回数は 0 回＝evaluator は使わない。" if _docs_only else
                        "今回の見直しの回数は 0 回＝evaluator は使わない。worker の一次判断を鵜呑み"
                        "にせず、実装に関する主張は必ず自分でソースを確認してから最終回答に含める。")
