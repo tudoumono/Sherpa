@@ -1,0 +1,8 @@
+<struts>
+  <constant name="struts.i18n.encoding" value="UTF-8"/>
+  <package name="default" extends="struts-default">
+    <action name="order" class="com.acme.struts.OrderAction">
+      <result>/order.jsp</result>
+    </action>
+  </package>
+</struts>

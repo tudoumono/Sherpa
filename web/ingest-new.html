@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<!-- S3-A（2026-07-08）: 「資料を取り込む」画面は「取り込み状況」と統合し、ingest.html に一本化した。
+     この ingest-new.html はブックマーク救済のための薄いリダイレクト（実体・機能は ingest.html 側）。
+     RV Med2（2026-07-08）: meta refresh は撤去した（JS無効時に「戻る」で meta refresh が再び前方へ
+     進めてしまう履歴ループを避けるため）。JS 有効時のみ自動遷移し、query/hash は引き継ぐ（例:
+     ?foo=1#bar も ingest.html 側にそのまま渡す）。JS 無効環境は本文の平文リンクのみで遷移する。 -->
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<title>Sherpa — 資料（移動しました）</title>
+<script>location.replace('ingest.html' + location.search + location.hash);</script>
+</head>
+<body>
+<p>この画面は「資料」画面に統合されました。自動で移動します。移動しない場合は
+<a href="ingest.html">こちら</a>をクリックしてください。</p>
+</body>
+</html>

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Agent（Claude Code のサブエージェント）用 worktree の基点をローカル main に揃える。
+#
+# 背景: Agent の worktree 隔離は `origin/main` を基点に作られる。内部 main を push していないと
+# 基点が数百コミット古くなり、レーンが古いコードに対して実装してしまう。`git worktree add`／
+# `git clone` の初回チェックアウトだけを対象にする（このときだけ直前 HEAD が null SHA になる）。
+# 通常の `checkout`/`switch`（`-b` でのブランチ作成含む）は直前 HEAD が実 SHA で渡るため発火しない
+# ——worktree 内でのブランチ切替や `git bisect` を巻き込んで hard reset しない。
+# 有効化: `git config core.hooksPath scripts/git-hooks`（`make hooks`）。
+set -u
+[ "${1:-}" = "0000000000000000000000000000000000000000" ] || exit 0
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+case "$top" in
+  */.claude/worktrees/agent-*) ;;
+  *) exit 0 ;;
+esac
+main="$(git rev-parse --verify -q main)" || exit 0
+head="$(git rev-parse --verify -q HEAD)" || exit 0
+[ "$head" = "$main" ] && exit 0
+if git merge-base --is-ancestor "$head" "$main"; then
+  behind="$(git rev-list --count "$head".."$main")"
+  git reset -q --hard "$main" && echo "post-checkout: agent worktree の基点を main（${behind} コミット先）へ揃えました" >&2
+fi
+exit 0

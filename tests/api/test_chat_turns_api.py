@@ -1,0 +1,988 @@
+"""チャットターンのバックグラウンド実行（覗き窓方式）。正典: docs/proposals/2026-07-03-チャット背景実行.md。
+
+`POST /chat/turns` はターンを background thread として起動して即座に turn_id を返す。
+`GET /chat/turns/{turn_id}/stream?cursor=N` はバッファを cursor から replay→追従する「尾行」に
+すぎない（購読ゼロでもターンは完走・DB永続する）。`GET /chat/turns/running`／
+`POST /chat/turns/{turn_id}/stop` はそれぞれ一覧・停止。
+
+会話フローは要 Neo4j（graph-load 済）＋ Postgres 起動（test_chat_m8.py と同じ前提）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+
+import pytest
+from _world_setup import TEST_WORLD_ID, ensure_v1
+
+os.environ.setdefault("SHERPA_STREAM_PACE", "0")   # 既定は即時（テスト高速化・pace が要るテストは個別に monkeypatch）
+
+V = TEST_WORLD_ID
+
+
+@pytest.fixture(autouse=True)
+def _compat_mode(monkeypatch):
+    """このファイルはログインせず直接叩く前提（compat モード＝合成 admin・test_chat_m8.py と同じ流儀）。"""
+    monkeypatch.setenv("SHERPA_AUTH_DISABLED", "1")
+
+
+def _client():
+    from fastapi.testclient import TestClient
+    from sherpa.api import app
+    return TestClient(app)
+
+
+def _wait_turn_done(turn_id, timeout=5.0):
+    """turn_id の background thread が完走する（buffer.done）まで待つ（テストの後始末・レジストリ汚染防止）。"""
+    from sherpa import chat_turns
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec = chat_turns.get_turn(turn_id)
+        if rec is None or rec.buffer.done:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"turn {turn_id} が時間内に完了しなかった")
+
+
+def _drain_stream(resp_text: str) -> list[dict]:
+    return [json.loads(line[6:]) for line in resp_text.splitlines() if line.startswith("data: ")]
+
+
+def _start(uid, conversation_id, run_fn):
+    """テスト用ヘルパ: 予約方式（MEDIUM・Codex RV 修正）の `chat_turns.start_turn` を、
+    「conversation_id 決め打ち・run_fn そのまま」という以前の直感的な形で呼べるようにする橋渡し。
+    `start_turn` は `conversation_factory`（lock 外で呼ばれ conversation_id を確定する）と
+    `run_fn_factory`（確定した conversation_id を受けて実処理を組み立てる）を取るようになった。
+    """
+    from sherpa import chat_turns
+    return chat_turns.start_turn(uid=uid, conversation_factory=lambda: conversation_id,
+                                 run_fn_factory=lambda cid: run_fn)
+
+
+# ===== 完走・永続（購読ゼロでも DB に回答が残る） =====
+
+def test_turn_completes_and_persists_answer_without_any_subscriber():
+    """POST /chat/turns の直後は誰も GET /chat/turns/{id}/stream を叩かなくても、
+    background thread が最後まで走り DB（messages/trace）に答えが残る（proposal の核心）。"""
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("turn_id") and body.get("conversation_id")
+
+    _wait_turn_done(body["turn_id"])
+
+    conv = c.get(f"/conversations/{body['conversation_id']}").json()
+    roles = [m["role"] for m in conv["messages"]]
+    assert roles == ["user", "assistant"], f"購読ゼロで完走していない: {roles}"
+    assistant = conv["messages"][-1]
+    assert assistant["answer"]["lens"] == "impact"
+    assert assistant["answer"]["sources"], "出典が保存されていない"
+    assert assistant.get("trace"), "trace が保存されていない"
+
+
+def test_turn_start_response_returns_promptly_before_completion(monkeypatch):
+    """POST /chat/turns はターンの完走を待たずに即座に turn_id/conversation_id を返す
+    （pace を大きくしても応答が遅延しないことで確認する）。"""
+    from sherpa import chat_service
+    monkeypatch.setattr(chat_service, "emit_pace", lambda: 1.5)
+    ensure_v1()
+    c = _client()
+    t0 = time.time()
+    r = c.post("/chat/turns", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True})
+    elapsed = time.time() - t0
+    assert r.status_code == 200
+    assert elapsed < 1.0, f"POST /chat/turns が完走を待って遅延している: {elapsed}s"
+    _wait_turn_done(r.json()["turn_id"], timeout=10)
+
+
+def test_background_turn_persists_clarify_question_card_without_subscriber(monkeypatch):
+    """S1（ask_user-improvements.md）: 背景ターン（覗き窓方式・購読ゼロ）でも確認カードは assistant
+    メッセージとして永続化される。両経路（/chat/stream・/chat/turns）とも chat_service.stream_message
+    を通るため、question 到達時の保存はここでも効く（run_fn が generator を最後まで drain する＝
+    購読者が居なくても save は走る）。clarify に落とすため Tier2(LLM) を未接続化する
+    （[[feedback_intent_tier2_shared_dev_key_leak]]・共有 dev DB の実キーで先取り分類されるのを防ぐ）。"""
+    from sherpa import intent_llm
+    monkeypatch.setattr(intent_llm, "classify", lambda *a, **k: None)
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "税率を変えたら夜間バッチが落ちる？",
+                                    "world": V, "knowledge": True})
+    assert r.status_code == 200
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+    _wait_turn_done(tid)   # 購読者を一切張らずに完走を待つ
+
+    conv = c.get(f"/conversations/{cid}").json()
+    assistant = [m for m in conv["messages"] if m["role"] == "assistant"]
+    assert len(assistant) == 1, f"背景ターンで確認カードが保存されていない（S1）: {[m['role'] for m in conv['messages']]}"
+    saved = assistant[0]
+    assert saved["answer"]["lens"] == "clarify"
+    q = saved["answer"]["question"]
+    assert q["options"] and q["prompt"]
+    assert q["original_message"] == "税率を変えたら夜間バッチが落ちる？"
+    assert saved.get("trace"), "背景の clarify ターンでも trace が保存されるはず（思考の流れの復元）"
+
+
+# ===== 途中切断→再購読（cursor から replay・イベント欠落なし） =====
+
+def test_turn_stream_reconnect_from_cursor_has_no_event_gap(monkeypatch):
+    """最初の購読を意図的に打ち切り（＝途中切断を模す）、受け取った件数を cursor に再購読すると
+    残りのイベントが欠落なく届き、最終的に answer で完走する。"""
+    from sherpa import chat_service
+    monkeypatch.setattr(chat_service, "emit_pace", lambda: 0.12)   # 4ノード分の実時間の窓を作る
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True})
+    tid = r.json()["turn_id"]
+
+    first_events: list[dict] = []
+    with c.stream("GET", f"/chat/turns/{tid}/stream", params={"cursor": 0}) as s:
+        for line in s.iter_lines():
+            if line and line.startswith("data: "):
+                first_events.append(json.loads(line[6:]))
+                if len(first_events) >= 2:
+                    break   # ここで意図的に打ち切る（途中切断）＝ turn 自体は続く
+    assert first_events, "最初の接続でイベントを受け取れなかった"
+    assert first_events[-1]["type"] != "answer", "打ち切り前に完走してしまった（pace を確認）"
+
+    cursor = len(first_events)   # 受け取った件数 = 最後に受けたイベントの seq（購読者はこの1本のみ）
+    rest_events: list[dict] = []
+    with c.stream("GET", f"/chat/turns/{tid}/stream", params={"cursor": cursor}) as s:
+        for line in s.iter_lines():
+            if line and line.startswith("data: "):
+                rest_events.append(json.loads(line[6:]))
+
+    all_types = [e["type"] for e in first_events] + [e["type"] for e in rest_events]
+    assert all_types[-1] == "answer", f"再購読後に完走していない: {all_types}"
+    assert all_types.count("answer") == 1, f"answer が重複配信された: {all_types}"
+    _wait_turn_done(tid)
+
+
+def test_completed_turn_stream_replays_all_and_ends():
+    """完了済みターンへの購読は残イベントを replay してそのまま終了する（新規に増えない）。"""
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "こんにちは", "world": V, "knowledge": False})
+    tid = r.json()["turn_id"]
+    _wait_turn_done(tid)
+
+    resp = c.get(f"/chat/turns/{tid}/stream", params={"cursor": 0})
+    assert resp.status_code == 200
+    events = _drain_stream(resp.text)
+    assert events, "完了済みターンの replay が空だった"
+    assert events[-1]["type"] == "answer"
+
+    # cursor をイベント総数に合わせて再購読すると、新規イベントは無く即終了する（空 body）。
+    resp2 = c.get(f"/chat/turns/{tid}/stream", params={"cursor": len(events)})
+    assert resp2.status_code == 200
+    assert _drain_stream(resp2.text) == []
+
+
+# ===== 停止（turn_id 宛て・既存 stop_event 機構の流用） =====
+
+def test_turn_stop_via_turn_id_skips_assistant_save_and_yields_stopped(monkeypatch):
+    """POST /chat/turns/{turn_id}/stop は既存 stream_message(stop_event=...) と同じ意味論
+    （assistant は保存されない・stopped で終わる）を turn_id 宛てに提供する。"""
+    from sherpa import chat_service
+    monkeypatch.setattr(chat_service, "emit_pace", lambda: 0.15)
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True})
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+
+    sr = c.post(f"/chat/turns/{tid}/stop")
+    assert sr.json() == {"ok": True}
+
+    resp = c.get(f"/chat/turns/{tid}/stream", params={"cursor": 0})
+    events = _drain_stream(resp.text)
+    assert events, "停止ターンからイベントを受け取れなかった"
+    assert events[-1]["type"] == "stopped", f"stopped で終わっていない: {[e['type'] for e in events]}"
+
+    conv = c.get(f"/conversations/{cid}").json()
+    roles = [m["role"] for m in conv["messages"]]
+    assert roles == ["user"], f"assistant が保存されている（停止なのに完走扱い）: {roles}"
+
+
+def test_turn_stop_unknown_id_returns_ok_false():
+    c = _client()
+    r = c.post("/chat/turns/no-such-turn-id/stop")
+    assert r.status_code == 200
+    assert r.json() == {"ok": False}
+
+
+# ===== 他人の turn 購読・停止拒否 =====
+
+def test_turn_stream_and_stop_reject_other_users_turn():
+    """他人の turn_id は購読（404・/conversations と同じ「存在有無を教えない」流儀）も
+    停止（{"ok": false}・既存 /chat/stream/stop と同じ流儀）もできない。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+
+    def _blocking_run(stop_event, emit):
+        emit({"type": "node", "id": "x", "kind": "think", "label": "x", "detail": "x", "status": "done"})
+        gate.wait(timeout=5)
+
+    rec = _start("someone-else", 555001, _blocking_run)
+    try:
+        c = _client()   # compat モード = admin としてリクエストする
+        r = c.get(f"/chat/turns/{rec.turn_id}/stream", params={"cursor": 0})
+        assert r.status_code == 404
+
+        # 他人のターンの停止: 一般利用者は不可・管理者は可（実行を時間で打ち切らないため、固まった
+        # ターンを枠から解放できる主体が管理者にも要る）。compat モードの client は admin なので
+        # 一般利用者の判定は chat_turns.stop_turn を直接呼んで固定する。
+        assert chat_turns.stop_turn(rec.turn_id, "another-plain-user") is False
+        assert not rec.stop_event.is_set(), "他人のターンなのに停止イベントが立ってしまった"
+        # 管理者は all=true で全員分（uid 付き）を見て turn_id を知り、停止できる。
+        lr = c.get("/chat/turns/running", params={"all": "true"}).json()["turns"]
+        assert any(t["turn_id"] == rec.turn_id and t["uid"] == "someone-else" for t in lr)
+        # 既定（本人分）では他人のターンは出ず、uid は値を持たない。
+        mine = c.get("/chat/turns/running").json()["turns"]
+        assert all(t["turn_id"] != rec.turn_id and t.get("uid") is None for t in mine)
+        sr = c.post(f"/chat/turns/{rec.turn_id}/stop")
+        assert sr.json() == {"ok": True}
+        assert rec.stop_event.is_set(), "管理者の停止が効いていない"
+    finally:
+        gate.set()
+        _wait_turn_done(rec.turn_id)
+
+
+# ===== GET /chat/turns/running（トップバー表示・再接続の両方が使う） =====
+
+def test_running_turns_endpoint_reflects_lifecycle(monkeypatch):
+    """開始直後は running 一覧に turn_id が出て、完了後は消える。"""
+    from sherpa import chat_service
+    monkeypatch.setattr(chat_service, "emit_pace", lambda: 0.15)
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "消費税率を変えたい。影響は？", "world": V, "knowledge": True})
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+
+    running = c.get("/chat/turns/running").json()["turns"]
+    hit = next((t for t in running if t["turn_id"] == tid), None)
+    assert hit is not None, "開始直後は running 一覧に出るはず"
+    assert hit["conversation_id"] == cid
+    assert hit.get("started_at")
+
+    _wait_turn_done(tid, timeout=10)
+    running2 = c.get("/chat/turns/running").json()["turns"]
+    assert not any(t["turn_id"] == tid for t in running2), "完了後も running 一覧に残っている"
+
+
+def test_running_turns_endpoint_is_scoped_to_current_user():
+    """他人のターンは自分の running 一覧に出ない。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    rec = _start("someone-else-2", 555002, _blocking_run)
+    try:
+        c = _client()
+        running = c.get("/chat/turns/running").json()["turns"]
+        assert not any(t["turn_id"] == rec.turn_id for t in running)
+    finally:
+        gate.set()
+        _wait_turn_done(rec.turn_id)
+
+
+# ===== 同時実行上限（1ユーザー2・全体8） =====
+
+def test_start_turn_enforces_per_user_limit():
+    """chat_turns.start_turn は同一 uid の未完了ターンが MAX_TURNS_PER_USER に達すると
+    TurnLimitError(scope='user') を送出する（レジストリの数え方そのものを直接確認する）。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+    recs = []
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    try:
+        for i in range(chat_turns.MAX_TURNS_PER_USER):
+            recs.append(_start("limituser-a", 600 + i, _blocking_run))
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            _start("limituser-a", 699, _blocking_run)
+        assert ei.value.scope == "user"
+        # 別ユーザーは影響を受けない。
+        other = _start("limituser-b", 698, _blocking_run)
+        recs.append(other)
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+def test_start_turn_enforces_global_limit():
+    """全体の未完了ターン数が MAX_TURNS_GLOBAL に達すると、別ユーザーでも TurnLimitError(scope='global')。
+
+    他ファイル/他テストの残留ターンに影響されないよう、開始時点の未完了数を実測してから
+    不足分だけ埋める（決め打ちで「今 0 件のはず」とは仮定しない）。
+    """
+    from sherpa import chat_turns
+    gate = threading.Event()
+    recs = []
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=10)
+
+    try:
+        with chat_turns._REGISTRY_LOCK:
+            current = sum(1 for r in chat_turns._REGISTRY.values() if not r.buffer.done)
+        need = chat_turns.MAX_TURNS_GLOBAL - current
+        assert need >= 1, "既に全体上限に達した状態でテストを開始できない（残留ターンを確認）"
+        for i in range(need):
+            recs.append(_start(f"globallimituser{i}", 700 + i, _blocking_run))
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            _start("yet-another-user", 799, _blocking_run)
+        assert ei.value.scope == "global"
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+def test_start_turn_rejects_same_known_conversation_id_while_unfinished():
+    """既存会話への継続（`known_conversation_id` 明示）だけを対象に、同じ conversation_id の
+    未完了ターンが既にあれば TurnLimitError(scope='conversation')。別会話・新規会話
+    （known_conversation_id 省略）は対象外のまま受け付ける。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+    recs = []
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    try:
+        cid = 9001
+        rec1 = chat_turns.start_turn(
+            uid="convlimit-u1", conversation_factory=lambda: cid,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        recs.append(rec1)
+
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            chat_turns.start_turn(
+                uid="convlimit-u1", conversation_factory=lambda: cid,
+                run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        assert ei.value.scope == "conversation"
+
+        # 別会話（別 conversation_id）は影響を受けない。
+        other_cid = 9002
+        rec2 = chat_turns.start_turn(
+            uid="convlimit-u1", conversation_factory=lambda: other_cid,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=other_cid)
+        recs.append(rec2)
+
+        # 新規会話（known_conversation_id 省略）は同じ conversation_id が未完了でも対象外
+        # （uid は別にして、per-user 上限との干渉を避ける＝本テストの関心はあくまで会話単位判定）。
+        rec3 = chat_turns.start_turn(
+            uid="convlimit-u2", conversation_factory=lambda: cid,
+            run_fn_factory=lambda c: _blocking_run)
+        recs.append(rec3)
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+def test_start_turn_reserves_known_conversation_id_before_factory_completes():
+    """既存会話への継続は `conversation_factory()` の完了を待たず、予約レコード作成時点で
+    `conversation_id` を確定させる——確定が factory 完了後（None のまま）だと、factory 実行中に
+    同じ会話への2本目が会話単位の排他をすり抜けてしまう。"""
+    from sherpa import chat_turns
+    cid = 31001
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+
+    def _slow_factory():
+        factory_started.set()
+        release_factory.wait(timeout=5)
+        return cid
+
+    def _blocking_run(stop_event, emit):
+        pass
+
+    result: dict = {}
+
+    def _drive_first():
+        result["rec"] = chat_turns.start_turn(
+            uid="race-u1", conversation_factory=_slow_factory,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+
+    th = threading.Thread(target=_drive_first, daemon=True)
+    th.start()
+    try:
+        assert factory_started.wait(timeout=5), "1本目の factory が開始しなかった（テスト前提が崩れている）"
+
+        # 1本目の conversation_factory() がまだ完了していない間に、同じ会話へ2本目を試みる。
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            chat_turns.start_turn(
+                uid="race-u2", conversation_factory=lambda: cid,
+                run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        assert ei.value.scope == "conversation", (
+            "factory 実行中（conversation_id が未確定のはずの窓）でも同じ会話の2本目は"
+            "拒否されるべき"
+        )
+    finally:
+        release_factory.set()
+        th.join(timeout=5)
+        _wait_turn_done(result["rec"].turn_id)
+
+
+def test_conversation_scope_check_takes_priority_over_user_limit_when_both_apply(monkeypatch):
+    """ユーザー上限にも同時に達している場合でも、同一会話への2本目は scope='user' ではなく
+    scope='conversation' になる（会話単位の排他を集約上限より先に判定する）。"""
+    from sherpa import chat_turns
+    monkeypatch.setattr(chat_turns, "effective_limits", lambda: (1, 100))
+    gate = threading.Event()
+    recs = []
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    try:
+        cid = 32001
+        recs.append(chat_turns.start_turn(
+            uid="priority-u1", conversation_factory=lambda: cid,
+            run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid))
+
+        with pytest.raises(chat_turns.TurnLimitError) as ei:
+            chat_turns.start_turn(
+                uid="priority-u1", conversation_factory=lambda: cid,
+                run_fn_factory=lambda c: _blocking_run, known_conversation_id=cid)
+        assert ei.value.scope == "conversation", (
+            f"ユーザー上限（1）にも達しているが、会話排他が優先されるべき: {ei.value.scope!r}")
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+def test_chat_turns_start_returns_429_when_limit_exceeded(monkeypatch):
+    """POST /chat/turns は chat_turns.TurnLimitError を 429 に変換する（HTTP 層の配線確認）。"""
+    from sherpa import chat_turns
+
+    def _raise(*a, **k):
+        raise chat_turns.TurnLimitError("user")
+
+    monkeypatch.setattr(chat_turns, "start_turn", _raise)
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": False})
+    assert r.status_code == 429
+
+
+def test_chat_turns_start_returns_429_with_conversation_message_when_conversation_busy(monkeypatch):
+    """POST /chat/turns は TurnLimitError(scope='conversation') を 429＋会話継続専用の文言に
+    変換する（uid/global 上限と同じ 429 だが文言で区別する）。"""
+    from sherpa import chat_turns
+
+    def _raise(*a, **k):
+        raise chat_turns.TurnLimitError("conversation")
+
+    monkeypatch.setattr(chat_turns, "start_turn", _raise)
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": False})
+    assert r.status_code == 429
+    assert "この会話の別の回答を実行中です" in r.json()["detail"]
+
+
+def test_chat_turns_start_429_when_admin_already_at_user_limit():
+    """実際に admin（compat モードの合成ユーザー）が上限まで実行中のとき、本物の HTTP エンドポイントも
+    429 を返す（レジストリ状態と HTTP 層の両方を通した end-to-end 確認）。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    recs = [_start("admin", 800 + i, _blocking_run) for i in range(chat_turns.MAX_TURNS_PER_USER)]
+    try:
+        c = _client()   # compat モード = admin
+        r = c.post("/chat/turns", json={"message": "x", "world": V, "knowledge": False})
+        assert r.status_code == 429
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+def test_chat_turns_start_429_does_not_create_orphaned_conversation():
+    """MEDIUM（Codex RV）: 予約方式（`chat_turns.start_turn` が lock 内で上限判定＋枠登録を atomic に
+    行い、conversation_factory は lock の外＝予約成功後にしか呼ばれない）により、429（上限超過）は
+    会話を確定させる前に弾かれる＝空メッセージの会話が残らない。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+
+    def _blocking_run(stop_event, emit):
+        gate.wait(timeout=5)
+
+    recs = [_start("admin", 820 + i, _blocking_run) for i in range(chat_turns.MAX_TURNS_PER_USER)]
+    try:
+        c = _client()
+        before = len(c.get("/conversations").json())
+        r = c.post("/chat/turns", json={"message": "orphan-check-unique-message", "world": V, "knowledge": False})
+        assert r.status_code == 429
+        after = len(c.get("/conversations").json())
+        assert after == before, "429 で弾かれたのに会話が作られている（空会話が残る副作用）"
+    finally:
+        gate.set()
+        for rec in recs:
+            _wait_turn_done(rec.turn_id)
+
+
+# ===== TIMEOUT-1: 経過時間だけでは終了しない（旧 reaper 撤去）・停止は stop_turn 経由のみ =====
+
+def test_no_time_based_termination_and_stop_turn_frees_slot():
+    """調査全体を経過時間だけで終了させない契約（TIMEOUT-1）——`started_at` を過去へ大きく倒して
+    （制御した時計）レジストリへ触れて（sweep が走る）も、`stop_event` は立たず `buffer.done` にも
+    ならない（旧 reaper の MAX_TURN_SECONDS／FORCE_DONE_GRACE_SECONDS は撤去済み・復活していないこと
+    のコードでの保証）。終了は利用者の明示停止（`stop_turn`）を run_fn 自身が検知して終える経路
+    だけで、枠の解放（`buffer.done`）は `_run()` の finally が呼ぶ `mark_done()` が行う。"""
+    from datetime import datetime, timedelta, timezone
+
+    from sherpa import chat_turns
+    stop_seen = threading.Event()
+
+    def _run_fn(stop_event, emit):
+        # 通常の provider と同じ流儀（stop_event を検知したら終える）。「固まった」provider
+        # （stop_event を一切見ない）は本テストの対象外＝旧 reaper 前提の別契約だった。
+        if stop_event.wait(timeout=15):
+            stop_seen.set()
+
+    uid = "no-reaper-test-user"
+    rec = _start(uid, 900101, _run_fn)
+    try:
+        rec.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        chat_turns.list_running(uid)   # レジストリに触れる＝sweep が走る
+        assert not rec.stop_event.is_set(), "経過時間だけで stop_event が立っている（reaper が復活していないか）"
+        assert not rec.buffer.done, "経過時間だけで強制終了されている（reaper が復活していないか）"
+
+        assert chat_turns.stop_turn(rec.turn_id, uid) is True
+        _wait_turn_done(rec.turn_id, timeout=5)
+        assert stop_seen.is_set(), "run_fn が stop_event を検知していない"
+        assert rec.buffer.done, "stop_turn 後に枠（buffer.done）が解放されていない"
+    finally:
+        rec.stop_event.set()
+        _wait_turn_done(rec.turn_id, timeout=5)
+
+
+# ===== HIGH（Codex RV）: background thread の例外時も best-effort で永続する =====
+
+def test_turn_crash_persists_user_and_assistant_error_message(monkeypatch):
+    """background thread が stream_message 呼び出し自体で例外を投げても、(a) このターンの user
+    メッセージが補完され、(b) assistant にエラーの最小 envelope が保存される（POST /chat/turns は
+    conversation_id を返したのに会話が空、という事故を防ぐ）。chat_turns 側の枠解放（error イベント＋
+    mark_done）も従来どおり動くことも併せて確認する。"""
+    from sherpa import store
+    from sherpa.routers import chat as chat_routes
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom-for-test")
+
+    # ハンドラ（POST /chat/turns の背景実行）は sherpa/routers/chat.py 内で解決された stream_message
+    # を参照する（フェーズ3スライス7で router へ移動・api.stream_message はもう存在しない束縛）。
+    monkeypatch.setattr(chat_routes, "stream_message", _boom)
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "crash-check-unique", "world": V, "knowledge": False})
+    assert r.status_code == 200
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+    _wait_turn_done(tid)
+
+    conv = c.get(f"/conversations/{cid}").json()
+    roles = [m["role"] for m in conv["messages"]]
+    assert roles == ["user", "assistant"], f"クラッシュ時に user/assistant が永続されていない: {roles}"
+    assert conv["messages"][0]["content"] == "crash-check-unique"
+    assert "エラー" in conv["messages"][1]["content"]
+
+    resp = c.get(f"/chat/turns/{tid}/stream", params={"cursor": 0})
+    events = _drain_stream(resp.text)
+    assert events and events[-1]["type"] == "error", f"error イベントで枠解放されていない: {events}"
+
+    rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
+    assert rows, "クラッシュ時の chat.turn 監査が記録されていない"
+    assert rows[0]["outcome"] == "error"
+
+
+# ===== MEDIUM（Codex RV）: SSE 購読の切断検知（keepalive） =====
+
+def test_iter_sse_yields_keepalive_when_no_progress():
+    """新規イベントも完了も無いまま wait がタイムアウトすると keepalive コメント行を yield する
+    （クライアント切断後もこの generator が居座り続けないための安全弁）。"""
+    from sherpa import chat_turns
+    gate = threading.Event()
+
+    def _blocking_run(stop_event, emit):
+        emit({"type": "node", "id": "x", "kind": "think", "label": "x", "detail": "x", "status": "done"})
+        gate.wait(timeout=5)
+
+    rec = _start("keepalive-user", 900301, _blocking_run)
+    try:
+        gen = chat_turns.iter_sse(rec.turn_id, "keepalive-user", cursor=0, wait_timeout=0.05)
+        assert gen is not None
+        first = next(gen)
+        assert first.startswith("data: "), f"最初のイベントが data: で始まらない: {first!r}"
+        second = next(gen)
+        assert second == ": keepalive\n\n", f"keepalive が来ていない: {second!r}"
+        third = next(gen)
+        assert third == ": keepalive\n\n", f"keepalive が継続して来ない: {third!r}"
+    finally:
+        gate.set()
+        _wait_turn_done(rec.turn_id)
+
+
+def test_persist_turn_crash_sets_personal_flag_when_user_row_not_yet_saved():
+    """personal ターンのクラッシュ永続は、`saved_user_id` が無い（＝ user 行をまだ一度も
+    保存していない・on_user_saved 発火前にクラッシュした）場合でも会話フラグ
+    contains_personal_workspace を立てる（受領共有は会話フラグだけでブロックするため、
+    立てないと共有先に personal な質問文が見え得る）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-personal-flag")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "personal-q", "admin", V, True, RuntimeError("boom"))
+
+    got = store.get_conversation_for_read("admin", cid)
+    assert got["conversation"]["contains_personal_workspace"] is True, \
+        "personal クラッシュ後に会話フラグが立っていない（共有ブロックが効かない）"
+    roles = [m["role"] for m in got["messages"]]
+    assert roles == ["user", "assistant"]
+    msgs = store.get_conversation(cid)["messages"]   # get_conversation_for_read は personal 列を返さない
+    assert msgs[1]["personal"] is True
+
+
+def test_persist_turn_crash_sets_stop_kind_timeout_for_timeout_error():
+    """STAT-3 T3: `TimeoutError` で落ちたクラッシュ永続は `answer.stop_kind == "timeout"`
+    （型だけで判定・メッセージ本文は見ない・`stop_kind.from_exception` 参照）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-stop-kind-timeout")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "timeout-q", "admin", V, False, TimeoutError("deadline exceeded"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["answer"]["stop_kind"] == "timeout"
+
+
+def test_persist_turn_crash_sets_stop_kind_transport_error_for_os_error():
+    """STAT-3 T3: `OSError`（接続断等）は `stop_kind == "transport_error"`。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-stop-kind-transport")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "transport-q", "admin", V, False, ConnectionResetError("reset"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["answer"]["stop_kind"] == "transport_error"
+
+
+def test_persist_turn_crash_leaves_stop_kind_unset_for_other_exceptions():
+    """STAT-3 T3: timeout/transport_error のいずれでもない例外（`RuntimeError` 等）は
+    `stop_kind` を立てない（NULL のまま＝利用統計側で 'unknown' に畳み込む契約）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-stop-kind-unset")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "other-q", "admin", V, False, RuntimeError("boom"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert "stop_kind" not in assistant["answer"]
+
+
+def test_persist_turn_crash_stores_decided_lens_when_knowledge_on():
+    """`knowledge=True`（ナレッジ参照ターン）でクラッシュした場合、決定済みの lens
+    （調べ方の明示指定・例えば "qa"）で保存される（`lens="chat"` 固定だと `knowledge_turns`／
+    zero-hit の分母から漏れる・`sherpa/store/usage.py` の集計契約）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-knowledge-qa")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "qa-lens-q", "admin", V, False, RuntimeError("boom"),
+                            knowledge=True, lens="qa")
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "qa"
+    assert assistant["answer"]["lens"] == "qa"
+
+
+def test_persist_turn_crash_stores_none_lens_when_knowledge_on_but_undecided():
+    """`knowledge=True` でも lens が未決定（自動判定に入る前でクラッシュ・`lens=None`）
+    なら、"chat" で偽装せず `None` のまま保存する（意図判定前という正確な欠落を許容する）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-knowledge-none")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "auto-lens-q", "admin", V, False, RuntimeError("boom"),
+                            knowledge=True, lens=None)
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] is None
+    assert assistant["answer"]["lens"] is None
+
+
+def test_persist_turn_crash_keeps_chat_lens_when_knowledge_off():
+    """`knowledge=False`（ナレッジ参照なし＝素の会話）は "chat" が実際に正しい値のまま
+    （回帰確認・`lens` 引数が渡っていても knowledge オフの経路では使わない）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-knowledge-off")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "chat-lens-q", "admin", V, False, RuntimeError("boom"),
+                            knowledge=False, lens="qa")
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "chat"
+
+
+def test_persist_turn_crash_defaults_to_chat_lens_when_knowledge_kwargs_omitted():
+    """呼び出し側が `knowledge`/`lens` を渡さない既存呼び出し（このファイルの他のテスト・
+    将来の直接呼び出し）は従来どおり "chat" になる（既定値の後方互換）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-lens-defaults")
+    cid = conv["id"]
+
+    api._persist_turn_crash(cid, "default-lens-q", "admin", V, False, RuntimeError("boom"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "chat"
+
+
+def test_turn_crash_via_background_run_stores_decided_lens_not_chat(monkeypatch):
+    """`POST /chat/turns`（`_turn_run_fn.make_run` 経由の実背景実行）で、`with
+    neo4j_session() as s:` 自体がナレッジ参照ターン中に例外を投げても、保存される assistant 行の
+    lens は明示指定した "qa"（`req.lens`）のまま——`_turn_run_fn.make_run` のクロージャから
+    `_persist_turn_crash` へ実際に `knowledge`/`lens` が配線されていることを確認する。"""
+    from sherpa import store
+    from sherpa.routers import chat as chat_routes
+
+    def _boom_neo4j(*a, **k):
+        raise RuntimeError("boom-neo4j-session")
+    monkeypatch.setattr(chat_routes, "neo4j_session", _boom_neo4j)
+
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "crash-lens-qa-bg-unique", "world": V,
+                                    "knowledge": True, "lens": "qa"})
+    assert r.status_code == 200, r.text
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+    _wait_turn_done(tid)
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] == "qa", f"決定済み lens で保存されていない: {assistant['lens']!r}"
+
+
+def test_turn_crash_via_background_run_stores_none_lens_when_undecided(monkeypatch):
+    """`lens` を明示指定せず（自動判定＝`req.lens is None`）ナレッジ参照ターンが
+    `neo4j_session()` 自体で落ちた場合、保存される assistant 行の lens は "chat" ではなく
+    `None`（自動判定はこの関数から見えない位置で確定するため、意図判定前を正直に表す）。"""
+    from sherpa import store
+    from sherpa.routers import chat as chat_routes
+
+    def _boom_neo4j(*a, **k):
+        raise RuntimeError("boom-neo4j-session-auto")
+    monkeypatch.setattr(chat_routes, "neo4j_session", _boom_neo4j)
+
+    ensure_v1()
+    c = _client()
+    r = c.post("/chat/turns", json={"message": "crash-lens-auto-bg-unique", "world": V,
+                                    "knowledge": True})
+    assert r.status_code == 200, r.text
+    tid, cid = r.json()["turn_id"], r.json()["conversation_id"]
+    _wait_turn_done(tid)
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant = next(m for m in msgs if m["role"] == "assistant")
+    assert assistant["lens"] is None, f"意図判定前なのに lens が埋まっている: {assistant['lens']!r}"
+
+
+def test_persist_turn_crash_without_saved_user_id_ignores_stale_same_text_turn():
+    """`saved_user_id` が無い（`stream_message` が user 行保存**前**にクラッシュした＝
+    on_user_saved が一度も呼ばれなかった）場合、この run は user 行を保存していないことが
+    確定しているため、過去の**別ターン**に同文の user 行があっても本文検索はせず常に
+    新規保存する（本文一致で誤って別ターンの行・personal 値に対応付けない）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-no-callback-stale-row")
+    cid = conv["id"]
+    same_text = "同文の質問（コールバック前クラッシュ）"
+    stale_user = store.add_message(cid, "user", same_text, personal=False)
+
+    api._persist_turn_crash(cid, same_text, "admin", V, True, RuntimeError("boom"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    user_rows = [m for m in msgs if m["role"] == "user"]
+    assert len(user_rows) == 2, f"新規保存されず、古い行を再利用した: {user_rows}"
+    new_user = next(m for m in user_rows if m["id"] != stale_user["id"])
+    assert new_user["personal"] is True
+    assistant_rows = [m for m in msgs if m["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["personal"] is True
+
+    audit_rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
+    assert audit_rows
+    assert audit_rows[0]["detail"]["message_id_user"] == new_user["id"]
+    assert audit_rows[0]["detail"]["message_id_user"] != stale_user["id"]
+
+
+def test_persist_turn_crash_early_returns_without_assistant_or_audit_when_user_save_fails(monkeypatch):
+    """user 行の保存自体（`saved_user_id` が無い場合の新規保存）が失敗したら、assistant 行・
+    監査のどちらも作らずに終わる（ID が確定しないまま作ると、後から別ターンの行に誤って
+    紐付ける余地を残すより「何も残さない」方が安全）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-user-save-fails")
+    cid = conv["id"]
+
+    real_add_message = store.add_message
+
+    def _boom_on_user(conversation_id, role, *a, **kw):
+        if role == "user":
+            raise RuntimeError("db write failed")
+        return real_add_message(conversation_id, role, *a, **kw)
+    monkeypatch.setattr(store, "add_message", _boom_on_user)
+
+    api._persist_turn_crash(cid, "some-question", "admin", V, False, RuntimeError("boom"))
+
+    msgs = store.get_conversation(cid)["messages"]
+    assert msgs == [], f"user 保存失敗にもかかわらず何か残ってしまった: {msgs}"
+    audit_rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
+    assert audit_rows == [], "user 保存失敗時に監査行が残ってしまった"
+
+
+def test_persist_turn_crash_same_text_concurrent_turns_uses_carried_id_not_content_match():
+    """同一利用者が同文で2ターンを並走させ、B（非 personal）→A（personal）の順で user 行が
+    保存された後に A がクラッシュした場合、`saved_user_id`（stream_message の on_user_saved
+    コールバックで A のターン自身が直接受け取った値という想定）を渡せば、B の行
+    （id が小さい方＝先に保存された行）を誤って対応付けない。A 専用の復旧行が A の user 行
+    id・personal=True になる（`on_user_saved` を経由しない直接呼び出しでこの契約を補助的に
+    固定する・本物の callback を通す経路は
+    `test_persist_turn_crash_via_real_stream_message_callback_ignores_stale_same_text_turn`
+    が担う）。"""
+    from sherpa import api, store
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-same-text-concurrent")
+    cid = conv["id"]
+    b_user = store.add_message(cid, "user", "同文の質問", personal=False)   # ターンB（非personal）が先に保存
+    a_user = store.add_message(cid, "user", "同文の質問", personal=True)    # ターンA（personal）が後に保存
+
+    api._persist_turn_crash(cid, "同文の質問", "admin", V, True, RuntimeError("boom"),
+                            saved_user_id=a_user["id"], saved_user_personal=True)
+
+    msgs = store.get_conversation(cid)["messages"]
+    user_rows = [m for m in msgs if m["role"] == "user"]
+    assert len(user_rows) == 2, f"新たな user 行が追加されてしまった: {user_rows}"
+    assistant_rows = [m for m in msgs if m["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["personal"] is True, "A（personal）の復旧が B の非personalに引きずられた"
+
+    audit_rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
+    assert audit_rows
+    assert audit_rows[0]["detail"]["message_id_user"] == a_user["id"]
+    assert audit_rows[0]["detail"]["message_id_user"] != b_user["id"]
+
+
+def test_persist_turn_crash_via_real_stream_message_callback_ignores_stale_same_text_turn(monkeypatch):
+    """`chat_service.stream_message` を実際に呼び、`on_user_saved` が本物のコールバックとして
+    機能することを確認する。callback 発火後（＝ user 行を実際に保存した後）にクラッシュしても、
+    過去の別ターンに同文の非 personal な user 行があれば、callback が渡した実 id を使い、
+    その別ターンの行に誤って対応付けない。"""
+    from sherpa import chat_service, store
+    from sherpa.routers import chat as chat_routes
+
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-real-callback")
+    cid = conv["id"]
+    same_text = "同文の質問（実callback経路）"
+    stale_user = store.add_message(cid, "user", same_text, personal=False)
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom-after-user-saved")
+    monkeypatch.setattr(store, "get_settings", _boom)   # user 行保存の直後に呼ばれる箇所でクラッシュさせる
+
+    saved: dict = {}
+
+    def _on_user_saved(message_id, is_personal):
+        saved["id"] = message_id
+        saved["personal"] = is_personal
+
+    caught = None
+    try:
+        for _ in chat_service.stream_message(None, same_text, V, conversation_id=cid,
+                                             knowledge=False, user_id="admin", personal=True,
+                                             on_user_saved=_on_user_saved):
+            pass
+    except Exception as e:
+        caught = e
+    assert caught is not None, "get_settings のクラッシュが伝播していない"
+    assert saved.get("id") is not None, "on_user_saved が呼ばれていない（本物の callback が発火しなかった）"
+    assert saved["id"] != stale_user["id"]
+    assert saved["personal"] is True
+
+    chat_routes._persist_turn_crash(cid, same_text, "admin", V, True, caught,
+                                    saved_user_id=saved["id"], saved_user_personal=saved["personal"])
+
+    msgs = store.get_conversation(cid)["messages"]
+    assistant_rows = [m for m in msgs if m["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["personal"] is True
+
+    audit_rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
+    assert audit_rows
+    assert audit_rows[0]["detail"]["message_id_user"] == saved["id"]
+    assert audit_rows[0]["detail"]["message_id_user"] != stale_user["id"]
+
+
+def test_turn_crash_via_background_run_ignores_stale_same_text_turn(monkeypatch):
+    """バックグラウンド run（`POST /chat/turns` の実背景実行）経由でクラッシュした場合も、
+    `on_user_saved` で直接受け取った id を使い、同じ会話内の過去の別ターンの同文行に
+    誤って対応付けない（`_turn_run_fn.make_run` から `stream_message` までの配線を丸ごと通す）。"""
+    from sherpa import store
+
+    conv = store.create_conversation(user_id="admin", world=V, title="crash-bg-stale-row")
+    cid = conv["id"]
+    same_text = "同文の質問（バックグラウンドrun経由）"
+    stale_user = store.add_message(cid, "user", same_text, personal=False)
+
+    # `_prepare_agentic_snapshot`（受付段階・routers/chat.py）も `store.get_settings` を
+    # 一度だけ読む——ここを無条件に失敗させると受付自体が 500 で止まり、この試験が狙う
+    # 「バックグラウンド run 側で（on_user_saved 後に）クラッシュする」状況を作れない。
+    # 1回目（受付）は成功させ、2回目以降（`stream_message` 内・user 行保存後の読み取り）から
+    # 失敗させる。
+    calls = {"n": 0}
+
+    def _boom_from_second_call(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return store_get_settings_orig(*a, **k)
+        raise RuntimeError("boom-after-user-saved-bg")
+    store_get_settings_orig = store.get_settings
+    monkeypatch.setattr(store, "get_settings", _boom_from_second_call)
+
+    c = _client()
+    r = c.post("/chat/turns", json={"message": same_text, "world": V, "knowledge": False,
+                                    "conversation_id": cid, "personal": True})
+    assert r.status_code == 200, r.text
+    tid = r.json()["turn_id"]
+    _wait_turn_done(tid)
+
+    msgs = store.get_conversation(cid)["messages"]
+    user_rows = [m for m in msgs if m["role"] == "user"]
+    assert len(user_rows) == 2, f"新規保存されず、古い行を再利用した: {user_rows}"
+    new_user = next(m for m in user_rows if m["id"] != stale_user["id"])
+    assert new_user["personal"] is True
+    assistant_rows = [m for m in msgs if m["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["personal"] is True
+
+    audit_rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
+    assert audit_rows
+    assert audit_rows[0]["detail"]["message_id_user"] == new_user["id"]
+    assert audit_rows[0]["detail"]["message_id_user"] != stale_user["id"]

@@ -1,0 +1,18 @@
+{
+  "schema": "sherpa-ocr-observations-v1",
+  "metadata": {
+    "engine": "nvidia-nemotron-parse-2.0",
+    "model_revision": "PIN_A_COMMIT_SHA_ON_DGX",
+    "runtime": "PIN_RUNTIME_AND_VERSION",
+    "device": "DGX_SPARK_GPU",
+    "prompt": "PIN_PROMPT_OR_NULL",
+    "preprocessing": "original_png_or_documented_transform",
+    "model_artifact_sha256": "RECORD_AFTER_DOWNLOAD"
+  },
+  "cases": {
+    "office_screen": {"elapsed_seconds": 0, "observations": []},
+    "scan_pdf": {"elapsed_seconds": 0, "observations": []},
+    "hybrid_pdf": {"elapsed_seconds": 0, "observations": []},
+    "deprecated_stamp": {"elapsed_seconds": 0, "observations": []}
+  }
+}

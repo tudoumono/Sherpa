@@ -1,0 +1,103 @@
+/* @theme sherpa */
+/*
+ * Sherpa スライドテーマ — 柔らかく落ち着いたトーン（web/app.css の配色に準拠）。
+ * teal アクセント1色＋白背景＋広めの余白。凝りすぎず保守しやすい最小スタイル。
+ * 日本語は Noto Sans CJK JP → IPAGothic の順でフォールバック（フォント未導入でも文字化けしない）。
+ */
+@import 'default';
+
+:root {
+  --sherpa-accent: #0d9488;      /* teal（app.css --accent） */
+  --sherpa-accent-ink: #0f766e;  /* 濃いteal（--accent-ink） */
+  --sherpa-ink: #1f2937;         /* 本文（--ink） */
+  --sherpa-ink-2: #5b6573;       /* 補助テキスト（--ink-2） */
+  --sherpa-border: #e3e6ea;      /* 罫線（--border） */
+  --sherpa-surface-2: #f1f3f5;   /* 薄い面（--surface-2） */
+  --sherpa-bg: #ffffff;          /* スライド背景（白） */
+}
+
+section {
+  font-family: 'Noto Sans CJK JP', 'IPAGothic', 'Hiragino Kaku Gothic ProN',
+               'Yu Gothic UI', Meiryo, sans-serif;
+  background: var(--sherpa-bg);
+  color: var(--sherpa-ink);
+  font-size: 28px;
+  line-height: 1.6;
+  padding: 70px 80px;             /* 広めの余白 */
+}
+
+h1, h2, h3 {
+  color: var(--sherpa-accent-ink);
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+/* h1＝表紙タイトル。アクセントの下線で締める。 */
+h1 {
+  font-size: 52px;
+  border-bottom: 4px solid var(--sherpa-accent);
+  padding-bottom: 0.25em;
+  margin-bottom: 0.4em;
+}
+
+h2 {
+  font-size: 38px;
+  border-left: 8px solid var(--sherpa-accent);
+  padding-left: 0.4em;
+  margin-bottom: 0.6em;
+}
+
+h3 { font-size: 30px; }
+
+strong { color: var(--sherpa-accent-ink); font-weight: 700; }
+a { color: var(--sherpa-accent-ink); }
+
+ul, ol { margin: 0.2em 0; }
+li { margin: 0.35em 0; }
+
+/* 表：ヘッダ行を薄いアクセント面に、行区切りは細い罫線。 */
+table {
+  border-collapse: collapse;
+  font-size: 24px;
+  margin: 0.4em 0;
+}
+th, td {
+  border: 1px solid var(--sherpa-border);
+  padding: 8px 14px;
+  text-align: left;
+}
+th {
+  background: var(--sherpa-surface-2);
+  color: var(--sherpa-ink-2);
+  font-weight: 600;
+}
+
+/* コード：薄い面＋等幅。 */
+code {
+  background: var(--sherpa-surface-2);
+  color: var(--sherpa-accent-ink);
+  border-radius: 5px;
+  padding: 0.1em 0.4em;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+pre {
+  background: var(--sherpa-surface-2);
+  border: 1px solid var(--sherpa-border);
+  border-radius: 8px;
+  padding: 0.8em 1em;
+}
+pre code { background: transparent; padding: 0; }
+
+blockquote {
+  color: var(--sherpa-ink-2);
+  border-left: 4px solid var(--sherpa-border);
+  padding-left: 0.8em;
+  margin-left: 0;
+}
+
+/* ページ番号：控えめに右下へ。 */
+section::after {
+  color: var(--sherpa-ink-2);
+  font-size: 18px;
+}

@@ -1,0 +1,7 @@
+# Optional isolated OCR worker only. Do not install into the FastAPI/core MD conversion environment.
+-c constraints-ocr.txt
+psycopg[binary]>=3
+Pillow==12.3.0
+pypdfium2==5.11.0
+paddleocr==3.7.0
+paddlepaddle==3.3.0

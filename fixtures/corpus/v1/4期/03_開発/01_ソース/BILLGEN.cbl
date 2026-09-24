@@ -1,0 +1,9 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. BILLGEN.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           COPY INVOICE-CPY.
+           COPY TAX-CPY.
+       PROCEDURE DIVISION.
+           CALL 'TAXCALC'.
+           GOBACK.

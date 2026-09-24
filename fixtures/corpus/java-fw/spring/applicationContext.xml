@@ -1,0 +1,8 @@
+<beans>
+  <bean id="fooA1" class="com.acme.a.Foo"/>
+  <bean id="fooA2" class="com.acme.a.Foo"/>
+  <bean id="orderService" class="com.acme.a.Foo">
+    <property name="timeout" value="30"/>
+  </bean>
+  <alias name="orderService" alias="orderServiceAlias"/>
+</beans>

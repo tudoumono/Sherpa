@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ファイル管理（UI モック）</title>
+<style>
+  :root{
+    --accent:#0d9488;--accent-weak:#ccfbf1;--accent-ink:#0f766e;
+    --bg:#f6f7f9;--surface:#fff;--surface-2:#f1f3f5;--border:#e3e6ea;
+    --ink:#1f2937;--ink-2:#5b6573;--ink-3:#8b95a3;
+    --ok:#16a34a;--ok-bg:#e9f7ef;--warn:#d97706;--warn-bg:#fdf3e7;--danger:#dc2626;
+    --lock:#94a3b8;--radius:12px;--radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+  .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700}
+  .brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#fff}
+  .brand small{font-weight:500;color:var(--ink-3)}
+  .nav{display:flex;gap:4px}
+  .nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;color:var(--ink-2);text-decoration:none}
+  .nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .topbar .spacer{flex:1}
+  .user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+
+  .app{display:grid;grid-template-columns:288px 1fr;height:calc(100vh - 52px)}
+  .tree{border-right:1px solid var(--border);background:var(--surface);overflow:auto;padding:12px}
+  .grouptitle{font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--ink-3);margin:14px 6px 6px}
+  .verbox{display:flex;align-items:center;gap:6px;margin:0 4px 8px;height:32px;padding:0 10px;border:1px solid var(--border);border-radius:999px;background:var(--surface-2);font-size:12.5px;color:var(--ink-2)}
+  .verbox b{color:var(--ink)} .verbox .caret{margin-left:auto;color:var(--ink-3)}
+  .node{display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:7px;cursor:pointer;color:var(--ink-2);font-size:13px}
+  .node:hover{background:var(--surface-2)}
+  .node.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .node .ic{width:16px;text-align:center}
+  .node .lock{margin-left:auto;color:var(--lock);font-size:11px}
+  .node.indent{margin-left:18px}.node.indent2{margin-left:36px}
+  .ttlbadge{margin-left:auto;font-size:10.5px;color:var(--warn);background:var(--warn-bg);padding:1px 6px;border-radius:999px}
+
+  .main{overflow:auto;padding:20px 24px}
+  .crumb{font-size:13px;color:var(--ink-3);margin-bottom:6px}
+  .crumb b{color:var(--ink)}
+  .banner{display:none;align-items:center;gap:9px;padding:10px 13px;border-radius:var(--radius-sm);background:#eef2f7;border:1px solid var(--border);color:var(--ink-2);font-size:12.5px;margin-bottom:14px}
+  .banner.show{display:flex}
+  .banner .lk{color:var(--lock)}
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .h1{font-size:18px;font-weight:700} .toolbar .spacer{flex:1}
+  .btn-primary{height:34px;padding:0 14px;border:none;border-radius:var(--radius-sm);background:var(--accent);color:#fff;font-weight:600;font-size:13px}
+  .btn-primary:disabled{background:var(--surface-2);color:var(--ink-3);cursor:not-allowed}
+  .btn-ghost{height:34px;padding:0 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink-2);font-size:13px}
+
+  .folderview{display:none}.folderview.on{display:block}
+  table.files{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  table.files th{text-align:left;font-size:12px;font-weight:600;color:var(--ink-2);padding:11px 14px;border-bottom:1px solid var(--border);background:var(--surface-2)}
+  table.files td{padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
+  table.files tr:last-child td{border-bottom:none}
+  .fname{display:flex;align-items:center;gap:9px} .fname .fi{color:var(--ink-3)}
+  .status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}
+  .status .d{width:7px;height:7px;border-radius:50%}
+  .status.done{color:var(--ok)} .status.done .d{background:var(--ok)}
+  .status.proc{color:var(--warn)} .status.proc .d{background:var(--warn);animation:pulse 1.2s infinite}
+  .status.na{color:var(--ink-3)} .status.na .d{background:var(--ink-3)}
+  @keyframes pulse{50%{opacity:.35}}
+  .ttl{font-size:12px;color:var(--warn);font-weight:600}
+  .rowact{display:flex;gap:6px;justify-content:flex-end}
+  .iconact{width:30px;height:30px;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--ink-2);display:grid;place-items:center}
+  .iconact.del{color:var(--danger)}
+  .muted{color:var(--ink-3)}
+  .note{margin-top:10px;font-size:12px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav"><a href="chat-impact-analysis.html">チャット</a><a class="on">ファイル管理</a></nav>
+  <div class="spacer"></div>
+  <div class="user">田</div>
+</div>
+
+<div class="app">
+  <!-- フォルダツリー -->
+  <aside class="tree">
+    <div class="grouptitle">共有ナレッジベース（読取専用）</div>
+    <div class="verbox" title="版の選択（FM3）">版 <b>2025冬リリース</b><span class="caret">▾</span></div>
+    <div class="node on" data-folder="uploads-doc" data-ro="1" onclick="sel(this)"><span class="ic">📁</span>uploads / 設計書<span class="lock">🔒</span></div>
+    <div class="node indent" data-folder="uploads-spec" data-ro="1" onclick="sel(this)"><span class="ic">📁</span>仕様<span class="lock">🔒</span></div>
+    <div class="node" data-folder="uploads-copy" data-ro="1" onclick="sel(this)"><span class="ic">📁</span>uploads / src / copy（コピーブック）<span class="lock">🔒</span></div>
+    <div class="node indent" data-folder="uploads-cobol" data-ro="1" onclick="sel(this)"><span class="ic">📁</span>cobol<span class="lock">🔒</span></div>
+    <div class="node indent" data-folder="uploads-jcl" data-ro="1" onclick="sel(this)"><span class="ic">📁</span>jcl<span class="lock">🔒</span></div>
+    <div class="node" data-folder="md" data-ro="1" onclick="sel(this)"><span class="ic">📁</span>md / （MD変換後）<span class="lock">🔒</span></div>
+
+    <div class="grouptitle">個人ワークスペース（書込可）</div>
+    <div class="node" data-folder="ws" data-ro="0" onclick="sel(this)"><span class="ic">📁</span>workspace<span class="ttlbadge">添付2件</span></div>
+    <div class="node indent" data-folder="ws-out" data-ro="0" onclick="sel(this)"><span class="ic">📁</span>outputs（成果物）</div>
+    <div class="node indent" data-folder="ws-tmp" data-ro="0" onclick="sel(this)"><span class="ic">📁</span>tmp</div>
+  </aside>
+
+  <!-- メイン -->
+  <main class="main">
+    <div class="crumb" id="crumb">共有KB / 2025冬リリース / <b>uploads / 設計書</b></div>
+    <div class="banner" id="banner"><span class="lk">🔒</span>このフォルダは<b>読み取り専用</b>です（共有KB）。編集・削除・移動はできません。MD化と索引化は取り込みワーカーが自動実行します。</div>
+
+    <div class="toolbar">
+      <span class="h1" id="h1">設計書</span>
+      <div class="spacer"></div>
+      <button class="btn-ghost">⤴ 再取り込み</button>
+      <button class="btn-primary" id="uploadbtn" disabled>＋ アップロード</button>
+    </div>
+
+    <!-- uploads/設計書（読取専用・MD化ステータス: FM2） -->
+    <div class="folderview on" id="view-uploads-doc">
+      <table class="files">
+        <thead><tr><th>名前</th><th style="width:90px">種別</th><th style="width:90px">サイズ</th><th style="width:150px">MD化ステータス</th><th style="width:120px">更新</th><th style="width:70px"></th></tr></thead>
+        <tbody>
+          <tr><td><span class="fname"><span class="fi">📄</span>請求機能設計書.pdf</span></td><td>PDF</td><td>1.2 MB</td><td><span class="status done"><span class="d"></span>完了</span></td><td class="muted">6/18</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+          <tr><td><span class="fname"><span class="fi">📄</span>売上計上機能設計書.docx</span></td><td>DOCX</td><td>840 KB</td><td><span class="status done"><span class="d"></span>完了</span></td><td class="muted">6/18</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+          <tr><td><span class="fname"><span class="fi">📄</span>見積機能設計書.doc</span></td><td>DOC(旧)</td><td>610 KB</td><td><span class="status proc"><span class="d"></span>変換中…</span></td><td class="muted">6/24</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+          <tr><td><span class="fname"><span class="fi">📄</span>消費税対応 改修方針.pptx</span></td><td>PPTX</td><td>2.1 MB</td><td><span class="status na"><span class="d"></span>未処理</span></td><td class="muted">6/24</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+        </tbody>
+      </table>
+      <div class="note">旧形式（.doc/.xls/.ppt）は新形式へ自動変換 → MD化 → ES索引化（即時）。**Neo4jは抽出プレビュー承認(publish)後に反映**（13-詳細設計引継ぎ.md §5A）。静的解析トラックは copy/cobol/jcl を対象。</div>
+    </div>
+
+    <!-- uploads/src/copy（コピーブック） -->
+    <div class="folderview" id="view-uploads-copy">
+      <table class="files">
+        <thead><tr><th>名前</th><th style="width:90px">種別</th><th style="width:90px">サイズ</th><th style="width:170px">静的解析</th><th style="width:120px">更新</th><th style="width:70px"></th></tr></thead>
+        <tbody>
+          <tr><td><span class="fname"><span class="fi">📜</span>INVOICE-CPY.cpy</span></td><td>Copybook</td><td>8 KB</td><td><span class="status done"><span class="d"></span>解析済（被COPY 50本）</span></td><td class="muted">6/18</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+          <tr><td><span class="fname"><span class="fi">📜</span>CUSTOMER-CPY.cpy</span></td><td>Copybook</td><td>12 KB</td><td><span class="status done"><span class="d"></span>解析済（被COPY 31本）</span></td><td class="muted">6/18</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+          <tr><td><span class="fname"><span class="fi">📜</span>TAX-CPY.cpy</span></td><td>Copybook</td><td>3 KB</td><td><span class="status proc"><span class="d"></span>解析中…</span></td><td class="muted">6/24</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button></div></td></tr>
+        </tbody>
+      </table>
+      <div class="note">コピーブックの項目（例 <code>TAX-RATE</code>）が <code>DataItem</code> に、<code>COPY</code> 関係が <code>Module→Copybook</code> になり、影響範囲分析の網羅性の源になります。</div>
+    </div>
+
+    <!-- workspace（書込可・TTL・削除: FM1） -->
+    <div class="folderview" id="view-ws">
+      <table class="files">
+        <thead><tr><th>名前</th><th style="width:90px">種別</th><th style="width:90px">サイズ</th><th style="width:140px">自動削除まで</th><th style="width:120px">追加</th><th style="width:110px"></th></tr></thead>
+        <tbody>
+          <tr><td><span class="fname"><span class="fi">📄</span>顧客マスタ仕様_draft.docx</span><div class="muted" style="font-size:11px;margin-left:24px">チャット添付（ドキュメントチェック用）</div></td><td>DOCX</td><td>320 KB</td><td><span class="ttl">残り 5 日</span></td><td class="muted">6/19</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button><button class="iconact del" title="削除">🗑</button></div></td></tr>
+          <tr><td><span class="fname"><span class="fi">📄</span>新バッチ仕様メモ.txt</span><div class="muted" style="font-size:11px;margin-left:24px">チャット添付</div></td><td>TXT</td><td>11 KB</td><td><span class="ttl">残り 1 日</span></td><td class="muted">6/23</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button><button class="iconact del" title="削除">🗑</button></div></td></tr>
+        </tbody>
+      </table>
+      <div class="note">チャット添付は workspace に格納（grep のみ・RAG索引化なし）。<b>1週間 TTL で自動削除</b>。RAGの引用元には出ません（13-詳細設計引継ぎ.md §4/§5B）。</div>
+    </div>
+
+    <!-- outputs（成果物） -->
+    <div class="folderview" id="view-ws-out">
+      <table class="files">
+        <thead><tr><th>名前</th><th style="width:90px">種別</th><th style="width:90px">サイズ</th><th style="width:120px">生成元</th><th style="width:120px">作成</th><th style="width:110px"></th></tr></thead>
+        <tbody>
+          <tr><td><span class="fname"><span class="fi">📊</span>影響一覧_消費税率_2025冬.xlsx</span></td><td>XLSX</td><td>46 KB</td><td class="muted">UC-1</td><td class="muted">今日 14:33</td><td><div class="rowact"><button class="iconact" title="DL">⬇</button><button class="iconact del" title="削除">🗑</button></div></td></tr>
+        </tbody>
+      </table>
+      <div class="note">成果物（Excel・レポート）の出力先。DL 可。</div>
+    </div>
+
+    <!-- フォールバック空ビュー -->
+    <div class="folderview" id="view-empty"><div class="note">（このフォルダの内容はモック未作成）</div></div>
+  </main>
+</div>
+
+<script>
+  const labels={
+    'uploads-doc':['共有KB / 2025冬リリース / <b>uploads / 設計書</b>','設計書',1,'view-uploads-doc'],
+    'uploads-spec':['共有KB / 2025冬リリース / <b>uploads / 仕様</b>','仕様',1,'view-empty'],
+    'uploads-copy':['共有KB / 2025冬リリース / <b>uploads / src / copy</b>','コピーブック',1,'view-uploads-copy'],
+    'uploads-cobol':['共有KB / 2025冬リリース / <b>uploads / src / cobol</b>','COBOLソース',1,'view-empty'],
+    'uploads-jcl':['共有KB / 2025冬リリース / <b>uploads / src / jcl</b>','JCL',1,'view-empty'],
+    'md':['共有KB / 2025冬リリース / <b>md</b>','MD変換後',1,'view-empty'],
+    'ws':['個人 / <b>workspace</b>','workspace（チャット添付）',0,'view-ws'],
+    'ws-out':['個人 / workspace / <b>outputs</b>','outputs（成果物）',0,'view-ws-out'],
+    'ws-tmp':['個人 / workspace / <b>tmp</b>','tmp',0,'view-empty'],
+  };
+  function sel(el){
+    document.querySelectorAll('.node').forEach(n=>n.classList.remove('on'));
+    el.classList.add('on');
+    const k=el.dataset.folder, [crumb,h1,ro,view]=labels[k];
+    document.getElementById('crumb').innerHTML=crumb;
+    document.getElementById('h1').textContent=h1;
+    document.getElementById('banner').classList.toggle('show', ro===1);
+    document.getElementById('uploadbtn').disabled = (ro===1);
+    document.querySelectorAll('.folderview').forEach(v=>v.classList.remove('on'));
+    document.getElementById(view).classList.add('on');
+  }
+</script>
+</body>
+</html>

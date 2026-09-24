@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ナレッジグラフ</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="vendor/cytoscape.min.js"></script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  /* admin ガード（CLEAN-1・2026-09-03・W1 の残・同型是正）: この画面のデータ（`/graph`・
+     `/graph/facets`・`/graph/search`・`POST /graph/ask`）は全て admin 限定 API に依存する。
+     ingest.html（W1）/ admin-settings.html と同じ「非 admin は access-denied だけ見せる」パターン。 */
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<sherpa-topbar></sherpa-topbar>
+
+<div id="access-denied">
+  <div style="font-size:32px;margin-bottom:12px">🚫</div>
+  <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+  <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
+</div>
+
+<div id="main-content" class="graphwrap">
+  <header class="graphhead">
+    <div><h1>ナレッジグラフ</h1><p>名前から要素を探し、資料・プログラムのつながりを確認できます。</p></div>
+    <a class="help-link" href="manual.html#graph">使い方</a>
+  </header>
+  <div class="graphworkspace">
+  <div class="graphmain">
+    <div class="graphbar">
+      <label class="gsearch-field" for="gsearch">表示中から名前で探す
+        <input type="search" class="gsearch" id="gsearch" placeholder="例: 消費税率・プログラム名" aria-controls="gresults">
+      </label>
+      <details class="gconditions">
+        <summary>関係・条件で検索</summary>
+        <div class="gcondition-fields">
+          <label for="relfilter">関係<select class="gselect" id="relfilter"><option value="">関係</option></select></label>
+          <label for="fieldfilter">条件<select class="gselect" id="fieldfilter"><option value="">条件</option></select></label>
+          <label for="opfilter">一致方法<select class="gselect" id="opfilter">
+            <option value="eq">=</option><option value="contains">含む</option><option value="prefix">前方</option>
+          </select></label>
+          <label for="condvalue">値<input class="gsearch cond" id="condvalue" placeholder="例: 03_開発 / Module"></label>
+          <button class="btn-secondary" id="gfilter">検索</button>
+        </div>
+      </details>
+      <button class="btn-ghost" id="greset" hidden>検索を解除</button>
+    </div>
+    <div class="graphstatus">
+      <span class="gcount" id="gcount" role="status">読み込み中…</span>
+      <button class="btn-ghost mini" id="showall" hidden>すべて表示</button>
+      <div class="graphview-actions">
+        <button class="btn-ghost mini" id="relayout">再配置</button>
+        <button class="btn-ghost mini" id="fit">全体表示</button>
+      </div>
+    </div>
+    <div class="graphstage">
+      <div id="cy" aria-label="資料とプログラムの関係グラフ"></div>
+      <div class="loading-overlay" id="graph-loading" role="status" aria-live="polite">
+        <span class="spinner"></span><span>ナレッジグラフを読み込んでいます...</span>
+      </div>
+    </div>
+    <div class="graphhint">ドラッグで移動・ホイールで拡大縮小。要素を選ぶと周辺だけ表示し、「全体表示」で戻れます。</div>
+  </div>
+
+  <aside class="graphlegend" aria-label="グラフの検索結果と詳細">
+    <section id="gresults-section" hidden>
+      <h2>名前の検索結果 <span id="gresults-count"></span></h2>
+      <div id="gresults" class="gresults"></div>
+    </section>
+    <section>
+      <h2>選択した要素 <button class="btn-ghost mini" id="gselection-clear" hidden>解除</button></h2>
+      <p class="leg-help" id="nodecard-empty">グラフの要素、または名前の検索結果を選ぶと、詳細とつながりを確認できます。</p>
+      <div class="nodecard" id="nodecard"></div>
+    </section>
+    <section>
+      <h2>表示する種別 <button class="btn-ghost mini" id="fclear" hidden>クリア</button></h2>
+      <div id="legtypes"></div>
+      <button type="button" class="legrow ftog gdep" data-fdep="1" aria-pressed="false">廃止・未使用の疑いを隠す</button>
+      <p class="leg-help">色は種別、矢印は依存の向きです。全体図では、つながりの多い要素を中央に配置します。線の名前は要素を選ぶと表示されます。</p>
+    </section>
+    <section>
+      <h2><label for="gask">ナレッジ状況に質問</label></h2>
+      <textarea class="gask" id="gask" rows="3" placeholder="例: このナレッジベースはどこが弱い？"></textarea>
+      <button class="btn-secondary gaskbtn" id="gaskbtn">質問</button>
+      <div class="ganswer" id="ganswer"></div>
+    </section>
+    <a class="help-link" href="ingest.html">資料の取り込み状況</a>
+  </aside>
+  </div>
+</div>
+
+<script src="graph.js"></script>
+</body>
+</html>

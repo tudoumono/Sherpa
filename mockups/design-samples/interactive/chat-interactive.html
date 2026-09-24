@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<!--
+  Sherpa インタラクティブ・デモ（統合）— 2026-07-02 決定「見た目は現行維持・改善は操作感」
+  ─────────────────────────────────────────────────────────────────────────
+  ・見た目の正 = web/chat.html + web/app.css（--accent #0d9488 teal / 角丸 / ソフト影 /
+    ●塗り＝確実・○白抜き＝要確認 / tabular-nums）。ここではその CSS の必要部分を忠実にインライン。
+  ・追加したのは「操作感（インタラクション）」のみ。見た目トークンは一切いじっていない。
+  ・自己完結（外部依存なし・ダブルクリックで開ける）。素の JS。日本語 UI。
+  ・演出は 150〜300ms の ease・subtle。prefers-reduced-motion で自動無効化。
+  ・XSS: 表示文字列はすべて固定（このデモではユーザ入力を DOM に流し込む箇所も esc() を通す）。
+
+  収録インタラクション（詳細は index.html / README.md）:
+    1 メッセージ hover アクション   2 影響カードの展開/折りたたみ   3 フィルタチップ
+    4 出典ホバープレビュー           5 ストリーミング再生             6 スクロール追従ピル
+    7 入力欄の改善（D&D/送信中/Shift+Enter）  8 / コマンドパレット
+    9 スケルトンローディング         10 状態ドットのリッチツールチップ
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — チャット（操作感デモ）</title>
+<style>
+/* ===================================================================
+   (A) デザイントークン — web/app.css :root をそのまま（値は無改変）
+   =================================================================== */
+:root{
+  --accent:#0d9488; --accent-weak:#ccfbf1; --accent-ink:#0f766e;
+  --bg:#f6f7f9; --surface:#fff; --surface-2:#f1f3f5; --border:#e3e6ea;
+  --ink:#1f2937; --ink-2:#5b6573; --ink-3:#8b95a3;
+  --ok:#16a34a; --ok-bg:#e9f7ef; --warn:#d97706; --warn-bg:#fdf3e7;
+  --danger:#dc2626; --danger-bg:#fdecec;
+  --radius:12px; --radius-sm:8px;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+  --shadow-lg:0 10px 30px rgba(16,24,40,.18);
+  --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+}
+[data-theme="dark"]{
+  --bg:#0f1419; --surface:#161c23; --surface-2:#212a33; --border:#2b353f;
+  --ink:#e6edf3; --ink-2:#9fb0c0; --ink-3:#6b7a8a;
+  --accent:#2dd4bf; --accent-weak:#0c3b35; --accent-ink:#5eead4;
+  --ok:#34d399; --ok-bg:#0e3a2c; --warn:#fbbf24; --warn-bg:#3a2f10;
+  --danger:#f87171; --danger-bg:#3a1c1c;
+  --shadow:0 1px 2px rgba(0,0,0,.45),0 1px 3px rgba(0,0,0,.5);
+  --shadow-lg:0 10px 30px rgba(0,0,0,.55);
+}
+[data-theme="dark"] .bubble-user{color:#04201c}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;
+  line-height:1.6;font-variant-numeric:tabular-nums}
+button{font-family:inherit;cursor:pointer}
+a{color:var(--accent-ink)}
+
+/* ===================================================================
+   (B) 現行コンポーネント — web/app.css から必要分を移植（見た目は無改変）
+   =================================================================== */
+/* トップバー */
+.topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;
+  background:var(--surface);border-bottom:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.02em}
+.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);
+  display:grid;place-items:center;color:#fff;font-size:14px}
+.brand small{font-weight:500;color:var(--ink-3);margin-left:2px}
+.nav{display:flex;gap:4px;overflow-x:auto;min-width:0;white-space:nowrap;scrollbar-width:none}
+.nav::-webkit-scrollbar{display:none}
+.nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;
+  color:var(--ink-2);text-decoration:none}
+.nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+.topbar .spacer{flex:1}
+.topbar .user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);
+  display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+.healthdot{width:10px;height:10px;border-radius:50%;background:var(--border);flex:none;
+  text-decoration:none;cursor:default}
+.healthdot.ok{background:var(--ok)}
+.iconbtn{width:32px;height:32px;border-radius:8px;border:1px solid var(--border);background:var(--surface);
+  color:var(--ink-2);display:grid;place-items:center;font-size:15px}
+
+/* 3ペイン（Grid） */
+.app{display:grid;height:calc(100dvh - 52px);overflow:hidden;--chatmax:1120px;
+  grid-template-columns:var(--tL,264px) 5px minmax(0,1fr) 5px var(--tR,300px)}
+.app.lzero{grid-template-columns:0 5px minmax(0,1fr) 5px var(--tR,300px)}
+.app.rzero{grid-template-columns:var(--tL,264px) 5px minmax(0,1fr) 5px 0}
+.app.lzero.rzero{grid-template-columns:0 5px minmax(0,1fr) 5px 0}
+.splitter{cursor:col-resize;background:transparent;transition:background .15s}
+.splitter:hover{background:var(--accent)}
+.pane{min-height:0;min-width:0;display:flex;flex-direction:column}
+.pane.left{border-right:1px solid var(--border);background:var(--surface)}
+.pane.right{border-left:1px solid var(--border);background:var(--surface)}
+.pane.center{background:var(--bg)}
+.app.lzero .pane.left,.app.rzero .pane.right{overflow:hidden;pointer-events:none;border:none}
+.pane-body{flex:1;overflow:auto;padding:12px}
+.sidetoggle{width:30px;height:30px;border:none;background:transparent;border-radius:8px;color:var(--ink-2);
+  display:grid;place-items:center;cursor:pointer;flex:0 0 auto}
+.sidetoggle:hover{background:var(--surface-2);color:var(--ink)}
+#sideopen,#rightopen{display:none}
+.app.lzero #sideopen{display:grid}
+.app.rzero #rightopen{display:grid}
+
+/* 左: 履歴 */
+.pane.left .pane-body{display:flex;flex-direction:column;padding:14px 12px}
+.lbrand{display:flex;align-items:center;gap:8px;padding:2px 4px 12px}
+.lbrand .ltitle{font-size:13px;font-weight:600;color:var(--ink-2)}
+.newbtn{width:100%;height:36px;border:1px solid var(--accent);color:var(--accent-ink);background:var(--accent-weak);
+  border-radius:var(--radius-sm);font-weight:600;margin-bottom:10px}
+.hist{flex:1;overflow:auto;min-height:0}
+.histhead{font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--ink-3);margin:6px 8px 6px}
+.conv{display:flex;align-items:center;gap:6px;padding:9px 11px;border-radius:var(--radius-sm);margin-bottom:4px;
+  cursor:pointer;color:var(--ink-2)}
+.conv:hover{background:var(--surface-2)}
+.conv.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+.conv .cmain{flex:1;min-width:0}
+.conv .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv .d{font-size:11px;color:var(--ink-3)}
+.userbox{margin-top:auto;display:flex;align-items:center;gap:9px;padding:11px 8px 2px;border-top:1px solid var(--border)}
+.userbox .av{width:32px;height:32px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);
+  display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+.userbox b{font-size:13px}.userbox small{display:block;color:var(--ink-3);font-size:11px}
+
+/* 中央: 会話 */
+.chead{display:flex;align-items:center;gap:10px;padding:0 18px;height:54px;border-bottom:1px solid var(--border);
+  background:var(--surface);flex:0 0 auto;font-weight:600}
+.chead .spacer{flex:1}
+.chead #conv-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn-ghost{height:34px;padding:0 12px;border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--surface);color:var(--ink-2);font-size:13px}
+.btn-ghost:hover{background:var(--surface-2)}
+.msgwrap{position:relative;flex:1;min-height:0;display:flex}
+.messages{flex:1;overflow:auto;padding:24px 18px 18px;font-size:var(--chatfont,14.5px);line-height:1.6}
+.msg{width:100%;max-width:min(var(--chatmax,1040px),100%);margin:0 auto 18px}
+.messages .msg:first-child{margin-top:0}
+.msg.user{display:flex;justify-content:flex-end}
+.bubble-user{background:var(--accent);color:#fff;padding:10px 14px;border-radius:14px 14px 4px 14px;max-width:78%}
+.a-row{display:flex;gap:11px}
+.a-avatar{width:30px;height:30px;border-radius:8px;background:var(--accent-weak);color:var(--accent-ink);
+  display:grid;place-items:center;font-size:13px;flex:0 0 auto;font-weight:700}
+.a-body{flex:1;min-width:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
+.chip{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border-radius:999px;font-size:11.5px;
+  border:1px solid var(--accent);background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+.chip.ghost{background:var(--surface-2);color:var(--ink-3);border-color:var(--border)}
+.headline{font-weight:700;font-size:1.06em;line-height:1.55;margin:2px 0 8px}
+.ilist{list-style:none;margin:6px 0 0;padding:0}
+.ilist li{padding:8px 2px;border-bottom:1px solid var(--border)}
+.ilist .top{display:flex;align-items:center;gap:8px}
+.ilist .nm{font-weight:600}.ilist .spacer{flex:1}
+.kind{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;background:var(--surface-2);color:var(--ink-2)}
+.conf{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}
+.conf .d{width:8px;height:8px;border-radius:50%}
+.conf.ok{color:var(--ok)} .conf.ok .d{background:var(--ok)}
+.conf.warn{color:var(--warn)} .conf.warn .d{background:transparent;border:2px solid var(--warn);width:9px;height:9px}
+.statustag{font-size:10.5px;padding:1px 6px;border-radius:5px;margin-left:6px}
+.statustag.deprecated{background:var(--danger-bg);color:var(--danger)}
+.statustag.hidden_candidate{background:var(--warn-bg);color:var(--warn)}
+.pathbtn{border:none;background:none;color:var(--accent-ink);font-size:12px;cursor:pointer;padding:0}
+.path{font-size:12px;color:var(--ink-2);background:var(--surface-2);border-radius:8px;padding:9px 11px}
+.path .chain{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:var(--ink)}
+.path .ev{margin-top:6px;color:var(--ink-3)}
+.filterchip{height:28px;padding:0 11px;border-radius:999px;border:1px solid var(--border);background:var(--surface);
+  font-size:12px;color:var(--ink-2)}
+.filterchip.on{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+.sources{margin-top:12px;padding-top:10px;border-top:1px dashed var(--border)}
+.sources .h{font-size:11px;color:var(--ink-3);font-weight:700;letter-spacing:.04em;margin-bottom:6px}
+.sources a{display:inline-flex;align-items:center;gap:5px;font-size:12px;margin:0 12px 6px 0;color:var(--accent-ink);
+  text-decoration:none;position:relative}
+.sources a:hover{text-decoration:underline}
+.aiconcise{font-size:1em;line-height:1.7}
+.aiconcise b{color:var(--accent-ink)}
+.copybtn{border:1px solid var(--border);background:var(--surface);color:var(--ink-3);border-radius:7px;
+  height:24px;padding:0 8px;font-size:11.5px;margin-top:6px}
+.copybtn:hover{color:var(--accent-ink);border-color:var(--accent)}
+.msg.user .copybtn{margin:6px 2px 0 auto;display:block}
+
+/* コンポーザー */
+.composer{flex:0 0 auto;padding:12px 18px;border-top:1px solid var(--border);background:var(--surface)}
+.cbar{display:flex;align-items:center;gap:8px;margin:0 auto 8px;max-width:min(var(--chatmax,1040px),100%);flex-wrap:wrap}
+.cbar .spacer{flex:1}
+.kbtoggle{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:12.5px;font-family:inherit;cursor:pointer}
+.kbtoggle:hover{background:var(--surface)}
+.kbtoggle b{color:var(--ink-3);font-weight:600}
+.kbtoggle.on{background:var(--accent-weak);border-color:var(--accent);color:var(--accent-ink)}
+.kbtoggle.on b{color:var(--accent-ink)}
+.badge-brain{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:12.5px}
+.badge-brain b{color:var(--ink)} .badge-brain small{color:var(--ink-3)}
+.composer .box{max-width:min(var(--chatmax,1040px),100%);margin:0 auto;border:1px solid var(--border);
+  border-radius:var(--radius);padding:8px 10px;display:flex;align-items:flex-end;gap:8px;position:relative}
+.composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;font-size:14px;max-height:120px;
+  background:transparent;color:var(--ink);padding:6px 2px}
+.sendbtn{width:36px;height:36px;border-radius:8px;border:none;background:var(--accent);color:#fff;display:grid;
+  place-items:center;flex:0 0 auto;font-size:16px}
+.sendbtn:disabled{opacity:.7;cursor:default}
+.spinner{width:18px;height:18px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;
+  display:inline-block;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* 右: 思考の流れ */
+.rhead{display:flex;align-items:center;gap:8px;padding:0 16px;height:54px;border-bottom:1px solid var(--border);
+  font-weight:700;flex:0 0 auto}
+.rhead .rt{margin-left:auto;font-size:11px;font-weight:600;padding:3px 10px;border-radius:999px;
+  background:var(--surface-2);color:var(--ink-3);display:inline-flex;align-items:center;gap:6px}
+.rhead .rt .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.rhead .rt.live{background:var(--accent-weak);color:var(--accent-ink)} .rhead .rt.live .dot{animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.25}}
+.flow{padding:18px 16px;overflow:auto}
+.flow .hint{color:var(--ink-3);font-size:12px}
+.fstep{position:relative;display:flex;gap:12px;padding:0 0 22px}
+.fstep::before{content:"";position:absolute;left:13px;top:26px;bottom:-2px;width:2px;background:var(--border);transition:background .4s}
+.fstep:last-child::before{display:none}
+.fnode{width:28px;height:28px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;background:var(--surface);
+  border:2px solid var(--border);color:#fff;font-size:13px;position:relative;z-index:1;transition:.3s}
+.fbody{flex:1;min-width:0;padding-top:2px}
+.flabel{font-weight:600;font-size:13.5px;color:var(--ink-3);transition:color .3s}
+.fdetail{font-size:11.5px;color:var(--ink-3);margin-top:2px}
+.fstep.done .fnode{background:var(--ok);border-color:var(--ok)}
+.fstep.done .flabel{color:var(--ink)}
+.fstep.done::before{background:var(--ok)}
+.fstep.active .fnode{border-color:var(--accent);background:var(--accent-weak);animation:glow 1.5s infinite}
+.fstep.active .flabel{color:var(--accent-ink)}
+.fstep.active .fnode::after{content:"";width:9px;height:9px;border-radius:50%;background:var(--accent);animation:corepulse 1.2s infinite}
+@keyframes glow{0%{box-shadow:0 0 0 0 rgba(13,148,136,.45)}70%{box-shadow:0 0 0 11px rgba(13,148,136,0)}100%{box-shadow:0 0 0 0 rgba(13,148,136,0)}}
+@keyframes corepulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.6);opacity:.6}}
+.fstep.tool .fnode{border-color:var(--accent)}
+.fstep.tool.active .fnode{background:var(--accent-weak)}
+.fstep.tool.done .fnode{background:var(--accent);border-color:var(--accent)}
+.fstep.tool.done::before{background:var(--accent)}
+.fstep.tool .flabel::before{content:"🔧 ";font-size:11px}
+
+/* toast */
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--ink);color:var(--surface);
+  padding:9px 16px;border-radius:999px;font-size:12.5px;opacity:0;visibility:hidden;
+  transition:opacity .2s,visibility .2s;pointer-events:none;z-index:80}
+.toast.show{opacity:.95;visibility:visible}
+
+/* ===================================================================
+   (C) 操作感の追加分（すべて namespace 付き・見た目トークンは流用のみ）
+   =================================================================== */
+/* #1 メッセージ hover アクションバー */
+.msg-actions{display:flex;gap:6px;margin-top:8px;opacity:0;transform:translateY(3px);
+  transition:opacity .18s ease,transform .18s ease;pointer-events:none}
+.ai-msg:hover .msg-actions,.ai-msg:focus-within .msg-actions{opacity:1;transform:none;pointer-events:auto}
+.ix-act{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 10px;border-radius:7px;
+  border:1px solid var(--border);background:var(--surface);color:var(--ink-3);font-size:11.5px;font-family:inherit}
+.ix-act:hover{color:var(--accent-ink);border-color:var(--accent);background:var(--accent-weak)}
+
+/* #2 展開/折りたたみ（height アニメ）＋経路チップのハイライト連動 */
+.ilist li .ixdetail{max-height:0;overflow:hidden;opacity:0;
+  transition:max-height .24s ease,opacity .2s ease,margin .24s ease;margin-top:0}
+.ilist li.open .ixdetail{max-height:280px;opacity:1;margin-top:9px}
+.ilist li.open{background:linear-gradient(0deg,var(--surface-2),var(--surface-2)) padding-box;border-radius:8px}
+.pathbtn .caret{display:inline-block;transition:transform .2s ease}
+.ilist li.open .pathbtn .caret{transform:rotate(180deg)}
+.ix-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:7px}
+.ix-route .arr{color:var(--ink-3);font-size:11px}
+.ix-route .chip{opacity:0;transform:translateY(4px);transition:opacity .22s ease,transform .22s ease}
+.ilist li.open .ix-route .chip{opacity:1;transform:none}
+.ilist li.open .ix-route .chip:nth-child(1){transition-delay:.02s}
+.ilist li.open .ix-route .chip:nth-child(3){transition-delay:.09s}
+.ilist li.open .ix-route .chip:nth-child(5){transition-delay:.16s}
+.ix-route .chip.origin{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+/* #3 フィルタチップ（サマリ）＋件数バッジ */
+.ix-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:2px 0 10px}
+.ix-summary .filterchip .cnt{margin-left:5px;font-weight:700}
+.ix-shown{font-size:11.5px;color:var(--ink-3);margin-left:2px}
+.ilist li.ix-hide{display:none}
+
+/* #4 出典ホバープレビュー（ポップオーバー） */
+.ix-pop{position:absolute;left:0;bottom:130%;z-index:40;width:280px;background:var(--surface);
+  border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-lg);padding:10px 12px;
+  opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .16s ease,transform .16s ease,visibility .16s;
+  pointer-events:none}
+.ix-pop.show{opacity:1;visibility:visible;transform:none}
+.ix-pop .pd{font-size:11px;font-weight:700;color:var(--accent-ink);margin-bottom:4px}
+.ix-pop .pq{font-size:11.5px;color:var(--ink-2);line-height:1.55;
+  border-left:2px solid var(--accent);padding-left:8px}
+.ix-pop .ph{font-size:10.5px;color:var(--ink-3);margin-top:7px}
+
+/* #5 ストリーミング再生ツールバー＋トークン風カーソル */
+.ix-replaybar{display:flex;align-items:center;gap:10px;max-width:min(var(--chatmax,1040px),100%);
+  margin:0 auto 12px}
+.ix-play{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 14px;border-radius:999px;
+  border:1px solid var(--accent);background:var(--accent-weak);color:var(--accent-ink);font-weight:600;font-size:12.5px}
+.ix-play:disabled{opacity:.55;cursor:default}
+.ix-replaybar .note{font-size:11.5px;color:var(--ink-3)}
+.ix-typing::after{content:"▌";color:var(--accent);animation:cursorblink 1s step-end infinite;font-weight:400}
+@keyframes cursorblink{50%{opacity:0}}
+.ix-appear{animation:ixfade .3s ease both}
+@keyframes ixfade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* #6 スクロール追従ピル */
+.ix-jump{position:absolute;right:20px;bottom:16px;z-index:20;display:inline-flex;align-items:center;gap:6px;
+  height:34px;padding:0 14px;border-radius:999px;border:1px solid var(--border);background:var(--surface);
+  color:var(--accent-ink);font-size:12.5px;font-weight:600;box-shadow:var(--shadow-lg);
+  opacity:0;visibility:hidden;transform:translateY(6px);transition:opacity .2s ease,transform .2s ease,visibility .2s}
+.ix-jump.show{opacity:1;visibility:visible;transform:none}
+
+/* #7 入力欄: D&D 受け皿・ファイルチップ */
+.composer .box.ix-drag{border-color:var(--accent);background:var(--accent-weak);
+  box-shadow:0 0 0 3px var(--accent-weak)}
+.ix-dropnote{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  color:var(--accent-ink);font-size:12.5px;font-weight:600;pointer-events:none;border-radius:var(--radius)}
+.composer .box.ix-drag .ix-dropnote{display:flex}
+.ix-files{display:flex;flex-wrap:wrap;gap:6px;max-width:min(var(--chatmax,1040px),100%);margin:0 auto 8px}
+.ix-files:empty{display:none}
+.ix-file{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 6px 0 11px;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:12px}
+.ix-file .x{width:20px;height:20px;border:none;background:transparent;border-radius:50%;color:var(--ink-3);
+  font-size:13px;display:grid;place-items:center;cursor:pointer}
+.ix-file .x:hover{background:var(--surface);color:var(--danger)}
+.ix-hint{max-width:min(var(--chatmax,1040px),100%);margin:8px auto 0;text-align:center;font-size:11px;color:var(--ink-3)}
+.ix-hint kbd{font-family:inherit;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;
+  padding:1px 6px;font-size:10.5px;color:var(--ink-2)}
+
+/* #8 / コマンドパレット */
+.ix-cmd{position:absolute;left:0;bottom:calc(100% + 8px);z-index:40;width:min(440px,90%);
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-lg);
+  padding:6px;display:none}
+.ix-cmd.show{display:block;animation:ixfade .14s ease both}
+.ix-cmd .ch{font-size:10.5px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.05em;padding:6px 10px 4px}
+.ix-cmditem{display:block;width:100%;text-align:left;border:none;background:transparent;font-family:inherit;
+  padding:9px 11px;border-radius:8px;cursor:pointer;color:var(--ink-2)}
+.ix-cmditem:hover,.ix-cmditem.sel{background:var(--accent-weak)}
+.ix-cmditem b{display:block;font-size:13px;color:var(--ink)} .ix-cmditem.sel b{color:var(--accent-ink)}
+.ix-cmditem small{display:block;font-size:11px;color:var(--ink-3);margin-top:1px}
+
+/* #9 スケルトンローディング */
+.ix-skel{max-width:min(var(--chatmax,1040px),100%);margin:0 auto}
+.skl{background:var(--surface-2);border-radius:8px;position:relative;overflow:hidden}
+.skl::after{content:"";position:absolute;inset:0;transform:translateX(-100%);
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);animation:shimmer 1.3s infinite}
+[data-theme="dark"] .skl::after{background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent)}
+@keyframes shimmer{100%{transform:translateX(100%)}}
+.skl.line{height:12px;margin:0 0 10px}
+.skl.bubble{height:40px;width:60%;margin:0 0 22px auto;border-radius:14px}
+.skl.av{height:30px;width:30px;border-radius:8px}
+.ix-skelrow{display:flex;gap:11px;margin-top:6px}
+
+/* #10 状態ドットのリッチツールチップ */
+.ix-dotwrap{position:relative;display:inline-flex}
+.ix-tip{position:absolute;top:150%;right:-6px;z-index:60;width:220px;background:var(--surface);
+  border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-lg);padding:10px 12px;
+  opacity:0;visibility:hidden;transform:translateY(-4px);transition:opacity .16s ease,transform .16s ease,visibility .16s}
+.ix-dotwrap:hover .ix-tip,.ix-dotwrap:focus-within .ix-tip{opacity:1;visibility:visible;transform:none}
+.ix-tip .tt{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:var(--ink)}
+.ix-tip .tt .d{width:9px;height:9px;border-radius:50%;background:var(--ok)}
+.ix-tip .ts{font-size:11px;color:var(--ink-3);margin-top:5px;line-height:1.5}
+
+/* reduced-motion: 演出は全部止める（操作は生きる） */
+@media (prefers-reduced-motion: reduce){
+  *{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;scroll-behavior:auto !important}
+}
+</style>
+</head>
+<body>
+
+<!-- ===== トップバー（web/nav.js の描画を静的再現）===== -->
+<header class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav">
+    <a class="on" href="#">チャット</a>
+    <a href="#">資料を取り込む</a>
+    <a href="#">取り込み状況</a>
+    <a href="#">ナレッジグラフ</a>
+    <a href="#">概観</a>
+    <a href="#">使い方</a>
+    <a href="#">設定</a>
+  </nav>
+  <span class="spacer"></span>
+  <!-- #10 状態ドット + リッチツールチップ -->
+  <span class="ix-dotwrap" tabindex="0">
+    <a class="healthdot ok" id="healthdot" aria-label="サービス状態"></a>
+    <div class="ix-tip" role="tooltip">
+      <div class="tt"><span class="d"></span>サービスは正常です</div>
+      <div class="ts">検索・影響分析・グラフ探索すべて応答しています。<br>最終チェック <b id="hc-time">12:34</b></div>
+    </div>
+  </span>
+  <button class="iconbtn" id="themebtn" title="テーマ切替">🌙</button>
+  <div class="user" title="管理者">管</div>
+</header>
+
+<div class="app" id="app">
+  <!-- 左: 履歴 -->
+  <aside class="pane left">
+    <div class="pane-body">
+      <div class="lbrand">
+        <button class="sidetoggle" id="sideclose" title="サイドバーを閉じる">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
+        </button>
+        <span class="ltitle">チャット履歴</span>
+      </div>
+      <button class="newbtn">＋ 新しいチャット</button>
+      <div class="hist">
+        <div class="histhead">今日</div>
+        <div class="conv on"><div class="cmain"><div class="t">消費税率の影響範囲</div><div class="d">たった今</div></div></div>
+        <div class="conv"><div class="cmain"><div class="t">見積機能のエラー調査</div><div class="d">午前 11:20</div></div></div>
+        <div class="conv"><div class="cmain"><div class="t">受注テーブルの項目確認</div><div class="d">午前 9:44</div></div></div>
+        <div class="histhead">昨日</div>
+        <div class="conv"><div class="cmain"><div class="t">JCL の実行順序について</div><div class="d">昨日</div></div></div>
+        <div class="conv"><div class="cmain"><div class="t">請求書レイアウト定義のチェック</div><div class="d">昨日</div></div></div>
+      </div>
+      <div class="userbox">
+        <span class="av">管</span>
+        <div style="flex:1;min-width:0"><b>管理者</b><small>Sherpa</small></div>
+      </div>
+    </div>
+  </aside>
+
+  <div class="splitter" id="splitL" title="幅をドラッグで変更（デモでは固定）"></div>
+
+  <!-- 中央: 会話 -->
+  <main class="pane center">
+    <div class="chead">
+      <button class="sidetoggle" id="sideopen" title="サイドバーを開く">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
+      </button>
+      <span id="conv-title">消費税率の影響範囲</span>
+      <span class="spacer"></span>
+      <button class="btn-ghost" title="この会話を書き出す">⬇ 書き出し</button>
+      <button class="btn-ghost" title="この会話を共有">🔗 共有</button>
+      <button class="sidetoggle" id="rightclose" title="思考パネルを閉じる">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+      </button>
+      <button class="sidetoggle" id="rightopen" title="思考パネルを開く">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+      </button>
+    </div>
+
+    <div class="msgwrap">
+      <div class="messages" id="messages"></div>
+      <!-- スクロール追従ピル（#6・messages 領域の右下に浮かせる） -->
+      <button class="ix-jump" id="jumpBtn">↓ 最新へ</button>
+    </div>
+
+    <div class="composer">
+      <!-- #5 再生ツールバー -->
+      <div class="ix-replaybar">
+        <button class="ix-play" id="playBtn">▶ ストリーミングを再生</button>
+        <span class="note">思考の流れ → 回答がトークン風に流れ、カードが1枚ずつ現れます（初期表示は一発で全部）。</span>
+      </div>
+      <!-- #7 添付ファイルチップ -->
+      <div class="ix-files" id="fileChips"></div>
+      <div class="cbar">
+        <button class="kbtoggle on" title="社内ナレッジ（資料）を参照する">📚 ナレッジ参照 <b>オン</b></button>
+        <button class="kbtoggle" title="参照する範囲を絞る">🎯 範囲: <b>4期システム / 02_設計</b> ▾</button>
+        <button class="kbtoggle" id="attachBtn" title="このファイルを本人だけの個人ワークスペースへ保存する">📎 個人ファイルを追加</button>
+        <span class="spacer"></span>
+        <button class="badge-brain" title="利用するAI・実行環境を選ぶ">🧠 <b>GPT-5.5</b> <small>メイン</small> ▾</button>
+      </div>
+      <div class="box" id="box">
+        <!-- #8 コマンドパレット -->
+        <div class="ix-cmd" id="cmdPalette" role="listbox" aria-label="定型質問">
+          <div class="ch">定型質問（↑↓ で選択・Enter で挿入・Esc で閉じる）</div>
+        </div>
+        <textarea id="input" rows="1" placeholder="メッセージを入力（例: 消費税率を変えたい。影響は？ ／ &quot;/&quot; でテンプレ）"></textarea>
+        <button class="sendbtn" id="sendBtn" title="送信">↑</button>
+        <div class="ix-dropnote">📎 ここにドロップして個人ファイルに追加</div>
+      </div>
+      <div class="ix-hint"><kbd>Enter</kbd> で送信 ・ <kbd>Shift</kbd>+<kbd>Enter</kbd> で改行 ・ <kbd>/</kbd> で定型質問 ・ 回答末尾に出典（原本DL）</div>
+    </div>
+  </main>
+
+  <div class="splitter" id="splitR" title="幅をドラッグで変更（デモでは固定）"></div>
+
+  <!-- 右: 思考の流れ -->
+  <aside class="pane right">
+    <div class="rhead">
+      <button class="sidetoggle" id="rightclose2" title="思考パネルを閉じる">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+      </button>
+      思考の流れ <span class="rt" id="rt"><span class="dot"></span>待機中</span>
+    </div>
+    <div class="flow" id="flow"><div class="hint">質問すると、考えた道筋がここに流れます。</div></div>
+  </aside>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const sleep = (ms) => new Promise((r) => setTimeout(r, REDUCED ? 0 : ms));
+
+/* ---- toast（web/chat.js と同じ挙動） ---- */
+let _toastTimer = null;
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(_toastTimer); _toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+/* ===================================================================
+   コンテンツ（消費税影響分析・13件＝確実6/要確認7・出典3件）
+   =================================================================== */
+const HEADLINE = '消費税率の変更は、13件の資産に影響します。まず ● 確実の6件から着手するのがおすすめです。';
+const HEAD_CHIPS = ['影響調査', '消費税率', '税計算ルール'];   // 現行 .chips（レンズ＋経路）
+
+// trace = 経路のノード列（起点 消費税率 → … → 対象）。evidence = 根拠の doc＋該当文。
+const IMPACT = [
+  { name: '見積機能', category: 'COBOL', sure: true,
+    route: ['消費税率', 'TAX-RATE', '見積計算ロジック', '見積機能'],
+    ev: 'ESTIMATE.cbl 〔行 128–140〕: COMPUTE 見積金額 = 税抜金額 * (1 + TAX-RATE).' },
+  { name: '請求書レイアウト定義', category: '設計書', sure: true,
+    route: ['消費税率', '税額表示', '請求書レイアウト定義'],
+    ev: '請求書レイアウト_定義.md 〔§3.2〕: 税額欄は消費税率に基づき自動計算のうえ右詰め表示する。' },
+  { name: '税計算サブルーチン', category: 'Copybook', sure: true,
+    route: ['消費税率', 'TAX-RATE', '税計算サブルーチン'],
+    ev: 'TAXCALC.cpy 〔行 12〕: 01 TAX-RATE PIC 9V999 VALUE 0.100.' },
+  { name: '日次売上集計ジョブ', category: 'JCL', sure: true,
+    route: ['消費税率', '税計算ルール', '日次売上集計ジョブ'],
+    ev: 'DAILYSUM.jcl 〔STEP020〕: 税込金額の再集計に税計算サブルーチンを呼び出している。' },
+  { name: '消費税マスタ更新', category: 'COBOL', sure: true,
+    route: ['消費税率', 'TAX-RATE', '消費税マスタ更新'],
+    ev: 'TAXMUPD.cbl 〔行 44〕: 税率マスタへ TAX-RATE を書き込む更新処理。' },
+  { name: '請求書発行機能', category: 'COBOL', sure: true,
+    route: ['消費税率', '税額表示', '請求書発行機能'],
+    ev: 'INVOICE.cbl 〔行 210〕: 税額 = 明細合計 * TAX-RATE として印字。' },
+  { name: '受注登録画面', category: '画面仕様', sure: false,
+    route: ['消費税率', '税計算ルール', '受注登録画面'],
+    ev: '受注登録_画面仕様.md 〔§2〕: 税込金額を表示（税計算ルール経由・直接参照は要確認）。' },
+  { name: '見積書PDF出力', category: '設計書', sure: false,
+    route: ['消費税率', '税額表示', '見積書PDF出力'],
+    ev: '見積書PDF_仕様.md 〔§4.1〕: 税額の表示位置を定義（税率の直接参照有無は未確認）。' },
+  { name: '月次レポート集計', category: 'COBOL', sure: false,
+    route: ['消費税率', '税計算ルール', '月次レポート集計'],
+    ev: 'MONTHLY.cbl 〔行 76〕: 税込ベースで集計（税計算ルール経由）。' },
+  { name: '顧客請求サマリ', category: '設計書', sure: false,
+    route: ['消費税率', '税額表示', '顧客請求サマリ'],
+    ev: '顧客請求サマリ_定義.md 〔§1.3〕: 税額合計欄あり（算出元の特定が必要）。' },
+  { name: '返品処理', category: 'COBOL', sure: false, status: 'hidden_candidate',
+    route: ['消費税率', '税計算ルール', '返品処理'],
+    ev: 'RETURN.cbl 〔行 55〕: 返金額に税額を含む可能性（隠れ候補・要精査）。' },
+  { name: '旧税額計算モジュール', category: 'COBOL', sure: false, status: 'deprecated',
+    route: ['消費税率', 'TAX-RATE', '旧税額計算モジュール'],
+    ev: 'OLDTAX.cbl 〔行 9〕: 退役予定。参照元がなければ影響対象外。' },
+  { name: '取引明細エクスポート', category: 'JCL', sure: false,
+    route: ['消費税率', '税計算ルール', '取引明細エクスポート'],
+    ev: 'EXPORT.jcl 〔STEP040〕: 税込明細を外部連携（算出経路の確認が必要）。' },
+];
+const SURE_N = IMPACT.filter((x) => x.sure).length;
+const REVIEW_N = IMPACT.length - SURE_N;
+
+const SOURCES = [
+  { doc: '消費税率_定義.md', snip: '消費税率は税計算ルールの起点となる基準値。改定時は全参照資産の再確認が必要。' },
+  { doc: '税計算ルール_設計書.pdf', snip: '税額 = 税抜金額 × 消費税率。丸めは円未満切り捨て。見積・請求・集計が本ルールを参照。' },
+  { doc: '見積機能_仕様書.md', snip: '見積金額は税計算サブルーチン経由で算出。税率変更時は計算ロジックの改修が必須。' },
+];
+const STATUS_LABEL = { deprecated: '退役', hidden_candidate: '隠れ候補' };
+
+/* ===================================================================
+   会話の組み立て（instant / animated 共用）
+   =================================================================== */
+function userBubbleHTML(text) {
+  return `<div class="msg user"><div class="bubble-user">${esc(text)}</div></div>`;
+}
+function impactItemHTML(it) {
+  // 経路は「対象 ← … ← 消費税率（起点）」の順で表示（起点＝右端を accent 塗り）
+  const rev = it.route.slice().reverse();
+  const chipsHTML = rev.map((n, i) => {
+    const origin = (i === rev.length - 1) ? ' origin' : '';
+    const arr = i ? '<span class="arr">←</span>' : '';
+    return arr + `<span class="chip${origin}">${esc(n)}</span>`;
+  }).join('');
+  const tag = it.status ? `<span class="statustag ${it.status}">${esc(STATUS_LABEL[it.status])}</span>` : '';
+  return `<li data-sure="${it.sure ? 1 : 0}">
+    <div class="top">
+      <span class="conf ${it.sure ? 'ok' : 'warn'}"><span class="d"></span>${it.sure ? '確実' : '要確認'}</span>
+      <span class="kind">${esc(it.category)}</span>
+      <span class="nm">${esc(it.name)}</span>${tag}
+      <span class="spacer"></span>
+      <button class="pathbtn" data-toggle>経路 <span class="caret">▾</span></button>
+    </div>
+    <div class="ixdetail">
+      <div class="ix-route">${chipsHTML}</div>
+      <div class="path"><div class="chain">${esc(it.route.slice().reverse().join(' ← '))}</div><div class="ev">根拠: ${esc(it.ev)}</div></div>
+    </div>
+  </li>`;
+}
+function sourcesHTML() {
+  const items = SOURCES.map((s, i) =>
+    `<a href="#" data-src="${i}">📄 ${esc(s.doc)}<div class="ix-pop"><div class="pd">📄 ${esc(s.doc)}</div><div class="pq">${esc(s.snip)}</div><div class="ph">クリックで原本をダウンロード</div></div></a>`).join('');
+  return `<div class="sources"><div class="h">出典（原本をダウンロード）</div>${items}</div>`;
+}
+function summaryHTML() {
+  return `<div class="ix-summary">
+      <button class="filterchip on" data-filter="all">全て <span class="cnt">${IMPACT.length}</span></button>
+      <button class="filterchip" data-filter="sure"><span class="conf ok"><span class="d"></span>確実</span> <span class="cnt">${SURE_N}</span></button>
+      <button class="filterchip" data-filter="review"><span class="conf warn"><span class="d"></span>要確認</span> <span class="cnt">${REVIEW_N}</span></button>
+      <span class="ix-shown" id="shownCount">${IMPACT.length}件を表示中</span>
+    </div>`;
+}
+// 影響回答（AI メッセージ）全体。bodyHTML を差し込めるよう分割。
+function aiImpactHTML() {
+  // 現行 .chips = レンズ（影響調査）＋経路の代表ノード。すべて通常の accent チップ。
+  const chips = '<div class="chips">' + HEAD_CHIPS.map((c) =>
+    `<span class="chip">${esc(c)}</span>`).join('') + '</div>';
+  const list = '<ul class="ilist" id="ilist">' + IMPACT.map(impactItemHTML).join('') + '</ul>';
+  const actions = `<div class="msg-actions">
+      <button class="ix-act" data-copy>⧉ コピー</button>
+      <button class="ix-act" data-quote>❝ 引用して質問</button>
+      <button class="ix-act" data-rerun>↻ 再実行</button>
+    </div>`;
+  return `<div class="msg ai-msg"><div class="a-row"><div class="a-avatar">✦</div><div class="a-body">
+      ${chips}
+      <div class="headline" id="headline">${esc(HEADLINE)}</div>
+      ${summaryHTML()}
+      ${list}
+      ${sourcesHTML()}
+      ${actions}
+    </div></div></div>`;
+}
+// 追い質問（短い会話のリズム確認）
+function aiFollowupHTML() {
+  return `<div class="msg ai-msg"><div class="a-row"><div class="a-avatar">✦</div><div class="a-body">
+      <div class="aiconcise"><b>● 確実の6件</b>はすべて改修が必要です。中でも <b>見積機能（COBOL）</b> と
+      <b>請求書レイアウト定義</b> は税率が直接埋め込まれているため最優先で。○ 要確認の7件は税計算ルール経由のため、
+      まず参照有無の確認から始めてください。</div>
+      <div class="sources"><div class="h">出典（原本をダウンロード）</div>
+        <a href="#" data-src="1">📄 税計算ルール_設計書.pdf<div class="ix-pop"><div class="pd">📄 税計算ルール_設計書.pdf</div><div class="pq">${esc(SOURCES[1].snip)}</div><div class="ph">クリックで原本をダウンロード</div></div></a>
+      </div>
+      <div class="msg-actions">
+        <button class="ix-act" data-copy>⧉ コピー</button>
+        <button class="ix-act" data-quote>❝ 引用して質問</button>
+        <button class="ix-act" data-rerun>↻ 再実行</button>
+      </div>
+    </div></div></div>`;
+}
+
+const Q1 = '消費税率を10%から変更した場合、どの資産に影響しますか？';
+const Q2 = 'その中で、対応が必須なのはどれ？';
+
+/* ---- 一発表示（初期ロード後・従来相当） ---- */
+function buildInstant() {
+  $('messages').innerHTML = userBubbleHTML(Q1) + aiImpactHTML() + userBubbleHTML(Q2) + aiFollowupHTML();
+  wireAnswer();
+  setRt('完了', false);
+  // 思考の流れも「済み」の見た目で置く
+  $('flow').innerHTML = FLOW_STEPS.map((s) =>
+    `<div class="fstep done${s.tool ? ' tool' : ''}"><div class="fnode">✓</div><div class="fbody"><div class="flabel">${esc(s.label)}</div><div class="fdetail">${esc(s.detail)}</div></div></div>`).join('');
+}
+
+/* ===================================================================
+   #5 ストリーミング再生（思考の流れ → トークン風 → カードが1枚ずつ）
+   =================================================================== */
+const FLOW_STEPS = [
+  { label: '質問を理解', detail: '「消費税率の変更」→ 影響調査レンズ', tool: false },
+  { label: '共有ナレッジを全文検索', detail: 'grep: 消費税率 / TAX-RATE / 税額', tool: true },
+  { label: 'グラフ探索（Neo4j）', detail: '起点から影響の経路をたどる', tool: true },
+  { label: '根拠を整理', detail: '確実6 / 要確認7 を判定', tool: false },
+  { label: '回答を作成', detail: '答え先頭＋出典を組み立て', tool: false },
+];
+function setRt(text, live) {
+  const rt = $('rt'); rt.classList.toggle('live', !!live);
+  rt.innerHTML = '<span class="dot"></span>' + esc(text);
+}
+let _playing = false;
+async function replay() {
+  if (_playing) return; _playing = true;
+  $('playBtn').disabled = true; $('playBtn').textContent = '▶ 再生中…';
+  const m = $('messages'); m.innerHTML = ''; $('flow').innerHTML = '';
+  setRt('リアルタイム', true);
+
+  // 1) ユーザー質問
+  m.insertAdjacentHTML('beforeend', userBubbleHTML(Q1));
+  m.lastElementChild.classList.add('ix-appear');
+  scrollBottom(); await sleep(500);
+
+  // 2) 思考の流れ（順にチェック✓）
+  for (const s of FLOW_STEPS) {
+    const el = document.createElement('div');
+    el.className = 'fstep active' + (s.tool ? ' tool' : '');
+    el.innerHTML = `<div class="fnode"></div><div class="fbody"><div class="flabel">${esc(s.label)}</div><div class="fdetail">${esc(s.detail)}</div></div>`;
+    $('flow').appendChild(el); $('flow').scrollTop = $('flow').scrollHeight;
+    await sleep(620);
+    el.classList.remove('active'); el.classList.add('done');
+    el.querySelector('.fnode').textContent = '✓';
+  }
+  setRt('完了', false); await sleep(200);
+
+  // 3) 回答の器 → ヘッドラインをトークン風に
+  m.insertAdjacentHTML('beforeend', aiImpactHTML());
+  const ans = m.lastElementChild;
+  const head = ans.querySelector('#headline');
+  // カード・サマリ・出典・アクションを一旦隠す
+  const hideLater = ans.querySelectorAll('.ix-summary, #ilist, .sources, .msg-actions');
+  hideLater.forEach((n) => { n.style.display = 'none'; });
+  head.textContent = ''; head.classList.add('ix-typing');
+  scrollBottom();
+  await typeInto(head, HEADLINE);
+  head.classList.remove('ix-typing');
+  await sleep(150);
+
+  // 4) サマリ → カードを1枚ずつ → 出典 → アクション
+  const summary = ans.querySelector('.ix-summary');
+  summary.style.display = ''; summary.classList.add('ix-appear'); scrollBottom(); await sleep(220);
+  const list = ans.querySelector('#ilist'); list.style.display = '';
+  const lis = [...list.children];
+  lis.forEach((li) => { li.style.display = 'none'; });
+  for (const li of lis) {
+    li.style.display = ''; li.classList.add('ix-appear');
+    scrollBottom(); await sleep(REDUCED ? 0 : 120);
+  }
+  const src = ans.querySelector('.sources'); src.style.display = ''; src.classList.add('ix-appear');
+  const acts = ans.querySelector('.msg-actions'); acts.style.display = '';
+  scrollBottom(); await sleep(250);
+
+  // 5) 追い質問（リズム確認・一気に）
+  m.insertAdjacentHTML('beforeend', userBubbleHTML(Q2));
+  m.lastElementChild.classList.add('ix-appear');
+  m.insertAdjacentHTML('beforeend', aiFollowupHTML());
+  m.lastElementChild.classList.add('ix-appear');
+  wireAnswer(); scrollBottom();
+
+  $('playBtn').disabled = false; $('playBtn').textContent = '▶ ストリーミングを再生';
+  _playing = false;
+}
+async function typeInto(el, text) {
+  if (REDUCED) { el.textContent = text; return; }
+  const step = 2;               // 2文字ずつ＝トークン風
+  for (let i = 0; i <= text.length; i += step) {
+    el.textContent = text.slice(0, i);
+    // 追従中だけ最下部へ（#6 と協調）
+    if (isNearBottom()) scrollBottom();
+    await sleep(24);
+  }
+  el.textContent = text;
+}
+
+/* ===================================================================
+   回答内インタラクションの結線（instant/replay 双方で呼ぶ）
+   =================================================================== */
+function wireAnswer() {
+  applyFilter(currentFilter);   // フィルタの見た目を再適用
+}
+
+/* #2 展開/折りたたみ（イベント委譲） */
+$('messages').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-toggle]');
+  if (btn) { const li = btn.closest('li'); if (li) li.classList.toggle('open'); return; }
+
+  // #1 hover アクション
+  const copy = e.target.closest('[data-copy]');
+  if (copy) { copyAnswer(copy); return; }
+  const quote = e.target.closest('[data-quote]');
+  if (quote) { quoteAnswer(quote); return; }
+  const rerun = e.target.closest('[data-rerun]');
+  if (rerun) { toast('この質問を再実行します（デモ）'); replay(); return; }
+
+  // #3 フィルタ
+  const fc = e.target.closest('[data-filter]');
+  if (fc) { applyFilter(fc.dataset.filter); return; }
+
+  // #4 出典クリック（ダミーDL）
+  const src = e.target.closest('[data-src]');
+  if (src) { e.preventDefault(); toast('原本をダウンロードしました（デモ）'); return; }
+});
+
+/* #1 コピー：AI 本文をクリップボードへ */
+function copyAnswer(btn) {
+  const body = btn.closest('.a-body');
+  const clone = body.cloneNode(true);
+  clone.querySelectorAll('.msg-actions, .ix-summary, .ix-pop').forEach((n) => n.remove());
+  const text = clone.innerText.replace(/\n{3,}/g, '\n\n').trim();
+  const done = () => toast('コピーしました');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else { fallbackCopy(text, done); }
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed';
+  ta.style.opacity = '0'; document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch (_) { toast('コピーできませんでした'); }
+  document.body.removeChild(ta);
+}
+/* #1 引用して質問：入力欄に「> 引用」を挿入 */
+function quoteAnswer(btn) {
+  const head = btn.closest('.a-body').querySelector('.headline, .aiconcise');
+  const q = (head ? head.textContent : '').trim().slice(0, 90);
+  const inp = $('input');
+  inp.value = '> ' + q + (q.length >= 90 ? '…' : '') + '\n\n';
+  autoGrow(inp); inp.focus();
+  inp.selectionStart = inp.selectionEnd = inp.value.length;
+  toast('引用を入力欄に挿入しました');
+}
+
+/* ===================================================================
+   #3 フィルタチップ
+   =================================================================== */
+let currentFilter = 'all';
+function applyFilter(f) {
+  currentFilter = f;
+  const list = $('ilist'); if (!list) return;
+  let shown = 0;
+  [...list.children].forEach((li) => {
+    const sure = li.dataset.sure === '1';
+    const show = f === 'all' || (f === 'sure' && sure) || (f === 'review' && !sure);
+    li.classList.toggle('ix-hide', !show);
+    if (show) shown++;
+  });
+  document.querySelectorAll('.ix-summary .filterchip').forEach((c) =>
+    c.classList.toggle('on', c.dataset.filter === f));
+  const label = f === 'all' ? `${shown}件を表示中` : (f === 'sure' ? `確実の${shown}件を表示中` : `要確認の${shown}件を表示中`);
+  const sc = $('shownCount'); if (sc) sc.textContent = label;
+}
+
+/* ===================================================================
+   #4 出典ホバープレビュー（150ms 遅延で表示）
+   =================================================================== */
+let _popTimer = null;
+$('messages').addEventListener('mouseover', (e) => {
+  const a = e.target.closest('[data-src]'); if (!a) return;
+  const pop = a.querySelector('.ix-pop'); if (!pop) return;
+  clearTimeout(_popTimer);
+  _popTimer = setTimeout(() => pop.classList.add('show'), REDUCED ? 0 : 150);
+});
+$('messages').addEventListener('mouseout', (e) => {
+  const a = e.target.closest('[data-src]'); if (!a) return;
+  clearTimeout(_popTimer);
+  const pop = a.querySelector('.ix-pop'); if (pop) pop.classList.remove('show');
+});
+
+/* ===================================================================
+   #6 スクロール追従ピル
+   =================================================================== */
+function isNearBottom() {
+  const m = $('messages'); return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+}
+function scrollBottom() { const m = $('messages'); m.scrollTo({ top: m.scrollHeight, behavior: REDUCED ? 'auto' : 'smooth' }); }
+$('messages').addEventListener('scroll', () => {
+  $('jumpBtn').classList.toggle('show', !isNearBottom());
+});
+$('jumpBtn').addEventListener('click', () => { scrollBottom(); $('jumpBtn').classList.remove('show'); });
+
+/* ===================================================================
+   #7 入力欄: 自動高さ・送信中スピナー・D&D・ファイルチップ
+   =================================================================== */
+const input = $('input');
+function autoGrow(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
+input.addEventListener('input', () => { autoGrow(input); maybeOpenPalette(); });
+
+$('sendBtn').addEventListener('click', doSend);
+function doSend() {
+  const text = input.value.trim();
+  if (!text) { toast('メッセージを入力してください'); return; }
+  const btn = $('sendBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  setTimeout(() => {
+    btn.disabled = false; btn.textContent = '↑';
+    input.value = ''; autoGrow(input); clearFiles();
+    toast('送信しました（デモ・実際の応答は「▶ 再生」で確認できます）');
+  }, 1100);
+}
+
+// D&D 受け皿
+const box = $('box');
+['dragenter', 'dragover'].forEach((ev) => box.addEventListener(ev, (e) => {
+  e.preventDefault(); box.classList.add('ix-drag');
+}));
+['dragleave', 'drop'].forEach((ev) => box.addEventListener(ev, (e) => {
+  e.preventDefault();
+  if (ev === 'dragleave' && box.contains(e.relatedTarget)) return;
+  box.classList.remove('ix-drag');
+}));
+box.addEventListener('drop', (e) => {
+  const files = [...(e.dataTransfer ? e.dataTransfer.files : [])];
+  if (files.length) { files.forEach((f) => addFileChip(f.name)); toast(`${files.length} 件を添付しました`); }
+});
+$('attachBtn').addEventListener('click', () => {
+  // デモ用のダミーファイルを1件足す（実機はファイル選択ダイアログ）
+  const names = ['受注仕様_メモ.md', '税率改定_連絡.txt', '見積サンプル.csv'];
+  addFileChip(names[$('fileChips').children.length % names.length]);
+});
+function addFileChip(name) {
+  const chip = document.createElement('span'); chip.className = 'ix-file';
+  chip.innerHTML = `📎 ${esc(name)} <button class="x" title="削除" aria-label="削除">✕</button>`;
+  chip.querySelector('.x').addEventListener('click', () => chip.remove());
+  $('fileChips').appendChild(chip);
+}
+function clearFiles() { $('fileChips').innerHTML = ''; }
+
+/* ===================================================================
+   #8 / コマンドパレット
+   =================================================================== */
+const TEMPLATES = [
+  { title: '影響調査', desc: '〇〇を変更したときの影響範囲を洗い出す', text: '「」を変更した場合の影響範囲を、確実／要確認に分けて教えてください。' },
+  { title: '障害調査', desc: 'エラー・不具合の原因候補と関連箇所をたどる', text: '「」でエラーが出ています。原因の候補と関連する資産を教えてください。' },
+  { title: '仕様確認', desc: '資料の該当箇所を出典つきで確認する', text: '「」の仕様について、根拠となる資料の該当箇所を引用して教えてください。' },
+];
+const palette = $('cmdPalette');
+let _cmdSel = 0, _cmdOpen = false;
+function renderPalette() {
+  palette.innerHTML = '<div class="ch">定型質問（↑↓ で選択・Enter で挿入・Esc で閉じる）</div>' +
+    TEMPLATES.map((t, i) =>
+      `<button class="ix-cmditem${i === _cmdSel ? ' sel' : ''}" data-cmd="${i}"><b>${esc(t.title)}</b><small>${esc(t.desc)}</small></button>`).join('');
+}
+function openPalette() { _cmdOpen = true; _cmdSel = 0; renderPalette(); palette.classList.add('show'); }
+function closePalette() { _cmdOpen = false; palette.classList.remove('show'); }
+function maybeOpenPalette() {
+  if (input.value === '/') openPalette();
+  else if (_cmdOpen && !input.value.startsWith('/')) closePalette();
+}
+function pickTemplate(i) {
+  const t = TEMPLATES[i]; input.value = t.text; autoGrow(input);
+  closePalette(); input.focus();
+  // 「」の中にカーソルを置く
+  const pos = t.text.indexOf('」'); if (pos > 0) { input.selectionStart = input.selectionEnd = pos; }
+  toast(`テンプレ「${t.title}」を挿入しました`);
+}
+palette.addEventListener('click', (e) => {
+  const it = e.target.closest('[data-cmd]'); if (it) pickTemplate(+it.dataset.cmd);
+});
+input.addEventListener('keydown', (e) => {
+  if (_cmdOpen) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); _cmdSel = (_cmdSel + 1) % TEMPLATES.length; renderPalette(); return; }
+    if (e.key === 'ArrowUp') { e.preventDefault(); _cmdSel = (_cmdSel - 1 + TEMPLATES.length) % TEMPLATES.length; renderPalette(); return; }
+    if (e.key === 'Enter') { e.preventDefault(); pickTemplate(_cmdSel); return; }
+    if (e.key === 'Escape') { e.preventDefault(); closePalette(); return; }
+  }
+  // Enter=送信 / Shift+Enter=改行（現行踏襲）
+  if (e.key === 'Enter' && !e.shiftKey && !_cmdOpen) { e.preventDefault(); doSend(); }
+});
+document.addEventListener('click', (e) => { if (!palette.contains(e.target) && e.target !== input) closePalette(); });
+
+/* ===================================================================
+   #9 スケルトンローディング（初期0.6秒）→ 内容フェードイン
+   =================================================================== */
+function showSkeleton() {
+  $('messages').innerHTML = `<div class="ix-skel">
+      <div class="skl bubble"></div>
+      <div class="ix-skelrow"><div class="skl av"></div><div style="flex:1">
+        <div class="skl line" style="width:82%"></div>
+        <div class="skl line" style="width:64%"></div>
+        <div class="skl line" style="width:90%;height:34px"></div>
+        <div class="skl line" style="width:74%;height:34px"></div>
+      </div></div>
+    </div>`;
+}
+
+/* ===================================================================
+   その他: テーマ切替・パネル開閉・最終チェック時刻
+   =================================================================== */
+$('themebtn').addEventListener('click', () => {
+  const cur = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = cur;
+  $('themebtn').textContent = cur === 'dark' ? '☀' : '🌙';
+});
+function collapseLeft(v) { $('app').classList.toggle('lzero', v); }
+function collapseRight(v) { $('app').classList.toggle('rzero', v); }
+$('sideclose').addEventListener('click', () => collapseLeft(true));
+$('sideopen').addEventListener('click', () => collapseLeft(false));
+$('rightclose').addEventListener('click', () => collapseRight(true));
+$('rightclose2').addEventListener('click', () => collapseRight(true));
+$('rightopen').addEventListener('click', () => collapseRight(false));
+$('playBtn').addEventListener('click', replay);
+
+// 最終チェック時刻（デモ）
+(function () {
+  const d = new Date();
+  $('hc-time').textContent = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+})();
+
+/* ---- 起動: スケルトン → 一発表示 ---- */
+showSkeleton();
+setTimeout(() => {
+  const m = $('messages'); m.style.opacity = '0';
+  buildInstant();
+  m.style.transition = 'opacity .3s ease'; requestAnimationFrame(() => { m.style.opacity = '1'; });
+}, REDUCED ? 0 : 600);
+autoGrow(input);
+</script>
+</body>
+</html>

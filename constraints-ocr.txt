@@ -1,0 +1,7 @@
+# Optional isolated OCR worker constraints.
+# Core FastAPI uses constraints.txt (currently NumPy 2.5.x); PaddleX 3.7.x requires NumPy <2.4.
+# Keep this file separate so installing the optional worker never changes the core environment.
+numpy==2.3.5
+paddlex==3.7.2
+psycopg==3.3.4
+psycopg-binary==3.3.4

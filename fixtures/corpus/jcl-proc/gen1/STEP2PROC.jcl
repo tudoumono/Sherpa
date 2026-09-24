@@ -1,0 +1,2 @@
+// PROC
+//STEP1    EXEC PGM=PGMA

@@ -1,0 +1,29 @@
+[Unit]
+Description=Sherpa FastAPI
+Documentation=file:/opt/sherpa/current/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=sherpa-api
+Group=sherpa-workspace
+WorkingDirectory=/opt/sherpa/current
+Environment=SHERPA_ENV_FILE=/etc/sherpa/sherpa.env
+Environment=PYTHON_BIN=/opt/sherpa/current/.venv/bin/python
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0007
+ExecStart=/opt/sherpa/current/scripts/run-api.sh serve
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/sherpa/kb
+ReadWritePaths=/srv/sherpa/users /srv/sherpa/derived
+
+[Install]
+WantedBy=multi-user.target

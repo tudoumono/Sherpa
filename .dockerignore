@@ -1,0 +1,23 @@
+# 本番イメージ/配布に含めないもの（架空 golden テストデータを出荷しない・テスト資産は dev/CI のみ）。
+# 注: Docker の .dockerignore はインラインコメント非対応＝コメントは必ず行頭 # の独立行にする。
+# ただし現状アプリ用 Dockerfile は無く repo 直起動のため、本番非参照の主担保はランタイムの
+# SHERPA_USE_FIXTURES フラグ（worlds._fixtures）＋エンドポイントの world 実在ガード。下記は将来 build 時の除外。
+.git
+.gitignore
+.claude
+.pytest_cache
+__pycache__
+# 架空 golden テストコーパス（fixtures/corpus/v1 等）＝テスト専用・本番非参照
+fixtures
+# テストコード
+tests
+# 画面モック
+mockups
+# 設計ドキュメント（配布物には不要）
+docs
+# World原本・派生物・観測cache・model cache。OCR imageのbuild contextへも絶対に送らない。
+data
+# 秘密（実行時に注入・イメージに焼かない）。配布用の値なしexampleだけは除外解除する。
+.env
+.env.*
+!.env.example

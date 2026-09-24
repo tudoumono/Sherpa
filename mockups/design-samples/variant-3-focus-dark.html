@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<!--
+  Sherpa デザインサンプル — 方向3「モダン・フォーカス（ダーク基調）」
+  inspiration: aurora-ambient（暗い背景に柔らかいオーロラ状の光・単一アクセント・丸みのあるピル）
+  ダーク基調＋単一アクセント（teal）で情報のフォーカス感。ただし冷たくしない
+  ＝暖かみのあるチャコール・柔らかい光のにじみ・大きめの角丸を維持。
+  会話（中央）を光で持ち上げ、両サイドは静かに後退させる。
+  自己完結（インライン CSS・外部アセット参照なし）。デスクトップ 1200px 想定。
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — チャット（方向3 モダン・フォーカス）</title>
+<style>
+  :root{
+    --accent:#2dd4bf; --accent-2:#5eead4; --accent-weak:#0f3b35; --accent-ink:#7bf0dd;
+    --bg:#0f141b; --bg-2:#0b1015; --surface:#171e27; --surface-2:#1e2731; --border:#2a333f; --border-soft:#232c37;
+    --ink:#e8eef4; --ink-2:#9db0c1; --ink-3:#6a7887;
+    --ok:#34d399; --ok-bg:#0e3a2b; --warn:#fbbf24; --warn-bg:#39300f;
+    --radius:18px; --radius-sm:11px; --radius-pill:999px;
+    --shadow-1:0 1px 3px rgba(0,0,0,.4);
+    --shadow-2:0 6px 22px rgba(0,0,0,.4);
+    --shadow-lg:0 18px 48px rgba(0,0,0,.55);
+    --glow:0 0 40px rgba(45,212,191,.22);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);font-size:14px;line-height:1.7;
+    font-variant-numeric:tabular-nums;
+    background:
+      radial-gradient(48% 46% at 78% 4%, rgba(45,212,191,.14), transparent 66%),
+      radial-gradient(42% 46% at 6% 96%, rgba(129,140,248,.10), transparent 68%),
+      radial-gradient(30% 34% at 92% 90%, rgba(45,212,191,.08), transparent 70%),
+      var(--bg);
+    -webkit-font-smoothing:antialiased;}
+  button{font-family:inherit;cursor:pointer}
+
+  /* ===== トップバー ===== */
+  .topbar{height:60px;display:flex;align-items:center;gap:18px;padding:0 22px;
+    background:rgba(15,20,27,.72);backdrop-filter:saturate(1.2) blur(10px);
+    border-bottom:1px solid var(--border-soft);position:sticky;top:0;z-index:10}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:15px;letter-spacing:.01em}
+  .brand .mark{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:#04201c;font-size:15px;
+    background:linear-gradient(150deg,var(--accent-2),var(--accent));box-shadow:0 0 18px rgba(45,212,191,.5)}
+  .brand small{font-weight:500;color:var(--ink-3);font-size:11.5px}
+  .nav{display:flex;gap:3px;background:var(--surface);border:1px solid var(--border-soft);
+    border-radius:var(--radius-pill);padding:4px}
+  .nav a{height:32px;line-height:32px;padding:0 15px;border-radius:var(--radius-pill);font-size:13px;
+    color:var(--ink-2);text-decoration:none;transition:background .15s,color .15s}
+  .nav a:hover{color:var(--ink)}
+  .nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:700}
+  .topbar .spacer{flex:1}
+  .healthdot{width:11px;height:11px;border-radius:50%;background:var(--ok);
+    box-shadow:0 0 0 4px rgba(52,211,153,.16), 0 0 12px rgba(52,211,153,.5);cursor:default}
+  .iconbtn{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:var(--surface);
+    color:var(--ink-2);display:grid;place-items:center;font-size:15px}
+  .iconbtn:hover{background:var(--surface-2);color:var(--ink)}
+  .avatar-top{width:34px;height:34px;border-radius:50%;color:#04201c;display:grid;place-items:center;font-size:13px;
+    font-weight:800;background:linear-gradient(150deg,var(--accent-2),var(--accent))}
+
+  /* ===== 3ペイン ===== */
+  .app{display:grid;grid-template-columns:274px minmax(0,1fr);height:calc(100vh - 60px)}
+
+  /* 左: 履歴（静かに後退） */
+  .side{display:flex;flex-direction:column;padding:16px 14px;gap:8px;min-height:0;
+    border-right:1px solid var(--border-soft);background:rgba(11,16,21,.5)}
+  .newchat{height:44px;border:1px solid var(--accent);border-radius:var(--radius-sm);
+    background:var(--accent-weak);color:var(--accent-ink);font-weight:700;font-size:13.5px;
+    display:flex;align-items:center;justify-content:center;gap:7px;box-shadow:var(--glow)}
+  .newchat:hover{background:#12463f}
+  .histscroll{flex:1;overflow:auto;min-height:0;margin-top:4px}
+  .histhead{font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--ink-3);
+    padding:12px 10px 6px;text-transform:uppercase}
+  .histitem{display:block;width:100%;text-align:left;border:none;background:transparent;
+    padding:9px 11px;border-radius:var(--radius-sm);margin-bottom:2px;color:var(--ink-3);cursor:pointer}
+  .histitem:hover{background:var(--surface-2);color:var(--ink-2)}
+  .histitem.on{background:var(--surface);color:var(--ink);font-weight:600;box-shadow:inset 0 0 0 1px var(--border),var(--shadow-1)}
+  .histitem.on .t::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;
+    background:var(--accent);box-shadow:0 0 8px var(--accent);margin-right:7px;vertical-align:middle}
+  .histitem .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .histitem .d{font-size:11px;color:var(--ink-3);margin-top:1px}
+  .userbox{display:flex;align-items:center;gap:10px;padding:11px 8px 2px;border-top:1px solid var(--border-soft)}
+  .userbox .av{width:34px;height:34px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);
+    display:grid;place-items:center;color:var(--ink-2);font-size:12px;font-weight:700}
+  .userbox b{font-size:13px;display:block}.userbox small{color:var(--ink-3);font-size:11px}
+  .userbox .lo{margin-left:auto;width:30px;height:30px;border:none;background:transparent;border-radius:8px;
+    color:var(--ink-3);font-size:15px}
+  .userbox .lo:hover{background:var(--surface-2);color:var(--ink)}
+
+  /* 中央: 会話（フォーカス） */
+  .chat{display:flex;flex-direction:column;min-width:0;min-height:0}
+  .chathead{height:60px;display:flex;align-items:center;gap:12px;padding:0 28px;
+    border-bottom:1px solid var(--border-soft);flex:0 0 auto}
+  .chathead .title{font-weight:700;font-size:15px}
+  .chathead .spacer{flex:1}
+  .ghost{height:34px;padding:0 13px;border:1px solid var(--border);border-radius:var(--radius-sm);
+    background:var(--surface);color:var(--ink-2);font-size:12.5px;display:inline-flex;align-items:center;gap:6px}
+  .ghost:hover{background:var(--surface-2);color:var(--ink)}
+
+  .stream{flex:1;overflow:auto;padding:32px 28px 26px}
+  .msg{max-width:800px;margin:0 auto 28px}
+  .msg.user{display:flex;justify-content:flex-end}
+  .ububble{background:linear-gradient(150deg,var(--accent-2),var(--accent));color:#04201c;font-weight:600;
+    padding:12px 18px;border-radius:18px 18px 6px 18px;max-width:72%;font-size:14px;line-height:1.65;
+    box-shadow:0 6px 22px rgba(45,212,191,.3)}
+  .msg.ai{display:flex;gap:14px}
+  .a-avatar{width:38px;height:38px;border-radius:12px;flex:0 0 auto;display:grid;place-items:center;color:#04201c;
+    font-size:16px;font-weight:800;background:linear-gradient(150deg,var(--accent-2),var(--accent));box-shadow:var(--glow)}
+  .answer{flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:20px 22px;box-shadow:var(--shadow-2)}
+  .headline{font-size:16.5px;font-weight:800;line-height:1.6;letter-spacing:.01em;margin:0 0 15px}
+  .headline em{font-style:normal;color:var(--accent-ink)}
+
+  /* サマリ */
+  .summary{display:flex;gap:10px;margin-bottom:17px;flex-wrap:wrap}
+  .scell{background:var(--surface-2);border:1px solid var(--border);border-radius:14px;padding:13px 17px;
+    display:flex;align-items:baseline;gap:9px;min-width:112px}
+  .scell .n{font-size:23px;font-weight:800;line-height:1}
+  .scell .l{font-size:12px;color:var(--ink-3)}
+  .scell.total .n{color:var(--accent-ink)}
+  .scell.ok .n{color:var(--ok)} .scell.warn .n{color:var(--warn)}
+  .conf{display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:12.5px}
+  .conf .d{width:9px;height:9px;border-radius:50%}
+  .conf.ok{color:var(--ok)} .conf.ok .d{background:var(--ok);box-shadow:0 0 7px rgba(52,211,153,.6)}
+  .conf.warn{color:var(--warn)} .conf.warn .d{background:transparent;border:2px solid var(--warn);width:10px;height:10px}
+
+  /* 代表カード */
+  .cards-label{font-size:12px;font-weight:700;color:var(--ink-3);letter-spacing:.04em;margin:2px 0 9px}
+  .cards{display:flex;flex-direction:column;gap:11px}
+  .icard{background:var(--surface-2);border:1px solid var(--border);border-radius:15px;
+    padding:15px 17px;transition:border-color .18s,box-shadow .18s}
+  .icard:hover{border-color:var(--accent);box-shadow:var(--glow)}
+  .icard .top{display:flex;align-items:center;gap:10px}
+  .icard .nm{font-weight:700;font-size:14px}
+  .icard .kind{font-size:11px;padding:2px 9px;border-radius:var(--radius-pill);background:var(--bg-2);color:var(--ink-2);border:1px solid var(--border)}
+  .icard .top .spacer{flex:1}
+  .icard .why{font-size:12.5px;color:var(--ink-2);margin:9px 0 12px;line-height:1.65}
+  .route{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .chip{display:inline-flex;align-items:center;height:27px;padding:0 12px;border-radius:var(--radius-pill);
+    font-size:12px;font-weight:600;background:var(--accent-weak);color:var(--accent-ink)}
+  .chip.origin{background:linear-gradient(150deg,var(--accent-2),var(--accent));color:#04201c}
+  .route .arr{color:var(--ink-3);font-size:12px}
+
+  /* 出典フッター */
+  .sources{margin-top:17px;padding-top:15px;border-top:1px dashed var(--border)}
+  .sources .h{font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--ink-3);margin-bottom:9px}
+  .srcrow{display:flex;flex-wrap:wrap;gap:9px}
+  .src{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--accent-ink);
+    text-decoration:none;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius-pill);
+    padding:7px 13px;transition:border-color .15s,box-shadow .15s}
+  .src:hover{border-color:var(--accent);box-shadow:var(--glow)}
+  .src .dl{color:var(--ink-3);font-size:12px}
+
+  .aiconcise{font-size:14px;line-height:1.8;color:var(--ink)}
+  .aiconcise b{color:var(--accent-ink)}
+
+  /* ===== コンポーザー（光でフォーカス） ===== */
+  .composer{flex:0 0 auto;padding:14px 28px 22px;border-top:1px solid var(--border-soft);
+    background:linear-gradient(0deg, rgba(45,212,191,.05), transparent)}
+  .cbar{max-width:800px;margin:0 auto 10px;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 14px;border-radius:var(--radius-pill);
+    border:1px solid var(--border);background:var(--surface);color:var(--ink-2);font-size:12.5px}
+  .pill b{color:var(--ink);font-weight:700}
+  .pill.on{background:var(--accent-weak);border-color:var(--accent);color:var(--accent-ink);box-shadow:var(--glow)}
+  .pill.on b{color:var(--accent-ink)}
+  .cbar .spacer{flex:1}
+  .inputbox{max-width:800px;margin:0 auto;display:flex;align-items:flex-end;gap:10px;
+    border:1px solid var(--border);border-radius:20px;background:var(--surface);padding:11px 13px;box-shadow:var(--shadow-2)}
+  .inputbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-weak),var(--glow)}
+  .inputbox textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;font-size:14.5px;
+    background:transparent;color:var(--ink);line-height:1.6;padding:6px 4px;max-height:120px}
+  .inputbox textarea::placeholder{color:var(--ink-3)}
+  .send{width:40px;height:40px;border-radius:13px;border:none;color:#04201c;font-size:17px;display:grid;place-items:center;
+    background:linear-gradient(150deg,var(--accent-2),var(--accent));box-shadow:0 0 22px rgba(45,212,191,.55);flex:0 0 auto}
+  .send:hover{filter:brightness(1.08)}
+  .hintline{max-width:800px;margin:9px auto 0;text-align:center;font-size:11px;color:var(--ink-3)}
+</style>
+</head>
+<body class="v3">
+
+<header class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav">
+    <a class="on" href="#">チャット</a>
+    <a href="#">資料を取り込む</a>
+    <a href="#">ナレッジグラフ</a>
+    <a href="#">使い方</a>
+    <a href="#">設定</a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="healthdot" title="サービスは正常に動作しています"></span>
+  <button class="iconbtn" title="テーマ切替">☀</button>
+  <div class="avatar-top" title="管理者">管</div>
+</header>
+
+<div class="app">
+  <!-- 左: 履歴 -->
+  <aside class="side">
+    <button class="newchat">＋ 新しいチャット</button>
+    <div class="histscroll">
+      <div class="histhead">今日</div>
+      <button class="histitem on"><div class="t">消費税率の影響範囲</div><div class="d">たった今</div></button>
+      <button class="histitem"><div class="t">見積機能のエラー調査</div><div class="d">午前 11:20</div></button>
+      <button class="histitem"><div class="t">受注テーブルの項目確認</div><div class="d">午前 9:44</div></button>
+      <div class="histhead">昨日</div>
+      <button class="histitem"><div class="t">JCL の実行順序について</div><div class="d">昨日</div></button>
+      <button class="histitem"><div class="t">請求書レイアウト定義のチェック</div><div class="d">昨日</div></button>
+    </div>
+    <div class="userbox">
+      <span class="av">管</span>
+      <div><b>管理者</b><small>Sherpa</small></div>
+      <button class="lo" title="ログアウト">⎋</button>
+    </div>
+  </aside>
+
+  <!-- 中央: 会話 -->
+  <main class="chat">
+    <div class="chathead">
+      <span class="title">消費税率の影響範囲</span>
+      <span class="spacer"></span>
+      <button class="ghost" title="文字サイズ">あ</button>
+      <button class="ghost">⬇ 書き出し</button>
+      <button class="ghost">🔗 共有</button>
+    </div>
+
+    <div class="stream">
+      <!-- 1往復目 -->
+      <div class="msg user"><div class="ububble">消費税率を変更した場合、何に影響しますか？</div></div>
+
+      <div class="msg ai">
+        <div class="a-avatar">✦</div>
+        <div class="answer">
+          <div class="headline">消費税率の変更は、<em>13件の資産</em>に影響します。まず ● 確実の6件から着手するのがおすすめです。</div>
+
+          <div class="summary">
+            <div class="scell total"><span class="n">13</span><span class="l">影響する資産</span></div>
+            <div class="scell ok"><span class="n">6</span><span class="l"><span class="conf ok"><span class="d"></span>確実</span></span></div>
+            <div class="scell warn"><span class="n">7</span><span class="l"><span class="conf warn"><span class="d"></span>要確認</span></span></div>
+          </div>
+
+          <div class="cards-label">影響の大きい代表 3件</div>
+          <div class="cards">
+            <div class="icard">
+              <div class="top"><span class="nm">見積機能</span><span class="kind">COBOL</span><span class="spacer"></span><span class="conf ok"><span class="d"></span>確実</span></div>
+              <div class="why">税率を直接参照して見積金額を計算しています。税率変更時は計算ロジックの改修が必要です。</div>
+              <div class="route"><span class="chip origin">消費税率</span><span class="arr">←</span><span class="chip">税計算ルール</span><span class="arr">←</span><span class="chip">見積機能</span></div>
+            </div>
+            <div class="icard">
+              <div class="top"><span class="nm">請求書レイアウト定義</span><span class="kind">設計書</span><span class="spacer"></span><span class="conf ok"><span class="d"></span>確実</span></div>
+              <div class="why">税率と税額の表示位置がレイアウトに固定されています。表示仕様の見直しが必要です。</div>
+              <div class="route"><span class="chip origin">消費税率</span><span class="arr">←</span><span class="chip">税額表示</span><span class="arr">←</span><span class="chip">請求書レイアウト</span></div>
+            </div>
+            <div class="icard">
+              <div class="top"><span class="nm">受注登録画面</span><span class="kind">画面仕様</span><span class="spacer"></span><span class="conf warn"><span class="d"></span>要確認</span></div>
+              <div class="why">税計算ルールを経由して影響する可能性があります。実際の参照有無を確認してください。</div>
+              <div class="route"><span class="chip origin">消費税率</span><span class="arr">←</span><span class="chip">税計算ルール</span><span class="arr">←</span><span class="chip">受注登録</span></div>
+            </div>
+          </div>
+
+          <div class="sources">
+            <div class="h">出典</div>
+            <div class="srcrow">
+              <a class="src" href="#">📄 消費税率_定義.md <span class="dl">⬇</span></a>
+              <a class="src" href="#">📄 税計算ルール_設計書.pdf <span class="dl">⬇</span></a>
+              <a class="src" href="#">📄 見積機能_仕様書.md <span class="dl">⬇</span></a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2往復目 -->
+      <div class="msg user"><div class="ububble">その中で、対応が必須なのはどれ？</div></div>
+
+      <div class="msg ai">
+        <div class="a-avatar">✦</div>
+        <div class="answer">
+          <div class="aiconcise">
+            <b>● 確実の6件</b>はすべて改修が必要です。中でも <b>見積機能（COBOL）</b> と <b>請求書レイアウト定義</b> は税率が直接埋め込まれているため、最優先での修正をおすすめします。○ 要確認の7件は、税計算ルールを経由するため、まず影響有無の確認から始めてください。
+          </div>
+          <div class="sources">
+            <div class="h">出典</div>
+            <div class="srcrow">
+              <a class="src" href="#">📄 税計算ルール_設計書.pdf <span class="dl">⬇</span></a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- コンポーザー -->
+    <div class="composer">
+      <div class="cbar">
+        <span class="pill on">📚 ナレッジ参照 <b>オン</b></span>
+        <span class="pill">🎯 範囲: <b>4期システム / 02_設計</b> ▾</span>
+        <span class="spacer"></span>
+        <span class="pill">🧠 <b>GPT-5.5</b>（メイン）▾</span>
+      </div>
+      <div class="inputbox">
+        <textarea rows="1" placeholder="メッセージを入力（例: 消費税率を変えたい。影響は？）"></textarea>
+        <button class="send" title="送信">↑</button>
+      </div>
+      <div class="hintline">Enter で送信 / Shift + Enter で改行 ・ 回答の末尾には必ず出典（原本）が付きます</div>
+    </div>
+  </main>
+</div>
+
+</body>
+</html>

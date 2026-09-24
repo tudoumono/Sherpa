@@ -1,0 +1,2251 @@
+{
+  "fixtures/eval/deprecation_markers/inputs/DEP-DOCX-MARKERS.docx": {
+    "deleted_runs": [
+      "旧契約条項（変更履歴で削除）"
+    ],
+    "double_strike_runs": [
+      "旧仕様（二重取り消し線）"
+    ],
+    "hidden_runs": [
+      "内部メモ：非公開（隠し文字）"
+    ],
+    "strike_runs": [
+      "旧料金プラン（取り消し線）"
+    ]
+  },
+  "fixtures/eval/deprecation_markers/inputs/DEP-PPTX-MARKERS.pptx": {
+    "hidden_slides": [
+      "ppt/slides/slide4.xml"
+    ],
+    "shapes_by_slide": {
+      "ppt/slides/slide1.xml": [
+        {
+          "bbox_emu": [
+            500000,
+            500000,
+            3500000,
+            1000000
+          ],
+          "has_solid_fill": false,
+          "has_text": true,
+          "text": "旧機能C: 提供終了予定"
+        },
+        {
+          "bbox_emu": [
+            500000,
+            500000,
+            3500000,
+            1000000
+          ],
+          "has_solid_fill": true,
+          "has_text": false,
+          "text": ""
+        }
+      ],
+      "ppt/slides/slide2.xml": [
+        {
+          "bbox_emu": [
+            500000,
+            500000,
+            3500000,
+            1000000
+          ],
+          "has_solid_fill": false,
+          "has_text": true,
+          "text": "旧料金体系: 月額1000円"
+        },
+        {
+          "bbox_emu": [
+            500000,
+            500000,
+            3500000,
+            1000000
+          ],
+          "has_solid_fill": false,
+          "has_text": true,
+          "text": "廃止"
+        }
+      ],
+      "ppt/slides/slide3.xml": [
+        {
+          "bbox_emu": [
+            10144000,
+            500000,
+            12144000,
+            1000000
+          ],
+          "has_solid_fill": false,
+          "has_text": true,
+          "text": "旧仕様メモ（画面外配置）"
+        }
+      ],
+      "ppt/slides/slide4.xml": [
+        {
+          "bbox_emu": [
+            500000,
+            500000,
+            3500000,
+            1000000
+          ],
+          "has_solid_fill": false,
+          "has_text": true,
+          "text": "旧業務フロー（非表示スライド）"
+        }
+      ]
+    }
+  },
+  "fixtures/eval/deprecation_markers/inputs/DEP-XLSX-MARKERS.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          1,
+          2
+        ],
+        "kind": "picture",
+        "part": "xl/drawings/drawing1.xml",
+        "text": ""
+      }
+    ],
+    "hidden_columns": {
+      "対象": [
+        "C"
+      ]
+    },
+    "hidden_rows": {
+      "対象": [
+        4
+      ]
+    },
+    "hidden_sheets": [
+      "旧版"
+    ],
+    "strikethrough_cells": [
+      "対象!B2"
+    ],
+    "very_hidden_sheets": [
+      "内部退避"
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-006.xlsx": {
+    "hidden_columns": {
+      "現行": [
+        "D"
+      ]
+    },
+    "hidden_rows": {
+      "現行": [
+        3
+      ]
+    },
+    "hidden_sheets": [
+      "旧版"
+    ],
+    "very_hidden_sheets": [
+      "内部退避"
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-009.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          2,
+          6
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-010.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          1,
+          4
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "この範囲は廃止"
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-011.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          0,
+          1
+        ],
+        "kind": "picture",
+        "part": "xl/drawings/drawing1.xml",
+        "text": ""
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-013.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          1,
+          1
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "旧コード X01"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          1
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": ""
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          1
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "現行コード X02"
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-015.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          1,
+          1
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "画像埋込設計書"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          4
+        ],
+        "kind": "picture",
+        "part": "xl/drawings/drawing1.xml",
+        "text": ""
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-016.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          9,
+          1
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          2
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止予定"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          3
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止ではない"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          5
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      },
+      {
+        "from_cell_zero_based": [
+          6,
+          4
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-020.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          4,
+          8
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "都度指定"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          8
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          11
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "未承認"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          14
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "1,200,000"
+      },
+      {
+        "from_cell_zero_based": [
+          10,
+          19
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "実行"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          17
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "エラーメッセージ表示領域"
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-021.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          4,
+          5
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "1234567"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          8
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "1,200,000"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          12
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "未承認"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          10
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "都度指定"
+      },
+      {
+        "from_cell_zero_based": [
+          4,
+          10
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      },
+      {
+        "from_cell_zero_based": [
+          8,
+          10
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "法人都度指定"
+      },
+      {
+        "from_cell_zero_based": [
+          1,
+          16
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "エラーメッセージ表示領域"
+      },
+      {
+        "from_cell_zero_based": [
+          10,
+          19
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "実行"
+      },
+      {
+        "from_cell_zero_based": [
+          27,
+          7
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "EVT-EXEC"
+      },
+      {
+        "from_cell_zero_based": [
+          37,
+          7
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "ERR-021"
+      }
+    ]
+  },
+  "fixtures/eval/excel_ja/inputs/JPX-099.xlsx": {
+    "drawing_anchors": [
+      {
+        "from_cell_zero_based": [
+          1,
+          3
+        ],
+        "kind": "shape",
+        "part": "xl/drawings/drawing1.xml",
+        "text": "廃止"
+      }
+    ],
+    "hidden_sheets": [
+      "旧版"
+    ]
+  },
+  "fixtures/eval/office_ja/inputs/OJA-PPTX-EASY.pptx": {
+    "shapes_by_slide": {
+      "ppt/slides/slide1.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            600000,
+            900000,
+            5600000,
+            1600000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "口座照会プレゼン E-PPTX-101"
+        }
+      ],
+      "ppt/slides/slide2.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            900000,
+            1300000,
+            8500000,
+            2200000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "画面ID SCR-PPTX-01。未入力時は更新しない。"
+        }
+      ]
+    }
+  },
+  "fixtures/eval/office_ja/inputs/OJA-PPTX-HARD.pptx": {
+    "hidden_slides": [
+      "ppt/slides/slide2.xml"
+    ],
+    "shapes_by_slide": {
+      "ppt/slides/slide1.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            900000,
+            900000,
+            7500000,
+            1700000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "旧仕様: 取消上限50万円 E-PPTX-OLD"
+        },
+        {
+          "bbox_emu": [
+            750000,
+            750000,
+            7950000,
+            1950000
+          ],
+          "has_solid_fill": true,
+          "has_text": false,
+          "text": ""
+        },
+        {
+          "bbox_emu": [
+            900000,
+            900000,
+            7500000,
+            1700000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "H-PPTX-301 現行上限100万円 E-PPTX-301"
+        },
+        {
+          "bbox_emu": [
+            700000,
+            4100000,
+            2900000,
+            4900000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "廃止"
+        }
+      ],
+      "ppt/slides/slide2.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            900000,
+            1200000,
+            8900000,
+            2200000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "非表示スライド H-PPTX-HIDDEN: 取消上限30万円"
+        }
+      ],
+      "ppt/slides/slide3.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            800000,
+            1200000,
+            9400000,
+            2200000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "遠隔注記参照後、A01正常時だけA02を実行する。"
+        }
+      ]
+    }
+  },
+  "fixtures/eval/office_ja/inputs/OJA-PPTX-LARGE-TABLE.pptx": {
+    "shapes_by_slide": {
+      "ppt/slides/slide1.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide10.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide100.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide101.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide102.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide103.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide104.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide105.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide106.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide107.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide108.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide109.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide11.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide110.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide111.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide112.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide113.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide114.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide115.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide116.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide117.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide118.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide119.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide12.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide120.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide13.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide14.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide15.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide16.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide17.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide18.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide19.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide2.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide20.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide21.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide22.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide23.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide24.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide25.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide26.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide27.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide28.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide29.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide3.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide30.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide31.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide32.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide33.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide34.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide35.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide36.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide37.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide38.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide39.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide4.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide40.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide41.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide42.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide43.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide44.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide45.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide46.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide47.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide48.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide49.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide5.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide50.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide51.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide52.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide53.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide54.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide55.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide56.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide57.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide58.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide59.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide6.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide60.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide61.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide62.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide63.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide64.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide65.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide66.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide67.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide68.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide69.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide7.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide70.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide71.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide72.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide73.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide74.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide75.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide76.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide77.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide78.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide79.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide8.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide80.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide81.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide82.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide83.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide84.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide85.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide86.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide87.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide88.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide89.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide9.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide90.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide91.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide92.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide93.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide94.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide95.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide96.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide97.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide98.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ],
+      "ppt/slides/slide99.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        }
+      ]
+    }
+  },
+  "fixtures/eval/office_ja/inputs/OJA-PPTX-LONG-DESIGN.pptx": {
+    "shapes_by_slide": {
+      "ppt/slides/slide1.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            250000,
+            650000,
+            11850000,
+            6550000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "LD-0001 LD-BEGIN-0001 条件:受付番号が入力済みで処理区分が新規の場合。真:P-0002で入力検証を続ける。偽:E-LD-0001を記録してDB更新を行わない。LD-0002 条件:口座状態02が取引可能で利用停止理由が未設定の場合。真:P-0003で残高を照会する。偽:E-LD-0002を記録してDB更新を行わない。LD-0003 条件:取引金額区分3が日次限度内で累計額との合計も限度以下の場合。真:P-0004で手数料を計算する。偽:E-LD-0003を記録して承認待ちへ遷移する。LD-0004 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0005で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0005 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0006で取得値をワークへ設定する。偽:E-LD-0005を記録して作業単位をロールバックする。LD-0006 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0007で更新処理へ進む。偽:E-LD-0006を記録して承認待ちにする。LD-0007 条件:外部応答コード07が正常かつ応答時刻がタイムアウト以内の場合。真:P-0008で応答項目を反映する。偽:E-LD-0007を記録して再送判定へ進む。LD-0008 条件:更新前後の整合性検査08が成功し排他版番号が一致する場合。真:P-0009で次明細を処理する。偽:E-LD-0008を記録して全更新を取り消す。LD-0009 条件:入力項目09が必須かつ正規化後も空でない場合。真:P-0010で桁数検証する。偽:E-LD-0009を記録して入力画面へ戻す。LD-0010 条件:口座状態10が取引可能で利用停止理由が未設定の場合。真:P-0011で残高を照会する。偽:E-LD-0010を記録してDB更新を行わない。LD-0011 条件:取引金額区分2が日次限度内で累計額との合計も限度以下の場合。真:P-0012で手数料を計算する。偽:E-LD-0011を記録して承認待ちへ遷移する。LD-0012 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0013で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0013 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0014で取得値をワークへ設定する。偽:E-LD-0013を記録して作業単位をロールバックする。LD-0014 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0015で更新処理へ進む。偽:E-LD-0014を記録して承認待ちにする。LD-0015 条件:外部応答コード02が正常かつ応答時刻がタイムアウト以内の場合。真:P-0016で応答項目を反映する。偽:E-LD-0015を記録して再送判定へ進む。LD-0016 条件:更新前後の整合性検査16が成功し排他版番号が一致する場合。真:P-0017で次明細を処理する。偽:E-LD-0016を記録して全更新を取り消す。LD-0017 条件:入力項目17が必須かつ正規化後も空でない場合。真:P-0018で桁数検証する。偽:E-LD-0017を記録して入力画面へ戻す。LD-0018 条件:口座状態07が取引可能で利用停止理由が未設定の場合。真:P-0019で残高を照会する。偽:E-LD-0018を記録してDB更新を行わない。LD-0019 条件:取引金額区分1が日次限度内で累計額との合計も限度以下の場合。真:P-0020で手数料を計算する。偽:E-LD-0019を記録して承認待ちへ遷移する。LD-0020 条件:基準日区分6が営業日で締め時刻前の場合。真:P-0021で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0021 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0022で取得値をワークへ設定する。偽:E-LD-0021を記録して作業単位をロールバックする。LD-0022 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0023で更新処理へ進む。偽:E-LD-0022を記録して承認待ちにする。LD-0023 条件:外部応答コード10が正常かつ応答時刻がタイムアウト以内の場合。真:P-0024で応答項目を反映する。偽:E-LD-0023を記録して再送判定へ進む。LD-0024 条件:更新前後の整合性検査05が成功し排他版番号が一致する場合。真:P-0025で次明細を処理する。偽:E-LD-0024を記録して全更新を取り消す。LD-0025 条件:入力項目02が必須かつ正規化後も空でない場合。真:P-0026で桁数検証する。偽:E-LD-0025を記録して入力画面へ戻す。LD-0026 条件:口座状態04が取引可能で利用停止理由が未設定の場合。真:P-0027で残高を照会する。偽:E-LD-0026を記録してDB更新を行わない。LD-0027 条件:取引金額区分0が日次限度内で累計額との合計も限度以下の場合。真:P-0028で手数料を計算する。偽:E-LD-0027を記録して承認待ちへ遷移する。LD-0028 条件:基準日区分0が営業日で締め時刻前の場合。真:P-0029で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0029 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0030で取得値をワークへ設定する。偽:E-LD-0029を記録して作業単位をロールバックする。LD-0030 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0031で更新処理へ進む。偽:E-LD-0030を記録して承認待ちにする。LD-0031 条件:外部応答コード05が正常かつ応答時刻がタイムアウト以内の場合。真:P-0032で応答項目を反映する。偽:E-LD-0031を記録して再送判定へ進む。LD-0032 条件:更新前後の整合性検査13が成功し排他版番号が一致する場合。真:P-0033で次明細を処理する。偽:E-LD-0032を記録して全更新を取り消す。LD-0033 条件:入力項目10が必須かつ正規化後も空でない場合。真:P-0034で桁数検証する。偽:E-LD-0033を記録して入力画面へ戻す。LD-0034 条件:口座状態01が取引可能で利用停止理由が未設定の場合。真:P-0035で残高を照会する。偽:E-LD-0034を記録してDB更新を行わない。LD-0035 条件:取引金額区分8が日次限度内で累計額との合計も限度以下の場合。真:P-0036で手数料を計算する。偽:E-LD-0035を記録して承認待ちへ遷移する。LD-0036 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0037で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0037 条件:(チャネルがATMまたはインターネット)かつ口座状態が凍結ではなく、顧客認証レベルが2以上の場合。真:P-0038で取引制限を照会する。偽:E-LD-0037を記録し認証再実行画面へ戻す。LD-0038 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0039で更新処理へ進む。偽:E-LD-0038を記録して承認待ちにする。LD-0039 条件:外部応答コード00が正常かつ応答時刻がタイムアウト以内の場合。真:P-0040で応答項目を反映する。偽:E-LD-0039を記録して再送判定へ進む。LD-0040 条件:更新前後の整合性検査02が成功し排他版番号が一致する場合。真:P-0041で次明細を処理する。偽:E-LD-0040を記録して全更新を取り消す。LD-0041 条件:入力項目18が必須かつ正規化後も空でない場合。真:P-0042で桁数検証する。偽:E-LD-0041を記録して入力画面へ戻す。LD-0042 条件:口座状態09が取引可能で利用停止理由が未設定の場合。真:P-0043で残高を照会する。偽:E-LD-0042を記録してDB更新を行わない。LD-0043 条件:取引金額区分7が日次限度内で累計額との合計も限度以下の場合。真:P-0044で手数料を計算する。偽:E-LD-0043を記録して承認待ちへ遷移する。LD-0044 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0045で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0045 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0046で取得値をワークへ設定する。偽:E-LD-0045を記録して作業単位をロールバックする。LD-0046 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0047で更新処理へ進む。偽:E-LD-0046を記録して承認待ちにする。LD-0047 条件:外部応答コード08が正常かつ応答時刻がタイムアウト以内の場合。真:P-0048で応答項目を反映する。偽:E-LD-0047を記録して再送判定へ進む。LD-0048 条件:更新前後の整合性検査10が成功し排他版番号が一致する場合。真:P-0049で次明細を処理する。偽:E-LD-0048を記録して全更新を取り消す。LD-0049 条件:入力項目03が必須かつ正規化後も空でない場合。真:P-0050で桁数検証する。偽:E-LD-0049を記録して入力画面へ戻す。LD-0050 条件:口座状態06が取引可能で利用停止理由が未設定の場合。真:P-0051で残高を照会する。偽:E-LD-0050を記録してDB更新を行わない。LD-0051 条件:取引金額区分6が日次限度内で累計額との合計も限度以下の場合。真:P-0052で手数料を計算する。偽:E-LD-0051を記録して承認待ちへ遷移する。LD-0052 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0053で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0053 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0054で取得値をワークへ設定する。偽:E-LD-0053を記録して作業単位をロールバックする。LD-0054 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0055で更新処理へ進む。偽:E-LD-0054を記録して承認待ちにする。LD-0055 条件:外部応答コード03が正常かつ応答時刻がタイムアウト以内の場合。真:P-0056で応答項目を反映する。偽:E-LD-0055を記録して再送判定へ進む。LD-0056 条件:更新前後の整合性検査18が成功し排他版番号が一致する場合。真:P-0057で次明細を処理する。偽:E-LD-0056を記録して全更新を取り消す。LD-0057 条件:入力項目11が必須かつ正規化後も空でない場合。真:P-0058で桁数検証する。偽:E-LD-0057を記録して入力画面へ戻す。LD-0058 条件:口座状態03が取引可能で利用停止理由が未設定の場合。真:P-0059で残高を照会する。偽:E-LD-0058を記録してDB更新を行わない。LD-0059 条件:取引金額区分5が日次限度内で累計額との合計も限度以下の場合。真:P-0060で手数料を計算する。偽:E-LD-0059を記録して承認待ちへ遷移する。LD-0060 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0061で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0061 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0062で取得値をワークへ設定する。偽:E-LD-0061を記録して作業単位をロールバックする。LD-0062 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0063で更新処理へ進む。偽:E-LD-0062を記録して承認待ちにする。LD-0063 条件:外部応答コード11が正常かつ応答時刻がタイムアウト以内の場合。真:P-0064で応答項目を反映する。偽:E-LD-0063を記録して再送判定へ進む。LD-0064 条件:更新前後の整合性検査07が成功し排他版番号が一致する場合。真:P-0065で次明細を処理する。偽:E-LD-0064を記録して全更新を取り消す。LD-0065 条件:入力項目19が必須かつ正規化後も空でない場合。真:P-0066で桁数検証する。偽:E-LD-0065を記録して入力画面へ戻す。LD-0066 条件:口座状態00が取引可能で利用停止理由が未設定の場合。真:P-0067で残高を照会する。偽:E-LD-0066を記録してDB更新を行わない。LD-0067 条件:取引金額区分4が日次限度内で累計額との合計も限度以下の場合。真:P-0068で手数料を計算する。偽:E-LD-0067を記録して承認待ちへ遷移する。LD-0068 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0069で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0069 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0070で取得値をワークへ設定する。偽:E-LD-0069を記録して作業単位をロールバックする。LD-0070 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0071で更新処理へ進む。偽:E-LD-0070を記録して承認待ちにする。LD-0071 条件:外部応答コード06が正常かつ応答時刻がタイムアウト以内の場合。真:P-0072で応答項目を反映する。偽:E-LD-0071を記録して再送判定へ進む。LD-0072 条件:更新前後の整合性検査15が成功し排他版番号が一致する場合。真:P-0073で次明細を処理する。偽:E-LD-0072を記録して全更新を取り消す。LD-0073 条件:入力項目04が必須かつ正規化後も空でない場合。真:P-0074で桁数検証する。偽:E-LD-0073を記録して入力画面へ戻す。LD-0074 条件:口座状態08が取引可能で利用停止理由が未設定の場合。真:P-0075で残高を照会する。偽:E-LD-0074を記録してDB更新を行わない。LD-0075 条件:取引金額区分3が日次限度内で累計額との合計も限度以下の場合。真:P-0076で手数料を計算する。偽:E-LD-0075を記録して承認待ちへ遷移する。LD-0076 条件:基準日区分6が営業日で締め時刻前の場合。真:P-0077で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0077 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0078で取得値をワークへ設定する。偽:E-LD-0077を記録して作業単位をロールバックする。LD-0078 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0079で更新処理へ進む。偽:E-LD-0078を記録して承認待ちにする。LD-0079 条件:外部応答コード01が正常かつ応答時刻がタイムアウト以内の場合。真:P-0080で応答項目を反映する。偽:E-LD-0079を記録して再送判定へ進む。LD-0080 条件:更新前後の整合性検査04が成功し排他版番号が一致する場合。真:P-0081で次明細を処理する。偽:E-LD-0080を記録して全更新を取り消す。LD-0081 条件:入力項目12が必須かつ正規化後も空でない場合。真:P-0082で桁数検証する。偽:E-LD-0081を記録して入力画面へ戻す。LD-0082 条件:口座状態05が取引可能で利用停止理由が未設定の場合。真:P-0083で残高を照会する。偽:E-LD-0082を記録してDB更新を行わない。LD-0083 条件:取引金額区分2が日次限度内で累計額との合計も限度以下の場合。真:P-0084で手数料を計算する。偽:E-LD-0083を記録して承認待ちへ遷移する。LD-0084 条件:((取引種別が振込かつ依頼人本人確認済み)または(取引種別が口座振替かつ委託者契約が有効))かつ取消済みではない場合。真:P-0085で承認経路を決定する。偽:E-LD-0084を記録して受付を保留する。LD-0085 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0086で取得値をワークへ設定する。偽:E-LD-0085を記録して作業単位をロールバックする。LD-0086 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0087で更新処理へ進む。偽:E-LD-0086を記録して承認待ちにする。LD-0087 条件:外部応答コード09が正常かつ応答時刻がタイムアウト以内の場合。真:P-0088で応答項目を反映する。偽:E-LD-0087を記録して再送判定へ進む。LD-0088 条件:更新前後の整合性検査12が成功し排他版番号が一致する場合。真:P-0089で次明細を処理する。偽:E-LD-0088を記録して全更新を取り消す。LD-0089 条件:入力項目20が必須かつ正規化後も空でない場合。真:P-0090で桁数検証する。偽:E-LD-0089を記録して入力画面へ戻す。LD-0090 条件:口座状態02が取引可能で利用停止理由が未設定の場合。真:P-0091で残高を照会する。偽:E-LD-0090を記録してDB更新を行わない。LD-0091 条件:取引金額区分1が日次限度内で累計額との合計も限度以下の場合。真:P-0092で手数料を計算する。偽:E-LD-0091を記録して承認待ちへ遷移する。LD-0092 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0093で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0093 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0094で取得値をワークへ設定する。偽:E-LD-0093を記録して作業単位をロールバックする。LD-0094 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0095で更新処理へ進む。偽:E-LD-0094を記録して承認待ちにする。LD-0095 条件:外部応答コード04が正常かつ応答時刻がタイムアウト以内の場合。真:P-0096で応答項目を反映する。偽:E-LD-0095を記録して再送判定へ進む。LD-0096 条件:更新前後の整合性検査01が成功し排他版番号が一致する場合。真:P-0097で次明細を処理する。偽:E-LD-0096を記録して全更新を取り消す。LD-0097 条件:入力項目05が必須かつ正規化後も空でない場合。真:P-0098で桁数検証する。偽:E-LD-0097を記録して入力画面へ戻す。LD-0098 条件:口座状態10が取引可能で利用停止理由が未設定の場合。真:P-0099で残高を照会する。偽:E-LD-0098を記録してDB更新を行わない。LD-0099 条件:取引金額区分0が日次限度内で累計額との合計も限度以下の場合。真:P-0100で手数料を計算する。偽:E-LD-0099を記録して承認待ちへ遷移する。LD-0100 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0101で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0101 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0102で取得値をワークへ設定する。偽:E-LD-0101を記録して作業単位をロールバックする。LD-0102 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0103で更新処理へ進む。偽:E-LD-0102を記録して承認待ちにする。LD-0103 条件:外部応答コード12が正常かつ応答時刻がタイムアウト以内の場合。真:P-0104で応答項目を反映する。偽:E-LD-0103を記録して再送判定へ進む。LD-0104 条件:更新前後の整合性検査09が成功し排他版番号が一致する場合。真:P-0105で次明細を処理する。偽:E-LD-0104を記録して全更新を取り消す。LD-0105 条件:入力項目13が必須かつ正規化後も空でない場合。真:P-0106で桁数検証する。偽:E-LD-0105を記録して入力画面へ戻す。LD-0106 条件:口座状態07が取引可能で利用停止理由が未設定の場合。真:P-0107で残高を照会する。偽:E-LD-0106を記録してDB更新を行わない。LD-0107 条件:取引金額区分8が日次限度内で累計額との合計も限度以下の場合。真:P-0108で手数料を計算する。偽:E-LD-0107を記録して承認待ちへ遷移する。LD-0108 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0109で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0109 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0110で取得値をワークへ設定する。偽:E-LD-0109を記録して作業単位をロールバックする。LD-0110 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0111で更新処理へ進む。偽:E-LD-0110を記録して承認待ちにする。LD-0111 条件:外部応答コード07が正常かつ応答時刻がタイムアウト以内の場合。真:P-0112で応答項目を反映する。偽:E-LD-0111を記録して再送判定へ進む。LD-0112 条件:更新前後の整合性検査17が成功し排他版番号が一致する場合。真:P-0113で次明細を処理する。偽:E-LD-0112を記録して全更新を取り消す。LD-0113 条件:入力項目21が必須かつ正規化後も空でない場合。真:P-0114で桁数検証する。偽:E-LD-0113を記録して入力画面へ戻す。LD-0114 条件:口座状態04が取引可能で利用停止理由が未設定の場合。真:P-0115で残高を照会する。偽:E-LD-0114を記録してDB更新を行わない。LD-0115 条件:取引金額区分7が日次限度内で累計額との合計も限度以下の場合。真:P-0116で手数料を計算する。偽:E-LD-0115を記録して承認待ちへ遷移する。LD-0116 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0117で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0117 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0118で取得値をワークへ設定する。偽:E-LD-0117を記録して作業単位をロールバックする。LD-0118 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0119で更新処理へ進む。偽:E-LD-0118を記録して承認待ちにする。LD-0119 条件:外部応答コード02が正常かつ応答時刻がタイムアウト以内の場合。真:P-0120で応答項目を反映する。偽:E-LD-0119を記録して再送判定へ進む。LD-0120 条件:更新前後の整合性検査06が成功し排他版番号が一致する場合。真:P-0121で次明細を処理する。偽:E-LD-0120を記録して全更新を取り消す。LD-0121 条件:入力項目06が必須かつ正規化後も空でない場合。真:P-0122で桁数検証する。偽:E-LD-0121を記録して入力画面へ戻す。LD-0122 条件:口座状態01が取引可能で利用停止理由が未設定の場合。真:P-0123で残高を照会する。偽:E-LD-0122を記録してDB更新を行わない。LD-0123 条件:取引金額区分6が日次限度内で累計額との合計も限度以下の場合。真:P-0124で手数料を計算する。偽:E-LD-0123を記録して承認待ちへ遷移する。LD-0124 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0125で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0125 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0126で取得値をワークへ設定する。偽:E-LD-0125を記録して作業単位をロールバックする。LD-0126 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0127で更新処理へ進む。偽:E-LD-0126を記録して承認待ちにする。LD-0127 条件:適用開始日がNULLではなく、適用開始日以上かつ適用終了日未満に処理基準日時が含まれる場合。真:P-0128で現行料率を採用する。偽:E-LD-0127を記録し料率未確定として終了する。LD-0128 条件:更新前後の整合性検査14が成功し排他版番号が一致する場合。真:P-0129で次明細を処理する。偽:E-LD-0128を記録して全更新を取り消す。LD-0129 条件:入力項目14が必須かつ正規化後も空でない場合。真:P-0130で桁数検証する。偽:E-LD-0129を記録して入力画面へ戻す。LD-0130 条件:口座状態09が取引可能で利用停止理由が未設定の場合。真:P-0131で残高を照会する。偽:E-LD-0130を記録してDB更新を行わない。LD-0131 条件:取引金額区分5が日次限度内で累計額との合計も限度以下の場合。真:P-0132で手数料を計算する。偽:E-LD-0131を記録して承認待ちへ遷移する。LD-0132 条件:基準日区分6が営業日で締め時刻前の場合。真:P-0133で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0133 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0134で取得値をワークへ設定する。偽:E-LD-0133を記録して作業単位をロールバックする。LD-0134 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0135で更新処理へ進む。偽:E-LD-0134を記録して承認待ちにする。LD-0135 条件:外部応答コード05が正常かつ応答時刻がタイムアウト以内の場合。真:P-0136で応答項目を反映する。偽:E-LD-0135を記録して再送判定へ進む。LD-0136 条件:更新前後の整合性検査03が成功し排他版番号が一致する場合。真:P-0137で次明細を処理する。偽:E-LD-0136を記録して全更新を取り消す。LD-0137 条件:入力項目22が必須かつ正規化後も空でない場合。真:P-0138で桁数検証する。偽:E-LD-0137を記録して入力画面へ戻す。LD-0138 条件:口座状態06が取引可能で利用停止理由が未設定の場合。真:P-0139で残高を照会する。偽:E-LD-0138を記録してDB更新を行わない。LD-0139 条件:取引金額区分4が日次限度内で累計額との合計も限度以下の場合。真:P-0140で手数料を計算する。偽:E-LD-0139を記録して承認待ちへ遷移する。LD-0140 条件:基準日区分0が営業日で締め時刻前の場合。真:P-0141で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0141 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0142で取得値をワークへ設定する。偽:E-LD-0141を記録して作業単位をロールバックする。LD-0142 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0143で更新処理へ進む。偽:E-LD-0142を記録して承認待ちにする。LD-0143 条件:外部応答コード00が正常かつ応答時刻がタイムアウト以内の場合。真:P-0144で応答項目を反映する。偽:E-LD-0143を記録して再送判定へ進む。LD-0144 条件:更新前後の整合性検査11が成功し排他版番号が一致する場合。真:P-0145で次明細を処理する。偽:E-LD-0144を記録して全更新を取り消す。LD-0145 条件:入力項目07が必須かつ正規化後も空でない場合。真:P-0146で桁数検証する。偽:E-LD-0145を記録して入力画面へ戻す。LD-0146 条件:口座状態03が取引可能で利用停止理由が未設定の場合。真:P-0147で残高を照会する。偽:E-LD-0146を記録してDB更新を行わない。LD-0147 条件:取引金額区分3が日次限度内で累計額との合計も限度以下の場合。真:P-0148で手数料を計算する。偽:E-LD-0147を記録して承認待ちへ遷移する。LD-0148 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0149で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0149 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0150で取得値をワークへ設定する。偽:E-LD-0149を記録して作業単位をロールバックする。LD-0150 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0151で更新処理へ進む。偽:E-LD-0150を記録して承認待ちにする。LD-0151 条件:外部応答コード08が正常かつ応答時刻がタイムアウト以内の場合。真:P-0152で応答項目を反映する。偽:E-LD-0151を記録して再送判定へ進む。LD-0152 条件:更新前後の整合性検査00が成功し排他版番号が一致する場合。真:P-0153で次明細を処理する。偽:E-LD-0152を記録して全更新を取り消す。LD-0153 条件:入力項目15が必須かつ正規化後も空でない場合。真:P-0154で桁数検証する。偽:E-LD-0153を記録して入力画面へ戻す。LD-0154 条件:口座状態00が取引可能で利用停止理由が未設定の場合。真:P-0155で残高を照会する。偽:E-LD-0154を記録してDB更新を行わない。LD-0155 条件:取引金額区分2が日次限度内で累計額との合計も限度以下の場合。真:P-0156で手数料を計算する。偽:E-LD-0155を記録して承認待ちへ遷移する。LD-0156 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0157で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0157 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0158で取得値をワークへ設定する。偽:E-LD-0157を記録して作業単位をロールバックする。LD-0158 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0159で更新処理へ進む。偽:E-LD-0158を記録して承認待ちにする。LD-0159 条件:外部応答コード03が正常かつ応答時刻がタイムアウト以内の場合。真:P-0160で応答項目を反映する。偽:E-LD-0159を記録して再送判定へ進む。LD-0160 条件:更新前後の整合性検査08が成功し排他版番号が一致する場合。真:P-0161で次明細を処理する。偽:E-LD-0160を記録して全更新を取り消す。LD-0161 条件:入力項目00が必須かつ正規化後も空でない場合。真:P-0162で桁数検証する。偽:E-LD-0161を記録して入力画面へ戻す。LD-0162 条件:口座状態08が取引可能で利用停止理由が未設定の場合。真:P-0163で残高を照会する。偽:E-LD-0162を記録してDB更新を行わない。LD-0163 条件:取引金額区分1が日次限度内で累計額との合計も限度以下の場合。真:P-0164で手数料を計算する。偽:E-LD-0163を記録して承認待ちへ遷移する。LD-0164 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0165で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0165 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0166で取得値をワークへ設定する。偽:E-LD-0165を記録して作業単位をロールバックする。LD-0166 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0167で更新処理へ進む。偽:E-LD-0166を記録して承認待ちにする。LD-0167 条件:外部応答コード11が正常かつ応答時刻がタイムアウト以内の場合。真:P-0168で応答項目を反映する。偽:E-LD-0167を記録して再送判定へ進む。LD-0168 条件:更新前後の整合性検査16が成功し排他版番号が一致する場合。真:P-0169で次明細を処理する。偽:E-LD-0168を記録して全更新を取り消す。LD-0169 条件:入力項目08が必須かつ正規化後も空でない場合。真:P-0170で桁数検証する。偽:E-LD-0169を記録して入力画面へ戻す。LD-0170 条件:口座状態05が取引可能で利用停止理由が未設定の場合。真:P-0171で残高を照会する。偽:E-LD-0170を記録してDB更新を行わない。LD-0171 条件:取引金額区分0が日次限度内で累計額との合計も限度以下の場合。真:P-0172で手数料を計算する。偽:E-LD-0171を記録して承認待ちへ遷移する。LD-0172 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0173で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0173 条件:顧客マスタ照会のSQLCODEが0かつ取得件数が1件で、排他状態が他取引による更新中ではない場合。真:P-0174で顧客属性を展開する。偽:SQLCODEが100ならE-LD-0173-NF、それ以外はE-LD-0173-DBを記録してロールバックする。LD-0174 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0175で更新処理へ進む。偽:E-LD-0174を記録して承認待ちにする。LD-0175 条件:外部応答コード06が正常かつ応答時刻がタイムアウト以内の場合。真:P-0176で応答項目を反映する。偽:E-LD-0175を記録して再送判定へ進む。LD-0176 条件:更新前後の整合性検査05が成功し排他版番号が一致する場合。真:P-0177で次明細を処理する。偽:E-LD-0176を記録して全更新を取り消す。LD-0177 条件:入力項目16が必須かつ正規化後も空でない場合。真:P-0178で桁数検証する。偽:E-LD-0177を記録して入力画面へ戻す。LD-0178 条件:口座状態02が取引可能で利用停止理由が未設定の場合。真:P-0179で残高を照会する。偽:E-LD-0178を記録してDB更新を行わない。LD-0179 条件:取引金額区分8が日次限度内で累計額との合計も限度以下の場合。真:P-0180で手数料を計算する。偽:E-LD-0179を記録して承認待ちへ遷移する。LD-0180 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0181で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0181 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0182で取得値をワークへ設定する。偽:E-LD-0181を記録して作業単位をロールバックする。LD-0182 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0183で更新処理へ進む。偽:E-LD-0182を記録して承認待ちにする。LD-0183 条件:外部応答コード01が正常かつ応答時刻がタイムアウト以内の場合。真:P-0184で応答項目を反映する。偽:E-LD-0183を記録して再送判定へ進む。LD-0184 条件:更新前後の整合性検査13が成功し排他版番号が一致する場合。真:P-0185で次明細を処理する。偽:E-LD-0184を記録して全更新を取り消す。LD-0185 条件:入力項目01が必須かつ正規化後も空でない場合。真:P-0186で桁数検証する。偽:E-LD-0185を記録して入力画面へ戻す。LD-0186 条件:口座状態10が取引可能で利用停止理由が未設定の場合。真:P-0187で残高を照会する。偽:E-LD-0186を記録してDB更新を行わない。LD-0187 条件:取引金額区分7が日次限度内で累計額との合計も限度以下の場合。真:P-0188で手数料を計算する。偽:E-LD-0187を記録して承認待ちへ遷移する。LD-0188 条件:基準日区分6が営業日で締め時刻前の場合。真:P-0189で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0189 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0190で取得値をワークへ設定する。偽:E-LD-0189を記録して作業単位をロールバックする。LD-0190 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0191で更新処理へ進む。偽:E-LD-0190を記録して承認待ちにする。LD-0191 条件:外部応答コード09が正常かつ応答時刻がタイムアウト以内の場合。真:P-0192で応答項目を反映する。偽:E-LD-0191を記録して再送判定へ進む。LD-0192 条件:更新前後の整合性検査02が成功し排他版番号が一致する場合。真:P-0193で次明細を処理する。偽:E-LD-0192を記録して全更新を取り消す。LD-0193 条件:入力項目09が必須かつ正規化後も空でない場合。真:P-0194で桁数検証する。偽:E-LD-0193を記録して入力画面へ戻す。LD-0194 条件:口座状態07が取引可能で利用停止理由が未設定の場合。真:P-0195で残高を照会する。偽:E-LD-0194を記録してDB更新を行わない。LD-0195 条件:取引金額区分6が日次限度内で累計額との合計も限度以下の場合。真:P-0196で手数料を計算する。偽:E-LD-0195を記録して承認待ちへ遷移する。LD-0196 条件:基準日区分0が営業日で締め時刻前の場合。真:P-0197で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0197 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0198で取得値をワークへ設定する。偽:E-LD-0197を記録して作業単位をロールバックする。LD-0198 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0199で更新処理へ進む。偽:E-LD-0198を記録して承認待ちにする。LD-0199 条件:外部応答コード04が正常かつ応答時刻がタイムアウト以内の場合。真:P-0200で応答項目を反映する。偽:E-LD-0199を記録して再送判定へ進む。LD-0200 LD-MIDDLE-0200 条件:顧客区分が法人で取引金額が100万円以上かつ承認状態が未承認の場合。真:P-APPROVALへ進む。偽:P-0201へ進みE-LD-0200は記録しない。LD-0201 条件:入力項目17が必須かつ正規化後も空でない場合。真:P-0202で桁数検証する。偽:E-LD-0201を記録して入力画面へ戻す。LD-0202 条件:口座状態04が取引可能で利用停止理由が未設定の場合。真:P-0203で残高を照会する。偽:E-LD-0202を記録してDB更新を行わない。LD-0203 条件:取引金額区分5が日次限度内で累計額との合計も限度以下の場合。真:P-0204で手数料を計算する。偽:E-LD-0203を記録して承認待ちへ遷移する。LD-0204 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0205で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0205 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0206で取得値をワークへ設定する。偽:E-LD-0205を記録して作業単位をロールバックする。LD-0206 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0207で更新処理へ進む。偽:E-LD-0206を記録して承認待ちにする。LD-0207 条件:外部応答コード12が正常かつ応答時刻がタイムアウト以内の場合。真:P-0208で応答項目を反映する。偽:E-LD-0207を記録して再送判定へ進む。LD-0208 条件:更新前後の整合性検査18が成功し排他版番号が一致する場合。真:P-0209で次明細を処理する。偽:E-LD-0208を記録して全更新を取り消す。LD-0209 条件:入力項目02が必須かつ正規化後も空でない場合。真:P-0210で桁数検証する。偽:E-LD-0209を記録して入力画面へ戻す。LD-0210 条件:口座状態01が取引可能で利用停止理由が未設定の場合。真:P-0211で残高を照会する。偽:E-LD-0210を記録してDB更新を行わない。LD-0211 条件:取引金額区分4が日次限度内で累計額との合計も限度以下の場合。真:P-0212で手数料を計算する。偽:E-LD-0211を記録して承認待ちへ遷移する。LD-0212 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0213で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0213 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0214で取得値をワークへ設定する。偽:E-LD-0213を記録して作業単位をロールバックする。LD-0214 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0215で更新処理へ進む。偽:E-LD-0214を記録して承認待ちにする。LD-0215 条件:外部応答コード07が正常かつ応答時刻がタイムアウト以内の場合。真:P-0216で応答項目を反映する。偽:E-LD-0215を記録して再送判定へ進む。LD-0216 条件:更新前後の整合性検査07が成功し排他版番号が一致する場合。真:P-0217で次明細を処理する。偽:E-LD-0216を記録して全更新を取り消す。LD-0217 条件:入力項目10が必須かつ正規化後も空でない場合。真:P-0218で桁数検証する。偽:E-LD-0217を記録して入力画面へ戻す。LD-0218 条件:口座状態09が取引可能で利用停止理由が未設定の場合。真:P-0219で残高を照会する。偽:E-LD-0218を記録してDB更新を行わない。LD-0219 条件:取引金額区分3が日次限度内で累計額との合計も限度以下の場合。真:P-0220で手数料を計算する。偽:E-LD-0219を記録して承認待ちへ遷移する。LD-0220 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0221で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0221 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0222で取得値をワークへ設定する。偽:E-LD-0221を記録して作業単位をロールバックする。LD-0222 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0223で更新処理へ進む。偽:E-LD-0222を記録して承認待ちにする。LD-0223 条件:外部応答コード02が正常かつ応答時刻がタイムアウト以内の場合。真:P-0224で応答項目を反映する。偽:E-LD-0223を記録して再送判定へ進む。LD-0224 条件:更新前後の整合性検査15が成功し排他版番号が一致する場合。真:P-0225で次明細を処理する。偽:E-LD-0224を記録して全更新を取り消す。LD-0225 条件:入力項目18が必須かつ正規化後も空でない場合。真:P-0226で桁数検証する。偽:E-LD-0225を記録して入力画面へ戻す。LD-0226 条件:口座状態06が取引可能で利用停止理由が未設定の場合。真:P-0227で残高を照会する。偽:E-LD-0226を記録してDB更新を行わない。LD-0227 条件:取引金額区分2が日次限度内で累計額との合計も限度以下の場合。真:P-0228で手数料を計算する。偽:E-LD-0227を記録して承認待ちへ遷移する。LD-0228 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0229で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0229 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0230で取得値をワークへ設定する。偽:E-LD-0229を記録して作業単位をロールバックする。LD-0230 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0231で更新処理へ進む。偽:E-LD-0230を記録して承認待ちにする。LD-0231 条件:外部応答コード10が正常かつ応答時刻がタイムアウト以内の場合。真:P-0232で応答項目を反映する。偽:E-LD-0231を記録して再送判定へ進む。LD-0232 条件:更新前後の整合性検査04が成功し排他版番号が一致する場合。真:P-0233で次明細を処理する。偽:E-LD-0232を記録して全更新を取り消す。LD-0233 条件:入力項目03が必須かつ正規化後も空でない場合。真:P-0234で桁数検証する。偽:E-LD-0233を記録して入力画面へ戻す。LD-0234 条件:口座状態03が取引可能で利用停止理由が未設定の場合。真:P-0235で残高を照会する。偽:E-LD-0234を記録してDB更新を行わない。LD-0235 条件:取引金額区分1が日次限度内で累計額との合計も限度以下の場合。真:P-0236で手数料を計算する。偽:E-LD-0235を記録して承認待ちへ遷移する。LD-0236 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0237で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0237 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0238で取得値をワークへ設定する。偽:E-LD-0237を記録して作業単位をロールバックする。LD-0238 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0239で更新処理へ進む。偽:E-LD-0238を記録して承認待ちにする。LD-0239 条件:外部応答コード05が正常かつ応答時刻がタイムアウト以内の場合。真:P-0240で応答項目を反映する。偽:E-LD-0239を記録して再送判定へ進む。LD-0240 条件:更新前後の整合性検査12が成功し排他版番号が一致する場合。真:P-0241で次明細を処理する。偽:E-LD-0240を記録して全更新を取り消す。LD-0241 条件:入力項目11が必須かつ正規化後も空でない場合。真:P-0242で桁数検証する。偽:E-LD-0241を記録して入力画面へ戻す。LD-0242 条件:口座状態00が取引可能で利用停止理由が未設定の場合。真:P-0243で残高を照会する。偽:E-LD-0242を記録してDB更新を行わない。LD-0243 条件:取引金額区分0が日次限度内で累計額との合計も限度以下の場合。真:P-0244で手数料を計算する。偽:E-LD-0243を記録して承認待ちへ遷移する。LD-0244 条件:基準日区分6が営業日で締め時刻前の場合。真:P-0245で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0245 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0246で取得値をワークへ設定する。偽:E-LD-0245を記録して作業単位をロールバックする。LD-0246 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0247で更新処理へ進む。偽:E-LD-0246を記録して承認待ちにする。LD-0247 条件:外部応答コード00が正常かつ応答時刻がタイムアウト以内の場合。真:P-0248で応答項目を反映する。偽:E-LD-0247を記録して再送判定へ進む。LD-0248 条件:外部与信照会のHTTP状態が200かつ業務結果コードが00で、応答受信時刻が要求送信から3秒以内の場合。真:P-0249で与信枠を確定する。偽:タイムアウトか503なら最大2回再送し、上限到達時だけE-LD-0248を記録する。LD-0249 条件:入力項目19が必須かつ正規化後も空でない場合。真:P-0250で桁数検証する。偽:E-LD-0249を記録して入力画面へ戻す。LD-0250 条件:口座状態08が取引可能で利用停止理由が未設定の場合。真:P-0251で残高を照会する。偽:E-LD-0250を記録してDB更新を行わない。LD-0251 条件:取引金額区分8が日次限度内で累計額との合計も限度以下の場合。真:P-0252で手数料を計算する。偽:E-LD-0251を記録して承認待ちへ遷移する。LD-0252 条件:基準日区分0が営業日で締め時刻前の場合。真:P-0253で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0253 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0254で取得値をワークへ設定する。偽:E-LD-0253を記録して作業単位をロールバックする。LD-0254 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0255で更新処理へ進む。偽:E-LD-0254を記録して承認待ちにする。LD-0255 条件:外部応答コード08が正常かつ応答時刻がタイムアウト以内の場合。真:P-0256で応答項目を反映する。偽:E-LD-0255を記録して再送判定へ進む。LD-0256 条件:更新前後の整合性検査09が成功し排他版番号が一致する場合。真:P-0257で次明細を処理する。偽:E-LD-0256を記録して全更新を取り消す。LD-0257 条件:入力項目04が必須かつ正規化後も空でない場合。真:P-0258で桁数検証する。偽:E-LD-0257を記録して入力画面へ戻す。LD-0258 条件:口座状態05が取引可能で利用停止理由が未設定の場合。真:P-0259で残高を照会する。偽:E-LD-0258を記録してDB更新を行わない。LD-0259 条件:取引金額区分7が日次限度内で累計額との合計も限度以下の場合。真:P-0260で手数料を計算する。偽:E-LD-0259を記録して承認待ちへ遷移する。LD-0260 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0261で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0261 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0262で取得値をワークへ設定する。偽:E-LD-0261を記録して作業単位をロールバックする。LD-0262 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0263で更新処理へ進む。偽:E-LD-0262を記録して承認待ちにする。LD-0263 条件:外部応答コード03が正常かつ応答時刻がタイムアウト以内の場合。真:P-0264で応答項目を反映する。偽:E-LD-0263を記録して再送判定へ進む。LD-0264 条件:更新前後の整合性検査17が成功し排他版番号が一致する場合。真:P-0265で次明細を処理する。偽:E-LD-0264を記録して全更新を取り消す。LD-0265 条件:入力項目12が必須かつ正規化後も空でない場合。真:P-0266で桁数検証する。偽:E-LD-0265を記録して入力画面へ戻す。LD-0266 条件:口座状態02が取引可能で利用停止理由が未設定の場合。真:P-0267で残高を照会する。偽:E-LD-0266を記録してDB更新を行わない。LD-0267 条件:取引金額区分6が日次限度内で累計額との合計も限度以下の場合。真:P-0268で手数料を計算する。偽:E-LD-0267を記録して承認待ちへ遷移する。LD-0268 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0269で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0269 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0270で取得値をワークへ設定する。偽:E-LD-0269を記録して作業単位をロールバックする。LD-0270 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0271で更新処理へ進む。偽:E-LD-0270を記録して承認待ちにする。LD-0271 条件:外部応答コード11が正常かつ応答時刻がタイムアウト以内の場合。真:P-0272で応答項目を反映する。偽:E-LD-0271を記録して再送判定へ進む。LD-0272 条件:更新前後の整合性検査06が成功し排他版番号が一致する場合。真:P-0273で次明細を処理する。偽:E-LD-0272を記録して全更新を取り消す。LD-0273 条件:入力項目20が必須かつ正規化後も空でない場合。真:P-0274で桁数検証する。偽:E-LD-0273を記録して入力画面へ戻す。LD-0274 条件:口座状態10が取引可能で利用停止理由が未設定の場合。真:P-0275で残高を照会する。偽:E-LD-0274を記録してDB更新を行わない。LD-0275 条件:取引金額区分5が日次限度内で累計額との合計も限度以下の場合。真:P-0276で手数料を計算する。偽:E-LD-0275を記録して承認待ちへ遷移する。LD-0276 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0277で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0277 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0278で取得値をワークへ設定する。偽:E-LD-0277を記録して作業単位をロールバックする。LD-0278 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0279で更新処理へ進む。偽:E-LD-0278を記録して承認待ちにする。LD-0279 条件:外部応答コード06が正常かつ応答時刻がタイムアウト以内の場合。真:P-0280で応答項目を反映する。偽:E-LD-0279を記録して再送判定へ進む。LD-0280 条件:更新前後の整合性検査14が成功し排他版番号が一致する場合。真:P-0281で次明細を処理する。偽:E-LD-0280を記録して全更新を取り消す。LD-0281 条件:入力項目05が必須かつ正規化後も空でない場合。真:P-0282で桁数検証する。偽:E-LD-0281を記録して入力画面へ戻す。LD-0282 条件:口座状態07が取引可能で利用停止理由が未設定の場合。真:P-0283で残高を照会する。偽:E-LD-0282を記録してDB更新を行わない。LD-0283 条件:取引金額区分4が日次限度内で累計額との合計も限度以下の場合。真:P-0284で手数料を計算する。偽:E-LD-0283を記録して承認待ちへ遷移する。LD-0284 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0285で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0285 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0286で取得値をワークへ設定する。偽:E-LD-0285を記録して作業単位をロールバックする。LD-0286 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0287で更新処理へ進む。偽:E-LD-0286を記録して承認待ちにする。LD-0287 条件:更新対象の版番号が読込時版番号と一致し、かつ更新件数が1件の場合。真:P-0288で後続明細を更新する。偽:楽観ロック競合として全明細をロールバックしE-LD-0287を記録する。LD-0288 条件:更新前後の整合性検査03が成功し排他版番号が一致する場合。真:P-0289で次明細を処理する。偽:E-LD-0288を記録して全更新を取り消す。LD-0289 条件:入力項目13が必須かつ正規化後も空でない場合。真:P-0290で桁数検証する。偽:E-LD-0289を記録して入力画面へ戻す。LD-0290 条件:口座状態04が取引可能で利用停止理由が未設定の場合。真:P-0291で残高を照会する。偽:E-LD-0290を記録してDB更新を行わない。LD-0291 条件:取引金額区分3が日次限度内で累計額との合計も限度以下の場合。真:P-0292で手数料を計算する。偽:E-LD-0291を記録して承認待ちへ遷移する。LD-0292 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0293で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0293 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0294で取得値をワークへ設定する。偽:E-LD-0293を記録して作業単位をロールバックする。LD-0294 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0295で更新処理へ進む。偽:E-LD-0294を記録して承認待ちにする。LD-0295 条件:外部応答コード09が正常かつ応答時刻がタイムアウト以内の場合。真:P-0296で応答項目を反映する。偽:E-LD-0295を記録して再送判定へ進む。LD-0296 条件:更新前後の整合性検査11が成功し排他版番号が一致する場合。真:P-0297で次明細を処理する。偽:E-LD-0296を記録して全更新を取り消す。LD-0297 条件:入力項目21が必須かつ正規化後も空でない場合。真:P-0298で桁数検証する。偽:E-LD-0297を記録して入力画面へ戻す。LD-0298 条件:口座状態01が取引可能で利用停止理由が未設定の場合。真:P-0299で残高を照会する。偽:E-LD-0298を記録してDB更新を行わない。LD-0299 条件:取引金額区分2が日次限度内で累計額との合計も限度以下の場合。真:P-0300で手数料を計算する。偽:E-LD-0299を記録して承認待ちへ遷移する。LD-0300 条件:基準日区分6が営業日で締め時刻前の場合。真:P-0301で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0301 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0302で取得値をワークへ設定する。偽:E-LD-0301を記録して作業単位をロールバックする。LD-0302 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0303で更新処理へ進む。偽:E-LD-0302を記録して承認待ちにする。LD-0303 条件:外部応答コード04が正常かつ応答時刻がタイムアウト以内の場合。真:P-0304で応答項目を反映する。偽:E-LD-0303を記録して再送判定へ進む。LD-0304 条件:更新前後の整合性検査00が成功し排他版番号が一致する場合。真:P-0305で次明細を処理する。偽:E-LD-0304を記録して全更新を取り消す。LD-0305 条件:入力項目06が必須かつ正規化後も空でない場合。真:P-0306で桁数検証する。偽:E-LD-0305を記録して入力画面へ戻す。LD-0306 条件:口座状態09が取引可能で利用停止理由が未設定の場合。真:P-0307で残高を照会する。偽:E-LD-0306を記録してDB更新を行わない。LD-0307 条件:取引金額区分1が日次限度内で累計額との合計も限度以下の場合。真:P-0308で手数料を計算する。偽:E-LD-0307を記録して承認待ちへ遷移する。LD-0308 条件:基準日区分0が営業日で締め時刻前の場合。真:P-0309で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0309 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0310で取得値をワークへ設定する。偽:E-LD-0309を記録して作業単位をロールバックする。LD-0310 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0311で更新処理へ進む。偽:E-LD-0310を記録して承認待ちにする。LD-0311 条件:外部応答コード12が正常かつ応答時刻がタイムアウト以内の場合。真:P-0312で応答項目を反映する。偽:E-LD-0311を記録して再送判定へ進む。LD-0312 条件:更新前後の整合性検査08が成功し排他版番号が一致する場合。真:P-0313で次明細を処理する。偽:E-LD-0312を記録して全更新を取り消す。LD-0313 条件:入力項目14が必須かつ正規化後も空でない場合。真:P-0314で桁数検証する。偽:E-LD-0313を記録して入力画面へ戻す。LD-0314 条件:口座状態06が取引可能で利用停止理由が未設定の場合。真:P-0315で残高を照会する。偽:E-LD-0314を記録してDB更新を行わない。LD-0315 条件:取引金額区分0が日次限度内で累計額との合計も限度以下の場合。真:P-0316で手数料を計算する。偽:E-LD-0315を記録して承認待ちへ遷移する。LD-0316 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0317で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0317 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0318で取得値をワークへ設定する。偽:E-LD-0317を記録して作業単位をロールバックする。LD-0318 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0319で更新処理へ進む。偽:E-LD-0318を記録して承認待ちにする。LD-0319 条件:外部応答コード07が正常かつ応答時刻がタイムアウト以内の場合。真:P-0320で応答項目を反映する。偽:E-LD-0319を記録して再送判定へ進む。LD-0320 条件:更新前後の整合性検査16が成功し排他版番号が一致する場合。真:P-0321で次明細を処理する。偽:E-LD-0320を記録して全更新を取り消す。LD-0321 条件:(処理日が銀行営業日かつ時刻が08:00以上21:00未満)または(処理区分が夜間バッチかつ締め状態が未締め)の場合。真:P-0322で即時仕訳する。偽:P-DEFERへ遷移し翌営業日キューへ登録する。LD-0322 条件:口座状態03が取引可能で利用停止理由が未設定の場合。真:P-0323で残高を照会する。偽:E-LD-0322を記録してDB更新を行わない。LD-0323 条件:取引金額区分8が日次限度内で累計額との合計も限度以下の場合。真:P-0324で手数料を計算する。偽:E-LD-0323を記録して承認待ちへ遷移する。LD-0324 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0325で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0325 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0326で取得値をワークへ設定する。偽:E-LD-0325を記録して作業単位をロールバックする。LD-0326 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0327で更新処理へ進む。偽:E-LD-0326を記録して承認待ちにする。LD-0327 条件:外部応答コード02が正常かつ応答時刻がタイムアウト以内の場合。真:P-0328で応答項目を反映する。偽:E-LD-0327を記録して再送判定へ進む。LD-0328 条件:更新前後の整合性検査05が成功し排他版番号が一致する場合。真:P-0329で次明細を処理する。偽:E-LD-0328を記録して全更新を取り消す。LD-0329 条件:入力項目07が必須かつ正規化後も空でない場合。真:P-0330で桁数検証する。偽:E-LD-0329を記録して入力画面へ戻す。LD-0330 条件:口座状態00が取引可能で利用停止理由が未設定の場合。真:P-0331で残高を照会する。偽:E-LD-0330を記録してDB更新を行わない。LD-0331 条件:取引金額区分7が日次限度内で累計額との合計も限度以下の場合。真:P-0332で手数料を計算する。偽:E-LD-0331を記録して承認待ちへ遷移する。LD-0332 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0333で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0333 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0334で取得値をワークへ設定する。偽:E-LD-0333を記録して作業単位をロールバックする。LD-0334 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0335で更新処理へ進む。偽:E-LD-0334を記録して承認待ちにする。LD-0335 条件:外部応答コード10が正常かつ応答時刻がタイムアウト以内の場合。真:P-0336で応答項目を反映する。偽:E-LD-0335を記録して再送判定へ進む。LD-0336 条件:更新前後の整合性検査13が成功し排他版番号が一致する場合。真:P-0337で次明細を処理する。偽:E-LD-0336を記録して全更新を取り消す。LD-0337 条件:入力項目15が必須かつ正規化後も空でない場合。真:P-0338で桁数検証する。偽:E-LD-0337を記録して入力画面へ戻す。LD-0338 条件:口座状態08が取引可能で利用停止理由が未設定の場合。真:P-0339で残高を照会する。偽:E-LD-0338を記録してDB更新を行わない。LD-0339 条件:取引金額区分6が日次限度内で累計額との合計も限度以下の場合。真:P-0340で手数料を計算する。偽:E-LD-0339を記録して承認待ちへ遷移する。LD-0340 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0341で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0341 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0342で取得値をワークへ設定する。偽:E-LD-0341を記録して作業単位をロールバックする。LD-0342 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0343で更新処理へ進む。偽:E-LD-0342を記録して承認待ちにする。LD-0343 条件:外部応答コード05が正常かつ応答時刻がタイムアウト以内の場合。真:P-0344で応答項目を反映する。偽:E-LD-0343を記録して再送判定へ進む。LD-0344 条件:更新前後の整合性検査02が成功し排他版番号が一致する場合。真:P-0345で次明細を処理する。偽:E-LD-0344を記録して全更新を取り消す。LD-0345 条件:入力項目00が必須かつ正規化後も空でない場合。真:P-0346で桁数検証する。偽:E-LD-0345を記録して入力画面へ戻す。LD-0346 条件:口座状態05が取引可能で利用停止理由が未設定の場合。真:P-0347で残高を照会する。偽:E-LD-0346を記録してDB更新を行わない。LD-0347 条件:取引金額区分5が日次限度内で累計額との合計も限度以下の場合。真:P-0348で手数料を計算する。偽:E-LD-0347を記録して承認待ちへ遷移する。LD-0348 条件:基準日区分5が営業日で締め時刻前の場合。真:P-0349で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0349 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0350で取得値をワークへ設定する。偽:E-LD-0349を記録して作業単位をロールバックする。LD-0350 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0351で更新処理へ進む。偽:E-LD-0350を記録して承認待ちにする。LD-0351 条件:外部応答コード00が正常かつ応答時刻がタイムアウト以内の場合。真:P-0352で応答項目を反映する。偽:E-LD-0351を記録して再送判定へ進む。LD-0352 条件:更新前後の整合性検査10が成功し排他版番号が一致する場合。真:P-0353で次明細を処理する。偽:E-LD-0352を記録して全更新を取り消す。LD-0353 条件:入力項目08が必須かつ正規化後も空でない場合。真:P-0354で桁数検証する。偽:E-LD-0353を記録して入力画面へ戻す。LD-0354 条件:口座状態02が取引可能で利用停止理由が未設定の場合。真:P-0355で残高を照会する。偽:E-LD-0354を記録してDB更新を行わない。LD-0355 条件:取引金額区分4が日次限度内で累計額との合計も限度以下の場合。真:P-0356で手数料を計算する。偽:E-LD-0355を記録して承認待ちへ遷移する。LD-0356 条件:勘定更新が成功し通知更新が失敗した場合。真:勘定更新を打ち消す補償仕訳を作成し、通知は再送キューへ登録してE-LD-0356を記録する。偽:P-0357で通常の完了判定へ進む。LD-0357 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0358で取得値をワークへ設定する。偽:E-LD-0357を記録して作業単位をロールバックする。LD-0358 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0359で更新処理へ進む。偽:E-LD-0358を記録して承認待ちにする。LD-0359 条件:外部応答コード08が正常かつ応答時刻がタイムアウト以内の場合。真:P-0360で応答項目を反映する。偽:E-LD-0359を記録して再送判定へ進む。LD-0360 条件:更新前後の整合性検査18が成功し排他版番号が一致する場合。真:P-0361で次明細を処理する。偽:E-LD-0360を記録して全更新を取り消す。LD-0361 条件:入力項目16が必須かつ正規化後も空でない場合。真:P-0362で桁数検証する。偽:E-LD-0361を記録して入力画面へ戻す。LD-0362 条件:口座状態10が取引可能で利用停止理由が未設定の場合。真:P-0363で残高を照会する。偽:E-LD-0362を記録してDB更新を行わない。LD-0363 条件:取引金額区分3が日次限度内で累計額との合計も限度以下の場合。真:P-0364で手数料を計算する。偽:E-LD-0363を記録して承認待ちへ遷移する。LD-0364 条件:基準日区分0が営業日で締め時刻前の場合。真:P-0365で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0365 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0366で取得値をワークへ設定する。偽:E-LD-0365を記録して作業単位をロールバックする。LD-0366 条件:承認区分1が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0367で更新処理へ進む。偽:E-LD-0366を記録して承認待ちにする。LD-0367 条件:外部応答コード03が正常かつ応答時刻がタイムアウト以内の場合。真:P-0368で応答項目を反映する。偽:E-LD-0367を記録して再送判定へ進む。LD-0368 条件:更新前後の整合性検査07が成功し排他版番号が一致する場合。真:P-0369で次明細を処理する。偽:E-LD-0368を記録して全更新を取り消す。LD-0369 条件:入力項目01が必須かつ正規化後も空でない場合。真:P-0370で桁数検証する。偽:E-LD-0369を記録して入力画面へ戻す。LD-0370 条件:口座状態07が取引可能で利用停止理由が未設定の場合。真:P-0371で残高を照会する。偽:E-LD-0370を記録してDB更新を行わない。LD-0371 条件:取引金額区分2が日次限度内で累計額との合計も限度以下の場合。真:P-0372で手数料を計算する。偽:E-LD-0371を記録して承認待ちへ遷移する。LD-0372 条件:基準日区分1が営業日で締め時刻前の場合。真:P-0373で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0373 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0374で取得値をワークへ設定する。偽:E-LD-0373を記録して作業単位をロールバックする。LD-0374 条件:承認区分4が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0375で更新処理へ進む。偽:E-LD-0374を記録して承認待ちにする。LD-0375 条件:外部応答コード11が正常かつ応答時刻がタイムアウト以内の場合。真:P-0376で応答項目を反映する。偽:E-LD-0375を記録して再送判定へ進む。LD-0376 条件:更新前後の整合性検査15が成功し排他版番号が一致する場合。真:P-0377で次明細を処理する。偽:E-LD-0376を記録して全更新を取り消す。LD-0377 条件:入力項目09が必須かつ正規化後も空でない場合。真:P-0378で桁数検証する。偽:E-LD-0377を記録して入力画面へ戻す。LD-0378 条件:口座状態04が取引可能で利用停止理由が未設定の場合。真:P-0379で残高を照会する。偽:E-LD-0378を記録してDB更新を行わない。LD-0379 条件:取引金額区分1が日次限度内で累計額との合計も限度以下の場合。真:P-0380で手数料を計算する。偽:E-LD-0379を記録して承認待ちへ遷移する。LD-0380 条件:基準日区分2が営業日で締め時刻前の場合。真:P-0381で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0381 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0382で取得値をワークへ設定する。偽:E-LD-0381を記録して作業単位をロールバックする。LD-0382 条件:承認区分2が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0383で更新処理へ進む。偽:E-LD-0382を記録して承認待ちにする。LD-0383 条件:外部応答コード06が正常かつ応答時刻がタイムアウト以内の場合。真:P-0384で応答項目を反映する。偽:E-LD-0383を記録して再送判定へ進む。LD-0384 条件:更新前後の整合性検査04が成功し排他版番号が一致する場合。真:P-0385で次明細を処理する。偽:E-LD-0384を記録して全更新を取り消す。LD-0385 条件:入力項目17が必須かつ正規化後も空でない場合。真:P-0386で桁数検証する。偽:E-LD-0385を記録して入力画面へ戻す。LD-0386 条件:口座状態01が取引可能で利用停止理由が未設定の場合。真:P-0387で残高を照会する。偽:E-LD-0386を記録してDB更新を行わない。LD-0387 条件:取引金額区分0が日次限度内で累計額との合計も限度以下の場合。真:P-0388で手数料を計算する。偽:E-LD-0387を記録して承認待ちへ遷移する。LD-0388 条件:基準日区分3が営業日で締め時刻前の場合。真:P-0389で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0389 条件:高額取引フラグが有効または同一顧客の失敗回数が当日5回以上で、監査抑止区分が無効の場合。真:監査証跡へ理由コードAUD-389を記録し運用監視へ即時通知する。偽:通常監査ログだけを記録してP-0390へ進む。LD-0390 条件:承認区分0が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0391で更新処理へ進む。偽:E-LD-0390を記録して承認待ちにする。LD-0391 条件:外部応答コード01が正常かつ応答時刻がタイムアウト以内の場合。真:P-0392で応答項目を反映する。偽:E-LD-0391を記録して再送判定へ進む。LD-0392 条件:更新前後の整合性検査12が成功し排他版番号が一致する場合。真:P-0393で次明細を処理する。偽:E-LD-0392を記録して全更新を取り消す。LD-0393 条件:入力項目02が必須かつ正規化後も空でない場合。真:P-0394で桁数検証する。偽:E-LD-0393を記録して入力画面へ戻す。LD-0394 条件:口座状態09が取引可能で利用停止理由が未設定の場合。真:P-0395で残高を照会する。偽:E-LD-0394を記録してDB更新を行わない。LD-0395 条件:取引金額区分8が日次限度内で累計額との合計も限度以下の場合。真:P-0396で手数料を計算する。偽:E-LD-0395を記録して承認待ちへ遷移する。LD-0396 条件:基準日区分4が営業日で締め時刻前の場合。真:P-0397で当日扱いにする。偽:P-DEFERへ遷移して翌営業日扱いにする。LD-0397 条件:参照SQLのSQLCODEが0かつ取得件数が1件の場合。真:P-0398で取得値をワークへ設定する。偽:E-LD-0397を記録して作業単位をロールバックする。LD-0398 条件:承認区分3が承認済みまたは承認不要で、取消フラグが無効の場合。真:P-0399で更新処理へ進む。偽:E-LD-0398を記録して承認待ちにする。LD-0399 条件:外部応答コード09が正常かつ応答時刻がタイムアウト以内の場合。真:P-0400で応答項目を反映する。偽:E-LD-0399を記録して再送判定へ進む。LD-0400 LD-END-0400 条件:更新結果件数が1件でなく、かつ再試行回数が3以上の場合。真:全更新をロールバックしE-LD-0400を記録して運用監視へ通知する。偽:コミットして正常終了する。"
+        }
+      ]
+    }
+  },
+  "fixtures/eval/office_ja/inputs/OJA-PPTX-MEDIUM.pptx": {
+    "shapes_by_slide": {
+      "ppt/slides/slide1.xml": [
+        {
+          "bbox_emu": [
+            300000,
+            120000,
+            5500000,
+            540000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "AI/RAG向け合成設計書"
+        },
+        {
+          "bbox_emu": [
+            3100000,
+            4300000,
+            9300000,
+            5200000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "N-PPTX-201: E-PPTX-201はEVT-EXECだけに適用"
+        },
+        {
+          "bbox_emu": [
+            500000,
+            700000,
+            9500000,
+            1300000
+          ],
+          "has_solid_fill": true,
+          "has_text": true,
+          "text": "視覚読順は左表、右表、注記。XML順ではない。"
+        }
+      ]
+    }
+  }
+}

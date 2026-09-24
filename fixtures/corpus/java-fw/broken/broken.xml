@@ -1,0 +1,3 @@
+<beans>
+  <bean class="com.acme.a.Foo">
+</beans>

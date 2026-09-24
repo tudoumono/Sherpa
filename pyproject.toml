@@ -1,0 +1,52 @@
+# Sherpa — ツール設定集約（pytest / ruff / coverage）。
+# パッケージ化はしないため [build-system]/[project] は持たない（tool 設定のみ）。
+# 由来: docs/proposals/2026-07-02-リファクタリング計画.md フェーズ0（安全網）。
+
+[tool.pytest.ini_options]
+# 既定収集は unit/contract のみ（RV 指摘: -m は「収集後の選別」のため tests を丸ごと
+# 収集すると api/integration がモジュール import され、import 時の env 変更や
+# TestClient 生成が unit 実行に混入する）。api/integration はスライス2 の
+# pytest 化完了時にここへ追加する。明示パス指定（pytest tests/api 等）は従来どおり可。
+testpaths = ["tests/unit", "tests/contract"]
+# e2e/e2e_live は既定収集から外す（ブラウザ/起動済みサーバが要るため）。
+# 明示指定（例: `python3 -m pytest tests/e2e`）はコマンドライン引数が testpaths より
+# 優先されるため従来どおり動く（norecursedirs は再帰探索のみに効く）。
+norecursedirs = ["e2e", "e2e_live", ".*", ".venv", "build", "dist", "node_modules", "mockups", "*.egg"]
+addopts = "-ra"
+markers = [
+    "unit: 外部サービス不要の単体テスト",
+    "api: FastAPI TestClient 経由の API/画面配信テスト（Neo4j/Postgres を使うものを含む）",
+    "contract: 設計上の契約を固定するテスト（鏡モデル等・外部サービス不要）",
+    "integration: Neo4j/Postgres/Elasticsearch など実サービスを使う結合テスト",
+    "e2e: Playwright による UI テスト（DB/API はモック・web を静的配信）",
+    "e2e_live: Playwright + 起動済み FastAPI/DB を実際に叩く結合 UI テスト",
+]
+
+[tool.ruff]
+target-version = "py312"
+# 実態に合わせた行長（現行の最長は sherpa の 139 文字）。E501 は既定 select 外なので
+# 強制はしない（厳格化はフェーズ進行で。refactoring-plan フェーズ0-5）。
+line-length = 140
+# 生成物・非 Python・vendor 相当は対象外。
+exclude = ["web", "docker", "mockups", "dist", "fixtures", "data", ".venv"]
+
+[tool.ruff.lint]
+# 初期は「既存コードがそのまま通る」緩い設定（refactoring-plan フェーズ0-item5）。
+# 既定 select（E4/E7/E9/F）を保ちつつ、現行コードで多発する既存スタイル/レガシー由来の
+# コードのみ ignore する。sherpa/ は本スライスで編集不可のため config で吸収。
+# 各フェーズで --fix しながら順次この ignore を縮小し厳格化する。
+ignore = [
+    "E401",  # 1行複数 import（テストの定型）
+    "E402",  # トップ以外の import（sys.path 調整後の import・noqa 未付与分）
+    "E702",  # セミコロンによる複文（コードベース全体で多用される既存スタイル）
+    "E741",  # 曖昧な変数名 l（既存コード）
+    "E743",  # 曖昧な関数/クラス名 I（既存コード）
+    "F401",  # 未使用 import（既存コードに散在・編集不可のため暫定 ignore）
+    "F541",  # プレースホルダの無い f-string（既存コード）
+    "F811",  # 再定義（既存テストのランナー定義）
+    "F841",  # 未使用のローカル変数（既存テスト）
+]
+
+[tool.coverage.run]
+source = ["sherpa"]
+branch = true

@@ -1,0 +1,35 @@
+Sherpa — 業務AI基盤
+Copyright (c) 2026 tudoumono. All rights reserved.
+
+本ソフトウェアおよび付属ドキュメント一式（以下「本ソフトウェア」）は、
+プロプライエタリ（許可制）です。
+
+1. 利用許可
+   本ソフトウェアの使用・複製・改変・実行は、著作権者から事前の許可
+   （書面または電子的手段）を受けた者に限り認められます。許可された
+   利用者も、許可された範囲・目的に限って利用できます。
+
+2. 再配布・公開の禁止
+   許可の有無にかかわらず、本ソフトウェアの全部または一部を第三者へ
+   再配布・公開・貸与・サブライセンスすることはできません。
+
+3. 無保証・免責
+   本ソフトウェアは現状有姿（AS IS）で提供され、明示・黙示を問わず
+   いかなる保証もありません。著作権者は、本ソフトウェアの利用または
+   利用不能から生じるいかなる損害についても責任を負いません。
+
+4. 変更
+   著作権者は本ライセンス条件を変更できます。変更後の利用には変更後の
+   条件が適用されます。
+
+---
+
+This software and its accompanying documentation are proprietary.
+Use, copying, modification, or execution is permitted only to those who
+have received prior permission (written or electronic) from the copyright
+holder, and only within the permitted scope. Redistribution, publication,
+lending, or sublicensing of all or any part of this software is prohibited.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO EVENT
+SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE
+OF OR INABILITY TO USE THE SOFTWARE.
+(The Japanese text above prevails over this English reference.)

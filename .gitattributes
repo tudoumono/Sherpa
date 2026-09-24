@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.pdf binary
+
+# `git archive`（リリース tarball/zip）から除外＝架空 golden・テスト資産を配布物に含めない（本番非参照）。
+fixtures export-ignore
+tests export-ignore
+mockups export-ignore
+.claude export-ignore

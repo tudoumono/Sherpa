@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — KB取り込み管理（UI モック）</title>
+<style>
+  :root{
+    --accent:#0d9488;--accent-weak:#ccfbf1;--accent-ink:#0f766e;
+    --bg:#f6f7f9;--surface:#fff;--surface-2:#f1f3f5;--border:#e3e6ea;
+    --ink:#1f2937;--ink-2:#5b6573;--ink-3:#8b95a3;
+    --ok:#16a34a;--ok-bg:#e9f7ef;--warn:#d97706;--warn-bg:#fdf3e7;--danger:#dc2626;--danger-bg:#fdecec;--info:#2563eb;
+    --radius:12px;--radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);--shadow-lg:0 10px 30px rgba(16,24,40,.18);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+  .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700}
+  .brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#fff}
+  .brand small{font-weight:500;color:var(--ink-3)}
+  .nav{display:flex;gap:4px}.nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;color:var(--ink-2);text-decoration:none}
+  .nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .topbar .spacer{flex:1}
+  .user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 24px 48px}
+  .subnav{display:flex;gap:6px;margin-bottom:16px}
+  .subnav a{font-size:13px;padding:6px 12px;border-radius:999px;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);background:var(--surface)}
+  .subnav a.on{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent-weak);font-weight:600}
+  .pagehead{display:flex;align-items:flex-end;gap:14px;margin-bottom:16px}
+  .pagehead h1{font-size:21px;margin:0;font-weight:700}
+  .pagehead .sub{font-size:12.5px;color:var(--ink-3)}
+  .pagehead .spacer{flex:1}
+  .verbox{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);font-size:13px}
+  .verbox b{color:var(--ink)}
+  .btn-primary{height:34px;padding:0 14px;border:none;border-radius:var(--radius-sm);background:var(--accent);color:#fff;font-weight:600;font-size:13px}
+  .btn-ghost{height:34px;padding:0 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink-2);font-size:13px}
+
+  /* アップロード */
+  .drop{border:1.5px dashed var(--border);border-radius:var(--radius);background:var(--surface);padding:18px;text-align:center;color:var(--ink-3);margin-bottom:18px;font-size:13px}
+  .drop b{color:var(--ink-2)} .drop .hint{font-size:11.5px;margin-top:4px}
+
+  /* パイプライン表 */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+  .card-h{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--border)}
+  .card-h h3{font-size:14px;margin:0}.card-h .spacer{flex:1}
+  .card-h .small{font-size:12px;color:var(--ink-3)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-size:11.5px;font-weight:600;color:var(--ink-2);padding:10px 14px;border-bottom:1px solid var(--border);background:var(--surface-2)}
+  td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  .fname{display:flex;align-items:center;gap:8px;font-weight:600}
+  .fname small{font-weight:400;color:var(--ink-3)}
+  .dtype{font-size:11px;padding:2px 8px;border-radius:6px;background:var(--surface-2);color:var(--ink-2)}
+
+  /* トラック別ステッパー */
+  .pipe{display:flex;gap:6px;align-items:center}
+  .st{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid var(--border);color:var(--ink-3);background:var(--surface)}
+  .st .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+  .st.done{color:var(--ok);border-color:#bfe6cd;background:var(--ok-bg)}
+  .st.prog{color:var(--warn);border-color:#f3d9a8;background:var(--warn-bg)}
+  .st.prog .dot{animation:pulse 1.2s infinite}
+  .st.wait{color:var(--ink-3)}
+  .st.fail{color:var(--danger);border-color:#f3c0c0;background:var(--danger-bg)}
+  .st.warn{color:var(--warn);border-color:#f3d9a8;background:var(--warn-bg)}
+  .st.na{color:var(--ink-3);opacity:.55}
+  @keyframes pulse{50%{opacity:.35}}
+
+  .status{font-size:12px;font-weight:600}
+  .status.ok{color:var(--ok)} .status.run{color:var(--warn)} .status.err{color:var(--danger)}
+  .rowact{display:flex;gap:6px;justify-content:flex-end}
+  .mini{height:30px;padding:0 11px;border-radius:7px;border:1px solid var(--border);background:var(--surface);font-size:12px;color:var(--ink-2)}
+  .mini.prev{border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+  .mini.rerun{color:var(--danger);border-color:#f3c0c0}
+  .note{font-size:11.5px;color:var(--ink-3);margin-top:10px}
+
+  /* 抽出プレビュー（A17） */
+  .overlay{position:fixed;inset:0;background:rgba(16,24,40,.42);display:none;z-index:30}
+  .overlay.open{display:block}
+  .rv{position:absolute;inset:26px;background:var(--surface);border-radius:16px;box-shadow:var(--shadow-lg);display:flex;flex-direction:column;overflow:hidden}
+  .rv-h{padding:16px 22px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:14px}
+  .rv-h .hl{font-size:17px;font-weight:700}
+  .rv-h .sub{font-size:12.5px;color:var(--ink-3);margin-top:4px}
+  .rv-h .spacer{flex:1}
+  .closebtn{width:34px;height:34px;border-radius:8px;border:1px solid var(--border);background:var(--surface);font-size:16px;color:var(--ink-2)}
+  .rv-bar{display:flex;align-items:center;gap:10px;padding:11px 22px;border-bottom:1px solid var(--border);background:var(--surface-2);font-size:12.5px;color:var(--ink-2)}
+  .rv-bar .spacer{flex:1}
+  .badge{font-size:11px;font-weight:600;padding:1px 7px;border-radius:6px}
+  .b-static{background:var(--ok-bg);color:var(--ok)} .b-llm{background:var(--warn-bg);color:var(--warn)}
+  .rv-cols{flex:1;display:grid;grid-template-columns:1fr 1fr;min-height:0}
+  .col{overflow:auto;padding:16px 20px}
+  .col.left{border-right:1px solid var(--border)}
+  .col h4{font-size:12px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.04em;margin:0 0 10px}
+
+  .ent{display:flex;align-items:center;gap:9px;padding:9px 11px;border:1px solid var(--border);border-radius:8px;margin-bottom:7px}
+  .ent .ico{width:26px;height:26px;border-radius:6px;background:var(--accent-weak);color:var(--accent-ink);display:grid;place-items:center;font-size:11px;font-weight:700}
+  .ent .nm{font-weight:600;flex:1}.ent .nm small{display:block;font-weight:400;color:var(--ink-3);font-size:11px}
+
+  /* 名寄せカード */
+  .merge{border:1px solid var(--accent);background:var(--accent-weak);border-radius:10px;padding:11px 12px;margin-bottom:12px}
+  .merge .t{font-size:12px;color:var(--accent-ink);font-weight:700;margin-bottom:6px}
+  .merge .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+  .merge .chip{font-size:11.5px;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:2px 9px}
+  .merge .arrow{color:var(--accent-ink);font-weight:700}
+  .merge .canon{font-weight:700}
+  .merge .acts{display:flex;gap:7px;margin-top:8px}
+  .mbtn{height:28px;padding:0 11px;border-radius:7px;border:1px solid var(--accent);background:var(--surface);font-size:12px;color:var(--accent-ink);font-weight:600}
+  .mbtn.split{border-color:var(--border);color:var(--ink-2);font-weight:400}
+
+  .rel{padding:10px 11px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+  .rel .chain{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  .rel .meta{display:flex;align-items:center;gap:8px;margin-top:6px;font-size:11px;color:var(--ink-3)}
+  .rel .ev{font-size:11.5px;color:var(--ink-2);margin-top:5px}
+
+  .rv-foot{display:flex;align-items:center;gap:10px;padding:13px 22px;border-top:1px solid var(--border)}
+  .rv-foot .spacer{flex:1}
+  .btn-approve{height:36px;padding:0 16px;border:none;border-radius:8px;background:var(--accent);color:#fff;font-weight:700;font-size:13px}
+  .btn-reject{height:36px;padding:0 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--ink-2);font-size:13px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav"><a href="chat-impact-analysis.html">チャット</a><a href="file-manager.html">ファイル管理</a><a class="on">管理</a></nav>
+  <div class="spacer"></div>
+  <div class="user">管</div>
+</div>
+
+<div class="wrap">
+  <div class="subnav">
+    <a href="admin-usage.html">利用統計</a>
+    <a class="on">KB取り込み</a>
+    <a>版管理</a>
+    <a>ユーザー</a>
+    <a>コスト/キー</a>
+  </div>
+
+  <div class="pagehead">
+    <div><h1>KB取り込み管理</h1><div class="sub">共有ナレッジベースへの登録・索引化 ・ 書込は sherpa-ingest のみ</div></div>
+    <div class="spacer"></div>
+    <span class="verbox">版 <b>2025冬リリース</b> ▾</span>
+    <button class="btn-primary">＋ アップロード</button>
+  </div>
+
+  <!-- アップロード（A16） -->
+  <div class="drop">
+    <b>ファイルをドラッグ＆ドロップ</b>（バルク可） ・ .pdf .docx .xlsx .doc/.xls/.ppt(旧形式) .cpy .cbl .jcl
+    <div class="hint">checksum で重複検知 → 版内の差し替え扱い。doctype は自動判定＋手動補正。</div>
+  </div>
+
+  <!-- 取り込みパイプライン（A12–A15） -->
+  <div class="card">
+    <div class="card-h">
+      <h3>取り込みパイプライン</h3>
+      <span class="small">トラック: 変換 → MD → ES ／ 静的解析 → Neo4j</span>
+      <span class="spacer"></span>
+      <button class="btn-ghost">失敗のみ表示</button>
+    </div>
+    <table>
+      <thead><tr><th style="width:240px">文書</th><th style="width:96px">doctype</th><th>進捗（トラック別）</th><th style="width:96px">状態</th><th style="width:150px"></th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="fname">📄 請求機能設計書.pdf</span></td>
+          <td><span class="dtype">設計書</span></td>
+          <td><div class="pipe">
+            <span class="st done"><span class="dot"></span>変換</span>
+            <span class="st done"><span class="dot"></span>MD</span>
+            <span class="st done"><span class="dot"></span>ES</span>
+            <span class="st na"><span class="dot"></span>静的—</span>
+            <span class="st done"><span class="dot"></span>Neo4j(L)</span>
+          </div></td>
+          <td><span class="status ok">公開済</span></td>
+          <td><div class="rowact"><button class="mini prev" onclick="openPrev()">プレビュー</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="fname">📜 INVOICE-CPY.cpy <small>被COPY 50本</small></span></td>
+          <td><span class="dtype">copybook</span></td>
+          <td><div class="pipe">
+            <span class="st na"><span class="dot"></span>変換—</span>
+            <span class="st done"><span class="dot"></span>MD</span>
+            <span class="st done"><span class="dot"></span>ES</span>
+            <span class="st done"><span class="dot"></span>静的✓</span>
+            <span class="st done"><span class="dot"></span>Neo4j</span>
+          </div></td>
+          <td><span class="status ok">公開済</span></td>
+          <td><div class="rowact"><button class="mini prev" onclick="openPrev()">プレビュー</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="fname">📄 見積機能設計書.doc <small>旧形式</small></span></td>
+          <td><span class="dtype">設計書</span></td>
+          <td><div class="pipe">
+            <span class="st prog"><span class="dot"></span>変換中</span>
+            <span class="st wait"><span class="dot"></span>MD</span>
+            <span class="st wait"><span class="dot"></span>ES</span>
+            <span class="st na"><span class="dot"></span>静的—</span>
+            <span class="st wait"><span class="dot"></span>Neo4j</span>
+          </div></td>
+          <td><span class="status run">処理中</span></td>
+          <td><div class="rowact"><button class="mini">ログ</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="fname">📜 LEGACY.cbl <small>方言: 未対応</small></span></td>
+          <td><span class="dtype">cobol</span></td>
+          <td><div class="pipe">
+            <span class="st na"><span class="dot"></span>変換—</span>
+            <span class="st done"><span class="dot"></span>MD</span>
+            <span class="st done"><span class="dot"></span>ES</span>
+            <span class="st warn"><span class="dot"></span>静的⚠ Lへ</span>
+            <span class="st prog"><span class="dot"></span>Neo4j(L)</span>
+          </div></td>
+          <td><span class="status run">処理中</span></td>
+          <td><div class="rowact"><button class="mini">ログ</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="fname">📄 消費税対応_改修方針.pptx</span></td>
+          <td><span class="dtype">設計書</span></td>
+          <td><div class="pipe">
+            <span class="st fail"><span class="dot"></span>変換失敗</span>
+            <span class="st wait"><span class="dot"></span>MD</span>
+            <span class="st wait"><span class="dot"></span>ES</span>
+            <span class="st na"><span class="dot"></span>静的—</span>
+            <span class="st wait"><span class="dot"></span>Neo4j</span>
+          </div></td>
+          <td><span class="status err">失敗</span></td>
+          <td><div class="rowact"><button class="mini">ログ</button><button class="mini rerun">再実行</button></div></td>
+        </tr>
+        <tr>
+          <td><span class="fname">📜 NIGHTLY.jcl</span></td>
+          <td><span class="dtype">jcl</span></td>
+          <td><div class="pipe">
+            <span class="st na"><span class="dot"></span>変換—</span>
+            <span class="st done"><span class="dot"></span>MD</span>
+            <span class="st na"><span class="dot"></span>ES—</span>
+            <span class="st done"><span class="dot"></span>静的✓ ジョブ流</span>
+            <span class="st done"><span class="dot"></span>Neo4j</span>
+          </div></td>
+          <td><span class="status ok">公開済</span></td>
+          <td><div class="rowact"><button class="mini prev" onclick="openPrev()">プレビュー</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">✓=完了 ／ 処理中 ／ ⚠=静的解析未対応の方言は LLM 抽出（L）にフォールバック（A15） ／ 失敗は原因表示＋ステップ再実行（A14）。
+  「静的—」「ES—」はそのトラックが対象外。公開は<b>確信度ベースで自動</b>、<b>抽出プレビュー(A17)</b>は抜き取り/低確信の<b>任意レビュー・監査</b>。</div>
+</div>
+
+<!-- A17 抽出プレビュー：公開前の名寄せ・関係レビュー -->
+<div class="overlay" id="overlay">
+  <div class="rv">
+    <div class="rv-h">
+      <div><div class="hl">抽出プレビュー: INVOICE-CPY.cpy</div>
+        <div class="sub">公開前レビュー ・ 2025冬リリース ・ Neo4j 反映前 ・ <b>名寄せの確認が精度の肝</b>（ONTOLOGY §5）</div></div>
+      <div class="spacer"></div>
+      <button class="closebtn" onclick="closePrev()">✕</button>
+    </div>
+    <div class="rv-bar">
+      抽出: エンティティ <b>14</b>（<span class="badge b-static">静的 11</span> <span class="badge b-llm">LLM 3</span>） ・
+      関係 <b>62</b>（静的 58 / LLM 4） ・ 名寄せ候補 <b>2</b> 件 要確認
+      <span class="spacer"></span>
+      <span class="badge b-static">● 確実=静的</span> <span class="badge b-llm">○ 要確認=LLM</span>
+    </div>
+    <div class="rv-cols">
+      <!-- 左: エンティティ＋名寄せ -->
+      <div class="col left">
+        <h4>名寄せ（要確認）</h4>
+        <div class="merge">
+          <div class="t">⚠ 同一エンティティの候補 — 統合してよいか確認</div>
+          <div class="chips">
+            <span class="chip">消費税率 <small>（設計書・LLM）</small></span>
+            <span class="chip">税率 <small>（仕様・LLM）</small></span>
+            <span class="chip">TAX-RATE <small>（copybook・静的）</small></span>
+            <span class="arrow">→</span>
+            <span class="chip canon">Parameter: TAX-RATE</span>
+          </div>
+          <div style="font-size:11.5px;color:var(--accent-ink)">正準キー = hash(Parameter + 正規化"TAX-RATE" + 2025冬) ・ 確信度 0.88</div>
+          <div class="acts"><button class="mbtn">統合を承認</button><button class="mbtn split">分離（別物として扱う）</button></div>
+        </div>
+        <div class="merge" style="border-color:var(--border);background:var(--surface)">
+          <div class="t" style="color:var(--ink-2)">○ 顧客コード / CUST-CD → CustomerCode（確信度 0.61）</div>
+          <div class="acts"><button class="mbtn">統合を承認</button><button class="mbtn split">分離</button></div>
+        </div>
+
+        <h4 style="margin-top:16px">エンティティ（14）</h4>
+        <div class="ent"><span class="ico">Par</span><span class="nm">TAX-RATE <small>Parameter ・ 別名 消費税率/税率</small></span><span class="badge b-static">静的</span></div>
+        <div class="ent"><span class="ico">DI</span><span class="nm">INVOICE-AMOUNT <small>DataItem ・ INVOICE-CPY.請求金額</small></span><span class="badge b-static">静的</span></div>
+        <div class="ent"><span class="ico">Cpy</span><span class="nm">INVOICE-CPY <small>Copybook ・ 被COPY 50本</small></span><span class="badge b-static">静的</span></div>
+        <div class="ent"><span class="ico">Rul</span><span class="nm">消費税計算ルール <small>BusinessRule ・ 設計書由来</small></span><span class="badge b-llm">LLM</span></div>
+      </div>
+
+      <!-- 右: 関係 -->
+      <div class="col">
+        <h4>関係（62 ・ 主なもの）</h4>
+        <div class="rel">
+          <div class="chain">INVOICE-CPY ─CONTAINS→ TAX-RATE</div>
+          <div class="meta"><span class="badge b-static">静的・確実</span> 構造定義（01/05 レベル）</div>
+        </div>
+        <div class="rel">
+          <div class="chain">BILLGEN ─COPIES→ INVOICE-CPY</div>
+          <div class="meta"><span class="badge b-static">静的・確実</span> COPY 句 ・ 被COPY 50本の1つ</div>
+        </div>
+        <div class="rel">
+          <div class="chain">請求書発行機能 ─USES→ TAX-RATE</div>
+          <div class="meta"><span class="badge b-llm">LLM・要確認 0.62</span></div>
+          <div class="ev">根拠: 請求機能設計書.pdf §4「請求額は消費税率を用いて算出」</div>
+        </div>
+        <div class="rel">
+          <div class="chain">消費税計算ルール ─REFERENCES→ TAX-RATE</div>
+          <div class="meta"><span class="badge b-llm">LLM・要確認 0.71</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="rv-foot">
+      <span style="font-size:12px;color:var(--ink-3)">承認すると Neo4j（2025冬DB）に反映され、影響範囲分析の対象になります。</span>
+      <span class="spacer"></span>
+      <button class="btn-reject" onclick="closePrev()">差し戻し</button>
+      <button class="btn-approve" onclick="closePrev()">公開（グラフに反映）</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  function openPrev(){document.getElementById('overlay').classList.add('open');}
+  function closePrev(){document.getElementById('overlay').classList.remove('open');}
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closePrev();});
+</script>
+</body>
+</html>

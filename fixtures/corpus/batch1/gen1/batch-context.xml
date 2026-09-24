@@ -1,0 +1,9 @@
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:batch="http://www.springframework.org/schema/batch">
+  <batch:job id="nightlyJob">
+    <batch:step id="payrollStep">
+      <batch:tasklet ref="payrollTasklet"/>
+    </batch:step>
+  </batch:job>
+  <bean id="payrollTasklet" class="com.acme.PayrollTasklet"/>
+</beans>

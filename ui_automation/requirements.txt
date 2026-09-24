@@ -1,0 +1,4 @@
+-r ../requirements-dev.txt
+
+PyYAML>=6.0
+Pillow>=10.0

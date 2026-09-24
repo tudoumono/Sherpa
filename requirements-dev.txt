@@ -1,0 +1,8 @@
+# Sherpa MVP — 開発/テスト依存（テスト実行者だけが入れる。利用者の scripts/start.sh は入れない）。
+# 再現ピン止めは constraints.txt（`pip install -r requirements-dev.txt -c constraints.txt`）。
+-r requirements.txt
+httpx                # FastAPI TestClient
+pytest>=8
+pytest-cov           # カバレッジ計測（--cov=sherpa）
+ruff                 # lint（ruff check .）
+playwright           # ブラウザ UI テスト（tests/e2e・要 `python -m playwright install chromium`）

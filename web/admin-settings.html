@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — システム管理</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="fonts.css">
+<script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
+<script src="common.js"></script>
+<script src="nav.js"></script>
+<style>
+  .wrap2{max-width:none;margin:0}
+  #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
+  .sec{margin-top:18px}
+  .sec .body{padding:20px 24px}
+  .hint{font-size:var(--text-small);color:var(--ink-2);margin-top:4px}
+  .research-group{margin-top:28px;padding:20px;border:1px solid var(--border);
+    border-top:4px solid var(--ink-2);border-radius:var(--radius);background:var(--surface-2)}
+  .research-group + .research-group{margin-top:40px}
+  .research-group > h2{margin:0 0 20px;font-size:24px;font-weight:700;line-height:1.4;color:var(--ink)}
+  .research-group > .sec{margin-top:16px}
+  @media(max-width:640px){.research-group{padding:12px}.research-group > h2{font-size:21px}}
+  /* 取り込みアームのチェックボックス行 */
+  .armrow{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--border)}
+  .armrow:last-child{border-bottom:none}
+  .armrow input[type=checkbox],.armrow input[type=radio]{margin-top:3px;width:16px;height:16px;flex:none}
+  .armrow input:disabled{opacity:.5}
+  .armrow .arm-t{font-weight:600;font-size:var(--text-label);color:var(--ink)}
+  .armrow .arm-d{font-size:var(--text-small);color:var(--ink-3);margin-top:2px}
+  .armrow code{font-size:var(--text-caption);color:var(--ink-3)}
+  /* 旧形式変換バックエンド（W0） */
+  #legacy-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
+  #legacy-lo-missing{margin-top:8px}
+  /* 視覚読み取りの VLM 設定（⑤） */
+  #vlm-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
+  .vlm-field{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .vlm-field .vlm-l{font-size:var(--text-label);color:var(--ink);min-width:88px}
+  .vlm-field select,.vlm-field input[type=text],.vlm-field textarea{flex:1;max-width:360px;padding:6px 8px;
+    font-size:var(--text-label);font-family:inherit;border:1px solid var(--control-border);border-radius:var(--radius);
+    background:var(--surface);color:var(--ink)}
+  .vlm-cloud{display:flex;gap:10px;align-items:flex-start;padding:8px 0}
+  .vlm-cloud input[type=checkbox]{margin-top:3px;width:16px;height:16px;flex:none}
+  #vlm-key-missing{margin-top:8px}
+  .sec-actions{display:flex;gap:9px;align-items:center;margin-top:12px}
+  /* AIプロバイダ（クラウド）カード */
+  .testrow{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+  .cloud-provider-row{display:flex;gap:10px;align-items:flex-start;padding:8px 0}
+  .cloud-provider-row input[type=radio]{margin-top:3px;width:16px;height:16px;flex:none}
+  /* ヘッダ・保存バーの実寸を除いた残り高さを、ナビとパネルへ割り当てる。 */
+  .admin-layout{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+  .admin-layout > sherpa-topbar{flex:none}
+  .admin-layout > .wrap{width:100%;max-width:1440px;flex:1;min-height:0;padding:24px 28px 16px}
+  #main-content{height:100%;min-height:0;display:flex;flex-direction:column}
+  .pagehead{flex:none;flex-wrap:wrap;align-items:center;gap:8px 20px;margin-bottom:24px}
+  .pagehead > div:first-child{flex:1;min-width:260px}
+  .pagehead .sub{margin-top:6px;max-width:56rem}
+  .pagehead .spacer{display:none}
+  .wrap2.frm{flex:1;min-height:0;display:grid;grid-template-columns:14rem minmax(0,1fr);gap:24px;padding:0}
+  .admin-panels{min-height:0;min-width:0;display:flex;flex-direction:column}
+  .action-bar{flex:none;display:flex;justify-content:center;padding:12px 28px;
+    border-top:1px solid var(--border);background:var(--surface)}
+  .action-bar-inner{max-width:1384px;width:100%;display:flex;gap:10px 20px;align-items:center;flex-wrap:wrap}
+  .save-scope{font-size:var(--text-small);color:var(--ink-2)}
+  #msg{margin:0;font-size:var(--text-small)}
+  #unsaved-note{font-size:var(--text-small);font-weight:600;color:var(--accent-ink)}
+  #save-bar:has(#unsaved-note:not([hidden])) #msg:not(:has(.danger,.loading-inline)){display:none}
+  #save{flex:none}
+  .tres{font-size:var(--text-small)} .ok{color:var(--ok)} .danger{color:var(--danger)} .muted{color:var(--ink-3)}
+  /* 使えるモデル（model_catalog）: 用途×プロバイダの1枚表 */
+  .mc-table{width:100%;border-collapse:collapse;font-size:var(--text-label);margin-top:8px}
+  .mc-table th,.mc-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
+  .mc-table th{color:var(--ink-3);font-weight:600;font-size:var(--text-small)}
+  .mc-table td.mc-na{color:var(--ink-3)}
+  .mc-table select.mc-default{max-width:200px;padding:5px 7px;font-size:var(--text-small);border:1px solid var(--control-border);
+    border-radius:var(--radius);background:var(--surface);color:var(--ink)}
+  .mc-table td.mc-changed select.mc-default{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--surface))}
+  #mc-modal-textarea{width:100%;min-height:160px}
+  .modal-close{background:none;border:none;font-size:var(--text-body);color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
+  .modal-close:hover{background:var(--surface-2)}
+  /* 外部連携（API キー）カード */
+  .ek-table{width:100%;border-collapse:collapse;font-size:var(--text-label);margin-top:8px}
+  .ek-table th,.ek-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}
+  .ek-table th{color:var(--ink-3);font-weight:600;font-size:var(--text-small)}
+  .ek-table td.ek-muted{color:var(--ink-3)}
+  .ek-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:var(--text-caption)}
+  .ek-badge.ek-active{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .ek-badge.ek-revoked,.ek-badge.ek-expired{background:color-mix(in srgb,var(--ink-3) 16%,transparent);color:var(--ink-3)}
+  .mini.ek-danger{color:var(--danger);border-color:var(--danger)}
+  #ek-issue-form label{font-size:var(--text-small);color:var(--ink-3);display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+  #ek-issue-form input,#ek-issue-form textarea{padding:6px 8px;font-size:var(--text-label);font-family:inherit;
+    border:1px solid var(--control-border);border-radius:var(--radius);background:var(--surface);color:var(--ink)}
+  #ek-reveal-key{font-size:var(--text-label);word-break:break-all;padding:10px;border:1px solid var(--border);
+    border-radius:var(--radius);background:var(--surface-2);margin:10px 0}
+  .tabs{display:flex;flex-direction:column;gap:4px;overflow:auto;padding:0 8px 16px 0;
+    border-right:1px solid var(--border)}
+  .tab-group-title{padding:8px 12px;font-size:var(--text-small);font-weight:600;color:var(--ink-2)}
+  .tab-group-operations{margin-top:20px;border-top:1px solid var(--border);padding-top:20px}
+  .tab-btn{position:relative;flex:none;min-height:44px;padding:10px 12px;border:1px solid transparent;
+    border-radius:var(--radius-sm);background:transparent;font-size:var(--text-label);line-height:1.5;
+    font-weight:500;color:var(--ink-2);cursor:pointer;text-align:left;overflow-wrap:anywhere}
+  .tab-btn:hover{background:var(--surface-2);color:var(--ink)}
+  .tab-btn[aria-selected="true"]{color:var(--accent-ink);background:var(--accent-weak);font-weight:600;
+    border-color:var(--accent)}
+  .tab-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent-ink);
+    margin-left:6px;vertical-align:middle}
+  .tab-dot[hidden]{display:none}
+  .tabpanel:not([hidden]){flex:1;min-height:0;overflow:auto;padding:0 8px 20px 0;scrollbar-gutter:stable}
+  .tabpanel > .sec:first-child{margin-top:0}
+  .tabpanel-embed:not([hidden]){display:flex;overflow:hidden;padding:0;scrollbar-gutter:auto}
+  .embed-frame{flex:1;display:block;width:100%;height:100%;min-height:0;border:1px solid var(--border);
+    border-radius:var(--radius);background:var(--surface)}
+  @media(max-width:900px){
+    .admin-layout > .wrap{padding:16px 16px 12px}
+    .wrap2.frm{grid-template-columns:11rem minmax(0,1fr);gap:16px}
+    .pagehead{margin-bottom:16px}
+    .action-bar{padding:12px 16px}
+    .vlm-field{flex-wrap:wrap}
+    .vlm-field .vlm-l{width:100%}
+    .vlm-field select,.vlm-field input,.vlm-field textarea{min-width:0;max-width:100%;width:100%}
+  }
+  @media(max-width:600px){
+    .wrap2.frm{grid-template-columns:9rem minmax(0,1fr);gap:12px}
+    .tab-btn{padding:8px}
+  }
+  /* 拡大表示で縦方向が足りない場合はページをスクロールさせ、操作領域の高さを保つ。 */
+  @media(max-height:400px){
+    .admin-layout{height:auto;min-height:100dvh;overflow:auto}
+    .admin-layout > .wrap{flex:none}
+    #main-content{height:auto}
+    .wrap2.frm{flex:none;height:24rem}
+  }
+  /* 高度な設定は「詳細」折りたたみへ（タブあたり1箇所まで）。 */
+  details.adv{margin-top:16px;border-top:1px solid var(--border);padding-top:12px}
+  details.adv > summary{cursor:pointer;font-size:var(--text-small);font-weight:600;color:var(--ink-2);
+    list-style:none}
+  details.adv > summary::-webkit-details-marker{display:none}
+  details.adv > summary::before{content:'▸ ';color:var(--ink-3)}
+  details.adv[open] > summary::before{content:'▾ '}
+  details.adv > *:not(summary){margin-top:10px}
+  /* 既定から変えた項目だけ強調する（差分表示）。未変更は薄いまま。 */
+  .cfg-changed{border-color:var(--accent) !important;
+    background:color-mix(in srgb,var(--accent) 8%,var(--surface))}
+</style>
+</head>
+<body class="admin-layout">
+<sherpa-topbar></sherpa-topbar>
+
+<div class="wrap">
+  <div id="access-denied">
+    <div style="font-size:32px;margin-bottom:12px">🚫</div>
+    <div style="font-size:var(--text-body);font-weight:700;margin-bottom:8px">アクセス権限がありません</div>
+    <div style="font-size:var(--text-label)">管理者権限が必要です。</div>
+  </div>
+
+  <div id="main-content">
+    <div class="pagehead">
+      <div><h1>システム管理</h1>
+        <div class="sub">全ユーザーに適用する設定と、利用状況を管理します。自分だけの設定は「個人設定」へ。</div></div>
+      <div class="spacer"></div>
+      <!-- 開発者向け API 仕様書への導線（画面裏の HTTP API 仕様を確認する用途）。 -->
+      <a class="help-link" href="/docs" target="_blank" rel="noopener">Swagger UI（API仕様書）→</a>
+      <a class="help-link" href="manual.html#sysadmin">この画面の使い方 →</a>
+    </div>
+
+    <div class="wrap2 frm">
+      <!-- タブのキー・保存範囲を維持し、運用画面は初回選択時だけ iframe へ読み込む。 -->
+      <div class="tabs" role="tablist" id="admin-tabs" aria-label="システム管理の項目" aria-orientation="vertical">
+        <div class="tab-group-title" role="presentation">設定</div>
+        <button class="tab-btn" type="button" role="tab" data-tab="provider" aria-selected="true" id="tab-btn-provider" aria-controls="tabpanel-provider" tabindex="0">プロバイダ＋接続先<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-provider" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="research" aria-selected="false" id="tab-btn-research" aria-controls="tabpanel-research" tabindex="-1">調査・回答<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-research" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="models" aria-selected="false" id="tab-btn-models" aria-controls="tabpanel-models" tabindex="-1">使えるモデル<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-models" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="ingest" aria-selected="false" id="tab-btn-ingest" aria-controls="tabpanel-ingest" tabindex="-1">取り込み<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-ingest" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="usage" aria-selected="false" id="tab-btn-usage" aria-controls="tabpanel-usage" tabindex="-1">利用統計の AI<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-usage" hidden></span></button>
+        <button class="tab-btn" type="button" role="tab" data-tab="extkeys" aria-selected="false" id="tab-btn-extkeys" aria-controls="tabpanel-extkeys" tabindex="-1">外部連携<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-extkeys" hidden></span></button>
+        <div class="tab-group-title tab-group-operations" role="presentation">運用・管理</div>
+        <button class="tab-btn" type="button" role="tab" data-tab="users" aria-selected="false" id="tab-btn-users" title="利用者の追加・無効化・権限の変更。" aria-controls="tabpanel-users" tabindex="-1">ユーザー管理</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="usage-page" aria-selected="false" id="tab-btn-usage-page" title="利用の傾向・トークンの集計。" aria-controls="tabpanel-usage-page" tabindex="-1">利用統計</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit" title="誰が・いつ・何をしたかの記録。" aria-controls="tabpanel-audit" tabindex="-1">監査ログ</button>
+        <button class="tab-btn" type="button" role="tab" data-tab="status" aria-selected="false" id="tab-btn-status" title="各サービス（DB・検索・AI）の稼働状況。" aria-controls="tabpanel-status" tabindex="-1">システム状態</button>
+      </div>
+
+      <div class="admin-panels">
+      <!-- ===== タブ1: プロバイダ＋接続先 ===== -->
+      <div class="tabpanel" id="tabpanel-provider" data-tabpanel="provider" role="tabpanel" aria-labelledby="tab-btn-provider" tabindex="0">
+        <div class="card sec" id="cloud-card">
+          <div class="card-head"><span class="title">AIプロバイダ（クラウド）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">クラウドの AI は1つだけ選べます（同時に複数は使いません）。
+              選んでいない側のキーは消えずに残りますが使われません。ローカル AI（Ollama）は別枠でいつでも併用できます。</div>
+            <div id="cloud-provider-radios"><!-- JS が描画: openai/gemini/bedrock ラジオ --></div>
+
+            <div id="cloud-key-block" style="margin-top:14px">
+              <label class="vlm-field"><span class="vlm-l" id="cloud-key-label">キー</span>
+                <input type="password" id="cloud-key" placeholder="未設定" autocomplete="off" style="max-width:360px">
+              </label>
+              <div class="testrow" style="display:flex;gap:10px;align-items:center;margin-top:6px">
+                <button class="mini" id="cloud-key-test" type="button">接続テスト</button>
+                <span class="tres muted" id="cloud-key-test-res"></span>
+                <button class="mini ek-danger" id="cloud-key-clear" type="button">キーを削除</button>
+                <span class="tres muted" id="cloud-key-clear-res"></span>
+              </div>
+            </div>
+
+            <div class="hint" id="cloud-status" style="margin-top:10px"><!-- JS: 選択済み/既定 --></div>
+
+            <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+              <label class="vlm-cloud">
+                <input type="checkbox" id="personal-keys-allowed">
+                <span><span class="arm-t">利用者ごとの個人キーを許可する</span>
+                  <div class="arm-d">オンにすると、利用者は「個人設定」で自分の API キーを入力し、それを優先して使えます。
+                    オフ（既定）の状態では、利用者の個人キーは保存されません（既に保存済みのキーがある場合は、
+                    この設定を保存した時点で削除されます）。AI のキーはこの画面の中央設定だけで管理されます。</div></span>
+              </label>
+            </div>
+
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
+              <label class="vlm-cloud">
+                <input type="checkbox" id="web-search-allowed">
+                <span><span class="arm-t">Web 検索を許可する（Codex のみ）</span>
+                  <div class="arm-d">オンにすると、頭脳が Codex（OpenAI 直結）の利用者はチャットごとに Web 検索を
+                    ON/OFF できます（やりたいことブロックの「参照する」行）。オフ（既定）では Web 検索の行自体が
+                    表示されません。Azure OpenAI 等の接続先では、この設定に関わらず Web 検索は使えません。
+                    外部に送られるのは調べものの検索語だけで、社内資料そのものが外部へ送られることはありません。
+                    検索は OpenAI 側の仕組みで実行されるため、このサーバーから一般のインターネットへ
+                    新たに通信することもありません（必要なのは普段どおりの OpenAI への接続だけです）。</div></span>
+              </label>
+            </div>
+
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
+              <label class="vlm-cloud">
+                <input type="checkbox" id="openai-direct-visible">
+                <span><span class="arm-t">OpenAI 直結を利用者の構成一覧に出す</span>
+                  <div class="arm-d">オフ（既定）のとき OpenAI 系は Codex（OpenAI）に一本化され、利用者の実行構成
+                    一覧に「OpenAI」（直結）は表示されません。既に OpenAI 直結を選んでいる利用者の設定は
+                    そのまま有効に動きます（一覧外の現在値として表示）。</div></span>
+              </label>
+            </div>
+
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
+              <label class="vlm-field"><span class="vlm-l">ローカル AI（Ollama）の既定接続先</span>
+                <input type="text" id="cloud-ollama-url" placeholder="http://localhost:11434" style="max-width:360px">
+              </label>
+              <div class="hint">クラウドの選択に関わらず、常に使えます（社内のローカル AI・排他選択の対象外）。</div>
+            </div>
+
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px" id="openai-endpoint-block">
+              <span class="vlm-l" style="display:block;margin-bottom:6px">OpenAI の接続先</span>
+              <div id="openai-endpoint-radios"><!-- JS が描画: openai/azure/custom ラジオ --></div>
+              <div id="openai-endpoint-fields" style="margin-top:10px">
+                <label class="vlm-field"><span class="vlm-l">接続先 URL</span>
+                  <input type="text" id="openai-endpoint-base-url"
+                         placeholder="例: https://<リソース名>.openai.azure.com/openai/v1" style="max-width:360px">
+                </label>
+                <div class="hint">「その他 OpenAI 互換」を選んだ場合、接続先 URL のホストが私有アドレス（10.x/172.16-31.x/192.168.x/
+                  100.64.0.0-100.127.255.255 等）・localhost・.local/.internal/.lan 等の非公開名・ドット無しの裸のホスト名の
+                  いずれかならチャット画面に「社内サーバ」、公開ホスト（例: api.example.com）なら「クラウド（OpenAI 互換）」と
+                  表示されます。この判定は DNS 解決をせず URL 上のホスト表記だけで行うため、私有 IP に解決される公開ホスト名を
+                  設定している場合でも表記どおり「クラウド（OpenAI 互換）」表示になります。</div>
+                <label class="vlm-field"><span class="vlm-l">埋め込みのデプロイ名</span>
+                  <input type="text" id="openai-endpoint-embed-deployment"
+                         placeholder="空欄なら既定のモデル名" style="max-width:360px">
+                </label>
+                <div class="testrow">
+                  <button class="mini" id="openai-endpoint-test" type="button">接続テスト</button>
+                  <span class="tres muted" id="openai-endpoint-test-res"></span>
+                </div>
+              </div>
+              <div class="hint">接続先を変えると、検索の索引（埋め込み）が今の設定と合わなくなることがあります。切替後は資料フォルダの再取り込みが必要になる場合があります。</div>
+            </div>
+
+            <!-- 高度な設定（このタブの「詳細」折りたたみ・1箇所まで）。 -->
+            <details class="adv">
+              <summary>詳細設定</summary>
+              <label class="vlm-field"><span class="vlm-l">認証ヘッダ形式</span>
+                <select id="openai-endpoint-auth-header">
+                  <option value="bearer">Bearer（既定）</option>
+                  <option value="api-key">api-key</option>
+                </select>
+              </label>
+              <label class="vlm-field"><span class="vlm-l">API バージョン</span>
+                <input type="text" id="openai-endpoint-api-version"
+                       placeholder="不要なら空欄" style="max-width:360px">
+              </label>
+              <label class="vlm-field" style="align-items:flex-start">
+                <span class="vlm-l">利用者が選べる接続先（Ollama）</span>
+                <textarea id="cloud-ollama-allowlist" rows="3" style="max-width:360px"
+                          placeholder="例: 10.0.0.5:11434（1行に1つ）"></textarea>
+              </label>
+              <div class="hint">自分のパソコンだけなら空のままで構いません（localhost は常に使えます）。</div>
+              <label class="vlm-field" style="align-items:flex-start;margin-top:14px">
+                <span class="vlm-l">Webhook の許可先</span>
+                <textarea id="webhook-allowlist" rows="3" style="max-width:360px"
+                          placeholder="例: example.com:443（1行に1つ）"></textarea>
+              </label>
+              <div class="hint">外部連携キーの Webhook URL は、ここに登録した host:port
+                （またはこのサーバー自身＝localhost）宛てにしか設定できません（誤って社内の
+                他システムへ通知が飛ぶことを防ぐ・「外部連携（API キー）」タブで宛先を登録）。</div>
+            </details>
+
+            <div class="sec-actions">
+              <button class="btn-ghost" data-reset-tab="provider" type="button">このタブを既定に戻す</button>
+              <span class="tres muted" id="tab-reset-res-provider"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 同時実行の上限（背景実行の受付・sherpa/chat_turns.py::effective_limits）。
+             チャットの送信（背景実行のターン）を同時にいくつまで受け付けるかの上限です。
+             空欄のままなら環境設定の初期値（.env）が使われます。このタブの「既定に戻す」ボタン
+             （上の cloud-card 内）がこのカードの項目も一緒に既定へ戻す。 -->
+        <div class="card sec" id="chat-max-turns-card">
+          <div class="card-head"><span class="title">同時実行の上限</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">チャットで送信した、回答を作成中の質問を同時にいくつまで
+              受け付けるかの上限です。上限に達した分は待たされることなく、その場で
+              「実行中の回答が終わってからもう一度お試しください」という案内になります。空欄のままなら
+              組み込みの既定が使われます。</div>
+
+            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（1 人あたり）</span>
+              <input type="number" id="chat-max-turns-per-user" min="1" max="16" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="chat-max-turns-per-user-hint" style="margin:-8px 0 14px"></div>
+
+            <label class="vlm-field"><span class="vlm-l">同時に実行できる質問の数（全員の合計）</span>
+              <input type="number" id="chat-max-turns-global" min="1" max="64" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="chat-max-turns-global-hint" style="margin:-8px 0 6px"></div>
+          </div>
+        </div>
+
+        <!-- チャット画面のクイック入力例（ウェルカム画面のチップ・sherpa/chat_examples.py）。
+             導入先ごとに例文を差し替えられるようにする（既定は組み込みの4例）。 -->
+        <div class="card sec" id="chat-examples-card">
+          <div class="card-head"><span class="title">チャットの質問例（クイック入力）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">チャット画面を開いたときに表示される、クリックで入力欄に読み込める質問例です。
+              空欄のまま保存すると質問例は表示されません。組み込みの既定（4例）に戻すには、下の「未設定に戻す」を使ってください。</div>
+
+            <label class="armrow">
+              <input type="checkbox" id="chat-examples-enabled" checked>
+              <span><span class="arm-t">質問例を表示する</span>
+                <div class="arm-d">オフにすると、下欄の内容にかかわらず質問例のブロック自体を表示しません。</div></span>
+            </label>
+
+            <label class="vlm-field" style="margin-top:10px">
+              <span class="vlm-l">質問例（1行に1つ・最大8件・各200文字まで）</span>
+              <textarea id="chat-examples-items" rows="4"
+                        placeholder="例: 消費税率を変更すると、影響がありそうな箇所を教えてください。"></textarea>
+            </label>
+            <div class="hint" id="chat-examples-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
+
+            <div class="sec-actions">
+              <button class="btn-ghost" id="chat-examples-reset" type="button">未設定に戻す（組み込みの既定を使う）</button>
+              <span class="tres muted" id="chat-examples-reset-res"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" id="tabpanel-research" data-tabpanel="research" role="tabpanel" aria-labelledby="tab-btn-research" tabindex="0" hidden>
+        <p class="hint">利用する AI 経路（Codex または API）の設定と、共通の検索設定を調整します。
+          「標準」の値は、チャットの「深く」「最大」に応じて増えます。</p>
+        <section class="research-group" aria-labelledby="research-codex-heading">
+          <h2 id="research-codex-heading">Codex 専用</h2>
+          <div class="card sec" id="codex-investigation-card">
+            <div class="card-head"><span class="title">Codex に考えさせる量</span></div>
+            <div class="body">
+              <p class="hint">通常の調査で使う推論レベルです。「深く」は high、「最大」は xhigh。「作成」の標準は専用の環境設定を使います。</p>
+              <label class="vlm-field"><span class="vlm-l">Codex の推論レベル（標準・作成以外）</span>
+                <select id="depth-base-codex-reasoning" style="max-width:200px">
+                  <option value="">環境設定の既定に従う</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+              <div class="hint" id="depth-base-codex-reasoning-hint" style="margin:-8px 0 6px"></div>
+            </div>
+          </div>
+        </section>
+        <section class="research-group" aria-labelledby="research-api-heading">
+          <h2 id="research-api-heading">API 専用</h2>
+          <div class="card sec" id="api-investigation-card">
+            <div class="card-head"><span class="title">API での追加調査</span></div>
+            <div class="body">
+              <p class="hint">AI が検索・読み取りを指示し、Sherpa が結果を返すやり取りを繰り返します。
+                下の3項目は OpenAI・Ollama の調査ループと検索アシスタント用です。Codex 内部の調査には適用しません。</p>
+              <label class="vlm-field"><span class="vlm-l">探索の反復回数（標準）</span>
+                <input type="number" id="depth-base-max-turns" min="1" max="200" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-max-turns-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（標準）</span>
+                <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-grep-max-hits-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">1回に読み取る前後の行数（標準）</span>
+                <input type="number" id="depth-base-read-window" min="10" max="400" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-read-window-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">1回の AI 応答で実行するツール数の上限</span>
+                <input type="number" id="agentic-max-tools-per-turn" min="1" max="256" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="agentic-max-tools-per-turn-hint" style="margin:-8px 0 6px"></div>
+              <p class="hint">OpenAI・Ollama・Gemini・Bedrock 用（Codex は対象外）。1質問の累計ではなく、1応答ごとの上限です。
+                超過時は上限まで実行して調査を打ち切ります。「深く」「最大」でも固定です。</p>
+
+              <label class="vlm-field"><span class="vlm-l">埋め込みの同時送信数</span>
+                <input type="number" id="embed-parallel" min="1" max="16" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="embed-parallel-hint" style="margin:-8px 0 6px"></div>
+              <p class="hint">資料の取り込み時に、埋め込み API へ同時に送るリクエスト数です。大きくすると取り込みが速くなりますが、
+                プロバイダ側の同時実行/レート制限に早く当たることがあります。保存した値は次に開始する取り込みから反映されます。</p>
+            </div>
+          </div>
+          <!-- BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: AI が検索で1回に読み込む
+               情報量（予算）。既定は精度優先（絞らない）——費用を抑えたいときだけ管理者が明示的に下げる。
+               この画面が唯一の真実源（env 経由の指定は ENV-CLEAN・2026-09-03 で撤去済み）。 -->
+          <div class="card sec" id="agentic-budget-card" tabindex="-1">
+            <div class="card-head"><span class="title">API の調査で受け取る情報量</span></div>
+            <div class="body">
+              <div class="hint" style="margin-bottom:10px">API 経路で検索・読み取りなどのツールから受け取る情報量を制限します（Codex 内部は対象外）。
+                「前後の行数」は読む範囲、この設定は結果のデータ量の上限です。行数の範囲内でも、この上限で切り詰める場合があります。
+                空欄は既定値を使います。1KB＝1024バイトです。</div>
+              <div class="hint">ページ数は、文章中心のA4資料を1ページ約1,000字として換算した目安です。図表・コード・ファイル名などの付加情報によって変わります。</div>
+
+              <label class="vlm-field"><span class="vlm-l">ツール結果1件あたりの上限（KB）</span>
+                <input type="number" id="agentic-budget-per-result" min="1" max="8192" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="agentic-budget-per-result-hint" style="margin:-8px 0 14px"></div>
+
+              <label class="vlm-field"><span class="vlm-l">追加調査1回の累計上限（KB）</span>
+                <input type="number" id="agentic-budget-total" min="4" max="65536" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="agentic-budget-total-hint" style="margin:-8px 0 6px"></div>
+              <div class="hint">累計は、追加調査の開始から終了までに受け取った結果の合計です。同じ箇所を再取得した分も含みます。上限を超えると、その時点までの内容で回答をまとめます
+                （調べきれなかった旨も併せて伝えます）。</div>
+
+              <!-- BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定）:
+                   現在のモデルが一度に読める量（トークン数の上限）に合わせて、上の予算を自動で
+                   これ以上安全な値まで縮める（縮むだけ・自動では増えない）。 -->
+              <div class="hint" style="margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--border)">
+                現在のモデルが一度に読める量（トークン数）が分かっている場合、上の予算はその量を
+                超えないところまで自動的に絞られます（一度に読める量が大きくても、上の予算より増えることはありません）。</div>
+              <div class="hint" id="agentic-budget-window-status"><!-- JS: 現在のモデル・一度に読める量・出所・自動調整後の上限 --></div>
+              <div class="hint danger" id="agentic-budget-window-unknown" hidden>
+                コンテキスト上限を判定できないため、情報量の設定値を使います。必要なら「使えるモデル」で仕様値を補足してください。</div>
+
+
+            </div>
+          </div>
+        </section>
+        <section class="research-group" aria-labelledby="research-shared-heading">
+          <h2 id="research-shared-heading">両方に共通</h2>
+          <div class="card sec" id="search-investigation-card">
+            <div class="card-head"><span class="title">共通の資料検索・関係探索</span></div>
+            <div class="body">
+              <p class="hint">Sherpa が資料や候補を集める共通処理の設定です。Codex の事前検索にも使います。AI による追加調査全体の上限ではありません。</p>
+              <label class="vlm-field"><span class="vlm-l">内容の質問（仕様問い合わせ）のヒット件数上限（標準）</span>
+                <input type="number" id="depth-base-qa-max-hits" min="1" max="1000" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-qa-max-hits-hint" style="margin:-8px 0 14px"></div>
+
+              <p class="hint"><b>以下の二つの段数は、揃える必要はありません。</b>原因調査は関係の向きを限定しないため、同じ段数でも探索範囲が広がりやすくなります。範囲を広げたい調査の項目だけ調整してください。</p>
+              <p class="hint">1段は直接つながる箇所まで、2段はその先まで。段数を増やすと、候補数や処理時間が増えることがあります。</p>
+              <label class="vlm-field"><span class="vlm-l">影響分析でたどる段数（標準）</span>
+                <input type="number" id="depth-base-impact-depth" min="1" max="64" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-impact-depth-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">変更箇所から、呼び出し・参照などを影響が及ぶ方向にたどり、影響先の候補を探します。</p>
+
+              <label class="vlm-field"><span class="vlm-l">原因調査でたどる段数（標準）</span>
+                <input type="number" id="depth-base-troubleshoot-depth" min="1" max="16" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-troubleshoot-depth-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">症状文から関連箇所を見つけ、周囲の関係と資料から原因の手がかりを集めます。候補はその後の調査に使い、この処理だけで原因を確定しません。</p>
+            </div>
+          </div>
+        </section>
+        <div class="sec-actions">
+          <button class="btn-ghost" type="button" data-reset-tab="research">このタブを既定に戻す</button>
+          <span class="tres muted" id="tab-reset-res-research"></span>
+        </div>
+      </div>
+
+      <!-- ===== タブ2: 使えるモデル ===== -->
+      <div class="tabpanel" id="tabpanel-models" data-tabpanel="models" role="tabpanel" aria-labelledby="tab-btn-models" tabindex="0" hidden>
+        <div class="card sec" id="model-catalog-card">
+          <div class="card-head"><span class="title">使えるモデル</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:6px">用途ごとに、選べるモデルと既定を決めます（表示は選択中のクラウド AI・Ollama・Codex のみ）。</div>
+            <div id="model-catalog-table"><!-- JS が描画 --></div>
+              <div style="margin-top:14px">
+                <div class="vlm-l" style="margin-bottom:6px">コンテキスト上限の補足（API モデル・任意）</div>
+                <div class="hint" style="margin-bottom:8px">既定は未登録です。コンテキスト上限はプロバイダから取得、または組み込み情報で判定します。
+                  判定できないモデルは、提供元の仕様値を補足できます。手動登録値を優先します。Codex は対象外です。</div>
+                <div class="hint" style="margin-bottom:8px">判定できない場合は<a href="#agentic-budget-card">調査の情報量設定</a>を使います。そこも未設定なら、ツール結果1件は <b>256KB</b>、追加調査1回の累計は <b>4096KB（4MB）</b> です。
+                  これらは調査の制限値で、モデルのコンテキスト上限ではありません。</div>
+                <table class="mc-table" id="agentic-model-windows-table">
+                  <thead><tr><th>プロバイダ</th><th>モデル名</th><th>コンテキスト上限（トークン数）</th><th></th></tr></thead>
+                  <tbody id="agentic-model-windows-rows"></tbody>
+                </table>
+                <button class="btn-ghost" id="agentic-model-windows-add" type="button" style="margin-top:8px">行を追加</button>
+              </div>
+            <div class="sec-actions">
+              <button class="btn-ghost" data-reset-tab="models" type="button">このタブを既定に戻す</button>
+              <span class="tres muted" id="tab-reset-res-models"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== タブ3: 取り込み ===== -->
+      <div class="tabpanel" id="tabpanel-ingest" data-tabpanel="ingest" role="tabpanel" aria-labelledby="tab-btn-ingest" tabindex="0" hidden>
+        <div class="card sec">
+          <div class="card-head"><span class="title">取り込み設定（資料の読み取り方）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:6px">資料フォルダの文書をどう読み取って検索対象にするかを選びます。
+              変更は次回の取り込み・再取り込みから反映されます。</div>
+            <div id="arms-list"><!-- JS が描画 --></div>
+            <div class="hint" id="arms-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
+            <div class="hint">すべて外すと既定の構成（標準）に戻ります。</div>
+            <div class="sec-actions">
+              <button class="btn-ghost" data-reset-tab="ingest" type="button">このタブを既定に戻す</button>
+              <span class="tres muted" id="tab-reset-res-ingest"></span>
+            </div>
+
+            <!-- 高度な設定（旧形式変換・視覚読み取り）はこのタブの「詳細」折りたたみ1箇所にまとめる。 -->
+            <details class="adv">
+              <summary>詳細設定</summary>
+              <!-- 旧形式（.doc/.xls/.ppt）の変換バックエンド（W0: none/libreoffice・W1: office_com） -->
+              <div id="legacy-block" hidden style="margin-top:0;border-top:none;padding-top:0">
+                <div class="arm-t">旧形式（.doc / .xls / .ppt）の変換</div>
+                <div class="hint" style="margin-bottom:8px">Word / Excel / PowerPoint の<b>古い形式</b>のファイルを、
+                  新しい形式に変換してから読み取ります。</div>
+                <div id="legacy-radios"><!-- JS が描画 --></div>
+                <div class="hint" id="legacy-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
+                <div class="hint danger" id="legacy-lo-missing" hidden><!-- JS が描画: soffice 未検出時の案内 --></div>
+                <div class="hint danger" id="legacy-oc-missing" hidden><!-- JS が描画: Office 連携ワーカー不達時の案内 --></div>
+              </div>
+
+              <!-- ⑤（feedback-batch-2026-07-08）: 視覚読み取り（markitdown_ocr）の VLM 設定 -->
+              <div id="vlm-block" hidden>
+                <div class="arm-t">視覚読み取りの AI</div>
+                <div class="hint" style="margin-bottom:8px">上の「画像・スキャン文書を AI が見て読み取り（視覚読み取り）」を
+                  使うときに、どの AI で画像を読み取るかを選びます。</div>
+                <label class="vlm-field"><span class="vlm-l">使う AI</span>
+                  <select id="vlm-provider">
+                    <option value="ollama">ローカル（Ollama・このパソコン内で処理）</option>
+                    <option value="openai">クラウド（OpenAI）</option>
+                  </select>
+                </label>
+                <div class="hint" style="margin:-4px 0 8px">社内ネットワークの Ollama を使う場合は、接続先を IP アドレスで指定してください
+                  （ドメイン名を使う場合は、下のクラウド利用の許可が必要です）。</div>
+                <label class="vlm-field"><span class="vlm-l">モデル名</span>
+                  <input type="text" id="vlm-model" placeholder="qwen2.5vl" autocomplete="off">
+                </label>
+                <label class="vlm-cloud">
+                  <input type="checkbox" id="vlm-cloud-allowed">
+                  <span><span class="arm-t">クラウド AI（OpenAI）の利用を許可する</span>
+                    <div class="arm-d danger">許可すると、画像が外部の AI（OpenAI）に送信されます。機密資料では特にご注意ください。
+                      許可しない場合は、クラウドを選んでも画像は送信されません（読み取りは行われません）。</div></span>
+                </label>
+                <div class="hint danger" id="vlm-key-missing" hidden><!-- JS: クラウド選択かつキー未設定時の案内 --></div>
+                <div class="hint" id="vlm-status"><!-- JS: 既定に従っているか/固定中か --></div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1・U1）: rag.md の LLM 成形トグル。
+             既定 off（2026-09-05 裁定）。ON にすると取り込み後に自動実行され利用料が発生するため、費用の存在を平文で明示する。 -->
+        <div class="card sec" id="rag-llm-render-card">
+          <div class="card-head"><span class="title">検索用文書の読みやすい整形</span></div>
+          <div class="body">
+            <label class="armrow">
+              <input type="checkbox" id="rag-llm-render">
+              <span><span class="arm-t">AI で検索用の文書を読みやすく整形する</span>
+                <div class="arm-d">オンにすると、取り込んだ資料を AI が検索用に読みやすく自動整形します
+                  （資料の取り込み後に自動実行・<b>利用料が発生します</b>）。オフでも検索自体はできます
+                  （整形前の内容で検索します）。</div></span>
+            </label>
+            <div class="hint" id="rag-llm-render-status"><!-- JS が描画: 既定に従っているか/固定中か --></div>
+          </div>
+        </div>
+
+
+      </div>
+
+      <!-- ===== タブ4: 利用量 ===== -->
+      <div class="tabpanel" id="tabpanel-usage" data-tabpanel="usage" role="tabpanel" aria-labelledby="tab-btn-usage" tabindex="0" hidden>
+        <!-- STAT-2: 利用統計チャット専用の AI 選択（利用者の実行構成には依存しない・管理者全体で統一）。 -->
+        <div class="card sec" id="usage-chat-ai-card" hidden>
+          <div class="card-head"><span class="title">利用統計チャットに使う AI</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">利用統計画面のチャット欄（統計について
+              質問する）が使う AI です。利用者ごとのチャットの AI の設定とは別に、ここで選びます。
+              利用統計画面側で「今回だけ」一時的に切り替えることもできます（この設定自体は
+              変わりません）。</div>
+            <div id="usage-chat-ai-radios"><!-- JS が描画: 実行構成に合わせる/openai/ollama の3択ラジオ --></div>
+            <div class="hint" id="usage-chat-ai-status"><!-- JS: 固定中/連動中と、実際に使われる値の案内 --></div>
+            <div class="sec-actions">
+              <button class="btn-ghost" data-reset-tab="usage" type="button">このタブを既定に戻す</button>
+              <span class="tres muted" id="tab-reset-res-usage"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== タブ5: 外部連携（API キー） ===== -->
+      <div class="tabpanel" id="tabpanel-extkeys" data-tabpanel="extkeys" role="tabpanel" aria-labelledby="tab-btn-extkeys" tabindex="0" hidden>
+        <div class="card sec" id="ext-keys-card">
+          <div class="card-head"><span class="title">外部連携（API キー）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">他のアプリ（Dify 等）からこの Sherpa の検索・変換を呼び出すための
+              キーです。発行直後だけキー本体を表示します（以後は再表示できません・控えを保管してください）。
+              呼び出し回数の上限は「発行後、最初の呼び出しから24時間ごとの枠」で数えます（サーバーの再起動でカウントがリセットされます）。</div>
+
+            <label class="vlm-cloud" style="margin-bottom:10px">
+              <input type="checkbox" id="ext-keys-user-allowed">
+              <span><span class="arm-t">利用者のキー発行を許可する</span>
+                <div class="arm-d">オンにすると、利用者は「個人設定」で自分の API キーを発行・管理できます
+                  （アクセス範囲は本人の権限内に限られます）。オフ（既定）に戻すと、利用者が発行したキーはすべて失効します。</div></span>
+            </label>
+            <label class="vlm-field" style="margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:14px">
+              <span class="vlm-l">利用者キーの1日あたりの呼び出し上限</span>
+              <input type="number" id="ext-keys-user-quota-default" min="1" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="ext-keys-user-quota-default-hint" style="margin:-8px 0 14px"></div>
+
+            <label class="vlm-field" style="margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:14px">
+              <span class="vlm-l">AI 下調べ検索（外部からの検索呼び出し）の既定 AI</span>
+              <select id="ext-research-default-provider" style="max-width:260px">
+                <option value="ollama">ローカル（Ollama・既定）</option>
+                <option value="openai">クラウド（OpenAI）</option>
+              </select>
+            </label>
+            <div class="hint" id="ext-research-default-provider-hint" style="margin:-8px 0 14px"></div>
+            <div class="hint danger" id="ext-research-default-provider-invalid" hidden style="margin:-8px 0 14px"><!-- JS が描画: 保存値が不正な場合の案内 --></div>
+
+            <div id="ext-keys-list"><!-- JS が描画 --></div>
+            <div class="sec-actions">
+              <button class="btn-primary" id="ext-key-issue-open" type="button">発行</button>
+            </div>
+            <div class="sec-actions">
+              <button class="btn-ghost" data-reset-tab="extkeys" type="button">このタブを既定に戻す</button>
+              <span class="tres muted" id="tab-reset-res-extkeys"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 埋め込みタブ: ユーザー管理／利用統計／監査ログ／システム状態 =====
+           各ページを ?embed=1 で埋め込む（当該ページ側が自分のトップバー/ナビを隠す・
+           web/{admin-users,usage,audit,status}.js 冒頭）。初回選択時に data-src → src で
+           遅延ロードする（admin-settings.js::loadEmbedFrame）。単独アクセス（?embed 無しで
+           直接開く）は各ページとも従来どおり。 -->
+      <div class="tabpanel tabpanel-embed" id="tabpanel-users" data-tabpanel="users" role="tabpanel" aria-labelledby="tab-btn-users" tabindex="0" hidden>
+        <iframe class="embed-frame" id="embed-frame-users" title="ユーザー管理" data-src="admin-users.html?embed=1"></iframe>
+      </div>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-usage-page" data-tabpanel="usage-page" role="tabpanel" aria-labelledby="tab-btn-usage-page" tabindex="0" hidden>
+        <iframe class="embed-frame" id="embed-frame-usage-page" title="利用統計" data-src="usage.html?embed=1"></iframe>
+      </div>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-audit" data-tabpanel="audit" role="tabpanel" aria-labelledby="tab-btn-audit" tabindex="0" hidden>
+        <iframe class="embed-frame" id="embed-frame-audit" title="監査ログ" data-src="audit.html?embed=1"></iframe>
+      </div>
+      <div class="tabpanel tabpanel-embed" id="tabpanel-status" data-tabpanel="status" role="tabpanel" aria-labelledby="tab-btn-status" tabindex="0" hidden>
+        <iframe class="embed-frame" id="embed-frame-status" title="システム状態" data-src="status.html?embed=1"></iframe>
+      </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 使えるモデル: 一覧編集モーダル（app.css の .overlay/.modal 流儀を再利用） -->
+<div class="overlay" id="mc-overlay">
+  <div class="modal" role="dialog" aria-labelledby="mc-modal-title">
+    <div class="modal-h"><span id="mc-modal-title">モデル一覧を編集</span><span class="spacer"></span>
+      <button class="modal-close" id="mc-modal-close" type="button" aria-label="閉じる">✕</button></div>
+    <div class="modal-b">
+      <label for="mc-modal-textarea">選べるモデル（1行に1つ）</label>
+      <textarea id="mc-modal-textarea"></textarea>
+    </div>
+    <div class="modal-f">
+      <button class="btn-ghost" id="mc-modal-cancel" type="button">キャンセル</button>
+      <button class="btn-primary" id="mc-modal-save" type="button">反映</button>
+    </div>
+  </div>
+</div>
+
+<!-- API キー発行モーダル（発行フォーム→成功時はプレーンキーの1回表示に差し替える） -->
+<div class="overlay" id="ek-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ek-modal-title">
+    <div class="modal-h"><span id="ek-modal-title">API キーを発行</span><span class="spacer"></span>
+      <button class="modal-close" id="ek-modal-close" type="button" aria-label="閉じる">✕</button></div>
+    <div class="modal-b">
+      <form id="ek-issue-form">
+        <label>ラベル（用途のメモ）
+          <input type="text" id="ek-label" maxlength="100" placeholder="例: 社内ツール連携" required></label>
+        <label>対象フォルダID（空欄で全て）
+          <textarea id="ek-worlds" rows="2" placeholder="1行に1つ（例: test）"></textarea></label>
+        <label>この日まで有効（任意・空欄で無期限）<input type="date" id="ek-expires"></label>
+        <label>1日あたりの呼び出し上限（任意・空欄で無制限）
+          <input type="number" id="ek-quota" min="1" step="1"></label>
+        <label>Webhook URL（任意・取り込み完了/失敗の通知先）
+          <input type="url" id="ek-webhook-url" maxlength="2048"
+                 placeholder="https://example.com/hooks/sherpa"></label>
+        <div class="hint">未登録の宛先は「プロバイダ＋接続先」タブの「詳細設定」にある
+          「Webhook の許可先」へあらかじめ追加しておく必要があります
+          （自分のパソコン＝localhost は常に使えます）。</div>
+      </form>
+      <div id="ek-reveal" hidden>
+        <div class="hint danger">このキーは今だけ表示されます。控えを保管してください（再表示はできません）。</div>
+        <div id="ek-reveal-key"></div>
+        <button class="mini" id="ek-copy" type="button">コピー</button>
+        <span class="tres muted" id="ek-copy-res"></span>
+        <div id="ek-reveal-webhook" hidden style="margin-top:10px">
+          <div class="hint danger">Webhook の署名検証用シークレットも今だけ表示されます（再表示はできません）。</div>
+          <div id="ek-reveal-webhook-secret"></div>
+          <button class="mini" id="ek-copy-webhook-secret" type="button">コピー</button>
+          <span class="tres muted" id="ek-copy-webhook-secret-res"></span>
+        </div>
+      </div>
+      <span class="tres danger" id="ek-issue-err"></span>
+    </div>
+    <div class="modal-f">
+      <button class="btn-ghost" id="ek-modal-cancel" type="button">キャンセル</button>
+      <button class="btn-primary" id="ek-modal-submit" type="button">発行</button>
+    </div>
+  </div>
+</div>
+
+<div class="action-bar" id="save-bar">
+  <div class="action-bar-inner">
+    <button class="btn-primary" id="save">保存</button>
+    <span class="save-scope">すべての設定タブの変更をまとめて保存</span>
+    <span id="unsaved-note" role="status" hidden>未保存の変更があります</span>
+    <span class="note" id="msg"></span>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="admin-settings.js"></script>
+</body>
+</html>

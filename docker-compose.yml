@@ -1,0 +1,136 @@
+# Sherpa MVP — M0 足場のストア群（Neo4j / Elasticsearch / PostgreSQL）
+# 起動: make up   停止: make down   状態: make ps
+# 本番は /srv/sherpa＋専用ユーザー（08-実行権限と隔離.md）。これは dev 用の最小構成。
+#
+# ★ Docker 化するのは「ストア(DB)だけ」。アプリ/取り込み/Codex は WSL ホスト直（恒久・RUNTIME-SANDBOX §0.5）。
+#    理由: Codex の sandbox がホストネイティブ＝コンテナ化すると壊れる。ネイティブ前提を捨てるなら
+#    Office COM(有償)の意味も消える（LibreOffice で十分）ため、ホストに固定する。
+#    ②Office COM は Windows-side の独立ワーカー＋API（11-Office変換.md）。
+name: sherpa-mvp
+
+services:
+  postgres:                       # RDB 正本（documents / ingest_runs / analyses / users …）
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sherpa
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sherpa_dev}
+      POSTGRES_DB: sherpa
+    ports: ["127.0.0.1:${PGPORT:-5432}:5432"]   # localhost のみ（dev）。既存 PostgreSQL と衝突時は PGPORT で変更（store.py のクライアント側と共用の1変数）
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./scripts/seed_admin.sql:/docker-entrypoint-initdb.d/10_seed_admin.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sherpa"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # OCR worker は外部へ出られない閉じたネットワークに置くため、PG だけそこにも足を出す。
+    networks: [default, ocr-internal]
+
+  neo4j:                          # GraphRAG（影響範囲分析・world ごと1グラフ）
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-sherpa_dev}
+      NEO4J_server_memory_pagecache_size: 512m
+    ports: ["127.0.0.1:${SHERPA_NEO4J_HTTP_PORT:-7474}:7474", "127.0.0.1:${SHERPA_NEO4J_BOLT_PORT:-7687}:7687"]   # localhost のみ（dev）。変更時は NEO4J_URI も対で合わせる
+    volumes:
+      - neo4j:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  elasticsearch:                  # ベクトル/BM25 検索（MVP は任意・影響分析は Neo4j 主体）
+    build: ./docker/elasticsearch # 日本語形態素 analysis-kuromoji 入り（PG/Neo4j は素で日本語OK）
+    image: sherpa/es-kuromoji:8.19.20
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["127.0.0.1:${SHERPA_ES_PORT:-9200}:9200"]   # localhost のみ（ESは無認証＝外部公開しない・RV High）。変更時は ES_URL も対で合わせる
+    volumes:
+      - es:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200 >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  ocr-worker:                     # 任意: Evidence後段のPaddleOCR観測（基本MD/RAGとは分離）
+    # `profiles` 付き＝既定では起動しない。使うときだけ `--profile ocr` を明示する。
+    profiles: ["ocr"]
+    build:
+      context: .
+      dockerfile: docker/ocr/Dockerfile
+    image: sherpa/ocr-worker:paddleocr-3.7.0-cpu
+    init: true
+    user: "${SHERPA_OCR_UID:-1000}:${SHERPA_OCR_GID:-1000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # passwordをURLへ埋め込まない。`@:/?#%`等を含む運用passwordでもURL escape漏れを起こさない。
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: sherpa
+      PGUSER: sherpa
+      PGPASSWORD: ${POSTGRES_PASSWORD:-sherpa_dev}
+      SHERPA_DERIVED_DIR: /derived
+      SHERPA_OBSERVATION_DIR: /observations
+      # worker起動時に必須検査する。未設定時は空のまま渡し、sentinel mountから処理へ進ませない。
+      SHERPA_OCR_WORLD_ROOT: ${SHERPA_OCR_WORLD_ROOT:-}
+      PADDLE_PDX_CACHE_HOME: /models
+      HOME: /tmp/ocr-home
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+      FLAGS_use_mkldnn: "0"
+    command: ["python", "-m", "sherpa.ingest.ocr_worker", "--paddle-cache", "/models"]
+    volumes:
+      # Registryに保存したhost絶対pathをcontainerでも同じpathとして解決する。
+      # repository全体は`.env`等の秘密も含むためmountしない。許可するWorld共通rootだけを明示設定する。
+      - type: bind
+        # profile無効時もComposeの基本stackをparse可能にするsentinel。profile有効時はstart/workerが
+        # SHERPA_OCR_WORLD_ROOTの明示・絶対path・全登録World包含をfail-closedで検査する。
+        source: ${SHERPA_OCR_WORLD_ROOT:-/__sherpa_ocr_world_root_must_be_configured__}
+        target: ${SHERPA_OCR_WORLD_ROOT:-/__sherpa_ocr_world_root_must_be_configured__}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SHERPA_DERIVED_DIR:-./data/derived}
+        target: /derived
+        read_only: true
+      - type: bind
+        source: ${SHERPA_OBSERVATION_DIR:-./data/observations}
+        target: /observations
+      # 法務確認前はrepository/imageへ同梱しない。固定hash照合済みcacheだけをread-onlyで渡す。
+      - type: bind
+        source: ${SHERPA_OCR_MODEL_CACHE:-./data/ocr-models}
+        target: /models
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: ${SHERPA_OCR_MEMORY_LIMIT:-8g}
+    # dependency/model不備はheartbeatへ記録してexit 2。無限restart loopにせず有界再試行で停止する。
+    restart: "on-failure:3"
+    networks: [ocr-internal]
+
+  # ollama:                       # 簡易処理ローカルLLM（任意）。DGX 未接続のため当面は OpenAI で可。
+  #   image: ollama/ollama
+  #   ports: ["11434:11434"]
+  #   volumes: [ollama:/root/.ollama]
+
+volumes:
+  pg:
+  neo4j:
+  es:
+  # ollama:
+
+networks:
+  # 外部へ出られない閉じたネットワーク。OCR は完全にローカル推論で、外部通信は一切要らない。
+  ocr-internal:
+    internal: true

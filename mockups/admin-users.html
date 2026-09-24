@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — ユーザー管理（UI モック）</title>
+<style>
+  :root{
+    --accent:#0d9488;--accent-weak:#ccfbf1;--accent-ink:#0f766e;
+    --bg:#f6f7f9;--surface:#fff;--surface-2:#f1f3f5;--border:#e3e6ea;
+    --ink:#1f2937;--ink-2:#5b6573;--ink-3:#8b95a3;
+    --ok:#16a34a;--ok-bg:#e9f7ef;--warn:#d97706;--danger:#dc2626;--info:#2563eb;--info-bg:#e8effc;
+    --radius:12px;--radius-sm:8px;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+  .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700}.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#fff}.brand small{font-weight:500;color:var(--ink-3)}
+  .nav{display:flex;gap:4px}.nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;color:var(--ink-2);text-decoration:none}.nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .topbar .spacer{flex:1}.user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 24px 48px}
+  .subnav{display:flex;gap:6px;margin-bottom:16px}.subnav a{font-size:13px;padding:6px 12px;border-radius:999px;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);background:var(--surface)}.subnav a.on{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent-weak);font-weight:600}
+  .pagehead{display:flex;align-items:flex-end;gap:14px;margin-bottom:16px}.pagehead h1{font-size:21px;margin:0;font-weight:700}.pagehead .sub{font-size:12.5px;color:var(--ink-3)}.pagehead .spacer{flex:1}
+  .btn-primary{height:34px;padding:0 14px;border:none;border-radius:var(--radius-sm);background:var(--accent);color:#fff;font-weight:600;font-size:13px}
+  .search{height:34px;width:220px;border:1px solid var(--border);border-radius:8px;padding:0 12px;background:var(--surface);font:inherit}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-size:11.5px;font-weight:600;color:var(--ink-2);padding:11px 14px;border-bottom:1px solid var(--border);background:var(--surface-2)}
+  td{padding:12px 14px;border-bottom:1px solid var(--border);vertical-align:middle}tr:last-child td{border-bottom:none}
+  .uname{display:flex;align-items:center;gap:10px}
+  .av{width:32px;height:32px;border-radius:50%;background:var(--accent-weak);color:var(--accent-ink);display:grid;place-items:center;font-size:12px;font-weight:700}
+  .uname b{font-weight:600}.uname small{display:block;color:var(--ink-3);font-size:11.5px}
+  .role{height:30px;border:1px solid var(--border);border-radius:7px;padding:0 8px;font:inherit;font-size:12.5px;background:var(--surface)}
+  .badge{font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px}
+  .b-admin{background:var(--info-bg);color:var(--info)} .b-user{background:var(--surface-2);color:var(--ink-2)}
+  .b-on{background:var(--ok-bg);color:var(--ok)} .b-off{background:#fdecec;color:var(--danger)}
+  .muted{color:var(--ink-3)}
+  .rowact{display:flex;gap:6px;justify-content:flex-end}
+  .mini{height:30px;padding:0 11px;border-radius:7px;border:1px solid var(--border);background:var(--surface);font-size:12px;color:var(--ink-2)}
+  .mini.off{color:var(--danger);border-color:#f3c0c0}
+  .future{margin-top:14px;border:1px dashed var(--border);border-radius:10px;padding:12px 14px;font-size:12.5px;color:var(--ink-3);background:var(--surface)}
+  .future b{color:var(--ink-2)}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav"><a href="chat-impact-analysis.html">チャット</a><a href="file-manager.html">ファイル管理</a><a class="on">管理</a></nav>
+  <div class="spacer"></div><div class="user">管</div>
+</div>
+
+<div class="wrap">
+  <div class="subnav">
+    <a href="admin-usage.html">利用統計</a><a href="admin-ingest.html">KB取り込み</a>
+    <a href="admin-versions.html">版管理</a><a class="on">ユーザー</a><a href="admin-cost.html">コスト/キー</a>
+  </div>
+  <div class="pagehead">
+    <div><h1>ユーザー管理</h1><div class="sub">アカウント・ロール（決定1）。MVPは全社1KB・利用者登録可、管理者がロールを付与</div></div>
+    <div class="spacer"></div>
+    <input class="search" placeholder="名前・メールで検索">
+    <button class="btn-primary">＋ ユーザー追加</button>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>ユーザー</th><th style="width:130px">ロール</th><th style="width:140px">部門</th><th style="width:90px">状態</th><th style="width:120px">最終ログイン</th><th style="width:150px"></th></tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="uname"><span class="av">管</span><span><b>管理 太郎</b><small>admin@example.co.jp</small></span></div></td>
+          <td><select class="role"><option selected>管理者 (admin)</option><option>利用者 (user)</option></select></td>
+          <td class="muted">基盤保守課</td>
+          <td><span class="badge b-on">有効</span></td>
+          <td class="muted">今</td>
+          <td><div class="rowact"><button class="mini">編集</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="uname"><span class="av">田</span><span><b>田中 太郎</b><small>tanaka@example.co.jp</small></span></div></td>
+          <td><select class="role"><option>管理者 (admin)</option><option selected>利用者 (user)</option></select></td>
+          <td class="muted">経理システム課</td>
+          <td><span class="badge b-on">有効</span></td>
+          <td class="muted">今日</td>
+          <td><div class="rowact"><button class="mini">編集</button><button class="mini off">無効化</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="uname"><span class="av">鈴</span><span><b>鈴木 花子</b><small>suzuki@example.co.jp</small></span></div></td>
+          <td><select class="role"><option>管理者 (admin)</option><option selected>利用者 (user)</option></select></td>
+          <td class="muted">販売管理課</td>
+          <td><span class="badge b-on">有効</span></td>
+          <td class="muted">今日</td>
+          <td><div class="rowact"><button class="mini">編集</button><button class="mini off">無効化</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="uname"><span class="av">佐</span><span><b>佐藤 健</b><small>sato@example.co.jp</small></span></div></td>
+          <td><select class="role"><option>管理者 (admin)</option><option selected>利用者 (user)</option></select></td>
+          <td class="muted">基盤保守課</td>
+          <td><span class="badge b-on">有効</span></td>
+          <td class="muted">昨日</td>
+          <td><div class="rowact"><button class="mini">編集</button><button class="mini off">無効化</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="uname"><span class="av" style="background:var(--surface-2);color:var(--ink-3)">退</span><span><b>退職 一郎</b><small>taishoku@example.co.jp</small></span></div></td>
+          <td><select class="role" disabled><option selected>利用者 (user)</option></select></td>
+          <td class="muted">—</td>
+          <td><span class="badge b-off">無効</span></td>
+          <td class="muted">3か月前</td>
+          <td><div class="rowact"><button class="mini">再有効化</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="future">
+    <b>将来拡張（決定1・A28）</b>: 部門ごとの KB スコープ割当、SSO/ディレクトリ連携。MVP は
+    <b>全社1KB・利用者登録可・管理者ロールのみ</b>。無効化時は所有する会話・workspace の扱いを確認（A29）。
+  </div>
+</div>
+</body>
+</html>

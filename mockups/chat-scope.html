@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sherpa — スコープ参照 / ノートブック（UI モック・Phase2）</title>
+<style>
+  :root{
+    --accent:#0d9488;--accent-weak:#ccfbf1;--accent-ink:#0f766e;
+    --bg:#f6f7f9;--surface:#fff;--surface-2:#f1f3f5;--border:#e3e6ea;
+    --ink:#1f2937;--ink-2:#5b6573;--ink-3:#8b95a3;--lock:#94a3b8;
+    --radius:12px;--radius-sm:8px;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);--shadow-lg:0 10px 30px rgba(16,24,40,.18);
+    --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}html,body{height:100%}
+  body{margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);font-size:14px;line-height:1.6;font-variant-numeric:tabular-nums;min-width:1024px}
+  button{font-family:inherit;cursor:pointer}
+  .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700}.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#fff}.brand small{font-weight:500;color:var(--ink-3)}
+  .nav{display:flex;gap:4px}.nav a{height:32px;line-height:32px;padding:0 14px;border-radius:8px;font-size:13px;color:var(--ink-2);text-decoration:none}.nav a.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .topbar .spacer{flex:1}.user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:grid;place-items:center;color:var(--ink-2);font-size:12px}
+  .ph2{font-size:11px;background:#eef2f7;color:var(--ink-2);padding:2px 8px;border-radius:999px}
+
+  .app{display:grid;grid-template-columns:240px 1fr 308px;height:calc(100vh - 52px)}
+  .pane{min-height:0;min-width:0;display:flex;flex-direction:column}
+  .pane.left{border-right:1px solid var(--border);background:var(--surface)}
+  .pane.right{border-left:1px solid var(--border);background:var(--surface)}
+  .pane-body{flex:1;overflow:auto;padding:12px}
+  .newbtn{width:100%;height:34px;border:1px solid var(--accent);color:var(--accent-ink);background:var(--accent-weak);border-radius:var(--radius-sm);font-weight:600;margin-bottom:10px}
+  .conv{padding:8px 10px;border-radius:var(--radius-sm);margin-bottom:3px;color:var(--ink-2);font-size:13px}
+  .conv.active{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+
+  .conv-head{display:flex;align-items:center;gap:10px;padding:0 16px;height:50px;border-bottom:1px solid var(--border);background:var(--surface)}
+  .conv-title{font-weight:600}
+  .chip{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border:1px solid var(--border);border-radius:999px;background:var(--surface-2);font-size:12.5px;color:var(--ink-2);cursor:pointer}
+  .chip b{color:var(--ink)} .chip.scope{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink)}
+  .conv-head .spacer{flex:1}
+  .messages{flex:1;overflow:auto;padding:20px 18px}
+  .msg{width:min(760px,100%);margin:0 auto 18px}.msg.user{display:flex;justify-content:flex-end}
+  .bubble-user{background:var(--accent);color:#fff;padding:10px 14px;border-radius:14px 14px 4px 14px;max-width:75%}
+  .a-row{display:flex;gap:11px}.a-avatar{width:30px;height:30px;border-radius:8px;background:var(--accent-weak);color:var(--accent-ink);display:grid;place-items:center;font-weight:700;flex:0 0 auto}
+  .a-body{flex:1}.scopetag{font-size:11.5px;color:var(--accent-ink);background:var(--accent-weak);border-radius:999px;padding:2px 9px;display:inline-block;margin-bottom:8px}
+  .composer{padding:12px 18px;border-top:1px solid var(--border);background:var(--surface)}
+  .composer .box{max-width:760px;margin:0 auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;gap:8px}
+  .composer textarea{flex:1;border:none;outline:none;resize:none;font:inherit;background:transparent;padding:6px 2px}
+  .sendbtn{width:34px;height:34px;border-radius:8px;border:none;background:var(--accent);color:#fff}
+
+  /* 右: 参照中のソース（R22） */
+  .rhead{padding:13px 14px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px}
+  .rhead .cnt{font-size:11.5px;color:var(--ink-3);font-weight:400}
+  .scopebar{padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;color:var(--ink-2);background:var(--accent-weak)}
+  .scopebar b{color:var(--accent-ink)}
+  .src{display:flex;align-items:center;gap:9px;padding:8px 14px;font-size:12.5px;border-bottom:1px solid var(--surface-2)}
+  .src .fi{color:var(--ink-3)} .src small{display:block;color:var(--ink-3);font-size:11px}
+  .editscope{margin:12px 14px;height:34px;width:calc(100% - 28px);border:1px solid var(--accent);border-radius:8px;background:var(--surface);color:var(--accent-ink);font-weight:600;font-size:12.5px}
+  .wsnote{margin:0 14px 14px;font-size:11px;color:var(--ink-3);border:1px dashed var(--border);border-radius:8px;padding:9px}
+
+  /* スコープピッカー modal */
+  .overlay{position:fixed;inset:0;background:rgba(16,24,40,.42);display:none;z-index:30;align-items:center;justify-content:center}
+  .overlay.open{display:flex}
+  .modal{width:560px;max-width:92vw;background:var(--surface);border-radius:14px;box-shadow:var(--shadow-lg);overflow:hidden}
+  .modal-h{padding:15px 18px;border-bottom:1px solid var(--border);font-weight:700}
+  .modal-b{padding:14px 18px;max-height:60vh;overflow:auto}
+  .grp{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin:6px 0 6px}
+  .tnode{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:7px;font-size:13px;color:var(--ink-2);cursor:pointer}
+  .tnode:hover{background:var(--surface-2)}
+  .tnode.sel{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
+  .tnode.indent{margin-left:20px} .tnode .lock{margin-left:auto;color:var(--lock);font-size:11px}
+  .tnode.ws{opacity:.5;cursor:not-allowed} .tnode.ws .tag{margin-left:auto;font-size:10.5px;color:var(--ink-3)}
+  .radio{width:14px;height:14px;border-radius:50%;border:2px solid var(--ink-3)}
+  .tnode.sel .radio{border-color:var(--accent);position:relative}.tnode.sel .radio::after{content:"";position:absolute;inset:2px;border-radius:50%;background:var(--accent)}
+  .modal-f{display:flex;gap:9px;justify-content:flex-end;padding:13px 18px;border-top:1px solid var(--border)}
+  .btn-cancel{height:36px;padding:0 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--ink-2)}
+  .btn-primary{height:36px;padding:0 16px;border:none;border-radius:8px;background:var(--accent);color:#fff;font-weight:600}
+  .modal-note{font-size:11.5px;color:var(--ink-3);padding:0 18px 12px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="mark">⛰</span>Sherpa <small>業務AI基盤</small></div>
+  <nav class="nav"><a class="on">チャット</a><a href="file-manager.html">ファイル管理</a><a href="admin-usage.html">管理</a></nav>
+  <div class="spacer"></div><span class="ph2">スコープ参照 ・ Phase 2</span><div class="user">田</div>
+</div>
+
+<div class="app">
+  <aside class="pane left"><div class="pane-body">
+    <button class="newbtn">＋ 新しい会話</button>
+    <div class="conv active">請求まわりだけで質問</div>
+    <div class="conv">消費税率の改修 影響範囲</div>
+    <div class="conv">夜間バッチ ABEND 切り分け</div>
+  </div></aside>
+
+  <main class="pane center">
+    <div class="conv-head">
+      <span class="conv-title">請求まわりだけで質問</span>
+      <span class="chip" title="版（R1）">版 <b>2025冬</b> ▾</span>
+      <span class="chip scope" onclick="openPick()" title="参照範囲（R21）">📁 参照範囲: <b>請求サブシステム</b> ▾</span>
+      <div class="spacer"></div>
+    </div>
+    <div class="messages">
+      <div class="msg user"><div class="bubble-user">請求の締め処理で参照しているマスタは？</div></div>
+      <div class="msg"><div class="a-row"><div class="a-avatar">S</div><div class="a-body">
+        <span class="scopetag">📁 請求サブシステム の 8 ソースだけを根拠に回答</span>
+        <div>締め処理（<b>BILLGEN</b>）が参照するのは <b>税率マスタ</b>・<b>請求マスタ</b>です。
+        範囲外（売上・在庫など）は含めていません。必要なら参照範囲を広げてください。</div>
+      </div></div></div>
+    </div>
+    <div class="composer"><div class="box">
+      <textarea rows="1" placeholder="この参照範囲の中で質問…"></textarea><button class="sendbtn">↑</button>
+    </div></div>
+  </main>
+
+  <!-- 右: 参照中のソース（R22） -->
+  <aside class="pane right">
+    <div class="rhead">参照中のソース <span class="cnt">8 件</span></div>
+    <div class="scopebar">📁 <b>uploads/2025冬/請求サブシステム/</b> の部分木だけを参照（共有KB・読取専用）</div>
+    <div class="src"><span class="fi">📄</span><span>請求機能設計書.pdf<small>請求サブシステム/設計書/</small></span></div>
+    <div class="src"><span class="fi">📄</span><span>請求書 帳票定義.xlsx<small>請求サブシステム/帳票/</small></span></div>
+    <div class="src"><span class="fi">📜</span><span>BILLGEN.cbl<small>請求サブシステム/src/</small></span></div>
+    <div class="src"><span class="fi">📜</span><span>INVOICE-CPY.cpy<small>請求サブシステム/src/copy/</small></span></div>
+    <div class="src"><span class="fi">📄</span><span>税計算仕様書.xlsx<small>請求サブシステム/仕様/</small></span></div>
+    <button class="editscope" onclick="openPick()">参照範囲を変更</button>
+    <div class="wsnote"><b>workspace は別物</b>: 自分の持ち込みファイル（grepのみ・RAG非対象）。
+    参照範囲＝共有KBへのレンズで、ファイルは持ちません。1会話で両方併用可。</div>
+  </aside>
+</div>
+
+<!-- スコープピッカー（KBツリーから部分木を選ぶ・workspaceは選べない） -->
+<div class="overlay" id="pick">
+  <div class="modal">
+    <div class="modal-h">参照範囲を選ぶ</div>
+    <div class="modal-b">
+      <div class="grp">共有ナレッジベース / 2025冬リリース（読取専用）</div>
+      <div class="tnode" onclick="sel(this)"><span class="radio"></span>📁 KB 全体<span class="lock">🔒</span></div>
+      <div class="tnode sel indent" onclick="sel(this)"><span class="radio"></span>📁 請求サブシステム<span class="lock">🔒</span></div>
+      <div class="tnode indent" onclick="sel(this)"><span class="radio"></span>📁 売上サブシステム<span class="lock">🔒</span></div>
+      <div class="tnode indent" onclick="sel(this)"><span class="radio"></span>📁 顧客マスタ<span class="lock">🔒</span></div>
+      <div class="tnode indent" onclick="sel(this)"><span class="radio"></span>📁 共通基盤（コピーブック等）<span class="lock">🔒</span></div>
+      <div class="grp" style="margin-top:12px">個人ワークスペース</div>
+      <div class="tnode ws"><span class="radio"></span>📁 workspace<span class="tag">参照範囲に選べません（grep専用・RAG非対象）</span></div>
+    </div>
+    <div class="modal-note">参照範囲は共有KBの部分木のみ。workspace は別チャネル（持ち込み・grep）なので選べません。</div>
+    <div class="modal-f"><button class="btn-cancel" onclick="closePick()">キャンセル</button><button class="btn-primary" onclick="closePick()">この範囲にする</button></div>
+  </div>
+</div>
+
+<script>
+  function openPick(){document.getElementById('pick').classList.add('open');}
+  function closePick(){document.getElementById('pick').classList.remove('open');}
+  function sel(el){document.querySelectorAll('.tnode').forEach(n=>{if(!n.classList.contains('ws'))n.classList.remove('sel');});el.classList.add('sel');}
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closePick();});
+</script>
+</body>
+</html>

@@ -1,0 +1,270 @@
+"""ドキュメント・ドリフト検査（refactoring-plan フェーズ8d の前倒し分）。
+
+正典: docs/proposals/2026-07-02-リファクタリング計画.md 「8d. ドキュメント・ドリフトの CI 検査」。
+
+- test_retired_vocabulary_gate: 退役した「版」モデル固有語彙が、archive/proposals
+  以外の現役 docs（＋ CLAUDE.md）に「撤去の説明」以外の形で残っていないか検査する。
+- test_relative_markdown_links_resolve: docs 配下（archive 含む）＋ CLAUDE.md／
+  README.md／mockups/README.md の相対 Markdown リンクが実在するファイル/ディレクトリを
+  指しているか検査する。
+- test_env_vars_documented: sherpa/**/*.py が参照する `SHERPA_*` 環境変数が
+  `.env.example` ∪ `docs/manual/90-リファレンス.md` に文書化されているか検査する
+  （検査は「コードにあるのに docs に無い」の一方向のみ）。
+- test_api_version_param_retired: archive/proposals 以外の docs（＋ CLAUDE.md）に、旧 `version` が
+  API のクエリ/ボディパラメータとして**今なお受理される**という記載が残っていないか検査する
+  （フェーズ2第2段＝`version` 受理終了・2026-07-13 完了後のドリフト検査）。
+- test_settings_keys_documented: `PUT /settings`（個人設定・`SettingsReq`）／`PUT /admin/settings`
+  （全体設定・`SystemSettingsReq`）のフィールド名が `docs/manual/25-設定リファレンス.md` に
+  バックティック表記（`` `key_name` ``）で記載されているか検査する（MANUAL-2・一方向のみ）。
+- test_harness_make_targets_and_workflows_exist: `docs/20-開発ハーネス.md`・`tests/README.md`・
+  `.claude/skills/rv/SKILL.md` が本文中に書く `make <target>` が `Makefile` の実在ターゲットか、
+  本文中の `*.yml` 言及が `.github/workflows/` の実在ファイルかを検査する（開発ハーネス S3・
+  一方向のみ）。
+"""
+from __future__ import annotations
+
+import ast
+import pathlib
+import re
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+DOCS = ROOT / "docs"
+
+# 旧「版」モデル固有の表現のみを対象にする。`canonical_id` 単体は現役語彙
+# （パス同一性 ID・world_graph.py／ONTOLOGY §3）なので含めない。
+_RETIRED_VOCAB_RE = re.compile(r"版分離|版ライフサイクル|版公開|@版")
+
+# 禁止語を含む行でも、同じ行に「撤去の説明」だと分かる語があれば許容する。
+_EXPLAINED_RE = re.compile(r"撤去|退役|廃止|置換|旧|正典|historical")
+
+
+def _retired_vocab_targets() -> list[pathlib.Path]:
+    """docs/**/*.md のうち archive・proposals を除いたもの＋ CLAUDE.md。"""
+    targets: list[pathlib.Path] = []
+    for path in sorted(DOCS.rglob("*.md")):
+        rel_parts = path.relative_to(DOCS).parts
+        if rel_parts and rel_parts[0] in ("archive", "proposals"):
+            continue
+        targets.append(path)
+    # 公開 export（scripts/export_public.sh）には CLAUDE.md が含まれない＝存在するときだけ検査
+    # （内部リポでは常に存在＝検査は従来どおり効く）。
+    if (ROOT / "CLAUDE.md").exists():
+        targets.append(ROOT / "CLAUDE.md")
+    return targets
+
+
+def test_retired_vocabulary_gate():
+    """archive/proposals 以外の docs に旧「版」モデル語彙が説明抜きで残っていないこと。"""
+    violations: list[str] = []
+    for path in _retired_vocab_targets():
+        rel = path.relative_to(ROOT)
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if _RETIRED_VOCAB_RE.search(line) and not _EXPLAINED_RE.search(line):
+                violations.append(f"{rel}:{lineno}: {line.strip()}")
+
+    assert not violations, "退役語彙ゲート違反（撤去の説明なしに旧語彙が残存）:\n" + "\n".join(violations)
+
+
+# フェーズ2第2段（version 受理終了・2026-07-13）後のドリフト検査。
+# 「version が API のクエリ/ボディパラメータとして今なお受理される」という記載だけを狙い、
+# DB 列 `version`（例: `version=NULL`）・semver・`SHERPA_VERSION` env・設計私案の property 名
+# （例: `version=commit hash`）等の無関係な言及を誤検知しないよう、対象を2形に絞る:
+#   (a) クエリ文字列形の直書き（`?version=`・`&version=`）
+#   (b) 「version パラメータ」等、API パラメータとしての言及
+#   (c) 「version を（互換）受理／deprecation 警告」等の stale な現在形記述
+# 許容語は本ゲート専用（RV MED: `_EXPLAINED_RE` は `旧` を許すため「旧 version も当面受理」の
+# ような stale 記述まで通してしまう。ここでは「終了・撤去済み」を明示する語だけを許す）。
+_API_VERSION_QUERY_RE = re.compile(r"[?&]version=")
+_API_VERSION_PARAM_MENTION_RE = re.compile(r"version\s*(パラメータ|param\b)")
+_API_VERSION_STALE_RE = re.compile(r"version[^。\n]{0,30}(互換受理|受理|deprecation|警告)")
+_API_VERSION_OK_RE = re.compile(r"受理終了|受理は終了|受理を終了|受理削除|終了済み|撤去済み|削除済み|未宣言|無視され")
+
+
+def test_api_version_param_retired():
+    """archive/proposals 以外の docs に、旧 `version` が API パラメータとして受理される旨の記載が
+    「終了・撤去済み」の明示なしに残っていないこと（フェーズ2第2段の受け入れ基準）。"""
+    violations: list[str] = []
+    for path in _retired_vocab_targets():
+        rel = path.relative_to(ROOT)
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            hit = (_API_VERSION_QUERY_RE.search(line)
+                   or _API_VERSION_PARAM_MENTION_RE.search(line)
+                   or _API_VERSION_STALE_RE.search(line))
+            if hit and not _API_VERSION_OK_RE.search(line):
+                violations.append(f"{rel}:{lineno}: {line.strip()}")
+
+    assert not violations, "旧 version パラメータ受理ゲート違反（撤去の説明なしに記載が残存）:\n" + "\n".join(violations)
+
+
+# Markdown リンク `](target)` の target 抽出。画像 `![alt](target)` も同じ形なので
+# 併せて拾った上で、画像拡張子は下流で除外する。
+_MD_LINK_RE = re.compile(r"\]\(([^)]+)\)")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico")
+
+
+def _relative_link_targets() -> list[pathlib.Path]:
+    """docs/**/*.md（archive 含む全部）＋ CLAUDE.md／README.md／mockups/README.md。"""
+    targets = sorted(DOCS.rglob("*.md"))
+    # 公開 export（scripts/export_public.sh）には CLAUDE.md が含まれない＝存在するときだけ検査
+    # （内部リポでは常に存在＝検査は従来どおり効く）。
+    if (ROOT / "CLAUDE.md").exists():
+        targets.append(ROOT / "CLAUDE.md")
+    targets.append(ROOT / "README.md")
+    targets.append(ROOT / "mockups" / "README.md")
+    return targets
+
+
+def test_relative_markdown_links_resolve():
+    """相対 Markdown リンク（.md・ディレクトリ）がリンク元から解決して実在すること。
+
+    画像リンク（.png 等）は既知の未整備（スクショ未撮影・13-詳細設計引継ぎ.md 前提）があるため
+    対象外にする（docs/proposals/2026-07-02-リファクタリング計画.md 8b 参照）。
+    """
+    broken: list[str] = []
+    for path in _relative_link_targets():
+        rel = path.relative_to(ROOT)
+        text = path.read_text(encoding="utf-8")
+        for match in _MD_LINK_RE.finditer(text):
+            target = match.group(1).strip()
+            if target.startswith(("http://", "https://", "mailto:")):
+                continue
+            if target.startswith("#"):
+                continue
+            file_part = target.split("#", 1)[0]
+            if not file_part:
+                continue
+            is_dir = file_part.endswith("/")
+            is_md = file_part.lower().endswith(".md")
+            if not (is_dir or is_md):
+                continue
+            if file_part.lower().endswith(_IMAGE_EXTS):
+                continue
+            resolved = (path.parent / file_part).resolve()
+            if not resolved.exists():
+                broken.append(f"{rel}: {target}")
+
+    assert not broken, "相対リンク切れ:\n" + "\n".join(broken)
+
+
+# コードが参照する env-var 名の抽出（.env.example／manual/90 でも同じパターンで検査する）。
+_ENV_VAR_RE = re.compile(r"SHERPA_[A-Z_]+")
+
+SHERPA_SRC = ROOT / "sherpa"
+
+
+def test_env_vars_documented():
+    """sherpa/**/*.py が参照する SHERPA_* が .env.example / manual/90 に文書化されていること。
+
+    検査は「コードにあるのに docs に無い」の一方向のみ。逆（docs にあってコードに無い
+    ＝`SHERPA_ENV_FILE`／`SHERPA_HOST`／`SHERPA_PORT`／`SHERPA_UID`／
+    `SHERPA_UVICORN_WORKERS` 等・scripts/systemd 側が読む運用変数）は対象外
+    （docs/proposals/2026-07-02-リファクタリング計画.md 8d 参照）。
+    """
+    code_vars: set[str] = set()
+    for path in SHERPA_SRC.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        code_vars |= set(_ENV_VAR_RE.findall(text))
+
+    documented: set[str] = set()
+    for path in (ROOT / ".env.example", DOCS / "manual" / "90-リファレンス.md"):
+        text = path.read_text(encoding="utf-8")
+        documented |= set(_ENV_VAR_RE.findall(text))
+
+    missing = sorted(code_vars - documented)
+    assert not missing, "未文書化の環境変数（.env.example / manual/90 に追記が必要）:\n" + "\n".join(missing)
+
+
+# MANUAL-2（設定リファレンス新設）: 個人設定／全体設定の PUT ボディのフィールド名が
+# docs/manual/25-設定リファレンス.md にバックティック表記で載っているかの検査。
+# JS 側（web/settings.js・web/admin-settings.js）が組み立てる PUT ボディのキー名を正規表現で
+# 抜き出す方式は、body への代入が `body[provider + '_api_key']` のような動的組み立てを含み
+# 安定しないため、代わりに両エンドポイントの pydantic リクエストモデル（`SettingsReq`／
+# `SystemSettingsReq`）のフィールド名を ast で列挙する（タスク指示どおりスキーマ列挙ベースに
+# 簡素化・値は変わらない静的な `ast.AnnAssign` のみ拾う）。
+_SETTINGS_REQ_TARGETS = (
+    (ROOT / "sherpa" / "routers" / "system.py", "SettingsReq"),               # 個人設定（PUT /settings）
+    (ROOT / "sherpa" / "routers" / "system_extras.py", "SystemSettingsReq"),  # 全体設定（PUT /admin/settings）
+)
+
+_BACKTICK_IDENT_RE = re.compile(r"`([a-zA-Z_][a-zA-Z0-9_]*)`")
+
+
+def _pydantic_field_names(path: pathlib.Path, class_name: str) -> set[str]:
+    """`path` 内の `class_name`（BaseModel）が直接持つフィールド名（`ast.AnnAssign` のみ・
+    メソッド/プロパティは無視）。クラスが見つからなければテスト失敗（リネーム検知）。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                stmt.target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            }
+    raise AssertionError(f"{path.relative_to(ROOT)}: class {class_name} が見つかりません（リネーム/削除？）")
+
+
+def test_settings_keys_documented():
+    """`SettingsReq`／`SystemSettingsReq` の全フィールドが manual/25 にバックティック表記で
+    載っていること（検査は「スキーマにあるのに docs に無い」の一方向のみ）。"""
+    code_keys: set[str] = set()
+    for path, class_name in _SETTINGS_REQ_TARGETS:
+        code_keys |= _pydantic_field_names(path, class_name)
+
+    doc_path = DOCS / "manual" / "25-設定リファレンス.md"
+    documented = set(_BACKTICK_IDENT_RE.findall(doc_path.read_text(encoding="utf-8")))
+
+    missing = sorted(code_keys - documented)
+    assert not missing, (
+        "未文書化の設定キー（docs/manual/25-設定リファレンス.md にバックティック表記で追記が必要）:\n"
+        + "\n".join(missing)
+    )
+
+
+# 開発ハーネス S3: docs/20・tests/README・rv SKILL が言及する `make <target>` と workflow ファイル名
+# が実在することの検査（架空のターゲット・存在しない workflow への言及が docs に残ることを防ぐ）。
+_HARNESS_DOC_TARGETS = (
+    DOCS / "20-開発ハーネス.md",
+    ROOT / "tests" / "README.md",
+    ROOT / ".claude" / "skills" / "rv" / "SKILL.md",
+)
+_MAKE_TARGET_MENTION_RE = re.compile(r"\bmake ([a-zA-Z0-9_-]+)")
+_YML_MENTION_RE = re.compile(r"\b([a-zA-Z0-9_-]+\.yml)\b")
+
+
+def _makefile_targets() -> set[str]:
+    text = (ROOT / "Makefile").read_text(encoding="utf-8")
+    targets: set[str] = set()
+    for line in text.splitlines():
+        m = re.match(r"^([a-zA-Z0-9_-]+):", line)
+        if m:
+            targets.add(m.group(1))
+    return targets
+
+
+def test_harness_make_targets_and_workflows_exist():
+    """docs/20・tests/README・rv SKILL が言及する `make <target>` と `*.yml` が実在すること。"""
+    makefile_targets = _makefile_targets()
+    workflow_dir = ROOT / ".github" / "workflows"
+
+    missing_targets: list[str] = []
+    missing_workflows: list[str] = []
+    for path in _HARNESS_DOC_TARGETS:
+        if not path.exists():
+            continue
+        rel = path.relative_to(ROOT)
+        text = path.read_text(encoding="utf-8")
+        for m in _MAKE_TARGET_MENTION_RE.finditer(text):
+            target = m.group(1)
+            if target.endswith("-"):
+                continue   # 「make test-*」のような prose 中のワイルドカード表記は対象外
+            if target not in makefile_targets:
+                missing_targets.append(f"{rel}: make {target}")
+        for m in _YML_MENTION_RE.finditer(text):
+            name = m.group(1)
+            if not (workflow_dir / name).exists():
+                missing_workflows.append(f"{rel}: {name}")
+
+    assert not missing_targets, "存在しない make ターゲットへの言及:\n" + "\n".join(missing_targets)
+    assert not missing_workflows, "存在しない workflow ファイルへの言及:\n" + "\n".join(missing_workflows)

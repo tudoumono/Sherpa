@@ -1,0 +1,15 @@
+<mapper namespace="com.acme.mybatis.OrderMapper">
+  <sql id="cols">o.id, o.status</sql>
+  <select id="selectOrder" resultType="com.acme.mybatis.Order" parameterType="int">
+    SELECT <include refid="cols"/> FROM ORDERS o JOIN ORDER_LINES l ON l.order_id = o.id WHERE o.id = #{id}
+  </select>
+  <insert id="insertOrder">
+    INSERT INTO ORDERS (id, status) VALUES (#{id}, #{status})
+  </insert>
+  <update id="updateCustomer">
+    UPDATE "customers" SET name = #{name} WHERE id = #{id}
+  </update>
+  <select id="auditTrail">
+    SELECT * FROM AUDIT_LOG WHERE id = #{id}
+  </select>
+</mapper>

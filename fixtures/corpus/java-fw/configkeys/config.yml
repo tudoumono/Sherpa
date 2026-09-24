@@ -1,0 +1,7 @@
+tax:
+  rate: 0.08
+batch:
+  plugin: csv-importer
+  sources:
+    - a.csv
+    - b.csv
