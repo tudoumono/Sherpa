@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 全ログを1画面で見るための入口（`make logs`・2026-09-04 ユーザー依頼・LOG-UX）。
 # アプリ側ログ（data/run/*.log）と Docker ストアのログ（postgres/neo4j/elasticsearch/ocr-worker）を
-# 合流させ、[mem] 行（メモリと主要プロセス RSS）も添えて1画面で追う。名前は統一名前空間
+# 合流させて1画面で追う（-m を付けたときだけ [mem] 行＝メモリと主要プロセス RSS も添える）。名前は統一名前空間
 # （アプリ側・Docker 側どちらの名前でも同じ引数で指定できる）。外部依存は docker（無くてもアプリ側
 # だけで動く＝fail-soft）。詳しい使い方は ./scripts/logs.sh -h を参照（対応する名前を実環境から動的に
 # 表示する）。
@@ -12,13 +12,16 @@ cd "$ROOT"
 . "$ROOT/scripts/run-common.sh" 2>/dev/null || true
 LOG_DIR="${SHERPA_LOG_DIR:-data/run}"
 
-LINES=20 GREP="" LIST=0 MEM_INTERVAL=10 REPORT=0 REPORT_ALL=0 PRINT_HELP=0
+LINES=20 GREP="" LIST=0 MEM_INTERVAL=0 REPORT=0 REPORT_ALL=0 PRINT_HELP=0
 NAMES=()
 EXCLUDES=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) LINES="$2"; shift 2 ;;
-    -m) MEM_INTERVAL="$2"; shift 2 ;;
+    -m) if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+          [ "$2" -ge 1 ] || { echo "-m の間隔は 1 以上の秒数で指定してください（メモリ行が要らないときは -m を付けません）" >&2; exit 2; }
+          MEM_INTERVAL="$2"; shift 2
+        else MEM_INTERVAL=10; shift; fi ;;
     -g|--grep) GREP="$2"; shift 2 ;;
     -l|--list) LIST=1; shift ;;
     -r|--report) REPORT=1; shift ;;
@@ -112,13 +115,13 @@ _print_help() {
 使い方: ./scripts/logs.sh [オプション] [名前...]
 
 アプリ側ログ（$LOG_DIR/*.log）と Docker ストアのログを1画面に合流して追います
-（[mem] 行＝メモリと主要プロセス RSS も既定 ${MEM_INTERVAL} 秒おき）。名前を1つでも指定すると、
+（-m を付けたときだけ [mem] 行＝メモリと主要プロセス RSS も出す）。名前を1つでも指定すると、
 指定していない側（アプリ/Docker）は出しません。
 
 オプション:
   -n N          追う前にまず末尾 N 行を表示（既定 20）
   -g PATTERN    正規表現に一致する行だけ表示（タグ付与後に適用）
-  -m N          [mem] 行の間隔を N 秒に（既定 10・0 で出さない）
+  -m [N]        [mem] 行を出す（N 秒おき・N を省くと 10 秒）。既定は出さない
   -x 名前       表示対象から除外（複数回指定可・位置引数で選んだ後に除外を適用）
   -l, --list    追わずに一覧と各ログの末尾だけ表示して終了
   -r, --report  追わずに集計レポートを表示して終了（scripts/log_report.py・アプリ側ログが対象）

@@ -91,7 +91,7 @@ down:              ## ストア停止（OCR ワーカーも止める）
 ps:                ## 状態（OCR ワーカーを含む）
 	$(COMPOSE_ALL) ps
 
-logs:              ## 全ログを1画面で（アプリ+Docker+mem合流・ARGS で絞り込み: convert embed postgres 等。-r でレポート・-h でヘルプ）
+logs:              ## 全ログを1画面で（アプリ+Docker合流・ARGS で絞り込み: convert embed postgres 等。-m でメモリ行・-r でレポート・-h でヘルプ）
 	./scripts/logs.sh $(ARGS)
 
 bootstrap:         ## ローカル利用ディレクトリ作成＋.env 用意＋ストア待ち

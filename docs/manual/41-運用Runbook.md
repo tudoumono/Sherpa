@@ -388,7 +388,7 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 |---|---|
 | `-n N` | 追う前に末尾 N 行を先に表示（既定 20） |
 | `-g PATTERN` | 正規表現に一致する行だけ表示 |
-| `-m N` | メモリ行（[mem]＝空きメモリと主要プロセスの使用量）の間隔を N 秒に（既定 10・`0` で非表示） |
+| `-m [N]` | メモリ行（[mem]＝空きメモリと主要プロセスの使用量）を出す（N 秒おき・N を省くと 10 秒）。既定は出さない |
 | `-x 名前` | 指定した名前を除外（複数回可） |
 | `-l` | 追わずに、一覧と各ログの末尾だけ表示して終了 |
 | `-r` | 追わずに**集計レポート**（ファイル別の変換所要秒 Top10・埋め込みスループット・用途別トークン・エラーのまとめ） |
@@ -401,7 +401,7 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 make logs ARGS="convert embed libreoffice -m 5"   # 資料取り込みを監視（メモリ5秒間隔）
 make logs ARGS="-g 'ERROR|WARN|失敗|✗'"           # エラー・警告だけ拾う
 make logs ARGS="-x api"                            # アプリ全般から api のノイズを抜く
-make logs ARGS=""                                  # 全部（アプリ＋Docker＋メモリ）
+make logs ARGS=""                                  # 全部（アプリ＋Docker。メモリも見るときは -m）
 make logs ARGS="-l"                                # いまの状況を一覧で（追わない）
 make logs ARGS="-r"                                # 取り込み後の振り返りレポート
 ```
