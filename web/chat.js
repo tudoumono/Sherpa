@@ -21,12 +21,12 @@ import { openShareDialog } from './chat/share-dialog.js';
 import { welcome, initRefGraph } from './chat/render.js';
 import {
   loadConversations, deleteConversation, togglePin, renameConversation,
-  newConversation, openConversation, resumeRunningTurn, forkConversation,
+  newConversation, openConversation, resumeRunningTurn, forkConversation, syncConvParam,
 } from './chat/history.js';
 // H2（左ペイン履歴検索）: 副作用のみの import（#hist-search の配線・#convlist 再描画の監視は
 // history-search.js 内で完結し、history.js には触れない＝束縛する名前は無い）。
 import './chat/history-search.js';
-import { send, sendOrStop, _closeOtherTurns } from './chat/stream.js';
+import { send, sendOrStop, _closeOtherTurns, currentTurnGen } from './chat/stream.js';
 import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel, setKb } from './chat/scope.js';
 import { setLayer, setDepthProfile, setTools, setToolsAvailability, resetInquiryForNewConversation, refreshInquirySummary, toolsExplicitForRestore } from './chat/inquiry.js';
 import { applyCachedBrain, loadConfig, exportMessages } from './chat/menus.js';
@@ -442,8 +442,21 @@ applyCachedBrain();   // 前回のモデル/プロバイダを即反映（その
 // トップバーの「⏳ 回答作成中」インジケータ（nav.js）から `chat.html?conv=<id>` で遷移してきた場合、
 // その会話を自動で開く（実行中ターンがあれば openConversation → resumeRunningTurn が自動再購読する）。
 {
-  const _convParam = Number(new URLSearchParams(location.search).get('conv'));
-  if (_convParam) { openConversation(_convParam); } else { welcome(); resetInquiryForNewConversation(); loadConversations(); }
+  const _convRaw = new URLSearchParams(location.search).get('conv');
+  const _convParam = Number(_convRaw);
+  const _startNew = () => { welcome(); resetInquiryForNewConversation(); loadConversations(); };
+  if (_convParam) {
+    // 開けない番号（削除済み・他人の会話）はアドレス欄から外し、新しいチャットの画面にする。
+    // 待つ間に送信・新しいチャット・別の会話を開いた（世代が進んだ）なら、画面はもう触らない。
+    const _gen = currentTurnGen();
+    openConversation(_convParam).catch(() => {
+      if (currentTurnGen() !== _gen) return;
+      syncConvParam(null); toast('会話を開けませんでした'); _startNew();
+    });
+  } else {
+    if (_convRaw !== null) syncConvParam(null);
+    _startNew();
+  }
 }
 loadConfig();
 

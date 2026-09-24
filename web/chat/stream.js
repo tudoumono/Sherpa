@@ -27,7 +27,7 @@ import {
   ensureAnswerCard, finalizeAnswer, clearReveal, reveal,
   TraceTreeV2, deriveTraceStopReason, stopReasonInfo, stopReasonCategoryFromError,
 } from './render.js';
-import { loadConversations } from './history.js';
+import { loadConversations, syncConvParam } from './history.js';
 import { updateScopeHeader } from './scope.js';
 import { setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
 import { updateShareButtonState } from '../chat.js';
@@ -330,6 +330,11 @@ export function sendOrStop() {
 export function invalidateStopContext() {
   turnGen++;
 }
+// 今の世代（送信・新しいチャット・会話の切替で進む）。遅れて届いた結果が、まだ画面の持ち主かを
+// 呼び出し元が確かめるために使う（chat.js の初回表示の ?conv= が開けなかった場合）。
+export function currentTurnGen() {
+  return turnGen;
+}
 async function stopStream() {
   if (!S.es) return;
   const myGen = turnGen;   // 停止対象のターン世代を捕捉
@@ -560,6 +565,7 @@ export async function send(override) {
   // （再び開くのはヘッダ #inquiry-head またはチップ #inquiry-chip）。
   setInquiryOpen(false);
   S.cid = started.conversation_id;
+  syncConvParam(S.cid);
   S.turnId = started.turn_id;
   subscribeTurn(thinking);
 }

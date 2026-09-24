@@ -174,9 +174,19 @@ function unsubscribeTurn() {
   if (!S.es) return;
   S.es.close(); S.es = null;
 }
+// 開いている会話の番号をアドレス欄（?conv=）に出す（運用で活動記録を会話番号で引くため）。閲覧の可否は
+// サーバ側が本人の会話かを確かめる＝番号が見えても他人は開けない。戻る履歴は積まない（replaceState）。
+export function syncConvParam(cid) {
+  try {
+    const url = new URL(location.href);
+    if (cid) url.searchParams.set('conv', String(cid)); else url.searchParams.delete('conv');
+    if (url.href !== location.href) history.replaceState(history.state, '', url);
+  } catch (_) { /* アドレス欄の更新は補助＝失敗しても会話の表示は続ける */ }
+}
 export function newConversation() {
   unsubscribeTurn();
   S.cid = null; $('conv-title').textContent = '新しい会話';
+  syncConvParam(null);
   // SC-6e: 遅延中の /world-options 応答（chat.js の pendingConvWorld 後追い経路）が、後から
   // 届いたときに旧会話の範囲/調べ方/検索経路トグル等を新規会話へ誤って再適用しないよう、
   // ここで両方 null にする（後追い経路は S.pendingConvWorld が null なら何もしない）。
@@ -231,6 +241,7 @@ export async function openConversation(cid) {
   const data = await getJSON(`/conversations/${cid}`);
   unsubscribeTurn();
   S.cid = cid; $('conv-title').textContent = data.conversation.title || '会話';
+  syncConvParam(cid);
   $('messages').innerHTML = '';
   // Feature C: 会話の contains_personal_workspace フラグを反映。
   S.convHasPersonal = !!(data.conversation && data.conversation.contains_personal_workspace);

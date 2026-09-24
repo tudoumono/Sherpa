@@ -1169,6 +1169,23 @@ def test_chat_conversation_row_click_opens_not_renames(page, web_base_url):
 
     expect(page.locator("#conv-title")).to_have_text("消費税率の相談")   # 会話が開いた
     assert dialogs == [], f"行クリックで改名ダイアログが誤って開いた（クリック誤爆の再発）: {dialogs}"
+    # 開いた会話の番号がアドレス欄に出る（活動記録を会話番号で引くため）・新しいチャットで消える。
+    expect(page).to_have_url(re.compile(r"[?&]conv=101(&|$)"))
+    page.locator("#newbtn").click()
+    expect(page).not_to_have_url(re.compile(r"[?&]conv="))
+
+
+def test_chat_unopenable_conv_param_is_cleared(page, web_base_url):
+    """開けない会話番号（削除済み・他人の会話＝サーバが 404）でアドレス欄から開いたら、番号を外して新しいチャットに戻す。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.route("**/conversations/999", lambda r: r.fulfill(
+        status=404, content_type="application/json", body='{"detail": "会話が見つかりません"}'))
+    page.goto(f"{web_base_url}/chat.html?conv=999")
+
+    expect(page).not_to_have_url(re.compile(r"[?&]conv="))
+    expect(page.locator("#convlist")).to_contain_text("消費税率の相談")   # 一覧は表示される
 
 
 def test_chat_conversation_row_click_opens_at_minimum_sidebar_width(page, web_base_url):
