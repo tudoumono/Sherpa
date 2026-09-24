@@ -5,7 +5,7 @@
         graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
-        test-db-reset screenshots backup restore usage-backfill turn-activity azure-smoke doctor sandbox-check \
+        test-db-reset screenshots backup restore usage-backfill turn-activity graph-chain azure-smoke doctor sandbox-check \
         gate-slice gate-merge gate-release gate-ci test-inventory test-durations
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
@@ -240,6 +240,10 @@ usage-backfill:    ## 既存のassistantメッセージをturn_metrics/turn_tool
 turn-activity:     ## 1 つの会話の各ターンの活動記録（本体と下調べ役のトークン・往復・圧縮・ツール別の回数とバイト）を数字だけで表示（make turn-activity CONV=<会話番号>・本文は出さない）
 	@test -n "$${CONV:-}" || { echo "使い方: make turn-activity CONV=<会話番号>"; exit 2; }
 	./scripts/turn-activity.sh "$${CONV}"
+
+graph-chain:       ## 起点のファイルから呼び出し・コピー・DB アクセスを下り向きにたどり、届いたファイルと SQL の候補を表示（make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]・読み取り専用・本文は出さない）
+	@test -n "$${FROM:-}" || { echo "使い方: make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]"; exit 2; }
+	./scripts/graph-chain.sh --from "$${FROM}" $${WORLD:+--world "$${WORLD}"} $${DEPTH:+--depth "$${DEPTH}"}
 
 azure-smoke:        ## Azure OpenAI（等の OpenAI 互換接続先）への実疎通を確認（実 API 課金あり・確認プロンプト）。ARGS で --env-file/--dry-run 等を渡せる（例: ARGS="--env-file azure.env --yes"）
 	$(PY) scripts/azure_smoke.py $(ARGS)
