@@ -568,4 +568,5 @@ export async function send(override) {
   syncConvParam(S.cid);
   S.turnId = started.turn_id;
   subscribeTurn(thinking);
+  loadConversations();   // 受け付けた時点で履歴に出す（新しい会話は開始 POST で作られ、題名は質問の先頭）
 }

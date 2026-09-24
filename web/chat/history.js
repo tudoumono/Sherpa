@@ -2,7 +2,7 @@
 // 背景実行の再購読）を chat.js から純移動。export は chat.js 側に残る呼び出し元（$('convlist')/
 // $('newbtn')/$('conv-title') の delegate リスナー・init の deep-link 分岐・window.__sherpaChatTest
 // シーム）から参照される loadConversations/deleteConversation/togglePin/renameConversation/
-// newConversation/openConversation/resumeRunningTurn のみに絞る（_ownConvHTML/_receivedConvHTML/
+// newConversation/openConversation/resumeRunningTurn/syncConvParam のみに絞る（_ownConvHTML/_receivedConvHTML/
 // unsubscribeTurn は loadConversations/newConversation/openConversation の内部専用のため非公開のまま）。
 // newConversation/openConversation は render/scope/stream の複数ドメインを跨ぐオーケストレータ＝
 // welcome/appendUser/appendAssistantRaw/appendAnswer/attachTraceButton/renderTurnStack は render.js
@@ -88,9 +88,21 @@ function _ownConvHTML(c) {
    </div>`;
 }
 
+// 一覧の取得は重なり得る（初期表示・送信の受付・回答の終了）。成功した結果のうち、後から始めた取得のものだけを
+// 描く（遅れて届いた古い結果で、新しい会話を含む一覧を上書きしない）。取得に失敗したら今の一覧を残し、
+// まだ何も描いていないときだけ空の案内を出す（PG 未起動など・成功の世代は進めない）。
+let _convListGen = 0, _convListShown = 0;
 export async function loadConversations() {
-  let list = [];
-  try { list = await getJSON('/conversations'); } catch (e) { /* PG未起動なら空 */ }
+  const myGen = ++_convListGen;
+  let list = null;
+  try { list = await getJSON('/conversations'); } catch (e) { /* 下で扱う */ }
+  if (list === null) {
+    if (_convListShown || $('convlist').querySelector('.conv')) return;
+    list = [];
+  } else {
+    if (myGen < _convListShown) return;
+    _convListShown = myGen;
+  }
   // origin で分割: own / received_share
   const own = list.filter((c) => !c.origin || c.origin === 'own');
   const received = list.filter((c) => c.origin === 'received_share');
