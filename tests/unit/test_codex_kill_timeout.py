@@ -226,7 +226,9 @@ def test_generator_close_kills_process_and_removes_codex_home(tmp_path, monkeypa
 
 def test_generator_close_releases_conversation_lock(tmp_path, monkeypatch):
     """永続 CODEX_HOME 経路（`conversation_id` あり）でも、generator の途中 close で
-    `_conversation_lock` が確実に解放される（漏れると同一会話が恒久的に拒否され続ける）。"""
+    `_conversation_lock` が確実に解放される（漏れると同一会話が恒久的に拒否され続ける）。
+    会話生存確認（`store.owns_conversation`）は `tests/unit/conftest.py::_hermetic_conversation_alive`
+    が既定 True に固定する（conversation_id=424242 は実 DB 行を持たない）。"""
     from sherpa.providers.codex import provider as PV
 
     _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_close_conv")

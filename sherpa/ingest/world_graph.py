@@ -886,6 +886,27 @@ def _lstat_kind(p) -> str | None:
     return None
 
 
+def valid_rel_parts(rel: str) -> tuple[str, ...] | None:
+    """`rel`（world root 相対 POSIX パス）の文字列検証だけを行う（FS アクセス無し）。
+
+    絶対パス・`\\`・NUL・空/`.`/`..` 要素はすべて拒否する（`\\` はファイル名内に含まれ得ても
+    POSIX rel 契約を優先して拒否する意図的な制限・NUL は `os.lstat` 等に渡すと `ValueError` に
+    なり得るため事前に弾く）。通れば `"/"` 区切りのセグメント列を返す。
+
+    `resolve_path`（内容判定・FS 解決）と `ext_api._doc_path_segments`（原本DL配信・非FS）が
+    **この1関数だけ**を正規化の真実源として共有する——2箇所で別々に検証条件を書くと、片方だけ
+    緩い/厳しいまま個別に直されて再びズレる（`.` 要素だけ片方が許容していた実害＝内容判定は
+    「読み取り不可」扱いで通すのに配信側は実ファイルを開いて返してしまう秘匿ファイル漏洩の穴に
+    なっていた）。
+    """
+    if not rel or rel.startswith("/") or "\\" in rel or "\x00" in rel:
+        return None
+    parts = tuple(rel.split("/"))
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    return parts
+
+
 def resolve_path(world_dir, rel: str):
     """`rel`（world root 相対 POSIX）→ 原本 Path（**パス基準**・無ければ None）。
 
@@ -893,15 +914,12 @@ def resolve_path(world_dir, rel: str):
     （コストは `rel` の階層数のみに依存・世界内のファイル総数に依存しない）。
     途中経路のどれか1つでも symlink なら拒否する（`safe_files` が symlink file/dir を辿らず
     実在扱いしないのと同じ contract＝symlink 越しに同じ内容へ辿り着けても document とは認めない）。
-    `rel` の検証は**一切の FS アクセスより前**に文字列だけで行う: 絶対パス・`\\`・NUL・空/`.`/`..`
-    要素はすべて拒否する（`\\` はファイル名内に含まれ得ても POSIX rel 契約を優先して拒否する
-    意図的な制限・NUL は `os.lstat` 等に渡すと `ValueError` になり得るため事前に弾く）。
+    `rel` の検証（絶対パス・`\\`・NUL・空/`.`/`..` 要素の拒否）は `valid_rel_parts` に集約する
+    （一切の FS アクセスより前に文字列だけで判定する）。
     最後に解決後パスが world root 配下に収まることを再確認する（脱出防止の多層防御）。
     """
-    if not rel or rel.startswith("/") or "\\" in rel or "\x00" in rel:
-        return None
-    parts = rel.split("/")
-    if any(p in ("", ".", "..") for p in parts):
+    parts = valid_rel_parts(rel)
+    if parts is None:
         return None
     root = Path(world_dir)
     if _lstat_kind(root) != "dir":

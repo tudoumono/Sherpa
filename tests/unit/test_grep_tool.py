@@ -804,6 +804,51 @@ def test_grep_search_continues_scanning_past_max_hits_when_imp_map_nonempty(monk
     assert calls["n"] >= 7   # 全量走査（早期終了しない）ことの証跡
 
 
+# ===== ページング（offset・網羅性を落とさずに文脈枠を守る） =====
+
+def test_grep_search_offset_zero_matches_current_behavior(tmp_path):
+    """`offset` 省略（既定0）は既存の先頭ページと完全に同一（回帰）。"""
+    for name in ("d.md", "b.md", "a.md", "c.md", "e.md"):
+        _write(tmp_path, name, "NEEDLE here\n")
+    omitted = [h["doc_id"] for h in G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=3)]
+    explicit = [h["doc_id"] for h in G.grep_search(
+        "NEEDLE", world="v1", roots=[tmp_path], max_hits=3, offset=0)]
+    assert omitted == explicit == ["a.md", "b.md", "c.md"]
+
+
+def test_grep_search_offset_pages_through_all_hits_without_gaps_or_duplicates(tmp_path):
+    """`offset` を進めながらページングすると、母集団を重複・欠落なく全件たどれる
+    （`imp_map` が空＝発見順で先頭 heap_cap 件を選抜する経路・§I2）。"""
+    for name in ("d.md", "b.md", "a.md", "c.md", "e.md"):
+        _write(tmp_path, name, "NEEDLE here\n")
+    full = [h["doc_id"] for h in G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=10)]
+    assert full == ["a.md", "b.md", "c.md", "d.md", "e.md"]
+
+    collected: list = []
+    offset = 0
+    while True:
+        page = G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=2, offset=offset)
+        doc_ids = [h["doc_id"] for h in page]
+        if not doc_ids:
+            break
+        collected.extend(doc_ids)
+        offset += 2
+    assert collected == full   # 順序も含めて全件と一致（重複・欠落なし）
+
+
+def test_grep_search_offset_extends_heap_capacity_so_later_hits_become_reachable(tmp_path):
+    """早期終了の閾値は `max_hits` ではなく `heap_cap`（=max_hits+offset）——`offset` を進めると、
+    `max_hits` だけを基準にした旧実装なら打ち切り後で決して見えなかった発見順の後方（d.md/e.md）
+    にもページが届く。"""
+    for name in ("d.md", "b.md", "a.md", "c.md", "e.md"):
+        _write(tmp_path, name, "NEEDLE here\n")
+    first_page = [h["doc_id"] for h in G.grep_search("NEEDLE", world="v1", roots=[tmp_path], max_hits=2)]
+    assert first_page == ["a.md", "b.md"]   # heap_cap=2（offset=0）で打ち切り
+    later_page = [h["doc_id"] for h in G.grep_search(
+        "NEEDLE", world="v1", roots=[tmp_path], max_hits=2, offset=3)]
+    assert later_page == ["d.md", "e.md"]   # heap_cap=5 まで広がり後方の2件に到達する
+
+
 # ===== 打切りの申告: ヒット0件の打切り文書も報告する（検収是正） =====
 
 def test_truncated_docs_reports_file_with_no_hits(monkeypatch, tmp_path):

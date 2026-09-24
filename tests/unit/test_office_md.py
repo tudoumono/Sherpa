@@ -1180,7 +1180,6 @@ def test_human_md_partial_failure_keeps_es_meta_pending_until_fixed(monkeypatch,
 
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
     # レンダラ/抽出器の版を上げたのと同じ状況（実運用の drift 発生源）を模す。
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vNEW")
 

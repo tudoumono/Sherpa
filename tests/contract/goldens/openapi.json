@@ -49,11 +49,12 @@
         "type": "object"
       },
       "AdminUsageQualityRunReq": {
-        "description": "POST /admin/usage/quality-runs 入力（品質採点の入口）。\n\n採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。\n`rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-standard` を登録できる）。\n`condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。\n`executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・\n半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で\n読める。\n`cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を\n付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値\n（`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定\n`allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は\n`routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を\n埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の\n二重防御がある）。\n`run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない\n（`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。",
+        "description": "POST /admin/usage/quality-runs 入力（品質採点の入口）。\n\n採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。\n`rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-quick` を登録できる）。\n`condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。\n`executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・\n半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で\n読める。\n`cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を\n付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値\n（`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定\n`allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は\n`routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を\n埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の\n二重防御がある）。\n`run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない\n（`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。",
         "properties": {
           "condition": {
             "enum": [
               "main",
+              "depth2-quick",
               "depth2-standard",
               "depth2-deep",
               "depth2-max"
@@ -969,6 +970,7 @@
           "depth_profile": {
             "default": "standard",
             "enum": [
+              "quick",
               "standard",
               "deep",
               "max"
@@ -977,7 +979,7 @@
             "type": "string"
           },
           "knowledge": {
-            "default": false,
+            "default": true,
             "title": "Knowledge",
             "type": "boolean"
           },
@@ -1044,6 +1046,25 @@
               }
             ],
             "title": "Tools"
+          },
+          "tools_explicit": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "grep",
+                    "fulltext",
+                    "graph"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools Explicit"
           },
           "web_search": {
             "default": false,
@@ -1100,6 +1121,7 @@
           "depth_profile": {
             "default": "standard",
             "enum": [
+              "quick",
               "standard",
               "deep",
               "max"
@@ -1108,7 +1130,7 @@
             "type": "string"
           },
           "knowledge": {
-            "default": false,
+            "default": true,
             "title": "Knowledge",
             "type": "boolean"
           },
@@ -1180,6 +1202,25 @@
               }
             ],
             "title": "Tools"
+          },
+          "tools_explicit": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "grep",
+                    "fulltext",
+                    "graph"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools Explicit"
           },
           "web_search": {
             "default": false,
@@ -3257,7 +3298,7 @@
         "type": "object"
       },
       "IngestSummaryFields": {
-        "description": "`worlds.py::_ingest_summary`（`corpus_docs.scan_report` のキャッシュ ＋ graph/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable`（ING-2）は `worlds.last_scan_report` のキャッシュ（sync 完走時／\n`POST /worlds/{wid}/recount` の時だけ更新・**このエンドポイント自身はフォルダを歩かない**）。\n`counts_as_of`＝そのキャッシュの記録時刻（`None`＝未集計・再集計を促す）。\n`failed_files`／`partial_extraction_suspected`／`stage_summary`（ING-1）は最新 run の\n`extraction_snapshot` 由来（run が無い/該当データが無ければ `None`）。\n`failure_reason_catalog`／`partial_extraction_advice` は閉じた理由語彙の平文辞書（常時同一・\n`sherpa.ingest.failure_reasons` が単一の真実源）。\n`last_run_warnings`/`last_run_blocked` は元の flags を打ち切って導出したもの——\n`last_run_flags_total`＝打切り前の flags 総数・`last_run_flags_truncated`＝打切りが発生したか。\n`last_run_id`／`running_progress`（ING-3）＝最新 run の id と実行中進捗（実行中でなければ\n`running_progress` は `None`）。",
+        "description": "`worlds.py::_ingest_summary`（`corpus_docs.scan_report` のキャッシュ ＋ graph/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable`（ING-2）は `worlds.last_scan_report` のキャッシュ（sync 完走時／\n`POST /worlds/{wid}/recount` の時だけ更新・**このエンドポイント自身はフォルダを歩かない**）。\n`counts_as_of`＝そのキャッシュの記録時刻（`None`＝未集計・再集計を促す）。\n`failed_files`／`partial_extraction_suspected`／`stage_summary`（ING-1）は最新 run の\n`extraction_snapshot` 由来（run が無い/該当データが無ければ `None`）。\n`failure_reason_catalog`／`partial_extraction_advice` は閉じた理由語彙の平文辞書（常時同一・\n`sherpa.ingest.failure_reasons` が単一の真実源）。\n`last_run_warnings`/`last_run_blocked` は元の flags を打ち切って導出したもの——\n`last_run_flags_total`＝打切り前の flags 総数・`last_run_flags_truncated`＝打切りが発生したか。\n`last_run_id`／`running_progress`（ING-3）＝最新 run の id と実行中進捗（実行中でなければ\n`running_progress` は `None`）。\n`sensitive_excluded`／`unreachable_as_text`／`unreachable_as_text_by_ext`も\n`scanned`〜`unreadable` と同じキャッシュ由来——無変更の再同期（`ingest.worker._sync_impl` の\nunchanged 経路）は最新 run の `extraction_snapshot` を書き換えるだけで `scan_report` を再実行\nしないため、画面はこのキャッシュ（run に紐付かない世界単位の値）を見て初めて無変更後も\n表示が消えない。",
         "properties": {
           "analyzer_declined": {
             "title": "Analyzer Declined",
@@ -3412,6 +3453,10 @@
             "title": "Scanned",
             "type": "integer"
           },
+          "sensitive_excluded": {
+            "title": "Sensitive Excluded",
+            "type": "integer"
+          },
           "skipped_ext": {
             "additionalProperties": {
               "type": "integer"
@@ -3439,6 +3484,17 @@
             ],
             "title": "Stage Summary"
           },
+          "unreachable_as_text": {
+            "title": "Unreachable As Text",
+            "type": "integer"
+          },
+          "unreachable_as_text_by_ext": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Unreachable As Text By Ext",
+            "type": "object"
+          },
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
@@ -3456,6 +3512,9 @@
           "analyzer_declined",
           "analyzer_declined_as_document",
           "unreadable",
+          "sensitive_excluded",
+          "unreachable_as_text",
+          "unreachable_as_text_by_ext",
           "counts_as_of",
           "graph_nodes",
           "graph_edges",
@@ -4728,6 +4787,17 @@
             ],
             "title": "Cloud Provider"
           },
+          "codex_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Codex Mode"
+          },
           "codex_session_retention_days": {
             "anyOf": [
               {
@@ -4738,6 +4808,17 @@
               }
             ],
             "title": "Codex Session Retention Days"
+          },
+          "codex_worker_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Codex Worker Model"
           },
           "depth_base_codex_reasoning": {
             "anyOf": [
@@ -4863,6 +4944,19 @@
             ],
             "title": "Legacy Backend"
           },
+          "max_review_rounds": {
+            "anyOf": [
+              {
+                "maximum": 32.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Review Rounds"
+          },
           "model_catalog": {
             "anyOf": [
               {
@@ -4879,20 +4973,6 @@
               }
             ],
             "title": "Model Catalog"
-          },
-          "model_context_windows": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "integer"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Model Context Windows"
           },
           "ollama_allowlist": {
             "anyOf": [
@@ -5615,12 +5695,36 @@
             "title": "Auto Continues Turns",
             "type": "integer"
           },
+          "backend_unavailable_fulltext_turns": {
+            "title": "Backend Unavailable Fulltext Turns",
+            "type": "integer"
+          },
+          "backend_unavailable_graph_turns": {
+            "title": "Backend Unavailable Graph Turns",
+            "type": "integer"
+          },
           "context_compactions_total": {
             "title": "Context Compactions Total",
             "type": "integer"
           },
           "context_compactions_turns": {
             "title": "Context Compactions Turns",
+            "type": "integer"
+          },
+          "depth_escalated_turns": {
+            "title": "Depth Escalated Turns",
+            "type": "integer"
+          },
+          "duplicate_tool_call_total": {
+            "title": "Duplicate Tool Call Total",
+            "type": "integer"
+          },
+          "duplicate_tool_call_turns": {
+            "title": "Duplicate Tool Call Turns",
+            "type": "integer"
+          },
+          "graph_reingest_required_turns": {
+            "title": "Graph Reingest Required Turns",
             "type": "integer"
           },
           "provider": {
@@ -5637,6 +5741,10 @@
           },
           "synthesis_truncated_turns": {
             "title": "Synthesis Truncated Turns",
+            "type": "integer"
+          },
+          "tool_calls_exhausted_turns": {
+            "title": "Tool Calls Exhausted Turns",
             "type": "integer"
           },
           "tool_result_clipped_total": {
@@ -5665,10 +5773,17 @@
           "context_compactions_turns",
           "context_compactions_total",
           "synthesis_truncated_turns",
+          "depth_escalated_turns",
           "search_truncated_turns",
           "search_truncated_total",
           "auto_continues_turns",
-          "auto_continues_total"
+          "auto_continues_total",
+          "duplicate_tool_call_turns",
+          "duplicate_tool_call_total",
+          "backend_unavailable_fulltext_turns",
+          "backend_unavailable_graph_turns",
+          "graph_reingest_required_turns",
+          "tool_calls_exhausted_turns"
         ],
         "title": "UsageLimitsByProviderRow",
         "type": "object"
@@ -5737,7 +5852,7 @@
         "type": "object"
       },
       "UsageQualityRunRow": {
-        "description": "品質採点の条件×巡数別集計（`usage_stats()[\"quality_runs\"][\"by_rounds\"]`）。\n採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。\n\n`condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは\n見直しを回さない条件同士（main と depth2-standard・どちらも `rounds=0`）が混ざるため、\n集計はこの条件別に分ける。",
+        "description": "品質採点の条件×巡数別集計（`usage_stats()[\"quality_runs\"][\"by_rounds\"]`）。\n採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。\n\n`condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは\n見直しを回さない条件同士（main と depth2-quick・どちらも `rounds=0`）が混ざるため、\n集計はこの条件別に分ける。",
         "properties": {
           "condition": {
             "anyOf": [
@@ -7778,6 +7893,10 @@
             "title": "Scanned",
             "type": "integer"
           },
+          "sensitive_excluded": {
+            "title": "Sensitive Excluded",
+            "type": "integer"
+          },
           "skipped_ext": {
             "additionalProperties": {
               "type": "integer"
@@ -7805,6 +7924,17 @@
             ],
             "title": "Stage Summary"
           },
+          "unreachable_as_text": {
+            "title": "Unreachable As Text",
+            "type": "integer"
+          },
+          "unreachable_as_text_by_ext": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Unreachable As Text By Ext",
+            "type": "object"
+          },
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
@@ -7826,6 +7956,9 @@
           "analyzer_declined",
           "analyzer_declined_as_document",
           "unreadable",
+          "sensitive_excluded",
+          "unreachable_as_text",
+          "unreachable_as_text_by_ext",
           "counts_as_of",
           "graph_nodes",
           "graph_edges",
@@ -8076,6 +8209,10 @@
             "title": "Scanned",
             "type": "integer"
           },
+          "sensitive_excluded": {
+            "title": "Sensitive Excluded",
+            "type": "integer"
+          },
           "skipped_ext": {
             "additionalProperties": {
               "type": "integer"
@@ -8103,6 +8240,17 @@
             ],
             "title": "Stage Summary"
           },
+          "unreachable_as_text": {
+            "title": "Unreachable As Text",
+            "type": "integer"
+          },
+          "unreachable_as_text_by_ext": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Unreachable As Text By Ext",
+            "type": "object"
+          },
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
@@ -8124,6 +8272,9 @@
           "analyzer_declined",
           "analyzer_declined_as_document",
           "unreadable",
+          "sensitive_excluded",
+          "unreachable_as_text",
+          "unreachable_as_text_by_ext",
           "counts_as_of",
           "graph_nodes",
           "graph_edges",
@@ -8974,7 +9125,7 @@
         ]
       },
       "put": {
-        "description": "全体設定を部分更新（admin のみ・検証・監査・fail-closed）。\n\n未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名\nのみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・\nvlm は provider/model/cloud_allowed の型を検証する\n（不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。\ncodex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/\nwebhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する\n（junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら\n実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama\nのみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は\nollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。\"openai\" への\n変更はこの PUT 適用後の実効設定で実送信可能性も preflight する\n（`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの\n基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は\n`sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。chat_max_turns_per_user/\nchat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field\nで範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/\nagentic_budget_total（§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・\n累計=4096〜64MiB・範囲外は422）。model_context_windows（§3.4）は \"provider:model\" →\ntokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。\nchat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・\n`sherpa.chat_examples.validate` が意味検証・不正は422）。\n監査 INSERT の失敗は\n`store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（\ncommit 後の別接続 audit＋失敗時 compensate 方式では穴が残るため、原子性で置き換えた・\nannouncement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。",
+        "description": "全体設定を部分更新（admin のみ・検証・監査・fail-closed）。\n\n未指定キーは変更しない・`null` は未設定へ戻す（env/既定へフォールバック）。arms_enabled は既知アーム名\nのみ・legacy_backend は none|libreoffice|office_com・rag_llm_render（L5）は on|off のみ・\nvlm は provider/model/cloud_allowed の型を検証する\n（不正は 422）。ollama_allowlist（R2a-S2）は各エントリを host:port に正規化して保存する（junk は 422）。\ncodex_session_retention_days（R1b）は0以上の整数のみ（0=無制限・負値は422）。openai_endpoint_kind/base_url/auth_header/\nwebhook_allowlist（PART-6・W3）は ollama_allowlist と同形式で host:port に正規化して保存する\n（junk は 422）。api_version（SET-2c・接続先）は種別・URL 妥当性・ヘッダ形式を検証し、kind が openai 以外なら\n実効 base_url が空でないことも確認する（422）。usage_chat_provider（STAT-2）は openai|ollama\nのみ（不正は422・`cloud_provider` とは独立）。research_default_provider（PART-4a）は\nollama/openai のいずれかのみ（422・`research_service.RESEARCH_PROVIDERS`）。\"openai\" への\n変更はこの PUT 適用後の実効設定で実送信可能性も preflight する\n（`_assert_research_default_provider_sendable`・NG は422）。depth_base_*（SC-6c・調べる深さの\n基準値）は整数6項目が範囲検証済み（StrictInt+Field）、depth_base_codex_reasoning は\n`sherpa.depth_profile.CODEX_REASONING_LEVELS` のいずれかのみ（422）。chat_max_turns_per_user/\nchat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field\nで範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/\nagentic_budget_total（§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・\n累計=4096〜64MiB・範囲外は422）に加え、両者の相対関係も検証する（`_validate_agentic_budgets`・\n累計は1件あたり以上・逆転は422）——片方だけの指定でも保存済みのもう片方（DB の現在値）と\n突き合わせて判定する。\nchat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・\n`sherpa.chat_examples.validate` が意味検証・不正は422）。codex_worker_model（multi_agent の\nworker モデル・実装ベース探索の回復 S1）は文字列のみ（Codex 自身のモデルカタログは検証しない・\n空文字/nullは未設定へ戻す）。codex_mode（素の Codex モード）は standard/plain のみ（422）。\n監査 INSERT の失敗は\n`store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（\ncommit 後の別接続 audit＋失敗時 compensate 方式では穴が残るため、原子性で置き換えた・\nannouncement CRUD の compensate 方式とは異なる）。ここではその例外を 500 に変換するだけ。応答は GET と同形。",
         "operationId": "admin_settings_put_admin_settings_put",
         "requestBody": {
           "content": {
@@ -9674,7 +9825,7 @@
             "name": "knowledge",
             "required": false,
             "schema": {
-              "default": false,
+              "default": true,
               "title": "Knowledge",
               "type": "boolean"
             }
@@ -9745,6 +9896,7 @@
             "schema": {
               "default": "standard",
               "enum": [
+                "quick",
                 "standard",
                 "deep",
                 "max"
@@ -9809,6 +9961,23 @@
                 }
               ],
               "title": "Tools Graph"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tools_explicit",
+            "required": false,
+            "schema": {
+              "items": {
+                "enum": [
+                  "grep",
+                  "fulltext",
+                  "graph"
+                ],
+                "type": "string"
+              },
+              "title": "Tools Explicit",
+              "type": "array"
             }
           },
           {
@@ -10346,7 +10515,7 @@
     },
     "/conversations/{cid}": {
       "delete": {
-        "description": "会話を削除（所有会話・受領ラッパーいずれも削除可）。\n\n生きた受領ラッパーがこの会話を参照している場合は soft-delete（自分の一覧からは消えるが\n受領側は引き続き読める）、参照が無ければ物理削除（store.delete_conversation 参照）。",
+        "description": "会話を削除（所有会話・受領ラッパーいずれも削除可）。\n\n生きた受領ラッパーがこの会話を参照している場合は soft-delete（自分の一覧からは消えるが\n受領側は引き続き読める）、参照が無ければ物理削除（store.delete_conversation 参照）。\nどちらの場合も Codex resume セッション実体（`.codex-sessions/{cid}`）は即時削除する\n（_delete_codex_sessions_for_conversation 参照・soft delete でも削除する理由はそちら側に記載）。\n\nCodex 実行と同じ会話単位ロック（`CodexProvider._conversation_lock`）を DB 変更の前に\n非ブロッキングで取る。実行中（取れない）なら DB には一切触れず 409 を返す——取らずに削除すると、\n実行側がロック取得前に `.codex-sessions/{cid}` を作り直す窓ができ、削除済み会話の孤児\nディレクトリが TTL 掃除まで残る（実行側も同じロックを取ってから作成・生存確認する。\nprovider.py::CodexProvider._run_authoring 参照）。",
         "operationId": "conversation_delete_conversations__cid__delete",
         "parameters": [
           {

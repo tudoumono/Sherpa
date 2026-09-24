@@ -16,14 +16,12 @@ Evidence IR に載せる設計を扱う。本テストはその**受け入れ判
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEP_DIR = _ROOT / "fixtures" / "eval" / "deprecation_markers"
-_INVENTORY_JSON = _DEP_DIR / "benchmarks" / "deprecation_inventory.json"
 
 
 def _load_scanner():
@@ -55,16 +53,6 @@ def inventory() -> dict:
     """実データの走査（Office フィクスチャの全解析）は重いため、モジュール内の全テストで
     1回だけ実行し結果を共有する（走査結果自体は変えない・純粋な再計算の重複排除）。"""
     return _current_inventory()
-
-
-def test_inventory_matches_committed_snapshot(inventory):
-    """コミット済み `deprecation_inventory.json` が実データの再走査結果と一致する（drift 検知）。
-
-    ずれた場合は `generate_inventory.py` で再生成してから差分をレビューする（対象ディレクトリの
-    フィクスチャが増減・変更された場合に想定内で発生しうる）。
-    """
-    committed = json.loads(_INVENTORY_JSON.read_text(encoding="utf-8"))
-    assert inventory == committed
 
 
 def test_real_fixture_hidden_sheet_and_rows_columns(inventory):

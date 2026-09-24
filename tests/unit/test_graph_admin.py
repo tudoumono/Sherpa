@@ -120,6 +120,9 @@ def test_ask_graph_graph_schema_era_error_returns_closed_reason(monkeypatch):
     seq = [
         {"choices": [{"message": {"content": "", "tool_calls": [
             {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"TAX-RATE"}'}}]}}]},
+        # 世代不一致は例外ではなく機械可読コードのツール結果になる（`run_tool` の契約・
+        # チャットは grep/原本直読で調査を続ける）ため、ツール呼び出しの後もループは続く。
+        {"choices": [{"message": {"content": "関係は確認できませんでした。"}}]},
     ]
 
     def _boom(world, term, sp=None):
@@ -135,6 +138,34 @@ def test_ask_graph_graph_schema_era_error_returns_closed_reason(monkeypatch):
             settings={"agent": "openai", "openai_api_key": "x", "openai_model": "gpt-test"})
         assert res["status"] == "graph_reingest_required"
         assert res["cited_nodes"] == [] and res["docs"] == []
+    finally:
+        A._post, lens_service.neighbor_cards = o_post, o_cards
+
+
+def test_ask_graph_gemini_dialect_also_returns_closed_reason(monkeypatch):
+    """S4: 世代不一致の記録は方言ごとに抜けない——gemini 方言（`agentic_search.gemini`）でも
+    `ask_graph` は閉じた理由 `graph_reingest_required` を返す（グラフ照会は縮退しない）。"""
+    monkeypatch.setenv("SHERPA_EXTRA_AGENTS", "gemini")   # gemini は env で有効化する構成
+    monkeypatch.setattr("sherpa.store.get_system_settings",
+                        lambda: {"personal_api_keys_allowed": True, "cloud_provider": "gemini"})
+    seq = [
+        {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "graph_neighbors", "args": {"name": "TAX-RATE"}}}]}}]},
+        {"candidates": [{"content": {"parts": [{"text": "関係は確認できませんでした。"}]}}]},
+    ]
+
+    def _boom(world, term, sp=None):
+        from sherpa.ingest.world_neo4j import GraphSchemaEraError
+        raise GraphSchemaEraError(world, "old-era", lens="troubleshoot")
+
+    o_post, o_cards = A._post, lens_service.neighbor_cards
+    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
+    lens_service.neighbor_cards = _boom
+    try:
+        res = graph_admin.ask_graph(
+            "TAX-RATE の関連は？", "w", scope_paths=["4期"],
+            settings={"agent": "gemini", "gemini_api_key": "x"})
+        assert res["status"] == "graph_reingest_required"
     finally:
         A._post, lens_service.neighbor_cards = o_post, o_cards
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
@@ -88,16 +89,42 @@ def _ocr_worker_compose_subtree(compose: dict) -> dict:
     return {"services": {"ocr-worker": worker}, "networks": networks}
 
 
+def _strip_docstrings(tree: ast.AST) -> None:
+    """モジュール/関数/クラス先頭のdocstring文を木から取り除く（``ast.get_docstring``と同じ判定）。"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                del body[0]
+
+
+def _python_structural_hash(source: str, *, filename: str) -> str:
+    """コメント・docstring・整形（空白/改行/インデント幅）の差では変わらない構造ハッシュ。
+
+    OCR worker のバインド対象 .py はこれを通す——書式のみの編集で契約テストが赤くならない
+    ようにする（AST は元々コメントを保持せず、``ast.dump``は``include_attributes=False``が
+    既定のため行番号も出力に出ない。docstringだけ明示的に取り除く）。
+    """
+    tree = ast.parse(source, filename=filename)
+    _strip_docstrings(tree)
+    return hashlib.sha256(ast.dump(tree).encode("utf-8")).hexdigest()
+
+
 def compute_ocr_implementation_binding(root: Path) -> dict[str, str]:
     """OCR compose-profile 測定が束縛すべきファイル群のハッシュ一式。
 
     測定の契約テストと再測定手順の両方がこの1つの定義を使うことで、束縛対象の定義が
-    テスト側と生成側でズレないようにする。
+    テスト側と生成側でズレないようにする。``.py``は構造ハッシュ（``_python_structural_hash``）、
+    それ以外はバイト内容そのものをハッシュする。
     """
-    files = {
-        relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
-        for relative in OCR_BOUND_FULL_FILES
-    }
+    files = {}
+    for relative in OCR_BOUND_FULL_FILES:
+        path = root / relative
+        if relative.endswith(".py"):
+            files[relative] = _python_structural_hash(path.read_text(encoding="utf-8"), filename=relative)
+        else:
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     files["sherpa/store/db.py:ocr-relevant"] = hashlib.sha256(
         _db_ocr_relevant_source().encode("utf-8")
     ).hexdigest()

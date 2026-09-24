@@ -58,16 +58,16 @@
    "requirements-ocr.txt": "a9b42ec0d1e4b16779ab618094581bcb993ea9dd124f612a9252afc8d96a57e0",
    "constraints-ocr.txt": "b3d32ad9ed2018402ca7f2f9b46897ca97243921b99a1ed663bb827ae25063bb",
    "docker/ocr-models.lock.json": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
-   "sherpa/ingest/ai_observation.py": "feb6a351bba78a0c96e6f1af5df8c814c61b3894bc710cd7be5a25590c767b79",
-   "sherpa/ingest/ocr_worker.py": "6fa9d25331dc9947cc732eb3b8c2ce7b88dab069d6b67da1598230fa29d95824",
-   "sherpa/ingest/ocr_router.py": "26dcd240df907ff417d29fd7ef129b7a8d221216f0f8ab669f3d52344679ee73",
-   "sherpa/ingest/observation_render.py": "1ec878609817882735ed77596acf719f93e7511445f3dc93c23c848bfbe9c76b",
-   "sherpa/store/ocr_jobs.py": "2d2fee039f340b02e64b23ad209a09ccdcbe0571c58c6619e513667eaecbdc1f",
+   "sherpa/ingest/ai_observation.py": "d0cffce492b9057c239ad17b2460d18d6e32f0267e7c3b6bf9a0df48377bf104",
+   "sherpa/ingest/ocr_worker.py": "61da986a9666c0f81fb854f13c028effb011c258e3ed0eb33880eb679fe01d16",
+   "sherpa/ingest/ocr_router.py": "19bd4ffa3ba30ec6986cacf47d591715c4a2ce63352b69658305eb19ba35cecc",
+   "sherpa/ingest/observation_render.py": "5e228db253c580e13047387c9e0796aff3754d49f11295a20e324bc1a596aefc",
+   "sherpa/store/ocr_jobs.py": "8043dac5c9307c59475343eebdb9bf14446c8a0cd407e241852c0d733c70a910",
    "sherpa/store/db.py:ocr-relevant": "b3980df2bcd4cddb712abb4de2dad103424a6d9bf3139b955a660522e47a8a9d",
    "requirements.txt+constraints.txt:psycopg-lines": "b8d7d98a99031315f6df04b4f349c609fdc95c223d70a79b4e7eea80b13348e7",
    "docker-compose.yml:services.ocr-worker+networks": "4e27ba3424822bba8ed1058d15e7aea117e7c8e7616190589184e6f2f34c94ff"
   },
-  "files_updated_note": "2026-09-11: ai_observation.py・observation_render.py・ocr_jobs.py の未参照関数（searchable_observations／write_bundle_atomic／publish_snapshot／ObservationDocument／generation_terminal／mark_artifacts_published）を削除したのみ＝エンジン profile・画像・compose・依存は無変更、実測値は維持"
+  "files_updated_note": "2026-09-11: ai_observation.py・observation_render.py・ocr_jobs.py の未参照関数（searchable_observations／write_bundle_atomic／publish_snapshot／ObservationDocument／generation_terminal／mark_artifacts_published）を削除したのみ＝エンジン profile・画像・compose・依存は無変更、実測値は維持 ／ 2026-09-23: 対象.pyのハッシュ方式をバイト内容そのものから、docstring・コメントを除いたASTの構造ハッシュ（`compute_ocr_implementation_binding`/`_python_structural_hash`参照）へ変更した——書式のみの変更（コメント・docstring・空白）では赤くならないようにするため。あわせて、この方式で現在の実装に結び直した: (1) ocr_worker.py はPaddleOCR入力の一時ファイル拡張子をmedia_type別に写像するよう変更されたが、本measurementの入力はimage/pngのみで、image/pngの写像先（.png）は変更前後で同一のため recognized_text/recognized_confidence を含む実測結果に影響しない。(2) ocr_jobs.py は iter_succeeded_results のORDER BY/keyset比較の式を変更したが、本measurementはjob 1件のみを処理しており順序の影響を受けない。エンジン profile・画像・compose・依存は無変更＝runtime/mount_checks/network_checks/image_inventory の実測値は維持 ／ 2026-09-23（RV是正）: ORDER BY/COLLATEでのSQL側正規化はobservation_render._relative_source_pathのPurePosixPath正規化（連続する`/`の畳み込み・`.`除去・末尾`/`除去）まで再現できず同種の順序不一致が残っていたため、iter_succeeded_resultsを呼出側sort_key注入方式へ作り直した（ocr_worker.pyはsort_keyにobservation_render._relative_source_pathを渡す）。本measurementはjob 1件のみで並びの影響を受けないため無変更と判断し、ハッシュのみ再度結び直した。エンジン profile・画像・compose・依存は無変更＝runtime/mount_checks/network_checks/image_inventory の実測値は維持"
  },
  "runtime": {
   "worker_uid": 1000,

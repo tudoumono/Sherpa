@@ -919,16 +919,24 @@ USAGE_STATS_DEFAULT = {
              "tool_result_clipped_turns": 3, "tool_result_clipped_total": 5,
              "total_budget_hit_turns": 1,
              "context_compactions_turns": 2, "context_compactions_total": 4,
-             "synthesis_truncated_turns": 0,
+             "synthesis_truncated_turns": 0, "depth_escalated_turns": 2,
              "search_truncated_turns": 4, "search_truncated_total": 9,
-             "auto_continues_turns": 2, "auto_continues_total": 3},
+             "auto_continues_turns": 2, "auto_continues_total": 3,
+             "duplicate_tool_call_turns": 2, "duplicate_tool_call_total": 4,
+             "tool_calls_exhausted_turns": 1,
+             "backend_unavailable_fulltext_turns": 1, "backend_unavailable_graph_turns": 2,
+             "graph_reingest_required_turns": 1},
             {"provider": "openai", "turns": 6,
              "tool_result_clipped_turns": 0, "tool_result_clipped_total": 0,
              "total_budget_hit_turns": 0,
              "context_compactions_turns": 1, "context_compactions_total": 1,
-             "synthesis_truncated_turns": 1,
+             "synthesis_truncated_turns": 1, "depth_escalated_turns": 0,
              "search_truncated_turns": 0, "search_truncated_total": 0,
-             "auto_continues_turns": 0, "auto_continues_total": 0},
+             "auto_continues_turns": 0, "auto_continues_total": 0,
+             "duplicate_tool_call_turns": 0, "duplicate_tool_call_total": 0,
+             "tool_calls_exhausted_turns": 0,
+             "backend_unavailable_fulltext_turns": 0, "backend_unavailable_graph_turns": 0,
+             "graph_reingest_required_turns": 0},
         ],
     },
     # 巡別記録（chat-round・表示専用）の深さ×経路別/巡番号別の活動量。
@@ -943,7 +951,7 @@ USAGE_STATS_DEFAULT = {
              "limits": {"tool_result_clipped": 2, "auto_continues": 1},
              "verdicts": {"insufficient": 4, "sufficient": 4},
              "stops": {"rerun": 4, "sufficient": 4},
-             "missing_codes": {"unexplored": 3, "insufficient": 1}},
+             "missing_codes": {"unexplored": 3, "insufficient": 1, "source_missing": 2}},
         ],
         "by_round": [
             {"depth_profile": "deep", "provider": "codex", "round_no": 1, "rounds": 4,
@@ -1118,10 +1126,11 @@ SYSTEM_SETTINGS_VIEW = {
     # PART-6（2026-09-05-Webhook通知.md W3）: Webhook 宛先の SSRF allowlist。`ollama_allowlist` と
     # 同型（既定 loopback のみ許可＝配下 effective は空）。
     "webhook_allowlist": {"configured": None, "effective": []},
-    # R1b（2026-07-13 横断レビュー対応・Codex ネイティブ resume・決定5）: Codex resume セッションの
-    # 保持日数。既定（未設定）は 0＝無制限。フェーズ7-1（response_model 実測）で発見した実ドリフト
+    # R1b（2026-07-13 横断レビュー対応・Codex ネイティブ resume・決定5）→ 初期構成の既定
+    # （決定2026-09-19）: Codex resume セッションの保持日数。既定（未設定）は 30 日
+    # （明示的な 0 だけ無制限）。フェーズ7-1（response_model 実測）で発見した実ドリフト
     # 是正＝旧モックはこのキーを欠いていた（実 GET /admin/settings は常に持つ）。
-    "codex_session_retention_days": {"configured": None, "effective": 0},
+    "codex_session_retention_days": {"configured": None, "effective": 30, "default": 30},
     # STAT-2（2026-08-28-利用統計AIチャット.md 追記）: 利用統計チャット専用の AI 選択。利用者の
     # 実行構成（agent）には依存せず、管理者全体で1つに統一する。未設定時の既定は A7
     # （`cloud`.`provider`・下記）連動——この環境は A7=openai（既定）なので "openai"
@@ -1149,6 +1158,13 @@ SYSTEM_SETTINGS_VIEW = {
     # 埋め込み HTTP の同時送信数。既定（未設定）は
     # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
+    # 「最大」の深さが許す査読の巡数（`sherpa/depth_profile.py::MAX_REVIEW_ROUNDS_DEFAULT`＝7）。
+    "max_review_rounds": {"configured": None, "effective": 7, "default": 7},
+    # multi_agent（S6）の worker モデル（`sherpa/providers/codex/sandbox.py::_CODEX_WORKER_MODEL_FALLBACK`）。
+    "codex_worker_model": {"configured": None, "effective": "gpt-5.6-sol", "default": "gpt-5.6-sol"},
+    # 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。
+    "codex_mode": {"configured": None, "effective": "standard", "default": "standard",
+                   "options": ["standard", "plain"]},
     "chat_max_turns": {
         "per_user": {"configured": None, "effective": 2, "default": 2},
         "global": {"configured": None, "effective": 8, "default": 8},
@@ -1156,17 +1172,12 @@ SYSTEM_SETTINGS_VIEW = {
     # BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: agentic search の tool-result
     # バイト予算（1件あたり／1 run 累計）。既定（未設定）は env/コード既定（精度優先・262144/4194304
     # ＝`sherpa/agentic_search.py::TOOL_RESULT_MAX_BYTES`/`TOOL_RESULT_MAX_TOTAL_BYTES` の
-    # コード既定値と一致）。
-    # BUDGET-2（同 §3.4・2026-09-03 裁定）: `window`（現在のモデルの窓の4段解決結果・
-    # `sherpa/model_windows.py::resolve_window_tokens` の出力形）・`model_windows`（管理者登録表・
-    # "provider:model" → tokens）。mock は「窓が不明（登録値/API/シードのどれにも無い）」の
-    # 既定状態を表す（`sherpa/schemas.py::AgenticBudgetAdminInfo` と同じ形）。
+    # コード既定値と一致）。モデルの窓由来の上限との min()（旧 BUDGET-2・管理画面のモデル窓登録表）
+    # は撤去済み（`sherpa/schemas.py::AgenticBudgetAdminInfo` と同じ形＝`window`/`model_windows`
+    # キーは応答に含まれない）。
     "agentic_budget": {
         "per_result": {"configured": None, "effective": 262144, "default": 262144},
         "total": {"configured": None, "effective": 4194304, "default": 4194304},
-        "window": {"provider": "ollama", "model": "qwen2.5", "window_tokens": None,
-                  "source": "unknown", "derived_cap_bytes": None},
-        "model_windows": {"configured": None},
     },
     # チャット画面のクイック入力例（`sherpa/chat_examples.py`）。既定（未設定）は表示・組み込み4例
     # （`GET /settings` の非 admin 向け `chat_examples` は None を返す＝下記 SETTINGS_RESP 参照）。
@@ -1369,6 +1380,7 @@ WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_
                      "office_md": 1, "skipped_office": 0, "office_failed": 0,
                      "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
                      "analyzer_declined_as_document": 0, "unreadable": 0,
+                     "sensitive_excluded": 0, "unreachable_as_text": 0, "unreachable_as_text_by_ext": {},
                      "counts_as_of": "2026-07-03T09:00:00+00:00",
                      "graph_nodes": 4, "graph_edges": 3, "es_chunks": 6,
                      "last_run_id": 500,
@@ -1514,6 +1526,7 @@ def _mock_validate_openai_endpoint_cross(kind: str, base_url: str) -> str | None
 _DEPTH_BASE_INT_BOUNDS = {
     "agentic_max_tools_per_turn": (1, 256),
     "embed_parallel": (1, 16),
+    "max_review_rounds": (1, 32),
     "depth_base_max_turns": (1, 200),
     "depth_base_grep_max_hits": (1, 1000),
     "depth_base_qa_max_hits": (1, 1000),
@@ -1566,27 +1579,6 @@ def _mock_validate_agentic_budget(body: dict):
         err = _mock_validate_depth_base_int(key, val, lo, hi)
         if err:
             return err
-    return None
-
-
-# BUDGET-2（同 §3.4）: `model_context_windows`（"provider:model" → tokens）の簡易検証（実 API の
-# `sherpa.model_windows.validate_model_windows` の主要チェックだけを模す・e2e の UI 操作を
-# 支えるのが目的で、実 API の全パターンの再現はしない——網羅は `tests/unit/test_model_windows.py`）。
-def _mock_validate_model_windows(body: dict):
-    if "model_context_windows" not in body:
-        return None
-    val = body["model_context_windows"]
-    if val is None:
-        return None   # 未設定へ戻す
-    if not isinstance(val, dict):
-        return [{"loc": ["body", "model_context_windows"], "msg": "オブジェクトで指定してください"}]
-    for k, v in val.items():
-        if not isinstance(k, str) or ":" not in k or not k.split(":", 1)[1].strip():
-            return [{"loc": ["body", "model_context_windows"],
-                     "msg": f"'provider:model' 形式で指定してください: {k!r}"}]
-        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
-            return [{"loc": ["body", "model_context_windows"],
-                     "msg": f"model_context_windows[{k}] は正の整数で指定してください"}]
     return None
 
 
@@ -1643,7 +1635,8 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                       health_components: list | None = None, usage_stats: dict | None = None,
                       system_settings: dict | None = None, settings: dict | None = None,
                       stream_events: list | None = None, extra_users: list | None = None,
-                      tools_availability: dict | None = None, notifications: list | None = None):
+                      tools_availability: dict | None = None, notifications: list | None = None,
+                      world_options: dict | None = None):
     current_user = user or USER_ADMIN
     # GET /admin/users の既定2件（admin/sato）に加え、呼び出し元が `extra_users=` で行を追加
     # できる（例: pending 状態のユーザーなど、既定の POST/PATCH mock 経路では作れない状態を
@@ -1669,6 +1662,10 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     # 呼び出し元が渡した dict／モジュール定数 `SETTINGS_RESP` をそのまま参照すると、この install_api_mocks
     # 呼び出し（1テスト）の変更が他テスト・モジュール定数まで汚染してしまう。深いコピーで切り離す。
     settings_resp = json.loads(json.dumps(settings if settings is not None else SETTINGS_RESP))
+    # 初期構成の既定（2026-09-19 RV是正 #4）: GET /world-options の既定応答（呼び出し元が
+    # `world_options={"worlds": [], "labels": {}}` で資料フォルダ未登録を模せる）。
+    world_options_resp = json.loads(json.dumps(
+        world_options if world_options is not None else WORLD_OPTIONS_RESP))
     # S6: GET /settings/bedrock-models の既定応答（呼び出し元が `bedrock_models=` で上書き可・
     # 失敗系フローを試すテストのため）。ユーザー指名の Sonnet 4.6 を含めて動的取得の見た目を再現。
     bedrock_models_resp = bedrock_models if bedrock_models is not None else {"models": [
@@ -1777,9 +1774,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             _agentic_budget_err = _mock_validate_agentic_budget(body)
             if _agentic_budget_err:
                 return _json(route, {"detail": _agentic_budget_err}, status=422)
-            _model_windows_err = _mock_validate_model_windows(body)
-            if _model_windows_err:
-                return _json(route, {"detail": _model_windows_err}, status=422)
             # 反映済みビューを返す（簡易: 送られたキーだけ configured/effective を更新）。
             view = json.loads(json.dumps(system_settings_resp))
             if "arms_enabled" in body:
@@ -1966,6 +1960,31 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 parallel = view["embed_parallel"]
                 parallel["configured"] = value
                 parallel["effective"] = value if value is not None else parallel["default"]
+            if "max_review_rounds" in body:
+                value = body["max_review_rounds"]
+                rounds = view["max_review_rounds"]
+                rounds["configured"] = value
+                rounds["effective"] = value if value is not None else rounds["default"]
+            if "codex_worker_model" in body:
+                # 実 API の _validate_codex_worker_model と同じ正規化（空文字は None＝未設定）。
+                _raw = body["codex_worker_model"]
+                _val = _raw.strip() if isinstance(_raw, str) else _raw
+                _val = _val if _val else None
+                worker_model = view["codex_worker_model"]
+                worker_model["configured"] = _val
+                worker_model["effective"] = _val if _val is not None else worker_model["default"]
+            if "codex_mode" in body:
+                # 実 API の _validate_codex_mode と同じ正規化（null は既定の "standard" へ）。
+                _raw = body["codex_mode"]
+                _val = _raw.strip().lower() if isinstance(_raw, str) else _raw
+                mode = view["codex_mode"]
+                mode["configured"] = _val
+                mode["effective"] = _val if _val is not None else mode["default"]
+            if "codex_session_retention_days" in body:
+                value = body["codex_session_retention_days"]
+                retention = view["codex_session_retention_days"]
+                retention["configured"] = value
+                retention["effective"] = value if value is not None else retention["default"]
             # 同時実行の上限（簡易反映・null は default へ戻す・depth_profile と同型）。
             if "chat_max_turns" in view:
                 for _key, _put in (("per_user", "chat_max_turns_per_user"),
@@ -1985,11 +2004,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                         view["agentic_budget"][_key]["configured"] = _val
                         view["agentic_budget"][_key]["effective"] = (
                             _val if _val is not None else view["agentic_budget"][_key]["default"])
-            # BUDGET-2（§3.4）: モデル窓の登録表（簡易反映・追加/上書き/削除の永続化のみ——実 API の
-            # min() 適用・4段解決の再現はしない＝そこは tests/unit・tests/api の対象・モジュール
-            # docstring の比較粒度の方針どおり）。
-            if "model_context_windows" in body and "agentic_budget" in view:
-                view["agentic_budget"]["model_windows"]["configured"] = body["model_context_windows"]
             # チャット画面のクイック入力例（簡易反映・null は default（組み込み4例）へ戻す・
             # enabled=false／items=[] は effective=[] ＝非表示）。
             if "chat_examples" in body and "chat_examples" in view:
@@ -2213,7 +2227,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         if method == "GET" and path == "/worlds":
             return _json(route, {"worlds": [WORLD]})
         if method == "GET" and path == "/world-options":
-            return _json(route, WORLD_OPTIONS_RESP)
+            return _json(route, world_options_resp)
         if method == "GET" and path == "/chat/tools-availability":
             return _json(route, tools_availability_resp)
         if method == "GET" and path == "/config":
@@ -2585,6 +2599,46 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                                           "created_at": "2026-09-01T11:00:00+00:00"},
                                          {"role": "assistant", "answer": tools_answer, "trace": None,
                                           "created_at": "2026-09-01T11:00:10+00:00"},
+                                     ]})
+            if cid_str == "119":
+                # S4: グラフ縮退の troubleshoot（原因候補が無く qa 相当の下地＝citations だけ）。
+                degraded_trouble = {
+                    "lens": "troubleshoot",
+                    "headline": "関係のつながりをたどる検索に接続できなかったため、資料とソースを直接調べた結果で回答します。\n\n夜間バッチの停止は TAXCALC の異常終了が原因の可能性があります。",
+                    "route": {"path": ["文書を検索"]}, "summary": {"total": 1},
+                    "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both"},
+                    "data": {"type": "qa", "citations": [
+                        {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [10, 12],
+                         "quote": "ABEND-CODE 0C7"}]},
+                    "sources": [],
+                }
+                return _json(route, {"conversation": {"id": 119, "title": "グラフ不調で縮退した会話",
+                                                       "origin": "own", "version": "v1",
+                                                       "read_only": False,
+                                                       "contains_personal_workspace": False},
+                                     "messages": [
+                                         {"role": "user", "content": "夜間バッチが止まる",
+                                          "created_at": "2026-09-19T12:00:00+00:00"},
+                                         {"role": "assistant", "answer": degraded_trouble, "trace": None,
+                                          "created_at": "2026-09-19T12:00:10+00:00"},
+                                     ]})
+            if cid_str == "118":
+                # S4（裁定⑦）: 明示状態（利用者が実際に切り替えた軸）を会話メタへ保存した会話。
+                # `tools` は grep OFF だが、触ったのは grep だけ＝graph は「既定のまま ON」。
+                explicit_answer = {**IMPACT_ANSWER, "lens": "qa",
+                                  "scope": {"world": "w1", "scope_paths": [], "source": "all",
+                                            "layer": "both",
+                                            "tools": {"grep": False, "fulltext": True, "graph": True},
+                                            "tools_explicit": ["grep"]}}
+                return _json(route, {"conversation": {"id": 118, "title": "検索経路を1軸だけ操作した会話",
+                                                       "origin": "own", "version": "v1",
+                                                       "read_only": False,
+                                                       "contains_personal_workspace": False},
+                                     "messages": [
+                                         {"role": "user", "content": "消費税率を変えたい",
+                                          "created_at": "2026-09-19T11:00:00+00:00"},
+                                         {"role": "assistant", "answer": explicit_answer, "trace": None,
+                                          "created_at": "2026-09-19T11:00:10+00:00"},
                                      ]})
             if cid_str == "117":
                 # 範囲パネルの折りたたみツリー化（実環境指摘 2026-09-02）: 深い階層（SCOPES の

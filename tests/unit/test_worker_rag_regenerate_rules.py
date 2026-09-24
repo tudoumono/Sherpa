@@ -30,7 +30,6 @@ def test_regenerate_rag_rule_only_success_path(monkeypatch, tmp_path):
     monkeypatch.setattr(worlds, "world_dir", lambda world: tmp_path / "world")
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
 
     cleared = []
     monkeypatch.setattr(llm_render, "clear_cache", lambda world: cleared.append(world))
@@ -47,7 +46,7 @@ def test_regenerate_rag_rule_only_success_path(monkeypatch, tmp_path):
 
     result = worker.regenerate_rag_rule_only("v1")
     assert cleared == ["v1"]
-    assert refresh_calls == [True]           # RAG_ES無効＝refresh_rag自身がマーカーを確定する
+    assert refresh_calls == [False]          # RAG_ES有効＝マーカー保留（_reindex_after_rag_rewriteが確定）
     assert reindex_calls == ["v1"]
     assert result["status"] == "ok"
     assert result["rag_generated"] == 3
@@ -80,7 +79,6 @@ def test_regenerate_rag_rule_only_partial_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(worlds, "world_dir", lambda world: tmp_path / "world")
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
     monkeypatch.setattr(llm_render, "clear_cache", lambda world: None)
     monkeypatch.setattr(office_md, "refresh_rag",
                         lambda wd, derived, **kw: {"rag_generated": 1, "rag_failed": 1,
@@ -109,23 +107,6 @@ def test_regenerate_rag_rule_only_es_reindex_failed(monkeypatch, tmp_path):
 def test_reindex_after_rag_rewrite_returns_false_when_sig_missing(monkeypatch):
     monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": ""})
     assert worker._reindex_after_rag_rewrite("v1") is False
-
-
-def test_reindex_after_rag_rewrite_skips_es_when_rag_es_disabled(monkeypatch):
-    monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": "sig"})
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
-    monkeypatch.setattr(store, "world_lock", _noop_lock)
-    # rv-s2-mention #1: グラフ反映は RAG_ES の有無に関わらず常に呼ばれる（ES を経ない world でも
-    # 言及エッジは陳腐化しうるため）——ここでは呼ばれたことだけを確認する（内部の
-    # build_world_graph/load_world 自体は `test_worker_rag_refresh.py` 側の統合テストで確認済み）。
-    reflect_calls = []
-    monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: reflect_calls.append(world))
-
-    def _boom(*a, **kw):
-        raise AssertionError("RAG_ES無効ならESに触れてはいけない")
-    monkeypatch.setattr(office_md, "drop_rag_sig_marker", _boom)
-    assert worker._reindex_after_rag_rewrite("v1") is True
-    assert reflect_calls == ["v1"]
 
 
 def test_reindex_after_rag_rewrite_marker_drop_failure(monkeypatch):

@@ -63,6 +63,18 @@ def test_usage_subsystem_is_registered(tmp_path):
     assert "kind=embed" in (tmp_path / "usage.log").read_text(encoding="utf-8")
 
 
+def test_codex_subsystem_is_registered(tmp_path):
+    """Codex CLI 実行の開始/終了サマリ（`providers/base.py::_log_codex`）が codex.log 専用へ
+    配線される（`sherpa` ロガー本体＝run ログには INFO は伝播しない）。"""
+    assert log_setup._SUBSYSTEM_LOGGERS["codex"] == ("sherpa.codex", "codex.log")
+    log_setup.configure_logging(force=True, log_dir=tmp_path)
+    assert (tmp_path / "codex.log").exists()
+    logging.getLogger("sherpa.codex").info("start conv=1 uid=u1 config=openai")
+    for h in logging.getLogger("sherpa.codex").handlers:
+        h.flush()
+    assert "start conv=1" in (tmp_path / "codex.log").read_text(encoding="utf-8")
+
+
 def test_info_goes_to_subsystem_file_only_warning_also_reaches_run_logger(tmp_path, monkeypatch):
     """INFO は専用ファイルのみ／WARNING 以上は専用ファイル＋run ログ（"sherpa" ロガー）の両方に残る
     （専用ファイルを見ないと障害に気づけない、という新しい無音を作らない、の実測）。"""

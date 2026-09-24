@@ -219,8 +219,16 @@ def _stopped_turns_sql() -> str:
 # 除外される＝0件として集計に混じる（`docs/notes`「限定/計測」契約・制限そのものは変えない）。
 # `_usage_tok` と同じ「非数値/欠落は無視」防御（bool は 'true'/'false' 文字列のみ真偽扱い）。
 _USAGE_LIMIT_INT_FIELDS = ("tool_result_clipped", "context_compactions", "search_truncated",
-                           "auto_continues")
-_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated")
+                           "auto_continues", "duplicate_tool_call")
+# 縮退（バックエンド不調）の計数（`investigation_state._BACKEND_LIMIT_FIELD`／
+# `GRAPH_REINGEST_LIMIT_FIELD` と同じ語彙）。意味論は「このターンで初めて検出されたか」＝
+# 初回検出の計数で、障害が起きた巡の数ではない（`providers/base.py::_limits_delta` が
+# 偽→真になった巡だけ載せるため、同じ障害が続いても2巡目以降は計上されない）。
+# `tool_calls_exhausted`（クイックを本当に速くする・変更D③）はバックエンド不調ではなく
+# MCP ツール呼び出し回数の上限到達（Codex 経路のみ・`mcp_server.py`）。
+_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated", "depth_escalated",
+                            "backend_unavailable_fulltext", "backend_unavailable_graph",
+                            "graph_reingest_required", "tool_calls_exhausted")
 
 
 def _usage_limit_int(field: str) -> str:
@@ -442,6 +450,9 @@ def _compute_round_stats(round_rows) -> dict:
     unmatched_rounds = 0
     for r in round_rows:
         meta = r["meta"] or {}
+        # 深さは利用者が選んだ語彙そのもの（版の印は付けない）——`"standard"` の意味が 0 巡から
+        # 2 巡へ変わった前後は同じキーに畳まれる。版をまたぐ比較は品質採点の `condition`
+        # （`QUALITY_RUN_CONDITIONS`）側で分ける。
         depth = r["depth_profile"] or "unknown"
         provider = r["provider"] or "unknown"
 
@@ -581,17 +592,65 @@ def _round_rows_query(c, start_ts, end_exclusive_ts):
 
 
 # 最終回答の主張（`answer->'data'->'claims'`）のうち不明の理由コードを数えるための取得 SQL
-# （`usage_stats()`/`usage_depth_rounds()` が共有）。
+# （`usage_stats()`/`usage_depth_rounds()` が共有）。`gate_missing_codes`（S1b・Codex 経路の
+# 最終ゲート・`answer->'data'->'evidence_gate'->'missing_codes'`）も同じ行から拾う——Codex は
+# `chat-round` を発生させない経路のため、巡別記録（`_round_rows_query`）には不足軸が載らず、
+# ここが唯一の取得点になる（API 経路にはこのキー自体が無く NULL のまま＝`_compute_round_stats`
+# 側の `missing_codes` 集計と二重計上にならない）。
 def _final_claims_rows_query(c, start_ts, end_exclusive_ts):
     return c.execute(
         _USAGE_TURN_CTE + " "
         "SELECT answer->'usage'->>'provider' AS provider, "
         "  answer->'usage'->>'depth_profile' AS depth_profile, "
-        "  answer->'data'->'claims' AS claims "
+        "  answer->'data'->'claims' AS claims, "
+        "  answer->'data'->'evidence_gate'->'missing_codes' AS gate_missing_codes "
         "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s "
         "  AND jsonb_typeof(answer->'data'->'claims') = 'array'",
         (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
     ).fetchall()
+
+
+def _compute_final_missing_codes(final_claims_rows) -> dict[tuple, dict[str, int]]:
+    """S1b: 最終回答の `evidence_gate.missing_codes`（Codex 経路の最終ゲート・巡を発生させない
+    ため `chat-round` には載らない）を深さ×経路で合算する。非配列/欠落（API 経路・v1・旧データ）
+    は静かにスキップする（`_compute_final_reason_codes` と同じ「非配列は無視」防御）。
+    """
+    agg: dict[tuple, dict[str, int]] = {}
+    for r in final_claims_rows:
+        codes = r["gate_missing_codes"]
+        if not isinstance(codes, list):
+            continue
+        depth = r["depth_profile"] or "unknown"
+        provider = r["provider"] or "unknown"
+        bucket = agg.setdefault((depth, provider), {})
+        for code in codes:
+            if isinstance(code, str) and code:
+                bucket[code] = bucket.get(code, 0) + 1
+    return agg
+
+
+def _merge_final_missing_codes(rounds_stats: dict, final_claims_rows) -> None:
+    """S1b: 最終回答由来の不足軸（`_compute_final_missing_codes`）を、既存の巡別集計
+    （`rounds_stats["by_depth_provider"]`・表示は `web/usage.js::reviewCounts(r.missing_codes)`
+    のまま＝新しい表は作らない）へ深さ×経路で合流させる。Codex は `chat-round` を発生させない
+    ため、既存集計に対応するバケットが無い（深さ, "codex"）組は新規バケットとして追加する
+    （`rounds` 等の巡別指標は0のまま＝Codex 側にその意味の値が無いことを表す）。
+    """
+    agg = _compute_final_missing_codes(final_claims_rows)
+    if not agg:
+        return
+    by_key = {(a["depth_profile"], a["provider"]): a for a in rounds_stats["by_depth_provider"]}
+    for key, codes in agg.items():
+        bucket = by_key.get(key)
+        if bucket is None:
+            bucket = _new_round_bucket(*key)
+            bucket["elapsed_ms_avg"] = None
+            bucket["citations_delta_avg"] = None
+            by_key[key] = bucket
+            rounds_stats["by_depth_provider"].append(bucket)
+        for code, n in codes.items():
+            bucket["missing_codes"][code] = bucket["missing_codes"].get(code, 0) + n
+    rounds_stats["by_depth_provider"].sort(key=lambda a: (a["depth_profile"], a["provider"]))
 
 
 def _round_reason_codes(rounds_stats: dict, final_claims_rows) -> dict:
@@ -1218,6 +1277,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # 正本に触れない）。
     rounds_stats = _compute_round_stats(round_rows)
     rounds_stats["reason_codes"] = _round_reason_codes(rounds_stats, final_claims_rows)
+    _merge_final_missing_codes(rounds_stats, final_claims_rows)
 
     return {
         "users": users, "totals": totals, "daily": daily, "period": period,
@@ -1237,8 +1297,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
 _QUALITY_COUNT_FIELDS = ("correct", "wrong_assertion", "missing", "regressed", "unrated")
 
 # 採点した条件の閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。`main`＝見直しの無い
-# AP、`depth2-*`＝見直しを持つ AP の深さ別。
-QUALITY_RUN_CONDITIONS = ("main", "depth2-standard", "depth2-deep", "depth2-max")
+# AP、`depth2-*`＝見直しを持つ AP の深さ別（`depth2-quick` が見直し 0 巡・`depth2-standard` は
+# 見直し 2 巡）。
+QUALITY_RUN_CONDITIONS = ("main", "depth2-quick", "depth2-standard", "depth2-deep", "depth2-max")
 
 
 def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
@@ -1248,7 +1309,7 @@ def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
                              audit_actor: str | None = None) -> bool:
     """1採点ラン分の集計済みカウントを1行 INSERT する。
 
-    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-standard`）は0）。
+    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-quick`）は0）。
     `counts`: `_QUALITY_COUNT_FIELDS` の一部/全部（欠落キーは0・非負整数以外は0に丸める＝壊れた
     入力で例外にしない）。`condition`: `QUALITY_RUN_CONDITIONS` のいずれか（閉集合外は
     `UsagePeriodError` ではなく `ValueError`）。`executed_from`/`executed_to`: 質問セットを実行した

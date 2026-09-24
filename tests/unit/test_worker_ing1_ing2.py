@@ -244,6 +244,31 @@ def test_run_locked_success_records_stage_timings_and_counts(monkeypatch, _stub_
     assert counts["es_indexed"] == 0     # index_world のスタブ indexed=0
 
 
+def test_counts_summary_folds_scan_report_unreachable_and_sensitive_counts():
+    """変更D（未登録拡張子のソース到達可能性）: `corpus_docs.scan_report()` が返す
+    `unreachable_as_text`/`unreachable_as_text_by_ext`/`sensitive_excluded`（実際の走査結果は
+    `tests/unit/test_corpus_docs_text_kind.py` 側で固定）が、`worker._counts_summary(...,
+    scan_rep=...)` 経由で `extraction_snapshot["counts"]`（`_record` が `snap["counts"] = counts`
+    として書く先・`test_run_locked_success_records_stage_timings_and_counts` 参照）へそのまま残る。
+    `corpus_docs.scan_report` 自体は呼ばない（本ファイルの `_stub_ingest_summary_deps` が
+    autouse でこれを禁止しているため・ING-2）——`scan_rep` は実走査結果と同じ形の辞書を直接渡す。"""
+    scan_rep = {"scanned": 3, "indexed": 1, "unreachable_as_text": 2,
+               "sensitive_excluded": 1, "unreachable_as_text_by_ext": {".bin": 1}}
+    counts = worker._counts_summary(None, None, None, [], scan_rep=scan_rep)
+    assert counts["unreachable_as_text"] == 2
+    assert counts["sensitive_excluded"] == 1
+    assert counts["unreachable_as_text_by_ext"] == {".bin": 1}
+
+
+def test_counts_summary_omits_unreachable_by_ext_when_empty():
+    """`unreachable_as_text_by_ext` が空（未登録拡張子・バイナリ・秘匿のどれも無い world）なら
+    キー自体を付けない（0 と欠落を区別する既存契約・`_counts_summary` docstring 参照）。"""
+    scan_rep = {"unreachable_as_text": 0, "sensitive_excluded": 0, "unreachable_as_text_by_ext": {}}
+    counts = worker._counts_summary(None, None, None, [], scan_rep=scan_rep)
+    assert counts["unreachable_as_text"] == 0 and counts["sensitive_excluded"] == 0
+    assert "unreachable_as_text_by_ext" not in counts
+
+
 def test_run_locked_failure_keeps_partial_stage_timings(monkeypatch, _stub_pipeline):
     """STAT-3 S5: 失敗した run でも、そこまでに開いた段の時刻は残る（graph_build で blocked 終了＝
     es_index/finalize には到達しない）。"""
@@ -318,9 +343,7 @@ def _stub_ingest_summary_deps(monkeypatch):
 
 
 def test_ingest_summary_uses_cached_scan_report_without_walking(monkeypatch):
-    cached = {"scanned": 9, "indexed": 9, "by_doctype": {}, "office_md": 0, "skipped_office": 0,
-             "office_failed": 0, "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
-             "analyzer_declined_as_document": 0, "unreadable": 0}
+    cached = {**corpus_docs.empty_scan_report(), "scanned": 9, "indexed": 9}
     row = {"last_scan_report": cached, "last_scan_report_at": "2026-09-01T03:12:00+00:00"}
     s = worlds_router._ingest_summary("w", row)
     assert s["scanned"] == 9
@@ -333,6 +356,27 @@ def test_ingest_summary_reports_uncounted_when_no_cache_without_walking(monkeypa
     assert s["counts_as_of"] is None
     assert s["scanned"] == 0
     assert s["indexed"] == 0
+
+
+def test_ingest_summary_unreachable_as_text_survives_unchanged_sync(monkeypatch):
+    """無変更の再同期（`worker._sync_impl` の unchanged 経路・`_finalize_if_unused`）は最新 run の
+    `extraction_snapshot` に `counts`（`unreachable_as_text` 等）を持たない——scan_report を
+    再実行しないため。それでも画面用の値は世界単位のキャッシュ（`last_scan_report`）からそのまま
+    返る（run 由来の `stage_summary.counts` には依存しない）。"""
+    cached = {"scanned": 3, "indexed": 1, "by_doctype": {}, "office_md": 0, "skipped_office": 0,
+             "office_failed": 0, "skipped_other": 1, "skipped_ext": {".bin": 1}, "analyzer_declined": 0,
+             "analyzer_declined_as_document": 0, "unreadable": 0,
+             "sensitive_excluded": 1, "unreachable_as_text": 2, "unreachable_as_text_by_ext": {".bin": 1}}
+    row = {"last_scan_report": cached, "last_scan_report_at": "2026-09-01T03:12:00+00:00"}
+    # unchanged 経路の実際の snap 形（`_finalize_if_unused` docstring 参照）＝`counts` キー自体が無い。
+    monkeypatch.setattr(store, "get_latest_run_summary",
+                        lambda wid: {"status": "unchanged", "extraction_snapshot": {"changed": False},
+                                    "created_at": None})
+    s = worlds_router._ingest_summary("w", row)
+    assert s["unreachable_as_text"] == 2
+    assert s["sensitive_excluded"] == 1
+    assert s["unreachable_as_text_by_ext"] == {".bin": 1}
+    assert s["stage_summary"] is None   # 最新 run 自体は counts/stage_timings を持たない
 
 
 def test_ingest_summary_graph_and_es_counts_come_from_latest_published_run(monkeypatch):

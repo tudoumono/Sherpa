@@ -20,7 +20,7 @@ const $ = Sherpa.$;
 const LENS_LABEL = { auto: '自動', impact: '影響', troubleshoot: '原因', qa: '内容', author: '作成' };
 const LAYER_LABEL = { both: '資料＋コード', docs: '資料のみ', code: 'コードのみ' };
 // 調べる深さ（調べ方ブロック §3.2・SC-6c）。
-const DEPTH_LABEL = { standard: '標準', deep: '深く', max: '最大' };
+const DEPTH_LABEL = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
 // 検索経路トグル（調べ方ブロック §3.6・SC-6e）。キー順は要約ラベルの表示順にもなる。
 const TOOL_KEYS = ['grep', 'fulltext', 'graph'];
 const TOOL_LABEL = { grep: '語句そのまま検索', fulltext: '意味・表記ゆれも探す', graph: 'グラフ' };
@@ -175,14 +175,24 @@ export function setTools(tools) {
   renderInquiry();
 }
 
+// SC-6e: 送信に添える「利用者が実際に切り替えた軸」（`tools` の値だけでは既定のまま ON と
+// 明示 ON を区別できない）。サーバは会話メタ（`answer.scope.tools_explicit`）へ保存するだけで、
+// 実行にも 422 判定にも使わない——会話を開き直したときの明示状態の復元専用。
+export function toolsExplicitForSend(explicit = S.toolsExplicit) {
+  return TOOL_KEYS.filter((k) => explicit[k]);
+}
+
 // SC-6e: 会話ロード（`scope.js::applyConversationScope`）・pendingConvWorld 後追い復元
-// （`chat.js`）の両方が使う——復元した検索経路トグルの明示状態を計算する。復元値が全ON
-// （既定）なら全軸未操作（既定ONは次の送信で省略できる契約のまま）にする一方、1軸でも
-// OFF なら復元した3軸すべてを明示状態にする。全軸を一律「未操作」のままにすると、無操作で
-// 次の質問を送るだけで「既定ONは省略」の規則により復元した非既定値（例: grep OFF）が
-// 送信 body から消え、黙って全ONへ戻ってしまう（不達のまま復元したONも同様に省略され
-// 422にならない）。
-export function toolsExplicitForRestore(tools) {
+// （`chat.js`）の両方が使う——復元した検索経路トグルの明示状態を計算する。
+// 保存された明示状態（`saved`＝前回の送信時に実際に切り替えた軸）があればそれをそのまま使う
+// ——触っていない軸まで明示扱いにすると、その軸が不達のときに送信が 422 になってしまう。
+// 保存が無い旧回答だけ従来の近似（復元値が全ON なら全軸未操作・1軸でも OFF なら3軸とも明示）に
+// 落ちる: 全軸を一律「未操作」にすると、無操作で次の質問を送るだけで「既定ONは省略」の規則により
+// 復元した非既定値（例: grep OFF）が送信 body から消え、黙って全ONへ戻ってしまう。
+export function toolsExplicitForRestore(tools, saved) {
+  if (Array.isArray(saved)) {
+    return { grep: saved.includes('grep'), fulltext: saved.includes('fulltext'), graph: saved.includes('graph') };
+  }
   const isDefault = TOOL_KEYS.every((k) => tools[k]);
   return { grep: !isDefault, fulltext: !isDefault, graph: !isDefault };
 }

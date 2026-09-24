@@ -345,7 +345,7 @@
 
       <div class="card" style="overflow-x:auto;margin-bottom:14px">
         <div class="chart-title">打ち切りの内訳
-          <span class="info-dot" tabindex="0" title="1回の調査〜回答で、内部の制限（1件あたりの結果量・累計の結果量・会話履歴の整理・清書入力・検索結果の件数上限・Codexの自動継続）に実際に当たった回数です。制限そのものはここでは変えていません。Codex 経路は自動継続だけを数え、他の列は API 経路（OpenAI・Ollama・Gemini・Bedrock）のみ計測しています。">ⓘ</span>
+          <span class="info-dot" tabindex="0" title="1回の調査〜回答で、内部の制限（1件あたりの結果量・累計の結果量・会話履歴の整理・清書入力・検索結果の件数上限・同じ条件の再検索の省略・調査の回数上限・自動継続）に実際に当たった回数です。制限そのものはここでは変えていません。結果切り詰め・累計上限到達・検索の打ち切り・自動継続と右端3列（全文検索が使えなかった・グラフが使えなかった・グラフは再取り込み待ち）は Codex 経路でも数えます（同じ条件の再検索を省略・調査の回数上限に到達は Codex 経路のみ）。履歴の整理・清書の打ち切り・自動で深く調べたは API 経路（OpenAI・Ollama・Gemini・Bedrock）のみ計測しています。右端3列は「そのターンで最初に気づいた回数」で、同じ不調が続いても1ターンにつき1回だけ数えます。">ⓘ</span>
         </div>
         <table>
           <thead>
@@ -356,8 +356,14 @@
               <th class="num">累計上限到達</th>
               <th class="num">履歴の整理</th>
               <th class="num">清書の打ち切り</th>
+              <th class="num">自動で深く調べた</th>
               <th class="num">検索の打ち切り</th>
               <th class="num">自動継続</th>
+              <th class="num">同じ条件の再検索を省略</th>
+              <th class="num">調査の回数上限に到達</th>
+              <th class="num">全文検索が使えなかった</th>
+              <th class="num">グラフが使えなかった</th>
+              <th class="num">グラフは再取り込み待ち</th>
             </tr>
           </thead>
           <tbody id="limits-tbody"></tbody>
@@ -367,7 +373,7 @@
       <section class="card" id="review-stats-card" aria-labelledby="review-stats-heading" style="overflow-x:auto;margin-top:28px;margin-bottom:14px">
         <h2 id="review-stats-heading" style="font-size:var(--text-body)">見直しの働きを確かめる</h2>
         <p class="hint">見直しで増えた出典や判断の内訳と、正解付きの比較を確認できます。質問・回答の本文や資料名は表示しません。</p>
-        <p class="hint">順番が 0 の記録は、標準で行う最初の確認です。見直しの記録数は質問数とは異なります。確定・推定・不明は各回での判断の合計で、最終回答の正しさを示すものではありません。</p>
+        <p class="hint">順番が 0 の記録は、クイックで行う最初の確認です。見直しの記録数は質問数とは異なります。確定・推定・不明は各回での判断の合計で、最終回答の正しさを示すものではありません。</p>
         <div id="review-stats" aria-live="polite"></div>
       </section>
 

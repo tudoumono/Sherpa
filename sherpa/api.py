@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -33,6 +32,7 @@ from sherpa.deps import (
     _USERS_DIR,
     _browse_roots,
     _ensure_initial_admin,
+    _remove_codex_session_dir,
     _require_world,
     _validate_new_password,
     ensure_workspace,
@@ -1315,8 +1315,10 @@ def _sweep_expired_codex_sessions() -> dict:
     """R1b（会話継続・Codex ネイティブ resume・決定5）: 会話ごとの Codex resume セッション
     （`workspace/.codex-sessions/{cid}`）の TTL 掃除。
 
-    保持日数は admin 設定 `codex_session_retention_days`（system_settings・既定 0=無制限）。
-    0 以下（未設定含む）ならスイープしない。判定はディレクトリ自体の mtime（`CodexProvider` が
+    保持日数は admin 設定 `codex_session_retention_days`
+    （system_settings・未設定は既定30日・決定2026-09-19・`system_extras.effective_codex_session_retention_days`
+    が唯一の判定＝管理画面表示と同じ関数）。0（明示設定時のみ）ならスイープしない。判定は
+    ディレクトリ自体の mtime（`CodexProvider` が
     毎ターン `config.toml` をこの直下に作り直すため、実行するたびに更新される＝最終利用時刻の
     近似として十分・DB 台帳は持たない＝`_gc_orphan_workspace_files` と同じ「fs 実体が真実源」思想）。
     安全設計（既存 workspace TTL sweep と同一）:
@@ -1324,9 +1326,14 @@ def _sweep_expired_codex_sessions() -> dict:
     - symlink は触らない（is_symlink() 事前チェック）。
     - 削除は `.codex-sessions/{cid}` ディレクトリ配下に閉じ込め確認（relative_to）してから行う。
     - 共有 RAG（ES/Neo4j）・conversations 行には一切触れない（セッション実体のみ）。
+
+    DEPTH-2 S3b: `spawn_agent` した子エージェントの rollout も同じ CODEX_HOME
+    （`{cid}/sessions/**/*.jsonl`）配下に書かれる（親と別ファイル・同じディレクトリ木）ため、
+    `shutil.rmtree(cdir)` は子の分も一括で削除する——個別の回収コードは不要（対象を親スレッドだけに
+    限定していない）。
     """
     try:
-        retention_days = int(store.get_system_settings().get("codex_session_retention_days") or 0)
+        retention_days = system_extras.effective_codex_session_retention_days(store.get_system_settings())
     except Exception as e:
         _log.warning("sweep_expired_codex_sessions: system_settings 取得失敗、skip: %s", e)
         return {"skipped": "settings_unreachable"}
@@ -1355,8 +1362,7 @@ def _sweep_expired_codex_sessions() -> dict:
                     continue
                 if cdir.stat().st_mtime > cutoff:
                     continue                                  # 保持期間内＝まだ resume 対象として残す
-                cdir.resolve().relative_to(sessions_root_resolved)   # base-confined 再確認
-                shutil.rmtree(cdir, ignore_errors=False)
+                _remove_codex_session_dir(cdir, sessions_root)   # base-confined 再確認 + rmtree
                 deleted += 1
             except Exception as e:
                 _log.warning("sweep_expired_codex_sessions: failed uid=%s cid=%s: %s", udir.name, cdir.name, e)

@@ -102,6 +102,26 @@ def _hermetic_metering_record(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_conversation_alive(monkeypatch):
+    """`CodexProvider._run_authoring` が会話単位ロック取得後に行う会話生存確認
+    （`store.owns_conversation`・削除との競合防止・`docs/proposals/2026-09-21-調査台帳を文脈の外に
+    置く.md` §4-3）を既定で True に固定する（DB 非到達）。
+
+    多数の unit テストが `CodexProvider().run(ctx)` を実 DB 行の無い合成 conversation_id
+    （`_ctx(conversation_id=...)` 等）で直接呼ぶ——`owns_conversation` は元々 unit テストの対象外
+    だった新しい DB 呼び出しのため、固定しないと「conversation_id あり」の全テストが実 DB へ
+    到達し（かつ行が無いので False→ Codex を起動しない）unit テストの契約「外部サービス不要」を
+    破る（`_hermetic_system_settings` と同じ理由）。
+
+    会話削除との競合そのもの（False になった時に実行しないこと）を検証するテストは、本体で
+    `monkeypatch.setattr(store, "owns_conversation", lambda *a, **kw: False)` を明示的に上書きする
+    （autouse は本体実行より先に適用されるため、本体内の明示的 monkeypatch が最後に効く）。
+    """
+    from sherpa import store
+    monkeypatch.setattr(store, "owns_conversation", lambda *a, **kw: True)
+
+
+@pytest.fixture(autouse=True)
 def _reset_tools_availability_cache():
     """SC-6e: `agentic_search.tool_availability()` の process-local TTL キャッシュを各テスト開始前に
     リセットする——多数のテストが `es_index.available`/`agentic_search._graph_available` を

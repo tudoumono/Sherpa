@@ -1261,7 +1261,9 @@ def build_standard_publish_callback(
         def records():
             previous_source: str | None = None
             current_ir: evidence_ir.EvidenceIR | None = None
-            for row in ocr_jobs.iter_succeeded_results(world, canonical_generation_id):
+            for row in ocr_jobs.iter_succeeded_results(
+                world, canonical_generation_id, observation_render._relative_source_path,
+            ):
                 source_rel = str(row["source_rel_path"])
                 # 更新前に成功した秘匿名ジョブ（credentials.png 等）の再公開経路。Evidence を読み直して
                 # 観測を保存しない（run_once の終端化を通らない succeeded 行はここでだけ除外できる）。

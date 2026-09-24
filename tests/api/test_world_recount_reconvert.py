@@ -456,6 +456,55 @@ def test_status_success_does_not_walk_or_query_live_graph_es(client, monkeypatch
     assert body["es_chunks"] == 6
 
 
+def test_status_returns_200_for_legacy_scan_report_missing_new_fields(client, monkeypatch, tmp_path):
+    """`scan_report()` へ `sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext` を
+    追加する前に保存された旧形式の `last_scan_report`（この3項目を持たない dict）でも、状態取得API
+    は 500 にならない——欠落は `empty_scan_report()` の既定値（0/空）で補う。response_model
+    （`IngestSummaryFields`）はこの3項目を必須フィールドとして宣言しているため、旧形式をそのまま
+    返すと検証エラー（500）になっていた。
+
+    `counts_as_of` は補完時に `None`（未集計）へ倒す——保存済みの古い集計時刻をそのまま返すと、
+    「この時刻時点で実測0件だった」ように見え、本当にまだ数えていない状態と区別が付かない
+    （`scanned`/`indexed` 等の既存フィールドは実測値のまま・0/空で補うのは欠落した3項目だけ）。"""
+    from sherpa import store
+    legacy_cached = {"scanned": 5, "indexed": 5, "by_doctype": {}, "office_md": 0,
+                     "skipped_office": 0, "office_failed": 0, "skipped_other": 0, "skipped_ext": {},
+                     "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0,
+                     "document_count": 5}
+    monkeypatch.setattr(store, "get_world_status_row", lambda wid: {
+        "world_id": wid, "root_path": str(tmp_path), "label": "テスト", "last_synced_at": None,
+        "last_scan_report": legacy_cached, "last_scan_report_at": "2026-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
+
+    r = client.get("/worlds/w1/status")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scanned"] == 5 and body["indexed"] == 5
+    assert body["sensitive_excluded"] == 0
+    assert body["unreachable_as_text"] == 0
+    assert body["unreachable_as_text_by_ext"] == {}
+    assert body["counts_as_of"] is None   # 未集計として明示する（古い時刻を伴う0件に見せない）
+
+
+def test_status_counts_as_of_returns_to_timestamp_after_full_scan_report(client, monkeypatch, tmp_path):
+    """旧形式（欠落あり）の間は `counts_as_of` が `None` になるが、実際の集計（3項目を持つ完全な
+    `last_scan_report`）が保存された後は、その時刻がそのまま返る——`未集計`扱いは欠落時だけ。"""
+    from sherpa import corpus_docs, store
+    complete = {**corpus_docs.empty_scan_report(), "scanned": 5, "indexed": 5}
+    monkeypatch.setattr(store, "get_world_status_row", lambda wid: {
+        "world_id": wid, "root_path": str(tmp_path), "label": "テスト", "last_synced_at": None,
+        "last_scan_report": complete, "last_scan_report_at": "2026-02-01T00:00:00+00:00"})
+    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
+
+    r = client.get("/worlds/w1/status")
+    assert r.status_code == 200, r.text
+    assert r.json()["counts_as_of"] == "2026-02-01T00:00:00+00:00"
+
+
 def test_status_es_chunks_is_none_when_available_false_or_error_set(client, monkeypatch, tmp_path):
     """ES は `available is True` かつ `error` 無しの時だけ chunks を件数として見せる
     （delete_failed で旧索引が残ったまま「0件」を返す・bulk_errors が投入予定件数を実成功件数と

@@ -745,8 +745,13 @@ def test_usage_stats_limits_aggregates_by_provider_and_ignores_legacy_rows_witho
         "synthesis_truncated": False, "search_truncated": 3, "auto_continues": 1})
     _turn_with_limits(conv["id"], "q2", lens="qa", provider="codex", limits={
         "tool_result_clipped": 0, "total_budget_hit": True, "context_compactions": 0,
-        "synthesis_truncated": True, "search_truncated": 0, "auto_continues": 0})
+        "synthesis_truncated": True, "search_truncated": 0, "auto_continues": 0,
+        "depth_escalated": True})
     _turn_with_limits(conv["id"], "q3", lens="qa", provider="codex", limits=None)   # 旧行（キー無し）
+    # S4（縮退の可視化と計数）: バックエンド不調も同じフラットな bool 項目として集計へ乗る。
+    _turn_with_limits(conv["id"], "q4", lens="impact", provider="codex", limits={
+        "backend_unavailable_fulltext": True, "backend_unavailable_graph": True,
+        "graph_reingest_required": True})
 
     after = _limits_map()
     before_codex = before.get("codex", {})
@@ -755,7 +760,7 @@ def test_usage_stats_limits_aggregates_by_provider_and_ignores_legacy_rows_witho
     def _delta(key):
         return (after_codex.get(key) or 0) - (before_codex.get(key) or 0)
 
-    assert _delta("turns") == 3                        # 旧行も母数には入る
+    assert _delta("turns") == 4                        # 旧行も母数には入る
     assert _delta("tool_result_clipped_turns") == 1     # 1回以上だったターン数（q1のみ）
     assert _delta("tool_result_clipped_total") == 2     # 合計回数
     assert _delta("total_budget_hit_turns") == 1        # bool 系（q2のみ）
@@ -766,6 +771,10 @@ def test_usage_stats_limits_aggregates_by_provider_and_ignores_legacy_rows_witho
     assert _delta("search_truncated_total") == 3
     assert _delta("auto_continues_turns") == 1
     assert _delta("auto_continues_total") == 1
+    assert _delta("backend_unavailable_fulltext_turns") == 1   # S4: 全文検索の不調（q4のみ）
+    assert _delta("backend_unavailable_graph_turns") == 1      # S4: グラフの接続断（q4のみ）
+    assert _delta("graph_reingest_required_turns") == 1        # S4: 世代不一致は別項目
+    assert _delta("depth_escalated_turns") == 1         # bool 系（q2のみ・深さの自動引き上げ）
 
 
 def test_usage_stats_stop_kind_folds_out_of_vocabulary_values_into_unknown():
@@ -2527,8 +2536,11 @@ def test_usage_stats_from_to_is_half_open_and_matches_tool():
             return out
 
         # usage_conversations: 会話は同じでも user ターン数が期間で変わる（2ターン→1ターン）。
-        conv_wide = _tool("usage_conversations", base, end)
-        conv_narrow = _tool("usage_conversations", base, switch)
+        # `uid` で自分の会話だけに絞る——この表は**上位 N 件**（既定 20・`_clamp_limit`）で、
+        # 同じ期間に他のテストが作った会話が多いと、2ターンのこの会話が上位から押し出されて
+        # 見つからなくなる（期間境界の検証とは無関係の取りこぼし）。
+        conv_wide = _tool("usage_conversations", base, end, uid=uid)
+        conv_narrow = _tool("usage_conversations", base, switch, uid=uid)
         wide_turns = next(c["user_turns"] for c in conv_wide["conversations"]
                           if c["conversation_id"] == cid)
         narrow_turns = next(c["user_turns"] for c in conv_narrow["conversations"]
@@ -2686,7 +2698,7 @@ def test_admin_usage_quality_run_records_condition_and_executed_period():
         assert r1.status_code == 200, r1.text
         assert r1.json()["inserted"] is True
         # 同じ rounds=0 でも条件が違えば別行に分かれる。
-        r2 = _post(run_deep, "depth2-standard", 0, base, switch, correct=5)
+        r2 = _post(run_deep, "depth2-quick", 0, base, switch, correct=5)
         assert r2.status_code == 200, r2.text
         # 実行期間が照会期間からはみ出すランは母集団に入らない。
         r3 = _post(run_out, "depth2-deep", 3, switch, end + timedelta(hours=1), correct=1)
@@ -2696,7 +2708,7 @@ def test_admin_usage_quality_run_records_condition_and_executed_period():
         by_cond = {(r["condition"], r["rounds"]): r for r in out["by_rounds"]}
         assert by_cond[("main", 0)]["correct"] == 4
         assert by_cond[("main", 0)]["wrong_assertion"] == 1
-        assert by_cond[("depth2-standard", 0)]["correct"] == 5
+        assert by_cond[("depth2-quick", 0)]["correct"] == 5
         assert ("depth2-deep", 3) not in by_cond, "実行期間が照会期間を超えるランが集計に入った"
 
         # 実行期間の終端が照会の上限ちょうど（executed_to == to）のランは含む。

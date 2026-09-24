@@ -86,7 +86,7 @@ export function applyConversationScope(messages) {   // 会話を開いた時、
   S.tools = (sameDir && sc && sc.tools) ? { ...sc.tools } : { grep: true, fulltext: true, graph: true };
   // 復元値が全ON（既定）なら未操作、1軸でもOFFなら明示状態にする
   // （`inquiry.js::toolsExplicitForRestore` 参照・無操作の次送信で非既定値が消えないように）。
-  S.toolsExplicit = toolsExplicitForRestore(S.tools);
+  S.toolsExplicit = toolsExplicitForRestore(S.tools, (sameDir && sc) ? sc.tools_explicit : undefined);
   setToolsDetailsOpen(false);
   if (S.scopeTree) renderScopePanel(S.scopeTree);
   updateScopeHeader(sc);   // setScopeLabel 経由で refreshInquirySummary() も呼ぶ（チップ/要約を追随）
@@ -163,7 +163,7 @@ function updateScopeVisibility() {   // 範囲セレクタは「ナレッジ参�
   $('depth-row').hidden = !S.kb;   // SC-6c: 調べる深さも社内資料を参照するがONのときだけ選べる
   refreshInquirySummary();
 }
-function setKb(on) {                  // ナレッジ参照トグル（既定オフ）。オンで範囲指定が選べる
+export function setKb(on) {           // ナレッジ参照トグル（既定ON・決定2026-09-19）。オンで範囲指定が選べる
   S.kb = S.kbLocked ? true : on;      // Codex構成はON固定（decision 2026-08-15）
   const b = $('kbtoggle'); b.setAttribute('aria-pressed', S.kb ? 'true' : 'false');
   b.classList.toggle('on', S.kb); b.querySelector('b').textContent = S.kb ? 'オン' : 'オフ';

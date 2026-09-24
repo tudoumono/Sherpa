@@ -108,9 +108,9 @@ def test_es_search_parent_return_chunk_tier_keeps_full_chunk_text(monkeypatch, t
     assert h["text"] == long_text
 
 
-def test_es_search_parent_return_full_tier_omits_text_truncated(monkeypatch, tmp_path):
-    """同じ長い子チャンク本文でも "full" へ展開できたら `text_truncated` は付かない
-    （最終 text は rag.md 由来の別文字列に置き換わる）。"""
+def test_es_search_parent_return_region_tier_omits_text_truncated(monkeypatch, tmp_path):
+    """同じ長い子チャンク本文でも領域（"region"）へ展開できたら `text_truncated` は付かない
+    （最終 text は rag.md 由来の別文字列に置き換わる）。全文（"full"）段は無い（決定 2026-09-21）。"""
     world = "parent-return-full-omits-truncated-world"
     long_text = "z" * 600
     full_md = "<!-- chunk:cf1 -->\n" + "F" * 50 + "\n"   # 予算に余裕で収まる小さな全文
@@ -119,5 +119,5 @@ def test_es_search_parent_return_full_tier_omits_text_truncated(monkeypatch, tmp
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"full.docx": full_md})
     res, _, _, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     h = res["hits"][0]
-    assert h["tier"] == "full"
+    assert h["tier"] == "region"
     assert "text_truncated" not in h

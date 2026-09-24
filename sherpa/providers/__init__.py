@@ -401,12 +401,19 @@ def get_provider(settings: dict | None = None, system_settings: dict | None = No
 
     回答方針（system プロンプト・#2）を provider に載せる（LLM 系は system メッセージに前置）。
 
-    検索アシスタント（`sherpa/search_helper.py`）: agent=openai
-    （`provider_id == "openai"`）かつ per-user `search_helper` が解決できた時だけ `p._sub` を設定する
-    （ハイブリッド有効化のゲート）。他頭脳（heuristic/codex/gemini/bedrock/ollama）と OpenAI の
-    `_UnwiredProvider`（provider_id ''）は `provider_id` ゲートで影響を受けない。解決失敗（未設定／
-    鍵未設定）は例外にせず `resolve` が None を返す＝OFF 縮退（`p._sub` は `Provider` のクラス属性
-    `None` のまま）。
+    worker（下調べ役・`sherpa/search_helper.py`）: 頭脳 × `search_helper` の組合せ表（提案書
+    docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）に従い `p._sub` を設定する。
+    **openai/ollama 頭脳には必ず worker が付く**（下調べ役なしの選択肢は無い＝常に
+    「worker ＋ orchestrator/evaluator」のハイブリッド1経路）:
+    `search_helper=openai`/`ollama` は安いモデルの worker、空（未設定）・鍵未設定は
+    `search_helper.self_worker()`＝頭脳と同じ接続・同じモデルの worker。Ollama 頭脳 ×
+    `search_helper=openai` はクラウド1社の方針で**無視**し（honest failure にも黙った切替にも
+    しない・理由は監査側 `chat_service._audit_search_helper_ignored_reason` が別途記録する）、
+    無視した結果も頭脳自身の worker へ倒す。他頭脳（heuristic/codex/gemini/bedrock）と
+    `_UnwiredProvider`（provider_id ''）は `provider_id` ゲートで影響を受けない（Gemini/Bedrock は
+    §2.1 の対象外＝`_sub` は `None` のまま＝非ハイブリッドの単独ループ）。解決失敗（非空の
+    不正値・解決先モデル破損）は `resolve` が例外を送出し `p._search_helper_error` に理由を残す
+    ＝`_sub` は付けず `run()` が honest failure で止める（黙って別の worker へ倒さない）。
 
     本関数が1ターンの唯一の入口＝`system_settings` をここで1回だけ読み、メインプロバイダの選択
     （`_select_provider`）・検索アシスタント（`search_helper.resolve`）まで同じスナップショットを
@@ -436,7 +443,8 @@ def get_provider(settings: dict | None = None, system_settings: dict | None = No
     sys_s = system_settings if system_settings is not None else _store._read_system_settings_fresh()
     p = _select_provider(s, sys_s)
     p.system_prompt = (s.get("system_prompt") or "").strip()
-    if getattr(p, "provider_id", "") == "openai":
+    provider_id = getattr(p, "provider_id", "")
+    if provider_id in ("openai", "ollama"):
         from .. import search_helper as _sh
         # 検索アシスタント（`sherpa/search_helper.py`）: 利用者ごとの1設定から組み立てる。非空の
         # 不正値（未知の選択肢・解決先の管理者モデル破損等）は黙って OFF 縮退させず、
@@ -448,7 +456,20 @@ def get_provider(settings: dict | None = None, system_settings: dict | None = No
             p._search_helper_error = str(e)
         else:
             if helper is not None:
-                p._sub = helper
+                # 頭脳 × search_helper の組合せ表（§2.1）: Ollama 頭脳には openai の下調べ役を
+                # 付けない（クラウド1社の方針・設定は増やさず無視するだけ＝honest failure にも
+                # 黙った別プロバイダへの切替にもしない）。無視した事実は監査側が別途記録する。
+                # 判定基準は `_sh.is_cloud_helper_ignored`（正規化した設定値）に統一する
+                # （監査側の無視理由判定と同じ基準を使う＝一方だけ鍵の有無で結果がずれない）。
+                # 無視した結果も「worker 無し」にはせず頭脳自身の worker へ倒す（下の分岐）。
+                if _sh.is_cloud_helper_ignored(provider_id, s):
+                    helper = None
+            if helper is None:
+                # 「下調べ役なし」は選べない＝頭脳と同じ接続・同じモデルを worker として据える。
+                helper = _sh.self_worker(
+                    provider_id, p.model,
+                    key=getattr(p, "_key", None), url=getattr(p, "_url", None))
+            p._sub = helper
     return p
 
 

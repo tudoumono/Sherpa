@@ -88,7 +88,7 @@ class OllamaProvider(_GenProvider):
         sys = (self.system_prompt + "\n\n" if self.system_prompt else "") + \
             agentic_search.system_prompt(_eff_tools)
         # 調べる深さ（調べ方ブロック §3.2・SC-6c）: OpenAIProvider._agentic_loop と同じ計算
-        # （実効基準値＝system_settings→env→コード既定・既定 "standard" は倍率×1＝挙動不変）。
+        # （実効基準値＝system_settings→env→コード既定に倍率・既定 "standard" は倍率×1＝挙動不変）。
         profile = (ctx.scope_meta or {}).get("depth_profile")
         max_turns = depth_profile_mod.effective_max_turns(self._system_settings, agentic_search.MAX_TURNS, profile)
         # 利用統計（answer.usage）へ「実際にループへ渡した上限」を残す（再計算せず同じ値を記録する）。
@@ -108,7 +108,7 @@ class OllamaProvider(_GenProvider):
             layer=(ctx.scope_meta or {}).get("layer"),
             max_turns=max_turns, max_hits=max_hits, window_cap=window_cap,
             system_settings=self._system_settings,
-            tools_pref=_tools_pref, tools_availability=ctx.tools_availability)
+            tools_pref=_tools_pref, tools_availability=ctx.tools_availability, uid=ctx.uid)
 
     def _stream(self, prompt: str, completion: _CompletionState | None = None) -> Iterator[str]:
         body = json.dumps({"model": self.model, "stream": True,
@@ -143,7 +143,14 @@ class OllamaProvider(_GenProvider):
 
     def _attribute(self, text: str, digest: str, ev_map: dict, call_budget=None) -> set:
         from .. import agentic_search
-        return agentic_search.attribute_openai_style(
+        # 帰属呼び出し自体の usage を `self._last_usage` へ残す（`_stream` と同じ置き場——
+        # 呼び出し元が回収して `chat-review` へ記録する・`base.py::_log_chat_usage` docstring 参照）。
+        _usage = agentic_search._new_usage_acc()
+        ids = agentic_search.attribute_openai_style(
             llm.ollama_url(self._url, "/api/chat", system_settings=self._system_settings),
             llm.JSON_HEADERS, self.model, True,
-            text, digest, ev_map, self._timeout, call_budget=call_budget)
+            text, digest, ev_map, self._timeout, usage=_usage, call_budget=call_budget)
+        if agentic_search._usage_or_none(_usage):
+            self._last_usage = _usage_meta(self.provider_id, self.model, **_usage,
+                                           system_settings=self._system_settings)
+        return ids

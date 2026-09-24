@@ -2,6 +2,7 @@ AnnouncementOrderError
 ClientOpIdConflictError
 DEFAULT_SYSTEM_PROMPT
 ForkNotAllowedError
+MAPPING_VERSION
 MESSAGE_FEEDBACK_COMMENT_MAX_LEN
 MESSAGE_FEEDBACK_TAGS
 OpenAIEndpointSettingsConflict
@@ -67,6 +68,7 @@ annotations
 api_key_by_hash
 apply_system_settings_and_revoke_if_disabled
 audit
+backfill_all
 backfill_doc_count
 backfill_manifest_and_doc_count
 catchup_ollama_allowlist_for_env_seeded_url_v2
@@ -92,6 +94,7 @@ depth_quality_stats
 dict_row
 document_exists
 downgrade_orphaned_extracting_runs
+ensure_rows
 expired_workspace_files
 fail_close_if_extracting
 finish_ingest_run
@@ -137,6 +140,7 @@ list_workspace_files
 list_worlds_db
 live_workspace_rel_paths
 mark_workspace_file_expired
+metrics_from_answer
 migrate_marker_if_legacy_exists
 no_live_upload_for_path
 owns_assistant_message
@@ -177,6 +181,8 @@ touch_api_key
 update_announcement
 update_ingest_run_progress
 update_settings
+upsert
+upsert_best_effort
 upsert_message_feedback
 upsert_user
 upsert_world

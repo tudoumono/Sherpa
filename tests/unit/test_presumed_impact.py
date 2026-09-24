@@ -12,6 +12,8 @@ secRV 範囲外是正 追補（2026-07-19・RV指摘 MED-1）: `impact_service.r
 """
 from __future__ import annotations
 
+import json
+
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
 from sherpa import grep_tool, impact_service as I
 
@@ -235,31 +237,41 @@ def test_run_impact_no_truncation_output_unchanged(monkeypatch):
 # import 時に一度だけ確定する定数は実プロセスを新規に起こして検証する（`_fresh_import`）。
 # （`ingest.world_neo4j.IMPACT_MAX_DEPTH` と同じ env を共用・循環 import のため定数は複製）。
 
+def _impact_max_depth_env_script() -> str:
+    return (
+        "import inspect, json\n"
+        "import sherpa.impact_service as m\n"
+        "print(json.dumps({\n"
+        "    'impact_max_depth': m.IMPACT_MAX_DEPTH,\n"
+        "    'run_impact_depth': inspect.signature(m.run_impact).parameters['depth'].default,\n"
+        "}))\n"
+    )
+
+
 def test_impact_max_depth_fresh_import_env_unset_is_default():
-    assert FI.fresh_import_attr("sherpa.impact_service", "IMPACT_MAX_DEPTH",
-                                env={"SHERPA_IMPACT_MAX_DEPTH": None}) == 8
+    out = json.loads(FI.run_script(_impact_max_depth_env_script(),
+                                   env={"SHERPA_IMPACT_MAX_DEPTH": None}))
+    assert out["impact_max_depth"] == 8
 
 
 def test_impact_max_depth_fresh_import_env_valid_value():
-    assert FI.fresh_import_attr("sherpa.impact_service", "IMPACT_MAX_DEPTH",
-                                env={"SHERPA_IMPACT_MAX_DEPTH": "12"}) == 12
+    """正しい値が反映されることに加え、`run_impact` の `depth` 既定値が `IMPACT_MAX_DEPTH` に
+    揃っていること（既定値どうしが偶然一致するだけの「旧リテラル `depth=8` への退行」を検出
+    できない自己言及を避けるため、既定と異なる値で確認）も同じ fresh import でまとめて確認する。"""
+    out = json.loads(FI.run_script(_impact_max_depth_env_script(),
+                                   env={"SHERPA_IMPACT_MAX_DEPTH": "20"}))
+    assert out["impact_max_depth"] == 20
+    assert out["run_impact_depth"] == 20
 
 
 def test_impact_max_depth_fresh_import_env_invalid_falls_back_to_default():
     for bad in ("0", "65", "abc"):
-        assert FI.fresh_import_attr("sherpa.impact_service", "IMPACT_MAX_DEPTH",
-                                    env={"SHERPA_IMPACT_MAX_DEPTH": bad}) == 8, bad
+        out = json.loads(FI.run_script(_impact_max_depth_env_script(),
+                                       env={"SHERPA_IMPACT_MAX_DEPTH": bad}))
+        assert out["impact_max_depth"] == 8, bad
 
 
 def test_impact_max_depth_env_change_after_import_has_no_effect(monkeypatch):
     before = I.IMPACT_MAX_DEPTH
     monkeypatch.setenv("SHERPA_IMPACT_MAX_DEPTH", "40")
     assert I.IMPACT_MAX_DEPTH == before == 8
-
-
-def test_run_impact_default_depth_param_is_impact_max_depth():
-    """既定値と異なる env（20）で fresh import し、`run_impact` の `depth` 既定値が実際に
-    `IMPACT_MAX_DEPTH` を参照していることを確認する（旧リテラル `depth=8` への退行を検出できる形）。"""
-    assert FI.fresh_import_param_default(
-        "sherpa.impact_service", "run_impact", "depth",
-        env={"SHERPA_IMPACT_MAX_DEPTH": "20"}) == 20

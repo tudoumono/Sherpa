@@ -69,7 +69,7 @@ const OPENAI_ENDPOINT_KIND_LABELS = {
 // 使えるモデル（model_catalog）。用途名 → 平文の表示名（個人設定ページの既存の言い回しに合わせる）。
 const MC_USAGE_LABELS = {
   chat: 'チャット', intent: '依頼の仕分け',
-  embed: '検索の索引づくり', route: '振り分け', subsearch: '下調べ', codex: 'Codex',
+  embed: '検索の索引づくり', route: '振り分け', subsearch: '下調べ役のモデル（下調べ役に適用）', codex: 'Codex',
   render: '検索用文書の整形',
 };
 const MC_COLUMN_LABELS = { ollama: 'ローカル（Ollama）', codex: 'Codex' };
@@ -176,6 +176,12 @@ let _depthProfileBaseline = {};    // put キー -> 文字列化した configure
 // 他の6項目と同じく configured を基準にする（''=未設定＝「環境設定の既定に従う」の空選択肢）。
 let _depthReasoningBaseline = '';
 let _agenticToolLimitBaseline = '';
+let _maxReviewRoundsBaseline = '';
+let _codexWorkerModelBaseline = '';
+let _codexSessionRetentionDaysBaseline = '';
+// 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。configured を基準にする
+// （''=未設定＝「標準」の空選択肢・depth-base-codex-reasoning と同型）。
+let _codexModeBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
 
 // 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
@@ -1442,7 +1448,7 @@ function renderProviderTab(view) {
 // 「調査・回答」タブは接続設定と独立して描画・リセットする。
 function renderResearchTab(view) {
   renderAgenticBudget(view.agentic_budget);   // BUDGET-1（§3.4）
-  renderAgenticBudgetWindow(view.agentic_budget);      // BUDGET-2（§3.4）
+  renderCodexMode(view.codex_mode);
   renderDepthProfile(view.depth_profile);
   const limit = view.agentic_tool_limit;
   _agenticToolLimitBaseline = limit.configured == null ? '' : String(limit.configured);
@@ -1450,6 +1456,26 @@ function renderResearchTab(view) {
   $('agentic-max-tools-per-turn-hint').textContent = limit.configured == null
     ? `未設定です（環境設定の既定 ${limit.effective} 件が適用されます）。`
     : `この値で固定中です（環境設定の既定: ${limit.default} 件）。`;
+  const rounds = view.max_review_rounds;
+  _maxReviewRoundsBaseline = rounds.configured == null ? '' : String(rounds.configured);
+  $('max-review-rounds').value = _maxReviewRoundsBaseline;
+  $('max-review-rounds-hint').textContent = `現在の適用値: ${rounds.effective} 回。既定: ${rounds.default} 回。`
+    + (rounds.configured == null ? '未設定です。' : 'この値で固定中です。');
+  const workerModel = view.codex_worker_model;
+  _codexWorkerModelBaseline = workerModel.configured == null ? '' : String(workerModel.configured);
+  $('codex-worker-model').value = _codexWorkerModelBaseline;
+  $('codex-worker-model').placeholder = `既定: ${workerModel.default}`;
+  $('codex-worker-model-hint').textContent = workerModel.configured == null
+    // `effective` は Codex(OpenAI 系) の値（Azure は本体と同じデプロイ名へ倒れる）。構成は利用者ごとの
+    // 設定なので、ローカル（Ollama）構成の利用者にはここに出ない「本体と同じモデル名」が使われる。
+    ? `未設定です（実際に適用される値: ${workerModel.effective}。ローカル（Ollama）構成の利用者は本体と同じモデル名）。`
+    : `この値で固定中です（既定: ${workerModel.default}）。この値は全構成に適用されるため、ローカル（Ollama）構成の利用者がいる環境では Ollama 側にも存在するモデル名にしてください。`;
+  const retention = view.codex_session_retention_days;
+  _codexSessionRetentionDaysBaseline = retention.configured == null ? '' : String(retention.configured);
+  $('codex-session-retention-days').value = _codexSessionRetentionDaysBaseline;
+  $('codex-session-retention-days-hint').textContent =
+    `現在の適用値: ${retention.effective} 日（0=無制限）。既定: ${retention.default} 日。`
+    + (retention.configured == null ? '未設定です。' : 'この値で固定中です。');
   const parallel = view.embed_parallel;
   _embedParallelBaseline = parallel.configured == null ? '' : String(parallel.configured);
   $('embed-parallel').value = _embedParallelBaseline;
@@ -1458,8 +1484,35 @@ function renderResearchTab(view) {
     : `この値で固定中です（既定: ${parallel.default} 件）。`;
 }
 
+// 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。depth-base-codex-reasoning
+// と同型（空選択肢=未設定=既定の「標準」）。
+function renderCodexMode(cm) {
+  cm = cm || {};
+  $('codex-mode').value = cm.configured || '';
+  _codexModeBaseline = cm.configured || '';
+  $('codex-mode-hint').textContent = cm.configured == null
+    ? '未設定です（既定の標準が適用されます）。'
+    : 'この値で固定中です（既定: 標準）。';
+}
+
+function codexModeChanged() {
+  return $('codex-mode').value !== _codexModeBaseline;
+}
+
 function agenticToolLimitChanged() {
   return $('agentic-max-tools-per-turn').value.trim() !== _agenticToolLimitBaseline;
+}
+
+function maxReviewRoundsChanged() {
+  return $('max-review-rounds').value.trim() !== _maxReviewRoundsBaseline;
+}
+
+function codexWorkerModelChanged() {
+  return $('codex-worker-model').value.trim() !== _codexWorkerModelBaseline;
+}
+
+function codexSessionRetentionDaysChanged() {
+  return $('codex-session-retention-days').value.trim() !== _codexSessionRetentionDaysBaseline;
 }
 
 function embedParallelChanged() {
@@ -1669,129 +1722,7 @@ function validateAgenticBudgetInputs() {
   return errors;
 }
 
-// ===== BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定・
-// モデルが一度に読める量との連動）: 現在のモデルのヒント表示＋一度に読める量の管理者登録表（追加/上書き/削除）。=====
-
-const _MODEL_WINDOW_PROVIDER_LABELS = {
-  openai: 'OpenAI', gemini: 'Gemini（Google）', bedrock: 'AWS Bedrock (Claude)',
-  ollama: 'ローカル（Ollama）', codex: 'Codex',
-};
-const _MODEL_WINDOW_SOURCE_LABELS = {
-  registered: 'この画面で登録した値', api: 'AI から自動取得', seed: 'このアプリに組み込みの一覧',
-  unknown: '不明',
-};
-
-// 現在のモデル・一度に読める量・出所・自動調整後の上限（ヒント表示のみ・入力欄ではない）。
-function renderAgenticBudgetWindow(ab) {
-  const status = $('agentic-budget-window-status');
-  const unknownBox = $('agentic-budget-window-unknown');
-  const w = (ab || {}).window || {};
-  if (!status || !unknownBox) return;
-  if (w.provider === 'codex') {
-    status.textContent = 'Codex は対象外です。コンテキスト上限による情報量の調整は API 経路に適用します。';
-    unknownBox.hidden = true;
-    return;
-  }
-  const providerLabel = _MODEL_WINDOW_PROVIDER_LABELS[w.provider] || w.provider || '不明';
-  const modelLabel = w.model || '(未設定)';
-  if (w.source === 'unknown' || w.window_tokens == null) {
-    status.textContent = `現在のモデル: ${providerLabel} / ${modelLabel}`;
-    unknownBox.hidden = false;
-  } else {
-    const sourceLabel = _MODEL_WINDOW_SOURCE_LABELS[w.source] || w.source;
-    status.textContent = `現在のモデル: ${providerLabel} / ${modelLabel}　一度に読める量: `
-      + `${w.window_tokens.toLocaleString('ja-JP')} トークン（出所: ${sourceLabel}）　`
-      + `自動調整後の上限: ${_fmtBytesHuman(w.derived_cap_bytes)}（${_fmtDocumentPages(w.derived_cap_bytes)}）`;
-    unknownBox.hidden = true;
-  }
-}
-
-let _modelWindowsBaseline = {};   // render() 時点の登録値（"provider:model" -> tokens）
-
-function _modelWindowsRowHtml(provider, model, tokens) {
-  const providers = ['openai', 'gemini', 'ollama', 'bedrock'];
-  // 既存の Codex 登録を別プロバイダへ変換せず、適用対象外と表示して削除・変更可能にする。
-  const savedCodex = provider === 'codex'
-    ? '<option value="codex" selected disabled>Codex（適用対象外・保存済み）</option>' : '';
-  const opts = savedCodex + providers.map((p) =>
-    `<option value="${esc(p)}"${p === provider ? ' selected' : ''}>${esc(_MODEL_WINDOW_PROVIDER_LABELS[p] || p)}</option>`
-  ).join('');
-  return `<tr>
-    <td><select class="mw-provider">${opts}</select></td>
-    <td><input type="text" class="mw-model" value="${esc(model || '')}" placeholder="例: gpt-4o" autocomplete="off"></td>
-    <td><input type="number" class="mw-tokens" value="${tokens != null ? tokens : ''}" min="1" max="10000000" step="1" style="max-width:140px"></td>
-    <td><button class="btn-ghost mw-remove" type="button">削除</button></td>
-  </tr>`;
-}
-
-function renderModelWindowsTable(mw) {
-  const tbody = $('agentic-model-windows-rows');
-  if (!tbody) return;
-  const configured = (mw || {}).configured || {};
-  _modelWindowsBaseline = { ...configured };
-  tbody.innerHTML = Object.keys(configured).sort().map((key) => {
-    const [provider, ...rest] = key.split(':');
-    return _modelWindowsRowHtml(provider, rest.join(':'), configured[key]);
-  }).join('');
-}
-
-// 行の削除は動的に増減する要素のため、コンテナへのイベント委譲で拾う（他の動的リストと同じ流儀・
-// `_ekIssueOpen`/`_mcTable` 等の直下トップレベル `if (elem) elem.addEventListener(...)` に揃える）。
-const _mwAddBtn = $('agentic-model-windows-add');
-if (_mwAddBtn) _mwAddBtn.addEventListener('click', () => {
-  const tbody = $('agentic-model-windows-rows');
-  if (tbody) tbody.insertAdjacentHTML('beforeend', _modelWindowsRowHtml('openai', '', null));
-});
-const _mwRows = $('agentic-model-windows-rows');
-if (_mwRows) _mwRows.addEventListener('click', (ev) => {
-  if (ev.target && ev.target.classList.contains('mw-remove')) {
-    const tr = ev.target.closest('tr');
-    if (tr) tr.remove();
-  }
-});
-
-// 現在の行の内容（空行は無視）を "provider:model" -> tokens の dict にする。
-function _collectModelWindowsRows() {
-  const rows = Array.from(document.querySelectorAll('#agentic-model-windows-rows tr'));
-  const out = {};
-  rows.forEach((tr) => {
-    const provider = (tr.querySelector('.mw-provider') || {}).value || '';
-    const model = ((tr.querySelector('.mw-model') || {}).value || '').trim();
-    const tokensRaw = ((tr.querySelector('.mw-tokens') || {}).value || '').trim();
-    if (!model || tokensRaw === '') return;   // 未入力行は無視（保存対象にしない）
-    out[`${provider}:${model}`] = Number(tokensRaw);
-  });
-  return out;
-}
-
-function modelWindowsTableChanged() {
-  return JSON.stringify(_collectModelWindowsRows()) !== JSON.stringify(_modelWindowsBaseline);
-}
-
-function collectModelWindowsTable(body) {
-  if (!modelWindowsTableChanged()) return;
-  const rows = _collectModelWindowsRows();
-  body.model_context_windows = Object.keys(rows).length ? rows : null;
-}
-
-// 保存操作の事前チェック（422 の配列表示が読みにくいため先に弾く・他の validate* と同じ流儀）。
-function validateModelWindowsInputs() {
-  const errors = [];
-  Array.from(document.querySelectorAll('#agentic-model-windows-rows tr')).forEach((tr) => {
-    const model = ((tr.querySelector('.mw-model') || {}).value || '').trim();
-    const tokensRaw = ((tr.querySelector('.mw-tokens') || {}).value || '').trim();
-    if (!model && tokensRaw === '') return;   // 完全な空行は無視
-    if (!model) { errors.push('モデルが一度に読める量の登録: モデル名を入力してください'); return; }
-    const n = Number(tokensRaw);
-    if (tokensRaw === '' || !Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 10_000_000) {
-      errors.push(`モデルが一度に読める量の登録（${model}）: 一度に読める量（トークン数）は1〜10,000,000の整数で指定してください`);
-    }
-  });
-  return errors;
-}
-
 function renderModelsTab(view) {
-  renderModelWindowsTable((view.agentic_budget || {}).model_windows);   // BUDGET-2（§3.4）
   renderModelCatalog(view.model_catalog, (view.cloud || {}).provider);
 }
 
@@ -1946,12 +1877,13 @@ async function save() {
   const chatMaxTurnsErrors = validateChatMaxTurnsInputs();
   // BUDGET-1（§3.4）: agentic search の tool-result バイト予算も同じ理由で保存前に弾く。
   const agenticBudgetErrors = validateAgenticBudgetInputs();
-  // BUDGET-2（§3.4）: モデルが一度に読める量の登録表も同様に保存前に弾く。
-  const modelWindowsErrors = validateModelWindowsInputs();
-  const rangeErrors = depthProfileErrors.concat(chatMaxTurnsErrors).concat(agenticBudgetErrors)
-    .concat(modelWindowsErrors);
+  const rangeErrors = depthProfileErrors.concat(chatMaxTurnsErrors).concat(agenticBudgetErrors);
   const toolLimit = $('agentic-max-tools-per-turn');
   if (!toolLimit.checkValidity()) rangeErrors.push('ツール実行数の上限は1〜256の整数で指定してください');
+  const maxReviewRounds = $('max-review-rounds');
+  if (!maxReviewRounds.checkValidity()) rangeErrors.push('最大の見直しの回数は1〜32の整数で指定してください');
+  const codexSessionRetentionDays = $('codex-session-retention-days');
+  if (!codexSessionRetentionDays.checkValidity()) rangeErrors.push('Codex の会話セッションを保存する日数は0以上の整数で指定してください');
   const embedParallel = $('embed-parallel');
   if (!embedParallel.checkValidity()) rangeErrors.push('埋め込みの同時送信数は1〜16の整数で指定してください');
   if (rangeErrors.length) {
@@ -2035,13 +1967,26 @@ async function save() {
   if (agenticToolLimitChanged()) {
     body.agentic_max_tools_per_turn = toolLimit.value === '' ? null : Number(toolLimit.value);
   }
+  if (maxReviewRoundsChanged()) {
+    body.max_review_rounds = maxReviewRounds.value === '' ? null : Number(maxReviewRounds.value);
+  }
+  if (codexWorkerModelChanged()) {
+    const v = $('codex-worker-model').value.trim();
+    body.codex_worker_model = v === '' ? null : v;
+  }
+  if (codexModeChanged()) {
+    body.codex_mode = $('codex-mode').value || null;
+  }
+  if (codexSessionRetentionDaysChanged()) {
+    body.codex_session_retention_days = codexSessionRetentionDays.value === ''
+      ? null : Number(codexSessionRetentionDays.value);
+  }
   if (embedParallelChanged()) {
     body.embed_parallel = embedParallel.value === '' ? null : Number(embedParallel.value);
   }
   collectChatMaxTurns(body);   // 同時実行の上限（変わった項目だけ送る）
   if (chatExamplesChanged()) body.chat_examples = collectChatExamples();   // チャットの質問例
   collectAgenticBudget(body);  // BUDGET-1（§3.4）: 検索の情報量予算（変わった項目だけ送る）
-  collectModelWindowsTable(body);   // BUDGET-2（§3.4）: モデルが一度に読める量の登録表（変わっていれば送る）
   try {
     const view = await api('PUT', '/admin/settings', body);
     render(view);
@@ -2151,8 +2096,12 @@ async function resetResearchTab() {
   body.depth_base_codex_reasoning = null;
   body.agentic_max_tools_per_turn = null;
   body.embed_parallel = null;
+  body.max_review_rounds = null;
+  body.codex_worker_model = null;
+  body.codex_session_retention_days = null;
   body.agentic_budget_per_result = null;
   body.agentic_budget_total = null;
+  body.codex_mode = null;
   let view;
   try { view = await _putResetBody(body, resEl); } catch (e) { return; }
   _view = view;
@@ -2167,7 +2116,7 @@ async function resetModelsTab() {
   // 対象キーのみ・null で送る（他タブの未保存編集は一切含めない）。model_catalog を丸ごと
   // 既定へ戻すため、プロバイダタブ側に表示されている埋め込みデプロイ名も一緒に戻る
   // （同じキーの一部＝このリセットが正しく対象にする範囲）。
-  const body = { model_catalog: null, model_context_windows: null };
+  const body = { model_catalog: null };
   let view;
   try { view = await _putResetBody(body, resEl); } catch (e) { return; }
   _view = view;
@@ -2175,7 +2124,6 @@ async function resetModelsTab() {
   // 列プロバイダは「プロバイダタブの現在の未保存選択」に合わせる（保存済み値へ戻さない）。
   _mcCloudProvider = selectedCloudProvider();
   renderModelCatalogTable();
-  renderAgenticBudgetWindow(view.agentic_budget);
   syncEmbedDeploymentField();   // プロバイダ＋接続先タブ側の表示も新しい実効値へ追従させる
   applyConfigChangedHighlights(view);
   refreshTabDots();
@@ -2317,9 +2265,9 @@ const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
     || openaiEndpointChanged() || mcEmbedChanged()
     || chatMaxTurnsChanged() || chatExamplesChanged(),
-  research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged()
-    || agenticBudgetChanged(),
-  models: () => mcCatalogChangedExcludingEmbed() || modelWindowsTableChanged(),
+  research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged() || maxReviewRoundsChanged()
+    || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged(),
+  models: () => mcCatalogChangedExcludingEmbed(),
   ingest: () => armsChanged() || legacyChanged() || vlmChanged() || ragLlmRenderChanged(),
   usage: () => usageChatProviderChanged(),
   extkeys: () => extKeysAllowedChanged() || extKeysQuotaChanged() || extKeysResearchProviderChanged(),
@@ -2379,7 +2327,12 @@ function applyConfigChangedHighlights(view) {
   });
   const reasoning = dp.codex_reasoning || {};
   mark($('depth-base-codex-reasoning'), reasoning.effective !== reasoning.default);
+  mark($('codex-mode'), view.codex_mode.effective !== view.codex_mode.default);
   mark($('agentic-max-tools-per-turn'), view.agentic_tool_limit.effective !== view.agentic_tool_limit.default);
+  mark($('max-review-rounds'), view.max_review_rounds.effective !== view.max_review_rounds.default);
+  mark($('codex-worker-model'), view.codex_worker_model.effective !== view.codex_worker_model.default);
+  mark($('codex-session-retention-days'),
+    view.codex_session_retention_days.effective !== view.codex_session_retention_days.default);
   mark($('embed-parallel'), view.embed_parallel.effective !== view.embed_parallel.default);
   // 同時実行の上限。
   const cmt = view.chat_max_turns || {};

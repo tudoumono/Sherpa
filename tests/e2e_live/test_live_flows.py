@@ -157,7 +157,6 @@ def test_live_codex_mcp_stream_smoke(page, live_base_url, admin_login, api_put_j
     assert r.ok, f"failed to set codex agent: {r.status} {r.text()}"
 
     page.goto(f"{live_base_url}/ui/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("TAX-RATE に関係するプログラムを MCP で調べて")
     page.locator("#send").click()
 
@@ -180,7 +179,6 @@ def test_live_uc1_impact_lens_answer_card(page, live_base_url, admin_login, api_
     _force_heuristic(page, live_base_url, api_put_json)
 
     page.goto(f"{live_base_url}/ui/chat.html")
-    page.locator("#kbtoggle").click()   # 既定オフ→オン（社内資料を参照させる）
     card = _send_and_wait_answer(page, "消費税率を変えたら影響は？")
 
     expect(card).to_contain_text("影響範囲分析")
@@ -201,7 +199,6 @@ def test_live_uc3_troubleshoot_lens_answer_card(page, live_base_url, admin_login
     _force_heuristic(page, live_base_url, api_put_json)
 
     page.goto(f"{live_base_url}/ui/chat.html")
-    page.locator("#kbtoggle").click()
     card = _send_and_wait_answer(page, "夜間バッチ NIGHTLY でエラーが出た。原因候補は？")
 
     expect(card).to_contain_text("トラブルシュート")
@@ -219,7 +216,6 @@ def test_live_uc_qa_lens_answer_card(page, live_base_url, admin_login, api_put_j
     _force_heuristic(page, live_base_url, api_put_json)
 
     page.goto(f"{live_base_url}/ui/chat.html")
-    page.locator("#kbtoggle").click()
     card = _send_and_wait_answer(page, "端数処理の仕様は？")
 
     expect(card).to_contain_text("仕様問い合わせ")

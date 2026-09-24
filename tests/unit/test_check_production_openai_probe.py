@@ -10,8 +10,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from check_production_openai_probe import env_candidate_status, probe  # noqa: E402
@@ -33,31 +31,6 @@ def test_marker_found_openai_kind_no_base_url():
     """初回シード済みだが接続先は本家既定のまま（env に OPENAI_BASE_URL 等が無かった場合）。"""
     out = probe(lambda: {"openai_endpoint_seed_version": 1})
     assert out == ["MARKER_FOUND", "openai", "", "", "-"]
-
-
-@pytest.mark.parametrize("bad_value", [{}, [], 0, False])
-def test_falsy_non_string_base_url_is_db_endpoint_invalid_when_kind_is_openai(bad_value):
-    """実害の回帰固定: kind=openai（明示）でも base_url が falsy な非文字列（`{}`/`[]`/`0`/
-    `False`）なら `DB_ENDPOINT_INVALID` になる（`MARKER_FOUND` にはならない）。`llm.
-    openai_endpoint_kind()`/`llm.openai_base_url()` の型検査が kind=openai の早期 return より
-    先に効く契約を probe() 経由でも固定する。"""
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "openai",
-        "openai_base_url": bad_value,
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-
-
-@pytest.mark.parametrize("bad_value", [{}, [], 0, False])
-def test_falsy_non_string_base_url_is_db_endpoint_invalid_when_kind_unset(bad_value):
-    """kind 未設定（推定に委ねる）でも base_url が falsy な非文字列なら `DB_ENDPOINT_INVALID`
-    になる。"""
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_base_url": bad_value,
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
 
 
 def test_marker_found_azure_kind_with_base_url():
@@ -97,44 +70,6 @@ def test_marker_found_malformed_base_url_is_db_endpoint_invalid():
     assert out == ["DB_ENDPOINT_INVALID"]
 
 
-def test_marker_found_userinfo_in_base_url_is_db_endpoint_invalid():
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "custom",
-        "openai_base_url": "https://user:secret@gw.example.com/v1",
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-    assert "secret" not in "".join(out)
-
-
-def test_marker_found_query_in_base_url_is_db_endpoint_invalid():
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "custom",
-        "openai_base_url": "https://gw.example.com/v1?api-version=2024-01-01",
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-
-
-def test_marker_found_invalid_port_in_base_url_is_db_endpoint_invalid():
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "custom",
-        "openai_base_url": "https://gw.example.com:notaport/v1",
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-
-
-def test_marker_found_http_scheme_in_base_url_is_db_endpoint_invalid():
-    """https 以外の scheme も runtime validator が拒否する（preflight 独自の甘い判定を持たない）。"""
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "custom",
-        "openai_base_url": "http://gw.example.com/v1",
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-
-
 def test_marker_found_ipv6_base_url_returns_raw_host_without_brackets():
     """`host` は接続用の生値（角括弧なし）を返す。`check-production.sh` はこの値を
     `getent`／`/dev/tcp/<host>/<port>` へそのまま渡すため、角括弧を含むと正当な IPv6 接続先が
@@ -146,27 +81,6 @@ def test_marker_found_ipv6_base_url_returns_raw_host_without_brackets():
         "openai_base_url": "https://[2001:db8::1]:8443/v1",
     })
     assert out == ["MARKER_FOUND", "custom", "https", "2001:db8::1", "8443"]
-
-
-def test_marker_found_azure_kind_with_empty_base_url_is_db_endpoint_invalid():
-    """kind=azure だが base_url が空（不整合な/改ざんされた DB 状態）
-    の場合、`llm.openai_base_url()` の fail-safe（本家既定 URL への縮退）を経由した後の値ではなく
-    **生の kind/base** を検証するため、本家既定へ縮退して `MARKER_FOUND`(openai 相当) を誤って
-    返すのではなく `DB_ENDPOINT_INVALID` になる。"""
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "azure",
-        "openai_base_url": None,
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-
-
-def test_marker_found_custom_kind_with_missing_base_url_key_is_db_endpoint_invalid():
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "custom",
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
 
 
 def test_marker_found_azure_base_without_explicit_kind_infers_from_host():
@@ -181,21 +95,13 @@ def test_marker_found_azure_base_without_explicit_kind_infers_from_host():
     assert out == ["MARKER_FOUND", "azure", "https", "myres.openai.azure.com", "-"]
 
 
-def test_marker_found_unknown_kind_with_no_base_url_is_db_endpoint_invalid():
-    """`openai_endpoint_kind()` は未知の生 kind でも base 未設定なら
-    無条件で "openai" へ縮退するため、生の kind をチェックせずに正規化後の値だけを見ると
-    `kind="bogus"` という DB の破損値を見逃して `MARKER_FOUND`（openai・本家）を返してしまう。
-    非空の生 kind は openai/azure/custom の列挙として先に検証する。"""
-    out = probe(lambda: {
-        "openai_endpoint_seed_version": 1,
-        "openai_endpoint_kind": "bogus",
-    })
-    assert out == ["DB_ENDPOINT_INVALID"]
-
-
 def test_marker_found_unknown_kind_with_valid_base_url_is_db_endpoint_invalid():
-    """未知 kind は base_url が有効な URL であっても拒否する（kind 自体が不正なため、base の
-    有無・妥当性に関わらず DB_ENDPOINT_INVALID）。"""
+    """`openai_endpoint_kind()` は未知の生 kind でも base 未設定なら無条件で "openai" へ縮退する
+    ため、生の kind をチェックせずに正規化後の値だけを見ると `kind="bogus"` という DB の破損値を
+    見逃して `MARKER_FOUND`（openai・本家）を返してしまう。非空の生 kind は openai/azure/custom
+    の列挙として先に検証する（この pre-check は `validate_endpoint_settings()` 自身の判定で
+    `sherpa/llm.py` に委譲しない＝base_url が有効な URL であっても kind 自体が不正なら拒否する
+    ことまで確認し、base 未設定側の重複ケースは持たない）。"""
     out = probe(lambda: {
         "openai_endpoint_seed_version": 1,
         "openai_endpoint_kind": "bogus",

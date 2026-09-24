@@ -23,6 +23,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import shutil
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -124,6 +125,49 @@ def ensure_workspace(uid: str) -> Path:
     (base / "tmp").mkdir(parents=True, exist_ok=True)
     (base / "files").mkdir(parents=True, exist_ok=True)
     return base
+
+
+def _remove_codex_session_dir(target: Path, base: Path) -> None:
+    """`target`（`.codex-sessions/{cid}` 配下の1件）を `base`（`.codex-sessions` 本体）への
+    confinement 再確認のうえ削除する。symlink の扱いは呼び出し側の責務（本関数は「確認済みの
+    通常ディレクトリを安全に rmtree する」部分だけを担う単一真実源——TTL sweep
+    （`api._sweep_expired_codex_sessions`）と会話削除（`_delete_codex_sessions_for_conversation`）で
+    symlink policy が異なるため、その手前までを共通化する）。
+    confinement 崩壊は ValueError、rmtree 失敗は OSError を送出する（呼び出し側が捕捉して
+    fail-safe/fail-open を判断する）。
+    """
+    target.resolve().relative_to(base.resolve())
+    shutil.rmtree(target)
+
+
+def _delete_codex_sessions_for_conversation(uid: str, cid) -> None:
+    """会話削除に伴い、その会話の Codex resume セッション実体（`workspace/.codex-sessions/{cid}`）を
+    即時削除する（docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md §4-3）。
+
+    soft delete（受領共有ラッパーが生存中）でも削除する: 共有は DB 上の回答本文を見せるだけで
+    Codex セッションは resume 専用の実体＝共有継続とセッション保持は無関係
+    （呼び出し側 `sherpa/routers/conversations.py::conversation_delete` は soft/hard を区別しない）。
+
+    fail-open: 呼び出し側（会話削除 API）は本関数の成否に関わらず成功を返す前提のため、
+    例外を外へ投げずログ1行に留める。symlink 混入時は TTL sweep（丸ごとスキップ）より踏み込み、
+    リンク自体だけ unlink する（参照先には触れない）——会話が削除される以上、宙に浮いた
+    symlink を残す理由が無いため。
+    """
+    try:
+        udir = _USERS_DIR.resolve() / uid
+        sessions_root = udir / "workspace" / ".codex-sessions"
+        if sessions_root.is_symlink() or not sessions_root.is_dir():
+            return
+        sessions_root.resolve().relative_to(udir.resolve())
+        target = sessions_root / str(cid)
+        if target.is_symlink():
+            target.unlink()
+            return
+        if not target.is_dir():
+            return
+        _remove_codex_session_dir(target, sessions_root)
+    except Exception as e:
+        _log.warning("delete_codex_sessions_for_conversation: failed uid=%s cid=%s: %s", uid, cid, e)
 
 
 def _ensure_initial_admin(ip_hash: str | None = None, user_agent: str | None = None) -> dict | None:

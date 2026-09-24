@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "answer", "next_step", "claims"],
+  "properties": {
+    "status": {"type": "string", "enum": ["final", "in_progress"]},
+    "answer": {"type": "string"},
+    "next_step": {"type": ["string", "null"]},
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "text", "evidence_refs", "reason", "reason_code", "evidence_kinds"],
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"type": "string", "enum": ["confirmed", "inferred", "unknown"]},
+          "text": {"type": "string"},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "reason": {"type": "string"},
+          "reason_code": {
+            "type": "string",
+            "enum": ["", "not_found_in_scope", "unexplored", "insufficient", "conflict", "budget", "unreadable"]
+          },
+          "evidence_kinds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["source", "spec_doc", "definition", "log_config", "callgraph"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

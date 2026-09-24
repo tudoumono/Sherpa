@@ -131,10 +131,12 @@ def test_admin_settings_get_shape():
     assert vlm["default"]["cloud_allowed"] is False       # env/既定も cloud は常に false
     assert vlm["providers"] == ["ollama", "openai"]
     assert isinstance(vlm["available"], bool) and isinstance(vlm["openai_key_present"], bool)
-    # R1b（Codex ネイティブ resume・決定5）: 未設定は configured=None・effective=0（無制限）。
+    # R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）:
+    # 未設定は configured=None・effective=default=30日。0（無制限）は明示設定時のみ。
     csr = body["codex_session_retention_days"]
     assert csr["configured"] is None
-    assert csr["effective"] == 0
+    assert csr["effective"] == 30
+    assert csr["default"] == 30
     # STAT-2: 利用統計チャット専用の AI 選択。未設定（configured=None）時の既定は A7
     # （`cloud_provider`）連動——A7 が明示的に openai の時だけ openai・それ以外（この環境の
     # ように A7 も未設定の場合を含む）は ollama。
@@ -405,8 +407,8 @@ def test_put_vlm_reflects_and_resets():
 
 
 def test_put_codex_session_retention_days_reflects_and_resets():
-    """R1b（決定5）: 保持日数は生値が configured/effective に反映され、0（無制限）も明示保存できる。
-    null で未設定（＝0/無制限）へ戻る。"""
+    """R1b（決定5）→ 初期構成の既定（決定2026-09-19）: 保持日数は生値が configured/effective
+    に反映され、0（無制限）も明示保存できる。null で未設定（＝既定30日）へ戻る。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
@@ -421,11 +423,11 @@ def test_put_codex_session_retention_days_reflects_and_resets():
     csr2 = r2.json()["codex_session_retention_days"]
     assert csr2["configured"] == 0 and csr2["effective"] == 0
 
-    # null で未設定へ戻す。
+    # null で未設定へ戻す → 既定30日。
     r3 = admin.put("/admin/settings", json={"codex_session_retention_days": None})
     assert r3.status_code == 200, r3.text
     csr3 = r3.json()["codex_session_retention_days"]
-    assert csr3["configured"] is None and csr3["effective"] == 0
+    assert csr3["configured"] is None and csr3["effective"] == 30
 
 
 # ===== 使えるモデル（model_catalog） =====
@@ -2299,6 +2301,111 @@ def test_admin_settings_embed_parallel_rejects_invalid_values(bad):
     assert "embed_parallel" not in store.get_system_settings()
 
 
+def test_admin_settings_max_review_rounds_roundtrip():
+    """DEPTH-2 S5: 「最大」の深さが許す査読の巡数（設定は 1 項目だけ・既定 7・`embed_parallel`
+    と同型）。標準 0・深く 2 はコード固定のため設定に現れない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"max_review_rounds": 3})
+    assert response.status_code == 200, response.text
+    assert response.json()["max_review_rounds"]["effective"] == 3
+    assert store.get_system_settings()["max_review_rounds"] == 3
+    # 他の項目の部分更新で保存値が消えない。
+    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
+    assert response.json()["max_review_rounds"]["configured"] == 3
+    response = admin.put("/admin/settings", json={"max_review_rounds": None})
+    assert response.status_code == 200, response.text
+    rounds = response.json()["max_review_rounds"]
+    assert rounds["configured"] is None and rounds["effective"] == rounds["default"] == 7
+
+
+@pytest.mark.parametrize("bad", [0, -1, 33, True, "3", 1.5])
+def test_admin_settings_max_review_rounds_rejects_invalid_values(bad):
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"max_review_rounds": bad})
+    assert response.status_code == 422, response.text
+    assert "max_review_rounds" not in store.get_system_settings()
+
+
+def test_admin_settings_codex_worker_model_roundtrip():
+    """multi_agent（S6）の worker モデル（実装ベース探索の回復 S1）。未設定/空文字は None
+    （フォールバックへ戻る）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9-custom"})
+    assert response.status_code == 200, response.text
+    worker = response.json()["codex_worker_model"]
+    assert worker["configured"] == "gpt-5.9-custom" and worker["effective"] == "gpt-5.9-custom"
+    assert store.get_system_settings()["codex_worker_model"] == "gpt-5.9-custom"
+
+    response = admin.put("/admin/settings", json={"codex_worker_model": "  "})
+    assert response.status_code == 200, response.text
+    worker2 = response.json()["codex_worker_model"]
+    assert worker2["configured"] is None and worker2["effective"] == worker2["default"]
+
+    response = admin.put("/admin/settings", json={"codex_worker_model": None})
+    assert response.status_code == 200, response.text
+    assert response.json()["codex_worker_model"]["configured"] is None
+
+
+def test_admin_settings_codex_worker_model_effective_uses_main_model_for_azure_when_unconfigured():
+    """S6a RV是正3巡目 #2: Azure 接続先で worker 未設定のとき、`effective` は実際に適用される値
+    （本体 Codex のカタログ既定＝`model_catalog.resolve_model("codex","codex",...)`）を返す——
+    実機で spawn されない固定フォールバック値（`_CODEX_WORKER_MODEL_FALLBACK`＝`default`）とは
+    異なる値になる（管理画面の表示が実際の挙動と食い違わない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={
+        "openai_endpoint_kind": "azure", "openai_base_url": "https://myres.openai.azure.com/openai/v1"})
+    assert response.status_code == 200, response.text
+    worker = response.json()["codex_worker_model"]
+    assert worker["configured"] is None
+    assert worker["effective"] == "gpt-5.5"          # model_catalog の codex/codex 既定（本体の値）
+    assert worker["effective"] != worker["default"]  # 固定フォールバック（gpt-5.6-sol）とは異なる
+
+
+def test_admin_settings_codex_worker_model_rejects_control_characters():
+    """CR/LF・DEL 等の制御文字混入は 422（`_write_codex_agent_role_configs` が生成する TOML の
+    1行文字列を壊すため）。保存もされない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9\rinjected"})
+    assert response.status_code == 422, response.text
+    assert "codex_worker_model" not in store.get_system_settings()
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9\ninjected"})
+    assert response.status_code == 422, response.text
+    response = admin.put("/admin/settings", json={"codex_worker_model": "gpt-5.9\x7f"})
+    assert response.status_code == 422, response.text
+
+
+def test_admin_settings_codex_mode_roundtrip_and_rejects_invalid():
+    """素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。standard/plain
+    のみ許可・未設定/null は既定の standard へフォールバック・語彙外は422（保存もされない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"codex_mode": "plain"})
+    assert response.status_code == 200, response.text
+    mode = response.json()["codex_mode"]
+    assert mode["configured"] == "plain" and mode["effective"] == "plain"
+    assert store.get_system_settings()["codex_mode"] == "plain"
+
+    response = admin.put("/admin/settings", json={"codex_mode": None})
+    assert response.status_code == 200, response.text
+    mode2 = response.json()["codex_mode"]
+    assert mode2["configured"] is None and mode2["effective"] == "standard"
+
+    response = admin.put("/admin/settings", json={"codex_mode": "invalid"})
+    assert response.status_code == 422, response.text
+    assert "codex_mode" not in store.get_system_settings()
+
+
 @pytest.mark.parametrize("field,bad", [
     ("depth_base_max_turns", 0), ("depth_base_max_turns", 500),
     ("depth_base_grep_max_hits", 0), ("depth_base_read_window", 5),
@@ -2446,10 +2553,9 @@ def test_admin_settings_chat_max_turns_effective_limits_prefers_db_value():
 
 def test_admin_settings_view_agentic_budget_shape_unset():
     """GET /admin/settings の agentic_budget は未設定なら configured=None・
-    effective=default=コード既定（精度優先・262144/4194304）。BUDGET-2（§3.4）: 新設の DB 未設定
-    （fresh DB・system_settings 全消去）なら「現在のモデル」（既定は ollama/qwen2.5）の窓は
-    登録値/シード表のどちらにも無い＝unknown に落ち、effective は BUDGET-1 のみの値のまま
-    （退行しない）。"""
+    effective=default=コード既定（精度優先・262144/4194304）。モデルの窓由来の上限との min()
+    （旧 BUDGET-2・管理画面のモデル窓登録表）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が
+    制限しない」）——`window`/`model_windows` キー自体が応答から消えている。"""
     if not _try_init():
         pytest.skip("DB down")
     from sherpa import agentic_search
@@ -2457,15 +2563,11 @@ def test_admin_settings_view_agentic_budget_shape_unset():
     r = admin.get("/admin/settings")
     assert r.status_code == 200, r.text
     ab = r.json()["agentic_budget"]
-    assert set(ab.keys()) == {"per_result", "total", "window", "model_windows"}
+    assert set(ab.keys()) == {"per_result", "total"}
     assert ab["per_result"] == {"configured": None, "effective": agentic_search.TOOL_RESULT_MAX_BYTES,
                                 "default": agentic_search.TOOL_RESULT_MAX_BYTES}
     assert ab["total"] == {"configured": None, "effective": agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES,
                            "default": agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES}
-    assert ab["window"]["source"] == "unknown"
-    assert ab["window"]["window_tokens"] is None
-    assert ab["window"]["derived_cap_bytes"] is None
-    assert ab["model_windows"] == {"configured": None}
 
 
 @pytest.mark.parametrize("field,key,value", [
@@ -2524,64 +2626,83 @@ def test_admin_settings_agentic_budget_audit_records_change():
     assert rows[0]["after_state"].get("agentic_budget_per_result") == 300_000
 
 
-# ===== BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定・
-# モデル窓連動・min() 方式）=====
+# ===== BUDGET-1 相対検証（実装ベース探索の回復・根本原因対応D）=====
+# 累計（agentic_budget_total）は1件あたり（agentic_budget_per_result）以上でなければならない
+# ——範囲検証（StrictInt+Field）だけでは入れ替え保存（per_result=8MiB／total=4KiB）を防げず、
+# 実機で最初のツール呼び出しから即座に打ち切りになった。
 
-def test_admin_settings_model_windows_put_and_get_roundtrip():
-    """`model_context_windows` の追加・取得・削除（null で未設定へ戻す）。"""
+def test_admin_settings_agentic_budget_rejects_total_below_per_result_when_both_provided():
+    """両方同時指定で total < per_result（入れ替え保存）は422（平文メッセージ）。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
     r = admin.put("/admin/settings", json={
-        "model_context_windows": {"openai:my-test-model": 50_000, "ollama:qwen2.5": 32_768}})
-    assert r.status_code == 200, r.text
-    mw = r.json()["agentic_budget"]["model_windows"]
-    assert mw == {"configured": {"openai:my-test-model": 50_000, "ollama:qwen2.5": 32_768}}
-
-    r2 = admin.put("/admin/settings", json={"model_context_windows": None})
-    assert r2.status_code == 200, r2.text
-    assert r2.json()["agentic_budget"]["model_windows"] == {"configured": None}
-
-
-@pytest.mark.parametrize("bad", [
-    "not-a-dict",
-    {"no-colon-key": 100},
-    {"unknownprovider:m": 100},
-    {"openai:m": 0},
-    {"openai:m": -1},
-    {"openai:m": True},
-    {"openai:m": "50000"},
-])
-def test_admin_settings_model_windows_rejects_bad_shapes(bad):
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r = admin.put("/admin/settings", json={"model_context_windows": bad})
+        "agentic_budget_per_result": 8 * 1024 * 1024, "agentic_budget_total": 4096})
     assert r.status_code == 422, r.text
+    assert "合計は1件あたり以上にしてください" in r.text
 
 
-def test_admin_settings_model_windows_registered_value_narrows_effective_budget(monkeypatch):
-    """登録値（管理画面の「モデル窓」欄）が現在のモデルに一致すると、min() で `effective` が
-    窓由来の上限まで縮む（§3.4 min() 方式の end-to-end 固定）。「現在のモデル」の解決
-    （`_current_chat_provider_model`）はこのテストの主眼ではない（実行環境の `SHERPA_AGENT`
-    既定値に依存させない）ため ollama/qwen2.5 に固定する。"""
+def test_admin_settings_agentic_budget_accepts_total_equal_to_per_result():
+    """total == per_result（境界）は保存できる（422 にしない）。"""
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import model_windows
-    from sherpa.routers import system_extras
-    monkeypatch.setattr(system_extras, "_current_chat_provider_model", lambda sysset: ("ollama", "qwen2.5"))
     admin, _ = _admin_client()
     r = admin.put("/admin/settings", json={
-        "model_context_windows": {"ollama:qwen2.5": 40_000}})
+        "agentic_budget_per_result": 100_000, "agentic_budget_total": 100_000})
     assert r.status_code == 200, r.text
-    view = r.json()
-    ab = view["agentic_budget"]
-    assert ab["window"] == {"provider": "ollama", "model": "qwen2.5", "window_tokens": 40_000,
-                            "source": "registered",
-                            "derived_cap_bytes": model_windows.derive_window_bytes(40_000)}
-    expected_cap = model_windows.derive_window_bytes(40_000)
-    assert ab["per_result"]["effective"] == expected_cap
-    assert ab["total"]["effective"] == expected_cap
+    admin.put("/admin/settings", json={"agentic_budget_per_result": None, "agentic_budget_total": None})
+
+
+def test_admin_settings_agentic_budget_rejects_per_result_above_saved_total():
+    """片方（per_result）だけの指定でも、保存済みのもう片方（DB の現在値＝total）と突き合わせて
+    判定する——まず両方を整合させた基準値を保存してから、片方だけの更新を試す（デフォルト値や
+    他テストの残留状態に依存しない自己完結な検証）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r0 = admin.put("/admin/settings", json={
+        "agentic_budget_per_result": 2048, "agentic_budget_total": 4096})
+    assert r0.status_code == 200, r0.text
+    try:
+        r = admin.put("/admin/settings", json={"agentic_budget_per_result": 8192})   # 保存済み total(4096) を上回る
+        assert r.status_code == 422, r.text
+        assert "合計は1件あたり以上にしてください" in r.text
+    finally:
+        admin.put("/admin/settings", json={"agentic_budget_per_result": None, "agentic_budget_total": None})
+
+
+def test_admin_settings_agentic_budget_rejects_total_below_saved_per_result():
+    """逆方向: 片方（total）だけの指定でも、保存済みのもう片方（DB の現在値＝per_result）と
+    突き合わせて判定する。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r0 = admin.put("/admin/settings", json={
+        "agentic_budget_per_result": 500_000, "agentic_budget_total": 600_000})
+    assert r0.status_code == 200, r0.text
+    try:
+        r = admin.put("/admin/settings", json={"agentic_budget_total": 4096})   # 保存済み per_result(500000) を下回る
+        assert r.status_code == 422, r.text
+        assert "合計は1件あたり以上にしてください" in r.text
+    finally:
+        admin.put("/admin/settings", json={"agentic_budget_per_result": None, "agentic_budget_total": None})
+
+
+# ===== モデルの窓の管理者登録表（旧 BUDGET-2）は撤去済み =====
+# `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`: 利用者裁定「AI が持つ文脈窓を
+# Sherpa が制限しない」により `model_context_windows` の受け付け・保存・返却ごと撤去した。
+
+def test_admin_settings_put_ignores_unknown_model_context_windows_key():
+    """撤去済みキーを送っても 422 にはならず（未知フィールドは無視）、応答に `model_windows`/
+    `window` は含まれない（DB に残っている旧値があっても読み返さない・fail-safe）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    r = admin.put("/admin/settings", json={"model_context_windows": {"openai:m": 50_000}})
+    assert r.status_code == 200, r.text
+    ab = r.json()["agentic_budget"]
+    assert "model_windows" not in ab
+    assert "window" not in ab
 
 
 # ===== チャットの質問例（chat_examples） =====

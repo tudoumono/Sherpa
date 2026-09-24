@@ -1,15 +1,15 @@
-"""`sherpa/model_windows.py`（BUDGET-2・
-`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.4・2026-09-03 裁定）の単体テスト。
+"""`sherpa/model_windows.py`（`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.4・
+2026-09-03 裁定で導入・`docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で
+管理画面登録値（段1）を撤去）の単体テスト。
 
 - `derive_window_bytes`: 決定的な純関数（予約枠・安全係数・バイト換算率・下限）。
-- `resolve_window_tokens`: 4段解決の優先順（登録値 > プロバイダAPI > シード表 > 不明）。
+- `resolve_window_tokens`: 3段解決の優先順（プロバイダAPI > シード表 > 不明）。
 - `query_ollama_context_length`/`query_anthropic_context_length`: 失敗時 None（fail-safe）・
   TTL キャッシュ。実ネットワーク I/O はしない（`llm.urlopen_no_redirect` を monkeypatch）。
-- `validate_model_windows`: 管理画面登録値の検証（形式・範囲）。
 - `derive_ollama_base_url`: chat URL からの base 復元（決定的な文字列操作のみ）。
 
-agentic_search.py 側の配線（`resolve_tool_result_budgets` の min() 適用・呼び出し元ごとの
-provider/model 配線）は `tests/unit/test_agentic_search.py` の BUDGET-2 セクションが固定する。
+ツール結果バイト予算（`agentic_search.py::resolve_tool_result_budgets`）はもうこの窓解決を
+使わない（撤去済み）——agentic_search.py 側の固定は `tests/unit/test_agentic_search.py` が持つ。
 """
 from __future__ import annotations
 
@@ -72,52 +72,6 @@ def test_derive_ollama_base_url_mismatched_suffix_returns_none():
     assert MW.derive_ollama_base_url("http://x") is None
     assert MW.derive_ollama_base_url("http://x/api/show") is None
     assert MW.derive_ollama_base_url(123) is None
-
-
-# ===== registered_window_tokens / validate_model_windows =====
-
-def test_registered_window_tokens_hit():
-    sysset = {MW.MODEL_WINDOWS_KEY: {"openai:my-model": 50_000}}
-    assert MW.registered_window_tokens("openai", "my-model", sysset) == 50_000
-
-
-def test_registered_window_tokens_miss_returns_none():
-    assert MW.registered_window_tokens("openai", "unknown-model", {}) is None
-    assert MW.registered_window_tokens("openai", "my-model", {MW.MODEL_WINDOWS_KEY: "not-a-dict"}) is None
-
-
-def test_registered_window_tokens_rejects_bad_values():
-    """負値・0・bool・非整数は「未登録」扱い（fail-safe・保存経路は `validate_model_windows` が
-    弾くが、DB 直接編集等の破損値でも落ちない）。"""
-    for bad in (0, -1, True, "50000"):
-        sysset = {MW.MODEL_WINDOWS_KEY: {"openai:m": bad}}
-        assert MW.registered_window_tokens("openai", "m", sysset) is None, bad
-
-
-def test_validate_model_windows_none_clears():
-    assert MW.validate_model_windows(None) is None
-
-
-def test_validate_model_windows_valid_roundtrip():
-    out = MW.validate_model_windows({"openai:gpt-4o": 128_000, "ollama:qwen2.5": 32_768})
-    assert out == {"openai:gpt-4o": 128_000, "ollama:qwen2.5": 32_768}
-
-
-@pytest.mark.parametrize("bad", [
-    "not-a-dict",
-    {"": 100},                       # 空キー
-    {"no-colon": 100},               # provider:model 形式でない
-    {"unknownprovider:m": 100},      # 未知プロバイダ
-    {"openai:": 100},                # モデル名が空
-    {"openai:m": 0},                 # 0 は不可
-    {"openai:m": -1},                # 負値
-    {"openai:m": True},              # bool
-    {"openai:m": "128000"},          # 文字列
-    {"openai:m": 20_000_000},        # 上限超過
-])
-def test_validate_model_windows_rejects_bad_shapes(bad):
-    with pytest.raises(ValueError):
-        MW.validate_model_windows(bad)
 
 
 # ===== プロバイダAPI照会（ライブ I/O はしない・`llm.urlopen_no_redirect` を monkeypatch） =====
@@ -230,19 +184,14 @@ def test_query_anthropic_context_length_retrieve_raises_returns_none(monkeypatch
     assert MW.query_anthropic_context_length(_Client(), "claude-x") is None
 
 
-# ===== resolve_window_tokens（4段解決の優先順） =====
+# ===== resolve_window_tokens（3段解決の優先順） =====
 
 def test_resolve_window_tokens_empty_provider_or_model_is_unknown():
     assert MW.resolve_window_tokens("", "m", system_settings={}) == (None, "unknown")
     assert MW.resolve_window_tokens("openai", "", system_settings={}) == (None, "unknown")
 
 
-def test_resolve_window_tokens_registered_wins_over_seed():
-    sysset = {MW.MODEL_WINDOWS_KEY: {"openai:gpt-4o-mini": 9_999}}
-    assert MW.resolve_window_tokens("openai", "gpt-4o-mini", system_settings=sysset) == (9_999, "registered")
-
-
-def test_resolve_window_tokens_seed_when_no_registered(monkeypatch):
+def test_resolve_window_tokens_seed_when_no_api_match(monkeypatch):
     monkeypatch.setattr(MW, "query_ollama_context_length", lambda *a, **kw: None)
     assert MW.resolve_window_tokens("openai", "gpt-4o-mini", system_settings={}) == (128_000, "seed")
 

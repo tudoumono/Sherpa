@@ -74,7 +74,7 @@ def test_chat_persists_and_answers_answer_first():
     「消費税率」は構造的に解決しない——起点はコード自身の識別子（`TAX-RATE`）を使う。"""
     ensure_v1()
     c = _client()
-    # 既定はナレッジ参照オフ（素の会話）。社内資料に基づく回答は knowledge=True で要求する。
+    # 既定はナレッジ参照ON（決定2026-09-19）だが、ここは明示 knowledge=True で意図を固定する。
     r = c.post("/chat", json={"message": "TAX-RATE を変えたい。影響は？", "world": V, "knowledge": True, "stream_id": "m8-00780"}).json()
     cid = r["conversation_id"]
     ans = r["message"]["answer"]
@@ -103,9 +103,11 @@ def test_chat_routes_troubleshoot():
 
 
 def test_knowledge_off_is_plain_chat():
-    """既定（ナレッジ参照オフ）＝検索せず素の会話。レンズ=chat・出典なし・範囲=off。"""
+    """knowledge=False（既定は ON・決定2026-09-19。ここは明示 OFF）＝検索せず素の会話。
+    レンズ=chat・出典なし・範囲=off。"""
     c = _client()
-    ans = c.post("/chat", json={"message": "こんにちは", "world": V, "stream_id": "m8-01080"}).json()["message"]["answer"]
+    ans = c.post("/chat", json={"message": "こんにちは", "world": V, "knowledge": False,
+                                "stream_id": "m8-01080"}).json()["message"]["answer"]
     assert ans["lens"] == "chat" and ans["sources"] == [] and ans["scope"]["source"] == "off"
 
 
@@ -176,9 +178,11 @@ def test_chat_non_streaming_knowledge_on_saves_trace():
 
 
 def test_chat_non_streaming_knowledge_off_saves_trace():
-    """POST /chat（非ストリーミング）・ナレッジ参照OFF（素の会話・_plain_run 経路）。"""
+    """POST /chat（非ストリーミング）・ナレッジ参照OFF（素の会話・_plain_run 経路・明示 knowledge=False。
+    既定は ON・決定2026-09-19）。"""
     c = _client()
-    r = c.post("/chat", json={"message": "こんにちは", "world": V, "stream_id": "m8-01810"}).json()
+    r = c.post("/chat", json={"message": "こんにちは", "world": V, "knowledge": False,
+                              "stream_id": "m8-01810"}).json()
     trace = r["message"].get("trace")
     assert trace, "非ストリーミング・knowledge=False（_plain_run）で trace が保存されていない"
     assert any(n["id"] == "brain" for n in trace)
@@ -396,11 +400,13 @@ def test_chat_history_primes_next_turn_via_db_after_provider_reinstantiation():
     c = _client()
     try:
         chat_service.get_provider = lambda settings, **kw: _FakeProviderTurn1()
-        r1 = c.post("/chat", json={"message": "最初の質問です", "world": V, "stream_id": "m8-03990"}).json()
+        r1 = c.post("/chat", json={"message": "最初の質問です", "world": V, "knowledge": False,
+                                   "stream_id": "m8-03990"}).json()
         cid = r1["conversation_id"]
 
         chat_service.get_provider = lambda settings, **kw: _FakeProviderTurn2()
-        r2 = c.post("/chat", json={"message": "続けて教えて", "world": V, "conversation_id": cid, "stream_id": "m8-04030"}).json()
+        r2 = c.post("/chat", json={"message": "続けて教えて", "world": V, "knowledge": False,
+                                   "conversation_id": cid, "stream_id": "m8-04030"}).json()
         assert r2["conversation_id"] == cid
     finally:
         chat_service.get_provider = orig

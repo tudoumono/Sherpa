@@ -49,6 +49,21 @@ def test_record_run_tool_limits_counts_tool_result_clipped_for_byte_budget_tools
     assert state.limits["tool_result_clipped"] == 3
 
 
+def test_record_run_tool_limits_counts_ripgrep_search_hit_level_clip_once_via_top_level_flag(monkeypatch):
+    """`ripgrep_search`/`es_search` はヒット単位でバイトクリップするが、`_record_run_tool_limits`
+    は最上位キーしか見ない——`run_tool()` がいずれかのヒットを切ったときに最上位へ立てる
+    `text_truncated` 経由で `tool_result_clipped` が1回だけ計上される（1回の呼出で複数ヒットが
+    切られても呼び出し単位で1回）。"""
+    state = investigation_state.InvestigationState(question="q", scope={})
+    hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": "x" * 5000, "ext": ".md"},
+            {"doc_id": "b.md", "line": 1, "span": [1, 1], "text": "x" * 5000, "ext": ".md"}]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=30, tool_result_max_bytes=64 * 1024)
+    A._record_run_tool_limits(state, "ripgrep_search", res)
+    assert state.limits["tool_result_clipped"] == 1
+
+
 def test_record_run_tool_limits_noop_on_error_result_and_non_dict():
     state = investigation_state.InvestigationState(question="q", scope={})
     A._record_run_tool_limits(state, "ripgrep_search", {"error": "x"})
@@ -64,6 +79,7 @@ def test_investigation_state_bump_and_mark_limit():
     assert state.limits == {
         "tool_result_clipped": 0, "total_budget_hit": False, "context_compactions": 0,
         "synthesis_truncated": False, "search_truncated": 0, "auto_continues": 0,
+        "depth_escalated": False,
     }
     state.bump_limit("auto_continues")
     state.bump_limit("auto_continues", 2)
@@ -197,8 +213,8 @@ def test_codex_provider_without_cli_does_not_reference_unbound_counter(monkeypat
     from sherpa.providers.codex import provider as P
     monkeypatch.setattr(shutil, "which", lambda name: None)
     src = open(P.__file__, encoding="utf-8").read()
-    # 初期化が起動条件（shutil.which）より前にあることを固定する（起動しない経路の参照安全）。
-    assert src.index("_auto_continue_count = 0") < src.index('if shutil.which("codex") and ws_authoring')
+    # 初期化が起動条件（shutil.which の結果 `_codex_bin`）より前にあることを固定する（起動しない経路の参照安全）。
+    assert src.index("_auto_continue_count = 0") < src.index("if _codex_bin and ws_authoring")
 
 
 def test_openai_style_parallel_tool_calls_are_counted(monkeypatch):

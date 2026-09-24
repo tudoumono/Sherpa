@@ -25,7 +25,7 @@ import {
   setSendButtonStopping, startFlow, subscribeTurn, resetFlow, _questionAnswerState, appendRestoredQuestion,
   invalidateStopContext, startThinkingTicker,
 } from './stream.js';
-import { renderScopePanel, setScopeLabel, applyConversationScope } from './scope.js';
+import { renderScopePanel, setScopeLabel, applyConversationScope, setKb } from './scope.js';
 import { resetInquiryForNewConversation, applyInquiryOpenDefault } from './inquiry.js';
 import { toast, updateShareButtonState } from '../chat.js';
 
@@ -182,6 +182,15 @@ export function newConversation() {
   // ここで両方 null にする（後追い経路は S.pendingConvWorld が null なら何もしない）。
   S.pendingConvWorld = null; S.currentScopeMeta = null;
   S.scope = []; if (S.scopeTree) renderScopePanel(S.scopeTree); setScopeLabel('全体');   // 範囲を全体に戻す
+  // 資料参照は新規会話で既定ON（決定2026-09-19）に戻す——直前に開いていた会話が lens=chat
+  // （資料参照OFF）だった場合、`welcome()` 到達前の openConversation 復元（scope.js:61）が
+  // S.kb を false のまま残していたため、新規会話がその状態を引き継いでしまっていた。ただし
+  // 資料フォルダが1つも登録されていないと確定している環境（chat.js の /world-options 読込が
+  // 空で返り S.kbForcedOff=true になった場合）では無条件ONに戻すと素の雑談まで 404 になる
+  // （chat.js::setKb(false) 分岐と同じ判定）。`S.verLabels` の空チェックだと「まだ読込中／
+  // 読込失敗（未確認）」も「空で確定」と誤認して選択肢がある環境でも OFF になり得るため、
+  // 明示フラグ `S.kbForcedOff`（読込成功かつ空のときだけ true）だけを見る（RV是正）。
+  setKb(!S.kbForcedOff);
   resetInquiryForNewConversation();   // SC-6b: 調べ方/探す対象も自動・両方に戻し、ブロックを開く
   S.convHasPersonal = false; updateShareButtonState();   // Feature C: 新規会話は共有可能状態にリセット
   updateForkButtonState(null);   // SH-1: 新規会話は「引き継いで質問」対象外

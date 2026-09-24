@@ -39,6 +39,8 @@ _SUBSYSTEM_LOGGERS: dict[str, tuple[str, str]] = {
     # ::record 参照）。他系統と同じ「INFO 以下は専用ファイルのみ・WARNING 以上は run ログにも」だが、
     # usage ログは常時 INFO のみ（warning を出さない）ため実質専用ファイル限定になる。
     "usage": ("sherpa.usage", "usage.log"),
+    # Codex CLI 実行の開始/終了サマリ（`providers/codex/provider.py`・`providers/base.py::_log_codex`）。
+    "codex": ("sherpa.codex", "codex.log"),
 }
 
 _SUBSYSTEM_LEVEL = logging.INFO   # 専用ファイルへ書く下限（詳細込み）

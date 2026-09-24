@@ -12,7 +12,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     from playwright.sync_api import expect
 
     stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
-    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-standard"
+    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-quick"
     stats["quality_runs"]["by_rounds"][1]["rounds"] = 0
     install_api_mocks(page, usage_stats=stats)
     page.goto(f"{web_base_url}/usage.html")
@@ -27,6 +27,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     expect(quality_table).to_contain_text("本番相当")
     expect(quality_table).to_contain_text("見直しなし")
     expect(review).to_contain_text("未調査: 3")
+    expect(review).to_contain_text("ソース未確認: 2")   # 不足種別（閉集合）も平文ラベルで出る
     expect(review).to_contain_text("次の見直しへ: 4")
     expect(review).to_contain_text("0.36")
 
@@ -210,6 +211,17 @@ def test_usage_limits_table_renders_by_provider(page, web_base_url):
     expect(codex_row).to_contain_text("2件（計3回）")     # auto_continues
     openai_row = limits_tbody.locator("tr", has_text="OpenAI")
     expect(openai_row).to_contain_text("0件（計0回）")    # tool_result_clipped=0
+    # S2/S4: 自動引き上げ・バックエンド不調の列も見出しと値が並ぶ（bool 系＝件数のみ）。
+    heads = page.locator("#limits-tbody").locator("xpath=../thead//th")
+    expect(heads).to_contain_text(["自動で深く調べた"])
+    expect(heads).to_contain_text(["全文検索が使えなかった"])
+    expect(heads).to_contain_text(["グラフが使えなかった"])
+    expect(heads).to_contain_text(["グラフは再取り込み待ち"])
+    codex_cells = codex_row.locator("td")
+    assert codex_cells.nth(6).inner_text() == "2件"    # depth_escalated_turns（S2）
+    assert codex_cells.nth(9).inner_text() == "1件"    # backend_unavailable_fulltext_turns（S4）
+    assert codex_cells.nth(10).inner_text() == "2件"   # backend_unavailable_graph_turns（S4）
+    assert codex_cells.nth(11).inner_text() == "1件"   # graph_reingest_required_turns（S4）
 
 
 def test_usage_chat_notice_uses_plain_language_not_jargon(page, web_base_url):

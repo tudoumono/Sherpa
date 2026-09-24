@@ -7,7 +7,7 @@ import re
 import uuid
 from dataclasses import asdict
 from pathlib import PurePosixPath
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from psycopg.types.json import Json
@@ -633,47 +633,63 @@ def list_succeeded_results(world: str, canonical_generation_id: str) -> list[dic
 def iter_succeeded_results(
     world: str,
     canonical_generation_id: str,
+    sort_key: Callable[[str], str],
     *,
     batch_size: int = 100,
 ) -> Iterator[dict[str, Any]]:
-    """完了Setをkeyset paginationで有界に読む。
+    """完了Setを、呼出側が渡す``sort_key``が決める順で有界に読む。
 
-    ``fetchall``は各batch内だけであり、World全体を保持しない。Observation rendererが要求する
-    ``source_rel_path, observation_set_hash``順をDB側で固定する。
+    並び順はDBの照合順序やSQL側の正規化には頼らず、``sort_key``（呼出側は
+    ``observation_render._relative_source_path``——Observation renderer自身の検査と
+    同じ関数）だけで決める。検査側の正規化（区切り文字の置換に加え、連続する``/``の畳み込みや
+    ``.``除去等の``PurePosixPath``正規化）をSQLで再現すると、正規化が増えるたびに追随が
+    壊れるため、同じ関数を1回だけ両方に使う。
+
+    まず``id, source_rel_path, result_observation_set_hash``だけを全件読み（本体
+    ``result_payload``を含まないため、メモリは行数×短い文字列に収まる——World全体は保持
+    しないが、1世代の全succeeded行の軽量部分は保持する）。次に
+    ``(sort_key(source_rel_path), result_observation_set_hash, id)``順にPython側で並べ、
+    その順に``batch_size``件ずつ``id = ANY(%s)``で本体を取り出し、並べた順に戻してyieldする。
+    ``sort_key``が不正な``source_rel_path``（絶対パス・``..``等）でValueErrorを出す場合は
+    そのまま呼出側へ伝播する（検査と同じ失敗）。本体取得時点で条件を満たさなくなった
+    （状態が変わった・消えた）idは黙って飛ばす。
     """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
     if batch_size <= 0 or batch_size > 1000:
         raise ValueError("invalid OCR result batch size")
     _ensure()
-    previous: tuple[str, str, int] | None = None
-    while True:
-        where_after = ""
-        params: list[Any] = [selected_world, generation]
-        if previous is not None:
-            where_after = "AND (source_rel_path, result_observation_set_hash, id) > (%s,%s,%s) "
-            params.extend(previous)
-        params.append(batch_size)
-        with _connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
-                "AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL "
-                + where_after
-                + "ORDER BY source_rel_path, result_observation_set_hash, id LIMIT %s",
-                params,
-            ).fetchall()
-        if not rows:
-            return
-        for row in rows:
-            yield row
-        last = rows[-1]
-        previous = (
-            str(last["source_rel_path"]),
-            str(last["result_observation_set_hash"]),
-            int(last["id"]),
+    with _connect() as connection:
+        light_rows = connection.execute(
+            "SELECT id, source_rel_path, result_observation_set_hash FROM ocr_jobs "
+            "WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
+            "AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL",
+            (selected_world, generation),
+        ).fetchall()
+    ordered_ids = [
+        int(row["id"])
+        for row in sorted(
+            light_rows,
+            key=lambda row: (
+                sort_key(str(row["source_rel_path"])),
+                str(row["result_observation_set_hash"]),
+                int(row["id"]),
+            ),
         )
-        if len(rows) < batch_size:
-            return
+    ]
+    for start in range(0, len(ordered_ids), batch_size):
+        batch_ids = ordered_ids[start:start + batch_size]
+        with _connect() as connection:
+            body_rows = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE world=%s AND canonical_generation_id=%s AND status='succeeded' "
+                "AND result_payload IS NOT NULL AND result_observation_set_hash IS NOT NULL AND id = ANY(%s)",
+                (selected_world, generation, batch_ids),
+            ).fetchall()
+        by_id = {int(row["id"]): row for row in body_rows}
+        for row_id in batch_ids:
+            row = by_id.get(row_id)
+            if row is not None:
+                yield row
 
 
 def succeeded_results_snapshot(world: str, canonical_generation_id: str) -> dict[str, int | None]:

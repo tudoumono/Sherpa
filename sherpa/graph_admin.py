@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 from . import agent_constructs, agentic_search, llm, store
+from .investigation_state import GRAPH_REINGEST_LIMIT_FIELD
 from .impact_service import CATEGORY
 from .ingest.model import NODE_LABELS
 from .ingest.world_neo4j import (
@@ -199,8 +200,8 @@ def _cited_from_cards(cards: list[dict]) -> list[dict]:
     return out
 
 
-def _collect(events) -> tuple[str, set, list, dict | None]:
-    """イベント列 → `(answer, docs, cards, usage)`。`usage`（S1）は agentic_search が final イベントに
+def _collect(events) -> tuple[str, set, list, dict | None, dict]:
+    """イベント列 → `(answer, docs, cards, usage, limits)`。`usage`（S1）は agentic_search が final イベントに
     付与した usage メタ（無ければ None）をそのまま返す＝`kind='graph_ask'` の計測に使う。
 
     S1 是正: `not searched` の raise パスは、agentic_search が付与した usage 付きの final イベント自体を
@@ -209,6 +210,7 @@ def _collect(events) -> tuple[str, set, list, dict | None]:
     記録されない（既知の限界・S1 スコープ外＝raise を4タプルに変える改修はしない）。
     """
     answer, docs, cards, searched, usage = "", set(), [], False, None
+    limits: dict = {}
     for ev in events:
         if "node" in ev:
             searched = True
@@ -218,9 +220,10 @@ def _collect(events) -> tuple[str, set, list, dict | None]:
             cards += ev.get("cards") or []
             searched = searched or bool(ev.get("searched"))
             usage = ev.get("usage")
+            limits = ev.get("limits") or {}
     if not searched:
         raise RuntimeError("graph tool was not used")
-    return answer.strip(), docs, cards, usage
+    return answer.strip(), docs, cards, usage, limits
 
 
 def _status_context_text(summary: dict | None) -> str:
@@ -383,9 +386,18 @@ def ask_graph(question: str, world: str, scope_paths=None, settings: dict | None
             return {"status": "llm_unavailable", "world": world, "question": q,
                     "answer": _llm_unavailable_answer(status_summary),
                     "cited_nodes": [], "docs": [], "summary": status_summary}
-        answer, docs, cards, usage = _collect(events)
+        answer, docs, cards, usage, limits = _collect(events)
         from . import metering
         metering.record("graph_ask", prov, mod, usage, user_id=user_id, world=world)
+        if limits.get(GRAPH_REINGEST_LIMIT_FIELD):
+            # グラフそのものを引くのがこの画面の目的＝旧世代グラフでは縮退（grep で代替）しない。
+            # ツール側（`agentic_search.run_tool`）は世代不一致を例外ではなく機械可読コードの結果へ
+            # 変換して調査を続ける契約のため、例外は届かない——run が記録した事実を見て、下の
+            # `except GraphSchemaEraError`（他の入口からの直接の例外）と同じ閉じた理由を返す。
+            _log.warning("graph_ask がスキーマ世代不一致で失敗（fail-loud・world=%s）", world)
+            return {"status": "graph_reingest_required", "world": world, "question": q,
+                    "answer": GRAPH_SCHEMA_ERA_USER_MESSAGE,
+                    "cited_nodes": [], "docs": [], "summary": status_summary}
     except GraphSchemaEraError as e:
         # `graph_neighbors` ツール経由で上がる専用例外を
         # 下の generic except（"failed"）へ丸めず、閉じた理由 `graph_reingest_required` を返す

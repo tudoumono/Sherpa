@@ -27,7 +27,7 @@ import openpyxl
 import pytest
 
 from sherpa import es_index, store, worlds
-from sherpa.ingest import office_md, worker
+from sherpa.ingest import office_md, worker, world_neo4j
 
 
 def _build_world(tmp_path):
@@ -50,11 +50,25 @@ def _bump_marker(dmd, name):
     marker.write_text(marker.read_text(encoding="utf-8") + ";simulated-version-bump", encoding="utf-8")
 
 
+def _fake_es_meta_req(calls: list):
+    """`es_index._req` の外部境界フェイク（実 ES への通信を遮断する・
+    `tests/integration/test_worker_rag_refresh.py::_fake_es_meta_req` と同じ流儀）。`index_world`
+    自体は個別に差し替えて短絡するため、ここまで来るのは bulk 成功後に
+    `index_world_with_human_md_holdback` が呼ぶ `es_index.confirm_human_md_meta`
+    （`_index_meta` の GET→`_meta` 書き直しの PUT）だけの想定。呼び出しを `(method, path)` で
+    記録し、テスト側で「フェイクだけで完結した」ことを確認できるようにする。"""
+    def _req(method, path, body=None, **kw):
+        calls.append((method, path))
+        return {}
+    return _req
+
+
 @pytest.fixture
 def _stub(monkeypatch, tmp_path):
     """`sync()` を DB/Neo4j/ES 無しで駆動する。`office_md`/派生ファイルは実物のまま。"""
     wd, dmd = _build_world(tmp_path)
-    calls: dict[str, list] = {"run": [], "index_world": [], "needs_reindex": [], "reflect_graph": []}
+    calls: dict[str, list] = {"run": [], "index_world": [], "needs_reindex": [], "reflect_graph": [],
+                              "req": []}
 
     # rv-s2-mention #1: 軽量再生成が成功すると `_reflect_graph_after_rag_rewrite`
     # （`build_world_graph`→`world_neo4j.load_world`）が呼ばれるようになった——本ファイルの
@@ -62,6 +76,11 @@ def _stub(monkeypatch, tmp_path):
     # という本ファイルの docstring の前提を保つ）。呼ばれたことだけを記録する。
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite",
                         lambda world: calls["reflect_graph"].append(world))
+    # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——この world_id はどの世界にも
+    # 実在しないため、モックしなければ実 Neo4j 上で「スタンプ無し」と判定され、本ファイルが
+    # 対象としない不変分岐のグラフ修復が意図せず発火する（`reflect_graph` の呼び出し回数が
+    # 崩れる）。整合済み（None）を返し、この経路を評価対象外に保つ。
+    monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
 
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
@@ -75,7 +94,11 @@ def _stub(monkeypatch, tmp_path):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
 
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
+    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)   # 本番の値（常時 rag）で走らせる
+    # `index_world` を短絡しても、bulk 成功後の `confirm_human_md_meta`（`_meta.human_md_sig` の
+    # 書き直し）は `es_index._req` で実 ES へ GET/PUT する別経路——通信の境界（`_req`）自体を
+    # フェイクへ差し替え、実 ES の索引メタデータを書き換えないようにする（Codex RV 2巡目是正）。
+    monkeypatch.setattr(es_index, "_req", _fake_es_meta_req(calls["req"]))
 
     def _index_world(world, content_sig=None, **kw):
         calls["index_world"].append(content_sig)
@@ -133,11 +156,14 @@ def test_sync_rag_drift_only_regenerates_via_real_refresh_rag(_stub):
     _bump_marker(dmd, ".rag_sig")
     assert office_md.rag_sig_drift(dmd) is True
     res = worker.sync("w")
-    assert office_md.rag_sig_drift(dmd) is False    # RAG_ES無効＝refresh_rag自身が確定する
+    assert office_md.rag_sig_drift(dmd) is False    # RAG_ES有効＝ES(index_world)成功後にworkerが確定する
     assert office_md.evidence_ir_sig_drift(dmd) is False   # evidence側は無関係のまま変化しない
     assert _stub["calls"]["run"] == []
     assert res["status"] == "unchanged" and res["changed"] is False
     assert _stub["calls"]["reflect_graph"] == ["w"]  # rv-s2-mention #1: rag.md書換え成功後にグラフも追随させる
+    # 実 ES へは一切通信していない（フェイクの GET/PUT だけで confirm_human_md_meta が完結した）。
+    mapping_path = f"/{es_index._index('w')}/_mapping"
+    assert _stub["calls"]["req"] == [("GET", mapping_path), ("PUT", mapping_path)]
 
 
 def test_sync_evidence_drift_regenerates_via_real_refresh_evidence_ir_only(_stub):
@@ -153,7 +179,7 @@ def test_sync_evidence_drift_regenerates_via_real_refresh_evidence_ir_only(_stub
     assert res["status"] == "unchanged" and res["changed"] is False
 
 
-def test_sync_no_drift_keeps_existing_backfill_and_es_repair(_stub):
+def test_sync_no_drift_keeps_existing_backfill_and_es_repair(_stub, monkeypatch):
     """drift が何も無ければ軽量refreshは呼ばれず、既存の backfill/ES `needs_reindex` 経路が維持される。"""
     dmd = _stub["dmd"]
     old_rag_md = (dmd.parent / "rag" / "a.xlsx.rag.md").read_text(encoding="utf-8")
@@ -163,12 +189,60 @@ def test_sync_no_drift_keeps_existing_backfill_and_es_repair(_stub):
     assert res["status"] == "unchanged" and res["changed"] is False
     assert _stub["calls"]["reflect_graph"] == []   # rag.md自体が書き換わっていない＝グラフ反映も不要
 
+    # `reflect=False` は他段（台帳だけ確定・Neo4j 未反映）と同じくグラフ照合にも入らない
+    # （`check_graph_counts` 自体を呼ばない＝`_stub` の既定モックより厳しく「未呼出」を確認する）。
+    graph_check_calls = []
+    monkeypatch.setattr(world_neo4j, "check_graph_counts",
+                        lambda *a, **kw: graph_check_calls.append(1))
+    res2 = worker.sync("w", reflect=False)
+    assert res2["status"] == "unchanged" and res2["changed"] is False
+    assert graph_check_calls == []
+
+
+def test_sync_unchanged_backfills_legacy_scan_report_missing_new_fields(_stub, monkeypatch):
+    """無変更同期（unchanged 経路）で、保存済み `last_scan_report` が旧形式（`sensitive_excluded`/
+    `unreachable_as_text`/`unreachable_as_text_by_ext` を持たない）なら、sig が一致していても
+    scan_report を再実行して補完する（`corpus_docs.scan_report_missing_fields` が欠落を検知する）。"""
+    legacy = {"scanned": 1, "indexed": 1, "by_doctype": {}, "office_md": 0, "skipped_office": 0,
+             "office_failed": 0, "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
+             "analyzer_declined_as_document": 0, "unreadable": 0}
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": legacy}
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+
+    calls = []
+    monkeypatch.setattr(store, "set_scan_report",
+                        lambda world, report: calls.append((world, report)))
+
+    res = worker.sync("w")
+    assert res["status"] == "unchanged"
+    assert len(calls) == 1
+    saved_world, saved_report = calls[0]
+    assert saved_world == "w"
+    assert {"sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext"} <= saved_report.keys()
+
+
+def test_sync_unchanged_does_not_rebackfill_current_format_scan_report(_stub, monkeypatch):
+    """新形式（3項目を既に持つ）の `last_scan_report` は無変更同期のたびに再走査しない
+    （既存の「1回きりのバックフィル」契約を維持する・毎回の再走査は無駄なコスト）。"""
+    from sherpa import corpus_docs
+    current = {**corpus_docs.empty_scan_report(), "scanned": 1, "indexed": 1}
+    row = {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0, "last_scan_report": current}
+    monkeypatch.setattr(store, "get_world", lambda world: row)
+
+    calls = []
+    monkeypatch.setattr(store, "set_scan_report",
+                        lambda world, report: calls.append((world, report)))
+
+    res = worker.sync("w")
+    assert res["status"] == "unchanged"
+    assert calls == []
+
 
 def test_sync_human_md_only_drift_still_reaches_es_repair_same_call(_stub, monkeypatch):
     """human_md drift だけが起きた場合、`refresh_human_md` が `"handled"` を返しても、同じ
-    `sync()` 呼び出し内で ES の `needs_reindex` 自己修復まで到達する（RAG_ES OFF の world では
-    legacy `{rel}.md` の中身が ES の索引元そのものであり、ここで打ち切ると ES が古いまま次回
-    sync まで取り残されるため）。"""
+    `sync()` 呼び出し内で ES の `needs_reindex` 自己修復まで到達する（human_md は RAG_ES の
+    ON/OFF に関わらず ES の索引元に影響しうる——rag_chunks が無効/劣化した文書は legacy
+    `{rel}.md` へ縮退するため。ここで打ち切ると ES が古いまま次回 sync まで取り残される）。"""
     dmd = _stub["dmd"]
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "bumped-human-md-version")
     assert office_md.human_md_sig_drift(_stub["wd"], dmd) is True
@@ -536,16 +610,6 @@ def test_sync_refresh_failure_skips_es_and_marker(_stub, monkeypatch):
     assert office_md.rag_sig_drift(dmd) is True
 
 
-def test_rag_es_off_refresh_confirms_marker_itself(_stub):
-    """RAG_ES 無効時は `write_rag_sig_marker=False` を渡さない（既定 True のまま呼ぶ）契約を、
-    実際に refresh_rag 自身がマーカーを確定することで確認する。"""
-    dmd = _stub["dmd"]
-    _bump_marker(dmd, ".rag_sig")
-    worker.sync("w")
-    assert _stub["calls"]["index_world"] == []
-    assert office_md.rag_sig_drift(dmd) is False
-
-
 def test_holdback_unlink_failure_aborts_before_generation_and_keeps_marker(_stub, monkeypatch):
     """holdback（生成開始前の `.rag_sig` 削除）が実際に OSError で失敗すると、refresh は着手せず
     既存の `.rag_sig`／既存の `.rag.md` はどちらも無傷のまま残る（chmod で実際に unlink を失敗させる）。"""
@@ -667,13 +731,6 @@ def test_sidecar_missing_fallback_drops_rag_sig_when_rag_es_enabled(_stub, monke
     # run() 自体は mock なので派生物は復元されないが、`.rag_sig` は実際に drop_rag_sig_marker で
     # 削除される（次回 sync が分岐③へ確実に入るようにするため）。
     assert not (_stub["dmd"] / ".rag_sig").is_file()
-
-
-def test_sidecar_missing_fallback_no_drop_when_rag_es_disabled(_stub):
-    (_stub["dmd"].parent / "ir" / "a.xlsx.evidence.json").unlink()
-    marker_present_before = (_stub["dmd"] / ".rag_sig").is_file()
-    worker.sync("w")
-    assert (_stub["dmd"] / ".rag_sig").is_file() == marker_present_before   # RAG_ES無効なら触らない
 
 
 def test_sidecar_missing_detected_even_without_version_drift(_stub):

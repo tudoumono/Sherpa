@@ -257,6 +257,31 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
             "had_code_candidates": had_code_candidates}
 
 
+def _classify_verdict_reachable(result: dict) -> bool:
+    """`classify_document()` の戻り値から「本文をテキストとして読める（grep/精読/ES 索引の対象に
+    してよい）」かを導く単一の式。`kind=="code"`、または `kind=="document"` で `doctype` が付く
+    （登録済み資料種別／軽量テキスト枠の第1段・第2段いずれか）なら True。`kind=="unreadable"`
+    （読み取り不可）、または `doctype` が付かない `kind=="document"`（秘匿名・Office/画像・
+    declined 登録拡張子・内容が実質バイナリ）は False。
+
+    `_safe_doc_path`・`grep_search`・`_safe_original_path`（file_head）・`reachable_as_text` が
+    この1つの式を共有する（拡張子の許可リストではなく、常にこの確定判定が可否を決める）。
+    """
+    return result["kind"] == "code" or (result["kind"] == "document" and result.get("doctype") is not None)
+
+
+def reachable_as_text(rel_path: str, ext: str, read_head) -> bool:
+    """本文を検索・精読・索引の対象として読めるか（grep/`_safe_doc_path`/ES 索引が共有する判定）。
+
+    Office/PDF/画像は対象外——本文は派生MD経由でしか読めないため、呼び出し側がここへ来る前に
+    別解決（派生MD の実在確認）へ分岐する（本関数はその分岐を持たない）。秘匿ファイルは
+    `classify_document()` が内部で先に弾くため False になる。拡張子が登録済みかどうかは問わない
+    ——未登録拡張子（軽量テキスト枠の第2段・拡張子なし含む）でも内容が実際にテキストと判定できれば
+    True。
+    """
+    return _classify_verdict_reachable(classify_document(rel_path, ext, read_head))
+
+
 def _read_head(rp: Path, size: int = 4096) -> str:
     """先頭 `size` **バイト**を読み UTF-8（不正/途中で切れたバイト列は置換）でデコードする
     （`registry.resolve_lazy` の内容判定専用・head だけで足りる経路が使う軽量版）。
@@ -321,7 +346,7 @@ def _read_head_for_status(world: str, rel_path: str, size: int = 4096) -> str:
     return _read_head(rp, size)
 
 
-def status_document_doctype(rel_path: str, world: str) -> str | None:
+def status_document_doctype(rel_path: str, world: str, *, allow_content_sniff: bool = False) -> str | None:
     """文書状態APIが列挙する原本のdoctype。対象外の付帯物・重要度設定ファイル自体は ``None``。
 
     通常の文書台帳は検索可能になった文書だけを返すため、変換に失敗して派生物を持たない
@@ -335,18 +360,20 @@ def status_document_doctype(rel_path: str, world: str) -> str | None:
     `/ext/v1/doc` の配信可否・`document_count` の両方がこの1関数を経由する）——classify_document
     より前に判定する（除外対象の内容は読まない）。
 
-    `classify_document(..., allow_content_sniff=False)`: 軽量テキスト枠（`ingest.text_kind`）の
-    第2段（未知拡張子・拡張子なしの内容推定）は行わない——`manifest_doctype_count`（`ingest/
-    worker.py` がホットパスで使う）が想定する「追加の走査/world root 再解決をしない」契約を
-    守るため（`_read_head_for_status` docstring 参照）。第1段（拡張子マップ）で判定できる
-    軽量テキストは対象のまま（`text_kind.classify_ext` は内容を読まない）。
+    `allow_content_sniff`（既定 False）: 軽量テキスト枠（`ingest.text_kind`）の第2段
+    （未知拡張子・拡張子なしの内容推定）を行うか。既定 False は `manifest_doctype_count`
+    （`ingest/worker.py` がホットパスで使う）が想定する「追加の走査/world root 再解決をしない」
+    契約を守るため（`_read_head_for_status` docstring 参照）——manifest 件数分の呼び出しになる
+    経路はこの既定のまま使う。単発の doc_id 解決（`agentic_search.verify_doc_exists`・
+    `ext_api.ext_doc` の配信可否）は `True` を渡す——第2段の文書（未登録拡張子でも内容がテキストと
+    判定できるもの）を「存在しない」と誤判定しないため（1回の追加解決/読み取りのコストは許容する）。
     """
     if importance.is_importance_control_path(rel_path):
         return None
     ext = Path(rel_path).suffix.lower()
     result = classify_document(
         rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
-        allow_content_sniff=False)
+        allow_content_sniff=allow_content_sniff)
     return _doctype_for_count(result, ext)
 
 
@@ -373,6 +400,45 @@ def _doctype_for_count(result: dict, ext: str) -> str | None:
     if ext in office_md.IMAGE_EXT:
         return _IMAGE_DOCTYPE_LABEL
     return None
+
+
+def status_document_reachable(rel_path: str, world: str, *, allow_content_sniff: bool = False) -> bool | None:
+    """文書として実在し、原本DL・実在確認で配信/確認してよいかを3値で返す——曖昧な状態を
+    True/False へ丸めない。
+
+    - `True`：`classify_document()` が「読める」と積極的に確定した（`kind=="code"`／
+      `kind=="document"` で doctype 確定、または Office/PDF/画像＝拡張子分類のみで内容は読まない）。
+    - `False`：積極的に「対象外」と確定した（秘匿名・重要度制御ファイル・内容が実質バイナリ・
+      declined 拡張子等）。
+    - `None`：**判定できなかった**（`kind=="unreadable"`＝内容判定に必要な読み取り自体が失敗。
+      パスが長すぎて `lstat` が失敗する等）。
+
+    呼び出し元は **`is True` のときだけ**配信/実在扱いにする（fail-closed）。`status_document_
+    doctype()` は `kind=="unreadable"` を `_UNREADABLE_DOCTYPE_LABEL`（非 None）として返すため、
+    「配信してよいか」の判定にそのまま使うと判定不能を「読める」と取り違える——`resolve_path`
+    （`os.lstat` で完全パスを都度渡す）と配信側の `open_file_nofollow_walk`（dir_fd 相対で1段ずつ
+    open する・単一コンポーネント長の制約しか受けない）は実効的なパス長上限が異なるため、
+    内容判定だけが失敗し配信は成功する実害があった。`status_document_doctype()` 自体は
+    台帳・件数表示（「読み取れません」の明示バッジ）用に非 None のまま維持する——用途が違う。
+    """
+    if importance.is_importance_control_path(rel_path):
+        return False
+    ext = Path(rel_path).suffix.lower()
+    result = classify_document(
+        rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
+        allow_content_sniff=allow_content_sniff)
+    if result.get("sensitive"):
+        return False
+    if result["kind"] == "unreadable":
+        return None
+    if _classify_verdict_reachable(result):
+        return True
+    if ext in _OFFICE_DOCTYPE:
+        return True
+    from .ingest import office_md
+    if ext in office_md.IMAGE_EXT:
+        return True
+    return False
 
 
 def manifest_doctype_count(manifest: dict, world: str) -> int:
@@ -618,6 +684,20 @@ def _size_exceeded_row(rel: str, doctype: str, branch: str) -> dict:
             "reason": "size_exceeded", "md_path": None, **_scope_meta(rel)}
 
 
+# `scan_report()` へフィールドを追加したとき、追加前に保存された `worlds.last_scan_report`
+# はこのキーを持たない——`routers.worlds._ingest_summary`（response_model 必須フィールド）・
+# `ingest.worker._sync_impl`（無変更同期のバックフィル判定）が `scan_report_missing_fields()`
+# 経由で共有する単一のキー集合。
+SCAN_REPORT_REQUIRED_KEYS = ("sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext")
+
+
+def scan_report_missing_fields(rep) -> bool:
+    """`rep`（`last_scan_report` 列の値）が dict だが `SCAN_REPORT_REQUIRED_KEYS` のいずれかを
+    持たない（フィールド追加前に保存された旧形式）なら True。dict でない（None 等）場合は False
+    （呼び出し元の `is None` 判定と別に扱う——完全欠落と旧形式は別の枝）。"""
+    return isinstance(rep, dict) and any(k not in rep for k in SCAN_REPORT_REQUIRED_KEYS)
+
+
 def empty_scan_report() -> dict:
     """`scan_report()` の全ゼロ形（world 未解決の返値と同形）。
 
@@ -627,6 +707,7 @@ def empty_scan_report() -> dict:
     return {"scanned": 0, "indexed": 0, "by_doctype": {}, "office_md": 0,
             "skipped_office": 0, "office_failed": 0, "skipped_other": 0, "skipped_ext": {},
             "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0,
+            "sensitive_excluded": 0, "unreachable_as_text": 0, "unreachable_as_text_by_ext": {},
             "document_count": 0}
 
 
@@ -666,6 +747,14 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     再解決なし）——`ingest/worker.py` の成功確定経路はこの値をそのまま `confirm_doc_count` に使い、
     `manifest_doctype_count()` を別途呼ばない（HTML 等の accepts() 上書きアナライザに対する per-file
     `documents.resolve`→`worlds.world_dir` 再解決の重複を無くす）。
+
+    `sensitive_excluded`＝秘匿名（`text_kind.is_sensitive`）で分類自体をスキップした件数——拡張子
+    内訳は持たない（存在を推測させない）。`unreachable_as_text`＝`reachable_as_text` が False になる
+    （＝grep/read_around/ES 索引のどれからも本文を読めない）ファイルの総数（`unreadable` の読み取り
+    失敗・サイズ超過分＋`skipped_other` のうち Office/画像でも無い未分類分＋`sensitive_excluded` の
+    合算）。`unreachable_as_text_by_ext`＝そのうち秘匿を除いた拡張子別内訳（`skipped_ext` とは別の
+    Counter——`skipped_ext` は Office/画像の変換失敗・未対応も混ざるため、本文readabilityだけの
+    内訳を別に持つ）。
     """
     wd = worlds.world_dir(world)
     if not wd:
@@ -676,6 +765,8 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     (indexed, by, office_md_n, office_skip, office_fail, other, skipped_ext,
      analyzer_declined, analyzer_declined_as_document, unreadable, doc_count) = (
         0, Counter(), 0, 0, 0, 0, Counter(), 0, 0, 0, 0)
+    sensitive_excluded = 0
+    unreachable_ext: Counter = Counter()   # `unreadable`＋`other`（本文readability起因のみ）の拡張子別内訳
     scanned = 0
     # `expected_rels` 比較用（省略時は集めない＝無駄なメモリ確保を避ける）。manifest と同じ母集合
     # （重要度設定ファイルも含む全 rel）にするため、下の `continue` より前で追加する。
@@ -695,8 +786,9 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             return cache[size]
 
         result = classify_document(rel, ext, _cached_read_head)
-        if result.get("sensitive"):          # 秘匿名: 台帳にも件数にも入れない
+        if result.get("sensitive"):          # 秘匿名: 台帳にも by_doctype/skipped_ext にも入れない
             _log.warning("scan_report: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
+            sensitive_excluded += 1          # 拡張子内訳は持たない（存在を推測させない）
             continue
         # `document_count`（`/ext/v1/capabilities` の doc_count が使う値）: `manifest_doctype_count`/
         # `status_document_doctype` と同一の判定（`allow_content_sniff=False`）を、本ループが既に
@@ -712,11 +804,13 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             doc_count += 1
         if result["kind"] == "unreadable":
             unreadable += 1
+            unreachable_ext[ext or "(拡張子なし)"] += 1
             continue
         if result["kind"] == "code":
             if _text_oversize(rp):
                 unreadable += 1                         # 登録アナライザ/軽量テキスト枠のコード全般・サイズ超過は対象外（failure_reasons.size_exceeded）
                 skipped_ext[ext] += 1
+                unreachable_ext[ext or "(拡張子なし)"] += 1
                 continue
             indexed += 1
             by[result["doctype"]] += 1
@@ -725,6 +819,7 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             if result["doctype"] == text_kind.DOCUMENT_DOCTYPE_LABEL and _text_oversize(rp):
                 unreadable += 1                         # 軽量テキスト枠のみ・サイズ超過は対象外
                 skipped_ext[ext] += 1
+                unreachable_ext[ext or "(拡張子なし)"] += 1
                 continue
             indexed += 1
             by[result["doctype"]] += 1
@@ -767,6 +862,7 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
                 analyzer_declined += 1
             other += 1
             skipped_ext[ext or "(拡張子なし)"] += 1
+            unreachable_ext[ext or "(拡張子なし)"] += 1
     if expected_rels is not None and actual_rels != expected_rels:
         doc_count = None            # 世代混在（走査中の増減）＝実値を確定できないので更新保留
     return {"scanned": scanned, "indexed": indexed, "by_doctype": dict(by), "office_md": office_md_n,
@@ -774,6 +870,9 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             "skipped_other": other, "skipped_ext": dict(skipped_ext),
             "analyzer_declined": analyzer_declined,
             "analyzer_declined_as_document": analyzer_declined_as_document, "unreadable": unreadable,
+            "sensitive_excluded": sensitive_excluded,
+            "unreachable_as_text": unreadable + other + sensitive_excluded,
+            "unreachable_as_text_by_ext": dict(unreachable_ext),
             "document_count": doc_count}
 
 

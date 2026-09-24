@@ -253,7 +253,8 @@ def test_uninvited_direct_get_and_received_append_rejected():
 
     append = invitee.post(
         "/chat",
-        json={"message": "append should fail", "world": "v1", "conversation_id": wid},
+        json={"message": "append should fail", "world": "v1", "conversation_id": wid,
+              "stream_id": f"s4-append-{sfx}"},
     )
     assert append.status_code == 403, append.text
 

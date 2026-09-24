@@ -320,6 +320,17 @@ def run_troubleshoot(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, in
     return result
 
 
+class NeighborCardsFailure(list):
+    """`neighbor_cards` が内部で障害を捕捉したときだけ返す `list` のサブクラス（常に空）——戻り値の
+    型（`list`）自体は変えず、呼び出し元（`agentic_search.run_tool`）が `getattr(raw_cards,
+    "error_code", None)` で固定コードを拾えるようにする防御的な実装細部。通常の空リスト
+    （0件ヒット）とは `error_code` 属性の有無で区別できる。"""
+
+    def __init__(self, error_code: str):
+        super().__init__()
+        self.error_code = error_code
+
+
 def neighbor_cards(world, term, scope_paths=None) -> list:
     """関係グラフの**近傍カード**（原因候補）を返す。agentic ツール `graph_neighbors` 専用＝AI が
     「何を調べるか」を決めてグラフを引けるよう、`_troubleshoot_cards` を**自前で Neo4j セッションを
@@ -327,10 +338,17 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
     card をそのまま返す（agentic_search 側の構造 Evidence 生成が使う・公開経路には出さない）。
     Neo4j 不可・未解決はグレースフルに `[]`（agentic はツール結果が空でも他の道具で続行できる）。
 
-    **`GraphSchemaEraError` だけは再送出**する（`impact_service.presumed_impact` の
-    `GraphQueryOverloadError` 特別扱いと同じ流儀）——旧世代の実データを黙って空カードへ縮退させると
-    「見つからなかった」（本当に0件）と「読めない世代のグラフ」を区別できず、チャット側
-    （`chat_service._degrade_overload`）が honest failure を出す機会を失う。
+    捕捉した障害は握りつぶさず `NeighborCardsFailure`（`error_code` 属性を持つ空 `list`）で返す——
+    呼び出し元（`agentic_search.run_tool` の `graph_neighbors` 分岐）はこの属性を見て
+    `InvestigationState.backend_failures["graph"]`/`non_recoverable_failure` へ反映する
+    （`_record_tool_result_error_code` 参照）。接続系（`DriverError`/`TransientError`）は
+    `"graph_unavailable"`（回復可能）、それ以外（プログラムの欠陥・クエリのバグ等）は
+    `"graph_internal_error"`（回復不可）。型名はログに残す（例外の本文・メッセージは残さない）。
+
+    **`GraphSchemaEraError` だけは再送出**する——旧世代の実データを黙って空カードへ縮退させると
+    「見つからなかった」（本当に0件）と「読めない世代のグラフ」を区別できない。呼び出し元
+    （`agentic_search.run_tool` の `graph_neighbors` 分岐）がこの例外を機械可読コード
+    （`graph_reingest_required`）のツール結果へ変換し、調査は grep/原本直読で続く。
     """
     if not (term or "").strip():
         return []
@@ -348,8 +366,90 @@ def neighbor_cards(world, term, scope_paths=None) -> list:
         return cards
     except GraphSchemaEraError:
         raise
-    except Exception:
+    except Exception as exc:
+        from neo4j.exceptions import ConfigurationError, DriverError, TransientError
+        # `ConfigurationError` は階層上 `DriverError` のサブクラスだが意味的には非一時的な設定
+        # 不備＝回復不可（`agentic_search._is_recoverable_tool_exception` と同じ分類・別枠で除外）。
+        recoverable = not isinstance(exc, ConfigurationError) and isinstance(exc, (DriverError, TransientError))
+        _log.warning("lens_service: neighbor_cards 取得に失敗（回復%s）: %s errno=%s",
+                    "可" if recoverable else "不可", type(exc).__name__, getattr(exc, "errno", None))
+        return NeighborCardsFailure("graph_unavailable" if recoverable else "graph_internal_error")
+    finally:
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:
+                pass
+
+
+def _resolve_anchor_by_name(session, term, world, scope_prefixes=None):
+    """起点をグラフから**名前の一致**で直接引く（`resolve_anchor` と異なり world の全ノード名は
+    読まない・素の Codex モード専用・§1.3）。完全一致（`n.name = $term`）が0件のときだけ大文字小文字
+    無視の一致を試す。範囲の述語は `resolve_anchor` と同じ `_scope_pred`。"""
+    sp = list(scope_prefixes or [])
+    rows = _run_capped(
+        session,
+        f"MATCH (n:Entity {{world_id:$w}}) WHERE {_scope_pred('n')} AND n.name = $term "
+        "RETURN DISTINCT n.canonical_id AS cid, n.name AS name",
+        log_world=world, w=world, prefixes=sp, term=term,
+    )
+    if not rows:
+        rows = _run_capped(
+            session,
+            f"MATCH (n:Entity {{world_id:$w}}) WHERE {_scope_pred('n')} AND toLower(n.name) = toLower($term) "
+            "RETURN DISTINCT n.canonical_id AS cid, n.name AS name",
+            log_world=world, w=world, prefixes=sp, term=term,
+        )
+    return [(r["cid"], r["name"]) for r in rows]
+
+
+def neighbor_cards_graph_only(world, term, scope_paths=None) -> list:
+    """`neighbor_cards` のグラフだけ版（素の Codex モード＝`plain`・§1.3・§4）。grep は一切しない
+    （本文は Codex 自身がシェルで読む）——起点は `_resolve_anchor_by_name`（名前の一致で直接引く・
+    world の全ノード名は読まない）、近傍は既存の `neo4j_related` をそのまま使う。返すカードの
+    `evidence.grep` は常に空リスト・`source` は常に `"graph"`（grep 由来の evidence が無いため
+    `neighbor_cards` の "both" 分岐は起きない）。
+
+    戻り値の形・失敗の扱いは `neighbor_cards` と同じ（`cid` 付きカードの `list`・Neo4j 不可／
+    未解決は `NeighborCardsFailure`（`error_code` 属性つき空 `list`）・`GraphSchemaEraError` は
+    再送出＝旧世代グラフを黙って空へ縮退させない）。
+    """
+    if not (term or "").strip():
         return []
+    driver = None
+    try:
+        from neo4j import GraphDatabase
+
+        from .ingest import world_neo4j
+        env = world_neo4j._env()
+        driver = GraphDatabase.driver(env["uri"], auth=(env["user"], env["pw"]))
+        sp = scope.normalize_scope_paths(scope_paths) or None
+        with driver.session() as s:
+            pairs = _resolve_anchor_by_name(s, term, world, sp)
+            anchors = [c for c, _n in pairs]
+            related = neo4j_related(s, anchors, world, sp)
+        cards: list[dict] = []
+        for nb in related:
+            if nb["label"] == "DataItem":            # 末端の項目は粒度が細かすぎる（影響レンズで見る）
+                continue
+            cards.append({
+                "name": nb["name"], "label": nb["label"], "category": nb["category"],
+                "role": _ROLE.get(nb["label"], "近傍"), "distance": nb["distance"], "path": nb["path"],
+                "source": "graph",
+                "evidence": {"edges": nb["edges"], "grep": []},
+                "cid": nb["cid"],
+            })
+        cards.sort(key=lambda c: (_ROLE_RANK.get(c["label"], 9),
+                                  c["distance"] if c["distance"] is not None else 99, c["name"]))
+        return scope.filter_items(cards, sp)
+    except GraphSchemaEraError:
+        raise
+    except Exception as exc:
+        from neo4j.exceptions import ConfigurationError, DriverError, TransientError
+        recoverable = not isinstance(exc, ConfigurationError) and isinstance(exc, (DriverError, TransientError))
+        _log.warning("lens_service: neighbor_cards_graph_only 取得に失敗（回復%s）: %s errno=%s",
+                    "可" if recoverable else "不可", type(exc).__name__, getattr(exc, "errno", None))
+        return NeighborCardsFailure("graph_unavailable" if recoverable else "graph_internal_error")
     finally:
         if driver is not None:
             try:

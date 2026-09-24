@@ -18,7 +18,6 @@ def test_chat_streams_answer_with_explicit_scope(page, web_base_url):
     page.goto(f"{web_base_url}/chat.html")
 
     expect(page.locator("#messages")).to_contain_text("気になること")
-    page.locator("#kbtoggle").click()
     expect(page.locator("#scopesel")).to_be_visible()
 
     page.locator("#scopebtn").click()
@@ -52,7 +51,6 @@ def test_scope_panel_tree_collapses_to_top_level_by_default(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#scopebtn").click()
 
     expect(page.locator("#scopepanel [data-scope='4期']")).to_be_visible()
@@ -72,7 +70,6 @@ def test_scope_panel_toggle_click_does_not_change_selection(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#scopebtn").click()
 
     page.locator("#scopepanel [data-toggle='4期']").click()
@@ -103,7 +100,6 @@ def test_scope_panel_filter_narrows_and_selects_then_reverts_to_tree(page, web_b
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#scopebtn").click()
 
     page.locator("#scopefilter").fill("ソース")
@@ -1806,7 +1802,6 @@ def test_chat_sources_stay_single_list_without_sources_verified(page, web_base_u
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率を変えたい。影響は？")
     page.locator("#send").click()
 
@@ -1880,7 +1875,6 @@ def test_inquiry_block_lens_segment_sets_body_lens_and_grays_layer(page, web_bas
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
     expect(page.locator("#messages")).to_contain_text("気になること")
-    page.locator("#kbtoggle").click()
 
     page.locator("#lens-seg [data-lens='impact']").click()
     expect(page.locator("#lens-seg [data-lens='impact']")).to_have_class(re.compile(r"\bon\b"))
@@ -1903,7 +1897,6 @@ def test_inquiry_block_layer_segment_sets_body_layer(page, web_base_url):
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#layer-seg [data-layer='code']").click()
     expect(page.locator("#layer-seg [data-layer='code']")).to_have_class(re.compile(r"\bon\b"))
@@ -1981,7 +1974,7 @@ def test_inquiry_restore_auto_lens_resets_but_layer_persists(page, web_base_url)
     expect(page.locator("#layer-seg [data-layer='code']")).to_have_class(re.compile(r"\bon\b"))
 
 
-# ===== SC-6c: 調べる深さ（標準/深く/最大・調べ方ブロック §3.2）=====
+# ===== SC-6c: 調べる深さ（クイック/標準/深く/最大・調べ方ブロック §3.2）=====
 
 _DEPTH_DEEP_ANSWER = {
     "lens": "qa", "headline": "該当箇所が1件見つかりました。",
@@ -2005,7 +1998,6 @@ def test_inquiry_depth_profile_deep_send_reflects_body_and_header(page, web_base
         {"type": "answer", "conversation_id": 101, "message": {"answer": _DEPTH_DEEP_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#depth-seg [data-depth='deep']").click()
     expect(page.locator("#depth-seg [data-depth='deep']")).to_have_class(re.compile(r"\bon\b"))
@@ -2018,6 +2010,31 @@ def test_inquiry_depth_profile_deep_send_reflects_body_and_header(page, web_base
     body = records["turn_starts"][-1]
     assert body.get("depth_profile") == "deep"
     expect(page.locator("#messages")).to_contain_text("調べる深さ: 深く・所要 4分12秒")
+
+
+def test_inquiry_depth_profile_quick_send_reflects_body_and_header(page, web_base_url):
+    """「クイック」（見直しなし）も他の段と同じく `body.depth_profile` に載り、回答ヘッダに
+    「調べる深さ: クイック」として出る。"""
+    from playwright.sync_api import expect
+
+    answer = {**_DEPTH_DEEP_ANSWER,
+              "scope": {**_DEPTH_DEEP_ANSWER["scope"], "depth_profile": "quick"}}
+    records = install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+
+    page.locator("#depth-seg [data-depth='quick']").click()
+    expect(page.locator("#depth-seg [data-depth='quick']")).to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator("#inquiry-chip-label")).to_contain_text("クイック")
+
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    body = records["turn_starts"][-1]
+    assert body.get("depth_profile") == "quick"
+    expect(page.locator("#messages")).to_contain_text("調べる深さ: クイック・所要 4分12秒")
 
 
 def test_inquiry_restore_depth_profile_from_history(page, web_base_url):
@@ -2082,7 +2099,6 @@ def test_inquiry_tools_graph_only_send_reflects_body_and_hides_grep_fulltext_nod
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TOOLS_GRAPH_ONLY_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-details-body")).to_be_visible()
@@ -2110,7 +2126,6 @@ def test_inquiry_tools_last_one_cannot_be_turned_off(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
 
     page.locator("#tools-seg [data-tool='grep']").click()
@@ -2129,7 +2144,6 @@ def test_inquiry_tools_unavailable_chip_hidden(page, web_base_url):
 
     install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='graph']")).to_be_hidden()
     expect(page.locator("#tools-seg [data-tool='grep']")).to_be_visible()
@@ -2144,7 +2158,6 @@ def test_inquiry_tools_last_one_gating_ignores_unavailable_tool(page, web_base_u
 
     install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     page.locator("#tools-seg [data-tool='grep']").click()
     fulltext_btn = page.locator("#tools-seg [data-tool='fulltext']")
@@ -2162,7 +2175,6 @@ def test_inquiry_tools_unavailable_axis_omitted_from_send_avoids_422(page, web_b
 
     records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='graph']")).to_be_hidden()
 
@@ -2205,7 +2217,6 @@ def test_retry_hint_tools_button_resends_explicit_on_even_if_still_unavailable(p
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TOOLS_RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("OFF にした検索を戻す")
@@ -2243,7 +2254,6 @@ def test_inquiry_tools_toggle_off_then_on_sends_explicit_despite_availability_dr
 
     page.route("**/chat/turns", handle_turn_start)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
 
     graph_btn = page.locator("#tools-seg [data-tool='graph']")
@@ -2266,7 +2276,6 @@ def test_inquiry_tools_last_one_rapid_clicks_stay_on(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     page.locator("#tools-seg [data-tool='grep']").click()
     page.locator("#tools-seg [data-tool='fulltext']").click()
@@ -2287,7 +2296,6 @@ def test_inquiry_tools_chip_keyboard_activation_toggles(page, web_base_url):
 
     install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#tools-details-head").click()
     grep_btn = page.locator("#tools-seg [data-tool='grep']")
     grep_btn.focus()
@@ -2413,7 +2421,6 @@ def test_slash_prefix_message_sent_verbatim_without_body_lens(page, web_base_url
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("/影響 消費税率を変えたい")
     page.locator("#send").click()
@@ -2448,7 +2455,6 @@ def test_retry_hint_button_broadens_scope_and_resends(page, web_base_url):
         {"type": "answer", "conversation_id": 101, "message": {"answer": _RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("範囲を全体に広げる")
@@ -2485,7 +2491,6 @@ def test_retry_hint_button_raises_depth_profile_and_resends(page, web_base_url):
         {"type": "answer", "conversation_id": 101, "message": {"answer": _DEPTH_RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("調べる深さを上げて探す")
@@ -2523,7 +2528,6 @@ def test_codex_timeout_note_and_continue_button_resends_fixed_message(page, web_
         {"type": "answer", "conversation_id": 101, "message": {"answer": _CODEX_TIMEOUT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("次に資料を確認します。")
@@ -2562,7 +2566,6 @@ def test_codex_stopped_early_note_and_continue_button_resends_fixed_message(page
         {"type": "answer", "conversation_id": 101, "message": {"answer": _CODEX_STOPPED_EARLY_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
     page.locator("#input").fill("消費税率とは？")
     page.locator("#send").click()
     expect(page.locator("#messages")).to_contain_text("次に資料を確認します。")
@@ -2637,7 +2640,6 @@ def test_confirm_first_resend_restores_slash_lens_via_question_payload(page, web
     records = install_api_mocks(page)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("/影響 税率表を確認してから進めて。")
     page.locator("#send").click()
@@ -2688,7 +2690,6 @@ def test_confirm_first_resend_restores_tools_from_question_payload(page, web_bas
     records = install_api_mocks(page)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
-    page.locator("#kbtoggle").click()
 
     page.locator("#input").fill("原因を確認してから進めて。")
     page.locator("#send").click()
@@ -3025,3 +3026,366 @@ def test_mdlite_indented_table_and_quote_after_list_item_are_blocks(page, web_ba
 def test_mdlite_fence_in_second_level_list_is_recognized(page, web_base_url):
     html = _md(page, web_base_url, "1. 親\n   1. 子\n      ```\n      SELECT 1\n      ```")
     assert html == '<ol><li>親<ol><li>子<pre class="md-code"><code>SELECT 1</code></pre></li></ol></li></ol>'
+
+
+def test_inquiry_restore_only_touched_axis_is_explicit(page, web_base_url):
+    """S4（裁定⑦）: 会話メタに保存した明示状態（`scope.tools_explicit`）だけを明示扱いにする——
+    触っていない軸（ここでは graph・既定のまま ON）は復元後も未操作のままなので、その軸が不達でも
+    送信 body に含まれず 422 にならない。是正前は1軸でも非既定なら3軸すべてを明示扱いにしていたため、
+    無操作の追質問だけで「不達なのに明示 ON」となり 422 になっていた。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
+    page.goto(f"{web_base_url}/chat.html?conv=118")
+    expect(page.locator("#messages")).to_contain_text("消費税率")
+
+    page.locator("#input").fill("影響範囲を教えて")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+    expect(page.locator("#messages")).not_to_contain_text("現在利用できません")
+
+    body = records["turn_starts"][-1]
+    assert "graph" not in body["tools"], "触っていない graph は明示扱いにしない（不達なら省略）"
+    assert body["tools"].get("grep") is False        # 実際に切り替えた軸は復元して送る
+    assert body["tools_explicit"] == ["grep"]        # 明示状態そのものも次ターンへ引き継ぐ
+
+
+def test_confirm_first_resend_does_not_persist_override_as_explicit(page, web_base_url):
+    """S4（裁定⑦）: 確認カードの再送（override）は payload の検索経路トグルを1回限りそのまま送る
+    （全軸を明示扱いにして省略しない）——しかし会話メタへ保存する明示状態（`tools_explicit`）には
+    載せない。載せると以後その会話は触っていない軸まで明示扱いになり、その軸が不達のとき 422 になる。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    calls = {"n": 0}
+
+    def handle_turn_stream(route):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            events = [
+                {"type": "question", "conversation_id": 101, "interaction_id": "confirm-tools2",
+                 "mode": "single",
+                 "prompt": "確認してから進めるよう指定されています。何を確認してから進めますか？",
+                 "options": [{"id": "scope", "label": "対象範囲（どの資料/システムか）",
+                             "description": "どのフォルダ・資料・システムを対象にするか"}],
+                 "allow_free_text": True, "original_message": "原因を確認してから進めて。",
+                 "lens": "qa", "layer": None, "scope_paths": [],
+                 "lens_source": "explicit", "lens_block": None,
+                 "tools": {"grep": True, "fulltext": True, "graph": True}},
+            ]
+        else:
+            events = [{"type": "answer", "conversation_id": 101, "message": {"answer": IMPACT_ANSWER}}]
+        body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events)
+        route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=body)
+
+    records = install_api_mocks(page)
+    page.route("**/chat/turns/*/stream?**", handle_turn_stream)
+    page.goto(f"{web_base_url}/chat.html")
+
+    page.locator("#input").fill("原因を確認してから進めて。")
+    page.locator("#send").click()
+    expect(page.locator(".askcard")).to_be_visible()
+
+    page.locator("[data-qopt]").first.check()
+    page.locator("[data-ask-submit]").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    resend = records["turn_starts"][1]
+    assert resend.get("tools") == {"grep": True, "fulltext": True, "graph": True}   # 送信は1回限り全軸明示
+    assert "tools_explicit" not in resend, "チップを触っていないのに明示状態として保存してはいけない"
+
+
+_TROUBLE_DEGRADED_ANSWER = {
+    "lens": "troubleshoot",
+    "headline": "関係のつながりをたどる検索が使えないため、資料とソースを直接調べて回答します。\n\n夜間バッチの停止は TAXCALC の異常終了が原因の可能性があります。",
+    "route": {"path": ["文書を検索"]}, "summary": {"total": 1},
+    "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both"},
+    # グラフ不調の縮退は qa 相当の下地（citations・candidates 無し）で返る。
+    "data": {"type": "qa", "citations": [
+        {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [10, 12], "quote": "ABEND-CODE 0C7"}]},
+    "sources": [],
+}
+
+
+def test_troubleshoot_without_candidates_falls_back_to_citation_view(page, web_base_url):
+    """S4: グラフ縮退の troubleshoot は原因候補（candidates）を持たない qa 形の下地で返る——
+    原因候補の表示を選ぶと該当箇所が消えるため、impact と同じく引用表示へ落とす。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": _TROUBLE_DEGRADED_ANSWER}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("夜間バッチが止まる")
+    page.locator("#send").click()
+    expect(page.locator("#messages")).to_contain_text("資料とソースを直接調べて回答します")
+    expect(page.locator("#messages")).to_contain_text("該当箇所 (1)")   # 引用表示へ落ちている
+
+
+def test_export_includes_citations_when_troubleshoot_degraded_to_qa_shape(page, web_base_url, tmp_path):
+    """S4: グラフ縮退の troubleshoot（原因候補が無く qa 相当の下地）でも、書き出し・コピーに
+    該当箇所（citations）が入る——画面（render.js）と同じ条件で並べる。"""
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html?conv=119")
+    page.wait_for_selector("#messages .cites")
+
+    page.locator("#exportbtn").click()
+    with page.expect_download() as dl_info:
+        page.locator("#exportmenu [data-exp='txt']").click()
+    txt_path = tmp_path / "export_degraded.txt"
+    dl_info.value.save_as(txt_path)
+    txt = txt_path.read_text(encoding="utf-8")
+    assert "4期/03_開発/01_ソース/TAXCALC.cbl（行10-12）: ABEND-CODE 0C7" in txt
+
+
+# ===== S6a RV是正2巡目 #1/#4: 資料参照の既定ON運用まわり =====
+
+def test_new_conversation_resets_knowledge_toggle_to_on_after_chat_lens_conversation(page, web_base_url):
+    """RV是正#1: lens=chat（資料参照OFF）の会話を開いた直後は `S.kb` が false のままになる
+    （`applyConversationScope` が `ans.lens==='chat'` で setKb(false) するため）。「新しい会話」を
+    始めたら、その OFF を引き継がず既定ON（決定2026-09-19）へ戻り、送信 body の knowledge が
+    true になる。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.route("**/conversations/777", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({
+            "conversation": {"id": 777, "title": "雑談", "origin": "own", "version": "w1",
+                             "read_only": False, "contains_personal_workspace": False},
+            "messages": [
+                {"role": "user", "content": "こんにちは", "created_at": "2026-09-01T00:00:00+00:00"},
+                {"role": "assistant", "content": "こんにちは！", "answer": {"lens": "chat"},
+                 "trace": None, "created_at": "2026-09-01T00:00:05+00:00"},
+            ],
+        }, ensure_ascii=False)))
+    page.goto(f"{web_base_url}/chat.html")
+
+    page.evaluate("(id) => window.__sherpaChatTest.openConversation(id)", 777)
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")   # OFF を引き継いでいる
+
+    page.locator("#newbtn").click()
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")   # 新規会話は既定ONへ戻る
+
+    page.locator("#input").fill("消費税率を変えたい。影響は？")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is True
+
+
+def test_knowledge_toggle_forced_off_when_world_options_empty(page, web_base_url):
+    """RV是正#4: 資料フォルダが1つも登録されていない環境（`GET /world-options` が空）では、
+    既定ON（決定2026-09-19）のままだと素の雑談まで knowledge=True で送って 404 になる——
+    フロントが自発的に OFF へ倒し、送信 body の knowledge は false になる。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, world_options={"worlds": [], "labels": {}})
+    page.goto(f"{web_base_url}/chat.html")
+
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")
+
+    page.locator("#input").fill("こんにちは")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is False
+
+
+def test_new_conversation_stays_off_when_world_options_empty(page, web_base_url):
+    """S6a RV是正3巡目 #1: 資料フォルダ未登録（`GET /world-options` が空）の環境で「新しい会話」を
+    始めても、`newConversation()` の無条件ON復帰（`S.verLabels` を見ない版）が既定ONへ戻して
+    しまうと素の雑談まで 404 になる——選択肢が無いままなら OFF を維持する。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page, world_options={"worlds": [], "labels": {}})
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")
+
+    page.locator("#newbtn").click()
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")   # ONへ戻らない
+
+    page.locator("#input").fill("こんにちは")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is False
+
+
+def test_new_conversation_stays_on_when_world_options_fetch_fails(page, web_base_url):
+    """S6a RV是正4巡目: `GET /world-options` が失敗（未確認のまま）した環境では、
+    `S.kbForcedOff` は立たない（`S.verLabels` の空チェックだと「未確認」と「空で確定」を
+    区別できず OFF に倒れてしまっていた）——「新しい会話」を始めても資料参照は既定ON
+    （決定2026-09-19）のまま。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.route("**/world-options", lambda route: route.abort())
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")   # 未確認＝既定ONのまま
+
+    page.locator("#newbtn").click()
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")   # OFFへ誤って倒れない
+
+    page.locator("#input").fill("こんにちは")
+    page.locator("#send").click()
+    assert records["turn_starts"], "POST /chat/turns が呼ばれていない"
+    assert records["turn_starts"][-1]["knowledge"] is True
+
+
+# ===================================================================================
+# 回答末尾のトークン使用量: プロンプトキャッシュの内訳表示（フィードバック 2026-09-21）
+# ===================================================================================
+# 見出しの入力トークン数がキャッシュ済み再送分まで丸ごと乗せていて、実際に処理された量より
+# 大きく見えていた。`cached_input_tokens` が数値のときは実入力（= input - cached）とキャッシュを
+# 分けて出す（契約: cached ⊆ input・providers/base.py）。null/未定義（Ollama 等は内訳を返さない）は
+# 従来どおり総入力のみ。`codex_usage_breakdown` があるターンは本体/下調べ役の内訳も additive に出す。
+
+def test_chat_usage_meta_shows_cache_breakdown_when_present(page, web_base_url):
+    """`cached_input_tokens` が数値（>0）のとき、見出しは実入力とキャッシュを分けて出し、
+    展開には「実入力」「キャッシュ」の値が出る。"""
+    from playwright.sync_api import expect
+
+    answer = {**IMPACT_ANSWER, "usage": {
+        "provider": "openai", "model": "gpt-5.5", "input_tokens": 12000,
+        "cached_input_tokens": 9000, "output_tokens": 2000,
+        "reasoning_output_tokens": 0, "is_local": "cloud",
+    }}
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    usage_meta = page.locator(".usage-meta")
+    expect(usage_meta).to_have_count(1)
+    expect(usage_meta.locator("summary")).to_contain_text("🪙 3k in（+9k cache） / 2k out")
+    expect(usage_meta.locator(".usage-detail")).to_be_hidden()   # 既定は折りたたみ
+
+    usage_meta.locator("summary").click()
+    expect(usage_meta.locator(".usage-detail")).to_be_visible()
+    expect(usage_meta).to_contain_text("入力トークン: 12,000")
+    expect(usage_meta).to_contain_text("実入力 3,000・キャッシュ 9,000")
+
+
+def test_chat_usage_meta_omits_cache_when_absent(page, web_base_url):
+    """`cached_input_tokens` が null（内訳を返さない経路）のときは、見出し・展開ともに
+    現状どおり総入力のみを出し、キャッシュの語は出ない（0 と誤って断定しない）。"""
+    from playwright.sync_api import expect
+
+    answer = {**IMPACT_ANSWER, "usage": {
+        "provider": "ollama", "model": "qwen2.5", "input_tokens": 5000,
+        "cached_input_tokens": None, "output_tokens": 800,
+        "reasoning_output_tokens": 0, "is_local": "local",
+    }}
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    usage_meta = page.locator(".usage-meta")
+    expect(usage_meta.locator("summary")).to_contain_text("🪙 5k in / 800 out")
+    expect(usage_meta.locator("summary")).not_to_contain_text("cache")
+
+    usage_meta.locator("summary").click()
+    expect(usage_meta).to_contain_text("入力トークン: 5,000")
+    expect(usage_meta).not_to_contain_text("キャッシュ")
+
+
+def test_chat_usage_meta_headline_unchanged_when_cache_is_zero(page, web_base_url):
+    """`cached_input_tokens` が 0（数値だが実入力＝総入力で情報が無い）のときは、
+    見出しに「（+0 cache）」を出さず現状どおりにする。"""
+    from playwright.sync_api import expect
+
+    answer = {**IMPACT_ANSWER, "usage": {
+        "provider": "openai", "model": "gpt-5.5", "input_tokens": 400,
+        "cached_input_tokens": 0, "output_tokens": 60,
+        "reasoning_output_tokens": 0, "is_local": "cloud",
+    }}
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    usage_meta = page.locator(".usage-meta")
+    expect(usage_meta.locator("summary")).to_contain_text("🪙 400 in / 60 out")
+    expect(usage_meta.locator("summary")).not_to_contain_text("cache")
+
+
+def test_chat_usage_meta_shows_parent_child_breakdown(page, web_base_url):
+    """Codex 経路で下調べ役（spawn_agent）が動いたターンは `usage.codex_usage_breakdown`
+    （sherpa/providers/codex/provider.py）を持つ。展開時に本体/下調べ役の内訳を additive に出す。
+    体数は「実際に起動した数」＝`children_found + children_missing`（RV是正: found は usage を
+    読めた数だけなので、found だけを出すと動いた体数を過小に見せる——found=2・missing=1 なら
+    3 体動いたうち1体は記録が無い、という読みにする）。記録が取れなかった体数は muted で添える。"""
+    from playwright.sync_api import expect
+
+    answer = {**IMPACT_ANSWER, "usage": {
+        "provider": "codex", "model": "qwen2.5", "input_tokens": 1100,
+        "cached_input_tokens": 250, "output_tokens": 160,
+        "reasoning_output_tokens": 0, "is_local": "local",
+        "codex_usage_breakdown": {
+            "parent": {"input_tokens": 800, "cached_input_tokens": 200,
+                      "output_tokens": 100, "reasoning_output_tokens": 0},
+            "children": {"input_tokens": 300, "cached_input_tokens": 50,
+                        "output_tokens": 60, "reasoning_output_tokens": 0},
+            "children_found": 2, "children_missing": 1,
+        },
+    }}
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    usage_meta = page.locator(".usage-meta")
+    usage_meta.locator("summary").click()
+    expect(usage_meta).to_contain_text("本体: 入力 800")
+    expect(usage_meta).to_contain_text("うちキャッシュ 200")
+    expect(usage_meta).to_contain_text("出力 100")
+    expect(usage_meta).to_contain_text("下調べ役 3 体: 入力 300")
+    expect(usage_meta).to_contain_text("うちキャッシュ 50")
+    expect(usage_meta).to_contain_text("1 体は記録なし")
+
+
+def test_chat_usage_meta_breakdown_shows_missing_only_children(page, web_base_url):
+    """`children_found=0`（起動した下調べ役の usage が1件も読めなかった）でも
+    `children_missing` が1以上なら、動いたのに使用量が取れなかったことを隠さず
+    「下調べ役 {missing} 体: 入力 0 / 出力 0（{missing} 体は記録なし）」を出す
+    （表示条件は found ではなく found+missing の合計が0でないこと）。"""
+    from playwright.sync_api import expect
+
+    answer = {**IMPACT_ANSWER, "usage": {
+        "provider": "codex", "model": "qwen2.5", "input_tokens": 800,
+        "cached_input_tokens": 200, "output_tokens": 100,
+        "reasoning_output_tokens": 0, "is_local": "local",
+        "codex_usage_breakdown": {
+            "parent": {"input_tokens": 800, "cached_input_tokens": 200,
+                      "output_tokens": 100, "reasoning_output_tokens": 0},
+            "children": {"input_tokens": 0, "cached_input_tokens": 0,
+                        "output_tokens": 0, "reasoning_output_tokens": 0},
+            "children_found": 0, "children_missing": 2,
+        },
+    }}
+    install_api_mocks(page, stream_events=[
+        {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
+    ])
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("消費税率とは？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    usage_meta = page.locator(".usage-meta")
+    usage_meta.locator("summary").click()
+    expect(usage_meta).to_contain_text("下調べ役 2 体: 入力 0 / 出力 0")
+    expect(usage_meta).to_contain_text("2 体は記録なし")

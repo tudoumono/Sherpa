@@ -147,7 +147,8 @@ class GraphSchemaEraError(RuntimeError):
 # ユーザー向け平文メッセージ（専門用語ゼロ・docs/04-画面の原則.md §5/§6）。GRAPH_OVERLOAD_USER_MESSAGE
 # と同じく呼び出し側（routers/impact.py・routers/graph.py の 503・chat_service のチャット縮退）が共有する。
 GRAPH_SCHEMA_ERA_USER_MESSAGE = (
-    "この資料フォルダは再取り込みが必要です（内部形式が更新されました）。管理者にご連絡ください。"
+    "この資料フォルダの検索用データが古い内部形式のままです（内部形式が更新されました）。"
+    "管理者に『今すぐ更新』を依頼してください。"
 )
 
 
@@ -194,6 +195,18 @@ def check_schema_era(session, world: str, *, lens: str | None = None) -> None:
     era = row.get("era")
     if era != GRAPH_SCHEMA_ERA:
         raise GraphSchemaEraError(world, era, lens=lens)
+
+
+def world_graph_is_empty(session, world: str) -> bool:
+    """world に `:Entity` が1件も無い（＝未構築）か。`Neo4jError` はそのまま呼び出し元に送出する
+    （fail-loud・`check_schema_era` と同じ規律）。`LIMIT 1` で1件見つかった時点で打ち切る。
+    """
+    rows = session.run(
+        "OPTIONAL MATCH (n:Entity {world_id:$w}) WITH n LIMIT 1 RETURN count(n) AS c",
+        w=world,
+    ).data()
+    row = rows[0] if rows else None
+    return not (row and row.get("c"))
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -417,13 +430,69 @@ def load_world(nodes, edges, world_id, uri, user, password):
                     for batch in _batched(items, _NEO4J_BATCH_ROWS):
                         rows = [_edge_row(e) for e in batch]
                         tx.run(edge_cypher, rows=rows, world=world_id)
-                # このロードが作った world グラフのスキーマ世代を刻む
-                # （同一 tx＝rebuild と不可分。`:Entity` とは別ラベルなので上の DETACH DELETE の
-                # 対象に入らない——MERGE で世代を上書きするだけでよい）。
-                tx.run("MERGE (m:SherpaMeta {world_id:$w}) SET m.schema_era=$era",
-                      w=world_id, era=GRAPH_SCHEMA_ERA)
+                # このロードが作った world グラフのスキーマ世代と実物件数を刻む（同一 tx＝rebuild と
+                # 不可分。`:Entity` とは別ラベルなので上の DETACH DELETE の対象に入らない）。件数は
+                # 投入後の実物を数える——MERGE は重複を畳むため、投入前のリスト長（len(nodes)/
+                # len(edges)）ではなく実際に存在するノード/エッジを数え直す（`check_graph_counts`
+                # が照合する対象と同じ数え方に揃える・今すぐ更新での自己修復トリガー）。
+                node_count = tx.run(
+                    "MATCH (n:Entity {world_id:$w}) RETURN count(n) AS c", w=world_id
+                ).single()["c"]
+                edge_count = tx.run(
+                    "MATCH (a:Entity {world_id:$w})-[r]->() WHERE r.world_id=$w RETURN count(r) AS c",
+                    w=world_id,
+                ).single()["c"]
+                tx.run(
+                    "MERGE (m:SherpaMeta {world_id:$w}) "
+                    "SET m.schema_era=$era, m.node_count=$nc, m.edge_count=$ec",
+                    w=world_id, era=GRAPH_SCHEMA_ERA, nc=node_count, ec=edge_count)
                 return len(nodes), len(edges)
             return s.execute_write(_apply)
+    finally:
+        driver.close()
+
+
+def check_graph_counts(world_id, uri, user, password) -> str | None:
+    """保存済み `:SherpaMeta` の世代・件数スタンプを実際のグラフ内容と照合する（`load_world` が
+    刻む値と対・「今すぐ更新」の不変分岐が自己修復を要るか判定するために呼ぶ）。
+
+    作り直しが要る理由コードを返す:
+      - `"no_stamp"`＝`node_count`/`edge_count` が無い（`:SherpaMeta` 自体が無い場合を含む・
+        本チェック導入前の既存 world、またはグラフごと消された場合）。
+      - `"era_mismatch"`＝保存済み `schema_era` が現行 `GRAPH_SCHEMA_ERA` と不一致。
+      - `"count_mismatch"`＝スタンプ済み件数と実物（`:Entity{world_id}` の数・その世界の
+        ノードから出て `r.world_id` が一致するリレーションの数）が食い違う。
+    整合していれば `None`。1セッション・少数のクエリで完結させる（meta 読み取り1回＋実件数2回・
+    Cypher に LIMIT は使わない＝正確な件数）。
+
+    `load_world`/`delete_world` と同じくホストがドライバを自前で開閉する（呼び出し元が
+    `store.world_lock` を保持している前提はしない）。接続/クエリ例外はそのまま呼び出し元へ
+    伝播する（fail-loud・ここで握りつぶさない）。
+    """
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    try:
+        with driver.session() as s:
+            rows = s.run(
+                "MATCH (m:SherpaMeta {world_id:$w}) "
+                "RETURN m.schema_era AS era, m.node_count AS nc, m.edge_count AS ec",
+                w=world_id,
+            ).data()
+            meta = rows[0] if rows else None
+            if not meta or meta.get("nc") is None or meta.get("ec") is None:
+                return "no_stamp"
+            if meta.get("era") != GRAPH_SCHEMA_ERA:
+                return "era_mismatch"
+            actual_nc = s.run(
+                "MATCH (n:Entity {world_id:$w}) RETURN count(n) AS c", w=world_id
+            ).single()["c"]
+            actual_ec = s.run(
+                "MATCH (a:Entity {world_id:$w})-[r]->() WHERE r.world_id=$w RETURN count(r) AS c",
+                w=world_id,
+            ).single()["c"]
+            if actual_nc != meta["nc"] or actual_ec != meta["ec"]:
+                return "count_mismatch"
+            return None
     finally:
         driver.close()
 

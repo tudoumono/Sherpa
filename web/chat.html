@@ -177,8 +177,9 @@
           </div>
         </div>
         <div class="inquiry-row" id="depth-row">
-          <span class="inquiry-label" title="頭脳によって効く範囲が違います（推論の深さは Codex のみ・検索の反復回数やヒット件数は共通で効きます）">調べる深さ</span>
+          <span class="inquiry-label" title="見直しの回数です。クイック＝見直しなし（下調べ役の一次判断を確認 1 回だけ）／標準＝見直し 2 回／深く＝見直し 4 回・広く読む／最大＝管理者の設定値まで。どの段も管理者の設定値より多くはなりません。十分に調べられたら途中で終わります。使う AI によっては見直しが行われない構成があります。">調べる深さ</span>
           <div class="seg" id="depth-seg">
+            <button class="segbtn" data-depth="quick" type="button">クイック</button>
             <button class="segbtn on" data-depth="standard" type="button">標準</button>
             <button class="segbtn" data-depth="deep" type="button">深く</button>
             <button class="segbtn" data-depth="max" type="button">最大</button>
@@ -202,7 +203,7 @@
         <div class="inquiry-note muted" id="layer-note" hidden>ⓘ 影響検索（原因調べ）は資料とコードをつないで辿るため、探す対象の指定は使われません</div>
         <div class="inquiry-row">
           <span class="inquiry-label">参照する</span>
-          <button class="kbtoggle" id="kbtoggle" aria-pressed="false" title="社内ナレッジ（資料）を参照する">📚 社内資料 <b>オフ</b></button>
+          <button class="kbtoggle on" id="kbtoggle" aria-pressed="true" title="社内ナレッジ（資料）を参照する">📚 社内資料 <b>オン</b></button>
           <button class="kbtoggle" id="personaltoggle" aria-pressed="false" title="自分の個人ファイル（アップロード済み）を参照する">🗂 個人ファイル <b>オフ</b></button>
           <!-- WEB-1: 管理者が許可し、かつ現在の頭脳が Codex（OpenAI直結）のときだけ表示する（既定は非表示）。 -->
           <button class="kbtoggle" id="websearchtoggle" aria-pressed="false" hidden

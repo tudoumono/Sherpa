@@ -145,8 +145,8 @@ def test_degrade_result_node_known_reasons_only():
     assert node3["label"] == node["label"]
     assert node3["detail"] not in (node["detail"], node2["detail"])
     node4 = A._degrade_result_node({"hits": [], "degrade_reason": "vector_feature_mismatch"})
-    assert node4["label"] == node["label"]                  # 索引素性ズレ（再取り込み待ち）も同ラベル
-    assert "取り込み" in node4["detail"]                     # 一時障害ではなく取り込みやり直しを案内
+    assert node4["label"] == node["label"]                  # 索引素性ズレ（今すぐ更新待ち）も同ラベル
+    assert "今すぐ更新" in node4["detail"]                   # 一時障害ではなく今すぐ更新での解消を案内
     assert A._degrade_result_node({"hits": []}) is None
     assert A._degrade_result_node({"hits": [], "degrade_reason": "es_query_failed"}) is None
     assert A._degrade_result_node({"count": 0, "docs": []}) is None   # list_docs 等の無関係な result
@@ -372,6 +372,235 @@ def test_run_tool_forwards_max_hits_to_es_search(monkeypatch):
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: set())
     A.run_tool("es_search", {"query": "x"}, "v1", None, max_hits=60)
     assert captured.get("k") == 60
+
+
+# ===== ヒット単位のページング（offset）・ヒット単位のバイト上限（網羅性を落とさずに文脈枠を守る）=====
+
+def test_run_tool_offset_omitted_defaults_to_zero(monkeypatch):
+    """`args` に `offset` が無ければ0として grep_tool.grep_search へ転送する
+    （既存呼び出し元は無変更・offset は ripgrep_search だけが読む）。"""
+    captured = {}
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: captured.update(kw) or [])
+    A.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
+    assert captured.get("offset") == 0
+
+
+def test_run_tool_forwards_offset_to_grep_search(monkeypatch):
+    """`args["offset"]` は `grep_tool.grep_search` へそのまま転送する。"""
+    captured = {}
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: captured.update(kw) or [])
+    A.run_tool("ripgrep_search", {"query": "x", "offset": 15}, "v1", None)
+    assert captured.get("offset") == 15
+
+
+def test_run_tool_es_search_ignores_offset_argument(monkeypatch):
+    """`es_search`（ES hybrid）は offset ページングを持たない——kNN 句の候補集合はページを跨いで
+    固定できず、候補集合を揃えようとすると重要度補正後の順位がページごとに入れ替わり重複/欠落が
+    起きるため。`args["offset"]` を渡しても `es_index.search` へは転送されない。"""
+    from sherpa import documents
+
+    captured = {}
+
+    def fake_search(world, q, scope_paths=None, k=20, layer=None, **kw):
+        captured.update(kw)
+        return [], None
+
+    monkeypatch.setattr(A.es_index, "search", fake_search)
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: set())
+    A.run_tool("es_search", {"query": "x", "offset": 40}, "v1", None)
+    assert "offset" not in captured
+
+
+def test_run_tool_es_search_result_never_has_next_offset(monkeypatch):
+    """`es_search` の結果は `truncated:true` になっても `next_offset` を付けない
+    （続きが必要なら `max_hits` を増やす・上位K件打切りで続きが取れない実害は語句検索側の問題）。"""
+    from sherpa import documents
+
+    hits = [{"doc_id": f"a{i}.md", "line": 1, "text": "x", "ext": ".md", "score": 1.0}
+           for i in range(5)]
+    monkeypatch.setattr(A.es_index, "search", lambda *a, **kw: (hits, None))
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {h["doc_id"] for h in hits})
+    res, _docs, _cites, _cards = A.run_tool("es_search", {"query": "x"}, "v1", None, max_hits=5)
+    assert res.get("truncated") is True
+    assert "next_offset" not in res
+
+
+def test_run_tool_offset_negative_clamped_to_zero(monkeypatch):
+    """負の `offset` は0扱い（list_docs の offset クランプと同じ流儀）。"""
+    captured = {}
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: captured.update(kw) or [])
+    A.run_tool("ripgrep_search", {"query": "x", "offset": -7}, "v1", None)
+    assert captured.get("offset") == 0
+
+
+def test_run_tool_offset_past_abs_ceiling_short_circuits_without_calling_search(monkeypatch):
+    """`offset` は LLM が渡す未検証値——grep 側はヒープ容量を offset+ヒット数まで広げるため、
+    際限なく大きい offset を許すとヒープが無制限に肥大する（DoS）。`offset` 自体は**巻き戻さない**
+    （巻き戻すと next_offset を辿るたびに同じ範囲を再送し続け、上限を超えた領域へ永久に到達できない）
+    ——`offset >= MAX_HITS_ABS_MAX` なら検索自体を呼ばず空を返す（母集団の先はもう見ない）。"""
+    captured = {"called": False}
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: captured.update(called=True) or [])
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x", "offset": 10_000_000}, "v1", None, max_hits=30)
+    assert res == {"hits": []}
+    assert captured["called"] is False   # 検索そのものを呼ばない＝ヒープを膨らませない
+    assert "next_offset" not in res and "truncated" not in res
+
+
+def test_run_tool_ripgrep_search_offset_pages_through_real_corpus(monkeypatch, tmp_path):
+    """実コーパスを介した end-to-end: `offset` を進めてページングすると全件を重複・欠落なく
+    たどれ、続きがある間だけ `truncated`/`next_offset` が付く（最後のページには付かない）。"""
+    world = "offset-paging-world"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        name: "NEEDLE 行\n" for name in ("a.md", "b.md", "c.md", "d.md", "e.md")})
+
+    def _page(offset):
+        return A.run_tool("ripgrep_search", {"query": "NEEDLE", "offset": offset}, world, None,
+                          max_hits=2)[0]
+
+    p0 = _page(0)
+    assert [h["doc_id"] for h in p0["hits"]] == ["a.md", "b.md"]
+    assert p0.get("truncated") is True and p0.get("next_offset") == 2
+
+    p1 = _page(p0["next_offset"])
+    assert [h["doc_id"] for h in p1["hits"]] == ["c.md", "d.md"]
+    assert p1.get("truncated") is True and p1.get("next_offset") == 4
+
+    p2 = _page(p1["next_offset"])
+    assert [h["doc_id"] for h in p2["hits"]] == ["e.md"]
+    assert "truncated" not in p2 and "next_offset" not in p2   # 最後のページ＝続きは無い
+
+
+def test_run_tool_ripgrep_search_offset_near_ceiling_shrinks_page_without_rolling_back(monkeypatch, tmp_path):
+    """母集団が `MAX_HITS_ABS_MAX` を超えるとき、天井近くの offset は**巻き戻らない**——ページの
+    件数（`used_max_hits`）だけが縮み、既出ヒットを再送しない。天井ちょうどに達したページは
+    `next_offset` を出さない（最終ページ）。"""
+    world = "offset-ceiling-world"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        name: "NEEDLE 行\n" for name in ("a.md", "b.md", "c.md", "d.md", "e.md", "f.md", "g.md", "h.md")})
+    monkeypatch.setattr(A, "MAX_HITS_ABS_MAX", 5)   # 母集団(8件) > 天井(5件) を小さく再現
+
+    p0, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "NEEDLE", "offset": 0}, world, None, max_hits=3)
+    assert [h["doc_id"] for h in p0["hits"]] == ["a.md", "b.md", "c.md"]
+    assert p0.get("truncated") is True and p0.get("next_offset") == 3
+
+    # offset=3, max_hits=3 だが天井(5)まで残り2件しか無い＝ページは2件に縮む（3のままではない）。
+    p1, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "NEEDLE", "offset": 3}, world, None, max_hits=3)
+    assert [h["doc_id"] for h in p1["hits"]] == ["d.md", "e.md"]   # 既出の a/b/c を再送しない
+    assert p1.get("truncated") is True
+    assert "next_offset" not in p1   # ちょうど天井(5)に達した＝最終ページ
+
+    # 天井以上の offset は空（もう検索しない）。
+    p2, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "NEEDLE", "offset": 5}, world, None, max_hits=3)
+    assert p2 == {"hits": []}
+
+
+def test_run_tool_ripgrep_search_hit_text_clipped_to_per_hit_budget(monkeypatch):
+    """`per_hit = max(_HIT_TEXT_MIN_BYTES, tool_result_max_bytes // max_hits)` でヒットの
+    `text` を末尾クリップし、切ったヒットにだけ `text_truncated: True` を付ける
+    （`tool_result_max_bytes=64*1024, max_hits=30` → 2184 バイト）。"""
+    big_text = "x" * 5000   # per_hit より確実に大きい ASCII 本文（マルチバイト境界の影響を排除）
+    hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": big_text, "ext": ".md"}]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=30, tool_result_max_bytes=64 * 1024)
+    hit = res["hits"][0]
+    assert len(hit["text"].encode("utf-8")) == 2184
+    assert hit["text"] == big_text[:2184]   # 末尾だけを切る（先頭は保たれる）
+    assert hit["text_truncated"] is True
+
+
+def test_run_tool_ripgrep_search_per_hit_budget_floors_at_min_bytes(monkeypatch):
+    """ヒット数が多いほど1件あたりの均等割りは小さくなるが、下限 `_HIT_TEXT_MIN_BYTES`（512）は
+    必ず残る（`tool_result_max_bytes=64*1024, max_hits=200` → 65536//200=327 は512未満なので512）。"""
+    big_text = "x" * 5000
+    hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": big_text, "ext": ".md"}]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=200, tool_result_max_bytes=64 * 1024)
+    hit = res["hits"][0]
+    assert len(hit["text"].encode("utf-8")) == A._HIT_TEXT_MIN_BYTES == 512
+    assert hit["text_truncated"] is True
+
+
+def test_run_tool_ripgrep_search_serialized_view_stays_within_budget_despite_per_hit_overhead(monkeypatch):
+    """`per_hit = tr_max_bytes // max_hits` は text だけの割当てで、各ヒットの付帯情報
+    （doc_id・line 等）と JSON 構造分を数えない——30件×2184バイトの text だけなら 64KiB に収まる
+    計算でも、直列化した最終形は付帯情報の分だけ超過しうる。`view` を組み立てた後の実バイト数で
+    収まりを保証し（per_hit を詰めて再構築）、それでも `next_offset` と全ヒットの `doc_id` が
+    残ることを確認する。"""
+    hits = [{"doc_id": f"doc{i:03d}.md", "line": 1, "span": [1, 1], "text": "x" * 5000, "ext": ".md"}
+           for i in range(30)]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=30, tool_result_max_bytes=64 * 1024)
+    final_bytes = len(json.dumps(res, ensure_ascii=False).encode("utf-8"))
+    assert final_bytes <= 64 * 1024, final_bytes
+    assert len(res["hits"]) == 30
+    assert [h["doc_id"] for h in res["hits"]] == [f"doc{i:03d}.md" for i in range(30)]
+    assert res.get("next_offset") == 30
+    assert res.get("truncated") is True
+
+
+def test_run_tool_ripgrep_search_top_level_text_truncated_when_any_hit_clipped(monkeypatch):
+    """いずれかのヒットが per_hit で切られたら、結果の最上位にも `text_truncated: True` を立てる
+    ——`_record_run_tool_limits`/`mcp_server.py` はどちらも最上位キーしか見ないため、hits[i] だけ
+    に付けると `tool_result_clipped` の計測から漏れる。"""
+    hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": "x" * 5000, "ext": ".md"},
+            {"doc_id": "b.md", "line": 1, "span": [1, 1], "text": "short", "ext": ".md"}]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=30, tool_result_max_bytes=64 * 1024)
+    assert res["text_truncated"] is True
+    by_doc = {h["doc_id"]: h for h in res["hits"]}
+    assert by_doc["a.md"]["text_truncated"] is True
+    assert "text_truncated" not in by_doc["b.md"]
+
+
+def test_run_tool_ripgrep_search_no_top_level_text_truncated_when_no_hit_clipped(monkeypatch):
+    """1件もクリップされなければ最上位に `text_truncated` キー自体を作らない（既存語彙の流儀）。"""
+    hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": "short", "ext": ".md"}]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=30, tool_result_max_bytes=64 * 1024)
+    assert "text_truncated" not in res
+
+
+def test_run_tool_ripgrep_search_hit_under_per_hit_budget_is_byte_identical(monkeypatch):
+    """1ヒットが per_hit 未満なら一切変えない（`text_truncated` キー自体を作らない）。"""
+    small_text = "NEEDLE を含む短い一行"
+    hits = [{"doc_id": "a.md", "line": 1, "span": [1, 1], "text": small_text, "ext": ".md"}]
+    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: hits)
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "x"}, "v1", None, max_hits=30, tool_result_max_bytes=64 * 1024)
+    hit = res["hits"][0]
+    assert hit["text"] == small_text
+    assert "text_truncated" not in hit
+
+
+def test_run_tool_ripgrep_search_md_heading_survives_per_hit_clip(monkeypatch, tmp_path):
+    """MD ヒットの見出し行（節本文の先頭行）は末尾クリップでも失われない——実コーパスを介した
+    end-to-end で、大きな見出し節を持つヒットだけが切られ、見出しは残ることを確認する。"""
+    world = "hit-cap-md-world"
+    heading = "# TITLE"
+    body = ("NEEDLE line " + "x" * 60 + "\n") * 50   # 見出し込みで per_hit(2048) を確実に超える
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        "big.md": heading + "\n" + body,
+        "small.md": "NEEDLE small line\n",
+    })
+    res, _docs, _cites, _cards = A.run_tool(
+        "ripgrep_search", {"query": "NEEDLE"}, world, None, max_hits=2, tool_result_max_bytes=4096)
+    by_doc = {h["doc_id"]: h for h in res["hits"]}
+    big_hit = by_doc["big.md"]
+    assert len(big_hit["text"].encode("utf-8")) == 2048   # tool_result_max_bytes=4096, max_hits=2
+    assert big_hit["text"].startswith(heading)
+    assert big_hit["text_truncated"] is True
+    small_hit = by_doc["small.md"]
+    assert small_hit["text"] == "NEEDLE small line"
+    assert "text_truncated" not in small_hit
 
 
 def test_run_tool_window_cap_raises_read_around_ceiling(monkeypatch, tmp_path):
@@ -1422,6 +1651,118 @@ def _isolate_world_kb(monkeypatch, tmp_path, world: str, files: dict) -> None:
     monkeypatch.setattr(store, "get_world", lambda world_id: None)
 
 
+# ===== 未登録拡張子のソース到達可能性（ソースが神様の穴を塞ぐ・変更B/C）=====
+
+def test_unregistered_ext_reachable_grep_read_and_es_eligible(monkeypatch, tmp_path):
+    """`.zzz`（未登録拡張子のプレーンテキスト）が grep（`ripgrep_search`）・read_around（精読）の
+    両方から到達でき、`corpus_docs.world_documents`（ES 索引の材料）が doctype 付きで確定させる
+    ——拡張子の許可リストではなく `classify_document`/`reachable_as_text` の内容判定で可否が決まる。"""
+    world = "unreg-ext-reach"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        "notes/app.zzz": "NEEDLE_ZZZ ここに業務ルールを書く\nline two\n",
+    })
+    res, docs, cites, _ = A.run_tool("ripgrep_search", {"query": "NEEDLE_ZZZ"}, world, None)
+    assert res["hits"], res
+    hit = res["hits"][0]
+    assert hit["doc_id"] == "notes/app.zzz"
+    assert "notes/app.zzz" in docs
+    assert cites and cites[0]["doc_id"] == "notes/app.zzz"
+
+    r2, d2, _, _ = A.run_tool("read_around", {"doc_id": "notes/app.zzz", "line": hit["line"]}, world, None)
+    assert "error" not in r2, r2
+    assert "NEEDLE_ZZZ" in r2["text"]
+    assert "notes/app.zzz" in d2
+
+    from sherpa import corpus_docs
+    entry = next(d for d in corpus_docs.world_documents(world) if d["name"] == "notes/app.zzz")
+    assert entry.get("state") != "unreadable"
+    assert entry.get("doctype") is not None            # ES 索引の除外条件（doctype 無し）に該当しない
+
+
+def test_binary_unregistered_ext_unreachable_everywhere(monkeypatch, tmp_path):
+    """`.bin`（バイナリ・NUL バイト含む）は grep・read_around・台帳のどこからも到達できない
+    （内容が実質バイナリ＝`reachable_as_text` が False）。"""
+    world = "unreg-ext-binary"
+    binary_content = b"\x00\x01\x02BINARYDATA\xff\xfe\x00" * 20
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"blob.bin": binary_content})
+
+    res, docs, _, _ = A.run_tool("ripgrep_search", {"query": "BINARYDATA"}, world, None)
+    assert not res.get("hits")
+    assert not docs
+
+    r2, d2, _, _ = A.run_tool("read_around", {"doc_id": "blob.bin", "line": 1}, world, None)
+    assert "error" in r2
+    assert not d2
+
+    from sherpa import corpus_docs
+    assert not any(d["name"] == "blob.bin" for d in corpus_docs.world_documents(world))   # 台帳にも載らない
+
+
+def test_sensitive_dotenv_unreachable_and_not_logged(monkeypatch, tmp_path, caplog):
+    """`.env`（秘匿名）は grep・read_around のどちらからも到達できず、ログにも本文（秘密の値）が
+    出ない——`text_kind.is_sensitive` の判定で常に拒否される（拡張子の許可リストが安全を担わない
+    契約・変更A）。"""
+    world = "unreg-ext-dotenv"
+    secret_value = "SUPER_SECRET_TOKEN_VALUE_XYZ"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {".env": f"API_KEY={secret_value}\n"})
+
+    with caplog.at_level("WARNING"):
+        res, docs, _, _ = A.run_tool("ripgrep_search", {"query": "SUPER_SECRET"}, world, None)
+        assert not res.get("hits")
+        assert not docs
+        r2, d2, _, _ = A.run_tool("read_around", {"doc_id": ".env", "line": 1}, world, None)
+        assert "error" in r2
+        assert not d2
+    assert secret_value not in caplog.text
+
+
+def test_registered_extension_regression_still_reachable(monkeypatch, tmp_path):
+    """既存の登録拡張子（`.cbl`）は本変更後も従来どおり grep・read_around から読める（回帰なし）。"""
+    world = "unreg-ext-regress-cbl"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {
+        "PROG.cbl": "       PROGRAM-ID. PROG.\n       NEEDLE_CBL line.\n",
+    })
+    res, docs, _, _ = A.run_tool("ripgrep_search", {"query": "NEEDLE_CBL"}, world, None)
+    assert res["hits"], res
+    r2, d2, _, _ = A.run_tool(
+        "read_around", {"doc_id": "PROG.cbl", "line": res["hits"][0]["line"]}, world, None)
+    assert "error" not in r2, r2
+    assert "PROG.cbl" in d2
+
+
+# ===== verify_citation: 実在するが本文が読めない doc は exists=True（変更C）=====
+
+def test_verify_citation_true_for_reachable_unregistered_ext(monkeypatch, tmp_path):
+    """`.zzz`（未登録拡張子・変更Bで到達可能）の引用は `_safe_doc_path` 経由で通常どおり検証できる
+    （`exists=True`・`method` は span 有無に応じた通常の値）。"""
+    world = "verify-citation-zzz"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"app.zzz": "line one\nline two\n"})
+    v = A.verify_citation({"doc_id": "app.zzz", "span": [1, 1], "quote": "line one"}, world)
+    assert v == {"exists": True, "method": "span_verified"}
+
+
+def test_verify_citation_exists_true_but_unreadable_for_real_binary(monkeypatch, tmp_path):
+    """`_safe_doc_path` が拒否しても（本文がバイナリで読めない）、`verify_doc_exists`（実在＋
+    doctype 分類の確定判定）が実在を認めれば `exists=True`（`method="exists_unreadable"`・span 照合は
+    スキップ）を返す——「本文を読めるか」と「文書として実在するか」は別の問い。"""
+    world = "verify-citation-binary"
+    # `.docx` は `_OFFICE_MD` 経由で常に派生MD側へ解決される——ここでは Office 変換が未完了
+    # （派生MDが存在しない）状態を、`verify_doc_exists` 経由でも実在確認できる最小の再現に使う。
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"report.docx": b"PK\x03\x04fakezip"})
+    resolved = A._safe_doc_path(world, "report.docx")
+    assert resolved is None                             # 派生MD未生成＝read_around からは読めない
+    v = A.verify_citation({"doc_id": "report.docx", "span": [1, 1], "quote": "x"}, world)
+    assert v == {"exists": True, "method": "exists_unreadable"}
+
+
+def test_verify_citation_false_for_sensitive_doc_id(monkeypatch, tmp_path):
+    """秘匿ファイルは実在しても `exists=False` のまま（存在を漏らさない・変更C）。"""
+    world = "verify-citation-sensitive"
+    _isolate_world_kb(monkeypatch, tmp_path, world, {".env": "API_KEY=xyz\n"})
+    v = A.verify_citation({"doc_id": ".env", "span": [1, 1], "quote": "x"}, world)
+    assert v == {"exists": False, "method": "doc_missing"}
+
+
 def test_read_around_clips_output_for_huge_single_line_doc(monkeypatch, tmp_path):
     """secRV MED-B (a)(b): 単一行が巨大（200万文字）な文書でも、read_around の返却テキストは
     `TOOL_RESULT_MAX_BYTES`（BUDGET-1・§3.4 でコード既定 262144 へ引き上げ済み）に収まる。
@@ -1662,71 +2003,30 @@ def test_openai_style_budget_snapshotted_once_settings_change_mid_run_has_no_eff
         A._post, A.run_tool = orig_post, orig_run_tool
 
 
-# ===== BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定・
-# モデル窓連動・min() 方式）=====
+# ===== 窓連動の撤去（旧 BUDGET-2・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4 で導入・
+# `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で撤去）=====
 # `resolve_tool_result_budgets`/`effective_tool_result_max_bytes`/`effective_tool_result_max_total_bytes`
-# の `provider`/`model`（省略可）引数が「BUDGET-1 の解決値」と「窓由来の上限」の min() を取る契約を
-# 固定する。窓解決そのもの（4段の優先順・ライブ照会・シード表）は `tests/unit/test_model_windows.py`
-# が固定し、ここでは agentic_search 側の配線（min() の適用・byte-identical フォールバック・
-# openai_style/anthropic_style/gemini の呼び出し配線）だけを見る。
+# は `provider`/`model`/`ollama_base_url`/`anthropic_client` を受け取っても値の解決には使わない
+# （利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）——渡す・渡さないで結果が変わらないことを
+# 固定する。呼び出し元（openai_style/anthropic_style/gemini）が引き続きこれらを渡す配線自体
+# （互換のためだけの引数）は下のセクションで固定する。
 
-def test_window_derived_min_no_provider_is_byte_identical():
-    """`provider`/`model` を渡さない（既定 None）呼び出しは BUDGET-1 のみの結果——BUDGET-2 導入前と
-    完全に同じ値（退行チェック）。"""
+def test_resolve_tool_result_budgets_ignores_provider_and_model():
+    """`provider`/`model` を渡しても渡さなくても結果は同じ（コード既定/管理画面の基準値のみで
+    決まる）——旧実装はシード表に載っている openai/gpt-4o-mini で窓由来の上限まで縮んでいた。"""
     assert A.effective_tool_result_max_bytes({}) == A.TOOL_RESULT_MAX_BYTES
     assert A.effective_tool_result_max_total_bytes({}) == A.TOOL_RESULT_MAX_TOTAL_BYTES
     assert A.resolve_tool_result_budgets({}) == (A.TOOL_RESULT_MAX_BYTES, A.TOOL_RESULT_MAX_TOTAL_BYTES)
+    assert A.resolve_tool_result_budgets(
+        {}, provider="openai", model="gpt-4o-mini") == (A.TOOL_RESULT_MAX_BYTES, A.TOOL_RESULT_MAX_TOTAL_BYTES)
 
 
-def test_window_derived_min_unknown_model_keeps_base():
-    """`provider`/`model` を渡しても、窓がどの段（登録値/API/シード）にも無ければ「不明」——
-    BUDGET-1 の値のまま（フォールバック・退行にならない）。"""
-    per_result, total = A.resolve_tool_result_budgets(
-        {}, provider="openai", model="never-seen-model-xyz")
-    assert (per_result, total) == (A.TOOL_RESULT_MAX_BYTES, A.TOOL_RESULT_MAX_TOTAL_BYTES)
-
-
-def test_window_derived_min_shrinks_for_small_registered_window():
-    """小窓（登録値）のモデルへ切り替えると、両方の予算が窓由来の上限まで自動的に縮む
-    （§3.4「小窓ローカルLLMでの API ハードエラーを自動で防ぐ」）。"""
-    from sherpa import model_windows
-    sysset = {model_windows.MODEL_WINDOWS_KEY: {"openai:tiny-model": 40000}}   # 40k tokens
-    expected_cap = model_windows.derive_window_bytes(40000)
-    assert expected_cap < A.TOOL_RESULT_MAX_BYTES   # 前提: 実際に縮む窓であること
-    per_result, total = A.resolve_tool_result_budgets(sysset, provider="openai", model="tiny-model")
-    assert per_result == expected_cap
-    assert total == expected_cap
-
-
-def test_window_derived_min_does_not_increase_for_large_registered_window():
-    """大窓（登録値）でも、BUDGET-1 の解決値を超えて自動的には増えない（min() の対称性・
-    「支出の自動拡大はしない」裁定）。"""
-    from sherpa import model_windows
-    sysset = {model_windows.MODEL_WINDOWS_KEY: {"openai:huge-model": 50_000_000},   # 5000万 token
-             "agentic_budget_per_result": 5000, "agentic_budget_total": 20000}
-    per_result, total = A.resolve_tool_result_budgets(sysset, provider="openai", model="huge-model")
-    assert (per_result, total) == (5000, 20000)   # BUDGET-1 の解決値のまま（増えない）
-
-
-def test_window_derived_min_registered_overrides_seed():
-    """段1（登録値）は段3（シード表）より優先する（4段解決の優先順）——
-    `gpt-4o-mini` はシード表に実在するが、登録値がある場合はそちらを使う。"""
-    from sherpa import model_windows
-    sysset = {model_windows.MODEL_WINDOWS_KEY: {"openai:gpt-4o-mini": 1000}}   # 極端に小さい登録値
-    expected_cap = model_windows.derive_window_bytes(1000)
-    per_result, _ = A.resolve_tool_result_budgets(sysset, provider="openai", model="gpt-4o-mini")
-    assert per_result == expected_cap
-    assert expected_cap != model_windows.derive_window_bytes(128_000)   # シード値とは異なる
-
-
-def test_window_derived_min_seed_table_applies_for_known_openai_model():
-    """段3（シード表）: 登録値が無くても、シード表に載っている実在モデル（gpt-4o-mini）なら
-    窓が判明し、予算が窓由来の上限まで縮む。"""
-    from sherpa import model_windows
-    expected_cap = model_windows.derive_window_bytes(128_000)
-    assert expected_cap < A.TOOL_RESULT_MAX_BYTES   # 前提
-    per_result, _ = A.resolve_tool_result_budgets({}, provider="openai", model="gpt-4o-mini")
-    assert per_result == expected_cap
+def test_resolve_tool_result_budgets_large_admin_setting_not_clipped_by_any_model():
+    """管理画面の基準値を大きく設定していれば、モデルが小窓（シード表の gpt-4o-mini・
+    128,000 tokens）であっても、そのまま使われる（旧実装の min() 方式は撤去済み）。"""
+    sysset = {"agentic_budget_per_result": 5_000_000, "agentic_budget_total": 8_000_000}
+    per_result, total = A.resolve_tool_result_budgets(sysset, provider="openai", model="gpt-4o-mini")
+    assert (per_result, total) == (5_000_000, 8_000_000)
 
 
 def test_openai_style_derives_ollama_provider_and_base_url_for_budget_resolution(monkeypatch):
@@ -2284,22 +2584,37 @@ def test_env_int_clamps_dynamic_default(monkeypatch):
 
 # ===== MAX_HITS / READ_WINDOW（コード内定数の env 化） =====
 # import 時に一度だけ確定する定数は、同一プロセス内の monkeypatch では「起動時の env」を
-# 再現できないため、実プロセスを新規に起こして検証する（`_fresh_import` 参照）。
+# 再現できないため、実プロセスを新規に起こして検証する（`_fresh_import` 参照）。両定数を
+# 1回の fresh import でまとめて確認する（定数ごとに別プロセスへ分けない）。
 
-def test_max_hits_fresh_import_env_unset_is_default():
-    assert FI.fresh_import_attr("sherpa.agentic_search", "MAX_HITS",
-                                env={"SHERPA_GREP_MAX_HITS": None}) == 30
+def _max_hits_read_window_env_script() -> str:
+    return (
+        "import json\n"
+        "import sherpa.agentic_search as m\n"
+        "print(json.dumps({'max_hits': m.MAX_HITS, 'read_window': m.READ_WINDOW}))\n"
+    )
 
 
-def test_max_hits_fresh_import_env_valid_value():
-    assert FI.fresh_import_attr("sherpa.agentic_search", "MAX_HITS",
-                                env={"SHERPA_GREP_MAX_HITS": "100"}) == 100
+def test_max_hits_read_window_fresh_import_env_unset_is_default():
+    out = json.loads(FI.run_script(_max_hits_read_window_env_script(),
+                                   env={"SHERPA_GREP_MAX_HITS": None, "SHERPA_READ_WINDOW": None}))
+    assert out["max_hits"] == 30
+    assert out["read_window"] == 40
 
 
-def test_max_hits_fresh_import_env_invalid_falls_back_to_default():
-    for bad in ("0", "1001", "abc"):
-        assert FI.fresh_import_attr("sherpa.agentic_search", "MAX_HITS",
-                                    env={"SHERPA_GREP_MAX_HITS": bad}) == 30, bad
+def test_max_hits_read_window_fresh_import_env_valid_value():
+    out = json.loads(FI.run_script(_max_hits_read_window_env_script(),
+                                   env={"SHERPA_GREP_MAX_HITS": "100", "SHERPA_READ_WINDOW": "80"}))
+    assert out["max_hits"] == 100
+    assert out["read_window"] == 80
+
+
+def test_max_hits_read_window_fresh_import_env_invalid_falls_back_to_default():
+    for mh_bad, rw_bad in zip(("0", "1001", "abc"), ("5", "401", "abc")):
+        out = json.loads(FI.run_script(_max_hits_read_window_env_script(),
+                                       env={"SHERPA_GREP_MAX_HITS": mh_bad, "SHERPA_READ_WINDOW": rw_bad}))
+        assert out["max_hits"] == 30, mh_bad
+        assert out["read_window"] == 40, rw_bad
 
 
 def test_max_hits_env_change_after_import_has_no_effect(monkeypatch):
@@ -2307,22 +2622,6 @@ def test_max_hits_env_change_after_import_has_no_effect(monkeypatch):
     before = A.MAX_HITS
     monkeypatch.setenv("SHERPA_GREP_MAX_HITS", "999")
     assert A.MAX_HITS == before == 30
-
-
-def test_read_window_fresh_import_env_unset_is_default():
-    assert FI.fresh_import_attr("sherpa.agentic_search", "READ_WINDOW",
-                                env={"SHERPA_READ_WINDOW": None}) == 40
-
-
-def test_read_window_fresh_import_env_valid_value():
-    assert FI.fresh_import_attr("sherpa.agentic_search", "READ_WINDOW",
-                                env={"SHERPA_READ_WINDOW": "80"}) == 80
-
-
-def test_read_window_fresh_import_env_invalid_falls_back_to_default():
-    for bad in ("5", "401", "abc"):
-        assert FI.fresh_import_attr("sherpa.agentic_search", "READ_WINDOW",
-                                    env={"SHERPA_READ_WINDOW": bad}) == 40, bad
 
 
 def test_read_window_env_change_after_import_has_no_effect(monkeypatch):
@@ -2597,9 +2896,24 @@ def test_openai_style_stop_event_set_during_final_synthesis_skips_attribution(mo
         A._post, A.run_tool = orig_post, orig_run_tool
 
 
-def test_openai_style_finish_reason_length_skips_attribution(monkeypatch):
-    """`finish_reason=="length"`（打ち切り＝未完了）で終わった応答は、たとえ本文があっても
-    帰属呼び出しを発行しない（部分本文を確定回答として帰属しない）。"""
+@pytest.mark.parametrize("finish_reason,has_key,content", [
+    # `finish_reason=="length"`（打ち切り＝未完了）で終わった応答は、たとえ本文があっても
+    # 帰属呼び出しを発行しない（部分本文を確定回答として帰属しない）。
+    ("length", True, "途中で切れた回答"),
+    # `finish_reason=="content_filter"`（自然完了 allowlist に無い）も同様。main 3方言も
+    # plan/hybrid と同じ自然完了 allowlist へ揃える。
+    ("content_filter", True, "止められた回答"),
+    # `finish_reason` が欠落（キー自体が無い）した応答は、以前は「明示的に `length` のときだけ
+    # 未完了」という denylist 判定のもとで帰属が発行されていたが、自然完了 allowlist では
+    # 理由欠落もすべて未完了扱いになる——旧 denylist 期待（理由欠落でも帰属成功）を反転する固定。
+    (None, False, "理由欠落の回答"),
+    # `finish_reason` が文字列でない（壊れた upstream 応答が数値/dict 等を返した）場合、本文の
+    # 配信・`_result` の生成は落ちずに完走し（`TypeError` にならない）、帰属呼び出しも発行しない
+    # （`_openai_style_finish_reason` の非文字列→None 変換＋`_is_natural_completion` の
+    # isinstance ガード、両方の防御を経路として通す）。
+    ({"unexpected": "shape"}, True, "壊れた完了理由の回答"),
+])
+def test_openai_style_non_natural_completion_skips_attribution(monkeypatch, finish_reason, has_key, content):
     calls = []
 
     def fake_run_tool(name, args, world, scope_paths, **kw):
@@ -2611,7 +2925,10 @@ def test_openai_style_finish_reason_length_skips_attribution(monkeypatch):
         if len(calls) == 1:
             return {"choices": [{"message": {"content": "", "tool_calls": [
                 {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        return {"choices": [{"message": {"content": "途中で切れた回答"}, "finish_reason": "length"}]}
+        choice = {"message": {"content": content}}
+        if has_key:
+            choice["finish_reason"] = finish_reason
+        return {"choices": [choice]}
 
     orig_post, orig_run_tool = A._post, A.run_tool
     A._post, A.run_tool = fake_post, fake_run_tool
@@ -2622,7 +2939,7 @@ def test_openai_style_finish_reason_length_skips_attribution(monkeypatch):
             if "final" in ev:
                 final = ev
         assert len(calls) == 2   # 帰属は発行されない（3回目は無い）
-        assert final["final"] == "途中で切れた回答"
+        assert final["final"] == content
         assert final["attributed_ev_ids"] == set()
     finally:
         A._post, A.run_tool = orig_post, orig_run_tool
@@ -2807,116 +3124,27 @@ def test_final_synthesis_skips_send_when_stop_event_fires_during_node_yield(monk
     assert not any("final" in ev for ev in events)
 
 
-def test_openai_style_finish_reason_content_filter_skips_attribution(monkeypatch):
-    """`finish_reason=="content_filter"`（自然完了 allowlist に無い）で終わった応答は、たとえ
-    本文があっても帰属呼び出しを発行しない（main 3方言も plan/hybrid と同じ自然完了 allowlist へ
-    揃える）。"""
-    calls = []
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_REAL_DOC},
-               [{"doc_id": _REAL_DOC, "span": [1, 1], "quote": "x", "ext": ".md"}], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        if len(calls) == 1:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        return {"choices": [{"message": {"content": "止められた回答"}, "finish_reason": "content_filter"}]}
-
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = fake_post, fake_run_tool
-    try:
-        final = None
-        for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                                 max_turns=1):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 帰属は発行されない（3回目は無い）
-        assert final["final"] == "止められた回答"
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-def test_openai_style_finish_reason_missing_skips_attribution(monkeypatch):
-    """`finish_reason` が欠落（キー自体が無い）した応答は、以前は「明示的に `length` のときだけ
-    未完了」という denylist 判定のもとで帰属が発行されていたが、自然完了 allowlist では
-    理由欠落もすべて未完了扱いになる——旧 denylist 期待（理由欠落でも帰属成功）を反転する固定。"""
-    calls = []
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_REAL_DOC},
-               [{"doc_id": _REAL_DOC, "span": [1, 1], "quote": "x", "ext": ".md"}], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        if len(calls) == 1:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        return {"choices": [{"message": {"content": "理由欠落の回答"}}]}   # finish_reason キー自体が無い
-
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = fake_post, fake_run_tool
-    try:
-        final = None
-        for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                                 max_turns=1):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 帰属は発行されない（3回目は無い・旧 denylist なら発行されていた）
-        assert final["final"] == "理由欠落の回答"
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-def test_openai_style_non_string_finish_reason_skips_attribution_without_raising(monkeypatch):
-    """`finish_reason` が文字列でない（壊れた upstream 応答が数値/dict 等を返した）場合、本文の
-    配信・`_result` の生成は落ちずに完走し（`TypeError` にならない）、帰属呼び出しも発行しない
-    （`_openai_style_finish_reason` の非文字列→None 変換＋`_is_natural_completion` の isinstance
-    ガード、両方の防御を経路として通す）。"""
-    calls = []
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_REAL_DOC},
-               [{"doc_id": _REAL_DOC, "span": [1, 1], "quote": "x", "ext": ".md"}], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        if len(calls) == 1:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        # finish_reason が壊れて非文字列（dict）で返ってくる想定（JSON としては妥当な形）。
-        return {"choices": [{"message": {"content": "壊れた完了理由の回答"},
-                             "finish_reason": {"unexpected": "shape"}}]}
-
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = fake_post, fake_run_tool
-    try:
-        final = None
-        for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                                 max_turns=1):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 例外にならず完走・帰属は発行されない
-        assert final["final"] == "壊れた完了理由の回答"
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-def test_gemini_finish_reason_safety_skips_attribution(monkeypatch):
-    """`finishReason=="SAFETY"`（自然完了 allowlist に無い）で終わった応答は、たとえ本文があっても
-    帰属呼び出しを発行しない。"""
+@pytest.mark.parametrize("finish_reason,content,stop_reason", [
+    # `finishReason=="SAFETY"`（自然完了 allowlist に無い）で終わった応答は、たとえ本文があっても
+    # 帰属呼び出しを発行しない。"no_tool_calls"（自然終了）と偽らない。
+    ("SAFETY", "止められた回答", "content_filtered"),
+    # `finishReason=="MAX_TOKENS"`（打ち切り＝未完了）も同様。
+    ("MAX_TOKENS", "途中で切れた回答", None),
+    # `finishReason` が文字列でない（壊れた upstream 応答が dict 等を返した）場合、`cand0.get(
+    # "finishReason")` はそのまま非文字列値を返す（openai_style と異なりラッパー関数を経由しない）が、
+    # `_is_natural_completion` の isinstance ガードで例外にならず、本文配信・`_result` 生成は完走し
+    # 帰属呼び出しも発行しない。非文字列は自然終了(no_tool_calls)へ丸めない。
+    ({"unexpected": "shape"}, "壊れた完了理由の回答", "unknown"),
+])
+def test_gemini_non_natural_completion_skips_attribution(monkeypatch, finish_reason, content, stop_reason):
     real_doc = "4期/04_運用/障害記録.md"
     monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
         {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
     seq = [
         {"candidates": [{"content": {"parts": [
             {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "止められた回答"}]},
-                        "finishReason": "SAFETY"}]},
+        {"candidates": [{"content": {"parts": [{"text": content}]},
+                        "finishReason": finish_reason}]},
     ]
     calls = []
 
@@ -2932,44 +3160,10 @@ def test_gemini_finish_reason_safety_skips_attribution(monkeypatch):
             if "final" in ev:
                 final = ev
         assert len(calls) == 2   # 帰属（3回目）は発行されない
-        assert final["final"] == "止められた回答"
+        assert final["final"] == content
         assert final["attributed_ev_ids"] == set()
-        assert final["stop_reason"] == "content_filtered"   # "no_tool_calls"（自然終了）と偽らない
-    finally:
-        A._post = orig
-
-
-def test_gemini_non_string_finish_reason_skips_attribution_without_raising(monkeypatch):
-    """`finishReason` が文字列でない（壊れた upstream 応答が dict 等を返した）場合、`cand0.get(
-    "finishReason")` はそのまま非文字列値を返す（openai_style と異なりラッパー関数を経由しない）が、
-    `_is_natural_completion` の isinstance ガードで例外にならず、本文配信・`_result` 生成は完走し
-    帰属呼び出しも発行しない。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "壊れた完了理由の回答"}]},
-                        "finishReason": {"unexpected": "shape"}}]},
-    ]
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 例外にならず完走・帰属（3回目）は発行されない
-        assert final["final"] == "壊れた完了理由の回答"
-        assert final["attributed_ev_ids"] == set()
-        assert final["stop_reason"] == "unknown"   # 非文字列は自然終了(no_tool_calls)へ丸めない
+        if stop_reason is not None:
+            assert final["stop_reason"] == stop_reason
     finally:
         A._post = orig
 
@@ -3429,38 +3623,6 @@ def test_gemini_stop_event_set_after_final_response_skips_attribution(monkeypatc
         A._post = orig
 
 
-def test_gemini_finish_reason_max_tokens_skips_attribution(monkeypatch):
-    """`finishReason=="MAX_TOKENS"`（打ち切り＝未完了）で終わった応答は、たとえ本文が
-    あっても帰属呼び出しを発行しない。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "途中で切れた回答"}]},
-                        "finishReason": "MAX_TOKENS"}]},
-    ]
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 帰属（3回目）は発行されない
-        assert final["final"] == "途中で切れた回答"
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post = orig
-
-
 def test_gemini_mixed_valid_and_invalid_citations_resynthesizes_clean_body(monkeypatch):
     """検証で一部 citation が落ちた（実在 doc 1件＋存在しない doc 1件の混在）場合、Gemini 経路も
     `openai_style` と同じ「Committed Evidence だけからのクリーン再合成」を行う。落ちた doc に触れた
@@ -3649,8 +3811,8 @@ def test_gemini_ask_user_stub():
 
 @pytest.mark.parametrize("profile", ["standard", "deep", "max"])
 def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, profile):
-    """`_agentic_loop` は `ctx.scope_meta["depth_profile"]` の倍率を `openai_style` の
-    `max_turns`/`max_hits`/`window_cap` へ渡す（既定 `standard` は倍率×1＝env 既定値のまま）。"""
+    """`_agentic_loop` が `openai_style` へ渡す `max_turns`/`max_hits`/`window_cap` に、
+    `ctx.scope_meta["depth_profile"]` の倍率が一度だけ効く。"""
     from sherpa.agents import Ctx, OpenAIProvider
     from sherpa import depth_profile as D
     captured = {}
@@ -3673,7 +3835,8 @@ def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, pro
 
 
 def test_openai_provider_agentic_loop_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）。"""
+    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）＝
+    深さ（"deep"＝×2）の倍率はその実効基準値に掛かる。"""
     from sherpa.agents import Ctx, OpenAIProvider
     captured = {}
 
@@ -3689,12 +3852,12 @@ def test_openai_provider_agentic_loop_honors_system_settings_base_override(monke
               scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"},
               make_sources=lambda docs: [])
     list(p._agentic_loop(ctx))
-    assert captured.get("max_turns") == 10   # 5（基準値上書き）×2（深く）
+    assert captured.get("max_turns") == 10   # 5（基準値上書き）× 2（深く）
 
 
-def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_times_multiplier(monkeypatch):
-    """管理画面の基準値編集が Field 上限いっぱい（例: grep ヒット上限1000・読み取り窓400）でも、
-    調べる深さ「最大」との組み合わせで既存の絶対上限を超えない。"""
+def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_over_limit(monkeypatch):
+    """管理画面の基準値編集が既存の絶対上限を超える値（grep ヒット上限1500・読み取り窓600）＋
+    深さ「最大」（×2）でも、最終的に既存の絶対上限でクランプされる。"""
     from sherpa.agents import Ctx, OpenAIProvider
     captured = {}
 
@@ -3704,19 +3867,19 @@ def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_times_multiplier
 
     monkeypatch.setattr(A, "openai_style", fake_openai_style)
     p = OpenAIProvider("sk-dummy", "gpt-5.5", system_settings={
-        "depth_base_grep_max_hits": 1000, "depth_base_read_window": 400})
+        "depth_base_grep_max_hits": 1500, "depth_base_read_window": 600})
     ctx = Ctx(message="質問", world="v1", knowledge=True,
               route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
               dispatch=lambda lens, inp: {},
               scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "max"},
               make_sources=lambda docs: [])
     list(p._agentic_loop(ctx))
-    assert captured.get("max_hits") == A.MAX_HITS_ABS_MAX      # 2000 ではなく 1000
-    assert captured.get("window_cap") == A.READ_WINDOW_ABS_MAX  # 800 ではなく 400
+    assert captured.get("max_hits") == A.MAX_HITS_ABS_MAX      # 1500 ではなく 1000（絶対上限）
+    assert captured.get("window_cap") == A.READ_WINDOW_ABS_MAX  # 600 ではなく 400（絶対上限）
 
 
 def test_ollama_provider_agentic_loop_scales_with_depth_profile(monkeypatch):
-    """`OllamaProvider._agentic_loop` も OpenAIProvider と同じ倍率計算を openai_style へ渡す。"""
+    """`OllamaProvider._agentic_loop` も OpenAIProvider と同じ倍率を掛けて openai_style へ渡す。"""
     from sherpa.agents import Ctx, OllamaProvider
     from sherpa import depth_profile as D
     captured = {}
@@ -3871,8 +4034,7 @@ def test_provider_run_single_shot_stream_stops_between_chunks_when_stop_event_se
     events = list(p.run(ctx))
     deltas = [e for e in events if e.get("type") == "answer_delta"]
     assert produced == [0, 1], f"停止後も _stream から次のチャンクを引き出し続けている: {produced}"
-    assert deltas == [{"type": "answer_delta", "text": "chunk0"},
-                      {"type": "answer_delta", "text": "chunk1"}], \
+    assert [d["text"] for d in deltas][-2:] == ["chunk0", "chunk1"], \
         f"停止検知までに生成済みのチャンクは両方 yield されるはず: {deltas}"
     result = next(e for e in events if e.get("type") == "_result")
     assert result["env"]["headline"] == "".join(d["text"] for d in deltas)   # headline と配信本文が一致
@@ -3892,8 +4054,12 @@ def test_provider_run_single_shot_headline_byte_identical_to_stream():
               route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
               dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}},
               make_sources=lambda docs: [])
-    result = next(e for e in p.run(ctx) if e.get("type") == "_result")
-    assert result["env"]["headline"] == "影響は3件です。"
+    events = list(p.run(ctx))
+    deltas = [e for e in events if e.get("type") == "answer_delta"]
+    result = next(e for e in events if e.get("type") == "_result")
+    assert result["env"]["headline"].endswith("影響は3件です。")
+    # 根拠の不足の告知も delta として配信される＝保存本文と配信本文は一致したまま。
+    assert result["env"]["headline"] == "".join(d["text"] for d in deltas)
 
 
 def test_provider_run_single_shot_stop_event_headline_is_partial_stream_so_far():
@@ -3917,9 +4083,8 @@ def test_provider_run_single_shot_stop_event_headline_is_partial_stream_so_far()
               make_sources=lambda docs: [], stop_event=stop_event)
     events = list(p.run(ctx))
     deltas = [e for e in events if e.get("type") == "answer_delta"]
-    assert deltas == [{"type": "answer_delta", "text": "回答本文"}]
+    assert [d["text"] for d in deltas][-1:] == ["回答本文"]
     result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"] == "回答本文"
     assert result["env"]["headline"] == "".join(d["text"] for d in deltas)
 
 
@@ -4448,16 +4613,27 @@ def test_anthropic_style_stop_event_set_after_final_response_skips_attribution(m
     assert final["attributed_ev_ids"] == set()
 
 
-def test_anthropic_style_stop_reason_max_tokens_skips_attribution(monkeypatch):
-    """`stop_reason=="max_tokens"`（打ち切り＝未完了）で終わった応答は、たとえ本文が
-    あっても帰属呼び出しを発行しない。"""
+@pytest.mark.parametrize("stop_reason,content", [
+    # `stop_reason=="max_tokens"`（打ち切り＝未完了）で終わった応答は、たとえ本文が
+    # あっても帰属呼び出しを発行しない。
+    ("max_tokens", "途中で切れた回答"),
+    # `stop_reason` が欠落（None）した応答は、自然完了 allowlist（"end_turn"/"stop_sequence"）に
+    # 無いためすべて未完了扱い——旧 denylist 期待（理由欠落でも帰属成功）を反転する固定。
+    (None, "理由欠落の回答"),
+    # `stop_reason` が文字列でない（壊れた SDK/upstream 応答が dict 等を返した）場合、
+    # `getattr(resp, "stop_reason", None)` はそのまま非文字列値を返す（ラッパー関数を経由しない）が、
+    # `_is_natural_completion` の isinstance ガードで例外にならず、本文配信・`_result` 生成は完走し
+    # 帰属呼び出しも発行しない。
+    ({"unexpected": "shape"}, "壊れた完了理由の回答"),
+])
+def test_anthropic_style_non_natural_completion_skips_attribution(monkeypatch, stop_reason, content):
     real_doc = "4期/04_運用/障害記録.md"
     monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
         {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
     seq = [
         _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
                stop_reason="tool_use"),
-        _AResp([_ABlock("text", "途中で切れた回答")], stop_reason="max_tokens"),
+        _AResp([_ABlock("text", content)], stop_reason=stop_reason),
     ]
     client = _AClient(seq)
     final = None
@@ -4465,51 +4641,7 @@ def test_anthropic_style_stop_reason_max_tokens_skips_attribution(monkeypatch):
         if "final" in ev:
             final = ev
     assert len(client.messages.calls) == 2   # 帰属（3回目）は発行されない
-    assert final["final"] == "途中で切れた回答"
-    assert final["attributed_ev_ids"] == set()
-
-
-def test_anthropic_style_stop_reason_missing_skips_attribution(monkeypatch):
-    """`stop_reason` が欠落（None）した応答は、自然完了 allowlist（"end_turn"/"stop_sequence"）に
-    無いためすべて未完了扱い——旧 denylist 期待（理由欠落でも帰属成功）を反転する固定。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "理由欠落の回答")], stop_reason=None),
-    ]
-    client = _AClient(seq)
-    final = None
-    for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None):
-        if "final" in ev:
-            final = ev
-    assert len(client.messages.calls) == 2   # 帰属（3回目）は発行されない・旧 denylist なら発行されていた
-    assert final["final"] == "理由欠落の回答"
-    assert final["attributed_ev_ids"] == set()
-
-
-def test_anthropic_style_non_string_stop_reason_skips_attribution_without_raising(monkeypatch):
-    """`stop_reason` が文字列でない（壊れた SDK/upstream 応答が dict 等を返した）場合、
-    `getattr(resp, "stop_reason", None)` はそのまま非文字列値を返す（ラッパー関数を経由しない）が、
-    `_is_natural_completion` の isinstance ガードで例外にならず、本文配信・`_result` 生成は完走し
-    帰属呼び出しも発行しない。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "壊れた完了理由の回答")], stop_reason={"unexpected": "shape"}),
-    ]
-    client = _AClient(seq)
-    final = None
-    for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None):
-        if "final" in ev:
-            final = ev
-    assert len(client.messages.calls) == 2   # 例外にならず完走・帰属（3回目）は発行されない
-    assert final["final"] == "壊れた完了理由の回答"
+    assert final["final"] == content
     assert final["attributed_ev_ids"] == set()
 
 
@@ -5528,8 +5660,12 @@ def test_dispatch_tools_for_lens_availability_omitted_means_fully_available():
 # 全件・一覧の完了条件と中断時の書き方を明記したため golden 更新。
 _SYSTEM_GOLDEN_BYTES = 5025
 _SYSTEM_GOLDEN_SHA256 = "53a8b3c61adef925e3cfea57a889996dd88d503563c6b69dc7f7ddac8c63cde1"
-_DESC_ES_GOLDEN_BYTES = 647
-_DESC_ES_GOLDEN_SHA256 = "9bf6098dca7c695e63f41db30fcaa46bb31fe2861f9f3aafa6b0c518a9df9e00"
+# 契約変更（2026-09-21・全文(P3)段の撤去に伴い「返す本文は該当箇所の周辺まで（文書全体は返さない）
+# ——文書全体を確認したいときは doc_id を渡して read_doc で読む」を追記）したため golden 更新。
+# 契約変更（調査台帳を文脈の外に置く §2・es_search はページングを持たないため候補発見用に限定し、
+# 全件列挙は ripgrep_search/list_docs/原本読取へ誘導する一文を追記）したため golden 再更新。
+_DESC_ES_GOLDEN_BYTES = 1008
+_DESC_ES_GOLDEN_SHA256 = "33438a462fb4ed30f7b762a1696a631aeaa0f78996b8839293477dc3b132d8df"
 # 契約変更（S3c・裁定2026-09-11・graph_neighbors の近傍に辺ごとの種類と向きを追加したのに伴い
 # description へ「経路は辺ごとの種類と向き（from→to）付き」を追記）したため golden 更新。
 _DESC_GRAPH_GOLDEN_BYTES = 1190
@@ -5806,7 +5942,8 @@ def test_impact_lens_uses_agentic_tool_loop():
     従来は `run()` の分岐が impact を除外しており、Neo4j を1回引くだけで終わっていた。
     グラフが 0 件だと「根拠なし」で終わってしまい、自前 grep を続ける Codex と差が出ていた。
     ここでは「impact でも `_agentic_loop` が呼ばれ、引用付きの envelope が返る」ことを固定する
-    （author だけは agentic_search 未対応ツールのため従来どおり単発取得）。
+    （DEPTH-2 S2・§2.7: author も既定構成（検索アシスタント／計画なし）では同じ `_agentic_loop`
+    へ接続される——`write_output_file` ツールがこのループにだけ実装されているため）。
 
     world/doc_id は fixtures/corpus/v1 実在ファイル（EXT-2 機械検証が既定 ON のため、実在しない
     doc を指す citation は Committed Evidence から落ちる。テストの関心はルーティング＝
@@ -5841,7 +5978,7 @@ def test_impact_lens_uses_agentic_tool_loop():
 
     seen.clear()
     list(_P().run(_ctx("author")))
-    assert seen == [], "author は従来どおり単発取得のまま（agentic_search 未対応ツール）"
+    assert seen == ["agentic"], "author も既定構成では反復ツール検索を通るはず（DEPTH-2 S2）"
 
 
 # ===== TOOLREAD: read_doc/doc_outline（土台系・新設） =====
@@ -6304,37 +6441,64 @@ class _NeverCallAgenticLoop:
         raise AssertionError("blocked のはずの lens で _agentic_loop が呼ばれた")
 
 
-def test_agentic_run_impact_blocked_when_graph_unavailable():
-    """impact はグラフ必須（`_DISPATCH_REQUIRES_GRAPH`）——不達なら `_agentic_loop` を一切呼ばず
-    honest-failure envelope（`tools_blocked_env`）を返す。"""
+def _degraded_gate_provider(seen):
+    """入口ゲートで縮退したときに `_agentic_loop` が実際に呼ばれることを確かめる provider。"""
+    from sherpa.providers.base import _GenProvider
+
+    class _P(_GenProvider):
+        label, model, provider_id = "T", "m", "openai"
+
+        def _agentic_loop(self, ctx):
+            seen.append("agentic")
+            # has_structural_evidence=True で根拠ゲート（EXT-2）を素直に通す（下の陰性対照と同じ理由）。
+            yield {"final": "回答", "docs": set(), "searched": True, "cites": [], "cards": [],
+                  "has_structural_evidence": True}
+
+    return _P
+
+
+def test_agentic_run_impact_degrades_to_direct_search_when_graph_unavailable():
+    """S4: impact でグラフが不達でも `tools_blocked_env` で終わらせず、grep/原本直読の調査を
+    そのまま続ける（§0(c)）——回答の冒頭にグラフを使わなかった理由を平文で告知する。"""
+    seen = []
+    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert seen == ["agentic"], "調査ループを一度も回さずに終わってはいけない"
+    assert env["lens"] == "impact"
+    assert env["headline"].endswith("回答")
+    # 実接続の不達＝「接続できなかった」側の文言（利用者 OFF の「使えない」とは分ける）。
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["graph_unavailable"])
+    assert "agentic_failure" not in env    # 実行できなかったターン扱いにしない
+
+
+def test_agentic_run_troubleshoot_degrades_when_graph_off_via_pref():
+    """troubleshoot も同じ——実接続は可用でも会話の検索経路トグルで明示 OFF なら、グラフ抜きで
+    調査を続ける（可用性とユーザー希望の AND・`effective_tools_pref` 参照）。"""
+    seen = []
+    ctx = _blocking_gate_ctx("troubleshoot", {"grep": True, "fulltext": True, "graph": True},
+                            tools_pref={"graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert seen == ["agentic"]
+    assert env["lens"] == "troubleshoot"
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["blocked"])
+
+
+def test_agentic_run_impact_still_blocked_when_no_search_tool_remains():
+    """縮退の条件は「資料を探す手段が残っていること」——grep も全文も使えなければ従来どおり
+    honest-failure envelope（`tools_blocked_env`）で終わる。"""
     from sherpa.providers.base import _GenProvider
 
     class _P(_NeverCallAgenticLoop, _GenProvider):
         pass
 
-    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
+    ctx = _blocking_gate_ctx("impact", {"grep": False, "fulltext": False, "graph": False})
     events = list(_P().run(ctx))
     env = next(e["env"] for e in events if e.get("type") == "_result")
     assert env["lens"] == "impact"
     assert env["data"] == {}
     assert env["summary"]["total"] == 0
-    assert "グラフ" in env["headline"]
-
-
-def test_agentic_run_troubleshoot_blocked_when_graph_off_via_pref():
-    """troubleshoot もグラフ必須——実接続は可用でも、会話の検索経路トグルで明示 OFF にしていれば
-    同じく blocked（可用性とユーザー希望の AND・`effective_tools_pref` 参照）。"""
-    from sherpa.providers.base import _GenProvider
-
-    class _P(_NeverCallAgenticLoop, _GenProvider):
-        pass
-
-    ctx = _blocking_gate_ctx("troubleshoot", {"grep": True, "fulltext": True, "graph": True},
-                            tools_pref={"graph": False})
-    events = list(_P().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["lens"] == "troubleshoot"
-    assert env["data"] == {}
 
 
 def test_agentic_run_qa_blocked_when_grep_and_fulltext_both_unavailable():
@@ -7252,8 +7416,11 @@ def test_openai_style_yields_truncated_docs_node_when_ripgrep_search_reports_it(
 
 # ===== L4c: 親返し（検索は細かく・回答には文脈を・§3.3/§3.4）=====
 # es_search 限定・常時 ON（TOGGLE-RM・2026-09-03 でグローバル切替トグル `SHERPA_ES_PARENT_RETURN`
-# を撤去）。ヒットを doc_id で束ね、予算内なら rag.md 全文(P3)／領域(P2)を返し、両方超える場合は
-# 子チャンク（chunk・最低保証）のまま。
+# を撤去）。ヒットを doc_id で束ね、予算内なら rag.md の領域(P2)を返し、超える場合は
+# 子チャンク（chunk・最低保証）のまま。**全文(P3)段は無い**（決定 2026-09-21・調査の検索は場所を
+# 広く見つけるためのもので、文書まるごとを返すのはその設計思想に反する。全文が要るなら
+# read_doc で個別に取得する）。表示側（`rag_parent_return.py`・chat/search 用の出典カード）は
+# 別実装で P3/P2/chunk の3段のまま——ここで検証するのは調査側（`agentic_search`）のみ。
 
 def _setup_parent_return_world(monkeypatch, tmp_path, world: str, hits: list, rag_files: dict) -> None:
     """親返しテスト共通セットアップ: `es_index.search`/`documents.world_rel_set` をスタブし、
@@ -7271,25 +7438,33 @@ def _setup_parent_return_world(monkeypatch, tmp_path, world: str, hits: list, ra
     monkeypatch.setattr(documents, "world_rel_set", lambda w, **kw: {h["doc_id"] for h in hits})
 
 
-def test_parent_return_three_tiers_fixed_by_size(monkeypatch, tmp_path):
-    """P3(全文が予算内)・P2(領域縮退)・chunk(両方超過)の3段を、サイズを操作した3文書で同時に固定する
-    （§3.4 の配分規則＝ベストスコア順に P3→P2→chunk を試す）。"""
+def test_parent_return_no_full_tier_region_or_chunk_by_size(monkeypatch, tmp_path):
+    """全文(P3)段は無い（決定 2026-09-21）: サイズを操作した3文書でも tier は region か chunk にしか
+    ならない（§3.4 の配分規則＝ベストスコア順に region→chunk を試す）。`region.docx`（旧名）は
+    複数チャンクの rag.md のうち親グループに入る2チャンクだけを含み、対象外の領域（pad1）は
+    含まない——`chunk_ids_for_parent` が対象と答えたチャンクだけをアンカー単位で集める P2 の
+    仕組みそのもの。`many_chunks.docx` は rag.md に2チャンクあるが親グループには自分自身
+    （ヒットしたチャンク）しか含まれない場合の固定——**全文なら含まれたはずの無関係な後続チャンク
+    （cf2）が region では含まれない**ことを検証する（P3 撤去の実害＝無関係な内容を混ぜないことの
+    直接証拠）。"""
     world = "parent-return-tiers-world"
-    full_md = "<!-- chunk:cf1 -->\n" + "F" * 200 + "\n"
+    single_chunk_md = "<!-- chunk:cf1 -->\n" + "F" * 200 + "\n\n<!-- chunk:cf2 -->\n" + "Z" * 5000 + "\n"
     region_md = ("<!-- chunk:cr1 -->\n" + "R" * 100 + "\n\n"
                 "<!-- chunk:cr2 -->\n" + "R" * 100 + "\n\n"
                 "<!-- chunk:pad1 -->\n" + "P" * 5000 + "\n")
     chunk_md = ("<!-- chunk:cc1 -->\n" + "C" * 50 + "\n\n"
                "<!-- chunk:cc2 -->\n" + "C" * 5000 + "\n")
     hits = [
-        {"doc_id": "full.docx", "text": "F", "ext": ".docx", "chunk_id": "cf1", "parent_id": "pf", "score": 3.0},
+        {"doc_id": "many_chunks.docx", "text": "F", "ext": ".docx", "chunk_id": "cf1", "parent_id": "pf", "score": 3.0},
         {"doc_id": "region.docx", "text": "R", "ext": ".docx", "chunk_id": "cr1", "parent_id": "pr", "score": 2.0},
         {"doc_id": "chunk.docx", "text": "C", "ext": ".docx", "chunk_id": "cc1", "parent_id": "pc", "score": 1.0},
     ]
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {
-        "full.docx": full_md, "region.docx": region_md, "chunk.docx": chunk_md})
+        "many_chunks.docx": single_chunk_md, "region.docx": region_md, "chunk.docx": chunk_md})
 
     def fake_chunk_ids_for_parent(w, doc_id, parent_ids, limit=5000):
+        if doc_id == "many_chunks.docx":
+            return ["cf1"]                  # 親グループは自分自身のチャンクだけ（cf2 は対象外）
         if doc_id == "region.docx":
             return ["cr1", "cr2"]
         if doc_id == "chunk.docx":
@@ -7301,23 +7476,25 @@ def test_parent_return_three_tiers_fixed_by_size(monkeypatch, tmp_path):
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
-    assert by_doc["full.docx"]["tier"] == "full"
-    assert by_doc["full.docx"]["text"] == "\n".join(full_md.splitlines())
+    assert {h["tier"] for h in res["hits"]} <= {"region", "chunk"}   # "full" は絶対に出ない
+    assert by_doc["many_chunks.docx"]["tier"] == "region"
+    assert "F" * 200 in by_doc["many_chunks.docx"]["text"]
+    assert "Z" * 5000 not in by_doc["many_chunks.docx"]["text"]     # 親グループ外（cf2）は含まない
     assert by_doc["region.docx"]["tier"] == "region"
     assert "R" * 100 in by_doc["region.docx"]["text"]
     assert "P" * 5000 not in by_doc["region.docx"]["text"]      # 対象外の領域（pad1）は含まない
     assert by_doc["chunk.docx"]["tier"] == "chunk"
     assert by_doc["chunk.docx"]["text"] == "C"                  # 最低保証（子チャンクの結合＝1件分）
     # ベストスコア順（決定的な配分順）で並ぶ。
-    assert [h["doc_id"] for h in res["hits"]] == ["full.docx", "region.docx", "chunk.docx"]
+    assert [h["doc_id"] for h in res["hits"]] == ["many_chunks.docx", "region.docx", "chunk.docx"]
 
 
 def test_parent_return_minimum_guarantee_lower_score_doc_survives(monkeypatch, tmp_path):
-    """§3.4「最低保証」: スコア1位の文書が P3 で予算の残りを使い切っても、2位の文書の子チャンク
-    （最低保証＝baseline）は消えない（黙って空文字/欠落にならない）。"""
+    """§3.4「最低保証」: スコア1位の文書が領域(region)で予算の残りを使い切っても、2位の文書の
+    子チャンク（最低保証＝baseline）は消えない（黙って空文字/欠落にならない）。"""
     world = "parent-return-minguard-world"
-    doc1_md = "<!-- chunk:c1 -->\n" + "A" * 400 + "\n"          # 1位: 予算内に収まる全文
-    doc2_md = "<!-- chunk:c2 -->\n" + "B" * 50000 + "\n"        # 2位: 全文も領域も予算を大幅に超える
+    doc1_md = "<!-- chunk:c1 -->\n" + "A" * 400 + "\n"          # 1位: 予算内に収まる領域（単一チャンク）
+    doc2_md = "<!-- chunk:c2 -->\n" + "B" * 50000 + "\n"        # 2位: 領域も予算を大幅に超える
     hits = [
         {"doc_id": "top.docx", "text": "top-baseline", "ext": ".docx",
          "chunk_id": "c1", "parent_id": "p1", "score": 2.0},
@@ -7327,17 +7504,21 @@ def test_parent_return_minimum_guarantee_lower_score_doc_survives(monkeypatch, t
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits,
                                {"top.docx": doc1_md, "second.docx": doc2_md})
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
-    # baseline 合計（"top-baseline"+"second-baseline"）＋ doc1 の全文アップグレード分だけが入る予算
-    # （doc2 に回せる余剰は残らない設計値）。
+    # baseline 合計（"top-baseline"+"second-baseline"）＋ doc1 の領域アップグレード分だけが入る予算
+    # （doc2 に回せる余剰は残らない設計値。per_doc_cap は budget_for_rag//2 で余裕を持たせ、
+    # ここでは共有予算の枯渇だけを検証対象にする）。
     baseline_total = len("top-baseline".encode("utf-8")) + len("second-baseline".encode("utf-8"))
     delta_doc1 = len(doc1_md.encode("utf-8")) - len("top-baseline".encode("utf-8"))
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", baseline_total + delta_doc1)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
-    assert by_doc["top.docx"]["tier"] == "full"
+    assert by_doc["top.docx"]["tier"] == "region"
+    assert by_doc["top.docx"]["text"] == "A" * 400
     assert by_doc["second.docx"]["tier"] == "chunk"
     assert by_doc["second.docx"]["text"] == "second-baseline"   # 消えない・空にならない
+    # 共有予算の枯渇が理由（per_doc_cap 側の頭打ちではない）＝新設フラグは立たない。
+    assert "text_truncated" not in by_doc["second.docx"]
 
 
 def test_parent_return_declares_tier_for_every_doc(monkeypatch, tmp_path):
@@ -7419,9 +7600,9 @@ def test_parent_return_legacy_hits_pass_through_untouched(monkeypatch, tmp_path)
     assert "tier" not in legacy_entries[0] and "chunks" not in legacy_entries[0]
 
 
-def test_parent_return_redacts_full_and_region_text(monkeypatch, tmp_path):
-    """redaction（`_redact`）は P3/P2 の本文にも効く——ES ヒット断片だけでなく、rag.md から直接
-    読んだ全文/領域テキストも秘密パターンを伏せて返す（rag.md 全文を未マスクで LLM に渡さない）。"""
+def test_parent_return_redacts_region_text(monkeypatch, tmp_path):
+    """redaction（`_redact`）は領域(P2)の本文にも効く——ES ヒット断片だけでなく、rag.md から直接
+    読んだ領域テキストも秘密パターンを伏せて返す（rag.md を未マスクで LLM に渡さない）。"""
     world = "parent-return-redact-world"
     secret = "sk-1234567890ABCDEFGHIJ"                     # `_SECRET_RE` の sk- パターンに一致
     md = f"<!-- chunk:c1 -->\nAPIキー: {secret}\n"
@@ -7431,9 +7612,60 @@ def test_parent_return_redacts_full_and_region_text(monkeypatch, tmp_path):
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 5000)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
-    assert res["hits"][0]["tier"] == "full"
+    assert res["hits"][0]["tier"] == "region"
     assert secret not in res["hits"][0]["text"]
     assert "[REDACTED]" in res["hits"][0]["text"]
+
+
+def test_parent_return_never_returns_full_tier_even_with_huge_budget(monkeypatch, tmp_path):
+    """全文(P3)段は無い（決定 2026-09-21）の直接固定: 共有予算・1文書あたりの上限のどちらも
+    ゆとりがあり、旧 P3 なら確実に「全文」を選んでいたはずの条件下でも `tier` は `"region"`
+    にしかならない（`"full"` という文字列自体が出力に一切現れない）。"""
+    world = "parent-return-no-full-ever-world"
+    md = "<!-- chunk:c1 -->\n" + "A" * 100 + "\n"
+    hits = [{"doc_id": "a.docx", "text": "本文A", "ext": ".docx",
+            "chunk_id": "c1", "parent_id": "p1", "score": 1.0}]
+    _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"a.docx": md})
+    monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: ["c1"])
+    monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 1_000_000)     # 潤沢な予算（旧 P3 なら確実に採用）
+
+    res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
+    assert res["hits"][0]["tier"] == "region"
+    assert "full" not in json.dumps(res)
+
+
+def test_parent_return_per_doc_cap_stops_one_doc_eating_shared_budget(monkeypatch, tmp_path):
+    """新設: 領域(P2)にも1文書あたりの上限（ヒット単位のクリップと同じ「総予算を件数で均等割り・
+    下限 `_HIT_TEXT_MIN_BYTES`」規則）を掛ける。スコア1位の文書の領域が単独ではこの上限を超える
+    （が、共有の残り予算にはまだ余裕がある）とき、旧実装なら1位が予算を独占して2位の領域は
+    得られなかった。新実装では1位がこの上限に阻まれて chunk へ留まり（`text_truncated: true` を
+    申告）、消費されなかった共有予算のおかげで2位は領域を得られる。"""
+    world = "parent-return-per-doc-cap-world"
+    top_md = "<!-- chunk:c1 -->\n" + "A" * 2500 + "\n"        # 単独で per_doc_cap(2000) を超える
+    second_md = "<!-- chunk:c2 -->\n" + "B" * 1500 + "\n"     # per_doc_cap(2000) 以内に収まる
+    hits = [
+        {"doc_id": "top.docx", "text": "top-chunk", "ext": ".docx",
+         "chunk_id": "c1", "parent_id": "p1", "score": 2.0},
+        {"doc_id": "second.docx", "text": "second-chunk", "ext": ".docx",
+         "chunk_id": "c2", "parent_id": "p2", "score": 1.0},
+    ]
+    _setup_parent_return_world(monkeypatch, tmp_path, world, hits,
+                               {"top.docx": top_md, "second.docx": second_md})
+    monkeypatch.setattr(A.es_index, "chunk_ids_for_parent",
+                        lambda w, doc_id, parent_ids, limit=5000: (["c1"] if doc_id == "top.docx" else ["c2"]))
+    # budget_for_rag=4000・doc 数2件 → per_doc_cap=2000（_HIT_TEXT_MIN_BYTES=512 の床より大きい）。
+    monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 4000)
+
+    res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
+    by_doc = {h["doc_id"]: h for h in res["hits"]}
+    assert by_doc["top.docx"]["tier"] == "chunk"              # 1文書あたりの上限で領域を得られない
+    assert by_doc["top.docx"]["text"] == "top-chunk"          # 最低保証は消えない
+    assert by_doc["top.docx"]["text_truncated"] is True       # 上限で切られたことを申告する
+    assert by_doc["second.docx"]["tier"] == "region"          # 1位の独占が無くなり2位は領域を得る
+    assert by_doc["second.docx"]["text"] == "B" * 1500
+    assert "text_truncated" not in by_doc["second.docx"]
+    # `tool_result_clipped` 計測が拾う最上位フラグにも合流する（`_BYTE_CLIP_TOOLS` に es_search 含む）。
+    assert res["text_truncated"] is True
 
 
 def test_parent_return_disabled_env_is_byte_identical_to_hit_per_chunk(monkeypatch, tmp_path):
@@ -7764,7 +7996,7 @@ def test_run_tool_toctou_rejects_path_swapped_to_symlink_after_check(monkeypatch
     rp.symlink_to(outside)
 
     res, docs, _, _ = A.run_tool("file_head", {"doc_id": "note.txt"}, world, None)
-    assert res == {"error": "読み取りに失敗しました"}
+    assert res == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     assert docs == set()
 
 
@@ -7799,7 +8031,7 @@ def test_run_tool_ancestor_dir_symlink_swap_after_check_is_rejected(monkeypatch,
     sub_dir.symlink_to(outside)
 
     res, docs, _, _ = A.run_tool("file_head", {"doc_id": "sub/note.txt"}, world, None)
-    assert res == {"error": "読み取りに失敗しました"}
+    assert res == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     assert docs == set()
 
 
@@ -8124,3 +8356,639 @@ def test_usage_return_limit_caps_nested_series_in_overview():
     assert out["daily"][-1] == daily[-1]            # 直近側を残す
     assert out["users"] == [{"uid": "u", "turns": 1}]   # 系列でないリストは触らない
     assert out["truncated"] is True and out["omitted_count"] == 20
+
+
+def test_render_existing_claims_for_prompt_keeps_all_ids_over_budget():
+    from sherpa import agentic_search as A
+    claims = [
+        {"id": "c1", "status": "confirmed", "text": "x" * 500},
+        {"id": "c2", "status": "inferred", "text": "後続の主張"},
+    ]
+    out = A._render_existing_claims_for_prompt(claims, max_bytes=200)
+    assert len(out.encode("utf-8")) <= 200
+    assert "[c1]" in out and "[c2]" in out                    # 全件の id を保持
+    assert "confirmed" in out and "inferred" in out            # 全件の status を保持
+    lines = out.split("\n")
+    assert any(line.startswith("[c2]") for line in lines)      # c2 行が丸ごと残る（途中で切れない）
+    for line in lines:
+        assert line.count("[") == 0 or "]" in line             # id が途中で切れていない
+
+
+# ===== S3: 障害種別の分類（`_is_recoverable_tool_exception`/`_tool_backend_kind`/
+# `_record_tool_exception`/`_record_tool_result_error_code`）=====
+
+def test_tool_backend_kind_classifies_by_closed_set():
+    assert A._tool_backend_kind("es_search") == "fulltext"
+    assert A._tool_backend_kind("graph_neighbors") == "graph"
+    assert A._tool_backend_kind("ripgrep_search") == "read_io"
+    assert A._tool_backend_kind("xlsx_sheets") == "read_io"
+    assert A._tool_backend_kind("some_unknown_tool") == "read_io"   # 未知名は read_io へ丸める
+
+
+def test_is_recoverable_tool_exception_covers_os_timeout_and_neo4j_client_errors():
+    """接続断・タイムアウト・読取I/O（ES/Neo4j クライアント例外・`OSError`/`TimeoutError` 系）は
+    回復可能——それ以外（プログラムの欠陥を示す例外）は回復不可。"""
+    from neo4j.exceptions import ServiceUnavailable
+
+    assert A._is_recoverable_tool_exception(OSError("boom")) is True
+    assert A._is_recoverable_tool_exception(TimeoutError("boom")) is True
+    assert A._is_recoverable_tool_exception(ConnectionError("boom")) is True   # OSError のサブクラス
+    assert A._is_recoverable_tool_exception(ServiceUnavailable("boom")) is True
+    assert A._is_recoverable_tool_exception(TypeError("boom")) is False
+    assert A._is_recoverable_tool_exception(KeyError("boom")) is False
+    assert A._is_recoverable_tool_exception(AssertionError("boom")) is False
+
+
+def test_is_recoverable_tool_exception_excludes_neo4j_client_errors():
+    """`Neo4jError` のうち `ClientError` 系（`CypherSyntaxError`/`ConfigurationError` 含む・クエリの
+    バグや設定ミス）は回復不可——`TransientError`（サーバ側の一時的な過負荷等）だけが回復可能。"""
+    from neo4j.exceptions import ConfigurationError, CypherSyntaxError, TransientError
+
+    assert A._is_recoverable_tool_exception(TransientError("boom")) is True
+    assert A._is_recoverable_tool_exception(CypherSyntaxError("boom")) is False
+    assert A._is_recoverable_tool_exception(ConfigurationError("boom")) is False
+
+
+def test_is_recoverable_tool_exception_classifies_http_error_by_status_before_oserror():
+    """`HTTPError` は `OSError` のサブクラスだが、一般 `OSError` 判定より先にステータスコードで
+    分類する——4xx（クライアント起因）は回復不可、5xx・429（一時的）は回復可能。"""
+    import io
+    import urllib.error
+
+    def _http_error(code: int) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(b""))
+
+    assert A._is_recoverable_tool_exception(_http_error(400)) is False
+    assert A._is_recoverable_tool_exception(_http_error(404)) is False
+    assert A._is_recoverable_tool_exception(_http_error(429)) is True
+    assert A._is_recoverable_tool_exception(_http_error(500)) is True
+    assert A._is_recoverable_tool_exception(_http_error(503)) is True
+
+
+def test_record_tool_exception_marks_backend_kind_for_recoverable_and_flag_for_non_recoverable():
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_exception(state, "es_search", OSError("boom"))
+    assert state.backend_failures == {"fulltext": True, "graph": False, "read_io": False}
+    assert state.non_recoverable_failure is False
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_exception(state2, "graph_neighbors", TypeError("boom"))
+    assert state2.backend_failures == {"fulltext": False, "graph": False, "read_io": False}
+    assert state2.non_recoverable_failure is True   # プログラムの欠陥は種別に関わらずこのフラグ
+
+
+def test_record_tool_exception_non_recoverable_persists_alongside_recoverable():
+    """同一ターンで回復可能（接続断）と回復不可（プログラム欠陥）が混在しても、回復不可の
+    フラグは戻らない（一度立てたら run 内で戻さない・単発フォールバック禁止の判定材料）。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_exception(state, "ripgrep_search", OSError("boom"))
+    A._record_tool_exception(state, "es_search", TypeError("boom"))
+    assert state.backend_failures["read_io"] is True
+    assert state.non_recoverable_failure is True
+
+
+def test_record_tool_result_error_code_marks_read_io_only_for_known_code():
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"})
+    assert state.backend_failures["read_io"] is True
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state2, {"error": "範囲外です"})   # error_code 無し＝無反応
+    assert state2.backend_failures == {"fulltext": False, "graph": False, "read_io": False}
+
+
+def test_record_tool_result_error_code_marks_fulltext_for_es_hard_degrade():
+    """`es_search` の `degrade_reason` が `es_unavailable`/`es_query_failed`（BM25 自体も失敗した
+    既知値・`_ES_DEGRADE_WORDING` に含まれない）のとき `backend_failures["fulltext"]` を立てる——
+    BM25 継続時の縮退理由（`query_embed_failed` 等・`_ES_DEGRADE_WORDING` に含まれる既知値）は
+    検索自体は実行できているため対象外のまま。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state, {"hits": [], "degrade_reason": "es_unavailable"}, "es_search")
+    assert state.backend_failures["fulltext"] is True
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state2, {"hits": [], "degrade_reason": "query_embed_failed"}, "es_search")
+    assert state2.backend_failures["fulltext"] is False
+
+
+def test_record_tool_result_error_code_marks_graph_for_neighbor_cards_failure():
+    """`graph_neighbors` の結果に `neighbor_cards` 由来の固定コード（`"graph_unavailable"`＝回復可能／
+    `"graph_internal_error"`＝回復不可）が付いていれば、対応するフラグへ反映する。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state, {"neighbors": [], "error_code": "graph_unavailable"}, "graph_neighbors")
+    assert state.backend_failures["graph"] is True
+    assert state.non_recoverable_failure is False
+
+    state2 = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state2, {"neighbors": [], "error_code": "graph_internal_error"}, "graph_neighbors")
+    assert state2.backend_failures["graph"] is False
+    assert state2.non_recoverable_failure is True
+
+
+def test_open_doc_stream_open_failure_carries_read_io_error_code(monkeypatch, tmp_path):
+    """`_open_doc_stream` の実際の open 失敗（`OSError`）が固定理由コード `read_io_failed` を
+    結果へ付ける——例外にならず結果化される読取I/O失敗を `run_tool` 呼び出し元が拾える形。"""
+    from sherpa import scope as scope_mod
+
+    def _boom(root, rel_parts):
+        raise OSError("boom")
+
+    monkeypatch.setattr(A, "_open_file_nofollow_walk", _boom)
+    monkeypatch.setattr(A, "_safe_doc_path", lambda world, doc_id, layer=None: (tmp_path, "x.txt", tmp_path / "x.txt"))
+    monkeypatch.setattr(scope_mod, "in_scope", lambda doc_id, sp: True)
+    f, err = A._open_doc_stream("v1", "x.txt", None, None)
+    assert f is None
+    assert err == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
+
+
+def test_finalize_payload_preserves_budget_exhausted_stop_reason_when_citations_all_dropped():
+    """予算到達（turns_exhausted 等）で打ち切られたターンで、集めた引用候補が機械検証で全滅
+    （`committed` 空・`dropped` 非空）しても、`stop_reason` は `evidence_verification_failed` へ
+    上書きされない——上書きされると `providers/base.py::run` の単発フォールバック除外判定
+    （予算到達を縮退対象から除外する規律）が実際の終了理由を読み取れなくなる回帰を防ぐ。"""
+    payload = A._build_final_payload(
+        "", set(), True,
+        [{"doc_id": "ghost-does-not-exist.md", "span": [1, 1], "quote": "x", "ext": ".md"}],
+        [], None, set(), "turns_exhausted", "v1")
+    assert payload["cites"] == []
+    assert payload["dropped_citations"], "citation が全滅していない前提が崩れている"
+    assert payload["stop_reason"] == "turns_exhausted"
+
+
+def test_finalize_payload_still_upgrades_to_evidence_verification_failed_when_not_budget():
+    """予算到達以外（通常の自然完了等）の stop_reason で引用が全滅した場合は、従来どおり
+    `evidence_verification_failed` へ上書きされる（予算到達専用の除外が過剰に広がっていないこと）。"""
+    payload = A._build_final_payload(
+        "", set(), True,
+        [{"doc_id": "ghost-does-not-exist.md", "span": [1, 1], "quote": "x", "ext": ".md"}],
+        [], None, set(), "no_tool_calls", "v1")
+    assert payload["cites"] == []
+    assert payload["dropped_citations"]
+    assert payload["stop_reason"] == "evidence_verification_failed"
+
+
+def test_es_index_search_classifies_http_400_as_rejected_and_5xx_as_failed(monkeypatch):
+    """`es_index.search` の BM25 POST が例外を投げたとき、HTTP ステータスで回復可否を分類する——
+    4xx（クエリ自体の拒否＝構文/設定不備）は `es_query_rejected`（回復不可）、5xx/接続断は
+    従来どおり `es_query_failed`（回復可能）のまま。外部境界（HTTP 通信）にステータスを注入する。"""
+    import urllib.error
+
+    from sherpa import es_index
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_400(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise urllib.error.HTTPError("http://es/_search", 400, "Bad Request", {}, None)
+
+    monkeypatch.setattr(es_index, "_req", boom_400)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_rejected"
+
+    def boom_503(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise urllib.error.HTTPError("http://es/_search", 503, "Service Unavailable", {}, None)
+
+    monkeypatch.setattr(es_index, "_req", boom_503)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_failed"
+
+
+def test_record_tool_result_error_code_es_query_rejected_marks_non_recoverable():
+    """`es_search` の `degrade_reason` が `es_query_rejected`（4xx＝プログラム/設定の欠陥）のときは
+    `backend_failures["fulltext"]` ではなく `non_recoverable_failure` を立てる——単発フォールバック
+    への縮退（回復可能な障害のみが対象）を誤って許さないため。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(
+        state, {"hits": [], "degrade_reason": "es_query_rejected"}, "es_search")
+    assert state.backend_failures["fulltext"] is False
+    assert state.non_recoverable_failure is True
+
+
+def test_open_verified_original_open_failure_carries_read_io_error_code(monkeypatch, tmp_path):
+    """`_open_verified_original`（xlsx_sheets 等・原本読取ツールが使う TOCTOU 再検証 open）の
+    失敗が固定理由コード `read_io_failed` を結果へ付ける——`_open_doc_stream` と同じ経路で
+    `InvestigationState.backend_failures["read_io"]` に届くようにする。"""
+    def _boom(root, rel_parts):
+        raise OSError("boom")
+
+    monkeypatch.setattr(A, "_open_file_nofollow_walk", _boom)
+    f, err = A._open_verified_original(tmp_path, "x.txt", None)
+    assert f is None
+    assert err == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
+
+
+def test_compare_documents_read_failure_carries_read_io_error_code(monkeypatch, tmp_path):
+    """`compare_docs.compare` の RAG 正本読み取り失敗（`_read_capped` の `OSError`）が固定理由コード
+    `read_io_failed` を結果へ付ける——`_record_tool_result_error_code` は名前非依存でこれを拾い、
+    原本読取（compare_documents）だけが I/O 失敗したターンでも `backend_failures["read_io"]` に届く。"""
+    from sherpa import compare_docs
+
+    left = tmp_path / "left.rag.md"
+    right = tmp_path / "right.rag.md"
+    left.write_text("left content", encoding="utf-8")
+    right.write_text("right content", encoding="utf-8")
+
+    monkeypatch.setattr(compare_docs, "_in_scope", lambda doc_id, sp: True)
+    monkeypatch.setattr(compare_docs, "_rag_md_path",
+                        lambda world, doc_id: left if doc_id == "left.md" else right)
+
+    def boom_read(path, cap_bytes):
+        if path == right:
+            return None, False           # 読み取り失敗（OSError 相当）
+        return "left content", False
+
+    monkeypatch.setattr(compare_docs, "_read_capped", boom_read)
+    result = compare_docs.compare("v1", {"left_doc_id": "left.md", "right_doc_id": "right.md"})
+    assert result["status"] == "unsupported"
+    assert result["error_code"] == "read_io_failed"
+
+    from sherpa import investigation_state
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, result, "compare_documents")
+    assert state.backend_failures["read_io"] is True
+
+
+def test_es_index_search_keeps_non_raising_contract_for_non_communication_exception(monkeypatch):
+    """`es_index.search` の BM25 クエリで `JSONDecodeError`（非 JSON 応答・通信例外ではない）が
+    発生しても、`search()` の「例外を投げず `(hits, degrade_reason)` を返す」契約は保たれる
+    （`routers/documents.py`・`search_service.py`・`ext_api.py` 等、`run_tool` 境界の型分類に
+    委ねられない非 agentic 経路も同じ関数を呼ぶため）——通信障害と区別し、回復不可の固定コード
+    `es_query_rejected` を返す（`es_query_failed` として回復可能扱いにはしない）。"""
+    import json
+
+    from sherpa import es_index
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_bad_json(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise json.JSONDecodeError("bad json", "not json", 0)
+
+    monkeypatch.setattr(es_index, "_req", boom_bad_json)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_rejected"
+
+
+def test_run_tool_es_search_non_communication_degrade_reason_marks_non_recoverable(monkeypatch):
+    """`run_tool("es_search", ...)` は BM25 クエリのプログラムの欠陥・想定外の応答形
+    （`es_query_rejected`）を tool result の `degrade_reason` として返す（例外を投げない）。
+    `_record_tool_result_error_code` へ渡すと `non_recoverable_failure` が立つ——`fulltext`
+    （回復可能）へ誤って丸めない。"""
+    from sherpa import documents, es_index, investigation_state
+
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: set())
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_bug(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise TypeError("programming bug")
+
+    monkeypatch.setattr(es_index, "_req", boom_bug)
+
+    view, _docs, _cites, _cards = A.run_tool("es_search", {"query": "x"}, "v1", None)
+    assert view["degrade_reason"] == "es_query_rejected"
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, view, "es_search")
+    assert state.backend_failures["fulltext"] is False
+    assert state.non_recoverable_failure is True
+
+
+def test_es_index_search_treats_404_as_recoverable_index_not_yet_created(monkeypatch):
+    """ES の 404（索引未作成＝未取り込み world の常態）は `es_query_rejected`（回復不可）ではなく
+    `es_query_failed`（回復可能）に分類する——4xx を一律回復不可にすると、未取り込み world への
+    問い合わせで grep 縮退が恒久的に塞がれてしまう。"""
+    import urllib.error
+
+    from sherpa import es_index
+
+    monkeypatch.setattr(es_index, "available", lambda: True)
+
+    def boom_404(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
+        raise urllib.error.HTTPError("http://es/_search", 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(es_index, "_req", boom_404)
+    hits, reason = es_index.search("v1", "query", vector=False)
+    assert hits == [] and reason == "es_query_failed"
+
+
+def test_record_tool_result_error_code_es_404_marks_recoverable_fulltext():
+    """404（索引未作成）由来の `degrade_reason: "es_query_failed"` は `backend_failures["fulltext"]`
+    （回復可能）を立てる——`non_recoverable_failure` は立たない（未取り込み world での grep 縮退を
+    塞がないための対照テスト）。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, {"hits": [], "degrade_reason": "es_query_failed"}, "es_search")
+    assert state.backend_failures["fulltext"] is True
+    assert state.non_recoverable_failure is False
+
+
+def test_doc_readers_file_head_read_os_error_marks_backend_read_io(tmp_path):
+    """`doc_readers.file_head` の open 後 read 段 `OSError` が付ける `error_code: "read_io_failed"`
+    を `_record_tool_result_error_code` が拾い、`InvestigationState.backend_failures["read_io"]`
+    を立てる——xlsx/docx/pptx/pdf の TOCTOU 再検証 open 失敗（`_open_verified_original`）と同じ
+    経路に file_head 自身の read 失敗も合流する。"""
+    from sherpa import doc_readers, investigation_state
+
+    p = tmp_path / "note.txt"
+    p.write_text("hello\n", encoding="utf-8")
+    f = open(p, "rb")
+
+    def boom_read(n):
+        raise OSError("boom")
+
+    f.read = boom_read
+    result = doc_readers.file_head(f)
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(state, result, "file_head")
+    assert state.backend_failures["read_io"] is True
+
+
+def test_tool_hit_count_returns_none_for_graph_neighbors_error_code_result():
+    """`graph_neighbors` が `error_code`（`graph_unavailable`/`graph_internal_error`）付きの結果
+    （`{"neighbors": []}`・"error" キーは持たない）を返した場合、`_tool_hit_count` は 0 ではなく
+    None を返す——es_search の degrade と同じ規律で「実行できなかった」を「0件ヒット」と
+    混同しない。"""
+    assert A._tool_hit_count("graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}) is None
+    assert A._tool_hit_count("graph_neighbors", {"neighbors": [], "error_code": "graph_internal_error"}) is None
+    # error_code が無い通常の 0 件応答は従来どおり 0（回帰しないことの対照）。
+    assert A._tool_hit_count("graph_neighbors", {"neighbors": []}) == 0
+
+
+def test_hit_summary_node_sub_suppressed_for_graph_neighbors_error_code():
+    """サブ経路の追加ノード（`_hit_summary_node_sub`）も graph_neighbors の障害結果では
+    ノードを出さない（`None`）——0件ヒットと誤表示しない。"""
+    assert A._hit_summary_node_sub(
+        "graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}) is None
+
+
+def test_investigation_state_add_tool_result_does_not_record_zero_hits_gap_for_graph_error_code():
+    """`InvestigationState.add_tool_result` は graph_neighbors の障害結果（`error_code` 付き・
+    "error" キーは持たない）を「0件」の gap として積まない——`_tool_hit_count` が None を返す
+    ため `hits == 0` 分岐に入らず、誤って「実行できなかった」を「0件ヒット」と記録しない。"""
+    from sherpa import investigation_state
+
+    state = investigation_state.InvestigationState(question="q", scope={})
+    state.add_tool_result("graph_neighbors", {"name": "TAX-RATE"},
+                          {"neighbors": [], "error_code": "graph_unavailable"}, [], [])
+    assert not any("0件" in g for g in state.gaps)
+    assert state.tool_log[-1].hits is None
+
+
+# ===== S4（縮退の可視化と計数）: グラフの3状態（空・世代不一致・接続断）を区別して調査を止めない =====
+# モックは外部境界（Neo4j ドライバ）だけ——`lens_service`/`world_neo4j` の内部関数は差し替えない。
+
+class _FakeRecord(dict):
+    def data(self):
+        return dict(self)
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = [_FakeRecord(r) for r in rows]
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def data(self):
+        return [r.data() for r in self._rows]
+
+    def consume(self):
+        pass
+
+
+class _FakeSession:
+    """世代プローブ（`SherpaMeta`）にだけ実データ有り＋指定世代を返す fake（他クエリは0件）。"""
+
+    def __init__(self, era, raise_exc=None):
+        self.era, self.raise_exc = era, raise_exc
+
+    def run(self, query, **kw):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return _FakeResult([{"c": 1, "era": self.era}] if "SherpaMeta" in str(query) else [])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, session):
+        self._session = session
+
+    def session(self):
+        return self._session
+
+    def close(self):
+        pass
+
+
+def _patch_neo4j_driver(monkeypatch, session):
+    import neo4j
+    monkeypatch.setattr(neo4j.GraphDatabase, "driver",
+                        staticmethod(lambda *a, **kw: _FakeDriver(session)))
+
+
+def test_run_tool_graph_neighbors_schema_era_returns_reingest_code(monkeypatch):
+    """世代不一致（旧世代の実データ）は例外で調査を終端させず、MCP 側と同じ機械可読コードの
+    ツール結果へ変換して返す（`run_tool` は raise しない）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    res, docs, cites, cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+    assert res == {"error": "graph_reingest_required", "world": "v1", "stored_era": "old-era"}
+    assert docs == set() and cites == [] and cards == []
+
+
+def test_run_tool_graph_neighbors_connection_failure_returns_unavailable_code(monkeypatch):
+    """接続断（`ServiceUnavailable`＝`DriverError` 系）は世代不一致とは別コード（回復可能）。"""
+    from neo4j.exceptions import ServiceUnavailable
+    _patch_neo4j_driver(monkeypatch, _FakeSession(None, raise_exc=ServiceUnavailable("down")))
+    res, _docs, _cites, _cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+    assert res["neighbors"] == [] and res["error_code"] == "graph_unavailable"
+    assert "error" not in res
+
+
+def test_run_tool_graph_neighbors_empty_graph_is_not_a_failure(monkeypatch):
+    """空（未構築＝実データ0件）は現状どおり例外にも障害コードにもならない（近傍0件）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession(None))   # c=0 相当（SherpaMeta 以外は0件）
+
+    class _EmptySession(_FakeSession):
+        def run(self, query, **kw):
+            return _FakeResult([{"c": 0, "era": None}] if "SherpaMeta" in str(query) else [])
+
+    _patch_neo4j_driver(monkeypatch, _EmptySession(None))
+    res, _docs, _cites, _cards = A.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
+    assert res == {"neighbors": []}
+
+
+def test_record_tool_result_error_code_marks_graph_states_separately():
+    """世代不一致・接続断は別々の状態／別々の統計項目（`answer.limits`）になる。"""
+    from sherpa.investigation_state import InvestigationState
+    st = InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(st, {"error": "graph_reingest_required", "world": "v1",
+                                          "stored_era": "old"}, "graph_neighbors")
+    assert st.graph_schema_era_mismatch is True
+    assert st.limits["graph_reingest_required"] is True
+    assert st.backend_failures["graph"] is False           # 接続断とは混同しない
+
+    st2 = InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(st2, {"neighbors": [], "error_code": "graph_unavailable"},
+                                    "graph_neighbors")
+    assert st2.backend_failures["graph"] is True and st2.limits["backend_unavailable_graph"] is True
+    assert st2.graph_schema_era_mismatch is False
+    assert "graph_reingest_required" not in st2.limits
+
+
+def test_es_unavailable_marks_backend_unavailable_fulltext_limit():
+    """全文検索の不調も同じ流儀で `answer.limits` のフラットな bool 項目になる。"""
+    from sherpa.investigation_state import InvestigationState
+    st = InvestigationState(question="q", scope={})
+    A._record_tool_result_error_code(st, {"hits": [], "degrade_reason": "es_unavailable"}, "es_search")
+    assert st.limits["backend_unavailable_fulltext"] is True
+
+
+def test_openai_style_continues_with_grep_after_graph_schema_era(monkeypatch):
+    """世代不一致を検知しても調査ループは止まらず、後続の grep 結果で回答し切る
+    （縮退の事実は `limits` に残る）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    calls1 = [{"id": "c0", "function": {"name": "graph_neighbors",
+                                        "arguments": json.dumps({"name": "請求"})}}]
+    calls2 = [{"id": "c1", "function": {"name": "ripgrep_search",
+                                        "arguments": json.dumps({"query": "TAX-RATE"})}}]
+    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls1}}]},
+           {"choices": [{"message": {"content": "", "tool_calls": calls2}}]},
+           {"choices": [{"message": {"content": "税率は 10% です。"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 toolset=A.openai_tools(with_graph=True)))
+    final = next(e for e in events if "final" in e)
+    assert final["final"] == "税率は 10% です。"
+    assert final["docs"], "grep の出典が残る（グラフ不調でも回答を止めない）"
+    assert final["limits"]["graph_reingest_required"] is True
+
+
+# S4（RV3）: 世代不一致の記録は openai 方言だけでなく anthropic／gemini 方言でも行う
+# （`_record_tool_result_error_code` を呼ばないと縮退が無音化し、graph_admin の fail-loud も効かない）。
+
+def test_gemini_records_graph_reingest_required_in_limits(monkeypatch):
+    """gemini 方言でも `graph_neighbors` の世代不一致（結果化された障害）が limits に立つ。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    seq = [
+        {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "graph_neighbors", "args": {"name": "請求"}}}]}}]},
+        {"candidates": [{"content": {"parts": [{"text": "関係は確認できませんでした。"}]}}]},
+    ]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
+                           toolset=A.gemini_tools(with_graph=True)))
+    final = next(ev for ev in events if "final" in ev)
+    assert final["limits"]["graph_reingest_required"] is True
+
+
+def test_anthropic_style_records_graph_reingest_required_in_limits(monkeypatch):
+    """anthropic 方言（Bedrock）でも同じ（方言ごとに記録が抜けない）。"""
+    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
+    client = _AClient([
+        _AResp([_ABlock("tool_use", name="graph_neighbors", input={"name": "請求"}, id="tu1")],
+               stop_reason="tool_use"),
+        _AResp([_ABlock("text", "関係は確認できませんでした。")], stop_reason="end_turn"),
+    ])
+    events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None,
+                                    toolset=A.graph_openai_tools()))
+    final = next(ev for ev in events if "final" in ev)
+    assert final["limits"]["graph_reingest_required"] is True
+
+
+# S4（RV4）: 最初から不達で「ツール集合に入らなかった」バックエンドも縮退として計数する
+# （実行中に記録される機会が無いため）。利用者が自分で OFF にした場合は障害ではない＝計数しない。
+
+def test_openai_style_counts_fulltext_unavailable_when_es_unreachable(monkeypatch):
+    """ES が実接続で不達なら、es_search を1度も呼べなくても統計に縮退が残る。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_availability={"grep": True, "fulltext": False, "graph": True}))
+    final = next(e for e in events if "final" in e)
+    assert final["limits"]["backend_unavailable_fulltext"] is True
+
+
+def test_openai_style_does_not_count_fulltext_when_user_turned_it_off(monkeypatch):
+    """利用者が全文検索を OFF にしただけのターンは障害ではない（計数しない）。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_pref={"grep": True, "fulltext": False, "graph": True},
+                                 tools_availability={"grep": True, "fulltext": True, "graph": True}))
+    final = next(e for e in events if "final" in e)
+    assert "limits" not in final or "backend_unavailable_fulltext" not in final["limits"]
+
+
+def test_gemini_counts_fulltext_unavailable_when_es_unreachable(monkeypatch):
+    """他の方言でも同じ（判定はツール集合を組む1箇所に集約されている）。"""
+    seq = [{"candidates": [{"content": {"parts": [{"text": "回答"}]}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
+                           tools_availability={"grep": True, "fulltext": False, "graph": True}))
+    final = next(e for e in events if "final" in e)
+    assert final["limits"]["backend_unavailable_fulltext"] is True
+
+
+def test_agentic_run_impact_entry_degrade_counts_graph_unavailable():
+    """入口でグラフが不達のまま縮退したターンも統計に残る（グラフツールは集合から外れるため
+    実行中の記録機会が無い）。"""
+    seen = []
+    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert env["limits"]["backend_unavailable_graph"] is True
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["graph_unavailable"])
+
+
+def test_agentic_run_impact_entry_degrade_user_off_is_not_counted():
+    """利用者がグラフを OFF にしただけのターンは障害ではない＝計数せず、文言も「使えない」側。"""
+    seen = []
+    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": True},
+                            tools_pref={"graph": False})
+    events = list(_degraded_gate_provider(seen)().run(ctx))
+    env = next(e["env"] for e in events if e.get("type") == "_result")
+    assert "backend_unavailable_graph" not in (env.get("limits") or {})
+    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["blocked"])
+
+
+def test_openai_style_counts_graph_unavailable_for_any_lens(monkeypatch):
+    """S4: グラフ不達はレンズに依らずツール集合を組む時点で1回だけ計上する（全文検索と対称）。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_availability={"grep": True, "fulltext": True, "graph": False}))
+    final = next(e for e in events if "final" in e)
+    assert final["limits"]["backend_unavailable_graph"] is True
+    assert "backend_unavailable_fulltext" not in final["limits"]   # 使えている側は立てない
+
+
+def test_openai_style_does_not_count_graph_when_user_turned_it_off(monkeypatch):
+    """利用者が OFF にした軸は不達でも障害ではない（計数しない）。"""
+    seq = [{"choices": [{"message": {"content": "回答"}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 tools_pref={"grep": True, "fulltext": True, "graph": False},
+                                 tools_availability={"grep": True, "fulltext": True, "graph": False}))
+    final = next(e for e in events if "final" in e)
+    assert "limits" not in final or "backend_unavailable_graph" not in final["limits"]

@@ -27,16 +27,14 @@ _MD_EXT = {".md", ".markdown"}
 _RAG_SUFFIX = ".rag.md"
 # OCR 観測の本文ファイル名（`sherpa/ingest/observation_render.py::artifact_paths`）。
 _OBSERVATION_SUFFIX = ".rag_observations.md"
-# 高速な事前フィルタ（`doc_kinds.CODE_EXT`＝登録拡張子の和集合＋MD/テキスト＋軽量テキスト枠の
-# 第1段拡張子マップ）——最終判定ではない。「コードか資料か」の確定は `grep_search` 本体が
-# `corpus_docs.classify_document` に集約する（accepts() 全滅の登録拡張子や未登録拡張子を、
-# この集合の所属だけで「コード」と見なさない・§7 裁定10）。
-# `.txt` はコード判定の対象外（プレーンテキスト＝どちらでもない）だがここでは従来どおり grep 対象。
-# `text_kind.CODE_EXT`/`DOCUMENT_EXT`（第1段＝拡張子だけで判定可能）は事前フィルタに含める——
-# 第2段（未知拡張子・拡張子なしの内容推定）はここでは対象にしない（grep は問い合わせのたびに
-# 全木を歩くため、非対象拡張子ごとに内容を読む余地を持たせると検索コストが増える・§4 の設計判断。
-# 台帳/scan_report/status API は `classify_document` 経由で第2段まで判定するので齟齬ではない
-# ——grep だけが「未知拡張子の内容推定」に対応しない、という限定された既知の差）。
+# 拡張子だけで確実にテキストと分かる集合（`doc_kinds.CODE_EXT`＝登録拡張子の和集合＋MD/テキスト＋
+# 軽量テキスト枠の第1段拡張子マップ）。この集合の所属だけで「コード」とも「対象外」とも見なさない
+# ——`.txt` はコード判定の対象外（プレーンテキスト＝どちらでもない）だがここでは従来どおり grep
+# 対象。「コードか資料か・読めるか」の最終確定は常に `grep_search` 本体の
+# `corpus_docs.classify_document` 呼び出しに集約する（§7 裁定10）。この集合**に無い**拡張子
+# （未登録拡張子・拡張子なし＝軽量テキスト枠の第2段）も走査候補からは除外しない——`grep_search`
+# は全ファイルへ同じ `classify_document` 呼び出し（1ファイルにつき1回・先頭数KBのみ読む）を行い、
+# 内容が実際にテキストと判定できるかで可否を決める（拡張子の閉じた許可リストでは決めない）。
 _TEXT_EXT = _MD_EXT | CODE_EXT | {".txt"} | text_kind.CODE_EXT | text_kind.DOCUMENT_EXT
 
 # world 識別子は英数字＋限定記号のみ（`/`・`..` を含めない＝パストラバーサル防止）。
@@ -261,7 +259,7 @@ _DEADLINE_CHECK_LINES = 256   # 1ファイルの行走査ループ中に `deadli
 
 def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 scope_paths=None, deadline: float | None = None, layer=None,
-                truncated_docs: list | None = None):
+                truncated_docs: list | None = None, offset: int = 0):
     """`query` を含む行を world のフォルダ木から探し、根拠つきヒットを返す（read-only）。
 
     各ヒット: `{doc_id(=rel_path), path(内部用・API非露出), ext, line, span:[start,end], text, match}`
@@ -271,19 +269,21 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     `scope_paths`（フォルダ prefix）を渡すと、**その範囲の文書だけ** grep する（範囲外は読まない・MIRROR §3）。
 
     **ヒットの選抜**: 返すのは上限 `max_hits` 件の **top-K**——優先度は `(重要度rank降順, 発見順昇順)`（重要度＝
-    `高`>`中`/未設定>`低`・同 rank は先に見つかった方を残す）。`_重要度.txt` が無い world（または
-    `roots` 明示指定の呼び出し）は `imp_map` が空＝全ヒットの rank が揃う。この場合、ヒープが
-    `max_hits` で満杯になった時点で**以後どのヒットも数学的に二度と採用され得ない**
+    `高`>`中`/未設定>`低`・同 rank は先に見つかった方を残す）。ページング（`offset`）対応のため
+    ヒープ自体の容量は `heap_cap`（=`max_hits+offset`）——`offset=0` なら `heap_cap == max_hits`。
+    `_重要度.txt` が無い world（または `roots` 明示指定の呼び出し）は `imp_map` が空＝全ヒットの
+    rank が揃う。この場合、ヒープが `heap_cap` で満杯になった時点で**以後どのヒットも数学的に
+    二度と採用され得ない**
     （min-heap のキー `(rank, -seq)` は rank 一様なら新エントリの `-seq` が既存最小値より必ず
     小さくなるため、`entry > heap[0]` が恒に False になる）——この事実を使い、2つの打切り点で
     走査を早期終了する: **ファイル内**（行走査ループの各行の後・MD 最終節／
     未確定 pending 行の flush は行わない——早期終了した run だけが最終節／未確定 pending 行を
     取りこぼすが、この時点でヒープは満杯＝以後どのヒットも採用され得ないため最終出力は変わらない）と
     **ファイル境界**（1ファイルを終えるたびに判定・満たせば以後のファイル・root を一切開かない）。
-    早期終了しても選抜結果は「発見順で先頭 `max_hits` 件」のまま変わらず、`deadline` の消費
-    （`_check_deadline` の呼び出し頻度）は全量走査より減る。
+    早期終了しても選抜結果（offset によるページング前）は「発見順で先頭 `heap_cap` 件」のまま
+    変わらず、`deadline` の消費（`_check_deadline` の呼び出し頻度）は全量走査より減る。
     一方、`_重要度.txt` がある world（`imp_map` が非空）は、後から見つかった `高` 文書が現在の
-    ヒープ最下位を上書きしうるため、この早期終了条件は成立せず**常に全量走査**する（`max_hits`
+    ヒープ最下位を上書きしうるため、この早期終了条件は成立せず**常に全量走査**する（`heap_cap`
     到達後も走査を続けるぶん `deadline` 消費は増える——既存の周期チェックが引き続き効くことで
     ハングしないことがテストの固定対象）。
 
@@ -326,6 +326,11 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     超過していない通常経路の最終的な列挙順序（ソート結果）・ヒット内容はこれまでと変わらない
     （`deadline is None` の分岐は追加の `time.monotonic()` 呼び出しをしない）。PART-4
     （`agentic_search.run_tool`経由）が残り時間ベースで渡す・通常チャット経路は渡さない。
+
+    `offset`（省略可・既定0＝既存呼び出し元は無変更）: 上位 `offset + max_hits` 件までを選抜対象
+    にし（top-K ヒープの容量を `max_hits` からこの合計へ広げる・早期打切りの閾値も同じ合計を使う）、
+    最終的な優先順位付きリストのうち後ろ `max_hits` 件（`[offset:offset+max_hits]`）を返す。
+    `offset=0` は容量が従来どおり `max_hits` のまま＝結果は完全に不変。
     """
     def _check_deadline() -> None:
         if deadline is not None and time.monotonic() > deadline:
@@ -383,15 +388,21 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             imp_map = importance.resolve_for_world(world, root=wd, sig=sig)
     # ---- top-K（優先度つき）ヒット選抜（I2）----
     # 早期打切り（旧: ファイル内でヒット数到達時に break／ファイル境界でヒット数到達時に return）は
-    # 撤去し、常に対象を全量走査する。ヒットは `_offer` を通じて上限 `max_hits` の有界ヒープへ
-    # 出し入れし、`(rank, -seq)` の昇順（＝重要度が高いほど・同rankは発見順が早いほど）で最下位を
-    # 追い出す——メモリは常に高々 `max_hits` 件。`seq` は全ルート・全ファイルを通した発見順の
-    # 単調増加カウンタ（同一 rank 内の tie-break・heapq の比較がタプル要素だけで完結する保証にも使う
-    # ＝dict である hit 本体同士の比較には決して落ちない）。`imp_map` が空なら全ヒット rank が
-    # `importance.RANK_UNSET` で揃うため、選抜結果は「発見順で先頭 max_hits 件」になる
-    # （受け入れ条件＝`_重要度.txt` の無い world で出力不変）。
+    # 撤去し、常に対象を全量走査する。ヒットは `_offer` を通じて上限 `heap_cap`（=max_hits+offset・
+    # ページング対応）の有界ヒープへ出し入れし、`(rank, -seq)` の昇順（＝重要度が高いほど・同rankは
+    # 発見順が早いほど）で最下位を追い出す——メモリは常に高々 `heap_cap` 件。`seq` は全ルート・
+    # 全ファイルを通した発見順の単調増加カウンタ（同一 rank 内の tie-break・heapq の比較がタプル
+    # 要素だけで完結する保証にも使う＝dict である hit 本体同士の比較には決して落ちない）。`imp_map`
+    # が空なら全ヒット rank が `importance.RANK_UNSET` で揃うため、選抜結果は「発見順で先頭
+    # heap_cap 件」になり、最終的に `[offset:offset+max_hits]` を返す（受け入れ条件＝`_重要度.txt`
+    # の無い world・offset=0 で出力不変）。
     heap: list[tuple[int, int, dict]] = []
     seq = 0
+    offset = max(0, offset)   # 負値は0扱い（list_docs の offset クランプと同じ流儀）
+    # `heap_cap`: ページング対応（ヒット単位バイト上限とあわせ、網羅性を落とさずに文脈枠を守る）——
+    # offset 分だけ余分に選抜し、末尾で `[offset:offset+max_hits]` を切り出す。`offset=0` なら
+    # `heap_cap == max_hits` で従来と完全に同じ容量・同じ早期打切り閾値になる。
+    heap_cap = max_hits + offset
 
     def _offer(hit: dict) -> None:
         nonlocal seq
@@ -402,7 +413,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
         rank = importance.rank_of(res)
         hit.update(importance.public_fields(res))   # importance/importance_reason（条件付き・§I2 実装1）
         entry = (rank, -seq, hit)
-        if len(heap) < max_hits:
+        if len(heap) < heap_cap:
             heapq.heappush(heap, entry)
         elif entry > heap[0]:
             heapq.heapreplace(heap, entry)
@@ -426,7 +437,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             # を含む）を検知できない。
             _check_deadline()
             ext = p.suffix.lower()
-            ok_ext = (ext in _MD_EXT) if is_derived else (ext in _TEXT_EXT)
+            # 派生ツリー（Office/PDF の決定的MD）は拡張子で絞る（`.md`/`.rag.md` 以外は元々存在しない）。
+            # 原本ツリーは拡張子で絞らない——未登録拡張子・拡張子なしも候補に含め、可否は下の
+            # `classify_document` 呼び出し（1ファイル1回・必要な時だけ内容を読む）に委ねる。
+            ok_ext = (ext in _MD_EXT) if is_derived else True
             if not (p.is_file() and not p.is_symlink() and ok_ext):
                 continue
             try:
@@ -458,18 +472,19 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             is_code = False
             if not is_derived:
                 # コード解析層と同じ単一の判定（`corpus_docs.classify_document`）を実行ゲートにする
-                # （`_TEXT_EXT` は高速な事前フィルタに留め、最終判定はここに集約する・§7 裁定10）——
-                # accepts() 内容判定に必要なヘッダが読み取れない文書は除外し（この1件だけ skip・
-                # 検索全体は継続）、accepts() が全滅した登録拡張子は既存の資料種別（doctype）に
-                # 該当する場合だけ資料として扱う（該当しなければ未対応＝CODE_EXT の集合だけで
-                # 「コード」と見なさない）。ほとんどの拡張子（登録済みコード拡張子でも既定 accepts
-                # のみなら）は候補が無い/内容を読まないので判定コストは増えない。
+                # （拡張子の許可リストではなくこれが最終判定・§7 裁定10）——accepts() 内容判定に
+                # 必要なヘッダが読み取れない文書は除外し（この1件だけ skip・検索全体は継続）、
+                # accepts() が全滅した登録拡張子は既存の資料種別（doctype）に該当する場合だけ資料
+                # として扱う（該当しなければ未対応）。`_TEXT_EXT` に属する拡張子（登録済みコード・
+                # 軽量テキスト枠の第1段）はほとんどの場合ここで内容を読まない（既定 accepts の
+                # ままなら候補が無い/内容判定不要）——`_TEXT_EXT` 外（未登録拡張子・拡張子なし＝
+                # 軽量テキスト枠の第2段）だけが、ここで先頭数KBの内容判定（1ファイルにつき1回）を
+                # 要する。`corpus_docs.reachable_as_text` と同じ判定式（`_classify_verdict_reachable`）
+                # を共有する。
                 verdict = corpus_docs.classify_document(
                     rel, Path(rel).suffix.lower(),
                     lambda p=p, size=4096: corpus_docs._read_head(p, size))
-                if verdict["kind"] == "unreadable":
-                    continue
-                if verdict["kind"] != "code" and verdict.get("doctype") is None:
+                if not corpus_docs._classify_verdict_reachable(verdict):
                     continue
                 # TEXT-ALL L-1 是正（2026-09）: 軽量テキスト枠（`ingest.text_kind`）だけは、台帳/ES
                 # と同じ基準（`text_kind.MAX_BYTES`＝8MiB・`corpus_docs._text_oversize` と同一の
@@ -612,14 +627,15 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                                 _add_hit(h, s, e, _clip_utf8_bytes(text, _GREP_HIT_TEXT_MAX_BYTES))
                         line_i += 1
                         # `imp_map`
-                        # が空（rank一様）でヒープが `max_hits` で満杯なら、以後どのファイル・どの行の
-                        # ヒットも数学的に二度とヒープへ採用されない（min-heap の比較キー `(rank, -seq)`
-                        # は rank が一様なとき新エントリの `-seq` が既存最小値より必ず小さくなるため
-                        # `entry > heap[0]` が恒に False になる証明・モジュール docstring 参照）。
+                        # が空（rank一様）でヒープが `heap_cap`（=max_hits+offset）で満杯なら、以後どの
+                        # ファイル・どの行のヒットも数学的に二度とヒープへ採用されない（min-heap の
+                        # 比較キー `(rank, -seq)` は rank が一様なとき新エントリの `-seq` が既存最小値
+                        # より必ず小さくなるため `entry > heap[0]` が恒に False になる証明・モジュール
+                        # docstring 参照）。offset=0 なら `heap_cap == max_hits` で従来と同じ閾値。
                         # ファイル内break（この時点で MD 最終節／未確定 pending
                         # 行の flush は**行わない**——ヒープは満杯＝以後どのヒットも採用され得ないため
                         # 最終出力は変わらない）。
-                        if not imp_map and len(heap) >= max_hits:
+                        if not imp_map and len(heap) >= heap_cap:
                             hit_limit_reached = True
                             break
                     if not hit_limit_reached:
@@ -652,16 +668,20 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     truncated_docs.append(rel)
             # ファイル境界の
             # 打切り点（「ヒット数到達時の return」の意味論）——`imp_map` が空（rank一様）
-            # でヒープが `max_hits` で満杯なら、以後のファイル・root を一切開かない（`_check_deadline()`
+            # でヒープが `heap_cap` で満杯なら、以後のファイル・root を一切開かない（`_check_deadline()`
             # を含む以降の周期チェックも実行されない）。
-            if not imp_map and len(heap) >= max_hits:
+            if not imp_map and len(heap) >= heap_cap:
                 stop_scan = True
                 break
         if stop_scan:
             break
     _check_deadline()
-    # heap は有界（高々 max_hits 件）——最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・
-    # 同rankは発見順）へ並べ替えて返す。`entry`=(rank, -seq, hit) なので、
+    # heap は有界（高々 heap_cap 件）——最終順序だけ `(-rank, seq)` 昇順（重要度が高いほど先・
+    # 同rankは発見順）へ並べ替える。`entry`=(rank, -seq, hit) なので、
     # 望む並び順のキーは (-rank, seq) == (-entry[0], -entry[1])。
     heap.sort(key=lambda entry: (-entry[0], -entry[1]))
-    return [hit for _rank, _neg_seq, hit in heap]
+    ordered = [hit for _rank, _neg_seq, hit in heap]
+    # ページング（`heap_cap`＝offset+max_hits まで選抜済み）: 後ろ `max_hits` 件を返す。
+    # offset=0 は `len(ordered) <= max_hits` が常に成り立つため `ordered[0:max_hits] == ordered`
+    # ＝結果は完全に不変。
+    return ordered[offset:offset + max_hits]

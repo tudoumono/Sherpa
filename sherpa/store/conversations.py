@@ -15,6 +15,7 @@ from __future__ import annotations
 from psycopg.types.json import Json
 
 from .db import _connect, _ensure
+from .turn_metrics import upsert_best_effort as _turn_metrics_upsert_best_effort
 
 
 def create_conversation(user_id="admin", world="v1", title=None) -> dict:
@@ -30,7 +31,14 @@ def create_conversation(user_id="admin", world="v1", title=None) -> dict:
 
 def add_message(conversation_id, role, content="", lens=None,
                 route=None, trace=None, answer=None, personal=False) -> dict:
-    """メッセージを1件追加し、会話の updated_at を進める。personal=True＝そのターンが個人利用（sanitized share 用）。"""
+    """メッセージを1件追加し、会話の updated_at を進める。personal=True＝そのターンが個人利用（sanitized share 用）。
+
+    role='assistant' かつ answer が dict のとき、同じ接続・同じトランザクションで
+    `turn_metrics`/`turn_tool_stats`（docs/proposals/2026-09-23-利用統計の刷新.md §3.1/§4）へも書く。
+    この書込は `upsert_best_effort` が savepoint で保護するため、失敗してもここでの本体メッセージ
+    保存は失敗させない——両表は answer（この INSERT で確定する正本）から再生成できる派生物であり、
+    書込に失敗した行は `turn_metrics.ensure_rows()` が後で埋められる。
+    """
     _ensure()
     with _connect() as c:
         row = c.execute(
@@ -43,6 +51,10 @@ def add_message(conversation_id, role, content="", lens=None,
              Json(answer) if answer is not None else None, personal),
         ).fetchone()
         c.execute("UPDATE conversations SET updated_at=now() WHERE id=%s", (conversation_id,))
+        if role == "assistant" and isinstance(answer, dict):
+            _turn_metrics_upsert_best_effort(
+                c, message_id=row["id"], conversation_id=conversation_id,
+                created_at=row["created_at"], lens=lens, personal=personal, answer=answer)
         return row
 
 

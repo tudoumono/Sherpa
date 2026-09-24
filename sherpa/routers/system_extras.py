@@ -34,7 +34,6 @@ from sherpa import (
     ext_api,
     health,
     model_catalog,
-    model_windows,
     notifications,
     research_service,
     store,
@@ -43,6 +42,7 @@ from sherpa import (
     worlds,
 )
 from sherpa.agents import _web_search_admin_allowed
+from sherpa.providers.codex import sandbox as codex_sandbox
 from sherpa.deps import _current_user, _require_admin
 from sherpa.schemas import (
     AnnouncementMutateResponse,
@@ -62,6 +62,56 @@ _log = logging.getLogger("sherpa")
 extras_router = APIRouter()
 
 _ANNOUNCEMENT_CATEGORIES = ("maintenance", "case", "notice")
+
+# R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）: 会話ごとの Codex
+# resume セッション保持日数。未設定（None）はこの既定日数へフォールバックする——利用者が
+# 気づかないまま無制限に溜め続けない（初期構成の既定＝気づかなくても効く安全な値）。`0` は
+# 引き続き「無制限」として明示設定できる（未設定と 0 を区別する・`effective_codex_session_retention_days`）。
+CODEX_SESSION_RETENTION_DAYS_DEFAULT = 30
+
+
+def effective_codex_session_retention_days(system_settings: dict | None) -> int:
+    """`codex_session_retention_days` の実効値（`api._sweep_expired_codex_sessions` と
+    管理画面表示 `GET /admin/settings` の両方が呼ぶ唯一の判定）。
+
+    未設定（`None`・キー欠落）は `CODEX_SESSION_RETENTION_DAYS_DEFAULT` へ倒す。明示的に `0` を
+    保存した場合だけ「無制限」（0 を返す）——保存側の pydantic Field でも 0 以上の整数だけを
+    許すが、読み取り側でも壊れた保存値（負値・非 int）を安全側（既定日数）へ倒す。
+    """
+    if not isinstance(system_settings, dict):
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    raw = system_settings.get("codex_session_retention_days")
+    if raw is None:
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    if value < 0:
+        return CODEX_SESSION_RETENTION_DAYS_DEFAULT
+    return value
+
+
+def _effective_codex_worker_model(sysset: dict) -> str:
+    """`GET /admin/settings` の `codex_worker_model.effective`（S6a RV是正）。
+
+    `codex_sandbox._codex_worker_model(sysset, main_model=...)` の `main_model` は
+    `model_catalog.resolve_model("codex","codex",...)` で解決するが、この経路は内部で
+    `llm.openai_endpoint_kind()`（`_codex_worker_model` 自身が Azure 判定に呼ぶ）を通り、
+    保存済み `openai_base_url` が壊れた値（falsy な非文字列＝`{}`/`[]`/`0`/`False`）だと
+    `ValueError` を送出する——表示専用のこの経路がそれで丸ごと落ちて `GET /admin/settings`
+    自体が 500 になってはいけない（他の壊れた保存値と同じ「表示はベストエフォート・実送信時の
+    fail-closed 判定は別の責務」契約・`usage_chat._effective_provider_for_display` と同じ理由）。
+    解決できない場合は固定フォールバック（`_CODEX_WORKER_MODEL_FALLBACK`）へ倒す。
+    Codex(Ollama) 構成は利用者ごとの設定（`codex_model_provider`）でシステム側からは判定できない
+    ため、この値は Codex(OpenAI 系) の実効値。Ollama 構成の利用者は本体と同じモデルタグになる
+    （画面の注記で補う）。
+    """
+    try:
+        main_model = model_catalog.resolve_model("codex", "codex", None, system_settings=sysset)
+        return codex_sandbox._codex_worker_model(sysset, main_model=main_model)
+    except (ValueError, TypeError):
+        return codex_sandbox._codex_worker_model(sysset)
 
 
 class AnnouncementCreateReq(BaseModel):
@@ -115,8 +165,10 @@ class SystemSettingsReq(BaseModel):
     # null は未設定へ戻す。
     webhook_allowlist: list[str] | None = None
     # 会話ごとの Codex resume
-    # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は 0＝無制限
-    # （`api._sweep_expired_codex_sessions` 参照）。null は未設定へ戻す（＝無制限に戻る）。
+    # セッション（workspace/.codex-sessions/{cid}）の保持日数。既定（未設定=None）は
+    # `CODEX_SESSION_RETENTION_DAYS_DEFAULT`（30日・決定2026-09-19）。明示的な 0 は「無制限」
+    # （`effective_codex_session_retention_days`／`api._sweep_expired_codex_sessions` 参照）。
+    # null は未設定へ戻す（＝既定30日に戻る）。
     # 素の `int` は pydantic の緩い型強制で `true`→1・`"14"`→14 のように暗黙変換
     # されてしまう（bool は int のサブクラス）。`StrictInt` で bool/文字列からの暗黙変換を拒否する
     # （`codex_web_search` に `StrictBool` を使っているのと同じ理由）。
@@ -176,10 +228,11 @@ class SystemSettingsReq(BaseModel):
     # 戻す（既定は固定値ではなく A7・`cloud_provider` 連動＝`usage_chat._default_provider` 参照）。
     # 空文字は明示的に 422（未設定へ戻すのは null のみ）。
     usage_chat_provider: str | None = None
-    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 標準時の基準値。既定（未指定=None）は各モジュールの
-    # env 既定値（`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は
+    # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）が掛ける倍率の
+    # 基準値（標準時の値）。既定（未指定=None）は各モジュールの env 既定値
+    # （`sherpa/depth_profile.py::BASE_SETTINGS_KEYS` が対応する定数を列挙）。null は
     # 未設定へ戻す（env/既定へフォールバック）。倍率表自体（標準/深く/最大）は固定でここでは
-    # 編集しない——編集できるのは「標準」が指す基準値のみ。
+    # 編集しない。
     depth_base_max_turns: StrictInt | None = Field(default=None, ge=1, le=200)
     depth_base_grep_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
     depth_base_qa_max_hits: StrictInt | None = Field(default=None, ge=1, le=1000)
@@ -187,11 +240,24 @@ class SystemSettingsReq(BaseModel):
     depth_base_impact_depth: StrictInt | None = Field(default=None, ge=1, le=64)
     depth_base_troubleshoot_depth: StrictInt | None = Field(default=None, ge=1, le=16)
     depth_base_codex_reasoning: str | None = None
-    # API の1応答内のツール実行数。調べる深さの倍率を掛けず、全 API 方言に適用する。
+    # API の1応答内のツール実行数の絶対上限。調べる深さに依らず一定で、全 API 方言に適用する。
     agentic_max_tools_per_turn: StrictInt | None = Field(default=None, ge=1, le=256)
     # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。
     # 既定（未指定=None）は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
+    # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
+    # 深く 4 は固定（この上限で頭打ち）で、設定はこの 1 項目だけ。既定（未指定=None）は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。
+    # null は未設定へ戻す。
+    max_review_rounds: StrictInt | None = Field(
+        default=None, ge=depth_profile.MAX_REVIEW_ROUNDS_MIN, le=depth_profile.MAX_REVIEW_ROUNDS_MAX)
+    # multi_agent（S6）の worker モデル（`sherpa.providers.codex.sandbox._codex_worker_model`）。
+    # 既定（未指定=None）は `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）。空文字・null は
+    # 未設定へ戻す（実装ベース探索の回復 S1・案 B）。
+    codex_worker_model: str | None = None
+    # 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。"standard"（既定・
+    # Sherpa の検索ツールと調査台帳を使う）／"plain"（Codex が自分で資料を読む・試験用）。
+    # 未指定=None は既定 "standard" へ戻す。
+    codex_mode: str | None = None
     # チャット同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
     # 既定（未指定=None）は env 既定値（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）。
     # null は未設定へ戻す（env/既定へフォールバック）。
@@ -205,10 +271,6 @@ class SystemSettingsReq(BaseModel):
     # 1 run 累計=4096〜64MiB）。null は未設定へ戻す。
     agentic_budget_per_result: StrictInt | None = Field(default=None, ge=1024, le=8 * 1024 * 1024)
     agentic_budget_total: StrictInt | None = Field(default=None, ge=4096, le=64 * 1024 * 1024)
-    # モデル名→窓 tokens の管理者登録（"provider:model" キー・
-    # 追加/上書き/削除）。意味検証は `sherpa.model_windows.validate_model_windows`（`_validate_
-    # model_windows` が 422 へ変換）。null は未設定へ戻す（以後はプロバイダAPI/シード表/不明段のみ）。
-    model_context_windows: dict[str, StrictInt] | None = None
     # チャット画面のクイック入力例（ウェルカム画面のチップ）のカスタマイズ。`{enabled, items}`
     # （意味検証は `sherpa.chat_examples.validate`・`_validate_chat_examples` が 422 へ変換）。
     # null は未設定へ戻す（既定＝表示・組み込み4例）。
@@ -582,35 +644,6 @@ def announcement_delete(id: int, request: Request):
 
 _ENDPOINT_TEST_TIMEOUT_S = 10   # 接続テスト専用の短いタイムアウト（秒）。到達不能を素早く申告する
 
-def _current_chat_provider_model(sysset: dict) -> tuple[str, str]:
-    """BUDGET-2（§3.4）: 管理画面「検索1回あたりの情報量」カードに表示する「現在のモデル」——
-    システム既定のチャット/エージェント用の頭脳（個人設定の上書きは見ない・本ビューは全体設定の
-    ビューのため `agent_constructs.effective_agent({}, ...)` で「利用者設定なし」を渡す）。
-
-    GET /admin/settings を絶対に壊さない（例外はどこでも握りつぶし、解決できなければ空文字を返す
-    ＝呼び出し側は "unknown" として扱う）。"""
-    try:
-        from sherpa import agent_constructs
-        agent = agent_constructs.effective_agent({}, system_settings=sysset, strict=False)
-    except Exception:
-        return ("", "")
-    if not isinstance(agent, str) or agent not in ("openai", "ollama", "gemini", "bedrock"):
-        return (agent if isinstance(agent, str) else "", "")
-    try:
-        if agent == "bedrock":
-            # `bedrock_model` は利用者個人設定（`store.get_settings()`）の項目で system_settings
-            # には無い（`model_catalog` も bedrock を対象外にしている・モジュール docstring 参照）。
-            # 本ビューは特定利用者に紐付かないため、組み込み既定モデルで代表させる（個人上書きは
-            # このヒント表示には反映されない・実行時の実際の予算計算は別途 provider/model を渡す
-            # 呼び出し元が正しい値を使う）。
-            from sherpa import agents
-            mod = agents._BEDROCK_MODEL
-        else:
-            mod = model_catalog.resolve_model(agent, "chat", None, system_settings=sysset)
-    except Exception:
-        mod = ""
-    return (agent, mod or "")
-
 
 def _admin_settings_view() -> dict:
     """GET/PUT 共通の応答＝現行値（system_settings の生値）＋実効値（env/既定込みの解決結果）。
@@ -649,23 +682,6 @@ def _admin_settings_view() -> dict:
         eff_research_default_provider = research_service.default_research_provider(sysset)
     except ValueError:
         eff_research_default_provider = "(不正な保存値)"
-    # BUDGET-2（§3.4）: 「現在のモデル」の窓解決（登録値 > シード表 > 不明・GET はここでは段2
-    # 「プロバイダAPI」を意図的に呼ばない——`GET /admin/settings` はページ表示のたびに叩かれる
-    # 経路であり、Ollama `/api/show` への実ネットワーク I/O をここに乗せると (1) 管理画面の表示が
-    # 外部プロバイダの応答待ちでブロックされ、(2) 実 Ollama が動く開発機でテストを流すと本物の
-    # 通信が発生してしまう（受け入れ条件「実プロバイダへの通信はテストから発生しない」に抵触）。
-    # ライブ照会は実行時の実際の予算計算（`agentic_search.resolve_tool_result_budgets` が
-    # `openai_style`/`anthropic_style` から呼ぶ経路・run 開始時に1回だけ）でのみ行う——そちらは
-    # 元々そのモデルへ実際に接続する run の一部であり、新たな I/O 経路を増やすものではない。
-    # `ollama_base_url`/`anthropic_client` を省略するだけで `resolve_window_tokens` は段2を自動的に
-    # スキップする（fail-safe な設計）。GET を絶対に壊さない（例外はどこでも握りつぶし「不明」に
-    # 倒す）。
-    _window_provider, _window_model = _current_chat_provider_model(sysset)
-    try:
-        _window_tokens, _window_source = model_windows.resolve_window_tokens(
-            _window_provider, _window_model, system_settings=sysset)
-    except Exception:
-        _window_tokens, _window_source = None, "unknown"
     return {
         # クラウド AI プロバイダの中央設定。key_set はキーの値そのもの
         # を返さず有無のみ（他の *_key_set と同じ流儀）。`provider` は A7 の現在選択・`providers` は
@@ -815,11 +831,14 @@ def _admin_settings_view() -> dict:
             "configured": sysset.get("webhook_allowlist"),
             "effective": sorted(f"{h}:{p}" for h, p in webhooks._allowlisted_hosts(sysset)),
         },
-        # R1b（Codex ネイティブ resume・決定5）: 会話ごとの Codex resume セッションの保持日数。
-        # 0（既定・未設定）＝無制限（`api._sweep_expired_codex_sessions` が対象外としてスキップする）。
+        # R1b（Codex ネイティブ resume・決定5）→ 初期構成の既定（決定2026-09-19）: 会話ごとの
+        # Codex resume セッションの保持日数。未設定は既定 30 日、明示的な 0 だけが「無制限」
+        # （`effective_codex_session_retention_days`・`api._sweep_expired_codex_sessions` が同じ
+        # 判定を呼ぶ）。
         "codex_session_retention_days": {
-            "configured": sysset.get("codex_session_retention_days"),   # 生値（未設定=None＝無制限）
-            "effective": int(sysset.get("codex_session_retention_days") or 0),
+            "configured": sysset.get("codex_session_retention_days"),   # 生値（未設定=None）
+            "effective": effective_codex_session_retention_days(sysset),
+            "default": CODEX_SESSION_RETENTION_DAYS_DEFAULT,
         },
         # STAT-2: 利用統計チャット専用の AI 選択（利用者の実行構成には依存しない・管理者全体で統一）。
         # `effective`/`default` は A7（`cloud_provider`）連動（`usage_chat._default_provider`/
@@ -832,10 +851,20 @@ def _admin_settings_view() -> dict:
             "default": usage_chat._default_provider(sysset),
             "providers": list(usage_chat._USAGE_CHAT_PROVIDERS),
         },
-        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 「標準」が指す基準値。`effective` は
+        # 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。`effective` は
+        # `codex_sandbox.codex_mode()`（唯一の解決関数・実行時に provider.py が見るのと同じ値）。
+        # plain では下の depth_profile（見直しの回数等）は Codex に渡らない——設定自体は残す。
+        "codex_mode": {
+            "configured": sysset.get("codex_mode"),
+            "effective": codex_sandbox.codex_mode(sysset),
+            "default": "standard",
+            "options": list(codex_sandbox.CODEX_MODES),
+        },
+        # SC-6c（調べる深さ・調べ方ブロック §3.2）: 調べる深さ（標準/深く/最大）が掛ける倍率の
+        # 基準値（標準時の値）。`effective` は
         # `depth_profile.effective_base()`（system_settings→env→コード既定）の解決結果、
         # `default` は env/コード既定（未設定に戻したときの実効値）。倍率表自体（標準/深く/最大）は
-        # 固定で管理画面に出さない（§9・編集できるのは基準値のみ）。
+        # 固定でここでは編集しない。
         "depth_profile": {
             "max_turns": {
                 "configured": sysset.get("depth_base_max_turns"),
@@ -890,6 +919,25 @@ def _admin_settings_view() -> dict:
             "effective": embeddings.effective_embed_parallel(sysset),
             "default": embeddings.EMBED_PARALLEL_DEFAULT,
         },
+        # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
+        # 深く 4 はコード固定のため、設定はこの 1 項目だけ（env フォールバックは持たない）。
+        "max_review_rounds": {
+            "configured": sysset.get("max_review_rounds"),
+            "effective": depth_profile.effective_max_review_rounds(sysset),
+            "default": depth_profile.MAX_REVIEW_ROUNDS_DEFAULT,
+        },
+        # multi_agent（S6）の worker モデル（実装ベース探索の回復 S1・案 B）。env フォールバックは
+        # 持たない（設定は UI(DB) が唯一の持ち主）。`effective` は本体 Codex が実際に使うモデル名
+        # （カタログの codex/codex 既定値）を Azure 判定に使う——渡さないと Azure かつ未設定のとき
+        # `effective` が実在しないフォールバック固定値（`_CODEX_WORKER_MODEL_FALLBACK`）を表示
+        # してしまい、実際に使われる値（本体デプロイ名）と食い違う（RV是正・2026-09-19）。
+        # 解決自体が壊れた保存値（`_effective_codex_worker_model` docstring 参照）で失敗しても
+        # 表示専用のこの経路は 500 にしない（別の RV是正）。
+        "codex_worker_model": {
+            "configured": sysset.get("codex_worker_model"),
+            "effective": _effective_codex_worker_model(sysset),
+            "default": codex_sandbox._CODEX_WORKER_MODEL_FALLBACK,
+        },
         # 同時実行の上限（背景実行の受付・超過は 429・`sherpa/chat_turns.py::effective_limits`）。
         # `effective` は実際にターン受付が使う値そのもの（`effective_limits()` を直接呼ぶ・
         # 表示とターン受付の解決ロジックを二重化しない）。`default` は env 既定（未設定に戻した
@@ -908,39 +956,22 @@ def _admin_settings_view() -> dict:
         },
         # agentic search の
         # tool-result バイト予算を管理者設定へ昇格（env フォールバックは撤去済み）。
-        # `effective` は `agentic_search.resolve_tool_result_budgets()`（settings > コード既定→
-        # 窓由来上限との min()）の解決結果、`default` はコード既定（未設定に戻したときの
-        # 実効値・窓連動を含まない）。既定は精度優先（憲法1条・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）。
-        # `effective` は「現在のモデル」（`_current_chat_
-        # provider_model`）を渡して解決するため、窓が判明していれば min() 済みの値になる
-        # （窓が不明なら上のみの値のまま＝退行しない）。
+        # `effective` は `agentic_search.resolve_tool_result_budgets()`（settings > コード既定）の
+        # 解決結果、`default` はコード既定（未設定に戻したときの実効値）。既定は精度優先
+        # （憲法1条・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）。モデルの窓由来の上限との
+        # min()（旧 BUDGET-2）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」・
+        # `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）。
         "agentic_budget": {
             "per_result": {
                 "configured": sysset.get("agentic_budget_per_result"),
-                "effective": agentic_search.effective_tool_result_max_bytes(
-                    sysset, provider=_window_provider or None, model=_window_model or None),
+                "effective": agentic_search.effective_tool_result_max_bytes(sysset),
                 "default": agentic_search.TOOL_RESULT_MAX_BYTES,
             },
             "total": {
                 "configured": sysset.get("agentic_budget_total"),
-                "effective": agentic_search.effective_tool_result_max_total_bytes(
-                    sysset, provider=_window_provider or None, model=_window_model or None),
+                "effective": agentic_search.effective_tool_result_max_total_bytes(sysset),
                 "default": agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES,
             },
-            # BUDGET-2: 現在のモデルの窓解決結果（ヒント表示用）。`window_tokens`/`derived_cap_bytes`
-            # は `source` が "unknown" のときのみ None（管理画面はこのとき「窓が未登録です」の
-            # 平文案内＋登録欄を出す）。
-            "window": {
-                "provider": _window_provider,
-                "model": _window_model,
-                "window_tokens": _window_tokens,
-                "source": _window_source,
-                "derived_cap_bytes": (model_windows.derive_window_bytes(_window_tokens)
-                                      if _window_tokens is not None else None),
-            },
-            # モデル名→窓 tokens の管理者登録値（"provider:model" キー・追加/上書き/削除は PUT
-            # `model_context_windows`）。`configured` はそのままの生値（未設定なら null）。
-            "model_windows": {"configured": sysset.get(model_windows.MODEL_WINDOWS_KEY)},
         },
         # チャット画面のクイック入力例（ウェルカム画面のチップ）。`configured` は生値（未設定なら
         # null）、`effective` は実際に表示される内容（非表示なら空リスト）、`default` は組み込み既定
@@ -1259,6 +1290,39 @@ def _validate_depth_base_codex_reasoning(value):
     return v
 
 
+def _validate_codex_worker_model(value):
+    """`codex_worker_model`（multi_agent の worker モデル・実装ベース探索の回復 S1）の検証。
+    None は未設定（`_CODEX_WORKER_MODEL_FALLBACK` へフォールバック）。Codex 自身のモデルカタログは
+    Sherpa 側で把握しないため語彙検証はしない（空文字は None と同じ扱い＝未設定へ戻す）。
+    制御文字（CR/LF 等・DEL）を含む値は 422——`_write_codex_agent_role_configs` が TOML の
+    1行文字列としてそのまま書くため、混入すると生成 TOML が構文エラーになる。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(422, "codex_worker_model は文字列で指定してください")
+    v = value.strip()
+    if not v:
+        return None
+    if any(ch < " " or ch == "\x7f" for ch in v):
+        raise HTTPException(422, "codex_worker_model に制御文字は使えません")
+    return v
+
+
+def _validate_codex_mode(value):
+    """`codex_mode`（素の Codex モード・docs/proposals/2026-09-24-素のCodexモード.md §1.1）の検証。
+    None は未設定（既定 "standard" へフォールバック）。閉じた語彙（`codex_sandbox.CODEX_MODES`）
+    以外は 422——`depth_base_codex_reasoning` と同じ流儀（空文字も未設定扱いにはしない）。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(422, "codex_mode は文字列で指定してください")
+    v = value.strip().lower()
+    if v not in codex_sandbox.CODEX_MODES:
+        options = "/".join(codex_sandbox.CODEX_MODES)
+        raise HTTPException(422, f"codex_mode は {options} のいずれかで指定してください")
+    return v
+
+
 def _assert_research_default_provider_sendable(effective_settings: dict) -> None:
     """`research_default_provider` を "openai" にする PUT は、保存時点で実際に送信できる状態か
     preflight する（`research_service._connect_openai` が実行時に行う判定と全く同じ関数・同じ
@@ -1350,16 +1414,6 @@ def _validate_model_catalog(value):
         raise HTTPException(422, str(e))
 
 
-def _validate_model_windows(value):
-    """`model_context_windows`（BUDGET-2・§3.4）の検証。形・意味の検証本体は
-    `sherpa.model_windows.validate_model_windows`（`ValueError` を送出）で行い、ここでは 422 へ
-    変換するだけ（`_validate_model_catalog` と同じ流儀）。"""
-    try:
-        return model_windows.validate_model_windows(value)
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-
-
 def _validate_chat_examples(value):
     """`chat_examples`（チャット画面のクイック入力例）の検証。形・意味の検証本体は
     `sherpa.chat_examples.validate`（`ValueError` を送出）で行い、ここでは 422 へ変換するだけ
@@ -1370,8 +1424,36 @@ def _validate_chat_examples(value):
         raise HTTPException(422, str(e))
 
 
+def _validate_agentic_budgets(provided: dict, updates: dict) -> None:
+    """BUDGET-1 の2キー（`agentic_budget_per_result`/`agentic_budget_total`）は範囲検証
+    （StrictInt+Field）だけでは逆転（累計 < 1件あたり）を防げない——実機で per_result=8MiB／
+    total=4KiB という入れ替え保存が成立し、最初のツール呼び出しで即座に打ち切りになった。
+
+    累計は1件あたり以上でなければならない（422・逆転は保存させない）。判定は「両方同時指定」
+    だけでなく「片方だけの指定」でも成立させる必要があるため、指定していない側は
+    `store.get_system_settings()`（この PUT 適用前の保存済み現在値）で補う——`updates` に
+    含まれない側の値は変わらないまま保存されるため、変わらない側との整合も確認しないと
+    入れ替え保存を防げない。値の欠落（未設定/明示 null）はコード既定
+    （`agentic_search.TOOL_RESULT_MAX_BYTES`/`TOOL_RESULT_MAX_TOTAL_BYTES`・
+    `effective_tool_result_max_bytes`/`_max_total_bytes` が system_settings 未設定時に使う値と
+    同じ）へ倒す。"""
+    if "agentic_budget_per_result" not in provided and "agentic_budget_total" not in provided:
+        return
+    from sherpa import agentic_search
+    current = store.get_system_settings()
+    eff_per_result = (updates.get("agentic_budget_per_result")
+                      if "agentic_budget_per_result" in updates
+                      else current.get("agentic_budget_per_result")) or agentic_search.TOOL_RESULT_MAX_BYTES
+    eff_total = (updates.get("agentic_budget_total")
+                if "agentic_budget_total" in updates
+                else current.get("agentic_budget_total")) or agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES
+    if eff_total < eff_per_result:
+        raise HTTPException(422, "合計は1件あたり以上にしてください")
+
+
 def _validate_codex_session_retention_days(value):
-    """`codex_session_retention_days`（R1b・決定5）の検証。None は未設定（＝0/無制限へフォールバック）。
+    """`codex_session_retention_days`（R1b・決定5→初期構成の既定・決定2026-09-19）の検証。
+    None は未設定（＝既定30日へフォールバック・`effective_codex_session_retention_days`）。
     0 以上の整数のみ許可（0＝無制限・明示的に保存できる）。負値・非整数は 422。"""
     if value is None:
         return None
@@ -1418,10 +1500,13 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     chat_max_turns_global（同時実行の上限・`sherpa.chat_turns.effective_limits`）も StrictInt+Field
     で範囲検証済み（1〜16／1〜64・範囲外は422）。agentic_budget_per_result/
     agentic_budget_total（§3.4）も StrictInt+Field で範囲検証済み（1件あたり=1024〜8MiB・
-    累計=4096〜64MiB・範囲外は422）。model_context_windows（§3.4）は "provider:model" →
-    tokens の登録表（`sherpa.model_windows.validate_model_windows` が意味検証・不正は422）。
+    累計=4096〜64MiB・範囲外は422）に加え、両者の相対関係も検証する（`_validate_agentic_budgets`・
+    累計は1件あたり以上・逆転は422）——片方だけの指定でも保存済みのもう片方（DB の現在値）と
+    突き合わせて判定する。
     chat_examples（チャット画面のクイック入力例）は `{enabled, items}`（items は最大8件・各1〜200文字・
-    `sherpa.chat_examples.validate` が意味検証・不正は422）。
+    `sherpa.chat_examples.validate` が意味検証・不正は422）。codex_worker_model（multi_agent の
+    worker モデル・実装ベース探索の回復 S1）は文字列のみ（Codex 自身のモデルカタログは検証しない・
+    空文字/nullは未設定へ戻す）。codex_mode（素の Codex モード）は standard/plain のみ（422）。
     監査 INSERT の失敗は
     `store.set_system_settings` が設定変更と**同一トランザクション**で検知し自動 rollback する（
     commit 後の別接続 audit＋失敗時 compensate 方式では穴が残るため、原子性で置き換えた・
@@ -1482,6 +1567,13 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     if "embed_parallel" in provided:
         # StrictInt・範囲（1〜16）は pydantic Field が型検証済み。
         updates["embed_parallel"] = provided["embed_parallel"]
+    if "max_review_rounds" in provided:
+        # StrictInt・範囲は pydantic Field が型検証済み。
+        updates["max_review_rounds"] = provided["max_review_rounds"]
+    if "codex_worker_model" in provided:
+        updates["codex_worker_model"] = _validate_codex_worker_model(provided["codex_worker_model"])
+    if "codex_mode" in provided:
+        updates["codex_mode"] = _validate_codex_mode(provided["codex_mode"])
     # チャット同時実行の上限（2項目とも StrictInt+Field(ge,le) で pydantic が範囲検証済み）。
     for _k in ("chat_max_turns_per_user", "chat_max_turns_global"):
         if _k in provided:
@@ -1491,9 +1583,7 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
     for _k in ("agentic_budget_per_result", "agentic_budget_total"):
         if _k in provided:
             updates[_k] = provided[_k]
-    # BUDGET-2（§3.4）: モデル窓の管理者登録（"provider:model" → tokens）。
-    if "model_context_windows" in provided:
-        updates["model_context_windows"] = _validate_model_windows(provided["model_context_windows"])
+    _validate_agentic_budgets(provided, updates)
     if "chat_examples" in provided:
         updates["chat_examples"] = _validate_chat_examples(provided["chat_examples"])
     _cloud_secret_keys = frozenset({"openai_api_key", "gemini_api_key", "bedrock_api_key"})

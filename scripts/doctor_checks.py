@@ -29,9 +29,10 @@
   - `sherpa.agents._bedrock_auth_available()`: Bedrock の認証手掛かり（中央キーまたは AWS SigV4）
   - `sherpa.providers._codex_openai_compat_block_reason()`: Codex(Azure/custom) 構成の可否判定
     （`POST /settings/test` の Codex 分岐と同じ判定部品）
-  - `sherpa.search_helper.resolve()`: 検索ヘルパー（下調べ役）が実際にどの provider/URL/モデルを
-    使うかの解決（`user_settings.search_helper` 経由の Ollama 利用を見落とさないための再利用。
-    実行時に配線されるのは主頭脳が openai のときだけ＝`sherpa/providers/__init__.py::get_provider`
+  - `sherpa.search_helper.resolve()`: 検索ヘルパー（下調べ役＝worker）が実際にどの provider/URL/
+    モデルを使うかの解決（`user_settings.search_helper` 経由の Ollama 利用を見落とさないための再利用。
+    設定が空／無視のときは頭脳自身が worker になる（`search_helper.self_worker`）。
+    実行時に配線されるのは主頭脳が openai または ollama のときだけ（ollama 頭脳の openai 下調べ役は無視される）＝`sherpa/providers/__init__.py::get_provider`
     と同じゲートを合わせる）
   - `sherpa.model_catalog.resolve_model()`: プロバイダ／用途ごとの実効モデル名
   - `sherpa.store.db._connect()`: Postgres 接続（DSN／`row_factory` の唯一の真実源。ただし
@@ -80,6 +81,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -1349,6 +1351,98 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
     return out
 
 
+def check_codex_multi_agent_worker_model(sys_s: dict | None, rows: list[dict] | None) -> CheckResult:
+    """Codex 構成（OpenAI 系・Ollama とも）が使われているとき、multi_agent
+    （`[agents.worker]`/`[agents.evaluator]`・S6）の worker モデルが確認済みの値のままか、
+    管理画面で独自設定（system_settings `codex_worker_model`・実装ベース探索の回復 S1）
+    されているかを判定する（実 codex は呼ばない・値そのものは detail に出さない）。独自設定時は
+    Codex 自身のモデルカタログに存在するかを Sherpa 側で検証できないため `skip` にする
+    （`ng` にしない＝運用側の確認を促すだけ）。
+
+    実装（`sherpa.providers.codex.sandbox.codex_multi_agent_enabled`）は Azure・Ollama では常に
+    multi_agent を有効にする（決定2026-09-19・S6c）。worker 未設定時、Azure は本体 Codex と同じ
+    デプロイ名、Ollama は本体と同じローカルモデルタグ（`_codex_worker_model(...,
+    main_model=..., ollama=...)`／role config の `model_provider`・`[model_providers.*]`）を使う
+    ため、本体が到達できていれば worker も到達できる想定内の組合せとして `ok` にする（どちらも
+    実機未検証＝初回は spawn の成功と接続先ログを確認する必要がある・detail に明記）。Azure 以外の
+    独自エンドポイント（custom）は `codex_worker_model` が明示設定されていなければ本番側
+    `codex_multi_agent_enabled` が multi_agent 自体を無効化する（RV是正：custom は本体のモデル名を
+    流用できる保証が無いため）——この検査でも同じ理由付き `skip` にする。この検査はサンドボックス
+    無効の無効化は見ない（本番側の判定 `codex_multi_agent_enabled` に委ねる）。接続先設定を
+    読めない異常時を除き `ok`／`skip` を返す。
+    """
+    cid, label = "codex_multi_agent_worker_model", "Codex multi_agent（worker/evaluator）モデル整合"
+    if sys_s is None:
+        return CheckResult(cid, label, "skip", "system_settings を読み取れないため確認できません")
+    from sherpa import agent_constructs, llm
+
+    used = False
+    openai_used = False    # Codex(OpenAI 系＝ollama 以外) が1箇所でも使われているか
+    ollama_used = False    # Codex(Ollama) が1箇所でも使われているか
+    try:
+        eff0 = agent_constructs.effective_agent(None, system_settings=sys_s)
+        cmp0 = agent_constructs.codex_model_provider(None)
+        if eff0 == "codex":
+            used = True
+            openai_used = openai_used or cmp0 != "ollama"
+            ollama_used = ollama_used or cmp0 == "ollama"
+    except Exception:
+        used = True         # 判定不能＝安全側で「使われている」扱い
+        openai_used = True  # 種別不明時は OpenAI 系の判定（より厳格）を優先
+    if rows is None:
+        used = True          # user_settings 未読なら安全側で「使われている」扱い
+        openai_used = True
+    else:
+        for row in rows:
+            settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider")}
+            try:
+                eff = agent_constructs.effective_agent(settings, system_settings=sys_s)
+                cmp = agent_constructs.codex_model_provider(settings)
+            except Exception:
+                used = True
+                openai_used = True
+                continue
+            if eff == "codex":
+                used = True
+                openai_used = openai_used or cmp != "ollama"
+                ollama_used = ollama_used or cmp == "ollama"
+    if not used:
+        return CheckResult(cid, label, "skip", "Codex 構成が使われていません")
+    from sherpa.providers.codex import sandbox as codex_sandbox
+    if ollama_used and not openai_used:   # OpenAI 系が同時に使われていればそちらの判定を優先
+        if codex_sandbox._codex_worker_model(sys_s, ollama=True) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
+            return CheckResult(cid, label, "skip",
+                        "worker モデルが管理画面で独自設定されています"
+                        "（値が Codex 自身のモデルカタログに存在するか運用側で確認してください）")
+        return CheckResult(cid, label, "ok",
+                    "worker モデルは未設定のため、本体 Codex と同じローカルモデルを使います"
+                    "（本体が到達できていれば worker もそのまま動作するはずですが実機未検証のため、"
+                    "初回は spawn の成功を確認してください）")
+    try:
+        endpoint_kind = llm.openai_endpoint_kind(sys_s)
+    except Exception as e:
+        return CheckResult(cid, label, "ng", f"接続先設定が壊れているため確認できません（{type(e).__name__}）")
+    if endpoint_kind == "azure":
+        if codex_sandbox._codex_worker_model(sys_s) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
+            return CheckResult(cid, label, "skip",
+                        "worker モデルが管理画面で独自設定されています"
+                        "（値が Codex 自身のモデルカタログに存在するか運用側で確認してください）")
+        return CheckResult(cid, label, "ok",
+                    "worker モデルは未設定のため、本体 Codex と同じデプロイ名・接続先設定を使います"
+                    "（本体が到達できていれば worker もそのまま動作するはずですが実機未検証のため、"
+                    "初回は spawn の成功と接続先ログを確認してください）")
+    if endpoint_kind != "openai":
+        return CheckResult(cid, label, "skip",
+                    "Codex(OpenAI 系) 構成の接続先が独自エンドポイント（custom）のため、"
+                    "codex_worker_model が未設定なら multi_agent 自体を無効化しています"
+                    "（明示設定すればこの接続先設定で worker/evaluator も動きます）")
+    if codex_sandbox._codex_worker_model(sys_s) != codex_sandbox._CODEX_WORKER_MODEL_FALLBACK:
+        return CheckResult(cid, label, "skip",
+                    "worker モデルが管理画面で独自設定されています"
+                    "（値が Codex 自身のモデルカタログに存在するか運用側で確認してください）")
+    return CheckResult(cid, label, "ok", "worker モデルは確認済みカタログ値のままです")
+
+
 def _codex_required(sys_s: dict | None, rows: list[dict] | None) -> tuple[bool, bool, str]:
     """Codex CLI が現在の構成で**必須**かどうか、かつ OpenAI/Azure 側の認証確認
     （`codex login status`／`_codex_openai_compat_block_reason`）が必要かどうかを判定する。
@@ -1471,11 +1565,16 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
             _add(url, chat_model, "チャット（利用者設定）")
         elif eff == "codex" and row.get("codex_model_provider") == "ollama":
             _add(url, codex_model, "Codex(Ollama) 実行モデル")
-        # 検索ヘルパーは主頭脳が openai（`provider_id == "openai"`）のときだけ実際に配線される
-        # （`sherpa/providers/__init__.py::get_provider` 参照）。主頭脳が codex/ollama 等の利用者の
-        # `search_helper` 列は runtime では一切評価されないため、ここでも `eff == "openai"` の
-        # ときだけ解決する（残存設定を誤って「使っている」扱いにしない）。
-        if eff == "openai":
+        # worker（下調べ役）が配線されるのは主頭脳が openai／ollama のときだけ（`sherpa/providers/
+        # __init__.py::get_provider` 参照・頭脳 × search_helper の組合せ表は提案書
+        # docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。主頭脳が codex 等の
+        # 利用者の `search_helper` 列は runtime では一切評価されないため、ここでも `eff` が
+        # openai／ollama のときだけ解決する（残存設定を誤って「使っている」扱いにしない）。
+        # Ollama 頭脳には openai の下調べ役は付かない（クラウド1社の方針で無視）ため、
+        # `sh.get("provider") == "ollama"` の絞り込みだけで両頭脳とも組合せ表どおりになる。
+        # 「下調べ役なし」は無い＝`search_helper` が空／無視のときは頭脳自身が worker になるので、
+        # Ollama 頭脳ならチャットと同じ URL/モデルに下調べの用途が増える（`self_worker`）。
+        if eff in ("openai", "ollama"):
             try:
                 sh = search_helper.resolve(row_settings, system_settings=sys_s)
             except Exception:
@@ -1486,6 +1585,8 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
                 sh = None
             if sh and sh.get("provider") == "ollama":
                 _add(sh.get("url"), sh.get("model"), "検索ヘルパー（下調べ）")
+            elif eff == "ollama" and not type_error:
+                _add(url, chat_model, "検索ヘルパー（下調べ）")
 
     if type_error:
         return None
@@ -1872,6 +1973,111 @@ def check_codex(sys_s: dict | None, rows: list[dict] | None, required: bool, nee
     return out
 
 
+_CODEX_SANDBOX_TIMEOUT = 60.0
+# 実データ・DB・ネットワーク・AI に一切触れない固定の中身（`codex sandbox -P sherpa-authoring` の
+# 中で動かすだけ）。rg の有無はサンドボックス**内側**（`_codex_clean_env` が足す Codex 同梱 rg の
+# PATH を含む）で確認する——`&&` で繋ぐと rg 欠落時に SANDBOX_OK 自体が出せず「サンドボックスが
+# 動かない」という誤診断になるため、両方を無条件に確認して別々の行へ出す。
+# 資料フォルダ（一時の kb・引数 $1）へ書けないこと（読み取り専用）も同じ中で確かめる——原本と
+# 変換済みテキストを書き換えられないのはサンドボックスの read 指定が保証する契約のため。
+_CODEX_SANDBOX_PROBE_SCRIPT = (
+    "echo SANDBOX_OK; "
+    "if command -v rg >/dev/null 2>&1; then echo RG_OK; else echo RG_MISSING; fi; "
+    "if ( : > \"$1/.sherpa-write-probe\" ) 2>/dev/null; then echo KB_WRITABLE; else echo KB_READONLY; fi"
+)
+
+
+def _first_line_or(text: object, fallback: str) -> str:
+    """標準エラー等の1行目（200文字まで）。空・非文字列なら `fallback`。"""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    if isinstance(text, str) and text.strip():
+        return text.strip().splitlines()[0][:200]
+    return fallback
+
+
+def check_codex_sandbox(codex_required: bool) -> CheckResult:
+    """Codex の permission profile サンドボックス（bubblewrap・`sherpa-authoring`）が実際に
+    コマンドを実行できるかを、AI・DB・ネットワークに一切触れず確認する。
+
+    `codex sandbox -P sherpa-authoring -C <run> -- /bin/sh -c '...'` は、Sherpa のターンと**同じ
+    permission profile** の中でコマンドを1つ実行するだけの経路（`codex exec` は呼ばない＝課金なし）。
+    実機（閉域・Ubuntu 24.04）で「サンドボックス内のコマンドが何か月も全部失敗していたのに誰も
+    気付かなかった」事故（Ubuntu 23.10 以降の AppArmor ユーザー名前空間制限で bwrap が
+    `RTM_NEWADDR`／`uid_map` で落ちる・Codex 導入先が permission profile の外で `execvp` が失敗する・
+    rg 欠落で検索が grep へ縮退する）を、導入直後のセットアップ検査として先回りで検出する。
+    config の書き方・env の組み立ては `sandbox.py` の `_write_codex_authoring_config`／
+    `_codex_clean_env`（実際のターンが使うのと同じ関数）をそのまま呼ぶ——判定ロジックを
+    再実装しない。`system_settings={}` を渡す（接続先種別を問わない汎用チェックのため既定
+    "openai" 扱いで十分・doctor の読み取り専用契約どおり実 DB は読まない）。
+
+    `codex_required`（呼び出し元 `run_all` が `_codex_required()` で判定済みの値）が偽、または
+    codex CLI 自体が無いなら、実行せず `skip` にする。Codex を使う構成でサンドボックス機構そのものが
+    無効（`SHERPA_CODEX_SANDBOX=0`・緊急時専用の逃げ道）なら `ng`（本番はこの設定で起動を拒否する＝
+    `api._warn_codex_sandbox_disabled`）。
+    """
+    cid, label = "codex_sandbox", "Codex のサンドボックス"
+    if not codex_required:
+        return CheckResult(cid, label, "skip", "現在の構成では Codex を使わないため確認できません")
+    if not shutil.which("codex"):
+        return CheckResult(cid, label, "skip",
+                            "codex コマンドが見つからないため確認できません"
+                            "（「Codex CLI 導入」の項目を確認してください）")
+    from sherpa.providers.codex import sandbox as codex_sandbox
+    if not codex_sandbox._codex_sandbox_enabled():
+        return CheckResult(cid, label, "ng",
+                            "SHERPA_CODEX_SANDBOX が無効です（緊急時専用の逃げ道・Codex の読み取りの"
+                            "封じ込めが外れます）。本番（make serve）はこの設定で起動を拒否します。"
+                            "未設定に戻してください")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="sherpa-doctor-sandbox-") as tmp:
+            tmp_path = Path(tmp)
+            kb, home, run = tmp_path / "kb", tmp_path / "home", tmp_path / "run"
+            kb.mkdir()
+            home.mkdir()
+            run.mkdir()
+            codex_sandbox._write_codex_authoring_config(
+                home, [str(kb)], "medium", False, "doctor-check", None,
+                direct_read_roots=[str(kb)], system_settings={}, link_auth=False)
+            sandbox_env = codex_sandbox._codex_clean_env(home, run, run)
+            r = subprocess.run(
+                ["codex", "sandbox", "-P", "sherpa-authoring", "-C", str(run), "--",
+                 "/bin/sh", "-c", _CODEX_SANDBOX_PROBE_SCRIPT, "sh", str(kb)],
+                env=sandbox_env, capture_output=True, text=True, timeout=_CODEX_SANDBOX_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        detail = _first_line_or(e.stderr, "タイムアウトしました")
+        return CheckResult(cid, label, "ng", f"サンドボックスでコマンドを実行できませんでした: {detail}")
+    except Exception as e:
+        return CheckResult(cid, label, "ng",
+                            f"サンドボックスでコマンドを実行できませんでした: {type(e).__name__}")
+
+    out, err = r.stdout or "", r.stderr or ""
+    combined = out + "\n" + err
+    if r.returncode == 0 and "SANDBOX_OK" in out:
+        if "KB_READONLY" not in out:
+            return CheckResult(cid, label, "ng",
+                                "サンドボックスの中から資料フォルダに書き込めてしまいます"
+                                "（原本と変換済みテキストが読み取り専用になっていません）")
+        if "RG_OK" in out:
+            return CheckResult(cid, label, "ok", "サンドボックスでコマンドを実行できました（rg あり）")
+        # `_codex_clean_env` は Codex 同梱の rg も PATH へ足す（0.14.4）——それでも見つからないのは
+        # システムにも Codex 同梱にも rg が無い場合だけ。検索は動く（grep 縮退）ので ng だが致命ではない。
+        return CheckResult(cid, label, "ng",
+                            "rg が見つかりません（Codex 同梱の rg も見つかりません）。"
+                            "検索は grep で代わりにしますが遅くなります")
+    if "RTM_NEWADDR" in combined or "uid_map" in combined:
+        return CheckResult(cid, label, "ng",
+                            "Ubuntu のユーザー名前空間の制限（AppArmor）でサンドボックスを"
+                            "起動できません。sudo bash scripts/setup-codex-sandbox.sh apply で直せます")
+    if "execvp" in combined:
+        return CheckResult(cid, label, "ng",
+                            "サンドボックスの中から Codex 本体が見えません"
+                            f"（導入先: {codex_sandbox._codex_install_root()}）")
+    return CheckResult(cid, label, "ng",
+                        f"サンドボックスでコマンドを実行できませんでした: {_first_line_or(err, '(詳細不明)')}")
+
+
 # ---------------------------------------------------------------------------
 # 統合
 # ---------------------------------------------------------------------------
@@ -1918,6 +2124,8 @@ def run_all(*, probe_cloud: bool) -> list[CheckResult]:
         results.extend(check_ollama_probes(sys_s, rows))
         results.extend(check_codex(llm_sys_s, rows, codex_required, codex_needs_openai_auth,
                                     codex_note, probe_cloud, indeterminate=codex_indeterminate))
+        results.append(check_codex_sandbox(codex_required))
+        results.append(check_codex_multi_agent_worker_model(sys_s, rows))
 
         return results
 

@@ -49,10 +49,14 @@ def _copy_skill_dir(src: Path, dst: Path) -> bool:
         return False
 
 
-def deploy_skills(authoring: Path, uid: str, users_dir: Path) -> None:
+def deploy_skills(authoring: Path, uid: str, users_dir: Path, *, skip_prefix: str | None = None) -> None:
     """authoring/.agents/skills を毎回作り直し、base→個人オーバーレイの順で配備する。
 
     `authoring` は Codex の cwd（既存の封じ込め recipe そのまま・sandbox profile 変更ゼロ）。
+
+    `skip_prefix`（既定 None）: 指定すると、この文字列で始まる名前のスキル（base／個人どちらも）を
+    配備しない——素の Codex モード（`plain`・docs/proposals/2026-09-24-素のCodexモード.md §1.2）が
+    `"investigate-"` を渡し、調査スキル（原本を Python で開く前提の手順書）を置かない。
     """
     # RV HIGH: 親 `.agents` 自体の symlink も拒否する。Codex は authoring に書けるため、前回実行で
     # `.agents -> ../files` 等にすり替えられていると、下の rmtree/copytree が authoring 外
@@ -67,9 +71,14 @@ def deploy_skills(authoring: Path, uid: str, users_dir: Path) -> None:
         shutil.rmtree(dest_root, ignore_errors=True)
     dest_root.mkdir(parents=True, exist_ok=True)
 
+    def _skip(name: str) -> bool:
+        return skip_prefix is not None and name.startswith(skip_prefix)
+
     # ベース（リポジトリ管理・自作）を先に配備。
     if BASE_SKILLS_DIR.is_dir():
         for base_skill in sorted(p for p in BASE_SKILLS_DIR.iterdir() if p.is_dir()):
+            if _skip(base_skill.name):
+                continue
             _copy_skill_dir(base_skill, dest_root / base_skill.name)
 
     # 個人オーバーレイ（同名スキルは個人が置換）。存在しなくても正常（個人スキル未作成が既定）。
@@ -77,6 +86,8 @@ def deploy_skills(authoring: Path, uid: str, users_dir: Path) -> None:
     if personal_root.is_symlink() or not personal_root.is_dir():
         return
     for personal_skill in sorted(p for p in personal_root.iterdir() if p.is_dir()):
+        if _skip(personal_skill.name):
+            continue
         dst = dest_root / personal_skill.name
         if dst.exists() or dst.is_symlink():
             shutil.rmtree(dst, ignore_errors=True) if not dst.is_symlink() else dst.unlink()

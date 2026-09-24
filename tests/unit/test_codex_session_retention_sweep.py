@@ -1,7 +1,8 @@
 """R1b（会話継続・Codex ネイティブ resume・決定5）: `api._sweep_expired_codex_sessions` の単体テスト。
 
 会話ごとの Codex resume セッション実体（`workspace/.codex-sessions/{cid}`）を、admin 設定
-`codex_session_retention_days`（system_settings・既定0=無制限）に従って掃除する背景処理。
+`codex_session_retention_days`（system_settings・未設定は既定30日・明示的な0だけ無制限・
+決定2026-09-19＝初期構成の既定）に従って掃除する背景処理。
 既存の workspace TTL sweep（`_sweep_expired_workspace`/`_gc_orphan_workspace_files`）と同じ
 「安全に自動」思想（DB/設定不達なら何もしない・symlink は触らない・base-confined）を検証する。
 
@@ -33,16 +34,20 @@ def _mk_session_dir(users_dir: Path, uid: str, cid: str, age_days: float | None 
     return d
 
 
-def test_sweep_skips_when_retention_unset_default_zero(tmp_path, monkeypatch):
+def test_sweep_uses_default_retention_when_unset(tmp_path, monkeypatch):
+    """初期構成の既定（決定2026-09-19）: `codex_session_retention_days` 未設定は既定30日へ倒れる
+    ため、30日を超えたセッションは削除され、内側のセッションは残る。"""
     users_dir = tmp_path / "users"
-    d = _mk_session_dir(users_dir, "u1", "1", age_days=365)
+    old = _mk_session_dir(users_dir, "u1", "old-conv", age_days=365)
+    fresh = _mk_session_dir(users_dir, "u1", "fresh-conv", age_days=1)
     monkeypatch.setattr(api, "_USERS_DIR", users_dir)
     monkeypatch.setattr(store, "get_system_settings", lambda: {})
 
     result = api._sweep_expired_codex_sessions()
 
-    assert result == {"skipped": "unlimited"}
-    assert d.is_dir(), "既定（未設定=無制限）で削除されてしまった"
+    assert result["deleted"] == 1 and result.get("failed", 0) == 0
+    assert not old.exists(), "既定30日を超えたセッションが削除されていない"
+    assert fresh.is_dir(), "既定30日以内のセッションが誤って削除された"
 
 
 def test_sweep_skips_when_retention_explicitly_zero(tmp_path, monkeypatch):
@@ -69,6 +74,33 @@ def test_sweep_deletes_directories_older_than_retention(tmp_path, monkeypatch):
     assert result["deleted"] == 1 and result.get("failed", 0) == 0
     assert not old.exists(), "保持期間（7日）を超えたセッションが削除されていない"
     assert fresh.is_dir(), "保持期間内のセッションが誤って削除された"
+
+
+def test_sweep_deletes_child_thread_rollout_under_same_session_dir(tmp_path, monkeypatch):
+    """DEPTH-2 S3b（受け入れ条件(5)）: `spawn_agent` した子スレッドの rollout も、親と同じ
+    `{cid}/sessions/**/*.jsonl` 配下に書かれる——`{cid}` ディレクトリ丸ごとの `rmtree` は
+    個別の回収コードなしで子の分も一括で消す。"""
+    users_dir = tmp_path / "users"
+    d = _mk_session_dir(users_dir, "u1", "old-conv", age_days=10)
+    sessions = d / "sessions" / "2026" / "01" / "01"
+    sessions.mkdir(parents=True)
+    parent_rollout = sessions / "rollout-PARENT.jsonl"
+    child_rollout = sessions / "rollout-CHILD-1.jsonl"
+    parent_rollout.write_text('{"payload": {"id": "PARENT"}}\n')
+    child_rollout.write_text('{"payload": {"id": "CHILD-1", "parent_thread_id": "PARENT"}}\n')
+    # sweep はディレクトリ自体の mtime しか見ない（`_mk_session_dir` の docstring 参照）——配下に
+    # ファイルを追加すると `d` 自身の mtime が「今」に更新されてしまうため、age_days=10 を作り直す。
+    past = time.time() - 10 * 86400
+    os.utime(d, (past, past))
+    monkeypatch.setattr(api, "_USERS_DIR", users_dir)
+    monkeypatch.setattr(store, "get_system_settings", lambda: {"codex_session_retention_days": 7})
+
+    result = api._sweep_expired_codex_sessions()
+
+    assert result["deleted"] == 1 and result.get("failed", 0) == 0
+    assert not d.exists()
+    assert not parent_rollout.exists() and not child_rollout.exists(), \
+        "子スレッドの rollout が保持日数の掃除対象から漏れている"
 
 
 def test_sweep_across_multiple_users(tmp_path, monkeypatch):

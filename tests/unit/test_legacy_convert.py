@@ -589,7 +589,9 @@ def _start_mock_worker(*, token=None, versions=None, convert_status=200,
     srv.last_upload = None
     srv.last_path = None
     srv.convert_calls = 0
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    # poll_interval を既定の 0.5 秒より短くする（shutdown() はこの周期でしか停止要求に気づかない
+    # ため、既定のままだと各テストの後始末ごとに待たされる）。
+    t = threading.Thread(target=srv.serve_forever, args=(0.02,), daemon=True)
     t.start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
     return srv, url

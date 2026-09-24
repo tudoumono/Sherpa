@@ -12,6 +12,10 @@ Private Link 等でこの preflight の実行元から到達できない構成�
 検査）と同じやり方（`SHERPA_ENV_FILE` を存在しないパスにし、`fail()` が非0終了しない実装を利用して
 後続の検査まで進ませる・外部コマンドはフェイクの実行ファイルで差し替える）で、外部サービス・実DNS・
 実ネットワークに依存せず検査する。
+
+http 拒否が loopback でも成り立つこと（`http://127.0.0.1` 等）は
+`tests/unit/test_llm_openai_endpoint.py::test_http_localhost_rejected` が同じ判定（scheme が
+https 以外なら host によらず拒否）を見ているため、ここでは重複させない。
 """
 from __future__ import annotations
 
@@ -81,29 +85,6 @@ def _run_check_production(tmp_path: Path, *, openai_base_url: str | None,
                            capture_output=True, text=True, timeout=120)
 
 
-def test_check_production_mentions_openai_base_url_check():
-    """検査自体がスクリプトに存在すること（案内文の固定）。"""
-    src = CHECK_PRODUCTION.read_text(encoding="utf-8")
-    assert "OPENAI_BASE_URL" in src
-    assert "https" in src
-
-
-def test_check_production_read_only_no_writes_for_openai_base_url():
-    """この検査は読み取り専用（.env や sysctl 等へ書き込まない）こと。"""
-    src = CHECK_PRODUCTION.read_text(encoding="utf-8")
-    in_block = False
-    for lineno, raw in enumerate(src.splitlines(), start=1):
-        line = raw.strip()
-        if "OPENAI_BASE_URL" in line and line.startswith(("if ", "sherpa_env_default")):
-            in_block = True
-        if not in_block:
-            continue
-        if line.startswith(("fail ", "warn ", "ok ", "#", "echo ")):
-            continue
-        assert " > " not in line, f"line {lineno}: リダイレクト書込みの疑い: {raw}"
-        assert not line.startswith("tee"), f"line {lineno}: tee 書込みの疑い: {raw}"
-
-
 def test_ok_when_openai_base_url_unset(tmp_path: Path):
     r = _run_check_production(tmp_path, openai_base_url=None)
     out = r.stdout + r.stderr
@@ -113,36 +94,32 @@ def test_ok_when_openai_base_url_unset(tmp_path: Path):
 
 
 def test_ng_when_openai_base_url_is_plain_http(tmp_path: Path):
-    r = _run_check_production(tmp_path, openai_base_url="http://evil.example.com/v1")
+    """http は拒否される（DB 未到達時は env 候補モードへ fail-safe し、そのモードでも同じ判定に
+    なることを含む）。path に秘密らしき文字列が混入していても（Azure のデプロイ名欄等に誤って
+    貼り付けた想定）、拒否メッセージには host 以外を出さない（scheme も含めない・env 候補モードは
+    本番の `_openai_endpoint_seed_candidate`／`assert_openai_base_url_allowed` を共有するため、
+    この検証は bash 側でなく python 側の安全な host 表現を経由する）。"""
+    r = _run_check_production(
+        tmp_path, openai_base_url="http://evil.example.com/openai/deployments/sk-should-not-leak")
     out = r.stdout + r.stderr
     assert "NG" in out
     assert "https" in out
     assert "OPENAI_BASE_URL" in out
+    assert "NG: OPENAI_BASE_URL" in out
+    assert "sk-should-not-leak" not in out
+    assert "evil.example.com" in out
+    assert "接続先の検査モード: env 候補" in out
 
 
 def test_ng_when_openai_base_url_is_malformed(tmp_path: Path):
-    r = _run_check_production(tmp_path, openai_base_url="not-a-url")
+    """解析自体に失敗する値も NG にする。生の env 値をメッセージへ出さない（path に秘密らしき
+    文字列が混入していても解析失敗時の安全な表現になることを含む）。"""
+    r = _run_check_production(tmp_path, openai_base_url="not-a-url-sk-should-not-leak")
     out = r.stdout + r.stderr
     assert "NG" in out
     assert "OPENAI_BASE_URL" in out
-
-
-def test_ng_when_openai_base_url_is_http_loopback(tmp_path: Path):
-    """http はループバックであっても拒否される（2026-08-21: `sherpa/llm.py::assert_openai_base_url_allowed`
-    からループバック例外を撤去した＝https のみを許可する契約に揃える。従来この穴は実装検証にだけ
-    使われる抜け道でしかなかった）。"""
-    r = _run_check_production(tmp_path, openai_base_url="http://127.0.0.1:8099/v1")
-    out = r.stdout + r.stderr
     assert "NG: OPENAI_BASE_URL" in out
-    assert "https" in out
-
-
-def test_ng_when_openai_base_url_is_http_loopback_non_canonical_ip(tmp_path: Path):
-    """`127.0.0.1` 以外の 127.0.0.0/8 アドレスも同様に拒否される（http は一切許可しない）。"""
-    r = _run_check_production(tmp_path, openai_base_url="http://127.1.2.3:8099/v1")
-    out = r.stdout + r.stderr
-    assert "NG: OPENAI_BASE_URL" in out
-    assert "https" in out
+    assert "sk-should-not-leak" not in out
 
 
 def test_ng_when_hostname_unresolvable(tmp_path: Path):
@@ -160,7 +137,10 @@ def test_ng_when_hostname_unresolvable(tmp_path: Path):
 
 def test_ok_when_hostname_resolves_azure(tmp_path: Path):
     """名前解決できれば https チェックまでは OK になる（TCP 疎通の成否は warn 止まりなので
-    ここでは問わない）。実 DNS に依存させないよう `getent` を常に成功するフェイクに差し替える。"""
+    ここでは問わない）。DB に到達できない（preflight はサービス起動前に実行されることが多い）
+    ときは env 候補モードへ fail-safe し、従来どおり env の OPENAI_BASE_URL を検査することも
+    同じ出力でまとめて確認する。実 DNS に依存させないよう `getent` を常に成功するフェイクに
+    差し替える。"""
     r = _run_check_production(
         tmp_path,
         openai_base_url="https://my-resource.openai.azure.com/openai/v1/",
@@ -170,47 +150,7 @@ def test_ok_when_hostname_resolves_azure(tmp_path: Path):
     assert "OK: OPENAI_BASE_URL scheme: https://my-resource.openai.azure.com" in out
     assert "OK: OPENAI_BASE_URL host resolves: my-resource.openai.azure.com" in out
     assert "NG: OPENAI_BASE_URL" not in out
-
-
-def test_pseudo_secret_in_path_not_leaked_on_http_rejection(tmp_path: Path):
-    """path に秘密らしき文字列が混入していても（Azure のデプロイ名欄等に
-    誤って貼り付けた想定）、https 拒否メッセージには host 以外を出さない（scheme も含めない・
-    env 候補モードは本番の `_openai_endpoint_seed_candidate`／`assert_openai_base_url_allowed` を
-    共有するため、この検証は bash 側でなく python 側の安全な host 表現を経由する）。"""
-    r = _run_check_production(
-        tmp_path, openai_base_url="http://evil.example.com/openai/deployments/sk-should-not-leak")
-    out = r.stdout + r.stderr
-    assert "NG: OPENAI_BASE_URL" in out
-    assert "sk-should-not-leak" not in out
-    assert "evil.example.com" in out
-
-
-def test_pseudo_secret_in_path_not_leaked_on_parse_failure(tmp_path: Path):
-    """解析自体に失敗する値でも、生の env 値をメッセージへ出さない。"""
-    r = _run_check_production(tmp_path, openai_base_url="not-a-url-sk-should-not-leak")
-    out = r.stdout + r.stderr
-    assert "NG: OPENAI_BASE_URL" in out
-    assert "sk-should-not-leak" not in out
-
-
-def test_mode_falls_back_to_env_candidate_when_db_unreachable(tmp_path: Path):
-    """DB に到達できない（preflight はサービス起動前に実行されることが多い）
-    ときは env 候補モードへ fail-safe し、従来どおり env の OPENAI_BASE_URL を検査する。"""
-    r = _run_check_production(
-        tmp_path, openai_base_url="https://my-resource.openai.azure.com/openai/v1/",
-        fake_getent="#!/usr/bin/env bash\necho ok\nexit 0\n", force_db_unreachable=True)
-    out = r.stdout + r.stderr
     assert "接続先の検査モード: env 候補（DB 未到達" in out
-    assert "OK: OPENAI_BASE_URL scheme: https://my-resource.openai.azure.com" in out
-
-
-def test_mode_env_candidate_still_rejects_http_when_db_unreachable(tmp_path: Path):
-    r = _run_check_production(tmp_path, openai_base_url="http://evil.example.com/v1",
-                              force_db_unreachable=True)
-    out = r.stdout + r.stderr
-    assert "接続先の検査モード: env 候補" in out
-    assert "NG: OPENAI_BASE_URL" in out
-    assert "https" in out
 
 
 def test_tcp_unreachable_is_warn_not_fail(tmp_path: Path):

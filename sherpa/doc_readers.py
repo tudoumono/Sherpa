@@ -929,8 +929,10 @@ def file_head(f, max_bytes: int = _FILE_HEAD_DEFAULT,
         f.seek(0)
         raw = f.read(cap)
     except OSError:
+        # 呼び出し元（`agentic_search._record_tool_result_error_code`）が名前非依存で拾い
+        # `InvestigationState.backend_failures["read_io"]` へ反映する固定理由コード。
         _close_quiet(f)
-        return {"error": "ファイルを開けませんでした"}
+        return {"error": "ファイルを開けませんでした", "error_code": "read_io_failed"}
     _close_quiet(f)
     text = raw.decode("utf-8", errors="replace")
     if clean is not None and text:

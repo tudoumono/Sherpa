@@ -359,15 +359,38 @@
       </div>
 
       <div class="tabpanel" id="tabpanel-research" data-tabpanel="research" role="tabpanel" aria-labelledby="tab-btn-research" tabindex="0" hidden>
-        <p class="hint">利用する AI 経路（Codex または API）の設定と、共通の検索設定を調整します。
-          「標準」の値は、チャットの「深く」「最大」に応じて増えます。</p>
+        <p class="hint">調査に使う AI の設定と、共通の検索設定を調整します。</p>
+        <div class="card sec" id="review-rounds-card">
+          <div class="card-head"><span class="title">見直しの回数</span></div>
+          <div class="body">
+            <p class="hint">チャットの「調べる深さ」で見直しの回数を選べます。クイック＝見直しなし（下調べ役の一次判断を確認 1 回だけ）、標準＝見直し 2 回、深く＝見直し 4 回、最大＝下の設定値まで。十分に調べられたときは、途中で終わります。どの段もこの設定値より多くはなりません。</p>
+            <label class="vlm-field"><span class="vlm-l">最大の見直しの回数</span>
+              <input type="number" id="max-review-rounds" min="1" max="32" step="1" placeholder="既定: 7" style="max-width:160px">
+            </label>
+            <div class="hint" id="max-review-rounds-hint" style="margin:-8px 0 6px"></div>
+            <p class="hint">1〜32 回で指定できます。空欄で保存すると既定に戻ります。</p>
+          </div>
+        </div>
         <section class="research-group" aria-labelledby="research-codex-heading">
           <h2 id="research-codex-heading">Codex 専用</h2>
+          <div class="card sec" id="codex-mode-card">
+            <div class="card-head"><span class="title">Codex の調べ方</span></div>
+            <div class="body">
+              <p class="hint">素の Codex では「調べる深さ」は Codex の調べ方（見直しの回数・推論の強さ）には効きません。影響調査で一覧を作るときのたどる深さにだけ効きます。</p>
+              <label class="vlm-field"><span class="vlm-l">Codex の調べ方</span>
+                <select id="codex-mode" style="max-width:360px">
+                  <option value="">標準（Sherpa の検索ツールと調査台帳を使う）</option>
+                  <option value="plain">素の Codex（Codex が自分で資料を読む・試験用）</option>
+                </select>
+              </label>
+              <div class="hint" id="codex-mode-hint" style="margin:-8px 0 6px"></div>
+            </div>
+          </div>
           <div class="card sec" id="codex-investigation-card">
             <div class="card-head"><span class="title">Codex に考えさせる量</span></div>
             <div class="body">
-              <p class="hint">通常の調査で使う推論レベルです。「深く」は high、「最大」は xhigh。「作成」の標準は専用の環境設定を使います。</p>
-              <label class="vlm-field"><span class="vlm-l">Codex の推論レベル（標準・作成以外）</span>
+              <p class="hint">Codex 本体の考えさせる量に適用します。深さを変えてもこの値は変わりません。「作成」は専用の環境設定を使います。</p>
+              <label class="vlm-field"><span class="vlm-l">Codex の考えさせる量（作成以外）</span>
                 <select id="depth-base-codex-reasoning" style="max-width:200px">
                   <option value="">環境設定の既定に従う</option>
                   <option value="minimal">minimal</option>
@@ -380,6 +403,26 @@
               <div class="hint" id="depth-base-codex-reasoning-hint" style="margin:-8px 0 6px"></div>
             </div>
           </div>
+          <div class="card sec" id="codex-worker-model-card">
+            <div class="card-head"><span class="title">下調べ役のモデル</span></div>
+            <div class="body">
+              <p class="hint">Codex の下調べ役が使うモデル名です。空欄で保存すると既定に戻ります。</p>
+              <label class="vlm-field"><span class="vlm-l">下調べ役のモデル</span>
+                <input type="text" id="codex-worker-model" style="max-width:280px">
+              </label>
+              <div class="hint" id="codex-worker-model-hint" style="margin:-8px 0 6px"></div>
+            </div>
+          </div>
+          <div class="card sec" id="codex-session-retention-card">
+            <div class="card-head"><span class="title">会話セッションの保存日数</span></div>
+            <div class="body">
+              <p class="hint">Codex の会話セッションを保存する日数です。0 で無制限。空欄で保存すると既定に戻ります。</p>
+              <label class="vlm-field"><span class="vlm-l">Codex の会話セッションを保存する日数</span>
+                <input type="number" id="codex-session-retention-days" min="0" step="1" placeholder="既定: 30" style="max-width:160px">
+              </label>
+              <div class="hint" id="codex-session-retention-days-hint" style="margin:-8px 0 6px"></div>
+            </div>
+          </div>
         </section>
         <section class="research-group" aria-labelledby="research-api-heading">
           <h2 id="research-api-heading">API 専用</h2>
@@ -387,21 +430,11 @@
             <div class="card-head"><span class="title">API での追加調査</span></div>
             <div class="body">
               <p class="hint">AI が検索・読み取りを指示し、Sherpa が結果を返すやり取りを繰り返します。
-                下の3項目は OpenAI・Ollama の調査ループと検索アシスタント用です。Codex 内部の調査には適用しません。</p>
-              <label class="vlm-field"><span class="vlm-l">探索の反復回数（標準）</span>
+                探索の反復回数は OpenAI（API）・ローカル（Ollama）の下調べ役と回答をまとめる AI に適用します。</p>
+              <label class="vlm-field"><span class="vlm-l">探索の反復回数（基準値）</span>
                 <input type="number" id="depth-base-max-turns" min="1" max="200" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-max-turns-hint" style="margin:-8px 0 14px"></div>
-
-              <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（標準）</span>
-                <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
-              </label>
-              <div class="hint" id="depth-base-grep-max-hits-hint" style="margin:-8px 0 14px"></div>
-
-              <label class="vlm-field"><span class="vlm-l">1回に読み取る前後の行数（標準）</span>
-                <input type="number" id="depth-base-read-window" min="10" max="400" step="1" style="max-width:160px">
-              </label>
-              <div class="hint" id="depth-base-read-window-hint" style="margin:-8px 0 14px"></div>
 
               <label class="vlm-field"><span class="vlm-l">1回の AI 応答で実行するツール数の上限</span>
                 <input type="number" id="agentic-max-tools-per-turn" min="1" max="256" step="1" style="max-width:160px">
@@ -440,44 +473,49 @@
               <div class="hint" id="agentic-budget-total-hint" style="margin:-8px 0 6px"></div>
               <div class="hint">累計は、追加調査の開始から終了までに受け取った結果の合計です。同じ箇所を再取得した分も含みます。上限を超えると、その時点までの内容で回答をまとめます
                 （調べきれなかった旨も併せて伝えます）。</div>
-
-              <!-- BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定）:
-                   現在のモデルが一度に読める量（トークン数の上限）に合わせて、上の予算を自動で
-                   これ以上安全な値まで縮める（縮むだけ・自動では増えない）。 -->
-              <div class="hint" style="margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--border)">
-                現在のモデルが一度に読める量（トークン数）が分かっている場合、上の予算はその量を
-                超えないところまで自動的に絞られます（一度に読める量が大きくても、上の予算より増えることはありません）。</div>
-              <div class="hint" id="agentic-budget-window-status"><!-- JS: 現在のモデル・一度に読める量・出所・自動調整後の上限 --></div>
-              <div class="hint danger" id="agentic-budget-window-unknown" hidden>
-                コンテキスト上限を判定できないため、情報量の設定値を使います。必要なら「使えるモデル」で仕様値を補足してください。</div>
-
+              <div class="hint">目安として、累計上限は1件あたりの上限の16倍程度（既定 256KB:4096KB と同じ比率）を推奨します。累計が1件あたりを下回る組み合わせは保存できません（エラーになります）。</div>
 
             </div>
           </div>
         </section>
         <section class="research-group" aria-labelledby="research-shared-heading">
-          <h2 id="research-shared-heading">両方に共通</h2>
+          <h2 id="research-shared-heading">Codex・OpenAI・ローカルに共通</h2>
           <div class="card sec" id="search-investigation-card">
             <div class="card-head"><span class="title">共通の資料検索・関係探索</span></div>
             <div class="body">
-              <p class="hint">Sherpa が資料や候補を集める共通処理の設定です。Codex の事前検索にも使います。AI による追加調査全体の上限ではありません。</p>
-              <label class="vlm-field"><span class="vlm-l">内容の質問（仕様問い合わせ）のヒット件数上限（標準）</span>
+              <p class="hint">資料を探す件数・読む行数・関係をたどる段数の基準値です。調べる深さを変えても、この値は変わりません。</p>
+              <label class="vlm-field"><span class="vlm-l">資料検索のヒット件数上限（基準値）</span>
+                <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-grep-max-hits-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+
+              <label class="vlm-field"><span class="vlm-l">1回に読み取る前後の行数（基準値）</span>
+                <input type="number" id="depth-base-read-window" min="10" max="400" step="1" style="max-width:160px">
+              </label>
+              <div class="hint" id="depth-base-read-window-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+
+              <label class="vlm-field"><span class="vlm-l">内容の質問（仕様問い合わせ）のヒット件数上限（基準値）</span>
                 <input type="number" id="depth-base-qa-max-hits" min="1" max="1000" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-qa-max-hits-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">Codex・OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
 
               <p class="hint"><b>以下の二つの段数は、揃える必要はありません。</b>原因調査は関係の向きを限定しないため、同じ段数でも探索範囲が広がりやすくなります。範囲を広げたい調査の項目だけ調整してください。</p>
               <p class="hint">1段は直接つながる箇所まで、2段はその先まで。段数を増やすと、候補数や処理時間が増えることがあります。</p>
-              <label class="vlm-field"><span class="vlm-l">影響分析でたどる段数（標準）</span>
+              <label class="vlm-field"><span class="vlm-l">影響分析でたどる段数（基準値）</span>
                 <input type="number" id="depth-base-impact-depth" min="1" max="64" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-impact-depth-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">Codex・OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
               <p class="hint">変更箇所から、呼び出し・参照などを影響が及ぶ方向にたどり、影響先の候補を探します。</p>
 
-              <label class="vlm-field"><span class="vlm-l">原因調査でたどる段数（標準）</span>
+              <label class="vlm-field"><span class="vlm-l">原因調査でたどる段数（基準値）</span>
                 <input type="number" id="depth-base-troubleshoot-depth" min="1" max="16" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-troubleshoot-depth-hint" style="margin:-8px 0 14px"></div>
+              <p class="hint">Codex・OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
               <p class="hint">症状文から関連箇所を見つけ、周囲の関係と資料から原因の手がかりを集めます。候補はその後の調査に使い、この処理だけで原因を確定しません。</p>
             </div>
           </div>
@@ -495,18 +533,6 @@
           <div class="body">
             <div class="hint" style="margin-bottom:6px">用途ごとに、選べるモデルと既定を決めます（表示は選択中のクラウド AI・Ollama・Codex のみ）。</div>
             <div id="model-catalog-table"><!-- JS が描画 --></div>
-              <div style="margin-top:14px">
-                <div class="vlm-l" style="margin-bottom:6px">コンテキスト上限の補足（API モデル・任意）</div>
-                <div class="hint" style="margin-bottom:8px">既定は未登録です。コンテキスト上限はプロバイダから取得、または組み込み情報で判定します。
-                  判定できないモデルは、提供元の仕様値を補足できます。手動登録値を優先します。Codex は対象外です。</div>
-                <div class="hint" style="margin-bottom:8px">判定できない場合は<a href="#agentic-budget-card">調査の情報量設定</a>を使います。そこも未設定なら、ツール結果1件は <b>256KB</b>、追加調査1回の累計は <b>4096KB（4MB）</b> です。
-                  これらは調査の制限値で、モデルのコンテキスト上限ではありません。</div>
-                <table class="mc-table" id="agentic-model-windows-table">
-                  <thead><tr><th>プロバイダ</th><th>モデル名</th><th>コンテキスト上限（トークン数）</th><th></th></tr></thead>
-                  <tbody id="agentic-model-windows-rows"></tbody>
-                </table>
-                <button class="btn-ghost" id="agentic-model-windows-add" type="button" style="margin-top:8px">行を追加</button>
-              </div>
             <div class="sec-actions">
               <button class="btn-ghost" data-reset-tab="models" type="button">このタブを既定に戻す</button>
               <span class="tres muted" id="tab-reset-res-models"></span>

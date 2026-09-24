@@ -127,6 +127,23 @@ def test_resolve_path_rejects_embedded_nul(tmp_path):
     assert world_graph.resolve_path(wd, "4期更改/03_開発/ORDER-MAIN.cbl\x00.txt") is None
 
 
+def test_valid_rel_parts_shared_by_ext_api_doc_path_segments(tmp_path):
+    """`world_graph.valid_rel_parts`（`resolve_path` の文字列検証部分）は
+    `ext_api._doc_path_segments`（原本DL配信側のセグメント検証）と**同一の関数**——内容判定
+    （`resolve_path` 経由）と配信で正規化規則が食い違うと、判定側が拒否したパスを配信側だけが
+    実ファイルとして開いてしまう（秘匿ファイル漏洩の実害があった穴）。"""
+    from sherpa.ext_api import _doc_path_segments
+    from sherpa.ingest.world_graph import valid_rel_parts
+    assert _doc_path_segments.__module__ != valid_rel_parts.__module__   # 別モジュールだが
+    rejected = ["", "/etc/passwd", "a\\b", "a\x00b", "..", "../x", "a/../b",
+               ".", "./a", "a/./b", "a/.", "a//b"]
+    for rel in rejected:
+        assert valid_rel_parts(rel) is None, rel
+        assert _doc_path_segments(rel) is None, rel
+    assert valid_rel_parts("a/b/c.txt") == ("a", "b", "c.txt")
+    assert _doc_path_segments("a/b/c.txt") == ("a", "b", "c.txt")
+
+
 def test_resolve_path_does_not_walk_world_tree(tmp_path, monkeypatch):
     """`scope_infer.safe_files`（world 全体の走査）を一切呼ばずに解決できることを固定する
     （DOC-1＝root/rel の直接結合＋実在確認へ置換・全木走査は撤去）。"""

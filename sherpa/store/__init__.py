@@ -289,6 +289,17 @@ from .feedback import (
     get_feedback_by_message_ids_for_user,
     upsert_message_feedback,
 )  # noqa: F401
+# turn_metrics（集計専用の細い写像表・docs/proposals/2026-09-23-利用統計の刷新.md §3.1/§4）
+# への書込・移し替え・補完。facade 維持のため公開関数を re-export する（新規コードは
+# `from sherpa.store.turn_metrics import ...` の直 import を推奨・モジュール docstring 参照）。
+from .turn_metrics import (
+    MAPPING_VERSION,
+    backfill_all,
+    ensure_rows,
+    metrics_from_answer,
+    upsert,
+    upsert_best_effort,
+)  # noqa: F401
 from .shares import (
     _REDACTED_TEXT,
     _SANITIZED_TITLE,

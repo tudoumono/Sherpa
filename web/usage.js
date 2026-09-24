@@ -533,8 +533,14 @@ function renderLimits(limits) {
     <td class="num">${cnt(r.total_budget_hit_turns)}</td>
     <td class="num">${cnt(r.context_compactions_turns, r.context_compactions_total)}</td>
     <td class="num">${cnt(r.synthesis_truncated_turns)}</td>
+    <td class="num">${cnt(r.depth_escalated_turns)}</td>
     <td class="num">${cnt(r.search_truncated_turns, r.search_truncated_total)}</td>
     <td class="num">${cnt(r.auto_continues_turns, r.auto_continues_total)}</td>
+    <td class="num">${cnt(r.duplicate_tool_call_turns, r.duplicate_tool_call_total)}</td>
+    <td class="num">${cnt(r.tool_calls_exhausted_turns)}</td>
+    <td class="num">${cnt(r.backend_unavailable_fulltext_turns)}</td>
+    <td class="num">${cnt(r.backend_unavailable_graph_turns)}</td>
+    <td class="num">${cnt(r.graph_reingest_required_turns)}</td>
   </tr>`).join('');
 }
 
@@ -542,14 +548,21 @@ const REVIEW_LABELS = {
   confirmed: '確定', inferred: '推定', unknown: '不明',
   sufficient: '十分', insufficient: '根拠不足', undecidable: '判定できず',
   not_found_in_scope: '範囲内で見つからない', unexplored: '未調査', conflict: '食い違い', budget: '調査の上限', unreadable: '読み取り不可',
+  source_missing: 'ソース未確認', spec_missing: '設計書未確認', definition_missing: '定義未確認',
+  log_missing: 'ログ・設定未確認', callgraph_missing: '呼出関係未確認',
   rerun: '次の見直しへ', rounds_exhausted: '見直しの回数に到達',
   user_stop: '利用者が停止', ask_user: '利用者に確認', review_failed: '確認に失敗', failed: '失敗',
   tool_result_clipped: '1件の読取量を制限', total_budget_hit: '累計の読取量に到達',
   context_compactions: '会話履歴を整理', synthesis_truncated: '回答用の情報量を制限',
+  depth_escalated: '自動で深く調べた',
   search_truncated: '検索件数を制限', auto_continues: '続きを自動で実行',
+  duplicate_tool_call: '同じ条件の再検索を省略',
+  tool_calls_exhausted: '調査の回数上限に到達',
+  backend_unavailable_fulltext: '全文検索が使えなかった', backend_unavailable_graph: 'グラフが使えなかった',
+  graph_reingest_required: 'グラフは再取り込み待ち',
 };
-const REVIEW_DEPTH_LABELS = { standard: '標準', deep: '深く', max: '最大' };
-const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-standard': '見直しなし', 'depth2-deep': '見直しあり（深く）', 'depth2-max': '見直しあり（最大）' };
+const REVIEW_DEPTH_LABELS = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
+const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-quick': '見直しなし', 'depth2-standard': '標準（見直し 2 回）', 'depth2-deep': '深く（4 回）', 'depth2-max': '最大' };
 function reviewCounts(counts) {
   const totals = new Map();
   Object.entries(counts).forEach(([key, count]) => {

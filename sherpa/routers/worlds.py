@@ -343,6 +343,16 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     if not isinstance(rep, dict):
         rep = corpus_docs.empty_scan_report()
         counts_as_of = None
+    elif corpus_docs.scan_report_missing_fields(rep):
+        # `scan_report()` へフィールドを追加する前に保存された旧形式の集計は、追加後のキーを
+        # 持たない——response_model の必須フィールドのため、欠落したまま返すと 500 になる。
+        # 欠けているキーだけ `empty_scan_report()` の既定値（0/空）で補うが、`counts_as_of` は
+        # `None`（未集計）にする——補った 0/空を古い集計時刻と一緒に返すと「この時刻時点で実測
+        # 0件だった」と見え、本当に未集計であることと区別できない。無変更同期側
+        # （`ingest.worker._sync_impl` の `needs_scan_report_backfill`）が同じ欠落を検知して
+        # scan_report を再実行すれば、次回はここを通らず実測の時刻付きで返る。
+        rep = {**corpus_docs.empty_scan_report(), **rep}
+        counts_as_of = None
     last = store.get_latest_run_summary(wid)
     snap = (last or {}).get("extraction_snapshot")
     snap = snap if isinstance(snap, dict) else {}    # JSONB は dict 以外もありうる（500 にしない）

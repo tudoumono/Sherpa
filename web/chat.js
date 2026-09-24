@@ -27,7 +27,7 @@ import {
 // history-search.js 内で完結し、history.js には触れない＝束縛する名前は無い）。
 import './chat/history-search.js';
 import { send, sendOrStop, _closeOtherTurns } from './chat/stream.js';
-import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel } from './chat/scope.js';
+import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel, setKb } from './chat/scope.js';
 import { setLayer, setDepthProfile, setTools, setToolsAvailability, resetInquiryForNewConversation, refreshInquirySummary, toolsExplicitForRestore } from './chat/inquiry.js';
 import { applyCachedBrain, loadConfig, exportMessages } from './chat/menus.js';
 
@@ -457,6 +457,12 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
   const names = d.worlds || [];
   const lbls = d.labels || {};
   S.verLabels = {}; names.forEach((n) => { S.verLabels[n] = lbls[n] || n; });
+  // 資料フォルダが1つも登録されていない環境では、資料参照を送っても 404（世界が無い）に
+  // なるだけ＝既定ON（決定2026-09-19）のままだと素の雑談まで壊れる。未登録なら明示OFFへ倒す
+  // （Codex構成の kbLocked は setKb 自身が常にONへ上書きするため、ここでは分岐しない）。
+  // S.kbForcedOff も立てる——newConversation() が「未確認（読込前/失敗）」と「空で確定」を
+  // 区別して、後者のときだけ新規会話も OFF のままにするため（RV是正・決定2026-09-19）。
+  if (names.length === 0) { S.kbForcedOff = true; setKb(false); }
   const sel = $('version');
   if (sel) {
     sel.innerHTML = names.length
@@ -484,7 +490,7 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
         S.depthProfile = sc.depth_profile || 'standard';   // SC-6c: 同じ後追い経路で調べる深さも復元する
         S.webSearch = !!sc.web_search;   // WEB-1: 同じ後追い経路で Web 検索希望も復元する
         S.tools = sc.tools || { grep: true, fulltext: true, graph: true };   // SC-6e: 同じ後追い経路で検索経路トグルも復元する
-        S.toolsExplicit = toolsExplicitForRestore(S.tools);   // 復元値が非既定なら明示状態にする（scope.js と同じ規則）
+        S.toolsExplicit = toolsExplicitForRestore(S.tools, sc.tools_explicit);   // 触った軸だけ明示扱い（scope.js と同じ規則）
         refreshInquirySummary();
       }
       S.pendingConvWorld = null;                             // 選択肢に無い（削除済み）場合もここで諦める

@@ -2114,13 +2114,19 @@ def _content_type_for(ext: str, fd: int, size: int) -> str:
 
 
 def _doc_path_segments(path: str) -> tuple | None:
-    """`path`（query）→ 検証済み POSIX セグメント列（`..`/絶対/空要素/バックスラッシュ/NUL は None）。"""
-    if path.startswith("/") or "\\" in path or "\x00" in path:
-        return None
-    parts = tuple(path.split("/"))
-    if not parts or ".." in parts or "" in parts:
-        return None
-    return parts
+    """`path`（query）→ 検証済み POSIX セグメント列。
+
+    `corpus_docs.status_document_reachable`（内容判定・`world_graph.resolve_path` 経由）と
+    **同じ**正規化（`world_graph.valid_rel_parts`＝絶対パス・`\\`・NUL・空/`.`/`..` 要素の拒否）を
+    共有する——ここだけ別の検証条件を持つと、内容判定側が拒否したパスを配信側だけが実ファイルとして
+    開いてしまう（秘匿ファイル・未対応種別の漏洩経路になる）。ただしこの2関数の一致だけでは
+    十分でない（判定側の `resolve_path` と配信側の `open_file_nofollow_walk` は実効的なパス長
+    上限が異なるため、文字列としては同じでも `os.lstat` だけが失敗しうる）——だから配信可否は
+    `status_document_reachable` の `True` 確定だけで判定し、判定不能（`None`）は拒否する
+    （fail-closed・`ext_doc` 参照）。
+    """
+    from .ingest.world_graph import valid_rel_parts
+    return valid_rel_parts(path)
 
 
 @router.get("/doc", response_class=StreamingResponse, responses=_DOC_RESPONSES)
@@ -2143,7 +2149,15 @@ def ext_doc(request: Request, world: str = Query(..., min_length=1, max_length=1
         audit.detail.update({"world": world, "path": path})
         _enforce_world_scope(request, key, world)   # scope 外は世界の存在有無を明かさず先に 403
         ext = Path(path).suffix.lower()
-        if corpus_docs.status_document_doctype(path, world) is None:
+        # `allow_content_sniff=True`: 単発の doc_id 解決（manifest 件数分のホットループではない）
+        # ため、軽量テキスト枠の第2段（未登録拡張子・拡張子なし）も内容を読んで判定する——既定
+        # False のままだと grep/read_around では読める文書を 404 にしてしまう。`status_document_
+        # reachable` を使う（`status_document_doctype` ではない）——fail-closed: `True`（積極的に
+        # 「読める」と確定）のときだけ配信し、`None`（内容判定に必要な読み取り自体が失敗＝判定不能。
+        # 例: パスが長すぎて `lstat` が失敗する）を「対象外ではない」と丸めない。判定不能を通すと、
+        # 配信側の open 経路（dir_fd 相対で1段ずつ open）は判定側と異なる長さ制約しか受けないため、
+        # 内容判定に失敗したファイルがそのまま配信されてしまう。
+        if corpus_docs.status_document_reachable(path, world, allow_content_sniff=True) is not True:
             raise HTTPException(404, "対応していない種別、または文書が見つかりません")
         parts = _doc_path_segments(path)
         if parts is None:

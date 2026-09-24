@@ -1,21 +1,25 @@
 """軽量テキスト枠の種別判定（未登録拡張子のテキストファイル→コード/資料への振り分け）。
 
-ユーザー裁定 2026-09-02: 未登録拡張子のテキストファイルも台帳・出典・コマンド検索(grep/glob)まで
-通す（ベクトル・グラフ・LLM は一切通さない＝取り込みコスト増ゼロ）。判定は
+未登録拡張子のテキストファイルも台帳・出典・grep・ES全文・read_around（精読）まで通す
+（ベクトル・グラフ・LLM は一切通さない＝取り込みコスト増ゼロ）。判定は
 `corpus_docs.classify_document()` の「担当なし」経路（既存の言語アナライザ登録簿・Office/画像・
 `.md`/`.txt` のいずれにも該当しない拡張子）に対してのみ適用する——既存の判定は常に優先し、
 ここでは重複させない（本モジュール自身の拡張子集合も既存登録簿と重ならないよう選定する）。
 
-判定は2段構え（**2段の扱いは非対称**）:
+判定は2段構え:
 - 第1段（`classify_ext`）: 固定の拡張子マップ。一般言語＋設定ファイル系はコード側、
-  csv/tsv/rtf/log 等はコード資料側。内容は読まない。**台帳・出典DL・grep/glob・ES全文**まで
-  対象（検索可能集合＝引用可能集合の契約を保つため、通常の文書と同格に扱える）。
+  csv/tsv/rtf/log 等はコード資料側。内容は読まない。
 - 第2段（`sniff_content`）: 第1段で判定できない拡張子（未知拡張子・拡張子なし）だけ、
   先頭数KB（`corpus_docs._read_head` が既に読んでいるものを再利用）からバイナリ／コード／
-  資料を推定する。**迷ったら資料に倒す**（ユーザー裁定）。**台帳・出典DL・glob のみ**——
-  ES全文には含めない（`es_index.py` が拡張子で判別して除外する）。read_around（引用検証・
-  precise read）・`verify_doc_exists`（doctype ベースの確定判定を経由する経路）が拒否する
-  ことと整合させ、「ES で見つかるのに引用検証できない/精読できない」という非対称を避ける。
+  資料を推定する。**迷ったら資料に倒す**（ユーザー裁定）。
+
+両段とも**台帳・出典DL・grep・ES全文・read_around（精読）まで対象**（検索可能集合＝引用可能集合の
+契約・`corpus_docs.classify_document`/`reachable_as_text` の確定判定を grep/read_around/ES 索引が
+共有することで満たす——拡張子の許可リストでは決めない）。`status_document_doctype`/
+`verify_doc_exists`/`manifest_doctype_count`（`allow_content_sniff=False` 経由・ホットパスでの
+追加 I/O を避ける設計）だけは第2段を判定しない——これは「読めるか」とは別のホットパス最適化上の
+制約であり、上の対称性の対象外（`corpus_docs.classify_document` の `allow_content_sniff` 引数
+docstring 参照）。
 
 秘匿ファイル（`.env`/`.pem`/`.ppk`/`.key`・SSH秘密鍵 `id_rsa`系・`credentials`/`.netrc`/
 `.npmrc`/`.git-credentials`）は名前/拡張子で両段とも対象外（`is_sensitive`・小文字化して判定）。

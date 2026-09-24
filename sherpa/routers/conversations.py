@@ -13,7 +13,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from sherpa import store
-from sherpa.deps import _current_user
+from sherpa.deps import _current_user, _delete_codex_sessions_for_conversation
+from sherpa.providers.codex.provider import _conversation_lock
 
 # router に tags を持たせない: 各エンドポイントの `tags=["会話管理"]` と結合されて
 # 二重化してしまう（ルート表 golden 不一致の原因）ため、tags 指定は各デコレータ側のみに残す
@@ -57,10 +58,25 @@ def conversation_delete(cid: int, request: Request):
 
     生きた受領ラッパーがこの会話を参照している場合は soft-delete（自分の一覧からは消えるが
     受領側は引き続き読める）、参照が無ければ物理削除（store.delete_conversation 参照）。
+    どちらの場合も Codex resume セッション実体（`.codex-sessions/{cid}`）は即時削除する
+    （_delete_codex_sessions_for_conversation 参照・soft delete でも削除する理由はそちら側に記載）。
+
+    Codex 実行と同じ会話単位ロック（`CodexProvider._conversation_lock`）を DB 変更の前に
+    非ブロッキングで取る。実行中（取れない）なら DB には一切触れず 409 を返す——取らずに削除すると、
+    実行側がロック取得前に `.codex-sessions/{cid}` を作り直す窓ができ、削除済み会話の孤児
+    ディレクトリが TTL 掃除まで残る（実行側も同じロックを取ってから作成・生存確認する。
+    provider.py::CodexProvider._run_authoring 参照）。
     """
     u = _current_user(request)
-    if not store.delete_conversation(cid, u["uid"]):
-        raise HTTPException(404, "会話が見つかりません")
+    lock = _conversation_lock(cid)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "この会話は調査の実行中のため削除できません。終了してから再度お試しください")
+    try:
+        if not store.delete_conversation(cid, u["uid"]):
+            raise HTTPException(404, "会話が見つかりません")
+        _delete_codex_sessions_for_conversation(u["uid"], cid)
+    finally:
+        lock.release()
     return {"ok": True, "id": cid}
 
 

@@ -222,6 +222,23 @@ def test_verified_empty_input_returns_empty():
     assert C.verified_referenced_docs([], "test") == []
 
 
+def test_verified_includes_reachable_unregistered_ext_excludes_binary_and_sensitive(
+        monkeypatch, tmp_path):
+    """`verified_referenced_docs`（Codex 原本直読の出典化・実 `verify_doc_exists` 経由）は、
+    未登録拡張子でも内容がテキストと判定できる文書を「存在しない」扱いで落とさない——バイナリ・
+    秘匿名は従来どおり落ちる（mock を使わず実 `agentic_search.verify_doc_exists` を通す）。"""
+    from sherpa import worlds
+    root = tmp_path / "world"
+    root.mkdir()
+    (root / "app.zzz").write_text("readable text\n", encoding="utf-8")
+    (root / "blob.bin").write_bytes(b"\x00\x01binary\xff\xfe" * 10)
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+
+    out = C.verified_referenced_docs(["app.zzz", "blob.bin", ".env"], "test-world")
+    assert out == ["app.zzz"]
+
+
 def test_parse_keeps_text_after_the_reference_block():
     """参照ブロックの後ろに本文（注意事項）が続くとき、それを落とさない。"""
     from sherpa.providers.codex.citations import parse_referenced_docs

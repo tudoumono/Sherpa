@@ -38,6 +38,7 @@ import pytest  # noqa: E402
 
 from sherpa import agents as A  # noqa: E402
 from sherpa import chat_service as CS  # noqa: E402
+from sherpa.providers.prompts import _NO_PRESEARCH_HEADLINE  # noqa: E402
 from sherpa import store  # noqa: E402
 from sherpa.agents import Ctx  # noqa: E402
 
@@ -409,8 +410,10 @@ def test_exception_after_config_write_still_cleans_up(tmp_path, monkeypatch):
 
     env = _result_env(_run(prov, ctx))
 
-    assert env["headline"] == "dispatch-headline", (
-        f"config write 直後の例外は決定的回答にフォールバックするはず: {env!r}")
+    # MCP 有効の Codex 経路は presearch を省くため、決定的回答（"dispatch-headline"）ではなく
+    # `_gather` が省いたときの固定文言のまま利用者へ出る。
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
+        f"config write 直後の例外は presearch を省いた固定文言のままのはず: {env!r}")
     calls = _read_argv_log(argv_log)
     assert calls == [], f"config write 直後に例外が起きたら codex exec は一切呼ばないはず: {calls!r}"
 
@@ -500,8 +503,8 @@ def test_symlinked_conversation_session_dir_blocks_codex_entirely(tmp_path, monk
 
     env = _result_env(_run(prov, ctx))
 
-    assert env["headline"] == "dispatch-headline", (
-        "symlink 混入時は Codex を起動せず決定的回答に落ちるはず（MEDIUM-3 未是正）")
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
+        "symlink 混入時は Codex を起動せず presearch を省いた固定文言のままのはず（MEDIUM-3 未是正）")
     calls = _read_argv_log(argv_log)
     assert calls == [], f"symlink 混入時は codex exec を一切呼ばないはず: {calls!r}"
     assert not (evil_target / "config.toml").exists(), "symlink の指す先（外部）に config.toml を書いてしまった"
@@ -523,9 +526,43 @@ def test_symlinked_sessions_root_blocks_codex_entirely(tmp_path, monkeypatch):
 
     env = _result_env(_run(prov, ctx))
 
-    assert env["headline"] == "dispatch-headline"
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE
     calls = _read_argv_log(argv_log)
     assert calls == []
+
+
+def test_deleted_conversation_blocks_codex_and_releases_lock(tmp_path, monkeypatch):
+    """会話が削除済み（`store.owns_conversation` が False）なら、ロック取得後の生存確認
+    （provider.py::_run_authoring・削除との競合防止）で Codex を一切起動しない
+    ——symlink 混入と同じ fail-closed 扱い（決定的回答にフォールバック）で、かつ
+    `.codex-sessions/{cid}` を作り直さず、会話ロックは正しく解放される。"""
+    from sherpa import store
+    from sherpa.providers.codex.provider import _conversation_lock
+
+    _bin_dir, argv_log = _setup(tmp_path, monkeypatch, users_dirname="users_conv_gone")
+    monkeypatch.setattr(store, "owns_conversation", lambda uid, cid: False)
+
+    users_dir = Path(os.environ["SHERPA_USERS_DIR"]).resolve()
+    uid = "r1b-conv-gone"
+    cid = 20999
+    prov = A.CodexProvider()
+    ctx = _ctx(uid=uid, conversation_id=cid, codex_session_id=None)
+
+    env = _result_env(_run(prov, ctx))
+
+    # (a) 偽 codex を一度も呼ばない。
+    calls = _read_argv_log(argv_log)
+    assert calls == [], f"会話が削除済みなのに codex exec を呼んでいる: {calls!r}"
+    # (b) .codex-sessions/{cid} を作り直さない（削除済み会話の孤児ディレクトリ再発防止）。
+    session_dir = users_dir / uid / "workspace" / ".codex-sessions" / str(cid)
+    assert not session_dir.exists(), "削除済み会話の .codex-sessions/{cid} を作り直してしまった"
+    # (c) 会話ロックは解放されている（漏れると同一会話が恒久的に拒否され続ける）。
+    lock = _conversation_lock(cid)
+    assert lock.acquire(blocking=False), "run() 終了後も会話ロックが解放されていない"
+    lock.release()
+    # (d) 既存の fail-closed 経路（symlink 拒否・上の2テスト）と同じ形＝presearch を省いた固定文言。
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
+        "会話が削除済みの時は、symlink 拒否等と同じ固定文言のままのはず")
 
 
 def test_resume_retry_skipped_when_stopped_mid_attempt(tmp_path, monkeypatch):

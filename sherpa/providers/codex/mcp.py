@@ -244,10 +244,17 @@ def _codex_ask_capture(item: dict, ask_disabled: bool) -> dict | None:
     return _codex_ask_question(item)
 
 
-def _mcp_config_args(world: str, scope_paths, ask_disabled: bool = False, layer=None) -> list:
-    """codex exec に sherpa MCP サーバ(stdio)を登録する -c 引数（per-request＝~/.codex 設定を汚さない）。"""
+def _mcp_config_args(world: str, scope_paths, ask_disabled: bool = False, layer=None,
+                     extra_env: dict | None = None) -> list:
+    """codex exec に sherpa MCP サーバ(stdio)を登録する -c 引数（per-request＝~/.codex 設定を汚さない）。
+
+    `extra_env`（省略可）: `_mcp_env` の解決結果に上書きマージする追加 env（呼び出し元＝`provider.py`
+    が親プロセス側で1回だけ解決した値を渡す用途・例: MCP ツール結果の予算）。
+    """
     py = sys.executable or "python3"
     env = _mcp_env(world, scope_paths, ask_disabled, layer=layer)
+    if extra_env:
+        env.update(extra_env)
     env_toml = "{" + ", ".join(f"{k} = {_toml_str(v)}" for k, v in env.items()) + "}"
     # MCP ツール承認は approval_policy と別系統（codex 0.139）。default_tools_approval_mode="approve" で
     # **sandbox(-s read-only) を保ったまま**自動承認（非対話 exec は回答者が居らず prompt だと cancel になる）。

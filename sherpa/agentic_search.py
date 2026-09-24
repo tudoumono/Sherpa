@@ -140,14 +140,11 @@ _OFFICE_MD = {".docx", ".xlsx", ".pptx", ".pdf", ".doc", ".xls", ".ppt",
 # 解決規約は新形式と同じ **原本 rel + ".md"**（office_md.build_derived が出力名を原本 rel に揃えている）ので
 # ここでの分岐は不要＝ _OFFICE_MD に加えるだけで grep_search（derived md/ を直接見る）と read_around が一致する
 # （追加しないと grep はヒットするが read_around が拒否＝精読不可という非対称が生じる）。
-# read_around で読める本文種別だけ（.env 等の秘匿ファイルを LLM に読ませない・RV BLOCKER）。
-# ソース原文（コード）分はアナライザ登録簿が単一の真実源（§2.4）。
-# 軽量テキスト枠（`ingest.text_kind`）の第1段拡張子マップ（CODE_EXT/DOCUMENT_EXT）も対象に含める
-# ——`.env`/`.key`（`text_kind.SENSITIVE_EXT`／ドットファイル名判定）は元々この2集合に含まれず、
-# `classify_document()`（下の `_safe_doc_path`）が最終判定でも秘匿ファイル・意味層内部制御ファイル
-# （`worlds.is_semantic_control_path`）を対象外へ倒すため、ここに加えても RV BLOCKER の意図は
-# 破らない。grep_search（`grep_tool._TEXT_EXT` も同じ集合を追加済み）と read_around の対称性を保つ
-# （追加しないと「grep はヒットするが read_around が拒否」という同型の非対称が生じる）。
+# read_around が読める本文種別の代表的な集合（.env 等の秘匿ファイルは含まない・RV BLOCKER の
+# 意図は `text_kind.is_sensitive`／`classify_document` の確定判定が担う）。`_safe_doc_path` 自身は
+# もう拡張子の事前フィルタとしてこの集合を使わない（未登録拡張子・拡張子なしも
+# `classify_document`／`reachable_as_text` の確定判定に委ねる）——本集合は `_FILE_HEAD_KINDS`
+# の材料、および「登録済み・既知の本文種別」をテスト等から参照する用途に残す。
 _READABLE_EXT = ({".md", ".markdown", ".txt"} | _analyzer_registry.registered_extensions() | _OFFICE_MD
                 | text_kind.CODE_EXT | text_kind.DOCUMENT_EXT)
 
@@ -235,36 +232,17 @@ def _clamped_setting_int(raw, lo: int, hi: int) -> int | None:
     return iv if lo <= iv <= hi else None
 
 
-def _window_derived_min(base: int, system_settings: dict | None, provider: str | None,
-                        model: str | None, ollama_base_url: str | None, anthropic_client) -> int:
-    """BUDGET-2（§3.4・min() 方式）: `base`（BUDGET-1 の解決値）と「選択中モデルの
-    窓由来の上限」の小さい方を返す。`provider`/`model` 省略（既定 None）時は窓連動を一切行わず
-    `base` をそのまま返す＝既存呼び出し元（`provider`/`model` を渡さない）は byte-identical。
-    窓が不明（登録値/API/シードのどれにも無い）なときも同様に `base` のまま
-    （BUDGET-2 §3.4「限界に当たったら黙らない」は満たすが値自体は後退しない＝退行にならない）。
-    大窓が判明しても `base` を超えて増やすことはしない（min() の対称性がそのまま「支出の自動拡大
-    はしない」を保証する）。"""
-    if provider is None or model is None:
-        return base
-    from . import model_windows
-    tokens, _source = model_windows.resolve_window_tokens(
-        provider, model, system_settings=system_settings,
-        ollama_base_url=ollama_base_url, anthropic_client=anthropic_client)
-    if tokens is None:
-        return base
-    return min(base, model_windows.derive_window_bytes(tokens))
-
-
 def effective_tool_result_max_bytes(system_settings: dict | None = None, *, provider: str | None = None,
                                     model: str | None = None, ollama_base_url: str | None = None,
                                     anthropic_client=None) -> int:
-    """ツール結果1件あたりのバイト予算の実効値（system_settings > コード既定・BUDGET-1・
-    §3.4）。`system_settings` 省略時は `store.get_system_settings()` を呼ぶ（読めない/未設定は
+    """ツール結果1件あたりのバイト予算の実効値（system_settings > コード既定・BUDGET-1）。
+    `system_settings` 省略時は `store.get_system_settings()` を呼ぶ（読めない/未設定は
     コード既定 `TOOL_RESULT_MAX_BYTES` へ倒す・fail-safe）。
 
-    `provider`/`model`/`ollama_base_url`/`anthropic_client`（すべて省略可・BUDGET-2・§3.4）:
-    渡すと、上の解決値と「窓由来の上限」の min() を最終的な実効値にする（`_window_derived_min`
-    docstring 参照）。省略時（既定）は BUDGET-1 のみの結果＝byte-identical。"""
+    `provider`/`model`/`ollama_base_url`/`anthropic_client` は呼び出し元（`mcp_server.py`・
+    `providers/codex/provider.py`・本モジュールの `openai_style`/`anthropic_style`/`gemini`）との
+    互換のため引数として残すが、値の解決には使わない——モデルの窓由来の上限との min()（旧
+    BUDGET-2）は撤去した（利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）。"""
     sysset = system_settings
     if sysset is None:
         try:
@@ -273,8 +251,7 @@ def effective_tool_result_max_bytes(system_settings: dict | None = None, *, prov
         except Exception:
             sysset = {}
     v = _clamped_setting_int(sysset.get("agentic_budget_per_result"), 1024, 8 * 1024 * 1024)
-    base = v if v is not None else TOOL_RESULT_MAX_BYTES
-    return _window_derived_min(base, sysset, provider, model, ollama_base_url, anthropic_client)
+    return v if v is not None else TOOL_RESULT_MAX_BYTES
 
 
 def effective_tool_result_max_total_bytes(system_settings: dict | None = None, *,
@@ -282,7 +259,7 @@ def effective_tool_result_max_total_bytes(system_settings: dict | None = None, *
                                           ollama_base_url: str | None = None,
                                           anthropic_client=None) -> int:
     """1 run 累計のツール結果バイト予算の実効値（`effective_tool_result_max_bytes` と同型・
-    BUDGET-2 の追加引数も同じ意味）。"""
+    `provider`/`model`/`ollama_base_url`/`anthropic_client` も同じく互換のためだけの引数）。"""
     sysset = system_settings
     if sysset is None:
         try:
@@ -291,8 +268,7 @@ def effective_tool_result_max_total_bytes(system_settings: dict | None = None, *
         except Exception:
             sysset = {}
     v = _clamped_setting_int(sysset.get("agentic_budget_total"), 4096, 64 * 1024 * 1024)
-    base = v if v is not None else TOOL_RESULT_MAX_TOTAL_BYTES
-    return _window_derived_min(base, sysset, provider, model, ollama_base_url, anthropic_client)
+    return v if v is not None else TOOL_RESULT_MAX_TOTAL_BYTES
 
 
 def resolve_tool_result_budgets(system_settings: dict | None = None, *, provider: str | None = None,
@@ -305,15 +281,11 @@ def resolve_tool_result_budgets(system_settings: dict | None = None, *, provider
     省略時は内部で1回だけ取得し、2つの解決に使い回す（`get_system_settings()` は短TTLキャッシュ付き
     のため、省略しても DB を都度叩くわけではない）。
 
-    `provider`/`model`（省略可・既定 None＝BUDGET-1 のみ・BUDGET-2・§3.4）: その run の
-    メイン頭脳（`openai_style` の `ollama`/`model`・`anthropic_style`/`gemini` の `model`）を渡すと、
-    実効予算を「BUDGET-1 の解決値」と「窓由来の上限（選択中モデルの実コンテキスト窓から導く・
-    min() 方式）」の小さい方に絞る（小窓モデルへの切替で自動的に縮む・窓が不明/大きい場合は
-    BUDGET-1 の値から自動では増えない）。`ollama_base_url`（provider="ollama" のときのみ意味を
-    持つ・`model_windows.derive_ollama_base_url` 参照）・`anthropic_client`（`.models.retrieve()`
-    を持つ SDK クライアント）はプロバイダAPI照会用（`sherpa/model_windows.py::resolve_window_tokens`
-    参照・失敗/未提供は次の解決段へ fail-safe）。サブ頭脳（`_sub_agentic_loop`）の個別対応は将来
-    スライス——現状はメイン頭脳の呼び出し元だけがこれらを渡す。"""
+    `provider`/`model`/`ollama_base_url`/`anthropic_client`（省略可・既定 None）は
+    `effective_tool_result_max_bytes`/`effective_tool_result_max_total_bytes` への配線用の
+    引数——値の解決には使わない（モデルの窓由来の上限との min()＝旧 BUDGET-2 は撤去済み・
+    利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）。呼び出し元（`openai_style`/
+    `anthropic_style`/`gemini`）が現在のモデルをそのまま渡し続けているのは互換のためだけ。"""
     if system_settings is None:
         try:
             from . import store
@@ -349,8 +321,14 @@ _TRUNCATED_DOCS_MAX = 20
 # 許可外ツール拒否結果に埋める（モデル生成の）ツール名の上限バイト数。
 # 拒否理由がどのツール名かをモデルへ伝える最小限の情報量で十分＝短い固定長で足りる。
 _REJECTED_TOOL_NAME_MAX_BYTES = 32
-# 親返し（L4c・§3.3/§3.4）: es_search のヒットを doc_id で束ね、予算内なら rag.md 全文(P3)／
-# 領域(P2)を返す。常時 ON（グローバルな系統切替トグル
+# ripgrep_search/es_search: ヒット単位のバイト上限の下限（`tool_result_max_bytes` をヒット数で
+# 均等割りした値がこれを下回ってもここまでは残す）。日本語で約170文字＝見出し＋冒頭数行が残り、
+# 精読（read_around/read_doc）すべきかを判断できる最小限の量。母集団を広く返す設計（本モジュール
+# docstring 参照）では1ヒットあたりの本文量こそが文脈枠を圧迫する（grep の MD 該当節丸ごと・
+# ソース前後行が実測で数KB〜という報告）ため、件数ではなく本文量をヒット単位で頭打ちにする。
+_HIT_TEXT_MIN_BYTES = 512
+# 親返し（L4c・§3.3/§3.4・調査側）: es_search のヒットを doc_id で束ね、予算内なら rag.md の
+# 領域(P2)を返す（全文(P3)段は無い・2026-09-21）。常時 ON（グローバルな系統切替トグル
 # `SHERPA_ES_PARENT_RETURN` は撤去済み・復活させない）。
 # P2（領域）の対象チャンク集合を ES から引く際の1クエリあたりの取得上限（`es_index.
 # chunk_ids_for_parent` の `limit`）。region はどのみち byte_cap（予算）で頭打ちになるため、
@@ -580,10 +558,10 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
     トラバーサル（`..`/絶対/空セグメント/バックスラッシュ/NUL）拒否＋**本文種別のみ**＋
     解決後に許可ルート（Office=派生MD root／その他=world root）配下に閉じることを realpath で確認（symlink 脱出も拒否）。
 
-    `_READABLE_EXT` は高速な事前フィルタ（`doc_kinds`/`grep_tool._TEXT_EXT` と同型）——最終判定
-    ではない。登録拡張子（`_analyzer_registry.registered_extensions()` 由来）は accepts() 全滅
-    （未対応）や読み取り不可でも拡張子だけでは通さず、Office/画像を除く本文種別は
-    `corpus_docs.classify_document` で最終確定する（grep/ES/list_docs と同じ契約・§7 裁定10）。
+    拡張子の事前フィルタは持たない——Office/画像（`_OFFICE_MD`）だけを別解決（派生MD root）へ
+    分岐し、それ以外は登録拡張子か未登録拡張子（軽量テキスト枠の第2段・拡張子なし含む）かを問わず
+    `corpus_docs.classify_document`（`_classify_verdict_reachable`）で最終確定する（grep/ES/
+    list_docs と同じ契約・§7 裁定10・拡張子の許可リストは安全/到達可否の判断根拠にしない）。
     Office/画像（`_OFFICE_MD`）は既存の資料種別として固定の集合のため対象外——実在確認（下の
     `rp.is_file()`）だけで十分（この集合自体が「対応済みの資料種別」を表す・classify_document は
     Office/画像の拡張子分類を持たないため呼んでも判定できない）。
@@ -614,8 +592,6 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
     if ".." in parts or "" in parts:
         return None
     ext = Path(doc_id).suffix.lower()
-    if ext not in _READABLE_EXT:
-        return None
     if importance.is_importance_control_path(doc_id):   # 重要度設定ファイル自体は精読対象外（§5）
         return None
     if text_kind.is_sensitive(Path(doc_id).name, ext):
@@ -656,7 +632,7 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
         from . import corpus_docs
         verdict = corpus_docs.classify_document(
             doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size))
-        if verdict["kind"] == "unreadable" or (verdict["kind"] != "code" and verdict.get("doctype") is None):
+        if not corpus_docs._classify_verdict_reachable(verdict):
             return None
         is_code = verdict["kind"] == "code"
     if layer is not None and not layer_mod.in_layer_code(is_code, layer):
@@ -672,26 +648,36 @@ _XLSX_KINDS = frozenset({".xlsx"})
 _DOCX_KINDS = frozenset({".docx"})
 _PPTX_KINDS = frozenset({".pptx"})
 _PDF_KINDS = frozenset({".pdf"})
-# file_head はテキスト・コードのみ（Office/PDF/画像は専用ツールに任せる・_READABLE_EXT から
-# それらを引いた集合＝`grep_search`/`read_around` が読める本文種別と同じ土台）。
+# file_head はテキスト・コードのみ（Office/PDF/画像は専用ツールに任せる）。`_safe_original_path`
+# は `kinds` がこの定数と同じオブジェクトかどうかで file_head 呼び出しを見分け（他の4ツールは
+# `_XLSX_KINDS` 等の単一拡張子集合）、拡張子の閉じた許可リストとしては使わない——実際に読めるかは
+# `reachable_as_text` に委ねる（下記参照）。値そのものは後方互換のため維持する（テストの
+# メンバーシップ参照）。
 _FILE_HEAD_KINDS = frozenset(_READABLE_EXT - _OFFICE_MD)
 
 
 def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozenset, layer=None):
     """原本読取ツール（xlsx/docx/pptx/pdf/file_head）専用の doc_id→`(root, doc_id, 実パス, stat)` 解決。
 
-    `_safe_doc_path` と同じ検査項目（トラバーサル拒否・拡張子の事前フィルタ・重要度制御ファイル
-    除外・秘匿名除外・realpath 封じ込め・symlink 拒否・regular file）を共有するが、Office/PDF に
-    ついても**派生 MD ではなく world root の原本**へ解決する——`_safe_doc_path` は Office/PDF を
-    常に派生 MD 側へ解決するため兼用できない（原本読取ツールの目的そのものが原本を読むこと）。
+    `_safe_doc_path` と同じ検査項目（トラバーサル拒否・重要度制御ファイル除外・秘匿名除外・
+    realpath 封じ込め・symlink 拒否・regular file）を共有するが、Office/PDF についても
+    **派生 MD ではなく world root の原本**へ解決する——`_safe_doc_path` は Office/PDF を常に
+    派生 MD 側へ解決するため兼用できない（原本読取ツールの目的そのものが原本を読むこと）。
 
-    実在・文書種別・scope の確認は `verify_doc_exists`（台帳と同じ確定判定）をそのまま再利用する
-    （二重実装しない）。`kinds`（必須・キーワード専用）はこのツールが扱える拡張子集合。`layer`
-    （省略可）は file_head 専用——指定時は `classify_document` 確定判定（`layer_mod.in_layer_code`）
-    で層一致も見る（Office/PDF の5ツールは呼び出し側 `run_tool` が層で分岐済み＝常に docs 側扱い
-    のため `layer` を渡さない）。
+    `kinds`（必須・キーワード専用）はこのツールが扱える拡張子集合。Office/PDF の4ツール
+    （`_XLSX_KINDS`/`_DOCX_KINDS`/`_PPTX_KINDS`/`_PDF_KINDS`＝単一拡張子）は拡張子の一致を見た
+    上で、実在・文書種別・scope の確認を `verify_doc_exists`（台帳と同じ確定判定・拡張子だけで
+    doctype が決まるため内容は読まない）に委ねる。file_head（`kinds is _FILE_HEAD_KINDS`）は
+    Office/PDF/画像（専用ツールがある）だけを拒み、それ以外は拡張子を問わず
+    `corpus_docs.reachable_as_text`（`classify_document` 経由・軽量テキスト枠の第2段・
+    未登録拡張子も含む本文readability の確定判定）で可否を決める——`verify_doc_exists` は
+    ホットパス最適化のため内容 sniff をしない（`status_document_doctype` の
+    `allow_content_sniff=False`）ため、第2段の文書を「存在しない」と誤判定してしまい使えない。
+    `layer`（省略可）は file_head 専用——指定時は同じ確定判定（`layer_mod.in_layer_code`）で
+    層一致も見る（Office/PDF の4ツールは呼び出し側 `run_tool` が層で分岐済み＝常に docs 側扱いの
+    ため `layer` を渡さない）。
 
-    無効/範囲外/拡張子不一致/秘匿名/重要度制御/traversal/symlink/非regular/未実在/doctype不明は
+    無効/範囲外/拡張子不一致/秘匿名/重要度制御/traversal/symlink/非regular/未実在/読み取り不可は
     すべて `None`。
 
     戻り値の4つ目 `stat` は検査完了直後にこの関数自身が取った `rp.stat()`——呼び出し元
@@ -705,7 +691,11 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
     if ".." in parts or "" in parts:
         return None
     ext = Path(doc_id).suffix.lower()
-    if ext not in kinds:
+    is_file_head = kinds is _FILE_HEAD_KINDS
+    if is_file_head:
+        if ext in _OFFICE_MD:            # 専用ツール（xlsx/docx/pptx/pdf）が扱う——file_head は対象外
+            return None
+    elif ext not in kinds:
         return None
     if importance.is_importance_control_path(doc_id):
         return None
@@ -730,14 +720,17 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
             return None
     except OSError:
         return None
-    if not verify_doc_exists(doc_id, world, scope_paths):   # 実在・文書種別・scope の確定判定を共有
-        return None
-    if layer is not None:
-        from . import corpus_docs
+    from . import corpus_docs
+    if is_file_head:
         verdict = corpus_docs.classify_document(
             doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size))
+        if not corpus_docs._classify_verdict_reachable(verdict):
+            return None
         is_code = verdict["kind"] == "code"
-        if not layer_mod.in_layer_code(is_code, layer):
+        if layer is not None and not layer_mod.in_layer_code(is_code, layer):
+            return None
+    else:
+        if not verify_doc_exists(doc_id, world, scope_paths):   # 実在・文書種別・scope の確定判定を共有
             return None
     try:
         st = rp.stat()
@@ -765,26 +758,26 @@ def _open_verified_original(root: Path, doc_id: str, expected_st) -> tuple:
     """
     rel_parts = Path(doc_id).parts
     if not rel_parts:
-        return None, {"error": "読み取りに失敗しました"}
+        return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     try:
         fd = _open_file_nofollow_walk(root, rel_parts)
     except OSError:
-        return None, {"error": "読み取りに失敗しました"}
+        return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     try:
         post = os.fstat(fd)
         if not stat.S_ISREG(post.st_mode):
             os.close(fd)
-            return None, {"error": "読み取りに失敗しました"}
+            return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
         if (post.st_dev, post.st_ino) != (expected_st.st_dev, expected_st.st_ino):
             os.close(fd)
-            return None, {"error": "読み取りに失敗しました"}
+            return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
         f = os.fdopen(fd, "rb")
     except OSError:
         try:
             os.close(fd)
         except OSError:
             pass
-        return None, {"error": "読み取りに失敗しました"}
+        return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     return f, None
 
 
@@ -825,7 +818,9 @@ def _open_doc_stream(world: str, doc_id: str, sp, layer) -> tuple:
     try:
         fd = _open_file_nofollow_walk(root, rel_parts)
     except OSError:
-        return None, {"error": "読み取りに失敗しました"}
+        # 例外にならず結果化される読取I/O失敗——固定理由コード（`error_code`）を付け、
+        # 呼び出し元（`run_tool` 境界）が `InvestigationState.backend_failures["read_io"]` へ反映する。
+        return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     fd_owned = True
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -833,7 +828,7 @@ def _open_doc_stream(world: str, doc_id: str, sp, layer) -> tuple:
         f = os.fdopen(fd, "rb")
         fd_owned = False   # 以後の close は呼び出し元（f.close()）が引き受ける
     except OSError:
-        return None, {"error": "読み取りに失敗しました"}
+        return None, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
     finally:
         if fd_owned:
             try:
@@ -857,47 +852,19 @@ def _stream_doc_lines(f):
     return reader, grep_tool._logical_lines(reader, _READ_AROUND_FILE_CAP_BYTES)
 
 
-# ---- 親返し（L4c・§3.3/§3.4）: es_search のヒットを doc_id で束ね、rag.md の全文(P3)／
+# ---- 親返し（L4c・§3.3/§3.4・調査側）: es_search のヒットを doc_id で束ね、rag.md の
 # 領域(P2)を予算内で返す。検索自体は子チャンク単体のまま（BM25/kNN の精度が最も出る粒度）——
-# ここは「返す前」の後処理のみ。全文を読み込んでから切り詰める実装は禁止（§3.3）: サイズは
-# `stat` で先に見て（`_rag_md_size`）、P2 はアンカー単位のストリーミングで対象チャンクだけを
-# 集める（`_rag_md_region_text`）。既存の安全弁（`_open_doc_stream`/`_stream_doc_lines`＝
-# symlink TOCTOU 対策・`_READ_AROUND_FILE_CAP_BYTES`）を再利用し、二重実装しない。
-
-def _rag_md_size(world: str, doc_id: str, sp, layer) -> int | None:
-    """親返しの P3/P2 判定用: `doc_id` の rag.md（RAG 正本）のバイトサイズを `stat` で見る
-    （読む前に見る・§3.3）。rag.md へ解決できない（legacy md へ縮退済み・不在・範囲外）場合は
-    None——呼び出し元はその doc を親返し対象外として chunk tier のまま扱う。
-    """
-    if not scope_mod.in_scope(doc_id, sp):
-        return None
-    resolved = _safe_doc_path(world, doc_id, layer=layer)
-    if resolved is None:
-        return None
-    _root, lexical_rel, rp = resolved
-    if not lexical_rel.endswith(grep_tool._RAG_SUFFIX):
-        return None            # legacy md へ縮退済み＝rag.md 不在＝親返し対象外
-    try:
-        return rp.stat().st_size
-    except OSError:
-        return None
-
-
-def _rag_md_read_full(world: str, doc_id: str, sp, layer) -> str | None:
-    """親返し P3: rag.md 全文を `_open_doc_stream`/`_stream_doc_lines`（既存のストリーミング
-    読み取り・`_READ_AROUND_FILE_CAP_BYTES` で bounded）で読む。呼び出し元は `_rag_md_size` で
-    予算内と確認済みの doc にのみ呼ぶ（P3 は「サイズが既に小さいと分かっている」ケースの
-    全文読みであり、cap は TOCTOU 的なサイズ変化に対する保険）。open/read 失敗は None。
-    """
-    f, err = _open_doc_stream(world, doc_id, sp, layer)
-    if err is not None:
-        return None
-    try:
-        _reader, it = _stream_doc_lines(f)
-        return "\n".join(it)
-    finally:
-        f.close()
-
+# ここは「返す前」の後処理のみ。全文を読み込んでから切り詰める実装は禁止（§3.3）: P2 は
+# アンカー単位のストリーミングで対象チャンクだけを集める（`_rag_md_region_text`）。既存の
+# 安全弁（`_open_doc_stream`/`_stream_doc_lines`＝symlink TOCTOU 対策・`_READ_AROUND_FILE_CAP_BYTES`）
+# を再利用し、二重実装しない。
+#
+# **全文(P3)段は無い**（決定 2026-09-21）: 調査に使う検索は「場所を広く見つける」ためのもので、
+# 文書まるごとを返すのはその設計思想に反する（貪欲法でスコア上位の1文書が予算を食い切り、
+# 実測で累計バイト予算に到達して調査が打ち切られる原因になった）。全文が要ると AI が判断したら
+# `read_doc` で個別に取得する（`_DESC_ES` 系の説明文に明記）。表示側（利用者向け出典カード・
+# `rag_parent_return.py`）は別実装で全文段を持ち続ける（画面に収まる量の抜粋を作る用途で
+# 予算の食い合いが起きないため・§3.3/§3.4 の「適用範囲」は調査側と表示側で別々）。
 
 def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, byte_cap: int) -> str | None:
     """親返し P2: rag.md をアンカー（`<!-- chunk:{chunk_id} -->`・`es_index.rag_md_anchor_chunk_id`）
@@ -959,15 +926,22 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
 
 
 def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_rag: int) -> list:
-    """親返し（§3.3/§3.4）本体: doc_id ごとに束ねた rag チャンクのヒットを P3(全文)/P2(領域)/
-    chunk(子のみ) へ振り分ける。決定的な貪欲法（§3.4 配分規則）——
+    """親返し（§3.3/§3.4・調査側）本体: doc_id ごとに束ねた rag チャンクのヒットを P2(領域)/
+    chunk(子のみ) へ振り分ける（**全文(P3)段は無い**・上の節参照）。決定的な貪欲法（§3.4 配分規則）——
 
     1. まず全 doc の**最低保証**（子チャンク本文の合計＝`baseline`）を `budget_for_rag` から
        確保する（1位の巨大文書が予算を食い尽くして2位以下の子チャンクが消える事故を防ぐ）。
-    2. 残り予算をベストスコア順（同点は doc_id 昇順・決定的）に、rag.md サイズ（stat）が
-       残り予算に入るなら P3 全文／領域なら P2／どちらも無理なら chunk（子チャンクの結合）
-       のまま——という優先順で使う。
+    2. 残り予算をベストスコア順（同点は doc_id 昇順・決定的）に、領域が「共有の残り予算」と
+       「1文書あたりの上限（`per_doc_cap`）」の両方に収まるなら P2（領域）、収まらなければ
+       chunk（子チャンクの結合）のまま——という優先順で使う。`per_doc_cap` はヒット単位の
+       クリップ（`per_hit = tr_max_bytes // used_max_hits`）と同じ規則（総予算を件数で
+       均等割り・下限 `_HIT_TEXT_MIN_BYTES`）で、doc 群の件数（`len(groups)`）を単位にする——
+       これが無いと最上位1文書の巨大な領域が共有の残り予算を独占し、下位の文書が軒並み
+       chunk tier に落ちる（実測で累計バイト予算超過の一因になった事象の再発防止）。
     3. 各 doc は必ず1エントリを返し（消えない）、`tier` を必ず申告する（黙って縮退しない）。
+       `per_doc_cap` に阻まれて領域を取れなかった doc には `text_truncated: true` を立てる
+       （「予算総量が無いから chunk のまま」という既存の縮退とは区別し、read_doc で補える
+       余地があることを明示する）。
 
     `rag_groups`: `{doc_id: [{"chunk_id", "parent_id", "locator", "score", "text"}, ...]}`
     （`text` は redaction 済みの子チャンク本文＝文字数では切らない＝chunk tier の最低保証そのもの）。
@@ -981,39 +955,39 @@ def _resolve_parent_return(world: str, rag_groups: dict, sp, layer, budget_for_r
         groups.append((doc_id, items, baseline, best_score))
     remaining = max(0, budget_for_rag - sum(g[2] for g in groups))
     groups.sort(key=lambda g: (-g[3], g[0]))
+    per_doc_cap = max(_HIT_TEXT_MIN_BYTES, budget_for_rag // max(1, len(groups)))
 
     out = []
     for doc_id, items, baseline, _best_score in groups:
         chunk_ids = [it["chunk_id"] for it in items]
         tier = "chunk"
         text = "\n\n".join(it["text"] for it in items)   # 最低保証（既に redaction/クリップ済み）
-        full_size = _rag_md_size(world, doc_id, sp, layer)
-        if full_size is not None:
-            delta = full_size - baseline
-            if delta <= remaining:
-                full_text = _rag_md_read_full(world, doc_id, sp, layer)
-                if full_text is not None:
-                    text = _redact(full_text)
-                    tier = "full"
-                    remaining -= delta
-        if tier == "chunk":
-            parent_ids = sorted({it["parent_id"] for it in items if it.get("parent_id")})
-            if parent_ids:
-                target_ids = set(es_index.chunk_ids_for_parent(
-                    world, doc_id, parent_ids, limit=_PARENT_RETURN_REGION_CHUNKS_MAX))
-                target_ids |= set(chunk_ids)   # ヒット自身のチャンクは必ず含める（ES 反映漏れの安全弁）
-                region_cap = baseline + remaining
-                region_text = _rag_md_region_text(world, doc_id, sp, layer, target_ids, region_cap)
-                if region_text is not None:
-                    delta_region = len(region_text.encode("utf-8")) - baseline
-                    if delta_region <= remaining:
-                        text = _redact(region_text)
-                        tier = "region"
-                        remaining -= delta_region
+        text_truncated = False
+        parent_ids = sorted({it["parent_id"] for it in items if it.get("parent_id")})
+        if parent_ids:
+            target_ids = set(es_index.chunk_ids_for_parent(
+                world, doc_id, parent_ids, limit=_PARENT_RETURN_REGION_CHUNKS_MAX))
+            target_ids |= set(chunk_ids)   # ヒット自身のチャンクは必ず含める（ES 反映漏れの安全弁）
+            shared_cap = baseline + remaining
+            per_doc_ceiling = max(per_doc_cap, baseline)   # baseline（最低保証）自体は削らない
+            region_cap = min(shared_cap, per_doc_ceiling)
+            region_text = _rag_md_region_text(world, doc_id, sp, layer, target_ids, region_cap)
+            if region_text is not None:
+                delta_region = len(region_text.encode("utf-8")) - baseline
+                if delta_region <= remaining:
+                    text = _redact(region_text)
+                    tier = "region"
+                    remaining -= delta_region
+            if tier != "region" and per_doc_ceiling < shared_cap:
+                # 1文書あたりの上限が共有予算より先に効いた＝この文書は上限で頭打ちにされた
+                # （共有予算がそもそも無い場合は既存どおり無申告のまま chunk tier で足りる）。
+                text_truncated = True
         entry = {"doc_id": doc_id, "tier": tier, "text": text,
                  "chunks": [{"chunk_id": it["chunk_id"],
                              **({"locator": it["locator"]} if it.get("locator") is not None else {})}
                             for it in items]}
+        if text_truncated:
+            entry["text_truncated"] = True
         out.append(entry)
     return out
 
@@ -1029,7 +1003,12 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
     (1) doc 実在チェック: `_safe_doc_path` と同じ解決規則（rag/legacy 優先順位・封じ込め・秘匿種別拒否）
         で対象ファイルが実在・読み取り可能であることを確認する。失敗（不在／symlink 脱出等）は
         `exists=False`（呼び出し側はこの引用を Committed Evidence から除外する＝壊れた DL リンクを
-        出典に出さない）。
+        出典に出さない）——ただし「本文を読めるか」と「文書として実在するか」は別の問い
+        （`verify_doc_exists` docstring 参照）: `_safe_doc_path` が拒否した場合でも、`verify_doc_exists`
+        （実在＋doctype 分類の確定判定・内容の読み取り可否は問わない）が実在を認めれば
+        `exists=True`（`method="exists_unreadable"`・span 照合はスキップ）を返す。秘匿ファイル・
+        壊れた doc_id は `verify_doc_exists` 側でも False になるため `exists=False` のまま
+        （存在を漏らさない）。
     (2) span（grep/es_search 由来の整数行番号）があれば、その範囲を実際に読み直し `quote` と照合する
         （`grep_tool.grep_search` が `"\n".join(lines[s-1:e]).strip()` で組み立てる形と対称の再構成）。
         rag_chunks／Office 派生 MD 等、span が整数行番号を持たない引用（SEARCH-CUT-3 の locator 由来）は
@@ -1050,6 +1029,8 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
         return {"exists": False, "method": "doc_missing"}
     resolved = _safe_doc_path(world, doc_id)
     if resolved is None:
+        if verify_doc_exists(doc_id, world):
+            return {"exists": True, "method": "exists_unreadable"}
         return {"exists": False, "method": "doc_missing"}
     root, lexical_rel, _validated_path = resolved
     span = citation.get("span")
@@ -1219,6 +1200,14 @@ def system_prompt(tools_pref: dict | None = None) -> str:
 
 
 _PARAMS_SEARCH = {"type": "object", "properties": {
+    "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）"},
+    "offset": {"type": "integer",
+              "description": "ヒットの開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"}},
+    "required": ["query"]}
+# es_search（全文＋ベクトル）は offset を持たない——kNN 句の候補集合はページ間で固定できず、
+# offset だけ進めても kNN 側の候補（先頭 k 件）は変わらないため、ページを跨ぐと重要度補正後の
+# 順位が入れ替わり重複/欠落が起きる（実測）。続きが必要なら max_hits（絶対上限まで）を増やす。
+_PARAMS_ES_SEARCH = {"type": "object", "properties": {
     "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）"}},
     "required": ["query"]}
 _PARAMS_LIST_DOCS = {"type": "object", "properties": {
@@ -1271,7 +1260,8 @@ _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id
                 "file_truncated が付くヒットは、その文書がまだ検索し切れていない可能性がある——"
                 "read_doc で続きを確認する。text_truncated が付くヒットは本文が途中で切れている——"
                 "read_around（周辺）か read_doc（続き）で読む。"
-                "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。")
+                "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない——"
+                "next_offset をそのまま offset に渡せば続きが取れる（範囲を絞る・別の語で探すのも有効）。")
 _DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
              "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。")
 _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・全文を一度には読まない）。"
@@ -1305,9 +1295,13 @@ _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フ�
 _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
             "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。"
             "ripgrep_search が0件/空振りのときはまずこれを試す。doc_id と抜粋を関連度順で返す。"
+            "返す本文は該当箇所の周辺まで（文書全体は返さない）——文書全体を確認したいときは "
+            "doc_id を渡して read_doc で読む。"
             "text_truncated が付くヒットは本文が途中で切れている——read_around（周辺）か "
             "read_doc（続き）で読む。"
-            "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。")
+            "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
+            "es_search は候補の発見用——全件が必要な列挙は ripgrep_search"
+            "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。")
 _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する。結果が大きく変わる曖昧さがある場合だけ使う。"
              "例: 影響分析で起点や影響先が複数候補に割れるとき、確実な波及が0件で要確認だけになったときは、"
              "対象の絞り込みを確認してよい。依頼に「確認してから進めて」とあるときは調査より先に確認する。"
@@ -1327,8 +1321,11 @@ _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピー
 # ツールへの言及・推奨をそのまま残さない（無駄なターン/上限到達を防ぐ）。
 _DESC_ES_NO_GREP = ("社内資料を日本語の全文＋ベクトル検索（形態素・意味の近さ・関連度ランキング）。"
                     "言い回しが揺れる概念・日本語の同義語・自然文クエリに強い。doc_id と抜粋を関連度順で返す。"
+                    "返す本文は該当箇所の周辺まで（文書全体は返さない）——文書全体を確認したいときは "
+                    "doc_id を渡して read_doc で読む。"
                     "text_truncated が付くヒットは本文が途中で切れている——read_around（周辺）か read_doc（続き）で読む。"
-                    "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。")
+                    "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
+                    "es_search は候補の発見用——全件が必要な列挙は list_docs・原本の読取で行う。")
 _DESC_GRAPH_NO_GREP = ("関係グラフから、ある名前（プログラム/コピーブック/ジョブ/データ項目/テーブルなど）の**関連部品**をたどる"
                        "（コピー・呼び出し・参照・関連文書（言及）などの近傍を、つながりの経路つきで返す）。"
                        "各近傍の経路は**辺ごとの種類と向き（from→to）**付き。COPIES／INVOKES／ACCESSES／CONTAINS"
@@ -1434,6 +1431,223 @@ _PARAMS_FILE_HEAD = {"type": "object", "properties": {
     "max_bytes": {"type": "integer", "description": "読む最大バイト数（既定65536）"}},
     "required": ["doc_id"]}
 
+# ---- 作成系（author）の成果物ファイル: DEPTH-2 S2（§2.7）----
+# 個人 workspace（本人のみ・grep 対象・RAG には索引化しない）へ保存する——共有 KB とは無関係。
+# Codex（`providers/codex/provider.py` の run_dir 差分検出）と同じ台帳（`personal_workspace_files`）
+# 台帳へ登録し、同じ成果物カード（`env["created_files"]`）で見せる。
+_DESC_WRITE_OUTPUT_FILE = (
+    "作成した文書を個人の作業スペースに保存し、ダウンロードできるようにする"
+    "（作成系の依頼でファイルを納品するときに使う。調査・質問の回答には使わない）。"
+    "filename（拡張子つきの単純なファイル名・フォルダ区切り不可）と content（保存する内容の全文）を渡す。"
+    "同名ファイルが既にあれば自動的に別名で保存する（上書きしない）。"
+    "Markdown を marp のスライド形式（先頭に `---\\nmarp: true\\n---` のfront-matter）で書いたときは"
+    "marp:true も渡すと PDF/PowerPoint も自動生成される（それ以外の拡張子・marp 形式でない Markdown では無視）。"
+    "保存できたら rel_path と download_url を返す——最終回答の最後に作成したファイル名と内容の要約を書くこと。"
+    "保存できなかったときは error に理由が入る（内容は保存されていない）。")
+_PARAMS_WRITE_OUTPUT_FILE = {"type": "object", "properties": {
+    "filename": {"type": "string",
+                "description": "保存するファイル名（拡張子つき・フォルダ区切り不可・例 '消費税率一覧.md'）"},
+    "content": {"type": "string", "description": "保存する内容（テキスト全文）"},
+    "marp": {"type": "boolean",
+            "description": "true のとき、この Markdown を marp スライドとして PDF/PowerPoint も生成する（既定false）"}},
+    "required": ["filename", "content"]}
+
+# 保存できる内容の上限（新規ツールの安全弁・DoS 対策。既存の清書予算/回数上限の流用対象ではない
+# ＝§2.7 の「回数上限は既存の清書予算の値を流用」は追記継続の話で、本upperは別の懸念）。
+_WRITE_OUTPUT_FILE_MAX_BYTES = _env_int("SHERPA_WRITE_OUTPUT_FILE_MAX_BYTES", 2_000_000, 1024, 20_000_000)
+_SAFE_OUTPUT_FILENAME_RE = re.compile(r"^[^/\\\x00]{1,200}$")
+
+
+def _open_workspace_dir_fd(parent_fd: int, name: str) -> int:
+    """`parent_fd` 配下の `name` ディレクトリを、無ければ作成したうえで symlink を追わずに開いて
+    dir_fd を返す（C42 是正）。`name` が symlink（この呼び出しの直前に差し替えられた場合を含む）
+    なら `O_NOFOLLOW` で ELOOP となり、呼び出し元へ OSError が伝播する——一度開いた fd は
+    以後その名前がどう差し替えられても最初に開いた実ディレクトリを指し続けるため、後続の
+    階層をこの fd 基準で開けば途中の親の差替え（TOCTOU）に影響されない。
+    """
+    try:
+        os.mkdir(name, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+
+def _run_write_output_file(args: dict, uid: str | None) -> dict:
+    """`write_output_file` ツール本体（DEPTH-2 S2・§2.7）。
+
+    個人 workspace（`{SHERPA_USERS_DIR}/{uid}/workspace/files/`）へ保存し、Codex の created files
+    （`providers/codex/provider.py`）と**同じ台帳**（`store.record_workspace_file`・
+    `personal_workspace_files`）・**同じ TTL**（`SHERPA_WORKSPACE_TTL_DAYS`）へ登録する。
+    `marp: true` の Markdown は同じ `marp_render.render_outputs` 経路で pdf/pptx 化する。
+
+    fail-open/fail-closed の使い分け（Codex 経路と同じ区別を踏襲）: **台帳登録**（`record_workspace_file`）
+    の失敗は明示エラーを返し内容を保存しない（fail-closed 寄り）。**marp 変換**の失敗は注記だけで
+    継続する（.md 自体の保存は成功のまま・fail-open）。呼び出し元（`run_tool`）はどちらの場合も
+    例外を受け取らない契約——想定される失敗は必ず `{"error": ...}` を持つ dict で返し、調査ループ
+    全体（`openai_style`）を落とさない。
+    """
+    if not uid:
+        return {"error": "作成者が特定できないため保存できません（個人領域が未初期化です）"}
+    filename = str(args.get("filename") or "").strip()
+    if (not filename or not _SAFE_OUTPUT_FILENAME_RE.match(filename)
+            or filename in (".", "..") or "/" in filename or "\\" in filename):
+        return {"error": "filename が不正です（フォルダ区切りを含まない単純なファイル名を指定してください）"}
+    content = args.get("content")
+    if not isinstance(content, str):
+        return {"error": "content は文字列で渡してください"}
+    data = content.encode("utf-8")
+    if not data:
+        return {"error": "content が空です"}
+    if len(data) > _WRITE_OUTPUT_FILE_MAX_BYTES:
+        return {"error": f"内容が大きすぎます（上限 {_WRITE_OUTPUT_FILE_MAX_BYTES} バイト）"}
+    marp = bool(args.get("marp"))
+
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    from . import store
+    users_dir = Path(os.environ.get("SHERPA_USERS_DIR", "data/users")).resolve()
+    ws_files = users_dir / uid / "workspace" / "files"   # 表示・record_workspace_file 用（書込み自体は dir_fd 経由）
+
+    # C42（DEPTH-2 S2 是正）: C38 の「各階層が symlink でないか確認してから resolve() で照合する」
+    # 方式は、検査（stat/resolve）と実際の作成（open/write）の間に window があり、その間に
+    # 親（`uid_dir`・`ws_dir`）が他人の workspace への symlink へ差し替えられても検出できない
+    # （TOCTOU）。dir_fd による段階的オープンなら、各階層を「一度開いたら、その fd は以後どんな
+    # 名前差替えが起きても最初に開いた実ディレクトリを指し続ける」性質を使い、以降の名前解決を
+    # 一切パス文字列に頼らずに済ませられる——`uid`・`workspace`・`files` の各コンポーネントを
+    # 直前の fd を親として `O_NOFOLLOW` で個別に開く（symlink ならその場で ELOOP になり、
+    # 以降の階層は一切開かれない）。
+    try:
+        users_dir.mkdir(parents=True, exist_ok=True)   # 信頼済みの設定パス（`SHERPA_USERS_DIR`）自体は既存想定の外
+        fd_users = os.open(str(users_dir), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return {"error": "保存先を準備できませんでした"}
+    fd_uid = fd_ws = fd_files = -1
+    try:
+        fd_uid = _open_workspace_dir_fd(fd_users, uid)
+        fd_ws = _open_workspace_dir_fd(fd_uid, "workspace")
+        fd_files = _open_workspace_dir_fd(fd_ws, "files")
+    except OSError:
+        return {"error": "保存先が利用できません（管理者に確認してください）"}
+    finally:
+        os.close(fd_users)
+        if fd_uid >= 0:
+            os.close(fd_uid)
+        if fd_ws >= 0:
+            os.close(fd_ws)
+
+    try:
+        ttl_days = _env_int("SHERPA_WORKSPACE_TTL_DAYS", 90, 0, 3650)
+        expires = (datetime.now(timezone.utc) + timedelta(days=ttl_days)) if ttl_days > 0 else None
+        stem, suffix = Path(filename).stem or "output", Path(filename).suffix
+
+        def _write_and_register(name: str, raw: bytes) -> dict | None:
+            # `dir_fd=fd_files` の `O_EXCL|O_NOFOLLOW` で排他的に新規作成する——`name` という名前が
+            # 既に何か（通常ファイル・symlink のどちらでも）を指していれば、内容に関わらず作成自体が
+            # 失敗する（TOCTOU を作らない・「存在確認してから書く」の2手順に分けない）。`fd_files`
+            # は既に開いた実ディレクトリを指すため、`files` という名前がこの後どう差し替えられても
+            # 影響しない。
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+                             dir_fd=fd_files)
+            except OSError:
+                return None
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+            except OSError:
+                try:
+                    os.unlink(name, dir_fd=fd_files)
+                except OSError:
+                    pass
+                return None
+            try:
+                sha = hashlib.sha256(raw).hexdigest()
+                return store.record_workspace_file(uid, name, str(ws_files / name), len(raw), sha,
+                                                    expires_at=expires)
+            except Exception:
+                try:
+                    os.unlink(name, dir_fd=fd_files)   # 登録に失敗＝台帳の無い孤児を残さない（Codex 経路と同じ規律）
+                except OSError:
+                    pass
+                return None
+
+        def _name_occupied(name: str) -> bool:
+            # 別名候補選びの事前判定（最終防衛線は上の O_EXCL 作成）。symlink・通常ファイルの
+            # どちらでも「使用中」として次の連番へ回す（無言で上書き先を奪わない）。
+            try:
+                os.stat(name, dir_fd=fd_files, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return True
+            return True
+
+        row = None
+        i = 0
+        while i <= 10000:                            # 無限ループ防止（Codex 経路の同名回避と同じ上限）
+            rel = filename if i == 0 else f"{stem}_{i}{suffix}"
+            with store.workspace_file_lock(uid, rel):
+                if _name_occupied(rel) or not store.no_live_upload_for_path(uid, rel):
+                    i += 1
+                    continue
+                row = _write_and_register(rel, data)
+            break
+    finally:
+        os.close(fd_files)
+    if row is None:
+        return {"error": "保存中に登録へ失敗しました（内容は保存されていません）"}
+
+    result = {"rel_path": row["rel_path"], "download_url": f"/workspace/files/{row['id']}/download",
+              "bytes": len(data)}
+
+    if marp and Path(row["rel_path"]).suffix.lower() == ".md":
+        dst = ws_files / row["rel_path"]
+        try:
+            from . import marp_render
+            from .providers.codex.sandbox import _detect_chrome_path, _marp_bin
+            if not marp_render.is_marp_markdown(dst):
+                result["marp_note"] = ("marp:true が指定されましたが marp 形式"
+                                       "（front-matter の marp: true）ではないため変換しませんでした")
+            else:
+                rendered = marp_render.render_outputs(
+                    [dst], marp_bin=_marp_bin(), chrome_path=_detect_chrome_path(),
+                    theme_dirs=[Path(__file__).resolve().parent / "skills_base" / "marp" / "themes"],
+                    containment_root=ws_files)
+                extra = []
+                for out in rendered:
+                    try:
+                        raw = out.read_bytes()
+                    except OSError:
+                        continue
+                    try:
+                        sha = hashlib.sha256(raw).hexdigest()
+                        with store.workspace_file_lock(uid, out.name):
+                            r_row = store.record_workspace_file(
+                                uid, out.name, str(out), len(raw), sha, expires_at=expires)
+                    except Exception:
+                        continue   # marp 変換自体は成功済み＝この1形式の台帳登録失敗だけ諦める（fail-open）
+                    extra.append({"rel_path": r_row["rel_path"],
+                                 "download_url": f"/workspace/files/{r_row['id']}/download"})
+                if extra:
+                    result["rendered"] = extra
+                # C28 是正: `render_outputs` は形式ごとに fail-open で個別スキップする（例外を出さない・
+                # 未導入/Chromium 不在/ネットワーク隔離不可のいずれも空/部分リストで返る）ため、
+                # 利用者に案内した pdf/pptx（description 参照・html は内部形式で案内していない）が
+                # 実際には1つも登録されなかった／一部だけ欠けた場合に、無言で完了扱いにせず注記する
+                # （生成できても台帳登録に失敗した形式は download_url が無い＝利用者には「無い」のと
+                # 同じなので `extra`＝登録済みの側で確認する）。
+                _registered_suffixes = {Path(e["rel_path"]).suffix.lstrip(".").lower() for e in extra}
+                _missing_formats = [fmt for fmt in ("pdf", "pptx") if fmt not in _registered_suffixes]
+                if _missing_formats:
+                    result["marp_note"] = (
+                        f"{'/'.join(_missing_formats)} の生成に失敗しました"
+                        "（Markdown 自体は保存されています）")
+        except Exception as e:
+            _log.warning("write_output_file: marp レンダ処理が例外で終了（fail-open）: %s", e)
+            result["marp_note"] = "スライド変換（PDF/PowerPoint）に失敗しました。Markdown 自体は保存されています"
+    return result
+
 
 def _desc_es(with_grep: bool) -> str:
     """`with_grep` に応じた es_search の description（全ON相当時は正準文字列 `_DESC_ES` と byte 一致）。"""
@@ -1446,12 +1660,19 @@ def _desc_graph(with_grep: bool) -> str:
 
 
 def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool = True,
-                 with_grep: bool = True) -> list:
+                 with_grep: bool = True, with_write: bool = False) -> list:
     # can_ask=False（回答の再送＝依頼に「確認ID:」を含む実行）では ask_user
     #   ツール自体を渡さない＝再質問ループを構造的に塞ぐ（S2 の SHERPA_MCP_ASK_DISABLED と同思想）。
     # SC-6e: `with_grep`（既定 True）は検索経路トグルの grep 軸。list_docs/doc_outline/read_doc/
     #   read_around は土台系のため対象外＝常に含める。glob_search（ファイル名/パスのグロブ検索）も
     #   grep 軸に同居する。
+    # DEPTH-2 S2（§2.7）: `with_write`（既定 False＝オプトイン）は `write_output_file` の掲出可否——
+    #   呼び出し元（`openai_style` 本体）だけが `uid` の有無で明示的に True を渡す（uid が無ければ
+    #   登録先を特定できないため未掲出）。既定 False にしているのは、`gemini()`/`anthropic_style()`
+    #   （Gemini/Bedrock・DEPTH-2 S2 の対象外）や `_sub_loop`（検索アシスタント・書込み非対応の
+    #   プロファイル）等の**他の呼び出し元を無改修のまま**にするため——既定 True にすると、uid を
+    #   持たないこれらの経路にもツールが掲出され、呼んでも常に失敗する（登録先不明）だけの
+    #   無駄なターンを誘発する。
     t = [{"type": "function", "function": {"name": "list_docs", "description": _DESC_LIST_DOCS, "parameters": _PARAMS_LIST_DOCS}}]
     # K6: folder_tree は list_docs と同じ台帳ベースの土台系ツール（ES/graph/grep トグルと無関係）＝常に含める。
     t.append({"type": "function", "function": {"name": "folder_tree", "description": _DESC_FOLDER_TREE, "parameters": _PARAMS_FOLDER_TREE}})
@@ -1464,7 +1685,7 @@ def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
     t.append({"type": "function", "function": {"name": "read_around", "description": _DESC_READ, "parameters": _PARAMS_READ}})
     insert_at = len(t) - 3   # doc_outline/read_doc/read_around の直前（list_docs[+ripgrep_search]の直後）に差し込む
     if with_es:
-        t.insert(insert_at, {"type": "function", "function": {"name": "es_search", "description": _desc_es(with_grep), "parameters": _PARAMS_SEARCH}})
+        t.insert(insert_at, {"type": "function", "function": {"name": "es_search", "description": _desc_es(with_grep), "parameters": _PARAMS_ES_SEARCH}})
     if with_graph:
         t.insert(insert_at, {"type": "function", "function": {"name": "graph_neighbors", "description": _desc_graph(with_grep), "parameters": _PARAMS_GRAPH}})
     # GEN-DIFF: ES/graph の可用性に依存しない土台系ツール（read_around 等と同じ扱い）＝常に含める。
@@ -1477,13 +1698,17 @@ def openai_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
     t.append({"type": "function", "function": {"name": "pptx_slides", "description": _DESC_PPTX_SLIDES, "parameters": _PARAMS_PPTX_SLIDES}})
     t.append({"type": "function", "function": {"name": "pdf_pages", "description": _DESC_PDF_PAGES, "parameters": _PARAMS_PDF_PAGES}})
     t.append({"type": "function", "function": {"name": "file_head", "description": _DESC_FILE_HEAD, "parameters": _PARAMS_FILE_HEAD}})
+    if with_write:
+        t.append({"type": "function", "function": {"name": "write_output_file",
+                                                   "description": _DESC_WRITE_OUTPUT_FILE,
+                                                   "parameters": _PARAMS_WRITE_OUTPUT_FILE}})
     if can_ask:
         t.append({"type": "function", "function": {"name": "ask_user", "description": _DESC_ASK, "parameters": _PARAMS_ASK}})
     return t
 
 
 def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool = True,
-                 with_grep: bool = True) -> list:
+                 with_grep: bool = True, with_write: bool = False) -> list:
     # can_ask=False（確認ID 付き再送）では ask_user を渡さない（openai_tools と同じ）。
     # SC-6e: with_grep は openai_tools と同じ意味（既定 True）。glob_search も同じく grep 軸に同居する。
     fns = [{"name": "list_docs", "description": _DESC_LIST_DOCS, "parameters": _PARAMS_LIST_DOCS}]
@@ -1497,7 +1722,7 @@ def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
     fns.append({"name": "read_around", "description": _DESC_READ, "parameters": _PARAMS_READ})
     insert_at = len(fns) - 3
     if with_es:
-        fns.insert(insert_at, {"name": "es_search", "description": _desc_es(with_grep), "parameters": _PARAMS_SEARCH})
+        fns.insert(insert_at, {"name": "es_search", "description": _desc_es(with_grep), "parameters": _PARAMS_ES_SEARCH})
     if with_graph:
         fns.insert(insert_at, {"name": "graph_neighbors", "description": _desc_graph(with_grep), "parameters": _PARAMS_GRAPH})
     # GEN-DIFF: ES/graph の可用性に依存しない土台系ツール（read_around 等と同じ扱い）＝常に含める。
@@ -1509,6 +1734,9 @@ def gemini_tools(with_es: bool = False, with_graph: bool = False, can_ask: bool 
     fns.append({"name": "pptx_slides", "description": _DESC_PPTX_SLIDES, "parameters": _PARAMS_PPTX_SLIDES})
     fns.append({"name": "pdf_pages", "description": _DESC_PDF_PAGES, "parameters": _PARAMS_PDF_PAGES})
     fns.append({"name": "file_head", "description": _DESC_FILE_HEAD, "parameters": _PARAMS_FILE_HEAD})
+    if with_write:
+        fns.append({"name": "write_output_file", "description": _DESC_WRITE_OUTPUT_FILE,
+                    "parameters": _PARAMS_WRITE_OUTPUT_FILE})
     if can_ask:
         fns.append({"name": "ask_user", "description": _DESC_ASK, "parameters": _PARAMS_ASK})
     return [{"functionDeclarations": fns}]
@@ -1595,7 +1823,7 @@ _USAGE_TOOLS_SPEC = [
          "to": {"type": "string",
                 "description": "期間の終了日時（この日時は含まない・ISO 8601・オフセット必須）。"
                                "from と対で指定し days とは併用不可"}}}),
-    ("usage_depth_rounds", "深さ（標準/深く/最大）×経路（provider）別の査読巡数の分布と、"
+    ("usage_depth_rounds", "深さ（クイック/標準/深く/最大）×経路（provider）別の査読巡数の分布と、"
                           "不明（未確定）と判定された主張の理由コードの分布を取得する。"
                           "本文（質問/回答）は含まない。",
      {"type": "object", "properties": {
@@ -1998,16 +2226,155 @@ def _finish_reader_result(name: str, result: dict, doc_id: str, tr_max_bytes: in
     return best
 
 
+# 障害先（fulltext/graph/read）の分類——ツール名はこの分類にだけ使い、回復可否の判定には
+# 使わない（回復可否は例外の型で決める・`_is_recoverable_tool_exception` 参照）。
+_TOOL_BACKEND_KIND = {"es_search": "fulltext", "graph_neighbors": "graph"}
+
+
+def _tool_backend_kind(name: str) -> str:
+    """ツール名から障害先（`InvestigationState.backend_failures` の閉じたキー）を返す。"""
+    return _TOOL_BACKEND_KIND.get(name, "read_io")
+
+
+def _unreachable_backends_at_start(avail: dict | None, tp: dict) -> list:
+    """このターン、**実接続の不達**で使えないバックエンドの種別（利用者の OFF は含めない）。
+
+    不達のときツール集合から `es_search`／`graph_neighbors` 自体が外れるため、実行中に障害として
+    記録される機会が無い——ツール集合を組む時点で1回だけ記録するための判定（`toolset` を明示
+    指定された経路は可用性判定を一切参照しない契約のため対象外＝呼び出し元が `avail=None` で
+    渡す）。戻り値は `InvestigationState.backend_failures` の閉じたキー。
+    """
+    if avail is None:
+        return []
+    out = []
+    if not avail.get("fulltext") and tp.get("fulltext"):
+        out.append("fulltext")
+    if not avail.get("graph") and tp.get("graph"):
+        out.append("graph")
+    return out
+
+
+def _is_recoverable_tool_exception(exc: BaseException) -> bool:
+    """接続断・タイムアウト・読取I/O（ES/Neo4j クライアント例外・`OSError`/`TimeoutError` 系）だけを
+    回復可能とする——それ以外（`TypeError`/`KeyError`/assert 失敗等のプログラムの欠陥を示す例外・
+    クエリのバグや設定ミスを示す Neo4j `ClientError` 系）は回復不可扱いにする。単発フォールバックへの
+    縮退可否（`providers/base.py`）の判定基準はこの1関数に集約する。
+    """
+    # `HTTPError` は `URLError`/`OSError` のサブクラスだが、ステータスコードで回復可否が分かれる
+    # （4xx＝クライアント起因＝プログラム・設定の欠陥＝回復不可／5xx・429＝一時的な障害＝回復可能）
+    # ため、下の一般 `OSError` 判定より先に見る（`_retryable_post_error` と同じ判定順）。
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code <= 599
+    if isinstance(exc, (OSError, TimeoutError)):
+        return True
+    # 遅延 import（他の遅延 import と同じ理由）。neo4j の例外階層は `DriverError`
+    # （`ServiceUnavailable`/`SessionExpired` 等・ドライバ自身が検出した接続系の失敗）と
+    # `Neo4jError` の派生2系統（`TransientError`＝サーバ側の一時的な過負荷等／`ClientError`＝
+    # `CypherSyntaxError` 含む・クエリのバグ）に分かれる——回復可能なのは接続系（`DriverError`）と
+    # 一時的（`TransientError`）だけで、`ClientError` 系はプログラムの欠陥として回復不可扱いに
+    # する。`ConfigurationError`（設定ミス）は実際のクラス階層上は `DriverError` のサブクラスだが
+    # 意味的には非一時的な設定不備＝回復不可のため、`DriverError` 判定の前に別枠で除外する。
+    from neo4j.exceptions import ConfigurationError, DriverError, TransientError
+    if isinstance(exc, ConfigurationError):
+        return False
+    return isinstance(exc, (DriverError, TransientError))
+
+
+def _record_tool_exception(state, name: str, exc: BaseException) -> None:
+    """ツール呼び出し例外を `InvestigationState` へ記録する（回復可能なら種別ごと・回復不可なら
+    `non_recoverable_failure`）。`run_tool` 境界の例外変換（並列/直列の両経路）が呼ぶ。"""
+    if _is_recoverable_tool_exception(exc):
+        state.mark_backend_failure(_tool_backend_kind(name))
+    else:
+        state.mark_non_recoverable_failure()
+
+
+# `graph_neighbors`（`lens_service.neighbor_cards`）が内部で捕捉した障害の固定コード——本文・
+# 例外メッセージは持たない（ログの秘匿契約に合わせる）。`_record_tool_result_error_code` が
+# 拾って `InvestigationState` へ反映する。
+_GRAPH_NEIGHBORS_RECOVERABLE_ERROR_CODE = "graph_unavailable"
+_GRAPH_NEIGHBORS_NON_RECOVERABLE_ERROR_CODE = "graph_internal_error"
+# グラフのスキーマ世代不一致（`GraphSchemaEraError`）のツール結果コード——API 経路
+# （`run_tool` の `graph_neighbors` 分岐）と MCP 経路（`mcp_server.py::handle`・
+# `providers/codex/mcp.py::_graph_schema_era_from_item`）が共有する閉じたコード（本文を持たない）。
+GRAPH_REINGEST_ERROR_CODE = "graph_reingest_required"
+
+# グラフが使えないまま調べ続けたターンの通知（平文・専門用語ゼロ・資料名や本文を含まない）。
+# 3状態（入口で使えない＝未構築/OFF/不達／世代が古い／調査の途中で接続できなくなった）で別の
+# 文言にする——利用者の次の一手が違うため「使えない」と「取り込み直しが要る」を丸めない。
+# API 経路（`providers/base.py`）・Codex 経路（`providers/codex/provider.py`）・非agentic
+# （`chat_service._finalize`）が同じ文言を共有する。
+_GRAPH_DEGRADED_BLOCKED = "blocked"
+# world にグラフが未構築（`:Entity{world_id}` が0件）——障害ではないため統計フラグは立てない
+# （`chat_service._GRAPH_DEGRADED_LIMIT_FIELD` に対応エントリを持たない・通知文言のみ）。
+GRAPH_EMPTY_CODE = "graph_empty"
+GRAPH_DEGRADED_NOTICES = {
+    _GRAPH_DEGRADED_BLOCKED: "関係のつながりをたどる検索が使えないため、資料とソースを直接調べて回答します。",
+    GRAPH_REINGEST_ERROR_CODE: ("関係のつながりの情報が古いため今回は使わず、資料とソースを直接調べて"
+                                "回答します（管理者に『今すぐ更新』を依頼してください）。"),
+    # 入口で不達だったターンと調査の途中で切れたターンで同じ文言を使う（利用者にとっては
+    # どちらも「つながりを見に行けなかった」＝次の一手は同じ）。
+    _GRAPH_NEIGHBORS_RECOVERABLE_ERROR_CODE: ("関係のつながりをたどる検索に接続できなかったため、"
+                                              "資料とソースを直接調べた結果で回答します。"),
+    GRAPH_EMPTY_CODE: ("関係のつながりの情報がまだ作られていないため、資料とソースを直接調べて"
+                       "回答します（管理者に『今すぐ更新』を依頼してください）。"),
+}
+
+
+def graph_degraded_notice(code: str | None) -> str:
+    """縮退コード（閉集合）に対応する通知文言。未知・None は空文字（通知しない）。"""
+    return GRAPH_DEGRADED_NOTICES.get(code or "", "")
+
+
+def _record_tool_result_error_code(state, result, name: str | None = None) -> None:
+    """`run_tool()` の結果に固定理由コード（`error_code`）が付いていれば `InvestigationState` へ
+    反映する——例外にならず結果化された障害を拾う経路。対象:
+    - `graph_reingest_required`（`error` フィールド・グラフの世代不一致＝再取り込み待ち。接続断と
+      別項目で数え、通知文言も分ける）。
+    - `read_io_failed`（`_open_doc_stream` の読取I/O失敗）。
+    - `graph_unavailable`/`graph_internal_error`（`lens_service.neighbor_cards` が内部で捕捉し
+      握りつぶしていた障害——`_record_tool_exception` と同じ回復可否の意味で `graph_neighbors`
+      専用に記録する）。
+    - `es_search` の `degrade_reason` が `es_unavailable`/`es_query_failed`（BM25 自体も失敗し
+      hits が強制的に空になった＝一時的な障害・`_ES_DEGRADE_WORDING` に含まれない既知値）のとき
+      `backend_failures["fulltext"]` を立てる。`es_query_rejected`（4xx＝クエリの構文/設定不備＝
+      一時的でない）は `non_recoverable_failure` を立てる。
+    """
+    if not isinstance(result, dict):
+        return
+    if result.get("error") == GRAPH_REINGEST_ERROR_CODE:
+        # 世代不一致（`run_tool` の `graph_neighbors` 分岐が変換した結果）——接続断とは別状態。
+        state.mark_graph_schema_era_mismatch()
+    code = result.get("error_code")
+    if code == "read_io_failed":
+        state.mark_backend_failure("read_io")
+    elif code == _GRAPH_NEIGHBORS_RECOVERABLE_ERROR_CODE:
+        state.mark_backend_failure("graph")
+    elif code == _GRAPH_NEIGHBORS_NON_RECOVERABLE_ERROR_CODE:
+        state.mark_non_recoverable_failure()
+    if name == "es_search":
+        reason = result.get("degrade_reason")
+        if reason in ("es_unavailable", "es_query_failed"):
+            state.mark_backend_failure("fulltext")
+        elif reason == "es_query_rejected":
+            state.mark_non_recoverable_failure()
+
+
 # ---- ツール実行（read-only・world＋scope に限定）----
 
 def run_tool(name: str, args: dict, world: str, scope_paths,
             deadline: float | None = None, layer=None,
             max_hits: int | None = None, window_cap: int | None = None,
-            tool_result_max_bytes: int | None = None) -> tuple[dict, set, list, list]:
+            tool_result_max_bytes: int | None = None,
+            uid: str | None = None, graph_only: bool = False) -> tuple[dict, set, list, list]:
     """ツールを実行し `(結果, 触れた doc_id 集合, 引用候補, 候補カード)` を返す。範囲外/未解決/秘匿は安全に error。
 
     引用候補＝`{doc_id, span, quote, ext}`（grep/ES ヒット由来・UI/出典用）。候補カード＝`graph_neighbors` 由来の
     原因候補（troubleshoot の UI/エクスポート用）。tool result の本文は **秘密を伏せて**返す。
+
+    `uid`（DEPTH-2 S2・§2.7・省略可・既定 `None`）: `write_output_file`（成果物登録の共通化・個人
+    workspace の files/ へ保存）の書き先ユーザー id。`None`（省略）のときこのツールは実行せず
+    「作成者が特定できません」という error を返す（他のツールは `uid` を使わない）。
 
     `layer`（省略可・`"docs"|"code"|"both"`・既定 `None`＝`"both"`＝フィルタなし＝既存呼び出し元は
     無変更）: 探す対象（調べ方ブロック §3.4）。`scope_paths` と同じ「会話ターン全体にかかる硬い
@@ -2025,7 +2392,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     転送する。`window_cap`（省略可・既定 `None`＝モジュール既定 `READ_WINDOW`）: `read_around` の
     読み取り窓を2箇所で置き換える——① LLM が `window` 引数を省略したときの既定値、② 既存の
     `max(200, READ_WINDOW)` 安全クランプの `READ_WINDOW` 部分（200 の下限は維持）。どちらも
-    呼び出し元（`openai_style`）が既に倍率計算済みの
+    呼び出し元（`openai_style`）が既に実効基準値を解決済みの
     値を渡すだけで、本関数はクランプの形自体は変えない（LLM 自身が指定した値を上回らせない安全弁は
     維持）。`read_doc`（新設・土台系）の1回のページ幅にも `max(200, window_cap or READ_WINDOW)`
     ——read_around と同じ「200行フロア」の流儀を使う（read_doc に window 引数は無く、LLM は
@@ -2042,6 +2409,34 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     cap より後ろが検索できていない可能性があることを LLM に伝える（探す経路が黙って取りこぼす
     ことを防ぐ・読む経路の `file_truncated` と対称）。
 
+    `ripgrep_search` は `args["offset"]`（LLM 指定・省略時0・負値は0扱い）でページングする——
+    `grep_tool.grep_search` に `offset` をそのまま転送し（**巻き戻さない**・後述）、
+    `offset+使ったヒット数` 件目までの母集団のうち後ろのページを返す（`offset=0` は既存の先頭
+    ページと同一）。1ページで扱うヒット数（`used_max_hits`）は `max_hits` と
+    `MAX_HITS_ABS_MAX - offset` の小さい方——`offset` 自体はクランプせず、ページの件数を縮める側で
+    絶対上限 `MAX_HITS_ABS_MAX` を守る（grep 側は `offset+ヒット数` の分だけヒープ容量が伸びるため、
+    LLM が渡す `offset` を無検証で使うとヒープが際限なく肥大する。`offset` 自体を巻き戻すと
+    `next_offset` を辿るたびに同じ範囲を再送し続け、上限を超えた領域へ永久に到達できなくなる）。
+    `offset >= MAX_HITS_ABS_MAX` なら検索自体を呼ばず空のヒット一覧を返す（母集団の先はもう見ない・
+    終端）。`next_offset` は `offset+used_max_hits < MAX_HITS_ABS_MAX` のときだけ付く——縮めた
+    最終ページやちょうど天井に達したページはこれ以上ページングしない合図として省く。
+    `es_search`（ES hybrid）は offset ページングを持たない——kNN 句自身の候補集合はページを跨いで
+    固定できず（`from` だけ進めても kNN 側は常に先頭 k 件を候補にする）、候補集合をページ間で揃え
+    ようと kNN の k を広げると重要度補正後の合成スコアの順位がページごとに入れ替わり、既出ヒットの
+    重複と未取得ヒットの欠落が同時に起きる。全文検索は絶対上限（`k_ceiling`）まで一度に取れるため、
+    続きが必要なら `max_hits` を増やせば足りる——従来どおり `truncated:true`（続きは取れない）のみ。
+    ヒット数を広げても1ヒットあたりの本文量（grep の MD 該当節丸ごと・ソース前後行・ES の legacy
+    チャンク）こそが文脈枠を圧迫するため、両ツールとも `hits[i].text` は `tool_result_max_bytes` を
+    ヒット数で均等割りしたバイト数（下限 `_HIT_TEXT_MIN_BYTES`）で末尾クリップし、切ったヒットに
+    だけ `text_truncated: true` を付ける（親返し＝rag doc 群の text はこの均等割りの対象外・
+    §3.3/§3.4 の別予算配分のまま——ただし親返し自身も doc 群の件数で均等割りした
+    1文書あたりの上限を持ち、それに阻まれた doc には同じ `text_truncated: true` を
+    `_resolve_parent_return` が独自に付ける）。この均等割りは text だけの割当てで doc_id/line/span 等の付帯情報や JSON
+    構造分は数えないため、`view` を組み立てた後に直列化後の実バイト数を測り、`tr_max_bytes` を
+    超えていたら per_hit を詰めて再構築する（最大4回・下限は下回らない・いずれかのヒットが切られた
+    ら最上位にも `text_truncated: true` を立てる）。それでも収まらなければ呼び出し元の外側クリップ
+    （fail-open）に委ねる。
+
     `deadline`（省略可・`time.monotonic()` 系の絶対期限。既定 None＝無期限＝既存呼び出し元は無変更）:
     `ripgrep_search`（`grep_tool.grep_search`）・`list_docs`/`glob_search`（`doc_ledger.
     documents_for`→`corpus_docs.world_documents`→`scope_infer.safe_files`）・`es_search`（`documents.
@@ -2056,6 +2451,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     run 開始時に1回だけ `resolve_tool_result_budgets()` で解決したツール結果1件あたりのバイト予算。
     `max_hits`/`window_cap` と同じ「会話ターン全体にかかる」上書き——本関数内のバイトクリップ
     （`_clip_utf8_bytes`/`_clip_cards`/`read_doc` の逐次クリップ）は全てこの実効値を使う。
+
+    `graph_only`（省略可・既定 `False`）: 真のとき `graph_neighbors` は `lens_service.neighbor_cards`
+    の代わりに `lens_service.neighbor_cards_graph_only`（grep をしない・起点は名前の一致で直接引く）
+    を使う（素の Codex モード＝`plain`・§1.3・§4・MCP サーバが `SHERPA_MCP_TOOLSET=plain` のとき
+    だけ真で渡す）。他のツールには影響しない。
     """
     sp = scope_mod.normalize_scope_paths(scope_paths) or None
     args = args or {}
@@ -2133,7 +2533,16 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         degrade_reason = None
         truncated_docs: list = []                       # ripgrep_search のみ（es_search は空のまま）
         cap_reached = False                             # ヒット上限に達した（母集団の一部しか見ていない）
+        offset = 0                                       # ripgrep_search のみ意味を持つ（es_search は常に0＝ページングしない）
         if name == "es_search":
+            # 全文検索（ES hybrid）は offset ページングを持たない——kNN 句自身の候補集合はページを
+            # 跨いで固定できない（`from` だけ進めても kNN 側は常に先頭 k 件を候補にする）。候補集合を
+            # ページ間で揃えようと kNN の k を offset+size まで広げると、重要度補正後の合成スコアの
+            # 順位がページごとに入れ替わり、既出ヒットの重複と未取得ヒットの欠落が同時に起きる
+            # （BM25 不一致・kNN スコア僅差の2件で実測）。全文検索は絶対上限（k_ceiling）まで一度に
+            # 取れるため、続きが必要なら max_hits を増やせば足りる——上位K件打切りで続きが取れない
+            # 実害は語句検索側の問題であり、全文検索は従来どおり「続きは取れない」打ち切りのまま。
+            used_max_hits = max_hits or MAX_HITS
             from . import documents                       # ES ヒットは現 world に**実在する doc** だけ採用
             # 古い ES 索引由来の 404／別内容リンクを引用/出典に出さない（非agentic の _es_citations と同じ実在チェック）。
             # 実在集合は**1回だけ**作る（per-hit のツリー走査を避ける・rv MED）。
@@ -2145,11 +2554,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # k_ceiling=MAX_HITS_ABS_MAX（grep と共通の絶対上限）で es_index 側の env 由来の
             # 再クランプ（既定 50）を迂回する——grep（下の分岐）には元々このような再クランプが無い。
             es_hits, degrade_reason = es_index.search(world, q, scope_paths=sp,
-                                                      k=(max_hits or MAX_HITS), layer=layer,
+                                                      k=used_max_hits, layer=layer,
                                                       k_ceiling=MAX_HITS_ABS_MAX)
             # 上限到達は実在チェック・秘匿名除外の前（生ヒット数）で判定する——後で落ちた分で
             # 件数が減っても「上限まで返っていた＝母集団の一部」という事実は変わらない。
-            cap_reached = len(es_hits) >= (max_hits or MAX_HITS)
+            cap_reached = len(es_hits) >= used_max_hits
             # 秘匿名文書（`is_sensitive` 導入前に索引化された既存 ES ヒット）は実在チェックの後、
             # ここで一律に弾く——`_safe_doc_path` の秘匿名ガードは read_around（精読）専用で
             # es_search は通らないため、ここで塞がないと `credentials.xlsx` 等の本文が MCP/外部
@@ -2171,26 +2580,46 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                      **({"parent_id": h["parent_id"]} if h.get("parent_id") is not None else {})}
                     for h in valid_es_hits]
         else:
+            try:
+                offset = int(args.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            offset = max(0, offset)
+            # offset は list_docs と同じく LLM が渡す未検証値。grep 側はヒープ容量を offset+ヒット数まで
+            # 広げるため、際限なく大きい offset を許すとヒープが無制限に肥大する（1ヒットの text は
+            # 後述の per_hit クリップ前は `grep_tool._GREP_HIT_TEXT_MAX_BYTES` まであり得るため無視できない
+            # 量になる）。絶対上限 `MAX_HITS_ABS_MAX` を「offset+このページの件数」の合計に
+            # 適用する——**offset 自体は巻き戻さない**（巻き戻すと next_offset を辿るたびに同じ範囲を
+            # 再送し続け、上限を超えた領域へ永久に到達できなくなる）。このページで返す件数
+            # （`used_max_hits`）を縮めることで天井を守り、`offset` が天井以上ならこのページは
+            # 空を返す（母集団の先はもう見ない・終端）。
+            used_max_hits = min((max_hits or MAX_HITS), max(0, MAX_HITS_ABS_MAX - offset))
+            if used_max_hits <= 0:
+                return ({"hits": []}, docs, cites, cards)
             # `truncated_docs`: `_GREP_FILE_CAP_BYTES` で打ち切られた文書の doc_id。**ヒット0件の
             # 打切り文書もここに載る**ため、ヒット経由の `file_truncated` では無音になるケース
             # （cap より後ろにしか一致が無い＝「検索したのに出てこない」）を LLM へ伝えられる。
-            hits = grep_tool.grep_search(q, world, max_hits=(max_hits or MAX_HITS), scope_paths=sp,
-                                         deadline=deadline, layer=layer, truncated_docs=truncated_docs)
-        out = []
+            hits = grep_tool.grep_search(q, world, max_hits=used_max_hits, scope_paths=sp,
+                                         deadline=deadline, layer=layer, truncated_docs=truncated_docs,
+                                         offset=offset)
         # 親返し（L4c・§3.3/§3.4）: es_search 限定・既定 ON。rag チャンク由来のヒット（`chunk_id`
         # あり）は doc_id ごとに束ねて `_resolve_parent_return` へ渡し、legacy ヒット（`chunk_id`
         # 無し・40行チャンク由来）は従来どおり素通しする（`out` へ直接積む）。
         #
-        # 順位保持: `hits` は ES ヒットのスコア降順のまま
-        # 渡ってくる（`es_index.search`）。legacy ヒットを先に全部積み、rag 文書の集約結果を
-        # 末尾へ `extend` すると、rag 文書のスコアが legacy ヒットより高くても常に後方へ回ってしまう
-        # （検索結果全体のスコア降順という契約を崩す）。`rag_slot_index` で各 doc の
-        # **最初に出現した（＝最高スコアの）ヒットの位置**を `out` 内に予約し、legacy ヒットはその場で
-        # 確定させる二段構えにする——`_resolve_parent_return`（budget 計算後にしか結果が出ない）の
-        # 完了を待たずに全体の並びを一度の走査で確定できる。
+        # ---- Phase 1: 引用（cites）・doc 収集・rag_groups の組み立て（per_hit に依存しない・1回だけ）----
+        # 順位保持: `hits` は ES ヒットのスコア降順のまま渡ってくる（`es_index.search`）。legacy
+        # ヒットを先に全部積み、rag 文書の集約結果を末尾へ `extend` すると、rag 文書のスコアが
+        # legacy ヒットより高くても常に後方へ回ってしまう（検索結果全体のスコア降順という契約を
+        # 崩す）。`template`（出力順のプレースホルダ列）で各 doc の**最初に出現した（＝最高スコアの）
+        # ヒットの位置**を予約し、legacy ヒットはその場で確定させる——`_resolve_parent_return`
+        # （budget 計算後にしか結果が出ない）の完了を待たずに全体の並びを一度の走査で確定できる。
+        # legacy ヒットの `text` はここではまだクリップしない（Phase 2 が per_hit ごとに再構築する
+        # ため、redaction・quote・citations・rag_groups はクリップの試行回数に関わらず1回で済ませる
+        # ——ここを retry のたびにやり直すと `cites`/`docs` に同じ引用を何重にも積んでしまう）。
         parent_return_on = name == "es_search" and _parent_return_enabled()
+        template: list = []      # [("legacy", hit_view_dict) | ("rag", doc_id), ...]（出力順）
         rag_groups: dict = {}
-        rag_slot_index: dict[str, int] = {}   # doc_id -> `out` 内の予約位置（代表ヒットの位置）
+        rag_slot_index: dict[str, int] = {}   # doc_id -> template 内の予約位置（代表ヒットの位置）
         for h in hits:
             docs.add(h["doc_id"])
             redacted_text = _redact(h["text"])
@@ -2213,8 +2642,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 if h["doc_id"] not in rag_slot_index:
                     # 最初に出現した位置＝ES ヒットのスコア降順の下でその doc の最高スコア
                     # （同 doc の2件目以降は既に予約済みの枠へ集約されるだけ・新しい枠は作らない）。
-                    rag_slot_index[h["doc_id"]] = len(out)
-                    out.append(None)                      # 集約結果が確定するまでの予約枠
+                    rag_slot_index[h["doc_id"]] = len(template)
+                    template.append(("rag", h["doc_id"]))
                 continue
             hit_view = {"doc_id": h["doc_id"], "line": h["line"], "text": text_for_llm}
             # grep（`ripgrep_search`）ヒットが持つ登録者重要度（`grep_tool.
@@ -2233,26 +2662,83 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 # 検索できていない可能性があることを、探す経路でも黙らせない。理由が無ければキーを
                 # 作らない既存の流儀（`degrade_reason` 参照）＝通常のヒットは戻り値の形が完全に不変。
                 hit_view["file_truncated"] = True
-            out.append(hit_view)
-        if rag_groups:
-            # legacy ヒット分（`out` に既に積んだ分・予約枠の `None` は除く）を先に差し引いた残りが
-            # rag doc 群の予算（§3.4「全文書ぶんの最低保証」は legacy を含めた tool result 全体の
-            # 予算から見る）。
-            legacy_bytes = sum(len(hv["text"].encode("utf-8")) for hv in out if hv is not None)
-            budget_for_rag = max(0, tr_max_bytes - legacy_bytes)
-            resolved = _resolve_parent_return(world, rag_groups, sp, layer, budget_for_rag)
-            resolved_by_doc = {r["doc_id"]: r for r in resolved}
-            for doc_id, idx in rag_slot_index.items():
-                out[idx] = resolved_by_doc[doc_id]   # 予約した代表位置へ集約結果を差し戻す（§順位保持）
-        view = {"hits": out}
-        # ヒット上限（max_hits）に達した検索は母集団の一部しか返していない＝打ち切りの印を返す
-        # （続きを取る引数は無い＝モデルは範囲を絞る・別の語で探す・未確認として扱う）。
-        if cap_reached or len(hits) >= (max_hits or MAX_HITS):
-            view["truncated"] = True
-        if degrade_reason:                              # es_search のみ・BM25 継続時の縮退理由
-            view["degrade_reason"] = degrade_reason
-        if truncated_docs:                              # ripgrep_search のみ・打切りで探せていない文書
-            view["truncated_docs"] = truncated_docs[:_TRUNCATED_DOCS_MAX]
+            template.append(("legacy", hit_view))
+
+        # ---- Phase 2: per_hit を割り当てて `view` を組み立て、直列化後の実バイト数で収まりを保証する ----
+        def _build_view(per_hit: int) -> tuple[dict, bool]:
+            out = []
+            any_clipped = False
+            legacy_bytes = 0
+            for kind, payload in template:
+                if kind == "rag":
+                    out.append(None)                       # 集約結果が確定するまでの予約枠
+                    continue
+                hv = dict(payload)                          # per_hit ごとに作り直す（元の template は不変に保つ）
+                clipped_text = _clip_utf8_bytes(hv["text"], per_hit)
+                if clipped_text != hv["text"]:
+                    # 末尾だけを切る（`_clip_utf8_bytes` はバイト列の先頭から詰める）——MD ヒットの
+                    # 見出し行は section 本文の先頭行のため、この向きのクリップでも失われない。
+                    hv["text"] = clipped_text
+                    hv["text_truncated"] = True
+                    any_clipped = True
+                legacy_bytes += len(hv["text"].encode("utf-8"))
+                out.append(hv)
+            if rag_groups:
+                # legacy ヒット分（クリップ後の実バイト数）を先に差し引いた残りが rag doc 群の予算
+                # （§3.4「全文書ぶんの最低保証」は legacy を含めた tool result 全体の予算から見る）。
+                budget_for_rag = max(0, tr_max_bytes - legacy_bytes)
+                resolved = _resolve_parent_return(world, rag_groups, sp, layer, budget_for_rag)
+                resolved_by_doc = {r["doc_id"]: r for r in resolved}
+                for doc_id, idx in rag_slot_index.items():
+                    out[idx] = resolved_by_doc[doc_id]   # 予約した代表位置へ集約結果を差し戻す（§順位保持）
+                    if resolved_by_doc[doc_id].get("text_truncated"):
+                        # 親返し側（1文書あたりの上限）で切られた doc も legacy ヒットのクリップと
+                        # 同じ最上位フラグへ合流させる（`tool_result_clipped` 計測は最上位キーしか見ない）。
+                        any_clipped = True
+            view = {"hits": out}
+            # ヒット上限（used_max_hits）に達した検索は母集団の一部しか返していない＝打ち切りの
+            # 印を返す。`next_offset` は ripgrep_search だけが持つ——`offset` を先頭からのページ位置
+            # として、そのページが丁度 used_max_hits 件埋まっていれば offset+used_max_hits 件目より
+            # 先が存在しうる（ページングを持たない es_search は付けない・上の es_search 分岐参照）。
+            # `MAX_HITS_ABS_MAX` 未満のときだけ付ける——ちょうど天井に達するページ（`used_max_hits`
+            # が縮められた最終ページを含む）はこれ以上ページングしない、という合図をここで確定する
+            # （続きを辿らせて offset が際限なく伸びるのを防ぐ・巻き戻しはしない代わりに
+            # 「ここで終わり」を明示する）。
+            if cap_reached or len(hits) >= used_max_hits:
+                view["truncated"] = True
+                if name == "ripgrep_search" and offset + used_max_hits < MAX_HITS_ABS_MAX:
+                    view["next_offset"] = offset + used_max_hits
+            if degrade_reason:                              # es_search のみ・BM25 継続時の縮退理由
+                view["degrade_reason"] = degrade_reason
+            if truncated_docs:                              # ripgrep_search のみ・打切りで探せていない文書
+                view["truncated_docs"] = truncated_docs[:_TRUNCATED_DOCS_MAX]
+            if any_clipped:
+                # ヒット単位のクリップを最上位にも申告する——`_record_run_tool_limits`/
+                # `mcp_server.py` の tool_result_clipped 計測はどちらも最上位キーしか見ない
+                # （`read_around`/`read_doc` の text_truncated と同じ場所）ため、`hits[i]` だけに
+                # 付けると計測から漏れる。
+                view["text_truncated"] = True
+            return view, any_clipped
+
+        per_hit = max(_HIT_TEXT_MIN_BYTES, tr_max_bytes // max(1, used_max_hits))
+        view, _any_clipped = _build_view(per_hit)
+        # per_hit は text だけの割当てで、各ヒットの付帯情報（doc_id・line・span・importance 等）と
+        # JSON の構造分（キー名・区切り記号）を数えていない——ヒット数が多いほどこのオーバーヘッドが
+        # 積み上がり、text を per_hit ぴったりに詰めても `view` の直列化後の実バイト数が
+        # `tr_max_bytes` を超えうる。超えると `mcp_server._clip_tool_result` が結果全体を
+        # `{"truncated":..,"text":..}` の平文へ潰し、構造（`next_offset`・後方のヒットの doc_id 等）
+        # が失われる——「offset は巻き戻さない」契約を無意味にしないため、ここで実バイト数を測って
+        # 収まりを保証する。超えていたら per_hit を詰めて再構築する（最大4回・下限
+        # `_HIT_TEXT_MIN_BYTES` は割らない）。それでも収まらない場合だけ、現状どおり外側の
+        # `mcp_server._clip_tool_result`（fail-open）に委ねる——本文の総量自体が
+        # `_HIT_TEXT_MIN_BYTES` × ヒット数だけでも予算を超える極端なケースに限られる。
+        attempts = 1
+        while (per_hit > _HIT_TEXT_MIN_BYTES
+              and len(json.dumps(view, ensure_ascii=False).encode("utf-8")) > tr_max_bytes
+              and attempts < 4):
+            per_hit = max(_HIT_TEXT_MIN_BYTES, int(per_hit * 0.75))
+            view, _any_clipped = _build_view(per_hit)
+            attempts += 1
         return (view, docs, cites, cards)
     if name == "graph_neighbors":
         if layer not in (None, "both"):
@@ -2263,8 +2749,25 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # 無制限では硬いフィルタにならない）。層が限定されている間はこのツール自体を拒否する。
             return ({"error": "指定した探す対象（層）では関係グラフの照会は使えません"}, docs, cites, cards)
         from . import lens_service                       # 遅延 import（循環回避）
+        from .ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
         term = str(args.get("name") or "")
-        raw_cards = lens_service.neighbor_cards(world, term, sp) if term else []
+        try:
+            if not term:
+                raw_cards = []
+            elif graph_only:
+                raw_cards = lens_service.neighbor_cards_graph_only(world, term, sp)
+            else:
+                raw_cards = lens_service.neighbor_cards(world, term, sp)
+        except GraphSchemaEraError as e:
+            # 世代不一致は調査を終端させず、MCP 側（`mcp_server.py::handle`）と同じ機械可読コードの
+            # ツール結果へ変換して返す——以降のツール呼び出し（grep/原本直読）はそのまま続く。
+            # 呼び出し元（`run_tool` 境界）が `_record_tool_result_error_code` 経由で
+            # `InvestigationState.graph_schema_era_mismatch` を立てる。
+            return ({"error": GRAPH_REINGEST_ERROR_CODE, "world": e.world, "stored_era": e.stored_era},
+                    docs, cites, cards)
+        # `neighbor_cards` が内部で捕捉した障害（`lens_service.NeighborCardsFailure.error_code`・
+        # 属性が無ければ通常の空/非空リストのまま None）——戻り値の `list` 型自体は変えない。
+        _graph_error_code = getattr(raw_cards, "error_code", None)
         # LLM 向け `view` は
         # 従来から `cards[:_GRAPH_CARDS_MAX]` で件数制限していたが、4つ目の戻り値（呼び出し元 3 dialect が
         # `cards += cd` で蓄積し、troubleshoot の `data.candidates` へ最終的に載るサイドカー）は
@@ -2302,6 +2805,11 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # 呼び出し側（モデル）が「すべて」と断定しないよう打ち切りの事実と総数を返す。
             result["truncated"] = True
             result["count"] = len(raw_cards)
+        if _graph_error_code:
+            # `neighbor_cards` が内部で捕捉した障害（`"graph_unavailable"`/`"graph_internal_error"`）
+            # ——呼び出し元（`run_tool` 境界）が `_record_tool_result_error_code` 経由で
+            # `InvestigationState.backend_failures["graph"]`/`non_recoverable_failure` へ反映する。
+            result["error_code"] = _graph_error_code
         return (result, docs, cites, cards)
     if name == "read_around":
         doc_id = str(args.get("doc_id") or "")
@@ -2556,6 +3064,12 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             docs.add(doc_id)
             result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
         return (result, docs, cites, cards)
+    if name == "write_output_file":
+        # DEPTH-2 S2（§2.7）: docs/cites/cards は空のまま返す——個人 workspace の成果物は
+        # 共有 KB の出典（sources）検証（`_verified_sources`/`verify_doc_exists`）の対象外
+        # （RAG に索引化しない・出典欄には出さない契約）。成果物は別チャンネル
+        # （`InvestigationState.created_files`→ envelope の `created_files`）で運ぶ。
+        return (_run_write_output_file(args, uid), docs, cites, cards)
     if name in _USAGE_TOOL_ARG_KEYS:
         return _run_usage_tool(name, args, tr_max_bytes)
     return ({"error": f"unknown tool: {name}"}, docs, cites, cards)
@@ -2965,11 +3479,11 @@ _ES_DEGRADE_WORDING = {
     # 結果は同じ）。
     "hybrid_query_failed": ("検索の精度が一部低下しています",
                            "意味検索の問い合わせが一時的に失敗したため、キーワード一致のみで探しています"),
-    # 索引の埋め込み素性と現在の AI 設定が合わない（設定変更後の再取り込み待ち）。一時障害ではなく
-    # 再取り込みまで続く状態なので、案内文で「取り込みのやり直し」まで示す。
+    # 索引の埋め込み素性と現在の AI 設定が合わない（設定変更後の更新待ち）。一時障害ではなく
+    # 解消まで続く状態なので、案内文で直し方まで示す。
     "vector_feature_mismatch": ("検索の精度が一部低下しています",
                                 "取り込んだ資料が現在の AI 設定では意味検索に使えないため、キーワード一致のみで探しています"
-                                "（資料の取り込みをやり直すと戻ります）"),
+                                "（管理者に『今すぐ更新』を依頼してください）"),
 }
 
 
@@ -3036,8 +3550,11 @@ def _tool_hit_count(name: str, result: dict) -> int | None:
     既知値（`es_unavailable`/`es_query_failed`＝BM25 自体も失敗し hits が強制的に空になっている）
     のときも None にする——「検索は実行できたが0件だった」ことにはならないため、件数ノードで
     「0件（キーワード一致のみ）」と出すと実際には検索していないのに検索したかのような誤表示になる。
+    固定理由コード（`error_code`・`_record_tool_result_error_code` が拾うのと同じ語彙）が付いた
+    結果も同じ理由で None にする——`graph_neighbors` が内部で障害を握りつぶして `{"neighbors": []}`
+    を返す場合（"error" キーは持たない）等、「実行できなかった」を「0件ヒット」と混同しない。
     """
-    if not isinstance(result, dict) or "error" in result:
+    if not isinstance(result, dict) or "error" in result or result.get("error_code"):
         return None
     if name == "ripgrep_search":
         return len(result.get("hits") or [])
@@ -3081,13 +3598,15 @@ def _tool_hit_count(name: str, result: dict) -> int | None:
 _SEARCH_TRUNCATED_TOOLS = frozenset({
     "ripgrep_search", "es_search", "glob_search", "graph_neighbors", "list_docs", "doc_outline"})
 # tool_result_clipped（同）: 1 件あたりのバイト予算で本文が切り詰められた呼び出し。判定キーは
-# `text_truncated`（read_around/read_doc の逐次クリップ）と `byte_clipped`（`_finish_reader_result`
-# の原本読取ツール・compare_documents の diff がバイト予算で切ったときだけ立てる印）。読取ツールの
-# `truncated` は行数/ページ数の上限でも立つため使わない。件数上限の doc_outline/graph_neighbors/
-# 検索系は `search_truncated` で数える。
+# `text_truncated`（read_around/read_doc の逐次クリップ・ripgrep_search/es_search のヒット単位
+# クリップ）と `byte_clipped`（`_finish_reader_result` の原本読取ツール・compare_documents の diff
+# がバイト予算で切ったときだけ立てる印）。読取ツールの `truncated` は行数/ページ数の上限でも立つ
+# ため使わない。ripgrep_search/es_search は母集団側の打ち切り（`search_truncated`）とヒット単位の
+# バイト打ち切り（`tool_result_clipped`）が独立に起こりうる（同一呼び出しで両方立つこともある）。
+# 件数上限の doc_outline/graph_neighbors/list_docs/glob_search は `search_truncated` のみで数える。
 _BYTE_CLIP_TOOLS = frozenset({
     "read_around", "read_doc", "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
-    "pdf_pages", "file_head", "compare_documents"})
+    "pdf_pages", "file_head", "compare_documents", "ripgrep_search", "es_search"})
 
 
 def _record_run_tool_limits(state: "investigation_state.InvestigationState", name: str, result) -> None:
@@ -3795,13 +4314,22 @@ def verify_doc_exists(doc_id: str, world: str, scope_paths=None) -> bool:
     (1) 実在: `documents.resolve`（`world_graph.resolve_path`・root 配下への直接解決が真実源）。
         `resolve_path` は world 配下の通常ファイルを**種別を問わず**解決するため、
         これだけでは `.env`・鍵・内部設定ファイル等も「実在文書」として通ってしまう。
-    (2) 文書種別: `corpus_docs.status_document_doctype(doc_id, world)`（拡張子ベースの分類・
-        `accepts()` 内容判定が必要な場合だけ実体を読む）が `None`（対象外の付帯物）でないこと。
-        画像は「対応する派生 MD の有無」ではなく
-        この doctype 分類で許可する——派生 MD の生成タイミングに依存させない（`verify_citation`/
-        `_safe_doc_path` は read_around の本文読み取り用で解決先が派生 MD のため、生成が遅延/
-        未完了だと実在する原本を誤って「存在しない」と判定する。「本文を読めるか」と「文書として
-        実在するか」は別の問いで、本関数は後者だけを見る）。
+    (2) 文書種別: `corpus_docs.status_document_reachable(doc_id, world, allow_content_sniff=True)`
+        （拡張子ベースの分類・`accepts()`/軽量テキスト枠の第2段内容判定が必要な場合だけ実体を読む）
+        が **`True`（積極的に「読める」と確定）** であること——fail-closed。`False`（積極的に
+        対象外と確定）はもちろん、`None`（`kind=="unreadable"`＝内容判定に必要な読み取り自体が
+        失敗＝判定不能）も「読める」扱いにしない（`status_document_doctype()` は `kind==
+        "unreadable"` を非 None の値として返すため、それをそのまま「実在する」に丸めると
+        判定不能を積極的な確認と取り違える——長すぎるパスで `lstat` が失敗する一方、配信側の
+        open 経路はその制約を受けず成功する、という実害があった）。画像は「対応する派生 MD の
+        有無」ではなくこの分類で許可する——派生 MD の生成タイミングに依存させない
+        （`verify_citation`/`_safe_doc_path` は read_around の本文読み取り用で解決先が派生 MD の
+        ため、生成が遅延/未完了だと実在する原本を誤って「存在しない」と判定する。「本文を読めるか」
+        と「文書として実在するか」は別の問いで、本関数は後者だけを見る）。`allow_content_sniff=True`
+        ：本関数は1 doc_id につき1回だけ呼ばれる（`manifest_doctype_count` のような manifest
+        件数分のホットループではない）ため、軽量テキスト枠の第2段（未登録拡張子・拡張子なし）も
+        内容を読んで判定する——`False`（既定）のままだと grep/read_around では読める文書を
+        「存在しない」と誤判定し、出典（sources）から機械的に除外してしまう。
     (3) scope: `scope_paths` を渡した場合、`scope_mod.in_scope(doc_id, scope_paths)` も満たす
         こと（grep/es_search 自体が scope 内に絞って返す契約だが、ここでも独立に多層防御する）。
 
@@ -3811,7 +4339,7 @@ def verify_doc_exists(doc_id: str, world: str, scope_paths=None) -> bool:
         return False
     try:
         from . import corpus_docs, documents
-        if corpus_docs.status_document_doctype(doc_id, world) is None:
+        if corpus_docs.status_document_reachable(doc_id, world, allow_content_sniff=True) is not True:
             return False
         return documents.resolve(doc_id, world) is not None
     except Exception:
@@ -4794,10 +5322,19 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
                       failure_kind: str | None = None,
                       read_evidence: list | None = None,
                       gaps: list | None = None,
-                      limits: dict | None = None) -> dict:
+                      limits: dict | None = None,
+                      created_files: list | None = None,
+                      backend_failures: dict | None = None,
+                      non_recoverable_failure: bool = False) -> dict:
     """`{"final": ...}` イベントの共通組み立て（Committed Evidence 化は呼び出し元が済ませた状態で
     受け取る）。候補があったのに全滅した場合は `stop_reason` を `evidence_verification_failed` へ
     上書きする（honest failure）。
+
+    `created_files`（DEPTH-2 S2・§2.7・省略可・既定 None＝空）: `write_output_file` ツールが台帳
+    登録に成功した行（`InvestigationState.created_files`・`{"rel_path","download_url",...}`）。
+    値が空なら `limits` と同じ流儀でキー自体を payload に作らない（既存消費者への無害な後方互換）。
+    非空でも `gaps`/`read_evidence` と同じ内部専用チャンネル——公開 `data.citations`/Evidence Packet
+    には出さない（呼び出し元 base.py が `env["created_files"]`（ダウンロード導線カード）へ写す）。
 
     呼び出し元が `committed`/`dropped` を先に検査してから最終テキスト（自然回答かクリーン再合成か）
     を決めたいケース（no-tool 終了時の Anthropic/Gemini 経路等）向けに、`_commit_evidence` の実行は
@@ -4842,10 +5379,20 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
     `state`（`providers/base.py::_ingest_sub_final_into_state`）へ引き継ぐにはここに載せる
     必要がある——`read_evidence` と同じ内部専用チャンネル（Evidence Packet／`data.citations`
     には出さない）。
+
+    `backend_failures`（省略可・既定 None＝空）/`non_recoverable_failure`（省略可・既定 False）:
+    障害種別（`InvestigationState.backend_failures`/`non_recoverable_failure`）。`gaps`/`limits`
+    と同じ理由でここに載せないとループの外（`providers/base.py::_ingest_sub_final_into_state`）へ
+    引き継げない——単発フォールバックへの縮退可否判定（`providers/base.py::run`）が使う。
     """
     structural_evidence_meta = structural_evidence_meta or []
     has_structural_evidence = bool(structural_evidence_meta)
-    if not committed and dropped and not has_structural_evidence:
+    # 予算到達3種（turns_exhausted/budget_exceeded/tools_per_turn_exceeded）は根拠ゲートの
+    # 「候補があったのに全滅」より優先して保持する——ここで evidence_verification_failed へ
+    # 上書きすると、単発フォールバックへの縮退可否判定（`providers/base.py::run` の
+    # `_stop_reason_not_budget`）が実際の終了理由を読み取れなくなる。
+    if (not committed and dropped and not has_structural_evidence
+            and stop_reason not in _BUDGET_EXHAUSTED_STOP_REASONS):
         stop_reason = "evidence_verification_failed"
     used_evidence_docs = used_evidence_docs or set()
     attributed_ev_ids = attributed_ev_ids or set()
@@ -4878,6 +5425,13 @@ def _finalize_payload(text: str, docs: set, searched: bool, committed: list, evi
     # 制限0件」と解釈する・`store/usage.py::usage_stats` の `limits` 集計参照）。
     if limits and any(limits.values()):
         payload["limits"] = dict(limits)
+    # backend_failures（値が全て既定=False なら未計測と同じキー無しのまま・limits と同じ流儀）。
+    if backend_failures and any(backend_failures.values()):
+        payload["backend_failures"] = dict(backend_failures)
+    if non_recoverable_failure:
+        payload["non_recoverable_failure"] = True
+    if created_files:
+        payload["created_files"] = list(created_files)
     if evaluation is not None:
         payload["evaluation_status"] = evaluation.get("status")
         payload["evaluation_reason"] = evaluation.get("reason")
@@ -4893,7 +5447,10 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
                          attributed_ev_ids: set | None = None,
                          read_evidence: list | None = None,
                          gaps: list | None = None,
-                         limits: dict | None = None) -> dict:
+                         limits: dict | None = None,
+                         created_files: list | None = None,
+                         backend_failures: dict | None = None,
+                         non_recoverable_failure: bool = False) -> dict:
     """`_finalize_payload` の薄いラッパー。citation 列（Candidate のまま）を受け取り、ここで
     `_commit_evidence` を1回だけ実行してから共通組み立てへ渡す（緊急打ち切り経路でも未検証
     citation を外へ出さない）。
@@ -4902,7 +5459,58 @@ def _build_final_payload(text: str, docs: set, searched: bool, cites: list, card
     return _finalize_payload(text, docs, searched, committed, evidence_meta, dropped, cards, usage,
                              verified_docs, stop_reason, evaluation, structural_evidence_meta,
                              used_evidence_docs, attributed_ev_ids, read_evidence=read_evidence,
-                             gaps=gaps, limits=limits)
+                             gaps=gaps, limits=limits, created_files=created_files,
+                             backend_failures=backend_failures,
+                             non_recoverable_failure=non_recoverable_failure)
+
+
+def _render_existing_claims_for_prompt(existing_claims: list[dict] | None, max_bytes: int) -> str:
+    """再調査（2回目以降）の worker 一次判断要求へ渡す既存主張の整形——id・status・本文のみ
+    （`evidence_refs` は今回のローカル調査状態とは別採番のため渡さない・呼び出し元
+    `providers/base.py::_ingest_sub_final_into_state` docstring 参照）。`max_bytes`（
+    `_SYNTHESIS_MAX_BYTES // 4` と同じ「予算の1/4」流用・新設定は増やさない）超過時は、全件の
+    id・status を必ず保持し、本文だけを件ごとに均等配分の残余で切り詰める（入らない分は
+    「(本文省略)」で列挙）。行境界（1件=1行）で切り、id を途中で切らない——後続の `[cN]` 行が
+    丸ごと落ちると、取り込み側の id 置換（同一 id は最新扱い）が別論点の主張を消しうる。
+    """
+    if not existing_claims:
+        return ""
+    items = []
+    for c in existing_claims:
+        cid, status, text = c.get("id"), c.get("status"), c.get("text")
+        if not cid or not status or not text:
+            continue
+        items.append((cid, status, text))
+    if not items:
+        return ""
+
+    def _line(cid, status, text) -> str:
+        return f"[{cid}] {status}: {text}"
+
+    full_out = "\n".join(_line(cid, status, text) for cid, status, text in items)
+    if len(full_out.encode("utf-8")) <= max_bytes:
+        return full_out
+
+    n = len(items)
+    prefixes = [f"[{cid}] {status}: " for cid, status, _ in items]
+    prefix_bytes = [len(p.encode("utf-8")) for p in prefixes]
+    newline_bytes = max(n - 1, 0)
+    budget_for_text = max_bytes - sum(prefix_bytes) - newline_bytes
+    per_item_text_budget = max(budget_for_text // n, 0)
+
+    placeholder = "(本文省略)"
+    lines = []
+    for (cid, status, text), prefix in zip(items, prefixes):
+        if per_item_text_budget <= 0:
+            lines.append(f"{prefix}{placeholder}")
+            continue
+        raw_text = text.encode("utf-8")
+        if len(raw_text) <= per_item_text_budget:
+            lines.append(f"{prefix}{text}")
+        else:
+            truncated = raw_text[:per_item_text_budget].decode("utf-8", errors="ignore")
+            lines.append(f"{prefix}{truncated}" if truncated else f"{prefix}{placeholder}")
+    return "\n".join(lines)
 
 
 # ---- 反復ループ（OpenAI 形式＝OpenAI/Ollama 共用 ／ Gemini 形式）----
@@ -4918,8 +5526,28 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                  tool_deadline: float | None = None, layer=None,
                  max_hits: int | None = None, window_cap: int | None = None,
                  tools_pref: dict | None = None, tools_availability: dict | None = None,
-                 system_settings: dict | None = None):
+                 system_settings: dict | None = None, uid: str | None = None,
+                 request_claims: bool = True,
+                 existing_claims: list[dict] | None = None):
     """OpenAI/Ollama の tool-use を反復。`{"node":..}` を yield しつつ最後に `{"final","docs"}`。
+
+    `uid`（DEPTH-2 S2・§2.7・省略可・既定 `None`）: `write_output_file` ツール（成果物登録の
+    共通化）の書き先（個人 workspace の files/）を決める呼び出し元のユーザー id。`None`（省略・
+    テスト等）のときは `write_output_file` を呼んでも「作成者が特定できません」という error 結果に
+    なる（`run_tool` へそのまま転送・`toolset` を明示指定しても uid は常に転送する）。
+
+    `request_claims`（`final_synthesis=False` 経路限定・既定 `True`）: 偽なら worker の一次判断
+    （確定/推定/不明の主張配列）を要求する追加の LLM 呼び出し自体を発行しない。呼び出し元
+    （`providers/base.py`）がこのターンで主張を査読する見込みが無いと分かっている場合に使う——
+    査読を通らない主張はどのみち清書・公開へ渡らないため、要求すること自体が無駄になる。
+    `final_synthesis=True` のときは無視する。
+
+    `existing_claims`（`request_claims=True` かつ `final_synthesis=False` のときだけ使う・
+    省略可・既定 `None`）: 再調査（このターンで既に確定している worker 由来の主張がある場合）で、
+    `claims_prompt` へ渡す既存主張（`{"id","status","text",...}` の list・`investigation_state.
+    claim_to_dict` の形でよい・`evidence_refs`/`reason`/`reason_code` は無視する）。呼び出し元
+    （`providers/base.py::_agentic_run`）が初回にはこの引数を渡さない（既存の主張がまだ無い）——
+    渡さない場合は id 採番規約を伝えない（初回はどのみち衝突する既存 id が無い）。
 
     `layer`（省略可・既定 `None`＝`"both"`＝既存呼び出し元は無変更）: `scope_paths` と同じく
     `run_tool` へそのまま転送する探す対象フィルタ（調べ方ブロック §3.4）。
@@ -5126,14 +5754,16 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     msgs = [{"role": "system", "content": system}, *(history or []),
             {"role": "user", "content": user}]
     _tp = tools_pref_mod.normalize_tools_pref(tools_pref)
+    _unreachable_backends: list = []   # 実接続で不達のバックエンド（利用者の OFF とは区別する）
     if toolset is not None:
         tools = toolset               # SC-6e: 明示指定時は可用性判定を一切参照しない（docstring 参照）
     else:
         # SC-6e: 呼び出し元が渡した snapshot を使う（無ければ後方互換で都度チェック・TTLキャッシュつき）。
         _avail = tools_availability if tools_availability is not None else tool_availability()
+        _unreachable_backends = _unreachable_backends_at_start(_avail, _tp)
         tools = openai_tools(
             with_es=_avail["fulltext"] and _tp["fulltext"], with_graph=_avail["graph"] and _tp["graph"],
-            can_ask=can_ask, with_grep=_tp["grep"])
+            can_ask=can_ask, with_grep=_tp["grep"], with_write=uid is not None)
     # 実際に提示した `tools` からツール名集合を
     # 導出し、`allowed_tools` 未指定（メイン経路）でも「提示していないツール名は拒否」を強制する。
     offered_names = frozenset(t["function"]["name"] for t in tools)
@@ -5143,6 +5773,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     # `msgs` 内の「assistant(tool_calls)＋対応する tool メッセージ全部」1組ぶんの `[start, end)`
     # を古い順に積む——置換境界は常にこの組の先頭に揃えるため、組の途中で切ることがない。
     state = investigation_state.InvestigationState(question=user, scope={"world": world, "layer": layer})
+    for _kind in _unreachable_backends:
+        # 不達でツール集合から外れたターンも縮退として1回だけ計数する（実行中の記録機会が無い）。
+        state.mark_backend_failure(_kind)
     _prefix_len = len(msgs)
     _round_bounds: list[tuple[int, int]] = []
     docs: set = set()
@@ -5156,9 +5789,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     max_tools_per_turn = effective_max_tools_per_turn(system_settings)
     total_tool_bytes = 0                        # 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
-    # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: メイン頭脳の provider/model を渡し、
-    # 窓由来の上限との min() を取る（`resolve_tool_result_budgets` docstring 参照）。Ollama の場合
-    # だけ `/api/show` 照会用の base_url を導出する（`model_windows.derive_ollama_base_url`）。
+    # 変えても当該 run には影響しない）。メイン頭脳の provider/model/ollama_base_url も渡すが、
+    # 窓由来の上限との min()（旧 BUDGET-2）は撤去済みのため値の解決には使わない
+    # （`resolve_tool_result_budgets` docstring 参照）——呼び出し形自体は互換のためそのまま残す。
     from . import model_windows as _model_windows
     tool_result_max_bytes, tool_result_max_total_bytes = resolve_tool_result_budgets(
         system_settings=system_settings,
@@ -5194,7 +5827,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "budget_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                       created_files=state.created_files)
             return
         _acc_openai_usage(usage, resp, ollama)
         if usage_acc is not None:
@@ -5218,7 +5853,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world, verdict,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                               created_files=state.created_files)
                     return
                 if verdict["status"] in ("insufficient", "conflicting"):
                     if verdict["status"] == "conflicting":
@@ -5302,7 +5939,8 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     _ctx = contextvars.copy_context()
                     fut = _executor.submit(_ctx.run, run_tool, name, args, world, scope_paths,
                                            deadline=tool_deadline, layer=layer, max_hits=max_hits,
-                                           window_cap=window_cap, tool_result_max_bytes=tool_result_max_bytes)
+                                           window_cap=window_cap, tool_result_max_bytes=tool_result_max_bytes,
+                                           uid=uid)
                     _futures.append(("run", tc, name, args, fut))
             finally:
                 _executor.shutdown(wait=True)
@@ -5326,7 +5964,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                         yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                    verified_docs, "budget_exceeded", world,
                                                    structural_evidence_meta=structural_evidence_meta,
-                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                                   created_files=state.created_files)
                         return
                     tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                     if tc.get("id"):
@@ -5343,14 +5983,17 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     raise
                 except Exception as e:
                     # ワーカー（`run_tool`）の例外はこの呼び出しだけの error 結果に変換する
-                    # （他の呼び出しは既に並走して完了済み・止めない）。生の例外文字列（絶対パス
-                    # 等を含みうる）は次ターンの外部 LLM 送信本文へは出さず、固定文言にする——
-                    # 詳細はマスク済みのサーバーログにだけ残す（他の例外経路と同じ流儀）。
-                    from .ingest.graph_extract import _log_masked_exception
-                    _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e,
-                                          _header_secret(headers))
+                    # （他の呼び出しは既に並走して完了済み・止めない）。生の例外文字列（絶対パス・
+                    # ドキュメント本文の断片・辞書キー名等を含みうる——`_mask_secrets` は既知の
+                    # 秘密パターンしか伏せない）は本文はもちろんログにも出さない——型名と errno
+                    # （あれば）だけを残す（CLAUDE.md「鍵・トークンの内容を端末に出さない」節の
+                    # 精神に合わせ、ツール例外は文字列表現そのものを一切ログへ渡さない）。
+                    _log.warning("agentic_search: tool 実行に失敗（%s）: %s errno=%s",
+                                name, type(e).__name__, getattr(e, "errno", None))
+                    _record_tool_exception(state, name, e)   # 障害種別を調査状態へ記録
                     result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
                 _record_run_tool_limits(state, name, result)     # 並列経路も直列と同じ計測
+                _record_tool_result_error_code(state, result, name)    # 結果化済み障害（read_io/es/graph 等）の反映
                 hit_node = (_hit_summary_node_sub(name, result) if allowed_tools is not None
                            else _hit_summary_node(name, args, result))
                 if hit_node:
@@ -5372,7 +6015,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                               created_files=state.created_files)
                     return
                 docs |= d
                 cites += c
@@ -5402,6 +6047,19 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     _call_structural += _card_structural_evidence(cd)
                 structural_evidence_meta += _call_structural
                 state.add_tool_result(name, args, result, c, _call_structural)
+                # DEPTH-2 S2（§2.7）: 台帳登録に成功した回だけ成果物として蓄積する
+                # （`error` があれば失敗＝カードにしない・調査ループはこのまま継続する＝fail-open）。
+                if name == "write_output_file" and isinstance(result, dict) and "error" not in result:
+                    if result.get("rel_path"):
+                        state.created_files.append(
+                            {"rel_path": result["rel_path"], "download_url": result.get("download_url")})
+                    for _r in (result.get("rendered") or []):
+                        state.created_files.append(_r)
+                    # C21: 書込成功時点で呼び出し元（providers/base.py::_agentic_run）へ即時に
+                    # 伝える——このあと同じターン内で例外/ask_user が起きても、既に個人 workspace に
+                    # 実在するファイルの個人由来フラグを見失わない（"final" を待たない・"node" では
+                    # ない独立のサイドカーイベント）。
+                    yield {"created_files": list(state.created_files)}
                 tmsg = {"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)}
                 if tc.get("id"):
                     tmsg["tool_call_id"] = tc["id"]
@@ -5449,7 +6107,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                     yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                                verified_docs, "budget_exceeded", world,
                                                structural_evidence_meta=structural_evidence_meta,
-                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                               read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                               created_files=state.created_files)
                     return
                 tmsg = {"role": "tool", "name": safe_name, "content": json.dumps(result, ensure_ascii=False)}
                 if tc.get("id"):
@@ -5473,12 +6133,44 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 # チャット側は env を作らない）。これは意図的: ask_user の回答はフロントが新規メッセージ
                 # として再送し（chat_router の clarify 再開）、次ターンは新しい messages で検索し直す
                 # ＝この時点までの検索状態を持ち越す仕組みが元々無いので、破棄しても実害はない。
-                yield {"question": _question_from_args(args)}
+                # ただし `write_output_file` が既にこのターンで台帳登録に成功していれば
+                # （`state.created_files`）、ファイルは実在し個人 workspace に残ったまま――
+                # `final` を経ずに破棄すると呼び出し元の個人由来フラグ（`env["wrote_files"]`）が
+                # 立たず、確認カード・失敗保存が誤って共有可能（personal=False）のまま保存される
+                # （DEPTH-2 S2 是正）。question イベントに乗せて呼び出し元へ伝える。
+                yield {"question": _question_from_args(args), "created_files": list(state.created_files)}
                 return
-            result, d, c, cd = run_tool(name, args, world, scope_paths, deadline=tool_deadline,
-                                        layer=layer, max_hits=max_hits, window_cap=window_cap,
-                                        tool_result_max_bytes=tool_result_max_bytes)
+            # 直列経路も並列経路（上の `except GraphSchemaEraError: raise` / `except Exception`
+            # 分岐）と同じ例外変換にする——直列時だけ想定外例外がループ全体（`providers/base.py`
+            # の `except Exception as agentic_exc:`）まで伝播し全体終了になる非対称を解消する。
+            # ただし対象は `final_synthesis=False`（本関数の呼び出し元が `_sub_loop`＝self_worker
+            # 等の下調べ役サブループのときだけ・唯一この値を渡す・`providers/base.py::_sub_loop`
+            # 参照）に限る——`final_synthesis=True` の呼び出し元（research_service/graph_admin/
+            # usage_chat／頭脳自身の直接 `_agentic_loop`）は独自の例外分類契約を持つ
+            # （例: `research_service.run_research` の `_sherpa_llm_send_error` マーカーによる
+            # 「AI接続失敗」と「その他の予期しない失敗」の区別）——ここで例外をツール結果へ丸めて
+            # 飲み込むと、その契約が壊れる（grep 由来の I/O 例外が別の一般エラー文言へ化ける）。
+            from .ingest.world_neo4j import GraphSchemaEraError   # 遅延 import（他の遅延 import と同じ理由）
+            if final_synthesis:
+                result, d, c, cd = run_tool(name, args, world, scope_paths, deadline=tool_deadline,
+                                            layer=layer, max_hits=max_hits, window_cap=window_cap,
+                                            tool_result_max_bytes=tool_result_max_bytes, uid=uid)
+            else:
+                try:
+                    result, d, c, cd = run_tool(name, args, world, scope_paths, deadline=tool_deadline,
+                                                layer=layer, max_hits=max_hits, window_cap=window_cap,
+                                                tool_result_max_bytes=tool_result_max_bytes, uid=uid)
+                except GraphSchemaEraError:
+                    raise
+                except Exception as e:
+                    # 生の例外文字列（絶対パス・ドキュメント本文の断片等を含みうる）はログにも出さ
+                    # ない——型名と errno（あれば）だけを残す（並列経路と同じ流儀・上記コメント参照）。
+                    _log.warning("agentic_search: tool 実行に失敗（%s）: %s errno=%s",
+                                name, type(e).__name__, getattr(e, "errno", None))
+                    _record_tool_exception(state, name, e)   # 障害種別を調査状態へ記録
+                    result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
             _record_run_tool_limits(state, name, result)
+            _record_tool_result_error_code(state, result, name)    # 結果化済み障害（read_io/es/graph 等）の反映
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node`/`_tool_node_sub` は
             # 結果が出る前のノードのため件数を書けない・`_hit_summary_node`/`_hit_summary_node_sub`
             # 参照）。
@@ -5517,7 +6209,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                           created_files=state.created_files)
                 return
             docs |= d
             cites += c
@@ -5569,6 +6263,14 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             # C2（探索ループの文脈整理）: 既存の docs/cites/cards の収集と並行して調査状態も育てる
             # （検証前の生 citation・確定済みの構造的根拠・精読本文——`add_tool_result` docstring 参照）。
             state.add_tool_result(name, args, result, c, _call_structural)
+            # DEPTH-2 S2（§2.7）: 台帳登録に成功した回だけ成果物として蓄積する（並列経路と同じ判定）。
+            if name == "write_output_file" and isinstance(result, dict) and "error" not in result:
+                if result.get("rel_path"):
+                    state.created_files.append(
+                        {"rel_path": result["rel_path"], "download_url": result.get("download_url")})
+                for _r in (result.get("rendered") or []):
+                    state.created_files.append(_r)
+                yield {"created_files": list(state.created_files)}   # C21: 書込成功時点で即時に伝える（並列経路と同じ理由）
             tmsg = {"role": "tool", "name": name, "content": json.dumps(result, ensure_ascii=False)}
             if tc.get("id"):
                 tmsg["tool_call_id"] = tc["id"]
@@ -5583,7 +6285,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
             yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                        verified_docs, "tools_per_turn_exceeded", world,
                                        structural_evidence_meta=structural_evidence_meta,
-                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                       created_files=state.created_files)
             return
         _round_bounds.append((_round_start, len(msgs)))
         # 探索ループの文脈整理: `msgs` が予算を超えたら、最新 `SHERPA_AGENTIC_KEEP_RECENT_TOOLS`
@@ -5619,7 +6323,9 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                 yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
                                            verified_docs, "budget_exceeded", world, verdict,
                                            structural_evidence_meta=structural_evidence_meta,
-                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                                           read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure,
+                                           created_files=state.created_files)
                 return
             if verdict["status"] == "sufficient":
                 # §3.2: sufficient → Candidate/Verified から Committed Evidence へ（tail で確定）。
@@ -5659,10 +6365,64 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     # 最終回答**（外側クラウド合成 `_answer_prompt`）自身に対する帰属だけを使う契約
     # （`providers/base.py` がストリーム完了後に別途組み立てる）。
     if not final_synthesis:
-        yield _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
-                                   verified_docs, stop_reason, world, evaluation,
-                                   structural_evidence_meta=structural_evidence_meta,
-                                   read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+        # DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）: 文章を
+        # 破棄する代わりに、収集済み根拠（このループ専用のローカル `state`）から確定/推定/不明の
+        # 主張配列を worker 自身の接続・モデルで**1回だけ**要求する。通信失敗・パース不能・
+        # 途中で切れた JSON・budget_exceeded はいずれも `claims_raw=None`＝根拠だけで従来どおり
+        # 進む（honest failure に倒す既存契約は変えない・失敗に倒れない）。利用者の停止要求
+        # （`_SendAborted(reason="stop")`）だけは他の送信点と同じ契約で final を出さず return
+        # する。`evidence_refs` は worker
+        # 専用のローカル `state.evidence` の ev-N のまま持ち出す——Evidence Packet 化
+        # （`_commit_evidence`）前・親 `InvestigationState` とは別採番のため、ここでは書き換えない
+        # （書き換えは取り込み側 `providers/base.py::_ingest_sub_final_into_state` の責務・
+        # `investigation_state.remap_claim_refs_to_evidence` 参照）。`request_claims` が偽の
+        # ターン（呼び出し元が査読を発動しないと分かっている深さ）ではこの呼び出し自体を
+        # 発行しない——査読を通らない一次判断はどのみち公開されないため。
+        claims_raw = None
+        if request_claims and state.evidence:
+            try:
+                from .providers.prompts import claims_prompt
+                _claims_digest = state.render(max_bytes=_SYNTHESIS_MAX_BYTES // 2)
+                _existing_claims_text = _render_existing_claims_for_prompt(
+                    existing_claims, _SYNTHESIS_MAX_BYTES // 4)
+                _claims_msgs = [{"role": "system", "content": system},
+                                {"role": "user", "content": claims_prompt(
+                                    user, _claims_digest, _existing_claims_text)}]
+                _claims_body = {"model": model, "messages": _claims_msgs}
+                if ollama:
+                    _claims_body["stream"] = False
+                    _claims_body["options"] = {"temperature": 0.2}
+                _claims_resp = _send(endpoint, headers, _claims_body, timeout=_resolve_timeout(timeout))
+                _acc_openai_usage(usage, _claims_resp, ollama)
+                if usage_acc is not None:
+                    usage_acc["tokens"] = _usage_or_none(usage)
+                _claims_msg = ((_claims_resp.get("choices") or [{}])[0].get("message")
+                              if "choices" in _claims_resp else _claims_resp.get("message")) or {}
+                claims_raw = investigation_state.extract_claims_json(_openai_style_text(_claims_msg))
+            except _SendAborted as e:
+                if e.reason == "stop":
+                    return   # 停止時は final を出さない（他の送信点＝5766行付近と同じ契約）
+                claims_raw = None   # budget_exceeded は従来どおり「一次判断なし」で payload を返す
+            except Exception as e:
+                from .ingest.graph_extract import _log_masked_exception
+                _log_masked_exception(_log, "agentic_search: worker 一次判断の生成に失敗", e,
+                                      _header_secret(headers))
+                claims_raw = None
+        payload = _build_final_payload("", docs, searched, cites, cards, _usage_or_none(usage),
+                                       verified_docs, stop_reason, world, evaluation,
+                                       structural_evidence_meta=structural_evidence_meta,
+                                       read_evidence=_read_evidence_payload(state), gaps=state.gaps,
+                                       limits=state.limits, backend_failures=state.backend_failures,
+                                       non_recoverable_failure=state.non_recoverable_failure, created_files=state.created_files)
+        if claims_raw is not None:
+            parsed_claims = investigation_state.parse_claims(claims_raw, origin="worker")
+            if parsed_claims:
+                # 内部専用チャンネル（`read_evidence`/`gaps` と同じ「公開 payload/Evidence Packet
+                # には出さない」流儀）——in-process の generator 呼び出しのため Evidence オブジェクト
+                # をそのまま持ち出せる（JSON 化しない）。
+                payload["claims_raw"] = parsed_claims
+                payload["claims_evidence"] = list(state.evidence)
+        yield payload
         return
 
     committed, evidence_meta, dropped = _commit_evidence(cites, world)
@@ -5828,7 +6588,11 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
                             used_evidence_docs=resolve_attributed_doc_ids(_attributed, _ev_map),
                             attributed_ev_ids=_attributed,
                             synthesis_failed=_synthesis_failed, attribution_eligible=_eligible,
-                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state), gaps=state.gaps, limits=state.limits)
+                            failure_kind=_failure_kind, read_evidence=_read_evidence_payload(state),
+                            gaps=state.gaps, limits=state.limits,
+                            backend_failures=state.backend_failures,
+                            non_recoverable_failure=state.non_recoverable_failure,
+                            created_files=state.created_files)
 
 
 def anthropic_tools_from_openai(tools: list) -> list:
@@ -5886,10 +6650,12 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     if callable(client):                       # client_factory（遅延生成）にも対応
         client = client()
     _tp = tools_pref_mod.normalize_tools_pref(tools_pref)
+    _unreachable_backends: list = []   # 実接続で不達のバックエンド（利用者の OFF とは区別する）
     if toolset is not None:
         src_tools = toolset            # SC-6e: 明示指定時は可用性判定を一切参照しない（docstring 参照）
     else:
         _avail = tools_availability if tools_availability is not None else tool_availability()   # SC-6e
+        _unreachable_backends = _unreachable_backends_at_start(_avail, _tp)
         src_tools = openai_tools(
             with_es=_avail["fulltext"] and _tp["fulltext"], with_graph=_avail["graph"] and _tp["graph"],
             can_ask=can_ask, with_grep=_tp["grep"])
@@ -5901,6 +6667,9 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     # 「組」——`_round_bounds` はメッセージの中身の形に依存せず `[start, end)` だけで組を表すため、
     # OpenAI 方言と同じロジックをそのまま使える）。
     state = investigation_state.InvestigationState(question=user, scope={"world": world, "layer": layer})
+    for _kind in _unreachable_backends:
+        # 不達でツール集合から外れたターンも縮退として1回だけ計数する（実行中の記録機会が無い）。
+        state.mark_backend_failure(_kind)
     _prefix_len = len(messages)
     _round_bounds: list[tuple[int, int]] = []
     docs: set = set()
@@ -5913,10 +6682,9 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
     max_tools_per_turn = effective_max_tools_per_turn(system_settings)
     total_tool_bytes = 0                              # 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
-    # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: provider="bedrock"（本アプリの
-    # `anthropic_style` 唯一の呼び出し元）＋`client`（`.models.retrieve()` 照会用・現状
-    # `AnthropicBedrock` は非対応のため実質 no-op・`model_windows.query_anthropic_context_length`
-    # docstring 参照）を渡す。
+    # 変えても当該 run には影響しない）。provider="bedrock"（本アプリの `anthropic_style` 唯一の
+    # 呼び出し元）＋`client` も渡すが、窓由来の上限との min()（旧 BUDGET-2）は撤去済みのため値の
+    # 解決には使わない——呼び出し形自体は互換のためそのまま残す。
     tool_result_max_bytes, tool_result_max_total_bytes = resolve_tool_result_budgets(
         system_settings=system_settings,
         provider="bedrock", model=model, anthropic_client=client)
@@ -6075,6 +6843,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
                     _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e, None)
                     result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
                 _record_run_tool_limits(state, name, result)     # 並列経路も直列と同じ計測
+                _record_tool_result_error_code(state, result, name)    # 結果化済み障害（read_io/es/graph 等）の反映
                 hit_node = _hit_summary_node(name, args, result)
                 if hit_node:
                     yield {"node": hit_node}
@@ -6171,6 +6940,7 @@ def anthropic_style(client, model: str, system: str, user: str, world: str, scop
             result, d, c, cd = run_tool(name, args, world, scope_paths, layer=layer,
                                         tool_result_max_bytes=tool_result_max_bytes)
             _record_run_tool_limits(state, name, result)
+            _record_tool_result_error_code(state, result, name)    # 結果化済み障害（read_io/es/graph 等）の反映
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node` は結果が出る前のノード
             # のため件数を書けない・`_hit_summary_node` 参照）。`anthropic_style` に
             # `allowed_tools`/サブ経路は無い＝常にメイン経路の表示。
@@ -6316,10 +7086,12 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     url = llm.gemini_url(model)
     headers = llm.gemini_headers(api_key)
     _tp = tools_pref_mod.normalize_tools_pref(tools_pref)
+    _unreachable_backends: list = []   # 実接続で不達のバックエンド（利用者の OFF とは区別する）
     if toolset is not None:
         tools = toolset                # SC-6e: 明示指定時は可用性判定を一切参照しない（docstring 参照）
     else:
         _avail = tools_availability if tools_availability is not None else tool_availability()   # SC-6e
+        _unreachable_backends = _unreachable_backends_at_start(_avail, _tp)
         tools = gemini_tools(
             with_es=_avail["fulltext"] and _tp["fulltext"], with_graph=_avail["graph"] and _tp["graph"],
             can_ask=can_ask, with_grep=_tp["grep"])
@@ -6332,6 +7104,9 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     # ラウンド境界の追跡（この方言は1ターンにつき role=model 1件＋role=user(functionResponse 配列)
     # 1件＝計2メッセージが「組」）。
     state = investigation_state.InvestigationState(question=user, scope={"world": world, "layer": layer})
+    for _kind in _unreachable_backends:
+        # 不達でツール集合から外れたターンも縮退として1回だけ計数する（実行中の記録機会が無い）。
+        state.mark_backend_failure(_kind)
     _prefix_len = len(contents)
     _round_bounds: list[tuple[int, int]] = []
     docs: set = set()
@@ -6344,8 +7119,8 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
     max_tools_per_turn = effective_max_tools_per_turn(system_settings)
     total_tool_bytes = 0                        # 1 run 累計の tool-result バイト量
     # BUDGET-1（§3.4）: run 開始時に1回だけ解決し、run の間ずっと使い回す（途中で admin が設定を
-    # 変えても当該 run には影響しない）。BUDGET-2（§3.4）: provider="gemini"（現状ライブ窓照会も
-    # シード表も対象外＝登録値/不明のみを通る・管理画面の登録欄で上書き可能）。
+    # 変えても当該 run には影響しない）。provider="gemini" も渡すが、窓由来の上限との min()
+    # （旧 BUDGET-2）は撤去済みのため値の解決には使わない——呼び出し形自体は互換のためそのまま残す。
     tool_result_max_bytes, tool_result_max_total_bytes = resolve_tool_result_budgets(
         system_settings=system_settings,
         provider="gemini", model=model)
@@ -6491,6 +7266,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
                     _log_masked_exception(_log, f"agentic_search: tool 実行に失敗（{name}）", e, api_key)
                     result, d, c, cd = ({"error": "ツール実行に失敗しました"}, set(), [], [])
                 _record_run_tool_limits(state, name, result)     # 並列経路も直列と同じ計測
+                _record_tool_result_error_code(state, result, name)    # 結果化済み障害（read_io/es/graph 等）の反映
                 hit_node = _hit_summary_node(name, args, result)
                 if hit_node:
                     yield {"node": hit_node}
@@ -6580,6 +7356,7 @@ def gemini(api_key: str, model: str, system: str, user: str, world: str, scope_p
             result, d, c, cd = run_tool(name, args, world, scope_paths, layer=layer,
                                         tool_result_max_bytes=tool_result_max_bytes)
             _record_run_tool_limits(state, name, result)
+            _record_tool_result_error_code(state, result, name)    # 結果化済み障害（read_io/es/graph 等）の反映
             # 「何を探して・いくつ当たったか」の追加ノード（`_tool_node` は結果が出る前のノード
             # のため件数を書けない・`_hit_summary_node` 参照）。`gemini` に `allowed_tools`/
             # サブ経路は無い＝常にメイン経路の表示。

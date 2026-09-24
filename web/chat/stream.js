@@ -29,7 +29,7 @@ import {
 } from './render.js';
 import { loadConversations } from './history.js';
 import { updateScopeHeader } from './scope.js';
-import { setInquiryOpen, toolsForSend } from './inquiry.js';
+import { setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
 import { updateShareButtonState } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;   // 共通ユーティリティ（common.js）
@@ -512,6 +512,11 @@ export async function send(override) {
     if (tools) {
       const sendTools = toolsForSend(tools, isOverride ? { grep: true, fulltext: true, graph: true } : undefined);
       if (Object.keys(sendTools).length) body.tools = sendTools;
+      // 会話メタへ保存する明示状態は**実際の操作履歴だけ**（`S.toolsExplicit`）——override の
+      // 全軸 true はこの送信1回限りの解決済みの値で、保存すると以後その会話は触っていない軸まで
+      // 明示扱いになり、その軸が不達のとき 422 になってしまう。
+      const sendExplicit = toolsExplicitForSend(S.toolsExplicit);
+      if (sendExplicit.length) body.tools_explicit = sendExplicit;
     }
   }
   // 開始 POST を投げる前に世代を進める（購読確立＝subscribeTurn 呼び出しまで待つと、直前の

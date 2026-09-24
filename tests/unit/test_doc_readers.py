@@ -707,6 +707,22 @@ def test_file_head_applies_clean(tmp):
     assert "[REDACTED]" in r["text"]
 
 
+def test_file_head_read_os_error_carries_read_io_error_code(tmp):
+    """open 成功後（TOCTOU 検証済み）の `read()` 自体が `OSError` で失敗した場合、結果に固定理由
+    コード `error_code: "read_io_failed"` が付く——`agentic_search._record_tool_result_error_code`
+    が名前非依存で拾い `InvestigationState.backend_failures["read_io"]` へ反映する経路。"""
+    p = tmp / "note.txt"
+    p.write_text("hello\n", encoding="utf-8")
+    f = _open(p)
+
+    def boom_read(n):
+        raise OSError("boom")
+
+    f.read = boom_read           # open 自体は成功済み・read() 段だけ壊す
+    r = DR.file_head(f)
+    assert r == {"error": "ファイルを開けませんでした", "error_code": "read_io_failed"}
+
+
 # ===== サイズ上限（`SHERPA_DOC_READ_MAX_BYTES`）=====
 
 def test_size_limit_blocks_before_opening(tmp, monkeypatch):

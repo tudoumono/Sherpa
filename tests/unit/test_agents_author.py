@@ -18,6 +18,8 @@ import os
 import shutil
 import subprocess
 
+import pytest
+
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 from sherpa import agents as A  # noqa: E402
 
@@ -228,41 +230,56 @@ def test_codex_reasoning_author_env_default_and_override(monkeypatch):
     assert _compute(False, "low") == "low"
 
 
-# ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: Codex reasoning の per-turn 上書き =====
+# ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: Codex reasoning は深さで変えない =====
 
 def test_codex_run_wires_depth_profile_into_reasoning_branch():
-    """author/通常いずれの基準値にも `depth_profile_mod.codex_reasoning_for()` の上書きが
-    掛かること（ソース検査・実 codex CLI 起動は対象外）。標準の基準値は `effective_base()`
+    """author/通常いずれの基準値も `depth_profile_mod.codex_reasoning_for()` を通ること
+    （ソース検査・実 codex CLI 起動は対象外）。通常レンズの基準値は `effective_base()`
     （system_settings の管理画面編集）を経由すること。"""
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    assert "depth_profile_mod.codex_reasoning_for(" in src, "調べる深さの per-turn 上書きが無い"
+    assert "depth_profile_mod.codex_reasoning_for(" in src, "推論レベルの解決が一元化されていない"
     assert "depth_profile_mod.effective_base(" in src, \
         "通常レンズの基準値が管理画面の基準値編集（system_settings）を経由していない"
 
 
-def test_codex_reasoning_depth_profile_override_standard_deep_max(monkeypatch):
-    """標準/深く/最大それぞれで、CodexProvider の実際の分岐と同じ式（`_base_reason` の解決 →
-    `codex_reasoning_for`）を評価する（純関数の組み合わせ・実 codex CLI 起動は対象外）。"""
+def _compute_reason(is_author, self_reason, system_settings, profile):
+    """CodexProvider の実際の分岐と同じ式（`_base_reason` の解決 → `codex_reasoning_for`）。"""
     from sherpa import depth_profile as D
+    base_reason = (__import__("os").environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium") if is_author
+                  else D.effective_base(system_settings, "codex_reasoning", self_reason))
+    reason_raw = D.codex_reasoning_for(base_reason, profile)
+    return "low" if str(reason_raw).lower() == "minimal" else reason_raw
 
-    def _compute(is_author, self_reason, system_settings, profile):
-        base_reason = (__import__("os").environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium") if is_author
-                      else D.effective_base(system_settings, "codex_reasoning", self_reason))
-        reason_raw = D.codex_reasoning_for(base_reason, profile)
-        return "low" if str(reason_raw).lower() == "minimal" else reason_raw
 
+@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
+def test_codex_reasoning_is_fixed_by_admin_base_at_every_depth(monkeypatch, profile):
+    """CodexProvider の実際の分岐と同じ式で、推論レベルは**標準以上はどの深さでも管理画面の
+    基準値のまま**（深さは探索量と見直しの巡数にだけ効く・クイックだけ例外＝下の別テスト・
+    純関数の組み合わせ・実 codex CLI 起動は対象外）。"""
     monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
-    # 通常レンズ: 標準=self._reason のまま・深く=high・最大=xhigh。
-    assert _compute(False, "low", None, "standard") == "low"
-    assert _compute(False, "low", None, "deep") == "high"
-    assert _compute(False, "low", None, "max") == "xhigh"
-    # 管理画面の基準値編集（system_settings）が標準時の基準値を上書きする。
-    assert _compute(False, "low", {"depth_base_codex_reasoning": "medium"}, "standard") == "medium"
-    # author は基準値が別軸（env）だが、調べる深さの上書き自体は一律に掛かる。
-    assert _compute(True, "low", None, "standard") == "medium"   # author 既定
-    assert _compute(True, "low", None, "deep") == "high"
-    assert _compute(True, "low", None, "max") == "xhigh"
+    # 通常レンズ: 環境設定の既定（self._reason）のまま。
+    assert _compute_reason(False, "low", None, profile) == "low"
+    # 管理画面の基準値編集（system_settings）があればそれが全深さで使われる。
+    assert _compute_reason(False, "low", {"depth_base_codex_reasoning": "medium"}, profile) == "medium"
+    assert _compute_reason(False, "low", {"depth_base_codex_reasoning": "xhigh"}, profile) == "xhigh"
+    # author は基準値が別軸（env・既定 medium）だが、深さで変わらない点は同じ。
+    assert _compute_reason(True, "low", None, profile) == "medium"
+
+
+def test_codex_reasoning_drops_one_level_for_quick(monkeypatch):
+    """クイックを本当に速くする（変更D②）: クイックだけ `codex_reasoning_for` が1段下げる
+    （author・通常レンズいずれも同じ純関数を通るため同様に効く）。`minimal` への丸めは
+    image_gen/web_search 非互換のための既存の `"low"` 昇格（`_compute_reason` 末尾）でそのまま吸収
+    される。"""
+    monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
+    # 通常レンズ: "low" は最下段一歩手前 → 1段下げても "minimal" → 既存の昇格で "low" のまま。
+    assert _compute_reason(False, "low", None, "quick") == "low"
+    # 管理画面の基準値編集: "medium" → 1段下げて "low"。
+    assert _compute_reason(False, "low", {"depth_base_codex_reasoning": "medium"}, "quick") == "low"
+    assert _compute_reason(False, "low", {"depth_base_codex_reasoning": "xhigh"}, "quick") == "high"
+    # author も同じ純関数を通るため、既定 "medium" が1段下がって "low" になる。
+    assert _compute_reason(True, "low", None, "quick") == "low"
 
 
 # ===== P1-c: author 専用プロンプト（FS 版・MCP 版） =====
@@ -622,7 +639,7 @@ def test_created_file_registration_failure_keeps_run_dir_and_appends_note(monkey
     uid = "created-file-fail-u1"
     ctx = A.Ctx(
         message="質問", world="v1",
-        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True},
         dispatch=lambda lens_, inp: {
             "lens": lens_, "headline": "dispatch-headline",
             "summary": {"total": 0}, "data": {}, "sources": [],
@@ -670,7 +687,7 @@ def test_files_dir_unavailable_keeps_run_dir_and_appends_note(monkeypatch, tmp_p
 
     ctx = A.Ctx(
         message="質問", world="v1",
-        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True},
         dispatch=lambda lens_, inp: {
             "lens": lens_, "headline": "dispatch-headline",
             "summary": {"total": 0}, "data": {}, "sources": [],
@@ -738,7 +755,7 @@ def test_move_back_failure_after_registration_failure_is_logged_and_keeps_note(m
     uid = "move-back-fail-u1"
     ctx = A.Ctx(
         message="質問", world="v1",
-        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True},
         dispatch=lambda lens_, inp: {
             "lens": lens_, "headline": "dispatch-headline",
             "summary": {"total": 0}, "data": {}, "sources": [],
@@ -807,7 +824,7 @@ def test_created_file_outright_move_failure_is_logged_without_leaking_path(monke
     uid = "outright-move-fail-u1"
     ctx = A.Ctx(
         message="質問", world="v1",
-        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True},
         dispatch=lambda lens_, inp: {
             "lens": lens_, "headline": "dispatch-headline",
             "summary": {"total": 0}, "data": {}, "sources": [],
@@ -856,7 +873,7 @@ def test_gather_seam_intercepted_by_codex_provider(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", _no_popen)
 
-    def fake_gather(ctx):
+    def fake_gather(ctx, **_kw):   # `_gather` のキーワード引数（skip_presearch_lenses）を受け取れる形
         calls.append(ctx)
         yield {"type": "node", "id": "seam-pin-codex", "kind": "think",
                "label": "t", "detail": "", "status": "done"}
@@ -899,7 +916,7 @@ def test_run_authoring_refuses_when_mcp_disabled_and_layer_restricted(monkeypatc
 
     monkeypatch.setattr(subprocess, "Popen", _no_popen)
 
-    def fake_gather(ctx):
+    def fake_gather(ctx, **_kw):   # `_gather` のキーワード引数（skip_presearch_lenses）を受け取れる形
         yield {"type": "_env", "decision": {"lens": "qa", "input": ctx.message, "reason": "t"},
                "env": {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}}
 
@@ -932,7 +949,7 @@ def test_run_authoring_proceeds_when_mcp_disabled_but_layer_is_both(monkeypatch)
 
     monkeypatch.setattr(subprocess, "Popen", _capture_popen)
 
-    def fake_gather(ctx):
+    def fake_gather(ctx, **_kw):   # `_gather` のキーワード引数（skip_presearch_lenses）を受け取れる形
         yield {"type": "_env", "decision": {"lens": "qa", "input": ctx.message, "reason": "t"},
                "env": {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}}
 
@@ -1008,7 +1025,7 @@ def test_run_authoring_refuses_when_sandbox_disabled_and_layer_restricted(monkey
 
     monkeypatch.setattr(subprocess, "Popen", _no_popen)
 
-    def fake_gather(ctx):
+    def fake_gather(ctx, **_kw):   # `_gather` のキーワード引数（skip_presearch_lenses）を受け取れる形
         yield {"type": "_env", "decision": {"lens": "qa", "input": ctx.message, "reason": "t"},
                "env": {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}}
 
@@ -1035,7 +1052,7 @@ def test_honest_failure_user_facing_text_has_no_internal_jargon(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", _no_popen)
 
-    def fake_gather(ctx):
+    def fake_gather(ctx, **_kw):   # `_gather` のキーワード引数（skip_presearch_lenses）を受け取れる形
         yield {"type": "_env", "decision": {"lens": "qa", "input": ctx.message, "reason": "t"},
                "env": {"lens": "qa", "headline": "h", "summary": {"total": 0}, "data": {}, "sources": []}}
 
