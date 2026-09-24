@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Codex CLI（read-only サンドボックス）で RV（敵対レビュー）を実行する。
 # `docs/20-開発ハーネス.md` §3 が正典。プロンプトは引数または標準入力で渡す。
-# usage: rv_codex.sh -C <worktree> -n <name> [-m <model>] ["<prompt>"]
+# usage: rv_codex.sh -C <worktree> -n <name> [-m <model>] [-e <reasoning_effort>] ["<prompt>"]
+# -m/-e を省くと ~/.codex/config.toml の既定値に従う（既定値は変わり得るので、呼び出し側は明示する）。
 set -euo pipefail
 
-usage() { echo 'usage: rv_codex.sh -C <worktree> -n <name> [-m <model>] ["<prompt>"]' >&2; exit 2; }
+usage() { echo 'usage: rv_codex.sh -C <worktree> -n <name> [-m <model>] [-e <reasoning_effort>] ["<prompt>"]' >&2; exit 2; }
 
-DIR=""; NAME=""; MODEL=""
-while getopts ":C:n:m:" opt; do
+DIR=""; NAME=""; MODEL=""; EFFORT=""
+while getopts ":C:n:m:e:" opt; do
   case "$opt" in
     C) DIR="$OPTARG" ;;
     n) NAME="$OPTARG" ;;
     m) MODEL="$OPTARG" ;;
+    e) EFFORT="$OPTARG" ;;
     *) usage ;;
   esac
 done
@@ -42,11 +44,13 @@ rm -f "$OUT_DIR/last.txt"
 
 ARGS=(exec --json --skip-git-repo-check -C "$DIR" -s read-only -o "$OUT_DIR/last.txt")
 [ -n "$MODEL" ] && ARGS+=(-m "$MODEL")
+[ -n "$EFFORT" ] && ARGS+=(-c "model_reasoning_effort=\"$EFFORT\"")
 
 {
   echo "name=$NAME"
   echo "workdir=$DIR"
   echo "model=${MODEL:-default}"
+  echo "reasoning_effort=${EFFORT:-default}"
   echo "started=$(date -Iseconds)"
 } > "$OUT_DIR/meta"
 
