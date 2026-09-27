@@ -5498,7 +5498,7 @@
         "type": "object"
       },
       "UsageConversationTurns": {
-        "description": "会話あたりの user ターン数分布。\n\n値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に\nuser ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ全て None。",
+        "description": "会話あたりの user ターン数分布。\n\n値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に\nuser ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ分布は None。\nsession_eligible は期間内2ターン以上の会話数、session_recorded はそのうち現在CodexセッションIDを\n持つ会話数（どちらも対象がなければ0）。再開実行・成功の件数ではない。",
         "properties": {
           "avg": {
             "anyOf": [
@@ -5543,13 +5543,23 @@
               }
             ],
             "title": "P90"
+          },
+          "session_eligible": {
+            "title": "Session Eligible",
+            "type": "integer"
+          },
+          "session_recorded": {
+            "title": "Session Recorded",
+            "type": "integer"
           }
         },
         "required": [
           "avg",
           "median",
           "max",
-          "p90"
+          "p90",
+          "session_eligible",
+          "session_recorded"
         ],
         "title": "UsageConversationTurns",
         "type": "object"
@@ -5685,79 +5695,198 @@
         "type": "object"
       },
       "UsageLimitsByProviderRow": {
-        "description": "経路（provider）別の「打ち切りの内訳」（`InvestigationState.limits`・制限そのものは\n変えない計測専用）。\n\n`turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系\nキーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。旧行\n（`answer.limits` キー自体が無い）は全項目0として母数（`turns`）にだけ数える。",
+        "description": "経路（provider）別の「打ち切りの内訳」（`InvestigationState.limits`・制限そのものは\n変えない計測専用）。\n\n`turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系\nキーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。経路で記録しない\n項目は None。計測項目は発生0件でも0を返す。",
         "properties": {
           "auto_continues_total": {
-            "title": "Auto Continues Total",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Continues Total"
           },
           "auto_continues_turns": {
-            "title": "Auto Continues Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Continues Turns"
           },
           "backend_unavailable_fulltext_turns": {
-            "title": "Backend Unavailable Fulltext Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backend Unavailable Fulltext Turns"
           },
           "backend_unavailable_graph_turns": {
-            "title": "Backend Unavailable Graph Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backend Unavailable Graph Turns"
           },
           "context_compactions_total": {
-            "title": "Context Compactions Total",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Compactions Total"
           },
           "context_compactions_turns": {
-            "title": "Context Compactions Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Compactions Turns"
           },
           "depth_escalated_turns": {
-            "title": "Depth Escalated Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth Escalated Turns"
           },
           "duplicate_tool_call_total": {
-            "title": "Duplicate Tool Call Total",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Tool Call Total"
           },
           "duplicate_tool_call_turns": {
-            "title": "Duplicate Tool Call Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Tool Call Turns"
           },
           "graph_reingest_required_turns": {
-            "title": "Graph Reingest Required Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Graph Reingest Required Turns"
           },
           "provider": {
             "title": "Provider",
             "type": "string"
           },
           "search_truncated_total": {
-            "title": "Search Truncated Total",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Truncated Total"
           },
           "search_truncated_turns": {
-            "title": "Search Truncated Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search Truncated Turns"
           },
           "synthesis_truncated_turns": {
-            "title": "Synthesis Truncated Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Synthesis Truncated Turns"
           },
           "tool_calls_exhausted_turns": {
-            "title": "Tool Calls Exhausted Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Calls Exhausted Turns"
           },
           "tool_result_clipped_total": {
-            "title": "Tool Result Clipped Total",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Result Clipped Total"
           },
           "tool_result_clipped_turns": {
-            "title": "Tool Result Clipped Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Result Clipped Turns"
           },
           "total_budget_hit_turns": {
-            "title": "Total Budget Hit Turns",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Budget Hit Turns"
           },
           "turns": {
             "title": "Turns",

@@ -283,6 +283,47 @@ def test_admin_audit_list(client):
     _validate(sc.AdminAuditListResponse, r.json())
 
 
+def test_admin_usage_stats_limits_preserve_null_and_measured_zero(client, monkeypatch):
+    """GET /admin/usage/statsの応答モデルが未計測nullと計測済み0を保持する。"""
+    import copy
+
+    stats = copy.deepcopy(mock_api.USAGE_STATS_DEFAULT)
+    stats["limits"]["by_provider"][0]["synthesis_truncated_turns"] = None
+    stats["limits"]["by_provider"][0]["depth_escalated_turns"] = None
+    stats["limits"]["by_provider"][0]["context_compactions_turns"] = None
+    stats["limits"]["by_provider"][0]["context_compactions_total"] = None
+    stats["limits"]["by_provider"][1]["duplicate_tool_call_turns"] = None
+    stats["limits"]["by_provider"][1]["duplicate_tool_call_total"] = None
+    stats["limits"]["by_provider"][1]["tool_calls_exhausted_turns"] = None
+    stats["limits"]["by_provider"][1]["context_compactions_turns"] = 0
+    stats["limits"]["by_provider"][1]["context_compactions_total"] = 0
+    monkeypatch.setattr(store, "usage_stats", lambda **_kwargs: stats)
+    monkeypatch.setattr(store, "audit", lambda *_args, **_kwargs: None)
+
+    response = client.get("/admin/usage/stats")
+
+    assert response.status_code == 200, response.text
+    codex, api = response.json()["limits"]["by_provider"]
+    assert codex["context_compactions_turns"] is None
+    assert codex["synthesis_truncated_turns"] is None
+    assert codex["depth_escalated_turns"] is None
+    assert api["duplicate_tool_call_turns"] is None
+    assert api["tool_calls_exhausted_turns"] is None
+    assert api["context_compactions_turns"] == 0
+    assert api["context_compactions_total"] == 0
+    unknown = dict(api)
+    unknown["provider"] = "unknown"
+    for key in unknown:
+        if key not in ("provider", "turns"):
+            unknown[key] = None
+    stats["limits"]["by_provider"].append(unknown)
+    monkeypatch.setattr(store, "usage_stats", lambda **_kwargs: stats)
+    unknown_response = client.get("/admin/usage/stats")
+    assert unknown_response.status_code == 200, unknown_response.text
+    unknown_row = unknown_response.json()["limits"]["by_provider"][-1]
+    assert all(value is None for key, value in unknown_row.items() if key not in ("provider", "turns"))
+
+
 def test_admin_usage_stats(client):
     r = client.get("/admin/usage/stats")
     assert r.status_code == 200

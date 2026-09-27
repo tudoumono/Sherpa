@@ -764,9 +764,10 @@ def test_usage_stats_limits_aggregates_by_provider_and_ignores_legacy_rows_witho
     assert _delta("tool_result_clipped_turns") == 1     # 1回以上だったターン数（q1のみ）
     assert _delta("tool_result_clipped_total") == 2     # 合計回数
     assert _delta("total_budget_hit_turns") == 1        # bool 系（q2のみ）
-    assert _delta("context_compactions_turns") == 1
-    assert _delta("context_compactions_total") == 1
-    assert _delta("synthesis_truncated_turns") == 1
+    assert after_codex["context_compactions_turns"] is None
+    assert after_codex["context_compactions_total"] is None
+    assert after_codex["synthesis_truncated_turns"] is None
+    assert after_codex["depth_escalated_turns"] is None
     assert _delta("search_truncated_turns") == 1
     assert _delta("search_truncated_total") == 3
     assert _delta("auto_continues_turns") == 1
@@ -774,7 +775,6 @@ def test_usage_stats_limits_aggregates_by_provider_and_ignores_legacy_rows_witho
     assert _delta("backend_unavailable_fulltext_turns") == 1   # S4: 全文検索の不調（q4のみ）
     assert _delta("backend_unavailable_graph_turns") == 1      # S4: グラフの接続断（q4のみ）
     assert _delta("graph_reingest_required_turns") == 1        # S4: 世代不一致は別項目
-    assert _delta("depth_escalated_turns") == 1         # bool 系（q2のみ・深さの自動引き上げ）
 
 
 def test_usage_stats_stop_kind_folds_out_of_vocabulary_values_into_unknown():

@@ -898,12 +898,16 @@ class UsageConversationTurns(BaseModel):
     """会話あたりの user ターン数分布。
 
     値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に
-    user ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ全て None。
+    user ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ分布は None。
+    session_eligible は期間内2ターン以上の会話数、session_recorded はそのうち現在CodexセッションIDを
+    持つ会話数（どちらも対象がなければ0）。再開実行・成功の件数ではない。
     """
     avg: float | None
     median: float | None
     max: int | None
     p90: float | None
+    session_eligible: int
+    session_recorded: int
 
 
 class UsageResponseTimeRow(BaseModel):
@@ -968,34 +972,34 @@ class UsageLimitsByProviderRow(BaseModel):
     変えない計測専用）。
 
     `turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系
-    キーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。旧行
-    （`answer.limits` キー自体が無い）は全項目0として母数（`turns`）にだけ数える。
+    キーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。経路で記録しない
+    項目は None。計測項目は発生0件でも0を返す。
     """
     provider: str
     turns: int
-    tool_result_clipped_turns: int
-    tool_result_clipped_total: int
-    total_budget_hit_turns: int
-    context_compactions_turns: int
-    context_compactions_total: int
-    synthesis_truncated_turns: int
+    tool_result_clipped_turns: int | None
+    tool_result_clipped_total: int | None
+    total_budget_hit_turns: int | None
+    context_compactions_turns: int | None
+    context_compactions_total: int | None
+    synthesis_truncated_turns: int | None
     # 必要な根拠種別が揃わず深さを1段だけ自動で引き上げたターン数（`providers/base.py` の
     # 巡ループが `limits.depth_escalated` を立てる）。
-    depth_escalated_turns: int
-    search_truncated_turns: int
-    search_truncated_total: int
-    auto_continues_turns: int
-    auto_continues_total: int
+    depth_escalated_turns: int | None
+    search_truncated_turns: int | None
+    search_truncated_total: int | None
+    auto_continues_turns: int | None
+    auto_continues_total: int | None
     # 同一条件のツール呼び出しを2回目以降省略した回数（Codex 経路のみ・`mcp_server.py::
     # _is_duplicate_tool_call`）。
-    duplicate_tool_call_turns: int
-    duplicate_tool_call_total: int
+    duplicate_tool_call_turns: int | None
+    duplicate_tool_call_total: int | None
     # 縮退（バックエンド不調）の計数——意味論は「このターンで初めて検出されたか」＝初回検出の計数。
-    backend_unavailable_fulltext_turns: int
-    backend_unavailable_graph_turns: int
-    graph_reingest_required_turns: int
+    backend_unavailable_fulltext_turns: int | None
+    backend_unavailable_graph_turns: int | None
+    graph_reingest_required_turns: int | None
     # MCP ツール呼び出し回数の上限に到達したターン数（Codex 経路のみ・`mcp_server.py`）。
-    tool_calls_exhausted_turns: int
+    tool_calls_exhausted_turns: int | None
 
 
 class UsageLimits(BaseModel):

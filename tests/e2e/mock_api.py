@@ -877,7 +877,8 @@ USAGE_STATS_DEFAULT = {
         ],
     },
     # 会話あたりの user ターン数（avg/median/max/p90）と Codex resume 継続率
-    "conversation_turns": {"avg": 3.0, "median": 2.0, "max": 6, "p90": 5.0},
+    "conversation_turns": {"avg": 3.0, "median": 2.0, "max": 6, "p90": 5.0,
+                           "session_eligible": 4, "session_recorded": 2},
     "resume_rate": 0.5,
     # ターンの終了理由の分布（`sherpa/stop_kind.py` の 8 値＋'unknown'）と利用者の明示停止数
     "stop_kinds": [
@@ -918,8 +919,8 @@ USAGE_STATS_DEFAULT = {
             {"provider": "codex", "turns": 10,
              "tool_result_clipped_turns": 3, "tool_result_clipped_total": 5,
              "total_budget_hit_turns": 1,
-             "context_compactions_turns": 2, "context_compactions_total": 4,
-             "synthesis_truncated_turns": 0, "depth_escalated_turns": 2,
+             "context_compactions_turns": None, "context_compactions_total": None,
+             "synthesis_truncated_turns": None, "depth_escalated_turns": None,
              "search_truncated_turns": 4, "search_truncated_total": 9,
              "auto_continues_turns": 2, "auto_continues_total": 3,
              "duplicate_tool_call_turns": 2, "duplicate_tool_call_total": 4,
@@ -933,8 +934,8 @@ USAGE_STATS_DEFAULT = {
              "synthesis_truncated_turns": 1, "depth_escalated_turns": 0,
              "search_truncated_turns": 0, "search_truncated_total": 0,
              "auto_continues_turns": 0, "auto_continues_total": 0,
-             "duplicate_tool_call_turns": 0, "duplicate_tool_call_total": 0,
-             "tool_calls_exhausted_turns": 0,
+             "duplicate_tool_call_turns": None, "duplicate_tool_call_total": None,
+             "tool_calls_exhausted_turns": None,
              "backend_unavailable_fulltext_turns": 0, "backend_unavailable_graph_turns": 0,
              "graph_reingest_required_turns": 0},
         ],

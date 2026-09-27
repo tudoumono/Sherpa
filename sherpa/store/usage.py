@@ -214,21 +214,59 @@ def _stopped_turns_sql() -> str:
     )
 
 
-# limits（`answer->'limits'`・agentic_search.InvestigationState.limits・利用統計「打ち切りの
-# 内訳」専用の計測カウンタ）の SQL 抽出。旧行（キー自体が無い）は NULL のまま拾い FILTER で
-# 除外される＝0件として集計に混じる（`docs/notes`「限定/計測」契約・制限そのものは変えない）。
-# `_usage_tok` と同じ「非数値/欠落は無視」防御（bool は 'true'/'false' 文字列のみ真偽扱い）。
-_USAGE_LIMIT_INT_FIELDS = ("tool_result_clipped", "context_compactions", "search_truncated",
-                           "auto_continues", "duplicate_tool_call")
-# 縮退（バックエンド不調）の計数（`investigation_state._BACKEND_LIMIT_FIELD`／
-# `GRAPH_REINGEST_LIMIT_FIELD` と同じ語彙）。意味論は「このターンで初めて検出されたか」＝
-# 初回検出の計数で、障害が起きた巡の数ではない（`providers/base.py::_limits_delta` が
-# 偽→真になった巡だけ載せるため、同じ障害が続いても2巡目以降は計上されない）。
-# `tool_calls_exhausted`（クイックを本当に速くする・変更D③）はバックエンド不調ではなく
-# MCP ツール呼び出し回数の上限到達（Codex 経路のみ・`mcp_server.py`）。
-_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated", "depth_escalated",
-                            "backend_unavailable_fulltext", "backend_unavailable_graph",
-                            "graph_reingest_required", "tool_calls_exhausted")
+# SQL集計後、経路別定義で計測項目と未計測項目を分けてAPIへ返す。
+# イベントが一度も書かれない項目も、計測対象なら集計値0を保つ。
+_API_USAGE_LIMIT_FIELDS = {
+    "tool_result_clipped": "count",
+    "total_budget_hit": "flag",
+    "context_compactions": "count",
+    "synthesis_truncated": "flag",
+    "depth_escalated": "flag",
+    "search_truncated": "count",
+    "auto_continues": "count",
+    "backend_unavailable_fulltext": "flag",
+    "backend_unavailable_graph": "flag",
+    "graph_reingest_required": "flag",
+}
+_USAGE_LIMIT_FIELDS_BY_ROUTE = {
+    "codex": {
+        "tool_result_clipped": "count",
+        "total_budget_hit": "flag",
+        "search_truncated": "count",
+        "auto_continues": "count",
+        "duplicate_tool_call": "count",
+        "tool_calls_exhausted": "flag",
+        "backend_unavailable_fulltext": "flag",
+        "backend_unavailable_graph": "flag",
+        "graph_reingest_required": "flag",
+    },
+    # API 集計対象の provider 名を明示する。未知の provider は計測対象にしない。
+    "openai": _API_USAGE_LIMIT_FIELDS,
+    "ollama": _API_USAGE_LIMIT_FIELDS,
+    "gemini": _API_USAGE_LIMIT_FIELDS,
+    "bedrock": _API_USAGE_LIMIT_FIELDS,
+}
+_USAGE_LIMIT_INT_FIELDS = tuple(dict.fromkeys(
+    field for route_fields in _USAGE_LIMIT_FIELDS_BY_ROUTE.values()
+    for field, kind in route_fields.items() if kind == "count"))
+_USAGE_LIMIT_BOOL_FIELDS = tuple(dict.fromkeys(
+    field for route_fields in _USAGE_LIMIT_FIELDS_BY_ROUTE.values()
+    for field, kind in route_fields.items() if kind == "flag"))
+_USAGE_LIMIT_FIELD_KINDS = _USAGE_LIMIT_FIELDS_BY_ROUTE["codex"] | _API_USAGE_LIMIT_FIELDS
+
+
+def _usage_limits_provider_row(row: dict) -> dict:
+    """provider別に計測対象だけを値として返し、未計測項目は null にする。"""
+    measured = _USAGE_LIMIT_FIELDS_BY_ROUTE.get(row["provider"])
+    result = {"provider": row["provider"], "turns": row["turns"] or 0}
+    for field, kind in _USAGE_LIMIT_FIELD_KINDS.items():
+        value = row[f"{field}_turns"] or 0
+        result[f"{field}_turns"] = value if measured is not None and field in measured else None
+        if kind == "count":
+            total = row[f"{field}_total"]
+            result[f"{field}_total"] = (
+                int(total or 0) if measured is not None and field in measured else None)
+    return result
 
 
 def _usage_limit_int(field: str) -> str:
@@ -313,6 +351,8 @@ def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | N
 
     resume_rate: user ターン数2以上（＝2ターン目以降が有り得る）の会話のうち、
     `codex_session_id` が設定されている割合。分母（該当会話数）が0なら None（推定しない）。
+    conversation_turns に session_eligible（分母）と session_recorded（分子）を含める。
+    セッションIDは現在の保存状態であり、再開を試行・成功した記録ではない。
     """
     counts = sorted((r["user_turns"] or 0) for r in conversation_rows)
     if counts:
@@ -328,6 +368,7 @@ def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | N
     denom = len(eligible)
     resumed = sum(1 for r in eligible if r["codex_session_id"] is not None)
     resume_rate = (resumed / denom) if denom > 0 else None
+    conversation_turns.update(session_eligible=denom, session_recorded=resumed)
     return conversation_turns, resume_rate
 
 
@@ -1114,13 +1155,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
 
     # limits（「打ち切りの内訳」・経路別・利用統計 U 系と同じ形＝行=provider の list）。
     # `*_turns`＝回数系は1回以上・bool系は真だったターン数、`*_total`＝回数系の合計回数。
-    by_provider_limits = [
-        {"provider": r["provider"], "turns": r["turns"] or 0,
-         **{f"{f}_turns": r[f"{f}_turns"] or 0 for f in _USAGE_LIMIT_INT_FIELDS},
-         **{f"{f}_total": int(r[f"{f}_total"] or 0) for f in _USAGE_LIMIT_INT_FIELDS},
-         **{f"{f}_turns": r[f"{f}_turns"] or 0 for f in _USAGE_LIMIT_BOOL_FIELDS}}
-        for r in limits_rows
-    ]
+    by_provider_limits = [_usage_limits_provider_row(r) for r in limits_rows]
     limits_stats = {"by_provider": by_provider_limits}
 
     # 定着指標: JST 週（月曜始まり）ごとのアクティブユーザー集合→週次人数の推移＋連続週ペアの再訪率。

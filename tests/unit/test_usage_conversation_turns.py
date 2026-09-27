@@ -22,7 +22,8 @@ def _rows(*pairs):
 
 def test_conversation_turns_empty_input_returns_all_none():
     turns, resume_rate = store._compute_conversation_turn_stats([])
-    assert turns == {"avg": None, "median": None, "max": None, "p90": None}
+    assert turns == {"avg": None, "median": None, "max": None, "p90": None,
+                     "session_eligible": 0, "session_recorded": 0}
     assert resume_rate is None
 
 
@@ -43,27 +44,34 @@ def test_conversation_turns_avg_median_max_p90():
 def test_conversation_turns_single_conversation():
     rows = _rows((4, None))
     turns, _ = store._compute_conversation_turn_stats(rows)
-    assert turns == {"avg": 4.0, "median": 4.0, "max": 4, "p90": 4.0}
+    assert turns == {"avg": 4.0, "median": 4.0, "max": 4, "p90": 4.0,
+                     "session_eligible": 1, "session_recorded": 0}
 
 
 def test_resume_rate_denominator_excludes_single_turn_conversations():
     """user ターン1回の会話は resume_rate の分母に入らない（2ターン目以降が無いため）。"""
     rows = _rows((1, "sess-a"), (1, None))
-    _, resume_rate = store._compute_conversation_turn_stats(rows)
+    turns, resume_rate = store._compute_conversation_turn_stats(rows)
+    assert turns["session_eligible"] == 0
+    assert turns["session_recorded"] == 0
     assert resume_rate is None, "分母0（該当会話なし）は None のはず"
 
 
 def test_resume_rate_numerator_counts_conversations_with_codex_session_id():
     rows = _rows((2, "sess-a"), (5, None), (3, "sess-b"))
-    _, resume_rate = store._compute_conversation_turn_stats(rows)
+    turns, resume_rate = store._compute_conversation_turn_stats(rows)
     # 分母3（全会話が2ターン以上）・分子2（sess-a・sess-b）。
     assert resume_rate == pytest.approx(2 / 3)
+    assert turns["session_eligible"] == 3
+    assert turns["session_recorded"] == 2
 
 
 def test_resume_rate_zero_when_no_conversation_has_session_id():
     rows = _rows((2, None), (3, None))
-    _, resume_rate = store._compute_conversation_turn_stats(rows)
+    turns, resume_rate = store._compute_conversation_turn_stats(rows)
     assert resume_rate == 0.0
+    assert turns["session_eligible"] == 2
+    assert turns["session_recorded"] == 0
 
 
 # ===== STAT-4 U1（2026-09-12-利用統計の拡充2.md §2/§3）: 回答時間分布の純粋関数 =====
@@ -102,3 +110,16 @@ def test_response_time_stats_does_not_mutate_input_order():
     assert values == [5000, 1000, 3000]
     assert stats["max"] == 5000
     assert stats["median"] == 3000.0
+
+
+@pytest.mark.parametrize("pairs,eligible,recorded", [([], 0, 0), ([(1, "one"), (2, "two"), (3, None)], 2, 1)])
+def test_session_counts_survive_api_response_schema(pairs, eligible, recorded):
+    """画面に渡すAPIモデルのシリアライズで母数と分子を落とさない。"""
+    from pydantic import TypeAdapter
+    from sherpa.schemas import AdminUsageStatsResponse
+
+    turns, _ = store._compute_conversation_turn_stats(_rows(*pairs))
+    adapter = TypeAdapter(AdminUsageStatsResponse.model_fields["conversation_turns"].annotation)
+    data = adapter.dump_python(adapter.validate_python(turns), mode="json")
+    assert data["session_eligible"] == eligible
+    assert data["session_recorded"] == recorded
