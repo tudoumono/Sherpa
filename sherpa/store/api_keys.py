@@ -1,4 +1,4 @@
-"""外部連携 API キー（docs/proposals/2026-07-07-外部API化とDify.md E1）。
+"""外部連携 API キー（docs/archive/2026-07-07-外部API化とDify.md E1）。
 
 `sherpa/store/__init__.py` から純移動（フェーズ4 S2）。不変条件: プレーンキーは DB に残さない
 （key_hash のみ）。認証・監査は sherpa/ext_api.py が行う。

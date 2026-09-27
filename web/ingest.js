@@ -182,6 +182,14 @@ function summaryText(s) {
     p.push(declined.join('／'));
   }
   if (s.skipped_other) p.push(`除外 ${esc(s.skipped_other)} 件`);
+  // 本文が読めない（バイナリ・読み取り失敗・秘匿）ため grep/全文検索/精読のどれからも対象外に
+  // したファイル数。`stage_summary.counts`（最新 run の extraction_snapshot 由来）ではなく
+  // `scanned`/`skipped_other` と同じ世界単位のキャッシュ値を使う——無変更の再同期は
+  // extraction_snapshot を書き換えるだけで scan_report を再実行しないため、run 由来の値だと
+  // 無変更後に表示が消えてしまう。`counts_as_of` が無い（未集計・旧形式集計の欠落補完中を含む）
+  // ときは件数を出さない——実測でない 0 を「対象外 0 件」と誤解させない（`countsAsOfNote` の
+  // 「未集計」表示だけで足りる）。
+  if (s.counts_as_of && s.unreachable_as_text) p.push(`本文が読めず対象外 ${esc(s.unreachable_as_text)} 件`);
   p.push(`関係グラフ ${esc(s.graph_nodes)} 件`);
   if (s.es_chunks != null) p.push(`全文検索 ${esc(s.es_chunks)} 片`);
   else if (s.indexed > 0) p.push('全文検索 未接続');
@@ -212,6 +220,13 @@ function stageSummaryHtml(stage) {
   if (stage.es) {
     lines.push(`全文検索: ${stage.es.chunks != null ? esc(stage.es.chunks) + ' 片' : '-'}`
       + (stage.es.error ? `（エラー: ${esc(stage.es.error)}）` : ''));
+    // 資料が不変の更新はキャッシュ再利用のみで新規0件になる（費用が掛からないことの可視化）。
+    // reused を記録していない古い取り込み結果は「取れない値」であって0件ではない＝0で埋めない。
+    if (stage.es.embedded != null) {
+      lines.push(stage.es.reused != null
+        ? `埋め込み: 再利用 ${esc(stage.es.reused)} 件・新規 ${esc(stage.es.embedded)} 件`
+        : `埋め込み: 新規 ${esc(stage.es.embedded)} 件`);
+    }
   }
   if (stage.neo4j) {
     lines.push(`関係グラフ: ノード ${esc(stage.neo4j.nodes)} 件・関係 ${esc(stage.neo4j.edges)} 件`

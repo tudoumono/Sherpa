@@ -1068,7 +1068,7 @@ def test_filled_cells_clips_huge_declared_range_bounded_time():
 def test_jpx021_large_component_no_longer_degrades_to_single_bbox():
     """JPX-021.xlsx「統合設計」シートは旧上限（5,000）では2連結成分（A30:Z289＝面積6,760・
     A291:N654＝面積5,096）がどちらも `split_budget_exhausted=True` の単一外接矩形へ縮退していた
-    （`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の L1 実測で唯一
+    （`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の L1 実測で唯一
     excel2md に負けていた箇所）。上限を20,000へ引き上げた現在、この2成分はどちらも複数矩形へ
     正しく分割され、`split_budget_exhausted` が消えることを実データで固定する。
     """

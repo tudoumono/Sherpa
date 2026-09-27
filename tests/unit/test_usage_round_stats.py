@@ -119,6 +119,14 @@ def test_compute_round_stats_aggregates_limits_verdicts_stops_and_by_round():
     assert not _re.search(r'"missing"\s*:', _json.dumps(out))
 
 
+def test_compute_round_stats_aggregates_duplicate_tool_call_limit():
+    """`duplicate_tool_call`（同一クエリの重複実行の抑止・件数）も他の limits 増分と同じ経路で
+    巡内合算される（`_USAGE_LIMIT_INT_FIELDS`/`_ROUND_LIMIT_KEYS` への追加を確認する回帰）。"""
+    rows = [_round_row(meta={"round": 1, "limits": {"duplicate_tool_call": 2}}, turn_message_id=1)]
+    out = _usage_store._compute_round_stats(rows)
+    assert out["by_depth_provider"][0]["limits"] == {"duplicate_tool_call": 2}
+
+
 def test_compute_round_stats_aggregates_missing_codes_without_free_text():
     """不足軸（`missing_codes`）は本文を持たない閉じた分類として巡番号別に集計される
     （閉集合への丸め自体は記録元＝`providers.base._normalized_verdict` が行う——ここでは
@@ -199,6 +207,55 @@ def test_compute_final_reason_codes_empty_input():
     assert _usage_store._compute_final_reason_codes([]) == []
 
 
+# ===== S1b: `_compute_final_missing_codes`/`_merge_final_missing_codes`（Codex 経路の
+# 最終ゲート・`chat-round` を発生させない経路の唯一の取得点） =====
+
+def _gate_row(*, provider="codex", depth_profile="standard", gate_missing_codes):
+    return {"provider": provider, "depth_profile": depth_profile,
+            "claims": [], "gate_missing_codes": gate_missing_codes}
+
+
+def test_compute_final_missing_codes_counts_by_depth_provider():
+    rows = [_gate_row(gate_missing_codes=["spec_missing", "spec_missing"]),
+            _gate_row(gate_missing_codes=["log_missing"])]
+    out = _usage_store._compute_final_missing_codes(rows)
+    assert out == {("standard", "codex"): {"spec_missing": 2, "log_missing": 1}}
+
+
+def test_compute_final_missing_codes_skips_non_list_or_api_rows():
+    """API 経路の行にはこのキー自体が無い（NULL）——非配列は静かにスキップする。"""
+    rows = [_gate_row(gate_missing_codes=None), {"provider": "openai", "depth_profile": "deep",
+                                                 "claims": [], "gate_missing_codes": None}]
+    assert _usage_store._compute_final_missing_codes(rows) == {}
+
+
+def test_merge_final_missing_codes_adds_new_bucket_for_codex_only_depth():
+    """Codex は `chat-round` を発生させないため、既存の巡別集計に対応する（深さ, "codex"）組が
+    無い——新規バケットとして `by_depth_provider` へ追加し、既存の表示（`missing_codes` 列）に
+    経路別で載る。巡別指標（`rounds` 等）は0のまま。"""
+    rounds_stats = _usage_store._compute_round_stats([])
+    rows = [_gate_row(depth_profile="standard", gate_missing_codes=["callgraph_missing"])]
+    _usage_store._merge_final_missing_codes(rounds_stats, rows)
+    bucket = next(b for b in rounds_stats["by_depth_provider"]
+                 if (b["depth_profile"], b["provider"]) == ("standard", "codex"))
+    assert bucket["missing_codes"] == {"callgraph_missing": 1}
+    assert bucket["rounds"] == 0
+    assert bucket["elapsed_ms_avg"] is None and bucket["citations_delta_avg"] is None
+
+
+def test_merge_final_missing_codes_merges_into_existing_bucket():
+    """既存バケット（同じ深さ×経路の巡別記録が既にある）には加算する（上書きしない）。"""
+    round_rows = [_round_row(provider="codex", depth_profile="standard",
+                             meta={"round": 1, "missing_codes": ["spec_missing"]})]
+    rounds_stats = _usage_store._compute_round_stats(round_rows)
+    rows = [_gate_row(depth_profile="standard", gate_missing_codes=["spec_missing"])]
+    _usage_store._merge_final_missing_codes(rounds_stats, rows)
+    bucket = next(b for b in rounds_stats["by_depth_provider"]
+                 if (b["depth_profile"], b["provider"]) == ("standard", "codex"))
+    assert bucket["missing_codes"] == {"spec_missing": 2}
+    assert bucket["rounds"] == 1   # 巡別指標は既存のまま（合流は missing_codes だけ）
+
+
 # ===== 期間の解決（`days` と `from`/`to`）=====
 
 def test_usage_period_days_keeps_existing_shape_and_adds_from_to():
@@ -272,3 +329,61 @@ def test_usage_period_rejects_span_over_upper_limit():
     with pytest.raises(_usage_store.UsagePeriodError):
         _usage_store._usage_period(30, time_from="2026-01-01T00:00:00+09:00",
                                    time_to="2027-01-02T00:00:00+09:00")
+
+
+def test_round_stats_aggregate_evidence_kind_missing_codes_and_drop_free_text():
+    """根拠種別の不足コード（閉集合）も他の不足軸と同じ語彙として
+    集計に載り、記録元が落とす自由文・資料名は集計へ到達しない。"""
+    from sherpa.providers import base as _pb
+
+    codes = ["source_missing", "spec_missing", "definition_missing",
+             "log_missing", "callgraph_missing"]
+    rows = [_round_row(meta={"round": 0, "verdict": "insufficient", "stop": "rounds_exhausted",
+                             "missing_codes": codes,
+                             "claims": {"confirmed": 0, "inferred": 0, "unknown": 0,
+                                        "reason_codes": {}}},
+                      turn_message_id=1)]
+    out = _usage_store._compute_round_stats(rows)
+    assert out["by_depth_provider"][0]["missing_codes"] == dict.fromkeys(codes, 1)
+
+    # 記録元（`_normalized_verdict`）が閉集合でふるいにかけるため、語彙外・自由文・資料名は
+    # そもそも `missing_codes` に入らない（集計側に自由文が紛れ込む経路が無い）。
+    normalized = _pb._normalized_verdict({
+        "verdict": "insufficient", "missing": "消費税法.md を確認できていません",
+        "missing_codes": codes + ["消費税法.md", "ソース未確認", 1, None]})
+    assert normalized["missing_codes"] == sorted(codes)
+
+
+def test_compute_round_stats_counts_backend_degrade_limits():
+    """S4（縮退の可視化と計数）: バックエンド不調の bool 項目（`_USAGE_LIMIT_BOOL_FIELDS` に追加した
+    3項目）も巡別集計へそのまま乗る——`_ROUND_LIMIT_KEYS` が合成で拾うため個別の追加実装は無い。
+    巡内増分は「偽→真になった巡だけ」載るため、この合算は**初回検出の計数**であって
+    「障害が起きた巡の数」ではない。"""
+    rows = [
+        _round_row(meta={"round": 1, "citations_delta": 0, "verdict": "insufficient", "stop": "rerun",
+                         "limits": {"backend_unavailable_graph": True,
+                                    "graph_reingest_required": True},
+                         "claims": {"confirmed": 0, "inferred": 0, "unknown": 0, "reason_codes": {}}},
+                  turn_message_id=1),
+        _round_row(meta={"round": 2, "citations_delta": 0, "verdict": "sufficient", "stop": "sufficient",
+                         "limits": {"backend_unavailable_fulltext": True},
+                         "claims": {"confirmed": 0, "inferred": 0, "unknown": 0, "reason_codes": {}}},
+                  turn_message_id=1),
+    ]
+    out = _usage_store._compute_round_stats(rows)
+    assert out["by_depth_provider"][0]["limits"] == {
+        "backend_unavailable_graph": 1, "graph_reingest_required": 1,
+        "backend_unavailable_fulltext": 1}
+
+
+def test_compute_round_stats_counts_depth_escalated_rounds():
+    """S2: 深さの自動引き上げ（`limits.depth_escalated`）も他の bool 系と同じく
+    「その巡で真になった件数」として合算する（`_USAGE_LIMIT_BOOL_FIELDS` の1項目）。"""
+    rows = [
+        _round_row(meta={"round": 0, "limits": {}}, turn_message_id=1),
+        _round_row(meta={"round": 1, "limits": {"depth_escalated": True}}, turn_message_id=1),
+    ]
+    out = _usage_store._compute_round_stats(rows)
+    assert out["by_depth_provider"][0]["limits"] == {"depth_escalated": 1}
+    by_round = {r["round_no"]: r for r in out["by_round"]}
+    assert by_round[0]["limits"] == {} and by_round[1]["limits"] == {"depth_escalated": 1}

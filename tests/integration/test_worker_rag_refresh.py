@@ -3,8 +3,13 @@
 
 `worker.sync()`（公開エントリポイント）を通して駆動し、分岐選択そのものも検証対象に含める。
 DB/Neo4j には接続しない（`store.get_world`/`store.world_lock`/`worker.world_state`/
-`worker._derived_stale`/`worker.run`/`worker._run_locked` を monkeypatch）。ES は
-`es_index.rag_es_enabled`/`index_world` を monkeypatch し、実 ES には接続しない。
+`worker._derived_stale`/`worker.run`/`worker._run_locked`／`world_neo4j.check_graph_counts`/
+`world_neo4j.load_world` を monkeypatch——rag/evidence/document_ir いずれの drift も
+`_reflect_graph_after_rag_rewrite` 経由で `load_world` へ実 Neo4j 接続するため）。ES は
+`es_index.rag_es_enabled`/`index_world` を monkeypatch し、実 ES には接続しない
+（`index_world` を短絡しても bulk 成功後の `confirm_human_md_meta` は別経路で `_req` へ
+GET/PUT する——通信の境界である `es_index._req` 自体もフェイクへ差し替える・
+`_fake_es_meta_req` 参照）。
 """
 from __future__ import annotations
 
@@ -82,15 +87,51 @@ def _no_full_run(world, **kw):
     raise AssertionError("全再構築（run/_run_locked）は呼ばれない前提のテストで呼ばれた")
 
 
-def _apply_world_monkeypatches(monkeypatch, wd, dmd):
+def _fake_es_meta_req(calls: list):
+    """`es_index._req` の外部境界フェイク（実 ES への通信を遮断する）。`index_world` 自体は
+    個別に `es_index.index_world` を差し替えて短絡するため、ここまで来るのは
+    `index_world_with_human_md_holdback` が bulk 成功後に呼ぶ
+    `es_index.confirm_human_md_meta`（`_index_meta` の GET→`_meta` 書き直しの PUT）だけの想定。
+    呼び出しを `calls` へ `(method, path)` で記録し、テスト側で「フェイクだけで完結した
+    （実 ES へは一切通信していない）」ことを確認できるようにする。"""
+    def _req(method, path, body=None, **kw):
+        calls.append((method, path))
+        return {}
+    return _req
+
+
+def _apply_world_monkeypatches(monkeypatch, wd, dmd) -> list:
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
+    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)   # 本番の値（常時 rag）で走らせる
+    # 本番の値（True）だと `_refresh_derived_representations`/`_reindex_after_rag_rewrite` が
+    # `index_world_with_human_md_holdback` 経由で ES へ触れにいく——本ファイルの docstring が
+    # 明言する「実 ES には接続しない」前提を保つため、既定で成功を返すダミーへ差し替える
+    # （ES 反映の成否そのものを見るテストは各テストが個別に上書きする）。
+    monkeypatch.setattr(es_index, "index_world",
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
+    # `index_world` を短絡しても、bulk 成功後の `confirm_human_md_meta`（`_meta.human_md_sig` の
+    # 書き直し）は `es_index._req` で実 ES へ GET/PUT する別経路——通信の境界（`_req`）自体を
+    # フェイクへ差し替え、実 ES の索引メタデータを書き換えないようにする（Codex RV 是正）。
+    req_calls: list = []
+    monkeypatch.setattr(es_index, "_req", _fake_es_meta_req(req_calls))
 
     monkeypatch.setattr(worker, "world_state", lambda world, **kw: ("sig", {}))
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
+    # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——world_id "w" は実 Neo4j に無いため
+    # モックしなければ「スタンプ無し」と判定され、このファイルの docstring が明言する「実 Neo4j に
+    # 触れない」前提を破って実際に投入してしまう。整合済み（None）を返し評価対象外に保つ。
+    monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
+    # rag drift/evidence drift/document_ir drift のいずれも `_refresh_derived_representations` の
+    # 最後で `_reflect_graph_after_rag_rewrite`（RAG_ES の設定に関わらず常に呼ぶ）→
+    # `world_neo4j.load_world` へ実 Neo4j 接続する（Codex RV 2巡目是正・sweep で検出）。
+    # `worker._reflect_graph_after_rag_rewrite` 自体は差し替えない
+    # （`test_llm_rag_rewrite_reflects_mention_edges_in_graph` が言及エッジの中身を検証するため
+    # `build_world_graph` は実際に走らせる必要がある）——最後の送信先だけ差し替える。
+    # グラフの中身を見るテスト（同上）は `load_world` を自前でさらに上書きする。
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (len(nodes), len(edges)))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
@@ -101,20 +142,21 @@ def _apply_world_monkeypatches(monkeypatch, wd, dmd):
     # 前提を明示する（このfixtureを使う各テストが drift/sidecar 状態を個別に設定する）。
     monkeypatch.setattr(worker, "run", _no_full_run)
     monkeypatch.setattr(worker, "_run_locked", _no_full_run)
+    return req_calls
 
 
 @pytest.fixture
 def _world(tmp_path, monkeypatch):
     wd, dmd = _build_world(tmp_path)
-    _apply_world_monkeypatches(monkeypatch, wd, dmd)
-    return {"wd": wd, "dmd": dmd}
+    req_calls = _apply_world_monkeypatches(monkeypatch, wd, dmd)
+    return {"wd": wd, "dmd": dmd, "req_calls": req_calls}
 
 
 @pytest.fixture
 def _world_with_asset(tmp_path, monkeypatch):
     wd, dmd = _build_world_with_asset(tmp_path)
-    _apply_world_monkeypatches(monkeypatch, wd, dmd)
-    return {"wd": wd, "dmd": dmd}
+    req_calls = _apply_world_monkeypatches(monkeypatch, wd, dmd)
+    return {"wd": wd, "dmd": dmd, "req_calls": req_calls}
 
 
 def test_rag_refresh_regenerates_once_then_noop(_world_with_asset, monkeypatch):
@@ -154,8 +196,11 @@ def test_rag_refresh_regenerates_once_then_noop(_world_with_asset, monkeypatch):
 
     res = worker.sync("w")
     assert res["status"] == "unchanged" and res["changed"] is False
-    assert office_md.rag_sig_drift(dmd) is False        # RAG_ES無効＝refresh自身が確定する
+    assert office_md.rag_sig_drift(dmd) is False        # ES(index_world)成功後にworkerが確定する
     assert rag_calls == [1] and evidence_calls == []    # 軽量経路のrefresh_rag()だけが1回呼ばれる
+    # 実 ES へは一切通信していない（フェイクの GET/PUT だけで confirm_human_md_meta が完結した）。
+    mapping_path = f"/{es_index._index('w')}/_mapping"
+    assert _world_with_asset["req_calls"] == [("GET", mapping_path), ("PUT", mapping_path)]
 
     assert (_rag(dmd) / "a.xlsx.rag.md").read_text(encoding="utf-8") == correct_md              # 置換された
     assert (_rag(dmd) / "a.xlsx.rag_chunks.jsonl").read_text(encoding="utf-8") == correct_chunks
@@ -238,7 +283,7 @@ def test_llm_rag_rewrite_reflects_mention_edges_in_graph(_world, monkeypatch):
     monkeypatch.setattr(world_neo4j, "load_world", _fake_load_world)
 
     ok = worker._reindex_after_rag_rewrite("w")
-    assert ok is True                                    # RAG_ES 無効（`_world` fixture の既定）＝無条件成功
+    assert ok is True                                    # ES(index_world)成功（`_world` fixture の既定モック）
     assert len(load_calls) == 1                           # グラフ反映が実際に呼ばれた
     _nodes, edges = load_calls[0]
     dst_cid = world_graph._cid("Module", "w", "sample.cbl", "SAMPLE")
@@ -369,12 +414,14 @@ def test_legitimate_partial_sidecar_case_does_not_trigger_full_rebuild_loop(
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
+    # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——world_id "w" は実 Neo4j に無いため
+    # モックしなければ「スタンプ無し」と判定され実際に投入してしまう（本関数のテスト対象外）。
+    monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
     monkeypatch.setattr(worker, "run", _no_full_run)
     monkeypatch.setattr(worker, "_run_locked", _no_full_run)
@@ -410,12 +457,26 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
     monkeypatch.setattr(store, "get_world",
                          lambda world: {"last_sig": "sig", "last_manifest": {}, "last_doc_count": 0})
     monkeypatch.setattr(worker, "_derived_stale", lambda world: False)
+    # グラフ修復（`check_graph_counts`）も実 Neo4j に触れる——world_id "w" は実 Neo4j に無いため
+    # モックしなければ「スタンプ無し」と判定され実際に投入してしまう（本関数のテスト対象外）。
+    monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
+    # evidence drift の軽量再生成も `_reflect_graph_after_rag_rewrite` 経由で `world_neo4j.load_world`
+    # へ実 Neo4j 接続する（Codex RV 2巡目是正・sweep で検出・§ _apply_world_monkeypatches 参照）。
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (len(nodes), len(edges)))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
+    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)   # 本番の値（常時 rag）で走らせる
+    # 本ファイルの docstring が明言する「実 ES には接続しない」前提を保つ（§ _apply_world_monkeypatches 参照）。
+    monkeypatch.setattr(es_index, "index_world",
+                        lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
+    # `index_world` を短絡しても bulk 成功後の `confirm_human_md_meta` は `_req` で実 ES へ
+    # GET/PUT する別経路——通信の境界自体をフェイクへ差し替える（Codex RV 是正・
+    # `_fake_es_meta_req` docstring 参照）。
+    req_calls: list = []
+    monkeypatch.setattr(es_index, "_req", _fake_es_meta_req(req_calls))
     monkeypatch.setattr(es_index, "needs_reindex", lambda world, sig, **kw: False)
     monkeypatch.setattr(worker, "run", _no_full_run)
     monkeypatch.setattr(worker, "_run_locked", _no_full_run)
@@ -431,6 +492,10 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
         assert (_rag(dmd) / "empty.docx.rag.md").is_file()
         assert (_rag(dmd) / "empty.docx.rag_chunks.jsonl").is_file()
     assert office_md.evidence_ir_sig_drift(dmd) is False   # 1回目のrefreshで解消済み
+    # 実 ES へは一切通信していない（1回目の sync だけが confirm_human_md_meta まで到達し、
+    # フェイクの GET/PUT で完結した——drift 解消済みの2回目は ES 自体に触れない）。
+    mapping_path = f"/{es_index._index('w')}/_mapping"
+    assert req_calls == [("GET", mapping_path), ("PUT", mapping_path)]
 
 
 def _value_text(value) -> str:

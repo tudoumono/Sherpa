@@ -1,6 +1,6 @@
 """L4a（可視性・廃止表現の表示側・OCC-1のKV直列化）の実ファイル往復での受け入れ条件を検証する。
 
-正典: `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.3（key-value 表示形）・
+正典: `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.3（key-value 表示形）・
 §8.1（rag.md を正本にする・アンカー方式）。
 
 `tests/unit/test_deprecation_marker_acceptance.py`（L6′）は構造（`EvidenceElement.visibility`／

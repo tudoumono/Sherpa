@@ -108,7 +108,7 @@ def test_pptx_to_md_slide_text():
 
 
 def test_xlsx_to_md_values():
-    """H2（`docs/proposals/2026-08-28-人間向けMDの刷新.md` §3.1）: シート丸ごと1枚のパイプ表ではなく、
+    """H2（`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.1）: シート丸ごと1枚のパイプ表ではなく、
     `regions()` が検出した表候補ごとに `### {セル範囲}` の小見出し＋パイプ表を出す。"""
     import openpyxl
     d = tempfile.mkdtemp()
@@ -1180,7 +1180,6 @@ def test_human_md_partial_failure_keeps_es_meta_pending_until_fixed(monkeypatch,
 
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: False)
     # レンダラ/抽出器の版を上げたのと同じ状況（実運用の drift 発生源）を模す。
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vNEW")
 

@@ -102,7 +102,6 @@ _FAILED_FILES_LIMIT = 200   # ingest_runs.extraction_snapshot へ保存する量
 # 「抽出不完全の疑い」一覧（失敗ではない別枠・`failure_reasons.PARTIAL_EXTRACTION_LABEL/_ADVICE` 参照）。
 _PARTIAL_EXTRACTION_LIMIT = 200
 
-
 def _office_md_stage_summary(drep: dict) -> dict:
     """`office_md.build_derived()` の要約3値（`_record`／PG replace 失敗パスの両方で使う共通片）。"""
     return {"converted": drep.get("converted", 0), "failed": drep.get("failed", 0),
@@ -110,14 +109,19 @@ def _office_md_stage_summary(drep: dict) -> dict:
 
 
 def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict | None,
-                    rows: list | None) -> dict:
+                    rows: list | None, scan_rep: dict | None = None) -> dict:
     """STAT-3 S5: `extraction_snapshot["counts"]`（走査/対象/変換/索引/埋め込みの件数・時間）。
 
     取れない項目はキー自体を付けない（0 と欠落を区別する契約）。`_record`／PG replace 失敗パスの
     両方から呼ぶ（`_office_md_stage_summary`/`_failed_files_summary` と同じ共通片の役割）。
-    
+
     `legacy_converted`／`legacy_failed` は「この run で実際に前段変換（LibreOffice／COM）した件数」＝変換キャッシュ
     （CONV-CACHE）から復元した分は含まない（再同期では 0 になり得る・`converted` と `by_ext` には含まれる）。
+
+    `scan_rep`（省略可・`corpus_docs.scan_report()` の戻り値）: 本文が読めないため検索対象外にした
+    ファイル数と拡張子別内訳（`unreachable_as_text`/`unreachable_as_text_by_ext`）・秘匿除外件数
+    （`sensitive_excluded`）を `counts` へ合流する。成功確定経路（`_record` の `confirm_scan_report`）
+    だけが渡す——scan_report 自体が失敗/未計算の run は従来どおりキーごと省略する。
     """
     c: dict = {}
     if manifest is not None:
@@ -135,8 +139,16 @@ def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict |
             c["es_indexed"] = es_summary["indexed"]
         if es_summary.get("embedded") is not None:
             c["embedded_chunks"] = es_summary["embedded"]
+        if es_summary.get("reused") is not None:
+            c["reused_chunks"] = es_summary["reused"]
         if es_summary.get("embed_elapsed_ms") is not None:
             c["embed_elapsed_ms"] = es_summary["embed_elapsed_ms"]
+    if scan_rep is not None:
+        c["unreachable_as_text"] = scan_rep.get("unreachable_as_text", 0)
+        c["sensitive_excluded"] = scan_rep.get("sensitive_excluded", 0)
+        by_ext = scan_rep.get("unreachable_as_text_by_ext")
+        if by_ext:
+            c["unreachable_as_text_by_ext"] = by_ext
     return c
 
 
@@ -348,7 +360,8 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         _close_stage_timing()
         if stage_timings:
             snap["stage_timings"] = {k: dict(v) for k, v in stage_timings.items()}
-        counts = _counts_summary(drep, es_summary, manifest, rows if rows_known[0] else None)
+        counts = _counts_summary(drep, es_summary, manifest, rows if rows_known[0] else None,
+                                 scan_rep=confirm_scan_report)
         if counts:
             snap["counts"] = counts
         pending = {"status": status, "extraction_snapshot": snap, "published_snapshot": reflected,
@@ -581,11 +594,12 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
     es_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
                  "error": esr.get("error") if isinstance(esr, dict) else None,
                  "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
-                 # STAT-3 S5: counts（es_indexed／embedded_chunks／embed_elapsed_ms）の元データ。
-                 # `esr` に無ければ触れない（`.get()` は未取得時 None のまま＝`_counts` 側が欠落と
-                 # 0 を区別する）。
+                 # STAT-3 S5: counts（es_indexed／embedded_chunks／reused_chunks／embed_elapsed_ms）の
+                 # 元データ。`esr` に無ければ触れない（`.get()` は未取得時 None のまま＝`_counts` 側が
+                 # 欠落と 0 を区別する）。
                  "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
                  "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+                 "reused": esr.get("reused") if isinstance(esr, dict) else None,
                  "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
     neo4j_summary = {"nodes": n, "edges": m, "duration_sec": round(neo4j_duration_sec, 3)}
     # 既知の残余（ライブ鏡の本質的 TOCTOU）: この確定は**冒頭スキャン時点**の
@@ -870,9 +884,11 @@ def _record_es_index_failure(world: str, reason: str, *, run_id: int | None = No
 
 def _merge_es_runs(prev_summary, prev_timing, new_summary, new_timing):
     """同一 run で ES 再索引が 2 回走ったときの統計の合成。`prev_*` が None なら `new_*` をそのまま返す。
-    所要時間（`elapsed_ms`）と埋め込み（`embedded`・`embed_elapsed_ms`）は累積、`started_at` は初回、
-    `finished_at` は最終、索引件数（`indexed`・`chunks`）と状態（`available`・`error`）は最終回の値。
-    キャッシュ再利用の 2 回目で `embedded=0` になっても初回に実際に埋め込んだ件数は失わない。"""
+    所要時間（`elapsed_ms`）と埋め込み（`embedded`・`reused`・`embed_elapsed_ms`）は累積、
+    `started_at` は初回、`finished_at` は最終、索引件数（`indexed`・`chunks`）と状態
+    （`available`・`error`）は最終回の値。キャッシュ再利用の2回目で `embedded=0` になっても
+    初回に実際に埋め込んだ件数は失わない（`reused` も同様＝どちらの回も world 全体を対象にした
+    索引のため、部分集合の合算ではなく2回分の単純合計）。"""
     if prev_summary is None and prev_timing is None:
         return new_summary, new_timing
     def _add(a, b):
@@ -882,6 +898,7 @@ def _merge_es_runs(prev_summary, prev_timing, new_summary, new_timing):
     summary = dict(new_summary)
     if prev_summary:
         summary["embedded"] = _add(prev_summary.get("embedded"), new_summary.get("embedded"))
+        summary["reused"] = _add(prev_summary.get("reused"), new_summary.get("reused"))
         summary["embed_elapsed_ms"] = _add(prev_summary.get("embed_elapsed_ms"), new_summary.get("embed_elapsed_ms"))
     timing = dict(new_timing)
     if prev_timing:
@@ -1054,6 +1071,7 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
                 "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
                 "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
                 "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+                "reused": esr.get("reused") if isinstance(esr, dict) else None,
                 "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None,
             },
             "stage_timing": {
@@ -1114,6 +1132,9 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
     （`es_index.needs_reindex`→`index_world`）が成功したら `office_md.confirm_human_md_es_sig`
     で `.human_md_es_sig` マーカーを確定し、bulk_errors 等の部分失敗時は確定せず
     `store.add_ingest_run(status="failed")` で監査に残す（次回 sync が自動で再試行する）。
+    グラフも同じ不変分岐で自己修復する（`world_neo4j.check_graph_counts` が世代/件数の
+    食い違いを検知したら `_reflect_graph_after_rag_rewrite` で作り直す・埋め込み/LLM は呼ばない）。
+    `reflect=False` では他段と同じく Neo4j に一切触れないため、この照合・修復も行わない。
 
     署名の確定は `_run_locked`（`run` 経由・world_lock 保持中）だけが行う。
     ここ（`sync` 自身）は `run` 復帰**後**（＝lock 解放後）に確定を書き足さない＝他プロセスの
@@ -1128,7 +1149,8 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
     run_id 判明時に呼ばれるコールバック（旧経路・後方互換）。
     """
     def _finalize_if_unused(status: str, reasons: list[str] | None = None,
-                            stage_timings: dict | None = None, counts: dict | None = None) -> None:
+                            stage_timings: dict | None = None, counts: dict | None = None,
+                            es_summary: dict | None = None) -> None:
         # `_run_locked` を経由しない終了点専用（呼び出し元 run_id が未消化のまま残らないようにする）。
         if run_id is None:
             return
@@ -1144,6 +1166,15 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 snap["stage_timings"] = stage_timings
             if counts:
                 snap["counts"] = counts
+            # 実際に ES を張り直した run（`es_summary` が有る）だけ `extraction_snapshot.es` に残す
+            # （`_record` の全再構築経路と同じキー・同じ形）——`routers/worlds.py::_ingest_summary` の
+            # `stage_summary.es`（`store.get_latest_run_summary` の raw extraction_snapshot をそのまま
+            # 渡すだけ）がこの run の reused/embedded を拾えるようにする。張り直さなかった
+            # run（`es_summary is None`）には置かない——何もしていない run を ES 反映 run と偽らない。
+            # （`store.get_latest_es_run_summary` は別途 `published_at IS NOT NULL` も要求するため、
+            # この分岐の run は対象にならない——それは既存の別契約でここでは変えない。）
+            if es_summary is not None:
+                snap["es"] = es_summary
             store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap)
         except Exception:
             _log.warning(
@@ -1258,7 +1289,11 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             needs_doc_count_backfill = row is not None and row.get("last_doc_count") is None
             # last_scan_report 列の導入前に成功同期が確定していた既存 world も同様:
             # 内容不変のままだと `GET /worlds/{wid}/status` がずっと「未集計」を返し続ける。
-            needs_scan_report_backfill = row is not None and row.get("last_scan_report") is None
+            # `scan_report()` へフィールドを追加した後に保存された旧形式（dict だが新フィールドを
+            # 持たない）も同じバックフィルで更新する（`corpus_docs.scan_report_missing_fields` 参照）。
+            _cur_scan_report = row.get("last_scan_report") if row is not None else None
+            needs_scan_report_backfill = row is not None and (
+                _cur_scan_report is None or corpus_docs.scan_report_missing_fields(_cur_scan_report))
             if needs_manifest_backfill or needs_doc_count_backfill or needs_scan_report_backfill:
                 # 既に本関数の外側 `with` で lock 保持中——ここで再度 `store.world_lock` は
                 # 呼ばない（呼べば同一 lock の再入＝別コネクションでの自己デッドロック）。
@@ -1290,7 +1325,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                                 world,
                                 corpus_docs.manifest_doctype_count_from_root(saved_manifest, backfill_root),
                                 sig)
-                    if cur.get("last_scan_report") is None:
+                    if cur.get("last_scan_report") is None or corpus_docs.scan_report_missing_fields(cur.get("last_scan_report")):
                         # sig 一致を確認済みの区間内＝この世代の内容に対する scan_report として正当。
                         # `set_scan_report` は `last_synced_at` を更新しない（sig 確定の事実を書き換えない）。
                         try:
@@ -1303,6 +1338,32 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 # 呼び出し元へは（下の return で）status="unchanged" を返す＝バックフィルできなかった
                 # 今回の表示は保守的（実際には他プロセスが変更中/無効化した可能性がある）だが安全性の
                 # 問題は無い＝次回 sync が実際の状態を正しく判定して収束する。
+            # グラフ修復: 世代不一致・件数スタンプ欠落・実物との件数不一致（`check_graph_counts`）を
+            # 検知して既存の派生物から作り直す（管理UI不要・静的解析＋投入のみ＝埋め込み/LLM は
+            # 呼ばない）。ES 自己修復（直後のブロック）と同じ流儀で、例外は握りつぶさず
+            # `_finalize_reasons` へ積んで run を failed にする（回答/チャットの経路は変えない
+            # ——取り込み側の自己修復のみ）。`reflect=False`（Neo4j に反映しない sync・staging/検証
+            # 専用経路）は全段の経路（`if not reflect:` の台帳だけ確定）と同じく Neo4j に触れない
+            # ため、照合も修復もしない。
+            graph_repair_failure = None
+            if reflect:
+                try:
+                    genv = world_neo4j._env()
+                    graph_repair_reason = world_neo4j.check_graph_counts(
+                        world, genv["uri"], genv["user"], genv["pw"])
+                    if graph_repair_reason is not None:
+                        _t_graph0 = time.monotonic()
+                        _graph_repair_started_at = datetime.now(timezone.utc).isoformat()
+                        _reflect_graph_after_rag_rewrite(world)
+                        _stage_timings["graph_repair"] = {
+                            "started_at": _graph_repair_started_at,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                            "elapsed_ms": round((time.monotonic() - _t_graph0) * 1000),
+                        }
+                except Exception as e:
+                    _log.warning(
+                        "グラフ自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
+                    graph_repair_failure = e.__class__.__name__
             # ES 修復: 空/署名ズレ/埋め込みプロバイダ変更を検知して張り直す（管理UI不要）。失敗は
             # 別 run を作らず受付 run（`run_id`）自身の終端へ畳み込む——`index_world_with_human_md_holdback`
             # へ `run_id` を渡すことで内部の失敗記録を抑止し、ここで一度だけ terminal 化する。
@@ -1335,6 +1396,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                                       "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
                                       "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
                                       "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+                                      "reused": esr.get("reused") if isinstance(esr, dict) else None,
                                       "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
                     # 同じ run で内部再索引（refresh_es_info）の後に外側の再索引も走った場合は置換せず
                     # 合成する（所要時間・埋め込みは累積・開始は初回・終了は最終・索引件数と状態は最終）。
@@ -1353,13 +1415,16 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             _finalize_reasons = []
             if refresh_outcome == "rag_failed":
                 _finalize_reasons.append(f"rag_refresh_failed:{refresh_failure_reason}")
+            if graph_repair_failure is not None:
+                _finalize_reasons.append(f"graph_repair_failed:{graph_repair_failure}")
             if es_repair_failure is not None:
                 _finalize_reasons.append(f"es_repair_failed:{es_repair_failure}")
             if _finalize_reasons:
                 _finalize_if_unused("failed", _finalize_reasons,
-                                    stage_timings=_stage_timings, counts=_counts)
+                                    stage_timings=_stage_timings, counts=_counts, es_summary=es_summary)
             else:
-                _finalize_if_unused("auto_published", stage_timings=_stage_timings, counts=_counts)
+                _finalize_if_unused("auto_published", stage_timings=_stage_timings, counts=_counts,
+                                    es_summary=es_summary)
             return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
     # `op` を渡し忘れると `run()` の既定 "sync" に固定され、この呼び出し元が実際には
     # refresh/rerun 等でも Webhook payload の `op` が常に "sync" になってしまう——`op` を配線する。

@@ -1,5 +1,5 @@
 """ES 検索の探す対象（層）フィルタ（`es_index.search`/`search_knn_only(layer=...)`・
-docs/proposals/2026-08-29-調べ方ブロック.md §3.4）の単体テスト。
+docs/archive/2026-08-29-調べ方ブロック.md §3.4）の単体テスト。
 
 実 ES 不要（`_req`/`available`/`embeddings` をモックし、送信クエリボディの `filter` 節だけを検証する）。
 """

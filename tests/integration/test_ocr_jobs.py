@@ -5,6 +5,7 @@ import uuid
 import pytest
 
 from sherpa import store
+from sherpa.ingest import observation_render
 from sherpa.store import ocr_jobs
 
 
@@ -131,7 +132,9 @@ def test_succeeded_results_stream_and_snapshot_mark_use_real_postgres():
             )
             assert completed is not None
 
-        rows = list(ocr_jobs.iter_succeeded_results(world, generation, batch_size=1))
+        rows = list(ocr_jobs.iter_succeeded_results(
+            world, generation, observation_render._relative_source_path, batch_size=1,
+        ))
         assert [row["source_rel_path"] for row in rows] == ["a/large.pdf", "b/image.png"]
         snapshot = ocr_jobs.succeeded_results_snapshot(world, generation)
         assert snapshot["row_count"] == 2

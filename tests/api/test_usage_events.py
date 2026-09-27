@@ -145,6 +145,35 @@ def test_meta_column_roundtrip():
         _delete_usage_events_by_model(models)
 
 
+def test_chat_round_events_are_excluded_from_cost_aggregation_but_persist_meta():
+    """巡別記録（kind='chat-round'）は表示・分析用の別イベント＝課金集計
+    （`tokens.by_kind`）には出さない（正本＝chat／chat-sub／chat-review と二重に足さない）。
+    付帯内訳（`meta`）は行として保存される。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    admin, admin_uid = _admin_client()
+    world = f"usgevround{sfx}"
+    m_round = f"test-model-round-{sfx}"
+    try:
+        store.add_usage_event(kind="chat-round", provider="openai", model=m_round,
+                              input_tokens=11, cached_input_tokens=0, output_tokens=7,
+                              reasoning_output_tokens=0, calls=1, user_id=admin_uid, world=world,
+                              meta={"round": 2, "verdict": "insufficient",
+                                    "limits": {"tool_result_clipped": 1}})
+        r = admin.get("/admin/usage/stats?days=30")
+        assert r.status_code == 200, r.text
+        by_kind = r.json()["tokens"]["by_kind"]
+        assert all(row["kind"] != "chat-round" for row in by_kind)
+        with store._connect() as c:
+            row = c.execute("SELECT kind, meta FROM usage_events WHERE model = %s",
+                            (m_round,)).fetchone()
+        assert row["kind"] == "chat-round"
+        assert row["meta"]["round"] == 2 and row["meta"]["verdict"] == "insufficient"
+    finally:
+        _delete_usage_events_by_model([m_round])
+
+
 def test_by_kind_elapsed_ms_aggregation():
     """STAT-3 S2（2026-09-11-利用統計の拡充.md T2）: kind 別の elapsed_ms 合計/平均/計測件数。
     NULL 行（計測スコープ外）は平均から除かれ、chat 行は常に対象外（elapsed_n=0）。"""

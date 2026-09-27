@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shlex
 
 import pytest
 
@@ -2071,6 +2073,98 @@ def test_codex_required_does_not_expose_user_ids(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 3b. check_codex_multi_agent_worker_model（RV #66 是正）
+# ---------------------------------------------------------------------------
+
+def test_check_codex_multi_agent_worker_model_skip_when_settings_unavailable():
+    r = doctor_checks.check_codex_multi_agent_worker_model(None, [])
+    assert r.status == "skip"
+
+
+def test_check_codex_multi_agent_worker_model_skip_when_codex_not_used(monkeypatch):
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "ollama")
+    r = doctor_checks.check_codex_multi_agent_worker_model({}, [])
+    assert r.status == "skip"
+
+
+def test_check_codex_multi_agent_worker_model_ok_for_default_openai_endpoint(monkeypatch):
+    """Codex(OpenAI 系) 構成で接続先が既定(OpenAI 本家)なら worker モデルの整合は問題なし。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    r = doctor_checks.check_codex_multi_agent_worker_model({}, [])
+    assert r.status == "ok"
+
+
+def test_check_codex_multi_agent_worker_model_ok_for_azure_endpoint_unconfigured(monkeypatch):
+    """初期構成の既定（2026-09-19）: Codex(OpenAI 系) 構成で接続先が Azure でも multi_agent は
+    有効（`codex_multi_agent_enabled` が接続先を問わなくなった）。worker モデル未設定時は
+    本体 Codex と同じデプロイ名へ倒すため（`_codex_worker_model(..., main_model=...)`）、
+    本体が到達できていれば worker も動く想定内の組合せ＝ ok。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    sys_s = {"openai_endpoint_kind": "azure",
+             "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "ok"
+    assert "デプロイ名" in r.detail
+
+
+def test_check_codex_multi_agent_worker_model_skip_for_custom_endpoint(monkeypatch):
+    """Azure 以外の独自エンドポイント（custom）は worker モデルの解決を本体デプロイ名に倒して
+    いないため、引き続き理由付き skip（ng にしない）。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    sys_s = {"openai_endpoint_kind": "custom",
+             "openai_base_url": "https://example.com/v1"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "skip"
+    assert "custom" in r.detail
+
+
+def test_check_codex_multi_agent_worker_model_ok_when_only_ollama_backing(monkeypatch):
+    """S6c: Codex(Ollama) 構成だけの環境も multi_agent の対象——worker 未設定なら本体と同じ
+    ローカルモデルへ倒すため ok（Azure 接続先設定が残っていても Ollama 判定には無関係）。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "ollama")
+    sys_s = {"openai_endpoint_kind": "azure",
+             "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "ok"
+
+
+def test_check_codex_multi_agent_worker_model_detects_active_user_row(monkeypatch):
+    """システム既定は Codex を使っていなくても、有効な利用者のいずれかが Codex(OpenAI 系) を
+    使っていれば検査対象に含める。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent",
+                        lambda settings, **k: (settings or {}).get("agent") or "ollama")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider",
+                        lambda settings, **k: (settings or {}).get("codex_model_provider") or "openai")
+    sys_s = {"openai_endpoint_kind": "azure",
+             "openai_base_url": "https://myres.openai.azure.com/openai/v1"}
+    rows = [{"agent": "codex", "codex_model_provider": "openai"}]
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, rows)
+    assert r.status == "ok"
+
+
+def test_check_codex_multi_agent_worker_model_skip_when_configured_custom(monkeypatch):
+    """worker モデルが管理画面で独自設定（`codex_worker_model`）されているときは、Sherpa 側で
+    カタログ存在を検証できないため skip（実装ベース探索の回復 S1・案 B）。"""
+    from sherpa import agent_constructs
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(agent_constructs, "codex_model_provider", lambda *a, **k: "openai")
+    sys_s = {"codex_worker_model": "gpt-5.9-custom"}
+    r = doctor_checks.check_codex_multi_agent_worker_model(sys_s, [])
+    assert r.status == "skip"
+    assert "独自設定" in r.detail
+
+
+# ---------------------------------------------------------------------------
 # 3c. Ollama の用途別プローブ（実効URL・用途・モデル単位）
 # ---------------------------------------------------------------------------
 
@@ -2235,6 +2329,52 @@ def test_resolve_ollama_usages_search_helper_ignored_when_main_agent_not_openai(
     assert usages == []
 
 
+def test_resolve_ollama_usages_search_helper_when_main_agent_is_ollama(monkeypatch):
+    """(C6・RV採用) Ollama 頭脳 × search_helper=ollama の下調べ役（subsearch モデル）も
+    用途一覧に含める（§2.1 組合せ表どおり。以前は `eff == "openai"` の行だけしか解決せず、
+    この組合せが検査対象から漏れていた＝未導入でも doctor が検出できない実害だった）。"""
+    from sherpa import agent_constructs, keys, model_catalog, search_helper
+    monkeypatch.setattr(agent_constructs, "effective_agent",
+                         lambda settings, **k: (settings or {}).get("agent") or "openai")
+    monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
+    monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: "chat-model")
+    monkeypatch.setattr(search_helper, "resolve",
+                         lambda settings, **k: {"provider": "ollama", "url": "http://localhost:11434",
+                                               "model": "qwen2.5-subsearch"})
+    rows = [{"agent": "ollama", "codex_model_provider": None, "ollama_url": "http://localhost:11434",
+             "search_helper": "ollama"}]
+    usages = doctor_checks._resolve_ollama_usages({}, rows)
+    by_model = {u["model"]: u for u in usages}
+    assert "qwen2.5-subsearch" in by_model
+    assert "検索ヘルパー" in by_model["qwen2.5-subsearch"]["purposes"][0]
+    assert "chat-model" in by_model   # 頭脳自身（チャット）の用途も引き続き含まれる
+
+
+def test_check_ollama_probes_ng_for_missing_ollama_subsearch_model_when_brain_is_ollama(monkeypatch):
+    """(C6・受け入れ条件) Ollama 頭脳 × search_helper=ollama の subsearch モデルが未導入
+    （`_probe_ollama_usage` が False を返す）と、その用途が ng として報告される
+    （`_resolve_ollama_usages` は実装のまま使い、探索結果だけ確認する）。"""
+    from sherpa import agent_constructs, keys, model_catalog, search_helper
+    monkeypatch.setattr(agent_constructs, "effective_agent",
+                         lambda settings, **k: (settings or {}).get("agent") or "openai")
+    monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
+    monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: "chat-model")
+    monkeypatch.setattr(search_helper, "resolve",
+                         lambda settings, **k: {"provider": "ollama", "url": "http://localhost:11434",
+                                               "model": "qwen2.5-subsearch"})
+
+    def _fake_probe(url, model, sys_s):
+        return (model != "qwen2.5-subsearch", "ok" if model != "qwen2.5-subsearch" else "not found")
+    monkeypatch.setattr(doctor_checks, "_probe_ollama_usage", _fake_probe)
+    rows = [{"agent": "ollama", "codex_model_provider": None, "ollama_url": "http://localhost:11434",
+             "search_helper": "ollama"}]
+    results = doctor_checks.check_ollama_probes({}, rows)
+    by_status = {r.status for r in results}
+    assert "ng" in by_status
+    ng_results = [r for r in results if r.status == "ng"]
+    assert any("not found" in (r.detail or "") for r in ng_results)
+
+
 def test_resolve_ollama_usages_none_when_search_helper_resolve_raises(monkeypatch):
     """`search_helper.resolve()` は本番では例外を捕捉しない（呼び出し元が壊れた設定をそのまま
     検出する契約）。この行が「検索ヘルパーは使っていない」に丸められて黙って SKIP に落ちないよう、
@@ -2259,7 +2399,8 @@ def test_resolve_ollama_usages_dedupes_same_url_and_model(monkeypatch):
             {"agent": "ollama", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
     usages = doctor_checks._resolve_ollama_usages({}, rows)
     assert len(usages) == 1
-    assert len(usages[0]["purposes"]) == 1   # 用途ラベルも重複しない
+    # 用途ラベルも重複しない（2 行あっても 2 用途まで＝チャットと、頭脳自身が worker の下調べ）。
+    assert usages[0]["purposes"] == ["チャット（利用者設定）", "検索ヘルパー（下調べ）"]
 
 
 # ---------------------------------------------------------------------------
@@ -2383,117 +2524,44 @@ def test_probe_ollama_usage_url_display_resolution_does_not_crash_on_non_string_
     assert isinstance(detail, str) and detail
 
 
-_HOST = doctor_checks._OLLAMA_DEFAULT_HOST
-_NS = doctor_checks._OLLAMA_DEFAULT_NAMESPACE
-
-
 @pytest.mark.parametrize("ref,expected", [
-    ("qwen2.5", (_HOST, _NS, "qwen2.5", "latest")),
-    ("qwen2.5:7b", (_HOST, _NS, "qwen2.5", "7b")),
-    ("library/qwen2.5", (_HOST, _NS, "qwen2.5", "latest")),
-    ("library/qwen2.5:7b", (_HOST, _NS, "qwen2.5", "7b")),
-    ("myorg/qwen2.5:7b", (_HOST, "myorg", "qwen2.5", "7b")),
-    # 既定レジストリ・既定名前空間は明示されていても省略と等価（3要素そろえた完全修飾）。
-    ("registry.ollama.ai/library/qwen2.5", (_HOST, _NS, "qwen2.5", "latest")),
-    ("registry.ollama.ai/library/qwen2.5:7b", (_HOST, _NS, "qwen2.5", "7b")),
     # スラッシュ1個（namespace/model）は host を指定できない＝先頭要素がドメイン風でも
     # 「既定 host を省略した custom host」ではなく「namespace が registry.ollama.ai という
     # 別モデル」を意味する……はずだが、namespace の構成文字として `.` は無効（Ollama 公式
     # grammar は namespace に `.` を認めない）ため、この参照自体が不正（`None`）。
     ("registry.ollama.ai/qwen2.5", None),
-    # custom host は host[:port]/namespace/model の3要素そろえて初めて成立する。
-    ("registry.example.com:5000/myorg/qwen2.5", ("registry.example.com:5000", "myorg", "qwen2.5", "latest")),
-    ("registry.example.com:5000/myorg/qwen2.5:7b", ("registry.example.com:5000", "myorg", "qwen2.5", "7b")),
-    # 2要素で先頭がドメイン風でも custom host とは解釈しない（namespace 扱い）だが、
-    # namespace の構成文字として `:` は無効（`:` は host のポート区切り・タグ区切り専有）＝
-    # 2要素形では host を指定できないため、この参照は不正（`None`）。誤って受理すると
-    # 「見つからない＝pull すれば取得できる」という誤案内につながる。
-    ("registry.example.com:5000/qwen2.5", None),
-    # scheme 付きの完全修飾（3要素）も有効（scheme は host 部分の前置修飾として無視する）。
-    ("https://registry.example.com/myorg/qwen2.5:7b", ("registry.example.com", "myorg", "qwen2.5", "7b")),
     # scheme 付きで3要素そろっていない参照は不正（scheme 無しの短縮形と同一視しない＝
     # 実行時に送信されるのは正規化前の生の参照文字列そのものであり、doctor が「一致」と
     # 誤判定すると false-green になる）。
     ("http://qwen2.5", None),
     ("https://library/qwen2.5", None),
-    ("http://myorg/qwen2.5", None),
-    # 大小文字は区別しない。
-    ("QWEN2.5:LATEST", (_HOST, _NS, "qwen2.5", "latest")),
-    ("Registry.Ollama.AI/Library/Qwen2.5", (_HOST, _NS, "qwen2.5", "latest")),
-    # 明示的な ":" の直後にタグが無い参照は不正（暗黙の :latest 補完とは別物）。
-    ("qwen2.5:", None),
-    # 4要素以上（スラッシュ3個以上）は不正。
-    ("a/b/c/d", None),
-    # 文字種違反: namespace/model/tag の構成文字として `:` は無効（host のポート区切り・
-    # タグ区切りとしてのみ有効・かつ3要素形でしか host を指定できない）。2要素形の先頭要素は
-    # 常に namespace 扱いのため、`:` を含む時点で不正。
-    ("my:org/qwen2.5", None),
-    # namespace の構成文字として `.` は無効（model/tag は許可・namespace だけ不許可）。
-    ("my.org/qwen2.5", None),
-    # 空白・記号（許可文字集合外）は namespace/model/tag に使えない。
-    ("my org/qwen2.5", None),
-    ("myorg/qwen2.5:tag with space", None),
-    ("myorg/qwen2.5!", None),
-    # 先頭の `_` ・末尾の `_`／`-`（model/tag は `.` も）は許可される（Ollama 公式 grammar）。
-    ("_myorg/qwen2.5", (_HOST, "_myorg", "qwen2.5", "latest")),
-    ("myorg_/qwen2.5", (_HOST, "myorg_", "qwen2.5", "latest")),
-    ("myorg-/qwen2.5", (_HOST, "myorg-", "qwen2.5", "latest")),
-    ("myorg/_qwen2.5", (_HOST, "myorg", "_qwen2.5", "latest")),
-    ("myorg/qwen2.5_", (_HOST, "myorg", "qwen2.5_", "latest")),
-    ("myorg/qwen2.5:_7b", (_HOST, "myorg", "qwen2.5", "_7b")),
-    # 長さ上限: namespace/model/tag は各80文字（`_OLLAMA_NAME_PART_MAX_LEN`）。
-    ("a" * 81, None),
-    ("a" * 80, (_HOST, _NS, "a" * 80, "latest")),      # 上限ちょうどは許容（境界値）。
-    ("myorg/" + "a" * 81, None),
-    ("myorg/" + "a" * 80, (_HOST, "myorg", "a" * 80, "latest")),
+    # 2要素で先頭がドメイン風でも custom host とは解釈しない（namespace 扱い）だが、
+    # namespace の構成文字として `:` は無効（`:` は host のポート区切り・タグ区切り専有）＝
+    # 2要素形では host を指定できないため、この参照は不正（`None`）。誤って受理すると
+    # 「見つからない＝pull すれば取得できる」という誤案内につながる
+    # （`test_probe_ollama_usage_invalid_charset_ref_reports_invalid_not_pull_needed` が
+    # `_probe_ollama_usage` 越しに同じ入力で案内文側も確認する）。
+    ("registry.example.com:5000/qwen2.5", None),
+    # scheme 付きで3要素そろった参照は有効（scheme は host 部分の前置修飾として無視する）＝
+    # scheme 無しの同じ参照と同一の正規形へ畳み込まれる。管理画面のモデル参照欄は自由入力
+    # のため、Ollama Hub 等の URL 表示をそのまま貼り付けた値（scheme 付き）を弾いてしまうと
+    # 実害になる（RV是正: `test_probe_ollama_usage_*` はどれも scheme 付き入力を経由せず
+    # このケースの代替にならない）。
+    ("https://registry.example.com/myorg/qwen2.5:7b",
+     ("registry.example.com", "myorg", "qwen2.5", "7b")),
+    # custom host は host[:port]/namespace/model の3要素そろって初めて成立する有効な形
+    # （自前ホストの Ollama を既定以外のポートで運用する構成・管理画面で設定しうる値）。
+    # 上の2要素形（host 指定不能＝不正）の対になる受理側で、`test_probe_ollama_usage_*` は
+    # どれも既定ホスト／library 相当の入力しか経由せずこの custom host:port 形を確認しない
+    # （RV是正）。
+    ("registry.example.com:5000/myorg/qwen2.5:7b",
+     ("registry.example.com:5000", "myorg", "qwen2.5", "7b")),
 ])
-def test_normalize_ollama_ref(ref, expected):
-    assert doctor_checks._normalize_ollama_ref(ref) == expected
-
-
-def test_normalize_ollama_ref_host_max_length_boundary():
-    """host の長さ上限は350文字（`_OLLAMA_HOST_MAX_LEN`・Ollama 公式 grammar）。"""
-    host_350 = "h" * 346 + ".com"
-    host_351 = "h" * 347 + ".com"
-    assert len(host_350) == 350 and len(host_351) == 351
-    assert doctor_checks._normalize_ollama_ref(f"{host_350}/myorg/qwen2.5") is not None
-    assert doctor_checks._normalize_ollama_ref(f"{host_351}/myorg/qwen2.5") is None
-
-
-@pytest.mark.parametrize("ref,expected", [
-    # host の `_` は先頭・内部・末尾いずれの位置でも許可（Ollama 公式 grammar）。
-    ("_registry/myorg/model", ("_registry", "myorg", "model", "latest")),
-    ("registry_/myorg/model", ("registry_", "myorg", "model", "latest")),
-    ("my_registry/myorg/model", ("my_registry", "myorg", "model", "latest")),
-    # host の末尾 `-`／`.` も許可。
-    ("registry-/myorg/model", ("registry-", "myorg", "model", "latest")),
-    ("registry./myorg/model", ("registry.", "myorg", "model", "latest")),
-])
-def test_normalize_ollama_ref_host_allows_underscore_and_trailing_symbols(ref, expected):
-    assert doctor_checks._normalize_ollama_ref(ref) == expected
-
-
-@pytest.mark.parametrize("ref", [
-    "-registry/myorg/model",       # host 先頭の `-` は不可
-    ".registry/myorg/model",       # host 先頭の `.` は不可
-    "registry/-myorg/model",       # namespace 先頭の `-` は不可
-    "registry/myorg/-model",       # model 先頭の `-` は不可
-    "registry/myorg/.model",       # model 先頭の `.` は不可
-    "registry/myorg/model:-tag",   # tag 先頭の `-` は不可
-    "registry/myorg/model:.tag",   # tag 先頭の `.` は不可
-])
-def test_normalize_ollama_ref_rejects_leading_hyphen_or_dot(ref):
-    """各 part の先頭文字は英数字または `_` のみ（Ollama 公式 grammar）。先頭の `-`／`.` は
-    内部/末尾では許可される記号だが、先頭に限っては不正とする。"""
-    assert doctor_checks._normalize_ollama_ref(ref) is None
-
-
-@pytest.mark.parametrize("ref,expected", [
-    # host は先頭以外なら `:` を自由に含められる（数字 port に限定しない・Ollama 公式 grammar）。
-    ("host:abc/myorg/model", ("host:abc", "myorg", "model", "latest")),
-    ("host:5000:extra/myorg/model", ("host:5000:extra", "myorg", "model", "latest")),
-])
-def test_normalize_ollama_ref_host_colon_not_limited_to_numeric_port(ref, expected):
+def test_normalize_ollama_ref_valid_and_invalid_forms(ref, expected):
+    """誤 OK（false-green）・誤った案内につながる実害の拒否ケースと、管理画面から現実的に
+    入力されうる受理ケース（scheme 付き URL 貼り付け・custom host:port）だけを残す。基本形・
+    library プレフィックス・既定レジストリ・大小文字・タグ一致の判定は `test_probe_ollama_usage_*`
+    （`_probe_ollama_usage` 越しの一致判定）が確認する。"""
     assert doctor_checks._normalize_ollama_ref(ref) == expected
 
 
@@ -2509,40 +2577,13 @@ def test_normalize_ollama_ref_rejects_trailing_newline():
     assert doctor_checks._normalize_ollama_ref("qwen2.5") is not None
 
 
-def test_normalize_ollama_ref_scheme_qualified_equals_bare_form():
-    """scheme 付き完全修飾参照は、scheme 無しの同じ参照と同一の正規形へ畳み込まれる。"""
-    a = doctor_checks._normalize_ollama_ref("https://registry.example.com/myorg/qwen2.5:7b")
-    b = doctor_checks._normalize_ollama_ref("registry.example.com/myorg/qwen2.5:7b")
-    assert a is not None and a == b
-
-
-def test_normalize_ollama_ref_scheme_qualified_short_form_is_rejected_not_equated():
-    """`http://qwen2.5`／`https://library/qwen2.5` を、scheme 無しの短縮形（`qwen2.5`）と同一視
-    しない。実行時は正規化前の生の参照文字列がそのまま Codex/Ollama クライアントへ渡るため、
-    doctor がここで「一致」と判定しても実際には解決できない参照を誤って OK にする false-green
-    になる（scheme 検出時は host/namespace/model の3要素必須という Ollama 公式 parser の
-    grammar に従う）。"""
-    assert doctor_checks._normalize_ollama_ref("http://qwen2.5") is None
-    assert doctor_checks._normalize_ollama_ref("https://library/qwen2.5") is None
-    # 参考: scheme 無しなら同じ短縮形は有効（不正化の対象は「scheme 付きなのに短縮形」の組合せ）。
-    assert doctor_checks._normalize_ollama_ref("qwen2.5") is not None
-    assert doctor_checks._normalize_ollama_ref("library/qwen2.5") is not None
-
-
 def test_normalize_ollama_ref_default_host_without_namespace_is_distinct_model():
     """`otherns/qwen2.5`（スラッシュ1個）は「既定 host を省略した参照」ではなく
-    namespace が `otherns` という別のモデルを指す＝裸の `qwen2.5` とは一致しない。"""
+    namespace が `otherns` という別のモデルを指す＝裸の `qwen2.5` とは一致しない
+    （誤って同一視すると別モデルへの false match になる）。"""
     a = doctor_checks._normalize_ollama_ref("otherns/qwen2.5")
     b = doctor_checks._normalize_ollama_ref("qwen2.5")
     assert a is not None and b is not None and a != b
-
-
-def test_normalize_ollama_ref_namespace_with_dot_looking_like_host_is_rejected():
-    """`registry.ollama.ai/qwen2.5`（スラッシュ1個）の先頭要素はドメイン風に見えても常に
-    namespace 扱いになる（host を指定できるのは3要素形のみ）が、namespace の構成文字として
-    `.` は無効（Ollama 公式 grammar は namespace に `.` を認めない・model/tag とは異なる文字
-    集合）＝この参照は不正（`None`）。"""
-    assert doctor_checks._normalize_ollama_ref("registry.ollama.ai/qwen2.5") is None
 
 
 def test_probe_ollama_usage_library_prefix_matches_bare_repo_name(monkeypatch):
@@ -3058,6 +3099,66 @@ def test_codex_auth_azure_backing_sandbox_disabled_not_bypassed_by_personal_keys
     r = doctor_checks._check_codex_auth(sys_s, rows, required=True, note="", probe_cloud=True)
     assert r.status == "ng"
     assert "サンドボックス" in r.detail
+
+
+# ---------------------------------------------------------------------------
+# 4b. Codex のサンドボックス（`check_codex_sandbox`・実機事故の先回り検出）
+# ---------------------------------------------------------------------------
+
+def _write_fake_codex_sandbox(tmp_path, *, stdout_lines=(), stderr_lines=(), returncode=0):
+    """`codex sandbox -P sherpa-authoring -- ...` の代わりに canned な出力/終了コードを返す
+    偽実行ファイル（PATH の先頭に差し込む・実 codex/AI は一切呼ばない）。引数は無視する——
+    本テストの関心は doctor 側の分類ロジックであり、bwrap の実際の起動可否ではない。"""
+    d = tmp_path / "fakebin"
+    d.mkdir(exist_ok=True)
+    p = d / "codex"
+    body = ["#!/bin/sh"]
+    body += [f"echo {shlex.quote(line)}" for line in stdout_lines]
+    body += [f"echo {shlex.quote(line)} >&2" for line in stderr_lines]
+    body.append(f"exit {returncode}")
+    p.write_text("\n".join(body) + "\n", encoding="utf-8")
+    os.chmod(p, 0o755)
+    return d
+
+
+@pytest.mark.parametrize(
+    "stdout_lines, stderr_lines, returncode, expected_status, expected_substring",
+    [
+        (("SANDBOX_OK", "RG_OK", "KB_READONLY"), (), 0, "ok", "rg あり"),
+        (("SANDBOX_OK", "RG_OK", "KB_WRITABLE"), (), 0, "ng", "書き込めてしまいます"),
+        ((), ("bwrap: Failed RTM_NEWADDR: Operation not permitted",), 1, "ng",
+         "sudo bash scripts/setup-codex-sandbox.sh apply"),
+        ((), ("bwrap: execvp /opt/codex/codex: No such file or directory",), 1, "ng", "導入先"),
+    ],
+    ids=["sandbox_ok", "kb_writable", "rtm_newaddr", "execvp"],
+)
+def test_check_codex_sandbox_classifies_fake_codex_output(
+        tmp_path, monkeypatch, stdout_lines, stderr_lines, returncode,
+        expected_status, expected_substring):
+    """`codex sandbox -P sherpa-authoring` の代わりに canned な出力を返す偽 `codex`（PATH に
+    差し込む・実 codex/AI は一切呼ばない）で、doctor の判定と案内文言が実機の3症状
+    （成功／AppArmor のユーザー名前空間制限／サンドボックスから Codex 本体が見えない）を
+    正しく見分けることを確認する。"""
+    fake_dir = _write_fake_codex_sandbox(
+        tmp_path, stdout_lines=stdout_lines, stderr_lines=stderr_lines, returncode=returncode)
+    monkeypatch.setenv("PATH", f"{fake_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    result = doctor_checks.check_codex_sandbox(codex_required=True)
+    assert result.status == expected_status
+    assert expected_substring in result.detail
+
+
+def test_check_codex_sandbox_ng_when_sandbox_disabled(monkeypatch):
+    monkeypatch.setattr(doctor_checks.shutil, "which", lambda name: "/usr/bin/codex")
+    monkeypatch.setenv("SHERPA_CODEX_SANDBOX", "0")
+    result = doctor_checks.check_codex_sandbox(codex_required=True)
+    assert result.status == "ng"
+    assert "SHERPA_CODEX_SANDBOX" in result.detail
+
+
+def test_check_codex_sandbox_skips_when_not_required(monkeypatch):
+    """`codex_required=False` なら偽 `codex` すら呼ばず（PATH を変更しない）SKIP にする。"""
+    result = doctor_checks.check_codex_sandbox(codex_required=False)
+    assert result.status == "skip"
 
 
 # ---------------------------------------------------------------------------

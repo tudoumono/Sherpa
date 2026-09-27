@@ -1,7 +1,7 @@
 """API 経路（OpenAI/Gemini/Ollama/Bedrock 頭脳）の回答方針を、Codex 経路で先に実施した
 「回答を絞らない・確定した事実と推定は分けて推定は明示する・一覧は全件パス付き」へ揃える契約テスト
 （2026-09-10・ユーザー裁定「API 経路も同じ『絞らない』方針に揃える」・
-提案書 docs/proposals/2026-09-10-Codex原本直読と調査スキル.md §6 #6・
+提案書 docs/archive/2026-09-10-Codex原本直読と調査スキル.md §6 #6・
 RV 台帳 docs/rv/2026-09-10-Codex原本直読と調査スキル.md #3 起点）。
 
 `tests/unit/test_codex_workspace_authoring.py::test_answer_simplification_wording_contract_2026_09_10`

@@ -1,4 +1,4 @@
-"""人間が読める `{rel}.md` レンダラ（H2・`docs/proposals/2026-08-28-人間向けMDの刷新.md` §3.1/§3.2）。
+"""人間が読める `{rel}.md` レンダラ（H2・`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.1/§3.2）。
 
 document-ir（`sherpa/ingest/document_ir.py`）を、xlsx（`arms/ooxml_arm._build_xlsx_ir`）・docx
 （`arms/ooxml_arm._build_docx_ir`）の人間向け MD 生成と共有する共通土台にする: `ooxml/excel.py::regions()`・
@@ -61,7 +61,7 @@ _MAX_MERGE_DUPLICATE_CELLS = 200
 # シートごとに予算をリセットするとファイル全体では上限を大きく超えうる）。
 _MAX_HUMAN_MD_BYTES = 8 * 1024 * 1024
 
-# シートの可視性注記（HM1・`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の非対称
+# シートの可視性注記（HM1・`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の非対称
 # 是正）。`document_ir.Element.visibility_reason`（xlsx の `arms/ooxml_arm._build_xlsx_ir` が設定する
 # `"hidden_sheet"`/`"very_hidden"`）をそのまま画面に出さず、平文の注記へ変換する——**事実（見た目上
 # 非表示かどうか）だけを述べ、AI の観測・推測・内部語彙（enum 値そのもの）は一切含めない**。

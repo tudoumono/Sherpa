@@ -165,7 +165,6 @@ class Scene:
 
 
 def _scene_overview(page):
-    page.click("#kbtoggle")                       # ナレッジ参照オン（範囲セレクタが出る）
     _send(page, "消費税率を変えたい。影響は？")
     _wait_answer(page)
 
@@ -196,7 +195,6 @@ def _scene_kb_off(page):
 
 def _scene_scope_brain(page):
     _wait_brain(page)
-    page.click("#kbtoggle")                       # ナレッジ参照オン＝範囲セレクタ表示
     page.wait_for_selector("#scopesel", state="visible", timeout=5000)
 
 

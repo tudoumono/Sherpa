@@ -150,6 +150,33 @@ def test_stage2_binary_unknown_extension_is_not_listed(monkeypatch, tmp_path):
     assert rep["skipped_other"] == 1 and rep["skipped_ext"] == {".dat": 1}
 
 
+def test_scan_report_unreachable_as_text_counts_binary_and_sensitive_not_readable(monkeypatch, tmp_path):
+    """変更D（未登録拡張子のソース到達可能性）: `scan_report()` は「本文が読めないため検索対象外に
+    したファイル」の総数と拡張子別内訳を返す——読めるファイル（未登録拡張子でも第2段で資料に
+    倒れる）は数えず、バイナリ（`other`）と読み取り失敗/サイズ超過（`unreadable`）は拡張子内訳に
+    載せ、秘匿ファイルは総数にだけ含めて拡張子内訳には出さない（存在を推測させない）。"""
+    wd, _der = _world(monkeypatch, tmp_path)
+    (wd / "app.zzz").write_text("readable plain text\n", encoding="utf-8")   # 読める＝対象外に数えない
+    (wd / "blob.bin").write_bytes(b"\x00\x01\x02binary\xff\xfe")             # バイナリ＝other
+    (wd / ".env").write_text("SECRET=1\n", encoding="utf-8")                 # 秘匿＝総数のみ
+
+    docs = corpus_docs.world_documents("w")
+    assert [d["name"] for d in docs] == ["app.zzz"]      # 読めるものだけ台帳に載る
+
+    rep = corpus_docs.scan_report("w")
+    assert rep["sensitive_excluded"] == 1
+    assert rep["unreachable_as_text"] == 2               # blob.bin（other）＋.env（sensitive_excluded）
+    assert rep["unreachable_as_text_by_ext"] == {".bin": 1}   # 秘匿は拡張子内訳に出ない
+
+
+def test_empty_scan_report_has_zeroed_unreachable_as_text_fields():
+    """world 未解決時（`empty_scan_report()`）も新フィールドが同じ形（0/空辞書）で揃っている。"""
+    rep = corpus_docs.empty_scan_report()
+    assert rep["sensitive_excluded"] == 0
+    assert rep["unreachable_as_text"] == 0
+    assert rep["unreachable_as_text_by_ext"] == {}
+
+
 # ---- 秘匿ファイル慣習拡張子（安全側の例外・§ ING-TEXT-1 の判断） ----
 
 def test_sensitive_extension_env_is_not_classified_as_document(monkeypatch, tmp_path):

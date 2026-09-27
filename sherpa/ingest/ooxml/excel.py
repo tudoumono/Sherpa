@@ -1,6 +1,6 @@
 """Excel（.xlsx）の生 OOXML 抽出層（DOC-IR-004・パッケージ docstring＝`sherpa/ingest/ooxml/__init__.py` 参照）。
 
-`arms/ooxml_arm._build_xlsx_ir` が消費する純関数群。H2（`docs/proposals/2026-08-28-人間向けMDの刷新.md`）
+`arms/ooxml_arm._build_xlsx_ir` が消費する純関数群。H2（`docs/archive/2026-08-28-人間向けMDの刷新.md`）
 以降、`office_md._xlsx_md`（人間向け MD・`human_md.render_xlsx` 経由）も本モジュールの `regions()` を
 document-ir と共有する共通土台として消費する（旧・シート丸ごと1枚の打切り付きパイプ表は撤去済み）。
 
@@ -104,7 +104,7 @@ _SCORE_MIN_CELLS = 4
 # これを超える場合は分割を行わず単一の外接矩形のまま返す（巨大な単一表を割っても得るものが無い一方、
 # 計算量だけが増えるため）。
 #
-# HM1（`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の L1 実測での「excel2md に
+# HM1（`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の L1 実測での「excel2md に
 # 負けた」唯一の箇所）: 旧値 5,000 では JPX-021.xlsx の「統合設計」シートの2連結成分（A30:Z289＝面積
 # 6,760・A291:N654＝面積5,096）がどちらも分割されず単一外接矩形へ縮退していた。5,000→20,000へ引き上げ
 # （選択肢(a)。選択肢(b)＝上限超過成分を再帰的に半分割してから分割する案は「崖を無くせる」利点は

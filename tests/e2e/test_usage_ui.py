@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 
+import pytest
+
 from mock_api import USAGE_STATS_DEFAULT, install_api_mocks
 
 
@@ -12,7 +14,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     from playwright.sync_api import expect
 
     stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
-    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-standard"
+    stats["quality_runs"]["by_rounds"][1]["condition"] = "depth2-quick"
     stats["quality_runs"]["by_rounds"][1]["rounds"] = 0
     install_api_mocks(page, usage_stats=stats)
     page.goto(f"{web_base_url}/usage.html")
@@ -27,6 +29,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     expect(quality_table).to_contain_text("本番相当")
     expect(quality_table).to_contain_text("見直しなし")
     expect(review).to_contain_text("未調査: 3")
+    expect(review).to_contain_text("ソース未確認: 2")   # 不足種別（閉集合）も平文ラベルで出る
     expect(review).to_contain_text("次の見直しへ: 4")
     expect(review).to_contain_text("0.36")
 
@@ -37,6 +40,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     admin_row = page.locator("#usage-tbody tr.u-row", has_text="admin").first
     expect(admin_row.locator(".zhr-cell")).to_have_text("27%")
 
+    page.get_by_role("tab", name="利用者", exact=True).click()
     # ヒートマップ: 空状態が消え、SVG が描画される（セルが1つ以上存在する）。
     expect(page.locator("#heatmap-empty")).to_be_hidden()
     expect(page.locator("#heatmap-svg .cell")).to_have_count(24 * 7)
@@ -60,6 +64,7 @@ def test_usage_trends_section_renders_all_new_metrics(page, web_base_url):
     expect(page.locator("#chart-dl-empty")).to_be_hidden()
     expect(page.locator("#dl-total-badge")).to_have_text("期間合計 5件")
 
+    page.get_by_role("tab", name="トークン", exact=True).click()
     # F3（2026-07-07／2026-07-08 金額表示は撤去）: トークン（tiles・頭脳/モデル別表・日別チャート）。
     expect(page.locator("#t-tok-input")).to_have_text("12,000")
     expect(page.locator("#t-tok-output")).to_have_text("1,800")
@@ -86,9 +91,11 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
     install_api_mocks(page, usage_stats=empty)
     page.goto(f"{web_base_url}/usage.html")
 
-    expect(page.locator("#t-zerohit")).to_have_text("—")
+    expect(page.locator("#t-zerohit")).to_have_text("対象なし")
+    page.get_by_role("tab", name="利用者", exact=True).click()
     expect(page.locator("#usage-tbody .empty-row")).to_be_visible()
     expect(page.locator("#review-stats table")).to_have_count(3)
+    page.get_by_role("tab", name="品質", exact=True).click()
     expect(page.locator("#review-stats .hint", has_text="見直しの機能はこの環境では未導入です。")).to_be_visible()
     expect(page.locator("#review-stats tbody td")).to_have_text([
         "この期間の記録はありません。",
@@ -96,6 +103,7 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
         "この期間の記録はありません。",
     ])
 
+    page.get_by_role("tab", name="利用者", exact=True).click()
     expect(page.locator("#heatmap-empty")).to_be_visible()
     expect(page.locator("#chart-world-empty")).to_be_visible()
     expect(page.locator("#chart-provider-empty")).to_be_visible()
@@ -109,7 +117,8 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
     expect(page.locator("text=頭脳（AI）別利用比率")).to_be_visible()
 
     # F3: トークン表示も空状態で壊れない（tokens キーが無い応答＝undefined でも空表示）。
-    expect(page.locator("#t-tok-input")).to_have_text("0")
+    page.get_by_role("tab", name="トークン", exact=True).click()
+    expect(page.locator("#t-tok-input")).to_have_text("未取得")
     expect(page.locator("#chart-tokin-empty")).to_be_visible()
     expect(page.locator("#token-model-tbody .empty-row")).to_be_visible()
 
@@ -118,16 +127,17 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
     expect(page.locator("#token-kind-card")).to_be_hidden()
     expect(page.locator("#token-user-kind-card")).to_be_hidden()
     # (2) 終了理由の分布＝既存の頭脳別/world別バーと同じ空状態表示・停止数バッジは0件表示。
+    page.get_by_role("tab", name="品質", exact=True).click()
     expect(page.locator("#chart-stopkind-empty")).to_be_visible()
-    expect(page.locator("#stopkind-total-badge")).to_have_text("利用者停止 0件")
+    expect(page.locator("#stopkind-total-badge")).to_have_text("利用者停止 未取得")
     # (3) 会話あたりのやり取り回数・resume率＝サマリタイルと同じ「—」表示（カードは隠さない）。
-    expect(page.locator("#t-turns-avg")).to_have_text("—")
-    expect(page.locator("#t-turns-max")).to_have_text("—")
-    expect(page.locator("#t-resume-rate")).to_have_text("—")
+    expect(page.locator("#t-turns-avg")).to_have_text("未取得")
+    expect(page.locator("#t-turns-max")).to_have_text("未取得")
+    expect(page.locator("#t-resume-rate")).to_have_text("未取得")
     # (6) 回答時間の分布＝`overall` 行はつねに存在する契約なので「全体」行だけ「—」で描画される。
     rt_tbody = page.locator("#response-time-tbody")
     expect(rt_tbody).to_contain_text("全体")
-    expect(rt_tbody).to_contain_text("—")
+    expect(rt_tbody).to_contain_text("未取得")
     # (5) 会話別上位＝空/不在ならカードごと隠す。
     expect(page.locator("#conversations-top-card")).to_be_hidden()
     # 打ち切りの内訳＝limits キーが応答に無くても表は空のまま（クラッシュしない）。
@@ -135,20 +145,20 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
 
 
 def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
-    """（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: 見えていなかった6項目が
+    """（docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: 見えていなかった6項目が
     USAGE_STATS_DEFAULT の値どおりに描画される。"""
     from playwright.sync_api import expect
 
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
 
     # (1) 用途別（kind）表に所要時間の列（合計・平均・件数）。
     kind_tbody = page.locator("#token-kind-tbody")
     chat_row = kind_tbody.locator("tr", has_text="会話").first
-    expect(chat_row).to_contain_text("—")        # chat 行は所要時間を持たない（API 契約＝None）
+    expect(chat_row).to_contain_text("未計測")        # chat 行は所要時間を持たない（API 契約＝None）
     expect(chat_row).not_to_contain_text("秒")
     embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")
-    expect(embed_row).to_contain_text("—")       # elapsed_ms_total=None（報告不能マーカー）
+    expect(embed_row).to_contain_text("未計測")       # elapsed_ms_total=None（報告不能マーカー）
 
     # (2) 終了理由の分布（平文ラベル）と停止数のバッジ。
     stopkind_svg = page.locator("#chart-stopkind-svg")
@@ -167,6 +177,7 @@ def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
     expect(page.locator("#t-resume-rate")).to_have_text("50%")
 
     # (4) ユーザー別×用途別内訳。
+    page.get_by_role("tab", name="トークン", exact=True).click()
     expect(page.locator("#token-user-kind-card")).to_be_visible()
     ukind_tbody = page.locator("#token-user-kind-tbody")
     admin_intent_row = ukind_tbody.locator("tr", has_text="依頼の仕分け").first
@@ -198,18 +209,37 @@ def test_usage_limits_table_renders_by_provider(page, web_base_url):
     from playwright.sync_api import expect
 
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#quality?days=30")
 
     limits_tbody = page.locator("#limits-tbody")
     codex_row = limits_tbody.locator("tr", has_text="Codex")
     expect(codex_row).to_contain_text("10")     # turns
     expect(codex_row).to_contain_text("3件（計5回）")     # tool_result_clipped
     expect(codex_row).to_contain_text("1件")              # total_budget_hit（bool 系・合計は出さない）
-    expect(codex_row).to_contain_text("2件（計4回）")     # context_compactions
     expect(codex_row).to_contain_text("4件（計9回）")     # search_truncated
     expect(codex_row).to_contain_text("2件（計3回）")     # auto_continues
     openai_row = limits_tbody.locator("tr", has_text="OpenAI")
     expect(openai_row).to_contain_text("0件（計0回）")    # tool_result_clipped=0
+    # S2/S4: 自動引き上げ・バックエンド不調の列も見出しと値が並ぶ（bool 系＝件数のみ）。
+    heads = page.locator("#limits-tbody").locator("xpath=../thead//th")
+    expect(heads).to_contain_text(["自動で深く調べた"])
+    expect(heads).to_contain_text(["全文検索が使えなかった"])
+    expect(heads).to_contain_text(["グラフが使えなかった"])
+    expect(heads).to_contain_text(["グラフは再取り込み待ち"])
+    codex_cells = dict(zip(heads.all_text_contents(), codex_row.locator("td").all_text_contents()))
+    api_cells = dict(zip(heads.all_text_contents(), openai_row.locator("td").all_text_contents()))
+    assert codex_cells["履歴の整理"] == "未計測"
+    assert codex_cells["清書の打ち切り"] == "未計測"
+    assert codex_cells["自動で深く調べた"] == "未計測"
+    assert codex_cells["同じ条件の再検索を省略"] == "2件（計4回）"
+    assert codex_cells["全文検索が使えなかった"] == "1件"
+    assert codex_cells["グラフが使えなかった"] == "2件"
+    assert codex_cells["グラフは再取り込み待ち"] == "1件"
+    assert api_cells["履歴の整理"] == "1件（計1回）"
+    assert api_cells["清書の打ち切り"] == "1件"
+    assert api_cells["同じ条件の再検索を省略"] == "未計測"
+    tooltip = page.locator(".chart-title", has_text="打ち切りの内訳").locator(".info-dot")
+    expect(tooltip).to_have_attribute("title", re.compile(r"Codexで数える列.*API経路で数える列"))
 
 
 def test_usage_chat_notice_uses_plain_language_not_jargon(page, web_base_url):
@@ -218,7 +248,7 @@ def test_usage_chat_notice_uses_plain_language_not_jargon(page, web_base_url):
     from playwright.sync_api import expect
 
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
 
     notice = page.locator(".uc-send-notice")
     expect(notice).to_contain_text("見つからないと正直に答えた割合")
@@ -231,7 +261,7 @@ def test_usage_chat_shows_server_notes_as_hints(page, web_base_url):
     from playwright.sync_api import expect
 
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
 
     def handle_usage_chat(route):
         route.fulfill(content_type="application/json", body=json.dumps({
@@ -254,7 +284,7 @@ def test_usage_chat_shows_tool_calls_as_hints(page, web_base_url):
     from playwright.sync_api import expect
 
     install_api_mocks(page)
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
 
     def handle_usage_chat(route):
         route.fulfill(content_type="application/json", body=json.dumps({
@@ -278,7 +308,7 @@ def test_token_kind_table_renders(page, web_base_url):
     from playwright.sync_api import expect
 
     install_api_mocks(page)   # USAGE_STATS_DEFAULT（tokens.by_kind に chat×2（codex/gemini）/intent/embed の 4 行を含む）
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
 
     kind_tbody = page.locator("#token-kind-tbody")
     expect(page.locator("#token-kind-card")).to_be_visible()
@@ -288,7 +318,7 @@ def test_token_kind_table_renders(page, web_base_url):
 
     # gemini/embed 行はトークン列が全て null（報告不能マーカー）＝「—」で表示される。
     embed_row = kind_tbody.locator("tr", has_text="検索の索引づくり")
-    expect(embed_row).to_contain_text("—")
+    expect(embed_row).to_contain_text("未計測")
 
 
 def test_token_kind_table_hidden_when_absent(page, web_base_url):
@@ -296,7 +326,7 @@ def test_token_kind_table_hidden_when_absent(page, web_base_url):
     from playwright.sync_api import expect
 
     install_api_mocks(page, usage_stats={})
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
 
     expect(page.locator("#token-kind-card")).to_be_hidden()
 
@@ -351,7 +381,7 @@ def test_usage_chat_notice_shows_configured_provider_and_default_send_omits_over
     sent_bodies: list = []
     page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
     expect(page.locator('[data-uc-provider=""]')).to_have_attribute("aria-pressed", "true")
 
@@ -370,7 +400,7 @@ def test_usage_chat_temporary_toggle_overrides_one_send_without_persisting(page,
     sent_bodies: list = []
     page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, answer="回答"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
 
     ollama_btn = page.locator('[data-uc-provider="ollama"]')
     ollama_btn.click()
@@ -411,7 +441,7 @@ def test_usage_chat_shows_loading_state_before_settings_resolve_and_disables_sen
         route.fallback()
     page.route("**/admin/settings", hold_settings)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("確認中…")
     expect(page.locator("#usage-chat-send")).to_be_disabled()
 
@@ -434,7 +464,7 @@ def test_usage_chat_settings_fetch_failure_shows_error_and_disables_send(page, w
         route.fallback()
     page.route("**/admin/settings", fail_settings)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text(
         "送信先を取得できませんでした（再読み込みしてください）")
     expect(page.locator("#usage-chat-send")).to_be_disabled()
@@ -456,7 +486,7 @@ def test_usage_chat_notice_shows_cloud_openai_compatible_label_for_azure_endpoin
     settings["openai_endpoint"]["effective"]["kind"] = "azure"
     install_api_mocks(page, system_settings=settings)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: クラウド（OpenAI 互換）")
 
 
@@ -490,7 +520,7 @@ def test_usage_chat_refetches_settings_before_default_send_and_updates_note(page
     # （実サーバなら両者は常に同じ設定を見るため一致する）。
     page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, default_provider_used="ollama"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
 
     page.locator("#usage-chat-input").fill("質問")
@@ -511,7 +541,7 @@ def test_usage_chat_notice_updates_from_response_provider_used_after_send(page, 
     # 応答は pre-send の予定（openai）と異なる値（ollama）を返す＝実際に食い違いが起きた状況を模す。
     page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, default_provider_used="ollama"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")   # 送信前は「予定」
 
     page.locator("#usage-chat-input").fill("質問")
@@ -534,7 +564,7 @@ def test_usage_chat_blocks_default_send_when_saved_value_invalid(page, web_base_
     sent_bodies: list = []
     page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, default_provider_used="ollama"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
     expect(page.locator("#usage-chat-send")).to_be_disabled()
 
@@ -565,7 +595,7 @@ def test_usage_chat_override_send_in_flight_toggle_does_not_change_sent_request(
         route.fallback()
     page.route("**/admin/usage/chat", hold_chat)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
 
     page.locator('[data-uc-provider="ollama"]').click()
@@ -629,7 +659,7 @@ def test_usage_chat_default_send_toggled_during_settings_refetch_still_uses_capt
     page.route("**/admin/usage/chat",
               _handle_usage_chat(sent_bodies, default_provider_used="openai"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
 
     page.locator("#usage-chat-input").fill("質問")
@@ -680,7 +710,7 @@ def test_usage_chat_override_response_azure_kind_shown_in_last_sent_not_next_sen
                                            "endpoint_kind": None}))
     page.route("**/admin/usage/chat", chat_route)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
 
     page.locator("#usage-chat-input").fill("質問1")
@@ -718,7 +748,7 @@ def test_usage_chat_default_ollama_success_does_not_corrupt_openai_endpoint_kind
     page.route("**/admin/usage/chat",
               _handle_usage_chat(sent_bodies, default_provider_used="ollama", endpoint_kind=None))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: ローカル（Ollama）")
 
     page.locator("#usage-chat-input").fill("質問1")
@@ -747,7 +777,7 @@ def test_usage_chat_returning_to_default_after_override_send_still_shows_setting
     install_api_mocks(page, system_settings=settings)
     page.route("**/admin/usage/chat", _handle_usage_chat([], default_provider_used="ollama"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
     expect(page.locator("#usage-chat-send")).to_be_disabled()
 
@@ -777,7 +807,7 @@ def test_usage_chat_502_failure_updates_last_sent_note_since_actually_sent(page,
                                        "endpoint_kind": "azure"}))
     page.route("**/admin/usage/chat", chat_route)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-last-sent-note")).to_have_text(
         "前回の送信先: （まだ送信していません）")
 
@@ -801,7 +831,7 @@ def test_usage_chat_503_failure_does_not_update_last_sent_note_since_unsent(page
                                        "endpoint_kind": "openai"}))
     page.route("**/admin/usage/chat", chat_route)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     page.locator("#usage-chat-input").fill("質問")
     page.locator("#usage-chat-send").click()
     expect(page.locator("#usage-chat-messages .msg").last).to_contain_text("未接続です")
@@ -836,7 +866,7 @@ def test_usage_chat_override_send_refetches_settings_for_fresh_endpoint_kind(pag
     sent_bodies: list = []
     page.route("**/admin/usage/chat", _handle_usage_chat(sent_bodies, endpoint_kind="azure"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     page.locator('[data-uc-provider="openai"]').click()
     page.locator("#usage-chat-input").fill("質問")
     page.locator("#usage-chat-send").click()
@@ -874,7 +904,7 @@ def test_usage_chat_override_send_blocked_when_settings_refetch_fails(page, web_
                       body=json.dumps({"answer": "x", "provider_used": "ollama", "endpoint_kind": None}))
     page.route("**/admin/usage/chat", _record_and_fulfill)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     page.locator('[data-uc-provider="ollama"]').click()
     page.locator("#usage-chat-input").fill("質問")
     page.locator("#usage-chat-send").click()
@@ -897,7 +927,7 @@ def test_usage_chat_override_shows_selection_while_settings_error_shown_separate
                               "default": "ollama", "providers": ["openai", "ollama"]}
     install_api_mocks(page, system_settings=settings)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_contain_text("不正です")
     expect(page.locator("#usage-chat-settings-error-note")).to_be_hidden()
 
@@ -941,7 +971,7 @@ def test_usage_chat_default_send_refetch_failure_clears_stale_default_and_shows_
                       body=json.dumps({"answer": "x", "provider_used": "openai", "endpoint_kind": None}))
     page.route("**/admin/usage/chat", _record_and_fulfill)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
 
     page.locator("#usage-chat-input").fill("質問")
@@ -979,7 +1009,7 @@ def test_usage_chat_stale_settings_response_does_not_overwrite_newer_one(page, w
     page.route("**/admin/settings", settings_route)
     page.route("**/admin/usage/chat", _handle_usage_chat([], default_provider_used="openai"))
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     deadline = time.time() + 5
     while "first" not in held and time.time() < deadline:
         page.wait_for_timeout(20)
@@ -1022,7 +1052,7 @@ def test_usage_chat_openai_key_hint_shown_when_a7_not_openai(page, web_base_url)
     settings["cloud"]["provider"] = "gemini"
     install_api_mocks(page, system_settings=settings)
 
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-openai-key-hint")).to_be_visible()
     expect(page.locator("#usage-chat-openai-key-hint")).to_contain_text(
         "OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます")
@@ -1034,6 +1064,177 @@ def test_usage_chat_openai_key_hint_hidden_when_a7_is_openai(page, web_base_url)
     from playwright.sync_api import expect
 
     install_api_mocks(page)   # cloud.provider == "openai"（既定）
-    page.goto(f"{web_base_url}/usage.html")
+    page.goto(f"{web_base_url}/usage.html#ask?days=30")
     expect(page.locator("#usage-chat-provider-note")).to_have_text("送信先: OpenAI")
     expect(page.locator("#usage-chat-openai-key-hint")).to_be_hidden()
+
+
+@pytest.mark.parametrize("embedding", ["", "?embed=1"])
+def test_usage_overview_and_tabs_preserve_period_through_history(page, web_base_url, embedding):
+    """概要から詳細へ進み、戻る・再読込でも同じ期間で調べられる。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html{embedding}")
+    expect(page.locator("#usage-standalone")).to_be_visible() if embedding else expect(page.locator("#usage-standalone")).to_be_hidden()
+    expect(page.locator("#summary-tiles")).to_be_visible()
+    expect(page.locator("#usage-chat-card")).to_be_hidden()
+    expect(page.locator("#review-stats-card")).to_be_hidden()
+    assert page.locator(".period-bar").bounding_box()["y"] < page.locator("#summary-tiles").bounding_box()["y"]
+    page.locator('[data-days="7"]').click()
+    expect(page).to_have_url(re.compile(r"#overview\?days=7$"))
+    page.get_by_role("tab", name="品質", exact=True).click()
+    expect(page.locator("#review-stats-card")).to_be_visible()
+    expect(page.locator("#session-details")).not_to_have_attribute("open", "")
+    page.get_by_role("tab", name="品質", exact=True).press("ArrowRight")
+    expect(page.get_by_role("tab", name="トークン", exact=True)).to_be_focused()
+    expect(page.locator("#token-tiles")).to_be_visible()
+    page.go_back()
+    expect(page.get_by_role("tab", name="品質", exact=True)).to_have_attribute("aria-selected", "true")
+    page.reload()
+    expect(page.locator("#review-stats-card")).to_be_visible()
+    expect(page.locator('[data-days="7"]')).to_have_attribute("aria-pressed", "true")
+    page.get_by_role("tab", name="AIに聞く", exact=True).click()
+    expect(page.locator("#usage-chat-card")).to_be_visible()
+    expect(page.locator("#usage-chat-provider-note")).to_be_visible()
+    expect(page.locator("#summary-tiles")).to_be_hidden()
+
+
+@pytest.mark.parametrize("user_count", [10, 12])
+def test_usage_metric_definitions_missing_values_and_export(page, web_base_url, user_count):
+    """集計と母数の意味を確認し、0・未計測を区別した状態で保存できる。"""
+    from playwright.sync_api import expect
+
+    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    stats["tokens"]["totals"].update(input=0, output=None)
+    stats["tokens"]["by_user"] = [
+        {"uid": f"sample-user-{i}", "display_name": f"サンプル利用者{i}",
+         "turns": 1, "input": 1000 - i, "output": 10}
+        for i in range(user_count)
+    ]
+    install_api_mocks(page, usage_stats=stats)
+    page.goto(f"{web_base_url}/usage.html")
+    expect(page.locator("#zero-hit-counts")).to_contain_text("3件 / 社内資料参照の回答 14件")
+    page.locator("#usage-definitions summary").click()
+    expect(page.locator("#usage-definitions")).to_contain_text("回答のない質問は対象外")
+    expect(page.locator("#usage-period-label")).to_contain_text("JST")
+    page.get_by_role("tab", name="品質", exact=True).click()
+    page.locator("#session-details summary").click()
+    expect(page.locator("#t-resume-rate")).to_have_text("50%")
+    expect(page.locator("#session-counts")).to_have_text("IDあり 2件 / 対象会話 4件")
+    expect(page.locator("#session-details")).to_contain_text("成功率ではありません")
+    page.get_by_role("tab", name="トークン", exact=True).click()
+    expect(page.locator("#t-tok-input")).to_have_text("0")
+    expect(page.locator("#t-tok-output")).to_have_text("未計測")
+    expect(page.locator("#token-user-tbody tr")).to_have_count(10)
+    expect(page.locator("#token-user-tbody .user-uid")).to_have_text(
+        [row["uid"] for row in stats["tokens"]["by_user"][:10]])
+    page.locator("#usage-definitions summary").click()
+    with page.expect_download() as download:
+        page.locator("#usage-export").click()
+    data = json.loads(download.value.path().read_text())
+    assert data["period"] == stats["period"]
+    assert data["stats"]["tokens"]["totals"]["output"] is None
+    assert data["stats"]["tokens"]["by_user"] == stats["tokens"]["by_user"][:10]
+    assert data["stats"]["tokens"]["by_user_kind"] == stats["tokens"]["by_user_kind"]
+    assert "再開成功率は計測していません" in data["definitions"]
+    assert data["retrieved_at"]
+
+
+def test_usage_failed_period_does_not_display_or_export_previous_data(page, web_base_url):
+    """期間変更の取得失敗を、前期間の成功した値で隠さない。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html")
+    expect(page.locator("#summary-tiles")).to_be_visible()
+    page.route("**/admin/usage/stats?days=7", lambda route: route.fulfill(
+        status=500, content_type="application/json", body='{"detail":"集計失敗"}'))
+    page.locator('[data-days="7"]').click()
+    expect(page.locator("#usage-load-status")).to_contain_text("取得できませんでした")
+    expect(page.locator("#usage-period-label")).to_have_text("7日間（取得失敗）")
+    expect(page.locator("#summary-tiles")).to_be_hidden()
+    expect(page.locator("#usage-export")).to_be_disabled()
+    page.get_by_role("tab", name="トークン", exact=True).click()
+    expect(page.locator("#token-tiles")).to_be_hidden()
+    page.locator('[data-days="90"]').click()
+    expect(page.locator("#token-tiles")).to_be_visible()
+    expect(page.locator("#usage-export")).to_be_enabled()
+
+
+def test_usage_embedded_condition_can_open_as_standalone(page, web_base_url):
+    """管理画面のiframeから、条件をURLで再現できる単独表示へ移れる。"""
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#usage-page")
+    frame = page.frame_locator("#embed-frame-usage-page")
+    expect(frame.locator("#summary-tiles")).to_be_visible()
+    frame.locator('[data-days="7"]').click()
+    frame.get_by_role("tab", name="品質", exact=True).click()
+    frame.get_by_role("link", name="この条件で単独表示").click()
+    expect(page).to_have_url(f"{web_base_url}/usage.html#quality?days=7")
+    expect(page.locator("#review-stats-card")).to_be_visible()
+    page.reload()
+    expect(page.get_by_role("tab", name="品質", exact=True)).to_have_attribute("aria-selected", "true")
+    expect(page.locator('[data-days="7"]')).to_have_attribute("aria-pressed", "true")
+
+
+def test_usage_limits_preserve_recorded_values_and_mark_unmeasured(page, web_base_url):
+    """経路によって記録値を隠さず、未計測を0件や対象外と混同しない。"""
+    from playwright.sync_api import expect
+
+    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    api = stats["limits"]["by_provider"][1]
+    api.update(context_compactions_turns=0, context_compactions_total=0,
+               duplicate_tool_call_turns=None, duplicate_tool_call_total=None,
+               tool_calls_exhausted_turns=None, auto_continues_turns=None)
+    del api["total_budget_hit_turns"]
+    unknown = dict(api)
+    unknown["provider"] = "unknown"
+    for key in unknown:
+        if key not in ("provider", "turns"):
+            unknown[key] = None
+    stats["limits"]["by_provider"].append(unknown)
+    install_api_mocks(page, usage_stats=stats)
+    page.goto(f"{web_base_url}/usage.html#quality?days=30")
+    heads = page.locator("#limits-tbody").locator("xpath=../thead//th")
+    expect(page.locator("#limits-tbody tr")).to_have_count(3)
+    codex_cells, api_cells, unknown_cells = [
+        dict(zip(heads.all_text_contents(), row.locator("td").all_text_contents()))
+        for row in page.locator("#limits-tbody tr").all()
+    ]
+    assert codex_cells["履歴の整理"] == "未計測"
+    assert codex_cells["清書の打ち切り"] == "未計測"
+    assert codex_cells["自動で深く調べた"] == "未計測"
+    assert api_cells["履歴の整理"] == "0件（計0回）"
+    assert api_cells["同じ条件の再検索を省略"] == "未計測"
+    assert api_cells["調査の回数上限に到達"] == "未計測"
+    assert api_cells["自動継続"] == "未計測"
+    assert api_cells["累計上限到達"] == "未計測"
+    assert unknown_cells["経路"] == "不明"
+    assert all(value == "未計測" for key, value in unknown_cells.items()
+               if key not in ("経路", "対象ターン数"))
+
+
+@pytest.mark.parametrize("missing", ["omitted", "null", "empty"])
+def test_usage_zero_hit_missing_does_not_break_rendering(page, web_base_url, missing):
+    """出典なし集計の欠落でも、描画関数が例外を出さず他の統計を読める。"""
+    from playwright.sync_api import expect
+
+    stats = json.loads(json.dumps(USAGE_STATS_DEFAULT))
+    if missing == "omitted":
+        del stats["zero_hit"]
+    else:
+        stats["zero_hit"] = None if missing == "null" else {}
+    install_api_mocks(page, usage_stats=stats)
+    page.goto(f"{web_base_url}/usage.html")
+    expect(page.locator("#summary-tiles")).to_be_visible()
+    if missing == "omitted":
+        page.evaluate("renderZeroHitTile()")
+    else:
+        page.evaluate("value => renderZeroHitTile(value)", stats["zero_hit"])
+    expect(page.locator("#t-zerohit")).to_have_text("未取得")
+    expect(page.locator("#zero-hit-counts")).to_contain_text("出典なし 未取得件")
+    expect(page.locator("#t-turns")).to_have_text(str(stats["totals"]["turns"]))
+    expect(page.locator("#usage-export")).to_be_enabled()

@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の C# アナライザ統合テスト（アナライザ拡張 S7・
-docs/proposals/2026-09-05-アナライザ拡張.md §4(a)/§9 S7）。
+docs/archive/2026-09-05-アナライザ拡張.md §4(a)/§9 S7）。
 
 `fixtures/corpus/cs1` を実際に `build_world()` へ通し、継承/実装（`: Base, IFoo`）が全件
 `via=extends` になること・宣言型（`via=field_type`）・`new`（`via=call`）・完全修飾名（package

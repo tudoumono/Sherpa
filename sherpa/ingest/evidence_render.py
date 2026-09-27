@@ -8,7 +8,7 @@ recordが文字数上限に収まる限り1chunkとし、超える場合だけ�
 Markdownは人間向け正本ではなくAI/RAG向けの搬送表示である。画像は実assetへの相対Markdown記法と、
 位置・未解釈状態の自然文を併記する。
 
-**RAG正本はMarkdown側（D1・`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.1）**:
+**RAG正本はMarkdown側（D1・`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.1）**:
 各chunkの本文直前に決定的なアンカー行 `<!-- chunk:{chunk_id} -->` を1行だけ出す（`_markdown`）。
 索引時（`es_index._validate_rag_chunks`）はこのアンカーでMarkdownを分割し、その本文をES索引対象に
 する。JSONL（`{rel}.rag_chunks.jsonl`）はもう検索本文（旧`search_text`）を持たない——citation・
@@ -170,7 +170,7 @@ def _occlusion_kv_lines(extension: dict[str, Any]) -> list[str]:
     """`extension`（cell/element いずれも同じキー語彙）から可視性・廃止表現のkey-value行を作る。
 
     意味の断定はしない（`occluded_by`/`covered_by_text` の前面テキストをそのまま写すだけ・
-    `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.3）。生の reason 文字列
+    `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.3）。生の reason 文字列
     （`occluded_by_picture` 等）は `_VISIBILITY_REASON_LABELS` で平文へ写像し、rag.md には出さない。
     """
     lines: list[str] = []

@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import stat
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,7 @@ from pathlib import Path
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
 from sherpa import agents as A  # noqa: E402
+from sherpa.providers.prompts import _NO_PRESEARCH_HEADLINE  # noqa: E402
 
 
 def _ctx(uid: str, stop_event=None) -> "A.Ctx":
@@ -134,8 +136,11 @@ def test_stopped_before_any_output_keeps_deterministic_fallback(tmp_path, monkey
     env = _result_env(events)
     assert "接続できません" not in env["headline"], (
         f"ユーザー停止なのに未接続失敗の文言になっている（stop は失敗ではない）: {env!r}")
-    assert env["headline"] == "dispatch-headline-should-not-leak-as-real-answer", (
-        f"stop 経路は既存の決定的回答フォールバックのままのはず: {env!r}")
+    # MCP 有効の Codex 経路は presearch を省くため、`_gather` が最初に持つ headline は
+    # dispatch 由来の目印文字列ではなく `_NO_PRESEARCH_HEADLINE`——stop 経路はそれを上書きしない
+    # （dispatch が呼ばれていれば別の文字列になるため、presearch が復活する回帰もここで検知する）。
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
+        f"stop 経路は presearch を省いた `_gather` の headline のままのはず: {env!r}")
 
 
 # ===== (3) 一部出力はあるが agent_message が無いまま失敗 → 既存の決定的回答フォールバックのまま =====
@@ -156,8 +161,9 @@ def test_partial_tool_output_then_failure_keeps_deterministic_fallback(tmp_path,
 
     env = _result_env(_run(prov, ctx))
 
-    assert env["headline"] == "dispatch-headline-should-not-leak-as-real-answer", (
-        f"部分出力ケースは既存の決定的回答フォールバックのままのはず: {env!r}")
+    # presearch を省いたターンの `_gather` headline（`_NO_PRESEARCH_HEADLINE`）のままのはず。
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
+        f"部分出力ケースは presearch を省いた `_gather` の headline のままのはず: {env!r}")
 
 
 # ===== (4) 不採用の付帯条件（2026-08-18・Codex RV 2巡目）: HTTPS_PROXY の userinfo が漏れないこと =====
@@ -256,16 +262,57 @@ def test_popen_exec_failure_marks_codex_silent(tmp_path, monkeypatch):
     Popen を一度も完走していない旨を伝える第3分岐が `codex_silent_failure` を立てる
     （終了理由の分布からこの技術的失敗が漏れない）。"""
     bin_dir = _setup(tmp_path, monkeypatch, users_dirname="users_execfail")
+    # 壊れた shebang への execve は ENOENT で失敗する（存在しないのはインタプリタ側）。CPython の
+    # Popen は PATH 上の各候補を試し、ENOENT/ENOTDIR は黙って次の候補へ進む仕様のため、`_setup` の
+    # 既定 PATH（bin_dir の後ろに元の PATH も残す）のままだと PATH 上の本物の codex に
+    # フォールバックしてしまい、本物が実行される（認証エラー等で結局は無出力終了するため見かけ上は
+    # 緑になるが、検証したい「Popen 自体が一度も完走しない」経路を通らない・外部通信も発生する）。
+    # 偽 codex だけを PATH 上の唯一の候補にして、本物へのフォールバックを断つ。
+    monkeypatch.setenv("PATH", str(bin_dir))
     # `shutil.which` は実行ビットの有無だけを見る（中身は検査しない）ため、壊れた
     # shebang でも「見つかった」扱いになる＝Popen 到達までは通る。
     _write_fake_codex(bin_dir, "#!/no/such/interpreter-xyz\necho '{}'\n")
+
+    # `subprocess.Popen`（外部境界＝OS のプロセス起動）を、振る舞いを変えずに記録するだけの
+    # ラッパで包む。起動前ガード（`llm.assert_openai_io_allowed()` 等）が別の理由で例外に
+    # なっても同じ env 形（codex_silent_failure=True・headline 保持）になり得るため、下の
+    # env だけを見る assert では「意図どおり Popen 自体が FileNotFoundError で失敗した」ことまでは
+    # 確認できない——実際に呼ばれたことと、その失敗の型を直接記録して確かめる。
+    _popen_calls: list[tuple[str, str | None]] = []
+    _real_popen = subprocess.Popen
+
+    def _recording_popen(*args, **kwargs):
+        try:
+            proc = _real_popen(*args, **kwargs)
+        except Exception as exc:
+            _popen_calls.append(("error", type(exc).__name__))
+            raise
+        _popen_calls.append(("ok", None))
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", _recording_popen)
 
     prov = A.CodexProvider()
     ctx = _ctx(uid="execfail-u1")
     env = _result_env(_run(prov, ctx))
 
+    assert _popen_calls, (
+        "subprocess.Popen が一度も呼ばれていない（起動前ガードで弾かれ、意図した経路を"
+        "通っていない疑い）")
+    assert all(call == ("error", "FileNotFoundError") for call in _popen_calls), (
+        f"Popen が期待どおり FileNotFoundError で失敗していない: {_popen_calls!r}")
+
     assert env.get("codex_silent_failure") is True, (
         f"Popen 自体の起動失敗が codex_silent として印を付けられていない: {env!r}")
+    # 第3分岐（Popen 未完走＝`attempt_returncode is None` のまま）だけを狙い撃つ区別:
+    # 本物の codex が実際に起動して無出力のまま終了する「silent-codex」分岐
+    # （provider.py `elif _codex_silent_failure:` ＝ attempt_returncode is not None）は
+    # env["headline"] を「Codex に接続できませんでした」等へ書き換える。第3分岐はその節を
+    # 通らない（同 `else:` 節）ため `_gather` の headline（presearch を省いたターンは
+    # `_NO_PRESEARCH_HEADLINE`）が残ったまま——本物の codex 経由で「見かけ上」緑になって
+    # いないかをこの一致で区別する。
+    assert env["headline"] == _NO_PRESEARCH_HEADLINE, (
+        f"headline が書き換わっている＝本物の codex 経由の silent-codex 分岐を通った疑い: {env!r}")
     from sherpa import stop_kind
     assert stop_kind.resolve(env) == "codex_silent"
 

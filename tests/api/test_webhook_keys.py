@@ -1,4 +1,4 @@
-"""外部連携 API キーの Webhook 通知（PART-6・docs/proposals/2026-09-05-Webhook通知.md）のテスト。
+"""外部連携 API キーの Webhook 通知（PART-6・docs/archive/2026-09-05-Webhook通知.md）のテスト。
 
 対象: キー発行/一覧 API の `webhook_url` 検証（422）・secret は発行応答でのみ1度だけ返り一覧には
 出ない・`system_settings.webhook_allowlist` の管理者設定（GET/PUT /admin/settings）。要 Postgres

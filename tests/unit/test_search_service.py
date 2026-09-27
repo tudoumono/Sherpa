@@ -336,7 +336,7 @@ class _CtxRaise:
 
 def test_degrade_vocabulary():
     assert ss.DEGRADE_REASONS == frozenset({
-        "es_unavailable", "es_query_failed", "embedding_not_configured",
+        "es_unavailable", "es_query_failed", "es_query_rejected", "embedding_not_configured",
         "embedding_cloud_unavailable",
         "hybrid_query_failed",   # RV3（FBK-1）: hybrid 自体が失敗し BM25 は成功（hits は空でない）
         "vector_feature_mismatch", "query_embed_failed",
@@ -501,41 +501,41 @@ def test_no_forbidden_imports():
 
 # ---- SHERPA_IMPACT_MAX_DEPTH の伝播 ----
 
-def test_search_service_depth_defaults_match_impact_max_depth():
-    """`search()`/`_search_graph()` の `depth` 既定は `impact_service.IMPACT_MAX_DEPTH` に揃っている
-    （`ss.IMPACT_MAX_DEPTH` は `impact_service` からの re-export）。
-
-    既定値と異なる env（20）で fresh import して確認する＝既定値どうしが偶然一致するだけの
-    「旧リテラル `depth=8` への退行」を検出できない自己言及を避ける。
-    """
-    env = {"SHERPA_IMPACT_MAX_DEPTH": "20"}
-    assert FI.fresh_import_param_default("sherpa.search_service", "search", "depth", env=env) == 20
-    assert FI.fresh_import_param_default(
-        "sherpa.search_service", "_search_graph", "depth", env=env) == 20
-
-
-def test_ext_search_req_depth_default_and_ceiling_track_impact_max_depth():
-    """`ExtSearchReq.depth` の既定は `search_service.IMPACT_MAX_DEPTH` に揃える（env を上げれば既定も
-    上がる）。上限（le）は元の外部 API 契約 `12` を後退させない＝`max(12, IMPACT_MAX_DEPTH)`
-    （env 未設定/12未満でも契約上の上限は12のまま・env で12を超えて広げたときだけ上限も広がる）。
-
-    Pydantic の `Field` は import 時に評価されるため、既定値と異なる env の fresh process で
-    `model_fields`/シグネチャを直接観測する（同一プロセス内で既定値のまま比較すると、
-    旧リテラル `Field(default=8, ge=1, le=12)` への退行を検出できない）。
-    """
-    script = (
-        "import json\n"
+def _impact_max_depth_propagation_script() -> str:
+    return (
+        "import inspect, json\n"
+        "import sherpa.search_service as ss\n"
         "import sherpa.ext_api as ext_api\n"
         "field = ext_api.ExtSearchReq.model_fields['depth']\n"
         "ge = next(m.ge for m in field.metadata if hasattr(m, 'ge'))\n"
         "le = next(m.le for m in field.metadata if hasattr(m, 'le'))\n"
-        "print(json.dumps({'default': field.default, 'ge': ge, 'le': le}))\n"
+        "print(json.dumps({\n"
+        "    'search_depth': inspect.signature(ss.search).parameters['depth'].default,\n"
+        "    'search_graph_depth': inspect.signature(ss._search_graph).parameters['depth'].default,\n"
+        "    'ext_req_default': field.default, 'ext_req_ge': ge, 'ext_req_le': le,\n"
+        "}))\n"
     )
-    out = json.loads(FI.run_script(script, env={"SHERPA_IMPACT_MAX_DEPTH": "20"}))
-    assert out["default"] == 20
-    assert out["ge"] == 1
-    assert out["le"] == 20   # 12 を超えて広げた env にあわせて上限も 20 まで広がる
 
-    out_low = json.loads(FI.run_script(script, env={"SHERPA_IMPACT_MAX_DEPTH": "5"}))
-    assert out_low["default"] == 5
-    assert out_low["le"] == 12   # 12 未満の env でも契約上の上限は12のまま後退しない
+
+def test_search_service_and_ext_search_req_depth_track_impact_max_depth():
+    """`search()`/`_search_graph()` の `depth` 既定と `ExtSearchReq.depth` の既定/上限は、どちらも
+    `impact_service.IMPACT_MAX_DEPTH` に揃っている（`ss.IMPACT_MAX_DEPTH` は re-export）。
+    上限（le）は元の外部 API 契約 `12` を後退させない＝`max(12, IMPACT_MAX_DEPTH)`
+    （env 未設定/12未満でも契約上の上限は12のまま・env で12を超えて広げたときだけ上限も広がる）。
+
+    Pydantic の `Field` と関数シグネチャの既定値はどちらも import 時に評価されるため、既定値と
+    異なる env の fresh process で直接観測する（同一プロセス内で既定値のまま比較すると、
+    旧リテラル `depth=8`／`Field(default=8, ge=1, le=12)` への退行を検出できない自己言及になる）。
+    """
+    out = json.loads(FI.run_script(_impact_max_depth_propagation_script(),
+                                   env={"SHERPA_IMPACT_MAX_DEPTH": "20"}))
+    assert out["search_depth"] == 20
+    assert out["search_graph_depth"] == 20
+    assert out["ext_req_default"] == 20
+    assert out["ext_req_ge"] == 1
+    assert out["ext_req_le"] == 20   # 12 を超えて広げた env にあわせて上限も 20 まで広がる
+
+    out_low = json.loads(FI.run_script(_impact_max_depth_propagation_script(),
+                                       env={"SHERPA_IMPACT_MAX_DEPTH": "5"}))
+    assert out_low["ext_req_default"] == 5
+    assert out_low["ext_req_le"] == 12   # 12 未満の env でも契約上の上限は12のまま後退しない

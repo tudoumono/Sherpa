@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の EXEC CICS XCTL/LINK の統合テスト（アナライザ拡張 S5b・
-docs/proposals/2026-09-05-アナライザ拡張.md §4(d)/§9 S5b）。
+docs/archive/2026-09-05-アナライザ拡張.md §4(d)/§9 S5b）。
 
 `fixtures/corpus/cobol-cics` を実際に `build_world()` へ通し、`Module(ONLINE1) -INVOKES(via=
 cics_xctl)-> Module(MENU01)`・`via=cics_link` → SUBR01/SUBR02・存在しない参照先の `unresolved`

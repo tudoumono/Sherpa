@@ -1,5 +1,5 @@
 """L5（rag.md の LLM 成形＋規則フォールバック・§8.3/§8.6・
-`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`）の単体テスト。
+`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`）の単体テスト。
 
 実 LLM 呼び出しは一切発生しない（`graph_extract.complete_json`/`available` を monkeypatch）。
 `SHERPA_KB_DIR`/`SHERPA_DERIVED_DIR` を `tmp_path` へ隔離し、共有 `data/derived` を書き換えない。

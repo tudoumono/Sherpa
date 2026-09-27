@@ -77,7 +77,7 @@ _CHUNK_LINES_DEFAULT = 40
 # 範囲 [1,1000] は ES の既定 max_result_window（10000）を十分下回る安全な値。
 _ES_SEARCH_K_MAX = max(50, _env_int("SHERPA_GREP_MAX_HITS", 50, 1, 1000))
 _TIMEOUT = 30
-ES_MAPPING_VERSION = "7"                            # マッピング/チャンクメタの版。上げると次回 sync で全 world が自動 reindex（needs_reindex 参照）
+ES_MAPPING_VERSION = "8"                            # マッピング/チャンクメタの版。上げると次回 sync で全 world が自動 reindex（needs_reindex 参照）
 # v5: `branch` フィールド追加（層フィルタ（`layer.es_filter`）を ext membership から
 # classify_document 確定値（`branch=="source"`）へ切替・grep/agentic と揃える）。
 # v6: rag チャンクの隣接キー（`previous_chunk_id`/`next_chunk_id`/`parent_id`/`logical_record_id`/
@@ -88,6 +88,10 @@ ES_MAPPING_VERSION = "7"                            # マッピング/チャン�
 # 検索クエリ側の重要度ブースト（`search()`/`search_knn_only()`）はこのフィールドへの `term` filter
 # なので、フィールド自体が無い文書は一致せず boost が完全 no-op になる（受け入れ条件＝
 # 重要度制御ファイルの無い world でスコア完全不変）。
+# v8: 軽量テキスト枠の第2段（未登録拡張子・拡張子なし）を索引対象に含める（`_iter_doc_chunk_
+# records` の除外撤去）——既存索引は第2段文書を持たないため reindex が必要。索引版を上げても
+# 埋め込みはキャッシュから再利用される＝再計算は発生しない（`embed_cache.sqlite3` のキーは
+# provider/model/dim/前処理アルゴリズム版で決まり、今回それらは変えていない）。
 # rag_chunks.jsonl 読み取りの安全弁（1文書分）。この用途の JSONL は通常でも1チャンクあたり
 # 数百〜数千文字程度（`evidence_render.MAX_GROUP_CHARS`＝1800 が生成側のグループ分割閾値）に収まるため、
 # 桁違いに超える入力は生成側の不具合・破損・攻撃的な入力とみなし、超過は個別行を切り詰めず
@@ -459,14 +463,22 @@ def delete_world(world: str) -> bool:
 
 
 def _confirm_content_sig(world: str, content_sig) -> None:
-    """bulk が**全バッチ成功した後**に `_meta.content_sig` を書く（`confirm_human_md_meta` と同じ
-    Put Mapping API で `_meta` だけ更新する）。
+    """bulk が**全バッチ成功した後**に `_meta.content_sig`・`_meta.doc_count` を**1回の**
+    read-modify-write で書く（`confirm_human_md_meta` と同じ Put Mapping API で `_meta` だけ更新する）。
 
     先に書かない理由は `index_world` の該当箇所を参照（途中でプロセスが落ちたときに中途半端な索引が
-    居座るのを防ぐ）。この書き込み自体が失敗した場合は content_sig が無いまま完全な索引が残る＝
-    次回 sync が1回だけ無駄に張り直す（安全側の失敗＝取りこぼしは生まない）。
+    居座るのを防ぐ）。`doc_count`（`count(world)`＝投入意図（Pass2 の `n_docs`）ではなく ES 側の実物・
+    `needs_reindex` の実件数照合の対象）を content_sig と**同じ書き込み**にまとめる——別々の
+    書き込みにすると、件数取得や2回目の PUT だけが失敗した場合に content_sig は確定済み・doc_count
+    は欠落のまま残り、以後「資料不変」の sync では実件数ズレを検知できなくなる（`doc_count` 欠落は
+    `needs_reindex` の対象外条件のため）。件数取得または書き込みが失敗すれば content_sig も書かれない
+    ＝次回 sync は既存の fail-closed（署名ズレ）で必ず1回張り直す（安全側の失敗＝取りこぼしは生まない）。
     """
     if not content_sig:
+        return
+    n = count(world)
+    if n is None:
+        _log.warning("es_index: 実件数の取得に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
         return
     existing = _index_meta(world)
     if existing is None:                    # GET 失敗＝既存 meta を消して PUT しない（次回 sync が再試行）
@@ -475,9 +487,10 @@ def _confirm_content_sig(world: str, content_sig) -> None:
     try:
         meta = dict(existing)
         meta["content_sig"] = content_sig
+        meta["doc_count"] = n
         _req("PUT", f"/{_index(world)}/_mapping", {"_meta": meta})
     except Exception:
-        _log.warning("es_index: content_sig の確定に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
+        _log.warning("es_index: content_sig/doc_count の確定に失敗しました（次回 sync が1回だけ張り直す）: world=%s", world)
 
 
 def _restore_refresh_interval(world: str) -> None:
@@ -1251,18 +1264,14 @@ def _iter_doc_chunk_records(world: str, d: dict, derived: Path | None, rag_exts:
         return None, None
     rel = d["name"]
     ext = Path(rel).suffix.lower()
-    # 軽量テキスト枠（`ingest.text_kind`）の**第2段**（未知拡張子・拡張子なしの内容推定）文書は
-    # ES 索引の対象外にする——第1段（拡張子マップ）は通常の文書と同格に扱うが、第2段は
-    # read_around（引用検証・精読）/`verify_doc_exists`/`manifest_doctype_count` が元々
-    # 対象外にしている（`corpus_docs._classify_generic_text`/`status_document_doctype` の
-    # `allow_content_sniff=False` 参照）ため、ES だけが検索可能でも引用・精読できない
-    # 非対称（「検索可能集合＝引用可能集合」契約の破れ）が生まれる。`d["doctype"]` が
-    # 軽量テキスト枠の2ラベル（`CODE_DOCTYPE_LABEL`/`DOCUMENT_DOCTYPE_LABEL`）で、かつ
-    # `text_kind.classify_ext(ext)` が `None`（＝第1段では判定できず第2段が必要だった）なら
-    # 第2段と判定できる——`corpus_docs` 側に専用フラグを追加せずに済む安価な再判定。
+    # 軽量テキスト枠（`ingest.text_kind`）の第1段・第2段（未知拡張子・拡張子なしの内容推定）は
+    # どちらも第1段と同格に ES 索引の対象にする——`agentic_search._safe_doc_path`（精読）・
+    # `grep_tool.grep_search` が `corpus_docs.classify_document` の確定判定（第2段まで）を共有する
+    # ため、「ES で見つかるのに引用検証/精読できない」非対称は生まれない（`reachable_as_text` 契約・
+    # `ingest.text_kind` モジュール docstring 参照）。`status_document_doctype`/`verify_doc_exists`/
+    # `manifest_doctype_count`（`allow_content_sniff=False`・ホットパス最適化）は依然として第2段を
+    # 判定しないが、これは別契約（読めるかどうかとは無関係な I/O 最適化）であり ES 索引には影響しない。
     is_light_text = d.get("doctype") in (text_kind.CODE_DOCTYPE_LABEL, text_kind.DOCUMENT_DOCTYPE_LABEL)
-    if is_light_text and text_kind.classify_ext(ext) is None:
-        return None, None
     # 軽量テキスト枠は「ベクトル・グラフ・LLM を一切通さない」契約——登録コード
     # （branch=="source"）だけでなく、軽量テキスト枠の資料側（csv/tsv/log/rtf 等・
     # branch=="office"）も embed 対象から除外する（下の `no_embed` へ搬送）。
@@ -1725,7 +1734,7 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
             out["embed_elapsed_ms"] = round(embed_elapsed_ms)
         return out
     _restore_refresh_interval(world)                   # 全バッチ成功＝最終refreshで可視化済み・背景リフレッシュを通常（"1s"）へ戻す
-    _confirm_content_sig(world, content_sig)           # 全バッチ成功後にだけ鮮度署名を確定する
+    _confirm_content_sig(world, content_sig)           # 全バッチ成功後にだけ鮮度署名と実件数を確定する
     out = {"available": True, "indexed": n_docs, "chunks": total_chunks,
           "vectors": bool(embed_feature_applies and had_embed_eligible),
           "embedded": embedded_total, "reused": reused_total, **rag_report}
@@ -1748,7 +1757,8 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     """ES 索引の張り直しが要るか（ES 稼働時のみ）。空 / 内容署名ズレ / **アーム構成ズレ** /
     **マッピング版ズレ** / **索引ソース方針(rag/legacy)ズレ** / **チャンク粒度ズレ** /
     **人間向け MD 版ズレ**（H2・RAG_ES の設定に関わらず評価） / **アナライザ構成ズレ** /
-    **埋め込み素性(provider/model/dim/前処理アルゴリズム版)ズレ** で True。
+    **埋め込み素性(provider/model/dim/前処理アルゴリズム版)ズレ** / **実件数ズレ**（`doc_count`
+    スタンプがある索引だけ・下記参照）で True。
 
     ＝内容（ソースファイル自体）が変わらなくても、(a) 取り込みアーム構成（例 OCR 有効/無効・vision
     有効/無効）を切り替えた、(b) このプロセスのマッピング/チャンクメタ仕様（`ES_MAPPING_VERSION`）が
@@ -1773,10 +1783,19 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     例外: 本 env 導入前の索引は全て旧既定40行チャンクで作られているため、欠落は `None` ではなく
     旧既定 `_CHUNK_LINES_DEFAULT`（40）として扱う（さもないと env 未使用の既存 world まで一律
     reindex される）。
+
+    **実件数ズレ**（`_confirm_content_sig` が索引完了時に content_sig と同じ書き込みで刻む
+    `doc_count`）: `_meta.doc_count` と
+    `count(world)`（実物）が食い違えば True——資料は不変のまま ES 側の文書が一部欠けた食い違いを
+    検知する（「今すぐ更新」の自己修復トリガー）。`doc_count` が無い旧索引では**この条件だけ**
+    比較しない（他の条件と違い None を不一致扱いしない）——スタンプを刻むためだけに全件を張り直すと、
+    埋め込みキャッシュが欠けていた場合に有料の埋め込みが走ってしまうため。次に張り直した時点から
+    この照合が効く。
     """
     if not available():
         return False
-    if not count(world):
+    n = count(world)
+    if not n:
         return True
     meta = _index_meta(world) or {}           # GET 失敗は未設定相当＝fail-closed で reindex を促す
     if meta.get("content_sig") != content_sig:
@@ -1796,7 +1815,10 @@ def needs_reindex(world: str, content_sig, settings: dict | None = None) -> bool
     ec = embeddings.cfg(_settings(settings))
     want = (ec["provider"], ec["model"], ec["dim"], embeddings.EMBEDDING_INPUT_ALGORITHM_ID) if ec else (None, None, None, None)
     have = (meta.get("embed_provider"), meta.get("embed_model"), meta.get("dim"), meta.get("embed_algo"))
-    return want != have
+    if want != have:
+        return True
+    doc_count = meta.get("doc_count")
+    return doc_count is not None and n != doc_count
 
 
 def _parse_hits(res: dict) -> list:
@@ -1865,16 +1887,39 @@ def _rerank_knn_by_importance(hits: list) -> list:
     return hits
 
 
+def _classify_query_exception(exc: Exception) -> str:
+    """BM25 クエリ実行時の例外を固定コードへ分類する（呼び出し元の `InvestigationState` 反映が
+    回復可否を区別できるよう、握りつぶす前に一度だけ判定する）。`search()`/`search_knn_only()` の
+    「例外を投げず `(hits, degrade_reason)` を返す」契約は保つ——どの例外もここでは再送出しない
+    （呼び出し元は `routers/documents.py`・`search_service.py`・`ext_api.py` 等の非 agentic 経路も
+    含み、そちらは `run_tool` 境界の型分類に委ねられないため）。
+
+    `HTTPError`（`URLError`/`OSError` のサブクラス）は 404（索引未作成＝未取り込み world の
+    常態）・429・5xx を `es_query_failed`（回復可能＝一時的、または再取り込みで直る障害）、
+    それ以外の 4xx（クエリ自体の拒否＝構文・設定不備）を `es_query_rejected`（回復不可）にする。
+    それ以外の `OSError`（接続断・タイムアウト等・`URLError`/`TimeoutError` 含む）も
+    `es_query_failed`。`JSONDecodeError`/`TypeError`/`KeyError`/`AssertionError` 等の非通信例外
+    （プログラムの欠陥・想定外の応答形を示す）は `es_query_rejected`（回復不可）——通信障害と
+    同じ回復可能扱いにはしない。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return ("es_query_failed" if (exc.code in (404, 429) or 500 <= exc.code <= 599)
+               else "es_query_rejected")
+    if isinstance(exc, OSError):
+        return "es_query_failed"
+    return "es_query_rejected"
+
+
 def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict | None = None,
           vector: bool = True, layer=None, k_ceiling: int | None = None) -> tuple[list, str | None]:
     """検索。`vector=True` かつ埋め込み設定があれば **kNN＋BM25 ハイブリッド**、無ければ BM25。範囲フィルタ・graceful。
 
     `k_ceiling`（省略可・既定 `None`＝モジュール既定 `_ES_SEARCH_K_MAX` を使う＝既存呼び出し元は
-    無変更）: 呼び出し元が既に「倍率適用後の絶対上限」まで検証済みの `k` を渡す場合
+    無変更）: 呼び出し元が既に絶対上限まで検証済みの `k` を渡す場合
     （`agentic_search.run_tool` の `es_search` 分岐＝調べる深さが計算した実効値）、`_ES_SEARCH_K_MAX`
     （env `SHERPA_GREP_MAX_HITS` 由来・既定 50 の床）による再クランプを迂回してこちらを使う——
-    `_ES_SEARCH_K_MAX` の既定 50 は grep 側の既定 30 よりヒット数を広めに取る設計のための床であり、
-    調べる深さ「最大」（既定 ×2＝60）のような意図的に大きい値まで潰してしまう。
+    `_ES_SEARCH_K_MAX` の既定 50 は grep 側の既定 30 よりヒット数を広めに取る設計のための床でありつつ、
+    管理画面で基準値を広げた場合のような意図的に大きい値まで許容する。
     `_ES_SEARCH_K_MAX` 自体の既存契約（`SHERPA_GREP_MAX_HITS` 未設定時は 50 を下回らない等・
     `tests/unit/test_es_index_meta.py` 参照）はこの引数を渡さない既存呼び出し元でそのまま残る。
 
@@ -1885,8 +1930,9 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
     degrade_reason 語彙: `es_unavailable`／`embedding_cloud_unavailable`／`vector_feature_mismatch`
     （索引の埋め込み素性が現在の設定と不一致＝再索引待ち・クエリ埋め込みは呼ばない）／`query_embed_failed`／
     `hybrid_query_failed`（hybrid 自体が失敗し BM25 は成功＝hits は空でない）／
-    `es_query_failed`（BM25 自体も失敗＝hits は空。`search_service.DEGRADE_REASONS` と同一集合・
-    増やすときは両方直す）。
+    `es_query_failed`（BM25 自体も失敗・接続断/タイムアウト/5xx 等の一時的な障害＝hits は空）／
+    `es_query_rejected`（BM25 自体も失敗・4xx＝クエリの構文/設定不備＝一時的でない＝hits は空）。
+    `search_service.DEGRADE_REASONS` と同一集合・増やすときは両方直す。
     `vector=False`＝BM25 のみ（クエリ埋め込みを呼ばない＝コスト/レイテンシ回避・facts 統合用・
     reason は常に None）。
     `layer`（省略可・`"docs"|"code"|"both"`・既定 `None`＝`"both"`＝フィルタなし＝既存呼び出し元は
@@ -1973,8 +2019,10 @@ def search(world: str, query: str, scope_paths=None, k: int = 20, settings: dict
             reason = "query_embed_failed"            # クエリ埋め込みの実通信失敗 → BM25 へ
     try:
         return _parse_hits(_req("POST", f"/{_index(world)}/_search", bm25)), reason
-    except Exception:
-        return [], "es_query_failed"                 # BM25 自体も失敗＝hits 空を最優先の理由で説明する
+    except Exception as exc:
+        # BM25 自体も失敗＝hits 空を最優先の理由で説明する（回復可否は `_classify_query_exception`
+        # が固定コードへ分類する）。
+        return [], _classify_query_exception(exc)
 
 
 def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
@@ -1985,7 +2033,8 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
     engines=["vector"] 単独を表現できない。本関数は top-level `knn` のみのクエリを発行する。
     返値 `(hits, degrade_reason|None)`。hits は `_parse_hits` 形 `{doc_id, line, text, score, ext}`。
     degrade_reason 語彙: es_unavailable / embedding_not_configured / embedding_cloud_unavailable /
-    vector_feature_mismatch / query_embed_failed / es_query_failed（search_service.py の
+    vector_feature_mismatch / query_embed_failed / es_query_failed（一時的な障害）/
+    es_query_rejected（4xx＝クエリの構文/設定不備＝一時的でない）（search_service.py の
     DEGRADE_REASONS と同一・増やすときは両方直す）。`embedding_cloud_unavailable` は
     A7 で明示選択したクラウドの埋め込みが解決できない場合＝`embedding_not_configured`（クラウドを
     一度も選んでいない通常の未設定）と区別し、呼び出し側が「設定すれば直る」のか「選択済みクラウド
@@ -2038,5 +2087,5 @@ def search_knn_only(world: str, query: str, scope_paths=None, k: int = 20,
         # 取得後の再ランクで重要度ブーストを適用する（`_rerank_knn_by_importance` 参照）。
         hits = _rerank_knn_by_importance(_parse_hits(_req("POST", f"/{_index(world)}/_search", body)))
         return hits[:k], None
-    except Exception:
-        return [], "es_query_failed"
+    except Exception as exc:
+        return [], _classify_query_exception(exc)

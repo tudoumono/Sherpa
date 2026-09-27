@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の画面テンプレート（JSP/JS/CSS）統合テスト（アナライザ拡張
-波3 レーン A・docs/proposals/2026-09-05-アナライザ拡張.md §13）。
+波3 レーン A・docs/archive/2026-09-05-アナライザ拡張.md §13）。
 
 `jsp.py`/`html.py`/`js.py`/`css.py` は `registry._ANALYZERS` に統合登録済み（波3 統合）のため、
 素の registry のまま `fixtures/corpus/web1` を `build_world()` へ通す。

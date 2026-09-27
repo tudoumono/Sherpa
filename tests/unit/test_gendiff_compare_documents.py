@@ -1,6 +1,6 @@
 """GEN-DIFF（`compare_documents`）の受け入れ条件テスト。
 
-正典: `docs/proposals/2026-09-03-世代間diff比較.md` §3〜§8。ツールは grep と同格の素朴な決定的
+正典: `docs/archive/2026-09-03-世代間diff比較.md` §3〜§8。ツールは grep と同格の素朴な決定的
 diff——レコード同定・業務キー対応付け・要約はしない（agentic loop の LLM が diff テキストを読んで
 行う）。ここでは決定的な入出力契約（`sherpa/compare_docs.py`）と、`agentic_search.run_tool`/
 `openai_tools`/`gemini_tools`/`mcp_server._tool_defs()` への配線を、実ファイル（`office_md.

@@ -59,7 +59,7 @@ _usage_log = logging.getLogger("sherpa.usage")   # 専用ファイル（usage.lo
 # 'chat-round': 査読の巡ごとの記録。表示・分析用の別イベントで、消費の正本
 # （清書＝`answer.usage`／worker＝'chat-sub'／evaluator・orchestrator＝'chat-review'）とは二重に
 # 足さない（`store/usage.py` の集計はこの kind を除外する）。巡番号・判定・不足の軸・引用件数の
-# 増分・巡内の limits 増分・主張の区分内訳・役割別の内訳は `meta` へ入れる。
+# 増分・巡内の limits 増分・主張の区分内訳・役割別の内訳は `meta` へ入れる。失敗巡も記録する。
 KINDS = ("intent", "embed", "graph_ask", "vlm", "chat-sub", "chat-plan",
         "usage_chat", "research", "chat-review", "chat-round", "rag_render")
 
@@ -171,7 +171,7 @@ def log_usage_line(kind, provider, model, tokens: dict, calls, world, elapsed: f
     `user_id` は載せない。呼び出し元の縮退契約と独立に自衛する（例外を外へ出さない・ログ出力の失敗が
     呼び出し元の成否に影響してはならない）。
 
-    `depth`（調べる深さ＝`"standard"/"deep"/"max"`）・`reasoning`（Codex 経路: 実際に渡した
+    `depth`（調べる深さ＝`"quick"/"standard"/"deep"/"max"`）・`reasoning`（Codex 経路: 実際に渡した
     `model_reasoning_effort`。API 経路: `_log_chat_usage` が `"turns=<N>/tools=<N>"` の形で渡す）は
     `record()` 経由の呼び出し（`kind="chat-sub"`等）では渡さない＝対象は `kind="chat"` のみ。
     """

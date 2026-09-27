@@ -384,144 +384,6 @@ def test_agentic_budget_card_reset_tab_included_in_research_reset(page, web_base
     expect(page.locator("#agentic-budget-per-result")).to_have_value("")
 
 
-# ===== BUDGET-2（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・2026-09-03 裁定・
-# モデル窓連動・min() 方式）=====
-
-def test_agentic_budget_window_unknown_shows_plain_language_notice(page, web_base_url):
-    """窓が不明（登録値/API/シードのどれにも無い）なら、平文の案内（申告）を出す
-    （§3.4「限界に当たったら黙らない」）。mock 既定はこの unknown 状態。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "research")
-
-    expect(page.locator("#agentic-budget-window-unknown")).to_be_visible()
-    expect(page.locator("#agentic-budget-window-unknown")).to_contain_text("コンテキスト上限を判定できない")
-    expect(page.locator("#agentic-budget-window-status")).to_contain_text("現在のモデル")
-
-
-def test_agentic_budget_window_resolved_shows_tokens_source_and_cap(page, web_base_url):
-    """窓が判明していれば、出所（登録値/自動取得/組み込み）とトークン数・自動調整後の上限を表示し、
-    不明時の案内は隠す。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["agentic_budget"]["window"] = {
-        "provider": "openai", "model": "gpt-4o-mini", "window_tokens": 128_000,
-        "source": "seed", "derived_cap_bytes": 96_000}
-    install_api_mocks(page, system_settings=system_settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "research")
-
-    status = page.locator("#agentic-budget-window-status")
-    expect(status).to_contain_text("gpt-4o-mini")
-    expect(status).to_contain_text("128,000")
-    expect(status).to_contain_text("このアプリに組み込みの一覧")
-    expect(status).to_contain_text("94KB")   # 96000 bytes ≒ 94KB（_fmtBytesHuman と同じ換算）
-    expect(page.locator("#agentic-budget-window-unknown")).to_be_hidden()
-
-
-def test_model_windows_table_renders_registered_rows(page, web_base_url):
-    """登録済みの窓（"provider:model" → tokens）は表の行として描画される。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["agentic_budget"]["model_windows"] = {
-        "configured": {"openai:gpt-4o": 128000, "ollama:qwen2.5": 32768}}
-    install_api_mocks(page, system_settings=system_settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "models")
-
-    rows = page.locator("#agentic-model-windows-rows tr")
-    expect(rows).to_have_count(2)
-    # 行の値は <input>/<select> の value（textContent には現れない）——モデル名の集合で照合する。
-    model_inputs = page.locator("#agentic-model-windows-rows .mw-model")
-    values = [model_inputs.nth(i).input_value() for i in range(model_inputs.count())]
-    assert set(values) == {"gpt-4o", "qwen2.5"}
-
-
-def test_model_windows_table_add_row_and_save_sends_new_entry(page, web_base_url):
-    """「行を追加」→入力→保存で、PUT body に "provider:model": tokens が乗る。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "models")
-
-    page.locator("#agentic-model-windows-add").click()
-    row = page.locator("#agentic-model-windows-rows tr").last
-    row.locator(".mw-provider").select_option("openai")
-    row.locator(".mw-model").fill("gpt-4o")
-    row.locator(".mw-tokens").fill("128000")
-    page.locator("#save").click()
-
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    body = records["admin_settings_put"][-1]
-    assert body.get("model_context_windows") == {"openai:gpt-4o": 128000}
-
-
-def test_model_windows_table_delete_row_and_save_sends_remaining(page, web_base_url):
-    """既存の行を削除して保存すると、残った行だけを送る（全削除なら null）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["agentic_budget"]["model_windows"] = {
-        "configured": {"openai:gpt-4o": 128000}}
-    records = install_api_mocks(page, system_settings=system_settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "models")
-    expect(page.locator("#agentic-model-windows-rows tr")).to_have_count(1)
-
-    page.locator("#agentic-model-windows-rows .mw-remove").click()
-    expect(page.locator("#agentic-model-windows-rows tr")).to_have_count(0)
-    page.locator("#save").click()
-
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["admin_settings_put"][-1].get("model_context_windows") is None
-
-
-def test_model_windows_table_save_rejects_invalid_tokens_client_side(page, web_base_url):
-    """トークン数が範囲外（0）だと、日本語エラーを表示して PUT 自体を送らない
-    （agentic_budget の range validation と同じ流儀）。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "models")
-
-    page.locator("#agentic-model-windows-add").click()
-    row = page.locator("#agentic-model-windows-rows tr").last
-    row.locator(".mw-model").fill("bad-model")
-    row.locator(".mw-tokens").fill("0")
-    page.locator("#save").click()
-
-    expect(page.locator("#msg")).to_contain_text("一度に読める量（トークン数）は1〜10,000,000の整数で指定してください")
-    assert records["admin_settings_put"] == []
-
-
-def test_model_windows_table_included_in_models_reset(page, web_base_url):
-    """「使えるモデル」タブの「既定に戻す」は model_context_windows も null で送る。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["agentic_budget"]["model_windows"] = {
-        "configured": {"openai:gpt-4o": 128000}}
-    records = install_api_mocks(page, system_settings=system_settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "models")
-
-    page.locator('[data-reset-tab="models"]').click()
-    expect(page.locator("#tab-reset-res-models")).to_contain_text("既定に戻しました")
-    put = records["admin_settings_put"][-1]
-    assert put["model_context_windows"] is None
-    expect(page.locator("#agentic-model-windows-rows tr")).to_have_count(0)
-
-
 def test_admin_settings_provider_tab_reset_sends_explicit_false_for_personal_keys(page, web_base_url):
     """裁定3: personal_api_keys_allowed のリセットは null ではなく明示 false を送る（実効既定と
     同値・バックエンドの一括削除は値が厳密に false になった時だけ発火するため、null では
@@ -3456,6 +3318,10 @@ def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html#research")
     expect(page.locator('#tabpanel-provider [id^="depth-base-"]')).to_have_count(0)
+    expect(page.locator('#max-review-rounds')).to_have_value('')
+    expect(page.locator('#max-review-rounds-hint')).to_contain_text('現在の適用値: 7 回。既定: 7 回。')
+    expect(page.locator('#search-investigation-card #depth-base-grep-max-hits')).to_be_visible()
+    expect(page.locator('#search-investigation-card #depth-base-read-window')).to_be_visible()
     expect(page.locator('#codex-investigation-card #depth-base-codex-reasoning')).to_be_visible()
     expect(page.locator('#api-investigation-card #depth-base-max-turns')).to_be_visible()
     expect(page.locator('#search-investigation-card #depth-base-impact-depth')).to_have_count(1)
@@ -3470,6 +3336,58 @@ def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
     expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('固定中')
 
 
+def test_codex_worker_model_renders_default_placeholder_and_saves(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    field = page.locator('#codex-worker-model-card #codex-worker-model')
+    expect(field).to_have_value('')
+    expect(field).to_have_attribute('placeholder', '既定: gpt-5.6-sol')
+    expect(page.locator('#codex-worker-model-hint')).to_contain_text('未設定です（実際に適用される値: gpt-5.6-sol。')
+    field.fill('gpt-5.6-sol-mini')
+    expect(page.locator('#tab-dot-research')).to_be_visible()
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'codex_worker_model': 'gpt-5.6-sol-mini'}
+    page.reload()
+    expect(page.locator('#codex-worker-model')).to_have_value('gpt-5.6-sol-mini')
+    expect(page.locator('#codex-worker-model-hint')).to_contain_text('固定中')
+
+
+def test_codex_worker_model_clear_sends_null(page, web_base_url):
+    from playwright.sync_api import expect
+    import mock_api
+
+    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    settings['codex_worker_model'] = {
+        'configured': 'gpt-5.6-sol-mini', 'effective': 'gpt-5.6-sol-mini', 'default': 'gpt-5.6-sol'}
+    records = install_api_mocks(page, system_settings=settings)
+    page.goto(f"{web_base_url}/admin-settings.html#research")
+    expect(page.locator('#codex-worker-model')).to_have_value('gpt-5.6-sol-mini')
+    page.locator('#codex-worker-model').fill('')
+    page.locator('#save').click()
+    expect(page.locator('#msg')).to_contain_text('保存しました')
+    assert records['admin_settings_put'][-1] == {'codex_worker_model': None}
+
+
+def test_codex_worker_model_highlight_differs_from_default(page, web_base_url):
+    """既定から変えた項目だけ強調する（agentic_budget/depth_profile と同型）。"""
+    import re
+
+    from playwright.sync_api import expect
+    import mock_api
+
+    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
+    settings['codex_worker_model'] = {
+        'configured': 'gpt-5.6-sol-mini', 'effective': 'gpt-5.6-sol-mini', 'default': 'gpt-5.6-sol'}
+    install_api_mocks(page, system_settings=settings)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, 'research')
+
+    expect(page.locator('#codex-worker-model')).to_have_class(re.compile(r'\bcfg-changed\b'))
+
+
 def test_research_reset_preserves_provider_draft(page, web_base_url):
     from playwright.sync_api import expect
 
@@ -3482,7 +3400,14 @@ def test_research_reset_preserves_provider_draft(page, web_base_url):
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 11 and all(value is None for value in body.values())
+    assert len(body) == 15 and all(value is None for value in body.values())
+    assert set(body) == {
+        'depth_base_max_turns', 'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
+        'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
+        'depth_base_codex_reasoning', 'agentic_max_tools_per_turn', 'embed_parallel',
+        'max_review_rounds', 'codex_worker_model', 'codex_session_retention_days',
+        'agentic_budget_per_result', 'agentic_budget_total', 'codex_mode',
+    }
     assert 'openai_api_key' not in body and 'cloud_provider' not in body
     expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')
     expect(page.locator('#tab-dot-research')).to_be_hidden()
@@ -3683,8 +3608,8 @@ def test_depth_profile_card_reset_tab_nulls_all_seven_fields(page, web_base_url)
     body = records["admin_settings_put"][-1]
     for key in ("depth_base_max_turns", "depth_base_grep_max_hits", "depth_base_qa_max_hits",
                "depth_base_read_window", "depth_base_impact_depth", "depth_base_troubleshoot_depth",
-               "depth_base_codex_reasoning"):
-        assert body.get(key) is None, key
+               "depth_base_codex_reasoning", "max_review_rounds"):
+        assert key in body and body[key] is None, key
 
 
 def test_mock_validate_depth_base_rejects_negative_zero_and_upper_plus_one():
@@ -4073,7 +3998,7 @@ def test_admin_users_embed_param_hides_own_nav(page, web_base_url):
 
 
 def test_research_budget_draft_survives_ingest_reset(page, web_base_url):
-    """取り込みのリセットにモデル登録を含めず、別タブの情報量の未保存編集を残す。"""
+    """取り込みのリセットで研究タブの未保存編集（情報量の1件あたり上限）を巻き込まず残す。"""
     from playwright.sync_api import expect
 
     records = install_api_mocks(page)
@@ -4086,80 +4011,9 @@ def test_research_budget_draft_survives_ingest_reset(page, web_base_url):
     page.locator('[data-reset-tab="ingest"]').click()
     expect(page.locator('#tab-reset-res-ingest')).to_contain_text('既定に戻しました')
     assert 'agentic_budget_per_result' not in records['admin_settings_put'][-1]
-    assert 'model_context_windows' not in records['admin_settings_put'][-1]
     open_tab(page, 'research')
     expect(page.locator('#agentic-budget-per-result')).to_have_value('512')
     expect(page.locator('#tab-dot-research')).to_be_visible()
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存しました')
     assert records['admin_settings_put'][-1]['agentic_budget_per_result'] == 512 * 1024
-
-
-def test_model_windows_excludes_codex_and_preserves_existing_entry(page, web_base_url):
-    """新規登録はAPIだけ。保存済みCodexを別プロバイダへ誤変換しない。"""
-    from copy import deepcopy
-
-    from playwright.sync_api import expect
-
-    view = deepcopy(SYSTEM_SETTINGS_VIEW)
-    view['agentic_budget']['model_windows']['configured'] = {'codex:gpt-test': 128000}
-    records = install_api_mocks(page, system_settings=view)
-    page.goto(f'{web_base_url}/admin-settings.html')
-    open_tab(page, 'models')
-    saved = page.locator('#agentic-model-windows-rows tr').first
-    expect(saved.locator('.mw-provider')).to_have_value('codex')
-    expect(saved.locator('option[value="codex"]')).to_be_disabled()
-    expect(saved.locator('option[value="codex"]')).to_contain_text('適用対象外')
-    page.locator('#save').click()
-    expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert 'model_context_windows' not in records['admin_settings_put'][-1]
-    page.locator('#agentic-model-windows-add').click()
-    added = page.locator('#agentic-model-windows-rows tr').last
-    expect(added.locator('option[value="codex"]')).to_have_count(0)
-    added.locator('.mw-model').fill('api-test')
-    added.locator('.mw-tokens').fill('64000')
-    page.locator('#save').click()
-    expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert records['admin_settings_put'][-1]['model_context_windows'] == {
-        'codex:gpt-test': 128000, 'openai:api-test': 64000,
-    }
-
-
-def test_codex_budget_window_is_not_applicable(page, web_base_url):
-    from copy import deepcopy
-
-    from playwright.sync_api import expect
-
-    view = deepcopy(SYSTEM_SETTINGS_VIEW)
-    view['agentic_budget']['window'] = {
-        'provider': 'codex', 'model': '', 'source': 'unknown', 'window_tokens': None,
-    }
-    install_api_mocks(page, system_settings=view)
-    page.goto(f'{web_base_url}/admin-settings.html')
-    open_tab(page, 'research')
-    expect(page.locator('#agentic-budget-window-status')).to_contain_text('Codex は対象外')
-    expect(page.locator('#agentic-budget-window-status')).not_to_contain_text('未設定')
-    expect(page.locator('#agentic-budget-window-unknown')).to_be_hidden()
-
-
-def test_model_window_draft_survives_research_reset(page, web_base_url):
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f'{web_base_url}/admin-settings.html')
-    open_tab(page, 'models')
-    page.locator('#agentic-model-windows-add').click()
-    row = page.locator('#agentic-model-windows-rows tr').last
-    row.locator('.mw-model').fill('gpt-4o')
-    row.locator('.mw-tokens').fill('128000')
-    expect(page.locator('#tab-dot-models')).to_be_visible()
-    expect(page.locator('#tab-dot-research')).to_be_hidden()
-    open_tab(page, 'research')
-    page.locator('[data-reset-tab="research"]').click()
-    expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
-    assert 'model_context_windows' not in records['admin_settings_put'][-1]
-    open_tab(page, 'models')
-    expect(row.locator('.mw-tokens')).to_have_value('128000')
-    page.locator('#save').click()
-    expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert records['admin_settings_put'][-1]['model_context_windows'] == {'openai:gpt-4o': 128000}

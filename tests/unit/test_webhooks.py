@@ -1,4 +1,4 @@
-"""Webhook 通知（PART-6・sherpa/webhooks.py・docs/proposals/2026-09-05-Webhook通知.md）の unit テスト。
+"""Webhook 通知（PART-6・sherpa/webhooks.py・docs/archive/2026-09-05-Webhook通知.md）の unit テスト。
 
 対象: 宛先検証（allowlist必須〔loopback含む〕/userinfo拒否/fail-closed・W3・RV是正#1/#8）・
 署名の既知ベクトル（W4）・リトライ回数とバックオフ・試行毎の宛先再評価（W1・RV是正#6・

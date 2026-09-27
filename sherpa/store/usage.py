@@ -214,13 +214,59 @@ def _stopped_turns_sql() -> str:
     )
 
 
-# limits（`answer->'limits'`・agentic_search.InvestigationState.limits・利用統計「打ち切りの
-# 内訳」専用の計測カウンタ）の SQL 抽出。旧行（キー自体が無い）は NULL のまま拾い FILTER で
-# 除外される＝0件として集計に混じる（`docs/notes`「限定/計測」契約・制限そのものは変えない）。
-# `_usage_tok` と同じ「非数値/欠落は無視」防御（bool は 'true'/'false' 文字列のみ真偽扱い）。
-_USAGE_LIMIT_INT_FIELDS = ("tool_result_clipped", "context_compactions", "search_truncated",
-                           "auto_continues")
-_USAGE_LIMIT_BOOL_FIELDS = ("total_budget_hit", "synthesis_truncated")
+# SQL集計後、経路別定義で計測項目と未計測項目を分けてAPIへ返す。
+# イベントが一度も書かれない項目も、計測対象なら集計値0を保つ。
+_API_USAGE_LIMIT_FIELDS = {
+    "tool_result_clipped": "count",
+    "total_budget_hit": "flag",
+    "context_compactions": "count",
+    "synthesis_truncated": "flag",
+    "depth_escalated": "flag",
+    "search_truncated": "count",
+    "auto_continues": "count",
+    "backend_unavailable_fulltext": "flag",
+    "backend_unavailable_graph": "flag",
+    "graph_reingest_required": "flag",
+}
+_USAGE_LIMIT_FIELDS_BY_ROUTE = {
+    "codex": {
+        "tool_result_clipped": "count",
+        "total_budget_hit": "flag",
+        "search_truncated": "count",
+        "auto_continues": "count",
+        "duplicate_tool_call": "count",
+        "tool_calls_exhausted": "flag",
+        "backend_unavailable_fulltext": "flag",
+        "backend_unavailable_graph": "flag",
+        "graph_reingest_required": "flag",
+    },
+    # API 集計対象の provider 名を明示する。未知の provider は計測対象にしない。
+    "openai": _API_USAGE_LIMIT_FIELDS,
+    "ollama": _API_USAGE_LIMIT_FIELDS,
+    "gemini": _API_USAGE_LIMIT_FIELDS,
+    "bedrock": _API_USAGE_LIMIT_FIELDS,
+}
+_USAGE_LIMIT_INT_FIELDS = tuple(dict.fromkeys(
+    field for route_fields in _USAGE_LIMIT_FIELDS_BY_ROUTE.values()
+    for field, kind in route_fields.items() if kind == "count"))
+_USAGE_LIMIT_BOOL_FIELDS = tuple(dict.fromkeys(
+    field for route_fields in _USAGE_LIMIT_FIELDS_BY_ROUTE.values()
+    for field, kind in route_fields.items() if kind == "flag"))
+_USAGE_LIMIT_FIELD_KINDS = _USAGE_LIMIT_FIELDS_BY_ROUTE["codex"] | _API_USAGE_LIMIT_FIELDS
+
+
+def _usage_limits_provider_row(row: dict) -> dict:
+    """provider別に計測対象だけを値として返し、未計測項目は null にする。"""
+    measured = _USAGE_LIMIT_FIELDS_BY_ROUTE.get(row["provider"])
+    result = {"provider": row["provider"], "turns": row["turns"] or 0}
+    for field, kind in _USAGE_LIMIT_FIELD_KINDS.items():
+        value = row[f"{field}_turns"] or 0
+        result[f"{field}_turns"] = value if measured is not None and field in measured else None
+        if kind == "count":
+            total = row[f"{field}_total"]
+            result[f"{field}_total"] = (
+                int(total or 0) if measured is not None and field in measured else None)
+    return result
 
 
 def _usage_limit_int(field: str) -> str:
@@ -305,6 +351,8 @@ def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | N
 
     resume_rate: user ターン数2以上（＝2ターン目以降が有り得る）の会話のうち、
     `codex_session_id` が設定されている割合。分母（該当会話数）が0なら None（推定しない）。
+    conversation_turns に session_eligible（分母）と session_recorded（分子）を含める。
+    セッションIDは現在の保存状態であり、再開を試行・成功した記録ではない。
     """
     counts = sorted((r["user_turns"] or 0) for r in conversation_rows)
     if counts:
@@ -320,6 +368,7 @@ def _compute_conversation_turn_stats(conversation_rows) -> tuple[dict, float | N
     denom = len(eligible)
     resumed = sum(1 for r in eligible if r["codex_session_id"] is not None)
     resume_rate = (resumed / denom) if denom > 0 else None
+    conversation_turns.update(session_eligible=denom, session_recorded=resumed)
     return conversation_turns, resume_rate
 
 
@@ -442,6 +491,9 @@ def _compute_round_stats(round_rows) -> dict:
     unmatched_rounds = 0
     for r in round_rows:
         meta = r["meta"] or {}
+        # 深さは利用者が選んだ語彙そのもの（版の印は付けない）——`"standard"` の意味が 0 巡から
+        # 2 巡へ変わった前後は同じキーに畳まれる。版をまたぐ比較は品質採点の `condition`
+        # （`QUALITY_RUN_CONDITIONS`）側で分ける。
         depth = r["depth_profile"] or "unknown"
         provider = r["provider"] or "unknown"
 
@@ -581,17 +633,65 @@ def _round_rows_query(c, start_ts, end_exclusive_ts):
 
 
 # 最終回答の主張（`answer->'data'->'claims'`）のうち不明の理由コードを数えるための取得 SQL
-# （`usage_stats()`/`usage_depth_rounds()` が共有）。
+# （`usage_stats()`/`usage_depth_rounds()` が共有）。`gate_missing_codes`（S1b・Codex 経路の
+# 最終ゲート・`answer->'data'->'evidence_gate'->'missing_codes'`）も同じ行から拾う——Codex は
+# `chat-round` を発生させない経路のため、巡別記録（`_round_rows_query`）には不足軸が載らず、
+# ここが唯一の取得点になる（API 経路にはこのキー自体が無く NULL のまま＝`_compute_round_stats`
+# 側の `missing_codes` 集計と二重計上にならない）。
 def _final_claims_rows_query(c, start_ts, end_exclusive_ts):
     return c.execute(
         _USAGE_TURN_CTE + " "
         "SELECT answer->'usage'->>'provider' AS provider, "
         "  answer->'usage'->>'depth_profile' AS depth_profile, "
-        "  answer->'data'->'claims' AS claims "
+        "  answer->'data'->'claims' AS claims, "
+        "  answer->'data'->'evidence_gate'->'missing_codes' AS gate_missing_codes "
         "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s "
         "  AND jsonb_typeof(answer->'data'->'claims') = 'array'",
         (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
     ).fetchall()
+
+
+def _compute_final_missing_codes(final_claims_rows) -> dict[tuple, dict[str, int]]:
+    """S1b: 最終回答の `evidence_gate.missing_codes`（Codex 経路の最終ゲート・巡を発生させない
+    ため `chat-round` には載らない）を深さ×経路で合算する。非配列/欠落（API 経路・v1・旧データ）
+    は静かにスキップする（`_compute_final_reason_codes` と同じ「非配列は無視」防御）。
+    """
+    agg: dict[tuple, dict[str, int]] = {}
+    for r in final_claims_rows:
+        codes = r["gate_missing_codes"]
+        if not isinstance(codes, list):
+            continue
+        depth = r["depth_profile"] or "unknown"
+        provider = r["provider"] or "unknown"
+        bucket = agg.setdefault((depth, provider), {})
+        for code in codes:
+            if isinstance(code, str) and code:
+                bucket[code] = bucket.get(code, 0) + 1
+    return agg
+
+
+def _merge_final_missing_codes(rounds_stats: dict, final_claims_rows) -> None:
+    """S1b: 最終回答由来の不足軸（`_compute_final_missing_codes`）を、既存の巡別集計
+    （`rounds_stats["by_depth_provider"]`・表示は `web/usage.js::reviewCounts(r.missing_codes)`
+    のまま＝新しい表は作らない）へ深さ×経路で合流させる。Codex は `chat-round` を発生させない
+    ため、既存集計に対応するバケットが無い（深さ, "codex"）組は新規バケットとして追加する
+    （`rounds` 等の巡別指標は0のまま＝Codex 側にその意味の値が無いことを表す）。
+    """
+    agg = _compute_final_missing_codes(final_claims_rows)
+    if not agg:
+        return
+    by_key = {(a["depth_profile"], a["provider"]): a for a in rounds_stats["by_depth_provider"]}
+    for key, codes in agg.items():
+        bucket = by_key.get(key)
+        if bucket is None:
+            bucket = _new_round_bucket(*key)
+            bucket["elapsed_ms_avg"] = None
+            bucket["citations_delta_avg"] = None
+            by_key[key] = bucket
+            rounds_stats["by_depth_provider"].append(bucket)
+        for code, n in codes.items():
+            bucket["missing_codes"][code] = bucket["missing_codes"].get(code, 0) + n
+    rounds_stats["by_depth_provider"].sort(key=lambda a: (a["depth_profile"], a["provider"]))
 
 
 def _round_reason_codes(rounds_stats: dict, final_claims_rows) -> dict:
@@ -661,7 +761,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
       - `resume_rate`: user ターン数2以上の会話のうち `conversations.codex_session_id` が設定されている
         割合。対象会話が無ければ None（推定しない）。`_compute_conversation_turn_stats` 参照。
 
-    `docs/proposals/2026-09-12-利用統計の拡充2.md` §2/§3:
+    `docs/archive/2026-09-12-利用統計の拡充2.md` §2/§3:
       - `tokens.by_user_kind`: ユーザー別 × 用途別（kind）の calls/tokens/elapsed_ms（`tokens.by_kind`
         と同じ材料・同じ扱い）。chat 行（`messages.answer->'usage'` 由来）は `token_by_user`
         （`user_rows` と同じ `turns` CTE 集計）から `kind='chat'` として合流し、それ以外の kind は
@@ -932,7 +1032,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
             "GROUP BY c.id",
             (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
-        # 会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。対象は
+        # 会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。対象は
         # 「期間内に user ターンが1件以上ある会話」（他の会話系集計と同じ母集団）——1行=1会話。
         # chat（messages.answer->'usage'）の合計と回答時間平均（duration_ms・欠落行は AVG が自然に除外）
         # をここで集計し、それ以外の kind（usage_events 由来）は下の conv_kind_rows で別途取得して
@@ -1055,13 +1155,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
 
     # limits（「打ち切りの内訳」・経路別・利用統計 U 系と同じ形＝行=provider の list）。
     # `*_turns`＝回数系は1回以上・bool系は真だったターン数、`*_total`＝回数系の合計回数。
-    by_provider_limits = [
-        {"provider": r["provider"], "turns": r["turns"] or 0,
-         **{f"{f}_turns": r[f"{f}_turns"] or 0 for f in _USAGE_LIMIT_INT_FIELDS},
-         **{f"{f}_total": int(r[f"{f}_total"] or 0) for f in _USAGE_LIMIT_INT_FIELDS},
-         **{f"{f}_turns": r[f"{f}_turns"] or 0 for f in _USAGE_LIMIT_BOOL_FIELDS}}
-        for r in limits_rows
-    ]
+    by_provider_limits = [_usage_limits_provider_row(r) for r in limits_rows]
     limits_stats = {"by_provider": by_provider_limits}
 
     # 定着指標: JST 週（月曜始まり）ごとのアクティブユーザー集合→週次人数の推移＋連続週ペアの再訪率。
@@ -1218,6 +1312,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # 正本に触れない）。
     rounds_stats = _compute_round_stats(round_rows)
     rounds_stats["reason_codes"] = _round_reason_codes(rounds_stats, final_claims_rows)
+    _merge_final_missing_codes(rounds_stats, final_claims_rows)
 
     return {
         "users": users, "totals": totals, "daily": daily, "period": period,
@@ -1237,8 +1332,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
 _QUALITY_COUNT_FIELDS = ("correct", "wrong_assertion", "missing", "regressed", "unrated")
 
 # 採点した条件の閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。`main`＝見直しの無い
-# AP、`depth2-*`＝見直しを持つ AP の深さ別。
-QUALITY_RUN_CONDITIONS = ("main", "depth2-standard", "depth2-deep", "depth2-max")
+# AP、`depth2-*`＝見直しを持つ AP の深さ別（`depth2-quick` が見直し 0 巡・`depth2-standard` は
+# 見直し 2 巡）。
+QUALITY_RUN_CONDITIONS = ("main", "depth2-quick", "depth2-standard", "depth2-deep", "depth2-max")
 
 
 def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
@@ -1248,7 +1344,7 @@ def record_depth_quality_run(rounds, counts: dict | None, *, condition: str,
                              audit_actor: str | None = None) -> bool:
     """1採点ラン分の集計済みカウントを1行 INSERT する。
 
-    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-standard`）は0）。
+    `rounds`: 比較した巡数（0以上——見直しを一度も回さない条件（`main`・`depth2-quick`）は0）。
     `counts`: `_QUALITY_COUNT_FIELDS` の一部/全部（欠落キーは0・非負整数以外は0に丸める＝壊れた
     入力で例外にしない）。`condition`: `QUALITY_RUN_CONDITIONS` のいずれか（閉集合外は
     `UsagePeriodError` ではなく `ValueError`）。`executed_from`/`executed_to`: 質問セットを実行した
@@ -1351,7 +1447,7 @@ def depth_quality_stats(days: int = 180, *, time_from: str | None = None,
 
 
 # ===================================================================================
-# docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツールが
+# docs/archive/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツールが
 # 使う、絞り込み付きの集計関数。不変条件は本モジュール冒頭と同じ（本文・会話タイトルは一切
 # SELECT しない）ことに加え、display_name も返さない（ツールの戻り値は件数・時刻・種別・トークン・
 # 所要時間・会話 id・uid・world のみという契約——`usage_stats()` 自体の戻り値は画面表示用のため

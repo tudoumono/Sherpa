@@ -46,7 +46,7 @@ def test_collect_defs_extracts_non_public_sibling_as_child_module():
 
 def test_collect_defs_falls_back_to_first_type_when_no_public_type_present():
     """public 型が1つも無いファイルでも黙って消さない——最初の型宣言を primary に採る
-    （CODE-1d の実装判断・docs/proposals/2026-08-29-コード解析層のコンポーネント化.md の
+    （CODE-1d の実装判断・docs/archive/2026-08-29-コード解析層のコンポーネント化.md の
     CODE-1d 節に報告）。"""
     text = "class PackagePrivateOnly {\n}\n"
     res = A.collect_defs(text, "PackagePrivateOnly.java")

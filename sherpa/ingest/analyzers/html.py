@@ -1,4 +1,4 @@
-"""静的 HTML テンプレートアナライザ（docs/proposals/2026-09-05-アナライザ拡張.md §13 波3 レーン A）。
+"""静的 HTML テンプレートアナライザ（docs/archive/2026-09-05-アナライザ拡張.md §13 波3 レーン A）。
 
 `accepts()` は内容判定つき（コーディネータ裁定・HTML の分類）: 先頭64KB にアプリ画面の目印
 （`<form`・`<script src`・`<link rel="stylesheet">`・JSP/JSF/Thymeleaf のタグ/属性

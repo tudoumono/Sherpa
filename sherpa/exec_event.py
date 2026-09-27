@@ -1,4 +1,4 @@
-"""Execution Event v2 のビルダ（設計: docs/proposals/2026-08-22-拡張設計.md §2・EXT-1）。
+"""Execution Event v2 のビルダ（設計: docs/archive/2026-08-22-拡張設計.md §2・EXT-1）。
 
 v1 の最小契約 `{type:"node", id, kind, label, detail, status}` を土台に、階層構造を表す新規フィールド
 （`event_type`/`parent_id`/`run_id`/`agent_run_id`/`parent_agent_run_id`/`task_id`/`phase`/`seq`/

@@ -1,6 +1,6 @@
 """L8（複数アーム観測の並存＋LLM再構築の入力・§8.2）の単体/実往復テスト。
 
-正典: `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.2。実VLM/実LLM 呼び出しは
+正典: `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.2。実VLM/実LLM 呼び出しは
 一切発生しない（`vision_arm.resolve_vlm`/`vision_arm._vlm_read` を monkeypatch）。固定する契約:
 
 1. canonical が読めている要素へ第二アーム（VLM）が走らないこと（`ocr_router` の raster 候補選定を

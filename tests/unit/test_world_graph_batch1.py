@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由のシェル/バッチ（POSIX/bat）・Spring Batch XML 統合テスト
-（アナライザ拡張 波3 レーン B・docs/proposals/2026-09-05-アナライザ拡張.md §13）。
+（アナライザ拡張 波3 レーン B・docs/archive/2026-09-05-アナライザ拡張.md §13）。
 
 `shell.py` は本作業（波3 レーン B）で新規作成した未登録アナライザのため、`registry._ANALYZERS`
 を monkeypatch して既存の登録済みアナライザ（`CobolAnalyzer`/`JavaAnalyzer`/`XmlConfigAnalyzer` 等）

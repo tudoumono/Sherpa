@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """UI 改善の比較用スクリーンショット行列（モック API＋Playwright・docker 不要）。
 
-docs/proposals/2026-09-07-UI改善.md §7 の検証表（画面／テーマ／ビューポート・ズーム／状態）を
+docs/archive/2026-09-07-UI改善.md §7 の検証表（画面／テーマ／ビューポート・ズーム／状態）を
 機械的に撮る道具。マニュアル画像（scripts/capture_screenshots.py・docs/manual/images）とは別物で、
 出力は `tmp/ui-shots/<label>/`（git 管理外）。ブランチごとに label を変えて撮り、`--compare` で
 並べた HTML を作って見比べる（A/B＝main／design/claude／design/codex）。

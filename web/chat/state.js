@@ -26,8 +26,14 @@ export const S = {
   toolsExplicit: { grep: false, fulltext: false, graph: false },
   verLabels: {},   // 取込ディレクトリ識別子→表示名（例 v1→4期・/world-options 由来）
   pendingConvWorld: null,   // 会話復元が選択肢の読込より先に走った時の後追い適用（deep-link ?conv= の競合対策）
-  kb: false,               // ナレッジ参照（既定オフ）
+  kb: true,                // ナレッジ参照（既定ON・決定2026-09-19＝初期構成の既定）
   kbLocked: false,         // Codex 構成は資料参照ON固定（決定 2026-08-15・サーバ側でも強制）
+  // 資料フォルダが1つも登録されていないと判明した（`GET /world-options` が空で返った）明示フラグ。
+  // 既定 false＝「未確認」（読込前・失敗時を「未登録」と誤認しない）。true になるのは
+  // chat.js の /world-options 読込ハンドラが names.length===0 を確認した時だけ
+  // （newConversation() はこのフラグの有無だけを見て資料参照の既定ON/OFFを決める・
+  // S.verLabels の空チェックだと「未到着」と「空で確定」を区別できず決定2026-09-19）。
+  kbForcedOff: false,
   personal: false,         // Feature B: 個人ファイル参照トグル（既定オフ）
   webSearch: false,        // WEB-1: Codex の Web 検索をこのチャットで希望するか（既定オフ・新規会話は常にオフ）
   convHasPersonal: false,  // Feature C: 現在の会話が個人コンテンツを参照済みか

@@ -1,5 +1,5 @@
 """chat_turns.TurnBuffer が Execution Event v2 ペイロードを無改修で運べることの単体テスト
-（EXT-1 受け入れ条件(c)・`docs/proposals/2026-08-22-拡張設計.md` §11.3①・DB/Neo4j 不要）。
+（EXT-1 受け入れ条件(c)・`docs/archive/2026-08-22-拡張設計.md` §11.3①・DB/Neo4j 不要）。
 
 `TurnBuffer` は payload を型を持たない `dict` として append-only に保持するだけ（`chat_turns.py`
 モジュール docstring「薄いラッパー」）。本テストは v2 ノード（`parent_id`/`agent_run_id` 等を持つ）が

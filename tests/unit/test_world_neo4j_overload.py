@@ -14,6 +14,7 @@ secRV 範囲外是正 追補（2026-07-19・RV指摘 HIGH-1）: 天井到達で 
 """
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
@@ -188,42 +189,57 @@ def test_module_defaults_are_clamped_into_range():
     assert 100 <= wn._NEO4J_MAX_ROWS <= 1_000_000
 
 
-# ---- SHERPA_IMPACT_MAX_DEPTH ----
+# ---- SHERPA_IMPACT_MAX_DEPTH / SHERPA_NEO4J_BATCH_ROWS ----
 # import 時に一度だけ確定する定数は実プロセスを新規に起こして検証する（`_fresh_import`）。
+# 両定数を1回の fresh import でまとめて確認する（`_NEO4J_BATCH_ROWS` 側の同型テストは
+# このスクリプトを再利用する）。
+
+def _neo4j_env_constants_script() -> str:
+    return (
+        "import inspect, json\n"
+        "import sherpa.ingest.world_neo4j as m\n"
+        "print(json.dumps({\n"
+        "    'impact_max_depth': m.IMPACT_MAX_DEPTH,\n"
+        "    'batch_rows': m._NEO4J_BATCH_ROWS,\n"
+        "    'world_impact_depth': inspect.signature(m.world_impact).parameters['depth'].default,\n"
+        "    'run_world_impact_depth': inspect.signature(m.run_world_impact).parameters['depth'].default,\n"
+        "}))\n"
+    )
+
 
 def test_impact_max_depth_fresh_import_env_unset_is_default():
-    assert FI.fresh_import_attr("sherpa.ingest.world_neo4j", "IMPACT_MAX_DEPTH",
-                                env={"SHERPA_IMPACT_MAX_DEPTH": None}) == 8
+    out = json.loads(FI.run_script(_neo4j_env_constants_script(),
+                                   env={"SHERPA_IMPACT_MAX_DEPTH": None, "SHERPA_NEO4J_BATCH_ROWS": None}))
+    assert out["impact_max_depth"] == 8
+    assert out["batch_rows"] == 5000
 
 
 def test_impact_max_depth_fresh_import_env_valid_value():
-    assert FI.fresh_import_attr("sherpa.ingest.world_neo4j", "IMPACT_MAX_DEPTH",
-                                env={"SHERPA_IMPACT_MAX_DEPTH": "12"}) == 12
+    """正しい値が反映されることに加え、`world_impact`/`run_world_impact` の `depth` 既定値が
+    `IMPACT_MAX_DEPTH` に揃っていること（既定値どうしが偶然一致するだけの「旧リテラル
+    `depth=8` への退行」を検出できない自己言及を避けるため、既定と異なる値で確認）も
+    同じ fresh import でまとめて確認する。"""
+    out = json.loads(FI.run_script(_neo4j_env_constants_script(),
+                                   env={"SHERPA_IMPACT_MAX_DEPTH": "20", "SHERPA_NEO4J_BATCH_ROWS": "10"}))
+    assert out["impact_max_depth"] == 20
+    assert out["batch_rows"] == 10
+    assert out["world_impact_depth"] == 20
+    assert out["run_world_impact_depth"] == 20
 
 
 def test_impact_max_depth_fresh_import_env_invalid_falls_back_to_default():
-    for bad in ("0", "65", "abc"):
-        assert FI.fresh_import_attr("sherpa.ingest.world_neo4j", "IMPACT_MAX_DEPTH",
-                                    env={"SHERPA_IMPACT_MAX_DEPTH": bad}) == 8, bad
+    for depth_bad, rows_bad in zip(("0", "65", "abc"), ("0", "abc", "-5")):
+        out = json.loads(FI.run_script(_neo4j_env_constants_script(),
+                                       env={"SHERPA_IMPACT_MAX_DEPTH": depth_bad,
+                                            "SHERPA_NEO4J_BATCH_ROWS": rows_bad}))
+        assert out["impact_max_depth"] == 8, depth_bad
+        assert out["batch_rows"] == 5000, rows_bad
 
 
 def test_impact_max_depth_env_change_after_import_has_no_effect(monkeypatch):
     before = wn.IMPACT_MAX_DEPTH
     monkeypatch.setenv("SHERPA_IMPACT_MAX_DEPTH", "40")
     assert wn.IMPACT_MAX_DEPTH == before == 8
-
-
-def test_world_impact_default_depth_param_is_impact_max_depth():
-    """`world_impact`/`run_world_impact` の `depth` 既定値は `IMPACT_MAX_DEPTH` に揃っている。
-
-    既定値と異なる env（20）で fresh import して確認する＝既定値どうしが偶然一致するだけの
-    「旧リテラル `depth=8` への退行」を検出できない自己言及を避ける。
-    """
-    env = {"SHERPA_IMPACT_MAX_DEPTH": "20"}
-    assert FI.fresh_import_param_default(
-        "sherpa.ingest.world_neo4j", "world_impact", "depth", env=env) == 20
-    assert FI.fresh_import_param_default(
-        "sherpa.ingest.world_neo4j", "run_world_impact", "depth", env=env) == 20
 
 
 # ---- resolve_world_entity / world_impact: overload が fail-loud で伝播 ------
@@ -324,6 +340,15 @@ def test_world_impact_passes_query_timeout():
 # transaction が本当にロールバックすることの確認（fake では検証できない）と、バッチ行数を変えても
 # 最終結果が同一であることの確認は `tests/integration/test_world_neo4j_batch_load.py` に置く。
 
+class _FakeCountResult:
+    """`tx.run(...).single()["c"]` に応えるだけの最小スタブ（`load_world` が投入後に刻む
+    node_count/edge_count の件数照会向け・本ファイルの対象である UNWIND バッチ本体の検証には
+    無関係のため値は固定 0 でよい）。"""
+
+    def single(self):
+        return {"c": 0}
+
+
 class _FakeBatchTx:
     """`tx.run(cypher, **params)` を記録する最小スタブ。`fail_on_call`（1始まりの通し番号）に
     達したら例外を投げる——`session.execute_write` に渡す関数が例外を投げれば実 driver は tx を
@@ -340,6 +365,7 @@ class _FakeBatchTx:
         self.log.append((cypher, params))
         if self.fail_on_call is not None and self._i == self.fail_on_call:
             raise RuntimeError("boom mid-batch")
+        return _FakeCountResult()
 
 
 class _FakeBatchSession:
@@ -459,23 +485,9 @@ def test_load_world_unknown_vocab_rejected_before_any_write(monkeypatch):
     assert log == []                               # 検証前に落ちるので tx すら開始しない
 
 
-# ---- SHERPA_NEO4J_BATCH_ROWS（import 時に一度だけ確定・`_fresh_import` で実プロセス検証） ---
-
-def test_neo4j_batch_rows_fresh_import_env_unset_is_default():
-    assert FI.fresh_import_attr("sherpa.ingest.world_neo4j", "_NEO4J_BATCH_ROWS",
-                                env={"SHERPA_NEO4J_BATCH_ROWS": None}) == 5000
-
-
-def test_neo4j_batch_rows_fresh_import_env_valid_value():
-    assert FI.fresh_import_attr("sherpa.ingest.world_neo4j", "_NEO4J_BATCH_ROWS",
-                                env={"SHERPA_NEO4J_BATCH_ROWS": "10"}) == 10
-
-
-def test_neo4j_batch_rows_fresh_import_env_invalid_falls_back_to_default():
-    for bad in ("0", "abc", "-5"):
-        assert FI.fresh_import_attr("sherpa.ingest.world_neo4j", "_NEO4J_BATCH_ROWS",
-                                    env={"SHERPA_NEO4J_BATCH_ROWS": bad}) == 5000, bad
-
+# ---- SHERPA_NEO4J_BATCH_ROWS ----
+# unset/valid/invalid の確認は test_impact_max_depth_fresh_import_env_* に統合済み
+# （IMPACT_MAX_DEPTH と同じ fresh import でまとめて検証する）。
 
 def test_neo4j_batch_rows_env_change_after_import_has_no_effect(monkeypatch):
     before = wn._NEO4J_BATCH_ROWS

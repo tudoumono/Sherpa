@@ -1,6 +1,6 @@
 """PART-6: 取り込み run の terminal 化から `webhooks.notify_run_terminal` が呼ばれる配線テスト。
 
-`docs/proposals/2026-09-05-Webhook通知.md` の発火点契約（`worker._record` の確定パス＋
+`docs/archive/2026-09-05-Webhook通知.md` の発火点契約（`worker._record` の確定パス＋
 `_sync_impl._finalize_if_unused`）を、DB/ネットワーク不要のスタブ実行で検証する
 （`tests/unit/test_ingest_worker_flags.py` と同じ構成のスタブ流儀）。実際の HTTP 送信・
 宛先検証・リトライは `tests/unit/test_webhooks.py` の担当——ここでは「正しい引数で

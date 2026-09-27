@@ -29,7 +29,7 @@ def add_usage_event(*, kind, provider, model=None, input_tokens=None, cached_inp
     `elapsed_ms`（STAT-3 S2・2026-09-11-利用統計の拡充.md T2）: 呼び出しの所要時間（ミリ秒）。
     None＝計測スコープ外（`metering.py` docstring 参照）で取れない・記録しない。
 
-    `conversation_id`（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）: 会話別集計キー。
+    `conversation_id`（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）: 会話別集計キー。
     None＝会話 id が未確定の経路（新規会話の初回など）で、既存行への遡及もしない。
 
     `meta`（省略可・既定 None・DEPTH-2 S5）: 表示・分析用の付帯内訳（JSONB）。課金集計は読まない

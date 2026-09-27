@@ -851,15 +851,54 @@ function _fmtTokensCompact(n) {
   if (n >= 1000) return Math.round(n / 1000) + 'k';
   return String(n);
 }
+// キャッシュ内訳（cached_input_tokens）は null/undefined になりうる（Ollama 等は内訳を返さない）。
+// 契約: cached ⊆ input（別枠ではない・providers/base.py 参照）＝数値のときだけ「実入力 = 入力 - キャッシュ」
+// を出す。null/undefined は「内訳なし」＝従来どおり総入力のみを出す。
+function _hasCacheBreakdown(v) { return typeof v === 'number'; }
 function usageMetaHTML(u) {
   if (!u || typeof u !== 'object') return '';
-  const inC = _fmtTokensCompact(u.input_tokens), outC = _fmtTokensCompact(u.output_tokens);
-  const cached = u.cached_input_tokens ? `（うちキャッシュ ${(u.cached_input_tokens | 0).toLocaleString()}）` : '';
+  const inTotal = u.input_tokens | 0;
+  const hasCache = _hasCacheBreakdown(u.cached_input_tokens);
+  const cachedN = hasCache ? Math.max(u.cached_input_tokens | 0, 0) : 0;
+  const actualIn = hasCache ? Math.max(inTotal - cachedN, 0) : inTotal;
+  const outC = _fmtTokensCompact(u.output_tokens);
+  // 見出しはキャッシュが 0 のとき実入力＝総入力で情報が無いので、（+0 cache）は出さず現状のまま。
+  const headIn = (hasCache && cachedN > 0)
+    ? `${esc(_fmtTokensCompact(actualIn))} in（+${esc(_fmtTokensCompact(cachedN))} cache）`
+    : `${esc(_fmtTokensCompact(inTotal))} in`;
+  const cachedDetail = hasCache
+    ? `（実入力 ${actualIn.toLocaleString()}・キャッシュ ${cachedN.toLocaleString()}）` : '';
   const reason = u.reasoning_output_tokens ? `（うち推論 ${(u.reasoning_output_tokens | 0).toLocaleString()}）` : '';
-  return `<details class="usage-meta"><summary>🪙 ${esc(inC)} in / ${esc(outC)} out</summary>`
-    + `<div class="usage-detail"><div>入力トークン: ${(u.input_tokens | 0).toLocaleString()} <span class="muted">${cached}</span></div>`
+  return `<details class="usage-meta"><summary>🪙 ${headIn} / ${esc(outC)} out</summary>`
+    + `<div class="usage-detail"><div>入力トークン: ${inTotal.toLocaleString()} <span class="muted">${cachedDetail}</span></div>`
     + `<div>出力トークン: ${(u.output_tokens | 0).toLocaleString()} <span class="muted">${reason}</span></div>`
+    + _usageBreakdownRowsHTML(u.codex_usage_breakdown)
     + '</div></details>';
+}
+// Codex 経路で下調べ役（spawn_agent）が動いたターンだけ `usage.codex_usage_breakdown`
+// （{parent, children, children_found, children_missing}・sherpa/providers/codex/provider.py）を持つ。
+// 本体/下調べ役の内訳を additive に出す。体数は「実際に起動した数」＝found+missing
+// （found は usage を読めた数だけなので、missing がある時に found だけを出すと動いた体数を
+// 過小に見せてしまう）。合計が0＝下調べ役なしのターンは何も出さない。
+function _usageBreakdownRowsHTML(breakdown) {
+  if (!breakdown || typeof breakdown !== 'object') return '';
+  const found = breakdown.children_found | 0;
+  const missing = breakdown.children_missing | 0;
+  const total = found + missing;
+  if (!total) return '';
+  const parent = breakdown.parent || {}, children = breakdown.children || {};
+  // 0 は「実入力＝総入力で情報が無い」ので出さない（見出しの（+0 cache）省略と同じ扱い）。
+  const cacheNote = (part) => {
+    const v = part && part.cached_input_tokens;
+    return (_hasCacheBreakdown(v) && (v | 0) > 0)
+      ? ` <span class="muted">（うちキャッシュ ${(v | 0).toLocaleString()}）</span>` : '';
+  };
+  const missingNote = missing > 0
+    ? ` <span class="muted">（${missing} 体は記録なし）</span>` : '';
+  return `<div>本体: 入力 ${(parent.input_tokens | 0).toLocaleString()}${cacheNote(parent)}`
+    + ` / 出力 ${(parent.output_tokens | 0).toLocaleString()}</div>`
+    + `<div>下調べ役 ${total} 体: 入力 ${(children.input_tokens | 0).toLocaleString()}${cacheNote(children)}`
+    + ` / 出力 ${(children.output_tokens | 0).toLocaleString()}${missingNote}</div>`;
 }
 // S4-e（複数プロファイル並用・UI表示・§6.3）: サブループ（下調べ等）のトークン使用量を
 // プロファイル別に additive 表示する。`answer.usage_subs`（複数・S4 プランナ実行時）と
@@ -939,8 +978,11 @@ function answerHTML(answer, trace, feedback) {
   // impact はグラフ由来（items/presumed）と反復ツール検索由来（citations）の2形がある。
   // グラフ結果が無い回答は QA と同じ引用表示へ落とす（本文だけで根拠が見えない状態を作らない）。
   const impactHasGraph = !!(answer.data && ((answer.data.items || []).length || (answer.data.presumed || []).length));
+  // troubleshoot も同型: グラフ不調で原因候補（candidates）が無い回答は qa 形の下地
+  // （citations）で返るため、QA と同じ引用表示へ落とす（該当箇所を消さない）。
+  const troubleHasCandidates = !!(answer.data && (answer.data.candidates || []).length);
   const body = (answer.lens === 'impact' && impactHasGraph) ? renderImpact(answer)
-    : answer.lens === 'troubleshoot' ? renderTrouble(answer) : renderQa(answer);
+    : (answer.lens === 'troubleshoot' && troubleHasCandidates) ? renderTrouble(answer) : renderQa(answer);
   // 検証バッジ（verification_method 別）は trace_version=2 の回答に限定する
   // （v1・version 欠落の回答は従来どおり EV-0 の根拠/参考2区分のみ＝byte-identical を保つ）。
   const evidencePacketForBadges = answer.trace_version === 2 ? (answer.data && answer.data.evidence_packet) : null;
@@ -977,7 +1019,7 @@ function _scopeChipsHTML(scope) {
 // 回答ヘッダへ1チップで示す。`scope.depth_profile` が無い（SC-6c 導入前の旧回答）ときは何も出さない
 // （`_scopeChipsHTML` の `scope.layer` 欠落時と同じ後方互換の作法）。`duration_ms`（LOG-1a）が
 // 無ければ調べる深さだけを出す。
-const DEPTH_CHIP_LABEL = { standard: '標準', deep: '深く', max: '最大' };
+const DEPTH_CHIP_LABEL = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
 function _fmtDurationJa(ms) {
   const totalSec = Math.round(ms / 1000);
   const m = Math.floor(totalSec / 60), s = totalSec % 60;

@@ -2,7 +2,7 @@
 // 背景実行の再購読）を chat.js から純移動。export は chat.js 側に残る呼び出し元（$('convlist')/
 // $('newbtn')/$('conv-title') の delegate リスナー・init の deep-link 分岐・window.__sherpaChatTest
 // シーム）から参照される loadConversations/deleteConversation/togglePin/renameConversation/
-// newConversation/openConversation/resumeRunningTurn のみに絞る（_ownConvHTML/_receivedConvHTML/
+// newConversation/openConversation/resumeRunningTurn/syncConvParam のみに絞る（_ownConvHTML/_receivedConvHTML/
 // unsubscribeTurn は loadConversations/newConversation/openConversation の内部専用のため非公開のまま）。
 // newConversation/openConversation は render/scope/stream の複数ドメインを跨ぐオーケストレータ＝
 // welcome/appendUser/appendAssistantRaw/appendAnswer/attachTraceButton/renderTurnStack は render.js
@@ -25,7 +25,7 @@ import {
   setSendButtonStopping, startFlow, subscribeTurn, resetFlow, _questionAnswerState, appendRestoredQuestion,
   invalidateStopContext, startThinkingTicker,
 } from './stream.js';
-import { renderScopePanel, setScopeLabel, applyConversationScope } from './scope.js';
+import { renderScopePanel, setScopeLabel, applyConversationScope, setKb } from './scope.js';
 import { resetInquiryForNewConversation, applyInquiryOpenDefault } from './inquiry.js';
 import { toast, updateShareButtonState } from '../chat.js';
 
@@ -88,9 +88,21 @@ function _ownConvHTML(c) {
    </div>`;
 }
 
+// 一覧の取得は重なり得る（初期表示・送信の受付・回答の終了）。成功した結果のうち、後から始めた取得のものだけを
+// 描く（遅れて届いた古い結果で、新しい会話を含む一覧を上書きしない）。取得に失敗したら今の一覧を残し、
+// まだ何も描いていないときだけ空の案内を出す（PG 未起動など・成功の世代は進めない）。
+let _convListGen = 0, _convListShown = 0;
 export async function loadConversations() {
-  let list = [];
-  try { list = await getJSON('/conversations'); } catch (e) { /* PG未起動なら空 */ }
+  const myGen = ++_convListGen;
+  let list = null;
+  try { list = await getJSON('/conversations'); } catch (e) { /* 下で扱う */ }
+  if (list === null) {
+    if (_convListShown || $('convlist').querySelector('.conv')) return;
+    list = [];
+  } else {
+    if (myGen < _convListShown) return;
+    _convListShown = myGen;
+  }
   // origin で分割: own / received_share
   const own = list.filter((c) => !c.origin || c.origin === 'own');
   const received = list.filter((c) => c.origin === 'received_share');
@@ -174,14 +186,33 @@ function unsubscribeTurn() {
   if (!S.es) return;
   S.es.close(); S.es = null;
 }
+// 開いている会話の番号をアドレス欄（?conv=）に出す（運用で活動記録を会話番号で引くため）。閲覧の可否は
+// サーバ側が本人の会話かを確かめる＝番号が見えても他人は開けない。戻る履歴は積まない（replaceState）。
+export function syncConvParam(cid) {
+  try {
+    const url = new URL(location.href);
+    if (cid) url.searchParams.set('conv', String(cid)); else url.searchParams.delete('conv');
+    if (url.href !== location.href) history.replaceState(history.state, '', url);
+  } catch (_) { /* アドレス欄の更新は補助＝失敗しても会話の表示は続ける */ }
+}
 export function newConversation() {
   unsubscribeTurn();
   S.cid = null; $('conv-title').textContent = '新しい会話';
+  syncConvParam(null);
   // SC-6e: 遅延中の /world-options 応答（chat.js の pendingConvWorld 後追い経路）が、後から
   // 届いたときに旧会話の範囲/調べ方/検索経路トグル等を新規会話へ誤って再適用しないよう、
   // ここで両方 null にする（後追い経路は S.pendingConvWorld が null なら何もしない）。
   S.pendingConvWorld = null; S.currentScopeMeta = null;
   S.scope = []; if (S.scopeTree) renderScopePanel(S.scopeTree); setScopeLabel('全体');   // 範囲を全体に戻す
+  // 資料参照は新規会話で既定ON（決定2026-09-19）に戻す——直前に開いていた会話が lens=chat
+  // （資料参照OFF）だった場合、`welcome()` 到達前の openConversation 復元（scope.js:61）が
+  // S.kb を false のまま残していたため、新規会話がその状態を引き継いでしまっていた。ただし
+  // 資料フォルダが1つも登録されていないと確定している環境（chat.js の /world-options 読込が
+  // 空で返り S.kbForcedOff=true になった場合）では無条件ONに戻すと素の雑談まで 404 になる
+  // （chat.js::setKb(false) 分岐と同じ判定）。`S.verLabels` の空チェックだと「まだ読込中／
+  // 読込失敗（未確認）」も「空で確定」と誤認して選択肢がある環境でも OFF になり得るため、
+  // 明示フラグ `S.kbForcedOff`（読込成功かつ空のときだけ true）だけを見る（RV是正）。
+  setKb(!S.kbForcedOff);
   resetInquiryForNewConversation();   // SC-6b: 調べ方/探す対象も自動・両方に戻し、ブロックを開く
   S.convHasPersonal = false; updateShareButtonState();   // Feature C: 新規会話は共有可能状態にリセット
   updateForkButtonState(null);   // SH-1: 新規会話は「引き継いで質問」対象外
@@ -222,6 +253,7 @@ export async function openConversation(cid) {
   const data = await getJSON(`/conversations/${cid}`);
   unsubscribeTurn();
   S.cid = cid; $('conv-title').textContent = data.conversation.title || '会話';
+  syncConvParam(cid);
   $('messages').innerHTML = '';
   // Feature C: 会話の contains_personal_workspace フラグを反映。
   S.convHasPersonal = !!(data.conversation && data.conversation.contains_personal_workspace);

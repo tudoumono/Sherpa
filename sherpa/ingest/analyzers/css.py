@@ -1,4 +1,4 @@
-"""CSS アナライザ（docs/proposals/2026-09-05-アナライザ拡張.md §13 波3 レーン A）。
+"""CSS アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §13 波3 レーン A）。
 
 `.css` を**全件受理**する。ファイル自体を主体定義（`Module`・primary・拡張子込みファイル名）とし、
 children は持たない。参照は `@import url("x.css")`／`@import "x.css"`（`url(...)` の引用符省略形

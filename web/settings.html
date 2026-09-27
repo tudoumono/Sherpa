@@ -90,19 +90,15 @@
          旧「サブエージェント・プロファイル」を1設定へ置き換えたもの。利用者ごとの設定。 -->
     <div class="card" id="search-helper-card" style="margin-top:16px">
       <div class="card-head">下調べ（資料の検索）に使う AI</div>
-      <div class="hint" style="margin-bottom:6px">資料をたくさん読む「下調べ」だけを安い AI に任せ、
-        <b>最終的な回答は上で選んだ AI が作ります</b>（費用の節約）。
-        資料調査は読む量が多く、費用の大半がここで発生します。
-        <b>「OpenAI」を選んでいるときだけ働きます</b>（Codex は自分で調べるため対象外）。</div>
+      <div class="hint" style="margin-bottom:6px">「チャットに使う AI」が OpenAI またはローカル（Ollama）のときに働きます。
+        最終的な回答は上で選んだ AI が作ります。ローカルを選んでいるときは「OpenAI の低コストモデル」の指定は使われず、選んだ AI 自身が調べます。</div>
       <label>使う AI</label>
       <select id="search_helper">
-        <option value="">使わない（上で選んだ AI が自分で調べる）</option>
+        <option value="">選んだ AI 自身が調べる（低コストモデルを使わない）</option>
         <option value="ollama">ローカル（Ollama）— 無料</option>
         <option value="openai">OpenAI の低コストモデル</option>
       </select>
-      <div class="hint">モデルは管理者が設定した既定を使います。うまく調べられなかった時は、
-        黙って他の方法に切り替えず、エラーとして知らせます。案内に従って設定を見直すか、
-        「使わない」に変更してください。</div>
+      <div class="hint">下調べ役のモデルは管理者が設定します。この選択を未設定（空）にすると、チャットに使う AI 自身が調べます。</div>
       <div class="hint danger" id="search-helper-legacy-note" hidden></div>
     </div>
 

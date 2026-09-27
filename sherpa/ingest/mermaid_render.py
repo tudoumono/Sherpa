@@ -1,6 +1,6 @@
 """図形＋コネクタ（Evidence IRの`connects_to`関係）からMermaid flowchartを組み立てる（L9・R3）。
 
-`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.4/§8.5の裁定に従い、外部ライブラリ
+`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.4/§8.5の裁定に従い、外部ライブラリ
 （excel2md等）へは依存しない自前実装。入力（要素集合＋`connects_to`/`overlaps`関係）が同じなら常に
 同じMarkdownテキストを返す純関数——LLMは使わず、推測（座標からのエッジ捏造等）もしない。
 

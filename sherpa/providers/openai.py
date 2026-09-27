@@ -124,7 +124,7 @@ class OpenAIProvider(_GenProvider):
             layer=(ctx.scope_meta or {}).get("layer"),
             max_turns=max_turns, max_hits=max_hits, window_cap=window_cap,
             system_settings=self._system_settings,
-            tools_pref=_tools_pref, tools_availability=ctx.tools_availability)
+            tools_pref=_tools_pref, tools_availability=ctx.tools_availability, uid=ctx.uid)
 
     def _stream(self, prompt: str, completion: _CompletionState | None = None) -> Iterator[str]:
         # temperature は送らない（gpt-5.5 系は既定値(1)以外を拒否し 400 になる・2026-08-15 実測）。
@@ -176,7 +176,14 @@ class OpenAIProvider(_GenProvider):
 
     def _attribute(self, text: str, digest: str, ev_map: dict, call_budget=None) -> set:
         from .. import agentic_search
-        return agentic_search.attribute_openai_style(
+        # 帰属呼び出し自体の usage を `self._last_usage` へ残す（`_stream` と同じ置き場——
+        # 呼び出し元が回収して `chat-review` へ記録する・`base.py::_log_chat_usage` docstring 参照）。
+        _usage = agentic_search._new_usage_acc()
+        ids = agentic_search.attribute_openai_style(
             llm.openai_url("chat/completions", system_settings=self._system_settings),
             llm.openai_headers(self._key, system_settings=self._system_settings), self.model, False,
-            text, digest, ev_map, self._timeout, call_budget=call_budget)
+            text, digest, ev_map, self._timeout, usage=_usage, call_budget=call_budget)
+        if agentic_search._usage_or_none(_usage):
+            self._last_usage = _usage_meta(self.provider_id, self.model, **_usage,
+                                           system_settings=self._system_settings)
+        return ids

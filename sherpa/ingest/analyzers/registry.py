@@ -41,7 +41,7 @@ from .xml_config import XmlConfigAnalyzer
 from .yaml_config import YamlConfigAnalyzer
 
 # 優先順＝この並び順（§7 裁定2）。JavaAnalyzer は拡張子 `.java` が他アナライザと衝突しない
-# ため末尾に追加（新言語1つでの手順検証・docs/proposals/2026-08-29-コード解析層のコンポーネント化.md §4.2）。
+# ため末尾に追加（新言語1つでの手順検証・docs/archive/2026-08-29-コード解析層のコンポーネント化.md §4.2）。
 # Properties/YamlConfig/XmlConfig（アナライザ拡張 S3b・A6/A7）・SqlDdlAnalyzer（S2・A1/A10）も
 # 拡張子が他アナライザと衝突しないため末尾に追加——新規アナライザの追加自体は `config_signature()`
 # の `_ANALYZERS` タプル材料が自動的に変わるため `CODE_ANALYZERS_SCHEMA_VERSION` の据え置きでよい

@@ -269,10 +269,17 @@ function _answerLines(ans, md) {
   const L = [(md ? '**回答（' : '回答（') + (LENS_FULL[ans.lens] || ans.lens || '未判定') + (md ? '）**' : '）'),   // lens が null（意図判定前のクラッシュ保存）でも null を文字列化しない
     (md ? '_範囲: ' : '範囲: ') + _scopeText(ans) + (md ? '_' : ''), ans.headline || ''];
   const d = ans.data || {};
+  // 画面（render.js の本文切り替え）と同じ条件で並べる: グラフ由来の結果を持たない impact／
+  // troubleshoot（グラフ不調で qa 相当の下地へ縮退したターン）は引用（該当箇所）を書き出す。
+  const impactHasGraph = !!((d.items || []).length || (d.presumed || []).length);
+  const troubleHasCandidates = !!(d.candidates || []).length;
+  const showCitations = (ans.lens === 'qa'
+    || (ans.lens === 'impact' && !impactHasGraph)
+    || (ans.lens === 'troubleshoot' && !troubleHasCandidates));
   if (ans.lens === 'impact') (d.items || []).forEach((it) => L.push(`${md ? '- ' : '・'}${it.category}｜${it.name}`));
   if (ans.lens === 'impact') (d.presumed || []).forEach((p) => L.push(`${md ? '- ' : '・'}推定｜${p.category}｜${p.name}`));
   if (ans.lens === 'troubleshoot') (d.candidates || []).slice(0, 8).forEach((c) => L.push(`${md ? '- ' : '・'}${c.name}（${c.role || ''}）`));
-  if (ans.lens === 'qa') (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
+  if (showCitations) (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
   if ((ans.sources || []).length) {
     // EV-0（拡張設計 §4.4）: sources_verified があれば書き出しも根拠/参考の2区分にする（render.js と同じ区分・除外はしない）。
     const verified = Array.isArray(ans.sources_verified) ? new Set(ans.sources_verified) : null;

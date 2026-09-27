@@ -1,6 +1,6 @@
 """`compare_documents`（GEN-DIFF）本体: 2文書の RAG 正本（`.rag.md`）を突き合わせる素朴な決定的 diff。
 
-正典: `docs/proposals/2026-09-03-世代間diff比較.md` §3〜§8。**方針（裁定）**: ツールは grep と同格の
+正典: `docs/archive/2026-09-03-世代間diff比較.md` §3〜§8。**方針（裁定）**: ツールは grep と同格の
 素朴な決定的ツール——レコード同定・業務キー対応付け・要約・ask_user 連携は行わない。曖昧な対応文書
 （§4）は候補一覧を返すだけで会話側（agentic loop の LLM）が確認する。
 
@@ -88,9 +88,12 @@ def _rag_md_path(world: str, doc_id: str) -> Path | None:
 
 def _doc_exists(doc_id: str, world: str) -> bool:
     """doc_id が world 内に文書として実在するか（`agentic_search.verify_doc_exists` と同じ2判定・
-    scope は呼び出し元＝`compare`/`_discover` が別途見る）。"""
+    scope は呼び出し元＝`compare`/`_discover` が別途見る）。`status_document_reachable` の `True`
+    確定だけを「実在する」に丸める（fail-closed）——判定不能（`None`）を実在扱いにしない。
+    `allow_content_sniff=True`：本関数は1 doc_id につき1回だけ呼ばれる（manifest 件数分の
+    ホットループではない）ため、軽量テキスト枠の第2段も内容を読んで判定する。"""
     try:
-        if corpus_docs.status_document_doctype(doc_id, world) is None:
+        if corpus_docs.status_document_reachable(doc_id, world, allow_content_sniff=True) is not True:
             return False
         return documents.resolve(doc_id, world) is not None
     except Exception:
@@ -247,8 +250,11 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     left_text, left_trunc = _read_capped(left_path, _RAG_MD_READ_CAP_BYTES)
     right_text, right_trunc = _read_capped(right_path, _RAG_MD_READ_CAP_BYTES)
     if left_text is None or right_text is None:
+        # `_open_doc_stream`/`_open_verified_original` と同じ固定理由コード——呼び出し元
+        # （`agentic_search._record_tool_result_error_code`）が名前非依存で拾い
+        # `InvestigationState.backend_failures["read_io"]` へ反映する。
         return {"status": "unsupported", "left_doc_id": left_doc_id, "right_doc_id": right_doc_id,
-                "reason": "RAG 正本の読み取りに失敗しました"}
+                "reason": "RAG 正本の読み取りに失敗しました", "error_code": "read_io_failed"}
 
     left_meta = _parse_header(left_text)
     right_meta = _parse_header(right_text)

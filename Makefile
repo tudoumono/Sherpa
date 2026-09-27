@@ -5,7 +5,7 @@
         graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
-        test-db-reset screenshots backup restore azure-smoke doctor \
+        test-db-reset screenshots backup restore usage-backfill turn-activity graph-chain azure-smoke doctor sandbox-check \
         gate-slice gate-merge gate-release gate-ci test-inventory test-durations
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
@@ -91,7 +91,7 @@ down:              ## ストア停止（OCR ワーカーも止める）
 ps:                ## 状態（OCR ワーカーを含む）
 	$(COMPOSE_ALL) ps
 
-logs:              ## 全ログを1画面で（アプリ+Docker+mem合流・ARGS で絞り込み: convert embed postgres 等。-r でレポート・-h でヘルプ）
+logs:              ## 全ログを1画面で（アプリ+Docker合流・ARGS で絞り込み: convert embed postgres 等。-m でメモリ行・-r でレポート・-h でヘルプ）
 	./scripts/logs.sh $(ARGS)
 
 bootstrap:         ## ローカル利用ディレクトリ作成＋.env 用意＋ストア待ち
@@ -234,11 +234,25 @@ restore:           ## バックアップから戻す（make restore FROM=data/ba
 	@test -n "$(FROM)" || { echo "使い方: make restore FROM=data/backups/<日時>"; exit 2; }
 	YES="$(YES)" ./scripts/restore.sh "$(FROM)"
 
+usage-backfill:    ## 既存のassistantメッセージをturn_metrics/turn_tool_statsへ一度だけ移す（冪等・複数回実行可）
+	./scripts/usage-backfill.sh
+
+turn-activity:     ## 1 つの会話の各ターンの活動記録（本体と下調べ役のトークン・往復・圧縮・ツール別の回数とバイト）を数字だけで表示（make turn-activity CONV=<会話番号>・本文は出さない）
+	@test -n "$${CONV:-}" || { echo "使い方: make turn-activity CONV=<会話番号>"; exit 2; }
+	./scripts/turn-activity.sh "$${CONV}"
+
+graph-chain:       ## 起点のファイルから呼び出し・コピー・DB アクセスを下り向きにたどり、届いたファイルと SQL の候補を表示（make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]・読み取り専用・本文は出さない）
+	@test -n "$${FROM:-}" || { echo "使い方: make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]"; exit 2; }
+	./scripts/graph-chain.sh --from "$${FROM}" $${WORLD:+--world "$${WORLD}"} $${DEPTH:+--depth "$${DEPTH}"}
+
 azure-smoke:        ## Azure OpenAI（等の OpenAI 互換接続先）への実疎通を確認（実 API 課金あり・確認プロンプト）。ARGS で --env-file/--dry-run 等を渡せる（例: ARGS="--env-file azure.env --yes"）
 	$(PY) scripts/azure_smoke.py $(ARGS)
 
 doctor:            ## 導入先の統合セットアップ検査（ストア疎通/ES版+kuromoji/設定/LLM最小プローブ/Codex経路・読み取り専用）。PROBE_CLOUD=1 で課金プロバイダの実接続も確認
 	PROBE_CLOUD="$(PROBE_CLOUD)" ./scripts/doctor.sh
+
+sandbox-check:     ## Codex のサンドボックス（bubblewrap）の前提を確認（Ubuntu 23.10+ の AppArmor ユーザー名前空間制限・root不要）。直すには sudo bash scripts/setup-codex-sandbox.sh apply
+	./scripts/setup-codex-sandbox.sh check
 
 diag:              ## 解析用のログ回収バンドルを作る（機密を含めない・dist/diag/）。ARGS で --days/--out 等を渡せる
 	./scripts/diag.sh $(ARGS)

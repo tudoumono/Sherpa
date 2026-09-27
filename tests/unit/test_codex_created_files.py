@@ -56,8 +56,17 @@ def test_agents_md_excluded_from_both_snapshots():
     before/after 両方のスキャンから除外しないと初回実行で成果物と誤認 → files/ へ move され
     （authoring から消える）→ 毎回 AGENTS_N.md が台帳に蓄積する。両側に除外があること。"""
     src = _src()
-    assert src.count('p.relative_to(run_dir) != Path("AGENTS.md")') == 2, \
-        "AGENTS.md の除外が before/after の両スキャンに入っていない"
+    assert src.count(
+        'p.relative_to(run_dir) not in (Path("AGENTS.md"), Path(_MCP_SIDECAR_NAME))') == 2, \
+        "AGENTS.md/.mcp_sidecar.jsonl の除外が before/after の両スキャンに入っていない"
+
+
+def test_mcp_sidecar_excluded_from_both_snapshots():
+    """DEPTH-2 S3b是正: `.mcp_sidecar.jsonl`（子エージェントの観測サイドカー）を成果物走査から
+    除外しないと、共有 KB だけを読む会話でも台帳登録・`codex_wrote_files` が立ち、個人由来扱いに
+    なって通常共有を阻害する（AGENTS.md と同じ除外リストで両スキャンとも対象外にする）。"""
+    src = _src()
+    assert "_MCP_SIDECAR_NAME" in src, "サイドカーのファイル名定数が使われていない"
 
 
 def test_download_endpoint_matches_url_format():

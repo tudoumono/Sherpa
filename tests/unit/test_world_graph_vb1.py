@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の VB アナライザ統合テスト（アナライザ拡張 波3 レーン C・
-docs/proposals/2026-09-05-アナライザ拡張.md §9・ユーザー裁定 2026-09-06）。
+docs/archive/2026-09-05-アナライザ拡張.md §9・ユーザー裁定 2026-09-06）。
 
 `VbAnalyzer` は `registry._ANALYZERS` に統合登録済み（波3 統合）のため、素の registry のまま
 `fixtures/corpus/vb1` を `build_world()` へ通す。

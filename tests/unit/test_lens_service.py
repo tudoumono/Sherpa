@@ -17,6 +17,7 @@ secRV 範囲外是正 追補（2026-07-19・RV指摘 HIGH-1）: 天井 break 後
 """
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
@@ -316,6 +317,103 @@ def test_neighbor_cards_agentic_path_preserves_cid(monkeypatch):
     assert cards and cards[0]["cid"] == "module:w1:a/b#TAXCALC"
 
 
+def test_neighbor_cards_graph_only_skips_grep_and_returns_graph_rows(monkeypatch):
+    """素の Codex モード専用 `neighbor_cards_graph_only`（§1.3・§4）は grep を一切しない
+    （呼ばれたら失敗する差し替え）——起点はグラフの名前一致（`_resolve_anchor_by_name`）で直接引き、
+    近傍は既存の `neo4j_related` をそのまま使う。返すカードは `source="graph"`・
+    `evidence.grep=[]`（grep 由来の証跡を持たない）。"""
+    import neo4j as neo4j_mod
+
+    from sherpa.ingest import world_neo4j
+
+    def _boom(*a, **k):
+        raise AssertionError("neighbor_cards_graph_only が grep_search を呼んでいる")
+
+    monkeypatch.setattr(ls, "grep_search", _boom)
+    fake = _FakeSession(rows=[_related_row("module:w1:a/b#TAXCALC", "TAXCALC")])
+
+    class _Sess:
+        def __enter__(self):
+            return fake
+
+        def __exit__(self, *a):
+            return False
+
+    class _Driver:
+        def session(self):
+            return _Sess()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(neo4j_mod.GraphDatabase, "driver", lambda uri, auth: _Driver())
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+
+    cards = ls.neighbor_cards_graph_only("w1", "TAXCALC")
+    assert cards == [{
+        "name": "TAXCALC", "label": "Module", "category": "ソース", "role": "実装",
+        "distance": 1, "path": ["ROOT", "TAXCALC"], "source": "graph",
+        "evidence": {"edges": [{"type": "USES", "doc": "a.md"}], "grep": []},
+        "cid": "module:w1:a/b#TAXCALC",
+    }]
+
+
+def test_neighbor_cards_recoverable_failure_returns_error_coded_empty_list(monkeypatch):
+    """`neighbor_cards` が接続系の例外（`DriverError`）を捕捉した場合、戻り値は空リストのままだが
+    `error_code`（"graph_unavailable"＝回復可能）を属性として持つ——`agentic_search.run_tool` の
+    `graph_neighbors` 分岐がこれを拾って `InvestigationState.backend_failures["graph"]` へ反映する
+    （戻り値の `list` 型自体は変えない・既存の全呼び出し元の fake が `list` を返すだけで良い契約を壊さない）。"""
+    import neo4j as neo4j_mod
+    from neo4j.exceptions import ServiceUnavailable
+
+    from sherpa.ingest import world_neo4j
+
+    class _Driver:
+        def session(self):
+            raise ServiceUnavailable("boom")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(neo4j_mod.GraphDatabase, "driver", lambda uri, auth: _Driver())
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+
+    cards = ls.neighbor_cards("w1", "TAXCALC の ABEND")
+    assert cards == []
+    assert getattr(cards, "error_code", None) == "graph_unavailable"
+
+
+def test_neighbor_cards_non_recoverable_failure_returns_error_coded_empty_list(monkeypatch):
+    """プログラムの欠陥を示す例外（`TypeError`）は回復不可＝`"graph_internal_error"`。"""
+    import neo4j as neo4j_mod
+
+    from sherpa.ingest import world_neo4j
+
+    monkeypatch.setattr(ls, "_troubleshoot_cards",
+                        lambda session, term, world, scope_paths=None: (_ for _ in ()).throw(TypeError("bug")))
+
+    class _Sess:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *a):
+            return False
+
+    class _Driver:
+        def session(self):
+            return _Sess()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(neo4j_mod.GraphDatabase, "driver", lambda uri, auth: _Driver())
+    monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
+
+    cards = ls.neighbor_cards("w1", "TAXCALC の ABEND")
+    assert cards == []
+    assert getattr(cards, "error_code", None) == "graph_internal_error"
+
+
 # ---- env 検証（_env_int・agentic_search と同一セマンティクス） --------------
 
 def test_env_int_falls_back_on_invalid_values(monkeypatch):
@@ -354,41 +452,50 @@ def test_module_defaults_are_clamped_into_range():
 # ---- SHERPA_TROUBLESHOOT_GRAPH_DEPTH ----
 # import 時に一度だけ確定する定数は実プロセスを新規に起こして検証する（`_fresh_import`）。
 
+def _troubleshoot_graph_depth_env_script() -> str:
+    return (
+        "import inspect, json\n"
+        "import sherpa.lens_service as m\n"
+        "print(json.dumps({\n"
+        "    'troubleshoot_graph_depth': m.TROUBLESHOOT_GRAPH_DEPTH,\n"
+        "    'neo4j_related_depth': inspect.signature(m.neo4j_related).parameters['depth'].default,\n"
+        "    'troubleshoot_cards_depth':"
+        " inspect.signature(m._troubleshoot_cards).parameters['depth'].default,\n"
+        "    'run_troubleshoot_depth': inspect.signature(m.run_troubleshoot).parameters['depth'].default,\n"
+        "}))\n"
+    )
+
+
 def test_troubleshoot_graph_depth_fresh_import_env_unset_is_default():
-    assert FI.fresh_import_attr("sherpa.lens_service", "TROUBLESHOOT_GRAPH_DEPTH",
-                                env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": None}) == 3
+    out = json.loads(FI.run_script(_troubleshoot_graph_depth_env_script(),
+                                   env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": None}))
+    assert out["troubleshoot_graph_depth"] == 3
 
 
 def test_troubleshoot_graph_depth_fresh_import_env_valid_value():
-    assert FI.fresh_import_attr("sherpa.lens_service", "TROUBLESHOOT_GRAPH_DEPTH",
-                                env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "5"}) == 5
+    """正しい値が反映されることに加え、`neo4j_related`/`_troubleshoot_cards`/`run_troubleshoot` の
+    `depth` 既定値が `TROUBLESHOOT_GRAPH_DEPTH` に揃っていること（既定値どうしが偶然一致するだけの
+    「旧リテラル `depth=3` への退行」を検出できない自己言及を避けるため、既定と異なる値で確認）も
+    同じ fresh import でまとめて確認する。"""
+    out = json.loads(FI.run_script(_troubleshoot_graph_depth_env_script(),
+                                   env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "5"}))
+    assert out["troubleshoot_graph_depth"] == 5
+    assert out["neo4j_related_depth"] == 5
+    assert out["troubleshoot_cards_depth"] == 5
+    assert out["run_troubleshoot_depth"] == 5
 
 
 def test_troubleshoot_graph_depth_fresh_import_env_invalid_falls_back_to_default():
     for bad in ("0", "17", "abc"):
-        assert FI.fresh_import_attr("sherpa.lens_service", "TROUBLESHOOT_GRAPH_DEPTH",
-                                    env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": bad}) == 3, bad
+        out = json.loads(FI.run_script(_troubleshoot_graph_depth_env_script(),
+                                       env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": bad}))
+        assert out["troubleshoot_graph_depth"] == 3, bad
 
 
 def test_troubleshoot_graph_depth_env_change_after_import_has_no_effect(monkeypatch):
     before = ls.TROUBLESHOOT_GRAPH_DEPTH
     monkeypatch.setenv("SHERPA_TROUBLESHOOT_GRAPH_DEPTH", "10")
     assert ls.TROUBLESHOOT_GRAPH_DEPTH == before == 3
-
-
-def test_troubleshoot_depth_default_params_are_troubleshoot_graph_depth():
-    """`neo4j_related`/`_troubleshoot_cards`/`run_troubleshoot` の `depth` 既定値は
-    `TROUBLESHOOT_GRAPH_DEPTH` に揃っている。
-
-    既定値と異なる env（7）で fresh import して確認する＝既定値どうしが偶然一致するだけの
-    「旧リテラル `depth=3` への退行」を検出できない自己言及を避ける。
-    """
-    env = {"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "7"}
-    assert FI.fresh_import_param_default("sherpa.lens_service", "neo4j_related", "depth", env=env) == 7
-    assert FI.fresh_import_param_default(
-        "sherpa.lens_service", "_troubleshoot_cards", "depth", env=env) == 7
-    assert FI.fresh_import_param_default(
-        "sherpa.lens_service", "run_troubleshoot", "depth", env=env) == 7
 
 
 # ===== run_qa の layer 転送（探す対象・調べ方ブロック §3.4） =====

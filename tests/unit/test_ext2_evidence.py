@@ -236,6 +236,24 @@ def test_verify_doc_exists_false_for_dotenv_and_key_files(monkeypatch, tmp_path)
     assert A.verify_doc_exists("note.md", "test-world") is True   # 対応する doctype があれば通る
 
 
+def test_verify_doc_exists_true_for_unregistered_ext_readable_text_false_for_binary(
+        monkeypatch, tmp_path):
+    """未登録拡張子（軽量テキスト枠の第2段）は、内容が実際にテキストと判定できれば
+    `verify_doc_exists` も True（`status_document_doctype(..., allow_content_sniff=True)`）——
+    grep/read_around では読めるのに出典/原本DLからだけ「存在しない」扱いになる非対称を解消する。
+    内容が実質バイナリなら第2段の内容判定を経ても doctype は付かず False のまま。"""
+    from sherpa import worlds
+    root = tmp_path / "world"
+    root.mkdir()
+    (root / "app.zzz").write_text("readable text\n", encoding="utf-8")
+    (root / "blob.bin").write_bytes(b"\x00\x01binary\xff\xfe" * 10)
+
+    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+
+    assert A.verify_doc_exists("app.zzz", "test-world") is True
+    assert A.verify_doc_exists("blob.bin", "test-world") is False
+
+
 def test_verify_doc_exists_false_when_outside_scope(monkeypatch, tmp_path):
     """`scope_paths` を渡した場合、doc_id がその範囲外なら実在しても False（多層防御・
     grep/es_search 自体が scope 内に絞って返す契約とは独立に、ここでも改めて確認する）。"""
@@ -335,6 +353,26 @@ def test_verified_sources_helper_filters_nonexistent_doc():
 
 def test_verified_sources_helper_returns_empty_when_make_sources_none():
     assert PB._verified_sources(None, {_REAL_DOC}, "v1") == ([], [])
+
+
+def test_verified_sources_includes_reachable_unregistered_ext_excludes_binary_and_sensitive(
+        monkeypatch, tmp_path):
+    """`_verified_sources`（出典フッターの DL リンク）は、未登録拡張子でも内容がテキストと
+    判定できる文書（grep/read_around で既に読める）を「存在しない」扱いで出典から除外しない
+    ——`verify_doc_exists` が軽量テキスト枠の第2段まで判定するようになったため。内容が実質
+    バイナリの未登録拡張子・秘匿ファイルは従来どおり除外される。"""
+    from sherpa import worlds
+    root = tmp_path / "world"
+    root.mkdir()
+    (root / "app.zzz").write_text("readable text\n", encoding="utf-8")
+    (root / "blob.bin").write_bytes(b"\x00\x01binary\xff\xfe" * 10)
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+
+    make_sources = lambda docs: [{"doc_id": d} for d in docs]   # noqa: E731
+    sources, ids = PB._verified_sources(make_sources, {"app.zzz", "blob.bin", ".env"}, "test-world")
+    assert ids == ["app.zzz"]
+    assert [s["doc_id"] for s in sources] == ["app.zzz"]
 
 
 # ==== _committed_evidence_doc_ids / _evidence_packet_evidence の used 判定（直接単体テスト）====
@@ -1065,7 +1103,7 @@ def test_empty_list_docs_alone_passes_evidence_gate_as_aggregate_evidence_main_p
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         env = next(e["env"] for e in events if e.get("type") == "_result")
-        assert env["headline"] == "0件でした。"
+        assert env["headline"].endswith("0件でした。")   # 冒頭に根拠不足の告知が付く（本文は不変）
         assert env["data"]["evidence_packet"]["investigation_status"] == "sufficient"
     finally:
         _restore_post(orig)
@@ -1098,7 +1136,7 @@ def test_empty_list_docs_alone_passes_evidence_gate_as_aggregate_evidence_sub_pa
         ctx = _ctx()
         events = list(p._agentic_run(ctx, {"lens": "qa", "input": ctx.message, "reason": "test"}))
         env = next(e["env"] for e in events if e.get("type") == "_result")
-        assert env["headline"] == "0件でした。"
+        assert env["headline"].endswith("0件でした。")   # 冒頭に根拠不足の告知が付く（本文は不変）
         assert env["data"]["evidence_packet"]["investigation_status"] == "sufficient"
     finally:
         _restore_post(orig)

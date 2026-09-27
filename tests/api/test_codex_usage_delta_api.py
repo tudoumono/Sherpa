@@ -1,6 +1,6 @@
 """Codex 累計 usage の会話単位の永続化（`store.get_codex_usage_total`）。
 
-`docs/proposals/2026-09-07-Codex途中経過で止まる.md` §3.5 の是正: resume ターンの `answer.usage` を
+`docs/archive/2026-09-07-Codex途中経過で止まる.md` §3.5 の是正: resume ターンの `answer.usage` を
 ターン差分にするため、`CodexProvider` は直近ターンの累計（`answer.codex_usage_total`）を次ターンへ
 持ち越す（`chat_service` が `Ctx.codex_usage_prev_total` として前渡しする）。
 `test_conversations_search.py`/`test_auth_sharing.py` と同じ流儀: store 層の関数を直接呼んでデータ

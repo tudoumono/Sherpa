@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from _test_users import register_test_uid
-from sherpa import agents, auth, store
+from sherpa import agents, auth, search_helper, store
 from sherpa.api import app
 
 
@@ -180,7 +180,9 @@ def test_legacy_db_values_and_feature_env_do_not_resurrect_sub_candidates(monkey
         assert provider._sub_candidates is None, (
             "レガシー値＋SHERPA_SUBAGENTS_ENABLED=1 でも _sub_candidates は None のまま"
             "（get_provider から subagent_profiles 配線が完全に消えている）")
-        assert provider._sub is None, "検索アシスタント未設定のまま _sub が解決されている"
+        assert provider._sub["profile_id"] == search_helper.SELF_PROFILE_ID, (
+            "検索アシスタント未設定のターンは頭脳自身が worker になる（レガシー値由来の "
+            f"worker が配線されている: {provider._sub.get('profile_id')}）")
     finally:
         _restore_system_settings(snapshot)
 
@@ -235,4 +237,6 @@ def test_flag_and_legacy_keys_together_do_not_wire_sub_candidates(monkeypatch):
     assert provider._sub_candidates is None, (
         "env フラグ＋system 設定＋user 設定を旧方式が活性化していた前提どおり揃えても "
         "_sub_candidates が配線された＝get_provider に旧配線が復活している")
-    assert provider._sub is None, "search_helper 未設定なのに _sub が解決されている"
+    assert provider._sub["profile_id"] == search_helper.SELF_PROFILE_ID, (
+        "search_helper 未設定のターンは頭脳自身が worker になる（旧 `sub_profile` 由来の "
+        f"worker が配線されている: {provider._sub.get('profile_id')}）")

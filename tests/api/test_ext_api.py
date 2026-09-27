@@ -1050,6 +1050,21 @@ def _mock_external_world(monkeypatch, root):
                         lambda w, **kw: worlds.ExternalWorldResolution("ok", root))
 
 
+def _mock_external_world_and_world_dir(monkeypatch, root):
+    """`_mock_external_world` に加え `worlds.world_dir` も同じ root へ差し替える。
+
+    `ext_doc` はファイル配信を `resolve_external_world`（外部API専用の world 解決）経由で行うが、
+    doctype 判定（`corpus_docs.status_document_doctype`）内部の内容読み取り
+    （`documents.resolve`→`worlds.world_dir`）は別経路——登録済みの実 world では両者が同じ
+    registry 行に解決されるため一致するが、`_mock_external_world` 単独では `world_dir` 側が
+    未登録のまま（内容判定が必要な拡張子だと read 失敗＝`unreadable` に丸められ、内容に関わらず
+    doctype が付いてしまう）。内容判定を伴うテスト（未登録拡張子の到達可能性）はこちらを使う。
+    """
+    from sherpa import worlds
+    _mock_external_world(monkeypatch, root)
+    monkeypatch.setattr(worlds, "world_dir", lambda w: root)
+
+
 def test_doc_rejects_symlink_in_path(tmp_path, monkeypatch):
     """world root 配下の中間要素が symlink だと、実ファイルが world 外にあっても 404
     （`safe_open.open_file_nofollow_walk` は中間ディレクトリも O_NOFOLLOW で辿る）。"""
@@ -1139,6 +1154,181 @@ def test_doc_rejects_importance_control_file(tmp_path, monkeypatch):
     key = _mk_doc_key(_sfx())
     r = _doc("docsafety", "_重要度.txt", api_key=key)
     assert r.status_code == 404, r.text
+
+
+def test_doc_downloads_unregistered_ext_readable_text(tmp_path, monkeypatch):
+    """未登録拡張子でも内容がテキストと判定できれば原本DLできる（軽量テキスト枠の第2段・
+    `status_document_doctype(..., allow_content_sniff=True)`）——grep/read_around で読める文書が
+    ダウンロードだけ 404 になる非対称を解消する。"""
+    if not _try_init():
+        pytest.skip("DB down")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    content = b"readable plain text content\n"
+    (root / "app.zzz").write_bytes(content)
+    _mock_external_world_and_world_dir(monkeypatch, root)
+
+    key = _mk_doc_key(_sfx())
+    r = _doc("docsafety", "app.zzz", api_key=key)
+    assert r.status_code == 200, r.text
+    assert r.content == content
+
+
+def test_doc_rejects_unregistered_ext_binary(tmp_path, monkeypatch):
+    """未登録拡張子で内容が実質バイナリ（NUL バイト支配的）なら、内容判定を有効にしても
+    doctype が付かない＝原本DLの対象外のまま 404（grep/精読/ES 索引からも対象外の文書と同じ扱い
+    ——`corpus_docs.scan_report` の `unreachable_as_text` に数えられる集合）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "blob.bin").write_bytes(b"\x00\x01\x02binary\xff\xfe" * 10)
+    _mock_external_world_and_world_dir(monkeypatch, root)
+
+    key = _mk_doc_key(_sfx())
+    r = _doc("docsafety", "blob.bin", api_key=key)
+    assert r.status_code == 404, r.text
+
+
+def test_doc_rejects_sensitive_unregistered_name(tmp_path, monkeypatch):
+    """秘匿名（`.env`）は内容判定を有効にしても対象外のまま 404（存在を漏らさない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    _mock_external_world_and_world_dir(monkeypatch, root)
+
+    key = _mk_doc_key(_sfx())
+    r = _doc("docsafety", ".env", api_key=key)
+    assert r.status_code == 404, r.text
+
+
+def test_doc_rejects_dot_segment_path_tricks_matching_content_check(tmp_path, monkeypatch):
+    """`./`・`.//`・`a/./b`・末尾 `/.`（生の `.` セグメント表現・URL エンコード `%2e` を含む）は、
+    配信側（`_doc_path_segments`）・内容判定側（`status_document_doctype`→`resolve_path`）の
+    どちらも同じ正規化（`world_graph.valid_rel_parts`）で拒否する——正規化規則が2箇所で
+    食い違うと、内容判定側は「読み取り不可」で通してしまうのに配信側だけが実ファイルを開いて
+    返してしまう（秘密鍵等の漏洩経路）。実ファイル（`.` トリックが無ければ普通に読める内容）で
+    再現する——モックで経路を差し替えると穴を再現できないため。秘密鍵の中身はアサーションに
+    出さない（ステータスコードだけを見る）。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    # PEM 秘密鍵ヘッダを持つファイル（拡張子トリック無しの直指定でも内容判定で対象外になる対照）。
+    (root / "blob.zzz").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\n" + "A" * 64 + "\n-----END RSA PRIVATE KEY-----\n",
+        encoding="utf-8")
+    (root / "sub").mkdir()
+    # トリック無しなら普通に読める（秘密鍵ではない）ファイル——`.` トリックがコンテンツではなく
+    # パス正規化自体で拒否されることを、こちらで独立に固定する。
+    (root / "sub" / "note.zzz").write_text("readable plain text\n", encoding="utf-8")
+    _mock_external_world_and_world_dir(monkeypatch, root)
+
+    key = _mk_doc_key(_sfx())
+    headers = {"X-API-Key": key}
+
+    for tricky in ("./blob.zzz", ".//blob.zzz", "sub/./note.zzz", "note.zzz/.", "sub/note.zzz/."):
+        r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": tricky}, headers=headers)
+        assert r.status_code == 404, tricky
+
+    # URL エンコード表現（`%2e`→`.`・`%2f`→`/`）が実際に HTTP 層でデコードされた後も拒否されること。
+    r = client.get("/ext/v1/doc?world=docsafety&path=%2eblob.zzz", headers=headers)
+    assert r.status_code == 404, r.text
+    r = client.get("/ext/v1/doc?world=docsafety&path=sub%2f%2enote.zzz", headers=headers)
+    assert r.status_code == 404, r.text
+
+    # トリック無しの正常なパスは従来どおり取得できる（回帰）。
+    r = _doc("docsafety", "sub/note.zzz", api_key=key)
+    assert r.status_code == 200, r.text
+    assert r.content == b"readable plain text\n"
+
+
+def _build_deep_tree_with_leaves(root, num_segments: int, seg_len: int, leaves: dict) -> dict:
+    """PATH_MAX を超える深いディレクトリ木を dir_fd 相対の syscall だけで構築し（累積パス文字列は
+    一度も作らない——配信側 `safe_open.open_file_nofollow_walk` が辿るのと同じ経路）、`leaves`
+    （{ファイル名: バイト列}）を最深ディレクトリへ書き込む。通常の `Path.mkdir(parents=True)`
+    （内部で累積パスを使う）ではこの深さを作れない（`os.lstat`/累積パスでの `os.mkdir` は
+    ENAMETOOLONG で失敗する）。戻り値は {ファイル名: world root からの相対 rel}。
+    """
+    segs = ["あ" * seg_len] * num_segments
+    dir_fd = os.open(str(root), os.O_DIRECTORY)
+    try:
+        for seg in segs:
+            try:
+                os.mkdir(seg, dir_fd=dir_fd)
+            except FileExistsError:
+                pass
+            new_fd = os.open(seg, os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = new_fd
+        for name, content in leaves.items():
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, dir_fd=dir_fd)
+            try:
+                os.write(fd, content)
+            finally:
+                os.close(fd)
+    finally:
+        os.close(dir_fd)
+    prefix = "/".join(segs)
+    return {name: f"{prefix}/{name}" for name in leaves}
+
+
+def test_doc_rejects_path_too_long_for_content_check_even_though_serving_would_succeed(
+        tmp_path, monkeypatch):
+    """内容判定（`status_document_reachable`→`world_graph.resolve_path`）は累積パス文字列を
+    `os.lstat` するため、パス全体が長すぎると（ENAMETOOLONG）判定不能（`None`）になる。一方
+    配信側（`safe_open.open_file_nofollow_walk`）は dir_fd 相対で1段ずつ open するため同じ
+    ファイルを問題なく開ける——判定不能を「対象外ではない」に丸めると、判定できなかった
+    ファイルがそのまま配信されてしまう（fail-open）。実ファイル（PEM 秘密鍵ヘッダを持つものと、
+    トリック無しなら普通に読めるテキストの両方・同じ長さ）で固定する——「判定できない以上、
+    内容に関わらず拒否する」ことを見るため。秘密鍵の中身はアサーションに出さない
+    （ステータスコードだけを見る）。
+    """
+    if not _try_init():
+        pytest.skip("DB down")
+
+    root = tmp_path / "root"
+    root.mkdir()
+    leaves = _build_deep_tree_with_leaves(root, 18, 80, {
+        "secret.zzz": b"-----BEGIN RSA PRIVATE KEY-----\n" + b"A" * 64
+                     + b"\n-----END RSA PRIVATE KEY-----\n",
+        "plain.zzz": b"readable plain text\n",
+    })
+    full_path = root.joinpath(*(["あ" * 80] * 18), "secret.zzz")
+    try:
+        full_path.stat()
+        pytest.fail("累積パスの stat が成功した＝この環境では ENAMETOOLONG を再現できない")
+    except OSError as e:
+        import errno
+        assert e.errno == errno.ENAMETOOLONG, f"想定外の errno（この環境の PATH_MAX 設定を確認）: {e}"
+
+    _mock_external_world_and_world_dir(monkeypatch, root)
+    key = _mk_doc_key(_sfx())
+    headers = {"X-API-Key": key}
+
+    for rel in leaves.values():
+        r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": rel}, headers=headers)
+        assert r.status_code == 404, rel
+
+    # 通常の長さの正常ファイルは従来どおり取得できる（回帰）。
+    (root / "normal.zzz").write_bytes(b"ok\n")
+    r = client.get("/ext/v1/doc", params={"world": "docsafety", "path": "normal.zzz"}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.content == b"ok\n"
+
+    # `verify_doc_exists` 側にも同じ fail-closed 原則が効くこと（`worlds.world_dir` は
+    # `_mock_external_world_and_world_dir` が既に同じ root へ向けている）。
+    from sherpa import agentic_search
+    for rel in leaves.values():
+        assert agentic_search.verify_doc_exists(rel, "docsafety") is False, rel
+    assert agentic_search.verify_doc_exists("normal.zzz", "docsafety") is True
 
 
 def test_doc_rejects_ooxml_content_types_missing(tmp_path, monkeypatch):

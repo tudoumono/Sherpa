@@ -1,6 +1,6 @@
 """非agentic の ES 補完（`search_service`/`chat_service`）向けの親返し（P3/P2/chunk 縮退）。
 
-正典: `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.3/§3.4（agentic の
+正典: `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.3/§3.4（agentic の
 `agentic_search._resolve_parent_return` と同じ設計・§3.4「適用範囲」を非agentic 側へ拡張＝CITE-1）。
 検索（BM25/kNN のヒット選定）自体は変えない——ここは「ヒットを doc_id で束ねて、返す本文を
 P3（全文）/P2（領域）/chunk（子チャンクのみ）へ振り分ける」返却直前の後処理のみ。

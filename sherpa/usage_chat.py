@@ -8,7 +8,7 @@
 改善ログ側は質問/一言コメントを👎が付いたものだけ先頭100字に切り詰めて含むことがある
 （`improvement_log.compact_summary` 参照・会話全文やタイトルを丸ごと渡すことはない）。
 
-docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 上記の一括コンテキストに加え、
+docs/archive/2026-09-12-利用統計の拡充2.md §3b: 上記の一括コンテキストに加え、
 `graph_admin.ask_graph` と同じ調査ループ（`agentic_search.openai_style`）へ専用 toolset
 （`agentic_search.usage_openai_tools()`・7つの `usage_*` 関数）を渡し、渡した統計データだけでは
 答えられない切り口（任意の期間・特定利用者の用途別内訳・特定会話の内訳・回答時間の分布）を
@@ -182,7 +182,7 @@ def _stats_projection(stats: dict, *, limit_users: int, limit_tok_users: int, li
     `by_user` より多くなりうるが専用の上限は設けない）。`response_time`（全体＋経路別の
     avg/median/p90/max・件数）は本文/タイトルを含まない集計のみなのでそのまま含める。
 
-    `conversations_top`（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）も
+    `conversations_top`（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）も
     `limit_tok_users` を流用して間引き（`usage_stats` 側で既に上位20件へ切り詰め済み・ここでは
     文脈サイズが超過した場合の追加間引き）、`kinds` は `kind`/`calls`/`input`/`output` だけの
     要約にする（`cached_input`/`reasoning_output`/`elapsed_ms_*` は本用途（誰のどの会話が重いか）
@@ -662,7 +662,7 @@ def answer_usage_question(question: str, history: list[dict], *, system_settings
     実送信は `agentic_search.openai_style`（graph_admin と同じ調査ループ）に委譲する——
     以前の「統計データを1回だけプロンプトに入れて JSON で答えさせる」一発回答から、
     渡された統計データに加えて調査ツール（usage_* の7つ）を反復呼び出しできる形に変わった
-    （`docs/proposals/2026-09-12-利用統計の拡充2.md` §3b）。history の扱い・プロンプト予算調整
+    （`docs/archive/2026-09-12-利用統計の拡充2.md` §3b）。history の扱い・プロンプト予算調整
     （`_fit_history_to_prompt_budget`）・統計データ/改善ログ要約の埋め込みは変えていない
     （変わったのは「1回の完了で答えさせる」→「ツール反復ループで答えさせる」という送信方式のみ）。
     """

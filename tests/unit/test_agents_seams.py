@@ -115,7 +115,7 @@ def test_gather_seam_intercepted_by_gen_provider(monkeypatch):
         "（base.py がローカル束縛化した可能性＝facade 実行時解決の退行）"
     )
     result = next(e for e in events if isinstance(e, dict) and e.get("type") == "_result")
-    assert result["env"]["headline"] == "stub-answer"   # _stream スタブの回答が env に反映される
+    assert result["env"]["headline"].endswith("stub-answer")   # _stream スタブの回答が env に反映される
     assert result["decision"]["lens"] == "qa"
 
 

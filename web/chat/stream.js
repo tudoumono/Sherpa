@@ -27,9 +27,9 @@ import {
   ensureAnswerCard, finalizeAnswer, clearReveal, reveal,
   TraceTreeV2, deriveTraceStopReason, stopReasonInfo, stopReasonCategoryFromError,
 } from './render.js';
-import { loadConversations } from './history.js';
+import { loadConversations, syncConvParam } from './history.js';
 import { updateScopeHeader } from './scope.js';
-import { setInquiryOpen, toolsForSend } from './inquiry.js';
+import { setInquiryOpen, toolsForSend, toolsExplicitForSend } from './inquiry.js';
 import { updateShareButtonState } from '../chat.js';
 
 const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime;   // 共通ユーティリティ（common.js）
@@ -330,6 +330,11 @@ export function sendOrStop() {
 export function invalidateStopContext() {
   turnGen++;
 }
+// 今の世代（送信・新しいチャット・会話の切替で進む）。遅れて届いた結果が、まだ画面の持ち主かを
+// 呼び出し元が確かめるために使う（chat.js の初回表示の ?conv= が開けなかった場合）。
+export function currentTurnGen() {
+  return turnGen;
+}
 async function stopStream() {
   if (!S.es) return;
   const myGen = turnGen;   // 停止対象のターン世代を捕捉
@@ -512,6 +517,11 @@ export async function send(override) {
     if (tools) {
       const sendTools = toolsForSend(tools, isOverride ? { grep: true, fulltext: true, graph: true } : undefined);
       if (Object.keys(sendTools).length) body.tools = sendTools;
+      // 会話メタへ保存する明示状態は**実際の操作履歴だけ**（`S.toolsExplicit`）——override の
+      // 全軸 true はこの送信1回限りの解決済みの値で、保存すると以後その会話は触っていない軸まで
+      // 明示扱いになり、その軸が不達のとき 422 になってしまう。
+      const sendExplicit = toolsExplicitForSend(S.toolsExplicit);
+      if (sendExplicit.length) body.tools_explicit = sendExplicit;
     }
   }
   // 開始 POST を投げる前に世代を進める（購読確立＝subscribeTurn 呼び出しまで待つと、直前の
@@ -555,6 +565,8 @@ export async function send(override) {
   // （再び開くのはヘッダ #inquiry-head またはチップ #inquiry-chip）。
   setInquiryOpen(false);
   S.cid = started.conversation_id;
+  syncConvParam(S.cid);
   S.turnId = started.turn_id;
   subscribeTurn(thinking);
+  loadConversations();   // 受け付けた時点で履歴に出す（新しい会話は開始 POST で作られ、題名は質問の先頭）
 }

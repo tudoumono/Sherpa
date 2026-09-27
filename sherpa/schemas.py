@@ -208,8 +208,9 @@ class SettingsResponse(BaseModel):
     # （openai_only / ollama_only / codex_openai / codex_ollama）。`constructs_available` は
     # この環境で選べるものだけ（env `SHERPA_EXTRA_AGENTS` で追加AIを有効化したら増える）。
     codex_model_provider: str
-    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べだけを安いモデルへ任せる
-    # 利用者ごとの設定（''＝使わない／'ollama'／'openai'）。モデル名は管理者のカタログ既定に従う。
+    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べ（worker）だけを安いモデルへ任せる
+    # 利用者ごとの設定（''＝安いモデルを使わず頭脳自身が worker／'ollama'／'openai'）。
+    # モデル名は管理者のカタログ既定に従う。
     search_helper: str
     # 旧・個人上書き時代のモデル指定（読み取り専用・注記表示のみ）。
     search_helper_model: str
@@ -446,8 +447,12 @@ class WebhookAllowlistInfo(BaseModel):
 
 
 class CodexSessionRetentionInfo(BaseModel):
+    """`configured` は管理者が実際に保存した生値（未設定なら `None`）、`effective` は
+    未設定時のフォールバックを含む実効値、`default` は未設定時に使われる既定日数
+    （初期構成の既定＝30日・決定2026-09-19。`0` は明示設定時のみ「無制限」として扱う）。"""
     configured: int | None
     effective: int
+    default: int
 
 
 class ChatExamplesAdminInfo(BaseModel):
@@ -506,10 +511,32 @@ class DepthProfileCodexReasoningInfo(BaseModel):
     options: list[str]
 
 
+class CodexWorkerModelInfo(BaseModel):
+    """multi_agent（`[agents.worker]`）の worker モデル（実装ベース探索の回復 S1・案 B）。
+    `configured` は管理者が保存した生値（未設定なら `None`）、`effective` は
+    `sherpa.providers.codex.sandbox._codex_worker_model` の解決結果、`default` は
+    フォールバック定数（`_CODEX_WORKER_MODEL_FALLBACK`）。"""
+    configured: str | None
+    effective: str
+    default: str
+
+
+class CodexModeInfo(BaseModel):
+    """`codex_mode`（素の Codex モード・docs/archive/2026-09-24-素のCodexモード.md §1.1）。
+    `configured` は管理者が保存した生値（未設定なら `None`）、`effective` は
+    `sherpa.providers.codex.sandbox.codex_mode` の解決結果、`default` は "standard"、`options` は
+    選べる値（`sherpa.providers.codex.sandbox.CODEX_MODES`）。"""
+    configured: str | None
+    effective: str
+    default: str
+    options: list[str]
+
+
 class DepthProfileAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `depth_profile`（SC-6c・`sherpa/depth_profile.py`・
-    system_extras.py::_admin_settings_view）。調べる深さ（標準/深く/最大）が掛ける倍率の
-    **基準値**（標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。"""
+    system_extras.py::_admin_settings_view）。調べる深さ（クイック/標準/深く/最大）が掛ける倍率の
+    **基準値**（クイック・標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。
+    `codex_reasoning` は深さで変わらない（どの深さでもこの基準値がそのまま使われる）。"""
     max_turns: DepthProfileBaseInfo
     grep_max_hits: DepthProfileBaseInfo
     qa_max_hits: DepthProfileBaseInfo
@@ -529,37 +556,15 @@ class ChatMaxTurnsAdminInfo(BaseModel):
     global_: DepthProfileBaseInfo = Field(alias="global")
 
 
-class ModelWindowResolutionInfo(BaseModel):
-    """`agentic_budget.window`（BUDGET-2・§3.4・`sherpa/model_windows.py::resolve_window_tokens`・
-    system_extras.py::_current_chat_provider_model）。現在のモデル（システム既定のチャット/
-    エージェント頭脳）の窓の4段解決結果。`provider`/`model` は解決できないときは空文字。
-    `window_tokens`/`derived_cap_bytes` は `source="unknown"`（登録値/API/シードのどれにも
-    無い）のときのみ null——このとき管理画面は「窓が未登録です」の平文案内＋登録欄を出す。"""
-    provider: str
-    model: str
-    window_tokens: int | None
-    source: str
-    derived_cap_bytes: int | None
-
-
-class ModelWindowsRegisteredInfo(BaseModel):
-    """`agentic_budget.model_windows`（BUDGET-2・§3.4）。モデル名→窓 tokens の管理者登録表
-    （"provider:model" キー・追加/上書き/削除は PUT `model_context_windows`）。`configured` は
-    生値そのもの（未設定なら null）。"""
-    configured: dict[str, int] | None
-
-
 class AgenticBudgetAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `agentic_budget`（`sherpa/agentic_search.py::
     resolve_tool_result_budgets`・system_extras.py::_admin_settings_view）。agentic search の
     tool-result バイト予算（1件あたり／1 run 累計）——`DepthProfileBaseInfo` と同型
-    （configured=管理者の生値・effective=system_settings→env→コード既定→窓由来上限との
-    min() の解決結果・default=env/コード既定＝未設定に戻したときの実効値・窓連動を含まない）。
-    `window`/`model_windows` は窓のヒント表示＋管理者登録表。"""
+    （configured=管理者の生値・effective=system_settings→コード既定の解決結果・default=コード既定
+    ＝未設定に戻したときの実効値）。モデルの窓由来の上限との min()（旧 BUDGET-2・管理画面の
+    モデル窓登録表）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）。"""
     per_result: DepthProfileBaseInfo
     total: DepthProfileBaseInfo
-    window: ModelWindowResolutionInfo
-    model_windows: ModelWindowsRegisteredInfo
 
 
 class AdminSettingsView(BaseModel):
@@ -591,6 +596,14 @@ class AdminSettingsView(BaseModel):
     # 埋め込み HTTP の同時送信数（`embeddings.effective_embed_parallel`）。
     # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=EMBED_PARALLEL_DEFAULT）。
     embed_parallel: DepthProfileBaseInfo
+    # 「最大」の深さが許す査読の巡数（`depth_profile.effective_max_review_rounds`）。
+    # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=MAX_REVIEW_ROUNDS_DEFAULT）。
+    max_review_rounds: DepthProfileBaseInfo
+    # multi_agent（S6）の worker モデル（`sandbox._codex_worker_model`）。env フォールバックは
+    # 持たない（default=`_CODEX_WORKER_MODEL_FALLBACK`）。
+    codex_worker_model: CodexWorkerModelInfo
+    # 素の Codex モード（`sandbox.codex_mode`）。env フォールバックは持たない（default="standard"）。
+    codex_mode: CodexModeInfo
     chat_examples: ChatExamplesAdminInfo
 
 
@@ -885,12 +898,16 @@ class UsageConversationTurns(BaseModel):
     """会話あたりの user ターン数分布。
 
     値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に
-    user ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ全て None。
+    user ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ分布は None。
+    session_eligible は期間内2ターン以上の会話数、session_recorded はそのうち現在CodexセッションIDを
+    持つ会話数（どちらも対象がなければ0）。再開実行・成功の件数ではない。
     """
     avg: float | None
     median: float | None
     max: int | None
     p90: float | None
+    session_eligible: int
+    session_recorded: int
 
 
 class UsageResponseTimeRow(BaseModel):
@@ -934,7 +951,7 @@ class UsageConversationKindRow(BaseModel):
 
 
 class UsageConversationRow(BaseModel):
-    """会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。
+    """会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。
 
     トークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で
     切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。
@@ -955,21 +972,34 @@ class UsageLimitsByProviderRow(BaseModel):
     変えない計測専用）。
 
     `turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系
-    キーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。旧行
-    （`answer.limits` キー自体が無い）は全項目0として母数（`turns`）にだけ数える。
+    キーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。経路で記録しない
+    項目は None。計測項目は発生0件でも0を返す。
     """
     provider: str
     turns: int
-    tool_result_clipped_turns: int
-    tool_result_clipped_total: int
-    total_budget_hit_turns: int
-    context_compactions_turns: int
-    context_compactions_total: int
-    synthesis_truncated_turns: int
-    search_truncated_turns: int
-    search_truncated_total: int
-    auto_continues_turns: int
-    auto_continues_total: int
+    tool_result_clipped_turns: int | None
+    tool_result_clipped_total: int | None
+    total_budget_hit_turns: int | None
+    context_compactions_turns: int | None
+    context_compactions_total: int | None
+    synthesis_truncated_turns: int | None
+    # 必要な根拠種別が揃わず深さを1段だけ自動で引き上げたターン数（`providers/base.py` の
+    # 巡ループが `limits.depth_escalated` を立てる）。
+    depth_escalated_turns: int | None
+    search_truncated_turns: int | None
+    search_truncated_total: int | None
+    auto_continues_turns: int | None
+    auto_continues_total: int | None
+    # 同一条件のツール呼び出しを2回目以降省略した回数（Codex 経路のみ・`mcp_server.py::
+    # _is_duplicate_tool_call`）。
+    duplicate_tool_call_turns: int | None
+    duplicate_tool_call_total: int | None
+    # 縮退（バックエンド不調）の計数——意味論は「このターンで初めて検出されたか」＝初回検出の計数。
+    backend_unavailable_fulltext_turns: int | None
+    backend_unavailable_graph_turns: int | None
+    graph_reingest_required_turns: int | None
+    # MCP ツール呼び出し回数の上限に到達したターン数（Codex 経路のみ・`mcp_server.py`）。
+    tool_calls_exhausted_turns: int | None
 
 
 class UsageLimits(BaseModel):
@@ -1065,7 +1095,7 @@ class UsageQualityRunRow(BaseModel):
     採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。
 
     `condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは
-    見直しを回さない条件同士（main と depth2-standard・どちらも `rounds=0`）が混ざるため、
+    見直しを回さない条件同士（main と depth2-quick・どちらも `rounds=0`）が混ざるため、
     集計はこの条件別に分ける。"""
     condition: str | None
     rounds: int
@@ -1087,7 +1117,7 @@ class AdminUsageQualityRunReq(BaseModel):
     """POST /admin/usage/quality-runs 入力（品質採点の入口）。
 
     採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。
-    `rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-standard` を登録できる）。
+    `rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-quick` を登録できる）。
     `condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。
     `executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・
     半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で
@@ -1102,7 +1132,7 @@ class AdminUsageQualityRunReq(BaseModel):
     `run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない
     （`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。"""
     rounds: StrictInt = Field(ge=0)
-    condition: Literal["main", "depth2-standard", "depth2-deep", "depth2-max"]
+    condition: Literal["main", "depth2-quick", "depth2-standard", "depth2-deep", "depth2-max"]
     executed_from: StrictStr = Field(min_length=1, max_length=64)
     executed_to: StrictStr = Field(min_length=1, max_length=64)
     correct: StrictInt = Field(default=0, ge=0)
@@ -1360,6 +1390,11 @@ class IngestSummaryFields(BaseModel):
     `last_run_flags_total`＝打切り前の flags 総数・`last_run_flags_truncated`＝打切りが発生したか。
     `last_run_id`／`running_progress`（ING-3）＝最新 run の id と実行中進捗（実行中でなければ
     `running_progress` は `None`）。
+    `sensitive_excluded`／`unreachable_as_text`／`unreachable_as_text_by_ext`も
+    `scanned`〜`unreadable` と同じキャッシュ由来——無変更の再同期（`ingest.worker._sync_impl` の
+    unchanged 経路）は最新 run の `extraction_snapshot` を書き換えるだけで `scan_report` を再実行
+    しないため、画面はこのキャッシュ（run に紐付かない世界単位の値）を見て初めて無変更後も
+    表示が消えない。
     """
     scanned: int
     indexed: int
@@ -1372,6 +1407,9 @@ class IngestSummaryFields(BaseModel):
     analyzer_declined: int
     analyzer_declined_as_document: int
     unreadable: int
+    sensitive_excluded: int
+    unreachable_as_text: int
+    unreachable_as_text_by_ext: dict[str, int]
     counts_as_of: str | None
     graph_nodes: int
     graph_edges: int

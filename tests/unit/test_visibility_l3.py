@@ -1,4 +1,4 @@
-"""可視性・廃止表現の全形式展開（L3・docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md §2）の単体テスト。
+"""可視性・廃止表現の全形式展開（L3・docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md §2）の単体テスト。
 
 対象: `evidence_spike.py`（xlsx の図形/画像による覆い判定・pptx の既存判定の Evidence IR への移送）、
 `ooxml/excel.py::strike_cells`／`ooxml/word.py::strike_runs`（取り消し線・D-1）、

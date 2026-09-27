@@ -29,7 +29,7 @@ const PROVIDER_COLOR = {
   bedrock: 'var(--danger)', ollama: 'var(--accent-ink)', unknown: 'var(--border)',
 };
 
-// （docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: ターンの終了理由（`sherpa/stop_kind.py` の
+// （docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: ターンの終了理由（`sherpa/stop_kind.py` の
 // 閉じた8値＋'unknown'）の平文ラベル。未知の値は生の値をそのまま表示する（fail-safe・KIND_LABEL と同じ流儀）。
 const STOP_KIND_LABEL = {
   completed: '完了', stopped_by_user: '利用者が停止', budget: '調査の上限', no_evidence: '根拠不足',
@@ -40,7 +40,55 @@ const STOP_KIND_ORDER = ['completed', 'stopped_by_user', 'budget', 'no_evidence'
   'transport_error', 'timeout', 'codex_silent', 'codex_partial', 'unknown'];
 function stopKindLabel(k) { return STOP_KIND_LABEL[k] || k; }
 
-let _days = 30;
+let _stats = null;
+let _loadedAt = null;
+const USAGE_TABS = ['overview', 'users', 'quality', 'tokens', 'ask'];
+function usageView() {
+  const [tab, query] = location.hash.slice(1).split('?');
+  const days = Number(new URLSearchParams(query).get('days'));
+  return { tab: USAGE_TABS.includes(tab) ? tab : 'overview', days: [7, 30, 90].includes(days) ? days : 30 };
+}
+let _days = usageView().days;
+function showUsageTab(tab) {
+  const standalone = $('usage-standalone');
+  standalone.hidden = !new URLSearchParams(location.search).has('embed');
+  standalone.href = `usage.html#${tab}?days=${_days}`;
+  document.querySelectorAll('[data-usage-panel]').forEach((el) => { el.hidden = el.dataset.usagePanel !== tab; });
+  document.querySelectorAll('[data-usage-tab]').forEach((el) => {
+    const selected = el.dataset.usageTab === tab;
+    el.setAttribute('aria-selected', String(selected));
+    el.tabIndex = selected ? 0 : -1;
+  });
+  document.querySelectorAll('[data-usage-link]').forEach((el) => {
+    el.href = `#${el.dataset.usageLink}?days=${_days}`;
+  });
+}
+function navigateUsage(tab, days = _days) {
+  location.hash = `${tab}?days=${days}`;
+}
+document.querySelectorAll('[data-usage-tab]').forEach((btn) => {
+  btn.addEventListener('click', () => navigateUsage(btn.dataset.usageTab));
+  btn.addEventListener('keydown', (event) => {
+    const index = USAGE_TABS.indexOf(btn.dataset.usageTab);
+    let next;
+    if (event.key === 'ArrowRight') next = (index + 1) % USAGE_TABS.length;
+    else if (event.key === 'ArrowLeft') next = (index + USAGE_TABS.length - 1) % USAGE_TABS.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = USAGE_TABS.length - 1;
+    else return;
+    event.preventDefault();
+    document.querySelector(`[data-usage-tab="${USAGE_TABS[next]}"]`).focus();
+    navigateUsage(USAGE_TABS[next]);
+  });
+});
+let _adminReady = false;
+window.addEventListener('hashchange', () => {
+  const view = usageView();
+  if (_adminReady && view.days !== _days) load(view.days);
+  showUsageTab(view.tab);
+});
+showUsageTab(usageView().tab);
+
 let _sortKey = 'turns';
 let _sortDir = 'desc';
 let _users = [];
@@ -68,9 +116,9 @@ function fmtDate(iso) {
 
 // ===== 描画 =====
 function renderSummary(totals) {
-  $('t-active').textContent = (totals.active_users || 0).toLocaleString('ja-JP');
-  $('t-turns').textContent = (totals.turns || 0).toLocaleString('ja-JP');
-  $('t-conversations').textContent = (totals.conversations || 0).toLocaleString('ja-JP');
+  $('t-active').textContent = fmtTokOrDash(totals.active_users);
+  $('t-turns').textContent = fmtTokOrDash(totals.turns);
+  $('t-conversations').textContent = fmtTokOrDash(totals.conversations);
 }
 
 function lensBarHTML(lens) {
@@ -265,8 +313,9 @@ function renderCharts(daily, period) {
 // 週次アクティブ・DL日別は既存 renderTrendChart（1系列の折れ線）をそのまま再利用する。
 
 function renderZeroHitTile(zeroHit) {
-  const rate = zeroHit && zeroHit.rate;
-  $('t-zerohit').textContent = (rate === null || rate === undefined) ? '—' : `${Math.round(rate * 100)}%`;
+  const rate = zeroHit?.rate;
+  $('t-zerohit').textContent = zeroHit?.knowledge_turns === 0 ? '対象なし' : fmtPctOrDash(rate);
+  $('zero-hit-counts').textContent = `出典なし ${fmtTokOrDash(zeroHit?.zero_hit_turns)}件 / 社内資料参照の回答 ${fmtTokOrDash(zeroHit?.knowledge_turns)}件。出典の有無は回答の正しさを示しません。`;
 }
 
 const DAY_LABELS_JST = ['日', '月', '火', '水', '木', '金', '土'];   // Postgres DOW: 0=日〜6=土
@@ -466,22 +515,25 @@ function renderStopKinds(stopKinds, stoppedTurns) {
   });
   renderBarChart($('chart-stopkind-svg'), $('chart-stopkind-empty'), $('chart-stopkind-tip'),
     $('chart-stopkind-wrap'), items, { unit: '件', title: 'ターンの終了理由' });
-  $('stopkind-total-badge').textContent = `利用者停止 ${(stoppedTurns || 0).toLocaleString('ja-JP')}件`;
+  $('stopkind-total-badge').textContent = `利用者停止 ${fmtTokOrDash(stoppedTurns)}${stoppedTurns == null ? '' : '件'}`;
 }
 
-// ミリ秒を秒表記へ（null は「—」）。回答時間・所要時間の各テーブル/カードで共用。
+// ミリ秒を秒表記へ（null は未計測・欠落は未取得）。回答時間・所要時間の各テーブル/カードで共用。
 function fmtSecOrDash(ms) {
-  if (ms === null || ms === undefined) return '—';
+  if (ms === undefined) return '未取得';
+  if (ms === null) return '未計測';
   return `${(Number(ms) / 1000).toFixed(1)}秒`;
 }
-// 件数（会話あたりのやり取り回数の avg/median/p90 等）の小数表示（null は「—」）。
+// 件数（会話あたりのやり取り回数の avg/median/p90 等）の小数表示（null は未計測・欠落は未取得）。
 function fmtNumOrDash(v, digits) {
-  if (v === null || v === undefined) return '—';
+  if (v === undefined) return '未取得';
+  if (v === null) return '未計測';
   return Number(v).toFixed(digits === undefined ? 1 : digits);
 }
-// 割合（0〜1）を%表示へ（null は「—」・renderZeroHitTile と同じ丸め方）。
+// 割合（0〜1）を%表示へ（null は未計測・欠落は未取得）。
 function fmtPctOrDash(v) {
-  if (v === null || v === undefined) return '—';
+  if (v === undefined) return '未取得';
+  if (v === null) return '未計測';
   return `${Math.round(v * 100)}%`;
 }
 
@@ -492,9 +544,9 @@ function renderConversationTurns(turns, resumeRate) {
   $('t-turns-avg').textContent = fmtNumOrDash(t.avg);
   $('t-turns-median').textContent = fmtNumOrDash(t.median);
   $('t-turns-p90').textContent = fmtNumOrDash(t.p90);
-  $('t-turns-max').textContent = (t.max === null || t.max === undefined)
-    ? '—' : Number(t.max).toLocaleString('ja-JP');
-  $('t-resume-rate').textContent = fmtPctOrDash(resumeRate);
+  $('t-turns-max').textContent = fmtTokOrDash(t.max);
+  $('t-resume-rate').textContent = t.session_eligible === 0 ? '対象なし' : fmtPctOrDash(resumeRate);
+  $('session-counts').textContent = `IDあり ${fmtTokOrDash(t.session_recorded)}件 / 対象会話 ${fmtTokOrDash(t.session_eligible)}件`;
 }
 
 // 回答時間の分布（全体＋経路別）。`overall` は API 契約上つねに存在する行（対象0件でも
@@ -512,7 +564,7 @@ function renderResponseTime(rt) {
     <td class="num">${fmtSecOrDash(row.median)}</td>
     <td class="num">${fmtSecOrDash(row.p90)}</td>
     <td class="num">${fmtSecOrDash(row.max)}</td>
-    <td class="num">${(row.n || 0).toLocaleString('ja-JP')}</td>
+    <td class="num">${fmtTokOrDash(row.n)}</td>
   </tr>`).join('');
 }
 
@@ -523,9 +575,9 @@ function renderLimits(limits) {
   const tb = $('limits-tbody');
   if (!tb) return;
   const rows = (limits && limits.by_provider) || [];
-  const cnt = (turns, total) => (total === undefined
-    ? `${(turns || 0).toLocaleString('ja-JP')}件`
-    : `${(turns || 0).toLocaleString('ja-JP')}件（計${(total || 0).toLocaleString('ja-JP')}回）`);
+  const cnt = (turns, total) => turns == null ? '未計測' : (total === undefined
+    ? `${turns.toLocaleString('ja-JP')}件`
+    : `${turns.toLocaleString('ja-JP')}件（計${fmtTokOrDash(total)}回）`);
   tb.innerHTML = rows.map((r) => `<tr>
     <td>${esc(providerLabel(r.provider))}</td>
     <td class="num">${(r.turns || 0).toLocaleString('ja-JP')}</td>
@@ -533,8 +585,14 @@ function renderLimits(limits) {
     <td class="num">${cnt(r.total_budget_hit_turns)}</td>
     <td class="num">${cnt(r.context_compactions_turns, r.context_compactions_total)}</td>
     <td class="num">${cnt(r.synthesis_truncated_turns)}</td>
+    <td class="num">${cnt(r.depth_escalated_turns)}</td>
     <td class="num">${cnt(r.search_truncated_turns, r.search_truncated_total)}</td>
     <td class="num">${cnt(r.auto_continues_turns, r.auto_continues_total)}</td>
+    <td class="num">${cnt(r.duplicate_tool_call_turns, r.duplicate_tool_call_total)}</td>
+    <td class="num">${cnt(r.tool_calls_exhausted_turns)}</td>
+    <td class="num">${cnt(r.backend_unavailable_fulltext_turns)}</td>
+    <td class="num">${cnt(r.backend_unavailable_graph_turns)}</td>
+    <td class="num">${cnt(r.graph_reingest_required_turns)}</td>
   </tr>`).join('');
 }
 
@@ -542,14 +600,21 @@ const REVIEW_LABELS = {
   confirmed: '確定', inferred: '推定', unknown: '不明',
   sufficient: '十分', insufficient: '根拠不足', undecidable: '判定できず',
   not_found_in_scope: '範囲内で見つからない', unexplored: '未調査', conflict: '食い違い', budget: '調査の上限', unreadable: '読み取り不可',
+  source_missing: 'ソース未確認', spec_missing: '設計書未確認', definition_missing: '定義未確認',
+  log_missing: 'ログ・設定未確認', callgraph_missing: '呼出関係未確認',
   rerun: '次の見直しへ', rounds_exhausted: '見直しの回数に到達',
   user_stop: '利用者が停止', ask_user: '利用者に確認', review_failed: '確認に失敗', failed: '失敗',
   tool_result_clipped: '1件の読取量を制限', total_budget_hit: '累計の読取量に到達',
   context_compactions: '会話履歴を整理', synthesis_truncated: '回答用の情報量を制限',
+  depth_escalated: '自動で深く調べた',
   search_truncated: '検索件数を制限', auto_continues: '続きを自動で実行',
+  duplicate_tool_call: '同じ条件の再検索を省略',
+  tool_calls_exhausted: '調査の回数上限に到達',
+  backend_unavailable_fulltext: '全文検索が使えなかった', backend_unavailable_graph: 'グラフが使えなかった',
+  graph_reingest_required: 'グラフは再取り込み待ち',
 };
-const REVIEW_DEPTH_LABELS = { standard: '標準', deep: '深く', max: '最大' };
-const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-standard': '見直しなし', 'depth2-deep': '見直しあり（深く）', 'depth2-max': '見直しあり（最大）' };
+const REVIEW_DEPTH_LABELS = { quick: 'クイック', standard: '標準', deep: '深く', max: '最大' };
+const REVIEW_CONDITION_LABELS = { main: '本番相当', 'depth2-quick': '見直しなし', 'depth2-standard': '標準（見直し 2 回）', 'depth2-deep': '深く（4 回）', 'depth2-max': '最大' };
 function reviewCounts(counts) {
   const totals = new Map();
   Object.entries(counts).forEach(([key, count]) => {
@@ -634,8 +699,8 @@ const KIND_LABEL = {
   rag_render: '検索用文書の整形',
 };
 function kindLabel(k) { return KIND_LABEL[k] || k; }
-// トークン列は null（プロバイダが usage を報告しなかった「報告不能」マーカー）なら「—」で表示する。
-function fmtTokOrDash(v) { return (v === null || v === undefined) ? '—' : Number(v).toLocaleString('ja-JP'); }
+// トークン列は null（プロバイダが usage を報告しなかった「報告不能」マーカー）なら「未計測」、項目欠落なら「未取得」で表示する。
+function fmtTokOrDash(v) { return v === undefined ? '未取得' : v === null ? '未計測' : Number(v).toLocaleString('ja-JP'); }
 function renderTokenKindTable(rows) {
   const card = $('token-kind-card');
   const tb = $('token-kind-tbody');
@@ -663,7 +728,7 @@ function renderTokenKindTable(rows) {
   }).join('');
 }
 
-// ユーザー別 × 用途別内訳（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (a)）。利用者に紐付かない
+// ユーザー別 × 用途別内訳（docs/archive/2026-09-12-利用統計の拡充2.md §2 (a)）。利用者に紐付かない
 // 呼び出しを含まないため、同一 kind の合計は token-kind-tbody の当該行以下になりうる。空/不在ならカードごと隠す
 // （token-kind-card と同じ流儀）。
 function renderTokenUserKindTable(rows) {
@@ -699,16 +764,16 @@ function renderTokenModelTable(rows) {
     return `<tr>
       <td>${name}</td>
       <td class="num">${(r.turns || 0).toLocaleString('ja-JP')}</td>
-      <td class="num">${(r.input || 0).toLocaleString('ja-JP')}</td>
-      <td class="num">${(r.cached_input || 0).toLocaleString('ja-JP')}</td>
-      <td class="num">${(r.output || 0).toLocaleString('ja-JP')}</td>
-      <td class="num">${(r.reasoning_output || 0).toLocaleString('ja-JP')}</td>
+      <td class="num">${fmtTokOrDash(r.input)}</td>
+      <td class="num">${fmtTokOrDash(r.cached_input)}</td>
+      <td class="num">${fmtTokOrDash(r.output)}</td>
+      <td class="num">${fmtTokOrDash(r.reasoning_output)}</td>
     </tr>`;
   }).join('');
 }
 function renderTokenUserTable(rows) {
   const tb = $('token-user-tbody');
-  const top = (rows || []).slice(0, 10);   // 上位ユーザー（サーバ側でトークン降順）
+  const top = rows || [];   // 取得時に画面・保存共通で上位10件へ絞っている。
   if (!top.length) {
     tb.innerHTML = '<tr class="empty-row"><td colspan="5">この期間のトークン記録はまだありません</td></tr>';
     return;
@@ -717,15 +782,15 @@ function renderTokenUserTable(rows) {
     <td><span class="${i === 0 ? 'rank top1' : 'rank'}">${i + 1}</span></td>
     <td><div class="user-name">${esc(u.display_name || u.uid)}</div><div class="user-uid">${esc(u.uid)}</div></td>
     <td class="num">${(u.turns || 0).toLocaleString('ja-JP')}</td>
-    <td class="num">${(u.input || 0).toLocaleString('ja-JP')}</td>
-    <td class="num">${(u.output || 0).toLocaleString('ja-JP')}</td>
+    <td class="num">${fmtTokOrDash(u.input)}</td>
+    <td class="num">${fmtTokOrDash(u.output)}</td>
   </tr>`).join('');
 }
 function renderTokens(tokens, period) {
   const t = tokens || {};
   const tot = t.totals || {};
-  $('t-tok-input').textContent = (tot.input || 0).toLocaleString('ja-JP');
-  $('t-tok-output').textContent = (tot.output || 0).toLocaleString('ja-JP');
+  $('t-tok-input').textContent = fmtTokOrDash(tot.input);
+  $('t-tok-output').textContent = fmtTokOrDash(tot.output);
   const daily = t.daily || [];
   renderTrendChart(
     $('chart-tokin-svg'), $('chart-tokin-empty'), $('chart-tokin-tip'), $('chart-tokin-wrap'),
@@ -745,7 +810,7 @@ function renderTokens(tokens, period) {
   renderTokenUserKindTable(t.by_user_kind || []);
 }
 
-// 会話ごとの補助 AI 使用量（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
+// 会話ごとの補助 AI 使用量（docs/archive/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
 // 降順で上位20件・タイトル/本文は含まない。「用途別」列は用途ごとに回数・トークン・所要時間を1行ずつ
 // 積む（`UsageConversationKindRow` の null の意味は用途別テーブルと同じ）。会話 id はテキスト表示のみ
 // （リンクにしない）。
@@ -796,10 +861,11 @@ function detailHTML(u) {
 
 function zeroHitCellHTML(u) {
   if (u.zero_hit_rate === null || u.zero_hit_rate === undefined) {
-    return '<td class="num zhr-cell" title="社内資料参照ターンがありません">—</td>';
+    const label = u.knowledge_turns === 0 ? '対象なし' : fmtPctOrDash(u.zero_hit_rate);
+    return `<td class="num zhr-cell">${label}</td>`;
   }
   const pct = Math.round(u.zero_hit_rate * 100);
-  const tip = `${(u.knowledge_turns || 0).toLocaleString('ja-JP')}件中${(u.zero_hit_turns || 0).toLocaleString('ja-JP')}件が根拠なし`;
+  const tip = `${(u.knowledge_turns || 0).toLocaleString('ja-JP')}件中${(u.zero_hit_turns || 0).toLocaleString('ja-JP')}件が出典なし`;
   return `<td class="num zhr-cell" title="${esc(tip)}">${pct}%</td>`;
 }
 
@@ -862,16 +928,25 @@ function setLoading() {
 async function load(days) {
   const seq = ++_loadSeq;   // このリクエストの連番（連打時、最新以外の描画は破棄する）
   _days = days;
+  _stats = null;
+  _loadedAt = null;
+  $('usage-export').disabled = true;
+  $('usage-stat-panels').hidden = true;
+  $('usage-period-label').textContent = `${days}日間を取得中…`;
+  $('usage-load-status').textContent = '利用統計を読み込んでいます…';
   setLoading();
   $('review-stats').textContent = '見直しの集計を読み込んでいます…';
   document.querySelectorAll('.period-bar .filterchip').forEach((b) => {
     b.classList.toggle('on', Number(b.dataset.days) === days);
+    b.setAttribute('aria-pressed', String(Number(b.dataset.days) === days));
   });
   try {
     const d = await getJSON('/admin/usage/stats?days=' + encodeURIComponent(days));
     if (seq !== _loadSeq) return;   // 後から連打された別リクエストが既に最新＝このレスポンスは古い
+    // 画面とJSON保存で同じ範囲を共有する（サーバのトークン降順を維持）。
+    if (d.tokens?.by_user) d.tokens.by_user = d.tokens.by_user.slice(0, 10);
     renderSummary(d.totals || {});
-    renderZeroHitTile(d.zero_hit || {});
+    renderZeroHitTile(d.zero_hit);
     renderCharts(d.daily || [], d.period);
     renderHeatmap(d.heatmap || []);
     renderWorldBar(d.worlds || []);
@@ -887,8 +962,18 @@ async function load(days) {
     renderConversationsTop(d.conversations_top || []);
     _users = d.users || [];
     applySortAndRender();
+    _stats = d;
+    _loadedAt = new Date().toISOString();
+    $('usage-period-label').textContent = `${d.period.start} ～ ${d.period.end}（JST・終了日を含む）`;
+    $('usage-load-status').textContent = `取得時刻: ${new Date(_loadedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })} JST`;
+    $('usage-stat-panels').hidden = false;
+    $('usage-export').disabled = false;
+    $('usage-tbody').setAttribute('aria-busy', 'false');
+    showUsageTab(usageView().tab);
   } catch (e) {
     if (seq !== _loadSeq) return;
+    $('usage-period-label').textContent = `${days}日間（取得失敗）`;
+    $('usage-load-status').textContent = `利用統計を取得できませんでした: ${String(e)}。期間ボタンで再取得できます。`;
     $('usage-tbody').setAttribute('aria-busy', 'false');
     $('usage-tbody').innerHTML = `<tr><td colspan="8" style="color:var(--danger);padding:16px">読み込みに失敗しました: ${esc(String(e))}</td></tr>`;
     $('review-stats').textContent = '見直しの集計を読み込めませんでした。';
@@ -896,9 +981,24 @@ async function load(days) {
   }
 }
 
+$('usage-export').addEventListener('click', () => {
+  const payload = { retrieved_at: _loadedAt, timezone: 'Asia/Tokyo', period: _stats.period,
+    definitions: $('usage-definitions').textContent.trim(), stats: _stats };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `usage-${_stats.period.start}-${_stats.period.end}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+});
+
 // ===== イベント =====
 document.querySelectorAll('.period-bar .filterchip').forEach((b) => {
-  b.addEventListener('click', () => load(Number(b.dataset.days)));
+  b.addEventListener('click', () => {
+    const days = Number(b.dataset.days);
+    if (days === _days) load(days);
+    else navigateUsage(usageView().tab, days);
+  });
 });
 
 document.querySelectorAll('th.sortable').forEach((th) => {
@@ -1297,6 +1397,6 @@ ucUpdateOpenaiKeyHint();      // A7 未確認のうちは非表示
     if (denied) denied.style.display = 'block';
     return;
   }
-  await ucLoadSettings();
-  await load(_days);
+  _adminReady = true;
+  await Promise.all([ucLoadSettings(), load(usageView().days)]);
 })();

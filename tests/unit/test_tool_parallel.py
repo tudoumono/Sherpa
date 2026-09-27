@@ -464,3 +464,77 @@ def test_gemini_worker_exception_detail_not_sent_to_next_llm_request(monkeypatch
     responses = [p["functionResponse"]["response"] for p in resp_parts]
     assert {"error": "ツール実行に失敗しました"} in responses
     assert _DUMMY_ABS_PATH not in json.dumps(bodies[1])
+
+
+# ===== S3(c): 直列経路も並列経路と同じ例外変換にする =====
+
+def test_openai_style_serial_tool_exception_converts_to_error_result_like_parallel(monkeypatch):
+    """1本だけの呼び出し（並列化の対象外＝直列経路を通る）でツール例外が起きても、run 全体が
+    落ちず固定文言のエラー結果へ変換されて続行する——並列経路（`test_openai_style_
+    one_worker_exception_does_not_block_others`）と同じ形・同じ秘匿処理（絶対パスの生文字列が
+    次ターンの送信本文に出ない）。この変換は `final_synthesis=False`（`providers/base.py::_sub_loop`
+    ＝self_worker 等の下調べ役サブループ限定）のときだけ適用される——`final_synthesis=True`
+    （research_service 等の直接呼び出し・既定値）は独自の例外分類契約を持つため対象外
+    （`test_research_service.py::test_grep_tool_connection_error_does_not_get_ai_connection_message`
+    参照）。"""
+    calls = _openai_calls(["BOOM"])
+    seq = [
+        {"choices": [{"message": {"content": "", "tool_calls": calls}}]},
+        {"choices": [{"message": {"content": "完了。"}}]},
+    ]
+    bodies = []
+
+    def fake_post(url, headers, body, timeout=90):
+        bodies.append(body)
+        return seq.pop(0)
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        raise FileNotFoundError(f"[Errno 2] No such file or directory: '{_DUMMY_ABS_PATH}'")
+
+    monkeypatch.setattr(A, "_post", fake_post)
+    monkeypatch.setattr(A, "run_tool", fake_run_tool)
+    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                                 toolset=_OPENAI_TOOLSET, final_synthesis=False))
+    final = next(e for e in events if "final" in e)
+    # `final_synthesis=False` は文章を破棄する契約（`providers/base.py::_agentic_run` の S3 分岐）
+    # のため本文は常に空——run 全体が例外で落ちず完走したことは `final` イベントの到達自体で確認する。
+    assert final["final"] == ""
+    tool_msgs = {m["tool_call_id"]: m["content"] for m in bodies[1]["messages"] if m.get("role") == "tool"}
+    assert json.loads(tool_msgs["c0"]) == {"error": "ツール実行に失敗しました"}   # 並列経路と同じ固定文言
+    assert _DUMMY_ABS_PATH not in json.dumps(bodies[1])   # 例外の生文字列が本文に含まれない（並列経路と同じ）
+
+
+def test_openai_style_serial_tool_exception_propagates_when_final_synthesis_true(monkeypatch):
+    """`final_synthesis=True`（既定値・research_service/graph_admin/usage_chat／頭脳自身の直接
+    `_agentic_loop` が使う）では、直列経路のツール例外変換を適用せず生の例外をそのまま伝播する
+    ——呼び出し元（例: `research_service.run_research`）が自前の例外分類契約
+    （`_sherpa_llm_send_error` マーカーによる「AI接続失敗」と「その他の予期しない失敗」の区別）を
+    持つため、ここで丸めて飲み込むとその契約を壊す（回帰防止・test_research_service.py 参照）。"""
+    calls = _openai_calls(["BOOM"])
+    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        raise FileNotFoundError(f"[Errno 2] No such file or directory: '{_DUMMY_ABS_PATH}'")
+
+    monkeypatch.setattr(A, "run_tool", fake_run_tool)
+    with pytest.raises(FileNotFoundError):
+        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                            toolset=_OPENAI_TOOLSET))
+
+
+def test_openai_style_serial_graph_schema_era_error_propagates(monkeypatch):
+    """1本だけの呼び出し（直列経路）でも `GraphSchemaEraError` は通常のツールエラーへ丸めず
+    そのまま再送出する——並列経路（`test_openai_style_graph_schema_era_error_propagates_through_
+    parallel_batch`）と同じ fail-loud 契約。"""
+    calls = [{"id": "c0", "function": {"name": "graph_neighbors", "arguments": json.dumps({"entity": "x"})}}]
+    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls}}]}]
+    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
+
+    def fake_run_tool(name, args, world, scope_paths, **kw):
+        raise GraphSchemaEraError(world, None, lens="troubleshoot")
+
+    monkeypatch.setattr(A, "run_tool", fake_run_tool)
+    with pytest.raises(GraphSchemaEraError):
+        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
+                            toolset=A.openai_tools(with_graph=True)))
