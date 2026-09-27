@@ -142,7 +142,7 @@ def _remove_codex_session_dir(target: Path, base: Path) -> None:
 
 def _delete_codex_sessions_for_conversation(uid: str, cid) -> None:
     """会話削除に伴い、その会話の Codex resume セッション実体（`workspace/.codex-sessions/{cid}`）を
-    即時削除する（docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md §4-3）。
+    即時削除する（docs/archive/2026-09-21-調査台帳を文脈の外に置く.md §4-3）。
 
     soft delete（受領共有ラッパーが生存中）でも削除する: 共有は DB 上の回答本文を見せるだけで
     Codex セッションは resume 専用の実体＝共有継続とセッション保持は無関係

@@ -414,7 +414,7 @@ def test_same_uid_concurrent_runs_get_separate_run_dirs_and_neither_is_busy(tmp_
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
 
@@ -544,7 +544,7 @@ def test_conversation_lock_held_through_result_event(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
 
@@ -617,7 +617,7 @@ def test_created_file_registration_failure_keeps_run_dir_and_appends_note(monkey
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     users_dir = tmp_path / "users"
     monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
@@ -672,7 +672,7 @@ def test_files_dir_unavailable_keeps_run_dir_and_appends_note(monkeypatch, tmp_p
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     users_dir = tmp_path / "users"
     monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
@@ -720,7 +720,7 @@ def test_move_back_failure_after_registration_failure_is_logged_and_keeps_note(m
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     users_dir = tmp_path / "users"
     monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
@@ -799,7 +799,7 @@ def test_created_file_outright_move_failure_is_logged_without_leaking_path(monke
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     users_dir = tmp_path / "users"
     monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))
@@ -977,7 +977,7 @@ def test_run_dir_ignores_stale_authoring_leftovers(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     # 偽 codex は平文 agent_message を返す（run dir/台帳登録/会話ロックの検証が目的で出力スキーマは
     # 対象外）。`--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため
-    # 無効化する（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # 無効化する（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     users_dir = tmp_path / "users"
     monkeypatch.setenv("SHERPA_USERS_DIR", str(users_dir))

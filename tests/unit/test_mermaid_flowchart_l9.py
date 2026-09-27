@@ -1,5 +1,5 @@
 """図形＋コネクタ→Mermaidフローチャート（L9・R3・
-`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.4/§8.5）の契約を pin する。
+`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.4/§8.5）の契約を pin する。
 
 対象: `mermaid_render.py`（純関数のノードID・ラベル優先順位・prst→形状マッピング・未接続コネクタの
 注記）と、`evidence_render._flow_diagram_records`（コンテナ単位recordのcitation完全性）。

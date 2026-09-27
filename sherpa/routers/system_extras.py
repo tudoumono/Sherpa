@@ -254,7 +254,7 @@ class SystemSettingsReq(BaseModel):
     # 既定（未指定=None）は `_CODEX_WORKER_MODEL_FALLBACK`（実機確認済みの安価枠）。空文字・null は
     # 未設定へ戻す（実装ベース探索の回復 S1・案 B）。
     codex_worker_model: str | None = None
-    # 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。"standard"（既定・
+    # 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。"standard"（既定・
     # Sherpa の検索ツールと調査台帳を使う）／"plain"（Codex が自分で資料を読む・試験用）。
     # 未指定=None は既定 "standard" へ戻す。
     codex_mode: str | None = None
@@ -851,7 +851,7 @@ def _admin_settings_view() -> dict:
             "default": usage_chat._default_provider(sysset),
             "providers": list(usage_chat._USAGE_CHAT_PROVIDERS),
         },
-        # 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。`effective` は
+        # 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。`effective` は
         # `codex_sandbox.codex_mode()`（唯一の解決関数・実行時に provider.py が見るのと同じ値）。
         # plain では下の depth_profile（見直しの回数等）は Codex に渡らない——設定自体は残す。
         "codex_mode": {
@@ -960,7 +960,7 @@ def _admin_settings_view() -> dict:
         # 解決結果、`default` はコード既定（未設定に戻したときの実効値）。既定は精度優先
         # （憲法1条・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）。モデルの窓由来の上限との
         # min()（旧 BUDGET-2）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」・
-        # `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）。
+        # `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）。
         "agentic_budget": {
             "per_result": {
                 "configured": sysset.get("agentic_budget_per_result"),
@@ -1309,7 +1309,7 @@ def _validate_codex_worker_model(value):
 
 
 def _validate_codex_mode(value):
-    """`codex_mode`（素の Codex モード・docs/proposals/2026-09-24-素のCodexモード.md §1.1）の検証。
+    """`codex_mode`（素の Codex モード・docs/archive/2026-09-24-素のCodexモード.md §1.1）の検証。
     None は未設定（既定 "standard" へフォールバック）。閉じた語彙（`codex_sandbox.CODEX_MODES`）
     以外は 422——`depth_base_codex_reasoning` と同じ流儀（空文字も未設定扱いにはしない）。"""
     if value is None:

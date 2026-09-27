@@ -45,7 +45,7 @@ CODE_EXT = frozenset({
     # 契約に反する＝CODE-1d で新言語を1つ足した際に判明・以後は「登録簿に専用アナライザが
     # 増えたら、その拡張子はここから外す」運用とする）。`.properties`/`.yaml`/`.yml`/`.xml` も
     # 同じ理由で含めない——アナライザ拡張 S3b で `PropertiesAnalyzer`/`YamlConfigAnalyzer`/
-    # `XmlConfigAnalyzer` が登録済み（docs/proposals/2026-09-05-アナライザ拡張.md §6）。`.sql` も
+    # `XmlConfigAnalyzer` が登録済み（docs/archive/2026-09-05-アナライザ拡張.md §6）。`.sql` も
     # 同じ理由で含めない——アナライザ拡張 S2 で `SqlDdlAnalyzer` が登録済み。`.c`/`.h`/`.cs` も
     # 同じ理由で含めない——アナライザ拡張 S6/S7 で `CAnalyzer`/`CSharpAnalyzer` が登録済み。
     # `.js`/`.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb` も同じ理由で含めない——アナライザ拡張 波3 で

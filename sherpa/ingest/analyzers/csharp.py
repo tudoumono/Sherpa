@@ -1,4 +1,4 @@
-"""C# アナライザ（docs/proposals/2026-09-05-アナライザ拡張.md §4(a)/§9 S7・A1＝本体のみ・FW なし）。
+"""C# アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §4(a)/§9 S7・A1＝本体のみ・FW なし）。
 
 `class`/`interface`/`struct`/`enum`/`record`（`record class`/`record struct` を含む・ファイル主体）
 を主体定義（`Module`）とし、Java と同様に同一ファイル内の非 public 型を子定義（`Module`・

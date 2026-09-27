@@ -179,7 +179,7 @@ let _agenticToolLimitBaseline = '';
 let _maxReviewRoundsBaseline = '';
 let _codexWorkerModelBaseline = '';
 let _codexSessionRetentionDaysBaseline = '';
-// 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。configured を基準にする
+// 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。configured を基準にする
 // （''=未設定＝「標準」の空選択肢・depth-base-codex-reasoning と同型）。
 let _codexModeBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
@@ -1484,7 +1484,7 @@ function renderResearchTab(view) {
     : `この値で固定中です（既定: ${parallel.default} 件）。`;
 }
 
-// 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。depth-base-codex-reasoning
+// 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。depth-base-codex-reasoning
 // と同型（空選択肢=未設定=既定の「標準」）。
 function renderCodexMode(cm) {
   cm = cm || {};

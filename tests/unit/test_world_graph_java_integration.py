@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の Java 統合テスト（CODE-1d＝新言語1つでの手順検証・
-docs/proposals/2026-08-29-コード解析層のコンポーネント化.md §4.2 (b)(c)）。
+docs/archive/2026-08-29-コード解析層のコンポーネント化.md §4.2 (b)(c)）。
 
 `fixtures/corpus/java1`（2パッケージ・相互参照あり・新規作成）を実際に `build_world()` へ通し、
 共通層（`sherpa/ingest/world_graph.py`・無改修）の同一 top_scope 内最近傍解決・`ambiguous_reference`

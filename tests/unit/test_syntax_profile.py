@@ -1,4 +1,4 @@
-"""`scripts/syntax_profile.py`（S0・構文分布スクリプト・docs/proposals/2026-09-05-アナライザ拡張.md §9）の単体テスト。
+"""`scripts/syntax_profile.py`（S0・構文分布スクリプト・docs/archive/2026-09-05-アナライザ拡張.md §9）の単体テスト。
 
 読み取り専用・LLM 不使用・world への書込みなしのため、DB/ES/Neo4j は一切使わない。`fixtures/corpus/`
 の既存 COBOL/JCL サンプルと、tmp_path に作る最小サンプル（各構文1本ずつ）で主要カウンタが期待値に

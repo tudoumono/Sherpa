@@ -1,8 +1,8 @@
-"""Codex authoring 実行前に authoring ディレクトリへ書き出す AGENTS.md（docs/proposals/2026-07-02-Codex強化計画.md §2）。
+"""Codex authoring 実行前に authoring ディレクトリへ書き出す AGENTS.md（docs/archive/2026-07-02-Codex強化計画.md §2）。
 
 `agents.py` の `CodexProvider._prompt`/`_prompt_mcp` に埋め込んでいた**共通ルール**（KB 以外を読まない・
 根拠ベースで答える・成果物は authoring 直下 等）をここへ切り出し、プロンプト側は
-質問固有の部分だけに痩せさせる（docs/proposals/2026-07-02-Codex強化計画.md §5-1 決定）。
+質問固有の部分だけに痩せさせる（docs/archive/2026-07-02-Codex強化計画.md §5-1 決定）。
 
 Codex CLI は cwd 直下（＝ authoring/）の AGENTS.md を実行時に自動的に読み込む（公式仕様）。per-request で
 毎回上書きするため内容は決定的固定文字列（冪等）。実行後も authoring に残ってよい
@@ -143,7 +143,7 @@ def _source_verification_paragraph(direct_read: bool, layer: str | None = None) 
   または再調査では調べる量を一段引き上げる（読む範囲・確認するファイルを広げる）。
 """
 
-# `--output-schema`（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3）有効時だけ付け足す段落。
+# `--output-schema`（docs/archive/2026-09-08-Codex出力スキーマ.md §2-3）有効時だけ付け足す段落。
 # スキーマ無効時にこの構造化応答の要求を出すと、Codex が実際には守れない形式を約束させられるだけで
 # 実害がある（`--output-schema` が無ければ CLI 側の強制も無い）ため、`write_agents_md` の
 # `output_schema` 引数が真のときだけ本文に足す。
@@ -202,7 +202,7 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
   揃っているときだけ——揃わない場合は `inferred` にし、`reason` に確認できていない種別を書く。
 """
 
-# 調査台帳（`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §3・§6「AGENTS.md で済む箇所」・
+# 調査台帳（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §3・§6「AGENTS.md で済む箇所」・
 # 台帳ファイル自体の読み書き契約は `sherpa/investigation_ledger.py` が正典）の作り方・使い方を
 # 伝える段落。機械的な完了判定（provider.py 側・別契約）は `.tmp/investigation/` 配下の台帳の
 # 非終端有無を見て `status=final` を拒否する——この段落が無いまま機械判定だけ効くと、Codex が
@@ -416,7 +416,7 @@ _MULTI_AGENT_RESUME_FALLBACK_PARAGRAPH = """\
 """
 
 
-# 素の Codex モード（`plain`・docs/proposals/2026-09-24-素のCodexモード.md §1.2）専用の最小形。
+# 素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2）専用の最小形。
 # 台帳・分類原則の長文・出力スキーマ・worker/evaluator・investigate スキル誘導・グラフ不調時の
 # 段落は出さない——残すのは containment（読取専用・範囲・秘匿は読まない・書き込みは authoring
 # だけ）・出典の書き方・成果物の置き場所・ソースを正とする一文だけ。

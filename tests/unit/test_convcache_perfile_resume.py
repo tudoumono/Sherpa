@@ -1,7 +1,7 @@
 """CONV-CACHE（per-file 変換結果の再ビルド跨ぎキャッシュ）の受け入れ条件を実往復で固定する。
 
 背景: 実環境（10,000ファイル・1件30秒級）で取り込みの変換段（office_md）が完走できず、再実行が
-毎回0から始まる障害への対応（正典 `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §9・
+毎回0から始まる障害への対応（正典 `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §9・
 CONV-CACHE 行）。`_build_derived_into_staging` は per-file ループの各 rel を
 `(原本の resolved path, st_size, st_mtime_ns, 変換パイプライン署名)` キーでキャッシュし、ヒット時は
 実変換（①アーム実行・Evidence/RAG 生成）を丸ごとスキップしてステージングへコピーするだけで済ませる。

@@ -1,4 +1,4 @@
-"""チャット履歴の検索（H1・docs/proposals/2026-09-07-履歴検索と下調べ並列化.md §1）テスト。
+"""チャット履歴の検索（H1・docs/archive/2026-09-07-履歴検索と下調べ並列化.md §1）テスト。
 
 `test_auth_sharing.py`/`test_sanitized_share.py`/`test_share_fork_refresh.py` と同じ流儀:
 store 層の関数（`store.search_conversations`）を直接呼んでデータ・可視集合の契約を固定し、

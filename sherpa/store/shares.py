@@ -282,7 +282,7 @@ _SHARE_SAFE_LENS = ("qa", "impact", "troubleshoot", "chat", "clarify")
 _EVIDENCE_PACKET_STR_FIELDS = ("task_id", "investigation_status", "summary", "stop_reason", "next_action")
 _EVIDENCE_PACKET_INT_FIELDS = ("candidates_seen", "candidates_inspected", "evidence_selected")
 _EVIDENCE_ITEM_STR_FIELDS = ("evidence_id", "source_type", "source_path", "verification_method")
-# DEPTH-2 S1（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5）: 主張（`data.claims[]`）の
+# DEPTH-2 S1（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.5）: 主張（`data.claims[]`）の
 # 共有用 allowlist フィールド——`evidence_refs` はこの調査内の `ev-N`／provider の evidence_refs
 # 参照文字列のみで、doc_id・原文は含まないため型検証だけで再構築できる。
 _CLAIM_STR_FIELDS = ("id", "status", "text", "reason", "reason_code")

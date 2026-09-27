@@ -1,6 +1,6 @@
 """`compare_documents`（GEN-DIFF）本体: 2文書の RAG 正本（`.rag.md`）を突き合わせる素朴な決定的 diff。
 
-正典: `docs/proposals/2026-09-03-世代間diff比較.md` §3〜§8。**方針（裁定）**: ツールは grep と同格の
+正典: `docs/archive/2026-09-03-世代間diff比較.md` §3〜§8。**方針（裁定）**: ツールは grep と同格の
 素朴な決定的ツール——レコード同定・業務キー対応付け・要約・ask_user 連携は行わない。曖昧な対応文書
 （§4）は候補一覧を返すだけで会話側（agentic loop の LLM）が確認する。
 

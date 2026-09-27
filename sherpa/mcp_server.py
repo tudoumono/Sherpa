@@ -18,7 +18,7 @@ MCP がツールを渡す唯一の素直な口（network 不要＝本サーバ�
   **ask_user を tools/list から外す**（呼べる道具を最初から見せない＝最強のガード・RV HIGH 2026-07-07）。
   それでも呼ばれたら（Codex がプロンプト指示に反した場合の防御）初回でも `_ASK_RESULT_AGAIN` を返す
   ＝質問カードを出さないまま調査を打ち切らせない（ラッパー側 `_ask_disabled` と同じフラグを共有）。
-- DEPTH-2 S3b（`docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1）: Codex の
+- DEPTH-2 S3b（`docs/archive/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1）: Codex の
   multi_agent（`spawn_agent`）で起動された子エージェントの MCP 呼出は、親プロセスの `--json`
   イベントには構造化イベントとして現れない（実機確認済み）。子・親のどちらから呼ばれたかを
   本サーバは区別できないため、`SHERPA_MCP_SIDECAR`（JSONL パス・model-shell の書込許可領域の外＝
@@ -64,7 +64,7 @@ _ASK_RESULT_AGAIN = "既に質問済みです。調査を続けて回答をま�
 
 _LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status"})
 
-# 素の Codex モード（`plain`・docs/proposals/2026-09-24-素のCodexモード.md §1.2/§3）で公開する
+# 素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2/§3）で公開する
 # ツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る（値のぶれを作らない）。
 _PLAIN_TOOLSET = frozenset({"graph_neighbors", "ask_user"})
 
@@ -209,7 +209,7 @@ def _tool_defs() -> list:
     defs = [
         {"name": "list_docs", "description": agentic_search._DESC_LIST_DOCS,
          "inputSchema": agentic_search._PARAMS_LIST_DOCS},
-        # K6（`docs/proposals/2026-09-04-グラフのソース正典化.md` §3・§4b S1）: list_docs と同じ
+        # K6（`docs/archive/2026-09-04-グラフのソース正典化.md` §3・§4b S1）: list_docs と同じ
         # 台帳ベースの土台系ツール（ES/graph 可用性に依存しない）＝常に公開する。
         {"name": "folder_tree", "description": agentic_search._DESC_FOLDER_TREE,
          "inputSchema": agentic_search._PARAMS_FOLDER_TREE},
@@ -223,11 +223,11 @@ def _tool_defs() -> list:
          "inputSchema": agentic_search._PARAMS_READ_DOC},
         {"name": "read_around", "description": agentic_search._DESC_READ,
          "inputSchema": agentic_search._PARAMS_READ},
-        # GEN-DIFF（`docs/proposals/2026-09-03-世代間diff比較.md` §5）: ES/graph の可用性に依存しない
+        # GEN-DIFF（`docs/archive/2026-09-03-世代間diff比較.md` §5）: ES/graph の可用性に依存しない
         # 土台系ツール（read_around 等と同じ扱い）＝常に公開する。
         {"name": "compare_documents", "description": agentic_search._DESC_COMPARE,
          "inputSchema": agentic_search._PARAMS_COMPARE},
-        # S3b（原本読取ツール・`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
+        # S3b（原本読取ツール・`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
         # `file_head`（テキスト・コード）は層に関係なく常に公開する（`run_tool` 側が層で個別に
         # 絞る）。Office/PDF の5本（下）は探す対象がソースに限定されている間は外す（Office/PDF は
         # 常に docs 側扱いのため・`run_tool` 側の拒否と多層防御）。
@@ -360,7 +360,7 @@ def _sidecar_error_code(name, result) -> None:
 # 累計（1 run 全体）のツール結果バイト予算・ツール呼び出し回数の上限は Codex 経路では持たない
 # （撤去済み）: MCP プロセス単位の累計値は Codex CLI の自動圧縮で文脈が空いてもリセットされず、
 # 到達後は本文系ツールが永続的に拒否される——「調査の途中で閉じる」を作る側だった
-# （`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2）。1件あたりの上限は
+# （`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2）。1件あたりの上限は
 # CLI の remote compact 失敗（`_CONTEXT_WINDOW_EXCEEDED_CODE`）という実障害の根拠があるため残す。
 #
 # `list_docs`/`folder_tree`（一覧のみ・本文を返さない土台系ツール）と `ask_user`（制御系・専用分岐で
@@ -609,7 +609,7 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
     自身が直列化後の実バイト数で収まりを保証する仕組み（ripgrep_search/es_search の per-hit
     シュリンク・`_finish_reader_result` の二分探索）を持つため、ここに来るのは通常その保証が
     効かない極端なケースだけ——「構造を保ったまま続きを取れる」ことを保証する最終防衛線として、
-    結果の形ごとに分岐する（`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §2「1件あたりの
+    結果の形ごとに分岐する（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §2「1件あたりの
     ツール結果バイト予算」）。
 
     `name`（呼び出したツール名）・`args`（そのツール呼出の生の引数）は `handle()` が渡す——

@@ -1,4 +1,4 @@
-"""アナライザ拡張 S3a（docs/proposals/2026-09-05-アナライザ拡張.md §4(b)/(c)/(c)'/(f)・A6/A8/A9）の
+"""アナライザ拡張 S3a（docs/archive/2026-09-05-アナライザ拡張.md §4(b)/(c)/(c)'/(f)・A6/A8/A9）の
 共通層契約テスト。設定ファイルアナライザ本体（S3b）は未実装のため、既存の流儀
 （`tests/unit/test_world_graph_edge_extra.py` と同じ・Java/XML に依存しない最小のフェイクアナライザで
 `registry._ANALYZERS` を monkeypatch）で共通層（`world_graph`）だけを検証する。

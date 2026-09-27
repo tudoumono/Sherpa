@@ -22,7 +22,7 @@ _INVESTIGATION_STATUS_COMPLETED = "sufficient"
 # ——除外しないと出典 0 件のまま未完了/理由不明のターンが honest_failure に誤って混入する。
 # `refusal`（安全上の理由で回答を控えた）・`tools_per_turn_exceeded`（ツール呼び出し数の上限）は
 # 一般には正常終了だが、本モジュールの集計区分では「答えられた」とも「答えられなかった（honest
-# failure）」とも数えたくないためこちら側に含める（docs/proposals/2026-08-28-改善ログ.md §0.2）。
+# failure）」とも数えたくないためこちら側に含める（docs/archive/2026-08-28-改善ログ.md §0.2）。
 # `truncated`/`content_filtered` を生成する経路は現時点のコードに無いため、これらに起因する
 # is_incomplete は実データ上は常に0のまま。
 INCOMPLETE_STOP_REASONS = ("truncated", "content_filtered", "unknown", "refusal", "tools_per_turn_exceeded")
@@ -30,7 +30,7 @@ INCOMPLETE_STOP_REASONS = ("truncated", "content_filtered", "unknown", "refusal"
 # 「答えられなかった」に含めない）。
 _KNOWLEDGE_LENSES = ("qa", "impact", "troubleshoot")
 # 現在コードが実際に生成しうる stop_reason の閉じた語彙（`agentic_search.py`/`providers/base.py`
-# 参照・正典 docs/proposals/2026-08-28-改善ログ.md §0.2 の表と一致させる）。`_resolve_stop_reason`
+# 参照・正典 docs/archive/2026-08-28-改善ログ.md §0.2 の表と一致させる）。`_resolve_stop_reason`
 # はこの語彙に無い値・非文字列を `"unknown"` へ正規化する——未知語をそのまま通すと
 # `stop_reason_counts` 等の下流集計が無制限に増殖し、honest_failure/incomplete の判定も
 # 「知らない値」を暗黙に自然完了扱いしてしまう。
@@ -50,7 +50,7 @@ _TOOL_CALL_LABELS = frozenset({
     "資料を検索（grep）",
     "ファイル名で検索", "フォルダ構成を確認",
     "該当箇所を精読", "文書を通読", "見出し構造を確認", "関係グラフをたどる", "世代間の差分を比較",
-    # 原本読取ツール（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
+    # 原本読取ツール（`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）:
     # `agentic_search._ORIGINAL_READ_LABELS`/`providers/codex/provider.py` の tlabel 辞書と同じ文言。
     # 「原本のシート一覧を確認」（xlsx_sheets）はツール呼び出しとしては数えるが、シート名・
     # 大きさを見るだけで本文は読んでいないため `_FILES_READ_LABEL` には含めない（下記参照）。

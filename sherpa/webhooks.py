@@ -1,4 +1,4 @@
-"""Webhook 通知（PART-6・docs/proposals/2026-09-05-Webhook通知.md）。
+"""Webhook 通知（PART-6・docs/archive/2026-09-05-Webhook通知.md）。
 
 取り込み run の terminal 化（sync/refresh/rebind/rerun/delete の完了・失敗）を、
 `api_keys.webhook_url` を登録したキー宛てに署名付き POST で通知する（ポーリング排除）。
@@ -276,7 +276,7 @@ def _enqueue(key_id: int, url: str, secret: str, payload: dict) -> None:
 def notify_run_terminal(world: str, run_id: int | None, op: str, status: str, *,
                         doc_count: int | None = None) -> None:
     """取り込み run の terminal 化を、`world` を許可する Webhook 登録済みキー全部へ通知する
-    （イベント仕様は `docs/proposals/2026-09-05-Webhook通知.md` 参照）。
+    （イベント仕様は `docs/archive/2026-09-05-Webhook通知.md` 参照）。
 
     best-effort・呼び出し元（`ingest.worker._record`／`worlds._finalize_pending_run`／
     `routers/worlds._run_delete_background`／`background.py` の最外周セーフティネット）は

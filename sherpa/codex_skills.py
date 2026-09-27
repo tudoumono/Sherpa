@@ -55,7 +55,7 @@ def deploy_skills(authoring: Path, uid: str, users_dir: Path, *, skip_prefix: st
     `authoring` は Codex の cwd（既存の封じ込め recipe そのまま・sandbox profile 変更ゼロ）。
 
     `skip_prefix`（既定 None）: 指定すると、この文字列で始まる名前のスキル（base／個人どちらも）を
-    配備しない——素の Codex モード（`plain`・docs/proposals/2026-09-24-素のCodexモード.md §1.2）が
+    配備しない——素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2）が
     `"investigate-"` を渡し、調査スキル（原本を Python で開く前提の手順書）を置かない。
     """
     # RV HIGH: 親 `.agents` 自体の symlink も拒否する。Codex は authoring に書けるため、前回実行で

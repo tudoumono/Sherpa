@@ -2039,7 +2039,7 @@ class _GenProvider(Provider):
     def _claims_synthesis(self, orig_message: str, digest: str,
                           stop_event=None, existing_claims: list | None = None,
                           findings_text: str = "") -> tuple[list | None, dict | None]:
-        """DEPTH-2 S1（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2/§2.5）: 再調査後も
+        """DEPTH-2 S1（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.2/§2.5）: 再調査後も
         なお不足と査読が判定したとき、全回答を固定文言に置き換える前に、確定/推定/不明で構造化した
         主張配列を**1回の呼び出しで**生成する（`_sufficiency_verdict` と同じ4方言非依存の自前
         JSON プロトコル・ツール呼び出しは行わない）。

@@ -3,7 +3,7 @@
 python-pptx に依存せず、手組みの最小 pptx（zipfile で XML を直接書く）で検証する。
 EMU 単位: 1 inch = 914400 EMU。テキスト shape は幅 4000000 x 高さ 2000000 EMU を基準に置く。
 
-正典: docs/proposals/2026-07-07-MD化多アーム統合.md A5 ／ docs/11-Office変換.md §5.5。
+正典: docs/archive/2026-07-07-MD化多アーム統合.md A5 ／ docs/11-Office変換.md §5.5。
 2026-07-12 ユーザー決定＝簡略版（人手確認UIなし・MD本文へマーカー行を自動出力するだけ）。
 """
 from __future__ import annotations

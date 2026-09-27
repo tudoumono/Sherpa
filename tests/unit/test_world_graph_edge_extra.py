@@ -138,7 +138,7 @@ def test_cobol_jcl_copybook_graph_is_unaffected_by_the_extra_transparency_mechan
     ——エッジ属性の透過機構を足しても、その graph は（S1 の意図した差分を除き）不変（`nodes`/
     `edges`/`flags` を丸ごと byte 同一で比較・実測は git stash による before/after 比較で確認済み・
     報告参照）。**唯一の例外**は COBOL の CALL 由来 `INVOKES` エッジの `via=call`（S1・RV1 是正・
-    docs/proposals/2026-09-05-アナライザ拡張.md §4(d)）——それ以外（JCL/コピーブック・COBOL の
+    docs/archive/2026-09-05-アナライザ拡張.md §4(d)）——それ以外（JCL/コピーブック・COBOL の
     `COPIES` 等）は引き続き `via`/追加キーが一切乗らないことを固定する。"""
     wd = ROOT / "fixtures" / "corpus" / "v1"
     nodes, edges, flags = world_graph.build_world(wd, "v1_regress_test")

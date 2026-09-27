@@ -3017,7 +3017,7 @@ def _table_md(tbl_el) -> str:
 
 
 def _docx_md(p: Path) -> str | None:
-    """DOCX の人間向け MD（H2・`docs/proposals/2026-08-28-人間向けMDの刷新.md` §3.2）。
+    """DOCX の人間向け MD（H2・`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.2）。
 
     document-ir（`arms/ooxml_arm._build_docx_ir`）を共通土台にし、`human_md.render_docx` へ委譲する
     （結合セル・ネスト表の展開は `_docx_table_walk` の解決結果をそのまま使う＝独自の簡易パーサは
@@ -3239,7 +3239,7 @@ def _pptx_group_texts(grp) -> list[str]:
 # ---- .xlsx（openpyxl・値ベース）----
 
 def _xlsx_md(p: Path) -> str | None:
-    """XLSX の人間向け MD（H2・`docs/proposals/2026-08-28-人間向けMDの刷新.md` §3.1）。
+    """XLSX の人間向け MD（H2・`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.1）。
 
     document-ir（`arms/ooxml_arm._build_xlsx_ir`）を共通土台にし、`human_md.render_xlsx` へ委譲する
     （シート丸ごと1枚の打切り付きパイプ表ではなく、`ooxml/excel.py::regions()` が検出する表候補

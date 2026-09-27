@@ -626,7 +626,7 @@ def test_run_tool_window_cap_raises_read_around_ceiling(monkeypatch, tmp_path):
     assert res_wide["text"].splitlines()[0] == "1: line 1"         # 先頭行までレンジが伸びる
 
 
-# ===== docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツール =====
+# ===== docs/archive/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツール =====
 # world/scope_paths とは無関係（引数検証・dispatch・cards サイドカーだけを固定する・DB は monkeypatch
 # で切り離す＝本ファイルの他の run_tool テストと同じ「実埋め込み/実DBを叩かない」流儀）。
 
@@ -2004,7 +2004,7 @@ def test_openai_style_budget_snapshotted_once_settings_change_mid_run_has_no_eff
 
 
 # ===== 窓連動の撤去（旧 BUDGET-2・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4 で導入・
-# `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で撤去）=====
+# `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で撤去）=====
 # `resolve_tool_result_budgets`/`effective_tool_result_max_bytes`/`effective_tool_result_max_total_bytes`
 # は `provider`/`model`/`ollama_base_url`/`anthropic_client` を受け取っても値の解決には使わない
 # （利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）——渡す・渡さないで結果が変わらないことを
@@ -7781,7 +7781,7 @@ def test_graph_neighbors_view_marks_edges_backed_by_unverified_docs(monkeypatch)
         lens_service.neighbor_cards = orig
 
 
-# ===== S3b: 原本読取ツール（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
+# ===== S3b: 原本読取ツール（`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
 # `_safe_original_path` の封じ込め（`_safe_doc_path` と同じ検査項目を Office/PDF は世界 root の
 # 原本へ解決する版で共有）と、`run_tool` への配線（xlsx/docx/pptx/pdf/file_head）を検証する。
 # `doc_readers.py` 自体の入出力契約は tests/unit/test_doc_readers.py が担う——ここでは

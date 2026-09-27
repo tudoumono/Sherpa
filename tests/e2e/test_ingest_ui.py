@@ -964,7 +964,7 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
     expect(pickbtn).to_be_enabled()
 
 
-# ソース正典化（`docs/proposals/2026-09-04-グラフのソース正典化.md`・S3）: 「グラフを生成」ボタン
+# ソース正典化（`docs/archive/2026-09-04-グラフのソース正典化.md`・S3）: 「グラフを生成」ボタン
 # （`data-extract`）・`extractWorld()`・`isGraphExtractFailure`（llm_unavailable/llm_error 案内）は
 # web/ingest.js から機構ごと撤去済み（意味層 LLM 抽出は K9 で撤去・バックエンドの `/extract` は
 # 後続レーンで撤去予定）。この機構だけを検証していた

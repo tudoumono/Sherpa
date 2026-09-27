@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の SQL/DDL・EXEC SQL 統合テスト（アナライザ拡張 S2・
-docs/proposals/2026-09-05-アナライザ拡張.md §4(a)/(d)/(g)）。
+docs/archive/2026-09-05-アナライザ拡張.md §4(a)/(d)/(g)）。
 
 `fixtures/corpus/sql1`（DDL 3表＋うち1つ引用識別子＋制約行混在＋CREATE VIEW/ALTER TABLE＋
 コメント/文字列内の CREATE TABLE 罠＋EXEC SQL を含む COBOL）を実際に `build_world()` へ通し、

@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の Java FW / 設定ファイル統合テスト（アナライザ拡張 S3b/S3'・
-docs/proposals/2026-09-05-アナライザ拡張.md §4(b)/(c)/(c)'）。
+docs/archive/2026-09-05-アナライザ拡張.md §4(b)/(c)/(c)'）。
 
 `fixtures/corpus/java-fw`（Spring/MyBatis/Struts の最小サンプル＋設定でない XML＋壊れた XML＋
 properties/YAML＋`configkeys/`＝S3' のキー単位 children/config_key 参照サンプル）を実際に

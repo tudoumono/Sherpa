@@ -1,5 +1,5 @@
 """共有フォーク（SH-1・引き継いで質問）と再共有（SH-2・スナップショット更新）テスト
-（docs/proposals/2026-08-23-共有フォーク.md）。
+（docs/archive/2026-08-23-共有フォーク.md）。
 
 `test_sanitized_share.py`/`test_auth_sharing.py` と同じ流儀: store 層の関数を直接呼んで
 データ・例外契約を固定し、HTTP ステータス（403/404/409）の対応づけはルータ経由（TestClient）で

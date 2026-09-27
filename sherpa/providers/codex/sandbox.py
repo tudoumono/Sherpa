@@ -41,7 +41,7 @@ def _codex_sandbox_enabled() -> bool:
     return os.environ.get("SHERPA_CODEX_SANDBOX", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 
-# 素の Codex モード（管理画面の設定 `codex_mode`・docs/proposals/2026-09-24-素のCodexモード.md §1.1）。
+# 素の Codex モード（管理画面の設定 `codex_mode`・docs/archive/2026-09-24-素のCodexモード.md §1.1）。
 # "standard"＝今の作り（比較の基準）・"plain"＝Sherpa の上乗せ（台帳・出力スキーマ・multi_agent・
 # 検索/読取ツール一式）を外し、Codex 本来の調べ方（シェルで資料フォルダを直接読む）に任せる。
 CODEX_MODES = ("standard", "plain")
@@ -199,7 +199,7 @@ def _kb_read_roots(world: str) -> list:
 def _direct_read_roots(world: str, scope_paths=None) -> list:
     """原本直読（Codex がコードインタープリターで直接開く）で permission profile に read を許す
     絶対パスの一覧＝KB root（`_kb_read_roots`）＋派生ルート（`derived_md_dir`／`derived_rag_dir`・
-    存在するもののみ）。正典＝docs/proposals/2026-09-10-Codex原本直読と調査スキル.md §2-1/§2-2。
+    存在するもののみ）。正典＝docs/archive/2026-09-10-Codex原本直読と調査スキル.md §2-1/§2-2。
 
     範囲（scope）の限定は read root を狭めるのではなく、`_scope_deny_entries` が「範囲の経路上に
     ない兄弟（フォルダ・ファイル）」を個別 deny することで実現する——Codex サンドボックス

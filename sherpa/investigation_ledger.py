@@ -1,4 +1,4 @@
-"""調査台帳の純関数部分（`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §3/§7 が正典）。
+"""調査台帳の純関数部分（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §3/§7 が正典）。
 
 台帳は「回答の正本」ではなく「1ターンの作業台帳」。業務事実の正本は常にソース、利用者への回答の
 正本は `messages.answer`（正典 §3「位置づけ」）。このモジュールは台帳の read/write/判定だけを扱う
@@ -30,7 +30,7 @@
   という2つの抜け道を塞ぐ）。
 - `required_checks` は `EVIDENCE_KINDS`（`source`/`spec_doc`/`definition`/`log_config`/
   `callgraph`）の閉集合——語彙外・重複・空配列は無効
-  （`docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` §3.3。何を確認すべきか
+  （`docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` §3.3。何を確認すべきか
   宣言していない item は完了判定できない）。`EVIDENCE_REQUIRED_STATUSES` の3状態はさらに、その
   状態が意味として要求する根拠種別が `evidence` の `kind` に無ければ無効とする（`source_confirmed`
   →`source`／`spec_only`→`spec_doc`／`conflict`→`source`と`spec_doc`の両方。設計書の根拠だけでは
@@ -138,7 +138,7 @@ class Verdict:
     一貫させるため）。例外は `unsatisfied`（下記）の id——構造的には有効・終端だが根拠種別が
     未充足の item は `non_terminal_ids` にも重ねて現れる。
 
-    `unsatisfied`（`docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` §3.3が
+    `unsatisfied`（`docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` §3.3が
     正典）: `EVIDENCE_REQUIRED_STATUSES`（`source_confirmed`/`spec_only`/`conflict`）の登録済み
     item のうち、`required_checks` と `ledger_complete()` の `required_extra` の**和集合**の一部が
     `evidence` に無い id → 足りない種別（ソート済み）の対応。item 自体は `validate_item` 上は有効
@@ -401,7 +401,7 @@ def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...]
     非終端/無効 item はここに現れず、`unregistered_ids` にのみ現れる（前掲の契約を報告欄でも
     一貫させる）。
 
-    `unsatisfied`（`docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` §3.3が
+    `unsatisfied`（`docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` §3.3が
     正典）: 登録集合内・有効（`snapshot.items` に入っている）・状態が `EVIDENCE_REQUIRED_STATUSES`
     の item のうち、`required_checks` に宣言した根拠種別の一部が `evidence` の `kind` に無い id
     → 足りない種別（ソート済みタプル）の対応。item 自体は `validate_item` の意味では有効

@@ -402,7 +402,7 @@ def get_provider(settings: dict | None = None, system_settings: dict | None = No
     回答方針（system プロンプト・#2）を provider に載せる（LLM 系は system メッセージに前置）。
 
     worker（下調べ役・`sherpa/search_helper.py`）: 頭脳 × `search_helper` の組合せ表（提案書
-    docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）に従い `p._sub` を設定する。
+    docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）に従い `p._sub` を設定する。
     **openai/ollama 頭脳には必ず worker が付く**（下調べ役なしの選択肢は無い＝常に
     「worker ＋ orchestrator/evaluator」のハイブリッド1経路）:
     `search_helper=openai`/`ollama` は安いモデルの worker、空（未設定）・鍵未設定は

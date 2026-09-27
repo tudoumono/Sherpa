@@ -1,6 +1,6 @@
 """L4b（派生物のフォルダ三分割・§8.1）の受け入れ条件を実配置で固定する。
 
-正典: `docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.1（三階層＋フォルダ分離）。
+正典: `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.1（三階層＋フォルダ分離）。
 
 既存の大半の単体テストは `worlds.derived_md_dir`/`derived_rag_dir`/`derived_ir_dir` を monkeypatch
 で個別に差し替えている（office_md.build_derived への直接パス指定・grep_tool/agentic_search/

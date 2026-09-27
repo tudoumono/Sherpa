@@ -8,7 +8,7 @@
 
 制約: **メインが OpenAI 直結構成または Ollama 構成のときだけ効く**（頭脳 × 本設定の組合せ表は
 `sherpa/providers/__init__.py::get_provider` docstring・提案書
-docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。`resolve()` 自体は頭脳の種類を
+docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。`resolve()` 自体は頭脳の種類を
 見ない（設定1項目から下調べ役の形を組み立てるだけ）——どの頭脳でどの選択を実際に使うか／無視するか
 の判断は呼び出し側（`get_provider`）が組合せ表に従って行う。Codex 構成は Codex CLI が自分でツールを
 回すため、Sherpa 側のサブループが介在しない。

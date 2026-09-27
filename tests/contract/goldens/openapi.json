@@ -5437,7 +5437,7 @@
         "type": "object"
       },
       "UsageConversationRow": {
-        "description": "会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。\n\nトークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で\n切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。\n`response_time_avg_ms` は `duration_ms` が保存された assistant 行のみの平均（0件なら None）。\nタイトル・本文は含まない。",
+        "description": "会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。\n\nトークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で\n切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。\n`response_time_avg_ms` は `duration_ms` が保存された assistant 行のみの平均（0件なら None）。\nタイトル・本文は含まない。",
         "properties": {
           "conversation_id": {
             "title": "Conversation Id",

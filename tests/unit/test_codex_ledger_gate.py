@@ -1,4 +1,4 @@
-"""調査台帳ゲート（`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §2/§4/§6 の provider.py
+"""調査台帳ゲート（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §2/§4/§6 の provider.py
 統合・`sherpa/investigation_ledger.py` は純関数のみ担当）。
 
 `CodexProvider._run_authoring` は、出力スキーマ v2（`_schema_v2`）が有効なとき、モデルが返した

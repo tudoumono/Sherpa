@@ -1,6 +1,6 @@
 """chat_service の単体テスト。
 
-- _cap_trace_v2: EXT-1（Execution Event v2・`docs/proposals/2026-08-22-拡張設計.md` §2）。
+- _cap_trace_v2: EXT-1（Execution Event v2・`docs/archive/2026-08-22-拡張設計.md` §2）。
   TOGGLE-RM（2026-09-03）で v1（旧 `_cap_trace`・トグル `SHERPA_EXEC_EVENT_V2`）を撤去し常時
   v2 固定＝`answer.trace_version` は常に2が付く。二段上限（RV是正・needs-work全6件採用）:
   ①ソフト上限（親は必ず残し末端だけ `(parent_id, kind, agent_run_id)` 単位で集約ノードへ畳む・
@@ -1340,7 +1340,7 @@ def test_handle_message_saves_trace_version_always(monkeypatch):
 
 def test_handle_message_saves_trace_version_and_hierarchy(monkeypatch):
     """受け入れ条件(b): trace_version=2 のターンで parent_id/agent_run_id を持つイベントが
-    保存される（`docs/proposals/2026-08-22-拡張設計.md` §11.3①）。"""
+    保存される（`docs/archive/2026-08-22-拡張設計.md` §11.3①）。"""
     conv_id = _new_conv()
     parent = EE.build_event("agent-1", "agent", "サブ開始", "worker1 を起動", "done",
                             event_type="agent_started", agent_run_id="sub:worker1:1",
@@ -2786,7 +2786,7 @@ def test_facts_impact_zero_items_uses_synthesis_digest_not_zero_count():
 def test_answer_prompt_list_docs_completion_uses_set_match_not_sum():
     """C3 是正: list_docs の全件確認の完了条件を「列挙件数の単純合計」ではなく「同条件で取得した
     パスの重複除去した集合の件数と総数の照合」に変える（提案書
-    docs/proposals/2026-09-11-全件調査の完了条件と中断時の回答.md の C4「件数一致だけで、欠落と
+    docs/archive/2026-09-11-全件調査の完了条件と中断時の回答.md の C4「件数一致だけで、欠落と
     重複が相殺された状態を合格にしない」が正典）。重複ページの列挙件数が単純合計されると、
     実際には一部ページが欠落していても合計値だけは総数と一致し得る——集合照合ならその欠落を
     見逃さない。"""

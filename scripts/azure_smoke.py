@@ -2,7 +2,7 @@
 """Azure OpenAI（または他の OpenAI 互換エンドポイント）への実疎通を一発で確認する（2026-08-20 作成）。
 
 背景: `sherpa/llm.py` に接続先の設定化（`OPENAI_BASE_URL` 等・2026-08-18・
-docs/proposals/2026-08-18-AzureOpenAI対応.md）を実装したが、実 Azure での疎通は未検証だった。
+docs/archive/2026-08-18-AzureOpenAI対応.md）を実装したが、実 Azure での疎通は未検証だった。
 このスクリプトは、実 Azure アカウントを持つ利用者が「何が通って何が落ちるか」を一発で確かめ、
 同じものを先方（本番）環境の受け入れ確認にも使えるようにする。
 

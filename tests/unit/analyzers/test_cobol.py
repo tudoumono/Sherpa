@@ -149,7 +149,7 @@ def test_extract_refs_finds_dynamic_call_within_column_72():
 
 def test_extract_refs_detects_dynamic_call_beyond_column_72_when_source_format_free():
     """`>>SOURCE FORMAT FREE` 指示文があるファイルは自由形式＝73桁以降も切り詰めない
-    （固定／自由形式は入力から判定する・docs/proposals/2026-08-29-コード解析層のコンポーネント化.md §2.2）。"""
+    （固定／自由形式は入力から判定する・docs/archive/2026-08-29-コード解析層のコンポーネント化.md §2.2）。"""
     beyond = " " * 72 + "CALL COLUMN73PLUS."
     text = ">>SOURCE FORMAT FREE\n       PROGRAM-ID. ORDER-MAIN.\n" + beyond + "\n"
     res = A.extract_refs(text, "ORDER-MAIN.cbl")

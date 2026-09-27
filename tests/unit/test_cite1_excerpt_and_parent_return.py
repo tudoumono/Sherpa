@@ -1,8 +1,8 @@
 """CITE-1（H3/SC-4 の生き残り核）の受け入れ条件テスト。
 
-正典: `docs/proposals/2026-08-22-検索接続切替.md` §9（SC-4 追加要件）・
-`docs/proposals/2026-08-28-人間向けMDの刷新.md` §7（H3）・
-`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.3/§3.4（非agentic への適用範囲拡張）。
+正典: `docs/archive/2026-08-22-検索接続切替.md` §9（SC-4 追加要件）・
+`docs/archive/2026-08-28-人間向けMDの刷新.md` §7（H3）・
+`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.3/§3.4（非agentic への適用範囲拡張）。
 
 - excerpts.py: rag チャンクの locator/chunk_id/span から人間向け MD の該当節へ引き直せること・
   対応不能時のフォールバック＋位置ヒントを固定する。

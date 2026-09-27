@@ -94,7 +94,7 @@
   .chart-total{font-size:var(--text-caption);font-weight:400;color:var(--ink-3);margin-left:4px;font-variant-numeric:tabular-nums}
   .zhr-cell{cursor:help}
 
-  /* （docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: 会話別上位の「用途別」列＝用途ごとの
+  /* （docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: 会話別上位の「用途別」列＝用途ごとの
      回数・トークン・所要時間を1行ずつ積む小さな内訳リスト。 */
   .convkinds{margin:0;padding:0;list-style:none;font-size:var(--text-caption)}
   .convkinds li{white-space:nowrap}
@@ -322,7 +322,7 @@
 </section>
 <section id="usage-panel-quality" role="tabpanel" aria-labelledby="usage-tab-quality" data-usage-panel="quality" hidden>
       <div class="usage-section-heading"><h2>回答の状態と時間</h2><p class="hint">途中で終わった理由、回答時間、見直しの記録を確認できます。完了は正解を意味しません。</p></div>
-      <!-- ターンの傾向（docs/proposals/2026-09-12-利用統計の拡充2.md §2）: 終了理由の分布・会話あたりの
+      <!-- ターンの傾向（docs/archive/2026-09-12-利用統計の拡充2.md §2）: 終了理由の分布・会話あたりの
            やり取り回数と resume 率・回答時間の分布。 -->
       <div class="pagehead" style="margin-top:28px">
         <div><h2 style="font-size:var(--text-body);margin:0">ターンの傾向</h2></div>
@@ -486,7 +486,7 @@
           <tbody id="token-kind-tbody"></tbody>
         </table>
       </div>
-      <!-- ユーザー別 × 用途別内訳（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (a)）。
+      <!-- ユーザー別 × 用途別内訳（docs/archive/2026-09-12-利用統計の拡充2.md §2 (a)）。
            tokens.by_user_kind が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
       <div class="card" id="token-user-kind-card" style="overflow-x:auto;margin-bottom:14px" hidden>
         <div class="chart-title">ユーザー別×用途別</div>
@@ -522,7 +522,7 @@
           <tbody id="token-user-tbody"></tbody>
         </table>
       </div>
-      <!-- 会話ごとの補助 AI 使用量（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
+      <!-- 会話ごとの補助 AI 使用量（docs/archive/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
            上位20件。タイトル・本文は表示しない＝会話 id はテキストのみ（リンクにしない）。
            conversations_top が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
       <div class="card" id="conversations-top-card" style="overflow-x:auto" hidden>

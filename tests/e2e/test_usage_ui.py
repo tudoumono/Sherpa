@@ -145,7 +145,7 @@ def test_usage_trends_section_handles_empty_data_without_crashing(page, web_base
 
 
 def test_usage_stat4_new_metrics_render_with_default_seed(page, web_base_url):
-    """（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: 見えていなかった6項目が
+    """（docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: 見えていなかった6項目が
     USAGE_STATS_DEFAULT の値どおりに描画される。"""
     from playwright.sync_api import expect
 

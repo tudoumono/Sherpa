@@ -1,4 +1,4 @@
-"""DEPTH-2 S2（§2.7・docs/proposals/2026-09-17-深さの再定義とレビュー巡.md）単体テスト。
+"""DEPTH-2 S2（§2.7・docs/archive/2026-09-17-深さの再定義とレビュー巡.md）単体テスト。
 
 - write_output_file ツール本体（`agentic_search._run_write_output_file`）: 個人 workspace の
   files/ 台帳（`personal_workspace_files`）へ登録・marp:true の pdf/pptx 化（marp_render はモック）。

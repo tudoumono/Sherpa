@@ -120,9 +120,9 @@ from .sandbox import (
 # 同じ場所を指すには `parents[2]` にする（モジュール docstring 参照）。
 _SKILLS_BASE = Path(__file__).resolve().parents[2] / "skills_base"
 
-# `--output-schema` に渡す固定スキーマファイル（docs/proposals/2026-09-08-Codex出力スキーマ.md §2-1）。
+# `--output-schema` に渡す固定スキーマファイル（docs/archive/2026-09-08-Codex出力スキーマ.md §2-1）。
 # パッケージ内に同梱（本モジュールと同じディレクトリ）。v2（DEPTH-2 S1・
-# docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5）は v1 の3キーに `claims`
+# docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.5）は v1 の3キーに `claims`
 # （確定/推定/不明の主張配列）を足した版——`SHERPA_CODEX_OUTPUT_SCHEMA` の値で選ぶ。
 _OUTPUT_SCHEMA_PATH = Path(__file__).resolve().parent / "output_schema.json"
 _OUTPUT_SCHEMA_PATH_V2 = Path(__file__).resolve().parent / "output_schema_v2.json"
@@ -216,7 +216,7 @@ def _resolve_mcp_budget(system_settings: dict | None, model: str | None,
 
     ツール呼び出し回数の上限は渡さない（`SHERPA_MCP_TOOL_MAX_CALLS` は撤去済み）——クイックも
     含め、調査を終了させる上限は設けず速さは見直し回数・推論段で表現する
-    （`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §2）。
+    （`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §2）。
     """
     provider = "ollama" if ollama_base_url is not None else "openai"
     sysset = system_settings
@@ -851,7 +851,7 @@ _CONTINUE_PROMPT_SCHEMA = (
     "終わっていなければ `final` にせず、`in_progress` のまま `next_step` に残りを書いてください。"
 )
 
-# 調査台帳ゲート（docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md §2/§4/§6・
+# 調査台帳ゲート（docs/archive/2026-09-21-調査台帳を文脈の外に置く.md §2/§4/§6・
 # `investigation_ledger.py` が判定の純関数部分）: `status=final` を機械的にそのまま信じず、台帳
 # （`run_dir/.tmp/investigation/`）が完了しているかを確認してから受理する。既存の自動継続
 # （`SHERPA_CODEX_AUTO_CONTINUE`・「in_progress のまま尽きた」を検出する別枠）とは独立の上限。
@@ -1126,7 +1126,7 @@ def _retire_investigation_ledger(investigation_dir: Path, ledger_home: Path,
         return False
 
 
-# ---- 出力スキーマ（`--output-schema`・docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3）----
+# ---- 出力スキーマ（`--output-schema`・docs/archive/2026-09-08-Codex出力スキーマ.md §2-3）----
 # `_OUTPUT_SCHEMA_PATH` の3キーちょうど（strict・additionalProperties: false）と対応させる。
 _STRUCTURED_KEYS = {"status", "answer", "next_step"}
 _STRUCTURED_STATUSES = {"final", "in_progress"}
@@ -1741,7 +1741,7 @@ class CodexProvider(Provider):
         return sysp + base + " " + _NO_FILES_SENTENCE + f"\n\n{self._history_block()}【質問】{message}"
 
     def _prompt_plain(self, message, lens, world, mcp: bool = True):
-        """素の Codex（`plain`・docs/proposals/2026-09-24-素のCodexモード.md §1.2）向けプロンプト。
+        """素の Codex（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2）向けプロンプト。
 
         Sherpa 側の調べ方の上乗せ（MCP ツール一覧と使い分け・list_docs 誘導・investigate スキル
         誘導・台帳・影響調査の手順の長文・原因調査の症状語の指示）は持たない——Codex 本来の調べ方
@@ -1825,7 +1825,7 @@ class CodexProvider(Provider):
     def _run_authoring(self, ctx: Ctx) -> Iterator[dict]:
         decision = env = None
         _turn_t0 = time.monotonic()   # `sherpa.usage` ログ 1 行の elapsed（このターン全体）
-        # 素の Codex モード（`codex_mode`・docs/proposals/2026-09-24-素のCodexモード.md §1.1）:
+        # 素の Codex モード（`codex_mode`・docs/archive/2026-09-24-素のCodexモード.md §1.1）:
         # ターンの最初に1回だけ決め、以下の全箇所（プロンプト・AGENTS.md・スキル配備・出力
         # スキーマ・multi_agent・台帳・MCP env・codex.log 開始行・activity.settings）で同じ値を
         # 使う。`standard`（既定）はこのフラグが常に偽のまま＝以降の分岐は全て else 側（現行の

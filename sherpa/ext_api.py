@@ -1,7 +1,7 @@
 """外部連携 API（`/ext/v1`）— APIキー認証基盤・決定的変換・エンジン分離検索＋RRF融合・
 discovery・原本取得・キーの world スコープ。
 
-docs/proposals/2026-07-07-外部API化とDify.md／docs/proposals/2026-08-24-部品API設計.md の
+docs/archive/2026-07-07-外部API化とDify.md／docs/archive/2026-08-24-部品API設計.md の
 スコープを実装する（sync/run照会は不要と判断・実装しない。キー単位のレート制限は
 `_verify_key_sync` 内の `sherpa.ratelimit.check_ext_api_rate_limit` 呼び出しで別途実装済み）。
 
@@ -38,7 +38,7 @@ CFB ヘッダの健全性のみ検証する（stream 列挙・形式判別はし
 writer スレッド経由・hash-chain は DB 側で直列化されるため並列化はしない）を一元的に行う。
 詳細は `ExtRequestMiddleware` の docstring 参照。下流
 （agentic search の実行イベント等）への request_id 伝播は
-docs/proposals/2026-08-24-部品API設計.md §8 のとおり PART-4 側のスコープ（ここでは行わない）。
+docs/archive/2026-08-24-部品API設計.md §8 のとおり PART-4 側のスコープ（ここでは行わない）。
 """
 from __future__ import annotations
 

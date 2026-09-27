@@ -522,7 +522,7 @@ class CodexWorkerModelInfo(BaseModel):
 
 
 class CodexModeInfo(BaseModel):
-    """`codex_mode`（素の Codex モード・docs/proposals/2026-09-24-素のCodexモード.md §1.1）。
+    """`codex_mode`（素の Codex モード・docs/archive/2026-09-24-素のCodexモード.md §1.1）。
     `configured` は管理者が保存した生値（未設定なら `None`）、`effective` は
     `sherpa.providers.codex.sandbox.codex_mode` の解決結果、`default` は "standard"、`options` は
     選べる値（`sherpa.providers.codex.sandbox.CODEX_MODES`）。"""
@@ -951,7 +951,7 @@ class UsageConversationKindRow(BaseModel):
 
 
 class UsageConversationRow(BaseModel):
-    """会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。
+    """会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。
 
     トークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で
     切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。

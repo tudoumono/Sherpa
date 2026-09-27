@@ -1,5 +1,5 @@
-"""`sherpa/model_windows.py`（`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.4・
-2026-09-03 裁定で導入・`docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で
+"""`sherpa/model_windows.py`（`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §3.4・
+2026-09-03 裁定で導入・`docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で
 管理画面登録値（段1）を撤去）の単体テスト。
 
 - `derive_window_bytes`: 決定的な純関数（予約枠・安全係数・バイト換算率・下限）。

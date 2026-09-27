@@ -770,7 +770,7 @@ _SCHEMA = [
     "ALTER TABLE depth_quality_runs ADD COLUMN IF NOT EXISTS executed_to TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS idx_depth_quality_runs_executed "
     "ON depth_quality_runs (executed_from, executed_to)",
-    # 集計専用の細い写像表（docs/proposals/2026-09-23-利用統計の刷新.md §3.1/§4）。1 assistant
+    # 集計専用の細い写像表（docs/archive/2026-09-23-利用統計の刷新.md §3.1/§4）。1 assistant
     # message = 1 行。正本は引き続き messages.answer（JSONB・全文）——本表はそこから再生成できる
     # 派生物で、集計を索引付きで速くするためのコピー（`store/turn_metrics.py::metrics_from_answer`
     # が唯一の写像元）。personal はこのアシスタント回答自体が個人の資料を使ったか

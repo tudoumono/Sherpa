@@ -1600,7 +1600,7 @@ def test_chunk_locator_absent_when_no_usable_citation():
 
 
 # ---- _validate_rag_chunks（rag_chunks.jsonl + rag.md → ES bulk 用の (ids, bodies, texts, reason)）----
-# D1（`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.1）: 索引本文は jsonl の
+# D1（`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.1）: 索引本文は jsonl の
 # `search_text` ではなく rag.md のアンカー間本文から取る。
 
 _ROW1 = {"chunk_id": "rc1", "source_rel_path": "a.docx",

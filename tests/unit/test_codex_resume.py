@@ -231,7 +231,7 @@ def _setup(tmp_path: Path, monkeypatch, users_dirname: str = "users") -> tuple[P
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / users_dirname))
     # 偽 codex は平文 agent_message を返す（resume 配線の検証が目的で出力スキーマは対象外）。
     # `--output-schema`（既定 ON）だと平文は未完了扱いになり headline が変わってしまうため無効化する
-    # （docs/proposals/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
+    # （docs/archive/2026-09-08-Codex出力スキーマ.md §2-3 のスキーマ無効時契約）。
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
     # RV再検証 HIGH-1 検証用: `_write_codex_authoring_config` は実 `CODEX_HOME/auth.json`（無ければ
     # `~/.codex/auth.json`）が存在する時だけ symlink を張る。ホストの実 `~/.codex` 状態に依存させず

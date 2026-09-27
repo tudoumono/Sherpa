@@ -1,6 +1,6 @@
 """「今すぐ更新」の自己修復（R1 グラフ・R2 ES）を実 Neo4j・実 ES・実 Postgres で検証する。
 
-docs/proposals/2026-09-23-今すぐ更新で索引とグラフを直す.md の受入条件 1〜4 を、
+docs/archive/2026-09-23-今すぐ更新で索引とグラフを直す.md の受入条件 1〜4 を、
 `worker.sync()` の不変分岐（"今すぐ更新" と同じ入口）を通して固定する。world は本テスト専用に
 `worlds.register()` で登録し（フィクスチャは使わない・COBOL の CALL で実際のエッジを1本作る）、
 Neo4j/ES を直接 corrupt してから sync 1回で戻ることを確かめる。world_id はレーン注入の

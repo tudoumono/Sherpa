@@ -2,7 +2,7 @@
 
 Codex（MCP 経由）と API 経路の頭脳（OpenAI/Gemini のツール呼び出し）が**同じ関数**で原本
 （Excel／Word／PowerPoint／PDF／テキスト・コード）の中身を読む
-（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）。毎回 Python を書かせず
+（`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）。毎回 Python を書かせず
 シート・段落・ページを直接返すことで、トークンと実行時間を削り再現性を上げる——Codex がコードを
 書くのは突合・集計など定型外の作業だけにする。
 

@@ -34,7 +34,7 @@ def add_message(conversation_id, role, content="", lens=None,
     """メッセージを1件追加し、会話の updated_at を進める。personal=True＝そのターンが個人利用（sanitized share 用）。
 
     role='assistant' かつ answer が dict のとき、同じ接続・同じトランザクションで
-    `turn_metrics`/`turn_tool_stats`（docs/proposals/2026-09-23-利用統計の刷新.md §3.1/§4）へも書く。
+    `turn_metrics`/`turn_tool_stats`（docs/archive/2026-09-23-利用統計の刷新.md §3.1/§4）へも書く。
     この書込は `upsert_best_effort` が savepoint で保護するため、失敗してもここでの本体メッセージ
     保存は失敗させない——両表は answer（この INSERT で確定する正本）から再生成できる派生物であり、
     書込に失敗した行は `turn_metrics.ensure_rows()` が後で埋められる。

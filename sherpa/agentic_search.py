@@ -1283,7 +1283,7 @@ _DESC_LIST_DOCS = ("文書台帳の一覧・件数を返す（本文は読まな
                    "count は絞り込み後の全件数（limit/offset と無関係）、docs は offset から limit 件までの"
                    "一覧（rel_path/doctype/state）。truncated:true なら残りがある——次回呼び出しの offset に"
                    "next_offset をそのまま渡して続きを取る。")
-# K6（`docs/proposals/2026-09-04-グラフのソース正典化.md` §3・§4b S1）: list_docs（ls 相当・フラット
+# K6（`docs/archive/2026-09-04-グラフのソース正典化.md` §3・§4b S1）: list_docs（ls 相当・フラット
 # 一覧）に対する tree 相当。フォルダ名の意味解釈はしない（クエリ時にこのツールの呼び出し元＝LLM が
 # 解釈する・K6・§5「フォルダ意味ノードの事前計算はしない」）。
 _DESC_FOLDER_TREE = ("world のフォルダ階層を、深さ上限つき・フォルダごとの件数つきで俯瞰する"
@@ -1347,7 +1347,7 @@ _DESC_GLOB = ("ファイル名・フォルダ名のパターンで対象範囲�
              "大文字小文字は区別しない。該当パス一覧と総件数を返す（上限200件・超過分は打ち切り＝truncated:true。"
              "続きは取れないので、その範囲は未確認として扱い count との差を全件と断定しない）。"
              "『x/**』は x 自体にも一致する（配下だけに絞るなら『x/**/*』）。")
-# GEN-DIFF（世代間diff比較・`docs/proposals/2026-09-03-世代間diff比較.md`）: grep と同格の素朴な
+# GEN-DIFF（世代間diff比較・`docs/archive/2026-09-03-世代間diff比較.md`）: grep と同格の素朴な
 # 決定的ツール——2文書のRAG正本（.rag.md）の unified diff を返すだけで、レコード同定・業務キー
 # 対応付け・要約はしない（それらは呼び出し元＝LLM が diff テキストを読んで行う）。
 _DESC_COMPARE = ("2つの文書のRAG正本（.rag.md）を突き合わせ、追加/削除/変更行の unified diff を返す"
@@ -1374,7 +1374,7 @@ _VERIFIED_READ_TOOLS = frozenset({"read_around", "read_doc", "xlsx_range", "docx
                                   "pptx_slides", "pdf_pages", "file_head"})
 
 
-# ---- 原本読取ツール（S3b・`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）----
+# ---- 原本読取ツール（S3b・`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）----
 # Codex（MCP 経由）と API 経路の頭脳（このモジュールの function-calling）が**同じ関数**
 # （`doc_readers.py`）で原本の中身を読む。毎回 Python を書かせない＝トークンと実行時間を削り、
 # 再現性を上げる（突合・集計など定型外の作業だけ Python に任せる）。
@@ -2961,7 +2961,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             result["file_truncated"] = True
         return (result, docs, cites, cards)
     if name == "compare_documents":
-        # GEN-DIFF（`docs/proposals/2026-09-03-世代間diff比較.md` §3〜§5）: 実装本体は独立モジュール
+        # GEN-DIFF（`docs/archive/2026-09-03-世代間diff比較.md` §3〜§5）: 実装本体は独立モジュール
         # （`compare_docs.py`）——ここでは scope/deadline を渡して呼び、①出典（docs）への反映、
         # ②予算クリップ（他ツールと同じ `_clip_utf8_bytes`/`tr_max_bytes`）だけを担う。
         from . import compare_docs
@@ -3075,7 +3075,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
     return ({"error": f"unknown tool: {name}"}, docs, cites, cards)
 
 
-# ---- 利用統計チャットの調査ツール（docs/proposals/2026-09-12-利用統計の拡充2.md §3b）----
+# ---- 利用統計チャットの調査ツール（docs/archive/2026-09-12-利用統計の拡充2.md §3b）----
 # world/scope_paths とは無関係（管理者向け利用統計は KB world を持たない）。docs/cites は常に
 # 空（引用機構を使わない）——「調べた内容」の記録は `cards` サイドカーに `{"tool","args"}` として積む
 # （`graph_neighbors` が `cards` を候補カードのサイドカーとして使うのと同じ「run_tool の4つ目の
@@ -6365,7 +6365,7 @@ def openai_style(endpoint: str, headers: dict, model: str, system: str, user: st
     # 最終回答**（外側クラウド合成 `_answer_prompt`）自身に対する帰属だけを使う契約
     # （`providers/base.py` がストリーム完了後に別途組み立てる）。
     if not final_synthesis:
-        # DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）: 文章を
+        # DEPTH-2 S4b（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）: 文章を
         # 破棄する代わりに、収集済み根拠（このループ専用のローカル `state`）から確定/推定/不明の
         # 主張配列を worker 自身の接続・モデルで**1回だけ**要求する。通信失敗・パース不能・
         # 途中で切れた JSON・budget_exceeded はいずれも `claims_raw=None`＝根拠だけで従来どおり

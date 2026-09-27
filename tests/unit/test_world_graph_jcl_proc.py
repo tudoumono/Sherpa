@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の JCL PROC/INCLUDE 展開の統合テスト（アナライザ拡張 S5a・
-docs/proposals/2026-09-05-アナライザ拡張.md §4(d)/§9 S5a）。
+docs/archive/2026-09-05-アナライザ拡張.md §4(d)/§9 S5a）。
 
 `fixtures/corpus/jcl-proc` を実際に `build_world()` へ通し、`Batch(JOB) -INVOKES(via=exec_proc)->
 Batch(PROC) -INVOKES-> Module` の2段・`INCLUDE MEMBER=` の `Batch` 化・世代（トップフォルダ）跨ぎで

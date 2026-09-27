@@ -1,5 +1,5 @@
 """`world_graph.build_world()` 経由の C アナライザ統合テスト（アナライザ拡張 S6・
-docs/proposals/2026-09-05-アナライザ拡張.md §4(a)/§9 S6/§12）。
+docs/archive/2026-09-05-アナライザ拡張.md §4(a)/§9 S6/§12）。
 
 `fixtures/corpus/c1` を実際に `build_world()` へ通し、`#include` の2段解決（相対パス完全一致→
 拡張子込み basename 最近傍・§12）・関数呼び出しの単純名解決（`.c` 定義側の children を優先し

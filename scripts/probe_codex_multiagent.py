@@ -4,7 +4,7 @@ wait_agent/close_agent・`[agents]`/`[agents.<name>]`）が、Sherpa の Codex �
 permission profile・MCP sherpa サーバ・resume・`--json` イベント・usage）の中で使えるかを実機で
 確認し、`--json` のイベント列・セッション JSONL・usage をファイルへ保存する。
 
-正典: docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.6・§5 S3・§12。
+正典: docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.6・§5 S3・§12。
 検収項目 (a)〜(j) は同提案書の受け入れ条件のとおり。
 
 **最重要の設計原則**: `scripts/azure_smoke.py` と同じく、config.toml 生成・permission profile・

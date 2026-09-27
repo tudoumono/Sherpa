@@ -1,5 +1,5 @@
 """調べる深さ（探索の踏み込み度合い）＝ EXT-5 Depth/Cost/Verification Profile の吸収
-（調べ方ブロック §3.2・`docs/proposals/2026-08-29-調べ方ブロック.md`）。
+（調べ方ブロック §3.2・`docs/archive/2026-08-29-調べ方ブロック.md`）。
 
 `depth_profile`: `"quick" | "standard" | "deep" | "max"`（既定 `"standard"`）。
 深さは2つの軸に効く:
@@ -16,7 +16,7 @@
 本体が必要な根拠種別を揃えられないと判断したターンは、上限内で深さを1段だけ自動で引き上げる
 （`escalated_profile`・`providers/base.py` の巡ループが唯一の消費者）。
 
-基準値は「env → system_settings」（`docs/proposals/2026-08-23-設定の責務再設計.md` の SET-2・
+基準値は「env → system_settings」（`docs/archive/2026-08-23-設定の責務再設計.md` の SET-2・
 WEB-1 と同じ思想）: 各モジュールの既存定数（`agentic_search.MAX_TURNS` 等）が env フォールバック
 のまま残り、`effective_base()` が `system_settings`（管理画面 admin-settings.html の基準値編集
 セクション・§3.2）にキーがあればそちらを優先する。DB 不達／未設定はそのまま呼び出し側が渡した

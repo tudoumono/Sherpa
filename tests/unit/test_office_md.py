@@ -108,7 +108,7 @@ def test_pptx_to_md_slide_text():
 
 
 def test_xlsx_to_md_values():
-    """H2（`docs/proposals/2026-08-28-人間向けMDの刷新.md` §3.1）: シート丸ごと1枚のパイプ表ではなく、
+    """H2（`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.1）: シート丸ごと1枚のパイプ表ではなく、
     `regions()` が検出した表候補ごとに `### {セル範囲}` の小見出し＋パイプ表を出す。"""
     import openpyxl
     d = tempfile.mkdtemp()

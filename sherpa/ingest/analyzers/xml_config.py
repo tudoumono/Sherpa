@@ -3,7 +3,7 @@
 `.xml` 拡張子は**全件受理**する（`accepts()` は既定のまま上書きしない）——設定 XML と判定できた
 ファイルだけファイル自体を主体定義（`Config`）にし、判定できないファイル（Maven pom・web.xml 等）は
 primary なし＋`Dropped("xml_not_config", ...)` で通す（拒否すると台帳・grep・ES から消える・
-docs/proposals/2026-09-05-アナライザ拡張.md §6 参照）。壊れた XML は `Dropped("xml_parse_error", ...)`。
+docs/archive/2026-09-05-アナライザ拡張.md §6 参照）。壊れた XML は `Dropped("xml_parse_error", ...)`。
 
 ルート要素のローカル名で FW を判定する（`beans`/`mapper`/`struts` の根判定は namespace URI を
 問わない）。Spring Batch（`<job>`/`<step>`/`<tasklet>`/`<chunk>`/`<job-listener>`）だけは

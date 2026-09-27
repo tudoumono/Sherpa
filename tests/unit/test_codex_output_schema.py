@@ -1,4 +1,4 @@
-"""Codex `--output-schema`（構造化最終応答での完了判定・docs/proposals/2026-09-08-Codex出力スキーマ.md）。
+"""Codex `--output-schema`（構造化最終応答での完了判定・docs/archive/2026-09-08-Codex出力スキーマ.md）。
 
 `providers/codex/provider.py::CodexProvider._run_authoring` は、Codex(OpenAI) 構成かつ env
 `SHERPA_CODEX_OUTPUT_SCHEMA` が "0" でない（既定 ON）とき `--output-schema <固定スキーマファイル>` を
@@ -610,7 +610,7 @@ def test_empty_final_answer_falls_to_fixed_message_not_dispatch(tmp_path, monkey
     assert env["headline"] != "dispatch-headline"
 
 
-# ===== DEPTH-2 S1（出力スキーマ v2・主張配列・docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5） =====
+# ===== DEPTH-2 S1（出力スキーマ v2・主張配列・docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.5） =====
 
 def _sj2(status: str, answer: str, claims: list, next_step: str | None = None) -> str:
     return json.dumps({"status": status, "answer": answer, "next_step": next_step, "claims": claims},

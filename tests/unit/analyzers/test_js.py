@@ -1,4 +1,4 @@
-"""`JsAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・docs/proposals/2026-09-05-アナライザ拡張.md
+"""`JsAnalyzer` の単体テスト（アナライザ拡張 波3 レーン A・docs/archive/2026-09-05-アナライザ拡張.md
 §13）。"""
 from __future__ import annotations
 

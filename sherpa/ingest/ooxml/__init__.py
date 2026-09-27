@@ -18,7 +18,7 @@ PowerPoint（`powerpoint.py`・DOC-IR-003）: 非表示スライド・発表者�
 
 Excel（`excel.py`・DOC-IR-004）: 非表示シート/行/列・名前付き範囲・コメント・ハイパーリンク・外部
 ブック参照は MD が表示しない構造のため独立実装。連続領域（非空セルの4連結成分＝「表」）の検出
-（`regions()`）自体は、H2（`docs/proposals/2026-08-28-人間向けMDの刷新.md`）以降 `office_md._xlsx_md`
+（`regions()`）自体は、H2（`docs/archive/2026-08-28-人間向けMDの刷新.md`）以降 `office_md._xlsx_md`
 （人間向け MD・`sherpa/ingest/human_md.py::render_xlsx` 経由）とも共有する共通土台になっている
 （旧・シート丸ごと1枚の打切り付きパイプ表は撤去済み・二重実装しない）。
 """

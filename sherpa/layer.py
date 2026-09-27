@@ -14,7 +14,7 @@ grep・ES・list_docs・read_around に対する硬いフィルタとして適�
   実ファイルを読める文脈ではこちらを使う（`corpus_docs.classify_document` と同じ判定を
   二重に持たない・§7 裁定10）。
 
-**適用しない対象**（`docs/proposals/2026-08-29-調べ方ブロック.md` §3.5・§8 裁定1/7）:
+**適用しない対象**（`docs/archive/2026-08-29-調べ方ブロック.md` §3.5・§8 裁定1/7）:
 - グラフ traversal（impact レンズ・troubleshoot レンズの近傍探索）は言及エッジ（`DOCUMENTS` の
   `via=mention`）が Document とコードを木を跨いで繋ぐため、層で分断しない
   （`applies_to_lens()` が qa/author のみ真を返す）。

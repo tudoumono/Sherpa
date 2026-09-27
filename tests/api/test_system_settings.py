@@ -2385,7 +2385,7 @@ def test_admin_settings_codex_worker_model_rejects_control_characters():
 
 
 def test_admin_settings_codex_mode_roundtrip_and_rejects_invalid():
-    """素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。standard/plain
+    """素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。standard/plain
     のみ許可・未設定/null は既定の standard へフォールバック・語彙外は422（保存もされない）。"""
     if not _try_init():
         pytest.skip("DB down")
@@ -2689,7 +2689,7 @@ def test_admin_settings_agentic_budget_rejects_total_below_saved_per_result():
 
 
 # ===== モデルの窓の管理者登録表（旧 BUDGET-2）は撤去済み =====
-# `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`: 利用者裁定「AI が持つ文脈窓を
+# `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`: 利用者裁定「AI が持つ文脈窓を
 # Sherpa が制限しない」により `model_context_windows` の受け付け・保存・返却ごと撤去した。
 
 def test_admin_settings_put_ignores_unknown_model_context_windows_key():

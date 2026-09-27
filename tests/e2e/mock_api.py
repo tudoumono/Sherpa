@@ -38,7 +38,7 @@ SCOPES = {
 # S3: 実形状（sherpa/preview_service.py::graph_view）は世代/位置に top_scope・path を持つ（旧モックの
 # "parent" キーは実 API に存在しない＝実ドリフト是正。web/graph.js の `d.parent` 参照はレガシー耐性の
 # 防御コードで、未定義でも支障なし）。edges にも実際は status がある。
-# ソース正典化（`docs/proposals/2026-09-04-グラフのソース正典化.md`・K9〜K13）: 意味層 LLM 抽出・
+# ソース正典化（`docs/archive/2026-09-04-グラフのソース正典化.md`・K9〜K13）: 意味層 LLM 抽出・
 # 概念ラベル（Parameter/Function 等）・REALIZES/IMPLEMENTED_BY・em（確実/要確認）は撤去済み。
 # 4ノードの旧「消費税率(Parameter)→TAX-RATE」REALIZES 橋は「税計算仕様書.md(Document) が
 # DOCUMENTS(via=mention) で TAX-RATE を言及」に置換（K3 の言及エッジ）。旧「請求機能(Function・
@@ -1163,7 +1163,7 @@ SYSTEM_SETTINGS_VIEW = {
     "max_review_rounds": {"configured": None, "effective": 7, "default": 7},
     # multi_agent（S6）の worker モデル（`sherpa/providers/codex/sandbox.py::_CODEX_WORKER_MODEL_FALLBACK`）。
     "codex_worker_model": {"configured": None, "effective": "gpt-5.6-sol", "default": "gpt-5.6-sol"},
-    # 素の Codex モード（docs/proposals/2026-09-24-素のCodexモード.md §1.1）。
+    # 素の Codex モード（docs/archive/2026-09-24-素のCodexモード.md §1.1）。
     "codex_mode": {"configured": None, "effective": "standard", "default": "standard",
                    "options": ["standard", "plain"]},
     "chat_max_turns": {

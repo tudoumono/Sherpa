@@ -1,5 +1,5 @@
 """`scripts/check-production.sh` の `OPENAI_BASE_URL` 検査（S3・
-docs/proposals/2026-08-18-AzureOpenAI対応.md）。
+docs/archive/2026-08-18-AzureOpenAI対応.md）。
 
 背景: 実行環境が Azure と分かり、`OPENAI_BASE_URL`（env・`sherpa/llm.py::openai_base_url`）で
 OpenAI 互換の接続先（Azure OpenAI・Private Link 経由のゲートウェイ等）へ切り替えられるようにした。

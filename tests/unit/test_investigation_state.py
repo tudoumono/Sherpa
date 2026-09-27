@@ -1166,7 +1166,7 @@ def test_render_claims_formats_by_status():
     assert IS.render_claims([]) == ""
 
 
-# ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2）:
+# ===== DEPTH-2 S4b（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.2）:
 # worker の一次判断——origin と evidence_refs の親 state への remap =====
 
 def test_parse_claims_defaults_origin_to_synthesis_and_set_claims_accepts_worker_origin():

@@ -1,5 +1,5 @@
 """ターンの終了理由（`stop_kind`）の正規化（正典
-`docs/proposals/2026-09-11-利用統計の拡充.md`）。
+`docs/archive/2026-09-11-利用統計の拡充.md`）。
 
 `messages.answer.stop_kind` に保存する8値の閉じた語彙と、複数の判定源（API 経路の
 `evidence_packet.stop_reason`・Codex 経路の `codex_stopped_early`/`codex_silent_failure`・

@@ -761,7 +761,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
       - `resume_rate`: user ターン数2以上の会話のうち `conversations.codex_session_id` が設定されている
         割合。対象会話が無ければ None（推定しない）。`_compute_conversation_turn_stats` 参照。
 
-    `docs/proposals/2026-09-12-利用統計の拡充2.md` §2/§3:
+    `docs/archive/2026-09-12-利用統計の拡充2.md` §2/§3:
       - `tokens.by_user_kind`: ユーザー別 × 用途別（kind）の calls/tokens/elapsed_ms（`tokens.by_kind`
         と同じ材料・同じ扱い）。chat 行（`messages.answer->'usage'` 由来）は `token_by_user`
         （`user_rows` と同じ `turns` CTE 集計）から `kind='chat'` として合流し、それ以外の kind は
@@ -1032,7 +1032,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
             "GROUP BY c.id",
             (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
-        # 会話ごとの補助 AI 使用量（`docs/proposals/2026-09-12-利用統計の拡充2.md` §2 (b)）。対象は
+        # 会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。対象は
         # 「期間内に user ターンが1件以上ある会話」（他の会話系集計と同じ母集団）——1行=1会話。
         # chat（messages.answer->'usage'）の合計と回答時間平均（duration_ms・欠落行は AVG が自然に除外）
         # をここで集計し、それ以外の kind（usage_events 由来）は下の conv_kind_rows で別途取得して
@@ -1447,7 +1447,7 @@ def depth_quality_stats(days: int = 180, *, time_from: str | None = None,
 
 
 # ===================================================================================
-# docs/proposals/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツールが
+# docs/archive/2026-09-12-利用統計の拡充2.md §3b: 利用統計チャットの調査ツールが
 # 使う、絞り込み付きの集計関数。不変条件は本モジュール冒頭と同じ（本文・会話タイトルは一切
 # SELECT しない）ことに加え、display_name も返さない（ツールの戻り値は件数・時刻・種別・トークン・
 # 所要時間・会話 id・uid・world のみという契約——`usage_stats()` 自体の戻り値は画面表示用のため

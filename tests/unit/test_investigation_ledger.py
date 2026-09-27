@@ -1,6 +1,6 @@
 """調査台帳の純関数部分（`sherpa.investigation_ledger`）の単体テスト。
 
-正典: `docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §3/§7。ここでは統合（provider.py 等
+正典: `docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §3/§7。ここでは統合（provider.py 等
 への組み込み）は対象外——`load_ledger`/`ledger_complete`/`no_progress`/`write_item_atomic`/
 `write_manifest_atomic` の契約だけを固定する。
 """

@@ -1,4 +1,4 @@
-"""素の Codex モード（`codex_mode=plain`・docs/proposals/2026-09-24-素のCodexモード.md）の
+"""素の Codex モード（`codex_mode=plain`・docs/archive/2026-09-24-素のCodexモード.md）の
 統合検証。既存 `tests/unit/test_codex_no_presearch.py` と同じ「偽 codex 実行ファイルを PATH に
 差し込む」流儀（実 codex は一切呼ばない）に、`tests/unit/test_codex_ledger_gate.py` の
 「偽 codex が自分の `CODEX_HOME`（config.toml）を読んで検証結果をファイルへ書く」手法を組み合わせる

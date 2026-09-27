@@ -1878,7 +1878,7 @@ def test_export_menu_txt_and_md_split_grounded_and_reference_sources(page, web_b
 
 
 # ===== SC-6b: 調べ方ブロック（右ペイン下部の固定フッター・入力欄の要約チップ）=====
-# docs/proposals/2026-08-29-調べ方ブロック.md §2・§7。範囲/参照するトグルの既存 e2e（#kbtoggle・
+# docs/archive/2026-08-29-調べ方ブロック.md §2・§7。範囲/参照するトグルの既存 e2e（#kbtoggle・
 # #scopesel 系・#personaltoggle）はブロックへ移設しただけで挙動は変えていないため、上記の既存テスト
 # （test_chat_streams_answer_with_explicit_scope・test_chat_sends_personal_workspace_toggle_to_stream 等）
 # は無改修のまま新レイアウトでも通る前提（ID を変えていない・ブロックは既定オープン）。ここでは

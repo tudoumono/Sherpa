@@ -123,7 +123,7 @@ def test_codex_clean_env_passes_proxy_and_ca_only_when_set(monkeypatch, tmp_path
 
 
 # ===== MCP ツール結果予算の env 化（1件あたりの上限は窓から切り離し済み・
-# `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）=====
+# `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）=====
 # `_resolve_mcp_budget_env`/`_resolve_mcp_budget` は `agentic_search.resolve_tool_result_budgets`
 # の実効値（管理画面の基準値に深さの扱いを掛けたもの）と Codex 経路の固定天井（64KiB）の min() を
 # env dict にする。モデルの窓・その有無は一切見ない（旧 BUDGET-2 の窓連動は撤去済み）。
@@ -203,7 +203,7 @@ def test_resolve_mcp_budget_env_hits_and_window_respect_admin_base_settings():
 
 
 # ===== 調査を終了させる上限の撤去: 累計バイト予算・呼び出し回数の上限 =====
-# `docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2: 累計（1 run 全体）のツール結果
+# `docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2: 累計（1 run 全体）のツール結果
 # バイト予算（`SHERPA_MCP_TOOL_BUDGET_TOTAL_BYTES`）とクイックの呼び出し回数上限
 # （`SHERPA_MCP_TOOL_MAX_CALLS`）は、到達すると「ここまでの結果でまとめてください」という
 # 調査打切りの信号になっていたため撤去した。深さに関わらずどちらの env キーも一切載らない。
@@ -1618,7 +1618,7 @@ def test_codex_run_argv_disables_multi_agent_on_sandbox_fallback(tmp_path, monke
 
 
 # ===== argv `-c model_context_window`: Codex CLI 既定272,000tokens×0.9での自動圧縮を防ぐ =====
-# `docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`: 十分大きな値を常に渡すと
+# `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`: 十分大きな値を常に渡すと
 # モデルの文脈窓は Codex CLI 任せ——Sherpa は `model_context_window` を渡さない（利用者裁定
 # 「AI が持つ文脈窓を Sherpa が制限しない」・大きな値を渡して切り詰めさせる方式は実環境の CLI で
 # 圧縮が起きず API 上限で失敗したため撤回）。
@@ -2139,7 +2139,7 @@ def test_blocker2_codex_cwd_is_authoring_not_files():
     assert "ws_files" in src, "files/ の参照が消えた（台帳登録 or symlink チェックに必要）"
 
 
-# ===== Codex 強化計画 Phase0（docs/proposals/2026-07-02-Codex強化計画.md §5 決定）
+# ===== Codex 強化計画 Phase0（docs/archive/2026-07-02-Codex強化計画.md §5 決定）
 # → WEB-1（docs/notes/2026-08-29-デプロイ後バックログ.md）で管理者段を管理画面へ移管:
 # 1) web_search 既定 OFF・管理画面「プロバイダ＋接続先」タブで許可（env は初回シードのみ）
 # 2) AGENTS.md（共通ルールをプロンプトから分離）
@@ -2975,7 +2975,7 @@ def test_run_authoring_failed_mcp_read_is_not_a_source(tmp_path, monkeypatch):
 
 
 # ===== DEPTH-2 S3b: サイドカー（子エージェントの観測）=====
-# `docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(2)(3)(6)。
+# `docs/archive/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(2)(3)(6)。
 # s3b-fix2: サイドカーは run_dir（model-shell の書込許可領域＝ `":workspace_roots"` `"." = "write"`）
 # の外・codex_home 配下に置く契約（#22 是正）。偽 codex は `CODEX_HOME` env（`_codex_clean_env` が
 # 設定）から codex_home の実パスを読み取れる（実際の MCP サーバの代わりに直接書く＝

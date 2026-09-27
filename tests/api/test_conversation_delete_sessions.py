@@ -1,5 +1,5 @@
 """会話削除時の Codex resume セッション実体の削除
-（`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §4-3）。
+（`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §4-3）。
 
 `DELETE /conversations/{cid}` は DB 側の削除（`store.delete_conversation`・soft/hard 問わず）に
 加えて `.codex-sessions/{cid}`（Codex ネイティブ resume の永続 CODEX_HOME。将来はここに退避される

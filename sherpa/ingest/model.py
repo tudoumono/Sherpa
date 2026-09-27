@@ -8,7 +8,7 @@ K13（確定・復活させない）: 意味層フル抽出・REALIZES 橋の撤
 （Parameter/BusinessRule/Function/Screen/Report/Standard/Incident・USES/REFERENCES/IMPLEMENTED_BY/
 PRODUCED_BY/CONFORMS_TO/RELATES_TO/REALIZES）を刈った。Table/ACCESSES は当初 producer ゼロの計画枠
 だったが、アナライザ拡張 S2（`SqlDdlAnalyzer`＝DDL の `CREATE TABLE`・COBOL `EXEC SQL`→
-`ACCESSES(via=exec_sql)`）で producer が付いた（docs/proposals/2026-09-05-アナライザ拡張.md §4(a)/(d)/(g)）。
+`ACCESSES(via=exec_sql)`）で producer が付いた（docs/archive/2026-09-05-アナライザ拡張.md §4(a)/(d)/(g)）。
 
 A6（アナライザ拡張・2026-09-05・K13 確定後の唯一の追加）: `Config`（設定ファイル・.properties/YAML/
 XML 設定の受け皿）を1種のみ追加。エッジ型は増やさない——`INVOKES`/`ACCESSES` を `via` で細分する

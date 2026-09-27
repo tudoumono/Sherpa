@@ -1,4 +1,4 @@
-"""`sherpa/store/turn_metrics.py`（`docs/proposals/2026-09-23-利用統計の刷新.md` §3.1/§4 が正典）
+"""`sherpa/store/turn_metrics.py`（`docs/archive/2026-09-23-利用統計の刷新.md` §3.1/§4 が正典）
 の単体テスト。
 
 前半は `metrics_from_answer`（DB 非依存の純粋写像）、後半は `store.add_message`/`backfill_all`/

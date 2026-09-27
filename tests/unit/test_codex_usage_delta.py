@@ -1,6 +1,6 @@
 """Codex の resume ターンの usage をターン差分にする（`CodexProvider._run_authoring` の usage 集計）。
 
-背景（提案書 docs/proposals/2026-09-07-Codex途中経過で止まる.md §3.5）: `turn.completed.usage` は
+背景（提案書 docs/archive/2026-09-07-Codex途中経過で止まる.md §3.5）: `turn.completed.usage` は
 セッション累計（`last_total_token_usage.total`）で、`codex exec resume` は前回までの累計を復元して
 から加算する。R1b の resume を使う2ターン目以降は、そのターンの `answer.usage` にセッション累計が
 乗り、ターンごとの利用統計が過大計上される。`CodexProvider` は resume が効いた（フォールバックして
@@ -342,7 +342,7 @@ def test_auto_continue_uses_latest_snapshot_for_delta(tmp_path, monkeypatch):
 
 
 # ===== DEPTH-2 S3b: 子スレッド（spawn_agent）の usage 合算 =====
-# `docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(4)。
+# `docs/archive/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(4)。
 
 def test_child_thread_usage_merged_into_answer_usage_with_breakdown(tmp_path, monkeypatch):
     """親の `turn.completed.usage` に、同ターン中に spawn_agent された子2本の session JSONL
@@ -775,7 +775,7 @@ def test_no_evaluator_spawn_when_sufficient_stays_zero_children(tmp_path, monkey
 # ===== 予算天井の窓連動の撤去・codex.log 開始/終了行の実効値可視化 =====
 # 旧実装は窓が不明なとき Codex 専用の固定天井（64KiB）へ落ちていた（実環境で `agentic_budget_
 # total=4MiB` を保存していても実際は 1MiB で打ち切られていた原因）。利用者裁定「AI が持つ文脈窓を
-# Sherpa が制限しない」（`docs/proposals/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）で
+# Sherpa が制限しない」（`docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）で
 # この天井・窓連動ごと撤去済み——常にコード既定／管理画面の基準値をそのまま使う。開始行の
 # `window_source`/`window_cli` は常に `none`（窓は Codex CLI 任せ・Sherpa は渡さない）。
 

@@ -1,6 +1,6 @@
 """K6（`folder_tree`）の受け入れ条件テスト。
 
-正典: `docs/proposals/2026-09-04-グラフのソース正典化.md` §3 K6・§4b S1。木の集計本体
+正典: `docs/archive/2026-09-04-グラフのソース正典化.md` §3 K6・§4b S1。木の集計本体
 （`sherpa/folder_tree.py`）は `doc_ledger.documents_for()` を monkeypatch した合成データで
 精密に固定する（深さクランプ・per-フォルダ打切り・列挙件数の安全弁は fixtures の実木では
 境界条件を作りにくいため）。配線（`agentic_search.run_tool`/`openai_tools`/`gemini_tools`/

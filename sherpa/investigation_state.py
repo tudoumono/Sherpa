@@ -1,5 +1,5 @@
 """1質問1調査状態（`InvestigationState`）——アプリ側（機械的・LLM なし）で根拠・調査の限界・
-呼び出し記録を集約する（`docs/proposals/2026-09-07-調査結果集約と並列実行の改善方針.md`
+呼び出し記録を集約する（`docs/archive/2026-09-07-調査結果集約と並列実行の改善方針.md`
 「改善方針」節）。用途は2つ:
 
 1. 探索ループ（`agentic_search.openai_style`/`anthropic_style`/`gemini`）が自分の会話履歴
@@ -113,7 +113,7 @@ class ToolCall:
     error: str | None
 
 
-# DEPTH-2 S1（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2/§2.5）: メイン査読が
+# DEPTH-2 S1（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.2/§2.5）: メイン査読が
 # 再調査後もなお不足と判定したとき、全回答を固定文言へ置き換える代わりに主張単位で
 # 確定/推定/不明を持たせ、裏付けのある部分を残す。理由コードは閉じた語彙（unknown 限定）。
 _CLAIM_STATUSES = frozenset({"confirmed", "inferred", "unknown"})

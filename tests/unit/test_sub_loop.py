@@ -2570,7 +2570,7 @@ def test_fold_sub_usage_sums_elapsed_independently_of_unknown_tokens():
     assert isinstance(acc.get("elapsed_ms"), int) and acc["elapsed_ms"] >= 0
 
 
-# ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
+# ===== DEPTH-2 S4b（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
 # worker の一次判断は final_synthesis=False（下調べ役）経路だけに関わる =====
 
 def test_no_worker_path_output_unchanged_by_depth2_s4b():

@@ -24,7 +24,7 @@ DOC-IR-004（フェーズ2「Excel」）: XLSX にも document-ir-v2 を構築�
 共通生抽出層 `sherpa/ingest/ooxml/excel.py`（openpyxl・値/数式の2回ロード・cap 付き走査）を消費して IR を
 組み立てる。
 
-H2（`docs/proposals/2026-08-28-人間向けMDの刷新.md`）: docx/xlsx の人間向け MD（`{rel}.md`）は、
+H2（`docs/archive/2026-08-28-人間向けMDの刷新.md`）: docx/xlsx の人間向け MD（`{rel}.md`）は、
 シート丸ごと1枚の打切り付きパイプ表（旧 `office_md._xlsx_md`）・素朴な `w:tbl` パイプ表（旧
 `office_md._table_md` 直呼び）をやめ、本モジュールが構築する document-ir を `human_md.render_xlsx`/
 `render_docx` へ渡して生成する。`OoxmlArm.convert()` は docx/xlsx について IR を1回だけ構築し、MD 生成と
@@ -225,7 +225,7 @@ class OoxmlArm:
 
 def _docx_floating_anchor_facts(p_el) -> list[dict]:
     """段落 `p_el` 内の浮動図形（`wp:anchor`）を、幾何断定なしの関連付けの事実として返す
-    （D-2・`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.2）。
+    （D-2・`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.2）。
 
     Word はフロー配置のため、覆われる側の段落の実座標がレイアウト計算前に確定しない
     （xlsx のセル格子・pptx の EMU 座標と異なりここだけ本物の制約がある）。したがって幾何的な
@@ -860,7 +860,7 @@ def _build_xlsx_ir(p: Path) -> document_ir.DocumentIR | None:
     """XLSX から document-ir-v2 を構築する（DOC-IR-004・提案書 §7 フェーズ2「Excel」）。
 
     共通生抽出層 `sherpa/ingest/ooxml/excel.py` を消費するだけ（純関数群・二重実装しない）。H2
-    （`docs/proposals/2026-08-28-人間向けMDの刷新.md`）以降、`office_md._xlsx_md`（人間向け MD）は
+    （`docs/archive/2026-08-28-人間向けMDの刷新.md`）以降、`office_md._xlsx_md`（人間向け MD）は
     本関数の戻り値をそのまま `human_md.render_xlsx` へ渡して生成する（シート丸ごと1枚の打切り付き
     パイプ表は撤去済み）。安全弁は**2系統**（正典 §10 裁定#1 参照）: (1) `excel.regions()`/`merged_map`
     が持つ cap（`excel.DEFAULT_CAP_CELLS` 等・走査自体をこの段階で頭打ちにする）と、

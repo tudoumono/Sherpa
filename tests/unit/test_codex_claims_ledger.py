@@ -1,6 +1,6 @@
 """`claims` と調査台帳の突合（`sherpa.providers.codex.provider._claims_vs_ledger`）。
 
-正典: `docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §3「claims は台帳からの投影」・
+正典: `docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §3「claims は台帳からの投影」・
 §6 ステップ4後半。`claims[].evidence_refs`（Codex 自身の自己申告・`"path:line"` 形式の文字列
 配列）を、調査台帳の item が持つ `evidence`（`path`/`line`）と突き合わせ、1件も一致しない
 confirmed 主張は裏付けの実在を確認できないとして推定（inferred）へ格下げする。

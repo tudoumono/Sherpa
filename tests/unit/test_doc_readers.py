@@ -1,6 +1,6 @@
 """原本読取ツールの中核（`sherpa/doc_readers.py`）の受け入れテスト。
 
-正典: `docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9・§4。DB/ES/Neo4j 不要
+正典: `docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9・§4。DB/ES/Neo4j 不要
 （`doc_readers` は**開いたバイナリファイルオブジェクト**だけを受ける純関数——world/scope/秘匿判定・
 path→fd の TOCTOU 対策済み open は呼び出し元 `agentic_search.run_tool`/`_safe_original_path` の
 責務であり、ここでは対象外）。

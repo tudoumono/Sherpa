@@ -1567,7 +1567,7 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
             _add(url, codex_model, "Codex(Ollama) 実行モデル")
         # worker（下調べ役）が配線されるのは主頭脳が openai／ollama のときだけ（`sherpa/providers/
         # __init__.py::get_provider` 参照・頭脳 × search_helper の組合せ表は提案書
-        # docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。主頭脳が codex 等の
+        # docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。主頭脳が codex 等の
         # 利用者の `search_helper` 列は runtime では一切評価されないため、ここでも `eff` が
         # openai／ollama のときだけ解決する（残存設定を誤って「使っている」扱いにしない）。
         # Ollama 頭脳には openai の下調べ役は付かない（クラウド1社の方針で無視）ため、

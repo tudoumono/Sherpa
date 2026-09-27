@@ -124,7 +124,7 @@ def _setup(tmp_path: Path, monkeypatch, steps: list, users_dirname: str) -> Path
     """偽 codex を PATH に差し込み、呼び出しごとの応答計画（steps）を JSON で渡す。戻り値は argv_log。
 
     本ファイルの偽 codex は平文（JSON でない）agent_message を返す（語尾ヒューリスティックの検証が
-    目的）。`--output-schema`（既定 ON・docs/proposals/2026-09-08-Codex出力スキーマ.md）が有効だと
+    目的）。`--output-schema`（既定 ON・docs/archive/2026-09-08-Codex出力スキーマ.md）が有効だと
     平文は「構造化 message でない」＝未完了として扱われ、本ファイルの契約（語尾一覧による継続判定）が
     検証できなくなるため、ここで明示的に無効化する（同提案 §2-3 の「スキーマ無効時は現行ヒューリス
     ティックのまま」契約のテスト）。

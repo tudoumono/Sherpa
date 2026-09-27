@@ -1,4 +1,4 @@
-"""エンジン分離検索＋RRF融合（共通層・docs/proposals/2026-07-07-外部API化とDify.md E2）。
+"""エンジン分離検索＋RRF融合（共通層・docs/archive/2026-07-07-外部API化とDify.md E2）。
 
 3プリミティブ（keyword=ES BM25 / vector=ES 純kNN / graph=Neo4j 影響たどり）を分離し、
 融合は RRF 固定。**共有 KB のみ**（個人 workspace・personal テーブルへの参照は禁止・CLAUDE.md 契約）。

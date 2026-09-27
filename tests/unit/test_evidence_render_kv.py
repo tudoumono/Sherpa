@@ -241,7 +241,7 @@ def test_non_table_long_text_split_keeps_shape_fill_asset_on_first_chunk():
 # これを`_field_piece`/`_context_summary_record`と同じ「出所:」＋「{label}: 「値」」の2行KVへ揃える。
 
 def test_element_piece_paragraph_matches_proposal_example():
-    """`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md` §4 の実例どおりの出力を pin する。"""
+    """`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §4 の実例どおりの出力を pin する。"""
     element = _element("e1", "paragraph", "対象システム: BETA契約管理システム")
     piece = R._element_piece(
         element, {"e1": element}, [], "業務フロー補足_契約.docx",
@@ -853,7 +853,7 @@ def test_occlusion_kv_lines_overlap_from_occluded_by_text():
 
 
 def test_occlusion_kv_lines_overlap_from_covered_by_text_matches_proposal_example():
-    """`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`§2.3の実例どおり。"""
+    """`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§2.3の実例どおり。"""
     lines = R._occlusion_kv_lines({"covered_by_text": {"element_id": "shape:2", "text": "廃止"}})
     assert lines == ["重なり: 「廃止」"]
 
@@ -936,7 +936,7 @@ def test_element_piece_strike_kv():
 
 
 def test_element_piece_covered_by_text_kv_matches_proposal_example():
-    """`docs/proposals/2026-09-02-RAG表現の全形式展開と文脈保持.md`§2.3の実例どおり:
+    """`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§2.3の実例どおり:
     前面テキスト「廃止」との重なりがそのまま出る（意味の断定はしない）。"""
     element = _element("e1", "shape", "旧料金体系: 月額1000円",
                         covered_by_text={"element_id": "shape:2", "text": "廃止"})

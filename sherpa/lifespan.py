@@ -5,7 +5,7 @@
   （2026-07-03 RV 対応 MEDIUM で②の直後に SHERPA_TEST_DB_ISOLATED 検査を追加＝同じ流儀の fail-closed 検査）
   （背景実行チャットターン §7・docs/proposals/2026-07-03-チャット背景実行.md 導入時、②の検査群に
   workers>1 警告を追加＝fail-closed ではなく警告のみ）
-  （Linux サーバホスト対応 L1・docs/proposals/2026-07-10-Linuxサーバホスト.md 導入時、②の検査群に
+  （Linux サーバホスト対応 L1・docs/archive/2026-07-10-Linuxサーバホスト.md 導入時、②の検査群に
   フォルダ選択ルート（既定 /mnt）不在の警告を追加＝同じく fail-closed ではなく警告のみ）
   （監査台帳 2026-07-10-監査対応台帳.md #3 対応で、①auth bootstrap が既定パスワードで admin を
   DB に刻んでしまう**前**に `_warn_default_admin_password()` を追加＝唯一 ①より前に置く fail-closed 検査）
@@ -28,7 +28,7 @@
   （`openai_endpoint_kind`/`openai_base_url`/`openai_auth_header`/`openai_api_version`）も同じ
   「一度だけ」方式で初回シードする。`healthz()` 側の同名呼び出しは DB 一時不達時の再試行専用
   （通常起動の唯一の実行経路はここ）・`sherpa/llm.py` 参照）
-  （外部連携 API（docs/proposals/2026-08-24-部品API設計.md）対応で、`ext_api._audit_writer`
+  （外部連携 API（docs/archive/2026-08-24-部品API設計.md）対応で、`ext_api._audit_writer`
   （監査DB書込み専用の単一 writer スレッド）の start/stop をここで管理する＝プロセス起動と共に
   受付を開始し、shutdown 時は新規受付を止めて既存 queue を回収してから終了する）
   （LOG-2（サブシステム別ログ分離）対応で、起動処理の先頭（`_attach_request_id_filter()` より前）に

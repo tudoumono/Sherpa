@@ -612,7 +612,7 @@ def test_review_usage_recorded_via_metering(monkeypatch):
         A._post = orig
 
 
-# ---- DEPTH-2 S1（主張構造での部分回答・docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.5） ----
+# ---- DEPTH-2 S1（主張構造での部分回答・docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.5） ----
 
 def test_claims_synthesis_preserves_partial_answer_after_reruns_exhausted():
     """再調査を尽くしてもなお不足のとき、確定/不明が混在する主張構造が得られれば、固定文言では
@@ -803,7 +803,7 @@ def test_review_stop_event_during_read_loop_aborts_immediately(monkeypatch):
     assert len(p._synth_prompts) == 1   # 2回目の _stream（確定判定の消費）は発行されない
 
 
-# ===== DEPTH-2 S4b（docs/proposals/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
+# ===== DEPTH-2 S4b（docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.2・§5 S4）:
 # worker（下調べ役）の一次判断 =====
 
 def test_worker_primary_judgment_not_exposed_in_quick_depth_without_claims():
@@ -2325,7 +2325,7 @@ def test_incomplete_answer_demotes_claims_missing_required_kinds(monkeypatch):
         A._post = orig
 
 
-# ===== S2（`docs/proposals/2026-09-19-実装ベース探索の回復.md` §3）: 深さの自動引き上げ =====
+# ===== S2（`docs/archive/2026-09-19-実装ベース探索の回復.md` §3）: 深さの自動引き上げ =====
 
 def _escalation_rounds(recorded) -> list:
     return [kw for a, kw in recorded if a[0] == "chat-round"]

@@ -29,7 +29,7 @@ const PROVIDER_COLOR = {
   bedrock: 'var(--danger)', ollama: 'var(--accent-ink)', unknown: 'var(--border)',
 };
 
-// （docs/proposals/2026-09-12-利用統計の拡充2.md §2 (c)）: ターンの終了理由（`sherpa/stop_kind.py` の
+// （docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: ターンの終了理由（`sherpa/stop_kind.py` の
 // 閉じた8値＋'unknown'）の平文ラベル。未知の値は生の値をそのまま表示する（fail-safe・KIND_LABEL と同じ流儀）。
 const STOP_KIND_LABEL = {
   completed: '完了', stopped_by_user: '利用者が停止', budget: '調査の上限', no_evidence: '根拠不足',
@@ -728,7 +728,7 @@ function renderTokenKindTable(rows) {
   }).join('');
 }
 
-// ユーザー別 × 用途別内訳（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (a)）。利用者に紐付かない
+// ユーザー別 × 用途別内訳（docs/archive/2026-09-12-利用統計の拡充2.md §2 (a)）。利用者に紐付かない
 // 呼び出しを含まないため、同一 kind の合計は token-kind-tbody の当該行以下になりうる。空/不在ならカードごと隠す
 // （token-kind-card と同じ流儀）。
 function renderTokenUserKindTable(rows) {
@@ -810,7 +810,7 @@ function renderTokens(tokens, period) {
   renderTokenUserKindTable(t.by_user_kind || []);
 }
 
-// 会話ごとの補助 AI 使用量（docs/proposals/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
+// 会話ごとの補助 AI 使用量（docs/archive/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
 // 降順で上位20件・タイトル/本文は含まない。「用途別」列は用途ごとに回数・トークン・所要時間を1行ずつ
 // 積む（`UsageConversationKindRow` の null の意味は用途別テーブルと同じ）。会話 id はテキスト表示のみ
 // （リンクにしない）。

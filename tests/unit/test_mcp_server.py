@@ -455,7 +455,7 @@ def test_tools_call_graph_neighbors_rejected_when_layer_restricted(monkeypatch):
 
 
 def test_toolset_plain_exposes_only_three_and_rejects_others(monkeypatch):
-    """素の Codex モード（`SHERPA_MCP_TOOLSET=plain`・docs/proposals/2026-09-24-素のCodexモード.md
+    """素の Codex モード（`SHERPA_MCP_TOOLSET=plain`・docs/archive/2026-09-24-素のCodexモード.md
     §3）は es_search・graph_neighbors・ask_user だけを tools/list に出す。それ以外（grep/読取/
     list_docs 系・台帳ツール）は直接 tools/call されても、tools/list に出していなくても存在しない
     ツールと同じエラーで拒否する（多層防御）。未設定（既定）はこのテストの外で全ツールが出ることを
@@ -499,7 +499,7 @@ def test_serve_loop_roundtrip():
     assert any(t["name"] == "ripgrep_search" for t in responses[1]["result"]["tools"])
 
 
-# ===== S3b: 原本読取ツール（`docs/proposals/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
+# ===== S3b: 原本読取ツール（`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
 
 def test_tools_list_exposes_original_read_tools():
     """原本読取ツール6本が tools/list に出る（schema/description は agentic_search と共通）。"""
@@ -542,7 +542,7 @@ def test_tools_list_keeps_office_read_tools_when_layer_docs_both_or_unset():
 
 
 # ===== DEPTH-2 S3b: サイドカー（子エージェントの MCP 呼出・ask_user の観測）=====
-# `docs/proposals/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(1)(3)(6)。
+# `docs/archive/2026-09-17-深さの再定義とレビュー巡.md` §2.6/§9.1・受け入れ条件(1)(3)(6)。
 # `SHERPA_MCP_SIDECAR` が設定されている間だけ、run_dir 配下の JSONL へ doc_id／ツール名／種別／
 # 時刻（と ask_user の質問）だけを追記する（本文は書かない）。未設定時は既存どおり何もしない。
 
@@ -785,7 +785,7 @@ def test_tool_result_clipped_writes_sidecar_limit_entry(tmp_path, monkeypatch):
 # ===== ツール呼び出し回数の上限は撤去済み =====
 # 旧 `SHERPA_MCP_TOOL_MAX_CALLS`（クイックのときだけ親が渡していた・`depth_base_max_turns` の
 # 実効値流用）到達時に返していた `tool_call_budget_exhausted` は、調査を終了させる信号だった
-# （`docs/proposals/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2）。MCP サーバはこの env をもう
+# （`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2）。MCP サーバはこの env をもう
 # 読まない——古い親プロセス由来の env が残っていても無視される。
 
 def test_tool_calls_not_capped_even_with_legacy_max_calls_env(monkeypatch):

@@ -1,5 +1,5 @@
 """`sherpa/providers/codex/activity.py`（利用統計の刷新 提案書
-`docs/proposals/2026-09-23-利用統計の刷新.md` §3.1・S1）のテスト。受入条件の再現に絞る
+`docs/archive/2026-09-23-利用統計の刷新.md` §3.1・S1）のテスト。受入条件の再現に絞る
 （record 種類ごとの個別テストや内部ヘルパ単体テストは作らない・公開の `summarize_turn` と
 偽 Codex/フェイク provider の実行結果だけで確かめる）。
 

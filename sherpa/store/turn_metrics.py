@@ -1,5 +1,5 @@
 """回答 JSON（`messages.answer`）から `turn_metrics`/`turn_tool_stats`（集計専用の細い写像表・
-`docs/proposals/2026-09-23-利用統計の刷新.md` §3.1/§4 が正典）への書込。
+`docs/archive/2026-09-23-利用統計の刷新.md` §3.1/§4 が正典）への書込。
 
 正本は引き続き `messages.answer`（JSONB・全文）。本モジュールが書く2表はそこから**再生成できる
 派生物**——集計クエリを索引付きで速くするためのコピーであり、単一真実源ではない。
