@@ -1150,3 +1150,32 @@ def test_grep_search_size_exclusion_single_source_of_truth_via_text_kind_max_byt
     monkeypatch.setattr("sherpa.ingest.text_kind.MAX_BYTES", size + 1)   # 以内＝再び検索対象
     hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path])
     assert len(hits) == 1
+
+
+
+def test_grep_search_bom_utf8_first_heading_recognized(tmp_path):
+    """BOM 付き UTF-8 の1行目にある `#` 見出しが正しく認識される——修正前は1行目に U+FEFF が
+    残ったまま `lstrip()` でも消えず、見出し節の本文にも BOM がそのまま混入していた
+    （`grep_tool._logical_lines` の `utf-8-sig` は最初のセグメントでだけ BOM を落とす契約）。"""
+    raw = b"\xef\xbb\xbf" + "# 見出し\nNEEDLE本文\n".encode("utf-8")
+    _write(tmp_path, "doc.md", raw)
+    hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path])
+    assert len(hits) == 1
+    assert "﻿" not in hits[0]["text"]
+    assert hits[0]["text"].startswith("# 見出し")
+
+
+def test_grep_search_cp932_detected_despite_long_ascii_prefix(monkeypatch, tmp_path):
+    """先頭判定の否定: 判定範囲は全体をチャンク分割で見る——先頭チャンクが ASCII だけでも、後続
+    チャンクの CP932 の日本語行を見て cp932 と判定できる（`text_encoding._SCAN_CHUNK_BYTES` を
+    小さくして、実運用の64KiBチャンクを小さな試料でも跨がせて確かめる）。"""
+    from sherpa import text_encoding
+    monkeypatch.setattr(text_encoding, "_SCAN_CHUNK_BYTES", 8)
+    ascii_prefix = "A" * 64 + "\r\n"
+    jp_line = "架空の締め処理の通知メッセージ\r\n"
+    raw = ascii_prefix.encode("ascii") + jp_line.encode("cp932")
+    _write(tmp_path, "batch.cbl", raw)
+    hits = G.grep_search("締め処理", world="v1", roots=[tmp_path])
+    assert len(hits) == 1
+    assert "�" not in hits[0]["text"]
+    assert "締め処理" in hits[0]["text"]

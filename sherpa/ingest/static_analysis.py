@@ -63,7 +63,7 @@ _WITH_DEBUGGING_MODE = re.compile(r"WITH\s+DEBUGGING\s+MODE", re.I)
 _DIVISION_HEADER = re.compile(
     r"\b(?:IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\b", re.I)
 _LEVEL_ITEM_COLUMN1 = re.compile(r"^\d{2}\s+[A-Z0-9#@$-]", re.I)
-# 固定列の優先証拠（`_detect_column1_style` 参照）: 8桁目（`line[7:72]`）から始まるレベル
+# 固定列の優先証拠（`_detect_column1_style` 参照）: 8桁目（CP932幅で数える）から始まるレベル
 # 番号付き項目定義。`_LEVEL_ITEM_COLUMN1` とはアンカーの基準列が異なるだけで文字集合は同じ。
 _LEVEL_ITEM_FIXED = re.compile(r"^\s*\d{2}\s+[A-Z0-9#@$-]+", re.I)
 
@@ -103,9 +103,30 @@ def _is_comment_column1_style(line: str) -> bool:
     return line.startswith("*")
 
 
+def _fixed_column_slice(line: str, start: int, stop: int) -> str:
+    """固定形式の0始まり桁範囲を元の文字列から取り出す。
+
+    保存時の符号化に関係なく、CP932で表せる文字はそのバイト幅、表せないUnicode文字は
+    1文字1桁とする。UTF-8へ保存し直しても固定列の配置は同じ。`replace` は幅計算だけに
+    使用し、本文の文字は置き換えない。範囲境界をまたぐ全角文字は含めない。
+    """
+    if line.isascii():
+        return line[start:stop]
+    column = 0
+    chars = []
+    for char in line:
+        next_column = column + len(char.encode("cp932", errors="replace"))
+        if next_column > stop:
+            break
+        if column >= start:
+            chars.append(char)
+        column = next_column
+    return "".join(chars)
+
+
 def _is_comment_fixed_columns(line: str) -> bool:
     """固定列（fixed columns）ファイル専用のコメント判定: 1〜6桁（連番領域）の内容に関係なく
-    7桁目（0始まり index 6）の `*`/`/` をコメント行として扱う（`_is_seq_area` による連番領域の
+    7桁目（CP932幅で数える）の `*`/`/` をコメント行として扱う（`_is_seq_area` による連番領域の
     妥当性チェックはしない——様式判定で既に固定列と確定しているファイルでは、連番領域が数字
     専用か英数字混在かに関わらず7桁目 indicator の意味は変わらないため。`A00030*    COPY
     FAKE.` のような英数字連番＋7桁目 `*` の行を、`_is_seq_area` 経由の `_is_comment` は
@@ -113,7 +134,7 @@ def _is_comment_fixed_columns(line: str) -> bool:
     `_normalize_logical_lines`（固定列分岐）が使う。
     自由形式・JCL・列1始まりが使う `_is_comment`/`_is_comment_column1_style` は署名・挙動とも不変。
     """
-    return len(line) > 6 and line[6] in "*/"
+    return _fixed_column_slice(line, 6, 7) in ("*", "/")
 
 
 def _is_word_char(ch: str) -> bool:
@@ -142,8 +163,8 @@ def _detect_column1_style(lines: list) -> bool:
     ファイル内で様式を混在させると構造的に破綻するため）。
 
     **優先1: 固定列の証拠を先に見る**（列1証拠より優先し、見つかればそこで確定して列1証拠は
-    見ない）。コメントでない物理行のうち、7桁目（0始まり index 6）が固定列の有効な
-    indicator（空白・`D`/`d`・`-`・`*`・`/`）であり、かつ8桁目以降（`line[7:72]` の字下げを
+    見ない）。コメントでない物理行のうち、7桁目（CP932幅で数える）が固定列の有効な
+    indicator（空白・`D`/`d`・`-`・`*`・`/`）であり、かつ8〜72桁（実コード領域の字下げを
     許容するため `.lstrip()` する）から次のいずれかが始まる行が1つでもあれば「固定列
     （fixed columns）」と確定する:
 
@@ -181,9 +202,9 @@ def _detect_column1_style(lines: list) -> bool:
     for line in lines:
         if _is_comment(line):
             continue
-        if line[6:7] not in (" ", "D", "d", "-", "*", "/"):
+        if _fixed_column_slice(line, 6, 7) not in (" ", "D", "d", "-", "*", "/"):
             continue
-        code_area = line[7:72].lstrip()
+        code_area = _fixed_column_slice(line, 7, 72).lstrip()
         if (_DIVISION_HEADER.match(code_area)
                 or _PROGRAM_ID.match(code_area)
                 or _LEVEL_ITEM_FIXED.match(code_area)):
@@ -340,14 +361,14 @@ def _build_fixed_column_logical(physical_lines: list, include_debug: bool) -> tu
     for i, line in enumerate(physical_lines, 1):
         if _is_comment_fixed_columns(line):
             continue
-        if not line[6:72].strip():
+        if not _fixed_column_slice(line, 6, 72).strip():
             continue                                # 空行（7〜72桁が空白のみ）は結合対象から除外
-        indicator = line[6:7]
+        indicator = _fixed_column_slice(line, 6, 7)
         if indicator in ("D", "d") and not include_debug:
-            debug_lines.append((i, line[7:72].strip()[:120]))
+            debug_lines.append((i, _fixed_column_slice(line, 7, 72).strip()[:120]))
             continue                                # 状態機械から見えない存在として飛ばす
         if indicator == "-":
-            cont_area = line[11:72]
+            cont_area = _fixed_column_slice(line, 11, 72)
             if not frags:
                 cont = cont_area.lstrip()
                 if cont[:1] in ("'", '"'):
@@ -377,7 +398,7 @@ def _build_fixed_column_logical(physical_lines: list, include_debug: bool) -> tu
             continue
         flush()
         frag_line = i
-        frags = [line[7:72]]
+        frags = [_fixed_column_slice(line, 7, 72)]
         frag_segments = [0]
         frag_len = len(frags[0])
         quote_state = _scan_quote_state(frags[0], None)
@@ -403,7 +424,8 @@ def _normalize_logical_lines(text: str, free_format: bool) -> tuple:
     `debug_dropped` は常に空。
 
     **固定列（fixed columns）**: 全物理行に列位置の意味があるとみなし、無条件に
-    1〜6桁の連番領域と 73桁以降（識別領域）を落とし、8〜72桁の実コード領域だけを残す
+    1〜6桁の連番領域と 73桁以降（識別領域）を落とし、8〜72桁の実コード領域だけを残す。
+    桁幅は `_fixed_column_slice` のCP932幅契約に従う（文字列のindexとは異なる）
     （継続結合・コメント／空行の除外の詳細は `_build_fixed_column_logical` 参照）。
 
     7桁目 indicator が `D`/`d`（デバッグ行）の有無は2段構えで扱う——D 行を継続結合の対象に

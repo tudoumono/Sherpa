@@ -100,10 +100,21 @@ PDF は `pdfplumber.open(path)` で両世代のページテキストを列（1 �
 ```python
 import difflib
 
-with open(old_path, encoding="utf-8", errors="replace") as f:
-    old_lines = f.readlines()
-with open(new_path, encoding="utf-8", errors="replace") as f:
-    new_lines = f.readlines()
+# 旧/新のソースは CP932（Shift_JIS）のことがあるため、決め打ちで utf-8 置換読みにせず実際の
+# 符号化を判定してから読む（unified_diff への入力は readlines() と同じく改行を残す＝keepends）。
+def read_src(p):
+    with open(p, "rb") as f:
+        b = f.read()
+    if b.startswith(b"\xef\xbb\xbf"):
+        return b[3:].decode("utf-8", "replace")
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        u, c = b.decode("utf-8", "replace"), b.decode("cp932", "replace")
+        return c if c.count("�") < u.count("�") else u
+
+old_lines = read_src(old_path).splitlines(keepends=True)
+new_lines = read_src(new_path).splitlines(keepends=True)
 diff = difflib.unified_diff(old_lines, new_lines, fromfile=str(old_path), tofile=str(new_path))
 print("".join(diff))
 ```

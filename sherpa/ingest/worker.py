@@ -149,6 +149,13 @@ def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict |
         by_ext = scan_rep.get("unreachable_as_text_by_ext")
         if by_ext:
             c["unreachable_as_text_by_ext"] = by_ext
+        # SRH-05: 理由別内訳（判別不能／バイナリ）と、対象外にしない「一部が化けている」件数。
+        by_reason = scan_rep.get("unreachable_by_reason")
+        if by_reason:
+            c["unreachable_by_reason"] = by_reason
+        encoding_partial = scan_rep.get("encoding_partial_count", 0)
+        if encoding_partial:
+            c["encoding_partial_count"] = encoding_partial
     return c
 
 

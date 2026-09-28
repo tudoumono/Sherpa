@@ -285,14 +285,14 @@ def test_unreadable_resource_doc_is_skipped_and_flagged(tmp_path, monkeypatch):
     defs = {"g1/a.fk": _def("Module", "SOMENAME")}
     monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
 
-    real_read_text = pathlib.Path.read_text
+    real_read_bytes = pathlib.Path.read_bytes
 
-    def _boom_read_text(self, *a, **kw):          # 対象ファイル限定（他の読み取りは通常どおり）
+    def _boom_read_bytes(self, *a, **kw):         # 対象ファイル限定（他の読み取りは通常どおり）
         if self.name == "unreadable.md":
             raise OSError("boom")
-        return real_read_text(self, *a, **kw)
+        return real_read_bytes(self, *a, **kw)
 
-    monkeypatch.setattr(pathlib.Path, "read_text", _boom_read_text)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", _boom_read_bytes)
 
     _, edges, flags = world_graph.build_world(wd, "w")
     assert _mention_edges(edges) == []

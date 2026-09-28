@@ -51,7 +51,7 @@ import zlib
 from collections import OrderedDict
 from typing import Callable
 
-from . import redact_keys
+from . import redact_keys, text_encoding
 
 # ---- サイズ上限（既定 50 MiB・env で上書き可）--------------------------------------------------
 
@@ -908,14 +908,12 @@ _FILE_HEAD_DEFAULT = 65536
 
 def file_head(f, max_bytes: int = _FILE_HEAD_DEFAULT,
              clean: Callable[[str], str] | None = None) -> dict:
-    """先頭 `max_bytes` バイトを UTF-8（不正/途中で切れたバイト列は置換）でデコードして返す。
+    """先頭 max_bytes バイトを UTF-8 / CP932 で返す。不正・途中で切れた文字は置換する。
 
-    `corpus_docs._read_head` と同じ「バイト単位で読んでからデコード」の流儀（マルチバイト文字の
-    境界で誤って余分/不足を読まない）。BOM/エンコーディング判定は既存に無いため行わない
-    （既存流儀どおり）。`clean`（省略可）はデコード後の全文へ適用する——`max_bytes` はここでは
-    OS 読み取り自体の上限のため、境界をまたいだ秘密パターンはそもそも読めておらず `clean` の
-    前後を問わず救えない（読めた範囲内の秘密を伏せるのが `clean` の役目）。この関数は使い切りの
-    読み取り（キャッシュしない）——常に自分で `f` を close する。
+    符号化の判定は先頭の最大 DETECT_CAP_BYTES を対象にし、返却量とは独立に行う。
+    ASCII の後に現れる日本語も判定するため、max_bytes を超える範囲を読むことがある。
+    clean は返却対象の全文に適用する。max_bytes の境界をまたぐ秘密パターンは未読なので、
+    読めた範囲内の秘密を伏せる。呼出元から渡された f はこの関数が閉じる。
     """
     if _too_big_fd(f):
         _close_quiet(f)
@@ -926,6 +924,7 @@ def file_head(f, max_bytes: int = _FILE_HEAD_DEFAULT,
         cap = _FILE_HEAD_DEFAULT
     try:
         size = os.fstat(f.fileno()).st_size
+        enc = text_encoding.detect_fd(f.fileno())
         f.seek(0)
         raw = f.read(cap)
     except OSError:
@@ -934,7 +933,7 @@ def file_head(f, max_bytes: int = _FILE_HEAD_DEFAULT,
         _close_quiet(f)
         return {"error": "ファイルを開けませんでした", "error_code": "read_io_failed"}
     _close_quiet(f)
-    text = raw.decode("utf-8", errors="replace")
+    text = text_encoding.decode(raw, enc)
     if clean is not None and text:
         # 全文を1回で扱う（複数要素にまたがる状態は不要だが、`KeyBlockRedactor` で他の
         # `doc_readers` 関数と同じ経路に揃える——単発呼び出しでも動作は `clean` 直呼びと同じ）。

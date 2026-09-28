@@ -189,7 +189,18 @@ function summaryText(s) {
   // 無変更後に表示が消えてしまう。`counts_as_of` が無い（未集計・旧形式集計の欠落補完中を含む）
   // ときは件数を出さない——実測でない 0 を「対象外 0 件」と誤解させない（`countsAsOfNote` の
   // 「未集計」表示だけで足りる）。
-  if (s.counts_as_of && s.unreachable_as_text) p.push(`本文が読めず対象外 ${esc(s.unreachable_as_text)} 件`);
+  // SRH-05: 理由が判明している分（文字コード判別不能／バイナリ）だけ内訳をカッコ書きで添える
+  // （残りは秘匿/その他の未対応＝従来どおり理由を出さない）。
+  if (s.counts_as_of && s.unreachable_as_text) {
+    const byReason = s.unreachable_by_reason || {};
+    const parts = [];
+    if (byReason.encoding_undetermined) parts.push(`文字コード判別不能 ${esc(byReason.encoding_undetermined)}`);
+    if (byReason.binary) parts.push(`バイナリ ${esc(byReason.binary)}`);
+    const detail = parts.length ? `（${parts.join('・')}）` : '';
+    p.push(`本文が読めず対象外 ${esc(s.unreachable_as_text)} 件${detail}`);
+  }
+  // 「一部が化けている（要確認）」は対象外にしない別枠（`partial_extraction_suspected` と同型）。
+  if (s.counts_as_of && s.encoding_partial_count) p.push(`一部が化けている（要確認） ${esc(s.encoding_partial_count)} 件`);
   p.push(`関係グラフ ${esc(s.graph_nodes)} 件`);
   if (s.es_chunks != null) p.push(`全文検索 ${esc(s.es_chunks)} 片`);
   else if (s.indexed > 0) p.push('全文検索 未接続');
@@ -562,6 +573,7 @@ function isFailureState(state) {
 const REASON_JA = {
   read_failed: 'ファイルを読み取れませんでした',
   unreadable_code_file: 'コードを読み取れなかったため取り込みを止めました',
+  encoding_undetermined: '文字コードを判別できないため読み取れません（UTF-8/CP932どちらも文字化けします）',
 };
 // Office 変換失敗の内側の理由（`office_md_blocked:{doc}\t{innerReason}` の innerReason 部）→ 平文。
 // 例外クラス名（`unhandled_exception:RuntimeError` 等の `:` 以降）はそのまま出さない
@@ -616,6 +628,14 @@ function provBadges(p) {                     // 文書一覧の来歴バッジ�
 function analyzerBadgeRow(d) {
   if (d.branch !== 'source' || !d.analyzer) return '';
   return `<div class="provrow"><span class="provbadge">解析: ${esc(analyzerLabel(d.analyzer))}</span></div>`;
+}
+
+// SRH-05: 対象外にしないが符号化の読み取りが不確実な資料への注意バッジ（`state` は変えない＝
+// 検索/精読は可能・要確認のみ）。
+const ENCODING_PARTIAL_TIP = '文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります（要確認）';
+function encodingPartialBadge(d) {
+  if (!d.encoding_partial) return '';
+  return `<div class="provrow"><span class="provbadge warn" title="${esc(ENCODING_PARTIAL_TIP)}">一部が化けている（要確認）</span></div>`;
 }
 
 // 重要度バッジ（登録フォルダの `_重要度.txt` による登録者の注記・無ければ空文字＝後方互換）。
@@ -728,7 +748,7 @@ function row(d) {
     ? `<div class="muted" style="font-size:var(--text-caption);margin-top:3px">理由: ${esc(reasonText(d.reason))}</div>` : '';
   const rerun = isFailureState(d.state) ? `<button class="mini" data-rerun="${esc(d.name)}">やり直す</button>` : '';
   return `<tr>
-    <td><span class="fname">${icon} ${esc(d.name)}</span>${reason}${provBadges(d.provenance)}${analyzerBadgeRow(d)}</td>
+    <td><span class="fname">${icon} ${esc(d.name)}</span>${reason}${provBadges(d.provenance)}${analyzerBadgeRow(d)}${encodingPartialBadge(d)}</td>
     <td><span class="dtype">${esc(d.doctype)}</span></td>
     <td><span class="status ${st.cls}"><span class="d"></span>${esc(st.mark)}</span></td>
     <td class="muted">${esc(place)}</td>

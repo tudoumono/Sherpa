@@ -280,7 +280,7 @@ _ANALYZERS: tuple[Analyzer, ...] = _UPSTREAM_ANALYZERS + discover_extension_anal
 # まま台帳・ES に載らなかった）。登録簿自体（`_ANALYZERS`/`extensions`）は無変更のため、この
 # 版を上げないと `content_sig`/ES `analyzer_config_sig` が drift を検知できず、既存 world が
 # 次回 sync/reindex まで新しい分類を反映しない。
-CODE_ANALYZERS_SCHEMA_VERSION = 10   # v3: _CALL/_COPY の前方語境界是正（偽参照の除去）
+CODE_ANALYZERS_SCHEMA_VERSION = 11   # 原本の文字コード・分類・固定形式の桁幅を含む解析契約の版
 # v4: COPY/CALL 抽出前に引用文字列の中身／行末インラインコメント
 # （`*>` 以降）を除去する前処理を追加（COBOL の引用/コメント誤検知の是正）＋ `CALL "PGM"`
 # （二重引用符）も INVOKES として受理するよう `_CALL` を拡張。

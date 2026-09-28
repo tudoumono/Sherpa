@@ -25,7 +25,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 
-from sherpa import store
+from sherpa import store, text_encoding
 from sherpa.deps import _current_user, ensure_workspace
 from sherpa.schemas import (
     WorkspaceFileDeleteResponse,
@@ -329,7 +329,9 @@ def workspace_search(request: Request, q: str = Query(..., min_length=1)):
         if ext not in _WORKSPACE_SEARCHABLE_EXT:
             continue
         try:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw_bytes = p.read_bytes()
+            enc = text_encoding.detect_bytes(raw_bytes, complete=True)
+            lines = text_encoding.decode(raw_bytes, enc).splitlines()
         except Exception:
             continue
         for i, ln in enumerate(lines):

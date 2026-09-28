@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import worlds
+from . import corpus_docs, worlds
 
 
 def read_world_doc_text(world: str, d: dict) -> str | None:
@@ -19,6 +19,6 @@ def read_world_doc_text(world: str, d: dict) -> str | None:
     if not p or not p.is_file():
         return None
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        return corpus_docs.read_full_text_and_raw(p)[0]
     except OSError:
         return None

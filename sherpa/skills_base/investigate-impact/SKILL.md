@@ -30,12 +30,24 @@ CONTAINS だけで構成された経路は影響の根拠にしてよい。**向
 
 ```python
 # 影響先候補（例: JCL・COBOL ソース・設定ファイル）を直接開いて、変更対象の名前がどこでどう
-# 参照されているかを確認する。text_kind が判定できないコード/設定ファイルはそのままテキストとして読む。
+# 参照されているかを確認する。src/ は CP932（Shift_JIS）のことがあるため、決め打ちで utf-8
+# 置換読みにせず実際の符号化を判定してから読む（BOM・strict UTF-8 を優先し、
+# それ以外は置換文字が少ない場合だけ CP932 を選ぶ）。
+def read_src(p):
+    with open(p, "rb") as f:
+        b = f.read()
+    if b.startswith(b"\xef\xbb\xbf"):
+        return b[3:].decode("utf-8", "replace")
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        u, c = b.decode("utf-8", "replace"), b.decode("cp932", "replace")
+        return c if c.count("�") < u.count("�") else u
+
 target_name = "TAXRATE"   # 変更対象の名前（例）
-with open(candidate_path, encoding="utf-8", errors="replace") as f:
-    for i, line in enumerate(f, start=1):
-        if target_name in line:
-            print(i, line.rstrip())
+for i, line in enumerate(read_src(candidate_path).splitlines(), start=1):
+    if target_name in line:
+        print(i, line.rstrip())
 ```
 
 Excel/Word/PowerPoint/PDF の設計書側に影響先の記述があるときは investigate-spec スキルの雛形

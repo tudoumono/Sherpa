@@ -100,6 +100,10 @@ AGENTS_MD = f"""\
 _INVESTIGATE_SKILLS_PARAGRAPH = """\
 - 質問の型（資料一覧／仕様の問い合わせ／影響範囲／原因調査／比較）に合う `.agents/skills` の
   investigate-* スキルを読んで、その手順（ツールで当たり→原本の中身を確かめる→答える）どおりに進める。
+- `src/` のソースは CP932（Shift_JIS）のことがある。日本語の語で探す・読むときは
+  ripgrep_search／read_around を使う（UTF-8/CP932 を判定して読む）。シェルで探すなら、
+  CP932 と確認したソースに `rg -E sjis` を使う。cat／sed で読む場合もそのファイルだけ
+  `iconv -f CP932 -t UTF-8` を通す。UTF-8 のファイルには適用しない。
 """
 
 # 本体自身のソース確認要件（深さに関わらず常時）: worker の主張を鵜呑みにせず、根拠に示された

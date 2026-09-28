@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from . import agent_constructs, agentic_search, app_version, exec_event, intent_llm, scope, store, worlds
+from . import agent_constructs, agentic_search, app_version, exec_event, intent_llm, scope, store, text_encoding, worlds
 from . import depth_profile as depth_profile_mod
 from . import investigation_state as investigation_state_mod
 from . import layer as layer_mod
@@ -1477,7 +1477,9 @@ def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
         if target.suffix.lower() not in _PERSONAL_SEARCHABLE_EXT:
             continue
         try:
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw_bytes = target.read_bytes()
+            enc = text_encoding.detect_bytes(raw_bytes, complete=True)
+            lines = text_encoding.decode(raw_bytes, enc).splitlines()
         except Exception:
             continue
         for i, ln in enumerate(lines):

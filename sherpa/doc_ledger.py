@@ -216,6 +216,8 @@ def preview_documents(world: str, *, root=None, files=None, sig: str | None = No
     `state`/`label`/`reason` は `documents_for()`（走査結果＋直近 run の blocked flag 突き合わせ済み）
     の同名フィールドをそのまま通す——Office の未抽出箇所通知・`unreadable`（読み取り不可）・
     `unknown`（直近 run を確認できなかった）を「使えます」で一律に上書きしない。
+    `encoding_partial`（あれば True のみ・SRH-05）＝対象外にしないが符号化の読み取りが不確実な
+    資料（`state="ready"` のまま）——画面が「要確認」バッジを出す材料。
 
     `analyzer`＝担当アナライザの内部名（`corpus_docs.iter_world_documents` 参照・コード文書のみ
     非 `None`）。`doctype`（種別表示用）とは独立した値——§7 裁定2 の受入条件（取り込み画面で
@@ -246,6 +248,8 @@ def preview_documents(world: str, *, root=None, files=None, sig: str | None = No
                "state": r.get("state", "ready"), "label": r.get("label", "使えます"),
                "reason": r.get("reason"),
                **_importance_fields(r["name"], res_map)}
+        if r.get("encoding_partial"):   # SRH-05: 対象外にしないが符号化の読み取りが不確実な資料
+            doc["encoding_partial"] = True
         prov = corpus_docs.provenance_summary(r.get("md_path"))   # md_path 無し/欠落は None＝付けない
         if prov:
             doc["provenance"] = prov

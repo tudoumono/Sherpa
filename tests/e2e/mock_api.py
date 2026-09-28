@@ -1382,6 +1382,7 @@ WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_
                      "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
                      "analyzer_declined_as_document": 0, "unreadable": 0,
                      "sensitive_excluded": 0, "unreachable_as_text": 0, "unreachable_as_text_by_ext": {},
+                     "unreachable_by_reason": {}, "encoding_partial_count": 0,
                      "counts_as_of": "2026-07-03T09:00:00+00:00",
                      "graph_nodes": 4, "graph_edges": 3, "es_chunks": 6,
                      "last_run_id": 500,
