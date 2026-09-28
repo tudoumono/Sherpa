@@ -7,12 +7,14 @@
 """
 from __future__ import annotations
 
+import os
+
 import logging
 import time
 from collections import Counter
 from pathlib import Path
 
-from . import json_io
+from . import json_io, text_encoding
 from . import scope_infer as si
 from . import worlds
 from .ingest import importance, text_kind
@@ -85,8 +87,55 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True) -> dict:
-    """1ファイルの分類（列挙・集計・状態APIが共有する単一の判定）。
+def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True,
+                      text_quality=None) -> dict:
+    """`_classify_document_core()` の判定を返す（判定そのものの説明はそちらの docstring 参照）。
+
+    `text_quality`（SRH-05・省略可・キーワード専用・zero-arg callable）: テキストとして読める
+    （`_classify_verdict_reachable()` が True）と core が判定した場合だけ呼ぶ——Office/PDF/画像・
+    秘匿名・未対応は対象外のまま core の結果をそのまま返す（本文を原本ツリーから直接読むのは
+    `kind=="code"` またはテキスト資料の doctype 確定時だけ・`grep_tool.grep_search` が派生MDを
+    UTF-8 固定で読み符号化判定を省くのと同じ理由）。`text_quality()` は `(encoding, ratio,
+    majority_garbled)`（`text_encoding.detect_fd_quality` と同型・`ratio`＝化け比率・
+    `majority_garbled`＝空でない行の過半に化けがあるか）または `None`（読み取り不能）を返す
+    callable——呼び出し元は `_text_quality_for(rp)` を渡す。
+
+    `text_encoding.quality_of(ratio, majority_garbled)` が:
+    - `"ok"`（置換なし）: core の結果をそのまま返す（追加のキーも付けない）。
+    - `"partial"`（一部が化けている・対象外にしない）: `result["encoding_partial"] = True` を足す
+      （`kind`/`doctype` は変えない＝検索・精読は従来どおり可能・利用者/Codex への注意喚起のみ）。
+    - `"undetermined"`（UTF-8 でも CP932 でも化ける）: `kind`/`doctype` を未対応
+      （`document`/`None`）へ**書き換え**、`result["unreadable_reason"] = "encoding_undetermined"`
+      を足す——`_classify_verdict_reachable()` が False になり、grep/scan_report/read_around 等の
+      既存の到達可否ゲートが自動的に対象外にする（拡張子の許可リストではなくこの1つの判定式が
+      可否を決める契約・§7 裁定10 を維持）。
+
+    `text_quality is None`（既定）: 補正を一切行わない——既存呼び出し元（quality を渡さない全ての
+    呼び出し・`status_document_doctype` 系のホットパス含む）は完全に無変更のまま。
+    """
+    result = _classify_document_core(rel_path, ext, read_head, allow_content_sniff=allow_content_sniff)
+    if text_quality is None or not _classify_verdict_reachable(result):
+        return result
+    quality = text_quality()
+    if quality is None:
+        return result
+    level = text_encoding.quality_of(quality[1], quality[2])
+    if level == "ok":
+        return result
+    out = dict(result)
+    out["encoding"] = quality[0]
+    if level == "undetermined":
+        out["kind"] = "document"
+        out["doctype"] = None
+        out["unreadable_reason"] = "encoding_undetermined"
+    else:
+        out["encoding_partial"] = True
+    return out
+
+
+def _classify_document_core(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True) -> dict:
+    """1ファイルの分類（列挙・集計・状態APIが共有する単一の判定）。`classify_document()`
+    （符号化の読み取り品質を補正する薄いラッパー・SRH-05）が本関数へ委譲する——直接は呼ばない。
 
     `read_head`（`size` キーワードを受け取れる callable）は `registry.resolve_lazy` の内容判定に
     そのまま渡す——実際に必要な時（拡張子を要求する候補の誰かが `accepts()` を上書きしている時）
@@ -248,7 +297,12 @@ def _classify_generic_text(rel_path: str, ext: str, read_head, had_code_candidat
                 return {"kind": "unreadable", "had_code_candidates": had_code_candidates}
         sniff = text_kind.sniff_content(head)
         if sniff == "binary":
-            return {"kind": "document", "doctype": None, "had_code_candidates": had_code_candidates}
+            # SRH-05: 理由を明示するが、一覧への出し方（バイナリは載せない）は従来どおり——
+            # `unreadable_reason` は `scan_report()` の理由別内訳（`unreachable_by_reason`）専用で、
+            # `iter_world_documents()` は既存契約のとおりこの旗を見ない（`test_stage2_binary_
+            # unknown_extension_is_not_listed` が固定する既存挙動＝バイナリは一覧に出ない）。
+            return {"kind": "document", "doctype": None, "had_code_candidates": had_code_candidates,
+                    "unreadable_reason": "binary"}
         kind = sniff
     if kind == "code":
         return {"kind": "code", "doctype": text_kind.CODE_DOCTYPE_LABEL, "analyzer": None,
@@ -283,7 +337,7 @@ def reachable_as_text(rel_path: str, ext: str, read_head) -> bool:
 
 
 def _read_head(rp: Path, size: int = 4096) -> str:
-    """先頭 `size` **バイト**を読み UTF-8（不正/途中で切れたバイト列は置換）でデコードする
+    """先頭 `size` **バイト**を読み UTF-8/CP932（不正/途中で切れたバイト列は置換）でデコードする
     （`registry.resolve_lazy` の内容判定専用・head だけで足りる経路が使う軽量版）。
     読めなければ `_HeadUnreadable`。
 
@@ -296,13 +350,53 @@ def _read_head(rp: Path, size: int = 4096) -> str:
     """
     try:
         with rp.open("rb") as f:
-            return f.read(size).decode("utf-8", errors="replace")
+            # 分類は先頭だけで足りる＝読み込み量を先頭 size バイトに保つ（全体判定の detect_fd は使わない）。
+            raw = f.read(size)
+            encoding = text_encoding.detect_bytes(raw, complete=len(raw) < size or os.fstat(f.fileno()).st_size <= size)
+            return text_encoding.decode(raw, encoding)
     except OSError as e:
         raise _HeadUnreadable(str(e)) from e
 
 
+# SRH-05: 符号化の読み取り品質（`text_encoding.detect_fd_quality` の薄いラッパー）。原本ツリーの
+# 実パスを持つ呼び出し元（`scan_report`/`iter_world_documents`/`grep_tool.grep_search`/
+# `agentic_search._safe_doc_path` 等）が `classify_document(..., text_quality=...)` へ渡す
+# closure、およびツール結果への注意喚起（`encoding_caution_for*`）の両方の入口。
+# `text_encoding` 側のキャッシュ（ファイル state キー）を共有するため、同じファイルに対して
+# `_read_head`/`read_full_text_and_raw` 等が既に符号化判定を済ませていれば再スキャンしない。
+def _text_quality_for(rp: Path) -> tuple[str, float, bool] | None:
+    """`rp` の `(encoding, replacement_ratio, majority_garbled)`。開けなければ `None`。"""
+    try:
+        with rp.open("rb") as f:
+            return text_encoding.detect_fd_quality(f.fileno())
+    except OSError:
+        return None
+
+
+# ツール結果（read_doc/read_around/ripgrep_search 等）へ添える短い注意文——判定結果（"partial"/
+# "undetermined"）だけで決まる閉じた語彙（利用者向け平文ではなく Codex 向けの機械的な印だが、
+# 文言そのものは `failure_reasons` の平文と同じ趣旨で揃える）。
+_ENCODING_CAUTION = {
+    "partial": "この資料は文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります（要確認）。",
+    "undetermined": "この資料は文字コードを判別できず、内容が正しく読み取れていません。",
+}
+
+
+def encoding_caution_for_ratio(ratio: float, majority_garbled: bool = False) -> str | None:
+    """置換文字比率＋行の過半化け判定 → ツール結果への注意文（"ok" なら None）。"""
+    return _ENCODING_CAUTION.get(text_encoding.quality_of(ratio, majority_garbled))
+
+
+def encoding_caution_for(rp: Path) -> str | None:
+    """`rp` の符号化品質に応じた注意文（読み取り不能/"ok" なら None）。"""
+    tq = _text_quality_for(rp)
+    if tq is None:
+        return None
+    return encoding_caution_for_ratio(tq[1], tq[2])
+
+
 def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
-    """ファイルをバイナリで**1回だけ**読み、全文（UTF-8・不正/途中で切れたバイト列は置換でデコード）
+    """ファイルをバイナリで**1回だけ**読み、全文（UTF-8/CP932・不正バイト列は置換でデコード）
     と生バイト列の両方を返す。読めなければ `OSError`（呼び出し元の既存の読取失敗処理に委ねる）。
 
     `ingest.world_graph` の Pass1（構文解析用の全文と、アナライザごとに異なる `accepts()` 判定用の
@@ -318,7 +412,9 @@ def read_full_text_and_raw(rp: Path) -> tuple[str, bytes]:
     # 全文はテキストモード読取（`Path.read_text`）と同じユニバーサル改行（CRLF/単独 CR → LF）に
     # 揃える——行単位で構文を見るアナライザが単独 CR のファイルで1行に潰れないため。head 用の
     # 生バイト列は無加工（バイト境界の契約を保つ）。
-    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    encoding = text_encoding.detect_bytes(raw[:text_encoding.DETECT_CAP_BYTES],
+                                          complete=len(raw) <= text_encoding.DETECT_CAP_BYTES)
+    text = text_encoding.decode(raw, encoding).replace("\r\n", "\n").replace("\r", "\n")
     return text, raw
 
 
@@ -688,7 +784,8 @@ def _size_exceeded_row(rel: str, doctype: str, branch: str) -> dict:
 # はこのキーを持たない——`routers.worlds._ingest_summary`（response_model 必須フィールド）・
 # `ingest.worker._sync_impl`（無変更同期のバックフィル判定）が `scan_report_missing_fields()`
 # 経由で共有する単一のキー集合。
-SCAN_REPORT_REQUIRED_KEYS = ("sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext")
+SCAN_REPORT_REQUIRED_KEYS = ("sensitive_excluded", "unreachable_as_text", "unreachable_as_text_by_ext",
+                            "unreachable_by_reason", "encoding_partial_count")
 
 
 def scan_report_missing_fields(rep) -> bool:
@@ -708,6 +805,7 @@ def empty_scan_report() -> dict:
             "skipped_office": 0, "office_failed": 0, "skipped_other": 0, "skipped_ext": {},
             "analyzer_declined": 0, "analyzer_declined_as_document": 0, "unreadable": 0,
             "sensitive_excluded": 0, "unreachable_as_text": 0, "unreachable_as_text_by_ext": {},
+            "unreachable_by_reason": {}, "encoding_partial_count": 0,
             "document_count": 0}
 
 
@@ -755,6 +853,17 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
     合算）。`unreachable_as_text_by_ext`＝そのうち秘匿を除いた拡張子別内訳（`skipped_ext` とは別の
     Counter——`skipped_ext` は Office/画像の変換失敗・未対応も混ざるため、本文readabilityだけの
     内訳を別に持つ）。
+
+    SRH-05（原本の符号化・読み取りの正直化）: `classify_document(..., text_quality=...)` を通して
+    原本ツリーの符号化品質を判定する（Office/PDF/画像・秘匿名・未対応拡張子は対象外のまま・
+    `classify_document` docstring 参照）。`unreachable_by_reason`＝`unreachable_as_text` の内訳の
+    うち理由コードが判明しているものだけの Counter（キーは `failure_reasons.REASON_CATALOG` の
+    語彙——現状 `"encoding_undetermined"`／`"binary"`。バイナリ（`ingest.text_kind.sniff_content`
+    が判定・未知拡張子のみ）と符号化判別不能（登録拡張子も含む全テキストが対象）はどちらも
+    `other`/`unreachable_as_text_by_ext` へ既に合流済みの内訳を、理由別にも見せるだけ——二重計上
+    ではない）。`encoding_partial_count`＝対象外にはしないが置換文字が残る（`quality_of`＝
+    `"partial"`）ファイルの件数——`unreachable_as_text` には**含めない**（読める・検索/精読の対象の
+    まま・要確認の別枠）。
     """
     wd = worlds.world_dir(world)
     if not wd:
@@ -767,6 +876,8 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
         0, Counter(), 0, 0, 0, 0, Counter(), 0, 0, 0, 0)
     sensitive_excluded = 0
     unreachable_ext: Counter = Counter()   # `unreadable`＋`other`（本文readability起因のみ）の拡張子別内訳
+    unreachable_by_reason: Counter = Counter()   # SRH-05: 理由コードが判明している分だけの内訳
+    encoding_partial_count = 0                    # SRH-05: 対象外にしない「一部が化けている」件数
     scanned = 0
     # `expected_rels` 比較用（省略時は集めない＝無駄なメモリ確保を避ける）。manifest と同じ母集合
     # （重要度設定ファイルも含む全 rel）にするため、下の `continue` より前で追加する。
@@ -785,11 +896,20 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
                 cache[size] = _read_head(rp, size)
             return cache[size]
 
-        result = classify_document(rel, ext, _cached_read_head)
+        result = classify_document(rel, ext, _cached_read_head,
+                                   text_quality=lambda rp=rp: _text_quality_for(rp))
         if result.get("sensitive"):          # 秘匿名: 台帳にも by_doctype/skipped_ext にも入れない
             _log.warning("scan_report: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
             sensitive_excluded += 1          # 拡張子内訳は持たない（存在を推測させない）
             continue
+        # SRH-05: 理由が判明している「対象外」の内訳（`unreachable_as_text` には含めない——
+        # このあとの分岐で `result` は "code"/doctype 付きのまま扱われ、`indexed` 等の既存の
+        # 集計を通常どおり増やす）。「一部が化けている」件数（`encoding_partial_count`）は
+        # `indexed` を実際に加算する分岐（下の "code"/doctype 分岐）でだけ数える——ここで
+        # 数えると、サイズ超過で対象外（`unreadable`）になる資料まで二重に数えてしまう。
+        ur_reason = result.get("unreadable_reason")
+        if ur_reason:
+            unreachable_by_reason[ur_reason] += 1
         # `document_count`（`/ext/v1/capabilities` の doc_count が使う値）: `manifest_doctype_count`/
         # `status_document_doctype` と同一の判定（`allow_content_sniff=False`）を、本ループが既に
         # 読んだ head を `_cached_read_head` 経由で再利用して求める——`registry` の登録済みアナライザ
@@ -814,6 +934,8 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
                 continue
             indexed += 1
             by[result["doctype"]] += 1
+            if result.get("encoding_partial"):          # SRH-05: 対象外にしない「一部が化けている」件数
+                encoding_partial_count += 1
             continue
         if result["doctype"] is not None:              # 資料表（.md/.txt 等）にある拡張子
             if result["doctype"] == text_kind.DOCUMENT_DOCTYPE_LABEL and _text_oversize(rp):
@@ -823,6 +945,8 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
                 continue
             indexed += 1
             by[result["doctype"]] += 1
+            if result.get("encoding_partial"):          # SRH-05: 対象外にしない「一部が化けている」件数
+                encoding_partial_count += 1
             if result["had_code_candidates"]:           # 担当アナライザは居たが accepts() 全滅＝資料として扱う
                 analyzer_declined_as_document += 1
             continue
@@ -858,7 +982,10 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
                 office_fail += 1
                 skipped_ext[ext] += 1
         else:                                          # 既存の資料種別に該当しない＝未対応（§7 裁定10）
-            if result["had_code_candidates"]:
+            # SRH-05: `classify_document` は undetermined を document/None へ書き換えても
+            # `had_code_candidates` はそのまま残す——理由が符号化（`ur_reason` あり）なら
+            # アナライザは何も拒否していないので「未対応」には数えない（二重の理由を出さない）。
+            if result["had_code_candidates"] and not ur_reason:
                 analyzer_declined += 1
             other += 1
             skipped_ext[ext or "(拡張子なし)"] += 1
@@ -873,6 +1000,8 @@ def scan_report(world: str, *, expected_rels: frozenset[str] | None = None) -> d
             "sensitive_excluded": sensitive_excluded,
             "unreachable_as_text": unreadable + other + sensitive_excluded,
             "unreachable_as_text_by_ext": dict(unreachable_ext),
+            "unreachable_by_reason": dict(unreachable_by_reason),
+            "encoding_partial_count": encoding_partial_count,
             "document_count": doc_count}
 
 
@@ -911,6 +1040,14 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
     サイズ超過（8MiB・grep 上限と同じ）は `state="unreadable"`／`reason="size_exceeded"`
     （`failure_reasons.REASON_CATALOG` の既存語彙を再利用・派生MD もベクトル/グラフも作らない
     ＝原文をそのまま grep/ES 全文の対象にする）。
+
+    SRH-05: 文字コードを判別できない原本（登録拡張子・軽量テキスト枠の両方が対象）は
+    `state="unreadable"`／`reason="encoding_undetermined"` で載せる（`read_failed`/`size_exceeded`
+    と同じ既存の出し方）。ただしバイナリ（`text_kind.sniff_content` 判定）は**この行に含めない**
+    ——バイナリの未知拡張子は従来どおり一覧に出ない契約（`test_stage2_binary_unknown_extension_
+    is_not_listed` が固定）を保つ。対象外にしない「一部が化けている」（`encoding_partial`）は
+    通常どおり `state="ready"` のまま、行へ `encoding_partial: True` を追加で持つ（コード/テキスト
+    資料の行のみ・Office/画像/サイズ超過には付けない）。
     """
     wd = root if root is not None else worlds.world_dir(world)
     if not wd:
@@ -927,16 +1064,25 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
         # コード判定は拡張子だけでなく accepts() まで見て確定する（`resolve_lazy` は既定 accepts
         # （常に真）のアナライザしか候補に無ければ内容を読まない＝列挙コストは増やさない・§7 裁定10）。
         # scan_report/status_document_doctype と同じ classify_document() を共有する。
-        result = classify_document(rel, ext, lambda rp=rp, size=4096: _read_head(rp, size))
+        result = classify_document(rel, ext, lambda rp=rp, size=4096: _read_head(rp, size),
+                                   text_quality=lambda rp=rp: _text_quality_for(rp))
         if result.get("sensitive"):          # 秘匿名: 台帳に載せない・Office/画像へ再採用しない
             _log.warning("iter_world_documents: 秘匿名のため対象外にしました（doctype=対象外 ext=%s）", ext)
             continue
+        encoding_partial_kw = {"encoding_partial": True} if result.get("encoding_partial") else {}
         if result["kind"] == "unreadable":
             # 内容判定が必要だったが読み取れない＝次点アナライザへ誤配属せず判定を打ち切り、
             # 明示の失敗状態として出す。
             yield {"name": rel, "path": rel, "doctype": None, "branch": None, "analyzer": None,
                    "state": "unreadable", "label": "読み取れません", "reason": "read_failed",
                    "md_path": None, **_scope_meta(rel)}
+        elif result.get("unreadable_reason") == "encoding_undetermined":
+            # SRH-05: `read_failed`/`size_exceeded` と同じ既存の出し方（バイナリはこの行に含めない
+            # ——`unreadable_reason` docstring 参照・一覧非表示の既存契約を保つ）。
+            from .ingest.failure_reasons import REASON_CATALOG as _RC
+            yield {"name": rel, "path": rel, "doctype": None, "branch": None, "analyzer": None,
+                   "state": "unreadable", "label": _RC["encoding_undetermined"]["label"],
+                   "reason": "encoding_undetermined", "md_path": None, **_scope_meta(rel)}
         elif result["kind"] == "code":
             # `analyzer`＝担当アナライザの内部名（`Analyzer.name`）。`doctype` は種別表示用の
             # 平文ラベル素材で、両者は現行構成では同値だが独立した概念（§7 裁定2の受入条件＝
@@ -949,14 +1095,14 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
                 yield {"name": rel, "path": rel, "doctype": result["doctype"], "branch": "source",
                        "analyzer": analyzer_obj.name if analyzer_obj is not None else None,
                        "state": "ready", "label": "使えます", "reason": None,
-                       "md_path": None, **_scope_meta(rel)}
+                       "md_path": None, **_scope_meta(rel), **encoding_partial_kw}
         elif result["doctype"] is not None:              # 設計書/テキスト（コード拡張子が accepts() 全滅時もここへ資料落ち）
             if result["doctype"] == text_kind.DOCUMENT_DOCTYPE_LABEL and _text_oversize(rp):
                 yield _size_exceeded_row(rel, result["doctype"], "office")
             else:
                 yield {"name": rel, "path": rel, "doctype": result["doctype"], "branch": "office", "analyzer": None,
                        "state": "ready", "label": "使えます", "reason": None,
-                       "md_path": None, **_scope_meta(rel)}
+                       "md_path": None, **_scope_meta(rel), **encoding_partial_kw}
         elif ext in _OFFICE_DOCTYPE:
             # rag 表現が正本（`grep_tool.preferred_derived_name` と同じ優先順位）: include_rag 有効時は
             # legacy `.md` より `.rag.md` を優先する（grep/ES/グラフが同じ物理ファイルを見る・

@@ -56,6 +56,18 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
         "label": "書き込み失敗",
         "advice": "派生ファイルの書き込みに失敗しました。ディスクの空き容量や権限を確認し、時間をおいて再試行してください。",
     },
+    # SRH-05: 原本の文字コード/内容の読み取り判定（`corpus_docs`/`text_encoding`/`ingest.text_kind`
+    # が単一の真実源）。office_md 由来の失敗（上のエントリ）とは別系統だが、同じ閉じた語彙・
+    # 表示の枠組み（`label`/`advice`）を再利用する。
+    "encoding_undetermined": {
+        "label": "文字コードを判別できない",
+        "advice": "UTF-8でもCP932（Shift-JIS系）でも文字化けするため読み取れません。"
+                  "文字コードを確認し、UTF-8で保存し直してください。",
+    },
+    "binary": {
+        "label": "バイナリ",
+        "advice": "文字として読み取れない形式（バイナリ）のため対象外です。",
+    },
     "other": {
         "label": "その他の失敗",
         "advice": "原因を特定できませんでした。管理者にお問い合わせください。",
@@ -65,6 +77,12 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
 # 「抽出不完全の疑い（要確認）」＝失敗ではない別枠（`REASON_CATALOG` には含めない・取り込み自体は成功のまま）。
 PARTIAL_EXTRACTION_LABEL = "抽出不完全の疑い（要確認）"
 PARTIAL_EXTRACTION_ADVICE = "本文の一部しか読み取れていない可能性があります。開いて確認し、必要なら保存し直すか再変換してください。"
+
+# SRH-05: 「一部が化けている（要確認）」＝失敗ではない別枠（`PARTIAL_EXTRACTION_LABEL` と同型）。
+# UTF-8/CP932 のどちらで読んでも置換文字が僅かに残るが、`text_encoding.UNDETERMINED_RATIO` を
+# 超えない（＝文字コード自体は判別できている）ファイルに付く——対象外にはしない。
+ENCODING_PARTIAL_LABEL = "一部が化けている（要確認）"
+ENCODING_PARTIAL_ADVICE = "文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります。開いて確認し、必要なら文字コードを直して保存し直してください。"
 
 # `document_ir_failed:<detail>` の detail のうち、それ自体が既に閉じた語彙のコードであるもの
 # （`ooxml_arm.OoxmlArm.convert()` が例外クラス名の代わりに埋め込む・detail 側の単一の真実源）。

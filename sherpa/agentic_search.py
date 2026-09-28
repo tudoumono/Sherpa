@@ -29,6 +29,7 @@ from pathlib import Path
 from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, redact_keys, stop_kind, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
+from . import text_encoding
 from . import tools_pref as tools_pref_mod
 from .ingest import importance, text_kind
 from .ingest.analyzers import registry as _analyzer_registry
@@ -630,8 +631,11 @@ def _safe_doc_path(world: str, doc_id: str, *, layer=None):
     is_code = False
     if not is_office:
         from . import corpus_docs
+        # SRH-05: `text_quality` を渡し、文字コードを判別できない原本（UTF-8/CP932 どちらも化ける）
+        # を対象外にする——grep/scan_report と同じ `_classify_verdict_reachable` 判定を共有する。
         verdict = corpus_docs.classify_document(
-            doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size))
+            doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size),
+            text_quality=lambda p=rp: corpus_docs._text_quality_for(p))
         if not corpus_docs._classify_verdict_reachable(verdict):
             return None
         is_code = verdict["kind"] == "code"
@@ -722,8 +726,10 @@ def _safe_original_path(world: str, doc_id: str, scope_paths, *, kinds: frozense
         return None
     from . import corpus_docs
     if is_file_head:
+        # SRH-05: `_safe_doc_path` と同じ理由（文字コードを判別できない原本は対象外）。
         verdict = corpus_docs.classify_document(
-            doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size))
+            doc_id, ext, lambda p=rp, size=4096: corpus_docs._read_head(p, size),
+            text_quality=lambda p=rp: corpus_docs._text_quality_for(p))
         if not corpus_docs._classify_verdict_reachable(verdict):
             return None
         is_code = verdict["kind"] == "code"
@@ -840,16 +846,27 @@ def _open_doc_stream(world: str, doc_id: str, sp, layer) -> tuple:
 
 def _stream_doc_lines(f):
     """open 済み `f`（`_open_doc_stream` が返すバイナリファイル）を `_READ_AROUND_FILE_CAP_BYTES`/
-    `_READ_LINE_MAX_BYTES` で bounded にストリーミング走査する `(reader, 行イテレータ)` を返す。
+    `_READ_LINE_MAX_BYTES` で bounded にストリーミング走査する `(reader, 行イテレータ,
+    encoding_caution)` を返す。
 
     行番号の定義は `_logical_lines`（`str.splitlines()` と同一の論理行）——grep のヒット行番号と
     read 側の行番号がずれない（`grep_tool._logical_lines` 参照）。呼び出し元はイテレータを消費し
     終えた後（cap 到達・EOF・呼び出し元都合の早期打ち切りのいずれか）に `reader.truncated`/
     `reader.line_overflowed` を見て `file_truncated` を判定する（`grep_tool.grep_search` の
     `effective_truncated = reader.truncated or reader.line_overflowed` と同じ判定式）。
+
+    符号化の判定と行分割は grep と共有し、検索・精読・引用の行番号を揃える。
+
+    `encoding_caution`（SRH-05）: 対象外にはしないが符号化の読み取りが不確実（`quality_of`＝
+    "partial"）なら短い注意文、それ以外（"ok"・判定不能）は `None`——`text_encoding.detect_fd_quality`
+    は fd の state キーでキャッシュ済みのため、既に呼んだ `enc` の判定を再スキャンしない
+    （`corpus_docs._text_quality_for` を経由せず fd を直接使う＝二重 open を避ける）。
     """
+    from . import corpus_docs
     reader = grep_tool._CappedStreamReader(f, line_max_bytes=_READ_LINE_MAX_BYTES)
-    return reader, grep_tool._logical_lines(reader, _READ_AROUND_FILE_CAP_BYTES)
+    enc, ratio, majority_garbled = text_encoding.detect_fd_quality(f.fileno())
+    caution = corpus_docs.encoding_caution_for_ratio(ratio, majority_garbled)
+    return reader, grep_tool._logical_lines(reader, _READ_AROUND_FILE_CAP_BYTES, encoding=enc), caution
 
 
 # ---- 親返し（L4c・§3.3/§3.4・調査側）: es_search のヒットを doc_id で束ね、rag.md の
@@ -900,7 +917,7 @@ def _rag_md_region_text(world: str, doc_id: str, sp, layer, target_chunk_ids, by
             over = True
 
     try:
-        _reader, it = _stream_doc_lines(f)
+        _reader, it, _enc_caution = _stream_doc_lines(f)   # 親返しの抜粋には注意文を付けない（表示側 rag_parent_return.py が別実装）
         for line in it:
             anchor_id = es_index.rag_md_anchor_chunk_id(line)
             if anchor_id is not None:
@@ -1020,9 +1037,10 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
     `verification_method` に記録が残るため、後から実測できる）。
 
     `_content_cache`（省略可・内部専用）: 非 None のとき `(root, lexical_rel)` をキーにファイル内容
-    （bytes・実在しなければ None）をキャッシュし、同一 doc を跨ぐ複数回の呼び出し（例:
-    `providers/base.py` が同一 doc 内の複数の統合 span を再検証するとき）でディスク再読込を
-    1 doc につき1回に抑える。既定 None は従来どおり呼び出しごとに毎回読む（byte-identical）。
+    （`(bytes, encoding)` のタプル・実在しなければ None）をキャッシュし、同一 doc を跨ぐ複数回の
+    呼び出し（例: `providers/base.py` が同一 doc 内の複数の統合 span を再検証するとき）で
+    ディスク再読込・符号化判定を 1 doc につき1回に抑える。既定 None は従来どおり呼び出しごとに
+    毎回読む（byte-identical）。
     """
     doc_id = citation.get("doc_id")
     if not doc_id or not isinstance(doc_id, str):
@@ -1045,9 +1063,10 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
         return {"exists": True, "method": "exists_no_span"}
     cache_key = (str(root), lexical_rel) if _content_cache is not None else None
     if cache_key is not None and cache_key in _content_cache:
-        raw = _content_cache[cache_key]
-        if raw is None:
+        cached = _content_cache[cache_key]
+        if cached is None:
             return {"exists": False, "method": "doc_missing"}
+        raw, enc = cached
     else:
         try:
             fd = _open_file_nofollow_walk(root, rel_parts)
@@ -1063,6 +1082,7 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
                 return {"exists": False, "method": "doc_missing"}
             with os.fdopen(fd, "rb") as f:
                 fd_owned = False
+                enc = text_encoding.detect_fd(f.fileno())
                 raw = f.read(_READ_AROUND_FILE_CAP_BYTES)
         except OSError:
             if cache_key is not None:
@@ -1075,8 +1095,8 @@ def verify_citation(citation: dict, world: str, *, _content_cache: dict | None =
                 except OSError:
                     pass
         if cache_key is not None:
-            _content_cache[cache_key] = raw
-    lines = raw.decode("utf-8", errors="replace").splitlines()
+            _content_cache[cache_key] = (raw, enc)
+    lines = text_encoding.decode(raw, enc).splitlines()
     s, e = span
     if s > len(lines):
         return {"exists": True, "method": "span_unmatched"}
@@ -2662,6 +2682,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
                 # 検索できていない可能性があることを、探す経路でも黙らせない。理由が無ければキーを
                 # 作らない既存の流儀（`degrade_reason` 参照）＝通常のヒットは戻り値の形が完全に不変。
                 hit_view["file_truncated"] = True
+            if h.get("encoding_caution"):
+                # `grep_tool.grep_search` が一部が化けているヒットに付けた注意文（SRH-05）を
+                # ここで転送しないと、read_doc/read_around には付く印が ripgrep_search だけ落ちる。
+                hit_view["encoding_caution"] = h["encoding_caution"]
             template.append(("legacy", hit_view))
 
         # ---- Phase 2: per_hit を割り当てて `view` を組み立て、直列化後の実バイト数で収まりを保証する ----
@@ -2839,7 +2863,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         e_target = line - 1 + window + 1            # 0-based 窓の終端（排他）
         collected: list[tuple[int, str]] = []
         try:
-            _reader, it = _stream_doc_lines(f)
+            _reader, it, encoding_caution = _stream_doc_lines(f)
             for idx, t in enumerate(it):
                 if idx >= e_target:
                     break
@@ -2855,7 +2879,13 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         read_around_truncated = len(text.encode("utf-8")) > tr_max_bytes
         text = _clip_utf8_bytes(text, tr_max_bytes)
         docs.add(doc_id)
-        result = {"doc_id": doc_id, "text": text}
+        # `encoding_caution` を `text` より前に置く——read_around は `end_line` を持たないため
+        # MCP の `_clip_tool_result` は行境界保存の分岐に乗らず、直列化 JSON の先頭切り詰め
+        # （fail-open）に落ちる。`text` の後ろに置くと大きな本文の陰で注意文ごと切り落とされる。
+        result: dict = {"doc_id": doc_id}
+        if encoding_caution:   # SRH-05: 対象外にしないが符号化の読み取りが不確実な資料の機械的な印
+            result["encoding_caution"] = encoding_caution
+        result["text"] = text
         if read_around_truncated:
             result["text_truncated"] = True
         return (result, docs, cites, cards)
@@ -2882,7 +2912,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         window_lines: list[str] = []
         total = 0
         try:
-            reader, it = _stream_doc_lines(f)
+            reader, it, encoding_caution = _stream_doc_lines(f)
             for idx, t in enumerate(it):
                 if start - 1 <= idx < target_end:
                     window_lines.append(t)
@@ -2922,6 +2952,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             result["text_truncated"] = True
         if file_truncated:
             result["file_truncated"] = True
+        if encoding_caution:   # SRH-05: 対象外にしないが符号化の読み取りが不確実な資料の機械的な印
+            result["encoding_caution"] = encoding_caution
         return (result, docs, cites, cards)
     if name == "doc_outline":
         doc_id = str(args.get("doc_id") or "")
@@ -2931,7 +2963,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         all_headings: list = []
         total = 0
         try:
-            reader, it = _stream_doc_lines(f)
+            reader, it, _enc_caution = _stream_doc_lines(f)   # doc_outline は見出しのみ返す＝注意文は付けない
             for idx, t in enumerate(it):
                 m = _HEADING_RE.match(t.lstrip())
                 if m:
@@ -3055,13 +3087,18 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         f, open_err = _open_verified_original(_root, _resolved_doc_id, st)   # TOCTOU 再検証
         if open_err is not None:
             return (open_err, docs, cites, cards)
-        from . import doc_readers
+        from . import corpus_docs, doc_readers
         kwargs = {"clean": _redact}
         if args.get("max_bytes") is not None:
             kwargs["max_bytes"] = args["max_bytes"]
         result = _redact_deep(doc_readers.file_head(f, **kwargs))
         if not (isinstance(result, dict) and result.get("error")):
             docs.add(doc_id)
+            # SRH-05: read_doc/read_around と同じ印——file_head も原本読取ツールなので、一部が
+            # 化けている資料を印なしで黙って返さない（`_finish_reader_result` はキーを保存する）。
+            caution = corpus_docs.encoding_caution_for(rp)
+            if caution:
+                result["encoding_caution"] = caution
             result = _finish_reader_result(name, result, doc_id, tr_max_bytes)
         return (result, docs, cites, cards)
     if name == "write_output_file":

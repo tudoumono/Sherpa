@@ -685,13 +685,19 @@ def test_file_head_reads_within_cap_and_redacts_nothing_itself(tmp):
     assert r == {"size": 12, "text": "hello\nworld\n", "truncated": False}
 
 
-def test_file_head_truncates_at_max_bytes(tmp):
+@pytest.mark.parametrize("encoding, text, cap, expected", [
+    ("utf-8", "x" * 100, 10, "x" * 10),
+    ("utf-8", "日本語", 4, "日�"),
+    ("cp932", "日本語", 3, "日�"),
+])
+def test_file_head_truncates_at_max_bytes(tmp, encoding, text, cap, expected):
     p = tmp / "note.txt"
-    p.write_text("x" * 100, encoding="utf-8")
-    r = DR.file_head(_open(p), max_bytes=10)
+    raw = text.encode(encoding)
+    p.write_bytes(raw)
+    r = DR.file_head(_open(p), max_bytes=cap)
     assert r["truncated"] is True
-    assert r["text"] == "x" * 10
-    assert r["size"] == 100
+    assert r["text"] == expected
+    assert r["size"] == len(raw)
 
 
 def test_file_head_missing_file_returns_error(tmp):
@@ -699,12 +705,15 @@ def test_file_head_missing_file_returns_error(tmp):
         _open(tmp / "missing.txt")
 
 
-def test_file_head_applies_clean(tmp):
+@pytest.mark.parametrize("encoding", ["utf-8", "cp932"])
+def test_file_head_applies_clean(tmp, encoding):
     p = tmp / "note.txt"
-    p.write_text("password=hunter2", encoding="utf-8")
+    p.write_bytes("架空の設定\npassword=hunter2".encode(encoding))
     from sherpa.agentic_search import _redact
     r = DR.file_head(_open(p), clean=_redact)
+    assert "架空の設定" in r["text"]
     assert "[REDACTED]" in r["text"]
+    assert "hunter2" not in r["text"]
 
 
 def test_file_head_read_os_error_carries_read_io_error_code(tmp):

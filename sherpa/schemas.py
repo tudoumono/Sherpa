@@ -1395,6 +1395,10 @@ class IngestSummaryFields(BaseModel):
     unchanged 経路）は最新 run の `extraction_snapshot` を書き換えるだけで `scan_report` を再実行
     しないため、画面はこのキャッシュ（run に紐付かない世界単位の値）を見て初めて無変更後も
     表示が消えない。
+    `unreachable_by_reason`／`encoding_partial_count`（SRH-05）も同じキャッシュ由来：
+    `unreachable_by_reason`＝`unreachable_as_text` の内訳のうち理由コードが判明しているものだけ
+    （`"encoding_undetermined"`／`"binary"`）。`encoding_partial_count`＝対象外にしない
+    「一部が化けている」件数（`unreachable_as_text` には含めない・読める文書のうち要確認のもの）。
     """
     scanned: int
     indexed: int
@@ -1410,6 +1414,8 @@ class IngestSummaryFields(BaseModel):
     sensitive_excluded: int
     unreachable_as_text: int
     unreachable_as_text_by_ext: dict[str, int]
+    unreachable_by_reason: dict[str, int]
+    encoding_partial_count: int
     counts_as_of: str | None
     graph_nodes: int
     graph_edges: int

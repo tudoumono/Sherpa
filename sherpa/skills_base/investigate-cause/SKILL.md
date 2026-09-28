@@ -35,12 +35,24 @@ Excel の設定シート・パラメータ一覧などは `xlsx_sheets(doc_id=..
 
 ```python
 # 複数ファイルの同じキーの値を突き合わせる例（設定の食い違いが原因の場合に有効）。
+# 設定ファイル・ソースは CP932（Shift_JIS）のことがあるため、決め打ちで utf-8 置換読みにせず
+# 実際の符号化を判定してから読む。
+def read_src(p):
+    with open(p, "rb") as f:
+        b = f.read()
+    if b.startswith(b"\xef\xbb\xbf"):
+        return b[3:].decode("utf-8", "replace")
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        u, c = b.decode("utf-8", "replace"), b.decode("cp932", "replace")
+        return c if c.count("�") < u.count("�") else u
+
 values = {}
 for p in candidate_paths:
-    with open(p, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if "TARGET_KEY" in line:
-                values[str(p)] = line.strip()
+    for line in read_src(p).splitlines():
+        if "TARGET_KEY" in line:
+            values[str(p)] = line.strip()
 for k, v in values.items():
     print(k, "->", v)
 ```

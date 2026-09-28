@@ -61,6 +61,33 @@ def test_status_shows_analyzer_declined_breakdown(page, web_base_url):
     expect(stat).to_contain_text("未対応 3 件")
 
 
+def test_status_shows_unreachable_reason_breakdown_and_partial_count(page, web_base_url):
+    """SRH-05: 「本文が読めず対象外 N 件」の理由別内訳（判別できない／バイナリ）と、対象外にしない
+    「一部が化けている（要確認）」件数を別枠で出す。"""
+    import json
+
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+
+    def handle_status(route):
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            **WORLD_STATUS_RESP,
+            "unreachable_as_text": 5,
+            "unreachable_by_reason": {"encoding_undetermined": 2, "binary": 1},
+            "encoding_partial_count": 4,
+        }))
+    page.route("**/worlds/w1/status", handle_status)
+
+    page.goto(f"{web_base_url}/ingest.html")
+
+    stat = page.locator('[data-stat="w1"]')
+    expect(stat).to_contain_text("本文が読めず対象外 5 件")
+    expect(stat).to_contain_text("文字コード判別不能 2")
+    expect(stat).to_contain_text("バイナリ 1")
+    expect(stat).to_contain_text("一部が化けている（要確認） 4 件")
+
+
 def test_status_shows_unreadable_code_file_blocked_message_with_doc_name(page, web_base_url):
     """不可読コードによる全体停止（`unreadable_code_file`）は対象ファイル名付きで状況欄へ出す
     （`last_run_blocked` の doc/reason を使う・`last_run_warnings` の reason のみでは doc が届かない）。"""

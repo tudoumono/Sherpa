@@ -1133,6 +1133,23 @@ def test_clip_tool_result_unknown_shape_falls_back_with_note(monkeypatch):
     assert clipped["note"] == M._CLIP_FALLBACK_NOTE
 
 
+def test_clip_tool_result_read_around_keeps_encoding_caution_when_fallback_truncates(monkeypatch):
+    """SRH-05是正: `read_around` の結果は `hits` も `end_line` も持たないため、予算超過時は
+    直列化 JSON の先頭切り詰め（fail-open）に落ちる——`encoding_caution` を `text`（本文・
+    巨大になりうる）より前に置くことで（`agentic_search.run_tool` の read_around 分岐）、
+    先頭切り詰めでも印が生き残る。以前は `text` の後ろにあったため、本文が長い結果ではこの
+    fail-open 経路で注意文ごと切り落とされていた。"""
+    from sherpa import corpus_docs
+    caution = corpus_docs._ENCODING_CAUTION["partial"]
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "400")
+    result = {"doc_id": "memo.txt", "encoding_caution": caution, "text": "x" * 5000}
+    clipped, was_clipped = M._clip_tool_result(result, name="read_around", args={})
+    assert was_clipped is True
+    final_bytes = len(json.dumps(clipped, ensure_ascii=False).encode("utf-8"))
+    assert final_bytes <= 400
+    assert f'"encoding_caution": "{caution}"' in clipped["text"]
+
+
 def test_clip_tool_result_under_budget_is_byte_identical(monkeypatch):
     """予算以下の結果は無変更（バイト一致）——早期リターンの契約を明示的に固定する。"""
     monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "65536")

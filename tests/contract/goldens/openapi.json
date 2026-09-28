@@ -3298,7 +3298,7 @@
         "type": "object"
       },
       "IngestSummaryFields": {
-        "description": "`worlds.py::_ingest_summary`（`corpus_docs.scan_report` のキャッシュ ＋ graph/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable`（ING-2）は `worlds.last_scan_report` のキャッシュ（sync 完走時／\n`POST /worlds/{wid}/recount` の時だけ更新・**このエンドポイント自身はフォルダを歩かない**）。\n`counts_as_of`＝そのキャッシュの記録時刻（`None`＝未集計・再集計を促す）。\n`failed_files`／`partial_extraction_suspected`／`stage_summary`（ING-1）は最新 run の\n`extraction_snapshot` 由来（run が無い/該当データが無ければ `None`）。\n`failure_reason_catalog`／`partial_extraction_advice` は閉じた理由語彙の平文辞書（常時同一・\n`sherpa.ingest.failure_reasons` が単一の真実源）。\n`last_run_warnings`/`last_run_blocked` は元の flags を打ち切って導出したもの——\n`last_run_flags_total`＝打切り前の flags 総数・`last_run_flags_truncated`＝打切りが発生したか。\n`last_run_id`／`running_progress`（ING-3）＝最新 run の id と実行中進捗（実行中でなければ\n`running_progress` は `None`）。\n`sensitive_excluded`／`unreachable_as_text`／`unreachable_as_text_by_ext`も\n`scanned`〜`unreadable` と同じキャッシュ由来——無変更の再同期（`ingest.worker._sync_impl` の\nunchanged 経路）は最新 run の `extraction_snapshot` を書き換えるだけで `scan_report` を再実行\nしないため、画面はこのキャッシュ（run に紐付かない世界単位の値）を見て初めて無変更後も\n表示が消えない。",
+        "description": "`worlds.py::_ingest_summary`（`corpus_docs.scan_report` のキャッシュ ＋ graph/ES 件数・最終実行状態）。\n\n`scanned`〜`unreadable`（ING-2）は `worlds.last_scan_report` のキャッシュ（sync 完走時／\n`POST /worlds/{wid}/recount` の時だけ更新・**このエンドポイント自身はフォルダを歩かない**）。\n`counts_as_of`＝そのキャッシュの記録時刻（`None`＝未集計・再集計を促す）。\n`failed_files`／`partial_extraction_suspected`／`stage_summary`（ING-1）は最新 run の\n`extraction_snapshot` 由来（run が無い/該当データが無ければ `None`）。\n`failure_reason_catalog`／`partial_extraction_advice` は閉じた理由語彙の平文辞書（常時同一・\n`sherpa.ingest.failure_reasons` が単一の真実源）。\n`last_run_warnings`/`last_run_blocked` は元の flags を打ち切って導出したもの——\n`last_run_flags_total`＝打切り前の flags 総数・`last_run_flags_truncated`＝打切りが発生したか。\n`last_run_id`／`running_progress`（ING-3）＝最新 run の id と実行中進捗（実行中でなければ\n`running_progress` は `None`）。\n`sensitive_excluded`／`unreachable_as_text`／`unreachable_as_text_by_ext`も\n`scanned`〜`unreadable` と同じキャッシュ由来——無変更の再同期（`ingest.worker._sync_impl` の\nunchanged 経路）は最新 run の `extraction_snapshot` を書き換えるだけで `scan_report` を再実行\nしないため、画面はこのキャッシュ（run に紐付かない世界単位の値）を見て初めて無変更後も\n表示が消えない。\n`unreachable_by_reason`／`encoding_partial_count`（SRH-05）も同じキャッシュ由来：\n`unreachable_by_reason`＝`unreachable_as_text` の内訳のうち理由コードが判明しているものだけ\n（`\"encoding_undetermined\"`／`\"binary\"`）。`encoding_partial_count`＝対象外にしない\n「一部が化けている」件数（`unreachable_as_text` には含めない・読める文書のうち要確認のもの）。",
         "properties": {
           "analyzer_declined": {
             "title": "Analyzer Declined",
@@ -3325,6 +3325,10 @@
               }
             ],
             "title": "Counts As Of"
+          },
+          "encoding_partial_count": {
+            "title": "Encoding Partial Count",
+            "type": "integer"
           },
           "es_chunks": {
             "anyOf": [
@@ -3495,6 +3499,13 @@
             "title": "Unreachable As Text By Ext",
             "type": "object"
           },
+          "unreachable_by_reason": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Unreachable By Reason",
+            "type": "object"
+          },
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
@@ -3515,6 +3526,8 @@
           "sensitive_excluded",
           "unreachable_as_text",
           "unreachable_as_text_by_ext",
+          "unreachable_by_reason",
+          "encoding_partial_count",
           "counts_as_of",
           "graph_nodes",
           "graph_edges",
@@ -7891,6 +7904,10 @@
             ],
             "title": "Counts As Of"
           },
+          "encoding_partial_count": {
+            "title": "Encoding Partial Count",
+            "type": "integer"
+          },
           "es_chunks": {
             "anyOf": [
               {
@@ -8064,6 +8081,13 @@
             "title": "Unreachable As Text By Ext",
             "type": "object"
           },
+          "unreachable_by_reason": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Unreachable By Reason",
+            "type": "object"
+          },
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
@@ -8088,6 +8112,8 @@
           "sensitive_excluded",
           "unreachable_as_text",
           "unreachable_as_text_by_ext",
+          "unreachable_by_reason",
+          "encoding_partial_count",
           "counts_as_of",
           "graph_nodes",
           "graph_edges",
@@ -8173,6 +8199,10 @@
               }
             ],
             "title": "Counts As Of"
+          },
+          "encoding_partial_count": {
+            "title": "Encoding Partial Count",
+            "type": "integer"
           },
           "es_chunks": {
             "anyOf": [
@@ -8380,6 +8410,13 @@
             "title": "Unreachable As Text By Ext",
             "type": "object"
           },
+          "unreachable_by_reason": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Unreachable By Reason",
+            "type": "object"
+          },
           "unreadable": {
             "title": "Unreadable",
             "type": "integer"
@@ -8404,6 +8441,8 @@
           "sensitive_excluded",
           "unreachable_as_text",
           "unreachable_as_text_by_ext",
+          "unreachable_by_reason",
+          "encoding_partial_count",
           "counts_as_of",
           "graph_nodes",
           "graph_edges",

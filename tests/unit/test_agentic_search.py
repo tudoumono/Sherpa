@@ -1763,6 +1763,62 @@ def test_verify_citation_false_for_sensitive_doc_id(monkeypatch, tmp_path):
     assert v == {"exists": False, "method": "doc_missing"}
 
 
+
+@pytest.mark.parametrize("encoding", ["cp932", "utf-8-sig"])
+@pytest.mark.parametrize("newline", ["\r\n", "\f"])
+def test_cp932_source_searchable_readable_and_verifiable(monkeypatch, tmp_path, encoding, newline):
+    """CP932（Shift_JIS）の原本が ripgrep_search で当たり、その行番号で read_around/read_doc が
+    同じ行を正しい日本語で返し、verify_citation が `span_verified` になり、file_head も化けない
+    （架空の締め処理コメント・半角カナ・CRLF・波ダッシュを含む COBOL ソース）。"""
+    world = "cp932-source-t1"
+    lines = [
+        "       IDENTIFICATION DIVISION.",
+        "      * 架空の締め処理①の初期化",
+        "       ｱｲｳｴｵ 半角カナだけの行",
+        "       MOVE '～' TO WK-MARK.",
+    ]
+    text = newline.join(lines) + newline
+    raw = text.encode(encoding)
+    _isolate_world_kb(monkeypatch, tmp_path, world, {"BATCH01.cbl": raw})
+
+    # (1) ripgrep_search が日本語の語で当たる。
+    res, docs, cites, _ = A.run_tool("ripgrep_search", {"query": "締め処理"}, world, None)
+    assert res["hits"], res
+    hit = res["hits"][0]
+    assert hit["doc_id"] == "BATCH01.cbl"
+    assert "�" not in hit["text"]
+    hit_line = hit["line"]
+    assert lines[hit_line - 1] in hit["text"]
+
+    # (2) 同じ行番号で read_around/read_doc が正しい日本語を返す。
+    r_around, d_around, _, _ = A.run_tool(
+        "read_around", {"doc_id": "BATCH01.cbl", "line": hit_line}, world, None)
+    assert "error" not in r_around, r_around
+    assert "締め処理" in r_around["text"]
+    assert "�" not in r_around["text"]
+    assert "BATCH01.cbl" in d_around
+
+    r_doc, d_doc, _, _ = A.run_tool(
+        "read_doc", {"doc_id": "BATCH01.cbl", "start_line": 1}, world, None)
+    assert "error" not in r_doc, r_doc
+    assert "�" not in r_doc["text"]
+    for ln in lines:
+        assert ln in r_doc["text"]
+    assert "BATCH01.cbl" in d_doc
+
+    # (3) verify_citation が span_verified になる（span=その行・quote=その行）。
+    v = A.verify_citation(
+        {"doc_id": "BATCH01.cbl", "span": [hit_line, hit_line], "quote": lines[hit_line - 1]}, world)
+    assert v == {"exists": True, "method": "span_verified"}
+
+    # (4) file_head も化けない。
+    r_head, d_head, _, _ = A.run_tool("file_head", {"doc_id": "BATCH01.cbl"}, world, None)
+    assert "error" not in r_head, r_head
+    assert "締め処理" in r_head["text"]
+    assert "�" not in r_head["text"]
+    assert "BATCH01.cbl" in d_head
+
+
 def test_read_around_clips_output_for_huge_single_line_doc(monkeypatch, tmp_path):
     """secRV MED-B (a)(b): 単一行が巨大（200万文字）な文書でも、read_around の返却テキストは
     `TOOL_RESULT_MAX_BYTES`（BUDGET-1・§3.4 でコード既定 262144 へ引き上げ済み）に収まる。

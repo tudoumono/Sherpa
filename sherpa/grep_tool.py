@@ -16,6 +16,7 @@ from collections import deque
 from pathlib import Path
 
 from . import layer as layer_mod
+from . import text_encoding
 from .doc_kinds import CODE_EXT
 from .ingest import text_kind
 
@@ -173,7 +174,7 @@ class _CappedStreamReader:
             yield carry
 
 
-def _logical_lines(reader, cap: int):
+def _logical_lines(reader, cap: int, encoding: str = "utf-8"):
     """ストリーム読みの生バイト行（`\n` 区切り）→ **`str.splitlines()` と同一の論理行**の列。
 
     行番号の定義は `str.splitlines()`（全体 decode → `splitlines()`）であり、read_around/read_doc も同じ
@@ -182,13 +183,21 @@ def _logical_lines(reader, cap: int):
     数えると、`\r` 単独・`\f`（改ページ＝COBOL/JCL リストに実在する）・`\x85`（NEL＝EBCDIC 変換由来）・
     `\u2028` 等を含む文書で**ヒットの行番号と精読の行番号がズレ、引用と read_around が食い違う**。
 
-    `\n`（0x0A）は UTF-8 のマルチバイト列の続きバイトになり得ないため、`\n` 区切りの生バイト行を
-    個別に decode → `splitlines()` した結果を連結すると、全体を decode → `splitlines()` した結果と
-    完全に一致する（各セグメントは `\n` を含まず、他の区切り文字はセグメント内で完結する）。
-    空セグメント（連続改行）は空行1本として数える（`"".splitlines()` は `[]` を返すため明示の補正）。
+    `\n`（0x0A）は UTF-8/CP932 いずれのマルチバイト列の続きバイトにもなり得ないため
+    （`text_encoding` docstring 参照）、`\n` 区切りの生バイト行を個別に decode → `splitlines()`
+    した結果を連結すると、全体を decode → `splitlines()` した結果と完全に一致する（各セグメントは
+    `\n` を含まず、他の区切り文字はセグメント内で完結する）。空セグメント（連続改行）は空行1本として
+    数える（`"".splitlines()` は `[]` を返すため明示の補正）。
+
+    `encoding`（`text_encoding.detect_fd`/`detect_bytes` が返す判定結果）: `utf-8-sig` は先頭の BOM を
+    最初のセグメントでだけ落とす——全セグメントへ `utf-8-sig` を適用すると、文書中程に偶然 U+FEFF が
+    現れた場合（コピペ由来の BOM 等）まで誤って削ってしまう。
     """
+    rest_encoding = "utf-8" if encoding == "utf-8-sig" else encoding
+    first = True
     for raw_line in reader.lines(cap=cap):
-        decoded = raw_line.decode("utf-8", errors="replace")
+        decoded = text_encoding.decode(raw_line, encoding if first else rest_encoding)
+        first = False
         yield from (decoded.splitlines() or [""])
 
 
@@ -470,6 +479,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
             if not scope.in_scope(rel, scope_paths):  # 範囲外の文書はそもそも読まない
                 continue
             is_code = False
+            encoding_caution = None   # SRH-05: 対象外にしない「一部が化けている」ヒットへの注意文
             if not is_derived:
                 # コード解析層と同じ単一の判定（`corpus_docs.classify_document`）を実行ゲートにする
                 # （拡張子の許可リストではなくこれが最終判定・§7 裁定10）——accepts() 内容判定に
@@ -481,11 +491,19 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 # 軽量テキスト枠の第2段）だけが、ここで先頭数KBの内容判定（1ファイルにつき1回）を
                 # 要する。`corpus_docs.reachable_as_text` と同じ判定式（`_classify_verdict_reachable`）
                 # を共有する。
+                # SRH-05: `text_quality` を渡すと、文字コードを判別できない（UTF-8/CP932 どちらも
+                # 化ける）原本は `_classify_verdict_reachable` が False になり grep からも除外される
+                # （grep/scan_report/read_around が同じ1つの判定式を共有する契約・§7 裁定10を維持）。
+                # 対象外にしない「一部が化けている」（`encoding_partial`）は検索対象のまま、この
+                # ファイルの各ヒットへ注意文（`encoding_caution`）を付ける。
                 verdict = corpus_docs.classify_document(
                     rel, Path(rel).suffix.lower(),
-                    lambda p=p, size=4096: corpus_docs._read_head(p, size))
+                    lambda p=p, size=4096: corpus_docs._read_head(p, size),
+                    text_quality=lambda p=p: corpus_docs._text_quality_for(p))
                 if not corpus_docs._classify_verdict_reachable(verdict):
                     continue
+                if verdict.get("encoding_partial"):
+                    encoding_caution = corpus_docs._ENCODING_CAUTION["partial"]
                 # TEXT-ALL L-1 是正（2026-09）: 軽量テキスト枠（`ingest.text_kind`）だけは、台帳/ES
                 # と同じ基準（`text_kind.MAX_BYTES`＝8MiB・`corpus_docs._text_oversize` と同一の
                 # 判定式）でサイズ超過を grep からも除外する。是正前は台帳側が `size_exceeded` で
@@ -535,6 +553,12 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                 # ストリーミングでは巨大 decode は起きないが、open 直後〜走査開始前の境界として
                 # 引き続き確認する。
                 _check_deadline()
+                # 派生ツリー（Office/PDF 由来の決定的 MD・`.rag.md`）は Sherpa 自身が UTF-8 で書いた
+                # ものなので判定を省く（原本ツリーだけ実バイト列から符号化を判定する）。
+                try:
+                    enc = "utf-8" if is_derived else text_encoding.detect_fd(f.fileno())
+                except OSError:
+                    continue                          # この 1 件だけ飛ばす（検索全体を失敗させない）
                 reader = _CappedStreamReader(f)
                 is_md = is_derived or ext in _MD_EXT
                 out_ext = Path(rel).suffix.lower()      # doc_id（元ファイル）の拡張子で表示
@@ -571,7 +595,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                     # 終えるまで確定しない）は、ヒープに残っている（このファイル由来の）エントリを
                     # 事後に見つけて付与する形にする（下の該当箇所参照・ヒープは有界なのでこの事後
                     # 走査も高々 `max_hits` 件で終わる）。
-                    _offer({
+                    hit = {
                         "doc_id": rel,                # world root 相対パス（来歴・DL キー・§2.2）
                         "path": str(p),                # 内部用（物理パス）。API 露出は lens 層で除去。
                         "ext": out_ext,
@@ -579,7 +603,10 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
                         "span": [s, e],
                         "text": text,
                         "match": q,
-                    })
+                    }
+                    if encoding_caution:      # SRH-05: 対象外にしないが一部が化けているファイルの目印
+                        hit["encoding_caution"] = encoding_caution
+                    _offer(hit)
 
                 def _emit_md_section(end_line: int) -> None:
                     nonlocal section_has_hit
@@ -594,7 +621,7 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
 
                 hit_limit_reached = False   # ファイル内でヒット数上限に達したか（達したら flush を省く）
                 try:
-                    for t in _logical_lines(reader, _GREP_FILE_CAP_BYTES):
+                    for t in _logical_lines(reader, _GREP_FILE_CAP_BYTES, encoding=enc):
                         if (deadline is not None and line_i > 0 and line_i % _DEADLINE_CHECK_LINES == 0
                                 and time.monotonic() > deadline):
                             raise GrepDeadlineExceeded("grep 走査がデッドラインを超えました")

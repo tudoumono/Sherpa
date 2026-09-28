@@ -75,13 +75,13 @@ def test_read_full_text_and_raw_decodes_full_text_and_head_from_one_read(tmp_pat
 
 
 def test_read_full_text_and_raw_normalizes_newlines_like_read_text(tmp_path):
-    """全文は `Path.read_text` と同じユニバーサル改行（CRLF/単独 CR → LF）・BOM と不正 UTF-8 は
-    置換デコードのまま・生バイト列は無加工。"""
+    """全文は `Path.read_text` と同じユニバーサル改行（CRLF/単独 CR → LF）・BOM は除去、不正 UTF-8 は
+    置換デコード・生バイト列は無加工。"""
     from sherpa import corpus_docs
     p = tmp_path / "x.c"
     raw = b"\xef\xbb\xbfint value;\rint f(void) { return 0; }\r\nlast\xff"
     p.write_bytes(raw)
     text, got_raw = corpus_docs.read_full_text_and_raw(p)
     assert got_raw == raw
-    assert text == p.read_text(encoding="utf-8", errors="replace")
+    assert text == p.read_text(encoding="utf-8-sig", errors="replace")
     assert "\r" not in text and text.count("\n") == 2

@@ -30,7 +30,7 @@ import re
 import stat as stat_mod
 from pathlib import Path, PurePosixPath
 
-from .. import corpus_docs, doc_text, grep_tool, scope_infer, worlds
+from .. import corpus_docs, doc_text, grep_tool, scope_infer, text_encoding, worlds
 from . import importance, text_kind
 from .analyzers import registry as analyzer_registry
 from .identifiers import normalize_code_name as _norm
@@ -601,6 +601,16 @@ def build_world(world_dir, world_id: str, *, files=None):
             # 確定も行わせない（部分グラフを確定しない・復旧後の次回 sync で全再構築される）。
             flags.append({"doc": rel, "reason": "unreadable_code_file", "action": "blocked"})
             continue
+        # SRH-05: 台帳（`corpus_docs.classify_document`）・grep・精読が「文字コードを判別できない」
+        # として対象外にする原本は、グラフにもノード・エッジを作らない——判定は `classify_document`
+        # と同じ基準（`text_encoding.quality_of`）を直接使う（拡張子候補は既に上限8MiB以内・
+        # `DETECT_CAP_BYTES`=64MiBの範囲内なので `complete=True` で全量判定できる）。ここで
+        # 除外しないと、台帳/grep/read_around では対象外なのに影響調査のグラフにだけ現れる
+        # （裏付けとして出典 DL できるが read_doc では読めない）食い違いになる。
+        encoding, enc_ratio, enc_majority_garbled = text_encoding.detect_bytes_quality(raw, complete=True)
+        if text_encoding.quality_of(enc_ratio, enc_majority_garbled) == "undetermined":
+            flags.append({"doc": rel, "reason": "encoding_undetermined", "action": "warn"})
+            continue
         # `accepts()` に渡す head サイズはアナライザごとの宣言（`Analyzer.head_bytes`・既定4KiB）に
         # 従う。`text[:head_bytes]` の**文字**数切り詰めはマルチバイト文字を含む文書で
         # 実際のバイト範囲が宣言より広がってしまう（`corpus_docs._read_head` docstring 参照）ため、
@@ -608,8 +618,8 @@ def build_world(world_dir, world_id: str, *, files=None):
         # （`rp` を再度開き直さない——ファイルを2回開くと、全文は読めたのに間でファイルが消える/
         # 権限が変わるなどの TOCTOU で head 側だけ失敗しうる。`raw` は既に読み終えたバイト列なので
         # スライス・デコードは失敗しない）。
-        def _head_for(a, raw=raw):
-            return raw[:getattr(a, "head_bytes", 4096)].decode("utf-8", errors="replace")
+        def _head_for(a, raw=raw, encoding=encoding):
+            return text_encoding.decode(raw[:getattr(a, "head_bytes", 4096)], encoding)
         analyzer = next((a for a in candidates if a.accepts(rel, _head_for(a))), None)
         if analyzer is None:                              # 拡張子は一致するが内容判定で不採用
             continue
