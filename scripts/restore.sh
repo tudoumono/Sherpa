@@ -51,9 +51,13 @@ done
 [ -n "$SRC" ] || { usage >&2; exit 2; }
 
 abspath() {
-  local path
+  local path resolved
   case "$1" in /*) path="$1" ;; *) path="$ROOT/${1#./}" ;; esac
-  realpath -m -- "$path"
+  if ! resolved="$(sherpa_resolve_real_path "$path")"; then
+    fail "パスを正規化できません（realpath / ${PYTHON_BIN:-python3} のどちらも使えません）: $path"
+    exit 1
+  fi
+  printf '%s\n' "$resolved"
 }
 path_contains() {  # $1 が $2 と同じ、またはその祖先
   [ "$1" = "$2" ] || case "$2" in "$1"/*) return 0 ;; *) return 1 ;; esac
@@ -79,22 +83,40 @@ SRC_PROJECT="$(manifest_get project)"
 
 # --- 1. sha256 照合（何かを消す前に必ず） ---------------------------------------
 note "MANIFEST の sha256 を照合中..."
-declare -A ALLOWED=() SEEN=()
-ALLOWED[env]=1
-ALLOWED[users.tar.gz]=1
-ALLOWED[derived.tar.gz]=1
-for suffix in pg neo4j es; do ALLOWED["volumes/${SRC_PROJECT}_${suffix}.tar.gz"]=1; done
+# 連想配列（bash 4+）は使わない（macOS 標準の bash は 3.2）。空白区切りの文字列＋case 照合で代用する。
+# 許可名に空白は含まれないため、空白を含む rel は一致せず拒否される＝fail-closed のままで安全性は変わらない。
+ALLOWED_LIST="env users.tar.gz derived.tar.gz"
+for suffix in pg neo4j es; do ALLOWED_LIST="$ALLOWED_LIST volumes/${SRC_PROJECT}_${suffix}.tar.gz"; done
+SEEN_LIST=""
+
+is_allowed() {  # $1=rel
+  local rel="$1" name
+  # shellcheck disable=SC2086  # ALLOWED_LIST は空白区切りの固定名の集合＝意図的な word-splitting
+  for name in $ALLOWED_LIST; do
+    case "$rel" in "$name") return 0 ;; esac
+  done
+  return 1
+}
+is_seen() {  # $1=rel
+  local rel="$1" name
+  # shellcheck disable=SC2086
+  for name in $SEEN_LIST; do
+    case "$rel" in "$name") return 0 ;; esac
+  done
+  return 1
+}
+mark_seen() { SEEN_LIST="$SEEN_LIST $1"; }
 
 SUM_COUNT=0
 while IFS= read -r line; do
   [[ "$line" =~ ^([0-9a-f]{64})\ \ (.+)$ ]] || continue
   expected="${BASH_REMATCH[1]}"
   rel="${BASH_REMATCH[2]}"
-  if [ -z "${ALLOWED[$rel]:-}" ]; then
+  if ! is_allowed "$rel"; then
     fail "MANIFEST に許可されていない復元対象があります: $rel"
     exit 1
   fi
-  if [ -n "${SEEN[$rel]:-}" ]; then
+  if is_seen "$rel"; then
     fail "MANIFEST に同じ復元対象が重複しています: $rel"
     exit 1
   fi
@@ -103,13 +125,13 @@ while IFS= read -r line; do
     fail "MANIFEST の復元対象が通常ファイルではありません: $rel"
     exit 1
   fi
-  actual="$(sha256sum "$payload" | awk '{print $1}')"
+  actual="$(sherpa_sha256_hex "$payload")"
   if [ "$actual" != "$expected" ]; then
     fail "sha256 が一致しないファイルがあります: $rel"
     fail "復元を中止します（何も変更していません）。"
     exit 1
   fi
-  SEEN["$rel"]=1
+  mark_seen "$rel"
   SUM_COUNT=$((SUM_COUNT + 1))
 done < <(sed -n '/^\[sha256\]$/,$p' "$MANIFEST")
 
@@ -123,11 +145,11 @@ fi
 while IFS= read -r -d '' payload; do
   rel="${payload#"$SRC/"}"
   [ "$rel" = MANIFEST ] && continue
-  if [ -z "${ALLOWED[$rel]:-}" ]; then
+  if ! is_allowed "$rel"; then
     fail "MANIFEST にないファイルがあります: $rel（復元対象へ混入させないため中止）"
     exit 1
   fi
-  if [ -z "${SEEN[$rel]:-}" ]; then
+  if ! is_seen "$rel"; then
     fail "MANIFEST にないファイルがあります: $rel（sha256 未照合）"
     exit 1
   fi

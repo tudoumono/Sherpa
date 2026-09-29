@@ -105,6 +105,52 @@ sherpa_compose() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# macOS（BSD 系コマンド・stock には sha256sum が無い・bash 3.2）向けの互換ヘルパ。
+# backup.sh / restore.sh が使う。realpath -m 相当と sha256 計算は GNU coreutils 依存が強く、
+# 素の呼び出しだと BSD 環境で即失敗する（check-production.sh の `_resolve_real_path` と同方式）。
+# ---------------------------------------------------------------------------
+
+# realpath -m 相当（存在しないパスも正規化できる）。BSD realpath には -m が無く、古い macOS
+# （12.3 未満）には realpath 自体が無いため、まず GNU 版を試し、使えなければ python3 の
+# os.path.realpath（存在しないパスも扱える）へフォールバックする。両方失敗したら非0・出力なし
+# （fail-closed。未解決の文字列へ黙って逃げて誤判定を招かない）。
+sherpa_resolve_real_path() {  # $1=path -> stdout に canonical path
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$p" 2>/dev/null && return 0
+  fi
+  "${PYTHON_BIN:-python3}" -c 'import os, sys
+print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null
+}
+
+# sha256 の計算はこれに一本化する（$@ =対象ファイル1件以上）。出力は sha256sum 互換の
+# "<hex>  <path>"（path は引数をそのまま反映）。解決順: sha256sum → shasum -a 256（stock macOS）→
+# python3。この形式で揃えることで、Linux で取ったバックアップの MANIFEST を macOS で照合でき、
+# 逆も成り立つ。
+sherpa_sha256_files() {  # file...
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -- "$@"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -- "$@"
+  else
+    "${PYTHON_BIN:-python3}" -c '
+import hashlib, sys
+for path in sys.argv[1:]:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    print("%s  %s" % (h.hexdigest(), path))
+' "$@"
+  fi
+}
+
+# 1ファイルの hex だけを返す（sha256sum の照合側・restore.sh 向け）。
+sherpa_sha256_hex() {  # file
+  sherpa_sha256_files "$1" | awk '{print $1}'
+}
+
 sherpa_env_default SHERPA_PORT SHERPA_HOST
 
 # ---------------------------------------------------------------------------
