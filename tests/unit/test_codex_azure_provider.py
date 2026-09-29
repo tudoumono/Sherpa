@@ -532,6 +532,7 @@ def test_select_provider_ollama_construct_ignores_azure_settings(sysset):
     from sherpa.providers import _select_provider
 
     _azure(sysset)
+    sysset["model_catalog"] = {"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}}
     p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
                           "ollama_url": "http://localhost:11434"})
     assert p.__class__.__name__ == "CodexProvider"
@@ -555,12 +556,13 @@ def test_select_provider_ollama_construct_sandbox_disabled_is_fail_closed(monkey
     assert "OpenAI" in p.howto   # 原因（黙って OpenAI へ繋がりうること）を利用者に伝える
 
 
-def test_select_provider_ollama_construct_sandbox_enabled_explicit_still_wires(monkeypatch):
+def test_select_provider_ollama_construct_sandbox_enabled_explicit_still_wires(monkeypatch, sysset):
     """回帰確認: サンドボックスが明示的に有効（既定と同じ）なら従来どおり Codex(Ollama) が組み立て
     られる。"""
     from sherpa.providers import _select_provider
 
     monkeypatch.setenv("SHERPA_CODEX_SANDBOX", "1")
+    sysset["model_catalog"] = {"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}}
     p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
                           "ollama_url": "http://localhost:11434"})
     assert p.__class__.__name__ == "CodexProvider"
@@ -665,3 +667,13 @@ def test_select_provider_openai_direct_azure_with_deployment_name_wires_provider
     p = _select_provider({"agent": "openai", "openai_api_key": "sk-real-azure-key"})
     assert p.__class__.__name__ == "OpenAIProvider"
     assert p.model == "my-embed-chat-deployment"
+
+
+def test_select_provider_ollama_construct_with_default_openai_model_is_unwired(sysset):
+    """Codex(Ollama) で使えるモデルが既定の OpenAI 向けの名前のままなら、実行前に理由付きで止める。"""
+    from sherpa.providers import _select_provider
+
+    p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
+                          "ollama_url": "http://localhost:11434"})
+    assert p.__class__.__name__ == "_UnwiredProvider"
+

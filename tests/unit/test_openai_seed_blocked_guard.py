@@ -58,6 +58,7 @@ def test_select_provider_codex_openai_unwired_when_seed_blocked(monkeypatch):
 
 def test_select_provider_codex_ollama_not_blocked_by_seed_block(monkeypatch):
     """Codex(Ollama) 構成は OpenAI 接続先シードの状態と無関係＝blocked 中でも遮断しない。"""
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"model_catalog": {"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}}})
     llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
     p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
                           "ollama_url": "http://localhost:11434"})

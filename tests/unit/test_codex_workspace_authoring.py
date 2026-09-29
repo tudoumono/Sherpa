@@ -2625,6 +2625,7 @@ def test_codex_ollama_config_points_at_configured_url(tmp_path):
 def test_codex_ollama_selection_passes_configured_url(monkeypatch):
     """`_select_provider` が Codex(Ollama) 構成で `ollama_url` を CodexProvider へ渡す。"""
     from sherpa.providers import _select_provider
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"model_catalog": {"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}}})
 
     p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
                           "ollama_url": "http://localhost:11434"})
