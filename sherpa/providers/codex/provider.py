@@ -634,16 +634,22 @@ def _spawn_stop_watcher(proc, stop_event, reap_lock, reaped) -> "threading.Threa
     `_kill_session` 実行までを `reap_lock` で finally 側と直列化し、`reaped["done"]` が立って
     いれば（または waitid が ECHILD＝既に reap 済みなら）このスレッドは何もせず戻る。
     """
+    # macOS の CPython には os.waitid が無い＝reap せずに終了を覗けないので、停止操作だけを見る
+    # （終了後の片付けは finally 側の `_kill_session` が担う）。
+    _can_peek_exit = hasattr(os, "waitid")
+
     def _watch(_proc=proc, _ev=stop_event, _lock=reap_lock, _reaped=reaped):
         while True:
             with _lock:
                 if _reaped["done"]:
                     return
-                try:
-                    exited = os.waitid(
-                        os.P_PID, _proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-                except ChildProcessError:
-                    return   # 既に別経路（finally）で reap 済み（ECHILD）＝ sid には触れない
+                exited = False
+                if _can_peek_exit:
+                    try:
+                        exited = os.waitid(
+                            os.P_PID, _proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+                    except ChildProcessError:
+                        return   # 既に別経路（finally）で reap 済み（ECHILD）＝ sid には触れない
                 if exited:
                     _kill_session(_proc.pid)   # pipe を握ったまま残る子を片付けて EOF にする
                     return
