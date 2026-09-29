@@ -373,6 +373,11 @@ def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None
     import subprocess
     if not shutil.which("codex"):
         raise RuntimeError("codex CLI が見つかりません")
+    # Codex(Ollama) は codex login を使わない（独自プロバイダで Ollama へ直接つなぐ）＝Ollama へ届くかを見る。
+    from . import agent_constructs
+    if agent_constructs.codex_model_provider(settings) == "ollama":
+        _ai_check_ollama(settings, system_settings)
+        return
     # Azure/互換接続先の Codex(OpenAI) 構成は ChatGPT ログイン（auth.json）を使わず、子プロセス env の
     # OPENAI_API_KEY（`keys.resolve_api_key("openai")` で解決したキー）で認証する
     # （`providers/codex/sandbox._write_codex_authoring_config` の独自 provider・env_key 方式）。

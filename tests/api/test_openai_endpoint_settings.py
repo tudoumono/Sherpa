@@ -340,9 +340,24 @@ def test_settings_test_codex_azure_real_connection_failure_is_not_reported_ok(mo
     assert "sk-azure-bad-key" not in body["detail"]
 
 
+class _FakeOllamaTags:
+    """Ollama の /api/tags の応答（外部境界）。組み込み既定の Codex モデル名を取得済みにする。"""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        import json as _json
+        from sherpa import model_catalog
+        name = model_catalog.resolve_model("codex", "codex", None, system_settings={})
+        return _json.dumps({"models": [{"name": f"{name}:latest"}]}).encode()
+
+
 def test_settings_test_codex_ollama_construct_ignores_azure_env(monkeypatch):
-    """Codex(Ollama) 構成（`codex_model_provider="ollama"`）は Azure 判定の対象外＝従来どおり
-    `codex login status` を見る（`_select_provider` の同種分岐と一貫）。"""
+    """Codex(Ollama) 構成（`codex_model_provider="ollama"`）は Azure 判定の対象外で、codex login
+    ではなく Ollama に届くか・モデルがあるかを見る（`_select_provider` の同種分岐と一貫）。"""
     import shutil
     import subprocess
 
@@ -359,14 +374,15 @@ def test_settings_test_codex_ollama_construct_ignores_azure_env(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
     monkeypatch.setattr(
         subprocess, "run",
-        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "logged in", "stderr": ""})())
+        lambda *a, **k: type("R", (), {"returncode": 1, "stdout": "", "stderr": "not logged in"})())
+    monkeypatch.setattr(llm, "urlopen_no_redirect", lambda *a, **k: _FakeOllamaTags())
     monkeypatch.setattr(llm, "openai_endpoint_kind", lambda system_settings=None: "azure", raising=False)
 
     r = c.post("/settings/test", json={"provider": "codex"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
-    assert body["detail"] == "接続OK"
+    assert body["detail"].startswith("接続OK")
 
 
 def test_settings_test_codex_ollama_unaffected_by_corrupted_openai_endpoint_kind(monkeypatch):
@@ -374,7 +390,7 @@ def test_settings_test_codex_ollama_unaffected_by_corrupted_openai_endpoint_kind
     同じ順序＝Ollama 分岐を先に見る）。保存済み中央設定の `openai_endpoint_kind`/`openai_base_url`
     が型破損（JSONB の非文字列値）していて `openai_endpoint_kind()` が `ValueError` を送出する
     状態でも、Codex(Ollama) 利用時は先に Ollama 分岐で確定するためこの呼び出し自体が発生せず、
-    接続テストは通常どおり `codex login status` を見て `ok=True` を返す（先に
+    接続テストは通常どおり Ollama を見て `ok=True` を返す（先に
     `openai_endpoint_kind()` を評価してしまう実装だと、無関係な破損設定のせいで
     false negative になっていた）。"""
     import shutil
@@ -393,7 +409,8 @@ def test_settings_test_codex_ollama_unaffected_by_corrupted_openai_endpoint_kind
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
     monkeypatch.setattr(
         subprocess, "run",
-        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "logged in", "stderr": ""})())
+        lambda *a, **k: type("R", (), {"returncode": 1, "stdout": "", "stderr": "not logged in"})())
+    monkeypatch.setattr(llm, "urlopen_no_redirect", lambda *a, **k: _FakeOllamaTags())
 
     def _boom(system_settings=None):
         raise ValueError("接続先設定（openai_endpoint_kind）の保存値が不正です（文字列ではありません）")
@@ -403,7 +420,7 @@ def test_settings_test_codex_ollama_unaffected_by_corrupted_openai_endpoint_kind
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
-    assert body["detail"] == "接続OK"
+    assert body["detail"].startswith("接続OK")
 
 
 def test_settings_test_codex_ollama_sandbox_disabled_reports_fail_closed(monkeypatch):

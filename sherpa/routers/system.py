@@ -322,6 +322,31 @@ def _public_settings(s: dict) -> dict:
             "chat_examples": chat_examples.public_examples(sys_s)}
 
 
+
+
+def _codex_ollama_probe(s: dict, sys_s: dict, model: str | None) -> dict:
+    """Codex(Ollama) の接続テスト。実行時（`providers._select_provider`）と同じ接続先の解決と許可の
+    確認をしてから、Ollama の `/api/tags` でモデルが取得済みかを見る（タグ無しは `:latest` とみなす）。"""
+    import json as _json
+    base = keys.resolve_ollama_url(s, system_settings=sys_s)
+    try:
+        llm.assert_ollama_url_allowed(base, system_settings=sys_s)
+    except Exception:
+        return {"ok": False, "provider": "codex", "model": model,
+                "detail": "設定のローカルAIの接続先が許可されていません。設定画面で確認してください"}
+    try:
+        with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=10) as r:
+            names = {m.get("name") for m in (_json.loads(r.read()).get("models") or [])
+                     if isinstance(m, dict)}
+    except Exception as e:
+        return {"ok": False, "provider": "codex", "model": model,
+                "detail": f"ローカルAI（Ollama）に接続できません（{type(e).__name__}）"}
+    if model and model not in names and f"{model}:latest" not in names:
+        return {"ok": False, "provider": "codex", "model": model,
+                "detail": f"ローカルAI（Ollama）にモデル {model} がありません（ollama pull で取得してください）"}
+    return {"ok": True, "provider": "codex", "model": model,
+            "detail": "接続OK（ローカルAI・codex login の状態は問いません）"}
+
 @settings_router.get("/config", tags=["設定"], response_model=ConfigResponse)
 def config_get(request: Request):
     """利用可能な AI プロバイダ情報（現在の設定を踏まえた provider_info）を返す。"""
@@ -824,7 +849,7 @@ def settings_test(req: TestReq, request: Request):
         # ok=True を返してしまう。ここで共通文法（`CodexProvider` と同じ判定）を先に確認する。
         if model and not model_catalog.CODEX_MODEL_NAME_RE.fullmatch(model):
             return {"ok": False, "provider": "codex", "model": model,
-                    "detail": "モデル名の形式が不正です（使える文字: 英数字 . _ / - ・64文字以内）"}
+                    "detail": "モデル名の形式が不正です（使える文字: 英数字 . _ : / - ・64文字以内）"}
         if not shutil.which("codex"):
             return {"ok": False, "provider": "codex", "model": model, "detail": "codex CLI が見つかりません（インストール/PATH を確認）"}
         # 接続先が Azure 等（`openai_endpoint_kind() != "openai"`）の
@@ -856,7 +881,9 @@ def settings_test(req: TestReq, request: Request):
             sandbox_reason = _codex_ollama_sandbox_disabled_reason()
             if sandbox_reason is not None:
                 return {"ok": False, "provider": "codex", "model": model, "detail": sandbox_reason}
-            _codex_kind = None
+            # Codex(Ollama) は codex login を使わない（独自プロバイダで Ollama へ直接つなぐ）ので、
+            # 実行時と同じ接続先へ届くか・モデルがあるかを確かめる。
+            return _codex_ollama_probe(s, sys_s, model)
         else:
             # `sys_s`（保存済み中央設定）の openai_endpoint_kind/openai_base_url は JSONB のため
             # 非文字列の破損値もあり得る。`openai_endpoint_kind()` は判定分岐より先に型検査する契約
@@ -867,7 +894,7 @@ def settings_test(req: TestReq, request: Request):
             except ValueError:
                 return {"ok": False, "provider": "codex", "model": model,
                         "detail": "接続先の設定が不正です。管理者に確認してください"}
-        if codex_provider_choice != "ollama" and _codex_kind != "openai":
+        if _codex_kind != "openai":
             from sherpa.providers import _codex_openai_compat_block_reason
             probe_settings = {**s, "openai_api_key": req.openai_api_key or s.get("openai_api_key")}
             # 入力中の未保存キー（req.openai_api_key）は A6（personal_api_keys_allowed）の対象外で
