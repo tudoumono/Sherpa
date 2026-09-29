@@ -353,3 +353,26 @@ def test_check_ports_matches_any_listener_pid_for_multi_worker_app(tmp_path: Pat
     )
     r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, cwd=ROOT)
     assert "自アプリ" in r.stdout, r.stdout + r.stderr
+
+
+def test_check_ports_uses_lsof_when_ss_is_unavailable(tmp_path: Path):
+    """ss が使えない環境（macOS）では lsof で listen の pid を取り、自アプリを他プロセスと誤判定しない。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "ss").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    (bin_dir / "lsof").write_text("#!/usr/bin/env bash\nprintf 'p4242\\ncbash\\nf3\\n'\n", encoding="utf-8")
+    for name in ("ss", "lsof"):
+        (bin_dir / name).chmod(0o755)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", SHERPA_PORT="18766",
+               SHERPA_ENV_FILE=str(tmp_path / "none.env"), SHERPA_SKIP_PORT_CHECK="")
+    script = (
+        f'echo $$ > "{run_dir}/api.pid"; '
+        f'RUN_DIR="{run_dir}"; APP_PID_FILE="{run_dir}/api.pid"; APP_PROC_NEEDLE=bash; '
+        f'export RUN_DIR APP_PID_FILE APP_PROC_NEEDLE; '
+        f'sed -e "s/p4242/p$$/" -i "{bin_dir}/lsof"; '
+        f'"{ROOT}/scripts/check-ports.sh" 2>&1 | grep -E "アプリ 占有" '
+    )
+    r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, cwd=ROOT)
+    assert "自アプリ" in r.stdout, r.stdout + r.stderr
