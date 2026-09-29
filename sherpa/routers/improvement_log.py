@@ -16,28 +16,12 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from sherpa import improvement_log, store
+from sherpa.csv_safe import csv_safe as _csv_safe
 from sherpa.deps import _current_user, _require_admin
 
 _log = logging.getLogger("sherpa")
 
 improvement_log_router = APIRouter()
-
-# 先頭がこれらの文字（半角/全角の = + - @・タブ・CR・LF）のセルは、スプレッドシートアプリが
-# 数式として解釈しうる（CSV インジェクション・OWASP WSTG 準拠）。先頭の半角空白は無視して判定する
-# （空白の後に = 等が来ても検知する）。先頭に `'`（テキスト強制の慣用記法）を前置して無害化する。
-_CSV_FORMULA_TRIGGER_PREFIXES = (
-    "=", "+", "-", "@", "\t", "\r", "\n",
-    "＝", "＋", "－", "＠",   # 全角 = + - @
-)
-
-
-def _csv_safe(value):
-    if not isinstance(value, str):
-        return value
-    if value.lstrip(" ").startswith(_CSV_FORMULA_TRIGGER_PREFIXES):
-        return "'" + value
-    return value
-
 
 def _export_filename(fmt: str) -> str:
     return f"sherpa-improvement-log-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.{fmt}"

@@ -124,8 +124,13 @@
   .period-bar{flex-wrap:wrap}
   .uc-provider-btn{min-height:36px}
 
-  .usage-controls{display:grid;grid-template-columns:auto 1fr;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)}
+  .usage-controls{display:grid;grid-template-columns:1fr;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)}
   .usage-controls .period-bar{margin:0}
+  .period-range{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-left:8px}
+  .period-range input[type=date]{font-size:var(--text-small)}
+  [data-theme="dark"] .period-range input[type=date]{color-scheme:dark}
+  .period-range-error{font-size:var(--text-small);color:var(--danger)}
+  .period-range-error:empty{display:none}
   .usage-definitions{grid-column:1/-1}
   .usage-condition,.usage-next{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
   .usage-condition{font-size:var(--text-small);color:var(--ink-2)}
@@ -173,19 +178,27 @@
         <button type="button" class="filterchip" data-days="7">7日</button>
         <button type="button" class="filterchip on" data-days="30">30日</button>
         <button type="button" class="filterchip" data-days="90">90日</button>
+        <form class="period-range" id="period-range" novalidate>
+          <input type="date" id="period-start" aria-label="開始日" required>
+          <span aria-hidden="true">～</span>
+          <input type="date" id="period-end" aria-label="終了日" required>
+          <button type="submit" class="btn-ghost">この期間で表示</button>
+          <span class="period-range-error" id="period-range-error" role="alert"></span>
+        </form>
       </div>
 
-<div class="usage-condition"><span id="usage-period-label">期間を確認中…</span><button class="btn-ghost" id="usage-export" type="button" disabled>集計を保存（JSON）</button><a id="usage-standalone" href="usage.html" target="_top" hidden>この条件で単独表示</a></div>
+<div class="usage-condition"><span id="usage-period-label">期間を確認中…</span><button class="btn-ghost" id="usage-export" type="button" disabled>集計を保存（JSON）</button><button class="btn-ghost" id="usage-export-detail" type="button" disabled>明細を保存（ZIP）</button><a id="usage-standalone" href="usage.html" target="_top" hidden>この条件で単独表示</a></div>
 <details class="usage-definitions" id="usage-definitions">
   <summary>集計条件・指標の定義</summary>
   <dl>
-    <dt>期間と対象</dt><dd>日本時間（JST）の暦日で集計します。当日は途中経過です。会話の集計は質問の日時を基準とし、削除済み会話・受け取った共有会話は除きます。ログイン等は各操作の日時が基準です。</dd>
+    <dt>期間と対象</dt><dd>日本時間（JST）の暦日で集計します。期間は7・30・90日か、開始日と終了日（両日を含む・最長365日）で選べます。当日は途中経過です。会話の集計は質問の日時を基準とし、削除済み会話・受け取った共有会話は除きます。ログイン等は各操作の日時が基準です。</dd>
     <dt>アクティブユーザー・総ターン数・会話数</dt><dd>期間内に質問した利用者数・質問の回数・質問を含む会話数です。回答の成功件数ではありません。</dd>
     <dt>出典なし率</dt><dd>社内資料参照の回答があるターンを分母、その出典の一覧が空（欠落・不正な形式を含む）のターンを分子にします。素の会話と回答のない質問は対象外です。出典ありは正解、出典なしは資料不足という意味ではありません。出典の欠落・不正形式の件数は分離計測していません。</dd>
     <dt>Codexセッション保持率</dt><dd>期間内に2回以上やり取りした会話のうち、現在CodexセッションIDを持つ会話の割合です。品質タブの技術的な指標に表示します。再開成功率は計測していません。</dd>
     <dt>回答時間・終了理由</dt><dd>回答時間は記録された時間のある回答が対象です。表の件数が母数です。利用者停止は時間分布に含みません。終了理由の件数と利用者停止の件数は別に示します。</dd>
     <dt>使用量・欠測</dt><dd>トークン合計と日別グラフはチャット分、用途別は補助AIも含みます。キャッシュは入力の内数、推論は出力の内数です。未計測・未取得・対象なしを0と区別します。ただし元のチャット集計で未記録を0として合算した値から欠測件数は復元できません。</dd>
     <dt>一覧の上限</dt><dd>トークン利用の多いユーザーは上位10件、会話別は上位20件です。集計の保存も画面と同じ範囲（トークン利用の多いユーザーは上位10件）で、期間・定義を含めます。全会話の明細を保存する機能ではありません。</dd>
+    <dt>明細を保存（ZIP）</dt><dd>今表示している期間の回答明細を1つのZIPファイルにまとめます。質問・回答の本文、会話の題名、参照した資料、ツールの引数は含みません。会話番号・回答番号を手がかりに、必要な範囲だけDBや個別の記録と突き合わせて調べられます。</dd>
   </dl>
 </details>
 </div>

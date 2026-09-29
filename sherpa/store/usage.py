@@ -150,6 +150,10 @@ def _usage_period(days=None, *, time_from=None, time_to=None):
 # 「期間内メッセージが1件も無い会話」のみで、そのような会話はどの user 行も `turn_created_at` が
 # 期間外になるため最終 WHERE でどのみち出力から落ちる対象＝除外しても出力は変わらない
 # （id/created_at の単調性に一切依存しない）。
+#
+# `message_id`/`message_created_at`（assistant 側の messages.id/created_at）は、既存の集計
+# クエリはどれも SELECT リストに明示していないため無害な追加列——利用明細エクスポート
+# （`usage_export_turns`）が回答番号として使う。
 _USAGE_TURN_CTE = (
     "WITH touched AS ("
     "  SELECT DISTINCT conversation_id FROM messages WHERE created_at >= %s AND created_at < %s"
@@ -163,12 +167,13 @@ _USAGE_TURN_CTE = (
     "  JOIN conversations c ON c.id = m.conversation_id "
     "  WHERE c.deleted_at IS NULL AND c.origin='own' "
     "), assistant_replies AS ("
-    "  SELECT DISTINCT ON (conversation_id, turn_no) conversation_id, turn_no, lens, answer "
+    "  SELECT DISTINCT ON (conversation_id, turn_no) conversation_id, turn_no, lens, answer, "
+    "    id AS message_id, created_at AS message_created_at "
     "  FROM numbered WHERE role='assistant' AND turn_no > 0 "
     "  ORDER BY conversation_id, turn_no, id "
     "), turns AS ("
     "  SELECT n.user_id, n.version, n.conversation_id, n.created_at AS turn_created_at, "
-    "    n.personal AS user_personal, ar.lens, ar.answer "
+    "    n.personal AS user_personal, ar.lens, ar.answer, ar.message_id, ar.message_created_at "
     "  FROM numbered n LEFT JOIN assistant_replies ar "
     "    ON ar.conversation_id = n.conversation_id AND ar.turn_no = n.turn_no "
     "  WHERE n.role='user' "
@@ -1325,6 +1330,59 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         "rounds": rounds_stats,
         "quality_runs": depth_quality_stats(days, time_from=time_from, time_to=time_to),
     }
+
+
+def usage_export_turns(days: int = 30, *, time_from: str | None = None, time_to: str | None = None) -> list[dict]:
+    """管理者の利用明細エクスポート（ZIP）用: 期間内の回答（assistant 返答）1件=1行の生データ。
+
+    母集団・期間境界は `usage_stats()` と同じ（`_USAGE_TURN_CTE`・`c.origin='own'`・
+    `deleted_at IS NULL`・境界は質問（user 発言）の `turn_created_at`）。応答の無いユーザー発言
+    （実行中・利用者停止等）は `message_id IS NULL` で除外する——報告する回答が無いため。
+
+    `answer` は数字と閉じた語彙の欄だけを SQL で選んで組み直した JSON（本文・出典・主張は
+    DB から読まない＝`scripts/turn_activity.py::_rows` と同じ規律）。
+    """
+    _ensure()
+    start_ts, end_exclusive_ts, _period = _usage_period(days, time_from=time_from, time_to=time_to)
+    with _connect() as c:
+        rows = c.execute(
+            _USAGE_TURN_CTE + " "
+            "SELECT conversation_id, message_id, message_created_at, user_id AS uid, lens, "
+            "  jsonb_build_object("
+            "    'usage', answer->'usage', 'limits', answer->'limits', 'activity', answer->'activity', "
+            "    'stop_kind', answer->'stop_kind', 'codex_error_code', answer->'codex_error_code', "
+            "    'duration_ms', answer->'duration_ms', "
+            "    'investigation', jsonb_build_object("
+            "      'complete', answer->'investigation'->'complete', "
+            "      'continuations', answer->'investigation'->'continuations', "
+            "      'counts', answer->'investigation'->'counts')) AS answer "
+            "FROM turns WHERE message_id IS NOT NULL "
+            "  AND turn_created_at >= %s AND turn_created_at < %s "
+            "ORDER BY conversation_id, message_id",
+            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def usage_export_aux_calls(days: int = 30, *, time_from: str | None = None,
+                           time_to: str | None = None) -> list[dict]:
+    """管理者の利用明細エクスポート（ZIP）用: 期間内の `usage_events`（チャット以外の LLM 呼び出し・
+    査読の巡別記録を含む）1件=1行の生データ。
+
+    `usage_stats()` の会話単位集計とは異なり会話所属で絞らない（`usage_events` は
+    `conversation_id IS NULL` の行を持ちうる＝取り込み時の埋め込み等・遡及なし契約）——境界は
+    イベント自身の `ts` のみ。`world` 列は意図的に選ばない（取り込みフォルダの名前になり得る）。
+    """
+    _ensure()
+    start_ts, end_exclusive_ts, _period = _usage_period(days, time_from=time_from, time_to=time_to)
+    with _connect() as c:
+        rows = c.execute(
+            "SELECT ts, kind, provider, model, input_tokens, cached_input_tokens, output_tokens, "
+            "  reasoning_output_tokens, calls, elapsed_ms, user_id AS uid, conversation_id "
+            "FROM usage_events WHERE ts >= %s AND ts < %s ORDER BY ts",
+            (start_ts, end_exclusive_ts),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # 品質採点の入口。1巡 vs 3巡等の正解付き比較は既存の実測枠の運用に委ねる——ここは採点結果の

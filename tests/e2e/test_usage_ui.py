@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -347,6 +348,46 @@ def test_usage_period_switch_refetches_and_rerenders_trends(page, web_base_url):
     expect(page.locator(".period-bar [data-days='7']")).to_have_class(re.compile(r"\bon\b"))
     assert records["admin_usage_stats"][-1]["days"] == ["7"]
     expect(page.locator("#t-zerohit")).to_have_text("50%")
+
+
+def test_usage_custom_period_sends_jst_half_open_range(page, web_base_url):
+    """開始日・終了日の指定は JST の [開始日 00:00, 終了日の翌日 00:00) で取得し、URL にも残す。
+    開始日が終了日より後なら取得せずに理由を出す。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html#tokens?days=30")
+    expect(page.locator("#usage-stat-panels")).to_be_visible()
+    sent = len(records["admin_usage_stats"])
+
+    page.locator("#period-start").fill("2026-02-10")
+    page.locator("#period-end").fill("2026-02-01")
+    page.locator("#period-range button[type=submit]").click()
+    expect(page.locator("#period-range-error")).to_have_text("開始日は終了日以前にしてください")
+    assert len(records["admin_usage_stats"]) == sent
+
+    page.locator("#period-start").fill("2026-01-01")
+    page.locator("#period-end").fill("2026-01-31")
+    with page.expect_request(lambda r: "/admin/usage/stats?" in r.url) as req:
+        page.locator("#period-range button[type=submit]").click()
+    expect(page.locator("#period-range-error")).to_be_empty()
+    expect(page).to_have_url(re.compile(r"#tokens\?start=2026-01-01&end=2026-01-31$"))
+    expect(page.locator(".period-bar .filterchip.on")).to_have_count(0)
+    query = parse_qs(urlparse(req.value.url).query)
+    assert query["from"] == ["2026-01-01T00:00:00+09:00"]
+    assert query["to"] == ["2026-02-01T00:00:00+09:00"]
+    assert "days" not in query
+
+    # URL に直接書いた不正な期間も、取得せずに理由を出す（開いた直後も同じ）。
+    sent = len(records["admin_usage_stats"])
+    page.goto(f"{web_base_url}/usage.html#tokens?start=2026-02-10&end=2026-02-01")
+    expect(page.locator("#period-range-error")).to_have_text("開始日は終了日以前にしてください")
+    page.reload()
+    expect(page.locator("#period-range-error")).to_have_text("開始日は終了日以前にしてください")
+    expect(page.locator("#usage-stat-panels")).to_be_hidden()
+    page.locator("#usage-tab-quality").click()
+    expect(page).to_have_url(re.compile(r"#quality\?start=2026-02-10&end=2026-02-01$"))
+    assert len(records["admin_usage_stats"]) == sent
 
 
 # ===== STAT-2: 統計チャットの「今回だけ」一時プロバイダ切替（保存しない・リクエスト単位） =====
@@ -1141,6 +1182,38 @@ def test_usage_metric_definitions_missing_values_and_export(page, web_base_url, 
     assert data["retrieved_at"]
 
 
+def test_usage_export_zip_button_requests_current_period(page, web_base_url):
+    """「明細を保存（ZIP）」は画面が表示している期間（load() が /admin/usage/stats へ渡すのと
+    同じクエリの組み立て）で /admin/usage/export を取得し、応答のファイル名で保存する。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/usage.html")
+    expect(page.locator("#usage-export-detail")).to_be_enabled()
+
+    with page.expect_download() as download:
+        page.locator("#usage-export-detail").click()
+    assert download.value.suggested_filename == "usage-detail-20260601-20260630.zip"
+    assert records["admin_usage_export"][-1]["days"] == ["30"]
+
+    page.locator('[data-days="7"]').click()
+    expect(page.locator("#usage-export-detail")).to_be_enabled()
+    with page.expect_download():
+        page.locator("#usage-export-detail").click()
+    assert records["admin_usage_export"][-1]["days"] == ["7"]
+
+    page.locator("#period-start").fill("2026-01-01")
+    page.locator("#period-end").fill("2026-01-31")
+    page.locator("#period-range button[type=submit]").click()
+    expect(page.locator("#usage-export-detail")).to_be_enabled()
+    with page.expect_download():
+        page.locator("#usage-export-detail").click()
+    query = records["admin_usage_export"][-1]
+    assert query["from"] == ["2026-01-01T00:00:00+09:00"]
+    assert query["to"] == ["2026-02-01T00:00:00+09:00"]
+    assert "days" not in query
+
+
 def test_usage_failed_period_does_not_display_or_export_previous_data(page, web_base_url):
     """期間変更の取得失敗を、前期間の成功した値で隠さない。"""
     from playwright.sync_api import expect
@@ -1155,11 +1228,13 @@ def test_usage_failed_period_does_not_display_or_export_previous_data(page, web_
     expect(page.locator("#usage-period-label")).to_have_text("7日間（取得失敗）")
     expect(page.locator("#summary-tiles")).to_be_hidden()
     expect(page.locator("#usage-export")).to_be_disabled()
+    expect(page.locator("#usage-export-detail")).to_be_disabled()
     page.get_by_role("tab", name="トークン", exact=True).click()
     expect(page.locator("#token-tiles")).to_be_hidden()
     page.locator('[data-days="90"]').click()
     expect(page.locator("#token-tiles")).to_be_visible()
     expect(page.locator("#usage-export")).to_be_enabled()
+    expect(page.locator("#usage-export-detail")).to_be_enabled()
 
 
 def test_usage_embedded_condition_can_open_as_standalone(page, web_base_url):

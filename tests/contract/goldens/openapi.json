@@ -9473,6 +9473,82 @@
         ]
       }
     },
+    "/admin/usage/export": {
+      "get": {
+        "description": "利用明細エクスポート（ZIP・管理者のみ）。画面が表示している期間の回答明細を1つの ZIP に\nまとめて返す——質問・回答の本文・会話タイトル・参照した資料・ツールの引数は含めない\n（会話番号・回答番号で DB や `make turn-activity CONV=<会話番号>` と突き合わせる調査用途）。\n\n期間の受け方は `GET /admin/usage/stats` と完全に同じ（`days` の明示指定と `from`/`to` の\n同時指定は422・`from`/`to` は両方必須・半開区間 `[from, to)`・最大365日）。閲覧と同じ流儀で\n`admin.usage_exported`（detail は期間だけ）を fail-closed で監査する。",
+        "operationId": "admin_usage_export_admin_usage_export_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 365,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Usage Export",
+        "tags": [
+          "管理者:利用統計"
+        ]
+      }
+    },
     "/admin/usage/quality-runs": {
       "post": {
         "description": "品質採点（1巡 vs 3巡等の正解付き比較）の結果を「集計済みカウント」だけで受け取る入口。\n採点そのものは既存の実測枠の運用に委ねる——質問文・回答本文はフィールド自体が無く\n受け付けない（受け取っても保存できない）。",
