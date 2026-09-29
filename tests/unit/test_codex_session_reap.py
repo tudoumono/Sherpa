@@ -234,3 +234,21 @@ def test_kill_session_reaps_orphan_but_spares_unrelated_session(monkeypatch):
                 os.kill(pipe_child_pid, signal.SIGKILL)
             except Exception:
                 pass
+
+
+def test_kill_session_falls_back_to_killpg_without_pidfd(monkeypatch):
+    """`os.pidfd_open` が無い環境（macOS 想定）で `_kill_session` が pidfd 経路へ入らず、
+    `os.killpg` フォールバック（`_kill_session_fallback_killpg`）へ縮退することを確かめる。
+    実プロセスは起動しない——外部境界（`os.pidfd_open` の有無・`os.killpg`・`os.getpgid`）
+    だけを monkeypatch し、`os.killpg` は呼び出しを記録するだけで実プロセスを殺さない。"""
+    monkeypatch.delattr(os, "pidfd_open", raising=False)   # macOS には元々存在しない属性
+
+    calls = []
+    def _zombie_getpgid(pid):   # macOS はリーダーが reap 前のゾンビだと getpgid が ESRCH
+        raise ProcessLookupError(pid)
+    monkeypatch.setattr(os, "getpgid", _zombie_getpgid)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+
+    PV._kill_session(4242)
+
+    assert calls == [(4242, signal.SIGKILL)]

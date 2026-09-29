@@ -483,6 +483,29 @@ _SESSION_REAP_ATTEMPTS = 5      # 固定回数（無限リトライにしない�
 _SESSION_REAP_INTERVAL_S = 0.05  # 数十ミリ秒
 
 
+def _kill_session_fallback_killpg(sid: int, reason: str) -> None:
+    """pidfd/`/proc` が使えない環境（macOS 等）向けの縮退経路。`_kill_session` の docstring が
+    定める前提（呼び出し側が `proc.wait()` で reap する前に呼ぶ＝sid の pid 再利用は起きない）は
+    そのまま活きるため、その前提だけを頼りに `os.killpg`（`_killpg` と同じ手段）で group ごと
+    SIGKILL する。setpgid で group を抜けた孤児までは届かない縮退版であることを毎回 1 回だけ
+    警告する（黙って諦めない＝AttributeError を汎用例外として握り潰さない）。
+
+    `start_new_session=True` で起動しているので pgid == sid。getpgid は使わない——macOS では
+    リーダーが reap 前のゾンビになっていると getpgid が ESRCH になり、group に残った子へ届かない。"""
+    try:
+        os.killpg(sid, signal.SIGKILL)
+    except ProcessLookupError:
+        return        # group にもう誰もいない＝回収するものが無い
+    except Exception as exc:
+        _log.warning(
+            "codex session reap: killpg フォールバックにも失敗しました（%s・%s）sid=%s",
+            reason, type(exc).__name__, sid)
+        return
+    _log.warning(
+        "codex session reap: pidfd/proc 非対応環境のため killpg フォールバックへ縮退しました"
+        "（%s・setpgid で group を抜けた子は回収できません）sid=%s", reason, sid)
+
+
 def _kill_session(sid: int) -> None:
     """`sid` を session id に持つプロセスを、残りが無くなるまで数回 SIGKILL する。呼び出し側は
     `start_new_session=True` で起動した Popen の pid を渡す（setsid の仕様上、その pid がそのまま
@@ -508,14 +531,15 @@ def _kill_session(sid: int) -> None:
     `pidfd_send_signal` で送ることで防ぐ（pidfd は確保した瞬間のプロセスに固定され、番号の
     再利用があっても別プロセスには届かない）。
 
-    pidfd が使えない環境（関数が無い・カーネル未対応＝ENOSYS）や `/proc` が無い/読めない環境では
-    何もしない（fail-open。pid 番号だけで送る旧方式へは戻さない）。自分自身（Sherpa のプロセス）と
-    このセッションに属さないプロセスには絶対に触らない。
+    pidfd が使えない環境（関数が無い＝macOS 等の AttributeError・カーネル未対応＝ENOSYS）や
+    `/proc` が無い/読めない環境では `_kill_session_fallback_killpg` へ縮退する（pid 番号だけで
+    送る旧方式へは戻さない）。自分自身（Sherpa のプロセス）とこのセッションに属さないプロセスには
+    絶対に触らない。
     """
     if sid <= 0:
         return
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        _log.warning("codex session reap: pidfd 未対応環境のため何もしません（AttributeError）sid=%s", sid)
+        _kill_session_fallback_killpg(sid, "pidfd 未対応")
         return
     my_pid = os.getpid()
     try:
@@ -523,7 +547,8 @@ def _kill_session(sid: int) -> None:
             try:
                 candidates = [e for e in os.listdir("/proc") if e.isdigit()]
             except OSError:
-                return   # /proc が無い/読めない環境（fail-open・何もしない）
+                _kill_session_fallback_killpg(sid, "/proc 未対応")
+                return
             matched = 0
             for entry in candidates:
                 pid = int(entry)
