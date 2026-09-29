@@ -51,6 +51,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 import threading
 from pathlib import Path
@@ -482,6 +483,31 @@ def _killpg(proc) -> None:
 _SESSION_REAP_ATTEMPTS = 5      # 固定回数（無限リトライにしない）
 _SESSION_REAP_INTERVAL_S = 0.05  # 数十ミリ秒
 
+
+
+_STARTUP_STDERR_MAX_BYTES = 4096
+_STARTUP_STDERR_MAX_LINES = 20
+
+
+def _log_startup_stderr(f, returncode, got_any_line: bool, conv, uid) -> None:
+    """Codex が `--json` のイベントを1件も出さずに異常終了したときだけ、stderr の先頭を伏せ字にかけて
+    ログに残す（起動時の失敗＝設定の拒否・サンドボックスの起動失敗の原因はここにしか出ない）。
+    正常終了・イベントが出た後の失敗では読まない。どちらでもファイルは閉じて捨てる。"""
+    try:
+        if returncode not in (None, 0) and not got_any_line:
+            f.seek(0)
+            head = f.read(_STARTUP_STDERR_MAX_BYTES).decode("utf-8", "replace")
+            lines = [ln.rstrip() for ln in head.splitlines() if ln.strip()][:_STARTUP_STDERR_MAX_LINES]
+            if lines:
+                _log.warning("codex startup failure: returncode=%s conv=%s uid=%s stderr=\n%s",
+                             returncode, conv, uid, agentic_search._redact("\n".join(lines)))
+    except Exception:
+        pass
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
 
 def _kill_session_fallback_killpg(sid: int, reason: str) -> None:
     """pidfd/`/proc` が使えない環境（macOS 等）向けの縮退経路。`_kill_session` の docstring が
@@ -2704,6 +2730,7 @@ class CodexProvider(Provider):
                     nonlocal _agent_start_mono, _agent_end_mono
                     got_any_line = False
                     attempt_returncode = None
+                    _stderr_f = None
                     _attempt_ran_tools = False
                     _turn_failed = False
                     _turn_failed_code = None
@@ -2749,15 +2776,16 @@ class CodexProvider(Provider):
                             llm.assert_openai_io_allowed()
                         # start_new_session で独立プロセスグループにし、停止/後始末で
                         #   MCP subprocess / shell child まで group ごと確実に殺す（creds env の寿命を延ばさない）。
-                        # stderr は捨てる（保存もログ出力もしない）——Codex CLI の stderr には
-                        # 資料名・本文・環境変数値が混ざり得る一方、伏せ字（`agentic_search._redact`）は
-                        # 秘密の既知パターンしか落とせない。失敗の原因は `--json` の `codex_error_info`
-                        # （固定語彙）と Codex CLI 自身の rollout JSONL に残る。
+                        # stderr は名前の無い一時ファイルへ向け、`--json` のイベントを1件も出さずに異常終了した
+                        # ときだけ先頭を読んでログに残す（`_log_startup_stderr`）。それ以外は読まずに捨てる——
+                        # 応答が流れ始めた後の stderr には資料名・本文が混ざり得るため。起動時の失敗
+                        # （設定の拒否・サンドボックスの起動失敗）はイベントも rollout も残らず、stderr だけが手がかり。
                         if _agent_start_mono is None:   # 利用統計 activity: 最初の Popen だけを起点にする
                             _agent_start_mono = time.monotonic()
+                        _stderr_f = tempfile.TemporaryFile()
                         proc = subprocess.Popen(
                             argv, env=popen_env, cwd=str(run_dir), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            stdout=subprocess.PIPE, stderr=_stderr_f, text=True,
                             start_new_session=True)
                         # 途中停止の有無によらず常に起動する（別グループの子が pipe を握って
                         # 離さないケースの pipe 閉じ役も兼ねる・_spawn_stop_watcher 参照）。
@@ -2988,6 +3016,9 @@ class CodexProvider(Provider):
                             # 利用統計 activity: 直近の wait 完了直後を終端にする（attempt ごとに
                             # 更新＝最後の attempt の終端が残る）。
                             _agent_end_mono = time.monotonic()
+                        if _stderr_f is not None:
+                            _log_startup_stderr(_stderr_f, attempt_returncode, got_any_line,
+                                                ctx.conversation_id, uid)
 
                 def _absorb_last_message_fallback() -> None:
                     """attempt が `--json` に agent_message を出さず `-o` 最終メッセージファイルにだけ

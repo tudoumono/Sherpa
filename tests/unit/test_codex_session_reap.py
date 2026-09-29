@@ -273,3 +273,22 @@ def test_codex_launcher_dir_added_only_for_macos_symlink(monkeypatch, tmp_path):
     assert SB._codex_install_root() == real_dir
     monkeypatch.setattr(sys, "platform", "linux")
     assert SB._codex_launcher_dir() is None
+
+
+def test_startup_stderr_logged_only_when_no_events_and_failed(caplog):
+    """イベントを1件も出さずに異常終了したときだけ stderr の先頭を残し、それ以外は読まない。"""
+    import logging
+    import tempfile
+
+    def _f(text):
+        f = tempfile.TemporaryFile()
+        f.write(text.encode("utf-8"))
+        return f
+
+    with caplog.at_level(logging.WARNING, logger="sherpa"):
+        PV._log_startup_stderr(_f("Error: config rejected\n"), 1, False, 7, "u")
+        PV._log_startup_stderr(_f("streamed body\n"), 1, True, 7, "u")
+        PV._log_startup_stderr(_f("normal\n"), 0, False, 7, "u")
+    text = caplog.text
+    assert "config rejected" in text
+    assert "streamed body" not in text and "normal" not in text
