@@ -509,6 +509,15 @@ def _log_startup_stderr(f, returncode, got_any_line: bool, conv, uid) -> None:
         except Exception:
             pass
 
+
+# モデルの思考の区切りの制御記号（例 `<|channel|>`・`<channel>`・`<think>`）。Codex が知らないモデル
+# （Ollama のタグ等）では Codex が取り除けずに思考の本文へ残るので、表示の1行要約からだけ外す。
+_CONTROL_MARKER_RE = re.compile(r"<\|?/?[A-Za-z_]{1,24}\|?>")
+
+
+def _strip_control_markers(text: str) -> str:
+    return _CONTROL_MARKER_RE.sub("", text)
+
 def _kill_session_fallback_killpg(sid: int, reason: str) -> None:
     """pidfd/`/proc` が使えない環境（macOS 等）向けの縮退経路。`_kill_session` の docstring が
     定める前提（呼び出し側が `proc.wait()` で reap する前に呼ぶ＝sid の pid 再利用は起きない）は
@@ -2634,6 +2643,9 @@ class CodexProvider(Provider):
                 _schema_level = 0 if _plain else _env_int("SHERPA_CODEX_OUTPUT_SCHEMA", 2, 0, 2)
                 _schema_on = self._ollama_base_url is None and _schema_level >= 1
                 _schema_v2 = _schema_on and _schema_level == 2
+                # ログ・利用統計には実際に効いている値を出す（Codex(Ollama) は出力スキーマを使わない＝0。
+                # 設定値のまま出すと、主張の根拠と台帳の保証が効いているように見える）。
+                _schema_level_effective = 2 if _schema_v2 else (1 if _schema_on else 0)
                 if _schema_on:
                     argv_base += ["--output-schema",
                                  str(_OUTPUT_SCHEMA_PATH_V2 if _schema_v2 else _OUTPUT_SCHEMA_PATH)]
@@ -2657,7 +2669,7 @@ class CodexProvider(Provider):
                     "schema_level=%s model=%s reasoning=%s budget_per_result=%s budget_total=%s "
                     "max_hits=%s window_cap=%s max_calls=%s window_source=%s window_cli=%s",
                     ctx.conversation_id, uid, _codex_mode_label, _codex_config_kind, _multi_agent_enabled,
-                    _depth_label, _review_rounds, _schema_level, self.model, _reason,
+                    _depth_label, _review_rounds, _schema_level_effective, self.model, _reason,
                     _mcp_budget_env.get("SHERPA_MCP_TOOL_BUDGET_BYTES", "-"),
                     "none",
                     _mcp_budget_env.get("SHERPA_MCP_TOOL_MAX_HITS", "-"),
@@ -2672,7 +2684,7 @@ class CodexProvider(Provider):
                     "provider": "codex", "mode": _codex_mode_label, "config": _codex_config_kind,
                     "model": self.model,
                     "reasoning": _reason, "depth": _depth_label, "review_rounds": _review_rounds,
-                    "schema_level": _schema_level, "multi_agent": _multi_agent_enabled,
+                    "schema_level": _schema_level_effective, "multi_agent": _multi_agent_enabled,
                     "budget_per_result": _int_or_none(_mcp_budget_env.get("SHERPA_MCP_TOOL_BUDGET_BYTES")),
                     "max_hits": _int_or_none(_mcp_budget_env.get("SHERPA_MCP_TOOL_MAX_HITS")),
                     "window_cap": _int_or_none(_mcp_budget_env.get("SHERPA_MCP_TOOL_WINDOW_CAP")),
@@ -2974,7 +2986,8 @@ class CodexProvider(Provider):
                                     if isinstance(_tid, str) and _tid:
                                         _child_thread_ids.add(_tid)
                             elif it == "reasoning" and e.get("type") == "item.completed":
-                                txt = (item.get("text") or "").strip().splitlines()
+                                txt = [ln for ln in (_strip_control_markers(ln).strip() for ln in
+                                                     (item.get("text") or "").splitlines()) if ln]
                                 if txt:
                                     yield _node(f"cx-{iid}", "think", "考える", txt[-1][:80], "done")
                             elif it == "agent_message" and e.get("type") in ("item.completed", "item.updated"):
@@ -3680,7 +3693,9 @@ class CodexProvider(Provider):
                 # 台帳の終了状態（正典§6「codex.log 終了行」）: 語彙は env["investigation"]["stopped_reason"]
                 # の4値より粗い3値（missing/complete/incomplete）——ログ行は運用の一目確認用、
                 # 打ち切り理由の詳細（no_progress/cap 等）は env 側にだけ持つ。
-                if _investigation_verdict is None or _investigation_verdict.manifest_invalid:
+                if not _schema_v2:
+                    _ledger_log_state = "off"      # 台帳を使わない構成（Codex(Ollama)・素の Codex 等）
+                elif _investigation_verdict is None or _investigation_verdict.manifest_invalid:
                     _ledger_log_state = "missing"
                 elif _investigation_verdict.complete:
                     _ledger_log_state = "complete"

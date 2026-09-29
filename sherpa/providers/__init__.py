@@ -333,6 +333,14 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
                     return _facade._UnwiredProvider("Codex（OpenAI 互換の接続先）", str(e))
         from sherpa import model_catalog
         codex_model = model_catalog.resolve_model("codex", "codex", None, system_settings=sys_s)
+        # Codex(Ollama) で既定の OpenAI 向けの名前のまま＝Ollama に無い名前を送って毎回失敗する
+        # （Codex が知っている名前だと Ollama の未対応の入力まで送る）。実行前に理由を返す。
+        if ollama_base_url is not None and (
+                not codex_model or codex_model == model_catalog.hardcoded_fallback("codex", "codex")):
+            return _facade._UnwiredProvider(
+                "Codex（ローカルLLM）",
+                "管理画面の「使えるモデル」で Codex の列に Ollama のモデル名（例 gpt-oss:20b）を登録してください"
+                "（既定の OpenAI 向けの名前のままでは動きません）")
         # カタログ外の値は縮退させない（`model_catalog.resolve_model` の契約）ため、`codex_model` は
         # 管理者のカタログ設定に不整合が生じた直後の一時的な値でありうる。
         # `CodexProvider.__init__` の `InvalidModelNameError`（不正な非空モデル名）だけを狭く拾い、
