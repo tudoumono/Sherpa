@@ -138,7 +138,7 @@ apt_offline_install() {
   local desc="$1" kit_root="$2" group_dir="$3"; shift 3
   local names=("$@") mode before rc=0 simlog tmpd A=() kit_uri
   if [ ! -d "$group_dir" ] || [ -z "$(find "$group_dir" -maxdepth 1 -name '*.deb' 2>/dev/null)" ]; then
-    warn "$desc の .deb が見つかりません（$group_dir）。オンライン側で収集していないためスキップします。"
+    warn "$desc の .deb が見つかりません（${group_dir}）。オンライン側で収集していないためスキップします。"
     return 1
   fi
   # 相対パスは必ず絶対化する。apt の file: URI は絶対パス必須（相対だと "Invalid URI, local URIS must
@@ -174,7 +174,7 @@ apt_offline_install() {
     A=(-o "Dir::Etc::sourcelist=$tmpd/sources.list" -o "Dir::Etc::sourceparts=-"
        -o "Dir::State::lists=$tmpd/lists" -o "APT::Sandbox::User=root"
        -o "Acquire::Check-Date=false")
-    note "$desc: ローカル repo（file:$kit_root）から [${names[*]}] を導入します..."
+    note "$desc: ローカル repo（file:${kit_root}）から [${names[*]}] を導入します..."
     if ! _apt_offline_run apt-get "${A[@]}" update; then
       fail "$desc: ローカル repo の読み込み（apt-get update）に失敗しました。考えられる原因:"
       fail "  - 索引（Packages/Release）が壊れている／.deb を差し替えたのに索引を作り直していない（Hash Sum mismatch）"
@@ -212,7 +212,7 @@ apt_offline_install() {
   rm -f "$simlog"
 
   if [ "$rc" != 0 ]; then
-    fail "$desc の導入に失敗しました（apt-get exit=$rc）。"
+    fail "$desc の導入に失敗しました（apt-get exit=${rc}）。"
     fail "  復旧を試すには: sudo dpkg --configure -a; sudo apt-get -f -s install で計画を確認し（削除が無いこと）、"
     fail "  sudo apt-get -f --no-remove install  の後、再実行してください（-f だけの実行は削除を提案し得るので使わない）。"
     fail "  それでも失敗する場合は、オンライン側でこの機体と同じ OS/アーキテクチャ（BASELINE 参照）で収集し直してください。"
@@ -251,7 +251,7 @@ _baseline_get() { sed -n "s/^$2=//p" "$1" | head -1; }
 apt_offline_check_baseline() {  # $1=kit_root
   local kit_root="$1" b="$1/BASELINE" mism=0 host_id host_ver host_code host_arch k_id k_ver k_code k_arch
   if [ ! -f "$b" ]; then
-    warn "BASELINE（$b）がありません（旧キット）。土台の照合をスキップして続行しますが、"
+    warn "BASELINE（${b}）がありません（旧キット）。土台の照合をスキップして続行しますが、"
     warn "  収集元と OS/アーキテクチャがずれていると .deb 導入が依存不足で止まります（-s 先行で検出はします）。"
     return 0
   fi

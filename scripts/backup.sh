@@ -85,22 +85,22 @@ DEST="$BACKUP_DIR/$STAMP"
 VOLUMES=("${PROJECT}_pg" "${PROJECT}_neo4j" "${PROJECT}_es")
 
 if [ -n "${SHERPA_ENV_FILE:-}" ] && [ ! -f "$ENV_FILE" ]; then
-  fail "指定された SHERPA_ENV_FILE がありません: $ENV_FILE（env を欠いた不完全なバックアップは作りません）"
+  fail "指定された SHERPA_ENV_FILE がありません: ${ENV_FILE}（env を欠いた不完全なバックアップは作りません）"
   exit 1
 fi
 
 [[ "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || {
-  fail "compose project 名が不正です: $PROJECT（小文字英数字で始まる英数字・_・- のみ）"; exit 1;
+  fail "compose project 名が不正です: ${PROJECT}（小文字英数字で始まる英数字・_・- のみ）"; exit 1;
 }
 # chmod/tar の対象に広すぎるパスや自己包含を許さない。BACKUP_DIR が users/derived の中にあると、
 # 作成中のバックアップ自身を tar が再帰的に読み続けるため、実行前に止める。
 if [ "$BACKUP_DIR" = / ] || [ "$BACKUP_DIR" = "$ROOT" ] || path_contains "$BACKUP_DIR" "$ROOT"; then
-  fail "SHERPA_BACKUP_DIR が広すぎます: $BACKUP_DIR（専用のサブディレクトリを指定してください）"; exit 1
+  fail "SHERPA_BACKUP_DIR が広すぎます: ${BACKUP_DIR}（専用のサブディレクトリを指定してください）"; exit 1
 fi
 for spec in "個人領域:$USERS" "派生物:$DERIVED"; do
   label="${spec%%:*}"; dir="${spec#*:}"
   if [ "$dir" = / ] || path_contains "$dir" "$ROOT"; then
-    fail "$label のパスが広すぎます: $dir（専用のサブディレクトリを指定してください）"; exit 1
+    fail "$label のパスが広すぎます: ${dir}（専用のサブディレクトリを指定してください）"; exit 1
   fi
 done
 if paths_overlap "$BACKUP_DIR" "$USERS" || { [ "$WITH_DERIVED" = 1 ] && paths_overlap "$BACKUP_DIR" "$DERIVED"; }; then
@@ -266,7 +266,7 @@ if [ -d "$USERS" ]; then
   tar czf "$DEST/users.tar.gz" -C "$USERS" .
   ok "users.tar.gz ($(du -h "$DEST/users.tar.gz" | cut -f1))"
 else
-  warn "個人領域が見つかりません: $USERS（SHERPA_USERS_DIR が未設定／別の場所にありませんか？）。空の状態として退避します。"
+  warn "個人領域が見つかりません: ${USERS}（SHERPA_USERS_DIR が未設定／別の場所にありませんか？）。空の状態として退避します。"
   tar czf "$DEST/users.tar.gz" --files-from /dev/null
   ok "users.tar.gz（空）"
 fi

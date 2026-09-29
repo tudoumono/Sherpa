@@ -37,7 +37,7 @@ if pgrep -f "python -m pytest" | grep -qv "^$$\$"; then
 fi
 
 if ! gate_acquire_all_or_none; then
-  echo "他のゲート（lane/integration）が実行中のため開始しません（ロック: ${GATE_LANE_SLOT_LOCKS[*]} $GATE_INTEGRATION_LOCKFILE）" >&2
+  echo "他のゲート（lane/integration）が実行中のため開始しません（ロック: ${GATE_LANE_SLOT_LOCKS[*]} ${GATE_INTEGRATION_LOCKFILE}）" >&2
   exit 2
 fi
 

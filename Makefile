@@ -154,7 +154,9 @@ test: test-unit test-api test-contract test-integration  ## 単体＋API＋契�
 gate-slice:         ## 変更ファイルから該当テストを自動選択して実行（BASE=<ref> 既定 main）
 	$(PY) scripts/gate_slice.py --base $(BASE)
 
-gate-merge: SHELL := /usr/bin/bash
+# set -euo pipefail を使う target の shell。bash の場所は OS で違う（macOS は /bin/bash）ので PATH から解決する。
+BASH_BIN := $(shell command -v bash 2>/dev/null || echo /bin/bash)
+gate-merge: SHELL := $(BASH_BIN)
 gate-merge:         ## マージ前ゲート（単体全件+契約＋変更領域の必須スイート。BASE=<ref> 既定 main）
 	set -euo pipefail; \
 	. scripts/lib/gate_budget.sh; \
@@ -171,7 +173,7 @@ gate-merge:         ## マージ前ゲート（単体全件+契約＋変更領�
 # テストを含む＝DB 要否を機械的に仕分ける仕組みは無いため、DB が使える手元環境での運用に委ねる。
 # routers/** を変更しない限り gate-merge は API 層を要求しない）。
 
-gate-release: SHELL := /usr/bin/bash
+gate-release: SHELL := $(BASH_BIN)
 gate-release:       ## リリース前フルゲート（結合+ブラウザ結合+本番前チェック。VERIFY_KIT=1で追加）
 	set -euo pipefail; \
 	$(MAKE) test; \
@@ -179,14 +181,14 @@ gate-release:       ## リリース前フルゲート（結合+ブラウザ結�
 	$(MAKE) prod-check; \
 	if [ "$(VERIFY_KIT)" = "1" ]; then $(MAKE) verify-kit; fi
 
-gate-ci: SHELL := /usr/bin/bash
+gate-ci: SHELL := $(BASH_BIN)
 gate-ci:            ## CI用（ruff+単体全件+契約・予算チェック込み・Postgres serviceのみ前提）
 	set -euo pipefail; \
 	. scripts/lib/gate_budget.sh; \
 	ruff check . ; \
 	gate_run_unit_contract_budgeted "$(PY)"
 
-test-inventory: SHELL := /usr/bin/bash
+test-inventory: SHELL := $(BASH_BIN)
 test-inventory:     ## テスト件数表（ディレクトリ別）＋遅い20本（test-durations 呼び出し）
 	set -euo pipefail; \
 	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/unit tests/contract --collect-only -q \

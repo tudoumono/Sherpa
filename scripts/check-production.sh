@@ -130,7 +130,7 @@ _check_openai_endpoint_host() {
   else
     warn "$label の $display_host:$tcp_port に TCP 接続できません（3秒）。"\
 "Private Link 等でこの preflight の実行元から到達できない構成なら問題ありません。到達できるはずの構成なら"\
-" プロキシ/ファイアウォールの許可先（$display_host）を確認してください。"
+" プロキシ/ファイアウォールの許可先（${display_host}）を確認してください。"
   fi
 }
 

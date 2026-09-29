@@ -149,7 +149,7 @@ _on_err() {
   echo "" >&2
   echo "✗ 導入はここで失敗しました" >&2
   echo "   ステップ : $CURRENT_STEP" >&2
-  echo "   コマンド : L$line: $cmd（終了コード $rc）" >&2
+  echo "   コマンド : L$line: ${cmd}（終了コード ${rc}）" >&2
   echo "   ログ全文 : $_LOG_FILE" >&2
   echo "   このログファイル1本を持ち出せば、オンライン側で原因調査ができます。" >&2
 }
@@ -168,7 +168,7 @@ if [ "$TARGET_DIR" != "$ROOT" ]; then
     fail "realpath コマンドが見つかりません（coreutils 未導入の疑い）。--target-dir の絶対パス化に必要です。"
     exit 1
   fi
-  # 相対パスは呼び出し時の cwd（$ORIG_PWD・上で cd "$ROOT" より前に控えた値）基準で解決する。
+  # 相対パスは呼び出し時の cwd（${ORIG_PWD}・上で cd "$ROOT" より前に控えた値）基準で解決する。
   case "$TARGET_DIR" in
     /*) : ;;
     *) TARGET_DIR="$ORIG_PWD/$TARGET_DIR" ;;
@@ -193,7 +193,7 @@ _on_exit() {
   # （ERR 経由なら詳細は表示済み＝まとめだけ。fail→exit 1 の経路でもここは通る）。
   if [ "$rc" != 0 ] && [ "${_ERR_SHOWN:-0}" != 1 ]; then
     echo "" >&2
-    echo "✗ 導入は完了していません（ステップ「${CURRENT_STEP:-（準備段階）}」で中断・終了コード $rc）" >&2
+    echo "✗ 導入は完了していません（ステップ「${CURRENT_STEP:-（準備段階）}」で中断・終了コード ${rc}）" >&2
     echo "   ログ全文 : ${_LOG_FILE:-（ログ開始前）}" >&2
   elif [ "$rc" = 0 ] && [ -n "${_LOG_FILE:-}" ]; then
     echo "ログ: $_LOG_FILE"
@@ -433,8 +433,8 @@ echo ""
 # **据え付け後の最終パスに対して**行う（venv の shebang が最初から最終パスになる）。
 # 全部成功したらマーカーを削除して初めて「完成版」を名乗り（13番）、--target-dir 時はそこから
 # current への symlink 切替を行う。途中のどこかで失敗すれば current は旧版のまま無傷。
-# 以降の 2〜12 番は $INSTALL_DIR（--target-dir 未指定なら $ROOT、指定時は今回据え付けた
-# releases/<版> の最終パス）に対して行う。$TARGET_DIR（= current の symlink パス）へは
+# 以降の 2〜12 番は ${INSTALL_DIR}（--target-dir 未指定なら ${ROOT}、指定時は今回据え付けた
+# releases/<版> の最終パス）に対して行う。${TARGET_DIR}（= current の symlink パス）へは
 # マーカー削除後（13番）まで書かない。
 # ---------------------------------------------------------------------------
 _step "1. アプリ本体"
@@ -575,7 +575,7 @@ elif [ -f "$INSTALL_DIR/.env.example" ]; then
   cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
   ok ".env を作成しました（.env.example から）。冒頭「0. 本番チェックリスト」節を必ず設定してください: $INSTALL_DIR/.env"
 else
-  warn ".env.example が見つかりません（$INSTALL_DIR）。.env の初期作成をスキップします。"
+  warn ".env.example が見つかりません（${INSTALL_DIR}）。.env の初期作成をスキップします。"
 fi
 echo ""
 
@@ -752,7 +752,7 @@ if [ -f "$MARP_TARBALL" ]; then
   tar -xzf "$MARP_TARBALL" -C "$MARP_DEST"
   ok "marp-cli を展開しました: $MARP_DEST/node_modules"
 else
-  warn "marp-cli の tarball が見つかりません（$MARP_TARBALL）。オンライン側で収集していないためスキップします。"
+  warn "marp-cli の tarball が見つかりません（${MARP_TARBALL}）。オンライン側で収集していないためスキップします。"
 fi
 echo ""
 
@@ -828,7 +828,7 @@ if [ -f "$CHROMIUM_TARBALL" ]; then
     warn "Chromium システム依存の導入に失敗しました（本体は展開済み・PDF/PPTX 出力は失敗する可能性があります）。"
   fi
 else
-  warn "Playwright Chromium の tarball が見つかりません（$CHROMIUM_TARBALL）。オンライン側で収集していないためスキップします。"
+  warn "Playwright Chromium の tarball が見つかりません（${CHROMIUM_TARBALL}）。オンライン側で収集していないためスキップします。"
 fi
 echo ""
 
@@ -986,10 +986,10 @@ echo ""
 #     （--target-dir 使用時のみ・全工程完了後の最後の一歩）
 #
 # RV HIGH（2026-07-15 再々RV・核心／5巡目RVで finalize 手段を mv→マーカー削除に変更）:
-# ここまでの 2〜12 番は全部 $INSTALL_DIR（今回据え付けた releases/<版> の最終パス。venv 等の
+# ここまでの 2〜12 番は全部 ${INSTALL_DIR}（今回据え付けた releases/<版> の最終パス。venv 等の
 # 絶対パスは既にこの最終パスで焼き込まれている）に対して行ってきた。releases/<版> が
 # 「本物の完成版」を名乗るのは検証まで全部成功してマーカーを消した瞬間、current
-# （$TARGET_DIR）を新しい版へ向けるのはさらにその後の、この最後の一歩だけにする。
+# （${TARGET_DIR}）を新しい版へ向けるのはさらにその後の、この最後の一歩だけにする。
 # 途中のどこかで失敗していれば（最終検証 NG も含め）current は元の版のまま無傷・
 # releases/<版> にはマーカーが残ったまま＝ --list-releases/--rollback-to には出ない
 # （次回同じ版名で再実行すれば rm -rf されて作り直される）。
@@ -1032,7 +1032,7 @@ if [ -n "$PENDING_MARKER_PATH" ]; then
         0) ok "切替前のバックアップを取りました: $_BK_DIR/（最新の <日時>/・戻すには make restore FROM=<そのdir>）" ;;
         3) warn "バックアップ未取得（ストア/アプリ稼働中）。更新前の1点を残すには make stop && make backup を推奨します。"
            warn "  （このまま current の切替は続行します。旧版へ戻す際、DB の状態は保証されません）" ;;
-        *) fail "切替前のバックアップに失敗したため（exit=$_BK_RC）、版の確定と current の切替を中止します。"
+        *) fail "切替前のバックアップに失敗したため（exit=${_BK_RC}）、版の確定と current の切替を中止します。"
            fail "  $TARGET_DIR は元の版のままです。原因を直して同じ導入を再実行してください。"
            VERIFY_FAILED=1 ;;
       esac

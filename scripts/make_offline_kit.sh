@@ -19,7 +19,7 @@
 #  11. OCR（画像内文字の読み取り・既定ON）＝隔離ワーカーのイメージ＋専用 wheel＋モデル。
 #  14. Codex CLI（npm 導入済みツリー・linux-x64 静的バイナリ込み。--skip-codex で除外）
 #
-# apt 系収集（3・5・7・9のdeps・10）は既定で「素の対象OSコンテナ内」で行う（$APT_BASE_IMAGE）。
+# apt 系収集（3・5・7・9のdeps・10）は既定で「素の対象OSコンテナ内」で行う（${APT_BASE_IMAGE}）。
 # `apt-get install --download-only` は収集マシンの導入済み状態を基準に依存解決するため、収集マシンに
 # 既に入っているパッケージの .deb は集まらない＝まっさらな閉域ホストで依存不足になりうる。素のコンテナで
 # 行えばこの問題を回避でき、sudo も不要（docker 権限のみ）。Docker が無い収集マシンではフォールバックとして
@@ -152,7 +152,7 @@ _apt_collect_debs() {
     _apt_write_packages "$packages" "$dest_dir"
     return 0
   fi
-  note "docker run --rm $APT_BASE_IMAGE（素の対象OSコンテナ）で [$packages] を download-only 収集します..."
+  note "docker run --rm ${APT_BASE_IMAGE}（素の対象OSコンテナ）で [$packages] を download-only 収集します..."
   # R3: コンテナ内は root 実行のため、素のまま書き出すと bind mount 先（ホスト側）の .deb が
   # root 所有になり、再実行時に一般ユーザー権限の reset_dir()（rm -rf）が失敗して --fetch の
   # 冪等性が壊れる。コンテナ内で呼び出し側ユーザーの uid:gid へ chown してから抜ける。
@@ -189,7 +189,7 @@ _apt_write_packages() {  # $1=名前（空白区切り） $2=dest_dir
 # software-properties-common …）が導入済みで、キット側の .deb（例: Chromium 依存の libglib2.0-0t64 新版）が
 # それらの**上げ先**を要求する。上げ先が索引に無いと apt は「その群を削除して ubuntu-server も削除」で辻褄を
 # 合わせようとし、--no-remove で fail-close（実機は無傷だがその群は入らない）。よって最小イメージの閉包に
-# 加えて $BASE_CLOSURE_PACKAGES（既定: ubuntu-minimal ubuntu-standard ubuntu-server）を --download-only で
+# 加えて ${BASE_CLOSURE_PACKAGES}（既定: ubuntu-minimal ubuntu-standard ubuntu-server）を --download-only で
 # **追加収集**し、実機の導入済み集合の上げ先も base/debs に含める（導入はしない＝コンテナは肥大しない。
 # 実機での手当て BASE_CLOSURE_PACKAGES 導入で 92→583 個・解消を確認）。
 #
@@ -394,11 +394,11 @@ _check_python_version_match() {  # $1=収集に使う python の major.minor
     # 特定できないなら収集そのものを止める（既存の SHERPA_ALLOW_PY_MISMATCH=1 を明示 escape hatch
     # として、そのときだけ警告で続行する＝不一致が確認できた場合と同じ緩和経路に揃える）。
     if [ "${SHERPA_ALLOW_PY_MISMATCH:-0}" = 1 ]; then
-      warn "対象 OS（$APT_BASE_IMAGE）の python3 版を特定できませんが SHERPA_ALLOW_PY_MISMATCH=1 のため照合をスキップして続行します（wheel の ABI 不一致で閉域で壊れ得ます）。"
+      warn "対象 OS（${APT_BASE_IMAGE}）の python3 版を特定できませんが SHERPA_ALLOW_PY_MISMATCH=1 のため照合をスキップして続行します（wheel の ABI 不一致で閉域で壊れ得ます）。"
       return 0
     fi
-    fail "対象 OS（$APT_BASE_IMAGE）の python3 版を特定できませんでした（docker 不通・apt-cache 無し・BASELINE 未整備のいずれか）。"
-    fail "  収集側 Python（$host_mm）が閉域側の python3 と ABI 一致するか確認できないため、収集を中止します。"
+    fail "対象 OS（${APT_BASE_IMAGE}）の python3 版を特定できませんでした（docker 不通・apt-cache 無し・BASELINE 未整備のいずれか）。"
+    fail "  収集側 Python（${host_mm}）が閉域側の python3 と ABI 一致するか確認できないため、収集を中止します。"
     fail "  対処: docker を復旧する（daemon 起動・レジストリへ到達可能にする）か、apt-cache が使える機体で"
     fail "        実行するか、承知の上なら SHERPA_ALLOW_PY_MISMATCH=1 を付けてください。"
     return 1
@@ -411,7 +411,7 @@ _check_python_version_match() {  # $1=収集に使う python の major.minor
     warn "収集側 Python $host_mm と対象 OS の python3 $target_mm が不一致ですが SHERPA_ALLOW_PY_MISMATCH=1 のため続行します（wheel の ABI 不一致で閉域で壊れ得ます）。"
     return 0
   fi
-  fail "収集側 Python（$host_mm）と対象 OS（$APT_BASE_IMAGE）の python3（$target_mm）の major.minor が一致しません。"
+  fail "収集側 Python（${host_mm}）と対象 OS（${APT_BASE_IMAGE}）の python3（${target_mm}）の major.minor が一致しません。"
   fail "  このまま集めた wheel は閉域側の python3 では入りません（ABI 不一致）。収集を中止します。"
   fail "  対処: docker のある機体で実行する（既定で素のコンテナ内の python3 で pip download する）か、"
   fail "        PYTHON_BIN=python$target_mm を指定するか、承知の上なら SHERPA_ALLOW_PY_MISMATCH=1 を付けてください。"
@@ -427,7 +427,7 @@ _pip_download_wheels() {
   mkdir -p "$dest"
   if [ "$WHEELS_IN_CONTAINER" = 1 ]; then
     [ -n "$cons" ] && cons_opt=(-c "/src/$cons")
-    note "docker run --rm $APT_BASE_IMAGE（素の対象OSコンテナ・python3-pip 導入）で pip download -r $req ${cons:+-c $cons} → $dest"
+    note "docker run --rm ${APT_BASE_IMAGE}（素の対象OSコンテナ・python3-pip 導入）で pip download -r $req ${cons:+-c $cons} → $dest"
     docker run --rm -v "$ROOT:/src:ro" -v "$dest:/out" "$APT_BASE_IMAGE" bash -c "
       set -e
       export DEBIAN_FRONTEND=noninteractive
@@ -717,7 +717,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_FONTS" != 1 ]; then
     if curl -fsSL "$HACKGEN_URL" -o "$OUT/fonts/hackgen/$(basename "$HACKGEN_URL")"; then
       ok "HackGen（zip）: $OUT/fonts/hackgen/$(basename "$HACKGEN_URL")"
     else
-      warn "HackGen のダウンロードに失敗しました: $HACKGEN_URL（収集を継続します）。"
+      warn "HackGen のダウンロードに失敗しました: ${HACKGEN_URL}（収集を継続します）。"
     fi
   else
     warn "HackGen の最新リリース URL を解決できませんでした（GitHub API 制限・ネットワーク不通の可能性・収集を継続します）。"
@@ -744,7 +744,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_NODE" != 1 ]; then
   note "Node.js v${NODE_VERSION} を取得します: $NODE_URL"
   if curl -fsSL "$NODE_URL" -o "$OUT/node/$NODE_TARBALL" && curl -fsSL "$NODE_SHASUMS_URL" -o "$OUT/node/SHASUMS256.txt"; then
     if (cd "$OUT/node" && grep " $NODE_TARBALL\$" SHASUMS256.txt | sha256sum -c -); then
-      ok "Node.js: $OUT/node/$NODE_TARBALL（sha256 検証OK）"
+      ok "Node.js: $OUT/node/${NODE_TARBALL}（sha256 検証OK）"
     else
       fail "Node.js tarball の sha256 検証に失敗しました（改ざん・破損の疑い）。$OUT/node/ を確認してください。"
       exit 1
@@ -768,7 +768,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_NODE" != 1 ]; then
 elif [ "$SKIP_NODE" = 1 ]; then
   warn "--skip-node が指定されたため、Node.js/marp-cli の収集をスキップしました。"
 else
-  note "[計画] curl -fsSL $NODE_URL -o $OUT/node/$NODE_TARBALL（+ SHASUMS256.txt で sha256 検証）"
+  note "[計画] curl -fsSL $NODE_URL -o $OUT/node/${NODE_TARBALL}（+ SHASUMS256.txt で sha256 検証）"
   note "[計画] tools/marp/node_modules が無ければ npm --prefix tools/marp install @marp-team/marp-cli"
   note "  → tar czf $OUT/marp/tools-marp-node_modules.tar.gz"
   note "→ 実行するには --fetch を指定してください（--skip-node で除外可）。"

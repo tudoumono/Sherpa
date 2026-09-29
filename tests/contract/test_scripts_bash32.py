@@ -61,3 +61,17 @@ def test_linux_only_list_names_existing_scripts():
     names = {p.name for p in SCRIPTS.rglob("*.sh")}
     missing = sorted(LINUX_ONLY - names)
     assert not missing, f"対象外の一覧に無いスクリプトがあります: {missing}"
+
+
+# `$VAR` の直後に全角文字などの非 ASCII が続くと、macOS の bash はロケールによってその先頭バイトを
+# 変数名に取り込み、`set -u` で止まる（Linux では起きない）。`${VAR}` と囲めば起きない。Linux 専用も含めて全部見る。
+_VAR_BEFORE_NON_ASCII = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]")
+
+
+def test_scripts_brace_variables_before_non_ascii():
+    found = [f"{path.relative_to(ROOT)}:{no}: {line.strip()}"
+             for path in sorted(SCRIPTS.rglob("*.sh"))
+             for no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+             if _VAR_BEFORE_NON_ASCII.search(line)]
+    assert not found, "変数の直後に非 ASCII の文字があります（${VAR} と囲んでください）:\n" + "\n".join(found)
+
