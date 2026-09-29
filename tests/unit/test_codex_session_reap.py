@@ -252,3 +252,24 @@ def test_kill_session_falls_back_to_killpg_without_pidfd(monkeypatch):
     PV._kill_session(4242)
 
     assert calls == [(4242, signal.SIGKILL)]
+
+
+def test_codex_launcher_dir_added_only_for_macos_symlink(monkeypatch, tmp_path):
+    """macOS で codex が symlink（Homebrew Cask 等）なら symlink 側のフォルダも読ませる。Linux は対象外。"""
+    import shutil
+    import sys
+
+    from sherpa.providers.codex import sandbox as SB
+    real_dir = tmp_path / "Caskroom" / "codex" / "0.0.0" / "bin"
+    real_dir.mkdir(parents=True)
+    (real_dir / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+    link_dir = tmp_path / "bin"
+    link_dir.mkdir()
+    (link_dir / "codex").symlink_to(real_dir / "codex")
+    monkeypatch.setattr(shutil, "which", lambda name: str(link_dir / "codex") if name == "codex" else None)
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert SB._codex_launcher_dir() == link_dir
+    assert SB._codex_install_root() == real_dir
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert SB._codex_launcher_dir() is None

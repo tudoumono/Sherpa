@@ -113,6 +113,15 @@ def codex_multi_agent_enabled(*, ollama_base_url: str | None, system_settings: d
     return True
 
 
+# 役割ファイルの developer_instructions（Codex(Ollama) 構成のみ・AGENTS.md の役割段落と同じ趣旨の要旨）。
+_WORKER_ROLE_INSTRUCTIONS = (
+    "あなたは下調べ役です。親から渡された項目について資料とソースを検索・精読し、"
+    "見つけた事実を根拠（資料・箇所）付きで返してください。推測は推測と明記してください。")
+_EVALUATOR_ROLE_INSTRUCTIONS = (
+    "あなたは見直し役です。親の下書きと根拠を別の観点から確かめ、根拠と食い違う主張や"
+    "確かめていない項目を具体的に指摘してください。")
+
+
 def _codex_worker_model(system_settings: dict | None = None, *, main_model: str | None = None,
                         ollama: bool = False) -> str:
     """`[agents.worker]` の `model` に使う値（S6 で `[agents.*]` を生成するときに呼ぶ）。
@@ -166,12 +175,22 @@ def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, work
     worker_path = d / "worker.toml"
     evaluator_path = d / "evaluator.toml"
     _provider_block = ("\n" + "\n".join(provider_lines) + "\n") if provider_lines else ""
+    # Codex(Ollama) 構成: 新しい Codex（0.158 で確認）は役割ファイルに developer_instructions が無いと
+    # 役割を黙って捨てる（multi_agent が効かない）。Ollama 構成に限って役割の要旨を書く
+    # （OpenAI/Azure 構成は確かめた版の書き方のまま変えない）。
+    _is_ollama = any('"sherpa-ollama"' in ln for ln in (provider_lines or []))
+    _worker_role = (f'developer_instructions = {_toml_str(_WORKER_ROLE_INSTRUCTIONS)}\n'
+                    if _is_ollama else "")
+    _evaluator_role = (f'developer_instructions = {_toml_str(_EVALUATOR_ROLE_INSTRUCTIONS)}\n'
+                       if _is_ollama else "")
     worker_path.write_text(
         f'model = {_toml_str(worker_model)}\n'
-        f'model_reasoning_effort = {_toml_str(worker_reasoning)}\n' + _provider_block, encoding="utf-8")
+        f'model_reasoning_effort = {_toml_str(worker_reasoning)}\n' + _worker_role + _provider_block,
+        encoding="utf-8")
     evaluator_path.write_text(
         f'model = {_toml_str(evaluator_model)}\n'
-        f'model_reasoning_effort = {_toml_str(evaluator_reasoning)}\n' + _provider_block, encoding="utf-8")
+        f'model_reasoning_effort = {_toml_str(evaluator_reasoning)}\n' + _evaluator_role + _provider_block,
+        encoding="utf-8")
     return str(worker_path), str(evaluator_path)
 
 
@@ -706,6 +725,22 @@ def _codex_install_root() -> Path | None:
     return real.parent
 
 
+def _codex_launcher_dir() -> Path | None:
+    """macOS で `codex` が symlink（Homebrew Cask 等）のとき、その symlink を置いたフォルダ。
+    Codex はサンドボックスの中で PATH から自分を起動し直すので、実体のフォルダ
+    （`_codex_install_root`）だけでなく symlink 側も読めないと Seatbelt に拒まれる。Linux
+    （bubblewrap）は実体側だけで動き、symlink を跨ぐ行は起動失敗の原因になるので対象外。"""
+    if sys.platform != "darwin":
+        return None
+    exe = shutil.which("codex")
+    if not exe or not Path(exe).is_symlink():
+        return None
+    d = Path(exe).parent
+    if d.resolve() != d or d == _codex_install_root():
+        return None
+    return d
+
+
 def _codex_bundled_rg_dir() -> Path | None:
     """Codex の導入先に同梱された ripgrep のフォルダ（`vendor/<triple>/codex-path`）。無ければ None。"""
     root = _codex_install_root()
@@ -856,6 +891,9 @@ def _write_codex_authoring_config(codex_home: Path, kb_roots: list, reason: str,
     _codex_root = _codex_install_root()
     if _codex_root is not None:
         lines.append(f'{_toml_str(str(_codex_root))} = "read"')
+    _codex_launcher = _codex_launcher_dir()
+    if _codex_launcher is not None:
+        lines.append(f'{_toml_str(str(_codex_launcher))} = "read"')
     # 裁定: Codex は層の指定を強制しない——直読は層に関係なく read（旧: mcp=True
     # かつ層限定のとき KB ルートを明示 deny していたが撤去。層のフィルタは MCP ツール側のみ）。
     # `direct_read_roots is not None` のときは `kb_roots` の代わりにそちらを read する
