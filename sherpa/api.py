@@ -1051,13 +1051,13 @@ def _warn_multi_worker_chat_turns():
 # lifespan.py:31 が `api._warn_browse_roots_missing()` を属性経由で直接呼ぶ起動処理のため api.py に
 # 残す（_browse_roots は sherpa.deps へ移動・上記で再エクスポート済みの裸名を呼ぶ）。
 def _warn_browse_roots_missing():
-    """フォルダ選択の許可ルート（既定 `/mnt`）が1つも存在しなければ起動時に警告する。
+    """フォルダ選択の許可ルート（既定 `/mnt:/srv:/home:/Users`）が1つも存在しなければ起動時に警告する。
 
-    既定 `/mnt` は WSL（Windows ドライブ自動マウント）前提で、素の Linux サーバでは
-    通常空か存在しない。取り込み登録の入口（`/fs/list`）が事実上使えないまま気付かれない
-    事故を防ぐため、`_warn_fixtures` 等と同じ流儀＝大警告のみ（fail-closed にはしない・
-    `SHERPA_BROWSE_ROOTS` で任意のルートを指せる環境もあり得るため起動は止めない）。
-    既定値そのものは変えない（警告追加のみ・非破壊）。
+    既定の `/mnt` は WSL（Windows ドライブ自動マウント）前提・`/Users` は macOS 前提で、
+    素の Linux サーバやコンテナでは通常どれも空か存在しない。取り込み登録の入口（`/fs/list`）が
+    事実上使えないまま気付かれない事故を防ぐため、`_warn_fixtures` 等と同じ流儀＝大警告のみ
+    （fail-closed にはしない・`SHERPA_BROWSE_ROOTS` で任意のルートを指せる環境もあり得るため
+    起動は止めない）。
     """
     import logging
     roots = _browse_roots()
@@ -1076,9 +1076,10 @@ def _warn_browse_roots_missing():
     log.warning(
         "\n" + "!" * 72 + "\n"
         "!! フォルダ選択のルート（%s）が存在しません。\n"
-        "!! Linux サーバ等（WSL の /mnt 自動マウント前提が成り立たない環境）では\n"
+        "!! Linux サーバ等（WSL の /mnt 自動マウント前提が成り立たない環境）や macOS では\n"
         "!! SHERPA_BROWSE_ROOTS 環境変数で資料フォルダの親ディレクトリを指定してください\n"
-        "!!   例: SHERPA_BROWSE_ROOTS=/srv/sherpa-data\n"
+        "!!   例（Linux サーバ）: SHERPA_BROWSE_ROOTS=/srv/sherpa-data\n"
+        "!!   例（macOS）:       SHERPA_BROWSE_ROOTS=/Users\n"
         + "!" * 72,
         ":".join(str(r) for r in roots))
 

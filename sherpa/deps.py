@@ -248,12 +248,12 @@ def _client_ip_hash(request: Request) -> str | None:
 # （lifespan 起動処理）が共用するため deps.py へ移動。
 
 def _browse_roots() -> list:
-    """フォルダ選択で辿れるルート（既定 `/mnt:/srv:/home`）。`SHERPA_BROWSE_ROOTS`（`:`区切り）で設定可。
+    """フォルダ選択で辿れるルート（既定 `/mnt:/srv:/home:/Users`）。`SHERPA_BROWSE_ROOTS`（`:`区切り）で設定可。
 
-    既定は実データの置き場の定番3箇所（/mnt=Windowsドライブ・SMBマウント、/srv=サーバ配置、
-    /home=ユーザー領域）に限る（2026-09-04 裁定）。`/` を既定にしない——登録＝共有KBへの公開
-    （鏡モデル）であり、/etc 等のシステム領域を誤登録すると全利用者へ晒される。roots は
-    フォルダ閲覧/登録パス検証の封じ込め境界でもある（secRV）。
+    既定は実データの置き場の定番4箇所（/mnt=Windowsドライブ・SMBマウント、/srv=サーバ配置、
+    /home=ユーザー領域、/Users=macOS のユーザー領域）に限る。
+    `/` を既定にしない——登録＝共有KBへの公開（鏡モデル）であり、/etc 等のシステム領域を誤登録すると
+    全利用者へ晒される。roots はフォルダ閲覧/登録パス検証の封じ込め境界でもある（secRV）。
 
     空セグメント（例 `SHERPA_BROWSE_ROOTS=/srv/data:` の末尾など）は除外する。
     `Path("")` は cwd 扱いになり、警告抑止や許可ルートへの意図しない cwd 混入を招くため。
@@ -261,7 +261,7 @@ def _browse_roots() -> list:
     """
     env = os.environ.get("SHERPA_BROWSE_ROOTS")
     segments = [p for p in env.split(":") if p] if env else []
-    return [Path(p) for p in (segments or ["/mnt", "/srv", "/home"])]
+    return [Path(p) for p in (segments or ["/mnt", "/srv", "/home", "/Users"])]
 
 
 def _under_roots(p: Path, roots) -> bool:

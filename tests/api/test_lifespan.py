@@ -1541,6 +1541,17 @@ def test_warn_browse_roots_missing_survives_is_dir_exception(monkeypatch, caplog
     assert any("フォルダ選択のルート" in r.message for r in caplog.records)
 
 
+def test_warn_browse_roots_missing_mentions_macos_example(monkeypatch, caplog):
+    """全ルート不在の警告文には macOS 向けの直し方（`SHERPA_BROWSE_ROOTS=/Users`）も含む
+    （既定ルートに /Users を足しても、コンテナ等でどれも無いケースは残るため案内は必要）。"""
+    import logging
+    monkeypatch.delenv("SHERPA_BROWSE_ROOTS", raising=False)
+    monkeypatch.setattr("pathlib.Path.is_dir", lambda self: False)
+    with caplog.at_level(logging.WARNING, logger="sherpa"):
+        api._warn_browse_roots_missing()
+    assert any("SHERPA_BROWSE_ROOTS=/Users" in r.message for r in caplog.records)
+
+
 def test_browse_roots_excludes_empty_segments(monkeypatch):
     """`SHERPA_BROWSE_ROOTS=/missing:` のような末尾コロンで生じる空セグメントは除外する
     （`Path("")` は cwd 扱いになり、警告抑止や許可ルートへの意図しない cwd 混入を招くため）。"""
@@ -1549,10 +1560,11 @@ def test_browse_roots_excludes_empty_segments(monkeypatch):
 
 
 def test_browse_roots_falls_back_to_default_when_all_segments_empty(monkeypatch):
-    """全セグメントが空（例 `SHERPA_BROWSE_ROOTS=:`）なら既定 `/mnt:/srv:/home` にフォールバックする
-    （既定の3ルートは2026-09-04裁定・`deps._browse_roots` docstring 参照）。"""
+    """全セグメントが空（例 `SHERPA_BROWSE_ROOTS=:`）なら既定 `/mnt:/srv:/home:/Users` にフォールバックする
+    （既定の4ルートは2026-09-04裁定＋macOS対応の/Users追加・`deps._browse_roots` docstring 参照）。"""
     monkeypatch.setenv("SHERPA_BROWSE_ROOTS", ":")
-    assert api._browse_roots() == [api.Path("/mnt"), api.Path("/srv"), api.Path("/home")]
+    assert api._browse_roots() == [
+        api.Path("/mnt"), api.Path("/srv"), api.Path("/home"), api.Path("/Users")]
 
 
 # ---- ② poller の有効/無効 ----
