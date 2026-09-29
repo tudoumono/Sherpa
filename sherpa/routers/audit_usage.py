@@ -14,15 +14,16 @@ import io
 import json
 import logging
 import math
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from sherpa import store, usage_chat
+from sherpa import app_version, store, usage_chat, usage_export
 from sherpa.deps import _current_user, _require_admin
 from sherpa.schemas import (
     AdminAuditListResponse,
@@ -31,6 +32,7 @@ from sherpa.schemas import (
     AdminUsageStatsResponse,
     UsageChatResponse,
 )
+from sherpa.store.usage import usage_export_aux_calls, usage_export_turns
 
 _log = logging.getLogger("sherpa")
 
@@ -300,6 +302,59 @@ def admin_usage_stats(request: Request, days: int = Query(30, ge=1, le=365),
         _log.critical("audit write failed for admin.usage_viewed – fail-closed")
         raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed）")
     return result
+
+
+@audit_usage_router.get("/admin/usage/export", tags=["管理者:利用統計"])
+def admin_usage_export(request: Request, days: int = Query(30, ge=1, le=365),
+                       time_from: str | None = Query(None, alias="from"),
+                       time_to: str | None = Query(None, alias="to")):
+    """利用明細エクスポート（ZIP・管理者のみ）。画面が表示している期間の回答明細を1つの ZIP に
+    まとめて返す——質問・回答の本文・会話タイトル・参照した資料・ツールの引数は含めない
+    （会話番号・回答番号で DB や `make turn-activity CONV=<会話番号>` と突き合わせる調査用途）。
+
+    期間の受け方は `GET /admin/usage/stats` と完全に同じ（`days` の明示指定と `from`/`to` の
+    同時指定は422・`from`/`to` は両方必須・半開区間 `[from, to)`・最大365日）。閲覧と同じ流儀で
+    `admin.usage_exported`（detail は期間だけ）を fail-closed で監査する。
+    """
+    u = _current_user(request)
+    _require_admin(u)
+    if (time_from is not None or time_to is not None) and "days" in request.query_params:
+        raise HTTPException(422, "days と from/to は同時に指定できません")
+    try:
+        summary = store.usage_stats(days=days, time_from=time_from, time_to=time_to)
+        turn_rows = usage_export_turns(days=days, time_from=time_from, time_to=time_to)
+        aux_rows = usage_export_aux_calls(days=days, time_from=time_from, time_to=time_to)
+    except store.UsagePeriodError as e:
+        raise HTTPException(422, str(e)) from None
+
+    # ZIP は数十MBになり得るため、一時ファイル（大きければディスクへ退避）に書き、少しずつ返す。
+    buf = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
+    try:
+        usage_export.build_export_zip(
+            buf, summary=summary, turn_rows=turn_rows, aux_rows=aux_rows,
+            retrieved_at=datetime.now(timezone.utc), app_ver=app_version.current())
+        detail = {"days": days} if time_from is None and time_to is None else {"from": time_from, "to": time_to}
+        try:
+            store.audit(u["uid"], "admin.usage_exported", "usage", None, detail=detail,
+                        outcome="success", severity="info")
+        except Exception:
+            _log.critical("audit write failed for admin.usage_exported – fail-closed")
+            raise HTTPException(500, "監査ログの記録に失敗しました（fail-closed）") from None
+    except BaseException:
+        buf.close()
+        raise
+
+    def _chunks():
+        try:
+            buf.seek(0)
+            while chunk := buf.read(1024 * 1024):
+                yield chunk
+        finally:
+            buf.close()
+
+    filename = f"usage-detail-{summary['period']['start']}-{summary['period']['end']}.zip"
+    return StreamingResponse(_chunks(), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @audit_usage_router.post("/admin/usage/quality-runs", tags=["管理者:利用統計"],

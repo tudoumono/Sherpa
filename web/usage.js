@@ -1,4 +1,4 @@
-// 利用統計画面（admin 専用）。GET /admin/usage/stats?days= でユーザー別/全体の利用量を集計表示する。
+// 利用統計画面（admin 専用）。GET /admin/usage/stats?days=（または from/to）でユーザー別/全体の利用量を集計表示する。
 // 狙い＝よく使うユーザーを見つけてヒアリング候補にする（本文・タイトルは API 側で一切返さない）。
 // セキュリティ: server data は全て esc()。data-* 委譲でインライン handler なし。
 'use strict';
@@ -43,16 +43,56 @@ function stopKindLabel(k) { return STOP_KIND_LABEL[k] || k; }
 let _stats = null;
 let _loadedAt = null;
 const USAGE_TABS = ['overview', 'users', 'quality', 'tokens', 'ask'];
+// 期間は {days}（7/30/90）か {start, end}（JST 暦日・両日を含む）。URL の # に同じ形で持つ。
+const PERIOD_MAX_DAYS = 365;   // API の from/to の上限と同じ
+function dateSerial(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s || '')) return null;
+  const [y, m, d] = s.split('-').map(Number);
+  const t = Date.UTC(y, m - 1, d);
+  return new Date(t).toISOString().slice(0, 10) === s ? t / 86400000 : null;
+}
+function nextDate(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+}
+function todayJst() {
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Tokyo' }).format(new Date());
+}
+function rangeError(start, end) {
+  const a = dateSerial(start), b = dateSerial(end);
+  if (a === null || b === null) return '開始日と終了日を入れてください';
+  if (a > b) return '開始日は終了日以前にしてください';
+  if (b > dateSerial(todayJst())) return '終了日は今日以前にしてください';
+  if (b - a + 1 > PERIOD_MAX_DAYS) return `期間は最大${PERIOD_MAX_DAYS}日です`;
+  return '';
+}
+// p が null＝URL の期間指定が不正で未取得（タブ移動などは不正な指定をそのまま引き継ぐ）。
+let _invalidPeriodQuery = 'days=30';
+function periodQuery(p) { return !p ? _invalidPeriodQuery : p.start ? `start=${p.start}&end=${p.end}` : `days=${p.days}`; }
+// API へ渡す期間クエリ（URL の # とは別の組み立て＝開始日は JST の日初から、終了日の翌日の日初
+// まで・API は半開区間 [from, to)）。集計取得（load）と明細ZIP保存の両方がこれを使う——
+// 現在表示している期間と食い違う range を送らない。
+function periodApiQuery(period) {
+  return period.start
+    ? `from=${encodeURIComponent(`${period.start}T00:00:00+09:00`)}&to=${encodeURIComponent(`${nextDate(period.end)}T00:00:00+09:00`)}`
+    : `days=${encodeURIComponent(period.days)}`;
+}
+function periodText(p) { return p.start ? `${p.start} ～ ${p.end}` : `${p.days}日間`; }
 function usageView() {
   const [tab, query] = location.hash.slice(1).split('?');
-  const days = Number(new URLSearchParams(query).get('days'));
-  return { tab: USAGE_TABS.includes(tab) ? tab : 'overview', days: [7, 30, 90].includes(days) ? days : 30 };
+  const q = new URLSearchParams(query);
+  const days = Number(q.get('days'));
+  const start = q.get('start'), end = q.get('end');
+  const hasRange = q.has('start') || q.has('end');
+  const periodError = hasRange ? rangeError(start, end) : '';
+  const period = hasRange && !periodError ? { start, end } : { days: [7, 30, 90].includes(days) ? days : 30 };
+  return { tab: USAGE_TABS.includes(tab) ? tab : 'overview', period, periodError, start, end };
 }
-let _days = usageView().days;
+let _period = usageView().periodError ? null : usageView().period;
 function showUsageTab(tab) {
   const standalone = $('usage-standalone');
   standalone.hidden = !new URLSearchParams(location.search).has('embed');
-  standalone.href = `usage.html#${tab}?days=${_days}`;
+  standalone.href = `usage.html#${tab}?${periodQuery(_period)}`;
   document.querySelectorAll('[data-usage-panel]').forEach((el) => { el.hidden = el.dataset.usagePanel !== tab; });
   document.querySelectorAll('[data-usage-tab]').forEach((el) => {
     const selected = el.dataset.usageTab === tab;
@@ -60,11 +100,35 @@ function showUsageTab(tab) {
     el.tabIndex = selected ? 0 : -1;
   });
   document.querySelectorAll('[data-usage-link]').forEach((el) => {
-    el.href = `#${el.dataset.usageLink}?days=${_days}`;
+    el.href = `#${el.dataset.usageLink}?${periodQuery(_period)}`;
   });
 }
-function navigateUsage(tab, days = _days) {
-  location.hash = `${tab}?days=${days}`;
+function navigateUsage(tab, period = _period) {
+  location.hash = `${tab}?${periodQuery(period)}`;
+}
+function selectPeriod(period) {
+  if (_period && periodQuery(period) === periodQuery(_period)) load(period);
+  else navigateUsage(usageView().tab, period);
+}
+// URL の期間指定が不正なら取得せず、理由を出す（別の期間を選ぶと取得する）。
+function showPeriodError(view) {
+  _loadSeq++;   // 取得中の応答は捨てる
+  _period = null;
+  _invalidPeriodQuery = new URLSearchParams({ start: view.start || '', end: view.end || '' }).toString();
+  _stats = null;
+  $('usage-export').disabled = true;
+  $('usage-export-detail').disabled = true;
+  $('usage-stat-panels').hidden = true;
+  document.querySelectorAll('.period-bar .filterchip').forEach((b) => {
+    b.classList.remove('on');
+    b.setAttribute('aria-pressed', 'false');
+  });
+  $('period-start').value = view.start || '';
+  $('period-end').value = view.end || '';
+  $('period-range-error').textContent = view.periodError;
+  $('usage-period-label').textContent = '期間の指定に誤りがあります';
+  $('usage-load-status').textContent = `${view.periodError}。期間を選び直してください。`;
+  showUsageTab(view.tab);
 }
 document.querySelectorAll('[data-usage-tab]').forEach((btn) => {
   btn.addEventListener('click', () => navigateUsage(btn.dataset.usageTab));
@@ -84,7 +148,8 @@ document.querySelectorAll('[data-usage-tab]').forEach((btn) => {
 let _adminReady = false;
 window.addEventListener('hashchange', () => {
   const view = usageView();
-  if (_adminReady && view.days !== _days) load(view.days);
+  if (_adminReady && view.periodError) showPeriodError(view);
+  else if (_adminReady && (!_period || periodQuery(view.period) !== periodQuery(_period))) load(view.period);
   showUsageTab(view.tab);
 });
 showUsageTab(usageView().tab);
@@ -925,23 +990,28 @@ function setLoading() {
 }
 
 // ===== データ取得 =====
-async function load(days) {
+async function load(period) {
   const seq = ++_loadSeq;   // このリクエストの連番（連打時、最新以外の描画は破棄する）
-  _days = days;
+  _period = period;
   _stats = null;
+  $('period-range-error').textContent = '';
   _loadedAt = null;
   $('usage-export').disabled = true;
+  $('usage-export-detail').disabled = true;
   $('usage-stat-panels').hidden = true;
-  $('usage-period-label').textContent = `${days}日間を取得中…`;
+  $('usage-period-label').textContent = `${periodText(period)}を取得中…`;
   $('usage-load-status').textContent = '利用統計を読み込んでいます…';
   setLoading();
   $('review-stats').textContent = '見直しの集計を読み込んでいます…';
   document.querySelectorAll('.period-bar .filterchip').forEach((b) => {
-    b.classList.toggle('on', Number(b.dataset.days) === days);
-    b.setAttribute('aria-pressed', String(Number(b.dataset.days) === days));
+    const on = !period.start && Number(b.dataset.days) === period.days;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
   });
+  if (period.start) { $('period-start').value = period.start; $('period-end').value = period.end; }
+  const query = periodApiQuery(period);
   try {
-    const d = await getJSON('/admin/usage/stats?days=' + encodeURIComponent(days));
+    const d = await getJSON('/admin/usage/stats?' + query);
     if (seq !== _loadSeq) return;   // 後から連打された別リクエストが既に最新＝このレスポンスは古い
     // 画面とJSON保存で同じ範囲を共有する（サーバのトークン降順を維持）。
     if (d.tokens?.by_user) d.tokens.by_user = d.tokens.by_user.slice(0, 10);
@@ -965,14 +1035,19 @@ async function load(days) {
     _stats = d;
     _loadedAt = new Date().toISOString();
     $('usage-period-label').textContent = `${d.period.start} ～ ${d.period.end}（JST・終了日を含む）`;
+    if (!$('period-range-error').textContent) {   // 送信前に弾いた入力と理由は残す
+      $('period-start').value = d.period.start;
+      $('period-end').value = d.period.end;
+    }
     $('usage-load-status').textContent = `取得時刻: ${new Date(_loadedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })} JST`;
     $('usage-stat-panels').hidden = false;
     $('usage-export').disabled = false;
+    $('usage-export-detail').disabled = false;
     $('usage-tbody').setAttribute('aria-busy', 'false');
     showUsageTab(usageView().tab);
   } catch (e) {
     if (seq !== _loadSeq) return;
-    $('usage-period-label').textContent = `${days}日間（取得失敗）`;
+    $('usage-period-label').textContent = `${periodText(period)}（取得失敗）`;
     $('usage-load-status').textContent = `利用統計を取得できませんでした: ${String(e)}。期間ボタンで再取得できます。`;
     $('usage-tbody').setAttribute('aria-busy', 'false');
     $('usage-tbody').innerHTML = `<tr><td colspan="8" style="color:var(--danger);padding:16px">読み込みに失敗しました: ${esc(String(e))}</td></tr>`;
@@ -992,13 +1067,48 @@ $('usage-export').addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
+$('usage-export-detail').addEventListener('click', async () => {
+  const btn = $('usage-export-detail');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '作成中…';
+  $('usage-load-status').textContent = '明細ZIPを作成しています…';
+  try {
+    const r = await fetch('/admin/usage/export?' + periodApiQuery(_period));
+    if (!r.ok) {
+      let data = null;
+      try { data = await r.json(); } catch (_) { data = null; }
+      throw new Error((data && data.detail) || `エラー (${r.status})`);
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get('content-disposition') || '';
+    const m = cd.match(/filename="([^"]+)"/);
+    const name = m ? m[1] : 'usage-detail.zip';
+    Sherpa.downloadBlob(blob, name);
+    $('usage-load-status').textContent = `明細ZIPを保存しました: ${name}`;
+  } catch (e) {
+    $('usage-load-status').textContent = `明細ZIPの作成に失敗しました: ${String(e)}`;
+    toast('明細ZIPの作成に失敗しました');
+  } finally {
+    btn.disabled = !_stats;   // 作成中に期間が変わり読み込みが失敗していたら押せる状態へ戻さない
+    btn.textContent = label;
+  }
+});
+
 // ===== イベント =====
 document.querySelectorAll('.period-bar .filterchip').forEach((b) => {
   b.addEventListener('click', () => {
-    const days = Number(b.dataset.days);
-    if (days === _days) load(days);
-    else navigateUsage(usageView().tab, days);
+    selectPeriod({ days: Number(b.dataset.days) });
   });
+});
+$('period-start').max = todayJst();
+$('period-end').max = todayJst();
+$('period-range').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const start = $('period-start').value, end = $('period-end').value;
+  const error = rangeError(start, end);
+  if (error) { $('period-range-error').textContent = error; return; }
+  selectPeriod({ start, end });
 });
 
 document.querySelectorAll('th.sortable').forEach((th) => {
@@ -1398,5 +1508,7 @@ ucUpdateOpenaiKeyHint();      // A7 未確認のうちは非表示
     return;
   }
   _adminReady = true;
-  await Promise.all([ucLoadSettings(), load(usageView().days)]);
+  const view = usageView();
+  if (view.periodError) showPeriodError(view);
+  await Promise.all([ucLoadSettings(), view.periodError ? null : load(view.period)]);
 })();

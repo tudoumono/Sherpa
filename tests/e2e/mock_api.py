@@ -1697,6 +1697,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "bedrock_models_verify": [],
         "admin_health": [],
         "admin_usage_stats": [],
+        "admin_usage_export": [],
         "world_diff": [],
         "world_register": [],
         "world_refresh": [],
@@ -1758,6 +1759,18 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             if current_user.get("role") != "admin":
                 return _json(route, {"detail": "管理者権限が必要です"}, status=403)
             return _json(route, usage_stats_resp)
+        if method == "GET" and path == "/admin/usage/export":
+            records["admin_usage_export"].append(query)
+            if current_user.get("role") != "admin":
+                return _json(route, {"detail": "管理者権限が必要です"}, status=403)
+            return route.fulfill(
+                status=200,
+                body=b"PK\x05\x06" + b"\x00" * 18,   # 空ZIPの終端シグネチャ（中身の検証はしない）
+                headers={
+                    "content-type": "application/zip",
+                    "content-disposition": 'attachment; filename="usage-detail-20260601-20260630.zip"',
+                },
+            )
         if method == "GET" and path == "/admin/settings":
             if current_user.get("role") != "admin":
                 return _json(route, {"detail": "管理者権限が必要です"}, status=403)
@@ -2969,6 +2982,7 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/health/summary"),
     ("GET", "/admin/health"),
     ("GET", "/admin/usage/stats"),
+    ("GET", "/admin/usage/export"),
     ("GET", "/admin/settings"),
     ("PUT", "/admin/settings"),
     ("POST", "/admin/settings/openai-endpoint-test"),
