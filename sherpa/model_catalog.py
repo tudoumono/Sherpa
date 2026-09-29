@@ -37,13 +37,14 @@ _USAGE_FALLBACK = {"render": "extract"}
 
 # モデル名の文法（provider を問わない共通の下限・1〜128文字）。個人設定の自由入力欄
 # （`sherpa/routers/system.py::_MODEL_NAME_RE` は本定数を re-export する・二重定義しない）と
-# 同じパターンを使う。Codex だけは CLI 引数（argv `-m`）に渡すため、追加でより厳しい制約
-# （`:` 不可・64文字上限）を持つ（`sherpa/providers/codex/provider.py::CodexProvider.__init__`）。
+# 同じパターンを使う。Codex だけは CLI 引数（argv `-m`）に渡すため、追加で 64 文字の上限を持つ
+# （`sherpa/providers/codex/provider.py::CodexProvider.__init__`）。`:` は Codex（Ollama）の
+# モデルのタグ（例 gpt-oss:20b）に要るので許す（argv はシェルを通らず、config.toml へは `_toml_str` で書く）。
 # `validate_catalog` はここで両方を強制する＝管理者が保存できたモデル名が、個人設定の保存では
 # 拒否される／Codex では honest failure（`CodexProvider.__init__` の `ValueError`）になる、
 # という食い違いを防ぐ（管理者が保存できる値は、常にどの消費者でもそのまま使える）。
 MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\-]{0,127}")
-CODEX_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/\-]{0,63}")
+CODEX_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\-]{0,63}")
 
 
 class InvalidModelNameError(ValueError):

@@ -295,13 +295,9 @@ def test_validate_catalog_accepts_openai_model_name_up_to_128_chars():
     assert out["openai"]["chat"]["allowed"] == ["a" * 128]
 
 
-def test_validate_catalog_rejects_codex_model_name_with_colon():
-    """Codex は argv `-m` に渡すため、個人設定/カタログより厳しい文法（`:` 不可・64文字以内・
-    `CodexProvider.__init__` の `CODEX_MODEL_NAME_RE`）を持つ。カタログ側もこれに揃え、
-    Ollama の `sha256:abcd` のような他プロバイダでは有効な形式を codex 用途では拒否する。"""
-    import pytest
-    with pytest.raises(ValueError):
-        model_catalog.validate_catalog({"codex": {"codex": {"allowed": ["gpt-5.5:latest"], "default": ""}}})
+def test_validate_catalog_accepts_codex_ollama_model_tag_with_colon():
+    """Codex(Ollama) のモデルはタグ付き（例 gpt-oss:20b）が普通なので、codex 用途でも `:` を受け付ける。"""
+    model_catalog.validate_catalog({"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}})
 
 
 def test_validate_catalog_rejects_codex_model_name_over_64_chars():
@@ -325,7 +321,7 @@ def test_codex_model_name_re_matches_catalog_grammar():
 
 
 def test_codex_provider_rejects_invalid_nonempty_model_name_as_honest_failure():
-    """重大バグ是正（RV 3巡目 #9）: `validate_catalog` が拒否するのと同じ形（`:` を含む）を
+    """`validate_catalog` が拒否するのと同じ形（空白を含む）を
     `CodexProvider` に直接渡すと、黙って `gpt-5.5` へ置換せず `InvalidModelNameError`（honest
     failure・`ValueError` のサブクラス）を送出する。表示したモデルと実際に実行されるモデルが
     食い違う事故を防ぐ（呼び出し側は `sherpa/providers/__init__.py::_select_provider` が
@@ -334,7 +330,7 @@ def test_codex_provider_rejects_invalid_nonempty_model_name_as_honest_failure():
 
     from sherpa.providers.codex.provider import CodexProvider
     with pytest.raises(model_catalog.InvalidModelNameError):
-        CodexProvider(model="gpt-5.5:latest")
+        CodexProvider(model="gpt 5.5")
 
 
 def test_codex_provider_resolves_none_or_empty_model_to_default():
