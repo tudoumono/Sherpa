@@ -250,7 +250,7 @@ $('export-csv').addEventListener('click', () => exportAudit('csv'));
 $('export-jsonl').addEventListener('click', () => exportAudit('jsonl'));
 // フィルターで Enter → 検索
 ['f-actor', 'f-action'].forEach((id) => {
-  const el = $(id); if (el) el.addEventListener('keydown', (e) => { if (e.key === 'Enter') search(0); });
+  const el = $(id); if (el) el.addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') search(0); });
 });
 
 // テーマ切替

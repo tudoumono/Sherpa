@@ -177,7 +177,7 @@ with argv_log.open("a", encoding="utf-8") as f:
     f.write(repr(args) + "\n")
     f.flush()
 
-_prompt_text = args[-1] if args else ""
+_prompt_text = sys.stdin.read() if args and args[-1] == "-" else (args[-1] if args else "")
 if "TRIGGER_ASK_USER_BREAK" in _prompt_text:
     # RV再検証 LOW（2巡目）: ask_user で早期 break するターンの cleanup 検証用。resume の有無に
     # 関わらず（prompt 末尾の文言だけを見て）ask_user の mcp_tool_call を1件返して即終了する。

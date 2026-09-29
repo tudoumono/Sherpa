@@ -1046,3 +1046,65 @@ def test_ollama_configured_failure_still_warns(monkeypatch, caplog):
         out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
     assert out["ok"] is False
     assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ===== 埋め込みモデル未取得の検出（#45: 接続できても必要な埋め込みモデルが無いと BM25 のみへ
+# 黙って縮退するため、疎通確認とは別に明示的に報告する） =====
+
+class _FakeOllamaTagsResponse:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._payload
+
+
+def _tags_payload(*names: str) -> bytes:
+    import json
+    return json.dumps({"models": [{"name": n} for n in names]}).encode()
+
+
+def test_ollama_ping_ng_when_embed_model_missing_from_tags(monkeypatch):
+    """埋め込みが Ollama に解決され、かつ必要なモデルが `/api/tags` に無ければ、疎通自体は成功
+    していても ng になり、`ollama pull` の案内を含む。"""
+    from sherpa import embeddings, health, llm, store
+    monkeypatch.setattr(store, "get_system_settings", lambda: {"ollama_url": "http://127.0.0.1:11434"})
+    monkeypatch.setattr(llm, "urlopen_no_redirect",
+                        lambda url, timeout=None: _FakeOllamaTagsResponse(_tags_payload("qwen2.5:latest")))
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {
+        "provider": "ollama", "url": "http://127.0.0.1:11434", "model": "nomic-embed-text", "dim": 768})
+    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
+    assert out["ok"] is False
+    assert "nomic-embed-text" in out["detail"]
+    assert "ollama pull nomic-embed-text" in out["detail"]
+
+
+def test_ollama_ping_ok_when_embed_model_present_in_tags(monkeypatch):
+    """必要な埋め込みモデルが（暗黙の `:latest` を含めて）一覧にあれば ok のまま。"""
+    from sherpa import embeddings, health, llm, store
+    monkeypatch.setattr(store, "get_system_settings", lambda: {"ollama_url": "http://127.0.0.1:11434"})
+    monkeypatch.setattr(llm, "urlopen_no_redirect",
+                        lambda url, timeout=None: _FakeOllamaTagsResponse(
+                            _tags_payload("nomic-embed-text:latest")))
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {
+        "provider": "ollama", "url": "http://127.0.0.1:11434", "model": "nomic-embed-text", "dim": 768})
+    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
+    assert out["ok"] is True
+
+
+def test_ollama_ping_unaffected_when_embed_not_ollama(monkeypatch):
+    """埋め込みが Ollama 以外（未設定含む）の構成では、このチェック自体を行わない
+    （タグ一覧に何があっても ok のまま＝既存の疎通確認のみの挙動を変えない）。"""
+    from sherpa import embeddings, health, llm, store
+    monkeypatch.setattr(store, "get_system_settings", lambda: {"ollama_url": "http://127.0.0.1:11434"})
+    monkeypatch.setattr(llm, "urlopen_no_redirect",
+                        lambda url, timeout=None: _FakeOllamaTagsResponse(_tags_payload("qwen2.5:latest")))
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)
+    out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
+    assert out["ok"] is True

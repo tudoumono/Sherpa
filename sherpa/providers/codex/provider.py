@@ -701,6 +701,36 @@ def _spawn_stop_watcher(proc, stop_event, reap_lock, reaped) -> "threading.Threa
     return t
 
 
+def _spawn_wall_clock_watcher(proc, deadline_mono: float, reap_lock, reaped, hit_state: dict) -> "threading.Thread":
+    """1ターン全体（自動継続を含む）の壁時計上限。`deadline_mono`（`time.monotonic()` 基準）に
+    達したら `_spawn_stop_watcher` の停止操作分岐と同じ手順（`_killpg`→`_kill_session`）で
+    この attempt のプロセスを打ち切る——`reap_lock`/`reaped` を共有することで、`_attempt` の
+    finally（reap する側）・`_spawn_stop_watcher`（利用者の停止操作）と3者間で二重キルや
+    reap 後の pid 再利用への誤送信を避ける（判定は `reap_lock` の中で行う）。
+
+    `hit_state["hit"]`: 実際にこの関数が打ち切った時だけ True を書く（プロセスが期限前に
+    自然終了した場合は何もしない）。attempt をまたいで同じ dict を渡すことで、1ターンの
+    どの attempt で上限に達したかによらず呼び出し側が一箇所で判定できる。
+    """
+    def _watch(_proc=proc, _deadline=deadline_mono, _lock=reap_lock, _reaped=reaped, _hit=hit_state):
+        while True:
+            with _lock:
+                if _reaped["done"]:
+                    return
+            remaining = _deadline - time.monotonic()
+            if remaining <= 0:
+                with _lock:
+                    if not _reaped["done"]:
+                        _hit["hit"] = True
+                        _killpg(_proc)
+                        _kill_session(_proc.pid)
+                return
+            time.sleep(min(remaining, 0.3))
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t
+
+
 _LAST_MESSAGE_MAX_BYTES = 16 * 1024 * 1024   # 最終メッセージの保険読取のメモリ保護（回答の長さを切る目的ではない）
 
 
@@ -1645,6 +1675,9 @@ _DEMOTED_CLAIMS_NOTE = "一部の内容は必要な根拠の種別が揃って�
 # 成果物の move／台帳登録に1件でも失敗したとき、回答本文の末尾に付ける固定文
 # （`_created_files_failed` 判定・headline がどの分岐で組み立てられていても一律に付く）。
 _CREATED_FILES_FAILURE_NOTE = "（作成したファイルの一部を保存できませんでした。管理者に確認してください）"
+# 壁時計上限（`SHERPA_CODEX_WALL_CLOCK_LIMIT_S`）で打ち切った時に headline へ付ける注記
+# （`_created_files_failed` と同じ「どの分岐で組み立てられていても一律に付く」位置に付く）。
+_WALL_CLOCK_LIMIT_NOTE = "（時間の上限に達したため、ここまでの結果で打ち切りました）"
 
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
@@ -2066,6 +2099,11 @@ class CodexProvider(Provider):
         # ごとに更新）——準備（スキル配備・config生成）や後処理（子 usage 走査）を含めない。
         _agent_start_mono: float | None = None
         _agent_end_mono: float | None = None
+        # 1ターン全体（自動継続・台帳継続を含む）の壁時計上限（既定90分・0=無制限・
+        # `SHERPA_CODEX_WALL_CLOCK_LIMIT_S` で変更可）。`_agent_start_mono`（最初の Popen 開始）
+        # を起点にする——継続 attempt も同じ起点からの残り時間で打ち切る。
+        _wall_clock_limit_s = _env_int("SHERPA_CODEX_WALL_CLOCK_LIMIT_S", 90 * 60, 0, 24 * 3600)
+        _wall_clock_state = {"hit": False}   # いずれかの attempt が上限で打ち切られたら True（attempt をまたいで保持）
         # resume 試行が失敗し新規セッションへ切り替わったら True にする（if ブロックが丸ごと
         # スキップされる経路もあるためここで既定 False・usage のターン差分判定に使う）。
         _resume_fallback_happened = False
@@ -2693,18 +2731,21 @@ class CodexProvider(Provider):
                 # `_agent_end_mono` から）は最初の Popen・最後の wait が確定してから finally
                 # ブロックでまとめて計算する（ここではまだ `_agent_start_mono` が定まっていない）。
 
-                def _build_argv(use_resume: bool, prompt_text: str | None = None) -> list:
+                def _build_argv(use_resume: bool) -> list:
                     """resume 分岐は `codex exec resume [SESSION_ID] [PROMPT]` の位置引数どおり、
                     exec 共通オプションの後・末尾プロンプトの前に `resume <sid>` を挿む。resume 先 id は
                     `thread_id`（`thread.started` で捕捉した最新値）を優先し、未捕捉なら呼び出し時点の
                     `resume_sid` に落ちる（自動継続はフレッシュ実行で捕捉した thread_id で resume する）。
-                    `prompt_text` 省略時は通常の質問プロンプト（`prompt`）を使う（継続 attempt だけ別文言）。"""
+                    プロンプト本文は argv に載せず（同一ホストの他ユーザーが `ps` で読める）、
+                    プロンプト位置には `-` だけを置いて標準入力から読ませる（`codex exec --help`／
+                    `codex exec resume --help` の両方が明記する挙動）——本文は `_attempt` が Popen 後に
+                    `proc.stdin` へ書く。"""
                     av = list(argv_base)
                     if use_resume:
                         sid = thread_id or resume_sid
                         if sid:
                             av += ["resume", sid]
-                    av.append(prompt if prompt_text is None else prompt_text)
+                    av.append("-")
                     return av
 
                 got_any_line = False   # resume 試行で1行も --json イベントを受け取れなければ resume 失敗とみなす
@@ -2771,7 +2812,8 @@ class CodexProvider(Provider):
                                                      # item id は attempt（codex exec プロセス）ごとに振り直される）
                     _attempt_mcp_open: set = set()
                     _attempt_mcp_max_in_flight = 0
-                    argv = _build_argv(use_resume, prompt_text)
+                    argv = _build_argv(use_resume)
+                    _stdin_text = prompt if prompt_text is None else prompt_text
                     proc = None
                     # finally（reap する側）と監視スレッド（waitid で覗く側）の間で「回収済みか」
                     # を直列化する。回収済みの後は sid が再利用され得るため、回収の前後は
@@ -2796,12 +2838,35 @@ class CodexProvider(Provider):
                             _agent_start_mono = time.monotonic()
                         _stderr_f = tempfile.TemporaryFile()
                         proc = subprocess.Popen(
-                            argv, env=popen_env, cwd=str(run_dir), stdin=subprocess.DEVNULL,
+                            argv, env=popen_env, cwd=str(run_dir), stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=_stderr_f, text=True,
                             start_new_session=True)
+                        # プロンプト本文を標準入力へ書いて即座に閉じる（argv には `-` しか載っていない）。
+                        # 書き込みは別スレッドにする——本文が大きいと OS パイプバッファを
+                        # 埋めて書き込みがブロックし得るが、この関数自身は直後に `proc.stdout` を
+                        # 読み始める（ブロッキング read）ため、同じスレッドで書くと双方向で
+                        # ブロックし合うデッドロックになる。
+                        def _write_stdin(_p=proc, _text=_stdin_text):
+                            try:
+                                _p.stdin.write(_text)
+                            except Exception:
+                                pass
+                            finally:
+                                try:
+                                    _p.stdin.close()
+                                except Exception:
+                                    pass
+                        threading.Thread(target=_write_stdin, daemon=True).start()
                         # 途中停止の有無によらず常に起動する（別グループの子が pipe を握って
                         # 離さないケースの pipe 閉じ役も兼ねる・_spawn_stop_watcher 参照）。
                         _spawn_stop_watcher(proc, ctx.stop_event, _reap_lock, _reaped)
+                        if _wall_clock_limit_s > 0:
+                            # 1ターン全体（自動継続込み）の壁時計上限。`_agent_start_mono` は
+                            # このターンの最初の Popen 直前に確定済み（上のガード）——継続 attempt も
+                            # 同じ起点からの残り時間で打ち切る。
+                            _spawn_wall_clock_watcher(
+                                proc, _agent_start_mono + _wall_clock_limit_s, _reap_lock, _reaped,
+                                _wall_clock_state)
                         node_n = 0
                         for line in proc.stdout:
                             line = line.strip()
@@ -3315,7 +3380,7 @@ class CodexProvider(Provider):
                     # 1行以上出すようになっても取りこぼさないよう、「非ゼロ終了かつ agent_message が
                     # 1つも無い」場合も resume 失敗とみなす（`got_any_line` 単独判定の将来耐性・
                     # retry はこれまでどおり resume 試行時に1回だけ）。
-                    _stopped = ctx.stop_event is not None and ctx.stop_event.is_set()
+                    _stopped = (ctx.stop_event is not None and ctx.stop_event.is_set()) or _wall_clock_state["hit"]
                     _no_agent_output = not _agent_msgs and not _agent_partial
                     _resume_attempt_failed = (not got_any_line) or (
                         attempt_returncode not in (0, None) and _no_agent_output)
@@ -3378,7 +3443,9 @@ class CodexProvider(Provider):
                     # 比較・純関数）を見て、進捗があれば streak をリセットする。
                     _ledger_prev_snapshot: investigation_ledger.LedgerSnapshot | None = None
                     while True:
-                        _stopped_for_continue = ctx.stop_event is not None and ctx.stop_event.is_set()
+                        _stopped_for_continue = (
+                            (ctx.stop_event is not None and ctx.stop_event.is_set())
+                            or _wall_clock_state["hit"])
                         if codex_question is not None or _stopped_for_continue:
                             break
                         if not (_session_persistence_enabled and (thread_id or resume_sid)):
@@ -3846,9 +3913,10 @@ class CodexProvider(Provider):
                     pass
                 # codex exec を実際に起動した（attempt_returncode is not None＝Popen が完走した）
                 # にもかかわらず stdout に JSON を1行も出さず（got_any_line=False）、answer も得られない
-                # 場合だけ「正直に伝える」文言へ切り替える対象とする。ユーザーの stop_event による打ち切り
-                # は失敗ではないため対象外（途中で殺しただけで agent_message が無いのは想定内の挙動）。
-                _stopped_final = ctx.stop_event is not None and ctx.stop_event.is_set()
+                # 場合だけ「正直に伝える」文言へ切り替える対象とする。ユーザーの stop_event による打ち切り・
+                # 壁時計上限による打ち切り（`_wall_clock_state`）は失敗ではないため対象外（途中で殺した
+                # だけで agent_message が無いのは想定内の挙動）。
+                _stopped_final = (ctx.stop_event is not None and ctx.stop_event.is_set()) or _wall_clock_state["hit"]
                 # §2-10: 最新 attempt（継続 attempt を含む）が `turn.failed`／`error` で閉じ、
                 # その attempt 自身は agent_message を1つも出さなかった（`_agent_msgs[_attempt_msgs_start:]`
                 # も `_agent_partial` も空）場合、過去 attempt の（古い）回答が `answer` に残っていても
@@ -4320,6 +4388,11 @@ class CodexProvider(Provider):
                 # headline がどの分岐（answer/silent_failure/未応答）で組み立てられていても、
                 # 保存できなかった成果物がある事実は一律に伝える。
                 env["headline"] = f"{env['headline']}\n\n{_CREATED_FILES_FAILURE_NOTE}"
+            if _wall_clock_state["hit"]:
+                # headline がどの分岐で組み立てられていても、時間の上限で打ち切った事実は
+                # 一律に伝える。「打ち切りの内訳」（利用統計）へも記録する。
+                env["headline"] = f"{env['headline']}\n\n{_WALL_CLOCK_LIMIT_NOTE}"
+                env["limits"] = {**(env.get("limits") or {}), "wall_clock_hit": True}
             yield {"type": "answer_delta", "text": env["headline"]}   # Codex は一括→フロントで段階表示
             yield {"type": "_result", "env": env, "decision": decision}
         finally:

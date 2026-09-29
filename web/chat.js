@@ -263,7 +263,8 @@ $('forkbtn').addEventListener('click', () => {
 });
 
 $('send').addEventListener('click', sendOrStop);
-$('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+// IME の変換確定の Enter では送信しない（isComposing が無い組み合わせに備えて keyCode 229 も見る・usage.js と同じ）。
+$('input').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
 // コピー（メッセージ全体）。secure context 外では textarea フォールバック。
 // export: web/chat/share-dialog.js の共有URLコピーボタンから参照される

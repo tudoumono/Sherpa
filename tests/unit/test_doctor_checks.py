@@ -2255,18 +2255,20 @@ def test_resolve_ollama_usages_none_when_per_row_effective_agent_raises(monkeypa
 
 
 def test_resolve_ollama_usages_empty_when_nobody_uses_ollama(monkeypatch):
-    from sherpa import agent_constructs
+    from sherpa import agent_constructs, embeddings
     monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "openai")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
     rows = [{"agent": "openai", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
     assert doctor_checks._resolve_ollama_usages({}, rows) == []
 
 
 def test_resolve_ollama_usages_system_default_chat(monkeypatch):
-    from sherpa import agent_constructs, keys, model_catalog
+    from sherpa import agent_constructs, embeddings, keys, model_catalog
     monkeypatch.setattr(agent_constructs, "effective_agent",
                          lambda settings, **k: "ollama" if not settings else None)
     monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
     monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: f"{provider}-{usage}-model")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
     usages = doctor_checks._resolve_ollama_usages({}, [])
     assert len(usages) == 1
     assert usages[0]["url"] == "http://localhost:11434"
@@ -2275,12 +2277,13 @@ def test_resolve_ollama_usages_system_default_chat(monkeypatch):
 
 
 def test_resolve_ollama_usages_per_user_override_url(monkeypatch):
-    from sherpa import agent_constructs, keys, model_catalog
+    from sherpa import agent_constructs, embeddings, keys, model_catalog
     monkeypatch.setattr(agent_constructs, "effective_agent",
                          lambda settings, **k: (settings or {}).get("agent") or "openai")
     monkeypatch.setattr(keys, "resolve_ollama_url",
                          lambda settings, **k: (settings or {}).get("ollama_url") or "http://localhost:11434")
     monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: "chat-model")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
     rows = [{"agent": "ollama", "codex_model_provider": None,
             "ollama_url": "http://personal-ollama:11434", "search_helper": ""}]
     usages = doctor_checks._resolve_ollama_usages({}, rows)
@@ -2289,11 +2292,12 @@ def test_resolve_ollama_usages_per_user_override_url(monkeypatch):
 
 
 def test_resolve_ollama_usages_codex_ollama_backing_uses_codex_model(monkeypatch):
-    from sherpa import agent_constructs, keys, model_catalog
+    from sherpa import agent_constructs, embeddings, keys, model_catalog
     monkeypatch.setattr(agent_constructs, "effective_agent",
                          lambda settings, **k: (settings or {}).get("agent") or "openai")
     monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
     monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: f"{provider}-{usage}")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
     rows = [{"agent": "codex", "codex_model_provider": "ollama", "ollama_url": None, "search_helper": ""}]
     usages = doctor_checks._resolve_ollama_usages({}, rows)
     assert len(usages) == 1
@@ -2302,11 +2306,12 @@ def test_resolve_ollama_usages_codex_ollama_backing_uses_codex_model(monkeypatch
 
 
 def test_resolve_ollama_usages_search_helper_when_main_agent_is_openai(monkeypatch):
-    from sherpa import agent_constructs, search_helper
+    from sherpa import agent_constructs, embeddings, search_helper
     monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "openai")
     monkeypatch.setattr(search_helper, "resolve",
                          lambda settings, **k: {"provider": "ollama", "url": "http://localhost:11434",
                                                "model": "qwen2.5"})
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
     rows = [{"agent": "openai", "codex_model_provider": None, "ollama_url": None, "search_helper": "ollama"}]
     usages = doctor_checks._resolve_ollama_usages({}, rows)
     assert len(usages) == 1
@@ -2318,8 +2323,9 @@ def test_resolve_ollama_usages_search_helper_ignored_when_main_agent_not_openai(
     """検索ヘルパーは主頭脳が openai のときだけ実際に配線される
     （`sherpa/providers/__init__.py::get_provider` 参照）。主頭脳が codex/ollama の利用者の
     `search_helper` 列は runtime で一切評価されないため、ここでも解決を試みない。"""
-    from sherpa import agent_constructs, search_helper
+    from sherpa import agent_constructs, embeddings, search_helper
     monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "codex")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
 
     def _should_not_be_called(*a, **k):
         raise AssertionError("主頭脳が openai でないのに search_helper.resolve を呼んではいけない")
@@ -2390,17 +2396,74 @@ def test_resolve_ollama_usages_none_when_search_helper_resolve_raises(monkeypatc
 
 
 def test_resolve_ollama_usages_dedupes_same_url_and_model(monkeypatch):
-    from sherpa import agent_constructs, keys, model_catalog
+    from sherpa import agent_constructs, embeddings, keys, model_catalog
     monkeypatch.setattr(agent_constructs, "effective_agent",
                          lambda settings, **k: (settings or {}).get("agent") or "openai")
     monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
     monkeypatch.setattr(model_catalog, "resolve_model", lambda provider, usage, *a, **k: "chat-model")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)   # embed はこのテストの対象外
     rows = [{"agent": "ollama", "codex_model_provider": None, "ollama_url": None, "search_helper": ""},
             {"agent": "ollama", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
     usages = doctor_checks._resolve_ollama_usages({}, rows)
     assert len(usages) == 1
     # 用途ラベルも重複しない（2 行あっても 2 用途まで＝チャットと、頭脳自身が worker の下調べ）。
     assert usages[0]["purposes"] == ["チャット（利用者設定）", "検索ヘルパー（下調べ）"]
+
+
+def test_resolve_ollama_usages_includes_embed_when_embeddings_resolve_to_ollama(monkeypatch):
+    """埋め込みが Ollama に解決される構成（#45）では、chat／codex／検索ヘルパーと同列に
+    埋め込みの (URL, モデル) も用途一覧へ含める（per-user 設定を持たないためシステム全体で1回だけ
+    解決する＝`embeddings.cfg()` はユーザー設定を読まない）。"""
+    from sherpa import agent_constructs, embeddings
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "openai")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {
+        "provider": "ollama", "url": "http://localhost:11434", "model": "nomic-embed-text"})
+    rows = [{"agent": "openai", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
+    usages = doctor_checks._resolve_ollama_usages({}, rows)
+    assert len(usages) == 1
+    assert usages[0]["url"] == "http://localhost:11434"
+    assert usages[0]["model"] == "nomic-embed-text"
+    assert usages[0]["purposes"] == ["埋め込み（ベクトル検索）"]
+
+
+def test_resolve_ollama_usages_omits_embed_when_not_ollama(monkeypatch):
+    """埋め込みが Ollama 以外（未設定含む）の構成では埋め込みを用途一覧へ加えない
+    （既存の chat/codex/検索ヘルパーだけの構成を変えない）。"""
+    from sherpa import agent_constructs, embeddings
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "openai")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {"provider": "openai", "key": "sk-x"})
+    rows = [{"agent": "openai", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
+    assert doctor_checks._resolve_ollama_usages({}, rows) == []
+
+
+def test_resolve_ollama_usages_none_when_embed_cfg_raises(monkeypatch):
+    """`embeddings.cfg()` 自体が想定外の例外を投げても、黙って「埋め込みは使っていない」に
+    丸めず判定不能（`None`）へ倒す（他の解決要因と同じ fail-closed 契約）。"""
+    from sherpa import agent_constructs, embeddings
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "openai")
+
+    def _boom(*a, **k):
+        raise RuntimeError("cloud_provider の値が不正")
+    monkeypatch.setattr(embeddings, "cfg", _boom)
+    rows = [{"agent": "openai", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
+    assert doctor_checks._resolve_ollama_usages({}, rows) is None
+
+
+def test_check_ollama_probes_ng_for_missing_embed_model(monkeypatch):
+    """(#45 受け入れ条件) 埋め込みモデルが Ollama に未取得だと、doctor がその用途を ng として
+    報告する（`_probe_ollama_usage` は実装のまま使い、タグ一覧に無いモデルとして扱う）。"""
+    from sherpa import agent_constructs, embeddings, keys, llm
+    monkeypatch.setattr(agent_constructs, "effective_agent", lambda *a, **k: "openai")
+    monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: {
+        "provider": "ollama", "url": "http://localhost:11434", "model": "nomic-embed-text"})
+    monkeypatch.setattr(llm, "urlopen_no_redirect",
+                        lambda url, timeout=None: _FakeOllamaResponse(_tags_response("qwen2.5:latest")))
+    monkeypatch.setattr(keys, "resolve_ollama_url", lambda settings, **k: "http://localhost:11434")
+    rows = [{"agent": "openai", "codex_model_provider": None, "ollama_url": None, "search_helper": ""}]
+    results = doctor_checks.check_ollama_probes({}, rows)
+    assert len(results) == 1
+    assert results[0].status == "ng"
+    assert "pull" in results[0].detail
 
 
 # ---------------------------------------------------------------------------

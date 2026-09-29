@@ -89,6 +89,14 @@ _DEFAULT_CATALOG: dict[str, dict[str, dict[str, object]]] = {
         # 埋め込みの次元は固定（768・sherpa/embeddings.py の _MODELS 表）。allowed は次元互換の
         # モデルだけを登録する運用とする（次元情報そのものの管理は将来課題）。
         "embed": {"allowed": ["nomic-embed-text"], "default": "nomic-embed-text"},
+        # 空セルを意図的に置く（`allowed`/`default` を埋めない）: 組み込み既定を空のまま残すことで
+        # `resolve_model()` は `_USAGE_FALLBACK`（render→extract）へ引き続き倒れ、既存 DB に残る
+        # 旧 extract セルの値（admin が過去に設定したモデル名）を読み続ける。ここに実在するモデル名を
+        # 既定値として入れてしまうと、admin が extract だけを設定した環境で `resolve_model` が
+        # フォールバックへ進む前にこの既定値を返してしまい、実際には未取得のモデルへ黙って切り替わる
+        # （fail-loud の後退）。管理画面には空セルとして表示され（`allowed` を追加すれば編集可能）、
+        # 管理者が明示保存した時点で初めてこの値が使われる。
+        "render": {"allowed": [], "default": ""},
     },
     "codex": {
         "codex": {"allowed": ["gpt-5.5"], "default": "gpt-5.5"},
