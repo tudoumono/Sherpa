@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -26,6 +27,7 @@ pytestmark = pytest.mark.contract
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP = ROOT / "scripts" / "backup.sh"
 RESTORE = ROOT / "scripts" / "restore.sh"
+RUN_COMMON = ROOT / "scripts" / "run-common.sh"
 
 FAKE_DOCKER = r"""#!/usr/bin/env bash
 # 偽 docker: 引数を ARGLOG に追記し、サブコマンドごとに決め打ちの応答を返す。
@@ -106,6 +108,41 @@ def test_scripts_parse_and_help():
         assert subprocess.run(["bash", "-n", str(s)], capture_output=True).returncode == 0, s
         r = subprocess.run([str(s), "--help"], capture_output=True, text=True, timeout=30)
         assert r.returncode == 0 and "使い方" in r.stdout, s
+
+
+def test_sha256_helper_falls_back_without_sha256sum(tmp_path: Path):
+    """run-common.sh の sha256 ヘルパー（macOS 対応・stock macOS には sha256sum が無い）は
+    sha256sum が PATH に無くても shasum -a 256 へフォールバックし、同じ hex を返す。"""
+    payload = tmp_path / "f.txt"
+    payload.write_bytes(b"hello sherpa\n")
+    want = hashlib.sha256(payload.read_bytes()).hexdigest()
+
+    # 今の PATH から sha256sum だけを欠いた PATH を組む（他のコマンドは実体のまま使えるようにする）。
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        d = Path(entry)
+        if not d.is_dir():
+            continue
+        for exe in d.iterdir():
+            if exe.name == "sha256sum" or (stub_bin / exe.name).exists():
+                continue
+            try:
+                (stub_bin / exe.name).symlink_to(exe)
+            except OSError:
+                continue
+    env = dict(os.environ)
+    env["PATH"] = str(stub_bin)
+
+    r = subprocess.run(
+        ["bash", "-c", f'. "{RUN_COMMON}"; sherpa_sha256_hex "{payload}"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == want
 
 
 def test_dry_run_prints_plan_and_writes_nothing(tmp_path: Path):

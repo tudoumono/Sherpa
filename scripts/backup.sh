@@ -62,9 +62,13 @@ done
 
 # 相対指定は「リポジトリ基準」に揃え、既存 symlink も実体へ解決する。
 abspath() {
-  local path
+  local path resolved
   case "$1" in /*) path="$1" ;; *) path="$ROOT/${1#./}" ;; esac
-  realpath -m -- "$path"
+  if ! resolved="$(sherpa_resolve_real_path "$path")"; then
+    fail "パスを正規化できません（realpath / ${PYTHON_BIN:-python3} のどちらも使えません）: $path"
+    exit 1
+  fi
+  printf '%s\n' "$resolved"
 }
 path_contains() {  # $1 が $2 と同じ、またはその祖先
   [ "$1" = "$2" ] || case "$2" in "$1"/*) return 0 ;; *) return 1 ;; esac
@@ -227,7 +231,7 @@ MANIFEST="$DEST/MANIFEST"
 {
   echo "sherpa_backup=1"
   echo "version=$(cat "$ROOT/VERSION" 2>/dev/null || echo unknown)"
-  echo "created=$(date -Iseconds)"
+  echo "created=$(date +%Y-%m-%dT%H:%M:%S%z)"
   echo "host=$(hostname)"
   echo "project=$PROJECT"
   echo "work_image=$IMAGE"
@@ -250,7 +254,7 @@ for v in "${VOLUMES[@]}"; do
   note "ボリューム $v を退避中..."
   _docker run --rm --entrypoint tar -v "$v:/v:ro" -v "$DEST/volumes:/b" "$IMAGE" \
     czf "/b/$v.tar.gz" --numeric-owner -C /v .
-  if [ "$(stat -c %u "$DEST/volumes/$v.tar.gz")" != "$(id -u)" ]; then
+  if [ "$(stat -c %u "$DEST/volumes/$v.tar.gz" 2>/dev/null || stat -f %u "$DEST/volumes/$v.tar.gz")" != "$(id -u)" ]; then
     _docker run --rm --entrypoint chown -v "$DEST/volumes:/b" "$IMAGE" "$UID_GID" "/b/$v.tar.gz"
   fi
   chmod 600 "$DEST/volumes/$v.tar.gz"
@@ -281,11 +285,15 @@ if [ -f "$ENV_FILE" ]; then
   ok "env（$ENV_FILE のコピー・0600）"
 fi
 
-# sha256 は MANIFEST の末尾に `sha256sum` 形式で並べる（restore が `sha256sum -c` で照合する）。
+# sha256 は MANIFEST の末尾に sha256sum 互換形式で並べる（restore が sherpa_sha256_hex で照合する）。
+# BSD xargs に -r が無いので xargs は使わず、配列に集めて空でないときだけ呼ぶ。
 (
   cd "$DEST"
   echo "[sha256]"
-  find . -type f ! -name MANIFEST | sed 's|^\./||' | sort | xargs -r sha256sum
+  PAYLOAD_FILES=()
+  while IFS= read -r f; do PAYLOAD_FILES+=("$f"); done \
+    < <(find . -type f ! -name MANIFEST | sed 's|^\./||' | sort)
+  if [ ${#PAYLOAD_FILES[@]} -gt 0 ]; then sherpa_sha256_files "${PAYLOAD_FILES[@]}"; fi
 ) >> "$MANIFEST"
 # 途中失敗したディレクトリを復元元に使わせない。全 payload の checksum を書き終えた最後にだけ完成印を付ける。
 echo "complete=1" >> "$MANIFEST"
