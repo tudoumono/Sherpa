@@ -5,7 +5,7 @@
         graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
-        test-db-reset screenshots backup restore usage-backfill turn-activity graph-chain azure-smoke doctor sandbox-check \
+        test-db-reset screenshots backup restore usage-backfill turn-activity graph-chain azure-smoke codex-compat doctor sandbox-check \
         gate-slice gate-merge gate-release gate-ci test-inventory test-durations
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
@@ -249,6 +249,9 @@ graph-chain:       ## 起点のファイルから呼び出し・コピー・DB �
 
 azure-smoke:        ## Azure OpenAI（等の OpenAI 互換接続先）への実疎通を確認（実 API 課金あり・確認プロンプト）。ARGS で --env-file/--dry-run 等を渡せる（例: ARGS="--env-file azure.env --yes"）
 	$(PY) scripts/azure_smoke.py $(ARGS)
+
+codex-compat:      ## Codex CLI を新しい版へ上げる前の互換の通し試験（実 API は呼ばない・偽の接続先で本番の Codex 実行経路を1ターン確認）
+	SHERPA_USE_FIXTURES=1 $(PY) scripts/codex_compat.py
 
 doctor:            ## 導入先の統合セットアップ検査（ストア疎通/ES版+kuromoji/設定/LLM最小プローブ/Codex経路・読み取り専用）。PROBE_CLOUD=1 で課金プロバイダの実接続も確認
 	PROBE_CLOUD="$(PROBE_CLOUD)" ./scripts/doctor.sh

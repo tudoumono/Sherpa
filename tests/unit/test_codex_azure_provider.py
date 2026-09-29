@@ -222,6 +222,18 @@ def test_azure_endpoint_multi_agent_worker_uses_configured_value_over_main_model
     assert 'model = "gpt-5.9-custom"' in worker_toml
 
 
+def test_default_openai_endpoint_multi_agent_writes_developer_instructions_in_role_configs(tmp_path):
+    """接続先が既定(OpenAI 本家)の role config（worker/evaluator）にも developer_instructions を
+    書く（codex-compat 通し試験・0.153.4 実機で --strict-config の受理を確認済み。以前は
+    Codex(Ollama) 構成限定だったが、新しい Codex は無いと役割を黙って捨てるため全接続先で書く）。"""
+    txt = _config_text(tmp_path, multi_agent=True, orchestrator_model="gpt-5.5")
+    assert "[agents.worker]" in txt
+    worker_toml = (tmp_path / "ch" / "agents" / "worker.toml").read_text()
+    evaluator_toml = (tmp_path / "ch" / "agents" / "evaluator.toml").read_text()
+    assert "developer_instructions = " in worker_toml
+    assert "developer_instructions = " in evaluator_toml
+
+
 def test_ollama_construct_ignores_azure_settings(tmp_path, sysset):
     """Codex(Ollama) 構成（`ollama_base_url` あり）は接続先設定と無関係＝従来どおり ollama 行だけ。"""
     _azure(sysset)

@@ -175,14 +175,12 @@ def _write_codex_agent_role_configs(codex_home: Path, *, worker_model: str, work
     worker_path = d / "worker.toml"
     evaluator_path = d / "evaluator.toml"
     _provider_block = ("\n" + "\n".join(provider_lines) + "\n") if provider_lines else ""
-    # Codex(Ollama) 構成: 新しい Codex（0.158 で確認）は役割ファイルに developer_instructions が無いと
-    # 役割を黙って捨てる（multi_agent が効かない）。Ollama 構成に限って役割の要旨を書く
-    # （OpenAI/Azure 構成は確かめた版の書き方のまま変えない）。
-    _is_ollama = any('"sherpa-ollama"' in ln for ln in (provider_lines or []))
-    _worker_role = (f'developer_instructions = {_toml_str(_WORKER_ROLE_INSTRUCTIONS)}\n'
-                    if _is_ollama else "")
-    _evaluator_role = (f'developer_instructions = {_toml_str(_EVALUATOR_ROLE_INSTRUCTIONS)}\n'
-                       if _is_ollama else "")
+    # Codex（0.158 で確認）は役割ファイルに developer_instructions が無いと役割を黙って捨てる
+    # （multi_agent が効かない）。全接続先（既定 OpenAI／Azure／custom／Ollama）で常に書く
+    # （0.153.4 実機の `--strict-config` で受理を確認済み・codex-compat 通し試験・provider 種別を
+    # 問わず role config の未知フィールド扱いにはならない）。
+    _worker_role = f'developer_instructions = {_toml_str(_WORKER_ROLE_INSTRUCTIONS)}\n'
+    _evaluator_role = f'developer_instructions = {_toml_str(_EVALUATOR_ROLE_INSTRUCTIONS)}\n'
     worker_path.write_text(
         f'model = {_toml_str(worker_model)}\n'
         f'model_reasoning_effort = {_toml_str(worker_reasoning)}\n' + _worker_role + _provider_block,
