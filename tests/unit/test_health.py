@@ -1108,3 +1108,32 @@ def test_ollama_ping_unaffected_when_embed_not_ollama(monkeypatch):
     monkeypatch.setattr(embeddings, "cfg", lambda *a, **k: None)
     out = health._check_one("ollama", "o", "none", health._ping_ollama, "hint")
     assert out["ok"] is True
+
+
+def test_ai_check_codex_ollama_requires_codex_model_pulled(monkeypatch):
+    """Codex(Ollama) は Ollama に届くだけでなく、Codex に使うモデルが取得済みかも見る。"""
+    import json as _json
+
+    import pytest
+    from sherpa import health
+
+    monkeypatch.setattr(health.shutil, "which", lambda _: "/usr/bin/codex")
+    cat = {"model_catalog": {"codex": {"codex": {"allowed": ["gpt-oss:20b"], "default": "gpt-oss:20b"}}}}
+
+    def _tags(names):
+        class _R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return _json.dumps({"models": [{"name": n} for n in names]}).encode()
+        return lambda *a, **k: _R()
+
+    monkeypatch.setattr("sherpa.llm.urlopen_no_redirect", _tags(["nomic-embed-text:latest"]))
+    with pytest.raises(RuntimeError, match="gpt-oss:20b"):
+        health._ai_check_codex({"codex_model_provider": "ollama"}, cat)
+    monkeypatch.setattr("sherpa.llm.urlopen_no_redirect", _tags(["gpt-oss:20b"]))
+    health._ai_check_codex({"codex_model_provider": "ollama"}, cat)

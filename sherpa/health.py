@@ -423,7 +423,17 @@ def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None
     # Codex(Ollama) は codex login を使わない（独自プロバイダで Ollama へ直接つなぐ）＝Ollama へ届くかを見る。
     from . import agent_constructs
     if agent_constructs.codex_model_provider(settings) == "ollama":
-        _ai_check_ollama(settings, system_settings)
+        from . import keys as _keys, llm as _llm, model_catalog
+        base = _keys.resolve_ollama_url(settings, system_settings=system_settings)
+        with _llm.urlopen_no_redirect(_llm.ollama_url(base, "/api/tags"), timeout=_AI_TIMEOUT) as r:
+            tags = json.loads(r.read())
+        # 届くだけでなく、Codex に使うモデルが Ollama に取得済みかも見る（無ければ毎ターン失敗する）。
+        model = model_catalog.resolve_model("codex", "codex", None, system_settings=system_settings)
+        names = {m.get("name") for m in (tags.get("models") or []) if isinstance(m, dict)} \
+            if isinstance(tags, dict) else set()
+        if model and model not in names and f"{model}:latest" not in names:
+            raise RuntimeError(f"Codex に使うモデル {model} が Ollama にありません（ollama pull で取得するか、"
+                               "使えるモデルの Codex の列を Ollama のモデル名にしてください）")
         return
     # Azure/互換接続先の Codex(OpenAI) 構成は ChatGPT ログイン（auth.json）を使わず、子プロセス env の
     # OPENAI_API_KEY（`keys.resolve_api_key("openai")` で解決したキー）で認証する
