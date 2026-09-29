@@ -267,3 +267,92 @@ def test_generator_close_releases_conversation_lock(tmp_path, monkeypatch):
     assert lk.acquire(blocking=False), "close() 後も会話ロックが解放されていない（恒久拒否になる）"
     lk.release()
     assert not run_dir.exists(), f"close() 後も run dir が残っている: {run_dir}"
+
+
+# ===== 1ターン全体の壁時計上限 =====
+
+def test_wall_clock_limit_kills_long_running_turn(tmp_path, monkeypatch):
+    """`SHERPA_CODEX_WALL_CLOCK_LIMIT_S` に達したら、利用者の停止操作と同じ経路（`_killpg`→
+    `_kill_session`）でプロセスを打ち切り、途中までの結果＋打ち切りの旨を返し、
+    `env["limits"]["wall_clock_hit"]` へ記録する。"""
+    _bin_dir, sentinel_dir = _setup(tmp_path, monkeypatch, users_dirname="users_wallclock")
+    monkeypatch.setenv("SHERPA_CODEX_WALL_CLOCK_LIMIT_S", "1")
+
+    prov = A.CodexProvider()
+    ctx = _ctx(uid="killwall-u1")
+
+    events: list = []
+
+    def _drive():
+        for ev in prov.run(ctx):
+            events.append(ev)
+
+    th = threading.Thread(target=_drive, daemon=True)
+    th.start()
+
+    pid_file = sentinel_dir / "codex.pid"
+    child_pid_file = sentinel_dir / "child.pid"
+    assert _wait_for_file(pid_file, timeout=10), "偽 codex プロセスが起動した形跡が無い（テスト前提が崩れている）"
+    assert _wait_for_file(child_pid_file, timeout=10), "偽 codex の子プロセスが起動した形跡が無い"
+    pid = _read_pid(pid_file)
+    child_pid = _read_pid(child_pid_file)
+
+    th.join(timeout=20)
+    assert not th.is_alive(), "壁時計上限が想定時間内に効いていない（wall-clock watcher の kill 疑い）"
+
+    assert not _pid_alive(pid), f"上限到達後も偽 codex 本体(pid={pid})が生きている"
+    assert not _pid_alive(child_pid), f"上限到達後もプロセスグループ内の子(pid={child_pid})が生きている"
+
+    results = [e for e in events if isinstance(e, dict) and e.get("type") == "_result"]
+    assert len(results) == 1, f"打ち切り後に _result が出ていない events={events!r}"
+    env = results[0]["env"]
+    assert env.get("limits", {}).get("wall_clock_hit") is True, "打ち切りの内訳（env['limits']）に記録されていない"
+    assert "時間の上限" in (env.get("headline") or ""), f"利用者向けの打ち切り文言が無い: {env.get('headline')!r}"
+
+
+# ===== プロンプトは argv でなく標準入力で渡す =====
+
+def _write_fake_codex_capture_stdin(bin_dir: Path, argv_log: Path, stdin_log: Path) -> None:
+    """argv（repr）と標準入力の内容をそれぞれ別ファイルへ書き、即座に終了する偽 codex。"""
+    script = bin_dir / "codex"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path(r'{argv_log}').write_text(repr(sys.argv[1:]), encoding='utf-8')\n"
+        f"pathlib.Path(r'{stdin_log}').write_text(sys.stdin.read(), encoding='utf-8')\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {'id': '1', 'type': 'agent_message', "
+        "'text': 'ok'}}))\n"
+        "sys.exit(0)\n"
+    )
+    mode = script.stat().st_mode
+    script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def test_prompt_delivered_via_stdin_not_argv(tmp_path, monkeypatch):
+    """プロンプト本文（利用者の質問・資料パス）は argv に載らない（同一ホストの他ユーザーが
+    `ps` で読めない）。プロンプト位置には `-` だけが載り、本文は標準入力で渡る。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    stdin_log = tmp_path / "stdin.log"
+    _write_fake_codex_capture_stdin(bin_dir, argv_log, stdin_log)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users_stdin_prompt"))
+    monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
+
+    marker = "スタジン漏洩確認マーカー-STDIN-PROMPT-MARKER"
+    ctx = A.Ctx(
+        message=marker, world="v1",
+        route=lambda msg: {"lens": "qa", "input": msg, "reason": "test", "confident": True},
+        dispatch=lambda lens_, inp: {
+            "lens": lens_, "headline": "dispatch-headline",
+            "summary": {"total": 0}, "data": {}, "sources": [],
+        },
+        knowledge=True, uid="stdin-prompt-u1",
+    )
+    list(A.CodexProvider().run(ctx))
+
+    argv = eval(argv_log.read_text(encoding="utf-8"))
+    assert argv[-1] == "-", f"プロンプト位置が `-`（標準入力）でない: {argv!r}"
+    assert not any(marker in str(a) for a in argv), f"質問文が argv に残っている: {argv!r}"
+    assert marker in stdin_log.read_text(encoding="utf-8"), "プロンプトが標準入力で渡っていない"

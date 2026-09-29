@@ -463,7 +463,7 @@ $('gsearch').addEventListener('input', (e) => search(e.target.value));
 $('gfilter').addEventListener('click', runGraphSearch);
 $('greset').addEventListener('click', resetGraphSearch);
 $('showall').addEventListener('click', showAllNodes);
-$('condvalue').addEventListener('keydown', (e) => { if (e.key === 'Enter') runGraphSearch(); });
+$('condvalue').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') runGraphSearch(); });
 $('gaskbtn').addEventListener('click', askGraph);
 $('gask').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) askGraph(); });
 $('relayout').addEventListener('click', () => { if (cy) { clearSelection(); cy.layout(graphLayout()).run(); } });

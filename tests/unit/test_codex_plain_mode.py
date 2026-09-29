@@ -31,6 +31,8 @@ agents_md_log = pathlib.Path(r"__AGENTS_MD_LOG__")
 toolset_log = pathlib.Path(r"__TOOLSET_LOG__")
 
 args = sys.argv[1:]
+if args and args[-1] == "-":   # プロンプトは argv でなく標準入力から渡される（fake codex 側も同じ規約に合わせる）
+    args = args[:-1] + [sys.stdin.read()]
 argv_log.write_text(repr(args), encoding="utf-8")
 
 run_dir = pathlib.Path(args[args.index("-C") + 1])

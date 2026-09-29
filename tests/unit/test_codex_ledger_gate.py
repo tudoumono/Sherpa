@@ -46,6 +46,8 @@ import tomllib
 argv_log = pathlib.Path(r"__ARGV_LOG__")
 plan_path = pathlib.Path(r"__PLAN_PATH__")
 args = sys.argv[1:]
+if args and args[-1] == "-":   # プロンプトは argv でなく標準入力から渡される（fake codex 側も同じ規約に合わせる）
+    args = args[:-1] + [sys.stdin.read()]
 with argv_log.open("a", encoding="utf-8") as f:
     f.write(repr(args) + "\n")
     f.flush()

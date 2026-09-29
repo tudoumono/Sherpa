@@ -363,12 +363,22 @@ def test_bedrock_and_route_excluded_from_default_catalog():
 # ---- render 用途（L5 残課題の是正: LLM 成形＝llm_render.py が extract セルを共用していた件）---------
 
 def test_render_usage_is_registered_but_absent_from_default_catalog():
-    """`render` は `USAGES` に登録するが、`route` と同型で `_DEFAULT_CATALOG` には持たせない
-    （静的な既定値を置くと、admin が extract 側だけ変更した場合にフォールバックが追随しなくなる
-    ため・`resolve_model` が動的に extract の解決結果へフォールバックする設計）。"""
+    """`render` は `USAGES` に登録するが、openai/gemini/codex は `route` と同型で `_DEFAULT_CATALOG`
+    に持たせない（静的な既定値を置くと、admin が extract 側だけ変更した場合にフォールバックが
+    追随しなくなるため・`resolve_model` が動的に extract の解決結果へフォールバックする設計）。
+
+    ollama だけは**空セル**（`allowed=[]`／`default=""`）を持つ（#48 是正）: 管理画面の
+    「使えるモデル」表は、対象セルが `_DEFAULT_CATALOG` に無い（＝`effective` に無い）と
+    「一覧を編集」ボタン自体が出ず、admin が一度も触れないセルを永遠に編集できない
+    （route と同じ扱いのまま放置すると Ollama 構成で render 用途を設定する手段が無くなる）。
+    空セルなら `resolve_model` の動的フォールバックは変わらない（下の
+    `test_resolve_model_render_falls_back_to_extract_when_unset` が固定）まま、UI からだけ編集可能になる。"""
     assert "render" in model_catalog.USAGES
-    for provider_cells in model_catalog._DEFAULT_CATALOG.values():
-        assert "render" not in provider_cells
+    for provider, provider_cells in model_catalog._DEFAULT_CATALOG.items():
+        if provider == "ollama":
+            assert provider_cells["render"] == {"allowed": [], "default": ""}
+        else:
+            assert "render" not in provider_cells
 
 
 def test_resolve_model_render_falls_back_to_extract_when_unset(monkeypatch):
@@ -393,6 +403,17 @@ def test_resolve_model_render_uses_its_own_cell_when_configured(monkeypatch):
         }}})
     assert model_catalog.resolve_model("openai", "render", None) == "custom-render"
     assert model_catalog.resolve_model("openai", "extract", None) == "custom-extract"
+
+
+def test_ollama_render_can_be_configured_from_the_empty_builtin_cell(monkeypatch):
+    """#48: Ollama 構成でも render 用途のモデルを管理画面から設定できる（`_DEFAULT_CATALOG` の
+    空セルが `validate_catalog` の保存対象になり、`resolve_model` がその値をそのまま使う）。"""
+    saved = model_catalog.validate_catalog(
+        {"ollama": {"render": {"allowed": ["gemma3:latest"], "default": "gemma3:latest"}}})
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"model_catalog": saved})
+    assert model_catalog.resolve_model("ollama", "render", None) == "gemma3:latest"
+    # extract 側は無関係のまま（render を設定しても extract の解決には影響しない）。
+    assert model_catalog.resolve_model("ollama", "extract", None) == "qwen2.5"
 
 
 def test_hardcoded_fallback_render_is_empty_by_design():

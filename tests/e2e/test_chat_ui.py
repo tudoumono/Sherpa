@@ -3406,3 +3406,21 @@ def test_chat_usage_meta_breakdown_shows_missing_only_children(page, web_base_ur
     usage_meta.locator("summary").click()
     expect(usage_meta).to_contain_text("下調べ役 2 体: 入力 0 / 出力 0")
     expect(usage_meta).to_contain_text("2 体は記録なし")
+
+
+def test_chat_ime_composition_enter_does_not_send(page, web_base_url):
+    """日本語の変換確定の Enter（keyCode 229・isComposing）では送信しない。通常の Enter では送信する。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html")
+    expect(page.locator("#messages")).to_contain_text("気になること")
+
+    page.locator("#input").fill("へんかんちゅう")
+    page.locator("#input").dispatch_event("keydown", {"key": "Enter", "keyCode": 229, "isComposing": True})
+    page.wait_for_timeout(300)
+    assert not records["turn_starts"], "変換確定の Enter で送信された"
+
+    page.locator("#input").press("Enter")
+    expect(page.locator("#messages")).to_contain_text("へんかんちゅう")
+    assert records["turn_starts"]

@@ -93,6 +93,16 @@ class _NotApplicable(RuntimeError):
     detail「対象外（…）」・DEBUG ログとして扱う。"""
 
 
+class _OllamaEmbedModelMissing(RuntimeError):
+    """埋め込みが Ollama 構成に解決されているのに、その埋め込みモデルが Ollama 未取得（`/api/tags`
+    の一覧に無い）。`_classify()` が案内文をそのまま使う（モデル名は秘密ではないため、他の
+    分類のように短いラベルへ丸めない）。"""
+
+    def __init__(self, model: str):
+        self.model = model
+        super().__init__(model)
+
+
 def _ping_bedrock() -> None:
     """**ネットワークに一切出ない**軽量チェック: 中央キー、または SigV4 の静的な手掛かりの**存在**だけを見る。
 
@@ -137,13 +147,47 @@ def _ping_ollama() -> None:
     base = keys.resolve_ollama_url(None, system_settings=sys_s)
     try:
         with llm.urlopen_no_redirect(llm.ollama_url(base, "/api/tags"), timeout=_TIMEOUT) as r:
-            json.loads(r.read())
+            data = json.loads(r.read())
     except Exception as e:
         if not configured:
             # 接続先を設定していない環境（Ollama を使っていない）で、既定の localhost に応答が
             # 無いのは正常＝対象外。設定済みで落ちている場合だけ本物の失敗として上へ。
             raise _NotApplicable(f"接続先が未設定（既定 {base} にも応答なし）") from e
         raise
+    _check_ollama_embed_model(data, sys_s)
+
+
+def _check_ollama_embed_model(tags_response: object, sys_s: dict) -> None:
+    """`/api/tags` の応答（`_ping_ollama` が既に取得済み・追加の通信は行わない）から、埋め込みが
+    Ollama 構成に解決されている場合だけ、その埋め込みモデルが導入済みかを確認する。
+
+    埋め込みモデルが未取得のまま気付かれないと、ベクトル検索が BM25（キーワード一致）のみへ
+    黙って縮退する（会話自体は継続できるため、doctor／health のどちらも今まで検出していなかった）。
+    埋め込みが Ollama 以外（未設定含む）の構成では何もしない。タグ無し参照は Ollama 自身の解決と
+    同じく `:latest` とみなす（host/namespace を含む完全な参照比較は行わない・doctor の用途別
+    プローブ（`scripts/doctor_checks.py::_probe_ollama_usage`）ほど厳密な照合は不要）。
+    """
+    from . import embeddings
+    try:
+        ec = embeddings.cfg(None, system_settings=sys_s)
+    except Exception:
+        return   # 埋め込み設定自体の解決失敗はこのチェックの対象外（このチェックを止めない）
+    if not ec or ec.get("provider") != "ollama":
+        return
+    model = ec.get("model")
+    if not isinstance(model, str) or not model:
+        return
+    names: set[str] = set()
+    if isinstance(tags_response, dict):
+        raw_models = tags_response.get("models")
+        if isinstance(raw_models, list):
+            for entry in raw_models:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if isinstance(name, str) and name:
+                    names.add(name)
+    wanted = model if ":" in model else f"{model}:latest"
+    if wanted not in names:
+        raise _OllamaEmbedModelMissing(model)
 
 
 # (id, 表示名, 落ちたときの全体への影響, ping, 対処ヒント)
@@ -176,6 +220,9 @@ def _classify(e: BaseException) -> str:
     urllib は接続系エラーを URLError でラップする（reason に原因例外を持つ）ので、
     e 自体に加えて __cause__ / reason も1段見る。
     """
+    if isinstance(e, _OllamaEmbedModelMissing):
+        return (f"埋め込みモデル {e.model} が Ollama にありません（ollama pull {e.model}）。"
+                "このままではベクトル検索が使えずキーワード検索だけになります")
     for c in (e, getattr(e, "__cause__", None), getattr(e, "reason", None)):
         if c is None:
             continue

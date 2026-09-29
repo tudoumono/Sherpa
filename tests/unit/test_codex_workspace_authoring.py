@@ -48,12 +48,12 @@ def test_codex_permission_profile_is_default():
     from sherpa import agents as A
     import inspect
     src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    # 既定 ON・--strict-config・profile 生成・クリーン env・stdin 遮断が run() に含まれる。
+    # 既定 ON・--strict-config・profile 生成・クリーン env・プロンプトは標準入力経由が run() に含まれる。
     assert "_codex_sandbox_enabled" in src, "permission profile 分岐が run() に無い"
     assert "--strict-config" in src, "--strict-config が無い"
     assert "_write_codex_authoring_config" in src, "profile config 生成呼出が無い"
     assert "_codex_clean_env" in src, "クリーン env（creds 非渡し）が無い"
-    assert "stdin=subprocess.DEVNULL" in src, "stdin 遮断（stdin ハング回避）が無い"
+    assert "stdin=subprocess.PIPE" in src, "プロンプトを標準入力へ渡す配線が無い"
     assert "read-only" not in src, "argv に read-only が残っている"
 
 
@@ -476,7 +476,9 @@ def test_run_authoring_uses_direct_read_ok_for_prompt_and_disables_on_enum_failu
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import json, pathlib, sys\n"
-        f"pathlib.Path(r'{argv_log}').open('a', encoding='utf-8').write(sys.argv[-1] + chr(10) + '---' + chr(10))\n"
+        # プロンプトは argv でなく標準入力から渡される（末尾は `-`）——fake codex 側も同じ規約に合わせる。
+        "_prompt = sys.stdin.read() if sys.argv[-1:] == ['-'] else (sys.argv[-1] if sys.argv[1:] else '')\n"
+        f"pathlib.Path(r'{argv_log}').open('a', encoding='utf-8').write(_prompt + chr(10) + '---' + chr(10))\n"
         "print(json.dumps({'type': 'item.completed', "
         "'item': {'id': '1', 'type': 'agent_message', 'text': 'ok'}}))\n"
         "sys.exit(0)\n"

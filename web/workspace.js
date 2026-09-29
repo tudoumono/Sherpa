@@ -172,7 +172,7 @@ function initSearch() {
   const btn = $('search-btn');
   const inp = $('search-q');
   if (btn) btn.addEventListener('click', doSearch);
-  if (inp) inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+  if (inp) inp.addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') doSearch(); });
 }
 
 // ===== テーマ切替（全ページ共通パターン）=====

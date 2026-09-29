@@ -874,7 +874,7 @@ $('tree').addEventListener('click', (e) => {                 // 範囲で絞る
 });
 $('detailbtn').addEventListener('click', openPrev);
 $('esbtn').addEventListener('click', searchEs);
-$('esq').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchEs(); });
+$('esq').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') searchEs(); });
 $('rows').addEventListener('click', (e) => {
   const dl = e.target.closest('[data-dl]'); if (dl) return download(dl.dataset.dl);
   const rr = e.target.closest('[data-rerun]'); if (rr) return rerun(rr.dataset.rerun);

@@ -11,9 +11,9 @@
     ため・`_classify_llm_probe_failure()` 参照）。Ollama も `_ai_check_ollama` を使わず
     `sherpa.llm.urlopen_no_redirect`／`ollama_url` を直接呼ぶ＝下記参照。中央既定 URL の疎通
     だけでなく、個人の接続先上書き・用途別モデルの実在確認まで必要なため。対象は
-    chat／Codex(Ollama backing)／検索ヘルパーの3用途のみ＝embed 用途（`nomic-embed-text` 等）は
-    対象外。埋め込みが解決できない場合はベクトル検索が BM25 のみへ縮退するだけで会話自体は
-    継続できるため、他の3用途と同列の疎通確認は行わない）
+    chat／Codex(Ollama backing)／検索ヘルパー／embed（埋め込み・`sherpa.embeddings.cfg()` が
+    Ollama に解決した場合のみ）の4用途——埋め込みモデルが未取得のまま気付かれずにいると、
+    ベクトル検索が BM25（キーワード一致）のみへ黙って縮退するため、他の3用途と同列に確認する）
   - `check_production_openai_probe.probe()`：system_settings 側の接続先（`openai_endpoint_kind`／
     `openai_base_url`）妥当性判定（`scripts/check-production.sh` と共有）。env 候補
     （初回シード前）の妥当性判定・以後のチェックが使う実効値の算出は `sherpa.llm.
@@ -1513,10 +1513,17 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
     最終的に関数全体を `None` へ倒す）。判定できないことを「使っていない」と区別できないまま
     黙殺すると、設定解決が壊れているだけの環境が「Ollama は未使用（任意構成）」という無関係な
     SKIP に化けてしまう（`check_ollama_probes` の fail-closed 契約と食い違う）。
+
+    embed（埋め込み）は per-user 設定を持たない（`sherpa.embeddings.cfg()` は
+    `user_settings` を読まない・システム既定のみ）ため、chat／codex のようにシステム既定＋
+    有効な利用者ごとに解決するのではなく、`sys_s` から一度だけ解決する。`cfg()` 自体が
+    `provider != "ollama"` を安全に返す設計（例外を投げず None／別プロバイダの dict を返す）
+    のため、その解決自体が例外を投げた場合だけ `type_error` を立てる（他の解決要因と同じ
+    fail-closed 契約）。
     """
     if sys_s is None or rows is None:
         return None
-    from sherpa import agent_constructs, keys, model_catalog, search_helper
+    from sherpa import agent_constructs, embeddings, keys, model_catalog, search_helper
     usages: dict[tuple[str, str], set[str]] = {}
     type_error = False
 
@@ -1537,6 +1544,14 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
         # `run_all()` 全体を未捕捉の traceback で巻き込まない＝この関数自身の「判定できない」
         # 契約（`None`）にそのまま乗せる。
         return None
+
+    try:
+        ec = embeddings.cfg(None, system_settings=sys_s)
+    except Exception:
+        type_error = True
+        ec = None
+    if ec and ec.get("provider") == "ollama":
+        _add(ec.get("url"), ec.get("model"), "埋め込み（ベクトル検索）")
 
     try:
         if agent_constructs.effective_agent(None, system_settings=sys_s) == "ollama":
