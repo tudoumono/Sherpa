@@ -1219,16 +1219,28 @@ def system_prompt(tools_pref: dict | None = None) -> str:
     return "".join(parts)
 
 
+# COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: 調査台帳がある実行
+# （Codex 標準モード・MCP 経由）で、検索・読取ツールの結果を台帳の項目ごとの記録
+# （`sherpa/mcp_server.py::_record_item_coverage`→`investigation_ledger.append_coverage_atomic`）へ
+# 結びつけるための任意引数。`run_tool()` 自身はこのキーを読まない（無視するだけ・他 dialect でも
+# 無害）——MCP 層（`mcp_server.handle`）だけがこの値を見る。schema/description は6ツール共通で
+# `agentic_search`/MCP 二重管理しない契約に合わせてここで一括定義する。
+_ITEM_PARAM_SCHEMA = {"type": "string",
+                     "description": "調査台帳の項目 id（省略可）。台帳の項目のために探す・読むときに付ける"}
+_ITEM_PARAM_NOTE = "調査台帳の項目のために探す・読むときは item にその項目の id を付ける（省略可）。"
+
 _PARAMS_SEARCH = {"type": "object", "properties": {
     "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）"},
     "offset": {"type": "integer",
-              "description": "ヒットの開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"}},
+              "description": "ヒットの開始位置（既定0）。truncated:true のときは next_offset をそのまま渡すと続きが取れる"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["query"]}
 # es_search（全文＋ベクトル）は offset を持たない——kNN 句の候補集合はページ間で固定できず、
 # offset だけ進めても kNN 側の候補（先頭 k 件）は変わらないため、ページを跨ぐと重要度補正後の
 # 順位が入れ替わり重複/欠落が起きる（実測）。続きが必要なら max_hits（絶対上限まで）を増やす。
 _PARAMS_ES_SEARCH = {"type": "object", "properties": {
-    "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）"}},
+    "query": {"type": "string", "description": "検索キーワード（型番・関数名・固有名詞など具体語が有効）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["query"]}
 _PARAMS_LIST_DOCS = {"type": "object", "properties": {
     "path_prefix": {"type": "string",
@@ -1255,12 +1267,14 @@ _PARAMS_READ = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "ripgrep_search が返した doc_id（資料の相対パス）"},
     "line": {"type": "integer", "description": "精読の中心行（ヒット行）"},
     # 実際の既定値（`READ_WINDOW`）を埋め込む＝env で変えたときにモデルへの通知も追随する。
-    "window": {"type": "integer", "description": f"前後に読む行数（既定 {READ_WINDOW}）"}},
+    "window": {"type": "integer", "description": f"前後に読む行数（既定 {READ_WINDOW}）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id", "line"]}
 _PARAMS_READ_DOC = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "list_docs/ripgrep_search 等が返した doc_id（資料の相対パス）"},
     "start_line": {"type": "integer",
-                  "description": "読み始める行（既定1）。続きが必要なら前回の返却が示す次の行を指定して呼び直す"}},
+                  "description": "読み始める行（既定1）。続きが必要なら前回の返却が示す次の行を指定して呼び直す"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 _PARAMS_OUTLINE = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "list_docs/ripgrep_search 等が返した doc_id（資料の相対パス）"}},
@@ -1281,15 +1295,18 @@ _DESC_SEARCH = ("社内資料を全文 grep して当たりを付ける（doc_id
                 "read_doc で続きを確認する。text_truncated が付くヒットは本文が途中で切れている——"
                 "read_around（周辺）か read_doc（続き）で読む。"
                 "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない——"
-                "next_offset をそのまま offset に渡せば続きが取れる（範囲を絞る・別の語で探すのも有効）。")
+                "next_offset をそのまま offset に渡せば続きが取れる（範囲を絞る・別の語で探すのも有効）。"
+                f"{_ITEM_PARAM_NOTE}")
 _DESC_READ = ("ヒット箇所の周辺行だけを精読する（全文は読まない）。doc_id と line を渡す。"
-             "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。")
+             "text_truncated が付いたら本文が上限で切れている——read_doc で続き（次の開始行）を読む。"
+             f"{_ITEM_PARAM_NOTE}")
 _DESC_READ_DOC = ("文書を開始行から連続して読む（通読向け・全文を一度には読まない）。"
                   "doc_id と start_line（省略時1）を渡す。1回の返却行数には上限があり、"
                   "「全◯行中 X〜Y行目」を返すので、続きが必要なら次の開始行（end_line+1）を"
                   "指定して再度呼び出す（range 外の start_line はエラーで明示）。"
                   "text_truncated が付くときは行内容が大きすぎて途中で切れている・"
-                  "file_truncated が付くときは文書自体が大きすぎて total_lines が過小申告の可能性がある。")
+                  "file_truncated が付くときは文書自体が大きすぎて total_lines が過小申告の可能性がある。"
+                  f"{_ITEM_PARAM_NOTE}")
 _DESC_OUTLINE = ("文書の見出し構造（Markdown の #/##/### 見出し・派生MDの表/シート見出しを含む）を"
                  "行番号つきで返す。read_doc/read_around で読む箇所の当たりを付けるのに使う。"
                  "見出しが無い文書は総行数だけを返す。file_truncated が付くときは文書自体が"
@@ -1321,7 +1338,8 @@ _DESC_ES = ("社内資料を日本語の全文＋ベクトル検索（形態素�
             "read_doc（続き）で読む。"
             "truncated:true はヒット数が上限に達した＝母集団の一部しか見ていない（続きは取れない・範囲を絞るか別の語で探し、残りは未確認として扱う）。"
             "es_search は候補の発見用——全件が必要な列挙は ripgrep_search"
-            "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。")
+            "（truncated:true なら next_offset を offset に渡して続きを取る）・list_docs・原本の読取で行う。"
+            f"{_ITEM_PARAM_NOTE}")
 _DESC_ASK = ("回答や検索条件を確定する前にユーザへ確認する。結果が大きく変わる曖昧さがある場合だけ使う。"
              "例: 影響分析で起点や影響先が複数候補に割れるとき、確実な波及が0件で要確認だけになったときは、"
              "対象の絞り込みを確認してよい。依頼に「確認してから進めて」とあるときは調査より先に確認する。"
@@ -1335,7 +1353,8 @@ _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピー
                "実在確認できない）を含む経路は候補＝原本で確認する。"
                "名前が一つでも判明したら、その関連の広がりは grep を反復するより先にこれで辿るほうが早い。"
                "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。"
-               "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。")
+               "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。"
+               f"{_ITEM_PARAM_NOTE}")
 # grep OFF/不達で es_search/graph_neighbors だけが提示されるときの代替 description（SC-6e）。
 # `_DESC_ES`/`_DESC_GRAPH` はいずれも grep（ripgrep_search）への言及を含むため、提示していない
 # ツールへの言及・推奨をそのまま残さない（無駄なターン/上限到達を防ぐ）。
@@ -1355,7 +1374,8 @@ _DESC_GRAPH_NO_GREP = ("関係グラフから、ある名前（プログラム/�
                        "原因の手がかり集め（トラブルシュート）に有効。"
                        "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。")
 _PARAMS_GRAPH = {"type": "object", "properties": {
-    "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"}},
+    "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["name"]}
 _PARAMS_GLOB = {"type": "object", "properties": {
     "pattern": {"type": "string",
@@ -1445,10 +1465,12 @@ _PARAMS_PDF_PAGES = {"type": "object", "properties": {
     "required": ["doc_id"]}
 _DESC_FILE_HEAD = ("テキスト・コード原本の先頭バイトをそのまま返す（原本を直接読む・派生ではない・"
                   "Office/PDF は対象外＝xlsx_sheets/docx_paragraphs/pptx_slides/pdf_pages を使う）。"
-                  "max_bytes（既定65536）まで読み、上限で切れていたら truncated:true。")
+                  "max_bytes（既定65536）まで読み、上限で切れていたら truncated:true。"
+                  f"{_ITEM_PARAM_NOTE}")
 _PARAMS_FILE_HEAD = {"type": "object", "properties": {
     "doc_id": {"type": "string", "description": "資料フォルダからの相対パス（テキスト・コード）"},
-    "max_bytes": {"type": "integer", "description": "読む最大バイト数（既定65536）"}},
+    "max_bytes": {"type": "integer", "description": "読む最大バイト数（既定65536）"},
+    "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 
 # ---- 作成系（author）の成果物ファイル: DEPTH-2 S2（§2.7）----
@@ -2318,6 +2340,11 @@ _GRAPH_NEIGHBORS_NON_RECOVERABLE_ERROR_CODE = "graph_internal_error"
 # （`run_tool` の `graph_neighbors` 分岐）と MCP 経路（`mcp_server.py::handle`・
 # `providers/codex/mcp.py::_graph_schema_era_from_item`）が共有する閉じたコード（本文を持たない）。
 GRAPH_REINGEST_ERROR_CODE = "graph_reingest_required"
+# read_doc/read_around 自身の引数検証エラー（整数変換失敗・行範囲が総行数を超える等）の固定
+# コード——`_open_doc_stream` の「読めない」（scope 外・doc_id 無効・IO 失敗）とは別枠（呼び出し
+# 側の引数の誤りであって、対象が読み取れないわけではない）。COD-16 の項目ごとの未確認
+# （`mcp_server._coverage_outcome`）がこの区別に使う（引数誤りは coverage に記録しない）。
+_READ_INVALID_ARGS_ERROR_CODE = "read_invalid_args"
 
 # グラフが使えないまま調べ続けたターンの通知（平文・専門用語ゼロ・資料名や本文を含まない）。
 # 3状態（入口で使えない＝未構築/OFF/不達／世代が古い／調査の途中で接続できなくなった）で別の
@@ -2843,7 +2870,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             # （下の安全クランプは既存のまま維持）。
             window = int(args.get("window") or (window_cap or READ_WINDOW))
         except (TypeError, ValueError):
-            return ({"error": "line/window は整数で"}, docs, cites, cards)
+            return ({"error": "line/window は整数で",
+                    "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
         # 上限は 200 を後退させず、`READ_WINDOW`（env）／`window_cap`（調べる深さ・SC-6c）が
         # 200を超えたときだけ追随する（既定・LLM 明示どちらの window 値にも同じ上限を適用する）。
         window = max(1, min(window, max(200, window_cap or READ_WINDOW)))
@@ -2894,7 +2922,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         try:
             start = int(args.get("start_line") or 1)
         except (TypeError, ValueError):
-            return ({"error": "start_line は整数で"}, docs, cites, cards)
+            return ({"error": "start_line は整数で",
+                    "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
         if start < 1:
             start = 1
         f, err = _open_doc_stream(world, doc_id, sp, layer)
@@ -2921,7 +2950,8 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             f.close()
         file_truncated = reader.truncated or reader.line_overflowed
         if total and start > total:
-            return ({"error": f"range 外です（start_line={start}・全{total}行）"}, docs, cites, cards)
+            return ({"error": f"range 外です（start_line={start}・全{total}行）",
+                    "error_code": _READ_INVALID_ARGS_ERROR_CODE}, docs, cites, cards)
         # ページ幅どおりに組んでから TOOL_RESULT_MAX_BYTES で一括クリップすると、`end_line`
         # （「ここまで読んだ」という申告）と実際に `text` に入っている内容が食い違う（無言の
         # 欠落）。1行ずつバイト予算を累積し、予算を超える直前の行で止めて、そこを実際の

@@ -15,6 +15,7 @@ os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
 os.environ["SHERPA_MCP_WORLD"] = "v1"
 os.environ.pop("SHERPA_MCP_SCOPE", None)
 from sherpa import mcp_server as M   # noqa: E402
+from sherpa import investigation_ledger as IL   # noqa: E402
 import _corpus_expect as CE   # noqa: E402   # フィクスチャ実走査ベースの list_docs 期待値（フェーズ7 S1）
 
 
@@ -1356,4 +1357,198 @@ def test_ledger_manifest_set_refuses_symlinked_manifest(tmp_path, monkeypatch):
     body = _ledger_call("ledger_manifest_set", {"question_kind": "list", "items": ["a"]})
     assert body["error"] == "ledger_manifest_invalid"
     assert outside.read_text() == "{}"
+
+
+# ===== COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: 項目ごとの未確認 =====
+
+_ITEM_TOOLS = ("ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors")
+
+
+def test_item_param_present_optional_on_all_six_tools():
+    """6ツールの inputSchema に `item`（省略可・required には無い）が追加されている
+    （schema/description は agentic_search と共通＝二重管理しない）。"""
+    resp = M.handle({"jsonrpc": "2.0", "id": 200, "method": "tools/list"})
+    byname = {t["name"]: t for t in resp["result"]["tools"]}
+    for name in _ITEM_TOOLS:
+        schema = byname[name]["inputSchema"]
+        assert "item" in schema["properties"], name
+        assert "item" not in schema.get("required", []), name
+        assert "item" in byname[name]["description"], name
+
+
+def test_plain_toolset_graph_neighbors_schema_excludes_item(monkeypatch):
+    """素の Codex モード（plain）は台帳を使わないので何も変えない——`graph_neighbors` の
+    schema に `item` を出さない（6ツール共通スキーマの `item` 追加が plain へ漏れない）。"""
+    os.environ["SHERPA_MCP_TOOLSET"] = "plain"
+    try:
+        resp = M.handle({"jsonrpc": "2.0", "id": 199, "method": "tools/list"})
+        graph = next(t for t in resp["result"]["tools"] if t["name"] == "graph_neighbors")
+        assert "item" not in graph["inputSchema"]["properties"]
+    finally:
+        os.environ.pop("SHERPA_MCP_TOOLSET", None)
+
+
+def test_item_coverage_recorded_for_hit_outcome(tmp_path, monkeypatch):
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    resp = M.handle({"jsonrpc": "2.0", "id": 201, "method": "tools/call",
+                     "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE", "item": "a"}}})
+    assert not resp["result"]["isError"]
+    coverage = IL.load_coverage(directory)
+    assert coverage["a"] == ("hit",)
+    lines = [json.loads(l) for l in (directory / "coverage.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["tool"] == "ripgrep_search" and set(lines[0].keys()) == {"item", "tool", "outcome", "ts"}
+
+
+def test_item_coverage_recorded_for_no_hits_outcome(tmp_path, monkeypatch):
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    resp = M.handle({"jsonrpc": "2.0", "id": 202, "method": "tools/call",
+                     "params": {"name": "ripgrep_search",
+                               "arguments": {"query": "ZZZ_NO_SUCH_TOKEN_XYZ", "item": "b"}}})
+    assert not resp["result"]["isError"]
+    assert IL.load_coverage(directory) == {"b": ("no_hits",)}
+
+
+def test_item_coverage_not_recorded_without_item_argument(tmp_path, monkeypatch):
+    """`item` を付けない既存呼出しは無変更——coverage.jsonl 自体が作られない。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    resp = M.handle({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
+                     "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+    assert not resp["result"]["isError"]
+    assert not (directory / "coverage.jsonl").exists()
+
+
+def test_item_coverage_not_recorded_when_ledger_dir_unset(monkeypatch):
+    """台帳を使わないターン（`SHERPA_MCP_LEDGER_DIR` 未設定・素の Codex モード含む）は `item` が
+    付いていても書かない（fail-closed・例外も出さない）。"""
+    monkeypatch.delenv("SHERPA_MCP_LEDGER_DIR", raising=False)
+    resp = M.handle({"jsonrpc": "2.0", "id": 204, "method": "tools/call",
+                     "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE", "item": "c"}}})
+    assert not resp["result"]["isError"]
+
+
+def test_item_coverage_unsafe_item_id_does_not_break_tool_call(tmp_path, monkeypatch):
+    """不正な id（`_validate_safe_id` と同じ規則で拒否される）は fail-open——ツール呼出自体は
+    成功のまま、coverage.jsonl には何も書かれない。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    resp = M.handle({"jsonrpc": "2.0", "id": 205, "method": "tools/call",
+                     "params": {"name": "ripgrep_search",
+                               "arguments": {"query": "TAX-RATE", "item": "../outside"}}})
+    assert not resp["result"]["isError"]
+    assert not (directory / "coverage.jsonl").exists()
+
+
+def test_item_coverage_read_doc_unreadable_outcome(tmp_path, monkeypatch):
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    resp = M.handle({"jsonrpc": "2.0", "id": 206, "method": "tools/call",
+                     "params": {"name": "read_doc", "arguments": {"doc_id": "居ない.md", "item": "d"}}})
+    assert resp["result"]["isError"]
+    assert IL.load_coverage(directory) == {"d": ("unreadable",)}
+
+
+def test_item_coverage_graph_schema_era_error_records_error_outcome(tmp_path, monkeypatch):
+    """`GraphSchemaEraError`（graph_neighbors の except 分岐）も item 付きなら coverage へ記録する。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+
+    def _boom(name, args, world, scope_paths, **kw):
+        raise M.GraphSchemaEraError(world, "old-era", lens="troubleshoot")
+    monkeypatch.setattr(M.agentic_search, "run_tool", _boom)
+    resp = M.handle({"jsonrpc": "2.0", "id": 207, "method": "tools/call",
+                     "params": {"name": "graph_neighbors", "arguments": {"name": "請求", "item": "e"}}})
+    assert resp["result"]["isError"] is True
+    assert IL.load_coverage(directory) == {"e": ("error",)}
+
+
+def test_item_coverage_child_and_parent_share_same_ledger_dir(tmp_path, monkeypatch):
+    """子（spawn_agent の worker）は親と同じ `SHERPA_MCP_LEDGER_DIR` を渡される契約——2回の
+    独立した handle() 呼出し（別プロセス相当）でも同じディレクトリへ記録が積み上がる（サイドカーを
+    介さず、台帳と同じ書込手段を共有する設計を、単一プロセス内の2呼出しで近似的に確認する）。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    M.handle({"jsonrpc": "2.0", "id": 208, "method": "tools/call",
+             "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE", "item": "f"}}})
+    M.handle({"jsonrpc": "2.0", "id": 209, "method": "tools/call",
+             "params": {"name": "ripgrep_search",
+                       "arguments": {"query": "ZZZ_NO_SUCH_TOKEN_XYZ", "item": "f"}}})
+    assert IL.load_coverage(directory)["f"] == ("hit", "no_hits")
+
+
+# ===== _coverage_outcome（分類関数の直接検証・handle() を介さない純粋な入出力） =====
+
+@pytest.mark.parametrize("name,result,is_error,expected", [
+    ("ripgrep_search", {"hits": []}, False, "no_hits"),
+    ("ripgrep_search", {"hits": [{"doc_id": "a", "text": "x"}], "truncated": True}, False, "limit"),
+    ("ripgrep_search", {"hits": [{"doc_id": "a", "text": "x", "text_truncated": True}]}, False, "truncated"),
+    ("ripgrep_search", {"hits": [{"doc_id": "a", "text": "x"}]}, False, "hit"),
+    ("es_search", {"hits": []}, False, "no_hits"),
+    ("read_doc", {"text": "x", "end_line": 1}, False, "hit"),
+    ("read_doc", {"text": "x", "end_line": 1, "text_truncated": True}, False, "truncated"),
+    ("read_doc", {"error": "読めない"}, True, "unreadable"),
+    ("read_around", {"error": "読めない"}, True, "unreadable"),
+    ("file_head", {"error": "読めない"}, True, "unreadable"),
+    ("graph_neighbors", {"neighbors": []}, False, "no_hits"),
+    ("graph_neighbors", {"neighbors": [{"name": "X"}], "truncated": True, "count": 5}, False, "limit"),
+    ("graph_neighbors", {"neighbors": [{"name": "X"}]}, False, "hit"),
+    ("graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}, False, "error"),
+    # es_search の degrade_reason／truncated／truncated_docs は0件の判定より前に見る
+    # （ヒットが有っても truncated_docs があれば truncated）。
+    ("es_search", {"hits": [], "degrade_reason": "es_unavailable"}, False, "error"),
+    ("es_search", {"hits": [{"doc_id": "a", "text": "x"}], "degrade_reason": "es_query_failed"},
+     False, "error"),
+    ("es_search", {"hits": [], "degrade_reason": "es_query_rejected"}, False, "error"),
+    ("es_search", {"hits": [], "truncated": True}, False, "limit"),
+    ("ripgrep_search", {"hits": [], "truncated_docs": ["b.md"]}, False, "truncated"),
+    ("ripgrep_search", {"hits": [{"doc_id": "a", "text": "x"}], "truncated_docs": ["b.md"]},
+     False, "truncated"),
+    # read_doc/read_around の引数誤り（範囲外・型不正）は「読めない」にせず記録しない対象。
+    ("read_doc", {"error": "range 外です", "error_code": M.agentic_search._READ_INVALID_ARGS_ERROR_CODE},
+     True, None),
+    ("read_around", {"error": "line/window は整数で",
+                     "error_code": M.agentic_search._READ_INVALID_ARGS_ERROR_CODE}, True, None),
+])
+def test_coverage_outcome_classification(name, result, is_error, expected):
+    assert M._coverage_outcome(name, result, is_error) == expected
+
+
+def test_item_coverage_read_doc_invalid_args_not_recorded(tmp_path, monkeypatch):
+    """read_doc の「range 外」エラーは coverage.jsonl に
+    書かれない——読めない系のエラー（`unreadable`）と混同しない。doc_id は実ヒットから取る
+    （既存の test_tools_call_read_doc_and_doc_outline_on_fixtures と同じ流儀）。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    hit_resp = M.handle({"jsonrpc": "2.0", "id": 209, "method": "tools/call",
+                         "params": {"name": "ripgrep_search", "arguments": {"query": "TAX-RATE"}}})
+    doc_id = json.loads(hit_resp["result"]["content"][0]["text"])["hits"][0]["doc_id"]
+    resp = M.handle({"jsonrpc": "2.0", "id": 210, "method": "tools/call",
+                     "params": {"name": "read_doc",
+                               "arguments": {"doc_id": doc_id, "start_line": 999999, "item": "g"}}})
+    assert resp["result"]["isError"]
+    assert "range 外" in json.loads(resp["result"]["content"][0]["text"])["error"]
+    assert not (directory / "coverage.jsonl").exists()
+
+
+def test_duplicate_tool_call_excludes_item_from_key_and_backfills_new_item_coverage(tmp_path, monkeypatch):
+    """`item` だけが違う同一条件の呼出は重複として拒否される
+    （`item` を除いた正規化キー）。拒否された呼出でも item が付いていれば、初回の結果区分をその
+    item にも記録する——run_tool を再実行せず結果を再送しないため、この item だけ coverage.jsonl
+    に記録が残らない事故を防ぐ。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    monkeypatch.setattr(M.agentic_search, "run_tool",
+                        lambda *a, **kw: ({"hits": [{"doc_id": "a.md", "text": "x"}]}, set(), [], []))
+    r1 = M.handle({"jsonrpc": "2.0", "id": 320, "method": "tools/call",
+                  "params": {"name": "ripgrep_search",
+                            "arguments": {"query": "COD16-DUP-ITEM-KEY", "item": "h1"}}})
+    assert not r1["result"]["isError"]
+    r2 = M.handle({"jsonrpc": "2.0", "id": 321, "method": "tools/call",
+                  "params": {"name": "ripgrep_search",
+                            "arguments": {"query": "COD16-DUP-ITEM-KEY", "item": "h2"}}})
+    assert r2["result"]["isError"]
+    assert json.loads(r2["result"]["content"][0]["text"])["error"] == "duplicate_tool_call"
+    assert IL.load_coverage(directory) == {"h1": ("hit",), "h2": ("hit",)}
 

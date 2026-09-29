@@ -901,3 +901,168 @@ def test_ledger_progressed_false_when_unsatisfied_item_unchanged():
     from sherpa.providers.codex import provider as PV
     snap = _unsatisfied_snapshot()
     assert PV._ledger_progressed(snap, snap) is False
+
+
+# ===== COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: `unverified` =====
+
+def test_unverified_is_terminal_and_does_not_block_completion():
+    item = _item("a", status="unverified", reason="not_searched", evidence=[])
+    manifest = _manifest("a")
+    snap = L.LedgerSnapshot(manifest=manifest, items={"a": item}, invalid_ids=())
+    verdict = L.ledger_complete(snap)
+    assert verdict.complete is True
+    assert verdict.terminal_counts == {"unverified": 1}
+
+
+@pytest.mark.parametrize("reason", sorted(L.UNVERIFIED_REASON_CODES))
+def test_unverified_accepts_each_closed_reason_code(reason):
+    item = _item("a", status="unverified", reason=reason, evidence=[])
+    assert L.validate_item(item) == []
+
+
+@pytest.mark.parametrize("reason", ["", "自由記述の理由", "search_truncated "])
+def test_unverified_rejects_reason_outside_closed_vocabulary(reason):
+    item = _item("a", status="unverified", reason=reason, evidence=[])
+    assert L.validate_item(item) != []
+
+
+# ===== coverage.jsonl（項目ごとの記録）=====
+
+def test_append_and_load_coverage_round_trip(tmp_path):
+    L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", "hit")
+    L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", "truncated")
+    L.append_coverage_atomic(tmp_path, "b", "read_doc", "unreadable")
+    coverage = L.load_coverage(tmp_path)
+    assert coverage == {"a": ("hit", "truncated"), "b": ("unreadable",)}
+    # 本文・引数は書かない契約——各行はちょうど4キー（item/tool/outcome/ts）だけ。
+    lines = [json.loads(l) for l in (tmp_path / "coverage.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(set(l.keys()) == {"item", "tool", "outcome", "ts"} for l in lines)
+
+
+def test_append_coverage_rejects_unsafe_item_id(tmp_path):
+    with pytest.raises(ValueError):
+        L.append_coverage_atomic(tmp_path, "../outside", "ripgrep_search", "hit")
+    assert not (tmp_path / "coverage.jsonl").exists()
+
+
+def test_append_coverage_rejects_unknown_outcome(tmp_path):
+    with pytest.raises(ValueError):
+        L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", "not-a-real-outcome")
+
+
+def test_load_coverage_empty_when_file_missing(tmp_path):
+    assert L.load_coverage(tmp_path) == {}
+
+
+def test_append_coverage_atomic_refuses_symlinked_coverage_file(tmp_path):
+    """`coverage.jsonl` 自体が symlink に差し替えられていたら（`_reject_symlinked_dir` は
+    dir の経路しか見ないため、この TOCTOU はファイル側で別に塞ぐ）追記せず `OSError`。"""
+    outside = tmp_path / "outside.jsonl"
+    ledger_dir = tmp_path / "investigation"
+    ledger_dir.mkdir()
+    (ledger_dir / "coverage.jsonl").symlink_to(outside)
+    with pytest.raises(OSError):
+        L.append_coverage_atomic(ledger_dir, "a", "ripgrep_search", "hit")
+    assert not outside.exists(), "symlink 先へ書いてはいけない"
+
+
+def test_load_coverage_ignores_broken_and_malformed_lines(tmp_path):
+    (tmp_path / "coverage.jsonl").write_text(
+        "{broken\n"
+        + json.dumps({"item": "a", "tool": "ripgrep_search", "outcome": "hit", "ts": 1.0}) + "\n"
+        + json.dumps({"item": "b", "tool": "ripgrep_search", "outcome": "not-a-real-outcome", "ts": 1.0}) + "\n"
+        + json.dumps({"item": "c", "outcome": "hit", "ts": 1.0}) + "\n",   # tool 欠落＝キー集合不一致
+        encoding="utf-8")
+    assert L.load_coverage(tmp_path) == {"a": ("hit",)}
+
+
+# ===== apply_unverified_downgrades（提案書§5 受け入れ）=====
+
+def _not_found(item_id: str, subject: str = "対象") -> dict:
+    return _item(item_id, status="not_found_in_scope", reason="調べたが見つからなかった",
+                subject=subject, evidence=[])
+
+
+def test_downgrade_truncated_coverage_to_unverified_search_truncated(tmp_path):
+    """受け入れ①: 切り詰めが起きた検索に item を付けた項目を not_found_in_scope で終えると
+    unverified（理由 search_truncated）になる。"""
+    L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", "truncated")
+    manifest = _manifest("a")
+    snap = L.LedgerSnapshot(manifest=manifest, items={"a": _not_found("a")}, invalid_ids=())
+    new_snap = L.apply_unverified_downgrades(tmp_path, snap)
+    assert new_snap.items["a"]["status"] == "unverified"
+    assert new_snap.items["a"]["reason"] == "search_truncated"
+    on_disk = json.loads((tmp_path / "items/a.json").read_text(encoding="utf-8"))
+    assert on_disk == new_snap.items["a"]
+
+
+def test_downgrade_no_coverage_at_all_to_unverified_not_searched(tmp_path):
+    """受け入れ②: item 付きの検索が無い「無い」は unverified（not_searched）になる。"""
+    manifest = _manifest("a")
+    snap = L.LedgerSnapshot(manifest=manifest, items={"a": _not_found("a")}, invalid_ids=())
+    new_snap = L.apply_unverified_downgrades(tmp_path, snap)
+    assert new_snap.items["a"]["status"] == "unverified"
+    assert new_snap.items["a"]["reason"] == "not_searched"
+
+
+def test_downgrade_clean_zero_hit_coverage_stays_not_found_in_scope(tmp_path):
+    """受け入れ③: 切り詰めの無い0件の検索だけなら not_found_in_scope のまま。"""
+    L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", "no_hits")
+    L.append_coverage_atomic(tmp_path, "a", "es_search", "no_hits")
+    manifest = _manifest("a")
+    snap = L.LedgerSnapshot(manifest=manifest, items={"a": _not_found("a")}, invalid_ids=())
+    new_snap = L.apply_unverified_downgrades(tmp_path, snap)
+    assert new_snap.items["a"]["status"] == "not_found_in_scope"
+    assert new_snap.items["a"]["reason"] == "調べたが見つからなかった"
+    assert not (tmp_path / "items/a.json").exists(), "書換えが起きないので元のまま（このテストは書いていない）"
+
+
+@pytest.mark.parametrize("outcome,expected_reason", [
+    ("timeout", "timeout"),
+    ("unreadable", "unreadable"),
+    ("limit", "search_truncated"),
+    ("error", "search_error"),
+])
+def test_downgrade_reason_priority_for_each_problem_outcome(tmp_path, outcome, expected_reason):
+    L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", outcome)
+    manifest = _manifest("a")
+    snap = L.LedgerSnapshot(manifest=manifest, items={"a": _not_found("a")}, invalid_ids=())
+    new_snap = L.apply_unverified_downgrades(tmp_path, snap)
+    assert new_snap.items["a"]["status"] == "unverified"
+    assert new_snap.items["a"]["reason"] == expected_reason
+
+
+def test_downgrade_ignores_unregistered_and_confirmed_and_other_statuses(tmp_path):
+    """登録集合に無い item・確認済み系の item・既に unverified の item は対象外
+    （coverage に問題があっても書き換えない）。"""
+    L.append_coverage_atomic(tmp_path, "a", "ripgrep_search", "timeout")
+    L.append_coverage_atomic(tmp_path, "b", "ripgrep_search", "timeout")
+    L.append_coverage_atomic(tmp_path, "c", "ripgrep_search", "timeout")
+    manifest = _manifest("b", "c")   # "a" は未登録
+    items = {
+        "a": _not_found("a"),                                      # 未登録
+        "b": _item("b", status="source_confirmed"),                # 確認済み系
+        "c": _item("c", status="unverified", reason="not_searched", evidence=[]),   # 既に unverified
+    }
+    snap = L.LedgerSnapshot(manifest=manifest, items=items, invalid_ids=())
+    new_snap = L.apply_unverified_downgrades(tmp_path, snap)
+    assert new_snap.items["a"]["status"] == "not_found_in_scope"   # 未登録は素通り
+    assert new_snap.items["b"]["status"] == "source_confirmed"
+    assert new_snap.items["c"]["reason"] == "not_searched"         # 変わらない
+    assert not (tmp_path / "items/b.json").exists() and not (tmp_path / "items/c.json").exists()
+
+
+def test_downgrade_exclude_ids_keeps_items_already_not_found_before_this_turn(tmp_path):
+    """`exclude_ids`（このターンの開始時点で既に not_found_in_scope だった item）に
+    含まれる id は、item 付きの記録が無ければ降格しない——前のターンで確定した項目を「調べた
+    記録が無い」という理由だけで unverified/not_searched にしない。記録があれば通常どおり判定する。"""
+    manifest = _manifest("a", "b", "c")
+    items = {"a": _not_found("a"), "b": _not_found("b"), "c": _not_found("c")}
+    L.append_coverage_atomic(tmp_path, "c", "ripgrep_search", "truncated")   # c だけ記録あり
+    snap = L.LedgerSnapshot(manifest=manifest, items=items, invalid_ids=())
+    new_snap = L.apply_unverified_downgrades(tmp_path, snap, exclude_ids=frozenset({"a", "c"}))
+    assert new_snap.items["a"]["status"] == "not_found_in_scope"   # 除外対象・記録なしは据え置き
+    assert new_snap.items["c"]["reason"] == "search_truncated"     # 除外対象でも記録があれば判定する
+    assert new_snap.items["b"]["status"] == "unverified"           # 除外されない item は通常どおり降格
+    assert new_snap.items["b"]["reason"] == "not_searched"
+    assert not (tmp_path / "items/a.json").exists()

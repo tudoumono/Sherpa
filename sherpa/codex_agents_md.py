@@ -287,6 +287,8 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
   worker は `ledger_item_put` だけを使い、自分に割り当てられた item だけを更新する。
   worker を使わない場合は親が全 item を登録・更新する（`owner: "parent"`）。同じ id を2つの
   プロセスが同時に更新しない。`error` が返ったら `problems` を読み、入力を直して再呼び出しする。
+- 台帳の項目のために探す・読むとき（ripgrep_search／es_search／read_doc／read_around／file_head／
+  graph_neighbors）は、その項目の item id を `item` 引数に付ける。
 - item の欄は `id`／`kind`／`subject`／`required_checks`／`evidence`／`status`／`reason`／`owner`
   の8キーちょうど（余分なキーは書かない）。`id` は英数字・ハイフン・アンダースコアのみ。`subject`・
   `reason` は2,000文字まで。`evidence` は `kind`（`source`／`spec_doc`／`definition`／

@@ -829,6 +829,19 @@ def test_write_agents_md_v2_paragraph_has_final_in_progress_wording(tmp_path):
     assert "予算到達" in v2_txt   # 中断条件（全件確認前・予算到達）が v2 段落自身に残っている
 
 
+def test_write_agents_md_v2_paragraph_mentions_item_argument_for_coverage(tmp_path):
+    """COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: 台帳段落は
+    「item のために探すときは付ける」とだけ足す（調べ方の指示は増やさない）——6ツール名を含む。"""
+    from sherpa import codex_agents_md
+    d = tmp_path / "authoring"
+    d.mkdir()
+    codex_agents_md.write_agents_md(d, output_schema=True, output_schema_v2=True)
+    txt = (d / "AGENTS.md").read_text(encoding="utf-8")
+    assert "item" in txt
+    for tool in ("ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors"):
+        assert tool in txt, tool
+
+
 def test_write_agents_md_v2_paragraph_requires_output_schema_on(tmp_path):
     """`output_schema=False` なら `output_schema_v2=True` を渡しても段落を足さない
     （`--output-schema` 自体が無効なターンへ CLI が強制しない構造化応答を約束させない）。"""
