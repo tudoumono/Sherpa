@@ -87,7 +87,7 @@ valid_port() {  # 1..65535 の10進整数だけを許す（ss/docker の引数�
 # ---------------------------------------------------------------------------
 check_pair() {  # $1=項目名 $2=compose変数名 $3=compose側ポート $4=アプリ変数名 $5=アプリ側URL/DSN
   local label="$1" cvar="$2" cport="$3" avar="$4" aval="$5" host aport parsed
-  if [ -n "${BAD_PORTS[$cvar]:-}" ]; then return 0; fi
+  if is_bad_port "$cvar"; then return 0; fi
   if [ -z "$aval" ]; then
     rows+=("$label|$cvar=$cport|($avar 未設定→同じポート)|-|OK")
     return
@@ -168,11 +168,13 @@ APP_V="${SHERPA_PORT:-8000}"
 PROJECT="${COMPOSE_PROJECT_NAME:-sherpa-mvp}"
 
 # 値が不正なまま ss / docker の検索条件へ渡さない。整合表には項目ごとに1度だけ出す。
-declare -A BAD_PORTS=()
+# 連想配列（bash 4+）は macOS 標準の bash 3.2 に無いので、空白区切りの変数名の列で持つ（変数名に空白は入らない）。
+BAD_PORTS=" "
+is_bad_port() { case "$BAD_PORTS" in *" $1 "*) return 0 ;; esac; return 1; }
 validate_config_port() {  # $1=表示名 $2=変数名 $3=値
   local label="$1" var="$2" port="$3"
   valid_port "$port" && return
-  BAD_PORTS["$var"]=1
+  BAD_PORTS="$BAD_PORTS$var "
   rows+=("$label|$var=$port|-|**ポート不正**|NG")
   fail "$label: $var は 1〜65535 の整数で指定してください（現在: $port）"
   fixes+=("$label: $var を 1〜65535 の空いているポートへ直してください。")
@@ -217,7 +219,18 @@ listener_info() {  # $1=port → listen 中なら "pid=… proc=…"（分かる
       return 0
     fi
   fi
-  # ss が無い環境（最小コンテナ等）: bash の /dev/tcp で接続を試す（listen していれば繋がる）。
+  # ss が無い環境（macOS 等）: lsof で listen している pid を取る（見えるのは権限の及ぶプロセスだけ）。
+  if command -v lsof >/dev/null 2>&1; then
+    local procs pids
+    out="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpc 2>/dev/null || true)"
+    pids="$(printf '%s\n' "$out" | sed -n 's/^p\([0-9][0-9]*\)$/\1/p' | sort -u | tr '\n' ',' | sed 's/,$//')"
+    if [ -n "$pids" ]; then   # pid の行が取れたときだけ信じる（形式の違う lsof の出力は使わない）
+      procs="$(printf '%s\n' "$out" | sed -n 's/^c//p' | head -1)"
+      printf 'proc=%s pids=%s' "${procs:-?}" "$pids"
+      return 0
+    fi
+  fi
+  # ss も lsof も使えない（最小コンテナ等）: bash の /dev/tcp で接続を試す（listen していれば繋がる）。
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     exec 3>&- 2>/dev/null || true
     printf 'proc=? pid=?'
@@ -247,7 +260,7 @@ docker_owner() {  # $1=port → ours:<names> / other:<names>。docker 不可な�
 
 check_port() {  # $1=項目名 $2=変数名 $3=port $4=種別（store|app）
   local label="$1" var="$2" port="$3" kind="$4" info owner
-  if [ -n "${BAD_PORTS[$var]:-}" ]; then return 0; fi
+  if is_bad_port "$var"; then return 0; fi
   if ! info="$(listener_info "$port")"; then
     rows+=("$label 占有|$var=$port|-|空き|OK")
     return
@@ -259,6 +272,12 @@ check_port() {  # $1=項目名 $2=変数名 $3=port $4=種別（store|app）
       # pids=a,b,c のいずれかが自アプリの pid（親）なら自分たち。多ワーカーでは子 pid が並ぶ。
       case ",${info##*pids=}," in *",$pid,"*)
         rows+=("$label 占有|$var=$port|-|使用中（自アプリ pid=$pid）|OK"); return ;;
+      esac
+      # listen の事実だけで pid が分からない（ss も lsof も無い）ときは、所有者を判定できないので保留する。
+      case "$info" in *pids=*) ;; *)
+        rows+=("$label 占有|$var=$port|-|使用中（所有者を確認できません）|WARN")
+        warn "$label: ポート $port は使用中ですが、使っているプロセスを確認できません（ss / lsof が無い）。"
+        return ;;
       esac
     fi
     rows+=("$label 占有|$var=$port|-|**他プロセスが使用中**（$info）|NG")
