@@ -101,7 +101,7 @@ check_pair() {  # $1=項目名 $2=compose変数名 $3=compose側ポート $4=ア
   read -r host aport <<<"$parsed"
   if ! valid_port "$aport"; then
     rows+=("$label|$cvar=$cport|$avar → $host:$aport|**ポート不正**|NG")
-    fail "$label: $avar のポートは 1〜65535 の整数で指定してください（現在: $aport）"
+    fail "$label: $avar のポートは 1〜65535 の整数で指定してください（現在: ${aport}）"
     fixes+=("$label: $avar を正しい URL/DSN に直してください。")
     return
   fi
@@ -156,7 +156,7 @@ check_remote() {  # $1=項目名 $2=compose変数名 $3=compose側ポート $4=�
   else
     rows+=("$label|$cvar=$cport|$avar → $host:$aport|**別ホスト・接続できず**|NG")
     fail "$label: $avar の接続先 $host:$aport に TCP 接続できません（3秒以内に応答なし）"
-    fixes+=("$label: 別ホストのストア（$label）が起動しているか、ファイアウォールでポート $aport が許可されているかを確認してください。まだ起動していない段階で先へ進むなら SHERPA_SKIP_PORT_CHECK=1 で疎通検査だけ省略できます。")
+    fixes+=("$label: 別ホストのストア（${label}）が起動しているか、ファイアウォールでポート $aport が許可されているかを確認してください。まだ起動していない段階で先へ進むなら SHERPA_SKIP_PORT_CHECK=1 で疎通検査だけ省略できます。")
   fi
 }
 
@@ -176,7 +176,7 @@ validate_config_port() {  # $1=表示名 $2=変数名 $3=値
   valid_port "$port" && return
   BAD_PORTS="$BAD_PORTS$var "
   rows+=("$label|$var=$port|-|**ポート不正**|NG")
-  fail "$label: $var は 1〜65535 の整数で指定してください（現在: $port）"
+  fail "$label: $var は 1〜65535 の整数で指定してください（現在: ${port}）"
   fixes+=("$label: $var を 1〜65535 の空いているポートへ直してください。")
 }
 validate_config_port "PostgreSQL"    PGPORT                 "$PGPORT_V"
@@ -271,7 +271,7 @@ check_port() {  # $1=項目名 $2=変数名 $3=port $4=種別（store|app）
     if pid="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)"; then
       # pids=a,b,c のいずれかが自アプリの pid（親）なら自分たち。多ワーカーでは子 pid が並ぶ。
       case ",${info##*pids=}," in *",$pid,"*)
-        rows+=("$label 占有|$var=$port|-|使用中（自アプリ pid=$pid）|OK"); return ;;
+        rows+=("$label 占有|$var=$port|-|使用中（自アプリ pid=${pid}）|OK"); return ;;
       esac
       # listen の事実だけで pid が分からない（ss も lsof も無い）ときは、所有者を判定できないので保留する。
       case "$info" in *pids=*) ;; *)
@@ -280,20 +280,20 @@ check_port() {  # $1=項目名 $2=変数名 $3=port $4=種別（store|app）
         return ;;
       esac
     fi
-    rows+=("$label 占有|$var=$port|-|**他プロセスが使用中**（$info）|NG")
-    fail "$label: ポート $port は既に他のプロセスが使っています（$info）"
+    rows+=("$label 占有|$var=$port|-|**他プロセスが使用中**（${info}）|NG")
+    fail "$label: ポート $port は既に他のプロセスが使っています（${info}）"
     fixes+=("$label: そのプロセスを止めるか、$var を空いているポートに変えてください。")
     return
   fi
   owner="$(docker_owner "$port")"
   case "$owner" in
     "!")
-      rows+=("$label 占有|$var=$port|-|**使用中・所有者不明**（docker 照会不可・$info）|NG")
-      fail "$label: ポート $port は使用中ですが、docker で所有者を確認できません（$info）"
+      rows+=("$label 占有|$var=$port|-|**使用中・所有者不明**（docker 照会不可・${info}）|NG")
+      fail "$label: ポート $port は使用中ですが、docker で所有者を確認できません（${info}）"
       fixes+=("$label: 自分たちの compose project のコンテナなら問題ありません。確認のうえ SHERPA_SKIP_PORT_CHECK=1 で通せます。他人のサービスなら $var を空いているポートに変えてください。") ;;
     "")
-      rows+=("$label 占有|$var=$port|-|**他プロセスが使用中**（$info）|NG")
-      fail "$label: ポート $port は既に他のプロセスが使っています（$info）"
+      rows+=("$label 占有|$var=$port|-|**他プロセスが使用中**（${info}）|NG")
+      fail "$label: ポート $port は既に他のプロセスが使っています（${info}）"
       fixes+=("$label: そのプロセスを止めるか、$var を空いているポートに変えてください（変えたらアプリ側の接続先も自動で追随します。DATABASE_URL/ES_URL/NEO4J_URI を明示している場合はそちらも）。") ;;
     ours:*)
       rows+=("$label 占有|$var=$port|-|使用中（自コンテナ ${owner#ours:}）|OK") ;;
@@ -302,7 +302,7 @@ check_port() {  # $1=項目名 $2=変数名 $3=port $4=種別（store|app）
       fail "$label: ポート $port は別の Docker コンテナ（${owner#other:}）が公開しています"
       fixes+=("$label: そのコンテナを止めるか、$var を空いているポートに変えてください。") ;;
     *)
-      rows+=("$label 占有|$var=$port|-|**所有者判定不正**（$owner）|NG")
+      rows+=("$label 占有|$var=$port|-|**所有者判定不正**（${owner}）|NG")
       fail "$label: ポート $port の Docker 所有者を安全に判定できません"
       fixes+=("$label: docker ps で所有者を確認し、原因を解消してください。") ;;
   esac

@@ -176,7 +176,7 @@ sherpa_codex_ensure_auth() {
   fi
   mkdir -p "$home" && chmod 700 "$home"
   if printf '%s\n' "$key" | codex login --with-api-key >/dev/null 2>&1; then
-    echo "Codex CLI を API キーで認証しました（$auth・通信なし）"
+    echo "Codex CLI を API キーで認証しました（${auth}・通信なし）"
     return 0
   fi
   echo "ⓘ Codex CLI の API キー認証に失敗しました。手動: printenv OPENAI_API_KEY | codex login --with-api-key" >&2

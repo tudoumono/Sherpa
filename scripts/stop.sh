@@ -29,7 +29,7 @@ stop_pid() {  # $1=表示名  $2=pidファイル  $3=コマンドライン照合
   fi
   case "$rc" in
     0)
-      echo "$label を停止します（pid $pid）..."
+      echo "$label を停止します（pid ${pid}）..."
       kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
       local deadline=$(( $(date +%s) + ${SHERPA_STOP_WAIT:-10} ))
       while kill -0 "$pid" 2>/dev/null; do

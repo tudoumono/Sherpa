@@ -62,7 +62,7 @@ missing=0
 
 if ! command -v "$PY" >/dev/null 2>&1; then
   cat >&2 <<EOF
-✗ Python3 が見つかりません（コマンド: $PY）。
+✗ Python3 が見つかりません（コマンド: ${PY}）。
   Sherpa の起動には Python3 が必要です。
   Ubuntu / WSL2 での導入例:
     sudo apt update && sudo apt install -y python3 python3-venv python3-pip
@@ -70,6 +70,16 @@ if ! command -v "$PY" >/dev/null 2>&1; then
 EOF
   missing=1
 fi
+
+# docker compose version はデーモンが止まっていても成功するので、到達性は docker info で見る
+# （止まっていると待つことがあるため、timeout があれば上限を付ける）。
+docker_reachable() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 docker info >/dev/null 2>&1
+  else
+    docker info >/dev/null 2>&1
+  fi
+}
 
 if ! command -v docker >/dev/null 2>&1; then
   cat >&2 <<'EOF'
@@ -86,6 +96,16 @@ elif ! docker compose version >/dev/null 2>&1; then
   Docker Desktop / Docker Engine が起動しているか、Docker Compose が有効かを確認してください。
   （Docker Desktop の場合は、先にアプリを起動しておく必要があります）
   確認:  docker compose version
+EOF
+  missing=1
+elif ! docker_reachable; then
+  cat >&2 <<'EOF'
+✗ Docker は入っていますが、Docker の本体（デーモン）に接続できません。
+  macOS:  Docker Desktop を起動してください（open -a Docker）。メニューバーのクジラが動きを止めるまで待ちます。
+  Linux:  sudo systemctl start docker
+          起動しているのに繋がらないときは、docker を使う権限を確認してください
+          （sudo usermod -aG docker "$USER" のあと、ログインし直す）。
+  確認:  docker info
 EOF
   missing=1
 fi
@@ -113,7 +133,7 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 # --- 既に起動していれば二重起動しない（pid の所有者を検証してから判定・RV High-1） ---
 if pid="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE")"; then
-  echo "Sherpa は既に起動しています（pid $pid）。"
+  echo "Sherpa は既に起動しています（pid ${pid}）。"
   echo "  URL:    $CHAT_URL"
   echo "  状態:   make status"
   echo "  停止:   make stop"
@@ -214,7 +234,7 @@ launch_bg() {  # $1=ログファイル  $2=pidファイル  $3...=exec するコ
 # --- アプリをバックグラウンド起動 ---
 # 前回ログが非空なら退避してから空で作り直す（起動のたびに上書きしない・LOG-2）。
 sherpa_rotate_log "$APP_LOG"
-echo "Sherpa アプリを起動します（モード: $MODE・ログ: ${APP_LOG#$ROOT/}）..."
+echo "Sherpa アプリを起動します（モード: ${MODE}・ログ: ${APP_LOG#$ROOT/}）..."
 launch_bg "$APP_LOG" "$APP_PID_FILE" ./scripts/run-api.sh "$MODE"
 
 # healthz が応答するまで待つ（既定30秒）。
@@ -234,7 +254,7 @@ until healthz_ok; do
     echo "✗ アプリの起動確認（healthz）が ${APP_WAIT}秒でタイムアウトしました。" >&2
     # タイムアウトした起動プロセスを残さない（RV Med-2）: 停止してから pid ファイルを消す。
     if pid="$(live_pid "$APP_PID_FILE")"; then
-      echo "  起動したプロセス（pid $pid）を停止します..." >&2
+      echo "  起動したプロセス（pid ${pid}）を停止します..." >&2
       kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
       sleep 1
       if kill -0 "$pid" 2>/dev/null; then
@@ -265,7 +285,7 @@ caddy_started=0
 if [ "$LAN" = "1" ]; then
   if command -v caddy >/dev/null 2>&1 && [ -f "$ROOT/deploy/Caddyfile" ]; then
     if pid="$(live_matching_pid "$CADDY_PID_FILE" "$CADDY_PROC_NEEDLE")"; then
-      echo "Caddy は既に起動しています（pid $pid）。"
+      echo "Caddy は既に起動しています（pid ${pid}）。"
       caddy_started=1
     else
       [ -f "$CADDY_PID_FILE" ] && rm -f "$CADDY_PID_FILE"
@@ -300,7 +320,7 @@ fi
 # --- 起動完了の案内 ---
 echo ""
 echo "──────────────────────────────────────────────"
-echo "Sherpa を起動しました（モード: $MODE）。"
+echo "Sherpa を起動しました（モード: ${MODE}）。"
 echo "  ローカル:  $CHAT_URL"
 if [ "$LAN" = "1" ]; then
   if [ "$caddy_started" = 1 ]; then

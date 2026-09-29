@@ -21,7 +21,7 @@ LOCK="$ROOT/docker/ocr-models.lock.json"
 # OCR の依存はコアと同居できない（コア=numpy 2.5系 / paddlex=numpy<2.4 必須）。
 # そのため専用の venv を使う。無ければ作る。
 if [ ! -x "$VENV/bin/python" ]; then
-  echo "==> OCR 用の Python 環境を作ります（$VENV）"
+  echo "==> OCR 用の Python 環境を作ります（${VENV}）"
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install -q --upgrade pip
 fi

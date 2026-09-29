@@ -86,7 +86,7 @@ DBNAME="sherpa_test_${LANE}"
 
 PY="$(gate_resolve_venv_python "$WORKTREE")"
 if [ ! -x "$PY" ]; then
-  echo "venv の python が見つかりません（$PY）。worktree または主リポジトリに .venv を用意してください" >&2
+  echo "venv の python が見つかりません（${PY}）。worktree または主リポジトリに .venv を用意してください" >&2
   exit 2
 fi
 
@@ -94,7 +94,7 @@ fi
 LANE_LOCKFILE="/tmp/sherpa-gate-${LANE}.lock"
 echo "=== integration ($LANE): レーン別ロック待ち ($(date +%H:%M:%S))"
 if ! gate_acquire_named_lock "$LANE_LOCKFILE"; then
-  echo "integration ($LANE): レーン別ロックの取得に失敗しました（$LANE_LOCKFILE）" >&2
+  echo "integration ($LANE): レーン別ロックの取得に失敗しました（${LANE_LOCKFILE}）" >&2
   exit 1
 fi
 
@@ -102,7 +102,7 @@ fi
 echo "=== integration ($LANE): 専用ロック待ち ($(date +%H:%M:%S))"
 exec {LOCK_FD}>"$GATE_INTEGRATION_LOCKFILE"
 if ! flock "$LOCK_FD"; then
-  echo "integration ($LANE): 専用ロックの取得に失敗しました（$GATE_INTEGRATION_LOCKFILE）" >&2
+  echo "integration ($LANE): 専用ロックの取得に失敗しました（${GATE_INTEGRATION_LOCKFILE}）" >&2
   exit 1
 fi
 echo "=== integration ($LANE): 専用ロック確保 ($(date +%H:%M:%S))"

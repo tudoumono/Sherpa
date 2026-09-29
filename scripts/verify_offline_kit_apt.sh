@@ -122,7 +122,7 @@ _host_image_prereqs_ok() {
   for pkg in $HOST_PREREQ_PACKAGES; do
     status="$(docker run --rm "$img" dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)"
     if [ "$status" != installed ]; then
-      warn "  前提パッケージが未導入です: $pkg（$img）"
+      warn "  前提パッケージが未導入です: ${pkg}（${img}）"
       return 1
     fi
   done
@@ -139,7 +139,7 @@ _host_image_fresh() {
   base="$(docker image inspect --format '{{index .Config.Labels "sherpa.wftest.base_tag"}}' "$img" 2>/dev/null || true)"
   snap="$(docker image inspect --format '{{index .Config.Labels "sherpa.wftest.snapshot"}}' "$img" 2>/dev/null || true)"
   if [ "$recipe" != "$HOST_RECIPE_VERSION" ] || [ "$base" != "$HOST_BASE_TAG" ] || [ "$snap" != "$SNAPSHOT" ]; then
-    warn "  来歴 label が一致しません（label: recipe=$recipe base=$base snapshot=$snap / 現在: recipe=$HOST_RECIPE_VERSION base=$HOST_BASE_TAG snapshot=$SNAPSHOT）"
+    warn "  来歴 label が一致しません（label: recipe=$recipe base=$base snapshot=$snap / 現在: recipe=$HOST_RECIPE_VERSION base=$HOST_BASE_TAG snapshot=${SNAPSHOT}）"
     return 1
   fi
   # 2026-08-18（Codex RV 2巡目 指摘6）: `_build_host_image` は導入パッケージ集合の sha256
@@ -158,8 +158,8 @@ _host_image_fresh() {
 }
 
 _build_host_image() {
-  note "検証用ホスト像（$HOST_IMAGE）を構築します: $HOST_BASE_TAG に ubuntu-minimal/ubuntu-standard/ubuntu-server＋"
-  note "  linux-image-generic を snapshot $SNAPSHOT（GA 直後）で導入し、apt lists を空にします（オンライン・数分）..."
+  note "検証用ホスト像（${HOST_IMAGE}）を構築します: $HOST_BASE_TAG に ubuntu-minimal/ubuntu-standard/ubuntu-server＋"
+  note "  linux-image-generic を snapshot ${SNAPSHOT}（GA 直後）で導入し、apt lists を空にします（オンライン・数分）..."
   note "  RV MED-2: recommends 込みで導入します（--no-install-recommends は外した。実機の Ubuntu Server 標準"
   note "  導入（apt 既定 Install-Recommends=yes）に近づけ、この検証の目的＝搬入先の導入済み集合の近似の忠実性を優先する判断）。"
   docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
@@ -188,7 +188,7 @@ _build_host_image() {
   for pkg in $HOST_PREREQ_PACKAGES; do
     status="$(docker exec "$BUILD_CONTAINER" dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null || true)"
     if [ "$status" != installed ]; then
-      fail "検証用ホスト像の構築: 前提パッケージが導入されていません（$pkg）。recommends 込みでも入らない場合は"
+      fail "検証用ホスト像の構築: 前提パッケージが導入されていません（${pkg}）。recommends 込みでも入らない場合は"
       fail "  ホスト像のレシピ（このスクリプト §1）の見直しが必要です。"
       docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
       return 1
@@ -204,7 +204,7 @@ _build_host_image() {
     --change "LABEL sherpa.wftest.pkgset_sha256=$PKGSET_SHA256" \
     "$BUILD_CONTAINER" "$HOST_IMAGE" >/dev/null
   docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
-  ok "検証用ホスト像を用意しました: $HOST_IMAGE（recipe=$HOST_RECIPE_VERSION pkgset_sha256=${PKGSET_SHA256:0:12}…・導入パッケージ一覧は"
+  ok "検証用ホスト像を用意しました: ${HOST_IMAGE}（recipe=$HOST_RECIPE_VERSION pkgset_sha256=${PKGSET_SHA256:0:12}…・導入パッケージ一覧は"
   ok "  docker run --rm $HOST_IMAGE cat /root/PACKAGE-LIST.txt で確認可）"
 }
 
@@ -212,7 +212,7 @@ if [ "${SHERPA_WFTEST_REBUILD_HOST:-0}" = 1 ]; then
   note "SHERPA_WFTEST_REBUILD_HOST=1 のため、既存のホスト像を確認せず作り直します。"
   _build_host_image || exit 2
 elif docker image inspect "$HOST_IMAGE" >/dev/null 2>&1; then
-  note "検証用ホスト像（$HOST_IMAGE）は既にあります。来歴（レシピ版/ベースタグ/snapshot/前提パッケージ）を照合します..."
+  note "検証用ホスト像（${HOST_IMAGE}）は既にあります。来歴（レシピ版/ベースタグ/snapshot/前提パッケージ）を照合します..."
   if _host_image_fresh "$HOST_IMAGE"; then
     note "→ 来歴が一致するため再利用します（作り直すには SHERPA_WFTEST_REBUILD_HOST=1）。"
   else
@@ -277,7 +277,7 @@ _verify_group() {  # $1=表示名 $2=キット内の group_dir（相対）
   fi
 }
 
-echo "--- apt グループの実導入（--network none・$KIT） ---"
+echo "--- apt グループの実導入（--network none・${KIT}） ---"
 BEFORE_KERNEL="$(_apt_offline_kernel_snapshot)"
 _verify_group "Python 実行系"          "python/debs"
 _verify_group "Docker Engine"          "docker-engine/debs"
@@ -302,7 +302,7 @@ fi
 ok "出荷ゲート: OK（削除ゼロ・カーネル残存・導入失敗なしを確認しました）。"
 DRV
 
-note "検証用ホスト（$HOST_IMAGE）を --network none で起動し、キット（$KIT_DIR）を実導入します..."
+note "検証用ホスト（${HOST_IMAGE}）を --network none で起動し、キット（${KIT_DIR}）を実導入します..."
 echo ""
 RC=0
 docker run --rm --network none \
@@ -313,7 +313,7 @@ docker run --rm --network none \
   "$HOST_IMAGE" bash /mnt/driver.sh || RC=$?
 echo ""
 if [ "$RC" != 0 ]; then
-  fail "出荷ゲート NG（終了コード $RC）。キット（$KIT_DIR）を搬入前に修正してください。"
+  fail "出荷ゲート NG（終了コード ${RC}）。キット（${KIT_DIR}）を搬入前に修正してください。"
   exit "$RC"
 fi
 ok "出荷ゲート OK: $KIT_DIR は搬入先相当のホストへ削除ゼロ・カーネル残存で導入できます。"

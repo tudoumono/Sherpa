@@ -146,11 +146,11 @@ while IFS= read -r -d '' payload; do
   rel="${payload#"$SRC/"}"
   [ "$rel" = MANIFEST ] && continue
   if ! is_allowed "$rel"; then
-    fail "MANIFEST にないファイルがあります: $rel（復元対象へ混入させないため中止）"
+    fail "MANIFEST にないファイルがあります: ${rel}（復元対象へ混入させないため中止）"
     exit 1
   fi
   if ! is_seen "$rel"; then
-    fail "MANIFEST にないファイルがあります: $rel（sha256 未照合）"
+    fail "MANIFEST にないファイルがあります: ${rel}（sha256 未照合）"
     exit 1
   fi
 done < <(find "$SRC" -mindepth 1 ! -type d -print0)
@@ -212,7 +212,7 @@ fi
 APP_RUNNING=""
 # アプリの稼働判定は project 名に依らない（pid ファイルはこのリポジトリのアプリを指す・RV）。
 if APP_RUNNING="$(live_matching_pid "$APP_PID_FILE" "$APP_PROC_NEEDLE" 2>/dev/null)"; then
-  fail "アプリが稼働中です（pid=$APP_RUNNING）。個人領域/ストアへの書込みを止めるため、make stop してから再実行してください。"
+  fail "アプリが稼働中です（pid=${APP_RUNNING}）。個人領域/ストアへの書込みを止めるため、make stop してから再実行してください。"
   exit 1
 fi
 
@@ -237,7 +237,7 @@ command -v docker >/dev/null 2>&1 || { fail "docker が見つかりません（�
   ATTACHED_ALL="$(printf '%s\n' "$ATTACHED_ALL" | sed '/^$/d' | sort -u)"
   if [ -n "$ATTACHED_ALL" ]; then
     fail "ボリュームを参照しているコンテナがあります（稼働中/停止中を問わず、掴まれたままでは差し替えられません）:"
-    while IFS=$'\t' read -r cname cstate; do fail "    $cname（$cstate）"; done <<<"$ATTACHED_ALL"
+    while IFS=$'\t' read -r cname cstate; do fail "    ${cname}（${cstate}）"; done <<<"$ATTACHED_ALL"
     fail "  make stop（compose down＝コンテナは削除・ボリュームは残る）を実行してから再実行してください。"
     fail "  compose 管理外のコンテナなら docker rm <名前> で外してください。"
     exit 1
@@ -251,7 +251,7 @@ command -v docker >/dev/null 2>&1 || { fail "docker が見つかりません（�
 fi
 
 echo "=== Sherpa 復元 ==="
-echo "元:            $SRC（$(manifest_get version) / $(manifest_get created) / $(manifest_get host)）"
+echo "元:            ${SRC}（$(manifest_get version) / $(manifest_get created) / $(manifest_get host)）"
 echo "プロジェクト:  $PROJECT"
 for f in "${VOL_TARS[@]}"; do
   base="$(basename "$f" .tar.gz)"
@@ -282,7 +282,7 @@ for f in "${VOL_TARS[@]}"; do
   vol="${base/#${SRC_PROJECT}_/${PROJECT}_}"
   note "ボリューム $vol を作り直して展開中..."
   if _docker volume inspect "$vol" >/dev/null 2>&1; then
-    _docker volume rm "$vol" >/dev/null || { fail "既存 volume を削除できません: $vol（何かが使用中でないか確認してください）"; exit 1; }
+    _docker volume rm "$vol" >/dev/null || { fail "既存 volume を削除できません: ${vol}（何かが使用中でないか確認してください）"; exit 1; }
   fi
   _docker volume create "$vol" >/dev/null
   _docker run --rm --entrypoint tar -v "$vol:/v" -v "$SRC/volumes:/b:ro" "$IMAGE" \
@@ -305,7 +305,7 @@ restore_dir() {  # $1=tar $2=展開先
   fi
   if ! tar xzf "$tar" -C "$tmp"; then
     rm -rf -- "$tmp"
-    fail "展開に失敗しました: $tar（現在の $dir は変更していません）"
+    fail "展開に失敗しました: ${tar}（現在の $dir は変更していません）"
     return 1
   fi
   if [ -e "$dir" ]; then
@@ -338,7 +338,7 @@ if [ -f "$SRC/derived.tar.gz" ]; then restore_dir "$SRC/derived.tar.gz" "$DERIVE
 if [ -f "$SRC/env" ]; then
   if [ -f "$ENV_FILE" ]; then
     if diff -q "$SRC/env" "$ENV_FILE" >/dev/null 2>&1; then
-      ok ".env はバックアップと同一（$ENV_FILE）"
+      ok ".env はバックアップと同一（${ENV_FILE}）"
     else
       warn ".env に差分があります（上書きしていません・必要なら手で反映）: $ENV_FILE ← $SRC/env"
       # API key/password を端末ログへ漏らさない。差分行から変数名だけを抽出し、値は一切表示しない。
@@ -352,7 +352,7 @@ if [ -f "$SRC/env" ]; then
       fi
     fi
   else
-    warn "現在の .env がありません（$ENV_FILE）。バックアップの $SRC/env を参考に用意してください（自動では置きません）。"
+    warn "現在の .env がありません（${ENV_FILE}）。バックアップの $SRC/env を参考に用意してください（自動では置きません）。"
   fi
 fi
 
