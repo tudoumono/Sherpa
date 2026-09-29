@@ -182,6 +182,12 @@ _DESC_GRAPH_PLAIN = (
     "`unverified` の辺を含む経路は候補＝原本で確認する。名前は完全一致で引く（シェルで正確な名前を見つけてから"
     "渡す）。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
 )
+# plain（台帳を持たない・「何も変えない」契約）は `item`（COD-16・§2）を出さない——
+# `agentic_search._PARAMS_GRAPH` は6ツール共通スキーマのため item を含むが、`name` の schema/
+# 説明は共有したまま `item` だけを除いたコピーを使う（`name` の二重管理はしない）。
+_PARAMS_GRAPH_PLAIN = {**agentic_search._PARAMS_GRAPH,
+                      "properties": {k: v for k, v in agentic_search._PARAMS_GRAPH["properties"].items()
+                                     if k != "item"}}
 
 
 def _tool_defs() -> list:
@@ -201,7 +207,7 @@ def _tool_defs() -> list:
         defs = []
         if _layer() in (None, "both"):
             defs.append({"name": "graph_neighbors", "description": _DESC_GRAPH_PLAIN,
-                        "inputSchema": agentic_search._PARAMS_GRAPH})
+                        "inputSchema": _PARAMS_GRAPH_PLAIN})
         if not _ask_disabled():
             defs.append({"name": "ask_user", "description": agentic_search._DESC_ASK,
                         "inputSchema": agentic_search._PARAMS_ASK})
@@ -348,6 +354,108 @@ def _sidecar_error_code(name, result) -> None:
         if isinstance(code, str) and code in _SIDECAR_ERROR_CODES:
             _sidecar_append({"kind": "error", "code": code, "tool": name, "ts": time.time()})
             return
+
+
+# ---- COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: 項目ごとの未確認 ----
+# 検索・読取ツール6本（任意引数 `item`＝台帳の項目 id・`agentic_search._ITEM_PARAM_SCHEMA` 参照）の
+# 呼出結果を `investigation_ledger.append_coverage_atomic` で台帳の置き場（coverage.jsonl）へ記録
+# する。親・子（`spawn_agent` の worker）は同じ `SHERPA_MCP_LEDGER_DIR` を渡されるため、この
+# 記録も台帳の items/ と同じく親子で共有される（サイドカーを介さない・台帳と同じ書込手段）。
+_ITEM_PARAM_TOOLS = frozenset({
+    "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors"})
+_ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})   # `hits` 配列を持つ形
+_ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head"})   # 単一文書読取の形
+# 単一文書読取の error はほぼ全て「その doc_id を読めなかった」ことを意味する（scope 外・秘匿・
+# IO 失敗のいずれも呼び出し元からは同じ「読めない」に見える）——read 系だけはこの単純化を採る。
+# 検索・グラフ系の error はこの単純化をせず、`error_code` が既知の「読めない」系コードのときだけ
+# unreadable にする（それ以外は一般 error）。
+_ITEM_UNREADABLE_ERROR_CODES = frozenset({"read_io_failed"})
+
+
+def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
+    """`item` 付き呼出しの結果を、`investigation_ledger.COVERAGE_OUTCOMES` の7区分へ落とす。
+    戻り値が `None` のときは記録しない対象（呼び出し側の引数誤り＝範囲外/型不正——道具や
+    対象が読み取れないわけではなく、どちらの区分にも当てはまらない）。
+
+    母集団側の打切り（`truncated`＝件数上限）・1件あたりのバイト予算の打切り
+    （`text_truncated`／`file_truncated`／`byte_clipped`／`partial_hit`／`partial_line`）は、
+    利用統計「打ち切りの内訳」（`agentic_search._SEARCH_TRUNCATED_TOOLS`/`_BYTE_CLIP_TOOLS`）と
+    同じ判定キーを使う（車輪の再発明をしない・語彙だけ7区分へ翻訳する）。`timeout` はこの経路
+    （MCP は `run_tool()` へ `deadline` を渡さない）では実際には発生しないが、
+    `investigation_ledger.UNVERIFIED_REASON_CODES` の閉じた語彙に対応する区分として温存する。
+    """
+    if not isinstance(result, dict):
+        return "error"
+    if is_error:
+        if name in _ITEM_READ_TOOLS:
+            if result.get("error_code") == agentic_search._READ_INVALID_ARGS_ERROR_CODE:
+                return None   # 呼び出し側の引数誤り（範囲外・型不正）——読めない扱いにしない
+            return "unreadable"
+        if result.get("error_code") in _ITEM_UNREADABLE_ERROR_CODES:
+            return "unreadable"
+        return "error"
+    if name in _ITEM_HITS_TOOLS:
+        # 0件の判定より前に、道具そのものの失敗（error）・母集団側の打切り（limit）・
+        # バイト予算での打切り（truncated_docs）を判定する——ヒットが有っても
+        # `truncated_docs` があれば truncated（探せていない文書がある事実は隠さない）。
+        if name == "es_search" and result.get("degrade_reason") in (
+                "es_unavailable", "es_query_failed", "es_query_rejected"):
+            return "error"
+        if result.get("truncated"):
+            return "limit"
+        if result.get("truncated_docs"):
+            return "truncated"
+        hits = result.get("hits")
+        if isinstance(hits, list) and len(hits) == 0:
+            return "no_hits"
+        if isinstance(hits, list) and any(
+                isinstance(h, dict) and (h.get("text_truncated") or h.get("file_truncated"))
+                for h in hits):
+            return "truncated"
+        return "hit"
+    if name == "graph_neighbors":
+        if result.get("error_code"):   # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
+            return "error"
+        neighbors = result.get("neighbors")
+        if isinstance(neighbors, list) and len(neighbors) == 0:
+            return "no_hits"
+        if result.get("truncated"):
+            return "limit"
+        return "hit"
+    # read_doc/read_around/file_head（単一文書読取の形）
+    if (result.get("text_truncated") or result.get("file_truncated") or result.get("truncated")
+            or result.get("byte_clipped") or result.get("partial_hit") or result.get("partial_line")):
+        return "truncated"
+    return "hit"
+
+
+def _record_item_coverage(name: str, args: dict, result, is_error: bool) -> None:
+    """`item` 引数つきの検索・読取ツール呼出しの結果区分を台帳の置き場（coverage.jsonl）へ追記
+    する。**fail-open**——`item` が無い/不正・対象外ツール・`_coverage_outcome` が `None`
+    （呼び出し側の引数誤り）・`SHERPA_MCP_LEDGER_DIR` 未設定（台帳を使わないターン・素の Codex
+    モード）はいずれも何もしない。書込に失敗しても（`OSError`/`ValueError`＝`item` が安全でない
+    id）ツール呼出自体は失敗させない——観測用の副記録であって、ツール結果本体の契約ではない。"""
+    if name not in _ITEM_PARAM_TOOLS:
+        return
+    outcome = _coverage_outcome(name, result, is_error)
+    if outcome is None:
+        return
+    # `item` を除いた正規化キー（`_dedup_key`）へこの結果区分を控える（`item` の無い呼出しも）
+    # ——後で同じ条件が item 付きで重複呼出しされたとき（`_is_duplicate_tool_call`）、run_tool を
+    # 再実行せずにこの結果区分をその item へ転記できる（`_record_duplicate_item_coverage` 参照）。
+    _dkey = _dedup_key(name, args)
+    if _dkey is not None and _dkey in _seen_tool_calls:
+        _seen_tool_calls[_dkey] = outcome
+    item_id = args.get("item") if isinstance(args, dict) else None
+    if not isinstance(item_id, str) or not item_id:
+        return
+    ledger_dir = os.environ.get("SHERPA_MCP_LEDGER_DIR")
+    if not ledger_dir:
+        return
+    try:
+        investigation_ledger.append_coverage_atomic(Path(ledger_dir), item_id, name, outcome)
+    except (OSError, ValueError):
+        pass
 
 
 # ---- ツール結果1件あたりのバイト予算・調べる深さ連動の実効上限（Azure 実機の
@@ -673,22 +781,37 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
 # モジュール docstring の DEPTH-2 S3b 参照）で (ツール名, 引数の正規化 JSON) だけを覚え、結果本文は
 # 一切保持しない（メモリ・漏洩の両面）。multi_agent の子エージェントは親とは別に覚える。
 _DUPLICATE_CALL_CACHE_MAX = 64
-_seen_tool_calls: "OrderedDict[tuple, None]" = OrderedDict()
+# 値は COD-16 の結果区分（`_coverage_outcome` の戻り値）——初回呼出しの結果が確定するまでは
+# `None`（`_is_duplicate_tool_call` が挿入した直後の値・`_record_item_coverage` が後から埋める）。
+_seen_tool_calls: "OrderedDict[tuple, str | None]" = OrderedDict()
 # ask_user は専用分岐で既に処理済み（重複可＝毎回同じ確認文言を返す契約）。`_BUDGET_EXEMPT_TOOLS`
 # （一覧のみの土台系）も対象外——list_docs/folder_tree を繰り返し呼ぶこと自体は実害が無い。
 _DUPLICATE_CHECK_EXEMPT_TOOLS = frozenset({"ask_user"}) | _BUDGET_EXEMPT_TOOLS
 
 
+def _dedup_key(name: str, args) -> tuple | None:
+    """重複判定・COD-16 の結果区分キャッシュが共有する正規化キー。`item`（台帳の項目 id）は
+    除いて正規化する——同じ検索条件を別の item タグで呼び直しても、道具として見た呼出しの
+    同一性は変わらない（`item` は Sherpa 側の付け札であって Codex から見た引数ではない）。
+    直列化できない引数は `None`（同一性を判定できない・呼び出し側は fail-open にする）。
+    """
+    try:
+        _key_args = ({k: v for k, v in args.items() if k != "item"}
+                    if isinstance(args, dict) else args)
+        return (name, json.dumps(_key_args, sort_keys=True, ensure_ascii=False))
+    except TypeError:
+        return None
+
+
 def _is_duplicate_tool_call(name: str, args: dict) -> bool:
     """同一 `(name, 正規化した args)` の2回目以降の呼出なら True（初回はここで記録するだけ）。
 
-    `json.dumps(args, sort_keys=True)` でキー順の違いを同一視する。件数上限
+    `_dedup_key` でキー順の違い・`item` の違いを同一視する。件数上限
     （`_DUPLICATE_CALL_CACHE_MAX`）に達したら最も古いキーから捨てる（LRU）——無限に覚え続けて
     プロセスのメモリを圧迫しないため。
     """
-    try:
-        key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
-    except TypeError:
+    key = _dedup_key(name, args)
+    if key is None:
         return False   # 直列化できない引数は同一性を判定できない＝重複扱いしない（fail-open）
     if key in _seen_tool_calls:
         _seen_tool_calls.move_to_end(key)
@@ -697,6 +820,34 @@ def _is_duplicate_tool_call(name: str, args: dict) -> bool:
     if len(_seen_tool_calls) > _DUPLICATE_CALL_CACHE_MAX:
         _seen_tool_calls.popitem(last=False)
     return False
+
+
+def _record_duplicate_item_coverage(name: str, args: dict) -> None:
+    """重複拒否した呼出し（`_is_duplicate_tool_call` が `True`）でも、`item` が付いていれば
+    初回呼出しの結果区分（`_seen_tool_calls` に控えた値）をこの item にも記録する（COD-16）。
+    重複拒否は run_tool を呼ばず結果を再送しないため、これをしないとこの item だけ
+    coverage.jsonl に記録が残らず「調べた記録が無い」（`not_searched`）に誤判定される。
+
+    初回の結果区分がまだ確定していない（同一キーの呼出しが並行している等）・`item` 無し・
+    対象外ツール・`_coverage_outcome` が記録しない対象（`None`）だった場合はいずれも何もしない
+    （fail-open・観測用の副記録）。
+    """
+    if name not in _ITEM_PARAM_TOOLS:
+        return
+    item_id = args.get("item") if isinstance(args, dict) else None
+    if not isinstance(item_id, str) or not item_id:
+        return
+    key = _dedup_key(name, args)
+    outcome = _seen_tool_calls.get(key) if key is not None else None
+    if outcome is None:
+        return
+    ledger_dir = os.environ.get("SHERPA_MCP_LEDGER_DIR")
+    if not ledger_dir:
+        return
+    try:
+        investigation_ledger.append_coverage_atomic(Path(ledger_dir), item_id, name, outcome)
+    except (OSError, ValueError):
+        pass
 
 
 def _ok(rid, result: dict) -> dict:
@@ -760,6 +911,7 @@ def handle(req: dict) -> dict | None:
             # 同一条件の再実行は run_tool を呼ばず本文も再送しない（実機で同じ ripgrep_search が
             # 2回ずつ走り同一結果を二重に文脈へ積んでいた事象への対処・module docstring 参照）。
             _sidecar_append({"kind": "limit", "field": "duplicate_tool_call", "ts": time.time()})
+            _record_duplicate_item_coverage(name, args)   # COD-16: 初回の結果区分をこの item にも転記
             err_body = {"error": "duplicate_tool_call",
                        "hint": "同じ条件の検索は既に実行済みです。条件を変えてください。"}
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
@@ -788,6 +940,7 @@ def handle(req: dict) -> dict | None:
             err_body = {"error": agentic_search.GRAPH_REINGEST_ERROR_CODE,
                         "world": e.world, "stored_era": e.stored_era}
             _sidecar_error_code(name, err_body)   # 子が受け取った障害も親が観測できるようにする
+            _record_item_coverage(name, args, err_body, True)
             return _ok(rid, {"content": [{"type": "text", "text": json.dumps(err_body, ensure_ascii=False)}],
                              "isError": True})
         is_error = bool(isinstance(result, dict) and result.get("error"))
@@ -831,6 +984,9 @@ def handle(req: dict) -> dict | None:
             # （成功ページを装わない契約）——`is_error` はクリップ前の結果で確定済みのため、
             # クリップ後に error 形へ変わった分もここで同じ基準（`result.get("error")`）で拾い直す。
             is_error = is_error or bool(isinstance(result, dict) and result.get("error"))
+        # COD-16: `item` 付き呼出しの結果区分を台帳へ記録する（Codex へ返す最終形＝クリップ後の
+        # `result`/`is_error` を使う——外側クリップ自体が「切り詰め」の事実そのものであるため）。
+        _record_item_coverage(name, args, result, is_error)
         # MCP 標準＝content[].text。Codex が読む本文＝run_tool の結果（graph_neighbors は compact neighbors）。
         text = json.dumps(result, ensure_ascii=False)
         return _ok(rid, {"content": [{"type": "text", "text": text}], "isError": is_error})

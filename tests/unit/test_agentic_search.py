@@ -5720,12 +5720,16 @@ _SYSTEM_GOLDEN_SHA256 = "53a8b3c61adef925e3cfea57a889996dd88d503563c6b69dc7f7dda
 # ——文書全体を確認したいときは doc_id を渡して read_doc で読む」を追記）したため golden 更新。
 # 契約変更（調査台帳を文脈の外に置く §2・es_search はページングを持たないため候補発見用に限定し、
 # 全件列挙は ripgrep_search/list_docs/原本読取へ誘導する一文を追記）したため golden 再更新。
-_DESC_ES_GOLDEN_BYTES = 1008
-_DESC_ES_GOLDEN_SHA256 = "33438a462fb4ed30f7b762a1696a631aeaa0f78996b8839293477dc3b132d8df"
+# 契約変更（COD-16・2026-09-29・台帳の項目のために探すときは item を付ける旨の一文を追記）
+# したため golden 再更新。
+_DESC_ES_GOLDEN_BYTES = 1123
+_DESC_ES_GOLDEN_SHA256 = "4a1893e34dd5113b313e9762944d10b085c2698738f39c0b47f999ec77b0966a"
 # 契約変更（S3c・裁定2026-09-11・graph_neighbors の近傍に辺ごとの種類と向きを追加したのに伴い
 # description へ「経路は辺ごとの種類と向き（from→to）付き」を追記）したため golden 更新。
-_DESC_GRAPH_GOLDEN_BYTES = 1190
-_DESC_GRAPH_GOLDEN_SHA256 = "6906fe828fda4729af11a6cd5064dc8e8b6226be0183262814bb08320d10c53a"
+# 契約変更（COD-16・2026-09-29・台帳の項目のために探すときは item を付ける旨の一文を追記）
+# したため golden 再更新。
+_DESC_GRAPH_GOLDEN_BYTES = 1305
+_DESC_GRAPH_GOLDEN_SHA256 = "5e5e7639b19c1a2603cb4efc15f3582893b018a54224ef32d4e46a0f57ced4d5"
 
 
 def _sha256_utf8(s: str) -> str:

@@ -87,6 +87,14 @@ if ledger:
     for item_id, item in (ledger.get("items") or {}).items():
         (items_dir / f"{item_id}.json").write_text(
             json.dumps(item, ensure_ascii=False), encoding="utf-8")
+    coverage = ledger.get("coverage")
+    if coverage:
+        # COD-16: coverage.jsonl（項目ごとの記録）をテストが直接置けるようにする——実際の呼出しは
+        # `sherpa/mcp_server.py::_record_item_coverage` が同じ形（item/tool/outcome/ts の4キー）で
+        # 書く（この拡張はそれを模す・本文/引数は含めない契約はテスト側でも守る）。
+        with (inv_dir / "coverage.jsonl").open("a", encoding="utf-8") as f:
+            for entry in coverage:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     if ledger.get("delete_manifest"):
         mf = inv_dir / "manifest.json"
         if mf.exists():
@@ -173,10 +181,15 @@ def test_ledger_written_through_mcp_accepts_final(tmp_path, monkeypatch):
               "ledger_tools": [
                   {"name": "ledger_manifest_set", "arguments": {"question_kind": "list", "items": ["a"]}},
                   {"name": "ledger_item_put", "arguments": _item("a", "source_confirmed", evidence=_EVIDENCE)},
-              ], "agent_messages": [_final("MCPで登録しました。")], "usage": helper._usage()}]
+              ], "agent_messages": [_final("MCPで登録しました。")], "usage": helper._usage()},
+             # COD-15（提案書§3.5）: 台帳が complete になった直後の見直しの一巡（1回だけ）。
+             # ledger_tools を持たない別 step にする——最終 step の再生に任せると mcp_log に
+             # 2行目が追記され、`json.loads(log.read_text())`（1件の JSON を想定）が壊れる。
+             {"thread_id": "TH-MCP-LEDGER",
+              "agent_messages": [_final("見直しましたが変更ありません。")], "usage": helper._usage()}]
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_mcp_ledger")
     env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("mcp-ledger", 31001)))
-    assert len(helper._read_argv_log(argv_log)) == 1
+    assert len(helper._read_argv_log(argv_log)) == 2
     results = json.loads(log.read_text())
     assert results[0]["manifest_invalid"] is True and results[0]["items"] == 0
     assert results[1] == {"ok": True}
@@ -184,6 +197,7 @@ def test_ledger_written_through_mcp_accepts_final(tmp_path, monkeypatch):
     assert results[3]["complete"] is True
     assert env["investigation"]["complete"] is True
     assert env["investigation"]["continuations"] == 0
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 0, "items_added": 0}
 
 
 def test_ledger_mcp_unsatisfied_kinds_in_continuation_prompt(tmp_path, monkeypatch):
@@ -203,7 +217,8 @@ def test_ledger_mcp_unsatisfied_kinds_in_continuation_prompt(tmp_path, monkeypat
     argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_mcp_unsatisfied")
     env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("mcp-unsatisfied", 31002)))
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 2
+    # COD-15: complete に届いた後、見直しの一巡が1回入る（3回目・最終 step の再生）。
+    assert len(calls) == 3
     assert "未充足: sel1_z（source が未確認）" in calls[1][-1]
     assert partial["subject"] not in calls[1][-1]
     assert "docs/spec.md" not in calls[1][-1] and "src/a.py" not in calls[1][-1]
@@ -239,7 +254,8 @@ def test_ledger_source_required_by_scope_even_when_item_omits_it(tmp_path, monke
     env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("src-required", 31101)))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 2, f"範囲にソースがあるので spec_only だけでは受理しないはず: {calls!r}"
+    # COD-15: complete に届いた後、見直しの一巡が1回入る（3回目・最終 step の再生）。
+    assert len(calls) == 3, f"範囲にソースがあるので spec_only だけでは受理しないはず: {calls!r}"
     assert "未充足: a（source が未確認）" in calls[1][-1]
     assert env["investigation"]["complete"] is True
 
@@ -262,7 +278,8 @@ def test_ledger_spec_only_completes_when_layer_excludes_source(tmp_path, monkeyp
     env = helper._result_env(helper._run(A.CodexProvider(), ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 1, f"層が docs のターンは source を要求せず1回で受理するはず: {calls!r}"
+    # COD-15: complete に届いた後、見直しの一巡が1回入る（2回目・最終 step の再生）。
+    assert len(calls) == 2, f"層が docs のターンは source を要求せず見直し込み2回で受理するはず: {calls!r}"
     assert env["investigation"]["complete"] is True
 
 
@@ -293,12 +310,15 @@ def test_ledger_complete_on_first_attempt_accepts_without_extra_continuation(tmp
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 1, f"台帳が最初から complete なら1回で受理のはず: {calls!r}"
+    # COD-15（提案書§3.5）: 台帳が最初から complete でも、受理する前に見直しの一巡が1回入る
+    # （偽 codex は最終 step を再生し、目録が増えないのでそのまま受理する＝2回）。
+    assert len(calls) == 2, f"台帳が最初から complete でも見直しの一巡で2回のはず: {calls!r}"
     assert env["headline"] == "結論です。"
     assert env["investigation"]["complete"] is True
     assert env["investigation"]["continuations"] == 0
     assert env["investigation"]["stopped_reason"] == "complete"
     assert env["limits"]["ledger_incomplete"] is False
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 0, "items_added": 0}
 
 
 # ===== 2. 1 attempt目は非終端1件 → 継続プロンプトに id が含まれる → 2 attempt目で終端 → 受理 =====
@@ -319,7 +339,8 @@ def test_ledger_incomplete_item_triggers_one_ledger_continuation(tmp_path, monke
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 2, f"非終端1件→終端で2回のはず: {calls!r}"
+    # COD-15: 非終端1件→終端（2回）で complete に届いた後、見直しの一巡が1回入る（3回目）。
+    assert len(calls) == 3, f"非終端1件→終端→見直しの一巡で3回のはず: {calls!r}"
     assert "a" in calls[1][-1], f"継続プロンプトに未完了 id が含まれない: {calls[1][-1]!r}"
     assert "resume" in calls[1] and "TH-L2" in calls[1]
     assert env["headline"] == "確定しました。"
@@ -496,7 +517,8 @@ def test_restore_ledger_when_message_starts_with_continue_prefix(tmp_path, monke
         uid=uid, conversation_id=conv_id, message="続きをお願いします")))
 
     calls2 = helper._read_argv_log(argv_log2)
-    assert len(calls2) == 1, f"復元されていれば manifest 既存＝1回で complete のはず: {calls2!r}"
+    # COD-15: 復元されていれば manifest 既存＝1回で complete に届き、見直しの一巡が1回入って2回。
+    assert len(calls2) == 2, f"復元されていれば1回で complete →見直しで2回のはず: {calls2!r}"
     assert env2["investigation"]["restored"] is True
     assert env2["investigation"]["complete"] is True
 
@@ -592,7 +614,8 @@ def test_stale_rejected_final_is_not_returned_after_ledger_continuation_goes_in_
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 3, f"final(拒否)→in_progress→final(受理)で3回のはず: {calls!r}"
+    # COD-15: final(拒否)→in_progress→final(受理)で complete に届いた後、見直しの一巡が1回入る。
+    assert len(calls) == 4, f"final(拒否)→in_progress→final→見直しの一巡で4回のはず: {calls!r}"
     assert env["headline"] == "最終結論です。", (
         f"拒否済みの古い final が受理されている（RV高-1 未是正）: {env['headline']!r}")
     assert env["investigation"]["complete"] is True
@@ -625,9 +648,10 @@ def test_ledger_progress_resets_streak_when_any_item_terminalizes_each_round(tmp
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 4, (
-        f"1件ずつ終端化する3回の継続（初回+3）で complete に届くはず（無進捗誤検知で打ち切られて"
-        f"いないか）: {calls!r}")
+    # COD-15: complete に届いた後、見直しの一巡が1回入る（5回目・最終 step の再生）。
+    assert len(calls) == 5, (
+        f"1件ずつ終端化する3回の継続（初回+3）→見直しの一巡で complete に届くはず（無進捗誤検知で"
+        f"打ち切られていないか）: {calls!r}")
     assert env["headline"] == "全て確認しました。"
     assert env["investigation"]["complete"] is True
     assert env["investigation"]["stopped_reason"] == "complete"
@@ -930,7 +954,8 @@ def test_manifest_invalid_content_is_repaired_via_cap_budget_then_succeeds(tmp_p
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 2, f"内容不正の manifest は修復催促1回で受理されるはず: {calls!r}"
+    # COD-15: 修復催促1回で complete に届いた後、見直しの一巡が1回入る（3回目）。
+    assert len(calls) == 3, f"内容不正の manifest は修復催促1回→見直しの一巡で受理されるはず: {calls!r}"
     assert calls[1][-1] == PV._LEDGER_MANIFEST_INVALID_PROMPT, (
         f"内容不正の manifest への催促文言が「未作成」用と区別されていない: {calls[1][-1]!r}")
     assert env["headline"] == "修復して完了しました。"
@@ -997,8 +1022,9 @@ def test_progress_during_auto_continue_resets_no_progress_streak(tmp_path, monke
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 5, (
-        f"台帳継続→自動継続(進捗)→台帳継続→自動継続(進捗)→complete で5回のはず"
+    # COD-15: complete に届いた後、見直しの一巡が1回入る（6回目・最終 step の再生）。
+    assert len(calls) == 6, (
+        f"台帳継続→自動継続(進捗)→台帳継続→自動継続(進捗)→complete→見直しの一巡で6回のはず"
         f"（自動継続中の進捗が streak に反映されず無進捗2回と誤検知されていないか・RV中-1 "
         f"5巡目 未是正）: {calls!r}")
     assert env["headline"] == "全て確認しました。"
@@ -1153,9 +1179,11 @@ def test_field_level_progress_without_terminalizing_resets_no_progress_streak(tm
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 4, (
-        f"pending→in_progress→evidence追加→terminal の4回で complete のはず（field-level進捗が"
-        f"streak に反映されず無進捗2回と誤検知されていないか・RV中-2 6巡目 未是正）: {calls!r}")
+    # COD-15: complete に届いた後、見直しの一巡が1回入る（5回目・最終 step の再生）。
+    assert len(calls) == 5, (
+        f"pending→in_progress→evidence追加→terminal の4回→見直しの一巡で complete のはず"
+        f"（field-level進捗が streak に反映されず無進捗2回と誤検知されていないか・RV中-2 "
+        f"6巡目 未是正）: {calls!r}")
     assert env["headline"] == "確認完了です。"
     assert env["investigation"]["complete"] is True
     assert env["investigation"]["continuations"] == 3
@@ -1274,6 +1302,44 @@ def test_copy_investigation_contract_files_refuses_symlinked_manifest(tmp_path):
         PV._copy_investigation_contract_files(src, dst)
 
     assert not (dst / "manifest.json").exists(), "symlink の中身がコピーされてしまっている"
+
+
+def test_copy_investigation_contract_files_carries_coverage_jsonl(tmp_path):
+    """`coverage.jsonl` も台帳と同じ置き場のため、退避・復元で一緒に持ち越す
+    ——これが無いと「続き」ターンは前ターンの検索記録が消え、前ターンで確定した
+    `not_found_in_scope` の item が誤って `unverified`/`not_searched` へ降格されうる。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "manifest.json").write_text(json.dumps({"question_kind": "list", "created_at": "t",
+                                                   "items": ["a"]}), encoding="utf-8")
+    (src / "coverage.jsonl").write_text(
+        json.dumps({"item": "a", "tool": "ripgrep_search", "outcome": "no_hits", "ts": 1.0}) + "\n",
+        encoding="utf-8")
+    dst = tmp_path / "dst"
+
+    PV._copy_investigation_contract_files(src, dst)
+
+    assert (dst / "coverage.jsonl").read_text(encoding="utf-8") == (src / "coverage.jsonl").read_text(
+        encoding="utf-8")
+    assert IL.load_coverage(dst) == {"a": ("no_hits",)}
+
+
+def test_copy_investigation_contract_files_refuses_symlinked_coverage_jsonl(tmp_path):
+    """`coverage.jsonl` も manifest/items と同じ symlink 拒否規律——コピー直前に
+    個別確認し、symlink なら `OSError` で中止する（退避先へ漏らさない）。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "manifest.json").write_text(json.dumps({"question_kind": "list", "created_at": "t",
+                                                   "items": ["a"]}), encoding="utf-8")
+    secret = tmp_path / "secret_coverage.txt"
+    secret.write_text("漏れてはいけない内容", encoding="utf-8")
+    (src / "coverage.jsonl").symlink_to(secret)
+    dst = tmp_path / "dst"
+
+    with pytest.raises(OSError):
+        PV._copy_investigation_contract_files(src, dst)
+
+    assert not (dst / "coverage.jsonl").exists()
 
 
 def test_restore_refuses_and_deletes_when_retired_manifest_is_symlink(tmp_path, monkeypatch):
@@ -1474,7 +1540,8 @@ def test_confirmed_claim_with_unmatched_ledger_refs_is_downgraded_to_inferred(tm
     env = helper._result_env(helper._run(prov, ctx))
 
     calls = helper._read_argv_log(argv_log)
-    assert len(calls) == 1, f"台帳が最初から complete なら1回で受理のはず: {calls!r}"
+    # COD-15: 台帳が最初から complete でも、見直しの一巡が1回入って2回で受理する。
+    assert len(calls) == 2, f"台帳が最初から complete でも見直しの一巡で2回のはず: {calls!r}"
     assert env["investigation"]["complete"] is True
     out_claim = env["data"]["claims"][0]
     assert out_claim["status"] == "inferred"
@@ -1588,3 +1655,436 @@ def test_plain_mode_turn_keeps_retained_ledger_of_standard(tmp_path, monkeypatch
     helper._result_env(helper._run(A.CodexProvider(system_settings={"codex_mode": "plain"}), helper._ctx(
         uid=uid, conversation_id=conv_id, message="別の依頼です")))
     assert retired.is_dir(), "plain のターンが standard の退避台帳を消した"
+
+
+# ===== COD-16/COD-17（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2/§3）: =====
+# ===== coverage.jsonl による降格・回答末尾の「確認できなかった項目」節 ==============
+
+def test_not_found_in_scope_with_truncated_coverage_downgrades_and_appends_section(tmp_path, monkeypatch):
+    """受け入れ①（提案書§5）: 切り詰めが起きた検索に item を付けた項目を not_found_in_scope で
+    終えると unverified（理由 search_truncated）になり、回答末尾に「確認できなかった項目」節が付く。"""
+    steps = [{"thread_id": "TH-COD16-A",
+              "ledger": {"manifest": _manifest(["a"]),
+                        "items": {"a": _item("a", "not_found_in_scope", reason="探したが無かった")},
+                        "coverage": [{"item": "a", "tool": "ripgrep_search", "outcome": "truncated",
+                                    "ts": 1.0}]},
+              "agent_messages": [_final("対象は見つかりませんでした。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_cod16_downgrade")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("cod16-a", 31101)))
+    assert env["investigation"]["complete"] is True
+    assert env["investigation"]["counts"] == {"unverified": 1}
+    assert "確認できなかった項目:" in env["headline"]
+    assert "対象（検索が上限に達し、途中までしか確認できませんでした）" in env["headline"]
+    assert "探したが無かった" not in env["headline"], "モデルの自由記述の reason をそのまま転記しない"
+
+
+def test_not_found_in_scope_with_no_hits_only_coverage_stays_and_still_appends_section(tmp_path, monkeypatch):
+    """受け入れ③（提案書§5）: 切り詰めの無い0件の検索だけなら not_found_in_scope のまま——ただし
+    COD-17 は not_found_in_scope も「確認できなかった項目」に含める契約（§3 の閉じた4状態）。"""
+    steps = [{"thread_id": "TH-COD16-B",
+              "ledger": {"manifest": _manifest(["a"]),
+                        "items": {"a": _item("a", "not_found_in_scope", reason="探したが無かった")},
+                        "coverage": [{"item": "a", "tool": "ripgrep_search", "outcome": "no_hits",
+                                    "ts": 1.0}]},
+              "agent_messages": [_final("対象は見つかりませんでした。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_cod16_stay")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("cod16-b", 31102)))
+    assert env["investigation"]["counts"] == {"not_found_in_scope": 1}
+    assert "対象（登録範囲内では見つかりませんでした）" in env["headline"]
+
+
+def test_no_coverage_at_all_downgrades_to_not_searched(tmp_path, monkeypatch):
+    """受け入れ②（提案書§5）: item 付きの検索が1回も無い「無い」は unverified（not_searched）。"""
+    steps = [{"thread_id": "TH-COD16-C",
+              "ledger": {"manifest": _manifest(["a"]),
+                        "items": {"a": _item("a", "not_found_in_scope", reason="探したが無かった")}},
+              "agent_messages": [_final("対象は見つかりませんでした。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_cod16_notsearched")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("cod16-c", 31103)))
+    assert env["investigation"]["counts"] == {"unverified": 1}
+    assert "対象（この項目を調べた記録がありません）" in env["headline"]
+
+
+def test_all_confirmed_items_do_not_append_unconfirmed_section(tmp_path, monkeypatch):
+    """未確認の項目が無い回答には「確認できなかった項目」節が付かない（提案書§5）。"""
+    steps = [{"thread_id": "TH-COD16-D",
+              "ledger": {"manifest": _manifest(["a"]),
+                        "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+              "agent_messages": [_final("確認できました。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_cod16_allconfirmed")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("cod16-d", 31104)))
+    assert env["investigation"]["complete"] is True
+    assert "確認できなかった項目" not in env["headline"]
+
+
+def test_tool_error_coverage_downgrades_to_search_error_with_its_own_phrase(tmp_path, monkeypatch):
+    """道具そのものが失敗した（`error`）記録は、切り詰め（`search_truncated`）とは別の
+    `search_error` へ降格し、専用の定型文（「検索が失敗し」）が節に出る——`search_truncated` の
+    文言（「上限に達し」）とは混同しない。"""
+    steps = [{"thread_id": "TH-COD16-E",
+              "ledger": {"manifest": _manifest(["a"]),
+                        "items": {"a": _item("a", "not_found_in_scope", reason="探したが無かった")},
+                        "coverage": [{"item": "a", "tool": "es_search", "outcome": "error", "ts": 1.0}]},
+              "agent_messages": [_final("対象は見つかりませんでした。")], "usage": helper._usage()}]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_cod16_search_error")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("cod16-e", 31105)))
+    assert env["investigation"]["counts"] == {"unverified": 1}
+    assert "対象（検索が失敗し、確認できませんでした）" in env["headline"]
+    assert "上限に達し" not in env["headline"], "search_error が search_truncated の文言に紛れている"
+
+
+def test_unconfirmed_section_includes_non_terminal_and_missing_items(tmp_path):
+    """台帳が未完了のまま受理された（cap/no_progress 等）ターンで、登録済みだが非終端
+    （pending/in_progress）の item・item ファイル自体が無い item（missing）も、「確認できなかった
+    項目」節に「調べ終わっていません」の定型文で載る——台帳が未完了のまま黙って節から落ちない。
+    （純関数の直接検証・台帳ゲート全体を回さない最小の再現）。"""
+    manifest = _manifest(["a", "b", "c", "d"])
+    items = {
+        "a": _item("a", "not_found_in_scope", reason="探したが無かった"),
+        "b": _item("b", "pending"),
+        "c": _item("c", "in_progress"),
+        # "d" は item ファイル自体を作らない＝missing（manifest には登録済み）
+    }
+    snapshot = IL.LedgerSnapshot(manifest=manifest, items=items, invalid_ids=())
+    section = PV._unconfirmed_items_section(snapshot)
+    assert "対象（登録範囲内では見つかりませんでした）" in section
+    assert "- 対象（調べ終わっていません）" in section
+    assert section.count("調べ終わっていません") == 3, "b・c・d の3件が載るはず"
+    assert "- d（調べ終わっていません）" in section, "item ファイルが無い item は id をそのまま件名にする"
+
+
+# ===== COD-15/COD-02（提案書§3.5）: 見直しの一巡 =====
+
+def test_review_round_asked_once_when_complete_and_no_growth(tmp_path, monkeypatch):
+    """台帳が complete になった直後に見直しの一巡が1回だけ頼まれる——目録が増えなければ、その
+    答えで受理する（初回 complete→見直し1回＝2 attempt）。"""
+    steps = [
+        {"thread_id": "TH-REV1",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV1",
+         "agent_messages": [_final("見直しましたが変更ありません。")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_once")
+    events = helper._run(A.CodexProvider(), helper._ctx("review-once", 32001))
+    env = helper._result_env(events)
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 2, f"見直しの一巡は1回だけ頼まれ、増えなければ2回で受理のはず: {calls!r}"
+    review_nodes = [e for e in events
+                   if isinstance(e, dict) and e.get("type") == "node"
+                   and str(e.get("id", "")).startswith("ledger-review-")]
+    assert [n["id"] for n in review_nodes] == ["ledger-review-1"]
+    assert env["investigation"]["complete"] is True
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 0, "items_added": 0}
+    assert env["headline"] == "見直しましたが変更ありません。"
+
+
+def test_review_round_growth_returns_to_investigation_then_reviews_again(tmp_path, monkeypatch):
+    """見直しの一巡で目録が増えたら（想定外の発見）既存の台帳継続へ戻って調べ、再び完了したら
+    見直しの一巡へ戻る——2回目は増えなければそこで終わる（目録が増えた回数=1）。"""
+    steps = [
+        {"thread_id": "TH-REV2",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV2",   # 見直しの一巡①: 想定外の項目 b を目録に足す
+         "ledger": {"manifest": _manifest(["a", "b"]), "items": {"b": _item("b", "pending")}},
+         "agent_messages": [_final("見直したところ b が必要でした。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV2",   # 通常の台帳継続: b を終端化する
+         "ledger": {"items": {"b": _item("b", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("bも確認しました。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV2",   # 見直しの一巡②: 今度は何も増えない
+         "agent_messages": [_final("これ以上の見直しはありません。")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_growth")
+    events = helper._run(A.CodexProvider(), helper._ctx("review-growth", 32002))
+    env = helper._result_env(events)
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 4, f"見直し→台帳継続→見直しの4 attempt のはず: {calls!r}"
+    review_nodes = [e for e in events
+                   if isinstance(e, dict) and e.get("type") == "node"
+                   and str(e.get("id", "")).startswith("ledger-review-")]
+    assert [n["id"] for n in review_nodes] == ["ledger-review-1", "ledger-review-2"]
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 1, "items_added": 1}
+    assert env["investigation"]["continuations"] == 1
+    assert env["investigation"]["complete"] is True
+
+
+def test_review_round_stops_asking_after_cap_reached(tmp_path, monkeypatch):
+    """目録が増えた（見直した）回数が上限（2）に達したら、以後は見直しの一巡を頼まない。"""
+    steps = [
+        {"thread_id": "TH-REV3",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV3",   # 見直し①: b を足す
+         "ledger": {"manifest": _manifest(["a", "b"]), "items": {"b": _item("b", "pending")}},
+         "agent_messages": [_final("bが必要でした。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV3",   # b を終端化
+         "ledger": {"items": {"b": _item("b", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("bも確認しました。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV3",   # 見直し②: c を足す（上限まで）
+         "ledger": {"manifest": _manifest(["a", "b", "c"]), "items": {"c": _item("c", "pending")}},
+         "agent_messages": [_final("cも必要でした。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV3",   # c を終端化——以後は上限のため見直しを頼まず、ここで受理する
+         "ledger": {"items": {"c": _item("c", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("cも確認しました。")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_cap")
+    events = helper._run(A.CodexProvider(), helper._ctx("review-cap", 32003))
+    env = helper._result_env(events)
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 5, f"見直し2回・台帳継続2回・初回の5 attempt で上限のはず: {calls!r}"
+    review_nodes = [e for e in events
+                   if isinstance(e, dict) and e.get("type") == "node"
+                   and str(e.get("id", "")).startswith("ledger-review-")]
+    assert [n["id"] for n in review_nodes] == ["ledger-review-1", "ledger-review-2"]
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 2, "items_added": 2}
+    assert env["investigation"]["complete"] is True
+
+
+def test_review_round_reverts_to_pre_review_candidate_when_answer_gets_worse(tmp_path, monkeypatch):
+    """見直しの一巡の後の回答が空になった（悪化した）ときは、見直し前の候補を使う——どちらも
+    claims が空で `_candidate_final()` 自身の「claims を持つ final を優先」ヒューリスティックが
+    効かないケースで、明示的な戻しが効くことを確かめる。"""
+    def _plain_final(answer: str) -> str:
+        return json.dumps({"status": "final", "answer": answer, "next_step": None, "claims": []},
+                          ensure_ascii=False)
+
+    steps = [
+        {"thread_id": "TH-REV4",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_plain_final("対象は Y です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV4",   # 見直しの一巡: 空の回答へ悪化
+         "agent_messages": [_plain_final("")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_revert")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-revert", 32004)))
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 2
+    assert env["headline"] == "対象は Y です。", "悪化した見直し後の空の答えでなく、見直し前の答えに戻すはず"
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 0, "items_added": 0}
+
+
+def test_review_round_does_nothing_in_plain_mode(tmp_path, monkeypatch):
+    """素の Codex（plain）モードでは見直しの一巡を頼まない（台帳ゲート自体が効かない）。"""
+    steps = [
+        {"thread_id": "TH-REV-PLAIN",
+         "agent_messages": ["素の回答です。"], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_plain")
+    events = helper._run(A.CodexProvider(system_settings={"codex_mode": "plain"}),
+                         helper._ctx("review-plain", 32005))
+    env = helper._result_env(events)
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 1, "plain モードは見直しの一巡を頼まず1回のはず"
+    review_nodes = [e for e in events
+                   if isinstance(e, dict) and e.get("type") == "node"
+                   and str(e.get("id", "")).startswith("ledger-review-")]
+    assert review_nodes == []
+    assert env.get("investigation") is None
+
+
+def test_review_round_broken_json_does_not_mark_stopped_early(tmp_path, monkeypatch):
+    """見直しの実行自体が壊れた JSON（構造化出力のスキーマに合わない）で終わり、
+    目録も増えなければ、実行前の状態へ戻して抜ける——台帳ゲートを通った完成回答が
+    `codex_stopped_early`（途中停止）扱いに置き換わってはいけない。"""
+    steps = [
+        {"thread_id": "TH-REV5",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV5",   # 見直しの一巡: 壊れたJSON（構造化出力のスキーマに合わない平文）
+         "agent_messages": ["これは構造化出力のスキーマに合わない平文です。"], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_broken_json")
+    events = helper._run(A.CodexProvider(), helper._ctx("review-broken-json", 32006))
+    env = helper._result_env(events)
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 2, f"見直しの一巡は1回だけ頼まれるはず: {calls!r}"
+    assert env["headline"] == "初回の結論です。"
+    assert not env.get("codex_stopped_early"), (
+        "見直しの実行が壊れたJSONで終わっただけで完成回答を途中停止扱いにしてはいけない")
+    assert not env.get("codex_silent_failure")
+
+
+def test_review_round_reopened_ledger_without_growth_returns_to_gate_not_cap(tmp_path, monkeypatch):
+    """見直しが目録を増やさずに既存 item を非終端（in_progress 等）へ差し戻した
+    場合、その場で受理せず通常の台帳ゲートへ戻る——打ち切り理由を誤って "cap" にしない。
+    再確認後に complete へ戻れば stopped_reason は "complete"。"""
+    steps = [
+        {"thread_id": "TH-REV6",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV6",   # 見直し: 目録は増やさず a を in_progress へ差し戻す
+         "ledger": {"items": {"a": _item("a", "in_progress")}},
+         "agent_messages": [_final("見直し中に確認が必要になりました。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV6",   # 通常の台帳継続: a を再び終端化する
+         "ledger": {"items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("確認できました。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV6",   # 見直し2回目: 今度は何も変えない
+         "agent_messages": [_final("これ以上の見直しはありません。")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_reopen")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-reopen", 32007)))
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 4, f"見直し→台帳継続→見直しの4 attempt のはず: {calls!r}"
+    assert env["investigation"]["complete"] is True
+    assert env["investigation"]["stopped_reason"] == "complete", (
+        "見直しで一時的に不完全になっただけで打ち切り理由を cap にしてはいけない")
+    assert env["investigation"]["continuations"] == 1
+    # 目録は一度も増えていない（rounds/items_added は growth の回数だけを数える）。
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 0, "items_added": 0}
+
+
+def test_review_round_growth_reverts_to_pre_review_candidate_when_followup_stalls(tmp_path, monkeypatch):
+    """見直しが目録を増やした後（既存の台帳継続へ戻る分岐）、その項目の調査が
+    進捗せず無進捗上限で打ち切られた場合、見直し前の完成回答へ切り戻す——後続の台帳継続で積んだ
+    弱い候補（空の答え）が最終回答として選ばれてはいけない。"""
+    steps = [
+        {"thread_id": "TH-REV7",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV7",   # 見直し: 想定外の項目 b を目録に足す
+         "ledger": {"manifest": _manifest(["a", "b"]), "items": {"b": _item("b", "pending")}},
+         "agent_messages": [_final("見直したところ b が必要でした。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV7",   # 台帳継続1: b は進捗せず、答えも弱くなる（空）
+         "agent_messages": [_final("")], "usage": helper._usage()},
+        {"thread_id": "TH-REV7",   # 台帳継続2: 引き続き進捗せず、無進捗上限（2）に達して打ち切り
+         "agent_messages": [_final("")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_growth_stall")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-growth-stall", 32008)))
+
+    calls = helper._read_argv_log(argv_log)
+    assert len(calls) == 4, f"見直し→台帳継続×2の4 attempt のはず: {calls!r}"
+    assert env["investigation"]["stopped_reason"] == "no_progress"
+    assert env["investigation"]["review"] == {"attempted": True, "rounds": 1, "items_added": 1}
+    # 無進捗で打ち切られた後続の弱い候補（空の答え）でなく、見直し前の答えに戻すはず（b が
+    # 非終端のまま残るため「確認できなかった項目」節が末尾に付くのは正しい）。
+    assert env["headline"].startswith("初回の結論です。")
+    assert "対象（調べ終わっていません）" in env["headline"]
+
+
+def test_review_round_reopening_every_time_is_capped_by_requests(tmp_path, monkeypatch):
+    """見直しのたびに目録を増やさず台帳を未完了へ戻しても、見直しを頼むのは上限（2回）まで——
+    台帳継続の上限まで見直しと継続を繰り返さない。"""
+    reopen = {"items": {"a": _item("a", "in_progress")}}
+    close = {"items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}}
+    steps = [
+        {"thread_id": "TH-REV8", "ledger": {"manifest": _manifest(["a"]), **close},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV8", "ledger": reopen,   # 見直し1: a を差し戻す
+         "agent_messages": [_final("見直し1。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV8", "ledger": close,    # 台帳継続1
+         "agent_messages": [_final("確認1。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV8", "ledger": reopen,   # 見直し2: また差し戻す
+         "agent_messages": [_final("見直し2。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV8", "ledger": close,    # 台帳継続2（この後は見直しを頼まない）
+         "agent_messages": [_final("確認2。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV8", "ledger": reopen,
+         "agent_messages": [_final("頼まれていない見直し。")], "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_reopen_cap")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-reopen-cap", 32009)))
+
+    assert len(helper._read_argv_log(argv_log)) == 5
+    assert env["investigation"]["complete"] is True
+    assert env["investigation"]["continuations"] == 2
+
+
+def test_review_round_growth_reverts_when_followup_ends_in_progress(tmp_path, monkeypatch):
+    """見直しが目録を増やした後の台帳継続が回答を出さずに（in_progress のまま）終わったら、
+    見直し前の完成回答へ戻す——作業宣言を回答にせず、途中停止の印も立てない。"""
+    steps = [
+        {"thread_id": "TH-REV9",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV9",   # 見直し: b を目録に足す
+         "ledger": {"manifest": _manifest(["a", "b"]), "items": {"b": _item("b", "pending")}},
+         "agent_messages": [_final("b が必要でした。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV9",
+         "agent_messages": [json.dumps({"status": "in_progress", "answer": "b を調べています。",
+                                        "next_step": "続けます", "claims": []}, ensure_ascii=False)],
+         "usage": helper._usage()},
+        {"thread_id": "TH-REV9",
+         "agent_messages": [json.dumps({"status": "in_progress", "answer": "b を調べています。",
+                                        "next_step": "続けます", "claims": []}, ensure_ascii=False)],
+         "usage": helper._usage()},
+    ]
+    _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_growth_inprog")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-growth-inprog", 32010)))
+
+    assert env["headline"].startswith("初回の結論です。")
+    assert not env.get("codex_stopped_early")
+
+
+def test_review_round_growth_then_worse_followup_reverts_before_second_review(tmp_path, monkeypatch):
+    """見直しで目録が増えた後の台帳継続が、主張の減った回答で台帳を完了させたら、2 回目の見直しを
+    頼まず 1 回目の見直しの直前の回答へ戻す（2 回目の控えで悪化を上書きしない）。"""
+    def claim(cid, text):
+        return {"id": cid, "status": "confirmed", "text": text, "evidence_refs": ["src/a.py:1"],
+                "reason": "", "reason_code": "", "evidence_kinds": ["source"]}
+    three = [claim("c1", "対象は X"), claim("c2", "対象は Y"), claim("c3", "対象は Z")]
+    steps = [
+        {"thread_id": "TH-REV10",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final_with_claims("初回の結論です（X・Y・Z）。", three)], "usage": helper._usage()},
+        {"thread_id": "TH-REV10",   # 見直し: b を目録に足す
+         "ledger": {"manifest": _manifest(["a", "b"]), "items": {"b": _item("b", "pending")}},
+         "agent_messages": [_final_with_claims("b が必要でした（X・Y・Z）。", three)], "usage": helper._usage()},
+        {"thread_id": "TH-REV10",   # 台帳継続: b を終端化するが回答は b のことだけ
+         "ledger": {"items": {"b": _item("b", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final_with_claims("b だけの回答です。", [claim("c9", "b は W")])],
+         "usage": helper._usage()},
+        {"thread_id": "TH-REV10",
+         "agent_messages": [_final_with_claims("頼まれていない見直し。", [claim("c9", "b は W")])],
+         "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_growth_worse")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-growth-worse", 32011)))
+
+    assert len(helper._read_argv_log(argv_log)) == 3
+    assert "初回の結論です（X・Y・Z）。" in env["headline"]
+    assert "b だけの回答です。" not in env["headline"]
+
+
+def test_review_round_growth_ending_in_progress_does_not_ask_second_review(tmp_path, monkeypatch):
+    """見直しが目録を増やして（足した項目は終端済み）in_progress で終わったら、2 回目の見直しを
+    頼まず見直し前の回答へ戻す——途中停止の印を立てない。"""
+    steps = [
+        {"thread_id": "TH-REV11",
+         "ledger": {"manifest": _manifest(["a"]),
+                    "items": {"a": _item("a", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [_final("初回の結論です。")], "usage": helper._usage()},
+        {"thread_id": "TH-REV11",
+         "ledger": {"manifest": _manifest(["a", "b"]),
+                    "items": {"b": _item("b", "source_confirmed", evidence=_EVIDENCE)}},
+         "agent_messages": [json.dumps({"status": "in_progress", "answer": "b を足しました。",
+                                        "next_step": "答え直します", "claims": []}, ensure_ascii=False)],
+         "usage": helper._usage()},
+        {"thread_id": "TH-REV11",
+         "agent_messages": [json.dumps({"status": "in_progress", "answer": "頼まれていない見直し。",
+                                        "next_step": "続けます", "claims": []}, ensure_ascii=False)],
+         "usage": helper._usage()},
+    ]
+    argv_log = _setup(tmp_path, monkeypatch, steps, users_dirname="users_review_growth_inprog2")
+    env = helper._result_env(helper._run(A.CodexProvider(), helper._ctx("review-growth-inprog2", 32012)))
+
+    assert len(helper._read_argv_log(argv_log)) == 2
+    assert "初回の結論です。" in env["headline"]
+    assert not env.get("codex_stopped_early")
+

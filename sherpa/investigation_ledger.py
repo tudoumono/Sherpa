@@ -54,6 +54,8 @@ from __future__ import annotations
 import json
 import errno
 import os
+import stat
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +63,11 @@ from pathlib import Path
 # 非終端＝まだ検証していない／検証中。終端＝検証結果が確定した状態（正典§3「状態語彙」）。
 # 未知の状態文字列はどちらの集合にも属さない＝item は無効として扱われる。
 NON_TERMINAL_STATUSES: frozenset[str] = frozenset({"pending", "in_progress"})
+# `unverified`（COD-16・2026-09-29「調査の網羅と未確認の明示」提案書 §2）: 「確認できなかった」
+# ことそのものを理由付きの終端として明示する状態——`not_found_in_scope` と違い、Sherpa が
+# coverage.jsonl（`load_coverage`）の記録に基づき機械的に置き換える（`apply_unverified_downgrades`）
+# ことがある。モデル自身が直接 `ledger_item_put` で使ってもよい（両方とも `reason` は
+# `UNVERIFIED_REASON_CODES` の閉じた語彙のみ）。
 TERMINAL_STATUSES: frozenset[str] = frozenset({
     "source_confirmed",
     "spec_only",
@@ -68,13 +75,39 @@ TERMINAL_STATUSES: frozenset[str] = frozenset({
     "not_found_in_scope",
     "unreadable",
     "unavailable",
+    "unverified",
 })
 
 # 「確認不能・範囲外・読取不能」は**理由付き**の終端でなければならない（正典§3「状態語彙」）。
 # `reason.strip()` が空ならその item は無効——理由の無い確認不能は、調べずに終端化する抜け道になる。
-REASON_REQUIRED_STATUSES: frozenset[str] = frozenset({"not_found_in_scope", "unreadable", "unavailable"})
+# `unverified` も理由必須——ただしこの状態だけは `reason` 自体が閉じた語彙
+# （`UNVERIFIED_REASON_CODES`）でなければならない（`validate_item` の追加チェック）。
+REASON_REQUIRED_STATUSES: frozenset[str] = frozenset({
+    "not_found_in_scope", "unreadable", "unavailable", "unverified"})
 # 「確認済み」系の終端は根拠（evidence）1件以上が必須——根拠の無い「確認済み」も同じ抜け道になる。
 EVIDENCE_REQUIRED_STATUSES: frozenset[str] = frozenset({"source_confirmed", "spec_only", "conflict"})
+
+# `unverified` の `reason` が取れる値の閉じた語彙（COD-16 §2・提案書§5 受け入れ）。自由記述にすると
+# 「確認できなかった項目」節（provider.py 側）が理由を機械的に利用者向け文へ変換できない——
+# 台帳へ本文を書かせない契約（モジュール docstring）とも整合する。
+# - search_truncated: 検索がヒット数上限／件数上限で打ち切られた（母集団の一部しか見ていない）。
+# - search_error: 検索・グラフの道具そのものが失敗した（`error`＝母集団を確認できていない・
+#   切り詰めとは別＝道具が結果を返せなかった側）。
+# - no_hits_only: 0件の検索しか行っていない（モデル自身が「これだけでは確信が持てない」と判断
+#   したときに使う——Sherpa 側の機械的な降格はこの理由を選ばない・§5「切り詰めの無い0件の検索
+#   だけなら not_found_in_scope のまま」）。
+# - timeout: 検索・読取が時間切れになった。
+# - unreadable: 検索・読取の対象が読み取れなかった。
+# - not_searched: この item に対して item 付きの検索・読取が1回も行われていない。
+UNVERIFIED_REASON_CODES: frozenset[str] = frozenset({
+    "search_truncated", "search_error", "no_hits_only", "timeout", "unreadable", "not_searched"})
+
+# 「確認できなかった項目」（COD-17・提案書§3）として回答末尾の節に集める終端状態の閉集合。
+# `not_found_in_scope` は（降格されていなくても）利用者からは「見つからなかった＝確認できな
+# かった」に見えるため常に含める——ここでの意味は「陽性確認が無い」であって「調べが甘い」とは
+# 限らない（降格された分だけ理由が `unverified`/`UNVERIFIED_REASON_CODES` になる）。
+UNCONFIRMED_STATUSES: frozenset[str] = frozenset({
+    "unverified", "not_found_in_scope", "unreadable", "unavailable"})
 
 # 台帳が扱う根拠種別の閉集合（`sherpa/investigation_state.py` の `EVIDENCE_KINDS` と同じ語彙
 # ——このモジュールは他の sherpa モジュールを import しない契約のため独立定義する・葉ノード
@@ -301,6 +334,10 @@ def validate_item(item, *, expected_id: str | None = None) -> list[str]:
     # 確認不能系の終端は理由必須（理由なしで「調べずに終端化」できる抜け道を塞ぐ）。
     if status in REASON_REQUIRED_STATUSES and reason.strip() == "":
         return [f"status '{status}' は reason が必須"]
+    # `unverified` は理由が閉じた語彙（`UNVERIFIED_REASON_CODES`）でなければならない——自由記述の
+    # 理由文にすると回答末尾の節（provider.py）が機械的に人間向け文へ変換できなくなる。
+    if status == "unverified" and reason not in UNVERIFIED_REASON_CODES:
+        return [f"status 'unverified' の reason は {sorted(UNVERIFIED_REASON_CODES)} のいずれかである必要がある"]
     # 確認済み系の終端は根拠1件以上必須（根拠なしの「確認済み」も同じ抜け道）。さらに、その状態が
     # 意味として要求する根拠種別（`_STATUS_REQUIRED_EVIDENCE_KINDS`）が `evidence` の `kind` に
     # 実在するかも確認する（設計書の根拠だけで `source_confirmed` は成立しない）。
@@ -558,3 +595,153 @@ def write_manifest_atomic(dir: Path, manifest: dict) -> Path:
     """manifest を `dir/manifest.json` へ原子的に書く（親が使う想定の書込関数）。"""
     dir = Path(dir)
     return _write_json_atomic(dir / _MANIFEST_FILENAME, manifest)
+
+
+# ---- 項目ごとの調査カバレッジ記録（COD-16・2026-09-29「調査の網羅と未確認の明示」提案書 §2）----
+# `dir/coverage.jsonl`（台帳と同じ置き場）に、item 引数つきの検索・読取ツール呼出し1回ごとの
+# 結果区分だけを追記する（`sherpa/mcp_server.py` が呼ぶ・本文/引数の中身は一切書かない）。
+# 親・子（`spawn_agent` の worker）は同じ `SHERPA_MCP_LEDGER_DIR` を渡されるため、この
+# ファイルも台帳の items/ と同じく親子共有——サイドカー（`.mcp_sidecar.jsonl`）を介さずに
+# 子の観測を親と同じ場所へ集める（子の MCP 呼出は親の `--json` に現れないが、ファイル書込は
+# プロセスに関係なく同じディレクトリへ届く）。
+COVERAGE_OUTCOMES: frozenset[str] = frozenset({
+    "hit", "no_hits", "truncated", "limit", "timeout", "unreadable", "error"})
+_COVERAGE_FILENAME = "coverage.jsonl"
+_COVERAGE_REQUIRED_KEYS = frozenset({"item", "tool", "outcome", "ts"})
+
+
+def append_coverage_atomic(dir: Path, item_id: str, tool: str, outcome: str) -> None:
+    """`dir/coverage.jsonl` へ1行（`item`/`tool`/`outcome`/`ts` の4キーだけ）を追記する。
+
+    `item_id` は `_validate_safe_id` と同じ規則で検証する（`ValueError` で fail-loud・
+    write_item_atomic と同じ規律——呼び出し元＝`mcp_server.py` が catch して fail-open にする）。
+    `outcome` は `COVERAGE_OUTCOMES` の外なら `ValueError`（プログラミングエラー・呼び出し元は
+    サーバ自身でモデル入力ではないため fail-loud でよい）。追記は "a" モードの単発 `write()`
+    （`mcp_server._sidecar_append` と同じ流儀）——複数プロセス（親子）が同じファイルへ追記しても
+    1行の長さが一般的な PIPE_BUF に収まる限り、行単位で混ざらない。
+
+    `coverage.jsonl` 自体は `O_NOFOLLOW`・`O_NONBLOCK`（FIFO に差し替えられても開くところで
+    待たない）で開き、fstat で通常ファイルであることを確かめてから
+    書く——`_reject_symlinked_dir` は `dir` の経路だけを検査するため、ファイル自体が後から
+    symlink に差し替えられる余地（TOCTOU）は別に塞ぐ必要がある（`load_ledger` が symlink を
+    一切辿らないのと対に、書込側も辿らない）。symlink／通常ファイルでない場合は `OSError`
+    （呼び出し元は上と同じ fail-open で catch する）。
+    """
+    item_id = _validate_safe_id(item_id)
+    if not isinstance(tool, str) or not tool:
+        raise ValueError(f"tool must be a non-empty str: {tool!r}")
+    if outcome not in COVERAGE_OUTCOMES:
+        raise ValueError(f"unknown coverage outcome: {outcome!r}")
+    dir = Path(dir)
+    path = dir / _COVERAGE_FILENAME
+    _reject_symlinked_dir(dir)
+    dir.mkdir(parents=True, exist_ok=True)
+    entry = {"item": item_id, "tool": tool, "outcome": outcome, "ts": time.time()}
+    line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.ELOOP, "coverage.jsonl is not a regular file", str(path))
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def load_coverage(dir: Path) -> dict[str, tuple[str, ...]]:
+    """`dir/coverage.jsonl` を読み、item id → その item に対する `outcome` の記録順タプルへ
+    まとめる。壊れた行・型不正な行・語彙外の `outcome`・symlink・読めないファイルはいずれも
+    fail-safe（無視するか空を返す・例外を投げない——`load_ledger` と同じ流儀）。
+    """
+    dir = Path(dir)
+    path = dir / _COVERAGE_FILENAME
+    if _is_symlink_fail_closed(path) or not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or set(entry.keys()) != _COVERAGE_REQUIRED_KEYS:
+            continue
+        item_id, outcome = entry.get("item"), entry.get("outcome")
+        if not isinstance(item_id, str) or not item_id or outcome not in COVERAGE_OUTCOMES:
+            continue
+        out.setdefault(item_id, []).append(outcome)
+    return {item_id: tuple(outcomes) for item_id, outcomes in out.items()}
+
+
+# `not_found_in_scope` を `unverified` へ機械的に置き換えるときの理由の優先順位（COD-16 §2・
+# 提案書§5「切り詰め・上限・時間切れ・読めない」の列挙順）。`search_truncated` は「truncated」
+# （検索母集団の一部しか見ていない）と「limit」（同義・`mcp_server._coverage_outcome` の上限区分）
+# の両方を受ける語彙——`UNVERIFIED_REASON_CODES` に「limit」専用の枠は無いためここで合流させる。
+# `error`（道具そのものの失敗＝母集団を確認できていない）は「途中までは見た」`search_truncated`
+# とは別原因のため、独立した `search_error` へ分ける（合流させない・降格時の理由文も別文にする——
+# provider.py 側の `_UNVERIFIED_REASON_PHRASES`）。複数の outcome が混在する item は、このタプルの
+# 先頭（最も原因が明確なもの）から順に一致した理由を採用する。
+_DOWNGRADE_REASON_PRIORITY: tuple[tuple[str, frozenset[str]], ...] = (
+    ("timeout", frozenset({"timeout"})),
+    ("unreadable", frozenset({"unreadable"})),
+    ("search_error", frozenset({"error"})),
+    ("search_truncated", frozenset({"truncated", "limit"})),
+)
+
+
+def apply_unverified_downgrades(dir: Path, snapshot: LedgerSnapshot,
+                                *, exclude_ids: frozenset[str] = frozenset()) -> LedgerSnapshot:
+    """`not_found_in_scope` の**登録済み** item を、`coverage.jsonl`（`load_coverage`）の記録に
+    基づき必要なら `unverified` へ機械的に置き換える（COD-16 §2・提案書§5 受け入れ）。
+
+    置き換え規則:
+    - この item に `item` 付きの呼出しが1回も記録されていない → `reason="not_searched"`。
+    - 記録はあるが `truncated`／`limit`／`timeout`／`unreadable`／`error` のいずれかが1回でも
+      あれば、`_DOWNGRADE_REASON_PRIORITY` の優先順位で reason を選び置き換える。
+    - 記録が `hit`／`no_hits` だけ（問題が無い）なら置き換えない——「切り詰めの無い0件の検索
+      だけなら `not_found_in_scope` のまま」（提案書§5）。
+
+    `not_found_in_scope` 以外の状態（`unverified` を含む・モデル自身が直接その状態にした item・
+    確認済み系の終端）は対象外——確認済みの状態を coverage の記録だけで書き換えない。未登録
+    item（manifest の登録集合に無い id）も対象外（`ledger_complete` と同じ「登録集合だけを見る」
+    契約）。
+
+    `exclude_ids`（呼び出し側＝provider.py が渡す「このターンの開始時点で既に
+    `not_found_in_scope` だった item id」の集合・既定は空）に含まれる id は、記録が1件も無い
+    ときだけ対象外にする——前のターン（「続き」）で確定した項目を、記録が無いという理由だけで
+    `unverified`/`not_searched` へ降格しない（記録を持ち越せなかった退避台帳でも同じ）。記録が
+    あれば（このターンで調べ直した等）通常どおり判定する。
+
+    `dir` 上の対象 item ファイルを実際に書き換える（`write_item_atomic`）。書換えに失敗した
+    item（`OSError`）は元の状態のまま返す——fail-open（完了判定・回答生成を止めない）。
+    戻り値は置き換え後の新しい `LedgerSnapshot`。
+    """
+    coverage = load_coverage(dir)
+    manifest_ids = set(snapshot.manifest["items"]) if snapshot.manifest is not None else set()
+    new_items = dict(snapshot.items)
+    for item_id, item in snapshot.items.items():
+        if item_id not in manifest_ids or item.get("status") != "not_found_in_scope":
+            continue
+        outcomes = coverage.get(item_id)
+        if not outcomes and item_id in exclude_ids:
+            continue
+        if not outcomes:
+            reason = "not_searched"
+        else:
+            outcome_set = set(outcomes)
+            reason = next((code for code, bucket in _DOWNGRADE_REASON_PRIORITY if bucket & outcome_set),
+                         None)
+            if reason is None:
+                continue   # hit/no_hits だけ＝置き換えない（not_found_in_scope のまま）
+        new_item = {**item, "status": "unverified", "reason": reason}
+        try:
+            write_item_atomic(dir, new_item)
+        except (OSError, ValueError):
+            continue       # 書換え失敗は元の状態のまま（fail-open）
+        new_items[item_id] = new_item
+    return LedgerSnapshot(manifest=snapshot.manifest, items=new_items, invalid_ids=snapshot.invalid_ids)

@@ -61,6 +61,7 @@ EXPECTED: dict[tuple[str, str], int] = {
     ("GET", "/admin/audit/verify"): 401,
     ("GET", "/admin/audit/export"): 401,
     ("GET", "/admin/usage/stats"): 401,
+    ("GET", "/admin/usage/export"): 401,
     ("POST", "/admin/usage/chat"): 401,
     ("POST", "/admin/usage/quality-runs"): 401,
     ("GET", "/admin/improvement-log/export"): 401,
