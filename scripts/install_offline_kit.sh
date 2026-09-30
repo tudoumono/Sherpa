@@ -61,6 +61,14 @@ ORIG_PWD="$(pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Codex CLI（固定版）の展開に使う（sherpa_sha256_hex・codex_pin_extract_bin）。
+# shellcheck source=scripts/run-common.sh
+. "$ROOT/scripts/run-common.sh"
+# shellcheck source=scripts/codex-version.env
+. "$ROOT/scripts/codex-version.env"
+# shellcheck source=scripts/lib/codex_pin.sh
+. "$ROOT/scripts/lib/codex_pin.sh"
+
 OUT="$ROOT/dist/offline-kit"
 TARGET_DIR="$ROOT"
 
@@ -757,28 +765,28 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 7b. Codex CLI（tools/codex/ へ展開・静的バイナリを PATH に載せる）
+# 7b. Codex CLI（固定版・tools/codex/bin/codex へ展開。静的バイナリのため npm/node は不要）
 #     sherpa は `shutil.which("codex")` で探す。run-common.sh が tools/codex/bin を PATH に足す。
 #     認証は Sherpa を動かすユーザーで `printenv OPENAI_API_KEY | codex login --with-api-key`
 #     （~/.codex/auth.json を書くだけ・通信不要・実測 2026-08-18）。推論時だけ OpenAI へ出る。
 # ---------------------------------------------------------------------------
 _step "7b. Codex CLI"
-CODEX_TARBALL="$(ls "$OUT"/codex/openai-codex-*-linux-x64.tar.gz 2>/dev/null | head -1 || true)"
+# このホストの OS/CPU の固定アセット名だけを選び、リポジトリに固定した sha256 と照合する
+# （キット内の SHA256SUMS やファイルの並びには頼らない）。
+CODEX_KEY="$(codex_pin_platform_key)"
+CODEX_TARBALL=""
+[ -n "$CODEX_KEY" ] && CODEX_TARBALL="$OUT/codex/$(codex_pin_asset_name "$CODEX_KEY")"
 if [ -n "$CODEX_TARBALL" ] && [ -f "$CODEX_TARBALL" ]; then
-  if [ -f "$OUT/codex/SHA256SUMS" ] && ! ( cd "$OUT/codex" && sha256sum -c --quiet SHA256SUMS ); then
-    fail "Codex CLI の tarball が SHA256SUMS と一致しません（搬入時の破損/すり替え）。"; exit 1
+  if [ "$(sherpa_sha256_hex "$CODEX_TARBALL")" != "$(codex_pin_sha256 "$CODEX_KEY")" ]; then
+    fail "Codex CLI の tarball が固定の sha256（scripts/codex-version.env）と一致しません（搬入時の破損/すり替え）。"; exit 1
   fi
   CODEX_DEST="$INSTALL_DIR/tools/codex"
-  rm -rf "$CODEX_DEST/node_modules/@openai/codex"
-  mkdir -p "$CODEX_DEST/node_modules/@openai" "$CODEX_DEST/bin"
-  tar -xzf "$CODEX_TARBALL" -C "$CODEX_DEST/node_modules/@openai"
-  CODEX_BIN_REAL="$CODEX_DEST/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
-  if [ ! -x "$CODEX_BIN_REAL" ]; then
-    fail "Codex CLI の実行ファイルが展開後に見つかりません: $CODEX_BIN_REAL"; exit 1
+  if ! codex_pin_extract_bin "$CODEX_TARBALL" "$CODEX_DEST/bin/codex" "$CODEX_PIN_VERSION"; then
+    fail "Codex CLI の展開・版確認に失敗しました: $CODEX_TARBALL"; exit 1
   fi
-  # node に依存しない静的バイナリへ直接リンク（--skip-node のキットでも Codex は動く）。
-  ln -sfn "$CODEX_BIN_REAL" "$CODEX_DEST/bin/codex"
-  ok "Codex CLI を展開しました: $CODEX_DEST/bin/codex（$(cat "$OUT/codex/VERSION" 2>/dev/null || echo ?)）"
+  # 旧キット（npm の導入ツリー）の残りを片付ける（固定版の差し替えが済んでから）。
+  rm -rf "$CODEX_DEST/node_modules"
+  ok "Codex CLI を展開しました: $CODEX_DEST/bin/codex（${CODEX_PIN_VERSION}）"
   # env ファイル（SHERPA_ENV_FILE ＞ /etc/sherpa/sherpa.env）に OPENAI_API_KEY があれば、ここで認証まで済ませる
   # （通信なし・冪等・run-common の sherpa_codex_ensure_auth）。**この導入を実行しているユーザーの** ~/.codex に
   # 書くので、Sherpa を動かすユーザーで導入していることが前提（root 実行は冒頭で拒否済み）。
@@ -797,7 +805,7 @@ if [ -n "$CODEX_TARBALL" ] && [ -f "$CODEX_TARBALL" ]; then
   fi
   note "  推論時は OpenAI API へ到達できる必要があります（閉域なら api.openai.com への穴あけ）。"
 else
-  warn "Codex CLI の tarball が見つかりません（$OUT/codex/）。--skip-codex で収集していない場合はスキップします。"
+  warn "このホスト（$(uname -s) $(uname -m)）向けの Codex CLI の tarball が見つかりません（$OUT/codex/）。--skip-codex で収集していないか、キットの対象 OS/CPU（CODEX_PIN_KIT_PLATFORM）が違います。スキップします。"
   note "  この状態では Codex(OpenAI)/Codex(Ollama) 構成は使えません（OpenAI 直結・ローカル(Ollama) は使えます）。"
 fi
 echo ""
@@ -973,7 +981,7 @@ _verify "フォント（Noto Sans CJK JP / HackGen）" "$FONTS_COLLECTED" "fc-li
 OCR_COLLECTED=0
 [ -f "$OUT/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar" ] && OCR_COLLECTED=1
 CODEX_COLLECTED=0
-[ -n "$(ls "$OUT"/codex/openai-codex-*-linux-x64.tar.gz 2>/dev/null)" ] && CODEX_COLLECTED=1
+[ -n "$(ls "$OUT"/codex/codex-*.tar.gz 2>/dev/null)" ] && CODEX_COLLECTED=1
 _verify "Codex CLI（tools/codex/bin/codex --version）" "$CODEX_COLLECTED" "'$INSTALL_DIR/tools/codex/bin/codex' --version"
 # モデルの照合はワーカー自身が起動時に行う（固定 hash と一致しなければ available=false）。
 # ここではイメージが読み込めていること・モデルが置かれていることだけを見る。

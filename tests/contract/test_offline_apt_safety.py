@@ -289,13 +289,17 @@ def test_collector_propagates_docker_failure(tmp_path: Path):
 
 def test_kit_carries_codex_cli_and_installer_puts_it_on_path():
     """Codex(OpenAI) 構成は「OpenAI へだけ穴あけ」の閉域で使う前提＝Codex CLI はキットが運ぶ。
-    収集: npm 導入済みツリーを tar（--skip-codex で除外可）／導入: tools/codex/bin/codex に静的バイナリを
-    リンク／run-common が PATH に載せる（sherpa は shutil.which("codex") で探す）。"""
+    収集: 固定版（scripts/codex-version.env）の配布物を GitHub リリースから取得（--skip-codex で除外）／
+    導入: tools/codex/bin/codex へ展開（静的バイナリ・npm/node 不要・2026-09-30 固定版導入で置換）／
+    run-common が PATH に載せる（sherpa は shutil.which("codex") で探す）。"""
     make = MAKE.read_text(encoding="utf-8")
     inst = INSTALL.read_text(encoding="utf-8")
     common = (ROOT / "scripts" / "run-common.sh").read_text(encoding="utf-8")
-    assert "--skip-codex" in make and "openai-codex-" in make and "@openai/codex" in make
+    version_env = (ROOT / "scripts" / "codex-version.env").read_text(encoding="utf-8")
+    assert "--skip-codex" in make and "codex_pin_fetch_asset" in make
+    assert "CODEX_PIN_VERSION" in version_env and "CODEX_PIN_SHA256_linux_x86_64" in version_env
     assert 'tools/codex/bin/codex' in inst and "codex login --with-api-key" in inst
+    assert "codex_pin_extract_bin" in inst
     assert 'tools/codex/bin' in common
     # 認証案内は「通信不要」であることを明記（実測 2026-08-18: unshare -n 下で Successfully logged in）
     assert "通信不要" in inst

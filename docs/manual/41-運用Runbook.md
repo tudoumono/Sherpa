@@ -338,13 +338,19 @@ set_openai_endpoint_seed_blocked`）で OpenAI 系 I/O 全体を止める設計�
 
 ### S11. Codex CLI の版を上げる前に
 
-次の資料の取り込み（または任意のタイミング）で Codex CLI（`@openai/codex`）を新しい版へ上げる前に、
+次の資料の取り込み（または任意のタイミング）で Codex CLI を新しい版へ上げる前に、
 `make codex-compat` を流してください。実 API を一切呼ばずに（課金なし・Azure 等へ接続しない）、
 偽の接続先を使って Sherpa の本番の Codex 実行経路（設定の生成・サンドボックス・MCP・multi_agent の
 役割ファイル・出力スキーマ）を実際の Codex CLI で1ターン走らせ、認証ヘッダ・`api-version`・モデル名
 （デプロイ名）が正しく届くか、プロンプトが標準入力経由で渡るか、役割ファイルが拒否されないかを確認します。
 全項目 OK（終了コード 0）を確認してから版を上げてください。NG があれば、上げる前に原因を確認してください
 （このスクリプトが検証する契約は `sherpa/providers/codex/sandbox.py`／`sherpa/providers/codex/provider.py`）。
+
+Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定しています。`make start`（と
+`make codex-install`）は固定版を `tools/codex/bin/codex` へ入れ（公式リリースの単体バイナリ・sha256 と版を
+照合）、`PATH` 上の他の codex より優先して使います。いまの状態は `make codex-version` で確かめられます。
+版を上げるときは、`make codex-compat` が全項目 OK になった版の番号・配布物名・sha256 を
+`scripts/codex-version.env` に書き換えます（取得できないネットワークでは閉域キットで運びます）。
 
 ## ログ
 

@@ -132,7 +132,9 @@ def _ensure_auth(tmp_path: Path, env_key: str, home: Path, log: Path) -> tuple[i
     envf.write_text(f"OPENAI_API_KEY={env_key}\n", encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_HOME")}
     env.update(PATH=f"{bin_dir}:{env['PATH']}", SHERPA_ENV_FILE=str(envf), CODEX_HOME=str(home))
-    r = subprocess.run(["bash", "-c", f'ROOT="{ROOT}"; . "{COMMON}"; sherpa_codex_ensure_auth; echo rc=$?'],
+    # source 後に偽 codex を先頭へ付け直す: run-common.sh は `make start` で入った `tools/codex/bin` を
+    # PATH の先頭へ足すので、そのままだと本物の codex が偽より先に見つかる。
+    r = subprocess.run(["bash", "-c", f'. "{COMMON}"; PATH="{bin_dir}:$PATH"; sherpa_codex_ensure_auth; echo rc=$?'],
                        env=env, capture_output=True, text=True, timeout=30)
     return int(r.stdout.strip().rsplit("rc=", 1)[1]), r.stdout + r.stderr
 

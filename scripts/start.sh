@@ -193,6 +193,33 @@ if ! ./scripts/check-ports.sh; then
   exit 1
 fi
 
+# --- Codex CLI の固定版をそろえる（tools/codex/）。管理者権限不要・冪等。ネットワーク不可・対象外
+#     OS/CPU の場合は codex_install.sh が日本語で警告するだけで、起動は止めない（設計どおり）。
+./scripts/codex_install.sh || true
+# 初回導入では run-common.sh を読んだ時点で tools/codex/bin が無く PATH に載っていない。この後の
+# API キー認証（sherpa_codex_ensure_auth）とサンドボックス点検が導入した固定版を見るよう、ここで足す。
+if [ -x "$ROOT/tools/codex/bin/codex" ]; then
+  case ":$PATH:" in
+    *":$ROOT/tools/codex/bin:"*) : ;;
+    *) PATH="$ROOT/tools/codex/bin:$PATH"; export PATH ;;
+  esac
+fi
+
+# --- Codex のサンドボックス（bubblewrap）前提の確認（Ubuntu の AppArmor・root 不要）。既存の
+#     scripts/setup-codex-sandbox.sh check をそのまま使う（Linux 専用スクリプトのため Linux でのみ）。
+#     自動修正はしない（root が要る）。問題が無ければ何も表示しない。
+if [ "$(uname -s)" = "Linux" ]; then
+  if ! sandbox_check_out="$(./scripts/setup-codex-sandbox.sh check 2>&1)"; then
+    cat >&2 <<EOF
+
+ⓘ Codex のサンドボックス（bubblewrap）の前提が整っていません（サンドボックス内のコマンドが失敗する可能性があります）。
+${sandbox_check_out}
+
+  直すには: sudo bash scripts/setup-codex-sandbox.sh apply（root 権限が要るため自動では直しません。起動はこのまま続けます）
+EOF
+  fi
+fi
+
 # --- ストア（PostgreSQL / Elasticsearch / Neo4j）起動 → healthy 3つを待つ ---
 echo "ストア（PostgreSQL / Elasticsearch / Neo4j）を起動します..."
 sherpa_compose up -d
