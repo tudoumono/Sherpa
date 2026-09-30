@@ -18,8 +18,8 @@
 #                 除去する）。
 #
 # 例:
-#   scripts/gate-lane.sh /home/tudo/projects/Sherpa-h2 h2
-#   scripts/gate-lane.sh /home/tudo/projects/Sherpa-test1 smoke --only tests/unit/test_layer.py
+#   scripts/gate-lane.sh /path/to/worktree-h2 h2
+#   scripts/gate-lane.sh /path/to/worktree-smoke smoke --only tests/unit/test_layer.py
 #
 # 契約: 同一レーン名の二重起動はレーン別ロック（/tmp/sherpa-gate-<lane>.lock・ブロッキング・
 # gate-integration.sh とも共有＝同名レーンを lane/integration 両入口から同時に起動できない）で

@@ -1,7 +1,7 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help hooks start stop restart status check-ports up down ps logs bootstrap demo mirror install-docker ocr-models \
+.PHONY: help hooks dev-setup start stop restart status check-ports up down ps logs bootstrap demo mirror install-docker ocr-models \
         graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
@@ -29,6 +29,9 @@ export SHERPA_UNIT_BUDGET_SEC
 hooks:            ## git フック（scripts/git-hooks）を有効化＝Agent worktree の基点をローカル main に自動で揃える
 	git config core.hooksPath scripts/git-hooks
 	@echo "core.hooksPath=scripts/git-hooks（post-checkout: .claude/worktrees/agent-* の基点を main へ揃える）"
+
+dev-setup:         ## 新しい貢献者向け: venv＋開発依存＋git フック＋.env雛形を1コマンドで用意（何度実行しても安全。CONTRIBUTING.md 参照）
+	./scripts/dev-setup.sh
 
 help:             ## このコマンド一覧を表示
 	@echo "Sherpa — make の使い方"
