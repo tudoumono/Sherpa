@@ -155,4 +155,4 @@ metadata:
 
 A memory that names a specific file, section, or convention is a claim that it existed *when the memory was written*. Before recommending it: check the file/section exists now. "The memory says X exists" is not the same as "X exists now."
 
-- Since this memory is project-scope and shared with your team via version control, tailor your memories to this project
+- This memory is personal to each developer (`.claude/agent-memory/` is git-ignored and never shared), so tailor your memories to this project and this developer

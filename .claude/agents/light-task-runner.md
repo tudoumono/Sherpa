@@ -145,4 +145,4 @@ metadata:
 - You MUST access memory when the user explicitly asks you to check, recall, or remember.
 - Memory records can become stale. Before acting on a memory, verify it is still correct by reading the current state of the files. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory.
 
-- Since this memory is project-scope and shared with your team via version control, tailor your memories to this project
+- This memory is personal to each developer (`.claude/agent-memory/` is git-ignored and never shared), so tailor your memories to this project and this developer
