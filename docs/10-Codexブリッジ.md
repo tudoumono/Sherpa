@@ -31,7 +31,7 @@ flowchart TD
   API -->|"SSE: trace/message"| B
   API --> BR["Session Bridge（Codex Runner）<br/>resume or new ＋ プロファイル注入(uid/writable_roots/model)"]
   BR --> UNIT["systemd sherpa-agent@uid（cwd=workspace, sandbox）<br/>codex exec [resume sid] --json"]
-  UNIT -->|"メイン推論（テキストのみ）"| OAI["OpenAI API（外部）"]
+  UNIT -->|"メイン推論（テキスト・画像＝推論の入力のみ）"| OAI["OpenAI API（外部）"]
   UNIT -->|"サブ / 機密 / embed"| OLL["Ollama（ローカル・WSL）"]
   UNIT -->|"stdout: JSONL events"| EM["Event Mapper<br/>trace/route/result/usage"]
   EM --> RDB[("RDB: messages / analyses / usage_events")]
