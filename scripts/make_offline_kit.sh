@@ -17,7 +17,8 @@
 #      ライブラリ .deb も収集する＝同梱しないと最小構成ホストで起動できない）
 #  10. LibreOffice（旧形式 Office 変換バックエンドの選択肢の一つ・sherpa/ingest/arms/legacy_convert.py）
 #  11. OCR（画像内文字の読み取り・既定ON）＝隔離ワーカーのイメージ＋専用 wheel＋モデル。
-#  14. Codex CLI（npm 導入済みツリー・linux-x64 静的バイナリ込み。--skip-codex で除外）
+#  14. Codex CLI（固定版・scripts/codex-version.env に集約された配布物を取得。既定 linux_x86_64。
+#      --skip-codex で除外。ネットワークから直接取得＝収集機に Codex/npm の導入は不要）
 #
 # apt 系収集（3・5・7・9のdeps・10）は既定で「素の対象OSコンテナ内」で行う（${APT_BASE_IMAGE}）。
 # `apt-get install --download-only` は収集マシンの導入済み状態を基準に依存解決するため、収集マシンに
@@ -48,6 +49,10 @@ cd "$ROOT"
 # docker compose の呼び出し（OCR イメージの build）を sherpa_compose に揃えるため（.env の受け渡しを一本化）。
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
+# shellcheck source=scripts/codex-version.env
+. "$ROOT/scripts/codex-version.env"
+# shellcheck source=scripts/lib/codex_pin.sh
+. "$ROOT/scripts/lib/codex_pin.sh"
 
 OUT="$ROOT/dist/offline-kit"
 NODE_VERSION="22.22.3"   # 08-実行権限と隔離.md / 2026-07-07-Marpスライド作成.md の実績ピン留め版
@@ -85,7 +90,7 @@ usage() {
   --skip-libreoffice      LibreOffice の収集をスキップする
   --skip-ocr              OCR（画像内文字の読み取り）資材の収集をスキップする
   --skip-base             土台の閉包（素のコンテナ導入済みパッケージの .deb・base/debs）をスキップする
-  --skip-codex            Codex CLI（npm の導入済みツリー）の収集をスキップする
+  --skip-codex            Codex CLI（固定版・scripts/codex-version.env）の収集をスキップする
   -h, --help              このヘルプを表示する
 
 出力先: dist/offline-kit/
@@ -953,32 +958,34 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # 14. Codex CLI（Codex(OpenAI) 構成に必須・「OpenAI へだけ NW 穴あけ」の閉域で使う）
-#     npm の導入済みツリー（@openai/codex ＋ 同梱の linux-x64 静的バイナリ）を tar で運ぶ。閉域では
-#     `npm install` の依存解決（optionalDependencies の platform 別パッケージ）を再現しにくいため。
+#     固定版の配布物（scripts/codex-version.env・単一の静的バイナリを含む tar.gz）を GitHub の
+#     リリースから直接取得する。npm・node は前提にしない。対象 OS/CPU はキットの既定
+#     （CODEX_PIN_KIT_PLATFORM・既定 linux_x86_64）で、収集機の OS/CPU には依存しない
+#     （環境変数で上書き可。例: CODEX_PIN_KIT_PLATFORM=linux_aarch64）。
 #     認証は閉域側で `printenv OPENAI_API_KEY | codex login --with-api-key`（通信不要・実測 2026-08-18）。
 # ---------------------------------------------------------------------------
 echo "--- 14. Codex CLI ---"
 if [ "$FETCH" = 1 ] && [ "$SKIP_CODEX" != 1 ]; then
   reset_dir "$OUT/codex"
-  CODEX_PKG_DIR="$(npm root -g 2>/dev/null)/@openai/codex"
-  if [ -d "$CODEX_PKG_DIR" ] && [ -f "$CODEX_PKG_DIR/package.json" ]; then
-    CODEX_VER="$(node -p "require(process.argv[1]).version" "$CODEX_PKG_DIR/package.json")"   # node は npm と同居（端末の Python に依存させない）
-    if [ ! -x "$CODEX_PKG_DIR/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex" ]; then
-      fail "Codex の linux-x64 バイナリが見つかりません（収集機が linux-x64 でないか、導入が不完全）。--skip-codex で除外できます。"
-      exit 1
-    fi
-    tar -C "$(dirname "$CODEX_PKG_DIR")" -czf "$OUT/codex/openai-codex-$CODEX_VER-linux-x64.tar.gz" codex
-    printf '%s\n' "$CODEX_VER" > "$OUT/codex/VERSION"
-    ( cd "$OUT/codex" && sha256sum ./*.tar.gz > SHA256SUMS )
-    ok "Codex CLI $CODEX_VER: $OUT/codex/（$(du -h "$OUT/codex"/*.tar.gz | cut -f1)）"
-  else
-    fail "Codex CLI が導入されていません（npm install -g @openai/codex）。--skip-codex で除外できます。"
+  CODEX_KIT_ASSET="$(codex_pin_asset_name "$CODEX_PIN_KIT_PLATFORM")"
+  if [ -z "$CODEX_KIT_ASSET" ]; then
+    fail "CODEX_PIN_KIT_PLATFORM が未対応です（${CODEX_PIN_KIT_PLATFORM}）。scripts/codex-version.env を確認してください。"
     exit 1
   fi
+  note "固定版 Codex CLI（${CODEX_PIN_VERSION}・${CODEX_KIT_ASSET}）を取得します..."
+  codex_fetch_rc=0
+  codex_pin_fetch_asset "$CODEX_PIN_KIT_PLATFORM" "$OUT/codex/$CODEX_KIT_ASSET" || codex_fetch_rc=$?
+  if [ "$codex_fetch_rc" -ne 0 ]; then
+    fail "Codex CLI の取得に失敗しました（sha256 不一致、またはネットワーク不可）。--skip-codex で除外できます。"
+    exit 1
+  fi
+  printf '%s\n' "$CODEX_PIN_VERSION" > "$OUT/codex/VERSION"
+  ( cd "$OUT/codex" && sha256sum "$CODEX_KIT_ASSET" > SHA256SUMS )
+  ok "Codex CLI ${CODEX_PIN_VERSION}（${CODEX_PIN_KIT_PLATFORM}）: $OUT/codex/${CODEX_KIT_ASSET}（$(du -h "$OUT/codex/$CODEX_KIT_ASSET" | cut -f1)・sha256 検証OK）"
 elif [ "$SKIP_CODEX" = 1 ]; then
   warn "--skip-codex が指定されたため、Codex CLI の収集をスキップしました（閉域で Codex 構成は使えません）。"
 else
-  note "[計画] $(npm root -g 2>/dev/null)/@openai/codex を tar 化（linux-x64 静的バイナリ込み・tar 後 約130MB）"
+  note "[計画] 固定版 Codex CLI（${CODEX_PIN_VERSION}・${CODEX_PIN_KIT_PLATFORM}）を GitHub リリースから取得し sha256 検証（tar 後 約100MB）"
   note "  → $OUT/codex/"
   note "→ 実行するには --fetch を指定してください（--skip-codex で除外可）。"
 fi

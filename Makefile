@@ -6,6 +6,7 @@
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
         test-db-reset screenshots backup restore usage-backfill turn-activity graph-chain azure-smoke codex-compat doctor sandbox-check \
+        codex-install codex-version \
         gate-slice gate-merge gate-release gate-ci test-inventory test-durations
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
@@ -258,6 +259,12 @@ doctor:            ## 導入先の統合セットアップ検査（ストア疎�
 
 sandbox-check:     ## Codex のサンドボックス（bubblewrap）の前提を確認（Ubuntu 23.10+ の AppArmor ユーザー名前空間制限・root不要）。直すには sudo bash scripts/setup-codex-sandbox.sh apply
 	./scripts/setup-codex-sandbox.sh check
+
+codex-install:      ## 固定版 Codex CLI（scripts/codex-version.env）を tools/codex/ に導入（既に固定版なら何もしない・管理者権限不要。make start も同じ確認を行う）
+	./scripts/codex_install.sh
+
+codex-version:      ## 固定版と、tools/codex/・PATH 上に実際にある Codex CLI の版を表示（導入は行わない）
+	./scripts/codex_install.sh --check
 
 diag:              ## 解析用のログ回収バンドルを作る（機密を含めない・dist/diag/）。ARGS で --days/--out 等を渡せる
 	./scripts/diag.sh $(ARGS)

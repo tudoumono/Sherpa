@@ -34,6 +34,8 @@ node_modules/
 dist/
 build/
 coverage/
+# 固定版 Codex CLI の導入先（scripts/codex_install.sh が生成・展開先ごとに異なるので追跡しない）
+tools/codex/
 # 独立UI自動化のスクリーンショット・ログ・trace・集計結果
 ui_automation/artifacts/
 # pytest-cov のローカル成果物（CI と同じ --cov をローカル実行すると生成される）
