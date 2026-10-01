@@ -25,6 +25,13 @@ def resolve(rel: str, world: str | None = None):
     文書台帳との正準一致確認（別名/列挙不能ディレクトリ対策）は `/documents/download`
     エンドポイント（`sherpa/routers/documents.py`）側だけの責務とし、本関数自体には
     持ち込まない——DB 到達に依存させると `tests/unit` が要求する DB 非依存性が壊れるため。
+
+    アーカイブ取り込み（zip/tar(.gz)/tgz）: `rel` が原本ツリー（`wd`）直下に実在しなければ、
+    展開先（`worlds.archives_dir`）も同じ `resolve_path`（`..`/絶対/symlink 拒否・root 限定）で
+    試す——原本には zip/tar がファイルとして存在する（ディレクトリではない）ため、その配下の
+    `rel`（`<アーカイブ>/<中のパス>`）は `wd` 側の途中コンポーネントが `dir` でなく必ず解決失敗する
+    （誤って原本を素通りすることはない）。中のファイルのDLは**展開した写し**を返す契約
+    （原本アーカイブ自体のDLは従来どおり `wd` 側が先に解決して返す）。
     """
     if importance.is_importance_control_path(rel):
         return None
@@ -32,7 +39,10 @@ def resolve(rel: str, world: str | None = None):
     wd = worlds.world_dir(world)
     if not wd:
         return None
-    return resolve_path(wd, rel)
+    found = resolve_path(wd, rel)
+    if found is not None:
+        return found
+    return resolve_path(worlds.archives_dir(world), rel)
 
 
 def world_rel_set(world: str | None = None, root=None, strict: bool = False, *,
@@ -56,5 +66,6 @@ def world_rel_set(world: str | None = None, root=None, strict: bool = False, *,
         wd = worlds.world_dir(world)
     if not wd:
         return set()
-    return {r for _rp, r in scope_infer.safe_files(wd, strict=strict, deadline=deadline)
+    also = worlds.archives_dir(world) if world is not None else None
+    return {r for _rp, r in scope_infer.safe_files(wd, strict=strict, deadline=deadline, also=also)
            if not importance.is_importance_control_path(r)}

@@ -59,7 +59,8 @@ def _content_rels(world: str, root=None, strict: bool = False, deadline: float |
     wd = root if root is not None else worlds.world_dir(world)
     if not wd:
         return []
-    return [rel for rp, rel in scope_infer.safe_files(wd, strict=strict, deadline=deadline)
+    also = worlds.archives_dir(world)   # アーカイブ取り込み: 展開先も範囲ツリー（フォルダ選択）の対象にする
+    return [rel for rp, rel in scope_infer.safe_files(wd, strict=strict, deadline=deadline, also=also)
            if rp.suffix.lower() in _CONTENT_EXT and not importance.is_importance_control_path(rel)]
 
 

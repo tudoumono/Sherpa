@@ -1162,11 +1162,11 @@ def test_human_md_config_sig_fail_closed_while_world_has_pending_human_md_drift(
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vX")
-    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd: True)
+    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd, world=None: True)
     monkeypatch.setattr(office_md, "human_md_es_sig_drift", lambda dmd: True)
     assert es_index._human_md_config_sig("w") == es_index._HUMAN_MD_PENDING_SENTINEL
 
-    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd: False)
+    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd, world=None: False)
     # render 側は直ったが ES 側のマーカーはまだ True＝依然 pending。
     assert es_index._human_md_config_sig("w") == es_index._HUMAN_MD_PENDING_SENTINEL
 
@@ -1347,7 +1347,7 @@ def test_confirm_human_md_meta_updates_field_and_converges_needs_reindex(monkeyp
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vX")
-    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd: False)
+    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd, world=None: False)
     monkeypatch.setattr(office_md, "human_md_es_sig_drift", lambda dmd: False)   # マーカーは既に確定済み
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "count", lambda w: 5)
@@ -1391,7 +1391,7 @@ def test_confirm_human_md_meta_refuses_while_still_pending(monkeypatch, tmp_path
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vX")
-    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd: True)   # まだ pending
+    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd, world=None: True)   # まだ pending
     put_calls: list[tuple] = []
     monkeypatch.setattr(es_index, "_req", lambda *a, **kw: put_calls.append(a) or {})
     assert es_index.confirm_human_md_meta("w") is False
@@ -1411,7 +1411,7 @@ def test_confirm_human_md_meta_skips_put_when_meta_get_fails(monkeypatch, tmp_pa
     monkeypatch.setattr(worlds_mod, "world_dir", lambda w: wd)
     monkeypatch.setattr(worlds_mod, "derived_md_dir", lambda w: dmd)
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vX")
-    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd: False)
+    monkeypatch.setattr(office_md, "human_md_sig_drift", lambda wd, dmd, world=None: False)
     monkeypatch.setattr(office_md, "human_md_es_sig_drift", lambda dmd: False)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: None)   # GET 失敗を模す
 

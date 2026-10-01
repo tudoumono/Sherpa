@@ -492,9 +492,12 @@ def _current_human_md_sig() -> str:
             f"docx={ooxml_arm.DOCX_EXTRACTOR_VERSION};xlsx={ooxml_arm.XLSX_EXTRACTOR_VERSION}")
 
 
-def human_md_sig_drift(wd, derived) -> bool:
+def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
     """素の docx/xlsx のうち、`{rel}.md`（human_md 生成）の版が現在の `_current_human_md_sig()` と
     食い違う rel が1件でもあれば True。
+
+    `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先（`_archive_also_root`）も合流して評価する
+    ——省略時（`None`）は従来どおり `wd` だけを見る（既存呼び出し元は無変更）。
 
     **`.md` sidecar の有無では絞り込まない**: 空の xlsx 等は `.md` を持たない
     （`human_md.render_xlsx`／`render_docx` が None を返した）のが正当な結果でありうるが、それでも
@@ -518,7 +521,7 @@ def human_md_sig_drift(wd, derived) -> bool:
     dr = Path(derived)
     dr_ir = _sibling_layer_dir(dr, "ir")          # `.derived.json` マニフェストは ir 層（§8.1 三階層）
     current = _current_human_md_sig()
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         if rp.suffix.lower() not in (".docx", ".xlsx"):
             continue
         if _is_sensitive_original(rp, rp.suffix.lower()):
@@ -547,10 +550,12 @@ def _is_sensitive_original(rp: Path, ext: str) -> bool:
     return text_kind.is_sensitive(rp.name, ext)
 
 
-def refresh_human_md(wd, derived) -> dict:
+def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     """人間向け `{rel}.md` **だけ**の軽量再生成（H2・単一 asset・RAG-KV の drift 連鎖と
     同じ考え方）。`human_md_sig_drift` が対象とする条件と同じ rel だけを選び、document-ir を作り
     直して `human_md.render_docx`/`render_xlsx` へ渡し、`{rel}.md` だけを書き換える。
+
+    `world`（アーカイブ取り込み）: `human_md_sig_drift` と同じ（省略時は従来どおり `wd` だけ）。
     `.document.json`/`.evidence.json`/`.rag.md`/`.rag_chunks.jsonl`・ES 索引には一切触れない
     （`.rag_sig`/`.document_ir_sig` も変更しない＝RAG_ES 有効時でも ES を無駄に再索引させない）。
 
@@ -593,7 +598,7 @@ def refresh_human_md(wd, derived) -> dict:
     current = _current_human_md_sig()
     generated = failed = 0
     failures: list[dict] = []
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in (".docx", ".xlsx"):
             continue
@@ -658,7 +663,7 @@ def _write_human_md_es_sig_marker(dr: Path) -> bool:
         return False
 
 
-def confirm_human_md_es_sig(wd, derived) -> bool:
+def confirm_human_md_es_sig(wd, derived, *, world: str | None = None) -> bool:
     """`.human_md_es_sig` を現行値で確定する（ES が bulk 成功でこの版まで追随できたと記録する）。
 
     呼び出し元（`worker`）は `es_index.index_world()` の戻り値を検査し、失敗（`error` キー）が
@@ -668,10 +673,12 @@ def confirm_human_md_es_sig(wd, derived) -> bool:
     確定できた（True）か、render 側の drift が残っていて確定を見送った・マーカーの書込自体が
     失敗した（いずれも False）かを返す。呼び出し元は False の場合、失敗として扱う
     （例: `ingest_runs` へ記録する）。
+
+    `world`（アーカイブ取り込み）: `human_md_sig_drift` へそのまま転送する（省略時は従来どおり）。
     """
     wd = Path(wd).resolve()
     dr = Path(derived)
-    if human_md_sig_drift(wd, dr):
+    if human_md_sig_drift(wd, dr, world=world):
         return False
     return _write_human_md_es_sig_marker(dr)
 
@@ -756,6 +763,26 @@ def evidence_ir_sig_drift(derived_md_dir) -> bool:
 
 # ---- Evidence IR由来のpipe-free RAG表現版 drift（E3）----
 _RAG_SIG_MARKER = ".rag_sig"
+
+
+def _archive_also_root(world: str | None) -> Path | None:
+    """アーカイブ取り込み（zip/tar(.gz)/tgz）: `world` が分かれば、その展開先
+    （`worlds.archives_dir`・存在しなければ呼び出し側は何も変わらない）を返す——
+    `scope_infer.safe_files(wd, also=...)` へそのまま渡すための唯一の入口（office_md 内の
+    原本ツリー走査＝変換・drift 判定・軽量再生成の**全箇所**がこのヘルパーを共有する＝
+    「展開先を第2の原本の根として扱う」ロジックを1か所に集約し、呼び出し側ごとに
+    二重実装しない）。展開先の木は `<アーカイブの相対パス>/<中のパス>` という doc_id と
+    同じ相対パス構造を持つため、`wd` と `also` を合わせて歩いた結果の `rel` はそのまま
+    派生物（md/rag/ir）の置き場キーとして使える（原本ツリーへは一切書かない）。
+
+    `world` 不明（省略されたテスト/軽量 API 呼び出し等）なら `None`——`scope_infer.safe_files`
+    は `also=None` を「合流なし」として扱うため、既存呼び出し元（`world` を渡さない）は
+    完全に無変更のまま。
+    """
+    if not world:
+        return None
+    from .. import worlds
+    return worlds.archives_dir(world)
 
 
 def _resolve_ocr_observation_dir(world: str | None) -> Path | None:
@@ -1943,12 +1970,13 @@ def _build_derived_into_staging(
         failed += 1
         conversion_failures.append({"doc": rel, "reason": reason_code})
 
-    candidate_total = sum(1 for rp, _rel in si.safe_files(wd) if rp.suffix.lower() in candidate)
+    _also = _archive_also_root(world)   # アーカイブ取り込み: この関数内の全 safe_files 呼び出しで共有
+    candidate_total = sum(1 for rp, _rel in si.safe_files(wd, also=_also) if rp.suffix.lower() in candidate)
     processed_candidates = 0
     if progress is not None:
         progress(0, candidate_total)
 
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, also=_also):
         ext = rp.suffix.lower()
         if ext not in candidate:
             continue
@@ -2344,9 +2372,16 @@ def _build_derived_into_staging(
     return rep
 
 
-def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = True) -> dict:
+def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = True,
+                        world: str | None = None) -> dict:
     """**IR だけ**の軽量再生成（DOC-IR-001.5・修正3）。`build_derived` と違い derived を全消去しない
     （MD／meta.json／`.arms_sig` には一切触れない＝IR 版だけの更新で全再ビルドを誘発しない）。
+
+    `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先（`_archive_also_root`）も合流して歩く
+    ——**ここを省くと、展開先の `.document.json` が下の stale 一掃ループに「原本が消えた」と
+    誤認されて毎回削除される**（アーカイブ自体は消えていないのに、軽量再生成のたびに展開先
+    由来の IR が消えては次の `_build_derived_into_staging` 全再構築で復活する往復になる）。
+    省略時（`None`）は従来どおり `wd` だけを見る（既存呼び出し元は無変更）。
 
     `wd` を `scope_infer.safe_files` で歩き、原本が素の `.docx`/`.pptx`/`.xlsx`（B1 と同じ理由で旧形式は
     対象外＝`build_derived` の B1 コメント参照）**かつ** 対応する `derived/{rel}.md` が既に在る文書だけを
@@ -2386,7 +2421,7 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
     generated = failed = 0
     failures: list[dict] = []
     seen_ir: set[str] = set()
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in ooxml_arm._IR_EXTS:
             continue
@@ -2515,9 +2550,12 @@ def _write_derived_sidecar_manifest(dr: Path, dr_rag: Path, dr_ir: Path, rel: st
         return False
 
 
-def rag_sidecars_missing(wd, derived) -> bool:
+def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
     """原本ごとに生成時マニフェスト（`_write_derived_sidecar_manifest`）を読み、そこに列挙された
     sidecar・asset が1つでも欠落していれば True。
+
+    `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先も合流して評価する——省くと展開先由来の
+    文書のマニフェストを一切確認せず、欠落があっても検知できない（省略時は従来どおり `wd` だけ）。
 
     どの sidecar が生成されるかは実行時条件（空/image-only・有効 arm・legacy backend 到達性・
     raster 等）で決定的に変わり、原本の拡張子だけからは静的に導出できない。ここでは生成した側
@@ -2546,7 +2584,7 @@ def rag_sidecars_missing(wd, derived) -> bool:
     # build_derived が候補として実際に処理しうる拡張子とだけ突き合わせる（それ以外の原本＝
     # 設計書/ソースコード等は最初からマニフェストを持たない対象外であり、無いことは欠落ではない）。
     manifest_candidates = OFFICE_EXT | RASTER_EVIDENCE_EXT | convertible_exts()
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in manifest_candidates:
             continue
@@ -2592,7 +2630,9 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
     生成を開始せず `error` を返す。
 
     `world`（O1）は `_build_derived_into_staging` docstring 参照——公開中の OCR 観測を VLM と
-    合流して rag.md へ含める。
+    合流して rag.md へ含める。**併せて** zip/tar 展開先（`_archive_also_root`）も合流して歩く
+    ——これを省くと、展開先由来の evidence.json/rag.md/assets が下の stale 一掃ループに
+    「原本が消えた」と誤認されて削除される（`refresh_document_ir` と同じ理由）。
     """
     from .. import scope_infer as si
     from . import evidence_ir
@@ -2638,7 +2678,7 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
     legacy_cache = legacy_convert.cache_root_for(dr)
     obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決（O1）
     ocr_observation_marker = _ocr_observation_marker_for(obs_dir)
-    for rp, rel in si.safe_files(wd):
+    for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         if rp.suffix.lower() not in EVIDENCE_EXT:
             continue
         ext = rp.suffix.lower()
@@ -2783,7 +2823,9 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     生成開始前に `.rag_sig` を明示的に未確定へ戻す）。
 
     `world`（O1）は `_build_derived_into_staging` docstring 参照——OCR 完了後の「追いつき」
-    再生成はこの関数（`rag_sig_drift` の OCR 観測次元が誘発）が担う。
+    再生成はこの関数（`rag_sig_drift` の OCR 観測次元が誘発）が担う。**併せて** zip/tar 展開先
+    （`_archive_also_root`）も `sources` に合流する——これを省くと、下の `source_path is None`
+    判定が展開先由来の `rel` を「原本が消えた」として `failed` へ誤計上する。
     """
     from .. import scope_infer as si
     from . import evidence_ir
@@ -2815,7 +2857,7 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             "error": "rag_sig_unlink_failed",
         }
     sources = {
-        rel: rp for rp, rel in si.safe_files(wd)
+        rel: rp for rp, rel in si.safe_files(wd, also=_archive_also_root(world))
         if rp.suffix.lower() in EVIDENCE_EXT
     }
     generated = failed = 0

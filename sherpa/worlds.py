@@ -70,6 +70,42 @@ def derived_ir_dir(world_id: str) -> Path:
     return derived_dir(world_id) / "ir"
 
 
+def archives_dir(world_id: str) -> Path:
+    """zip/tar(.gz)/tgz の展開先（アーカイブ取り込み）。`derived_dir` の兄弟（`archives/`）——
+    原本（登録ディレクトリ）には一切書かない。木の構成がそのまま doc_id になる＝
+    `archives_dir(world_id) / "<アーカイブの相対パス>" / "<中のパス>"`
+    （`scope_infer.safe_files(..., also=archives_dir(world_id))` で世界本体の列挙へ合流する際、
+    `also` root からの相対パスがそのまま `<アーカイブの相対パス>/<中のパス>` になるよう
+    `ingest.archive_extract` 側が展開先をこの形に合わせている）。delete/世代入替時はこの木ごと消す
+    （`derived_dir` 全体の削除に含まれる）。"""
+    return derived_dir(world_id) / "archives"
+
+
+def archives_work_dir(world_id: str) -> Path:
+    """アーカイブ展開の作業領域（ステージング・退避・異常終了時の掃除専用・`archives_dir` の
+    **外**＝`derived_dir` の兄弟）。
+
+    `archives_dir` は文書列挙（`scope_infer.safe_files(..., also=archives_dir(...))`）・grep・
+    Codex 原本直読の読み取り範囲に含まれる公開領域——展開の途中経過（ステージング）や旧内容の
+    退避をここに置くと、途中の書きかけの中身が列挙/検索に漏れたり、異常終了時の掃除（名前の
+    パターンで探して消す）が展開物の中の似た名前のフォルダを誤って消しうる（RV是正・実害）。
+    本領域は `ingest.archive_extract` だけが使い、他のどの読み取り経路（`also=`／grep の
+    roots_spec／Codex の `_direct_read_roots`）にも**一切登場させない**——登場させたら契約違反。
+    異常終了時の掃除は中身を単純に全消去するだけでよい（公開済みの中身と混在しないため、
+    名前のパターンで選別する必要が無い）。
+    """
+    return derived_dir(world_id) / "archives_work"
+
+
+def archive_manifest_path(world_id: str) -> Path:
+    """アーカイブごとの展開結果サマリ（`ingest.archive_extract.sync_world_archives` が書く）。
+
+    `archives_dir` の**外**に置く——中に置くと `scope_infer.safe_files(archives_dir(...))` が
+    このサマリ自身を展開済み文書の1件として拾ってしまう（展開木は中身だけを持つ、という契約を守る）。
+    """
+    return derived_dir(world_id) / "archive_manifest.json"
+
+
 # ---- OCR 観測領域（任意機能・既定 OFF）----------------------------------------
 # OCR は隔離 worker が動かす。worker には **登録ディレクトリと Canonical 派生を read-only** で渡し、
 # **書けるのは観測領域だけ** に限定する。以下はその境界を fail-closed で守るための検証群で、

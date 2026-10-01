@@ -409,7 +409,7 @@ def _human_md_config_sig(world: str) -> str | None:
         wd = worlds.world_dir(world)
         dmd = worlds.derived_md_dir(world)
         if wd and dmd.exists() and (
-                office_md.human_md_sig_drift(wd, dmd) or office_md.human_md_es_sig_drift(dmd)):
+                office_md.human_md_sig_drift(wd, dmd, world=world) or office_md.human_md_es_sig_drift(dmd)):
             return _HUMAN_MD_PENDING_SENTINEL
         return office_md._current_human_md_sig()
     except Exception:

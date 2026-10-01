@@ -62,10 +62,19 @@ def _lstat_kind(p: Path) -> str | None:
     return None
 
 
-def safe_files(root, *, strict: bool = False, deadline: float | None = None):
+def safe_files(root, *, strict: bool = False, deadline: float | None = None, also=None):
     """`root` 配下の実ファイルを安全に列挙（**symlink file/dir を辿らない**・root 限定）。
 
     各要素は `(resolved_path, rel_posix)`。symlink は file/dir とも prune（脱出/誤参照を防ぐ）。
+
+    `also`（省略可・キーワード専用・アーカイブ取り込み）: 指定すると `root` の列挙に続けて
+    この第2の root も同じ規律（symlink 禁止・root 限定・strict/deadline）で列挙し、結果を連結する
+    ——`ingest.archive_extract` が展開した zip/tar の中身（`worlds.archives_dir(world_id)`）を
+    世界本体の文書列挙へ合流させるための唯一のフック（doc_id＝`also` root からの相対パス＝
+    `<アーカイブの相対パス>/<中のパス>` と一致する・展開先のディレクトリ構成がそのまま doc_id に
+    なるよう `archive_extract` 側が合わせている）。`also` が存在しない/空なら何も足さない
+    （世界に zip/tar が無い・展開が未実行の既存 world は無変更）。1段だけ連結する（`also` 自身は
+    再帰的に `also` を取らない＝無限連結を作らない）。
 
     `strict=False`（既定・内部 UI 向け）: root/ディレクトリ列挙/各エントリの種別判定で起きる
     `OSError`（権限エラー・途中での消失等）は該当箇所だけ黙って skip する（部分的な結果でも
@@ -102,6 +111,18 @@ def safe_files(root, *, strict: bool = False, deadline: float | None = None):
     軽いディレクトリを辿る合計時間」を抑えるものであり、単一の重い I/O 待ちからは守らない
     （既知の限界として受容する）。
     """
+    # `also` は「無ければ無いで構わない」補助 root（zip/tar の無い world では `archives_dir` が
+    # 実在しない＝大多数のケース）——`Path.is_dir()` で実在を見てから連結する。ここで素通し
+    # （無条件で再帰）すると、(a) archives の無い既存 world でも常に2回歩く形になり、歩行回数を
+    # 固定した既存テスト（`test_worker_ledger_rows_walk.py` 等）を壊し、(b) `strict=True` 経路
+    # （`root` は呼び出し側が実在確認済みという前提で OSError を re-raise する）で、単に「archives
+    # が無い」だけのケースまで re-raise してしまう（実際に踏んだ実害・2026-10-01）。`also` が
+    # 実在しないときは**この関数を呼ぶ前と完全に同じ単一 root 走査**に縮退する（既存呼び出し元は
+    # 挙動・歩行回数とも無変更のまま）。
+    if also is not None and Path(also).is_dir():
+        yield from safe_files(root, strict=strict, deadline=deadline)
+        yield from safe_files(also, strict=strict, deadline=deadline)
+        return
     root = Path(root)
     if deadline is not None and time.monotonic() > deadline:
         raise ScopeWalkDeadlineExceeded("scope 走査がデッドラインを超えました")

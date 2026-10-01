@@ -71,6 +71,13 @@ def doc_download(request: Request, rel: str = Query(...), world: str = Query(_DE
     秘匿名（`text_kind.is_sensitive`）は台帳確認の直後・実体確認より前で塞ぐ——`is_sensitive`
     導入前に取り込まれ台帳に残っている行（`credentials.xlsx` 等）が実体確認まで進んでしまうと
     素通しで配信されるため（台帳 #81）。存在を明かさない既存の「見つからない」応答と同じ形にする。
+
+    アーカイブ取り込み（zip/tar(.gz)/tgz）: 中のファイル（doc_id＝`<アーカイブ>/<中のパス>`）は
+    原本ツリー（`root`）には実在しない（アーカイブ自身はファイルでありディレクトリではないため
+    `root` 側の途中コンポーネント解決は必ず失敗する）——その場合だけ展開先（`worlds.archives_dir`）を
+    anchor にして同じ O_NOFOLLOW walk を試す（`p`＝`documents.resolve` が既に同じ優先順位で
+    解決済みの実体と一致する anchor を選ぶ）。中のファイルのDLは**展開した写し**を返す（原本
+    アーカイブそのものではない）契約。
     """
     u = _current_user(request)
     with world_lock_shared(world):
@@ -85,8 +92,16 @@ def doc_download(request: Request, rel: str = Query(...), world: str = Query(_DE
             p = doc_ledger.original_path(rel, world)
             if not p:
                 raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
+            anchor = root
+            archives_root = worlds.archives_dir(world)
+            if archives_root.is_dir():
+                try:
+                    if p.resolve().is_relative_to(archives_root.resolve()):
+                        anchor = archives_root
+                except OSError:
+                    pass
             try:
-                fd = safe_open.open_file_nofollow_walk(root, tuple(rel.split("/")))
+                fd = safe_open.open_file_nofollow_walk(anchor, tuple(rel.split("/")))
             except OSError:
                 raise HTTPException(404, "原本が見つかりません（パス不一致／未実在）")
             try:

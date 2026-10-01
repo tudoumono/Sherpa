@@ -361,6 +361,14 @@ def grep_search(query: str, world: str = "v1", roots=None, max_hits: int = 50,
     else:
         wd = worlds.world_dir(world)
         roots_spec = [(wd, False)] if wd else []
+        # アーカイブ取り込み（zip/tar(.gz)/tgz）: 展開先（`worlds.archives_dir`）も原本ツリーと同じ
+        # 規律（`is_derived=False`＝`classify_document` で分類・層判定も通常どおり）で grep 対象に
+        # 含める——展開木の構成がそのまま doc_id（`<アーカイブ>/<中のパス>`）になるため、
+        # 原本ツリーと同じ rel 組み立てロジックがそのまま成立する（下の `rel = p.resolve().
+        # relative_to(rootr)` を参照）。zip/tar の無い world は `archives_dir` が存在しないため無害。
+        der_archives = worlds.archives_dir(world)
+        if der_archives.is_dir():
+            roots_spec.append((der_archives, False))
         # rag（RAG 正本）と md（人間用・legacy 縮退）は§8.1 三階層のフォルダ分離で別ディレクトリ
         # ——両方を is_derived ルートとして歩く。優先順位判定（下の `preferred_derived_name`）は
         # `der_rag` を固定で参照するため、どちらのルートを走査中でも同じ判定になる。

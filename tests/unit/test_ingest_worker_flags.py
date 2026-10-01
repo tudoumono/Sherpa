@@ -182,7 +182,7 @@ def test_human_md_es_confirm_failure_becomes_warn_flag_not_silent_success(
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
-    monkeypatch.setattr(office_md, "confirm_human_md_es_sig", lambda wd, dmd: False)
+    monkeypatch.setattr(office_md, "confirm_human_md_es_sig", lambda wd, dmd, world=None: False)
 
     res = worker.run("w")
 
@@ -205,7 +205,7 @@ def test_human_md_es_meta_confirm_failure_becomes_warn_flag(_stub_pipeline, monk
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
-    monkeypatch.setattr(office_md, "confirm_human_md_es_sig", lambda wd, dmd: True)
+    monkeypatch.setattr(office_md, "confirm_human_md_es_sig", lambda wd, dmd, world=None: True)
     monkeypatch.setattr(es_index, "confirm_human_md_meta", lambda world: False)
 
     res = worker.run("w")

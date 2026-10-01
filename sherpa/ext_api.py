@@ -2142,6 +2142,10 @@ def ext_doc(request: Request, world: str = Query(..., min_length=1, max_length=1
     所有権を引き継ぐ・documents ルータの `/documents/download` と共有）から読むだけ、で一切
     パスを再解決しない。検証と配信が別操作（パスで再 open）だと、その間隔（TOCTOU）で world 外
     ファイルへの symlink 差し替えやサイズ上限の迂回を許してしまう。
+
+    アーカイブ取り込み（zip/tar(.gz)/tgz）: 中のファイルは原本ツリーに実在しないため、
+    world root での open が失敗した場合だけ展開先（`worlds.archives_dir`）を anchor にして
+    同じ O_NOFOLLOW walk を再試行する（`/documents/download` と同じ規則・展開した写しを返す）。
     """
     del x_request_id
     with _AuditScope(request, "ext_api.doc", "ext_doc") as audit:
@@ -2166,7 +2170,19 @@ def ext_doc(request: Request, world: str = Query(..., min_length=1, max_length=1
         try:
             fd = safe_open.open_file_nofollow_walk(root, parts)
         except OSError:
-            raise HTTPException(404, "文書が見つかりません（パス不一致／未実在）")
+            # アーカイブ取り込み（zip/tar(.gz)/tgz）: 中のファイル（doc_id＝`<アーカイブ>/<中のパス>`）は
+            # 原本ツリー（`root`）には実在しない（アーカイブ自身はファイルでありディレクトリでは
+            # ないため、root 側の途中コンポーネント解決は必ず失敗する）——`status_document_reachable`
+            # が内部で使う `documents.resolve` と同じ優先順位（原本→展開先）で、展開先
+            # （`worlds.archives_dir`）を anchor にした同じ O_NOFOLLOW walk だけを再試行する
+            # （`/documents/download` と同じ規則）。中のファイルのDLは**展開した写し**を返す契約。
+            archives_root = worlds.archives_dir(world)
+            if not archives_root.is_dir():
+                raise HTTPException(404, "文書が見つかりません（パス不一致／未実在）")
+            try:
+                fd = safe_open.open_file_nofollow_walk(archives_root, parts)
+            except OSError:
+                raise HTTPException(404, "文書が見つかりません（パス不一致／未実在）")
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):

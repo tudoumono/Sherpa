@@ -1563,7 +1563,7 @@ def _scope_evidence_kinds(world: str, scope_paths, layer, *,
         _log.warning("範囲内の根拠種別を判定できませんでした（world root 不明・必須種別はそのまま適用します）")
         return None
     try:
-        entries = list(si.safe_files(wd, deadline=deadline))
+        entries = list(si.safe_files(wd, deadline=deadline, also=worlds.archives_dir(world)))
     except Exception:
         _log.warning("範囲内の根拠種別を判定できませんでした（必須種別はそのまま適用します）",
                      exc_info=True)
