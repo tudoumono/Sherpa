@@ -299,7 +299,7 @@ def test_kit_carries_codex_cli_and_installer_puts_it_on_path():
     assert "--skip-codex" in make and "codex_pin_fetch_asset" in make
     assert "CODEX_PIN_VERSION" in version_env and "CODEX_PIN_SHA256_linux_x86_64" in version_env
     assert 'tools/codex/bin/codex' in inst and "codex login --with-api-key" in inst
-    assert "codex_pin_extract_bin" in inst
+    assert "codex_pin_extract_package" in inst
     assert 'tools/codex/bin' in common
     # 認証案内は「通信不要」であることを明記（実測 2026-08-18: unshare -n 下で Successfully logged in）
     assert "通信不要" in inst

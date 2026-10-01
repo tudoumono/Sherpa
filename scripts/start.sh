@@ -198,7 +198,7 @@ fi
 ./scripts/codex_install.sh || true
 # 初回導入では run-common.sh を読んだ時点で tools/codex/bin が無く PATH に載っていない。この後の
 # API キー認証（sherpa_codex_ensure_auth）とサンドボックス点検が導入した固定版を見るよう、ここで足す。
-if [ -x "$ROOT/tools/codex/bin/codex" ]; then
+if sherpa_codex_local_complete; then
   case ":$PATH:" in
     *":$ROOT/tools/codex/bin:"*) : ;;
     *) PATH="$ROOT/tools/codex/bin:$PATH"; export PATH ;;

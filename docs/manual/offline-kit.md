@@ -98,7 +98,7 @@ apt 系の資材（python3 系・Docker Engine・フォント・Chromium のシ�
 | **土台の閉包 .deb**（libc6/perl-base/zlib1g 等・収集コンテナに導入済みの全パッケージ） | 素の対象OSコンテナで `apt-get install --download-only --reinstall $(dpkg-query -W …)`（`--skip-base` で除外可）。収集イメージの土台は再ビルドで更新済みのことがあり、閉域ホスト（リリース版）より新しい＝依存が土台で満たされる前提が崩れるため同梱する | `dist/offline-kit/base/debs/` |
 | **repo 索引＋BASELINE**（`Packages`/`Packages.gz`/`Release`・`BASELINE`・各グループの `debs/PACKAGES`） | 素のコンテナで `apt-utils` を入れ `apt-ftparchive packages/release`。BASELINE は収集元の OS/版/arch/収集日/イメージ digest | `dist/offline-kit/` 直下 |
 | OCR モデル（PP-OCRv6 det/rec・Apache-2.0） | `scripts/fetch_ocr_models.sh` で取得し `docker/ocr-models.lock.json` と照合（約134MB） | `dist/offline-kit/ocr/models/` |
-| **Codex CLI**（Apache-2.0・固定版の静的バイナリ） | GitHub の公式リリースから固定版（`scripts/codex-version.env`）を取得し sha256 を照合（既定 Linux x86_64・`CODEX_PIN_KIT_PLATFORM` で変更・`--skip-codex` で除外） | `dist/offline-kit/codex/`（導入先 `tools/codex/bin/codex`） |
+| **Codex CLI**（Apache-2.0・固定版の package 一式＝本体＋bwrap・rg 等） | GitHub の公式リリースから固定版（`scripts/codex-version.env`）を取得し sha256 を照合（既定 Linux x86_64・`CODEX_PIN_KIT_PLATFORM` で変更・`--skip-codex` で除外） | `dist/offline-kit/codex/`（導入先 `tools/codex/`・実行ファイルは `bin/codex`） |
 
 ### なぜ apt 系の資材を「素のコンテナ内」で収集するか
 

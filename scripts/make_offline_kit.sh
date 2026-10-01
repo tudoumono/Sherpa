@@ -958,7 +958,7 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # 14. Codex CLI（Codex(OpenAI) 構成に必須・「OpenAI へだけ NW 穴あけ」の閉域で使う）
-#     固定版の配布物（scripts/codex-version.env・単一の静的バイナリを含む tar.gz）を GitHub の
+#     固定版の配布物（scripts/codex-version.env・codex-package-*.tar.gz＝本体に bwrap・rg 等の付属物を加えた一式）を GitHub の
 #     リリースから直接取得する。npm・node は前提にしない。対象 OS/CPU はキットの既定
 #     （CODEX_PIN_KIT_PLATFORM・既定 linux_x86_64）で、収集機の OS/CPU には依存しない
 #     （環境変数で上書き可。例: CODEX_PIN_KIT_PLATFORM=linux_aarch64）。
@@ -985,7 +985,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_CODEX" != 1 ]; then
 elif [ "$SKIP_CODEX" = 1 ]; then
   warn "--skip-codex が指定されたため、Codex CLI の収集をスキップしました（閉域で Codex 構成は使えません）。"
 else
-  note "[計画] 固定版 Codex CLI（${CODEX_PIN_VERSION}・${CODEX_PIN_KIT_PLATFORM}）を GitHub リリースから取得し sha256 検証（tar 後 約100MB）"
+  note "[計画] 固定版 Codex CLI（${CODEX_PIN_VERSION}・${CODEX_PIN_KIT_PLATFORM}）を GitHub リリースから取得し sha256 検証（package 一式・約100〜150MB）"
   note "  → $OUT/codex/"
   note "→ 実行するには --fetch を指定してください（--skip-codex で除外可）。"
 fi

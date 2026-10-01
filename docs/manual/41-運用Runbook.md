@@ -347,8 +347,9 @@ set_openai_endpoint_seed_blocked`）で OpenAI 系 I/O 全体を止める設計�
 （このスクリプトが検証する契約は `sherpa/providers/codex/sandbox.py`／`sherpa/providers/codex/provider.py`）。
 
 Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定しています。`make start`（と
-`make codex-install`）は固定版を `tools/codex/bin/codex` へ入れ（公式リリースの単体バイナリ・sha256 と版を
-照合）、`PATH` 上の他の codex より優先して使います。いまの状態は `make codex-version` で確かめられます。
+`make codex-install`）は固定版を `tools/codex/` へ入れ（公式リリースの package 一式＝本体 `bin/codex` に、サンドボックスの
+`bwrap`（Linux）・`rg` などの付属物を加えたもの。sha256 と版を照合し、`tools/codex/` 全体を入れ替えます。
+本体だけの古い配置は一式で入れ直されます）、`PATH` 上の他の codex より優先して使います。いまの状態は `make codex-version` で確かめられます。
 版を上げるときは、`make codex-compat` が全項目 OK になった版の番号・配布物名・sha256 を
 `scripts/codex-version.env` に書き換えます（取得できないネットワークでは閉域キットで運びます）。
 

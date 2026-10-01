@@ -727,6 +727,10 @@ def _codex_install_root() -> Path | None:
         # プラットフォーム別の実行ファイルのパッケージは npm の配置次第で pkg の下（入れ子）にも
         # 隣（同じ @openai スコープ直下）にも置かれる——スコープごと読ませる。
         return pkg.parent if pkg.parent.name == "@openai" else pkg
+    # package 一式（`<root>/bin/codex`＋`<root>/codex-package.json`・codex-path/rg・codex-resources/bwrap）は
+    # 付属物ごと読めるよう `<root>`（tools/codex 等・その外には広げない）を返す。
+    if real.parent.name == "bin" and (real.parent.parent / "codex-package.json").is_file():
+        return real.parent.parent
     return real.parent
 
 
@@ -747,10 +751,14 @@ def _codex_launcher_dir() -> Path | None:
 
 
 def _codex_bundled_rg_dir() -> Path | None:
-    """Codex の導入先に同梱された ripgrep のフォルダ（`vendor/<triple>/codex-path`）。無ければ None。"""
+    """Codex の導入先に同梱された ripgrep のフォルダ（package 一式の `<root>/codex-path`、または npm 版の
+    `vendor/<triple>/codex-path`）。無ければ None。"""
     root = _codex_install_root()
     if root is None:
         return None
+    direct = root / "codex-path" / "rg"
+    if direct.is_file() and os.access(direct, os.X_OK):
+        return direct.parent
     for cand in sorted(root.glob("**/vendor/*/codex-path/rg")):
         if cand.is_file() and os.access(cand, os.X_OK):
             return cand.parent

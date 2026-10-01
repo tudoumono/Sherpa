@@ -16,9 +16,18 @@ if [ -d "$ROOT/tools/node/bin" ]; then
   esac
   export PATH
 fi
-# 閉域キットが展開する Codex CLI（tools/codex/bin/codex＝静的バイナリへの symlink）。sherpa は
-# `shutil.which("codex")` で探すため、PATH に載せるだけで見つかる（2026-08-18・キットに Codex を同梱）。
-if [ -d "$ROOT/tools/codex/bin" ]; then
+# 固定版の Codex CLI（tools/codex/・公式の package 一式）。sherpa は `shutil.which("codex")` で探すため、
+# PATH に載せるだけで見つかる。付属物（rg・Linux はサンドボックスの bwrap）がそろった一式のときだけ載せる
+# ——本体だけの配置を先頭に置くと、付属物のある既存の codex（npm 版等）を覆い隠してシェルが動かない。
+sherpa_codex_local_complete() {
+  [ -x "$ROOT/tools/codex/bin/codex" ] && [ -x "$ROOT/tools/codex/bin/codex-code-mode-host" ] || return 1
+  [ -x "$ROOT/tools/codex/codex-path/rg" ] && [ -x "$ROOT/tools/codex/codex-resources/zsh/bin/zsh" ] || return 1
+  if [ "$(uname -s)" = "Linux" ]; then
+    [ -x "$ROOT/tools/codex/codex-resources/bwrap" ] || return 1
+  fi
+  return 0
+}
+if sherpa_codex_local_complete; then
   case ":$PATH:" in
     *":$ROOT/tools/codex/bin:"*) : ;;
     *) PATH="$ROOT/tools/codex/bin:$PATH" ;;
