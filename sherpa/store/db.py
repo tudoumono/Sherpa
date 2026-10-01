@@ -862,6 +862,26 @@ _SCHEMA = [
         ms BIGINT,
         UNIQUE (message_id, agent_index, tool)
     )""",
+    # ---- 調査台帳の記録（COD-18 ①〜③・2026-10-01「調査台帳を回答ごとに残す」提案書）----
+    #      1 assistant message = 0〜1 行（台帳を使う構成で、台帳ゲートが実際に走ったターンだけ
+    #      持つ・`sherpa/providers/codex/provider.py::_investigation_record_payload`／
+    #      `sherpa/chat_service.py` が assistant message 保存の直後に書く）。manifest/items/coverage
+    #      は投稿時点の調査台帳の正規ファイル（`investigation_ledger.py` の正規形）をそのまま写した
+    #      ものであり、本文・資料名そのものは運ばない（契約は investigation_ledger.py 側で担保済み）。
+    #      `messages.trace` には入れない（JSONB 肥大で利用統計の表示が遅くなった過去がある・
+    #      別の持ち場として分離する）。
+    """CREATE TABLE IF NOT EXISTS investigation_records (
+        message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        complete BOOLEAN NOT NULL,
+        truncated BOOLEAN NOT NULL DEFAULT false,
+        manifest JSONB,
+        items JSONB NOT NULL DEFAULT '{}',
+        coverage JSONB NOT NULL DEFAULT '{}'
+    )""",
+    "CREATE INDEX IF NOT EXISTS investigation_records_conversation "
+    "ON investigation_records(conversation_id)",
 ]
 # PERF-1（台帳#17）: usage_stats の期間絞り（`_usage_period_bounds`）が messages.created_at で
 # 索引を使えるようにする。**契約の範囲**: messages 全体に対する線形の物理読取（Seq/Index Scanで

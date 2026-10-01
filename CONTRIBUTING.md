@@ -68,7 +68,7 @@ AI エージェントの記憶（Claude Code のメモリ・`.claude/agent-memor
 - **実環境の社内固有の名前を記録に残すこと**: 利用者の実環境に由来する固有名（ファイル名・画面/帳票名・
   項目名・ホスト名/パス等）をコード・テスト・文書・コミットメッセージに書かないこと。一般名に置き換えます。
 - **権限の迂回**: サンドボックス・パーミッションプロファイル・deny ルールを無効化・回避すること。
-- **登録ディレクトリ（world）への書き込み**: 本番 `data/kb/{world}/…` は読み取り専用です。書き込みは
+- **登録ディレクトリ（資料フォルダ）への書き込み**: 本番 `data/kb/{world}/…` は読み取り専用です。書き込みは
   `users/{user_id}/workspace/` のみ（成果物は `workspace/outputs/`）。ただし dev の `fixtures/corpus/**` は
   テストデータとして再構成可（本番の READ-ONLY とは別扱い）。
 
@@ -101,7 +101,7 @@ AI エージェントの記憶（Claude Code のメモリ・`.claude/agent-memor
 ## 並列作業（レーン）とテスト用DBの分離
 
 複数のスライスを並行して進めるときは、レーンごとに専用の Postgres DB（`sherpa_test_<lane>`）と
-Neo4j/Elasticsearch の world（`pytest-<lane>`）を分離して使います。
+Neo4j/Elasticsearch の資料フォルダ（`pytest-<lane>`）を分離して使います。
 
 ```bash
 scripts/gate-lane.sh <worktree の絶対パス> <lane名> --only tests/unit/test_foo.py

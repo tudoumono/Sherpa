@@ -58,6 +58,7 @@ GET	/conversations/{cid}	会話管理	conversation_get
 DELETE	/conversations/{cid}	会話管理	conversation_delete
 POST	/conversations/{cid}/pin	会話管理	conversation_pin
 PATCH	/conversations/{cid}	会話管理	conversation_rename
+GET	/conversations/{cid}/messages/{message_id}/investigation	会話管理	conversation_investigation_download
 POST	/troubleshoot/run	トラブルシュート・QA	troubleshoot_run
 POST	/qa/run	トラブルシュート・QA	qa_run
 GET	/documents/download	文書	doc_download

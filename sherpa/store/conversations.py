@@ -296,6 +296,9 @@ def delete_conversation(conversation_id, user_id="admin") -> bool:
                     "DELETE FROM message_feedback WHERE message_id IN "
                     "(SELECT id FROM messages WHERE conversation_id=%s)",
                     (conversation_id,))
+                # 調査の記録も同じ理由で消す（messages が残るため FK の CASCADE が発火しない）。
+                c.execute("DELETE FROM investigation_records WHERE conversation_id=%s",
+                          (conversation_id,))
         else:
             n = c.execute("DELETE FROM conversations WHERE id=%s AND user_id=%s",
                           (conversation_id, user_id)).rowcount

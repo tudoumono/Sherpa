@@ -9,12 +9,15 @@ api.py 側は削除したブロックの元位置に `app.include_router(convers
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+import json
+
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
-from sherpa import store
+from sherpa import investigation_record_render, store
 from sherpa.deps import _current_user, _delete_codex_sessions_for_conversation
 from sherpa.providers.codex.provider import _conversation_lock
+from sherpa.store import investigation_records as store_investigation
 
 # router に tags を持たせない: 各エンドポイントの `tags=["会話管理"]` と結合されて
 # 二重化してしまう（ルート表 golden 不一致の原因）ため、tags 指定は各デコレータ側のみに残す
@@ -115,3 +118,35 @@ def conversation_rename(cid: int, req: RenameReq, request: Request):
     if not store.rename_conversation(cid, title, u["uid"]):
         raise HTTPException(404, "会話が見つかりません")
     return {"ok": True, "id": cid, "title": title}
+
+
+@router.get("/conversations/{cid}/messages/{message_id}/investigation", tags=["会話管理"])
+def conversation_investigation_download(cid: int, message_id: int, request: Request,
+                                         format: str = Query("md", pattern="^(md|json)$")):
+    """調査の記録（`investigation_records`・COD-18「調査台帳を回答ごとに残す」提案書）のダウンロード。
+
+    会話の所有者のみ（`owns_assistant_message` と同じ判定＝他人の会話・論理削除済み・共有の
+    閲覧者（受領共有ラッパーは `origin != 'own'`）はすべて 404・`conversation_rename` と同じ
+    「所有会話のみ」の流儀だが、こちらは403との区別をしない＝常に404）。記録が無い
+    （台帳を使わない構成・台帳ゲートが走らなかったターン）メッセージも404。
+
+    `format=md`（既定）は人が読む Markdown・`format=json` は保存した3つ（manifest/items/
+    coverage）をそのまま返す。ファイル名は固定の一般名（質問文・資料名を含めない・CLAUDE.md
+    「実環境の固有名」節と同じ理由）。
+    """
+    u = _current_user(request)
+    if not store.owns_assistant_message(u["uid"], cid, message_id):
+        raise HTTPException(404, "記録が見つかりません")
+    record = store_investigation.get_investigation_record(message_id)
+    if record is None:
+        raise HTTPException(404, "記録が見つかりません")
+    if format == "json":
+        body = {"complete": record["complete"], "truncated": record["truncated"],
+                "manifest": record["manifest"], "items": record["items"],
+                "coverage": record["coverage"]}
+        return Response(content=json.dumps(body, ensure_ascii=False, indent=2),
+                        media_type="application/json; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="investigation.json"'})
+    md = investigation_record_render.render_markdown(record)
+    return Response(content=md, media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="investigation.md"'})

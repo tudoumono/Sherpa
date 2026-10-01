@@ -48,6 +48,7 @@ from .lens_service import (
     run_qa,
     run_troubleshoot,
 )
+from .store import investigation_records as store_investigation
 
 # 調べる深さ（探索反復・grep/ES ヒット上限。§3.2）: qa レンズの run_qa が直接 grep する経路
 # 固有の既定値（`agentic_search.MAX_HITS` とは別の定数・§1.6）。ここに1箇所だけ持ち、
@@ -1275,6 +1276,40 @@ def _pop_evidence_committed(env: dict, trace_nodes: dict):
     return node
 
 
+def _mark_investigation_recorded(env: dict, investigation_record: dict | None) -> None:
+    """COD-18（提案書「調査台帳を回答ごとに残す」§1）: `investigation_record`（provider が `_result`
+    の別項目として渡した台帳・`None`＝台帳ゲートが走らなかったターン）があれば、`env["investigation"]`
+    （既に provider が組み立て済みの要約）へ `recorded` の印を立てる。**assistant message を
+    `store.add_message` で保存する前**に呼ぶこと——この印は `messages.answer` JSONB の一部として
+    一緒に永続化される（実際の DB 保存成否ではなく「保存を試みる」印・`_save_investigation_record`
+    の docstring 参照）。
+    """
+    if investigation_record is not None and isinstance(env.get("investigation"), dict):
+        env["investigation"]["recorded"] = True
+
+
+def _save_investigation_record(investigation_record: dict | None, message_id, conversation_id) -> None:
+    """COD-18 §1: `investigation_record` を `investigation_records` 表へ保存する。**assistant
+    message を保存した直後**（`message_id` が実在する状態）に呼ぶこと——`investigation_records.
+    message_id` は `messages(id)` への FK のため、先に messages 行が無ければ書けない。この
+    前後関係により、`_mark_investigation_recorded` が先に立てた `recorded` 印は「保存を試みた」
+    ことを示すだけで、この保存が実際に失敗しても（fail-open・警告ログのみ）印は訂正しない——
+    回答の保存自体を失敗させない契約を優先する（稀な DB 障害時のみ起こりうる軽微な不整合）。
+    `investigation_record is None` は何もしない。
+    """
+    if investigation_record is None:
+        return
+    try:
+        store_investigation.save_investigation_record(
+            message_id, conversation_id,
+            complete=bool(investigation_record.get("complete")),
+            manifest=investigation_record.get("manifest"),
+            items=investigation_record.get("items") or {},
+            coverage=investigation_record.get("coverage") or {})
+    except Exception as e:
+        _log.warning("investigation record save failed (fail-open): %s", e)
+
+
 # 影響分析の Neo4j 安全弁＝timeout＋緊急天井・fail-loud＝偽陰性防止:
 # `_dispatch` の impact 分岐（`run_impact`→`ingest.world_neo4j`）が `GraphQueryOverloadError` を
 # raise した場合、**LLM 合成を一切経由させず**固定文言の `_result` へ差し替える。impact レンズだけが
@@ -1823,10 +1858,13 @@ def handle_message(session, message, world="v1",
 
     env["duration_ms"] = round((time.monotonic() - _t0) * 1000)
     _finalize_activity_phases(env, env["duration_ms"])
+    _investigation_record = result.get("investigation_record")
+    _mark_investigation_recorded(env, _investigation_record)
     msg = store.add_message(conversation_id, "assistant", env["headline"],
                             lens=result["decision"]["lens"], route=env["route"], answer=env,
                             trace=_cap_trace_v2(trace_nodes),
                             personal=_used_personal)
+    _save_investigation_record(_investigation_record, msg["id"], conversation_id)
     # 停止終端（DEPTH-2 S5）は監査も停止として残す——ただし assistant は保存済みなので
     # `assistant_msg_id` を渡す（本文の保存と監査を一致させる）。
     _audit_chat_turn(user_id, conversation_id, settings,
@@ -2038,10 +2076,13 @@ def stream_message(session, message, world="v1",
 
             env["duration_ms"] = round((time.monotonic() - _t0) * 1000)
             _finalize_activity_phases(env, env["duration_ms"])
+            _investigation_record = ev.get("investigation_record")
+            _mark_investigation_recorded(env, _investigation_record)
             msg = store.add_message(conversation_id, "assistant", env["headline"],
                                     lens=ev["decision"]["lens"], route=env["route"], answer=env,
                                     trace=_cap_trace_v2(trace_nodes),
                                     personal=_used_personal)
+            _save_investigation_record(_investigation_record, msg["id"], conversation_id)
             # 停止終端（DEPTH-2 S5）は監査も停止として残す（assistant は保存済み＝本文の保存と一致）。
             _audit_chat_turn(user_id, conversation_id, settings,
                              lens=("stopped" if _terminal == "stopped" else ev["decision"]["lens"]),
