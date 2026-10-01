@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# 固定版 Codex CLI（scripts/codex-version.env）を tools/codex/bin/codex にそろえる。
-# 管理者権限不要・冪等（既に固定版なら何もしない）。make start / make codex-install から呼ぶ。
+# 固定版 Codex CLI（scripts/codex-version.env）を tools/codex/ にそろえる（package 一式＝bin/codex・
+# codex-path/rg・Linux は codex-resources/bwrap ほか）。
+# 管理者権限不要・冪等（既に固定版で付属物もそろっていれば何もしない。本体だけの古い配置は入れ直す）。make start / make codex-install から呼ぶ。
 #
 #   ./scripts/codex_install.sh            # 確認・無ければ導入・違えば入れ替え
 #   ./scripts/codex_install.sh --check     # 導入は行わず、固定版と現状を表示するだけ
@@ -26,20 +27,29 @@ case "${1:-}" in
   *) echo "使い方: $0 [--check]" >&2; exit 2 ;;
 esac
 
-BIN_DIR="$ROOT/tools/codex/bin"
-BIN="$BIN_DIR/codex"
+DEST="$ROOT/tools/codex"
+BIN="$DEST/bin/codex"
 KEY="$(codex_pin_platform_key)"
 
 current=""
 if [ -x "$BIN" ]; then
   current="$(codex_pin_installed_version "$BIN" || true)"
 fi
+# 固定版で、かつ付属物（rg・Linux は bwrap）もそろっているか。版だけ一致の本体のみ配置（0.14.28〜31）は偽。
+complete=0
+if [ -n "$KEY" ] && codex_pin_installed_ok "$KEY" "$DEST" "$CODEX_PIN_VERSION"; then
+  complete=1
+fi
 
 if [ "$MODE" = "check" ]; then
   echo "固定版: ${CODEX_PIN_VERSION}"
   if [ -n "$current" ]; then
     if [ "$current" = "$CODEX_PIN_VERSION" ]; then
-      echo "導入済み（${BIN}）: ${current}（一致）"
+      if [ "$complete" = 1 ]; then
+        echo "導入済み（${BIN}）: ${current}（一致・付属物あり）"
+      else
+        echo "導入済み（${BIN}）: ${current}（版は一致・付属物が不足＝入れ直しが必要）"
+      fi
     else
       echo "導入済み（${BIN}）: ${current}（不一致）"
     fi
@@ -52,15 +62,19 @@ if [ "$MODE" = "check" ]; then
   exit 0
 fi
 
-if [ -n "$current" ] && [ "$current" = "$CODEX_PIN_VERSION" ]; then
-  echo "Codex CLI は既に固定版です（${current}・${BIN}）。"
+if [ "$complete" = 1 ]; then
+  echo "Codex CLI は既に固定版です（${current}・付属物あり・${BIN}）。"
   exit 0
+fi
+if [ -n "$current" ] && [ "$current" = "$CODEX_PIN_VERSION" ]; then
+  echo "固定版ですが付属物（bwrap・rg）が無い配置です（本体だけの旧い導入）。一式で入れ直します。"
 fi
 
 # tools/codex が無く、PATH 上の codex（npm 版など）が既に固定版なら取得しない（閉域で毎回の取得待ちを避ける）。
+# ただし付属物（rg・Linux は bwrap）を持つ配置のときだけ（npm 版は持つ・付属物の無い単体ファイルは取得する）。
 if [ -z "$current" ] && command -v codex >/dev/null 2>&1; then
   path_ver="$(codex_pin_installed_version "$(command -v codex)" || true)"
-  if [ "$path_ver" = "$CODEX_PIN_VERSION" ]; then
+  if [ "$path_ver" = "$CODEX_PIN_VERSION" ] && codex_pin_path_codex_has_accessories "$(command -v codex)"; then
     echo "PATH 上の Codex CLI が固定版です（${path_ver}・$(command -v codex)）。取得しません。"
     exit 0
   fi
@@ -103,10 +117,10 @@ EOF
   exit 1
 fi
 
-if ! codex_pin_extract_bin "$TMP_TARBALL" "$BIN" "$CODEX_PIN_VERSION"; then
+if ! codex_pin_extract_package "$TMP_TARBALL" "$DEST" "$CODEX_PIN_VERSION" "$KEY"; then
   rm -f "$TMP_TARBALL"
-  echo "✗ Codex CLI の展開・版確認に失敗しました（既存の ${BIN} は変更していません）。" >&2
+  echo "✗ Codex CLI の展開・検査・版確認に失敗しました（既存の ${DEST} は変更していません）。" >&2
   exit 1
 fi
 rm -f "$TMP_TARBALL"
-echo "Codex CLI ${CODEX_PIN_VERSION} を導入しました（${BIN}）。"
+echo "Codex CLI ${CODEX_PIN_VERSION} を導入しました（${DEST}・付属物込み）。"

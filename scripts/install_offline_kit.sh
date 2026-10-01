@@ -765,7 +765,7 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 7b. Codex CLI（固定版・tools/codex/bin/codex へ展開。静的バイナリのため npm/node は不要）
+# 7b. Codex CLI（固定版・package 一式を tools/codex/ へ展開＝bin/codex・codex-path/rg・Linux は codex-resources/bwrap。npm/node は不要）
 #     sherpa は `shutil.which("codex")` で探す。run-common.sh が tools/codex/bin を PATH に足す。
 #     認証は Sherpa を動かすユーザーで `printenv OPENAI_API_KEY | codex login --with-api-key`
 #     （~/.codex/auth.json を書くだけ・通信不要・実測 2026-08-18）。推論時だけ OpenAI へ出る。
@@ -781,12 +781,12 @@ if [ -n "$CODEX_TARBALL" ] && [ -f "$CODEX_TARBALL" ]; then
     fail "Codex CLI の tarball が固定の sha256（scripts/codex-version.env）と一致しません（搬入時の破損/すり替え）。"; exit 1
   fi
   CODEX_DEST="$INSTALL_DIR/tools/codex"
-  if ! codex_pin_extract_bin "$CODEX_TARBALL" "$CODEX_DEST/bin/codex" "$CODEX_PIN_VERSION"; then
-    fail "Codex CLI の展開・版確認に失敗しました: $CODEX_TARBALL"; exit 1
+  # 検査（脱出パス・リンクの拒否・付属物の存在・版）→ tools/codex 全体を rename で入れ替える
+  # （旧キットの npm 導入ツリー・本体だけの旧い配置の残りも丸ごと置き換わる）。
+  if ! codex_pin_extract_package "$CODEX_TARBALL" "$CODEX_DEST" "$CODEX_PIN_VERSION" "$CODEX_KEY"; then
+    fail "Codex CLI の展開・検査・版確認に失敗しました: $CODEX_TARBALL"; exit 1
   fi
-  # 旧キット（npm の導入ツリー）の残りを片付ける（固定版の差し替えが済んでから）。
-  rm -rf "$CODEX_DEST/node_modules"
-  ok "Codex CLI を展開しました: $CODEX_DEST/bin/codex（${CODEX_PIN_VERSION}）"
+  ok "Codex CLI を展開しました: $CODEX_DEST/bin/codex（${CODEX_PIN_VERSION}・bwrap・rg 等の付属物込み）"
   # env ファイル（SHERPA_ENV_FILE ＞ /etc/sherpa/sherpa.env）に OPENAI_API_KEY があれば、ここで認証まで済ませる
   # （通信なし・冪等・run-common の sherpa_codex_ensure_auth）。**この導入を実行しているユーザーの** ~/.codex に
   # 書くので、Sherpa を動かすユーザーで導入していることが前提（root 実行は冒頭で拒否済み）。
@@ -982,7 +982,7 @@ OCR_COLLECTED=0
 [ -f "$OUT/ocr/ocr-worker-paddleocr-3.7.0-cpu.tar" ] && OCR_COLLECTED=1
 CODEX_COLLECTED=0
 [ -n "$(ls "$OUT"/codex/codex-*.tar.gz 2>/dev/null)" ] && CODEX_COLLECTED=1
-_verify "Codex CLI（tools/codex/bin/codex --version）" "$CODEX_COLLECTED" "'$INSTALL_DIR/tools/codex/bin/codex' --version"
+_verify "Codex CLI（tools/codex/bin/codex --version・codex-path/rg）" "$CODEX_COLLECTED" "'$INSTALL_DIR/tools/codex/bin/codex' --version && [ -x '$INSTALL_DIR/tools/codex/codex-path/rg' ]"
 # モデルの照合はワーカー自身が起動時に行う（固定 hash と一致しなければ available=false）。
 # ここではイメージが読み込めていること・モデルが置かれていることだけを見る。
 _verify "OCR（ワーカーのイメージとモデル）" "$OCR_COLLECTED" \

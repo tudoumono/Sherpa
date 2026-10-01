@@ -86,38 +86,117 @@ codex_pin_fetch_asset() {
   return 0
 }
 
-# $1=tar.gz  $2=展開先の実行ファイルパス  $3=期待する版（例 0.153.4）
-# 配布物は「サブディレクトリ無し・1ファイルのみ」の tar.gz（実機確認済み・scripts/codex-version.env
-# 冒頭コメント参照）。それ以外の構成は想定外として拒否する。
-# 展開先と同じフォルダの一時領域で展開し、`--version` が期待する版を返したときだけ rename で差し替える
-# （同一ファイルシステム内の rename＝途中で失敗しても既存の $2 は壊れない）。
-codex_pin_extract_bin() {
-  local tarball="$1" dest="$2" want="$3" dir tmp entries n got
-  dir="$(dirname "$dest")"
-  mkdir -p "$dir" || return 1
-  tmp="$(mktemp -d "$dir/.codex-staging.XXXXXX")" || return 1
-  if ! tar -xzf "$tarball" -C "$tmp" 2>/dev/null; then
-    rm -rf "$tmp"
-    return 1
+# $1=platform key  $2=パッケージのルート（tools/codex 相当）-> 付属物がそろっていれば 0。
+# 必須: bin/codex・codex-path/rg（共通）、Linux は codex-resources/bwrap（サンドボックス）。
+# bwrap・rg が無いと OS 側に bubblewrap の無い機械でシェルのコマンドが全て失敗する。
+codex_pin_package_complete() {
+  local key="$1" root="$2"
+  [ -x "$root/bin/codex" ] || return 1
+  [ -x "$root/bin/codex-code-mode-host" ] || return 1
+  [ -x "$root/codex-path/rg" ] || return 1
+  [ -x "$root/codex-resources/zsh/bin/zsh" ] || return 1
+  case "$key" in
+    linux_*) [ -x "$root/codex-resources/bwrap" ] || return 1 ;;
+  esac
+  return 0
+}
+
+# $1=platform key  $2=パッケージのルート  $3=期待する版 -> 版が一致し付属物もそろっていれば 0。
+codex_pin_installed_ok() {
+  local key="$1" root="$2" want="$3" got
+  codex_pin_package_complete "$key" "$root" || return 1
+  got="$(codex_pin_installed_version "$root/bin/codex" || true)"
+  [ "$got" = "$want" ]
+}
+
+# $1=PATH 上の codex のパス -> 付属物の一式（codex_pin_package_complete と同じ基準）を持つ配置なら 0。
+# 単体の実行ファイルは、その一つ上（`bin/` の親）を一式のルートとして確かめる。npm 版（実体が .js の
+# ランチャー）は、同梱の `node_modules/@openai/codex-*/vendor/<triple>/` を一式のルートとして確かめる。
+codex_pin_path_codex_has_accessories() {
+  local exe="$1" real key root triple
+  key="$(codex_pin_platform_key)"
+  [ -n "$key" ] || return 1
+  real="$(readlink -f "$exe" 2>/dev/null || realpath "$exe" 2>/dev/null || printf '%s' "$exe")"
+  case "$real" in
+    *.js)
+      case "$key" in
+        linux_x86_64) triple="x86_64-unknown-linux-musl" ;;
+        linux_aarch64) triple="aarch64-unknown-linux-musl" ;;
+        darwin_arm64) triple="aarch64-apple-darwin" ;;
+        darwin_x86_64) triple="x86_64-apple-darwin" ;;
+        *) return 1 ;;
+      esac
+      for root in "$(dirname "$real")"/../node_modules/@openai/codex-*/vendor/"$triple"/; do
+        [ -d "$root" ] || continue
+        codex_pin_package_complete "$key" "${root%/}" && return 0
+      done
+      return 1
+      ;;
+  esac
+  codex_pin_package_complete "$key" "$(dirname "$real")/.."
+}
+
+# $1=tar.gz  -> アーカイブの中身が安全なら 0（脱出パス・絶対パス・リンク・デバイス等を含めば非0）。
+# 一覧の種別文字（tar -tv の先頭）は '-'（通常ファイル）と 'd'（ディレクトリ）だけを許す。
+codex_pin_inspect_archive() {
+  local tarball="$1" name type
+  tar -tzf "$tarball" >/dev/null 2>&1 || { echo "codex_pin_inspect_archive: 読めないアーカイブです: $tarball" >&2; return 1; }
+  while IFS= read -r name; do
+    case "$name" in
+      /*|..|../*|*/..|*/../*) echo "codex_pin_inspect_archive: 不正なパス（脱出・絶対パス）: ${name}" >&2; return 1 ;;
+    esac
+  done < <(tar -tzf "$tarball" 2>/dev/null)
+  while IFS= read -r type; do
+    case "$type" in
+      -|d) ;;
+      *) echo "codex_pin_inspect_archive: リンク・デバイス等の種別を含みます（${type}）: $tarball" >&2; return 1 ;;
+    esac
+  done < <(tar -tvzf "$tarball" 2>/dev/null | cut -c1)
+  return 0
+}
+
+# $1=tar.gz（codex-package-<triple>.tar.gz）  $2=導入先ディレクトリ（例 tools/codex）
+# $3=期待する版（例 0.153.4）  $4=platform key
+# 導入先と同じファイルシステムの作業領域（導入先の親の隠しフォルダ）へ展開 → 中身の検査（脱出パス・
+# 絶対パス・リンク・デバイスの拒否／bin/codex と付属物の存在）→ 展開した bin/codex の --version を確認 →
+# 導入先全体を rename で入れ替える。途中で失敗しても既存の導入先は壊れない（古い残りは混ざらない＝
+# 旧い本体だけの配置・npm の残りも丸ごと置き換わる）。
+codex_pin_extract_package() {
+  local tarball="$1" dest="$2" want="$3" key="$4" parent stage got old
+  parent="$(dirname "$dest")"
+  mkdir -p "$parent" || return 1
+  codex_pin_inspect_archive "$tarball" || return 1
+  stage="$(mktemp -d "$parent/.codex-staging.XXXXXX")" || return 1
+  if ! tar -xzf "$tarball" -C "$stage" 2>/dev/null; then
+    echo "codex_pin_extract_package: 展開に失敗しました: $tarball" >&2
+    rm -rf "$stage"; return 1
   fi
-  entries=("$tmp"/*)
-  n="${#entries[@]}"
-  if [ "$n" -ne 1 ] || [ ! -f "${entries[0]}" ] || [ -L "${entries[0]}" ]; then
-    echo "codex_pin_extract_bin: 想定外の tar 構成です（1ファイルのみを期待）: $tarball" >&2
-    rm -rf "$tmp"
-    return 1
+  # 展開後にも念のため、通常ファイルとディレクトリ以外（リンク・デバイス）が無いことを確かめる。
+  if [ -n "$(find "$stage" ! -type f ! -type d -print -quit)" ]; then
+    echo "codex_pin_extract_package: リンク・デバイス等を含みます: $tarball" >&2
+    rm -rf "$stage"; return 1
   fi
-  chmod +x "${entries[0]}"
-  got="$(codex_pin_installed_version "${entries[0]}" || true)"
+  chmod -R u+rwX "$stage"
+  if ! codex_pin_package_complete "$key" "$stage"; then
+    echo "codex_pin_extract_package: 必須の付属物がありません（bin/codex・bin/codex-code-mode-host・codex-path/rg・codex-resources/zsh・Linux は codex-resources/bwrap）: $tarball" >&2
+    rm -rf "$stage"; return 1
+  fi
+  got="$(codex_pin_installed_version "$stage/bin/codex" || true)"
   if [ "$got" != "$want" ]; then
-    echo "codex_pin_extract_bin: 展開した Codex CLI の版が一致しません（期待 ${want}・実際 ${got:-取得失敗}）: $tarball" >&2
-    rm -rf "$tmp"
-    return 1
+    echo "codex_pin_extract_package: 展開した Codex CLI の版が一致しません（期待 ${want}・実際 ${got:-取得失敗}）: $tarball" >&2
+    rm -rf "$stage"; return 1
   fi
-  if ! mv -f "${entries[0]}" "$dest"; then
-    rm -rf "$tmp"
-    return 1
+  old=""
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    old="$parent/.codex-old.$$.$RANDOM"
+    if ! mv "$dest" "$old"; then
+      rm -rf "$stage"; return 1
+    fi
   fi
-  rm -rf "$tmp"
+  if ! mv "$stage" "$dest"; then
+    [ -n "$old" ] && mv "$old" "$dest"
+    rm -rf "$stage"; return 1
+  fi
+  [ -n "$old" ] && rm -rf "$old"
   return 0
 }
