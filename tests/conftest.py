@@ -13,9 +13,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
+import re
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -48,16 +52,64 @@ def _swap_dbname(dsn: str, dbname: str) -> str:
     return _ci.make_conninfo(**d)
 
 
+# TEST-5（使い捨て per-run DB）: ひな型 DB 名・プロセス間の作り直し排他に使う advisory lock 鍵・
+# 使い捨て DB 名のパターン（`sherpa_test_run_<作成時刻base36>_<pid>_<乱数6桁hex>`・先頭の
+# base36 を stale 掃除の経過時間判定に使う）。鍵は固定文字列のハッシュ（`sherpa.store.db` の
+# 各種 advisory lock と同型・別名前空間にするため DDL の `_SCHEMA_LOCK_KEY` とは別の種を使う）。
+_TEMPLATE_DBNAME = "sherpa_test_template"
+_TEMPLATE_LOCK_KEY = int.from_bytes(
+    hashlib.sha1(b"sherpa_test_db_template_build").digest()[:8], "big", signed=True)
+_EPHEMERAL_RE = re.compile(r"^sherpa_test_run_([0-9a-z]+)_(\d+)_[0-9a-f]{6}$")
+# 2 時間より短くしない: 掃除は経過時間だけで判定するため、短くすると実行中の別の pytest の DB を消しうる。
+_STALE_DB_MAX_AGE_HOURS = max(2.0, float(os.environ.get("SHERPA_TEST_DB_STALE_HOURS", "6")))
+
+# pytest_sessionfinish で使い捨て DB を drop するための状態（`_setup_ephemeral_test_db` が
+# 使い捨て経路を取った時だけ埋まる）。
+_EPHEMERAL_DB_NAME: str | None = None
+_EPHEMERAL_ORIG_DSN: str | None = None
+
+
 def _setup_test_pg_dsn() -> None:
     """セッション最初期（他 fixture より先・conftest モジュール import 時）に
-    `SHERPA_PG_DSN` を専用 DB `sherpa_test` へ差し替える（テスト用 DB 分離）。
+    `SHERPA_PG_DSN` をテスト専用 DB へ差し替える（テスト用 DB 分離・TEST-5＝既定は流すたびの
+    使い捨て DB・docs/20-開発ハーネス.md §6）。
 
-    - `SHERPA_TEST_PG_DSN` が明示されていればそれをテスト DSN としてそのまま使う。
-      無ければ元 DSN（`store._dsn()` と同じ解決順＝SHERPA_PG_DSN→DATABASE_URL→PG*）
-      から dbname だけ `sherpa_test` に差し替えて構成する。
+    経路は3つ（優先順）:
+      1. `SHERPA_TEST_PG_DSN` が明示されていれば、それをそのままテスト DSN として使う
+         （`scripts/gate-lane.sh` 等が既に `sherpa_test_<lane>` を用意して起動した場合＝
+         二重に作らない。`_setup_fixed_test_db` へ委譲）。
+      2. `SHERPA_TEST_DB_SHARED=1` なら、従来どおり共有 DB `sherpa_test` を使う（逃げ道・
+         `_setup_fixed_test_db` へ委譲）。
+      3. 既定（上記どちらでもない）: ひな型 DB `sherpa_test_template`（スキーマ適用済み・
+         空データ）から `CREATE DATABASE ... TEMPLATE` で複製した使い捨て DB
+         （`sherpa_test_run_<...>`）を使う（`_setup_ephemeral_test_db`）。セッション終了時
+         （`pytest_sessionfinish`）に drop する。異常終了で残った古い使い捨て DB は次回起動時に
+         掃除する（`_sweep_stale_ephemeral_dbs`）。
+
+    どの経路でも、接続不可（Postgres 到達不能）なら**何もしない**（`SHERPA_PG_DSN` は書き換え
+    ない＝既存の per-test `pytest.skip` に委ねる。停止時の graceful SKIP を壊さない）。
+    """
+    from sherpa import store   # store は最下層（他 sherpa.* 非 import）・import 時副作用なし
+
+    orig_dsn = store._dsn()
+
+    explicit_dsn = os.environ.get("SHERPA_TEST_PG_DSN")
+    if explicit_dsn:
+        _setup_fixed_test_db(orig_dsn, explicit_dsn)
+        return
+    if os.environ.get("SHERPA_TEST_DB_SHARED") == "1":
+        _setup_fixed_test_db(orig_dsn, _swap_dbname(orig_dsn, "sherpa_test"))
+        return
+    _setup_ephemeral_test_db(orig_dsn)
+
+
+def _setup_fixed_test_db(orig_dsn: str, test_dsn: str) -> None:
+    """固定名のテスト DB（レーン DB／共有 `sherpa_test`）を使う経路（旧 `_setup_test_pg_dsn` の
+    本体・挙動は無変更）。
+
     - **安全ガード**: テスト DSN の dbname が元 DSN と同一なら `pytest.exit`
       （fail-closed。誤設定で再び dev DB に書く事故を構造的に防ぐ）。
-    - 元 DSN の Postgres に接続して `CREATE DATABASE sherpa_test`（重複は握る＝冪等）。
+    - 元 DSN の Postgres に接続して `CREATE DATABASE`（重複は握る＝冪等）。
       **接続不可（到達できない）となら何もしない**（`SHERPA_PG_DSN` は書き換えない＝既存の
       per-test `pytest.skip` に委ねる。Postgres 停止時の graceful SKIP を壊さない）。
       **接続はできたが CREATE DATABASE 自体が失敗**（権限不足等・`DuplicateDatabase` 以外）
@@ -66,19 +118,13 @@ def _setup_test_pg_dsn() -> None:
       fail-open だった）。
     - `SHERPA_TEST_DB_ISOLATED=1` も同時に立てる。`sherpa.reconcile.reconcile_derivatives()`
       がこれを見て**全面 skip** する（2026-07-03 インシデント再発防止）: Postgres の world
-      レジストリは `sherpa_test`（隔離済・別内容）を指すが Neo4j/ES/`data/derived` は実環境と
+      レジストリはテスト DB（隔離済・別内容）を指すが Neo4j/ES/`data/derived` は実環境と
       **共有**のままのため、レジストリ基準の「孤児」判定が実世界（例: 実登録 `test`）を
       丸ごと孤児削除しうる（実際に発生済＝実 world `test` の Neo4j 76 ノードが消えた事故）。
     - `SHERPA_ORIG_PG_DSN` に元 DSN（base/実 DB）も残す。`tests/_world_registry.py` が
       base の worlds レジストリへ照会するための経路（2026-07-03 RV 対応 HIGH#2 の汎用ガード）。
     """
     import psycopg
-
-    from sherpa import store   # store は最下層（他 sherpa.* 非 import）・import 時副作用なし
-
-    orig_dsn = store._dsn()
-    test_dsn = os.environ.get("SHERPA_TEST_PG_DSN") or _swap_dbname(orig_dsn, "sherpa_test")
-
     from psycopg import conninfo as _ci
 
     orig_dbname = _ci.conninfo_to_dict(orig_dsn).get("dbname")
@@ -116,6 +162,180 @@ def _setup_test_pg_dsn() -> None:
     os.environ["SHERPA_PG_DSN"] = test_dsn
     os.environ["SHERPA_TEST_DB_ISOLATED"] = "1"   # reconcile_derivatives() の全面 skip 用（上記 docstring 参照）
     os.environ["SHERPA_ORIG_PG_DSN"] = orig_dsn   # _world_registry.py の実レジストリ照会用
+
+
+def _ephemeral_db_name() -> str:
+    """使い捨て DB 名を生成する（`sherpa_test_run_<作成時刻base36>_<pid>_<乱数6桁hex>`）。
+    先頭の base36 は stale 掃除（`_sweep_stale_ephemeral_dbs`）が経過時間の判定に使う。
+    """
+    import random
+
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    n = int(time.time())
+    ts36 = "0" if n == 0 else ""
+    while n:
+        n, r = divmod(n, 36)
+        ts36 = digits[r] + ts36
+    rand = f"{random.SystemRandom().getrandbits(24):06x}"
+    return f"sherpa_test_run_{ts36}_{os.getpid()}_{rand}"
+
+
+def _template_is_current(template_dsn: str, expected_hash: str) -> bool:
+    """ひな型 DB が存在し、かつ現在のコード側スキーマと一致するか（`schema_version` の最新行で判定）。"""
+    import psycopg
+
+    try:
+        with psycopg.connect(template_dsn, autocommit=True, connect_timeout=5) as c:
+            row = c.execute(
+                "SELECT schema_hash FROM schema_version ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    except Exception:
+        return False
+    return bool(row) and row[0] == expected_hash
+
+
+def _run_init_schema_subprocess(dsn: str) -> None:
+    """`sherpa.store.db.init_schema()` を別プロセスで実行し、ひな型 DB にスキーマを適用する。
+
+    現在のプロセス内で `SHERPA_PG_DSN` を一時的に差し替えて直接呼ぶ方式は避ける——
+    `init_schema()` はプロセス全体のグローバル状態（`store.db._inited`・バックグラウンド索引
+    構築スレッドが `_dsn()` を遅延評価で読む）を書き換えるため、本体プロセスの env を
+    その後すぐに使い捨て DB 側へ戻しても、その書き換えの影響がどちらの DB に対して効くかが
+    タイミング依存になる。別プロセスなら、プロセス終了と同時にその状態も消える。
+    """
+    code = "from sherpa.store import db as store_db\nstore_db.init_schema()\n"
+    env = dict(os.environ)
+    env["SHERPA_PG_DSN"] = dsn
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=str(ROOT), env=env,
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        pytest.exit(
+            "テスト用 DB 分離（使い捨て）: ひな型 DB へのスキーマ適用に失敗しました。\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+
+
+def _ensure_template_db(conn, orig_dsn: str) -> str:
+    """ひな型 DB（`sherpa_test_template`）が無い・スキーマが古ければ作り直し、常に最新の
+    ひな型 DSN を返す。`conn` は `orig_dsn` への既存 autocommit 接続（呼び出し元が管理・
+    ここでは閉じない）。**呼び出し元が advisory lock（`_TEMPLATE_LOCK_KEY`）を持った状態で呼ぶ**——
+    鮮度の確認・作り直し・複製を同じロックの中で終えないと、スキーマの違う別の作業場所が間に作り直した
+    ひな型を複製してしまう。
+    """
+    from sherpa.store import db as store_db
+
+    template_dsn = _swap_dbname(orig_dsn, _TEMPLATE_DBNAME)
+    if _template_is_current(template_dsn, store_db._SCHEMA_HASH):
+        return template_dsn
+    conn.execute(f'DROP DATABASE IF EXISTS "{_TEMPLATE_DBNAME}" WITH (FORCE)')
+    conn.execute(f'CREATE DATABASE "{_TEMPLATE_DBNAME}"')
+    _run_init_schema_subprocess(template_dsn)
+    return template_dsn
+
+
+def _sweep_stale_ephemeral_dbs(conn) -> None:
+    """前回までの異常終了で残った使い捨て DB（`_STALE_DB_MAX_AGE_HOURS` 時間より古いもの）を
+    掃除する（best-effort・失敗は無視＝他プロセスが同時に使用/掃除中の可能性がある）。
+    """
+    cutoff = time.time() - _STALE_DB_MAX_AGE_HOURS * 3600
+    try:
+        rows = conn.execute(
+            "SELECT datname FROM pg_database WHERE datname LIKE 'sherpa_test_run_%'"
+        ).fetchall()
+    except Exception:
+        return
+    for (name,) in rows:
+        m = _EPHEMERAL_RE.match(name)
+        if not m:
+            continue
+        try:
+            created = int(m.group(1), 36)
+        except ValueError:
+            continue
+        if created < cutoff:
+            try:
+                conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+            except Exception:
+                pass   # 他プロセスが使用中／同時に掃除中＝握り潰して続行
+
+
+def _setup_ephemeral_test_db(orig_dsn: str) -> None:
+    """既定経路（TEST-5）: ひな型 DB から複製した使い捨て DB を使う。
+
+    Postgres 不達なら何もしない（`_setup_fixed_test_db` と同じ fail-open 方針）。ひな型/使い捨て
+    DB の作成自体が失敗した場合（権限不足等）は `pytest.exit`（fail-closed・base DB へ書き続ける
+    事故を防ぐ・`_setup_fixed_test_db` と同じ方針）。
+    """
+    global _EPHEMERAL_DB_NAME, _EPHEMERAL_ORIG_DSN
+    import psycopg
+
+    try:
+        conn = psycopg.connect(orig_dsn, autocommit=True, connect_timeout=5)
+    except Exception:
+        return   # Postgres 不到達＝何もしない（既存の per-test SKIP に委ねる）
+
+    try:
+        _sweep_stale_ephemeral_dbs(conn)
+        eph_name = _ephemeral_db_name()
+        last_err: Exception | None = None
+        conn.execute("SELECT pg_advisory_lock(%s)", (_TEMPLATE_LOCK_KEY,))
+        try:
+            _ensure_template_db(conn, orig_dsn)
+            for attempt in range(5):
+                try:
+                    conn.execute(f'CREATE DATABASE "{eph_name}" TEMPLATE "{_TEMPLATE_DBNAME}"')
+                    last_err = None
+                    break
+                except psycopg.errors.ObjectInUse as e:
+                    # 直前の鮮度確認で開いた接続がサーバ側でまだ閉じ切っていない間だけ起きる
+                    # （「ひな型に他の接続がある」）。それ以外の失敗はやり直さずに止める。
+                    last_err = e
+                    time.sleep(0.2 * (attempt + 1))
+                except Exception as e:
+                    last_err = e
+                    break
+        finally:
+            try:
+                conn.execute("SELECT pg_advisory_unlock(%s)", (_TEMPLATE_LOCK_KEY,))
+            except Exception:
+                pass
+        if last_err is not None:
+            pytest.exit(
+                f"テスト用 DB 分離（使い捨て）: {eph_name!r} の作成に失敗しました"
+                f"（{last_err.__class__.__name__}: {last_err}）。Postgres の権限・"
+                "ひな型 DB の状態を確認してください。"
+            )
+    finally:
+        conn.close()
+
+    test_dsn = _swap_dbname(orig_dsn, eph_name)
+    os.environ["SHERPA_PG_DSN"] = test_dsn
+    os.environ["SHERPA_TEST_DB_ISOLATED"] = "1"
+    os.environ["SHERPA_ORIG_PG_DSN"] = orig_dsn
+    _EPHEMERAL_DB_NAME = eph_name
+    _EPHEMERAL_ORIG_DSN = orig_dsn
+
+
+def pytest_sessionfinish(session, exitstatus):   # noqa: ARG001 (pytest hook シグネチャ固定)
+    """使い捨て DB（`_setup_ephemeral_test_db` が作った場合のみ）をセッション終了時に drop する
+    （best-effort。異常終了で drop できなかった分は次回起動時の `_sweep_stale_ephemeral_dbs` が
+    拾う）。"""
+    if not _EPHEMERAL_DB_NAME:
+        return
+    try:
+        from sherpa.store import db as store_db
+        store_db.close_pg_pool(timeout=5.0)   # DROP 前にプールの接続を閉じる（WITH (FORCE) が最終防御）
+    except Exception:
+        pass
+    import psycopg
+
+    try:
+        with psycopg.connect(_EPHEMERAL_ORIG_DSN, autocommit=True, connect_timeout=5) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{_EPHEMERAL_DB_NAME}" WITH (FORCE)')
+    except Exception:
+        pass   # best-effort（次回起動時の stale sweep が拾う）
 
 
 _setup_test_pg_dsn()

@@ -878,8 +878,15 @@ _SCHEMA = [
         truncated BOOLEAN NOT NULL DEFAULT false,
         manifest JSONB,
         items JSONB NOT NULL DEFAULT '{}',
-        coverage JSONB NOT NULL DEFAULT '{}'
+        coverage JSONB NOT NULL DEFAULT '{}',
+        reviews JSONB NOT NULL DEFAULT '[]'
     )""",
+    # COD-18 ⑤（2026-10-01「調査の途中で台帳を確かめ、目的や観点を見直す」利用者指示）: 既存の
+    # investigation_records（CREATE TABLE IF NOT EXISTS では新規作成しか通らない）に対する後付け
+    # 列——中間の見直し（`investigation_ledger.load_reviews` の正規形の配列）を本文・資料名を
+    # 運ばない契約のまま別列に積む（`manifest`/`items`/`coverage` と同じ「正規形をそのまま写す」
+    # 分担）。
+    "ALTER TABLE investigation_records ADD COLUMN IF NOT EXISTS reviews JSONB NOT NULL DEFAULT '[]'",
     "CREATE INDEX IF NOT EXISTS investigation_records_conversation "
     "ON investigation_records(conversation_id)",
 ]

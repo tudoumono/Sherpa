@@ -24,9 +24,16 @@ def _item(item_id, *, status="source_confirmed", subject="対象", reason="",
            "status": status, "reason": reason, "owner": "main"}
 
 
+def _review(verdict="mostly_answered", added_items=None, extra_perspectives=None):
+    """COD-18 ⑤: `investigation_ledger.validate_review_entry()` を満たす最小の見直し。"""
+    return {"purpose": "目的の言い直し", "perspectives": ["画面"], "summary": "分かったこと",
+            "added_items": added_items or [], "removed_items": [], "verdict": verdict,
+            "extra_perspectives": extra_perspectives or [], "ts": 1.0, "terminal_count": 1}
+
+
 def test_trim_to_budget_truncates_items_from_the_back_and_sets_truncated():
     """合算サイズが上限を超えたら id 降順（後ろ）から削り、`truncated=True` になる。超えなければ
-    何も削らない。"""
+    何も削らない。`reviews`（COD-18 ⑤）は省略可引数——既存の4引数呼び出しも動く。"""
     # 2桁ゼロ埋め id（i00..i49）＝文字列の昇順と数値の昇順が一致する（`sorted(..., reverse=True)` の
     # 削除順が直感どおりになるようにテスト側で揃える）。
     ids = [f"i{i:02d}" for i in range(50)]
@@ -35,20 +42,28 @@ def test_trim_to_budget_truncates_items_from_the_back_and_sets_truncated():
     items = {i: _item(i, subject=big_subject) for i in ids}
     coverage = {i: ["hit"] for i in ids}
 
-    _m, trimmed_items, trimmed_coverage, truncated = store_investigation.trim_to_budget(
+    _m, trimmed_items, trimmed_coverage, trimmed_reviews, truncated = store_investigation.trim_to_budget(
         manifest, items, coverage)
     assert truncated is True
     assert len(trimmed_items) < 50
+    assert trimmed_reviews == []
     # 後ろ（id 降順）から削る＝先頭側（i00 等）は残り、末尾側（i49 等）から落ちる。
     assert "i00" in trimmed_items
     assert "i49" not in trimmed_items
 
-    # 小さい入力は変更なし。
+    # 小さい入力は変更なし（reviews 省略時の既定は空配列）。
     small_items = {"i0": _item("i0")}
-    _m2, out_items, out_coverage, out_truncated = store_investigation.trim_to_budget(
+    _m2, out_items, out_coverage, out_reviews, out_truncated = store_investigation.trim_to_budget(
         manifest, small_items, {"i0": ["hit"]})
     assert out_truncated is False
     assert out_items == small_items
+    assert out_reviews == []
+
+    # reviews を渡しても超えなければそのまま保持される。
+    _m3, _i3, _c3, out_reviews3, out_truncated3 = store_investigation.trim_to_budget(
+        manifest, small_items, {"i0": ["hit"]}, [_review()])
+    assert out_truncated3 is False
+    assert out_reviews3 == [_review()]
 
 
 def test_render_markdown_table_and_unconfirmed_section():
@@ -77,6 +92,32 @@ def test_render_markdown_table_and_unconfirmed_section():
     assert "対象1" not in md.split("## 確認できなかった項目")[1].split("## 検索の結果")[0]   # 確認済みの i1 は節に出ない
 
 
+def test_render_markdown_includes_mid_review_section():
+    """COD-18 ⑤: Markdown に「途中の見直し」節が出て、目的・観点・分かったこと・足した/外した
+    項目と理由・判断・追加で調べられる観点を含む（見直しが無ければ「(なし)」）。"""
+    record = {
+        "complete": True, "truncated": False,
+        "manifest": {"question_kind": "qa", "created_at": "2026-10-01T00:00:00Z", "items": ["i1"]},
+        "items": {"i1": _item("i1")},
+        "coverage": {"i1": ["hit"]},
+        "reviews": [_review(verdict="mostly_answered", added_items=[{"id": "i2", "reason": "発見"}],
+                            extra_perspectives=["帳票"])],
+    }
+    md = investigation_record_render.render_markdown(record)
+    assert "## 途中の見直し" in md
+    section = md.split("## 途中の見直し")[1].split("## 確認できなかった項目")[0]
+    assert "目的の言い直し" in section
+    assert "画面" in section
+    assert "分かったこと" in section
+    assert "i2: 発見" in section
+    assert "おおむね出た（mostly_answered）" in section
+    assert "帳票" in section
+
+    no_review_record = {**record, "reviews": []}
+    md_no_review = investigation_record_render.render_markdown(no_review_record)
+    assert "## 途中の見直し\n\n(なし)" in md_no_review
+
+
 def _try_init():
     try:
         store.init_schema()
@@ -85,8 +126,8 @@ def _try_init():
 
 
 def test_save_and_get_investigation_record_round_trip_and_cascades_on_conversation_delete():
-    """保存→取得の往復（COD-18 §1）と、会話の物理削除（`messages` FK CASCADE）で記録も消えること
-    （正典§7「削除の伝播」と同じ `ON DELETE CASCADE` の実動作確認）。"""
+    """保存→取得の往復（COD-18 §1・⑤の `reviews` 列も含む）と、会話の物理削除（`messages` FK
+    CASCADE）で記録も消えること（正典§7「削除の伝播」と同じ `ON DELETE CASCADE` の実動作確認）。"""
     _try_init()
     conv = store.create_conversation(user_id="admin", world="v1", title="investigation record test")
     msg = store.add_message(conv["id"], "assistant", "headline", answer={"headline": "headline"})
@@ -94,15 +135,33 @@ def test_save_and_get_investigation_record_round_trip_and_cascades_on_conversati
     manifest = {"question_kind": "qa", "created_at": "2026-10-01T00:00:00Z", "items": ["i1"]}
     items = {"i1": _item("i1")}
     coverage = {"i1": ["hit"]}
+    reviews = [_review()]
     saved = store_investigation.save_investigation_record(
-        msg["id"], conv["id"], complete=True, manifest=manifest, items=items, coverage=coverage)
+        msg["id"], conv["id"], complete=True, manifest=manifest, items=items, coverage=coverage,
+        reviews=reviews)
     assert saved["complete"] is True and saved["truncated"] is False
     assert saved["manifest"] == manifest
     assert saved["items"] == items
+    assert saved["reviews"] == reviews
 
     fetched = store_investigation.get_investigation_record(msg["id"])
     assert fetched["conversation_id"] == conv["id"]
     assert fetched["items"]["i1"]["status"] == "source_confirmed"
+    assert fetched["reviews"] == reviews
 
     assert store.delete_conversation(conv["id"], "admin") is True
     assert store_investigation.get_investigation_record(msg["id"]) is None
+
+
+def test_save_investigation_record_defaults_reviews_to_empty_list_when_omitted():
+    """`reviews` 省略時（台帳ゲートが走らない構成・見直し自体が無いターン）は空配列で保存される
+    ——既存呼び出し（`reviews` を渡さない構成）が壊れないことの確認。"""
+    _try_init()
+    conv = store.create_conversation(user_id="admin", world="v1", title="investigation record test 2")
+    msg = store.add_message(conv["id"], "assistant", "headline", answer={"headline": "headline"})
+    saved = store_investigation.save_investigation_record(
+        msg["id"], conv["id"], complete=True,
+        manifest={"question_kind": "qa", "created_at": "2026-10-01T00:00:00Z", "items": ["i1"]},
+        items={"i1": _item("i1")}, coverage={"i1": ["hit"]})
+    assert saved["reviews"] == []
+    assert store.delete_conversation(conv["id"], "admin") is True

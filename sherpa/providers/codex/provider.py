@@ -978,27 +978,48 @@ def _ledger_tool_detail_item(a: dict) -> str:
     return f"状態: {status}" if isinstance(status, str) and status in known else ""
 
 
+def _ledger_tool_detail_review(a: dict) -> str:
+    """COD-18 ⑤: `verdict`（閉じた語彙）だけを出す。purpose/summary/perspectives 等の
+    モデル生成文字列（本文）は出さない——`_ledger_tool_detail_item` と同じ契約。"""
+    verdict = a.get("verdict")
+    return f"判断: {verdict}" if isinstance(verdict, str) and verdict in investigation_ledger.REVIEW_VERDICTS else ""
+
+
 # 「思考の流れ」の台帳ツール行の補足。id・subject・reason 等のモデル生成文字列は出さない
 # （件数と状態語彙＝閉集合だけ）。
 _LEDGER_TOOL_DETAILS = {
     "ledger_manifest_set": _ledger_tool_detail_manifest,
     "ledger_item_put": _ledger_tool_detail_item,
     "ledger_status": lambda a: "",
+    "ledger_review_put": _ledger_tool_detail_review,
 }
 
 
 def _ledger_continue_prompt(verdict: investigation_ledger.Verdict) -> str:
-    """未完了の台帳へ、idと未充足の根拠種別だけを返す。本文・pathは含めない。"""
+    """未完了の台帳へ、idと未充足の根拠種別だけを返す。本文・pathは含めない。
+
+    COD-18 ⑤: `verdict.review_missing`/`verdict.review_pending_ids`（`require_review=True` で
+    呼ばれた `ledger_complete()` だけが立てる・`require_review=False` の呼び出し元では常に
+    偽/空のため、この段落は一切足されない＝現行と完全に同じ文面のまま）が立っていれば、中間の
+    見直しが必要な旨を追記する。id は item id のみ（本文・path は含めない・他の行と同じ流儀）。
+    """
     def _join(ids: tuple) -> str:
         return "、".join(ids) if ids else "なし"
     unsatisfied = "、".join(f"{item_id}（{'・'.join(kinds)} が未確認）"
                          for item_id, kinds in sorted(verdict.unsatisfied.items())) or "なし"
+    _review_note = ""
+    if verdict.review_missing:
+        _review_note = "回答を確定する前に ledger_review_put で中間の見直しを1件書いてください。"
+    elif verdict.review_pending_ids:
+        _review_note = (f"見直しで足したと申告した項目が未終端です: "
+                        f"{_join(verdict.review_pending_ids)}。終端にしてください。")
     return (
         "調査台帳に未完了の項目があります。"
         f"未完了: {_join(verdict.non_terminal_ids)}。"
         f"無効: {_join(verdict.invalid_ids)}。"
         f"欠落: {_join(verdict.missing_ids)}。"
         f"未充足: {unsatisfied}。"
+        f"{_review_note}"
         "これらを終端状態にしてから最終回答を返してください。台帳に無い新しい主張は書かないこと。"
     )
 
@@ -1023,6 +1044,33 @@ _LEDGER_REVIEW_PROMPT = (
 # 見直しを頼む回数の上限（提案書§3.5「見直しは2回まで」）。台帳継続の上限
 # （`_LEDGER_CONTINUE_CAP`）とは別枠——目録を増やさずに台帳を未完了へ戻した見直しも1回に数える。
 _LEDGER_REVIEW_CAP = 2
+
+
+# COD-18 ⑤「追加で調べますか？」（提案書・利用者2026-10-01指示§4）: 台帳にまだ解決していない
+# 「追加の観点」の義務（`investigation_ledger.pending_continuation_review()`）が残っていたら、
+# 回答の末尾にこの定型文を付ける（AI の自由記述文をそのまま流さない既存の流儀・
+# `_UNCONFIRMED_ITEMS_HEADER` と同じ）。`extra_perspectives` の正規化（改行・制御文字除去・
+# Markdown エスケープ・長さの切り詰め）は `investigation_ledger.sanitize_review_text_list` を
+# 「続き」の注入文・調査の記録の Markdown 表示と共通で使う（RV是正・1箇所を直せば全箇所に効く）。
+# RV是正3巡目: 義務の判定（どの見直しが未解決か）は `pending_continuation_review()` に一本化——
+# 「最後の見直し」だけを見ていた旧実装は、間に `insufficient`／`added_items` 空の見直しを挟むと
+# 義務を見失う穴があった。
+_REVIEW_CONTINUATION_HEADER = "追加で調べられる観点"
+_REVIEW_CONTINUATION_FOOTER = "続けて調べる場合は『続き』と送ってください。"
+
+
+def _review_continuation_note(reviews: tuple[dict, ...]) -> str:
+    """`reviews`（`load_reviews()` の戻り値・記録順）の中に、まだ解決していない「追加の観点」の
+    義務（`investigation_ledger.pending_continuation_review()`）があれば、回答末尾に付ける定型文を
+    返す（無ければ空文字・純関数）。"""
+    pending = investigation_ledger.pending_continuation_review(reviews)
+    if pending is None:
+        return ""
+    extras_text = investigation_ledger.sanitize_review_text_list(pending.get("extra_perspectives"))
+    if not extras_text:
+        return ""
+    return (f"{_REVIEW_CONTINUATION_HEADER}: " + extras_text + "。"
+           + _REVIEW_CONTINUATION_FOOTER)
 
 
 def _ledger_review_is_worse(pre: dict | None, post: dict | None) -> bool:
@@ -1208,16 +1256,21 @@ def _investigation_tree_has_symlink(root: Path) -> bool:
 
 
 def _copy_investigation_contract_files(src: Path, dst: Path) -> None:
-    """`src` の台帳の正規ファイル（`manifest.json`・`items/*.json`・`coverage.jsonl`）だけを
-    `dst` へコピーする（RV 高-1・2026-09-22 6巡目是正）。それ以外のファイル・ディレクトリは
-    無視する——退避・復元の対象を正典§3の正規形＋COD-16 の coverage 記録に限定し、無関係な
-    ファイルが紛れ込む経路を塞ぐ。
+    """`src` の台帳の正規ファイル（`manifest.json`・`items/*.json`・`coverage.jsonl`・
+    `reviews.jsonl`）だけを `dst` へコピーする（RV 高-1・2026-09-22 6巡目是正）。それ以外の
+    ファイル・ディレクトリは無視する——退避・復元の対象を正典§3の正規形＋COD-16 の coverage
+    記録＋COD-18 ⑤の中間の見直しに限定し、無関係なファイルが紛れ込む経路を塞ぐ。
 
     `coverage.jsonl`（COD-16・項目ごとの未確認）も台帳と同じ置き場のため一緒に持ち越す——
     これを持ち越さないと、「続き」で復元したターンは前ターンの検索記録が消え、前ターンで
     確定した `not_found_in_scope` の item が「この一連の呼出しで item 付きの検索が無い」を
     理由に `unverified`/`not_searched` へ誤って降格されうる（`apply_unverified_downgrades` 側の
     `exclude_ids` は別の多層防御・provider.py の呼び出し元参照）。
+
+    `reviews.jsonl`（COD-18 ⑤・中間の見直し）も同じ理由で持ち越す——持ち越さないと、「続き」で
+    復元したターンは前ターンに書いた見直し（`mostly_answered`＋`extra_perspectives` を含む）が
+    消え、台帳が全 item 終端でも `review_missing` のまま完了できない（見直しを無意味に書き
+    直させることになる）。
 
     RV 高-1（2026-09-22 8巡目是正）: 呼び出し側の `_investigation_tree_has_symlink`（木の走査）が
     列挙不可なディレクトリで symlink を見落とす可能性が別途あるため（`_investigation_tree_has_
@@ -1247,6 +1300,11 @@ def _copy_investigation_contract_files(src: Path, dst: Path) -> None:
         if coverage_src.is_symlink():
             raise OSError(f"refusing to copy symlink: {coverage_src.name}")
         shutil.copy2(coverage_src, dst / "coverage.jsonl")
+    reviews_src = src / "reviews.jsonl"
+    if reviews_src.is_file():
+        if reviews_src.is_symlink():
+            raise OSError(f"refusing to copy symlink: {reviews_src.name}")
+        shutil.copy2(reviews_src, dst / "reviews.jsonl")
 
 
 def _restore_investigation_ledger(retired_dir: Path, investigation_dir: Path, tmp_root: Path) -> bool:
@@ -1284,13 +1342,29 @@ def _restore_investigation_ledger(retired_dir: Path, investigation_dir: Path, tm
 
 
 def _retire_investigation_ledger(investigation_dir: Path, ledger_home: Path,
-                                 *, required_extra: tuple[str, ...] = ()) -> bool:
+                                 *, required_extra: tuple[str, ...] = (),
+                                 require_review: bool = False) -> bool:
     """未完了（または manifest 破損等で判定不能）の調査台帳を `ledger_home/investigation` へ
-    退避する（正典§3「置き場所」/§4「寿命」）。complete なら退避先を削除する。
+    退避する（正典§3「置き場所」/§4「寿命」）。complete なら退避先を削除する（ただし、台帳に
+    まだ解決していない「追加の観点」の義務が残っていれば complete でも退避する・下記）。
 
     `required_extra`: 呼び出し元（`_run_authoring`）のターン内で台帳ゲートへ渡したものと**同じ値**
     を渡すこと——ここだけ渡さないと、ゲート側は未完了（追加種別が未充足）と判定した台帳を、ここは
     complete と誤判定して削除してしまう（次ターンの「続き」で復元できなくなる）。
+
+    `require_review`（COD-18 ⑤・既定 `False`）: `True` なら `investigation_dir/reviews.jsonl`
+    （`load_reviews`）を読み、台帳ゲートと同じ `ledger_complete(..., reviews=...,
+    require_review=True)` で complete を判定する——呼び出し元の台帳ゲートが `_ledger_require_review`
+    を渡しているターンでは、ここも同じ値を渡すこと（渡さないと、中間の見直しが未了のまま
+    complete と誤判定して退避先を消してしまう）。
+
+    COD-18 ③「追加で調べますか？」（RV是正3巡目）: 退避の要否は `force_retain` 引数ではなく、
+    `investigation_ledger.pending_continuation_review(reviews)` を直接呼んで内部で決める——
+    「続き」ターンかどうかの文脈（呼び出し元が `_ledger_require_continuation_resolved` を渡す
+    かどうか）とは独立に、見直しの列に未解決の義務が残っていれば（ターン0＝義務を初めて作った
+    ターンであっても）`complete` でも退避する。回答末尾の定型文・「続き」の継続プロンプトへの
+    注入・`ledger_complete()` の完了判定と同じ単一の純関数を使う契約（`require_review=False`
+    のターンは `reviews` を読まないため義務も無い扱い）。
 
     RV 中-3（2026-09-22 3巡目是正）: 通常終了時はこの関数の**戻り値**（実際に退避を実行できたか）
     を `env["investigation"]["retained"]` にそのまま使う——退避前に式で予測した値を使わない
@@ -1312,9 +1386,12 @@ def _retire_investigation_ledger(investigation_dir: Path, ledger_home: Path,
     """
     retire_dir = ledger_home / "investigation"
     try:
+        reviews = investigation_ledger.load_reviews(investigation_dir) if require_review else ()
         verdict = investigation_ledger.ledger_complete(
-            investigation_ledger.load_ledger(investigation_dir), required_extra=required_extra)
-        if verdict.complete:
+            investigation_ledger.load_ledger(investigation_dir), required_extra=required_extra,
+            reviews=reviews, require_review=require_review)
+        force_retain = investigation_ledger.pending_continuation_review(reviews) is not None
+        if verdict.complete and not force_retain:
             if retire_dir.exists():
                 _remove_dir_best_effort(retire_dir)
             return False
@@ -2216,12 +2293,23 @@ class CodexProvider(Provider):
         # `sp`/`decision["lens"]` が確定した直後に実値へ上書きする——それより前に例外・早期
         # return（busy・MCP 無効等）が起きても finally が空タプルを安全に参照できるよう先に確定する。
         _ledger_required_extra: tuple[str, ...] = ()
+        # COD-18 ⑤: 中間の見直しを完了判定へ必須にするか（`_schema_v2 and mcp` が確定した直後に
+        # 上書きする・`_ledger_required_extra` と同じ理由で早期 return 経路向けに先に確定する）。
+        _ledger_require_review = False
+        # RV是正3巡目（「続き」）: 台帳に残っている「追加の観点」の義務の解決を要求するか
+        # （既定False＝現行と同じ・義務の有無は `investigation_ledger.pending_continuation_review()`
+        # が見直しの列だけから決める・下記）。
+        _ledger_require_continuation_resolved = False
         _investigation_restored = False
         _investigation_verdict = None              # investigation_ledger.Verdict（ゲート確定後に埋める）
         # COD-16（`docs/proposals/2026-09-29-調査の網羅と未確認の明示.md` §2）: `_investigation_verdict`
         # と対になる降格適用済みの LedgerSnapshot（§3「確認できなかった項目」節が読む・
         # ゲート確定後に埋める）。
         _investigation_snapshot = None
+        # COD-18 ⑤: このターン確定時点の中間の見直し（`load_reviews` の戻り値・ゲート確定後に
+        # 埋める）と、末尾へ付ける「追加で調べますか？」の定型文（無ければ空文字）。
+        _investigation_reviews: tuple[dict, ...] = ()
+        _review_continuation_note_text = ""
         # COD-18（提案書「調査台帳を回答ごとに残す」§1）: `_result` の env とは別項目として
         # chat_service へ渡す台帳の正規形（manifest/items/coverage）。`env["investigation"]` が
         # 組み立てられるのと同じ箇所で埋める——ゲートが1度も走らなかったターン（早期 return 済み
@@ -2497,19 +2585,6 @@ class CodexProvider(Provider):
                                        "reason": ("素の Codex で" if _plain else "MCP 無効の構成で")
                                                  + "直読の準備（秘匿ファイル列挙／範囲）に失敗"}}
                     return
-                # MCP でも FS でも同じプロンプト組み立て（personal_facts を注入）。
-                if mcp or _plain:
-                    _codex_msg = ctx.message
-                    if ctx.personal_facts:
-                        _codex_msg = (f"{ctx.message}\n\n"
-                                      f"【個人ファイル内ヒット（本人のみ・共有不可）】\n{ctx.personal_facts}")
-                    if _plain:
-                        prompt = self._prompt_plain(_codex_msg, decision["lens"], ctx.world, mcp=mcp)
-                    else:
-                        prompt = self._prompt_mcp(_codex_msg, decision["lens"], ctx.world,
-                                                  direct_read=_direct_read_ok, layer=_layer)
-                else:
-                    prompt = self._prompt(ctx.message, decision["lens"], env, ctx.world)
                 # §3: --ephemeral（セッションをディスクに残さない）と -o（最終メッセージのファイル
                 # 出力＝JSON 抽出が空だった時の保険）は sandbox/fallback どちらでも共通。.tmp/ は既存の
                 # run_dir 新規ファイル走査（台帳登録スキャン）から除外済みのディレクトリ（既存の挙動を流用）。
@@ -2569,6 +2644,52 @@ class CodexProvider(Provider):
                     item_id for item_id, item in
                     investigation_ledger.load_ledger(_investigation_dir).items.items()
                     if item.get("status") == "not_found_in_scope")
+                # COD-18 ⑤「続き」での追加の観点（提案書・利用者2026-10-01指示§4・RV是正3巡目）:
+                # 復元**後**の実際の `_investigation_dir` から見直しを読み、義務
+                # （`investigation_ledger.pending_continuation_review()`）が残っていれば、Codex へ
+                # 「これを新しい項目として調べてから答えて」と伝える——復元される台帳は既に完了
+                # （`complete=True`）扱いのため、この一文が無いと Codex は何も調べずすぐ `final` を
+                # 返してしまう。復元が行われなかった・失敗した（mcp 無効・symlink 検出・部分復元
+                # 失敗等）ターンは `_investigation_dir` が空のまま（`_restore_investigation_ledger`
+                # は失敗時に空の `items/` へ戻す）なので `pending_continuation_review` は `None` を
+                # 返し、この節は自然に「注入しない」側へ倒れる——復元に失敗した台帳の内容を
+                # 当てにした指示を出さない（RV是正2巡目で裁定・3巡目でも維持）。
+                _investigation_reviews_for_prompt = investigation_ledger.load_reviews(_investigation_dir)
+                _continuation_review_note = ""
+                if (not _plain
+                        and (ctx.message or "").strip().startswith(("続き", "つづき", "続けて"))):
+                    _pending_review = investigation_ledger.pending_continuation_review(
+                        _investigation_reviews_for_prompt)
+                    # RV是正3巡目: 義務が残っているかどうかは `pending_continuation_review()`
+                    # （見直しの列全体を見る単一の純関数）だけを根拠に決める——このターンで
+                    # `complete` を受理する前に義務の解決を要求するかどうか（下の
+                    # `ledger_complete()` 呼び出し全てへ渡す・退避判断も同じ関数を使う）。
+                    _ledger_require_continuation_resolved = _pending_review is not None
+                    if _pending_review is not None:
+                        # RV是正（正規化）: 末尾の定型文（`_review_continuation_note`）と同じ
+                        # `sanitize_review_text_list` を通す（3箇所で別々の正規化を持たない）。
+                        _extras_text = investigation_ledger.sanitize_review_text_list(
+                            _pending_review.get("extra_perspectives"))
+                        if _extras_text:
+                            _continuation_review_note = (
+                                f"前回の見直しで追加に調べられるとした観点: {_extras_text}。"
+                                "これを新しい調査項目として ledger_manifest_set に足してから調べて"
+                                "ください。")
+                # MCP でも FS でも同じプロンプト組み立て（personal_facts を注入）。
+                if mcp or _plain:
+                    _codex_msg = ctx.message
+                    if ctx.personal_facts:
+                        _codex_msg = (f"{ctx.message}\n\n"
+                                      f"【個人ファイル内ヒット（本人のみ・共有不可）】\n{ctx.personal_facts}")
+                    if _continuation_review_note:
+                        _codex_msg = f"{_codex_msg}\n\n【前回の続き】\n{_continuation_review_note}"
+                    if _plain:
+                        prompt = self._prompt_plain(_codex_msg, decision["lens"], ctx.world, mcp=mcp)
+                    else:
+                        prompt = self._prompt_mcp(_codex_msg, decision["lens"], ctx.world,
+                                                  direct_read=_direct_read_ok, layer=_layer)
+                else:
+                    prompt = self._prompt(ctx.message, decision["lens"], env, ctx.world)
                 _last_message_path = _tmp / f"last-message-{hashlib.sha1(os.urandom(8)).hexdigest()[:12]}.txt"
                 # MCP ツール結果の予算・grep ヒット上限・読み取り窓を親側で1回だけ解決し、子プロセスの
                 # env として渡す（`mcp_server.py::_env_budget_bytes` が最優先で読む・§3.4 の
@@ -2692,6 +2813,23 @@ class CodexProvider(Provider):
                 if _schema_on:
                     argv_base += ["--output-schema",
                                  str(_OUTPUT_SCHEMA_PATH_V2 if _schema_v2 else _OUTPUT_SCHEMA_PATH)]
+                # COD-18 ⑤（提案書・利用者2026-10-01指示）: 中間の見直し（`ledger_review_put`）を
+                # 完了判定へ必須にするのは Codex の標準モード（`_schema_v2 and mcp`）だけ——素の
+                # Codex・台帳を使わない構成・Codex(Ollama)（`_schema_v2` が常に偽）は対象外のまま
+                # 今の動きを維持する。このターンの台帳ゲート呼び出し全て（while ループ・退避・最終
+                # 判定）へ同じ値を渡す（`_ledger_required_extra` と同じ「ターンの最初に1回だけ決め、
+                # ぶれさせない」流儀）。`ledger_status`（MCP ツールの自己確認）にも同じ値を env で
+                # 伝える——伝えないと Codex の自己確認が実際のゲートより早く complete:true を見てしまう
+                # （`SHERPA_CODEX_SANDBOX=0` の緊急避難経路だけは popen_env を早期に確定させるため
+                # この env は乗らない＝自己確認がわずかに楽観的になるだけで、実際のゲート
+                # （`_ledger_require_review` を直接使う以下の分岐）は影響を受けない）。
+                _ledger_require_review = _schema_v2 and mcp
+                if mcp and not _plain:
+                    _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRE_REVIEW"] = "1" if _ledger_require_review else "0"
+                    # RV是正3巡目（「続き」）: `ledger_status` の自己確認にも同じ義務フラグを伝える
+                    # （`SHERPA_MCP_LEDGER_REQUIRED_EXTRA` と同じ受け渡し方式）。
+                    _mcp_budget_env["SHERPA_MCP_LEDGER_REQUIRE_CONTINUATION_RESOLVED"] = (
+                        "1" if _ledger_require_continuation_resolved else "0")
                 _codex_run_started_at = time.monotonic()
                 # 子 rollout の mtime 下限（壁時計・resume は thread id を使い回すため、
                 # `_collect_child_token_usage` の新形式判定はこれより前に書かれたファイルを
@@ -3028,7 +3166,9 @@ class CodexProvider(Provider):
                                           # 本文は出さず、件数・状態語彙（閉集合）だけを表示する。
                                           "ledger_manifest_set": "調査台帳に項目を登録",
                                           "ledger_item_put": "調査台帳の項目を更新",
-                                          "ledger_status": "調査台帳の状態を確認"}.get(tool, "その他の処理")
+                                          "ledger_status": "調査台帳の状態を確認",
+                                          "ledger_review_put": "回答前に中間の見直しを記録"}.get(
+                                              tool, "その他の処理")
                                 if tool in _LEDGER_TOOL_DETAILS:
                                     detail = _LEDGER_TOOL_DETAILS[tool](a)
                                 else:
@@ -3447,6 +3587,10 @@ class CodexProvider(Provider):
                     # ループの各周の先頭で `_ledger_progressed`（前周と今周の `LedgerSnapshot` の
                     # 比較・純関数）を見て、進捗があれば streak をリセットする。
                     _ledger_prev_snapshot: investigation_ledger.LedgerSnapshot | None = None
+                    # COD-18 ⑤: 見直し（`reviews.jsonl`）の件数も進捗の判定材料に加える——見直しを
+                    # 1件書いただけでは item の状態（status/evidence/reason）が何も変わらないため、
+                    # `_ledger_progressed`（item 側だけを見る純関数）は見直し単独の進捗を検知できない。
+                    _ledger_prev_reviews: tuple[dict, ...] = ()
                     while True:
                         _stopped_for_continue = (
                             (ctx.stop_event is not None and ctx.stop_event.is_set())
@@ -3461,13 +3605,19 @@ class CodexProvider(Provider):
                         _ledger_verdict = None
                         if _ledger_gate_active:
                             _ledger_snapshot = investigation_ledger.load_ledger(_investigation_dir)
+                            _ledger_reviews = (investigation_ledger.load_reviews(_investigation_dir)
+                                               if _ledger_require_review else ())
                             _ledger_verdict = investigation_ledger.ledger_complete(
-                                _ledger_snapshot, required_extra=_ledger_required_extra)
+                                _ledger_snapshot, required_extra=_ledger_required_extra,
+                                reviews=_ledger_reviews, require_review=_ledger_require_review,
+                                require_continuation_resolved=_ledger_require_continuation_resolved)
                             if (_ledger_prev_snapshot is not None
-                                    and _ledger_progressed(_ledger_prev_snapshot, _ledger_snapshot,
-                                                           required_extra=_ledger_required_extra)):
+                                    and (_ledger_progressed(_ledger_prev_snapshot, _ledger_snapshot,
+                                                            required_extra=_ledger_required_extra)
+                                         or len(_ledger_reviews) > len(_ledger_prev_reviews))):
                                 _ledger_no_progress_streak = 0
                             _ledger_prev_snapshot = _ledger_snapshot
+                            _ledger_prev_reviews = _ledger_reviews
                         _has_candidate_final = _candidate_final() is not None
                         if _ledger_gate_active and _has_candidate_final:
                             # ---- 台帳ゲート分岐（正典§2/§4/§6・`_schema_v2` のときだけ効かせる）----
@@ -3531,7 +3681,11 @@ class CodexProvider(Provider):
                                 # in_progress へ差し戻した・evidence を消した等）ときは、通常の
                                 # 台帳ゲートへ戻す——打ち切り理由を誤って "cap" にしない。
                                 _ledger_review_verdict_after = investigation_ledger.ledger_complete(
-                                    _ledger_review_snapshot_after, required_extra=_ledger_required_extra)
+                                    _ledger_review_snapshot_after, required_extra=_ledger_required_extra,
+                                    reviews=(investigation_ledger.load_reviews(_investigation_dir)
+                                            if _ledger_require_review else ()),
+                                    require_review=_ledger_require_review,
+                                    require_continuation_resolved=_ledger_require_continuation_resolved)
                                 if not _ledger_review_verdict_after.complete:
                                     continue
                                 break
@@ -3649,8 +3803,16 @@ class CodexProvider(Provider):
                         _investigation_snapshot = investigation_ledger.apply_unverified_downgrades(
                             _investigation_dir, investigation_ledger.load_ledger(_investigation_dir),
                             exclude_ids=_investigation_pre_turn_not_found_ids)
+                        # COD-18 ⑤: 中間の見直し（本文を持つため台帳 snapshot とは別に読む・
+                        # §4「追加で調べますか？」の末尾注記・退避の force_retain 判定の両方が
+                        # `investigation_ledger.pending_continuation_review()` 経由で使う）。
+                        _investigation_reviews = (investigation_ledger.load_reviews(_investigation_dir)
+                                                  if _ledger_require_review else ())
+                        _review_continuation_note_text = _review_continuation_note(_investigation_reviews)
                         _investigation_verdict = investigation_ledger.ledger_complete(
-                            _investigation_snapshot, required_extra=_ledger_required_extra)
+                            _investigation_snapshot, required_extra=_ledger_required_extra,
+                            reviews=_investigation_reviews, require_review=_ledger_require_review,
+                            require_continuation_resolved=_ledger_require_continuation_resolved)
                         if _investigation_stopped_reason is None:
                             if _investigation_verdict.complete:
                                 _investigation_stopped_reason = "complete"
@@ -3868,8 +4030,12 @@ class CodexProvider(Provider):
                     # 保持する。
                     _investigation_retained = False
                     if _ledger_home is not None and not _investigation_retire_done:
+                        # COD-18 ④「追加で調べますか？」（RV是正3巡目）: 退避の判断は
+                        # `_retire_investigation_ledger` 内部で `pending_continuation_review()`
+                        # を直接使う（`force_retain` 引数は撤去・単一の純関数に一本化）。
                         _investigation_retained = _retire_investigation_ledger(
-                            _investigation_dir, _ledger_home, required_extra=_ledger_required_extra)
+                            _investigation_dir, _ledger_home, required_extra=_ledger_required_extra,
+                            require_review=_ledger_require_review)
                         _investigation_retire_done = True
                     _ledger_id_report_limit = 50
                     env["investigation"] = {
@@ -3890,6 +4056,12 @@ class CodexProvider(Provider):
                             "rounds": _ledger_review_rounds,
                             "items_added": _ledger_review_items_added,
                         },
+                        # COD-18 ⑤: 中間の見直し（本体別枠・本文なし・件数と未充足 id だけ）。
+                        "mid_review": {
+                            "count": len(_investigation_reviews),
+                            "missing": _investigation_verdict.review_missing,
+                            "pending": list(_investigation_verdict.review_pending_ids[:_ledger_id_report_limit]),
+                        },
                     }
                     env["limits"] = {**(env.get("limits") or {}),
                                      "ledger_incomplete": not _investigation_verdict.complete}
@@ -3897,12 +4069,15 @@ class CodexProvider(Provider):
                     # 既に `_investigation_snapshot` 側の検証（`validate_item`）が除外済み——
                     # `ledger_item_put` が書込時に同じ検証を通しているため、通常は常に正規形。
                     # `load_coverage` は item ごとの outcome タプルのみ（本文を持たない）。
+                    # COD-18 ⑤: `reviews`（本文を持つ・`validate_review_entry()` 済みの正規形のみ）
+                    # も調査の記録の一部として積む——`investigation_record_render.py` の節の素材。
                     _investigation_record_payload = {
                         "complete": _investigation_verdict.complete,
                         "manifest": _investigation_snapshot.manifest,
                         "items": dict(_investigation_snapshot.items),
                         "coverage": {k: list(v) for k, v in
                                     investigation_ledger.load_coverage(_investigation_dir).items()},
+                        "reviews": list(_investigation_reviews),
                     }
                 # §2-3/5: `_schema_on` は構造化 message から見出しを選ぶ（生 JSON をそのまま出さない・
                 # 平文ヒューリスティックへは戻さない）。無効時は現行どおりの選び方（下記）。
@@ -4323,6 +4498,13 @@ class CodexProvider(Provider):
                     _unconfirmed_section = _unconfirmed_items_section(_investigation_snapshot)
                     if _unconfirmed_section:
                         env["headline"] = f"{env['headline']}\n\n{_unconfirmed_section}"
+                # COD-18 ④「追加で調べますか？」: 最後の中間の見直しが mostly_answered かつ
+                # extra_perspectives を挙げていたら定型文を付ける（AI の自由記述はそのまま流さない・
+                # `_review_continuation_note_text` は観点を短く切って並べただけの決定的な文字列）。
+                # 台帳は既に `force_retain` で退避済み（上の env["investigation"] 組立箇所）——
+                # 「続き」で復元されれば `_investigation_dir`／`reviews.jsonl` がそのまま戻る。
+                if _review_continuation_note_text:
+                    env["headline"] = f"{env['headline']}\n\n{_review_continuation_note_text}"
                 # 自動継続を尽くしてもなお進行中の宣言文（「次に○○します」等）がそのまま headline に
                 # 残ったターン——本文は書き換えない（`answer` は既存どおりそのまま使う）。`_codex_stopped_early`
                 # だけを根拠に envelope へ印を付け、chat_service._finalize が予算到達時の途中結果・出典0件時の案内と同形式
@@ -4432,7 +4614,8 @@ class CodexProvider(Provider):
                     if (_investigation_dir is not None and _ledger_home is not None
                             and not _investigation_retire_done):
                         _retire_investigation_ledger(
-                            _investigation_dir, _ledger_home, required_extra=_ledger_required_extra)
+                            _investigation_dir, _ledger_home, required_extra=_ledger_required_extra,
+                            require_review=_ledger_require_review)
                     _release_active_run_dir(run_dir)
                     if _created_files_failed:
                         # 保存に失敗した成果物がある run_dir は削除せず回収用に残す

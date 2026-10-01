@@ -1066,3 +1066,188 @@ def test_downgrade_exclude_ids_keeps_items_already_not_found_before_this_turn(tm
     assert new_snap.items["b"]["status"] == "unverified"           # 除外されない item は通常どおり降格
     assert new_snap.items["b"]["reason"] == "not_searched"
     assert not (tmp_path / "items/a.json").exists()
+
+
+# ===== COD-18 ⑤（利用者2026-10-01指示・`docs/proposals/課題管理簿.md` COD-18）: =====
+# ===== 中間の見直し（reviews.jsonl・`validate_review_entry`/`ledger_complete(require_review=...)`） =====
+
+def _review(verdict: str = "mostly_answered", added_items=None, extra_perspectives=None,
+           ts: float = 1.0, terminal_count: int = 1) -> dict:
+    return {"purpose": "依頼の目的", "perspectives": ["画面"], "summary": "分かったこと",
+            "added_items": added_items or [], "removed_items": [], "verdict": verdict,
+            "extra_perspectives": extra_perspectives or [], "ts": ts,
+            "terminal_count": terminal_count}
+
+
+def test_validate_review_entry_rejects_extra_missing_and_oversized_fields():
+    """正規形はキー集合完全一致・各欄の型/上限・`insufficient` では `extra_perspectives` 空を
+    要求する（本文を持つ唯一の正規形だが、自由記述欄の無制限肥大化は上限で塞ぐ）。"""
+    assert L.validate_review_entry(_review()) == []
+    # 余分なキー（本文混入の経路）は拒否。
+    assert L.validate_review_entry({**_review(), "note": "x"}) != []
+    # 必須キー欠落。
+    missing = _review()
+    del missing["summary"]
+    assert L.validate_review_entry(missing) != []
+    # perspectives は1件以上必須（空配列は無効）。
+    assert L.validate_review_entry({**_review(), "perspectives": []}) != []
+    # purpose の上限超過。
+    assert L.validate_review_entry({**_review(), "purpose": "x" * (L.SUBJECT_MAX_LEN + 1)}) != []
+    # verdict が insufficient なのに extra_perspectives が非空＝矛盾として拒否。
+    bad = _review(verdict="insufficient", extra_perspectives=["観点"])
+    assert L.validate_review_entry(bad) != []
+    # added_items の要素はキー集合 {id, reason} ちょうど・id は安全な書式のみ。
+    assert L.validate_review_entry(
+        {**_review(), "added_items": [{"id": "../x", "reason": "理由"}]}) != []
+    assert L.validate_review_entry(
+        {**_review(), "added_items": [{"id": "a", "reason": "理由", "extra": 1}]}) != []
+    # ts は数値（bool は int の部分型のため明示的に拒否）。
+    assert L.validate_review_entry({**_review(), "ts": True}) != []
+
+
+def test_append_review_atomic_refuses_symlinked_reviews_file(tmp_path):
+    """`reviews.jsonl` 自体が symlink に差し替えられていたら追記せず `OSError`（`coverage.jsonl`
+    と同じ TOCTOU 対策・ファイル側で個別確認する）。"""
+    outside = tmp_path / "outside.jsonl"
+    ledger_dir = tmp_path / "investigation"
+    ledger_dir.mkdir()
+    (ledger_dir / "reviews.jsonl").symlink_to(outside)
+    with pytest.raises(OSError):
+        L.append_review_atomic(ledger_dir, _review())
+    assert not outside.exists(), "symlink 先へ書いてはいけない"
+
+
+def test_append_and_load_reviews_round_trip_skips_invalid_lines(tmp_path):
+    L.append_review_atomic(tmp_path, _review(verdict="insufficient"))
+    L.append_review_atomic(tmp_path, _review(verdict="mostly_answered", extra_perspectives=["帳票"]))
+    # 壊れた行・正規形に合わない行は読み飛ばす（fail-safe・`load_coverage` と同じ流儀）。
+    with (tmp_path / "reviews.jsonl").open("a", encoding="utf-8") as f:
+        f.write("not json\n")
+        f.write(json.dumps({"purpose": "欠落だらけ"}) + "\n")
+    reviews = L.load_reviews(tmp_path)
+    assert len(reviews) == 2
+    assert reviews[0]["verdict"] == "insufficient"
+    assert reviews[1]["extra_perspectives"] == ["帳票"]
+
+
+def test_ledger_complete_requires_review_and_tracks_pending_added_items():
+    """`require_review=True` のとき: 見直しが1件も無ければ `review_missing`＝complete 不可。
+    見直しはあるが `added_items` に挙げた id が未終端・未登録なら `review_pending_ids`＝complete
+    不可。その id が終端になれば complete。`require_review=False`（既定）では現行と完全に
+    同じ（どちらも常に偽/空）。"""
+    manifest = _manifest("a", "b")
+    items = {"a": _item("a", status="source_confirmed")}
+    snap = L.LedgerSnapshot(manifest=manifest, items=items, invalid_ids=())
+
+    # 既定（require_review 省略）は review を一切見ない＝現行と同じ結果。
+    verdict_default = L.ledger_complete(snap, reviews=(_review(),))
+    assert verdict_default.review_missing is False
+    assert verdict_default.review_pending_ids == ()
+
+    # 見直しが無い＝review_missing で未完了（他が全部揃っていても）。
+    complete_items = {"a": _item("a", status="source_confirmed")}
+    complete_snap = L.LedgerSnapshot(manifest=_manifest("a"), items=complete_items, invalid_ids=())
+    v_missing = L.ledger_complete(complete_snap, require_review=True)
+    assert v_missing.complete is False
+    assert v_missing.review_missing is True
+
+    # 見直しはあるが、足したと申告した id "b" がまだ非終端＝review_pending。
+    v_pending = L.ledger_complete(snap, reviews=(_review(added_items=[{"id": "b", "reason": "発見"}]),),
+                                  require_review=True)
+    assert v_pending.complete is False
+    assert v_pending.review_missing is False
+    assert v_pending.review_pending_ids == ("b",)
+    assert "b" in v_pending.missing_ids   # 登録済みだが item ファイル未作成＝継続判定は missing 経路で拾う
+
+    # "b" を終端化すれば、同じ見直しで complete になる。
+    done_items = {**items, "b": _item("b", status="source_confirmed")}
+    done_snap = L.LedgerSnapshot(manifest=manifest, items=done_items, invalid_ids=())
+    v_done = L.ledger_complete(done_snap, reviews=(_review(added_items=[{"id": "b", "reason": "発見"}]),),
+                               require_review=True)
+    assert v_done.complete is True
+    assert v_done.review_pending_ids == ()
+
+    # 無効な見直し（正規形に合わない）は無視され、review_missing のまま。
+    v_invalid_review = L.ledger_complete(done_snap, reviews=({"purpose": "欠落"},), require_review=True)
+    assert v_invalid_review.review_missing is True
+
+
+# ===== RV是正（1巡目・順番）: terminal_count は見直しを書いた時点の終端件数・1未満は無効 =====
+
+def test_validate_review_entry_rejects_terminal_count_below_one():
+    """`terminal_count`（見直しを書いた時点で台帳にあった終端 item の件数）は1以上の整数が必須
+    ——0・負・非整数・欠落はすべて無効（受付の拒否は mcp_server.py 側の責務だが、正規形としても
+    1未満の見直しは `load_reviews()` の「有効な見直し」から外れる・下記で確認）。"""
+    assert L.validate_review_entry(_review(terminal_count=1)) == []
+    assert L.validate_review_entry(_review(terminal_count=0)) != []
+    assert L.validate_review_entry(_review(terminal_count=-1)) != []
+    assert L.validate_review_entry({**_review(), "terminal_count": True}) != []
+    bad = _review()
+    del bad["terminal_count"]
+    assert L.validate_review_entry(bad) != []
+
+
+# ===== RV是正（3巡目・置き場所）: load_reviews/append_review_atomic は台帳と同じ symlink 規律 =====
+
+def test_load_reviews_and_append_refuse_when_dir_itself_is_symlink_or_not_a_directory(tmp_path):
+    """`dir` 自身が symlink、またはディレクトリでなければ `load_ledger` と同じ流儀で拒否する——
+    `reviews.jsonl` という末端ファイルだけを見ていると、`dir` 自体が別の調査台帳ディレクトリへの
+    symlink の場合にリンク先の見直しを読み込んでしまう（そのリーク経路を塞ぐ）。"""
+    # dir 自体が symlink（リンク先に正当な見直しがあっても読まない）。
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    L.append_review_atomic(real_dir, _review())
+    assert len(L.load_reviews(real_dir)) == 1   # リンク先を直接読めば1件あることの確認
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir)
+    assert L.load_reviews(link_dir) == ()
+    with pytest.raises(PermissionError):
+        L.append_review_atomic(link_dir, _review())
+
+    # dir がディレクトリでない（通常ファイル）。
+    file_as_dir = tmp_path / "not_a_dir"
+    file_as_dir.write_text("x", encoding="utf-8")
+    assert L.load_reviews(file_as_dir) == ()
+    with pytest.raises(PermissionError):
+        L.append_review_atomic(file_as_dir, _review())
+
+
+# ===== RV是正（4巡目・上限）: 件数とバイト数の上限 =====
+
+def test_append_review_atomic_rejects_beyond_count_and_byte_limits(tmp_path):
+    """件数が `REVIEWS_MAX_COUNT` に達した追記、ファイル総バイト数が `REVIEWS_MAX_BYTES` を
+    超える追記はいずれも書き込まず `ValueError`。読込（`load_reviews`）も上限までしか読まない。"""
+    for _ in range(L.REVIEWS_MAX_COUNT):
+        L.append_review_atomic(tmp_path, _review())
+    assert len(L.load_reviews(tmp_path)) == L.REVIEWS_MAX_COUNT
+    with pytest.raises(ValueError):
+        L.append_review_atomic(tmp_path, _review())   # 件数の上限超過
+
+    # バイト数の上限: 上限ぴったりまで既存ファイルを埋めてから1件追記しようとすると拒否される
+    # （既存コンテンツはテスト側で直接書く——内部関数の monkeypatch ではなくファイルの実体を操作）。
+    bytes_dir = tmp_path / "bytes"
+    bytes_dir.mkdir()
+    path = bytes_dir / "reviews.jsonl"
+    path.write_bytes(b"x" * L.REVIEWS_MAX_BYTES)
+    with pytest.raises(ValueError):
+        L.append_review_atomic(bytes_dir, _review())   # バイト数の上限超過
+
+
+# ===== RV是正（5巡目・正規化）: 表示・プロンプト注入へ出す前の共通サニタイズ =====
+
+def test_sanitize_review_text_strips_control_chars_escapes_markdown_and_truncates():
+    """改行・制御文字を取り除き、Markdown の表示崩れを起こす記号をエスケープし、1件あたり・
+    全体それぞれの上限で切る（回答末尾の定型文・「続き」の注入文・調査の記録の Markdown 表示が
+    共通で通す関数）。"""
+    raw = "観点*です\n\t`コード`[リンク](x)|パイプ"
+    cleaned = L.sanitize_review_text(raw)
+    assert "\n" not in cleaned and "\t" not in cleaned
+    assert cleaned == r"観点\*です\`コード\`\[リンク\](x)\|パイプ"
+    assert L.sanitize_review_text("x" * (L.REVIEW_TEXT_PER_ITEM_MAX + 50)) == "x" * L.REVIEW_TEXT_PER_ITEM_MAX
+    assert L.sanitize_review_text(None) == ""
+
+    many = ["x" * L.REVIEW_TEXT_PER_ITEM_MAX for _ in range(20)]
+    joined = L.sanitize_review_text_list(many)
+    assert len(joined) == L.REVIEW_TEXT_TOTAL_MAX
+    assert L.sanitize_review_text_list([]) == ""
+    assert L.sanitize_review_text_list(["帳票", None, "  ", "画面"]) == "帳票、画面"

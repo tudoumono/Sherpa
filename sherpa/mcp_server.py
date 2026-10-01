@@ -62,7 +62,7 @@ _ASK_STATE = {"count": 0}
 _ASK_RESULT_FIRST = "質問はユーザーに届きました。追加調査はせず、ここまでに確認できたことを省略せずまとめて終了してください。"
 _ASK_RESULT_AGAIN = "既に質問済みです。調査を続けて回答をまとめてください。"
 
-_LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status"})
+_LEDGER_TOOLS = frozenset({"ledger_manifest_set", "ledger_item_put", "ledger_status", "ledger_review_put"})
 
 # 素の Codex モード（`plain`・docs/archive/2026-09-24-素のCodexモード.md §1.2/§3）で公開する
 # ツールの全体。`_tool_defs()`・`handle()` のどちらもこの集合だけを見る（値のぶれを作らない）。
@@ -105,6 +105,36 @@ def _ledger_tool_defs() -> list:
         {"name": "ledger_status",
          "description": "調査台帳の完了・未充足・無効・欠落を確認する。ファイルを直接書かず台帳ツールを使う。",
          "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+        {"name": "ledger_review_put",
+         "description": "回答を確定する前の中間の見直しを1件記録する（本体だけが呼ぶ・worker は呼ばない）。"
+                        "先に item を1件以上終端にしてから呼ぶこと（終端が0件なら拒否される）。"
+                        "ファイルを直接書かずこのツールを使う。",
+         "inputSchema": {
+             "type": "object", "additionalProperties": False,
+             "required": ["purpose", "perspectives", "summary", "added_items", "removed_items",
+                         "verdict", "extra_perspectives"],
+             "properties": {
+                 "purpose": {"type": "string", "maxLength": investigation_ledger.SUBJECT_MAX_LEN},
+                 "perspectives": {"type": "array",
+                                  "items": {"type": "string", "maxLength": investigation_ledger.SUBJECT_MAX_LEN}},
+                 "summary": {"type": "string", "maxLength": investigation_ledger.REVIEW_SUMMARY_MAX_LEN},
+                 "added_items": {"type": "array", "items": {
+                     "type": "object", "additionalProperties": False, "required": ["id", "reason"],
+                     "properties": {
+                         "id": {"type": "string"},
+                         "reason": {"type": "string", "maxLength": investigation_ledger.REASON_MAX_LEN},
+                     }}},
+                 "removed_items": {"type": "array", "items": {
+                     "type": "object", "additionalProperties": False, "required": ["id", "reason"],
+                     "properties": {
+                         "id": {"type": "string"},
+                         "reason": {"type": "string", "maxLength": investigation_ledger.REASON_MAX_LEN},
+                     }}},
+                 "verdict": {"type": "string", "enum": sorted(investigation_ledger.REVIEW_VERDICTS)},
+                 "extra_perspectives": {"type": "array",
+                                        "items": {"type": "string",
+                                                  "maxLength": investigation_ledger.SUBJECT_MAX_LEN}},
+             }}},
     ]
 
 
@@ -117,14 +147,19 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
     try:
         if name == "ledger_status":
             snapshot = investigation_ledger.load_ledger(directory)
+            _require_review = _ledger_require_review()
+            _reviews = investigation_ledger.load_reviews(directory) if _require_review else ()
             verdict = investigation_ledger.ledger_complete(
-                snapshot, required_extra=_ledger_required_extra())
+                snapshot, required_extra=_ledger_required_extra(),
+                reviews=_reviews, require_review=_require_review,
+                require_continuation_resolved=_ledger_require_continuation_resolved())
             return {
                 "complete": verdict.complete, "manifest_invalid": verdict.manifest_invalid,
                 "items": len(snapshot.items) + len(snapshot.invalid_ids),
                 "non_terminal": verdict.non_terminal_ids, "unsatisfied": verdict.unsatisfied,
                 "invalid": verdict.invalid_ids, "missing": verdict.missing_ids,
                 "unregistered": verdict.unregistered_ids, "counts": verdict.terminal_counts,
+                "review_missing": verdict.review_missing, "review_pending": verdict.review_pending_ids,
             }
         if name == "ledger_item_put":
             problems = investigation_ledger.validate_item(args)
@@ -135,6 +170,37 @@ def _run_ledger_tool(name: str, args: dict) -> dict:
             except ValueError as exc:
                 return {"error": "ledger_item_invalid", "problems": [str(exc)]}
             return {"ok": True, "id": args["id"]}
+        if name == "ledger_review_put":
+            # RV是正（順番）: 見直しは終端の item が1件以上できてから書く——受付時に現在の台帳を
+            # 数え、終端が0件なら書き込まず拒否する（「最初の item が1つでも終端になった後」の
+            # 指示を機械的に強制する）。`ts`/`terminal_count` はサーバが付ける（モデルには渡させ
+            # ない・manifest の `created_at` と同じ分担）。`terminal_count` はこの見直しを書いた
+            # **時点**の終端件数として台帳へそのまま記録する——後で item の状態が変わっても
+            # この見直しの有効性（`validate_review_entry` の1以上要件）は変わらない。
+            # RV是正（2巡目）: **manifest に登録済みの id だけ**を数える——未登録の item（親の
+            # manifest にまだ無い・子が勝手に作った shard 等）を終端にしても、中間の見直しの前提
+            # （「台帳としてこの依頼を調べ進めている」）にはならない（`ledger_complete()` の
+            # `unregistered_ids` の扱いと同じ「登録集合だけを見る」契約に揃える）。
+            snapshot = investigation_ledger.load_ledger(directory)
+            manifest_ids = (set(snapshot.manifest["items"])
+                            if snapshot.manifest is not None else set())
+            terminal_count = sum(
+                1 for item_id, item in snapshot.items.items()
+                if item_id in manifest_ids
+                and item.get("status") in investigation_ledger.TERMINAL_STATUSES)
+            if terminal_count < 1:
+                return {"error": "ledger_review_rejected",
+                       "problems": ["終端の項目がまだ1件もありません。先に item を1件以上"
+                                   "終端にしてから見直しを書いてください。"]}
+            stored = {**args, "ts": time.time(), "terminal_count": terminal_count}
+            problems = investigation_ledger.validate_review_entry(stored)
+            if problems:
+                return {"error": "ledger_review_invalid", "problems": problems}
+            try:
+                investigation_ledger.append_review_atomic(directory, stored)
+            except (OSError, ValueError) as exc:
+                return {"error": "ledger_review_rejected", "problems": [str(exc)]}
+            return {"ok": True}
 
         manifest_path = directory / "manifest.json"
         if manifest_path.is_symlink():
@@ -297,6 +363,23 @@ def _ledger_required_extra() -> tuple[str, ...]:
     if not all(k in investigation_ledger.EVIDENCE_KINDS for k in kinds):
         return ()
     return kinds
+
+
+def _ledger_require_review() -> bool:
+    """`ledger_status` の自己確認（COD-18 ⑤・中間の見直し）が `ledger_complete()` へ
+    `require_review=True` を渡すか（`SHERPA_MCP_LEDGER_REQUIRE_REVIEW`・親プロセスが
+    そのターンの実際のゲート判定と同じ値を `"1"`/未設定で渡す）。未設定・`"1"` 以外は要求しない
+    （fail-safe・この env はあくまで自己確認の利便性のためで、実際の完了判定
+    （provider.py の台帳ゲート）はこの env に関わらず独立に `require_review` を決める）。"""
+    return os.environ.get("SHERPA_MCP_LEDGER_REQUIRE_REVIEW", "").strip() == "1"
+
+
+def _ledger_require_continuation_resolved() -> bool:
+    """`ledger_status` の自己確認へ渡す `ledger_complete()` の `require_continuation_resolved`
+    （`SHERPA_MCP_LEDGER_REQUIRE_CONTINUATION_RESOLVED`・RV是正3巡目「続き」——前ターンの
+    `mostly_answered`＋`extra_perspectives` を注入して復元したターンだけ `1` を渡す）。
+    未設定・`"1"` 以外は要求しない（fail-safe・現行と同じ「義務の有無を見ない」の意味）。"""
+    return os.environ.get("SHERPA_MCP_LEDGER_REQUIRE_CONTINUATION_RESOLVED", "").strip() == "1"
 
 
 def _ask_disabled() -> bool:

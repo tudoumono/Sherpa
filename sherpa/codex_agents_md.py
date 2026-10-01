@@ -325,6 +325,36 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
   （evaluator）の巡数と反証確認の厚みだけ。
 """
 
+# 中間の見直し（COD-18 ⑤・利用者2026-10-01指示・`docs/proposals/課題管理簿.md` COD-18）:
+# 「最初に目録を決め、項目を順に確かめ、最後に1回だけ見直す」標準モードの流れに、調査の途中で
+# 目的・観点を確かめ直す場面を1つ挟む。`_investigation_ledger_paragraph` と同じ条件
+# （`_ledger_enabled`）のときだけ足す——台帳が無いターンに `ledger_review_put` を使わせる指示は
+# 実行不能（台帳自体を作れない）。既存の「見直しの一巡」（COD-15・`provider.py` の
+# `_LEDGER_REVIEW_PROMPT`）とは別の仕組み——COD-15 は台帳が complete になった**後**に1〜2回だけ
+# 頼む最終点検、こちらは complete になる**前**（最初の item が1つでも終端になった時点）に最低
+# 1回必須の中間点検——両方を求められたターンでは、まずこの段落の中間の見直しを満たしてから
+# complete になり、その後に COD-15 の最終点検が走る。
+_INVESTIGATION_REVIEW_PARAGRAPH = """\
+- 台帳を作った依頼では、最初の item が1つでも終端になった後、最終回答（`status: final`）を
+  返す前に `ledger_review_put` で中間の見直しを最低1回書く（本体だけが呼ぶ。worker は呼ばない）。
+  書く内容は7つ: `purpose`（この依頼の目的を自分の言葉で1〜2文に言い直したもの）／
+  `perspectives`（必要な観点の一覧。例: 画面・バッチ・DB・帳票・設定。1件以上）／
+  `summary`（ここまでで分かったことの要約）／`added_items`・`removed_items`（この見直しで台帳に
+  足した・外した item の id とその理由。無ければ空配列。実際に item を足す・外す操作自体は
+  `ledger_manifest_set`／該当 item への `ledger_item_put` で別途行う）／`verdict`
+  （`insufficient`＝求める答えに対してまだ全然足りない、`mostly_answered`＝求める答えはおおむね
+  出た、のどちらか）／`extra_perspectives`（`verdict` が `mostly_answered` のときだけ、まだ調べ
+  られる観点があれば挙げる配列。無ければ空配列。`insufficient` のときは必ず空配列）。
+  見直しで item を `added_items` に挙げたら、その item が終端になるまで調べる——足したと申告した
+  のに終端にしない item があると `ledger_status` は `complete` を true にしない
+  （`review_pending` に残る）。
+  `verdict` が `insufficient` なら調査を続け、調べたことをもとに必要ならもう一度見直しを書いて
+  よい（上限は今の調べる深さ・継続回数の範囲内）。`mostly_answered` ならそのまま次へ進んでよい。
+  `ledger_status` の `review_missing`（見直しが1件も無い）または `review_pending`（見直しで
+  足した項目が未終端）が立っている間は、台帳の他の item が全て終端でも `complete` は true に
+  ならない——`status=final` を返さず、見直しを書く（または足した item を終端にする）。
+"""
+
 
 # worker を使う条件・並列数・依頼の形（網羅性の強化と、クイックを本当に速くする §変更A）。
 # 「使うかどうか」は委ねない（観点が2つ以上に分かれる依頼では必ず使う）——「観点の分け方・
@@ -519,6 +549,7 @@ def write_agents_md(authoring: Path, output_schema: bool = False, direct_read: b
                    + (_INVESTIGATE_SKILLS_PARAGRAPH if direct_read else "")
                    + structured_paragraph
                    + (_investigation_ledger_paragraph(direct_read, layer, source_required)
+                      + _INVESTIGATION_REVIEW_PARAGRAPH
                       if _ledger_enabled else "")
                    + (_multi_agent_role_paragraph(review_rounds, direct_read, layer,
                                                   escalate=review_rounds_escalation,

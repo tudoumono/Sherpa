@@ -48,12 +48,23 @@
   model-shell が書ける領域にあり、リンク先を親権限（Sherpa 本体）で読むと本文・他会話の情報が
   漏れる——`dir`／`manifest.json`／`items/`／各 `items/*.json` はいずれも読む前に symlink 判定
   し、1つでも symlink ならその要素は読まずに無効にする（詳細は `load_ledger` の docstring）。
+- **中間の見直し**（COD-18 ⑤・`docs/proposals/課題管理簿.md` COD-18・利用者2026-10-01指示）:
+  `dir/reviews.jsonl`（台帳と同じ置き場）に、台帳が完了と判定される前に最低1回必要な「目的・
+  観点の見直し」を1行1件で追記する（`append_review_atomic`・`coverage.jsonl` と同じ追記専用の
+  jsonl）。1行の正規形は `validate_review_entry()` が検証する8キーちょうど（本文は `purpose`/
+  `summary`/`perspectives`/`extra_perspectives` に書いてよいが、各欄に上限文字数・配列件数の
+  上限を設ける——自由記述欄が無制限に肥大化する経路を塞ぐ）。`ledger_complete()` は
+  `require_review=True` のときだけ、有効な見直しが1件も無い（`review_missing`）・見直しが
+  `added_items` に挙げた item id が終端になっていない（`review_pending_ids`）のいずれかなら
+  `complete=False` にする——`require_review` の既定は `False`（渡さない呼び出しは現行と完全に
+  同じ結果＝Codex の標準モード以外（素の Codex・台帳を使わない構成）はこの条件を一切見ない）。
 """
 from __future__ import annotations
 
 import json
 import errno
 import os
+import re
 import stat
 import time
 import uuid
@@ -181,6 +192,16 @@ class Verdict:
     なっても、source を確認していない以上は未充足）。継続判定・無進捗判定が既存の
     `non_terminal_ids` 経路でそのまま効くよう、未充足の id は `non_terminal_ids` にも含める
     （`unsatisfied` は内訳の報告専用）。
+
+    `review_missing`/`review_pending_ids`（COD-18 ⑤・`ledger_complete()` に `require_review=True`
+    を渡したときだけ意味を持つ・既定 `require_review=False` ではどちらも常に偽/空で `complete` に
+    影響しない）: `review_missing` は有効な中間の見直し（`validate_review_entry()` を満たす
+    `reviews` の要素）が1件も無いこと、または `require_continuation_resolved=True` のとき
+    `pending_continuation_review(reviews)` が非 `None`（＝まだ解決していない「追加の観点」の
+    義務が残っている）であることを示す。`review_pending_ids` は、いずれかの見直しが
+    `added_items` に挙げた item id のうち、登録集合に無い・item ファイルが無い/無効・終端でない、
+    のいずれかに該当するもの（昇順タプル）——見直しで「足した」と申告した項目が実際には終端に
+    なっていないことを示す。どちらか一方でも真/非空なら `complete=False`。
     """
 
     complete: bool
@@ -191,6 +212,8 @@ class Verdict:
     unsatisfied: dict[str, tuple[str, ...]]
     terminal_counts: dict[str, int]
     manifest_invalid: bool
+    review_missing: bool = False
+    review_pending_ids: tuple[str, ...] = ()
 
 
 def _is_symlink_fail_closed(path: Path) -> bool:
@@ -407,7 +430,9 @@ def load_ledger(dir: Path) -> LedgerSnapshot:
     return LedgerSnapshot(manifest=manifest, items=items, invalid_ids=tuple(sorted(invalid)))
 
 
-def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...] = ()) -> Verdict:
+def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...] = (),
+                    reviews: tuple[dict, ...] = (), require_review: bool = False,
+                    require_continuation_resolved: bool = False) -> Verdict:
     """台帳の完了判定（正典§3「状態語彙」＝`final` の条件は「非終端がゼロ」・正典§4「壊れた台帳
     から `final` を生成しない」）。
 
@@ -416,6 +441,29 @@ def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...]
     効く——モデル自身が `required_checks` に含めなかった種別でも呼び出し側の事情で完了判定に
     足せる（例: 範囲にソースがある調査は `source` を必須にする。詳細は `_missing_required_kinds`
     docstring）。理由付きの終端（`REASON_REQUIRED_STATUSES`）は対象外。
+
+    `reviews`/`require_review`（COD-18 ⑤・既定は空タプル/`False`＝現行と完全に同じ結果。
+    呼び出し側＝Codex の標準モードだけが `require_review=True` を渡す）: `reviews` の各要素は
+    `validate_review_entry()` を満たすものだけを「有効な見直し」として数える（`terminal_count`
+    欠落・1未満の要素はこの時点で無効——「見直しを書いた時点で終端項目が1件以上あった」ことを
+    その場で検証済みの見直ししか有効扱いしない設計）。`require_review=True` のとき、有効な
+    見直しが1件も無ければ `Verdict.review_missing=True`。1件以上あれば、`Verdict.review_pending_ids`
+    （昇順タプル）に、いずれかの見直しが `added_items` に挙げた item id のうち登録集合に無い・
+    `snapshot.items` に無い（欠落/無効）・状態が終端でない、のいずれかに該当するものをまとめる。
+    どちらか一方でも真/非空なら `complete=False`（`require_review=False` のときはこの2項目を
+    一切見ない＝常に偽/空）。
+
+    `require_continuation_resolved`（COD-18 ⑤ RV是正3巡目・既定 `False`）: `True` のとき、
+    `pending_continuation_review(reviews)`（下記・単一の純関数）が非 `None`（＝まだ解決していない
+    「追加の観点」の義務が残っている）なら `Verdict.review_missing=True` にする（有効な見直しが
+    1件以上あっても）。呼び出し側（provider.py）は「続き」で前ターンの未投資観点を注入した
+    ターンだけこれを `True` にする——義務の有無の判定自体は呼び出し側の事情（何件目以降かの
+    カウント等）を一切持たず、見直しの列の内容だけから `pending_continuation_review()` が決める
+    （「最後の見直し」だけを見ると、間に `insufficient`／`added_items` 空の見直しを挟んだときに
+    義務が消えてしまう穴があった・RV是正3巡目）。`require_continuation_resolved=False`（既定・
+    「続き」以外の全ターン）では義務の有無を一切見ない——義務が残っていても、そのターン自身の
+    完了は妨げない（回答末尾の定型文・退避の判断は別途 `pending_continuation_review()` を直接
+    使う・下記）。
 
     `complete=True` は次の**すべて**を満たすときだけ:
     - 有効な manifest が存在し、その `items`（登録集合）が**空でない**（`manifest_invalid=False`）。
@@ -475,12 +523,48 @@ def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...]
         if status in TERMINAL_STATUSES:
             terminal_counts[status] = terminal_counts.get(status, 0) + 1
 
+    review_missing = False
+    review_pending_ids: tuple[str, ...] = ()
+    if require_review:
+        valid_reviews = [r for r in reviews if not validate_review_entry(r)]
+        if not valid_reviews:
+            review_missing = True
+        elif require_continuation_resolved and pending_continuation_review(reviews) is not None:
+            # RV是正（「続き」3巡目）: 義務の判定は `pending_continuation_review()`（単一の純関数・
+            # 見直しの列全体を見る）に一本化——件数の基準値（旧 `min_review_count`）を外から渡す
+            # 方式は、間に `insufficient`／`added_items` 空の見直しを挟むと基準値がずれて義務を
+            # 見失う穴があった。`review_missing` を流用し、継続プロンプトが「見直しを書いて
+            # ください」と促す既存の経路へそのまま乗せる。
+            review_missing = True
+        else:
+            pending: set[str] = set()
+            for review in valid_reviews:
+                for ref in review.get("added_items") or []:
+                    if not isinstance(ref, dict):
+                        continue
+                    added_id = ref.get("id")
+                    if not isinstance(added_id, str):
+                        continue
+                    if added_id not in manifest_ids:
+                        pending.add(added_id)
+                        continue
+                    added_item = snapshot.items.get(added_id)
+                    if added_item is None:
+                        pending.add(added_id)   # 欠落 or 無効（`snapshot.invalid_ids` 側）
+                        continue
+                    if (added_item.get("status") in NON_TERMINAL_STATUSES
+                            or added_id in unsatisfied):
+                        pending.add(added_id)
+            review_pending_ids = tuple(sorted(pending))
+
     complete = (
         not manifest_invalid
         and not non_terminal_ids
         and not invalid_ids
         and not missing_ids
         and not unsatisfied
+        and not review_missing
+        and not review_pending_ids
     )
 
     return Verdict(
@@ -492,6 +576,8 @@ def ledger_complete(snapshot: LedgerSnapshot, *, required_extra: tuple[str, ...]
         unsatisfied=unsatisfied,
         terminal_counts=terminal_counts,
         manifest_invalid=manifest_invalid,
+        review_missing=review_missing,
+        review_pending_ids=review_pending_ids,
     )
 
 
@@ -745,3 +831,294 @@ def apply_unverified_downgrades(dir: Path, snapshot: LedgerSnapshot,
             continue       # 書換え失敗は元の状態のまま（fail-open）
         new_items[item_id] = new_item
     return LedgerSnapshot(manifest=snapshot.manifest, items=new_items, invalid_ids=snapshot.invalid_ids)
+
+
+# ---- 中間の見直し（COD-18 ⑤・`docs/proposals/課題管理簿.md` COD-18・利用者2026-10-01指示）----
+# `dir/reviews.jsonl`（台帳・coverage.jsonl と同じ置き場）に、回答を確定する前の「目的・観点の
+# 見直し」を1行1件で追記する。本文（purpose/summary/perspectives/extra_perspectives）を持つ点は
+# item/manifest と異なる（正典§3の「台帳は本文を持たない」原則の対象外——見直しは人が後から
+# 読む「調査の記録」の一部として本文を持つことが要件そのもの・COD-18 ⑤①〜③）。本文を持つ分、
+# 各欄に上限文字数・配列件数の上限を設け、自由記述欄が無制限に肥大化する経路だけを塞ぐ。
+REVIEW_VERDICTS: frozenset[str] = frozenset({"insufficient", "mostly_answered"})
+# `summary` は purpose/perspectives より長い説明文を想定するため別上限（`SUBJECT_MAX_LEN` の2倍）。
+REVIEW_SUMMARY_MAX_LEN = SUBJECT_MAX_LEN * 2
+# 観点・足した/外した項目の配列件数の上限（1回の見直しでの宣言量を有界にする）。
+_REVIEW_LIST_MAX_ITEMS = 50
+# review entry の正規形（キー集合完全一致）。`ts`/`terminal_count` はサーバ（mcp_server.py）が
+# 設定する（`manifest.created_at` と同じ分担——モデル自身には渡させない）。`terminal_count`
+# （RV是正・順番の検証）: この見直しを書いた**時点**で台帳にあった終端 item の件数——`ledger_
+# review_put` は受付時にこれを数え、1未満なら書込み自体を拒否する（`mcp_server.py` 側の責務）。
+# `validate_review_entry()` が1以上を要求するため、`load_reviews()` が返す「有効な見直し」は
+# 必ずこの条件を満たす——`ledger_complete()` 側は改めて現在の item 状態を見ずに、この記録済みの
+# 値を信じればよい（見直しの後で item の状態が巻き戻っても、見直しの有効性自体は変わらない）。
+_REVIEW_REQUIRED_KEYS = frozenset({
+    "purpose", "perspectives", "summary", "added_items", "removed_items",
+    "verdict", "extra_perspectives", "ts", "terminal_count"})
+# `added_items`/`removed_items` の1要素の正規形（キー集合完全一致）。
+_REVIEW_ITEM_REF_KEYS = frozenset({"id", "reason"})
+# item id の書式（AGENTS.md の案内と同じ＝英数字・ハイフン・アンダースコアのみ）。
+_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+_REVIEWS_FILENAME = "reviews.jsonl"
+# RV是正（上限）: 見直しは本文（purpose/summary/perspectives 等）を持つため、item/coverage と
+# 違い無制限の自由記述が何度も積み重なり得る——件数と `reviews.jsonl` の総バイト数の両方に
+# 上限を設け、超える追記は拒否する（`append_review_atomic`）。読込（`load_reviews`）も同じ上限で
+# 打ち切り、上限を超えて書かれたファイル（上限追加前の遺産・外部からの改ざん等）を丸ごと
+# パースしようとしない。
+REVIEWS_MAX_COUNT = 20
+REVIEWS_MAX_BYTES = 256 * 1024  # 256 KiB
+
+
+def _validate_text_list(value, field_name: str, *, require_non_empty: bool) -> list[str]:
+    """`perspectives`/`extra_perspectives` 共通の検証（配列・件数上限・各要素が非空 str で
+    `SUBJECT_MAX_LEN` 以下）。問題を人が読める理由の文字列のリストで返す（無ければ空）。"""
+    if not isinstance(value, list):
+        return [f"{field_name} は配列である必要がある"]
+    if len(value) > _REVIEW_LIST_MAX_ITEMS:
+        return [f"{field_name} が上限({_REVIEW_LIST_MAX_ITEMS}件)を超えている"]
+    if require_non_empty and len(value) == 0:
+        return [f"{field_name} が空——観点を1件以上挙げる"]
+    for idx, v in enumerate(value):
+        if not isinstance(v, str) or v.strip() == "":
+            return [f"{field_name}[{idx}] は非空の str である必要がある"]
+        if len(v) > SUBJECT_MAX_LEN:
+            return [f"{field_name}[{idx}] が上限({SUBJECT_MAX_LEN}文字)を超えている"]
+    return []
+
+
+def _validate_item_refs(value, field_name: str) -> list[str]:
+    """`added_items`/`removed_items` 共通の検証（配列・件数上限・各要素は `id`/`reason` の2キー
+    ちょうど・`id` は item id の書式・`reason` は非空かつ `REASON_MAX_LEN` 以下）。"""
+    if not isinstance(value, list):
+        return [f"{field_name} は配列である必要がある"]
+    if len(value) > _REVIEW_LIST_MAX_ITEMS:
+        return [f"{field_name} が上限({_REVIEW_LIST_MAX_ITEMS}件)を超えている"]
+    for idx, ref in enumerate(value):
+        if not isinstance(ref, dict) or set(ref.keys()) != _REVIEW_ITEM_REF_KEYS:
+            return [f"{field_name}[{idx}] のキー集合が {sorted(_REVIEW_ITEM_REF_KEYS)} と一致しない"]
+        rid = ref.get("id")
+        if not isinstance(rid, str) or not _ITEM_ID_RE.match(rid):
+            return [f"{field_name}[{idx}].id は item id の書式（英数字・ハイフン・アンダースコア）"
+                   " である必要がある"]
+        reason = ref.get("reason")
+        if not isinstance(reason, str) or reason.strip() == "":
+            return [f"{field_name}[{idx}].reason は非空の str である必要がある"]
+        if len(reason) > REASON_MAX_LEN:
+            return [f"{field_name}[{idx}].reason が上限({REASON_MAX_LEN}文字)を超えている"]
+    return []
+
+
+def validate_review_entry(entry) -> list[str]:
+    """中間の見直し1件の正規形を検証し、problems を人が読める理由の文字列のリストで返す（問題が
+    無ければ空リスト・真偽判定は `not validate_review_entry(...)`）。キー集合が
+    `_REVIEW_REQUIRED_KEYS` の9つと完全一致する（item/manifest と同じ流儀）。`verdict` が
+    `insufficient` のときは `extra_perspectives` を空配列にする（`mostly_answered` の意味だけが
+    持つ「追加で調べられる観点」を、まだ足りないと判断した見直しに混在させない）。`terminal_count`
+    は1以上の整数を要求する（RV是正・順番——見直しを書いた時点で終端 item が1件も無い見直しは
+    無効。サーバが受付時に数えて埋める値のため、ここでは型・下限だけ検証する）。
+    """
+    if not isinstance(entry, dict):
+        return ["review は dict である必要がある"]
+    extra_keys = set(entry.keys()) - _REVIEW_REQUIRED_KEYS
+    missing_keys = _REVIEW_REQUIRED_KEYS - set(entry.keys())
+    if extra_keys or missing_keys:
+        problems: list[str] = []
+        if extra_keys:
+            problems.append(f"review に余分なキーがある: {sorted(extra_keys)}")
+        if missing_keys:
+            problems.append(f"review に必須キーが無い: {sorted(missing_keys)}")
+        return problems
+    purpose = entry.get("purpose")
+    if not isinstance(purpose, str) or purpose.strip() == "":
+        return ["purpose は非空の str である必要がある"]
+    if len(purpose) > SUBJECT_MAX_LEN:
+        return [f"purpose が上限({SUBJECT_MAX_LEN}文字)を超えている"]
+    summary = entry.get("summary")
+    if not isinstance(summary, str) or summary.strip() == "":
+        return ["summary は非空の str である必要がある"]
+    if len(summary) > REVIEW_SUMMARY_MAX_LEN:
+        return [f"summary が上限({REVIEW_SUMMARY_MAX_LEN}文字)を超えている"]
+    problems = _validate_text_list(entry.get("perspectives"), "perspectives", require_non_empty=True)
+    if problems:
+        return problems
+    problems = _validate_item_refs(entry.get("added_items"), "added_items")
+    if problems:
+        return problems
+    problems = _validate_item_refs(entry.get("removed_items"), "removed_items")
+    if problems:
+        return problems
+    verdict = entry.get("verdict")
+    if not isinstance(verdict, str) or verdict not in REVIEW_VERDICTS:
+        return [f"verdict は {sorted(REVIEW_VERDICTS)} のいずれかである必要がある"]
+    problems = _validate_text_list(entry.get("extra_perspectives"), "extra_perspectives",
+                                   require_non_empty=False)
+    if problems:
+        return problems
+    if verdict != "mostly_answered" and entry.get("extra_perspectives"):
+        return ["verdict が insufficient のときは extra_perspectives を空配列にする"]
+    ts = entry.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return ["ts は数値である必要がある"]
+    terminal_count = entry.get("terminal_count")
+    if isinstance(terminal_count, bool) or not isinstance(terminal_count, int) or terminal_count < 1:
+        return ["terminal_count は1以上の整数である必要がある"]
+    return []
+
+
+def append_review_atomic(dir: Path, entry: dict) -> None:
+    """1件の中間の見直しを `dir/reviews.jsonl` へ追記する。`entry` は呼び出し側
+    （`mcp_server.py`）が `ts`/`terminal_count` を付けたうえで `validate_review_entry()` を通した
+    完全な正規形を渡す契約——本関数自身は正規形を検証しない（`write_item_atomic` と同じ分担）。
+
+    書込方式は `append_coverage_atomic` と同じ（単発 "a" write・`O_NOFOLLOW`・`O_NONBLOCK`・
+    fstat で通常ファイルであることを確認してから書く——TOCTOU で symlink に差し替えられた
+    ファイルへ書かない。複数プロセス（親子）が同じファイルへ追記しても、1行の長さが一般的な
+    PIPE_BUF に収まる限り行単位で混ざらない）。`dir` 自身が symlink／ディレクトリでなければ
+    `load_ledger` と同じ流儀で拒否する（`_is_symlink_fail_closed`・`PermissionError`）。`dir` の
+    経路に symlink が含まれていれば同じく `PermissionError`（`_reject_symlinked_dir`）。
+
+    RV是正（上限）: 追記後の件数が `REVIEWS_MAX_COUNT` を超える、または追記後のファイル総バイト数
+    が `REVIEWS_MAX_BYTES` を超える場合は書き込まず `ValueError`（fail-loud・呼び出し元
+    ＝mcp_server.py が `problems` としてモデルへ返す）。既存ファイルの読み直し→判定→追記の間は
+    原子的ではない（`append_coverage_atomic` と同じ既存の複数プロセス前提＝1行が PIPE_BUF に
+    収まる限り破損しないが、上限ちょうどの際に稀に多少超過する競合はあり得る——件数・バイト数は
+    フェイルセーフの目安であり厳密な排他ではない）。
+    """
+    dir = Path(dir)
+    if _is_symlink_fail_closed(dir) or not dir.is_dir():
+        raise PermissionError(errno.EPERM, "台帳ディレクトリが symlink またはディレクトリでない", str(dir))
+    path = dir / _REVIEWS_FILENAME
+    _reject_symlinked_dir(dir)
+    dir.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+    existing_size = 0
+    existing_count = 0
+    if path.is_file() and not path.is_symlink():
+        try:
+            existing = path.read_bytes()
+        except OSError:
+            existing = b""
+        existing_size = len(existing)
+        existing_count = existing.count(b"\n")
+    if existing_count >= REVIEWS_MAX_COUNT:
+        raise ValueError(f"reviews が上限({REVIEWS_MAX_COUNT}件)に達しています")
+    if existing_size + len(line) > REVIEWS_MAX_BYTES:
+        raise ValueError(f"reviews.jsonl が上限({REVIEWS_MAX_BYTES}バイト)を超えます")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.ELOOP, "reviews.jsonl is not a regular file", str(path))
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def load_reviews(dir: Path) -> tuple[dict, ...]:
+    """`dir/reviews.jsonl` を読み、`validate_review_entry()` を満たす見直しだけを記録順の
+    タプルで返す（壊れた行・型不正・語彙外・symlink・読めないファイルは fail-safe で無視—
+    `load_coverage` と同じ流儀。例外は投げない）。
+
+    `dir` 自身が symlink／ディレクトリでなければ空タプル（`load_ledger` と同じ流儀——`dir` だけを
+    対象に symlink 判定すると、`dir` 自身が別ディレクトリへの symlink の場合に通り抜けて
+    リンク先の `reviews.jsonl` を読んでしまう）。
+
+    RV是正（上限）: 先頭 `REVIEWS_MAX_BYTES` バイト・`REVIEWS_MAX_COUNT` 件までしか読まない
+    （超えた分は読み捨てる・`append_review_atomic` が書き込み時に同じ上限を課すため正常に書かれた
+    ファイルはこの上限内に収まるが、上限追加前の遺産ファイルや外部からの改ざんで超過していても
+    無制限にメモリへ展開しない）。
+    """
+    dir = Path(dir)
+    if _is_symlink_fail_closed(dir) or not dir.is_dir():
+        return ()
+    path = dir / _REVIEWS_FILENAME
+    if _is_symlink_fail_closed(path) or not path.is_file():
+        return ()
+    try:
+        with path.open("rb") as f:
+            raw = f.read(REVIEWS_MAX_BYTES + 1)
+    except OSError:
+        return ()
+    try:
+        text = raw[:REVIEWS_MAX_BYTES].decode("utf-8", errors="ignore")
+    except ValueError:
+        return ()
+    out: list[dict] = []
+    for line in text.splitlines():
+        if len(out) >= REVIEWS_MAX_COUNT:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if validate_review_entry(entry):
+            continue
+        out.append(entry)
+    return tuple(out)
+
+
+def pending_continuation_review(reviews: tuple[dict, ...]) -> dict | None:
+    """見直しの列（`load_reviews()` の戻り値・記録順。`validate_review_entry()` を満たさない
+    要素は無視する）から、まだ「追加の観点」を調べる義務が残っている見直しを返す（無ければ
+    `None`・純関数）。
+
+    義務の定義: `verdict == "mostly_answered"` かつ `extra_perspectives` が非空の見直しのうち、
+    その**後**（記録順で後）に `added_items` を1件以上持つ見直しがまだ1件も書かれていないもの。
+    該当が複数あれば直近（最新）のものを返す——新しい義務が立った時点で、それより古い義務は
+    役目を終えたとみなす（1つの台帳が複数の未解決の「追加観点」を並行して抱える設計にしない）。
+
+    RV是正3巡目（COD-18 ⑤・`docs/proposals/課題管理簿.md` COD-18）: 回答末尾の定型文・「続き」の
+    継続プロンプトへの注入・`ledger_complete()` の完了判定（`require_continuation_resolved=True`
+    のとき）・退避判断（`force_retain`）の4箇所は、義務の有無・内容をこの関数**だけ**を根拠に
+    判定する契約——以前は「最後の見直し」だけを見ていたため、間に `insufficient`／`added_items`
+    が空の見直しを1回挟むと、直近の義務が（まだ解決していないのに）見えなくなる穴があった。
+    """
+    valid = [r for r in reviews if not validate_review_entry(r)]
+    pending: dict | None = None
+    for review in valid:
+        if pending is not None and review.get("added_items"):
+            pending = None
+        if review.get("verdict") == "mostly_answered" and review.get("extra_perspectives"):
+            pending = review
+    return pending
+
+
+# ---- 見直しの自由記述を表示・プロンプト注入へ出す前の正規化（RV是正）----
+# `extra_perspectives` 等は見直しの自由記述（`validate_review_entry` は長さ・件数の上限だけを
+# 課し、内容の文字種は制約しない）——回答末尾の定型文・「続き」の継続プロンプトへの注入・
+# 調査の記録の Markdown 表示のいずれも、この1つの関数を通してから使う（3箇所で別々の正規化を
+# 持たない＝一箇所を直せば全箇所に効く）。改行・制御文字で表示/プロンプトの構造を乱したり、
+# Markdown の記号で表示崩れを起こしたりする経路を塞ぐ（本文を一切書かない契約を補強する最終防御
+# ではなく、あくまで表示崩れ防止——内容そのものの正当性は `validate_review_entry` が担う）。
+REVIEW_TEXT_PER_ITEM_MAX = 200
+REVIEW_TEXT_TOTAL_MAX = 1000
+# Markdown で特別な意味を持つ記号のうち、表示崩れの原因になりやすいものだけをエスケープする
+# （`-`/`.`/`#` 等の行頭でだけ意味を持つ記号は、この関数の出力が常に文中・ラベルの後ろに置かれる
+# 用途（「- 観点: …」「追加で調べられる観点: …」）のため対象にしない——過剰なエスケープで
+# 可読性を落とさない）。`\` を最初に処理しないと後続のエスケープで二重にバックスラッシュが付く。
+_REVIEW_TEXT_ESCAPE_CHARS = ("\\", "`", "*", "_", "[", "]", "|")
+
+
+def sanitize_review_text(text) -> str:
+    """見直しの自由記述1件を正規化する。改行・制御文字を取り除き（`str.isprintable()`。ASCII
+    空白は printable 扱いのため残る）、`_REVIEW_TEXT_ESCAPE_CHARS` をエスケープし、
+    `REVIEW_TEXT_PER_ITEM_MAX` 文字で切る。非 str・空文字は空文字を返す（純関数・例外を投げない）。
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = "".join(ch for ch in text if ch.isprintable()).strip()
+    for ch in _REVIEW_TEXT_ESCAPE_CHARS:
+        cleaned = cleaned.replace(ch, "\\" + ch)
+    return cleaned[:REVIEW_TEXT_PER_ITEM_MAX]
+
+
+def sanitize_review_text_list(values, *, separator: str = "、") -> str:
+    """`extra_perspectives` 等（str の配列）の各要素を `sanitize_review_text` で正規化してから
+    `separator` で結合し、結合結果全体を `REVIEW_TEXT_TOTAL_MAX` 文字で切る（純関数）。空・非 str
+    の要素は読み飛ばす。回答末尾の定型文・「続き」の継続プロンプトへの注入・調査の記録の
+    Markdown 表示のいずれもこの関数を通す契約（RV是正）。
+    """
+    cleaned = [c for c in (sanitize_review_text(v) for v in (values or [])) if c]
+    return separator.join(cleaned)[:REVIEW_TEXT_TOTAL_MAX]

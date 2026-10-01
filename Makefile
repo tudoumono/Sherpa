@@ -202,8 +202,8 @@ test-inventory:     ## テスト件数表（ディレクトリ別）＋遅い20�
 test-durations:     ## 単体+契約を --durations=20 で実行し遅い20本を表示
 	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/unit tests/contract -q --durations=20
 
-test-db-reset:      ## テスト専用 DB sherpa_test を作り直す（DROP→CREATE・無ければ CREATE のみ）
-	$(PY) scripts/test_db_reset.py
+test-db-reset:      ## テスト専用 DB を作り直す（DROP→CREATE・既定は共有 sherpa_test。DBNAME=sherpa_test_template でひな型を作り直す）
+	$(PY) scripts/test_db_reset.py $(if $(DBNAME),--name $(DBNAME))
 
 api:               ## FastAPI 起動（dev 専用・fixtures フラグ ON＝架空 golden を grep 併用。本番では使わない→serve）
 	./scripts/run-api.sh dev

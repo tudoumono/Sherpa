@@ -10888,7 +10888,7 @@
     },
     "/conversations/{cid}/messages/{message_id}/investigation": {
       "get": {
-        "description": "調査の記録（`investigation_records`・COD-18「調査台帳を回答ごとに残す」提案書）のダウンロード。\n\n会話の所有者のみ（`owns_assistant_message` と同じ判定＝他人の会話・論理削除済み・共有の\n閲覧者（受領共有ラッパーは `origin != 'own'`）はすべて 404・`conversation_rename` と同じ\n「所有会話のみ」の流儀だが、こちらは403との区別をしない＝常に404）。記録が無い\n（台帳を使わない構成・台帳ゲートが走らなかったターン）メッセージも404。\n\n`format=md`（既定）は人が読む Markdown・`format=json` は保存した3つ（manifest/items/\ncoverage）をそのまま返す。ファイル名は固定の一般名（質問文・資料名を含めない・CLAUDE.md\n「実環境の固有名」節と同じ理由）。",
+        "description": "調査の記録（`investigation_records`・COD-18「調査台帳を回答ごとに残す」提案書）のダウンロード。\n\n会話の所有者のみ（`owns_assistant_message` と同じ判定＝他人の会話・論理削除済み・共有の\n閲覧者（受領共有ラッパーは `origin != 'own'`）はすべて 404・`conversation_rename` と同じ\n「所有会話のみ」の流儀だが、こちらは403との区別をしない＝常に404）。記録が無い\n（台帳を使わない構成・台帳ゲートが走らなかったターン）メッセージも404。\n\n`format=md`（既定）は人が読む Markdown・`format=json` は保存した4つ（manifest/items/\ncoverage/reviews＝COD-18 ⑤「中間の見直し」）をそのまま返す。ファイル名は固定の一般名\n（質問文・資料名を含めない・CLAUDE.md「実環境の固有名」節と同じ理由）。",
         "operationId": "conversation_investigation_download_conversations__cid__messages__message_id__investigation_get",
         "parameters": [
           {

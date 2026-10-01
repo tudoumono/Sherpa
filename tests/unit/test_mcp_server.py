@@ -67,6 +67,57 @@ def test_ledger_tools_persist_and_preserve_created_at(tmp_path, monkeypatch):
     assert _ledger_call("ledger_status", {})["missing"] == ["b"]
 
 
+def _review(**changes):
+    return {"purpose": "依頼の目的", "perspectives": ["画面"], "summary": "分かったこと",
+            "added_items": [], "removed_items": [], "verdict": "mostly_answered",
+            "extra_perspectives": [], **changes}
+
+
+def test_ledger_review_put_rejected_before_any_item_terminalizes_then_accepted(tmp_path, monkeypatch):
+    """RV是正（1巡目・順番）: `ledger_review_put` を呼ぶ時点で台帳に終端の item が1件も無ければ
+    書き込まず拒否する（`error: ledger_review_rejected`）。item を終端にしてから呼び直せば
+    受理され、`terminal_count`（サーバが数えて書き足す値）が記録される。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    _ledger_call("ledger_manifest_set", {"question_kind": "list", "items": ["a"]})
+    _ledger_call("ledger_item_put", _ledger_item(status="pending", evidence=[]))
+
+    rejected = _ledger_call("ledger_review_put", _review())
+    assert rejected["error"] == "ledger_review_rejected"
+    assert not (directory / "reviews.jsonl").exists(), "拒否されたのにファイルへ書かれている"
+
+    _ledger_call("ledger_item_put", _ledger_item())   # source_confirmed（既定）＝終端にする
+    accepted = _ledger_call("ledger_review_put", _review())
+    assert accepted == {"ok": True}
+    stored = json.loads((directory / "reviews.jsonl").read_text().splitlines()[0])
+    assert stored["terminal_count"] == 1
+
+
+def test_ledger_review_put_ignores_terminal_items_outside_the_manifest(tmp_path, monkeypatch):
+    """RV是正（2巡目・順番）: `terminal_count` は manifest に登録済みの id の終端だけを数える
+    ——目録に無い item（"b"）が終端でも、登録済みの item（"a"）が非終端のままなら
+    `ledger_review_put` は拒否される。"""
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    _ledger_call("ledger_manifest_set", {"question_kind": "list", "items": ["a"]})
+    _ledger_call("ledger_item_put", _ledger_item("a", status="pending", evidence=[]))
+    # "b" は manifest に登録していない——終端だが目録外。
+    _ledger_call("ledger_item_put", _ledger_item("b"))
+
+    rejected = _ledger_call("ledger_review_put", _review())
+    assert rejected["error"] == "ledger_review_rejected", (
+        "目録外の終端 item だけで ledger_review_put が受理されている（RV是正2巡目 未是正）")
+    assert not (directory / "reviews.jsonl").exists()
+
+    # "a" を manifest に追加登録し、終端にすれば受理される。
+    _ledger_call("ledger_manifest_set", {"question_kind": "list", "items": ["a", "b"]})
+    _ledger_call("ledger_item_put", _ledger_item("a"))   # 終端にする
+    accepted = _ledger_call("ledger_review_put", _review())
+    assert accepted == {"ok": True}
+    stored = json.loads((directory / "reviews.jsonl").read_text().splitlines()[-1])
+    assert stored["terminal_count"] == 2   # 登録済みの a・b がともに終端
+
+
 def test_ledger_status_reports_unsatisfied_invalid_and_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(tmp_path))
     _ledger_call("ledger_manifest_set", {"question_kind": "list", "items": ["a", "bad", "missing"]})
