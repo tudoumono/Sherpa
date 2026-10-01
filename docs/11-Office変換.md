@@ -1,8 +1,8 @@
 # 取り込み: Office/PDF → Markdown 変換（採用方式・改訂）
 
 > **⚠ 2026-06-28 取り込み/範囲は [03-鏡モデル.md](03-鏡モデル.md) が一次情報・移行完了**。
-> `md/{version}`・`src/{version}` の version 別ディレクトリ表記は**登録ディレクトリ（world）配下の1フォルダ木**へ置換済
-> （MD化本文も world 内のパスで doc_id＝rel_path）。矛盾時は [03-鏡モデル.md](03-鏡モデル.md) を優先。
+> `md/{version}`・`src/{version}` の version 別ディレクトリ表記は**登録ディレクトリ（資料フォルダ）配下の1フォルダ木**へ置換済
+> （MD化本文も資料フォルダ内のパスで doc_id＝rel_path）。矛盾時は [03-鏡モデル.md](03-鏡モデル.md) を優先。
 
 > Office も LibreOffice も無い前提で再検討（一次調査＋Codex 相談 job `office2md` で確定）。
 > 方針: **レンダリングに頼らず、OOXML を直接パース → 中間JSON → 決定的に Markdown 化（既定）**。

@@ -208,8 +208,15 @@ def _strip_shared_message(m: dict) -> dict:
         filtered_data = _redact_importance_from_answer_data(data) if isinstance(data, dict) else data
         if isinstance(data, dict) and filtered_data != data:
             needs_copy = True
+        # 調査の記録は会話の持ち主だけが取れる＝受領共有の読者には「記録あり」の旗を見せない
+        # （見せると画面にダウンロードの導線が出て、押すと必ず 404 になる）。
+        inv = a.get("investigation")
+        if isinstance(inv, dict) and "recorded" in inv:
+            needs_copy = True
         if needs_copy:
             new_a = {k: v for k, v in a.items() if k not in _drop}
+            if isinstance(inv, dict) and "recorded" in inv:
+                new_a["investigation"] = {k: v for k, v in inv.items() if k != "recorded"}
             if isinstance(srcs, list):
                 new_a["sources"] = filtered_sources
             if isinstance(sv, list):

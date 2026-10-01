@@ -38,7 +38,7 @@
 - **復旧**: `make up`（起動のみ＝healthy を**待ちません**）→ `make ps` で `healthy` を確認 → `make status`。
   アプリの再起動は不要（接続は都度張るため自然回復）。healthy 待ちまで任せたい場合は `make start`（内蔵の待機つき）。
 - **ボリューム破損の場合**（起動してもすぐ落ちる・pg のログに破損エラー）: 下の「リストア手順」でバックアップから復元。
-- **影響範囲**: PostgreSQL は**一次データ**（会話・文書台帳・world レジストリ・ユーザー/設定・監査ログ）。
+- **影響範囲**: PostgreSQL は**一次データ**（会話・文書台帳・資料フォルダレジストリ・ユーザー/設定・監査ログ）。
   ここだけはバックアップでしか守れません（下の「バックアップ」参照）。
 
 ### S3. Neo4j が停止した
@@ -361,7 +361,7 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 | アプリ（run ログ） | `data/run/api.log` | アプリ全体の標準出力/標準エラー（起動処理・各リクエストの警告以上・uvicorn のアクセスログ等） |
 | Caddy（LAN 公開時のみ） | `data/run/caddy.log` | リバースプロキシ/HTTPS のログ |
 | LibreOffice 変換 | `data/run/libreoffice.log` | 旧形式 Office（.doc/.xls/.ppt）変換の詳細（`legacy_backend`＝libreoffice／office_com 両方。`SHERPA_LOG_DIR` で変更可） |
-| MD 変換（取り込み） | `data/run/convert.log` | 取り込み（world スキャン→MD化→索引）の進行ログの詳細 |
+| MD 変換（取り込み） | `data/run/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
 | LLM 埋め込み | `data/run/embed.log` | ベクトル埋め込み生成（OpenAI/Gemini/Ollama）の詳細 |
 | AI 利用量 | `data/run/usage.log` | LLM 呼び出し1回ごとの kind/provider/model/トークン数/経過秒（`sherpa/metering.py::record`・チャット本回答含む・LOG-UX・2026-09-04） |
 | Codex 実行ログ | `make logs ARGS="codex"`（`data/run/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |

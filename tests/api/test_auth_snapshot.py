@@ -112,6 +112,7 @@ EXPECTED: dict[tuple[str, str], int] = {
     ("DELETE", "/conversations/{cid}"): 401,
     ("POST", "/conversations/{cid}/pin"): 401,
     ("PATCH", "/conversations/{cid}"): 401,
+    ("GET", "/conversations/{cid}/messages/{message_id}/investigation"): 401,
     ("POST", "/troubleshoot/run"): 401,
     ("POST", "/qa/run"): 401,
     ("GET", "/documents/download"): 401,

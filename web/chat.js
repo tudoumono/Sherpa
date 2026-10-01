@@ -53,6 +53,20 @@ $('messages').addEventListener('click', async (e) => {
     const name = dl.textContent.replace(/^📄\s*/, '').split('/').filter(Boolean).pop() || 'download';
     Sherpa.downloadBlob(blob, name);   // UI フィードバック3: revoke タイミング問題を共通ヘルパで回避
   }
+  // COD-18（調査台帳を回答ごとに残す）: href は renderInvestigationRecord では組み立てられない
+  // （answer 自体は会話id/メッセージidを持たない）ため、クリック時に .msg._messageId（feedback と
+  // 同じ置き場・appendAnswer/finalizeAnswer が設定）と S.cid から組み立てる。
+  const idl = e.target.closest('[data-investigation-dl]');
+  if (idl) {
+    e.preventDefault();
+    const msg = idl.closest('.msg');
+    const mid = msg && msg._messageId;
+    if (!mid || !S.cid) return;
+    const r = await fetch(`/conversations/${S.cid}/messages/${mid}/investigation?format=md`);
+    if (!r.ok) { alert('記録を取得できませんでした'); return; }
+    const blob = await r.blob();
+    Sherpa.downloadBlob(blob, 'investigation.md');
+  }
 });
 // #2: 行トグル（role=button）のキーボード操作。実クリック処理へ委譲（ロジック一本化・セレクタは同様に .ilist 内に限定）
 $('messages').addEventListener('keydown', (e) => {
@@ -471,7 +485,7 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
   const names = d.worlds || [];
   const lbls = d.labels || {};
   S.verLabels = {}; names.forEach((n) => { S.verLabels[n] = lbls[n] || n; });
-  // 資料フォルダが1つも登録されていない環境では、資料参照を送っても 404（世界が無い）に
+  // 資料フォルダが1つも登録されていない環境では、資料参照を送っても 404（資料フォルダが無い）に
   // なるだけ＝既定ON（決定2026-09-19）のままだと素の雑談まで壊れる。未登録なら明示OFFへ倒す
   // （Codex構成の kbLocked は setKb 自身が常にONへ上書きするため、ここでは分岐しない）。
   // S.kbForcedOff も立てる——newConversation() が「未確認（読込前/失敗）」と「空で確定」を

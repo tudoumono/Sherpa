@@ -2222,6 +2222,11 @@ class CodexProvider(Provider):
         # と対になる降格適用済みの LedgerSnapshot（§3「確認できなかった項目」節が読む・
         # ゲート確定後に埋める）。
         _investigation_snapshot = None
+        # COD-18（提案書「調査台帳を回答ごとに残す」§1）: `_result` の env とは別項目として
+        # chat_service へ渡す台帳の正規形（manifest/items/coverage）。`env["investigation"]` が
+        # 組み立てられるのと同じ箇所で埋める——ゲートが1度も走らなかったターン（早期 return 済み
+        # 経路）は `None` のまま（chat_service は `None` を「台帳なし」として DB 保存をスキップする）。
+        _investigation_record_payload: dict | None = None
         # COD-16: このターンの開始時点（前ターンの退避台帳の復元直後・まだ何も探していない）で
         # 既に `not_found_in_scope` だった item の id 集合——`apply_unverified_downgrades` は
         # この集合にある id を降格対象から除く（前のターンで確定した項目を、このターンの
@@ -3888,6 +3893,17 @@ class CodexProvider(Provider):
                     }
                     env["limits"] = {**(env.get("limits") or {}),
                                      "ledger_incomplete": not _investigation_verdict.complete}
+                    # COD-18 §1: この時点の台帳の正規形を env とは別項目に積む（本文・path は
+                    # 既に `_investigation_snapshot` 側の検証（`validate_item`）が除外済み——
+                    # `ledger_item_put` が書込時に同じ検証を通しているため、通常は常に正規形。
+                    # `load_coverage` は item ごとの outcome タプルのみ（本文を持たない）。
+                    _investigation_record_payload = {
+                        "complete": _investigation_verdict.complete,
+                        "manifest": _investigation_snapshot.manifest,
+                        "items": dict(_investigation_snapshot.items),
+                        "coverage": {k: list(v) for k, v in
+                                    investigation_ledger.load_coverage(_investigation_dir).items()},
+                    }
                 # §2-3/5: `_schema_on` は構造化 message から見出しを選ぶ（生 JSON をそのまま出さない・
                 # 平文ヒューリスティックへは戻さない）。無効時は現行どおりの選び方（下記）。
                 if _schema_on:
@@ -4394,7 +4410,8 @@ class CodexProvider(Provider):
                 env["headline"] = f"{env['headline']}\n\n{_WALL_CLOCK_LIMIT_NOTE}"
                 env["limits"] = {**(env.get("limits") or {}), "wall_clock_hit": True}
             yield {"type": "answer_delta", "text": env["headline"]}   # Codex は一括→フロントで段階表示
-            yield {"type": "_result", "env": env, "decision": decision}
+            yield {"type": "_result", "env": env, "decision": decision,
+                  "investigation_record": _investigation_record_payload}
         finally:
             # RV 中-1（2026-09-22 2巡目是正）: 台帳の退避・削除が終わるまで会話ロックを保持する。
             # ロックを先に解放すると、同じ会話の「続き」ターンが直後にロックを取得して復元処理

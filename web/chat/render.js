@@ -991,7 +991,8 @@ function answerHTML(answer, trace, feedback) {
     + codexStoppedEarlyNoteHTML(answer)
     + retryHintsHTML(answer.retry_hints) + body
     + refGraphHTML(answer) + renderCreatedFiles(answer.created_files)
-    + renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges) + personalHTML
+    + renderSources(answer.sources, answer.sources_verified, evidencePacketForBadges)
+    + renderInvestigationRecord(answer.investigation) + personalHTML
     + summaryHTML + usageHTML + usageSubHTML
     + '<button class="copybtn" data-copy>⧉ コピー</button><button class="copybtn" data-export>⬇ 書き出し</button>'
     + feedbackHtml;
@@ -1252,5 +1253,15 @@ function renderSources(sources, verifiedDocIds, evidencePacket) {   // 04-画面
       + group('根拠（精読済み）', grounded) + group('参考（ヒットのみ）', reference) + '</div>';
   }
   return `<div class="sources"><div class="h">出典（原本をダウンロード）</div>${sources.map(link).join('')}</div>`;
+}
+// COD-18（調査台帳を回答ごとに残す・提案書）: 台帳の記録が保存された回答にだけ、Markdown の
+// ダウンロード導線を出す（answer.investigation.recorded・サーバ側 provider.py/chat_service.py 参照）。
+// href は実クリック時に data-investigation-dl 委譲ハンドラ（chat.js）が組み立てる（会話id/
+// メッセージidは要素の _messageId・S.cid に頼る＝renderCreatedFiles と違い answer 自体は id を
+// 持たないため、ここでは placeholder のまま出す）。
+function renderInvestigationRecord(investigation) {
+  if (!investigation || !investigation.recorded) return '';
+  return '<div class="sources investigation-record"><div class="h">調査の記録</div>'
+    + '<a href="#" data-investigation-dl>📋 Markdown でダウンロード</a></div>';
 }
 

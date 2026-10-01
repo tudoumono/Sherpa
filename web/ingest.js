@@ -81,7 +81,7 @@ async function register() {
     // 下段（取り込み状況）の行が数秒間隔でポーリングして表示する（`loadStat` 参照）。
     const res = await api('POST', '/worlds', { path, label: label || null });
     $('regmsg').innerHTML = `✓ ${esc(res.note)}`;
-    // ②是正（利用者報告 2026-09-03）: 受付直後は世界行がまだ `GET /worlds` に現れない（背景で
+    // ②是正（利用者報告 2026-09-03）: 受付直後は資料フォルダ行がまだ `GET /worlds` に現れない（背景で
     // 作成中）——`trackNewRegistration` がそれを検出するまで待たせず、受付応答自身が返す
     // `world_id` で楽観的なプレースホルダ行を即時表示する。実際の行（操作ボタン付き）は
     // 行が現れ次第 `reloadAll` の `loadList()` が上書きする（既存の run 追跡機構の範囲内・
@@ -105,9 +105,9 @@ function showOptimisticRegisteredRow(worldId, label, path) {
     + `<span class="spinner spinner-sm"></span><span>取り込み中…（登録処理を開始しています）</span></span></div></div>`;
 }
 
-// 未登録フォルダの新規登録は World 行自体が背景（`worlds.register`）で作られるため、受付直後は
+// 未登録フォルダの新規登録は資料フォルダ行自体が背景（`worlds.register`）で作られるため、受付直後は
 // 通常の /worlds 一覧・status にまだ現れない——行が現れるまでは受付 run（run_id）自身を
-// /ingest/runs で追跡する（既存の run_id は世界行と無関係に検索できる）。行が現れたら通常の
+// /ingest/runs で追跡する（既存の run_id は資料フォルダ行と無関係に検索できる）。行が現れたら通常の
 // reloadAll/loadStat のポーリングへ切り替える。行が現れないまま run が terminal（failed）に
 // 達した場合は登録失敗として表示する（例: 極小窓の同時登録競合）。
 async function trackNewRegistration(worldId, runId) {
@@ -184,7 +184,7 @@ function summaryText(s) {
   if (s.skipped_other) p.push(`除外 ${esc(s.skipped_other)} 件`);
   // 本文が読めない（バイナリ・読み取り失敗・秘匿）ため grep/全文検索/精読のどれからも対象外に
   // したファイル数。`stage_summary.counts`（最新 run の extraction_snapshot 由来）ではなく
-  // `scanned`/`skipped_other` と同じ世界単位のキャッシュ値を使う——無変更の再同期は
+  // `scanned`/`skipped_other` と同じ資料フォルダ単位のキャッシュ値を使う——無変更の再同期は
   // extraction_snapshot を書き換えるだけで scan_report を再実行しないため、run 由来の値だと
   // 無変更後に表示が消えてしまう。`counts_as_of` が無い（未集計・旧形式集計の欠落補完中を含む）
   // ときは件数を出さない——実測でない 0 を「対象外 0 件」と誤解させない（`countsAsOfNote` の
@@ -208,7 +208,7 @@ function summaryText(s) {
 }
 
 // ING-2: 件数の集計時刻＋再集計ボタン（`GET /worlds/{id}/status` はキャッシュを読むだけでフォルダを
-// 歩かない・保存済み集計が無い world は counts_as_of=null＝「未集計」を促す）。
+// 歩かない・保存済み集計が無い資料フォルダは counts_as_of=null＝「未集計」を促す）。
 function countsAsOfNote(s, wid) {
   const at = s.counts_as_of ? `（${esc(Sherpa.fmtDateTime(s.counts_as_of))} 時点）` : '（未集計）';
   return ` <span class="muted" data-countsof="${esc(wid)}">${at}</span>`
@@ -363,7 +363,7 @@ function summaryNote(s, wid) {
   return `<span>${summaryText(s)}</span>${countsNote}${progressNote(s)}${note}${dangerNote}${detail}`;
 }
 // ING-3: 実行中（`running_progress` あり）は行の操作ボタンを無効化する（多重クリックはサーバ側の
-// world 単位の単一実行〔既存 run への合流〕で安全だが、UI 側でも明示的に抑止する）。
+// 資料フォルダ単位の単一実行〔既存 run への合流〕で安全だが、UI 側でも明示的に抑止する）。
 function setIngestBusy(world_id, busy) {
   document.querySelectorAll(`[data-refresh="${world_id}"],`
     + `[data-rag-rules="${world_id}"],[data-del="${world_id}"]`)
@@ -371,11 +371,11 @@ function setIngestBusy(world_id, busy) {
 }
 
 // ING-3b（利用者報告 2026-09-04）: 登録ボタン（`pickbtn`）は上の行ボタンと違い world_id に
-// 紐付かない（登録前は世界がまだ無い）ため、`loadStat` が集計した「実行中の world_id 集合」で
+// 紐付かない（登録前は資料フォルダがまだ無い）ため、`loadStat` が集計した「実行中の world_id 集合」で
 // 管理する——`worlds.register` は登録処理全体（多くの場合 es_index 段を含み数時間かかりうる）を
 // グローバル advisory lock の下で行うため、実行中に別の登録を投げると新規リクエストが完了まで
-// ブロックされてしまう（サーバ側で弾かれず「固まって見える」）。Set のまま（world 単位で複数を
-// 素朴に集計するだけ）にしておき、現行の単一 world 運用が将来複数に広がっても書き直し不要にする。
+// ブロックされてしまう（サーバ側で弾かれず「固まって見える」）。Set のまま（資料フォルダ単位で複数を
+// 素朴に集計するだけ）にしておき、現行の単一資料フォルダ運用が将来複数に広がっても書き直し不要にする。
 const _runningWorldIds = new Set();
 function _updatePickbtnState() {
   const b = $('pickbtn');
@@ -460,7 +460,7 @@ async function recount(world_id) {
   loadStat(world_id);
 }
 
-// ---- 再変換（ING-1・失敗一覧の1件をやり直す＝更新と同じ world 全体 sync が走る）----
+// ---- 再変換（ING-1・失敗一覧の1件をやり直す＝更新と同じ資料フォルダ全体 sync が走る）----
 async function reconvertFile(world_id, rel) {
   if (!confirm(`「${rel}」を再変換します。\n\n更新（今すぐ取り込み直す）と同じ処理が資料フォルダ全体に対して走ります。続けますか？`)) return;
   const el = document.querySelector(`[data-stat="${world_id}"]`);
@@ -850,7 +850,7 @@ async function download(name) {
 }
 
 async function rerun() {
-  // 鏡＝即反映ライブ鏡: world 全体のクリーン rebuild（doc 単位の差分やり直しは無い）。ING-3:
+  // 鏡＝即反映ライブ鏡: 資料フォルダ全体のクリーン rebuild（doc 単位の差分やり直しは無い）。ING-3:
   // 即受付・背景実行のため、他のボタン（更新/削除）と同じ共通 api()＋エラー確認＋reloadAll()へ
   // 統一する（進捗・完了は上段の行ポーリング loadStat が示す）。
   try {

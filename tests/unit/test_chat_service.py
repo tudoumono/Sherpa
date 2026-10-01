@@ -547,6 +547,20 @@ def _fixed_result(headline):
             "decision": {"lens": "qa", "input": "q", "reason": "t"}}
 
 
+def _fixed_result_with_investigation(headline, investigation_record):
+    """COD-18 §1 用: provider が `_result` の別項目として渡す `investigation_record`
+    （`None`＝台帳ゲートが走らなかったターン）付きの `_result`。`env["investigation"]` は provider が
+    実際に組み立てる要約（`complete`/`counts` 等）の最小形を模す——`chat_service._mark_
+    investigation_recorded` はこの dict に `recorded` を足すだけで、台帳の中身自体は混ぜない。"""
+    env = {"headline": headline, "summary": {}, "data": {}, "sources": [],
+          "scope": {"world": "v1", "scope_paths": [], "source": "all"}}
+    if investigation_record is not None:
+        env["investigation"] = {"complete": investigation_record["complete"], "counts": {}}
+    return {"type": "_result", "env": env,
+            "decision": {"lens": "qa", "input": "q", "reason": "t"},
+            "investigation_record": investigation_record}
+
+
 def _fixed_question():
     return {"type": "question", "interaction_id": "q1", "mode": "single",
             "prompt": "確認したいことがあります。",
@@ -623,6 +637,57 @@ def test_stream_message_mock_store_answer_trace_version(monkeypatch):
                            user_id="admin", knowledge=False))
     assert saved[-1]["role"] == "assistant"
     assert saved[-1]["answer"]["trace_version"] == 2
+
+
+def test_handle_message_saves_investigation_record_when_present(monkeypatch):
+    """COD-18 §1: provider が `_result` の別項目として渡した調査台帳は、assistant message 保存の
+    **直後**にその message id で `investigation_records` へ保存を試みる（complete/incomplete の
+    両方＝「調べ終わった・途中の両方」）。`env["investigation"]["recorded"]` は保存前（＝
+    `messages.answer` として一緒に永続化される側）に立つ。台帳の中身（manifest/items/coverage）は
+    `env`（＝`messages.answer`／`messages.trace`）には一切現れない——別項目として渡されるだけ。"""
+    saved_records: list = []
+    monkeypatch.setattr(CS.store_investigation, "save_investigation_record",
+                        lambda message_id, conversation_id, **kw: saved_records.append(
+                            {"message_id": message_id, "conversation_id": conversation_id, **kw}))
+    for complete in (True, False):
+        investigation_record = {"complete": complete,
+                                "manifest": {"question_kind": "qa", "created_at": "t", "items": ["i1"]},
+                                "items": {"i1": {"id": "i1", "subject": "本文っぽい何か"}},
+                                "coverage": {"i1": ["hit"]}}
+        events = [_fixed_result_with_investigation(f"回答(complete={complete})", investigation_record)]
+        monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+        saved = _mock_store_no_db(monkeypatch)
+
+        out = CS.handle_message(None, "台帳つきテスト", world="v1", conversation_id=999,
+                                user_id="admin", knowledge=False)
+        msg = out["message"]
+        assert msg["answer"]["investigation"]["recorded"] is True
+        assert "manifest" not in msg["answer"]["investigation"]   # 本文/台帳の中身は env に混ぜない
+        assert "本文っぽい何か" not in str(msg["answer"])
+        for node in (msg["trace"] or []):
+            assert "manifest" not in node and "items" not in node   # trace にも中身が入らない
+        assert saved[-1] is msg
+
+    assert [r["complete"] for r in saved_records] == [True, False]
+    assert all(r["conversation_id"] == 999 for r in saved_records)
+    assert all(r["manifest"]["question_kind"] == "qa" for r in saved_records)
+    assert all(r["items"]["i1"]["subject"] == "本文っぽい何か" for r in saved_records)
+
+
+def test_handle_message_skips_investigation_save_when_no_ledger(monkeypatch):
+    """`investigation_record is None`（台帳ゲートが走らなかったターン・台帳を使わない構成）は
+    DB 保存を試みず、`env["investigation"]` も（provider が元々キー自体を置かないため）持たない。"""
+    saved = _mock_store_no_db(monkeypatch)
+    save_calls: list = []
+    monkeypatch.setattr(CS.store_investigation, "save_investigation_record",
+                        lambda *a, **k: save_calls.append((a, k)))
+    events = [_fixed_result("台帳なし回答")]   # investigation_record キー自体を持たない（.get→None）
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+
+    out = CS.handle_message(None, "台帳なしテスト", world="v1", conversation_id=999,
+                            user_id="admin", knowledge=False)
+    assert "investigation" not in out["message"]["answer"]
+    assert save_calls == []
 
 
 # ===== A1: 一度個人由来になった会話は、以後 personal=False のターンも個人扱いを維持する =====

@@ -213,6 +213,9 @@ POLICY: dict[tuple[str, str], str] = {
     ("DELETE", "/conversations/{cid}"): "login",
     ("POST", "/conversations/{cid}/pin"): "login",
     ("PATCH", "/conversations/{cid}"): "login",
+    # cid=1・message_id=999999999 は実在しない（_PLACEHOLDERS）＝owns_assistant_message が必ず偽と
+    # なり処理に届く前に404で止まる（DENY_ONLY 不要・/conversations/{wid}/fork と同じ理由）。
+    ("GET", "/conversations/{cid}/messages/{message_id}/investigation"): "login",
     ("POST", "/troubleshoot/run"): "login",
     ("POST", "/qa/run"): "login",
     ("GET", "/documents/download"): "login",
@@ -364,7 +367,8 @@ def test_policy_covers_all_routes():
     assert len(ADMIN_ROUTES) == 42
     assert len(EXT_KEY_ROUTES) == 6
     assert len(SPECIAL_ROUTES) == 7
-    assert len(LOGIN_ROUTES) == 49
+    # login=調査の記録のダウンロード（COD-18・`C-CONV-INVESTIGATION-01`）1件追加で50。
+    assert len(LOGIN_ROUTES) == 50
 
 
 def test_admin_routes_deny_for_anon_and_nonadmin_user():
