@@ -692,9 +692,9 @@ def test_sidecar_missing_fallback_runs_inside_same_lock_as_detection(_stub, monk
 
     orig_missing = office_md.rag_sidecars_missing
 
-    def _missing(wd_, dmd_):
+    def _missing(wd_, dmd_, world=None):
         events.append("detect")
-        return orig_missing(wd_, dmd_)
+        return orig_missing(wd_, dmd_, world=world)
     monkeypatch.setattr(office_md, "rag_sidecars_missing", _missing)
 
     run_seen_lock_active = []

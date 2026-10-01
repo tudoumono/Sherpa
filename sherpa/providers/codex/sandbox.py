@@ -215,8 +215,15 @@ def _kb_read_roots(world: str) -> list:
 
 def _direct_read_roots(world: str, scope_paths=None) -> list:
     """原本直読（Codex がコードインタープリターで直接開く）で permission profile に read を許す
-    絶対パスの一覧＝KB root（`_kb_read_roots`）＋派生ルート（`derived_md_dir`／`derived_rag_dir`・
-    存在するもののみ）。正典＝docs/archive/2026-09-10-Codex原本直読と調査スキル.md §2-1/§2-2。
+    絶対パスの一覧＝KB root（`_kb_read_roots`）＋派生ルート（`derived_md_dir`／`derived_rag_dir`／
+    `archives_dir`・存在するもののみ）。正典＝docs/archive/2026-09-10-Codex原本直読と調査スキル.md
+    §2-1/§2-2。
+
+    `archives_dir`（アーカイブ取り込み・zip/tar(.gz)/tgz の展開先）: 中のファイルの同一性（doc_id）は
+    `<アーカイブ>/<中のパス>`だが、実体は KB root（原本・READ-ONLY）の外、派生領域に置く——他の
+    派生ルートと同じ理由（展開先は原本ではない）でここに明示的に足す（他の派生物
+    （`derived_ir_dir`/`semantic_dir`）同様、黙って範囲を広げない＝このリストに無い派生サブ
+    ディレクトリは読めないまま）。
 
     範囲（scope）の限定は read root を狭めるのではなく、`_scope_deny_entries` が「範囲の経路上に
     ない兄弟（フォルダ・ファイル）」を個別 deny することで実現する——Codex サンドボックス
@@ -226,7 +233,7 @@ def _direct_read_roots(world: str, scope_paths=None) -> list:
     from ... import worlds
 
     roots = list(_kb_read_roots(world))
-    for fn in (worlds.derived_md_dir, worlds.derived_rag_dir):
+    for fn in (worlds.derived_md_dir, worlds.derived_rag_dir, worlds.archives_dir):
         try:
             d = fn(world)
             if d.exists():

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .. import corpus_docs, es_index, scope_infer, store, webhooks, worlds
-from . import failure_reasons, importance, office_md, world_graph, world_graph_service, world_neo4j
+from . import archive_extract, failure_reasons, importance, office_md, world_graph, world_graph_service, world_neo4j
 from .analyzers import registry as analyzer_registry
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
@@ -218,7 +218,7 @@ def _ledger_rows(world: str, *, sig: str | None = None) -> list:
     root = worlds.world_dir(world)
     if not root:
         return []
-    files = list(scope_infer.safe_files(root))
+    files = list(scope_infer.safe_files(root, also=worlds.archives_dir(world)))
     res_map = importance.resolve_for_world(world, root=root, files=files, sig=sig)
     rows = []
     for d in corpus_docs.world_documents(world, root=root, files=files):
@@ -425,6 +425,19 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
 
     store.set_world_sig(world, "")                          # pre-invalidate（ガード無し・fail-closed）
 
+    # アーカイブ取り込み（zip/tar(.gz)/tgz）: 原本には書かず、展開先（`worlds.archives_dir`）を
+    # 原本側のアーカイブ集合と突き合わせて差分同期する（鏡＝更新は置換・削除は展開先ごと消える）。
+    # 以降のグラフ構築・台帳行（`_ledger_rows`）は `scope_infer.safe_files(..., also=worlds.
+    # archives_dir(world))` でこの展開先を合流させるため、それらより**前**に展開を終えておく
+    # 必要がある。展開済みのプレーンテキスト/コード/`.md` は通常どおり台帳・grep・ES・グラフ・
+    # Codex 原本直読に乗る——**展開した Office/PDF の決定的 MD 化はこのスライスでは未配線**（office_md
+    # の変換ループは別途 `wd` を直接歩くため・既知の残課題）。失敗しても取り込み全体は止めない
+    # （アーカイブ側の個別失敗は展開結果サマリへ閉じ込め、台帳の該当行へ反映する・corpus_docs 側の責務）。
+    try:
+        archive_extract.sync_world_archives(world, worlds.world_dir(world))
+    except Exception:
+        _log.warning("アーカイブの展開に失敗しました（取り込み自体は継続）: world=%s", world, exc_info=True)
+
     # 順序: ①Office→決定的MD を先に作る（corpus_docs / ES が Office 項目定義表も参照できる）→
     # ②グラフ構築。
     _progress("office_md", done=0, total=None)
@@ -572,7 +585,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
             wd = worlds.world_dir(world)
             dmd = worlds.derived_md_dir(world)
             if wd and dmd.exists():
-                if office_md.confirm_human_md_es_sig(wd, dmd):
+                if office_md.confirm_human_md_es_sig(wd, dmd, world=world):
                     # マーカー確定に続けて ES 自身の `_meta.human_md_sig` も現行署名へ書き直す
                     # （書き直さないと meta だけ None のまま残り、次回 sync が human_md 次元で
                     # 無駄な reindex を繰り返す・`es_index.confirm_human_md_meta` docstring 参照）。
@@ -862,7 +875,7 @@ def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings
     failure_reason = None
     if not ok:
         failure_reason = esr.get("error") or "unavailable"
-    elif tracked and not office_md.confirm_human_md_es_sig(world_dir, derived_md_dir):
+    elif tracked and not office_md.confirm_human_md_es_sig(world_dir, derived_md_dir, world=world):
         failure_reason = "human_md_es_sig_marker_write_failed"
     elif tracked and not es_index.confirm_human_md_meta(world):
         _log.warning(
@@ -991,14 +1004,14 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
     dmd = worlds.derived_md_dir(world)
     if not wd or not dmd.exists():                      # text/code のみの world は評価対象が無い
         return None, None, None
-    if office_md.rag_sidecars_missing(wd, dmd):          # drift の有無によらず常に確認する
+    if office_md.rag_sidecars_missing(wd, dmd, world=world):   # drift の有無によらず常に確認する
         return "needs_full_run", None, None
     # human_md drift は document_ir/evidence/rag のいずれとも独立（②のみ・rag/ES には触れない）。
     # 排他分岐の外で必ず確認する＝document_ir 等に drift が無くても human_md だけ古ければ拾う。
     human_md_handled = False
     human_md_failure_reason = None                       # 失敗しても以降の drift 判定は続行する（連鎖は独立）
-    if office_md.human_md_sig_drift(wd, dmd):
-        hm_result = office_md.refresh_human_md(wd, dmd)
+    if office_md.human_md_sig_drift(wd, dmd, world=world):
+        hm_result = office_md.refresh_human_md(wd, dmd, world=world)
         failed = hm_result.get("human_md_failed", 0)
         if failed:
             human_md_failure_reason = f"human_md_refresh_failed:{failed}"
@@ -1018,7 +1031,7 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
         return ("handled" if human_md_handled else None), None, None
     document_ir_ok = True                                # document_ir を経由しない経路では常に真のまま
     if document_ir_drift:
-        doc_result = office_md.refresh_document_ir(wd, dmd, write_document_ir_sig_marker=False)
+        doc_result = office_md.refresh_document_ir(wd, dmd, write_document_ir_sig_marker=False, world=world)
         if doc_result.get("error"):                      # 構造的な setup 失敗＝1文書も処理できていない
             _log.warning(
                 "document_ir の軽量再生成に失敗しました（次回 sync で再試行）: world=%s detail=%s",

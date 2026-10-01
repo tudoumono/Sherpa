@@ -229,7 +229,7 @@ def _build_full_view(world: str, status: dict, *, need_files: bool = False) -> d
         nonlocal files, wd_used
         if need_files:
             wd_used = worlds.world_dir(world)
-            files = list(si.safe_files(wd_used)) if wd_used else []
+            files = list(si.safe_files(wd_used, also=worlds.archives_dir(world))) if wd_used else []
             return _build(world, files=files)
         return _build(world)
 
@@ -376,7 +376,8 @@ def build_preview(world: str | None = None) -> dict:
 
     wd = worlds.world_dir(world)
     if wd:
-        files = bundle["files"] if bundle["files"] is not None else list(si.safe_files(wd))
+        files = bundle["files"] if bundle["files"] is not None else list(
+            si.safe_files(wd, also=worlds.archives_dir(world)))
         # `sig`（登録済み world の last_sig・未登録は空文字）を重要度解決へ渡す: `resolve_for_world`
         # は `sig=None` だと `worker.world_signature_of_root(wd)` でメタデータ署名を**もう1回**
         # 全木走査して作ってしまう（`files` を渡していても避けられない別の走査）。`bundle["sig"]`

@@ -17,7 +17,7 @@ from pathlib import Path
 from . import json_io, text_encoding
 from . import scope_infer as si
 from . import worlds
-from .ingest import importance, text_kind
+from .ingest import archive_extract, importance, text_kind
 from .ingest.analyzers import registry as _analyzer_registry
 
 _log = logging.getLogger("sherpa")
@@ -39,6 +39,40 @@ _OFFICE_DOCTYPE = {".docx": "Word", ".doc": "Word(旧)", ".xlsx": "Excel", ".xls
 _IMAGE_DOCTYPE_LABEL = "画像"
 # 内容判定（accepts）が必要だったが読み取れなかった時の明示 doctype。
 _UNREADABLE_DOCTYPE_LABEL = "読み取り不可"
+# アーカイブ取り込み（zip/tar(.gz)/tgz）: アーカイブ自身の台帳1行用 doctype（中のファイルは通常の
+# doctype・branch で別行になる＝`ingest.archive_extract.sync_world_archives` が展開した木を
+# `also=` で合流させる・下の `_archive_row` 参照）。
+_ARCHIVE_DOCTYPE_LABEL = "アーカイブ(zip/tar)"
+
+
+def _archive_row(rel: str, world: str) -> dict:
+    """アーカイブ自身（zip/tar(.gz)/tgz）の台帳1行——`archive_extract.sync_world_archives` が
+    `worlds.archive_manifest_path(world)` へ書いたサマリから組み立てる（展開結果の件数・失敗理由）。
+
+    マニフェストに該当行が無い（取り込みが一度も展開段を通っていない・古い台帳の再走査等）場合は
+    `state="unreadable"`／`reason="archive_pending"`——黙って一覧から消さない。
+    """
+    manifest = json_io.read_json(worlds.archive_manifest_path(world), default={})
+    summary = manifest.get(rel) if isinstance(manifest, dict) else None
+    if not isinstance(summary, dict):
+        return {"name": rel, "path": rel, "doctype": _ARCHIVE_DOCTYPE_LABEL, "branch": "archive",
+               "analyzer": None, "state": "unreadable", "label": "展開待ち", "reason": "archive_pending",
+               "md_path": None, **_scope_meta(rel)}
+    status = summary.get("status")
+    if status == "ok":
+        extracted = summary.get("extracted_count", 0)
+        skipped = (summary.get("skipped_sensitive", 0) + summary.get("skipped_nested", 0)
+                  + summary.get("skipped_traversal", 0) + summary.get("skipped_symlink", 0))
+        label = f"展開済み（{extracted}件" + (f"・対象外{skipped}件" if skipped else "") + "）"
+        return {"name": rel, "path": rel, "doctype": _ARCHIVE_DOCTYPE_LABEL, "branch": "archive",
+               "analyzer": None, "state": "ready", "label": label, "reason": None,
+               "md_path": None, **_scope_meta(rel)}
+    from .ingest.failure_reasons import REASON_CATALOG as _RC
+    reason = summary.get("reason") or "other"
+    label = _RC.get(reason, _RC["other"])["label"]
+    return {"name": rel, "path": rel, "doctype": _ARCHIVE_DOCTYPE_LABEL, "branch": "archive",
+           "analyzer": None, "state": "unreadable", "label": label, "reason": reason,
+           "md_path": None, **_scope_meta(rel)}
 
 
 class _HeadUnreadable(Exception):
@@ -1056,9 +1090,29 @@ def iter_world_documents(world: str, include_rag: bool = False, *, root=None, de
     derived_rag = worlds.derived_rag_dir(world)          # RAG 正本層（§8.1 三階層）
     conv = _office_convertible()                       # OOXML＋（バックエンド有なら）PDF
     image_exts = _image_convertible(conv)              # 画像（OCR 有効時のみ非空・既定は空＝画像は台帳に載らない）
-    entries = files if files is not None else si.safe_files(wd, deadline=deadline)
+    # アーカイブ取り込み: `worlds.archives_dir(world)` は zip/tar(.gz)/tgz の展開先（存在しなければ
+    # `safe_files` が無害に空を返す＝zip/tar の無い world は従来どおり）。展開木の構成がそのまま
+    # doc_id（`<アーカイブの相対パス>/<中のパス>`）になるため、合流後は通常の文書と同じ分類・
+    # MD参照（`derived/(rel+".md")`）がそのまま成立する。
+    entries = files if files is not None else si.safe_files(
+        wd, deadline=deadline, also=worlds.archives_dir(world))
     for rp, rel in entries:
         if importance.is_importance_control_path(rel):  # 重要度設定ファイル自体は文書として扱わない（§5）
+            continue
+        if archive_extract.archive_kind(rel) is not None:
+            # アーカイブ自身（原本ツリー側の zip/tar(.gz)/tgz・展開先 `archives_dir` には同名の
+            # エントリは現れない＝展開先の rel は常に `<アーカイブ>/<中のパス>` で長くなる）は、
+            # 通常の分類（`classify_document`）を経由させない——バイナリとして「黙って見えなくなる」
+            # 既存の2段判定（`text_kind`）に流すと展開結果が一覧から消えるため、専用の1行にする。
+            # 秘匿判定は**この専用1行を作る前**に行う（他の秘匿ファイルと同じ「台帳に一切出さない」
+            # 扱い——`archive_extract.sync_world_archives` が秘匿名のアーカイブを展開しない
+            # ようになっても、原本ツリー側にはそのアーカイブ自身が実在し続けるため、ここで塞がないと
+            # 「展開待ち」等の行として存在だけが漏れる）。
+            if text_kind.is_sensitive_doc_id(rel):
+                _log.warning(
+                    "iter_world_documents: 秘匿名のため対象外にしました（アーカイブ・doctype=対象外）")
+                continue
+            yield _archive_row(rel, world)
             continue
         ext = rp.suffix.lower()
         # コード判定は拡張子だけでなく accepts() まで見て確定する（`resolve_lazy` は既定 accepts

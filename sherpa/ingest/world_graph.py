@@ -437,7 +437,8 @@ def build_world(world_dir, world_id: str, *, files=None):
     除外する＝呼び出し側が渡す `files` には含めてよい・S工事③是正・`preview_service.build_preview`
     参照）。省略時は従来どおりここで直接歩く。
     """
-    entries = files if files is not None else scope_infer.safe_files(world_dir)
+    entries = files if files is not None else scope_infer.safe_files(
+        world_dir, also=worlds.archives_dir(world_id))
     # 秘匿ファイル（.env 系・id_rsa 系・credentials 等＝名前規約を含む）はグラフ取り込みでも読まない。
     # 台帳・grep・精読は classify_document で外れるが、Pass1 は拡張子で候補を引くため別に塞ぐ
     # （上流構成でも `.env.yaml`／`.env.sh` は YAML／shell アナライザの候補になる）。

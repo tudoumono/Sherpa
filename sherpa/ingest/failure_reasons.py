@@ -68,6 +68,21 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
         "label": "バイナリ",
         "advice": "文字として読み取れない形式（バイナリ）のため対象外です。",
     },
+    # アーカイブ取り込み（`ingest.archive_extract`）: zip/tar(.gz)/tgz の展開結果のうち、
+    # 展開自体を行わない3種類（`archive_extract.ArchiveExtractor` の docstring参照）。
+    "archive_encrypted": {
+        "label": "未対応（暗号化）",
+        "advice": "パスワード付き（暗号化）のため中身を取り込めません。パスワードを解除して保存し直してください。",
+    },
+    "archive_nested": {
+        "label": "未対応（入れ子）",
+        "advice": "アーカイブの中に別のアーカイブ（zip/tar）が入っているため、その中身は取り込めません。"
+                  "展開してから登録し直してください。",
+    },
+    "archive_too_large": {
+        "label": "未対応（大きすぎる）",
+        "advice": "展開後の件数またはサイズが大きすぎるため取り込めません。アーカイブを分割してください。",
+    },
     "other": {
         "label": "その他の失敗",
         "advice": "原因を特定できませんでした。管理者にお問い合わせください。",
