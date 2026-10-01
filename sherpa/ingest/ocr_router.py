@@ -20,11 +20,12 @@ from . import evidence_ir
 
 
 OCR_ROUTE_SCHEMA_VERSION = "ocr-route-manifest-v1"
-OCR_ROUTER_PROFILE = "evidence-raster-router-v3"
+OCR_ROUTER_PROFILE = "evidence-raster-router-v4"
 OCR_ROUTE_SIG_MARKER = ".ocr_route_sig"
 ROUTE_STATUSES = frozenset({"selected", "excluded", "failed_binding"})
 RASTER_ELEMENT_TYPES = frozenset({"picture", "image_xobject", "image", "standalone_image", "image_fill"})
 RASTER_ASSET_ROLES = frozenset({"picture_content", "shape_fill"})
+UNSUPPORTED_IMAGE_FORMAT = "unsupported_image_format"
 PAGE_RENDER_PROFILE: dict[str, Any] = {
     "renderer": "pypdfium2",
     "profile": "pdf-page-render-pypdfium2-200dpi-rgb-png-v1",
@@ -35,6 +36,28 @@ PAGE_RENDER_PROFILE: dict[str, Any] = {
 }
 
 _SHA256_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
+_MAGIC_HEAD_BYTES = 16
+
+
+def raster_media_type(head: bytes) -> str | None:
+    """先頭バイトからOCR workerが読めるラスタ形式のmedia typeを返す。読めない形式はNone。
+
+    拡張子やmimetypesの推測は使わない（WMF/EMFなどPillowが開けない形式を判別できない）。
+    OCRに回してよい形式の判定はここ1か所に置く。
+    """
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    if head.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 @dataclass(frozen=True)
@@ -45,6 +68,18 @@ class AssetBinding:
     relative_path: str
     media_type: str
     pixel_size: list[int] | None = None
+    # 先頭バイトで読めるラスタと確認できたか。None=未判定（media_typeで判断する）。
+    raster_readable: bool | None = None
+
+    def is_readable_raster(self) -> bool:
+        if self.raster_readable is not None:
+            return self.raster_readable
+        return (self.media_type or "").split(";")[0].strip().lower() in _READABLE_MEDIA_TYPES
+
+
+_READABLE_MEDIA_TYPES = frozenset({
+    "image/png", "image/jpeg", "image/gif", "image/bmp", "image/tiff", "image/webp",
+})
 
 
 @dataclass(frozen=True)
@@ -149,8 +184,13 @@ def inventory_assets(root: str | Path) -> list[AssetBinding]:
             continue
         digest = _file_sha256(path)
         relative = _safe_relative(path.relative_to(asset_root).as_posix())
-        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        binding = AssetBinding(asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=media_type)
+        with path.open("rb") as stream:
+            sniffed = raster_media_type(stream.read(_MAGIC_HEAD_BYTES))
+        media_type = sniffed or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        binding = AssetBinding(
+            asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=media_type,
+            raster_readable=sniffed is not None,
+        )
         by_hash.setdefault(digest, binding)
     return [by_hash[key] for key in sorted(by_hash)]
 
@@ -228,7 +268,7 @@ def build_manifest(
         relative = _safe_relative(binding.relative_path)
         normalized = AssetBinding(
             asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=binding.media_type,
-            pixel_size=binding.pixel_size,
+            pixel_size=binding.pixel_size, raster_readable=binding.raster_readable,
         )
         existing = bindings.get(digest)
         if existing is None or normalized.relative_path < existing.relative_path:
@@ -279,6 +319,14 @@ def build_manifest(
                     route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",
                     status="failed_binding", reason_code="verified_asset_not_found", priority=_priority(element),
                     asset_sha256=f"sha256:{digest}", detail=detail,
+                ))
+                continue
+            if not binding.is_readable_raster():
+                decisions.append(OCRRouteDecision(
+                    route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",
+                    status="excluded", reason_code=UNSUPPORTED_IMAGE_FORMAT, priority=0,
+                    asset_sha256=binding.asset_sha256, asset_rel_path=binding.relative_path,
+                    media_type=binding.media_type, detail=detail,
                 ))
                 continue
             pixel_size = candidate.get("pixel_size")

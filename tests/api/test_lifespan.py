@@ -1623,13 +1623,14 @@ def test_lifespan_runs_startup_steps_in_order(monkeypatch):
     monkeypatch.setattr(api, "_start_poller", lambda: calls.append("poller"))
     monkeypatch.setattr(api, "_reconcile_orphans", lambda: calls.append("reconcile"))
     monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda: calls.append("sweep"))
+    monkeypatch.setattr(api, "_backfill_turn_metrics_on_startup", lambda: calls.append("turn_metrics_backfill"))
     with TestClient(api.app):
         pass
     assert calls == [
         "schema", "seed_settings", "seed_ollama_url", "confirm_legacy_env_seed", "catchup_ollama_allowlist",
         "seed_openai_endpoint", "seed_depth_profile", "model_catalog_seed", "purge_personal_keys", "warn_change_me", "warn_default_admin", "auth",
         "warn_fixtures", "warn_test_db_isolated", "warn_codex_sandbox", "warn_multi_worker", "warn_browse_roots",
-        "poller", "reconcile", "sweep",
+        "poller", "reconcile", "sweep", "turn_metrics_backfill",
     ]
 
 
@@ -1662,6 +1663,7 @@ def test_lifespan_reattaches_request_id_filter_before_other_startup_steps(monkey
     monkeypatch.setattr(api, "_start_poller", lambda: calls.append("poller"))
     monkeypatch.setattr(api, "_reconcile_orphans", lambda: calls.append("reconcile"))
     monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda: calls.append("sweep"))
+    monkeypatch.setattr(api, "_backfill_turn_metrics_on_startup", lambda: calls.append("turn_metrics_backfill"))
     with TestClient(api.app):
         pass
     assert calls[0] == "attach_request_id_filter"
@@ -1698,13 +1700,14 @@ def test_lifespan_continues_when_schema_init_fails(monkeypatch):
     monkeypatch.setattr(api, "_start_poller", lambda: calls.append("poller"))
     monkeypatch.setattr(api, "_reconcile_orphans", lambda: calls.append("reconcile"))
     monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda: calls.append("sweep"))
+    monkeypatch.setattr(api, "_backfill_turn_metrics_on_startup", lambda: calls.append("turn_metrics_backfill"))
     with TestClient(api.app):
         pass
     assert calls == [
         "seed_settings", "seed_ollama_url", "confirm_legacy_env_seed", "catchup_ollama_allowlist",
         "seed_openai_endpoint", "seed_depth_profile", "model_catalog_seed", "purge_personal_keys", "warn_change_me", "warn_default_admin", "auth",
         "warn_fixtures", "warn_test_db_isolated", "warn_codex_sandbox", "warn_multi_worker", "warn_browse_roots",
-        "poller", "reconcile", "sweep",
+        "poller", "reconcile", "sweep", "turn_metrics_backfill",
     ]
 
 

@@ -176,31 +176,23 @@ def test_compute_round_stats_limits_ignores_unknown_keys_and_malformed_values():
     assert out["by_depth_provider"][0]["limits"] == {}
 
 
-def _claims_row(*, provider="openai", depth_profile="max", claims):
-    return {"provider": provider, "depth_profile": depth_profile, "claims": claims}
+def _claims_row(*, provider="openai", depth_profile="max", unknown_reasons):
+    """`turn_metrics.claims_unknown_reasons`（理由コード→件数・主張を持たないターンは None）。"""
+    return {"provider": provider, "depth_profile": depth_profile, "unknown_reasons": unknown_reasons}
 
 
-def test_compute_final_reason_codes_counts_unknown_claims_only():
-    rows = [
-        _claims_row(claims=[
-            {"status": "confirmed", "reason_code": ""},
-            {"status": "unknown", "reason_code": "budget"},
-            {"status": "unknown", "reason_code": "budget"},
-            {"status": "unknown", "reason_code": "conflict"},
-        ]),
-    ]
+def test_compute_final_reason_codes_sums_unknown_reasons_across_turns():
+    rows = [_claims_row(unknown_reasons={"budget": 2, "conflict": 1}),
+            _claims_row(unknown_reasons={"budget": 1})]
     out = _usage_store._compute_final_reason_codes(rows)
-    assert {"depth_profile": "max", "provider": "openai", "reason_code": "budget", "claims": 2} in out
+    assert {"depth_profile": "max", "provider": "openai", "reason_code": "budget", "claims": 3} in out
     assert {"depth_profile": "max", "provider": "openai", "reason_code": "conflict", "claims": 1} in out
     assert len(out) == 2
 
 
-def test_compute_final_reason_codes_skips_malformed_claims():
-    rows = [_claims_row(claims=[None, "not-a-dict", {"status": "unknown"}, 42]),
-            _claims_row(claims=None)]
-    out = _usage_store._compute_final_reason_codes(rows)
-    # 理由コード欠落（キー自体が無い）は "unknown" へ畳み込む。
-    assert out == [{"depth_profile": "max", "provider": "openai", "reason_code": "unknown", "claims": 1}]
+def test_compute_final_reason_codes_turn_without_unknown_claims_adds_nothing():
+    rows = [_claims_row(unknown_reasons={}), _claims_row(unknown_reasons=None)]
+    assert _usage_store._compute_final_reason_codes(rows) == []
 
 
 def test_compute_final_reason_codes_empty_input():
@@ -212,20 +204,20 @@ def test_compute_final_reason_codes_empty_input():
 
 def _gate_row(*, provider="codex", depth_profile="standard", gate_missing_codes):
     return {"provider": provider, "depth_profile": depth_profile,
-            "claims": [], "gate_missing_codes": gate_missing_codes}
+            "unknown_reasons": {}, "gate_missing_codes": gate_missing_codes}
 
 
 def test_compute_final_missing_codes_counts_by_depth_provider():
-    rows = [_gate_row(gate_missing_codes=["spec_missing", "spec_missing"]),
-            _gate_row(gate_missing_codes=["log_missing"])]
+    rows = [_gate_row(gate_missing_codes={"spec_missing": 2}),
+            _gate_row(gate_missing_codes={"log_missing": 1})]
     out = _usage_store._compute_final_missing_codes(rows)
     assert out == {("standard", "codex"): {"spec_missing": 2, "log_missing": 1}}
 
 
-def test_compute_final_missing_codes_skips_non_list_or_api_rows():
-    """API 経路の行にはこのキー自体が無い（NULL）——非配列は静かにスキップする。"""
+def test_compute_final_missing_codes_skips_null_or_api_rows():
+    """API 経路の行にはこのキー自体が無い（NULL）——静かにスキップする。"""
     rows = [_gate_row(gate_missing_codes=None), {"provider": "openai", "depth_profile": "deep",
-                                                 "claims": [], "gate_missing_codes": None}]
+                                                 "unknown_reasons": {}, "gate_missing_codes": None}]
     assert _usage_store._compute_final_missing_codes(rows) == {}
 
 
@@ -234,7 +226,7 @@ def test_merge_final_missing_codes_adds_new_bucket_for_codex_only_depth():
     無い——新規バケットとして `by_depth_provider` へ追加し、既存の表示（`missing_codes` 列）に
     経路別で載る。巡別指標（`rounds` 等）は0のまま。"""
     rounds_stats = _usage_store._compute_round_stats([])
-    rows = [_gate_row(depth_profile="standard", gate_missing_codes=["callgraph_missing"])]
+    rows = [_gate_row(depth_profile="standard", gate_missing_codes={"callgraph_missing": 1})]
     _usage_store._merge_final_missing_codes(rounds_stats, rows)
     bucket = next(b for b in rounds_stats["by_depth_provider"]
                  if (b["depth_profile"], b["provider"]) == ("standard", "codex"))
@@ -248,7 +240,7 @@ def test_merge_final_missing_codes_merges_into_existing_bucket():
     round_rows = [_round_row(provider="codex", depth_profile="standard",
                              meta={"round": 1, "missing_codes": ["spec_missing"]})]
     rounds_stats = _usage_store._compute_round_stats(round_rows)
-    rows = [_gate_row(depth_profile="standard", gate_missing_codes=["spec_missing"])]
+    rows = [_gate_row(depth_profile="standard", gate_missing_codes={"spec_missing": 1})]
     _usage_store._merge_final_missing_codes(rounds_stats, rows)
     bucket = next(b for b in rounds_stats["by_depth_provider"]
                  if (b["depth_profile"], b["provider"]) == ("standard", "codex"))

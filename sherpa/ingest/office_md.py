@@ -725,7 +725,9 @@ _EVIDENCE_IR_SIG_MARKER = ".evidence_ir_sig"
 
 def _current_evidence_ir_sig() -> str:
     """現在のEvidence IR契約、parser profile、通常生成対象の抽出器版の署名。"""
-    from . import evidence_ir, evidence_spike, excel_display, legacy_provenance, office_native_display, raster_evidence
+    from . import (
+        evidence_ir, evidence_spike, excel_display, legacy_provenance, office_native_display, raster_evidence,
+    )
     from .arms import ooxml_arm
 
     return (f"schema={evidence_ir.EVIDENCE_IR_SCHEMA_VERSION};"
@@ -1167,6 +1169,59 @@ def ocr_enabled() -> bool:
     if raw is None or not raw.strip():
         return True
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def write_ocr_route_sig_marker(dr) -> None:
+    """`.ocr_route_sig` を確定する。OCR refresh の enqueue が成功した後にだけ呼ぶこと
+    （先に確定すると enqueue 失敗時に次回 sync が再試行の入口を失う）。"""
+    dr = Path(dr)
+    from . import ocr_router
+    try:
+        (dr / ocr_router.OCR_ROUTE_SIG_MARKER).write_text(ocr_router.ocr_route_sig_value() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ocr_route_refresh_needed(derived) -> bool:
+    """公開中のルート（`.ocr_route.json`）が現行のルート版で作られていなければ True（OCR 有効時のみ）。"""
+    from . import ocr_router
+    return ocr_enabled() and ocr_router.ocr_route_sig_drift(derived)
+
+
+def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
+    """ルート版が古い／欠けている `.ocr_route.json` だけを、公開中の Evidence と assets から作り直す。
+
+    あわせて全ルートについて、「読めない画像形式」として対象外の入力に残っている過去の
+    queued/failed job を cancelled へ終端する（refresh run の進み具合に依存させない）。
+    Evidence・rag.md・ES には触れない（ルートの分類規則だけが変わった時の軽量経路）。
+    マーカー（`.ocr_route_sig`）はここでは確定しない（呼び出し元が全件成功を確認して確定）。
+    """
+    from . import evidence_ir, ocr_router
+    from ..store import ocr_jobs
+
+    dr = Path(derived)
+    dr_ir = _sibling_layer_dir(dr, "ir")
+    dr_rag = _sibling_layer_dir(dr, "rag")
+    rewritten = failed = 0
+    for evidence_path in sorted(dr_ir.rglob("*.evidence.json")):
+        rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(".evidence.json")]
+        route_path = dr_ir / f"{rel}.ocr_route.json"
+        try:
+            raw = route_path.read_text(encoding="utf-8") if route_path.is_file() else None
+            if raw is None or json.loads(raw).get("router_profile") != ocr_router.OCR_ROUTER_PROFILE:
+                ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
+                assets = ocr_router.inventory_assets(dr_rag / f"{rel}.assets")
+                manifest = ocr_router.build_manifest(ir, source_rel_path=rel, assets=assets)
+                ocr_router.write_json_atomic(route_path, manifest)
+                rewritten += 1
+            else:
+                manifest = ocr_router.from_json_str(raw)
+            ocr_jobs.cancel_unsupported_routes(
+                world, generation_id, rel, ocr_jobs.unsupported_route_ids(manifest))
+        except Exception:
+            failed += 1
+            _log.warning("OCRルートの書き直し/終端に失敗しました（次回 sync で再試行）: %s", rel, exc_info=True)
+    return {"ocr_routes_rewritten": rewritten, "ocr_routes_failed": failed}
 
 
 def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:

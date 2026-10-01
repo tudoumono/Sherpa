@@ -114,6 +114,34 @@ def enqueue_job(
         ).fetchone()
 
 
+def unsupported_route_ids(manifest: Any) -> list[str]:
+    """manifest のうち「読めない画像形式」として対象外になった入力の route_input_id。"""
+    return [
+        decision.route_input_id for decision in manifest.decisions
+        if decision.status == "excluded" and decision.reason_code == "unsupported_image_format"
+    ]
+
+
+def cancel_unsupported_routes(
+    world: str, canonical_generation_id: str, source_rel_path: str, route_input_ids: list[str],
+) -> int:
+    """読めない画像形式になった入力の過去の queued/failed job を cancelled へ終端する（leased は触らない）。"""
+    if not route_input_ids:
+        return 0
+    generation = _generation_id(canonical_generation_id)
+    _ensure()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE ocr_jobs SET status='cancelled', lease_owner=NULL, lease_token=NULL, "
+            "lease_expires_at=NULL, error_code='unsupported_image_format', "
+            "error_detail='image format is not readable', updated_at=now(), finished_at=now() "
+            "WHERE world=%s AND canonical_generation_id=%s AND source_rel_path=%s "
+            "AND route_input_id = ANY(%s) AND status IN ('queued','failed')",
+            (world, generation, _relative_path(source_rel_path), list(route_input_ids)),
+        )
+        return int(cursor.rowcount)
+
+
 def enqueue_manifest_jobs(
     world: str,
     manifest: Any,
@@ -122,7 +150,15 @@ def enqueue_manifest_jobs(
     engine_profile_hash: str,
     max_attempts: int = 3,
 ) -> list[dict]:
-    """OCRRouteManifestのselected入力だけを冪等enqueueする。"""
+    """OCRRouteManifestのselected入力だけを冪等enqueueする。
+
+    読めない画像形式（``unsupported_image_format``）として対象外になった入力に、過去のルートで
+    作られた queued/failed の job が残っていれば cancelled へ終端する（失敗として数え続けない）。
+    実行中（leased）の行は触らない。
+    """
+    unsupported_ids = unsupported_route_ids(manifest)
+    if unsupported_ids:
+        cancel_unsupported_routes(world, canonical_generation_id, manifest.source_rel_path, unsupported_ids)
     jobs = []
     for decision in manifest.decisions:
         if decision.status != "selected":
@@ -403,6 +439,19 @@ def fail_job(
             "WHERE id=%s AND status='leased' AND lease_token=%s AND lease_expires_at>now() RETURNING *",
             (retryable, retryable, retry_delay_seconds, error_code.strip(), error_detail,
              retryable, job_id, lease_token),
+        ).fetchone()
+
+
+def cancel_unsupported_image_job(job_id: int, lease_token: str) -> dict | None:
+    """読めない画像形式の job を、lease を確認した上で cancelled に終端する（失敗には数えない）。"""
+    _ensure()
+    with _connect() as connection:
+        return connection.execute(
+            "UPDATE ocr_jobs SET status='cancelled', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, "
+            "error_code='unsupported_image_format', error_detail='image format is not readable', "
+            "updated_at=now(), finished_at=now() "
+            "WHERE id=%s AND status='leased' AND lease_token=%s AND lease_expires_at>now() RETURNING *",
+            (job_id, lease_token),
         ).fetchone()
 
 

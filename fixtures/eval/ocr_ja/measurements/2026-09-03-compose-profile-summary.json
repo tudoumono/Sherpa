@@ -6,8 +6,8 @@
  "profile": "ocr",
  "environment_file_loaded": false,
  "note": "O2（RV是正）: 2026-08-16実測の再実測。前回はrequirements.txt/constraints.txt/docker-compose.ymlを丸ごとハッシュしていたため、性能台帳#17 QW2（psycopg_poolの core requirements.txt 追加）のようなOCR無関係な依存追加でも赤くなっていた。束縛を絞り込み（compute_ocr_implementation_bindingを参照）、psycopg関連行とocr-workerサービス定義のみを対象にした上で、67d3b4a8（O1: OCR観測をrag.mdへ統合）とbac1d024/722c139e（QW2: PGプール化）を反映した現行実装に対して再測定した。単発のmount/network静的チェックだけでなく、raster_evidence→ocr_router.build_manifest→ocr_jobs.enqueue_manifest_jobsで実際にjobを積み、隔離ワーカー（起動中コンテナ）に実PaddleOCR推論をさせてrag_observation_chunksが得られること（『廃止』の実認識）まで確認した。",
- "files_updated_at": "2026-09-09T00:00:00Z",
- "files_updated_note": "CLEAN-2 item a/e: `implementation.files` のみを機械的に更新した（フル O2 手順の再実測ではない）。(1) item a で `sherpa/ingest/observation_render.py` から検索専用描画（Markdown/chunk JSONL 生成）を撤去し、`.ai_observations.jsonl`（office_md._load_ocr_observation_sets が読む Observation Set 本体）の永続化・世代管理だけを残した＝ファイル内容が変わったためハッシュ更新。(2) item e で `sherpa/store/db.py` の束縛を全文ハッシュから `sherpa/store/db.py:ocr-relevant`（`world_lock`/`_connect`/`_ensure`/PG プール一式・OCR関連テーブルのDDLだけを抽出）へ絞り込んだ＝会話/監査等の無関係テーブル変更で赤くならないようにする是正（`compute_ocr_implementation_binding`/`_db_ocr_relevant_source` 参照）。Dockerfile/docker-compose.yml/requirements-ocr.txt/constraints-ocr.txt/ocr-models.lock.json はいずれも無変更のため、`image`/`runtime`/`mount_checks`/`network_checks`/`image_inventory`（`python_package_inventory_sha256` 等）の実測値はこの更新の対象外＝直前の実測（2026-09-02T23:57:30Z・上記 note 参照）をそのまま維持する。フルの隔離 compose 実行による再実測（image.id の更新等）は本レーンのスコープ外として次回に持ち越す。 ／ 2026-09-09: `sherpa/ingest/ocr_worker.py` のハッシュのみ更新（秘匿名の原本＝text_kind.is_sensitive_doc_id を run_once・run_refresh_once・再公開 records() の各入口で読み取り前に除外する是正）。エンジン profile・画像・compose・依存は無変更＝image/runtime/mount_checks/network_checks/image_inventory の実測値は 2026-09-02T23:57:30Z のまま維持。フル再実測は次回に持ち越す（前例 CLEAN-2 と同じ扱い）。",
+ "files_updated_at": "2026-10-02T00:00:00Z",
+ "files_updated_note": "CLEAN-2 item a/e: `implementation.files` のみを機械的に更新した（フル O2 手順の再実測ではない）。(1) item a で `sherpa/ingest/observation_render.py` から検索専用描画（Markdown/chunk JSONL 生成）を撤去し、`.ai_observations.jsonl`（office_md._load_ocr_observation_sets が読む Observation Set 本体）の永続化・世代管理だけを残した＝ファイル内容が変わったためハッシュ更新。(2) item e で `sherpa/store/db.py` の束縛を全文ハッシュから `sherpa/store/db.py:ocr-relevant`（`world_lock`/`_connect`/`_ensure`/PG プール一式・OCR関連テーブルのDDLだけを抽出）へ絞り込んだ＝会話/監査等の無関係テーブル変更で赤くならないようにする是正（`compute_ocr_implementation_binding`/`_db_ocr_relevant_source` 参照）。Dockerfile/docker-compose.yml/requirements-ocr.txt/constraints-ocr.txt/ocr-models.lock.json はいずれも無変更のため、`image`/`runtime`/`mount_checks`/`network_checks`/`image_inventory`（`python_package_inventory_sha256` 等）の実測値はこの更新の対象外＝直前の実測（2026-09-02T23:57:30Z・上記 note 参照）をそのまま維持する。フルの隔離 compose 実行による再実測（image.id の更新等）は本レーンのスコープ外として次回に持ち越す。 ／ 2026-09-09: `sherpa/ingest/ocr_worker.py` のハッシュのみ更新（秘匿名の原本＝text_kind.is_sensitive_doc_id を run_once・run_refresh_once・再公開 records() の各入口で読み取り前に除外する是正）。エンジン profile・画像・compose・依存は無変更＝image/runtime/mount_checks/network_checks/image_inventory の実測値は 2026-09-02T23:57:30Z のまま維持。フル再実測は次回に持ち越す（前例 CLEAN-2 と同じ扱い）。 ／ 2026-10-02: `ocr_router.py`・`ocr_worker.py` のハッシュのみ更新（読めない画像形式＝WMF/EMF 等を先頭バイトで判定し、ルートで対象外として記録・worker は再試行しない別コードで終える是正）。エンジン profile・画像・compose・依存は無変更＝実測値は維持。 ocr_jobs.py のハッシュも更新（読めない画像形式として対象外になった入力の過去の job を cancelled へ終端する是正・同じく実測値は維持）。ocr_router_profile を v4 へ更新（測定の入力は PNG 1 枚のみで WMF/EMF を含まないため、v4 でも選ばれる入力は同じ）。 ocr_worker.py・ocr_jobs.py のハッシュを再更新（読めない画像形式の job を lease 確認つきで cancelled へ終端する是正・実測値は維持）。 ocr_jobs.py のハッシュを再更新（過去 job の終端を store 関数 cancel_unsupported_routes に切り出し sync から直接呼ぶ是正・実測値は維持）。",
  "input": {
   "kind": "synthetic_fixture",
   "source": "fixtures/eval/excel_ja/assets/廃止スタンプ.png",
@@ -51,7 +51,7 @@
  "implementation": {
   "git_head_before_commit": "67d3b4a81d0d7bde154c7142e8c61b8604009552",
   "engine_profile_hash": "sha256:c897791f09dc29f9010c36e30d784e719d100bc040774e049bfa1b9e6e9a1435",
-  "ocr_router_profile": "evidence-raster-router-v3",
+  "ocr_router_profile": "evidence-raster-router-v4",
   "binding_scope": "compute_ocr_implementation_binding()（tests/contract/test_ocr_observation_contract.py）が定義する、OCR worker の実行に効くファイル集合のみ（2026-09-03 に requirements.txt 等の丸ごとハッシュから絞り込み・理由は上の note を参照）。",
   "files": {
    "docker/ocr/Dockerfile": "6dd5ddffc57de9122e3e192e77c181b7f5bce089d0e7c839a1c1a7e3df93dc9f",
@@ -59,10 +59,10 @@
    "constraints-ocr.txt": "b3d32ad9ed2018402ca7f2f9b46897ca97243921b99a1ed663bb827ae25063bb",
    "docker/ocr-models.lock.json": "4c44f3b17c59b1407078542884cfb931a35b30640306f3897b8d6acd729a518e",
    "sherpa/ingest/ai_observation.py": "d0cffce492b9057c239ad17b2460d18d6e32f0267e7c3b6bf9a0df48377bf104",
-   "sherpa/ingest/ocr_worker.py": "61da986a9666c0f81fb854f13c028effb011c258e3ed0eb33880eb679fe01d16",
-   "sherpa/ingest/ocr_router.py": "19bd4ffa3ba30ec6986cacf47d591715c4a2ce63352b69658305eb19ba35cecc",
+   "sherpa/ingest/ocr_worker.py": "89772a8b541411d121bdb90d929820a237c23e0b20518b52e781e7a45fab9faf",
+   "sherpa/ingest/ocr_router.py": "dd26eee5452dda0276e4599c77d1f9313c0fe2e73416b47a9b827aa5245be676",
    "sherpa/ingest/observation_render.py": "5e228db253c580e13047387c9e0796aff3754d49f11295a20e324bc1a596aefc",
-   "sherpa/store/ocr_jobs.py": "8043dac5c9307c59475343eebdb9bf14446c8a0cd407e241852c0d733c70a910",
+   "sherpa/store/ocr_jobs.py": "bae5fb7f34e7fb12c94182eec8c2bba07c63f3c47b4cf8f6491dc2e2b41dcaac",
    "sherpa/store/db.py:ocr-relevant": "b3980df2bcd4cddb712abb4de2dad103424a6d9bf3139b955a660522e47a8a9d",
    "requirements.txt+constraints.txt:psycopg-lines": "b8d7d98a99031315f6df04b4f349c609fdc95c223d70a79b4e7eea80b13348e7",
    "docker-compose.yml:services.ocr-worker+networks": "4e27ba3424822bba8ed1058d15e7aea117e7c8e7616190589184e6f2f34c94ff"

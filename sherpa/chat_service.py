@@ -1485,6 +1485,7 @@ def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
     - 検索は personal_workspace_files 台帳上の status='uploaded' ファイルのみ（FS 残骸を拒否）。
     - base は users_dir / uid / workspace / files に閉じ込める（symlink・パストラバーサル拒否）。
     - ES/Neo4j・共有 KB には一切触れない。他ユーザーの uid は引数で分離されているので越境不可。
+    - 秘匿名（`text_kind.is_sensitive_doc_id`）のファイルは読まない。
     """
     if not query or not query.strip():
         return []
@@ -1511,6 +1512,9 @@ def _personal_grep_hits(user_id: str, query: str, users_dir: str) -> list[dict]:
         if not target.is_file():
             continue
         if target.suffix.lower() not in _PERSONAL_SEARCHABLE_EXT:
+            continue
+        # 秘匿名のファイルは本文を推論へ渡さない（共有 KB と同じ判定）。
+        if text_kind.is_sensitive_doc_id(rel_path):
             continue
         try:
             raw_bytes = target.read_bytes()

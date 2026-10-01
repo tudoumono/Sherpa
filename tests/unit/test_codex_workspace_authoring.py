@@ -1899,6 +1899,22 @@ def test_personal_grep_hits_own_file(tmp_path):
     assert hits[0]["source"] == "個人ファイル内ヒット"
 
 
+def test_personal_grep_hits_skips_sensitive_names(tmp_path):
+    """秘匿名の個人ファイルは検索可能な拡張子でもヒットに出さない（本文を推論へ渡さない）。"""
+    from sherpa.chat_service import _personal_grep_hits
+    from unittest.mock import patch
+
+    uid = "testuser_sens"
+    files_dir = tmp_path / uid / "workspace" / "files"
+    files_dir.mkdir(parents=True)
+    (files_dir / "credentials.csv").write_text("API_TOKEN,abc\n", encoding="utf-8")
+    (files_dir / "memo.csv").write_text("API_TOKEN,memo\n", encoding="utf-8")
+    with patch("sherpa.store.live_workspace_rel_paths", return_value={"credentials.csv", "memo.csv"}):
+        hits = _personal_grep_hits(uid, "API_TOKEN", str(tmp_path))
+
+    assert [h["rel_path"] for h in hits] == ["memo.csv"]
+
+
 def test_personal_grep_hits_cross_user_isolation(tmp_path):
     """user_a のファイルは user_b の grep に出ない（越境不可）。"""
     from sherpa.chat_service import _personal_grep_hits

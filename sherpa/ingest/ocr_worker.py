@@ -234,6 +234,11 @@ class OCRBindingError(OCRWorkerError):
     retryable = False
 
 
+class OCRUnsupportedImageError(OCRWorkerError):
+    error_code = ocr_router.UNSUPPORTED_IMAGE_FORMAT
+    retryable = False
+
+
 class OCRInferenceProcessError(OCRWorkerError):
     error_code = "engine_process_failed"
     retryable = True
@@ -580,9 +585,12 @@ def _read_bytes(path: Path, *, on_progress: Callable[[], None] | None = None) ->
 
 
 def _image_size(raw: bytes) -> list[int]:
-    from PIL import Image
-    with Image.open(io.BytesIO(raw)) as image:
-        return [image.width, image.height]
+    from PIL import Image, UnidentifiedImageError
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            return [image.width, image.height]
+    except UnidentifiedImageError as exc:
+        raise OCRUnsupportedImageError("image format is not readable") from exc
 
 
 def _safe_asset(asset_root: Path, relative_path: str) -> Path:
@@ -690,6 +698,8 @@ def prepare_input(
         raw = _read_bytes(_safe_asset(asset_root, decision.asset_rel_path), on_progress=on_progress)
         if _sha256_bytes(raw) != decision.asset_sha256:
             raise OCRBindingError("asset hash mismatch")
+        if ocr_router.raster_media_type(raw[:16]) is None:
+            raise OCRUnsupportedImageError("image format is not readable")
         return PreparedOCRInput(
             image_bytes=raw, asset_sha256=decision.asset_sha256, media_type=decision.media_type,
             pixel_size=decision.pixel_size or _image_size(raw), input_kind="asset", render_profile=None,
@@ -961,6 +971,14 @@ def run_once(
             retry_delay_seconds=0,
         )
         return WorkerResult(status="stopping", job_id=job_id, error_code=exc.error_code)
+    except OCRUnsupportedImageError as exc:
+        cancelled = ocr_jobs.cancel_unsupported_image_job(job_id, lease_token)
+        if cancelled is not None:
+            try:
+                _publish_terminal_generation(cancelled, publish_observation, None)
+            except Exception:
+                pass
+        return WorkerResult(status="cancelled", job_id=job_id, error_code=exc.error_code)
     except OCRWorkerError as exc:
         failed = ocr_jobs.fail_job(
             job_id, lease_token, error_code=exc.error_code, error_detail=str(exc), retryable=exc.retryable,

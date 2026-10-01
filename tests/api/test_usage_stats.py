@@ -35,7 +35,7 @@ def _mk_user(uid: str, password: str, role: str = "user") -> None:
 def _turn(cid: int, user_text: str, *, lens: str | None, personal: bool = False, assistant_personal: bool | None = None):
     """1ターン（user→assistant）を追加する。assistant_personal 省略時は user と同じ扱い。"""
     store.add_message(cid, "user", user_text, personal=personal)
-    store.add_message(cid, "assistant", f"({lens})への回答", lens=lens,
+    store.add_message(cid, "assistant", f"({lens})への回答", lens=lens, answer={},
                       personal=personal if assistant_personal is None else assistant_personal)
 
 
@@ -447,8 +447,8 @@ def test_usage_stats_lens_only_counts_first_assistant_reply_per_turn():
 
     conv = store.create_conversation(user_id=uid, world=f"multiworld{sfx}")
     store.add_message(conv["id"], "user", "1つの質問")
-    store.add_message(conv["id"], "assistant", "最初の返答", lens="impact")
-    store.add_message(conv["id"], "assistant", "2件目の返答（同じターン扱いのはず）", lens="qa")
+    store.add_message(conv["id"], "assistant", "最初の返答", lens="impact", answer={})
+    store.add_message(conv["id"], "assistant", "2件目の返答（同じターン扱いのはず）", lens="qa", answer={})
 
     r = admin.get("/admin/usage/stats?days=30")
     row = next(u for u in r.json()["users"] if u["uid"] == uid)
@@ -804,8 +804,8 @@ def test_usage_stats_stop_kind_folds_out_of_vocabulary_values_into_unknown():
     reply = store.add_message(conv["id"], "assistant", "(qa)への回答", lens="qa",
                               answer={"stop_kind": "completed"})
     with psycopg.connect(store._dsn()) as c:
-        c.execute("UPDATE messages SET answer = jsonb_set(answer, '{stop_kind}', "
-                  "'\"not_a_real_stop_kind\"') WHERE id=%s", (reply["id"],))
+        c.execute("UPDATE turn_metrics SET stop_kind='not_a_real_stop_kind' WHERE message_id=%s",
+                  (reply["id"],))
 
     after = _stop_kinds_map()
     assert after.get("not_a_real_stop_kind", 0) - before.get("not_a_real_stop_kind", 0) == 0, (
@@ -1423,10 +1423,10 @@ def test_usage_stats_period_prefilter_does_not_leak_orphan_reply_across_boundary
     # 期間の直前に発言した「古いターン」（期間外＝出力から除外されるべき）。
     stale_user = store.add_message(conv["id"], "user", "期間直前の質問")
     # その assistant 返信が境界を跨いで期間直後に生成された想定（絞り込み後も残る孤立行）。
-    stale_reply = store.add_message(conv["id"], "assistant", "遅れて生成された返信", lens="qa")
+    stale_reply = store.add_message(conv["id"], "assistant", "遅れて生成された返信", lens="qa", answer={})
     # 期間内の正規ターン。
     fresh_user = store.add_message(conv["id"], "user", "期間内の質問")
-    fresh_reply = store.add_message(conv["id"], "assistant", "正しい返信", lens="impact")
+    fresh_reply = store.add_message(conv["id"], "assistant", "正しい返信", lens="impact", answer={})
 
     with psycopg.connect(store._dsn()) as c:
         c.execute("UPDATE messages SET created_at = (%s || ' 00:00:00+09:00')::timestamptz - interval '1 second' "

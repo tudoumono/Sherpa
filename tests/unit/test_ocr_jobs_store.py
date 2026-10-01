@@ -375,3 +375,62 @@ def test_iter_succeeded_results_orders_by_c_collation_not_locale_collation(tmp_p
         assert result["artifact_count"] == 2
     finally:
         ocr_jobs.purge_world(world)
+
+
+def test_unsupported_image_route_cancels_old_failed_job_but_not_leased():
+    """読めない画像形式として対象外になったルートの過去の failed/queued job は cancelled に終端し、
+    実行中（leased）の行は触らない。status_summary では failed ではなく cancelled に数える。"""
+    from sherpa.ingest import ocr_router
+
+    _try_init_real_postgres()
+    world = "test-ocr-unsupported-" + uuid.uuid4().hex
+    generation = "a" * 64
+    profile = "sha256:" + "e" * 64
+    try:
+        def decision(route_id: str, status: str, reason: str) -> ocr_router.OCRRouteDecision:
+            return ocr_router.OCRRouteDecision(
+                route_input_id=route_id, target_evidence_id="e-" + route_id, input_kind="asset",
+                status=status, reason_code=reason, priority=1,
+                asset_sha256="sha256:" + "f" * 64, asset_rel_path="a.wmf", media_type="image/x-wmf",
+            )
+
+        def manifest(*decisions: ocr_router.OCRRouteDecision) -> ocr_router.OCRRouteManifest:
+            return ocr_router.OCRRouteManifest(
+                schema_version=ocr_router.OCR_ROUTE_SCHEMA_VERSION,
+                router_profile=ocr_router.OCR_ROUTER_PROFILE,
+                source_rel_path="doc/old.xls", source_content_hash="sha256:" + "b" * 64,
+                decisions=list(decisions), route_manifest_hash="sha256:" + "c" * 64,
+            )
+
+        old = manifest(*(decision(f"r{i}", "selected", "evidence_raster_asset") for i in range(3)))
+        ocr_jobs.enqueue_manifest_jobs(
+            world, old, canonical_generation_id=generation, engine_profile_hash=profile,
+        )
+        with ocr_jobs._connect() as connection:
+            connection.execute(
+                "UPDATE ocr_jobs SET status='failed', error_code='engine_failure' "
+                "WHERE world=%s AND route_input_id='r0'", (world,),
+            )
+            connection.execute(
+                "UPDATE ocr_jobs SET status='leased', lease_token='t' "
+                "WHERE world=%s AND route_input_id='r1'", (world,),
+            )
+
+        new = manifest(*(decision(f"r{i}", "excluded", "unsupported_image_format") for i in range(2)))
+        assert ocr_jobs.enqueue_manifest_jobs(
+            world, new, canonical_generation_id=generation, engine_profile_hash=profile,
+        ) == []
+
+        with ocr_jobs._connect() as connection:
+            rows = {
+                row["route_input_id"]: row for row in connection.execute(
+                    "SELECT route_input_id, status, error_code FROM ocr_jobs WHERE world=%s", (world,),
+                ).fetchall()
+            }
+        assert rows["r0"]["status"] == "cancelled" and rows["r0"]["error_code"] == "unsupported_image_format"
+        assert rows["r1"]["status"] == "leased"
+        assert rows["r2"]["status"] == "queued"
+        summary = ocr_jobs.status_summary(world, generation)
+        assert summary["failed"] == 0 and summary["counts"]["cancelled"] == 1
+    finally:
+        ocr_jobs.purge_world(world)

@@ -672,20 +672,22 @@ def _build_derived(world, *, world_sig: str | None = None, progress=None) -> dic
         return {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}}
     rep = office_md.build_derived(
         wd, worlds.derived_md_dir(world), world_sig=world_sig, progress=progress, world=world)
-    if not rep.get("error"):
-        _enqueue_ocr_refresh(world, world_sig)
+    if not rep.get("error") and not rep.get("ocr_routes_error") and _enqueue_ocr_refresh(world, world_sig):
+        # ルート生成に成功し・公開済み・refresh も積めた時だけ確定（満たさなければ次回 sync が再試行する）。
+        office_md.write_ocr_route_sig_marker(worlds.derived_md_dir(world))
     return rep
 
 
-def _enqueue_ocr_refresh(world, world_sig: str | None) -> None:
+def _enqueue_ocr_refresh(world, world_sig: str | None) -> bool:
     """公開できた派生物に対して、OCR の作り直しを1行だけ積む（既定OFF・best-effort）。
 
     積むのは「この署名の派生物を OCR し直す」という指示だけで、どのラスタを読むかの展開は
     隔離 worker が公開済みのルート（`.ocr_route.json`）を辿って行う。OCR は任意観測なので、
     ここでの失敗を取り込みの失敗へ昇格させない（次回の取り込みか明示実行で拾い直す）。
+    積めたら True、積まなかった/失敗したら False（呼び出し元がルート版マーカーの確定に使う）。
     """
     if not office_md.ocr_enabled() or not world_sig:
-        return
+        return False
     try:
         from ..store import ocr_jobs
         from . import derived_generation, ocr_worker
@@ -693,9 +695,11 @@ def _enqueue_ocr_refresh(world, world_sig: str | None) -> None:
         # 世代IDは投入側と照合側で必ず同じ写像を使う（`generation_id_for` のコメント参照）。
         ocr_jobs.enqueue_refresh_run(
             world, derived_generation.generation_id_for(world_sig), ocr_worker.profile_hash())
+        return True
     except Exception:
         _log.warning(
             "OCR再実行のenqueueに失敗しました（取り込み自体は成功）: world=%s", world, exc_info=True)
+        return False
 
 
 def _derived_stale(world) -> bool:
@@ -1018,6 +1022,21 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
             _log.warning(
                 "human_md の軽量再生成で一部の文書が失敗しました（次回 sync で再試行）: "
                 "world=%s detail=%s", world, hm_result)
+        human_md_handled = True
+    # OCR ルート版の drift は Evidence/rag と独立（ルートだけ書き直す・ES には触れない）。
+    # 書き直したルートで「読めない画像形式」になった入力の過去の job も、ここで直接終端する。
+    # マーカーは、全件の書き直し・終端と OCR refresh の enqueue が成功した後にだけ確定する。
+    if office_md.ocr_route_refresh_needed(dmd):
+        try:
+            active_sig = (dmd / office_md._WORLD_SIG_MARKER).read_text(encoding="utf-8").strip()
+        except OSError:
+            active_sig = ""
+        if active_sig:
+            from . import derived_generation
+            route_result = office_md.refresh_ocr_routes(
+                dmd, world=world, generation_id=derived_generation.generation_id_for(active_sig))
+            if not route_result.get("ocr_routes_failed") and _enqueue_ocr_refresh(world, active_sig):
+                office_md.write_ocr_route_sig_marker(dmd)
         human_md_handled = True
     document_ir_drift = office_md.document_ir_sig_drift(dmd)
     evidence_drift = office_md.evidence_ir_sig_drift(dmd)
