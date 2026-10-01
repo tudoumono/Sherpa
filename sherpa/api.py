@@ -1446,6 +1446,23 @@ def _sweep_expired_on_startup():
     threading.Thread(target=_run, daemon=True, name="sherpa-ws-ttl").start()
 
 
+def _backfill_turn_metrics_on_startup():
+    """起動時に `turn_metrics` の行が無い回答だけを別スレッドで補完する（利用統計の集計表・
+    旧版アプリで保存された回答や書込失敗の取りこぼしを埋める）。起動と要求処理を止めない・失敗しても
+    アプリを落とさない（best-effort）。冪等・再開可能（`store.turn_metrics.backfill_missing`）。"""
+    import threading
+
+    def _run():
+        try:
+            from sherpa.store.turn_metrics import backfill_missing
+            r = backfill_missing()
+            _log.info("turn_metrics 起動時補完: written=%s failed=%s", r["written"], r["failed"])
+        except Exception as e:
+            _log.warning("turn_metrics 起動時補完に失敗しました（起動は続行・次回起動で再試行）: %s", e)
+
+    threading.Thread(target=_run, daemon=True, name="sherpa-turn-metrics-backfill").start()
+
+
 # 運営掲示板（GET/POST/PATCH/DELETE /announcements*）・全体設定（GET/PUT /admin/settings）・
 # 外部APIキー（POST/GET/DELETE /ext/v1/admin/keys）は sherpa/routers/system_extras.py へ移動済み
 # （extras_router の include は healthz_router include の直後・上記参照）。

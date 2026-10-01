@@ -644,3 +644,40 @@ def ensure_rows(start_ts, end_ts) -> int:
                 last_id = r["id"]
             c.commit()
     return processed
+
+
+def backfill_missing() -> dict:
+    """`turn_metrics` 行が無い assistant メッセージ（`answer` 有り）だけを埋める（起動時の
+    自動補完用・全期間）。`backfill_all()` と違い、既に行があるメッセージは読まない・書き直さない。
+
+    冪等・再開可能: 行を持つメッセージは次回の対象から外れるため、中断（プロセス終了）後に
+    もう一度走らせると残りだけを処理する。`id` 昇順 keyset・バッチごとに commit。
+    書込失敗の行は `upsert_best_effort` が warning を残してスキップし、次回起動で再試行される。
+
+    戻り値: `{"written": 書込に成功した件数, "failed": 失敗した件数}`。
+    """
+    _ensure()
+    written = failed = 0
+    last_id = 0
+    with _connect() as c:
+        while True:
+            rows = c.execute(
+                "SELECT m.id, m.conversation_id, m.created_at, m.lens, m.personal, m.answer "
+                "FROM messages m LEFT JOIN turn_metrics tm ON tm.message_id = m.id "
+                "WHERE m.role='assistant' AND m.answer IS NOT NULL AND tm.message_id IS NULL "
+                "  AND m.id > %s "
+                "ORDER BY m.id LIMIT %s",
+                (last_id, _BACKFILL_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                if upsert_best_effort(c, message_id=r["id"], conversation_id=r["conversation_id"],
+                                      created_at=r["created_at"], lens=r["lens"],
+                                      personal=r["personal"], answer=r["answer"]):
+                    written += 1
+                else:
+                    failed += 1
+                last_id = r["id"]
+            c.commit()
+    return {"written": written, "failed": failed}

@@ -179,6 +179,141 @@ def test_sync_evidence_drift_regenerates_via_real_refresh_evidence_ir_only(_stub
     assert res["status"] == "unchanged" and res["changed"] is False
 
 
+def _old_route_world_with_failed_wmf_job(_stub):
+    """ルート版 v3・読めない画像（WMF）を持つ公開済み資料フォルダと、その入力の failed job を作る。
+    返り値: (route_path, route_input_id, generation_id)。"""
+    import hashlib
+    import io
+    import json
+
+    from openpyxl.drawing.image import Image as XImage
+    from PIL import Image
+    from sherpa.ingest import derived_generation, evidence_ir, ocr_router
+    from sherpa.store import ocr_jobs
+
+    wd, dmd = _stub["wd"], _stub["dmd"]
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(buf, "PNG")
+    png = wd.parent / "p.png"
+    png.write_bytes(buf.getvalue())
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "x"
+    wb.active.add_image(XImage(str(png)), "B2")
+    wb.save(wd / "a.xlsx")
+    assert office_md.build_derived(wd, dmd)["evidence_ir_failed"] == 0
+    # 画像の実体を WMF のバイト列へ差し替え、Evidence の hash も合わせる（実環境の WMF 図と同じ状態）。
+    wmf = b"\xd7\xcd\xc6\x9a" + b"\x00" * 32
+    asset = next((dmd.parent / "rag" / "a.xlsx.assets").iterdir())
+    old_hash = asset.stem
+    new_hash = hashlib.sha256(wmf).hexdigest()
+    asset.unlink()
+    (asset.parent / (new_hash + asset.suffix)).write_bytes(wmf)
+    for name in ("a.xlsx.evidence.json", "a.xlsx.derived.json"):
+        doc = dmd.parent / "ir" / name
+        doc.write_text(doc.read_text(encoding="utf-8").replace(old_hash, new_hash), encoding="utf-8")
+    evidence = dmd.parent / "ir" / "a.xlsx.evidence.json"
+    ir = evidence_ir.from_json_str(evidence.read_text(encoding="utf-8"))
+    manifest = ocr_router.build_manifest(
+        ir, source_rel_path="a.xlsx", assets=ocr_router.inventory_assets(asset.parent))
+    route_input_id = ocr_jobs.unsupported_route_ids(manifest)[0]
+    route = dmd.parent / "ir" / "a.xlsx.ocr_route.json"
+    route.write_text(json.dumps({**json.loads(ocr_router.to_json_str(manifest)),
+                                 "router_profile": "evidence-raster-router-v3"}), encoding="utf-8")
+    (dmd / ".world_sig").write_text("sig\n", encoding="utf-8")
+    generation = derived_generation.generation_id_for("sig")
+    ocr_jobs.enqueue_job(
+        world="w", source_rel_path="a.xlsx", canonical_generation_id=generation,
+        source_content_hash=manifest.source_content_hash, route_manifest_hash=manifest.route_manifest_hash,
+        route_input={"route_input_id": route_input_id, "input_kind": "asset", "status": "selected",
+                     "asset_rel_path": "x.wmf"},
+        engine_profile_hash="sha256:" + "e" * 64,
+    )
+    with ocr_jobs._connect() as connection:
+        connection.execute(
+            "UPDATE ocr_jobs SET status='failed', error_code='engine_failure' WHERE world='w'")
+    return route, route_input_id, generation
+
+
+def _job_state(generation):
+    from sherpa.store import ocr_jobs
+    with ocr_jobs._connect() as connection:
+        return connection.execute(
+            "SELECT status, error_code FROM ocr_jobs WHERE world='w' AND canonical_generation_id=%s",
+            (generation,)).fetchone()
+
+
+def test_sync_rewrites_old_route_and_cancels_old_failed_job_without_touching_rag(_stub, monkeypatch):
+    """ルート版 v3 で公開済みの資料フォルダ: 通常の sync がルートだけを現行版へ書き直し、読めない画像に
+    なった入力の過去の failed job を cancelled に終端してからマーカーを確定する。Evidence/rag は再生成しない。"""
+    import json
+    from sherpa.ingest import ocr_router
+    from sherpa.store import ocr_jobs
+
+    ocr_jobs.purge_world("w")
+    try:
+        route, _rid, generation = _old_route_world_with_failed_wmf_job(_stub)
+        rag_before = (_stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_bytes()
+        monkeypatch.setattr(ocr_jobs, "enqueue_refresh_run", lambda *a, **kw: {})
+
+        worker.sync("w")
+
+        assert json.loads(route.read_text(encoding="utf-8"))["router_profile"] == ocr_router.OCR_ROUTER_PROFILE
+        assert dict(_job_state(generation)) == {"status": "cancelled", "error_code": "unsupported_image_format"}
+        assert ocr_router.ocr_route_sig_drift(_stub["dmd"]) is False
+        assert (_stub["dmd"].parent / "rag" / "a.xlsx.rag.md").read_bytes() == rag_before
+        assert _stub["calls"]["index_world"] == []
+    finally:
+        ocr_jobs.purge_world("w")
+
+
+def test_route_marker_stays_unwritten_when_cancel_fails_and_next_sync_retries(_stub, monkeypatch):
+    from sherpa.ingest import ocr_router
+    from sherpa.store import ocr_jobs
+
+    ocr_jobs.purge_world("w")
+    try:
+        _route, _rid, generation = _old_route_world_with_failed_wmf_job(_stub)
+        monkeypatch.setattr(ocr_jobs, "enqueue_refresh_run", lambda *a, **kw: {})
+        real = ocr_jobs.cancel_unsupported_routes
+
+        def _fail(*a, **kw):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(ocr_jobs, "cancel_unsupported_routes", _fail)
+        worker.sync("w")
+        assert ocr_router.ocr_route_sig_drift(_stub["dmd"]) is True      # 再試行の入口が残る
+        assert _job_state(generation)["status"] == "failed"
+
+        monkeypatch.setattr(ocr_jobs, "cancel_unsupported_routes", real)
+        worker.sync("w")
+        assert _job_state(generation)["status"] == "cancelled"
+        assert ocr_router.ocr_route_sig_drift(_stub["dmd"]) is False
+    finally:
+        ocr_jobs.purge_world("w")
+
+
+def test_route_generation_failure_in_build_leaves_marker_unwritten_and_next_sync_creates_routes(
+        _stub, monkeypatch):
+    from sherpa.ingest import ocr_router
+    from sherpa.store import ocr_jobs
+
+    dmd = _stub["dmd"]
+    monkeypatch.setattr(ocr_jobs, "enqueue_refresh_run", lambda *a, **kw: {})
+    real = office_md._write_ocr_routes
+
+    def _boom(*a, **kw):
+        raise RuntimeError("route failure")
+    monkeypatch.setattr(office_md, "_write_ocr_routes", _boom)
+    worker._build_derived("w", world_sig="sig")
+    route = dmd.parent / "ir" / "a.xlsx.ocr_route.json"
+    assert not route.exists()
+    assert ocr_router.ocr_route_sig_drift(dmd) is True
+
+    monkeypatch.setattr(office_md, "_write_ocr_routes", real)
+    worker.sync("w")
+    assert route.is_file()
+    assert ocr_router.ocr_route_sig_drift(dmd) is False
+
+
 def test_sync_no_drift_keeps_existing_backfill_and_es_repair(_stub, monkeypatch):
     """drift が何も無ければ軽量refreshは呼ばれず、既存の backfill/ES `needs_reindex` 経路が維持される。"""
     dmd = _stub["dmd"]

@@ -2,6 +2,7 @@
 
 旧 startup ハンドラ 5 本を **順序を変えずに** 1 つの lifespan コンテキストマネージャへ集約する:
   ①auth bootstrap → ②fixtures fail-closed 検査 → ③folder poller → ④孤児 reconcile → ⑤workspace TTL sweep。
+  （末尾に⑥`turn_metrics` 欠落行の別スレッド補完を追加＝利用統計の集計表・起動を止めない best-effort）
   （2026-07-03 RV 対応 MEDIUM で②の直後に SHERPA_TEST_DB_ISOLATED 検査を追加＝同じ流儀の fail-closed 検査）
   （背景実行チャットターン §7・docs/proposals/2026-07-03-チャット背景実行.md 導入時、②の検査群に
   workers>1 警告を追加＝fail-closed ではなく警告のみ）
@@ -130,6 +131,7 @@ async def lifespan(app):
         api._start_poller()
         api._reconcile_orphans()
         api._sweep_expired_on_startup()
+        api._backfill_turn_metrics_on_startup()
         yield
     finally:
         # ING-3: shutdown 時は取り込みの背景実行（`sherpa.ingest.background`）も新規受付を

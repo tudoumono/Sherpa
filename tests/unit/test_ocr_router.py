@@ -164,10 +164,12 @@ def test_missing_or_unbound_asset_is_explicit_failed_binding():
 
 def test_asset_inventory_hashes_bytes_and_rejects_symlink(tmp_path):
     asset = tmp_path / "screen.png"
-    asset.write_bytes(b"image-bytes")
+    raw = b"\x89PNG\r\n\x1a\nimage-bytes"
+    asset.write_bytes(raw)
     inventory = ocr_router.inventory_assets(tmp_path)
     assert inventory == [ocr_router.AssetBinding(
-        asset_sha256=ASSET_HASH, relative_path="screen.png", media_type="image/png", pixel_size=None,
+        asset_sha256="sha256:" + hashlib.sha256(raw).hexdigest(), relative_path="screen.png",
+        media_type="image/png", pixel_size=None, raster_readable=True,
     )]
 
     link = tmp_path / "linked.png"
@@ -209,3 +211,35 @@ def test_route_signature_drift_is_fail_closed_for_missing_or_invalid_marker(tmp_
 
     marker.write_text(ocr_router.ocr_route_sig_value() + "\n", encoding="utf-8")
     assert ocr_router.ocr_route_sig_drift(tmp_path) is False
+
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+_WMF = b"\xd7\xcd\xc6\x9a" + b"\x00" * 16
+_EMF = b"\x01\x00\x00\x00" + b"\x00" * 36 + b" EMF" + b"\x00" * 16
+
+
+def test_unreadable_image_formats_are_recorded_as_excluded_without_jobs(tmp_path):
+    """WMF/EMF（拡張子が.pngでも中身で判定）は記録だけ残しOCRジョブにしない。PNG/JPEGは今どおり選ぶ。"""
+    files = {"a.png": _PNG, "b.jpg": _JPEG, "c.wmf": _WMF, "d.png": _EMF}
+    for name, raw in files.items():
+        (tmp_path / name).write_bytes(raw)
+    elements = [_element("page-1", "page")] + [
+        _element(
+            f"pic-{name}", "picture",
+            extension={"asset_sha256": "sha256:" + hashlib.sha256(raw).hexdigest()},
+        )
+        for name, raw in files.items()
+    ]
+    ir = _ir(*elements)
+    manifest = ocr_router.build_manifest(
+        ir, source_rel_path="doc.docx", assets=ocr_router.inventory_assets(tmp_path),
+    )
+
+    by_target = {item.target_evidence_id: item for item in manifest.decisions if item.input_kind == "asset"}
+    assert by_target["pic-a.png"].status == "selected"
+    assert by_target["pic-b.jpg"].status == "selected"
+    for key in ("pic-c.wmf", "pic-d.png"):
+        assert by_target[key].status == "excluded"
+        assert by_target[key].reason_code == "unsupported_image_format"
+    assert ocr_router.validation_errors(manifest, ir=ir) == []

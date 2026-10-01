@@ -885,3 +885,37 @@ def test_paddle_input_suffix_maps_media_types_to_supported_extensions():
     assert ocr_worker._paddle_input_suffix("application/octet-stream") == ".png"
     assert ocr_worker._paddle_input_suffix("") == ".png"
     assert ocr_worker._paddle_input_suffix("image/gif") == ".png"   # Paddle 非対応形式は png 扱いで中身判定に委ねる
+
+
+def test_unreadable_image_is_cancelled_once_without_retry(monkeypatch, tmp_path):
+    ir, asset_root, decision, job = _picture_route(tmp_path)
+    wmf = b"\xd7\xcd\xc6\x9a" + b"\x00" * 32
+    (asset_root / decision.asset_rel_path).write_bytes(wmf)
+    decision = ocr_router.OCRRouteDecision(
+        **{**asdict(decision), "asset_sha256": "sha256:" + hashlib.sha256(wmf).hexdigest(),
+           "pixel_size": None},
+    )
+    job = {**job, "route_input": asdict(decision)}
+    failures = []
+    cancels = []
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: None)
+    monkeypatch.setattr(
+        ocr_worker.ocr_jobs, "fail_job",
+        lambda *args, **kwargs: failures.append(kwargs) or {**job, "status": "failed"},
+    )
+    monkeypatch.setattr(
+        ocr_worker.ocr_jobs, "cancel_unsupported_image_job",
+        lambda *args: cancels.append(args) or {**job, "status": "cancelled"},
+    )
+
+    result = ocr_worker.run_once(
+        "worker-1", engine=FakeEngine(), canonical_is_current=lambda world, generation: True,
+        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
+        resolve_asset_root=lambda leased: asset_root,
+    )
+
+    assert result.status == "cancelled" and result.error_code == "unsupported_image_format"
+    assert failures == []                                   # 失敗には数えない
+    assert cancels == [(job["id"], job["lease_token"])]

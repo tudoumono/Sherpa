@@ -274,26 +274,6 @@ def _usage_limits_provider_row(row: dict) -> dict:
     return result
 
 
-def _usage_limit_int(field: str) -> str:
-    return (f"CASE WHEN (answer->'limits'->>'{field}') ~ '^[0-9]+$' "
-            f"THEN (answer->'limits'->>'{field}')::bigint ELSE 0 END")
-
-
-def _usage_limit_bool(field: str) -> str:
-    return f"(answer->'limits'->>'{field}') = 'true'"
-
-
-def _usage_limits_select_cols() -> str:
-    cols = []
-    for f in _USAGE_LIMIT_INT_FIELDS:
-        expr = _usage_limit_int(f)
-        cols.append(f"COUNT(*) FILTER (WHERE {expr} > 0) AS {f}_turns")
-        cols.append(f"COALESCE(SUM({expr}), 0) AS {f}_total")
-    for f in _USAGE_LIMIT_BOOL_FIELDS:
-        cols.append(f"COUNT(*) FILTER (WHERE {_usage_limit_bool(f)}) AS {f}_turns")
-    return ", ".join(cols)
-
-
 def _usage_token_sum_cols() -> str:
     return ("COUNT(*) AS turns, "
             f"SUM({_usage_tok('input_tokens')}) AS input, "
@@ -304,6 +284,64 @@ def _usage_token_sum_cols() -> str:
 
 # usage を持つ user ターン（対応 assistant 返答に answer.usage がある）だけを集計対象にする WHERE 追加句。
 _USAGE_TOKEN_WHERE = " AND jsonb_typeof(answer->'usage')='object' "
+
+
+# ---- turn_metrics 版の集計部品（`usage_stats` 専用） ----
+#
+# 1 ターン＝期間内の user 発言 1 件＋その最初の assistant 返答の `turn_metrics` 行。ターンは
+# リクエストごとに 1 回だけ一時表 `usage_turns` へ組み立て、各集計はこの表だけを読む。
+# `messages.answer`（JSONB・TOAST）には触れない: ターンの組み立ては `messages` の細い列
+# （id/会話/時刻/personal）と `turn_metrics` の結合だけで済み、回答 JSON を述語に使う旧方式
+# （ターン数×assistant 行数の入れ子ループで展開が走る）を避ける。
+#
+# 対応付けは `turn_metrics.user_message_id`（保存時に「直近の先行 user 発言」で決まる）で引き、
+# 1 ターンに複数返答があれば `message_id` が最小のもの（旧 CTE の「最初の assistant」と同じ）。
+# `personal_turns` は user 発言の `messages.personal`（`turn_metrics.personal` は回答側の別物）。
+# トークンは `turn_metrics` の値（activity 優先）＝失敗ターンの実消費も数える。
+_TURN_LIMIT_FIELDS = _USAGE_LIMIT_INT_FIELDS + _USAGE_LIMIT_BOOL_FIELDS
+_TURN_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+
+
+def _build_usage_turns(c, start_ts, end_exclusive_ts) -> None:
+    """期間 `[start_ts, end_exclusive_ts)`（user 発言の created_at 基準）のターンを一時表
+    `usage_turns` へ作る（呼び出しトランザクションの終了で消える）。"""
+    c.execute("DROP TABLE IF EXISTS pg_temp.usage_turns")
+    cols = ", ".join(
+        f"tm.{f}" for f in ("message_id", "lens", "provider", "model", "depth_profile", "stop_kind",
+                            "duration_ms", "sources_count", "claims_unknown_reasons",
+                            "gate_missing_codes") + _TURN_TOKEN_FIELDS + _TURN_LIMIT_FIELDS)
+    c.execute(
+        "CREATE TEMP TABLE usage_turns ON COMMIT DROP AS "
+        "SELECT DISTINCT ON (u.id) u.id AS user_message_id, u.conversation_id, "
+        "  u.created_at AS turn_created_at, u.personal AS user_personal, "
+        "  c.user_id, c.version, c.codex_session_id, " + cols + " "
+        "FROM messages u JOIN conversations c ON c.id = u.conversation_id "
+        "LEFT JOIN turn_metrics tm ON tm.user_message_id = u.id "
+        "WHERE u.role = 'user' AND u.created_at >= %s AND u.created_at < %s "
+        "  AND c.deleted_at IS NULL AND c.origin = 'own' "
+        "ORDER BY u.id, tm.message_id",
+        (start_ts, end_exclusive_ts),
+    )
+
+
+def _turn_token_sum_cols() -> str:
+    return ("COUNT(*) AS turns, "
+            "SUM(input_tokens) AS input, SUM(cached_input_tokens) AS cached_input, "
+            "SUM(output_tokens) AS output, SUM(reasoning_output_tokens) AS reasoning_output")
+
+
+# トークンを持つターン（`turn_metrics` に usage か activity がある返答）だけを集計対象にする WHERE 句。
+_TURN_TOKEN_WHERE = " WHERE input_tokens IS NOT NULL "
+
+
+def _turn_limits_select_cols() -> str:
+    cols = []
+    for f in _USAGE_LIMIT_INT_FIELDS:
+        cols.append(f"COUNT(*) FILTER (WHERE {f} > 0) AS {f}_turns")
+        cols.append(f"COALESCE(SUM({f}), 0) AS {f}_total")
+    for f in _USAGE_LIMIT_BOOL_FIELDS:
+        cols.append(f"COUNT(*) FILTER (WHERE {f}) AS {f}_turns")
+    return ", ".join(cols)
 
 
 def _compute_retention(week_user_rows) -> dict:
@@ -550,25 +588,16 @@ def _compute_round_stats(round_rows) -> dict:
 
 
 def _compute_final_reason_codes(final_claims_rows) -> list[dict]:
-    """最終回答の主張（`answer->'data'->'claims'`）のうち不明（`status='unknown'`）の
-    理由コードを、深さ×経路×理由コードで合算する（主張単位）。
-
-    行の `claims` が非配列/欠落（旧データ）は静かにスキップする——
-    `jsonb_typeof(...)='array'` で SQL 側が既に絞っているが、要素自体が非 dict の防御的想定外
-    データも同様にスキップする（他の集計と同じ「非数値/欠落は無視」防御）。
-    """
+    """最終回答の主張のうち不明（`status='unknown'`）の理由コードを、深さ×経路×理由コードで
+    合算する（主張単位）。行の `unknown_reasons` は `turn_metrics.claims_unknown_reasons`
+    （理由コード→件数）。"""
     agg: dict[tuple, dict[str, int]] = {}
     for r in final_claims_rows:
         depth = r["depth_profile"] or "unknown"
         provider = r["provider"] or "unknown"
         bucket = agg.setdefault((depth, provider), {})
-        for claim in (r["claims"] or []):
-            if not isinstance(claim, dict) or claim.get("status") != "unknown":
-                continue
-            code = claim.get("reason_code") or "unknown"
-            if not isinstance(code, str):
-                continue
-            bucket[code] = bucket.get(code, 0) + 1
+        for code, n in (r["unknown_reasons"] or {}).items():
+            bucket[code] = bucket.get(code, 0) + int(n)
     return [
         {"depth_profile": dp, "provider": pv, "reason_code": code, "claims": n}
         for (dp, pv), bucket in sorted(agg.items())
@@ -582,7 +611,7 @@ def _compute_final_reason_codes(final_claims_rows) -> list[dict]:
 # 揃える）を使う——巡イベント自身の `ts` で絞ると、同じユーザーターンの巡別記録と最終回答
 # （`turns`/`conv_turn_rows` 系）が異なる期間境界に割れ、両者を突き合わせる集計（例:
 # reason_codes の final/rounds 比較）の母集団がずれる。「所属する user ターン」は
-# 「その巡の ts 以前で最も新しい同会話の user メッセージ」（`user_msgs` の LATERAL）。見つからない
+# 「その巡の ts 以前で最も新しい同会話の user メッセージ」（`owning` の DISTINCT ON）。見つからない
 # （過去データ・想定外の順序）場合は巡自身の `ts` へ後退する＝従来どおり必ず何らかの期間値を持つ。
 #
 # `rounds` CTE は `e.ts >= start_ts`（下限のみ）で事前に絞る——`turn_created_at <= e.ts` が
@@ -591,87 +620,78 @@ def _compute_final_reason_codes(final_claims_rows) -> list[dict]:
 # `e.ts` より過去になり得るため、`e.ts < end_exclusive_ts` を先に切ると期間内のターンに属す
 # 巡を落としかねない——最終 WHERE の `turn_created_at < end_exclusive_ts` だけで絞る）。
 #
-# assistant 対応付け（最終 LATERAL）は「巡の ts 以降・かつ同会話の**次の** user メッセージより前」
+# assistant 対応付け（`turn_metrics` との最終 DISTINCT ON）は「巡の ts 以降・かつ同会話の**次の** user メッセージより前」
 # に限定する（上限なしの `m.created_at >= r.ts` だけだと、このターンの assistant が
 # 保存されなかった行＝利用者の停止等で assistant 未保存の巡が、次ターンの assistant に
 # 誤って結合し水増しされる）。範囲内に assistant が無ければ `turn_message_id` は NULL のまま
 # （`_compute_round_stats` 側で `unmatched_rounds` に計上する）。
 def _round_rows_query(c, start_ts, end_exclusive_ts):
+    # 巡が属する user ターン＝その巡の ts を含む区間 [その user の created_at, 次の user の created_at)。
+    # 区間の包含で 1 件に決まるため、巡ごとの並べ替え・LATERAL を要さない（巡×ターンを会話単位で
+    # 結合するだけ）。巡の本体（meta 等の幅のある列）は対応付けが済んだ後で id から引く。
     return c.execute(
         "WITH rounds AS ("
-        "  SELECT e.id, e.ts, e.provider, e.input_tokens, e.output_tokens, e.elapsed_ms, e.meta, "
-        "    e.conversation_id "
-        "  FROM usage_events e WHERE e.kind = 'chat-round' AND e.ts >= %s"
-        "), touched_convs AS ("
-        "  SELECT DISTINCT conversation_id FROM rounds"
+        "  SELECT e.id, e.ts, e.conversation_id FROM usage_events e "
+        "  WHERE e.kind = 'chat-round' AND e.ts >= %s AND e.conversation_id IS NOT NULL"
         "), user_msgs AS ("
         "  SELECT m.conversation_id, m.created_at, "
         "    LEAD(m.created_at) OVER (PARTITION BY m.conversation_id ORDER BY m.created_at) "
         "      AS next_user_created_at "
-        "  FROM messages m JOIN touched_convs t ON t.conversation_id = m.conversation_id "
-        "  WHERE m.role = 'user'"
-        "), owning AS ("
-        "  SELECT r.id AS round_id, r.ts, r.provider, r.input_tokens, r.output_tokens, r.elapsed_ms, "
-        "    r.meta, r.conversation_id, COALESCE(u.created_at, r.ts) AS turn_created_at, "
-        "    u.next_user_created_at "
-        "  FROM rounds r LEFT JOIN LATERAL ("
-        "    SELECT um.created_at, um.next_user_created_at FROM user_msgs um "
-        "    WHERE um.conversation_id = r.conversation_id AND um.created_at <= r.ts "
-        "    ORDER BY um.created_at DESC LIMIT 1"
-        "  ) u ON true"
+        "  FROM messages m "
+        "  WHERE m.role = 'user' AND m.conversation_id IN (SELECT conversation_id FROM rounds)"
+        "), in_period AS ("
+        "  SELECT r.id AS round_id, r.ts, r.conversation_id, u.next_user_created_at "
+        "  FROM rounds r LEFT JOIN user_msgs u "
+        "    ON u.conversation_id = r.conversation_id AND u.created_at <= r.ts "
+        "    AND (u.next_user_created_at IS NULL OR r.ts < u.next_user_created_at) "
+        "  JOIN conversations c ON c.id = r.conversation_id "
+        "  WHERE c.deleted_at IS NULL AND c.origin = 'own' "
+        "    AND COALESCE(u.created_at, r.ts) >= %s AND COALESCE(u.created_at, r.ts) < %s"
+        "), matched AS ("
+        "  SELECT DISTINCT ON (o.round_id) o.round_id, tm.message_id AS turn_message_id, tm.depth_profile "
+        "  FROM in_period o "
+        "  LEFT JOIN (turn_metrics tm JOIN messages am ON am.id = tm.message_id) "
+        "    ON tm.conversation_id = o.conversation_id AND am.created_at >= o.ts "
+        "    AND (o.next_user_created_at IS NULL OR am.created_at < o.next_user_created_at) "
+        "  ORDER BY o.round_id, am.created_at ASC"
         ") "
-        "SELECT o.ts, o.provider, o.input_tokens, o.output_tokens, o.elapsed_ms, o.meta, "
-        "  ta.id AS turn_message_id, ta.answer->'usage'->>'depth_profile' AS depth_profile "
-        "FROM owning o "
-        "JOIN conversations c ON c.id = o.conversation_id "
-        "LEFT JOIN LATERAL ("
-        "  SELECT m.id, m.answer FROM messages m "
-        "  WHERE m.conversation_id = o.conversation_id AND m.role = 'assistant' "
-        "    AND m.created_at >= o.ts "
-        "    AND (o.next_user_created_at IS NULL OR m.created_at < o.next_user_created_at) "
-        "  ORDER BY m.created_at ASC LIMIT 1"
-        ") ta ON true "
-        "WHERE c.deleted_at IS NULL AND c.origin = 'own' "
-        "  AND o.turn_created_at >= %s AND o.turn_created_at < %s",
+        "SELECT e.ts, e.provider, e.input_tokens, e.output_tokens, e.elapsed_ms, e.meta, "
+        "  x.turn_message_id, x.depth_profile "
+        "FROM matched x JOIN usage_events e ON e.id = x.round_id",
         (start_ts, start_ts, end_exclusive_ts),
     ).fetchall()
 
 
-# 最終回答の主張（`answer->'data'->'claims'`）のうち不明の理由コードを数えるための取得 SQL
-# （`usage_stats()`/`usage_depth_rounds()` が共有）。`gate_missing_codes`（S1b・Codex 経路の
-# 最終ゲート・`answer->'data'->'evidence_gate'->'missing_codes'`）も同じ行から拾う——Codex は
-# `chat-round` を発生させない経路のため、巡別記録（`_round_rows_query`）には不足軸が載らず、
-# ここが唯一の取得点になる（API 経路にはこのキー自体が無く NULL のまま＝`_compute_round_stats`
-# 側の `missing_codes` 集計と二重計上にならない）。
-def _final_claims_rows_query(c, start_ts, end_exclusive_ts):
+# 最終回答の不明理由コード（`turn_metrics.claims_unknown_reasons`）と最終ゲートの不足軸
+# （`gate_missing_codes`）を、組み立て済みの一時表 `usage_turns`（`_build_usage_turns`）から
+# 取る（`usage_stats()`/`usage_depth_rounds()` が共有）。主張を持つターン（`claims_unknown_reasons`
+# が NULL でない＝回答に `data.claims` 配列がある）だけが対象。`gate_missing_codes`（Codex 経路の
+# 最終ゲート）は Codex が `chat-round` を発生させないため、巡別記録（`_round_rows_query`）には
+# 不足軸が載らず、ここが唯一の取得点になる（API 経路は NULL のまま＝`_compute_round_stats` 側の
+# `missing_codes` 集計と二重計上にならない）。
+def _final_claims_rows_query(c):
     return c.execute(
-        _USAGE_TURN_CTE + " "
-        "SELECT answer->'usage'->>'provider' AS provider, "
-        "  answer->'usage'->>'depth_profile' AS depth_profile, "
-        "  answer->'data'->'claims' AS claims, "
-        "  answer->'data'->'evidence_gate'->'missing_codes' AS gate_missing_codes "
-        "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s "
-        "  AND jsonb_typeof(answer->'data'->'claims') = 'array'",
-        (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+        "SELECT provider, depth_profile, claims_unknown_reasons AS unknown_reasons, gate_missing_codes "
+        "FROM usage_turns WHERE claims_unknown_reasons IS NOT NULL"
     ).fetchall()
 
 
 def _compute_final_missing_codes(final_claims_rows) -> dict[tuple, dict[str, int]]:
     """S1b: 最終回答の `evidence_gate.missing_codes`（Codex 経路の最終ゲート・巡を発生させない
-    ため `chat-round` には載らない）を深さ×経路で合算する。非配列/欠落（API 経路・v1・旧データ）
-    は静かにスキップする（`_compute_final_reason_codes` と同じ「非配列は無視」防御）。
+    ため `chat-round` には載らない）を深さ×経路で合算する。行の `gate_missing_codes` は
+    `turn_metrics.gate_missing_codes`（コード→件数）。NULL（API 経路・v1・旧データ）は静かに
+    スキップする。
     """
     agg: dict[tuple, dict[str, int]] = {}
     for r in final_claims_rows:
         codes = r["gate_missing_codes"]
-        if not isinstance(codes, list):
+        if not isinstance(codes, dict):
             continue
         depth = r["depth_profile"] or "unknown"
         provider = r["provider"] or "unknown"
         bucket = agg.setdefault((depth, provider), {})
-        for code in codes:
-            if isinstance(code, str) and code:
-                bucket[code] = bucket.get(code, 0) + 1
+        for code, n in codes.items():
+            bucket[code] = bucket.get(code, 0) + int(n)
     return agg
 
 
@@ -728,6 +748,12 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     active_days・daily の日付境界は **user メッセージのみ**を **JST（Asia/Tokyo）**で区切り、
     **`_usage_period_bounds` で計算した固定の JST 暦日下限**を users/daily/audit すべてに使う
     （表とグラフの合計を一致させる）。
+
+    ターン由来の集計の読み元: user 発言（`messages`）と、その最初の返答の `turn_metrics` 行を
+    リクエストごとに 1 回だけ一時表（`_build_usage_turns`）へ組み、各集計はそれだけを読む（回答 JSON
+    は読まない）。トークンは `turn_metrics`（activity 優先）の値＝失敗ターンの実消費も数える。
+    `turn_metrics` の無い返答（旧版で保存・書込失敗）は起動時の補完（`turn_metrics.backfill_missing`）
+    が埋めるまで、そのターンの返答由来の項目（lens・トークン等）に現れない。
 
     集計の前提:
       - `c.origin='own'` に限定（sanitized_snapshot は本文コピー済みの内部成果物で、同じ owner の
@@ -823,8 +849,8 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     _ensure()
     start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
+        _build_usage_turns(c, start_ts, end_exclusive_ts)
         user_rows = c.execute(
-            _USAGE_TURN_CTE + " "
             "SELECT user_id AS uid, "
             "  COUNT(*) AS turns, "
             "  COUNT(DISTINCT conversation_id) AS conversations, "
@@ -838,13 +864,10 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
             "  ARRAY_REMOVE(ARRAY_AGG(DISTINCT version), NULL) AS worlds, "
             "  COUNT(*) FILTER (WHERE lens IS NOT NULL AND lens != 'chat') AS knowledge_turns, "
             "  COUNT(*) FILTER (WHERE lens IS NOT NULL AND lens != 'chat' AND "
-            "    CASE WHEN jsonb_typeof(answer->'sources')='array' "
-            "         THEN jsonb_array_length(answer->'sources') ELSE 0 END = 0) AS zero_hit_turns "
-            "FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s "
+            "    sources_count = 0) AS zero_hit_turns "
+            "FROM usage_turns "
             "GROUP BY user_id "
             "ORDER BY turns DESC, user_id",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
         daily_rows = c.execute(
             "SELECT (m.created_at AT TIME ZONE 'Asia/Tokyo')::date AS date, "
@@ -865,11 +888,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         ).fetchall()
         name_rows = c.execute("SELECT uid, display_name FROM users").fetchall()
         world_rows = c.execute(
-            _USAGE_TURN_CTE + " "
-            "SELECT version AS world, COUNT(*) AS turns FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s AND version IS NOT NULL "
+            "SELECT version AS world, COUNT(*) AS turns FROM usage_turns "
+            "WHERE version IS NOT NULL "
             "GROUP BY version ORDER BY turns DESC, version",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
         provider_rows = c.execute(
             "SELECT CASE WHEN detail->>'provider' = ANY(%s) THEN detail->>'provider' ELSE 'unknown' END AS provider, "
@@ -891,16 +912,14 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # （既存の provider_rows の allowlist 畳み込みと同じ思想）。確認カード
         # （lens='clarify'＝意図確認の一時停止・終了理由を持たない正常な行）は母数から外す。
         stop_kind_rows = c.execute(
-            _USAGE_TURN_CTE + " "
-            "SELECT CASE WHEN answer->>'stop_kind' = ANY(%s) THEN answer->>'stop_kind' "
+            "SELECT CASE WHEN stop_kind = ANY(%s) THEN stop_kind "
             "  ELSE 'unknown' END AS stop_kind, COUNT(*) AS n "
-            "FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s "
-            "  AND answer IS NOT NULL "
+            "FROM usage_turns "
+            "WHERE message_id IS NOT NULL "
             "  AND lens IS DISTINCT FROM 'clarify' "
-            "  AND answer->>'stop_kind' IS DISTINCT FROM 'stopped_by_user' "
-            "GROUP BY stop_kind ORDER BY n DESC",
-            (start_ts, end_exclusive_ts, list(stop_kind.STOP_KINDS), start_ts, end_exclusive_ts),
+            "  AND stop_kind IS DISTINCT FROM 'stopped_by_user' "
+            "GROUP BY 1 ORDER BY n DESC",
+            (list(stop_kind.STOP_KINDS),),
         ).fetchall()
         # limits（「打ち切りの内訳」・経路別）: `stop_kind_rows` から `stopped_by_user` の除外だけを
         # 外した population（turn_created_at 境界・answer IS NOT NULL・clarify 除外——巡ループの
@@ -908,15 +927,12 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # `answer->'usage'->>'provider'` 別の集計を足す
         # （`token_by_model` と同じ provider 抽出キー・専用フィールドは持たない＝重複させない）。
         limits_rows = c.execute(
-            _USAGE_TURN_CTE + " "
-            "SELECT COALESCE(answer->'usage'->>'provider', 'unknown') AS provider, "
-            "  COUNT(*) AS turns, " + _usage_limits_select_cols() + " "
-            "FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s "
-            "  AND answer IS NOT NULL "
+            "SELECT COALESCE(provider, 'unknown') AS provider, "
+            "  COUNT(*) AS turns, " + _turn_limits_select_cols() + " "
+            "FROM usage_turns "
+            "WHERE message_id IS NOT NULL "
             "  AND lens IS DISTINCT FROM 'clarify' "
-            "GROUP BY provider ORDER BY turns DESC",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+            "GROUP BY 1 ORDER BY turns DESC, provider",
         ).fetchall()
         # 利用者停止（`stopped_by_user`）は上の分布から除いてある（assistant 未保存の停止に加え、
         # 巡ループの停止終端が保存する行も除外する）——監査
@@ -941,11 +957,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
             (start_ts, end_exclusive_ts),
         ).fetchall()
         week_user_rows = c.execute(
-            _USAGE_TURN_CTE + " "
             "SELECT DISTINCT user_id AS uid, "
             "  date_trunc('week', turn_created_at AT TIME ZONE 'Asia/Tokyo')::date AS week_start "
-            "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+            "FROM usage_turns",
         ).fetchall()
         download_daily_rows = c.execute(
             "SELECT (created_at AT TIME ZONE 'Asia/Tokyo')::date AS date, COUNT(*) AS n FROM audit_log "
@@ -957,28 +971,18 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         #   入力/出力トークン数のみ集計する（金額換算はしない）。
         #   usage を持たないターン（heuristic・停止・旧データ）は自然に除外。
         token_model_rows = c.execute(
-            _USAGE_TURN_CTE + " "
-            "SELECT answer->'usage'->>'provider' AS provider, answer->'usage'->>'model' AS model, "
-            + _usage_token_sum_cols() + " FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s" + _USAGE_TOKEN_WHERE +
+            "SELECT provider, model, " + _turn_token_sum_cols() + " FROM usage_turns" + _TURN_TOKEN_WHERE +
             "GROUP BY provider, model ORDER BY input DESC, output DESC",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
         token_user_rows = c.execute(
-            _USAGE_TURN_CTE + " "
-            "SELECT user_id AS uid, " + _usage_token_sum_cols() + " FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s" + _USAGE_TOKEN_WHERE +
-            "GROUP BY user_id ORDER BY (SUM(" + _usage_tok('input_tokens') + ") + SUM("
-            + _usage_tok('output_tokens') + ")) DESC, user_id",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+            "SELECT user_id AS uid, " + _turn_token_sum_cols() + " FROM usage_turns" + _TURN_TOKEN_WHERE +
+            "GROUP BY user_id ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC, user_id",
         ).fetchall()
         token_daily_rows = c.execute(
-            _USAGE_TURN_CTE + " "
             "SELECT (turn_created_at AT TIME ZONE 'Asia/Tokyo')::date AS date, "
-            f"SUM({_usage_tok('input_tokens')}) AS input, SUM({_usage_tok('output_tokens')}) AS output "
-            "FROM turns WHERE turn_created_at >= %s AND turn_created_at < %s" + _USAGE_TOKEN_WHERE +
+            "SUM(input_tokens) AS input, SUM(output_tokens) AS output "
+            "FROM usage_turns" + _TURN_TOKEN_WHERE +
             "GROUP BY date ORDER BY date",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
         # チャット以外の LLM 呼び出し（intent 分類・
         # グラフ抽出・概念候補提案・埋め込み・admin グラフ質問・VLM）を kind 別に集計。usage_events は
@@ -1016,12 +1020,13 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # 停止/実行中のターンは assistant 自体が無く、duration_ms が数値でない行（想定外データ）は
         # 正規表現で弾く——`_usage_tok` と同じ防御思想（非数値/欠落は集計対象から静かに除く）。
         response_time_rows = c.execute(
-            "SELECT answer->'usage'->>'provider' AS provider, (answer->>'duration_ms')::bigint AS duration_ms "
-            "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
-            "WHERE m.created_at >= %s AND m.created_at < %s AND m.role='assistant' "
+            "SELECT tm.provider, tm.duration_ms "
+            "FROM turn_metrics tm JOIN messages m ON m.id = tm.message_id "
+            "JOIN conversations c ON c.id = tm.conversation_id "
+            "WHERE m.created_at >= %s AND m.created_at < %s "
             "  AND c.deleted_at IS NULL AND c.origin='own' "
-            "  AND m.lens IS DISTINCT FROM 'clarify' "   # 確認カードは回答前の一時停止＝回答時間ではない
-            "  AND answer->>'duration_ms' ~ '^[0-9]+$'",
+            "  AND tm.lens IS DISTINCT FROM 'clarify' "   # 確認カードは回答前の一時停止＝回答時間ではない
+            "  AND tm.duration_ms IS NOT NULL",
             (start_ts, end_exclusive_ts),
         ).fetchall()
         # 会話あたりの user ターン数分布・resume_rate。`turns`（`_USAGE_TURN_CTE`）由来にすることで、
@@ -1030,12 +1035,9 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # 「期間内の user ターン数」であり、会話の全履歴ではない（`c.id` で GROUP BY＝主キーへの
         # 関数従属により `codex_session_id` を非集約のまま選べる）。
         conversation_turn_rows = c.execute(
-            _USAGE_TURN_CTE + " "
-            "SELECT c.id AS cid, c.codex_session_id, COUNT(*) AS user_turns "
-            "FROM turns JOIN conversations c ON c.id = turns.conversation_id "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s "
-            "GROUP BY c.id",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
+            "SELECT conversation_id AS cid, codex_session_id, COUNT(*) AS user_turns "
+            "FROM usage_turns "
+            "GROUP BY conversation_id, codex_session_id",
         ).fetchall()
         # 会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。対象は
         # 「期間内に user ターンが1件以上ある会話」（他の会話系集計と同じ母集団）——1行=1会話。
@@ -1044,20 +1046,16 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # Python 側で合流する（`tokens.by_kind`/`by_user_kind` と同じ「chat は turns 由来・他は
         # usage_events 由来」という合成方針）。
         conv_turn_rows = c.execute(
-            _USAGE_TURN_CTE + " "
             "SELECT conversation_id AS cid, user_id AS uid, version AS world, "
             "  COUNT(*) AS user_turns, "
-            "  COUNT(*) FILTER (WHERE jsonb_typeof(answer->'usage')='object') AS chat_calls, "
-            f"  SUM({_usage_tok('input_tokens')}) AS chat_input, "
-            f"  SUM({_usage_tok('cached_input_tokens')}) AS chat_cached_input, "
-            f"  SUM({_usage_tok('output_tokens')}) AS chat_output, "
-            f"  SUM({_usage_tok('reasoning_output_tokens')}) AS chat_reasoning_output, "
-            "  AVG(CASE WHEN lens IS DISTINCT FROM 'clarify' AND answer->>'duration_ms' ~ '^[0-9]+$' "
-            "    THEN (answer->>'duration_ms')::bigint END) AS avg_response_time_ms "
-            "FROM turns "
-            "WHERE turn_created_at >= %s AND turn_created_at < %s "
+            "  COUNT(*) FILTER (WHERE input_tokens IS NOT NULL) AS chat_calls, "
+            "  SUM(input_tokens) AS chat_input, "
+            "  SUM(cached_input_tokens) AS chat_cached_input, "
+            "  SUM(output_tokens) AS chat_output, "
+            "  SUM(reasoning_output_tokens) AS chat_reasoning_output, "
+            "  AVG(CASE WHEN lens IS DISTINCT FROM 'clarify' THEN duration_ms END) AS avg_response_time_ms "
+            "FROM usage_turns "
             "GROUP BY conversation_id, user_id, version",
-            (start_ts, end_exclusive_ts, start_ts, end_exclusive_ts),
         ).fetchall()
         _conv_cids = [r["cid"] for r in conv_turn_rows]
         # usage_events は明示的に `conv_turn_rows` が返した会話 id（=期間内に user ターンがある会話）に
@@ -1085,7 +1083,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         # 最終回答の主張のうち不明（`status='unknown'`）の理由コード分布（主張単位）。深さ・経路
         # （`answer->'usage'`）別に数える——巡別（chat-round）の集計とは別軸（こちらは全巡を経た
         # 最終回答時点の判定・巡ごとの是正で覆った分は数えない）。
-        final_claims_rows = _final_claims_rows_query(c, start_ts, end_exclusive_ts)
+        final_claims_rows = _final_claims_rows_query(c)
 
     display_names = {r["uid"]: r["display_name"] for r in name_rows}
     _aux_key = {"auth.login": "logins", "document.downloaded": "downloads",
@@ -1999,7 +1997,8 @@ def usage_depth_rounds(days: int = 30, *, time_from: str | None = None,
     start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
         round_rows = _round_rows_query(c, start_ts, end_exclusive_ts)
-        final_claims_rows = _final_claims_rows_query(c, start_ts, end_exclusive_ts)
+        _build_usage_turns(c, start_ts, end_exclusive_ts)
+        final_claims_rows = _final_claims_rows_query(c)
     rounds_stats = _compute_round_stats(round_rows)
     return _tool_json_projection({
         "period": period,
