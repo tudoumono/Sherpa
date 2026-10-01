@@ -130,9 +130,9 @@ def conversation_investigation_download(cid: int, message_id: int, request: Requ
     「所有会話のみ」の流儀だが、こちらは403との区別をしない＝常に404）。記録が無い
     （台帳を使わない構成・台帳ゲートが走らなかったターン）メッセージも404。
 
-    `format=md`（既定）は人が読む Markdown・`format=json` は保存した3つ（manifest/items/
-    coverage）をそのまま返す。ファイル名は固定の一般名（質問文・資料名を含めない・CLAUDE.md
-    「実環境の固有名」節と同じ理由）。
+    `format=md`（既定）は人が読む Markdown・`format=json` は保存した4つ（manifest/items/
+    coverage/reviews＝COD-18 ⑤「中間の見直し」）をそのまま返す。ファイル名は固定の一般名
+    （質問文・資料名を含めない・CLAUDE.md「実環境の固有名」節と同じ理由）。
     """
     u = _current_user(request)
     if not store.owns_assistant_message(u["uid"], cid, message_id):
@@ -143,7 +143,7 @@ def conversation_investigation_download(cid: int, message_id: int, request: Requ
     if format == "json":
         body = {"complete": record["complete"], "truncated": record["truncated"],
                 "manifest": record["manifest"], "items": record["items"],
-                "coverage": record["coverage"]}
+                "coverage": record["coverage"], "reviews": record.get("reviews") or []}
         return Response(content=json.dumps(body, ensure_ascii=False, indent=2),
                         media_type="application/json; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="investigation.json"'})

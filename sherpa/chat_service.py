@@ -1305,7 +1305,8 @@ def _save_investigation_record(investigation_record: dict | None, message_id, co
             complete=bool(investigation_record.get("complete")),
             manifest=investigation_record.get("manifest"),
             items=investigation_record.get("items") or {},
-            coverage=investigation_record.get("coverage") or {})
+            coverage=investigation_record.get("coverage") or {},
+            reviews=investigation_record.get("reviews") or [])
     except Exception as e:
         _log.warning("investigation record save failed (fail-open): %s", e)
 

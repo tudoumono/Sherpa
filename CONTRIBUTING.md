@@ -98,6 +98,14 @@ AI エージェントの記憶（Claude Code のメモリ・`.claude/agent-memor
 - 検証は作業内容に比例させます（小修正は該当テストのみ、横断変更は広め、大規模マージ前だけフルゲート）。
 - 詳しくは [docs/20-開発ハーネス.md §6](docs/20-開発ハーネス.md) を参照してください。
 
+## テスト用 DB（既定は使い捨て）
+
+`pytest` は起動のたびに Postgres の使い捨て DB をひな型 DB（`sherpa_test_template`）から複製して使い、
+終了時に drop します（`tests/conftest.py`）。普段は何も意識する必要はありません——同時に複数の
+`pytest` を走らせても DB は衝突せず、残骸も溜まりません。明示的に共有 DB（`sherpa_test`）を使いたい
+ときだけ `SHERPA_TEST_DB_SHARED=1` を付けます。`make test-db-reset`（`DBNAME=sherpa_test_template` で
+ひな型も）は手動での作り直し用に残っています。詳しくは docs/20 §6 を参照してください。
+
 ## 並列作業（レーン）とテスト用DBの分離
 
 複数のスライスを並行して進めるときは、レーンごとに専用の Postgres DB（`sherpa_test_<lane>`）と
