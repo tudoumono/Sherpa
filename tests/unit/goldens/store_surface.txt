@@ -113,6 +113,7 @@ get_latest_es_run_summary
 get_latest_published_run_summary
 get_latest_run_summary
 get_messages_by_ids
+get_recent_es_attempts
 get_session_id
 get_settings
 get_system_settings

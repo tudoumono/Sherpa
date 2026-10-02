@@ -3365,6 +3365,39 @@
             ],
             "title": "Es Chunks"
           },
+          "es_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Es Error"
+          },
+          "es_index_kept": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Es Index Kept"
+          },
+          "es_state": {
+            "enum": [
+              "ok",
+              "reflecting",
+              "failed",
+              "unavailable",
+              "unknown"
+            ],
+            "title": "Es State",
+            "type": "string"
+          },
           "failed_files": {
             "anyOf": [
               {
@@ -3556,6 +3589,9 @@
           "graph_nodes",
           "graph_edges",
           "es_chunks",
+          "es_state",
+          "es_error",
+          "es_index_kept",
           "last_run_id",
           "last_run_status",
           "last_run_warnings",
@@ -7967,6 +8003,39 @@
             ],
             "title": "Es Chunks"
           },
+          "es_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Es Error"
+          },
+          "es_index_kept": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Es Index Kept"
+          },
+          "es_state": {
+            "enum": [
+              "ok",
+              "reflecting",
+              "failed",
+              "unavailable",
+              "unknown"
+            ],
+            "title": "Es State",
+            "type": "string"
+          },
           "failed_files": {
             "anyOf": [
               {
@@ -8166,6 +8235,9 @@
           "graph_nodes",
           "graph_edges",
           "es_chunks",
+          "es_state",
+          "es_error",
+          "es_index_kept",
           "last_run_id",
           "last_run_status",
           "last_run_warnings",
@@ -8262,6 +8334,39 @@
               }
             ],
             "title": "Es Chunks"
+          },
+          "es_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Es Error"
+          },
+          "es_index_kept": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Es Index Kept"
+          },
+          "es_state": {
+            "enum": [
+              "ok",
+              "reflecting",
+              "failed",
+              "unavailable",
+              "unknown"
+            ],
+            "title": "Es State",
+            "type": "string"
           },
           "failed_files": {
             "anyOf": [
@@ -8495,6 +8600,9 @@
           "graph_nodes",
           "graph_edges",
           "es_chunks",
+          "es_state",
+          "es_error",
+          "es_index_kept",
           "last_run_id",
           "last_run_status",
           "last_run_warnings",

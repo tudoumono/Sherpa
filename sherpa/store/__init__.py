@@ -135,6 +135,7 @@ from .ingest import (  # noqa: F401
     finish_ingest_run_and_confirm_world,
     finish_ingest_run_and_delete_world,
     get_latest_es_run_summary,
+    get_recent_es_attempts,
     get_latest_published_run_summary,
     get_latest_run_summary,
     list_ingest_runs,

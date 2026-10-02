@@ -12,6 +12,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _no_es_attempts(monkeypatch):
+    from sherpa import store
+    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
+
+
 @pytest.fixture
 def client(auth_disabled):
     from sherpa.api import app
@@ -527,6 +533,44 @@ def test_status_es_chunks_is_none_when_available_false_or_error_set(client, monk
     r2 = client.get("/worlds/w1/status")
     assert r2.status_code == 200, r2.text
     assert r2.json()["es_chunks"] is None
+
+
+def test_status_es_state_distinguishes_failed_unavailable_reflecting(client, monkeypatch, tmp_path):
+    """`es_state`: 失敗した ES run（未反映の run も含む）は failed・旧索引が残ると言えるのは旧索引に触れる前の
+    失敗で、かつ過去に成功した記録があるときだけ。接続不可は unavailable・ES の段の実行中だけ reflecting。"""
+    from sherpa import store
+    run = {"v": None}
+    monkeypatch.setattr(store, "get_world_status_row", lambda wid: {
+        "world_id": wid, "root_path": str(tmp_path), "label": None, "last_synced_at": None,
+        "last_scan_report": None, "last_scan_report_at": None})
+    monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: run["v"])
+    monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
+    ok = {"available": True, "error": None, "chunks": 3}
+
+    def es(*attempts):
+        monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: list(attempts))
+        return client.get("/worlds/w1/status").json()
+
+    emb = {"available": True, "error": "embedding_cloud_unavailable", "chunks": 0}
+    b = es({"available": True, "error": "bulk_errors", "chunks": 0}, ok)
+    assert (b["es_state"], b["es_index_kept"]) == ("failed", False) and b["es_error"]
+    assert es(emb, ok)["es_index_kept"] is True
+    assert "クラウド" not in es(emb, ok)["es_error"]
+    assert es(emb)["es_index_kept"] is False                      # 初回: 旧索引の記録なし
+    assert es(emb, {"available": True, "error": None, "chunks": 0})["es_index_kept"] is False
+    assert es({"available": True, "error": "delete_failed", "chunks": 0}, ok)["es_index_kept"] is False
+    bulk = {"available": True, "error": "bulk_failed", "chunks": 0}
+    assert es(emb, bulk, ok)["es_index_kept"] is False            # 成功の後に索引を消す失敗がある
+    assert es(emb, emb, ok)["es_index_kept"] is True              # 索引に触れない失敗は読み飛ばす
+    assert es(emb, *([emb] * 50), ok)["es_index_kept"] is True    # 窓の奥の成功も拾う（limit は store 側）
+    assert es({"available": False, "error": None})["es_state"] == "unavailable"
+    assert es(ok)["es_state"] == "ok"
+    prog = lambda stage: {"status": "extracting", "extraction_snapshot": None, "progress": {
+        "stage": stage, "stage_label": "x", "done": None, "total": None, "updated_at": "2026-01-01T00:00:00+00:00"}}
+    run["v"] = prog("graph_build")
+    assert es(emb, ok)["es_state"] == "failed"                    # ES 以外の段の実行中は直前の記録
+    run["v"] = prog("es_index")
+    assert es(emb, ok)["es_state"] == "reflecting"
 
 
 def test_status_es_chunks_survive_a_newer_pg_replace_failed_run(client, monkeypatch, tmp_path):

@@ -344,3 +344,17 @@ def get_latest_es_run_summary(world) -> dict | None:
             "WHERE kb_id=%s AND version=%s AND published_at IS NOT NULL AND extraction_snapshot ? 'es' "
             "ORDER BY id DESC LIMIT 1",
             (_KB_ID, world)).fetchone()
+
+
+def get_recent_es_attempts(world, limit: int = 200) -> list[dict]:
+    """ES 段まで到達した直近の run（`extraction_snapshot` に `es` キーがある・反映済みかは問わない）の
+    `es` 記録を新しい順に返す。**画面の全文検索の状態判定専用**——資料が変わらない経路で再索引に
+    失敗した run は `published_at` を持たないが、直近の失敗としてここには含める
+    （件数表示は `get_latest_es_run_summary` を使う）。"""
+    _ensure()
+    with _connect() as c:
+        rows = c.execute(
+            "SELECT extraction_snapshot->'es' AS es FROM ingest_runs "
+            "WHERE kb_id=%s AND version=%s AND extraction_snapshot ? 'es' "
+            "ORDER BY id DESC LIMIT %s", (_KB_ID, world, limit)).fetchall()
+    return [r["es"] for r in rows if isinstance(r.get("es"), dict)]

@@ -202,8 +202,14 @@ function summaryText(s) {
   // 「一部が化けている（要確認）」は対象外にしない別枠（`partial_extraction_suspected` と同型）。
   if (s.counts_as_of && s.encoding_partial_count) p.push(`一部が化けている（要確認） ${esc(s.encoding_partial_count)} 件`);
   p.push(`関係グラフ ${esc(s.graph_nodes)} 件`);
-  if (s.es_chunks != null) p.push(`全文検索 ${esc(s.es_chunks)} 片`);
-  else if (s.indexed > 0) p.push('全文検索 未接続');
+  // 全文検索の状態（`es_state`）。索引が残ると言えるのは `es_index_kept` のときだけ。
+  if (s.es_state === 'reflecting') p.push('全文検索 反映中');
+  else if (s.es_state === 'failed') {
+    const why = s.es_error ? `（${esc(s.es_error)}）` : '';
+    p.push(`全文検索 前回の反映に失敗${why}${s.es_index_kept ? '・今ある索引で検索できます' : ''}`);
+  } else if (s.es_state === 'unavailable') { if (s.indexed > 0) p.push('全文検索 未接続'); }
+  else if (s.es_state === 'unknown') { if (s.indexed > 0) p.push('全文検索 確認中'); }
+  else if (s.es_chunks != null) p.push(`全文検索 ${esc(s.es_chunks)} 片`);
   return p.join(' ／ ');
 }
 

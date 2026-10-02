@@ -11,8 +11,15 @@ graph/ES へ live 照会しない）。`store.get_latest_run_summary`/`get_lates
 """
 from __future__ import annotations
 
+import pytest
+
 from sherpa import store
 from sherpa.routers import worlds as worlds_router
+
+
+@pytest.fixture(autouse=True)
+def _no_es_attempts(monkeypatch):
+    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
 
 _BASE_REP = {"scanned": 1, "indexed": 0, "by_doctype": {}, "office_md": 0,
             "skipped_office": 0, "office_failed": 0, "skipped_other": 0, "skipped_ext": {},

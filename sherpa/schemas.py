@@ -1442,6 +1442,9 @@ class IngestSummaryFields(BaseModel):
     graph_nodes: int
     graph_edges: int
     es_chunks: int | None
+    es_state: Literal["ok", "reflecting", "failed", "unavailable", "unknown"]
+    es_error: str | None
+    es_index_kept: bool | None
     last_run_id: int | None
     last_run_status: str | None
     last_run_warnings: list[str]

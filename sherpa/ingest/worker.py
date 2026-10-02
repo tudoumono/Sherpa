@@ -899,7 +899,10 @@ def _record_es_index_failure(world: str, reason: str, *, run_id: int | None = No
     try:
         store.add_ingest_run(
             world, status="failed",
-            extraction_snapshot={"stage": "es_index", "error": reason},
+            extraction_snapshot={"stage": "es_index", "error": reason,
+                                 # 接続できないだけ（unavailable）は失敗の理由ではなく未接続として残す
+                                 "es": {"available": False,
+                                        "error": None if reason == "unavailable" else reason}},
             created_by="admin")
     except Exception:
         _log.warning(
