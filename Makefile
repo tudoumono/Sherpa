@@ -78,7 +78,7 @@ COMPOSE_ALL := $(COMPOSE) --profile ocr
 
 up:                ## ストア起動（Postgres/Neo4j/ES）＋ OCR ワーカー（前提が揃っていれば）
 	$(COMPOSE) up -d
-	@./scripts/ocr-up.sh || true
+	@./scripts/ocr-up.sh
 
 ocr-models:        ## OCR のモデルを取得（約134MB・閉域へはこのフォルダを丸ごとコピー）
 	./scripts/fetch_ocr_models.sh

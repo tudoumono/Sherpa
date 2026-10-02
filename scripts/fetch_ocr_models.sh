@@ -18,6 +18,21 @@ CACHE="${SHERPA_OCR_MODEL_CACHE:-$ROOT/data/ocr-models}"
 VENV="$ROOT/.venv-ocr"
 LOCK="$ROOT/docker/ocr-models.lock.json"
 
+# paddleocr は共有ライブラリを要求する。無いと長い traceback で落ちるため、import の前に確かめて
+# 手順を示す（Linux のみ・macOS には該当しない）。
+if [ "$(uname -s)" = "Linux" ] && command -v ldconfig >/dev/null 2>&1; then
+  _missing=""
+  for _lib in libGL.so.1 libglib-2.0.so.0 libgomp.so.1; do
+    ldconfig -p 2>/dev/null | grep -q "$_lib" || _missing="$_missing $_lib"
+  done
+  if [ -n "$_missing" ]; then
+    echo "OCR に必要なライブラリが見つかりません:$_missing" >&2
+    echo "  次を実行してから、もう一度 make ocr-models を実行してください:" >&2
+    echo "  sudo apt-get install -y libgl1 libglib2.0-0 libgomp1" >&2
+    exit 1
+  fi
+fi
+
 # OCR の依存はコアと同居できない（コア=numpy 2.5系 / paddlex=numpy<2.4 必須）。
 # そのため専用の venv を使う。無ければ作る。
 if [ ! -x "$VENV/bin/python" ]; then

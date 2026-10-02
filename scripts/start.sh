@@ -230,7 +230,9 @@ echo "ローカルデータを準備し、ストアの起動を待ちます..."
 
 # OCR ワーカー（画像内文字の読み取り）。登録済み資料フォルダを見て起動先を決めるため、
 # ストアが healthy になった後に呼ぶ。前提が足りなければ案内だけ出して起動は続行する。
-./scripts/ocr-up.sh || true
+# 起動・更新に失敗（コード更新の失敗など）したときもアプリは起動を続け、最後に目立つ警告を出して非ゼロで終える。
+ocr_up_rc=0
+./scripts/ocr-up.sh || ocr_up_rc=$?
 
 # OpenAI API キーの案内（未設定でもブロックしない）
 check_openai_key
@@ -364,3 +366,9 @@ echo "  停止:   make stop        （アプリ＋Caddy＋ストアを全部停�
 echo "  再起動: make restart"
 echo "  ログ:   tail -f ${APP_LOG#$ROOT/}"
 echo "──────────────────────────────────────────────"
+if [ "$ocr_up_rc" != 0 ]; then
+  echo ""
+  echo "【失敗】OCR ワーカーを起動・更新できませんでした（上の表示を確認）。アプリ本体は起動しています。" >&2
+  echo "  直してから make up を実行してください。" >&2
+  exit "$ocr_up_rc"
+fi
