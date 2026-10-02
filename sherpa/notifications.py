@@ -65,7 +65,7 @@ def _world_labels() -> dict[str, str]:
 
 
 def _item(*, kind: str, world: str, world_label: str, status: str, message: str, at,
-         admin_only: bool, action: dict | None = None) -> dict:
+         admin_only: bool, action: dict | None = None, link: str | None = None) -> dict:
     at_iso = _iso(at) or datetime.now(timezone.utc).isoformat()
     return {
         "id": f"{kind}:{world}:{at_iso}",
@@ -77,6 +77,7 @@ def _item(*, kind: str, world: str, world_label: str, status: str, message: str,
         "created_at": at_iso,
         "admin_only": admin_only,
         "action": action,
+        "link": link,              # 画面遷移先（ボタン操作ではなく開くだけの通知）
     }
 
 
@@ -170,10 +171,31 @@ def _ocr_notifications(labels: dict[str, str]) -> list[dict]:
     return items
 
 
-def list_notifications(*, is_admin: bool) -> list[dict]:
-    """ホーム画面向けの通知一覧（新しい順）。`is_admin=False` は a) のみ返す。"""
+_SHARE_LABEL = "会話の共有"
+
+
+def _share_expiry_notifications(uid: str) -> list[dict]:
+    """d) 自分が所有する共有の期限が近い（7 日以内）通知。所有者本人にだけ出す（既読管理なし）。"""
+    now = datetime.now(timezone.utc)
+    items = []
+    for r in store.list_expiring_shares_for_owner(uid):
+        exp = r["expires_at"]
+        days = max(1, -(-int((exp - now).total_seconds()) // 86400))   # 切り上げ（残り 0 日表示を避ける）
+        title = r.get("title") or "会話"
+        items.append(_item(
+            kind="share_expiring", world=str(r["share_id"]), world_label=_SHARE_LABEL, status="warn",
+            message=f"共有『{title}』の期限が{days}日後（{exp.astimezone().strftime('%Y-%m-%d')}）に切れます。延長できます。",
+            at=now, admin_only=False,
+            link=f"/ui/chat.html?conv={r['conversation_id']}&share=1"))
+    return items
+
+
+def list_notifications(*, is_admin: bool, uid: str | None = None) -> list[dict]:
+    """ホーム画面向けの通知一覧（新しい順）。`is_admin=False` は a)（＋uid 指定時は d）のみ返す。"""
     labels = _world_labels()
     items = _ingest_run_notifications(labels)
+    if uid:
+        items += _share_expiry_notifications(uid)
     if is_admin:
         items += _llm_render_notifications(labels)
         items += _ocr_notifications(labels)

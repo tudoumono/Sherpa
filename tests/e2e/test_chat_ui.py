@@ -1255,6 +1255,23 @@ def test_chat_can_share_current_conversation(page, web_base_url):
     assert "expires_at" in records["share_create"][-1]
 
 
+def test_chat_share_dialog_extend_button_posts_30_days(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html")
+    page.locator("#input").fill("消費税率を変えたい。影響は？")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+
+    page.locator("#sharebtn").click()
+    expect(page.locator("#share-days")).to_have_value("30")   # 標準は30日・無期限の選択肢は無い
+    expect(page.locator("#share-days option")).not_to_contain_text(["無期限"])
+    page.locator("[data-share-extend='77']").click()
+    expect(page.locator("#toast")).to_contain_text("30日後")
+    assert records["share_extend"] == [("/conversation-shares/77/extend", {"days": 30})]
+
+
 def test_chat_share_dialog_autocomplete_pick_and_chip_and_free_text_combine(page, web_base_url):
     """バッチ2・5番（2026-07-03）: 入力中にドロップダウン候補（デバウンス200ms）→クリックで確定し
     チップ化。既存のカンマ区切り手入力（チップ化しない自由入力）と組み合わせても両方送られる

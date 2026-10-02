@@ -367,8 +367,8 @@ def test_revoke_makes_share_unavailable():
         assert data.get("share_status") == "unavailable" or data.get("messages") == []
 
 
-def test_share_create_without_expires_at_is_unlimited_and_survives_source_delete():
-    """2026-07-02-共有の無期限と永続化.md: expires_at 省略（無期限）で作成→click 成功、
+def test_share_create_without_expires_at_defaults_30d_and_survives_source_delete():
+    """expires_at 省略（作成+30日）で作成→click 成功、
     かつ共有元を削除しても受領側は読める（API 経由のエンドツーエンド確認）。"""
     if not _try_init():
         pytest.skip("DB down")
@@ -384,11 +384,19 @@ def test_share_create_without_expires_at_is_unlimited_and_survives_source_delete
     olr = client.post("/auth/login", json={"username": owner_uid, "password": owner_pw})
     owner_cookies = olr.cookies
 
-    # expires_at を省略（Optional・省略時は None=無期限）。
+    # expires_at を省略＝作成から 30 日。明示的な null（無期限）は 422。
+    nr = client.post(f"/conversations/{cid}/shares",
+                     json={"invitee_user_ids": [invitee_uid], "expires_at": None},
+                     cookies=owner_cookies)
+    assert nr.status_code == 422, nr.text
     sr = client.post(f"/conversations/{cid}/shares",
                      json={"invitee_user_ids": [invitee_uid]},
                      cookies=owner_cookies)
     assert sr.status_code == 200, sr.text
+    lst = store.list_shares_for_conversation(owner_uid, cid)
+    assert len(lst) == 1
+    delta = lst[0]["expires_at"] - lst[0]["created_at"]
+    assert timedelta(days=30) - timedelta(seconds=5) <= delta <= timedelta(days=30) + timedelta(seconds=5)
     share_url = sr.json()["url"]
 
     ilr = client.post("/auth/login", json={"username": invitee_uid, "password": invitee_pw})
@@ -593,3 +601,145 @@ def test_admin_password_reset_forces_change_on_next_login():
     lr = client.post("/auth/login", json={"username": usr_uid, "password": f"reset-pass-{sfx}"})
     assert lr.status_code == 200, lr.text
     assert lr.json()["must_change_password"] is True
+
+
+def _audit_insert_fails(monkeypatch, action: str):
+    """指定 action の監査 INSERT だけを失敗させる（監査は外部境界ではなく検証対象の失敗点）。"""
+    real = store._audit_insert
+
+    def boom(c, actor, act, *a, **kw):
+        if act == action:
+            raise RuntimeError("audit down")
+        return real(c, actor, act, *a, **kw)
+    monkeypatch.setattr(store, "_audit_insert", boom)
+
+
+def test_share_revoke_audit_failure_keeps_share_active(monkeypatch):
+    """取消と監査は同一トランザクション: 監査が失敗したら 500 で取消も戻る（共有は有効のまま）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    owner_uid, owner_pw = _mk_user(f"rao{sfx}")
+    invitee_uid, _ = _mk_user(f"rai{sfx}")
+    cid = store.create_conversation(user_id=owner_uid, world="v1", title="取消監査")["id"]
+    store.add_message(cid, "user", "q")
+    cookies = client.post("/auth/login", json={"username": owner_uid, "password": owner_pw}).cookies
+    sid = client.post(f"/conversations/{cid}/shares", json={"invitee_user_ids": [invitee_uid]},
+                      cookies=cookies).json()["share_id"]
+
+    _audit_insert_fails(monkeypatch, "share.revoked")
+    with TestClient(app, raise_server_exceptions=False) as c2:
+        r = c2.post(f"/conversation-shares/{sid}/revoke", cookies=cookies)
+    assert r.status_code == 500
+    assert [s for s in store.list_shares_for_conversation(owner_uid, cid)
+            if s["share_id"] == sid][0]["revoked_at"] is None
+
+
+def test_share_receive_audit_failure_creates_no_wrapper(monkeypatch):
+    """受領と監査は同一トランザクション: 監査が失敗したら 500 で受領ラッパーも作られない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    owner_uid, owner_pw = _mk_user(f"rbo{sfx}")
+    invitee_uid, invitee_pw = _mk_user(f"rbi{sfx}")
+    cid = store.create_conversation(user_id=owner_uid, world="v1", title="受領監査")["id"]
+    store.add_message(cid, "user", "q")
+    ocookies = client.post("/auth/login", json={"username": owner_uid, "password": owner_pw}).cookies
+    url = client.post(f"/conversations/{cid}/shares", json={"invitee_user_ids": [invitee_uid]},
+                      cookies=ocookies).json()["url"]
+    icookies = client.post("/auth/login", json={"username": invitee_uid, "password": invitee_pw}).cookies
+
+    _audit_insert_fails(monkeypatch, "share.accepted")
+    with TestClient(app, raise_server_exceptions=False) as c2:
+        r = c2.get(url, cookies=icookies, follow_redirects=False)
+    assert r.status_code == 500
+    assert [c for c in store.list_conversations(invitee_uid) if c["origin"] == "received_share"] == []
+
+
+# ===== 期限前の通知・延長 =====
+
+def _sql(q: str, *args):
+    import psycopg
+    with psycopg.connect(store._dsn()) as c:
+        c.execute(q, args)
+        c.commit()
+
+
+def _share_via_api(prefix: str):
+    sfx = _sfx()
+    owner_uid, owner_pw = _mk_user(f"{prefix}o{sfx}")
+    invitee_uid, invitee_pw = _mk_user(f"{prefix}i{sfx}")
+    cid = store.create_conversation(user_id=owner_uid, world="v1", title=f"延長{sfx}")["id"]
+    store.add_message(cid, "user", "q")
+    ocookies = client.post("/auth/login", json={"username": owner_uid, "password": owner_pw}).cookies
+    r = client.post(f"/conversations/{cid}/shares", json={"invitee_user_ids": [invitee_uid]}, cookies=ocookies)
+    assert r.status_code == 200, r.text
+    return owner_uid, invitee_uid, invitee_pw, cid, r.json()["share_id"], r.json()["url"], ocookies
+
+
+def test_share_expiry_notice_owner_only_within_7_days_incl_legacy_null():
+    from sherpa import notifications
+    if not _try_init():
+        pytest.skip("DB down")
+    owner, invitee, _, cid, sid, _, _ = _share_via_api("na")
+    # 8 日後に切れる共有 → 通知なし
+    _sql("UPDATE conversation_shares SET expires_at=now() + interval '8 days' WHERE id=%s", sid)
+    assert [n for n in notifications.list_notifications(is_admin=False, uid=owner)
+            if n["kind"] == "share_expiring"] == []
+    # 旧 NULL 行（作成 25 日前＝残り 5 日）→ 所有者にだけ出る
+    _sql("UPDATE conversation_shares SET expires_at=NULL, created_at=now() - interval '25 days' WHERE id=%s", sid)
+    got = [n for n in notifications.list_notifications(is_admin=False, uid=owner) if n["kind"] == "share_expiring"]
+    assert len(got) == 1 and "5日後" in got[0]["message"] and f"conv={cid}" in got[0]["link"]
+    assert [n for n in notifications.list_notifications(is_admin=False, uid=invitee)
+            if n["kind"] == "share_expiring"] == []
+    assert [n for n in notifications.list_notifications(is_admin=False)
+            if n["kind"] == "share_expiring"] == []
+
+
+def test_share_extend_sets_now_plus_days_and_rejects_bad_requests():
+    if not _try_init():
+        pytest.skip("DB down")
+    owner, invitee, invitee_pw, cid, sid, _, ocookies = _share_via_api("ne")
+    assert client.post(f"/conversation-shares/{sid}/extend", json={"days": 31}, cookies=ocookies).status_code == 422
+    assert client.post(f"/conversation-shares/{sid}/extend", json={"days": 0}, cookies=ocookies).status_code == 422
+    r = client.post(f"/conversation-shares/{sid}/extend", json={"days": 10}, cookies=ocookies)
+    assert r.status_code == 200, r.text
+    row = [s for s in store.list_shares_for_conversation(owner, cid) if s["share_id"] == sid][0]
+    delta = row["expires_at"] - datetime.now(timezone.utc)
+    assert timedelta(days=10) - timedelta(minutes=1) <= delta <= timedelta(days=10)
+    # 非所有者・不在は 404（存在を漏らさない）
+    icookies = client.post("/auth/login", json={"username": invitee, "password": invitee_pw}).cookies
+    assert client.post(f"/conversation-shares/{sid}/extend", json={}, cookies=icookies).status_code == 404
+    assert client.post("/conversation-shares/999999999/extend", json={}, cookies=ocookies).status_code == 404
+    # 取消済みは 404
+    assert client.post(f"/conversation-shares/{sid}/revoke", cookies=ocookies).status_code == 200
+    assert client.post(f"/conversation-shares/{sid}/extend", json={}, cookies=ocookies).status_code == 404
+
+
+def test_share_extend_audit_failure_keeps_expiry(monkeypatch):
+    if not _try_init():
+        pytest.skip("DB down")
+    owner, _, _, cid, sid, _, ocookies = _share_via_api("nf")
+    before = [s for s in store.list_shares_for_conversation(owner, cid) if s["share_id"] == sid][0]["expires_at"]
+    _sql("UPDATE conversation_shares SET expires_at=now() + interval '2 days' WHERE id=%s", sid)
+    _audit_insert_fails(monkeypatch, "share.extended")
+    with TestClient(app, raise_server_exceptions=False) as c2:
+        r = c2.post(f"/conversation-shares/{sid}/extend", json={"days": 30}, cookies=ocookies)
+    assert r.status_code == 500
+    after = [s for s in store.list_shares_for_conversation(owner, cid) if s["share_id"] == sid][0]["expires_at"]
+    assert after - datetime.now(timezone.utc) < timedelta(days=3) and after < before
+
+
+def test_recipient_regains_access_after_extending_expired_share():
+    if not _try_init():
+        pytest.skip("DB down")
+    owner, invitee, invitee_pw, cid, sid, url, ocookies = _share_via_api("nr")
+    icookies = client.post("/auth/login", json={"username": invitee, "password": invitee_pw}).cookies
+    assert client.get(url, cookies=icookies, follow_redirects=False).status_code in (200, 302)
+    wid = [c for c in store.list_conversations(invitee) if c["origin"] == "received_share"][0]["id"]
+    _sql("UPDATE conversation_shares SET expires_at=now() - interval '1 day' WHERE id=%s", sid)
+    assert store.get_conversation_for_read(invitee, wid)["share_status"] == "unavailable"
+    assert client.post(f"/conversation-shares/{sid}/extend", json={}, cookies=ocookies).status_code == 200
+    rec = [c for c in store.list_conversations(invitee) if c["id"] == wid][0]
+    assert rec["share_status"] == "active" and rec["share_expires_at"] is not None
+    assert len(store.get_conversation_for_read(invitee, wid)["messages"]) == 1

@@ -21,7 +21,7 @@ _JST = timezone(timedelta(hours=9))
 # 同じ allowlist で畳み込む二重防御。store.py は他の sherpa.* を import しない設計
 # （循環 import 回避・store は最下層）のため、`sherpa.agents.AGENT_PROVIDERS` の値をここに複製する。
 # 値を変更したらそちらも合わせて確認すること。
-_USAGE_KNOWN_PROVIDERS = ("heuristic", "codex", "openai", "gemini", "bedrock", "ollama")
+_USAGE_KNOWN_PROVIDERS = ("heuristic", "codex", "openai", "gemini", "bedrock", "ollama", "simple")
 
 
 def _usage_period_bounds(days: int):
@@ -625,13 +625,18 @@ def _compute_final_reason_codes(final_claims_rows) -> list[dict]:
 # 保存されなかった行＝利用者の停止等で assistant 未保存の巡が、次ターンの assistant に
 # 誤って結合し水増しされる）。範囲内に assistant が無ければ `turn_message_id` は NULL のまま
 # （`_compute_round_stats` 側で `unmatched_rounds` に計上する）。
-def _round_rows_query(c, start_ts, end_exclusive_ts):
-    # 巡が属する user ターン＝その巡の ts を含む区間 [その user の created_at, 次の user の created_at)。
-    # 区間の包含で 1 件に決まるため、巡ごとの並べ替え・LATERAL を要さない（巡×ターンを会話単位で
-    # 結合するだけ）。巡の本体（meta 等の幅のある列）は対応付けが済んだ後で id から引く。
-    return c.execute(
+def _build_usage_rounds(c, start_ts, end_exclusive_ts) -> None:
+    """期間内の `chat-round` を、所属ターン・assistant 対応付け済みで一時表 `usage_rounds` へ作る
+    （呼び出しトランザクションの終了で消える）。`meta`（JSONB）は巡ごとに取り出す欄だけを生の
+    JSONB のまま持つ（`->` は meta がオブジェクトでなければ NULL＝`_compute_round_stats` の `or {}`
+    と同じ空扱い）。型の判定・合算は集計側（`_round_stats_from_sql`）が値の種類ごとに 1 回だけ行う。
+    """
+    c.execute("DROP TABLE IF EXISTS pg_temp.usage_rounds")
+    c.execute(
+        "CREATE TEMP TABLE usage_rounds ON COMMIT DROP AS "
         "WITH rounds AS ("
-        "  SELECT e.id, e.ts, e.conversation_id FROM usage_events e "
+        "  SELECT e.id, e.ts, e.conversation_id, e.provider, e.input_tokens, e.output_tokens, "
+        "    e.elapsed_ms, e.meta FROM usage_events e "
         "  WHERE e.kind = 'chat-round' AND e.ts >= %s AND e.conversation_id IS NOT NULL"
         "), user_msgs AS ("
         "  SELECT m.conversation_id, m.created_at, "
@@ -655,25 +660,186 @@ def _round_rows_query(c, start_ts, end_exclusive_ts):
         "    AND (o.next_user_created_at IS NULL OR am.created_at < o.next_user_created_at) "
         "  ORDER BY o.round_id, am.created_at ASC"
         ") "
-        "SELECT e.ts, e.provider, e.input_tokens, e.output_tokens, e.elapsed_ms, e.meta, "
-        "  x.turn_message_id, x.depth_profile "
-        "FROM matched x JOIN usage_events e ON e.id = x.round_id",
+        "SELECT x.turn_message_id, "
+        "  COALESCE(NULLIF(x.depth_profile, ''), 'unknown') AS depth, "
+        "  COALESCE(NULLIF(r.provider, ''), 'unknown') AS provider, "
+        "  r.input_tokens, r.output_tokens, r.elapsed_ms, "
+        "  r.meta->'round' AS rnd, r.meta->'citations_delta' AS cit, "
+        "  r.meta->'claims'->'confirmed' AS cl_confirmed, r.meta->'claims'->'inferred' AS cl_inferred, "
+        "  r.meta->'claims'->'unknown' AS cl_unknown, r.meta->'claims'->'reason_codes' AS reason_codes, "
+        "  r.meta->'limits' AS limits, r.meta->'verdict' AS verdict, r.meta->'stop' AS stop, "
+        "  r.meta->'missing_codes' AS missing "
+        "FROM matched x JOIN rounds r ON r.id = x.round_id",
         (start_ts, start_ts, end_exclusive_ts),
+    )
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _round_stats_from_sql(c) -> dict:
+    """一時表 `usage_rounds`（`_build_usage_rounds`）を集計し、`_compute_round_stats` と同じ形の
+    dict を返す。巡の行は Python へ引かない: 同じ値の巡を SQL で束ね（巡数 `w`）、値の種類ごとに
+    `_accumulate_round` と同じ規則（どの欄をどの型で数えるか）を `w` 倍して足す——コストは巡数でなく
+    値の種類（引用増分・主張件数・理由コード・limits・不足軸の組）に比例する。
+    """
+    has_tokens = "(input_tokens IS NOT NULL OR output_tokens IS NOT NULL)"
+    scalars = c.execute(
+        "SELECT depth, provider, rnd, cit, cl_confirmed, cl_inferred, cl_unknown, COUNT(*) AS w, "
+        "  COALESCE(SUM(elapsed_ms), 0) AS elapsed_total, COUNT(elapsed_ms) AS elapsed_n, "
+        f"  COALESCE(SUM(COALESCE(input_tokens, 0)) FILTER (WHERE {has_tokens}), 0) AS input_total, "
+        f"  COALESCE(SUM(COALESCE(output_tokens, 0)) FILTER (WHERE {has_tokens}), 0) AS output_total, "
+        f"  COUNT(*) FILTER (WHERE {has_tokens}) AS tokens_n "
+        "FROM usage_rounds GROUP BY depth, provider, rnd, cit, cl_confirmed, cl_inferred, cl_unknown"
     ).fetchall()
+    maps = c.execute(
+        "SELECT depth, provider, rnd, reason_codes, limits, COUNT(*) AS w FROM usage_rounds "
+        "GROUP BY depth, provider, rnd, reason_codes, limits"
+    ).fetchall()
+    labels = c.execute(
+        "SELECT depth, provider, rnd, verdict, stop, missing, COUNT(*) AS w FROM usage_rounds "
+        "GROUP BY depth, provider, rnd, verdict, stop, missing"
+    ).fetchall()
+    dist = c.execute(
+        "SELECT depth, provider, rounds_reached, COUNT(*) AS turns FROM ("
+        "  SELECT turn_message_id, MIN(depth) AS depth, MIN(provider) AS provider, "
+        "    MAX(CASE WHEN jsonb_typeof(rnd) = 'number' AND rnd::text ~ '^-?[0-9]{1,15}$' "
+        "      THEN (rnd #>> '{}')::bigint END) AS max_round "
+        "  FROM usage_rounds WHERE turn_message_id IS NOT NULL GROUP BY turn_message_id"
+        ") t CROSS JOIN LATERAL (SELECT CASE WHEN COALESCE(t.max_round, 0) > 0 "
+        "  THEN t.max_round ELSE 1 END AS rounds_reached) rr "
+        "GROUP BY depth, provider, rounds_reached"
+    ).fetchall()
+    unmatched = c.execute(
+        "SELECT COUNT(*) AS n FROM usage_rounds WHERE turn_message_id IS NULL").fetchone()["n"]
+
+    by_fine: dict[tuple, dict] = {}
+
+    def _bucket(r) -> dict:
+        rd = r["rnd"]
+        round_no = rd if _is_int(rd) else None
+        key = (r["depth"], r["provider"], round_no)
+        agg = by_fine.get(key)
+        if agg is None:
+            agg = by_fine[key] = _new_round_bucket(r["depth"], r["provider"])
+            agg["round_no"] = round_no
+        return agg
+
+    for r in scalars:
+        agg, w = _bucket(r), r["w"]
+        agg["rounds"] += w
+        cd = r["cit"]
+        if isinstance(cd, (int, float)) and not isinstance(cd, bool):
+            agg["citations_delta_total"] += cd * w
+        agg["elapsed_ms_total"] += int(r["elapsed_total"])
+        agg["elapsed_n"] += r["elapsed_n"]
+        agg["input_tokens"] += int(r["input_total"])
+        agg["output_tokens"] += int(r["output_total"])
+        agg["tokens_n"] += r["tokens_n"]
+        for status in _CLAIM_STATUS_KEYS:
+            v = r[f"cl_{status}"]
+            if _is_int(v):
+                agg["claims"][status] += v * w
+    for r in maps:
+        agg, w = _bucket(r), r["w"]
+        rc = r["reason_codes"]
+        if isinstance(rc, dict):
+            for code, n in rc.items():
+                if _is_int(n):
+                    agg["reason_codes"][code] = agg["reason_codes"].get(code, 0) + n * w
+        limits = r["limits"]
+        if isinstance(limits, dict):
+            for k, v in limits.items():
+                if k not in _ROUND_LIMIT_KEYS:
+                    continue
+                if isinstance(v, bool):
+                    if v:
+                        agg["limits"][k] = agg["limits"].get(k, 0) + w
+                elif isinstance(v, (int, float)):
+                    agg["limits"][k] = agg["limits"].get(k, 0) + v * w
+    for r in labels:
+        agg, w = _bucket(r), r["w"]
+        for field, key in (("verdicts", "verdict"), ("stops", "stop")):
+            v = r[key]
+            if isinstance(v, str) and v:
+                agg[field][v] = agg[field].get(v, 0) + w
+        missing = r["missing"]
+        if isinstance(missing, (list, str, dict)):   # 元の `for code in meta.get("missing_codes") or []` と同じ反復対象
+            for code in missing:
+                if isinstance(code, str) and code:
+                    agg["missing_codes"][code] = agg["missing_codes"].get(code, 0) + w
+
+    # 深さ×経路の合計は巡番号別の群を足し上げる。
+    by_dp: dict[tuple, dict] = {}
+    for (depth, provider, _rn), a in by_fine.items():
+        t = by_dp.setdefault((depth, provider), _new_round_bucket(depth, provider))
+        for f in ("rounds", "citations_delta_total", "elapsed_ms_total", "elapsed_n",
+                  "input_tokens", "output_tokens", "tokens_n"):
+            t[f] += a[f]
+        for status in _CLAIM_STATUS_KEYS:
+            t["claims"][status] += a["claims"][status]
+        for f in ("reason_codes", "limits", "verdicts", "stops", "missing_codes"):
+            for k, n in a[f].items():
+                t[f][k] = t[f].get(k, 0) + n
+
+    def _finalize(agg: dict) -> dict:
+        return {**agg,
+                "elapsed_ms_avg": (agg["elapsed_ms_total"] / agg["elapsed_n"]) if agg["elapsed_n"] else None,
+                "citations_delta_avg": (agg["citations_delta_total"] / agg["rounds"]) if agg["rounds"] else None}
+
+    return {
+        "by_depth_provider": [
+            _finalize(a) for a in sorted(by_dp.values(), key=lambda a: (a["depth_profile"], a["provider"]))],
+        "by_round": [
+            _finalize(a) for a in sorted(
+                by_fine.values(),
+                key=lambda a: (a["depth_profile"], a["provider"], a["round_no"] is None, a["round_no"] or 0))],
+        "round_distribution": [
+            {"depth_profile": r["depth"], "provider": r["provider"],
+             "rounds_reached": r["rounds_reached"], "turns": r["turns"]}
+            for r in sorted(dist, key=lambda r: (r["depth"], r["provider"], r["rounds_reached"]))],
+        "unmatched_rounds": unmatched,
+    }
 
 
 # 最終回答の不明理由コード（`turn_metrics.claims_unknown_reasons`）と最終ゲートの不足軸
 # （`gate_missing_codes`）を、組み立て済みの一時表 `usage_turns`（`_build_usage_turns`）から
 # 取る（`usage_stats()`/`usage_depth_rounds()` が共有）。主張を持つターン（`claims_unknown_reasons`
 # が NULL でない＝回答に `data.claims` 配列がある）だけが対象。`gate_missing_codes`（Codex 経路の
-# 最終ゲート）は Codex が `chat-round` を発生させないため、巡別記録（`_round_rows_query`）には
-# 不足軸が載らず、ここが唯一の取得点になる（API 経路は NULL のまま＝`_compute_round_stats` 側の
-# `missing_codes` 集計と二重計上にならない）。
-def _final_claims_rows_query(c):
-    return c.execute(
-        "SELECT provider, depth_profile, claims_unknown_reasons AS unknown_reasons, gate_missing_codes "
-        "FROM usage_turns WHERE claims_unknown_reasons IS NOT NULL"
+# 最終ゲート）は Codex が `chat-round` を発生させないため、巡別記録（`_build_usage_rounds`）には
+# 不足軸が載らず、ここが唯一の取得点になる（API 経路は NULL のまま＝`_round_stats_from_sql` 側の
+# `missing_codes` 集計と二重計上にならない）。ターンの行は Python へ引かず、深さ×経路×コードの
+# 合計だけを SQL で返す（規則は `_compute_final_reason_codes`/`_compute_final_missing_codes` と同一）。
+def _final_claims_from_sql(c) -> tuple[list[dict], dict[tuple, dict[str, int]]]:
+    """`(最終回答の不明理由コード分布, 最終ゲートの不足軸の深さ×経路別合算)`。ターンの行は Python へ
+    引かず、同じ値のターンを SQL で束ね（ターン数 `w`）、値の種類ごとに `_compute_final_reason_codes`/
+    `_compute_final_missing_codes` と同じ規則を `w` 倍して足す。"""
+    rows = c.execute(
+        "SELECT COALESCE(NULLIF(depth_profile, ''), 'unknown') AS depth, "
+        "  COALESCE(NULLIF(provider, ''), 'unknown') AS provider, "
+        "  claims_unknown_reasons AS unknown_reasons, gate_missing_codes, COUNT(*) AS w "
+        "FROM usage_turns WHERE claims_unknown_reasons IS NOT NULL "
+        "GROUP BY 1, 2, 3, 4"
     ).fetchall()
+    reasons: dict[tuple, dict[str, int]] = {}
+    missing_agg: dict[tuple, dict[str, int]] = {}
+    for r in rows:
+        key, w = (r["depth"], r["provider"]), r["w"]
+        bucket = reasons.setdefault(key, {})
+        for code, n in (r["unknown_reasons"] or {}).items():
+            bucket[code] = bucket.get(code, 0) + int(n) * w
+        codes = r["gate_missing_codes"]
+        if isinstance(codes, dict):
+            mb = missing_agg.setdefault(key, {})
+            for code, n in codes.items():
+                mb[code] = mb.get(code, 0) + int(n) * w
+    final_reasons = [
+        {"depth_profile": dp, "provider": pv, "reason_code": code, "claims": n}
+        for (dp, pv), bucket in sorted(reasons.items())
+        for code, n in sorted(bucket.items())
+    ]
+    return final_reasons, missing_agg
 
 
 def _compute_final_missing_codes(final_claims_rows) -> dict[tuple, dict[str, int]]:
@@ -702,7 +868,10 @@ def _merge_final_missing_codes(rounds_stats: dict, final_claims_rows) -> None:
     ため、既存集計に対応するバケットが無い（深さ, "codex"）組は新規バケットとして追加する
     （`rounds` 等の巡別指標は0のまま＝Codex 側にその意味の値が無いことを表す）。
     """
-    agg = _compute_final_missing_codes(final_claims_rows)
+    _merge_final_missing_agg(rounds_stats, _compute_final_missing_codes(final_claims_rows))
+
+
+def _merge_final_missing_agg(rounds_stats: dict, agg: dict[tuple, dict[str, int]]) -> None:
     if not agg:
         return
     by_key = {(a["depth_profile"], a["provider"]): a for a in rounds_stats["by_depth_provider"]}
@@ -719,10 +888,10 @@ def _merge_final_missing_codes(rounds_stats: dict, final_claims_rows) -> None:
     rounds_stats["by_depth_provider"].sort(key=lambda a: (a["depth_profile"], a["provider"]))
 
 
-def _round_reason_codes(rounds_stats: dict, final_claims_rows) -> dict:
+def _round_reason_codes(rounds_stats: dict, final_reasons: list[dict]) -> dict:
     """理由コード分布の2軸（`final`＝最終回答の主張／`rounds`＝巡別記録の主張内訳の合算）。"""
     return {
-        "final": _compute_final_reason_codes(final_claims_rows),
+        "final": final_reasons,
         "rounds": [
             {"depth_profile": a["depth_profile"], "provider": a["provider"],
              "reason_code": code, "claims": n}
@@ -837,7 +1006,7 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         `turn_created_at`。
       - `usage_events` 由来（chat-sub/chat-review/intent/embed ほか）: イベント自身の `ts`。
       - 巡集計（`rounds`・kind='chat-round'）: **その巡が属する user 発言の `created_at`**
-        （`_round_rows_query`）——巡イベント自身の `ts` が `to` を越えていても、所属する user 発言が
+        （`_build_usage_rounds`）——巡イベント自身の `ts` が `to` を越えていても、所属する user 発言が
         期間内なら数える（最終回答由来の集計と母集団を揃えるため）。
       - 品質採点（`quality_runs`）: **実行期間（`executed_from`/`executed_to`）の完全包含**
         （`depth_quality_stats`）——登録時刻では絞らない。
@@ -1077,13 +1246,14 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
         )
         # 巡別記録（`chat-round`）の表示専用集計——深さ（`answer->'usage'->>'depth_profile'`）×
         # 経路（provider）別の巡数分布・活動量（引用増分・所要時間・トークン）・主張の区分/理由
-        # コード内訳。期間境界・assistant 対応付けの規約は `_round_rows_query` 参照（他集計と同じ
+        # コード内訳。期間境界・assistant 対応付けの規約は `_build_usage_rounds` 参照（他集計と同じ
         # 「所属する user ターン」基準の境界に揃える）。
-        round_rows = _round_rows_query(c, start_ts, end_exclusive_ts)
+        _build_usage_rounds(c, start_ts, end_exclusive_ts)
+        rounds_stats = _round_stats_from_sql(c)
         # 最終回答の主張のうち不明（`status='unknown'`）の理由コード分布（主張単位）。深さ・経路
         # （`answer->'usage'`）別に数える——巡別（chat-round）の集計とは別軸（こちらは全巡を経た
         # 最終回答時点の判定・巡ごとの是正で覆った分は数えない）。
-        final_claims_rows = _final_claims_rows_query(c)
+        final_reasons, final_missing = _final_claims_from_sql(c)
 
     display_names = {r["uid"]: r["display_name"] for r in name_rows}
     _aux_key = {"auth.login": "logins", "document.downloaded": "downloads",
@@ -1313,9 +1483,8 @@ def usage_stats(days: int = 30, *, time_from: str | None = None, time_to: str | 
     # 巡別記録（表示専用）の深さ×経路別集計＋理由コードの主張単位分布（巡別＝chat-round の
     # meta 由来／最終＝最終回答の data.claims 由来。二軸とも課金集計（tokens.*）とは独立＝
     # 正本に触れない）。
-    rounds_stats = _compute_round_stats(round_rows)
-    rounds_stats["reason_codes"] = _round_reason_codes(rounds_stats, final_claims_rows)
-    _merge_final_missing_codes(rounds_stats, final_claims_rows)
+    rounds_stats["reason_codes"] = _round_reason_codes(rounds_stats, final_reasons)
+    _merge_final_missing_agg(rounds_stats, final_missing)
 
     return {
         "users": users, "totals": totals, "daily": daily, "period": period,
@@ -1996,14 +2165,14 @@ def usage_depth_rounds(days: int = 30, *, time_from: str | None = None,
         days = _clamp_days(days)
     start_ts, end_exclusive_ts, period = _usage_period(days, time_from=time_from, time_to=time_to)
     with _connect() as c:
-        round_rows = _round_rows_query(c, start_ts, end_exclusive_ts)
+        _build_usage_rounds(c, start_ts, end_exclusive_ts)
+        rounds_stats = _round_stats_from_sql(c)
         _build_usage_turns(c, start_ts, end_exclusive_ts)
-        final_claims_rows = _final_claims_rows_query(c)
-    rounds_stats = _compute_round_stats(round_rows)
+        final_reasons, _final_missing = _final_claims_from_sql(c)
     return _tool_json_projection({
         "period": period,
         "round_distribution": rounds_stats["round_distribution"],
         "unmatched_rounds": rounds_stats["unmatched_rounds"],
-        "reason_codes": _round_reason_codes(rounds_stats, final_claims_rows),
+        "reason_codes": _round_reason_codes(rounds_stats, final_reasons),
         "quality": depth_quality_stats(days, time_from=time_from, time_to=time_to),
     })

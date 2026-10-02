@@ -336,6 +336,9 @@ let _notifTimer = null;
 
 function notifItemHTML(n) {
   const icon = NOTIF_STATUS_ICON[n.status] || 'ℹ️';
+  const link = n.link ? `<div class="notif-actions">
+      <a class="act-btn" href="${esc(n.link)}">共有を確認・延長する</a>
+    </div>` : '';
   const action = n.action ? `<div class="notif-actions">
       <button class="act-btn" data-notif-method="${esc(n.action.method)}" data-notif-path="${esc(n.action.path)}"
         data-notif-ask="${n.action.confirm ? '1' : ''}">${esc(n.action.label)}</button>
@@ -347,7 +350,7 @@ function notifItemHTML(n) {
       <span class="notif-date">${esc(fmtDateTime(n.created_at))}</span>
     </div>
     <div class="notif-body">${esc(n.message)}</div>
-    ${action}
+    ${action}${link}
   </div>`;
 }
 

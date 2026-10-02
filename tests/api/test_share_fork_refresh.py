@@ -167,8 +167,11 @@ def test_fork_denied_when_share_expired():
     conv = store.create_conversation(user_id=owner, world="v1", title="期限切れ共有")
     cid = conv["id"]
     store.add_message(cid, "user", "質問")
-    sid = _mk_share(cid, owner, invitee, expires_at=_past(), sfx=sfx)
-    wid = store.accept_share(sid, invitee)
+    sid = _mk_share(cid, owner, invitee, sfx=sfx)
+    wid = store.accept_share(sid, invitee)   # 受領は有効なうちに済ませ、その後で期限切れにする
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE conversation_shares SET expires_at=%s WHERE id=%s", (_past(), sid))
+        c.commit()
 
     with pytest.raises(store.ForkNotAllowedError):
         store.fork_received_share(invitee, wid)
@@ -411,6 +414,27 @@ def test_refresh_updates_content_swaps_wrapper_source_soft_deletes_old():
     assert old_row[0] is not None, "旧 snapshot が soft delete されていない"
     assert wrapper_row[0] == new_snap, "受領ラッパーの source_conversation_id が新 snapshot に付け替わっていない"
     assert share_row[0] == th, "token_hash が refresh で変わった"
+
+
+def test_refresh_audit_failure_rolls_back_refresh(monkeypatch):
+    """更新と監査は同一トランザクション: 監査 INSERT が失敗したら snapshot は差し替わらない。"""
+    if not _try_init():
+        return
+    sfx = _sfx()
+    owner, invitee = _mk_users(sfx, "rfao", "rfai")
+    cid = store.create_conversation(user_id=owner, world="v1", title="再共有監査")["id"]
+    store.add_message(cid, "user", "最初の質問")
+    old_snap = store.create_sanitized_snapshot(owner, cid)
+    th = hashlib.sha256(f"refaud-{sfx}".encode()).hexdigest()
+    sid = store.create_share(old_snap, owner, th, _future(), [invitee])
+    store.add_message(cid, "user", "追加の質問")
+
+    def boom(*a, **kw):
+        raise RuntimeError("audit down")
+    monkeypatch.setattr(store, "_audit_insert", boom)
+    with pytest.raises(RuntimeError):
+        store.refresh_sanitized_share(owner, sid, audit={"ip_hash": None, "user_agent": ""})
+    assert store.resolve_share_by_token(th)["conversation_id"] == old_snap
 
 
 def test_refresh_non_sanitized_share_raises_not_sanitized():

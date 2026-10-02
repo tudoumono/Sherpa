@@ -290,14 +290,16 @@ def test_round_matching_equals_old_lateral_query():
     start, end, _ = U._usage_period(time_from=_FROM, time_to=_TO)
     with store._connect() as c:
         old = c.execute(_OLD_ROUND_SQL, (start, start, end)).fetchall()
-        new = U._round_rows_query(c, start, end)
-    def key(r):
-        return (r["ts"], r["provider"], r["turn_message_id"], r["depth_profile"])
+        U._build_usage_rounds(c, start, end)
+        new = c.execute("SELECT provider, turn_message_id, depth FROM usage_rounds").fetchall()
+    def key(provider, turn_id, depth):
+        return (provider, -1 if turn_id is None else turn_id, depth or "unknown")
 
-    assert sorted(map(key, new)) == sorted(map(key, old))
+    assert sorted(key(r["provider"], r["turn_message_id"], r["depth_profile"]) for r in old) == sorted(
+        key(r["provider"], r["turn_message_id"], r["depth"]) for r in new)
     assert len(new) == 3
     # 返答の保存されなかったターンの巡は、次のターンの返答へ結合しない
-    assert [r["turn_message_id"] for r in new if r["ts"] == s.time_of(s.orphan_user) + timedelta(seconds=30)] == [None]
+    assert sum(1 for r in new if r["turn_message_id"] is None) == 1
 
 
 def test_aggregation_does_not_read_answer_json():

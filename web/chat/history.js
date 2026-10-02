@@ -43,6 +43,10 @@ function _receivedConvHTML(c) {
   const statusLabel = status === 'expired' ? '期限切れ' : status === 'revoked' ? '共有取消' : inactive ? '利用不可' : '';
   const by = esc(c.shared_by_name || c.shared_by_user_id || '');
   const byText = by ? `${by}さんから` : '';
+  // 期限まで 7 日以内の有効な共有だけ、いつまで読めるかを添える。
+  const expMs = c.share_expires_at ? new Date(c.share_expires_at).getTime() : NaN;
+  const expText = (status === 'active' && expMs - Date.now() <= 7 * 86400 * 1000)
+    ? `この共有は ${esc(new Date(expMs).toLocaleDateString('sv-SE'))} まで閲覧できます` : '';
   return `<div class="conv${c.pinned ? ' pinned' : ''}${inactive ? ' conv-inactive' : ''}${id === S.cid ? ' on' : ''}" data-open="${id}" data-inactive="${inactive ? '1' : ''}">
      <button class="cmain" type="button" title="${esc(c.title || '会話')}" aria-label="${esc(c.title || '会話')}を開く">
        <span class="t">
@@ -50,7 +54,7 @@ function _receivedConvHTML(c) {
          <span class="badge-shared">共有</span><span class="badge-ro">🔒</span>${esc(c.title || '会話')}
          ${statusLabel ? `<span class="badge-status">${esc(statusLabel)}</span>` : ''}
        </span>
-       <span class="d">${byText ? `<span class="shared-by">${byText}</span>・` : ''}${date}</span>
+       <span class="d">${byText ? `<span class="shared-by">${byText}</span>・` : ''}${date}${expText ? `・${expText}` : ''}</span>
      </button>
      <button class="conv-more" type="button" data-conv-menu="${id}" aria-expanded="false"
        aria-controls="conv-actions-${id}" aria-label="${esc(c.title || '会話')}のその他の操作" title="その他の操作">

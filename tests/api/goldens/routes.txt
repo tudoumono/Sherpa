@@ -26,6 +26,7 @@ GET	/users/suggest	会話共有	users_suggest
 POST	/conversations/{cid}/shares	会話共有	conversation_share_create
 GET	/share/conversations/{token}	会話共有	share_click
 POST	/conversation-shares/{share_id}/revoke	会話共有	conversation_share_revoke
+POST	/conversation-shares/{share_id}/extend	会話共有	conversation_share_extend
 POST	/conversations/{wid}/fork	会話共有	conversation_fork
 POST	/conversation-shares/{share_id}/refresh	会話共有	conversation_share_refresh
 GET	/conversations/{cid}/shares	会話共有	conversation_shares_list

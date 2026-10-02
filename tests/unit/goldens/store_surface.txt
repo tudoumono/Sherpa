@@ -11,6 +11,7 @@ QUALITY_RUN_CONDITIONS
 SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK
 SelfIssuedQuotaExceededError
 ShareNotSanitizedError
+ShareUnavailableError
 UsagePeriodError
 UserApiKeysDisallowedError
 _ANNOUNCEMENT_FIELDS
@@ -96,6 +97,7 @@ document_exists
 downgrade_orphaned_extracting_runs
 ensure_rows
 expired_workspace_files
+extend_share
 fail_close_if_extracting
 finish_ingest_run
 finish_ingest_run_and_confirm_world
@@ -131,6 +133,7 @@ list_conversations
 list_document_worlds
 list_documents
 list_documents_page
+list_expiring_shares_for_owner
 list_export_messages
 list_ingest_runs
 list_shares_for_conversation

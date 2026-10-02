@@ -9,7 +9,7 @@
 「スキーマが実測とずれている」方を直す（アプリ側 `sherpa/routers/*.py`・`sherpa/schemas.py` は
 変えても、応答内容そのものは変えない）。
 
-非対象（63件中6件・JSON でないため TypeAdapter 適用不可）:
+非対象（65件中6件・JSON でないため TypeAdapter 適用不可）:
   - GET /documents/download（StreamingResponse・fd 配信）・GET /workspace/files/{file_id}/download（FileResponse）
   - GET /admin/audit/export（CSV/JSONL の Response）・GET /admin/usage/export（ZIP の StreamingResponse）
   - GET /chat/stream・GET /chat/turns/{turn_id}/stream（StreamingResponse・SSE）
@@ -766,4 +766,4 @@ def test_ext_keys_route_set_matches_mocked_registry():
 def test_mocked_registry_route_count_matches_docstring_claim():
     """このファイル・`sherpa/schemas.py` の docstring が「`MOCKED` の全ルート」と主張している
     実際の件数を機械的に固定する（新規ルート追加時に更新漏れがあれば、ここで検知される）。"""
-    assert len(mock_api.MOCKED) == 63
+    assert len(mock_api.MOCKED) == 65
