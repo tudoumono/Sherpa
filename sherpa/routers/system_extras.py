@@ -245,6 +245,9 @@ class SystemSettingsReq(BaseModel):
     # 埋め込み HTTP の同時送信数（`sherpa.embeddings.embed()` の有界スレッドプール）。
     # 既定（未指定=None）は `embeddings.EMBED_PARALLEL_DEFAULT`（4）。null は未設定へ戻す。
     embed_parallel: StrictInt | None = Field(default=None, ge=1, le=16)
+    # 埋め込みの接続先。"auto"（回答用に選んだクラウドに従う・既定）／"ollama"（常に中央 Ollama）。
+    # null は未設定（既定 auto）へ戻す。回答側のプロバイダ選択（cloud_provider）とは独立。
+    embed_provider: str | None = None
     # 「最大」の深さが許す査読の巡数（`depth_profile.review_rounds_for`）。クイック 0・標準 2・
     # 深く 4 は固定（この上限で頭打ち）で、設定はこの 1 項目だけ。既定（未指定=None）は `depth_profile.MAX_REVIEW_ROUNDS_DEFAULT`（7）。
     # null は未設定へ戻す。
@@ -914,6 +917,14 @@ def _admin_settings_view() -> dict:
         },
         # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_provider_batches` を
         # 束ねて並列送信する本数）。env フォールバックは持たない（設定は UI(DB) が唯一の持ち主）。
+        "embed_provider": {
+            "configured": sysset.get("embed_provider"),
+            "effective": embeddings.effective_embed_provider(sysset),
+            "default": embeddings.EMBED_PROVIDER_DEFAULT,
+            "options": list(embeddings.EMBED_PROVIDERS),
+            "ollama_model": model_catalog.resolve_model("ollama", "embed", None, system_settings=sysset)
+                            or embeddings._MODELS["ollama"][0],
+        },
         "embed_parallel": {
             "configured": sysset.get("embed_parallel"),
             "effective": embeddings.effective_embed_parallel(sysset),
@@ -1308,6 +1319,19 @@ def _validate_codex_worker_model(value):
     return v
 
 
+def _validate_embed_provider(value):
+    """`embed_provider`（埋め込みの接続先）の検証。None は未設定（既定 "auto"）。閉じた語彙以外は 422。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(422, "embed_provider は文字列で指定してください")
+    from sherpa import embeddings
+    v = value.strip().lower()
+    if v not in embeddings.EMBED_PROVIDERS:
+        raise HTTPException(422, f"embed_provider は {'/'.join(embeddings.EMBED_PROVIDERS)} のいずれかで指定してください")
+    return v
+
+
 def _validate_codex_mode(value):
     """`codex_mode`（素の Codex モード・docs/archive/2026-09-24-素のCodexモード.md §1.1）の検証。
     None は未設定（既定 "standard" へフォールバック）。閉じた語彙（`codex_sandbox.CODEX_MODES`）
@@ -1564,6 +1588,8 @@ def admin_settings_put(req: SystemSettingsReq, request: Request):
             provided["depth_base_codex_reasoning"])
     if "agentic_max_tools_per_turn" in provided:
         updates["agentic_max_tools_per_turn"] = provided["agentic_max_tools_per_turn"]
+    if "embed_provider" in provided:
+        updates["embed_provider"] = _validate_embed_provider(provided["embed_provider"])
     if "embed_parallel" in provided:
         # StrictInt・範囲（1〜16）は pydantic Field が型検証済み。
         updates["embed_parallel"] = provided["embed_parallel"]

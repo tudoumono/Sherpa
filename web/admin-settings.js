@@ -183,6 +183,7 @@ let _codexSessionRetentionDaysBaseline = '';
 // （''=未設定＝「標準」の空選択肢・depth-base-codex-reasoning と同型）。
 let _codexModeBaseline = '';
 let _embedParallelBaseline = '';   // 埋め込みの同時送信数
+let _embedProviderBaseline = '';   // 埋め込みの接続先（''=回答と同じクラウド・既定）
 
 // 同時実行の上限（`sherpa/chat_turns.py::effective_limits`）。`_DEPTH_BASE_FIELDS` と同型
 // （GET 応答は `view.chat_max_turns.<view>`・PUT は `body.<put>`）。
@@ -1422,6 +1423,7 @@ function renderProviderTab(view) {
   renderOllamaAllowlist(view.ollama_allowlist);
   renderWebhookAllowlist(view.webhook_allowlist);
   renderOpenaiEndpoint(view.openai_endpoint);   // _mcState（使えるモデル）を先に更新してから読む
+  renderEmbedProvider(view.embed_provider);
   _cloudBaseline = {
     provider: cloud.provider || 'openai',
     providerRaw: cloud.provider_raw || null,
@@ -1493,6 +1495,19 @@ function renderCodexMode(cm) {
   $('codex-mode-hint').textContent = cm.configured == null
     ? '未設定です（既定の標準が適用されます）。'
     : 'この値で固定中です（既定: 標準）。';
+}
+
+function renderEmbedProvider(ep) {
+  ep = ep || {};
+  _embedProviderBaseline = ep.configured || '';
+  $('embed-provider').value = _embedProviderBaseline;
+  $('embed-provider-hint').textContent = ep.effective === 'ollama'
+    ? `ローカル（Ollama）で埋め込みます。使うモデル: ${ep.ollama_model}`
+    : '回答に使うクラウドと同じ接続先で埋め込みます（既定）。';
+}
+
+function embedProviderChanged() {
+  return $('embed-provider').value !== _embedProviderBaseline;
 }
 
 function codexModeChanged() {
@@ -1974,6 +1989,9 @@ async function save() {
     const v = $('codex-worker-model').value.trim();
     body.codex_worker_model = v === '' ? null : v;
   }
+  if (embedProviderChanged()) {
+    body.embed_provider = $('embed-provider').value || null;
+  }
   if (codexModeChanged()) {
     body.codex_mode = $('codex-mode').value || null;
   }
@@ -2061,6 +2079,7 @@ async function resetProviderTab() {
     openai_base_url: null,
     openai_auth_header: null,
     openai_api_version: null,
+    embed_provider: null,
     // 埋め込みのデプロイ名（model_catalog.openai.embed）だけ組み込み既定へ戻す（他タブの
     // 未保存編集は同送しない・上の _configuredRawWithoutOpenaiEmbed 参照）。
     model_catalog: _configuredRawWithoutOpenaiEmbed(),
@@ -2263,7 +2282,7 @@ window.addEventListener('hashchange', () => activateTab(location.hash.replace('#
 // （埋め込みデプロイ名欄は物理的に「プロバイダ＋接続先」タブにあるため、そちらで判定する）。
 const TAB_DIRTY = {
   provider: () => cloudChanged() || ollamaAllowlistChanged() || webhookAllowlistChanged()
-    || openaiEndpointChanged() || mcEmbedChanged()
+    || openaiEndpointChanged() || mcEmbedChanged() || embedProviderChanged()
     || chatMaxTurnsChanged() || chatExamplesChanged(),
   research: () => depthProfileChanged() || agenticToolLimitChanged() || embedParallelChanged() || maxReviewRoundsChanged()
     || codexWorkerModelChanged() || codexSessionRetentionDaysChanged() || agenticBudgetChanged() || codexModeChanged(),
@@ -2315,6 +2334,7 @@ function applyConfigChangedHighlights(view) {
   mark($('cloud-ollama-url'), !!(cloud.ollama_url && cloud.ollama_url !== 'http://localhost:11434'));
   mark($('cloud-ollama-allowlist'), !!(view.ollama_allowlist && (view.ollama_allowlist.configured || []).length));
   mark($('webhook-allowlist'), !!(view.webhook_allowlist && (view.webhook_allowlist.configured || []).length));
+  mark($('embed-provider'), (view.embed_provider || {}).effective !== (view.embed_provider || {}).default);
   mark($('openai-endpoint-radios'), !!(oe.kind && oe.kind !== 'openai'));
   mark($('openai-endpoint-base-url'), !!oe.base_url);
   mark($('openai-endpoint-auth-header'), !!(oe.auth_header && oe.auth_header !== 'bearer'));

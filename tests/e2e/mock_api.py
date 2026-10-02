@@ -1159,6 +1159,8 @@ SYSTEM_SETTINGS_VIEW = {
     # 埋め込み HTTP の同時送信数。既定（未設定）は
     # `sherpa/embeddings.py::EMBED_PARALLEL_DEFAULT`（4）。env フォールバックは持たない。
     "embed_parallel": {"configured": None, "effective": 4, "default": 4},
+    "embed_provider": {"configured": None, "effective": "auto", "default": "auto",
+                       "options": ["auto", "ollama"], "ollama_model": "nomic-embed-text"},
     # 「最大」の深さが許す査読の巡数（`sherpa/depth_profile.py::MAX_REVIEW_ROUNDS_DEFAULT`＝7）。
     "max_review_rounds": {"configured": None, "effective": 7, "default": 7},
     # multi_agent（S6）の worker モデル（`sherpa/providers/codex/sandbox.py::_CODEX_WORKER_MODEL_FALLBACK`）。
@@ -1988,6 +1990,12 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
                 worker_model = view["codex_worker_model"]
                 worker_model["configured"] = _val
                 worker_model["effective"] = _val if _val is not None else worker_model["default"]
+            if "embed_provider" in body:
+                _raw = body["embed_provider"]
+                _val = _raw.strip().lower() if isinstance(_raw, str) else _raw
+                ep = view["embed_provider"]
+                ep["configured"] = _val
+                ep["effective"] = _val if _val is not None else ep["default"]
             if "codex_mode" in body:
                 # 実 API の _validate_codex_mode と同じ正規化（null は既定の "standard" へ）。
                 _raw = body["codex_mode"]

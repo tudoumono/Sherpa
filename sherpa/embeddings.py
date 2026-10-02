@@ -46,6 +46,18 @@ EMBEDDING_INPUT_ALGORITHM_ID = "utf8-window-mean-l2-v2"
 _MODELS = {"openai": ("text-embedding-3-small", 1536),
            "gemini": ("gemini-embedding-001", 1536),
            "ollama": ("nomic-embed-text", 768)}
+# 埋め込みの接続先（システム設定 `embed_provider`）。"auto"＝回答用に選んだクラウドに従う（既定・
+# 従来どおり）／"ollama"＝回答側のクラウド選択に関わらず中央 Ollama を使う。
+EMBED_PROVIDERS = ("auto", "ollama")
+EMBED_PROVIDER_DEFAULT = "auto"
+# Ollama の埋め込みモデル名（タグ除く）→ 次元。表に無いモデルは初回に1件だけ埋め込んで実測する
+# （`ollama_embed_dim`）。ES の dense_vector 次元が実際の応答とずれると索引が作れないため、推測しない。
+_OLLAMA_KNOWN_DIMS = {"nomic-embed-text": 768, "bge-m3": 1024, "mxbai-embed-large": 1024,
+                      "bge-large": 1024, "all-minilm": 384, "embeddinggemma": 768}
+_OLLAMA_DIM_PROBE_TIMEOUT = 15
+_OLLAMA_DIM_FAIL_TTL = 60.0
+_ollama_dim_cache: dict = {}        # (url, model) -> 実測次元
+_ollama_dim_failed: dict = {}       # (url, model) -> 失敗時刻（連続リトライで検索が詰まらないため）
 # 専用ログ（sherpa.embed）へルーティングする（`sherpa/log_setup.py` の登録表参照）。
 _log = logging.getLogger("sherpa.embed")
 
@@ -62,6 +74,40 @@ def effective_embed_parallel(system_settings: dict | None) -> int:
     if configured < EMBED_PARALLEL_MIN or configured > EMBED_PARALLEL_MAX:
         return EMBED_PARALLEL_DEFAULT
     return configured
+
+
+def effective_embed_provider(system_settings: dict | None) -> str:
+    """埋め込みの接続先（`embed_provider`）。未設定・不正値は "auto"（読み取り側でも独立に検証する）。"""
+    value = system_settings.get("embed_provider") if isinstance(system_settings, dict) else None
+    return value if value in EMBED_PROVIDERS else EMBED_PROVIDER_DEFAULT
+
+
+def ollama_embed_dim(url: str, model: str) -> int | None:
+    """Ollama 埋め込みモデルの次元。既知表→実測（1件を埋め込んで応答の長さを採る・成功のみ
+    プロセス内キャッシュ）の順。解決できなければ None（呼び出し側は埋め込み不可として扱う）。"""
+    known = _OLLAMA_KNOWN_DIMS.get(model.split(":", 1)[0])
+    if known:
+        return known
+    key = (url, model)
+    if key in _ollama_dim_cache:
+        return _ollama_dim_cache[key]
+    failed_at = _ollama_dim_failed.get(key)
+    if failed_at is not None and time.monotonic() - failed_at < _OLLAMA_DIM_FAIL_TTL:
+        return None
+    try:
+        with llm.no_proxy_requests():
+            r = llm.post_json(llm.ollama_url(url, "/api/embed"), llm.JSON_HEADERS,
+                              {"model": model, "input": ["dimension probe"]}, _OLLAMA_DIM_PROBE_TIMEOUT)
+        vecs = r.get("embeddings") if isinstance(r, dict) else None
+        dim = len(vecs[0]) if isinstance(vecs, list) and vecs and isinstance(vecs[0], list) else 0
+    except Exception as exc:
+        _log.warning("ollama embed dimension probe failed: model=%s error_type=%s", model, type(exc).__name__)
+        dim = 0
+    if dim <= 0:
+        _ollama_dim_failed[key] = time.monotonic()
+        return None
+    _ollama_dim_cache[key] = dim
+    return dim
 
 
 def cfg(settings: dict | None = None, *, system_settings: dict | None = None) -> dict | None:
@@ -120,6 +166,19 @@ def cfg(settings: dict | None = None, *, system_settings: dict | None = None) ->
         model = model_catalog.resolve_model("ollama", "embed", None, system_settings=sys_s) or m
         return {"provider": "ollama", "url": url, "model": model, "dim": d, "parallel": parallel}
 
+    # 埋め込みの接続先を管理者が「ローカル（Ollama）」にしているときは、回答側のクラウド選択に
+    # 関わらず中央 Ollama を使う（共有 KB の索引は利用者ごとに変えない＝個人設定の URL は読まない）。
+    # 解決できなければ None（クラウドへは倒さない＝費用を避けるための選択を黙って覆さない）。
+    if effective_embed_provider(sys_s) == "ollama":
+        from . import keys as _k, model_catalog
+        url = _k.resolve_ollama_url(None, system_settings=sys_s)
+        model = (model_catalog.resolve_model("ollama", "embed", None, system_settings=sys_s)
+                 or _MODELS["ollama"][0])
+        dim = ollama_embed_dim(url, model)
+        if dim is None:
+            return None
+        return {"provider": "ollama", "url": url, "model": model, "dim": dim, "parallel": parallel}
+
     # `cloud_provider`（A7）が非空の不正値（env 誤記・旧データ等）のときは、黙って既定（openai）
     # へ倒れたキーで埋め込みを送信しない（fail-closed）。埋め込みは既存の graceful 契約
     # （「埋め込み未設定/失敗時は BM25 のみで索引・vector 検索は degrade」＝呼び出し元の docstring
@@ -151,6 +210,8 @@ def cloud_selected_but_unavailable(system_settings: dict | None = None) -> bool:
         return False
     from . import keys as _keys, store
     sys_s = system_settings if system_settings is not None else store.get_system_settings()
+    if effective_embed_provider(sys_s) == "ollama":
+        return True   # ローカルを明示選択済み＝cfg() が None なら Ollama/モデルが使えない障害（BM25 へ黙って降格しない）
     return _keys.cloud_provider_explicitly_selected(sys_s)
 
 

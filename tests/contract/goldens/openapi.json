@@ -4935,6 +4935,17 @@
             ],
             "title": "Embed Parallel"
           },
+          "embed_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embed Provider"
+          },
           "gemini_api_key": {
             "anyOf": [
               {
