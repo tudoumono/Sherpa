@@ -459,12 +459,16 @@ applyCachedBrain();   // 前回のモデル/プロバイダを即反映（その
 {
   const _convRaw = new URLSearchParams(location.search).get('conv');
   const _convParam = Number(_convRaw);
+  const _wantShare = new URLSearchParams(location.search).get('share') === '1';
   const _startNew = () => { welcome(); resetInquiryForNewConversation(); loadConversations(); };
   if (_convParam) {
     // 開けない番号（削除済み・他人の会話）はアドレス欄から外し、新しいチャットの画面にする。
     // 待つ間に送信・新しいチャット・別の会話を開いた（世代が進んだ）なら、画面はもう触らない。
     const _gen = currentTurnGen();
-    openConversation(_convParam).catch(() => {
+    openConversation(_convParam).then(() => {
+      // 通知（共有の期限が近い）からの遷移: 共有ダイアログ（一覧＋延長）を開く。
+      if (_wantShare) $('sharebtn').click();
+    }).catch(() => {
       if (currentTurnGen() !== _gen) return;
       syncConvParam(null); toast('会話を開けませんでした'); _startNew();
     });

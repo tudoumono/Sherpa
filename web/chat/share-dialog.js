@@ -67,7 +67,7 @@ function _shareStatusLabel(s) {
 
 function _shareExistingRowHTML(s) {
   const invitees = (s.invitees || []).map((i) => esc(i.name || i.uid)).join('、') || '（招待者なし）';
-  const expiresText = s.expires_at ? `期限: ${esc(fmtDateTime(s.expires_at))}` : '無期限';
+  const expiresText = `期限: ${esc(fmtDateTime(s.expires_at))}`;
   const sanitizedText = s.sanitized ? '個人部分を除いて共有' : '会話をそのまま共有';
   const active = !s.revoked_at;
   const refreshedText = s.refreshed_at ? `・最終更新: ${esc(fmtDateTime(s.refreshed_at))}` : '';
@@ -78,6 +78,7 @@ function _shareExistingRowHTML(s) {
     </div>
     <div class="share-existing-acts">
       ${(s.sanitized && active) ? `<button class="mini" data-share-refresh="${s.share_id}">最新の内容に更新</button>` : ''}
+      ${active ? `<button class="mini" data-share-extend="${s.share_id}">延長</button>` : ''}
       ${active ? `<button class="mini ek-danger" data-share-revoke="${s.share_id}">取消</button>` : ''}
     </div>
   </div>`;
@@ -125,7 +126,7 @@ export function openShareDialog(cid, title) {
   result.hidden = true;
   form.hidden = false;
   document.getElementById('share-invitees').value = '';
-  document.getElementById('share-days').value = '7';
+  document.getElementById('share-days').value = '30';
   document.getElementById('share-err').textContent = '';
   _inviteeChips = [];
   renderInviteeChips();
@@ -186,6 +187,19 @@ export function openShareDialog(cid, title) {
         if (!r.ok) throw new Error(String(r.status));
       } catch (_) { revokeBtn.disabled = false; return; }
       loadShareExistingList(cid);
+      return;
+    }
+    const extendBtn = e.target.closest('[data-share-extend]');
+    if (extendBtn) {
+      extendBtn.disabled = true;
+      try {
+        const r = await fetch(`/conversation-shares/${extendBtn.dataset.shareExtend}/extend`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: 30 }),
+        });
+        if (!r.ok) throw new Error(String(r.status));
+      } catch (_) { extendBtn.disabled = false; toast('延長できませんでした'); return; }
+      await loadShareExistingList(cid);
+      toast('期限を今から30日後に延ばしました');
       return;
     }
     const refreshBtn = e.target.closest('[data-share-refresh]');
@@ -264,9 +278,7 @@ export function openShareDialog(cid, title) {
   document.getElementById('share-submit')?.addEventListener('click', async () => {
     const cid = Number(overlay.dataset.cid);
     const rawInvitees = document.getElementById('share-invitees').value;
-    // '0' = 無期限。Number('0')||7 は 0 が falsy で 7 に化けてしまうため、'0' は先に判定する。
-    const daysRaw = document.getElementById('share-days').value;
-    const days = daysRaw === '0' ? 0 : (Number(daysRaw) || 7);
+    const days = Number(document.getElementById('share-days').value) || 30;
     const errEl = document.getElementById('share-err');
 
     // チップ確定分 ＋ 自由入力（カンマ/スペース区切り）の両方を合わせる（既存の手入力との後方互換）。
@@ -275,7 +287,7 @@ export function openShareDialog(cid, title) {
     if (!invitees.length) { errEl.textContent = '招待するユーザー名を入力してください'; return; }
 
     errEl.textContent = '';
-    const expires = days === 0 ? null : new Date(Date.now() + days * 86400 * 1000).toISOString();
+    const expires = new Date(Date.now() + days * 86400 * 1000).toISOString();
     const submitBtn = document.getElementById('share-submit');
     if (submitBtn.disabled) return;   // 多重クリック防止（連打で共有リンクを二重作成しない）
     submitBtn.disabled = true;

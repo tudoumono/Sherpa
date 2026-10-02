@@ -21,7 +21,9 @@ from psycopg.types.json import Json
 
 from .. import citations as citations_mod
 from ..ingest import importance
-from .conversations import is_personal_tainted, _resolve_received_share_msg_src
+from .conversations import (
+    SHARE_DEFAULT_EXPIRY_DAYS, SHARE_EFFECTIVE_EXPIRES_SQL, is_personal_tainted, _resolve_received_share_msg_src,
+)
 from .db import _connect, _ensure
 from .feedback import get_feedback_by_message_ids_for_user
 
@@ -617,13 +619,14 @@ def create_sanitized_snapshot(owner_uid: str, source_cid: int) -> int | None:
 
 
 def create_share(cid, owner_uid, token_hash, expires_at, invitee_uids, created_by=None) -> int:
-    """共有リンクを作成し招待を登録。返り値＝share id。`expires_at=None` は無期限。"""
+    """共有リンクを作成し招待を登録。返り値＝share id。`expires_at=None` は作成から既定日数後。"""
     _ensure()
     with _connect() as c:
         sid = c.execute(
             "INSERT INTO conversation_shares (conversation_id, owner_user_id, token_hash, expires_at, created_by) "
-            "VALUES (%s,%s,%s,%s,%s) RETURNING id",
-            (cid, owner_uid, token_hash, expires_at, created_by or owner_uid)).fetchone()["id"]
+            "VALUES (%s,%s,%s,COALESCE(%s, now() + make_interval(days => %s)),%s) RETURNING id",
+            (cid, owner_uid, token_hash, expires_at, SHARE_DEFAULT_EXPIRY_DAYS,
+             created_by or owner_uid)).fetchone()["id"]
         for iu in invitee_uids:
             c.execute("INSERT INTO conversation_share_invites (share_id, invitee_user_id, invited_by) "
                       "VALUES (%s,%s,%s) ON CONFLICT (share_id, invitee_user_id) DO NOTHING",
@@ -632,12 +635,14 @@ def create_share(cid, owner_uid, token_hash, expires_at, invitee_uids, created_b
 
 
 def resolve_share_by_token(token_hash) -> dict | None:
-    """token hash → share 行（`active`＝未取消・期限内（または無期限） を含む）。存在しなければ None。"""
+    """token hash → share 行（`active`＝未取消・期限内 を含む）。存在しなければ None。
+    `expires_at` は実効期限（NULL の旧行は created_at＋既定日数）。"""
     _ensure()
     with _connect() as c:
         return c.execute(
-            "SELECT id, conversation_id, owner_user_id, expires_at, revoked_at, "
-            "(revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())) AS active "
+            "SELECT id, conversation_id, owner_user_id, "
+            f"{SHARE_EFFECTIVE_EXPIRES_SQL} AS expires_at, revoked_at, "
+            f"(revoked_at IS NULL AND {SHARE_EFFECTIVE_EXPIRES_SQL}>now()) AS active "
             "FROM conversation_shares WHERE token_hash=%s", (token_hash,)).fetchone()
 
 
@@ -648,8 +653,19 @@ def is_invited(share_id, uid) -> bool:
                               "WHERE share_id=%s AND invitee_user_id=%s", (share_id, uid)).fetchone())
 
 
-def accept_share(share_id, uid) -> int:
+class ShareUnavailableError(Exception):
+    """受領時の再確認で共有が使えなくなっていた（取消・期限切れ・招待外）。`args[0]` が reason。"""
+
+
+def accept_share(share_id, uid, *, audit: dict | None = None) -> int:
     """クリックした uid の履歴に受領ラッパー行を作る（同 uid×share は1行・冪等）。wrapper id を返す。
+
+    `audit`（`{"ip_hash","user_agent"}`）を渡すと、受領（`share.accepted`）の監査を
+    **同一トランザクション**で書く。監査 INSERT が失敗すれば例外が伝播し、ラッパー作成ごと
+    rollback される（fail-closed・`fork_received_share` と同じ方式）。
+
+    取消・有効期限・招待は同一トランザクション内で再確認し、使えなければ `ShareUnavailableError`
+    （状態も監査も書かない）。
 
     `delete_conversation` との競合防止。新規 wrapper を作る前に共有元 conversation 行を
     `SELECT ... FOR UPDATE OF c` でロックする（delete_conversation 側も同じ行をロックするため直列化）。
@@ -666,14 +682,26 @@ def accept_share(share_id, uid) -> int:
         existing = c.execute(
             "SELECT id FROM conversations WHERE user_id=%s AND share_id=%s "
             "AND origin='received_share' AND deleted_at IS NULL", (uid, share_id)).fetchone()
+        # ロック順は 共有元会話 → 共有行（delete_conversation と同順）。revoke/extend は共有行の
+        # 単発 UPDATE のみで会話行を取らないため逆順にならない。
+        src = c.execute(
+            "SELECT c.id FROM conversation_shares s JOIN conversations c ON c.id=s.conversation_id "
+            "WHERE s.id=%s FOR UPDATE OF c", (share_id,)).fetchone()
+        if not src:
+            raise ValueError(f"共有元の会話が見つかりません（share_id={share_id}）")
+        # 呼び出し側の事前判定から本トランザクションまでの間に取消/期限切れ/招待外になっていないかを、
+        # 共有行を FOR SHARE で押さえたまま再確認する（以降の取消・延長の UPDATE は本 tx の完了を待つ）。
+        st = c.execute(
+            f"SELECT (revoked_at IS NULL) AS live, ({SHARE_EFFECTIVE_EXPIRES_SQL}>now()) AS fresh "
+            "FROM conversation_shares WHERE id=%s FOR SHARE", (share_id,)).fetchone()
+        if not st or not st["live"] or not st["fresh"]:
+            raise ShareUnavailableError("revoked" if st and not st["live"] else "expired")
+        if not c.execute("SELECT 1 FROM conversation_share_invites "
+                         "WHERE share_id=%s AND invitee_user_id=%s", (share_id, uid)).fetchone():
+            raise ShareUnavailableError("not_invited")
         if existing:
             wid = existing["id"]
         else:
-            src = c.execute(
-                "SELECT c.id FROM conversation_shares s JOIN conversations c ON c.id=s.conversation_id "
-                "WHERE s.id=%s FOR UPDATE OF c", (share_id,)).fetchone()
-            if not src:
-                raise ValueError(f"共有元の会話が見つかりません（share_id={share_id}）")
             row = c.execute(
                 "INSERT INTO conversations (user_id, version, title, origin, source_conversation_id, "
                 "  share_id, shared_by_user_id, received_at, read_only) "
@@ -684,17 +712,78 @@ def accept_share(share_id, uid) -> int:
         c.execute("UPDATE conversation_share_invites SET accepted_at=now() "
                   "WHERE share_id=%s AND invitee_user_id=%s AND accepted_at IS NULL", (share_id, uid))
         c.execute("UPDATE conversation_shares SET last_used_at=now() WHERE id=%s", (share_id,))
+        if audit is not None:
+            from sherpa import store as _facade   # 実行時解決（monkeypatch シーム維持・fork と同じ）
+            srow = c.execute("SELECT conversation_id FROM conversation_shares WHERE id=%s",
+                             (share_id,)).fetchone()
+            _facade._audit_insert(
+                c, uid, "share.accepted", "share", f"share:{share_id}",
+                detail={"wrapper_conversation_id": wid, "source_conversation_id": srow["conversation_id"]},
+                outcome="success", ip_hash=audit.get("ip_hash"), user_agent=audit.get("user_agent"))
         return wid
 
 
-def revoke_share(share_id, owner_uid) -> bool:
-    """所有者が共有を取消（行は消さず revoked_at を立てる）。"""
+def revoke_share(share_id, owner_uid, *, audit: dict | None = None) -> bool:
+    """所有者が共有を取消（行は消さず revoked_at を立てる）。
+
+    `audit`（`{"ip_hash","user_agent"}`）を渡すと、取消が成立したときだけ `share.revoked` の監査を
+    **同一トランザクション**で書く。監査 INSERT が失敗すれば例外が伝播し、取消ごと rollback される
+    （fail-closed）。"""
     _ensure()
     with _connect() as c:
         n = c.execute("UPDATE conversation_shares SET revoked_at=now() "
                       "WHERE id=%s AND owner_user_id=%s AND revoked_at IS NULL",
                       (share_id, owner_uid)).rowcount
+        if n > 0 and audit is not None:
+            from sherpa import store as _facade   # 実行時解決（monkeypatch シーム維持・fork と同じ）
+            _facade._audit_insert(c, owner_uid, "share.revoked", "share", f"share:{share_id}",
+                                  outcome="success", ip_hash=audit.get("ip_hash"),
+                                  user_agent=audit.get("user_agent"))
     return n > 0
+
+
+SHARE_EXPIRY_NOTICE_DAYS = 7   # 所有者へ「もうすぐ期限切れ」を通知する残り日数
+
+
+def extend_share(share_id, owner_uid, days: int, *, audit: dict | None = None):
+    """所有者が共有の期限を `now()+days` 日へ延ばす（取消済みは不可・期限切れは可・何度でも）。
+
+    成立すれば新しい実効期限（tz-aware datetime）を返す。存在しない／所有者不一致／取消済みは
+    None（呼び出し側で 404＝存在を漏らさない）。`audit`（`{"ip_hash","user_agent"}`）を渡すと
+    `share.extended` の監査を**同一トランザクション**で書く。監査 INSERT が失敗すれば例外が
+    伝播し、期限の更新ごと rollback される（fail-closed）。"""
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "UPDATE conversation_shares SET expires_at=now() + make_interval(days => %s) "
+            "WHERE id=%s AND owner_user_id=%s AND revoked_at IS NULL RETURNING expires_at",
+            (days, share_id, owner_uid)).fetchone()
+        if row is None:
+            return None
+        if audit is not None:
+            from sherpa import store as _facade   # 実行時解決（monkeypatch シーム維持・fork と同じ）
+            _facade._audit_insert(c, owner_uid, "share.extended", "share", f"share:{share_id}",
+                                  detail={"days": days, "expires_at": row["expires_at"].isoformat()},
+                                  outcome="success", ip_hash=audit.get("ip_hash"),
+                                  user_agent=audit.get("user_agent"))
+        return row["expires_at"]
+
+
+def list_expiring_shares_for_owner(owner_uid, within_days: int = SHARE_EXPIRY_NOTICE_DAYS) -> list[dict]:
+    """`owner_uid` が所有し、実効期限が今から `within_days` 日以内に来る（未取消・未失効の）共有。
+    実効期限は旧 NULL 行を含む（`SHARE_EFFECTIVE_EXPIRES_SQL`）。サニタイズ共有は元会話の
+    タイトル・id を返す（snapshot の固定タイトルを見せない）。返す列: share_id・conversation_id
+    （所有者の元会話）・title・expires_at。期限が近い順。"""
+    _ensure()
+    eff = SHARE_EFFECTIVE_EXPIRES_SQL.replace("expires_at", "s.expires_at").replace("created_at", "s.created_at")
+    with _connect() as c:
+        return c.execute(
+            f"SELECT s.id AS share_id, src.id AS conversation_id, src.title, {eff} AS expires_at "
+            "FROM conversation_shares s JOIN conversations t ON t.id=s.conversation_id "
+            "JOIN conversations src ON src.id = COALESCE(t.source_conversation_id, t.id) "
+            "WHERE s.owner_user_id=%s AND s.revoked_at IS NULL AND src.deleted_at IS NULL "
+            f"  AND {eff}>now() AND {eff}<=now() + make_interval(days => %s) "
+            f"ORDER BY {eff}", (owner_uid, within_days)).fetchall()
 
 
 # ==== フォーク（「この会話を引き継いで質問」）====
@@ -787,8 +876,11 @@ class ShareNotSanitizedError(Exception):
     """通常共有（元会話をライブ参照＝更新の概念が無い）への refresh 要求（409 相当）。"""
 
 
-def refresh_sanitized_share(owner_uid, share_id) -> dict:
+def refresh_sanitized_share(owner_uid, share_id, *, audit: dict | None = None) -> dict:
     """サニタイズ共有のスナップショットを最新の内容へ取り直す。リンク・招待・期限は不変。
+
+    `audit`（`{"ip_hash","user_agent"}`）を渡すと `share.refreshed` の監査を**同一トランザクション**で
+    書く。監査 INSERT が失敗すれば例外が伝播し、更新ごと rollback される（fail-closed）。
 
     対象は **サニタイズ共有だけ**（`conversation_shares.conversation_id` が
     `origin='sanitized_snapshot'` の会話）。通常共有（元会話をライブ参照）には
@@ -850,6 +942,14 @@ def refresh_sanitized_share(owner_uid, share_id) -> dict:
             "WHERE origin='received_share' AND share_id=%s AND deleted_at IS NULL",
             (new_snapshot_id, share_id))
         c.execute("UPDATE conversations SET deleted_at=now() WHERE id=%s", (old_snapshot["id"],))
+        if audit is not None:
+            from sherpa import store as _facade   # 実行時解決（monkeypatch シーム維持・fork と同じ）
+            _facade._audit_insert(
+                c, owner_uid, "share.refreshed", "share", f"share:{share_id}",
+                detail={"old_snapshot_id": old_snapshot["id"], "new_snapshot_id": new_snapshot_id,
+                        "source_conversation_id": source_cid},
+                outcome="success", severity="info", ip_hash=audit.get("ip_hash"),
+                user_agent=audit.get("user_agent"))
         return {"share_id": share_id, "old_snapshot_id": old_snapshot["id"],
                 "new_snapshot_id": new_snapshot_id, "source_conversation_id": source_cid,
                 "refreshed_at": refreshed["refreshed_at"]}
@@ -869,7 +969,9 @@ def list_shares_for_conversation(owner_uid, cid) -> list[dict]:
     with _connect() as c:
         rows = c.execute(
             "SELECT s.id AS share_id, (t.origin='sanitized_snapshot') AS sanitized, "
-            "  s.created_at, s.expires_at, s.revoked_at, s.refreshed_at, s.last_used_at "
+            "  s.created_at, "
+            f"  COALESCE(s.expires_at, s.created_at + interval '{SHARE_DEFAULT_EXPIRY_DAYS} days') AS expires_at, "
+            "  s.revoked_at, s.refreshed_at, s.last_used_at "
             "FROM conversation_shares s JOIN conversations t ON t.id = s.conversation_id "
             "WHERE s.owner_user_id=%s AND (t.id=%s OR t.source_conversation_id=%s) "
             "ORDER BY s.created_at DESC",

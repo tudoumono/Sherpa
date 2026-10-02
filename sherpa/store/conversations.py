@@ -17,6 +17,12 @@ from psycopg.types.json import Json
 from .db import _connect, _ensure
 from .turn_metrics import upsert_best_effort as _turn_metrics_upsert_best_effort
 
+# 共有は必ず期限を持つ。省略時の既定日数。`expires_at IS NULL` の旧行は読み取り時に
+# 作成日時＋この日数で失効する（DB は書き換えない）。
+SHARE_DEFAULT_EXPIRY_DAYS = 30
+# 共有行（`conversation_shares`・別名なし／別名つきは `_s` 版）の実効期限 SQL 式。
+SHARE_EFFECTIVE_EXPIRES_SQL = f"COALESCE(expires_at, created_at + interval '{SHARE_DEFAULT_EXPIRY_DAYS} days')"
+
 
 def create_conversation(user_id="admin", world="v1", title=None) -> dict:
     # 列名 `version` は歴史的（DB 不変・語彙統一のスコープ外）。引数/値は world 用語。
@@ -120,9 +126,12 @@ def _visible_conversations_rows(c, user_id, limit) -> list:
         "c.share_id, c.source_conversation_id, "
         "CASE WHEN c.origin='received_share' THEN "
         "  (SELECT CASE WHEN s.revoked_at IS NOT NULL THEN 'revoked' "
-        "               WHEN s.expires_at IS NOT NULL AND s.expires_at<=now() THEN 'expired' "
-        "               ELSE 'active' END "   # expires_at IS NULL = 無期限（常に active 側）
-        "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_status "
+        f"               WHEN COALESCE(s.expires_at, s.created_at + interval '{SHARE_DEFAULT_EXPIRY_DAYS} days')<=now() THEN 'expired' "
+        "               ELSE 'active' END "
+        "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_status, "
+        "CASE WHEN c.origin='received_share' THEN "
+        f"  (SELECT COALESCE(s.expires_at, s.created_at + interval '{SHARE_DEFAULT_EXPIRY_DAYS} days') "
+        "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_expires_at "
         "FROM conversations c LEFT JOIN users u ON u.uid=c.shared_by_user_id "
         "LEFT JOIN users fu ON fu.uid=c.forked_from_user_id "
         "WHERE c.user_id=%s AND c.deleted_at IS NULL AND c.origin<>'sanitized_snapshot' "  # snapshot は内部成果物＝非表示
@@ -161,9 +170,9 @@ def _resolve_received_share_msg_src(c, uid, share_id, source_conversation_id):
     いなければ `(source_conversation_id, None)` を返す。無効なら `(None, "unavailable")`、
     共有後に元会話が個人 workspace を参照するようになっていたら `(None, "personal_blocked")`。
     """
-    # expires_at IS NULL = 無期限（revoke されない限り active）。
+    # expires_at IS NULL の旧行は created_at＋既定日数で失効する（SHARE_EFFECTIVE_EXPIRES_SQL）。
     share = c.execute(
-        "SELECT (revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())) AS active "
+        f"SELECT (revoked_at IS NULL AND {SHARE_EFFECTIVE_EXPIRES_SQL}>now()) AS active "
         "FROM conversation_shares WHERE id=%s", (share_id,)).fetchone()
     invited = c.execute("SELECT 1 FROM conversation_share_invites "
                         "WHERE share_id=%s AND invitee_user_id=%s", (share_id, uid)).fetchone()

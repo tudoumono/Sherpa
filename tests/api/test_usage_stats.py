@@ -2449,7 +2449,7 @@ def _seed_round_turn(cid: int, *, at, provider: str, model: str, world: str, uid
                      input_tokens: int, text: str) -> None:
     """user ターン（`at`）→ 巡（`at`+1分）→ assistant（`at`+2分）を明示時刻で仕込む。
 
-    期間境界のテストは「所属する user ターンの created_at」で判定される（`_round_rows_query`）
+    期間境界のテストは「所属する user ターンの created_at」で判定される（`_build_usage_rounds`）
     ため、user メッセージの created_at を直接 UPDATE して境界ちょうどに置く。
     """
     store.add_message(cid, "user", text)

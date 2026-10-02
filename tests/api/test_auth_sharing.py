@@ -244,8 +244,9 @@ def _mk_users(sfx: str, *names: str):
     return uids
 
 
-def test_unlimited_expiry_active_forever_until_revoked():
-    """expires_at=None（無期限）は時間経過に依存せず active・revoke で即時無効。"""
+def test_share_default_expiry_and_legacy_null_row_expires_at_created_plus_30d():
+    """create_share(None)＝作成+30日。expires_at IS NULL の旧行は created_at+30日で読み取り時に失効
+    （resolve_share_by_token・受領側の一覧/本文読みの両経路）。revoke は即時有効。"""
     from sherpa import store
     try:
         store.init_schema()
@@ -254,30 +255,70 @@ def test_unlimited_expiry_active_forever_until_revoked():
     sfx = str(int(time.time() * 1000))
     owner, invitee = _mk_users(sfx, "ulo", "uli")
 
-    conv = store.create_conversation(user_id=owner, world="v1", title="無期限共有")
+    conv = store.create_conversation(user_id=owner, world="v1", title="既定期限共有")
     cid = conv["id"]
     store.add_message(cid, "user", "質問")
     store.add_message(cid, "assistant", "回答")
 
     th = hashlib.sha256(("ultok-" + sfx).encode()).hexdigest()
-    sid = store.create_share(cid, owner, th, None, [invitee])   # expires_at=None＝無期限
-
+    sid = store.create_share(cid, owner, th, None, [invitee])
     resolved = store.resolve_share_by_token(th)
-    assert resolved["expires_at"] is None
     assert resolved["active"] is True
+    with psycopg.connect(store._dsn()) as c:
+        row = c.execute("SELECT expires_at, created_at + interval '30 days' AS want "
+                        "FROM conversation_shares WHERE id=%s", (sid,)).fetchone()
+        assert row[0] == row[1]
 
+        # 旧行（NULL）へ戻し、created_at を 29 日前 → まだ有効。
+        c.execute("UPDATE conversation_shares SET expires_at=NULL, "
+                  "created_at=now() - interval '29 days' WHERE id=%s", (sid,))
+        c.commit()
+    assert store.resolve_share_by_token(th)["active"] is True
     wid = store.accept_share(sid, invitee)
     rec = [r for r in store.list_conversations(invitee) if r["id"] == wid][0]
     assert rec["share_status"] == "active"
+    assert len(store.get_conversation_for_read(invitee, wid)["messages"]) == 2
+    assert store.list_shares_for_conversation(owner, cid)[0]["expires_at"] is not None
 
-    r = store.get_conversation_for_read(invitee, wid)
-    assert len(r["messages"]) == 2
-
-    # revoke は無期限でも即時有効。
-    assert store.revoke_share(sid, owner) is True
+    # 31 日前 → 失効（解決・一覧・本文読み）。
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE conversation_shares SET created_at=now() - interval '31 days' WHERE id=%s", (sid,))
+        c.commit()
     assert store.resolve_share_by_token(th)["active"] is False
+    rec = [r for r in store.list_conversations(invitee) if r["id"] == wid][0]
+    assert rec["share_status"] == "expired"
     r2 = store.get_conversation_for_read(invitee, wid)
     assert r2["share_status"] == "unavailable" and r2["messages"] == []
+
+
+def test_accept_share_rechecks_revoked_inside_transaction():
+    """事前判定（resolve_share_by_token が active）の後に所有者が取消した場合、accept_share は
+    ラッパー・accepted_at・last_used_at・`share.accepted` 監査のいずれも書かず拒否する。"""
+    from sherpa import store
+    try:
+        store.init_schema()
+    except Exception as e:
+        pytest.skip(f"infra down: {e}")
+    sfx = str(int(time.time() * 1000))
+    owner, invitee = _mk_users(sfx, "rco", "rci")
+    cid = store.create_conversation(user_id=owner, world="v1", title="受領再確認")["id"]
+    th = hashlib.sha256(("rctok-" + sfx).encode()).hexdigest()
+    sid = store.create_share(cid, owner, th, None, [invitee])
+
+    assert store.resolve_share_by_token(th)["active"] is True      # 事前判定は通る
+    assert store.is_invited(sid, invitee) is True
+    assert store.revoke_share(sid, owner) is True                   # その後に取消
+    with pytest.raises(store.ShareUnavailableError):
+        store.accept_share(sid, invitee, audit={"ip_hash": None, "user_agent": ""})
+
+    assert [c for c in store.list_conversations(invitee) if c["origin"] == "received_share"] == []
+    with psycopg.connect(store._dsn()) as c:
+        acc = c.execute("SELECT accepted_at FROM conversation_share_invites "
+                        "WHERE share_id=%s AND invitee_user_id=%s", (sid, invitee)).fetchone()
+        used = c.execute("SELECT last_used_at FROM conversation_shares WHERE id=%s", (sid,)).fetchone()
+        n = c.execute("SELECT count(*) FROM audit_log WHERE action='share.accepted' AND resource_id=%s",
+                      (f"share:{sid}",)).fetchone()
+    assert acc[0] is None and used[0] is None and n[0] == 0
 
 
 def test_delete_conversation_without_wrapper_hard_deletes():
@@ -441,7 +482,7 @@ def test_share_boundary_expires_at_equals_now_is_inactive():
     """境界: expires_at == now() ちょうどの共有は active=False（期限切れ扱い）。
 
     resolve_share_by_token / get_conversation_for_read（sherpa/store/shares.py）の active 判定は
-    `revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())`（`>=` ではなく `>`）＝
+    `revoked_at IS NULL AND COALESCE(expires_at, created_at+30日)>now()`（`>=` ではなく `>`）＝
     境界（等しい瞬間）は active から外れる。この等号境界を実際の関数呼び出し2回（別トランザクション
     ＝別 now()）で再現するのは実時間が必ず前進するため不可能なので、同一トランザクション内で
     now() を2回参照する（Postgres の now() はトランザクション開始時刻で安定）ことで expires_at を
@@ -474,7 +515,7 @@ def test_share_boundary_expires_at_equals_now_is_inactive():
 
         # resolve_share_by_token（sherpa/store/shares.py）と同一の active 式。
         active_row = c.execute(
-            "SELECT (revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())) AS active "
+            "SELECT (revoked_at IS NULL AND COALESCE(expires_at, created_at + interval '30 days')>now()) AS active "
             "FROM conversation_shares WHERE id=%s", (sid,),
         ).fetchone()
     active = active_row[0] if isinstance(active_row, tuple) else active_row["active"]
@@ -501,8 +542,8 @@ def test_share_boundary_operator_pinned_to_implementation():
 
     for fn in (_conv._resolve_received_share_msg_src, _shares.resolve_share_by_token):
         src = inspect.getsource(fn)
-        assert "expires_at IS NULL OR expires_at>now()" in src, (
-            f"{fn.__name__} の active 式が 'expires_at IS NULL OR expires_at>now()' から変わった＝"
+        assert "SHARE_EFFECTIVE_EXPIRES_SQL}>now()" in src, (
+            f"{fn.__name__} の active 式が 'SHARE_EFFECTIVE_EXPIRES_SQL を使う active 式' から変わった＝"
             "本ファイルの境界テスト（複製 SQL）が実装とズレている可能性。両方を同時に更新すること"
         )
 

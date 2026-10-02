@@ -183,6 +183,7 @@ POLICY: dict[tuple[str, str], str] = {
     # SH-1/SH-2（2026-08-23-共有フォーク.md・2026-09-05実装）。
     ("POST", "/conversations/{wid}/fork"): "login",
     ("POST", "/conversation-shares/{share_id}/refresh"): "login",
+    ("POST", "/conversation-shares/{share_id}/extend"): "login",   # 非所有者/不在は 404（許可側 probe 可）
     ("GET", "/conversations/{cid}/shares"): "login",
     ("POST", "/workspace/files"): "login",
     ("GET", "/workspace/files"): "login",
@@ -368,7 +369,7 @@ def test_policy_covers_all_routes():
     assert len(EXT_KEY_ROUTES) == 6
     assert len(SPECIAL_ROUTES) == 7
     # login=調査の記録のダウンロード（COD-18・`C-CONV-INVESTIGATION-01`）1件追加で50。
-    assert len(LOGIN_ROUTES) == 50
+    assert len(LOGIN_ROUTES) == 51
 
 
 def test_admin_routes_deny_for_anon_and_nonadmin_user():

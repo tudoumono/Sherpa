@@ -1402,11 +1402,12 @@ CHAT_TURNS_RUNNING_EMPTY = {"turns": []}
 CONVERSATIONS_LIST = [
     {"id": 101, "title": "消費税率の相談", "version": "v1", "pinned": False,
      "updated_at": "2026-07-01T09:00:00+00:00", "origin": "own", "read_only": False,
-     "received_at": None, "shared_by_user_id": None, "shared_by_name": None, "share_status": None},
+     "received_at": None, "shared_by_user_id": None, "shared_by_name": None, "share_status": None,
+     "share_expires_at": None},
     {"id": 202, "title": "共有された障害調査", "version": "v1", "pinned": False,
      "updated_at": "2026-07-01T09:30:00+00:00", "origin": "received_share", "read_only": True,
      "received_at": "2026-07-01T09:30:00+00:00", "shared_by_user_id": "admin",
-     "shared_by_name": "管理者", "share_status": "active"},
+     "shared_by_name": "管理者", "share_status": "active", "share_expires_at": None},
 ]
 
 # H2（履歴検索・e2e 専用フィクスチャ）: id=101（「消費税率の相談」）のタイトルには現れない語彙で
@@ -1706,6 +1707,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "auth_login": [],
         "auth_logout": [],
         "share_create": [],
+        "share_extend": [],
         "users_suggest": [],
         "admin_users_post": [],
         "admin_users_patch": [],
@@ -2358,6 +2360,11 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             if q is not None:
                 return _json(route, conversations_search_response(q))
             return _json(route, CONVERSATIONS_LIST)
+        if method == "GET" and path.startswith("/conversations/") and path.endswith("/shares"):
+            return _json(route, [{
+                "share_id": 77, "sanitized": False, "created_at": "2026-07-01T09:00:00+00:00",
+                "expires_at": "2026-07-31T09:00:00+00:00", "revoked_at": None, "refreshed_at": None,
+                "last_used_at": None, "invitees": [{"uid": "sato", "name": "佐藤", "accepted_at": None}]}])
         if method == "GET" and path.startswith("/conversations/"):
             cid_str = path.rsplit("/", 1)[-1]
             if cid_str == "102":
@@ -2713,6 +2720,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             return _json(route, {"ok": True, "share_id": 77,
                                  "url": "/share/conversations/share-token-101",
                                  "expires_at": body.get("expires_at")})
+        if method == "POST" and path.startswith("/conversation-shares/") and path.endswith("/extend"):
+            records["share_extend"].append((path, _post_json(request)))
+            return _json(route, {"ok": True, "share_id": 77, "expires_at": "2026-08-30T09:00:00+00:00"})
         if method == "GET" and path == "/scopes":
             return _json(route, SCOPES)
         if method == "GET" and path == "/graph":
@@ -3023,6 +3033,8 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/conversations/{cid}"),
     ("GET", "/users/suggest"),
     ("POST", "/conversations/{cid}/shares"),
+    ("GET", "/conversations/{cid}/shares"),
+    ("POST", "/conversation-shares/{share_id}/extend"),
     ("GET", "/scopes"),
     ("GET", "/graph"),
     ("GET", "/graph/facets"),

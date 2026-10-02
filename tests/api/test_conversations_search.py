@@ -10,6 +10,7 @@ import hashlib
 import time
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 import pytest
 
 from _common import _login, _try_init
@@ -145,8 +146,11 @@ def test_search_received_share_content_requires_valid_share():
     assert store.revoke_share(sid_revoked, owner) is True
 
     cid_expired = _mk_shared_conv("調査ログC")
-    wid_expired = store.accept_share(
-        _mk_share(cid_expired, owner, invitee, expires_at=_past(), sfx=sfx), invitee)
+    sid_expired = _mk_share(cid_expired, owner, invitee, sfx=sfx)
+    wid_expired = store.accept_share(sid_expired, invitee)   # 受領は有効なうちに済ませてから期限切れにする
+    with psycopg.connect(store._dsn()) as c:
+        c.execute("UPDATE conversation_shares SET expires_at=%s WHERE id=%s", (_past(), sid_expired))
+        c.commit()
 
     cid_personal = _mk_shared_conv("調査ログD")
     wid_personal = store.accept_share(_mk_share(cid_personal, owner, invitee, sfx=sfx), invitee)

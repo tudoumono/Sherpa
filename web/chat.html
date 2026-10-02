@@ -258,11 +258,11 @@
       <select id="share-days">
         <option value="1">1日</option>
         <option value="3">3日</option>
-        <option value="7" selected>7日</option>
+        <option value="7">7日</option>
         <option value="14">14日</option>
-        <option value="30">30日</option>
-        <option value="0">無期限</option>
+        <option value="30" selected>30日（標準）</option>
       </select>
+      <div class="share-hint" style="font-size:12px;color:var(--ink-3);margin-top:4px">共有には必ず期限があります。標準は30日で、短くすることもできます。</div>
       <div class="share-err" id="share-err"></div>
       <div style="display:flex;gap:10px;margin-top:16px">
         <button class="btn-primary" id="share-submit" style="flex:1">共有リンクを発行</button>

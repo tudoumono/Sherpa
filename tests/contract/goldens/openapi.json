@@ -1415,6 +1415,30 @@
         "title": "ConversationForkResponse",
         "type": "object"
       },
+      "ConversationShareExtendResponse": {
+        "description": "POST /conversation-shares/{share_id}/extend（shares.py::conversation_share_extend）。",
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "share_id": {
+            "title": "Share Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "share_id",
+          "expires_at"
+        ],
+        "title": "ConversationShareExtendResponse",
+        "type": "object"
+      },
       "ConversationShareRefreshResponse": {
         "description": "POST /conversation-shares/{share_id}/refresh（SH-2・shares.py::conversation_share_refresh）。",
         "properties": {
@@ -4565,6 +4589,19 @@
           "note"
         ],
         "title": "ShareCreateResponse",
+        "type": "object"
+      },
+      "ShareExtendReq": {
+        "properties": {
+          "days": {
+            "default": 30,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Days",
+            "type": "integer"
+          }
+        },
+        "title": "ShareExtendReq",
         "type": "object"
       },
       "ShareInviteeItem": {
@@ -10636,6 +10673,66 @@
         ]
       }
     },
+    "/conversation-shares/{share_id}/extend": {
+      "post": {
+        "description": "共有の期限を今から `days` 日（1〜30・省略30）へ延ばす（所有者のみ・何度でも）。\n\n期限切れでも未取消なら延長できる（招待し直し不要）。取消済み・所有者以外・存在しない共有は\nいずれも 404（存在を漏らさない）。期限更新と監査は同一トランザクション（fail-closed）。",
+        "operationId": "conversation_share_extend_conversation_shares__share_id__extend_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "share_id",
+            "required": true,
+            "schema": {
+              "title": "Share Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ShareExtendReq"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationShareExtendResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Conversation Share Extend",
+        "tags": [
+          "会話共有"
+        ]
+      }
+    },
     "/conversation-shares/{share_id}/refresh": {
       "post": {
         "description": "サニタイズ共有のスナップショットを最新の内容へ取り直す（SH-2・所有者のみ）。\n通常共有（元会話をライブ参照）は 409（常に最新のため更新の概念が無い）。",
@@ -13479,7 +13576,7 @@
     },
     "/notifications": {
       "get": {
-        "description": "非同期処理の完了/要対応の通知（NOTIFY-1・ホーム画面「通知」区画用・ログイン必須）。\n\n誰でも取り込み run の完了/失敗が見える。admin はさらにグラフ drift・LLM 成形完了・OCR\n反映待ちも見える（`notifications.list_notifications` が role で絞る）。既読管理はしない\n（毎回現在の状態から組み立てて返す）。",
+        "description": "非同期処理の完了/要対応の通知（NOTIFY-1・ホーム画面「通知」区画用・ログイン必須）。\n\n誰でも取り込み run の完了/失敗が見える。admin はさらにグラフ drift・LLM 成形完了・OCR\n反映待ちも見える（`notifications.list_notifications` が role で絞る）。自分が所有する共有の期限が\n7 日以内に来る場合は本人にだけ見える。既読管理はしない\n（毎回現在の状態から組み立てて返す）。",
         "operationId": "notifications_list_notifications_get",
         "responses": {
           "200": {

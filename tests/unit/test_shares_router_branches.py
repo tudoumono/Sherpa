@@ -62,7 +62,8 @@ def test_users_suggest_forwards_query_and_excludes_self(monkeypatch):
 # ===== POST /conversations/{cid}/shares =====
 
 def _share_req(invitee=("u2",), expires_at=None, sanitize=False):
-    return shares_routes.ShareCreateReq(invitee_user_ids=list(invitee), expires_at=expires_at, sanitize=sanitize)
+    kw = {} if expires_at is None else {"expires_at": expires_at}   # 省略＝既定期限（明示 null は 422）
+    return shares_routes.ShareCreateReq(invitee_user_ids=list(invitee), sanitize=sanitize, **kw)
 
 
 def test_share_create_not_owner_denies_403(monkeypatch):
@@ -276,7 +277,7 @@ def test_share_click_source_gone_403(monkeypatch):
                         lambda th: {"id": 1, "active": True, "conversation_id": 10})
     monkeypatch.setattr(shares_routes.store, "is_invited", lambda sid, uid: True)
 
-    def _boom(sid, uid):
+    def _boom(sid, uid, **kw):
         raise ValueError("共有元の会話が見つかりません")
 
     monkeypatch.setattr(shares_routes.store, "accept_share", _boom)
@@ -293,24 +294,22 @@ def test_share_click_success_redirects_to_chat(monkeypatch):
     monkeypatch.setattr(shares_routes.store, "resolve_share_by_token",
                         lambda th: {"id": 1, "active": True, "conversation_id": 10})
     monkeypatch.setattr(shares_routes.store, "is_invited", lambda sid, uid: True)
-    monkeypatch.setattr(shares_routes.store, "accept_share", lambda sid, uid: 55)
-    monkeypatch.setattr(shares_routes.store, "audit", lambda *a, **kw: None)
+    monkeypatch.setattr(shares_routes.store, "accept_share", lambda sid, uid, **kw: 55)
     out = shares_routes.share_click("tok", _req())
     assert out.status_code == 302 and "/ui/chat.html?conversation_id=55" in out.headers["location"]
 
 
-def test_share_click_accept_success_but_audit_failure_500(monkeypatch):
+def test_share_click_accept_failure_incl_audit_in_tx_500(monkeypatch):
     monkeypatch.setattr(shares_routes.auth, "auth_disabled", lambda: True)
     monkeypatch.setattr(shares_routes, "_synthetic_admin", lambda: _user("admin"))
     monkeypatch.setattr(shares_routes.store, "resolve_share_by_token",
                         lambda th: {"id": 1, "active": True, "conversation_id": 10})
     monkeypatch.setattr(shares_routes.store, "is_invited", lambda sid, uid: True)
-    monkeypatch.setattr(shares_routes.store, "accept_share", lambda sid, uid: 55)
 
     def _boom(*a, **kw):
-        raise RuntimeError("audit down")
+        raise RuntimeError("audit down")   # 監査は accept_share と同一トランザクション内で失敗する
 
-    monkeypatch.setattr(shares_routes.store, "audit", _boom)
+    monkeypatch.setattr(shares_routes.store, "accept_share", _boom)
     with pytest.raises(HTTPException) as ei:
         shares_routes.share_click("tok", _req())
     assert ei.value.status_code == 500
@@ -319,7 +318,7 @@ def test_share_click_accept_success_but_audit_failure_500(monkeypatch):
 # ===== POST /conversation-shares/{share_id}/revoke =====
 
 def test_conversation_share_revoke_not_owner_or_already_revoked_403(monkeypatch):
-    monkeypatch.setattr(shares_routes.store, "revoke_share", lambda sid, uid: False)
+    monkeypatch.setattr(shares_routes.store, "revoke_share", lambda sid, uid, **kw: False)
     audit_calls = []
     monkeypatch.setattr(shares_routes.store, "audit", lambda *a, **kw: audit_calls.append((a, kw)))
     with pytest.raises(HTTPException) as ei:
@@ -329,21 +328,19 @@ def test_conversation_share_revoke_not_owner_or_already_revoked_403(monkeypatch)
 
 
 def test_conversation_share_revoke_success(monkeypatch):
-    monkeypatch.setattr(shares_routes.store, "revoke_share", lambda sid, uid: True)
-    audit_calls = []
-    monkeypatch.setattr(shares_routes.store, "audit", lambda *a, **kw: audit_calls.append((a, kw)))
+    calls = []
+    monkeypatch.setattr(shares_routes.store, "revoke_share", lambda sid, uid, **kw: calls.append(kw) or True)
     out = shares_routes.conversation_share_revoke(5, _req())
     assert out == {"ok": True, "share_id": 5}
-    assert audit_calls[0][0][1] == "share.revoked" and audit_calls[0][1]["outcome"] == "success"
+    assert set(calls[0]["audit"]) == {"ip_hash", "user_agent"}   # 監査は store が同一 tx で書く
 
 
 def test_conversation_share_revoke_audit_failure_500(monkeypatch):
-    monkeypatch.setattr(shares_routes.store, "revoke_share", lambda sid, uid: True)
 
     def _boom(*a, **kw):
         raise RuntimeError("audit down")
 
-    monkeypatch.setattr(shares_routes.store, "audit", _boom)
+    monkeypatch.setattr(shares_routes.store, "revoke_share", _boom)
     with pytest.raises(HTTPException) as ei:
         shares_routes.conversation_share_revoke(5, _req())
     assert ei.value.status_code == 500

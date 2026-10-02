@@ -1710,6 +1710,7 @@ class ConversationSummary(BaseModel):
     shared_by_user_id: str | None
     shared_by_name: str | None
     share_status: str | None
+    share_expires_at: WireDateTime | None = None   # 受領共有の実効期限（それ以外は None）
     forked_from: ForkedFromInfo | None = None
     match: ConversationSearchMatch | None = None
 
@@ -1789,6 +1790,13 @@ class ConversationShareRefreshResponse(BaseModel):
     ok: bool
     share_id: int
     refreshed_at: WireDateTime
+
+
+class ConversationShareExtendResponse(BaseModel):
+    """POST /conversation-shares/{share_id}/extend（shares.py::conversation_share_extend）。"""
+    ok: bool
+    share_id: int
+    expires_at: WireDateTime
 
 
 class ShareInviteeItem(BaseModel):

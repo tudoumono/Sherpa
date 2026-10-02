@@ -10,16 +10,18 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sherpa import auth, store
+from sherpa.store.conversations import SHARE_DEFAULT_EXPIRY_DAYS
 from sherpa.deps import _COOKIE, _client_ip_hash, _current_user, _synthetic_admin
 from sherpa.schemas import (
     ConversationForkResponse,
+    ConversationShareExtendResponse,
     ConversationShareRefreshResponse,
     ShareCreateResponse,
     ShareListItem,
@@ -36,12 +38,16 @@ router = APIRouter()
 
 class ShareCreateReq(BaseModel):
     invitee_user_ids: list[str]
-    expires_at: datetime | None = None   # None＝無期限（2026-07-02-共有の無期限と永続化.md）
+    expires_at: datetime | None = None   # 省略＝作成から既定日数後。明示的な null（無期限）は 422
     sanitize: bool = False        # 個人 workspace 参照会話を、個人部分を伏せた snapshot として共有する（§Phase2）
 
 
 class ShareRevokeReq(BaseModel):
     pass
+
+
+class ShareExtendReq(BaseModel):
+    days: int = Field(SHARE_DEFAULT_EXPIRY_DAYS, ge=1, le=SHARE_DEFAULT_EXPIRY_DAYS)   # 今から最大 30 日
 
 
 # ===== 共有エンドポイント =====
@@ -76,6 +82,10 @@ def conversation_share_create(cid: int, req: ShareCreateReq, request: Request):
         except Exception:
             pass
         raise HTTPException(403, "自分の会話のみ共有できます")
+
+    # 共有は必ず期限を持つ（無期限は不可）。省略は既定日数、明示的な null だけ拒否する。
+    if "expires_at" in req.model_fields_set and req.expires_at is None:
+        raise HTTPException(422, "共有には有効期限が必要です（無期限にはできません）")
 
     # 個人 workspace ガード（§Phase2: sanitize=true なら個人部分を伏せた snapshot を共有）
     share_target_cid = cid
@@ -126,8 +136,10 @@ def conversation_share_create(cid: int, req: ShareCreateReq, request: Request):
 
     token = auth.new_token()
     th = auth.token_hash(token)
-    expires = req.expires_at   # None＝無期限
-    if expires is not None and expires.tzinfo is None:
+    expires = req.expires_at
+    if expires is None:
+        expires = datetime.now(timezone.utc) + timedelta(days=SHARE_DEFAULT_EXPIRY_DAYS)
+    elif expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
     sid = store.create_share(share_target_cid, u["uid"], th, expires, req.invitee_user_ids)
 
@@ -136,7 +148,7 @@ def conversation_share_create(cid: int, req: ShareCreateReq, request: Request):
                     detail={"conversation_id": share_target_cid, "source_conversation_id": cid,
                             "sanitized": sanitized, "owner_uid": u["uid"],
                             "invitee_uids": req.invitee_user_ids,
-                            "expires_at": expires.isoformat() if expires is not None else None},
+                            "expires_at": expires.isoformat()},
                     outcome="success", severity="info",
                     ip_hash=ip_hash, user_agent=ua)
     except Exception:
@@ -192,7 +204,18 @@ def share_click(token: str, request: Request):
     # 受領ラッパー作成（冪等）。共有元が同時に物理削除された極小レース（RV HIGH 対応・store.accept_share
     # の FOR UPDATE ロック導入後の残余ケース）は ValueError として拒否する。
     try:
-        wid = store.accept_share(share["id"], u["uid"])
+        # 受領と監査は同一トランザクション（監査失敗ならラッパーも作られない＝fail-closed）。
+        wid = store.accept_share(share["id"], u["uid"],
+                                 audit={"ip_hash": ip_hash, "user_agent": ua})
+    except store.ShareUnavailableError as e:
+        reason = e.args[0] if e.args else "revoked"
+        try:
+            store.audit(u["uid"], "share.denied", "share", f"share:{share['id']}",
+                        outcome="deny", reason=reason, severity="warning",
+                        ip_hash=ip_hash, user_agent=ua)
+        except Exception:
+            pass
+        raise HTTPException(403, "この共有は開けません（無効・期限切れ・取消済みのいずれか）")
     except ValueError:
         try:
             store.audit(u["uid"], "share.denied", "share", f"share:{share['id']}",
@@ -201,14 +224,8 @@ def share_click(token: str, request: Request):
         except Exception:
             pass
         raise HTTPException(403, "この共有は開けません（共有元が削除されました）")
-
-    try:
-        store.audit(u["uid"], "share.accepted", "share", f"share:{share['id']}",
-                    detail={"wrapper_conversation_id": wid,
-                            "source_conversation_id": share["conversation_id"]},
-                    outcome="success", ip_hash=ip_hash, user_agent=ua)
     except Exception:
-        _log.critical("audit write failed for share.accepted (share %s) – fail-closed", share["id"])
+        _log.critical("share.accepted failed (share %s) – fail-closed", share["id"])
         raise HTTPException(500, "共有処理中にエラーが発生しました")
 
     return RedirectResponse(f"/ui/chat.html?conversation_id={wid}", status_code=302)
@@ -220,7 +237,12 @@ def conversation_share_revoke(share_id: int, request: Request):
     u = _current_user(request)
     ip_hash = _client_ip_hash(request)
     ua = request.headers.get("user-agent", "")[:512]
-    ok = store.revoke_share(share_id, u["uid"])
+    try:
+        # 取消と監査は同一トランザクション（監査失敗なら取消も戻る＝fail-closed）。
+        ok = store.revoke_share(share_id, u["uid"], audit={"ip_hash": ip_hash, "user_agent": ua})
+    except Exception:
+        _log.critical("share.revoked failed (fail-closed)")
+        raise HTTPException(500, "取消処理中にエラーが発生しました")
     if not ok:
         try:
             store.audit(u["uid"], "share.revoked", "share", f"share:{share_id}",
@@ -229,13 +251,28 @@ def conversation_share_revoke(share_id: int, request: Request):
         except Exception:
             pass
         raise HTTPException(403, "取消できません（所有者以外 or 既に取消済み）")
-    try:
-        store.audit(u["uid"], "share.revoked", "share", f"share:{share_id}",
-                    outcome="success", ip_hash=ip_hash, user_agent=ua)
-    except Exception:
-        _log.critical("audit write failed for share.revoked (fail-closed)")
-        raise HTTPException(500, "取消処理中にエラーが発生しました")
     return {"ok": True, "share_id": share_id}
+
+
+@router.post("/conversation-shares/{share_id}/extend", tags=["会話共有"],
+             response_model=ConversationShareExtendResponse)
+def conversation_share_extend(share_id: int, request: Request, req: ShareExtendReq | None = None):
+    """共有の期限を今から `days` 日（1〜30・省略30）へ延ばす（所有者のみ・何度でも）。
+
+    期限切れでも未取消なら延長できる（招待し直し不要）。取消済み・所有者以外・存在しない共有は
+    いずれも 404（存在を漏らさない）。期限更新と監査は同一トランザクション（fail-closed）。"""
+    u = _current_user(request)
+    days = (req or ShareExtendReq()).days
+    ip_hash = _client_ip_hash(request)
+    ua = request.headers.get("user-agent", "")[:512]
+    try:
+        expires = store.extend_share(share_id, u["uid"], days, audit={"ip_hash": ip_hash, "user_agent": ua})
+    except Exception:
+        _log.critical("share.extended failed (fail-closed)")
+        raise HTTPException(500, "延長処理中にエラーが発生しました")
+    if expires is None:
+        raise HTTPException(404, "共有が見つかりません")
+    return {"ok": True, "share_id": share_id, "expires_at": expires}
 
 
 # ===== SH-1: フォーク（「この会話を引き継いで質問」）=====
@@ -286,25 +323,19 @@ def conversation_share_refresh(share_id: int, request: Request):
     ip_hash = _client_ip_hash(request)
     ua = request.headers.get("user-agent", "")[:512]
     try:
-        result = store.refresh_sanitized_share(u["uid"], share_id)
+        # 更新と監査は同一トランザクション（監査失敗なら更新も戻る＝fail-closed）。
+        result = store.refresh_sanitized_share(u["uid"], share_id,
+                                               audit={"ip_hash": ip_hash, "user_agent": ua})
     except LookupError:
         raise HTTPException(404, "共有が見つかりません")
     except PermissionError:
         raise HTTPException(403, "所有者のみ更新できます")
     except store.ShareNotSanitizedError:
         raise HTTPException(409, "この共有は常に最新の内容を表示します")
-
-    try:
-        store.audit(u["uid"], "share.refreshed", "share", f"share:{share_id}",
-                    detail={"old_snapshot_id": result["old_snapshot_id"],
-                            "new_snapshot_id": result["new_snapshot_id"],
-                            "source_conversation_id": result["source_conversation_id"]},
-                    outcome="success", severity="info", ip_hash=ip_hash, user_agent=ua)
     except Exception:
-        # fail-closed: DB 側は既に確定済み（1トランザクションで commit 済み）だが、監査できない
-        # 状態を成功として返さない（他の書込系エンドポイントと同じ流儀）。
-        _log.critical("audit write failed for share.refreshed (share %s) – fail-closed", share_id)
+        _log.critical("share.refreshed failed (share %s) – fail-closed", share_id)
         raise HTTPException(500, "更新処理中にエラーが発生しました")
+
     return {"ok": True, "share_id": share_id, "refreshed_at": result["refreshed_at"]}
 
 

@@ -451,11 +451,12 @@ def notifications_list(request: Request):
     """非同期処理の完了/要対応の通知（NOTIFY-1・ホーム画面「通知」区画用・ログイン必須）。
 
     誰でも取り込み run の完了/失敗が見える。admin はさらにグラフ drift・LLM 成形完了・OCR
-    反映待ちも見える（`notifications.list_notifications` が role で絞る）。既読管理はしない
+    反映待ちも見える（`notifications.list_notifications` が role で絞る）。自分が所有する共有の期限が
+    7 日以内に来る場合は本人にだけ見える。既読管理はしない
     （毎回現在の状態から組み立てて返す）。
     """
     u = _current_user(request)
-    return {"notifications": notifications.list_notifications(is_admin=u.get("role") == "admin")}
+    return {"notifications": notifications.list_notifications(is_admin=u.get("role") == "admin", uid=u["uid"])}
 
 
 # ===== 運営掲示板（2026-07-02-利用統計とホーム掲示板.md Feature 2・公開/削除タイマー） =====
