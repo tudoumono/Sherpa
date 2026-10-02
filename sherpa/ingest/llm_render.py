@@ -167,6 +167,8 @@ _AI_OBSERVATION_BODY_MARKER = "AI画像観測（原本確定値ではない）"
 # 保護行検証は固定 prefix 行と「」原値しか見ないため、Mermaid フェンス内は素通しになり、
 # ここでスキップしないと LLM 成形が図のコードを書き換えうる（evidence_render.FLOW_DIAGRAM_BODY_MARKER）。
 _FLOW_DIAGRAM_BODY_MARKER = "フロー図（機械生成・Mermaid）"
+# メタファイル図の描画命令から取り出した文字（元の値）も決定的な成果物＝成形対象外。
+_FIGURE_TEXT_BODY_MARKER = "図の中の文字（元の値）"
 
 
 def _is_ai_observation_body(body: str) -> bool:
@@ -174,8 +176,8 @@ def _is_ai_observation_body(body: str) -> bool:
 
 
 def _is_machine_artifact_body(body: str) -> bool:
-    """LLM 成形の対象外（生の記録・決定的成果物）か。AI観測とフロー図の両マーカーを束ねる。"""
-    return body.startswith((_AI_OBSERVATION_BODY_MARKER, _FLOW_DIAGRAM_BODY_MARKER))
+    """LLM 成形の対象外（生の記録・決定的成果物）か。AI観測・フロー図・図の中の文字のマーカーを束ねる。"""
+    return body.startswith((_AI_OBSERVATION_BODY_MARKER, _FLOW_DIAGRAM_BODY_MARKER, _FIGURE_TEXT_BODY_MARKER))
 
 
 def _leading_chrome(block: str) -> str:

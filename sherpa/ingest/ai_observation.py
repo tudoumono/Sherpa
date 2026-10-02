@@ -38,6 +38,8 @@ class ObservationInput:
     pixel_size: list[int] | None = None
     input_kind: str = "asset"
     render_profile: dict[str, Any] | None = None
+    # WMF/EMF 内のビットマップを読んだとき、その親メタファイル（Evidence 要素が持つ資産）の hash。
+    parent_asset_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,9 @@ def _canonical(value: Any) -> str:
 def _content_payload(observation_set: AIObservationSet) -> dict:
     payload = asdict(observation_set)
     payload.pop("observation_set_hash", None)
+    for item in payload["inputs"]:
+        if item.get("parent_asset_sha256") is None:       # 親が無い入力のhashは従来のまま
+            item.pop("parent_asset_sha256", None)
     return payload
 
 
@@ -160,6 +165,9 @@ def build(
             pixel_size=item.get("pixel_size"),
             input_kind=str(item.get("input_kind") or "asset"),
             render_profile=dict(item["render_profile"]) if isinstance(item.get("render_profile"), dict) else None,
+            parent_asset_sha256=(
+                _tagged_sha256(str(item["parent_asset_sha256"])) if item.get("parent_asset_sha256") else None
+            ),
         ))
 
     input_ids = {item.input_id for item in built_inputs}
@@ -388,7 +396,7 @@ def validation_errors(
                 errors.append(f"target_evidence_missing:{item.input_id}")
                 continue
             if item.input_kind == "asset":
-                if item.asset_sha256 not in _target_asset_hashes(target):
+                if (item.parent_asset_sha256 or item.asset_sha256) not in _target_asset_hashes(target):
                     errors.append(f"target_asset_mismatch:{item.input_id}")
             elif target.type != "page":
                 errors.append(f"page_render_target:{item.input_id}")

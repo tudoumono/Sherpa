@@ -25,7 +25,7 @@ import uuid
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import ai_observation, context_ir, evidence_ir, mermaid_render
 
@@ -1627,6 +1627,72 @@ def _ai_observation_records(
     return records
 
 
+FIGURE_TEXT_BODY_MARKER = "図の中の文字（元の値）"
+
+
+def _figure_text_records(
+    ir: evidence_ir.EvidenceIR,
+    ctx: context_ir.ContextIR,
+    figure_texts: Mapping[str, list[list[str]]],
+) -> list[dict]:
+    """メタファイル図（WMF/EMF）の描画命令に載っていた文字を、図の位置の独立recordにする。
+
+    AI観測と違い画素の読み取りではなく原本の描画命令にある文字列そのもの（元の値）。
+    ``figure_texts`` は Evidence 要素ID → 図ごとの文字行のリスト。
+    """
+    elements = {element.element_id: element for element in ir.elements}
+    records: list[dict] = []
+    for element_id, blocks in sorted(figure_texts.items()):
+        target = elements.get(element_id)
+        if target is None:
+            continue
+        section_path = _element_section_path(ir, ctx, target)
+        section_text = "の".join(section_path)
+        valid_blocks = [[line for line in block if line.strip()] for block in blocks]
+        valid_blocks = [block for block in valid_blocks if block]
+        for index, lines in enumerate(valid_blocks, start=1):
+            logical_record_id = _stable_id("logical-figure-text", ir.source.content_hash, element_id, index)
+            body = FIGURE_TEXT_BODY_MARKER + "\n" + "\n".join(lines)
+            semantic = (
+                f"原本「{Path(ctx.source_name).name}」の{section_text}にある図（WMF/EMF）に描かれていた文字"
+                f"（描画命令の元の値）。内容は「{' / '.join(lines)}」である。"
+            )
+            piece = {
+                "semantic": semantic,
+                "markdown": body,
+                "exact": "\n".join(lines),
+                "evidence_id": target.element_id,
+                "locator": _compact_locator(target.locator),
+                "header_path": [],
+                "text_span": None,
+                "relations": [],
+                "evidence_state": {"visibility": target.visibility, "lifecycle": target.lifecycle},
+                "object_metadata": {
+                    "asset_sha256": target.extension.get("asset_sha256"),
+                    "media_part": target.extension.get("media_part"),
+                },
+            }
+            records.append(_base_record(
+                source_hash=ir.source.content_hash,
+                kind="figure_text",
+                logical_record_id=logical_record_id,
+                group_index=1,
+                group_count=1,
+                section_path=section_path,
+                pieces=[piece],
+                sort_key=_record_sort_key(target.locator, target.order, 0, 5_000 + index),
+                parent_id=target.parent_id,
+                source_name=Path(ctx.source_name).name,
+                document_context={
+                    "source_name": Path(ctx.source_name).name,
+                    "sheet": target.locator.sheet,
+                    "slide": target.locator.slide,
+                    "page": target.locator.page,
+                },
+            ))
+    return records
+
+
 # `llm_render._is_ai_observation_body`と同型の本文マーカー——LLM成形（rag.mdの平文しか見えない）が
 # 構造化されたrecord kindの代わりにこの行でフロー図recordを識別し、Mermaidコードを書き換え対象から
 # 除外できるようにする。L9時点ではllm_render.py側の配線は未着手（他レーンが同ファイルを並行編集中の
@@ -2007,8 +2073,12 @@ def render(
     *,
     source_name: str,
     observation_set: ai_observation.AIObservationSet | None = None,
+    figure_texts: Mapping[str, list[list[str]]] | None = None,
 ) -> RenderedEvidence:
-    """Evidence IRから同一record集合を経由してMarkdownとchunkを決定的に生成する。"""
+    """Evidence IRから同一record集合を経由してMarkdownとchunkを決定的に生成する。
+
+    ``figure_texts``: メタファイル図の描画命令から取り出した文字（Evidence 要素ID → 図ごとの文字行）。
+    """
     ir_errors = evidence_ir.validation_errors(ir)
     if ir_errors:
         raise ValueError("invalid Evidence IR: " + ",".join(ir_errors))
@@ -2029,6 +2099,8 @@ def render(
         ir, context, aliases, suppressed)
     records.extend(_coverage_notice_records(ir, source_name))
     records.extend(_flow_diagram_records(ir, context))
+    if figure_texts:
+        records.extend(_figure_text_records(ir, context, figure_texts))
     if observation_set is not None:
         records.extend(_ai_observation_records(ir, context, observation_set))
     records.sort(key=lambda record: record["_sort_key"])

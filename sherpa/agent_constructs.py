@@ -117,7 +117,8 @@ def _auto_default_agent(system_settings: dict | None = None) -> str:
     `system_settings`（省略可）: `_codex_auth_available`／キー解決へそのまま渡す（省略時は
     自分で読む）。
     """
-    if shutil.which("codex") and _codex_auth_available(system_settings):
+    from sherpa import required_tools
+    if shutil.which("codex") and _codex_auth_available(system_settings) and not required_tools.codex_cli_missing():
         return "codex"
     from sherpa import keys
     if is_real_api_key(keys.resolve_api_key("openai", None, system_settings=system_settings)):
@@ -341,8 +342,11 @@ def available_constructs(system_settings: dict | None = None) -> list[dict[str, 
     sys_s = system_settings if system_settings is not None else store.get_system_settings()
     provider = keys.selected_cloud_provider(sys_s)
     openai_direct_visible = bool(sys_s.get("openai_direct_visible"))
+    from sherpa import required_tools
+    codex_ready = not required_tools.codex_cli_missing()   # codex 本体が無ければ選ばせない（実行時に失敗するため）
     out = [dict(c) for c in CONSTRUCTS
-           if not (c["agent"] == "openai" and (provider != "openai" or not openai_direct_visible))]
+           if not (c["agent"] == "openai" and (provider != "openai" or not openai_direct_visible))
+           and not (c["agent"] == "codex" and not codex_ready)]
     for name in sorted(enabled_extra_agents()):
         if name == "heuristic":
             continue   # 利用者向け選択肢には出さない（内部フォールバック専用）

@@ -290,16 +290,21 @@ def test_round_matching_equals_old_lateral_query():
     start, end, _ = U._usage_period(time_from=_FROM, time_to=_TO)
     with store._connect() as c:
         old = c.execute(_OLD_ROUND_SQL, (start, start, end)).fetchall()
-        U._build_usage_rounds(c, start, end)
-        new = c.execute("SELECT provider, turn_message_id, depth FROM usage_rounds").fetchall()
-    def key(provider, turn_id, depth):
-        return (provider, -1 if turn_id is None else turn_id, depth or "unknown")
+        U._build_usage_turns(c, start, end, with_next=True)
+        U._build_usage_rounds(c, start)
+        new = c.execute("SELECT turn_message_id, w, depth FROM usage_rounds WHERE per_turn").fetchall()
 
-    assert sorted(key(r["provider"], r["turn_message_id"], r["depth_profile"]) for r in old) == sorted(
-        key(r["provider"], r["turn_message_id"], r["depth"]) for r in new)
-    assert len(new) == 3
+    # 巡 → 所属ターンの返答の対応（ターンごとの巡数と深さ）が旧 LATERAL 版と一致する
+    old_map: dict = {}
+    for r in old:
+        k = -1 if r["turn_message_id"] is None else r["turn_message_id"]
+        n, _ = old_map.get(k, (0, None))
+        old_map[k] = (n + 1, r["depth_profile"] or "unknown")
+    new_map = {(-1 if r["turn_message_id"] is None else r["turn_message_id"]): (r["w"], r["depth"]) for r in new}
+    assert old_map == new_map
+    assert sum(r["w"] for r in new) == 3
     # 返答の保存されなかったターンの巡は、次のターンの返答へ結合しない
-    assert sum(1 for r in new if r["turn_message_id"] is None) == 1
+    assert sum(r["w"] for r in new if r["turn_message_id"] is None) == 1
 
 
 def test_aggregation_does_not_read_answer_json():

@@ -147,7 +147,7 @@ def compute_ocr_implementation_binding(root: Path) -> dict[str, str]:
 def test_e16_schema_and_fixed_profiles_are_public_contracts():
     assert ai_observation.AI_OBSERVATION_SCHEMA_VERSION == "ai-observation-set-v1alpha2"
     assert ocr_router.OCR_ROUTE_SCHEMA_VERSION == "ocr-route-manifest-v1"
-    assert ocr_router.OCR_ROUTER_PROFILE == "evidence-raster-router-v4"
+    assert ocr_router.OCR_ROUTER_PROFILE == "evidence-raster-router-v5"
     assert ocr_router.ocr_route_sig_value().startswith("sha256:")
     assert ocr_router.PAGE_RENDER_PROFILE == {
         "renderer": "pypdfium2",

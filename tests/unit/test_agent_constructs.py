@@ -16,6 +16,8 @@ from sherpa import agent_constructs as AC
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
     monkeypatch.delenv(AC.EXTRA_AGENTS_ENV, raising=False)
+    from sherpa import required_tools
+    monkeypatch.setattr(required_tools, "codex_cli_missing", lambda: False)   # 実機の codex の有無に依らない
 
 
 def test_default_shows_exactly_three_constructs():

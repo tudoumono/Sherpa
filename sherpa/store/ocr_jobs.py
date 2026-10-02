@@ -118,7 +118,7 @@ def unsupported_route_ids(manifest: Any) -> list[str]:
     """manifest のうち「読めない画像形式」として対象外になった入力の route_input_id。"""
     return [
         decision.route_input_id for decision in manifest.decisions
-        if decision.status == "excluded" and decision.reason_code == "unsupported_image_format"
+        if decision.status == "excluded" and decision.reason_code in ("unsupported_image_format", "metafile_expanded")
     ]
 
 

@@ -2,7 +2,10 @@
 
 - 旧実装（巡の行を Python へ引いて `_compute_round_stats`/`_compute_final_*` で集計）の凍結コピーと、
   SQL 集計（`_build_usage_rounds`＋`_round_stats_from_sql`／`_final_claims_from_sql`）の結果一致。
-  過去に保存済みの巡（欠けた欄・型の崩れた欄・meta が NULL/配列の行）も同じ規則で数える。
+  書込側が書く型（整数・文字列・オブジェクト）の meta と、欠けた欄・meta が NULL/配列の行は同じ規則で数える。
+  小数・文字列で保存された「整数のはずの欄」は旧実装の型判定（整数だけ数える）と同じ結果にはならない
+  （書込側が書かない形＝契約外）。
+- 期間内に所属ターンを持たない巡（user 発言の無い会話・会話 id なしの巡）は数えない。
 - 巡の行を Python へ引かない（返答が増えても集計時間が巡数に比例しない）合成データでの表示時間。
 
 要 Postgres。DB 不可は SKIP。
@@ -108,14 +111,14 @@ def _meta_variants():
     return [
         {"round": 1, "citations_delta": 2,
          "claims": {"confirmed": 3, "inferred": 1, "unknown": 2,
-                    "reason_codes": {"not_found": 2, "conflict": 1, "bad_bool": True, "bad_float": 1.5, "zero": 0}},
+                    "reason_codes": {"not_found": 2, "conflict": 1, "bad_bool": True, "bad_str": "1", "zero": 0}},
          "limits": {lim_int: 2, lim_int2: 1.5, lim_bool: True, lim_bool2: False, "not_a_limit": 9,
                     U._USAGE_LIMIT_INT_FIELDS[2]: "x"},
          "verdict": "insufficient", "stop": "max_rounds",
          "missing_codes": ["source", "", "source", 3, None, "design"], "missing": ["自由文"]},
-        {"round": 2, "citations_delta": 1.5, "claims": {"confirmed": True, "inferred": 2.0, "unknown": 0},
+        {"round": 2, "citations_delta": 1.5, "claims": {"confirmed": True, "inferred": "2", "unknown": 0},
          "verdict": "", "stop": 5, "missing_codes": []},
-        {"round": 2.0, "citations_delta": True, "claims": None, "limits": []},   # 巡番号が整数でない
+        {"round": "2", "citations_delta": True, "claims": None, "limits": []},   # 巡番号が整数でない
         {"round": True, "claims": {"reason_codes": None}, "verdict": "sufficient"},
         {"round": "3", "stop": "sufficient", "missing_codes": ["source"]},
         {},                                                                       # 空の meta
@@ -162,12 +165,12 @@ def _seed() -> _World:
         c = w.conv(**kw)
         w.msg(c, "user", _T0 + timedelta(hours=1))
         w.round(c, _T0 + timedelta(hours=1, seconds=5), metas[0])
-    # 会話 D: user 発言が無い巡（巡自身の ts で期間判定・対応する返答なし）／会話 id なしの巡
+    # 会話 D: 空・配列・NULL の meta（欠けた欄は数えない）。provider が空は "unknown"
     d = w.conv()
-    w.round(d, _T0 + timedelta(hours=2), metas[5])
-    w.round(d, _T0 + timedelta(hours=2, minutes=1), metas[6], provider="")
-    w.round(d, _T0 + timedelta(hours=2, minutes=2), metas[7], provider="ollama")
-    w.round(None, _T0 + timedelta(hours=3), metas[0])
+    w.msg(d, "user", _T0 + timedelta(hours=2))
+    w.round(d, _T0 + timedelta(hours=2, seconds=10), metas[5])
+    w.round(d, _T0 + timedelta(hours=2, seconds=20), metas[6], provider="")
+    w.round(d, _T0 + timedelta(hours=2, seconds=30), metas[7], provider="ollama")
     # 会話 E: 別利用者・別の深さ（返答 1 件・巡 3 つ）
     e = w.conv()
     w.msg(e, "user", _T0 + timedelta(days=2))
@@ -177,6 +180,16 @@ def _seed() -> _World:
     w.msg(e, "assistant", _T0 + timedelta(days=2, seconds=40), lens="qa", answer=_answer("light", provider="ollama"))
     w.flush()
     return w
+
+
+def _sql_round_stats(c, start, end) -> dict:
+    U._build_usage_turns(c, start, end, with_next=True)
+    U._build_usage_rounds(c, start)
+    new = U._round_stats_from_sql(c)
+    final_reasons, final_missing = U._final_claims_from_sql(c)
+    new["reason_codes"] = U._round_reason_codes(new, final_reasons)
+    U._merge_final_missing_agg(new, final_missing)
+    return new
 
 
 def _reference(c, start, end) -> dict:
@@ -197,10 +210,7 @@ def test_sql_round_stats_equal_python_aggregation_on_edge_cases():
     start, end, _ = U._usage_period(time_from=_FROM, time_to=_TO)
     with store._connect() as c:
         old = _reference(c, start, end)
-        U._build_usage_rounds(c, start, end)
-        new = U._round_stats_from_sql(c)
-        new["reason_codes"] = U._round_reason_codes(new, U._final_claims_from_sql(c)[0])
-        U._merge_final_missing_agg(new, U._final_claims_from_sql(c)[1])
+        new = _sql_round_stats(c, start, end)
     assert old["by_depth_provider"], "データが入っていない"
     assert old["unmatched_rounds"] >= 2 and any(b["round_no"] is None for b in old["by_round"])
     dp = old["by_depth_provider"]
@@ -231,7 +241,8 @@ def test_round_stats_are_empty_when_no_rounds_in_period():
         pytest.skip("DB down")
     start, end, _ = U._usage_period(time_from="2003-03-01T00:00:00+09:00", time_to="2003-03-02T00:00:00+09:00")
     with store._connect() as c:
-        U._build_usage_rounds(c, start, end)
+        U._build_usage_turns(c, start, end, with_next=True)
+        U._build_usage_rounds(c, start)
         new = U._round_stats_from_sql(c)
     assert new == U._compute_round_stats([])
 
@@ -257,7 +268,8 @@ def test_round_stats_time_does_not_grow_with_round_count():
             "INSERT INTO turn_metrics (message_id, conversation_id, user_message_id, user_id, world, created_at, lens, "
             "  provider, model, depth_profile, stop_kind, duration_ms, sources_count, mapping_source, mapping_version) "
             "SELECT a.id, a.conversation_id, (SELECT max(u.id) FROM messages u WHERE u.conversation_id=a.conversation_id "
-            "  AND u.role='user' AND u.id < a.id), cv.user_id, cv.version, a.created_at, 'qa', 'codex', 'm', "
+            "  AND u.role='user' AND u.created_at = a.created_at - interval '40 seconds'), "
+            "  cv.user_id, cv.version, a.created_at, 'qa', 'codex', 'm', "
             "  (ARRAY['light','standard','deep'])[1 + a.id %% 3], 'completed', 1000, 1, 'answer_only', 1 "
             "FROM messages a JOIN conversations cv ON cv.id=a.conversation_id "
             "WHERE a.role='assistant' AND a.conversation_id = ANY(%s)", (cids,))
@@ -277,7 +289,8 @@ def test_round_stats_time_does_not_grow_with_round_count():
         start, end, _ = U._usage_period(90)
         t0 = time.perf_counter()
         with store._connect() as c:
-            U._build_usage_rounds(c, start, end)
+            U._build_usage_turns(c, start, end, with_next=True)
+            U._build_usage_rounds(c, start)
             stats = U._round_stats_from_sql(c)
         dt = time.perf_counter() - t0
         assert dt < 3.0, f"巡の集計が {dt:.2f}s"
