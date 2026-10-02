@@ -1,0 +1,7 @@
+# ocr-worker のイメージへ「焼いたコードの版」を表示用ラベルとして付ける（scripts/ocr-up.sh が重ねて使う）。
+# 固定測定に束縛される docker-compose.yml 本体は変えない。
+services:
+  ocr-worker:
+    build:
+      labels:
+        sherpa.code-version: ${SHERPA_APP_VERSION:-unknown}

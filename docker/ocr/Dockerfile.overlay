@@ -1,0 +1,12 @@
+# 導入済みの OCR ワーカーイメージへ、現在のアプリのコードだけを載せ替える薄いイメージ。
+# ベースイメージが引けない閉域でも、ネットワーク無しでコードを更新するために使う（scripts/ocr-up.sh）。
+# 古い sherpa/ を先に消すので、削除・改名されたファイルは残らない。
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN rm -rf /app/sherpa
+COPY sherpa /app/sherpa
+
+ARG SHERPA_APP_VERSION=unknown
+LABEL sherpa.code-version=${SHERPA_APP_VERSION} \
+      sherpa.overlay=1

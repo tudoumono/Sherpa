@@ -109,6 +109,26 @@ else
   echo "  [停止] ワーカー        : 未起動（make up で起動・モデル未取得なら make ocr-models）"
 fi
 
+# ワーカーのイメージに焼かれたコードの版が、いまのアプリの VERSION と違えば知らせる
+# （古いコードのまま動くと、直したはずの不具合が再発する）。
+_ocr_img_ver="$(docker image inspect -f '{{index .Config.Labels "sherpa.code-version"}}' sherpa/ocr-worker:paddleocr-3.7.0-cpu 2>/dev/null || true)"
+_app_ver="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
+if [ -n "$_ocr_img_ver" ] && [ "$_ocr_img_ver" != "<no value>" ]; then
+  _app_commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+  # ラベルにコミットがあり、こちらも取れるときはコミットまで比べる（どちらかが無ければ VERSION だけ）。
+  _cmp_img="${_ocr_img_ver%%+*}"; _cmp_app="$_app_ver"
+  if [ -n "$_app_commit" ] && [ "$_ocr_img_ver" != "$_cmp_img" ]; then
+    _cmp_img="$_ocr_img_ver"; _cmp_app="$_app_ver+$_app_commit"
+  fi
+  if [ "$_cmp_img" = "$_cmp_app" ]; then
+    printf '  ワーカーのコード : %s\n' "$_ocr_img_ver"
+  else
+    printf '  [注意] ワーカーのコードが古い: %s（アプリは %s） → make up で更新できます（閉域でも可）\n' "$_ocr_img_ver" "$_app_ver"
+  fi
+elif docker image inspect sherpa/ocr-worker:paddleocr-3.7.0-cpu >/dev/null 2>&1; then
+  printf '  [注意] ワーカーのコードの版が不明（古いイメージ） → make up で更新できます（閉域でも可）\n'
+fi
+
 # 落ちているものへの案内。
 if [ "$stores_down" != 0 ] || [ "$app_down" != 0 ]; then
   echo ""

@@ -59,14 +59,37 @@ if ! docker image inspect sherpa/ocr-worker:paddleocr-3.7.0-cpu >/dev/null 2>&1;
 fi
 
 echo "  OCR（画像内文字の読み取り）ワーカーを起動します..."
-# 閉域（オフライン導入）ではベースイメージが無く再ビルドできない——キットが load 済みの
-# イメージをそのまま使う。ベースが引ける環境（開発機）だけ従来どおり毎回ビルドする。
+# ワーカーへ焼くコードの版（VERSION ＋ git のコミット・コミットが取れなければ VERSION のみ）。
+SHERPA_APP_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo unknown)"
+_ocr_commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+[ -n "$_ocr_commit" ] && SHERPA_APP_VERSION="$SHERPA_APP_VERSION+$_ocr_commit"
+export SHERPA_APP_VERSION
+
+# 閉域（オフライン導入）ではベースイメージが無く、フルビルドできない。その場合も**コードは必ず更新する**:
+# 導入済みイメージの上に、現在の sherpa/ だけを載せ替えた薄いイメージを作って同じ名前で付け替える
+# （ネットワーク不要）。ベースが引ける環境（開発機）は従来どおり毎回フルビルドする。
+_ocr_image=sherpa/ocr-worker:paddleocr-3.7.0-cpu
 _ocr_base="$(awk 'toupper($1)=="FROM"{print $2; exit}' "$ROOT/docker/ocr/Dockerfile" 2>/dev/null)"
-if [ -n "$_ocr_base" ] && ! docker image inspect "$_ocr_base" >/dev/null 2>&1    && docker image inspect sherpa/ocr-worker:paddleocr-3.7.0-cpu >/dev/null 2>&1; then
-  echo "  （ベースイメージが無いため再ビルドせず、導入済みイメージをそのまま使います）"
+if [ -n "$_ocr_base" ] && ! docker image inspect "$_ocr_base" >/dev/null 2>&1 \
+   && docker image inspect "$_ocr_image" >/dev/null 2>&1; then
+  echo "  （ベースイメージが無いため、導入済みイメージにアプリのコードだけを載せ替えます）"
+  # 載せ替え済みのイメージの上へ重ねると層が増え続けるため、素のイメージを別名で保持してそこから作る。
+  if [ "$(docker image inspect -f '{{index .Config.Labels "sherpa.overlay"}}' "$_ocr_image" 2>/dev/null)" != "1" ]; then
+    docker tag "$_ocr_image" "$_ocr_image-base"
+  fi
+  if ! docker build -q -f "$ROOT/docker/ocr/Dockerfile.overlay" \
+    --build-arg "BASE_IMAGE=$_ocr_image-base" --build-arg "SHERPA_APP_VERSION=$SHERPA_APP_VERSION" \
+    -t "$_ocr_image" "$ROOT" >/dev/null; then
+    # 黙って古いワーカーを動かし続けない（起動の成功に見せない）。意図したスキップ（exit 0）とは区別する。
+    echo "  【失敗】OCR ワーカーのコード更新に失敗しました。ワーカーは古いコードのままです。" >&2
+    echo "    Docker の状態を確認し、もう一度 make up を実行してください。" >&2
+    exit 1
+  fi
   sherpa_compose --profile ocr up -d ocr-worker
 else
-  sherpa_compose --profile ocr up -d --build ocr-worker
+  # 版ラベルは別ファイルで重ねる（docker-compose.yml 本体は固定測定に束縛されるため触らない）。
+  COMPOSE_FILE="$ROOT/docker-compose.yml:$ROOT/docker/ocr/compose.version.yml" \
+    sherpa_compose --profile ocr up -d --build ocr-worker
 fi
 echo "    資料フォルダ（読み取り専用）: $SHERPA_OCR_WORLD_ROOT"
 echo "    モデル（読み取り専用）      : $MODEL_CACHE"
