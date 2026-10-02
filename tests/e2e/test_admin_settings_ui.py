@@ -718,6 +718,12 @@ def test_admin_settings_legacy_backend_radio_and_missing_notice(page, web_base_u
     expect(page.locator("#legacy-status")).to_contain_text("既定に従っています")
     expect(page.locator("#legacy-lo-missing")).to_be_visible()
     expect(page.locator("#legacy-lo-missing")).to_contain_text("LibreOffice が見つかりません")
+    expect(page.locator("#legacy-radios input[data-legacy='libreoffice'] ~ span")).to_contain_text(
+        "LibreOffice が入っていません")
+    # 「必要な道具」表: 無い道具は「入っていません」＋入れ方、有る道具は「入っています」。
+    expect(page.locator("#required-tools-body tr[data-tool='libreoffice']")).to_contain_text("入っていません")
+    expect(page.locator("#required-tools-body tr[data-tool='libreoffice']")).to_contain_text("apt-get install")
+    expect(page.locator("#required-tools-body tr[data-tool='chromium']")).to_contain_text("入っています")
     # office_com は URL 未設定＝「接続先 SHERPA_OFFICE_COM_URL を設定してください」案内。
     expect(page.locator("#legacy-oc-missing")).to_be_visible()
     expect(page.locator("#legacy-oc-missing")).to_contain_text("SHERPA_OFFICE_COM_URL")
@@ -781,6 +787,23 @@ def test_admin_settings_legacy_backend_office_com_direct(page, web_base_url):
     put = records["admin_settings_put"][-1]
     assert put["legacy_backend"] == "office_com"
     expect(page.locator("#legacy-radios input[data-legacy='office_com']")).to_be_checked()
+
+
+def test_admin_settings_legacy_backend_office_com_direct_without_office_is_disabled(page, web_base_url):
+    """PowerShell 連携はあるが Office に届かない（available=false）なら Office 連携は選べない。"""
+    from playwright.sync_api import expect
+
+    view = {**SYSTEM_SETTINGS_VIEW, "legacy_backend": {
+        "configured": None, "effective": "none", "default": "none",
+        "options": ["none", "libreoffice", "office_com"],
+        "libreoffice": {"available": False, "version": None},
+        "office_com": {"configured_url": False, "mode": "direct", "powershell": True,
+                       "available": False, "versions": None}}}
+    install_api_mocks(page, system_settings=view)
+    page.goto(f"{web_base_url}/admin-settings.html")
+    open_tab(page, "ingest")
+    open_advanced(page, "tabpanel-ingest")
+    expect(page.locator("#legacy-radios input[data-legacy='office_com']")).to_be_disabled()
 
 
 def test_admin_settings_legacy_backend_select_and_save(page, web_base_url):

@@ -407,6 +407,16 @@ class OfficeComInfo(BaseModel):
     versions: dict[str, Any] | None
 
 
+class RequiredToolInfo(BaseModel):
+    id: str
+    label: str
+    installed: bool
+    version: str | None = None
+    used_by: list[str]
+    how_to_install: str
+    detail: str | None = None
+
+
 class LegacyBackendInfo(BaseModel):
     configured: str | None
     effective: str
@@ -591,6 +601,7 @@ class AdminSettingsView(BaseModel):
     model_catalog: ModelCatalogAdminInfo
     arms: ArmsInfo
     legacy_backend: LegacyBackendInfo
+    required_tools: list[RequiredToolInfo]
     rag_llm_render: RagLlmRenderInfo
     vlm: VlmInfo
     ollama_allowlist: OllamaAllowlistInfo

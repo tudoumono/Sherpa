@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, StrictBool
 
-from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, search_helper, store
+from sherpa import agent_constructs, chat_examples, keys, llm, model_catalog, required_tools, search_helper, store
 # `_bedrock_key_fingerprint` は `sherpa/store/settings.py`
 # へ移設した（`add_bedrock_verified_models` が同一トランザクション内で使う必要があるため）。ここでは
 # store facade から re-export する（`sherpa.routers.system._bedrock_key_fingerprint`／
@@ -695,6 +695,10 @@ def settings_put(req: SettingsReq, request: Request):
     # ＝画面から消えているのに設定だけ残る状態を作らない（`agent_constructs` 参照）。
     if req.agent and agent_constructs.runtime_blocked(req.agent):
         raise HTTPException(422, "この AI はこの環境では利用できません（管理者が有効化していません）")
+    if req.agent == "codex":
+        _codex_msg = required_tools.codex_cli_missing_message()
+        if _codex_msg:
+            raise HTTPException(422, _codex_msg)
     # A7（クラウドプロバイダ排他選択）: 選択中でないクラウド系 agent（openai/gemini/bedrock）は
     # 保存させない（保存できても実行時に ollama へフォールバックするだけの構成を作らせない）。
     if req.agent and agent_constructs.agent_requires_unselected_cloud(req.agent, sys_s):

@@ -212,8 +212,7 @@ class OoxmlArm:
                       for f in e.source_map.get("flags", [])]
             for flag_name in sorted(set(flagged)):
                 notes.append(f"{flag_name}_tables:{flagged.count(flag_name)}")
-        from .. import human_md
-        md = human_md.render_docx(document) if ext == ".docx" else human_md.render_xlsx(document)
+        md = office_md._render_human_md(document, p, ext)
         if md is None:
             # IR 自体は構築できた（document is not None）が、レンダラが本文を1つも見つけられなかった
             # 場合（docx の空文書等・xlsx は `human_md.render_xlsx` が常に非 None を返すため実質 docx のみ）。

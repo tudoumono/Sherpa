@@ -288,16 +288,17 @@ function renderLegacy(lb) {
   const selected = _legacySelectedValue(lb);
   const defaultName = lb.default || 'none';
   const loOk = !!(lb.libreoffice && lb.libreoffice.available);
-  // W2'（2026-07-08）: Office 連携は「到達可（http ワーカー or direct の Office 検出）」または
-  // 「同一マシンで direct 検出済み（powershell 連携あり＝Office が未導入でも選択自体は許可）」なら選べる。
+  // Office 連携は実際に到達できるとき（http ワーカー or direct で Office を検出）だけ選べる。
   const oc = lb.office_com || {};
-  const ocOk = !!(oc.available || oc.mode === 'direct');
+  const ocOk = !!oc.available;
   $('legacy-radios').innerHTML = lb.options.map((name) => {
     const meta = LEGACY_LABELS[name] || { label: name, desc: '' };
     const checked = name === selected ? ' checked' : '';
     // 変換手段が無い選択肢は選べない（disabled）＝fail-safe（選んでも変換不可）。
     // LibreOffice は soffice 未検出時・Office 連携は到達不可（http 不達 かつ direct 未検出）時。
     const disabled = ((name === 'libreoffice' && !loOk) || (name === 'office_com' && !ocOk)) ? ' disabled' : '';
+    const reason = (name === 'libreoffice' && !loOk) ? 'LibreOffice が入っていません'
+      : ((name === 'office_com' && !ocOk) ? 'Office 連携が使えません' : '');
     let ver = '';
     if (name === 'libreoffice' && loOk && lb.libreoffice.version) {
       ver = ` <code>${esc(lb.libreoffice.version)}</code>`;
@@ -315,6 +316,7 @@ function renderLegacy(lb) {
       + `<input type="radio" name="legacy-backend" data-legacy="${esc(name)}"${checked}${disabled}>`
       + `<span><span class="arm-t">${esc(label)}</span>${ver}`
       + (meta.desc ? `<div class="arm-d">${esc(meta.desc)}</div>` : '')
+      + (reason ? `<div class="arm-d danger">${esc(reason)}</div>` : '')
       + `</span></label>`;
   }).join('');
   const miss = $('legacy-lo-missing');
@@ -1741,7 +1743,24 @@ function renderModelsTab(view) {
   renderModelCatalog(view.model_catalog, (view.cloud || {}).provider);
 }
 
+// 「必要な道具」表。応答に required_tools が無ければカードごと隠す（前方互換）。
+function renderRequiredTools(tools) {
+  const card = $('required-tools-card');
+  if (!card) return;
+  if (!Array.isArray(tools) || !tools.length) { card.hidden = true; return; }
+  card.hidden = false;
+  $('required-tools-body').innerHTML = tools.map((t) => {
+    const state = t.installed
+      ? `入っています${t.version ? ' <code>' + esc(t.version) + '</code>' : ''}`
+      : `<span class="danger">入っていません</span>${t.detail ? ' <span class="muted">（' + esc(t.detail) + '）</span>' : ''}`;
+    return `<tr data-tool="${esc(t.id)}"><td>${esc(t.label)}</td><td>${state}</td>`
+      + `<td>${(t.used_by || []).map(esc).join('<br>')}</td>`
+      + `<td class="${t.installed ? 'mc-na' : ''}">${t.installed ? '―' : '<code>' + esc(t.how_to_install) + '</code>'}</td></tr>`;
+  }).join('');
+}
+
 function renderIngestTab(view) {
+  renderRequiredTools(view.required_tools);
   renderArms(view.arms || {});
   renderArmsStatus(view.arms || {});
   renderLegacy(view.legacy_backend);

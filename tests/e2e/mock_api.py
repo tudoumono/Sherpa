@@ -1119,6 +1119,14 @@ SYSTEM_SETTINGS_VIEW = {
         "office_com": {"configured_url": False, "mode": "unavailable", "powershell": False,
                        "available": False, "versions": None},
     },
+    "required_tools": [
+        {"id": "libreoffice", "label": "LibreOffice", "installed": False, "version": None,
+         "used_by": ["古い形式（.doc / .xls / .ppt）の変換"], "how_to_install": "sudo apt-get install -y libreoffice",
+         "detail": None},
+        {"id": "chromium", "label": "Chromium", "installed": True, "version": None,
+         "used_by": ["スライドの PDF / PowerPoint 出力"], "how_to_install": "npx playwright install chromium",
+         "detail": None},
+    ],
     # L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）: rag.md の LLM 成形トグル。既定 on。
     "rag_llm_render": {"configured": None, "effective": True, "default": True, "options": ["on", "off"]},
     # R2a-S2（2026-07-13 横断レビュー対応）: Ollama 接続先の SSRF allowlist。既定（未設定）は

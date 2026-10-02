@@ -2097,6 +2097,33 @@ def check_codex_sandbox(codex_required: bool) -> CheckResult:
 # 統合
 # ---------------------------------------------------------------------------
 
+_CODEX_ACCESSORY_TOOL_IDS = frozenset({"bwrap", "ripgrep"})
+
+
+def check_required_tools() -> list[CheckResult]:
+    """外部の道具の導入状況（管理画面の「必要な道具」と同じ `sherpa.required_tools.snapshot()`）。
+    入っていない道具は使う機能が使えないだけなので NG にせず SKIP（入れ方を添える）。"""
+    try:
+        from sherpa import required_tools
+        rows = required_tools.snapshot(force=True)
+    except Exception:
+        return [CheckResult("required_tools", "必要な道具", "skip", "導入状況を確認できませんでした")]
+    out: list[CheckResult] = []
+    for r in rows:
+        label = f"道具: {r['label']}"
+        uses = "・".join(r["used_by"])
+        if r["installed"]:
+            ver = f" {r['version']}" if r.get("version") else ""
+            out.append(CheckResult(f"tool_{r['id']}", label, "ok", f"入っています{ver}（{uses}）"))
+        else:
+            extra = f"［{r['detail']}］" if r.get("detail") else ""
+            # Codex の付属物（bwrap・rg）は欠けても Codex 調査自体は選べる＝警告だけで「使えません」と断定しない。
+            effect = "" if r["id"] in _CODEX_ACCESSORY_TOOL_IDS else f"（{uses}が使えません）"
+            out.append(CheckResult(f"tool_{r['id']}", label, "skip",
+                                    f"入っていません{extra}{effect}。入れ方: {r['how_to_install']}"))
+    return out
+
+
 def run_all(*, probe_cloud: bool) -> list[CheckResult]:
     with _log_redaction_active():
         results: list[CheckResult] = []
@@ -2141,6 +2168,7 @@ def run_all(*, probe_cloud: bool) -> list[CheckResult]:
                                     codex_note, probe_cloud, indeterminate=codex_indeterminate))
         results.append(check_codex_sandbox(codex_required))
         results.append(check_codex_multi_agent_worker_model(sys_s, rows))
+        results.extend(check_required_tools())
 
         return results
 

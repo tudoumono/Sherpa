@@ -492,6 +492,42 @@ def _current_human_md_sig() -> str:
             f"docx={ooxml_arm.DOCX_EXTRACTOR_VERSION};xlsx={ooxml_arm.XLSX_EXTRACTOR_VERSION}")
 
 
+_LEGACY_HUMAN_MD_EXT = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
+
+
+def _md_is_from_ooxml_arm(dr: Path, rel: str) -> bool:
+    """既存の `{rel}.md` が ooxml アーム由来か（失敗の注記などを作り直しで上書きしない）。"""
+    try:
+        meta = json.loads((dr / (rel + ".md.meta.json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("arm") == "ooxml"
+
+
+def _legacy_human_md_source(rp: Path, rel: str, dr: Path) -> Path | None:
+    """旧形式 `.doc`/`.xls` の人間向け MD を作り直すための、**キャッシュ済み**の変換後 OOXML を返す。
+
+    変換（LibreOffice/COM）は再実行しない。原本が変わっていない変換キャッシュ（`legacy_convert.ensure_ooxml`
+    が残す `{rel}{ext}` と `.key`）が無ければ None＝その文書は次の通常取り込みが作り直すまで据え置く。
+    既存の `{rel}.md` が ooxml アーム由来でない（失敗の注記など）場合も None（注記を上書きしない）。
+    """
+    from .arms import legacy_convert
+
+    target_ext = _LEGACY_HUMAN_MD_EXT.get(rp.suffix.lower())
+    if target_ext is None:
+        return None
+    cache_path = legacy_convert.cache_root_for(dr) / (rel + target_ext)
+    key_path = Path(str(cache_path) + ".key")
+    try:
+        if (not cache_path.is_file() or key_path.read_text(encoding="utf-8").strip()
+                != legacy_convert._source_key(rp)):
+            return None
+        meta = json.loads((dr / (rel + ".md.meta.json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return cache_path if isinstance(meta, dict) and meta.get("arm") == "ooxml" else None
+
+
 def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
     """素の docx/xlsx のうち、`{rel}.md`（human_md 生成）の版が現在の `_current_human_md_sig()` と
     食い違う rel が1件でもあれば True。
@@ -505,7 +541,7 @@ def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
     永久に「未評価」のまま drift 検知から漏れる（`refresh_human_md`／`_write_derived_sidecar_manifest`
     docstring 参照）。マニフェスト自体が読めない rel は「未評価」と同じ扱い（drift あり）にする
     （`rag_sidecars_missing` 側が別途この rel を全再構築の対象にできる）。legacy `.doc`/`.xls`
-    （前段変換経由）は対象外（`refresh_human_md` docstring のスコープ限定参照）。
+    （前段変換経由）は変換キャッシュが残っているものだけが対象（`_legacy_human_md_source`）。
 
     **有効アーム（`SHERPA_ARMS`）に従う**: docx/xlsx を担当する `ooxml` アームが無効化されている
     間はこの関数の対象から完全に外す（drift 評価そのものをしない）。`ooxml` 無効時は
@@ -522,7 +558,11 @@ def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
     dr_ir = _sibling_layer_dir(dr, "ir")          # `.derived.json` マニフェストは ir 層（§8.1 三階層）
     current = _current_human_md_sig()
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
-        if rp.suffix.lower() not in (".docx", ".xlsx"):
+        if rp.suffix.lower() not in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"):
+            continue
+        if rp.suffix.lower() in _LEGACY_HUMAN_MD_EXT and _legacy_human_md_source(rp, rel, dr) is None:
+            continue
+        if rp.suffix.lower() == ".pptx" and not _md_is_from_ooxml_arm(dr, rel):
             continue
         if _is_sensitive_original(rp, rp.suffix.lower()):
             # 秘匿名は `{rel}.derived.json` マニフェストを一切持たない契約（`_is_sensitive_original`
@@ -550,6 +590,15 @@ def _is_sensitive_original(rp: Path, ext: str) -> bool:
     return text_kind.is_sensitive(rp.name, ext)
 
 
+def _render_human_md(ir, path: Path, ext: str) -> str | None:
+    """docx/xlsx の document-ir から人間向け MD を作る（WMF/EMF 図の文字は原本パッケージから拾って添える）。"""
+    from . import human_md, metafile_text
+
+    if ext == ".docx":
+        return human_md.render_docx(ir, figure_texts=metafile_text.docx_figure_texts(path))
+    return human_md.render_xlsx(ir, figure_texts=metafile_text.xlsx_figure_texts(path))
+
+
 def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     """人間向け `{rel}.md` **だけ**の軽量再生成（H2・単一 asset・RAG-KV の drift 連鎖と
     同じ考え方）。`human_md_sig_drift` が対象とする条件と同じ rel だけを選び、document-ir を作り
@@ -566,11 +615,9 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     側が `asset_versions.human_md`/`.human_md_es_sig` マーカーを見て判断する（`es_index.py`
     `_human_md_config_sig` 参照）。
 
-    スコープ限定（既知の制約）: 素の `.docx`/`.xlsx` だけを対象にする。legacy `.doc`/`.xls`
-    （前段変換経由で human_md 生成される rel）はここでは対象にしない——前段変換の再実行
-    （`legacy_convert`）を伴うため単一 asset の軽量再生成という設計から外れる。legacy 系は次回の
-    通常 sync/run（原本変化等）が拾う（据え置きの間、レンダラ版が変わっても legacy 系の
-    `{rel}.md` は追随が遅れうる＝受容）。
+    legacy `.doc`/`.xls`: 変換キャッシュ（`legacy_convert.ensure_ooxml` が残す変換後 OOXML）が原本と一致して
+    残っているものだけ、そのキャッシュから作り直す（変換は再実行しない）。キャッシュが無い文書は据え置き、
+    次の通常取り込みが変換し直したときに現行版で書かれる。
 
     **`.md` sidecar の有無では絞り込まない**: `human_md_sig_drift` と同じ理由で、空の
     xlsx/docx（IR は構築できるが本文が無く `.md` を書かない rel）も評価対象にする——IR が構築でき
@@ -586,7 +633,6 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     """
     from . import arms as _arms
     from .. import scope_infer as si
-    from . import human_md
     from .arms import ooxml_arm
 
     if "ooxml" not in _arms.enabled_arm_names():
@@ -600,9 +646,18 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     failures: list[dict] = []
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
-        if ext not in (".docx", ".xlsx"):
+        if ext not in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"):
             continue
-        if _is_sensitive_original(rp, ext):
+        source = rp
+        if ext in _LEGACY_HUMAN_MD_EXT:
+            # 旧形式はキャッシュ済みの変換後 OOXML から作り直す（無ければ据え置き・変換は再実行しない）。
+            source = _legacy_human_md_source(rp, rel, dr)
+            if source is None:
+                continue
+            ext = _LEGACY_HUMAN_MD_EXT[ext]
+        elif ext == ".pptx" and not _md_is_from_ooxml_arm(dr, rel):
+            continue
+        if _is_sensitive_original(rp, rp.suffix.lower()):
             # 秘匿名は human_md を一切持たない契約（`_is_sensitive_original` 参照）。除外しないと
             # 秘匿本文が IR 経由で `{rel}.md` へ平文で書き出されうる。
             continue
@@ -611,18 +666,20 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
         recorded = versions.get("human_md") if isinstance(versions, dict) else None
         if recorded == current:
             continue
+        ir = None
+        if ext != ".pptx":                            # pptx の MD は document-ir を経由しない
+            try:
+                ir = ooxml_arm._build_docx_ir(source) if ext == ".docx" else ooxml_arm._build_xlsx_ir(source)
+            except Exception as e:
+                failed += 1
+                failures.append({"doc": rel, "reason": f"ir_build_failed:{e.__class__.__name__}"})
+                continue
+            if ir is None:
+                failed += 1
+                failures.append({"doc": rel, "reason": "ir_build_failed"})
+                continue
         try:
-            ir = ooxml_arm._build_docx_ir(rp) if ext == ".docx" else ooxml_arm._build_xlsx_ir(rp)
-        except Exception as e:
-            failed += 1
-            failures.append({"doc": rel, "reason": f"ir_build_failed:{e.__class__.__name__}"})
-            continue
-        if ir is None:
-            failed += 1
-            failures.append({"doc": rel, "reason": "ir_build_failed"})
-            continue
-        try:
-            md = human_md.render_docx(ir) if ext == ".docx" else human_md.render_xlsx(ir)
+            md = _pptx_md(source) if ext == ".pptx" else _render_human_md(ir, source, ext)
             if md is not None:
                 json_io.write_text_atomic(dr / (rel + ".md"), md)
             # md is None（docx のみ実質発生・xlsx は human_md.render_xlsx が常に非 None を返す）は
@@ -826,7 +883,7 @@ def _current_rag_sig(*, ocr_observation_marker: str | None = None) -> str:
     既存の `.rag_sig`/holdback/`_reindex_after_rag_rewrite` 連鎖にそのまま乗る
     （新しい再生成・再索引の仕組みは作らない）。
     """
-    from . import ai_observation, context_ir, evidence_render
+    from . import ai_observation, context_ir, evidence_render, metafile_text
 
     return (f"renderer={evidence_render.RAG_RENDERER_VERSION};"
             f"chunker={evidence_render.RAG_CHUNKER_VERSION};"
@@ -840,6 +897,7 @@ def _current_rag_sig(*, ocr_observation_marker: str | None = None) -> str:
             f"identifier_roles={context_ir.IDENTIFIER_ROLE_ANALYZER_VERSION};"
             f"identifier_metadata={context_ir.IDENTIFIER_METADATA_SCHEMA_VERSION}/"
             f"{context_ir.IDENTIFIER_MAX_MENTIONS_PER_CHUNK};"
+            f"metafile_text={metafile_text.METAFILE_EXTRACT_VERSION};"
             f"evidence={_current_evidence_ir_sig()};"
             f"ocr_observation={ocr_observation_marker or 'none'}")
 
@@ -944,11 +1002,52 @@ def _extract_evidence_assets(
     extracted,
     destination: Path,
 ) -> list[Path]:
-    from . import evidence_spike, raster_evidence
+    from . import evidence_spike, metafile_text, raster_evidence
 
     if Path(source_path).suffix.lower() in RASTER_EVIDENCE_EXT:
         return raster_evidence.extract_assets(source_path, extracted, destination)
-    return evidence_spike.extract_assets(extraction_path, extracted, destination)
+    written = evidence_spike.extract_assets(extraction_path, extracted, destination)
+    # WMF/EMF の中のビットマップは PNG にして子として並べる（OCR ルートが親の図に結び付けて選ぶ）。
+    metafile_text.materialize_children(destination)
+    return written
+
+
+def _build_figure_texts(extracted_evidence, assets_dir: Path) -> dict[str, list[list[str]]]:
+    """WMF/EMF の図の描画命令に載っている文字を、図（Evidence 要素）ごとに取り出す。
+
+    OCR の有効/無効や完了に依存せず、抽出済み assets だけから決定的に作る。失敗は「この文書の図の
+    文字なし」へ縮退し、rag.md の生成は止めない。
+    """
+    from . import metafile_text, ocr_router
+
+    try:
+        paths: dict[str, str] = {}
+        for binding in ocr_router.inventory_assets(assets_dir):
+            if binding.parent_sha256 is None and not binding.is_readable_raster():
+                paths.setdefault(binding.asset_sha256, binding.relative_path)
+        if not paths:
+            return {}
+        cache: dict[str, list[str]] = {}
+        result: dict[str, list[list[str]]] = {}
+        for element in extracted_evidence.elements:
+            for candidate in ocr_router._raster_candidates(element):
+                raw = candidate.get("asset_sha256")
+                if not isinstance(raw, str):
+                    continue
+                digest = raw.strip().lower()
+                digest = digest if digest.startswith("sha256:") else "sha256:" + digest
+                relative = paths.get(digest)
+                if relative is None:
+                    continue
+                if digest not in cache:
+                    content = metafile_text.read_asset_content(assets_dir.joinpath(*relative.split("/")))
+                    cache[digest] = content.lines if content is not None else []
+                if cache[digest]:
+                    result.setdefault(element.element_id, []).append(cache[digest])
+        return result
+    except Exception:
+        _log.warning("図の中の文字の抽出に失敗しました（この文書では出さずに継続）", exc_info=True)
+        return {}
 
 
 def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
@@ -1196,7 +1295,7 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
     Evidence・rag.md・ES には触れない（ルートの分類規則だけが変わった時の軽量経路）。
     マーカー（`.ocr_route_sig`）はここでは確定しない（呼び出し元が全件成功を確認して確定）。
     """
-    from . import evidence_ir, ocr_router
+    from . import evidence_ir, metafile_text, ocr_router
     from ..store import ocr_jobs
 
     dr = Path(derived)
@@ -1210,6 +1309,7 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
             raw = route_path.read_text(encoding="utf-8") if route_path.is_file() else None
             if raw is None or json.loads(raw).get("router_profile") != ocr_router.OCR_ROUTER_PROFILE:
                 ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
+                metafile_text.materialize_children(dr_rag / f"{rel}.assets")
                 assets = ocr_router.inventory_assets(dr_rag / f"{rel}.assets")
                 manifest = ocr_router.build_manifest(ir, source_rel_path=rel, assets=assets)
                 ocr_router.write_json_atomic(route_path, manifest)
@@ -1851,11 +1951,14 @@ def _build_derived_into_staging(
         try:
             assets_dir = dr_rag / (rel + ".assets")
             observation_set = None
+            figure_texts = None
             if prebuilt_evidence is None or actual.suffix.lower() not in LEGACY_OFFICE_EXT:
                 _extract_evidence_assets(rp, actual, extracted_evidence, assets_dir)
                 observation_set = _build_observation_set(extracted_evidence, rel, assets_dir, obs_dir=obs_dir)
+                figure_texts = _build_figure_texts(extracted_evidence, assets_dir)
             rendered = evidence_render.render(
-                extracted_evidence, source_name=rel, observation_set=observation_set)
+                extracted_evidence, source_name=rel, observation_set=observation_set,
+                figure_texts=figure_texts)
             json_io.write_text_atomic(
                 dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
             evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
@@ -2290,9 +2393,7 @@ def _build_derived_into_staging(
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_text(result.md, encoding="utf-8")      # 出力MD は委譲変換のまま＝バイト一致（決定的）
             _check_partial_extraction(rp, result.md, rel, result.document, partial_extraction_suspected)
-            if ext in (".docx", ".xlsx") and arm_name == "ooxml":
-                # 素の docx/xlsx だけを対象にする（旧 .doc/.xls の legacy 前段変換経由は対象外＝
-                # スコープを絞った既知の制約。legacy 経路は次回の通常 sync/run が拾う）。
+            if ext in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt") and arm_name == "ooxml":
                 human_md_sig_for_rel = _current_human_md_sig()
             _write_provenance(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
@@ -2811,7 +2912,8 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
                 _extract_evidence_assets(rp, actual, extracted, asset_dir)
                 observation_set = _build_observation_set(extracted, rel, asset_dir, obs_dir=obs_dir)
                 rendered = evidence_render.render(
-                    extracted, source_name=rel, observation_set=observation_set)
+                    extracted, source_name=rel, observation_set=observation_set,
+                    figure_texts=_build_figure_texts(extracted, asset_dir))
                 json_io.write_text_atomic(
                     dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
                 evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
@@ -2965,10 +3067,13 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             asset_dir = dr_rag / (rel + ".assets")
             shutil.rmtree(asset_dir, ignore_errors=True)
             observation_set = None
+            figure_texts = None
             if actual.suffix.lower() not in LEGACY_OFFICE_EXT:
                 _extract_evidence_assets(source_path, actual, ir, asset_dir)
                 observation_set = _build_observation_set(ir, rel, asset_dir, obs_dir=obs_dir)
-            rendered = evidence_render.render(ir, source_name=rel, observation_set=observation_set)
+                figure_texts = _build_figure_texts(ir, asset_dir)
+            rendered = evidence_render.render(
+                ir, source_name=rel, observation_set=observation_set, figure_texts=figure_texts)
             json_io.write_text_atomic(
                 dr_rag / (rel + ".rag.md"), _stamp_rule_only_rag_markdown(rendered.markdown))
             evidence_render.write_chunks_atomic(dr_rag / (rel + ".rag_chunks.jsonl"), rendered.chunks)
@@ -3120,10 +3225,9 @@ def _docx_md(p: Path) -> str | None:
     （結合セル・ネスト表の展開は `_docx_table_walk` の解決結果をそのまま使う＝独自の簡易パーサは
     持たない）。IR 構築に失敗すれば未対応（None・fail-safe）。
     """
-    from . import human_md
     from .arms import ooxml_arm
     ir = ooxml_arm._build_docx_ir(p)
-    return human_md.render_docx(ir) if ir is not None else None
+    return _render_human_md(ir, p, ".docx") if ir is not None else None
 
 
 # ---- .pptx（ppt/slides/slideN.xml 直読み）----
@@ -3159,11 +3263,15 @@ def _slide_order(z) -> list[str]:
 
 
 def _pptx_md(p: Path) -> str | None:
+    from . import metafile_text
+
     out = []
+    cache: dict[str, list[str]] = {}
     with zipfile.ZipFile(p) as z:
         for i, n in enumerate(_slide_order(z), 1):
             root = ET.fromstring(z.read(n))
-            texts = _pptx_slide_texts(root)
+            figures = metafile_text.pptx_slide_figures(p, n, cache)
+            texts = _pptx_slide_texts(root, figures)
             if texts:
                 out.append(f"## スライド {i}")
                 out.extend(texts)
@@ -3181,7 +3289,12 @@ _HIDDEN_MARKER = "**［隠し候補：前面の図形に覆われた文字］**"
 _OCCLUSION_RATIO = 0.9                                        # 交差面積÷テキストshape面積のしきい値
 
 
-def _pptx_slide_texts(root) -> list[str]:
+def _figure_text_line(lines: list[str]) -> str:
+    """メタファイル図の描画命令にある文字（元の値）を 1 つのブロックにする（人間向け MD 用）。"""
+    return "図の中の文字（元の値）\n" + "\n".join("- " + line for line in lines)
+
+
+def _pptx_slide_texts(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
     """1スライド分のテキスト行（shape 単位・文書順・A5 の隠し候補マーカー付き）。
 
     shape 単位の歩行ロジックがどんな理由で失敗しても（未知の構造・想定外の要素等）、例外を握って
@@ -3190,9 +3303,11 @@ def _pptx_slide_texts(root) -> list[str]:
     一致する（spTree の文書順走査は `root.iter` と同じ順序でテキストを拾うため）。
     """
     try:
-        return _pptx_slide_texts_by_shape(root)
+        return _pptx_slide_texts_by_shape(root, figures)
     except Exception:
-        return _pptx_slide_texts_flat(root)
+        flat = _pptx_slide_texts_flat(root)
+        # 位置を決められないときは、図の文字をスライド末尾へまとめる。
+        return flat + [_figure_text_line(lines) for blocks in (figures or {}).values() for lines in blocks]
 
 
 def _pptx_slide_texts_flat(root) -> list[str]:
@@ -3255,7 +3370,7 @@ def _bbox_intersection_ratio(inner: tuple, outer: tuple) -> float:
     return (dx * dy) / inner_area
 
 
-def _pptx_slide_texts_by_shape(root) -> list[str]:
+def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
     """`p:cSld/p:spTree` 直下を文書順（=z順・背面→前面）で歩き、shape 単位でテキストを取る。
 
     A5: 各テキスト shape について、それより後（前面）にある occluder 候補（無地塗りの空shape／画像）と
@@ -3301,7 +3416,9 @@ def _pptx_slide_texts_by_shape(root) -> list[str]:
     out: list[str] = []
     n = len(entries)
     for i, entry in enumerate(entries):
+        figure_blocks = [_figure_text_line(lines) for lines in (figures or {}).get(i, [])]
         if not entry["has_text"]:
+            out.extend(figure_blocks)                            # 図（pic・graphicFrame）の直後に出す
             continue
         hidden = False
         if entry["kind"] == "sp" and entry["bbox"] is not None:
@@ -3315,6 +3432,7 @@ def _pptx_slide_texts_by_shape(root) -> list[str]:
         if hidden:
             out.append(_HIDDEN_MARKER)
         out.extend(entry["texts"])
+        out.extend(figure_blocks)
     return out
 
 
@@ -3343,10 +3461,9 @@ def _xlsx_md(p: Path) -> str | None:
     ごとに見出し＋パイプ表を出す＝独自の簡易パーサは持たない）。IR 構築に失敗すれば未対応
     （None・fail-safe）。
     """
-    from . import human_md
     from .arms import ooxml_arm
     ir = ooxml_arm._build_xlsx_ir(p)
-    return human_md.render_xlsx(ir) if ir is not None else None
+    return _render_human_md(ir, p, ".xlsx") if ir is not None else None
 
 
 # ---- .pdf（テキスト層・バックエンド：pypdf＝同梱既定 / pdfminer.six＝任意）----

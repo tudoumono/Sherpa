@@ -16,16 +16,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from . import evidence_ir
+from . import evidence_ir, metafile_text
 
 
 OCR_ROUTE_SCHEMA_VERSION = "ocr-route-manifest-v1"
-OCR_ROUTER_PROFILE = "evidence-raster-router-v4"
+OCR_ROUTER_PROFILE = "evidence-raster-router-v5"
 OCR_ROUTE_SIG_MARKER = ".ocr_route_sig"
 ROUTE_STATUSES = frozenset({"selected", "excluded", "failed_binding"})
 RASTER_ELEMENT_TYPES = frozenset({"picture", "image_xobject", "image", "standalone_image", "image_fill"})
 RASTER_ASSET_ROLES = frozenset({"picture_content", "shape_fill"})
 UNSUPPORTED_IMAGE_FORMAT = "unsupported_image_format"
+METAFILE_EXPANDED = "metafile_expanded"
 PAGE_RENDER_PROFILE: dict[str, Any] = {
     "renderer": "pypdfium2",
     "profile": "pdf-page-render-pypdfium2-200dpi-rgb-png-v1",
@@ -36,7 +37,7 @@ PAGE_RENDER_PROFILE: dict[str, Any] = {
 }
 
 _SHA256_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
-_MAGIC_HEAD_BYTES = 16
+_MAGIC_HEAD_BYTES = 64
 
 
 def raster_media_type(head: bytes) -> str | None:
@@ -70,6 +71,8 @@ class AssetBinding:
     pixel_size: list[int] | None = None
     # 先頭バイトで読めるラスタと確認できたか。None=未判定（media_typeで判断する）。
     raster_readable: bool | None = None
+    # WMF/EMF から取り出した埋込ビットマップ（PNG）の親メタファイル hash。通常の画像は None。
+    parent_sha256: str | None = None
 
     def is_readable_raster(self) -> bool:
         if self.raster_readable is not None:
@@ -167,16 +170,25 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _child_parent_hash(relative: str) -> str | None:
+    """``_metafile/{親のsha256}/{連番}.png`` の形なら親の hash（``sha256:`` 付き）を返す。"""
+    parts = PurePosixPath(relative).parts
+    if len(parts) == 3 and parts[0] == metafile_text.CHILD_DIR and re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+        return "sha256:" + parts[1]
+    return None
+
+
 def inventory_assets(root: str | Path) -> list[AssetBinding]:
     """asset directoryを読み、bytes hashを権威として安全なinventoryを返す。
 
     symlinkはsource/generation境界を越え得るため受理しない。同一hashが複数名で存在する場合は
-    辞書順で最初のpathだけを採用し、routerの出力を決定的にする。
+    辞書順で最初のpathだけを採用し、routerの出力を決定的にする。メタファイルから取り出した子PNGは
+    親ごとに別の資産として数える（同じ画像が別の図に入っていても、それぞれの図の結果になる）。
     """
     asset_root = Path(root)
     if not asset_root.is_dir() or asset_root.is_symlink():
         return []
-    by_hash: dict[str, AssetBinding] = {}
+    by_key: dict[tuple[str, str], AssetBinding] = {}
     for path in sorted(asset_root.rglob("*"), key=lambda item: item.relative_to(asset_root).as_posix()):
         if path.is_symlink():
             raise ValueError(f"asset inventory contains symlink: {path.relative_to(asset_root).as_posix()}")
@@ -185,14 +197,17 @@ def inventory_assets(root: str | Path) -> list[AssetBinding]:
         digest = _file_sha256(path)
         relative = _safe_relative(path.relative_to(asset_root).as_posix())
         with path.open("rb") as stream:
-            sniffed = raster_media_type(stream.read(_MAGIC_HEAD_BYTES))
+            head = stream.read(_MAGIC_HEAD_BYTES)
+        sniffed = raster_media_type(head[:16])
         media_type = sniffed or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        parent = _child_parent_hash(relative)
         binding = AssetBinding(
             asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=media_type,
-            raster_readable=sniffed is not None,
+            pixel_size=metafile_text.child_png_size(head) if parent else None,
+            raster_readable=sniffed is not None, parent_sha256=parent,
         )
-        by_hash.setdefault(digest, binding)
-    return [by_hash[key] for key in sorted(by_hash)]
+        by_key.setdefault((digest, parent or ""), binding)
+    return [by_key[key] for key in sorted(by_key)]
 
 
 def _manifest_payload(manifest: OCRRouteManifest) -> dict[str, Any]:
@@ -263,13 +278,21 @@ def build_manifest(
     """Evidenceと検証済みasset bindingから副作用なしでroute manifestを作る。"""
     source_rel = _safe_relative(source_rel_path)
     bindings: dict[str, AssetBinding] = {}
+    children: dict[str, dict[str, AssetBinding]] = {}
     for binding in assets:
         digest = _hex_digest(binding.asset_sha256)
         relative = _safe_relative(binding.relative_path)
+        parent = _tagged_digest(binding.parent_sha256) if binding.parent_sha256 else None
         normalized = AssetBinding(
             asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=binding.media_type,
-            pixel_size=binding.pixel_size, raster_readable=binding.raster_readable,
+            pixel_size=binding.pixel_size, raster_readable=binding.raster_readable, parent_sha256=parent,
         )
+        if parent is not None:
+            siblings = children.setdefault(_hex_digest(parent), {})
+            existing_child = siblings.get(digest)
+            if existing_child is None or normalized.relative_path < existing_child.relative_path:
+                siblings[digest] = normalized
+            continue
         existing = bindings.get(digest)
         if existing is None or normalized.relative_path < existing.relative_path:
             bindings[digest] = normalized
@@ -322,6 +345,38 @@ def build_manifest(
                 ))
                 continue
             if not binding.is_readable_raster():
+                embedded = [children[digest][key] for key in sorted(children.get(digest, {}))]
+                if embedded:
+                    # メタファイル（WMF/EMF）自体はOCRへ回さず、中のビットマップ（子PNG）を同じ図の位置の
+                    # 入力として選ぶ。親の分類は行き止まりではなく「展開済み」。
+                    decisions.append(OCRRouteDecision(
+                        route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",
+                        status="excluded", reason_code=METAFILE_EXPANDED, priority=0,
+                        asset_sha256=binding.asset_sha256, asset_rel_path=binding.relative_path,
+                        media_type=binding.media_type,
+                        detail={**detail, "child_asset_sha256s": [item.asset_sha256 for item in embedded]},
+                    ))
+                    for child in embedded:
+                        child_detail = {
+                            **detail,
+                            "parent_route_input_id": route_id,
+                            "parent_asset_sha256": binding.asset_sha256,
+                            "parent_asset_rel_path": binding.relative_path,
+                        }
+                        decisions.append(OCRRouteDecision(
+                            route_input_id=_stable_id(
+                                "ocr-input", ir.source.content_hash, element.element_id, "asset",
+                                child.asset_sha256, asset_index, "metafile_child", binding.asset_sha256,
+                            ),
+                            target_evidence_id=element.element_id, input_kind="asset",
+                            status="selected", reason_code="metafile_embedded_bitmap",
+                            priority=_priority(element), asset_sha256=child.asset_sha256,
+                            asset_rel_path=child.relative_path, media_type=child.media_type,
+                            pixel_size=child.pixel_size, detail=child_detail,
+                        ))
+                        if isinstance(element.locator.page, int):
+                            selected_images_by_page.add(element.locator.page)
+                    continue
                 decisions.append(OCRRouteDecision(
                     route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",
                     status="excluded", reason_code=UNSUPPORTED_IMAGE_FORMAT, priority=0,

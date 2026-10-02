@@ -30,6 +30,8 @@ pptx/PDF はこのモジュールの対象外（正典 §3.3/§3.4 の裁定ど�
 """
 from __future__ import annotations
 
+import re
+
 from . import document_ir
 from .ooxml import excel
 
@@ -38,7 +40,8 @@ from .ooxml import excel
 # 選択的再生成＝RAG-KV の drift 連鎖と同じ考え方）。この関数の出力形状（見出し/注記文言/分割規則）を
 # 変えたら上げる。
 # v4→v5（HM1 の docx 見送り分・2026-09-03）: `render_docx` へ画像存在注記（`ir.picture_count`）を追加。
-HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v5"
+# v5→v6（WMF/EMF 図の文字）: 図の描画命令に載っている文字を、図を含む段落・表（xlsx はアンカーセル）の直後へ「図の中の文字（元の値）」として出す。
+HUMAN_MD_RENDERER_VERSION = "human-md-renderer-v6"
 
 # 1グループ（画面に1回に出すパイプ表の塊）あたりの目安上限文字数。key-value化提案書の
 # `evidence_render.MAX_GROUP_CHARS`（RAG チャンク用途・1800）とは用途が異なる（人間が画面で読む単位）
@@ -147,7 +150,34 @@ class _OutputBudget:
         return encoded.decode("utf-8", errors="ignore")
 
 
-def render_xlsx(ir: document_ir.DocumentIR) -> str | None:
+def _column_letters(column: int) -> str:
+    letters = ""
+    while column > 0:
+        column, rest = divmod(column - 1, 26)
+        letters = chr(65 + rest) + letters
+    return letters
+
+
+def _figure_text_block(figures: list | None, *, with_cell: bool = False) -> str:
+    """WMF/EMF 図の描画命令にある文字（元の値）。AI の観測ではなく原本の値そのもの。"""
+    parts = []
+    for figure in figures or []:
+        lines = [line for line in figure.lines if line.strip()]
+        if not lines:
+            continue
+        where = ""
+        if with_cell and figure.anchor is not None:
+            where = f"（{_column_letters(figure.anchor[1])}{figure.anchor[0]}付近）"
+        parts.append("図の中の文字（元の値）" + where + "\n" + "\n".join("- " + line for line in lines))
+    return "\n\n".join(parts)
+
+
+def _table_min_row(table: document_ir.Element) -> int | None:
+    match = re.match(r"[A-Za-z]+(\d+)", str(table.source_map.get("range", "")))
+    return int(match.group(1)) if match else None
+
+
+def render_xlsx(ir: document_ir.DocumentIR, figure_texts: dict[str, list] | None = None) -> str | None:
     """xlsx の document-ir から人間向け MD を生成する（正典 §3.1）。`ir` にシートが1つも無ければ None
     （document-ir 自体が構築できていない＝呼び出し元の異常）だが、シートはあるが表候補が0件（空シート
     のみ）でも None は返さない＝見出し＋注記だけの MD になる（モジュール docstring 参照）。
@@ -191,12 +221,25 @@ def render_xlsx(ir: document_ir.DocumentIR) -> str | None:
         tables = sorted(
             (e for e in ir.elements if e.type == "table" and e.parent_id == sheet.element_id),
             key=lambda e: e.order)
+        # 図の文字は、アンカーのセルより上から始まる最後の表の直後へ（該当が無い・位置不明の図はシート先頭）。
+        figure_slots: dict[int, list] = {}
+        for figure in (figure_texts or {}).get(sheet.source_map.get("sheet", ""), []):
+            slot = -1
+            if figure.anchor is not None:
+                for ti, table in enumerate(tables):
+                    min_row = _table_min_row(table)
+                    if min_row is not None and min_row <= figure.anchor[0]:
+                        slot = ti
+            figure_slots.setdefault(slot, []).append(figure)
+        top_block = _figure_text_block(figure_slots.get(-1), with_cell=True)
+        if top_block and budget.consume(top_block):
+            sheet_parts.append(top_block)
         if not tables:
             note = "（このシートには値のあるセルが見つかりませんでした）"
             if budget.consume(note):
                 sheet_parts.append(note)
         else:
-            for table in tables:
+            for ti, table in enumerate(tables):
                 if budget.truncated:
                     break
                 rendered = _render_xlsx_table(table, budget)
@@ -204,6 +247,9 @@ def render_xlsx(ir: document_ir.DocumentIR) -> str | None:
                     sheet_parts.append(rendered)
                 elif budget.truncated:
                     break
+                block = _figure_text_block(figure_slots.get(ti), with_cell=True)
+                if block and budget.consume(block):
+                    sheet_parts.append(block)
         if sheet_parts:
             out.append("\n\n".join(sheet_parts))
         elif budget.truncated:
@@ -259,7 +305,7 @@ def _count_elements_with_descendants(elements, by_parent: dict) -> int:
     return sum(1 + _count_descendant_elements(e.element_id, by_parent) for e in elements)
 
 
-def render_docx(ir: document_ir.DocumentIR) -> str | None:
+def render_docx(ir: document_ir.DocumentIR, figure_texts: list | None = None) -> str | None:
     """docx の document-ir から人間向け MD を生成する（正典 §3.2）。本文が1件も無ければ None。
 
     見出し・段落・表を原本の出現順（`Element.order`）どおりに並べる。表は `_docx_table_walk` が
@@ -275,6 +321,8 @@ def render_docx(ir: document_ir.DocumentIR) -> str | None:
     `ir.picture_count`（HM1・xlsx の画像存在注記の docx 版）: docx はシート等の中間スコープを
     持たないため、文書冒頭に1回だけ「画像がN枚あります」の事実（枚数のみ・内容の解釈は載せない＝
     xlsx と同じ方針）を出す。
+    ``figure_texts``（WMF/EMF 図の描画命令にある文字・元の値）は、その図を含む本文直下の段落・表の直後へ
+    出す。位置を決められない図だけ、画像注記の直後（本文の先頭）にまとめる。
     """
     by_parent: dict[str | None, list[document_ir.Element]] = {}
     for e in ir.elements:
@@ -291,6 +339,25 @@ def render_docx(ir: document_ir.DocumentIR) -> str | None:
         note = f"（画像が{ir.picture_count}枚あります。内容は原本で確認してください）"
         if budget.consume(note):
             out.append(note)
+    # 図の文字は、その図を含む段落・表（本文の出現順）の直後へ。位置を決められない図は先頭。
+    figure_slots: dict[int, list] = {}
+    for figure in figure_texts or []:
+        slot = -1
+        if figure.anchor is not None:
+            paragraph_limit, table_limit = figure.anchor
+            for index, element in enumerate(top):
+                if element.type == "table":
+                    position = element.source_map.get("table_index")
+                    before = position is not None and position < table_limit
+                else:
+                    position = element.source_map.get("paragraph_index")
+                    before = position is not None and position < paragraph_limit
+                if before:
+                    slot = index
+        figure_slots.setdefault(slot, []).append(figure)
+    figure_block = _figure_text_block(figure_slots.get(-1))
+    if figure_block and budget.consume(figure_block):
+        out.append(figure_block)
     omitted = [0]                                     # ミュータブルな1要素リスト＝再帰全体で共有するカウンタ
     for i, e in enumerate(top):
         if budget.truncated:
@@ -299,6 +366,9 @@ def render_docx(ir: document_ir.DocumentIR) -> str | None:
         rendered = _render_docx_element(e, by_parent, budget, omitted)
         if rendered:
             out.append(rendered)
+        block = _figure_text_block(figure_slots.get(i))
+        if block and budget.consume(block):
+            out.append(block)
         # rendered が空文字列でも、_render_docx_element 自身が自己申告済み（下記 docstring の
         # 自己申告契約）なのでここでは何もしない＝二重計上しない。
     if budget.truncated:

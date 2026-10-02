@@ -318,9 +318,46 @@ def test_admin_settings_secret_key_control_char_check_runs_before_strip():
     assert r_clear.status_code == 200, r_clear.text
 
 
-def test_admin_settings_legacy_backend_reflects_and_resets():
+def _soffice_present(monkeypatch) -> None:
+    """libreoffice を保存対象にするテストは soffice の有無に依らず通す（未導入なら保存は 422）。"""
+    from sherpa.ingest.arms import legacy_convert
+    monkeypatch.setattr(legacy_convert, "soffice_available", lambda: True)
+
+
+def test_admin_settings_exposes_required_tools_and_rejects_libreoffice_when_missing(monkeypatch):
     if not _try_init():
         pytest.skip("DB down")
+    from sherpa import required_tools
+    from sherpa.ingest.arms import legacy_convert
+    monkeypatch.setattr(legacy_convert, "soffice_available", lambda: False)
+    monkeypatch.setattr(legacy_convert, "soffice_version", lambda: None)
+    required_tools.snapshot(force=True)
+    admin, _ = _admin_client()
+    tools = {t["id"]: t for t in admin.get("/admin/settings").json()["required_tools"]}
+    assert tools["libreoffice"]["installed"] is False
+    r = admin.put("/admin/settings", json={"legacy_backend": "libreoffice"})
+    assert r.status_code == 422
+    assert "LibreOffice が入っていません" in r.text
+    assert admin.put("/admin/settings", json={"legacy_backend": "none"}).status_code == 200
+
+
+def test_put_settings_agent_codex_rejected_when_codex_cli_missing(monkeypatch):
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import required_tools
+    admin, _ = _admin_client()
+    monkeypatch.setattr(required_tools, "codex_cli_missing", lambda: True)
+    r = admin.put("/settings", json={"agent": "codex"})
+    assert r.status_code == 422
+    assert "Codex CLI が入っていません" in r.text
+    monkeypatch.setattr(required_tools, "codex_cli_missing", lambda: False)
+    assert admin.put("/settings", json={"agent": "codex"}).status_code == 200
+
+
+def test_admin_settings_legacy_backend_reflects_and_resets(monkeypatch):
+    if not _try_init():
+        pytest.skip("DB down")
+    _soffice_present(monkeypatch)
     admin, _ = _admin_client()
     # none|libreoffice は許可され、生値が configured/effective に反映される。
     r = admin.put("/admin/settings", json={"legacy_backend": "libreoffice"})
@@ -884,9 +921,10 @@ def test_config_omits_token_pricing():
     assert "token_pricing" not in cfg
 
 
-def test_partial_update_leaves_other_keys_untouched():
+def test_partial_update_leaves_other_keys_untouched(monkeypatch):
     if not _try_init():
         pytest.skip("DB down")
+    _soffice_present(monkeypatch)
     admin, _ = _admin_client()
     admin.put("/admin/settings", json={"legacy_backend": "libreoffice"})
     # arms_enabled を触らない更新でも legacy_backend は残る。
@@ -898,9 +936,10 @@ def test_partial_update_leaves_other_keys_untouched():
 
 # ===== 監査 =====
 
-def test_put_writes_audit_warning():
+def test_put_writes_audit_warning(monkeypatch):
     if not _try_init():
         pytest.skip("DB down")
+    _soffice_present(monkeypatch)
     admin, admin_uid = _admin_client()
     r = admin.put("/admin/settings", json={"legacy_backend": "libreoffice"})
     assert r.status_code == 200, r.text

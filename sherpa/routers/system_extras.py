@@ -35,6 +35,7 @@ from sherpa import (
     health,
     model_catalog,
     notifications,
+    required_tools,
     research_service,
     store,
     usage_chat,
@@ -798,6 +799,8 @@ def _admin_settings_view() -> dict:
                 "versions": (legacy_convert.office_com_healthz() or {}).get("versions"),
             },
         },
+        # 外部の道具の導入状況（sherpa/required_tools.py・短時間キャッシュ）。
+        "required_tools": required_tools.snapshot(),
         # rag.md の LLM 成形トグル（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1）。
         # 既定 off（実測で文体整形のみ・コスト不釣合）。ON でも規則版と両立・既存の成形版は残る。
         "rag_llm_render": {
@@ -1042,6 +1045,8 @@ def _validate_legacy_backend(value):
         raise HTTPException(
             422, f"未対応の変換バックエンドです: {name}"
                  f"（利用可能: {', '.join(sorted(legacy_convert.KNOWN_BACKENDS))}）")
+    if name == "libreoffice" and not legacy_convert.soffice_available():
+        raise HTTPException(422, "LibreOffice が入っていません（入れ方: sudo apt-get install -y libreoffice）")
     return name
 
 

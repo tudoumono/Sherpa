@@ -753,6 +753,7 @@ def build_observation_set(
             "pixel_size": prepared.pixel_size,
             "input_kind": prepared.input_kind,
             "render_profile": prepared.render_profile,
+            "parent_asset_sha256": (decision.detail or {}).get("parent_asset_sha256"),
         }],
         observations=[{
             "input_id": decision.route_input_id,
