@@ -53,6 +53,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from sherpa import ext_api, log_setup, store
@@ -62,6 +63,7 @@ _log = logging.getLogger("sherpa")
 
 @asynccontextmanager
 async def lifespan(app):
+    _metafile_render_stop = threading.Event()
     # LOG-2（2026-09-03）: サブシステム別ログ（専用ファイルハンドラ）を設定する。ここより後段の
     # ext_api._attach_request_id_filter() が "sherpa"/"sherpa.*" の作成済み logger の handlers を
     # 毎回スキャンして request_id フィルタを付け直すため、**必ずそれより前**に呼ぶ契約
@@ -132,8 +134,11 @@ async def lifespan(app):
         api._reconcile_orphans()
         api._sweep_expired_on_startup()
         api._backfill_turn_metrics_on_startup()
+        from sherpa.ingest import metafile_render
+        metafile_render.start_loop(_metafile_render_stop)   # WMF/EMF の図全体の描画待ちを 1 件ずつ進める
         yield
     finally:
+        _metafile_render_stop.set()
         # ING-3: shutdown 時は取り込みの背景実行（`sherpa.ingest.background`）も新規受付を
         # 止める——直後に `downgrade_orphaned_extracting_runs()`（次回起動時）に頼らず、今動いて
         # いる run が「中断」ではなく完走できるだけの短い猶予（best-effort）を与える。daemon

@@ -1277,6 +1277,30 @@ def _convert_libreoffice(src: Path, target_ext: str) -> bytes | None:
         shutil.rmtree(outdir, ignore_errors=True)
 
 
+def render_metafile_png(data: bytes, kind: str) -> tuple[bytes | None, str | None]:
+    """WMF/EMF の bytes を LibreOffice で PNG に描画する（原本は触らず一時 dir のコピーだけを渡す）。
+
+    戻りは ``(png, None)`` か ``(None, 理由)``。理由は ``unavailable``（soffice 未検出）／``timeout``／
+    ``convert_failed``。直列実行・プロファイル分離・タイムアウト時のプロセスグループ停止は
+    ``_convert_libreoffice`` と同じ。
+    """
+    if not soffice_available():
+        return None, "unavailable"
+    work = tempfile.mkdtemp(prefix="sherpa-lo-meta-")
+    try:
+        src = Path(work) / f"figure.{kind}"
+        src.write_bytes(data)
+        take_conversion_failure_reason()
+        png = _convert_libreoffice(src, ".png")
+        if png is None:
+            return None, "timeout" if take_conversion_failure_reason() == "timeout" else "convert_failed"
+        return png, None
+    except OSError:
+        return None, "convert_failed"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _run_soffice(cmd: list[str], src: Path) -> bool:
     """soffice を実行し成功/失敗を返す。タイムアウト/非0終了/起動失敗はすべて False（fail-safe）。
 

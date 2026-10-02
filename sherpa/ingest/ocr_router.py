@@ -20,13 +20,19 @@ from . import evidence_ir, metafile_text
 
 
 OCR_ROUTE_SCHEMA_VERSION = "ocr-route-manifest-v1"
-OCR_ROUTER_PROFILE = "evidence-raster-router-v5"
+OCR_ROUTER_PROFILE = "evidence-raster-router-v6"
 OCR_ROUTE_SIG_MARKER = ".ocr_route_sig"
 ROUTE_STATUSES = frozenset({"selected", "excluded", "failed_binding"})
 RASTER_ELEMENT_TYPES = frozenset({"picture", "image_xobject", "image", "standalone_image", "image_fill"})
 RASTER_ASSET_ROLES = frozenset({"picture_content", "shape_fill"})
 UNSUPPORTED_IMAGE_FORMAT = "unsupported_image_format"
 METAFILE_EXPANDED = "metafile_expanded"
+METAFILE_RENDERED = "metafile_rendered"
+METAFILE_RENDER_UNAVAILABLE = "metafile_render_unavailable"
+METAFILE_RENDER_FAILED = "metafile_render_failed"
+METAFILE_RENDER_PENDING = "metafile_render_pending"
+METAFILE_TOO_LARGE = "metafile_too_large"
+METAFILE_RENDER_UNAVAILABLE_MESSAGE = "未対応（LibreOffice が入っていません）"
 PAGE_RENDER_PROFILE: dict[str, Any] = {
     "renderer": "pypdfium2",
     "profile": "pdf-page-render-pypdfium2-200dpi-rgb-png-v1",
@@ -73,6 +79,8 @@ class AssetBinding:
     raster_readable: bool | None = None
     # WMF/EMF から取り出した埋込ビットマップ（PNG）の親メタファイル hash。通常の画像は None。
     parent_sha256: str | None = None
+    # WMF/EMF の全体描画の状態（``pending`` / ``unavailable`` / ``failed:{理由}``）。描画できた・不要だった・対象外は None。
+    render_state: str | None = None
 
     def is_readable_raster(self) -> bool:
         if self.raster_readable is not None:
@@ -194,6 +202,8 @@ def inventory_assets(root: str | Path) -> list[AssetBinding]:
             raise ValueError(f"asset inventory contains symlink: {path.relative_to(asset_root).as_posix()}")
         if not path.is_file():
             continue
+        if path.name.endswith(metafile_text.RENDER_STATE_SUFFIX) and path.parent.name == metafile_text.CHILD_DIR:
+            continue                       # 全体描画の記録（資産ではない）
         digest = _file_sha256(path)
         relative = _safe_relative(path.relative_to(asset_root).as_posix())
         with path.open("rb") as stream:
@@ -201,10 +211,13 @@ def inventory_assets(root: str | Path) -> list[AssetBinding]:
         sniffed = raster_media_type(head[:16])
         media_type = sniffed or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         parent = _child_parent_hash(relative)
+        render_state = None
+        if parent is None and sniffed is None and metafile_text.sniff(head) is not None:
+            render_state = metafile_text.read_render_state(asset_root, digest)
         binding = AssetBinding(
             asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=media_type,
             pixel_size=metafile_text.child_png_size(head) if parent else None,
-            raster_readable=sniffed is not None, parent_sha256=parent,
+            raster_readable=sniffed is not None, parent_sha256=parent, render_state=render_state,
         )
         by_key.setdefault((digest, parent or ""), binding)
     return [by_key[key] for key in sorted(by_key)]
@@ -269,6 +282,28 @@ def _raster_candidates(element: evidence_ir.EvidenceElement) -> list[dict[str, A
     return result
 
 
+def _render_outcome(binding: AssetBinding) -> tuple[str, dict[str, Any]]:
+    """メタファイルの全体描画の状態を（理由コード, detail）にする。状態が無ければ読めない画像形式。"""
+    state = binding.render_state
+    if not state or state == "rendered_unapplied":     # 描画済み（反映の仕上げ待ち）は状態なしと同じ
+        return UNSUPPORTED_IMAGE_FORMAT, {}
+    if state == "too_large":                           # 描画しない図は、LibreOffice の有無より大きさの理由を残す
+        return METAFILE_TOO_LARGE, {"message": "大きすぎるため読み取りの対象外（32 MiB を超える図）"}
+    if state == "unavailable":
+        return METAFILE_RENDER_UNAVAILABLE, {"message": METAFILE_RENDER_UNAVAILABLE_MESSAGE}
+    if state == "pending":
+        return METAFILE_RENDER_PENDING, {"message": "図全体の描画待ち（バックグラウンドで順に描画します）"}
+    if state:
+        return METAFILE_RENDER_FAILED, {"message": "未対応（図全体の描画に失敗しました）",
+                                        "render_failure": state.partition(":")[2]}
+    return UNSUPPORTED_IMAGE_FORMAT, {}
+
+
+def render_unavailable(decision: OCRRouteDecision) -> bool:
+    """この入力（親のメタファイル）が「LibreOffice が無くて全体描画できない」状態か（DIB の有無によらない）。"""
+    return (decision.detail or {}).get("message") == METAFILE_RENDER_UNAVAILABLE_MESSAGE
+
+
 def build_manifest(
     ir: evidence_ir.EvidenceIR,
     *,
@@ -286,6 +321,7 @@ def build_manifest(
         normalized = AssetBinding(
             asset_sha256=f"sha256:{digest}", relative_path=relative, media_type=binding.media_type,
             pixel_size=binding.pixel_size, raster_readable=binding.raster_readable, parent_sha256=parent,
+            render_state=binding.render_state,
         )
         if parent is not None:
             siblings = children.setdefault(_hex_digest(parent), {})
@@ -349,12 +385,15 @@ def build_manifest(
                 if embedded:
                     # メタファイル（WMF/EMF）自体はOCRへ回さず、中のビットマップ（子PNG）を同じ図の位置の
                     # 入力として選ぶ。親の分類は行き止まりではなく「展開済み」。
+                    # 全体描画が済んでいない（待ち・未対応・失敗）ときは、その状態を親の detail に残す。
+                    _, render_extra = _render_outcome(binding)
                     decisions.append(OCRRouteDecision(
                         route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",
                         status="excluded", reason_code=METAFILE_EXPANDED, priority=0,
                         asset_sha256=binding.asset_sha256, asset_rel_path=binding.relative_path,
                         media_type=binding.media_type,
-                        detail={**detail, "child_asset_sha256s": [item.asset_sha256 for item in embedded]},
+                        detail={**detail, "child_asset_sha256s": [item.asset_sha256 for item in embedded],
+                                **render_extra},
                     ))
                     for child in embedded:
                         child_detail = {
@@ -369,7 +408,10 @@ def build_manifest(
                                 child.asset_sha256, asset_index, "metafile_child", binding.asset_sha256,
                             ),
                             target_evidence_id=element.element_id, input_kind="asset",
-                            status="selected", reason_code="metafile_embedded_bitmap",
+                            status="selected",
+                            reason_code=(
+                                METAFILE_RENDERED if PurePosixPath(child.relative_path).name == metafile_text.RENDER_NAME
+                                else "metafile_embedded_bitmap"),
                             priority=_priority(element), asset_sha256=child.asset_sha256,
                             asset_rel_path=child.relative_path, media_type=child.media_type,
                             pixel_size=child.pixel_size, detail=child_detail,
@@ -377,11 +419,12 @@ def build_manifest(
                         if isinstance(element.locator.page, int):
                             selected_images_by_page.add(element.locator.page)
                     continue
+                reason, extra = _render_outcome(binding)
                 decisions.append(OCRRouteDecision(
                     route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",
-                    status="excluded", reason_code=UNSUPPORTED_IMAGE_FORMAT, priority=0,
+                    status="excluded", reason_code=reason, priority=0,
                     asset_sha256=binding.asset_sha256, asset_rel_path=binding.relative_path,
-                    media_type=binding.media_type, detail=detail,
+                    media_type=binding.media_type, detail={**detail, **extra},
                 ))
                 continue
             pixel_size = candidate.get("pixel_size")
