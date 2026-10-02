@@ -412,8 +412,12 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     last_status = (last or {}).get("status")
     running_progress = (last or {}).get("progress") if last_status == "extracting" else None
     running_progress = running_progress if isinstance(running_progress, dict) else None
+    # 状態判定は「反映済みか」を問わない直近の ES 記録から（変更なしの再索引失敗も拾う）。
+    es_attempts = store.get_recent_es_attempts(wid)
+    es_state, es_error, es_index_kept = _es_reflect_state(es_attempts, running_progress)
     return {**rep, "counts_as_of": str(counts_as_of) if counts_as_of else None,
             "graph_nodes": graph_nodes, "graph_edges": graph_edges, "es_chunks": es_chunks,
+            "es_state": es_state, "es_error": es_error, "es_index_kept": es_index_kept,
             "last_run_id": (last or {}).get("id"),
             "last_run_status": last_status, "last_run_warnings": warns,
             "last_run_blocked": blocked,
@@ -424,6 +428,63 @@ def _ingest_summary(wid: str, row: dict) -> dict:
             "running_progress": running_progress,
             "failure_reason_catalog": failure_reasons.REASON_CATALOG,
             "partial_extraction_advice": failure_reasons.PARTIAL_EXTRACTION_ADVICE}
+
+
+# ES 反映の失敗理由（`es_index.index_world` の error 値）→ 利用者向けの平文。未知の値は内部の
+# 例外名や接続先を含みうるため原文を出さず汎用文にする。
+_ES_ERROR_TEXT = {
+    "embedding_cloud_unavailable": "検索用の AI（埋め込み）に接続できませんでした",
+    "embed_cache_write_failed": "一時データの保存に失敗しました（ディスクの空きを確認してください）",
+    "delete_failed": "古い索引の入れ替えに失敗しました",
+    "create_failed": "索引の作成に失敗しました（ディスクの空きを確認してください）",
+    "bulk_failed": "索引への書き込みに失敗しました（ディスクの空きを確認してください）",
+    "bulk_errors": "索引への書き込みが一部拒否されました（ディスクの空きを確認してください）",
+    "no_chunks": "検索用の断片を作れませんでした",
+}
+# 旧索引に触れる前に打ち切られる失敗＝直前までの索引が残る。delete_failed は削除の成否を
+# 証明できず、bulk 失敗は索引を空へ戻し、create 失敗・no_chunks は空のため「残る」と言えない。
+_ES_ERRORS_OLD_INDEX_KEPT = frozenset({"embedding_cloud_unavailable", "embed_cache_write_failed",
+                                       "human_md_es_sig_marker_drop_failed"})
+_ES_PROGRESS_STAGE = "es_index"
+
+
+def _es_succeeded(es) -> bool:
+    return (isinstance(es, dict) and es.get("available") is True and not es.get("error")
+            and (es.get("chunks") or 0) > 0)
+
+
+def _old_index_kept(earlier) -> bool:
+    """最新の失敗より前の記録（新しい順）をたどり、索引に触れる前の失敗は読み飛ばし、最初に出会った
+    それ以外が「件数 > 0 の成功」のときだけ true（索引を消す・状態が不確定な記録に先に出会えば false）。"""
+    for a in earlier:
+        if _es_succeeded(a):
+            return True
+        err = a.get("error") if isinstance(a, dict) else None
+        if not (isinstance(err, str) and err in _ES_ERRORS_OLD_INDEX_KEPT):
+            return False
+    return False
+
+
+def _es_reflect_state(attempts, running_progress) -> tuple[str, str | None, bool | None]:
+    """ES 段の記録（新しい順の `es` 一覧・新しい ES 照会はしない）から (es_state, es_error, es_index_kept)。
+    es_state: reflecting（ES の段の実行中）／ok／failed／unavailable（接続できない）／unknown。
+    es_index_kept は failed のとき、旧索引があったと記録で確かめられ、かつ失敗が旧索引に触れる前の
+    ものだけ true。"""
+    if isinstance(running_progress, dict) and running_progress.get("stage") == _ES_PROGRESS_STAGE:
+        return "reflecting", None, None
+    latest = attempts[0] if attempts else None
+    if not isinstance(latest, dict):
+        return "unknown", None, None
+    err = latest.get("error")
+    if err:
+        key = err if isinstance(err, str) else ""
+        kept = key in _ES_ERRORS_OLD_INDEX_KEPT and _old_index_kept(attempts[1:])
+        return "failed", _ES_ERROR_TEXT.get(key, "原因は管理者向けの記録を確認してください"), kept
+    if latest.get("available") is True:
+        return "ok", None, None
+    if latest.get("available") is False:
+        return "unavailable", None, None
+    return "unknown", None, None
 
 
 def _ingest_summary_after_mutation(wid: str) -> dict:

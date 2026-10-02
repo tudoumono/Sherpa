@@ -306,9 +306,9 @@
                 <textarea id="webhook-allowlist" rows="3" style="max-width:360px"
                           placeholder="例: example.com:443（1行に1つ）"></textarea>
               </label>
-              <div class="hint">外部連携キーの Webhook URL は、ここに登録した host:port
-                （またはこのサーバー自身＝localhost）宛てにしか設定できません（誤って社内の
-                他システムへ通知が飛ぶことを防ぐ・「外部連携（API キー）」タブで宛先を登録）。</div>
+              <div class="hint">外部連携キーの Webhook URL は、ここに登録した host:port 宛てにしか設定できません。
+                このサーバー自身（localhost）宛てでも登録が必要で、空のままだと通知はどこにも送れません
+                （誤って社内の他システムへ通知が飛ぶことを防ぐ・「外部連携（API キー）」タブで宛先を登録）。</div>
             </details>
 
             <div class="sec-actions">
@@ -762,7 +762,7 @@
                  placeholder="https://example.com/hooks/sherpa"></label>
         <div class="hint">未登録の宛先は「プロバイダ＋接続先」タブの「詳細設定」にある
           「Webhook の許可先」へあらかじめ追加しておく必要があります
-          （自分のパソコン＝localhost は常に使えます）。</div>
+          （自分のパソコン＝localhost 宛てでも登録が必要です）。</div>
       </form>
       <div id="ek-reveal" hidden>
         <div class="hint danger">このキーは今だけ表示されます。控えを保管してください（再表示はできません）。</div>

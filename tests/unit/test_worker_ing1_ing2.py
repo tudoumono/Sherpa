@@ -340,6 +340,7 @@ def _stub_ingest_summary_deps(monkeypatch):
     monkeypatch.setattr(store, "get_latest_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_published_run_summary", lambda wid: None)
     monkeypatch.setattr(store, "get_latest_es_run_summary", lambda wid: None)
+    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
 
 
 def test_ingest_summary_uses_cached_scan_report_without_walking(monkeypatch):

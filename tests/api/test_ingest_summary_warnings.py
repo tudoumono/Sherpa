@@ -13,7 +13,14 @@ monkeypatch＝DB 不要。
 """
 from __future__ import annotations
 
+import pytest
+
 from sherpa import api, store
+
+
+@pytest.fixture(autouse=True)
+def _no_es_attempts(monkeypatch):
+    monkeypatch.setattr(store, "get_recent_es_attempts", lambda wid, limit=200: [])
 
 _ROW = {"last_scan_report": None, "last_scan_report_at": None}
 
