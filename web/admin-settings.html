@@ -269,6 +269,19 @@
               <div class="hint">接続先を変えると、検索の索引（埋め込み）が今の設定と合わなくなることがあります。切替後は資料フォルダの再取り込みが必要になる場合があります。</div>
             </div>
 
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px" id="embed-provider-block">
+              <label class="vlm-field"><span class="vlm-l">埋め込みの接続先</span>
+                <select id="embed-provider" style="max-width:360px">
+                  <option value="">回答と同じクラウド（既定）</option>
+                  <option value="ollama">ローカル（Ollama）</option>
+                </select>
+              </label>
+              <div class="hint" id="embed-provider-hint" style="margin:-8px 0 6px"></div>
+              <div class="hint">切り替えると、検索用のベクトルをすべて作り直します。時間はかかりますが、ローカルなら API の費用はかかりません。
+                ローカルを選ぶ場合は、日本語に対応した多言語の埋め込みモデルをおすすめします（使うモデルは「使えるモデル」タブの Ollama の埋め込み欄で決めます）。
+                切り替えた後は、各資料フォルダで「今すぐ更新」を実行してください（実行しなくても、次の取り込み・更新のときに作り直されます）。</div>
+            </div>
+
             <!-- 高度な設定（このタブの「詳細」折りたたみ・1箇所まで）。 -->
             <details class="adv">
               <summary>詳細設定</summary>

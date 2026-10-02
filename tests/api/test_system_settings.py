@@ -2291,6 +2291,23 @@ def test_admin_settings_embed_parallel_roundtrip():
     assert parallel["configured"] is None and parallel["effective"] == parallel["default"] == 4
 
 
+def test_admin_settings_embed_provider_roundtrip_and_rejects_bad_value():
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    response = admin.put("/admin/settings", json={"embed_provider": "ollama"})
+    assert response.status_code == 200, response.text
+    view = response.json()["embed_provider"]
+    assert view["configured"] == "ollama" and view["effective"] == "ollama"
+    assert store.get_system_settings()["embed_provider"] == "ollama"
+    for bad in ("gemini", "", 3):
+        assert admin.put("/admin/settings", json={"embed_provider": bad}).status_code == 422
+    assert store.get_system_settings()["embed_provider"] == "ollama"
+    response = admin.put("/admin/settings", json={"embed_provider": None})
+    view = response.json()["embed_provider"]
+    assert view["configured"] is None and view["effective"] == view["default"] == "auto"
+
+
 @pytest.mark.parametrize("bad", [0, -1, 17, True, "3", 1.5])
 def test_admin_settings_embed_parallel_rejects_invalid_values(bad):
     if not _try_init():

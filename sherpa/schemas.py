@@ -532,6 +532,16 @@ class CodexModeInfo(BaseModel):
     options: list[str]
 
 
+class EmbedProviderInfo(BaseModel):
+    """`embed_provider`（埋め込みの接続先・`embeddings.effective_embed_provider`）。`ollama_model` は
+    "ollama" のとき使う埋め込みモデル名（使えるモデル表の ollama/embed 既定）。"""
+    configured: str | None
+    effective: str
+    default: str
+    options: list[str]
+    ollama_model: str
+
+
 class DepthProfileAdminInfo(BaseModel):
     """GET・PUT /admin/settings の `depth_profile`（SC-6c・`sherpa/depth_profile.py`・
     system_extras.py::_admin_settings_view）。調べる深さ（クイック/標準/深く/最大）が掛ける倍率の
@@ -596,6 +606,7 @@ class AdminSettingsView(BaseModel):
     # 埋め込み HTTP の同時送信数（`embeddings.effective_embed_parallel`）。
     # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=EMBED_PARALLEL_DEFAULT）。
     embed_parallel: DepthProfileBaseInfo
+    embed_provider: EmbedProviderInfo
     # 「最大」の深さが許す査読の巡数（`depth_profile.effective_max_review_rounds`）。
     # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=MAX_REVIEW_ROUNDS_DEFAULT）。
     max_review_rounds: DepthProfileBaseInfo
