@@ -18,6 +18,12 @@ import _metafile_builders as mb  # noqa: E402
 from sherpa.ingest import evidence_ir, metafile_text, ocr_router, office_md  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_libreoffice(monkeypatch, tmp_path):
+    """この file は埋込ビットマップと文字の抽出が対象。全体描画（LibreOffice）は test_metafile_render.py で見る。"""
+    monkeypatch.setenv("SHERPA_SOFFICE_BIN", str(tmp_path / "no-such-soffice"))
+
+
 # ---- 文字（C） ------------------------------------------------------------------------------
 
 def test_wmf_text_follows_font_charset_and_reads_top_to_bottom():
@@ -138,10 +144,10 @@ def test_router_selects_child_png_linked_to_its_parent_metafile(monkeypatch, tmp
     assert not (tmp_path / "world" / "_metafile").exists()                   # 資料フォルダには書かない
 
 
-def test_metafile_without_bitmaps_stays_unsupported(monkeypatch, tmp_path):
+def test_metafile_without_bitmaps_and_without_libreoffice_is_unsupported(monkeypatch, tmp_path):
     _, dmd = _build(monkeypatch, tmp_path, mb.emf([mb.emf_exttextout_w("文字だけ", 0, 0)]))
     decisions = _route(dmd)["decisions"]
-    assert [item["reason_code"] for item in decisions] == [ocr_router.UNSUPPORTED_IMAGE_FORMAT]
+    assert [item["reason_code"] for item in decisions] == [ocr_router.METAFILE_RENDER_UNAVAILABLE]
 
 
 # ---- rag.md / 人間向け MD ----------------------------------------------------------------------
@@ -339,7 +345,7 @@ def test_already_ingested_folder_picks_up_children_and_text_once_without_changin
     rag_path.write_text(office_md._stamp_rule_only_rag_markdown(old.markdown), encoding="utf-8")
     shutil.rmtree(dmd.parent / "rag" / "a.docx.assets" / metafile_text.CHILD_DIR)
     route_path = dmd.parent / "ir" / "a.docx.ocr_route.json"
-    route_path.write_text(json.dumps({**_route(dmd), "router_profile": "evidence-raster-router-v4"}), encoding="utf-8")
+    route_path.write_text(json.dumps({**_route(dmd), "router_profile": "evidence-raster-router-v5"}), encoding="utf-8")
     (dmd / ocr_router.OCR_ROUTE_SIG_MARKER).write_text("sha256:old\n", encoding="utf-8")
     sig = (dmd / office_md._RAG_SIG_MARKER)
     sig.write_text(sig.read_text(encoding="utf-8").replace(

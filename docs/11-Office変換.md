@@ -18,6 +18,9 @@
 
 **確定（決まったこと）**:
 - 方式＝**OOXML 直パース → (中間JSON) → Markdown**。**Office/LibreOffice 非依存・Linux-native**。
+- **例外（任意・OCR 専用）**: LibreOffice は MD 化の方式には使わない。ただし WMF/EMF の図は、LibreOffice が入っている環境に限り、
+  バックグラウンドで図全体を PNG に描いて OCR に回す（`sherpa/ingest/metafile_render.py`）。入っていなければ
+  「未対応（LibreOffice が入っていません）」と記録するだけで、ほかの処理は LibreOffice に依存しない。管理画面の「必要な道具」に出る。
 - 不採用＝LibreOffice（ずれる）／VLM全面（数値誤読＋要レンダ）／直テキスト化（構造喪失）。
 - **アーム4種（プラグイン式）**: ①OOXML直(既定=値の権威) ②Office COM(任意=高忠実) ③VLM(ラスタ画像) ④PDF系(PDF入力)。
 - **オブジェクト種別の取り方**（§2.1）: ベクタ図=決定的／ラスタ画像=VLM／表=XMLで正確／**全列挙で silent drop ゼロ**。
@@ -48,6 +51,7 @@
   （Mermaid 化は**任意**＝できなければ LLM/VLM で図の内容を**テキスト記述**して残す）。
 - **直テキスト化しない**（座標・結合セル・図形・接続の意味が落ちる）。
 - **レンダリングエンジンに依存しない**（Office / LibreOffice / Gotenberg / Collabora は全て不可・OUT）。
+  唯一の例外は上記の、WMF/EMF の図全体を OCR のために描く任意の用途（LibreOffice が無くても取り込みは変わらない）。
   `.xlsx/.docx/.pptx` は **ZIP＋XML（OOXML）**なので、表も図形も **XML から直接読める**。
 
 ## 2. パイプライン（2段・Linux-native）

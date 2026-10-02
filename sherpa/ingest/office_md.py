@@ -1301,7 +1301,7 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
     dr = Path(derived)
     dr_ir = _sibling_layer_dir(dr, "ir")
     dr_rag = _sibling_layer_dir(dr, "rag")
-    rewritten = failed = 0
+    rewritten = failed = unavailable = 0
     for evidence_path in sorted(dr_ir.rglob("*.evidence.json")):
         rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(".evidence.json")]
         route_path = dr_ir / f"{rel}.ocr_route.json"
@@ -1316,12 +1316,15 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
                 rewritten += 1
             else:
                 manifest = ocr_router.from_json_str(raw)
+            unavailable += sum(
+                1 for d in manifest.decisions if ocr_router.render_unavailable(d))
             ocr_jobs.cancel_unsupported_routes(
                 world, generation_id, rel, ocr_jobs.unsupported_route_ids(manifest))
         except Exception:
             failed += 1
             _log.warning("OCRルートの書き直し/終端に失敗しました（次回 sync で再試行）: %s", rel, exc_info=True)
-    return {"ocr_routes_rewritten": rewritten, "ocr_routes_failed": failed}
+    return {"ocr_routes_rewritten": rewritten, "ocr_routes_failed": failed,
+            "metafile_render_unavailable": unavailable}
 
 
 def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
@@ -1334,7 +1337,7 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
     """
     from . import evidence_ir, ocr_router
 
-    summary = {"documents": 0, "selected": 0, "excluded": 0, "failed_binding": 0}
+    summary = {"documents": 0, "selected": 0, "excluded": 0, "failed_binding": 0, "metafile_render_unavailable": 0}
     for path in sorted(stage_ir.rglob("*.evidence.json")):
         rel = path.relative_to(stage_ir).as_posix()
         source_rel_path = rel[: -len(".evidence.json")]
@@ -1346,6 +1349,8 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
         for decision in manifest.decisions:
             if decision.status in summary:
                 summary[decision.status] += 1
+            if ocr_router.render_unavailable(decision):
+                summary["metafile_render_unavailable"] += 1     # 「未対応（LibreOffice が入っていません）」の図の数
     return summary
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import io
+import json
 import re
 import struct
 import zipfile
@@ -30,6 +31,11 @@ MAX_BITMAP_PIXELS = 25_000_000
 MIN_BITMAP_SIDE = 32
 SNIFF_BYTES = 64
 CHILD_DIR = "_metafile"
+RENDER_NAME = "render.png"                    # 図全体を LibreOffice で描いた PNG（``_metafile/{親hash}/`` の下）
+RENDER_STATE_SUFFIX = ".render.json"          # ``_metafile/{親hash}.render.json``: 描画できなかった理由の記録
+RENDER_CACHE_DIR = "_metafile_render_cache"    # 派生領域直下: {親sha256}.png（描画）／{親sha256}.failed（失敗の理由）
+MAX_RENDER_PIXELS = 25_000_000
+MIN_TEXT_CHARS_FOR_SKIP = 20                  # 埋込ビットマップがあり、文字がこれ以上取れた図は描画しない
 
 _WMF_PLACEABLE = b"\xd7\xcd\xc6\x9a"
 _EMF_SIGNATURE_OFFSET = 40
@@ -464,11 +470,127 @@ def read_asset_content(path: Path) -> MetafileContent | None:
     return extract(data)
 
 
-def materialize_children(assets_dir: str | Path) -> int:
+def _render_wanted(content: MetafileContent) -> bool:
+    """全体描画をするか。埋込ビットマップが無い図、または文字がほとんど取れなかった図だけ描く。
+
+    ビットマップがあり文字も十分取れた図は、描画しても同じ内容の OCR が重なるだけなので描かない。
+    """
+    if not content.bitmaps:
+        return True
+    return sum(len(line) for line in content.lines) < MIN_TEXT_CHARS_FOR_SKIP
+
+
+def _valid_render(png: bytes) -> bool:
+    """出力が本物の PNG で、画素数が上限内かを確かめる。"""
+    size = child_png_size(png[:32])
+    if size is None or size[0] < 1 or size[1] < 1 or size[0] * size[1] > MAX_RENDER_PIXELS:
+        return False
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(png)) as image:
+            image.verify()
+    except Exception:
+        return False
+    return True
+
+
+def _state_path(root: Path, parent_hex: str) -> Path:
+    return root / CHILD_DIR / f"{parent_hex}{RENDER_STATE_SUFFIX}"
+
+
+def read_render_state_record(root: Path, parent_hex: str) -> dict | None:
+    try:
+        value = json.loads(_state_path(root, parent_hex).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) and isinstance(value.get("state"), str) else None
+
+
+def read_render_state(root: Path, parent_hex: str) -> str | None:
+    """描画の状態（``pending`` / ``unavailable`` / ``failed:{理由}``）。記録が無ければ None。"""
+    record = read_render_state_record(root, parent_hex)
+    return record["state"] if record else None
+
+
+def _write_state(root: Path, parent_hex: str, state: str | None, file: str | None = None) -> None:
+    path = _state_path(root, parent_hex)
+    try:
+        if state is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"state": state, "file": file}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def render_cache_dir(assets_dir: str | Path) -> Path:
+    """描画 PNG を親 sha256 で共有する置き場（派生領域の直下・``rag`` 層の兄弟。資料フォルダ側には作らない）。"""
+    root = Path(assets_dir)
+    for ancestor in root.parents:
+        if ancestor.name in ("rag", "rag.staging", "rag.retired"):
+            return ancestor.parent / RENDER_CACHE_DIR
+    return root.parent / RENDER_CACHE_DIR
+
+
+def cached_render(cache_dir: Path, parent_hex: str) -> bytes | None:
+    try:
+        png = (cache_dir / f"{parent_hex}.png").read_bytes()
+    except OSError:
+        return None
+    return png if _valid_render(png) else None
+
+
+def cached_failure(cache_dir: Path, parent_hex: str) -> str | None:
+    try:
+        return (cache_dir / f"{parent_hex}.failed").read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def clear_render_state(root: Path, parent_hex: str) -> None:
+    _write_state(root, parent_hex, None)
+
+
+def _materialize_render(root: Path, name: str, kind: str, parent_hex: str, *, keep_state: bool = False) -> int:
+    """図全体の描画 PNG を ``_metafile/{親hash}/render.png`` へ置く。LibreOffice はここでは呼ばない。
+
+    共有キャッシュ（親 hash）に描画があればそれを写す。無ければ LibreOffice の有無で ``unavailable``／
+    ``pending`` を記録し、描画はバックグラウンド（``metafile_render``）が行う。過去に失敗した図は
+    ``failed:{理由}`` のまま再試行しない。
+    """
+    target = root / CHILD_DIR / parent_hex / RENDER_NAME
+    if target.is_file():
+        return 0
+    cache = render_cache_dir(root)
+    png = cached_render(cache, parent_hex)
+    if png is not None:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(png)
+        except OSError:
+            return 0
+        # keep_state: バックグラウンドの反映では、ルート書き直しと OCR job の enqueue が済むまで
+        # 再試行できる状態（rendered_unapplied）を残す（呼び出し元が成功後に消す）。
+        _write_state(root, parent_hex, "rendered_unapplied" if keep_state else None, name)
+        return 1
+    failure = cached_failure(cache, parent_hex)
+    if failure is not None:
+        _write_state(root, parent_hex, f"failed:{failure}")
+        return 0
+    from .arms import legacy_convert
+
+    _write_state(root, parent_hex, "pending" if legacy_convert.soffice_available() else "unavailable", name)
+    return 0
+
+
+def materialize_children(assets_dir: str | Path, *, keep_state: bool = False) -> int:
     """``{rel}.assets/`` 内の WMF/EMF から埋込ビットマップを PNG にして ``_metafile/{親hash}/`` へ書く。
 
     親（メタファイル）の hash 名ディレクトリの下に連番＋PNG hash で置くため、再実行しても同じ名前になる。
-    書くのは派生物の assets 内だけ（登録した資料フォルダには触れない）。失敗は握りつぶして次へ進む。
+    全体の描画が要る図（``_render_wanted``）は、共有キャッシュから写すか、状態（``pending``／``unavailable``）
+    だけを記録する（LibreOffice は呼ばない）。書くのは派生物の assets 内だけ（登録した資料フォルダには
+    触れない）。失敗は握りつぶして次へ進む。
     """
     root = Path(assets_dir)
     if not root.is_dir():
@@ -478,7 +600,7 @@ def materialize_children(assets_dir: str | Path) -> int:
         if path.is_symlink() or not path.is_file():
             continue
         content = read_asset_content(path)
-        if content is None or not content.bitmaps:
+        if content is None or content.kind is None:
             continue
         try:
             parent_hex = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -486,7 +608,8 @@ def materialize_children(assets_dir: str | Path) -> int:
             continue
         target_dir = root / CHILD_DIR / parent_hex
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
+            if content.bitmaps:
+                target_dir.mkdir(parents=True, exist_ok=True)
             for index, bitmap in enumerate(content.bitmaps, start=1):
                 name = f"{index:02d}-{hashlib.sha256(bitmap.png).hexdigest()[:16]}.png"
                 target = target_dir / name
@@ -495,6 +618,13 @@ def materialize_children(assets_dir: str | Path) -> int:
                     written += 1
         except OSError:
             continue
+        if content.reason == "too_large":
+            _write_state(root, parent_hex, "too_large", path.name)    # 読まない理由をルートに残す（描画もしない）
+        elif _render_wanted(content):
+            try:
+                written += _materialize_render(root, path.name, content.kind, parent_hex, keep_state=keep_state)
+            except Exception:
+                pass
     return written
 
 
