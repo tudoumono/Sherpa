@@ -1,8 +1,7 @@
 """1ターンの活動記録（`answer["activity"]`）を安全な文字列表現へ変換する共通ロジック。
 
-`scripts/turn_activity.py`（`make turn-activity`）と管理者の利用明細エクスポート
-（`sherpa/usage_export.py`）が共有する——表示規則（識別子の形の文字列だけを出し、それ以外は
-「（その他）」に畳み込む）を二重に持たない。
+管理者の利用明細エクスポート（`sherpa/usage_export.py`）と会話トレース（`scripts/conversation_trace.py`・
+`make trace`）が使う。表示規則は識別子の形の文字列だけを出し、それ以外は「（その他）」に畳み込む。
 
 activity は Codex 経路で 0.13.1 以降に保存したターンにだけあり、`source` が `"codex_rollout"` の
 ときだけ agents/tools/settings を持つ（それ以外は phases_ms.total と app_version のみ）。

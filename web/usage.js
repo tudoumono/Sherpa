@@ -1059,12 +1059,8 @@ async function load(period) {
 $('usage-export').addEventListener('click', () => {
   const payload = { retrieved_at: _loadedAt, timezone: 'Asia/Tokyo', period: _stats.period,
     definitions: $('usage-definitions').textContent.trim(), stats: _stats };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `usage-${_stats.period.start}-${_stats.period.end}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
+  Sherpa.downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+    `usage-${_stats.period.start}-${_stats.period.end}.json`);
 });
 
 $('usage-export-detail').addEventListener('click', async () => {

@@ -7,7 +7,7 @@
 `usage_export_aux_calls` に委ねる（このモジュールは受け取った行を整形するだけ）。
 
 activity 由来の文字列（ツール名・モデル名・設定値・エラーコード・未解析の種類）の安全化規則は
-`sherpa.turn_activity_format`（`scripts/turn_activity.py` と共有）に従う——二重の流儀を持たない。
+`sherpa.turn_activity_format` に従う。
 """
 from __future__ import annotations
 
@@ -222,7 +222,7 @@ def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> s
         f"アプリの版: {app_ver or '不明'}",
         "",
         "質問と回答の本文・会話の題名・参照した資料・ツールの引数は含みません。会話番号・回答番号で",
-        "DB や `make turn-activity CONV=<会話番号>` と突き合わせられます。",
+        "DB や `make trace CONV=<会話番号>` と突き合わせられます。",
         "",
         "ファイルと列:",
         "  summary.json    利用統計の集計（GET /admin/usage/stats の応答そのもの。画面は上位10件に絞る一覧も全件）"
@@ -239,8 +239,8 @@ def _readme_text(period: dict, retrieved_at: datetime, app_ver: str | None) -> s
         "  aux_calls.csv   期間内のチャット以外のAI呼び出し（usage_events）1件=1行。日時・"
         "用途・経路・モデル・トークン4種・呼び出し回数・経過時間・利用者ID・会話番号。",
         "  daily.csv       日別。日付・利用者数・ターン数・入力/出力トークン。",
-        "  activity/<会話番号>.txt   その会話の期間内の回答について"
-        "`make turn-activity CONV=<会話番号>` と同じ表示。",
+        "  activity/<会話番号>.txt   その会話の期間内の回答ごとの活動記録（本体と下調べ役の"
+        "トークン・往復・圧縮・ツール別の回数とバイト）を数字だけで表示。",
         "",
         "列が空欄なのは「その経路・その回答では記録されない」ことを表し、0（測って0だった）とは"
         "区別しています。",

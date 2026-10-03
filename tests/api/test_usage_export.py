@@ -2,7 +2,7 @@
 
 - admin ゲート（非 admin → 403）
 - 質問・回答の本文／会話の題名／参照した資料／台帳の id 一覧が ZIP のどのファイルにも含まれない
-- turns.csv に会話番号・回答番号が含まれる（DB や `make turn-activity` との突き合わせに使う）
+- turns.csv に会話番号・回答番号が含まれる（DB や `make trace` との突き合わせに使う）
 - `days` の明示指定と `from`/`to` の同時指定は 422
 
 要 Postgres。DB 不可は SKIP。

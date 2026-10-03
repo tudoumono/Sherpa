@@ -142,3 +142,130 @@ def test_succeeded_results_stream_and_snapshot_mark_use_real_postgres():
         assert all(row["artifact_published"] for row in ocr_jobs.list_succeeded_results(world, generation))
     finally:
         ocr_jobs.purge_world(world)
+
+
+def _world_rows(world: str) -> int:
+    with ocr_jobs._connect() as c:
+        return sum(c.execute(f"SELECT count(*) AS n FROM {t} WHERE world=%s", (world,)).fetchone()["n"]
+                   for t in ("ocr_jobs", "ocr_result_cache", "ocr_refresh_runs"))
+
+
+def _enqueue_one(world: str) -> None:
+    ocr_jobs.enqueue_job(
+        world=world, source_rel_path="sub/design.xlsx", canonical_generation_id="a" * 64,
+        source_content_hash="sha256:" + "b" * 64, route_manifest_hash="sha256:" + "c" * 64,
+        route_input=_route("route-1"), engine_profile_hash="sha256:" + "e" * 64,
+    )
+    ocr_jobs.put_cached_result(
+        world, "sha256:" + "1" * 64, "sha256:" + "e" * 64,
+        {"schema": "ocr-engine-lines-v1", "observations": [{"text": "secret"}]},
+    )
+
+
+def test_world_wipe_removes_ocr_rows_and_failure_keeps_them_for_retry(monkeypatch, tmp_path):
+    """資料フォルダの削除（wipe）で OCR の本文（job/cache）も消える。消去に失敗したら例外で止まり行は残る。"""
+    from sherpa.ingest import worker
+
+    _init_or_skip()
+    world = "test-ocr-wipe-" + uuid.uuid4().hex
+    monkeypatch.setenv("SHERPA_OBSERVATION_DIR", str(tmp_path / "obs"))
+    obs = tmp_path / "obs" / world
+    obs.mkdir(parents=True)
+    (obs / ".ai_observations.jsonl").write_text("secret", encoding="utf-8")
+    try:
+        _enqueue_one(world)
+        import shutil
+        real_rmtree = shutil.rmtree
+
+        def _rm_boom(*_a, **_k):
+            raise OSError("rm fault")
+
+        monkeypatch.setattr(shutil, "rmtree", _rm_boom)       # 観測の削除が失敗したら OCR の行は残る（再試行できる）
+        with pytest.raises(OSError, match="rm fault"):
+            worker._wipe_locked(world, reflect=False)
+        monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+        assert _world_rows(world)
+        assert obs.exists()
+
+        real_purge = ocr_jobs.purge_world
+
+        def _boom(_world):
+            raise RuntimeError("pg fault")
+
+        monkeypatch.setattr(ocr_jobs, "purge_world", _boom)
+        with pytest.raises(RuntimeError, match="pg fault"):
+            worker._wipe_locked(world, reflect=False)
+        assert _world_rows(world)
+
+        monkeypatch.setattr(ocr_jobs, "purge_world", real_purge)
+        obs.mkdir(exist_ok=True)
+        worker._wipe_locked(world, reflect=False)
+        assert not _world_rows(world)
+        assert not obs.exists()
+    finally:
+        ocr_jobs.purge_world(world)
+
+
+def test_refresh_enqueue_after_world_purge_leaves_no_job():
+    """削除（purge_world）の後に refresh が job を積もうとしても、run 行が無いので何も残らない。"""
+    from types import SimpleNamespace
+
+    _init_or_skip()
+    world = "test-ocr-race-" + uuid.uuid4().hex
+    gen, profile = "a" * 64, "sha256:" + "e" * 64
+    manifest = SimpleNamespace(
+        source_rel_path="a.xlsx", source_content_hash="sha256:" + "b" * 64,
+        route_manifest_hash="sha256:" + "c" * 64, decisions=[],
+    )
+    try:
+        ocr_jobs.enqueue_refresh_run(world, gen, profile)
+        run = ocr_jobs.lease_refresh_run("w", lease_seconds=60, world=world)
+        with ocr_jobs._connect() as c:
+            c.execute("UPDATE ocr_refresh_runs SET lease_expires_at=now()-interval '1 second' WHERE id=%s", (run["id"],))
+        assert ocr_jobs.enqueue_manifest_jobs(                                    # 期限切れの lease では積まない
+            world, manifest, canonical_generation_id=gen, engine_profile_hash=profile,
+            refresh_run=(run["id"], run["lease_token"])) is None
+        ocr_jobs.purge_world(world)
+        assert ocr_jobs.enqueue_manifest_jobs(
+            world, manifest, canonical_generation_id=gen, engine_profile_hash=profile,
+            refresh_run=(run["id"], run["lease_token"])) is None
+        assert not _world_rows(world)
+    finally:
+        ocr_jobs.purge_world(world)
+
+
+def test_world_wipe_refuses_overlapping_observation_dir_before_deleting_anything(monkeypatch, tmp_path):
+    """観測の置き場が登録 root（読み取り専用の原本）と重なる設定（別の綴り＝symlink 別名・祖先を含む）では、
+    削除は何も消さずに止まり、原本も OCR の行も残る。"""
+    from sherpa.ingest import worker
+
+    _init_or_skip()
+    world = "ocroverlap" + uuid.uuid4().hex[:8]
+    obs_base = tmp_path / "obs"
+    obs_base.mkdir()
+    target = obs_base / world                         # 観測の置き場 {base}/{world}
+    target.mkdir()
+    (target / "original.txt").write_text("source", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(target)                          # 同じ実体の別の綴り（大文字小文字違いの FS と同じ同一性の問題）
+    parent_alias = tmp_path / "parent-alias"
+    parent_alias.symlink_to(tmp_path)                 # 観測の置き場の祖先を指す登録 root
+    monkeypatch.setenv("SHERPA_OBSERVATION_DIR", str(obs_base))
+    try:
+        _enqueue_one(world)
+        for root in (alias, parent_alias):
+            store.upsert_world(world, str(root))
+            with pytest.raises(ValueError):
+                worker._wipe_locked(world, reflect=False)
+            assert (target / "original.txt").read_text(encoding="utf-8") == "source"
+            assert _world_rows(world)                 # 検証は何かを消す前＝OCR の行も残る
+        not_dir = obs_base / (world + "f")             # 通常のファイルは対象にできない（何も消さずに拒否）
+        not_dir.write_text("x", encoding="utf-8")
+        store.upsert_world(world + "f", str(tmp_path / "elsewhere"))
+        with pytest.raises(ValueError):
+            worker._wipe_locked(world + "f", reflect=False)
+        assert not_dir.exists()
+    finally:
+        store.delete_world_row(world)
+        store.delete_world_row(world + "f")
+        ocr_jobs.purge_world(world)

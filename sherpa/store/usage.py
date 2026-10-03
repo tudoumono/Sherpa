@@ -1619,7 +1619,7 @@ def usage_export_turns(days: int = 30, *, time_from: str | None = None, time_to:
     同じ `turn_metrics` から読む（活動記録があればその値＝失敗ターンの実消費も数える）。
 
     `answer` は数字と閉じた語彙の欄だけを `turn_metrics` から組み直した JSON（本文・出典・主張は
-    DB から読まない＝`scripts/turn_activity.py::_rows` と同じ規律）。
+    DB から読まない）。
     """
     _ensure()
     start_ts, end_exclusive_ts, _period = _usage_period(days, time_from=time_from, time_to=time_to)

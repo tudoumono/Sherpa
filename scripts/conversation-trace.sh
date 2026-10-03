@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# 1 つの会話の活動記録を数字だけで表示する（`make turn-activity CONV=<番号>`）の薄いラッパー。
-# 運用環境の設定ファイルを doctor.sh/diag.sh と同じ読み方（`sherpa_source_dotenv`・SHERPA_ENV_FILE で
-# 差し替え可）で取り込んでから実行する（読まずに実行すると store が既定の接続先を読んでしまう）。
-# 設定ファイルの中身は端末に出さない。
+# 会話トレースの書き出し（`make trace`）の薄いラッパー。運用環境の設定ファイル（SHERPA_ENV_FILE で
+# 差し替え可）を取り込んでから実行する。設定ファイルの中身は端末に出さない。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -23,4 +21,4 @@ else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
-exec "$PYTHON_BIN" "$ROOT/scripts/turn_activity.py" "$@"
+exec "$PYTHON_BIN" "$ROOT/scripts/conversation_trace.py" "$@"

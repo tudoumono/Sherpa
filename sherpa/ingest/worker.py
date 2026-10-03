@@ -1571,7 +1571,7 @@ def _wipe_locked(world, *, reflect) -> dict:
     """`wipe_world` の lock 未取得版（呼び出し元が既に world_lock を保持している前提）。
 
     **fail-closed**: グラフ削除に失敗したら例外を投げる（握りつぶさない）。グラフを先に消し、
-    成功してから台帳をクリアする（途中失敗で「台帳空・グラフ残」を作らない）。参照元の外部フォルダは消さない。
+    成功してから台帳・OCR 読み取り結果をクリアする（途中失敗で「台帳空・グラフ残」を作らない）。参照元の外部フォルダは消さない。
 
     pre-invalidate 設計: `last_sig` の無効化（`''`）は
     **関数冒頭**（Neo4j delete より前）で**ガード無し**に行う。
@@ -1583,6 +1583,7 @@ def _wipe_locked(world, *, reflect) -> dict:
     無効化が書けた後は、delete/replace/rmtree のどこで失敗・クラッシュしても last_sig は既に `''`
     （実 sig と一致しない番兵）＝次回 sync が必ず「変更あり」判定で再構築し、自己修復に収束する。
     """
+    obs_dir = worlds.observation_removal_target(world)     # 何かを消す前に検証（原本・登録 root と重なる設定なら例外で何も消さない）
     store.set_world_sig(world, "")                          # pre-invalidate（fail-closed）
     deleted = 0
     if reflect:                                            # Neo4j 失敗は伝播（呼出側は registry を進めない）
@@ -1590,6 +1591,10 @@ def _wipe_locked(world, *, reflect) -> dict:
         deleted = world_neo4j.delete_world(world, env["uri"], env["user"], env["pw"])
     ledger = store.replace_documents(world, [])            # グラフ削除成功後に台帳クリア
     import shutil
+    from ..store import ocr_jobs
+    if obs_dir is not None:
+        shutil.rmtree(obs_dir)                             # OCR ワーカーが書いた観測本文。失敗は伝播（OCR の行を残して再試行）
+    ocr_jobs.purge_world(world)                            # OCR 読み取り結果（本文）の job/cache/run。失敗は伝播
     shutil.rmtree(worlds.derived_dir(world), ignore_errors=True)   # 派生MD（Office由来）も消す
     try:
         es_index.delete_world(world)                  # ES インデックスも削除（派生物の一括伝播）

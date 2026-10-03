@@ -276,6 +276,7 @@ _SCHEMA = [
     "ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS cache_hit BOOLEAN NOT NULL DEFAULT false",
     "ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS observation_count INTEGER",
     "ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS artifact_published BOOLEAN NOT NULL DEFAULT false",
+    "ALTER TABLE ocr_jobs ADD COLUMN IF NOT EXISTS cache_input_fingerprint TEXT",
     "CREATE INDEX IF NOT EXISTS ocr_jobs_leaseable ON ocr_jobs(priority DESC, available_at, id) "
     "WHERE status IN ('queued','leased')",
     "CREATE INDEX IF NOT EXISTS ocr_jobs_world_generation ON ocr_jobs(world, canonical_generation_id, status)",
