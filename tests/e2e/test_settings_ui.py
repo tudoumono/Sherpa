@@ -13,19 +13,20 @@ def test_settings_save_and_connection_test_do_not_echo_saved_keys(page, web_base
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/settings.html")
 
-    expect(page.locator("#agent")).to_have_value("openai_only")   # 4構成: 既定の構成id
+    expect(page.locator("#agent")).to_have_value("simple")   # 3構成: 既定の構成id
     expect(page.locator("#okey")).to_have_value("")
     expect(page.locator("#okey")).to_have_attribute("placeholder", "設定済み（変更する時だけ入力）")
 
-    # 実行構成は実際に選び直した時だけ送る（触っていなければ送らない）ため、既定の openai_only から
-    # ollama_only へ実際に変える（key 非echo確認とは別軸だが、選び直した値が正しく送られることも
+    # 実行構成は実際に選び直した時だけ送る（触っていなければ送らない）ため、既定の simple から
+    # codex_ollama へ実際に変える（key 非echo確認とは別軸だが、選び直した値が正しく送られることも
     # 併せて固定する）。
-    page.locator("#agent").select_option("ollama_only")
+    page.locator("#agent").select_option("codex_ollama")
     page.locator("#okey").fill("sk-test")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["agent"] == "ollama"
+    assert records["settings_put"][-1]["agent"] == "codex"
+    assert records["settings_put"][-1]["codex_model_provider"] == "ollama"
     assert records["settings_put"][-1]["openai_api_key"] == "sk-test"
 
     expect(page.locator("#okey")).to_have_value("")
@@ -42,14 +43,15 @@ def test_settings_agent_untouched_save_omits_agent_fields(page, web_base_url):
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/settings.html")
 
-    page.locator("#sysprompt").fill("回答は簡潔に。")
+    page.locator("#okey").fill("sk-untouched")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put = records["settings_put"][-1]
     assert "agent" not in put
     assert "codex_model_provider" not in put
-    assert put["system_prompt"] == "回答は簡潔に。"
+    assert put["openai_api_key"] == "sk-untouched"
+    assert "system_prompt" not in put and "search_helper" not in put
 
 
 def test_settings_agent_reselect_same_value_omits_agent_fields(page, web_base_url):
@@ -60,8 +62,8 @@ def test_settings_agent_reselect_same_value_omits_agent_fields(page, web_base_ur
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/settings.html")
 
-    expect(page.locator("#agent")).to_have_value("openai_only")
-    page.locator("#agent").select_option("openai_only")
+    expect(page.locator("#agent")).to_have_value("simple")
+    page.locator("#agent").select_option("simple")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
@@ -165,17 +167,17 @@ def test_settings_agent_survives_reload_failure_and_resends_on_revert(page, web_
 
     page.route("**/settings", fail_second_settings_get)
     page.goto(f"{web_base_url}/settings.html")
-    expect(page.locator("#agent")).to_have_value("openai_only")
+    expect(page.locator("#agent")).to_have_value("simple")
 
-    page.locator("#agent").select_option("ollama_only")
+    page.locator("#agent").select_option("codex_ollama")
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("再読込に失敗しました")
-    assert records["settings_put"][-1]["agent"] == "ollama"
+    assert records["settings_put"][-1]["agent"] == "codex"
 
-    page.locator("#agent").select_option("openai_only")
+    page.locator("#agent").select_option("simple")
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["agent"] == "openai"
+    assert records["settings_put"][-1]["agent"] == "simple"
 
 
 def test_settings_agent_put_4xx_keeps_old_baseline_and_omits_fields_after_revert(page, web_base_url):
@@ -202,16 +204,16 @@ def test_settings_agent_put_4xx_keeps_old_baseline_and_omits_fields_after_revert
 
     page.route("**/settings", fail_first_settings_put)
     page.goto(f"{web_base_url}/settings.html")
-    expect(page.locator("#agent")).to_have_value("openai_only")
+    expect(page.locator("#agent")).to_have_value("simple")
 
-    page.locator("#agent").select_option("ollama_only")
+    page.locator("#agent").select_option("codex_ollama")
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("invalid")
     assert records["settings_put"] == []   # モック側の記録はフォールバック経路でしか積まれない
 
-    # 元の値（openai_only）へ戻して保存 — 拒否された変更はサーバに適用されていない＝基準値は
+    # 元の値（simple）へ戻して保存 — 拒否された変更はサーバに適用されていない＝基準値は
     # 最初から動いていないはず。値が基準値と一致するので agent／codex_model_provider は送らない。
-    page.locator("#agent").select_option("openai_only")
+    page.locator("#agent").select_option("simple")
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put = records["settings_put"][-1]
@@ -244,9 +246,9 @@ def test_settings_agent_put_5xx_resends_on_retry_then_omits_after_success(page, 
 
     page.route("**/settings", fail_first_settings_put)
     page.goto(f"{web_base_url}/settings.html")
-    expect(page.locator("#agent")).to_have_value("openai_only")
+    expect(page.locator("#agent")).to_have_value("simple")
 
-    page.locator("#agent").select_option("ollama_only")
+    page.locator("#agent").select_option("codex_ollama")
     page.locator("#save").click()
     expect(page.locator("#msg .danger")).to_be_visible()
 
@@ -255,8 +257,8 @@ def test_settings_agent_put_5xx_resends_on_retry_then_omits_after_success(page, 
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put = records["settings_put"][-1]
-    assert put["agent"] == "ollama"
-    assert put["codex_model_provider"] is None
+    assert put["agent"] == "codex"
+    assert put["codex_model_provider"] == "ollama"
 
     # 直前の保存が成功した＝基準値は具体値（ollama）へ進んでいる。選択を変えずにもう一度保存すると
     # 今度は省略される。
@@ -288,107 +290,23 @@ def test_settings_agent_put_network_error_resends_on_retry_then_omits_after_succ
 
     page.route("**/settings", abort_first_settings_put)
     page.goto(f"{web_base_url}/settings.html")
-    expect(page.locator("#agent")).to_have_value("openai_only")
+    expect(page.locator("#agent")).to_have_value("simple")
 
-    page.locator("#agent").select_option("ollama_only")
+    page.locator("#agent").select_option("codex_ollama")
     page.locator("#save").click()
     expect(page.locator("#msg .danger")).to_be_visible()
 
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put = records["settings_put"][-1]
-    assert put["agent"] == "ollama"
-    assert put["codex_model_provider"] is None
+    assert put["agent"] == "codex"
+    assert put["codex_model_provider"] == "ollama"
 
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put2 = records["settings_put"][-1]
     assert "agent" not in put2
     assert "codex_model_provider" not in put2
-
-
-def test_settings_agent_a7_mismatch_rejected_with_422(page, web_base_url):
-    """A7（クラウドプロバイダ排他選択）: 選択中でないクラウド系 agent の保存は 422 で拒否される
-    （実サーバ `sherpa/routers/system.py::settings_put` と同じ・個人設定画面の <select> は既に
-    A7 でフィルタ済みの選択肢しか出さないため、通常操作では起きない＝直接 fetch で契約を固定する）。"""
-    settings = {**mock_api.SETTINGS_RESP, "cloud_provider": "gemini"}
-    records = install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    result = page.evaluate("""async () => {
-      const r = await fetch('/settings', {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({agent: 'openai'}),
-      });
-      return { status: r.status, body: await r.json() };
-    }""")
-
-    assert result["status"] == 422
-    assert "クラウドプロバイダ" in result["body"]["detail"]
-    assert records["settings_put"][-1] == {"agent": "openai"}
-
-
-def test_settings_agent_disabled_bedrock_rejected_with_422_even_if_cloud_matches(page, web_base_url):
-    """有効化していない頭脳（bedrock/gemini）の保存は、たまたま cloud_provider が一致していても
-    422 で拒否される（実サーバ `agent_constructs.runtime_blocked` 相当・A7 の一致確認だけでは
-    「そもそも使えない」ケースを見逃す）。"""
-    settings = {**mock_api.SETTINGS_RESP, "cloud_provider": "bedrock"}   # bedrock は未有効のまま
-    records = install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    result = page.evaluate("""async () => {
-      const r = await fetch('/settings', {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({agent: 'bedrock'}),
-      });
-      return { status: r.status, body: await r.json() };
-    }""")
-
-    assert result["status"] == 422
-    assert "有効化していません" in result["body"]["detail"]
-    assert records["settings_put"][-1] == {"agent": "bedrock"}
-
-
-def test_settings_agent_a7_check_uses_provider_synced_from_admin_update(page, web_base_url):
-    """個人設定（PUT /settings）の A7 判定は、管理画面（PUT /admin/settings）でクラウド
-    プロバイダを切り替えた直後の値を参照する（同期していないと、古い cloud_provider を見て
-    実サーバでは通るはずの保存を誤って拒否し続ける／その逆になる）。"""
-    settings = {**mock_api.SETTINGS_RESP, "cloud_provider": "openai"}
-    records = install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    # 切替前: openai は選択中のクラウドと一致するので通る。
-    before = page.evaluate("""async () => {
-      const r = await fetch('/settings', {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({agent: 'openai'}),
-      });
-      return r.status;
-    }""")
-    assert before == 200
-
-    # 管理画面でクラウドプロバイダを gemini へ切り替える。
-    admin_result = page.evaluate("""async () => {
-      const r = await fetch('/admin/settings', {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({cloud_provider: 'gemini'}),
-      });
-      return r.status;
-    }""")
-    assert admin_result == 200
-
-    # 切替後: 個人設定の A7 判定も追従し、openai の保存は拒否される（同期が無いと 200 のまま残る）。
-    after = page.evaluate("""async () => {
-      const r = await fetch('/settings', {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({agent: 'openai'}),
-      });
-      return { status: r.status, body: await r.json() };
-    }""")
-    assert after["status"] == 422
-    assert "クラウドプロバイダ" in after["body"]["detail"]
-    assert len(records["settings_put"]) == 2
-    assert len(records["admin_settings_put"]) == 1
 
 
 def test_settings_save_bar_stays_visible_when_scrolled(page, web_base_url):
@@ -413,160 +331,11 @@ def test_settings_ctrl_s_saves(page, web_base_url):
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/settings.html")
 
-    page.locator("#sysprompt").fill("Ctrl+S 保存の確認")
+    page.locator("#okey").fill("sk-ctrl-s")
     page.keyboard.press("Control+s")
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["system_prompt"] == "Ctrl+S 保存の確認"
-
-
-def test_settings_bedrock_fetch_models_replaces_options_and_saves(page, web_base_url):
-    """S6: 「利用可能なモデルを取得」→ <select> の選択肢が取得結果に置き換わる → 選んで保存、の流れ。
-    ユーザー指名の Sonnet 4.6 は ID をハードコードせず、動的取得の結果に出てくれば選べることを示す。
-
-    RV MED（F5・2026-07-16再検証→N4・3巡目再検証）: 取得結果には静的 choices の1つ（jp Haiku）が
-    含まれるが、もう一方（global Haiku）は含まれない。静的 choices は列挙結果の行を作らず（N4:
-    重複防止）、静的 choices 再追加ループが「列挙結果の有無に関係なく」正典ラベルで必ず1回だけ
-    描画する。取得後の選択肢は「列挙のうち非静的1件（us Sonnet）＋静的 choices 2件（jp Haiku・
-    global Haiku）」の3件になる（旧実装は丸ごと置換で global Haiku が消えていた＝F5 の実害）。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page, settings=mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS)
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel.locator("option")).to_have_count(2)   # 初期は静的2択
-
-    page.locator("#bmodel-fetch").click()
-    expect(page.locator("#bmodel-fetch-res")).to_contain_text("2件のモデルを取得しました")
-    assert len(records["bedrock_models_fetch"]) == 1
-
-    expect(sel.locator("option")).to_have_count(3)   # 非静的1件＋静的 choices 2件（常に描画）
-    expect(sel.locator("option[value='global.anthropic.claude-haiku-4-5-20251001-v1:0']")).to_have_count(1)
-    expect(sel.locator("option[value='jp.anthropic.claude-haiku-4-5-20251001-v1:0']")).to_have_count(1)
-    sel.select_option("us.anthropic.claude-sonnet-4-6-20260115-v1:0")
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["bedrock_model"] == "us.anthropic.claude-sonnet-4-6-20260115-v1:0"
-
-
-def test_settings_bedrock_static_choice_survives_fetch_and_is_sent_on_save(page, web_base_url):
-    """RV MED（F5・実害再現）: 静的 Global を選択中に「利用可能なモデルを取得」を押し、その一覧に
-    Global が含まれていない場合でも、Global は legacy に転落せず選択肢に残り続け、保存すると
-    `bedrock_model` にちゃんと Global が送信される（旧実装は select 再構築で Global が消え、
-    legacy option として復活して null 送信になっていた＝保存「成功」表示なのに実際は変わらない）。"""
-    from playwright.sync_api import expect
-
-    static_global = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "bedrock_model": static_global, "bedrock_model_known": True,
-               "bedrock_model_label": "Claude Haiku 4.5（Global 推論プロファイル）"}
-    records = install_api_mocks(page, settings=settings, bedrock_models={"models": [
-        {"id": "jp.anthropic.claude-sonnet-4-6-20260115-v1:0", "label": "Claude Sonnet 4.6（JP 推論プロファイル）"},
-    ], "error": None})   # Global を含まない一覧
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel).to_have_value(static_global)
-
-    page.locator("#bmodel-fetch").click()
-    expect(page.locator("#bmodel-fetch-res")).to_contain_text("1件のモデルを取得しました")
-    expect(sel.locator("option[value='" + static_global + "']")).to_have_count(1)
-    expect(sel.locator("option[value='" + static_global + "']")).not_to_contain_text("旧設定")
-    expect(sel).to_have_value(static_global)   # 選択も維持される
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["bedrock_model"] == static_global
-
-
-def test_settings_bedrock_known_models_map_keeps_static_canonical_label(page, web_base_url):
-    """L4（LOW・2026-07-16 Codex RV 5巡目再検証）: クライアント側の `knownBedrockModels`
-    （known 分類キャッシュ）の静的 choices エントリは、`load()` が返した保存値のラベルでも、
-    verify 応答のラベルでも上書きされない（静的の正典ラベルを保つ）。R4-4 で
-    `addOrSelectBedrockModelOption`/`setBedrockModelOptions` 側は対応済みだったが、`load()` 自身の
-    `knownBedrockModels.set(s.bedrock_model, ...)` が保存値=静的IDの時に上書きしてしまう抜け穴が
-    残っていた。"""
-    from playwright.sync_api import expect
-
-    static_id = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
-    canonical_label = "Claude Haiku 4.5（JP 推論プロファイル・既定）"
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "bedrock_model": static_id, "bedrock_model_known": True,
-               "bedrock_model_label": "サーバの汎用ラベル（正典とは異なる文言）"}
-    install_api_mocks(page, settings=settings, bedrock_verify={
-        "ok": True, "id": static_id, "label": "verify応答の汎用ラベル（正典とは異なる文言）"})
-    page.goto(f"{web_base_url}/settings.html")
-
-    # ページ初期化時点の load() で、サーバが返した「正典とは異なる」ラベルにも関わらず、
-    # knownBedrockModels の静的エントリは正典ラベルのまま（L4 のガード）。
-    label = page.evaluate("knownBedrockModels.get('" + static_id + "')")
-    assert label == canonical_label, label
-
-    # verify 経由でも静的エントリは上書きされない（R4-4）。
-    page.locator("#bmodel-manual").fill(static_id)
-    page.locator("#bmodel-verify").click()
-    expect(page.locator("#bmodel-verify-res")).to_contain_text("検証OK")
-    label2 = page.evaluate("knownBedrockModels.get('" + static_id + "')")
-    assert label2 == canonical_label, label2
-
-    # option 自体の表示も正典ラベルのまま。
-    opt = page.locator("#bmodel option[value='" + static_id + "']")
-    expect(opt).to_have_text(canonical_label)
-
-
-def test_settings_bedrock_fetch_models_failure_keeps_static_choices(page, web_base_url):
-    """S6: 取得失敗（キー未設定/403等）は静的既定の選択肢のまま・理由を表示（画面を壊さない）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page, settings=mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, bedrock_models={"models": [], "error": "Bedrock の API キーが未設定です"})
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    page.locator("#bmodel-fetch").click()
-    expect(page.locator("#bmodel-fetch-res")).to_contain_text("Bedrock の API キーが未設定です")
-    expect(sel.locator("option")).to_have_count(2)   # 静的既定のまま
-
-
-def test_settings_bedrock_verify_model_id_adds_and_selects_option(page, web_base_url):
-    """バッチ2・1番（2026-07-03）: 「利用可能なモデルを取得」（一覧列挙・control-plane 権限が要る）が
-    使えない構成向け。モデルIDを直接入力して「検証して追加」→ 成功したら <select> に追加＆選択状態に。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page, settings=mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, bedrock_verify={
-        "ok": True, "id": "jp.anthropic.claude-sonnet-4-6-20260101-v1:0",
-        "label": "Claude Sonnet 4.6（JP 推論プロファイル）"})
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel.locator("option")).to_have_count(2)
-
-    page.locator("#bmodel-manual").fill("jp.anthropic.claude-sonnet-4-6-20260101-v1:0")
-    page.locator("#bmodel-verify").click()
-
-    expect(page.locator("#bmodel-verify-res")).to_contain_text("検証OK")
-    expect(sel.locator("option")).to_have_count(3)   # 追加された
-    expect(sel).to_have_value("jp.anthropic.claude-sonnet-4-6-20260101-v1:0")   # 選択状態に
-    assert records["bedrock_models_verify"][-1] == {"model_id": "jp.anthropic.claude-sonnet-4-6-20260101-v1:0"}
-
-    # 保存は従来の PUT（追加操作自体は保存しない）。
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["bedrock_model"] == "jp.anthropic.claude-sonnet-4-6-20260101-v1:0"
-
-
-def test_settings_bedrock_verify_model_id_failure_shows_reason_and_does_not_add(page, web_base_url):
-    """検証失敗（形式不正/403等）は理由を表示し、<select> には追加しない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page, settings=mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, bedrock_verify={"ok": False, "error": "認証エラー（403）。API キー/権限を確認してください。"})
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    page.locator("#bmodel-manual").fill("jp.anthropic.claude-not-real-v1:0")
-    page.locator("#bmodel-verify").click()
-
-    expect(page.locator("#bmodel-verify-res")).to_contain_text("認証エラー（403）")
-    expect(sel.locator("option")).to_have_count(2)   # 追加されていない
+    assert records["settings_put"][-1]["openai_api_key"] == "sk-ctrl-s"
 
 
 def test_settings_codex_agent_saves(page, web_base_url):
@@ -602,38 +371,7 @@ def test_settings_codex_connection_test_sends_unsaved_openai_key(page, web_base_
         "provider": "codex", "openai_api_key": "sk-unsaved-azure-key"}
 
 
-# ===== RV MED（2026-07-15）: legacy マーカーが検証済み再選択を握りつぶすフロントの実害バグ修正 =====
-
-def test_settings_bedrock_verify_reselecting_legacy_saved_model_sends_it_on_save(page, web_base_url):
-    """核心回帰: 保存済みの動的モデル（サーバが `bedrock_model_known: false`＝旧設定表示）を、同じ
-    ID で verify に成功させてから保存すると、`bedrock_model` がちゃんと送信される。旧実装は既存
-    option の `data-legacy` を消さずに選択するだけだったため、`selectedBedrockModel` が legacy 扱いの
-    まま null を返し、保存が「成功」表示なのに実際は直前の値のまま（サーバ側は何も変わらない）だった。"""
-    from playwright.sync_api import expect
-
-    legacy_id = "us.anthropic.claude-legacy-saved-v1:0"
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "bedrock_model": legacy_id,
-               "bedrock_model_known": False, "bedrock_model_label": legacy_id}
-    records = install_api_mocks(page, settings=settings, bedrock_verify={
-        "ok": True, "id": legacy_id, "label": "Legacy Saved Model（検証済み）"})
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel.locator("option")).to_have_count(3)   # 静的2択＋保存済み legacy 枠
-    expect(sel).to_have_value(legacy_id)
-    expect(sel.locator("option[value='" + legacy_id + "']")).to_contain_text("旧設定")
-
-    page.locator("#bmodel-manual").fill(legacy_id)
-    page.locator("#bmodel-verify").click()
-    expect(page.locator("#bmodel-verify-res")).to_contain_text("検証OK")
-    expect(sel.locator("option")).to_have_count(3)   # 新規追加ではなく既存枠を更新しただけ
-    expect(sel).to_have_value(legacy_id)
-    expect(sel.locator("option[value='" + legacy_id + "']")).not_to_contain_text("旧設定")
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["bedrock_model"] == legacy_id   # legacy マーカーが外れ実送信される
-
+# ===== 保存後の再読込 =====
 
 def test_settings_save_waits_for_reload_before_showing_success(page, web_base_url):
     """L5（LOW・2026-07-16 Codex RV 5巡目再検証）: Playwright の `expect()` auto-wait は、`load()` を
@@ -642,9 +380,8 @@ def test_settings_save_waits_for_reload_before_showing_success(page, web_base_ur
     できない false green になりうる（Codex RV 指摘）。ここでは保存後の2回目の `GET /settings`
     （`save()` 内の自動 `load()` が発行するもの）をテスト側で意図的に保留し、解放**前**に
     「成功メッセージがまだ出ていない・保存ボタンが無効のまま」であることを明示的に確認してから
-    解放する（`tests/e2e/test_chat_ui.py` の保留 route パターンを踏襲）。解放後は選択中 option が
-    `option:checked` でちょうど1つ・`data-legacy` 属性が無いことを、ラベル文字列比較ではなく
-    属性で確認する。
+    解放する（`tests/e2e/test_chat_ui.py` の保留 route パターンを踏襲）。解放後に成功メッセージが出て、
+    保存ボタンが再び有効になる。
     """
     import json
 
@@ -670,9 +407,9 @@ def test_settings_save_waits_for_reload_before_showing_success(page, web_base_ur
     # このハンドラを経由させ、カウンタで「何回目か」を確実に判別できるようにする）。
     page.route("**/settings", hold_second_settings_get)
     page.goto(f"{web_base_url}/settings.html")
-    expect(page.locator("#agent")).to_have_value("openai_only")   # 4構成: 既定の構成id   # 初回 load() の完了を待つ
+    expect(page.locator("#agent")).to_have_value("simple")   # 3構成: 既定の構成id   # 初回 load() の完了を待つ
 
-    page.locator("#sysprompt").fill("保留GET確認用の回答方針")
+    page.locator("#okey").fill("sk-held-get")
     page.locator("#save").click()
 
     # PUT 自体は完了する（records に積まれる）はずだが、保留中の GET /settings のせいで load() が
@@ -686,255 +423,21 @@ def test_settings_save_waits_for_reload_before_showing_success(page, web_base_ur
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
     expect(page.locator("#save")).not_to_be_disabled()
-    # ラベル文字列比較ではなく属性で確認: 選択中 option がちょうど1つ・data-legacy 属性が無い。
-    checked = page.locator("#bmodel option:checked")
-    expect(checked).to_have_count(1)
-    assert checked.get_attribute("data-legacy") is None
-
-
-def test_search_helper_toggle_saves_correctly_after_prior_reload_failure(page, web_base_url):
-    """保存後の自動 `load()`（GET /settings 再読込）が失敗しても、直前の PUT 自体は正しく送信
-    されており、以後の操作・保存は独立して正しく動く（「保存はできたが再読込に失敗した」表示の
-    あとも2回目の保存が正しい値で送られる）。"""
-    import json
-
-    from playwright.sync_api import expect
-
-    settings = {**mock_api.SETTINGS_RESP, "search_helper": ""}
-    records = install_api_mocks(page, settings=settings)
-
-    get_count = {"n": 0}
-
-    def fail_second_settings_get(route):
-        if route.request.method != "GET":
-            route.fallback()
-            return
-        get_count["n"] += 1
-        if get_count["n"] == 2:   # 1回目=初期 load()・2回目=1回目保存後の自動 load() だけ失敗させる
-            route.fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "boom"}))
-            return
-        route.fallback()
-
-    page.route("**/settings", fail_second_settings_get)
-    page.goto(f"{web_base_url}/settings.html")
-    expect(page.locator("#search_helper")).to_have_value("")
-
-    page.locator("#search_helper").select_option("ollama")
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("再読込に失敗しました")
-    assert records["settings_put"][-1]["search_helper"] == "ollama"
-
-    page.locator("#search_helper").select_option("")
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["search_helper"] == ""
-
-
-def test_search_helper_invalid_value_preserved_and_not_cleared_by_unrelated_save(page, web_base_url):
-    """保存済み `search_helper` が不正な値（旧データ・env 誤記等）のとき、設定画面は黙って
-    ''（使わない）に見せかけず「不正な値」として保持する option を表示する。この状態のまま
-    無関係な項目（system_prompt）だけを保存しても search_helper は送らない（未指定＝変更しない）
-    ＝黙って解除されない（正規化不一致の是正・Bedrock モデル select の legacy option と同型）。"""
-    from playwright.sync_api import expect
-
-    settings = {**mock_api.SETTINGS_RESP, "search_helper": "gemini"}
-    records = install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#search_helper")
-    expect(sel).to_have_value("gemini")
-    checked = sel.locator("option:checked")
-    expect(checked).to_contain_text("不正な値")
-
-    page.locator("#sysprompt").fill("テスト用の方針")
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["search_helper"] is None
-
-
-def test_search_helper_legacy_model_note_says_unused_not_prioritized(page, web_base_url):
-    """個人設定に残る旧 `search_helper_model` の値は、実行時にはもう一切使われない（管理者の
-    使えるモデル一覧の既定が適用される）。注記はこの1種類のみで、「優先されています」という
-    誤った文言の分岐は無い。"""
-    from playwright.sync_api import expect
-
-    settings = {**mock_api.SETTINGS_RESP, "search_helper": "openai", "search_helper_model": "gpt-4o-mini"}
-    install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    note = page.locator("#search-helper-legacy-note")
-    expect(note).to_be_visible()
-    expect(note).to_contain_text("現在使われません")
-    expect(note).not_to_contain_text("優先")
-
-
-def test_settings_bedrock_stateful_reload_drops_unselected_fetch_options_and_keeps_reverified(page, web_base_url):
-    """RV LOW（N5・2026-07-16 Codex RV 3巡目再検証）: 前回のテスト（同一 DOM で `load()` を複数回
-    走らせる確認）は `GET /settings` の応答が静的固定 mock だったため、fetch で追加された「legacy
-    ではない」stale な option が消えなくても検知できない false green だった（旧実装＝
-    `option[data-legacy]` だけを除去する版でも通ってしまう）。ここでは `PUT /settings`／verify が
-    状態を更新し `GET /settings` がそれを返す状態持ち mock（`mock_api._json`/`_post_json` を再利用・
-    mock_api の既存パターンに従う）で検証する:
-      (a) fetch で複数の非静的 option（X/Y/Z）を作る→1つ（X）だけ選んで保存→`save()` 内の自動
-          `load()` 完了後に、選ばなかった Y/Z が消えていること（静的2択＋X の3件のみ残る）。
-      (b) サーバ側の保存値が「未検証」に変わった場合に `load()` を呼び直すと legacy 表示へ正しく
-          再分類され、そこから verify → 保存すると、以後の自動 `load()` でも非 legacy のまま残る
-          こと。
-    """
-    from playwright.sync_api import expect
-
-    # 状態持ち mock: PUT /settings と verify がこの dict/set を更新し、GET /settings が都度これを
-    # 返す（mock_api.SETTINGS_RESP を土台にする＝キー集合は本物の応答形と揃える）。
-    # 4構成（2026-08-15）: Bedrock を扱うため、追加AIを有効化した環境の応答を土台にする。
-    state = dict(mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS)
-    known_ids = {"us.anthropic.claude-x-v1:0", "us.anthropic.claude-y-v1:0", "us.anthropic.claude-z-v1:0"}
-    labels = {"us.anthropic.claude-x-v1:0": "Model X", "us.anthropic.claude-y-v1:0": "Model Y",
-             "us.anthropic.claude-z-v1:0": "Model Z"}
-
-    def stateful_handler(route):
-        request = route.request
-        method = request.method.upper()
-        path = urlparse(request.url).path
-        if method == "GET" and path == "/settings":
-            mock_api._json(route, dict(state))
-            return
-        if method == "PUT" and path == "/settings":
-            body = mock_api._post_json(request)
-            mid = body.get("bedrock_model")
-            if mid is not None:
-                state["bedrock_model"] = mid
-                state["bedrock_model_known"] = mid in known_ids
-                state["bedrock_model_label"] = labels.get(mid, mid)
-            mock_api._json(route, dict(state))
-            return
-        if method == "POST" and path == "/settings/bedrock-models/verify":
-            body = mock_api._post_json(request)
-            mid = body.get("model_id") or ""
-            known_ids.add(mid)
-            labels[mid] = f"{mid}（検証済み）"
-            mock_api._json(route, {"ok": True, "id": mid, "label": labels[mid]})
-            return
-        route.fallback()   # 対象外（他パス／他メソッド）は install_api_mocks の catch-all に委譲
-
-    install_api_mocks(page, bedrock_models={"models": [
-        {"id": "us.anthropic.claude-x-v1:0", "label": "Model X"},
-        {"id": "us.anthropic.claude-y-v1:0", "label": "Model Y"},
-        {"id": "us.anthropic.claude-z-v1:0", "label": "Model Z"},
-    ], "error": None})
-    # install_api_mocks 後に登録＝より具体的な2パターンが catch-all より先に評価される
-    # （Playwright は最後に登録した route を先に評価・comment 例は mock_api.py の
-    # 「page.route("**/chat/turns/running", ...) で上書きする」と同じ流儀）。
-    page.route("**/settings", stateful_handler)
-    page.route("**/settings/bedrock-models/verify", stateful_handler)
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel.locator("option")).to_have_count(2)   # 初期は静的2択（既定値は静的の1つ）
-
-    page.locator("#bmodel-fetch").click()
-    expect(page.locator("#bmodel-fetch-res")).to_contain_text("3件のモデルを取得しました")
-    expect(sel.locator("option")).to_have_count(5)   # 静的2＋列挙3件（X/Y/Z）
-
-    sel.select_option("us.anthropic.claude-x-v1:0")
-    page.locator("#save").click()          # save() 内で自動的に load() が走る（同一 DOM・reload 無し）
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-
-    # (a) 旧実装（legacy option だけ除去）なら Y・Z が残ったまま＝5件のまま。新実装は静的2＋X の3件。
-    expect(sel.locator("option")).to_have_count(3)
-    expect(sel.locator("option[value='us.anthropic.claude-y-v1:0']")).to_have_count(0)
-    expect(sel.locator("option[value='us.anthropic.claude-z-v1:0']")).to_have_count(0)
-    expect(sel).to_have_value("us.anthropic.claude-x-v1:0")
-    # RV LOW（R4-3・2026-07-16 Codex RV 4巡目再検証）: save() は load() 完了を待ってから「保存
-    # しました」を表示するようになった（await load()）。「保存しました」が見えている時点で DOM の
-    # 再構築も完了しているはずなので、選択中の option がちょうど1つ・非 legacy であることまで
-    # 確認する（N5 の残余レース＝「表示は保存済みだが DOM 側の再構築が追いついていない」を検知）。
-    x_opts = sel.locator("option[value='us.anthropic.claude-x-v1:0']")
-    expect(x_opts).to_have_count(1)
-    expect(x_opts).not_to_contain_text("旧設定")
-
-    # (b) サーバ側の保存値が「未検証」に変わった場合の再分類。save() 経由だと選択中の値（X）を
-    # PUT してしまい state を上書きしてしまうため、load() を直接呼んで「サーバ側の値が別セッション
-    # 等で変わった」再読込を再現する（settings.js はクラシック script ＝ load はグローバル関数）。
-    legacy_id = "us.anthropic.claude-legacy-v1:0"
-    state["bedrock_model"] = legacy_id
-    state["bedrock_model_known"] = False
-    state["bedrock_model_label"] = legacy_id
-    page.evaluate("load()")
-    expect(sel.locator("option[value='" + legacy_id + "']")).to_contain_text("旧設定")
-
-    page.locator("#bmodel-manual").fill(legacy_id)
-    page.locator("#bmodel-verify").click()
-    expect(page.locator("#bmodel-verify-res")).to_contain_text("検証OK")
-    expect(sel.locator("option[value='" + legacy_id + "']")).not_to_contain_text("旧設定")
-
-    page.locator("#save").click()          # 選択中は verify 済みの legacy_id ＝ PUT はそのまま送れる
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    # R4-3: ここでも「保存しました」＝ load() 完了後、選択中 option がちょうど1つ・非 legacy。
-    legacy_opts = sel.locator("option[value='" + legacy_id + "']")
-    expect(legacy_opts).to_have_count(1)
-    expect(legacy_opts).not_to_contain_text("旧設定")
-    expect(sel).to_have_value(legacy_id)
-
-
-def test_settings_bedrock_known_saved_value_shows_label_not_legacy(page, web_base_url):
-    """`bedrock_model_known: true` の保存値は「旧設定」表示にならず、サーバ整形済みラベルで通常
-    option として表示され、再選択なしでもそのまま保存できる（known＝正当な値の証明）。"""
-    from playwright.sync_api import expect
-
-    known_id = "jp.anthropic.claude-sonnet-4-6-20260101-v1:0"
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "bedrock_model": known_id, "bedrock_model_known": True,
-               "bedrock_model_label": "Claude Sonnet 4.6（JP 推論プロファイル）"}
-    records = install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel.locator("option")).to_have_count(3)
-    opt = sel.locator("option[value='" + known_id + "']")
-    expect(opt).to_contain_text("Claude Sonnet 4.6（JP 推論プロファイル）")
-    expect(opt).not_to_contain_text("旧設定")
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["bedrock_model"] == known_id   # known は legacy 扱いされない
-
-
-def test_settings_bedrock_unknown_saved_value_stays_legacy_and_sends_null(page, web_base_url):
-    """未検証（`bedrock_model_known: false`）の保存値は従来どおり「旧設定」表示のままになり、
-    再検証せずそのまま保存すると `bedrock_model` は null で送信される（allowlist を偽装できない・
-    サーバ側は現在保存中の値を保つ）。"""
-    from playwright.sync_api import expect
-
-    unknown_id = "us.anthropic.claude-unknown-v1:0"
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "bedrock_model": unknown_id, "bedrock_model_known": False,
-               "bedrock_model_label": unknown_id}
-    records = install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    sel = page.locator("#bmodel")
-    expect(sel.locator("option[value='" + unknown_id + "']")).to_contain_text("旧設定")
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["settings_put"][-1]["bedrock_model"] is None
 
 
 # ===== 個人 API キー欄の表示/非表示 =====
 
 def test_personal_keys_disabled_hides_key_inputs_and_shows_note(page, web_base_url):
     """`personal_api_keys_allowed=false`（管理者が個人キーを許可していない・既定）のとき、
-    3種のキー入力欄は隠れ、「キーは管理者が設定します」の注記が出る。"""
+    キー入力欄は隠れ、「キーは管理者が設定します」の注記が出る。"""
     from playwright.sync_api import expect
 
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "personal_api_keys_allowed": False}
+    settings = {**mock_api.SETTINGS_RESP, "personal_api_keys_allowed": False}
     install_api_mocks(page, settings=settings)
     page.goto(f"{web_base_url}/settings.html")
 
     expect(page.locator("#okey-row")).to_be_hidden()
     expect(page.locator("#okey-disabled-note")).to_be_visible()
-    expect(page.locator("#gkey-row")).to_be_hidden()
-    expect(page.locator("#gkey-disabled-note")).to_be_visible()
-    expect(page.locator("#bkey-row")).to_be_hidden()
-    expect(page.locator("#bkey-disabled-note")).to_be_visible()
 
 
 def test_personal_keys_allowed_shows_key_inputs(page, web_base_url):
@@ -946,22 +449,6 @@ def test_personal_keys_allowed_shows_key_inputs(page, web_base_url):
 
     expect(page.locator("#okey-row")).to_be_visible()
     expect(page.locator("#okey-disabled-note")).to_be_hidden()
-
-
-def test_a7_non_selected_cloud_provider_hides_key_row_even_when_personal_keys_allowed(page, web_base_url):
-    """personal_api_keys_allowed=true でも、選択中でないクラウド AI（A7）のキー欄は隠す
-    （A6 のみでなく A7 の選択状態も見る）。"""
-    from playwright.sync_api import expect
-
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "cloud_provider": "gemini"}
-    install_api_mocks(page, settings=settings)
-    page.goto(f"{web_base_url}/settings.html")
-
-    expect(page.locator("#okey-row")).to_be_hidden()
-    expect(page.locator("#okey-disabled-note")).to_be_visible()
-    expect(page.locator("#okey-disabled-note")).to_contain_text("選択されていません")
-    expect(page.locator("#gkey-row")).to_be_visible()
-    expect(page.locator("#gkey-disabled-note")).to_be_hidden()
 
 
 # ===== 外部連携（自分の API キー）=====

@@ -211,12 +211,6 @@ def test_resolve_parent_return_reports_tier_for_every_doc_never_drops():
     assert out == [{"doc_id": "missing.xlsx", "tier": "chunk", "text": "X", "chunk_ids": ["c1"]}]
 
 
-def test_parent_return_enabled_always_true_no_env_toggle():
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・常時 True（env に一切
-    左右されない）。"""
-    assert rag_parent_return.parent_return_enabled() is True
-
-
 def test_apply_to_hits_disabled_returns_input_unchanged(monkeypatch):
     """`parent_return_enabled` は今も内部シームとして残るため、直接差し替えて False 分岐を
     引き続き検証する（env では OFF にできない）。"""
@@ -228,17 +222,6 @@ def test_apply_to_hits_disabled_returns_input_unchanged(monkeypatch):
 def test_apply_to_hits_passes_through_non_rag_hits():
     hits = [{"doc_id": "legacy.txt", "line": 3, "text": "no chunk_id here", "score": 1.0}]
     assert rag_parent_return.apply_to_hits("w", hits) == hits
-
-
-def test_excerpt_budget_bytes_default_and_env_bounds(monkeypatch):
-    monkeypatch.delenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", raising=False)
-    assert rag_parent_return.excerpt_budget_bytes() == rag_parent_return.DEFAULT_BUDGET_BYTES
-    monkeypatch.setenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", "not-a-number")
-    assert rag_parent_return.excerpt_budget_bytes() == rag_parent_return.DEFAULT_BUDGET_BYTES
-    monkeypatch.setenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", "999999999999")   # out of range
-    assert rag_parent_return.excerpt_budget_bytes() == rag_parent_return.DEFAULT_BUDGET_BYTES
-    monkeypatch.setenv("SHERPA_CHAT_ES_EXCERPT_BUDGET_BYTES", "65536")
-    assert rag_parent_return.excerpt_budget_bytes() == 65536
 
 
 # ---- 実配線: lens_service.run_qa / chat_service._es_citations ----
@@ -287,8 +270,8 @@ def test_excerpts_module_does_not_import_agentic_search():
 
 
 def test_rag_parent_return_module_has_no_forbidden_imports():
-    """`search_service.py` の分離境界（api/agents/chat_service/chat_router/grep_tool を import しない）
-    を共有部品側も満たすことを確認する——`search_service.py` から import できる前提。"""
+    """`parts/read/fused_search.py` の分離境界（api/agents/chat_service/chat_router/grep_tool を import しない）
+    を共有部品側も満たすことを確認する——`parts/read/fused_search.py` から import できる前提。"""
     import sherpa.rag_parent_return as m
     src_globals = set(m.__dict__.keys())
     for forbidden in ("api", "agents", "chat_service", "chat_router", "grep_tool", "agentic_search"):

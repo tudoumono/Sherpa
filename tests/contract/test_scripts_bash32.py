@@ -1,9 +1,4 @@
-"""運用スクリプトが macOS 標準の bash 3.2 で動く書き方に留まっていることの契約。
-
-macOS の /bin/bash は 3.2 のまま更新されず、`#!/usr/bin/env bash` は Homebrew の bash が無ければそれを拾う。
-bash 4 以降の構文（連想配列など）は `bash -n` の構文検査では見つからず、実行時に初めて落ちるため、
-字面で検出する。Linux 専用と割り切ったスクリプトだけを対象外にする。
-"""
+"""運用スクリプトが macOS 標準の bash 3.2 で動く書き方に留まっていることの契約。"""
 from __future__ import annotations
 
 import re
@@ -12,11 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 
-# Linux（Ubuntu/WSL2）専用のスクリプト。macOS では使わない（gate 系は flock を使う開発用）。
+# Linux（Ubuntu/WSL2）専用のスクリプト。macOS では使わない（apt・dpkg・useradd 等を使う）。
 LINUX_ONLY = frozenset({
     "install_offline_kit.sh", "make_offline_kit.sh", "verify_offline_kit_apt.sh",
-    "setup-runtime-users.sh", "setup-codex-sandbox.sh",
-    "gate_common.sh", "gate-integration.sh",
+    "setup-runtime-users.sh",
 })
 
 # bash 4 以降でしか動かない構文（名前・正規表現）。

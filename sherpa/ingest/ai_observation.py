@@ -1,8 +1,9 @@
-"""OCR/VLMの結果をCanonical Evidenceと分離して保存するAI Observation Set契約。
+"""OCR/VLM の結果を Canonical Evidence と分けて保存する AI Observation Set。
 
-Observation Setは原本Evidenceを上書きしない。入力画像、対象Evidence、provider/model、prompt、前処理、
-応答hashと個々の観測をcontent-addressedな別成果物として固定する。RAG rendererは明示的に渡された
-1つのSetだけを参照し、``use_for_answer``かつ最低信頼度以上の観測だけを「AI観測」と明示して追加する。
+原本 Evidence は上書きしない。入力画像・対象 Evidence・provider/model・prompt・前処理・応答 hash と
+個々の観測を、content-addressed な別成果物として固定する。
+RAG 側は ``use_for_answer`` かつ最低信頼度以上の観測だけを「AI観測」と明示して追加する。
+設計: docs/design/rag.md「OCR（非同期・隔離ワーカー）」
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ class ObservationInput:
     pixel_size: list[int] | None = None
     input_kind: str = "asset"
     render_profile: dict[str, Any] | None = None
-    # WMF/EMF 内のビットマップを読んだとき、その親メタファイル（Evidence 要素が持つ資産）の hash。
+    # WMF/EMF 内のビットマップを読んだときの、親メタファイルの hash
     parent_asset_sha256: str | None = None
 
 
@@ -95,7 +96,7 @@ def _content_payload(observation_set: AIObservationSet) -> dict:
     payload = asdict(observation_set)
     payload.pop("observation_set_hash", None)
     for item in payload["inputs"]:
-        if item.get("parent_asset_sha256") is None:       # 親が無い入力のhashは従来のまま
+        if item.get("parent_asset_sha256") is None:       # 親が無い入力は項目ごと外す
             item.pop("parent_asset_sha256", None)
     return payload
 
@@ -109,16 +110,12 @@ def _stable_id(prefix: str, *parts: Any) -> str:
 
 
 def evidence_binding_id(ir: evidence_ir.EvidenceIR) -> str:
-    """派生物全体のgeneration IDが無い呼出側向けに、Evidence bytesへの拘束IDを返す。
-
-    製品workerは``derived_generation_id``を明示して上書きする。評価や単体利用では、このIDでも
-    Observationを別のEvidence内容へ誤接続できない。
-    """
+    """派生物全体の generation ID が無い呼出側向けに、Evidence bytes への拘束 ID を返す。"""
     return hashlib.sha256(evidence_ir.to_json_str(ir).encode("utf-8")).hexdigest()
 
 
 def _target_asset_hashes(target: evidence_ir.EvidenceElement) -> set[str]:
-    """Evidence要素に直接または複数asset配列で拘束された全ラスタhashを返す。"""
+    """Evidence 要素に直接または複数 asset 配列で拘束された全ラスタ hash を返す。"""
     values: list[Any] = [target.extension.get("asset_sha256")]
     assets = target.extension.get("assets")
     if isinstance(assets, list):
@@ -145,10 +142,9 @@ def build(
     canonical_generation_id: str | None = None,
     engine_profile_hash: str | None = None,
 ) -> AIObservationSet:
-    """provider応答を固定したObservation Setへ正規化する。
+    """provider 応答を固定した Observation Set へ正規化する。
 
-    ``inputs``と``observations``はprovider固有JSONを直接受けず、呼出adapterが共通fieldへ正規化した値を渡す。
-    IDは内容から決定的に生成し、再実行結果は異なるresponse hashとSet hashになる。
+    ``inputs``/``observations`` は呼出 adapter が共通 field へ正規化した値を渡す。ID は内容から決定的に生成する。
     """
     built_inputs: list[ObservationInput] = []
     for index, item in enumerate(inputs, start=1):
@@ -174,7 +170,7 @@ def build(
     built_observations: list[AIObservation] = []
     for index, item in enumerate(observations, start=1):
         input_id = str(item["input_id"])
-        # OCRの識別子、空白、改行を原文どおり保持する。空文字判定だけvalidation側でstripして行う。
+        # OCR の識別子・空白・改行は原文どおり保持（空判定だけ validation 側で strip する）
         text = str(item.get("text") or "")
         observation_id = str(item.get("observation_id") or _stable_id(
             "ai-observation", ir.source.content_hash, input_id, item.get("kind"), text,
@@ -232,28 +228,13 @@ def merge_sets(
     *,
     ir: evidence_ir.EvidenceIR,
 ) -> AIObservationSet:
-    """複数アーム（VLM・OCR等）の観測Setを、単一Set契約のレンダラ（`evidence_render.render`）へ
-    渡せる1つのSetへ合流する（O1・L8の器はSetを1つしか受けない）。
+    """複数アーム（VLM・OCR 等）の観測 Set を、1 つの Set へ合流する（レンダラは Set を 1 つしか受けない）。
 
-    ``sets``が1件なら（新規Setを作らず）そのまま返す——単一由来のときは`observation_set.provider`/
-    `.model`が正確な出所を表すという既存契約（`evidence_render._ai_observation_records`が
-    Setレベルのprovider/modelを本文へ埋め込む）を壊さない。2件以上のときだけ合成Setを組む。
-
-    各観測の真の出所（元Setのprovider/model/model_revision/execution_mode/observation_set_hash）は
-    `attributes["origin_*"]`へ書き足して保持する——合成Set自体のprovider/model（複数由来の連結）は
-    本文の文言としては粗いが、`record["ai_observation"]["attributes"]`経由で由来を復元できる
-    （どちら由来かのメタが失われない・O1 要件）。
-
-    同一``input_id``が複数Setに現れた場合（同じ画像要素をVLMとOCRの両方が選定した場合等）、
-    内容（asset_sha256等）が一致する前提で1つへ畳む——不一致は取り違えとみなし例外にする。
-
-    ``source_content_hash``（同じ原本 bytes に拘束された観測か）が食い違うSet同士は合流できない
-    （異なる原本の観測を混ぜない）。``canonical_generation_id``は意図的に**比較しない**——
-    アームごとに異なる採番方式を使う（VLM＝`evidence_binding_id(ir)`＝文書内容のhash・
-    OCR＝world署名由来のworld単位generation id）ため、同じ原本・同じ瞬間の観測でも一致しない
-    のが正常であり、一致を要求すると VLM/OCR は実運用で決して合流できなくなる。合成Set自身の
-    ``canonical_generation_id``は、``ir``から`evidence_binding_id`で改めて決定的に採番する
-    （元Setのどちらの値でもない、この合流結果に固有のID）。
+    ① ``sets`` が 1 件ならそのまま返す。
+    ② 各観測の出所（元 Set の provider/model/model_revision/execution_mode/hash）を ``attributes["origin_*"]`` へ保持する。
+    ③ 同一 ``input_id`` は内容が一致する前提で 1 つへ畳み、不一致は例外にする。
+    ``source_content_hash`` が食い違う Set は合流できない。``canonical_generation_id`` は
+    アームごとに採番方式が違うため比較せず、合成 Set 側で ``ir`` から採番し直す。
     """
     if not sets:
         raise ValueError("at least one AI Observation Set is required")
@@ -404,7 +385,7 @@ def validation_errors(
 
 
 def answer_observations(observation_set: AIObservationSet) -> list[AIObservation]:
-    """Semantic/RAG viewへ採用できる明示承認済み観測だけを返す。"""
+    """RAG view へ採用できる明示承認済みの観測だけを返す。"""
     return [
         item for item in observation_set.observations
         if item.use_for_answer and item.confidence >= MIN_ANSWER_CONFIDENCE

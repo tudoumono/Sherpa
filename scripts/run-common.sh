@@ -262,12 +262,12 @@ healthz_ok() {
 # ---------------------------------------------------------------------------
 # 起動時ログローテーション（LOG-2・2026-09-03）: 起動のたびに run/caddy ログを空へ切り詰める
 # （旧 `: > "$LOG"`）と、前回の障害調査ができない。既存ログが非空ならタイムスタンプ付きへ退避して
-# から空で作り直し、同ファミリー（退避ファイル）の保持数（SHERPA_LOG_KEEP・既定10）超過分だけ
+# から空で作り直し、同ファミリー（退避ファイル）の保持数（既定10）超過分だけ
 # 古い順に削除する。命名規約は `<stem>-YYYYmmdd-HHMMSS[-N]<拡張子>`——Python 側
 # （`sherpa/log_setup.py::rotate_and_prune`・サブシステム専用ログの退避）と揃えている。
 # ---------------------------------------------------------------------------
 
-# $1=ログファイル。呼び出し側が事前に mkdir -p している前提（start.sh は RUN_DIR を作成済み）。
+# $1=ログファイル、$2=保持数（省略時 10）。呼び出し側が事前に mkdir -p している前提（start.sh は RUN_DIR を作成済み）。
 sherpa_rotate_log() {
   local log="$1" dir base stem suffix ts archived n
   dir="$(dirname "$log")"
@@ -288,15 +288,14 @@ sherpa_rotate_log() {
     mv "$log" "$archived"
   fi
   : > "$log"
-  sherpa_prune_log_family "$log"
+  sherpa_prune_log_family "$log" "${2:-10}"
 }
 
-# $1=ログファイル。同ファミリーの退避ファイル（$1 と同じ dir・stem・拡張子で、退避の命名規約に
+# $1=ログファイル、$2=保持数（省略時 10）。同ファミリーの退避ファイル（$1 と同じ dir・stem・拡張子で、退避の命名規約に
 # 厳密一致するものだけ＝無関係ファイルを消さないガード）を保持数超過分だけ古い順に削除する。
 sherpa_prune_log_family() {
   local log="$1" dir base stem suffix keep f files=() count excess i
-  sherpa_env_default SHERPA_LOG_KEEP
-  keep="${SHERPA_LOG_KEEP:-10}"
+  keep="${2:-10}"
   case "$keep" in ''|*[!0-9]*) keep=10 ;; esac
   dir="$(dirname "$log")"
   base="$(basename "$log")"

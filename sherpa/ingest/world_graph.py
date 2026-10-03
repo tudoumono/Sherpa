@@ -1,24 +1,14 @@
-"""鏡モデルのグラフ構築（03-鏡モデル.md・再プラン手順2-3）。
+"""鏡モデルのグラフ構築（資料フォルダの走査からノード・エッジの生成まで）。
 
-登録ディレクトリ＝**1つの世界**を走査し、**パス同一性**のノードと**同一 top_scope 内の最近傍**で解決した
-構造エッジ（COPIES/INVOKES/CONTAINS）を作る。各ノードは検索スコープのメタデータ
-（`world_id / top_scope / phase / category / path`）を持つ（§3）。世代をまたぐ対応/意味エッジ
-（CORRESPONDS_TO 等）は別途（影響 traversal 外）。
-
-本採用（カットオーバー済）: 旧 `@version` 経路（merge/neo4j_load/semantic）は撤去。台帳/Neo4j/impact は
-すべて本モジュールのパス同一性グラフに乗る。言語ごとの定義/参照抽出（Pass1/Pass2）は
-`sherpa.ingest.analyzers`（`registry` が拡張子→アナライザ解決の単一の真実源）に委譲し、本モジュールは
-名前解決（`_resolve_nearest`）・cid 組み立てなど言語非依存の共通層のみを持つ。
-特定テーマの名前は持たない（語彙はデータ＝ファイル/パス由来）。
-
-（2026-09-04-グラフのソース正典化.md §4）: 意味層フル抽出（L 抽出・`_load_semantic`）・
-REALIZES 橋（`_load_concepts`/`_load_auto_concepts`・手動/自動）は概念ごと撤去。事前計算に残すのは
-決定的（再現100%）に計算できる構造（骨格＝Pass1/Pass2＋言及エッジ＝Pass3）だけ——業務語からコードへの
-入口はクエリ時のエージェント（文書 grep→辞書ノード）に委ねる（§2）。
-
-Pass3（2026-09-04-グラフのソース正典化.md §2）: Pass1 の定義索引をそのまま辞書として資料文書
-（`branch=="office"`）の本文と決定的に突合し、`Document -DOCUMENTS(via="mention")-> コード` を張る
-（LLM ゼロ・影響 traversal 外・世代をまたいでよい制度化された例外＝`_mention_pass` 参照）。
+資料フォルダ（登録ディレクトリ）を走査し、パス同一性のノードと、同一 top_scope 内の最近傍で解決した
+構造エッジ（COPIES/INVOKES/CONTAINS/ACCESSES）を作る。各ノードは検索スコープのメタデータ
+（`world_id / top_scope / phase / category / path`）を持つ。
+① Pass1: 言語アナライザ（`sherpa.ingest.analyzers`）で定義を集める。
+② Pass2: 参照を同 top_scope 内の最近傍で解決して構造エッジを張る。
+③ Pass3: 定義索引を辞書として資料文書の本文と決定的に突合し、`Document -DOCUMENTS(via="mention")-> コード` を張る
+   （世代をまたいでよい例外・影響 traversal の対象外）。
+LLM は使わない。言語ごとの抽出はアナライザ側、本モジュールは名前解決・cid 組み立てなど言語非依存の共通層。
+設計: docs/design/scope.md「リンクの解決：構造エッジ・対応エッジ・言及エッジ」
 """
 from __future__ import annotations
 
@@ -28,6 +18,7 @@ import os
 import posixpath
 import re
 import stat as stat_mod
+from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
 from .. import corpus_docs, doc_text, grep_tool, scope_infer, text_encoding, worlds
@@ -53,7 +44,7 @@ def _tree_distance(a: str, b: str) -> int:
 
 
 def _cid(label: str, world: str, rel: str, name: str) -> str:
-    """ファイル由来＝パス同一性の canonical_id（複製は別ノード・MIRROR-MODEL §2.1）。"""
+    """ファイル由来＝パス同一性の canonical_id（複製は別ノード）。"""
     return f"{label.lower()}:{world}:{rel}#{name}"
 
 
@@ -70,8 +61,8 @@ def _top(rel: str):
 def _resolve_nearest(defs, kind, name, ref_rel):
     """`defs[(kind,name)]` の候補 rel から ref_rel に最も近いものを返す。
 
-    **同一 top_scope（世代）に限定**してから最近傍（MIRROR-MODEL §2.2/§2.3＝構造エッジは世代をまたがない）。
-    戻り `(rel | None, status)`＝`status` は `''`(解決) / `'ambiguous'`(同距離複数) / `'cross_scope'`(同世代に定義無し)。
+    同一 top_scope（世代）に限定してから最近傍を選ぶ。戻りは `(rel | None, status)`。
+    `status` は `''`(解決) / `'ambiguous'`(同距離複数) / `'cross_scope'`(同世代に定義無し)。
     """
     cands = defs.get((kind, name))
     if not cands:
@@ -87,13 +78,11 @@ def _resolve_nearest(defs, kind, name, ref_rel):
 
 
 def _resolve_qualified(qualified_defs, kind, name, ref_rel):
-    """完全修飾名（アナライザ拡張）の解決: `qualified_defs[(kind,name)]`（`[(rel,実名), ...]`）
-    を同一 top_scope に絞り、パス距離で最近傍を解決する（**同一性＝パス**の帰結として同じ完全修飾名が
-    複数 rel に存在し得る——`_resolve_nearest` と同じ規律で最短距離を採用し、最短距離が複数あれば
-    任意選択せず `'ambiguous'` を返す）。戻り `(rel|None, 実名|None, status)`＝`status` は
-    `''`(解決) / `'ambiguous'`(同距離複数) / `'cross_scope'` / `'unresolved'`（`unresolved`/`cross_scope`
-    は呼び出し側が単純名フォールバックへ倒す・qualified_fallback を flags に記録する。`ambiguous` は
-    フォールバックせずそのまま flags へ記録する）。
+    """完全修飾名の解決: `qualified_defs[(kind,name)]`（`[(rel,実名), ...]`）を同一 top_scope に絞り、パス距離で最近傍を選ぶ。
+
+    最短距離が複数なら任意選択せず `'ambiguous'`。戻りは `(rel|None, 実名|None, status)`。
+    `status` は `''` / `'ambiguous'` / `'cross_scope'` / `'unresolved'`（`unresolved`/`cross_scope` は呼び出し側が
+    単純名フォールバックへ倒して qualified_fallback を flags に記録し、`ambiguous` はそのまま flags へ記録する）。
     """
     cands = qualified_defs.get((kind, name))
     if not cands:
@@ -110,20 +99,12 @@ def _resolve_qualified(qualified_defs, kind, name, ref_rel):
 
 
 def _resolve_nearest_keyed(index, analyzer_name, kind, name, ref_rel):
-    """単純名での children 解決（アナライザ拡張 S6・波3 C↔VB 分離 RV＝手続き型言語の関数呼び出し
-    解決共通）: `index[(analyzer_name,kind,name)]`（`[(rel, 実際の cid_key, c_kind|None), ...]`）を
-    同一 top_scope に絞り、パス距離で最近傍を解決する。`_resolve_qualified` と同型だが、材料が
-    完全修飾名ではなく「表示名→実際の cid_key」の対応表である点が異なる。索引キーに
-    `analyzer_name` を含めるのは、C・VB のように複数アナライザが単純名解決を要求する場合に
-    異なる言語間で同名の単純名が誤接続しないようにするため（登録・参照とも同一アナライザ内だけで
-    解決する）。
+    """単純名での children 解決（手続き型言語の関数呼び出し解決共通）。
 
-    `c_kind == "definition"` の候補が1件でもあれば、`"declaration"`（宣言のみ）は候補から外し
-    定義側だけで最近傍を決める（`.c` の定義を `.h` の宣言より優先する・アナライザ拡張§9——
-    実装が同一ディレクトリに無ければ宣言側にフォールバックする）。定義候補が1件も無ければ
-    従来どおり全候補（宣言のみ）で最近傍を決める。優先した側の中で同距離複数（同一 rel に
-    複数の実キーが対応する場合を含む）は任意選択せず `'ambiguous'` にする。
-    戻り `(rel|None, 実キー|None, status)`。
+    `index[(analyzer_name,kind,name)]`（`[(rel, 実際の cid_key, c_kind|None), ...]`）を同一 top_scope に絞り、
+    パス距離で最近傍を選ぶ。索引キーに `analyzer_name` を含め、他言語の同名と誤接続しない。
+    `c_kind == "definition"` の候補があれば `"declaration"` を外して定義側だけで決める（無ければ全候補）。
+    同距離複数は任意選択せず `'ambiguous'`。戻りは `(rel|None, 実キー|None, status)`。
     """
     cands = index.get((analyzer_name, kind, name))
     if not cands:
@@ -144,24 +125,18 @@ def _resolve_nearest_keyed(index, analyzer_name, kind, name, ref_rel):
 
 
 def _simple_name_calls(analyzer_name) -> bool:
-    """`analyzer_name` のアナライザが単純名の呼び出し解決（children への2段目）を要求するか
-    （`Analyzer.resolves_calls_by_simple_name`）。未登録名は False。"""
+    """`analyzer_name` のアナライザが単純名の呼び出し解決（children への 2 段目）を要求するか。未登録名は False。"""
     for a in analyzer_registry.known_analyzers():
         if a.name == analyzer_name:
             return bool(getattr(a, "resolves_calls_by_simple_name", False))
     return False
 
 def _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name):
-    """C の `#include "path"` 1段目解決（アナライザ拡張 §4(a)/§12）: パス区切りを含む
-    `include_path` を参照元 `ref_rel` からの相対パスとして解決し、その rel_path が実際に `name`
-    （拡張子込みファイル名）の主体であれば一意にそのまま採用する——パス自体が一意な指定のため
-    `_resolve_nearest` の距離計算・曖昧判定は経由しない。同一 top_scope を跨ぐ解決はしない
-    （MIRROR-MODEL §2.2/§2.3）。見つからなければ `None`（呼び出し側が拡張子込み basename の
-    同一 top_scope 内最近傍へフォールバックする＝2段目）。
+    """C の `#include "path"` の 1 段目解決: パス区切りを含む `include_path` を参照元 `ref_rel` からの相対パスとして解決する。
 
-    `include_path` は区切りを `/` に正規化してから渡される想定（アナライザ入口側・§4(a)）だが、
-    ここでも防御的に `\\`→`/` を **`normpath` の前に**行う——`posixpath.normpath` は `\\` を
-    区切りとして扱わないため、後から置換しても `..` の畳み込みが正しく行われない。
+    その rel_path が実際に `name`（拡張子込みファイル名）の主体であれば一意に採用し、距離計算・曖昧判定は経由しない。
+    同一 top_scope を跨ぐ解決はしない。見つからなければ `None`（呼び出し側が basename の最近傍へフォールバックする）。
+    区切りは `normpath` の前に `\\`→`/` へ直す。
     """
     base_dir = ref_rel.rsplit("/", 1)[0] if "/" in ref_rel else ""
     joined = f"{base_dir}/{include_path}" if base_dir else include_path
@@ -171,12 +146,41 @@ def _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name):
     return candidate if rel_name.get(candidate) == (kind, name) else None
 
 
+def _build_path_suffix_index(rel_name):
+    """`_resolve_path_suffix` 用の事前索引 `(label, top_scope, 末尾パス) -> [rel, ...]` を Pass1 完了直後に 1 回だけ構築する。
+
+    1 つの rel_path が持つ末尾パスは、パス区切り単位の末尾（`"c.xml"`／`"b/c.xml"`／`"a/b/c.xml"`）の深さの数だけ。
+    """
+    index: dict = defaultdict(list)
+    for rel, (label, _name) in rel_name.items():
+        top = _top(rel)
+        parts = rel.split("/")
+        for i in range(len(parts)):
+            index[(label, top, "/".join(parts[i:]))].append(rel)
+    return index
+
+
+def _resolve_path_suffix(suffix_index, kind, suffix, ref_rel):
+    """パス末尾一致での解決（Spring `<import resource>` 等の classpath 相対パス参照）。
+
+    classpath 相対の指定は参照元ファイルの位置と無関係のため、資料フォルダ内の実ファイルの rel_path が
+    指定パス（`suffix`）と末尾一致する形でしか解決しない（basename だけの最近傍解決はしない）。
+    `suffix_index` から同一 top_scope 内の候補を引き、1 件に決まらなければ接続しない。
+    戻りは `(rel|None, status)`。`status` は `''`(解決) / `'ambiguous'`(2 件以上) / `'unresolved'`(0 件)。
+    """
+    matches = suffix_index.get((kind, _top(ref_rel), suffix), [])
+    if not matches:
+        return None, "unresolved"
+    if len(matches) > 1:
+        return None, "ambiguous"
+    return matches[0], ""
+
+
 def _aggregate_pass2_edges(raw_edges: list) -> list:
-    """§4(f)（アナライザ拡張・エッジ集約規則）: 同一 `(src, type, dst)` の複数候補を1本へ集約する。
+    """同一 `(src, type, dst)` の複数候補を 1 本へ集約する。
 
     `analyzer_registry.via_priority_rank`（FW 固有 via を汎用 via より優先）で採用する候補を選び、
-    同順位は初出（最初に見つかった候補）を採用する——line/via ともに**採用した候補から丸ごと**
-    引き継ぐ（一部だけ混ぜない・§4(f) 是正③）。`(src,type,dst)` の初出順を保って返す。
+    同順位は初出を採用する。line/via は採用した候補から丸ごと引き継ぐ。`(src,type,dst)` の初出順を保って返す。
     """
     best: dict = {}
     order: list = []
@@ -192,36 +196,25 @@ def _aggregate_pass2_edges(raw_edges: list) -> list:
 
 
 def _document_cid(world_id: str, rel: str) -> str:
-    """Document ノードの同一性＝**パス**（03-鏡モデル.md・D1b-2）。言及エッジ（Pass3）の言及元
-    Document ノードが、文書ごとに揺れうる表題ではなく rel_path で同一ノードに収束するための cid。"""
+    """Document ノードの同一性＝パス。言及元 Document ノードを rel_path で同一ノードに収束させるための cid。"""
     return f"document:{world_id}:{rel}"
 
 
-# --- （2026-09-04-グラフのソース正典化.md §2）: 辞書突合→言及エッジ（Pass3） ---
-# アナライザ（不変・K2）が Pass1 で作る defs 索引（(label,name)->[rel,...]）を**そのまま辞書**として
-# 再利用し、資料文書（`branch=="office"`）の本文と決定的（LLM ゼロ）に突合する。
-# `Document -DOCUMENTS(via="mention")-> コードノード` を張る——`DOCUMENTS` は既存の型（`CORRESPONDS_TO`
-# と同族）で影響 traversal（`_IMPACT_REL`）に含まれない＝規律は自動で満たされる。
+# --- 辞書突合→言及エッジ（Pass3） ---
+# Pass1 の定義索引 `(label,name)->[rel,...]` をそのまま辞書として、資料文書（`branch=="office"`）の本文と
+# 決定的（LLM なし）に突合し、`Document -DOCUMENTS(via="mention")-> コードノード` を張る。
+# `DOCUMENTS` は影響 traversal（`_IMPACT_REL`）に含まれない。
 
-MENTION_SCHEMA_VERSION = 3   # 突合仕様の版（worker._sig の材料。仕様変更時に既存 world を素通りさせない）
-                              # v2（S2-LEAFNAME）: 修飾名（cid_key）を持つ子定義も単純名（表示名）で
-                              # 辞書突合できるようにした（後述 `_mention_dictionary` 参照）。
-                              # v3: トークン文字集合をアナライザの
-                              # COBOL 識別子文字集合（`static_analysis._PROGRAM_ID` 等の `[A-Z0-9#@$-]`）
-                              # と揃えた（`#@$` を追加）——`BILL@01` のような識別子が `BILL`/`01` に
-                              # 分割され、無関係な定義へ誤って言及リンクしていた穴を塞ぐ。
+MENTION_SCHEMA_VERSION = 3   # 突合仕様の版（worker._sig の材料。仕様変更時に既存の資料フォルダを素通りさせない）
 
 _MENTION_TOKEN_RE = re.compile(r"[A-Za-z0-9_#@$-]+")
 
 
 def _mention_tokenize(text: str) -> list:
-    """文書テキスト→識別子形トークン（`[A-Za-z0-9_-]+` の最大連続・1パス・K4①）。
+    """文書テキスト→識別子形トークン（`[A-Za-z0-9_-]+` の最大連続）。
 
-    突合専用の正規化（本関数が唯一の定義・K4②）: **生値のまま**（大文字小文字を区別する）。
-    `identifiers.normalize_code_name` は `upper()` するため使わない——大小区別の突合と矛盾する
-    （`DATA`/`data` のような誤リンクは逆引きを汚染するため fail-closed 側に倒す・K4②）。
-    重複トークンは初出順で1つにまとめる（部分文字列検索はしない＝トークン全体一致のみ・
-    1文書内の探索・上限判定を軽くするだけで突合の意味は変えない）。
+    突合専用の正規化: 生値のまま（大文字小文字を区別する）。`identifiers.normalize_code_name` は使わない。
+    重複トークンは初出順で 1 つにまとめる（トークン全体一致のみ・部分文字列検索はしない）。
     """
     seen: set = set()
     out: list = []
@@ -233,72 +226,39 @@ def _mention_tokenize(text: str) -> list:
     return out
 
 
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`world_neo4j._env_int` と同一セマンティクス）。
-
-    重複の理由も同じ: 下位層モジュール（本モジュール）が上位（`world_neo4j`）を import すると
-    循環 import になるため、6行のヘルパーをここに複製する。負値/非整数、および範囲 [lo, hi] 外の
-    値は既定へフォールバックする（既定値自体も [lo, hi] へクランプ）。
-    """
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
+# 辞書突合の名前長下限（1〜64）／1 文書あたりの言及エッジ上限。`worker.world_signature` の材料にもなる。
+_MENTION_MIN_LEN = 4
+_MENTION_MAX_PER_DOC = 200
 
 
 def _mention_min_len() -> int:
-    """辞書突合の名前長下限（既定4・env `SHERPA_MENTION_MIN_LEN`・範囲1〜64・裁定3）。"""
-    return _env_int("SHERPA_MENTION_MIN_LEN", 4, 1, 64)
+    """辞書突合の名前長下限。"""
+    return _MENTION_MIN_LEN
 
 
 def _mention_max_per_doc() -> int:
-    """1文書あたりの言及エッジ上限（既定200・env `SHERPA_MENTION_MAX_PER_DOC`・裁定6）。"""
-    return _env_int("SHERPA_MENTION_MAX_PER_DOC", 200, 1, 100_000)
+    """1文書あたりの言及エッジ上限。"""
+    return _MENTION_MAX_PER_DOC
 
 
 def _mention_eligible(name: str, min_len: int) -> bool:
     """名前が辞書突合の対象になり得るか。
 
-    ①長さ下限未満、②`_MENTION_TOKEN_RE` の1トークンとして丸ごと一致しない名前（例:
-    コピーブック子項目の修飾名 `GROUP.LEAFNAME`——`.` を含み `_mention_tokenize` が
-    構造的に複数トークンへ分断するため、資料文書のどんなテキストからも単一トークンとして
-    出現し得ない）は、辞書に載せても絶対に突合しない死重みなので除外する。"""
+    長さ下限未満、または `_MENTION_TOKEN_RE` の 1 トークンとして丸ごと一致しない名前（例: `GROUP.LEAFNAME`）は
+    突合し得ないため除外する。"""
     return len(name) >= min_len and _MENTION_TOKEN_RE.fullmatch(name) is not None
 
 
 def _mention_dictionary(defs: dict, aliases: dict | None = None, *, min_len: int = 1) -> tuple[dict, int]:
     """`defs`（Pass1 の定義索引 `(label,key)->[rel,...]`）→ 言及突合の辞書 `name->[(label,rel,key),...]`。
 
-    `min_len`: 突合され得ない名前（長さ下限未満／`_mention_tokenize` が
-    決して1トークンとして生成しない修飾名）を**辞書構築の時点で**除外する——文書側の
-    トークンを都度 `min_len` で足切りするだけだと、辞書自体には短い名前/修飾名がそのまま残り、
-    (a) 定義が全て短名だけの world でも辞書が非空になり文書走査がスキップされない、
-    (b) 突合し得ない修飾名の同世代衝突まで `ambiguous_alias_count` に数えてしまう、の2点で
-    無駄・誤カウントを生む。ここで先に落とすことで両方解消する（辞書構築後の
-    突合結果自体は同値——除外される名前はそもそも一致し得なかったもののみ）。
-
-    **同一 top_scope（世代）内に同名の定義が複数あるものは曖昧＝その世代は除外**（K4④・名前解決と
-    同じ流儀・ラベルは問わない＝同一世代で異なるラベルが同名でも曖昧）。**世代が違う同名は
-    同一論理実体の各世代＝曖昧ではない**——名前一致する全世代の定義それぞれを辞書に残す（K5）。
-
-    `key` は `defs` のキーそのもの（`DefItem.cid_key` を含み得る修飾名）——ノードの cid は常に
-    この `key` で組み立てられているため、辞書引きに使った文字列（トークン／単純名）とは別に
-    保持して返す（S2-LEAFNAME）。
-
-    `aliases`（省略可・`(label,simple_name)->[(rel,key),...]`）: コピーブックの子項目
-    （`GROUP.ITEM` のような修飾名）のように `cid_key`（辞書突合のトークン化では `.` で分断され
-    構造的に一致しえない）と表示名（単純名）が異なる定義を、**表示名でも**辞書に登録する
-    （03-鏡モデル.md §2.4 追記）。表示名バケットは修飾名バケットと別キーなので同一定義が
-    二重にカウントされることはない——`build_world` 側は `key != name` のときだけ渡す。
-
-    戻り値: `(mdict, ambiguous_alias_count)`。`ambiguous_alias_count` は `aliases` 経由で登録された
-    単純名のうち、いずれかの世代で同名衝突（曖昧）により張れなかった名前の数
-    （world 単位の1件の flag 申告用・実測目的）。
+    - `min_len` 未満の名前と、1 トークンとして生成されない修飾名は、辞書構築の時点で除外する。
+    - 同一 top_scope（世代）内に同名の定義が複数ある場合は曖昧として、その世代は除外する（ラベルは問わない）。
+      世代が違う同名は曖昧ではなく、全世代の定義をそれぞれ辞書に残す。
+    - `key` は `defs` のキーそのもの（修飾名を含み得る）。dst の cid 組み立てに使うため、辞書引きの文字列とは別に保持する。
+    - `aliases`（`(label,simple_name)->[(rel,key),...]`）は、`cid_key` と表示名が異なる定義（コピーブックの
+      `GROUP.ITEM` 等）を表示名でも登録する。`build_world` は `key != name` のときだけ渡す。
+    戻り値は `(mdict, ambiguous_alias_count)`。後者は `aliases` 経由の単純名のうち、同名衝突で張れなかった名前の数。
     """
     by_name_gen: dict = {}
     alias_names: set = set()
@@ -331,11 +291,7 @@ def _mention_dictionary(defs: dict, aliases: dict | None = None, *, min_len: int
 
 
 def _ensure_mention_document(nodes: dict, world_id: str, rel: str) -> str:
-    """言及元 Document ノードを get-or-create（同一性＝パス・`_document_cid` と同じ規約）。
-
-    複数の言及がある場合でも同一 cid の既存ノードをそのまま再利用する
-    （Document の同一性契約そのもの）。
-    """
+    """言及元 Document ノードを get-or-create する（同一性＝パス・`_document_cid` と同じ規約）。"""
     cid = _document_cid(world_id, rel)
     if cid in nodes:
         return cid
@@ -349,16 +305,11 @@ def _ensure_mention_document(nodes: dict, world_id: str, rel: str) -> str:
 
 def _mention_edges_for_doc(rel: str, text: str, mdict: dict, min_len: int, max_per_doc: int,
                            world_id: str, nodes: dict, edges: list, flags: list) -> None:
-    """1文書分の言及突合: トークン化→辞書突合→`Document -DOCUMENTS(via=mention)-> コード` を張る。
+    """1 文書分の言及突合: トークン化→辞書突合→`Document -DOCUMENTS(via=mention)-> コード` を張る。
 
-    1文書あたりの上限（`max_per_doc`）で安全弁をかける——超過分は張らずに件数だけ
-    `flags`（`mention_overflow`）へ申告する（黙って切り捨てない）。K5 で1トークンが複数世代へ
-    展開される場合も**エッジ**単位でカウントする。
-
-    `targets` の各要素は `(label, rel, key)`——`key` は dst cid の組み立てに使うノードの実際の
-    識別子（修飾名を含み得る）で、トークン文字列 `tok` とは別物（S2-LEAFNAME・トークンをそのまま
-    dst cid に使うと存在しないノードを指してしまう）。同一 `(doc, dst)` は1本にまとめる——
-    修飾キーと単純名の両方の辞書エントリが同じ定義を指す場合の重複エッジを防ぐ。
+    1 文書あたりの上限（`max_per_doc`）を超えた分は張らず、件数を `flags`（`mention_overflow`）へ申告する。
+    上限は 1 トークンが複数世代へ展開される場合もエッジ単位で数える。
+    dst の cid は `targets` の `key`（修飾名を含み得る）で組み立てる。同一 `(doc, dst)` は 1 本にまとめる。
     """
     added = 0
     overflow = 0
@@ -392,18 +343,10 @@ def _mention_pass(world_dir, world_id: str, defs: dict, aliases: dict, files, no
                   edges: list, flags: list) -> None:
     """Pass3: 資料文書（`branch=="office"`）を辞書と突合し言及エッジを張る。
 
-    世界にコード定義が無ければ辞書が空＝文書列挙自体を省く（コスト・flags 双方の無駄を避ける）。
-    ソース原文（`branch=="source"`）は突合対象外（§2・裁定5）。
-
-    `aliases`（`build_world` が Pass1 で集めた `(label,simple_name)->[(rel,key),...]`）は
-    `_mention_dictionary` へそのまま渡す——単純名でも同名衝突があれば world 単位で1件
-    `mention_ambiguous_names` を申告する（実測目的・S2-LEAFNAME）。
-
-    `worlds.pin_world_root` で `world_id→world_dir` の解決をこの `build_world` 呼び出しが受けた
-    実際の root に固定する: `corpus_docs.iter_world_documents` へは `root=world_dir` を直接渡すが、
-    `doc_text.read_world_doc_text` は `md_path` を持たない文書で内部的に `worlds.world_dir(world_id)`
-    を呼ぶため、レジストリ未登録/別 root での呼び出し（テスト fixture・`world_id` がまだ登録されて
-    いない preview 等）でも同じ物理 root を確実に見る（`pin_world_root` の既存規律と同じ）。
+    コード定義が無ければ辞書が空のため文書列挙を省く。ソース原文（`branch=="source"`）は突合対象外。
+    `aliases` は `_mention_dictionary` へそのまま渡し、単純名の同名衝突があれば `mention_ambiguous_names` を 1 件申告する。
+    `worlds.pin_world_root` で `world_id→world_dir` の解決をこの呼び出しが受けた root に固定する
+    （`doc_text.read_world_doc_text` が内部で `worlds.world_dir` を引くため）。
     """
     min_len = _mention_min_len()
     max_per_doc = _mention_max_per_doc()
@@ -420,62 +363,45 @@ def _mention_pass(world_dir, world_id: str, defs: dict, aliases: dict, files, no
                 continue
             rel = d["name"]
             text = doc_text.read_world_doc_text(world_id, d)
-            if text is None:                          # 読めない＝スキップ（黙って落とさない・裁定5）
+            if text is None:                          # 読めない＝スキップ
                 flags.append({"reason": "unreadable_mention_doc", "doc": rel})
                 continue
             _mention_edges_for_doc(rel, text, mdict, min_len, max_per_doc, world_id, nodes, edges, flags)
 
 
 def build_world(world_dir, world_id: str, *, files=None):
-    """世界（登録ディレクトリ）を `(nodes, edges, flags)` に。パス同一性＋同 top_scope 内最近傍解決。
+    """資料フォルダ（登録ディレクトリ）を `(nodes, edges, flags)` にする。パス同一性＋同 top_scope 内の最近傍解決。
 
-    骨格（Pass1/Pass2＝COPIES/CONTAINS/INVOKES/ACCESSES）＋言及エッジ（Pass3・辞書突合）のみを
-    決定的に構築する（S3・K9-K11＝意味層フル抽出・REALIZES 橋は撤去済み）。
-
-    `files`（省略可・キーワード専用）: 呼び出し側が既に `scope_infer.safe_files(world_dir)` を1回
-    materialize（`list(...)`）済みなら渡す——与えられれば再度歩かない（`_重要度.txt` はここで
-    除外する＝呼び出し側が渡す `files` には含めてよい・S工事③是正・`preview_service.build_preview`
-    参照）。省略時は従来どおりここで直接歩く。
+    骨格（Pass1/Pass2＝COPIES/CONTAINS/INVOKES/ACCESSES）と言及エッジ（Pass3）だけを決定的に構築する。
+    `files`（省略可）: 呼び出し側が `scope_infer.safe_files(world_dir)` を materialize 済みなら渡す（再度歩かない）。
+    `_重要度.txt` はここで除外する。
     """
     entries = files if files is not None else scope_infer.safe_files(
         world_dir, also=worlds.archives_dir(world_id))
-    # 秘匿ファイル（.env 系・id_rsa 系・credentials 等＝名前規約を含む）はグラフ取り込みでも読まない。
-    # 台帳・grep・精読は classify_document で外れるが、Pass1 は拡張子で候補を引くため別に塞ぐ
-    # （上流構成でも `.env.yaml`／`.env.sh` は YAML／shell アナライザの候補になる）。
+    # 秘匿ファイル（環境変数ファイル系・秘密鍵系・credentials 等）はグラフ取り込みでも読まない。
+    # Pass1 は拡張子で候補を引くため、拡張子付きの秘匿名（YAML・shell 等）を別に塞ぐ。
     files = [(rp, rel) for rp, rel in entries
              if not importance.is_importance_control_path(rel)
              and not text_kind.is_sensitive(PurePosixPath(rel).name, PurePosixPath(rel).suffix.lower())]
 
     defs: dict = {}            # (label, NAME) -> [rel, ...]
     qualified_defs: dict = {}  # (label, cid_key) -> [(rel, 実名), ...]（cid_key が付く定義は常時登録）
-    rel_name: dict = {}        # rel -> (label, NAME)  ＝ファイルの主体名（next() 廃止）
+    rel_name: dict = {}        # rel -> (label, NAME)  ＝ファイルの主体名
     texts: dict = {}           # rel -> (text, analyzer)
     nodes: dict = {}           # cid -> node
     edges: list = []
-    link_edges: list = []      # Pass2 の解決済みエッジ（§4(f) 集約前のステージング）
+    link_edges: list = []      # Pass2 の解決済みエッジ（集約前のステージング）
     flags: list = []
-    # 言及突合の単純名エイリアス（S2-LEAFNAME）: (label, DefItem.name) -> [(rel, DefItem.key), ...]。
-    # `key`（cid_key）が `name`（表示名）と異なる子定義（例: コピーブックの `GROUP.ITEM`）だけを
-    # 登録する——`key` はそのまま構造解決 `defs` のキーとして使われ続けるので触らず、Pass3 の
-    # 辞書突合だけ単純名でも引けるように別枠で足す（`_mention_dictionary` 参照）。
+    # 言及突合の単純名エイリアス: (label, DefItem.name) -> [(rel, DefItem.key), ...]。
+    # `key`（cid_key）が `name`（表示名）と異なる子定義（コピーブックの `GROUP.ITEM` 等）だけを登録する。
     mention_aliases: dict = {}
-    # 手続き型言語の関数呼び出し解決専用の索引（§9）: (analyzer_name, label, 単純名) ->
-    # [(rel, cid_key, c_kind|None), ...]。children は `defs` に cid_key（修飾名）でしか登録されない
-    # （primary の src 固定と cid 組み立ての整合を保つため）——`_link` が通常解決（`defs`）で
-    # unresolved のときだけ2段目として参照する。索引キーに `analyzer_name` を含めることで、
-    # C・VB のように複数アナライザが `resolves_calls_by_simple_name` を持つ場合でも、たまたま
-    # 同名の単純名が異なる言語のアナライザ間で誤接続しない（登録・参照とも同一アナライザ内だけで
-    # 解決する）。参照側も同じアナライザ由来かつ `via=call` のときだけに限定する。
+    # 手続き型言語の関数呼び出し解決専用の索引: (analyzer_name, label, 単純名) -> [(rel, cid_key, c_kind|None), ...]。
+    # children は `defs` に cid_key（修飾名）でしか登録されないため、`_link` が通常解決で unresolved のときだけ
+    # 2 段目として参照する。索引キーに analyzer_name を含め、他言語の同名と誤接続しない。
     simple_name_defs: dict = {}
-    # A9（`via=config_key`）専用の索引: (label, key_kind, 裸キー) -> [(rel, cid_key), ...]。
-    # properties/YAML/XML 設定のキー child（`label=="Config"` かつ `cid_key` に `"key:"` 接頭辞・
-    # `_register_children` 参照）だけを登録する——`_link_config_key_all` はこれだけを見て
-    # primary（`defs`）候補を混ぜない（primary と同名の裸キーがあっても primary には張らない）。
-    # `key_kind`（`child.extra.get("key_kind")`・Config キーは種別で名前空間を
-    # 分ける："property"/"bean"/"action"/"mapper"/"url"/"env"）を索引キーへ含めることで、
-    # たまたま同じ裸キー文字列を持つ bean と property 等が誤って同一視されない。参照側
-    # （`RefCandidate.extra["key_kind"]`）にも定義側にも `key_kind` が無い場合は `None` 同士
-    # だけが一致する（タプル比較の自然な帰結・フェイクアナライザを使う既存テストとの後方互換）。
+    # `via=config_key` 専用の索引: (label, key_kind, 裸キー) -> [(rel, cid_key), ...]。
+    # 設定ファイルのキー child（`label=="Config"` かつ `cid_key` が `"key:"` 接頭辞）だけを登録し、primary（`defs`）候補を混ぜない。
+    # `key_kind`（"property"/"bean"/"action"/"mapper"/"url"/"env"）を索引キーに含め、同じ裸キーの別種別を同一視しない。
     config_key_index: dict = {}
 
     def _def(label, name, rel):
@@ -485,36 +411,23 @@ def build_world(world_dir, world_id: str, *, files=None):
     def _index_def(label, name, rel):
         """`defs` 解決索引にだけ登録する（`rel_name` は更新しない）。
 
-        `_def` は「このファイルの主体」を兼ねて `rel_name[rel]` も書き換えるため、children に
-        そのまま使うと後勝ちで primary の src 決定（Pass2 の `rel_name.get(rel)`）を壊す。
-        children（JAVA-1 残課題#3・非 public 兄弟型等）は解決対象にはしたいが主体ではないため、
-        索引登録だけを行う専用ヘルパーにする。
+        children は解決対象にしたいがファイルの主体ではないため、`_def` と違い主体の src 決定を壊さない。
         """
         defs.setdefault((label, name), []).append(rel)
 
     def _index_qualified(label, cid_key, rel, actual_name):
-        """完全修飾名を解決索引へ追加登録する（`defs` とは別枠）。
+        """完全修飾名を解決索引（`defs` とは別枠）へ追加登録する。
 
-        `cid_key` が付いているものは常に登録する——children は cid が `.key`（＝`cid_key` が
-        設定されていればその値）で組み立てられるため（`child_cid = _cid(..., child.key)`）、
-        `cid_key == actual_name` は children では常に成立する（`DefItem.key` が `cid_key` をそのまま
-        返す・`_base.py`）。`_resolve_qualified` は `qualified_defs` だけを見るため、ここで
-        「一致するなら skip」してしまうと children の完全修飾名参照は常に登録漏れになり、
-        `unresolved` に落ちたあとの単純名フォールバックも `defs`（cid_key キー）と噛み合わず
-        解決できない。`actual_name` は常に cid 構築に使った値そのものなので、登録を条件なしに
-        行っても `_cid(kind, world_id, rel, resolved_name)` の整合は崩れない。
+        `cid_key` が付いているものは条件なしで登録する（children は cid が `cid_key` で組み立てられるため、
+        skip すると完全修飾名参照が登録漏れになる）。
         """
         if cid_key is not None:
             qualified_defs.setdefault((label, cid_key), []).append((rel, actual_name))
 
     def _sanitized_extra(analyzer_name, rel, label, name, base_keys, extra):
-        """`DefItem.extra` から共通層が確定したフィールドと同名のキーを除去する（黙って上書きさせない）。
+        """`DefItem.extra` から共通層が確定したフィールドと同名のキーを除去する。
 
-        アナライザは `extra` で任意プロパティを足せるが、`cid`/`label`/`name`/`analyzer` 等
-        共通層が算出した既存キーまで上書きできてしまうと、来歴（誰が解析したか）や識別子を
-        偽装できてしまう。1つでも衝突したら `extra` を**丸ごと**捨てて `flags` に理由付きで記録する
-        （衝突していない他のキーだけ部分採用しない＝「ここまでは信じてよい」という誤った安心感を
-        与えない）。
+        `cid`/`label`/`name`/`analyzer` 等を上書きさせない。1 つでも衝突したら `extra` を丸ごと捨て、理由を `flags` に記録する。
         """
         bad = set(extra) & base_keys
         if not bad:
@@ -530,8 +443,7 @@ def build_world(world_dir, world_id: str, *, files=None):
                           "why": d.reason, "line": d.line, "snippet": d.snippet})
 
     def _register_children(parent_cid, children, rel, analyzer_name):
-        """`parent -CONTAINS-> child` を1本ずつ生成する共通処理（primary の `children` と
-        `DefResult.extras` 各グループの `children` の両方で使う・アナライザ拡張 A10）。"""
+        """`parent -CONTAINS-> child` を 1 本ずつ生成する共通処理（primary の `children` と `DefResult.extras` の両方で使う）。"""
         for child in children:
             if child.label not in analyzer_registry.NODE_LABELS:
                 flags.append({"reason": "unknown_label", "analyzer": analyzer_name,
@@ -543,47 +455,30 @@ def build_world(world_dir, world_id: str, *, files=None):
             child_extra = _sanitized_extra(analyzer_name, rel, child.label, child.name,
                                            child_base.keys(), child.extra)
             nodes[child_cid] = {**child_base, **child_extra}
-            _index_def(child.label, child.key, rel)   # JAVA-1 残課題#3: children も解決対象にする
-            _index_qualified(child.label, child.cid_key, rel, child.key)   # child.key は cid_key 設定時それと同値
-            if child.key != child.name:                # 修飾名≠表示名＝言及辞書に単純名でも登録（S2-LEAFNAME）
+            _index_def(child.label, child.key, rel)   # children も解決対象にする
+            _index_qualified(child.label, child.cid_key, rel, child.key)
+            if child.key != child.name:                # 修飾名≠表示名＝言及辞書に単純名でも登録
                 mention_aliases.setdefault((child.label, child.name), []).append((rel, child.key))
                 if _simple_name_calls(analyzer_name):
-                    # 手続き型言語の関数呼び出し解決専用（§9・`Analyzer.resolves_calls_by_simple_name`）: `defs` は children を cid_key（修飾名）でしか
-                    # 索引しない（`_index_def(child.label, child.key, rel)`・上記）ため、呼び出し側が
-                    # 単純名（例: `util_add`）を渡す `_resolve_nearest(defs, ...)` は解決できない——
-                    # `_index_qualified` の「cid_key==actual_name なら常に登録される」という別の抜け穴
-                    # （reference_qualified_index_children_key_equals_cid_key_gap）と同根の穴。
-                    # `simple_name_defs`（`(analyzer_name,label,単純名)->[(rel,実際のcid_key,c_kind|None),...]`）
-                    # を専用の索引として別枠で持ち、`_link` が `defs` 解決失敗（unresolved）時のみ
-                    # 2段目として参照する（`mention_aliases` は Pass3 辞書突合専用のため転用しない・
-                    # 別枠にする）。`c_kind`（`child.extra["c_kind"]`・c.py が付与）は定義（`.c`）を
-                    # 宣言（`.h`）より優先するための材料（`_resolve_nearest_keyed` 参照）。索引キーに
-                    # `analyzer_name` を含めることで、C・VB のように複数アナライザが同じ索引へ
-                    # 書き込んでも、他言語の unresolved 参照が偶然の同名一致で誤接続しない
-                    # （言語混在 world での誤接続防止・波3 統合 RV）。
+                    # 手続き型言語の関数呼び出し解決専用の単純名索引（`Analyzer.resolves_calls_by_simple_name`）:
+                    # `defs` は children を cid_key（修飾名）でしか索引しないため、単純名の呼び出しは `_link` が 2 段目で `simple_name_defs` を引く。
+                    # `c_kind` は定義（`.c`）を宣言（`.h`）より優先する材料。索引キーに analyzer_name を含め、他言語の同名と誤接続しない。
                     simple_name_defs.setdefault((analyzer_name, child.label, child.name), []).append(
                         (rel, child.key, child.extra.get("c_kind")))
             if child.cid_key is not None and child.cid_key.startswith("key:"):
-                # A9 config_key 専用索引（properties/YAML/XML 設定のキー child のみ）。key_kind
-                # で名前空間を分ける（未設定は None・`_link_config_key_all` 参照）。
+                # `via=config_key` 専用索引（設定ファイルのキー child のみ）。key_kind で名前空間を分ける。
                 config_key_index.setdefault(
                     (child.label, child.extra.get("key_kind"), child.name), []).append((rel, child.key))
             edges.append({"type": "CONTAINS", "src": parent_cid, "dst": child_cid, "doc": rel,
                           "line": child.line, "extraction_method": "static", "status": "active"})
 
-    # --- Pass 1: 定義収集＋ノード（拡張子→アナライザを引いて collect_defs を呼ぶ汎用ループ・
-    # 言語ごとの分岐は sherpa.ingest.analyzers 配下のクラスへ移設済み）---
+    # --- Pass 1: 定義収集＋ノード（拡張子→アナライザを引いて collect_defs を呼ぶ汎用ループ）---
     for rp, rel in files:
         candidates = analyzer_registry.candidates(rel)
         if not candidates:                                # どのアナライザも拡張子を担当しない＝資料
             continue
-        # サイズ上限（8MiB・grep 上限と同じ・単一の真実源＝`text_kind.MAX_BYTES`）: 登録アナライザ
-        # 全般（cobol/copybook/jcl/java/xml_config/properties/yaml_config）に一律で適用する——
-        # `corpus_docs.classify_document` の accepts() 判定は既定 accepts のアナライザでは内容を
-        # 読まない（実ファイルサイズも見ない）ため、ここで読み飛ばさないと本ループの
-        # `corpus_docs.read_full_text_and_raw()` が巨大ファイルを全量メモリに読み込み、単一 worker を
-        # 1ファイルで OOM させ得る。8MiB 超のソースは言語を問わず実務上あり得ない前提
-        # （`corpus_docs._text_oversize` と同じ前提）。
+        # サイズ上限（`text_kind.MAX_BYTES`）: 全アナライザに一律で適用する。
+        # 読み飛ばさないと `read_full_text_and_raw()` が巨大ファイルを全量メモリに読み込み、単一 worker が OOM し得る。
         try:
             oversize = rp.stat().st_size > text_kind.MAX_BYTES
         except OSError:
@@ -596,36 +491,23 @@ def build_world(world_dir, world_id: str, *, files=None):
             text, raw = corpus_docs.read_full_text_and_raw(rp)
         except OSError:
             # 受理済み（拡張子が一致する）コード文書の実読込失敗は run 全体を失敗させる（fail-closed）。
-            # `corpus_docs.classify_document` は既定 accepts のアナライザでは内容を読まないため
-            # 検知できない——実際に読み込む Pass1 だけがこの失敗を確実に検知できる。blocked flag は
-            # `worker._run_locked` の既存チェックにより台帳書込・Neo4j 反映へ進ませず、正しい sig への
-            # 確定も行わせない（部分グラフを確定しない・復旧後の次回 sync で全再構築される）。
+            # blocked flag により台帳書込・Neo4j 反映へ進ませず、部分グラフを確定しない（次回 sync で全再構築）。
             flags.append({"doc": rel, "reason": "unreadable_code_file", "action": "blocked"})
             continue
-        # SRH-05: 台帳（`corpus_docs.classify_document`）・grep・精読が「文字コードを判別できない」
-        # として対象外にする原本は、グラフにもノード・エッジを作らない——判定は `classify_document`
-        # と同じ基準（`text_encoding.quality_of`）を直接使う（拡張子候補は既に上限8MiB以内・
-        # `DETECT_CAP_BYTES`=64MiBの範囲内なので `complete=True` で全量判定できる）。ここで
-        # 除外しないと、台帳/grep/read_around では対象外なのに影響調査のグラフにだけ現れる
-        # （裏付けとして出典 DL できるが read_doc では読めない）食い違いになる。
+        # 台帳（`corpus_docs.classify_document`）・grep・精読が「文字コードを判別できない」として対象外にする原本は、
+        # グラフにもノード・エッジを作らない（判定は `text_encoding.quality_of` を直接使う）。
         encoding, enc_ratio, enc_majority_garbled = text_encoding.detect_bytes_quality(raw, complete=True)
         if text_encoding.quality_of(enc_ratio, enc_majority_garbled) == "undetermined":
             flags.append({"doc": rel, "reason": "encoding_undetermined", "action": "warn"})
             continue
-        # `accepts()` に渡す head サイズはアナライザごとの宣言（`Analyzer.head_bytes`・既定4KiB）に
-        # 従う。`text[:head_bytes]` の**文字**数切り詰めはマルチバイト文字を含む文書で
-        # 実際のバイト範囲が宣言より広がってしまう（`corpus_docs._read_head` docstring 参照）ため、
-        # 上の読み取りが返した生バイト列 `raw` を `head_bytes` バイトちょうどでスライス・デコードする
-        # （`rp` を再度開き直さない——ファイルを2回開くと、全文は読めたのに間でファイルが消える/
-        # 権限が変わるなどの TOCTOU で head 側だけ失敗しうる。`raw` は既に読み終えたバイト列なので
-        # スライス・デコードは失敗しない）。
+        # `accepts()` に渡す head は `Analyzer.head_bytes`（既定 4KiB）のバイト数で、読み取り済みの生バイト列 `raw` を
+        # スライス・デコードする（ファイルを開き直さない）。
         def _head_for(a, raw=raw, encoding=encoding):
             return text_encoding.decode(raw[:getattr(a, "head_bytes", 4096)], encoding)
         analyzer = next((a for a in candidates if a.accepts(rel, _head_for(a))), None)
         if analyzer is None:                              # 拡張子は一致するが内容判定で不採用
             continue
-        # 受理済み（拡張子一致＋accepts 通過）なら主体の有無に関わらず Pass2 を通す——JOB を持たない
-        # JCL PROC ファイルのような「主体なしファイル」も dropped_syntax 検知の対象にする。
+        # 受理済み（拡張子一致＋accepts 通過）なら主体の有無に関わらず Pass2 を通す（主体なしファイルも dropped_syntax 検知の対象）。
         texts[rel] = (rp, analyzer, hashlib.sha1(raw).hexdigest())   # 本文は保持しない（Pass2 で読み直す＝メモリを有界化）・指紋で同一性を照合
         defres = analyzer.collect_defs(text, rel)
         _flag_dropped(analyzer.name, rel, defres.dropped)
@@ -645,10 +527,8 @@ def build_world(world_dir, world_id: str, *, files=None):
         nodes[prim_cid] = {**prim_base, **prim_extra}
         _register_children(prim_cid, defres.children, rel, analyzer.name)
 
-        # アナライザ拡張 A10: 同一ファイル内の主体以外のトップレベル定義（DDL の2件目以降の
-        # `CREATE TABLE` 等）。primary と同じ規則でノード化・索引登録するが、`_index_def`
-        # （`_def` ではない）を使い `rel_name[rel]` は更新しない——ファイルの主体（Pass2 の
-        # 参照元）は引き続き1つのまま。
+        # 同一ファイル内の主体以外のトップレベル定義（DDL の 2 件目以降の `CREATE TABLE` 等）。
+        # primary と同じ規則でノード化・索引登録するが、`_index_def` を使い `rel_name[rel]` は更新しない。
         for group in defres.extras:
             item = group.primary
             if item.label not in analyzer_registry.NODE_LABELS:
@@ -663,16 +543,15 @@ def build_world(world_dir, world_id: str, *, files=None):
             extra_props = _sanitized_extra(analyzer.name, rel, item.label, item.name,
                                            extra_base.keys(), item.extra)
             nodes[extra_cid] = {**extra_base, **extra_props}
-            if item.key != item.name:                  # 修飾名≠表示名＝言及辞書に単純名でも登録（S2-LEAFNAME）
+            if item.key != item.name:                  # 修飾名≠表示名＝言及辞書に単純名でも登録
                 mention_aliases.setdefault((item.label, item.name), []).append((rel, item.key))
             _register_children(extra_cid, group.children, rel, analyzer.name)
 
     # --- Pass 2: 参照解決（同 top_scope 内 最近傍）＋構造エッジ ---
     def _apply_extra(edge, etype, ref_rel, analyzer_name, extra):
-        """`RefCandidate.extra`（CODE-2・JAVA-1 残課題#4）を解決後のエッジへ加算的に透過する。
+        """`RefCandidate.extra` を解決後のエッジへ加算的に透過する。
 
-        細分ラベル `via` は既知値（`KNOWN_VIA`）のみ通す——未知値は Dropped と同様に flags へ
-        記録し、その属性だけを落とす（構造の事実＝エッジ自体は張る・黙って新値を増やさない）。
+        細分ラベル `via` は既知値（`KNOWN_VIA`）のみ通し、未知値は flags へ記録してその属性だけを落とす（エッジ自体は張る）。
         """
         if not extra:
             return
@@ -689,24 +568,11 @@ def build_world(world_dir, world_id: str, *, files=None):
             edge.update(extra)
 
     def _link_config_key_all(etype, src_cid, kind, name, ref_rel, line, analyzer_name, extra, reverse):
-        """A9（アナライザ拡張）: `via=config_key` の参照だけ、同一 top_scope 内の同名
-        `Config` キー全件へ1本ずつエッジを張る特例——通常の最近傍/ambiguous 判定を迂回する
-        （環境別設定ファイル・application-dev/prod 等が同名キーを持つ場合に両方へ張るため）。
+        """`via=config_key` の参照だけ、同一 top_scope 内の同名 `Config` キー全件へ 1 本ずつエッジを張る特例。
 
-        child の cid は `cid_key`（`DefItem.key`）で組み立てられる（`_register_children`）。
-        properties/YAML のキー child のように `cid_key` が表示名（`name`）と異なる（`"key:"` 接頭辞・
-        primary との自己ループ回避）ため、`config_key_index`（`_register_children` が同じ場所で
-        `"key:"` 接頭辞を持つ Config child だけを集めた専用索引）だけを候補源にする——`defs`
-        （primary も含む構造解決索引）は混ぜない。primary と同名の裸キーが存在しても、この索引には
-        Config child しか登録されないため primary へは張られない。
-        dst cid は必ず**一致した候補の cid_key**で組み立てる（rel ごとに異なり得る）——裸の `name`
-        でそのまま組み立てると、properties/YAML 側の名前空間分離が効かず別ノード（file primary 等）
-        の cid と衝突し得る（RV波1是正）。
-
-        `key_kind`: 参照側 `extra.get("key_kind")` も索引キーに含める——
-        `config_key_index` の登録側（`_register_children`）と同じタプル形 `(label, key_kind, name)`
-        で引くため、`key_kind` が無い（`None`）参照は `key_kind` が無い定義としか一致しない
-        （タプル比較の自然な帰結・フェイクアナライザを使う既存テストとの後方互換）。
+        通常の最近傍/ambiguous 判定を迂回する（環境別設定ファイルが同名キーを持つ場合に両方へ張るため）。
+        候補源は `config_key_index`（`"key:"` 接頭辞を持つ Config child だけ）で、primary（`defs`）は混ぜない。
+        dst cid は一致した候補の `cid_key` で組み立てる。`key_kind` も索引キーに含める（無い参照は無い定義としか一致しない）。
         """
         cands = list(config_key_index.get((kind, extra.get("key_kind"), name), []))
         same = [(r, key) for r, key in cands if _top(r) == _top(ref_rel)]
@@ -725,8 +591,7 @@ def build_world(world_dir, world_id: str, *, files=None):
 
     def _link(etype, src_cid, kind, name, ref_rel, line, analyzer_name=None, extra=None, reverse=False):
         extra = dict(extra) if extra else {}
-        # `qualified` は解決の指示であってエッジの事実ではない——共通層が消費して取り除く
-        # （残っていると `_apply_extra` がそのまま edge のプロパティへ透過してしまう）。
+        # `qualified` は解決の指示であってエッジの事実ではないため、共通層が消費して取り除く
         qualified = bool(extra.pop("qualified", False)) and "." in name
 
         if extra.get("via") == "config_key":              # A9: 通常解決の前に特例へ分岐
@@ -734,12 +599,22 @@ def build_world(world_dir, world_id: str, *, files=None):
             return
 
         resolved_name = name
+        # 同様に pop する（残すと `_apply_extra` が edge のプロパティへ透過する）
+        path_suffix = bool(extra.pop("path_suffix", False)) if extra.get("via") == "include" else False
         include_path = extra.get("include_path") if extra.get("via") == "include" else None
-        if include_path and "/" in include_path:
-            # C の `#include`（§4(a)/§12）1段目: 相対パス完全一致（同一 top_scope 内）。
-            # 見つからなければ2段目（拡張子込み basename の最近傍）へフォールバックする——
-            # `qualified` の完全一致→単純名フォールバックと同型の2段構成だが、解決の材料が
-            # cid_key ではなく `include_path`（パス文字列）である点が異なるため専用分岐にする。
+        if path_suffix:
+            # Spring `<import resource>` 等の classpath 相対パス参照: 資料フォルダ内の実ファイルの rel_path が末尾一致する形でしか解決しない。
+            # 一意に決まらなければ接続しない。
+            rel, status = _resolve_path_suffix(path_suffix_index, kind, name, ref_rel)
+            if status:
+                flags.append({"reason": ("config_import_ambiguous" if status == "ambiguous"
+                                         else "config_import_unresolved"),
+                             "from": ref_rel, "kind": kind, "name": name, "line": line,
+                             "via": extra.get("via")})
+                return
+            resolved_name = rel_name[rel][1]
+        elif include_path and "/" in include_path:
+            # C の `#include` の 1 段目: 相対パス完全一致（同一 top_scope 内）。見つからなければ 2 段目（拡張子込み basename の最近傍）へ。
             rel = _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name)
             if rel is None:
                 rel, status = _resolve_nearest(defs, kind, name, ref_rel)
@@ -753,7 +628,7 @@ def build_world(world_dir, world_id: str, *, files=None):
                 flags.append({"reason": "ambiguous", "from": ref_rel, "kind": kind, "name": name,
                              "line": line, "via": extra.get("via")})
                 return
-            if status:                                    # 完全一致なし（unresolved/cross_scope）＝単純名へフォールバック（§4(c)'）
+            if status:                                    # 完全一致なし（unresolved/cross_scope）＝単純名へフォールバック
                 simple = name.rsplit(".", 1)[-1]
                 rel, status = _resolve_nearest(defs, kind, simple, ref_rel)
                 if status:
@@ -767,16 +642,9 @@ def build_world(world_dir, world_id: str, *, files=None):
         else:
             rel, status = _resolve_nearest(defs, kind, name, ref_rel)
             if status == "unresolved" and _simple_name_calls(analyzer_name) and extra.get("via") == "call":
-                # 手続き型言語（C/VB）の関数呼び出し解決専用（§9）: `defs` は children を
-                # cid_key（修飾名）でしか索引しないため、単純名（例: `util_add`）は通常解決で
-                # 見つからない。`simple_name_defs` を2段目として参照し、その判定結果
-                # （解決/ambiguous/cross_scope/unresolved）をそのまま採用する——1段目の `status`
-                # （"unresolved" 固定）で上書きせず2段目の判定を伝播する（2段目が ambiguous でも
-                # "unresolved" に化けさせない）。索引キーに `analyzer_name` を含むため、参照側も
-                # 同じアナライザ由来かつ `via=call` のときだけに限定する——他言語からの unresolved
-                # 参照（例: Java の `new Worker()`）まで2段目に倒すと、C・VB のように複数アナライザが
-                # `resolves_calls_by_simple_name` を持つ場合にたまたま同名の関数へ誤接続し得る
-                # （言語混在 world での誤接続防止・登録側の限定と対をなす）。
+                # 手続き型言語（C/VB）の関数呼び出し解決: 通常解決で見つからない単純名は `simple_name_defs` を 2 段目として参照し、
+                # その判定結果（解決/ambiguous/cross_scope/unresolved）をそのまま採用する。
+                # 参照側も同じアナライザ由来かつ `via=call` のときだけに限る。
                 alt_rel, alt_key, alt_status = _resolve_nearest_keyed(
                     simple_name_defs, analyzer_name, kind, name, ref_rel)
                 if alt_status:
@@ -795,12 +663,12 @@ def build_world(world_dir, world_id: str, *, files=None):
         _apply_extra(edge, etype, ref_rel, analyzer_name, extra)
         link_edges.append(edge)
 
+    # Pass1 完了直後（`rel_name` 確定後）に 1 回だけ構築し、`_link` が閉包で参照する
+    path_suffix_index = _build_path_suffix_index(rel_name)
+
     for rel, (rp, analyzer, raw_sha1) in texts.items():
-        # Pass1 は本文を保持しない（`texts[rel]` は `(rp, analyzer)` のみ）——world 全体のコード
-        # 総量に比例したメモリを Pass1〜Pass2 間で同時保持しない（単一 worker・100GB 級コーパス
-        # 前提）。1 ファイルあたり Pass1 で1回・Pass2 で1回の計2回読む（Pass3 の都度読み直しと
-        # 同じ流儀）。Pass1 で accepts() 済み＝通常は再読取も成功するが、取り込み中の削除/権限変更
-        # 等で失敗しうるため Pass1 と同じ fail-closed（blocked flag・部分グラフを確定しない）で扱う。
+        # Pass1 は本文を保持しない（コード総量に比例したメモリを持たない）。Pass2 で 1 回読み直し、失敗時は Pass1 と同じ
+        # fail-closed（blocked flag・部分グラフを確定しない）で扱う。
         try:
             # Pass1 と同じサイズ上限（Pass1〜Pass2 の間に原本側で肥大したファイルを全量読まない）。
             if rp.stat().st_size > text_kind.MAX_BYTES:
@@ -811,8 +679,7 @@ def build_world(world_dir, world_id: str, *, files=None):
             flags.append({"doc": rel, "reason": "unreadable_code_file", "action": "blocked"})
             continue
         if hashlib.sha1(_raw).hexdigest() != raw_sha1:
-            # Pass1 と Pass2 の間に原本が書き換わった＝Pass1 の定義（旧本文）と Pass2 の参照（新本文）を
-            # 混ぜると存在しない依存を作る。黙って通さず blocked（次回 sync で全再構築）。
+            # Pass1 と Pass2 の間に原本が書き換わった場合は、定義と参照を混ぜず blocked にする（次回 sync で全再構築）
             flags.append({"doc": rel, "reason": "changed_between_passes", "action": "blocked"})
             continue
         ref_result = analyzer.extract_refs(text, rel)
@@ -834,29 +701,22 @@ def build_world(world_dir, world_id: str, *, files=None):
             _link(ref.edge_type, src, ref.kind, ref.name, rel, ref.line,
                  analyzer_name=analyzer.name, extra=ref.extra, reverse=ref.reverse)
 
-    # §4(f)（アナライザ拡張）: 同一 (src,type,dst) の複数候補を1本へ集約してから確定する
-    # （FW 固有 via を汎用 via より優先・line は採用した via の出現行のまま）。全 Pass2 エッジに適用
-    # する——nodes/flags は不変のまま、edges は (src,type,dst) の集合は不変で本数だけ重複の分減り得る
-    # （§8 受け入れ条件・golden 固定＝tests/unit/test_world_graph_analyzer_expansion_common.py）。
+    # 同一 (src,type,dst) の複数候補を 1 本へ集約してから確定する（全 Pass2 エッジに適用・nodes/flags は不変）
     edges.extend(_aggregate_pass2_edges(link_edges))
 
-    # Pass2 完了直後にコード本文を解放する——Pass3（`_mention_pass`）
-    # は `corpus_docs.iter_world_documents`/`doc_text.read_world_doc_text` 経由で資料文書
-    # （`branch=="office"`）の本文を都度読み直す独立した経路で、この `texts` 辞書（Pass1 で読んだ
-    # コード全文）を参照しない。大きい world ではコード全文を Pass3 の間も保持し続けるだけ無駄
-    # （メモリの早期解放）。
+    # Pass2 完了直後にコード本文を解放する（Pass3 は資料文書の本文を別経路で読み直す）
     texts.clear()
 
-    # Pass3: 辞書突合→言及エッジ（S2・単純名エイリアス込み＝S2-LEAFNAME）
+    # Pass3: 辞書突合→言及エッジ
     _mention_pass(world_dir, world_id, defs, mention_aliases, files, nodes, edges, flags)
 
     return list(nodes.values()), edges, flags
 
 
 def subgraph(nodes, edges, prefix: str | None = None):
-    """**範囲フィルタ**＝`path` prefix（top_scope/phase…どの階層でも）で部分グラフに絞る（MIRROR §3）。
+    """範囲フィルタ: `path` prefix（どの階層でも）で部分グラフに絞る。
 
-    `prefix=None`/`''` は全体。両端点が範囲内のエッジだけ残す（traversal を Cypher で絞るのと同じ意味の in-memory 版）。
+    `prefix=None`/`''` は全体。両端点が範囲内のエッジだけ残す。
     """
     if not prefix:
         return list(nodes), list(edges)
@@ -880,9 +740,7 @@ def subgraph(nodes, edges, prefix: str | None = None):
 def _lstat_kind(p) -> str | None:
     """`os.lstat()` ベースで種別を返す（`"dir"`/`"file"`/`"symlink"`/`None`＝不在扱い）。
 
-    `Path.is_dir()`/`is_file()`/`is_symlink()` は内部で `OSError` を握って `False` を返すため
-    使わない（`scope_infer._lstat_kind`/`worlds._lstat_kind` と同じ設計）。`resolve_path` は
-    fail-closed（見えなければ「無い」）でよい経路のため、`OSError` は種別不明＝`None` に潰す。
+    `Path.is_dir()` 等は `OSError` を握るため使わない。`OSError` は種別不明＝`None` にする。
     """
     try:
         st = os.lstat(p)
@@ -898,17 +756,10 @@ def _lstat_kind(p) -> str | None:
 
 
 def valid_rel_parts(rel: str) -> tuple[str, ...] | None:
-    """`rel`（world root 相対 POSIX パス）の文字列検証だけを行う（FS アクセス無し）。
+    """`rel`（資料フォルダ root 相対 POSIX パス）の文字列検証だけを行う（FS アクセス無し）。
 
-    絶対パス・`\\`・NUL・空/`.`/`..` 要素はすべて拒否する（`\\` はファイル名内に含まれ得ても
-    POSIX rel 契約を優先して拒否する意図的な制限・NUL は `os.lstat` 等に渡すと `ValueError` に
-    なり得るため事前に弾く）。通れば `"/"` 区切りのセグメント列を返す。
-
-    `resolve_path`（内容判定・FS 解決）と `ext_api._doc_path_segments`（原本DL配信・非FS）が
-    **この1関数だけ**を正規化の真実源として共有する——2箇所で別々に検証条件を書くと、片方だけ
-    緩い/厳しいまま個別に直されて再びズレる（`.` 要素だけ片方が許容していた実害＝内容判定は
-    「読み取り不可」扱いで通すのに配信側は実ファイルを開いて返してしまう秘匿ファイル漏洩の穴に
-    なっていた）。
+    絶対パス・`\\`・NUL・空/`.`/`..` 要素はすべて拒否し、通れば `"/"` 区切りのセグメント列を返す。
+    `resolve_path` と `ext_api._doc_path_segments`（原本 DL 配信）が、正規化の真実源としてこの 1 関数だけを共有する。
     """
     if not rel or rel.startswith("/") or "\\" in rel or "\x00" in rel:
         return None
@@ -919,15 +770,11 @@ def valid_rel_parts(rel: str) -> tuple[str, ...] | None:
 
 
 def resolve_path(world_dir, rel: str):
-    """`rel`（world root 相対 POSIX）→ 原本 Path（**パス基準**・無ければ None）。
+    """`rel`（資料フォルダ root 相対 POSIX）→ 原本 Path（パス基準・無ければ None）。
 
-    root から `rel` の各階層へ直接 `os.lstat` して降りるだけで解決する——world 全体を走査しない
-    （コストは `rel` の階層数のみに依存・世界内のファイル総数に依存しない）。
-    途中経路のどれか1つでも symlink なら拒否する（`safe_files` が symlink file/dir を辿らず
-    実在扱いしないのと同じ contract＝symlink 越しに同じ内容へ辿り着けても document とは認めない）。
-    `rel` の検証（絶対パス・`\\`・NUL・空/`.`/`..` 要素の拒否）は `valid_rel_parts` に集約する
-    （一切の FS アクセスより前に文字列だけで判定する）。
-    最後に解決後パスが world root 配下に収まることを再確認する（脱出防止の多層防御）。
+    ① `rel` を `valid_rel_parts` で検証する（FS アクセスより前）。
+    ② root から `rel` の各階層へ直接 `os.lstat` して降りる（資料フォルダ全体は走査しない）。途中経路に symlink があれば拒否する。
+    ③ 解決後パスが root 配下に収まることを再確認する（脱出防止）。
     """
     parts = valid_rel_parts(rel)
     if parts is None:

@@ -1,12 +1,7 @@
-"""MD化アームのプラグイン基盤（正典 docs/11-Office変換.md §5.6/§5.7・起案 docs/archive/archive/2026-07-07-MD化多アーム統合.md A1）。
+"""MD化アームのプラグイン基盤。アーム（arm）＝1つの文書を Markdown 化する変換ルート1本。プロトコル（`Arm`）・結果 dataclass（`ArmResult`）・設定駆動レジストリ（`system_settings.arms_enabled`・管理画面「取り込み」）を持つ。
 
-**アーム（arm）** ＝1つの文書を Markdown 化する変換ルート（手法）の1本。複数アームを差し替え可能に
-（プラグイン式）する。A1 は**この器だけ**を作る:
-プロトコル・結果 dataclass・設定駆動レジストリ（system_settings `arms_enabled`・管理画面「取り込み」）。
-既存の OOXML/PDF 変換を挙動不変で包む。
-
-既定（`ooxml,pdf_text`）では従来と完全に同一の挙動（`office_md` の決定的変換へ委譲）。未知のアーム名は
-警告して無視する（fail-safe）。
+既定（`ooxml,pdf_text`）は `office_md` の決定的変換へ委譲する。未知のアーム名は警告して無視する。
+設計: docs/design/rag.md「アーム一覧」
 """
 from __future__ import annotations
 
@@ -15,25 +10,20 @@ import os
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-# 実 import（TYPE_CHECKING ガードにしない）: `document_ir` は stdlib のみに依存する純データ型モジュールで
-# 循環 import が無く、実行時に `typing.get_type_hints(ArmResult)` で注釈を解決する利用者を壊さないため
-# （RV2巡目 Low: TYPE_CHECKING ガードだと NameError になる）。
+# 実 import にする（`TYPE_CHECKING` ガードにしない）: 実行時に `typing.get_type_hints(ArmResult)` で注釈を解決する利用者のため。`document_ir` は stdlib のみの純データ型で循環しない。
 from ..document_ir import DocumentIR
 
 _log = logging.getLogger(__name__)
 
-# 既定の有効アーム（導入しても現行と挙動が変わらない構成・INGEST-MD §5.6 の①OOXML＋④PDFテキスト）。
+# 既定の有効アーム（OOXML＋PDF テキスト）。
 DEFAULT_ARMS: tuple[str, ...] = ("ooxml", "pdf_text")
 
 
 @dataclass
 class ArmResult:
-    """1アームの変換結果。`md=None`＝このアームでは変換できない/失敗（fail-safe・未対応表示に倒す）。
+    """1アームの変換結果。`md=None`＝このアームでは変換できない/失敗（未対応表示に倒す）。
 
-    `method`＝変換手法名（例 "ooxml"/"pdf_text"/"vision"）。`confidence`＝0.0〜1.0。
-    `notes`＝来歴の補足（バックエンド名等）。
-    `document`＝document-ir-v1（文書標準構造）の並行生成結果（DOC-IR-001）。md が正のまま（検索/ES/grep/台帳/
-    削除経路は不変）＝IR は付随情報であり、未対応アーム/形式では `None`（既定・後方互換）。
+    `method`＝変換手法名（例 "ooxml"/"pdf_text"/"vision"）。`confidence`＝0.0〜1.0。`notes`＝来歴の補足（バックエンド名等）。`document`＝document-ir-v1 の並行生成結果。md が正で、IR は付随情報（未対応アーム/形式では `None`）。
     """
     md: str | None
     method: str
@@ -59,9 +49,7 @@ class Arm(Protocol):
 def _registry() -> dict[str, Arm]:
     """名前 → アーム実装のマップ（アーム追加時にエントリを足す唯一の場所）。
 
-    既定（DEFAULT_ARMS＝ooxml,pdf_text）以外の vision は登録済みだが**既定では無効**
-    （有効化は `SHERPA_ARMS` か管理画面のチェックボックス）＝導入しても挙動は変わらない。
-    tesseract 直の `ocr` アームは撤去した（2026-07-08・視覚読み取りは `vision`＝VLM に一本化）。
+    既定以外の `vision` は登録済みだが既定では無効（有効化は管理画面）。
     """
     from . import vision_arm, ooxml_arm, pdf_text_arm
     return {"ooxml": ooxml_arm.OoxmlArm(), "pdf_text": pdf_text_arm.PdfTextArm(),
@@ -69,11 +57,9 @@ def _registry() -> dict[str, Arm]:
 
 
 def arm_availability() -> dict[str, bool]:
-    """既知アームごとの「この環境で実際に使えるか」（未導入アームの UI 案内用・S1 の legacy_backend.available と同型）。
+    """既知アームごとの「この環境で実際に使えるか」（未導入アームの UI 案内用）。
 
-    アームが optional な可用性判定（`available()`）を持てば（pdf_text＝PDF 抽出バックエンド到達性・
-    vision＝VLM 設定の実効可用性）それを、無ければ常時利用可（ooxml）とみなす。
-    fail-safe: 判定中の例外は「利用不可」に倒す。
+    アームが `available()` を持てばそれを、無ければ常時利用可（ooxml）とみなす。判定中の例外は「利用不可」に倒す。
     """
     out: dict[str, bool] = {}
     for name, arm in _registry().items():
@@ -89,7 +75,7 @@ def arm_availability() -> dict[str, bool]:
 
 
 def _dedup(names) -> list[str]:
-    """順序を保ったまま重複除去（二重変換防止）。"""
+    """順序を保ったまま重複除去する。"""
     seen: set[str] = set()
     out: list[str] = []
     for n in names:
@@ -100,12 +86,11 @@ def _dedup(names) -> list[str]:
 
 
 def _env_configured_names() -> list[str]:
-    """env `SHERPA_ARMS`（カンマ区切り）による有効アーム名（順序保持・重複除去）。未設定は既定。
+    """MCP サブプロセスへ親が渡す実効アームのスナップショット（env `SHERPA_MCP_ARMS`・カンマ区切り）による有効アーム名（順序保持・重複除去）。無ければ既定。
 
-    system_settings を見ない env/既定のみの解決（GET /admin/settings の「既定へ戻すと何になるか」表示や、
-    system_settings が読めない/未設定の文脈でのフォールバックに使う）。
+    system_settings を見ない解決（管理画面の「既定へ戻すと何になるか」表示や、system_settings が読めない文脈＝MCP サブプロセスのフォールバック用）。
     """
-    raw = os.environ.get("SHERPA_ARMS")
+    raw = os.environ.get("SHERPA_MCP_ARMS")
     names = list(DEFAULT_ARMS) if raw is None else [n.strip() for n in raw.split(",") if n.strip()]
     return _dedup(names)
 
@@ -113,10 +98,7 @@ def _env_configured_names() -> list[str]:
 def _system_arms_enabled() -> list[str] | None:
     """全体設定（system_settings）の `arms_enabled`（有効なら list[str]）。
 
-    優先順 system_settings > env > 既定（docs/archive/proposals/2026-07-08-設定分離とUI整備.md S1）の最上位。
-    未設定・空リスト・不正値は None を返し、呼び出し側は env/既定へフォールバックする。
-    **fail-safe**: store を読めない文脈（MCP サブプロセスは PG creds を持たない・DB 停止中）では例外を
-    握って None（＝env へ倒す）。取り込みホットループでの DB 打鍵は store 側の短TTLキャッシュで平滑化する。
+    優先順 system_settings > MCP スナップショット > 既定の最上位。未設定・空リスト・不正値は None（呼び出し側がスナップショット/既定へフォールバックする）。store を読めない文脈（MCP サブプロセス・DB 停止中）では例外を握って None を返す。
     """
     try:
         from sherpa import store
@@ -125,39 +107,33 @@ def _system_arms_enabled() -> list[str] | None:
         return None
     if isinstance(val, list):
         names = [str(n).strip() for n in val if str(n).strip()]
-        return names or None       # 空リストは「未設定」扱い＝env へ（S1 仕様）
+        return names or None  # 空リストは「未設定」扱い＝env へ
     return None
 
 
 def _configured_names() -> list[str]:
-    """有効アーム名（順序保持・重複除去）。優先順は system_settings > env > 既定。
-
-    system_settings の `arms_enabled`（非空 list）があればそれを最優先し、無ければ env `SHERPA_ARMS`
-    （未設定は既定）へフォールバックする。既知/未知の選別は呼び出し側（`enabled_arm_names`）が行う。
-    """
+    """有効アーム名（順序保持・重複除去）。優先順は system_settings > MCP スナップショット > 既定。既知/未知の選別は呼び出し側（`enabled_arm_names`）が行う。"""
     sys_names = _system_arms_enabled()
     names = sys_names if sys_names is not None else _env_configured_names()
     return _dedup(names)
 
 
 def known_arm_names() -> list[str]:
-    """登録済み（既知）の全アーム名（ソート済み）。PUT /admin/settings の `arms_enabled` 検証・
-    設定画面のチェックボックス描画に使う。"""
+    """登録済み（既知）の全アーム名（ソート済み）。`PUT /admin/settings` の `arms_enabled` 検証・設定画面のチェックボックス描画に使う。"""
     return sorted(_registry())
 
 
 def env_default_arm_names() -> list[str]:
-    """system_settings を無視した env/既定の実効アーム名（既知名のみ）。設定画面で「未設定に戻すと
-    何が有効になるか」を示すために使う（fail-safe: 未知名は除外）。"""
+    """system_settings を無視した既定の実効アーム名（既知名のみ）。設定画面で「未設定に戻すと何が有効になるか」を示すために使う。"""
     reg = _registry()
     return [n for n in _env_configured_names() if n in reg]
 
 
-_warned_unknown: set[str] = set()      # 同じ未知名の警告はプロセス内1回だけ（sync/scan 毎のスパム防止・RV Low）
+_warned_unknown: set[str] = set()  # 同じ未知名の警告はプロセス内1回だけ
 
 
 def enabled_arm_names() -> list[str]:
-    """有効かつ既知のアーム名（登録順ではなく `SHERPA_ARMS` の指定順）。未知名は警告して除外（fail-safe）。"""
+    """有効かつ既知のアーム名（指定順）。未知名は警告して除外する。"""
     reg = _registry()
     out: list[str] = []
     unknown: list[str] = []
@@ -168,12 +144,12 @@ def enabled_arm_names() -> list[str]:
             unknown.append(name)
             _warned_unknown.add(name)
     if unknown:
-        _log.warning("SHERPA_ARMS の未知アームを無視します: %s（既知: %s）",
+        _log.warning("未知アームを無視します: %s（既知: %s）",
                      ",".join(unknown), ",".join(sorted(reg)))
     return out
 
 
 def enabled_arms() -> list[Arm]:
-    """有効なアームのインスタンス列（`SHERPA_ARMS` の指定順）。未知名は警告して無視する（fail-safe）。"""
+    """有効なアームのインスタンス列（指定順）。未知名は警告して無視する。"""
     reg = _registry()
     return [reg[name] for name in enabled_arm_names()]

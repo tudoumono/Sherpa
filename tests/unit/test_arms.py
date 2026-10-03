@@ -1,8 +1,8 @@
 """MD化アーム・プラグイン基盤（A1）の単体テスト（DB不要）。
 
-- レジストリ: `SHERPA_ARMS` 解決（既定・カスタム・未知名無視・重複除去）。
+- レジストリ: `SHERPA_MCP_ARMS` 解決（既定・カスタム・未知名無視・重複除去）。
 - ooxml_arm / pdf_text_arm の accepts / convert（office_md への委譲・バックエンド有無）。
-- arms_sig drift: 構成変更で True・同一で False・旧 `.pdf_backend` からの移行。
+- arms_sig drift: 構成変更で True・同一で False。
 - 来歴サイドカー `{rel}.md.meta.json` の生成（内容・決定性）。
 """
 from __future__ import annotations
@@ -36,24 +36,24 @@ def _docx(dirpath, name="a.docx"):
     return p
 
 
-# ---- レジストリ（SHERPA_ARMS 解決）----
+# ---- レジストリ（SHERPA_MCP_ARMS 解決）----
 
 def test_default_arms_when_unset(monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     assert arms.enabled_arm_names() == ["ooxml", "pdf_text"]      # 既定＝現行と同一構成
     names = [a.name for a in arms.enabled_arms()]
     assert names == ["ooxml", "pdf_text"]
 
 
 def test_custom_arms_selection_and_order(monkeypatch):
-    monkeypatch.setenv("SHERPA_ARMS", "pdf_text, ooxml")          # 空白 trim・指定順を保持
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "pdf_text, ooxml")          # 空白 trim・指定順を保持
     assert arms.enabled_arm_names() == ["pdf_text", "ooxml"]
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml")
     assert arms.enabled_arm_names() == ["ooxml"]
 
 
 def test_unknown_arm_ignored_with_warning(monkeypatch, caplog):
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,bogus,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,bogus,pdf_text")
     import logging
     with caplog.at_level(logging.WARNING):
         names = arms.enabled_arm_names()
@@ -62,12 +62,12 @@ def test_unknown_arm_ignored_with_warning(monkeypatch, caplog):
 
 
 def test_duplicate_arms_deduped(monkeypatch):
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,ooxml,pdf_text")
     assert arms.enabled_arm_names() == ["ooxml", "pdf_text"]       # 重複は畳む（二重変換防止）
 
 
 def test_empty_arms_is_none(monkeypatch):
-    monkeypatch.setenv("SHERPA_ARMS", " , ")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", " , ")
     assert arms.enabled_arm_names() == []                          # 全部空＝有効アーム無し（fail-safe）
 
 
@@ -75,7 +75,7 @@ def test_empty_arms_is_none(monkeypatch):
 
 def test_system_settings_arms_take_priority_over_env(monkeypatch):
     from sherpa import store
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml")                     # env は ooxml のみ
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml")                     # env は ooxml のみ
     monkeypatch.setattr(store, "get_system_settings",
                         lambda: {"arms_enabled": ["pdf_text", "ooxml"]})
     assert arms.enabled_arm_names() == ["pdf_text", "ooxml"]       # 全体設定が env に優先（順序も尊重）
@@ -83,14 +83,14 @@ def test_system_settings_arms_take_priority_over_env(monkeypatch):
 
 def test_system_settings_empty_arms_falls_back_to_env(monkeypatch):
     from sherpa import store
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml")
     monkeypatch.setattr(store, "get_system_settings", lambda: {"arms_enabled": []})
     assert arms.enabled_arm_names() == ["ooxml"]                   # 空リスト＝未設定扱い＝env へ
 
 
 def test_system_settings_unset_arms_falls_back_to_default(monkeypatch):
     from sherpa import store
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     monkeypatch.setattr(store, "get_system_settings", lambda: {})
     assert arms.enabled_arm_names() == ["ooxml", "pdf_text"]       # env も無し＝コード既定
 
@@ -103,7 +103,7 @@ def test_system_settings_unreadable_is_failsafe_to_env(monkeypatch):
         raise RuntimeError("no PG creds (MCP subprocess)")
 
     monkeypatch.setattr(store, "get_system_settings", _boom)
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml")
     assert arms.enabled_arm_names() == ["ooxml"]
 
 
@@ -116,11 +116,11 @@ def test_system_settings_arms_unknown_names_filtered(monkeypatch):
 
 
 def test_known_and_env_default_arm_names(monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     # 登録済み全アーム（ソート済み・tesseract直OCRとMarkItDownは不採用）。
     assert arms.known_arm_names() == ["ooxml", "pdf_text", "vision"]
     assert arms.env_default_arm_names() == ["ooxml", "pdf_text"]   # env/既定の実効（system 抜き・既定は不変）
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml")
     assert arms.env_default_arm_names() == ["ooxml"]               # env を反映（system は見ない）
 
 
@@ -170,7 +170,7 @@ def test_pdf_text_arm_accepts_and_backend_gating():
 # ---- arms_sig drift（構成変更/同一/旧マーカー移行）----
 
 def test_arms_sig_drift_same_config_false(monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = pathlib.Path(tempfile.mkdtemp())
     o_b = office_md._pdf_backend
     try:
@@ -182,7 +182,7 @@ def test_arms_sig_drift_same_config_false(monkeypatch):
 
 
 def test_arms_sig_drift_on_backend_change(monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = pathlib.Path(tempfile.mkdtemp())
     o_b = office_md._pdf_backend
     try:
@@ -199,29 +199,9 @@ def test_arms_sig_drift_on_arm_change(monkeypatch):
     o_b = office_md._pdf_backend
     try:
         office_md._pdf_backend = lambda: None
-        monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+        monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
         office_md._write_arms_sig_marker(d)
-        monkeypatch.setenv("SHERPA_ARMS", "ooxml")                 # 有効アーム構成を変更
-        assert office_md.arms_sig_drift(d) is True
-    finally:
-        office_md._pdf_backend = o_b
-
-
-def test_arms_sig_drift_migrates_old_pdf_marker(monkeypatch):
-    """旧 `.pdf_backend` マーカーしか無い派生 dir を既定アーム構成と読み替えて判定（後方互換）。
-
-    DOC-IR-001.5（修正3）で document-ir 版（`docir`）成分は arms_sig から分離済み（`.document_ir_sig` という
-    別マーカーへ移動＝`es_index._arms_config_sig()` 経由の全 world ES 再索引誘発を避けるため）。よって
-    arms_sig の読み替えロジック自体（PDF バックエンドの一致判定）は DOC-IR-001 以前の挙動に戻る。
-    """
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)               # 既定 ooxml,pdf_text
-    d = pathlib.Path(tempfile.mkdtemp())
-    o_b = office_md._pdf_backend
-    try:
-        (d / office_md._OLD_PDF_MARKER).write_text("none", encoding="utf-8")
-        office_md._pdf_backend = lambda: None
-        assert office_md.arms_sig_drift(d) is False                # 旧「none」＝既定構成・バックエンド無しと一致
-        office_md._pdf_backend = lambda: "pypdf"                   # バックエンドが変わった＝drift
+        monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml")                 # 有効アーム構成を変更
         assert office_md.arms_sig_drift(d) is True
     finally:
         office_md._pdf_backend = o_b
@@ -230,10 +210,9 @@ def test_arms_sig_drift_migrates_old_pdf_marker(monkeypatch):
 def test_arms_sig_drift_no_marker_baseline(monkeypatch):
     """マーカー皆無＝既定構成・バックエンド無しを基準に判定（marker 書込失敗時の無限ループ回避）。
 
-    DOC-IR-001.5（修正3）で document-ir 版成分は arms_sig から分離済み（`test_arms_sig_drift_migrates_old_pdf_marker`
-    docstring 参照）＝DOC-IR-001 以前の挙動に戻る。
+    DOC-IR-001.5（修正3）で document-ir 版成分は arms_sig から分離済み。
     """
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = pathlib.Path(tempfile.mkdtemp())
     o_b = office_md._pdf_backend
     try:
@@ -248,7 +227,7 @@ def test_arms_sig_drift_no_marker_baseline(monkeypatch):
 def test_arms_sig_drift_unwritable_dir_does_not_loop(monkeypatch):
     """RV Med（2026-07-08）: marker を書けない派生 dir では drift=True を返し続けない（毎 sync フルリビルド
     のループ防止）。書込 probe が失敗 → 警告して据え置き（False）。書ける dir では従来どおり True。"""
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = pathlib.Path(tempfile.mkdtemp())
     o_b = office_md._pdf_backend
     try:
@@ -267,7 +246,7 @@ def test_arms_sig_drift_existing_marker_mismatch_unwritable_dir_does_not_loop(mo
     """RV Med（Codex gpt-5.5/xhigh・2026-07-08 R1）: **marker が既に存在**するが今の署名と不一致
     （例: tesseract 直の `ocr` アーム撤去で署名フォーマットが変わり、旧 `;ocr=...` 付き marker が不一致に
     なるケース）でも、dir が書けなければ drift=True を返し続けない（no-marker ケースと同じ fail-safe）。"""
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)                # 既定 ooxml,pdf_text
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)                # 既定 ooxml,pdf_text
     d = pathlib.Path(tempfile.mkdtemp())
     o_b = office_md._pdf_backend
     try:
@@ -287,7 +266,7 @@ def test_arms_sig_drift_existing_marker_mismatch_unwritable_dir_does_not_loop(mo
 
 def test_unknown_arm_warns_once(monkeypatch, caplog):
     """未知アーム名の警告はプロセス内1回だけ（sync/scan 毎のスパム防止・RV Low）。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,nosuch-arm")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,nosuch-arm")
     monkeypatch.setattr(arms, "_warned_unknown", set())            # プロセス内状態をテスト用にリセット
     with caplog.at_level("WARNING"):
         assert arms.enabled_arm_names() == ["ooxml"]
@@ -299,7 +278,7 @@ def test_unknown_arm_warns_once(monkeypatch, caplog):
 # ---- 来歴サイドカー（build_derived が {rel}.md.meta.json を生成・決定的）----
 
 def test_provenance_sidecar_written_for_ooxml(monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = tempfile.mkdtemp()
     src = pathlib.Path(d) / "src"; src.mkdir()
     _docx(src, "doc.docx")
@@ -314,7 +293,7 @@ def test_provenance_sidecar_written_for_ooxml(monkeypatch):
 
 
 def test_provenance_sidecar_records_pdf_backend(monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = tempfile.mkdtemp()
     src = pathlib.Path(d) / "src"; src.mkdir()
     writer = PdfWriter()
@@ -336,7 +315,7 @@ def test_provenance_sidecar_records_pdf_backend(monkeypatch):
 
 def test_provenance_sidecar_is_deterministic(monkeypatch):
     """同一入力・同一構成なら bytes 一致（タイムスタンプ無し・キー順固定）。"""
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = tempfile.mkdtemp()
     src = pathlib.Path(d) / "src"; src.mkdir()
     _docx(src, "doc.docx")
@@ -348,10 +327,8 @@ def test_provenance_sidecar_is_deterministic(monkeypatch):
 
 
 def test_sidecar_not_grepped_or_ledgered(monkeypatch):
-    """サイドカー（`.meta.json`）は grep に載らない。RAG MD は `grep_tool.rag_grep_enabled` の
-    向きどおりに載る（常時 ON＝載る・legacy 側は直接差し替えて模擬——TOGGLE-RM・2026-09-03 で
-    グローバルな系統切替トグルは撤去済みのため env では OFF にできない）。台帳はsource起点。"""
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    """サイドカー（`.meta.json`）は grep に載らない。RAG MD は載る（doc_id は原本のまま）。台帳はsource起点。"""
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = tempfile.mkdtemp()
     src = pathlib.Path(d) / "src"; src.mkdir()
     _docx(src, "doc.docx")
@@ -371,11 +348,6 @@ def test_sidecar_not_grepped_or_ledgered(monkeypatch):
     monkeypatch.setattr(worlds, "derived_md_dir", lambda _world: der)
     monkeypatch.setattr(worlds, "derived_rag_dir", lambda _world: der_rag)
 
-    # legacy モード（直接差し替えて模擬）: RAG MD だけにある語を legacy grep は拾わない。
-    monkeypatch.setattr(grep_tool, "rag_grep_enabled", lambda: False)
-    assert grep_tool.grep_search("RAG_ONLY_MARKER", world="v1") == []
-
-    # 既定（常時 ON）: 同じ語を RAG MD 側から拾う（doc_id は原本のまま＝派生名は露出しない）。
-    monkeypatch.setattr(grep_tool, "rag_grep_enabled", lambda: True)
+    # RAG MD にだけある語を RAG MD 側から拾う（doc_id は原本のまま＝派生名は露出しない）。
     hits = grep_tool.grep_search("RAG_ONLY_MARKER", world="v1")
     assert len(hits) == 1 and hits[0]["doc_id"] == "doc.docx"

@@ -1,9 +1,9 @@
-"""Excelセルの原値・型付き値・数式・表示値を決定的に抽出する。
+"""Excel セルの原値・型付き値・数式・表示値を決定的に抽出する。
 
-Microsoft Excelの表示エンジンを利用できないLinux基本経路向け。OOXMLの``<v>``を原値の
-権威、openpyxlの型変換結果を型付き値の権威として分離し、対応を明示できる主要書式だけを
-表示する。複雑な条件、会計、ロケール、和暦等を推測して近似せず``display_status=unsupported``
-にする。LLM・外部通信・再計算は行わない。
+OOXML の ``<v>`` を原値の権威、openpyxl の型変換結果を型付き値の権威として分け、
+対応できる主要書式だけを表示する。複雑な条件・会計・ロケール・和暦等は近似せず
+``display_status=unsupported`` にする。LLM・外部通信・再計算は行わない。
+設計: docs/design/rag.md「アームの選択方式（実装済みは「最初に受理した1本」）」
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _number_or_text(value: str | None) -> Any:
 
 
 def _json_scalar(value: Any) -> Any:
-    """Python固有型を決定的なJSON値へ変換する。"""
+    """Python 固有型を決定的な JSON 値へ変換する。"""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, datetime):
@@ -142,7 +142,7 @@ def _raw_from_cell(cell: ET.Element, shared: list[str]) -> Any:
 
 
 def _raw_cells(path: Path, targets: dict[str, set[str]]) -> dict[tuple[str, str], dict[str, Any]]:
-    """対象座標だけをworksheet XMLからstream抽出する。"""
+    """対象座標だけを worksheet XML から stream 抽出する。"""
     out: dict[tuple[str, str], dict[str, Any]] = {}
     with zipfile.ZipFile(path) as archive:
         parts = _sheet_parts(archive)
@@ -260,7 +260,7 @@ def _format_decimal(value: int | float, code: str) -> str | None:
 
 
 def _date_tokens(code: str) -> list[tuple[str, bool]] | None:
-    """(text, is_token)列へ分解する。quote/escapeはliteralに確定する。"""
+    """(text, is_token) 列へ分解する。quote/escape は literal に確定する。"""
     out: list[tuple[str, bool]] = []
     index = 0
     while index < len(code):
@@ -334,7 +334,7 @@ def _format_date(value: date | datetime | time, code: str) -> str | None:
 
 
 def format_display(value: Any, number_format: str, *, formula_cache_missing: bool = False) -> DisplayResult:
-    """主要Excel書式だけを表示し、未対応は推測しない。"""
+    """主要な Excel 書式だけを表示し、未対応は推測しない。"""
     if formula_cache_missing:
         return DisplayResult(None, EXCEL_DISPLAY_PROFILE, "unsupported", "formula_cache_missing")
     if value is None:
@@ -362,11 +362,10 @@ def format_display(value: Any, number_format: str, *, formula_cache_missing: boo
 
 
 def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dict[tuple[str, str], dict[str, Any]]:
-    """対象セルの10項目契約を返す。targetsは``{sheet: {A1, ...}}``。
+    """対象セルの 10 項目契約を返す。targets は ``{sheet: {A1, ...}}``。
 
-    `wb_formula`（data_only=False）と `wb_values`（data_only=True）を**逐次**ロードする（MEM-1）。
-    両方を同時にオブジェクトツリーへ展開するとピークメモリが約2倍になるため、1冊読み終えて
-    閉じてからもう1冊を開く＝ピーク時に生きているブックを常に1冊に保つ。
+    ① OOXML から原値・数式を読む ② 数式ブック（data_only=False）を読んで閉じる
+    ③ 値ブック（data_only=True）を読んで表示値を決める。2 冊を同時に開かない（メモリのピーク抑制）。
     """
     import openpyxl
 
@@ -378,15 +377,9 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
     raw = _raw_cells(source, normalized_targets)
 
     def _load_formula_pass() -> dict[tuple[str, str], dict[str, Any]]:
-        """第1パス（wb_formula）: シート/セルごとに必要な情報だけを中間dictへ抽出してから閉じる。
-        シート欠落チェック（旧・両ブック存在チェック）は、ここに無ければ第2パスで自然にスキップ
-        される形で再現する。
+        """第 1 パス（数式ブック）: セルごとに必要な情報だけを中間 dict へ抽出してから閉じる。
 
-        独立した関数スコープに閉じ込めるのが要点——`wb_formula`だけでなく、ループ内で束縛される
-        `formula_sheet`/`formula_cell`（Cellはparentツリー経由でWorkbook全体を参照する）もこの
-        関数が返った時点でフレームごと消える。呼び出し元のローカル変数として残さないことで、
-        `wb_formula.close()`（循環参照ゆえ即解放しない）に加えてGCが確実に回収できる状態を作る
-        （MEM-1のRV是正#1・close()だけでは不十分）。
+        Workbook を参照するローカル変数をこの関数の中に閉じ込め、戻った時点で GC が回収できるようにする。
         """
         intermediate: dict[tuple[str, str], dict[str, Any]] = {}
         wb_formula = openpyxl.load_workbook(source, data_only=False, read_only=False, keep_links=False)
@@ -399,9 +392,7 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
                     formula_cell = formula_sheet[coordinate]
                     xml = raw.get((sheet_name, coordinate), {})
                     formula = xml.get("formula")
-                    # shared formulaのfollowerはOOXML上``<f t="shared" si="…"/>``となり、
-                    # XML直読だけでは式が単独の``=``になる。openpyxlがmasterから復元した式を
-                    # 権威として補い、存在する数式を空式として保存しない。
+                    # shared formula の follower は XML 直読だと式が単独の ``=`` になるため、openpyxl が復元した式で補う
                     if (formula in {None, "="} and isinstance(formula_cell.value, str)
                             and formula_cell.value.startswith("=")):
                         formula = formula_cell.value
@@ -419,12 +410,10 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
         return intermediate
 
     intermediate = _load_formula_pass()
-    # 関数フレームが消えても、openpyxlのWorkbookは内部循環参照（cell⇄parent等）を持つため
-    # CPythonの参照カウント方式だけでは即解放されない（次の周期的GCまで生き残る）。第2パスを
-    # 開く前にGCを1回回し、ピーク時に生きているブックを常に1冊に保つ。
+    # Workbook は循環参照を持つため、第 2 パスの前に GC を回して常に 1 冊だけ生かす
     gc.collect()
 
-    # 第2パス（wb_values）: formulaの場合のみ再計算値を要するため、第1パスの中間dictと合流する。
+    # 第 2 パス（値ブック）: 数式セルの再計算値を取り、第 1 パスの中間 dict と合流する
     out: dict[tuple[str, str], dict[str, Any]] = {}
     wb_values = openpyxl.load_workbook(source, data_only=True, read_only=False, keep_links=False)
     try:
@@ -466,7 +455,7 @@ def extract_cell_metadata(path: str | Path, targets: dict[str, set[str]]) -> dic
 
 
 def enrich_evidence(ir, path: str | Path) -> None:
-    """XLSX Evidenceのcell/formula extensionへ表示契約をin-placeで追加する。"""
+    """XLSX Evidence の cell/formula extension へ表示契約を in-place で追加する。"""
     targets: dict[str, set[str]] = {}
     elements = []
     for element in ir.elements:

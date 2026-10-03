@@ -1,67 +1,32 @@
 """API 応答スキーマ集約。
 
-`tests/e2e/mock_api.py` の `MOCKED` レジストリ（`len(mock_api.MOCKED)` 件・実測は
-`tests/api/test_response_schemas.py::test_mocked_registry_route_count_matches_docstring_claim`
-で固定）を対象に、実 TestClient 応答から「実測で」書き起こした pydantic 応答モデル。
-ここに定義したモデルは2通りに使われる:
+実 TestClient 応答から書き起こした pydantic 応答モデルで、`tests/api/test_mock_api_contract.py` の TypeAdapter 契約テストが
+`tests/e2e/mock_api.py` の `MOCKED` 応答を検証する。キー集合が常に固定のモデルだけ各 router の response_model に付与する。
 
-  1. **TypeAdapter 契約テスト**（`tests/api/test_response_schemas.py`）: `MOCKED` の実応答を
-     ここのモデルで validate する（response_model は付与していないので挙動リスクはゼロ）。
-  2. **response_model 付与**（各 `sherpa/routers/*.py`）: この中の一部（キー集合が常に固定＝
-     条件分岐で増減しない）だけに実際に付与する。
-
-**設計方針**:
-  - 応答内容は変更しない（挙動不変が絶対条件）。DB 由来の値をハンドラが `str(...)` で明示的に
-    文字列化している箇所（例: `workspace_file_list` の `created_at`）は、モデル側も `str` 型にする
-    （`datetime` 型にすると pydantic が再シリアライズし、既存の `str(datetime)` 形式（空白区切り）
-    と食い違う＝挙動変更になるため）。ハンドラが生の datetime を返す箇所は下記 `WireDateTime` 型を使う
-    （生の `datetime` 型は使わない）。
-  - **datetime 型は必ず `WireDateTime`（下で定義）を使う。生の `datetime` を直接フィールド型にしない**:
-    pydantic v2 は response_model 経由の aware datetime を
-    既定で `...Z`（Z サフィックス）に正規化するが、response_model 非付与時（FastAPI 既定の
-    jsonable_encoder）は `dt.isoformat()`（`+00:00` オフセット表記）を返す＝response_model の
-    有無だけで同じ値のワイヤー表現が変わってしまう（実測で確認済み）。`WireDateTime` は
-    `PlainSerializer` で明示的に `.isoformat()` を使うため、response_model 付与の有無に関わらず
-    元の表現に一致する。
-  - キー集合が分岐で変わる応答のうち、分岐が `Literal` で判別可能な有限個（かつ各分岐内は完全に
-    固定形）のものは `Union[...]`（pydantic の smart-mode union）で表現し response_model を付与する
-    （実測: FastAPI は各分岐に応じて正しい方だけを直列化し、他分岐のキーを混ぜない）。
-    例: `POST /worlds`（`action` で2分岐）・`POST /settings/bedrock-models/verify`（`ok` で2分岐）。
-  - キー集合がネストした list 要素の中で個別に増減する応答（例: `GET /admin/es/search` の
-    `hits[].extraction_method` は値がある時だけキーが付く）は response_model を付与しない
-    （TypeAdapter 契約のみ・キー欠落/型不一致による黙殺・500化を避ける）。
-  - 深くネストした自由形式 JSON（監査ログの `detail`/`before_state`/`after_state`、抽出フラグ等）は
-    `Any` / `dict[str, Any]` で緩く受ける（内容を検証しすぎて実データで 500 化しないため）。
-  - フィールド名に `version` を含むモデル（`ConversationSummary`・`AdminSettingsView` の
-    `libreoffice.version`）は response_model を付与しない: 付与すると OpenAPI スキーマに
-    `version` プロパティが露出し、`tests/api/test_world_param_compat.py::
-    test_openapi_surface_has_no_version_parameter`（退役した version/世代 概念を API surface に
-    再宣言しない contract）を壊す。値そのもの（DB 列・ソフトウェアバージョン文字列）は退役概念とは
-    無関係だが、このガードはフィールド名の文字列一致で判定するため機械的に従う。
+守ること:
+- 応答内容は変えない。ハンドラが `str(...)` で文字列化している値（例: `created_at`）は `str` 型にする。
+- datetime は必ず `WireDateTime` を使う（生の `datetime` を直接フィールド型にしない）。
+- 分岐が `Literal` で判別できる有限個の固定形は `Union[...]` で表し response_model を付与する（例: `POST /worlds`）。
+- ネストした list 要素の中でキーが増減する応答は response_model を付与しない。
+- 自由形式 JSON（監査ログの `detail` 等）は `Any` / `dict[str, Any]` で緩く受ける。
+- フィールド名に `version` を含むモデル（`ConversationSummary`・`AdminSettingsView`）は response_model を付与しない
+  （OpenAPI に `version` を露出させない `tests/api/test_world_param_compat.py::test_openapi_surface_has_no_version_parameter` に従う）。
 """
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, PlainSerializer, StrictInt, StrictStr
 
-# pydantic v2 は response_model 経由だと
-# aware datetime を既定で `2026-07-01T09:10:00Z`（Z サフィックス）に正規化する。response_model
-# 非付与時（FastAPI 既定の jsonable_encoder）は `dt.isoformat()`（`+00:00` オフセット表記）を返す
-# ため、response_model を付与しただけで**同じ datetime 値のワイヤー表現が変わってしまう**
-# （挙動不変の絶対条件に反する・実測で確認済み）。`PlainSerializer` で明示的に `.isoformat()` を
-# 使う型を1つ定義し、datetime を持つ全フィールドをこれに統一する（response_model 付与の有無に
-# 関わらず同じ表現になる・将来 response_model を付与するルートが増えても再発しない）。
+# 全 datetime フィールドの型。`PlainSerializer` で `.isoformat()` を明示し、response_model の有無で `Z` 表記と `+00:00` 表記が変わらないようにする
 WireDateTime = Annotated[datetime, PlainSerializer(lambda v: v.isoformat(), return_type=str)]
 
 
-# ===================================================================================
-# 認証（sherpa/routers/auth.py）
-# ===================================================================================
+# ===== 認証（sherpa/routers/auth.py） =====
 
 class AuthMeResponse(BaseModel):
-    """GET /auth/me（auth.py::auth_me）。"""
+    """現在のログインユーザー（GET /auth/me）。"""
     uid: str
     email: str | None
     display_name: str | None
@@ -71,7 +36,7 @@ class AuthMeResponse(BaseModel):
 
 
 class AuthLoginResponse(BaseModel):
-    """POST /auth/login（auth.py::auth_login）。"""
+    """ログイン結果（POST /auth/login）。"""
     ok: bool
     uid: str
     must_change_password: bool
@@ -79,24 +44,20 @@ class AuthLoginResponse(BaseModel):
 
 
 class OkResponse(BaseModel):
-    """`{"ok": true}` のみを返すエンドポイント共通形（auth_logout 等）。"""
+    """`{"ok": true}` のみを返すエンドポイント共通形。"""
     ok: bool
 
 
-# ===================================================================================
-# システム（sherpa/routers/system.py・sherpa/routers/system_extras.py）
-# ===================================================================================
+# ===== システム（sherpa/routers/system.py・system_extras.py） =====
 
 class HealthSummaryResponse(BaseModel):
-    """GET /health/summary（system_extras.py::health_summary・health.summary()）。"""
+    """状態ドット用の最小サマリ（GET /health/summary）。"""
     status: str
     checked_at: str
 
 
 class HealthComponent(BaseModel):
-    """`GET /admin/health` の `components[]` 要素（health.py::_check_one）。`hint` は `ok=False` の
-    時だけキーが付く（`ok=True` では欠落）ため `None` 既定にしているが、response_model は付与しない
-    （TypeAdapter 契約のみ・欠落キーを常時 `null` 出力に変えてしまう挙動変化を避ける）。"""
+    """`GET /admin/health` の `components[]` 要素。`hint` は `ok=False` のときだけ付く。"""
     id: str
     label: str
     impact: str
@@ -107,54 +68,22 @@ class HealthComponent(BaseModel):
 
 
 class AdminHealthResponse(BaseModel):
-    """GET /admin/health（system_extras.py::admin_health）。response_model 非付与（上記 `hint` の
-    条件付きキーのため・TypeAdapter 契約のみ）。"""
+    """全コンポーネントの健全性（GET /admin/health）。"""
     status: str
     checked_at: str
     ttl_seconds: float
     components: list[HealthComponent]
 
 
-class BedrockModelChoice(BaseModel):
-    """`GET /settings/bedrock-models` の `models[]` 要素（providers/bedrock.py::list_bedrock_inference_profiles）。"""
-    id: str
-    label: str
-
-
-class BedrockModelsResponse(BaseModel):
-    """GET /settings/bedrock-models（system.py::settings_bedrock_models）。"""
-    models: list[BedrockModelChoice]
-    error: str | None
-
-
-class BedrockVerifyOk(BaseModel):
-    """POST /settings/bedrock-models/verify・成功分岐（`ok` で判別可能・system.py::settings_bedrock_models_verify）。"""
-    ok: Literal[True]
-    id: str
-    label: str
-
-
-class BedrockVerifyErr(BaseModel):
-    """POST /settings/bedrock-models/verify・失敗分岐（形式不正/連打/401403/ネットワーク、すべて同形）。"""
-    ok: Literal[False]
-    error: str
-
-
-BedrockVerifyResponse = Union[BedrockVerifyOk, BedrockVerifyErr]
-
-
 class ConfigResponse(BaseModel):
-    """GET /config（system.py::config_get・providers/__init__.py::provider_info）。"""
+    """現在の実行構成（GET /config）。"""
     agent: str
     label: str
     model: str
 
 
 class ConstructChoice(BaseModel):
-    """GET・PUT /settings の `constructs_available[]` 要素（`sherpa/agent_constructs.py`）。
-
-    `agent`/`codex_model_provider` は保存すべき設定値そのもの＝画面はこの2つをそのまま PUT する。
-    """
+    """GET・PUT /settings の `constructs_available[]` 要素。`agent`/`codex_model_provider` は画面がそのまま PUT する設定値。"""
     id: str
     agent: str
     codex_model_provider: str | None
@@ -163,154 +92,100 @@ class ConstructChoice(BaseModel):
 
 
 class ModelChoiceInfo(BaseModel):
-    """GET・PUT /settings の `model_catalog[field]`（`sherpa/model_catalog.py::field_choice_info`）で
-    使う共通の選択肢形。`allowed` が空でも `default` が非空のことがある（カタログ未編集＝組み込み
-    既定のみの状態）。"""
+    """GET・PUT /settings の `ollama_url_choice` や GET・PUT /admin/settings の `model_catalog` のセルで使う選択肢の共通形。`allowed` が空でも `default` が非空のことがある。"""
     allowed: list[str]
     default: str
 
 
 class OllamaUrlChoiceInfo(ModelChoiceInfo):
-    """`ollama_url_choice`（`system.py::_ollama_url_choice`）専用の選択肢形。`allowed` は許可ポリシー
-    （loopback／admin allowlist）を満たす完全 URL のみ。`legacy` は利用者の現在の保存値が許可されて
-    いない場合だけ非 null（`allowed` には混ぜない＝選んでも 422 になる値を選択肢として出さない）。"""
+    """個人の Ollama 接続先の選択肢。`allowed` は許可ポリシーを満たす完全 URL のみ。`legacy` は現在の保存値が許可されていない場合だけ非 null。"""
     legacy: str | None
 
 
 class SettingsResponse(BaseModel):
-    """GET・PUT /settings（system.py::_public_settings。全キー常時存在）。
+    """GET・PUT /settings（全キー常時存在）。
 
-    モデル名・機能別プロバイダの個人設定（旧 openai_model/gemini_model/ollama_model/codex_model/
-    extract_provider/graph_provider/intent_provider/embed_provider/intent_model）は個人設定に無い
-    ＝応答にも含めない（管理者の使えるモデル一覧（`model_catalog`）・選択中のクラウドプロバイダ
-    だけで決まる）。旧 `codex_reasoning`（Codex の推論深さ）も個人設定に無いが、使えるモデル一覧の
-    対象外＝環境変数 `SHERPA_CODEX_REASONING` だけで決まる。`bedrock_model` は例外（実在確認済み
-    モデルの専用機構のため個人設定に残す）。`search_helper_model` も例外（個人設定に入力欄・保存
-    経路は無いが、以前この画面で選んだ値が DB に残っている利用者への注記表示のため読み取り専用
-    で返す・web/settings.js 参照）。
+    モデル名・機能別プロバイダ・Web 検索の希望は個人設定に無い（モデルは管理者の使えるモデル一覧と選択中のクラウドプロバイダだけで決まり、Web 検索はチャットごとの希望だけで決まる）ため応答に含めない。
     """
     agent: str
     web_search_available: bool
-    codex_web_search: bool
     openai_key_set: bool
-    # 接続先の種類
-    # （openai/azure/custom）とホスト名のみ（キー・パスは出さない）。
+    # 接続先の種類（openai/azure/custom）とホスト名のみ（キー・パスは出さない）
     openai_endpoint_kind: str
     openai_base_url_host: str
     ollama_url: str | None
-    gemini_key_set: bool
-    bedrock_model: str
-    bedrock_key_set: bool
-    # legacy 表示と検証済み表示の区別用（system.py::_public_settings）。
-    bedrock_model_known: bool
-    bedrock_model_label: str
-    # 4構成（`sherpa/agent_constructs.py`）: 標準MVPが見せる実行構成
-    # （openai_only / ollama_only / codex_openai / codex_ollama）。`constructs_available` は
-    # この環境で選べるものだけ（env `SHERPA_EXTRA_AGENTS` で追加AIを有効化したら増える）。
+    # この環境で選べる実行構成（simple / codex_openai / codex_ollama）
     codex_model_provider: str
-    # 検索アシスタント（`sherpa/search_helper.py`）: 下調べ（worker）だけを安いモデルへ任せる
-    # 利用者ごとの設定（''＝安いモデルを使わず頭脳自身が worker／'ollama'／'openai'）。
-    # モデル名は管理者のカタログ既定に従う。
-    search_helper: str
-    # 旧・個人上書き時代のモデル指定（読み取り専用・注記表示のみ）。
-    search_helper_model: str
     construct_id: str
     constructs_available: list[ConstructChoice]
-    system_prompt: str
-    # A7 の現在選択（openai/gemini/bedrock）と
-    # A6 の個人キー許可フラグ（既定 false）。画面がキー欄の表示/非表示・注記を切り替えるための情報。
+    # 現在選択中のクラウドプロバイダ、と個人キー許可フラグ（既定 false）
     cloud_provider: str
     personal_api_keys_allowed: bool
-    # 利用者本人による外部連携 API キー自己発行の許可トグル（admin が管理画面で設定・既定
-    # false）。画面が個人設定の「外部連携」欄を出し分けるための情報（`personal_api_keys_allowed`
-    # と同型の出し分けパターン）。
+    # 利用者本人による外部連携 API キー自己発行の許可（管理者設定・既定 false）
     user_api_keys_allowed: bool
-    # 自己発行キーの1日あたり呼び出し上限（既定/上限・管理者統制）。発行フォームのプレース
-    # ホルダ表示用。
+    # 自己発行キーの1日あたり呼び出し上限（既定/上限・管理者統制）
     user_api_keys_daily_quota_default: int
-    # モデル名欄ごとの選択肢（`sherpa/model_catalog.py`。system.py::_public_settings が
-    # `model_catalog.FIELD_CELLS` の全フィールドを常に含める）。個人設定にモデル名欄は無いが、
-    # 管理画面の「使えるモデル」との配線を共有するため引き続き返す。
-    model_catalog: dict[str, ModelChoiceInfo]
-    # プロバイダ別選択肢（system.py::_model_choice_table_by_provider）。
-    model_catalog_by_provider: dict[str, dict[str, ModelChoiceInfo]]
-    # 個人の Ollama 接続先 `<select>` の選択肢（system.py::_ollama_url_choice。allowed は完全 URL）。
+    # 個人の Ollama 接続先 `<select>` の選択肢（allowed は完全 URL）
     ollama_url_choice: OllamaUrlChoiceInfo
-    # チャット画面のクイック入力例（管理者設定・`sherpa/chat_examples.py::public_examples`）。
-    # None＝未設定（フロントの組み込み既定を使う）。配列（空含む）＝管理者の明示設定（空＝非表示）。
+    # チャット画面のクイック入力例。None＝未設定（フロントの組み込み既定を使う）、配列（空含む）＝管理者の明示設定（空＝非表示）
     chat_examples: list[str] | None
 
 
 class SettingsTestResponse(BaseModel):
-    """POST /settings/test（system.py::settings_test。全分岐で同じ4キー）。"""
+    """接続テスト結果（POST /settings/test）。全分岐で同じ4キー。"""
     ok: bool
     provider: str
     model: str
     detail: str | None
 
 
-# ---- 管理者:全体設定（system_extras.py::_admin_settings_view）----
+# ---- 管理者:全体設定 ----
 
 class CloudInfo(BaseModel):
-    """クラウド AI プロバイダの中央設定（A6/A7）。"""
+    """クラウド AI プロバイダの中央設定。"""
     provider: str
-    # `provider` は既定 openai への読み替え込みの実効値
-    # （常に非 null）。`provider_raw` は `cloud_provider` の生の保存値（未選択＝一度も PUT されて
-    # いない場合は null）——UI はこれで「admin が実際に選んだか」を判別する（`provider` だけでは
-    # 初期表示の既定 openai と明示選択した openai を区別できない）。
+    # `provider` は既定 openai への読み替え込みの実効値。`provider_raw` は生の保存値（未選択＝一度も PUT されていなければ null）
     provider_raw: str | None
     providers: list[str]
     personal_api_keys_allowed: bool
     openai_key_set: bool
-    gemini_key_set: bool
-    bedrock_key_set: bool
     ollama_url: str
+    # 保存済みの `cloud_provider` が閉じたプロバイダ（gemini/bedrock）のときだけその名前。それ以外は null
+    retired_provider: str | None
     personal_keys_in_use_count: int
-    # WEB-1: Codex の Web 検索を管理者が許可しているか（既定 false）。
+    # Codex の Web 検索を管理者が許可しているか（既定 false）
     web_search_allowed: bool
-    # OpenAI 直結を利用者の実行構成一覧に出すか（既定 false・`sherpa/agent_constructs.py`
-    # `available_constructs` 参照）。
-    openai_direct_visible: bool
 
 
 class ExtKeysDailyQuotaDefaultInfo(BaseModel):
-    """自己発行キーの1日あたり呼び出し上限の既定/上限（`configured`=管理者の生値・
-    `effective`=未設定時のフォールバック込みで実際に適用される値・`default`=組み込みの
-    フォールバック値そのもの＝差分強調の基準）。"""
+    """自己発行キーの1日あたり呼び出し上限（`configured`=管理者の生値・`effective`=実際に適用される値・`default`=組み込みの既定値）。"""
     configured: int | None
     effective: int
     default: int
 
 
 class ExtKeysResearchProviderInfo(BaseModel):
-    """AI 下調べ検索（POST /ext/v1/research）の既定 AI（PART-4a・`configured`=管理者の生値・
-    `effective`=未設定時のフォールバック込みで実際に適用される値・`default`=組み込みの
-    フォールバック値そのもの＝差分強調の基準）。"""
+    """外部からの簡易回答（POST /ext/v1/answer）の既定 AI（`configured`=管理者の生値・`effective`=実際に適用される値・`default`=組み込みの既定値）。"""
     configured: str | None
     effective: str
     default: str
 
 
 class ExtKeysAdminInfo(BaseModel):
-    """外部連携 API キー: 利用者本人による自己発行の許可トグル
-    （system_extras.py::_admin_settings_view）。`self_issued_active_count` は OFF で保存する前の
-    確認ダイアログ用プレビュー（失効済み/期限切れは含まない・`CloudInfo.personal_keys_in_use_count`
-    と同型）。"""
+    """外部連携 API キーの自己発行の許可。`self_issued_active_count` は OFF にする前の確認用の件数（失効済み/期限切れは含まない）。"""
     user_api_keys_allowed: bool
     self_issued_active_count: int
     daily_quota_default: ExtKeysDailyQuotaDefaultInfo
     research_default_provider: ExtKeysResearchProviderInfo
 
 
-# ---- 外部連携 API キー管理（system_extras.py::_key_created_out/_key_list_out・
-# POST/GET/DELETE /ext/v1/admin/keys・POST/GET/DELETE /ext/v1/keys で共通の形）----
+# ---- 外部連携 API キー管理（POST/GET/DELETE /ext/v1/admin/keys・POST/GET/DELETE /ext/v1/keys で共通の形） ----
 
 class ExtKeyCreatedResponse(BaseModel):
-    """発行直後のレスポンス（プレーンキーを含む・このレスポンスでのみ返す）。admin 発行・
-    利用者自己発行のどちらも同じ形（`system_extras.py::_key_created_out`）。
+    """発行直後のレスポンス（プレーンキーを含み、このレスポンスでのみ返す）。
 
-    `webhook_secret`（PART-6）も**このレスポンスでのみ**平文で返す（`webhook_url` を指定した
-    ときだけ非 null・以後は一覧にも二度と出さない）。"""
+    `webhook_secret` もこのレスポンスでのみ平文で返す（`webhook_url` を指定したときだけ非 null）。
+    """
     ok: bool
     id: int
     key: str
@@ -326,8 +201,7 @@ class ExtKeyCreatedResponse(BaseModel):
 
 
 class ExtKeyListItem(BaseModel):
-    """キー一覧の1行（プレーンキーは含めない）。`webhook`（PART-6）は Webhook 登録の有無のみ・
-    `webhook_host`（登録時のみ）は宛先の host:port（path/query・`webhook_secret` は含めない）。"""
+    """キー一覧の1行（プレーンキーは含めない）。`webhook` は Webhook 登録の有無、`webhook_host` は宛先の host:port のみ。"""
     id: int
     key_prefix: str
     label: str
@@ -357,13 +231,12 @@ class ExtKeyRevokeResponse(BaseModel):
 
 
 class ExtKeyRecoverResponse(BaseModel):
-    """曖昧な発行結果（POST 応答が届かなかった等）の回復専用エンドポイントの応答。
-    `found=True` のときだけ実際に失効している（呼び出し側は found を見て文言を出し分ける）。"""
+    """曖昧な発行結果の回復用エンドポイントの応答。`found=True` のときだけ実際に失効している。"""
     found: bool
     id: int | None
     revoked_at: str | None
 class OpenaiEndpointConfigured(BaseModel):
-    """`openai_endpoint.configured`（admin が実際に保存した生値・未設定なら null）。"""
+    """`openai_endpoint.configured`（管理者が保存した生値・未設定なら null）。"""
     kind: str | None
     base_url: str | None
     auth_header: str | None
@@ -371,7 +244,7 @@ class OpenaiEndpointConfigured(BaseModel):
 
 
 class OpenaiEndpointEffective(BaseModel):
-    """`openai_endpoint.effective`（`sherpa/llm.py` による解決結果）。"""
+    """`openai_endpoint.effective`（解決結果）。"""
     kind: str
     base_url: str
     auth_header: str
@@ -379,7 +252,7 @@ class OpenaiEndpointEffective(BaseModel):
 
 
 class OpenaiEndpointInfo(BaseModel):
-    """SET-2c: OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。"""
+    """OpenAI 互換 API の接続先（本家／Azure OpenAI／その他 OpenAI 互換）。"""
     configured: OpenaiEndpointConfigured
     effective: OpenaiEndpointEffective
     kinds: list[str]
@@ -449,26 +322,20 @@ class OllamaAllowlistInfo(BaseModel):
 
 
 class WebhookAllowlistInfo(BaseModel):
-    """Webhook 宛先の SSRF allowlist。
-    `OllamaAllowlistInfo` と同形（`configured`=管理者の生値・`effective`=loopback を除いた
-    実際に許可される非 loopback 接続先の host:port）。"""
+    """Webhook 宛先の許可リスト（`configured`=管理者の生値・`effective`=実際に許可される非 loopback の host:port）。"""
     configured: list[str] | None
     effective: list[str]
 
 
 class CodexSessionRetentionInfo(BaseModel):
-    """`configured` は管理者が実際に保存した生値（未設定なら `None`）、`effective` は
-    未設定時のフォールバックを含む実効値、`default` は未設定時に使われる既定日数
-    （初期構成の既定＝30日・決定2026-09-19。`0` は明示設定時のみ「無制限」として扱う）。"""
+    """`configured`=管理者が保存した生値（未設定なら null）、`effective`=実効値、`default`=未設定時の既定日数（`0` は明示設定時のみ「無制限」）。"""
     configured: int | None
     effective: int
     default: int
 
 
 class ChatExamplesAdminInfo(BaseModel):
-    """チャット画面のクイック入力例（`sherpa/chat_examples.py`）。`configured` は保存されている
-    生値（未設定なら None・破損値も含め透過表示するため `Any`＝他の *AdminInfo と同じ理由）。
-    `effective` は実際に表示される内容（非表示なら空リスト）、`default` は組み込み既定4例。"""
+    """チャット画面のクイック入力例。`configured`=保存されている生値（未設定なら null）、`effective`=実際に表示される内容（非表示なら空リスト）、`default`=組み込み既定4例。"""
     configured: dict[str, Any] | None
     effective: list[str]
     default: list[str]
@@ -476,45 +343,25 @@ class ChatExamplesAdminInfo(BaseModel):
     max_item_length: int
 
 
-class UsageChatAdminInfo(BaseModel):
-    """STAT-2: 利用統計チャット専用の AI 選択（`usage_chat_provider`・"openai"|"ollama"・
-    利用者の実行構成には依存しない・管理者全体で統一）。`configured` は保存されている生値
-    （未設定なら `None`）——DB への直接書き込み等の破損値（"openai"/"ollama"以外の文字列に
-    限らず、非文字列型も含む）をそのまま透過して表示する契約のため `Any` にする
-    （`str | None` だと非文字列の破損値で応答全体の pydantic 検証が失敗し、
-    `GET /admin/settings` 自体が 500 化してしまう＝モジュール docstring の
-    「深くネストした自由形式 JSON」節と同じ理由）。"""
-    configured: Any
-    effective: str
-    default: str
-    providers: list[str]
-
-
 class ModelCatalogAdminInfo(BaseModel):
-    """GET・PUT /admin/settings の `model_catalog`（`sherpa/model_catalog.py`・
-    system_extras.py::_admin_settings_view）。`configured` は管理者が実際に保存した生値（未設定なら
-    null）、`effective` は組み込み既定に管理者設定を重ねた解決結果（プロバイダ→用途→セル）。"""
+    """GET・PUT /admin/settings の `model_catalog`。`configured`=管理者が保存した生値（未設定なら null）、`effective`=組み込み既定に管理者設定を重ねた解決結果（プロバイダ→用途→セル）。"""
     configured: dict[str, dict[str, ModelChoiceInfo]] | None
     effective: dict[str, dict[str, ModelChoiceInfo]]
-    # 組み込み既定のみ（管理者設定を一切重ねない解決結果）。管理画面が「セルの値が既定と異なるか」を
-    # 判定するための基準値（`effective` はセル単位で管理者設定込みのため差分判定の基準にできない）。
+    # 組み込み既定のみの解決結果（セルの値が既定と異なるかの判定基準）
     builtin: dict[str, dict[str, ModelChoiceInfo]]
     providers: list[str]
     usages: list[str]
 
 
 class DepthProfileBaseInfo(BaseModel):
-    """SC-6c（調べる深さ・調べ方ブロック §3.2）の整数系基準値1項目（標準時の値）。
-    `configured` は管理者が実際に保存した生値（未設定なら `None`）、`effective` は
-    `system_settings → env → コード既定` の解決結果、`default` は env/コード既定
-    （未設定に戻したときの実効値）。"""
+    """調べる深さの整数系基準値1項目（標準時の値）。`configured`=管理者が保存した生値（未設定なら null）、`effective`=解決結果、`default`=未設定に戻したときの実効値。"""
     configured: int | None
     effective: int
     default: int
 
 
 class DepthProfileCodexReasoningInfo(BaseModel):
-    """SC-6c: Codex 推論レベルの基準値（`sherpa.depth_profile.CODEX_REASONING_LEVELS` の1つ）。"""
+    """Codex 推論レベルの基準値（`sherpa.depth_profile.CODEX_REASONING_LEVELS` の1つ）。"""
     configured: str | None
     effective: str
     default: str
@@ -522,20 +369,14 @@ class DepthProfileCodexReasoningInfo(BaseModel):
 
 
 class CodexWorkerModelInfo(BaseModel):
-    """multi_agent（`[agents.worker]`）の worker モデル（実装ベース探索の回復 S1・案 B）。
-    `configured` は管理者が保存した生値（未設定なら `None`）、`effective` は
-    `sherpa.providers.codex.sandbox._codex_worker_model` の解決結果、`default` は
-    フォールバック定数（`_CODEX_WORKER_MODEL_FALLBACK`）。"""
+    """multi_agent の worker モデル。`configured`=管理者が保存した生値（未設定なら null）、`effective`=解決結果、`default`=フォールバック値。"""
     configured: str | None
     effective: str
     default: str
 
 
 class CodexModeInfo(BaseModel):
-    """`codex_mode`（素の Codex モード・docs/archive/2026-09-24-素のCodexモード.md §1.1）。
-    `configured` は管理者が保存した生値（未設定なら `None`）、`effective` は
-    `sherpa.providers.codex.sandbox.codex_mode` の解決結果、`default` は "standard"、`options` は
-    選べる値（`sherpa.providers.codex.sandbox.CODEX_MODES`）。"""
+    """`codex_mode`（素の Codex モード）。`configured`=管理者が保存した生値（未設定なら null）、`effective`=解決結果、`default`="standard"、`options`=選べる値。"""
     configured: str | None
     effective: str
     default: str
@@ -543,8 +384,7 @@ class CodexModeInfo(BaseModel):
 
 
 class EmbedProviderInfo(BaseModel):
-    """`embed_provider`（埋め込みの接続先・`embeddings.effective_embed_provider`）。`ollama_model` は
-    "ollama" のとき使う埋め込みモデル名（使えるモデル表の ollama/embed 既定）。"""
+    """`embed_provider`（埋め込みの接続先）。`ollama_model` は "ollama" のとき使う埋め込みモデル名。"""
     configured: str | None
     effective: str
     default: str
@@ -553,11 +393,8 @@ class EmbedProviderInfo(BaseModel):
 
 
 class DepthProfileAdminInfo(BaseModel):
-    """GET・PUT /admin/settings の `depth_profile`（SC-6c・`sherpa/depth_profile.py`・
-    system_extras.py::_admin_settings_view）。調べる深さ（クイック/標準/深く/最大）が掛ける倍率の
-    **基準値**（クイック・標準時の値）のみを持つ——倍率表自体（§3.2）は固定で編集対象外。
-    `codex_reasoning` は深さで変わらない（どの深さでもこの基準値がそのまま使われる）。"""
-    max_turns: DepthProfileBaseInfo
+    """GET・PUT /admin/settings の `depth_profile`。調べる深さ（クイック/標準/深く/最大）が掛ける倍率の基準値（クイック・標準時の値）のみを持つ（倍率表は固定）。
+    `codex_reasoning` は深さで変わらない。"""
     grep_max_hits: DepthProfileBaseInfo
     qa_max_hits: DepthProfileBaseInfo
     read_window: DepthProfileBaseInfo
@@ -567,33 +404,27 @@ class DepthProfileAdminInfo(BaseModel):
 
 
 class ChatMaxTurnsAdminInfo(BaseModel):
-    """GET・PUT /admin/settings の `chat_max_turns`（同時実行の上限・`sherpa/chat_turns.py::
-    effective_limits`・system_extras.py::_admin_settings_view）。`per_user`/`global` は
-    `DepthProfileBaseInfo` と同型（configured=管理者の生値・effective=system_settings→env の
-    解決結果・default=env 既定＝未設定に戻したときの実効値）。`global` は Python の予約語のため
-    属性名は `global_`（`Field(alias="global")`）——JSON 上のキーは `chat_max_turns.global` のまま。"""
+    """GET・PUT /admin/settings の `chat_max_turns`（同時実行の上限）。`per_user`/`global` は `DepthProfileBaseInfo` と同型。
+    `global` は予約語のため属性名は `global_`（JSON 上のキーは `global`）。"""
     per_user: DepthProfileBaseInfo
     global_: DepthProfileBaseInfo = Field(alias="global")
 
 
 class AgenticBudgetAdminInfo(BaseModel):
-    """GET・PUT /admin/settings の `agentic_budget`（`sherpa/agentic_search.py::
-    resolve_tool_result_budgets`・system_extras.py::_admin_settings_view）。agentic search の
-    tool-result バイト予算（1件あたり／1 run 累計）——`DepthProfileBaseInfo` と同型
-    （configured=管理者の生値・effective=system_settings→コード既定の解決結果・default=コード既定
-    ＝未設定に戻したときの実効値）。モデルの窓由来の上限との min()（旧 BUDGET-2・管理画面の
-    モデル窓登録表）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）。"""
+    """GET・PUT /admin/settings の `agentic_budget`（Codex の MCP ツール結果1件あたりのバイト予算）。`DepthProfileBaseInfo` と同型。"""
     per_result: DepthProfileBaseInfo
-    total: DepthProfileBaseInfo
+
+
+class WorkspaceAdminInfo(BaseModel):
+    """GET・PUT /admin/settings の `workspace`（個人ファイル）。`max_bytes`=1 件の上限（バイト）、`ttl_days`=保持日数（0 は無期限）。どちらも `DepthProfileBaseInfo` と同型。"""
+    max_bytes: DepthProfileBaseInfo
+    ttl_days: DepthProfileBaseInfo
 
 
 class AdminSettingsView(BaseModel):
-    """GET・PUT /admin/settings（system_extras.py::_admin_settings_view。全キー常時存在）。
+    """GET・PUT /admin/settings（全キー常時存在）。
 
-    response_model は付与しない: `legacy_backend.libreoffice.version`（soffice 検出バージョン
-    文字列）が OpenAPI スキーマに `version` プロパティとして露出し、
-    `test_world_param_compat.py::test_openapi_surface_has_no_version_parameter`（退役した
-    version/世代 概念を API surface に再宣言しない contract）に抵触するため。TypeAdapter 契約のみ。
+    response_model は付与しない（`legacy_backend.libreoffice.version` が OpenAPI に `version` を露出させるため）。
     """
     cloud: CloudInfo
     ext_keys: ExtKeysAdminInfo
@@ -607,29 +438,23 @@ class AdminSettingsView(BaseModel):
     ollama_allowlist: OllamaAllowlistInfo
     webhook_allowlist: WebhookAllowlistInfo
     codex_session_retention_days: CodexSessionRetentionInfo
-    usage_chat: UsageChatAdminInfo
     depth_profile: DepthProfileAdminInfo
     chat_max_turns: ChatMaxTurnsAdminInfo
     agentic_budget: AgenticBudgetAdminInfo
-    # API 経路の 1 応答あたりのツール実行上限（`agentic_search.effective_max_tools_per_turn`）。
-    # `DepthProfileBaseInfo` と同型（configured=管理者の生値・effective=解決結果・default=コード既定）。
-    agentic_tool_limit: DepthProfileBaseInfo
-    # 埋め込み HTTP の同時送信数（`embeddings.effective_embed_parallel`）。
-    # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=EMBED_PARALLEL_DEFAULT）。
+    workspace: WorkspaceAdminInfo
+    # 埋め込み HTTP の同時送信数。`DepthProfileBaseInfo` と同型
     embed_parallel: DepthProfileBaseInfo
     embed_provider: EmbedProviderInfo
-    # 「最大」の深さが許す査読の巡数（`depth_profile.effective_max_review_rounds`）。
-    # `DepthProfileBaseInfo` と同型。env フォールバックは持たない（default=MAX_REVIEW_ROUNDS_DEFAULT）。
+    # 「最大」の深さが許す査読の巡数。`DepthProfileBaseInfo` と同型
     max_review_rounds: DepthProfileBaseInfo
-    # multi_agent（S6）の worker モデル（`sandbox._codex_worker_model`）。env フォールバックは
-    # 持たない（default=`_CODEX_WORKER_MODEL_FALLBACK`）。
+    # multi_agent の worker モデル
     codex_worker_model: CodexWorkerModelInfo
-    # 素の Codex モード（`sandbox.codex_mode`）。env フォールバックは持たない（default="standard"）。
+    # 素の Codex モード（default="standard"）
     codex_mode: CodexModeInfo
     chat_examples: ChatExamplesAdminInfo
 
 
-# ---- 運営掲示板（system_extras.py::_announcement_out）----
+# ---- 運営掲示板 ----
 
 class AnnouncementOut(BaseModel):
     id: int
@@ -647,22 +472,20 @@ class AnnouncementOut(BaseModel):
 
 
 class AnnouncementsListResponse(BaseModel):
-    """GET /announcements。"""
+    """お知らせ一覧（GET /announcements）。"""
     announcements: list[AnnouncementOut]
 
 
 class AnnouncementMutateResponse(BaseModel):
-    """POST /admin/announcements・PATCH /admin/announcements/{id}。"""
+    """お知らせの作成・更新結果（POST /admin/announcements・PATCH /admin/announcements/{id}）。"""
     ok: bool
     announcement: AnnouncementOut
 
 
-# ===================================================================================
-# 管理者:ユーザー管理（sherpa/routers/admin_users.py）
-# ===================================================================================
+# ===== 管理者:ユーザー管理（sherpa/routers/admin_users.py） =====
 
 class UserRow(BaseModel):
-    """`GET /admin/users`（store.list_users）の1行。"""
+    """ユーザー一覧（GET /admin/users）の1行。"""
     uid: str
     email: str | None
     display_name: str | None
@@ -677,7 +500,7 @@ class AdminUsersListResponse(BaseModel):
 
 
 class UserCreateRow(BaseModel):
-    """`store.create_user` の RETURNING 列（`last_login_at` を持たない・UserRow と別形）。"""
+    """ユーザー作成の応答（`last_login_at` を持たない・`UserRow` と別形）。"""
     uid: str
     email: str | None
     display_name: str | None
@@ -691,17 +514,20 @@ class AdminUserCreateResponse(BaseModel):
     user: UserCreateRow
 
 
+class AdminUserImportResponse(BaseModel):
+    created: int
+    uids: list[str]
+
+
 class AdminUserPatchResponse(BaseModel):
     ok: bool
     uid: str
 
 
-# ===================================================================================
-# 管理者:監査ログ（sherpa/routers/audit_usage.py）
-# ===================================================================================
+# ===== 管理者:監査ログ（sherpa/routers/audit_usage.py） =====
 
 class AuditRow(BaseModel):
-    """`GET /admin/audit`（store.list_audit）の1行。列は固定 SELECT・値は自由形式 JSON を含む。"""
+    """監査ログ（GET /admin/audit）の1行。値は自由形式 JSON を含む。"""
     id: int
     actor_user_id: str | None
     action: str
@@ -727,8 +553,7 @@ class AdminAuditListResponse(BaseModel):
     limit: int
 
 
-# ---- 管理者:利用統計（audit_usage.py::admin_usage_stats・store/usage.py::usage_stats）----
-# 全キーが常時存在（分岐で増減しない・末尾の return 文が単一の固定 dict リテラル）ため response_model を付与する。
+# ---- 管理者:利用統計。全キーが常時存在するため response_model を付与する ----
 
 class UsageLens(BaseModel):
     impact: int
@@ -772,10 +597,7 @@ class UsagePeriod(BaseModel):
     start: str
     end: str
     days: int
-    # 実際に使った半開区間 `[from, to)`（ISO 8601・オフセット付き）。`days` 指定でも `from`/`to`
-    # 指定でも入る（`start`/`end` は従来どおり JST 暦日で `end` は**含む**終了日＝画面の日別
-    # チャートのゼロ埋め範囲。意味を変えないためこちらを別フィールドとして足す）。UsagePeriod を
-    # 返す他の経路（期間指定を持たない集計）では未設定のことがあるため任意。
+    # 実際に使った半開区間 `[from, to)`（ISO 8601・オフセット付き）。`start`/`end` は JST 暦日で `end` は含む終了日。期間指定を持たない集計では未設定のことがある
     from_: str | None = Field(default=None, alias="from")
     to: str | None = None
 
@@ -797,10 +619,7 @@ class UsageProviderRow(BaseModel):
 
 
 class UsageStopKindRow(BaseModel):
-    """`sherpa/stop_kind.py` の閉じた8値
-    （`completed`/`stopped_by_user`/`budget`/`no_evidence`/`transport_error`/`timeout`/
-    `codex_silent`/`codex_partial`）またはそのいずれにも該当しない過去データ/未計測経路の
-    `unknown` のいずれか。"""
+    """ターンの終了理由。`completed`/`stopped_by_user`/`budget`/`no_evidence`/`transport_error`/`timeout`/`codex_silent`/`codex_partial` の8値、または過去データ・未計測経路の `unknown`。"""
     stop_kind: str
     turns: int
 
@@ -868,13 +687,8 @@ class UsageTokenTotals(BaseModel):
 class UsageTokenByKind(BaseModel):
     """用途別（kind）内訳。
 
-    chat 行は messages.answer->'usage' 由来（トークン列は常に int）。それ以外の kind（`metering.KINDS`
-    参照・intent/embed/graph_ask/vlm 等）は usage_events 由来で、プロバイダが usage を報告しなかった
-    行はトークン列が None（「報告不能」マーカー・0 に丸めない）。
-
-    `elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n`:
-    usage_events.elapsed_ms（計測スコープの無い呼び出しは NULL）の合計・平均（NULL 行を除く）・
-    計測ありの行数。chat 行は対象外（別契約）＝常に total/avg=None・n=0。
+    chat 行は `messages.answer->'usage'` 由来（トークン列は常に int）。それ以外の kind は `usage_events` 由来で、プロバイダが usage を報告しなかった行はトークン列が None（0 に丸めない）。
+    `elapsed_ms_total`/`elapsed_ms_avg`/`elapsed_n` は計測ありの行の合計・平均・行数（chat 行は対象外＝total/avg=None・n=0）。
     """
     kind: str
     provider: str
@@ -890,10 +704,7 @@ class UsageTokenByKind(BaseModel):
 
 
 class UsageTokenByUserKind(BaseModel):
-    """ユーザー別 × 用途別（kind）内訳。`UsageTokenByKind` の内訳をユーザーごとに分けたもの。
-    利用者に紐付かない呼び出し（取り込み時の埋め込み・画像読み取り・rag_render 等）は含まれないため、
-    同一 kind の合計は対応する `UsageTokenByKind` 行以下になりうる。null の意味・chat 行の
-    elapsed 扱いは `UsageTokenByKind` と同じ。"""
+    """ユーザー別 × 用途別（kind）内訳（`UsageTokenByKind` をユーザーごとに分けたもの）。利用者に紐付かない呼び出しは含まれない。"""
     uid: str
     display_name: str
     kind: str
@@ -917,12 +728,8 @@ class UsageTokens(BaseModel):
 
 
 class UsageConversationTurns(BaseModel):
-    """会話あたりの user ターン数分布。
-
-    値は期間内の user ターン数（`turn_created_at` が期間内）を会話ごとに数えたもの（対象は期間内に
-    user ターンが 1 件以上ある会話・会話の全履歴ではない）。対象会話が無ければ分布は None。
-    session_eligible は期間内2ターン以上の会話数、session_recorded はそのうち現在CodexセッションIDを
-    持つ会話数（どちらも対象がなければ0）。再開実行・成功の件数ではない。
+    """会話あたりの user ターン数分布（期間内の user ターンが1件以上ある会話が対象。対象が無ければ分布は None）。
+    `session_eligible` は期間内2ターン以上の会話数、`session_recorded` はそのうち現在の Codex セッション ID を持つ会話数。
     """
     avg: float | None
     median: float | None
@@ -933,12 +740,7 @@ class UsageConversationTurns(BaseModel):
 
 
 class UsageResponseTimeRow(BaseModel):
-    """回答時間（ミリ秒・`messages.answer->>'duration_ms'`）の分布統計（1グループ分）。
-
-    `provider` は経路別行（`response_time.by_provider`）でのみ設定され、全体行
-    （`response_time.overall`）では常に `None`。対象0件なら `avg`/`median`/`max`/`p90` は
-    `None`（`n`=0）——`_compute_response_time_stats` 参照。
-    """
+    """回答時間（ミリ秒）の分布統計（1グループ分）。`provider` は経路別行でのみ設定され、全体行では `None`。対象0件なら `avg`/`median`/`max`/`p90` は `None`（`n`=0）。"""
     provider: str | None
     avg: float | None
     median: float | None
@@ -948,19 +750,16 @@ class UsageResponseTimeRow(BaseModel):
 
 
 class UsageResponseTime(BaseModel):
-    """回答時間の分布：全体（`overall`）と経路（`provider`）別（`by_provider`）。
+    """回答時間の分布：全体（`overall`）と経路別（`by_provider`）。
 
-    対象は期間内の assistant 行のうち `duration_ms` が保存されている行のみ（利用者の明示停止・
-    実行中のターンは assistant 自体を保存しないため対象外）。確認カード（`lens='clarify'`＝回答前の
-    一時停止）も含めない。
+    対象は期間内の assistant 行のうち `duration_ms` が保存されている行のみ（確認カードと、実行中・保存されずに止まったターンは含まない。停止しても回答が保存されたターンは含む）。
     """
     overall: UsageResponseTimeRow
     by_provider: list[UsageResponseTimeRow]
 
 
 class UsageConversationKindRow(BaseModel):
-    """会話ごとの用途別（kind）内訳（`conversations_top[].kinds` の1行）。null の意味・chat 行の
-    elapsed 扱いは `UsageTokenByKind` と同じ。"""
+    """会話ごとの用途別（kind）内訳（`conversations_top[].kinds` の1行）。null の意味は `UsageTokenByKind` と同じ。"""
     kind: str
     calls: int
     input: int | None
@@ -973,12 +772,8 @@ class UsageConversationKindRow(BaseModel):
 
 
 class UsageConversationRow(BaseModel):
-    """会話ごとの補助 AI 使用量（`docs/archive/2026-09-12-利用統計の拡充2.md` §2 (b)）。
-
-    トークン合計（`kinds` 内の input+output の合算）の降順で上位20件のみ（`usage_stats` 側で
-    切り詰め済み）。`user_turns` は期間内の user ターン数（`conversation_turns` と同じ母集団）。
-    `response_time_avg_ms` は `duration_ms` が保存された assistant 行のみの平均（0件なら None）。
-    タイトル・本文は含まない。
+    """会話ごとの補助 AI 使用量。トークン合計の降順で上位20件のみ。
+    `user_turns` は期間内の user ターン数、`response_time_avg_ms` は `duration_ms` が保存された assistant 行のみの平均（0件なら None）。タイトル・本文は含まない。
     """
     conversation_id: int
     uid: str
@@ -990,12 +785,9 @@ class UsageConversationRow(BaseModel):
 
 
 class UsageLimitsByProviderRow(BaseModel):
-    """経路（provider）別の「打ち切りの内訳」（`InvestigationState.limits`・制限そのものは
-    変えない計測専用）。
+    """経路（provider）別の「打ち切りの内訳」（計測専用）。
 
-    `turns` はこの provider の対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系
-    キーが真だったターン数、`*_total` は回数系キーの合計回数（bool系には無い）。経路で記録しない
-    項目は None。計測項目は発生0件でも0を返す。
+    `turns` は対象ターン総数（分母）。`*_turns` は回数系キーが1回以上／bool系キーが真だったターン数、`*_total` は回数系キーの合計回数。経路で記録しない項目は None。
     """
     provider: str
     turns: int
@@ -1005,37 +797,32 @@ class UsageLimitsByProviderRow(BaseModel):
     context_compactions_turns: int | None
     context_compactions_total: int | None
     synthesis_truncated_turns: int | None
-    # 必要な根拠種別が揃わず深さを1段だけ自動で引き上げたターン数（`providers/base.py` の
-    # 巡ループが `limits.depth_escalated` を立てる）。
+    # 必要な根拠種別が揃わず深さを1段だけ自動で引き上げたターン数
     depth_escalated_turns: int | None
     search_truncated_turns: int | None
     search_truncated_total: int | None
     auto_continues_turns: int | None
     auto_continues_total: int | None
-    # 同一条件のツール呼び出しを2回目以降省略した回数（Codex 経路のみ・`mcp_server.py::
-    # _is_duplicate_tool_call`）。
+    # 同一条件のツール呼び出しを2回目以降省略した回数（Codex 経路のみ）
     duplicate_tool_call_turns: int | None
     duplicate_tool_call_total: int | None
-    # 縮退（バックエンド不調）の計数——意味論は「このターンで初めて検出されたか」＝初回検出の計数。
+    # 縮退（バックエンド不調）の計数（このターンで初めて検出された回数）
     backend_unavailable_fulltext_turns: int | None
     backend_unavailable_graph_turns: int | None
     graph_reingest_required_turns: int | None
-    # MCP ツール呼び出し回数の上限に到達したターン数（Codex 経路のみ・`mcp_server.py`）。
+    # MCP ツール呼び出し回数の上限に到達したターン数（Codex 経路のみ）
     tool_calls_exhausted_turns: int | None
 
 
 class UsageLimits(BaseModel):
-    """内部制限の打ち切り分布（`usage_stats()["limits"]`）。"""
+    """内部制限の打ち切り分布。"""
     by_provider: list[UsageLimitsByProviderRow]
 
 
 class UsageRoundDepthProviderRow(BaseModel):
-    """深さ×経路別の巡別記録（`chat-round`・表示専用）の活動量（`usage_stats()
-    ["rounds"]["by_depth_provider"]`）。課金の正本ではない（`tokens.*` と二重に数えない）。
-
-    `limits`: 巡内 limits 増分の合算（数値系は合計・当たったか系は真になった巡数）。
-    `verdicts`/`stops`: evaluator の判定・巡を止めた理由の分類別件数（固定語彙のラベルのみ・
-    本文は含まない）。`missing_codes`: 不足軸の閉じた分類別件数（自由文の `missing` は含まない）。"""
+    """深さ×経路別の巡別記録の活動量（表示専用・課金の正本ではない）。
+    `limits`: 巡内 limits 増分の合算。`verdicts`/`stops`: evaluator の判定・巡を止めた理由の分類別件数。`missing_codes`: 不足軸の閉じた分類別件数。
+    """
     depth_profile: str
     provider: str
     rounds: int
@@ -1056,9 +843,7 @@ class UsageRoundDepthProviderRow(BaseModel):
 
 
 class UsageRoundByRoundRow(BaseModel):
-    """深さ×経路×**巡番号**別の巡別記録の活動量（`usage_stats()["rounds"]["by_round"]`）。
-    `UsageRoundDepthProviderRow` と同じ集計を巡番号（`meta.round`）単位で分けたもの——
-    「2巡目は1巡目より効くか」の判断に使う。`round_no` が取れない行は `None` に畳み込む。"""
+    """深さ×経路×巡番号別の巡別記録の活動量（`UsageRoundDepthProviderRow` を巡番号単位で分けたもの。`round_no` が取れない行は `None`）。"""
     depth_profile: str
     provider: str
     round_no: int | None
@@ -1080,8 +865,7 @@ class UsageRoundByRoundRow(BaseModel):
 
 
 class UsageRoundDistributionRow(BaseModel):
-    """深さ×経路×到達巡数ごとのターン件数（`usage_stats()["rounds"]["round_distribution"]`）。
-    `rounds_reached` はそのターンで実際に到達した巡番号の最大値。"""
+    """深さ×経路×到達巡数ごとのターン件数。`rounds_reached` はそのターンで到達した巡番号の最大値。"""
     depth_profile: str
     provider: str
     rounds_reached: int
@@ -1097,14 +881,13 @@ class UsageReasonCodeRow(BaseModel):
 
 
 class UsageRoundReasonCodes(BaseModel):
-    """理由コード分布の2軸: `final`＝最終回答の主張（`answer.data.claims`）、
-    `rounds`＝巡別記録（`chat-round`）の主張内訳を巡単位で合算したもの。"""
+    """理由コード分布: `final`＝最終回答の主張、`rounds`＝巡別記録の主張内訳を巡単位で合算したもの。"""
     final: list[UsageReasonCodeRow]
     rounds: list[UsageReasonCodeRow]
 
 
 class UsageRounds(BaseModel):
-    """巡別記録（`usage_stats()["rounds"]`）。本文は含まない。"""
+    """巡別記録（本文は含まない）。"""
     by_depth_provider: list[UsageRoundDepthProviderRow]
     by_round: list[UsageRoundByRoundRow]
     round_distribution: list[UsageRoundDistributionRow]
@@ -1113,12 +896,9 @@ class UsageRounds(BaseModel):
 
 
 class UsageQualityRunRow(BaseModel):
-    """品質採点の条件×巡数別集計（`usage_stats()["quality_runs"]["by_rounds"]`）。
-    採点そのものの本文（質問/回答）は保存しない——ここは件数と費用のみ。
-
-    `condition`: 採点した条件（`store/usage.py::QUALITY_RUN_CONDITIONS` の閉集合）。巡数だけでは
-    見直しを回さない条件同士（main と depth2-quick・どちらも `rounds=0`）が混ざるため、
-    集計はこの条件別に分ける。"""
+    """品質採点の条件×巡数別集計（件数と費用のみ・質問/回答の本文は保存しない）。
+    `condition`: 採点した条件（閉集合）。巡数だけでは区別できない条件同士を分けて集計する。
+    """
     condition: str | None
     rounds: int
     runs: int
@@ -1136,23 +916,11 @@ class UsageQualityRuns(BaseModel):
 
 
 class AdminUsageQualityRunReq(BaseModel):
-    """POST /admin/usage/quality-runs 入力（品質採点の入口）。
+    """品質採点の登録入力（POST /admin/usage/quality-runs）。質問/回答の本文は受け付けない。
 
-    採点そのものの本文（質問/回答）は受け付けない——フィールド自体が無い。件数は0以上。
-    `rounds` も0以上（見直しを一度も回さない条件＝`main`/`depth2-quick` を登録できる）。
-    `condition` は閉集合（自由文にしない＝表記ゆれで集計が割れるのを防ぐ）。
-    `executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・
-    半開区間 `[from, to)`）——集計はこの実行期間で照会するため、採点を後日登録しても元の期間で
-    読める。
-    `cost_usd` は任意（費用が取れなければ省略）——**型注釈自体には** `allow_inf_nan=False`/`ge=0` を
-    付けない: pydantic の制約違反として弾くと、FastAPI の既定 422 ハンドラが違反した生の値
-    （`inf`/`nan`）をエラー本文の `input` にそのまま埋め込もうとし、`JSONResponse`（既定
-    `allow_nan=False`）のレンダリングで `ValueError` を送出して**500 に化ける**。有限・非負の判定は
-    `routers/audit_usage.py::admin_usage_quality_run_create` がハンドラ内で行い、生の値を
-    埋め込まない定型メッセージで 422 を返す（`store.record_depth_quality_run` 側にも同じ判定の
-    二重防御がある）。
-    `run_id`（任意）は呼び出し側指定の冪等キー——同じ値で再送しても2行目を作らない
-    （`store.record_depth_quality_run` の一意制約・監査書込み失敗後のリトライでの二重計上対策）。"""
+    件数・`rounds` は0以上。`condition` は閉集合。`executed_from`/`executed_to` は質問セットを実行した期間（ISO 8601・オフセット必須・半開区間 `[from, to)`）。
+    `cost_usd` は任意（有限・非負。違反は定型メッセージの 422）。`run_id`（任意）は冪等キーで、同じ値で再送しても2行目を作らない。
+    """
     rounds: StrictInt = Field(ge=0)
     condition: Literal["main", "depth2-quick", "depth2-standard", "depth2-deep", "depth2-max"]
     executed_from: StrictStr = Field(min_length=1, max_length=64)
@@ -1168,13 +936,12 @@ class AdminUsageQualityRunReq(BaseModel):
 
 class AdminUsageQualityRunAck(BaseModel):
     ok: bool = True
-    # `run_id` 重複で `record_depth_quality_run` が新規行を作らなかった（ON CONFLICT DO NOTHING）
-    # ときは False（`run_id` の値自体はレスポンスに出さない）。
+    # `run_id` 重複で新規行を作らなかったときは False
     inserted: bool = True
 
 
 class AdminUsageStatsResponse(BaseModel):
-    """GET /admin/usage/stats（store/usage.py::usage_stats）。"""
+    """利用統計（GET /admin/usage/stats）。"""
     users: list[UsageUserRow]
     totals: UsageTotals
     daily: list[UsageDailyPoint]
@@ -1197,40 +964,10 @@ class AdminUsageStatsResponse(BaseModel):
     quality_runs: UsageQualityRuns
 
 
-class UsageChatToolCall(BaseModel):
-    """`UsageChatResponse.tool_calls` の1件。呼んだ調査ツールの名前と引数
-    （数値と id のみ・本文/タイトル/鍵は一切含まない）。"""
-    name: str
-    args: dict = {}
-
-
-class UsageChatResponse(BaseModel):
-    """POST /admin/usage/chat（sherpa/usage_chat.py::answer_usage_question）。
-
-    `provider_used`/`endpoint_kind`: 実際に使われた AI（"openai"|"ollama"）と、openai 使用時
-    の接続先種別（"openai"|"azure"|"custom"・ollama 使用時は `None`）。画面は「今回だけ」トグルを使わない送信の送信先表示を、送信前の予定表示ではなく
-    この確定値で更新する（GET /admin/settings とこの POST の間に他セッションが専用設定を
-    変更した場合の食い違いを、応答時点の値で吸収する）。
-
-    `notes`: 画面へそのまま見せる注記（改善ログの要約が取得できなかった場合の告知など・
-    通常は空リスト）。
-
-    `tool_calls`: 今回の質問応答で実際に呼んだ調査ツール（`usage_overview`等7つ・
-    `agentic_search.usage_openai_tools()`）の名前と引数。渡された統計データだけで答えた場合は
-    空リスト。"""
-    answer: str
-    provider_used: str
-    endpoint_kind: str | None = None
-    notes: list[str] = []
-    tool_calls: list[UsageChatToolCall] = []
-
-
-# ===================================================================================
-# 個人ワークスペース（sherpa/routers/workspace.py）
-# ===================================================================================
+# ===== 個人ワークスペース（sherpa/routers/workspace.py） =====
 
 class WorkspaceFileRow(BaseModel):
-    """`GET /workspace/files`。`created_at`/`expires_at` はハンドラが `str(...)` 済み＝ str 型のまま。"""
+    """個人 workspace のファイル一覧（GET /workspace/files）。`created_at`/`expires_at` は文字列。"""
     id: int
     rel_path: str
     size_bytes: int
@@ -1269,12 +1006,10 @@ class WorkspaceSearchResponse(BaseModel):
     hits: list[WorkspaceSearchHit]
 
 
-# ===================================================================================
-# 資料フォルダ(World)管理（sherpa/routers/worlds.py）
-# ===================================================================================
+# ===== 資料フォルダ管理（sherpa/routers/worlds.py） =====
 
 class PublicWorld(BaseModel):
-    """`worlds.py::_public_world`。"""
+    """公開用の資料フォルダ情報。"""
     world_id: str
     label: str | None
     root_path: str | None
@@ -1282,12 +1017,12 @@ class PublicWorld(BaseModel):
 
 
 class WorldsListResponse(BaseModel):
-    """GET /worlds。"""
+    """資料フォルダ一覧（GET /worlds）。"""
     worlds: list[PublicWorld]
 
 
 class WorldOptionsResponse(BaseModel):
-    """GET /world-options。"""
+    """資料フォルダの選択肢（GET /world-options）。"""
     worlds: list[str]
     labels: dict[str, str]
 
@@ -1298,18 +1033,14 @@ class FsEntry(BaseModel):
 
 
 class FsListResponse(BaseModel):
-    """GET /fs/list。"""
+    """フォルダ一覧（GET /fs/list）。"""
     path: str
     parent: str | None
     entries: list[FsEntry]
 
 
-# ---- GET /ingest/preview（preview_service.py::build_preview）----
-# response_model は付与しない: `documents[].provenance`（corpus_docs.provenance_summary が真値の
-# 時だけ足す）・`documents[].importance`（`_重要度.txt` の解決結果がある時だけ足す・無ければ3キー
-# とも省略）が条件付きキーのため（TypeAdapter 契約のみ・欠落キーを常時 `null` 出力に変える挙動変化を
-# 避ける）。名寄せ（merges）・extraction_method は持たない（全ノード/エッジが常に static のため
-# 意味を持たない）。
+# ---- GET /ingest/preview ----
+# response_model は付与しない（`documents[].provenance`・`documents[].importance` が条件付きキーのため。TypeAdapter 契約のみ）
 
 class IngestPreviewDocument(BaseModel):
     name: str
@@ -1361,7 +1092,7 @@ class IngestPreviewCounts(BaseModel):
 
 
 class ImportanceDiagnostic(BaseModel):
-    """`_重要度.txt` の構文診断1件（`ingest.importance.Diagnostic` の実測形）。"""
+    """`_重要度.txt` の構文診断1件。"""
     config_path: str
     line: int | None
     column: int
@@ -1370,7 +1101,7 @@ class ImportanceDiagnostic(BaseModel):
 
 
 class IngestPreviewResponse(BaseModel):
-    """GET /ingest/preview。response_model 非付与（上記 documents/merges の条件付きキーのため）。"""
+    """取り込みのプレビュー（GET /ingest/preview）。response_model は付与しない（条件付きキーのため）。"""
     world: str
     label: str | None
     counts: IngestPreviewCounts
@@ -1382,15 +1113,13 @@ class IngestPreviewResponse(BaseModel):
 
 
 class IngestBlockedDoc(BaseModel):
-    """`_ingest_summary` の `last_run_blocked` 要素（対象ファイルが特定できる blocked flag の doc/reason）。"""
+    """`last_run_blocked` の要素（対象ファイルが特定できる blocked flag の doc/reason）。"""
     doc: str
     reason: str
 
 
 class RunProgress(BaseModel):
-    """実行中 run の逐次進捗（ING-3・`ingest_runs.progress`）。内部段キー（`stage`）に対応する
-    利用者向け平文は `stage_label`（サーバ定数・`sherpa.ingest.worker.STAGE_LABELS`）。
-    `done`/`total`＝ファイル単位の進捗（段によっては件数を持たず両方 `None`）。"""
+    """実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。"""
     stage: str
     stage_label: str
     done: int | None
@@ -1399,28 +1128,15 @@ class RunProgress(BaseModel):
 
 
 class IngestSummaryFields(BaseModel):
-    """`worlds.py::_ingest_summary`（`corpus_docs.scan_report` のキャッシュ ＋ graph/ES 件数・最終実行状態）。
+    """資料フォルダの取り込み状況（スキャン結果のキャッシュ＋グラフ/ES 件数・最終実行状態）。
 
-    `scanned`〜`unreadable`（ING-2）は `worlds.last_scan_report` のキャッシュ（sync 完走時／
-    `POST /worlds/{wid}/recount` の時だけ更新・**このエンドポイント自身はフォルダを歩かない**）。
-    `counts_as_of`＝そのキャッシュの記録時刻（`None`＝未集計・再集計を促す）。
-    `failed_files`／`partial_extraction_suspected`／`stage_summary`（ING-1）は最新 run の
-    `extraction_snapshot` 由来（run が無い/該当データが無ければ `None`）。
-    `failure_reason_catalog`／`partial_extraction_advice` は閉じた理由語彙の平文辞書（常時同一・
-    `sherpa.ingest.failure_reasons` が単一の真実源）。
-    `last_run_warnings`/`last_run_blocked` は元の flags を打ち切って導出したもの——
-    `last_run_flags_total`＝打切り前の flags 総数・`last_run_flags_truncated`＝打切りが発生したか。
-    `last_run_id`／`running_progress`（ING-3）＝最新 run の id と実行中進捗（実行中でなければ
-    `running_progress` は `None`）。
-    `sensitive_excluded`／`unreachable_as_text`／`unreachable_as_text_by_ext`も
-    `scanned`〜`unreadable` と同じキャッシュ由来——無変更の再同期（`ingest.worker._sync_impl` の
-    unchanged 経路）は最新 run の `extraction_snapshot` を書き換えるだけで `scan_report` を再実行
-    しないため、画面はこのキャッシュ（run に紐付かない世界単位の値）を見て初めて無変更後も
-    表示が消えない。
-    `unreachable_by_reason`／`encoding_partial_count`（SRH-05）も同じキャッシュ由来：
-    `unreachable_by_reason`＝`unreachable_as_text` の内訳のうち理由コードが判明しているものだけ
-    （`"encoding_undetermined"`／`"binary"`）。`encoding_partial_count`＝対象外にしない
-    「一部が化けている」件数（`unreachable_as_text` には含めない・読める文書のうち要確認のもの）。
+    `scanned`〜`unreadable` は sync 完走時と `POST /worlds/{wid}/recount` のときだけ更新されるキャッシュで、このエンドポイント自身はフォルダを歩かない。
+    `counts_as_of` はそのキャッシュの記録時刻（`None`＝未集計）。`sensitive_excluded`/`unreachable_as_text`/`unreachable_as_text_by_ext`/
+    `unreachable_by_reason`（`"encoding_undetermined"`/`"binary"`）/`encoding_partial_count`（一部が化けている件数）も同じキャッシュ由来。
+    `failed_files`/`partial_extraction_suspected`/`stage_summary` は最新 run の由来（無ければ `None`）。
+    `failure_reason_catalog`/`partial_extraction_advice` は閉じた理由語彙の平文辞書。
+    `last_run_warnings`/`last_run_blocked` は flags を打ち切って導出したもの（`last_run_flags_total`=打切り前の総数・`last_run_flags_truncated`=打切りの有無）。
+    `last_run_id`/`running_progress` は最新 run の id と実行中進捗（実行中でなければ `running_progress` は `None`）。
     """
     scanned: int
     indexed: int
@@ -1460,8 +1176,7 @@ class IngestSummaryFields(BaseModel):
 
 
 class WorldStatusResponse(IngestSummaryFields):
-    """GET /worlds/{wid}/status（`_ingest_summary` の全キーを**フラットに**展開・`worlds.py::world_status`）。
-    `last_synced_at` はハンドラが `str(...)` 済み＝ str 型のまま。"""
+    """資料フォルダの状況（GET /worlds/{wid}/status）。取り込み状況の全キーをフラットに展開する。`last_synced_at` は文字列。"""
     ok: bool
     world_id: str
     label: str | None
@@ -1470,8 +1185,7 @@ class WorldStatusResponse(IngestSummaryFields):
 
 
 class WorldDiffResponse(BaseModel):
-    """POST /worlds/diff・GET /worlds/{wid}/diff（`worlds.py::_diff_payload` ＋ `ingest_worker.diff_dir`。
-    全キー常時存在）。"""
+    """差分プレビュー（POST /worlds/diff・GET /worlds/{wid}/diff）。全キー常時存在。"""
     ok: bool
     registered: bool
     world_id: str | None
@@ -1485,17 +1199,11 @@ class WorldDiffResponse(BaseModel):
 
 
 class WorldIngestAcceptedResponse(BaseModel):
-    """POST /worlds・POST /worlds/{wid}/refresh・DELETE /worlds/{wid}・
-    POST /worlds/{wid}/rebind・POST /ingest/rerun（即受付契約・HTTP 202）。
+    """取り込み操作の受付結果（POST /worlds・POST /worlds/{wid}/refresh・DELETE /worlds/{wid}・POST /worlds/{wid}/rebind・POST /ingest/rerun。HTTP 202）。
 
-    取り込み本体（登録/更新の再取り込み・削除の派生物wipe・参照先変更の
-    破棄→再作成・強制フル再構築）は背景（`sherpa.ingest.background`）で継続する——この応答は
-    「受け付けた」ことだけを示す。
-    `run_id`＝`ingest_runs.id`（受付処理自身が O(1) の INSERT で確保してから
-    背景実行へ渡すため、この応答の時点で**必ず**判明している＝非 null）。`joined=True`＝world
-    単位の多重クリック制御（操作種別＋正規化 payload の一致）により新規実行はせず既存 run へ
-    合流した（不一致なら 409）。進捗・結果は `GET /worlds/{wid}/status` の `last_run_*`／進捗中
-    フィールドで確認する（削除成功後は world 行自体が消えるため同エンドポイントは 404 になる）。
+    本体処理は背景で継続し、この応答は「受け付けた」ことだけを示す。`run_id` は受付時点で必ず判明している（非 null）。
+    `joined=True` は多重クリック制御（操作種別＋正規化 payload の一致）により新規実行せず既存 run へ合流した場合（不一致なら 409）。
+    進捗・結果は `GET /worlds/{wid}/status` で確認する（削除成功後は 404）。
     """
     ok: bool
     world_id: str
@@ -1505,16 +1213,13 @@ class WorldIngestAcceptedResponse(BaseModel):
 
 
 class WorldRecountResponse(IngestSummaryFields):
-    """POST /worlds/{wid}/recount（ING-2・`corpus_docs.scan_report` を明示的に再実行してキャッシュし直す・
-    唯一の明示的な実走査・同期のまま＝2TB 走査でも軽量な metadata 集計のため背景化していない）。
-    `worlds.py::world_recount` が `_ingest_summary` をフラットに展開して返す。"""
+    """再集計（POST /worlds/{wid}/recount）。スキャンを明示的に再実行してキャッシュし直し、取り込み状況をフラットに展開して返す（同期）。"""
     ok: bool
     world_id: str
 
 
 class WorldReconvertResponse(BaseModel):
-    """POST /worlds/{wid}/reconvert（ING-1・1ファイルの旧形式変換キャッシュを落として world 全体を sync・
-    同期のまま＝対象は1ファイルのみで背景化していない）。`summary` は `_ingest_summary` をネスト。"""
+    """1ファイルの再変換（POST /worlds/{wid}/reconvert）。旧形式変換キャッシュを落として world 全体を sync する（同期）。`summary` は取り込み状況をネストする。"""
     ok: bool
     world_id: str
     rel: str
@@ -1526,12 +1231,10 @@ class WorldReconvertResponse(BaseModel):
     note: str
 
 
-# ===================================================================================
-# ナレッジグラフ（sherpa/routers/graph.py）
-# ===================================================================================
+# ===== ナレッジグラフ（sherpa/routers/graph.py） =====
 
 class GraphNode(BaseModel):
-    """GET /graph（preview_service.py::graph_view の nodes）。"""
+    """グラフのノード（GET /graph の nodes）。"""
     id: str
     name: str | None
     type: str | None
@@ -1543,7 +1246,7 @@ class GraphNode(BaseModel):
 
 
 class GraphEdge(BaseModel):
-    """GET /graph（preview_service.py::graph_view の edges）。"""
+    """グラフのエッジ（GET /graph の edges）。"""
     source: str
     target: str
     type: str
@@ -1551,7 +1254,7 @@ class GraphEdge(BaseModel):
 
 
 class GraphCounts(BaseModel):
-    """`preview_service.py::_counts`（S3・K12＝全ノード/エッジが常に static のため llm/both は撤去済み）。"""
+    """グラフの件数。"""
     entities: int
     entities_static: int
     relations: int
@@ -1562,7 +1265,7 @@ class GraphCounts(BaseModel):
 
 
 class GraphResponse(BaseModel):
-    """GET /graph（`graph.py::graph_get`。`signature` はルーターが ETag 用に pop 済み＝応答に含まれない）。"""
+    """グラフ全体（GET /graph）。"""
     world: str
     nodes: list[GraphNode]
     edges: list[GraphEdge]
@@ -1573,7 +1276,7 @@ class GraphResponse(BaseModel):
 
 
 class GraphFacetsResponse(BaseModel):
-    """GET /graph/facets（graph_admin.py::facets）。"""
+    """グラフの絞り込み候補（GET /graph/facets）。"""
     node_labels: list[str]
     node_labels_ja: dict[str, str]
     relationship_types: list[str]
@@ -1581,7 +1284,7 @@ class GraphFacetsResponse(BaseModel):
 
 
 class GraphSearchNode(BaseModel):
-    """GET /graph/search（graph_admin.py::_node。GraphNode と別形＝phase/category を持つ）。"""
+    """検索結果のノード（GET /graph/search。`GraphNode` と別形で phase/category を持つ）。"""
     id: str
     name: str | None
     type: str | None
@@ -1596,80 +1299,20 @@ class GraphSearchNode(BaseModel):
 
 
 class GraphSearchCounts(BaseModel):
-    """`graph_admin.py::_rows_to_graph` 既定の counts（`{"nodes":.., "edges":..}` ＝ GraphCounts と別形）。"""
+    """検索結果の件数（`{"nodes":.., "edges":..}`・`GraphCounts` と別形）。"""
     nodes: int
     edges: int
 
 
 class GraphSearchResponse(BaseModel):
-    """GET /graph/search（graph_admin.py::_rows_to_graph）。"""
+    """グラフ検索の結果（GET /graph/search）。"""
     world: str
     nodes: list[GraphSearchNode]
     edges: list[GraphEdge]
     counts: GraphSearchCounts
 
 
-# ---- POST /graph/ask（graph_admin.py::ask_graph・graph.py::_knowledge_status_summary）----
-# 全分岐（llm_unavailable/failed/no_graph_evidence/ok）が同じキー集合を返す（`status` の値だけが違う）
-# ため response_model を付与できる。
-
-class KnowledgeIsolatedNode(BaseModel):
-    name: str | None
-    type: str | None
-    path: str | None
-
-
-class KnowledgeWeakDocument(BaseModel):
-    name: str | None
-    doctype: str | None
-    category: str | None
-
-
-class KnowledgeIngestError(BaseModel):
-    id: Any
-    status: str | None
-    created_at: str
-
-
-class KnowledgeStatusSummary(BaseModel):
-    """graph.py::_knowledge_status_summary（`POST /graph/ask` の `summary` フィールド）。"""
-    world: str
-    scope_paths: list[str]
-    documents: int
-    graph_nodes: int
-    graph_edges: int
-    isolated_node_count: int
-    isolated_nodes: list[KnowledgeIsolatedNode]
-    weak_document_count: int
-    weak_documents: list[KnowledgeWeakDocument]
-    recent_ingest_errors: list[KnowledgeIngestError]
-
-
-class GraphAskCitedNode(BaseModel):
-    name: str | None
-    label: str | None
-    type_ja: str | None
-    role: Any
-    category: Any
-    distance: Any
-    path: list[Any]
-    edges: list[Any]
-
-
-class GraphAskResponse(BaseModel):
-    """POST /graph/ask（graph.py::graph_ask・graph_admin.py::ask_graph）。"""
-    status: str
-    world: str
-    question: str
-    answer: str
-    cited_nodes: list[GraphAskCitedNode]
-    docs: list[str]
-    summary: KnowledgeStatusSummary
-
-
-# ===================================================================================
-# 範囲（sherpa/routers/impact.py::scopes）
-# ===================================================================================
+# ===== 範囲（sherpa/routers/impact.py::scopes） =====
 
 class ScopeItem(BaseModel):
     path: str
@@ -1679,18 +1322,16 @@ class ScopeItem(BaseModel):
 
 
 class ScopesResponse(BaseModel):
-    """GET /scopes（scope.py::scope_tree）。"""
+    """範囲セレクタ用のフォルダ木（GET /scopes）。"""
     world: str
     label: str | None
     scopes: list[ScopeItem]
 
 
-# ===================================================================================
-# 会話管理・会話共有（sherpa/routers/conversations.py・sherpa/routers/shares.py）
-# ===================================================================================
+# ===== 会話管理・会話共有（sherpa/routers/conversations.py・shares.py） =====
 
 class ForkedFromInfo(BaseModel):
-    """SH-1: フォーク元の出所表示（編集不可）。`name` は表示名未設定/退会等で `None` になりうる。"""
+    """フォーク元の出所表示（編集不可）。`name` は表示名未設定/退会等で `None` になりうる。"""
     share_id: int
     user_id: str
     name: str | None
@@ -1698,21 +1339,13 @@ class ForkedFromInfo(BaseModel):
 
 
 class ConversationSearchMatch(BaseModel):
-    """H1（履歴検索）: `GET /conversations?q=`（store.search_conversations）が行に付ける一致箇所。
-    `where="title"` はタイトル一致、`"message"` は本文（messages.content／answer.headline）一致。"""
+    """履歴検索（`GET /conversations?q=`）が行に付ける一致箇所。`where="title"` はタイトル一致、`"message"` は本文一致。"""
     where: Literal["title", "message"]
     snippet: str
 
 
 class ConversationSummary(BaseModel):
-    """`GET /conversations`（store.list_conversations／`q` 指定時は store.search_conversations）の1行。
-    `match` は `q` 指定時のみ付く（省略時は常に欠落・従来どおり）。
-
-    response_model は付与しない: `version`（DB 列・歴史的名称＝世代/世界 ID の実体・語彙統一の
-    スコープ外＝DB 不変）が OpenAPI スキーマに `version` プロパティとして露出し、
-    `test_world_param_compat.py::test_openapi_surface_has_no_version_parameter`（退役した
-    version/世代 概念を API surface に再宣言しない contract）に抵触するため。TypeAdapter 契約のみ。
-    """
+    """会話一覧（`GET /conversations`）の1行。`match` は `q` 指定時のみ付く。response_model は付与しない（`version` が OpenAPI に露出するため）。"""
     id: int
     title: str | None
     version: str
@@ -1724,14 +1357,13 @@ class ConversationSummary(BaseModel):
     shared_by_user_id: str | None
     shared_by_name: str | None
     share_status: str | None
-    share_expires_at: WireDateTime | None = None   # 受領共有の実効期限（それ以外は None）
+    share_expires_at: WireDateTime | None = None  # 受領共有の実効期限（それ以外は None）
     forked_from: ForkedFromInfo | None = None
     match: ConversationSearchMatch | None = None
 
 
 class ConversationDetailConv(BaseModel):
-    """`GET /conversations/{cid}` の `conversation`（store/shares.py::get_conversation_for_read。
-    無効な受領共有分岐でも同じ列を返す＝形は不変）。"""
+    """`GET /conversations/{cid}` の `conversation`。無効な受領共有分岐でも同じ列を返す。"""
     id: int
     user_id: str
     version: str
@@ -1751,10 +1383,8 @@ class ConversationDetailConv(BaseModel):
 
 
 class ConversationMessage(BaseModel):
-    """`messages[]` の1件。受領共有は `route`/`trace` を `None` に伏せるが、キー自体は消えない
-    （`answer` はレンズごとに中身が異なる多相構造のため `Any`）。`feedback` は読者本人が投稿した
-    フィードバック（{rating,tags,comment}・無ければ `None`。受領共有の閲覧者には常に `None`
-    ＝所有者のフィードバックは漏らさない）。"""
+    """`messages[]` の1件。受領共有は `route`/`trace` を `None` に伏せる（キーは残る）。`answer` はレンズごとに中身が異なるため `Any`。
+    `feedback` は読者本人のフィードバック（{rating,tags,comment}・無ければ `None`。受領共有の閲覧者には常に `None`）。"""
     id: int
     role: str
     content: str
@@ -1767,9 +1397,7 @@ class ConversationMessage(BaseModel):
 
 
 class ConversationDetailResponse(BaseModel):
-    """GET /conversations/{cid}（store/shares.py::get_conversation_for_read）。response_model 非付与:
-    `share_status` は無効/個人ブロックの受領共有の時だけ付くトップレベルの条件付きキーのため
-    （TypeAdapter 契約のみ・欠落キーを常時 `null` 出力に変える挙動変化を避ける）。"""
+    """会話の詳細（GET /conversations/{cid}）。response_model は付与しない（`share_status` が無効/個人ブロックの受領共有のときだけ付く条件付きキーのため）。"""
     conversation: ConversationDetailConv
     messages: list[ConversationMessage]
     share_status: str | None = None
@@ -1781,12 +1409,12 @@ class UserSuggestItem(BaseModel):
 
 
 class UsersSuggestResponse(BaseModel):
-    """GET /users/suggest。"""
+    """ユーザー候補（GET /users/suggest）。"""
     users: list[UserSuggestItem]
 
 
 class ShareCreateResponse(BaseModel):
-    """POST /conversations/{cid}/shares（shares.py::conversation_share_create）。"""
+    """会話共有の作成（POST /conversations/{cid}/shares）。"""
     ok: bool
     share_id: int
     url: str
@@ -1794,20 +1422,20 @@ class ShareCreateResponse(BaseModel):
 
 
 class ConversationForkResponse(BaseModel):
-    """POST /conversations/{wid}/fork（SH-1・shares.py::conversation_fork）。"""
+    """会話のフォーク（POST /conversations/{wid}/fork）。"""
     ok: bool
     conversation_id: int
 
 
 class ConversationShareRefreshResponse(BaseModel):
-    """POST /conversation-shares/{share_id}/refresh（SH-2・shares.py::conversation_share_refresh）。"""
+    """会話共有の更新（POST /conversation-shares/{share_id}/refresh）。"""
     ok: bool
     share_id: int
     refreshed_at: WireDateTime
 
 
 class ConversationShareExtendResponse(BaseModel):
-    """POST /conversation-shares/{share_id}/extend（shares.py::conversation_share_extend）。"""
+    """会話共有の期限延長（POST /conversation-shares/{share_id}/extend）。"""
     ok: bool
     share_id: int
     expires_at: WireDateTime
@@ -1820,7 +1448,7 @@ class ShareInviteeItem(BaseModel):
 
 
 class ShareListItem(BaseModel):
-    """`GET /conversations/{cid}/shares`（SH-2・store/shares.py::list_shares_for_conversation）の1件。"""
+    """会話共有一覧（`GET /conversations/{cid}/shares`）の1件。"""
     share_id: int
     sanitized: bool
     created_at: WireDateTime
@@ -1831,41 +1459,35 @@ class ShareListItem(BaseModel):
     invitees: list[ShareInviteeItem]
 
 
-# ===================================================================================
-# チャット（sherpa/routers/chat.py）
-# ===================================================================================
+# ===== チャット（sherpa/routers/chat.py） =====
 
 class ChatTurnStartResponse(BaseModel):
-    """POST /chat/turns（chat.py::chat_turns_start）。"""
+    """チャットターンの開始（POST /chat/turns）。"""
     turn_id: str
     conversation_id: int
 
 
 class ChatTurnStopResponse(BaseModel):
-    """POST /chat/turns/{turn_id}/stop。"""
+    """チャットターンの停止（POST /chat/turns/{turn_id}/stop）。"""
     ok: bool
 
 
 class ChatTurnRunning(BaseModel):
-    """`GET /chat/turns/running` の1要素。`started_at` はハンドラが `.isoformat()` 済み＝ str 型のまま。"""
+    """`GET /chat/turns/running` の1要素。`started_at` は文字列。"""
     turn_id: str
     conversation_id: int
     started_at: str
-    uid: str | None = None   # `all=true`（管理者）のときだけ値が入る（それ以外は null）
+    uid: str | None = None  # `all=true`（管理者）のときだけ値が入る（それ以外は null）
 
 
 class ChatTurnsRunningResponse(BaseModel):
     turns: list[ChatTurnRunning]
 
 
-# ===================================================================================
-# 文書（sherpa/routers/documents.py）
-# ===================================================================================
+# ===== 文書（sherpa/routers/documents.py） =====
 
 class EsSearchHit(BaseModel):
-    """`GET /admin/es/search` の hits[] 要素。`extraction_method`/`confidence`/`has_conflicts` は
-    元コードが値がある時だけキーを足す（欠落時デフォルト無し）ため `Any` で緩衝し、response_model は
-    付与しない（TypeAdapter 契約のみ）。"""
+    """`GET /admin/es/search` の hits[] 要素。`extraction_method`/`confidence`/`has_conflicts` は値があるときだけキーが付く。"""
     doc_id: str
     line: Any
     snippet: str
@@ -1877,8 +1499,7 @@ class EsSearchHit(BaseModel):
 
 
 class EsSearchResponse(BaseModel):
-    """GET /admin/es/search（documents.py::_admin_es_search_endpoint）。response_model 非付与
-    （hits[] のキーが条件付きのため・TypeAdapter 契約のみ）。"""
+    """ES 検索（GET /admin/es/search）。response_model は付与しない（hits[] のキーが条件付きのため）。"""
     world: str
     query: str
     scope_paths: list[str]

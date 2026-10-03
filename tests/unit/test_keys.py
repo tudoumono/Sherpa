@@ -24,8 +24,8 @@ def test_selected_cloud_provider_defaults_to_openai_when_unset(monkeypatch):
 
 
 def test_selected_cloud_provider_normalizes_case_and_whitespace(monkeypatch):
-    _sys(monkeypatch, {"cloud_provider": " Gemini "})
-    assert keys.selected_cloud_provider() == "gemini"
+    _sys(monkeypatch, {"cloud_provider": " OpenAI "})
+    assert keys.selected_cloud_provider() == "openai"
 
 
 def test_selected_cloud_provider_falls_back_to_default_for_unknown_value(monkeypatch):
@@ -36,7 +36,7 @@ def test_selected_cloud_provider_falls_back_to_default_for_unknown_value(monkeyp
 
 def test_selected_cloud_provider_accepts_explicit_system_settings_dict():
     """呼び出し側が system_settings を明示的に渡した場合は store を読まない（引数優先）。"""
-    assert keys.selected_cloud_provider({"cloud_provider": "bedrock"}) == "bedrock"
+    assert keys.selected_cloud_provider({"cloud_provider": "not-a-real-provider"}) == "openai"
 
 
 def test_selected_cloud_provider_strict_raises_for_unknown_value(monkeypatch):
@@ -93,7 +93,7 @@ def test_cloud_provider_explicitly_selected_true_even_when_value_equals_default(
 
 
 def test_cloud_provider_explicitly_selected_true_for_other_explicit_values(monkeypatch):
-    for value in ("gemini", "bedrock", "not-a-real-provider"):
+    for value in ("not-a-real-provider",):
         _sys(monkeypatch, {"cloud_provider": value})
         assert keys.cloud_provider_explicitly_selected() is True
 
@@ -159,33 +159,10 @@ def test_resolve_api_key_empty_string_personal_value_does_not_win(monkeypatch):
 def test_resolve_api_key_unknown_provider_raises():
     import pytest
     with pytest.raises(ValueError):
-        keys.resolve_api_key("anthropic-direct", {})
+        keys.resolve_api_key("gemini", {})
 
 
-# ---- resolve_api_key: A7（クラウドプロバイダ排他選択） ----
-
-def test_resolve_api_key_a7_blocks_non_selected_provider_even_with_keys_present(monkeypatch):
-    """gemini の中央/個人キーが両方あっても、選択中プロバイダが openai なら None（保存キーは温存・不使用）。"""
-    _sys(monkeypatch, {"personal_api_keys_allowed": True, "cloud_provider": "openai",
-                       "gemini_api_key": "central-gemini"})
-    assert keys.resolve_api_key("gemini", {"gemini_api_key": "personal-gemini"}) is None
-
-
-def test_resolve_api_key_a7_allows_selected_provider(monkeypatch):
-    _sys(monkeypatch, {"personal_api_keys_allowed": True, "cloud_provider": "gemini",
-                       "gemini_api_key": "central-gemini"})
-    assert keys.resolve_api_key("gemini", {}) == "central-gemini"
-
-
-def test_resolve_api_key_a7_switching_provider_does_not_delete_other_keys(monkeypatch):
-    """非選択プロバイダのキーは system_settings にそのまま残っている想定＝resolve は None を返すだけ
-    （削除はしない・呼び出し側は sysset に触れていない）。"""
-    sysset = {"personal_api_keys_allowed": True, "cloud_provider": "bedrock",
-              "openai_api_key": "still-here-but-unused", "bedrock_api_key": "bedrock-key"}
-    _sys(monkeypatch, sysset)
-    assert keys.resolve_api_key("openai", {}) is None
-    assert keys.resolve_api_key("bedrock", {}) == "bedrock-key"
-    assert sysset["openai_api_key"] == "still-here-but-unused"   # 温存されたまま（消えていない）
+# ---- resolve_api_key: A7（クラウドプロバイダ） ----
 
 
 def test_resolve_api_key_strict_raises_for_invalid_cloud_provider(monkeypatch):
@@ -219,7 +196,7 @@ def test_resolve_ollama_url_personal_overrides_central(monkeypatch):
 
 
 def test_resolve_ollama_url_not_gated_by_a7_cloud_provider_selection(monkeypatch):
-    """クラウドプロバイダが gemini/bedrock を選んでいても Ollama は常に使える（排他対象外）。"""
+    """閉じたプロバイダの保存値が残っていても Ollama は常に使える（排他対象外）。"""
     _sys(monkeypatch, {"cloud_provider": "gemini", "ollama_url": "http://central-ollama:11434"})
     assert keys.resolve_ollama_url({}) == "http://central-ollama:11434"
 

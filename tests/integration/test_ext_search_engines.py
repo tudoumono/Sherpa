@@ -1,8 +1,8 @@
-"""外部連携 API E2a〜b（`sherpa/search_service.py` のエンジン分離検索）の統合テスト。
+"""外部連携 API E2a〜b（`sherpa/parts/read/fused_search.py` のエンジン分離検索）の統合テスト。
 
 要 ES/Neo4j 実接続（不達なら SKIP・tests/integration の既存流儀）。RRF融合の計算式・graph
-マッピングの純粋ロジックは `tests/unit/test_search_service.py` で検証済み。ここでは実 ES/Neo4j
-経路（`es_index.search`/`search_knn_only`/Neo4j 影響たどり）が search_service 経由で正しく
+マッピングの純粋ロジックは `tests/unit/test_fused_search.py` で検証済み。ここでは実 ES/Neo4j
+経路（`es_index.search`/`search_knn_only`/Neo4j 影響たどり）が fused_search 経由で正しく
 配線されていること、および既存 `es_index.search()` を1文字も壊していないことを検証する。
 """
 from __future__ import annotations
@@ -13,7 +13,8 @@ import time
 import pytest
 from _world_setup import TEST_WORLD_ID
 
-from sherpa import es_index, search_service
+from sherpa import es_index
+from sherpa.parts.read import fused_search
 
 
 def _es_or_skip():
@@ -53,7 +54,7 @@ def _index_v1():
 def test_keyword_engine_es():
     _es_or_skip()
     _index_v1()
-    hits, reason = search_service._search_keyword(TEST_WORLD_ID, "消費税率", [], 5, None)
+    hits, reason = fused_search._search_keyword(TEST_WORLD_ID, "消費税率", [], 5, None)
     assert reason is None
     assert hits and all(h["doc_id"] and h["snippet"] for h in hits)
 
@@ -89,7 +90,7 @@ def test_knn_only_no_bm25_leak(monkeypatch):
 def test_existing_search_unchanged():
     """既存 `es_index.search()`（ハイブリッド固定）の挙動が search_knn_only 追加後も不変。
     RV2（FBK-1・2026-09-01）: 返値は (hits, degrade_reason) タプルへ統一——通常の索引済み world
-    では degrade しないため reason は None のまま（`search_knn_only`/`search_service` と同型）。"""
+    では degrade しないため reason は None のまま（`search_knn_only`/`fused_search` と同型）。"""
     _es_or_skip()
     _index_v1()
     hits, reason = es_index.search(TEST_WORLD_ID, "消費税率", k=5)
@@ -100,7 +101,7 @@ def test_existing_search_unchanged():
 def test_scope_filter_all_engines():
     _es_or_skip()
     _index_v1()
-    hits, reason = search_service._search_keyword(TEST_WORLD_ID, "バッチ", ["4期/03_開発"], 10, None)
+    hits, reason = fused_search._search_keyword(TEST_WORLD_ID, "バッチ", ["4期/03_開発"], 10, None)
     assert reason is None
     assert all(h["doc_id"].startswith("4期/03_開発") for h in hits)
 
@@ -111,7 +112,7 @@ def test_graph_engine_impact():
     _neo4j_or_skip()
     from _world_setup import ensure_v1
     ensure_v1()
-    hits, reason = search_service._search_graph(TEST_WORLD_ID, "消費税率", None, 10, None)
+    hits, reason = fused_search._search_graph(TEST_WORLD_ID, "消費税率", None, 10, None)
     assert reason is None
     assert hits, "影響たどりの結果が空（fixture の起点語が変わっていないか確認）"
     assert all(h["key"] for h in hits)
@@ -129,7 +130,7 @@ def test_public_search_combines_engines():
     _index_v1()
     from _world_setup import ensure_v1
     ensure_v1()
-    res = search_service.search(TEST_WORLD_ID, "消費税率", engines=["keyword", "graph"], k=10)
+    res = fused_search.search(TEST_WORLD_ID, "消費税率", engines=["keyword", "graph"], k=10)
     assert set(res["engines_used"]) == {"keyword", "graph"}
     assert res["degraded"] == []
     assert res["hits"]
@@ -138,7 +139,7 @@ def test_public_search_combines_engines():
 # ===== 契約テスト: 個人 workspace は検索対象に出ない（CLAUDE.md 契約）=====
 
 def test_search_never_returns_workspace():
-    """個人 workspace に置いたファイルは ES/Neo4j 経由の search_service の hits に一切出ない
+    """個人 workspace に置いたファイルは ES/Neo4j 経由の fused_search の hits に一切出ない
     （共有 KB のみが検索対象・CLAUDE.md 契約）。"""
     _es_or_skip()
     _index_v1()
@@ -150,7 +151,7 @@ def test_search_never_returns_workspace():
     ws_dir.mkdir(parents=True, exist_ok=True)
     (ws_dir / "secret.txt").write_text(marker, encoding="utf-8")
     try:
-        hits, reason = search_service._search_keyword(TEST_WORLD_ID, marker, [], 10, None)
+        hits, reason = fused_search._search_keyword(TEST_WORLD_ID, marker, [], 10, None)
         assert reason is None
         assert hits == []
     finally:

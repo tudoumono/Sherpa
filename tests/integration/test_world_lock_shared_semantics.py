@@ -1,11 +1,12 @@
 """`store.db.world_lock_shared`（共有 advisory lock）の実 PostgreSQL 相互排他検証（要 Postgres）。
 
-PART-4（`sherpa/research_service.py`）が rebind（`sherpa.ingest.worker` の排他 `world_lock`）との
-TOCTOU を避けるために使う共有ロックの意味論そのものを、複数コネクションで実測する:
+読み取り専用処理（`sherpa/doc_ledger.py`・`sherpa/routers/documents.py` 等）が rebind
+（`sherpa.ingest.worker` の排他 `world_lock`）との TOCTOU を避けるために使う共有ロックの意味論
+そのものを、複数コネクションで実測する:
 
-  1. 共有ロック同士は並行できる（research 同士がブロックし合わない）。
-  2. 排他ロック（`world_lock`）保持中は共有ロックの取得が待たされる（rebind 中は research が待つ）。
-  3. 共有ロック保持中は排他ロックの取得が待たされる（research 中は rebind が待つ）。
+  1. 共有ロック同士は並行できる（読み取り専用処理同士がブロックし合わない）。
+  2. 排他ロック（`world_lock`）保持中は共有ロックの取得が待たされる（rebind 中は読み取りが待つ）。
+  3. 共有ロック保持中は排他ロックの取得が待たされる（読み取り中は rebind が待つ）。
   4. `timeout_ms` を超えると `psycopg.errors.LockNotAvailable`（呼び出し元は 503 にする）。
 
 Neo4j は不要（PostgreSQL の advisory lock だけの検証）。

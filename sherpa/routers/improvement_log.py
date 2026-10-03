@@ -1,10 +1,4 @@
-"""管理者:改善ログ。`GET /admin/improvement-log/export` のみ。
-
-集計ロジック（ページング・個人情報除外・1ターン→エクスポート1行の変換・honest_failure 判定）は
-`sherpa/improvement_log.py` に置く。
-
-このモジュールは `sherpa.api` を import しない（循環回避）。
-"""
+"""管理者向けの改善ログ（`GET /admin/improvement-log/export`）。集計ロジックは `sherpa/improvement_log.py`。`sherpa.api` を import しない。"""
 from __future__ import annotations
 
 import csv
@@ -33,12 +27,8 @@ def admin_improvement_log_export(
     days: int = Query(30, ge=1, le=365),
     format: str = Query("csv", pattern="^(csv|jsonl)$"),
 ):
-    """改善ログを CSV/JSONL でエクスポートする（admin のみ）。1行＝1ターン（assistant メッセージ）。
-
-    個人情報由来のターン（質問・回答のいずれか）と sanitized share の複製は除外する
-    （`improvement_log.fetch_export_rows` 参照）。上限（`improvement_log.EXPORT_MAX_ROWS`）に
-    到達した場合は `X-Truncated: true` ヘッダ（JSONL は末尾に `{"truncated": true}` 行も追加）で
-    明示する。エクスポート実行自体を監査に記録する（fail-closed・`/admin/audit/export` と同じ流儀）。
+    """改善ログを CSV/JSONL でエクスポートする（管理者のみ）。1行＝1ターン（assistant メッセージ）。
+    個人情報由来のターンと sanitized share の複製は除く。行数の上限に達した場合は `X-Truncated: true` ヘッダ（JSONL は末尾に `{"truncated": true}` 行も追加）で示す。エクスポート実行は監査に記録し、記録できなければエクスポートを返さない（500）。
     """
     u = _current_user(request)
     _require_admin(u)

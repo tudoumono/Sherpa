@@ -1,6 +1,6 @@
 """改善ログエクスポート API（`GET /admin/improvement-log/export`）。
 
-- admin のみ（未ログイン401は test_auth_snapshot.py で snapshot 済み・非admin403はここで確認）。
+- admin のみ（未ログイン401は test_authz_matrix.py で固定済み・非admin403はここで確認）。
 - CSV/JSONL 両対応・1行=1ターン（assistant メッセージ）。質問の対応付けは `chat.turn` 監査
   （message_id_user/message_id_assistant）で厳密に行う——対応付けられない（監査行が無い/
   欠けている）ターンは fail-closed で丸ごと除外する（個人情報の有無が確認できないため）。

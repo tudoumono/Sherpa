@@ -87,7 +87,6 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
 
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
-    monkeypatch.setenv("SHERPA_CODEX_REASONING", "medium")   # 基準値（クイックの standard なら low へ下がる）
 
     ctx = A.Ctx(
         message="消費税率の仕様を教えて",
@@ -99,7 +98,8 @@ def test_plain_mode_turn_skips_schema_and_multi_agent_and_uses_minimal_prompt(tm
         knowledge=True, uid="plain-mode-u1", make_sources=lambda docs: [],
         scope_meta={"depth_profile": "quick"},   # plain では調べる深さが効かない（推論は基準値のまま）
     )
-    prov = A.CodexProvider(system_settings={"codex_mode": "plain"})
+    # 基準値は管理画面の設定（クイックの standard なら low へ下がる値）
+    prov = A.CodexProvider(system_settings={"codex_mode": "plain", "depth_base_codex_reasoning": "medium"})
     env = _result_env(list(prov.run(ctx)))
 
     # (e) 平文の回答がそのまま headline になる（非スキーマ経路 _pick_codex_headline）。

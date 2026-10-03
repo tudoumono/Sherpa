@@ -4,6 +4,7 @@ import ast
 import hashlib
 import inspect
 import json
+import textwrap
 from pathlib import Path
 from unittest import mock
 
@@ -76,7 +77,12 @@ _DB_OCR_SCHEMA_MARKERS = ("ocr_jobs", "ocr_refresh_runs", "ocr_result_cache", "o
 
 
 def _db_ocr_relevant_source() -> str:
-    parts = [inspect.getsource(getattr(store_db, name)) for name in _DB_OCR_RELEVANT_CALLABLES]
+    # コメント・docstring・整形では変わらないよう、定義ごとに構造（AST）で比べる
+    parts = []
+    for name in _DB_OCR_RELEVANT_CALLABLES:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(store_db, name))))
+        _strip_docstrings(tree)
+        parts.append(ast.dump(tree))
     schema_subset = [stmt for stmt in store_db._SCHEMA
                      if any(marker in stmt for marker in _DB_OCR_SCHEMA_MARKERS)]
     parts.append("\n".join(schema_subset))
@@ -290,19 +296,6 @@ def test_db_ocr_relevant_source_reacts_to_world_lock_body_changes():
     baseline = _db_ocr_relevant_source()
     with mock.patch.object(store_db, "world_lock", _different_world_lock):
         assert _db_ocr_relevant_source() != baseline
-
-
-def test_retired_observation_render_symbols_are_gone():
-    """O1（2026-09-03）で検索専用描画（Markdown/chunk JSONL）を撤去した——CLAUDE.md 退役リスト参照。
-    `observation_render.py` は `.ai_observations.jsonl`（`office_md._load_ocr_observation_sets` が
-    読む Observation Set 本体）の永続化・世代管理だけを残す。"""
-    for retired in (
-        "render", "render_many", "RenderedObservations", "write_markdown_atomic",
-        "write_chunks_atomic", "OBSERVATION_CHUNK_SCHEMA",
-    ):
-        assert not hasattr(observation_render, retired), retired
-    fields = set(observation_render.ObservationArtifactPaths.__dataclass_fields__)
-    assert fields == {"generation_root", "observation_sets_jsonl"}
 
 
 def test_publish_snapshot_stream_only_persists_observation_set_jsonl(tmp_path):

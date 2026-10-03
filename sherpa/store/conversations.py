@@ -1,14 +1,7 @@
-"""会話・メッセージ（M8・DATA-MODEL conversations/messages の MVP 部分集合）。
-
-`sherpa/store/__init__.py` から純移動（フェーズ4 S10）。ロジックは一切変更していない。
-Postgres に会話とメッセージを保存する。結果カードは assistant メッセージの `answer`(JSONB) に
-格納し、`route`/`trace`/`lens` も持つ（経路チップ R2・トレース R8）。
-
-`accept_share`（shares.py）と `delete_conversation`（本モジュール）は同一 conversations 行を
-`SELECT ... FOR UPDATE` でロックすることで競合を直列化する契約がある（両関数の docstring 参照）。
-この2関数はモジュールをまたぐが、Python の関数呼び出しで結合しているわけではなく、どちらも
-同じ Postgres トランザクション機構（行ロック）を経由して直列化されるため、モジュール間の
-import は不要（純移動でこの契約は変わらない）。
+"""会話・メッセージの保存と参照（`conversations`/`messages`）。
+結果カードは assistant メッセージの `answer`(JSONB) に格納し、`route`/`trace`/`lens` も持つ。
+`accept_share`（shares.py）と `delete_conversation` は同じ conversations 行を `SELECT ... FOR UPDATE` でロックして直列化する（行ロックによるため import で結合しない）。
+設計: docs/design/chat.md「会話の保存と継続」
 """
 from __future__ import annotations
 
@@ -17,15 +10,13 @@ from psycopg.types.json import Json
 from .db import _connect, _ensure
 from .turn_metrics import upsert_best_effort as _turn_metrics_upsert_best_effort
 
-# 共有は必ず期限を持つ。省略時の既定日数。`expires_at IS NULL` の旧行は読み取り時に
-# 作成日時＋この日数で失効する（DB は書き換えない）。
+# 共有の既定有効日数。`expires_at IS NULL` の行は読み取り時に作成日時＋この日数で失効扱いにする（DB は書き換えない）。
 SHARE_DEFAULT_EXPIRY_DAYS = 30
-# 共有行（`conversation_shares`・別名なし／別名つきは `_s` 版）の実効期限 SQL 式。
+# 共有行（`conversation_shares`・別名つきは `_s` 版）の実効期限 SQL 式。
 SHARE_EFFECTIVE_EXPIRES_SQL = f"COALESCE(expires_at, created_at + interval '{SHARE_DEFAULT_EXPIRY_DAYS} days')"
 
 
 def create_conversation(user_id="admin", world="v1", title=None) -> dict:
-    # 列名 `version` は歴史的（DB 不変・語彙統一のスコープ外）。引数/値は world 用語。
     _ensure()
     with _connect() as c:
         return c.execute(
@@ -37,13 +28,8 @@ def create_conversation(user_id="admin", world="v1", title=None) -> dict:
 
 def add_message(conversation_id, role, content="", lens=None,
                 route=None, trace=None, answer=None, personal=False) -> dict:
-    """メッセージを1件追加し、会話の updated_at を進める。personal=True＝そのターンが個人利用（sanitized share 用）。
-
-    role='assistant' かつ answer が dict のとき、同じ接続・同じトランザクションで
-    `turn_metrics`/`turn_tool_stats`（docs/archive/2026-09-23-利用統計の刷新.md §3.1/§4）へも書く。
-    この書込は `upsert_best_effort` が savepoint で保護するため、失敗してもここでの本体メッセージ
-    保存は失敗させない——両表は answer（この INSERT で確定する正本）から再生成できる派生物であり、
-    書込に失敗した行は `turn_metrics.ensure_rows()` が後で埋められる。
+    """メッセージを1件追加し、会話の updated_at を進める。personal=True はそのターンが個人利用（sanitized share 用）。
+    role='assistant' かつ answer が dict のとき、同じトランザクションで `turn_metrics`/`turn_tool_stats` へも書く。この書込は `upsert_best_effort` が savepoint で保護するため、失敗してもメッセージ保存は失敗させない。
     """
     _ensure()
     with _connect() as c:
@@ -65,12 +51,7 @@ def add_message(conversation_id, role, content="", lens=None,
 
 
 def recent_messages(conversation_id, limit) -> list:
-    """直近 `limit` 件のメッセージを軽量に返す（id/role/content のみ・時系列昇順）。
-
-    R1a（会話継続・履歴 priming）: `get_conversation` は answer/trace の JSONB まで全件取得するため、
-    毎ターンの履歴読みに使うには重い。本関数は列を絞った `ORDER BY id DESC LIMIT` で取得し、
-    呼び出し側（chat_service）が使いやすい昇順（古い→新しい）に戻して返す。
-    """
+    """直近 `limit` 件のメッセージを軽量に返す（id/role/content のみ・時系列昇順・履歴の読み込み用）。"""
     _ensure()
     with _connect() as c:
         rows = c.execute(
@@ -81,7 +62,7 @@ def recent_messages(conversation_id, limit) -> list:
 
 
 def set_message_personal(message_id) -> None:
-    """指定メッセージを個人利用ターンとしてマーク（sanitized share の redaction 対象にする）。"""
+    """指定メッセージを個人利用ターンとしてマークする（sanitized share の redaction 対象）。"""
     _ensure()
     with _connect() as c:
         c.execute("UPDATE messages SET personal=TRUE WHERE id=%s", (message_id,))
@@ -103,21 +84,13 @@ def get_conversation(conversation_id) -> dict | None:
         return {"conversation": conv, "messages": msgs}
 
 
-_DEFAULT_LIST_LIMIT = 50   # list_conversations/search_conversations 共通の既定件数
+_DEFAULT_LIST_LIMIT = 50
 
 
 def _visible_conversations_rows(c, user_id, limit) -> list:
-    """所有会話＋受領共有ラッパーの可視行を取得する（`list_conversations`/`search_conversations` 共通の
-    可視集合判定＝新しい認可分岐を作らない）。`list_conversations` の公開行には出さない
-    `share_id`/`source_conversation_id`（`search_conversations` が受領共有の本文所在を解決するために
-    使う）も含む——公開行を組み立てる側（`_public_conversation_row`）がこの2列を落として従来の
-    応答形を保つ。
-
-    SH-1（2026-08-23-共有フォーク.md）: フォークで複製した会話（`forked_at` 設定済み）は
-    `forked_from_share_id`/`forked_from_user_id`/`forked_from_name`/`forked_at`（出所表示用）を持つ。
-    判定は `forked_from_share_id IS NOT NULL` ではなく **`forked_at IS NOT NULL`** で行う
-    （`forked_from_share_id` は共有そのものが後で削除されると `ON DELETE SET NULL` で NULL に
-    落ちる・`forked_from_user_id`/`forked_at` は影響を受けない・db.py のスキーマ参照）。
+    """所有会話＋受領共有ラッパーの可視行を取得する（`list_conversations`/`search_conversations` 共通の可視集合判定）。
+    公開行に出さない `share_id`/`source_conversation_id` も含み、`_public_conversation_row` が落とす。
+    フォークで複製した会話は `forked_from_*`/`forked_at`（出所表示用）を持つ。フォーク判定は `forked_at IS NOT NULL`（`forked_from_share_id` は共有削除で NULL になるため）。
     """
     return c.execute(
         "SELECT c.id, c.title, c.version, c.pinned, c.updated_at, c.origin, c.read_only, c.received_at, "
@@ -134,17 +107,14 @@ def _visible_conversations_rows(c, user_id, limit) -> list:
         "   FROM conversation_shares s WHERE s.id=c.share_id) ELSE NULL END AS share_expires_at "
         "FROM conversations c LEFT JOIN users u ON u.uid=c.shared_by_user_id "
         "LEFT JOIN users fu ON fu.uid=c.forked_from_user_id "
-        "WHERE c.user_id=%s AND c.deleted_at IS NULL AND c.origin<>'sanitized_snapshot' "  # snapshot は内部成果物＝非表示
-        "ORDER BY c.origin, c.pinned DESC, c.updated_at DESC LIMIT %s",   # own が先・ピンは上部（#8）
+        "WHERE c.user_id=%s AND c.deleted_at IS NULL AND c.origin<>'sanitized_snapshot' "
+        "ORDER BY c.origin, c.pinned DESC, c.updated_at DESC LIMIT %s",
         (user_id, limit),
     ).fetchall()
 
 
 def _public_conversation_row(r) -> dict:
-    """`_visible_conversations_rows` の1行を `GET /conversations` の公開形へ変換する
-    （`share_id`/`source_conversation_id` を含む内部専用列を落とし、`forked_from` を組み立てる。
-    `forked_from` の `share_id` は `forked_from_share_id` をそのまま返す＝NULL を許す
-    （共有削除後は `share_id: null` だが `user_id`/`name`/`at` は残る）。"""
+    """`_visible_conversations_rows` の1行を `GET /conversations` の公開形へ変換する（内部専用列を落とし、`forked_from` を組み立てる）。共有削除後も `forked_from.share_id` は NULL を許し、`user_id`/`name`/`at` は残る。"""
     forked_from = None
     if r["forked_at"] is not None:
         forked_from = {"share_id": r["forked_from_share_id"], "user_id": r["forked_from_user_id"],
@@ -155,22 +125,16 @@ def _public_conversation_row(r) -> dict:
 
 
 def list_conversations(user_id="admin", limit=_DEFAULT_LIST_LIMIT) -> list:
-    """自分の会話＋受領共有ラッパーを返す（origin/read_only/shared_by/share_status 付き・削除済みは除外）。
-    表示名は `shared_by_name` と同じ流儀（`users.display_name` の LEFT JOIN）で解決する。"""
+    """自分の会話＋受領共有ラッパーを返す（origin/read_only/shared_by/share_status 付き・削除済みは除外）。"""
     _ensure()
     with _connect() as c:
         return [_public_conversation_row(r) for r in _visible_conversations_rows(c, user_id, limit)]
 
 
 def _resolve_received_share_msg_src(c, uid, share_id, source_conversation_id):
-    """受領共有ラッパーの本文所在を判定する（`shares.py::get_conversation_for_read`・
-    `search_conversations` 共通・呼び出し側の接続 `c` 上でそのまま実行する＝二重実装しない）。
-
-    共有が有効（取消なし・期限内・招待済み）かつ元会話が個人 workspace 参照でブロックされて
-    いなければ `(source_conversation_id, None)` を返す。無効なら `(None, "unavailable")`、
-    共有後に元会話が個人 workspace を参照するようになっていたら `(None, "personal_blocked")`。
+    """受領共有ラッパーの本文所在を判定する（`get_conversation_for_read`・`search_conversations` 共通・呼び出し側の接続 `c` 上で実行）。
+    共有が有効（取消なし・期限内・招待済み）かつ元会話が個人 workspace 参照でブロックされていなければ `(source_conversation_id, None)`、無効なら `(None, "unavailable")`、個人参照でブロックなら `(None, "personal_blocked")`。
     """
-    # expires_at IS NULL の旧行は created_at＋既定日数で失効する（SHARE_EFFECTIVE_EXPIRES_SQL）。
     share = c.execute(
         f"SELECT (revoked_at IS NULL AND {SHARE_EFFECTIVE_EXPIRES_SQL}>now()) AS active "
         "FROM conversation_shares WHERE id=%s", (share_id,)).fetchone()
@@ -186,12 +150,11 @@ def _resolve_received_share_msg_src(c, uid, share_id, source_conversation_id):
     return source_conversation_id, None
 
 
-_SEARCH_SNIPPET_RADIUS = 60   # H1（履歴検索）: 抜粋は最初の一致位置の前後 60 字
+_SEARCH_SNIPPET_RADIUS = 60  # 抜粋は最初の一致位置の前後 60 字。
 
 
 def _search_snippet(text, q) -> str | None:
-    """`text` 内で `q`（大小文字を区別しない）が最初に現れた位置の前後 `_SEARCH_SNIPPET_RADIUS` 字を
-    返す。一致しなければ None（`text` が空/None のときも None）。"""
+    """`text` 内で `q`（大小文字を区別しない）が最初に現れた位置の前後 `_SEARCH_SNIPPET_RADIUS` 字を返す。一致しなければ None。"""
     if not text:
         return None
     idx = text.lower().find(q.lower())
@@ -203,22 +166,13 @@ def _search_snippet(text, q) -> str | None:
 
 
 def search_conversations(user_id, q) -> list:
-    """本人が読める会話（自分の会話＋有効な受領共有）のタイトル・本文を対象にした検索（H1）。
-
-    可視集合は `list_conversations` と同じ判定（`_visible_conversations_rows`）を再利用する
-    （新しい認可分岐を作らない）。受領共有の本文所在は `_resolve_received_share_msg_src` で判定し、
-    無効（取消・期限切れ・招待外）・個人ブロックの共有はタイトルのみを対象にする（本文は
-    問い合わせない）。sanitized 共有はスナップショット会話自身が可視集合に含まれる（元会話の
-    `source_conversation_id` は snapshot を指す）ため、対象本文は自動的に伏字後のものになる。
-
-    タイトル一致を本文一致より優先する（`match.where`）。本文一致は `messages.content`／
-    `answer->>'headline'` への ILIKE 1回（可視集合の本文所在 id へまとめて・索引は増やさない）。
-    タイトル・本文のどちらにも一致しない行は返さない。
+    """本人が読める会話（自分の会話＋有効な受領共有）のタイトル・本文を検索する。
+    可視集合は `_visible_conversations_rows` を再利用する。無効（取消・期限切れ・招待外）・個人ブロックの共有はタイトルだけを対象にする。タイトル一致を本文一致より優先し（`match.where`）、本文は `messages.content`/`answer->>'headline'` への ILIKE 1回で探す。どちらにも一致しない行は返さない。
     """
     _ensure()
     with _connect() as c:
         rows = _visible_conversations_rows(c, user_id, _DEFAULT_LIST_LIMIT)
-        msg_src_by_cid: dict = {}   # 可視行 id -> 本文を読みに行く先（own は自分自身・received_share は元会話）
+        msg_src_by_cid: dict = {}  # 可視行 id -> 本文を読みに行く先（own は自分自身・received_share は元会話）。
         for r in rows:
             if r["origin"] == "received_share":
                 resolved, _status = _resolve_received_share_msg_src(
@@ -227,11 +181,10 @@ def search_conversations(user_id, q) -> list:
                     msg_src_by_cid[r["id"]] = resolved
             else:
                 msg_src_by_cid[r["id"]] = r["id"]
-        content_hits: dict = {}   # 本文所在 id -> 抜粋（同じ会話に複数一致があれば ORDER BY id DESC の先頭＝最新を採用）
+        content_hits: dict = {}  # 本文所在 id -> 抜粋（複数一致は id が最大＝最新を採用）。
         msg_src_ids = sorted(set(msg_src_by_cid.values()))
         if msg_src_ids:
-            # ILIKE の `%`/`_`（ワイルドカード）とエスケープ文字自身をリテラル化する
-            # （`users.py::suggest_users` と同じ手当て）。
+            # ILIKE の `%`/`_` とエスケープ文字自身をリテラル化する。
             escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             like = f"%{escaped}%"
             msg_rows = c.execute(
@@ -244,7 +197,7 @@ def search_conversations(user_id, q) -> list:
             for mr in msg_rows:
                 cid = mr["conversation_id"]
                 if cid in content_hits:
-                    continue   # 既により新しい行（id DESC の先頭）で確定済み
+                    continue
                 snippet = _search_snippet(mr["content"], q) or _search_snippet(mr["headline"], q)
                 if snippet is not None:
                     content_hits[cid] = snippet
@@ -258,29 +211,16 @@ def search_conversations(user_id, q) -> list:
                 msg_src = msg_src_by_cid.get(r["id"])
                 snippet = content_hits.get(msg_src) if msg_src is not None else None
                 if snippet is None:
-                    continue   # タイトル不一致かつ本文不一致
+                    continue
                 row["match"] = {"where": "message", "snippet": snippet}
             out.append(row)
         return out
 
 
 def delete_conversation(conversation_id, user_id="admin") -> bool:
-    """会話を削除。所有者一致のみ。
-
-    生きた受領共有ラッパー（origin='received_share' AND deleted_at IS NULL）がこの会話を
-    source_conversation_id として参照している場合、物理削除すると受領側が読めなくなるため
-    **soft delete**（deleted_at=now()）にとどめる（所有者の一覧/操作からは既存の
-    `deleted_at IS NULL` フィルタで消える・受領側はこれまで通り読める）。
-    参照するラッパーが無ければ従来どおり物理削除（messages は FK ON DELETE CASCADE で一緒に消える・#6）。
-    取消(revoke)・期限切れによるアクセス遮断は本関数と無関係で、これまで通り有効
-    （docs/proposals/2026-07-02-共有の無期限と永続化.md）。
-
-    RV HIGH: `accept_share` との競合防止。対象行を `SELECT ... FOR UPDATE` で先にロックしてから
-    wrapper 有無を判定・削除する（ロック無しだと「wrapper 無し→物理削除」の判定と同時に
-    accept_share が新規 wrapper を INSERT し、その wrapper の source_conversation_id が
-    FK SET NULL で即座に壊れる TOCTOU が起きる）。accept_share 側も同じ行を FOR UPDATE で
-    ロックするため、どちらが先に行ロックを取っても、そのトランザクションが commit するまで
-    もう一方は待たされ、判定がズレない。
+    """会話を削除する（所有者一致のみ）。
+    生きた受領共有ラッパー（origin='received_share' AND deleted_at IS NULL）が `source_conversation_id` として参照している場合は soft delete（deleted_at=now()）にとどめ、無ければ物理削除する（messages は FK CASCADE）。取消・期限切れのアクセス遮断には影響しない。
+    `accept_share` との競合防止のため、対象行を `SELECT ... FOR UPDATE` でロックしてから wrapper 有無の判定と削除を行う。
     """
     _ensure()
     with _connect() as c:
@@ -298,14 +238,12 @@ def delete_conversation(conversation_id, user_id="admin") -> bool:
                 "WHERE id=%s AND user_id=%s AND deleted_at IS NULL",
                 (conversation_id, user_id)).rowcount
             if n > 0:
-                # soft delete は messages 行を物理的には残す（受領側が読み続けるため）が、
-                # message_feedback は FK CASCADE の対象外（会話ではなく messages にぶら下がる）
-                # なので明示的に消す。所有者本人が削除した会話へのフィードバックを残す理由が無い。
+                # soft delete では messages が残り FK CASCADE が効かないため、message_feedback を明示的に消す。
                 c.execute(
                     "DELETE FROM message_feedback WHERE message_id IN "
                     "(SELECT id FROM messages WHERE conversation_id=%s)",
                     (conversation_id,))
-                # 調査の記録も同じ理由で消す（messages が残るため FK の CASCADE が発火しない）。
+                # 調査の記録も同様に消す。
                 c.execute("DELETE FROM investigation_records WHERE conversation_id=%s",
                           (conversation_id,))
         else:
@@ -315,8 +253,7 @@ def delete_conversation(conversation_id, user_id="admin") -> bool:
 
 
 def set_pinned(conversation_id, pinned: bool, user_id="admin") -> bool:
-    """会話のピン止めを設定/解除（#8）。所有者一致のみ。soft-delete 済み（deleted_at 設定済み）は対象外
-    （RV MEDIUM: 削除済み会話への操作が 200 を返していたため deleted_at IS NULL を明示）。"""
+    """会話のピン止めを設定/解除する（所有者一致のみ・soft-delete 済みは対象外）。"""
     _ensure()
     with _connect() as c:
         n = c.execute(
@@ -326,8 +263,7 @@ def set_pinned(conversation_id, pinned: bool, user_id="admin") -> bool:
 
 
 def rename_conversation(conversation_id, title, user_id="admin") -> bool:
-    """会話のタイトルを変更。所有者一致のみ。並び順は変えない（updated_at は触らない）。
-    soft-delete 済みは対象外（呼出側 API は owns_conversation で既に弾くが、多層防御として本関数側でも確認）。"""
+    """会話のタイトルを変更する（所有者一致のみ・soft-delete 済みは対象外・updated_at は変えない）。"""
     _ensure()
     with _connect() as c:
         n = c.execute(
@@ -344,11 +280,7 @@ def set_session_id(conversation_id, session_id) -> None:
 
 
 def get_session_id(conversation_id) -> str | None:
-    """会話に紐づく直近の `codex_session_id`（R1b: Codex ネイティブ resume の判定用）。
-
-    行が無い/未設定なら None（chat_service はこれを `Ctx.codex_session_id` に渡すだけで、
-    None なら CodexProvider は resume を試みず新規セッションを開始する）。
-    """
+    """会話に紐づく直近の `codex_session_id`（Codex の resume 判定用）。無い/未設定なら None。"""
     _ensure()
     with _connect() as c:
         row = c.execute(
@@ -357,11 +289,7 @@ def get_session_id(conversation_id) -> str | None:
 
 
 def get_codex_usage_total(conversation_id) -> dict | None:
-    """会話の直近 assistant メッセージが記録した Codex 累計 usage（`answer->'codex_usage_total'`）。
-
-    行が無い/該当メッセージが無い/未設定なら None（chat_service はこれを
-    `Ctx.codex_usage_prev_total` に渡すだけで、CodexProvider がターン差分の判定に使う）。
-    """
+    """会話の直近 assistant メッセージが記録した Codex 累計 usage（`answer->'codex_usage_total'`）。無い/未設定なら None。"""
     _ensure()
     with _connect() as c:
         row = c.execute(
@@ -381,8 +309,7 @@ def owns_conversation(uid, cid) -> bool:
 
 
 def owns_assistant_message(uid, conversation_id, message_id) -> bool:
-    """`message_id` が `conversation_id`（自分の所有会話・origin='own'）に属する assistant メッセージか。
-    フィードバック投稿対象の検証専用（他人の会話・受領共有・非 assistant・存在しないメッセージは False）。"""
+    """`message_id` が `conversation_id`（自分の所有会話・origin='own'）に属する assistant メッセージか（フィードバック投稿対象の検証用）。"""
     _ensure()
     with _connect() as c:
         return bool(c.execute(
@@ -393,11 +320,7 @@ def owns_assistant_message(uid, conversation_id, message_id) -> bool:
 
 
 def is_personal_tainted(message: dict) -> bool:
-    """メッセージ1件が個人情報由来か。`messages.personal` 列を優先し、無ければ（列導入前の
-    未バックフィル行）`answer` 内の旧マーカー（personal_sources／_personal_facts／
-    codex_wrote_files）を見る。`shares.py::create_sanitized_snapshot` の taint 判定と同じ基準
-    （共通ヘルパへ集約・両方が個別に判定基準を持つと片方だけ更新されてズレる）。
-    """
+    """メッセージ1件が個人情報由来か。`messages.personal` 列を優先し、無ければ（旧行）`answer` 内の旧マーカー（personal_sources／_personal_facts／codex_wrote_files）で判定する。`shares.py::create_sanitized_snapshot` の taint 判定と同じ基準。"""
     if message.get("personal"):
         return True
     answer = message.get("answer")
@@ -408,23 +331,9 @@ def is_personal_tainted(message: dict) -> bool:
 
 
 def list_export_messages(*, time_from, cursor_id: int | None, limit: int) -> list[dict]:
-    """改善ログエクスポート用: `time_from` 以降の assistant メッセージを新しい順（id 降順）で
-    ページング取得する（`cursor_id` 指定時はそれより小さい id のみ＝呼び出し側が前ページ最後の
-    id を渡してキーセット方式で進める）。
-
-    質問（対応する user メッセージ）は `chat.turn` 監査ログの `message_id_user`/
-    `message_id_assistant` で対応付ける（「直前の user 行」を推測しない）。**対応付けられる
-    監査行が無いターンは fail-closed でこの一覧から除外する**（`JOIN`＝内部結合。ターン処理が
-    例外でクラッシュした場合の復旧経路（`routers/chat.py::_persist_turn_crash`）は監査に
-    message_id_user/message_id_assistant を残すが、それでも書き込み自体が失敗した/対応付け不能な
-    ターンは「個人情報の有無が確認できない」として出さない——`chat.turn` 監査自体は fail-open
-    （`chat_service.py::_audit_chat_turn`）なので、対応付けが無いことは「非個人と確認できた」を
-    意味しない）。個人情報の判定に使えるよう、対応する質問側の `personal`/`answer` も同梱する
-    （呼び出し側で `is_personal_tainted` を質問・回答の両方に適用する契約）。
-
-    sanitized share の複製（`conversations.origin='sanitized_snapshot'`）は元会話の内容を
-    複製したものなので除外する（同じ内容が二重に出る・sanitize 後の伏字状態は改善ログの
-    分析対象として不適切）。論理削除済み（`deleted_at IS NOT NULL`）の会話も除外する。
+    """改善ログエクスポート用: `time_from` 以降の assistant メッセージを新しい順（id 降順）でページング取得する（`cursor_id` 指定時はそれより小さい id のみ）。
+    質問（user メッセージ）は `chat.turn` 監査ログの `message_id_user`/`message_id_assistant` で対応付ける。対応付けられないターンは個人情報の有無が確認できないため内部結合で除外する（fail-closed）。質問側の `personal`/`answer` も同梱し、呼び出し側が `is_personal_tainted` を両方に適用する。
+    sanitized share の複製（`origin='sanitized_snapshot'`）と論理削除済みの会話は除外する。
     """
     _ensure()
     cursor_clause = "AND m.id < %s" if cursor_id is not None else ""
@@ -455,8 +364,7 @@ def list_export_messages(*, time_from, cursor_id: int | None, limit: int) -> lis
 
 
 def conversation_has_personal_message(cid) -> bool:
-    """会話に個人ターン（messages.personal=TRUE）が1件でもあるか（通常共有 guard の多層防御）。
-    会話フラグ contains_personal_workspace とズレても（部分失敗/手動修復）漏らさないための保険。"""
+    """会話に個人ターン（messages.personal=TRUE）が1件でもあるか（会話フラグとズレても漏らさないための多層防御）。"""
     _ensure()
     with _connect() as c:
         return bool(c.execute(
@@ -465,10 +373,7 @@ def conversation_has_personal_message(cid) -> bool:
 
 
 def conversation_is_personal_tainted(cid) -> bool:
-    """会話が個人由来か（後続ターンの個人扱い判定用）。会話フラグ `contains_personal_workspace`・
-    `messages.personal=TRUE`・列導入前の旧行の `answer` マーカー（`is_personal_tainted` と同じ基準）
-    のいずれかで真。`conversation_has_personal_message`（personal 列のみ）より広い＝伏字共有の
-    伏字判定（`is_personal_tainted`）と同じ集合を見る。"""
+    """会話が個人由来か（後続ターンの個人扱い判定用）。会話フラグ `contains_personal_workspace`・`messages.personal=TRUE`・旧行の `answer` マーカーのいずれかで真（`is_personal_tainted` と同じ基準）。"""
     _ensure()
     with _connect() as c:
         row = c.execute("SELECT contains_personal_workspace FROM conversations WHERE id=%s",
@@ -484,10 +389,7 @@ def conversation_is_personal_tainted(cid) -> bool:
 
 def set_contains_personal_workspace(conversation_id: int) -> None:
     """会話に個人 workspace 参照フラグを立てる（冪等・FALSE→TRUE のみ）。
-
-    個人ファイルを参照/生成した会話を共有不可にするためのフラグ。
-    不変条件: このフラグが TRUE の会話は POST /conversations/{cid}/shares が 409 を返す
-    （既存ガード・2026-07-01-認証実装計画.md スライス1）。
+    このフラグが TRUE の会話は POST /conversations/{cid}/shares が 409 を返す。
     """
     _ensure()
     with _connect() as c:

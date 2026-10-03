@@ -1,10 +1,6 @@
-"""外部連携 API キー（docs/archive/2026-07-07-外部API化とDify.md E1）。
-
-`sherpa/store/__init__.py` から純移動（フェーズ4 S2）。不変条件: プレーンキーは DB に残さない
-（key_hash のみ）。認証・監査は sherpa/ext_api.py が行う。
-
-`expires_at`/`daily_quota`（オプトイン・NULL=既存キーと同じ後方互換の無期限/無制限）・
-`owner_uid`（利用者による自己発行キーの所有者 uid・NULL=admin 発行の従来キー）を持つ。
+"""外部連携 API キーの台帳（`api_keys`）。プレーンキーは DB に残さず key_hash のみ持つ。認証・監査は `sherpa/ext_api.py`。
+`expires_at`/`daily_quota`（NULL＝無期限/無制限）・`owner_uid`（自己発行キーの所有者・NULL＝admin 発行）を持つ。
+設計: docs/design/users.md「外部 API の鍵（`/ext/v1/*`）」
 """
 from __future__ import annotations
 
@@ -12,37 +8,29 @@ import psycopg
 
 from .db import _connect, _ensure
 
-# system_settings.user_api_keys_allowed の判定と、自己発行キーの書込みを直列化する固定
-# advisory lock key（"KEYU"）。`_PERSONAL_KEY_LOCK` と同型の競合対策: 「事前チェック後に
-# admin が無効化した」競合窓を、書込み直前の同一トランザクション再確認で閉じる。
+# `user_api_keys_allowed` の判定と自己発行キーの書込みを直列化する固定 advisory lock key（"KEYU"）。
 _USER_KEY_LOCK = 0x4B455955
 
-# 利用者自己発行キーの1日あたり呼び出し上限の既定/上限（管理者が system_settings で
-# 上書きするまでのフォールバック）。自己発行キーは常にこれ以下のクォータを持つ＝空欄で
-# 無制限を選べない（admin 発行キーはこの上限の対象外・引き続き空欄=無制限を選べる）。
+# 自己発行キーの1日あたり呼び出し上限の既定/上限（管理者設定までのフォールバック）。自己発行キーは空欄（無制限）を選べない。
 SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK = 100
 
 
 def resolve_self_issued_daily_quota_cap(system_settings: dict) -> int:
-    """自己発行キーの日次クォータの既定値／上限（管理者設定・未設定はフォールバック定数）。"""
+    """自己発行キーの日次クォータの既定値/上限（管理者設定・未設定はフォールバック定数）。"""
     configured = system_settings.get("user_api_keys_daily_quota_default")
     return int(configured) if configured else SELF_ISSUED_DAILY_QUOTA_DEFAULT_FALLBACK
 
 
 class UserApiKeysDisallowedError(Exception):
-    """自己発行キーの書込み直前に再確認した結果、`system_settings.user_api_keys_allowed` が
-    偽だった（事前チェックの後に admin が無効化した競合・A6 の `PersonalKeysDisallowedError` と同型）。"""
+    """自己発行キーの書込み直前の再確認で `user_api_keys_allowed` が偽だった。"""
 
 
 class SelfIssuedQuotaExceededError(Exception):
-    """自己発行キーの `daily_quota` 指定が、書込み直前にロック内で再読した現在の上限を超えていた
-    （TOCTOU 対策: 利用者が上限を読んでから admin が引き下げた競合を、書込み直前の同一トランザクション
-    再確認で閉じる・`UserApiKeysDisallowedError` と同型）。"""
+    """自己発行キーの `daily_quota` が、書込み直前にロック内で再読した現在の上限を超えていた。"""
 
 
 class ClientOpIdConflictError(Exception):
-    """`client_op_id`（非NULL部分一意制約・`api_keys_client_op_id_unique`）が既存行と衝突した
-    （同じ操作トークンで2回目の発行を試みた・呼び出し側は409を返すこと）。"""
+    """`client_op_id`（非NULL部分一意制約）が既存行と衝突した（呼び出し側は 409 を返す）。"""
 
 
 def insert_api_key(key_hash: str, key_prefix: str, label: str, created_by: str,
@@ -50,36 +38,15 @@ def insert_api_key(key_hash: str, key_prefix: str, label: str, created_by: str,
                     daily_quota: int | None = None, owner_uid: str | None = None,
                     client_op_id: str | None = None, webhook_url: str | None = None,
                     webhook_secret: str | None = None) -> dict:
-    """発行済みキーのハッシュを台帳登録。返値 {id, key_prefix, label, created_by, created_at,
-    allowed_worlds, expires_at, daily_quota, owner_uid, client_op_id, webhook_url, webhook_secret}。
-
-    `allowed_worlds`（world スコープ・オプトイン）: None＝全 world 許可（既定・既存キーと同じ
-    後方互換の挙動）。空リストは「どの world にもアクセスできない」キーになる（呼び出し側の
-    意図的な選択・拒否はしない）。
-
-    `webhook_url`/`webhook_secret`（PART-6・オプトイン）: 両方 None＝Webhook 無効（既定）。
-    宛先検証（`sherpa.webhooks.assert_webhook_url_allowed`）・secret 生成は呼び出し側
-    （`routers/system_extras.py`）の責務——ここではそのまま保存するだけ。
-
-    `expires_at`（有効期限・オプトイン）: None＝無期限（既存キーと同じ後方互換）。
-
-    `owner_uid`（利用者による自己発行キーの所有者 uid）: None＝admin 発行（従来どおり
-    「誰でも使える」システムキー・`daily_quota` は呼び出し側の指定をそのまま使う＝None なら無制限）。
-    非 None（自己発行）のときは、同一トランザクション・`_USER_KEY_LOCK` の下で以下を**両方**
-    再確認する（事前チェック（router 側）はあくまで早期リターン用の best-effort・ここが唯一の
-    正本）:
-      1. `system_settings.user_api_keys_allowed` が真であること（偽なら `UserApiKeysDisallowedError`）。
-      2. `daily_quota`（未指定なら管理者の現在の既定を適用・指定ありなら現在の上限を超えないこと・
-         超えていれば `SelfIssuedQuotaExceededError`）。既存キーの `daily_quota` は発行時点の値の
-         まま固定される（**非遡及**——admin が既定/上限を後から変えても、発行済みキーの実際の
-         クォータは変わらない。認証時（`ext_api._verify_key_sync`）は行に保存された値だけを見る）。
-
-    `client_op_id`（オプトイン）: 発行 UI が生成するクライアント側の操作トークン（UUID）。POST
-    応答がタイムアウト/通信断/不正な形で失われた場合に、専用の回復エンドポイント
-    （`revoke_unconfirmed_key_by_client_op_id`）がこの値で照合して自動失効できるようにするための
-    相関 ID（秘密ではない・機能的な用途のみ）。大小文字表記の違いは同一の UUID を指すため、
-    保存前に標準の小文字正準形へ正規化する（router 側の `_validate_client_op_id_format` が
-    通常は既に正規化済みだが、store 層を直接呼ぶ経路（テスト等）向けの独立した最後の砦）。
+    """発行済みキーのハッシュを台帳登録する。返値 {id, key_prefix, label, created_by, created_at, allowed_worlds, expires_at, daily_quota, owner_uid, client_op_id, webhook_url, webhook_secret}。
+    `allowed_worlds`: None＝全 world 許可、空リスト＝どの world にも不可。
+    `webhook_url`/`webhook_secret`: 両方 None＝Webhook 無効。宛先検証・secret 生成は呼び出し側の責務で、ここでは保存のみ。
+    `expires_at`: None＝無期限。`owner_uid`: None＝admin 発行（`daily_quota` は指定どおり）。
+    非 None（自己発行）のときは、同一トランザクション・`_USER_KEY_LOCK` の下で次を再確認する。
+      1. `user_api_keys_allowed` が真（偽なら `UserApiKeysDisallowedError`）。
+      2. `daily_quota`（未指定なら現在の既定・指定ありなら現在の上限以下。超えれば `SelfIssuedQuotaExceededError`）。
+    発行済みキーの `daily_quota` は発行時点の値で固定され、後から変えても遡及しない。
+    `client_op_id`: 発行 UI の操作トークン（UUID）。応答が失われた場合の回復（`revoke_unconfirmed_key_by_client_op_id`）の相関 ID。小文字の正準形へ正規化して保存する。
     """
     _ensure()
     if client_op_id:
@@ -112,9 +79,7 @@ def insert_api_key(key_hash: str, key_prefix: str, label: str, created_by: str,
                  daily_quota, owner_uid, client_op_id, webhook_url, webhook_secret),
             ).fetchone()
         except psycopg.errors.UniqueViolation as e:
-            # `key_hash` にも UNIQUE があるため、衝突が client_op_id 由来かを制約名で見分ける
-            # （key_hash 衝突＝暗号学的ハッシュの偶発衝突は実質起こらないが、誤って
-            # ClientOpIdConflictError にすり替えないよう制約名を確認する）。
+            # `key_hash` にも UNIQUE があるため、衝突が client_op_id 由来かを制約名で見分ける。
             if getattr(getattr(e, "diag", None), "constraint_name", None) == \
                     "api_keys_client_op_id_unique":
                 raise ClientOpIdConflictError(
@@ -124,15 +89,7 @@ def insert_api_key(key_hash: str, key_prefix: str, label: str, created_by: str,
 
 def api_key_by_hash(key_hash: str) -> dict | None:
     """X-API-Key 検証用（DB 1回引き）。失効済みも返す（呼び出し側で revoked_at を見て 401）。
-
-    `allowed_worlds`／`expires_at`／`daily_quota`／`owner_uid` も返す
-    （None＝各々 全world許可／無期限／無制限／admin発行）。
-
-    `owner_status`: `owner_uid` が非 NULL（利用者自己発行キー）のとき、所有者の現在の
-    `users.status` を同じ引きで返す（`owner_uid` が NULL の admin 発行キーは常に NULL）。
-    Cookie セッションは毎回 `users.status='active'` を確認する（`session_user` 参照）ため、
-    自己発行キーもこれに揃える——所有者を無効化してもキー自体は失効しないままだと、
-    アカウント停止をキー経由で迂回できてしまう（呼び出し側で非 active/不在を 401 にする）。
+    `allowed_worlds`/`expires_at`/`daily_quota`/`owner_uid` も返す。`owner_status` は自己発行キーの所有者の現在の `users.status`（admin 発行キーは NULL）で、呼び出し側が非 active/不在を 401 にする。
     """
     _ensure()
     with _connect() as c:
@@ -146,10 +103,8 @@ def api_key_by_hash(key_hash: str) -> dict | None:
 
 
 def list_api_keys(owner_uid: str | None = None) -> list:
-    """API キー一覧（admin 用は `owner_uid` 省略＝全件・個人設定用は本人の uid を渡す＝自分のキーのみ）。
-
-    `webhook_url` も返す（一覧は host:port の表示までは可・呼び出し側が `webhook_url` から
-    導く・`webhook_secret` はここでは選択しない＝一覧に平文 secret を絶対に出さない契約）。
+    """API キー一覧（admin 用は `owner_uid` 省略＝全件・個人設定用は本人の uid＝自分のキーのみ）。
+    `webhook_url` は返すが `webhook_secret` は選択しない（平文 secret を一覧に出さない）。
     """
     _ensure()
     where = "WHERE owner_uid=%s " if owner_uid is not None else ""
@@ -166,16 +121,9 @@ def list_api_keys(owner_uid: str | None = None) -> list:
 
 
 def list_webhook_keys_for_world(world: str) -> list:
-    """`world` を許可する、Webhook 宛先が登録済みの有効キー一覧（PART-6・RV是正#2）。
-
-    対象: 失効しておらず（`revoked_at IS NULL`）・期限切れでなく（`expires_at IS NULL OR
-    expires_at > now()`・`_verify_key_sync` と同じ判定規則）・所有ユーザーが有効
-    （`owner_uid IS NULL`＝admin 発行キーは対象外の判定なし・非 NULL は `users.status='active'`
-    ——`api_key_by_hash` の `owner_status` 判定と同型）・`webhook_url` を持ち、`allowed_worlds` が
-    `world` を許可する（None＝全 world 許可、または `world` を含む）キー全部——
-    `ext_api._enforce_world_scope`（`allowed is None or world not in allowed` の否定）と
-    同じ判定規則を SQL 側で再現する。`webhook_secret`（署名生成に必須・平文）も返す——
-    呼び出し側（`sherpa.webhooks`）は送信直後に破棄し、ログ/監査には残さない。
+    """`world` を許可する、Webhook 宛先が登録済みの有効キー一覧。
+    有効＝失効しておらず・期限切れでなく・所有ユーザーが active（admin 発行は判定なし）で、`allowed_worlds` が `world` を許可する（`ext_api._enforce_world_scope` と同じ判定）。
+    `webhook_secret`（署名生成用）も返す。呼び出し側は送信直後に破棄し、ログ/監査に残さない。
     """
     _ensure()
     with _connect() as c:
@@ -190,12 +138,25 @@ def list_webhook_keys_for_world(world: str) -> list:
         ).fetchall()
 
 
-def revoke_api_key(key_id: int, revoked_by: str, *, owner_uid: str | None = None) -> dict | None:
-    """失効（冪等）。未知 id は None。既に失効済みなら行をそのまま返す（revoked_at は変えない）。
+def get_api_key_webhook(key_id: int) -> dict | None:
+    """鍵の通知先 `{webhook_url, webhook_secret}`。失効・期限切れ・未登録・所有者が active でない鍵は None。
+    Codex ジョブの受付可否判定と送信の各試行直前の宛先解決が使う。`webhook_secret` はログ・応答に出さない。
+    """
+    _ensure()
+    with _connect() as c:
+        return c.execute(
+            "SELECT k.webhook_url, k.webhook_secret FROM api_keys k "
+            "LEFT JOIN users u ON u.uid = k.owner_uid "
+            "WHERE k.id=%s AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > now()) "
+            "  AND (k.owner_uid IS NULL OR u.status = 'active') "
+            "  AND k.webhook_url IS NOT NULL AND k.webhook_secret IS NOT NULL",
+            (key_id,),
+        ).fetchone()
 
-    `owner_uid` を指定すると、その uid が所有する行だけを対象にする（利用者が自分のキーだけを
-    失効できるようにするための絞り込み・他人/admin発行キーは対象外＝None を返す＝呼出側で404）。
-    省略時（admin 発行/失効の既存フロー）は所有者を問わず任意のキーを失効できる。
+
+def revoke_api_key(key_id: int, revoked_by: str, *, owner_uid: str | None = None) -> dict | None:
+    """失効（冪等）。未知 id は None、既に失効済みなら行をそのまま返す。
+    `owner_uid` を指定すると、その uid が所有する行だけを対象にする（他人・admin 発行キーは None）。省略時は所有者を問わない。
     """
     _ensure()
     cond = "id=%s"
@@ -215,19 +176,9 @@ def revoke_api_key(key_id: int, revoked_by: str, *, owner_uid: str | None = None
 def revoke_unconfirmed_key_by_client_op_id(client_op_id: str, revoked_by: str, *,
                                            created_by: str | None = None,
                                            owner_uid: str | None = None) -> dict | None:
-    """曖昧な発行結果（POST 応答がタイムアウト/通信断/不正な形で失われた）の回復専用。
-
-    認証済みの本人が発行操作を試みた `client_op_id` に一致する**未失効**キーだけを、単一の
-    原子的 UPDATE で照合・失効する。一覧を取得してから別リクエストで DELETE する2段構成
-    （旧設計）は (a) 一覧に本人以外の行も混じりうる (b) 取得と失効の間に別の変更が起こりうる、
-    という2つの隙があった——ここでは `client_op_id` と所有条件を**同一 SQL の WHERE 句**で
-    照合するため、`client_op_id` が（万一）他人の値と衝突していても他人のキーには触れない。
-
-    `created_by`（admin 発行の回復・`owner_uid IS NULL` の行のみ対象）と `owner_uid`
-    （自己発行の回復）は排他——呼び出し側はどちらか一方だけを渡す。一致しなければ None
-    （POST がサーバーに届かなかった、またはまだコミットされていない可能性——呼び出し側で
-    有界に再試行すること）。`client_op_id` の照合は `lower()` で行う（大小文字表記の違いで
-    一致し損ねない・DB 側の一意インデックスと同じ規則）。
+    """曖昧な発行結果（POST 応答が失われた）の回復専用。
+    認証済みの本人が試みた `client_op_id` に一致する未失効キーだけを、単一の原子的 UPDATE（所有条件も同じ WHERE）で失効する。
+    `created_by`（admin 発行・`owner_uid IS NULL` の行のみ）と `owner_uid`（自己発行）は排他で、どちらか一方だけを渡す。一致しなければ None。`client_op_id` は `lower()` で照合する。
     """
     if not client_op_id:
         return None
@@ -250,14 +201,10 @@ def revoke_unconfirmed_key_by_client_op_id(client_op_id: str, revoked_by: str, *
 
 
 def _revoke_self_issued_api_keys_in_tx(conn, actor: str) -> int:
-    """`revoke_self_issued_api_keys` の本体（呼び出し側が開いた接続/トランザクションに載せる）。
-
-    `_USER_KEY_LOCK` は呼び出し側が既に取得している前提（`revoke_self_issued_api_keys` は自分で
-    取る・`apply_system_settings_and_revoke_if_disabled` は設定変更と共通のトランザクションで
-    先に取る）。冪等: 既に失効済みの行は WHERE 句で対象外＝実際に失効した行数だけが
-    `RETURNING` に乗る。変更が無い（0件）ときは監査行も作らない。
+    """`revoke_self_issued_api_keys` の本体（呼び出し側の接続/トランザクションに載る）。
+    `_USER_KEY_LOCK` は呼び出し側が取得済みであること。冪等で、実際に失効した行数だけが `RETURNING` に乗り、0件なら監査行も作らない。
     """
-    from sherpa import store as _facade   # set_system_settings と同じ理由（monkeypatch シーム維持）
+    from sherpa import store as _facade
     rows = conn.execute(
         "UPDATE api_keys SET revoked_at=now(), revoked_by=%s "
         "WHERE owner_uid IS NOT NULL AND revoked_at IS NULL "
@@ -270,11 +217,8 @@ def _revoke_self_issued_api_keys_in_tx(conn, actor: str) -> int:
 
 
 def revoke_self_issued_api_keys(actor: str = "system") -> int:
-    """`user_api_keys_allowed` が偽へ戻ったとき、利用者発行キー（`owner_uid` が非 NULL）を
-    一括失効する（`purge_personal_api_keys` と同型）。単独呼び出し用（起動時の backstop 等）。
-    設定変更と同一トランザクションで行いたい場合は `apply_system_settings_and_revoke_if_disabled`
-    を使うこと（設定 commit 後に失効だけ失敗すると、再度 ON にした時に失効し損ねた旧キーが
-    有効なまま復活してしまうため）。
+    """`user_api_keys_allowed` が偽へ戻ったとき、利用者発行キー（`owner_uid` が非 NULL）を一括失効する（単独呼び出し用）。
+    設定変更と同一トランザクションで行うなら `apply_system_settings_and_revoke_if_disabled` を使う。
     """
     _ensure()
     with _connect() as c:
@@ -283,10 +227,7 @@ def revoke_self_issued_api_keys(actor: str = "system") -> int:
 
 
 def count_self_issued_active_api_keys() -> int:
-    """有効な（失効しておらず、期限切れでもない）利用者発行キーの件数。管理画面が
-    `user_api_keys_allowed` を OFF で保存する前に、失効対象件数を確認ダイアログへ表示する
-    ためのプレビュー用（`count_users_with_personal_keys` と同型）。
-    """
+    """有効な（失効しておらず期限切れでもない）利用者発行キーの件数（`user_api_keys_allowed` を OFF にする前の確認ダイアログ用）。"""
     _ensure()
     with _connect() as c:
         row = c.execute(
@@ -296,30 +237,16 @@ def count_self_issued_active_api_keys() -> int:
     return int(row["n"]) if row else 0
 
 
-# 呼び出し数の集計クエリに掛ける statement_timeout（ms）。監査台帳が肥大しても一覧表示全体を
-# 無期限にブロックしないための上限（`ext_api._audit_db_connect` の考え方と同じ）。
+# 呼び出し数の集計クエリの statement_timeout（ms）。
 _CALL_COUNT_STATEMENT_TIMEOUT_MS = 3000
-# 集計対象の期間（日）。「累計」ではなく直近の呼び出し傾向を見せれば十分という判断
-# （無期限の集計は監査行が増えるほど遅くなる・書込み時カウンタ表への移行は将来課題）。
+# 集計対象の期間（日）。
 _CALL_COUNT_WINDOW_DAYS = 30
 
 
 def count_ext_api_calls_by_key(key_ids, *, days: int = _CALL_COUNT_WINDOW_DAYS, now=None) -> dict:
-    """指定した API キー（`key_ids`）の直近 `days` 日分の呼び出し回数（監査台帳から集計）。
-    key_id -> 件数。`key_ids` が空/None なら空 dict を返す（全キー無制限集計はしない——
-    呼び出し側は「今から一覧に出す行の id」だけを渡すこと。本人一覧は本人のキーだけを渡すため
-    自然に本人キーのみの集計になる）。
-
-    `actor_user_id` は X-API-Key 認証ルート（`ext_api.require_api_key`）が常に `f"ext:{key_id}"`
-    の形で書く（成功・401・429 のいずれも）——admin のキー発行/一覧/失効操作は admin 本人の uid が
-    actor になるため混入しない。0件のキーはこの辞書に含まれない（呼び出し側で `.get(id, 0)` する）。
-
-    `now`（省略可・テスト専用の注入口）: 集計の基準時刻（tz-aware datetime）。省略時は DB の
-    `now()`（実時刻）を使う。窓の境界（例:「31日前の呼び出しは除外される」）を検証するテストは、
-    監査行の `created_at` を直接 UPDATE してはならない（`audit_log` はハッシュチェーンで完全性を
-    保証しており、`created_at` はハッシュ算出対象のフィールド——直接書き換えると
-    `entry_hash` と実際の値が食い違い、チェーンの完全性検証が壊れる）。代わりにここで基準時刻を
-    未来へ注入し、実際の（不変の）`created_at` を窓の外へ押し出すことで境界を再現する。
+    """指定した API キー（`key_ids`）の直近 `days` 日分の呼び出し回数（監査台帳から集計）を key_id -> 件数で返す。
+    `key_ids` が空/None なら空 dict（全キー集計はしない）。0件のキーは含まれない（呼び出し側で `.get(id, 0)`）。
+    `now`（テスト用）: 集計の基準時刻。窓の境界を検証するときは `audit_log.created_at` を書き換えず（ハッシュ対象）、`now` を未来へ注入する。
     """
     if not key_ids:
         return {}
@@ -352,24 +279,8 @@ def count_ext_api_calls_by_key(key_ids, *, days: int = _CALL_COUNT_WINDOW_DAYS, 
 
 def apply_system_settings_and_revoke_if_disabled(uid, updates: dict,
                                                  secret_keys: frozenset | None = None) -> dict:
-    """全体設定の部分更新（`settings.set_system_settings` に委譲）を行いつつ、更新後に
-    `user_api_keys_allowed` が実効 OFF（明示 false、または明示 null＝既定 false へ戻る）になる
-    場合は、設定の適用・利用者発行キーの一括失効・両方の監査を**同一トランザクション**で行う
-    （`set_system_settings` の `in_txn` フックに載せる）。
-
-    設定 commit 後に別トランザクションで失効すると、その失効が失敗した場合に「OFF なのに
-    revoked_at が空の旧キーが残る」状態になり、再度 ON にした瞬間その旧キーが復活してしまう
-    （認証時の fail-safe 判定は OFF の間だけ効くため、ON に戻ると素通りする）。同一トランザクション
-    にすることで、設定変更と失効は必ず両方成功するか両方ロールバックするかのどちらかになる。
-
-    `user_api_keys_allowed`／`user_api_keys_daily_quota_default` のいずれかを含む更新は、
-    値に関わらず（ON/OFF/クォータ変更のみ、いずれも）`_USER_KEY_LOCK` を取ってから適用する。
-    これは複数ロックの取得順序の話ではなく（単一ロックのため「順序」は生じない）、
-    `insert_api_key` の自己発行 TOCTOU 再確認（同じ2キーを同じロック下で読む）と**同じロックを
-    共有して排他する**ことが目的——「admin がこの2キーのどちらかを書いている最中」と「利用者が
-    自己発行で読んでいる最中」が同じロックドメインで排他されることを構造的に保証し、
-    片方だけロックを取る経路が残って稀に交差読み取りが起こる余地を無くす（`turning_off` の
-    時だけ一括失効を追加で行う点は従来どおり）。
+    """全体設定の部分更新（`settings.set_system_settings` に委譲）を行い、更新後に `user_api_keys_allowed` が実効 OFF になる場合は、設定の適用・利用者発行キーの一括失効・両方の監査を同一トランザクションで行う（`in_txn` フック）。
+    `user_api_keys_allowed`/`user_api_keys_daily_quota_default` を含む更新は、値に関わらず `_USER_KEY_LOCK` を取ってから適用する（`insert_api_key` の再確認と同じロックで排他する）。
     """
     from . import settings as _settings_mod
 
@@ -379,9 +290,7 @@ def apply_system_settings_and_revoke_if_disabled(uid, updates: dict,
 
     def _hook(conn, hook_uid, _updates):
         if touches_user_key_settings:
-            # 自己発行の書込み（`insert_api_key`）と同じロックを取ってから適用する: 「この2キー
-            # への admin 書込み」と「トグルが ON である前提の自己発行（既定/上限の再読を含む）」が
-            # 同時に起きても、どちらか一方が完全に先に終わってからもう一方が始まる。
+            # `insert_api_key` と同じロックを取ってから適用する。
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (_USER_KEY_LOCK,))
         if turning_off:
             _revoke_self_issued_api_keys_in_tx(conn, hook_uid)
@@ -390,7 +299,7 @@ def apply_system_settings_and_revoke_if_disabled(uid, updates: dict,
 
 
 def touch_api_key(key_id: int) -> None:
-    """last_used_at 更新（best-effort・認証成功時に呼ぶ）。"""
+    """last_used_at を更新する（best-effort・認証成功時に呼ぶ）。"""
     _ensure()
     with _connect() as c:
         c.execute("UPDATE api_keys SET last_used_at=now() WHERE id=%s", (key_id,))

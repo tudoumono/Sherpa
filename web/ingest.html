@@ -14,9 +14,7 @@
   .section-title{font-size:var(--text-body);font-weight:700;color:var(--ink);margin:0}
   .section-head{display:flex;align-items:flex-end;gap:14px;margin:28px 0 12px}
   .section-head .spacer{flex:1}
-  /* 上: 資料フォルダ（登録・一覧）＝旧 ingest-new.html。
-     .field label / .field input / .mini 等は app.css のグローバル定義を上書きするため、
-     必ず .folders 配下に限定してスコープする（下の「取り込み状況」の .field/.mini に波及させない）。*/
+  /* 上: 資料フォルダ（登録・一覧）。.field label / .field input / .mini 等は app.css のグローバル定義を上書きするため、必ず .folders 配下に限定してスコープする（下の「取り込み状況」に波及させない）。 */
   .folders{max-width:920px}
   .folders .field label{display:block;font-size:var(--text-small);color:var(--ink-3,#8b95a3);margin-bottom:3px}
   .folders .field input{width:100%;min-width:0}
@@ -52,9 +50,7 @@
   .fitem{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--ink,#1f2937)}
   .fitem:hover{background:var(--accent-weak,#ccfbf1)}
   .picker .pf{padding:12px 16px;border-top:1px solid var(--border,#e3e6ea);display:flex;gap:10px;justify-content:flex-end}
-  /* admin ガード（W1・2026-09-03）: この画面のデータ（資料フォルダ一覧・取り込み状況・全文検索）は
-     全て admin 限定 API に依存する（`/worlds`・`/ingest/preview`・`/admin/es/search`）。admin-settings.html
-     / audit.html と同じ「非 admin は access-denied だけ見せる」パターン。 */
+  /* admin ガード: この画面のデータ（`/worlds`・`/ingest/preview`・`/admin/es/search`）は全て admin 限定 API に依存するため、非 admin は access-denied だけ見せる。 */
   #access-denied{display:none;text-align:center;padding:60px 20px;color:var(--ink-3)}
   .folders .rowmain{flex-wrap:wrap}
   .folders .row .pth{flex-basis:220px}
@@ -78,7 +74,7 @@
     <a class="help-link" href="manual.html#register">この画面の使い方 →</a>
   </div>
 
-  <!-- ===== 上: 資料フォルダ（登録・一覧）＝旧 ingest-new.html ===== -->
+  <!-- ===== 上: 資料フォルダ（登録・一覧） ===== -->
   <div class="folders">
     <div class="section-head"><div class="section-title">資料フォルダ</div></div>
 
@@ -117,7 +113,7 @@
     </div>
   </div>
 
-  <!-- ===== 下: 取り込み状況（文書一覧・全文検索）＝旧 ingest.html ===== -->
+  <!-- ===== 下: 取り込み状況（文書一覧・全文検索） ===== -->
   <div class="section-head">
     <div><div class="section-title">取り込み状況</div>
       <div class="sub" style="font-size:var(--text-small)">どの資料が使えるかを確認し、失敗したものをやり直します</div>
@@ -174,7 +170,7 @@
   </div>
 </div>
 
-<!-- 詳細（管理）: A17 抽出プレビュー（関係・廃止ラベルの精度監査） -->
+<!-- 詳細（管理）: 抽出プレビュー（関係・廃止ラベルの精度監査） -->
 <div class="overlay" id="overlay">
   <div class="rv">
     <div class="rv-h">

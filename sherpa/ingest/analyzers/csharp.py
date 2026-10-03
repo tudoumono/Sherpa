@@ -1,32 +1,12 @@
-"""C# アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §4(a)/§9 S7・A1＝本体のみ・FW なし）。
+"""C# アナライザ（本体のみ・FW なし）。`class`/`interface`/`struct`/`enum`/`record` を主体定義（`Module`）とし、同一ファイル内の非 public 型を子定義（`CONTAINS`）として返す。`namespace X;` と `namespace X { ... }` の両方に対応し、`cid_key` は `Namespace.Type`。
 
-`class`/`interface`/`struct`/`enum`/`record`（`record class`/`record struct` を含む・ファイル主体）
-を主体定義（`Module`）とし、Java と同様に同一ファイル内の非 public 型を子定義（`Module`・
-`CONTAINS`）として返す。`namespace X;`（ファイルスコープ）と `namespace X { ... }`（ブロック
-スコープ）の両方に対応し、`cid_key` に `Namespace.Type` の完全修飾名を持たせる（Java の package
-修飾と同型・§4(c)' の qualified 名2段解決の対象になる）。
-
-C# は基底クラス/実装インタフェースを `:` 1つで併記し `implements` 相当のキーワードを持たない
-ため、判定を誤って作り込むより単純化する——**base list の全エントリを `via=extends` に統一**
-する（`docs/proposals` の記載どおり `implements` は使わない）。base list の対象範囲は `where`
-（ジェネリクス制約）の手前までに限定し、`enum X : int` の `:`（underlying type・継承ではない）
-は base list として扱わない（enum 宣言自体を対象外にする）。フィールド/プロパティ/引数の
-宣言型は Java と同じ枠組みで `via=field_type`（`var` は除外・ジェネリクス1段まで）。
-`using X;`（インポート形）は参照にしない（ヒントのみ・Java の import と同じ扱い）。
-`using Alias = Namespace.Real;`（エイリアス形）は辞書化し、base/field/new の型トークンが
-エイリアスなら実体（`Namespace.Real`）への `qualified` 参照（`extra={"qualified": True}`）に
-置換して既存の完全修飾名2段解決へ渡す。`[Inject]` 格上げは行わない（A2）。`new X(...)` は
-`via=call`。`partial class`（複数ファイル分割）は解決せず `Dropped("cs_partial", ...)` として
-申告する。
-
-外部パーサは使わず、正規表現＋行走査で確実に取れるものだけ取る（COBOL/JCL/Java と同じ流儀）。
-コメント（`//`・`/* */`）と文字列/char/逐語的文字列リテラル（`@"..."`・二重引用符のエスケープが
-`""` になる点が通常の文字列と異なる）は `_sanitize()` で空白化してから走査する。
-
-大文字小文字は区別する（正規化しない・C# は大文字小文字を区別する言語）。
-
-**検出限界**: ジェネリクス制約（`where T : class`）は無視する（base list 抽出を `where` の手前で
-打ち切るだけで、制約自体は解析しない）。複数物理行にまたがる型ヘッダ/宣言は見逃す（安全側）。
+参照（`INVOKES`）:
+- base list の全エントリを `via=extends`（`where` の手前まで。`enum X : int` は対象外）。
+- フィールド/プロパティ/引数の宣言型を `via=field_type`、`new X(...)` を `via=call`。
+- `using Alias = Namespace.Real;` は辞書化し、型トークンがエイリアスなら実体への `qualified` 参照に置換する。`using X;` は参照にしない。
+- `partial class` は `Dropped("cs_partial")` で申告する。
+正規表現＋行走査（コメント・文字列・逐語的文字列は `_sanitize()` で空白化）。大文字小文字は区別する。複数物理行の宣言は見逃す。
+設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
@@ -38,11 +18,9 @@ CSHARP_EXT = frozenset({".cs"})
 
 _NAMESPACE_FILE_SCOPED = re.compile(r'^\s*namespace\s+([\w.]+)\s*;', re.M)
 _NAMESPACE_BLOCK = re.compile(r'^\s*namespace\s+([\w.]+)\s*\{', re.M)
-# `using Alias = Namespace.Real;`（エイリアス形・item9）。プレーンな `using X;`（インポート形）は
-# エイリアス化しないため別枠で辞書化するだけで、参照候補には出さない。
+# `using Alias = Namespace.Real;`（エイリアス形）。`using X;`（インポート形）は参照候補に出さない。
 _USING_ALIAS = re.compile(r'^\s*using\s+([A-Za-z_][\w]*)\s*=\s*([\w.]+)\s*;', re.M)
-# `record`（位置指定 primary constructor）は `record class`/`record struct` の2形も併記できる——
-# 後続の型キーワードを挟んでから名前が来る点だけ他の宣言と異なる。
+# `record` は `record class`/`record struct` の形もあり、型キーワードを挟んでから名前が来る。
 _TYPE_DECL = re.compile(
     r'\b(?:partial\s+)?(?:class|interface|struct|enum|record(?:\s+(?:class|struct))?)\s+([A-Za-z_][\w]*)'
 )
@@ -50,7 +28,7 @@ _PARTIAL_MODIFIER = re.compile(r'\bpartial\b')
 _PUBLIC_MODIFIER = re.compile(r'\bpublic\b')
 _ENUM_KEYWORD = re.compile(r'\benum\b')
 _WHERE_KEYWORD = re.compile(r'\bwhere\b')
-# base list 本体（`where` 手前に切り詰めた範囲だけを対象にする・呼び出し側で truncate 済み）。
+# base list 本体（`where` 手前に切り詰めた範囲だけが対象・呼び出し側で truncate 済み）。
 _BASE_LIST = re.compile(r':\s*(?P<bases>[^{;]+)', re.S)
 _HEADER_SCAN_LIMIT = 4000
 
@@ -66,8 +44,7 @@ _JDK_LIKE_COMMON_TYPES = frozenset({
 
 _ANNOTATION_ONLY_LINE = re.compile(r'^\[(?P<name>[A-Za-z_][\w]*)(?:\([^)]*\))?\]\s*$')
 _LEADING_ATTRIBUTES = re.compile(r'^(?:\[[A-Za-z_][\w]*(?:\([^)]*\))?\]\s*)+')
-# フィールド／自動実装プロパティ宣言（クラス直下＝深度1限定）。終端は `;`（フィールド/式形プロパティ）
-# ／`=`（初期化子）／`{`（`{ get; set; }` 形の自動実装プロパティ）のいずれか。
+# フィールド／自動実装プロパティ宣言（クラス直下＝深度1）。終端は `;`／`=`／`{` のいずれか。
 _FIELD_OR_PROP_DECL = re.compile(
     r'^(?:(?:public|private|protected|internal|static|readonly|const|virtual|override|sealed|'
     r'abstract|new)\s+)*'
@@ -90,8 +67,7 @@ _PARAM_ENTRY_TYPE = re.compile(
 
 
 def _sanitize(text: str) -> str:
-    """コメント（`//`・`/* */`）と文字列/char/逐語的文字列リテラルの中身を空白化した、同じ行数の
-    文字列を返す（偽マッチ除外専用・改行は保持し行番号が原本と1対1のまま）。"""
+    """コメントと文字列/char/逐語的文字列リテラルの中身を空白化した同じ行数の文字列を返す（偽マッチ除外用・行番号は原本と1対1）。"""
     out: list = []
     i, n = 0, len(text)
     while i < n:
@@ -113,7 +89,7 @@ def _sanitize(text: str) -> str:
                 out.append(" ")
                 i += 1
             continue
-        if ch == "@" and text[i:i + 2] == '@"':            # 逐語的文字列（`""` はエスケープされた `"`）
+        if ch == "@" and text[i:i + 2] == '@"':  # 逐語的文字列（`""` はエスケープされた `"`）
             out.append("  ")
             i += 2
             while i < n:
@@ -189,9 +165,7 @@ def _split_top_level_commas(s: str) -> list:
 
 
 def _split_type_list(raw: str) -> list:
-    """base list（`: Base, IFoo` 等）のカンマ区切り要素から型トークンを取り出す。`.` を含む
-    完全修飾トークン（`A.Base` 等）は完全名のまま返す——単純名へ落とさない（`_emit_type_ref` 側で
-    `.` の有無により `qualified` 参照へ振り分ける）。"""
+    """base list のカンマ区切り要素から型トークンを取り出す。`.` を含む完全修飾トークンは完全名のまま返す。"""
     names = []
     for part in _strip_generics(raw).split(","):
         token = re.sub(r"[^\w.]", "", part).strip(".")
@@ -201,10 +175,7 @@ def _split_type_list(raw: str) -> list:
 
 
 def _namespace_and_depth_offset(sanitized: str):
-    """`namespace` の宣言形（ファイルスコープ／ブロックスコープ）を判定し、`(package, depth_offset)`
-    を返す。ブロックスコープ（`namespace X { ... }`）はそれ自体が波括弧1段を消費するため、内側の
-    型宣言を「トップレベル」とみなす基準の深度を1つずらす（Java には無い C# 固有の事情）。
-    """
+    """`namespace` の宣言形（ファイルスコープ／ブロックスコープ）を判定し `(package, depth_offset)` を返す。ブロックスコープは波括弧1段を消費するため、型宣言の基準深度を1つずらす。"""
     fm = _NAMESPACE_FILE_SCOPED.search(sanitized)
     if fm:
         return fm.group(1), 0
@@ -215,8 +186,7 @@ def _namespace_and_depth_offset(sanitized: str):
 
 
 def _iter_top_level_type_decls(sanitized: str, depth_offset: int):
-    """`depth_offset`（`namespace` ブロックの有無で0または1）と同じ波括弧深度の型宣言を
-    `(match, line, is_public)` で返す。それより深い（内部クラス等）は `nested` として返す。"""
+    """`depth_offset` と同じ波括弧深度の型宣言を `(match, line, is_public)` で返す。より深い（内部クラス等）は `nested` として返す。"""
     depth = 0
     pos = 0
     top: list = []
@@ -241,11 +211,7 @@ def _header_of(sanitized: str, decl_end: int) -> str:
 
 
 def _emit_type_ref(refs: list, name: str, line: int, via: str, aliases: dict) -> None:
-    """`INVOKES` 候補を1件積む——`name` が `using` エイリアス（item9）なら実体（完全修飾名）への
-    `qualified` 参照に置換して既存の完全修飾名2段解決（`_resolve_qualified`）へ渡す。`name` 自体が
-    既に `.` を含む完全修飾トークン（base list/宣言型/`new` で直接書かれた完全名）の場合も
-    同じ `qualified` 参照にする——単純名へ落とさず完全名を保持したまま解決へ渡す（alias 置換と
-    同じ経路。単純名フォールバックは共通層 `world_graph._link` 側が担う）。"""
+    """`INVOKES` 候補を1件積む。`name` が `using` エイリアスなら実体（完全修飾名）の `qualified` 参照に置換する。`.` を含む完全修飾トークンも同じ `qualified` 参照にする（単純名へ落とさない）。"""
     if name in aliases:
         refs.append(RefCandidate("INVOKES", "Module", aliases[name], line,
                                  extra={"via": via, "qualified": True}))
@@ -258,11 +224,7 @@ def _emit_type_ref(refs: list, name: str, line: int, via: str, aliases: dict) ->
 
 def _emit_declared_type_refs(refs: list, type_token: str, generics_token: str | None, line: int,
                              aliases: dict) -> None:
-    """宣言型（＋1段のジェネリクス型引数）を `INVOKES(via=field_type)` 候補として積む。
-    共通型（`_JDK_LIKE_COMMON_TYPES`）・小文字始まり（`var`/プリミティブ含む）は候補にしない。
-    `type_token`（および各ジェネリクス型引数）が `.` を含む完全修飾名（`A.Base`/`C.Dep` 等）の
-    場合、判定（大文字始まり・共通型除外）には末尾セグメントを使うが、参照そのものは完全名の
-    まま渡す（`_emit_type_ref` 側で `qualified` 参照へ振り分ける——単純名へ落とさない）。"""
+    """宣言型（＋1段のジェネリクス型引数）を `INVOKES(via=field_type)` 候補として積む。共通型・小文字始まり（`var`/プリミティブ）は除く。完全修飾名は、判定には末尾セグメントを使い、参照は完全名のまま渡す。"""
     simple = type_token.rsplit(".", 1)[-1]
     if simple[:1].isupper() and simple not in _JDK_LIKE_COMMON_TYPES:
         _emit_type_ref(refs, type_token, line, "field_type", aliases)
@@ -299,9 +261,7 @@ def _find_param_list(line: str):
 
 
 def _collect_declared_type_refs(sanitized: str, depth_offset: int, aliases: dict) -> list:
-    """フィールド/自動実装プロパティ/コンストラクタ引数/メソッド引数の宣言型を参照候補として抽出
-    する（トップレベル型の直下＝`depth_offset + 1` に限定・Java 版と同じ「メソッド本体内は対象外」
-    規律）。"""
+    """フィールド/自動実装プロパティ/コンストラクタ/メソッド引数の宣言型を参照候補として抽出する（トップレベル型の直下＝`depth_offset + 1` のみ。メソッド本体内は対象外）。"""
     refs: list = []
     depth = 0
     target_depth = depth_offset + 1
@@ -357,19 +317,15 @@ class CSharpAnalyzer(Analyzer):
         primary_name = primary_m.group(1)
         qualified = f"{package}.{primary_name}" if package else primary_name
 
-        # `partial class`（複数ファイル分割）は解決せず申告するだけ（Dropped・撤去した children には
-        # しない——ファイル自体の主体定義は通常どおり作る）。
+        # `partial class` は解決せず `Dropped` で申告するだけ（ファイルの主体定義は通常どおり作る）。
         for m, line, _pub in top:
-            if _PARTIAL_MODIFIER.search(m.group(0)):        # `partial` は `_TYPE_DECL` 自身の
-                                                             # マッチ文字列内に含まれる（マッチ前ではない）
+            if _PARTIAL_MODIFIER.search(m.group(0)):  # `partial` は `_TYPE_DECL` 自身の
+                                                             # マッチ文字列内に含まれる
                 snippet = (lines_raw[line - 1].strip()[:120] if line - 1 < len(lines_raw) else "")
                 dropped.append(Dropped("cs_partial", line, snippet))
 
         primary = DefItem(label="Module", name=primary_name, cid_key=qualified)
-        # 非 primary 型（同一ファイル内の内部/非 public 型）にも namespace 込みの `cid_key` を
-        # 設定する——別 namespace の同名型と区別できないと、`using Alias = N.Child;` のような
-        # 完全修飾参照が意図した namespace の型へ一意に解決できない（`_resolve_qualified` は
-        # `cid_key` の完全一致でしか引けないため）。
+        # 非 primary 型にも namespace 込みの `cid_key` を設定する（別 namespace の同名型と区別し、完全修飾参照を一意に解決するため）。
         children = [
             DefItem(label="Module", name=m.group(1),
                     cid_key=f"{package}.{m.group(1)}" if package else m.group(1), line=line)
@@ -381,19 +337,18 @@ class CSharpAnalyzer(Analyzer):
     def extract_refs(self, text: str, rel_path: str) -> RefResult:
         sanitized = _sanitize(text)
         _package, depth_offset = _namespace_and_depth_offset(sanitized)
-        # `using Alias = Namespace.Real;`（item9）を辞書化する——プレーンな `using X;` はヒントの
-        # ままエッジ化しない（マッチ対象が違う正規表現のため自然に除外される）。
+        # `using Alias = Namespace.Real;` を辞書化する。
         aliases = dict(_USING_ALIAS.findall(sanitized))
         refs: list = []
 
         top, _nested = _iter_top_level_type_decls(sanitized, depth_offset)
         for m, line, _pub in top:
             if _ENUM_KEYWORD.search(m.group(0)):
-                continue                                  # `enum X : int` の `:` は underlying type
-                                                            # であり base list ではない（item3）
+                continue  # `enum X : int` の `:` は underlying type
+                                                            # であり base list ではない
             header = _header_of(sanitized, m.end())
             wm = _WHERE_KEYWORD.search(header)
-            base_part = header[:wm.start()] if wm else header   # `where`（ジェネリクス制約）手前まで
+            base_part = header[:wm.start()] if wm else header  # `where`（ジェネリクス制約）手前まで
             bm = _BASE_LIST.search(base_part)
             if bm:
                 for name in _split_type_list(bm.group("bases")):
@@ -401,13 +356,12 @@ class CSharpAnalyzer(Analyzer):
 
         for m in _CALL_LIKE.finditer(sanitized):
             line = _line_at(sanitized, m.start())
-            # `.` を含む完全修飾トークン（`C.Target()` 等）は完全名のまま渡す——単純名へ落とさない
-            # （`_emit_type_ref` 側で `qualified` 参照へ振り分ける）。
+            # `.` を含む完全修飾トークンは完全名のまま渡す。
             name = _strip_generics(m.group("type")).strip(".")
             if name:
                 _emit_type_ref(refs, name, line, "call", aliases)
 
         refs.extend(_collect_declared_type_refs(sanitized, depth_offset, aliases))
 
-        # `using X;`（インポート形）はヒントのみ（Java の import と同じくエッジ化しない）。
+        # `using X;`（インポート形）はヒントのみでエッジ化しない。
         return RefResult(refs=refs)

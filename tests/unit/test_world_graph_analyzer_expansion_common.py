@@ -584,19 +584,7 @@ JAVA1_WORLD_ID = "java1_test"
 def _snapshot(world_dir, world_id: str) -> dict:
     """`build_world` の出力を golden 比較用に正規化する（nodes は cid・edges は (type,src,dst)・
     flags は JSON 文字列でソートし、辞書の内部反復順に依存しない安定した表現にする）。"""
-    # 言及エッジ（Pass3）の閾値は env で動くため、golden の基準値（既定値）に固定して比較・再生成の
-    # 条件を揃える（環境の設定次第で偽失敗し、その環境で再生成すると誤った golden が確定してしまう）。
-    pinned = {"SHERPA_MENTION_MIN_LEN": "4", "SHERPA_MENTION_MAX_PER_DOC": "200"}
-    saved = {k: os.environ.get(k) for k in pinned}
-    os.environ.update(pinned)
-    try:
-        nodes, edges, flags = world_graph.build_world(world_dir, world_id)
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    nodes, edges, flags = world_graph.build_world(world_dir, world_id)
     return {
         "nodes": sorted(nodes, key=lambda n: n["cid"]),
         "edges": sorted(edges, key=lambda e: (e["type"], e["src"], e["dst"])),

@@ -1,30 +1,17 @@
-"""文書標準構造（document-ir-v1）の型と直列化（起案 docs/archive/proposals/2026-07-20-調査型RAG詳細修正計画.html §6.1・
-外部レビュー確定の契約修正＝DOC-IR-001.5）。
+"""文書標準構造（document-ir-v3）の型と決定的 JSON 直列化。
 
-**MD 出力と並行して生成する構造化表現**。MD が正のまま（検索/ES/grep/台帳/削除経路は不変）＝本モジュールは
-`DocumentIR` を組み立てる純粋なデータ型と決定的 JSON 直列化だけを持つ（取り込み・書き出しは各アーム／
-`office_md.py` 側の責務）。
-
-`world_id` は今回含めない（取込側の責務・将来対応）。`doc_id` はアーム段階では空文字（`""`）で構わない＝
-確定は取り込み側（`office_md.build_derived`）が原本相対パス（`rel`）を設定してから行う。
-
-`element_id`（`para:N`／`heading:N`／`table:N` 等）は**文書版内で決定的な要素ID**（World 再構築内の識別子）
-であり、原本へ要素を前方追加すると後続の連番はずれる＝**版をまたぐ安定IDではない**（採番規則の詳細は各
-アーム実装＝`arms/ooxml_arm.py` の docstring を参照）。
+MD 出力と並行して作る構造化表現。取り込み・書き出しは各アーム／`office_md.py` の責務で、
+ここは `DocumentIR` のデータ型と直列化だけを持つ。
+`doc_id` はアーム段階では空文字で、`office_md.build_derived` が原本相対パスを設定して確定する。
+`element_id`（`para:N` 等）は再構築内で決定的な ID であり、要素の前方追加で連番がずれる（採番規則は `arms/ooxml_arm.py`）。
+設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
 """
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
 
-DOCUMENT_IR_SCHEMA_VERSION = "document-ir-v3"          # JSON 形式そのものの版（抽出処理の版とは分離＝DOC-IR-001.5）
-# v1→v2（DOC-IR-003・提案書 §7 フェーズ2「PowerPoint」）: `Element.visibility_reason` を追加。JSON 形状が
-# 変わるため版分離の規律（外部レビュー#2）に従い bump する＝「現在の（pptx）覆い判定を標準構造の
-# visibility と visibility_reason へ移す」という設計方針の反映（DOCX 側の hidden_text にも同時に設定）。
-# v2→v3（HM1 の docx 見送り分・2026-09-03）: `DocumentIR.picture_count` を追加（docx は xlsx の
-# シート単位 `Element.source_map["picture_count"]` に相当する「シート」概念を持たないため、文書全体の
-# 画像枚数を DocumentIR 直下に持つ＝`human_md.render_docx` の画像存在注記が読む）。xlsx/pptx は既定0のまま
-# （xlsx は従来どおり sheet 要素の source_map を使う）。
+DOCUMENT_IR_SCHEMA_VERSION = "document-ir-v3"          # JSON 形式の版（抽出処理の版とは別）
 
 
 @dataclass
@@ -44,13 +31,11 @@ class Extraction:
 
 @dataclass
 class Cell:
-    """表1セル（原本の行/列位置を保持した位置付きセル・DOC-IR-001.5・修正1）。
+    """表1セル（原本の行/列位置を保持した位置付きセル）。
 
-    `row`/`column` は 1-based の実グリッド座標（`w:gridSpan`/`w:vMerge` 等の結合を解決した後の位置）。
-    `row_span`/`column_span` は結合の**起点セル**にのみ 2 以上が入る（結合の継続セル＝内容を持たない
-    merged 継続セルは要素自体を作らない＝起点セルの span で表現する。採番規則は `arms/ooxml_arm.py` の
-    `_docx_table_cells` docstring 参照）。`role` は意味付け（ヘッダ/データ等）。**IR は原本忠実**＝常に
-    `"unknown"`（ヘッダ判定は検索用表現生成層＝RAG-REP-001 の責務）。
+    `row`/`column` は結合を解決した後の 1-based グリッド座標。`row_span`/`column_span` は結合の起点セルにだけ
+    2 以上が入り、継続セルは要素を作らない（`arms/ooxml_arm.py` の `_docx_table_cells`）。
+    `role` は常に `"unknown"`（ヘッダ判定は検索用表現の生成側）。
     """
     row: int
     column: int
@@ -64,19 +49,11 @@ class Cell:
 class Element:
     """1構造要素（段落/見出し/表/スライド/shape 等）。`text`/`cells` は要素型に応じ一方のみで可（他方は None）。
 
-    表要素（`type="table"`）は行ごとの子要素を持たず、`cells`（位置付きセル配列）だけで表現する
-    （DOC-IR-001.5・修正1＝旧 `type="table_row"`／`values: dict` は撤去）。
+    表要素（`type="table"`）は行の子要素を持たず、`cells`（位置付きセル配列）だけで表現する。
 
-    `visibility_reason`（document-ir-v2・DOC-IR-003、L3で意味を拡張）: 大半は `visibility="hidden"` の理由
-    （オープン語彙・現状値は `"hidden_run"`（Word の `w:vanish`）／`"hidden_slide"`（PowerPoint の非表示
-    スライド）／`"occluded"`（前面の無地図形/画像に覆われた・pptx A5 判定の構造化）／`"off_slide"`
-    （スライド外配置）／`"hidden_sheet"`/`"very_hidden"`（Excel の非表示/完全非表示シート））。
-    **例外が1つだけある**: `"strike"`（取り消し線・`w:strike`/`w:dstrike`／xlsx `font.strike`）は
-    `visibility="visible"` のまま設定する——取り消し線は隠し文字と異なり本文が読める状態のまま
-    （画面上は見えている）ため、`visibility="hidden"` にすると事実と異なる断定になる。それ以外の
-    reason は引き続き `visibility="hidden"` とセットで使うこと。前面の**テキスト**による上書き
-    （`covered_by_text`）は `visibility_reason` を使わず `source_map` 側に置く（意味の確定は検索表現層の
-    責務・`"strike"` と混同しないよう別キーに分離）。
+    `visibility_reason` は `visibility="hidden"` の理由（`hidden_run`／`hidden_slide`／`occluded`／
+    `off_slide`／`hidden_sheet`／`very_hidden`）。例外は `"strike"`（取り消し線）で、本文が読めるため
+    `visibility="visible"` のまま設定する。前面テキストによる上書き（`covered_by_text`）は `source_map` に置く。
     """
     element_id: str
     type: str                              # "paragraph" | "heading" | "table" | "slide" | "shape" | "notes" | ...
@@ -93,11 +70,10 @@ class Element:
 
 @dataclass
 class DocumentIR:
-    """1文書の標準構造（document-ir-v1）。
+    """1文書の標準構造。
 
-    `picture_count`（v3・HM1）: 文書全体に含まれる画像の総数（0＝画像なし、または未計測のファイル種別）。
-    docx はシート等の中間スコープを持たないため文書直下に置く（xlsx は代わりに各 `sheet` 要素の
-    `source_map["picture_count"]` を使う＝`human_md.render_xlsx` 参照）。
+    `picture_count` は文書全体の画像総数（0＝画像なしまたは未計測）。xlsx は各 `sheet` 要素の
+    `source_map["picture_count"]` を使う（`human_md.render_xlsx`）。
     """
     schema_version: str
     doc_id: str
@@ -107,7 +83,7 @@ class DocumentIR:
 
 
 def to_json_str(ir: DocumentIR) -> str:
-    """決定的直列化（キー順固定・タイムスタンプ無し）。`office_md._write_provenance` の meta.json と同じ流儀。"""
+    """決定的に JSON 化する（キー順固定・タイムスタンプ無し）。"""
     return json.dumps(asdict(ir), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
 
 

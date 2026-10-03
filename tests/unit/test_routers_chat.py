@@ -126,7 +126,7 @@ def test_prepare_agentic_snapshot_reads_settings_exactly_once_when_knowledge_sta
 
     def _fake_get_settings(uid):
         calls["n"] += 1
-        return {"agent": "openai"}
+        return {"agent": "heuristic"}
 
     monkeypatch.setattr(RC.store, "get_settings", _fake_get_settings)
 

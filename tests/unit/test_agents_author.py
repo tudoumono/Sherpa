@@ -2,11 +2,9 @@
 
 lens='author' の前提条件ゲート:
   - 頭脳=Codex かつ ナレッジ参照 ON のときだけファイル作成を試みる。
-  - 他頭脳（Heuristic/OpenAI等の _GenProvider 系）は author 判定でもファイルを作らず、
-    従来 qa 相当の下書きで回答する（headline 冒頭に案内を前置）。
   - Codex＋ナレッジ OFF は「資料に基づいて作成するため、ナレッジ参照をオンにしてください」と正直に返す
     （作成系の語を含まない素の雑談は従来どおりの汎用案内のまま）。
-  - CodexProvider は author のとき reasoning を SHERPA_CODEX_REASONING_AUTHOR（既定 medium）に
+  - CodexProvider は author のとき reasoning を 専用の定数 `_REASONING_AUTHOR`（medium）に
     切り替える。通常レンズは現行のまま。
 
 subprocess を起動する CodexProvider.run() の分岐は、既存 test_codex_workspace_authoring.py と
@@ -22,6 +20,7 @@ import pytest
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 from sherpa import agents as A  # noqa: E402
+from _det_provider import DeterministicTestProvider  # noqa: E402
 
 
 def _ctx(lens="author", knowledge=True, make_sources=None, message="消費税率の一覧をExcelにまとめて"):
@@ -67,7 +66,7 @@ def test_gather_tools_blocked_replaces_done_detail_with_blocked_message():
     """`dispatch` が `_tools_blocked=True` を返すと、"done" ノードの detail が「N件を確認」ではなく
     ブロックを説明する固定文言になる（実際には何も検索していないのに完了したかのような trace を
     出さない・SC-6e）。"""
-    events = list(A.HeuristicProvider().run(_ctx_with_blocked_dispatch()))
+    events = list(DeterministicTestProvider().run(_ctx_with_blocked_dispatch()))
     tool_done = [e for e in events if e.get("type") == "node" and e.get("kind") == "tool"
                 and e.get("status") == "done"]
     assert tool_done, "tool ノードが無い"
@@ -78,102 +77,17 @@ def test_gather_tools_blocked_replaces_done_detail_with_blocked_message():
 
 def test_gather_tools_blocked_sidecar_not_leaked_to_public_env():
     """`_tools_blocked` は `_gather` が pop する内部専用サイドカーで、公開 `_result.env` には残らない。"""
-    events = list(A.HeuristicProvider().run(_ctx_with_blocked_dispatch()))
+    events = list(DeterministicTestProvider().run(_ctx_with_blocked_dispatch()))
     result = next(e for e in events if e.get("type") == "_result")
     assert "_tools_blocked" not in result["env"]
 
 
 def test_gather_not_blocked_keeps_existing_done_wording():
     """`_tools_blocked` が無い（既定・従来どおり）envelope では "件を確認" のまま（byte-identical 回帰）。"""
-    events = list(A.HeuristicProvider().run(_ctx(lens="qa")))
+    events = list(DeterministicTestProvider().run(_ctx(lens="qa")))
     tool_done = [e for e in events if e.get("type") == "node" and e.get("kind") == "tool"
                 and e.get("status") == "done"]
     assert tool_done and all("件を確認" in n["detail"] for n in tool_done)
-
-
-# ===== HeuristicProvider: 他頭脳 fallback 文言 =====
-
-def test_heuristic_provider_prepends_author_fallback_note():
-    events = list(A.HeuristicProvider().run(_ctx(lens="author")))
-    result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"].startswith(A._AUTHOR_FALLBACK_NOTE)
-    assert "該当箇所が2件見つかりました。" in result["env"]["headline"]
-    assert result["decision"]["lens"] == "author"
-
-
-def test_heuristic_provider_non_author_lens_unaffected():
-    events = list(A.HeuristicProvider().run(_ctx(lens="qa")))
-    result = next(e for e in events if e.get("type") == "_result")
-    assert not result["env"]["headline"].startswith("ファイル作成は頭脳")
-    assert result["env"]["headline"] == "該当箇所が2件見つかりました。"
-
-
-# ===== _GenProvider: 他頭脳 fallback 文言 + agentic 除外 =====
-
-class _FakeGen(A._GenProvider):
-    """subprocess/HTTP を使わない _GenProvider のテスト用具象クラス。"""
-    label = "FakeGen"
-
-    def _stream(self, prompt):
-        yield "生成した下書き文。"
-
-    def _agentic_loop(self, ctx):
-        raise AssertionError("author は agentic_run に入ってはいけない（未対応ツール）")
-
-
-def test_gen_provider_prepends_author_fallback_note_and_skips_agentic():
-    # make_sources を与えて agentic 経路が「有効な状況」でも author は _agentic_run を使わないことを確認。
-    ctx = _ctx(lens="author", make_sources=lambda docs: [])
-    events = list(_FakeGen().run(ctx))
-    result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"].startswith(A._AUTHOR_FALLBACK_NOTE)
-    assert "生成した下書き文。" in result["env"]["headline"]
-    # ライブ表示にも note が反映される（answer_delta の最初のチャンクが note）。
-    deltas = [e["text"] for e in events if e.get("type") == "answer_delta"]
-    assert deltas and deltas[0] == A._AUTHOR_FALLBACK_NOTE
-
-
-def test_gen_provider_qa_lens_still_uses_agentic_when_available():
-    """回帰: author 以外（qa）は従来どおり make_sources 有りなら agentic 経路を試みる
-    （_agentic_loop が呼ばれて例外→フォールバック node が出ることで間接確認）。"""
-    ctx = _ctx(lens="qa", make_sources=lambda docs: [])
-    events = list(_FakeGen().run(ctx))
-    # _agentic_loop が AssertionError を投げても _agentic_run 全体は Exception 節で捕捉されフォールバックする。
-    assert any(e.get("id") == "fallback" for e in events if e.get("type") == "node"), \
-        "qa で agentic 経路が試みられていない（フォールバック node が出ていない）"
-
-
-class _FakeGenWithUsage(A._GenProvider):
-    """`_FakeGen` と同じ author 単発経路だが、`_stream` が本物の usage 相当（`_last_usage`）も
-    残す（C6 再現用）。"""
-    label = "FakeGenUsage"
-    provider_id = "openai"
-    model = "gpt-5.5"
-
-    def _stream(self, prompt):
-        from sherpa.providers.base import _usage_meta
-        self._last_usage = _usage_meta(self.provider_id, self.model, input_tokens=10, output_tokens=3,
-                                       system_settings={})   # is_local が DB を叩かないよう固定
-        yield "生成した下書き文。"
-
-    def _agentic_loop(self, ctx):
-        raise AssertionError("author は agentic_run に入ってはいけない（未対応ツール）")
-
-
-def test_gen_provider_author_usage_carries_depth_profile():
-    """C6 是正: API の author 経路（単発・非 agentic）は answer.usage に `depth_profile`
-    （S1 の他経路＝agentic 非ハイブリッド `:2404` 等と同じ `depth_profile.usage_extras` 契約）を
-    載せる——是正前は `env["usage"] = self._last_usage` を素通しするだけで depth_profile が
-    欠落し、`_log_chat_usage` へ渡す usage にも乗らずログからも消えていた。"""
-    ctx = A.Ctx(
-        message="消費税率の一覧をExcelにまとめて", world="v1",
-        route=lambda msg: {"lens": "author", "input": msg, "reason": "test", "confident": True},
-        dispatch=lambda lens_, inp: {"headline": "該当箇所が2件見つかりました。",
-                                     "summary": {"total": 2}, "data": {"citations": []}, "sources": []},
-        knowledge=True, make_sources=lambda docs: [],
-        scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"})
-    result = next(e for e in _FakeGenWithUsage().run(ctx) if e.get("type") == "_result")
-    assert result["env"]["usage"]["depth_profile"] == "deep"
 
 
 # ===== CodexProvider._plain_text: 参照OFFで呼ばれた場合の安全網 =====
@@ -200,35 +114,6 @@ def test_plain_run_passes_ctx_message_to_plain_text():
 
 # ===== CodexProvider: author のときだけ reasoning を切り替える（ソース検査） =====
 
-def test_codex_run_has_author_reasoning_branch():
-    import inspect
-    src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    assert 'decision["lens"] == "author"' in src, "author 判定の分岐が run() に無い"
-    assert "SHERPA_CODEX_REASONING_AUTHOR" in src, "author 専用 reasoning env が無い"
-    # TIMEOUT-1: 経過時間だけの打ち切りは撤去済み（threading.Timer/SHERPA_CODEX_TIMEOUT_AUTHOR は
-    # コードから撤去済み・復活していないことをコードで保証する）。
-    assert "threading.Timer" not in src, "threading.Timer が復活している（TIMEOUT-1 の契約違反）"
-    assert "SHERPA_CODEX_TIMEOUT_AUTHOR" not in src, "SHERPA_CODEX_TIMEOUT_AUTHOR が復活している"
-
-
-def test_codex_reasoning_author_env_default_and_override(monkeypatch):
-    """env 未設定時は既定 'medium'・設定時はその値を使う（実際の分岐ロジックを直接評価）。"""
-    import os as _os
-    monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
-
-    def _compute(is_author, self_reason):
-        _reason_raw = (_os.environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium")
-                      if is_author else self_reason)
-        return "low" if str(_reason_raw).lower() == "minimal" else _reason_raw
-
-    # author=True・env 未設定 → 既定 medium。
-    assert _compute(True, "low") == "medium"
-    # author=True・env 設定あり → その値。
-    monkeypatch.setenv("SHERPA_CODEX_REASONING_AUTHOR", "high")
-    assert _compute(True, "low") == "high"
-    # author=False（通常レンズ） → 従来どおり self._reason のまま。
-    assert _compute(False, "low") == "low"
-
 
 # ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: Codex reasoning は深さで変えない =====
 
@@ -246,7 +131,7 @@ def test_codex_run_wires_depth_profile_into_reasoning_branch():
 def _compute_reason(is_author, self_reason, system_settings, profile):
     """CodexProvider の実際の分岐と同じ式（`_base_reason` の解決 → `codex_reasoning_for`）。"""
     from sherpa import depth_profile as D
-    base_reason = (__import__("os").environ.get("SHERPA_CODEX_REASONING_AUTHOR", "medium") if is_author
+    base_reason = ("medium" if is_author
                   else D.effective_base(system_settings, "codex_reasoning", self_reason))
     reason_raw = D.codex_reasoning_for(base_reason, profile)
     return "low" if str(reason_raw).lower() == "minimal" else reason_raw
@@ -257,13 +142,12 @@ def test_codex_reasoning_is_fixed_by_admin_base_at_every_depth(monkeypatch, prof
     """CodexProvider の実際の分岐と同じ式で、推論レベルは**標準以上はどの深さでも管理画面の
     基準値のまま**（深さは探索量と見直しの巡数にだけ効く・クイックだけ例外＝下の別テスト・
     純関数の組み合わせ・実 codex CLI 起動は対象外）。"""
-    monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
     # 通常レンズ: 環境設定の既定（self._reason）のまま。
     assert _compute_reason(False, "low", None, profile) == "low"
     # 管理画面の基準値編集（system_settings）があればそれが全深さで使われる。
     assert _compute_reason(False, "low", {"depth_base_codex_reasoning": "medium"}, profile) == "medium"
     assert _compute_reason(False, "low", {"depth_base_codex_reasoning": "xhigh"}, profile) == "xhigh"
-    # author は基準値が別軸（env・既定 medium）だが、深さで変わらない点は同じ。
+    # author は基準値が別軸（定数・medium）だが、深さで変わらない点は同じ。
     assert _compute_reason(True, "low", None, profile) == "medium"
 
 
@@ -272,7 +156,6 @@ def test_codex_reasoning_drops_one_level_for_quick(monkeypatch):
     （author・通常レンズいずれも同じ純関数を通るため同様に効く）。`minimal` への丸めは
     image_gen/web_search 非互換のための既存の `"low"` 昇格（`_compute_reason` 末尾）でそのまま吸収
     される。"""
-    monkeypatch.delenv("SHERPA_CODEX_REASONING_AUTHOR", raising=False)
     # 通常レンズ: "low" は最下段一歩手前 → 1段下げても "minimal" → 既存の昇格で "low" のまま。
     assert _compute_reason(False, "low", None, "quick") == "low"
     # 管理画面の基準値編集: "medium" → 1段下げて "low"。

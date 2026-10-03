@@ -225,7 +225,7 @@ def _print_env_candidate() -> None:
     追加の行として出力する。
 
     `sherpa.llm`（`sherpa.api` ではない）から検証関数を読む＝`sherpa/api.py` は FastAPI アプリ全体
-    （`fastapi`/`anthropic` 等の重い依存）を import するため、依存未導入の環境で `UNAVAILABLE` に
+    （`fastapi` 等の重い依存）を import するため、依存未導入の環境で `UNAVAILABLE` に
     倒れた直後にさらに `sherpa.api` を import しようとすると同じ理由でまた失敗する（`sherpa.llm` は
     stdlib のみの軽量モジュール＝依存未導入でも import できる）。失敗時は候補検証自体をスキップ
     （bash 側は env 未検証のまま従来の "OPENAI_BASE_URL is not set" 等へ委ねる）。

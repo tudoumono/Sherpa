@@ -1,8 +1,8 @@
-"""4形式を同じEvidence IR契約へ通すE2aの限定spike。
+"""XLSX/DOCX/PPTX/PDF を同じ Evidence IR 契約へ通す。
 
-現行Document IRを共通coreへ写し、現行IRが落としているDrawingML/PDF object inventoryを原本packageから
-補う。画像の内容、overlayの業務状態、図の意味は推測せず、存在・位置・hash・幾何関係と未解釈状態だけを
-残す。E2b以降の本番adapterを固定する前に、共通coreと形式別extensionの境界を検証するための実装である。
+現行 Document IR を共通 core へ写し、Document IR が落としている DrawingML/PDF の object inventory を原本 package から補う。
+画像の内容・overlay の業務状態・図の意味は推測せず、存在・位置・hash・幾何関係と未解釈状態だけを残す。
+設計: docs/design/rag.md「取り込みのアーム」
 """
 from __future__ import annotations
 
@@ -33,27 +33,9 @@ _DGM = "{http://schemas.openxmlformats.org/drawingml/2006/diagram}"
 _V = "{urn:schemas-microsoft-com:vml}"
 _O = "{urn:schemas-microsoft-com:office:office}"
 _CT = "{http://schemas.openxmlformats.org/package/2006/content-types}"
-# v3（L3・可視性・廃止表現の全形式展開）: `_xlsx_objects` に図形/画像によるセルの覆い判定
-# （`_occlusion_ratio`・`mark_hidden`）を追加し、`_adapt_document_ir` が非表示行/列・取り消し線を
-# `table:N`/`strike:N` から対応する `cell` 要素の `visibility`/`extension["visibility_reason"]` へ
-# 反映するようになった。
-# v4: `_xlsx_objects` が `xdr:grpSp`（グループ）の中を pptx の `walk()` と同じ考え方で再帰し、
-# 子図形を個別要素として出すようになった（従来はグループ直下しか見ておらず、中の図形は
-# 1個の連結文字列に潰れて検索に出なかった）。`start_object_id`/`end_object_id` はコネクタ要素
-# だけに付ける（従来は子孫コネクタの接続先をグループ自身の属性として誤って持っていた）。
-# v5（L9・R3）: 図形/コネクタの`extension["prst"]`（DrawingML `prstGeom/@prst`）を追加し、
-# コネクタの`start_object_id`/`end_object_id`をpptxと対称に`connects_to`関係へ解決するようになった。
+# 各形式の adapter 版。Evidence の中身が変わる変更をしたら上げる。
 XLSX_ADAPTER_VERSION = "xlsx-evidence-adapter-v5"
-# v3（L3）: docxの`strike:N`（`_build_docx_ir`）が`visibility_reason="strike"`を持つようになった
-# （`_adapt_document_ir`は既存の`extension["visibility_reason"]`コピー経路をそのまま使うため
-# `_adapt_document_ir`自体は変更していないが、docxが出すEvidence要素の中身が変わるため版を上げる）。
-# v4（S1・D-2）: `_build_docx_ir`が段落のsource_mapへ`floating_anchors`（浮動図形の関連付けの事実・
-# 幾何断定なし）を持つようになり、`_adapt_document_ir`がそれをEvidence extensionへ運ぶようになった。
 DOCX_ADAPTER_VERSION = "docx-evidence-adapter-v4"
-# v3（L3）: `_pptx_objects`/`_adapt_document_ir` が `covered_by_text`（前面テキストによる重ね）を
-# 前面要素の生テキストごと `extension` へ直接持たせるようになった（従来は `document_ir_source_map` に
-# 前面要素の生ID参照だけが埋もれており、Evidence IR単体からは前面テキストへ辿れなかった）。
-# v4（L9・R3）: 図形の`extension["prst"]`（DrawingML `prstGeom/@prst`）を追加した。
 PPTX_ADAPTER_VERSION = "pptx-evidence-adapter-v4"
 PDF_ADAPTER_VERSION = "pdf-evidence-adapter-v2"
 PDF_XOBJECT_MAX_DEPTH = 16
@@ -203,11 +185,10 @@ class _Builder:
         return self._element_coverage[element_id]
 
     def mark_hidden(self, element_id: str, *, reason: str, extra_extension: dict[str, Any] | None = None) -> None:
-        """既存要素の`visibility`を`"hidden"`へ差し替える（xlsxの図形/画像による覆いなど、要素追加後に
-        幾何交差が判明するケース用）。`EvidenceElement`はfrozen dataclassのため`dataclasses.replace`で
-        差し替える。`value`/`locator`/`coverage_id`は変えない（意味は断定せず可視性と理由だけ更新する・
-        意味の断定はしない共通思想）。呼び出し順で複数の前面図形が同じ要素へ一致した場合は
-        最後の呼び出し（=z_order降順で最も手前）が勝つ（先勝ちで固定しない）。
+        """既存要素の `visibility` を `"hidden"` へ差し替える（xlsx の図形/画像による覆いなど、要素追加後に幾何交差が判明するケース用）。
+
+        `EvidenceElement` は frozen のため `dataclasses.replace` で差し替え、`value`/`locator`/`coverage_id` は変えない。
+        複数の前面図形が同じ要素へ一致した場合は、最後の呼び出し（z_order 降順で最も手前）が勝つ。
         """
         index = self._element_index[element_id]
         element = self.ir.elements[index]
@@ -290,16 +271,12 @@ def _adapt_document_ir(
     *,
     consume_legacy: bool = False,
 ) -> dict[str, str]:
-    """現行IRを共通coreへ写す。cellは独立element、parent_idでtable所属を明示する。
+    """現行 IR を共通 core へ写す。cell は独立 element とし、parent_id で table 所属を明示する。
 
-    ``consume_legacy``は通常取り込みの巨大XLSX用。既存IR成果物とchunkを書き終えた後に限って使い、
-    tableごとのcellをEvidenceへ移し終えた時点で元listを空にして二重保持のpeakを抑える。
-
-    L3（可視性・廃止表現の全形式展開）: xlsxのcell要素を組み立てる際、親`table:N`の`source_map`が持つ
-    `hidden_rows`/`hidden_columns`（この表の範囲に絞り込んだ非表示行/列一覧）と、同じ`legacy.elements`内の
-    `strike_text`要素（`(sheet, cell)`で対応付け）を突き合わせ、対応するcellの`visibility`/
-    `extension["visibility_reason"]`へ直接反映する（`ooxml_arm._build_xlsx_ir`docstring「非表示行/列・
-    取り消し線のcell単位への反映」参照・`_field_piece`が読むのはcell要素自身の状態のため）。
+    ``consume_legacy`` は通常取り込みの巨大 XLSX 用。既存 IR 成果物と chunk を書き終えた後に限って使い、
+    table ごとの cell を Evidence へ移し終えた時点で元 list を空にしてピークメモリを抑える。
+    xlsx の cell は、親 `table:N` の `source_map` の `hidden_rows`/`hidden_columns` と `strike_text` 要素を突き合わせ、
+    cell 自身の `visibility`/`extension["visibility_reason"]` へ直接反映する。
     """
     if legacy is None:
         return {}
@@ -319,10 +296,7 @@ def _adapt_document_ir(
         ids[element.element_id] = _stable_id("evidence", element.type, asdict(locator), element.order)
         legacy_by_id[element.element_id] = element
 
-    # L3（可視性・廃止表現の全形式展開）: xlsxの取り消し線（`_build_xlsx_ir`が独立の`strike_text`要素として
-    # 抽出済み）を、対応するcell要素へも構造的に反映する（`strike_text`要素だけでは`_field_piece`が読む
-    # cell自身のvisibility/extensionに触れないため）。`(sheet, cell)`の集合だけを先に作っておき、
-    # cell構築時にO(1)で引ける形にする（table当たりcell数が多い場合の走査量を増やさない）。
+    # xlsx の取り消し線（独立の `strike_text` 要素）を対応する cell 要素へも反映するため、`(sheet, cell)` の集合を先に作る
     xlsx_strike_cells: set[tuple[str | None, str | None]] = (
         {(el.source_map.get("sheet"), el.source_map.get("cell"))
          for el in legacy.elements if el.type == "strike_text"}
@@ -337,21 +311,16 @@ def _adapt_document_ir(
             "extraction": asdict(element.extraction),
             "visibility_reason": element.visibility_reason,
         }
-        # L3（可視性・廃止表現の全形式展開）: pptxの前面テキストによる重ね（`_build_pptx_ir`の
-        # covered_by_text＝取り消し線的表現）は`source_map`に前面**要素ID（document_ir内部ID）**しか
-        # 持たないため、そのままではEvidence側から前面テキストへ辿れない。ここで前面要素を解決し、
-        # Evidence element_idと前面テキストをこの要素自身のextensionへ直接持たせる（意味の断定＝「廃止」等は
-        # しない・前面テキストをそのまま埋めるだけ＝意味の断定はしない共通思想）。
+        # pptx の前面テキストによる重ね（`covered_by_text`）は `source_map` に前面要素の内部 ID しか無いため、
+        # 前面要素を解決して Evidence element_id と前面テキストをこの要素の extension へ直接持たせる（意味の断定はしない）。
         covered_by_text_id = element.source_map.get("covered_by_text")
         if isinstance(covered_by_text_id, str):
             front_legacy = legacy_by_id.get(covered_by_text_id)
             front_evidence_id = ids.get(covered_by_text_id)
             if front_legacy is not None and front_evidence_id is not None:
                 extension["covered_by_text"] = {"element_id": front_evidence_id, "text": front_legacy.text}
-        # D-2（docxの浮動図形と段落の関連付け・`ooxml_arm._docx_floating_anchor_facts`docstring参照）:
-        # 段落側のsource_mapに載った関連付けの事実（幾何断定なし）をそのままEvidence extensionへ運ぶ。
-        # `_docx_host_objects`のEMU座標`overlaps`（浮動図形どうしの幾何関係）とは別物であることを
-        # キー名（"floating_anchors"）で区別する。
+        # docx の浮動図形と段落の関連付けの事実（幾何断定なし）を Evidence extension へ運ぶ。
+        # `_docx_host_objects` の EMU 座標 `overlaps` とは別物なのでキー名（"floating_anchors"）で区別する。
         floating_anchors = element.source_map.get("floating_anchors")
         if isinstance(floating_anchors, list) and floating_anchors:
             extension["floating_anchors"] = floating_anchors
@@ -370,9 +339,7 @@ def _adapt_document_ir(
         if element_id != ids[element.element_id]:
             raise ValueError("legacy element ID calculation drift")
         parent_coverage_id = builder.coverage_for(element_id)
-        # L3: xlsxはこの表要素のsource_mapが「この矩形範囲に関係する非表示行/列」を既に持っている
-        # （`_build_xlsx_ir`参照・シート全体ではなく表の範囲に絞り込み済み）。cellごとに判定するための
-        # 集合へ先に変換する（毎cellでリスト内包しない）。
+        # xlsx はこの表要素の source_map が表の範囲に絞った非表示行/列を持つため、cell ごとに判定する集合へ先に変換する
         hidden_rows = set(element.source_map.get("hidden_rows") or []) if file_type == "xlsx" else set()
         hidden_columns = set(element.source_map.get("hidden_columns") or []) if file_type == "xlsx" else set()
         if file_type == "xlsx":
@@ -398,9 +365,7 @@ def _adapt_document_ir(
             cell_visibility = element.visibility
             cell_extension: dict[str, Any] = {"role": cell.role}
             if file_type == "xlsx":
-                # 優先順位: 非表示行 → 非表示列 → 取り消し線（非表示行/列は実際に画面から消える幾何的
-                # 事実＝hidden_sheetと同じ扱い。取り消し線は本文が読める状態のまま＝visibilityは変えず
-                # reasonだけ残す＝「意味の断定はしない」共通設計）。
+                # 優先順位: 非表示行 → 非表示列 → 取り消し線（取り消し線は本文が読めるため visibility は変えず reason だけ残す）
                 if cell.row in hidden_rows:
                     cell_visibility = "hidden"
                     cell_extension["visibility_reason"] = "hidden_row"
@@ -842,22 +807,18 @@ def _drawing_kind(node: ET.Element) -> str | None:
 
 
 def _occlusion_ratio() -> float:
-    """覆い判定のしきい値（交差面積 ÷ 対象面積・0.0-1.0）。**定義は `office_md._OCCLUSION_RATIO` 1箇所**。
+    """覆い判定のしきい値（交差面積 ÷ 対象面積・0.0-1.0）。定義は `office_md._OCCLUSION_RATIO` の 1 箇所。
 
-    pptx は `_adapt_document_ir`→`ooxml_arm`→`office_md` の経路で同じ定数へ到達する。xlsx はここで
-    直接判定するため、値を複製せず呼び出しのたびに読む（複製すると片方だけ変えたときに pptx と
-    xlsx で判定が黙って食い違う）。import は関数内で行う——`office_md` 側が `evidence_spike` を
-    関数内 import しており、モジュール階層で相互参照すると循環するため。
+    pptx と判定をそろえるため値を複製せず、呼び出しのたびに読む。循環 import を避けるため import は関数内で行う。
     """
     from . import office_md
     return office_md._OCCLUSION_RATIO
 
 
 def _xlsx_shape_has_solid_fill(node: ET.Element) -> bool:
-    """xlsx図形（`xdr:sp`）が`xdr:spPr/a:solidFill`を持つか（`a:noFill`ならFalse）。
+    """xlsx 図形（`xdr:sp`）が `xdr:spPr/a:solidFill` を持つか（`a:noFill` なら False）。
 
-    `office_md._pptx_has_solid_fill`と同じ判定をxlsxのspreadsheetDrawing名前空間へ適用したもの
-    （DrawingMLの塗り語彙自体はpptx/xlsxで共通のため二重の判定基準を作らない）。
+    `office_md._pptx_has_solid_fill` と同じ判定を spreadsheetDrawing 名前空間へ適用したもの。
     """
     sp_pr = node.find(f"{_XDR}spPr")
     if sp_pr is None:
@@ -1359,11 +1320,10 @@ def _vml_texts(shape: ET.Element) -> tuple[list[str], list[str]]:
 
 
 def _vml_assets(entries: dict[str, bytes], part: str, shape: ET.Element) -> dict[str, Any]:
-    """VML shapeの画像参照をDrawingMLと同じasset契約へ写す。
+    """VML shape の画像参照を DrawingML と同じ asset 契約へ写す。
 
-    VMLは``v:imagedata``のほか、画像塗りを``v:fill``へ保持する原本がある。実際のOffice文書では
-    relationship属性が``r:id``または旧Office名前空間の``o:relid``になるため、どちらもpart自身の
-    relationshipから解決する。参照単位を維持し、同じbytesを複数箇所が参照してもここでは統合しない。
+    画像は ``v:imagedata`` のほか ``v:fill`` に保持される原本がある。relationship 属性は ``r:id`` または ``o:relid`` で、
+    どちらも part 自身の relationship から解決する。参照単位を維持し、同じ bytes を複数箇所が参照しても統合しない。
     """
     relationships = _image_relationship_records(entries, part)
     references: list[dict[str, Any]] = []
@@ -1515,11 +1475,7 @@ def _connection(node: ET.Element | None) -> int | None:
 
 
 def _prst_geom(node: ET.Element, prefix: str, kind: str) -> str | None:
-    """DrawingMLの`prstGeom/@prst`（プリセット図形種）をpptx/xlsx共通で取り出す。
-
-    Mermaidフローチャート化（L9）のノード形状マッピングの入力。閉じた語彙として扱わず、
-    未知の`prst`値もそのまま保持する（マッピング側でフォールバックする）。
-    """
+    """DrawingML の `prstGeom/@prst`（プリセット図形種）を pptx/xlsx 共通で取り出す。未知の値もそのまま保持する。"""
     if kind not in {"shape", "textbox", "connector"}:
         return None
     sp_pr = node.find(f"{prefix}spPr")
@@ -1554,8 +1510,7 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes], legacy_ids: dict
                 continue
             content_parts.add(drawing_part)
             drawing_rels = _relationships(entries, drawing_part)
-            # L9: コネクタのrelation化はpptx（`_pptx_objects.walk`）と同じ二段パス——
-            # drawing part全体（全anchor）を先に歩いてobject_idを集め、その後で解決する。
+            # コネクタの relation 化は pptx（`_pptx_objects.walk`）と同じ二段パス: drawing part 全体の object_id を先に集めてから解決する
             pending_connectors: list[tuple[str, int | None, int | None]] = []
             ids_by_object: dict[int, str] = {}
             for z_order, anchor in enumerate(list(drawing), start=1):
@@ -1563,14 +1518,10 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes], legacy_ids: dict
                 source_rect = _cell_rect(cell_range)
 
                 def walk(nodes: list[ET.Element], parent_id: str | None, order_base: int) -> None:
-                    """`xdr:grpSp`の子を個別要素として辿る（`_pptx_objects.walk`と同じ再帰形）。
+                    """`xdr:grpSp` の子を個別要素として辿る（`_pptx_objects.walk` と同じ再帰形）。
 
-                    グループの中身を1本の連結文字列へ潰さず、ノード名で検索できるようにする
-                    （xlsxはpptxと違いグループの中を歩いていなかったため個別要素が出ていなかった）。
-                    xlsxのdrawing座標系はanchor（from/to marker）単位でしかセル範囲を持たない
-                    （pptxのEMU座標＋累積変換とは異なる）ため、group子孫の`cell_range`は親anchorの
-                    ものをそのまま継承する（個々の子のオフセットまでは追わない＝図形種別
-                    `prstGeom`の抽出と同じくMermaid化レーンのスコープ）。
+                    グループの中身を連結文字列へ潰さず、ノード名で検索できるようにする。xlsx の drawing 座標系は anchor 単位でしか
+                    セル範囲を持たないため、group 子孫の `cell_range` は親 anchor のものをそのまま継承する。
                     """
                     local_index = 0
                     for node in nodes:
@@ -1672,12 +1623,9 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes], legacy_ids: dict
                                 sheet=sheet_name,
                             )
                         if source_rect is not None and order_base == 0:
-                            # 状態は確定せず、drawingと抽出済みcell regionの幾何交差だけをrelationにする。
-                            # **グループ子孫（order_base != 0）は対象外**: 子の cell_range は親 anchor の
-                            # 継承（近似）であり、その矩形で overlaps/覆いを主張すると「グループ内の
-                            # 小さな図形がグループ全域を覆う」という事実でない幾何を relation にしてしまう
-                            # （「推測しない・幾何交差だけ」の契約に反する）。子要素は検索向けの個別
-                            # 要素としてだけ出し、幾何関係はトップレベル（anchor 矩形が自分自身のもの）に限る。
+                            # 状態は確定せず、drawing と抽出済み cell region の幾何交差だけを relation にする。
+                            # グループ子孫（order_base != 0）は対象外: 子の cell_range は親 anchor の継承（近似）で、
+                            # その矩形で overlaps/覆いを主張すると事実でない幾何を relation にしてしまう。
                             same_sheet = [target for target in builder.ir.elements if target.locator.sheet == sheet_name]
                             exact_tables = [target for target in same_sheet
                                             if target.type == "table" and _cell_rect(target.locator.cell_range) == source_rect]
@@ -1704,11 +1652,8 @@ def _xlsx_objects(builder: _Builder, entries: dict[str, bytes], legacy_ids: dict
                                         "target_overlap_ratio": intersection_area / target_area if target_area else 0.0,
                                     },
                                 )
-                            # L3（可視性・廃止表現の全形式展開）: 不透明な前面図形/画像（塗りつぶし図形または画像）が
-                            # セルを閾値以上覆うなら、そのセル要素を hidden へ差し替える（`_field_piece` は cell 自身の
-                            # `visibility` を見るため table 要素ではなく cell 要素を対象にする）。意味の断定
-                            # （「廃止」等）はしない＝前面図形の種別・テキスト・名前だけを `occluded_by` へ残す
-                            # （意味の断定はしない共通思想）。
+                            # 不透明な前面図形/画像（塗りつぶし図形または画像）がセルを閾値以上覆うなら、そのセル要素を hidden へ差し替える
+                            # （`_field_piece` は cell 自身の `visibility` を見る）。前面図形の種別・テキスト・名前だけを `occluded_by` へ残す（意味の断定はしない）。
                             is_opaque_occluder = kind == "picture" or (kind == "shape" and _xlsx_shape_has_solid_fill(node))
                             if is_opaque_occluder:
                                 occluded_by: dict[str, Any] = {"kind": kind, "element_id": element_id, "z_order": z_order}
@@ -2542,8 +2487,7 @@ def _pptx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
                 )
                 if reason:
                     extension["visibility_reason"] = reason
-                # L3: covered_by_text（前面テキストによる重ね）もadapted要素から引き継ぐ（visibility_reasonと
-                # 同じ経路・二重に判定し直さない）。
+                # covered_by_text も adapted 要素から引き継ぐ（visibility_reason と同じ経路・二重に判定し直さない）
                 if adapted is not None and adapted.extension.get("covered_by_text") is not None:
                     extension["covered_by_text"] = adapted.extension["covered_by_text"]
                 locator = evidence_ir.Locator(

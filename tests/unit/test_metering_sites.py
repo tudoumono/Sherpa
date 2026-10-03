@@ -15,7 +15,6 @@ from __future__ import annotations
 import pathlib
 import tempfile
 import types
-from types import SimpleNamespace
 
 from sherpa import agentic_search, embeddings, graph_admin, intent_llm as I, llm, metering
 from sherpa.ingest import graph_extract as GE
@@ -66,18 +65,6 @@ def test_complete_json_feeds_acc_per_provider(monkeypatch):
     text2 = GE.complete_json("s", "u", cfg_o)
     assert text2 == text
 
-    # gemini
-    monkeypatch.setattr(llm, "post_json", lambda *a, **k: {
-        "candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}],
-        "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3,
-                          "cachedContentTokenCount": 1, "thoughtsTokenCount": 2}})
-    metering.acc_begin()
-    GE.complete_json("s", "u", {"provider": "gemini", "key": "k", "model": "gemini-2.5-flash"})
-    tokens, n = metering.acc_end()
-    assert n == 1
-    assert tokens == {"input_tokens": 7, "cached_input_tokens": 1, "output_tokens": 3,
-                      "reasoning_output_tokens": 2}
-
     # ollama
     monkeypatch.setattr(llm, "post_json", lambda *a, **k: {
         "message": {"content": '{"ok":true}'}, "prompt_eval_count": 4, "eval_count": 2})
@@ -86,33 +73,6 @@ def test_complete_json_feeds_acc_per_provider(monkeypatch):
     tokens, n = metering.acc_end()
     assert n == 1
     assert tokens == {"input_tokens": 4, "cached_input_tokens": 0, "output_tokens": 2,
-                      "reasoning_output_tokens": 0}
-
-    # bedrock（fake AnthropicBedrock クライアント・実 AWS は叩かない）
-    import anthropic
-
-    class _FakeResp:
-        def __init__(self):
-            self.content = [SimpleNamespace(type="text", text="ok")]
-            self.usage = SimpleNamespace(input_tokens=9, cache_read_input_tokens=1,
-                                         cache_creation_input_tokens=0, output_tokens=4)
-
-    class _FakeMessages:
-        def create(self, **kwargs):
-            return _FakeResp()
-
-    class _FakeClient:
-        def __init__(self, **kwargs):
-            self.messages = _FakeMessages()
-
-    monkeypatch.setattr(anthropic, "AnthropicBedrock", _FakeClient)
-    metering.acc_begin()
-    out = GE.complete_json("s", "u", {"provider": "bedrock", "region": "ap-northeast-1",
-                                      "model": "anthropic.claude-opus-4-8", "api_key": "k"})
-    tokens, n = metering.acc_end()
-    assert out == "ok"
-    assert n == 1
-    assert tokens == {"input_tokens": 10, "cached_input_tokens": 1, "output_tokens": 4,
                       "reasoning_output_tokens": 0}
 
 
@@ -155,7 +115,7 @@ def test_intent_classify_records_nothing_when_cfg_none(monkeypatch):
 
 # ---- embeddings.embed ----
 
-def test_embed_records_and_gemini_null_marker(monkeypatch):
+def test_embed_records_usage(monkeypatch):
     texts = [f"t{i}" for i in range(120)]   # _BATCH=50 → 50/50/20 の3バッチ
 
     # openai: usage.prompt_tokens の合計・output=0。
@@ -179,21 +139,6 @@ def test_embed_records_and_gemini_null_marker(monkeypatch):
     # 呼び出し元の変更なしに elapsed_ms（ミリ秒）が自動で乗る。
     assert isinstance(c["elapsed_ms"], int) and c["elapsed_ms"] >= 0
     calls.clear()
-
-    # gemini: batchEmbedContents に usage フィールドが無い＝報告不能マーカー（全 None）。
-    def _gemini_post(url, headers, body, timeout):
-        n = len(body["requests"])
-        return {"embeddings": [{"values": [1.0] * 8} for _ in range(n)]}
-
-    monkeypatch.setattr(llm, "post_json", _gemini_post)
-    cfg_g = {"provider": "gemini", "key": "k", "model": "gemini-embedding-001", "dim": 8}
-    vecs = embeddings.embed(texts, cfg_g)
-    assert vecs is not None and len(vecs) == 120
-    assert len(calls) == 1
-    c = calls[0]
-    assert c["kind"] == "embed" and c["calls"] == 3
-    assert c["input_tokens"] is None and c["cached_input_tokens"] is None
-    assert c["output_tokens"] is None and c["reasoning_output_tokens"] is None
 
 
 def test_embed_metering_noop_does_not_affect_vectors_or_request(monkeypatch):
@@ -232,49 +177,6 @@ def test_openai_embed_restores_input_order_from_response_indices(monkeypatch):
 
 # ---- graph_admin.ask_graph ----
 
-def test_ask_graph_stops_discarding_usage(monkeypatch):
-    events = [
-        {"node": "graph_neighbors"},
-        {"final": "ans", "docs": [], "cards": [{"name": "TAX-RATE", "label": "Parameter"}],
-         "searched": True, "usage": {"input_tokens": 30, "cached_input_tokens": 0,
-                                     "output_tokens": 10, "reasoning_output_tokens": 0}},
-    ]
-    monkeypatch.setattr(agentic_search, "openai_style", lambda *a, **k: events)
-    _enable(monkeypatch)
-    calls = _spy(monkeypatch)
-    s = {"agent": "openai", "openai_api_key": "k", "openai_model": "gpt-5.5"}
-    res = graph_admin.ask_graph("消費税率は？", "v1", settings=s, user_id="u1")
-    assert res["status"] == "ok"
-    assert len(calls) == 1
-    c = calls[0]
-    assert c["kind"] == "graph_ask" and c["provider"] == "openai" and c["model"] == "gpt-5.5"
-    assert c["input_tokens"] == 30 and c["output_tokens"] == 10
-    assert c["user_id"] == "u1" and c["world"] == "v1"
-
-
-def test_ask_graph_not_searched_path_records_nothing(monkeypatch):
-    """not-searched（graph tool was not used）raise パスは、usage 付きの final イベントごと握りつぶす
-    （既知の限界・S1 スコープ外）。except → status='failed' に落ち、record() は呼ばれない。"""
-    events = [{"final": "ans", "docs": [], "cards": [], "searched": False,
-              "usage": {"input_tokens": 5, "output_tokens": 1}}]
-    monkeypatch.setattr(agentic_search, "openai_style", lambda *a, **k: events)
-    _enable(monkeypatch)
-    calls = _spy(monkeypatch)
-    s = {"agent": "openai", "openai_api_key": "k"}
-    res = graph_admin.ask_graph("なにか", "v1", settings=s)
-    assert res["status"] == "failed"
-    assert calls == []
-
-
-def test_ask_graph_llm_unavailable_records_nothing(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)   # 開発機の実 env キーに左右されない（settings 側も鍵無し）
-    _enable(monkeypatch)
-    calls = _spy(monkeypatch)
-    res = graph_admin.ask_graph("なにか", "v1", settings={"agent": "openai"})   # key 無し
-    assert res["status"] == "llm_unavailable"
-    assert calls == []
-
-
 # ---- vision_arm.VisionArm.convert（VLM）----
 
 def _img(dirpath, name="scan.png"):
@@ -284,7 +186,7 @@ def _img(dirpath, name="scan.png"):
 
 
 def test_vlm_convert_records_aggregated(monkeypatch):
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text,vision")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text,vision")
     monkeypatch.setattr(llm, "post_json", lambda url, headers, body, timeout=90: {
         "message": {"content": "スキャン本文"}, "prompt_eval_count": 12, "eval_count": 6})
     _enable(monkeypatch)
@@ -302,7 +204,7 @@ def test_vlm_convert_records_aggregated(monkeypatch):
 def test_vlm_convert_pdf_records_calls_equal_pages(monkeypatch):
     from sherpa.ingest import office_md
 
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text,vision")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text,vision")
     monkeypatch.setattr(llm, "post_json", lambda url, headers, body, timeout=90: {
         "message": {"content": "ページ本文"}, "prompt_eval_count": 5, "eval_count": 2})
 

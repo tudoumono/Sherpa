@@ -1,9 +1,7 @@
-"""認可プローブ共通基盤（フェーズ7 S4・test_auth_snapshot.py から抽出）。
+"""認可プローブ共通基盤（フェーズ7 S4）。
 
-`tests/api/test_auth_snapshot.py`（未ログイン×全ルートのステータス snapshot）と
-`tests/api/test_authz_matrix.py`（役割×全ルートの認可マトリクス）が共有する「全 APIRoute を
+`tests/api/test_authz_matrix.py`（役割×全ルートの認可マトリクス）などが共有する「全 APIRoute を
 決定的に叩く」ための土台（プレースホルダ・最小 body・request ヘルパ・ルート列挙）を1本化する。
-ロジックは test_auth_snapshot.py から移動のみ（挙動は変更しない）。
 
 測り方の約束（両テストファイル共通）:
   - GET は共通のダミー query（`query`/`q`/`rel`）を常に付す。追加の必須 query を持つルートは
@@ -16,7 +14,7 @@
   - path パラメータは `_PLACEHOLDERS` のダミー値で埋める。
 
 S4 で `id`/`key_id` を "1" から大きな未使用値へ変更した理由: test_authz_matrix.py は
-（test_auth_snapshot.py と異なり）ログイン済みセッションで実際に handler の中まで実行させる
+ログイン済みセッションで実際に handler の中まで実行させる
 「許可側」probe も行う。dev の Postgres は共有・汚染された実データを持つため（既存メモ参照）、
 "1" のような小さい ID が実在の `announcements`/`ext_api_keys` 行と衝突すると、admin probe が
 本物の行を書き換え/失効させてしまいかねない。実在しないことがほぼ確実な大きな ID にして
@@ -36,6 +34,7 @@ _PLACEHOLDERS = {
     "file_id": "1", "aid": "1", "wid": "w1", "source_id": "1",
     "id": "999999999", "turn_id": "x", "key_id": "999999999",
     "conversation_id": "999999999", "message_id": "999999999",
+    "job_id": "nonexistent-job-id",
 }
 
 # SH-1（2026-08-23-共有フォーク.md）: `POST /conversations/{wid}/fork` は `wid` を**会話 id（int）**
@@ -52,11 +51,10 @@ _PATH_PLACEHOLDER_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
 # validation を通る）か、body 自体が無いため既定の空 `{}` のままで良い。
 # 対応する Pydantic モデルは sherpa/api.py・sherpa/routers/*.py（ExtSearchReq のみ sherpa/ext_api.py）参照:
 #   PasswordChangeReq / UserCreateReq / ShareCreateReq / ImpactReq / ChatReq / ChatStreamStopReq /
-#   TestReq / BedrockVerifyReq / RenameReq / TroubleshootReq / QaReq / WorldReq / DiffReq /
-#   DisableReq / RebindReq / ReconvertReq / GraphAskReq / AnnouncementCreateReq
-# （`/admin/usage/chat`・`POST /chat/{conversation_id}/messages/{message_id}/feedback` は
-#   body の型を固定しない自前パース（`routers/audit_usage.py::admin_usage_chat`・
-#   `routers/chat.py::chat_message_feedback`）のため対象外・下の最小 body は認証チェックへ
+#   TestReq / RenameReq / TroubleshootReq / QaReq / WorldReq / DiffReq /
+#   DisableReq / RebindReq / ReconvertReq / AnnouncementCreateReq
+# （`POST /chat/{conversation_id}/messages/{message_id}/feedback` は
+#   body の型を固定しない自前パース（`routers/chat.py::chat_message_feedback`）のため対象外・下の最小 body は認証チェックへ
 #   到達させるためだけの任意の妥当な値）
 _JSON_BODY: dict[tuple[str, str], dict] = {
     ("POST", "/auth/change-password"): {
@@ -73,7 +71,6 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
     ("POST", "/chat/turns"): {"message": "x"},   # ChatReq と同一モデル（背景実行版チャット送信）
     ("POST", "/chat/{conversation_id}/messages/{message_id}/feedback"): {"rating": "up"},
     ("POST", "/settings/test"): {"provider": "openai"},
-    ("POST", "/settings/bedrock-models/verify"): {"model_id": "x"},
     ("PATCH", "/conversations/{cid}"): {"title": "x"},
     ("POST", "/troubleshoot/run"): {"symptom": "x"},
     ("POST", "/qa/run"): {"question": "x"},
@@ -81,8 +78,6 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
     ("POST", "/worlds/diff"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/{wid}/rebind"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/{wid}/reconvert"): {"rel": "x"},
-    ("POST", "/graph/ask"): {"question": "x"},
-    ("POST", "/admin/usage/chat"): {"question": "x"},
     ("POST", "/admin/usage/quality-runs"): {"rounds": 1, "condition": "main",
                                             "executed_from": "2026-01-01T00:00:00+09:00",
                                             "executed_to": "2026-01-02T00:00:00+09:00"},
@@ -101,7 +96,8 @@ _EXTRA_QUERY: dict[tuple[str, str], dict] = {
 }
 
 # multipart（`UploadFile = File(...)`）で叩く必要があるルート。
-_MULTIPART_ROUTES = {("POST", "/workspace/files"), ("POST", "/ext/v1/convert")}
+_MULTIPART_ROUTES = {("POST", "/workspace/files"), ("POST", "/ext/v1/convert"),
+                     ("POST", "/admin/users/import")}
 
 
 def _fill(path: str, key: tuple[str, str] | None = None) -> str:

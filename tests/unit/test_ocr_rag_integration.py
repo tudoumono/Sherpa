@@ -282,7 +282,7 @@ def test_build_observation_set_merges_vlm_and_ocr_when_both_present(monkeypatch,
 # ---- 3. 実往復（office_md.build_derived）: rag.md への統合を実ファイルで固定 --------------------------
 
 def _build_derived_with_world(monkeypatch, tmp_path, source: Path, *, world: str, arms: str = "ooxml,pdf_text"):
-    monkeypatch.setenv("SHERPA_ARMS", arms)
+    monkeypatch.setenv("SHERPA_MCP_ARMS", arms)
     wd = tmp_path / "world"
     wd.mkdir()
     shutil.copy(source, wd / source.name)

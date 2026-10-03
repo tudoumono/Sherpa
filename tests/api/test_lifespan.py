@@ -1,8 +1,7 @@
 """lifespan（起動処理）受け入れテスト（refactoring-plan フェーズ1・on_event→lifespan 移行）。
 
-`@app.on_event("startup")` から `sherpa.lifespan.lifespan` への移行に伴い、起動 3 点の挙動を固定する:
+`@app.on_event("startup")` から `sherpa.lifespan.lifespan` への移行に伴い、起動 2 点の挙動を固定する:
   ① production で fixtures を参照し得る設定なら起動拒否（fail-closed）／dev は警告のみで続行
-  ② folder poller が env（SHERPA_POLL_SECONDS）で有効/無効に切り替わる
   ③ TestClient 起動（lifespan の __enter__）で起動処理が旧登録順どおりに走る
 
 いずれも DB/Neo4j/ES を要さないよう、外部サービスに触れる本体は monkeypatch でスタブ化する。
@@ -27,38 +26,6 @@ def _restore_background_accepting():
     `ShuttingDownError`（503）で壊れる（pytest は同一プロセス内で全テストを実行するため）。"""
     yield
     background.start_accepting()
-
-
-@pytest.fixture(autouse=True)
-def _default_no_legacy_marker(monkeypatch):
-    """`store.migrate_marker_if_legacy_exists` を既定で `False`（旧 `env_seed_version` は存在しない
-    ＝新規導入環境）へ差し替える（autouse）。`_seed_settings_from_env`／`_seed_ollama_url_from_env`
-    は候補構築より前に必ずこれを呼ぶため、個々のテストが明示的に差し替えない限り実 DB へ触れて
-    しまう（`with TestClient(api.app):`／`system_router.healthz()` を使うテストを含め、本ファイルの
-    大半は「新規導入環境」の挙動を検証する前提のため、既定を安全側＝False に倒す）。旧マーカー分岐
-    そのものを検証するテストは、各テスト内で `monkeypatch.setattr(store,
-    "migrate_marker_if_legacy_exists", ...)` により後勝ちで上書きする。"""
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists",
-                        lambda guard_key, legacy_key, guard_value=True: False)
-
-
-class _FakeThread:
-    """`threading.Thread(...).start()` を捕捉するスタブ（実スレッドは起動しない）。"""
-
-    def __init__(self, records, *args, target=None, daemon=None, name=None, **kwargs):
-        self._records = records
-        self.name = name
-        self.daemon = daemon
-        self.target = target
-
-    def start(self):
-        self._records.append({"name": self.name, "daemon": self.daemon})
-
-
-def _thread_recorder(records):
-    def _factory(*args, **kwargs):
-        return _FakeThread(records, *args, **kwargs)
-    return _factory
 
 
 # ---- ① fixtures fail-closed 検査 ----
@@ -162,9 +129,6 @@ def test_warn_change_me_placeholders_dev_warns_but_continues(monkeypatch):
 # ---- env → system_settings 初回シード（`api._seed_settings_from_env`） ----
 # 完了マーカー（`system_settings.credential_seed_version`）方式。マーカーがあれば env を
 # 一切読まない（管理者が中央キーを削除した後の再起動で env から復活しない・下記のテストが固定）。
-# 旧共有マーカー（`env_seed_version`）は、このマーカーと `ollama_url_seed_version` の両方が
-# 確定した後にだけ rollback 互換のため追いつき確定する集約マーカー（直接の guard には使わない・
-# `api._confirm_legacy_env_seed_marker` 参照）。
 # 上書き防止の不変条件そのものは `store.seed_system_settings_once`（各 INSERT が guard_key の
 # 行の不在を WHERE NOT EXISTS で確認してから書く）が担保するため、以下は実 DB の代わりに
 # 素朴な dict ベースの疑似永続化（`_FakeSystemSettingsDB`）でその意味論まで含めて検証する。
@@ -177,18 +141,9 @@ class _FakeSystemSettingsDB:
     （管理者が特定のキーだけ削除していても、その削除後の状態を尊重して再挿入しない）。
     guard_key が無いときだけ、キーごとに「既存なら書かない」を見る。"""
 
-    def __init__(self, initial: dict | None = None, *, catchup_v2_reason: str = "skipped_unproven",
-                catchup_v2_host: str | None = None):
+    def __init__(self, initial: dict | None = None):
         self.data: dict = dict(initial or {})
         self.seed_calls: list[dict] = []
-        self.migrate_calls: list[dict] = []
-        self.catchup_calls: list[dict] = []
-        # v2 catch-up は audit ログを根拠に判定する（実 DB での意味論は
-        # tests/api/test_system_settings.py の `test_catchup_v2_*` 群が固定する）。ここでは
-        # api.py 側のオーケストレーション（marker gate・常時警告）だけを見るため、判定結果は
-        # テストが差し替えられる缶詰値にする。
-        self.catchup_v2_reason = catchup_v2_reason
-        self.catchup_v2_host = catchup_v2_host
 
     def get_system_settings(self) -> dict:
         return dict(self.data)
@@ -218,41 +173,11 @@ class _FakeSystemSettingsDB:
                     applied["ollama_allowlist"] = merged
         return applied, conflicts
 
-    def migrate_marker_if_legacy_exists(self, guard_key: str, legacy_key: str,
-                                        guard_value: object = True) -> bool:
-        """`store.migrate_marker_if_legacy_exists` の意味論を dict で模す（`legacy_key` があれば
-        `guard_key` だけを「移行済み」として確定し True・無ければ何もせず False）。
-        `seed_calls` には記録しない（`seed_system_settings_once` とは別の関数のため）。"""
-        self.migrate_calls.append({"guard_key": guard_key, "legacy_key": legacy_key})
-        if legacy_key not in self.data:
-            return False
-        if guard_key not in self.data:
-            self.data[guard_key] = guard_value
-        return True
-
-    def catchup_ollama_allowlist_for_env_seeded_url_v2(self, guard_key: str) -> str:
-        """`store.catchup_ollama_allowlist_for_env_seeded_url_v2` の意味論を dict で模す（marker
-        gate のみ・判定結果は `catchup_v2_reason`/`catchup_v2_host` で差し替え可能な缶詰値）。"""
-        self.catchup_calls.append({"guard_key": guard_key})
-        if guard_key in self.data:
-            return "already_present"
-        self.data[guard_key] = 1
-        if self.catchup_v2_reason == "added" and self.catchup_v2_host:
-            current = list(self.data.get("ollama_allowlist") or [])
-            if self.catchup_v2_host not in current:
-                self.data["ollama_allowlist"] = [*current, self.catchup_v2_host]
-        return self.catchup_v2_reason
-
 
 def _set_system_settings_recorder(monkeypatch):
     """`store.seed_system_settings_once` を差し替えて呼び出し引数を記録する（`_FakeSystemSettingsDB`
     を使わない単純なケース向け・guard_key/secret_keys/ollama_allowlist_merge kwarg も受理）。
-
-    `store.migrate_marker_if_legacy_exists` も常に `False`（旧 `env_seed_version` は存在しない＝
-    新規導入環境）へ差し替える（`_seed_settings_from_env`／`_seed_ollama_url_from_env` の両方が
-    候補構築より前にこれを呼ぶため、差し替えないと実 DB へ触れてしまう）。旧マーカー分岐そのものを
-    検証するテストは `monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", ...)` で
-    このデフォルトを個別に上書きすること。"""
+"""
     calls = []
 
     def _fake(updates, guard_key=None, secret_keys=None, *, ollama_allowlist_merge=None):
@@ -260,8 +185,6 @@ def _set_system_settings_recorder(monkeypatch):
                       "ollama_allowlist_merge": ollama_allowlist_merge})
         return dict(updates), {}
     monkeypatch.setattr(store, "seed_system_settings_once", _fake)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists",
-                        lambda guard_key, legacy_key, guard_value=True: False)
     return calls
 
 
@@ -269,9 +192,8 @@ def test_seed_settings_from_env_writes_keys_and_marker_in_one_call(monkeypatch):
     """未シード（マーカー無し）状態で、対象キーとマーカーを**同一の seed_system_settings_once 呼び出し**
     （＝同一トランザクション）で書く。"""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-seed-openai")
-    monkeypatch.setenv("GEMINI_API_KEY", "gemini-seed-key")
-    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AWS_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-seed-key")   # 閉じたプロバイダの env は読まない
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-seed-key")
     monkeypatch.delenv("OLLAMA_URL", raising=False)
     monkeypatch.delenv("SHERPA_PERSONAL_API_KEYS", raising=False)
     monkeypatch.delenv("SHERPA_ALLOW_WEB_SEARCH", raising=False)   # WEB-1: 未設定なら候補に含めない
@@ -280,10 +202,10 @@ def test_seed_settings_from_env_writes_keys_and_marker_in_one_call(monkeypatch):
     api._seed_settings_from_env()
     assert len(calls) == 1
     assert calls[0]["updates"] == {
-        "openai_api_key": "sk-seed-openai", "gemini_api_key": "gemini-seed-key",
+        "openai_api_key": "sk-seed-openai",
         "credential_seed_version": api._CREDENTIAL_SEED_VERSION,
     }
-    assert calls[0]["secret_keys"] == {"openai_api_key", "gemini_api_key"}
+    assert calls[0]["secret_keys"] == {"openai_api_key"}
 
 
 def test_seed_settings_from_env_ignores_ollama_url_entirely(monkeypatch):
@@ -306,15 +228,11 @@ def test_seed_settings_from_env_ignores_ollama_url_entirely(monkeypatch):
 
 
 # ===== OLLAMA_URL の独立シード（`api._seed_ollama_url_from_env`） =====
-# 以前は `_seed_settings_from_env()` の共有マーカー（`env_seed_version`）へ相乗りしており、
-# OLLAMA_URL が不正な形式でもマーカーが確定してしまい「env を直した後の次回起動で再評価される」
-# という docstring の約束を果たせなかった。専用マーカー（`ollama_url_seed_version`）に分離し、
-# 不正な間はこのマーカーだけ確定しない（他の資格情報の確定は妨げない・上のテスト参照）。
+# 専用マーカー（`ollama_url_seed_version`）を持ち、不正な間はこのマーカーだけ確定しない（他の資格情報の確定は妨げない）。
 
 def _set_ollama_seed_recorder(monkeypatch):
     """`store.seed_system_settings_once` を差し替えて呼び出し引数を記録する
-    （`_set_system_settings_recorder` と同じ形・`_seed_ollama_url_from_env` 専用・
-    `store.migrate_marker_if_legacy_exists` の既定 False 差し替えも同様）。"""
+    （`_set_system_settings_recorder` と同じ形・`_seed_ollama_url_from_env` 専用）。"""
     calls = []
 
     def _fake(updates, guard_key=None, secret_keys=None, *, ollama_allowlist_merge=None):
@@ -322,8 +240,6 @@ def _set_ollama_seed_recorder(monkeypatch):
                       "ollama_allowlist_merge": ollama_allowlist_merge})
         return dict(updates), {}
     monkeypatch.setattr(store, "seed_system_settings_once", _fake)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists",
-                        lambda guard_key, legacy_key, guard_value=True: False)
     return calls
 
 
@@ -384,7 +300,6 @@ def test_seed_ollama_url_from_env_allowlist_not_merged_when_url_conflicts(monkey
     db = _FakeSystemSettingsDB({"ollama_url": "http://already-there:11434"})   # url 行が既に存在
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", db.migrate_marker_if_legacy_exists)
     api._seed_ollama_url_from_env()
     assert "ollama_allowlist" not in db.data
     assert api._OLLAMA_URL_SEED_MARKER_KEY in db.data   # ollama_url 自体は競合したがマーカーは確定
@@ -417,7 +332,6 @@ def test_seed_ollama_url_from_env_reevaluates_after_env_is_fixed(monkeypatch):
     db = _FakeSystemSettingsDB({})
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", db.migrate_marker_if_legacy_exists)
 
     monkeypatch.setenv("OLLAMA_URL", "http://admin:s3cr3t@ollama-central.internal:11434")
     api._seed_ollama_url_from_env()
@@ -432,18 +346,13 @@ def test_seed_ollama_url_from_env_reevaluates_after_env_is_fixed(monkeypatch):
 
 
 def test_seed_settings_from_env_noop_when_marker_already_present(monkeypatch):
-    """`credential_seed_version` があれば env を一切読まない＝`migrate_marker_if_legacy_exists`
-    すら呼ばれない（安価な早期 return）。"""
+    """`credential_seed_version` があれば env を一切読まない（安価な早期 return）。"""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-would-be-seeded")
     monkeypatch.setattr(store, "get_system_settings",
                         lambda: {api._CREDENTIAL_SEED_MARKER_KEY: api._CREDENTIAL_SEED_VERSION})
     calls = _set_system_settings_recorder(monkeypatch)
-    migrate_calls = []
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists",
-                        lambda *a, **kw: (migrate_calls.append(1), False)[-1])
     api._seed_settings_from_env()
     assert calls == []
-    assert migrate_calls == []   # 早期 return のため呼ばれない
 
 
 def test_seed_settings_from_env_does_not_revive_deleted_key_after_marker_set(monkeypatch):
@@ -456,145 +365,6 @@ def test_seed_settings_from_env_does_not_revive_deleted_key_after_marker_set(mon
     calls = _set_system_settings_recorder(monkeypatch)
     api._seed_settings_from_env()
     assert calls == []   # 復活しない
-
-
-def test_seed_settings_from_env_migrates_via_legacy_marker_without_reading_env(monkeypatch):
-    """旧 `env_seed_version` がある環境（`credential_seed_version` 分離より前に
-    一度でも起動済み）では、`store.migrate_marker_if_legacy_exists()` が True を返した時点で
-    env を一切読まない＝`seed_system_settings_once`（候補構築・実際の書込み）は一度も呼ばれない。
-    admin が資格情報を削除済みで残存 env が古い値のままでも復活しない。"""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-old-env-value-admin-deleted-in-ui")
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})   # credential_seed_version 未確認
-    calls = _set_system_settings_recorder(monkeypatch)
-    migrate_calls = []
-
-    def _migrate(guard_key, legacy_key, guard_value=True):
-        migrate_calls.append((guard_key, legacy_key, guard_value))
-        return True   # 旧 env_seed_version が存在する環境を模す
-
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", _migrate)
-    api._seed_settings_from_env()
-    assert calls == []   # env は一切読まない（seed_system_settings_once は呼ばれない）
-    assert migrate_calls == [
-        (api._CREDENTIAL_SEED_MARKER_KEY, api._ENV_SEED_MARKER_KEY, api._CREDENTIAL_SEED_VERSION)]
-
-
-def test_seed_ollama_url_from_env_migrates_via_legacy_marker_without_reading_env(monkeypatch):
-    """`ollama_url` 側も同じ移行分岐を持つ。旧 `env_seed_version` がある環境
-    （`ollama_url_seed_version` 分離より前に一度でも起動済み）では、admin が意図的に削除した
-    `ollama_url`／`ollama_allowlist` を残存 env から復活・再認可しない（env・URL の形式チェックにも
-    一切進まない＝形式が不正な値でも同じくスキップされる）。"""
-    monkeypatch.setenv("OLLAMA_URL", "http://ollama-central.internal:11434")   # 残存 env（有効な形式）
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})   # ollama_url_seed_version 未確認
-    calls = _set_ollama_seed_recorder(monkeypatch)
-    migrate_calls = []
-
-    def _migrate(guard_key, legacy_key, guard_value=True):
-        migrate_calls.append((guard_key, legacy_key, guard_value))
-        return True
-
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", _migrate)
-    api._seed_ollama_url_from_env()
-    assert calls == []   # ollama_url・ollama_allowlist・fingerprint とも一切書かない
-    assert migrate_calls == [
-        (api._OLLAMA_URL_SEED_MARKER_KEY, api._ENV_SEED_MARKER_KEY, api._OLLAMA_URL_SEED_VERSION)]
-
-
-def test_seed_ollama_url_from_env_migrates_via_legacy_marker_even_with_malformed_env(monkeypatch):
-    """レガシー環境の判定は OLLAMA_URL の形式チェックより優先する＝残存 env が不正な形式（userinfo
-    混入等）でも、レガシー判定自体には影響しない（`migrate_marker_if_legacy_exists` が env を
-    一切見ずに True を返す設計のため・形式チェックへ一切進まないことを確認する）。"""
-    monkeypatch.setenv("OLLAMA_URL", "http://admin:s3cr3t@ollama-central.internal:11434")   # 不正形式
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})
-    calls = _set_ollama_seed_recorder(monkeypatch)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", lambda *a, **kw: True)
-    api._seed_ollama_url_from_env()
-    assert calls == []
-
-
-def test_seed_ollama_url_from_env_legacy_migration_does_not_race_with_concurrent_admin_clear(monkeypatch):
-    """「管理者 clear との競合テスト」。レガシー判定（`migrate_marker_if_legacy_exists`）から
-    実際のマーカー確定 INSERT までの間に、admin が別トランザクションで `ollama_url`／
-    `ollama_allowlist` を削除（clear）しても、移行分岐はこれらのキーへ一切触れない（ガードキー
-    以外は読み書きしない設計）ため、admin の削除操作を巻き戻したり競合したりしない。"""
-    db = _FakeSystemSettingsDB({
-        "env_seed_version": api._ENV_SEED_VERSION,   # 旧統合シード済み環境
-        "ollama_url": "http://central.internal:11434",
-        "ollama_allowlist": ["central.internal:11434"],
-    })
-    monkeypatch.setenv("OLLAMA_URL", "http://central.internal:11434")   # 残存 env（admin 削除前の値）
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-
-    real_migrate = db.migrate_marker_if_legacy_exists
-
-    def _migrate_with_concurrent_admin_clear(guard_key, legacy_key, guard_value=True):
-        # 「レガシー判定の最中に admin が別トランザクションで先に削除した」を模す
-        # （呼び出しのたびに実行＝判定の前後どちらで割り込んでも同じ結果になることを示す）。
-        db.data.pop("ollama_url", None)
-        db.data.pop("ollama_allowlist", None)
-        return real_migrate(guard_key, legacy_key, guard_value)
-
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", _migrate_with_concurrent_admin_clear)
-    api._seed_ollama_url_from_env()
-    assert "ollama_url" not in db.data   # admin の削除がそのまま残る（移行分岐が復活させない）
-    assert "ollama_allowlist" not in db.data
-    assert db.data[api._OLLAMA_URL_SEED_MARKER_KEY] == api._OLLAMA_URL_SEED_VERSION   # マーカーだけ確定
-
-
-# ===== `api._confirm_legacy_env_seed_marker`（旧共有マーカーの rollback 互換確定） =====
-# `credential_seed_version`／`ollama_url_seed_version` の**両方**が確定して初めて旧共有マーカー
-# （`env_seed_version`）を書く（ロールバック時に旧コードが「未シード」と正しく再評価できるようにする
-# ため・`api._seed_settings_from_env` の docstring 参照）。3状態（両方未確定／片方だけ確定／両方確定）
-# を fake DB で固定する。
-
-def test_confirm_legacy_env_seed_marker_noop_when_neither_new_marker_confirmed(monkeypatch):
-    db = _FakeSystemSettingsDB({})   # 両方とも未確定
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    api._confirm_legacy_env_seed_marker()
-    assert db.seed_calls == []
-    assert api._ENV_SEED_MARKER_KEY not in db.data
-
-
-def test_confirm_legacy_env_seed_marker_noop_when_only_credential_confirmed(monkeypatch):
-    db = _FakeSystemSettingsDB({api._CREDENTIAL_SEED_MARKER_KEY: api._CREDENTIAL_SEED_VERSION})
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    api._confirm_legacy_env_seed_marker()
-    assert db.seed_calls == []
-    assert api._ENV_SEED_MARKER_KEY not in db.data
-
-
-def test_confirm_legacy_env_seed_marker_noop_when_only_ollama_url_confirmed(monkeypatch):
-    db = _FakeSystemSettingsDB({api._OLLAMA_URL_SEED_MARKER_KEY: api._OLLAMA_URL_SEED_VERSION})
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    api._confirm_legacy_env_seed_marker()
-    assert db.seed_calls == []
-    assert api._ENV_SEED_MARKER_KEY not in db.data
-
-
-def test_confirm_legacy_env_seed_marker_confirms_when_both_new_markers_present(monkeypatch):
-    db = _FakeSystemSettingsDB({
-        api._CREDENTIAL_SEED_MARKER_KEY: api._CREDENTIAL_SEED_VERSION,
-        api._OLLAMA_URL_SEED_MARKER_KEY: api._OLLAMA_URL_SEED_VERSION,
-    })
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    api._confirm_legacy_env_seed_marker()
-    assert db.data[api._ENV_SEED_MARKER_KEY] == api._ENV_SEED_VERSION
-    assert len(db.seed_calls) == 1
-    assert db.seed_calls[0]["guard_key"] == api._ENV_SEED_MARKER_KEY
-
-
-def test_confirm_legacy_env_seed_marker_already_confirmed_does_not_rewrite(monkeypatch):
-    """旧マーカーが既に確定済みなら、新マーカー2つの状態に関わらず何もしない（早期 return）。"""
-    db = _FakeSystemSettingsDB({api._ENV_SEED_MARKER_KEY: api._ENV_SEED_VERSION})
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    api._confirm_legacy_env_seed_marker()
-    assert db.seed_calls == []
 
 
 def test_seed_settings_from_env_marks_done_even_when_nothing_to_seed(monkeypatch):
@@ -621,18 +391,6 @@ def test_seed_settings_from_env_ignores_placeholder_openai_key(monkeypatch):
     assert len(calls) == 1
     assert "openai_api_key" not in calls[0]["updates"]
     assert calls[0]["updates"]["credential_seed_version"] == api._CREDENTIAL_SEED_VERSION
-
-
-def test_seed_settings_from_env_bedrock_prefers_bearer_token_over_alias(monkeypatch):
-    """AWS_BEARER_TOKEN_BEDROCK と ANTHROPIC_AWS_API_KEY が両方あれば前者を採用する。"""
-    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bearer-value")
-    monkeypatch.setenv("ANTHROPIC_AWS_API_KEY", "alias-value")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})
-    calls = _set_system_settings_recorder(monkeypatch)
-    api._seed_settings_from_env()
-    assert calls[0]["updates"]["bedrock_api_key"] == "bearer-value"
 
 
 def test_seed_settings_from_env_personal_api_keys_truthy_strings(monkeypatch):
@@ -691,22 +449,20 @@ def test_seed_settings_from_env_aggregates_mismatch_warnings_into_one_line(monke
     する（キーごとに複数行出さない）。マーカーは立ち、DB の値は上書きされない。"""
     import logging
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env-value")
-    monkeypatch.setenv("GEMINI_API_KEY", "gemini-env-value")
-    monkeypatch.delenv("SHERPA_ALLOW_WEB_SEARCH", raising=False)   # WEB-1: 未設定なら候補に含めない
-    db = _FakeSystemSettingsDB({"openai_api_key": "sk-db-value", "gemini_api_key": "gemini-db-value"})
+    monkeypatch.setenv("SHERPA_ALLOW_WEB_SEARCH", "1")   # WEB-1: 資格情報以外の候補キーも食い違わせる
+    db = _FakeSystemSettingsDB({"openai_api_key": "sk-db-value", "web_search_allowed": False})
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", db.migrate_marker_if_legacy_exists)
     with caplog.at_level(logging.WARNING, logger="sherpa"):
         api._seed_settings_from_env()
     assert db.data == {  # DB 値は上書きしない
-        "openai_api_key": "sk-db-value", "gemini_api_key": "gemini-db-value",
+        "openai_api_key": "sk-db-value", "web_search_allowed": False,
         "credential_seed_version": api._CREDENTIAL_SEED_VERSION,
     }
     warn_records = [r for r in caplog.records if "無視されます" in r.getMessage()]
     assert len(warn_records) == 1   # 1行に集約
     msg = warn_records[0].getMessage()
-    assert "OPENAI_API_KEY" in msg and "GEMINI_API_KEY" in msg
+    assert "OPENAI_API_KEY" in msg and "SHERPA_ALLOW_WEB_SEARCH" in msg
 
 
 def test_seed_settings_from_env_survives_db_unreachable_and_does_not_mark_seeded(monkeypatch):
@@ -736,110 +492,23 @@ def test_seed_settings_does_not_clobber_admin_write_that_races_with_the_check(mo
 
     monkeypatch.setattr(store, "get_system_settings", _racy_get)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", db.migrate_marker_if_legacy_exists)
     api._seed_settings_from_env()
     assert db.data["openai_api_key"] == "sk-admin-value"   # env 値で上書きされていない
 
 
-def test_seed_settings_does_not_revive_key_deleted_after_marker_even_when_precheck_is_stale(monkeypatch):
-    """マーカー（`credential_seed_version` 相当）は既に存在する（＝シード完了済み）が、事前チェック
-    （`get_system_settings`）が古い「マーカー無し」を返す状況（キャッシュ経由等）でも、実際の
-    書込みは「今」のマーカー有無を見るため、管理者が削除した特定のキー（openai_api_key）が env
-    から再挿入されない。マーカーの有無だけを見て個々のキーの ON CONFLICT に任せていた旧設計では、
-    マーカーが既にあってもこのキーだけは復活してしまっていた。
-
-    是正後は「旧統合マーカー（`env_seed_version`）が既にある」ケースがこれに該当する
-    （`credential_seed_version` はまだ無いので事前チェック自体は `credential_seed_version` を
-    見て「未シード」と判定するが、`migrate_marker_if_legacy_exists()` が
-    `env_seed_version`（DB の実データ・precheck とは別の直接クエリ）をフレッシュに見て復活を防ぐ）。"""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-old-env-value-admin-deleted-in-ui")
-    # 実態: 旧統合マーカーは存在するが、admin が openai_api_key を削除済み（行が無い）。
-    db = _FakeSystemSettingsDB({"env_seed_version": api._ENV_SEED_VERSION})
-    # 事前チェックだけが古い情報（マーカー無し）を返す状況を模す（credential_seed_version の視点では
-    # 未シードに見える）。
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})
-    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", db.migrate_marker_if_legacy_exists)
-    api._seed_settings_from_env()
-    assert "openai_api_key" not in db.data   # 復活しない
-    assert db.data[api._CREDENTIAL_SEED_MARKER_KEY] == api._CREDENTIAL_SEED_VERSION   # 移行済みとして確定
-
-
-def test_catchup_v2_not_invoked_when_marker_already_present(monkeypatch):
-    """v2 marker が既にあれば `store.catchup_ollama_allowlist_for_env_seeded_url_v2` は呼ばない
-    （安価な早期 return・正しさの根拠は store 側の marker 確認だが、無駄な監査ログ問い合わせを
-    避ける）。中央URLが既に allowlist にあるため警告も出ない。"""
-    db = _FakeSystemSettingsDB({
-        "ollama_url": "http://central.internal:11434",
-        "ollama_allowlist": ["central.internal:11434"],
-        "ollama_allowlist_env_seed_catchup_v2": 1,
-    })
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "catchup_ollama_allowlist_for_env_seeded_url_v2",
-                        db.catchup_ollama_allowlist_for_env_seeded_url_v2)
-    api._catchup_ollama_allowlist_for_central_url()
-    assert db.catchup_calls == []
-
-
-def test_catchup_v2_invoked_once_when_marker_absent_and_adds_host(monkeypatch):
-    """marker が無ければ一度だけ v2 を呼ぶ。`added` の結果は allowlist へ反映される。"""
-    db = _FakeSystemSettingsDB(
-        {"ollama_url": "http://central.internal:11434"},
-        catchup_v2_reason="added", catchup_v2_host="central.internal:11434")
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "catchup_ollama_allowlist_for_env_seeded_url_v2",
-                        db.catchup_ollama_allowlist_for_env_seeded_url_v2)
-    api._catchup_ollama_allowlist_for_central_url()
-    assert len(db.catchup_calls) == 1
-    assert db.data["ollama_allowlist"] == ["central.internal:11434"]
-
-
-def test_catchup_v2_skipped_unproven_logs_persistent_warning(monkeypatch, caplog):
-    """重大バグ是正（RV 4巡目 #1・簡素化裁定）: fail-closed で追加できなかった（`skipped_unproven`）
-    場合、自動修復はしないが、中央URLが非loopbackでallowlistに無ければ healthz のたびに
-    1行警告する（管理者への手動修復の誘導）。"""
+def test_warn_central_ollama_not_allowed_warns_only_for_non_loopback_missing_from_allowlist(monkeypatch, caplog):
     import logging
 
-    db = _FakeSystemSettingsDB(
-        {"ollama_url": "http://central.internal:11434"}, catchup_v2_reason="skipped_unproven")
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "catchup_ollama_allowlist_for_env_seeded_url_v2",
-                        db.catchup_ollama_allowlist_for_env_seeded_url_v2)
-    with caplog.at_level(logging.WARNING, logger="sherpa"):
-        api._catchup_ollama_allowlist_for_central_url()
-    assert "ollama_allowlist" not in db.data
-    assert any("central.internal:11434" in r.getMessage() for r in caplog.records)
-
-
-def test_catchup_v2_warning_persists_across_calls_after_marker_set(monkeypatch, caplog):
-    """marker 確定後（v2 を二度と呼ばない状態）でも、中央URLが allowlist に無い限り、健全性確認の
-    たびに警告し続ける（自動修復しない代わりに気づけるようにする・簡素化裁定）。"""
-    import logging
-
-    db = _FakeSystemSettingsDB({
-        "ollama_url": "http://central.internal:11434",
-        "ollama_allowlist_env_seed_catchup_v2": 1,   # 既に評価済み・追加されなかった状態
-    })
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "catchup_ollama_allowlist_for_env_seeded_url_v2",
-                        db.catchup_ollama_allowlist_for_env_seeded_url_v2)
-    with caplog.at_level(logging.WARNING, logger="sherpa"):
-        api._catchup_ollama_allowlist_for_central_url()
-    assert db.catchup_calls == []   # v2 は呼ばれない
-    assert any("central.internal:11434" in r.getMessage() for r in caplog.records)
-
-
-def test_catchup_v2_no_warning_for_loopback_central_url(monkeypatch, caplog):
-    import logging
-
-    db = _FakeSystemSettingsDB(
-        {"ollama_url": "http://localhost:11434"}, catchup_v2_reason="skipped_unproven")
-    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
-    monkeypatch.setattr(store, "catchup_ollama_allowlist_for_env_seeded_url_v2",
-                        db.catchup_ollama_allowlist_for_env_seeded_url_v2)
-    with caplog.at_level(logging.WARNING, logger="sherpa"):
-        api._catchup_ollama_allowlist_for_central_url()
-    assert not any("許可一覧にありません" in r.getMessage() for r in caplog.records)
+    for url, allowlist, warns in (
+            ("http://central.internal:11434", [], True),
+            ("http://central.internal:11434", ["central.internal:11434"], False),
+            ("http://localhost:11434", [], False)):
+        db = _FakeSystemSettingsDB({"ollama_url": url, "ollama_allowlist": allowlist})
+        monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="sherpa"):
+            api._warn_central_ollama_not_allowed()
+        assert any("許可一覧にありません" in r.getMessage() for r in caplog.records) is warns, url
 
 
 def test_healthz_retries_seed_on_schema_readiness_recovery(monkeypatch):
@@ -858,10 +527,10 @@ def test_healthz_retries_seed_on_schema_readiness_recovery(monkeypatch):
     monkeypatch.setattr(store, "init_schema", lambda: None)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     seed_calls = []
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: seed_calls.append(True))
     system_router.healthz()
@@ -880,10 +549,10 @@ def test_healthz_retries_seed_when_already_ready_not_just_on_transition(monkeypa
     monkeypatch.setattr(store, "schema_ready", lambda: True)   # 遷移ではなく常に ready
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     seed_calls = []
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: seed_calls.append(True))
     system_router.healthz()
@@ -894,8 +563,8 @@ def test_healthz_retries_seed_when_already_ready_not_just_on_transition(monkeypa
 def test_healthz_retries_seed_after_transient_seed_failure_and_succeeds_once(monkeypatch):
     """シードだけが一時的に失敗（DB 瞬断等・schema 自体は ready のまま）しても、次の healthz
     呼び出しで再試行され、最終的に1回だけ実際にシードされる。`model_catalog.seed_catalog_once()`
-    ・`api._seed_ollama_url_from_env()`・`api._confirm_legacy_env_seed_marker()`・
-    `api._catchup_ollama_allowlist_for_central_url()`・`api._seed_openai_endpoint_from_env()` は
+    ・`api._seed_ollama_url_from_env()`・
+    `api._warn_central_ollama_not_allowed()`・`api._seed_openai_endpoint_from_env()` は
     no-op に差し替える（同じ `_flaky_get`/`db` を共有すると、そちらの呼び出しが
     `db.seed_calls`/失敗回数のカウントに混ざり、本テストの意図（資格情報シード単体の再試行）を
     ずらしてしまうため）。"""
@@ -905,10 +574,10 @@ def test_healthz_retries_seed_after_transient_seed_failure_and_succeeds_once(mon
     monkeypatch.setattr(store, "schema_ready", lambda: True)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     db = _FakeSystemSettingsDB()
     state = {"n": 0}
 
@@ -936,10 +605,9 @@ def test_healthz_retries_both_seeds_independently_with_separate_markers(monkeypa
     （`credential_seed_version`／`model_catalog_seed_version`）を持つ別々の呼び出しであり、互いを
     上書き・スキップさせない。1回目の healthz で両方が実際に書き込み、2回目は両方ともマーカー
     済みのため書き込みが増えない（重複シードしない）ことを固定する。`ollama_allowlist` 追いつき
-    移行（`_catchup_ollama_allowlist_for_central_url`）・`api._seed_openai_endpoint_from_env`
+    移行（`_warn_central_ollama_not_allowed`）・`api._seed_openai_endpoint_from_env`
     （SET-2c・独立した第3のマーカー・別テストで単体検証する）は本テストの焦点（この2つのマーカー
-    の独立性）と無関係なため no-op に差し替える（`api._seed_ollama_url_from_env`／
-    `api._confirm_legacy_env_seed_marker` も同様＝どちらも本テストが検証する2マーカーとは別の
+    の独立性）と無関係なため no-op に差し替える（`api._seed_ollama_url_from_env` も同様＝本テストが検証する2マーカーとは別の
     マーカーを扱う・専用テスト群で単体検証する）。"""
     from sherpa.routers import system as system_router
 
@@ -948,10 +616,10 @@ def test_healthz_retries_both_seeds_independently_with_separate_markers(monkeypa
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_EMBED_MODEL", raising=False)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     db = _FakeSystemSettingsDB()
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
@@ -969,17 +637,19 @@ def test_healthz_retries_both_seeds_independently_with_separate_markers(monkeypa
 def test_healthz_model_catalog_seed_retries_after_transient_failure_independent_of_env_seed(monkeypatch):
     """model_catalog シードだけが一時的に失敗しても、次の healthz 呼び出しで再試行され、最終的に
     1回だけ実際にシードされる（`test_healthz_retries_seed_after_transient_seed_failure_and_succeeds_once`
-    の env シード版と対の検証・env シード側／OLLAMA_URL シード／env_seed_version 互換確定／
-    ollama_allowlist 追いつき移行／openai_endpoint シード（SET-2c）は no-op に差し替えて分離する）。"""
+    の env シード版と対の検証・env シード側／OLLAMA_URL シード／
+    ollama_allowlist 警告／openai_endpoint シード（SET-2c）は no-op に差し替えて分離する）。"""
     from sherpa.routers import system as system_router
 
     monkeypatch.setattr(store, "schema_ready", lambda: True)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_user_agent_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_vlm_ollama_url_from_env", lambda: None)
     db = _FakeSystemSettingsDB()
     state = {"n": 0}
 
@@ -1003,16 +673,16 @@ def test_healthz_model_catalog_seed_retries_after_transient_failure_independent_
 def test_healthz_openai_endpoint_seed_retries_after_transient_failure_independent_of_others(monkeypatch):
     """SET-2c: `api._seed_openai_endpoint_from_env`（第3の独立マーカー
     `openai_endpoint_seed_version`）だけが一時的に失敗しても、次の healthz 呼び出しで再試行され、
-    最終的に1回だけ実際にシードされる（env シード／OLLAMA_URL シード／env_seed_version 互換確定／
+    最終的に1回だけ実際にシードされる（env シード／OLLAMA_URL シード／
     model_catalog シードは no-op に差し替えて分離する・上記2テストと対の検証）。"""
     from sherpa.routers import system as system_router
 
     monkeypatch.setattr(store, "schema_ready", lambda: True)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     db = _FakeSystemSettingsDB()
@@ -1044,14 +714,14 @@ def test_healthz_ollama_url_seed_reevaluates_after_env_fixed_independent_of_othe
 
     monkeypatch.setattr(store, "schema_ready", lambda: True)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     db = _FakeSystemSettingsDB()
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
-    monkeypatch.setattr(store, "migrate_marker_if_legacy_exists", db.migrate_marker_if_legacy_exists)
 
     monkeypatch.setenv("OLLAMA_URL", "http://admin:s3cr3t@ollama-central.internal:11434")   # 不正形式
     system_router.healthz()
@@ -1228,30 +898,33 @@ def test_seed_openai_endpoint_from_env_unblocks_when_marker_already_confirmed(mo
     llm.openai_url("chat/completions")   # 例外を出さない（解除されている）
 
 
-# ===== 調べる深さの基準値7項目・env→system_settings 初回シード（`api._seed_depth_profile_from_env`） =====
+# ===== 調べる深さの基準値6項目・env→system_settings 初回シード（`api._seed_depth_profile_from_env`・実行時は env を読まない） =====
 # SC-6c（調べ方ブロック §3.2）。`_seed_openai_endpoint_from_env`／`model_catalog.seed_catalog_once`
 # と同じ「一度だけ」方式（独立マーカー `depth_profile_seed_version`）。候補値は各モジュールの既存
 # env 定数を複製するだけで、数値6項目の妥当性検証（openai_endpoint のような fail-closed ブロック）は
 # 不要——各モジュールの起動時に既に検証済みの値のため常に有効。例外は Codex 推論（自由文字列）＝
 # 語彙検証し不正なら何も書かない（下の invalid/normalize テスト参照）。
 
-def test_seed_depth_profile_from_env_writes_all_seven_keys_and_marker_in_one_call(monkeypatch):
-    """未シード状態で、7項目とマーカーを同一の `seed_system_settings_once` 呼び出しで書く。
-    値は各モジュールの既存 env 定数そのもの（ここでは env を再読しない）。"""
-    from sherpa import agentic_search, chat_service, impact_service, lens_service
+def test_seed_depth_profile_from_env_writes_all_six_keys_and_marker_in_one_call(monkeypatch):
+    """未シード状態で、6項目とマーカーを同一の `seed_system_settings_once` 呼び出しで書く。
+    値は env（有効な値）→各モジュールのコード既定の順（env が無い項目はコード既定）。"""
+    from sherpa import chat_service
+    for name in ("SHERPA_GREP_MAX_HITS", "SHERPA_READ_WINDOW", "SHERPA_IMPACT_MAX_DEPTH",
+                 "SHERPA_CODEX_REASONING"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SHERPA_TROUBLESHOOT_GRAPH_DEPTH", "6")
     monkeypatch.setattr(store, "get_system_settings", lambda: {})
     calls = _set_system_settings_recorder(monkeypatch)
     api._seed_depth_profile_from_env()
     assert len(calls) == 1
     assert calls[0]["guard_key"] == api._DEPTH_PROFILE_SEED_MARKER_KEY
     assert calls[0]["updates"] == {
-        "depth_base_max_turns": agentic_search.MAX_TURNS,
-        "depth_base_grep_max_hits": agentic_search.MAX_HITS,
+        "depth_base_grep_max_hits": 45,
         "depth_base_qa_max_hits": chat_service.QA_MAX_HITS_DEFAULT,
-        "depth_base_read_window": agentic_search.READ_WINDOW,
-        "depth_base_impact_depth": impact_service.IMPACT_MAX_DEPTH,
-        "depth_base_troubleshoot_depth": lens_service.TROUBLESHOOT_GRAPH_DEPTH,
-        "depth_base_codex_reasoning": os.environ.get("SHERPA_CODEX_REASONING", "low").strip().lower(),
+        "depth_base_read_window": 60,
+        "depth_base_impact_depth": 10,
+        "depth_base_troubleshoot_depth": 6,   # env の有効値は初回シードで取り込む
+        "depth_base_codex_reasoning": "medium",
         api._DEPTH_PROFILE_SEED_MARKER_KEY: api._DEPTH_PROFILE_SEED_VERSION,
     }
 
@@ -1266,7 +939,7 @@ def test_seed_depth_profile_from_env_noop_when_marker_already_present(monkeypatc
 
 
 def test_seed_depth_profile_from_env_does_not_revive_deleted_key_after_marker_set(monkeypatch):
-    """管理者が基準値（例: depth_base_max_turns）を admin-settings.html で削除した後、マーカーが
+    """管理者が基準値（例: depth_base_grep_max_hits）を admin-settings.html で削除した後、マーカーが
     立っていれば env 既定値から復活しない。"""
     monkeypatch.setattr(store, "get_system_settings",
                         lambda: {api._DEPTH_PROFILE_SEED_MARKER_KEY: api._DEPTH_PROFILE_SEED_VERSION})
@@ -1276,15 +949,15 @@ def test_seed_depth_profile_from_env_does_not_revive_deleted_key_after_marker_se
 
 
 def test_seed_depth_profile_from_env_does_not_overwrite_existing_admin_value(monkeypatch):
-    """マーカー確定前でも、既に個別に保存済みの管理値（`depth_base_max_turns` 等）を env 由来の
+    """マーカー確定前でも、既に個別に保存済みの管理値（`depth_base_grep_max_hits` 等）を env 由来の
     候補で上書きしない（実 DB の `WHERE NOT EXISTS` 意味論を `_FakeSystemSettingsDB` で固定）。"""
-    db = _FakeSystemSettingsDB({"depth_base_max_turns": 99})
+    db = _FakeSystemSettingsDB({"depth_base_grep_max_hits": 99})
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
     monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
     api._seed_depth_profile_from_env()
-    assert db.data["depth_base_max_turns"] == 99   # 既存の管理値は上書きされない
+    assert db.data["depth_base_grep_max_hits"] == 99   # 既存の管理値は上書きされない
     assert db.data[api._DEPTH_PROFILE_SEED_MARKER_KEY] == api._DEPTH_PROFILE_SEED_VERSION   # マーカーは確定
-    assert db.data["depth_base_grep_max_hits"] is not None   # 他の6項目は通常どおりシードされる
+    assert db.data["depth_base_read_window"] is not None   # 他の5項目は通常どおりシードされる
 
 
 def test_seed_depth_profile_from_env_survives_db_unreachable_and_does_not_mark_seeded(monkeypatch):
@@ -1299,7 +972,7 @@ def test_seed_depth_profile_from_env_survives_db_unreachable_and_does_not_mark_s
 
 
 def test_seed_depth_profile_from_env_rejects_unknown_codex_reasoning_and_writes_nothing(monkeypatch, caplog):
-    """`SHERPA_CODEX_REASONING` が既知語彙以外なら、7項目・マーカーとも一切書かない
+    """`SHERPA_CODEX_REASONING` が既知語彙以外なら、6項目・マーカーとも一切書かない
     （不正値を一回性マーカー付きで永続化すると env 修正後も自動回復しなくなるため）。
     エラーログを出す（見送ったことが起動ログから分かるように）。"""
     monkeypatch.setenv("SHERPA_CODEX_REASONING", "ultra")
@@ -1323,18 +996,50 @@ def test_seed_depth_profile_from_env_normalizes_codex_reasoning_case_and_whitesp
     assert calls[0]["updates"]["depth_base_codex_reasoning"] == "high"
 
 
+def test_screen_settings_seed_from_env_then_workspace_limits_follow_db_only(monkeypatch):
+    """画面で変えられる運用設定（個人ファイルの上限・保持日数・同時実行・取り込み方式・旧形式の変換）は、
+    env に有効な値があるものだけ初回シードで DB へ入り（未設定・不正な項目は入れない）、以後の実行時は
+    DB の値だけを読む（env を後から変えても効かない・DB が未設定ならコード既定）。"""
+    from sherpa import workspace_limits
+    for name in ("SHERPA_CHAT_MAX_TURNS_PER_USER",):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SHERPA_WORKSPACE_MAX_BYTES", str(2 * 1024 * 1024))
+    monkeypatch.setenv("SHERPA_WORKSPACE_TTL_DAYS", "30")
+    monkeypatch.setenv("SHERPA_CHAT_MAX_TURNS_GLOBAL", "5")
+    monkeypatch.setenv("SHERPA_ARMS", "ooxml,bogus,pdf_text")
+    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "bogus")   # 不正な値は取り込まない
+    db = _FakeSystemSettingsDB()
+    monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
+    monkeypatch.setattr(store, "seed_system_settings_once", db.seed_system_settings_once)
+    api._seed_screen_settings_from_env()
+    assert db.data["workspace_max_bytes"] == 2 * 1024 * 1024
+    assert db.data["workspace_ttl_days"] == 30
+    assert db.data["chat_max_turns_global"] == 5
+    assert db.data["arms_enabled"] == ["ooxml", "pdf_text"]
+    assert "legacy_backend" not in db.data and "chat_max_turns_per_user" not in db.data
+    assert db.data[api._SCREEN_SETTINGS_SEED_MARKER_KEY] == api._SCREEN_SETTINGS_SEED_VERSION
+
+    monkeypatch.setenv("SHERPA_WORKSPACE_MAX_BYTES", str(50 * 1024 * 1024))   # 実行時は読まない
+    assert workspace_limits.max_bytes() == 2 * 1024 * 1024
+    assert workspace_limits.ttl_days() == 30
+    db.data["workspace_ttl_days"] = 0   # 管理画面で「無期限」に変えた値がそのまま効く
+    assert workspace_limits.ttl_days() == 0
+    del db.data["workspace_max_bytes"]   # 未設定はコード既定（env ではない）
+    assert workspace_limits.max_bytes() == workspace_limits.MAX_BYTES_DEFAULT
+
+
 def test_healthz_depth_profile_seed_recovers_after_env_fixed(monkeypatch):
     """不正な env で見送った直後の healthz 再試行では引き続き未シード。env を既知語彙へ直した後の
-    再試行で、7項目・マーカーが一括で確定する（`test_healthz_depth_profile_seed_retries_after_
+    再試行で、6項目・マーカーが一括で確定する（`test_healthz_depth_profile_seed_retries_after_
     transient_failure_independent_of_others` と対の検証・DB 瞬断ではなく env 不正が原因）。"""
     from sherpa.routers import system as system_router
 
     monkeypatch.setattr(store, "schema_ready", lambda: True)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     db = _FakeSystemSettingsDB()
     monkeypatch.setattr(store, "get_system_settings", db.get_system_settings)
@@ -1361,9 +1066,9 @@ def test_healthz_depth_profile_seed_retries_after_transient_failure_independent_
     monkeypatch.setattr(store, "schema_ready", lambda: True)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     db = _FakeSystemSettingsDB()
     state = {"n": 0}
@@ -1567,28 +1272,6 @@ def test_browse_roots_falls_back_to_default_when_all_segments_empty(monkeypatch)
         api.Path("/mnt"), api.Path("/srv"), api.Path("/home"), api.Path("/Users")]
 
 
-# ---- ② poller の有効/無効 ----
-
-def test_poller_disabled_by_default(monkeypatch):
-    """SHERPA_POLL_SECONDS 未設定（<=0）ならポーラースレッドを起動しない。"""
-    monkeypatch.delenv("SHERPA_POLL_SECONDS", raising=False)
-    records: list = []
-    monkeypatch.setattr("threading.Thread", _thread_recorder(records))
-    api._start_poller()
-    assert records == []
-
-
-def test_poller_enabled_when_env_positive(monkeypatch):
-    """SHERPA_POLL_SECONDS>0 なら daemon ポーラースレッドを1本起動する。"""
-    monkeypatch.setenv("SHERPA_POLL_SECONDS", "300")
-    records: list = []
-    monkeypatch.setattr("threading.Thread", _thread_recorder(records))
-    api._start_poller()
-    assert len(records) == 1
-    assert records[0]["name"] == "sherpa-poller"
-    assert records[0]["daemon"] is True
-
-
 # ---- ③ TestClient 起動で startup が旧登録順どおりに走る ----
 
 def test_lifespan_runs_startup_steps_in_order(monkeypatch):
@@ -1603,12 +1286,11 @@ def test_lifespan_runs_startup_steps_in_order(monkeypatch):
     monkeypatch.setattr(store, "init_schema", lambda: calls.append("schema"))
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: calls.append("seed_settings"))
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: calls.append("seed_ollama_url"))
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker",
-                        lambda: calls.append("confirm_legacy_env_seed"))
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url",
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed",
                         lambda: calls.append("catchup_ollama_allowlist"))
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: calls.append("seed_openai_endpoint"))
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: calls.append("seed_depth_profile"))
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: calls.append("seed_screen_settings"))
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: calls.append("model_catalog_seed"))
     monkeypatch.setattr(api, "_purge_personal_keys_if_disabled_on_startup",
                         lambda: calls.append("purge_personal_keys"))
@@ -1620,17 +1302,16 @@ def test_lifespan_runs_startup_steps_in_order(monkeypatch):
     monkeypatch.setattr(api, "_warn_codex_sandbox_disabled", lambda: calls.append("warn_codex_sandbox"))
     monkeypatch.setattr(api, "_warn_multi_worker_chat_turns", lambda: calls.append("warn_multi_worker"))
     monkeypatch.setattr(api, "_warn_browse_roots_missing", lambda: calls.append("warn_browse_roots"))
-    monkeypatch.setattr(api, "_start_poller", lambda: calls.append("poller"))
     monkeypatch.setattr(api, "_reconcile_orphans", lambda: calls.append("reconcile"))
-    monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda: calls.append("sweep"))
+    monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda *_a: calls.append("sweep"))
     monkeypatch.setattr(api, "_backfill_turn_metrics_on_startup", lambda: calls.append("turn_metrics_backfill"))
     with TestClient(api.app):
         pass
     assert calls == [
-        "schema", "seed_settings", "seed_ollama_url", "confirm_legacy_env_seed", "catchup_ollama_allowlist",
-        "seed_openai_endpoint", "seed_depth_profile", "model_catalog_seed", "purge_personal_keys", "warn_change_me", "warn_default_admin", "auth",
+        "schema", "seed_settings", "seed_ollama_url", "catchup_ollama_allowlist",
+        "seed_openai_endpoint", "seed_depth_profile", "seed_screen_settings", "model_catalog_seed", "purge_personal_keys", "warn_change_me", "warn_default_admin", "auth",
         "warn_fixtures", "warn_test_db_isolated", "warn_codex_sandbox", "warn_multi_worker", "warn_browse_roots",
-        "poller", "reconcile", "sweep", "turn_metrics_backfill",
+        "reconcile", "sweep", "turn_metrics_backfill",
     ]
 
 
@@ -1643,12 +1324,11 @@ def test_lifespan_reattaches_request_id_filter_before_other_startup_steps(monkey
     monkeypatch.setattr(store, "init_schema", lambda: calls.append("schema"))
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: calls.append("seed_settings"))
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: calls.append("seed_ollama_url"))
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker",
-                        lambda: calls.append("confirm_legacy_env_seed"))
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url",
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed",
                         lambda: calls.append("catchup_ollama_allowlist"))
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: calls.append("seed_openai_endpoint"))
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: calls.append("seed_depth_profile"))
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: calls.append("seed_screen_settings"))
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: calls.append("model_catalog_seed"))
     monkeypatch.setattr(api, "_purge_personal_keys_if_disabled_on_startup",
                         lambda: calls.append("purge_personal_keys"))
@@ -1660,9 +1340,8 @@ def test_lifespan_reattaches_request_id_filter_before_other_startup_steps(monkey
     monkeypatch.setattr(api, "_warn_codex_sandbox_disabled", lambda: calls.append("warn_codex_sandbox"))
     monkeypatch.setattr(api, "_warn_multi_worker_chat_turns", lambda: calls.append("warn_multi_worker"))
     monkeypatch.setattr(api, "_warn_browse_roots_missing", lambda: calls.append("warn_browse_roots"))
-    monkeypatch.setattr(api, "_start_poller", lambda: calls.append("poller"))
     monkeypatch.setattr(api, "_reconcile_orphans", lambda: calls.append("reconcile"))
-    monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda: calls.append("sweep"))
+    monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda *_a: calls.append("sweep"))
     monkeypatch.setattr(api, "_backfill_turn_metrics_on_startup", lambda: calls.append("turn_metrics_backfill"))
     with TestClient(api.app):
         pass
@@ -1680,12 +1359,11 @@ def test_lifespan_continues_when_schema_init_fails(monkeypatch):
     monkeypatch.setattr(store, "init_schema", _boom)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: calls.append("seed_settings"))
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: calls.append("seed_ollama_url"))
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker",
-                        lambda: calls.append("confirm_legacy_env_seed"))
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url",
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed",
                         lambda: calls.append("catchup_ollama_allowlist"))
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: calls.append("seed_openai_endpoint"))
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: calls.append("seed_depth_profile"))
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: calls.append("seed_screen_settings"))
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: calls.append("model_catalog_seed"))
     monkeypatch.setattr(api, "_purge_personal_keys_if_disabled_on_startup",
                         lambda: calls.append("purge_personal_keys"))
@@ -1697,17 +1375,16 @@ def test_lifespan_continues_when_schema_init_fails(monkeypatch):
     monkeypatch.setattr(api, "_warn_codex_sandbox_disabled", lambda: calls.append("warn_codex_sandbox"))
     monkeypatch.setattr(api, "_warn_multi_worker_chat_turns", lambda: calls.append("warn_multi_worker"))
     monkeypatch.setattr(api, "_warn_browse_roots_missing", lambda: calls.append("warn_browse_roots"))
-    monkeypatch.setattr(api, "_start_poller", lambda: calls.append("poller"))
     monkeypatch.setattr(api, "_reconcile_orphans", lambda: calls.append("reconcile"))
-    monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda: calls.append("sweep"))
+    monkeypatch.setattr(api, "_sweep_expired_on_startup", lambda *_a: calls.append("sweep"))
     monkeypatch.setattr(api, "_backfill_turn_metrics_on_startup", lambda: calls.append("turn_metrics_backfill"))
     with TestClient(api.app):
         pass
     assert calls == [
-        "seed_settings", "seed_ollama_url", "confirm_legacy_env_seed", "catchup_ollama_allowlist",
-        "seed_openai_endpoint", "seed_depth_profile", "model_catalog_seed", "purge_personal_keys", "warn_change_me", "warn_default_admin", "auth",
+        "seed_settings", "seed_ollama_url", "catchup_ollama_allowlist",
+        "seed_openai_endpoint", "seed_depth_profile", "seed_screen_settings", "model_catalog_seed", "purge_personal_keys", "warn_change_me", "warn_default_admin", "auth",
         "warn_fixtures", "warn_test_db_isolated", "warn_codex_sandbox", "warn_multi_worker", "warn_browse_roots",
-        "poller", "reconcile", "sweep", "turn_metrics_backfill",
+        "reconcile", "sweep", "turn_metrics_backfill",
     ]
 
 
@@ -1721,10 +1398,10 @@ def test_lifespan_stops_audit_writer_even_when_startup_step_raises(monkeypatch):
     monkeypatch.setattr(store, "init_schema", lambda: None)
     monkeypatch.setattr(api, "_seed_settings_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_ollama_url_from_env", lambda: None)
-    monkeypatch.setattr(api, "_confirm_legacy_env_seed_marker", lambda: None)
-    monkeypatch.setattr(api, "_catchup_ollama_allowlist_for_central_url", lambda: None)
+    monkeypatch.setattr(api, "_warn_central_ollama_not_allowed", lambda: None)
     monkeypatch.setattr(api, "_seed_openai_endpoint_from_env", lambda: None)
     monkeypatch.setattr(api, "_seed_depth_profile_from_env", lambda: None)
+    monkeypatch.setattr(api, "_seed_screen_settings_from_env", lambda: None)
     monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
     monkeypatch.setattr(api, "_purge_personal_keys_if_disabled_on_startup", lambda: None)
     monkeypatch.setattr(api, "_warn_change_me_placeholders", lambda: None)
@@ -1748,3 +1425,41 @@ def test_lifespan_stops_audit_writer_even_when_startup_step_raises(monkeypatch):
             pass
     assert stop_calls == [True], "起動処理中の例外でも audit writer の stop() が呼ばれていない"
     assert ext_api._audit_writer._state == ext_api._WRITER_STOPPED
+
+
+def test_lifespan_joins_startup_sweep_before_closing_pg_pool(monkeypatch):
+    """起動時の掃除スレッドは停止イベントの管理下に置かれ、終了時に PG プールを閉じる前に join される。"""
+    from sherpa.store import db as store_db
+
+    events: list[str] = []
+
+    class _FakeThread:
+        def join(self, timeout=None):
+            events.append("join")
+
+    monkeypatch.setattr(store, "init_schema", lambda: None)
+    for name in (
+        "_seed_settings_from_env", "_seed_ollama_url_from_env",
+        "_warn_central_ollama_not_allowed", "_seed_openai_endpoint_from_env",
+        "_seed_depth_profile_from_env", "_seed_screen_settings_from_env", "_seed_user_agent_from_env",
+        "_seed_vlm_ollama_url_from_env", "_purge_personal_keys_if_disabled_on_startup",
+        "_warn_change_me_placeholders", "_warn_default_admin_password", "_auth_bootstrap_on_startup",
+        "_warn_fixtures", "_warn_test_db_isolated", "_warn_codex_sandbox_disabled",
+        "_warn_multi_worker_chat_turns", "_warn_browse_roots_missing", "_reconcile_orphans",
+        "_backfill_turn_metrics_on_startup",
+    ):
+        monkeypatch.setattr(api, name, lambda *_a: None)
+    monkeypatch.setattr(model_catalog, "seed_catalog_once", lambda: None)
+    stops: list[bool] = []
+
+    def _sweep(stop):
+        stops.append(stop.is_set())
+        return _FakeThread()
+
+    monkeypatch.setattr(api, "_sweep_expired_on_startup", _sweep)
+    monkeypatch.setattr(api, "_start_workspace_maintenance_loop", lambda stop: _FakeThread())
+    monkeypatch.setattr(store_db, "close_pg_pool", lambda: events.append("close_pool"))
+    with TestClient(api.app):
+        pass
+    assert stops == [False]
+    assert events == ["join", "join", "close_pool"]

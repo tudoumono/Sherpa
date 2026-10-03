@@ -112,7 +112,7 @@ def test_ocr_pending_notification_triggers_catchup_once(monkeypatch):
     assert len(items) == 1
     assert items[0]["admin_only"] is True
     assert items[0]["action"]["path"] == "/worlds/w1/refresh"
-    assert calls == [("w1", "refresh", "{}")]   # folder poller / 手動更新と同じ op/fingerprint に合流できる
+    assert calls == [("w1", "refresh", "{}")]   # 手動更新と同じ op/fingerprint に合流できる
 
 
 def test_ocr_pending_skipped_when_not_drifted(monkeypatch):

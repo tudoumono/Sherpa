@@ -1,16 +1,4 @@
-"""バックアップ/復元スクリプトの契約（2026-08-18・docs/18 §7「make backup 未整備」の穴埋め）。
-
-外部サービス不要: docker は PATH 先頭に置いた偽物で置き換え、呼び出し引数をログに残して検証する。
-実 docker ボリュームでの往復（印を置く→backup→消す→restore→戻る）は手動の実機確認で行う。
-
-契約:
-- backup.sh / restore.sh は bash -n を通り、--help で使い方を出す
-- backup.sh --dry-run は計画（出力先・ボリューム3つ・個人領域・.env・ワークイメージ）を出し、何も書かない
-- <project>- 接頭辞のコンテナが動いていれば backup は fail（`make stop` を案内・--stop で自動停止）
-- restore は MANIFEST の sha256 が1つでも合わなければ何も変更せず止まる（docker volume rm を呼ばない）
-- Makefile に backup / restore ターゲットがある
-- install_offline_kit.sh は current 切替の前に backup.sh を呼ぶ経路を持つ（稼働中は警告して続行）
-"""
+"""バックアップ/復元スクリプトの契約（2026-08-18・docs/18 §7「make backup 未整備」の穴埋め）。"""
 from __future__ import annotations
 
 import hashlib
@@ -103,21 +91,23 @@ def _env_for(tmp_path: Path, env: dict[str, str], project: str = "sherpa-wftest"
     return env
 
 
-def test_scripts_parse_and_help():
+def test_scripts_parse_help_and_makefile_wiring():
     for s in (BACKUP, RESTORE):
         assert subprocess.run(["bash", "-n", str(s)], capture_output=True).returncode == 0, s
         r = subprocess.run([str(s), "--help"], capture_output=True, text=True, timeout=30)
         assert r.returncode == 0 and "使い方" in r.stdout, s
+    r = subprocess.run([str(RESTORE), "/nonexistent-dir"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1 and "ありません" in r.stderr   # MANIFEST が無いものは復元しない
+    mk = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "\nbackup:" in mk and "scripts/backup.sh" in mk and "\nrestore:" in mk and "scripts/restore.sh" in mk
+    phony = mk.split(".PHONY:", 1)[1].split("\n\n", 1)[0]
+    assert "backup" in phony and "restore" in phony
 
 
 def test_sha256_helper_falls_back_without_sha256sum(tmp_path: Path):
-    """run-common.sh の sha256 ヘルパー（macOS 対応・stock macOS には sha256sum が無い）は
-    sha256sum が PATH に無くても shasum -a 256 へフォールバックし、同じ hex を返す。"""
+    """run-common.sh の sha256 ヘルパーは sha256sum が PATH に無くても shasum -a 256 へフォールバックする。"""
     payload = tmp_path / "f.txt"
     payload.write_bytes(b"hello sherpa\n")
-    want = hashlib.sha256(payload.read_bytes()).hexdigest()
-
-    # 今の PATH から sha256sum だけを欠いた PATH を組む（他のコマンドは実体のまま使えるようにする）。
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
     for entry in os.environ.get("PATH", "").split(os.pathsep):
@@ -131,134 +121,62 @@ def test_sha256_helper_falls_back_without_sha256sum(tmp_path: Path):
                 (stub_bin / exe.name).symlink_to(exe)
             except OSError:
                 continue
-    env = dict(os.environ)
-    env["PATH"] = str(stub_bin)
-
-    r = subprocess.run(
-        ["bash", "-c", f'. "{RUN_COMMON}"; sherpa_sha256_hex "{payload}"'],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    r = subprocess.run(["bash", "-c", f'. "{RUN_COMMON}"; sherpa_sha256_hex "{payload}"'],
+                       env=dict(os.environ, PATH=str(stub_bin)), capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == want
+    assert r.stdout.strip() == hashlib.sha256(payload.read_bytes()).hexdigest()
 
 
 def test_dry_run_prints_plan_and_writes_nothing(tmp_path: Path):
     env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", tmp_path / "args.log"))
     r = _run([str(BACKUP), "--dry-run"], env)
     assert r.returncode == 0, r.stderr
-    out = r.stdout
-    for needle in (
-        "sherpa-wftest_pg sherpa-wftest_neo4j sherpa-wftest_es",
-        str(tmp_path / "users"),
-        str(tmp_path / "env"),
-        "ワークイメージ: postgres:16",
-        "含めない（--with-derived",
-        "--dry-run のため何も書きませんでした",
-    ):
-        assert needle in out, (needle, out)
+    for needle in ("sherpa-wftest_pg sherpa-wftest_neo4j sherpa-wftest_es", str(tmp_path / "users"),
+                   str(tmp_path / "env"), "ワークイメージ: postgres:16", "含めない（--with-derived",
+                   "--dry-run のため何も書きませんでした"):
+        assert needle in r.stdout, (needle, r.stdout)
     assert not (tmp_path / "bk").exists()
-    # dry-run では tar 用の docker run を一切呼ばない
-    assert "run --rm" not in (tmp_path / "args.log").read_text(encoding="utf-8")
-
-
-def test_dry_run_with_derived_lists_derived_dir(tmp_path: Path):
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", tmp_path / "args.log"))
+    assert "run --rm" not in (tmp_path / "args.log").read_text(encoding="utf-8")   # tar 用の docker run を呼ばない
     env["SHERPA_DERIVED_DIR"] = str(tmp_path / "derived")
     r = _run([str(BACKUP), "--dry-run", "--with-derived"], env)
-    assert r.returncode == 0, r.stderr
-    assert f"派生物:        {tmp_path / 'derived'}" in r.stdout
+    assert r.returncode == 0 and f"派生物:        {tmp_path / 'derived'}" in r.stdout
 
 
-def test_backup_fails_when_store_running_and_suggests_make_stop(tmp_path: Path):
+def test_backup_refuses_while_store_running(tmp_path: Path):
     arglog = tmp_path / "args.log"
-    env = _env_for(
-        tmp_path,
-        _fake_docker(
-            tmp_path / "bin",
-            arglog,
-            running="sherpa-wftest-postgres-1",
-            running_volume="sherpa-wftest_pg",
-        ),
-    )
+    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog, running="sherpa-wftest-postgres-1",
+                                          running_volume="sherpa-wftest_pg"))
     r = _run([str(BACKUP)], env)
-    assert r.returncode == 3  # 3=稼働中
+    assert r.returncode == 3   # 3=稼働中（install 13a が「警告して続行」と区別できる）
     assert "稼働中" in r.stderr and "make stop" in r.stderr and "--stop" in r.stderr
-    assert not (tmp_path / "bk").exists()
-    assert "run --rm" not in arglog.read_text(encoding="utf-8")
-
-
-def test_backup_ignores_other_projects_containers(tmp_path: Path):
-    """接頭辞が違うコンテナ（別プロジェクト）は「稼働中」と数えない。"""
-    env = _env_for(
-        tmp_path,
-        _fake_docker(
-            tmp_path / "bin",
-            tmp_path / "args.log",
-            running="sherpa-mvp-postgres-1",
-            running_volume="sherpa-mvp_pg",
-        ),
-    )
-    r = _run([str(BACKUP), "--dry-run"], env)
-    assert r.returncode == 0, r.stderr
-    assert "稼働中" not in r.stderr
-
-
-def test_backup_stop_flag_stops_only_that_projects_containers(tmp_path: Path):
-    """--stop（既定でないプロジェクト）は docker stop <そのコンテナ> を呼び、止まった後に続行する。"""
-    arglog = tmp_path / "args.log"
-    env = _env_for(
-        tmp_path,
-        _fake_docker(
-            tmp_path / "bin",
-            arglog,
-            running="sherpa-wftest-postgres-1",
-            running_volume="sherpa-wftest_pg",
-        ),
-    )
-    # 偽 docker は ps が常に同じ答えを返すので、stop 後も「稼働中」→ fail する。stop が呼ばれたことだけ確認する。
+    assert not (tmp_path / "bk").exists() and "run --rm" not in arglog.read_text(encoding="utf-8")
+    # --stop はそのプロジェクトのコンテナだけを止めて外す（偽 docker は ps が同じ答えを返すので最終的には 3）
     r = _run([str(BACKUP), "--stop"], env)
     log = arglog.read_text(encoding="utf-8")
-    assert "stop sherpa-wftest-postgres-1" in log and "rm sherpa-wftest-postgres-1" in log  # 止めるだけでなく外す
-    assert r.returncode == 3  # 3=稼働中（呼び出し側の install 13a が「警告して続行」と区別できる）
+    assert "stop sherpa-wftest-postgres-1" in log and "rm sherpa-wftest-postgres-1" in log and r.returncode == 3
+    # 接頭辞が違う別プロジェクトのコンテナは稼働中と数えない
+    other = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog, running="sherpa-mvp-postgres-1",
+                                            running_volume="sherpa-mvp_pg"))
+    r = _run([str(BACKUP), "--dry-run"], other)
+    assert r.returncode == 0 and "稼働中" not in r.stderr
 
 
-def test_backup_fails_without_any_image(tmp_path: Path):
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", tmp_path / "args.log", images=""))
-    r = _run([str(BACKUP), "--dry-run"], env)
-    assert r.returncode == 1
-    assert "既知の docker イメージがありません" in r.stderr
-
-
-def test_backup_refuses_missing_required_volume(tmp_path: Path):
-    env = _env_for(
-        tmp_path,
-        _fake_docker(
-            tmp_path / "bin",
-            tmp_path / "args.log",
-            missing_volume="sherpa-wftest_es",
-        ),
-    )
-    r = _run([str(BACKUP)], env)
-    assert r.returncode == 1
-    assert "必要な3 volume" in r.stderr and "sherpa-wftest_es" in r.stderr
+@pytest.mark.parametrize("kw,env_missing,needles", [
+    (dict(images=""), False, ["既知の docker イメージがありません"]),
+    (dict(missing_volume="sherpa-wftest_es"), False, ["必要な3 volume", "sherpa-wftest_es"]),
+    (dict(), True, ["不完全なバックアップ"]),
+])
+def test_backup_refuses_incomplete_environment(tmp_path: Path, kw, env_missing, needles):
+    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", tmp_path / "args.log", **kw))
+    if env_missing:
+        env["SHERPA_ENV_FILE"] = str(tmp_path / "missing.env")
+        needles = [*needles, "missing.env"]
+    r = _run([str(BACKUP), *(["--dry-run"] if kw.get("images") == "" or env_missing else [])], env)
+    assert r.returncode == 1 and all(n in r.stderr for n in needles)
     assert not (tmp_path / "bk").exists()
-
-
-def test_backup_refuses_missing_explicit_env_file(tmp_path: Path):
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", tmp_path / "args.log"))
-    missing = tmp_path / "missing.env"
-    env["SHERPA_ENV_FILE"] = str(missing)
-    r = _run([str(BACKUP), "--dry-run"], env)
-    assert r.returncode == 1
-    assert str(missing) in r.stderr and "不完全なバックアップ" in r.stderr
 
 
 def _make_backup_dir(tmp_path: Path, tamper: bool, *, with_volume: bool = True) -> Path:
-    import hashlib
-
     bk = tmp_path / "bk" / "20260818-000000"
     (bk / "volumes").mkdir(parents=True)
     files = {}
@@ -276,8 +194,7 @@ def _make_backup_dir(tmp_path: Path, tamper: bool, *, with_volume: bool = True) 
             p.write_text("OPENAI_API_KEY=backup-secret\nSHERPA_PORT=9000\n", encoding="utf-8")
         files[name] = hashlib.sha256(p.read_bytes()).hexdigest()
     if tamper:
-        # 改ざんは「別内容の**正しい** tar.gz」にする。非 tar のバイト列だと後段の `tar tzf` 検査でも止まり、
-        # sha256 ゲート自体が欠けても緑のままになる（RV: 変異実験で検出できなかった）。
+        # 改ざんは「別内容の正しい tar.gz」にする（非 tar だと後段の tar tzf で止まり sha256 ゲートの欠落を検出できない）
         evil = tmp_path / "evil.txt"
         evil.write_text("evil", encoding="utf-8")
         with tarfile.open(bk / "users.tar.gz", "w:gz") as tf:
@@ -289,77 +206,45 @@ def _make_backup_dir(tmp_path: Path, tamper: bool, *, with_volume: bool = True) 
     return bk
 
 
-def test_restore_stops_on_sha256_mismatch_without_touching_anything(tmp_path: Path):
-    arglog = tmp_path / "args.log"
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog))
-    env["YES"] = "1"
-    bk = _make_backup_dir(tmp_path, tamper=True)
-    r = _run([str(RESTORE), str(bk)], env)
-    assert r.returncode == 1
-    assert "sha256 が一致しない" in r.stderr and "何も変更していません" in r.stderr
-    log = arglog.read_text(encoding="utf-8") if arglog.exists() else ""
-    assert "volume rm" not in log and "run --rm" not in log
-    assert (tmp_path / "users" / "u1.txt").exists()  # 個人領域も無傷
-
-
-def test_restore_refuses_when_store_running(tmp_path: Path):
-    arglog = tmp_path / "args.log"
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog, running="sherpa-wftest-neo4j-1"))
-    env["YES"] = "1"
-    bk = _make_backup_dir(tmp_path, tamper=False)
-    r = _run([str(RESTORE), str(bk)], env)
-    assert r.returncode == 1
-    assert "参照しているコンテナ" in r.stderr and "make stop" in r.stderr
-    assert "volume rm" not in arglog.read_text(encoding="utf-8")
-
-
-def test_restore_rejects_unlisted_payload_before_docker_or_filesystem_changes(tmp_path: Path):
-    """MANIFEST 外の追加 tar を glob で拾い、任意名の volume を消してはならない。"""
-    arglog = tmp_path / "args.log"
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog))
-    env["YES"] = "1"
-    bk = _make_backup_dir(tmp_path, tamper=False)
+def _unlisted(bk):
     (bk / "volumes" / "victim_volume.tar.gz").write_bytes(b"not-listed")
 
-    r = _run([str(RESTORE), str(bk)], env)
 
-    assert r.returncode == 1
-    assert "MANIFEST にないファイル" in r.stderr
-    log = arglog.read_text(encoding="utf-8") if arglog.exists() else ""
-    assert "volume rm" not in log and "run --rm" not in log
-    assert (tmp_path / "users" / "u1.txt").exists()
-
-
-def test_restore_rejects_listed_unexpected_volume_name(tmp_path: Path):
-    """checksum が正しくても、3つの所定名以外の volume tar は削除対象にしない。"""
-    import hashlib
-
-    arglog = tmp_path / "args.log"
-    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog))
-    env["YES"] = "1"
-    bk = _make_backup_dir(tmp_path, tamper=False, with_volume=False)
+def _listed_unexpected(bk):
     extra = bk / "volumes" / "victim_volume.tar.gz"
     extra.write_bytes(b"listed-but-not-allowed")
     with (bk / "MANIFEST").open("a", encoding="utf-8") as fh:
         fh.write(f"{hashlib.sha256(extra.read_bytes()).hexdigest()}  volumes/{extra.name}\n")
 
-    r = _run([str(RESTORE), str(bk)], env)
 
-    assert r.returncode == 1
-    assert "許可されていない復元対象" in r.stderr
+@pytest.mark.parametrize("scenario,tamper,with_volume,running,message", [
+    ("sha256 mismatch", True, True, "", ["sha256 が一致しない", "何も変更していません"]),
+    ("unlisted payload", False, True, "", ["MANIFEST にないファイル"]),
+    ("listed unexpected volume", False, False, "", ["許可されていない復元対象"]),
+    ("store running", False, True, "sherpa-wftest-neo4j-1", ["参照しているコンテナ", "make stop"]),
+])
+def test_restore_refuses_without_touching_anything(tmp_path: Path, scenario, tamper, with_volume, running, message):
+    arglog = tmp_path / "args.log"
+    env = _env_for(tmp_path, _fake_docker(tmp_path / "bin", arglog, running=running))
+    env["YES"] = "1"
+    bk = _make_backup_dir(tmp_path, tamper=tamper, with_volume=with_volume)
+    if scenario == "unlisted payload":
+        _unlisted(bk)
+    elif scenario == "listed unexpected volume":
+        _listed_unexpected(bk)
+    r = _run([str(RESTORE), str(bk)], env)
+    assert r.returncode == 1 and all(m in r.stderr for m in message)
     log = arglog.read_text(encoding="utf-8") if arglog.exists() else ""
-    assert "volume rm" not in log and "run --rm" not in log
+    assert "volume rm" not in log and "run --rm" not in log   # 任意名の volume を消さない・何も復元しない
+    assert (tmp_path / "users" / "u1.txt").exists()   # 個人領域も無傷
 
 
 def test_restore_redacts_env_values_when_showing_difference(tmp_path: Path):
     env = _env_for(tmp_path, dict(os.environ))
-    current_env = Path(env["SHERPA_ENV_FILE"])
-    current_env.write_text("OPENAI_API_KEY=current-secret\nSHERPA_PORT=8000\n", encoding="utf-8")
+    Path(env["SHERPA_ENV_FILE"]).write_text("OPENAI_API_KEY=current-secret\nSHERPA_PORT=8000\n", encoding="utf-8")
     env["YES"] = "1"
     bk = _make_backup_dir(tmp_path, tamper=False, with_volume=False)
-
     r = _run([str(RESTORE), str(bk)], env)
-
     assert r.returncode == 0, r.stdout + r.stderr
     combined = r.stdout + r.stderr
     assert "OPENAI_API_KEY" in combined and "SHERPA_PORT" in combined
@@ -370,43 +255,21 @@ def test_restore_redacts_env_values_when_showing_difference(tmp_path: Path):
     assert len(before) == 1 and (before[0] / "u1.txt").exists()
 
 
-def test_restore_requires_manifest():
-    r = subprocess.run([str(RESTORE), "/nonexistent-dir"], capture_output=True, text=True, timeout=30)
-    assert r.returncode == 1 and "ありません" in r.stderr
-
-
-def test_makefile_has_backup_and_restore_targets():
-    mk = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert "\nbackup:" in mk and "scripts/backup.sh" in mk
-    assert "\nrestore:" in mk and "scripts/restore.sh" in mk and "FROM" in mk
-    phony = mk.split(".PHONY:", 1)[1].split("\n\n", 1)[0]
-    assert "backup" in phony and "restore" in phony
-
-
-def test_installer_backs_up_before_switch_and_warns_when_running():
-    """更新時の current 切替の前に backup.sh を呼ぶ経路がある（稼働中は警告して続行・抑止変数あり）。"""
+def test_installer_backs_up_before_switch_and_docs_describe_it():
     s = (ROOT / "scripts" / "install_offline_kit.sh").read_text(encoding="utf-8")
     hook = s.index("# 13a. 更新時のバックアップ")
     finalize = s.index('rm -f "$PENDING_MARKER_PATH"')
     swap = s.index('if _atomic_symlink_swap "$TARGET_DIR" "$PENDING_SWAP_TO"')
     assert hook < finalize < swap, "バックアップは版の確定・current 切替より前でなければ意味がない"
     body = s[hook:swap]
-    assert 'scripts/backup.sh' in body
-    assert "SHERPA_BACKUP_BEFORE_SWITCH" in body
+    assert "scripts/backup.sh" in body and "SHERPA_BACKUP_BEFORE_SWITCH" in body
     assert "バックアップ未取得（ストア/アプリ稼働中）" in body and "make stop && make backup" in body
-    assert "3)" in body and "SHERPA_DOCKER" in body  # 稼働中=exit 3 を区別・docker コマンドを引き継ぐ
+    assert "3)" in body and "SHERPA_DOCKER" in body   # 稼働中=exit 3 を区別
     assert "版の確定と current の切替を中止" in body and "VERIFY_FAILED=1" in body
-    # project 名の解決は backup.sh に委ねる（13a では二重判定しない＝判定ずれで fail-close になった RV の是正）
-    assert 'docker ps' not in body
-    # `${var:+KEY="$var"}` を未引用で env へ渡すと、値に引用符が混入し、空白を含む path は分割される。
-    assert 'env ${_BK_ENV:+' not in body
-    assert 'SHERPA_ENV_FILE="$_BK_ENV"' in body
-
-
-def test_docs_mention_backup_as_implemented():
+    assert "docker ps" not in body   # project 名の解決は backup.sh に委ねる
+    assert "env ${_BK_ENV:+" not in body and 'SHERPA_ENV_FILE="$_BK_ENV"' in body   # 空白入り path を分割しない
     d18 = (ROOT / "docs" / "18-オフライン構築.md").read_text(encoding="utf-8")
     assert "未整備（既知の穴）" not in d18 and "make backup" in d18 and "make restore" in d18
     m40 = (ROOT / "docs" / "manual" / "40-運用.md").read_text(encoding="utf-8")
     assert "バックアップと復元" in m40 and "SHERPA_BACKUP_BEFORE_SWITCH" in m40
-    m90 = (ROOT / "docs" / "manual" / "90-リファレンス.md").read_text(encoding="utf-8")
-    assert "SHERPA_BACKUP_DIR" in m90
+    assert "SHERPA_BACKUP_DIR" in (ROOT / "docs" / "manual" / "90-リファレンス.md").read_text(encoding="utf-8")

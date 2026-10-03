@@ -480,7 +480,7 @@ def test_redact_url_for_error_returns_none_on_empty_host():
 
 
 # ---------------------------------------------------------------------------
-# `ollama_url_fingerprint`（catchup_v2 の tamper 検知が使う正規化 host:port 指紋）
+# `ollama_url_fingerprint`（正規化 host:port 指紋）
 # ---------------------------------------------------------------------------
 
 

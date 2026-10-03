@@ -576,18 +576,18 @@ def test_settings_isolation_and_api_keys_not_returned(monkeypatch, _personal_key
     c1 = _login(u1, p1)
     c2 = _login(u2, p2)
     # openai_model/ollama_model は個人設定に無い（管理者のカタログだけで決まる）ため、user 別の
-    # 隔離は他の個人設定項目（system_prompt）でも確認する。
+    # 隔離は他の個人設定項目（codex_model_provider）でも確認する。
     r1 = c1.put(
         "/settings",
         json={
             "agent": "openai",
             "openai_api_key": openai_key,
             "gemini_api_key": gemini_key,
-            "system_prompt": f"u1-prompt-{sfx}",
+            "codex_model_provider": "ollama",
         },
     )
     assert r1.status_code == 200, r1.text
-    r2 = c2.put("/settings", json={"agent": "ollama", "system_prompt": f"u2-prompt-{sfx}"})
+    r2 = c2.put("/settings", json={"agent": "simple", "codex_model_provider": "openai"})
     assert r2.status_code == 200, r2.text
 
     s1 = c1.get("/settings")
@@ -596,8 +596,8 @@ def test_settings_isolation_and_api_keys_not_returned(monkeypatch, _personal_key
     d1, d2 = s1.json(), s2.json()
     assert d1["openai_key_set"] is True
     assert d2["openai_key_set"] is False
-    assert d1["system_prompt"] == f"u1-prompt-{sfx}"
-    assert d2["system_prompt"] == f"u2-prompt-{sfx}"
+    assert d1["codex_model_provider"] == "ollama"
+    assert d2["codex_model_provider"] == "openai"
 
     all_public = json.dumps({"u1": d1, "u2": d2, "config2": c2.get("/config").json()}, default=str)
     assert openai_key not in all_public

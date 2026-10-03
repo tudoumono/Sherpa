@@ -1,11 +1,10 @@
-"""Canonical Evidence IRの最小共通契約（E2a spike）。
+"""Canonical Evidence IR の最小共通契約。
 
-原本要素を早期に自然文へ畳み込まず、値、原本位置、親子、関係、coverageを分離して保持する。
-XLSX/DOCX/PPTX/PDFで共通に使うfieldだけをcoreへ置き、形式固有のanchor、座標系、operator等は
-``Locator.extension``と``EvidenceElement.extension``へ名前空間を保ったまま残す。
-
-このschemaは現行``document-ir-v2``を置換しない並行spikeである。World名や絶対pathを含めず、同じ
-原本bytesとparser profileから同じbyte列を生成できることを優先する。
+原本要素を自然文へ畳み込まず、値・原本位置・親子・関係・coverage を分けて保持する。
+XLSX/DOCX/PPTX/PDF で共通の field だけを core に置き、形式固有の anchor・座標系は
+``Locator.extension``/``EvidenceElement.extension`` へ名前空間を保って残す。
+資料フォルダ名や絶対パスは含めず、同じ原本 bytes と parser profile から同じ byte 列を生成する。
+設計: docs/design/rag.md「OCR（非同期・隔離ワーカー）」
 """
 from __future__ import annotations
 
@@ -35,10 +34,8 @@ CONTENT_BASES = frozenset({
     "none",
 })
 
-# ``intentionally_ignored`` is the only coverage state that deliberately omits
-# bytes from the searchable representation.  Keep the allowed classifier result
-# in the schema contract as well as in ``evidence_spike`` so a future parser (or
-# a hand-built IR) cannot silently relabel a content-bearing part as auxiliary.
+# ``intentionally_ignored`` は検索表現から意図的に外す唯一の coverage 状態。
+# 許可する (検知種別, 理由) をスキーマ側でも固定し、内容を持つ part を補助扱いに偽装させない。
 INTENTIONALLY_IGNORED_CONTRACT = frozenset({
     ("package_content_types", "package_support_part"),
     ("package_relationships", "package_support_part"),
@@ -50,7 +47,7 @@ INTENTIONALLY_IGNORED_CONTRACT = frozenset({
 
 @dataclass(frozen=True)
 class EvidenceSource:
-    """path identityから分離した原本contentの識別情報。"""
+    """パス同一性から分離した原本 content の識別情報。"""
 
     file_type: str
     content_hash: str
@@ -58,7 +55,7 @@ class EvidenceSource:
 
 @dataclass(frozen=True)
 class Locator:
-    """原本へ機械的に戻るための共通locatorと形式別extension。"""
+    """原本へ機械的に戻るための共通 locator と形式別 extension。"""
 
     part: str
     page: int | None = None
@@ -72,7 +69,7 @@ class Locator:
 
 @dataclass(frozen=True)
 class CoverageItem:
-    """検知したpart/object/regionをsilent dropしないための処理結果。"""
+    """検知した part/object/region を黙って落とさないための処理結果。"""
 
     coverage_id: str
     scope: str
@@ -86,13 +83,13 @@ class CoverageItem:
 
     @property
     def reason(self) -> str:
-        """v1alpha1参照元を壊さず、理由の権威をreason_codeへ一本化する。"""
+        """理由は reason_code が正。"""
         return self.reason_code
 
 
 @dataclass(frozen=True)
 class EvidenceElement:
-    """原本から決定的に得た1要素。意味上の断定はrelation/view側へ分離する。"""
+    """原本から決定的に得た 1 要素。意味上の断定は relation/view 側で扱う。"""
 
     element_id: str
     type: str
@@ -108,7 +105,7 @@ class EvidenceElement:
 
 @dataclass(frozen=True)
 class EvidenceRelation:
-    """要素間の観測可能な関係。推測した自然文はここへ入れない。"""
+    """要素間の観測可能な関係。推測した自然文は入れない。"""
 
     relation_id: str
     type: str
@@ -130,7 +127,7 @@ class EvidenceIR:
 
 
 def validation_errors(ir: EvidenceIR) -> list[str]:
-    """参照整合性とcoverage全分類を検査する。"""
+    """参照整合性と coverage 全分類を検査する。"""
     errors: list[str] = []
     if ir.schema_version != EVIDENCE_IR_SCHEMA_VERSION:
         errors.append("schema_version")
@@ -197,7 +194,7 @@ def validation_errors(ir: EvidenceIR) -> list[str]:
 
 
 def to_json_str(ir: EvidenceIR) -> str:
-    """検証済みIRを決定的JSONへ直列化する。"""
+    """検証済み IR を決定的 JSON へ直列化する。"""
     errors = validation_errors(ir)
     if errors:
         raise ValueError("invalid Evidence IR: " + ",".join(errors))
@@ -209,7 +206,7 @@ def _compact(value: Any) -> str:
 
 
 def make_coverage_id(scope: str, detected_kind: str, locator: Locator) -> str:
-    """scope・検知種別・原本位置からcoverage IDを決定生成する。"""
+    """scope・検知種別・原本位置から coverage ID を決定生成する。"""
     payload = "\n".join(_compact(value) for value in (scope, detected_kind, asdict(locator)))
     return "coverage:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
@@ -224,7 +221,7 @@ def _array_parts(values):
 
 
 def _json_parts(ir: EvidenceIR):
-    """sort_keys相当のroot順で、巨大配列を全dict化せず決定的JSON片へ展開する。"""
+    """sort_keys 相当の root 順で、巨大配列を全 dict 化せず決定的 JSON 片へ展開する。"""
     yield '{"coverage":'
     yield from _array_parts(ir.coverage)
     yield ',"elements":'
@@ -241,7 +238,7 @@ def _json_parts(ir: EvidenceIR):
 
 
 def write_json_atomic(path: str | Path, ir: EvidenceIR) -> Path:
-    """Evidence IRを全体文字列へ複製せず、同一directoryのtmpへstreamして原子置換する。"""
+    """Evidence IR を同一ディレクトリの tmp へ stream して原子置換する。"""
     errors = validation_errors(ir)
     if errors:
         raise ValueError("invalid Evidence IR: " + ",".join(errors))
@@ -261,7 +258,7 @@ def write_json_atomic(path: str | Path, ir: EvidenceIR) -> Path:
 
 
 def from_json_str(raw: str) -> EvidenceIR:
-    """決定的JSONを型付きEvidence IRへ戻し、参照整合性も再検証する。"""
+    """決定的 JSON を型付き Evidence IR へ戻し、参照整合性も再検証する。"""
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("Evidence IR must be a JSON object")

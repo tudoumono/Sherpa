@@ -29,10 +29,10 @@
   .armrow .arm-t{font-weight:600;font-size:var(--text-label);color:var(--ink)}
   .armrow .arm-d{font-size:var(--text-small);color:var(--ink-3);margin-top:2px}
   .armrow code{font-size:var(--text-caption);color:var(--ink-3)}
-  /* 旧形式変換バックエンド（W0） */
+  /* 旧形式変換バックエンド */
   #legacy-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
   #legacy-lo-missing{margin-top:8px}
-  /* 視覚読み取りの VLM 設定（⑤） */
+  /* 視覚読み取りの VLM 設定 */
   #vlm-block{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
   .vlm-field{display:flex;align-items:center;gap:10px;margin-bottom:10px}
   .vlm-field .vlm-l{font-size:var(--text-label);color:var(--ink);min-width:88px}
@@ -171,7 +171,6 @@
         <button class="tab-btn" type="button" role="tab" data-tab="research" aria-selected="false" id="tab-btn-research" aria-controls="tabpanel-research" tabindex="-1">調査・回答<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-research" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="models" aria-selected="false" id="tab-btn-models" aria-controls="tabpanel-models" tabindex="-1">使えるモデル<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-models" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="ingest" aria-selected="false" id="tab-btn-ingest" aria-controls="tabpanel-ingest" tabindex="-1">取り込み<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-ingest" hidden></span></button>
-        <button class="tab-btn" type="button" role="tab" data-tab="usage" aria-selected="false" id="tab-btn-usage" aria-controls="tabpanel-usage" tabindex="-1">利用統計の AI<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-usage" hidden></span></button>
         <button class="tab-btn" type="button" role="tab" data-tab="extkeys" aria-selected="false" id="tab-btn-extkeys" aria-controls="tabpanel-extkeys" tabindex="-1">外部連携<span class="tab-dot" title="未保存の変更" aria-label="未保存の変更" id="tab-dot-extkeys" hidden></span></button>
         <div class="tab-group-title tab-group-operations" role="presentation">運用・管理</div>
         <button class="tab-btn" type="button" role="tab" data-tab="users" aria-selected="false" id="tab-btn-users" title="利用者の追加・無効化・権限の変更。" aria-controls="tabpanel-users" tabindex="-1">ユーザー管理</button>
@@ -186,9 +185,9 @@
         <div class="card sec" id="cloud-card">
           <div class="card-head"><span class="title">AIプロバイダ（クラウド）</span></div>
           <div class="body">
-            <div class="hint" style="margin-bottom:10px">クラウドの AI は1つだけ選べます（同時に複数は使いません）。
-              選んでいない側のキーは消えずに残りますが使われません。ローカル AI（Ollama）は別枠でいつでも併用できます。</div>
-            <div id="cloud-provider-radios"><!-- JS が描画: openai/gemini/bedrock ラジオ --></div>
+            <div class="hint" style="margin-bottom:10px">クラウドの AI は OpenAI（Azure OpenAI を含む）を使います。ローカル AI（Ollama）は別枠でいつでも併用できます。</div>
+            <div class="hint danger" id="cloud-retired-warn" hidden></div>
+            <div id="cloud-provider-radios"><!-- JS が描画: クラウド AI のラジオ --></div>
 
             <div id="cloud-key-block" style="margin-top:14px">
               <label class="vlm-field"><span class="vlm-l" id="cloud-key-label">キー</span>
@@ -224,16 +223,6 @@
                     外部に送られるのは調べものの検索語だけで、社内資料そのものが外部へ送られることはありません。
                     検索は OpenAI 側の仕組みで実行されるため、このサーバーから一般のインターネットへ
                     新たに通信することもありません（必要なのは普段どおりの OpenAI への接続だけです）。</div></span>
-              </label>
-            </div>
-
-            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
-              <label class="vlm-cloud">
-                <input type="checkbox" id="openai-direct-visible">
-                <span><span class="arm-t">OpenAI 直結を利用者の構成一覧に出す</span>
-                  <div class="arm-d">オフ（既定）のとき OpenAI 系は Codex（OpenAI）に一本化され、利用者の実行構成
-                    一覧に「OpenAI」（直結）は表示されません。既に OpenAI 直結を選んでいる利用者の設定は
-                    そのまま有効に動きます（一覧外の現在値として表示）。</div></span>
               </label>
             </div>
 
@@ -318,10 +307,8 @@
           </div>
         </div>
 
-        <!-- 同時実行の上限（背景実行の受付・sherpa/chat_turns.py::effective_limits）。
-             チャットの送信（背景実行のターン）を同時にいくつまで受け付けるかの上限です。
-             空欄のままなら環境設定の初期値（.env）が使われます。このタブの「既定に戻す」ボタン
-             （上の cloud-card 内）がこのカードの項目も一緒に既定へ戻す。 -->
+        <!-- 同時実行の上限。チャットの送信（背景実行のターン）を同時にいくつまで受け付けるかの上限。空欄なら組み込みの既定が使われる。 -->
+        <!-- このタブの「既定に戻す」ボタンがこのカードの項目も一緒に既定へ戻す。 -->
         <div class="card sec" id="chat-max-turns-card">
           <div class="card-head"><span class="title">同時実行の上限</span></div>
           <div class="body">
@@ -342,8 +329,26 @@
           </div>
         </div>
 
-        <!-- チャット画面のクイック入力例（ウェルカム画面のチップ・sherpa/chat_examples.py）。
-             導入先ごとに例文を差し替えられるようにする（既定は組み込みの4例）。 -->
+        <!-- 個人ファイル（作業領域）。利用者がアップロードするファイルの 1 件あたりの上限と保持日数。空欄なら組み込みの既定が使われる。 -->
+        <div class="card sec" id="workspace-card">
+          <div class="card-head"><span class="title">個人ファイル（作業領域）</span></div>
+          <div class="body">
+            <div class="hint" style="margin-bottom:10px">利用者が自分の作業領域へアップロードするファイルと、Codex が作成した成果物の扱いです。
+              保持日数を過ぎたファイルは自動で削除されます。空欄のままなら組み込みの既定が使われます。</div>
+
+            <label class="vlm-field"><span class="vlm-l">1 件あたりのアップロード上限（MB）</span>
+              <input type="number" id="workspace-max-mb" min="1" max="1024" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="workspace-max-mb-hint" style="margin:-8px 0 14px"></div>
+
+            <label class="vlm-field"><span class="vlm-l">保持日数（0 は無期限）</span>
+              <input type="number" id="workspace-ttl-days" min="0" max="3650" step="1" style="max-width:160px">
+            </label>
+            <div class="hint" id="workspace-ttl-days-hint" style="margin:-8px 0 6px"></div>
+          </div>
+        </div>
+
+        <!-- チャット画面のクイック入力例（ウェルカム画面のチップ）。導入先ごとに例文を差し替えられる（既定は組み込みの4例）。 -->
         <div class="card sec" id="chat-examples-card">
           <div class="card-head"><span class="title">チャットの質問例（クイック入力）</span></div>
           <div class="body">
@@ -405,7 +410,7 @@
               <p class="hint">Codex 本体の考えさせる量に適用します。深さを変えてもこの値は変わりません。「作成」は専用の環境設定を使います。</p>
               <label class="vlm-field"><span class="vlm-l">Codex の考えさせる量（作成以外）</span>
                 <select id="depth-base-codex-reasoning" style="max-width:200px">
-                  <option value="">環境設定の既定に従う</option>
+                  <option value="">既定に従う</option>
                   <option value="minimal">minimal</option>
                   <option value="low">low</option>
                   <option value="medium">medium</option>
@@ -438,24 +443,10 @@
           </div>
         </section>
         <section class="research-group" aria-labelledby="research-api-heading">
-          <h2 id="research-api-heading">API 専用</h2>
+          <h2 id="research-api-heading">取り込み・検索の共通設定</h2>
           <div class="card sec" id="api-investigation-card">
-            <div class="card-head"><span class="title">API での追加調査</span></div>
+            <div class="card-head"><span class="title">埋め込みの同時送信数</span></div>
             <div class="body">
-              <p class="hint">AI が検索・読み取りを指示し、Sherpa が結果を返すやり取りを繰り返します。
-                探索の反復回数は OpenAI（API）・ローカル（Ollama）の下調べ役と回答をまとめる AI に適用します。</p>
-              <label class="vlm-field"><span class="vlm-l">探索の反復回数（基準値）</span>
-                <input type="number" id="depth-base-max-turns" min="1" max="200" step="1" style="max-width:160px">
-              </label>
-              <div class="hint" id="depth-base-max-turns-hint" style="margin:-8px 0 14px"></div>
-
-              <label class="vlm-field"><span class="vlm-l">1回の AI 応答で実行するツール数の上限</span>
-                <input type="number" id="agentic-max-tools-per-turn" min="1" max="256" step="1" style="max-width:160px">
-              </label>
-              <div class="hint" id="agentic-max-tools-per-turn-hint" style="margin:-8px 0 6px"></div>
-              <p class="hint">OpenAI・Ollama・Gemini・Bedrock 用（Codex は対象外）。1質問の累計ではなく、1応答ごとの上限です。
-                超過時は上限まで実行して調査を打ち切ります。「深く」「最大」でも固定です。</p>
-
               <label class="vlm-field"><span class="vlm-l">埋め込みの同時送信数</span>
                 <input type="number" id="embed-parallel" min="1" max="16" step="1" style="max-width:160px">
               </label>
@@ -464,13 +455,10 @@
                 プロバイダ側の同時実行/レート制限に早く当たることがあります。保存した値は次に開始する取り込みから反映されます。</p>
             </div>
           </div>
-          <!-- BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4）: AI が検索で1回に読み込む
-               情報量（予算）。既定は精度優先（絞らない）——費用を抑えたいときだけ管理者が明示的に下げる。
-               この画面が唯一の真実源（env 経由の指定は ENV-CLEAN・2026-09-03 で撤去済み）。 -->
           <div class="card sec" id="agentic-budget-card" tabindex="-1">
-            <div class="card-head"><span class="title">API の調査で受け取る情報量</span></div>
+            <div class="card-head"><span class="title">Codex の調査で受け取る情報量</span></div>
             <div class="body">
-              <div class="hint" style="margin-bottom:10px">API 経路で検索・読み取りなどのツールから受け取る情報量を制限します（Codex 内部は対象外）。
+              <div class="hint" style="margin-bottom:10px">Codex が検索・読み取りなどの Sherpa のツールから受け取る、結果1件あたりの情報量を制限します。
                 「前後の行数」は読む範囲、この設定は結果のデータ量の上限です。行数の範囲内でも、この上限で切り詰める場合があります。
                 空欄は既定値を使います。1KB＝1024バイトです。</div>
               <div class="hint">ページ数は、文章中心のA4資料を1ページ約1,000字として換算した目安です。図表・コード・ファイル名などの付加情報によって変わります。</div>
@@ -479,20 +467,11 @@
                 <input type="number" id="agentic-budget-per-result" min="1" max="8192" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="agentic-budget-per-result-hint" style="margin:-8px 0 14px"></div>
-
-              <label class="vlm-field"><span class="vlm-l">追加調査1回の累計上限（KB）</span>
-                <input type="number" id="agentic-budget-total" min="4" max="65536" step="1" style="max-width:160px">
-              </label>
-              <div class="hint" id="agentic-budget-total-hint" style="margin:-8px 0 6px"></div>
-              <div class="hint">累計は、追加調査の開始から終了までに受け取った結果の合計です。同じ箇所を再取得した分も含みます。上限を超えると、その時点までの内容で回答をまとめます
-                （調べきれなかった旨も併せて伝えます）。</div>
-              <div class="hint">目安として、累計上限は1件あたりの上限の16倍程度（既定 256KB:4096KB と同じ比率）を推奨します。累計が1件あたりを下回る組み合わせは保存できません（エラーになります）。</div>
-
             </div>
           </div>
         </section>
         <section class="research-group" aria-labelledby="research-shared-heading">
-          <h2 id="research-shared-heading">Codex・OpenAI・ローカルに共通</h2>
+          <h2 id="research-shared-heading">Codex の資料検索・関係探索</h2>
           <div class="card sec" id="search-investigation-card">
             <div class="card-head"><span class="title">共通の資料検索・関係探索</span></div>
             <div class="body">
@@ -501,19 +480,19 @@
                 <input type="number" id="depth-base-grep-max-hits" min="1" max="1000" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-grep-max-hits-hint" style="margin:-8px 0 14px"></div>
-              <p class="hint">OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+              <p class="hint">Codex が資料を調べる機能に適用します。</p>
 
               <label class="vlm-field"><span class="vlm-l">1回に読み取る前後の行数（基準値）</span>
                 <input type="number" id="depth-base-read-window" min="10" max="400" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-read-window-hint" style="margin:-8px 0 14px"></div>
-              <p class="hint">OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+              <p class="hint">Codex が資料を調べる機能に適用します。</p>
 
               <label class="vlm-field"><span class="vlm-l">内容の質問（仕様問い合わせ）のヒット件数上限（基準値）</span>
                 <input type="number" id="depth-base-qa-max-hits" min="1" max="1000" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-qa-max-hits-hint" style="margin:-8px 0 14px"></div>
-              <p class="hint">Codex・OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+              <p class="hint">Codex が資料を調べる機能に適用します。</p>
 
               <p class="hint"><b>以下の二つの段数は、揃える必要はありません。</b>原因調査は関係の向きを限定しないため、同じ段数でも探索範囲が広がりやすくなります。範囲を広げたい調査の項目だけ調整してください。</p>
               <p class="hint">1段は直接つながる箇所まで、2段はその先まで。段数を増やすと、候補数や処理時間が増えることがあります。</p>
@@ -521,14 +500,14 @@
                 <input type="number" id="depth-base-impact-depth" min="1" max="64" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-impact-depth-hint" style="margin:-8px 0 14px"></div>
-              <p class="hint">Codex・OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+              <p class="hint">Codex が資料を調べる機能に適用します。</p>
               <p class="hint">変更箇所から、呼び出し・参照などを影響が及ぶ方向にたどり、影響先の候補を探します。</p>
 
               <label class="vlm-field"><span class="vlm-l">原因調査でたどる段数（基準値）</span>
                 <input type="number" id="depth-base-troubleshoot-depth" min="1" max="16" step="1" style="max-width:160px">
               </label>
               <div class="hint" id="depth-base-troubleshoot-depth-hint" style="margin:-8px 0 14px"></div>
-              <p class="hint">Codex・OpenAI（API）・ローカル（Ollama）の資料を調べる機能に適用します。</p>
+              <p class="hint">Codex が資料を調べる機能に適用します。</p>
               <p class="hint">症状文から関連箇所を見つけ、周囲の関係と資料から原因の手がかりを集めます。候補はその後の調査に使い、この処理だけで原因を確定しません。</p>
             </div>
           </div>
@@ -572,7 +551,7 @@
             <!-- 高度な設定（旧形式変換・視覚読み取り）はこのタブの「詳細」折りたたみ1箇所にまとめる。 -->
             <details class="adv">
               <summary>詳細設定</summary>
-              <!-- 旧形式（.doc/.xls/.ppt）の変換バックエンド（W0: none/libreoffice・W1: office_com） -->
+              <!-- 旧形式（.doc/.xls/.ppt）の変換バックエンド（none/libreoffice/office_com） -->
               <div id="legacy-block" hidden style="margin-top:0;border-top:none;padding-top:0">
                 <div class="arm-t">旧形式（.doc / .xls / .ppt）の変換</div>
                 <div class="hint" style="margin-bottom:8px">Word / Excel / PowerPoint の<b>古い形式</b>のファイルを、
@@ -583,7 +562,7 @@
                 <div class="hint danger" id="legacy-oc-missing" hidden><!-- JS が描画: Office 連携ワーカー不達時の案内 --></div>
               </div>
 
-              <!-- ⑤（feedback-batch-2026-07-08）: 視覚読み取り（markitdown_ocr）の VLM 設定 -->
+              <!-- 視覚読み取り（markitdown_ocr）の VLM 設定 -->
               <div id="vlm-block" hidden>
                 <div class="arm-t">視覚読み取りの AI</div>
                 <div class="hint" style="margin-bottom:8px">上の「画像・スキャン文書を AI が見て読み取り（視覚読み取り）」を
@@ -612,8 +591,7 @@
           </div>
         </div>
 
-        <!-- L5（2026-09-02-RAG表現の全形式展開と文脈保持.md §8.6-1・U1）: rag.md の LLM 成形トグル。
-             既定 off（2026-09-05 裁定）。ON にすると取り込み後に自動実行され利用料が発生するため、費用の存在を平文で明示する。 -->
+        <!-- rag.md の LLM 成形トグル（既定 off）。ON にすると取り込み後に自動実行され利用料が発生するため、費用の存在を平文で明示する。 -->
         <div class="card sec" id="rag-llm-render-card">
           <div class="card-head"><span class="title">検索用文書の読みやすい整形</span></div>
           <div class="body">
@@ -642,26 +620,6 @@
 
       </div>
 
-      <!-- ===== タブ4: 利用量 ===== -->
-      <div class="tabpanel" id="tabpanel-usage" data-tabpanel="usage" role="tabpanel" aria-labelledby="tab-btn-usage" tabindex="0" hidden>
-        <!-- STAT-2: 利用統計チャット専用の AI 選択（利用者の実行構成には依存しない・管理者全体で統一）。 -->
-        <div class="card sec" id="usage-chat-ai-card" hidden>
-          <div class="card-head"><span class="title">利用統計チャットに使う AI</span></div>
-          <div class="body">
-            <div class="hint" style="margin-bottom:10px">利用統計画面のチャット欄（統計について
-              質問する）が使う AI です。利用者ごとのチャットの AI の設定とは別に、ここで選びます。
-              利用統計画面側で「今回だけ」一時的に切り替えることもできます（この設定自体は
-              変わりません）。</div>
-            <div id="usage-chat-ai-radios"><!-- JS が描画: 実行構成に合わせる/openai/ollama の3択ラジオ --></div>
-            <div class="hint" id="usage-chat-ai-status"><!-- JS: 固定中/連動中と、実際に使われる値の案内 --></div>
-            <div class="sec-actions">
-              <button class="btn-ghost" data-reset-tab="usage" type="button">このタブを既定に戻す</button>
-              <span class="tres muted" id="tab-reset-res-usage"></span>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <!-- ===== タブ5: 外部連携（API キー） ===== -->
       <div class="tabpanel" id="tabpanel-extkeys" data-tabpanel="extkeys" role="tabpanel" aria-labelledby="tab-btn-extkeys" tabindex="0" hidden>
         <div class="card sec" id="ext-keys-card">
@@ -684,7 +642,7 @@
             <div class="hint" id="ext-keys-user-quota-default-hint" style="margin:-8px 0 14px"></div>
 
             <label class="vlm-field" style="margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:14px">
-              <span class="vlm-l">AI 下調べ検索（外部からの検索呼び出し）の既定 AI</span>
+              <span class="vlm-l">簡易回答に使う AI（チャットの簡易・外部 API 共通）</span>
               <select id="ext-research-default-provider" style="max-width:260px">
                 <option value="ollama">ローカル（Ollama・既定）</option>
                 <option value="openai">クラウド（OpenAI）</option>
@@ -705,11 +663,8 @@
         </div>
       </div>
 
-      <!-- ===== 埋め込みタブ: ユーザー管理／利用統計／監査ログ／システム状態 =====
-           各ページを ?embed=1 で埋め込む（当該ページ側が自分のトップバー/ナビを隠す・
-           web/{admin-users,usage,audit,status}.js 冒頭）。初回選択時に data-src → src で
-           遅延ロードする（admin-settings.js::loadEmbedFrame）。単独アクセス（?embed 無しで
-           直接開く）は各ページとも従来どおり。 -->
+      <!-- ===== 埋め込みタブ: ユーザー管理／利用統計／監査ログ／システム状態 ===== -->
+      <!-- 各ページを ?embed=1 で埋め込む（当該ページ側が自分のトップバー/ナビを隠す）。初回選択時に data-src → src で遅延ロードする。 -->
       <div class="tabpanel tabpanel-embed" id="tabpanel-users" data-tabpanel="users" role="tabpanel" aria-labelledby="tab-btn-users" tabindex="0" hidden>
         <iframe class="embed-frame" id="embed-frame-users" title="ユーザー管理" data-src="admin-users.html?embed=1"></iframe>
       </div>

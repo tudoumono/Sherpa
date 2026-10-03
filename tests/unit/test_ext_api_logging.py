@@ -44,10 +44,10 @@ def _drive_lifespan_startup_and_shutdown(monkeypatch) -> None:
         "_seed_settings_from_env", "_purge_personal_keys_if_disabled_on_startup",
         "_warn_change_me_placeholders", "_warn_default_admin_password", "_auth_bootstrap_on_startup", "_warn_fixtures",
         "_warn_test_db_isolated", "_warn_codex_sandbox_disabled", "_warn_multi_worker_chat_turns",
-        "_warn_browse_roots_missing", "_start_poller", "_reconcile_orphans",
+        "_warn_browse_roots_missing", "_reconcile_orphans",
         "_sweep_expired_on_startup", "_backfill_turn_metrics_on_startup",
     ):
-        monkeypatch.setattr(api, name, lambda: None)
+        monkeypatch.setattr(api, name, lambda *_a: None)
 
     async def _drive():
         cm = _lifespan_cm(None)

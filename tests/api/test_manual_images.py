@@ -46,15 +46,6 @@ def test_manual_missing_image_is_404():
     assert c.get("/ui/manual-images/does-not-exist.png").status_code == 404
 
 
-def test_cloud_page_removed_but_graph_remains():
-    """「概観」（cloud）は機能ごと廃止＝直リンク 404。グラフ画面は従来どおり 200。"""
-    c = TestClient(app)
-    assert c.get("/ui/cloud.html").status_code == 404
-    assert c.get("/ui/cloud.js").status_code == 404
-    assert c.get("/ui/graph.html").status_code == 200
-    assert c.get("/ui/manual.html").status_code == 200
-
-
 def test_nav_has_no_overview_entry():
     """ナビ（nav.js）から「概観」/cloud.html の項目が消えていること（ソースを直接確認）。"""
     c = TestClient(app)

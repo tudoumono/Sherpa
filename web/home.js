@@ -1,5 +1,5 @@
 // トップ画面（運営掲示板）。GET /announcements で一覧表示、admin は同一画面で投稿・編集・削除・公開切替。
-// チャットへの導線は 1 クリック（.home-cta）＝タスク起点・チャット主入口の原則（04-画面の原則.md）を崩さない。
+// チャットへの導線は 1 クリック（.home-cta）。
 // セキュリティ: 本文は esc() 後に改行だけ <br> に変換（Markdown/HTML は一切描画しない＝XSS 回避）。
 'use strict';
 
@@ -27,9 +27,7 @@ function fmtDate(iso) {
   return fmtDateTime(iso, { dateOnly: true });
 }
 
-// S4: datetime-local input ⇄ ISO 8601（UTC）変換（公開/削除タイマー）。<input type=datetime-local> の値は
-// ブラウザのローカル時刻（実質 JST）として解釈される＝ new Date(value) で正しくローカル→UTC 変換できる
-// （S3 の時刻教訓＝素朴な文字列 slice は使わない）。
+// datetime-local input ⇄ ISO 8601（UTC）変換（公開/削除タイマー）。input の値はブラウザのローカル時刻として解釈されるため、new Date(value) でローカル→UTC 変換できる（文字列 slice は使わない）。
 function dtLocalToISO(value) {
   if (!value) return '';
   const d = new Date(value);
@@ -112,9 +110,7 @@ function renderPostForm() {
   $('pf-cancel').addEventListener('click', closePostForm);
 }
 
-// キャンセル・投稿成功の両方から使う共通の折りたたみ処理。消えるボタンの代わりに、
-// 再表示される開くボタンへ明示的にフォーカスを移す（DOM から消えた要素にはフォーカスできず
-// 何もしなければ body へ落ちてしまうため）。
+// キャンセル・投稿成功の両方から使う共通の折りたたみ処理。再表示される開くボタンへ明示的にフォーカスを移す（消えた要素にはフォーカスできず body へ落ちるため）。
 function closePostForm() {
   _postFormOpen = false;
   renderPostForm();
@@ -134,9 +130,7 @@ async function submitNewAnnouncement() {
   if (!body) { errEl.textContent = '本文は必須です'; return; }
   const btn = $('pf-submit');
   const cancelBtn = $('pf-cancel');
-  // 送信中はキャンセル・再送信を無効化する。無効化しないと、POST 待機中にキャンセルで
-  // フォーム DOM が破棄され、その後 POST が成功した際に `$('pf-title')` 等が null になり
-  // （一覧更新・成功通知が走らないまま）サーバには投稿済み＝二重投稿を誘発する。
+  // 送信中はキャンセル・再送信を無効化する（POST 待機中にフォーム DOM が破棄されると、成功時に `$('pf-title')` 等が null になり、投稿済みのまま二重投稿を誘発する）。
   btn.disabled = true;
   cancelBtn.disabled = true;
   try {
@@ -275,8 +269,7 @@ async function saveEdit(id) {
   if (!title) { if (errEl) errEl.textContent = 'タイトルは必須です'; return; }
   if (!body) { if (errEl) errEl.textContent = '本文は必須です'; return; }
   try {
-    // S4: このフォームは常に両方の日時欄を送る（未変更でも）。空欄は ""＝サーバ側で NULL クリアと解釈される
-    // （書込専用キーと同じ「未指定(省略)=変更しない・""=クリア」規約・空文字を明示的に送るのが重要）。
+    // このフォームは常に両方の日時欄を送る（未変更でも）。空欄は ""＝サーバ側で NULL クリアと解釈される（省略=変更しない・""=クリア）。
     const d = await api('PATCH', `/admin/announcements/${encodeURIComponent(id)}`,
       { title, body, category, pinned, publish_at: publishAt, expire_at: expireAt });
     _items = _items.map((a) => (a.id === id ? d.announcement : a));
@@ -327,10 +320,9 @@ $('ann-list').addEventListener('click', (e) => {
   if (delBtn) { deleteItem(Number(delBtn.dataset.delete)); return; }
 });
 
-// ===== 通知（NOTIFY-1・非同期処理の完了/要対応・掲示板とは別区画・既読管理なし） =====
-// 取り込み run の完了/失敗は誰でも見える。グラフ drift／LLM整形完了／OCR反映待ちは admin にだけ
-// サーバ側（GET /notifications）が返す——ここでは受け取った内容をそのまま出すだけで役割判定はしない。
-const NOTIF_POLL_MS = 45000;   // status.js の健全性ポーリングと同じ間隔（新しい常時ポーリングは追加しない）
+// ===== 通知（非同期処理の完了/要対応・掲示板とは別区画・既読管理なし） =====
+// 取り込み run の完了/失敗は誰でも見える。グラフ drift／LLM整形完了／OCR反映待ちは admin にだけサーバ側（GET /notifications）が返す。ここでは受け取った内容をそのまま出すだけで役割判定はしない。
+const NOTIF_POLL_MS = 45000;   // status.js の健全性ポーリングと同じ間隔
 const NOTIF_STATUS_ICON = { done: '✅', failed: '⚠️', warn: '⚠️' };
 let _notifTimer = null;
 
@@ -370,8 +362,7 @@ async function loadNotifications() {
   }
 }
 
-// 通知内の操作ボタン（再抽出を実行／更新する）。既存の資料フォルダ管理エンドポイントへ委譲するだけ
-// （POST /worlds/{wid}/extract・POST /worlds/{wid}/refresh）——ここに新しい変異ロジックは作らない。
+// 通知内の操作ボタン（再抽出を実行／更新する）。既存の資料フォルダ管理エンドポイント（POST /worlds/{wid}/extract・POST /worlds/{wid}/refresh）へ委譲するだけ。
 const notifList = $('notif-list');
 if (notifList) {
   notifList.addEventListener('click', async (e) => {

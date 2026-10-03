@@ -5,7 +5,7 @@
 すぎない（購読ゼロでもターンは完走・DB永続する）。`GET /chat/turns/running`／
 `POST /chat/turns/{turn_id}/stop` はそれぞれ一覧・停止。
 
-会話フローは要 Neo4j（graph-load 済）＋ Postgres 起動（test_chat_m8.py と同じ前提）。
+会話フローは要 Neo4j ＋ Postgres 起動（test_chat_m8.py と同じ前提）。
 """
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ import time
 import pytest
 from _world_setup import TEST_WORLD_ID, ensure_v1
 
-os.environ.setdefault("SHERPA_STREAM_PACE", "0")   # 既定は即時（テスト高速化・pace が要るテストは個別に monkeypatch）
 
 V = TEST_WORLD_ID
 

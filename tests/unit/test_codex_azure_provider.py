@@ -30,7 +30,6 @@ SET-2c（接続先の UI 移管）以降、接続先は env でなく `system_se
 """
 from __future__ import annotations
 
-import pathlib
 
 import pytest
 
@@ -644,43 +643,6 @@ def test_select_provider_azure_sandbox_enabled_explicit_still_wires(sysset, monk
     assert p._openai_api_key == "sk-real-azure-key"
 
 
-# ===== OpenAI 直結（Codex を介さない agent=openai）にも同じ既定値ガードを入れた =====
-
-def test_select_provider_openai_direct_ignores_personal_model_uses_catalog_default():
-    """個人設定の `openai_model` はもう読まれない＝管理者のカタログ既定（openai/chat）が使われる。
-    個人値とカタログ既定をわざと異なる値にする＝個人値参照が復活したらこのテストが落ちる。"""
-    from sherpa.providers import _select_provider
-
-    p = _select_provider({"agent": "openai", "openai_api_key": "sk-real-key",
-                          "openai_model": "personal-value-should-be-ignored"})
-    assert p.__class__.__name__ == "OpenAIProvider"
-    assert p.model == "gpt-5.5"   # 組み込み既定（個人値ではない）
-
-
-def test_select_provider_openai_direct_azure_default_model_is_unwired(sysset):
-    """「OpenAI 直結」構成でも、接続先が Azure 等で `openai_model` が既定値（"gpt-5.5"）のままなら
-    未接続を返す（Codex(OpenAI 互換) 構成と一貫させる）。"""
-    from sherpa.providers import _UnwiredProvider, _select_provider
-
-    _azure(sysset)
-    p = _select_provider({"agent": "openai", "openai_api_key": "sk-real-azure-key",
-                          "openai_model": "gpt-5.5"})
-    assert isinstance(p, _UnwiredProvider), "openai_model が既定値のままなのに OpenAIProvider が組み立てられた"
-    assert "デプロイ名" in p.howto
-
-
-def test_select_provider_openai_direct_azure_with_deployment_name_wires_provider(sysset):
-    """デプロイ名（管理者のカタログ・openai/chat の既定値と異なる値）が設定されていれば
-    従来どおり組み立てられる。"""
-    from sherpa.providers import _select_provider
-
-    _azure(sysset, model_catalog={"openai": {"chat": {"allowed": ["my-embed-chat-deployment"],
-                                                       "default": "my-embed-chat-deployment"}}})
-    p = _select_provider({"agent": "openai", "openai_api_key": "sk-real-azure-key"})
-    assert p.__class__.__name__ == "OpenAIProvider"
-    assert p.model == "my-embed-chat-deployment"
-
-
 def test_select_provider_ollama_construct_with_default_openai_model_is_unwired(sysset):
     """Codex(Ollama) で使えるモデルが既定の OpenAI 向けの名前のままなら、実行前に理由付きで止める。"""
     from sherpa.providers import _select_provider
@@ -688,4 +650,5 @@ def test_select_provider_ollama_construct_with_default_openai_model_is_unwired(s
     p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
                           "ollama_url": "http://localhost:11434"})
     assert p.__class__.__name__ == "_UnwiredProvider"
+
 

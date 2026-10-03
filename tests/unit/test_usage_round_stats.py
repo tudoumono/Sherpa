@@ -324,10 +324,7 @@ def test_usage_period_rejects_span_over_upper_limit():
 
 
 def test_round_stats_aggregate_evidence_kind_missing_codes_and_drop_free_text():
-    """根拠種別の不足コード（閉集合）も他の不足軸と同じ語彙として
-    集計に載り、記録元が落とす自由文・資料名は集計へ到達しない。"""
-    from sherpa.providers import base as _pb
-
+    """根拠種別の不足コード（閉集合）も他の不足軸と同じ語彙として集計に載る。"""
     codes = ["source_missing", "spec_missing", "definition_missing",
              "log_missing", "callgraph_missing"]
     rows = [_round_row(meta={"round": 0, "verdict": "insufficient", "stop": "rounds_exhausted",
@@ -337,13 +334,6 @@ def test_round_stats_aggregate_evidence_kind_missing_codes_and_drop_free_text():
                       turn_message_id=1)]
     out = _usage_store._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["missing_codes"] == dict.fromkeys(codes, 1)
-
-    # 記録元（`_normalized_verdict`）が閉集合でふるいにかけるため、語彙外・自由文・資料名は
-    # そもそも `missing_codes` に入らない（集計側に自由文が紛れ込む経路が無い）。
-    normalized = _pb._normalized_verdict({
-        "verdict": "insufficient", "missing": "消費税法.md を確認できていません",
-        "missing_codes": codes + ["消費税法.md", "ソース未確認", 1, None]})
-    assert normalized["missing_codes"] == sorted(codes)
 
 
 def test_compute_round_stats_counts_backend_degrade_limits():

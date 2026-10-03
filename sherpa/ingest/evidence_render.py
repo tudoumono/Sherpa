@@ -1,19 +1,15 @@
-"""Evidence IRとContext IRから内容中心のRAG用Markdown・構造chunkを同時生成する。
+"""Evidence IR と Context IR から、RAG 用 Markdown（rag.md）と構造 chunk を同時に生成する。
 
-値や関係をLLMで言い換えず、`〈項目〉: 「値」` の key-value 形式で決定的に直列化する（「である」文の
-自然文テンプレートは使わない＝値の境界を明示し断定文特有の誤り検出不能を避けるため）。検索文章は
-文書・論理領域・業務record key・field名と値を中心とし、セル番地やbboxはcitation metadataへ分離する。
-recordが文字数上限に収まる限り1chunkとし、超える場合だけ同じrecord keyを持つfield groupへ分割する。
+値や関係を LLM で言い換えず、`〈項目〉: 「値」` の key-value 形式で決定的に直列化する。
+検索文章は文書・論理領域・業務 record key・field 名と値を中心にし、セル番地や bbox は citation metadata へ分離する。
+record が文字数上限に収まる限り 1 chunk とし、超える場合だけ同じ record key を持つ field group へ分割する。
+画像は実 asset への相対 Markdown 記法と、位置・未解釈状態の自然文を併記する。
 
-Markdownは人間向け正本ではなくAI/RAG向けの搬送表示である。画像は実assetへの相対Markdown記法と、
-位置・未解釈状態の自然文を併記する。
-
-**RAG正本はMarkdown側（D1・`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md`§8.1）**:
-各chunkの本文直前に決定的なアンカー行 `<!-- chunk:{chunk_id} -->` を1行だけ出す（`_markdown`）。
-索引時（`es_index._validate_rag_chunks`）はこのアンカーでMarkdownを分割し、その本文をES索引対象に
-する。JSONL（`{rel}.rag_chunks.jsonl`）はもう検索本文（旧`search_text`）を持たない——citation・
-locator・隣接キー（B1）等の証跡専業サイドカーへ降格した。chunk_idはJSONLとMarkdownアンカーの
-双方を`_chunk_id_for_record`という同じ式で計算するため、生成時点で必ず1:1になる。
+RAG 正本は Markdown 側。各 chunk の本文直前に `<!-- chunk:{chunk_id} -->` のアンカー行を 1 行出し（`_markdown`）、
+索引時（`es_index._validate_rag_chunks`）はこのアンカーで Markdown を分割して ES 索引対象にする。
+JSONL（`{rel}.rag_chunks.jsonl`）は citation・locator・隣接キー等の証跡サイドカー。chunk_id は
+`_chunk_id_for_record` で JSONL とアンカーの双方が同じ式で計算するため、生成時点で 1:1 になる。
+設計: docs/design/rag.md「チャンク化の考え方」
 """
 from __future__ import annotations
 
@@ -114,8 +110,7 @@ def _cell_render_text(cell: evidence_ir.EvidenceElement) -> str:
 def _excel_value_note(metadata: dict[str, Any] | None) -> str:
     """material な Excel メタデータを改行区切りの key-value 行として返す（呼び出し側は `+=` 直結）。
 
-    非空時は先頭に `\n` を含める（呼び出し側が改行を挟まないため）。material でなければ `""`
-    （改行も付けない＝余分な空行を作らない）。
+    非空時は先頭に `\n` を含める。material でなければ `""`。
     """
     if metadata is None or not _excel_value_is_material(metadata):
         return ""
@@ -147,10 +142,8 @@ def _excel_value_is_material(metadata: dict[str, Any]) -> bool:
     )
 
 
-# L4a（可視性・廃止表現の表示側・提案書§2.3）: L3/S1/Z が Evidence IR へ載せた
-# `extension["visibility_reason"]` の平文ラベル対応表。ここに無い reason（None・未知値）は
-# `_field_piece`/`_element_piece` 側の既存フォールバック（生の `visibility`/`lifecycle` 値）に譲る
-# ＝この表に載っている reason だけ、生の enum 値の代わりにこのラベルを出す。
+# 可視性・廃止表現の表示側: `extension["visibility_reason"]` の平文ラベル対応表。
+# ここに無い reason（None・未知値）は生の `visibility`/`lifecycle` 値に譲る。
 _VISIBILITY_REASON_LABELS: dict[str, str] = {
     "occluded_by_picture": "画像に覆われている",
     "occluded_by_shape": "図形に覆われている",
@@ -167,11 +160,10 @@ _VISIBILITY_REASON_LABELS: dict[str, str] = {
 
 
 def _occlusion_kv_lines(extension: dict[str, Any]) -> list[str]:
-    """`extension`（cell/element いずれも同じキー語彙）から可視性・廃止表現のkey-value行を作る。
+    """`extension`（cell/element 共通のキー語彙）から可視性・廃止表現の key-value 行を作る。
 
-    意味の断定はしない（`occluded_by`/`covered_by_text` の前面テキストをそのまま写すだけ・
-    `docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §2.3）。生の reason 文字列
-    （`occluded_by_picture` 等）は `_VISIBILITY_REASON_LABELS` で平文へ写像し、rag.md には出さない。
+    意味の断定はしない（`occluded_by`/`covered_by_text` の前面テキストをそのまま写す）。
+    生の reason 文字列（`occluded_by_picture` 等）は `_VISIBILITY_REASON_LABELS` で平文へ写像し、rag.md には出さない。
     """
     lines: list[str] = []
     reason = extension.get("visibility_reason")
@@ -671,8 +663,7 @@ def _coverage_notice_records(ir: evidence_ir.EvidenceIR, source_name: str) -> li
         )
         if safe_reference_detail:
             semantic += f" 画像relationshipの安全化済み情報は{reference_text.removeprefix(', ')}である。"
-        # MEM-2: サイズ/セル数系ガードは実測値を平文に含める（利用者向けの一報の質・入口ガードの
-        # 上限値と実測値が両方分かって初めて「分割する」等の対処判断ができる）。
+        # サイズ/セル数系ガードは実測値を平文に含める（上限値と実測値が分かれば対処を判断できる）
         detail = item.detail if isinstance(item.detail, dict) else {}
         if reason == "cell_count_exceeded":
             measured, cap = detail.get("measured_cells"), detail.get("cap_cells")
@@ -1111,9 +1102,8 @@ def _element_piece(
     exact = _value_text(element.value)
     excel_metadata = _excel_value_metadata(element)
     shape_fill_assets = _shape_fill_assets(source_name, element)
-    # 基底文に続く付随情報（relation叙述文/ExcelノートKV/状態KV/shape-fill asset説明）。
-    # `_non_table_records`の長文分割で本文だけのsemantic/markdownに上書きされた際、
-    # 先頭chunkへ引き継ぐための複製（自己完結契約＝断片だけでも要素の全体像が分かる）。
+    # 基底文に続く付随情報（relation 叙述文/Excel ノート KV/状態 KV/shape-fill asset 説明）。
+    # `_non_table_records` の長文分割で本文だけに上書きされた際、先頭 chunk へ引き継ぐための複製。
     metadata_tail = ""     # semanticへの追加分（markdownはこれ+markdown_tail）
     markdown_tail = ""     # markdown固有の追加分（画像リンク等・semanticには載せない）
     section_text = "の".join(section_path) if section_path else _section(element.locator)[0]
@@ -1193,8 +1183,8 @@ def _element_piece(
         if relation_texts:
             metadata_tail += "\n" + "。".join(relation_texts) + "。"
         metadata_tail += _excel_value_note(excel_metadata)
-        # L4a: `visibility_reason`に平文ラベルの対応があれば、生の`visibility`値の代わりにそれを出す
-        # （`occlusion_lines`が可視性行を持つ場合は`state_texts`側の可視性行を出さない＝二重表現の回避）。
+        # `visibility_reason` に平文ラベルの対応があれば、生の `visibility` 値の代わりにそれを出す
+        # （`occlusion_lines` が可視性行を持つ場合は `state_texts` 側の可視性行を出さない）
         occlusion_lines = _occlusion_kv_lines(element.extension) if include_native_metadata else []
         occlusion_has_visibility = any(line.startswith("可視性:") for line in occlusion_lines)
         state_texts = []
@@ -1381,21 +1371,15 @@ def _pptx_object_aliases(
             continue
         target = native
         if native.type in {"table", "group"}:
-            # 束ね先は「実際に RAG レコードとして出力される要素」に限る。
-            #   - 入れ子の group など `_CONTAINER_TYPES` は出力されない
-            #   - 空セルも表レコードに出力されない
-            # どちらを選んでも alias の引用が消え、`element_coverage_missing` で文書ごと
-            # RAG 表現を作れなくなる（実測 2026-08-15・pptx 4件）。本文を持つ要素だけを候補にする。
+            # 束ね先は実際に RAG レコードとして出力される要素（本文を持つ要素）に限る。
+            # 入れ子の group など `_CONTAINER_TYPES` と空セルは出力されず、alias の引用が消えて `element_coverage_missing` になる。
             candidates = [
                 item for item in children.get(native.element_id, [])
                 if item.type not in _CONTAINER_TYPES and _value_text(item.value)
             ]
             if not candidates:
-                # 束ね先が container（table/group）のままだと `_non_table_records` が
-                # `_CONTAINER_TYPES` として除外するため、束ねた alias の引用がどこにも出ず
-                # `element_coverage_missing` で文書ごと失敗する（実測 2026-08-15: 装飾図形だけの
-                # グループを持つ pptx 4件が RAG 表現を作れず failed notice へ縮退していた）。
-                # 束ね先が出力されないときは**抑制せず元の要素をそのまま残す**（情報を落とさない）。
+                # 束ね先が container のままだと `_non_table_records` が除外し、alias の引用が出なくなる。
+                # 束ね先が出力されないときは抑制せず、元の要素をそのまま残す。
                 continue
             target = min(candidates, key=lambda item: item.order)
         aliases[target.element_id].append(alias)
@@ -1491,9 +1475,8 @@ def _non_table_records(
                 )
                 markdown = semantic
                 if index == 0:
-                    # relation叙述文/ExcelノートKV/状態KV/shape-fill asset説明は要素1件につき
-                    # 1回で足りる情報のため、分割後の先頭chunkにだけ引き継ぐ（全chunkへ複製すると
-                    # 内容が重複する）。markdown固有の画像リンク等は`markdown_tail`で別途復元する。
+                    # relation 叙述文/Excel ノート KV/状態 KV/shape-fill asset 説明は要素 1 件につき 1 回で足りるため、
+                    # 分割後の先頭 chunk にだけ引き継ぐ（markdown 固有の画像リンク等は `markdown_tail` で復元する）。
                     semantic += metadata_tail
                     markdown += metadata_tail + markdown_tail
                 pieces.append({
@@ -1693,20 +1676,15 @@ def _figure_text_records(
     return records
 
 
-# `llm_render._is_ai_observation_body`と同型の本文マーカー——LLM成形（rag.mdの平文しか見えない）が
-# 構造化されたrecord kindの代わりにこの行でフロー図recordを識別し、Mermaidコードを書き換え対象から
-# 除外できるようにする。L9時点ではllm_render.py側の配線は未着手（他レーンが同ファイルを並行編集中の
-# ため触れない）——このマーカーは将来1行の追加で接続できる形にするための備え。
+# フロー図 record を識別する本文マーカー（`llm_render._is_ai_observation_body` と同型）
 FLOW_DIAGRAM_BODY_MARKER = "フロー図（機械生成・Mermaid）"
 
 
 def _flow_diagram_records(ir: evidence_ir.EvidenceIR, ctx: context_ir.ContextIR) -> list[dict]:
-    """コンテナ（シート/スライド）単位で、図形＋コネクタからMermaid flowchartを1recordにする（L9・R3）。
+    """コンテナ（シート/スライド）単位で、図形＋コネクタから Mermaid flowchart を 1 record にする。
 
-    既存の要素単位record（`_non_table_records`）は変更しない——ノード/コネクタ要素は既にそちらで
-    個別にcitation済みであり、本recordは追加の可視化表現。ただし過去に図形を束ねた表現で
-    citationが漏れRAG表現全体が破綻した事故があるため（`_pptx_object_aliases`のコメント参照）、
-    図を構成する全要素（ノード＋未接続分を含む全コネクタ）を自己完結でcitationする。
+    既存の要素単位 record（`_non_table_records`）は変えず、追加の可視化表現として出す。
+    図を構成する全要素（ノード＋未接続分を含む全コネクタ）を自己完結で citation する。
     """
     elements = {element.element_id: element for element in ir.elements}
     containers = [element for element in ir.elements if element.type in {"sheet", "slide"}]
@@ -1810,21 +1788,15 @@ def _flow_diagram_records(ir: evidence_ir.EvidenceIR, ctx: context_ir.ContextIR)
 
 
 def _chunk_id_for_record(source_hash: str, record: dict) -> str:
-    """recordの決定的chunk_id。`_finalize_chunks`（jsonl）と`_markdown`（rag.mdアンカー）の
-    双方が同じ式で計算するため、生成時点で必ず1:1になる（§8.1・D1のアンカー方式）。"""
+    """record の決定的 chunk_id。`_finalize_chunks`（jsonl）と `_markdown`（rag.md アンカー）が同じ式で計算し、1:1 になる。"""
     return _stable_id("rag-chunk", source_hash, record["record_id"], RAG_CHUNKER_VERSION)
 
 
 def _apply_hidden_sheet_visibility(records: list[dict], ir: evidence_ir.EvidenceIR) -> None:
-    """非表示シート（`sheet` 要素の `hidden_sheet`/`very_hidden`）を、そのシート由来の全レコードへ
-    KV 行として伝播する（提案A・§2.3）。
+    """非表示シート（`sheet` 要素の `hidden_sheet`/`very_hidden`）を、そのシート由来の全レコードへ KV 行として伝播する。
 
-    `sheet` 要素はコンテナ型でレコード化されないため、シート単位の非表示はこの伝播が無いと
-    rag.md のどこにも現れない——「廃止した旧版シート」を非表示にする運用が検索で見分けられず、
-    可視シートの記述と同格に引用されてしまう。cell/element 自身の `visibility_reason`（覆い・
-    取り消し線等）とは独立の行として**各レコードに**足す（チャンクは断片単独で自己完結する契約の
-    ため、シート先頭の1レコードだけに付けるのでは足りない）。意味の断定はしない（非表示という
-    事実だけを平文で述べる）。
+    `sheet` 要素はレコード化されないため、伝播が無いと非表示であることが rag.md に現れない。
+    チャンクは断片単独で自己完結するため、シート先頭だけでなく各レコードに足す。非表示という事実だけを平文で述べる。
     """
     hidden: dict[str, str] = {}
     for element in ir.elements:
@@ -1956,9 +1928,7 @@ def _markdown(
         ])
     last_section: tuple[str, ...] | None = None
     for record in records:
-        # D1（rag.mdを正本にする・§8.1）: このchunkの見出し類より前にアンカーを置く——
-        # 索引時（`es_index`）はアンカー間（次のアンカー直前まで）をこのchunkの索引本文にするため、
-        # 見出し（## section/### key）もこのchunkの検索文脈として含まれる。
+        # このチャンクの見出し類より前にアンカーを置く（索引時はアンカー間をチャンクの索引本文にし、見出しも検索文脈に含める）
         chunk_id = _chunk_id_for_record(ir.source.content_hash, record)
         lines.append(f"<!-- chunk:{chunk_id} -->")
         section = tuple(record["section_path"])
@@ -2059,8 +2029,7 @@ def validation_errors(ir: evidence_ir.EvidenceIR, result: RenderedEvidence) -> l
     # renderer自身がMarkdown pipe tableを作らない。原値中のliteral pipeは保存対象なので禁止しない。
     if any(line.startswith("| ") and line.endswith(" |") for line in result.markdown.splitlines()):
         errors.append("generated_pipe_table")
-    # D1: rag.mdのアンカーとjsonlのchunk_idは生成時点で必ず1:1（`_chunk_id_for_record`を双方が
-    # 同じ式で呼ぶため）。崩れていたら生成ロジック自体のバグであり、ES側の縮退に任せず生成時に落とす。
+    # rag.md のアンカーと jsonl の chunk_id は 1:1 でなければならない（崩れていたら生成時に落とす）
     anchor_ids = set(re.findall(r"^<!-- chunk:(\S+) -->$", result.markdown, flags=re.MULTILINE))
     chunk_ids = {chunk["chunk_id"] for chunk in result.chunks}
     if anchor_ids != chunk_ids:

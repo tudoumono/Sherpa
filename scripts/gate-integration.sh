@@ -61,7 +61,7 @@ if [ "${#ONLY_ARGS[@]}" -gt 0 ]; then
     [ "$_a" = "-q" ] && continue
     _FILTERED_ONLY_ARGS+=("$_a")
   done
-  ONLY_ARGS=("${_FILTERED_ONLY_ARGS[@]}")
+  ONLY_ARGS=(${_FILTERED_ONLY_ARGS[@]+"${_FILTERED_ONLY_ARGS[@]}"})
 fi
 
 # --only の境界（tests/integration 配下のみ）。worktree/venv/DB より先に検証する＝境界違反を
@@ -100,16 +100,16 @@ fi
 
 # --- integration 専用ロック（ブロッキング・fail-closed） -----------------------------------
 echo "=== integration ($LANE): 専用ロック待ち ($(date +%H:%M:%S))"
-exec {LOCK_FD}>"$GATE_INTEGRATION_LOCKFILE"
-if ! flock "$LOCK_FD"; then
+if ! _gate_lock_take "$GATE_INTEGRATION_LOCKFILE" wait 201; then
   echo "integration ($LANE): 専用ロックの取得に失敗しました（${GATE_INTEGRATION_LOCKFILE}）" >&2
   exit 1
 fi
+LOCK_FD=$GATE_LOCK_FD
 echo "=== integration ($LANE): 専用ロック確保 ($(date +%H:%M:%S))"
 
 # --- 同時実行数のスロット確保（上限2・gate-lane.sh と合計で共有・空くまでブロッキングで待つ） ---
 echo "=== integration ($LANE): スロット待ち ($(date +%H:%M:%S))"
-gate_acquire_lane_slot
+gate_acquire_lane_slot || exit 1
 echo "=== integration ($LANE): スロット ${GATE_SLOT_INDEX}/${#GATE_LANE_SLOT_LOCKS[@]} を確保 ($(date +%H:%M:%S))"
 GATE_HELD_FDS=("$GATE_NAMED_LOCK_FD" "$LOCK_FD" "$GATE_SLOT_FD")
 

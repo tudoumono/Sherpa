@@ -155,11 +155,11 @@ apt_offline_install() {
     mode="files"
     [ -f "$kit_root/Packages" ] || note "$desc: 索引（$kit_root/Packages）が無い旧キットのため ./*.deb 列挙で導入します。"
   fi
-  simlog="$(mktemp)"
+  simlog="$(mktemp "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   before="$(_apt_offline_kernel_snapshot)"
 
   if [ "$mode" = repo ]; then
-    tmpd="$(mktemp -d)"
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
     mkdir -p "$tmpd/lists/partial"
     # sources.list の一行形式は空白で区切るため、パスに空白/%/#/? があると誤解釈される（実測: 空白入りで
     # 「File not found - …/dists/…」）。URI としてパーセントエンコードして書く。

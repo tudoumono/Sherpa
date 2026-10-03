@@ -237,62 +237,6 @@ def test_resolve_none_still_passes_through_the_check():
     assert stop_kind.resolve({"busy": True}) is None
 
 
-# ===== 下調べ役 catch-all は例外の型（timeout/transport_error）を優先して立てる =====
-# 従来は `agentic_failure` を "insufficient"/"error" に固定し `from_exception` を一度も呼ばず、
-# 下調べ役（Ollama 等）の read timeout が固定値 "error" に丸められていた。
-
-def test_agentic_run_catchall_marks_timeout_from_sub_loop_exception():
-    from sherpa.providers.base import Ctx, _GenProvider
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _sub_agentic_loop(self, ctx, request_claims=True):
-            raise TimeoutError("下調べ役が応答しない")
-            yield {}   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
-
-    p = _P()
-    p._sub = {"provider": "openai", "key": "sk-x", "url": None, "model": "gpt-5.4-mini",
-              "tools": frozenset({"ripgrep_search"}), "guard": {"min_citations": 1, "max_turns": 6,
-                                                                "llm_timeout": 60},
-              "profile_id": "search-helper-openai", "description": "", "name": "下調べ役"}
-    ctx = Ctx(message="バッチ停止の記録は？", world="v1", knowledge=True,
-              route=lambda m: {"lens": "qa", "reason": "t", "input": m},
-              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
-              make_sources=lambda docs: [{"doc_id": d} for d in docs])
-    events = list(p.run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["agentic_failure"] == "timeout", (
-        f"下調べ役のタイムアウトが固定値 'error' に丸められている: {env!r}")
-    assert stop_kind.resolve(env) == "timeout"
-
-
-# ===== 単発清書フォールバックは型が特定できない例外でも completed 扱いにしない =====
-# 従来は `stop_kind.from_exception` が None を返す例外（HTTPError の 401/429/5xx・JSON デコード
-# エラー等）は無印のまま `resolve()` に渡り "completed" として数えられていた。
-
-def test_single_shot_fallback_marks_unclassified_stream_exception_as_error():
-    from sherpa.providers.base import Ctx, _GenProvider
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _stream(self, prompt, completion=None):
-            raise ValueError("型を特定できないストリーム例外")
-            yield ""   # pragma: no cover - ジェネレータにするためのダミー yield（到達しない）
-
-    p = _P()
-    ctx = Ctx(message="こんにちは", world="v1", knowledge=True,
-              route=lambda m: {"lens": "author", "reason": "t", "input": m},
-              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
-              make_sources=lambda docs: [{"doc_id": d} for d in docs])
-    events = list(p.run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["agentic_failure"] == "error", (
-        f"型を特定できない例外が無印のまま completed に落ちている: {env!r}")
-    assert stop_kind.resolve(env) is None
-
-
 def test_from_exception_follows_one_level_of_cause():
     try:
         try:

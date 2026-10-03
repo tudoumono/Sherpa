@@ -482,16 +482,16 @@ def test_settings_isolated_per_user():
     l1 = client.post("/auth/login", json={"username": u1, "password": p1})
     l2 = client.post("/auth/login", json={"username": u2, "password": p2})
 
-    # u1 の settings を更新（system_prompt は個人設定の自由入力欄・値の一意性で隔離を確認できる）。
+    # u1 の settings を更新（codex_model_provider は個人設定の欄・u2 に波及しないことを確認する）。
     put1 = client.put("/settings",
-                      json={"system_prompt": f"prompt-{sfx}"},
+                      json={"codex_model_provider": "ollama"},
                       cookies=l1.cookies)
     assert put1.status_code == 200
 
     # u2 の settings は影響なし
     get2 = client.get("/settings", cookies=l2.cookies)
     assert get2.status_code == 200
-    assert get2.json()["system_prompt"] != f"prompt-{sfx}"
+    assert get2.json()["codex_model_provider"] != "ollama"
 
 
 def test_audit_row_written_for_login_and_share():

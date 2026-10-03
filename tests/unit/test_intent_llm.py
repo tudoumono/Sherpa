@@ -75,15 +75,6 @@ def test_cfg_model_catalog_override(monkeypatch):
     assert cfg["provider"] == "openai"
 
 
-def test_cfg_intent_model_default_unchanged(monkeypatch):
-    """個人設定の `intent_model` はもう読まれない＝消費側のハードコード既定のまま。"""
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
-    cfg = I._cfg({"openai_api_key": "test-key"})
-    assert cfg["model"] == "gpt-4o-mini"
-    cfg = I._cfg({"openai_api_key": "test-key", "intent_model": "ignored-value"})
-    assert cfg["model"] == "gpt-4o-mini"
-
-
 def test_cfg_returns_none_for_invalid_cloud_provider(monkeypatch, caplog):
     """`cloud_provider`（A7）が非空の不正値のとき、黙って既定（openai）へ倒れたキーで意図分類を
     送信しない＝`_cfg` は既存契約どおり None（`classify` は clarify へ縮退）に寄せる

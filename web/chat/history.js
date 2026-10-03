@@ -1,20 +1,6 @@
-// フェーズ6 S6（リファクタリング計画）: 会話履歴ドメイン（会話一覧の組み立て・open/new/rename/pin/delete・
-// 背景実行の再購読）を chat.js から純移動。export は chat.js 側に残る呼び出し元（$('convlist')/
-// $('newbtn')/$('conv-title') の delegate リスナー・init の deep-link 分岐・window.__sherpaChatTest
-// シーム）から参照される loadConversations/deleteConversation/togglePin/renameConversation/
-// newConversation/openConversation/resumeRunningTurn/syncConvParam のみに絞る（_ownConvHTML/_receivedConvHTML/
-// unsubscribeTurn は loadConversations/newConversation/openConversation の内部専用のため非公開のまま）。
-// newConversation/openConversation は render/scope/stream の複数ドメインを跨ぐオーケストレータ＝
-// welcome/appendUser/appendAssistantRaw/appendAnswer/attachTraceButton/renderTurnStack は render.js
-// から import。S7（リファクタリング計画）: setSendButtonStopping/startFlow/subscribeTurn/resetFlow/
-// _questionAnswerState/appendRestoredQuestion は chat.js から web/chat/stream.js へ純移動したため
-// import 元をそちらへ更新（history.js↔stream.js の意図した循環 import・関数宣言＝hoisted のため
-// 実行時に呼ぶ限り ESM で安全＝render.js の setRt・share-dialog.js の copyText と同じパターン）。
-// S8（リファクタリング計画）: renderScopePanel/setScopeLabel/applyConversationScope は
-// chat.js から web/chat/scope.js へ純移動したため import 元をそちらへ更新した（history.js↔scope.js
-// の意図した循環 import は発生しない＝scope.js は history.js を import しないため片方向）。
-// updateShareButtonState/toast はどのドメインにも属さない横断ユーティリティのため引き続き
-// chat.js 側に残り `import {...} from '../chat.js'` する（chat.js↔history.js の意図した循環 import）。
+// 会話履歴の一覧組み立て、会話の開く・新規・名前変更・ピン止め・削除、実行中ターンの再購読を担う。
+// 設計: docs/design/chat.md「会話の保存と継続」
+// stream.js・scope.js・render.js・chat.js とは関数宣言の hoist を前提に相互 import する（実行時に呼ぶ限り安全）。
 'use strict';
 
 import { S } from './state.js';
@@ -29,13 +15,13 @@ import { renderScopePanel, setScopeLabel, applyConversationScope, setKb } from '
 import { resetInquiryForNewConversation, applyInquiryOpenDefault } from './inquiry.js';
 import { toast, updateShareButtonState } from '../chat.js';
 
-const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime, getJSON = Sherpa.getJSON;   // 共通ユーティリティ（common.js）
+const $ = Sherpa.$, esc = Sherpa.esc, fmtDateTime = Sherpa.fmtDateTime, getJSON = Sherpa.getJSON;
 
 // ===== 会話履歴 =====
 
-// 受領共有行を組み立て（読み取り専用・pin/削除のみ・状態ラベル付き）
+// 受領共有行の HTML（読み取り専用・pin/削除のみ・状態ラベル付き）
 function _receivedConvHTML(c) {
-  // ID は必ず整数に正規化（data-* 属性に入れるので非数値を防ぐ）。
+  // id は data-* に入れるため整数に正規化する。
   const id = Number(c.id);
   const date = esc(fmtDateTime(c.received_at || c.updated_at));
   const status = c.share_status;              // active / expired / revoked / unavailable
@@ -67,12 +53,12 @@ function _receivedConvHTML(c) {
    </div>`;
 }
 
-// 所有会話行を組み立て（全操作可・共有ボタン付き）
+// 所有会話行の HTML（全操作可・共有ボタン付き）
 function _ownConvHTML(c) {
-  // ID は必ず整数に正規化（data-* 属性に入れるので非数値を防ぐ）。
+  // id は data-* に入れるため整数に正規化する。
   const id = Number(c.id);
   const date = esc(fmtDateTime(c.updated_at));
-  // SH-1: フォークで複製した会話は出所（○○さんの共有・日時）を編集不可の表示として残す。
+  // 引き継いだ会話は出所（共有元の名前・日時）を表示する。
   const f = c.forked_from;
   const forkedFromLine = f
     ? `<span class="d forked-from">出所: ${esc(f.name || f.user_id)}さんの共有（${esc(fmtDateTime(f.at))}）</span>` : '';
@@ -92,9 +78,8 @@ function _ownConvHTML(c) {
    </div>`;
 }
 
-// 一覧の取得は重なり得る（初期表示・送信の受付・回答の終了）。成功した結果のうち、後から始めた取得のものだけを
-// 描く（遅れて届いた古い結果で、新しい会話を含む一覧を上書きしない）。取得に失敗したら今の一覧を残し、
-// まだ何も描いていないときだけ空の案内を出す（PG 未起動など・成功の世代は進めない）。
+// 会話一覧を取得して描く。取得が重なったときは後から始めた取得の結果だけを描く。
+// 失敗時は今の一覧を残し、まだ何も描いていないときだけ空の案内を出す。
 let _convListGen = 0, _convListShown = 0;
 export async function loadConversations() {
   const myGen = ++_convListGen;
@@ -107,7 +92,7 @@ export async function loadConversations() {
     if (myGen < _convListShown) return;
     _convListShown = myGen;
   }
-  // origin で分割: own / received_share
+  // origin で自分の会話と共有された会話に分ける
   const own = list.filter((c) => !c.origin || c.origin === 'own');
   const received = list.filter((c) => c.origin === 'received_share');
 
@@ -124,7 +109,7 @@ export async function loadConversations() {
   } else {
     html = '<div class="muted" style="font-size:var(--text-small);padding:6px">会話はまだありません</div>';
   }
-  // 操作後の再描画でも、フォーカスを同じ会話か次の履歴へ保つ。
+  // 再描画後もフォーカスを同じ会話（無ければ近い行）へ戻す
   const focused = document.activeElement;
   const focusedRow = focused.closest('#convlist .conv');
   const rowIndex = focusedRow ? [...$('convlist').querySelectorAll('.conv')].indexOf(focusedRow) : -1;
@@ -138,14 +123,14 @@ export async function loadConversations() {
   }
 }
 
-export async function deleteConversation(id) {                 // #6: 確認してから削除（連鎖でメッセージも消える）
+export async function deleteConversation(id) {                 // 確認してから削除（メッセージも消える）
   if (!confirm('このチャット履歴を削除します。元に戻せません。よろしいですか？')) return;
   try { const r = await fetch('/conversations/' + id, { method: 'DELETE' }); if (!r.ok) throw new Error(r.status); }
-  catch (e) { toast('削除に失敗しました'); return; }   // 失敗（404/403等）は成功扱いにしない
+  catch (e) { toast('削除に失敗しました'); return; }
   if (id === S.cid) newConversation(); else loadConversations();
   toast('履歴を削除しました');
 }
-export async function togglePin(id, pinned) {                  // #8: ピン止め/解除（上部に表示）
+export async function togglePin(id, pinned) {                  // ピン止め/解除
   try {
     const r = await fetch('/conversations/' + id + '/pin', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned }) });
@@ -166,65 +151,43 @@ export async function renameConversation(id, current) {        // 履歴タイ�
   loadConversations(); toast('名前を変更しました');
 }
 
-// 背景実行（覗き窓方式）: 別会話へ移動・新規会話などで購読を外すのは「購読解除」だけでよい
-// （ターンはサーバ側 background thread で続く＝この機能の主目的そのもの）。旧 UI フィードバック1の
-// 頃は EventSource がターンの実体を兼ねていたため停止要求も併走させていたが、現在は明示的な
-// 「■ 停止」ボタン（stopStream()）だけがサーバへ停止要求を送る。
+// 会話遷移の共通経路。購読を解除する（ターン自体はサーバ側で続く・停止は「■ 停止」だけ）。
 function unsubscribeTurn() {
-  // 会話遷移（新規チャット・会話切替・削除後の遷移は newConversation 経由）の共通経路。S.es が
-  // 既に null（onerror が先着済みだが、その停止 POST 自体はまだ結果待ち／開始 POST の応答待ち中
-  // ＝send() が S.sending を立てた直後でまだ subscribeTurn に到達していない）でも、保留中の
-  // 停止・開始いずれの遅延結果も遷移先の画面の #rt・思考枠を後から上書きしないよう、ここで必ず
-  // 世代を進めて無効化する。
+  // ① 保留中の停止・開始の遅延結果が遷移先の画面を上書きしないよう世代を進める
   invalidateStopContext();
-  // `S.sending`（開始 POST 応答待ち中の二重送信ガード）も必ず解除する——ここで戻さないと、
-  // 旧 POST の応答が届く（＝ send() 自身が S.sending=false する）まで新しい画面で一切送信できない
-  // （旧 POST が応答しない/失敗さえしなければ実質恒久的に送信不能になる）。旧 POST が後から
-  // 届いても世代照合（turnGen）で結果は破棄される＝ここで先に解除しても二重送信にはならない。
+  // ② 開始 POST 応答待ちの二重送信ガードを解除する（旧応答は世代照合で破棄される）
   S.sending = false;
-  // 送信 UI（ボタンの disabled／aria-busy）は S.es の有無に関わらず必ず遷移先の既定状態へ戻す
-  // （開始 POST 応答待ち中に遷移した場合、send() 自身は `$('send').disabled = true` を立てた
-  // ままここへ来るため、S.es が無いからと戻さずに抜けるとボタンが押せないまま新しい画面に残る）。
+  // ③ 送信 UI は S.es の有無に関わらず既定状態へ戻す
   setSendButtonStopping(false);
   $('messages').setAttribute('aria-busy', 'false');
   if (!S.es) return;
   S.es.close(); S.es = null;
 }
-// 開いている会話の番号をアドレス欄（?conv=）に出す（運用で活動記録を会話番号で引くため）。閲覧の可否は
-// サーバ側が本人の会話かを確かめる＝番号が見えても他人は開けない。戻る履歴は積まない（replaceState）。
+// 開いている会話の番号をアドレス欄（?conv=）に出す。戻る履歴は積まない（replaceState）。
 export function syncConvParam(cid) {
   try {
     const url = new URL(location.href);
     if (cid) url.searchParams.set('conv', String(cid)); else url.searchParams.delete('conv');
     if (url.href !== location.href) history.replaceState(history.state, '', url);
-  } catch (_) { /* アドレス欄の更新は補助＝失敗しても会話の表示は続ける */ }
+  } catch (_) { /* アドレス欄の更新は補助 */ }
 }
 export function newConversation() {
   unsubscribeTurn();
   S.cid = null; $('conv-title').textContent = '新しい会話';
   syncConvParam(null);
-  // SC-6e: 遅延中の /world-options 応答（chat.js の pendingConvWorld 後追い経路）が、後から
-  // 届いたときに旧会話の範囲/調べ方/検索経路トグル等を新規会話へ誤って再適用しないよう、
-  // ここで両方 null にする（後追い経路は S.pendingConvWorld が null なら何もしない）。
+  // 遅延中の /world-options 応答が旧会話の設定を新規会話へ再適用しないよう null にする
   S.pendingConvWorld = null; S.currentScopeMeta = null;
   S.scope = []; if (S.scopeTree) renderScopePanel(S.scopeTree); setScopeLabel('全体');   // 範囲を全体に戻す
-  // 資料参照は新規会話で既定ON（決定2026-09-19）に戻す——直前に開いていた会話が lens=chat
-  // （資料参照OFF）だった場合、`welcome()` 到達前の openConversation 復元（scope.js:61）が
-  // S.kb を false のまま残していたため、新規会話がその状態を引き継いでしまっていた。ただし
-  // 資料フォルダが1つも登録されていないと確定している環境（chat.js の /world-options 読込が
-  // 空で返り S.kbForcedOff=true になった場合）では無条件ONに戻すと素の雑談まで 404 になる
-  // （chat.js::setKb(false) 分岐と同じ判定）。`S.verLabels` の空チェックだと「まだ読込中／
-  // 読込失敗（未確認）」も「空で確定」と誤認して選択肢がある環境でも OFF になり得るため、
-  // 明示フラグ `S.kbForcedOff`（読込成功かつ空のときだけ true）だけを見る（RV是正）。
+  // 資料参照は既定ONに戻す（資料フォルダが未登録と確定している S.kbForcedOff のときだけOFF）
   setKb(!S.kbForcedOff);
-  resetInquiryForNewConversation();   // SC-6b: 調べ方/探す対象も自動・両方に戻し、ブロックを開く
-  S.convHasPersonal = false; updateShareButtonState();   // Feature C: 新規会話は共有可能状態にリセット
-  updateForkButtonState(null);   // SH-1: 新規会話は「引き継いで質問」対象外
+  resetInquiryForNewConversation();   // 調べ方/探す対象を自動・両方に戻す
+  S.convHasPersonal = false; updateShareButtonState();
+  updateForkButtonState(null);
   welcome(); resetFlow(); loadConversations();
 }
 
-// SH-1（引き継いで質問）: 受領共有を開いた画面でだけボタンを出す（無効・個人ブロックの共有は除く）。
-// `data` は GET /conversations/{cid} の応答（`openConversation` から渡す）か、対象外なら null。
+// 「引き継いで質問」ボタンを、受領共有を開いた画面でだけ出す（無効・個人ブロックの共有は除く）。
+// data は GET /conversations/{cid} の応答。対象外は null。
 function updateForkButtonState(data) {
   const btn = $('forkbtn');
   if (!btn) return;
@@ -239,7 +202,7 @@ function updateForkButtonState(data) {
   }
 }
 
-// SH-1: 受領共有ラッパー wid を自分の会話として複製し、そのまま開く。
+// 受領共有 wid を自分の会話として複製し、そのまま開く。
 export async function forkConversation(wid) {
   let d;
   try {
@@ -251,32 +214,26 @@ export async function forkConversation(wid) {
   await openConversation(d.conversation_id);
 }
 export async function openConversation(cid) {
-  // 会話取得が成功するまで画面遷移を確定しない＝ unsubscribeTurn（世代の無効化を含む）は
-  // 取得成功後に呼ぶ（取得失敗時は今の画面に留まる＝暫定「停止しました」等の訂正待ちを
-  // 無効化してしまわないため）。
+  // 取得が成功してから購読を解除する（失敗時は今の画面に留まる）
   const data = await getJSON(`/conversations/${cid}`);
   unsubscribeTurn();
   S.cid = cid; $('conv-title').textContent = data.conversation.title || '会話';
   syncConvParam(cid);
   $('messages').innerHTML = '';
-  // Feature C: 会話の contains_personal_workspace フラグを反映。
+  // 個人コンテンツ参照済みフラグを反映
   S.convHasPersonal = !!(data.conversation && data.conversation.contains_personal_workspace);
   updateShareButtonState();
-  updateForkButtonState(data);   // SH-1: 引き継いで質問ボタンの表示切替
-  // UIフィードバック（2026-07-03・RV再検証 HIGH#1）: 右ペインに全ターンを時系列で積み上げ表示するため、
-  // **user 発言ごとにターンを起こす**（clarify/停止等で assistant 応答が無いターンも取りこぼさない）。
-  // 直後に assistant が来ればその trace を紐づけ、来なければ trace:null（「（記録なし）」）のまま残す。
-  const turns = [];   // [{question, time, trace}]（trace は無ければ null＝「（記録なし）」表示）
-  const qState = _questionAnswerState(data.messages);   // S1: 保存された確認カードの回答済み判定・操作可否
+  updateForkButtonState(data);
+  // 右ペインの積み上げ表示用に、user 発言ごとにターンを作り、直後の assistant 応答の trace を紐づける。
+  const turns = [];   // [{question, time, trace}]（trace 無しは null＝「（記録なし）」）
+  const qState = _questionAnswerState(data.messages);   // 確認カードの回答済み判定・操作可否
   data.messages.forEach((m, mi) => {
     if (m.role === 'user') {
       appendUser(m.content);
       turns.push({ question: m.content, time: m.created_at, trace: null });
       return;
     }
-    // S1（ask_user-improvements.md）: 保存された確認カード（answer.question）は askcard を再構築する
-    // （回答済みは選択内容つき・disabled、未回答の最新カードのみ操作可能）。受領共有では store 側で
-    // question を伏せているため、question が無い clarify メッセージ＝確認のやり取りのプレースホルダを出す。
+    // 保存された確認カードを再構築する（回答済みは disabled・未回答の最新だけ操作可）。question の無い clarify はプレースホルダ。
     let el;
     if (m.answer && m.answer.question) {
       el = appendRestoredQuestion(m.answer.question, qState.answered[mi], mi === qState.operableIdx);
@@ -286,65 +243,43 @@ export async function openConversation(cid) {
       el = appendAnswer(m.answer, m.id, m.trace, m.feedback);
     }
     let turn = turns[turns.length - 1];
-    if (!turn) { turn = { question: null, time: null, trace: null }; turns.push(turn); }   // 想定外の保険
-    turn.time = m.created_at || turn.time;   // 回答時刻の方が有益なので上書き
+    if (!turn) { turn = { question: null, time: null, trace: null }; turns.push(turn); }
+    turn.time = m.created_at || turn.time;
     turn.trace = (m.trace && m.trace.length) ? m.trace : null;
-    // EXT-4（拡張設計 §10）: trace_version は answer envelope 側（`m.answer.trace_version`）に付く
-    // （messages.trace 自体は v1/v2 とも配列のまま・§2.3）。無ければ v1 として描画する。
+    // trace_version は answer 側に付く（無ければ v1）
     turn.traceVersion = (m.answer && m.answer.trace_version === 2) ? 2 : 1;
-    // 終了理由（`deriveTraceStopReason`）は answer.data.evidence_packet を見るため、
-    // trace 配列だけでなく answer 自体も _buildTurnEl（render.js）へ渡す。
+    // 終了理由の導出に answer.data.evidence_packet が要るため answer も渡す
     turn.answer = m.answer;
     if (el && turn.trace) attachTraceButton(el, `fturn-${turns.length - 1}`);
   });
-  // 範囲・調べ方（明示時のみ）・探す対象は同じ関数の pendingConvWorld 後追い経路で復元する
-  // （RV1 #4・独立の sameDir 判定を増やさない）。開閉状態だけはこの会話専用の別の関心事なので
-  // ここで別途呼ぶ。
-  applyConversationScope(data.messages);   // 最後の回答の範囲/調べ方/探す対象をヘッダ/選択に反映（RV Med#1）
+  applyConversationScope(data.messages);   // 最後の回答の範囲/調べ方/探す対象をヘッダ/選択に反映
   applyInquiryOpenDefault(data.messages.length === 0);
-  $('messages').scrollTop = 0;             // 復元は先頭から表示（初回メッセージがヘッダに被らない）
+  $('messages').scrollTop = 0;
   resetFlow();
-  // UIフィードバック（RV再検証 HIGH#2）: 積み上げを出さないのは**受領共有**（route/trace を返さない
-  // 既存 posture）だけ。自分の会話は全ターン trace 無し（旧会話・ナレッジ参照オフ等）でも
-  // 「（記録なし）」の積み上げとして描画する（trace の有無では出し分けない）。
+  // 積み上げ表示は受領共有（trace を返さない）では出さない
   const isReceivedShare = !!(data.conversation && data.conversation.origin === 'received_share');
   if (!isReceivedShare && turns.length) renderTurnStack(turns);
   loadConversations();
-  if (!isReceivedShare) resumeRunningTurn(cid, turns);   // 背景実行: 実行中ターンがあれば自動で再購読
+  if (!isReceivedShare) resumeRunningTurn(cid, turns);   // 実行中ターンがあれば再購読
 }
 
-// 背景実行（proposal §3・再接続）: 会話を開いたとき実行中ターンがあれば、末尾（回答未保存の
-// ユーザー発言）をライブ状態にして cursor=0 から replay→追従する（積み上げ済みの過去ターンに
-// 続けて表示・renderTurnStack が既に描いた末尾の「（記録なし）」プレースホルダはそのまま流用する）。
+// 会話を開いたとき実行中ターンがあれば、末尾の質問をライブ状態にして cursor=0 から再購読する。
+// 設計: docs/design/chat.md「停止と同時実行」
 export async function resumeRunningTurn(cid, turns) {
   let running;
   try { running = await getJSON('/chat/turns/running'); } catch (e) { return; }
-  // 世代チェック。上の await（/chat/turns/running の応答待ち）の間に
-  // 別の会話（または新規会話）へ遷移していたら、この応答はもう古い＝今の画面には使わない
-  // （さもないと会話Aの遅延応答が会話Bの画面に誤って購読を張ってしまう）。S.cid は「いま画面に
-  // 表示している会話」を指す唯一の状態変数なので、これと比較するだけで十分。
+  // ① 応答待ちの間に別会話へ遷移していたら使わない
   if (S.cid !== cid) return;
-  // 開始 POST 応答待ち中（S.sending）なら、利用者が同じ会話で既に新しい送信を始めている——
-  // ここで見つかる「実行中ターン」はその新しい送信より前に始まった旧ターンの可能性が高い。
-  // 割り込んで再購読すると `subscribeTurn` が turnGen を進めてしまい、新しい送信の開始応答が
-  // 届いた時点でそれが世代不一致で破棄され（`send()` の turnGen 契約）、しかも `S.sending` を
-  // 解除する責任者が誰もいなくなって送信不能のまま固着する。新しい送信を必ず優先し、ここでは
-  // 何もしない（新しい送信自身が `subscribeTurn` を呼ぶ）。
+  // ② 新しい送信の開始応答待ち中は割り込まない（再購読すると新しい送信の世代が壊れる）
   if (S.sending) return;
   const hit = (running.turns || []).find((t) => t.conversation_id === cid);
   if (!hit) return;
-  // 同一 turnId への遅延/重複応答（GET /chat/turns/running が複数回呼ばれる・片方の応答が
-  // 遅れて後から届く等）で、既に購読中の同じターンへ何度も「再開」処理を走らせない——素通り
-  // させると `.thinking` プレースホルダーや `startFlow` の積み上げ表示を毎回二重に作ってしまい、
-  // `subscribeTurn` も無駄に既存の EventSource を閉じて張り直す（受信中のストリームを
-  // 一瞬でも切る実害がある）。
+  // ③ 購読中の同じターンへは再開処理を重ねない（表示の二重化・ストリームの張り直しを防ぐ）
   if (S.es && S.turnId === hit.turn_id) return;
-  // turnId 照合: 応答順が逆転し、この await の間に別経路（利用者自身の送信の完了）で既に
-  // "別の" turnId へ購読が確立していた場合も、その turnId を上書きしない（ここで見つかった
-  // 実行中ターンへ張り替えると、新しい送信の購読を巻き戻して孤児化させてしまう）。
+  // 別の turnId を購読済みなら上書きしない
   if (S.es && S.turnId && S.turnId !== hit.turn_id) return;
   S.turnId = hit.turn_id;
-  // サーバの started_at（TIMESTAMPTZ isoformat＝tz 付き）を起点に＝遷移・リロードで経過秒が 0 に戻らない
+  // 経過秒はサーバの started_at を起点にする
   S.turnStartedAtMs = Date.parse(hit.started_at) || Date.now();
   const lastTurn = turns[turns.length - 1];
   const question = (lastTurn && !lastTurn.trace) ? lastTurn.question : null;

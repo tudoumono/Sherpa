@@ -1,11 +1,9 @@
-"""`openai_model`／`gemini_model`／`codex_model`／`codex_reasoning` は個人設定に無い（管理者の
-使えるモデル一覧・環境変数だけで決まる）。
+"""個人設定に画面の無い項目（モデル名・Codex の推論・機能別プロバイダ・Web 検索の希望）は個人設定に無い
+（管理者の使えるモデル一覧・管理画面の設定・チャットごとの希望だけで決まる）。
 
-`SettingsReq` はこれらのフィールドを受け取らない＝ PUT ボディに含めても pydantic の未知フィールド
-として黙って無視される（保存もされず・422 にもならない）。`ollama_model`／`intent_model`／
-`search_helper_model`／機能別プロバイダ（graph/intent/embed_provider・extract_provider）は
-それぞれ専用のテストファイル（`test_ollama_model_settings.py` 等）で直接固定済み。このファイルは
-専用ファイルの無かった残り4フィールドをまとめて固定する。
+`SettingsReq` はこれらのフィールドを受け取らない＝ PUT ボディに含めても pydantic の未知フィールドとして
+黙って無視される（保存もされず・422 にもならない）。`user_settings` の該当列は起動時の移行で
+`DROP COLUMN IF EXISTS` され、撤去後も起動と個人設定の読み書きが壊れない。
 
 要 Postgres。DB 不可は SKIP（他の tests/api/test_*settings*.py と同じ流儀）。
 """
@@ -46,24 +44,26 @@ def _login(uid: str, password: str) -> TestClient:
     return c
 
 
-@pytest.mark.parametrize("field,value,default", [
-    ("openai_model", "gpt-5.4-mini", ""),
-    ("gemini_model", "gemini-2.5-flash-lite", ""),
-    ("codex_model", "gpt-5.4-mini", ""),
-    ("codex_reasoning", "high", "low"),
-])
-def test_field_is_silently_ignored_on_put(field, value, default):
-    """PUT にフィールドを含めても 200・保存されない（未知フィールドとして無視される）。
-    GET /settings の応答にもこのフィールドは含まれない（削除済みフィールドは応答からも返さない）。"""
+_RETIRED_FIELDS = {
+    "openai_model": "gpt-5.4-mini", "ollama_model": "qwen2.5", "codex_model": "gpt-5.4-mini",
+    "codex_reasoning": "high", "codex_web_search": True, "extract_provider": "ollama",
+    "intent_model": "gpt-4o-mini", "graph_provider": "ollama", "intent_provider": "openai",
+    "embed_provider": "ollama", "search_helper": "ollama", "search_helper_model": "qwen2.5",
+    "system_prompt": "独自の回答方針",
+}
+
+
+def test_retired_fields_are_silently_ignored_on_put():
+    """PUT に撤去済みフィールドを含めても 200・保存されない（未知フィールドとして無視される）。
+    GET /settings の応答にもこれらのフィールドは含まれない。"""
     _try_init()
     sfx = _sfx()
-    uid, pw = f"rmf{field[:4]}{sfx}", f"pw-{sfx}"
+    uid, pw = f"rmf{sfx}", f"pw-{sfx}"
     _mk_user(uid, pw)
     c = _login(uid, pw)
 
-    r = c.put("/settings", json={field: value})
+    r = c.put("/settings", json=_RETIRED_FIELDS)
     assert r.status_code == 200, r.text
-    assert field not in r.json()
-
-    assert store.get_settings(uid)[field] == default
-    assert field not in c.get("/settings").json()
+    saved, got = store.get_settings(uid), c.get("/settings").json()
+    for field in _RETIRED_FIELDS:
+        assert field not in r.json() and field not in saved and field not in got

@@ -1,8 +1,6 @@
-/* 画面フォントの固定定義（開発用フォント切替は撤去済み）。
-   本文は Noto Sans JP、コード（code/pre・パス表示など）は HackGen を起点に固定する。
-   いずれも CDN 参照・自己ホスト（@font-face）はしない＝端末にインストール済みなら適用され、
-   無ければスタックのフォールバックで劣化なく表示される（HackGen は同梱しない）。
-   実際の参照は app.css 等の font-family:var(--font-body / --font-code) 側。 */
+/* 画面フォントの定義。本文は Noto Sans JP、コード（code/pre・パス表示など）は HackGen を起点にする。
+   フォントは同梱せず、端末に無ければスタックのフォールバックで表示する。
+   参照側は font-family:var(--font-body / --font-code)。 */
 
 :root{
   --font-body:"Noto Sans JP","Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI",Meiryo,system-ui,sans-serif;

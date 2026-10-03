@@ -4,7 +4,7 @@
   1. sherpa/ 全体を静的に走査し、Ollama REST パス文字列（"/api/chat" 等）が
      `llm.ollama_url()` を経由せず直接組み立てられている行が無いことを pin する
      （新シンクがチョークポイントを迂回したら本テストが落ちる）。
-  2. 対象シンクとして列挙済みの6モジュール（agents=providers/ollama・embeddings・graph_admin・
+  2. 対象シンクとして列挙済みのモジュール（simple_chat・embeddings・graph_admin・
      intent_llm・graph_extract・health）＋実装時に判明した7人目の consumer（vision_arm）が
      実際にチョークポイントを参照していることを確認する。
   3. 各シンクを非 allowlist URL（allowlist 空＝loopback 以外は全拒否）で呼び、ネットワーク呼び出しが
@@ -25,7 +25,6 @@ import pytest
 
 from sherpa import embeddings, graph_admin, health, intent_llm, llm, store
 from sherpa.ingest import graph_extract
-from sherpa.providers import ollama as ollama_provider
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SHERPA = ROOT / "sherpa"
@@ -129,9 +128,8 @@ def test_no_ollama_url_evasion_patterns():
 
 # 対象シンクの列挙（R2a 事前分析）＋実装時に判明した7人目の consumer（vision_arm・R2a-S1・旧 markitdown_ocr_arm）。
 _KNOWN_SINK_MODULES = {
-    "providers/ollama.py": "OllamaProvider（agents の agentic ループ／単発ストリーミング頭脳）",
     "embeddings.py": "embeddings（ES kNN 用ベクトル埋め込み）",
-    "graph_admin.py": "graph_admin.ask_graph（管理グラフへの自然言語質問）",
+    "simple_chat.py": "simple_chat._resolve_llm（簡易の AI の接続先・管理グラフへの質問/チャットの簡易/外部簡易回答が共有）",
     "ingest/graph_extract.py": "graph_extract.complete_json（知識抽出。intent_llm.classify も再利用）",
     "health.py": "health（状態ドット `_ping_ollama` ／システム状態 AI 再チェック `_ai_check_ollama`）",
     "ingest/arms/vision_arm.py": "vision_arm（VLM 画像読取・R2a-S1 実装時に判明した7人目・旧 markitdown_ocr_arm）",
@@ -203,126 +201,55 @@ def test_intent_llm_classify_degrades_without_network_for_unlisted_url(monkeypat
     assert _no_network_by_default.calls == []
 
 
-def test_graph_admin_ask_graph_degrades_without_network_for_unlisted_url(_no_network_by_default):
-    settings = {"agent": "ollama", "ollama_url": _UNLISTED_LINK_LOCAL, "ollama_model": "qwen2.5"}
-    result = graph_admin.ask_graph("グラフの状況は?", "v1", settings=settings)
-    assert result["status"] == "failed"                        # 例外は外に漏れない
+def test_simple_provider_is_unwired_without_network_for_unlisted_url(_no_network_by_default):
+    """簡易（検索して答える）: 管理者設定の接続先が許可外なら `_resolve_llm` の1か所で止まり、
+    頭脳は未接続（`_UnwiredProvider`）になる＝通信は発生しない（ナレッジ参照のオン/オフどちらも）。"""
+    from sherpa import providers as providers_pkg
+    from sherpa.agents import Ctx
+
+    p = providers_pkg.get_provider({"agent": "simple"},
+                                   system_settings={"ollama_url": _UNLISTED_EXTERNAL})
+    assert isinstance(p, providers_pkg._UnwiredProvider)
+    for knowledge in (True, False):
+        ctx = Ctx(message="消費税率は?", world="v1", knowledge=knowledge,
+                  route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
+                  dispatch=lambda lens, inp: {}, make_sources=lambda docs: [])
+        result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
+        assert "接続されていません" in result["env"]["headline"]
     assert _no_network_by_default.calls == []
 
 
-def test_ollama_provider_agentic_run_degrades_without_network_for_unlisted_url(_no_network_by_default):
-    """agents（agentic ループ）: `_agentic_run` 経由で失敗し、run() 全体は単発 grep へフォールバックして
-    クラッシュしない（`_facade._gather` は route/dispatch を差し替えるので Neo4j 不要）。"""
-    from sherpa.agents import Ctx
+def test_select_provider_wires_simple_with_resolved_target_for_allowlisted_url():
+    """許可リストにある接続先なら簡易の頭脳が組み立てられ、`provider_id` は解決した実体の LLM
+    （ollama）・接続先は `llm.ollama_url` 経由の `/api/chat`。"""
+    from sherpa import providers as providers_pkg
 
-    p = ollama_provider.OllamaProvider(_UNLISTED_LAN, "qwen2.5")
-    ctx = Ctx(message="消費税率は?", world="v1", knowledge=True,
-             route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-             dispatch=lambda lens, inp: {"lens": "qa", "headline": "", "summary": {"total": 0},
-                                         "data": {}, "sources": [], "scope": {}},
-             scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-             make_sources=lambda docs: [])
-    result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-    assert result["env"]["lens"] == "qa"                       # 単発 grep フォールバックの env がそのまま返る
-    assert _no_network_by_default.calls == []
+    p = providers_pkg.get_provider(
+        {"agent": "simple"},
+        system_settings={"ollama_url": _UNLISTED_LAN, "ollama_allowlist": [_UNLISTED_LAN.split("//")[1]]})
+    assert type(p).__name__ == "SimpleProvider"
+    assert p.provider_id == "ollama" and p._endpoint.endswith("/api/chat")
 
 
-@pytest.mark.parametrize("lens", ["impact", "troubleshoot"])
-def test_ollama_provider_agentic_run_degrades_without_network_for_unlisted_url_graph_lenses(
-        lens, _no_network_by_default):
-    """SC-6e: impact/troubleshoot（グラフ必須レンズ）でも、agentic ループ開始前の接続先検証
-    （`_agentic_target_check`）が可用性解決（ES/Neo4j への実接続）より先に走り、不許可の
-    Ollama URL では可用性解決へ進む前に fail-closed で止まる（qa 固定の既存テストでは
-    レンズ別の回帰を検出できない・全レンズで同じ順序を保証する）。"""
-    from sherpa.agents import Ctx
-
-    p = ollama_provider.OllamaProvider(_UNLISTED_LAN, "qwen2.5")
-    ctx = Ctx(message="消費税率を変えたら夜間バッチに影響ある?", world="v1", knowledge=True,
-             route=lambda m: {"lens": lens, "input": m, "reason": "t"},
-             dispatch=lambda l, inp: {"lens": lens, "headline": "", "summary": {"total": 0},
-                                      "data": {}, "sources": [], "scope": {}},
-             scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-             make_sources=lambda docs: [])
-    result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-    assert result["env"]["lens"] == lens                       # 単発 grep フォールバックの env がそのまま返る
-    assert _no_network_by_default.calls == []
-
-
-def test_ollama_provider_plain_stream_degrades_without_network_for_unlisted_url(_no_network_by_default):
-    """agents（単発ストリーミング・ナレッジ参照オフ）: `_stream` が失敗しても `_plain_run` が
-    固定フォールバック文言に degrade する（クラッシュしない）。"""
-    from sherpa.agents import Ctx
-
-    p = ollama_provider.OllamaProvider(_UNLISTED_EXTERNAL, "qwen2.5")
-    ctx = Ctx(message="こんにちは", world="v1", knowledge=False,
-             route=lambda m: {}, dispatch=lambda lens, inp: {})
-    result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-    assert result["env"]["headline"]                           # _plain_text() の固定文言（空にならない）
-    assert _no_network_by_default.calls == []
-
-
-def test_ollama_provider_send_paths_are_io_free_with_injected_system_settings(monkeypatch):
-    """SC-6e: fresh system_settings を注入すれば、`_agentic_target_check`（agentic ループ
-    開始前の「純粋な文字列検証」契約）は `store.get_system_settings()` を一切呼ばない（DB getter を
-    記録型スタブに差し替え、呼び出しが無い＝`calls == []` を明示 assert する）。あわせて
-    `_agentic_loop`/`_stream`/`_attribute` の全 `llm.ollama_url()` 呼び出しが同一の注入済み
-    snapshot（同一オブジェクト）を使うことも確認する（URL 解決と allowlist 判定が別世代の設定を
-    見る穴を防ぐ）。
-
-    host は非 loopback（192.168.1.70）を使う——loopback は `_assert_host_port_allowed` が
-    allowlist 判定より先に常に許可するため、`_allowlisted_hosts()`（延いては DB read）を経由
-    しなくても偶然テストが通ってしまい、DB を読んでいる regression を検出できない。
-    """
-    db_calls: list = []
-    monkeypatch.setattr(store, "get_system_settings", lambda: db_calls.append(1) or {})
-
-    fresh = {"ollama_allowlist": ["192.168.1.70:11434"]}
-    p = ollama_provider.OllamaProvider("http://192.168.1.70:11434", "qwen2.5", system_settings=fresh)
-    p._agentic_target_check()   # allowlist 登録済みホスト＝許可（DB を読まず fresh を直接見る）
-    assert db_calls == [], "system_settings 注入済みなのに DB getter が呼ばれた"
-
-    seen: list = []
-
-    def _record_and_stop(base, path, *, extra_allowed=None, system_settings=None):
-        seen.append(system_settings)
-        raise RuntimeError("stop-after-record")   # ネットワークへ進む前に打ち切る
-
-    monkeypatch.setattr(ollama_provider.llm, "ollama_url", _record_and_stop)
-
-    from sherpa.agents import Ctx
-    ctx = Ctx(message="消費税率は?", world="v1",
-             route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-             dispatch=lambda lens, inp: {}, scope_meta={"world": "v1", "scope_paths": [], "source": "all"})
-    for call in (lambda: p._agentic_loop(ctx),
-                lambda: next(p._stream("hi")),
-                lambda: p._attribute("text", "digest", {})):
-        try:
-            call()
-        except RuntimeError:
-            pass
-    assert len(seen) == 3
-    assert all(s is fresh for s in seen)   # 同一オブジェクト＝3経路とも同じ snapshot を使い回している
-
-
-def test_select_provider_wires_same_system_settings_object_into_ollama_provider(monkeypatch):
-    """本番配線の固定: `providers/__init__.py::_select_provider` の `agent == "ollama"` 分岐が、
-    入口で読んだ fresh sys_s を `OllamaProvider(url, model, system_settings=sys_s)` の第3引数へ
-    渡し忘れる regression（上のテストが塞ぐ「省略時は DB read」契約の再発）を検出する。
-    `agents.OllamaProvider`（facade 実行時解決の対象・`_select_provider` が `_facade.OllamaProvider`
-    経由で呼ぶ）を recorder に差し替え、渡された system_settings が呼び出し元で渡した sentinel と
-    同一オブジェクトであることを identity で確認する（コピーや等価な別 dict では検出できない）。"""
+def test_select_provider_wires_same_system_settings_object_into_simple_provider(monkeypatch):
+    """本番配線の固定: `providers/__init__.py::_select_provider` の `agent == "simple"` 分岐が、
+    入口で読んだ fresh sys_s を `SimpleProvider(..., system_settings=sys_s)` へ渡し忘れる regression
+    （「省略時は DB read」契約の再発）を検出する。`agents.SimpleProvider`（facade 実行時解決の対象）を
+    recorder に差し替え、渡された system_settings が呼び出し元で渡した sentinel と同一オブジェクト
+    であることを identity で確認する（コピーや等価な別 dict では検出できない）。"""
     from sherpa import agents, providers as providers_pkg
 
-    sentinel = {"ollama_allowlist": ["192.168.1.80:11434"]}
+    sentinel = {"ollama_allowlist": ["192.168.1.80:11434"], "ollama_url": "http://192.168.1.80:11434",
+                "research_default_provider": "ollama"}
     captured: list = []
 
-    class _RecorderOllamaProvider:
-        def __init__(self, url, model, system_settings=None):
+    class _RecorderSimpleProvider:
+        def __init__(self, provider, model, endpoint, headers, system_settings=None):
             captured.append(system_settings)
 
-    monkeypatch.setattr(agents, "OllamaProvider", _RecorderOllamaProvider)
+    monkeypatch.setattr(agents, "SimpleProvider", _RecorderSimpleProvider)
     providers_pkg.get_provider({"agent": "ollama"}, system_settings=sentinel)
-    assert len(captured) == 1, "OllamaProvider が構築されなかった"
+    assert len(captured) == 1, "SimpleProvider が構築されなかった"
     assert captured[0] is sentinel, "入口で読んだ system_settings と別オブジェクトが渡された"
 
 
@@ -451,19 +378,8 @@ def test_assert_ollama_url_allowed_env_ollama_url_is_no_longer_implicit_member(m
         llm.assert_ollama_url_allowed(_UNLISTED_LAN)
 
 
-def test_assert_ollama_url_allowed_vlm_env_does_not_grant_general_ollama_url_access(monkeypatch):
-    """`SHERPA_VLM_OLLAMA_URL`（VLM 専用の接続先 env）も一般の Ollama 許可リストへは加算されない
-    （VLM 専用の権限を個人 `ollama_url` の保存・実行へ流用させない）。VLM 自身の送信は
-    `vision_arm._read_ollama` が `extra_allowed` でこの呼び出しだけに閉じて許可する
-    （`tests/unit/test_vision_arm_ssrf.py` 参照）。"""
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})
-    monkeypatch.setenv("SHERPA_VLM_OLLAMA_URL", _UNLISTED_LAN)
-    with pytest.raises(llm.SsrfBlocked):
-        llm.assert_ollama_url_allowed(_UNLISTED_LAN)
-
-
 def test_assert_ollama_url_allowed_extra_allowed_scopes_to_this_call_only(monkeypatch):
-    """`extra_allowed`（VLM 専用の局所許可・`vision_arm._read_ollama` が使う）は呼び出しにだけ効き、
+    """`extra_allowed`（呼び出し単位の局所許可）は呼び出しにだけ効き、
     一般の allowlist（`_allowlisted_hosts()`）を汚染しない。"""
     monkeypatch.setattr(store, "get_system_settings", lambda: {})
     hp = llm._canonical_host_port(_UNLISTED_LAN)
@@ -483,7 +399,7 @@ def test_assert_ollama_url_allowed_rejects_userinfo_even_for_loopback(monkeypatc
 
 def test_assert_ollama_url_allowed_malformed_url_does_not_leak_raw_value(monkeypatch):
     """解釈不能な URL（`_canonical_host_port` が None を返すケース・ここでは userinfo 付き）の
-    エラー文言に、生の `base` をそのまま埋め込まない（呼び出し元＝`usage_chat._resolve_cfg` 等が
+    エラー文言に、生の `base` をそのまま埋め込まない（呼び出し元が
     この文言をそのまま 503 の detail に含めるため、パスワード等が外部応答へ反射されるのを防ぐ）。"""
     monkeypatch.setattr(store, "get_system_settings", lambda: {})
     with pytest.raises(llm.SsrfBlocked) as exc:

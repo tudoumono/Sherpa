@@ -27,7 +27,7 @@ def _world(monkeypatch, tmp_path):
 
 def test_default_config_png_without_derived_is_reported_as_pending_failure(monkeypatch, tmp_path):
     """PNGは通常対象なので、sync前など派生が無い状態をその他ではなく変換失敗として可視化する。"""
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)          # 既定 ooxml,pdf_text
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)          # 既定 ooxml,pdf_text
     wd, der = _world(monkeypatch, tmp_path)
     (wd / "scan.png").write_bytes(b"img")
     (wd / "note.txt").write_text("本文", encoding="utf-8")
@@ -42,7 +42,7 @@ def test_default_config_png_without_derived_is_reported_as_pending_failure(monke
 
 def test_png_metadata_is_first_class_even_when_vision_enabled(monkeypatch, tmp_path):
     """PNGの決定的metadata派生があればdoctype「画像」で台帳・検索対象に載せる。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text,vision")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text,vision")
     wd, der = _world(monkeypatch, tmp_path)
     (wd / "scan.png").write_bytes(b"img")
     (der / "scan.png.md").write_text("画像内容は未解釈である。", encoding="utf-8")
@@ -59,7 +59,7 @@ def test_png_metadata_is_first_class_even_when_vision_enabled(monkeypatch, tmp_p
 
 def test_vision_enabled_image_without_md_is_failed(monkeypatch, tmp_path):
     """vision 有効だが派生MD が無い（VLM で文字が取れなかった）画像は変換失敗＝台帳に載せない。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text,vision")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text,vision")
     wd, der = _world(monkeypatch, tmp_path)
     (wd / "scan.png").write_bytes(b"img")                     # 派生MD 無し（VLM 失敗相当）
     rep = corpus_docs.scan_report("w")
@@ -71,7 +71,7 @@ def test_vision_enabled_image_without_md_is_failed(monkeypatch, tmp_path):
 
 def test_vision_disabled_png_metadata_is_still_available(monkeypatch, tmp_path):
     """visionアームが無効でもPNG metadata派生は台帳へ載る。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")       # vision 無効
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")       # vision 無効
     wd, der = _world(monkeypatch, tmp_path)
     (wd / "scan.png").write_bytes(b"img")
     (der / "scan.png.md").write_text("本文", encoding="utf-8")  # 派生MD が有っても載せない（アーム無効）
@@ -84,7 +84,7 @@ def test_vision_disabled_png_metadata_is_still_available(monkeypatch, tmp_path):
 
 def test_structured_listing_includes_image_only_pdf_with_rag_md(monkeypatch, tmp_path):
     """通常MDがなくてもEvidence RAG MDがあればstructured索引だけは文書を列挙できる。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     wd, der = _world(monkeypatch, tmp_path)
     der_rag = der.parent / "rag"; der_rag.mkdir()
     (wd / "scan.pdf").write_bytes(b"%PDF fixture")
@@ -103,7 +103,7 @@ def test_sensitive_image_original_name_is_not_reclassified_as_image(monkeypatch,
     """秘匿名の画像（`.env.png`）は `classify_document()` が document/None を返すが、
     Office 同様に画像拡張子分類（`office_md.IMAGE_EXT`）へ再度倒して台帳・件数へ載せてはいけない
     （vision 有効＝通常なら画像として first-class 化される構成で確認する）。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text,vision")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text,vision")
     wd, der = _world(monkeypatch, tmp_path)
     (wd / ".env.png").write_bytes(b"img")
     (wd / "scan.png").write_bytes(b"img")
@@ -123,7 +123,7 @@ def test_include_rag_prefers_rag_md_over_legacy_md_when_both_exist(monkeypatch, 
     """D1: 両方が存在する場合、include_rag=True は legacy `.md` より `.rag.md` を優先する
     （`grep_tool.preferred_derived_name` と同じ優先順位＝grep/ES/グラフが同じ物理ファイルを見る）。
     include_rag=False（既定）は従来どおり legacy のみを見る。"""
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     wd, der = _world(monkeypatch, tmp_path)
     der_rag = der.parent / "rag"; der_rag.mkdir()
     (wd / "a.docx").write_bytes(b"docx fixture")

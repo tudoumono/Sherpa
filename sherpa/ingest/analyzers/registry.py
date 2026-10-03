@@ -1,17 +1,8 @@
-"""言語アナライザの登録簿（拡張子→アナライザ解決の単一の真実源・§2.4・§7 裁定2/5/10）。
+"""言語アナライザの登録簿（拡張子→アナライザ解決の単一の真実源）。
 
-既知アナライザの列挙順＝**優先順**（同じ拡張子を複数のアナライザが要求したら上位が担当）。
-CODE-1b（管理画面の有効/無効・並び順）が本モジュールを介して `_ANALYZERS` を差し替える until
-それまでは固定の既定リストのみ。`registered_extensions()` が「コード」と見なす拡張子集合の
-単一の真実源——`doc_kinds.CODE_EXT`・`corpus_docs._doctype_map()`（コード分）・
-`scope._CONTENT_EXT`（コード分）・`agentic_search._READABLE_EXT`（コード分）・
-`ext_api._UTF8_DECLARE_EXT`／`_DOC_CONTENT_TYPE`（コード分）はすべてこれを参照する（§2.4）。
-`resolve_lazy()` は拡張子だけでなく `accepts()` の内容判定まで見て担当アナライザを確定する
-（`corpus_docs.iter_world_documents` が使う・既定 `accepts` のみなら内容を読まない）。
-
-`_ANALYZERS` ＝ `_UPSTREAM_ANALYZERS`（本体の固定既定リスト）＋ `discover_extension_analyzers()`
-（フォーク側の `<prefix>_*.py` 拡張アナライザを名前順で末尾に足す・拡張の契約 S4・
-docs/21-拡張の契約.md）。発見・命名・版署名の詳細は各関数のドキュストリング参照。
+既知アナライザの列挙順＝優先順（同じ拡張子を複数が要求したら上位が担当）。`registered_extensions()` が「コード」と見なす拡張子集合の単一の真実源で、`doc_kinds.CODE_EXT`・`corpus_docs._doctype_map()`・`scope._CONTENT_EXT`・`agentic_search._READABLE_EXT`・`ext_api` はこれを参照する。`resolve_lazy()` は拡張子に加えて `accepts()` の内容判定まで見て担当を確定する。
+`_ANALYZERS` ＝ `_UPSTREAM_ANALYZERS`（本体の固定リスト）＋ `discover_extension_analyzers()`（フォーク側の `<prefix>_*.py` を名前順で末尾に足す）。
+設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
@@ -40,17 +31,7 @@ from .vb import VbAnalyzer
 from .xml_config import XmlConfigAnalyzer
 from .yaml_config import YamlConfigAnalyzer
 
-# 優先順＝この並び順（§7 裁定2）。JavaAnalyzer は拡張子 `.java` が他アナライザと衝突しない
-# ため末尾に追加（新言語1つでの手順検証・docs/archive/2026-08-29-コード解析層のコンポーネント化.md §4.2）。
-# Properties/YamlConfig/XmlConfig（アナライザ拡張 S3b・A6/A7）・SqlDdlAnalyzer（S2・A1/A10）も
-# 拡張子が他アナライザと衝突しないため末尾に追加——新規アナライザの追加自体は `config_signature()`
-# の `_ANALYZERS` タプル材料が自動的に変わるため `CODE_ANALYZERS_SCHEMA_VERSION` の据え置きでよい
-# （S3b 前例）。CAnalyzer（`.c`/`.h`）・CSharpAnalyzer（`.cs`）も同じ理由で末尾追加（S6/S7・A1）。
-# JspAnalyzer/HtmlTemplateAnalyzer/JsAnalyzer/CssAnalyzer（波3 レーンA）・ShellBatchAnalyzer
-# （波3 レーンB）・VbAnalyzer（波3 レーンC）も同じ理由（拡張子非衝突）で末尾追加。ただし `.js`/
-# `.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb` は従来 `text_kind.CODE_EXT`（軽量テキスト枠）が拾って
-# いた拡張子のため、本登録により `classify_document()` の判定結果（branch）が変わる——
-# `CODE_ANALYZERS_SCHEMA_VERSION` を上げる理由の一つ（v9 参照）。
+# 優先順＝この並び順。拡張子が他と衝突しない新規アナライザは末尾に追加する（`config_signature()` の材料が自動で変わるので `CODE_ANALYZERS_SCHEMA_VERSION` は据え置きでよい）。
 _UPSTREAM_ANALYZERS: tuple[Analyzer, ...] = (
     CobolAnalyzer(), CopybookAnalyzer(), JclAnalyzer(), JavaAnalyzer(),
     PropertiesAnalyzer(), YamlConfigAnalyzer(), XmlConfigAnalyzer(),
@@ -59,45 +40,35 @@ _UPSTREAM_ANALYZERS: tuple[Analyzer, ...] = (
     ShellBatchAnalyzer(), VbAnalyzer(),
 )
 
-# 上流モジュールのファイル stem（拡張アナライザ発見の対象から除外・§4）。実ファイル名基準
-# （`xml_config.py`/`yaml_config.py` は登録名 "xml_config"/"yaml_config" と同じ stem）。
+# 上流モジュールのファイル stem（拡張アナライザ発見の対象から除外する。実ファイル名基準）。
 _UPSTREAM_MODULE_STEMS = frozenset({
     "cobol", "copybook", "jcl", "java", "c", "csharp", "sql", "js", "jsp", "html", "css",
     "vb", "shell", "xml_config", "yaml_config", "properties",
 })
 
-# フォーク側が拡張アナライザの接頭辞として使えない予約語（拡張の契約 S4・docs/21-拡張の契約.md）。
-# 上流の言語名＋内部モジュール名。実ファイル名と一致しない語（"xml"/"yaml"）も含める——本体が
-# 将来 `xml:*`/`yaml:*` という登録名を使う余地を残し、フォークにその名前空間を先取りさせない。
+# フォーク側が拡張アナライザの接頭辞として使えない予約語（上流の言語名＋内部モジュール名。`xml`/`yaml` も含める）。
 RESERVED_ANALYZER_PREFIXES = frozenset({
     "cobol", "copybook", "jcl", "java", "c", "csharp", "sql", "js", "jsp", "html", "css",
     "vb", "shell", "xml", "yaml", "properties", "base", "registry",
 })
 
-# 接頭辞の文字種（英小文字・数字・`_`）。`_` は区切りとしてだけでなく接頭辞内部でも使える
-# （例: サンプル拡張の接頭辞 `sample_ext`）——禁止するのは大文字・記号・空文字のみ。
+# 接頭辞の文字種（英小文字・数字・`_`）。禁止するのは大文字・記号・空文字のみ。
 _PREFIX_CHARSET_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
-# 拡張子の形式（照合側 `_ext()` は `PurePosixPath.suffix` の単一区切りしか返さない）。`.` + 英小文字/
-# 数字のみの単一区切り以外——大文字・単なる「.」・空文字だけでなく `.d.ts` のような多段接尾辞も
-# `_ext()` の出力形とは永久に一致せず担当なしになるため、契約違反として弾く。
+# 拡張子の形式。`.` + 英小文字/数字のみの単一区切りに限る（`_ext()` の出力形と一致しないものは担当なしになるため契約違反にする）。
 _EXT_FORMAT_RE = re.compile(r"\.[a-z0-9]+")
 
 
 class ExtensionAnalyzerError(RuntimeError):
-    """拡張アナライザの発見時契約違反（接頭辞不一致・拡張子衝突・version<1 等）。
-
-    黙って落とさない（アナライザ増設5箇条）——発見（モジュール import）時に例外にする。
-    """
+    """拡張アナライザの発見時契約違反（接頭辞不一致・拡張子衝突・version<1 等）。発見（モジュール import）時に例外にする。"""
 
 
-# 資料（非コード）として本体が扱う拡張子。corpus_docs（`_NONCODE_DOCTYPE`／`_OFFICE_DOCTYPE`）は本モジュールを
-# import するため、ここから逆向きに import できない＝定数を写し、整合は単体テストで固定する。
+# 資料（非コード）として本体が扱う拡張子。`corpus_docs` が本モジュールを import するため逆向きに import できず、定数を写して整合を単体テストで固定する。
 _DOCUMENT_EXT_FOR_COLLISION: frozenset = frozenset({
     ".md", ".markdown", ".txt",
     ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf",
     ".csv", ".tsv", ".rtf", ".log",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",   # 画像（office_md.IMAGE_EXT）
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",  # 画像（office_md.IMAGE_EXT）
 })
 
 
@@ -106,39 +77,25 @@ _SENSITIVE_EXT_FOR_COLLISION: frozenset = frozenset({".key", ".pem", ".ppk", ".e
 
 
 def _noncode_document_extensions() -> frozenset:
-    """資料（非コード）として本体が扱う拡張子の集合（写し・corpus_docs／text_kind と単体テストで同期）。"""
+    """資料（非コード）として本体が扱う拡張子の集合（写し）。"""
     return _DOCUMENT_EXT_FOR_COLLISION
 
 
 def discover_extension_analyzers(analyzers_dir: Path | None = None) -> tuple[Analyzer, ...]:
-    """`<prefix>_*.py`（フォーク側の拡張アナライザ・docs/21-拡張の契約.md）を発見し、契約を検証して
-    名前順のタプルで返す。
+    """`<prefix>_*.py`（フォーク側の拡張アナライザ）を発見し、契約を検証して名前順のタプルで返す。
 
-    対象: `analyzers_dir`（省略時は本パッケージのディレクトリ＝本番の発見対象。テストは tmp
-    ディレクトリを注入して発見規約・契約違反を検証する）直下の `*.py` のうち、`_` 始まり
-    （`_base.py`/`_sql_scan.py`/`__init__.py` 等の内部モジュール）・上流モジュール stem
-    （`_UPSTREAM_MODULE_STEMS`）・`registry` のいずれでもないもの全てを一旦読み込む。モジュール
-    属性 `ANALYZER`（`Analyzer` のインスタンス）を持たないものは拡張アナライザを名乗っていないと
-    みなし黙って読み飛ばす——`ANALYZER` を持つものだけが契約検証＋登録の対象で、ファイル名に `_`
-    を含まない（`<prefix>_*.py` の形でない）ものは命名規約違反として `ExtensionAnalyzerError`
-    にする（`ANALYZER` を宣言している以上、黙って読み飛ばさない）。
-
-    衝突判定の基準は上流アナライザ（`_UPSTREAM_ANALYZERS`）の拡張子集合に加え、既にこの発見処理で
-    見つかった拡張アナライザの `name`／`extensions`。`overrides` の除外は上流との衝突判定だけに使う
-    ——拡張アナライザ同士の衝突判定は `extensions` **全体**で行う（`overrides` に無いものだけを見ると、
-    同じ上流拡張子を意図的に共有する2本が互いに素通りしてしまう）。ただし同じ上流拡張子を両方が
-    `overrides` で明示的に共有していれば例外として許可する。`analyzers_dir` を注入したテストでも
-    本番の上流構成に対して検証する（フォークが守るべき契約は本番の上流と同じであるべきため）。
+    対象は `analyzers_dir`（省略時は本パッケージのディレクトリ）直下の `*.py` のうち、`_` 始まり・上流モジュール stem・`registry` を除くもの。
+    - モジュール属性 `ANALYZER` を持たないものは黙って読み飛ばす。持つものはファイル名に `_` を含まなければ `ExtensionAnalyzerError`。
+    - 衝突判定は上流の拡張子集合と、既に見つかった拡張アナライザの `name`／`extensions` に対して行う。`overrides` の除外は上流との衝突判定だけに使い、拡張アナライザ同士は `extensions` 全体で判定する（同じ上流拡張子を両方が `overrides` で共有する場合だけ許可）。
+    - `analyzers_dir` を注入しても本番の上流構成に対して検証する。
     """
     base_dir = analyzers_dir if analyzers_dir is not None else Path(__file__).resolve().parent
     upstream_ext: frozenset = frozenset().union(*(a.extensions for a in _UPSTREAM_ANALYZERS))
-    # 資料側の拡張子（.md/.txt/Office/PDF 等）も「上流の担当」に含める。ここに当たる拡張が
-    # overrides 無しで登録されると、資料の分類経路（派生 MD・branch）を黙って奪う。
+    # 資料側の拡張子（.md/.txt/Office/PDF 等）も「上流の担当」に含める（`overrides` 無しで登録されると資料の分類経路を奪う）。
     upstream_ext = upstream_ext | _noncode_document_extensions()
     found: list[Analyzer] = []
     found_names: set[str] = set()
     # 拡張子 → (既に見つかった拡張アナライザの name, その拡張子を overrides で宣言していたか)。
-    # 後者は「同じ上流拡張子を両方が overrides で共有」の例外判定に使う（衝突検出用）。
     found_ext_owner: dict[str, tuple[str, bool]] = {}
     for path in sorted(base_dir.glob("*.py")):
         stem = path.stem
@@ -147,10 +104,9 @@ def discover_extension_analyzers(analyzers_dir: Path | None = None) -> tuple[Ana
         module = _load_module_from_path(stem, path)
         analyzer = getattr(module, "ANALYZER", None)
         if analyzer is None:
-            continue   # ANALYZER を持たない＝拡張アナライザを名乗っていない（黙って読み飛ばす）
+            continue  # ANALYZER を持たない＝拡張アナライザではない（読み飛ばす）
         if "_" not in stem:
-            # ANALYZER を持つ＝拡張アナライザを名乗っている以上、命名規約違反（`<prefix>_*.py` でない）
-            # を黙って読み飛ばさない（読み飛ばすのは ANALYZER を持たない無関係なファイルだけ）。
+            # ANALYZER を持つ以上、命名規約違反（`<prefix>_*.py` でない）は読み飛ばさず例外にする。
             raise ExtensionAnalyzerError(
                 f"{stem}.py: ANALYZER を持つファイルは '<prefix>_*.py' の形にしてください（ファイル名に '_' がありません）")
         _validate_extension_analyzer(analyzer, stem, upstream_ext)
@@ -162,8 +118,7 @@ def discover_extension_analyzers(analyzers_dir: Path | None = None) -> tuple[Ana
             if prior is None:
                 continue
             prior_name, prior_is_override = prior
-            # 例外: 同じ上流拡張子を両方が overrides で明示的に共有している場合だけ許可する
-            # （overrides の除外は上流との衝突判定だけに使う——ここは extensions 全体で見る）。
+            # 例外: 同じ上流拡張子を両方が overrides で共有している場合だけ許可する。
             shared_upstream_override = (
                 ext in upstream_ext and ext in analyzer.overrides and prior_is_override)
             if not shared_upstream_override:
@@ -181,8 +136,7 @@ def discover_extension_analyzers(analyzers_dir: Path | None = None) -> tuple[Ana
 
 
 def _load_module_from_path(stem: str, path: Path):
-    """`path` を独立モジュールとして読み込む（`sys.modules` は一時登録のみ・衝突を避けるため
-    呼び出しごとに一意なモジュール名を使う）。"""
+    """`path` を独立モジュールとして読み込む（`sys.modules` へは一時登録のみ・呼び出しごとに一意なモジュール名）。"""
     mod_name = f"_sherpa_ext_analyzer__{stem}__{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:
@@ -197,11 +151,10 @@ def _load_module_from_path(stem: str, path: Path):
 
 
 def _validate_extension_analyzer(analyzer, filename_stem: str, upstream_ext: frozenset) -> None:
-    """発見した拡張アナライザの契約検証（§4・docs/21-拡張の契約.md）。違反は `ExtensionAnalyzerError`。"""
+    """発見した拡張アナライザの契約検証。違反は `ExtensionAnalyzerError`。"""
     if not isinstance(analyzer, Analyzer):
         raise ExtensionAnalyzerError(f"{filename_stem}.py: ANALYZER は Analyzer のインスタンスではありません")
-    # 型ミスは契約違反として報告する（黙って TypeError の traceback にしない・後続の集合演算・比較が
-    # list/str 相手に失敗する前に検査する）。
+    # 型ミスは契約違反として報告する（後続の集合演算・比較が失敗する前に検査する）。
     if not isinstance(analyzer.extensions, (set, frozenset)):
         raise ExtensionAnalyzerError(
             f"{filename_stem}.py: ANALYZER.extensions は set/frozenset にしてください"
@@ -211,8 +164,7 @@ def _validate_extension_analyzer(analyzer, filename_stem: str, upstream_ext: fro
             f"{filename_stem}.py: ANALYZER.version は int にしてください"
             f"（実際の型: {type(analyzer.version).__name__}）")
     if "version" not in vars(type(analyzer)):
-        # 上流クラス（JavaAnalyzer 等）を継承した拡張が version を省略すると上流の版を継承し、上流の版上げで
-        # 拡張の署名要素まで変わる＝「署名の独立」が破れる。拡張自身のクラスで宣言させる。
+        # 上流クラスを継承した拡張が version を省略すると上流の版を継承してしまう。拡張自身のクラスで宣言させる。
         raise ExtensionAnalyzerError(
             f"{filename_stem}.py: ANALYZER.version は拡張自身のクラスで宣言してください"
             "（上流クラスからの継承値は署名の独立を破るため受け付けない）")
@@ -254,8 +206,7 @@ def _validate_extension_analyzer(analyzer, filename_stem: str, upstream_ext: fro
                 f"{filename_stem}.py: 拡張子 {ext!r} は '.' + 英小文字/数字のみの単一区切りにしてください"
                 "（照合側 _ext() は PurePosixPath.suffix の単一区切りしか返さないため、"
                 "'.d.ts' のような多段接尾辞や大文字宣言は永久に担当なしになります）")
-    # 秘匿ファイル（.env/.pem 等）は overrides でも担当できない。担当できると秘匿除外が無効化され、
-    # 本文が grep・精読（外部 LLM 送信）へ流れる。
+    # 秘匿ファイル（.env/.pem 等）は overrides でも担当できない（秘匿除外が無効化され、本文が外部 LLM へ流れるため）。
     sensitive = analyzer.extensions & _SENSITIVE_EXT_FOR_COLLISION
     if sensitive:
         raise ExtensionAnalyzerError(
@@ -272,55 +223,11 @@ def _validate_extension_analyzer(analyzer, filename_stem: str, upstream_ext: fro
 
 _ANALYZERS: tuple[Analyzer, ...] = _UPSTREAM_ANALYZERS + discover_extension_analyzers()
 
-# `accepts()`/`classify_document` の分類契約版——分類結果（同じ入力に対する kind/doctype/branch の
-# 判定）に影響する意味変更（例: 既定 accepts の扱いを変える・優先順の解決規則を変える）があれば
-# 上げる。`config_signature()` の材料（`importance.IMPORTANCE_SCHEMA_VERSION` と同じ流儀）。
-# v2: 軽量テキスト枠（`ingest.text_kind`）導入——`classify_document()` の「担当なし」経路が
-# 未登録拡張子のテキストファイルを新たに code/document 判定するようになった（従来は未対応の
-# まま台帳・ES に載らなかった）。登録簿自体（`_ANALYZERS`/`extensions`）は無変更のため、この
-# 版を上げないと `content_sig`/ES `analyzer_config_sig` が drift を検知できず、既存 world が
-# 次回 sync/reindex まで新しい分類を反映しない。
-CODE_ANALYZERS_SCHEMA_VERSION = 11   # 原本の文字コード・分類・固定形式の桁幅を含む解析契約の版
-# v4: COPY/CALL 抽出前に引用文字列の中身／行末インラインコメント
-# （`*>` 以降）を除去する前処理を追加（COBOL の引用/コメント誤検知の是正）＋ `CALL "PGM"`
-# （二重引用符）も INVOKES として受理するよう `_CALL` を拡張。
-# v5: `NODE_LABELS` へ `Config` を追加（A6・設定ファイルアナライザの受け皿）。共通層の契約拡張
-# （`RefCandidate.reverse`／qualified 名の2段解決／エッジ集約・KNOWN_VIA の Config 系 via 追加）も
-# 本版に含む。
-# v6（アナライザ拡張）: 既存 `CobolAnalyzer` の `extract_refs` へ `EXEC SQL`→
-# `Table`/`ACCESSES(via=exec_sql)` 抽出を追加（同一構成のまま抽出結果が変わる変更・§6 版管理表）。
-# `SqlDdlAnalyzer` の新規登録自体は上記の理由により版を上げない。`DefResult.extras`（A10・DDL の
-# 複数 `CREATE TABLE` 用）の共通層契約拡張も本版に含む（既存アナライザは `extras` 既定空で無変更）。
-# v7（アナライザ拡張 波2）: `CAnalyzer`/`CSharpAnalyzer` の新規登録（S6/S7）＋
-# 既存 `CobolAnalyzer` の `EXEC CICS XCTL/LINK` 抽出（S5b）をまとめて1回で版上げする——新規登録
-# 単独では `config_signature()` が自動的に構成差分を検知するため版据え置きでもよい前例（S3b）が
-# あるが、波2は既存アナライザの抽出結果が変わる変更（S5b）を同時に含むため、対象を1つずつ切り
-# 分けず波全体で1回に統一する。
-# v8（アナライザ拡張 S3' 残課題）: 既存 `XmlConfigAnalyzer` の `collect_defs` へ
-# キー単位 `Config` children（Spring `<bean>`/`<property>`/`<alias>`・MyBatis 文 id/`<resultMap>`・
-# Struts `<action>`/`<constant>`）を追加し、既存 `JavaAnalyzer` の設定キー参照抽出へ
-# `getBean`/`@Qualifier`/`@Named`/`@Resource(name=...)` を追加した（同一構成のまま抽出結果が
-# 変わる変更・§6 版管理表）。
-# v9（アナライザ拡張 波3 統合）: `JspAnalyzer`/`HtmlTemplateAnalyzer`/`JsAnalyzer`/
-# `CssAnalyzer`（レーンA・画面テンプレート/JS/CSS）・`ShellBatchAnalyzer`（レーンB・シェル/バッチ）・
-# `VbAnalyzer`（レーンC・VB.NET/VB6/VBA/VBScript）を新規登録し、`text_kind.CODE_EXT` から
-# `.js`/`.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb`（専用アナライザに移管した拡張子）を外した——
-# 新規アナライザの追加自体は登録簿の構成差分として自動検知されるが、これらの拡張子が軽量テキスト
-# 枠から専用アナライザ判定へ切り替わる `classify_document()` の分類契約変更（v2 と同種）を含むため
-# 明示的に版を上げる。既存 `JavaAnalyzer` の URL キー定義側（`@RequestMapping`/`@GetMapping`等→
-# `Config` children・`key_kind="url"`）追加、`_base.KNOWN_VIA`/`VIA_PRIORITY` への `vba_sql` 追加
-# （VbAnalyzer の SQL 文字列参照の受け皿）も本版に含む。
-# v10（アナライザ拡張 波3 統合の是正）: `Config` キーの `cid_key` へ `key_kind` を含めて
-# 名前空間を分離（同名でも種別が違えば別ノード＝既存 cid と不一致）、単純名解決（`simple_name_defs`）
-# を言語（`c_kind`）内に限定（C/C# 間の誤接続を止める＝既存の跨言語一致が unresolved に変わり得る）、
-# `JavaAnalyzer` の `@RequestMapping`（クラス）×`@GetMapping`等（メソッド）の URL キーを配列直積で
-# 展開（複数値の組み合わせ抜けを解消）——いずれも登録簿の構成（`_ANALYZERS`/`extensions`）自体は
-# 無変更のまま抽出結果・cid が変わるため明示的に版を上げる。
+# `accepts()`/`classify_document` の分類契約版。分類結果（kind/doctype/branch）に影響する意味変更があれば上げる（`config_signature()` の材料）。
+CODE_ANALYZERS_SCHEMA_VERSION = 11  # 原本の文字コード・分類・固定形式の桁幅を含む解析契約の版
+# 解析結果（抽出される定義・参照・cid）に影響する変更をしたときに上げる。上げると署名が変わり、world が再構築される。
 
-# docs/05-グラフ語彙.md のクローズド語彙（アナライザが返してよいラベル/エッジ型の上限・§7 裁定5）。
-# （2026-09-04-グラフのソース正典化.md §4）確定リスト＋A6（`Config` 追加）。刈った型は復活させない
-# （`ingest.model.NODE_LABELS`/`EDGE_TYPES` と同じ集合＝`world_neo4j.WORLD_EDGE_TYPES` が
-# `CORRESPONDS_TO` を別途加算する）。
+# docs/05-グラフ語彙.md のクローズド語彙（アナライザが返してよいラベル/エッジ型の上限）。`ingest.model.NODE_LABELS`/`EDGE_TYPES` と同じ集合。
 NODE_LABELS = frozenset({"Module", "Copybook", "Batch", "DataItem", "Table", "Document", "Config"})
 EDGE_TYPES = frozenset({"COPIES", "CONTAINS", "INVOKES", "ACCESSES", "DOCUMENTS"})
 
@@ -331,7 +238,7 @@ def known_analyzers() -> tuple[Analyzer, ...]:
 
 
 def registered_extensions() -> frozenset:
-    """全アナライザの担当拡張子の和集合（拡張子集合の単一の真実源・§2.4）。"""
+    """全アナライザの担当拡張子の和集合（拡張子集合の単一の真実源）。"""
     exts: set = set()
     for a in _ANALYZERS:
         exts |= set(a.extensions)
@@ -341,20 +248,7 @@ def registered_extensions() -> frozenset:
 def config_signature() -> tuple:
     """現在の有効構成の署名（核の分類契約版＋登録順のアナライザごとの `(name, version, extensions)`）。
 
-    world 署名（`ingest/worker.py::_sig`）・ES 設定署名（`es_index.needs_reindex`）の材料に使う——
-    新規アナライザの追加・CODE-1b（管理画面）による有効/無効・並び替え・部品ごとの `version` 変更の
-    いずれかで構成が変われば署名が変わり、標準の「署名不一致→再構築」経路で台帳・Neo4j・ES の
-    `branch`（`corpus_docs.classify_document` 確定値）が自動的に作り直される（専用の移行機構を
-    持たない・`importance.IMPORTANCE_SCHEMA_VERSION` と同じ流儀）。呼び出しごとに `_ANALYZERS`
-    から都度計算する（`registered_extensions()` と同じくキャッシュしない）。
-
-    材料を `(name, tuple(extensions))` から `(name, version, tuple(extensions))` へ拡張した
-    （拡張の契約 S4・部品ごとの版署名）——**署名の独立まで**が保証範囲: ある部品の `version` を
-    上げても他の部品の材料（`name, version, extensions`）はそれぞれ独立のタプルのまま不変。ただし
-    `_ANALYZERS` 全体のタプルは変わるため、`config_signature()` 全体の値は変わり、世代署名が
-    畳み込まれる world は現行どおり全再構築される（費用ゼロ・時間のみ——ファイル単位の解析キャッシュ
-    や部分再構築は別スライス）。この材料形状の変更自体が世代署名を変えるため
-    `CODE_ANALYZERS_SCHEMA_VERSION` の明示的な版上げは不要（v9 の新規アナライザ登録と同じ前例）。
+    world 署名・ES 設定署名の材料。構成や部品の `version` が変わると署名が変わり、標準の「署名不一致→再構築」で台帳・Neo4j・ES の `branch` が作り直される。呼び出しごとに `_ANALYZERS` から計算する（キャッシュしない）。
     """
     return (CODE_ANALYZERS_SCHEMA_VERSION,
             tuple((a.name, a.version, tuple(sorted(a.extensions))) for a in _ANALYZERS))
@@ -369,11 +263,7 @@ def candidates(rel_path: str) -> tuple[Analyzer, ...]:
 
 
 def resolve(rel_path: str, head_text: str = "") -> Analyzer | None:
-    """`rel_path` の担当アナライザ（優先順で `accepts()` を通った最初のもの・§7 裁定2/10）。
-
-    どのアナライザも通らなければ `None`（資料の枠へ倒す——実際に資料として扱われるのは既存の
-    資料種別に該当する場合のみ・該当しなければ未対応＝§7 裁定10）。
-    """
+    """`rel_path` の担当アナライザ（優先順で `accepts()` を通った最初のもの）。どれも通らなければ `None`（資料の枠へ倒す）。"""
     for a in candidates(rel_path):
         if a.accepts(rel_path, head_text):
             return a
@@ -383,12 +273,7 @@ def resolve(rel_path: str, head_text: str = "") -> Analyzer | None:
 def resolve_lazy(rel_path: str, read_head) -> Analyzer | None:
     """`resolve()` の遅延読み取り版。`accepts()` を上書きしている候補があるときだけ `read_head()` を呼ぶ。
 
-    候補全員が既定の `accepts`（常に真）のままなら先頭候補がそのまま確定し、`read_head` は
-    一度も呼ばれない（内容を読まない＝列挙コストを増やさない・§7 裁定10）。`read_head` は
-    実際に必要になるまでファイルを開かない callable として呼び出し側が渡す（例: 先頭数 KB を
-    読むクロージャ）——`size`（キーワード専用で呼ぶ・省略時の既定は呼び出し側のクロージャに委ねる）
-    を受け取れる必要がある。読む量は候補ごとの `head_bytes`（`Analyzer` 既定4KiB・
-    `HtmlTemplateAnalyzer` は64KiB）に従い、候補ごとに自分の head だけで判定する（Pass1 と同じ材料）。
+    候補全員が既定の `accepts` なら先頭候補で確定し、`read_head` は呼ばれない。`read_head` は必要になるまでファイルを開かない callable で、`size` をキーワード専用で受け取れること。読む量は候補ごとの `head_bytes`（既定4KiB・`HtmlTemplateAnalyzer` は64KiB）に従う。
     """
     cands = candidates(rel_path)
     if not cands:
@@ -396,9 +281,7 @@ def resolve_lazy(rel_path: str, read_head) -> Analyzer | None:
     overriding = [a for a in cands if _overrides_accepts(a)]
     if not overriding:
         return cands[0]
-    # 候補ごとに自分の `head_bytes` 分だけを渡す（world_graph の Pass1 と同じ判定材料にする）。
-    # 大きい head を要求する候補の読み取り結果を小さい head の候補にそのまま渡すと、両経路で
-    # 分類が食い違う（片方は受理・片方は拒否）。同じサイズの読み取りは 1 回だけ。
+    # 候補ごとに自分の `head_bytes` 分だけを渡す（world_graph の Pass1 と同じ判定材料にする。大きい head の読み取り結果を小さい head の候補へ渡すと両経路で分類が食い違う）。同じサイズの読み取りは1回だけ。
     heads: dict[int, str] = {}
     for a in cands:
         if not _overrides_accepts(a):

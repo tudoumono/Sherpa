@@ -1,9 +1,4 @@
-"""コード識別子の正規化（COBOL 項目名/プログラム名/コピーブック名 等）の**単一の真実源**。
-
-複数モジュール（static_analysis/world_graph/impact_service）が同じ正規化
-（`strip().rstrip(".").upper()`）を各自で定義/再定義していたのを1箇所に集約（RV: DRY）。
-※ `scope._norm`（パス prefix 用 `strip("/")`）は目的が違うので統合しない。
-"""
+"""コード識別子（COBOL の項目名・プログラム名・コピーブック名など）の正規化。"""
 from __future__ import annotations
 
 

@@ -16,19 +16,15 @@ def _factories(calls):
         calls.append(("openai", key))
         return {"provider": "openai", "key": key}
 
-    def gemini(key):
-        calls.append(("gemini", key))
-        return {"provider": "gemini", "key": key}
-
     def ollama(url):
         calls.append(("ollama", url))
         return {"provider": "ollama", "url": url}
 
-    return openai, gemini, ollama
+    return openai, ollama
 
 
 def _no_env(monkeypatch):
-    for k in ("OPENAI_API_KEY", "GEMINI_API_KEY", "OLLAMA_URL"):
+    for k in ("OPENAI_API_KEY", "OLLAMA_URL"):
         monkeypatch.delenv(k, raising=False)
     # 本ファイルは provider_key 解決ロジックの検証が目的のため、settings に直接書く
     # テスト用キーが解決されるよう個人キーの利用を許可しておく（A6 既定 false・その挙動自体は
@@ -36,36 +32,16 @@ def _no_env(monkeypatch):
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"personal_api_keys_allowed": True})
 
 
-def _select_gemini(monkeypatch):
-    """A7（クラウドプロバイダ排他選択）: gemini の明示選択を検証するテストは、gemini が
-    選択中のクラウドプロバイダであることを明示する必要がある（既定は openai・`sherpa.keys`）。"""
-    monkeypatch.setattr("sherpa.store.get_system_settings",
-                        lambda: {"personal_api_keys_allowed": True, "cloud_provider": "gemini"})
-
-
-def test_select_provider_without_key_is_unchanged(monkeypatch):
-    """`provider_key` 未指定の既存呼び出し（intent_llm/embeddings の旧経路相当）は byte-identical。"""
-    _no_env(monkeypatch)
-    _select_gemini(monkeypatch)
-    calls = []
-    openai, gemini, ollama = _factories(calls)
-    cfg = llm.select_provider({"extract_provider": "gemini", "gemini_api_key": "k"},
-                              openai=openai, gemini=gemini, ollama=ollama)
-    assert cfg == {"provider": "gemini", "key": "k"} and calls == [("gemini", "k")]
-
-
 def test_select_provider_ignores_individual_overrides_and_uses_auto(monkeypatch):
     """個人設定に `graph_provider`/`extract_provider` が残っていても読まれない＝常に auto 解決
-    （選択中のクラウドプロバイダ→ollama）へ進む。ここでは gemini を選択中にし、settings 側の
-    `extract_provider`/`graph_provider`（どちらも openai/ollama を指す）が無視されることを示す。"""
+    （openai のキー→ollama）へ進む。settings 側の `extract_provider`/`graph_provider`（ollama を
+    指す）が無視され、openai のキーがあれば openai が選ばれることを示す。"""
     _no_env(monkeypatch)
-    _select_gemini(monkeypatch)
     calls = []
-    openai, gemini, ollama = _factories(calls)
-    settings = {"extract_provider": "ollama", "graph_provider": "openai",
-                "gemini_api_key": "k", "openai_api_key": "o"}
-    cfg = llm.select_provider(settings, openai=openai, gemini=gemini, ollama=ollama)
-    assert cfg == {"provider": "gemini", "key": "k"} and calls == [("gemini", "k")]
+    openai, ollama = _factories(calls)
+    settings = {"extract_provider": "ollama", "graph_provider": "ollama", "openai_api_key": "o"}
+    cfg = llm.select_provider(settings, openai=openai, ollama=ollama)
+    assert cfg == {"provider": "openai", "key": "o"} and calls == [("openai", "o")]
 
 
 def test_graph_extract_available_ignores_graph_provider_uses_auto(monkeypatch):
@@ -163,25 +139,8 @@ def test_embeddings_cfg_openai_embed_model_defaults_without_catalog(monkeypatch)
     assert cfg["model"] == "text-embedding-3-small"
 
 
-def test_embeddings_cfg_gemini_embed_model_catalog_override(monkeypatch):
-    """`embeddings.cfg` 経由（`model_catalog.resolve_model` を直接呼ぶのではなく実際の消費者
-    パスを通す）で gemini/embed のカタログ上書きが効くことを固定する。組み込み既定のまま比較する
-    弱いテスト（`tests/unit/test_model_catalog.py`）だけだと、`embeddings.py::cfg` の配線自体が
-    外れても検知できない（RV 是正・カスタム値を使い、旧ハードコード値へ戻す回帰も検出できる形にする）。"""
-    _no_env(monkeypatch)
-    _select_gemini(monkeypatch)
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {
-        "personal_api_keys_allowed": True, "cloud_provider": "gemini",
-        "model_catalog": {"gemini": {"embed": {"allowed": ["my-gemini-embed"],
-                                                "default": "my-gemini-embed"}}}})
-    monkeypatch.delenv("SHERPA_DISABLE_EMBED", raising=False)
-    cfg = embeddings.cfg({"extract_provider": "gemini", "gemini_api_key": "g"})
-    assert cfg == {"provider": "gemini", "key": "g", "model": "my-gemini-embed", "dim": 1536,
-                   "parallel": 4}
-
-
 def test_embeddings_cfg_ollama_embed_model_catalog_override(monkeypatch):
-    """`embeddings.cfg` 経由で ollama/embed のカタログ上書きが効くことを固定する（上記 gemini 版と対）。"""
+    """`embeddings.cfg` 経由で ollama/embed のカタログ上書きが効くことを固定する（openai 版と対）。"""
     _no_env(monkeypatch)
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {
         "personal_api_keys_allowed": True,

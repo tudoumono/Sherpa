@@ -9,8 +9,8 @@
      （config 作成後に block が成立するケースも含む＝Popen 直前ガード自体の独立性を確認）。
   4. `agentic_search.py::openai_style`/`_run_evaluation`/`attribute_openai_style` の HTTP 実送信直前
      （endpoint/headers を入口で1回だけ確定させて使い回す設計のため、送信のたびに再確認する）。
-  5. `embeddings.py`/`graph_extract.py`（intent 共有）/`vision_arm.py`/`providers/openai.py`
-     （streaming）の通常 HTTP sink。URL/header **確定後**に block へ遷移させてから呼ぶ
+  5. `embeddings.py`/`graph_extract.py`（intent 共有）/`vision_arm.py`
+     の通常 HTTP sink。URL/header **確定後**に block へ遷移させてから呼ぶ
      （`_block_after_headers_built` 参照・入口確認だけで先に止まる false green を避ける）。
 
 `sherpa.llm._openai_endpoint_seed_blocked_reason` はプロセス内グローバル＝各テストは
@@ -178,103 +178,6 @@ def test_popen_reached_for_ollama_construct_when_seed_blocked(tmp_path, monkeypa
 
 # ===== 4. agentic_search.py（HTTP 実送信直前） =====
 
-def test_openai_style_does_not_post_when_seed_blocked(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: calls.append((a, kw)) or {
-        "choices": [{"message": {"content": "unused", "tool_calls": None}, "finish_reason": "stop"}]})
-    llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
-
-    with pytest.raises(RuntimeError):
-        list(agentic_search.openai_style(
-            "https://api.openai.com/v1/chat/completions", {"Authorization": "Bearer x"},
-            "gpt-5.5", "system", "user", "v1", None, ollama=False, max_turns=1))
-    assert calls == [], f"blocked 中なのに _post が呼ばれた: {calls!r}"
-
-
-def test_openai_style_ollama_not_blocked_by_seed_block(monkeypatch):
-    """`ollama=True` は openai_endpoint シード状態と無関係＝blocked 中でも _post に到達する。"""
-    calls: list = []
-
-    def _fake_post(*a, **kw):
-        calls.append((a, kw))
-        return {"message": {"content": "ok"}}
-
-    monkeypatch.setattr(agentic_search, "_post", _fake_post)
-    llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
-
-    events = list(agentic_search.openai_style(
-        "http://localhost:11434/api/chat", {}, "qwen2.5", "system", "user", "v1", None,
-        ollama=True, max_turns=1))
-    assert calls, "Ollama 経路なのに blocked で _post まで遮断された"
-    assert events, "Ollama 経路が blocked の影響で応答を返さなかった"
-
-
-def test_run_evaluation_does_not_post_when_seed_blocked(monkeypatch):
-    """`_run_evaluation` は blocked 中の `assert_openai_io_allowed()` の `RuntimeError` を
-    そのまま呼び出し元へ伝播させる（`_send` と同じ契約＝別ナッジでの飲み込み再試行はしない）。
-    ガードは予算消費/usage 加算より先＝弾かれた試行の分は消費しない。"""
-    calls: list = []
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: calls.append((a, kw)) or {})
-    llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
-
-    budget = agentic_search._CallBudget(5)
-    usage_acc = {"calls": 0, "tokens": None}
-    with pytest.raises(RuntimeError):
-        agentic_search._run_evaluation(
-            "https://api.openai.com/v1/chat/completions", {"Authorization": "Bearer x"},
-            "gpt-5.5", [{"role": "user", "content": "hi"}], ollama=False, timeout=5,
-            usage=agentic_search._new_usage_acc(), usage_acc=usage_acc, call_budget=budget)
-    assert calls == [], f"blocked 中なのに _post が呼ばれた: {calls!r}"
-    assert budget.remaining == 5
-    assert usage_acc["calls"] == 0
-
-
-def test_run_evaluation_ollama_not_blocked_by_seed_block(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: calls.append((a, kw)) or {
-        "message": {"tool_calls": [{"function": {"name": "submit_evaluation",
-                    "arguments": '{"status":"sufficient","next_action":"stop"}'}}]}})
-    llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
-
-    agentic_search._run_evaluation(
-        "http://localhost:11434/api/chat", {}, "qwen2.5", [{"role": "user", "content": "hi"}],
-        ollama=True, timeout=5, usage=agentic_search._new_usage_acc(), usage_acc=None)
-    assert calls, "Ollama 経路なのに blocked で _post まで遮断された"
-
-
-def test_attribute_openai_style_does_not_post_when_seed_blocked(monkeypatch):
-    """`attribute_openai_style` も同様に broad except で囲むため、blocked 時は空集合へ縮退する
-    （`_post` 自体は呼ばれないことを固定する）。ガードは予算消費/usage 加算より先＝blocked で
-    弾かれた試行の分は call_budget・usage_acc とも消費しない。"""
-    calls: list = []
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: calls.append((a, kw)) or {})
-    llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
-
-    budget = agentic_search._CallBudget(5)
-    usage_acc = {"calls": 0, "tokens": None}
-    out = agentic_search.attribute_openai_style(
-        "https://api.openai.com/v1/chat/completions", {"Authorization": "Bearer x"}, "gpt-5.5",
-        False, "answer text", "digest text", {"e1": {}}, timeout=5,
-        usage_acc=usage_acc, call_budget=budget)
-    assert calls == [], f"blocked 中なのに _post が呼ばれた: {calls!r}"
-    assert out == set()
-    assert budget.remaining == 5      # 消費していない
-    assert usage_acc["calls"] == 0    # 加算していない
-
-
-def test_attribute_openai_style_ollama_not_blocked_by_seed_block(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: calls.append((a, kw)) or {
-        "message": {"tool_calls": [{"function": {"name": "submit_attribution",
-                    "arguments": '{"evidence_ids":["e1"]}'}}]}})
-    llm.set_openai_endpoint_seed_blocked("test: 壊れた OPENAI_BASE_URL")
-
-    agentic_search.attribute_openai_style(
-        "http://localhost:11434/api/chat", {}, "qwen2.5", True, "answer text", "digest text",
-        {"e1": {}}, timeout=5)
-    assert calls, "Ollama 経路なのに blocked で _post まで遮断された"
-
-
 def test_assert_openai_io_allowed_raises_when_blocked(monkeypatch):
     monkeypatch.setattr(llm, "_openai_endpoint_seed_blocked_reason", "boom")
     with pytest.raises(RuntimeError, match="boom"):
@@ -408,46 +311,10 @@ def _spy_begin_openai_send(monkeypatch):
     return calls
 
 
-def test_send_uses_begin_openai_send_for_openai_sink(monkeypatch):
-    """`_send`（`openai_style` 内部の物理送信）は OpenAI 経路（`ollama=False`）で
-    `llm.begin_openai_send` を経由する。"""
-    spy_calls = _spy_begin_openai_send(monkeypatch)
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: {
-        "choices": [{"message": {"content": "ok", "tool_calls": None}, "finish_reason": "stop"}]})
-    list(agentic_search.openai_style(
-        "https://api.openai.com/v1/chat/completions", {"Authorization": "Bearer x"},
-        "gpt-5.5", "system", "user", "v1", None, ollama=False, max_turns=1))
-    assert len(spy_calls) >= 1, "_send が llm.begin_openai_send を経由していない"
-
-
-def test_run_evaluation_uses_begin_openai_send(monkeypatch):
-    """`_run_evaluation` は OpenAI 経路で `llm.begin_openai_send` を経由する。"""
-    spy_calls = _spy_begin_openai_send(monkeypatch)
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: {
-        "choices": [{"message": {"content": "not a tool call"}}]})
-    agentic_search._run_evaluation(
-        "https://api.openai.com/v1/chat/completions", {"Authorization": "Bearer x"},
-        "gpt-5.5", [{"role": "user", "content": "hi"}], ollama=False, timeout=5,
-        usage=agentic_search._new_usage_acc(), usage_acc=None)
-    assert len(spy_calls) >= 1, "_run_evaluation が llm.begin_openai_send を経由していない"
-
-
-def test_attribute_openai_style_uses_begin_openai_send(monkeypatch):
-    """`attribute_openai_style` は OpenAI 経路で `llm.begin_openai_send` を経由する。"""
-    spy_calls = _spy_begin_openai_send(monkeypatch)
-    monkeypatch.setattr(agentic_search, "_post", lambda *a, **kw: {
-        "choices": [{"message": {"tool_calls": [
-            {"function": {"name": "submit_attribution", "arguments": '{"used":["e1"]}'}}]}}]})
-    agentic_search.attribute_openai_style(
-        "https://api.openai.com/v1/chat/completions", {"Authorization": "Bearer x"}, "gpt-5.5",
-        False, "answer text", "digest text", {"e1": {}}, timeout=5)
-    assert len(spy_calls) >= 1, "attribute_openai_style が llm.begin_openai_send を経由していない"
-
-
 # ===== 5. HTTP sink 直前ガード（agentic 以外の通常 OpenAI HTTP 経路） =====
-# embeddings.py/graph_extract.py（intent 共有）/vision_arm.py/providers/openai.py（streaming）は
-# `llm.openai_url()`/`openai_headers()` の入口確認だけでなく、`llm.openai_post_json()`／
-# `providers/openai.py::_stream` 内の実送信直前ガードでも独立に止まることを固定する。実際に
+# embeddings.py/graph_extract.py（intent 共有）/vision_arm.py は
+# `llm.openai_url()`/`openai_headers()` の入口確認だけでなく、`llm.openai_post_json()` の
+# 実送信直前ガードでも独立に止まることを固定する。実際に
 # ソケットを開く関数（`llm.urlopen_no_redirect`）を直接差し替え、blocked 中は一切呼ばれないことを
 # 確認する（`llm.post_json`（Gemini/Ollama 共用）が一律遮断されていないことも併せて確認する）。
 #
@@ -513,19 +380,6 @@ def test_vision_arm_read_openai_does_not_open_socket_when_seed_blocked(monkeypat
         img.write_bytes(b"\x89PNG\r\n\x1a\n")
         with pytest.raises(RuntimeError):
             vision_arm._read_openai(img, {"model": "gpt-5.5-vision"}, timeout=5)
-    assert calls == [], f"blocked 中なのにソケットが開かれた: {calls!r}"
-
-
-def test_openai_provider_stream_raises_before_socket_open_when_seed_blocked(monkeypatch):
-    from sherpa.providers.openai import OpenAIProvider
-
-    calls: list = []
-    monkeypatch.setattr(llm, "urlopen_no_redirect", lambda *a, **kw: calls.append(1))
-    _block_after_headers_built(monkeypatch)
-
-    prov = OpenAIProvider(api_key="sk-test")
-    with pytest.raises(RuntimeError):
-        list(prov._stream("hello"))
     assert calls == [], f"blocked 中なのにソケットが開かれた: {calls!r}"
 
 

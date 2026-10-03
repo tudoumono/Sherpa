@@ -1,55 +1,14 @@
-"""JSP アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §13 波3 レーン A・
-ユーザー裁定 2026-09-06＝画面テンプレート/JS/CSS をグラフに載せ、画面↔Struts action／URL／bean の
-突合を可能にする）。
+"""JSP アナライザ。`.jsp`/`.jspx`/`.jspf`/`.tag`/`.tagx` を全件受理し、ファイル自体を主体定義（`Module`・拡張子込みファイル名）とする（children なし）。
 
-`.jsp`/`.jspx`/`.jspf`/`.tag`/`.tagx` を**全件受理**する。ファイル自体を主体定義（`Module`・
-primary・拡張子込みファイル名＝C アナライザと同型）とし、children は持たない（JSP は動的言語＋
-テンプレート構文であり、ファイル内の要素を構造的な子定義として抽出できるものが無いため）。
-
-**コメント除去**（JSP コメント `<%-- ... --%>`／HTML コメント `<!-- ... -->` の中身は
-空白化してから走査する・偽マッチ除外）は一方向の線形スキャナで行う（閉じていないコメントは
-末尾まで1回だけ空白化する——`.*?` の遅延regexは閉じタグが無い入力で二次時間になる）。
-
-**タグ走査**は開始タグ（`<name attr=... attr2=...>`）だけを対象にした小さな字句解析で行う
-（属性順不同・引用符省略・大文字タグ名を許容）。`<script>...</script>`／`<style>...</style>` の
-本文区間はタグ走査の対象から外す（本文中に偶然 `<a href="...">` のような文字列があっても
-参照を作らない）。
-
-**参照抽出**:
-- `<%@ include file="x.jspf" %>`（非タグ構文・個別regex）／`<jsp:include page="…">`／
-  `<c:import url="…">`／`<jsp:directive.include file="…">`（`.jspx`）／`<script src="x.js">`／
-  `<link href="x.css">` → `INVOKES(via=include)`（C アナライザと同じ2段解決＝相対パス完全一致→
-  拡張子込み basename 最近傍。`world_graph._resolve_include_relpath()` 側）。
-  - `http:`/`https:`/`//`/`data:`/`javascript:`/`mailto:`/`#` 始まりは include 対象外
-    （`Dropped("web_external_ref", line, uri)`・URL キーにもしない）。
-  - `/` 始まりの include は参照元の top scope（rel_path の最初のセグメント）へ連結し、
-    参照元ファイルからの相対パスへ変換してから `include_path` にする（共通層
-    `_resolve_include_relpath` は参照元相対の解決しか行わないため、生成側で変換する）。
-  - `<base href="...">` があるファイルでは、それ以降の相対（`/` 始まりでも外部でもない）
-    include は basename 最近傍へフォールバックさせず `Dropped("web_relative_under_base", line, path)`
-    にする（`<base>` の影響範囲は解析しないため安全側でファイル全体に適用する・検出限界）。
-    `<base href>` 自体は `Dropped("web_base_href", line)` を1件申告する。
-  - `?`/`#` 以降は basename/`include_path` 算出前に除去する（`app.js?v=1` → `app.js`）。
-- `<s:form action="login">`（`/`・`.` を含まない裸名）／`href="login.action"`（`.action` 拡張子）
-  → Struts action キーへ `ACCESSES(via=config_key)`（名前は `.action` と先頭 `/` を落とした裸名）。
-  **裸名判定は `action=`/`href=` 属性値の形だけで決める**（タグ名は問わない）——`href="orders"` の
-  ような拡張子なし相対リンクも同じ形のため action キーと誤認し得る（構造情報を見ない粗い判定の
-  裏返しの検出限界・意図的な簡素化）。判定前に `?`/`#` 以降を除去する。
-- `action="/orders/list"`／`href="/orders/list"`（拡張子なし・`/` 始まり）→ URL キーへ
-  `ACCESSES(via=config_key)`（名前はクエリ/フラグメントを除いたパスそのまま）。外部スキーム
-  （`//` 始まり等）は対象外。
-- `<jsp:useBean id="x" class="FQCN">` の `class` → `INVOKES(via=bean_class, qualified=True)`
-  （完全修飾名解決＝`world_graph._resolve_qualified()`）。`id` 属性は対象外（bean キーへの突合は
-  `<s:property value>` 等の値スタックが曖昧なため）。EL 式（`${bean.prop}`）も同じ理由で対象外
-  ——値がどの bean を指すか構文だけでは決まらない（検出限界としてそのまま見逃す）。
-- `<%@ page import="a.b.C" %>` はヒントのみ（エッジ化しない・Java の `import` と同じ扱い）。
-- `<%@ taglib tagdir="/WEB-INF/tags" %>` はディレクトリ指定であり単一ファイルへの参照ではない
-  ——エッジ化しない（`.tag`/`.tagx` ファイル自体は拡張子登録により通常どおり `Module` primary を
-  持つ・タグ使用側との突合＝プレフィックス解決は本アナライザのスコープ外）。
-- スクリプトレット `<% ... %>`（`<%@`/`<%=`/`<%--` を除く）内の Java コードは解析しない——
-  ファイルにつき `Dropped("jsp_scriptlet", line)` を1件申告する（複数出現しても最初の1件のみ）。
-
-大文字小文字は区別しない（タグ名・属性名とも小文字化して判定する・HTML/JSP の実務上の慣習）。
+コメント（`<%-- --%>`／`<!-- -->`）は線形スキャナで空白化し、タグ走査は開始タグだけの字句解析（属性順不同・引用符省略・大文字タグ名可）で行う。`<script>`/`<style>` の本文は走査対象外。
+参照抽出:
+- `<%@ include file>`／`<jsp:include page>`／`<c:import url>`／`<jsp:directive.include file>`／`<script src>`／`<link href>` → `INVOKES(via=include)`（C アナライザと同じ2段解決）。外部参照スキームは `Dropped("web_external_ref")`。`/` 始まりは top scope へ連結して参照元からの相対パスにする。`<base href>` があるファイルの相対 include は `Dropped("web_relative_under_base")`、`<base href>` 自体も `Dropped("web_base_href")` を1件申告する。`?`/`#` 以降は除去する。
+- `action=`/`href=` 属性値 → `ACCESSES(via=config_key)`。裸名・`.action` 拡張子＝Struts action キー、拡張子なしの `/` 始まり＝URL キー。判定は属性値の形だけで行う粗い判定。
+- `<jsp:useBean class="FQCN">` → `INVOKES(via=bean_class, qualified=True)`。`id` 属性・EL 式は対象外。
+- `<%@ page import>`・`<%@ taglib tagdir>` はエッジ化しない。
+- スクリプトレット内の Java は解析せず、ファイルにつき `Dropped("jsp_scriptlet")` を1件申告する。
+大文字小文字は区別しない（タグ名・属性名は小文字化して判定する）。
+設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
@@ -62,7 +21,7 @@ from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResul
 
 JSP_EXT = frozenset({".jsp", ".jspx", ".jspf", ".tag", ".tagx"})
 
-# 外部参照スキーム（include 対象外・URL キーにもしない）。
+# 外部参照スキーム（include 対象外）。
 _EXTERNAL_SCHEMES = ("http:", "https:", "//", "data:", "javascript:", "mailto:", "#")
 
 
@@ -71,7 +30,7 @@ def _is_external_ref(path: str) -> bool:
 
 
 def _strip_query_fragment(val: str) -> str:
-    """`?`/`#` 以降を除去する（先に出現した方で切る・action判定/拡張子判定/basename取得の前段）。"""
+    """`?`/`#` 以降を除去する（先に出現した方で切る）。"""
     cut = len(val)
     for ch in ("?", "#"):
         idx = val.find(ch)
@@ -81,9 +40,7 @@ def _strip_query_fragment(val: str) -> str:
 
 
 def _scope_relative_include_path(ref_rel: str, raw_path: str) -> str:
-    """`/` 始まりの include を参照元の top scope（世代フォルダ）へ連結し、参照元ファイルからの
-    相対パスに変換する（`raw_path` は先頭 `/` を含む・共通層 `world_graph._resolve_include_relpath`
-    は参照元相対の解決しか行わないため、生成側でこの変換を行う）。"""
+    """`/` 始まりの include を参照元の top scope へ連結し、参照元ファイルからの相対パスに変換する（共通層 `_resolve_include_relpath` は参照元相対しか解決しないため）。"""
     stripped = raw_path.lstrip("/")
     if "/" not in ref_rel:
         return stripped
@@ -93,13 +50,12 @@ def _scope_relative_include_path(ref_rel: str, raw_path: str) -> str:
     return posixpath.relpath(target, start=base_dir)
 
 
-# JSP コメント／HTML コメントの開始マーカー（一方向の線形スキャナで空白化・偽マッチ除外専用）。
+# JSP コメント／HTML コメントの開始マーカー（線形スキャナで空白化する）。
 _COMMENT_MARKER_RE = re.compile(r'<%--|<!--')
 
 
 def _sanitize_comments(text: str) -> str:
-    """`<%-- ... --%>`／`<!-- ... -->` を線形1パスで空白化する（改行は保持・閉じていない
-    コメントは末尾まで1回で打ち切る——`.*?` の遅延regexは閉じタグが無い入力で二次時間になる）。"""
+    """`<%-- ... --%>`／`<!-- ... -->` を線形1パスで空白化する（改行は保持。閉じていないコメントは末尾まで）。"""
     out: list = []
     i, n = 0, len(text)
     while i < n:
@@ -138,15 +94,9 @@ _BARE_ACTION_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
 
 
 def _config_key_from_action_or_href(val: str) -> tuple[str, str] | None:
-    """`action`/`href` 属性値から `(名前, 種別)` を返す（種別は `extra["key_kind"]` として
-    `RefCandidate` にそのまま渡す・Config キーの名前空間分離）。
+    """`action`/`href` 属性値から `(名前, 種別)` を返す（種別は `extra["key_kind"]`）。
 
-    `?`/`#` 以降は判定前に除去する（`/login.action?next=/` → action キー `login`・
-    `/orders/list#tab` → URL キー `/orders/list`）。外部参照スキーム（`//` 始まり等）は対象外。
-    `.action` 拡張子＝Struts action キー（拡張子と先頭 `/` を落とす）。`/` 始まり＋最終セグメントに
-    `.` を含まない＝URL キー。`/`/`.` を含まない裸名（英数字/`_`/`-` のみ）＝Struts action キー
-    そのまま（`<s:form action="login">` 形）。どれにも該当しなければ `None`
-    （外部 URL・`#`・`javascript:...`・拡張子付き静的資産等は対象外）。
+    `?`/`#` 以降は除去し、外部参照スキームは対象外。`.action` 拡張子＝Struts action キー（拡張子と先頭 `/` を落とす）、`/` 始まりで最終セグメントに `.` なし＝URL キー、`/`/`.` を含まない裸名＝Struts action キー。どれにも該当しなければ `None`。
     """
     if not val:
         return None
@@ -170,8 +120,7 @@ def _config_key_from_action_or_href(val: str) -> tuple[str, str] | None:
 
 def _emit_include(raw_path: str, line: int, ref_rel: str, refs: list, dropped: list,
                   has_base: bool) -> None:
-    """include 系参照候補1件の処理（外部参照除外・`/` 始まりの scope 相対化・`<base>` 配下の
-    相対 include の抑止・basename 抽出）。"""
+    """include 系参照候補1件の処理（外部参照除外・`/` 始まりの scope 相対化・`<base>` 配下の相対 include の抑止・basename 抽出）。"""
     path = raw_path.replace("\\", "/")
     if _is_external_ref(path):
         dropped.append(Dropped("web_external_ref", line, path))
@@ -190,10 +139,9 @@ def _emit_include(raw_path: str, line: int, ref_rel: str, refs: list, dropped: l
                                  extra={"via": "include", "include_path": path}))
 
 
-# --- 開始タグの字句解析（属性順不同・引用符省略・大文字タグ名を許容） -----------------------
+# 開始タグの字句解析（属性順不同・引用符省略・大文字タグ名を許容）
 
-# 開始/終了タグ本体（属性文字列は「引用符区間 or `>`/引用符以外の1文字」の繰り返しとして消費し、
-# 属性値中の `>` に惑わされない）。
+# 開始/終了タグ本体（属性文字列は「引用符区間 or `>`/引用符以外の1文字」の繰り返しとして消費する）。
 _TAG_RE = re.compile(
     r'<(?P<slash>/?)(?P<name>[A-Za-z][A-Za-z0-9:._-]*)(?P<attrs>(?:"[^"]*"|\'[^\']*\'|[^>"\'])*)>'
 )
@@ -222,12 +170,7 @@ def _parse_attrs(attrs_str: str) -> dict:
 
 
 def _script_style_body_spans(text: str) -> list:
-    """`<script>...</script>`／`<style>...</style>` の本文区間（開始タグの直後〜対応する終了
-    タグの直前）。属性走査の対象から外す（本文中の偽タグ／属性値誤検出を防ぐ）。
-
-    終了タグ検索は `text[body_start:]` を切り出さず、コンパイル済みパターンの `search(text, pos)`
-    に位置だけを渡す——スライスは残り全文のコピーを毎回作るため、`<script>`/`<style>` が多い
-    ファイルで二次時間になる。"""
+    """`<script>`/`<style>` の本文区間（開始タグ直後〜終了タグ直前）。属性走査の対象から外す。終了タグ検索は `text[body_start:]` を切り出さず、`search(text, pos)` に位置を渡す（二次時間を避ける）。"""
     spans: list = []
     pos, n = 0, len(text)
     while pos < n:
@@ -245,9 +188,7 @@ def _script_style_body_spans(text: str) -> list:
 
 
 class JspAnalyzer(Analyzer):
-    """ファイル自体 → `Module`（primary・拡張子込みファイル名）。children は持たない。
-    include/script/link → `INVOKES(via=include)`。action/href の設定キー相当 → `ACCESSES
-    (via=config_key)`。`useBean class` → `INVOKES(via=bean_class, qualified)`。"""
+    """ファイル自体 → `Module`（primary）。include/script/link → `INVOKES(via=include)`。action/href → `ACCESSES(via=config_key)`。`useBean class` → `INVOKES(via=bean_class, qualified)`。"""
 
     name = "jsp"
     extensions = JSP_EXT
@@ -264,9 +205,7 @@ class JspAnalyzer(Analyzer):
         dropped: list = []
 
         exclude_spans = _script_style_body_spans(sanitized)
-        # `_TAG_RE.finditer` はタグ出現順（位置昇順）で返し、`exclude_spans` も左から右への
-        # 線形走査で作られるため位置昇順——両方を単調ポインタで1回だけ突合する（タグごとに
-        # `exclude_spans` 全件を再スキャンする二次時間を避ける）。
+        # `_TAG_RE.finditer` と `exclude_spans` はともに位置昇順なので、単調ポインタで1回だけ突合する。
         tag_matches = []
         excl_idx, n_excl = 0, len(exclude_spans)
         for m in _TAG_RE.finditer(sanitized):

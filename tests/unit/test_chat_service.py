@@ -870,7 +870,7 @@ def test_handle_message_shares_one_system_settings_snapshot_with_get_provider(mo
     """決定的レンズ（`_dispatch` の調べる深さ計算）と agentic 経路（`get_provider` の provider 選択）
     が同じ fresh snapshot を受け取る（別世代の system_settings を見ない・WEB-1 契約と統合）。"""
     _mock_store_no_db(monkeypatch)
-    sentinel = {"depth_base_max_turns": 42}
+    sentinel = {"depth_base_grep_max_hits": 42}
     monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: sentinel)
     captured = {}
 
@@ -886,7 +886,7 @@ def test_handle_message_shares_one_system_settings_snapshot_with_get_provider(mo
 
 def test_stream_message_shares_one_system_settings_snapshot_with_get_provider(monkeypatch):
     _mock_store_no_db(monkeypatch)
-    sentinel = {"depth_base_max_turns": 42}
+    sentinel = {"depth_base_grep_max_hits": 42}
     monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: sentinel)
     captured = {}
 
@@ -1664,7 +1664,7 @@ def _sm(depth_profile=None, **extra):
            "depth_profile": depth_profile, **extra}
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 8), ("standard", 8), ("deep", 10), ("max", 12)])
+@pytest.mark.parametrize("profile,expected_depth", [(None, 10), ("standard", 10), ("deep", 12), ("max", 14)])
 def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expected_depth):
     """影響たどりの深さ（既定 8）に深さの加算（標準+0／深く+2／最大+4）が載る。"""
     captured = {}
@@ -1678,7 +1678,7 @@ def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expecte
     assert captured["depth"] == expected_depth
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 3), ("standard", 3), ("deep", 5), ("max", 7)])
+@pytest.mark.parametrize("profile,expected_depth", [(None, 4), ("standard", 4), ("deep", 6), ("max", 8)])
 def test_dispatch_troubleshoot_depth_scales_with_profile(monkeypatch, profile, expected_depth):
     """トラブルシュート近傍の深さ（既定 3）にも同じ加算が載る。"""
     captured = {}
@@ -2638,129 +2638,6 @@ def test_stream_message_explicit_lens_wires_into_ctx_route(monkeypatch):
     ctx = captured["ctx"]
     assert ctx.scope_meta["lens_source"] == "explicit"
     assert ctx.route("夜間バッチが心配")["lens"] == "troubleshoot"
-
-
-# ===== STOP-1: 予算停止→保存済み answer までの統合（実プロバイダ経由） =====
-# `_FakeCtxCaptureProvider`（上）とは異なり、ここでは実際に `_GenProvider._agentic_run` を通す
-# （LLM だけ `agentic_search._post` をスタブ）——`providers/base.py` の budget_exhausted ガードが
-# 単発 grep フォールバックへ逃げず、固定 headline と Evidence Packet を `store.add_message` まで
-# 実際に届けることを end-to-end で固定する（フロント直接注入の e2e だけでは検出できないサーバ側の
-# 経路を通す）。
-
-def _mock_store_and_real_openai_provider(monkeypatch, *, max_turns=12, max_tools_per_turn=16,
-                                         tool_result_max_total_bytes=200_000):
-    """`store` をフェイク差し替えしつつ、`get_provider` は実 `OpenAIProvider` を返す
-    （Neo4j 依存の `_known_terms`/router 自動判定は避け、lens 明示指定で `_agentic_run` へ直行する）。
-
-    `MAX_TURNS`/`MAX_TOOLS_PER_TURN` は import 時に env（`SHERPA_AGENTIC_MAX_TURNS`/
-    `SHERPA_AGENTIC_MAX_TOOLS_PER_TURN`）で決まる可変値のため、呼び出し元が意図した
-    stop_reason（例: `tools_per_turn_exceeded`）とは別の予算超過（例: `turns_exhausted`）へ
-    先に落ちてテストが環境依存で不安定にならないよう、ここで明示的に固定する
-    （`TOOL_RESULT_MAX_TOTAL_BYTES` はコード既定の固定値だが、同じ理由で揃えて明示的に渡す）。
-    """
-    import sherpa.agentic_search as A
-    from sherpa.providers.openai import OpenAIProvider
-
-    monkeypatch.setattr(A, "MAX_TURNS", max_turns)
-    monkeypatch.setattr(A, "MAX_TOOLS_PER_TURN", max_tools_per_turn)
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", tool_result_max_total_bytes)
-    monkeypatch.setattr(A, "es_index", A.es_index)
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    saved = _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(CS, "get_provider", lambda settings, system_settings=None: OpenAIProvider("sk-dummy", "gpt-5.5"))
-    monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
-    return saved, A
-
-
-def test_stream_message_tools_per_turn_exceeded_saves_budget_headline_and_packet(monkeypatch):
-    """実環境の実害の再現: `SHERPA_AGENTIC_MAX_TOOLS_PER_TURN`（既定16）到達で打ち切られた
-    ターン（`stop_reason="tools_per_turn_exceeded"`）が、単発 grep フォールバック（Evidence
-    Packet ごと喪失）へ落ちずに固定 headline で保存されることを固定する。"""
-    from sherpa.providers.prompts import _BUDGET_EXHAUSTED_HEADLINE
-
-    saved, A = _mock_store_and_real_openai_provider(monkeypatch)
-    calls = [{"id": f"c{i}", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}
-             for i in range(25)]   # MAX_TOOLS_PER_TURN（既定16）超過＝1回の応答だけで打ち切り
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: {
-        "choices": [{"message": {"content": "", "tool_calls": calls}}]}
-    try:
-        list(CS.stream_message(None, "消費税率は?", world="v1", conversation_id=999,
-                               user_id="admin", knowledge=True, lens="qa"))
-    finally:
-        A._post = orig_post
-
-    row = next(r for r in saved if r["role"] == "assistant")
-    assert row["answer"]["headline"] == _BUDGET_EXHAUSTED_HEADLINE
-    assert row["answer"]["data"]["evidence_packet"]["stop_reason"] == "tools_per_turn_exceeded"
-
-
-def test_stream_message_budget_exceeded_saves_budget_headline_and_packet(monkeypatch):
-    """呼び出し予算（`_CallBudget`）枯渇（`stop_reason="budget_exceeded"`）でも同様に固定
-    headline で保存される（`tools_per_turn_exceeded` と別の生成箇所であることの回帰）。"""
-    from sherpa.providers.prompts import _BUDGET_EXHAUSTED_HEADLINE
-
-    saved, A = _mock_store_and_real_openai_provider(monkeypatch)
-    orig_post = A._post
-    # 1ターン目の tool_calls 応答の直後、呼び出し予算が枯渇した状態を模す
-    # （`_send` は物理送信のたびに `llm.begin_openai_send` を通るため、鍵検証まで到達させず
-    # `_post` 自体をスタブし、2回目の送信で `SendBudgetExceeded` を模擬する）。
-    import sherpa.llm as llm
-
-    def fake_begin(call_budget, usage_acc):
-        if fake_begin.n == 0:
-            fake_begin.n += 1
-            return
-        raise llm.SendBudgetExceeded("budget_exceeded")
-    fake_begin.n = 0
-    monkeypatch.setattr(llm, "begin_openai_send", fake_begin)
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}]
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        list(CS.stream_message(None, "消費税率は?", world="v1", conversation_id=999,
-                               user_id="admin", knowledge=True, lens="qa"))
-    finally:
-        A._post = orig_post
-
-    row = next(r for r in saved if r["role"] == "assistant")
-    assert row["answer"]["headline"] == _BUDGET_EXHAUSTED_HEADLINE
-    assert row["answer"]["data"]["evidence_packet"]["stop_reason"] == "budget_exceeded"
-
-
-def test_stream_message_turns_exhausted_with_ungrounded_synthesis_replaces_headline(monkeypatch):
-    """STOP-1: `turns_exhausted` の末尾合成（OpenAI 方言は追加 `_post` で非空本文を生成できる）が
-    根拠0件のまま断定文を返しても、その未検証の生成本文をそのまま回答として保存しない
-    （grounded QA 契約——根拠ゲートを自力で満たさない部分回答は固定 headline へ強制的に
-    差し替える。空回答のケースとは別の穴のため独立に固定する）。"""
-    from sherpa.providers.prompts import _BUDGET_EXHAUSTED_HEADLINE
-
-    saved, A = _mock_store_and_real_openai_provider(monkeypatch, max_turns=1)
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, set(), [], [])   # 根拠0件（citation も構造 Evidence も無し）
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        # `max_turns=1` でループが尽きた直後の末尾合成——tool_calls 無し・非空本文（根拠0件のまま）。
-        {"choices": [{"message": {"content": "資料にない断定本文（根拠なし）。"}}]},
-    ]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        list(CS.stream_message(None, "消費税率は?", world="v1", conversation_id=999,
-                               user_id="admin", knowledge=True, lens="qa"))
-    finally:
-        A._post = orig_post
-
-    row = next(r for r in saved if r["role"] == "assistant")
-    assert row["answer"]["headline"] == _BUDGET_EXHAUSTED_HEADLINE
-    assert "資料にない断定本文" not in row["answer"]["headline"]
-    assert row["answer"]["data"]["evidence_packet"]["stop_reason"] == "turns_exhausted"
-    assert row["answer"]["data"]["evidence_packet"]["evidence_selected"] == 0
 
 
 # ===== 打切り申告がチャットの headline へ出る（検収是正） =====

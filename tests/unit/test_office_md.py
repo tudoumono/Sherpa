@@ -762,7 +762,7 @@ def test_rag_sidecars_missing_disabled_arm_extension_is_not_falsely_flagged(monk
     マニフェストは空リストとして記録され、欠落扱いにはならない。"""
     import openpyxl
 
-    monkeypatch.setenv("SHERPA_ARMS", "pdf_text")     # ooxml を含まない構成
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "pdf_text")     # ooxml を含まない構成
     d = tempfile.mkdtemp()
     src = pathlib.Path(d) / "src"
     src.mkdir()

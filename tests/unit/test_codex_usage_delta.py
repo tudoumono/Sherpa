@@ -232,7 +232,7 @@ def test_fresh_session_without_prev_total_uses_raw_accumulated_usage(tmp_path, m
 # ===== STAT-3 S1（利用統計の拡充）: env["usage"] へ depth_profile/reasoning を足す =====
 
 def test_deep_depth_profile_keeps_configured_reasoning_in_usage(tmp_path, monkeypatch):
-    """推論レベルは深さで変えない——「深く」でも `model_reasoning_effort` は基準値（既定 "low"）の
+    """推論レベルは深さで変えない——「深く」でも `model_reasoning_effort` は基準値（既定 "medium"）の
     まま渡り、`env["usage"]["reasoning"]` もその値になる（上書きが無いので `reasoning_base` は
     付かない）。"""
     steps = [{"thread_id": "SID-DEEP", "agent_messages": ["確認した結果、影響はありません。"],
@@ -244,10 +244,10 @@ def test_deep_depth_profile_keeps_configured_reasoning_in_usage(tmp_path, monkey
     env = _result_env(_run(prov, ctx))
 
     calls = _read_argv_log(argv_log)
-    assert any("model_reasoning_effort=low" in a for a in calls[0]), \
-        f"実際に codex exec へ渡した引数が基準値 low のままになっていない: {calls[0]!r}"
+    assert any("model_reasoning_effort=medium" in a for a in calls[0]), \
+        f"実際に codex exec へ渡した引数が基準値 medium のままになっていない: {calls[0]!r}"
     assert env["usage"]["depth_profile"] == "deep"
-    assert env["usage"]["reasoning"] == "low"
+    assert env["usage"]["reasoning"] == "medium"
     assert "reasoning_base" not in env["usage"]
 
 
@@ -262,7 +262,7 @@ def test_standard_depth_profile_omits_reasoning_base_when_unchanged(tmp_path, mo
     env = _result_env(_run(prov, ctx))
 
     assert env["usage"]["depth_profile"] == "standard"
-    assert env["usage"]["reasoning"] == "low"
+    assert env["usage"]["reasoning"] == "medium"
     assert "reasoning_base" not in env["usage"]
 
 
@@ -809,27 +809,9 @@ def test_start_log_budget_per_result_uses_admin_baseline_unaffected_by_window(tm
     assert "window_cli=none" in line, line
     assert "budget_per_result=65536" in line, line
     assert "budget_total=none" in line, line
-    assert "reasoning=low" in line, line
+    assert "reasoning=medium" in line, line
     assert "max_calls=none" in line, line
     assert "max_hits=" in line and "window_cap=" in line, line
-
-
-def test_start_log_max_calls_always_none_even_for_quick_depth(tmp_path, monkeypatch, caplog):
-    """呼び出し回数の上限は撤去済み——クイックであっても開始行は常に `max_calls=none`
-    （調査を終了させる上限を外す・受け入れ条件3の固定）。"""
-    steps = [{"thread_id": "SID-LOG-QUICK", "agent_messages": ["確認した結果、影響はありません。"],
-              "usage": _usage()}]
-    _setup(tmp_path, monkeypatch, steps, users_dirname="users_log_start_quick")
-    prov = A.CodexProvider(system_settings={})
-    ctx = _ctx(uid="log-start-quick", conversation_id=1003, scope_meta={"depth_profile": "quick"})
-
-    with caplog.at_level(logging.INFO):
-        _run(prov, ctx)
-
-    starts = _codex_log_lines(caplog, "start ")
-    assert len(starts) == 1, starts
-    line = starts[0]
-    assert "max_calls=none" in line, line
 
 
 def test_end_log_shows_parent_and_child_token_breakdown(tmp_path, monkeypatch, caplog):

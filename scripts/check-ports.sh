@@ -126,14 +126,23 @@ check_pair() {  # $1=項目名 $2=compose変数名 $3=compose側ポート $4=ア
 # （(1) は設定の誤りそのものなので省略しない）。
 resolve_host() {  # $1=host → 解決できれば 0
   local host="$1"
-  command -v getent >/dev/null 2>&1 || return 0     # getent が無い最小環境では判定不能＝通す（fail-open はここだけ・後段の疎通で拾う）
-  getent ahosts "$host" >/dev/null 2>&1 || getent hosts "$host" >/dev/null 2>&1
+  if command -v getent >/dev/null 2>&1; then
+    getent ahosts "$host" >/dev/null 2>&1 || getent hosts "$host" >/dev/null 2>&1
+  elif command -v "${PYTHON_BIN:-python3}" >/dev/null 2>&1; then
+    # getent の無い環境（macOS の標準構成）は Python の名前解決で同じ検査を行う。
+    "${PYTHON_BIN:-python3}" "$ROOT/scripts/lib/portable_tools.py" resolve "$host" >/dev/null 2>&1
+  else
+    echo "WARN: getent も python も無いため ${host} の名前解決を確認できません" >&2
+    return 1   # 確認できないものを黙って通さない
+  fi
 }
 
 tcp_reachable() {  # $1=host $2=port → 3 秒以内に接続できれば 0
   local host="$1" port="$2"
   if command -v timeout >/dev/null 2>&1; then
     timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1
+  elif command -v "${PYTHON_BIN:-python3}" >/dev/null 2>&1; then
+    "${PYTHON_BIN:-python3}" "$ROOT/scripts/lib/portable_tools.py" tcp "$host" "$port" 3 >/dev/null 2>&1
   else
     (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1
   fi

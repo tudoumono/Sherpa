@@ -3,8 +3,8 @@
 正典: `docs/archive/2026-09-04-グラフのソース正典化.md` §3 K6・§4b S1。木の集計本体
 （`sherpa/folder_tree.py`）は `doc_ledger.documents_for()` を monkeypatch した合成データで
 精密に固定する（深さクランプ・per-フォルダ打切り・列挙件数の安全弁は fixtures の実木では
-境界条件を作りにくいため）。配線（`agentic_search.run_tool`/`openai_tools`/`gemini_tools`/
-`mcp_server._tool_defs`/SYSTEM）は実 fixtures（`v1`）で最小限の統合テストを添える。
+境界条件を作りにくいため）。配線（`agentic_search.run_tool`/
+`mcp_server._tool_defs`）は実 fixtures（`v1`）で最小限の統合テストを添える。
 """
 from __future__ import annotations
 
@@ -179,15 +179,6 @@ def test_run_tool_forwards_layer_to_folder_tree(monkeypatch):
 
 # ---- ツール登録（§5 の各配線箇所）----
 
-def test_registered_in_openai_tools():
-    names = [t["function"]["name"] for t in agentic_search.openai_tools(with_es=True, with_graph=True)]
-    assert "folder_tree" in names
-
-
-def test_registered_in_gemini_tools():
-    names = [f["name"] for f in agentic_search.gemini_tools(with_es=True, with_graph=True)[0]["functionDeclarations"]]
-    assert "folder_tree" in names
-
 
 def test_registered_in_mcp_tool_defs(monkeypatch):
     monkeypatch.delenv("SHERPA_MCP_ASK_DISABLED", raising=False)
@@ -204,5 +195,3 @@ def test_mcp_tool_defs_es_search_still_placed_right_after_ripgrep_search(monkeyp
     assert names.index("es_search") == names.index("ripgrep_search") + 1
 
 
-def test_system_prompt_mentions_folder_tree():
-    assert "folder_tree" in agentic_search.SYSTEM

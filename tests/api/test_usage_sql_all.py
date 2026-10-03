@@ -3,10 +3,8 @@
 - 回答時間（avg/median/p90/max）・会話あたりターン数分布を SQL（`percentile_cont`/`percentile_disc`）で求めた値が、
   参照実装（`_compute_response_time_stats`/`_compute_conversation_turn_stats`＝最近傍順位・中央値は
   偶数件で中央 2 値の平均）と一致する。
-- 会話別上位（`conversations_top`/`usage_conversations`）の並び・件数・内訳が既知の入力どおり。
-- 調査ツール（`usage_by_user`/`usage_daily`/`usage_stop_kinds`/`usage_response_time`/
-  `usage_conversation_detail`/`usage_export_turns`）が `turn_metrics` を読み、画面（`usage_stats`）と同じ数字を返す
-  （失敗ターンの実消費も数える）。
+- 会話別上位（`conversations_top`）の並び・件数・内訳が既知の入力どおり。
+- 画面（`usage_stats`）と利用明細（`usage_export_turns`）が `turn_metrics` を読む（失敗ターンの実消費も数える）。
 - `usage_stats` は集計値を返すだけで、ターン・巡の行を Python へ引かない（返る行数がデータ量に比例しない）。
 
 要 Postgres。DB 不可は SKIP。
@@ -157,77 +155,16 @@ def test_conversations_top_ranks_by_tokens_turns_elapsed_with_kind_breakdown(see
     assert c1["response_time_avg_ms"] == 4000.0                                            # (1000+2000+3000+10000)/4
     c3 = next(e for e in mine if e["conversation_id"] == s.c3)
     assert c3["kinds"] == [] and c3["response_time_avg_ms"] is None
-    # ツール版: 並び順と件数上限・利用者絞り込み
-    ua, ub = s.users
-    by_turns = store.usage_conversations(time_from=_FROM, time_to=_TO, sort="turns", uid=ua)["conversations"]
-    assert [e["conversation_id"] for e in by_turns] == [s.c1]
-    elapsed = store.usage_conversations(time_from=_FROM, time_to=_TO, sort="elapsed", uid=ub, limit=1)["conversations"]
-    assert [e["conversation_id"] for e in elapsed] == [s.c2]                               # kind の所要時間合計 40
-    both = store.usage_conversations(time_from=_FROM, time_to=_TO, sort="tokens", limit=50)["conversations"]
-    assert [e["conversation_id"] for e in both if e["conversation_id"] in (s.c1, s.c2, s.c3)] == [s.c2, s.c1, s.c3]
-    assert "display_name" not in both[0]
 
 
-def test_usage_tools_read_turn_metrics_and_match_the_screen(seed):
-    s = seed
-    ua, ub = s.users
+def test_usage_stats_screen_reads_turn_metrics(seed):
     stats = store.usage_stats(time_from=_FROM, time_to=_TO)
-    # ユーザー別 × 用途別: chat は失敗ターンの実消費（activity）も数える
-    rows = store.usage_by_user(time_from=_FROM, time_to=_TO, uid=ua)["rows"]
-    chat = next(r for r in rows if r["kind"] == "chat")
-    assert chat == {"uid": ua, "kind": "chat", "calls": 4, "input": 560, "cached_input": 100, "output": 56,
-                    "reasoning_output": 7, "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
-    screen = next(r for r in stats["tokens"]["by_user_kind"] if r["uid"] == ua and r["kind"] == "chat")
-    assert {k: chat[k] for k in ("calls", "input", "output")} == {k: screen[k] for k in ("calls", "input", "output")}
-    assert [r["kind"] for r in store.usage_by_user(time_from=_FROM, time_to=_TO, uid=ub, kind="chat")["rows"]] == ["chat"]
-    # 日別: tokens（失敗ターンの実消費を含む）・response_time
+    # 日別 tokens は失敗ターンの実消費も数える
     d0, d1 = (_BASE + timedelta(days=0)).date().isoformat(), (_BASE + timedelta(days=1)).date().isoformat()
     tokens_series = {r["date"]: r for r in stats["tokens"]["daily"]}
     assert tokens_series[d0]["input"] == 560 and tokens_series[d1]["input"] == 15
-    # 終了理由: 返答のあるターンだけ（停止・実行中は数えない）
-    sk = store.usage_stop_kinds(time_from=_FROM, time_to=_TO, uid=ua)
-    assert sk["stop_kinds"] == [{"stop_kind": "completed", "turns": 3}, {"stop_kind": "timeout", "turns": 1}]
+    # 終了理由は返答のあるターンだけ（停止・実行中は数えない）
     assert [x for x in stats["stop_kinds"] if x["stop_kind"] == "timeout"] == [{"stop_kind": "timeout", "turns": 1}]
-    # 会話 1 件の内訳
-    d = store.usage_conversation_detail(s.c1)
-    assert d["user_turns"] == 4
-    k = {x["kind"]: x for x in d["kinds"]}
-    assert k["chat"]["calls"] == 4 and k["chat"]["input"] == 560 and k["chat-sub"]["calls"] == 2
-    assert d["response_time_series"] == [
-        {"turn": 1, "duration_ms": 1000, "provider": "codex"}, {"turn": 2, "duration_ms": 2000, "provider": "codex"},
-        {"turn": 3, "duration_ms": 3000, "provider": "codex"}, {"turn": 4, "duration_ms": 10000, "provider": "codex"}]
-    d3 = store.usage_conversation_detail(s.c3)
-    assert d3["user_turns"] == 1 and d3["kinds"] == [] and d3["response_time_series"] == []
-    assert "error" in store.usage_conversation_detail(10**9)
-
-
-def test_recent_window_tools_response_time_and_daily():
-    """`days` だけで期間を決めるツール（`usage_response_time`/`usage_daily`）は、直近の窓に仕込んだ
-    一意な経路名の回答で確かめる（他のテストのデータと混ざらない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    prov = f"sqlprov{_sfx()}"
-    c = store.create_conversation(user_id=f"sqlrecent{_sfx()}", world="sqlw")
-    base = datetime.now(_JST) - timedelta(days=1)
-    ids = []
-    for dur in (100, 200, 600):
-        for role, kw in (("user", {}), ("assistant", {"lens": "qa", "answer": _answer(provider=prov, duration_ms=dur)})):
-            m = store.add_message(c["id"], role, "x", **kw)
-            base += timedelta(minutes=1)
-            ids.append((m["id"], base))
-    with psycopg.connect(store._dsn()) as k:
-        for mid, t in ids:
-            k.execute("UPDATE messages SET created_at=%s WHERE id=%s", (t, mid))
-        k.execute("UPDATE turn_metrics tm SET created_at = m.created_at FROM messages m WHERE m.id = tm.message_id")
-    rt = store.usage_response_time(days=7, provider=prov)
-    assert rt["provider"] == prov
-    assert {k: rt[k] for k in ("avg", "median", "max", "p90", "n")} == U._compute_response_time_stats([100, 200, 600])
-    assert rt["median"] == 200.0 and rt["p90"] == 600.0
-    assert store.usage_response_time(days=7, provider=f"{prov}-none")["n"] == 0
-    series = store.usage_daily(days=7, metric="response_time")["series"]
-    assert sum(r["n"] for r in series) >= 3
-    assert sum(r["value"] for r in store.usage_daily(days=7, metric="turns")["series"]) >= 3
-    assert sum(r["input"] for r in store.usage_daily(days=7, metric="tokens")["series"]) >= 30
 
 
 def test_export_turns_use_turn_metrics(seed):

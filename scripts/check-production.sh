@@ -35,6 +35,11 @@ fi
 
 command -v "${PYTHON_BIN:-python3}" >/dev/null 2>&1 || fail "python not found: ${PYTHON_BIN:-python3}"
 
+# getent・timeout（GNU）が無い環境（macOS の標準構成）では scripts/lib/portable_tools.py（Python の
+# socket／subprocess）で同じ検査を行う。どちらも使えないときは検査を抜かさず「確認できなかった」と警告する。
+_portable() { "${PYTHON_BIN:-python3}" "$ROOT/scripts/lib/portable_tools.py" "$@"; }
+_have_python() { command -v "${PYTHON_BIN:-python3}" >/dev/null 2>&1; }
+
 # ENV-ONE（env 例の1本化・2026-09-03）: 選び間違い（閉域網へ dev 用 env をそのまま持ち込む事故）を
 # 人の注意でなく機械のガードで塞ぐ。ここから3点は sherpa/api.py の起動時ガード
 # （`_warn_change_me_placeholders`／`_warn_default_admin_password`）と同じ判定を prod-check 側でも
@@ -111,11 +116,16 @@ _check_openai_endpoint_host() {
   ok "$label scheme: $scheme://$display_host"
   # 名前解決（check-ports.sh::resolve_host と同じ発想。別プロセスとして実行される check-ports.sh の
   # 関数はこのシェルから直接呼べないため、判定ロジックだけをここに複製する）。
-  if ! command -v getent >/dev/null 2>&1; then
-    warn "getent が無いため $label のホスト名解決を確認できません"
+  local resolved=0
+  if command -v getent >/dev/null 2>&1; then
+    if getent ahosts "$host" >/dev/null 2>&1 || getent hosts "$host" >/dev/null 2>&1; then resolved=1; fi
+  elif _have_python; then
+    if _portable resolve "$host" >/dev/null 2>&1; then resolved=1; fi
+  else
+    warn "getent も python も無いため $label のホスト名解決を確認できませんでした"
     return
   fi
-  if ! getent ahosts "$host" >/dev/null 2>&1 && ! getent hosts "$host" >/dev/null 2>&1; then
+  if [ "$resolved" != 1 ]; then
     fail "$label のホスト名 '$display_host' を名前解決できません（.env.example の例をそのまま有効化していませんか？）"
     return
   fi
@@ -124,8 +134,17 @@ _check_openai_endpoint_host() {
   # 実行元（踏み台・CI 等）から到達できない構成でも正常なことがあるため、失敗は warn 止まり
   # （fail にしない・check-ports.sh の別ホスト到達検査とはここが異なる）。
   local tcp_port="${port:-443}"
-  if command -v timeout >/dev/null 2>&1 \
-     && timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$tcp_port" >/dev/null 2>&1; then
+  local tcp_ok=0 tcp_checked=1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$tcp_port" >/dev/null 2>&1 && tcp_ok=1
+  elif _have_python; then
+    _portable tcp "$host" "$tcp_port" 3 >/dev/null 2>&1 && tcp_ok=1
+  else
+    tcp_checked=0
+  fi
+  if [ "$tcp_checked" = 0 ]; then
+    warn "timeout も python も無いため $label の $display_host:$tcp_port への TCP 接続を確認できませんでした"
+  elif [ "$tcp_ok" = 1 ]; then
     ok "$label reachable: $display_host:$tcp_port"
   else
     warn "$label の $display_host:$tcp_port に TCP 接続できません（3秒）。"\
@@ -145,9 +164,14 @@ _check_openai_endpoint_host() {
 # ＝コマンドライン引数には一切載せない（`ps`/`/proc/<pid>/cmdline` 経由の露出を避ける）。
 # `timeout` で全体に上限を掛ける（DB ホストが応答しない場合にこの preflight 自体が固まらないため）。
 _openai_probe=""
-if command -v "${PYTHON_BIN:-python3}" >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-  _openai_probe="$(timeout 5 "${PYTHON_BIN:-python3}" "$ROOT/scripts/check_production_openai_probe.py" 2>/dev/null)" \
-    || _openai_probe=""
+if _have_python; then
+  if command -v timeout >/dev/null 2>&1; then
+    _openai_probe="$(timeout 5 "${PYTHON_BIN:-python3}" "$ROOT/scripts/check_production_openai_probe.py" 2>/dev/null)" \
+      || _openai_probe=""
+  else
+    _openai_probe="$(_portable run-limited 5 "${PYTHON_BIN:-python3}" "$ROOT/scripts/check_production_openai_probe.py" 2>/dev/null)" \
+      || _openai_probe=""
+  fi
 fi
 _openai_status="$(printf '%s\n' "$_openai_probe" | sed -n '1p')"
 

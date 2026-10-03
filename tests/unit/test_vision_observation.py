@@ -222,7 +222,7 @@ def _vlm_stub(monkeypatch):
 
 
 def _built_rag_md(monkeypatch, tmp_path, source: Path, *, arms: str = "ooxml,pdf_text,vision") -> tuple[str, Path]:
-    monkeypatch.setenv("SHERPA_ARMS", arms)
+    monkeypatch.setenv("SHERPA_MCP_ARMS", arms)
     wd = tmp_path / "world"
     wd.mkdir()
     shutil.copy(source, wd / source.name)

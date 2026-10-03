@@ -4,9 +4,8 @@
 プロバイダ判定を再実装しない）:
 
   - `sherpa.health`: `COMPONENTS`／`_check_one`（Postgres・Neo4j 疎通・例外の安全な分類）・
-    `_ai_check_bedrock`（AWS Bedrock 最小プローブ）・`_ai_check_codex`（Codex CLI ログイン確認）を
-    そのまま使う。OpenAI／Gemini の最小プローブは `health._ai_check_openai`／`_ai_check_gemini` を
-    経由せず、`_run_raw_llm_probe()` が `graph_extract.complete_json()` を直接呼ぶ（失敗理由を
+    `_ai_check_codex`（Codex CLI ログイン確認）をそのまま使う。OpenAI の最小プローブは
+    `health._ai_check_openai` を経由せず、`_run_raw_llm_probe()` が `graph_extract.complete_json()` を直接呼ぶ（失敗理由を
     自由文へ変換する `_probe`／`_safe_detail` を経由すると fail-closed な構造化分類ができない
     ため・`_classify_llm_probe_failure()` 参照）。Ollama も `_ai_check_ollama` を使わず
     `sherpa.llm.urlopen_no_redirect`／`ollama_url` を直接呼ぶ＝下記参照。中央既定 URL の疎通
@@ -26,14 +25,8 @@
     `personal_keys_allowed()`（A7 排他選択・A6 個人キー許可・接続先解決の唯一の真実源）
   - `sherpa.agent_constructs`: `effective_agent()`（現在有効な頭脳）・`codex_model_provider()`・
     `is_real_api_key()`
-  - `sherpa.agents._bedrock_auth_available()`: Bedrock の認証手掛かり（中央キーまたは AWS SigV4）
   - `sherpa.providers._codex_openai_compat_block_reason()`: Codex(Azure/custom) 構成の可否判定
     （`POST /settings/test` の Codex 分岐と同じ判定部品）
-  - `sherpa.search_helper.resolve()`: 検索ヘルパー（下調べ役＝worker）が実際にどの provider/URL/
-    モデルを使うかの解決（`user_settings.search_helper` 経由の Ollama 利用を見落とさないための再利用。
-    設定が空／無視のときは頭脳自身が worker になる（`search_helper.self_worker`）。
-    実行時に配線されるのは主頭脳が openai または ollama のときだけ（ollama 頭脳の openai 下調べ役は無視される）＝`sherpa/providers/__init__.py::get_provider`
-    と同じゲートを合わせる）
   - `sherpa.model_catalog.resolve_model()`: プロバイダ／用途ごとの実効モデル名
   - `sherpa.store.db._connect()`: Postgres 接続（DSN／`row_factory` の唯一の真実源。ただし
     `sherpa.store.get_system_settings()` 等の高水準 API は未初期化時に `_ensure()`→`init_schema()`
@@ -51,7 +44,7 @@ user_settings の読み取りは `_connect()` を直接使った `SELECT` のみ
 
 **秘密の表示境界**: すべての `CheckResult.detail` は構築時に自動で `_sanitize_text()`（ANSI/制御
 文字の除去→秘密マスクの順・`CheckResult.__post_init__` 参照）を通る。加えて、`run_all()` の実行中は
-`_LOG_REDACTION_TARGET_ROOTS`（`sherpa`／`anthropic`／`httpx`／`httpcore`／`botocore`）配下の全ロガーが出す
+`_LOG_REDACTION_TARGET_ROOTS`（`sherpa`／`httpx`／`httpcore`）配下の全ロガーが出す
 レコードの本文（と `exc_info`/`exc_text`/`stack_info`）を固定文言へ差し替える
 （`_log_redaction_active()` 参照・`logging.Logger.callHandlers` を差し替える実装＝
 ハンドラが1つも設定されていない裸のスクリプト実行（`logging.lastResort` が実際の出力先になる）でも、
@@ -182,17 +175,10 @@ _log_redaction_captured_original = None
 
 
 # doctor 実行中に本文を差し替える対象のロガー名前空間（ルート名・子は "<root>." prefix で一致）。
-# `sherpa.*` に加え、Bedrock 実プローブが使う `anthropic` SDK とその下請け HTTP ライブラリ
-# （`httpx`／`httpcore`）を含める: `anthropic` パッケージは import 時に無条件で
-# `_utils/_logs.py::setup_logging()` を呼び、環境変数 `ANTHROPIC_LOG=debug`（運用者が調査目的で
-# 設定しうる一般的な SDK デバッグフラグ）が立っていると `anthropic`／`httpx` の各ロガーを
-# DEBUG へ引き上げ、リクエスト/レスポンス（ヘッダー・実キーを含みうる Authorization 等）を
-# そのままログへ出す。`botocore`（`anthropic` の Bedrock 実装が SigV4 署名に使う
-# `botocore.auth.SigV4Auth`）も同様のリスクを持つ: `botocore/auth.py` は DEBUG レベルで
-# `CanonicalRequest`（署名対象の生ヘッダー一式・一時セッショントークン `X-Amz-Security-Token` を
-# 含みうる）をそのままログへ出す契約（`logging.getLogger(__name__)` 経由・"botocore.auth" は
-# "botocore" の子ロガー）。`sherpa.*` だけを対象にした差し替えだとこれらの経路は素通りする。
-_LOG_REDACTION_TARGET_ROOTS = ("sherpa", "anthropic", "httpx", "httpcore", "botocore")
+# `sherpa.*` に加え、HTTP 下請けライブラリ（`httpx`／`httpcore`）を含める: これらは DEBUG へ
+# 引き上げられるとリクエスト/レスポンス（実キーを含みうる Authorization 等）をそのままログへ出す。
+# `sherpa.*` だけを対象にした差し替えだとこの経路は素通りする。
+_LOG_REDACTION_TARGET_ROOTS = ("sherpa", "httpx", "httpcore")
 
 
 def _is_log_redaction_target(name: str) -> bool:
@@ -386,8 +372,8 @@ def _read_active_user_configs_readonly() -> list[dict]:
     SELECT のみ・理由は `_fetch_system_settings_readonly` と同じ）。無効化済み利用者の残存設定を
     要否判定に混入させない。`user_id` は読まない（個々の利用者名は出力に使わない・件数のみ扱う）。
 
-    `ollama_url`／`search_helper` も併せて読む（`_resolve_ollama_usages` が個人の接続先上書き・
-    検索ヘルパー経由の Ollama 利用を判定するために使う）。
+    `ollama_url` も併せて読む（`_resolve_ollama_usages` が個人の接続先上書きによる Ollama 利用を
+    判定するために使う）。
 
     個人 API キーの**値そのものは読まない**（`check_selected_provider_key` が A6 個人キー許可時の
     「中央キーは無いが個人キーを持つ利用者が n 人いる」を判定するために使うのは真偽値だけで十分
@@ -401,10 +387,8 @@ def _read_active_user_configs_readonly() -> list[dict]:
     from sherpa.store.db import _connect
     with _connect(connect_timeout=_PG_READONLY_TIMEOUT, options=_PG_READONLY_OPTIONS) as c:
         rows = c.execute(
-            "SELECT us.agent, us.codex_model_provider, us.ollama_url, us.search_helper, "
-            "(us.openai_api_key IS NOT NULL AND us.openai_api_key <> '') AS has_openai_key, "
-            "(us.gemini_api_key IS NOT NULL AND us.gemini_api_key <> '') AS has_gemini_key, "
-            "(us.bedrock_api_key IS NOT NULL AND us.bedrock_api_key <> '') AS has_bedrock_key "
+            "SELECT us.agent, us.codex_model_provider, us.ollama_url, "
+            "(us.openai_api_key IS NOT NULL AND us.openai_api_key <> '') AS has_openai_key "
             "FROM user_settings us JOIN users u ON u.uid = us.user_id "
             "WHERE u.status = 'active'",
         ).fetchall()
@@ -448,8 +432,8 @@ _OPENAI_ENDPOINT_LABEL = "接続先設定（openai_endpoint_kind／openai_base_u
 
 
 def _openai_endpoint_status(sys_s: dict | None) -> dict:
-    """接続先設定（`openai_endpoint_kind`／`openai_base_url`）の判定結果と、以後の OpenAI/Gemini/
-    Bedrock 系チェックが使うべき**実効** `system_settings` を1回でまとめて返す
+    """接続先設定（`openai_endpoint_kind`／`openai_base_url`）の判定結果と、以後の OpenAI 系
+    チェックが使うべき**実効** `system_settings` を1回でまとめて返す
     （`{"status": "ok"/"ng"/"skip", "detail": str, "effective_sys_s": dict | None}`）。
 
     `sys_s` に起動時シードのマーカー（`openai_endpoint_seed_version`）がまだ無い（`NO_MARKER`）
@@ -547,11 +531,9 @@ def _personal_key_holder_count(provider: str, sys_s: dict | None, rows: list[dic
     （`_read_active_user_configs_readonly` が SQL 側で真偽値へ畳んだ列だけを見る＝本番の truthy
     判定と同じ生値判定で、プレースホルダ・空白のみの値も「あり」に数える・除外はしない）。
 
-    `keys.resolve_api_key(provider, ...)` は A7（排他選択）ゲートを持ち、`provider` が現在の
-    `cloud_provider`（システム選択）と一致しない限り、保存済みの個人キーがあっても常に `None` を
-    返す（温存されるだけで解決されない）。ここでも同じゲートを適用しないと、選択されていない
-    provider の残存キーを「その人数分は動く」と誤って数えてしまう（例: `cloud_provider=gemini` の
-    利用者が過去に保存した `openai_api_key` は、選択が gemini である限り誰も解決できない）。
+    `keys.resolve_api_key(provider, ...)` は A7 ゲートを持ち、`provider` が現在の `cloud_provider`
+    （システム選択）と一致しない限り常に `None` を返す。ここでも同じゲートを適用して、解決できない
+    キーを「その人数分は動く」と誤って数えない。
     """
     from sherpa import keys
     if sys_s is None or rows is None or not keys.personal_keys_allowed(sys_s):
@@ -565,21 +547,13 @@ def _personal_key_holder_count(provider: str, sys_s: dict | None, rows: list[dic
 def _central_auth_available(provider: str, sys_s: dict) -> bool:
     """中央（システム既定）の認証情報だけで `provider` が実際に動くか。
 
-    Bedrock だけは中央 API キー以外に AWS SigV4（`AWS_ACCESS_KEY_ID`／`AWS_PROFILE`／
-    `~/.aws/credentials`）でも正当に動く（`sherpa/providers/bedrock.py::_bedrock_auth_available`
-    が唯一の真実源）。中央キーが実在するプレースホルダ値（`sk-REPLACE_ME` 等）のときは
-    `is_real_api_key()` で弾いてから `_bedrock_auth_available` へ渡す（同関数は単純な truthy
-    判定しかしないため、プレースホルダ文字列も「キーあり」として通してしまう）。中央キーは
-    JSONB 由来で型を保証しないため、`is_real_api_key()` へ渡す前に `_as_key_str()` で
-    非文字列を弾く（`is_real_api_key()` は `.strip()` を呼ぶ契約＝非文字列だと `AttributeError`）。
+    プレースホルダ値（`sk-REPLACE_ME` 等）は `is_real_api_key()` で弾く。中央キーは JSONB 由来で
+    型を保証しないため、渡す前に `_as_key_str()` で非文字列を弾く（`is_real_api_key()` は
+    `.strip()` を呼ぶ契約＝非文字列だと `AttributeError`）。
     """
     from sherpa import agent_constructs, keys
     central_key = keys.resolve_api_key(provider, None, system_settings=sys_s)
-    is_real_central_key = agent_constructs.is_real_api_key(_as_key_str(central_key))
-    if provider == "bedrock":
-        from sherpa.agents import _bedrock_auth_available
-        return _bedrock_auth_available(central_key if is_real_central_key else None)
-    return is_real_central_key
+    return agent_constructs.is_real_api_key(_as_key_str(central_key))
 
 
 _INDETERMINATE = object()   # `effective_agent()` 等が例外を投げ、値そのものを判定できなかったことを表す番人
@@ -601,16 +575,11 @@ def _chat_or_codex_consumes(selected: str, sys_s: dict, rows: list[dict] | None)
         （`sherpa.providers._codex_openai_compat_block_reason` 参照）。実効頭脳が `codex` で
         ないのに `codex_model_provider` の残存値**だけ**で消費扱いにしない（実際には使われていない
         過去の設定の残骸を誤検出しない）。
-      - 検索ヘルパー（`search_helper`）は単独の判定材料にしない: `get_provider()` が実際に
-        `search_helper.resolve()` を配線するのは主頭脳が `"openai"`（`provider_id == "openai"`）の
-        ときだけなので、その場合は既に「実効頭脳が selected と一致」で捕捉済み（`search_helper` を
-        主頭脳と無関係に評価すると、主頭脳が codex/ollama の利用者の残存設定を誤って
-        「openai を消費している」扱いにしてしまう）。
-      - `effective_agent()` が gemini/bedrock を返しても、`agent_constructs.runtime_blocked()`
-        が真（`SHERPA_EXTRA_AGENTS` に含まれず現在の環境では無効）なら実行時は
-        `_DisabledProvider` に差し替わり、キーは一切参照されない（`sherpa/providers/__init__.py::
-        _select_provider` 参照）。この構成は「保存されているが無効」であって「selected を消費して
-        いる」わけではない（無効な理由は `_disabled_agent_configs` が別途 NG として報告する）。
+      - `effective_agent()` が閉じた頭脳（gemini/bedrock）を返しても、`agent_constructs.
+        runtime_blocked()` が真なら実行時は `_DisabledProvider` に差し替わり、キーは一切参照
+        されない（`sherpa/providers/__init__.py::_select_provider` 参照）。この構成は「保存されて
+        いるが無効」であって「selected を消費している」わけではない（無効な理由は
+        `_disabled_agent_configs` が別途 NG として報告する）。
 
     読み取り不能（`rows is None`）・`effective_agent()` の例外（設定解決不能）は、いずれも
     「判定不能」を「消費していない（一致しない）」へ丸めず fail-closed（消費している扱い）にする
@@ -702,23 +671,19 @@ def _agent_resolution_indeterminate(sys_s: dict, rows: list[dict] | None) -> boo
 
 
 def _second_path_purposes(provider: str) -> tuple[str, ...]:
-    """`provider` が openai／gemini のとき、chat／Codex とは独立した「第2の消費経路」
+    """`provider` が openai のとき、chat／Codex とは独立した「第2の消費経路」
     （`sherpa.llm.select_provider()`／`resolve_auto_provider()` を共有実装として使う自動解決）が
     実際に対応する用途一覧。
 
-    intent（`sherpa/intent_llm.py::_cfg`）・embed（`sherpa/embeddings.py::cfg`）はどちらも
-    `select_provider()` へ `bedrock=` factory を渡していない＝Bedrock 非対応
-    （`resolve_auto_provider(..., bedrock_capable=False)`）。render（`sherpa/ingest/llm_render.py`
-    経由の `graph_extract.available(usage="render")`・rag.md の LLM 成形・GRAPH-SRC 2026-09-04 で
-    旧 extract 用途の実消費先を継承）は Bedrock 対応の factory を渡すが、この関数は従来どおり
-    openai／gemini だけを対象にする（Bedrock をこの第2経路の自動検出対象に含めない・チャット/Codex
-    経由の `_chat_or_codex_consumes` のみで判定する＝過剰消費扱いを避ける・挙動は変更しない）。
+    intent（`sherpa/intent_llm.py::_cfg`）・embed（`sherpa/embeddings.py::cfg`）・render
+    （`sherpa/ingest/llm_render.py` 経由の `graph_extract.available(usage="render")`・rag.md の LLM 成形）
+    が対象。
 
     `SHERPA_DISABLE_EMBED`（`sherpa/embeddings.py::cfg` が最初に見るキルスイッチ）が設定されている
     環境では、embed は provider に関わらず実際には一切自動解決されない＝ここで対象から除く
     （設定されていても "intent"／"render" は引き続き対象＝キルスイッチは embed 専用）。
     """
-    if provider not in ("openai", "gemini"):
+    if provider != "openai":
         return ()
     if os.environ.get("SHERPA_DISABLE_EMBED"):
         return ("intent", "render")
@@ -767,7 +732,7 @@ def _consumed_llm_purposes(provider: str, sys_s: dict, rows: list[dict] | None) 
     purposes: list[str] = []
     if _chat_or_codex_consumes(provider, sys_s, rows):
         purposes.append("chat")
-    if provider in ("openai", "gemini") and _second_path_truthy(provider, sys_s, rows):
+    if provider == "openai" and _second_path_truthy(provider, sys_s, rows):
         purposes.extend(_second_path_purposes(provider))
     return purposes
 
@@ -789,11 +754,6 @@ def check_selected_provider_key(sys_s: dict | None, rows: list[dict] | None) -> 
     `_cloud_provider_consumed` を見て、現在の構成で実際に消費されないなら（`ollama_only`／
     `codex_ollama` のみの構成で `cloud_provider` が既定値のまま放置されている等）`skip` に、
     消費されるなら `ng` にする。
-
-    Bedrock だけは中央 API キー以外に AWS SigV4（`AWS_ACCESS_KEY_ID`／`AWS_PROFILE`／
-    `~/.aws/credentials`）でも正当に動く（`sherpa/providers/bedrock.py::_bedrock_auth_available`
-    が唯一の真実源）。ここを `is_real_api_key` だけで判定すると、SigV4 構成の正常な環境を
-    誤って NG にしてしまう。
 
     `_agent_resolution_indeterminate()` が真（`effective_agent()` が例外を投げる＝実効頭脳が
     判定不能）なら、上記の通常判定へは進まず本項目自身を固定文言の NG にする（`_cloud_provider_
@@ -827,14 +787,8 @@ def check_selected_provider_key(sys_s: dict | None, rows: list[dict] | None) -> 
     # consumed`（現在の実効消費のみを見る）だけでは「使われていません」という誤った skip になる。
     # 生の保存値が無い（既定値がそのまま残っているだけ）ときは、従来どおり実消費有無で判定する。
     if _cloud_provider_consumed(selected, sys_s, rows) or keys.cloud_provider_explicitly_selected(sys_s):
-        detail_ng = (
-            "選択中のクラウドプロバイダ（bedrock）の認証情報がありません"
-            "（管理画面でキーを設定するか、AWS_ACCESS_KEY_ID/AWS_PROFILE/"
-            "~/.aws/credentials のいずれかを用意してください）"
-            if selected == "bedrock" else
-            f"選択中のクラウドプロバイダ（{selected}）のキーが未設定です（管理画面で設定してください）"
-        )
-        return CheckResult(cid, label, "ng", detail_ng)
+        return CheckResult(cid, label, "ng",
+                            f"選択中のクラウドプロバイダ（{selected}）のキーが未設定です（管理画面で設定してください）")
     return CheckResult(cid, label, "skip",
                         f"選択中のクラウドプロバイダ（{selected}）は現在の構成では使われていません"
                         "（既定値が残っているだけの可能性があります）")
@@ -842,7 +796,7 @@ def check_selected_provider_key(sys_s: dict | None, rows: list[dict] | None) -> 
 
 def _disabled_agent_configs(sys_s: dict | None, rows: list[dict] | None) -> CheckResult:
     """保存された頭脳構成（システム既定／有効な利用者）が gemini/bedrock を指しているが、
-    現在の環境では `SHERPA_EXTRA_AGENTS` に含まれておらず無効（`agent_constructs.runtime_blocked()`
+    チャットで閉じていて無効（`agent_constructs.runtime_blocked()`
     が真）な件数を報告する。
 
     `_select_provider`（`sherpa/providers/__init__.py`）はキー解決より先に `runtime_blocked` を
@@ -851,7 +805,7 @@ def _disabled_agent_configs(sys_s: dict | None, rows: list[dict] | None) -> Chec
     からは除外した上で、ここで独立の NG として理由を明示する（実行時のエラー表示と一致させ、
     キーを設定しても解決しないことを利用者が誤解しないようにする）。
     """
-    cid, label = "disabled_agent_configs", "無効化された頭脳構成（SHERPA_EXTRA_AGENTS 未設定）"
+    cid, label = "disabled_agent_configs", "無効化された頭脳構成（チャットで閉じた頭脳）"
     if sys_s is None or rows is None:
         return CheckResult(cid, label, "skip",
                             "system_settings／user_settings を読み取れないため確認できません")
@@ -873,7 +827,7 @@ def _disabled_agent_configs(sys_s: dict | None, rows: list[dict] | None) -> Chec
     if count:
         return CheckResult(cid, label, "ng",
                     f"{count} 件の構成（システム既定または有効な利用者）が gemini/bedrock を"
-                    "選んでいますが、現在の環境では無効です（SHERPA_EXTRA_AGENTS に含まれていない）。"
+                    "選んでいますが、現在の環境では無効です（チャットで閉じている）。"
                     "実行時はエラー表示になります（鍵の有無とは無関係）")
     return CheckResult(cid, label, "ok", "該当する構成はありません")
 
@@ -882,11 +836,9 @@ def _disabled_agent_configs(sys_s: dict | None, rows: list[dict] | None) -> Chec
 # 3. LLM 最小プローブ
 # ---------------------------------------------------------------------------
 
-_CLOUD_LLM_CHECKS = ("openai", "gemini", "bedrock")
+_CLOUD_LLM_CHECKS = ("openai",)
 _CLOUD_LLM_LABELS = {
     "openai": "OpenAI / Azure OpenAI 最小プローブ",
-    "gemini": "Gemini 最小プローブ",
-    "bedrock": "AWS Bedrock 最小プローブ",
 }
 
 
@@ -896,7 +848,7 @@ _LLM_PROBE_USER = 'Return {"ok":true}'
 
 def _agent_actually_used(target_agent: str, sys_s: dict, rows: list[dict] | None) -> bool:
     """`target_agent`（`agent_constructs.effective_agent()` が返す値の1つ・"openai"／"codex"／
-    "ollama"／"gemini"／"bedrock"）が、システム既定または有効な利用者のいずれかで**実際に**
+    "ollama"）が、システム既定または有効な利用者のいずれかで**実際に**
     実効頭脳として使われているか。`agent_constructs.runtime_blocked()` で無効化されている構成は
     「使われている」に数えない（`_select_provider` がキー解決より先に `_DisabledProvider` へ
     差し替えるため）。読み取り不能（`rows is None`）・判定不能な例外は fail-closed（使われている
@@ -1007,8 +959,7 @@ def _embed_static_check(provider: str, sys_s: dict) -> str | None:
     (1) `model_catalog.resolve_model(provider, "embed", ...)` が例外を投げない・空文字列を
     返さないことを確認する（`system_settings` が壊れている・カタログの型が不正等を検出する）。
     (2) `provider == "openai"` かつ接続先が Azure/custom のときは、`_openai_azure_deployment_reason`
-    （"chat" と同じ判定条件）で埋め込み用デプロイ名の登録有無も確認する。Gemini には Azure の
-    ような別接続先の概念が無いため対象外。
+    （"chat" と同じ判定条件）で埋め込み用デプロイ名の登録有無も確認する。
 
     問題なければ（対象外の場合を含め）`None` を返す。呼び出し元（`check_cloud_llm_probes`）は、
     "embed" が `_consumed_llm_purposes` に含まれているときだけこの関数を呼ぶ。
@@ -1023,34 +974,6 @@ def _embed_static_check(provider: str, sys_s: dict) -> str | None:
     if provider != "openai":
         return None
     return _openai_azure_deployment_reason("embed", sys_s)
-
-
-def _sanitized_sys_s_for_bedrock_probe(sys_s: dict) -> dict:
-    """`health._ai_check_bedrock` へ渡す `system_settings` のスナップショットから、無効な中央
-    Bedrock キー（プレースホルダ・空文字列）を取り除いた**コピー**を返す（`sys_s` 自体は
-    書き換えない）。
-
-    `_ai_check_bedrock` 自身は内部で `keys.resolve_api_key("bedrock", {}, system_settings=...)`
-    により `bedrock_api_key` を独自に再解決するが、`resolve_api_key` は中央キーの値をそのまま
-    返す契約で `is_real_api_key()` によるプレースホルダ除外を行わない（呼び出し側の責務）。
-    プレースホルダのまま `BedrockProvider(..., api_key="sk-REPLACE_ME")` を組み立てると、
-    Anthropic SDK は**明示キーが与えられていればそれを優先し**、有効な SigV4
-    （`AWS_ACCESS_KEY_ID`／`AWS_PROFILE`／`~/.aws/credentials`）が実在していてもそちらへは
-    進まない。これは doctor 自身の判定（`_central_auth_available` は `is_real_api_key()` で
-    プレースホルダを弾いてから `_bedrock_auth_available` へ渡すため、SigV4 が有効なら `ok` と
-    正しく判定する）と食い違い、SigV4 が正しく設定されている環境でも実際の送信はプレースホルダの
-    まま行われてしまう（意味の無い認証情報での実送信・doctor の既定 `false OK` の一因）。
-    ここで中央キーを事前に検証し、無効なら `None` へ差し替えることで、`_ai_check_bedrock` 内部の
-    再解決結果を doctor 自身の判定と一致させる。中央キーは JSONB 由来で型を保証しないため、
-    `is_real_api_key()` へ渡す前に `_as_key_str()` で非文字列を弾く（`is_real_api_key()` は
-    `.strip()` を呼ぶ契約＝非文字列だと `AttributeError`）。
-    """
-    from sherpa import agent_constructs
-    if agent_constructs.is_real_api_key(_as_key_str(sys_s.get("bedrock_api_key"))):
-        return sys_s
-    sanitized = dict(sys_s)
-    sanitized["bedrock_api_key"] = None
-    return sanitized
 
 
 class _MissingApiKeyError(RuntimeError):
@@ -1078,15 +1001,7 @@ _KNOWN_EXC_TYPE_LABELS: tuple[tuple[type, str], ...] = (
 def _exc_type_label(e: BaseException) -> str:
     """`e` の型を固定の許可リスト（`_KNOWN_EXC_TYPE_LABELS`）へ照合し、対応する固定ラベル文字列を
     返す（許可リスト外は一律 `"UnknownError"`）。"""
-    labels = _KNOWN_EXC_TYPE_LABELS
-    try:
-        from anthropic import APIConnectionError as _AnthropicAPIConnectionError
-        from anthropic import APIStatusError as _AnthropicAPIStatusError
-        labels = ((_AnthropicAPIStatusError, "AnthropicAPIStatusError"),
-                  (_AnthropicAPIConnectionError, "AnthropicAPIConnectionError")) + labels
-    except Exception:
-        pass   # SDK 未対応環境でも import 失敗で落とさない
-    for cls, label in labels:
+    for cls, label in _KNOWN_EXC_TYPE_LABELS:
         try:
             if isinstance(e, cls):
                 return label
@@ -1155,25 +1070,23 @@ def _classify_llm_probe_failure(e: BaseException) -> str:
         return "error"
 
 
+_RETIRED_CLOUD_DETAIL = "保存されているクラウドの選択は廃止されました。管理画面で選び直してください"
+
+
 def _run_raw_llm_probe(provider: str, sys_s: dict, *, purpose: str = "chat") -> BaseException | None:
-    """`provider`（openai／gemini）へ最小リクエストを1回投げる。成功なら `None`、失敗なら
+    """`provider`（openai）へ最小リクエストを1回投げる。成功なら `None`、失敗なら
     **生の例外オブジェクト**を返す（文字列化しない＝呼び出し元は `_classify_llm_probe_failure` で
     型・構造化属性だけを見て分類する）。
 
     `graph_extract.complete_json()` を`_probe`／`_safe_detail` を経由せず**直接**呼ぶ（`_probe` は
     失敗時に理由を自由文へ変換してから返す設計のため、そちらを経由すると生の例外が手に入らない）。
-    `complete_json` 自体は `health._ai_check_openai`／`_ai_check_gemini` が内部で使っているのと
+    `complete_json` 自体は `health._ai_check_openai` が内部で使っているのと
     同じ本番関数＝挙動の重複実装ではない（cfg の組み立てだけをここで行う）。
 
     `purpose`（`model_catalog.resolve_model` の用途区分）: `check_cloud_llm_probes` は "chat"
     （既定）、`_check_codex_azure_compat` は Codex 用のデプロイ名解決が必要なため "codex" を渡す
     （`model_catalog.resolve_model("codex", "codex", ...)` と同じ組合せ・元の `_probe` 呼び出しの
     挙動を維持する）。
-
-    bedrock は対象外（`sherpa.providers.bedrock.BedrockProvider.probe()` が `_safe_bedrock_detail`
-    で理由を自由文化してから返す設計のため、同様に生の例外を取り出すには production 側の変更が
-    要る。現状は `health._ai_check_bedrock` をそのまま使い、`RuntimeError`（構造化属性なし）として
-    分類する＝HTTP ステータスは得られないが、自由文が出力に混ざることは無い）。
 
     キー解決・モデル解決・cfg 組み立て・実際の送信のすべてを**1つの `try` で包む**（準備処理が
     `try` の外側にあると、壊れた `system_settings`／`model_catalog` 等で例外が本関数の外まで
@@ -1186,7 +1099,8 @@ def _run_raw_llm_probe(provider: str, sys_s: dict, *, purpose: str = "chat") -> 
     try:
         from sherpa import agent_constructs, keys, model_catalog
         from sherpa.ingest.graph_extract import complete_json
-        key = keys.resolve_api_key(provider, None, system_settings=sys_s)
+        # strict: 廃止済みの cloud_provider 保存値では送信先を黙って OpenAI へ切り替えず例外にする。
+        key = keys.resolve_api_key(provider, None, system_settings=sys_s, strict=True)
         if not agent_constructs.is_real_api_key(_as_key_str(key)):
             return _MissingApiKeyError("no real API key resolved; probe not sent")
         if purpose == "codex":
@@ -1205,7 +1119,7 @@ def _run_raw_llm_probe(provider: str, sys_s: dict, *, purpose: str = "chat") -> 
 def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cloud: bool) -> list[CheckResult]:
     """選択中クラウドプロバイダについて、最小リクエストで実接続を確認する。
 
-    中央キー（や Bedrock の SigV4）が無くても、個人キーの利用が許可されておりかつ有効な利用者の
+    中央キーが無くても、個人キーの利用が許可されておりかつ有効な利用者の
     誰かが個人キーを保存済みなら、中央の認証情報だけで実プローブすると誤って NG になる（個人キー
     の値は一切読まないため、doctor 自身がそのキーで接続することはできない＝実プローブ不能）。
     その場合は接続を試みず、`selected_provider_key` と同じ判定で SKIP に収束させる。
@@ -1214,15 +1128,8 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
     参照）。
 
     中央認証が使えない（`_central_auth_available` が偽）と判定できたのに個人キー保有者も
-    いない構成では、`_run_raw_llm_probe`（openai／gemini）は内部の送信前ガード
-    （`is_real_api_key`）により実送信せず NG を返すが、Bedrock はここを経由せず
-    `health._ai_check_bedrock` を直接呼ぶ。`health._ai_check_bedrock` 内部の認証ゲート
-    （`sherpa.providers.bedrock._bedrock_auth_available`）は**単純な truthy 判定のみ**で
-    プレースホルダ値（`sk-REPLACE_ME` 等）を弾かない契約（呼び出し元が事前に
-    `is_real_api_key()` で弾いてから渡す前提の設計）だが、`_ai_check_bedrock` 自身はそのキーを
-    弾かずにそのまま渡すため、プレースホルダのまま実際の SDK 送信（`messages.create()`）まで
-    到達しうる。ここで既に「中央認証は使えない・個人キーも無い」と判定済みなので、Bedrock は
-    `health._ai_check_bedrock` を呼ばず直接 NG にする（fail-closed・送信ゼロ）。
+    いない構成では、`_run_raw_llm_probe` は内部の送信前ガード（`is_real_api_key`）により実送信せず
+    NG を返す。
 
     `selected`（A7 の `cloud_provider` 選択）が現在の構成で**実際に消費されていない**場合
     （`_consumed_llm_purposes` が空・例: 全員の実効頭脳が `ollama` で `cloud_provider` に
@@ -1235,7 +1142,7 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
     無条件で全プロバイダを SKIP にする（送信ゼロ）＝`check_openai_endpoint` の判定が確定するまで
     実際のキー・接続先を使った送信を一切行わない。
 
-    openai／gemini は chat とは独立の第2消費経路（intent／render／embed・
+    openai は chat とは独立の第2消費経路（intent／render／embed・
     `_second_path_purposes` 参照）を持つため、実際に消費されている用途**ごと**に検査する。
     "chat" 用途は `_agent_actually_used("openai", ...)`（狭義＝実効頭脳が直接 openai であること）
     で対象を絞り、静的なデプロイ名検査・実プローブの両方に**同じ**絞り込みを適用する
@@ -1252,7 +1159,7 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
     本項目自身を固定文言の NG にする（`check_selected_provider_key` と同じ理由・fail-closed な
     真偽値だけに頼ると判定不能だったこと自体が握り潰される）。
     """
-    from sherpa import health, keys
+    from sherpa import keys
     out = []
     selected = keys.selected_cloud_provider(sys_s) if sys_s is not None else None
     for provider in _CLOUD_LLM_CHECKS:
@@ -1260,6 +1167,9 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
         if sys_s is None:
             out.append(CheckResult(cid, label, "skip",
                                     "system_settings を読み取れないため確認できません"))
+            continue
+        if keys.retired_cloud_provider(sys_s) is not None:
+            out.append(CheckResult(cid, label, "ng", _RETIRED_CLOUD_DETAIL))   # 何も送信しない
             continue
         if selected != provider:
             out.append(CheckResult(cid, label, "skip", "選択中のクラウドプロバイダではありません（cloud_provider）"))
@@ -1273,7 +1183,7 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
         # 実プローブ（ネットワーク送信）の対象用途。"chat" は狭義（直接消費）のときだけ含める
         # （静的検査と同じ絞り込み・docstring 参照）。"embed" は実プローブを持たない（常に除外）。
         probe_purposes = [p for p in purposes if p not in ("chat", "embed")]
-        if openai_chat_direct or (provider != "openai" and "chat" in purposes):
+        if openai_chat_direct:
             probe_purposes.append("chat")
 
         static_ng_reason = None
@@ -1310,26 +1220,6 @@ def check_cloud_llm_probes(sys_s: dict | None, rows: list[dict] | None, probe_cl
                                         f"個人キー利用中の利用者が {n} 人います（値は確認しないため"
                                         "doctor からは実接続できません）・中央検査は対象外です"))
                 continue
-            if provider == "bedrock":
-                e = _MissingApiKeyError("no bedrock auth available (no real central key, no SigV4 hints)")
-                out.append(CheckResult(cid, label, "ng", f"接続に失敗しました: {_classify_llm_probe_failure(e)}"))
-                continue
-        if provider == "bedrock":
-            # システム既定モデルのみ疎通確認する（利用者別 `bedrock_model` 上書き・個人キーは
-            # doctor では検査しない＝値を読まない設計上、doctor 自身ではその利用者の構成を
-            # 再現できないため。該当する利用者は各自の設定画面の接続テストで確認する）。
-            # `max_retries=0`: SDK 既定のリトライ（既定2回・実 HTTP 送信が最大3回になりうる）を
-            # 無効化し、「1回だけ最小リクエストを送る」という本チェックの前提と実際の送信回数を
-            # 一致させる。
-            try:
-                health._ai_check_bedrock({}, _sanitized_sys_s_for_bedrock_probe(sys_s), max_retries=0)
-            except Exception as e:
-                out.append(CheckResult(cid, label, "ng", f"接続に失敗しました: {_classify_llm_probe_failure(e)}"))
-            else:
-                out.append(CheckResult(cid, label, "ok",
-                            "最小リクエストで疎通確認できました"
-                            "（利用者別モデル・個人キーは対象外＝各自の設定画面の接続テストで確認してください）"))
-            continue
         if not probe_purposes:
             # ここに到達する時点で purposes は非空（"not purposes" は上で弾き済み）だが、"chat" が
             # Codex 経由の間接消費だけで、この構成では実プローブ対象が無い（Codex 自身の接続確認は
@@ -1491,12 +1381,10 @@ def _codex_required(sys_s: dict | None, rows: list[dict] | None) -> tuple[bool, 
 def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[dict] | None:
     """Ollama が実際に必要とされる用途を (URL, モデル, 用途) 単位で列挙する。
 
-    中央既定 URL への `/api/tags` 疎通だけでは、個人の `ollama_url` 上書き・検索ヘルパー
-    （`user_settings.search_helper == "ollama"`）経由の利用を見落とし、false OK（別の URL/モデルが
+    中央既定 URL への `/api/tags` 疎通だけでは、個人の `ollama_url` 上書き経由の利用を見落とし、false OK（別の URL/モデルが
     壊れているのに見えない）と false NG（使っていない中央既定が単に未起動なだけ）の両方を招く。
     システム既定と有効な利用者全員の保存設定の両方から、実際に使われる (URL, モデル) の組を集める
-    （`sherpa.keys.resolve_ollama_url`／`sherpa.search_helper.resolve` を再利用し、解決ロジックを
-    再実装しない）。
+    （`sherpa.keys.resolve_ollama_url` を再利用し、解決ロジックを再実装しない）。
 
     戻り値: 判定できない（`sys_s`／`rows` 不明・`model_catalog` 解決が壊れた設定で例外を投げた・
     `ollama_url` が JSONB 由来の非文字列値等）場合は `None`（呼び出し元は安全側で `ng` にする）。
@@ -1523,7 +1411,7 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
     """
     if sys_s is None or rows is None:
         return None
-    from sherpa import agent_constructs, embeddings, keys, model_catalog, search_helper
+    from sherpa import agent_constructs, embeddings, keys, model_catalog
     usages: dict[tuple[str, str], set[str]] = {}
     type_error = False
 
@@ -1537,7 +1425,6 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
         usages.setdefault((url, model), set()).add(purpose)
 
     try:
-        chat_model = model_catalog.resolve_model("ollama", "chat", None, system_settings=sys_s)
         codex_model = model_catalog.resolve_model("codex", "codex", None, system_settings=sys_s)
     except Exception:
         # 壊れた `system_settings`（型不正な JSONB 値等）で `model_catalog` 側が例外を投げても、
@@ -1553,17 +1440,13 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
     if ec and ec.get("provider") == "ollama":
         _add(ec.get("url"), ec.get("model"), "埋め込み（ベクトル検索）")
 
-    try:
-        if agent_constructs.effective_agent(None, system_settings=sys_s) == "ollama":
-            _add(keys.resolve_ollama_url(None, system_settings=sys_s), chat_model, "システム既定（チャット）")
-    except Exception:
-        # システム既定が実際に ollama を使うか自体を判定できない＝「使っていない」に丸めず
-        # 判定不能（`type_error`）にする（本 docstring 末尾の段落参照）。
-        type_error = True
+    # 簡易の AI は、チャットで簡易を選ぶ利用者がいなくても外部 API の簡易回答（`/ext/v1/answer`）と
+    # グラフへの質問が常に使うため、常に点検の対象にする。
+    simple_used = True
 
     for row in rows:
         row_settings = {"agent": row.get("agent"), "codex_model_provider": row.get("codex_model_provider"),
-                        "ollama_url": row.get("ollama_url"), "search_helper": row.get("search_helper")}
+                        "ollama_url": row.get("ollama_url")}
         try:
             url = keys.resolve_ollama_url(row_settings, system_settings=sys_s)
         except Exception:
@@ -1572,36 +1455,24 @@ def _resolve_ollama_usages(sys_s: dict | None, rows: list[dict] | None) -> list[
         try:
             eff = agent_constructs.effective_agent(row_settings, system_settings=sys_s)
         except Exception:
-            # この利用者行が実際に ollama／Codex(Ollama) を使うか自体を判定できない＝「使っていない」
+            # この利用者行が実際に簡易／Codex(Ollama) を使うか自体を判定できない＝「使っていない」
             # に丸めず判定不能（`type_error`）にする（本 docstring 末尾の段落参照）。
             type_error = True
             eff = None
-        if eff == "ollama":
-            _add(url, chat_model, "チャット（利用者設定）")
-        elif eff == "codex" and row.get("codex_model_provider") == "ollama":
+        if eff == "codex" and row.get("codex_model_provider") == "ollama":
             _add(url, codex_model, "Codex(Ollama) 実行モデル")
-        # worker（下調べ役）が配線されるのは主頭脳が openai／ollama のときだけ（`sherpa/providers/
-        # __init__.py::get_provider` 参照・頭脳 × search_helper の組合せ表は提案書
-        # docs/archive/2026-09-17-深さの再定義とレビュー巡.md §2.1 が正典）。主頭脳が codex 等の
-        # 利用者の `search_helper` 列は runtime では一切評価されないため、ここでも `eff` が
-        # openai／ollama のときだけ解決する（残存設定を誤って「使っている」扱いにしない）。
-        # Ollama 頭脳には openai の下調べ役は付かない（クラウド1社の方針で無視）ため、
-        # `sh.get("provider") == "ollama"` の絞り込みだけで両頭脳とも組合せ表どおりになる。
-        # 「下調べ役なし」は無い＝`search_helper` が空／無視のときは頭脳自身が worker になるので、
-        # Ollama 頭脳ならチャットと同じ URL/モデルに下調べの用途が増える（`self_worker`）。
-        if eff in ("openai", "ollama"):
-            try:
-                sh = search_helper.resolve(row_settings, system_settings=sys_s)
-            except Exception:
-                # `search_helper.resolve()` は本番では例外を捕捉しない（呼び出し元が壊れた設定を
-                # そのまま検出する契約）。ここで「検索ヘルパーは使っていない」に丸めず判定不能
-                # （`type_error`）にする（本関数の docstring 末尾の段落と同じ契約）。
-                type_error = True
-                sh = None
-            if sh and sh.get("provider") == "ollama":
-                _add(sh.get("url"), sh.get("model"), "検索ヘルパー（下調べ）")
-            elif eff == "ollama" and not type_error:
-                _add(url, chat_model, "検索ヘルパー（下調べ）")
+
+    if simple_used:
+        # 簡易は管理者設定の AI だけを使う（`simple_chat._resolve_llm` と同じ解決）。Ollama のときは
+        # 中央の接続先＋その用途（subsearch）のモデルを検査する。OpenAI のときはキー/モデルの検査側が担う。
+        try:
+            from sherpa import simple_chat
+            simple_provider, simple_model = simple_chat.resolve_model_and_provider(None, sys_s, None)
+            if simple_provider == "ollama":
+                _add(keys.resolve_ollama_url(None, system_settings=sys_s), simple_model,
+                     "簡易（検索して答える）")
+        except Exception:
+            type_error = True
 
     if type_error:
         return None
@@ -1873,6 +1744,9 @@ def _check_codex_azure_compat(sys_s: dict, rows: list[dict] | None, required: bo
         return CheckResult(cid, label, "skip",
                             "設定形式は妥当です（実接続は課金の可能性があるため既定スキップ・"
                             "make doctor PROBE_CLOUD=1 で確認）")
+    from sherpa import keys as _keys
+    if _keys.retired_cloud_provider(sys_s) is not None:
+        return CheckResult(cid, label, "ng", _RETIRED_CLOUD_DETAIL)   # 何も送信しない
     e = _run_raw_llm_probe("openai", sys_s, purpose="codex")
     if e is not None:
         return CheckResult(cid, label, "ng", f"接続に失敗しました: {_classify_llm_probe_failure(e)}")
@@ -1911,7 +1785,7 @@ def _check_codex_auth(sys_s: dict, rows: list[dict] | None, required: bool, note
     from sherpa import health
     failure_status = "ng" if required else "skip"
     try:
-        health._ai_check_codex({}, {})
+        health._ai_check_codex({}, sys_s)
     except Exception as e:
         detail = (str(e) if required else
                   f"未ログインの可能性があります（現在の構成では Codex を使わないため問題ありません{note}）: {e}")
@@ -2140,7 +2014,7 @@ def run_all(*, probe_cloud: bool) -> list[CheckResult]:
         users_check, rows = _load_active_user_configs(pg.status == "ok")
         results.append(users_check)
 
-        # `llm_sys_s`（接続先が確定できないときは `None`）は openai/gemini/bedrock/Codex の
+        # `llm_sys_s`（接続先が確定できないときは `None`）は openai/Codex の
         # OpenAI 側（`_check_codex_azure_compat` 経由の実送信を含む）の全ての送信を伴う確認
         # （`check_selected_provider_key`／`check_cloud_llm_probes`／`check_codex`）へ渡す＝
         # 接続先が不正な間はこれらを一律 SKIP にする（`_openai_endpoint_status` docstring 参照）。

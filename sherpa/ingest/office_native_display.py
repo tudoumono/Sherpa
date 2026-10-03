@@ -1,10 +1,8 @@
 """Microsoft Excel による表示値補完。
 
-Linux 基本経路の ``excel_display`` が保持した原値・型・書式を正本として残したまま、管理者が
-``office_display.enabled`` を明示した場合だけ Windows Office worker へ対象セルを問い合わせる。
-worker が無い、応答が壊れている、セル単位の読み取りに失敗した、のいずれでも Linux の結果は
-変更しない。Office の結果は原値へ混ぜず、表示値と実効書式、それを得た worker profile だけを
-Evidence extension へ追加する。
+``office_display.enabled`` が有効なときだけ Windows Office worker へ対象セルを問い合わせ、
+表示値・実効書式・worker profile を Evidence extension へ追加する。
+worker 不在・応答不正・セル欠落のときは Linux 基本経路（``excel_display``）の結果を変えない。
 """
 from __future__ import annotations
 
@@ -43,7 +41,7 @@ class OfficeDisplayReport:
 
 
 def config() -> OfficeDisplayConfig:
-    """全体設定を fail-safe に読む。未設定・DB 不達は明示無効。"""
+    """全体設定を読む。未設定・DB 不達は無効。"""
     try:
         from sherpa import store
 
@@ -58,7 +56,7 @@ def config() -> OfficeDisplayConfig:
 
 
 def config_signature() -> str:
-    """Evidence 再生成判定へ載せる設定署名（worker 到達性には依存させない）。"""
+    """Evidence 再生成判定に使う設定署名（worker 到達性には依存しない）。"""
     current = config()
     return f"{OFFICE_NATIVE_DISPLAY_PROFILE}:{'enabled' if current.enabled else 'disabled'}:{current.mode}"
 
@@ -93,9 +91,7 @@ def _worker_profile(response: dict[str, Any]) -> dict[str, Any]:
 def enrich_evidence(ir, source_path: str | Path) -> OfficeDisplayReport:
     """対象セルを Office native の表示値で補完し、実行結果を返す。
 
-    ``source_path`` は旧 XLS の場合も正規化後 XLSX でなく原本を渡す。セル locator は正規化後
-    artifact 由来だが、sheet/cell が原本にも存在する場合だけ補完される。応答が無い場合や一部セルが
-    missing の場合は、そのセルの Linux metadata を一切上書きしない。
+    ``source_path`` は旧 XLS でも変換後でなく原本を渡す。応答が無いセルの Linux metadata は上書きしない。
     """
     current = config()
     if not current.enabled:
@@ -130,7 +126,7 @@ def enrich_evidence(ir, source_path: str | Path) -> OfficeDisplayReport:
         native = by_locator.get((element.locator.sheet, coordinate))
         if native is None:
             continue
-        # Linux側の基礎書式も失わない。number_format は Office の DisplayFormat 由来の実効値へ補完する。
+        # Linux 側の書式は linux_number_format に退避し、number_format を Office の実効値にする
         linux_number_format = element.extension.get("number_format")
         element.extension.update({
             "linux_number_format": linux_number_format,

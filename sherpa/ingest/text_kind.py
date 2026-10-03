@@ -1,34 +1,13 @@
-"""軽量テキスト枠の種別判定（未登録拡張子のテキストファイル→コード/資料への振り分け）。
+"""未登録拡張子のテキストファイルを「コード」か「資料」かに振り分け、秘匿ファイルを判定する。
 
-未登録拡張子のテキストファイルも台帳・出典・grep・ES全文・read_around（精読）まで通す
-（ベクトル・グラフ・LLM は一切通さない＝取り込みコスト増ゼロ）。判定は
-`corpus_docs.classify_document()` の「担当なし」経路（既存の言語アナライザ登録簿・Office/画像・
-`.md`/`.txt` のいずれにも該当しない拡張子）に対してのみ適用する——既存の判定は常に優先し、
-ここでは重複させない（本モジュール自身の拡張子集合も既存登録簿と重ならないよう選定する）。
-
-判定は2段構え:
-- 第1段（`classify_ext`）: 固定の拡張子マップ。一般言語＋設定ファイル系はコード側、
-  csv/tsv/rtf/log 等はコード資料側。内容は読まない。
-- 第2段（`sniff_content`）: 第1段で判定できない拡張子（未知拡張子・拡張子なし）だけ、
-  先頭数KB（`corpus_docs._read_head` が既に読んでいるものを再利用）からバイナリ／コード／
-  資料を推定する。**迷ったら資料に倒す**（ユーザー裁定）。
-
-両段とも**台帳・出典DL・grep・ES全文・read_around（精読）まで対象**（検索可能集合＝引用可能集合の
-契約・`corpus_docs.classify_document`/`reachable_as_text` の確定判定を grep/read_around/ES 索引が
-共有することで満たす——拡張子の許可リストでは決めない）。`status_document_doctype`/
-`verify_doc_exists`/`manifest_doctype_count`（`allow_content_sniff=False` 経由・ホットパスでの
-追加 I/O を避ける設計）だけは第2段を判定しない——これは「読めるか」とは別のホットパス最適化上の
-制約であり、上の対称性の対象外（`corpus_docs.classify_document` の `allow_content_sniff` 引数
-docstring 参照）。
-
-秘匿ファイル（`.env`/`.pem`/`.ppk`/`.key`・SSH秘密鍵 `id_rsa`系・`credentials`/`.netrc`/
-`.npmrc`/`.git-credentials`）は名前/拡張子で両段とも対象外（`is_sensitive`・小文字化して判定）。
-**内容による秘密鍵PEMヘッダ検知は第2段（未知拡張子の sniff）のみ**——第1段は設計上ファイル内容を
-読まない（O(1)/コスト増ゼロ契約）ため、第1段拡張子（.json/.toml 等）の中身に秘密が書かれている
-場合は検知しない（`.txt` 直行の既存経路と同じ残余リスク・受容記録はバックログ参照）。
-
-このモジュールは `corpus_docs`／`grep_tool` 等どこからでも安全に import できる葉ノードとして保つ
-（`re`/`pathlib` 以外の標準ライブラリのみ・sherpa 内の他モジュールを import しない）。
+担当なしの拡張子（言語アナライザ・Office/画像・`.md`/`.txt` のいずれでもない）に対して
+`corpus_docs.classify_document()` が使う。台帳・出典・grep・ES 全文・read_around まで通し、
+ベクトル・グラフ・LLM は通さない。判定は 2 段:
+- 第1段（`classify_ext`）: 固定の拡張子表。内容は読まない。
+- 第2段（`sniff_content`）: 第1段で決まらない拡張子だけ、先頭数KBの中身から推定する（迷ったら資料）。
+秘匿ファイル（`is_sensitive`）は名前・拡張子で両段とも対象外。内容による秘密鍵 PEM ヘッダ検知は第2段のみ。
+`re`/`pathlib` 以外を import しない葉ノードとして保つ。
+設計: docs/design/rag.md「サイズガードと文字コード・対象外」
 """
 from __future__ import annotations
 
@@ -36,80 +15,38 @@ import re
 from pathlib import Path
 
 # ---- 第1段: 拡張子マップ（固定表）----------------------------------------------------------
-# 一般言語＋設定ファイル系＝固定でコード側。既存の言語アナライザ登録簿（cobol/copybook/jcl・
-# `sherpa.ingest.analyzers.registry`）や Office/MD 系拡張子とは重複しない（重複時は既存が
-# 常に優先＝呼び出し側 `corpus_docs.classify_document` が先に確定させるため、ここには来ない）。
+# 一般言語＋設定ファイル系はコード側。言語アナライザ登録簿（`sherpa.ingest.analyzers.registry`）に
+# 専用アナライザがある拡張子はここに置かない。
 CODE_EXT = frozenset({
-    # 一般言語（`.java` は含めない——`sherpa.ingest.analyzers.registry` に専用の `JavaAnalyzer`
-    # が登録済みのため、ここに残すと本モジュール自身の docstring が謳う「既存登録簿と重複しない」
-    # 契約に反する＝CODE-1d で新言語を1つ足した際に判明・以後は「登録簿に専用アナライザが
-    # 増えたら、その拡張子はここから外す」運用とする）。`.properties`/`.yaml`/`.yml`/`.xml` も
-    # 同じ理由で含めない——アナライザ拡張 S3b で `PropertiesAnalyzer`/`YamlConfigAnalyzer`/
-    # `XmlConfigAnalyzer` が登録済み（docs/archive/2026-09-05-アナライザ拡張.md §6）。`.sql` も
-    # 同じ理由で含めない——アナライザ拡張 S2 で `SqlDdlAnalyzer` が登録済み。`.c`/`.h`/`.cs` も
-    # 同じ理由で含めない——アナライザ拡張 S6/S7 で `CAnalyzer`/`CSharpAnalyzer` が登録済み。
-    # `.js`/`.sh`/`.bash`/`.zsh`/`.bat`/`.cmd`/`.vb` も同じ理由で含めない——アナライザ拡張 波3 で
-    # `JsAnalyzer`/`ShellBatchAnalyzer`/`VbAnalyzer` が登録済み（`.mjs`/`.ksh`/`.bas`/`.cls`/
-    # `.frm`/`.ctl`/`.vbs` はそれぞれの専用アナライザが直接担当し元々ここには無かった拡張子）。
-    # `.cpp`/`.hpp`/`.ts`/`.ps1`/`.psm1` は対象外（A1 裁定＝C++/TypeScript/PowerShell アナライザは
-    # 作らない）のためここに残す。
     ".py", ".ts",
     ".cpp", ".hpp", ".pl", ".ps1", ".psm1",
     ".go", ".rb", ".php", ".kt", ".swift", ".scala", ".lua", ".r", ".awk",
-    # 設定ファイル系（構造化された key=value / key: value が支配的＝コード側扱い）。
-    # `.env` は要件の列挙に含まれるが `SENSITIVE_EXT`（下記）へ切り出す——両方の集合に置くと
-    # `scope._CONTENT_EXT`（`CODE_EXT` を直接参照）で範囲ツリーには数えるのに実際は
-    # 台帳/grep/ES から除外される、という矛盾した見え方になるため。
+    # 設定ファイル系（key=value が支配的＝コード側）。環境変数ファイルは `SENSITIVE_EXT` に置く
     ".ini", ".cfg", ".conf", ".json", ".toml",
 })
 
 # 資料側（自然文・表データ等）。
 DOCUMENT_EXT = frozenset({".csv", ".tsv", ".rtf", ".log"})
 
-# ノイズ拡張子（一時ファイル・対象外のまま）。`.log` は含めない（トラブルシュートで価値がある・
-# サイズ上限で守る＝要件どおり）。
+# ノイズ拡張子（一時ファイル・対象外）。`.log` は含めない
 NOISE_EXT = frozenset({".tmp", ".bak", ".swp", ".lock"})
 
-# 秘匿ファイルの慣習的拡張子（ノイズ/一時ファイルとは別枠——意味が違うので NOISE_EXT に混ぜない）。
-# `sherpa.agentic_search.verify_doc_exists()` は「`status_document_doctype()` が doctype 分類に
-# 無い付帯物を返す＝ None」を、`.env`/鍵ファイル等の秘匿ファイルが実在確認・grep・ES・read_around を
-# 素通りしない安全側の性質として使っている（`tests/unit/test_ext2_evidence.py::
-# test_verify_doc_exists_false_for_dotenv_and_key_files` が固定する既存契約）。軽量テキスト枠は
-# 「設定ファイル系はコード側」という要件を満たしつつ、この既存の安全側判定と衝突しないよう、
-# 秘匿ファイルの慣習を持つ拡張子だけを対象外に据え置く（`.env` は要件の設定ファイル系リストに
-# 含まれるが、実務上は秘密情報を持つ慣習が強いため例外的にここで除外する——判断に迷ったら
-# 安全側に倒す・除外の是非はユーザー確認を推奨）。
-# `.pem`（秘密鍵/証明書）・`.ppk`（PuTTY秘密鍵）も対象。`.env` 自体もここへ含める——
-# `dev.env`/`prod.env`（"env" が本物の拡張子になる suffix 形）を拾うため。
-# `scope._CONTENT_EXT` は `CODE_EXT`/`DOCUMENT_EXT` だけを見るため `SENSITIVE_EXT` を混ぜても
-# 「範囲ツリーに出るのに実際は除外される」矛盾は起きない。
+# 秘匿ファイルの拡張子（実在確認・grep・ES・read_around に出さない。`verify_doc_exists()` が前提にする）
 SENSITIVE_EXT = frozenset({".key", ".pem", ".ppk", ".env"})
 
-# `SENSITIVE_EXT`（拡張子集合）では捕まらない秘匿ファイル慣習:
-# - ドットファイル形（`.env` 単体・`.env.local`/`.env.production`）——`Path(".env").suffix` は
-#   空文字（pathlib は先頭ドットを拡張子区切りと見なさない）で拡張子集合に来ない。
-# - 拡張子を持たない慣習名（SSH秘密鍵 `id_rsa`/`id_rsa.pub`/`id_rsa.old` 等・AWS/gcloud等の
-#   `credentials`（ini形式）・`.netrc`／`.npmrc`／`.git-credentials`）。
-# ファイル名は **小文字化してから** 比較する（`.ENV`／`.Env.production` 等の大文字表記も
-# バイパスさせないため）。
+# 拡張子集合では捕まらない秘匿ファイル名（ドットファイル形の環境変数ファイル・`id_rsa*`・`credentials*`・`.netrc` 等）。
+# 比較はファイル名を小文字化してから行う
 _SENSITIVE_NAME_EXACT = frozenset({".env", ".netrc", ".npmrc", ".git-credentials"})
-# `credentials` は `id_rsa` と同様プレフィックス扱い: 拡張子無しの慣習名
-# （AWS/gcloud の ini 形式）だけでなく、`credentials.xlsx`／`credentials_2024.csv` のように
-# 秘匿情報を Office/表形式へ書き出した命名も捕まえる——完全一致のままだと拡張子が付いた
-# 途端に秘匿判定を素通りしてしまう（`"credentials".startswith("credentials")` は真のため、
-# 拡張子無しの従来挙動はそのまま保たれる）。
+# `credentials` はプレフィックス扱い（`credentials.xlsx` 等も秘匿）
 _SENSITIVE_NAME_PREFIXES = (".env.", "id_rsa", "credentials")
 
 # 一時ファイルの前綴り（例: Office のロックファイル `~$foo.docx`）。
 NOISE_NAME_PREFIXES = ("~$",)
 
-# サイズ上限＝grep 上限と同じ 8MiB（`grep_tool._GREP_FILE_CAP_BYTES` の既定値と同一の固定値・
-# 本モジュールは grep_tool を import しない葉ノードのため値は独立に持つ）。超過は失敗内訳へ
-# `size_exceeded`（`sherpa.ingest.failure_reasons.REASON_CATALOG` の既存語彙コード・呼び出し側が
-# 参照して `state="unreadable"`/`reason="size_exceeded"` として台帳へ載せる）。
+# サイズ上限（grep の上限と同じ 8MiB）。超過は呼び出し側が `reason="size_exceeded"` として台帳へ載せる
 MAX_BYTES = 8 * 1024 * 1024
 
-# 表示用 doctype（`corpus_docs._OFFICE_DOCTYPE`/`_NONCODE_DOCTYPE` と同じ固定ラベル）。
+# 表示用 doctype ラベル
 CODE_DOCTYPE_LABEL = "コード（汎用）"
 DOCUMENT_DOCTYPE_LABEL = "テキスト資料"
 
@@ -122,13 +59,9 @@ def is_noise(name: str, ext: str) -> bool:
 
 
 def is_sensitive(name: str, ext: str) -> bool:
-    """秘匿ファイルの慣習を持つか（`SENSITIVE_EXT` の拡張子、または `.env`系/`id_rsa`系/
-    `credentials`/`.netrc`/`.npmrc`/`.git-credentials` の名前・大文字表記も含む）。
+    """秘匿ファイルか（`SENSITIVE_EXT` の拡張子、または秘匿名・大文字表記を含む）。
 
-    `agentic_search.verify_doc_exists()` の既存の安全側判定（`SENSITIVE_EXT` docstring参照）と
-    衝突しないよう、軽量テキスト枠はこれらを対象外に据え置く。`ext` は呼び出し側（`corpus_docs`）が
-    既に `.lower()` 済みだが、`name`（ファイル名そのもの）はここで小文字化する
-    （`.ENV`/`ID_RSA` 等の大文字表記バイパスを防ぐ）。
+    `ext` は小文字化済みを受け取り、`name` はここで小文字化する。
     """
     if ext in SENSITIVE_EXT:
         return True
@@ -137,13 +70,7 @@ def is_sensitive(name: str, ext: str) -> bool:
 
 
 def is_sensitive_doc_id(doc_id: str) -> bool:
-    """`doc_id`（rel_path 文字列）から `is_sensitive` を呼ぶ薄いラッパー。
-
-    呼び出し側の多くは実ファイルの `Path` ではなく doc_id 文字列（ES ヒットの `doc_id`・
-    ledger の `rel` 等）しか持たない——`Path(doc_id).name`／`.suffix.lower()` の組み立てが
-    複数箇所に散っていた（台帳 #85〜#88）ため、判定の集約点としてここへ寄せる。挙動は
-    `is_sensitive(Path(doc_id).name, Path(doc_id).suffix.lower())` と完全に同一。
-    """
+    """`doc_id`（相対パス文字列）から `is_sensitive` を判定する。"""
     p = Path(doc_id)
     return is_sensitive(p.name, p.suffix.lower())
 
@@ -159,36 +86,29 @@ def classify_ext(ext: str) -> str | None:
 
 # ---- 第2段: 内容推定（未知拡張子・拡張子なしのみ）--------------------------------------------
 
-# 置換文字（デコード不能バイトの目印）の許容比率。これを超えたら「実質バイナリ」と見なす
-# （1文字程度の孤立したノイズでは誤爆させない・閾値は経験則）。
+# 置換文字の比率がこれを超えたら実質バイナリ
 _REPLACEMENT_RATIO_THRESHOLD = 0.02
 
-# `key=value`/`key: value` 行が支配的なら設定ファイル的＝コード寄りと判定する閾値。
-# キー側は ASCII 識別子のみに限定する: `\w` は Python の re が Unicode 既定のため日本語
-# （漢字/かな）にもマッチし、「用語1: 説明」のような日本語用語集の箇条書きが `code` に
-# 誤判定されてしまう。設定ファイルの key は実務上ほぼ ASCII のため、この制限で正規の
-# 設定ファイル判定は損なわない。
+# `key=value`/`key: value` 行が支配的ならコード寄り。キーは ASCII 識別子に限る（日本語の箇条書きを除くため）
 _KV_LINE_RATIO_THRESHOLD = 0.5
 _KV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*\s*[:=]\s*\S")
 
-# 秘密鍵 PEM ヘッダ（`-----BEGIN ... PRIVATE KEY-----`）検知——ファイル名/拡張子で秘匿ファイルの
-# 慣習に一致しない改名済み秘密鍵でも、内容ベースで無条件に対象外へ倒す（リネームされた秘密鍵
-# ファイルが第2段 sniff を素通りしてしまう経路を塞ぐ）。
+# 秘密鍵 PEM ヘッダ。名前が秘匿慣習に当たらない秘密鍵も内容で対象外にする
 _PRIVATE_KEY_MARKER = "PRIVATE KEY-----"
 
-# 構造記号（波括弧・丸括弧・角括弧・不等号・セミコロン）の出現比率がこれを超えたらコード寄り。
+# 構造記号の出現比率がこれを超えたらコード寄り
 _SYMBOL_CHARS = frozenset("{}();<>[]")
 _SYMBOL_RATIO_THRESHOLD = 0.02
 
-# コメント行（行頭がコメント記号）の比率がこれを超えたらコード寄り。
+# コメント行の比率がこれを超えたらコード寄り
 _COMMENT_PREFIXES = ("//", "#", "/*", "--", "*")
 _COMMENT_LINE_RATIO_THRESHOLD = 0.3
 
-# 日本語比率がこれを超えたら自然文＝資料と判定する（CJK 統合漢字・ひらがな・カタカナ）。
+# 日本語（漢字・かな）の比率がこれを超えたら資料
 _CJK_RATIO_THRESHOLD = 0.1
 _CJK_RANGES = ((0x3040, 0x309F), (0x30A0, 0x30FF), (0x4E00, 0x9FFF))
 
-# 平均行長がこれを超えたら長文の自然文＝資料寄りと判定する（コードは1行が短く改行が多い傾向）。
+# 平均行長がこれを超えたら資料寄り
 _AVG_LINE_LEN_DOCUMENT_THRESHOLD = 40
 
 
@@ -198,15 +118,10 @@ def _is_cjk(ch: str) -> bool:
 
 
 def sniff_content(text: str) -> str:
-    """先頭数KB（decode 済み・`errors="replace"`）からの中身推定。
+    """先頭数KB（decode 済み）から `"binary"`／`"code"`／`"document"` を推定する（迷ったら資料）。
 
-    戻り値: `"binary"`（対象外・NUL/デコード不能/秘密鍵PEMヘッダが支配的）／`"code"`（シバン・
-    記号密度・key=value 構造が支配的）／`"document"`（それ以外＝**迷ったら資料に倒す**・
-    ユーザー裁定）。
-
-    判定順序: 秘密鍵ヘッダ→バイナリ→シバン→**日本語比率→kv/記号/コメント密度**
-    →平均行長、の順——日本語比率判定を kv/記号密度より**先**にする（実測: 日本語の自然文
-    （用語集の箇条書き等）が kv/記号密度判定に先に拾われて `code` に誤判定されていた）。
+    判定順は 秘密鍵ヘッダ→バイナリ→シバン→日本語比率→kv/記号/コメント密度→平均行長。
+    日本語比率を kv/記号密度より先にするのは、日本語の箇条書きを `code` と誤判定しないため。
     """
     if not text:
         return "document"                          # 空ファイルは判定材料なし＝資料に倒す

@@ -1,10 +1,9 @@
-"""取り込みオーケストレーション（鏡モデル・即反映ライブ鏡・MIRROR-MODEL §4）。
+"""資料フォルダの取り込みオーケストレーション（ライブ鏡）。
 
-world（登録ディレクトリ）を1回スキャンし、**台帳＋グラフ(Neo4j)** を現状に一致させる単一の経路:
-スキャン→台帳書込(`store.replace_documents`)→グラフ構築(`world_graph.build_world`)→
-**world 単位のクリーン rebuild**(`world_neo4j.load_world`)→`ingest_runs` 記録。
-旧 version 別 src/md・merge(S+L)・filter_edges・auto-scope overrides は撤去（鏡は1木＋パス同一性）。
-特定テーマの名前は持たない（語彙は world のフォルダ/ファイル＝データ由来）。
+資料フォルダを1回スキャンし、台帳とグラフ（Neo4j）を現状に一致させる単一の経路:
+① スキャン→アーカイブの展開先の差分同期→② 派生 MD→③ グラフ構築（`world_graph.build_world`）→④ 資料フォルダ単位のグラフ置換（`world_neo4j.load_world`）→
+⑤ 台帳書込（`store.replace_documents`・グラフの置換が成功してから）→⑥ ES 索引→⑦ 仕上げ→ `ingest_runs` の終端記録。
+設計: docs/design/rag.md「全体の流れ」
 """
 from __future__ import annotations
 
@@ -19,14 +18,10 @@ from .. import corpus_docs, es_index, scope_infer, store, webhooks, worlds
 from . import archive_extract, failure_reasons, importance, office_md, world_graph, world_graph_service, world_neo4j
 from .analyzers import registry as analyzer_registry
 
-# MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
-# （`sherpa/log_setup.py` の登録表参照・office_md.py と合流させ1系統にする）。
+# MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる（`sherpa/log_setup.py`・office_md.py と同じ系統）
 _log = logging.getLogger("sherpa.ingest.convert")
 
-# ING-3（取り込みの背景実行化）: 段の表示名（内部段キー→利用者向け平文）。`ingest_runs.progress`
-# へ書き込み `GET /worlds/{wid}/status` が実行中 run の進捗として返す。段構成は実装の主要な
-# 待ち時間の境界に合わせたもの（office_md 段＝旧形式変換＋MD化＋検索用データ整形をまとめて1段・
-# es_index 段＝全文索引＋ベクトル化をまとめて1段——別々に計測できる境界が実装に無いものは分けない）。
+# 段の表示名（内部段キー→利用者向け平文）。`ingest_runs.progress` へ書き込み、`GET /worlds/{wid}/status` が実行中 run の進捗として返す
 STAGE_LABELS = {
     "accepted": "受け付けました",
     "scanning": "フォルダを確認中",
@@ -37,16 +32,12 @@ STAGE_LABELS = {
     "deleting": "検索用データを削除しています",
 }
 
-# 逐次進捗の書き込み頻度（office_md 段の per-file 進捗はこの件数ごとに間引く・毎ファイル書くと
-# 大規模 world で DB 書き込みが支配的になる）。最初（0件）・最後（総数一致）は間引かず必ず書く。
+# 逐次進捗の書き込み間隔（office_md 段の per-file 進捗をこの件数ごとに間引く）。最初（0件）と最後（総数一致）は必ず書く
 _PROGRESS_FILE_INTERVAL = 100
 
 
 def _target_of(url: str) -> str:
-    """URL/URI から「ホスト:ポート」だけを取り出す（失敗理由の表示用・userinfo/パスは落とす）。
-
-    取り出せない・空なら "?"。例外は投げない（失敗の記録処理の中で使うため）。
-    """
+    """URL/URI から「ホスト:ポート」だけを取り出す（失敗理由の表示用・userinfo/パスは落とす）。取り出せなければ "?"。例外は投げない。"""
     from urllib.parse import urlsplit
     try:
         u = urlsplit(url or "")
@@ -59,74 +50,55 @@ def _target_of(url: str) -> str:
 
 
 def build_world_graph(world: str):
-    """world の `(nodes, edges, flags)` を構築（有効グラフの単一入口へ委譲・DRY）。"""
+    """資料フォルダの `(nodes, edges, flags)` を構築する（有効グラフの単一入口へ委譲）。"""
     return world_graph_service.build_effective_world(world)
 
 
 def _reflect_graph_after_rag_rewrite(world: str) -> None:
     """`.rag.md` の軽量書換え後、Neo4j のグラフ（言及エッジ）を追いつかせる。
 
-    言及エッジ（Pass3・辞書突合）は `{rel}.rag.md` があればそれを本文として読む
-    （`corpus_docs.iter_world_documents` の `md_path` 選定・`world_graph._mention_pass` 参照）。
-    `_llm_render_pass`／`regenerate_rag_rule_only`／`_refresh_derived_representations`
-    （OCR 反映後の catch-up 等）はいずれも rag.md を書き換えるが世代（world 署名）は変えない
-    軽量経路のため、`_run_locked`（通常の full sync）の `build_world_graph`→`load_world` を
-    経由しない——放置すると ES だけ追随しグラフ（言及エッジ）が陳腐化したまま固定される。
-
-    ES 反映（RAG_ES 無効なら不要）とは独立に**常に**呼ぶ——グラフは RAG_ES の設定に関わらず
-    追随させる必要がある。呼び出し元が既に `store.world_lock(world)` を保持している前提の
-    lock-free ヘルパー（`_wipe_locked`/`_run_locked` と同じ流儀・世界単位ロックの再入不可を
-    避ける）。失敗は例外のまま呼び出し元へ伝播させる（ここで揉み消さない・best-effort にしない
-    ——各呼び出し元は既に `sync()`/`regenerate_rag_rule_only()` の例外伝播契約で受け止める）。
+    言及エッジは `{rel}.rag.md` があればそれを本文として読む。`_llm_render_pass`／`regenerate_rag_rule_only`／
+    `_refresh_derived_representations` は rag.md を書き換えるが世代（world 署名）を変えないため、`_run_locked` の
+    `build_world_graph`→`load_world` を経由しない。ES 反映とは独立に常に呼ぶ。
+    呼び出し元が `store.world_lock(world)` を保持している前提（ロックは再入不可）。失敗は例外のまま伝播させる。
     """
     nodes, edges, flags = build_world_graph(world)
     blocked = [f for f in flags if f.get("action") == "blocked"]
     if blocked:
-        # `_run_locked` と同じ fail-closed: 不可読/途中で変わったコードがあるとき部分グラフで
-        # 既存グラフを置換しない（参照エッジの欠けたグラフを確定させない）。例外で呼び出し元へ
-        # 伝播させ、run を失敗として記録させる（次回 sync の全再構築で収束する）。
+        # `_run_locked` と同じく、不可読/途中で変わったコードがあるときは部分グラフで既存グラフを置換せず、例外で run を失敗として記録する
         reasons = sorted({str(f.get("reason")) for f in blocked})
         raise RuntimeError(f"graph reflect blocked: {','.join(reasons)}")
     env = world_neo4j._env()
     world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
 
 
-# `office_md.build_derived()` が持つ per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。
-# ING-1: status 画面の「失敗ファイル一覧＋再変換ボタン」の元データへ一本化する（キー名の末尾
-# `_failures` を落とした残りを stage 名として使う）。
+# `office_md.build_derived()` の per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。末尾の `_failures` を落とした残りを stage 名にする
 _FAILURE_LIST_KEYS = ("unhandled_failures", "legacy_conversion_failures", "conversion_failures",
                      "document_ir_failures", "evidence_ir_failures", "rag_failures")
 
-_FAILED_FILES_LIMIT = 200   # ingest_runs.extraction_snapshot へ保存する量の上限（超過分は total/truncated で示す）
+_FAILED_FILES_LIMIT = 200   # `ingest_runs.extraction_snapshot` へ保存する件数の上限（超過分は total/truncated で示す）
 
-# 「抽出不完全の疑い」一覧（失敗ではない別枠・`failure_reasons.PARTIAL_EXTRACTION_LABEL/_ADVICE` 参照）。
+# 「抽出不完全の疑い」一覧（失敗とは別枠・`failure_reasons.PARTIAL_EXTRACTION_LABEL/_ADVICE`）の上限
 _PARTIAL_EXTRACTION_LIMIT = 200
 
 def _office_md_stage_summary(drep: dict) -> dict:
-    """`office_md.build_derived()` の要約3値（`_record`／PG replace 失敗パスの両方で使う共通片）。"""
+    """`office_md.build_derived()` の要約3値（`_record` と PG replace 失敗パスの共通片）。"""
     return {"converted": drep.get("converted", 0), "failed": drep.get("failed", 0),
             "unsupported": drep.get("unsupported", 0)}
 
 
 def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict | None,
                     rows: list | None, scan_rep: dict | None = None) -> dict:
-    """STAT-3 S5: `extraction_snapshot["counts"]`（走査/対象/変換/索引/埋め込みの件数・時間）。
+    """`extraction_snapshot["counts"]`（走査/対象/変換/索引/埋め込みの件数・時間）を作る。
 
-    取れない項目はキー自体を付けない（0 と欠落を区別する契約）。`_record`／PG replace 失敗パスの
-    両方から呼ぶ（`_office_md_stage_summary`/`_failed_files_summary` と同じ共通片の役割）。
-
-    `legacy_converted`／`legacy_failed` は「この run で実際に前段変換（LibreOffice／COM）した件数」＝変換キャッシュ
-    （CONV-CACHE）から復元した分は含まない（再同期では 0 になり得る・`converted` と `by_ext` には含まれる）。
-
-    `scan_rep`（省略可・`corpus_docs.scan_report()` の戻り値）: 本文が読めないため検索対象外にした
-    ファイル数と拡張子別内訳（`unreachable_as_text`/`unreachable_as_text_by_ext`）・秘匿除外件数
-    （`sensitive_excluded`）を `counts` へ合流する。成功確定経路（`_record` の `confirm_scan_report`）
-    だけが渡す——scan_report 自体が失敗/未計算の run は従来どおりキーごと省略する。
+    取れない項目はキー自体を付けない（0 と欠落を区別する）。`_record` と PG replace 失敗パスの両方から呼ぶ。
+    `legacy_converted`／`legacy_failed` はこの run で実際に前段変換した件数（変換キャッシュから復元した分は含まない）。
+    `scan_rep`（`corpus_docs.scan_report()` の戻り値）があれば、本文が読めず対象外にした件数・拡張子別内訳・秘匿除外件数を合流する。
     """
     c: dict = {}
     if manifest is not None:
-        c["scanned"] = len(manifest)              # 走査で見つけたファイル数（world 未解決時は manifest も None）
-    if rows is not None:                           # 台帳確定前に終わった失敗 run は「取れない」＝欄ごと省略
+        c["scanned"] = len(manifest)              # 走査で見つけたファイル数
+    if rows is not None:                           # 台帳確定前に終わった失敗 run は欄ごと省略
         c["targeted"] = len(rows)                  # 取り込み対象＝台帳に載せた数
     if drep is not None:
         c["converted"] = drep.get("converted", 0)
@@ -149,7 +121,7 @@ def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict |
         by_ext = scan_rep.get("unreachable_as_text_by_ext")
         if by_ext:
             c["unreachable_as_text_by_ext"] = by_ext
-        # SRH-05: 理由別内訳（判別不能／バイナリ）と、対象外にしない「一部が化けている」件数。
+        # 理由別内訳（判別不能／バイナリ）と、対象外にしない「一部が化けている」件数
         by_reason = scan_rep.get("unreachable_by_reason")
         if by_reason:
             c["unreachable_by_reason"] = by_reason
@@ -160,13 +132,10 @@ def _counts_summary(drep: dict | None, es_summary: dict | None, manifest: dict |
 
 
 def _failed_files_summary(drep: dict) -> dict:
-    """`office_md.build_derived()` の各段 `*_failures` を1つの一覧へまとめる（rel＋stage＋閉じた理由コード）。
+    """`office_md.build_derived()` の各段 `*_failures` を1つの一覧（rel＋stage＋理由コード）にまとめる。
 
-    `reason` は `failure_reasons.classify()` で閉じた語彙へ分類済み（`detail`＝分類前の生文字列・
-    `other` の内訳表示用）。`by_reason`＝理由コード別件数（**打ち切り前の全件**を対象・ING-1裁定2の
-    内訳集計）。`_FAILED_FILES_LIMIT` 件で `items` を打ち切り、`total`（打ち切り前の全件数）・
-    `truncated`（打ち切ったか）を併記する——`ingest_runs.extraction_snapshot` への保存量を抑えつつ、
-    全体件数・内訳は失わない。
+    `reason` は `failure_reasons.classify()` の語彙（`detail` は分類前の生文字列）。`by_reason` は打ち切り前の全件の理由コード別件数。
+    `items` は `_FAILED_FILES_LIMIT` 件で打ち切り、`total`・`truncated` を併記する。
     """
     items = []
     by_reason: dict[str, int] = {}
@@ -184,36 +153,20 @@ def _failed_files_summary(drep: dict) -> dict:
 
 
 def _partial_extraction_summary(drep: dict) -> dict:
-    """`office_md.build_derived()` の `partial_extraction_suspected`（失敗ではない「要確認」一覧）を整形する。
-
-    `_failed_files_summary` と同じ打ち切り契約（`total`/`truncated`）。失敗一覧と混ぜない別枠
-    （ING-1裁定・静かな部分抽出検知）。
-    """
+    """`office_md.build_derived()` の `partial_extraction_suspected`（失敗ではない「要確認」一覧）を整形する。`_failed_files_summary` と同じ打ち切り契約。"""
     items = [e for e in (drep.get("partial_extraction_suspected") or []) if isinstance(e.get("doc"), str)]
     return {"items": items[:_PARTIAL_EXTRACTION_LIMIT], "total": len(items),
             "truncated": len(items) > _PARTIAL_EXTRACTION_LIMIT}
 
 
 def _ledger_rows(world: str, *, sig: str | None = None) -> list:
-    """走査文書 → 台帳行（doc_id＝rel_path・原本DLはパス基準で解決するので original_path は持たない）。
+    """走査文書を台帳行にする（doc_id＝rel_path。原本 DL はパス基準で解決するので original_path は持たない）。
 
-    `state="unreadable"`（内容判定に必要なヘッダが読み取れない文書）は台帳の `status` にも
-    そのまま反映する——「使える」文書と黙って同列にしない。
-
-    `importance`/`importance_reason`/`importance_source`: `GET /documents`
-    の台帳高速経路（`doc_ledger.public_documents_page`）が実走査せずに重要度を返せるよう、
-    ここ（ingest 時・呼び出し元 `_run_locked` は `world_lock` 保持中で rebind と競合しない）で
-    `importance.resolve_for_world`（world 全体の走査を伴う）を1回だけ実行し materialize する
-    （§2 truth table＝無ければ3キーとも付けない・`doc_ledger._importance_fields` と同じ形）。
-
-    root/files/sig の一本化: `importance.resolve_for_world(world)`
-    と `corpus_docs.world_documents(world)` がそれぞれ独立に `worlds.world_dir()` を解決すると、
-    `_重要度.txt` 探索・文書列挙のために木を別々に歩くことになる（`resolve_for_world` 自体も
-    `sig` 省略時は自前の署名計算でもう1回歩く）——`_run_locked` の排他 `world_lock` 保持中に
-    実測 cold 時4walk・cache hit時も3walk。ここで `root` と `files`（`scope_infer.safe_files(root)`
-    の materialize 済み list）を1回だけ確定し、両方へ同じ `root`/`files`/`sig` を渡す
-    （`sig` 省略可＝呼び出し元 `_run_locked` が `world_state()` で既に確定済みの署名を渡せば、
-    `resolve_for_world` 内の自前署名計算も省ける）。
+    `state="unreadable"` の文書は台帳の `status` にもそのまま反映する。
+    `importance`/`importance_reason`/`importance_source` は、`GET /documents` の台帳高速経路が実走査せず返せるよう、
+    ここで `importance.resolve_for_world` を1回だけ実行して materialize する（値が無ければ3キーとも付けない）。
+    `root` と `files`（`scope_infer.safe_files(root)` の list）はここで1回だけ確定し、重要度解決と文書列挙に同じ `root`/`files`/`sig` を渡す
+    （木を何度も歩かないため。`sig` は呼び出し元 `_run_locked` が確定済みの署名を渡せる）。
     """
     root = worlds.world_dir(world)
     if not root:
@@ -238,17 +191,12 @@ def _ledger_rows(world: str, *, sig: str | None = None) -> list:
 
 def run(world, *, reflect=True, created_by="admin",
         scan_root=None, run_id=None, on_run_id=None, op: str = "sync") -> dict:
-    """1 world 分の取り込み（台帳＋グラフ反映）を実行し `ingest_runs` に記録、要約を返す。
+    """資料フォルダ1つ分の取り込み（台帳＋グラフ反映）を実行し、`ingest_runs` に記録して要約を返す。
 
-    **world 単位 advisory lock で直列化**（同じ world の同時 rebuild でグラフ/台帳が混ざらない）。
-    `reflect=False`＝Neo4j 反映を省く（DB 無し検証/テスト用＝台帳書込とグラフ構築だけ）。
-    `run_id`（ING-3）＝呼び出し元が受付時に O(1) で確保済みの `ingest_runs` 行を渡す時だけ
-    指定する（router は即受付契約のため、`run_id` は必ずここで判明済みの状態でこの関数に入る）。
-    省略時（`None`）は従来どおりここで自前に行を確保する（直接呼び出し・テスト用）。
-    `on_run_id`＝`run_id` を渡さない代わりに、確保された run_id が判明した瞬間に呼ばれる
-    コールバック（旧経路・後方互換）。
-    `op`（PART-6・Webhook 通知の情報用途のみ）＝sync/refresh/rebind/rerun のいずれか
-    （`rerun()` が "rerun" を渡す・他は既定 "sync"）。
+    資料フォルダ単位の advisory lock で直列化する。`reflect=False` は Neo4j 反映を省く（DB 無し検証/テスト用）。
+    `run_id` は呼び出し元が受付時に確保済みの `ingest_runs` 行を渡すときだけ指定する（省略時はここで確保する）。
+    `on_run_id` は確保された run_id が判明した時点で呼ばれるコールバック。
+    `op` は Webhook 通知の情報用途（sync/refresh/rebind/rerun）。
     """
     with store.world_lock(world):
         return _run_locked(world, reflect=reflect, created_by=created_by,
@@ -258,59 +206,23 @@ def run(world, *, reflect=True, created_by="admin",
 def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
                 op: str = "sync",
                 finalize: bool = True) -> dict:
-    # lock-free 版（呼び出し元が既に world_lock を保持している前提）。`worlds.rebind` はここを直接呼ぶ
-    # （`run` 経由だと session-level advisory lock は別コネクション再入不可＝自己デッドロックする）。
-    # **この run（この `_run_locked` 呼び出し）**の last_sig 無効化・確定はここで完結する（ただし
-    # `_wipe_locked` の pre-invalidate・`sync` の lock 内バックフィル・rebind 復旧の
-    # `restore_bind_invalidate_sig` も同じ world_lock 保持中に last_sig を書く別の書き込み者である）:
-    #  ① world 未解決（`sig is None`）は last_sig を含む mutation に一切触れず即 failed で終了する。ただし
-    #     `_record`（`ingest_runs` への失敗記録＝監査ログ）は書く（TOCTOU 対策・後続の
-    #     `_build_derived`/`build_world_graph` が world を再解決して番兵無しで進む窓を作らない）。
-    #  ② world 解決済みなら取り込み開始**前**に無効化（`''`）をガード無しで書く（pre-invalidate・fail-closed）
-    #     ＝PG に書けなければここで例外が伝播し反映を一切開始しない。書けた後はどこで失敗/
-    #     クラッシュしても last_sig は既に `''`（実 sig と一致しない番兵）＝次回 sync は必ず再構築する。
-    #  ③ 正しい署名への確定は**成功パスのみ**・かつ `_record`（`ingest_runs` 記録）が**成功した後**に行う
-    #     ＝記録が失敗すれば署名は無効のまま残り、次回 sync が再試行して記録漏れを拾い直す。
-    #  ④ `reflect=False`（staging）は確定しない＝グラフ未反映を「同期済み」として誤認させない。
-    #  呼び出し元（`worlds.register`/`worlds.rebind`/`worker.sync`）はここより後・lock 外で `set_world_sig`
-    #  を後置き確定しない（register/rebind 双方）: 他プロセスの pre-invalidate/削除を
-    #  有効署名で復活させる番兵復活の穴になるため。
-    #
-    # 取り込みの背景実行化・中断リカバリー: `run_id` は呼び出し元が確保済みの
-    # `ingest_runs` 行（`store.start_ingest_run` 済み）を渡す時だけ指定する（この関数へ入る**前**の
-    # 処理から同じ行へ進捗を積みたい場合）。
-    # 省略時（register/refresh/sync の通常経路）はここで自前に行を確保する——開始時 INSERT→
-    # 完了時 UPDATE の契約により、プロセス強制死で `finish_ingest_run`
-    # まで届かなかった run は `status='extracting'` のまま残り、起動時 lifespan が孤児として拾う。
-    # `world_state()`（ディレクトリ走査・大規模 root では時間がかかりうる）より**前**に行を確保する
-    # ことで、呼び出し元は「受付＝run_id 確定」をスキャン開始前の時点で得られる（即受付契約）。
-    #
-    # HTTP 経由（router の各エンドポイント）は必ず `run_id` を確保済みでここへ入る
-    # （`sherpa.ingest.background.start_or_join` の `create_run` が受付処理の中で O(1) INSERT する）。
-    # `run_id is None` はここでは直接呼び出し（テスト・CLI 等）専用の後方互換パスである。
-    # 孤児格下げは起動時 lifespan の一括処理**のみ**
-    # に一本化する（「稼働中に他プロセスが同じ world へ触れることは無い」という前提自体は
-    # 元々起動直後の一瞬しか意味を持たない narrow window 向けの band-aid であり、実行の都度この
-    # world へ問い合わせる設計はかえって「いつ・どこで孤児が回収されるか」を追いにくくする）。
-    #
-    # `finalize`（既定 True）: False の時、この呼び出しは `ingest_runs` の終端 UPDATE を一切書かず、
-    # 代わりに戻り値へ `_pending_finalize`（`finish_ingest_run`/`finish_ingest_run_and_confirm_world`
-    # へそのまま渡せる終端引数一式）を積んで返す（例外を投げる経路では `e._sherpa_ingest_run_pending`
-    # へ同じ内容を積む）。`worlds.rebind` が新root試行→（失敗時）旧root復旧の**複数回**の
-    # `_run_locked` 呼び出しを、受付 run にとっての「非terminalな内部段」として扱うための出口
-    # ——各段が個別に terminal 化すると、後段の呼び出しが前段の published_snapshot/source_doc_ids を
-    # 上書き消去しうる（世代跨ぎの Graph 件数 0 表示の原因になる）。呼び出し元は複数段の顛末を見た
-    # 上で、最終的にどちらか1回だけ `finish_ingest_run*` を呼ぶ。
+    # lock 保持下で呼ぶ版。`worlds.rebind` はここを直接呼ぶ（`run` 経由だと同じ advisory lock を再入できず自己デッドロックする）。
+    # last_sig はこの run の中で完結させる（他に書くのは `_wipe_locked` の pre-invalidate・`sync` の lock 内バックフィル・rebind 復旧の `restore_bind_invalidate_sig`）:
+    #  - world 未解決（`sig is None`）は last_sig に触れず即 failed にする（`_record` の監査記録だけ書く）
+    #  - 取り込み開始前に `''` で無効化する（pre-invalidate）。以後どこで失敗しても次回 sync は必ず再構築する
+    #  - 正しい署名の確定は成功パスで `_record` が成功した後だけ。`reflect=False`（staging）は確定しない
+    #  - 呼び出し元は lock 外で `set_world_sig` を後置き確定しない（他プロセスの無効化を復活させるため）
+    # `run_id`: 呼び出し元が確保済みの `ingest_runs` 行を渡す（HTTP 経由は必ず確保済み）。省略時はここで開始時に INSERT する。
+    # 行はスキャン開始前に確保する（即受付契約）。強制死で終端に届かなかった run は `extracting` のまま残り、起動時 lifespan が孤児として回収する。
+    # `finalize=False`: 終端 UPDATE を書かず、戻り値の `_pending_finalize`（例外時は `e._sherpa_ingest_run_pending`）に終端引数を載せて返す
+    # （`worlds.rebind` の複数段の呼び出しを、呼び出し元が最終結末を見て1回だけ terminal 化するため）。
     if run_id is None:
         run_row = store.start_ingest_run(world, scan_root=scan_root, created_by=created_by)
         run_id = run_row["id"]
     if on_run_id is not None:
         on_run_id(run_id)
 
-    # STAT-3 S5: 段ごとの開始・終了時刻（`_progress` の段遷移で確定・monotonic 差の ms と UTC ISO）。
-    # `_current_stage`＝今開いている段（同じ段への連続呼び出しでは開始時刻を更新しない）。段の終了は
-    # 次の段への遷移時、または run 終端（`_record`／pg_replace 失敗パス）で `_close_stage_timing()` を
-    # 呼んで確定する——失敗した run でも、そこまでに開いた段の時刻は残す。
+    # 段ごとの開始・終了時刻。`_progress` の段遷移で確定し、run 終端でも `_close_stage_timing()` で閉じる
     stage_timings: dict = {}
     _stage_mono: dict = {}
     _current_stage = [None]
@@ -339,10 +251,10 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                 "進捗の記録に失敗しました（取り込み自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
 
     _progress("scanning")
-    # 走査済み件数を逐次報告（総数は走査完了まで不明＝done のみ・UI 側は「N件確認済み」表示）。
+    # ① 走査（走査済み件数を逐次報告する。総数は走査完了まで不明）
     sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
 
-    nodes, edges, flags, rows = [], [], [], []              # 台帳行は派生MD（既に作成済）から確定（Office を含める）
+    nodes, edges, flags, rows = [], [], [], []              # 台帳行は派生 MD の作成後に確定する
     rows_known = [False]                                    # 台帳が確定したか（確定前の失敗 run は counts.targeted を出さない）
 
     def _record(status, reflected=None, ledger=0, extra_flags=(), drep=None,
@@ -352,9 +264,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         fl = list(flags) + list(extra_flags)
         snap = {"docs": len(rows), "nodes": len(nodes), "edges": len(edges), "flags": fl}
         if drep is not None:
-            # office_md 段の要約（ING-1・status 画面の詳細折りたたみ）。`drep` は derive の段階まで
-            # 進んでいれば呼び出し元が渡す（graph/ES/Neo4j の成否に関わらず、その時点までの
-            # office_md 内訳は分かっているため・失敗した run でも失敗ファイル一覧は失わない）。
+            # office_md 段の要約（失敗した run でも、derive まで進んでいれば失敗ファイル一覧を残す）
             snap["office_md"] = _office_md_stage_summary(drep)
             snap["failed_files"] = _failed_files_summary(drep)
             snap["partial_extraction_suspected"] = _partial_extraction_summary(drep)
@@ -362,8 +272,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
             snap["es"] = es_summary
         if neo4j_summary is not None:
             snap["neo4j"] = neo4j_summary
-        # STAT-3 S5: run 終端（この `_record` 呼び出し）で今開いている段を閉じてから記録する
-        # （失敗した run もそこまでの段の時刻を残す）。
+        # run 終端で今開いている段を閉じてから記録する
         _close_stage_timing()
         if stage_timings:
             snap["stage_timings"] = {k: dict(v) for k, v in stage_timings.items()}
@@ -376,17 +285,12 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                   "confirm_manifest": confirm_manifest, "confirm_doc_count": confirm_doc_count,
                   "confirm_scan_report": confirm_scan_report}
         if not finalize:
-            # `finalize=False`（rebind の新root試行/旧root復旧の内部段・呼び出し元が最終結末を
-            # 見てから一度だけ terminal 化する契約）: この行の DB 確定は呼び出し元に委ねる。
+            # `finalize=False`: この行の DB 確定は呼び出し元に委ねる
             return {"world": world, "status": status, "ledger": ledger,
                     "nodes": len(nodes), "edges": len(edges), "flags": fl, "run": None,
                     "_pending_finalize": pending}
-        # ING-3: 開始時に確保済みの行（`run_id`）を完了状態へ UPDATE する（INSERT ではない・
-        # `finish_ingest_run`/`finish_ingest_run_and_confirm_world` が `progress` を NULL へ戻す）。
-        # `confirm_sig` が渡された（＝この呼び出しが成功確定パス）時だけ、run 完了と
-        # world 側の署名/manifest/doc_count/scan_report 確定を**同一トランザクション**で行う
-        # （呼び出し元が scan_report をこの呼び出しより前に計算済みであること＝重い処理を
-        # トランザクション内に残さない契約）。
+        # 開始時に確保済みの行（`run_id`）を完了状態へ UPDATE する。`confirm_sig` があるとき（成功確定パス）だけ、
+        # run 完了と world 側の署名/manifest/doc_count/scan_report の確定を同一トランザクションで行う（重い計算は呼び出し前に済ませる）
         if confirm_sig is not None:
             rec = store.finish_ingest_run_and_confirm_world(
                 run_id, world, status=status, extraction_snapshot=snap,
@@ -397,9 +301,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
             rec = store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap,
                                           published_snapshot=reflected,
                                           source_doc_ids=pending["source_doc_ids"])
-        # PART-6: terminal 化のこの1点（`finalize=True` のときだけ実際に到達する）から Webhook
-        # 通知を best-effort で発火する（例外は握って取り込み成否へ昇格させない・
-        # `webhooks.notify_run_terminal` 自身が内部で全て捕捉するため try は防御的な二重）。
+        # terminal 化のこの1点から Webhook 通知を best-effort で発火する（取り込みの成否には影響させない）
         try:
             webhooks.notify_run_terminal(world, run_id, op, status, doc_count=len(rows))
         except Exception:
@@ -408,13 +310,8 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         return {"world": world, "status": status, "ledger": ledger,
                 "nodes": len(nodes), "edges": len(edges), "flags": fl, "run": rec}
 
-    def _office_flags(d):                                   # 派生MD のセットアップ失敗を正直に flag（書けないなら検索不可）
-        """per-file の詳細（rel/reason）はここへ複製しない——`failed_files`
-        （`_failed_files_summary`・200件上限で集約済み）を単一の出所にする。
-        `unhandled_failures` の全 rel を `office_md_blocked:{doc}\t{reason}` として無制限に
-        `flags`（`extraction_snapshot`/`last_run_blocked` へそのまま伝播・上限なし）へ複製すると、
-        失敗件数の多い world で JSONB が際限なく膨らむ。集約 warn だけを返す。
-        """
+    def _office_flags(d):                                   # 派生 MD のセットアップ失敗を flag にする
+        """派生 MD の失敗を集約 warn の flag にして返す。per-file の詳細は `failed_files` を単一の出所にし、ここへは複製しない（JSONB の肥大化を避ける）。"""
         if not d.get("error"):
             return []
         return [{"doc": None, "action": "warn", "reason": f"office_md:{d['error']}"}]
@@ -423,29 +320,21 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         flags = [{"doc": None, "action": "blocked", "reason": "world_unresolved"}]
         return _record("failed")
 
-    store.set_world_sig(world, "")                          # pre-invalidate（ガード無し・fail-closed）
+    store.set_world_sig(world, "")                          # pre-invalidate（ガード無し）
 
-    # アーカイブ取り込み（zip/tar(.gz)/tgz）: 原本には書かず、展開先（`worlds.archives_dir`）を
-    # 原本側のアーカイブ集合と突き合わせて差分同期する（鏡＝更新は置換・削除は展開先ごと消える）。
-    # 以降のグラフ構築・台帳行（`_ledger_rows`）は `scope_infer.safe_files(..., also=worlds.
-    # archives_dir(world))` でこの展開先を合流させるため、それらより**前**に展開を終えておく
-    # 必要がある。展開済みのプレーンテキスト/コード/`.md` は通常どおり台帳・grep・ES・グラフ・
-    # Codex 原本直読に乗る——**展開した Office/PDF の決定的 MD 化はこのスライスでは未配線**（office_md
-    # の変換ループは別途 `wd` を直接歩くため・既知の残課題）。失敗しても取り込み全体は止めない
-    # （アーカイブ側の個別失敗は展開結果サマリへ閉じ込め、台帳の該当行へ反映する・corpus_docs 側の責務）。
+    # アーカイブ（zip/tar(.gz)/tgz）は原本に書かず、展開先（`worlds.archives_dir`）を原本側のアーカイブ集合と突き合わせて差分同期する。
+    # 以降のグラフ構築・台帳行は展開先を合流させるため、それらより前に展開を終える。個別の失敗は展開結果サマリへ閉じ込め、取り込み全体は止めない。
     try:
         archive_extract.sync_world_archives(world, worlds.world_dir(world))
     except Exception:
         _log.warning("アーカイブの展開に失敗しました（取り込み自体は継続）: world=%s", world, exc_info=True)
 
-    # 順序: ①Office→決定的MD を先に作る（corpus_docs / ES が Office 項目定義表も参照できる）→
-    # ②グラフ構築。
+    # ② 派生 MD（Office→決定的 MD）を先に作る（corpus_docs / ES が Office 項目定義表も参照できるように）→ ③ グラフ構築
     _progress("office_md", done=0, total=None)
     _last_office_progress_done = [None]
 
     def _office_progress(done, total):
-        # Nファイルごとに間引く（先頭0件・末尾＝総数一致は必ず書く）。大規模 world で毎ファイル
-        # DB 書き込みしないための頻度制御（`_PROGRESS_FILE_INTERVAL`）。
+        # `_PROGRESS_FILE_INTERVAL` 件ごとに間引く（先頭・末尾は必ず書く）
         last = _last_office_progress_done[0]
         if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_office_progress_done[0] = done
@@ -453,66 +342,46 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
 
     drep = _build_derived(world, world_sig=sig, progress=_office_progress)
     if drep.get("error"):
-        # 派生生成が公開Gateで拒否された（不完全な世代）＝派生ディレクトリは旧内容のまま更新されて
-        # いない。ここで打ち切らずgraph/台帳/ESへ進むと、旧派生content(A)を基に反映した上で
-        # 新しい原本sig(B)を確定してしまい、次回syncが「sigはB・派生は(まだ)A」の不一致に
-        # 気付けなくなる（pre-invalidateはmutation開始前に書き済みなので、ここは確定側の分岐を
-        # 増やすだけで足りる）。sigを確定させず、冒頭のpre-invalidate（''）のまま終了する。
+        # 派生生成が公開 Gate で拒否された（不完全な世代）ときは、ここで打ち切る。進むと旧派生を基に反映した上で新しい署名を確定してしまう。
+        # 署名は確定せず、冒頭の pre-invalidate（''）のまま終了する
         return _record("failed", extra_flags=_office_flags(drep), drep=drep)
-    # `build_world_graph`（アナライザ解析込み・大きい world では無視できない時間が
-    # かかりうる）に入る**前**に段を「関係グラフを構築中」へ進める——ここで進めないと、この呼び出しの間
-    # 進捗が「office_md」のまま止まって見える（Neo4j へのロード開始まで graph_build 表示にならない）。
+    # `build_world_graph` は時間がかかりうるので、入る前に段を「関係グラフを構築中」へ進める
     _progress("graph_build")
     nodes, edges, flags = build_world_graph(world)
 
     if any(f.get("action") == "blocked" for f in flags):    # blocked＝world 未解決 or 不可読コード
-        # （unreadable_code_file）＝反映も台帳書込もしない（fail-closed・部分グラフを確定しない）
+        # 反映も台帳書込もしない（部分グラフを確定しない）
         return _record("failed", extra_flags=_office_flags(drep), drep=drep)
 
-    if not reflect:                                         # staging のみ（DB無し検証/テスト）＝台帳だけ
+    if not reflect:                                         # staging のみ（DB 無し検証/テスト）＝台帳だけ
         rows = _ledger_rows(world, sig=sig)
         rows_known[0] = True
         written = store.replace_documents(world, rows)
-        # 署名は確定しない＝ last_sig は pre-invalidate のまま `''`。staging は Neo4j 未反映なので
-        # 「同期済み」とみなさない＝以後の `sync(reflect=True)` が必ず本反映で再構築する。
+        # 署名は確定しない（last_sig は `''` のまま）。Neo4j 未反映を「同期済み」とみなさず、次の `sync(reflect=True)` が再構築する
         return _record("extracting", ledger=written, extra_flags=_office_flags(drep), drep=drep)
 
-    # reflect=True: グラフを atomic 置換（load_world が world_id 単位の delete+load を1 tx）。失敗時は tx ロールバックで
-    # 旧グラフが残り、台帳も書き換えない＝旧状態を一貫保持（派生MD は cache のため先行更新済・last_sig は冒頭の
-    # pre-invalidate で既に `''`＝ソース内容が不変（設定drift のみ）でも次回 sync が確実に再構築する）。
+    # ④ グラフを資料フォルダ単位で atomic に置換する（`load_world`）。失敗時は tx がロールバックされ旧グラフが残り、台帳も書き換えない
     env = None
     neo4j_t0 = time.monotonic()
     try:
         env = world_neo4j._env()
         n, m = world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
     except Exception as e:
-        # 失敗理由に**接続先（ホスト:ポート）**を含める（閉域実機）: NEO4J_URI の例示ホスト名を
-        # そのまま有効化して名前解決できず全滅、という事故で画面に例外クラス名しか出ず原因が追えなかった。
-        # 認証情報（user/pw・URL の userinfo）は含めない。
-        # 失敗した段も stage summary に残す（office_md は完了済みなので `drep` 込み・
-        # neo4j は未完了だが所要時間とエラーだけは分かる＝完全な沈黙にしない）。
+        # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す
         return _record("failed", extra_flags=[{"doc": None, "action": "blocked",
                        "reason": f"graph_reflect_failed:{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}"}],
                        drep=drep,
                        neo4j_summary={"error": f"{e.__class__.__name__}@{_target_of(env['uri'] if env else '')}",
                                      "duration_sec": round(time.monotonic() - neo4j_t0, 3)})
     neo4j_duration_sec = time.monotonic() - neo4j_t0
-    rows = _ledger_rows(world, sig=sig)                     # 派生 .md ができてから台帳（Office を含める）
+    rows = _ledger_rows(world, sig=sig)                     # ⑤ 台帳（派生 .md ができた後）
     rows_known[0] = True
     try:
-        written = store.replace_documents(world, rows)      # 台帳はグラフ成功後（不一致を残さない）
+        written = store.replace_documents(world, rows)      # グラフ成功後に書く（不一致を残さない）
     except Exception as e:
-        # R3-S1: PG 台帳 replace 失敗＝Neo4j は新・台帳は旧のまま残る窓。記録は best-effort
-        # （PG 全断なら記録自体も書けない＝元例外の伝播のみで可視。制約違反等のデータ起因失敗なら記録が残る）。
-        # last_sig は冒頭の pre-invalidate で既に `''`（fail-closed）＝ここで改めて無効化する必要はない
-        # （次回 sync は必ず全再構築で自己修復する・Codex finding #4）。
-        # office_md／neo4j は既に完了しているので、その要約は捨てずに残す（pg_replace だけが
-        # 失敗した run でも三段の状況が見える・失敗一覧も失わない）。`published_snapshot`
-        # も記録する——Neo4j へは既に反映済み（台帳 replace の失敗は Neo4j 側の巻き戻しを
-        # 伴わない）ため、run 自体は `failed` のままでも「今実際に Neo4j にある内容」は
-        # 新世代（n/m）。省略すると `get_latest_published_run_summary` が旧 run の件数を
-        # 返し続け、status の graph_nodes/graph_edges が実態より古いまま止まる。
-        _close_stage_timing()   # STAT-3 S5: pg_replace 段は graph_build 完了後・es_index 段より前に失敗するため段の時刻はここで確定
+        # PG の台帳 replace が失敗すると Neo4j は新・台帳は旧のまま残る。記録は best-effort で、last_sig は pre-invalidate 済みなので次回 sync が全再構築で自己修復する。
+        # office_md／neo4j は完了済みなので要約を残し、`published_snapshot` も記録する（Neo4j には既に新世代が入っているため）
+        _close_stage_timing()   # pg_replace 段の時刻をここで確定する
         pending = {"status": "failed", "source_doc_ids": [r["name"] for r in rows],
                   "extraction_snapshot": {"docs": len(rows), "nodes": len(nodes), "edges": len(edges),
                                           "flags": list(flags), "degraded": True,
@@ -530,14 +399,14 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                   "confirm_sig": None, "confirm_manifest": None, "confirm_doc_count": None,
                   "confirm_scan_report": None}
         if finalize:
-            # ING-3: 開始時に確保済みの行を UPDATE する（INSERT ではない・二重記録を避ける）。
+            # 開始時に確保済みの行を UPDATE する（INSERT しない）
             try:
                 store.finish_ingest_run(
                     run_id, status=pending["status"], source_doc_ids=pending["source_doc_ids"],
                     extraction_snapshot=pending["extraction_snapshot"],
                     published_snapshot=pending["published_snapshot"])
                 e._sherpa_ingest_run_recorded = True   # 呼び出し元（_run_worker_or_503 等）の二重記録を防ぐ
-                # PART-6: `_record` を経由しないこの terminal 化（pg_replace 失敗）でも通知する。
+                # `_record` を経由しないこの terminal 化でも通知する
                 try:
                     webhooks.notify_run_terminal(world, run_id, op, pending["status"])
                 except Exception:
@@ -546,8 +415,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                 _log.warning(
                     "pg_replace 失敗の記録に失敗（best-effort・元の例外はそのまま re-raise）: %s", record_exc)
         else:
-            # `finalize=False`（rebind の内部段）: ここでは書かず、呼び出し元が最終結末を
-            # 見てから一度だけ terminal 化できるよう、保留分を例外に添えて伝える。
+            # `finalize=False`: ここでは書かず、保留分を例外に添えて呼び出し元へ伝える
             e._sherpa_ingest_run_pending = pending
         raise
     extra = _office_flags(drep)
@@ -558,102 +426,70 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         # `_office_progress` と同じ間引き（`_PROGRESS_FILE_INTERVAL` 件ごと・先頭/末尾は必ず書く）。
         # es_index 側は既に doc グループ（flush）単位で呼ばれるため、ここは二重の安全弁。
         last = _last_es_progress_done[0]
-        # 直前と全く同じ done は無条件に書かない
-        # （`done==0`/`done==total` を同値でも毎回書くと、例えば空 world の Pass2 が
-        # `progress(0, 0)` を2回通知するケースで同一内容を重複書込みする）。
+        # 直前と同じ done は書かない
         if last == done:
             return
         if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_es_progress_done[0] = done
             _progress("es_index", done=done, total=total)
 
-    # ES/reconcile は best-effort だが握りつぶさず flag 化＝半壊状態の可視化（監査#5）。取り込み自体は成功扱いのまま。
+    # ⑥ ES 索引。ES/reconcile は best-effort で、失敗は握りつぶさず flag 化する（取り込み自体は成功扱いのまま）
     try:
-        # `content_sig` は冒頭 `world_state()` で確定済みの `sig` をそのまま渡す（再走査しない）
-        # ——ここで `world_signature(world)` を再計算すると SMB 越し 100GB 級 world で全木を
-        # もう一度 stat 走査するうえ、取り込み中に原本が変化して戻った（ABA）場合に別の署名を
-        # 刻んでしまい、PG（`sig`）と ES `_meta` の内容署名が食い違って次回 sync が内容不変の
-        # world を丸ごと再索引する。
+        # `content_sig` は冒頭で確定済みの `sig` をそのまま渡す（再計算すると全木の再走査になり、ABA で PG と ES の署名が食い違う）
         esr = es_index.index_world(world, content_sig=sig,
-                                   progress=_es_progress)   # ES 全文索引（best-effort・署名で鮮度管理・EMBED-3′: doc単位進捗）
-        if esr.get("error"):                                # delete/create/bulk 失敗は例外でなく error dict（available=False の未接続は warn しない）
+                                   progress=_es_progress)   # ES 全文索引（署名で鮮度管理・doc 単位進捗）
+        if esr.get("error"):                                # delete/create/bulk 失敗は error dict（未接続は warn しない）
             extra.append({"doc": None, "action": "warn", "reason": f"es_index_failed:{esr['error']}"})
         elif esr.get("available") is True:
-            # 全再構築は毎回 human_md も作り直すため render 側は既に追随済みのはず（bulk 成功時だけ
-            # 確定・RAG_ES の設定に関わらず評価）。次回 sync が human_md 次元だけで無駄な
-            # reindex を繰り返さないよう、ここで `.human_md_es_sig` を確定する。
+            # 全再構築は human_md も作り直すので、bulk 成功時だけ `.human_md_es_sig` を確定する（RAG_ES の設定に関わらず評価）
             wd = worlds.world_dir(world)
             dmd = worlds.derived_md_dir(world)
             if wd and dmd.exists():
                 if office_md.confirm_human_md_es_sig(wd, dmd, world=world):
-                    # マーカー確定に続けて ES 自身の `_meta.human_md_sig` も現行署名へ書き直す
-                    # （書き直さないと meta だけ None のまま残り、次回 sync が human_md 次元で
-                    # 無駄な reindex を繰り返す・`es_index.confirm_human_md_meta` docstring 参照）。
+                    # ES 自身の `_meta.human_md_sig` も現行署名へ書き直す（`es_index.confirm_human_md_meta`）
                     if not es_index.confirm_human_md_meta(world):
                         extra.append({"doc": None, "action": "warn",
                                       "reason": "human_md_es_meta_confirm_failed"})
                 else:
-                    # confirm を捨てずに flags へ反映する——render 側の drift 残り/マーカー書込
-                    # 失敗を「成功（auto_published）」で覆い隠さない。
+                    # confirm の失敗は flags へ反映する（成功で覆い隠さない）
                     extra.append({"doc": None, "action": "warn",
                                   "reason": "human_md_es_sig_marker_confirm_failed"})
     except Exception as e:
         esr = {"available": None, "error": f"{e.__class__.__name__}@{_target_of(es_index._url())}"}
         extra.append({"doc": None, "action": "warn",
                       "reason": f"es_index_failed:{e.__class__.__name__}@{_target_of(es_index._url())}"})
-    _progress("finalize")
+    _progress("finalize")     # ⑦ 仕上げ
     try:
-        from .. import reconcile                            # 取込のついでに孤児派生物を自動掃除（不可視・registry 確実時のみ）
+        from .. import reconcile                            # 孤児派生物の自動掃除（registry が確実なときだけ）
         reconcile.reconcile_derivatives(reflect=reflect)
     except Exception as e:
         extra.append({"doc": None, "action": "warn", "reason": f"reconcile_failed:{e.__class__.__name__}"})
     status = "auto_published_with_flags" if (flags or extra) else "auto_published"
-    # `esr`（直前の `es_index.index_world()` の戻り値）が既に `chunks`（bulk 対象件数）を持つ——
-    # 別途 `es_index.count()` を叩き直さない（この run が実際に送った件数と ES 側の現況が bulk 失敗時に
-    # 食い違いうる・無用な ES 往復を増やさない）。
+    # `esr` は `chunks`（bulk 対象件数）を既に持つので、`es_index.count()` は叩き直さない
     es_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
                  "error": esr.get("error") if isinstance(esr, dict) else None,
                  "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
-                 # STAT-3 S5: counts（es_indexed／embedded_chunks／reused_chunks／embed_elapsed_ms）の
-                 # 元データ。`esr` に無ければ触れない（`.get()` は未取得時 None のまま＝`_counts` 側が
-                 # 欠落と 0 を区別する）。
+                 # counts の元データ（`esr` に無ければ None のまま）
                  "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
                  "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
                  "reused": esr.get("reused") if isinstance(esr, dict) else None,
                  "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
     neo4j_summary = {"nodes": n, "edges": m, "duration_sec": round(neo4j_duration_sec, 3)}
-    # 既知の残余（ライブ鏡の本質的 TOCTOU）: この確定は**冒頭スキャン時点**の
-    # 署名であり、取り込み各段（派生MD/グラフ/台帳/ES）が実際に読んだ内容と原子的に一致する保証は無い。
-    # 取り込み中に外部がファイルを追加→確定前に削除して元へ戻す（ABA）と、反映済み内容(B)と署名(A)＝ディスク(A)
-    # が一致せず次回 sync が unchanged と誤判定し得る。恒久変化なら次回 sync の署名不一致で自己修復するが、
-    # 一時的な ABA はどの時点の再スキャンでも観測不能＝スキャン方式では閉じられない。完全閉鎖は取り込みが読む
-    # 不変スナップショット or 単調な世代ID の導入（別提案・同じ設計依存）で行う。
-    #
-    # scan_report は「run 完了＋world 確定」の**同一トランザクション**（`_record` の
-    # `confirm_*` 引数 → `finish_ingest_run_and_confirm_world`）へ含めるため、`_record` を呼ぶ
-    # **前**にここで計算しておく（重い処理をトランザクション内に残さない・run が「成功」を確定した
-    # 直後に world 側の確定が来ない中間状態を作らない）。計算自体の失敗は best-effort
-    # （`scan_rep=None` のまま渡す＝該当列は更新されず前回値が残る・次回 sync か明示の
-    # `POST /worlds/{id}/recount` が拾う。sig 確定自体は失敗させない）。
+    # 既知の残余: 確定する署名は冒頭スキャン時点のもので、各段が実際に読んだ内容と原子的には一致しない（取り込み中の ABA で次回 sync が unchanged と誤判定しうる）。
+    # 恒久変化なら次回 sync の署名不一致で自己修復する。
+    # scan_report は run 完了＋world 確定の同一トランザクションに含めるため、`_record` を呼ぶ前に計算する。計算の失敗は best-effort（`scan_rep=None` のまま渡し、前回値が残る）
     confirm_doc_count = None
     scan_rep = None
     if sig is not None:
         try:
-            # `expected_rels`（取り込み冒頭の manifest の rel 集合）を渡す——本走査時点の実集合と
-            # 食い違えば（取り込み中にファイルが増減した世代混在）`scan_rep["document_count"]` は
-            # `None` になり、下でそのまま「更新保留」に伝わる（`corpus_docs.scan_report` docstring 参照）。
+            # `expected_rels`（冒頭の manifest の rel 集合）と実集合が食い違えば `scan_rep["document_count"]` は `None` になり、更新保留になる
             scan_rep = corpus_docs.scan_report(world, expected_rels=frozenset(manifest))
         except Exception:
             scan_rep = None
             _log.warning(
                 "取り込み集計（scan_report）の計算に失敗しました（次回 status は前回値のまま）: "
                 "world=%s", world, exc_info=True)
-        # doc_count は外部公開 discovery（/ext/v1/capabilities）の事前集計値・ここ（成功確定）でだけ
-        # 更新する＝ホットパスでのファイルツリー走査を無くすための唯一の書き込み点。`scan_rep` の
-        # 算出自体が失敗した場合は `None` のまま渡す（`finish_ingest_run_and_confirm_world()` は
-        # `None` の列を更新せず前回値を保持する）——`manifest_doctype_count(manifest, world)` 等の
-        # 別経路で数え直すフォールバックは持たない（scan_report が best-effort である契約を、
-        # 失敗理由の異なる代替集計で覆い隠さないため）。
+        # doc_count は外部公開 discovery（/ext/v1/capabilities）の事前集計値で、成功確定でだけ更新する（`None` は前回値を保持する）
         confirm_doc_count = scan_rep.get("document_count") if scan_rep is not None else None
     return _record(status, reflected={"nodes": n, "edges": m}, ledger=written, extra_flags=extra,
                   drep=drep, es_summary=es_summary, neo4j_summary=neo4j_summary,
@@ -662,29 +498,23 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
 
 
 def _build_derived(world, *, world_sig: str | None = None, progress=None) -> dict:
-    """world の Office を決定的MD化して派生領域に materialize（grep 検索対象になる）。world 未解決は no-op。
-
-    `progress`（ING-3・`Callable[[int, int], None] | None`）は `office_md.build_derived` が既に
-    持つ per-file 進捗コールバックへそのまま転送する（done, total）。
-    """
+    """資料フォルダの Office を決定的 MD にして派生領域へ作る（grep の検索対象になる）。未解決は no-op。`progress` は `office_md.build_derived` の per-file 進捗コールバック（done, total）へ転送する。"""
     wd = worlds.world_dir(world)
     if not wd:
         return {"converted": 0, "failed": 0, "unsupported": 0, "by_ext": {}}
     rep = office_md.build_derived(
         wd, worlds.derived_md_dir(world), world_sig=world_sig, progress=progress, world=world)
     if not rep.get("error") and not rep.get("ocr_routes_error") and _enqueue_ocr_refresh(world, world_sig):
-        # ルート生成に成功し・公開済み・refresh も積めた時だけ確定（満たさなければ次回 sync が再試行する）。
+        # ルート生成に成功し、公開済みで、refresh も積めたときだけ確定する（満たさなければ次回 sync が再試行する）
         office_md.write_ocr_route_sig_marker(worlds.derived_md_dir(world))
     return rep
 
 
 def _enqueue_ocr_refresh(world, world_sig: str | None) -> bool:
-    """公開できた派生物に対して、OCR の作り直しを1行だけ積む（既定OFF・best-effort）。
+    """公開できた派生物に対して、OCR の作り直しを1行だけ積む（既定 OFF・best-effort）。
 
-    積むのは「この署名の派生物を OCR し直す」という指示だけで、どのラスタを読むかの展開は
-    隔離 worker が公開済みのルート（`.ocr_route.json`）を辿って行う。OCR は任意観測なので、
-    ここでの失敗を取り込みの失敗へ昇格させない（次回の取り込みか明示実行で拾い直す）。
-    積めたら True、積まなかった/失敗したら False（呼び出し元がルート版マーカーの確定に使う）。
+    積むのは「この署名の派生物を OCR し直す」という指示だけで、読む画像の展開は隔離 worker が公開済みのルート（`.ocr_route.json`）を辿って行う。
+    ここでの失敗は取り込みの失敗にしない。積めたら True、積まなかった/失敗したら False（呼び出し元がルート版マーカーの確定に使う）。
     """
     if not office_md.ocr_enabled() or not world_sig:
         return False
@@ -692,7 +522,7 @@ def _enqueue_ocr_refresh(world, world_sig: str | None) -> bool:
         from ..store import ocr_jobs
         from . import derived_generation, ocr_worker
 
-        # 世代IDは投入側と照合側で必ず同じ写像を使う（`generation_id_for` のコメント参照）。
+        # 世代 ID は投入側と照合側で必ず同じ写像（`generation_id_for`）を使う
         ocr_jobs.enqueue_refresh_run(
             world, derived_generation.generation_id_for(world_sig), ocr_worker.profile_hash())
         return True
@@ -703,16 +533,14 @@ def _enqueue_ocr_refresh(world, world_sig: str | None) -> bool:
 
 
 def _derived_stale(world) -> bool:
-    """**派生MD の作り直しが要るか**（変更検知の無変化判定に併用）。
+    """派生 MD の作り直しが要るか（変更検知の無変化判定に併用）。
 
-    派生ディレクトリが無い（＝この機能の後付け導入／`data/derived` 削除／`SHERPA_DERIVED_DIR` 変更）のに
-    変換可能 Office が在るなら True。一度ビルドすれば dir は残る（失敗ファイルがあっても）ので無限ループしない。
-    **アーム構成（有効アーム＋PDF バックエンド）が変わった時も True**（署名同一でも作り直す）。
-    記録したアーム構成と今が一致＝drift 無しなら再ビルドしない（無限ループしない）。
+    派生ディレクトリが無いのに変換可能な Office があれば True。アーム構成（有効アーム＋PDF バックエンド）が変わったときも True。
+    一度ビルドすればディレクトリは残るので無限ループしない。
     """
     dmd = worlds.derived_md_dir(world)
     if dmd.exists():
-        return office_md.arms_sig_drift(dmd)             # アーム構成/PDF バックエンドの変化を検知して作り直す
+        return office_md.arms_sig_drift(dmd)             # アーム構成/PDF バックエンドの変化で作り直す
     wd = worlds.world_dir(world)
     if not wd:
         return False
@@ -720,25 +548,23 @@ def _derived_stale(world) -> bool:
 
 
 def rerun(world, **kw) -> dict:
-    """失敗/再取り込みのやり直し＝**world 全体のクリーン rebuild**（即反映ライブ鏡）。"""
-    kw.setdefault("op", "rerun")   # PART-6: Webhook 通知の op（呼び出し側が明示すればそちらを優先）
+    """失敗/再取り込みのやり直し。資料フォルダ全体のクリーン rebuild を行う。"""
+    kw.setdefault("op", "rerun")   # Webhook 通知の op（呼び出し側が明示すればそちらを優先）
     return run(world, **kw)
 
 
-_SCAN_PROGRESS_INTERVAL = 500   # 走査進捗の報告間隔（ファイル数。SMB 越しの1万ファイル級で「無音の走査段」を無くす）
+_SCAN_PROGRESS_INTERVAL = 500   # 走査進捗の報告間隔（ファイル数）
 
 
 def _scan_dir(wd, progress=None) -> list:
-    """wd 配下の対象ファイルを `(rel, mtime_ns, ctime_ns, size)` のソート済みリストで返す（stat のみ・中身は読まない＝軽い）。
+    """`wd` 配下の対象ファイルを `(rel, mtime_ns, ctime_ns, size)` のソート済みリストで返す（stat のみで中身は読まない）。
 
-    `progress`（省略可・`Callable[[int], None]`）: 走査済みファイル数を `_SCAN_PROGRESS_INTERVAL`
-    件ごと＋最後に1回報告する（総数は走査が終わるまで不明＝件数のみ。「走査段が無音で
-    止まって見える」への対処）。"""
+    `progress`（省略可）は走査済みファイル数を `_SCAN_PROGRESS_INTERVAL` 件ごとと最後に報告する。"""
     parts = []
     for rp, rel in scope_infer.safe_files(wd):
         try:
             st = rp.stat()
-            parts.append((rel, st.st_mtime_ns, st.st_ctime_ns, st.st_size))   # ctime も（粗い mtime 対策）
+            parts.append((rel, st.st_mtime_ns, st.st_ctime_ns, st.st_size))   # ctime も含める
         except OSError:
             parts.append((rel, None, None, None))
         if progress is not None and len(parts) % _SCAN_PROGRESS_INTERVAL == 0:
@@ -750,14 +576,8 @@ def _scan_dir(wd, progress=None) -> list:
 
 
 def _sig(parts) -> str:
-    # `importance.IMPORTANCE_SCHEMA_VERSION`／`analyzer_registry.config_signature()`／
-    # `world_graph.MENTION_SCHEMA_VERSION`＋実効値（`_mention_min_len()`/`_mention_max_per_doc()`）
-    # を材料に含める——重要度機能のスキーマ、コード解析アナライザの有効構成（登録順・拡張子集合・
-    # 分類契約版）、辞書突合（言及エッジ）の仕様版、または env（`SHERPA_MENTION_MIN_LEN`/
-    # `SHERPA_MENTION_MAX_PER_DOC`）の実効値が変わった world は、ソースファイル自体が不変でも
-    # 署名が変わり、標準の「署名不一致→全再構築」経路で自動的に full rebuild される（旧世代の
-    # 台帳/Neo4j データの後始末に専用の移行経路を持たない——実効値未対応だと
-    # 設定変更後も既存 world の言及エッジが旧しきい値のまま素通りする）。
+    # 重要度のスキーマ版・アナライザの有効構成・言及エッジの仕様版と実効値（`world_graph._mention_min_len`/`_mention_max_per_doc`）を材料に含める。
+    # これらが変わると、ソースが不変でも署名が変わり全再構築される
     return hashlib.sha1(repr((importance.IMPORTANCE_SCHEMA_VERSION, analyzer_registry.config_signature(),
                              world_graph.MENTION_SCHEMA_VERSION, world_graph._mention_min_len(),
                              world_graph._mention_max_per_doc(), parts)).encode("utf-8")).hexdigest()
@@ -769,27 +589,21 @@ def _manifest(parts) -> dict:
 
 
 def world_signature_of_root(wd) -> str:
-    """既に解決済みの root（`Path`）から署名を計算する（`worlds.world_dir()` を再度呼ばない）。
+    """解決済みの root（`Path`）から署名を計算する（`worlds.world_dir()` を再度呼ばない）。
 
-    呼び出し元が root を取得済みの場合はこちらを使う——`world_signature(world_id)` のように
-    world_id から毎回 `world_dir()` を呼び直すと、その2回の呼び出しの間に rebind（root 差し替え）
-    が起きた場合、古い root を実際にスキャンしていながら新しい root の署名を返してしまい、
-    呼び出し元が「古い root の結果」を「新しい root の署名」でキャッシュする不整合が起きうる
-    （`ingest.importance.resolve_for_world` 参照）。
+    root 取得済みの呼び出し元はこちらを使う（再解決の間に rebind が起きると、古い root のスキャン結果を新しい root の署名で扱ってしまう）。
     """
     return _sig(_scan_dir(wd))
 
 
 def world_signature(world) -> str | None:
-    """world の安価な署名（各ファイルの rel/mtime/ctime/size の集約＋重要度スキーマ版＋アナライザ
-    構成署名の SHA1・`_sig()` 参照）。変更検知の基準。world 不在は None。"""
+    """資料フォルダの安価な署名（各ファイルの rel/mtime/ctime/size の集約＋重要度スキーマ版＋アナライザ構成署名の SHA1・`_sig()`）。変更検知の基準。不在は None。"""
     wd = worlds.world_dir(world)
     return world_signature_of_root(wd) if wd else None
 
 
 def world_state(world, progress=None):
-    """`(署名, ファイル明細)` を**1スキャン**で返す（取り込み時に両方を保存する用）。world 不在は `(None, None)`。
-    `progress` は `_scan_dir` へそのまま転送（走査済み件数の報告・省略可）。"""
+    """`(署名, ファイル明細)` を1スキャンで返す。資料フォルダ不在は `(None, None)`。`progress` は `_scan_dir` へ転送する。"""
     wd = worlds.world_dir(world)
     if not wd:
         return None, None
@@ -798,12 +612,10 @@ def world_state(world, progress=None):
 
 
 def diff_dir(wd, prev_manifest, prev_sig=None) -> dict:
-    """フォルダ現状 vs 取り込み済み明細の**差分**（read-only・グラフ/台帳/ES に一切書かない）。
+    """フォルダ現状と取り込み済み明細の差分を返す（read-only・グラフ/台帳/ES には書かない）。
 
-    返値: `added`/`removed`/`changed`（rel のリスト）＋ `total`（現在のファイル数）/`indexed`（前回取込のファイル数）。
-    `prev_manifest`=None/空＝未取り込み扱い＝全ファイルが added（＝登録したら入る件数のプレビュー）。
-    ただし**明細が未保存でも署名（`prev_sig`）が現状と一致**するなら取り込み済みと同一内容＝差分なし
-    （旧データ/バックフィル前に「全件 added」と誤表示しない）。
+    返値は `added`/`removed`/`changed`（rel のリスト）と `total`（現在のファイル数）・`indexed`（前回取込のファイル数）。
+    `prev_manifest` が None/空なら未取り込み扱い（全ファイルが added）。ただし明細が未保存でも署名（`prev_sig`）が現状と一致すれば差分なし。
     """
     parts = _scan_dir(wd)
     cur = _manifest(parts)
@@ -820,48 +632,17 @@ def diff_dir(wd, prev_manifest, prev_sig=None) -> dict:
 def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings: dict | None = None,
                                        run_id: int | None = None,
                                        progress: Callable[[int, int], None] | None = None) -> dict:
-    """`es_index.index_world()` を「human_md の ES 反映ホールドバック」込みで呼ぶ共通ヘルパ。
+    """`es_index.index_world()` を、human_md の ES 反映ホールドバック込みで呼ぶ共通ヘルパ。
 
-    `run_id`（受付 run の内部・`sync` の unchanged 分岐専用）指定時、失敗しても新規
-    `ingest_runs` 行は作らない——呼び出し元（`sync`）が戻り値（`available`/`error`）を見て
-    その受付 run 自身の terminal 化に畳み込む（別 run が生まれると、受付側の run_id を
-    ポーリングしているクライアントからは失敗が一切見えなくなる）。
-
-    `progress`（省略可）: そのまま `es_index.index_world()` へ
-    転送する（`(done_docs, total_docs)` を文書グループ flush ごとに受け取る）。呼び出し元が
-    `ingest_runs` への進捗記録を配線したい場合に使う（`_sync_impl` の unchanged 分岐の ES
-    自己修復は実環境で数時間かかりうる最長段になりうるため、進捗を配線できるようにする）。
-
-    `_refresh_derived_representations`（RAG_ES 有効時の holdback 分岐）・`sync`（legacy 自己修復
-    分岐）・`ocr_worker.reindex_observations` の3経路が個別に持っていた確定/失敗記録のロジックを
-    一元化する（`_run_locked`＝全再構築経路は、ES 失敗を他の失敗と合わせて1回の `ingest_runs`
-    レコードへ畳み込む既存の flag ベース契約のままここには含めない）。
-
-    **呼び出し前に必ず `.human_md_es_sig` マーカーを無効化する**（RAG-KV 提案書の `.rag_sig` と
-    同じ「再索引前に既存マーカーを落とす」順序）: 無効化せずに `index_world()` を直接呼ぶと、
-    以前の成功で既に確定済みのマーカーが残ったまま、今回の bulk が部分失敗しても
-    （`_human_md_config_sig` が pending でなくなっているため）ES 自身の `_meta` には
-    `ensure_index()`（bulk 実行**前**）の時点で「成功して確定した版」が書かれてしまう——
-    bulk の成否と無関係に meta が確定値になり、欠けた索引が固定される「二段階更新の穴」になる。
-    **この無効化自体が失敗（`OSError`）した場合は index_world() を呼ばず fail-closed で
-    終える**（RAG-KV 提案書 `.rag_sig` の契約と同型）——削除できたか分からない古いマーカーを
-    残したまま再索引すると、上記と同じ「meta が確定値のまま固定される」穴を再現しかねないため、
-    索引を開始せず失敗記録だけ残して次回 sync に委ねる。
-
-    bulk が成功（`available` かつ `error` キー無し）した時だけ `confirm_human_md_es_sig` で
-    マーカーを再確定し、**続けて `es_index.confirm_human_md_meta()` で ES 自身の
-    `_meta.human_md_sig` も現行署名へ書き直す**——`ensure_index()` は bulk 実行前の時点で
-    （このマーカー無効化直後は必ず pending のため）meta へ `None` を書いており、bulk 成功後に
-    meta を書き直さないと、マーカーは確定済みなのに meta だけ `None` のまま残り、次回
-    `needs_reindex()` が「None ≠ 現行版」を検知して**収束せず毎 sync 再索引し続ける**。
-
-    次のいずれかが起きた場合は `ingest_runs` へ `status="failed"` で記録する: (a) マーカーの
-    無効化自体が失敗、(b) `index_world()` 自体が失敗/未接続/例外、(c) confirm 自体の書込が
-    失敗した（`.human_md_es_sig` マーカーの書込エラー）。meta の書き直し（`confirm_human_md_meta`）
-    の失敗は実害が索引内容ではなく次回の自己修復ループの収束速度に留まるため、ここでは
-    warning に留め ingest_runs へは記録しない。戻り値は `index_world()` の結果そのもの
-    （呼ばなかった/例外時は `{"available": False, "error": ...}` を合成して返す＝呼び出し元は
-    常に dict を受け取れる）。
+    ① 呼び出し前に `.human_md_es_sig` マーカーを無効化する（確定済みマーカーが残ると、bulk が部分失敗しても meta が確定値になり欠けた索引が固定されるため）。
+       無効化に失敗（`OSError`）したら `index_world()` を呼ばず、失敗を記録して終える。
+    ② bulk が成功（`available` かつ `error` なし）したときだけ `confirm_human_md_es_sig` でマーカーを再確定し、
+       続けて `es_index.confirm_human_md_meta()` で ES 側の `_meta.human_md_sig` も現行署名へ書き直す（書かないと次回 `needs_reindex()` が収束しない）。
+    `ingest_runs` へ `status="failed"` で記録するのは (a) マーカー無効化の失敗 (b) `index_world()` の失敗/未接続/例外 (c) マーカー書込の失敗。meta の書き直しの失敗は warning のみ。
+    戻り値は `index_world()` の結果（呼ばなかった/例外時は `{"available": False, "error": ...}`）。
+    `run_id`（`sync` の unchanged 分岐専用）を指定すると失敗しても新規 `ingest_runs` 行を作らない（呼び出し元が戻り値から受付 run を terminal 化する）。
+    `progress` は `es_index.index_world()` へ転送する（`(done_docs, total_docs)`）。
+    `_refresh_derived_representations`・`sync`（legacy 自己修復分岐）・`ocr_worker.reindex_observations` が共用する（全再構築の `_run_locked` は含めない）。
     """
     world_dir = worlds.world_dir(world)
     derived_md_dir = worlds.derived_md_dir(world)
@@ -891,9 +672,7 @@ def index_world_with_human_md_holdback(world: str, *, content_sig=None, settings
 
 
 def _record_es_index_failure(world: str, reason: str, *, run_id: int | None = None) -> None:
-    """ES 反映失敗を記録する。`run_id` 指定時は新規行を作らない——呼び出し元
-    （`index_world_with_human_md_holdback` の `run_id` 引数 docstring 参照）が戻り値から
-    自分で判断し、受付 run 自身の terminal 化に畳み込む契約のため、ここでは何もしない。"""
+    """ES 反映失敗を記録する。`run_id` 指定時は何もしない（呼び出し元が戻り値から受付 run 自身を terminal 化する）。"""
     if run_id is not None:
         return
     try:
@@ -910,12 +689,10 @@ def _record_es_index_failure(world: str, reason: str, *, run_id: int | None = No
 
 
 def _merge_es_runs(prev_summary, prev_timing, new_summary, new_timing):
-    """同一 run で ES 再索引が 2 回走ったときの統計の合成。`prev_*` が None なら `new_*` をそのまま返す。
-    所要時間（`elapsed_ms`）と埋め込み（`embedded`・`reused`・`embed_elapsed_ms`）は累積、
-    `started_at` は初回、`finished_at` は最終、索引件数（`indexed`・`chunks`）と状態
-    （`available`・`error`）は最終回の値。キャッシュ再利用の2回目で `embedded=0` になっても
-    初回に実際に埋め込んだ件数は失わない（`reused` も同様＝どちらの回も world 全体を対象にした
-    索引のため、部分集合の合算ではなく2回分の単純合計）。"""
+    """同一 run で ES 再索引が 2 回走ったときの統計を合成する。`prev_*` が None なら `new_*` をそのまま返す。
+
+    所要時間と埋め込み（`embedded`・`reused`・`embed_elapsed_ms`）は累積、`started_at` は初回、`finished_at` は最終、
+    索引件数（`indexed`・`chunks`）と状態（`available`・`error`）は最終回の値。"""
     if prev_summary is None and prev_timing is None:
         return new_summary, new_timing
     def _add(a, b):
@@ -935,88 +712,37 @@ def _merge_es_runs(prev_summary, prev_timing, new_summary, new_timing):
 
 
 def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | None, str | None]:
-    """`sync()` の軽量再生成分岐（document_ir/evidence/rag drift のみで、arms drift・force・
-    原本変化は無し）。呼び出し元は `store.world_lock` の中でこれを呼ぶ（derived ディレクトリへの
-    書込を同一 world の並行 `run()`/`sync()` と競合させないため）。
+    """`sync()` の軽量再生成分岐（human_md/document_ir/evidence/rag の drift のみで、arms drift・force・原本変化は無い）。
 
-    戻り値: `(status, es_refresh_info, failure_reason)` の3タプル。`status`——sidecar 欠落を検知したら
-    `"needs_full_run"`（この関数自身は `run()`/`_run_locked()` を呼ばない＝呼び出し元が同じ
-    `store.world_lock` 区間の中で lock-free 版の `_run_locked()` を直接呼ぶ）。drift が無ければ
-    `None`。それ以外（human_md/document_ir/evidence/rag のいずれかの軽量再生成を実行した）は
-    `"handled"`（全て成功）または `"rag_failed"`（いずれかの軽量再生成が失敗——`failure_reason` に
-    詳細を積む）。呼び出し元はこれを ES 自己修復の成否と合成して run の終端 status/flags に反映する
-    （黙って `auto_published` にしない——`es_repair_failed` と同じ流儀）。`es_refresh_info`——この関数内で実際に ES 再索引
-    （`index_world_with_human_md_holdback`）を実行した場合だけ `{"summary": {...}, "stage_timing":
-    {...}}`（呼び出し元 `_sync_impl` の明示 ES 自己修復と同形）を返し、それ以外は `None`——
-    呼び出し元はこれを自身の `counts`/`stage_timings` へ畳み込む（この再索引の結果は関数内で
-    完結しており、呼び出し元へ返さないと直後の `es_index.needs_reindex` が収束済みと判定して
-    再実行されず、取り込み統計から丸ごと欠落する）。呼び出し元（`sync()`）は
-    `"handled"` でも backfill/ES 自己修復をスキップしない（human_md の軽量再生成が書き換える
-    legacy `{rel}.md` は ES の索引元になりうる——RAG_ES OFF なら常に、RAG_ES ON でも
-    `rag_chunks` が無効/劣化した文書は legacy 縮退で `{rel}.md` を読むため——同じ sync 呼び出し内で
-    `needs_reindex` 自己修復まで到達させる必要がある・`sync()` docstring 参照）。ES 自体が
-    この human_md 版まで実際に bulk 反映できたかは別途 `.human_md_es_sig` マーカー
-    （`office_md.confirm_human_md_es_sig`・ホールドバック方式）で確定する——render 側
-    （`asset_versions.human_md`）とは独立に、ES の bulk 成否を確認できる呼び出し元だけが
-    確定できるため（`es_index._human_md_config_sig` docstring 参照）。
+    呼び出し元は `store.world_lock` の中で呼ぶ（derived への書込を並行の `run()`/`sync()` と競合させない）。
+    戻り値は `(status, es_refresh_info, failure_reason)`。
+    - `status`: sidecar 欠落を検知したら `"needs_full_run"`（呼び出し元が同じ lock 区間で `_run_locked()` を直接呼ぶ）。
+      drift が無ければ `None`。軽量再生成を実行したら `"handled"`（全て成功）か `"rag_failed"`（`failure_reason` に詳細）。
+    - `es_refresh_info`: ここで ES 再索引を実行したときだけ `{"summary", "stage_timing"}`（呼び出し元の明示 ES 自己修復と同形）。呼び出し元が `counts`/`stage_timings` へ畳み込む。
+    呼び出し元は `"handled"` でも backfill/ES 自己修復をスキップしない（human_md が書き換える `{rel}.md` は legacy 縮退で ES の索引元になりうる）。
 
-    sidecar 欠落の確認は drift の有無に関わらず**必ず先に**行う——バージョン定数は不変
-    （drift 無し）のまま `.md`/`.md.meta.json`/`.evidence.json` が外部要因で欠落した場合、
-    drift 判定だけを見ていると恒久的な no-op になり検知できない（sig マーカー自体は現行値と
-    一致したままのため）。
+    手順:
+    ① sidecar（`.md`/`.md.meta.json`/`.evidence.json`）の欠落確認を、drift の有無に関わらず必ず先に行い、欠落なら全再構築へ回す。
+    ② human_md drift → `refresh_human_md`（`{rel}.md` だけの軽量再生成）。他の drift とは独立に必ず個別に確認・実行する。
+    ③ document_ir drift → `refresh_document_ir`（全 OOXML 文書を対象に再生成）。続けて ④ evidence→rag→（RAG_ES 有効時は）ES 反映まで連鎖させる。
+    ⑤ ③を経ない場合の evidence drift → `refresh_evidence_ir`（evidence→rag も）。⑥ ③⑤を経ない場合の rag drift → `refresh_rag`。
 
-    優先順位: ①sidecar 欠落→全再構築（他の全経路より先に確認・排他）。②human_md drift
-    （`office_md.human_md_sig_drift`・rel ごとの `asset_versions.human_md` 版）→
-    `refresh_human_md`（`{rel}.md` **だけ**の軽量再生成・単一 asset）。document_ir/evidence/rag
-    のいずれの drift/連鎖とも独立（人間向け MD の版だけが変わっても rag.md/ES を巻き込まない・
-    H2・正典 §10 裁定#4関連）ため②〜⑤とは排他ではなく**必ず個別に**確認・実行する。③document_ir
-    drift→`refresh_document_ir`（document.json/blocks/chunks の軽量再生成・**全 OOXML 文書を対象に
-    再生成する**＝docx/pptx/xlsx のどれか1つの抽出器版だけが上がった場合でも他の拡張子も
-    含めて世界全体を作り直す。世界単位の1つのマーカーで判定するため）。④（③を実行した場合は
-    それに続けて）evidence→rag→（RAG_ES 有効時は）ES 反映まで連鎖して再生成する。⑤（③を経ない
-    場合）evidence drift→`refresh_evidence_ir`（evidence→rag も同時に面倒を見る）。⑥（③⑤の
-    いずれも経ない場合）rag drift→`refresh_rag`。
-
-    document_ir と evidence/rag は独立した抽出パイプラインだが、どちらも同じ原本抽出器
-    （`ooxml_arm` 等）由来の値を版に含む——document_ir 版を上げる抽出器変更は evidence/rag の
-    抽出結果にも影響しうるため、**document_ir を再生成した場合は evidence/rag 自身の drift
-    判定結果によらず必ず evidence/rag（→ RAG_ES 有効時は ES）も連鎖再生成する**（取りこぼしを
-    避ける）。document_ir/evidence の再生成自体は検索 consumer の設定（RAG の ES 反映有効/無効等）
-    に左右されない既定の契約——`.rag_sig` の確定を ES 反映の成否まで保留するかどうかだけが
-    その設定で変わる（マーカー保留方式）。
-
-    document_ir 側の失敗分離（1文書の失敗で World 全体を止めない）: `refresh_document_ir` が
-    1文書でも失敗しても、それだけで evidence→rag への連鎖を打ち切らない——打ち切ると、その
-    失敗文書が直らない限り、成功した他の全文書分の evidence/RAG/ES まで永久に旧世代のまま
-    固定されてしまう。連鎖を打ち切るのは `error` キー（overlap 等の構造的な setup 失敗＝
-    1文書も処理できていない）が返った時だけにする。**`.document_ir_sig` は world 単位で1つの
-    マーカーしか持たない**ため、1文書でも失敗が残る限り次回 sync の `document_ir_sig_drift`
-    は world 全体として True のままになり、`refresh_document_ir` は対象 OOXML 文書を毎回
-    全件再実行する（成功済みの文書だけ・失敗文書だけを選んで再試行する仕組みは無い）。
-    連鎖先の evidence/rag（RAG_ES 有効時は ES 索引も）も、document_ir drift が続く限り
-    毎回再実行される。sync 自体は既定でポーリング駆動ではない（手動更新/登録時のリラン等が
-    契機）ため、この全件再実行の冗長さを個別最適化する必要は無いと判断している。
-
-    document_ir マーカーの確定順（上流→下流の逆順で確定する）: document_ir 自体の生成が
-    成功しても、その場で `.document_ir_sig` を確定しない（`refresh_document_ir` を
-    `write_document_ir_sig_marker=False` で呼ぶ）。**連鎖した evidence/rag（さらに RAG_ES
-    有効時は ES 反映）まで成功したことを確認できてから**、初めて `write_document_ir_sig_marker()`
-    で確定する。先に確定してしまうと、evidence/rag/ES 側の連鎖が（例えば `.rag_sig` の
-    ホールドバック削除失敗で）その場で失敗しても、次回 sync では document_ir drift が既に
-    False（かつ evidence/rag 自身の drift も、連鎖の起点になった時点で既にそれぞれ False
-    だったケースでは変化しない）になり、**再試行の入口そのものが失われる**（恒久的に
-    Evidence/RAG/ES が旧世代のまま固定される）。
+    守ること:
+    - document_ir を再生成したら、evidence/rag の drift 判定によらず必ず連鎖再生成する。
+    - `refresh_document_ir` が1文書失敗しても連鎖は止めない（`error` キー＝構造的な setup 失敗のときだけ止める）。
+      `.document_ir_sig` は資料フォルダ単位で1つなので、失敗が残る限り次回も全件を再実行する。
+    - `.document_ir_sig` は `write_document_ir_sig_marker=False` で呼び、連鎖した evidence/rag（と ES 反映）の成功を確認してから
+      `write_document_ir_sig_marker()` で確定する（先に確定すると再試行の入口が失われる）。
     """
     wd = worlds.world_dir(world)
     dmd = worlds.derived_md_dir(world)
-    if not wd or not dmd.exists():                      # text/code のみの world は評価対象が無い
+    if not wd or not dmd.exists():                      # text/code のみの資料フォルダは評価対象が無い
         return None, None, None
-    if office_md.rag_sidecars_missing(wd, dmd, world=world):   # drift の有無によらず常に確認する
+    if office_md.rag_sidecars_missing(wd, dmd, world=world):   # ① drift の有無によらず常に確認する
         return "needs_full_run", None, None
-    # human_md drift は document_ir/evidence/rag のいずれとも独立（②のみ・rag/ES には触れない）。
-    # 排他分岐の外で必ず確認する＝document_ir 等に drift が無くても human_md だけ古ければ拾う。
+    # ② human_md drift は他の drift と独立（rag/ES には触れない）。排他分岐の外で必ず確認する
     human_md_handled = False
-    human_md_failure_reason = None                       # 失敗しても以降の drift 判定は続行する（連鎖は独立）
+    human_md_failure_reason = None                       # 失敗しても以降の drift 判定は続行する
     if office_md.human_md_sig_drift(wd, dmd, world=world):
         hm_result = office_md.refresh_human_md(wd, dmd, world=world)
         failed = hm_result.get("human_md_failed", 0)
@@ -1026,9 +752,8 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
                 "human_md の軽量再生成で一部の文書が失敗しました（次回 sync で再試行）: "
                 "world=%s detail=%s", world, hm_result)
         human_md_handled = True
-    # OCR ルート版の drift は Evidence/rag と独立（ルートだけ書き直す・ES には触れない）。
-    # 書き直したルートで「読めない画像形式」になった入力の過去の job も、ここで直接終端する。
-    # マーカーは、全件の書き直し・終端と OCR refresh の enqueue が成功した後にだけ確定する。
+    # OCR ルート版の drift は Evidence/rag と独立（ルートだけ書き直し、ES には触れない）。読めない画像形式になった入力の過去の job もここで終端する。
+    # マーカーは、全件の書き直し・終端と OCR refresh の enqueue が成功した後にだけ確定する
     if office_md.ocr_route_refresh_needed(dmd):
         try:
             active_sig = (dmd / office_md._WORLD_SIG_MARKER).read_text(encoding="utf-8").strip()
@@ -1043,15 +768,13 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
         human_md_handled = True
     document_ir_drift = office_md.document_ir_sig_drift(dmd)
     evidence_drift = office_md.evidence_ir_sig_drift(dmd)
-    # `rag_sig_drift` の OCR 観測次元（O1）: 直近 sync 以降に OCR が新しい観測世代を公開していれば
-    # ここが True になり、evidence が不変でも rag drift 経由で `refresh_rag` を誘発する
-    # （OCR 完了後の rag.md/ES への「追いつき」は、この既存 drift 連鎖に乗せる・新しい仕組みは作らない）。
+    # `rag_sig_drift` は OCR 観測次元を含む。OCR が新しい観測世代を公開していれば evidence が不変でも `refresh_rag` を誘発する
     rag_drift = office_md.rag_sig_drift(dmd, world=world)
     if not document_ir_drift and not evidence_drift and not rag_drift:
         if human_md_failure_reason:
             return "rag_failed", None, human_md_failure_reason
         return ("handled" if human_md_handled else None), None, None
-    document_ir_ok = True                                # document_ir を経由しない経路では常に真のまま
+    document_ir_ok = True                                # document_ir を経由しない経路では真のまま
     if document_ir_drift:
         doc_result = office_md.refresh_document_ir(wd, dmd, write_document_ir_sig_marker=False, world=world)
         if doc_result.get("error"):                      # 構造的な setup 失敗＝1文書も処理できていない
@@ -1063,7 +786,7 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
                 reason = f"{human_md_failure_reason};{reason}"
             return "rag_failed", None, reason
         if doc_result.get("document_ir_failed", 0):
-            document_ir_ok = False                       # world単位マーカー未確定のまま＝今回もevidence/rag連鎖は継続
+            document_ir_ok = False                       # マーカーは未確定のまま・今回の evidence/rag 連鎖は継続する
             _partial = f"document_ir_refresh_failed:{doc_result.get('document_ir_failed')}"
             human_md_failure_reason = (f"{human_md_failure_reason};{_partial}"
                                        if human_md_failure_reason else _partial)   # 部分失敗も run の終端へ引き継ぐ
@@ -1071,7 +794,7 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
                 "document_ir の軽量再生成で一部の文書が失敗しました（マーカーは world 単位のため"
                 "全 OOXML 文書を対象に次回 sync も再実行されます・今回分の evidence/rag への"
                 "連鎖は継続します）: world=%s detail=%s", world, doc_result)
-    defer = es_index.rag_es_enabled()                    # RAG_ES有効時だけマーカー保留方式（ES成否込みで確定）
+    defer = es_index.rag_es_enabled()                    # RAG_ES 有効時だけマーカー保留方式（ES の成否込みで確定）
     if document_ir_drift or evidence_drift:
         result = office_md.refresh_evidence_ir(wd, dmd, write_rag_sig_marker=not defer, world=world)
         ok = not result.get("error") and result.get("evidence_ir_failed", 0) == 0 \
@@ -1087,25 +810,18 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
         if human_md_failure_reason:
             reason = f"{human_md_failure_reason};{reason}"
         return "rag_failed", None, reason
-    # rag.md が実際に書き換わった（`ok`）ので、ES 反映の成否に関わらずグラフ
-    # （言及エッジ）を追いつかせる。呼び出し元（`_sync_impl`）が既に `store.world_lock` を保持中
-    # ＝lock-free ヘルパーをそのまま呼ぶ（`_reflect_graph_after_rag_rewrite` docstring 参照）。
+    # rag.md が書き換わったので、ES 反映の成否に関わらずグラフ（言及エッジ）を追いつかせる（`store.world_lock` 保持中の呼び出し元から lock-free ヘルパーを呼ぶ）
     _reflect_graph_after_rag_rewrite(world)
-    es_ok = True                                         # holdback対象外（defer=False）なら確定済み扱い
-    es_refresh_info = None                                # ES再索引を実行した場合だけ呼び出し元へ返す
+    es_ok = True                                         # holdback 対象外（defer=False）なら確定済み扱い
+    es_refresh_info = None                                # ES 再索引を実行した場合だけ呼び出し元へ返す
     if defer:
-        # human_md は RAG_ES の設定に関わらず ES の索引内容に影響しうる（rag_chunks 無効時の
-        # legacy 縮退経路）ため、共通ヘルパが `.human_md_es_sig` の無効化/確定/失敗記録まで
-        # 一元的に面倒を見る（`index_world_with_human_md_holdback` docstring 参照）。
+        # human_md は RAG_ES の設定に関わらず ES の索引内容に影響しうるため、共通ヘルパが `.human_md_es_sig` の無効化/確定/失敗記録まで面倒を見る
         _es_t0 = time.monotonic()
         _es_started_at = datetime.now(timezone.utc).isoformat()
         esr = index_world_with_human_md_holdback(world, content_sig=sig)
         _es_finished_at = datetime.now(timezone.utc).isoformat()
         es_ok = esr.get("available") is True and not esr.get("error")
-        # 呼び出し元（`_sync_impl`）の明示 ES 自己修復（`_counts_summary`/`stage_timings` へ渡す
-        # 組み立て）と同形——この再索引がここで完結してしまうと、直後の呼び出し元の
-        # `es_index.needs_reindex` 判定が既に収束済み（False）を返し、取り込み統計から
-        # 索引件数・埋め込み件数/時間が丸ごと欠落する（呼び出し元が畳み込むための唯一の経路）。
+        # 呼び出し元の明示 ES 自己修復と同形（呼び出し元が `counts`/`stage_timings` へ畳み込む）
         es_refresh_info = {
             "summary": {
                 "available": esr.get("available") if isinstance(esr, dict) else None,
@@ -1127,30 +843,19 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
         else:
             _log.warning(
                 "RAG refresh後のES再索引が失敗しました（次回 sync で再試行）: world=%s", world)
-    # document_ir マーカーは、①document_ir自体が全件成功し（document_ir_ok）、②連鎖した
-    # evidence/rag（と該当すれば ES 反映）も成功した（es_ok）ことを確認できてから確定する
-    # （上の docstring 参照＝先に確定すると再試行の入口を失う）。
+    # document_ir マーカーは、document_ir 自体が全件成功し、連鎖した evidence/rag（と該当すれば ES 反映）も成功してから確定する
     if document_ir_drift and document_ir_ok and es_ok:
         office_md.write_document_ir_sig_marker(dmd)
-    if human_md_failure_reason:                          # evidence/rag/ES 自体は成功したが human_md/document_ir の一部が残った
+    if human_md_failure_reason:                          # evidence/rag/ES は成功したが human_md/document_ir の一部が残った
         return "rag_failed", es_refresh_info, human_md_failure_reason
     return "handled", es_refresh_info, None
 
 
 def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: str = "sync") -> dict:
-    """`_sync_impl` の薄いラッパー（L5・§8.6-4）。sync 本体は無変更のまま、成功後に rag.md の LLM
-    成形をバックグラウンドで後追い起動する（`llm_render.schedule_background`・world 単位で多重起動
-    しない・取りこぼしても次回 sync が再度契機になり収束する）。world が解決できなかった
-    （`status="unavailable"`）場合は起動しない——派生物自体が存在しない/古いままの可能性があるため。
-    背景起動自体の失敗は best-effort（`sync()` の戻り値・例外伝播には影響させない）。
+    """`_sync_impl` の薄いラッパー。成功後に rag.md の LLM 成形を背景で後追い起動する（`llm_render.schedule_background`）。
 
-    `SHERPA_TEST_DB_ISOLATED`（隔離テスト DB・`tests/conftest.py` が pytest 実行中は常に立てる内部
-    フラグ）が立っている間は起動しない——`sherpa.reconcile.reconcile_derivatives()` の全面 skip と
-    同じ fail-safe。`sync()` は数百のテストから直接呼ばれるため、無条件で daemon thread を
-    起動すると (a) LLM 呼び出しを伴わないテスト経路にまで実 DB 読み取り（`system_settings`）を
-    無警告に追加する、(b) `graph_extract.available`/`complete_json` を独自に monkeypatch している
-    別のテスト経由で、意図しないタイミングで `.rag.md` を書き換えて他テストのアサーションと
-    競合する、の2つの実害を生む。本番はこのフラグを立てないため既定 ON のまま影響しない。
+    資料フォルダが解決できなかった（`status="unavailable"`）場合と、`SHERPA_TEST_DB_ISOLATED`（pytest 実行中に立つ内部フラグ）が立っている間は起動しない。
+    背景起動の失敗は best-effort で、`sync()` の戻り値・例外には影響させない。
     """
     result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
     if result.get("status") != "unavailable" and not os.environ.get("SHERPA_TEST_DB_ISOLATED"):
@@ -1165,56 +870,36 @@ def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: s
 
 def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                op: str = "sync") -> dict:
-    """変更検知つき取り込み（手動「今すぐ更新」/ ポーリング/ 登録ボタンのリラン用）。**変わった時だけ**再ビルドする。
+    """変更検知つき取り込み（「今すぐ更新」・ポーリング・登録時のリラン用）。変わったときだけ再ビルドする。
 
-    署名が前回と同じ（かつ `force=False`）なら no-op（`changed=False`）。違えば `run` する。
-    署名不変でも human_md/document_ir/evidence/rag のいずれかの版だけが drift した場合は
-    `_refresh_derived_representations` による軽量再生成（分岐②③④⑤）を経由する
-    （RAG-KV-001・§3.2）。その後（`"handled"` でもスキップしない）の ES 自己修復
-    （`es_index.needs_reindex`→`index_world`）が成功したら `office_md.confirm_human_md_es_sig`
-    で `.human_md_es_sig` マーカーを確定し、bulk_errors 等の部分失敗時は確定せず
-    `store.add_ingest_run(status="failed")` で監査に残す（次回 sync が自動で再試行する）。
-    グラフも同じ不変分岐で自己修復する（`world_neo4j.check_graph_counts` が世代/件数の
-    食い違いを検知したら `_reflect_graph_after_rag_rewrite` で作り直す・埋め込み/LLM は呼ばない）。
-    `reflect=False` では他段と同じく Neo4j に一切触れないため、この照合・修復も行わない。
+    署名が前回と同じ（かつ `force=False`）なら no-op（`changed=False`）、違えば `run` する。
+    署名不変でも human_md/document_ir/evidence/rag の版だけが drift した場合は `_refresh_derived_representations` の軽量再生成を経由する。
+    その後（`"handled"` でもスキップせず）の ES 自己修復（`es_index.needs_reindex`→`index_world`）が成功したら `.human_md_es_sig` を確定し、
+    部分失敗時は確定せず `store.add_ingest_run(status="failed")` で監査に残す（次回 sync が再試行する）。
+    グラフも同じ不変分岐で自己修復する（`world_neo4j.check_graph_counts` が世代/件数の食い違いを検知したら `_reflect_graph_after_rag_rewrite` で作り直す）。
+    `reflect=False` では Neo4j に触れないため照合・修復も行わない。
 
-    署名の確定は `_run_locked`（`run` 経由・world_lock 保持中）だけが行う。
-    ここ（`sync` 自身）は `run` 復帰**後**（＝lock 解放後）に確定を書き足さない＝他プロセスの
-    pre-invalidate/削除が確定していた場合にそれを有効署名で上書き（番兵復活）する穴を作らない。
-
-    `run_id`＝呼び出し元が受付時に O(1) で確保済みの `ingest_runs` 行。全域
-    分岐（`_run_locked` を経由する `needs_full_run`/`run` 呼び出し）はそのまま `run_id` を転送する
-    ——`_run_locked` が完了時に terminal 化する。**`_run_locked` に到達しない分岐**
-    （world 未解決／完全な unchanged）は `sync` 自身がこの関数の最後で `run_id` を terminal 化
-    する（「unchanged も同じ run を terminal 化」する契約——未消化のまま `status='extracting'` の
-    行を残さない）。`on_run_id`＝`run_id` を渡さない代わりに、`_run_locked` 経由の分岐でのみ
-    run_id 判明時に呼ばれるコールバック（旧経路・後方互換）。
+    署名の確定は `_run_locked`（`run` 経由・world_lock 保持中）だけが行う。ここでは `run` 復帰後（lock 解放後）に確定を書き足さない（他プロセスの無効化を復活させるため）。
+    `run_id` は呼び出し元が受付時に確保済みの `ingest_runs` 行。`_run_locked` を経由する分岐はそのまま転送し、`_run_locked` に到達しない分岐
+    （資料フォルダ未解決／完全な unchanged）は `sync` 自身が最後に `run_id` を terminal 化する（`extracting` のまま残さない）。
+    `on_run_id` は `_run_locked` 経由の分岐で run_id が判明したときに呼ばれるコールバック。
     """
     def _finalize_if_unused(status: str, reasons: list[str] | None = None,
                             stage_timings: dict | None = None, counts: dict | None = None,
                             es_summary: dict | None = None) -> None:
-        # `_run_locked` を経由しない終了点専用（呼び出し元 run_id が未消化のまま残らないようにする）。
+        # `_run_locked` を経由しない終了点専用（呼び出し元の run_id を未消化のまま残さない）
         if run_id is None:
             return
         try:
             snap = {"changed": False}
             if reasons:
                 snap["flags"] = [{"doc": None, "action": "warn", "reason": r} for r in reasons]
-            # C5 是正: 原本不変（unchanged）でも実際に走査/自己修復した工程があれば、その所要時間
-            # （`stage_timings`）と取得できた計数（`counts`・`_counts_summary` と同じ「取れない項目は
-            # キー自体を付けない」契約）を残す——`_run_locked`（全再構築）経由の run と違い、この分岐は
-            # これまで実行した工程を一切 extraction_snapshot に残していなかった。
+            # unchanged でも走査/自己修復した工程があれば、所要時間（`stage_timings`）と取得できた計数（`counts`・取れない項目はキーごと省略）を残す
             if stage_timings:
                 snap["stage_timings"] = stage_timings
             if counts:
                 snap["counts"] = counts
-            # 実際に ES を張り直した run（`es_summary` が有る）だけ `extraction_snapshot.es` に残す
-            # （`_record` の全再構築経路と同じキー・同じ形）——`routers/worlds.py::_ingest_summary` の
-            # `stage_summary.es`（`store.get_latest_run_summary` の raw extraction_snapshot をそのまま
-            # 渡すだけ）がこの run の reused/embedded を拾えるようにする。張り直さなかった
-            # run（`es_summary is None`）には置かない——何もしていない run を ES 反映 run と偽らない。
-            # （`store.get_latest_es_run_summary` は別途 `published_at IS NOT NULL` も要求するため、
-            # この分岐の run は対象にならない——それは既存の別契約でここでは変えない。）
+            # 実際に ES を張り直した run（`es_summary` あり）だけ `extraction_snapshot.es` に残す（`_record` と同じキー・同じ形）。張り直さなかった run には置かない
             if es_summary is not None:
                 snap["es"] = es_summary
             store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap)
@@ -1223,9 +908,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 "sync の unchanged/unresolved run 確定に失敗しました（best-effort）: world=%s run_id=%s",
                 world, run_id, exc_info=True)
             return
-        # PART-6: `_run_locked`（延いては `_record`）を経由しないこの terminal 化専用の
-        # 分岐でも Webhook 通知を発火する（`_run_locked` の world 未解決分岐＝`_record("failed")`
-        # と同じ状況をここでも terminal 化するため）。
+        # `_run_locked`（`_record`）を経由しないこの terminal 化でも Webhook 通知を発火する
         try:
             webhooks.notify_run_terminal(world, run_id, op, status)
         except Exception:
@@ -1233,10 +916,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                         exc_info=True)
 
     def _progress(stage, done=None, total=None):
-        # `_run_locked` の同名クロージャ（上部）と同じ形——
-        # `sync()` の unchanged 分岐は `_run_locked` を経由しないため、ここで配線しないと
-        # 進捗記録が一切行われない（最初の world_state 走査・ES 自己修復とも「実環境で数時間動かないまま」に
-        # なりうる）。`run_id` が無い（CLI 直接呼び出し等）分岐は no-op。
+        # `_run_locked` の同名クロージャと同じ形。unchanged 分岐は `_run_locked` を経由しないためここで進捗を配線する。`run_id` が無い分岐は no-op
         if run_id is None:
             return
         try:
@@ -1248,23 +928,18 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
             _log.warning(
                 "進捗の記録に失敗しました（sync 自体は継続）: world=%s stage=%s", world, stage, exc_info=True)
 
-    # unchanged 自己修復（下の ES 修復分岐）の
-    # `index_world_with_human_md_holdback` progress コールバックを doc グループ（flush）
-    # 単位の呼び出しのままそのまま `_progress`（DB 書込み）へ転送すると、`_run_locked` 側の
-    # `_es_progress`（`_PROGRESS_FILE_INTERVAL`＝100件間隔・先頭/末尾のみ必ず書く）と同じ間引きが
-    # 掛からず、大規模 world の自己修復で毎 flush ごとに DB 書込みが積み重なる。
+    # ES 自己修復の progress は、`_run_locked` の `_es_progress` と同じ間引き（`_PROGRESS_FILE_INTERVAL` 件間隔・先頭/末尾は必ず書く）を掛けてから `_progress` へ渡す
     _last_unchanged_es_progress_done = [None]
 
     def _unchanged_es_progress(done, total):
         last = _last_unchanged_es_progress_done[0]
-        if last == done:              # #3(c) と同じ同値抑止
+        if last == done:              # 同値は書かない
             return
         if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_unchanged_es_progress_done[0] = done
             _progress("es_index", done=done, total=total)
 
-    # C5 是正: unchanged 分岐が実行した工程の所要時間を集める（`_finalize_if_unused` へ渡す・
-    # `_run_locked` 側の `stage_timings` と同じ「実行した段だけ載る」形）。
+    # unchanged 分岐が実行した工程の所要時間を集める（`_finalize_if_unused` へ渡す・実行した段だけ載る）
     _stage_timings: dict = {}
     _progress("scanning")
     _t_scan0 = time.monotonic()
@@ -1280,17 +955,11 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
         return {"world": world, "changed": False, "status": "unavailable"}
     row = store.get_world(world)
     prev = row.get("last_sig") if row else None
-    if not force and prev == sig and not _derived_stale(world):  # 無変化＝再ビルドしない（派生MD欠落時は除く）
-        # unchanged 経路の ES 自己修復（`needs_reindex`→
-        # `index_world_with_human_md_holdback`）を含め、この分岐の**全て**を単一の
-        # `store.world_lock` 区間に収める（`_refresh_derived_representations` 呼び出し
-        # 直後で `with` を閉じてバックフィル・ES 自己修復・マーカー確定を lock 外で
-        # 走らせると、その間に他プロセスの並行 sync/rebind/delete が割り込み、ES 反映が
-        # 参照した派生物と実際の world 世代が食い違いうる）。バックフィル用の第2の
-        # `store.world_lock` 呼び出しは同一ロックの**再入**になり自己デッドロックしうるため
-        # 行わず、同じ lock 区間へ直接畳み込む（`store.world_lock` は session-level advisory
-        # lock＝別コネクションでの再入不可・`wipe_world` docstring 参照）。
-        with store.world_lock(world):                    # derived への書込を同一worldの並行run/syncと直列化
+    if not force and prev == sig and not _derived_stale(world):  # 無変化＝再ビルドしない（派生 MD 欠落時は除く）
+        # unchanged 分岐の全て（軽量再生成・バックフィル・グラフ/ES 自己修復・マーカー確定）を単一の `store.world_lock` 区間に収める
+        # （区間を分けると並行の sync/rebind/delete が割り込み、反映が参照した派生物と世代が食い違う）。
+        # lock は再入できない（別コネクションの自己デッドロック）ので、区間内で `store.world_lock` を取り直さない
+        with store.world_lock(world):                    # derived への書込を同一資料フォルダの並行 run/sync と直列化
             _t_refresh0 = time.monotonic()
             _refresh_started_at = datetime.now(timezone.utc).isoformat()
             refresh_outcome, refresh_es_info, refresh_failure_reason = _refresh_derived_representations(world, sig)
@@ -1300,12 +969,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 "elapsed_ms": round((time.monotonic() - _t_refresh0) * 1000),
             }
             if refresh_outcome == "needs_full_run":
-                # 欠落検知→全再構築→`.rag_sig`削除を同一lock区間で行う（lockを一度解放して公開
-                # `run()`を呼ぶと、その間に他のsync/registerが割り込んで全再構築が重複したり、
-                # `.rag_sig`削除だけがlock外に取り残されたりする非原子性を生む）。`run()`自身が
-                # 取り直す非再入lockと衝突しないよう、ここでは lock-free 版の `_run_locked` を
-                # 直接呼ぶ（`worlds.rebind`/`_wipe_locked` と同じ流儀）。この「同一lock区間で
-                # 原子的に実行する」が正の契約（RAG-KV-001・§9.3はこの契約に更新済み）。
+                # 欠落検知→全再構築→`.rag_sig` 削除を同一 lock 区間で行う。`run()` は非再入 lock を取り直すので、lock-free 版の `_run_locked` を直接呼ぶ
                 res = _run_locked(world, reflect=reflect, created_by="admin", scan_root=None,
                                   run_id=run_id, on_run_id=on_run_id, op=op)
                 if es_index.rag_es_enabled() and not office_md.drop_rag_sig_marker(worlds.derived_md_dir(world)):
@@ -1314,79 +978,51 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                         "（ES再索引の再試行契機を逃す可能性）: world=%s", world)
                 return {"world": world, "changed": True, "status": res["status"],
                         "ledger": res["ledger"], "flags": list(res.get("flags", []))}
-            # `refresh_outcome == "handled"`（軽量再生成を実行済み）でもここで早期 return しない: human_md
-            # の軽量再生成（`refresh_human_md`）は RAG_ES OFF の world で ES の索引元そのもの
-            # （legacy `{rel}.md` の40行チャンク）を書き換えるため、直後の needs_reindex 自己修復まで
-            # 同じ sync 呼び出し内で到達しないと、ES が古いままの世代が次回 sync まで残ってしまう。
-            # document_ir/evidence/rag 側の軽量再生成は `{rel}.md` 自体に触れないため、ここを通っても
-            # `needs_reindex` は通常 False のまま（無害な追加チェック1回で済む）。軽量再生成で失敗した
-            # rel が残っていても、それは次回 sync の drift 判定が再試行する＝ここで後続処理を止める
-            # 理由にはならない。
-            # `last_manifest` は JSONB 列＝内容が空の world（本文0件）なら正当な値として `{}` が
-            # 入りうる。「欠落」の判定は `is None` で行う（`not {}` は真になるため、空 dict を
-            # 「未設定」と取り違えて空 world を同期のたびに毎回バックフィル対象にしてしまう）。
+            # `refresh_outcome == "handled"` でもここで早期 return しない（human_md の軽量再生成は legacy `{rel}.md`＝ES の索引元を書き換えるため、同じ呼び出し内で `needs_reindex` 自己修復まで到達させる）。
+            # 軽量再生成で失敗した rel は次回 sync の drift 判定が再試行する
+            # `last_manifest` は空の資料フォルダでは `{}` が正当な値なので、欠落の判定は `is None` で行う
             needs_manifest_backfill = row is not None and row.get("last_manifest") is None
-            # last_doc_count 列の導入前に成功同期が確定していた既存 world は、内容が不変（unchanged
-            # 経路）のままだと二度と _run_locked を通らず、document_count が永久に null のままになる。
+            # `last_doc_count` が NULL の資料フォルダは、unchanged のままだと `document_count` が null のままになるためバックフィルする
             needs_doc_count_backfill = row is not None and row.get("last_doc_count") is None
-            # last_scan_report 列の導入前に成功同期が確定していた既存 world も同様:
-            # 内容不変のままだと `GET /worlds/{wid}/status` がずっと「未集計」を返し続ける。
-            # `scan_report()` へフィールドを追加した後に保存された旧形式（dict だが新フィールドを
-            # 持たない）も同じバックフィルで更新する（`corpus_docs.scan_report_missing_fields` 参照）。
+            # last_scan_report も同様にバックフィルする（`scan_report()` の項目が不足する形式も `corpus_docs.scan_report_missing_fields` で検出して更新する）
             _cur_scan_report = row.get("last_scan_report") if row is not None else None
             needs_scan_report_backfill = row is not None and (
                 _cur_scan_report is None or corpus_docs.scan_report_missing_fields(_cur_scan_report))
             if needs_manifest_backfill or needs_doc_count_backfill or needs_scan_report_backfill:
-                # 既に本関数の外側 `with` で lock 保持中——ここで再度 `store.world_lock` は
-                # 呼ばない（呼べば同一 lock の再入＝別コネクションでの自己デッドロック）。
-                cur = store.get_world(world)                    # 他 writer が割り込んでいないか再読
-                # world root は1回だけ解決し（`worlds.world_dir` の DB 往復もありうる解決を
-                # manifest 件数分繰り返さない）、以降の doc_count 集計へそのまま渡す
-                # （`manifest_doctype_count_from_root` 参照——`manifest_doctype_count` を直接
-                # 呼ぶと accepts() 上書きアナライザの拡張子ごとに再解決してしまう）。
+                # 外側の `with` で lock 保持中なので `store.world_lock` を取り直さない（再入の自己デッドロック）
+                cur = store.get_world(world)                    # 他の writer が割り込んでいないか再読する
+                # root は1回だけ解決し、以降の doc_count 集計へ渡す（`manifest_doctype_count_from_root`）
                 backfill_root = worlds.world_dir(world)
                 if cur is not None and cur.get("last_sig") == sig:
                     if cur.get("last_manifest") is None and cur.get("last_doc_count") is None:
-                        # 両方 NULL＝1回の UPDATE でまとめて補完する（last_synced_at は変更しない・
-                        # 2ステップに分けて先に set_world_sig() で manifest だけ書くと、そちらが
-                        # last_synced_at=now() を書いてしまい「いつ確定したか」を偽ってしまう）。
+                        # 両方 NULL は1回の UPDATE でまとめて補完する（`last_synced_at` は変えない）
                         store.backfill_manifest_and_doc_count(
                             world, manifest,
                             corpus_docs.manifest_doctype_count_from_root(manifest, backfill_root), sig)
                     else:
                         if cur.get("last_manifest") is None:
                             store.set_world_sig(world, sig, manifest=manifest)
-                            cur = store.get_world(world)         # last_manifest が埋まった最新行を使い直す
+                            cur = store.get_world(world)         # `last_manifest` が埋まった最新行を使い直す
                         if cur.get("last_doc_count") is None:
                             saved_manifest = cur.get("last_manifest")
                             if saved_manifest is None:
                                 saved_manifest = manifest
-                            # last_synced_at は更新しない（`backfill_doc_count` 自体がそういう契約・
-                            # 「いつ確定したか」の事実を後追い補完で書き換えない）。
+                            # `last_synced_at` は更新しない
                             store.backfill_doc_count(
                                 world,
                                 corpus_docs.manifest_doctype_count_from_root(saved_manifest, backfill_root),
                                 sig)
                     if cur.get("last_scan_report") is None or corpus_docs.scan_report_missing_fields(cur.get("last_scan_report")):
-                        # sig 一致を確認済みの区間内＝この世代の内容に対する scan_report として正当。
-                        # `set_scan_report` は `last_synced_at` を更新しない（sig 確定の事実を書き換えない）。
+                        # sig 一致を確認済みの区間内なので、この世代に対する scan_report として正当（`last_synced_at` は更新しない）
                         try:
                             store.set_scan_report(world, corpus_docs.scan_report(world))
                         except Exception:
                             _log.warning(
                                 "取り込み集計（scan_report）のバックフィルに失敗しました: world=%s",
                                 world, exc_info=True)
-                # 不一致（他プロセスが無効化/更新済み）なら何もしない＝上書きしない。この skip 時も
-                # 呼び出し元へは（下の return で）status="unchanged" を返す＝バックフィルできなかった
-                # 今回の表示は保守的（実際には他プロセスが変更中/無効化した可能性がある）だが安全性の
-                # 問題は無い＝次回 sync が実際の状態を正しく判定して収束する。
-            # グラフ修復: 世代不一致・件数スタンプ欠落・実物との件数不一致（`check_graph_counts`）を
-            # 検知して既存の派生物から作り直す（管理UI不要・静的解析＋投入のみ＝埋め込み/LLM は
-            # 呼ばない）。ES 自己修復（直後のブロック）と同じ流儀で、例外は握りつぶさず
-            # `_finalize_reasons` へ積んで run を failed にする（回答/チャットの経路は変えない
-            # ——取り込み側の自己修復のみ）。`reflect=False`（Neo4j に反映しない sync・staging/検証
-            # 専用経路）は全段の経路（`if not reflect:` の台帳だけ確定）と同じく Neo4j に触れない
-            # ため、照合も修復もしない。
+                # sig が不一致（他プロセスが無効化/更新済み）なら何もしない（上書きしない）。次回 sync が実際の状態を判定して収束する
+            # グラフ修復: 世代不一致・件数スタンプ欠落・実物との件数不一致（`check_graph_counts`）を検知したら既存の派生物から作り直す（埋め込み/LLM は呼ばない）。
+            # 例外は握りつぶさず `_finalize_reasons` へ積んで run を failed にする。`reflect=False` は Neo4j に触れないので照合も修復もしない
             graph_repair_failure = None
             if reflect:
                 try:
@@ -1406,14 +1042,9 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                     _log.warning(
                         "グラフ自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
                     graph_repair_failure = e.__class__.__name__
-            # ES 修復: 空/署名ズレ/埋め込みプロバイダ変更を検知して張り直す（管理UI不要）。失敗は
-            # 別 run を作らず受付 run（`run_id`）自身の終端へ畳み込む——`index_world_with_human_md_holdback`
-            # へ `run_id` を渡すことで内部の失敗記録を抑止し、ここで一度だけ terminal 化する。
+            # ES 修復: 空/署名ズレ/埋め込みプロバイダ変更を検知して張り直す。失敗は別 run を作らず、`run_id` を渡して受付 run 自身の終端へ畳み込む
             es_repair_failure = None
-            # C7 是正: `_refresh_derived_representations` が内部で既に ES 再索引を実行していれば
-            # （RAG_ES 有効時の holdback 分岐）、その結果をここへ引き継ぐ——直後の `needs_reindex`
-            # は収束済み（False）を返しうるため、ここで畳み込まないと索引件数・工程時間が
-            # extraction_snapshot から丸ごと欠落する（未実行時は従来どおりキーごと省略）。
+            # `_refresh_derived_representations` が既に ES 再索引を実行していれば、その結果を引き継ぐ（畳み込まないと索引件数・工程時間が欠落する）
             es_summary = refresh_es_info["summary"] if refresh_es_info is not None else None
             if refresh_es_info is not None:
                 _stage_timings["es_index"] = refresh_es_info["stage_timing"]
@@ -1432,7 +1063,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                     }
                     if not (esr.get("available") is True and not esr.get("error")):
                         es_repair_failure = esr.get("error") or "unavailable"
-                    # `_record`（全再構築経路）の es_summary 組み立てと同形（STAT-3 S5 counts の元データ）。
+                    # `_record` の es_summary と同形（counts の元データ）
                     _outer_summary = {"available": esr.get("available") if isinstance(esr, dict) else None,
                                       "error": esr.get("error") if isinstance(esr, dict) else None,
                                       "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
@@ -1440,20 +1071,16 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                                       "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
                                       "reused": esr.get("reused") if isinstance(esr, dict) else None,
                                       "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None}
-                    # 同じ run で内部再索引（refresh_es_info）の後に外側の再索引も走った場合は置換せず
-                    # 合成する（所要時間・埋め込みは累積・開始は初回・終了は最終・索引件数と状態は最終）。
+                    # 内部再索引の後に外側の再索引も走った場合は置換せず合成する（`_merge_es_runs`）
                     es_summary, _stage_timings["es_index"] = _merge_es_runs(
                         es_summary, _stage_timings.get("es_index"), _outer_summary, _outer_timing)
             except Exception as e:
                 _log.warning(
                     "ES 自己修復中に予期しない例外が発生しました: world=%s", world, exc_info=True)
                 es_repair_failure = e.__class__.__name__
-            # drep（office_md 段別要約）／rows（台帳）は unchanged 分岐では存在しない——`_counts_summary`
-            # の契約どおりキーごと省略される（manifest の scanned 数と es_summary が実行した分だけ載る）。
+            # drep（office_md 段別要約）／rows（台帳）は unchanged 分岐に無いので `_counts_summary` がキーごと省略する
             _counts = _counts_summary(None, es_summary, manifest, None)
-            # `refresh_outcome == "rag_failed"`（軽量再生成自体が失敗）は ES 自己修復の成否と独立に
-            # run を failed へ倒す——ES が unavailable のまま握りつぶすのと同じ理由で、これを見送ると
-            # rag.md/evidence/document_ir が未反映のまま run が `auto_published` として記録される。
+            # `refresh_outcome == "rag_failed"` は ES 自己修復の成否と独立に run を failed にする（未反映のまま `auto_published` と記録しないため）
             _finalize_reasons = []
             if refresh_outcome == "rag_failed":
                 _finalize_reasons.append(f"rag_refresh_failed:{refresh_failure_reason}")
@@ -1468,9 +1095,8 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 _finalize_if_unused("auto_published", stage_timings=_stage_timings, counts=_counts,
                                     es_summary=es_summary)
             return {"world": world, "changed": False, "status": "unchanged", "ledger": 0}
-    # `op` を渡し忘れると `run()` の既定 "sync" に固定され、この呼び出し元が実際には
-    # refresh/rerun 等でも Webhook payload の `op` が常に "sync" になってしまう——`op` を配線する。
-    res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op)   # 署名の確定/無効化は run 内部（_run_locked）が lock 内で行う
+    # `op` を渡して Webhook payload の `op` を呼び出し元の種別にそろえる
+    res = run(world, reflect=reflect, run_id=run_id, on_run_id=on_run_id, op=op)   # 署名の確定/無効化は run 内部（`_run_locked`）が lock 内で行う
     return {"world": world, "changed": True, "status": res["status"],
             "ledger": res["ledger"], "flags": list(res.get("flags", []))}
 
@@ -1478,13 +1104,9 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
 def _reindex_after_rag_rewrite(world: str) -> bool:
     """rag.md が世代を変えずに書き換わった（LLM 成形の反映・規則版への一掃）後、ES へ載せ直す。
 
-    `_refresh_derived_representations` の holdback 分岐（`.rag_sig` を先に落としてから
-    `index_world_with_human_md_holdback` を呼び、bulk 成功でだけ確定する）と同じ順序を、
-    `store.world_lock` 区間の中で行う（derived への書込を並行 sync と直列化する・
-    `_refresh_derived_representations` docstring 参照）。**RAG_ES が無効な world では ES に
-    触れる必要が無い**ため、その場合は無条件で成功扱いにする（マーカー操作自体をスキップ）。
-    グラフ反映（`_reflect_graph_after_rag_rewrite`）は RAG_ES の有無に
-    関わらず常に行う——言及エッジは ES とは独立に陳腐化しうる。
+    `store.world_lock` 区間の中で、`_refresh_derived_representations` の holdback 分岐と同じ順序（`.rag_sig` を先に落とし、
+    `index_world_with_human_md_holdback` の bulk 成功でだけ確定）で行う。RAG_ES が無効なら ES には触れず成功扱いにする。
+    グラフ反映（`_reflect_graph_after_rag_rewrite`）は RAG_ES の有無に関わらず常に行う。
     """
     row = store.get_world(world)
     sig = row.get("last_sig") if row else None
@@ -1512,13 +1134,10 @@ def _reindex_after_rag_rewrite(world: str) -> bool:
 
 
 def _llm_render_pass(world: str) -> None:
-    """`sync()` 成功後にバックグラウンド thread から呼ばれる LLM 成形の1回分（L5・§8.6-4）。
+    """`sync()` 成功後に背景 thread から呼ばれる LLM 成形の1回分。
 
-    `llm_render.run_world_pass` はファイル書込までを担い、ここでは書き換わった rel が
-    1件でもあれば ES への反映（`_reindex_after_rag_rewrite`）まで面倒を見る。個々のファイル
-    書込は `store.world_lock` を取らない（LLM 呼び出しを含み長時間になりうるため、その間
-    正規の sync/削除等を長くブロックしないトレードオフ——`write_text_atomic` により個々の
-    ファイル書込自体は原子的で、競合時の最悪ケースは「次回パスで再度処理される」だけ）。
+    `llm_render.run_world_pass` がファイル書込までを担い、書き換わった rel が1件でもあればここで ES への反映（`_reindex_after_rag_rewrite`）まで行う。
+    個々のファイル書込は `store.world_lock` を取らない（LLM 呼び出しで長時間になるため。書込自体は `write_text_atomic` で原子的）。
     """
     from . import llm_render
     result = llm_render.run_world_pass(world)
@@ -1527,16 +1146,10 @@ def _llm_render_pass(world: str) -> None:
 
 
 def regenerate_rag_rule_only(world: str) -> dict:
-    """当該 world の LLM 成形キャッシュを一掃し、rag.md を規則版へ作り直す（管理者の明示操作・
-    §8.6-2「規則版で再生成」）。トグルの無効化（残す）とは独立——監査要件等で LLM 出力を今すぐ
-    一掃したいケース専用。トグルが ON のままなら、次の背景パスが改めて LLM 成形を試みうる
-    （一掃は時点操作であり、恒久的に LLM 成形を止めたいなら合わせてトグルを OFF にすること）。
+    """当該資料フォルダの LLM 成形キャッシュを一掃し、rag.md を規則版へ作り直す（管理者の明示操作「規則版で再生成」）。
 
-    既存の `office_md.refresh_rag`（Evidence IR から決定的に再生成する経路）をそのまま再利用する
-    ——「LLM 版を規則版へ逆変換する」のではなく、確立済みの生成経路を呼び直すことで rag.md が
-    常に規則版であることを保証する（`_stamp_rule_only_rag_markdown` により書込時に必ず
-    `生成手段: 規則` が刻まれる）。`store.world_lock` は `refresh_rag` 呼び出し元の既存契約に合わせ、
-    ここで1区間として確保する。
+    `office_md.refresh_rag`（Evidence IR から決定的に再生成する経路）を呼び直し、書込時に必ず `生成手段: 規則` が刻まれる（`_stamp_rule_only_rag_markdown`）。
+    `store.world_lock` はここで1区間として確保する。トグルが ON のままなら次の背景パスが再び LLM 成形を試みうる。
     """
     from . import llm_render
     wd = worlds.world_dir(world)
@@ -1544,7 +1157,7 @@ def regenerate_rag_rule_only(world: str) -> dict:
     if not wd or not dmd.exists():
         return {"status": "unavailable"}
     llm_render.clear_cache(world)
-    defer = es_index.rag_es_enabled()          # RAG_ES有効時はマーカー保留方式（ES成否込みで確定・sync()と同じ流儀）
+    defer = es_index.rag_es_enabled()          # RAG_ES 有効時はマーカー保留方式（ES の成否込みで確定・`sync()` と同じ）
     with store.world_lock(world):
         result = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=not defer, world=world)
     if result.get("error") or result.get("rag_failed", 0):
@@ -1556,48 +1169,40 @@ def regenerate_rag_rule_only(world: str) -> dict:
 
 
 def wipe_world(world, *, reflect=True) -> dict:
-    """world の派生物を**完全削除**（delete の前段）: グラフ（Neo4j）＋台帳＋ES。
+    """資料フォルダの派生物を完全削除する（delete の前段）: グラフ（Neo4j）＋台帳＋ES。
 
-    **world 単位 advisory lock で run と直列化**（同時 rebuild/delete の競合防止）。
-    ロック取得はここだけの薄いラッパー（`_wipe_locked` へ委譲）。`worlds.delete` は既に
-    外側で lock を取っているため lock-free の `_wipe_locked` を直接呼ぶ（session-level advisory lock は
-    別コネクション再入不可＝ここを経由すると自己デッドロックする）。
+    資料フォルダ単位の advisory lock で run と直列化する薄いラッパー（`_wipe_locked` へ委譲）。
+    `worlds.delete` は外側で lock 取得済みなので lock-free の `_wipe_locked` を直接呼ぶ（lock は再入不可）。
     """
     with store.world_lock(world):
         return _wipe_locked(world, reflect=reflect)
 
 
 def _wipe_locked(world, *, reflect) -> dict:
-    """`wipe_world` の lock 未取得版（呼び出し元が既に world_lock を保持している前提）。
+    """`wipe_world` の lock 未取得版（呼び出し元が world_lock を保持している前提）。
 
-    **fail-closed**: グラフ削除に失敗したら例外を投げる（握りつぶさない）。グラフを先に消し、
-    成功してから台帳・OCR 読み取り結果をクリアする（途中失敗で「台帳空・グラフ残」を作らない）。参照元の外部フォルダは消さない。
-
-    pre-invalidate 設計: `last_sig` の無効化（`''`）は
-    **関数冒頭**（Neo4j delete より前）で**ガード無し**に行う。
-    Neo4j delete 成功**後**に best-effort（例外握り潰し）で無効化すると、(a) delete commit 直後〜無効化書き込みの間の
-    クラッシュ窓、(b) 無効化自体が PG 断で失敗しても握り潰されて気付かれない、の2点で「グラフは空・
-    registry 行は残存・last_sig は旧の（現ソースと一致する）値のまま＝sync が unchanged と誤判定する
-    恒久サイレント不整合」を防ぎきれない。ここで先に無効化し、かつ失敗を伝播させることで:
-    無効化が書けない（PG 断）なら削除自体を開始しない＝まだ何も壊れていない時点で失敗が可視化される。
-    無効化が書けた後は、delete/replace/rmtree のどこで失敗・クラッシュしても last_sig は既に `''`
-    （実 sig と一致しない番兵）＝次回 sync が必ず「変更あり」判定で再構築し、自己修復に収束する。
+    ① 何かを消す前に OCR 観測ディレクトリの削除対象を検証する（原本・登録 root と重なる設定なら例外で何も消さない）。
+    ② `last_sig` を `''` に無効化する（Neo4j delete より前に、ガード無しで・失敗は伝播させる）。
+       書けなければ削除を開始せず、書けた後はどこで失敗しても次回 sync が必ず再構築する。
+    ③ グラフを削除する（失敗は握りつぶさず例外にする）。④ 成功してから台帳をクリアする（「台帳空・グラフ残」を作らない）。
+    ⑤ OCR 観測ディレクトリと OCR の job/cache/run を消す（失敗は伝播）。⑥ 派生物と ES インデックスを削除する。
+    参照元の外部フォルダは消さない。
     """
-    obs_dir = worlds.observation_removal_target(world)     # 何かを消す前に検証（原本・登録 root と重なる設定なら例外で何も消さない）
-    store.set_world_sig(world, "")                          # pre-invalidate（fail-closed）
+    obs_dir = worlds.observation_removal_target(world)     # ①
+    store.set_world_sig(world, "")                          # ② pre-invalidate
     deleted = 0
-    if reflect:                                            # Neo4j 失敗は伝播（呼出側は registry を進めない）
+    if reflect:                                            # ③ Neo4j 失敗は伝播（呼出側は registry を進めない）
         env = world_neo4j._env()
         deleted = world_neo4j.delete_world(world, env["uri"], env["user"], env["pw"])
-    ledger = store.replace_documents(world, [])            # グラフ削除成功後に台帳クリア
+    ledger = store.replace_documents(world, [])            # ④ グラフ削除成功後に台帳クリア
     import shutil
     from ..store import ocr_jobs
     if obs_dir is not None:
-        shutil.rmtree(obs_dir)                             # OCR ワーカーが書いた観測本文。失敗は伝播（OCR の行を残して再試行）
-    ocr_jobs.purge_world(world)                            # OCR 読み取り結果（本文）の job/cache/run。失敗は伝播
-    shutil.rmtree(worlds.derived_dir(world), ignore_errors=True)   # 派生MD（Office由来）も消す
+        shutil.rmtree(obs_dir)                             # ⑤ OCR 観測本文。失敗は伝播（OCR の行を残して再試行）
+    ocr_jobs.purge_world(world)                            # ⑤ OCR の job/cache/run。失敗は伝播
+    shutil.rmtree(worlds.derived_dir(world), ignore_errors=True)   # ⑥ 派生 MD（Office 由来）も消す
     try:
-        es_index.delete_world(world)                  # ES インデックスも削除（派生物の一括伝播）
+        es_index.delete_world(world)                  # ES インデックスも削除
     except Exception:
         pass
     return {"world": world, "ledger_cleared": ledger, "graph_deleted": deleted}

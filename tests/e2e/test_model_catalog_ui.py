@@ -42,43 +42,6 @@ def test_admin_model_catalog_table_renders_selected_cloud_and_ollama_and_codex_c
     expect(default_sel).to_have_value("gpt-5.5")
 
 
-def test_admin_model_catalog_bedrock_column_is_not_editable(page, web_base_url):
-    """Bedrock が選択中クラウド AI のときは、その列を編集不可（実在確認済みモデルの専用機構と
-    重複させない・個人設定の Bedrock 欄へ誘導する注記のみ）。"""
-    from playwright.sync_api import expect
-
-    settings = {**SYSTEM_SETTINGS_VIEW, "cloud": {**SYSTEM_SETTINGS_VIEW["cloud"], "provider": "bedrock"}}
-    install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "models")
-
-    table = page.locator("#model-catalog-table")
-    expect(table).to_contain_text("AWS Bedrock")
-    expect(table.locator("select.mc-default[data-provider='bedrock']")).to_have_count(0)
-    expect(page.locator("#model-catalog-card")).to_contain_text("個人設定")
-
-
-def test_admin_model_catalog_table_follows_cloud_provider_switch(page, web_base_url):
-    """クラウド AI のラジオを切り替えると、保存前でも「使えるモデル」表の1列目が即座に
-    追従する（保存するまで古い列のまま、という食い違いを防ぐ）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)   # 既定は openai
-    page.goto(f"{web_base_url}/admin-settings.html")   # 既定タブ＝プロバイダ＋接続先（クラウド AI ラジオが見える）
-
-    table = page.locator("#model-catalog-table")
-    open_tab(page, "models")
-    expect(table).to_contain_text("OpenAI")
-    expect(table).not_to_contain_text("Gemini")
-
-    open_tab(page, "provider")   # クラウド AI ラジオはこちらのタブ
-    page.locator("input[data-cloud-provider='gemini']").check()
-
-    open_tab(page, "models")   # 表側は切替前でも DOM は即時更新済み（保存前でも反映される）
-    expect(table).to_contain_text("Gemini")
-    expect(table.locator("select.mc-default[data-provider='gemini'][data-usage='chat']")).to_have_value("gemini-2.5-flash")
-
-
 def test_admin_model_catalog_empty_default_shows_explicit_placeholder_not_first_option(page, web_base_url):
     """重大バグ是正（RV 4巡目 #11）: セルの既定が空（未設定＝組み込み既定へ解決）のとき、
     どの <option> にも selected を付けないとブラウザが先頭の実モデル名を選択済みに見せてしまい

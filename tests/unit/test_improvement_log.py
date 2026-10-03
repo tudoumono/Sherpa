@@ -23,7 +23,7 @@ import pytest
 from sherpa import improvement_log as IL
 
 
-# ===== is_honest_failure / is_incomplete =====
+# ===== is_honest_failure =====
 
 def test_honest_failure_true_for_evidence_verification_failed_unconditionally():
     """evidence_verification_failed/evaluation_blocked は evidence_selected/investigation_status
@@ -90,22 +90,6 @@ def test_honest_failure_false_for_incomplete_stop_reasons_even_with_zero_evidenc
     honest_failure に含めない（未完了は honest_failure とは別カテゴリ）。"""
     assert IL.is_honest_failure(lens="qa", stop_reason=stop_reason, evidence_selected=0,
                                 investigation_status="insufficient") is False
-
-
-@pytest.mark.parametrize("stop_reason", [
-    "truncated", "content_filtered", "unknown", "refusal", "tools_per_turn_exceeded",
-])
-def test_is_incomplete_true_for_incomplete_stop_reasons(stop_reason):
-    assert IL.is_incomplete(stop_reason) is True
-
-
-@pytest.mark.parametrize("stop_reason", [
-    "evidence_verification_failed", "evaluation_blocked", "budget_exceeded", "turns_exhausted",
-    "evaluation_sufficient", "no_tool_calls",
-    None, "",
-])
-def test_is_incomplete_false_for_other_stop_reasons(stop_reason):
-    assert IL.is_incomplete(stop_reason) is False
 
 
 # ===== trace_tool_stats =====
@@ -326,7 +310,6 @@ def test_build_export_row_composite_stop_reason_mixed_with_incomplete_step():
         _msg_with_stop_reason("researcher:evaluation_sufficient+reviewer:truncated"),
         feedback=None)
     assert row["stop_reason"] == "truncated"
-    assert IL.is_incomplete(row["stop_reason"]) is True
 
 
 def test_build_export_row_composite_stop_reason_prefers_honest_over_natural_when_no_incomplete():
@@ -469,80 +452,6 @@ def _row(mid, *, question="質問", content="回答", stop_reason=None,
         answer["duration_ms"] = duration_ms
     return {"id": mid, "conversation_id": 1, "created_at": None, "question": question,
            "content": content, "answer": answer, "trace": None}
-
-
-def test_compact_summary_aggregates_feedback_and_honest_failure_and_incomplete(monkeypatch):
-    rows = [
-        _row(1, stop_reason="evaluation_blocked", evidence_selected=0,
-            investigation_status="insufficient", duration_ms=100),   # honest_failure（無条件語彙）
-        _row(2, stop_reason="truncated", evidence_selected=0, investigation_status="insufficient",
-            sources=[], duration_ms=200),  # incomplete のみ
-        _row(3, stop_reason="evaluation_sufficient", evidence_selected=1,
-            investigation_status="sufficient", sources=[{"doc_id": "d1"}], duration_ms=300),
-    ]
-    feedback = {
-        1: {"rating": "down", "tags": ["wrong_evidence"], "comment": "違う"},
-        3: {"rating": "up", "tags": [], "comment": None},
-    }
-    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: rows)
-    monkeypatch.setattr("sherpa.store.get_feedback_by_message_ids", lambda ids: feedback)
-
-    summary = IL.compact_summary(days=7)
-    assert summary["turns_total"] == 3
-    assert summary["feedback_up"] == 1
-    assert summary["feedback_down"] == 1
-    assert summary["feedback_tag_counts"] == {"wrong_evidence": 1}
-    assert summary["honest_failure_count"] == 1
-    assert summary["incomplete_count"] == 1
-    assert summary["duration_ms"]["count"] == 3
-    assert summary["flagged_questions_sample"] == ["質問"]
-    assert summary["stop_reason_counts"] == {
-        "evaluation_blocked": 1, "truncated": 1, "evaluation_sufficient": 1}
-
-
-def test_compact_summary_includes_down_comment_samples(monkeypatch):
-    rows = [_row(1, question="質問A"), _row(2, question="質問B")]
-    feedback = {
-        1: {"rating": "down", "tags": ["slow"], "comment": "遅かった"},
-        2: {"rating": "down", "tags": ["slow"], "comment": "根拠が薄い"},
-    }
-    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: rows)
-    monkeypatch.setattr("sherpa.store.get_feedback_by_message_ids", lambda ids: feedback)
-
-    summary = IL.compact_summary(days=7)
-    assert set(summary["flagged_comments_sample"]) == {"遅かった", "根拠が薄い"}
-
-
-def test_compact_summary_stop_reason_counts_uses_none_bucket_when_missing(monkeypatch):
-    rows = [_row(1)]   # stop_reason/evidence_selected/investigation_status 全て未指定
-    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: rows)
-    monkeypatch.setattr("sherpa.store.get_feedback_by_message_ids", lambda ids: {})
-
-    summary = IL.compact_summary(days=7)
-    assert summary["stop_reason_counts"] == {"none": 1}
-
-
-def test_compact_summary_flagged_questions_and_comments_capped_at_20(monkeypatch):
-    rows = [_row(i, question=f"質問{i}") for i in range(30)]
-    feedback = {i: {"rating": "down", "tags": [], "comment": f"一言{i}"} for i in range(30)}
-    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: rows)
-    monkeypatch.setattr("sherpa.store.get_feedback_by_message_ids", lambda ids: feedback)
-
-    summary = IL.compact_summary(days=30)
-    assert len(summary["flagged_questions_sample"]) == 20
-    assert len(summary["flagged_comments_sample"]) == 20
-
-
-def test_compact_summary_empty_period_returns_none_rates(monkeypatch):
-    monkeypatch.setattr("sherpa.store.list_export_messages", lambda **kwargs: [])
-    monkeypatch.setattr("sherpa.store.get_feedback_by_message_ids", lambda ids: {})
-    summary = IL.compact_summary(days=1)
-    assert summary["turns_total"] == 0
-    assert summary["honest_failure_rate"] is None
-    assert summary["incomplete_rate"] is None
-    assert summary["duration_ms"] == {"count": 0}
-    assert summary["stop_reason_counts"] == {}
-    assert summary["flagged_comments_sample"] == []
 
 
 # ===== is_export_row_personal_tainted =====

@@ -1,36 +1,11 @@
-"""JS アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §13 波3 レーン A）。
+"""JS アナライザ。`.js`/`.mjs` を全件受理し（`.ts` は対象外）、ファイル自体を主体定義（`Module`・拡張子込みファイル名）とする（children なし）。
 
-`.js`/`.mjs` を**全件受理**する（`.ts` は対象外・型情報が別に要る言語のため本スライスのスコープ外）。
-ファイル自体を主体定義（`Module`・primary・拡張子込みファイル名）とし、children は持たない
-——動的言語のため関数を構造的な子定義として抽出しない（検出限界として明記・呼び出し先解決も
-行わない）。
-
-**参照抽出**（コメント `//`・`/* */` の中身は空白化してから走査・文字列/テンプレートリテラルの
-中身は温存する——URL/パスは文字列リテラルの中に書かれるため）:
-- `import x from "./y.js"`／`require("./y")`／`importScripts("…")` → `INVOKES(via=include)`
-  （拡張子なしは `.js` を補ってから `include_path` にする・C アナライザと同じ2段解決）。
-  バックティック始まり（`import`/`require` はバックティックの識別子形パス）は対象外——node_modules
-  由来の裸パッケージ名（`import React from "react"`）と区別するため、`import`/`require` は `.`
-  始まり（`./`/`../`）のパスに限定する。`importScripts` はワーカースクリプトの慣習上バックティック
-  も含め任意の文字列を受理する。外部参照スキーム（`http:`/`https:`/`//`/`data:`/`javascript:`/
-  `mailto:`/`#`）は `Dropped("web_external_ref", line, uri)`（include 対象外）。`/` 始まりは参照元
-  top scope へ連結して参照元からの相対パスに変換する。`?`/`#` 以降は basename/`include_path` 算出前に
-  除去する。
-- 文字列リテラルの URL（`fetch("/api/x")`・`$.ajax({url: "/x"})`・`axios.get("/x")`・
-  `XMLHttpRequest.open("GET", "/x")`・`location.href = "/x"`・`form.action = "x.action"`）→
-  `ACCESSES(via=config_key)`（`/` 始まりはそのまま URL キー、`.action` 拡張子は Struts action キー
-  ＝拡張子と先頭 `/` を落とす）。判定前に `?`/`#` 以降を除去し、外部参照スキーム（`//` 始まりの
-  protocol-relative URL 等）は対象外にする。**構造情報は見ない**（呼び出し元オブジェクトの型までは
-  検証しない・`url:` キーはどの呼び出しの引数でも同じ扱いになる＝粗い判定の裏返しの検出限界）。
-- 動的な連結（文字列リテラル直後に `+` 結合・例 `"/orders/" + id`）は静的な値が決まらないため
-  `Dropped("js_dynamic_url", line)`（同じ行の他の静的 URL 呼び出しは、連結の一致区間と重ならない
-  限り通常どおり参照になる——除外は行単位ではなく match span 単位で行う）。
-- minified（`.min.js` ファイル名、または1行が4096文字超）は `Dropped("js_minified", 1)` を1件
-  申告し、それ以上の参照抽出を行わない（サニタイズ自体もコスト削減のためスキップする）。
-
-正規表現による粗い判定のため、コメント/文字列外に偶然同じ字面（`fetch(`・`url:` 等）が現れた場合の
-誤検出は考慮しない（他の言語アナライザと同じ限界）。JS の正規表現リテラル（`/pattern/`）はコメント
-判定の対象にしない（`//`/`/*` の2文字のみを見るため単独の `/` はそのまま素通りする）。
+参照抽出（コメントは空白化し、文字列/テンプレートリテラルの中身は残す）:
+- `import ... from "./y.js"`／`require("./y")`／`importScripts("…")` → `INVOKES(via=include)`（拡張子なしは `.js` を補う・C アナライザと同じ2段解決）。`import`/`require` は `.` 始まりのパスに限る（裸のパッケージ名は除く）。外部参照スキームは `Dropped("web_external_ref")`、`/` 始まりは top scope へ連結して相対パス化、`?`/`#` 以降は除去する。
+- 文字列リテラルの URL（`fetch`・`$.ajax({url})`・`axios.*`・`XMLHttpRequest.open`・`location.href =`・`.action =`）→ `ACCESSES(via=config_key)`（`/` 始まりは URL キー、`.action` は Struts action キー）。呼び出し元の型は検証しない粗い判定。
+- 動的連結（`"/orders/" + id`）は `Dropped("js_dynamic_url")`（一致区間単位で除外する）。
+- minified（`.min.js`、または1行4096文字超）は `Dropped("js_minified")` を1件申告し、抽出しない。
+設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
@@ -45,7 +20,7 @@ JS_EXT = frozenset({".js", ".mjs"})
 
 _MINIFIED_LINE_LEN = 4096
 
-# 外部参照スキーム（include 対象外・URL キーにもしない）。
+# 外部参照スキーム（include 対象外）。
 _EXTERNAL_SCHEMES = ("http:", "https:", "//", "data:", "javascript:", "mailto:", "#")
 
 
@@ -54,7 +29,7 @@ def _is_external_ref(path: str) -> bool:
 
 
 def _strip_query_fragment(val: str) -> str:
-    """`?`/`#` 以降を除去する（先に出現した方で切る・action判定/拡張子判定/basename取得の前段）。"""
+    """`?`/`#` 以降を除去する（先に出現した方で切る）。"""
     cut = len(val)
     for ch in ("?", "#"):
         idx = val.find(ch)
@@ -64,7 +39,7 @@ def _strip_query_fragment(val: str) -> str:
 
 
 def _scope_relative_include_path(ref_rel: str, raw_path: str) -> str:
-    """`jsp._scope_relative_include_path` と同じ規則（重複させる・共有モジュールを増やさない方針）。"""
+    """`jsp._scope_relative_include_path` と同じ規則（共有モジュールは作らず重複させる）。"""
     stripped = raw_path.lstrip("/")
     if "/" not in ref_rel:
         return stripped
@@ -81,9 +56,7 @@ def _is_minified(rel_path: str, text: str) -> bool:
 
 
 def _sanitize_comments_only(text: str) -> str:
-    """コメント（`//`・`/* */`）だけを空白化し、文字列/テンプレートリテラルの中身は残す
-    （URL/パスの読み取りに必要・c.py の同名ヘルパと同じ役割、テンプレートリテラルのバックティックも
-    文字列と同格に扱う点だけが異なる）。"""
+    """コメントだけを空白化し、文字列/テンプレートリテラルの中身は残す（URL/パスの読み取り用）。"""
     out: list = []
     i, n = 0, len(text)
     while i < n:
@@ -133,19 +106,16 @@ def _line_at(newline_offsets: list, pos: int) -> int:
     return bisect.bisect_left(newline_offsets, pos) + 1
 
 
-# `import ... from "./x"` （side-effect の `import "./x"` も含む・`from` は任意）。単一物理行内に
-# 限定する（`[^"'\n]` で改行を跨がせない＝複数行 import 文は見逃す・C アナライザと同じ安全側の限界）。
+# `import ... from "./x"`（side-effect の `import "./x"` も含む）。単一物理行内に限る。
 _IMPORT_FROM = re.compile(r'\bimport\b[^"\'\n]*?["\'](?P<path>\.\.?/[^"\']+)["\']')
 # `require("./x")`。
 _REQUIRE = re.compile(r'\brequire\(\s*["\'](?P<path>\.\.?/[^"\']+)["\']\s*\)')
 # `importScripts("x")`。
 _IMPORT_SCRIPTS = re.compile(r'\bimportScripts\(\s*["\'](?P<path>[^"\']+)["\']')
 
-# 文字列リテラル直後の `+`（動的連結）。
 _DYNAMIC_URL_HINT = re.compile(r'["\'](?P<path>/[^"\']*)["\']\s*\+')
 
-# URL/パス文字列リテラルを引数に取る呼び出し（`fetch`/`axios.*`/`.open(method, url)`/`url:`
-# キー＝`$.ajax({url: ...})` 相当／`location.href =`／`.action =`）。
+# URL/パス文字列リテラルを引数に取る呼び出し（`fetch`/`axios.*`/`.open(method, url)`/`url:`／`location.href =`／`.action =`）。
 _URL_CALL_SITES = re.compile(
     r'\bfetch\(\s*["\'](?P<path_fetch>/[^"\']*)["\']'
     r'|\baxios\.[a-zA-Z]+\(\s*["\'](?P<path_axios>/[^"\']*)["\']'
@@ -157,9 +127,7 @@ _URL_CALL_SITES = re.compile(
 
 
 def _config_key_name(val: str) -> tuple[str, str] | None:
-    """URL 文字列リテラルから `(名前, 種別)` を返す（種別は `extra["key_kind"]` として
-    `RefCandidate` にそのまま渡す・Config キーの名前空間分離）。判定前に `?`/`#` 以降を除去し、
-    外部参照スキーム（`//` 始まりの protocol-relative URL 等）は対象外にする。"""
+    """URL 文字列リテラルから `(名前, 種別)` を返す（種別は `extra["key_kind"]`）。`?`/`#` 以降は除去し、外部参照スキームは対象外。"""
     val = _strip_query_fragment(val)
     if not val or _is_external_ref(val):
         return None
@@ -172,9 +140,7 @@ def _config_key_name(val: str) -> tuple[str, str] | None:
 
 
 def _emit_include(raw_path: str, line: int, ref_rel: str, refs: list, dropped: list) -> None:
-    """`jsp._emit_include` と同じ規則だが `<base>` の概念が無いため `has_base` を持たない。
-    拡張子なしは `.js` を補ってから `include_path` にする（`import`/`require`/`importScripts`
-    いずれも同じ扱い・既存挙動を維持）。"""
+    """`jsp._emit_include` と同じ規則（`<base>` が無いので `has_base` は持たない）。拡張子なしは `.js` を補ってから `include_path` にする。"""
     path = raw_path.replace("\\", "/")
     if _is_external_ref(path):
         dropped.append(Dropped("web_external_ref", line, path))
@@ -193,9 +159,7 @@ def _emit_include(raw_path: str, line: int, ref_rel: str, refs: list, dropped: l
 
 
 class JsAnalyzer(Analyzer):
-    """ファイル自体 → `Module`（primary・拡張子込みファイル名）。children なし。
-    import/require/importScripts → `INVOKES(via=include)`。URL 文字列リテラル →
-    `ACCESSES(via=config_key)`。動的連結/minified → `Dropped`。"""
+    """ファイル自体 → `Module`（primary）。import/require/importScripts → `INVOKES(via=include)`。URL 文字列リテラル → `ACCESSES(via=config_key)`。動的連結/minified → `Dropped`。"""
 
     name = "js"
     extensions = JS_EXT
@@ -219,8 +183,7 @@ class JsAnalyzer(Analyzer):
                 line = _line_at(newline_offsets, m.start())
                 _emit_include(m.group("path"), line, rel_path, refs, dropped)
 
-        # 行配列は1回だけ作る——`sanitized.splitlines()` をループ内で毎回呼ぶと動的連結の
-        # 出現件数に比例して全文再分割のコストが掛かり二次時間になる。
+        # 行配列は1回だけ作る（ループ内で毎回分割すると二次時間になる）。
         sanitized_lines = sanitized.splitlines()
         dynamic_spans = [m.span() for m in _DYNAMIC_URL_HINT.finditer(sanitized)]
         seen_lines: set = set()
@@ -232,10 +195,7 @@ class JsAnalyzer(Analyzer):
             snippet = sanitized_lines[line - 1].strip()[:120]
             dropped.append(Dropped("js_dynamic_url", line, snippet))
 
-        # `_URL_CALL_SITES.finditer` は出現順（位置昇順）で返し、`dynamic_spans` も同じ順で
-        # 作られている（`_DYNAMIC_URL_HINT.finditer` も位置昇順・互いに重ならない）ため、
-        # 単調ポインタで1回だけ突合する——URL 候補ごとに `dynamic_spans` 全件を線形走査する
-        # 二次時間を避ける。
+        # `_URL_CALL_SITES` と `dynamic_spans` はともに位置昇順なので、単調ポインタで1回だけ突合する。
         dyn_idx, n_dyn = 0, len(dynamic_spans)
         for m in _URL_CALL_SITES.finditer(sanitized):
             u_start, u_end = m.start(), m.end()
@@ -243,7 +203,7 @@ class JsAnalyzer(Analyzer):
                 dyn_idx += 1
             overlaps_dynamic = dyn_idx < n_dyn and dynamic_spans[dyn_idx][0] < u_end
             if overlaps_dynamic:
-                continue                                # 動的連結側と一致区間が重なる＝既に Dropped 済み
+                continue  # 動的連結側と一致区間が重なる＝既に Dropped 済み
             val = next(v for v in m.groups() if v is not None)
             line = _line_at(newline_offsets, u_start)
             resolved = _config_key_name(val)

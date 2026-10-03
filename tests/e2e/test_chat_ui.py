@@ -1502,74 +1502,111 @@ def test_font_menu_opens_and_applies_selected_size(page, web_base_url):
     expect(page.locator("#messages")).to_have_css("font-size", "18px")
 
 
-def test_brain_menu_opens_and_shows_model_note_for_llm_provider(page, web_base_url):
-    """頭脳メニュー（#brainbadge）の開閉と、実行構成の切替を固定する。
+# 調べ方・深さ・検索経路の行は Codex 調査のときだけ出る（簡易では隠す）ため、それらを操作するテストは
+# Codex 構成の設定で起動する。
+_CODEX_SETTINGS = {**mock_api.SETTINGS_RESP, "agent": "codex", "construct_id": "codex_openai"}
 
-    4構成（2026-08-15・`sherpa/agent_constructs.py`）: メニューの項目はサーバが返す
-    `constructs_available` から描画され、`data-exec` は構成id（agent 名ではない）。
-    Codex(OpenAI) と Codex(Ollama) は同じ agent=codex で別項目として並ぶ。
 
-    モデル名は個人設定に無い（管理者の使えるモデル一覧・選択中のクラウドプロバイダだけで決まる）。
-    openai/gemini/ollama/codex はモデル欄自体を出さず案内文だけ（保存ボタンも無い＝ PUT しても
-    孤立フィールドとして無視されるだけの偽の「保存しました」を出さない）。唯一の例外は Bedrock
-    （実在確認済みモデルの専用機構が個人設定側にあり、自由入力 `<input>` のまま）。
-    """
+# 資料参照トグルが固定されない頭脳（Codex・簡易は ON 固定）。トグル自体の既定/強制 OFF の挙動
+# （サーバが旧来の頭脳を返す環境でも壊さない経路）を確かめるテストだけが使う。
+_UNLOCKED_KB_SETTINGS = {**mock_api.SETTINGS_RESP, "agent": "ollama", "construct_id": "ollama"}
+
+
+def _open_brain_menu(page):
     from playwright.sync_api import expect
 
-    # A7（クラウドプロバイダ排他選択）: openai と bedrock を同じセッションで両方保存できる
-    # 実サーバの状態は無い（選択中でないクラウド系 agent の保存は 422）ため、本テストは
-    # cloud_provider=bedrock に揃え、「モデル欄を持たない構成」の代表を openai ではなく
-    # ollama（A7 対象外・showModelNote の判定は openai と同じ扱い）で確認する。cloud_provider=bedrock
-    # なら実サーバの一覧も openai_only（provider≠openai）・gemini（provider≠gemini）を除いた
-    # 4件（ollama_only/codex_openai/codex_ollama/bedrock）になる＝一覧漏れの偽緑を作らないよう
-    # constructs_available・agent・construct_id もその状態に揃える。
-    _bedrock_constructs = [c for c in mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS["constructs_available"]
-                          if c["id"] not in ("openai_only", "gemini")]
-    settings = {**mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS, "cloud_provider": "bedrock",
-               "constructs_available": _bedrock_constructs, "agent": "ollama",
-               "construct_id": "ollama_only"}
-    records = install_api_mocks(page, settings=settings)
+    page.locator("#brainbadge").click()
+    expect(page.locator("#brainmenu")).to_be_visible()
+
+
+def test_brain_menu_lists_three_constructs_and_switching_puts_settings(page, web_base_url):
+    """頭脳メニューはサーバの `constructs_available`（Codex 調査 2 種＋簡易）をそのまま出し、
+    選択で PUT /settings が飛ぶ（`data-exec` は構成 id・Codex(OpenAI)/(Ollama) は同じ agent=codex）。"""
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
     page.goto(f"{web_base_url}/chat.html")
 
     expect(page.locator("#brainmenu")).to_be_hidden()
-    page.locator("#brainbadge").click()
-    expect(page.locator("#brainmenu")).to_be_visible()
-    # cloud_provider=bedrock の実サーバ相当＝ollama_only/codex_openai/codex_ollama/bedrock の4件
-    # （openai_only・gemini は A7 で一覧から外れる）。
-    expect(page.locator("#brainmenu [data-exec]")).to_have_count(4)
+    _open_brain_menu(page)
+    expect(page.locator("#brainmenu [data-exec]")).to_have_count(3)
+    expect(page.locator("#brainmenu [data-exec='simple']")).to_contain_text("簡易")
 
-    page.locator("#brainmenu [data-exec='ollama_only']").click()
-
-    # 実際に切り替わること（＝PUT /settings が飛ぶこと）まで見る。属性名と読み出し側の
-    # 食い違いで「クリックしても何も起きない」状態を作らないための固定（2026-08-15 実害）。
-    assert records["settings_put"][-1]["agent"] == "ollama"
-    assert records["settings_put"][-1]["codex_model_provider"] is None
-
-    # ollama はモデル欄自体を持たない（保存できないフィールドの偽の入力欄を出さない・openai と同型）。
-    expect(page.locator("#bm-modelinput")).to_have_count(0)
-    expect(page.locator("#bm-modelsave")).to_have_count(0)
-    expect(page.locator(".bm-model")).to_contain_text("管理画面")
-    # 接続テストはモデル欄が無くても引き続き提供される（キー疎通の確認は依然有効）。
-    expect(page.locator("#bm-modeltest")).to_be_visible()
-
-    # Bedrock はモデルカタログの対象外（実在確認済みモデルの専用機構が別にある）＝自由入力の
-    # <input> のまま（唯一モデル欄と保存ボタンが残る）。メニューは開いたまま（クリックでは閉じない）
-    # なので #brainbadge を再クリックしない（クリックすると開閉トグルで閉じてしまう）。
-    page.locator("#brainmenu [data-exec='bedrock']").click()
-    bedrock_field = page.locator("#bm-modelinput")
-    expect(bedrock_field).to_be_visible()
-    assert page.evaluate("document.getElementById('bm-modelinput').tagName") == "INPUT"
-    assert bedrock_field.get_attribute("aria-label") == "モデル名"
-    # Bedrock（唯一の個人設定モデル欄）は引き続き保存できる。
-    bedrock_field.fill("jp.anthropic.claude-haiku-4-5-20251001-v1:0")
-    page.locator("#bm-modelsave").click()
-    assert records["settings_put"][-1] == {"bedrock_model": "jp.anthropic.claude-haiku-4-5-20251001-v1:0"}
-
-    # Codex 2構成は同じ agent=codex で、codex_model_provider だけが違う（メニューは開いたまま）。
     page.locator("#brainmenu [data-exec='codex_ollama']").click()
-    expect(page.locator("#brainmenu [data-exec='codex_ollama']")).to_have_class(re.compile(r"\bon\b"))
     assert records["settings_put"][-1]["agent"] == "codex"
     assert records["settings_put"][-1]["codex_model_provider"] == "ollama"
+    # モデルは管理画面（個人のモデル欄・接続テストは無い）。
+    expect(page.locator("#bm-modelinput")).to_have_count(0)
+    expect(page.locator("#bm-modeltest")).to_have_count(0)
+    expect(page.locator(".bm-model")).to_contain_text("管理画面")
+
+
+def test_simple_mode_hides_inquiry_rows_and_shows_note_then_codex_restores(page, web_base_url):
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html")
+
+    # 既定の構成は簡易（モックの agent=simple）: 効かない行は隠れ、注記が出る。
+    for sel in ("#lens-row", "#depth-row", "#tools-details", "#websearchtoggle"):
+        expect(page.locator(sel)).to_be_hidden()
+    expect(page.locator("#simple-note")).to_be_visible()
+    expect(page.locator("#simple-note")).to_contain_text("Codex 調査へ")
+    # 簡易も Codex と同じく資料参照は ON 固定（サーバ側でも強制）。
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-disabled", "true")
+    expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "true")
+
+    _open_brain_menu(page)
+    page.locator("#brainmenu [data-exec='codex_openai']").click()
+    for sel in ("#lens-row", "#depth-row", "#tools-details"):
+        expect(page.locator(sel)).to_be_visible()
+    expect(page.locator("#simple-note")).to_be_hidden()
+
+    page.locator("#brainmenu [data-exec='simple']").click()
+    expect(page.locator("#depth-row")).to_be_hidden()
+    expect(page.locator("#simple-note")).to_be_visible()
+
+
+def test_simple_mode_brain_menu_says_model_is_admin_setting(page, web_base_url):
+    from playwright.sync_api import expect
+
+    install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html")
+    _open_brain_menu(page)
+    expect(page.locator(".bm-model")).to_contain_text("簡易回答に使う AI")
+    expect(page.locator("#bm-modeltest")).to_have_count(0)
+
+
+def test_simple_mode_stream_request_omits_depth_lens_and_tools(page, web_base_url):
+    from playwright.sync_api import expect
+
+    records = install_api_mocks(page)
+    page.goto(f"{web_base_url}/chat.html")
+
+    # Codex 調査で深さ・調べ方を選んでから簡易へ切り替える＝選択が残っていても送られない。
+    _open_brain_menu(page)
+    page.locator("#brainmenu [data-exec='codex_openai']").click()
+    page.locator("#depth-seg [data-depth='deep']").click()
+    page.locator("#lens-seg [data-lens='qa']").click()
+    _open_brain_menu(page)
+    page.locator("#brainmenu [data-exec='simple']").click()
+    expect(page.locator("#depth-row")).to_be_hidden()
+
+    page.locator("#input").fill("消費税率の定義を教えて")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+    body = records["turn_starts"][-1]
+    assert "depth_profile" not in body and "lens" not in body and "tools" not in body
+
+    # Codex 調査へ戻せば従来どおり送られる。
+    if page.locator("#brainmenu").is_hidden():
+        _open_brain_menu(page)
+    page.locator("#brainmenu [data-exec='codex_openai']").click()
+    page.locator("#input").fill("もう一度")
+    page.locator("#send").click()
+    expect(page.locator("#rt")).to_contain_text("完了")
+    body = records["turn_starts"][-1]
+    assert body.get("depth_profile") == "deep" and body.get("lens") == "qa"
 
 
 def test_chat_html_static_assets_load_without_failure(page, web_base_url):
@@ -1906,7 +1943,7 @@ def test_inquiry_block_lens_segment_sets_body_lens_and_grays_layer(page, web_bas
     グレーアウト＋注記が出る（§2.5・§3.1）。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html")
     expect(page.locator("#messages")).to_contain_text("気になること")
 
@@ -1988,7 +2025,7 @@ def test_inquiry_restore_explicit_lens_and_layer_from_history(page, web_base_url
     両方とも復元される（§4.2・§4.3）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html?conv=112")
     expect(page.locator("#messages")).to_contain_text("消費税率")
     expect(page.locator("#lens-seg [data-lens='impact']")).to_have_class(re.compile(r"\bon\b"))
@@ -2028,7 +2065,7 @@ def test_inquiry_depth_profile_deep_send_reflects_body_and_header(page, web_base
     「調べる深さ: 深く・所要 N分N秒」が表示される（§3.2・LOG-1a の duration_ms を流用）。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, stream_events=[
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, stream_events=[
         {"type": "answer", "conversation_id": 101, "message": {"answer": _DEPTH_DEEP_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
@@ -2053,7 +2090,7 @@ def test_inquiry_depth_profile_quick_send_reflects_body_and_header(page, web_bas
 
     answer = {**_DEPTH_DEEP_ANSWER,
               "scope": {**_DEPTH_DEEP_ANSWER["scope"], "depth_profile": "quick"}}
-    records = install_api_mocks(page, stream_events=[
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, stream_events=[
         {"type": "answer", "conversation_id": 101, "message": {"answer": answer}},
     ])
     page.goto(f"{web_base_url}/chat.html")
@@ -2076,7 +2113,7 @@ def test_inquiry_restore_depth_profile_from_history(page, web_base_url):
     とは違い、調べる深さは自動判定という概念が無いため常に復元する・§4.3）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html?conv=115")
     expect(page.locator("#messages")).to_contain_text("消費税率")
     expect(page.locator("#depth-seg [data-depth='deep']")).to_have_class(re.compile(r"\bon\b"))
@@ -2087,7 +2124,7 @@ def test_inquiry_new_conversation_resets_depth_profile_to_standard(page, web_bas
     """新規会話は常に「標準」（既存会話で深く/最大にしていても引き継がない・依頼の設計）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html?conv=115")
     expect(page.locator("#depth-seg [data-depth='deep']")).to_have_class(re.compile(r"\bon\b"))
 
@@ -2127,7 +2164,7 @@ def test_inquiry_tools_graph_only_send_reflects_body_and_hides_grep_fulltext_nod
     思考の流れには（ツールが提示されないため）grep/全文のノードが出ない。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, stream_events=[
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, stream_events=[
         {"type": "node", "id": "tool-graph", "kind": "tool", "status": "done",
          "label": "関係グラフをたどる", "detail": "「TAX-RATE」の関連部品"},
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TOOLS_GRAPH_ONLY_ANSWER}},
@@ -2158,7 +2195,7 @@ def test_inquiry_tools_last_one_cannot_be_turned_off(page, web_base_url):
     """残り1つの検索経路はクリックしても外せない（disabled・理由のツールチップ付き）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html")
     page.locator("#tools-details-head").click()
 
@@ -2176,7 +2213,7 @@ def test_inquiry_tools_unavailable_chip_hidden(page, web_base_url):
     グラフのチップ自体を表示しない（実効検索経路0を選べる状態を作らない）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
+    install_api_mocks(page, settings=_CODEX_SETTINGS, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='graph']")).to_be_hidden()
@@ -2190,7 +2227,7 @@ def test_inquiry_tools_last_one_gating_ignores_unavailable_tool(page, web_base_u
     （不達チップをカウントに含めて「まだ2つ残っている」と誤判定しない）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
+    install_api_mocks(page, settings=_CODEX_SETTINGS, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
     page.locator("#tools-details-head").click()
     page.locator("#tools-seg [data-tool='grep']").click()
@@ -2207,7 +2244,7 @@ def test_inquiry_tools_unavailable_axis_omitted_from_send_avoids_422(page, web_b
     このテストは是正前なら実際に失敗する（graph:true を送ってしまい 422 表示になる）。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html")
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='graph']")).to_be_hidden()
@@ -2246,7 +2283,7 @@ def test_retry_hint_tools_button_resends_explicit_on_even_if_still_unavailable(p
     OFFのまま実行されていた。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False},
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, tools_availability={"grep": True, "fulltext": True, "graph": False},
                                 stream_events=[
         {"type": "answer", "conversation_id": 101, "message": {"answer": _TOOLS_RETRY_HINT_ANSWER}},
     ])
@@ -2272,7 +2309,7 @@ def test_inquiry_tools_toggle_off_then_on_sends_explicit_despite_availability_dr
 
     from playwright.sync_api import expect
 
-    install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": True})
+    install_api_mocks(page, settings=_CODEX_SETTINGS, tools_availability={"grep": True, "fulltext": True, "graph": True})
     turn_bodies = []
 
     def handle_turn_start(route):
@@ -2308,7 +2345,7 @@ def test_inquiry_tools_last_one_rapid_clicks_stay_on(page, web_base_url):
     実効検索経路0を作れないことを連打耐性としても固定する）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html")
     page.locator("#tools-details-head").click()
     page.locator("#tools-seg [data-tool='grep']").click()
@@ -2328,7 +2365,7 @@ def test_inquiry_tools_chip_keyboard_activation_toggles(page, web_base_url):
     （クリックだけの実装になっていないことを固定する）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html")
     page.locator("#tools-details-head").click()
     grep_btn = page.locator("#tools-seg [data-tool='grep']")
@@ -2345,7 +2382,7 @@ def test_inquiry_restore_tools_missing_key_defaults_to_all_on(page, web_base_url
     開いても例外にならず、全ON（既定）として復元する。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html?conv=115")   # SC-6c の会話フィクスチャ（tools キー無し）
     expect(page.locator("#messages")).to_contain_text("消費税率")
     page.locator("#tools-details-head").click()
@@ -2363,7 +2400,7 @@ def test_inquiry_restore_tools_from_history(page, web_base_url):
     （復元値が非既定なら3軸とも明示状態にする・`inquiry.js::toolsExplicitForRestore` 参照）。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html?conv=116")
     expect(page.locator("#messages")).to_contain_text("消費税率")
     # 復元後も「詳細」自体は既定閉のまま（会話ごとに永続しない）。
@@ -2386,7 +2423,7 @@ def test_inquiry_new_conversation_resets_tools_to_all_on(page, web_base_url):
     """新規会話は常に全ON（既存会話で絞っていても引き継がない・依頼の設計）。"""
     from playwright.sync_api import expect
 
-    install_api_mocks(page)
+    install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.goto(f"{web_base_url}/chat.html?conv=116")
     page.locator("#tools-details-head").click()
     expect(page.locator("#tools-seg [data-tool='grep']")).not_to_have_class(re.compile(r"\bon\b"))
@@ -2418,7 +2455,7 @@ def test_new_conversation_during_pending_world_options_ignores_stale_conv_follow
     def _hold_world_options(route):
         held["route"] = route   # ここでは fulfill しない＝応答を明示的に保留する
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.route("**/world-options", _hold_world_options)
     page.goto(f"{web_base_url}/chat.html?conv=116")   # 検索経路を絞った会話（grep OFF）
 
@@ -2521,7 +2558,7 @@ def test_retry_hint_button_raises_depth_profile_and_resends(page, web_base_url):
     `test_retry_hint_button_broadens_scope_and_resends` と同じく元回答の値を維持する。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, stream_events=[
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, stream_events=[
         {"type": "answer", "conversation_id": 101, "message": {"answer": _DEPTH_RETRY_HINT_ANSWER}},
     ])
     page.goto(f"{web_base_url}/chat.html")
@@ -2671,7 +2708,7 @@ def test_confirm_first_resend_restores_slash_lens_via_question_payload(page, web
         body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events)
         route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=body)
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
 
@@ -2721,7 +2758,7 @@ def test_confirm_first_resend_restores_tools_from_question_payload(page, web_bas
         body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events)
         route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=body)
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
 
@@ -3069,7 +3106,7 @@ def test_inquiry_restore_only_touched_axis_is_explicit(page, web_base_url):
     無操作の追質問だけで「不達なのに明示 ON」となり 422 になっていた。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, tools_availability={"grep": True, "fulltext": True, "graph": False})
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS, tools_availability={"grep": True, "fulltext": True, "graph": False})
     page.goto(f"{web_base_url}/chat.html?conv=118")
     expect(page.locator("#messages")).to_contain_text("消費税率")
 
@@ -3113,7 +3150,7 @@ def test_confirm_first_resend_does_not_persist_override_as_explicit(page, web_ba
         body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events)
         route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=body)
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_CODEX_SETTINGS)
     page.route("**/chat/turns/*/stream?**", handle_turn_stream)
     page.goto(f"{web_base_url}/chat.html")
 
@@ -3184,7 +3221,7 @@ def test_new_conversation_resets_knowledge_toggle_to_on_after_chat_lens_conversa
 
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page)
+    records = install_api_mocks(page, settings=_UNLOCKED_KB_SETTINGS)
     page.route("**/conversations/777", lambda route: route.fulfill(
         status=200, content_type="application/json",
         body=json.dumps({
@@ -3216,7 +3253,7 @@ def test_knowledge_toggle_forced_off_when_world_options_empty(page, web_base_url
     フロントが自発的に OFF へ倒し、送信 body の knowledge は false になる。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, world_options={"worlds": [], "labels": {}})
+    records = install_api_mocks(page, settings=_UNLOCKED_KB_SETTINGS, world_options={"worlds": [], "labels": {}})
     page.goto(f"{web_base_url}/chat.html")
 
     expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")
@@ -3233,7 +3270,7 @@ def test_new_conversation_stays_off_when_world_options_empty(page, web_base_url)
     しまうと素の雑談まで 404 になる——選択肢が無いままなら OFF を維持する。"""
     from playwright.sync_api import expect
 
-    records = install_api_mocks(page, world_options={"worlds": [], "labels": {}})
+    records = install_api_mocks(page, settings=_UNLOCKED_KB_SETTINGS, world_options={"worlds": [], "labels": {}})
     page.goto(f"{web_base_url}/chat.html")
     expect(page.locator("#kbtoggle")).to_have_attribute("aria-pressed", "false")
 

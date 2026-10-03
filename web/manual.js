@@ -1,14 +1,8 @@
 'use strict';
 
-// マニュアル一本化（M-A・docs/proposals/2026-07-08-マニュアル一本化.md）: 正本は docs/manual/*.md。
-// この画面は「MD レンダラ」に徹し、本文を一切持たない（以後の更新は docs/manual/*.md を直すだけ）。
-//
-// 流れ: manifest.json（章の目次）を取得 → 章を選ぶと該当 .md を取得 → marked でレンダ →
-// 許可リスト方式でサニタイズ・再構築（DOMParser の不活性ドキュメント上で厳格に絞る。正本は自
-// リポジトリの MD だが多層防御）→ 表示。
-//
-// 既存アンカー互換: manifest の id は旧 manual.js の id（start/chat/register/graph/workspace/
-// settings/sysadmin 等）に合わせてある。他画面の help-link（manual.html#settings 等）は変更不要。
+// マニュアル画面: 正本は docs/manual/*.md。この画面は「MD レンダラ」に徹し、本文を持たない。
+// 流れ: manifest.json（章の目次）を取得 → 章を選ぶと該当 .md を取得 → marked でレンダ → 許可リスト方式でサニタイズ・再構築（DOMParser の不活性ドキュメント上で厳格に絞る）→ 表示。
+// manifest の id は他画面の help-link（manual.html#settings 等）のアンカーと対応させてある。
 
 const esc = Sherpa.esc;
 
@@ -31,12 +25,9 @@ function currentId() {
   return byId[id] ? id : 'start';
 }
 
-// ===== サニタイズ（Codex RV 2026-07-08 High1）=====
-// ブロックリスト（script/on*/javascript: だけ除去）は iframe srcdoc・object/embed・form・
-// style・meta refresh・data:text/html・外部 img 自動読み込みなどを通してしまう。ここでは
-// **許可リスト方式**へ転換: DOMParser の不活性ドキュメント（onload/onerror 等は発火しない）で
-// 一度パースし、許可タグ・許可属性だけを新規 DOM として組み立て直す（元ノードの属性を素通しせず、
-// 検査した値だけを新しい要素にコピーする）。ライブ DOM への挿入は呼び出し側が最後に一度だけ行う。
+// ===== サニタイズ =====
+// 許可リスト方式: DOMParser の不活性ドキュメント（onload/onerror 等は発火しない）で一度パースし、許可タグ・許可属性だけを新規 DOM として組み立て直す（元ノードの属性を素通しせず、検査した値だけをコピーする）。
+// ライブ DOM への挿入は呼び出し側が最後に一度だけ行う。
 
 // 内容ごと除去するタグ（script 実行・外部読み込み・フォーム送信・スタイル注入・メタリフレッシュ等、
 // 中身を見せる意味がなく危険な経路になり得るもの）。
@@ -53,9 +44,8 @@ const _ALLOWED_TAGS = new Set([
   'FIGURE', 'FIGCAPTION', 'SPAN', 'DIV',
 ]);
 
-// MD 内の相対画像参照（`images/xxx.png`・`./images/xxx.png`・クエリ付きも可）を、api.py の既存配信
-// （/ui/manual-images/）へ書き換える。対象外（外部 URL・data: 等）は null を返し、呼び出し側が
-// img 自体を落とす（自動読み込み＝オフライン契約・情報漏えい経路のため許可しない）。
+// MD 内の相対画像参照（`images/xxx.png` 等・クエリ付きも可）を、api.py の既存配信（/ui/manual-images/）へ書き換える。
+// 対象外（外部 URL・data: 等）は null を返し、呼び出し側が img 自体を落とす（外部の自動読み込みはオフライン契約・情報漏えい経路のため許可しない）。
 function _resolveImgSrc(raw) {
   let src = String(raw || '').trim();
   if (src.startsWith('./')) src = src.slice(2);
@@ -63,7 +53,7 @@ function _resolveImgSrc(raw) {
   return null;
 }
 
-// `<a href>` の解決（Codex RV Med1 も兼ねる）。優先順:
+// `<a href>` の解決。優先順:
 // 1) `#...` の同一ページ内アンカーはそのまま許可。
 // 2) 章間の相対 MD リンク（`12-....md` や `./12-....md`・`#節` 付きは章頭に落とす）は
 //    manifest の id 対応表から `#<章id>` へ書き換える。manifest に無い .md 参照（例: 上位

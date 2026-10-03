@@ -786,14 +786,6 @@ def _read_rag_md(der: Path, rel: str) -> str:
     return (der.parent / "rag" / f"{rel}.rag.md").read_text(encoding="utf-8")
 
 
-def test_finalize_chunks_no_longer_has_search_text_field():
-    """D1: jsonl（証跡サイドカー）はもう索引本文（旧`search_text`）を持たない。"""
-    _, der = _build_wide_xlsx(2)
-    chunks = _read_chunks(der, "big.xlsx")
-    assert chunks
-    assert all("search_text" not in chunk for chunk in chunks)
-
-
 def test_markdown_anchors_precede_each_chunk_and_match_chunk_ids_1to1():
     """D1: rag.md の各chunk本文の直前に`<!-- chunk:{chunk_id} -->`が1行だけ出て、jsonlの
     全chunk_idと過不足なく1:1対応する。"""

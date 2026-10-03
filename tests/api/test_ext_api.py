@@ -2,9 +2,9 @@
 
 要 Postgres。DB 不可は SKIP（tests/api の既存流儀）。admin キー発行/失効はセッション Cookie 認証
 （`/admin/users` 系と同じ）・convert/search/openapi は X-API-Key ヘッダ認証（Cookie ではない）。
-search 本体のエンジン分離/RRF融合ロジックは `sherpa/search_service.py` の
-`tests/unit/test_search_service.py` で検証済み。ここでは認証・世界/scope検証・監査・
-degrade 応答・openapi サブセットの配線を検証する（`sherpa.search_service.search` は monkeypatch で
+search 本体のエンジン分離/RRF融合ロジックは `sherpa/parts/read/fused_search.py` の
+`tests/unit/test_fused_search.py` で検証済み。ここでは認証・世界/scope検証・監査・
+degrade 応答・openapi サブセットの配線を検証する（`sherpa.parts.read.fused_search.search` は monkeypatch で
 スタブ化し ES/Neo4j 到達性に依存しない）。
 """
 from __future__ import annotations
@@ -343,7 +343,7 @@ def test_convert_tmpfile_cleaned(monkeypatch):
 
 # ===== POST /ext/v1/search（E2c）=====
 #
-# エンジン分離/RRF融合ロジック自体は tests/unit/test_search_service.py で検証済み。
+# エンジン分離/RRF融合ロジック自体は tests/unit/test_fused_search.py で検証済み。
 # ここでは ext_api 層の配線（認証・world/scope 検証・監査・degraded 応答・openapi サブセット）を検証する。
 
 def test_ext_search_requires_api_key():
@@ -523,7 +523,8 @@ def test_search_degraded_all_engines_down(monkeypatch):
         pytest.skip("DB down")
     from neo4j.exceptions import ServiceUnavailable
 
-    from sherpa import es_index, search_service
+    from sherpa import es_index
+    from sherpa.parts.read import fused_search
 
     monkeypatch.setattr(es_index, "available", lambda: False)
 
@@ -534,7 +535,7 @@ def test_search_degraded_all_engines_down(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    monkeypatch.setattr(search_service, "_neo4j_session", lambda: _RaiseCtx())
+    monkeypatch.setattr(fused_search, "_neo4j_session", lambda: _RaiseCtx())
 
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
@@ -555,10 +556,11 @@ def test_search_degraded_all_engines_down(monkeypatch):
 
 def test_search_filters_nonexistent_docs(monkeypatch):
     """R3-S2: 削除直後の窓で ES 索引に古いまま残る doc_id は返さない
-    （`documents.world_rel_set` の実在フィルタ・`chat_service._es_hits` と同型・search_service 側に集約）。"""
+    （`documents.world_rel_set` の実在フィルタ・`chat_service._es_hits` と同型・fused_search 側に集約）。"""
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import documents, search_service
+    from sherpa import documents
+    from sherpa.parts.read import fused_search
 
     def _fake_keyword(world, query, sp, k, settings, layer=None):
         return ([{"key": "real.md", "doc_id": "real.md", "path": "real.md", "line": 1,
@@ -566,7 +568,7 @@ def test_search_filters_nonexistent_docs(monkeypatch):
                  {"key": "deleted.md", "doc_id": "deleted.md", "path": "deleted.md", "line": 1,
                   "snippet": "s", "engine_score": 1.0, "judgement": None, "paths": None}], None)
 
-    monkeypatch.setattr(search_service, "_search_keyword", _fake_keyword)
+    monkeypatch.setattr(fused_search, "_search_keyword", _fake_keyword)
     monkeypatch.setattr(documents, "world_rel_set",
                         lambda world=None, root=None, strict=False, **kw: {"real.md"})
 
@@ -628,7 +630,8 @@ def test_ext_openapi_subset():
 
     assert set(doc["paths"].keys()) == {
         "/ext/v1/convert", "/ext/v1/search", "/ext/v1/capabilities", "/ext/v1/doc",
-        "/ext/v1/research"}
+        "/ext/v1/answer", "/ext/v1/codex/jobs", "/ext/v1/codex/jobs/{job_id}",
+        "/ext/v1/codex/jobs/{job_id}/result", "/ext/v1/codex/jobs/{job_id}/cancel"}
     assert not any(p.startswith("/ext/v1/admin") for p in doc["paths"])
 
     def _collect_refs(obj, out: set) -> None:
@@ -656,10 +659,10 @@ def test_ext_openapi_subset():
 # ===== search: depth パラメータ =====
 
 def test_search_depth_passthrough(monkeypatch):
-    """`ExtSearchReq.depth` が `search_service.search(depth=...)` まで素通しされる。"""
+    """`ExtSearchReq.depth` が `fused_search.search(depth=...)` まで素通しされる。"""
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import search_service
+    from sherpa.parts.read import fused_search
 
     captured = {}
 
@@ -668,7 +671,7 @@ def test_search_depth_passthrough(monkeypatch):
         captured["depth"] = depth
         return {"hits": [], "engines_used": [], "degraded": []}
 
-    monkeypatch.setattr(search_service, "search", _fake_search)
+    monkeypatch.setattr(fused_search, "search", _fake_search)
 
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
@@ -682,18 +685,18 @@ def test_search_depth_passthrough(monkeypatch):
 
     r = _search({"world": "v1", "query": "x"}, api_key=issued["key"])
     assert r.status_code == 200, r.text
-    assert captured["depth"] == 8   # 既定（従来の固定値と同じ）
+    assert captured["depth"] == fused_search.IMPACT_MAX_DEPTH == 10   # 既定（影響たどりのコード既定）
 
 
 def test_search_depth_out_of_range_422(monkeypatch):
-    """`depth` の上限（le）は元の外部 API 契約 12 を後退させない（`SHERPA_IMPACT_MAX_DEPTH`
-    未設定/12未満でも `max(12, IMPACT_MAX_DEPTH)`＝env 未設定時は従来どおり 12 のまま）。
+    """`depth` の上限（le）は元の外部 API 契約 12 を後退させない（コード既定 10 は 12 未満のため
+    `max(12, IMPACT_MAX_DEPTH)` は従来どおり 12 のまま）。
     0/13 は従来どおり範囲外、9〜12 は従来どおり受理されることの両方を固定する。"""
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import search_service
+    from sherpa.parts.read import fused_search
 
-    monkeypatch.setattr(search_service, "search",
+    monkeypatch.setattr(fused_search, "search",
                         lambda *a, **kw: {"hits": [], "engines_used": [], "degraded": []})
 
     sfx = _sfx()
@@ -712,13 +715,13 @@ def test_search_depth_out_of_range_422(monkeypatch):
 
 
 def test_search_depth_reaches_run_impact(monkeypatch):
-    """`search_service.search` 自体は monkeypatch せず、`_search_graph`→`run_impact` の実配線を
+    """`fused_search.search` 自体は monkeypatch せず、`_search_graph`→`run_impact` の実配線を
     通して depth の最終到達値を確認する（`test_search_depth_passthrough` は search() 止まり）。"""
     if not _try_init():
         pytest.skip("DB down")
     from contextlib import contextmanager
 
-    from sherpa import search_service
+    from sherpa.parts.read import fused_search
 
     captured = {}
 
@@ -730,8 +733,8 @@ def test_search_depth_reaches_run_impact(monkeypatch):
     def _fake_session():
         yield object()
 
-    monkeypatch.setattr(search_service, "_neo4j_session", _fake_session)
-    monkeypatch.setattr(search_service, "run_impact", _fake_run_impact)
+    monkeypatch.setattr(fused_search, "_neo4j_session", _fake_session)
+    monkeypatch.setattr(fused_search, "run_impact", _fake_run_impact)
 
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
@@ -747,10 +750,10 @@ def test_search_depth_reaches_run_impact(monkeypatch):
 # ===== 探す対象（層フィルタ・調べ方ブロック §3.4）=====
 
 def test_search_layer_passthrough(monkeypatch):
-    """`ExtSearchReq.layer` が `search_service.search(layer=...)` まで素通しされる（既定 both）。"""
+    """`ExtSearchReq.layer` が `fused_search.search(layer=...)` まで素通しされる（既定 both）。"""
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import search_service
+    from sherpa.parts.read import fused_search
 
     captured = {}
 
@@ -759,7 +762,7 @@ def test_search_layer_passthrough(monkeypatch):
         captured["layer"] = layer
         return {"hits": [], "engines_used": [], "degraded": []}
 
-    monkeypatch.setattr(search_service, "search", _fake_search)
+    monkeypatch.setattr(fused_search, "search", _fake_search)
 
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
@@ -799,7 +802,7 @@ def test_capabilities_requires_api_key():
     assert r.status_code == 401, r.text
 
 
-def test_capabilities_lists_worlds_and_features():
+def test_capabilities_lists_worlds_and_capabilities(monkeypatch):
     """`v1`（fixtures 直下・DB 未登録）は一覧に載る。fixtures はテスト経路で worker の成功同期を
     通っていないため `document_count`/`last_updated` は未確定＝null（正しい「不明」表示——
     確定値の取得は `test_capabilities_document_count_reflects_confirmed_sync` 側で検証）。"""
@@ -814,10 +817,33 @@ def test_capabilities_lists_worlds_and_features():
     r = _capabilities(api_key=issued["key"])
     assert r.status_code == 200, r.text
     body = r.json()
-    ids = {w["id"] for w in body["worlds"]}
-    assert "v1" in ids
-    assert set(body["features"]) == {
-        "convert", "search:keyword", "search:vector", "search:graph", "doc", "research"}
+    assert set(body) == {"worlds"}
+    w = next(w for w in body["worlds"] if w["world"] == "v1")
+    assert set(w) == {"world", "document_count", "last_updated", "capabilities"}
+    assert set(w["capabilities"]) == {"search", "answer", "codex_jobs", "embed", "convert"}
+    for cap in w["capabilities"].values():
+        assert isinstance(cap["configured"], bool) and isinstance(cap["available"], bool)
+        # reason は configured/available のどちらかが偽のときだけ付く
+        assert ("reason" in cap) == (not (cap["configured"] and cap["available"]))
+
+
+def test_capabilities_distinguishes_configured_from_runnable(monkeypatch):
+    """Codex は構成済みでも CLI が無ければ「設定済み・今は実行不可」（閉じた語彙の理由付き）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import codex_jobs_worker
+    monkeypatch.setattr(codex_jobs_worker, "capability", lambda: (True, False, "codex_cli_missing"))
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    issued = _issue_key(f"capsrun-{sfx}")
+    _logout()
+    r = _capabilities(api_key=issued["key"])
+    assert r.status_code == 200, r.text
+    w = next(w for w in r.json()["worlds"] if w["world"] == "v1")
+    assert w["capabilities"]["codex_jobs"] == {
+        "configured": True, "available": False, "reason": "codex_cli_missing"}
+    assert w["capabilities"]["convert"] == {"configured": True, "available": True}
 
 
 def test_capabilities_document_count_reflects_confirmed_sync(monkeypatch):
@@ -844,7 +870,7 @@ def test_capabilities_document_count_reflects_confirmed_sync(monkeypatch):
 
     r = _capabilities(api_key=issued["key"])
     assert r.status_code == 200, r.text
-    world = next(w for w in r.json()["worlds"] if w["id"] == "confirmed-world")
+    world = next(w for w in r.json()["worlds"] if w["world"] == "confirmed-world")
     assert world["document_count"] == 42
     assert world["last_updated"] is not None
 
@@ -899,7 +925,7 @@ def test_capabilities_last_updated_null_when_not_confirmed(tmp_path, monkeypatch
 
     r = _capabilities(api_key=issued["key"])
     assert r.status_code == 200, r.text
-    world = next(w for w in r.json()["worlds"] if w["id"] == "pending-world")
+    world = next(w for w in r.json()["worlds"] if w["world"] == "pending-world")
     assert world["last_updated"] is None
     assert world["document_count"] is None
 
@@ -1550,7 +1576,7 @@ def test_scoped_key_capabilities_filters_worlds():
 
     r = _capabilities(api_key=issued["key"])
     assert r.status_code == 200, r.text
-    ids = {w["id"] for w in r.json()["worlds"]}
+    ids = {w["world"] for w in r.json()["worlds"]}
     assert ids == {"v1"}
 
 
@@ -2644,12 +2670,12 @@ def test_unhandled_exception_gets_request_id_and_is_audited(monkeypatch):
     （`ExtRequestMiddleware` が自前で 500 応答を組み立てる・再送出はしない）。"""
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import search_service
+    from sherpa.parts.read import fused_search
 
     def _boom(*a, **kw):
         raise RuntimeError("simulated bug")
 
-    monkeypatch.setattr(search_service, "search", _boom)
+    monkeypatch.setattr(fused_search, "search", _boom)
 
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
@@ -3244,722 +3270,152 @@ def test_request_id_appears_on_application_log_records(caplog):
                       f"{[(rec.name, rec.getMessage()) for rec in caplog.records]}")
 
 
-# ===== POST /ext/v1/research（PART-4: AI 下調べ検索）=====
+# ===== POST /ext/v1/answer（簡易チャットの同期応答・`C-EXT-ANSWER-01`）=====
 #
-# agentic search 本体（ツール実行・Evidence Packet 組み立て）は tests/unit/test_ext2_evidence.py で
-# 既に検証済み（`_dedupe_citations_and_evidence`/`_evidence_packet_evidence` 等）。ここでは ext_api 層
-# の配線（認証・world/scope 検証・監査・model 許容値検証・プロバイダ未接続の honest failure・利用統計
-# 記録）を検証する。LLM は `agentic_search._post` を差し替えて呼ぶ（実 Ollama/OpenAI 到達不要・
-# `test_ext2_evidence.py` と同じ手法）。
+# 部品（読み取り部品）を道具として LLM に数回使わせて1回答える薄いループ（`sherpa/simple_chat.py`）
+# の契約テスト。LLM は外部境界のため HTTP 層（`agentic_search._post`）で偽装する（内部関数の
+# monkeypatch はしない）。ES/グラフは無効化し、提示される道具を ripgrep_search/read_around だけに
+# 絞る（`_install_answer_post` 参照・`tests/api/test_ext_api.py` の research セクションが使っていた
+# `_install_agentic_post` と同じ手法）。
 
-_RESEARCH_REAL_DOC = "4期/04_運用/障害記録.md"   # fixtures/corpus/v1 実在ファイル（test_ext2_evidence.py と同一）
-
-
-def test_normalize_evidence_spans_folds_none_element_to_none():
-    """RV12 是正の固定: `source_span` の要素に `None` が1つでも含まれていれば全体を `None` へ畳む
-    （`ExtEvidenceItem.source_span: list[int] | None` は要素として `None` を許さないため）。
-    有効な整数 span・既に `None` の span は変更しない。"""
-    from sherpa import ext_api
-
-    evidence = [
-        {"evidence_id": "ev-1", "source_span": [None, None]},
-        {"evidence_id": "ev-2", "source_span": [5, None]},
-        {"evidence_id": "ev-3", "source_span": [3, 6]},
-        {"evidence_id": "ev-4", "source_span": None},
-        {"evidence_id": "ev-5"},   # キー自体が無いケースも壊さない
-    ]
-    ext_api._normalize_evidence_spans(evidence)
-    assert evidence[0]["source_span"] is None
-    assert evidence[1]["source_span"] is None
-    assert evidence[2]["source_span"] == [3, 6]
-    assert evidence[3]["source_span"] is None
-    assert evidence[4].get("source_span") is None
+_ANSWER_REAL_DOC = "4期/04_運用/障害記録.md"   # fixtures/corpus/v1 実在ファイル
 
 
-def _research(payload: dict, api_key: str | None = None):
+def _answer(payload: dict, api_key: str | None = None):
     headers = {"X-API-Key": api_key} if api_key else {}
-    return client.post("/ext/v1/research", json=payload, headers=headers)
+    return client.post("/ext/v1/answer", json=payload, headers=headers)
 
 
-def _install_agentic_post(monkeypatch, seq):
-    """`sherpa.agentic_search._post` を固定応答列に差し替える（tests/unit/test_ext2_evidence.py と同じ手法）。"""
+def _install_answer_post(monkeypatch, seq):
+    """`sherpa.agentic_search._post`（簡易チャットの薄いループが実際に HTTP 送信する唯一の入口）を
+    固定応答列に差し替える。ES/グラフは不可にし、提示ツールを ripgrep_search/read_around のみに絞る
+    （可用性の短 TTL キャッシュは前のテストの差し替えが残らないよう都度リセットする）。
+    """
     from sherpa import agentic_search as A
     monkeypatch.setattr(A, "es_index", A.es_index)
     monkeypatch.setattr(A.es_index, "available", lambda: False)
     monkeypatch.setattr(A, "_graph_available", lambda: False)
-    # ツール可用性は短 TTL でプロセス内にキャッシュされる。前のテストが差し替えた可用性が
-    # 残ると、このテストの差し替え（ES あり/なし）が効かず提示ツールが食い違う＝毎回リセットする。
     monkeypatch.setattr(A, "_tools_availability_cache", {"at": 0.0, "data": None})
     monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
 
 
-_RESEARCH_SUCCESS_SEQ = [
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c1", "function": {"name": "ripgrep_search",
-         "arguments": '{"query":"税率改定に伴う障害の記録"}'}}]}}]},
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c2", "function": {"name": "read_around",
-         "arguments": f'{{"doc_id":"{_RESEARCH_REAL_DOC}","line":1}}'}}]}}]},
-    # finish_reason=stop（自然完了 allowlist）が無いと帰属呼び出し（次項）自体が省略される
-    # （`agentic_search._is_natural_completion` 参照）。
-    {"choices": [{"message": {"content": "税率改定に伴う障害です。"}, "finish_reason": "stop"}]},
-    # attribution 呼び出し（EV-0）: `submit_attribution` の tool 強制呼び出しへの応答形
-    # （`agentic_search.attribute_openai_style` 参照・プレーンな JSON content ではない）。
-    # 1回目は `openai_style` 自身が内部で行う帰属（重複排除**前**の添字・research_service は
-    # この結果を使わない）。2回目は `research_service.run_research` が最終重複排除の**後**に
-    # やり直す帰属（Evidence Packet の `used` へ実際に反映されるのはこちら）。
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c3", "function": {"name": "submit_attribution", "arguments": '{"used":["ev-1"]}'}}]}}]},
-    {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c4", "function": {"name": "submit_attribution", "arguments": '{"used":["ev-1"]}'}}]}}]},
-]
-
-
-def test_ext_research_requires_api_key():
-    if not _try_init():
-        pytest.skip("DB down")
-    r = _research({"world": "v1", "query": "税率改定の障害は？"})
-    assert r.status_code == 401, r.text
-
-
-def test_ext_research_unknown_world_404():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"research404-{sfx}")
-    _logout()
-
-    r = _research({"world": "no-such-world-xyz", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_ext_research_unknown_scope_422():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"research422-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"]},
-                  api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-def test_ext_research_param_limits_rejected_with_422():
-    """反復上限/件数上限/タイムアウトは Pydantic Field 制約（`/ext/v1/search` の k/depth/weights と
-    同じ自動バリデーション経路）——範囲外は 422（LLM を一切呼ばない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchlimits-{sfx}")
-    _logout()
-
-    for bad in ({"max_iterations": 13}, {"max_iterations": 0}, {"max_results": 0},
-               {"max_results": 51}, {"timeout_s": 4}, {"timeout_s": 181}):
-        r = _research({"world": "v1", "query": "x", **bad}, api_key=issued["key"])
-        assert r.status_code == 422, f"{bad}: {r.text}"
-
-
-def test_ext_research_world_scope_403():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key_scoped(f"research403-{sfx}", ["v1"])
-    _logout()
-
-    r = _research({"world": "other-world-xyz", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 403, r.text
-
-
-def test_ext_research_model_not_allowed_400():
-    """許可リスト外の model は 400（LLM を一切呼ばない・ネットワーク到達不要）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchbadmodel-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "model": "not-a-real-model"}, api_key=issued["key"])
-    assert r.status_code == 400, r.text
-
-
-def test_ext_research_openai_unavailable_returns_503_no_fallback(monkeypatch):
-    """model が openai 側カタログに一致する値でも、openai_api_key 未設定なら 503（黙って ollama へ
-    フォールバックしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})   # cloud_provider 未選択＝鍵解決は常に None
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchnokey-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "model": "gpt-5.4-mini"}, api_key=issued["key"])
-    assert r.status_code == 503, r.text
-
-
-def test_ext_research_unknown_provider_422():
-    """PART-4a: `provider` は ollama/openai の2択のみ（pydantic Literal・LLM を一切呼ばない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchbadprovider-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "provider": "gemini"}, api_key=issued["key"])
-    assert r.status_code == 422, r.text
-
-
-def test_ext_research_provider_openai_without_key_returns_503_fixed_message(monkeypatch):
-    """PART-4a: `provider=openai` を明示指定し、中央キー未設定なら 503＋固定文言
-    （`keys.NO_CENTRAL_KEY_MESSAGE`・黙って ollama へフォールバックしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})   # openai_api_key 未設定
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchprovidernokey-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x", "provider": "openai"}, api_key=issued["key"])
-    assert r.status_code == 503, r.text
-    assert r.json()["detail"] == keys.NO_CENTRAL_KEY_MESSAGE
-
-
-def test_ext_research_provider_openai_routes_to_openai_when_model_omitted(monkeypatch):
-    """PART-4a: `model` 省略・`provider=openai` 明示指定時は、管理者設定の既定（ollama）ではなく
-    openai 側カタログの既定モデルを使って openai 経路を呼ぶ（provider_used=="openai" で固定）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings",
-                        lambda **kw: {"openai_api_key": "sk-fake-test-key-for-provider-test"})
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchproveropenai-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？", "provider": "openai"},
-                  api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["provider_used"] == "openai"
-    assert body["model_used"] == "gpt-5.4-mini"
-
-
-def test_ext_research_provider_omitted_uses_admin_default_provider_setting(monkeypatch):
-    """リクエストの `provider` を省略した場合、管理者設定 `research_default_provider`
-    （既定 ollama）がハードコード既定より優先される——ここでは "openai" に設定した状態を模し、
-    明示指定なしでも openai 経路が呼ばれることを確認する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    monkeypatch.setattr(store, "get_system_settings",
-                        lambda **kw: {"openai_api_key": "sk-fake-test-key-for-provider-test",
-                                     "research_default_provider": "openai"})
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchdefaultopenai-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["provider_used"] == "openai"
-    assert body["model_used"] == "gpt-5.4-mini"
-
-
-def test_ext_research_ollama_default_success_with_evidence(monkeypatch):
-    """model 省略＝既定 Ollama。Evidence Packet（Committed Evidence）付きで 200 を返す。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchok-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["world"] == "v1"
-    assert body["provider_used"] == "ollama"
-    assert body["model_used"] == "qwen2.5"
-    # iterations（可視ステップ数=ツール呼び出し2回）と llm_calls（課金相当=ツール2回+最終合成+
-    # 帰属呼び出し1回〔内部のみ・単一 citation で ev-N 採番がずれないため研究サービス側の再帰属は
-    # 発行されない・RV12 是正で二重発行を解消〕の計4回）は一致しない値であることを固定する。
-    assert body["iterations"] == 2
-    assert body["llm_calls"] == 4
-    assert body["answer"]
-    packet = body["evidence_packet"]
-    assert packet["investigation_status"] == "sufficient"
-    assert packet["evidence"], "Evidence Packet に evidence が1件も無い"
-    ev = packet["evidence"][0]
-    assert ev["source_path"] == _RESEARCH_REAL_DOC
-    assert ev["evidence_id"] == "ev-1"
-
-
-def test_ext_research_es_search_hit_without_line_number_normalizes_span_to_none(monkeypatch):
-    """RV12 是正の固定: 行番号を持たない ES/RAG ヒット（`span=[None, None]`）が Evidence Packet の
-    `source_span` へそのまま転記されると、応答モデル（`ExtEvidenceItem.source_span: list[int] |
-    None`）の Pydantic 検証で 500 になる——API 境界（`ext_api._normalize_evidence_spans`）で
-    `None` へ正規化し、200 で返すことを固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import agentic_search as A
-
-    monkeypatch.setattr(A, "es_index", A.es_index)
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: False)
-    monkeypatch.setattr(A, "_tools_availability_cache", {"at": 0.0, "data": None})   # 前テストの可用性を持ち越さない
-
-    # `es_search`（rag_chunks 由来で行番号を持たない想定）が実在 doc への citation を
-    # `span=[None, None]` で返すケースを再現する（`agentic_search.run_tool` の es_search 分岐が
-    # `[h.get("line"), h.get("line")]` を組む際、`line` 欠落だとこの形になる）。
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_RESEARCH_REAL_DOC},
-               [{"doc_id": _RESEARCH_REAL_DOC, "span": [None, None], "quote": "本文", "ext": ".md"}], [])
-
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "es_search", "arguments": '{"query":"x"}'}}]}}]},
-        {"choices": [{"message": {"content": "見つかりました。"}, "finish_reason": "stop"}]},
-    ]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchspan-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "x"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    packet = r.json()["evidence_packet"]
-    assert packet["evidence"], "Evidence Packet に evidence が1件も無い"
-    for ev in packet["evidence"]:
-        assert ev["source_span"] is None or all(isinstance(x, int) for x in ev["source_span"])
-
-
-def test_ext_research_max_results_caps_evidence_count(monkeypatch):
-    """`max_results` は Evidence Packet の `evidence` 件数上限として働く。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchcap-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？", "max_results": 1},
-                  api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert len(r.json()["evidence_packet"]["evidence"]) <= 1
-
-
-def test_ext_research_audits_model_used_and_ev_ids(monkeypatch):
-    """監査行に model_used/provider_used/iterations と ev-* の一覧が残る（§8.3/§8.4）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchaudit-{sfx}")
-    _logout()
-    rid = f"probe-research-audit-{sfx}"
-
-    r = client.post(
-        "/ext/v1/research", json={"world": "v1", "query": "税率改定の障害は？"},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 200, r.text
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT actor_user_id, resource_type, detail FROM audit_log WHERE request_id=%s", (rid,)
-        ).fetchone()
-    assert row is not None
-    assert row["actor_user_id"] == f"ext:{issued['id']}"
-    assert row["resource_type"] == "ext_research"
-    assert row["detail"]["model_used"] == "qwen2.5"
-    assert row["detail"]["provider_used"] == "ollama"
-    assert row["detail"]["llm_calls"] == 4
-    assert row["detail"]["ev_ids"] == ["ev-1"]
-
-
-def test_ext_research_usage_metering_records_per_key(monkeypatch):
-    """利用量の記録は常時ON（TOGGLE-RM・2026-09-03）: キー別 usage_events へ記録される
-    （§8.3・kind='research'）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchusage-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-
-    with store._connect() as c:
-        rows = c.execute(
-            "SELECT provider, model, calls FROM usage_events WHERE kind='research' AND user_id=%s",
-            (f"ext:{issued['id']}",)
-        ).fetchall()
-    assert rows, "usage_events に research kind の行が記録されていない"
-    assert rows[-1]["provider"] == "ollama"
-    assert rows[-1]["model"] == "qwen2.5"
-    assert rows[-1]["calls"] == 4   # llm_calls と一致する実測値（ツール2回+最終合成+帰属呼び出し1回）
-
-
-def test_ext_research_pins_resolved_root(monkeypatch):
-    """`research_service.run_research` は `ext_api._resolve_world_or_error`（preflight・ロック**前**の
-    値）を使わず、共有ロック（`world_lock_shared`）を保持した状態で自前に `worlds.
-    resolve_external_world` を（再）解決してから `worlds.pin_world_root` で固定することを配線レベルで
-    固定する（TOCTOU 対策の実地確認。`tests/unit/test_worlds_pin_root.py` は pin 機構自体の契約、
-    `tests/integration/test_world_lock_shared_semantics.py` はロックの相互排他そのものを検証——
-    こちらは実際にその2つが呼ばれることを確認する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _install_agentic_post(monkeypatch, list(_RESEARCH_SUCCESS_SEQ))
-    from sherpa import worlds
-
-    seen = {}
-    real_pin = worlds.pin_world_root
-    real_resolve = worlds.resolve_external_world
-
-    def spy_pin(world_id, root):
-        seen["world_id"] = world_id
-        seen["root"] = root
-        return real_pin(world_id, root)
-
-    def spy_resolve(world_id, **kw):
-        seen["resolve_called"] = seen.get("resolve_called", 0) + 1
-        return real_resolve(world_id, **kw)
-
-    monkeypatch.setattr(worlds, "pin_world_root", spy_pin)
-    monkeypatch.setattr(worlds, "resolve_external_world", spy_resolve)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchpin-{sfx}")
-    _logout()
-
-    r = _research({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    assert seen["world_id"] == "v1"
-    assert seen["root"] == worlds.world_dir("v1")
-    assert seen["resolve_called"] >= 1, "研究実行経路が自前で world を再解決していない"
-
-
-def test_ext_research_overall_timeout_returns_504(monkeypatch):
-    """`timeout_s`（リクエスト全体のデッドライン）超過は 504（黙った空 200 にしない）。
-
-    実時間を待たない: `research_service.threading.Timer` を即時発火する fake に差し替え、
-    `stop_event` がループ冒頭（初回 `_post` の前）で立った状態を作る——`agentic_search.openai_style`
-    は `stop_event` が立っていれば `final` を yield せず終了する契約（既存挙動・agentic_search.py
-    docstring）ため、LLM 呼び出し自体が一度も発行されない decisive なタイムアウト再現になる。
+def test_ext_answer_sources_only_real_touched_verified_docs(monkeypatch):
+    """出典（sources）は、この回答中に実際に道具で触れ、かつ実在確認できた doc_id だけ。
+    往復（最大3回）・1往復あたりの道具呼び出し（内部上限4回）のどちらも超えない範囲に収まる。
     """
     if not _try_init():
         pytest.skip("DB down")
-    from sherpa import research_service
-
-    class _ImmediateTimer:
-        def __init__(self, interval, function):
-            self._function = function
-
-        def start(self):
-            self._function()   # デッドライン到達を即座に模擬（実待機なし）
-
-        def cancel(self):
-            pass
-
-    monkeypatch.setattr(research_service.threading, "Timer", _ImmediateTimer)
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchtimeout-{sfx}")
-    _logout()
-    rid = f"probe-research-timeout-{sfx}"
-
-    r = client.post(
-        "/ext/v1/research", json={"world": "v1", "query": "税率改定の障害は？", "timeout_s": 5},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
-    assert r.status_code == 504, r.text
-    assert "制限時間" in r.json()["detail"]
-
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT reason FROM audit_log WHERE request_id=%s", (rid,)).fetchone()
-    assert row is not None
-    assert row["reason"] == "timeout"   # `_HTTP_OUTCOME_REASON[504]`
-
-
-def test_ext_research_preflight_exceeding_deadline_returns_504_not_422(monkeypatch):
-    """RV5 是正の固定: scope_paths 走査（preflight）自体がリクエスト全体の共有デッドラインを
-    使い切るほど遅い場合、走査結果が「不明な範囲」であっても 422 ではなく 504 を返す——preflight
-    と `run_research` が同じ絶対期限（ハンドラ入口で確定）を共有する契約
-    （`ext_api.ext_research`/`research_service.run_research` docstring 参照）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchpreflightdl-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    def _slow_invalid_scope(*a, **kw):
-        clock["t"] = 1000.0   # scope 走査がデッドラインを丸ごと使い切ったことにする
-        return False
-
-    monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _slow_invalid_scope)
-
-    r = _research({"world": "v1", "query": "x", "scope_paths": ["no-such-scope-xyz"],
-                  "timeout_s": 5}, api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_preflight_elapsed_time_shares_absolute_deadline_with_run_research(monkeypatch):
-    """RV6 是正の固定: `run_research` へは preflight 消費後の `timeout_s`（残り秒数）を再計算して
-    渡すのではなく、ハンドラ入口で確定した絶対期限（`absolute_deadline`）そのものを渡す——
-    別々に `time.monotonic()` を起点に変換し直すと、整数秒への切り上げ＋変換〜呼び出しに実際に
-    かかる僅かな時間の両方が積み重なり、元の期限を最大約1秒超えてから 200 を返しうる（RV6・
-    旧実装は `timeout_s=max(1, math.ceil(_remaining()))` を渡し直していた＝RV5 時点の教訓）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import citations, ext_api, research_service
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchbudget-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    real_resolve = ext_api._resolve_world_or_error
-
-    def _slow_resolve(world, **kw):
-        clock["t"] = 12.0   # world 解決（preflight）に12秒かかったことにする
-        return real_resolve(world)
-
-    monkeypatch.setattr(ext_api, "_resolve_world_or_error", _slow_resolve)
-
-    captured: dict = {}
-
-    def _fake_run_research(**kw):
-        captured.update(kw)
-        return {"world": kw["world"], "query": kw["query"], "answer": "",
-                "evidence_packet": citations.build_evidence_packet(
-                    task_id="t", investigation_status="insufficient"),
-                "model_used": "qwen2.5", "provider_used": "ollama",
-                "iterations": 0, "llm_calls": 0, "used_ev_ids": []}
-
-    monkeypatch.setattr(research_service, "run_research", _fake_run_research)
-
-    r = _research({"world": "v1", "query": "x", "timeout_s": 30}, api_key=issued["key"])
-    assert r.status_code == 200, r.text
-    # 元の timeout_s（30）はそのまま渡る（メッセージ表示用・切り詰めない）。
-    assert captured["timeout_s"] == 30
-    # 絶対期限はハンドラ入口の時刻（0.0）+30 のまま——preflight が12秒使っても「期限」という
-    # 固定点自体は動かない（動くのは run_research 内部が見る「残り」だけ）。
-    assert captured["absolute_deadline"] == 30.0
-
-
-def test_ext_research_slow_world_resolver_404_becomes_504_when_deadline_exceeded(monkeypatch):
-    """RV6 是正の固定: world resolver（`worlds.resolve_external_world`）自体が長引いた末に
-    「未登録」（404 相当）で失敗した場合でも、その時点で既にリクエスト全体のデッドラインを
-    超えていれば 404 ではなく 504 を返す——`_resolve_world_or_error` 自身は期限を見ずに直接
-    404/503 を送出するだけなので、呼び出し元（`ext_research`）が resolver の失敗を捕捉して
-    判定する契約を固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api, worlds
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchslow404-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    def _slow_not_found(world_id, **kw):
-        clock["t"] = 1000.0   # world 解決自体がデッドラインを丸ごと使い切ったことにする
-        return worlds.ExternalWorldResolution("not_found", None)
-
-    monkeypatch.setattr(ext_api.worlds, "resolve_external_world", _slow_not_found)
-
-    r = _research({"world": "no-such-world-xyz", "query": "x", "timeout_s": 5},
-                  api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_slow_world_resolver_503_becomes_504_when_deadline_exceeded(monkeypatch):
-    """RV6 是正の固定: 上と同じ契約だが、resolver が registry 到達不可（`ExternalResolverError`
-    →503相当）で失敗する場合。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api, worlds
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchslow503-{sfx}")
-    _logout()
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(ext_api.time, "monotonic", lambda: clock["t"])
-
-    def _slow_unreachable(world_id, **kw):
-        clock["t"] = 1000.0
-        raise worlds.ExternalResolverError("simulated registry unreachable")
-
-    monkeypatch.setattr(ext_api.worlds, "resolve_external_world", _slow_unreachable)
-
-    r = _research({"world": "v1", "query": "x", "timeout_s": 5}, api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_fast_world_resolver_404_stays_404_when_deadline_not_exceeded():
-    """対照実験: resolver が期限内に速く失敗した場合は、これまでどおり素の 404 のまま
-    （デッドライン優先の再分類は「期限を超えた場合だけ」に限定されることの固定）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchfast404-{sfx}")
-    _logout()
-
-    r = _research({"world": "no-such-world-xyz", "query": "x", "timeout_s": 30},
-                  api_key=issued["key"])
-    assert r.status_code == 404, r.text
-
-
-def test_ext_research_scope_walk_deadline_exceeded_becomes_504(monkeypatch):
-    """RV6 是正の固定: scope_paths の木走査自体（`scope_infer.safe_files` の `deadline` 引数）が
-    デッドラインを超えて中断した場合（`scope_infer.ScopeWalkDeadlineExceeded`）、422/503 ではなく
-    504 を返す。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import ext_api, scope_infer
-
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchscopewalkdl-{sfx}")
-    _logout()
-
-    def _boom_walk(*a, **kw):
-        raise scope_infer.ScopeWalkDeadlineExceeded("simulated deadline mid-walk")
-
-    monkeypatch.setattr(ext_api.scope_mod, "valid_scope_paths", _boom_walk)
-
-    r = _research({"world": "v1", "query": "x", "scope_paths": ["4期"], "timeout_s": 5},
-                  api_key=issued["key"])
-    assert r.status_code == 504, r.text
-
-
-def test_ext_research_records_partial_cost_and_audit_on_mid_failure(monkeypatch):
-    """途中で LLM 呼び出しが失敗しても、それまでの llm_calls 分は metering に記録され、
-    監査 detail にも解決済み model_used/provider_used/llm_calls が残る。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import agentic_search as A
-
-    monkeypatch.setattr(A, "es_index", A.es_index)
-    monkeypatch.setattr(A.es_index, "available", lambda: False)
-    monkeypatch.setattr(A, "_graph_available", lambda: False)
     seq = [
+        # 0件ヒットのダミー語——このラウンドでは何も touch しない（read_around だけが唯一の
+        # 「触れた doc_id」になるようにし、他資料の偶発ヒットで assert が揺れないようにする）。
         {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAXCALC"}'}}]}}]},
+            {"id": "c1", "function": {"name": "ripgrep_search",
+             "arguments": '{"query":"該当なしのダミー語xyz99"}'}}]}}]},
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c2", "function": {"name": "read_around",
+             "arguments": f'{{"doc_id":"{_ANSWER_REAL_DOC}","line":1}}'}}]}}]},
+        {"choices": [{"message": {"content": "障害の記録を確認しました。"}, "finish_reason": "stop"}]},
     ]
-
-    def failing_post(url, headers, body, timeout=90):
-        if seq:
-            return seq.pop(0)
-        raise ConnectionError("simulated network failure")
-
-    monkeypatch.setattr(A, "_post", failing_post)
+    _install_answer_post(monkeypatch, seq)
 
     sfx = _sfx()
     adm_uid, adm_pw = _mk_admin(sfx)
     _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchfail-{sfx}")
+    issued = _issue_key(f"answerok-{sfx}")
     _logout()
-    rid = f"probe-research-fail-{sfx}"
 
-    r = client.post(
-        "/ext/v1/research", json={"world": "v1", "query": "TAXCALCの仕様は？"},
-        headers={"X-API-Key": issued["key"], "X-Request-Id": rid})
+    r = _answer({"world": "v1", "query": "税率改定の障害は？"}, api_key=issued["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["answer"] == "障害の記録を確認しました。"
+    assert body["tool_calls"] == 2
+    assert body["unconfirmed"] is False
+    assert "unconfirmed_reason" not in body   # 確かめられた回答では添えない（契約）
+    assert [s["doc_id"] for s in body["sources"]] == [_ANSWER_REAL_DOC]
+
+
+def test_ext_answer_unconfirmed_when_no_verified_sources(monkeypatch):
+    """道具を一度も使わず（＝触れた doc_id が無く）回答した場合、出典0件のまま黙って消さず
+    `unconfirmed=True` を明示する（§7・C-EXT-ANSWER-01 不変条件）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    seq = [{"choices": [{"message": {"content": "資料からは確認できませんでした。"},
+                        "finish_reason": "stop"}]}]
+    _install_answer_post(monkeypatch, seq)
+
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    issued = _issue_key(f"answernosrc-{sfx}")
+    _logout()
+
+    r = _answer({"world": "v1", "query": "存在しない話題"}, api_key=issued["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sources"] == []
+    assert body["tool_calls"] == 0
+    assert body["unconfirmed"] is True
+    assert body["unconfirmed_reason"] is not None
+
+
+def test_ext_answer_round_trip_and_tool_call_limits_not_exceeded(monkeypatch):
+    """往復は最大3回・1往復あたりの道具呼び出しは内部上限4回を超えない——モデルが毎回5件の
+    道具呼び出しを要求し、かつ一度も回答を終えなくても、実行される道具呼び出しは
+    3往復×4件=12件で頭打ちになり、往復が尽きれば `unconfirmed=True`（黙って打ち切らない）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+
+    def _round_with_calls(n: int) -> dict:
+        calls = [{"id": f"r{n}-{i}", "function": {"name": "ripgrep_search",
+                 "arguments": '{"query":"該当なしのダミー語xyz"}'}} for i in range(5)]
+        return {"choices": [{"message": {"content": "", "tool_calls": calls}}]}
+
+    seq = [_round_with_calls(1), _round_with_calls(2), _round_with_calls(3)]
+    _install_answer_post(monkeypatch, seq)
+
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    issued = _issue_key(f"answerlimits-{sfx}")
+    _logout()
+
+    r = _answer({"world": "v1", "query": "限界まで道具を呼ぶ"}, api_key=issued["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["tool_calls"] == 12        # 3往復 × 1往復あたり上限4件（5件要求しても4件で頭打ち）
+    assert body["unconfirmed"] is True
+    assert body["unconfirmed_reason"].startswith("round_trip_limit")
+
+
+def test_ext_answer_world_scope_403():
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    issued = _issue_key_scoped(f"answer403-{sfx}", ["v1"])
+    _logout()
+
+    r = _answer({"world": "other-world-xyz", "query": "x"}, api_key=issued["key"])
+    assert r.status_code == 403, r.text
+
+
+def test_ext_answer_llm_unavailable_returns_503_no_fallback(monkeypatch):
+    """既定 AI（管理者設定・ここでは openai へ固定）が未接続（中央キー未設定）なら 503——
+    黙って別プロバイダへフォールバックしない（`simple_chat._resolve_llm` は同モジュールの
+    `resolve_model_and_provider` を使う）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    monkeypatch.setattr(store, "get_system_settings",
+                        lambda **kw: {"research_default_provider": "openai"})
+
+    sfx = _sfx()
+    adm_uid, adm_pw = _mk_admin(sfx)
+    _login(adm_uid, adm_pw)
+    issued = _issue_key(f"answernokey-{sfx}")
+    _logout()
+
+    r = _answer({"world": "v1", "query": "x"}, api_key=issued["key"])
     assert r.status_code == 503, r.text
 
-    with store._connect() as c:
-        audit_row = c.execute(
-            "SELECT detail FROM audit_log WHERE request_id=%s", (rid,)).fetchone()
-        usage_rows = c.execute(
-            "SELECT provider, model, calls FROM usage_events WHERE kind='research' AND user_id=%s",
-            (f"ext:{issued['id']}",)).fetchall()
-    assert audit_row is not None
-    assert audit_row["detail"]["model_used"] == "qwen2.5"
-    assert audit_row["detail"]["provider_used"] == "ollama"
-    # 成功1回（ripgrep_search）+失敗1回分の送信——ただし `ConnectionError` は `OSError` の一種
-    # として `agentic_search._retryable_post_error` の再試行対象に入るため、`_send` が同一
-    # プロバイダ内で最大 `_POST_RETRY_ATTEMPTS`（2）回まで再試行する（初回+再試行2回=3回試行）。
-    # 実際に発行を試みた回数を数える契約（`llm_calls`/usage_events 双方）のため、失敗した
-    # 再試行分もすべて計上される＝1（成功）+3（失敗側の全試行）=4。
-    assert audit_row["detail"]["llm_calls"] == 4
-    assert usage_rows, "失敗時も usage_events へ記録される"
-    assert usage_rows[-1]["calls"] == 4
 
-
-def test_ext_research_openapi_subset_includes_research():
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    adm_uid, adm_pw = _mk_admin(sfx)
-    _login(adm_uid, adm_pw)
-    issued = _issue_key(f"researchopenapi-{sfx}")
-    _logout()
-
-    r = client.get("/ext/v1/openapi.json", headers={"X-API-Key": issued["key"]})
-    assert r.status_code == 200, r.text
-    assert "/ext/v1/research" in r.json()["paths"]

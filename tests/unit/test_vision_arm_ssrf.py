@@ -1,10 +1,6 @@
-"""VLM（vision_arm）の Ollama 送信が、自分の設定した接続先だけをこの呼び出しに閉じて許可する
-（`llm.ollama_url(..., extra_allowed=...)`）ことを固定する。
-
-VLM 専用 env（`SHERPA_VLM_OLLAMA_URL`）は一般の Ollama 許可リスト（`llm._allowlisted_hosts()`）へは
-もう加算されない（`tests/contract/test_ssrf_allowlist.py` 参照）。VLM 自身の送信が引き続き動くのは、
-`vision_arm._read_ollama` が自分の接続先だけを `extra_allowed` で明示的に許可しているため。
-`resolve_vlm()`（`_is_local_url`／`cloud_allowed`）で既に許可判定を済ませた接続先のみがここへ届く。
+"""VLM（vision_arm）の Ollama 送信は、中央の Ollama 接続先と同じ許可リスト
+（loopback＋管理画面の `ollama_allowlist`）で検証される。
+`resolve_vlm()`（`_ollama_url_permitted`／`cloud_allowed`）の判定を通った接続先だけがここへ届く。
 """
 from __future__ import annotations
 
@@ -14,7 +10,7 @@ import pytest
 
 from sherpa.ingest.arms import vision_arm
 
-_PRIVATE_UNLISTED = "http://192.168.50.50:11434"   # RFC1918・admin allowlist 未登録・env にも無い
+_PRIVATE = "http://192.168.50.50:11434"   # RFC1918
 
 
 @pytest.fixture
@@ -24,36 +20,52 @@ def tiny_image(tmp_path) -> Path:
     return p
 
 
-def test_read_ollama_allows_its_own_configured_destination_via_extra_allowed(monkeypatch, tiny_image):
-    """一般 allowlist に登録が無い接続先でも、VLM 自身が `cloud_allowed`（ここでは true にして
-    local 判定を迂回）で許可した接続先なら、`_read_ollama` は `extra_allowed` 経由で SsrfBlocked に
-    ならず実際に `llm.post_json` まで届く。"""
+def test_vlm_ollama_follows_central_url_and_admin_allowlist(monkeypatch, tiny_image):
+    """許可リストに載った接続先は `llm.post_json` まで届き、載っていない接続先は SsrfBlocked になる。"""
+    from sherpa import llm
     from sherpa.ingest.arms import vision_arm as va
     monkeypatch.setattr(va, "_cloud_allowed_now", lambda: True)
-
     calls = []
-
-    def _fake_post_json(url, headers, body, timeout=None):
-        calls.append(url)
-        return {"message": {"content": "読み取り結果"}}
-
-    monkeypatch.setattr("sherpa.llm.post_json", _fake_post_json)
+    monkeypatch.setattr("sherpa.llm.post_json",
+                        lambda url, headers, body, timeout=None: calls.append(url) or {"message": {"content": "読み取り結果"}})
     monkeypatch.setattr("sherpa.metering.acc_add", lambda *a, **kw: None)
+    cfg = {"ollama_url": _PRIVATE, "model": "qwen2.5vl"}
 
-    cfg = {"ollama_url": _PRIVATE_UNLISTED, "model": "qwen2.5vl"}
-    result = va._read_ollama(tiny_image, cfg, timeout=5)
-    assert result == "読み取り結果"
-    assert calls and calls[0].startswith(_PRIVATE_UNLISTED)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"ollama_allowlist": ["192.168.50.50:11434"]})
+    assert va._read_ollama(tiny_image, cfg, timeout=5) == "読み取り結果"
+    assert calls and calls[0].startswith(_PRIVATE)
 
-
-def test_read_ollama_without_extra_allowed_would_be_blocked(monkeypatch):
-    """回帰確認: `extra_allowed` を使わず一般の `assert_ollama_url_allowed` だけで同じ接続先を
-    検証すると拒否される（＝ `_read_ollama` の許可は本当に `extra_allowed` に依っている・
-    一般 allowlist が緩んだわけではないことの確認）。"""
-    from sherpa import llm
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {})
     with pytest.raises(llm.SsrfBlocked):
-        llm.assert_ollama_url_allowed(_PRIVATE_UNLISTED)
+        va._read_ollama(tiny_image, cfg, timeout=5)
+
+    # 接続先そのものは管理画面の中央の Ollama 接続先（未設定は既定）。環境変数は読まない。
+    monkeypatch.setenv("SHERPA_VLM_OLLAMA_URL", "http://10.9.9.9:11434")
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"ollama_url": "http://10.0.0.5:11434"})
+    assert vision_arm.vlm_config()["ollama_url"] == "http://10.0.0.5:11434"
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {})
+    assert vision_arm.vlm_config()["ollama_url"] == "http://localhost:11434"
+
+
+def test_resolve_vlm_ollama_uses_central_allowlist_not_ip_literal(monkeypatch):
+    """許可一覧にある DNS 名は cloud_allowed=false でも使え、許可されていない宛先は使えない。"""
+    monkeypatch.delenv("SHERPA_VLM_USABLE", raising=False)
+    host = "http://host.docker.internal:11434"
+    base = {"vlm": {"provider": "ollama"}, "ollama_url": host}
+    monkeypatch.setattr("sherpa.store.get_system_settings",
+                        lambda: {**base, "ollama_allowlist": ["host.docker.internal:11434"]})
+    assert vision_arm.resolve_vlm()["ollama_url"] == host
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: base)
+    assert vision_arm.resolve_vlm() is None
+
+
+def test_resolve_vlm_ollama_stops_when_central_url_unreadable(monkeypatch):
+    """中央の接続先を読めないときは localhost へ置き換えず、VLM を使えないものとして止める。"""
+    monkeypatch.delenv("SHERPA_VLM_USABLE", raising=False)
+    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"vlm": {"provider": "ollama"}})
+    monkeypatch.setattr("sherpa.keys.resolve_ollama_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    assert vision_arm.vlm_config()["ollama_url"] == ""
+    assert vision_arm.resolve_vlm() is None
 
 
 def test_openai_key_returns_none_for_invalid_cloud_provider(monkeypatch, caplog):

@@ -389,7 +389,7 @@ def test_tools_call_graph_schema_era_error_returns_structured_tool_error(monkeyp
     `graph_reingest_required`）で返す——Codex 側の `item["result"]` にそのまま載せるため。"""
     def _boom(name, args, world, scope_paths, **kw):
         raise M.GraphSchemaEraError(world, "old-era", lens="troubleshoot")
-    monkeypatch.setattr(M.agentic_search, "run_tool", _boom)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", _boom)
     resp = M.handle({"jsonrpc": "2.0", "id": 40, "method": "tools/call",
                      "params": {"name": "graph_neighbors", "arguments": {"name": "請求"}}})
     assert "error" not in resp                        # JSON-RPC プロトコルエラーではない
@@ -431,7 +431,7 @@ def test_tools_call_forwards_layer_to_run_tool(monkeypatch):
         captured["layer"] = kw.get("layer")
         return ({"hits": []}, set(), [], [])
 
-    monkeypatch.setattr(M.agentic_search, "run_tool", fake_run_tool)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", fake_run_tool)
     os.environ["SHERPA_MCP_LAYER"] = "docs"
     try:
         M.handle({"jsonrpc": "2.0", "id": 30, "method": "tools/call",
@@ -726,7 +726,7 @@ def test_graph_schema_era_writes_sidecar_error_entry_with_code_only(tmp_path, mo
 
     def _boom(name, args, world, scope_paths, **kw):
         raise M.GraphSchemaEraError(world, "old-era", lens="troubleshoot")
-    monkeypatch.setattr(M.agentic_search, "run_tool", _boom)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", _boom)
     resp = M.handle({"jsonrpc": "2.0", "id": 80, "method": "tools/call",
                      "params": {"name": "graph_neighbors", "arguments": {"name": "請求"}}})
     assert resp["result"]["isError"] is True
@@ -768,7 +768,7 @@ def test_large_tool_result_is_clipped_with_truncated_marker(monkeypatch):
     （呼出自体は失敗にしない・平文置換ではない）。1件も丸ごとは残せない予算でも `hits=[]` に
     縮退させず、先頭ヒットの本文を縮めて1件残す（`next_offset` を進めて重複拒否を避ける）。"""
     monkeypatch.setattr(M.agentic_search, "effective_tool_result_max_bytes", lambda **kw: 256)
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["x" * 1000]}, [], [], []))
     resp = M.handle({"jsonrpc": "2.0", "id": 90, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "x"}}})
@@ -786,38 +786,6 @@ def test_large_tool_result_is_clipped_with_truncated_marker(monkeypatch):
 # 文脈が空いてもリセットされず、到達後は本文系ツールが永続的に拒否されていた。1件あたりの予算
 # （`test_large_tool_result_is_clipped_with_truncated_marker` 等）は残る。
 
-def test_total_bytes_not_capped_beyond_former_ceiling(monkeypatch):
-    """累計が旧天井（1MiB）を大きく超える量を呼び続けても、本文系ツールは拒否されない
-    （受け入れ条件2・累計バイト予算の撤去）。"""
-    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "999999")   # 1件あたりの予算はここでは対象外
-    monkeypatch.setattr(M.agentic_search, "run_tool",
-                        lambda *a, **kw: ({"hits": ["y" * 50_000]}, [], [], []))
-    total_bytes = 0
-    for i in range(30):
-        r = M.handle({"jsonrpc": "2.0", "id": 100 + i, "method": "tools/call",
-                     "params": {"name": "ripgrep_search", "arguments": {"query": f"y{i}"}}})
-        assert r["result"]["isError"] is False, f"call {i} was rejected"
-        total_bytes += len(r["result"]["content"][0]["text"].encode("utf-8"))
-    assert total_bytes > 1024 * 1024, "旧天井(1MiB)を実際に超える量を送っていることの確認"
-
-
-def test_total_budget_hit_sidecar_entry_never_written(tmp_path, monkeypatch):
-    """累計予算の判定自体が無いため、サイドカーへ
-    `{"kind":"limit","field":"total_budget_hit"}` は一度も書かれない
-    （`sherpa/store/usage.py`・`stop_kind.py` が読むキー自体は撤去しない・値が常に立たないことの確認）。"""
-    sidecar = tmp_path / "sidecar.jsonl"
-    monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "999999")
-    monkeypatch.setattr(M.agentic_search, "run_tool",
-                        lambda *a, **kw: ({"hits": ["z" * 50_000]}, [], [], []))
-    for i in range(20):
-        M.handle({"jsonrpc": "2.0", "id": 200 + i, "method": "tools/call",
-                 "params": {"name": "ripgrep_search", "arguments": {"query": f"z{i}"}}})
-    entries = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines() if l.strip()] \
-        if sidecar.exists() else []
-    limit_entries = [e for e in entries if e.get("kind") == "limit" and e.get("field") == "total_budget_hit"]
-    assert limit_entries == []
-
 
 def test_tool_result_clipped_writes_sidecar_limit_entry(tmp_path, monkeypatch):
     """1件あたりのクリップが起きた呼出ごとにサイドカーへ
@@ -825,7 +793,7 @@ def test_tool_result_clipped_writes_sidecar_limit_entry(tmp_path, monkeypatch):
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
     monkeypatch.setattr(M.agentic_search, "effective_tool_result_max_bytes", lambda **kw: 64)
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["w" * 1000]}, [], [], []))
     M.handle({"jsonrpc": "2.0", "id": 110, "method": "tools/call",
              "params": {"name": "ripgrep_search", "arguments": {"query": "w"}}})
@@ -840,40 +808,11 @@ def test_tool_result_clipped_writes_sidecar_limit_entry(tmp_path, monkeypatch):
 # （`docs/archive/2026-09-21-調査台帳を文脈の外に置く.md` §1/§2）。MCP サーバはこの env をもう
 # 読まない——古い親プロセス由来の env が残っていても無視される。
 
-def test_tool_calls_not_capped_even_with_legacy_max_calls_env(monkeypatch):
-    """`SHERPA_MCP_TOOL_MAX_CALLS`（クイックの実効値相当・撤去済み）が env に残っていても、
-    17回以上呼んでも `tool_call_budget_exhausted` を返さない（受け入れ条件2・クイック相当）。"""
-    monkeypatch.setenv("SHERPA_MCP_TOOL_MAX_CALLS", "1")
-    monkeypatch.setattr(M.agentic_search, "run_tool",
-                        lambda *a, **kw: ({"hits": ["y"]}, [], [], []))
-    for i in range(20):
-        r = M.handle({"jsonrpc": "2.0", "id": 200 + i, "method": "tools/call",
-                     "params": {"name": "ripgrep_search", "arguments": {"query": f"y{i}"}}})
-        assert r["result"]["isError"] is False, f"call {i} was rejected"
-
-
-def test_tool_calls_exhausted_sidecar_entry_never_written(tmp_path, monkeypatch):
-    """呼び出し回数の判定自体が無いため、サイドカーへ
-    `{"kind":"limit","field":"tool_calls_exhausted"}` は一度も書かれない
-    （`sherpa/store/usage.py`・`stop_kind.py` が読むキー自体は撤去しない・値が常に立たないことの確認）。"""
-    sidecar = tmp_path / "sidecar.jsonl"
-    monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setenv("SHERPA_MCP_TOOL_MAX_CALLS", "1")
-    monkeypatch.setattr(M.agentic_search, "run_tool",
-                        lambda *a, **kw: ({"hits": ["z"]}, [], [], []))
-    for i in range(5):
-        M.handle({"jsonrpc": "2.0", "id": 210 + i, "method": "tools/call",
-                 "params": {"name": "ripgrep_search", "arguments": {"query": f"z{i}"}}})
-    entries = [json.loads(l) for l in sidecar.read_text(encoding="utf-8").splitlines() if l.strip()] \
-        if sidecar.exists() else []
-    limit_entries = [e for e in entries if e.get("kind") == "limit" and e.get("field") == "tool_calls_exhausted"]
-    assert limit_entries == []
-
 
 # ===== env 経由の予算上書き（`SHERPA_MCP_TOOL_BUDGET_BYTES`＝1件あたり）=====
 # 親プロセス（`CodexProvider`）が窓由来の実効値を解決した上でこの env を渡す（provider.py 参照）。
 # ここでは MCP サーバ側が「env があれば優先・無い/不正なら従来の effective_* 呼び出しへ
-# フォールバックする」ことだけを検証する（窓解決そのものは model_windows/agentic_search 側のテスト対象）。
+# フォールバックする」ことだけを検証する（窓解決そのものは agentic_search 側のテスト対象）。
 # `SHERPA_MCP_TOOL_BUDGET_TOTAL_BYTES`（累計・撤去済み）は読まれないことを別途検証する。
 
 def test_env_budget_bytes_takes_precedence_over_effective_call(monkeypatch):
@@ -882,29 +821,13 @@ def test_env_budget_bytes_takes_precedence_over_effective_call(monkeypatch):
     called = []
     monkeypatch.setattr(M.agentic_search, "effective_tool_result_max_bytes",
                         lambda **kw: called.append(1) or 999999)
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["x" * 1000]}, [], [], []))
     resp = M.handle({"jsonrpc": "2.0", "id": 120, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "x"}}})
     body = json.loads(resp["result"]["content"][0]["text"])
     assert body["truncated"] is True
     assert not called, "env 優先時は従来の effective_tool_result_max_bytes を呼ばない"
-
-
-def test_env_budget_total_bytes_is_no_longer_read(monkeypatch):
-    """`SHERPA_MCP_TOOL_BUDGET_TOTAL_BYTES`（累計予算・撤去済み）は設定されていても読まれない
-    ——`effective_tool_result_max_total_bytes` を呼ばず、本文系ツールも打ち切られない。"""
-    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_TOTAL_BYTES", "8")
-    called = []
-    monkeypatch.setattr(M.agentic_search, "effective_tool_result_max_total_bytes",
-                        lambda **kw: called.append(1) or 999999)
-    monkeypatch.setattr(M.agentic_search, "run_tool",
-                        lambda *a, **kw: ({"hits": ["y" * 100]}, [], [], []))
-    for i in range(5):
-        r = M.handle({"jsonrpc": "2.0", "id": 121 + i, "method": "tools/call",
-                     "params": {"name": "ripgrep_search", "arguments": {"query": f"y{i}"}}})
-        assert r["result"]["isError"] is False
-    assert not called, "累計予算の env は撤去済み＝effective_tool_result_max_total_bytes を呼ばない"
 
 
 @pytest.mark.parametrize("env_value", ["0", "-1", "not-a-number", ""])
@@ -914,7 +837,7 @@ def test_env_budget_bytes_invalid_falls_back_to_effective_call(monkeypatch, env_
     if env_value:
         monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", env_value)
     monkeypatch.setattr(M.agentic_search, "effective_tool_result_max_bytes", lambda **kw: 256)
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["x" * 1000]}, [], [], []))
     resp = M.handle({"jsonrpc": "2.0", "id": 123, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "x"}}})
@@ -927,8 +850,8 @@ def test_env_budget_bytes_invalid_falls_back_to_effective_call(monkeypatch, env_
 
 # ===== 実装ベース探索の回復・根本原因対応A: env の hits/window/bytes が run_tool へ実際に届く =====
 # `mcp_server.py` は従来 `run_tool()` へ `max_hits`/`window_cap`/`tool_result_max_bytes` を
-# 一切渡していなかった（管理画面の基準値も調べる深さの倍率も一切効かず、env 既定
-# `SHERPA_GREP_MAX_HITS`/`SHERPA_READ_WINDOW`・コード既定 262144 だけが効いていた）。
+# 一切渡していなかった（管理画面の基準値も調べる深さの倍率も一切効かず、
+# コード既定だけが効いていた）。
 
 def test_tools_call_forwards_env_hits_window_and_bytes_to_run_tool(monkeypatch):
     """`SHERPA_MCP_TOOL_MAX_HITS`/`_WINDOW_CAP`/`_BUDGET_BYTES`（親＝`CodexProvider` が
@@ -940,7 +863,7 @@ def test_tools_call_forwards_env_hits_window_and_bytes_to_run_tool(monkeypatch):
         captured.update(kw)
         return ({"hits": []}, set(), [], [])
 
-    monkeypatch.setattr(M.agentic_search, "run_tool", fake_run_tool)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", fake_run_tool)
     monkeypatch.setenv("SHERPA_MCP_TOOL_MAX_HITS", "77")
     monkeypatch.setenv("SHERPA_MCP_TOOL_WINDOW_CAP", "88")
     monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "99999")
@@ -961,7 +884,7 @@ def test_tools_call_hits_window_and_bytes_default_to_none_when_env_unset(monkeyp
         captured.update(kw)
         return ({"hits": []}, set(), [], [])
 
-    monkeypatch.setattr(M.agentic_search, "run_tool", fake_run_tool)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", fake_run_tool)
     for var in ("SHERPA_MCP_TOOL_MAX_HITS", "SHERPA_MCP_TOOL_WINDOW_CAP", "SHERPA_MCP_TOOL_BUDGET_BYTES"):
         monkeypatch.delenv(var, raising=False)
     M.handle({"jsonrpc": "2.0", "id": 201, "method": "tools/call",
@@ -1002,7 +925,7 @@ def test_tools_call_final_wire_text_stays_within_budget_for_quote_heavy_result(m
     """`handle()` が実際に返す JSON-RPC の `content[].text`（Codex が読む生のバイト列）自体が
     予算を超えない——`_clip_tool_result` 単体でなく end-to-end で保証する。"""
     monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "65536")
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"text": '"' * 70000}, [], [], []))
     resp = M.handle({"jsonrpc": "2.0", "id": 210, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "x"}}})
@@ -1017,8 +940,9 @@ def test_ripgrep_search_oversized_hit_set_absorbed_before_outer_clip(monkeypatch
     `{"truncated":..,"text":..}` の平文へ潰すことは起きない——`next_offset`・全ヒットの `doc_id`
     が構造ごと残る。"""
     monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", str(64 * 1024))
+    n_hits = M.agentic_search.MAX_HITS   # 既定の上限ちょうどのヒット数（続きの位置が付く）
     hits = [{"doc_id": f"doc{i:03d}.md", "path": f"/x/doc{i:03d}.md", "ext": ".md",
-            "line": 1, "span": [1, 1], "text": "x" * 5000, "match": "x"} for i in range(30)]
+            "line": 1, "span": [1, 1], "text": "x" * 5000, "match": "x"} for i in range(n_hits)]
     monkeypatch.setattr(M.agentic_search.grep_tool, "grep_search", lambda *a, **kw: hits)
     resp = M.handle({"jsonrpc": "2.0", "id": 211, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "x"}}})
@@ -1027,8 +951,8 @@ def test_ripgrep_search_oversized_hit_set_absorbed_before_outer_clip(monkeypatch
     assert len(wire_text.encode("utf-8")) <= 64 * 1024
     body = json.loads(wire_text)
     assert "clipped_bytes" not in body   # 外側クリップの平文置換が起きていない証跡
-    assert body.get("next_offset") == 30
-    assert [h["doc_id"] for h in body["hits"]] == [f"doc{i:03d}.md" for i in range(30)]
+    assert body.get("next_offset") == n_hits
+    assert [h["doc_id"] for h in body["hits"]] == [f"doc{i:03d}.md" for i in range(n_hits)]
 
 
 # ===== 調査台帳を文脈の外に置く §2/§5: 外側クリップ（最終防衛線）も構造を保ったまま続きを取れる形にする =====
@@ -1126,7 +1050,7 @@ def test_handle_reports_is_error_when_outer_clip_replaces_result_with_error(monk
     返っていた——`handle()` を通した最終応答で `isError=true` になることを固定する。"""
     monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "900")
     hit = {"doc_id": "d" * 1007, "line": 1, "text": "y" * 5000}   # doc_id 自体が予算超
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": [hit]}, set(), [], []))
     resp = M.handle({"jsonrpc": "2.0", "id": 700, "method": "tools/call",
                      "params": {"name": "ripgrep_search", "arguments": {"query": "x", "offset": 20}}})
@@ -1223,7 +1147,7 @@ def test_duplicate_tool_call_returns_error_without_calling_run_tool(monkeypatch)
         calls.append((name, dict(args)))
         return ({"hits": ["ok"]}, set(), [], [])
 
-    monkeypatch.setattr(M.agentic_search, "run_tool", fake_run_tool)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", fake_run_tool)
     r1 = M.handle({"jsonrpc": "2.0", "id": 300, "method": "tools/call",
                   "params": {"name": "ripgrep_search", "arguments": {"query": "同じ条件"}}})
     r2 = M.handle({"jsonrpc": "2.0", "id": 301, "method": "tools/call",
@@ -1237,7 +1161,7 @@ def test_duplicate_tool_call_returns_error_without_calling_run_tool(monkeypatch)
 
 def test_duplicate_tool_call_argument_order_is_order_independent(monkeypatch):
     """引数の順序が違うだけの呼出は同一視する（キー順に依存しない正規化）。"""
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"doc_id": "a.md", "text": "..."}, set(), [], []))
     r1 = M.handle({"jsonrpc": "2.0", "id": 302, "method": "tools/call",
                   "params": {"name": "read_doc", "arguments": {"doc_id": "a.md", "start_line": 1}}})
@@ -1253,7 +1177,7 @@ def test_duplicate_tool_call_writes_sidecar_limit_entry(tmp_path, monkeypatch):
     （`tool_result_clipped` と同じサイドカー経路・書式）。"""
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["ok"]}, set(), [], []))
     M.handle({"jsonrpc": "2.0", "id": 304, "method": "tools/call",
              "params": {"name": "ripgrep_search", "arguments": {"query": "重複検知テスト"}}})
@@ -1267,7 +1191,7 @@ def test_duplicate_tool_call_writes_sidecar_limit_entry(tmp_path, monkeypatch):
 def test_duplicate_tool_call_exempts_budget_exempt_tools(monkeypatch):
     """`_BUDGET_EXEMPT_TOOLS`（list_docs/folder_tree）は同一引数の繰り返し呼出でも重複扱いに
     しない（一覧のみの土台系ツールを繰り返し呼ぶこと自体は実害が無い）。"""
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"count": 0, "docs": []}, set(), [], []))
     args = {"path_prefix": ""}
     r1 = M.handle({"jsonrpc": "2.0", "id": 306, "method": "tools/call",
@@ -1280,7 +1204,7 @@ def test_duplicate_tool_call_exempts_budget_exempt_tools(monkeypatch):
 def test_duplicate_tool_call_cache_is_lru_bounded(monkeypatch):
     """件数上限（`_DUPLICATE_CALL_CACHE_MAX`）を超えたら最も古いキーから捨てる
     （無限に覚え続けてプロセスのメモリを圧迫しない）。"""
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["ok"]}, set(), [], []))
     for i in range(M._DUPLICATE_CALL_CACHE_MAX + 1):
         M.handle({"jsonrpc": "2.0", "id": 400 + i, "method": "tools/call",
@@ -1301,7 +1225,7 @@ def test_internal_search_truncated_writes_sidecar_limit_entry(tmp_path, monkeypa
     返したら `{"kind":"limit","field":"search_truncated"}` を書く（API 経路と同じ判定キー）。"""
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": ["a"], "truncated": True}, set(), [], []))
     M.handle({"jsonrpc": "2.0", "id": 600, "method": "tools/call",
              "params": {"name": "ripgrep_search", "arguments": {"query": "x"}}})
@@ -1315,7 +1239,7 @@ def test_internal_text_truncated_writes_sidecar_tool_result_clipped_entry(tmp_pa
     `{"kind":"limit","field":"tool_result_clipped"}` を書く（後段のバイト予算クリップとは別経路）。"""
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"text": "short", "text_truncated": True}, set(), [], []))
     M.handle({"jsonrpc": "2.0", "id": 601, "method": "tools/call",
              "params": {"name": "read_doc", "arguments": {"doc_id": "a.md"}}})
@@ -1329,7 +1253,7 @@ def test_internal_byte_clipped_flag_also_writes_tool_result_clipped_entry(tmp_pa
     同じ `tool_result_clipped` として数える。"""
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"text": "short", "byte_clipped": True}, set(), [], []))
     M.handle({"jsonrpc": "2.0", "id": 602, "method": "tools/call",
              "params": {"name": "file_head", "arguments": {"doc_id": "a.md"}}})
@@ -1344,7 +1268,7 @@ def test_internal_and_outer_clip_in_same_call_counted_once(tmp_path, monkeypatch
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
     monkeypatch.setattr(M.agentic_search, "effective_tool_result_max_bytes", lambda **kw: 64)
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"text": "x" * 1000, "text_truncated": True}, set(), [], []))
     M.handle({"jsonrpc": "2.0", "id": 603, "method": "tools/call",
              "params": {"name": "read_doc", "arguments": {"doc_id": "a.md"}}})
@@ -1358,7 +1282,7 @@ def test_internal_truncation_flags_ignored_for_tools_outside_either_set(tmp_path
     属さないツール（`folder_tree`）は `truncated`/`text_truncated` が立っていても何も書かない。"""
     sidecar = tmp_path / "sidecar.jsonl"
     monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"tree": {}, "truncated": True, "text_truncated": True},
                                           set(), [], []))
     M.handle({"jsonrpc": "2.0", "id": 604, "method": "tools/call",
@@ -1508,7 +1432,7 @@ def test_item_coverage_graph_schema_era_error_records_error_outcome(tmp_path, mo
 
     def _boom(name, args, world, scope_paths, **kw):
         raise M.GraphSchemaEraError(world, "old-era", lens="troubleshoot")
-    monkeypatch.setattr(M.agentic_search, "run_tool", _boom)
+    monkeypatch.setattr(M.tool_dispatch, "run_tool", _boom)
     resp = M.handle({"jsonrpc": "2.0", "id": 207, "method": "tools/call",
                      "params": {"name": "graph_neighbors", "arguments": {"name": "請求", "item": "e"}}})
     assert resp["result"]["isError"] is True
@@ -1590,7 +1514,7 @@ def test_duplicate_tool_call_excludes_item_from_key_and_backfills_new_item_cover
     に記録が残らない事故を防ぐ。"""
     directory = tmp_path / "investigation"
     monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
-    monkeypatch.setattr(M.agentic_search, "run_tool",
+    monkeypatch.setattr(M.tool_dispatch, "run_tool",
                         lambda *a, **kw: ({"hits": [{"doc_id": "a.md", "text": "x"}]}, set(), [], []))
     r1 = M.handle({"jsonrpc": "2.0", "id": 320, "method": "tools/call",
                   "params": {"name": "ripgrep_search",

@@ -1,21 +1,15 @@
-"""PDF→ページ画像のラスタ化ヘルパ（`vision`＝VLM 視覚読み取りが使う共有ユーティリティ）。
+"""PDF→ページ画像のラスタ化ヘルパ。`vision` アームが使う共有ユーティリティで、PDFium でページを画像化し、ページ数上限・ピクセル上限でクランプする。
 
-**tesseract の `ocr` アーム撤去（2026-07-08・視覚読み取りは vision（VLM）に一本化）**に伴い、
-`arms/ocr_arm.py` にあったラスタ化処理（PDFium でページを画像化・ページ数上限・ピクセル上限
-クランプ）をこの共有モジュールへ移設した。PyMuPDF/fitz はライセンス境界を単純にするため採用しない。
-唯一の呼び出し元は現在 `vision_arm`（テキスト層ゼロの
-PDF をページ画像化して VLM に渡す経路）。env 名は互換のため据え置く（改名しない）:
-`SHERPA_OCR_MAX_PAGES`（ページ数上限）・`SHERPA_OCR_MAX_PIXELS`（ラスタ化後の最長辺ピクセル上限）。
-
-決定的（同一入力・同一環境で同一出力）。ネットワーク I/O・LLM 呼び出しは行わない。
+env: `SHERPA_OCR_MAX_PAGES`（ページ数上限）。ラスタ化後の最長辺ピクセル上限は定数 `_MAX_PIXEL_SIDE`。決定的（同一入力・同一環境で同一出力）。ネットワーク I/O・LLM 呼び出しは行わない。
+設計: docs/design/rag.md「アーム一覧」
 """
 from __future__ import annotations
 
 import os
 
-_DEFAULT_MAX_PAGES = 20               # PDF のラスタ化対象ページ上限（暴走防止）
-_DEFAULT_MAX_PIXEL_SIDE = 4000        # ラスタ化後の最長辺の上限（px・巨大 MediaBox でのメモリ暴走防止・RV Med #5b）
-_RASTERIZE_DPI = 200                  # PDF→画像の解像度（固定＝決定的・ただし最長辺は上限でクランプされうる）
+_DEFAULT_MAX_PAGES = 20  # PDF のラスタ化対象ページ上限
+_MAX_PIXEL_SIDE = 4000  # ラスタ化後の最長辺の上限（px・巨大 MediaBox でのメモリ暴走防止）
+_RASTERIZE_DPI = 200  # PDF→画像の解像度（固定。最長辺は上限でクランプされうる）
 
 
 def pdf_rasterize_available() -> bool:
@@ -39,28 +33,14 @@ def _max_pages() -> int:
     return v if v > 0 else _DEFAULT_MAX_PAGES
 
 
-def _max_pixel_side() -> int:
-    """ラスタ化後の最長辺の上限（px・env `SHERPA_OCR_MAX_PIXELS`・不正/未設定は既定 4000・RV Med #5b）。"""
-    raw = os.environ.get("SHERPA_OCR_MAX_PIXELS")
-    if not raw:
-        return _DEFAULT_MAX_PIXEL_SIDE
-    try:
-        v = int(raw)
-    except ValueError:
-        return _DEFAULT_MAX_PIXEL_SIDE
-    return v if v > 0 else _DEFAULT_MAX_PIXEL_SIDE
-
-
 def _rasterize_page(page, dpi: int = _RASTERIZE_DPI):
-    """ページを固定 dpi でラスタライズし、最長辺が `_max_pixel_side()` を超えたら縮小倍率をクランプする
-    （巨大 MediaBox でのメモリ暴走防止・RV Med #5b）。決定的（同一入力・同一環境で同一出力）。
-    """
+    """ページを固定 dpi でラスタライズし、最長辺が `_MAX_PIXEL_SIDE` を超えたら縮小倍率をクランプする。決定的。"""
     width, height = page.get_size()
-    zoom = dpi / 72.0                                        # PDFium も PDF ポイント（72dpi）基準
+    zoom = dpi / 72.0  # PDFium も PDF ポイント（72dpi）基準
     longest = max(width, height) * zoom
-    cap = _max_pixel_side()
+    cap = _MAX_PIXEL_SIDE
     if longest > cap:
-        zoom *= cap / longest                                # 縮小倍率をクランプ（アスペクト比維持）
+        zoom *= cap / longest  # 縮小倍率をクランプ（アスペクト比維持）
     bitmap = page.render(scale=zoom)
     try:
         # PDFium の bitmap を閉じた後も使える独立した PIL 画像を返す。

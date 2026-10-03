@@ -143,109 +143,6 @@ def test_detail_does_not_leak_raw_exception_text():
         _restore()
 
 
-# ---- _ping_bedrock（Codex RV 修正: boto3/IMDS を撤去し純粋な env/ファイル存在チェックへ）----
-
-_AWS_ENV_KEYS = ("AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_AWS_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_PROFILE")
-
-
-def _clear_aws_env(monkeypatch) -> None:
-    for k in _AWS_ENV_KEYS:
-        monkeypatch.delenv(k, raising=False)
-
-
-def _select_bedrock(monkeypatch) -> None:
-    """A7: bedrock を選択中のクラウドプロバイダにする（既定 openai のままだと
-    `_ping_bedrock`/`_ai_check_bedrock` が SigV4/認証情報ファイルの確認より前に early return する）。"""
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"cloud_provider": "bedrock"})
-
-
-def test_ping_bedrock_does_not_reference_boto3():
-    """boto3 を import/呼び出ししないこと（IMDS 等ネットワークへ出ない約束の静的確認）。
-
-    docstring は経緯説明として "boto3" の語を含むため、生ソース文字列ではなく**コンパイル済み
-    バイトコードが参照する名前**（`co_names`＝import/属性アクセス/呼び出しの対象名）で判定する。
-    """
-    names = health._ping_bedrock.__code__.co_names
-    assert "boto3" not in names
-
-
-def test_ping_bedrock_fails_closed_without_any_credentials(monkeypatch, tmp_path):
-    _clear_aws_env(monkeypatch)
-    _select_bedrock(monkeypatch)
-    monkeypatch.setattr(health, "_aws_credentials_file", lambda: tmp_path / "no-such-file")
-    try:
-        health._ping_bedrock()
-        assert False, "認証情報が何も無いのに例外が出なかった"
-    except RuntimeError as e:
-        assert "見つかりません" in str(e)
-
-
-def test_ping_bedrock_ok_via_sigv4_env(monkeypatch, tmp_path):
-    """SigV4 の静的な手掛かり（AWS_ACCESS_KEY_ID/AWS_PROFILE）はインフラ管理のまま env を見る。"""
-    monkeypatch.setattr(health, "_aws_credentials_file", lambda: tmp_path / "no-such-file")
-    for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE"):
-        _clear_aws_env(monkeypatch)
-        _select_bedrock(monkeypatch)
-        monkeypatch.setenv(k, "dummy")
-        health._ping_bedrock()                     # 例外が出なければ OK
-
-
-def test_ping_bedrock_ok_via_central_key(monkeypatch, tmp_path):
-    """Bearer キー系（旧 AWS_BEARER_TOKEN_BEDROCK/ANTHROPIC_AWS_API_KEY）
-    はもう env を読まない。中央設定（system_settings.bedrock_api_key・cloud_provider=bedrock）経由で
-    解決されることを確認する（`sherpa.keys.resolve_api_key`）。"""
-    monkeypatch.setattr(health, "_aws_credentials_file", lambda: tmp_path / "no-such-file")
-    _clear_aws_env(monkeypatch)
-    monkeypatch.setattr("sherpa.store.get_system_settings",
-                        lambda: {"cloud_provider": "bedrock", "bedrock_api_key": "central-key"})
-    health._ping_bedrock()                          # 例外が出なければ OK
-
-
-def test_ping_bedrock_ok_via_credentials_file(monkeypatch, tmp_path):
-    _clear_aws_env(monkeypatch)
-    _select_bedrock(monkeypatch)
-    cred_file = tmp_path / ".aws" / "credentials"
-    cred_file.parent.mkdir(parents=True, exist_ok=True)
-    cred_file.write_text("[default]\naws_access_key_id = x\n", encoding="utf-8")
-    monkeypatch.setattr(health, "_aws_credentials_file", lambda: cred_file)
-    health._ping_bedrock()                          # 例外が出なければ OK（ファイル存在のみで判定）
-
-
-def test_ping_bedrock_reads_system_settings_exactly_once(monkeypatch, tmp_path):
-    """重大バグ是正（RV 4巡目 #7）: A7 判定（`selected_cloud_provider`）とキー解決
-    （`resolve_api_key`）を別々に読み直すと、途中の admin 更新でどちらか片方だけ新しい値を
-    見てしまう窓ができる。同じスナップショットを使い回し、DB 読取（`get_system_settings`）は
-    1回だけであることを spy で固定する。"""
-    _clear_aws_env(monkeypatch)
-    monkeypatch.setattr(health, "_aws_credentials_file", lambda: tmp_path / "no-such-file")
-    calls = []
-
-    def _spy():
-        calls.append(1)
-        return {"cloud_provider": "bedrock", "bedrock_api_key": "central-key"}
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", _spy)
-    health._ping_bedrock()
-    assert len(calls) == 1
-
-
-def test_ai_check_bedrock_reads_system_settings_exactly_once(monkeypatch):
-    """`_ai_check_bedrock` も同様に1回だけ読む（`_ping_bedrock` と同じ理由）。"""
-    calls = []
-
-    def _spy():
-        calls.append(1)
-        return {"cloud_provider": "openai"}   # bedrock 未選択＝早期 return する分岐で十分
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", _spy)
-    try:
-        health._ai_check_bedrock({})
-        assert False, "bedrock 未選択なのに例外が出なかった"
-    except RuntimeError:
-        pass
-    assert len(calls) == 1
-
-
 # ---- ai_snapshot（UI フィードバック4・2026-07-03: 管理者本人の設定で実接続確認） ----
 # _AI_COMPONENTS を偽 check に差し替えて検証する（実 AI へは一切繋がない）。
 
@@ -269,11 +166,11 @@ def _restore_ai() -> None:
     health._ai_cache = {}
 
 
-def test_ai_components_include_gemini():
-    """RV 相当の実装漏れ修正: 旧来の COMPONENTS（状態ドット用）は gemini を含んでいなかった。
-    ai_snapshot の対象には gemini が含まれる。"""
+def test_ai_components_cover_only_supported_providers():
+    """ai_snapshot の対象は openai/ollama/codex だけ（閉じたプロバイダ gemini/bedrock は含めない）。"""
     ids = [c[0] for c in health._AI_COMPONENTS]
-    assert "gemini" in ids, "gemini が AI ヘルスチェックの対象に含まれていない"
+    assert ids == ["openai", "ollama", "codex"]
+    assert all(c[0] not in ("gemini", "bedrock") for c in health.COMPONENTS)
 
 
 def test_ai_snapshot_passes_per_user_settings_to_each_check():
@@ -288,7 +185,7 @@ def test_ai_snapshot_passes_per_user_settings_to_each_check():
 
     _patch_ai_components({c[0]: _record(c[0]) for c in health._AI_COMPONENTS})
     try:
-        sentinel = {"openai_api_key": "sk-test-sentinel", "gemini_api_key": "AIza-test-sentinel"}
+        sentinel = {"openai_api_key": "sk-test-sentinel"}
         rows = health.ai_snapshot("admin", sentinel, force=True)
         assert all(c["ok"] for c in rows)
         for name, settings in received.items():
@@ -515,34 +412,6 @@ def test_ai_check_openai_strict_rejects_invalid_cloud_provider_without_probing(m
         graph_extract._probe = orig
 
 
-def test_ai_check_gemini_strict_rejects_invalid_cloud_provider_without_probing(monkeypatch):
-    import pytest
-    from sherpa import keys
-    from sherpa.ingest import graph_extract
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {
-        "personal_api_keys_allowed": True, "cloud_provider": "not-a-real-provider"})
-    probe_calls = []
-    orig = graph_extract._probe
-    graph_extract._probe = lambda cfg, timeout=None: (probe_calls.append(cfg) or (True, ""))
-    try:
-        with pytest.raises(keys.InvalidCloudProviderConfigError, match="not-a-real-provider"):
-            health._ai_check_gemini({"gemini_api_key": "gk-test"})
-        assert probe_calls == []
-    finally:
-        graph_extract._probe = orig
-
-
-def test_ai_check_bedrock_strict_rejects_invalid_cloud_provider_without_probing(monkeypatch):
-    import pytest
-    from sherpa import keys
-    monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {
-        "personal_api_keys_allowed": True, "cloud_provider": "not-a-real-provider",
-        "bedrock_api_key": "bk-test"})
-    with pytest.raises(keys.InvalidCloudProviderConfigError, match="not-a-real-provider"):
-        health._ai_check_bedrock({"bedrock_api_key": "bk-test"})
-
-
 def test_ai_check_openai_does_not_leak_reflected_url_into_health_log(monkeypatch, caplog):
     """custom/Azure 上流がエラー本文へ要求 URL を echo しても、health のサーバログ
     （`health._logger.warning`）に admin だけが設定した base URL の path（デプロイ名）・query
@@ -627,36 +496,6 @@ def test_ai_check_openai_rejects_placeholder_without_calling_probe(monkeypatch):
         assert called["n"] == 0, "プレースホルダなのに _probe（実API呼び出し）まで進んでいる"
     finally:
         graph_extract._probe = orig
-
-
-def test_ai_check_bedrock_passes_short_explicit_timeout_to_probe(monkeypatch):
-    """Bedrock も同様に `BedrockProvider.probe(timeout=...)` へ health 用の短い timeout を渡す。
-
-    A7: bedrock を選択中のプロバイダにする（既定 openai のままだと `_ai_check_bedrock` が
-    `sherpa.keys.selected_cloud_provider` のゲートで早期に RuntimeError を出す）。
-    """
-    from sherpa import agents
-
-    monkeypatch.setattr("sherpa.store.get_system_settings",
-                        lambda: {"cloud_provider": "bedrock", "personal_api_keys_allowed": True})
-
-    captured = {}
-
-    class _FakeBedrockProvider:
-        def __init__(self, *_a, **_k):
-            pass
-
-        def probe(self, timeout=None):
-            captured["timeout"] = timeout
-            return True, ""
-
-    orig = agents.BedrockProvider
-    agents.BedrockProvider = _FakeBedrockProvider
-    try:
-        health._ai_check_bedrock({"bedrock_api_key": "test-key"})
-        assert captured["timeout"] == health._AI_TIMEOUT
-    finally:
-        agents.BedrockProvider = orig
 
 
 def test_ai_check_codex_uses_key_auth_on_azure_endpoint(monkeypatch):
@@ -1011,16 +850,6 @@ def test_search_snapshot_marks_probe_exceeding_deadline_as_timeout(monkeypatch):
 
 # ===== 対象外（_NotApplicable）: 未設定/未選択のプロバイダを WARNING にしない（2026-09-04） =====
 
-def test_bedrock_unselected_is_not_applicable_not_warning(monkeypatch, caplog):
-    import logging
-    from sherpa import health, store
-    monkeypatch.setattr(store, "get_system_settings", lambda: {})   # cloud 未選択
-    with caplog.at_level(logging.DEBUG, logger="sherpa.health"):
-        out = health._check_one("bedrock", "b", "none", health._ping_bedrock, "hint")
-    assert out["ok"] is True and "対象外" in out["detail"]
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-
 def test_ollama_unconfigured_connection_refused_is_not_applicable(monkeypatch, caplog):
     import logging
     from sherpa import health, store, llm
@@ -1137,3 +966,5 @@ def test_ai_check_codex_ollama_requires_codex_model_pulled(monkeypatch):
         health._ai_check_codex({"codex_model_provider": "ollama"}, cat)
     monkeypatch.setattr("sherpa.llm.urlopen_no_redirect", _tags(["gpt-oss:20b"]))
     health._ai_check_codex({"codex_model_provider": "ollama"}, cat)
+
+

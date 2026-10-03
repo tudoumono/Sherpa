@@ -189,13 +189,19 @@ def _scene_clarify(page):
     page.wait_for_selector(".askcard", state="visible", timeout=20000)
 
 
-def _scene_kb_off(page):
-    _wait_brain(page)                             # バーが埋まるのを待つだけ（既定＝オフ）
+def _scene_kb_locked(page):
+    # 頭脳が簡易（モック既定）＝資料参照は「オン」固定（.locked）・調べ方等の行は隠れて案内が出る。
+    _wait_brain(page)
+    page.wait_for_selector("#kbtoggle.locked.on", state="visible", timeout=5000)
+    page.wait_for_selector("#simple-note", state="visible", timeout=5000)
 
 
 def _scene_scope_brain(page):
+    # 頭脳バッジのメニューを開き、選べる頭脳（Codex 調査・簡易）が並ぶ状態を撮る。
     _wait_brain(page)
     page.wait_for_selector("#scopesel", state="visible", timeout=5000)
+    page.click("#brainbadge")
+    page.wait_for_selector("#brainmenu .brainitem", state="visible", timeout=5000)
 
 
 def _scene_graph(page):
@@ -215,19 +221,6 @@ def _scene_graph_search(page):
     page.wait_for_function(
         "() => (document.getElementById('gcount')?.textContent || '').includes('検索結果')",
         timeout=10000)
-
-
-def _scene_graph_ask(page):
-    page.wait_for_function(
-        "() => (document.getElementById('gcount')?.textContent || '').includes('ノード')",
-        timeout=15000)
-    page.fill("#gask", "このナレッジベースはどこが弱い？ TAX-RATE に関係するものは？")
-    page.click("#gaskbtn")
-    page.wait_for_function(
-        "() => (document.getElementById('ganswer')?.textContent || '').trim().length > 0",
-        timeout=10000)
-    # サイドバーはスクロールするので、質問セクションを先頭に寄せてから撮る（回答と根拠が下端で切れない）。
-    page.evaluate("document.querySelector('.graphlegend section:has(#ganswer)').scrollIntoView({block:'start'})")
 
 
 def _scene_settings(page):
@@ -264,14 +257,10 @@ def _scene_es_search(page):
 
 
 def _scene_admin_settings(page):
-    # admin-settings.js は checkAdmin()（/auth/me）成功後に load()（/admin/settings）を呼ぶ。
-    # UI-TABS 化（2026-09-04）以降、アーム一覧（#arms-list）は「取り込み設定」タブの中＝既定タブでは
-    # 非表示。先にタブを選択してから描画完了（既定/固定中の判定文言）を待つ。
-    page.click('.tab-btn[data-tab="ingest"]')
-    page.wait_for_selector("#arms-list .armrow", state="visible", timeout=10000)
-    page.wait_for_function(
-        "() => (document.getElementById('arms-status')?.textContent || '').length > 0",
-        timeout=10000)
+    # 「調査・回答」タブ＝Codex 専用／取り込み・検索の共通設定／Codex の資料検索・関係探索の各区分を撮る。
+    page.click('.tab-btn[data-tab="research"]')
+    page.wait_for_selector("#research-codex-heading", state="visible", timeout=10000)
+    page.wait_for_selector("#research-shared-heading", state="attached", timeout=10000)
 
 
 SCENES: list[Scene] = [
@@ -298,13 +287,13 @@ SCENES: list[Scene] = [
           mock_kwargs={"stream_events": _CLARIFY_STREAM}),
     # --- 11. 使い方：範囲とAIの切り替え ---
     Scene("11-knowledge-toggle", "chat.html",
-          "入力欄付近のバー（ナレッジ参照トグル＝既定オフ）を切り出す",
-          setup=_scene_kb_off, crop=".cbar", is_chat=True),
+          "右ペイン下部「次の質問でやりたいこと」＝社内資料トグルがオン固定（簡易では調べ方等の行が隠れる）を切り出す",
+          setup=_scene_kb_locked, crop="#inquiry", is_chat=True),
     Scene("11-scope-brain", "chat.html",
-          "ナレッジ参照オンにして、範囲（フォルダ）と頭脳（AI）の選択が並ぶバーを切り出す",
-          setup=_scene_scope_brain, crop=".cbar", is_chat=True),
+          "頭脳バッジのメニューを開き、選べる頭脳（Codex 調査・簡易）が並ぶ画面を撮る",
+          setup=_scene_scope_brain, crop=None, is_chat=True),
     Scene("11-settings", "settings.html",
-          "設定画面（AI 接続：OpenAI/Gemini/Ollama/Codex のキー・モデル）を上部から",
+          "個人設定画面（チャットに使う AI の既定・自分の API キー）を上部から",
           setup=_scene_settings),
     # --- 20. 管理：資料の取り込み ---
     # S3-A: ingest-new.html は ingest.html に統合。上=資料フォルダ／下=取り込み状況を同一画面から撮る。
@@ -321,16 +310,13 @@ SCENES: list[Scene] = [
     Scene("21-graph-search", "graph.html",
           "関係=COPIES で絞り込み検索し、検索結果グラフを撮る",
           setup=_scene_graph_search, viewport=WIDE_VIEWPORT, settle_ms=1800),
-    Scene("21-graph-ask", "graph.html",
-          "グラフへの自然言語質問（右ペイン）＝管理チャットと根拠ノードを切り出す",
-          setup=_scene_graph_ask, crop=".graphlegend", viewport=WIDE_VIEWPORT, settle_ms=800),
     Scene("21-es-search", "ingest.html",
           "取り込み状況内の全文検索パネルで検索し、ヒット一覧カードを切り出す",
           setup=_scene_es_search, crop=".es-card", routes=routes_es_search),
     # --- 30. システム管理 ---
     Scene("24-admin-settings", "admin-settings.html",
-          "システム管理画面（取り込み設定・旧形式変換・視覚読み取りAI・管理メニュー）を上部から",
-          setup=_scene_admin_settings, crop=".wrap2.frm", viewport=WIDE_VIEWPORT),
+          "システム管理画面（設定の左メニュー＋「調査・回答」タブの Codex 専用／共通設定／資料検索・関係探索）を上部から",
+          setup=_scene_admin_settings, crop=".wrap2.frm", viewport=(1440, 1500)),
 ]
 
 

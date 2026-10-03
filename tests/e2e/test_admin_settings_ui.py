@@ -254,8 +254,6 @@ def test_agentic_budget_card_renders_unset_state(page, web_base_url):
 
     expect(page.locator("#agentic-budget-per-result")).to_have_value("")
     expect(page.locator("#agentic-budget-per-result-hint")).to_contain_text("未設定です")
-    expect(page.locator("#agentic-budget-total")).to_have_value("")
-    expect(page.locator("#agentic-budget-total-hint")).to_contain_text("未設定です")
 
 
 def test_agentic_budget_card_renders_configured_values_in_kb(page, web_base_url):
@@ -288,7 +286,7 @@ def test_agentic_budget_card_save_sends_kb_converted_to_bytes(page, web_base_url
     expect(page.locator("#msg")).to_contain_text("保存しました")
     body = records["admin_settings_put"][-1]
     assert body.get("agentic_budget_per_result") == 500 * 1024
-    assert "agentic_budget_total" not in body   # 触っていない項目は送らない
+    assert set(body) == {"agentic_budget_per_result"}   # 触っていない項目は送らない
 
 
 def test_agentic_budget_card_clear_field_sends_null(page, web_base_url):
@@ -297,18 +295,18 @@ def test_agentic_budget_card_clear_field_sends_null(page, web_base_url):
     import mock_api
 
     system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["agentic_budget"]["total"] = {
-        "configured": 2_000_000, "effective": 2_000_000, "default": 4194304}
+    system_settings["agentic_budget"]["per_result"] = {
+        "configured": 2_000_000, "effective": 2_000_000, "default": 262144}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
-    expect(page.locator("#agentic-budget-total")).to_have_value(str(round(2_000_000 / 1024)))
+    expect(page.locator("#agentic-budget-per-result")).to_have_value(str(round(2_000_000 / 1024)))
 
-    page.locator("#agentic-budget-total").fill("")
+    page.locator("#agentic-budget-per-result").fill("")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["admin_settings_put"][-1].get("agentic_budget_total") is None
+    assert records["admin_settings_put"][-1].get("agentic_budget_per_result") is None
 
 
 def test_agentic_budget_card_save_rejects_out_of_range_client_side(page, web_base_url):
@@ -329,18 +327,18 @@ def test_agentic_budget_card_save_rejects_out_of_range_client_side(page, web_bas
 
 
 def test_agentic_budget_card_save_rejects_zero_client_side(page, web_base_url):
-    """0 は下限未満（`min=4`）として拒否される（サーバの `ge=4096` bytes と同じ境界）。"""
+    """0 は下限未満（`min=1`）として拒否される（サーバの `ge=1024` bytes と同じ境界）。"""
     from playwright.sync_api import expect
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
 
-    page.locator("#agentic-budget-total").fill("0")
+    page.locator("#agentic-budget-per-result").fill("0")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text(
-        "追加調査1回の累計上限は4〜65536（KB）の整数で指定してください")
+        "ツール結果1件あたりの上限は1〜8192（KB）の整数で指定してください")
     assert records["admin_settings_put"] == []
 
 
@@ -359,12 +357,10 @@ def test_agentic_budget_card_highlight_differs_from_default(page, web_base_url):
     open_tab(page, "research")
 
     expect(page.locator("#agentic-budget-per-result")).to_have_class(re.compile(r"\bcfg-changed\b"))
-    expect(page.locator("#agentic-budget-total")).not_to_have_class(re.compile(r"\bcfg-changed\b"))
 
 
 def test_agentic_budget_card_reset_tab_included_in_research_reset(page, web_base_url):
-    """「調査・回答」タブの「既定に戻す」は agentic_budget_per_result/agentic_budget_total も
-    まとめて null で送る（他の調査設定と同じ1つのボタン）。"""
+    """「調査・回答」タブの「既定に戻す」は agentic_budget_per_result もまとめて null で送る（他の調査設定と同じ1つのボタン）。"""
     from playwright.sync_api import expect
     import mock_api
 
@@ -380,7 +376,7 @@ def test_agentic_budget_card_reset_tab_included_in_research_reset(page, web_base
     expect(page.locator("#tab-reset-res-research")).to_contain_text("既定に戻しました")
     put = records["admin_settings_put"][-1]
     assert put["agentic_budget_per_result"] is None
-    assert put["agentic_budget_total"] is None
+    assert "agentic_budget_total" not in put
     expect(page.locator("#agentic-budget-per-result")).to_have_value("")
 
 
@@ -434,23 +430,6 @@ def test_admin_settings_models_tab_reset_sends_model_catalog_null(page, web_base
     expect(page.locator("#tab-reset-res-models")).to_contain_text("既定に戻しました")
     put = records["admin_settings_put"][-1]
     assert put["model_catalog"] is None
-
-
-def test_admin_settings_usage_tab_reset_sends_usage_chat_provider(page, web_base_url):
-    """「利用量」タブのリセットは usage_chat_provider（STAT-2）を対象にする
-    （user_api_keys_allowed・quota は「外部連携」タブのリセットが扱う）。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    page.locator('[data-reset-tab="usage"]').click()
-    expect(page.locator("#tab-reset-res-usage")).to_contain_text("既定に戻しました")
-    put = records["admin_settings_put"][-1]
-    assert put["usage_chat_provider"] is None
-    assert "user_api_keys_allowed" not in put
-    assert "user_api_keys_daily_quota_default" not in put
 
 
 def test_admin_settings_extkeys_tab_reset_sends_explicit_false_and_null_quota(page, web_base_url):
@@ -541,7 +520,7 @@ def test_admin_settings_put_rejected_by_research_provider_preflight_does_not_rev
 
 
 def test_admin_settings_research_default_provider_renders_saves_and_dirty_by_value(page, web_base_url):
-    """「外部連携」タブの「AI 下調べ検索の既定 AI」select は render 時の effective 値を基準にした
+    """「外部連携」タブの「簡易回答に使う AI（チャットの簡易・外部 API 共通）」select は render 時の effective 値を基準にした
     値差分で dirty 判定する（touched フラグではない＝変更してから元に戻すと丸印が消える）。
     中央 OpenAI キーが設定済みの状態で保存すると research_default_provider が PUT body に含まれ、
     ヒント文言は UI 語彙（「ローカル（Ollama）」）と揃っている。"""
@@ -575,7 +554,7 @@ def test_admin_settings_research_default_provider_renders_saves_and_dirty_by_val
 
 
 def test_admin_settings_research_default_provider_openai_save_rejected_without_key(page, web_base_url):
-    """中央 OpenAI キー未設定のまま「AI 下調べ検索の既定 AI」を OpenAI にして保存すると、
+    """中央 OpenAI キー未設定のまま「簡易回答に使う AI」を OpenAI にして保存すると、
     実サーバの保存時 preflight（`_assert_research_default_provider_sendable`）と同じく 422 で
     拒否され、保存されずにエラー表示になる（既定のモック状態＝openai_key_set は False）。"""
     from playwright.sync_api import expect
@@ -660,7 +639,7 @@ def test_admin_settings_extkeys_tab_reset_includes_research_default_provider_nul
 def test_admin_settings_tab_reset_preserves_other_tab_unsaved_draft_and_dirty_dot(page, web_base_url):
     """タブ単位リセットは対象タブの描画・状態だけを更新し、他タブの未保存編集・丸印・
     書込専用キー入力は無言で消さない。取り込みタブで未保存のまま、プロバイダタブの
-    キー入力・利用量タブのリセットを行っても、取り込みタブの編集内容は残る。"""
+    キー入力・調査タブのリセットを行っても、取り込みタブの編集内容は残る。"""
     from playwright.sync_api import expect
 
     records = install_api_mocks(page)
@@ -674,10 +653,10 @@ def test_admin_settings_tab_reset_preserves_other_tab_unsaved_draft_and_dirty_do
     page.locator("#arms-list input[data-arm='pdf_text']").uncheck()
     expect(page.locator("#tab-dot-ingest")).to_be_visible()
 
-    # 利用量タブをリセットする（取り込み・プロバイダの未保存編集とは無関係のはず）。
-    open_tab(page, "usage")
-    page.locator('[data-reset-tab="usage"]').click()
-    expect(page.locator("#tab-reset-res-usage")).to_contain_text("既定に戻しました")
+    # 調査タブをリセットする（取り込み・プロバイダの未保存編集とは無関係のはず）。
+    open_tab(page, "research")
+    page.locator('[data-reset-tab="research"]').click()
+    expect(page.locator("#tab-reset-res-research")).to_contain_text("既定に戻しました")
 
     # 取り込みタブの未保存編集・丸印が残っている。
     open_tab(page, "ingest")
@@ -689,7 +668,7 @@ def test_admin_settings_tab_reset_preserves_other_tab_unsaved_draft_and_dirty_do
     expect(page.locator("#cloud-key")).to_have_value("sk-unsaved-draft")
 
     # 保存すると、取り込み（触った）とプロバイダ（キー入力）の両方が PUT body に載る
-    # （利用量タブのリセットに巻き込まれて消えていない）。
+    # （調査タブのリセットに巻き込まれて消えていない）。
     page.locator("#save").click()
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put = records["admin_settings_put"][-1]
@@ -905,243 +884,8 @@ def test_admin_settings_vlm_save_without_touching_omits_vlm(page, web_base_url):
     assert "vlm" not in records["admin_settings_put"][-1]
 
 
-def test_admin_settings_missing_tool_limit_shows_error_in_usage_tab(page, web_base_url):
-    """更新前サーバーの応答で描画が止まっても、利用統計AIタブを空白にしない。"""
-    from copy import deepcopy
-
-    from playwright.sync_api import expect
-
-    view = deepcopy(SYSTEM_SETTINGS_VIEW)
-    del view['agentic_tool_limit']
-    records = install_api_mocks(page, system_settings=view)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, 'usage')
-    expect(page.locator('#tabpanel-usage [role="alert"]')).to_contain_text('設定を読み込めませんでした')
-    expect(page.locator('#save')).to_be_disabled()
-    expect(page.locator('[data-reset-tab="usage"]')).to_be_disabled()
-    assert not records['admin_settings_put']
-
-
-def test_admin_settings_usage_chat_ai_radio_toggle(page, web_base_url):
-    """STAT-2: 「利用統計チャットに使う AI」ラジオは3択（実行構成に合わせる／OpenAI に固定／
-    ローカル(Ollama) に固定）で、選択状態は `configured`（生の保存値）基準——
-    `configured=None` なら effective が何であれ「実行構成に合わせる」がチェックされる。
-    触ってから保存すると usage_chat_provider が PUT body に含まれる。
-    未触の保存は含めない（rag_llm_render と同じダーティフラグ流儀）。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)   # usage_chat.configured=None, effective="openai"（既定）
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator("#usage-chat-ai-card")).to_be_visible()
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider=""]')).to_be_checked()
-
-    page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]').check()
-    page.locator("#save").click()
-
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["admin_settings_put"][-1]["usage_chat_provider"] == "ollama"
-
-
-def test_admin_settings_usage_chat_ai_save_without_touching_omits_key(page, web_base_url):
-    """未触の保存は usage_chat_provider を PUT body に含めない（exclude_unset 意味論）。"""
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    page.locator("#save").click()
-    assert "usage_chat_provider" not in records["admin_settings_put"][-1]
-
-
-def test_admin_settings_usage_chat_ai_save_reflects_and_reload_persists(page, web_base_url):
-    """保存すると PUT 応答（render(view)）にすぐ反映され、再読込（GET）でも同じ値が返る
-    （mock_api の PUT が system_settings_resp を in-place 更新する契約・
-    rag_llm_render 等の他フィールドと同型）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]').check()
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]')).to_be_checked()
-
-    page.reload()
-    open_tab(page, "usage")
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]')).to_be_checked()
-
-
-def test_admin_settings_usage_chat_ai_toggle_reverted_hides_dot(page, web_base_url):
-    """ラジオを ollama にしてから元（`configured=None`＝「実行構成に合わせる」）に戻すと、
-    丸印も PUT 対象からも外れる（rag_llm_render の同型テストと同じ値差分ベースの判定）。
-    baseline は `configured` 基準のため、戻す先は effective と同じ値（"openai"）の固定
-    ラジオではなく「実行構成に合わせる」ラジオである。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)   # usage_chat.configured=None（既定）
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    ollama_radio = page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]')
-    follow_radio = page.locator('#usage-chat-ai-radios input[data-usage-chat-provider=""]')
-    ollama_radio.check()
-    expect(page.locator("#tab-dot-usage")).to_be_visible()
-    follow_radio.check()
-    expect(page.locator("#tab-dot-usage")).to_be_hidden()
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert "usage_chat_provider" not in records["admin_settings_put"][-1]
-
-
-def test_admin_settings_usage_chat_ai_fix_survives_simultaneous_a7_change(page, web_base_url):
-    """A7（`cloud_provider`）を変更するのと同時に、利用統計チャット専用 AI を現在の実効値へ
-    明示固定して1回で保存しても、A7 の変更によって黙って反転しない。
-    `configured=None`（実行構成に合わせる）のまま「OpenAI に固定」を選ばずに保存すると、
-    usage_chat_provider は PUT から省略され、直後に A7 を Gemini へ変えた保存で実効値が
-    Ollama へ反転してしまっていた——「OpenAI に固定」を明示選択すれば、A7 が何であれ
-    usage_chat_provider が常に明示送信されるため反転しない。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)   # usage_chat.configured=None, cloud.provider="openai"
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    # 1回の保存の中で、A7 を Gemini へ変更しつつ、利用統計チャット専用 AI は
-    # 現在の実効値（OpenAI）で明示固定する。
-    page.locator("input[data-cloud-provider='gemini']").check()
-    open_tab(page, "usage")
-    page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="openai"]').check()
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-
-    put = records["admin_settings_put"][-1]
-    assert put.get("cloud_provider") == "gemini"
-    assert put.get("usage_chat_provider") == "openai", \
-        "同時保存で明示固定した usage_chat_provider が省略されてはいけない"
-
-    # 保存直後の反映・再読込後の両方で、A7 が Gemini になっても OpenAI に固定されたまま
-    # （黙って Ollama へ反転しない）。
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="openai"]')).to_be_checked()
-    page.reload()
-    open_tab(page, "usage")
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="openai"]')).to_be_checked()
-
-
-def test_admin_settings_usage_chat_ai_switch_from_fixed_to_follow_sends_explicit_null(
-        page, web_base_url):
-    """明示固定（`configured="ollama"`）から「実行構成に合わせる」へ切り替えて保存すると、
-    PUT body に `usage_chat_provider: null` が明示送信される——baseline（"ollama"）から
-    「実行構成に合わせる」（`configured` の DOM 表現 `""`）へ実際に値が変わったので、
-    rag_llm_render 等と同じダーティフラグ流儀で保存対象になる。初期値が既に「実行構成に
-    合わせる」で、触らずに保存すると usage_chat_provider が PUT から省略されるケース
-    （`test_admin_settings_usage_chat_ai_save_without_touching_omits_key` 等）とは別の経路
-    ——どちらも「今の選択のまま」だが、前者は明示的な変更（null を送る）、後者は無変更
-    （省略する）という違いがある。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "ollama", "effective": "ollama",
-                              "default": "openai", "providers": ["openai", "ollama"]}
-    records = install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]')).to_be_checked()
-
-    page.locator('#usage-chat-ai-radios input[data-usage-chat-provider=""]').check()
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-
-    put = records["admin_settings_put"][-1]
-    assert "usage_chat_provider" in put, "「実行構成に合わせる」への変更は明示送信されるはず"
-    assert put["usage_chat_provider"] is None
-
-    # 保存直後の反映・再読込後の両方で「実行構成に合わせる」のまま。
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider=""]')).to_be_checked()
-    page.reload()
-    open_tab(page, "usage")
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider=""]')).to_be_checked()
-
-
-def test_admin_settings_usage_chat_ai_openai_fix_shows_hint_when_a7_not_openai(page, web_base_url):
-    """A7（`cloud_provider`）が openai 以外（例: gemini）の間、「OpenAI に固定」ラジオの横に、
-    中央 OpenAI キーが実行構成が OpenAI の時しか使えない旨の注記を出す——A7 の排他選択契約
-    により、この状態で「OpenAI に固定」しても実際には 503（未接続）になるため、選ぶ前に
-    理由が分かるようにする。A7 が openai なら注記は出ない。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["cloud"]["provider"] = "gemini"
-    install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator("#usage-chat-ai-radios")).to_contain_text(
-        "OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます")
-    expect(page.locator("#usage-chat-ai-radios")).to_contain_text("現在: Gemini")
-
-    # A7 を openai へ戻すと注記は消える（保存せず、同じページ内の別タブの変更だけでは反映
-    # されないため、A7 を openai に戻した状態を最初から与えて再確認する）。
-    settings2 = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings2["cloud"]["provider"] = "openai"
-    install_api_mocks(page, system_settings=settings2)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-    expect(page.locator("#usage-chat-ai-radios")).not_to_contain_text("頭脳の選択が OpenAI のとき")
-
-
-def test_admin_settings_usage_chat_ai_shows_explicit_error_when_response_malformed(page, web_base_url):
-    """`usage_chat` が欠落/形状不正な応答でも、カードを隠したり
-    'openai' へ黙って補完したりせず、明示エラーを表示する。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    del settings["usage_chat"]
-    records = install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator("#usage-chat-ai-card")).to_be_visible()
-    expect(page.locator("#usage-chat-ai-radios")).to_contain_text("読み込めませんでした")
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider]')).to_have_count(0)
-
-    # 壊れたデータのまま保存しても usage_chat_provider は送らない（誤った値を捏造しない）。
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert "usage_chat_provider" not in records["admin_settings_put"][-1]
-
-
-def test_admin_settings_usage_chat_ai_missing_configured_key_shows_explicit_error(page, web_base_url):
-    """`usage_chat` 自体はあっても `configured` キーが欠落（`undefined`）している応答は、
-    `null`（未設定＝実行構成に合わせる、という正当な値）と取り違えず、明示エラーを表示する
-    ——`configured` の値ではなくキーの有無で判定するため、欠落を「未設定」と黙って
-    同一視しない。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    del settings["usage_chat"]["configured"]
-    records = install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator("#usage-chat-ai-card")).to_be_visible()
-    expect(page.locator("#usage-chat-ai-radios")).to_contain_text("読み込めませんでした")
-    expect(page.locator('#usage-chat-ai-radios input[data-usage-chat-provider]')).to_have_count(0)
-
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert "usage_chat_provider" not in records["admin_settings_put"][-1]
-
-
-def test_admin_settings_ingest_and_usage_highlight_differ_from_default(page, web_base_url):
-    """既定から変えた項目だけ強調する（取り込み・利用量タブ）。既定と一致する間は強調しない。"""
+def test_admin_settings_ingest_highlight_differs_from_default(page, web_base_url):
+    """既定から変えた項目だけ強調する（取り込みタブ）。既定と一致する間は強調しない。"""
     import re
 
     from playwright.sync_api import expect
@@ -1151,17 +895,11 @@ def test_admin_settings_ingest_and_usage_highlight_differ_from_default(page, web
     # 取り込み: enabled が env_default と異なる＝差分あり。
     settings["arms"]["configured"] = ["ooxml"]
     settings["arms"]["enabled"] = ["ooxml"]
-    # STAT-2: 利用統計チャットに使う AI も effective が default（openai）と異なる＝差分あり。
-    settings["usage_chat"] = {"configured": "ollama", "effective": "ollama", "default": "openai",
-                              "providers": ["openai", "ollama"]}
     install_api_mocks(page, system_settings=settings)
     page.goto(f"{web_base_url}/admin-settings.html")
 
     open_tab(page, "ingest")
     expect(page.locator("#arms-list")).to_have_class("cfg-changed")
-
-    open_tab(page, "usage")
-    expect(page.locator("#usage-chat-ai-card")).to_have_class(re.compile(r"\bcfg-changed\b"))
 
 
 def test_admin_settings_tab_selection_persists_across_reload_via_url_hash(page, web_base_url):
@@ -1219,9 +957,9 @@ def test_nav_system_admin_hidden_for_non_admin(page, web_base_url):
 
 # ===== クラウド AI プロバイダの中央設定 =====
 
-def test_admin_cloud_provider_renders_defaults_and_switches_key_block(page, web_base_url):
-    """既定モック（openai 選択・3キーとも未設定・個人キー許可 OFF）の描画と、ラジオ切替でキー欄の
-    ラベル/プレースホルダが選択中プロバイダに追従することを確認する。"""
+def test_admin_cloud_provider_renders_defaults(page, web_base_url):
+    """既定モック（openai 選択・キー未設定・個人キー許可 OFF）の描画を確認する（選べるクラウド AI は
+    OpenAI だけ・閉じたプロバイダの警告は出ない）。"""
     from playwright.sync_api import expect
 
     install_api_mocks(page)
@@ -1235,11 +973,8 @@ def test_admin_cloud_provider_renders_defaults_and_switches_key_block(page, web_
     expect(page.locator("#cloud-status")).to_contain_text("OpenAI")
     expect(page.locator("#cloud-status")).to_contain_text("中央設定のみ")
     expect(page.locator("#cloud-ollama-url")).to_have_value("http://localhost:11434")
-
-    page.locator("input[data-cloud-provider='gemini']").check()
-    expect(page.locator("#cloud-key-label")).to_contain_text("Gemini")
-    # プロバイダ切替でキー欄は再描画され、入力しかけていた値は残らない（前プロバイダ向けの誤送信防止）。
-    expect(page.locator("#cloud-key")).to_have_value("")
+    expect(page.locator("input[data-cloud-provider]")).to_have_count(1)
+    expect(page.locator("#cloud-retired-warn")).to_be_hidden()
 
 
 def test_admin_cloud_provider_save_sends_only_touched_fields(page, web_base_url):
@@ -1249,19 +984,17 @@ def test_admin_cloud_provider_save_sends_only_touched_fields(page, web_base_url)
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
 
-    page.locator("input[data-cloud-provider='bedrock']").check()
-    page.locator("#cloud-key").fill("bedrock-secret-key")
+    page.locator("#cloud-key").fill("openai-secret-key")
     page.locator("#personal-keys-allowed").check()
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
     put = records["admin_settings_put"][-1]
-    assert put["cloud_provider"] == "bedrock"
-    assert put["bedrock_api_key"] == "bedrock-secret-key"
+    assert put["openai_api_key"] == "openai-secret-key"
     assert put["personal_api_keys_allowed"] is True
-    # 触っていない項目（アーム・旧形式変換等）は送らない。
+    # 触っていない項目（アーム・旧形式変換等・クラウド AI の選択）は送らない。
     assert "arms_enabled" not in put and "legacy_backend" not in put
-    assert "openai_api_key" not in put and "gemini_api_key" not in put
+    assert "cloud_provider" not in put
 
 
 def test_admin_cloud_provider_explicit_click_on_default_still_saves_raw_value(page, web_base_url):
@@ -1285,30 +1018,6 @@ def test_admin_cloud_provider_explicit_click_on_default_still_saves_raw_value(pa
     put = records["admin_settings_put"][-1]
     assert put["cloud_provider"] == "openai"
     assert put["openai_api_key"] == "openai-secret-key"
-
-
-def test_admin_openai_direct_visible_save_sends_only_when_touched(page, web_base_url):
-    """OpenAI 直結を利用者の構成一覧に出すトグル（既定 OFF・決定 2026-09-20）は、他のトグルと
-    同じ「触った項目だけ送る」流儀に従う。"""
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    expect(page.locator("#openai-direct-visible")).not_to_be_checked()
-
-    page.locator("#openai-direct-visible").check()
-    page.locator("#save").click()
-
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    put = records["admin_settings_put"][-1]
-    assert put["openai_direct_visible"] is True
-
-    # 触っていなければ送らない（無関係な項目の保存で勝手に上書きしない）。
-    page.locator("#personal-keys-allowed").check()
-    page.locator("#save").click()
-    put2 = records["admin_settings_put"][-1]
-    assert "openai_direct_visible" not in put2
 
 
 def test_admin_cloud_provider_untouched_radio_omits_cloud_provider_on_other_save(page, web_base_url):
@@ -1553,168 +1262,6 @@ def test_admin_cloud_key_clear_button_disabled_immediately_after_clear(page, web
     page.locator("#cloud-key-clear").click()
     expect(page.locator("#cloud-key-clear-res")).to_contain_text("削除しました")
     expect(page.locator("#cloud-key-clear")).to_be_disabled()
-
-
-def test_admin_cloud_provider_switch_clears_previous_delete_result_text(page, web_base_url):
-    """クラウドプロバイダを切り替えると、前のプロバイダに対する削除結果表示
-    （「✓ 削除しました」等）が新しいプロバイダの結果に見えてしまわないようクリアされる。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["cloud"]["openai_key_set"] = True
-    install_api_mocks(page, system_settings=system_settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    page.once("dialog", lambda d: d.accept())
-    page.locator("#cloud-key-clear").click()
-    expect(page.locator("#cloud-key-clear-res")).to_contain_text("削除しました")
-
-    page.locator("input[data-cloud-provider='gemini']").check()
-    expect(page.locator("#cloud-key-clear-res")).to_have_text("")
-
-
-def test_admin_cloud_key_clear_pending_response_does_not_clobber_switched_provider(page, web_base_url):
-    """削除待ち中に別のプロバイダへ切り替えて未保存のキーを入力していると、遅れて届いた古い
-    削除応答（元のプロバイダ向け）が切替先の入力・表示を上書きしてはいけない（要求時のプロバイダ・
-    世代を捕捉し、応答時に不一致なら描画・文言更新を破棄する）。"""
-    import json as _json
-
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = _json.loads(_json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["cloud"]["openai_key_set"] = True
-    install_api_mocks(page, system_settings=system_settings)
-
-    held = {}
-
-    def hold_admin_settings_put(route):
-        if route.request.method != "PUT":
-            route.fallback()
-            return
-        held["route"] = route
-
-    page.route("**/admin/settings", hold_admin_settings_put)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    page.once("dialog", lambda d: d.accept())
-    page.locator("#cloud-key-clear").click()   # openai のキー削除を要求（応答は保留中）
-    expect(page.locator("#cloud-key-clear-res")).to_contain_text("削除しています")
-
-    # 応答が保留中に gemini へ切り替え、未保存のキーを入力する。
-    page.locator("input[data-cloud-provider='gemini']").check()
-    page.locator("#cloud-key").fill("AIza-unsaved-gemini-key")
-
-    # 保留していた openai 向けの削除応答（成功）を解放する。
-    held["route"].fulfill(status=200, content_type="application/json",
-                          body=_json.dumps(system_settings, ensure_ascii=False))
-    page.wait_for_timeout(200)
-
-    # gemini 向けの未保存入力・ラベル表示は無傷のまま（openai 向けの応答で上書きされない）。
-    expect(page.locator("#cloud-key")).to_have_value("AIza-unsaved-gemini-key")
-    expect(page.locator("#cloud-key-label")).to_contain_text("Gemini")
-    # 古い応答による誤った成功表示も出ない（gemini のキーが削除されたと誤解させない）。
-    expect(page.locator("#cloud-key-clear-res")).not_to_contain_text("削除しました")
-
-
-def test_admin_cloud_key_clear_roundtrip_switch_stale_response_does_not_corrupt(page, web_base_url):
-    """openai→gemini→openai と往復してから遅れて届く削除応答は、世代が不一致（各切替が削除待ちの
-    世代を進める）になった時点でもう「今の真実」を代表しない＝_view・表示のどちらにも一切反映
-    しない（判定を先に行い、不一致なら丸ごと捨てる。応答の内容を無視して「削除された」
-    という1点だけを常に反映する案は、この削除より後に同じ provider へ完了した別の保存の結果を
-    巻き戻してしまうため採らない）。ここでは、この破棄が例外を起こさないこと、往復後に
-    「削除しています...」等の残留表示が出ないことだけを確認する（往復のみ＝競合する保存が無い
-    ケースでの最終表示の正しさは、次の実際の取得/保存まで保証しない）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["cloud"]["openai_key_set"] = True
-    install_api_mocks(page, system_settings=system_settings)
-
-    held = {}
-
-    def hold_admin_settings_put(route):
-        if route.request.method != "PUT":
-            route.fallback()
-            return
-        held["route"] = route
-
-    page.route("**/admin/settings", hold_admin_settings_put)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    page.once("dialog", lambda d: d.accept())
-    page.locator("#cloud-key-clear").click()   # openai の削除を要求（応答は保留中）
-    expect(page.locator("#cloud-key-clear-res")).to_contain_text("削除しています")
-
-    # 応答が届く前に gemini → openai と往復する（各切替が削除待ちの世代を進める）。
-    page.locator("input[data-cloud-provider='gemini']").check()
-    expect(page.locator("#cloud-key-clear-res")).to_have_text("")
-    page.locator("input[data-cloud-provider='openai']").check()
-    expect(page.locator("#cloud-key-clear-res")).to_have_text("")
-
-    cleared = json.loads(json.dumps(system_settings))
-    cleared["cloud"]["openai_key_set"] = False
-    held["route"].fulfill(status=200, content_type="application/json",
-                          body=json.dumps(cleared, ensure_ascii=False))
-    page.wait_for_timeout(200)
-
-    # 不一致で捨てられた＝「削除しています...」の残留も「✓ 削除しました」の誤表示も出ない。
-    expect(page.locator("#cloud-key-clear-res")).to_have_text("")
-
-
-def test_admin_cloud_key_clear_pending_response_does_not_revert_newly_saved_key(page, web_base_url):
-    """削除待ち中に同じプロバイダへ新しいキーを保存すると、後から届く
-    古い削除応答（不一致）が、その新しいキーの「設定済み」表示を「未設定」へ巻き戻してはいけない。
-    判定（世代・プロバイダ一致）を先に行い、不一致なら _view には一切触れない（応答の値を見て
-    「削除された」という事実を無条件に信用する実装だと、この巻き戻りが起きる）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["cloud"]["openai_key_set"] = True
-    install_api_mocks(page, system_settings=system_settings)
-
-    held = {}
-
-    def hold_first_put(route):
-        if route.request.method != "PUT" or "route" in held:
-            route.fallback()
-            return
-        held["route"] = route
-
-    page.route("**/admin/settings", hold_first_put)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    page.once("dialog", lambda d: d.accept())
-    page.locator("#cloud-key-clear").click()   # openai の削除を要求（応答は保留中＝最初の PUT）
-    expect(page.locator("#cloud-key-clear-res")).to_contain_text("削除しています")
-
-    # 同じ openai へ新しいキーを入力して保存する（2件目の PUT・こちらは素通しで即応答）。
-    page.locator("#cloud-key").fill("sk-new-key-after-clear-started")
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-
-    # 保留していた最初の削除応答を、後から解放する（不一致＝もう「今の真実」ではない）。応答の
-    # 中身自体は「削除」という自分の操作の結果を正直に示す（openai_key_set=False）が、これは
-    # 2件目の保存より前の状態を表す＝古い（不一致で捨てられるべき）ことを確認するのが狙い。
-    stale_after_clear = json.loads(json.dumps(system_settings))
-    stale_after_clear["cloud"]["openai_key_set"] = False
-    held["route"].fulfill(status=200, content_type="application/json",
-                          body=json.dumps(stale_after_clear, ensure_ascii=False))
-    page.wait_for_timeout(200)
-
-    # _view.cloud が古い応答で汚染されていないかは、保存直後の描画だけでは見えない（保存の
-    # render() が既に正しい表示を出した後だから）。gemini → openai と切り替えて _view.cloud
-    # から再描画させ、内部状態そのものが巻き戻っていないことを確認する。
-    page.locator("input[data-cloud-provider='gemini']").check()
-    page.locator("input[data-cloud-provider='openai']").check()
-
-    # 新しく保存したキーの「設定済み」表示が、遅れて届いた削除応答で「未設定」へ戻っていないこと。
-    expect(page.locator("#cloud-key-clear")).to_be_enabled()
-    expect(page.locator("#cloud-key")).to_have_attribute(
-        "placeholder", "設定済み（変更する場合のみ入力）")
 
 
 def test_admin_cloud_key_input_after_clear_start_is_not_wiped_by_stale_response(page, web_base_url):
@@ -3232,110 +2779,9 @@ def test_admin_openai_endpoint_save_does_not_mutate_caller_supplied_system_setti
         "PUT ハンドラが呼び出し元所有の system_settings dict を直接書き換えた（deep-copy 漏れ）"
 
 
-def test_admin_settings_usage_chat_ai_shows_warning_for_invalid_configured_value(page, web_base_url):
-    """`usage_chat.configured` が選択肢に無い（旧データ・手動編集等で不正な値）場合、
-    ラジオを固定表示せず明示の注意文を出す（黙って既定へ丸めて正常な選択の
-    ように見せない）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "gemini", "effective": "(不正な保存値)",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    records = install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator("#usage-chat-ai-radios")).to_contain_text("不正です")
-    # 内部の非表示センチネル（`_USAGE_CHAT_PROVIDER_INVALID`）はチェック状態でも除外し、
-    # 実際に選べる（見える）ラジオがどれも選ばれていないことだけを確認する。
-    expect(page.locator(
-        '#usage-chat-ai-radios input[data-usage-chat-provider]:checked:not([hidden])'
-    )).to_have_count(0)
-    # 選び直して保存はできる（保存対象から外れていない）。
-    page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]').check()
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-    assert records["admin_settings_put"][-1].get("usage_chat_provider") == "ollama"
-
-
-def test_admin_settings_usage_chat_ai_invalid_saved_not_cleared_by_unrelated_save(page, web_base_url):
-    """保存値が不正な間、選び直さずに保存しても、`usage_chat_provider` を黙って null
-    （既定へ戻す＝不正値の暗黙解除）で送ってはいけない——PUT body に `usage_chat_provider`
-    キー自体が含まれないこと。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "gemini", "effective": "(不正な保存値)",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    records = install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    expect(page.locator("#usage-chat-ai-radios")).to_contain_text("不正です")
-    # 内部の非表示センチネル（`_USAGE_CHAT_PROVIDER_INVALID`）はチェック状態でも除外し、
-    # 実際に選べる（見える）ラジオがどれも選ばれていないことだけを確認する。
-    expect(page.locator(
-        '#usage-chat-ai-radios input[data-usage-chat-provider]:checked:not([hidden])'
-    )).to_have_count(0)
-
-    # usage_chat_provider には一切触れず、そのまま保存する。
-    page.locator("#save").click()
-    expect(page.locator("#msg")).to_contain_text("保存しました")
-
-    put = records["admin_settings_put"][-1]
-    assert "usage_chat_provider" not in put, \
-        "選び直していないのに usage_chat_provider が送られている（不正値を暗黙に解除している）"
-
-
-def test_admin_settings_usage_chat_ai_invalid_sentinel_not_keyboard_or_ax_reachable(
-        page, web_base_url):
-    """保存値が不正な間に混ぜる非表示センチネル（`_USAGE_CHAT_PROVIDER_INVALID`）は、
-    Tab／矢印キーで到達できず、アクセシビリティツリー（ロール）にも露出しない
-    （`hidden` 属性の既定挙動任せにせず `aria-hidden`/`tabindex="-1"` を明示する）。"""
-    from playwright.sync_api import expect
-    import mock_api
-
-    settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    settings["usage_chat"] = {"configured": "gemini", "effective": "(不正な保存値)",
-                              "default": "ollama", "providers": ["openai", "ollama"]}
-    install_api_mocks(page, system_settings=settings)
-    page.goto(f"{web_base_url}/admin-settings.html")
-    open_tab(page, "usage")
-
-    sentinel = page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="__invalid__"]')
-    expect(sentinel).to_have_attribute("aria-hidden", "true")
-    expect(sentinel).to_have_attribute("tabindex", "-1")
-
-    # AX ツリー（role=radio）に露出するのは実在する3択（実行構成に合わせる／openai／ollama）
-    # だけ。
-    expect(page.locator("#usage-chat-ai-radios").get_by_role("radio")).to_have_count(3)
-
-    _REAL_VALUES = ("", "openai", "ollama")   # "" ＝「実行構成に合わせる」ラジオの値
-
-    # 実際に Tab キーで到達しないこと: この card の次に来る focusable 要素（タブの既定リセット
-    # ボタン）から Shift+Tab で戻ると、ブラウザは `hidden`/`tabindex="-1"` の要素を
-    # ロービング tabindex から除外するため、チェック状態がセンチネル側にあってもグループ内の
-    # 実在するいずれかのラジオへ着地する（センチネルには乗らない）。
-    page.locator('[data-reset-tab="usage"]').focus()
-    page.keyboard.press("Shift+Tab")
-    focused_back = page.evaluate("document.activeElement.getAttribute('data-usage-chat-provider')")
-    assert focused_back in _REAL_VALUES, \
-        "Shift+Tab でラジオグループへ戻った時、センチネルではなく実在するラジオに着地するはず"
-
-    # 末尾（ollama）から ArrowDown で循環しても、センチネルに止まらず実在するラジオへ戻る
-    # （非表示センチネルはロービング tabindex の輪から除外されている）。
-    page.locator('#usage-chat-ai-radios input[data-usage-chat-provider="ollama"]').focus()
-    page.keyboard.press("ArrowDown")
-    focused_wrap = page.evaluate("document.activeElement.getAttribute('data-usage-chat-provider')")
-    assert focused_wrap in _REAL_VALUES, \
-        "末尾から ArrowDown で循環する時、センチネルではなく実在するラジオへ戻るはず"
-
-
 # ===== SC-6c: 調べる深さの基準値（調べ方ブロック §3.2・「調査・回答」タブのカード） =====
 
-def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
+def test_research_tab_groups_settings_and_saves_search_base(page, web_base_url):
     from playwright.sync_api import expect
 
     records = install_api_mocks(page)
@@ -3346,17 +2792,18 @@ def test_research_tab_groups_settings_and_saves_tool_limit(page, web_base_url):
     expect(page.locator('#search-investigation-card #depth-base-grep-max-hits')).to_be_visible()
     expect(page.locator('#search-investigation-card #depth-base-read-window')).to_be_visible()
     expect(page.locator('#codex-investigation-card #depth-base-codex-reasoning')).to_be_visible()
-    expect(page.locator('#api-investigation-card #depth-base-max-turns')).to_be_visible()
+    expect(page.locator('#depth-base-max-turns')).to_have_count(0)
     expect(page.locator('#search-investigation-card #depth-base-impact-depth')).to_have_count(1)
-    page.locator('#agentic-max-tools-per-turn').fill('6')
+    expect(page.locator('#agentic-max-tools-per-turn')).to_have_count(0)
+    expect(page.locator('#research-api-heading')).not_to_contain_text('API 専用')
+    page.locator('#depth-base-grep-max-hits').fill('6')
     expect(page.locator('#tab-dot-research')).to_be_visible()
     expect(page.locator('#tab-dot-provider')).to_be_hidden()
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert records['admin_settings_put'][-1] == {'agentic_max_tools_per_turn': 6}
+    assert records['admin_settings_put'][-1] == {'depth_base_grep_max_hits': 6}
     page.reload()
-    expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('6')
-    expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('固定中')
+    expect(page.locator('#depth-base-grep-max-hits')).to_have_value('6')
 
 
 def test_codex_worker_model_renders_default_placeholder_and_saves(page, web_base_url):
@@ -3418,21 +2865,21 @@ def test_research_reset_preserves_provider_draft(page, web_base_url):
     page.goto(f"{web_base_url}/admin-settings.html")
     page.locator('#cloud-key').fill('sk-test-unsaved')
     open_tab(page, 'research')
-    page.locator('#agentic-max-tools-per-turn').fill('5')
+    page.locator('#depth-base-grep-max-hits').fill('5')
     page.locator('#depth-base-codex-reasoning').select_option('high')
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator('#tab-reset-res-research')).to_contain_text('既定に戻しました')
     body = records['admin_settings_put'][-1]
-    assert len(body) == 15 and all(value is None for value in body.values())
+    assert len(body) == 12 and all(value is None for value in body.values())
     assert set(body) == {
-        'depth_base_max_turns', 'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
+        'depth_base_grep_max_hits', 'depth_base_qa_max_hits',
         'depth_base_read_window', 'depth_base_impact_depth', 'depth_base_troubleshoot_depth',
-        'depth_base_codex_reasoning', 'agentic_max_tools_per_turn', 'embed_parallel',
+        'depth_base_codex_reasoning', 'embed_parallel',
         'max_review_rounds', 'codex_worker_model', 'codex_session_retention_days',
-        'agentic_budget_per_result', 'agentic_budget_total', 'codex_mode',
+        'agentic_budget_per_result', 'codex_mode',
     }
     assert 'openai_api_key' not in body and 'cloud_provider' not in body
-    expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('')
+    expect(page.locator('#depth-base-grep-max-hits')).to_have_value('')
     expect(page.locator('#tab-dot-research')).to_be_hidden()
     open_tab(page, 'provider')
     expect(page.locator('#cloud-key')).to_have_value('sk-test-unsaved')
@@ -3444,41 +2891,22 @@ def test_provider_reset_preserves_research_draft(page, web_base_url):
 
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html#research")
-    page.locator('#depth-base-max-turns').fill('20')
-    page.locator('#agentic-max-tools-per-turn').fill('5')
+    page.locator('#depth-base-grep-max-hits').fill('20')
+    page.locator('#depth-base-read-window').fill('50')
     open_tab(page, 'provider')
     page.locator('[data-reset-tab="provider"]').click()
     expect(page.locator('#tab-reset-res-provider')).to_contain_text('既定に戻しました')
     assert not any(key.startswith('depth_base_') for key in records['admin_settings_put'][-1])
-    assert 'agentic_max_tools_per_turn' not in records['admin_settings_put'][-1]
     open_tab(page, 'research')
-    expect(page.locator('#depth-base-max-turns')).to_have_value('20')
-    expect(page.locator('#agentic-max-tools-per-turn')).to_have_value('5')
+    expect(page.locator('#depth-base-grep-max-hits')).to_have_value('20')
+    expect(page.locator('#depth-base-read-window')).to_have_value('50')
     expect(page.locator('#tab-dot-research')).to_be_visible()
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert records['admin_settings_put'][-1] == {'depth_base_max_turns': 20, 'agentic_max_tools_per_turn': 5}
+    assert records['admin_settings_put'][-1] == {'depth_base_grep_max_hits': 20, 'depth_base_read_window': 50}
 
 
-def test_research_tool_limit_rejects_out_of_range_and_can_clear(page, web_base_url):
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html#research")
-    page.locator('#agentic-max-tools-per-turn').fill('257')
-    page.locator('#save').click()
-    expect(page.locator('#msg')).to_contain_text('1〜256')
-    assert not records['admin_settings_put']
-    page.locator('#agentic-max-tools-per-turn').fill('3')
-    page.locator('#save').click()
-    expect(page.locator('#msg')).to_contain_text('保存しました')
-    page.locator('#agentic-max-tools-per-turn').fill('')
-    page.locator('#save').click()
-    expect(page.locator('#agentic-max-tools-per-turn-hint')).to_contain_text('未設定')
-    assert records['admin_settings_put'][-1] == {'agentic_max_tools_per_turn': None}
-
-
-# ===== 埋め込みの同時送信数（`agentic-max-tools-per-turn` と同じ型） =====
+# ===== 埋め込みの同時送信数 =====
 
 def test_research_tab_saves_embed_parallel(page, web_base_url):
     from playwright.sync_api import expect
@@ -3523,8 +2951,8 @@ def test_depth_profile_card_renders_unset_state(page, web_base_url):
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
 
-    expect(page.locator("#depth-base-max-turns")).to_have_value("")
-    expect(page.locator("#depth-base-max-turns-hint")).to_contain_text("未設定です")
+    expect(page.locator("#depth-base-grep-max-hits")).to_have_value("")
+    expect(page.locator("#depth-base-grep-max-hits-hint")).to_contain_text("未設定です")
     expect(page.locator("#depth-base-codex-reasoning")).to_have_value("")
     expect(page.locator("#depth-base-codex-reasoning-hint")).to_contain_text("未設定です")
 
@@ -3535,7 +2963,7 @@ def test_depth_profile_card_renders_configured_values(page, web_base_url):
     import mock_api
 
     system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["depth_profile"]["max_turns"] = {"configured": 20, "effective": 20, "default": 12}
+    system_settings["depth_profile"]["grep_max_hits"] = {"configured": 20, "effective": 20, "default": 30}
     system_settings["depth_profile"]["codex_reasoning"] = {
         "configured": "high", "effective": "high", "default": "low",
         "options": ["minimal", "low", "medium", "high", "xhigh"]}
@@ -3543,8 +2971,8 @@ def test_depth_profile_card_renders_configured_values(page, web_base_url):
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
 
-    expect(page.locator("#depth-base-max-turns")).to_have_value("20")
-    expect(page.locator("#depth-base-max-turns-hint")).to_contain_text("この値で固定中")
+    expect(page.locator("#depth-base-grep-max-hits")).to_have_value("20")
+    expect(page.locator("#depth-base-grep-max-hits-hint")).to_contain_text("この値で固定中")
     expect(page.locator("#depth-base-codex-reasoning")).to_have_value("high")
     expect(page.locator("#depth-base-codex-reasoning-hint")).to_contain_text("この値で固定中")
 
@@ -3557,15 +2985,15 @@ def test_depth_profile_card_save_sends_changed_fields_only(page, web_base_url):
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
 
-    page.locator("#depth-base-max-turns").fill("30")
+    page.locator("#depth-base-grep-max-hits").fill("30")
     page.locator("#depth-base-codex-reasoning").select_option("xhigh")
     page.locator("#save").click()
 
     expect(page.locator("#msg")).to_contain_text("保存しました")
     body = records["admin_settings_put"][-1]
-    assert body.get("depth_base_max_turns") == 30
+    assert body.get("depth_base_grep_max_hits") == 30
     assert body.get("depth_base_codex_reasoning") == "xhigh"
-    assert "depth_base_grep_max_hits" not in body   # 触っていない項目は送らない
+    assert "depth_base_qa_max_hits" not in body   # 触っていない項目は送らない
 
 
 def test_depth_profile_card_clear_field_sends_null(page, web_base_url):
@@ -3609,27 +3037,27 @@ def test_depth_profile_card_codex_reasoning_standalone_reset_sends_null_only(pag
     expect(page.locator("#msg")).to_contain_text("保存しました")
     body = records["admin_settings_put"][-1]
     assert body.get("depth_base_codex_reasoning") is None
-    assert "depth_base_max_turns" not in body   # 他の項目には触れていない
+    assert "depth_base_qa_max_hits" not in body   # 他の項目には触れていない
 
 
-def test_depth_profile_card_reset_tab_nulls_all_seven_fields(page, web_base_url):
-    """「このタブを既定に戻す」（調査・回答タブ）は調べる深さの基準値7項目も対象に含む。"""
+def test_depth_profile_card_reset_tab_nulls_all_fields(page, web_base_url):
+    """「このタブを既定に戻す」（調査・回答タブ）は調べる深さの基準値6項目も対象に含む。"""
     from playwright.sync_api import expect
     import mock_api
 
     system_settings = json.loads(json.dumps(mock_api.SYSTEM_SETTINGS_VIEW))
-    system_settings["depth_profile"]["max_turns"] = {"configured": 20, "effective": 20, "default": 12}
+    system_settings["depth_profile"]["grep_max_hits"] = {"configured": 20, "effective": 20, "default": 30}
     records = install_api_mocks(page, system_settings=system_settings)
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
-    expect(page.locator("#depth-base-max-turns")).to_have_value("20")
+    expect(page.locator("#depth-base-grep-max-hits")).to_have_value("20")
 
     page.locator('[data-reset-tab="research"]').click()
     expect(page.locator("#tab-reset-res-research")).to_contain_text("既定に戻しました")
-    expect(page.locator("#depth-base-max-turns")).to_have_value("")
+    expect(page.locator("#depth-base-grep-max-hits")).to_have_value("")
 
     body = records["admin_settings_put"][-1]
-    for key in ("depth_base_max_turns", "depth_base_grep_max_hits", "depth_base_qa_max_hits",
+    for key in ("depth_base_grep_max_hits", "depth_base_qa_max_hits",
                "depth_base_read_window", "depth_base_impact_depth", "depth_base_troubleshoot_depth",
                "depth_base_codex_reasoning", "max_review_rounds"):
         assert key in body and body[key] is None, key
@@ -3641,9 +3069,9 @@ def test_mock_validate_depth_base_rejects_negative_zero_and_upper_plus_one():
     これらの値の送信自体を防ぐため、mock の純関数を直接呼んで契約を確認する。"""
     import mock_api
 
-    assert mock_api._mock_validate_depth_base({"depth_base_max_turns": -1}) is not None
-    assert mock_api._mock_validate_depth_base({"depth_base_max_turns": 0}) is not None
-    assert mock_api._mock_validate_depth_base({"depth_base_max_turns": 201}) is not None
+    assert mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": -1}) is not None
+    assert mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": 0}) is not None
+    assert mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": 1001}) is not None
     assert mock_api._mock_validate_depth_base({"depth_base_read_window": 9}) is not None    # 下限10未満
     assert mock_api._mock_validate_depth_base({"depth_base_read_window": 401}) is not None  # 上限400+1
     assert mock_api._mock_validate_depth_base({"depth_base_troubleshoot_depth": 17}) is not None
@@ -3655,16 +3083,16 @@ def test_mock_validate_depth_base_int_error_shape_matches_real_pydantic_detail()
     のような表示崩れを検出できるe2e/クライアント側の対応漏れを見逃す。"""
     import mock_api
 
-    err = mock_api._mock_validate_depth_base({"depth_base_max_turns": 0})
+    err = mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": 0})
     assert isinstance(err, list) and len(err) == 1
     assert err[0]["type"] == "greater_than_equal"
-    assert err[0]["loc"] == ["body", "depth_base_max_turns"]
+    assert err[0]["loc"] == ["body", "depth_base_grep_max_hits"]
     assert err[0]["ctx"] == {"ge": 1}
 
-    err_hi = mock_api._mock_validate_depth_base({"depth_base_max_turns": 500})
-    assert err_hi[0]["type"] == "less_than_equal" and err_hi[0]["ctx"] == {"le": 200}
+    err_hi = mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": 5000})
+    assert err_hi[0]["type"] == "less_than_equal" and err_hi[0]["ctx"] == {"le": 1000}
 
-    err_type = mock_api._mock_validate_depth_base({"depth_base_max_turns": "twelve"})
+    err_type = mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": "twelve"})
     assert err_type[0]["type"] == "int_type"
 
     # codex_reasoning の語彙不一致は実APIの HTTPException と同じ文字列（リストではない）。
@@ -3676,11 +3104,11 @@ def test_mock_validate_depth_base_accepts_boundary_values_and_null():
     """対照: 下限・上限ちょうどの値と null（未設定へ戻す）は受理される（誤って範囲を狭めていないか）。"""
     import mock_api
 
-    assert mock_api._mock_validate_depth_base({"depth_base_max_turns": 1}) is None
-    assert mock_api._mock_validate_depth_base({"depth_base_max_turns": 200}) is None
+    assert mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": 1}) is None
+    assert mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": 1000}) is None
     assert mock_api._mock_validate_depth_base({"depth_base_read_window": 10}) is None
     assert mock_api._mock_validate_depth_base({"depth_base_read_window": 400}) is None
-    assert mock_api._mock_validate_depth_base({"depth_base_max_turns": None}) is None
+    assert mock_api._mock_validate_depth_base({"depth_base_grep_max_hits": None}) is None
 
 
 def test_mock_validate_depth_base_rejects_unknown_codex_reasoning_level():
@@ -3741,7 +3169,7 @@ def test_admin_settings_put_returns_422_for_out_of_range_depth_base(page, web_ba
           const res = await fetch('/admin/settings', {
             method: 'PUT', credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ depth_base_max_turns: 0 }),
+            body: JSON.stringify({ depth_base_grep_max_hits: 0 }),
           });
           return res.status;
         }
@@ -3749,7 +3177,7 @@ def test_admin_settings_put_returns_422_for_out_of_range_depth_base(page, web_ba
     assert status == 422
     # 直後の GET（再読込）が汚染されていない＝422 で state 変更していないことの確認。
     page.reload()
-    expect(page.locator("#depth-base-max-turns")).to_have_value("")
+    expect(page.locator("#depth-base-grep-max-hits")).to_have_value("")
 
 
 def test_depth_profile_card_save_rejects_out_of_range_client_side(page, web_base_url):
@@ -3761,10 +3189,10 @@ def test_depth_profile_card_save_rejects_out_of_range_client_side(page, web_base
     page.goto(f"{web_base_url}/admin-settings.html")
     open_tab(page, "research")
 
-    page.locator("#depth-base-max-turns").fill("201")
+    page.locator("#depth-base-grep-max-hits").fill("1001")
     page.locator("#save").click()
 
-    expect(page.locator("#msg")).to_contain_text("探索の反復回数は1〜200の整数で指定してください")
+    expect(page.locator("#msg")).to_contain_text("資料検索のヒット件数上限は1〜1000の整数で指定してください")
     assert records["admin_settings_put"] == []
 
 
@@ -3922,17 +3350,6 @@ def test_admin_settings_tab_bar_renders_four_embed_tabs_as_real_tabs(page, web_b
         expect(btn).to_have_attribute("role", "tab")
         assert btn.get_attribute("href") is None   # button のため href を持たない
         expect(btn).to_have_attribute("aria-selected", "false")
-
-
-def test_admin_settings_no_bottom_menucard_section(page, web_base_url):
-    """旧・下部の「管理メニュー」カード区画（menugrid/menucard）は撤去済み。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.goto(f"{web_base_url}/admin-settings.html")
-
-    expect(page.locator(".menugrid")).to_have_count(0)
-    expect(page.locator("a.menucard")).to_have_count(0)
 
 
 def test_admin_settings_embed_tab_click_stays_on_page_and_shows_iframe_panel(page, web_base_url):

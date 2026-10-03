@@ -1,6 +1,6 @@
 """影響分析 受け入れ（統合・要 Neo4j）: resolve→world_impact→結果整形が golden を返す（鏡モデル）。
 
-前提: Neo4j 起動。`_world_setup.ensure_v1()` で v1 world をロードする（旧 graph-load 不要）。
+前提: Neo4j 起動。`_world_setup.ensure_v1()` で v1 world をロードする。
 オラクル（正解）なのでテーマ名を含む（パイプライン本体は持たない＝AT-G3）。
 
 S3（2026-09-04-グラフのソース正典化.md §4・K9-K11）: 意味層フル抽出・REALIZES 橋・名寄せ

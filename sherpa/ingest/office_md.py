@@ -1,17 +1,12 @@
-"""Office（OOXML）→ 決定的 Markdown 変換（鏡モデルの派生MD・正典 docs/11-Office変換.md §D5）。
+"""Office（OOXML）/PDF → 決定的 Markdown 変換と、派生物（MD・IR・Evidence・RAG）の生成・drift 判定。
 
-**OOXML を直接パース**（Office/LibreOffice 非依存・Linux-native）。MVP は最小形＝本文/見出し/表（値）。
-- .docx: `word/document.xml` を document-ir 経由で読む（段落＋見出し＋結合セル/ネスト表展開済みの表・
-  `human_md.render_docx`）。外部ライブラリ不要。
-- .pptx: `ppt/slides/slideN.xml` のテキストを slide 順に。外部ライブラリ不要。
-- .xlsx: openpyxl（導入済）で document-ir 経由・シート内の表候補（`regions()`）ごとに値の表
-  （`human_md.render_xlsx`）。
-- .pdf: テキスト層を抽出（バックエンド pypdf・requirements.txt に同梱既定）。到達不可なら None＝「未対応」。
-- .doc/.xls/.ppt（旧バイナリ）: `to_markdown` は直接は扱わない（None）。build_derived が legacy_backend（W0・
-  LibreOffice 等）で先に OOXML へ前段変換し、MD 化は①OOXML へ委譲する（`arms/legacy_convert.py`）。
-
-決定的（タイムスタンプ等を出さない・順序安定）。壊れたファイル/非OOXML は例外を握って None。
-LLM は使わない（INGEST-MD: 大半は決定的MD化で LLM 不要）。
+OOXML を直接パースする（Office/LibreOffice 非依存）。
+- .docx/.xlsx: document-ir 経由で人間向け MD にする（`human_md.render_docx`/`render_xlsx`）。
+- .pptx: スライド順にテキストを出す。
+- .pdf: テキスト層を抽出する（バックエンド pypdf）。到達不可なら None＝「未対応」。
+- .doc/.xls/.ppt（旧バイナリ）: 直接は扱わず、legacy_backend で OOXML へ前段変換してから OOXML 経路へ委譲する（`arms/legacy_convert.py`）。
+決定的（タイムスタンプ等を出さない・順序安定）。壊れたファイル/非 OOXML は例外を握って None。LLM は使わない。
+設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
 """
 from __future__ import annotations
 
@@ -31,7 +26,6 @@ from .. import json_io
 from . import text_kind
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
-# （`sherpa/log_setup.py` の登録表参照・worker.py と合流させ1系統にする）。
 _log = logging.getLogger("sherpa.ingest.convert")
 
 # OOXML 名前空間
@@ -43,9 +37,8 @@ RASTER_EVIDENCE_EXT = frozenset({".png", ".jpg", ".jpeg"})    # OCRなしで存�
 LEGACY_OFFICE_EXT = frozenset({".doc", ".xls", ".ppt"})
 EVIDENCE_EXT = frozenset({".xlsx", ".docx", ".pptx", ".pdf"}) | RASTER_EVIDENCE_EXT | LEGACY_OFFICE_EXT
 PDF_EXT = {".pdf"}                                            # PDF はテキスト層を抽出（同梱既定バックエンド pypdf）
-# ラスタ画像（視覚読み取りアーム `vision`＝VLM の対象。tesseract ベースの `ocr` アームは存在しない）。
-# **vision 有効 かつ VLM 実効可時のみ** MD化候補になる（既定 ooxml,pdf_text では画像は
-# grep 専用の素ファイル）。
+# ラスタ画像（視覚読み取りアーム `vision`＝VLM の対象）。vision 有効かつ VLM 実効可のときだけ MD 化候補になる
+# （既定では画像は grep 専用の素ファイル）。
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
 OFFICE_EXT = CONVERTIBLE_EXT | PDF_EXT | set(LEGACY_OFFICE_EXT)   # Office/PDF 一括（未対応含む）
 
@@ -63,10 +56,8 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     return v if lo <= v <= hi else default
 
 
-# Office/PDF 取り込みの入口サイズガード（実環境 OOM 障害対応）。openpyxl は
-# read_only=False で全ブックをオブジェクトツリーとして展開するため、原本サイズに対しピークメモリが
-# 数倍〜数十倍に達しうる（セル書式・共有文字列・結合セル等の付帯構造が展開されるため）。この上限は
-# 「変換を試みる前に諦める」安全弁であり、変換アルゴリズム自体のメモリ効率とは独立（項目2参照）。
+# Office/PDF 取り込みの入口サイズガード。openpyxl は全ブックをオブジェクトツリーに展開するため、
+# ピークメモリが原本サイズの数倍〜数十倍になりうる。変換を試みる前に諦める安全弁。
 _OFFICE_FILE_CAP_BYTES = _env_int(
     "SHERPA_OFFICE_FILE_CAP_BYTES", 100 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
 _PDF_FILE_CAP_BYTES = _env_int(
@@ -74,11 +65,7 @@ _PDF_FILE_CAP_BYTES = _env_int(
 
 
 def _office_size_exceeded(rp: Path, ext: str) -> bool:
-    """変換前の入口サイズ超過判定（Office 系＝`.docx/.xlsx/.pptx/.doc/.xls/.ppt`・PDF は別 cap）。
-
-    stat 失敗（消失・権限・race）はサイズ超過として扱わない（`corpus_docs._text_oversize` と同じ
-    fail-open＝実読込の失敗は別経路が拾う）。
-    """
+    """変換前の入口サイズ超過判定（Office 系・PDF は別 cap）。stat 失敗はサイズ超過として扱わない（実読込の失敗は別経路が拾う）。"""
     cap = _PDF_FILE_CAP_BYTES if ext == ".pdf" else _OFFICE_FILE_CAP_BYTES
     try:
         return rp.stat().st_size > cap
@@ -86,17 +73,12 @@ def _office_size_exceeded(rp: Path, ext: str) -> bool:
         return False
 
 
-# xlsx セル数ガード（閉域実機の実測対応）: `SHERPA_OFFICE_FILE_CAP_BYTES` は
-# 原本の圧縮後（zip）サイズを見るため、xlsx は圧縮率が高く（共有文字列/繰り返し値が多い）実測
-# 13MB のファイルが st_size ガードを素通りし、python RSS 6.6GB・20分超に達した。この上限は
-# openpyxl を一切開かない段階で効かせる安全弁（1セル≈数百B〜数KBのオブジェクト化で数百万セル→
-# 数GB に達する実測ベース）。
+# xlsx セル数ガード: 圧縮後サイズ（`SHERPA_OFFICE_FILE_CAP_BYTES`）は圧縮率の高い xlsx を素通りさせるため、
+# openpyxl を開く前にセル数の上限で止める。
 _XLSX_CELL_CAP = _env_int("SHERPA_XLSX_CELL_CAP", 2_000_000, 1_000, 100_000_000)
 
-# Office 非圧縮サイズガード（MEM-2）: docx の巨大 document.xml・pptx の大量スライド等、xlsx 以外にも
-# 同型の圧縮爆弾リスクがある。zip の非圧縮サイズ合計（セントラルディレクトリの `ZipInfo.file_size`
-# の和のみ・シート/スライド本体は読まない＝安価）に対する上限。素の docx/xlsx/pptx と、旧形式
-# （.doc/.xls/.ppt）を①OOXML へ前段変換した後の materialized ファイルの両方に適用する。
+# Office 非圧縮サイズガード: zip の非圧縮サイズ合計（セントラルディレクトリの `ZipInfo.file_size` の和・本体は読まない）の上限。
+# 素の docx/xlsx/pptx と、旧形式を OOXML へ前段変換した後のファイルの両方に適用する。
 _OFFICE_UNCOMPRESSED_CAP_BYTES = _env_int(
     "SHERPA_OFFICE_UNCOMPRESSED_CAP_BYTES", 500 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024)
 
@@ -133,14 +115,10 @@ def _xlsx_dimension_area(ref: str) -> int | None:
 
 
 def _xlsx_estimated_cell_count(rp: Path) -> int | None:
-    """openpyxl でフルロードする前に、zip 内 `xl/worksheets/sheetN.xml` の `<dimension ref="..."/>`
-    だけをストリーミングで読み、全シートのセル数（面積）の和を見積もる（MEM-2・「速い棄却」）。
+    """openpyxl でロードする前に、`xl/worksheets/sheetN.xml` の `<dimension ref="..."/>` だけを読んで全シートのセル数（面積）の和を見積もる。
 
-    シート XML 全体は読まない（先頭 `_XLSX_DIMENSION_SCAN_BYTES` バイトだけ）。`<dimension>` は
-    書き手側の自己申告にすぎず、実際の `sheetData` のセル数と一致する保証は無い——ここで None
-    （dimension 欠落/不正）を返す場合は fail-open ではなく、呼び出し側が `_xlsx_actual_cell_count`
-    （`<c ` 実数カウント）へフォールバックする契約（自己申告を鵜呑みにして通す穴を塞ぐ・RV是正#2）。
-    壊れた zip/シート皆無だけは実カウント側でも同じ理由で None になる＝そこだけ真の fail-open。
+    先頭 `_XLSX_DIMENSION_SCAN_BYTES` バイトだけ読む。`<dimension>` は自己申告のため、欠落/不正で None を返したら
+    呼び出し側が `_xlsx_actual_cell_count`（実数カウント）へフォールバックする。壊れた zip/シート皆無は None。
     """
     try:
         with zipfile.ZipFile(rp) as zf:
@@ -169,13 +147,10 @@ _XLSX_CELL_COUNT_CHUNK_BYTES = 1 << 20  # 1MiB ずつ（シート全体を一度
 
 
 def _xlsx_actual_cell_count(rp: Path, cap: int) -> int | None:
-    """`<dimension>` が欠落/不正で見積不能な xlsx 向けに、シート XML の `<c ` 出現数を実際に
-    ストリーミングでカウントする（MEM-2 RV是正#2・`_xlsx_estimated_cell_count` の fail-open 置換）。
+    """`<dimension>` が欠落/不正な xlsx 向けに、シート XML の `<c ` 出現数を実際にストリーミングでカウントする。
 
-    1MiB チャンクで逐次読み、チャンク境界をまたぐ `<c ` を取りこぼさないよう直前チャンク末尾
-    （needle 長-1 バイト）だけを次回へ持ち越す。`cap` を超えた時点で残りを読まずに即座に打ち切る
-    （超過の有無だけが要件・正確な総数は不要）。壊れた zip/シート皆無は None（真の fail-open——
-    その場合 openpyxl 自体もほぼ確実に読めずどのみち失敗する）。
+    1MiB チャンクで読み、チャンク境界をまたぐ `<c ` は直前チャンク末尾（needle 長-1 バイト）を持ち越して拾う。
+    `cap` を超えた時点で打ち切る。壊れた zip/シート皆無は None。
     """
     try:
         with zipfile.ZipFile(rp) as zf:
@@ -203,10 +178,7 @@ def _xlsx_actual_cell_count(rp: Path, cap: int) -> int | None:
 
 
 def _office_uncompressed_total_bytes(rp: Path) -> int | None:
-    """zip セントラルディレクトリのみを読み、全エントリの非圧縮サイズ（`ZipInfo.file_size`）の和を
-    返す（MEM-2）。エントリ本体（シート/スライド XML 自体）は読まない＝安価。壊れた zip・stat 不能
-    は見積不能として None（fail-open）。
-    """
+    """zip セントラルディレクトリだけを読み、全エントリの非圧縮サイズ（`ZipInfo.file_size`）の和を返す。壊れた zip・stat 不能は None。"""
     try:
         with zipfile.ZipFile(rp) as zf:
             return sum(info.file_size for info in zf.infolist())
@@ -214,9 +186,8 @@ def _office_uncompressed_total_bytes(rp: Path) -> int | None:
         return None
 
 
-# 抽出不完全の疑い（ING-1・静かな部分抽出検知）: 原本サイズに対し生成MDが極端に小さければ疑いに
-# 計上する（docx/pdf 等にも効く粗い網・深いカバレッジ計算はしない）。1MiB 超という下限は「小さい
-# 原本はMDも小さくて正常」を除外するための保守的な閾値。
+# 抽出不完全の疑い（静かな部分抽出の検知）: 原本サイズに対し生成 MD が極端に小さければ疑いに計上する。
+# 1MiB 超という下限で、小さい原本を除く。
 _PARTIAL_SIZE_MIN_SOURCE_BYTES = 1024 * 1024
 _PARTIAL_SIZE_MAX_MD_BYTES = 512
 
@@ -224,9 +195,8 @@ _PARTIAL_SIZE_MAX_MD_BYTES = 512
 def _pdf_backend() -> str | None:
     """利用可能な PDF テキスト抽出バックエンド名（優先順 pypdf > pdfminer.six）。無ければ None。
 
-    `pypdf` は `requirements.txt` に**同梱既定**＝箱出しで PDF が読める。pdfminer.six は
-    任意の追加バックエンド。PyMuPDF は製品経路に採用しない。いずれも到達不可なら PDF は
-    「未対応」と正直表示（fail-safe）。テキスト層のみ＝スキャン画像（視覚読み取りは vision）は対象外。
+    pypdf は requirements.txt に同梱既定。いずれも到達不可なら PDF は「未対応」と表示する。
+    テキスト層のみ（スキャン画像の視覚読み取りは vision）。
     """
     for name, mod in (("pypdf", "pypdf"), ("pdfminer", "pdfminer.high_level")):
         try:
@@ -242,18 +212,12 @@ def pdf_available() -> bool:
 
 
 def convertible_exts() -> set:
-    """今 MD化できる拡張子。**有効アーム（`SHERPA_ARMS`）**が担当し、かつ現時点で変換可能な拡張子の和集合。
+    """今 MD 化できる拡張子。有効アーム（管理画面の取り込み設定）が担当し、かつ現時点で変換可能な拡張子の和集合。
 
-    既定（`ooxml,pdf_text`）では従来と同一＝OOXML は常時、PDF はバックエンド導入時のみ（無ければ未対応扱い）。
-    任意の vision アームが有効なら、その受理拡張子もここに合流させる（アーム名→拡張子の対応は本関数が集約）。
-
-    旧形式（.doc/.xls/.ppt）は legacy_backend（W0・LibreOffice 等）が旧→新へ前段変換し MD 化は①OOXML に委譲する
-    ため、**ooxml 有効 かつ 変換バックエンド到達可**（`legacy_convert.legacy_exts()` が非空）のときだけ合流させる。
-
-    Office（.docx/.xlsx/.pptx）は① OOXML 有効時だけ対象にする。PDF は `pdf_text`（テキスト層）または
-    `vision`（テキスト層ゼロのPDFをVLMで視覚読み取り）のいずれかが到達可なら変換候補（担当は
-    `pdf_escalation_target` が決める）。ラスタ画像は **vision（VLM 実効可）のときのみ**（`_image_convertible` と一致）
-    ＝それ以外は未対応（正直表示）。tesseract 直の `ocr` アームは存在しない。
+    - OOXML: ooxml アームが有効なとき。
+    - 旧形式（.doc/.xls/.ppt）: ooxml 有効かつ変換バックエンド到達可（`legacy_convert.legacy_exts()` が非空）のとき。
+    - PDF: `pdf_text` または `vision` のいずれかが到達可なら変換候補（担当は `pdf_escalation_target` が決める）。
+    - ラスタ画像: vision（VLM 実効可）のときのみ（`_image_convertible` と一致）。
     """
     from . import arms as _arms
     from .arms import legacy_convert
@@ -287,7 +251,7 @@ def _vision_image_ready(names) -> bool:
 
 
 def _image_convertible(names) -> bool:
-    """ラスタ画像を今 MD化できるか（vision＝VLM 実効可のときのみ・tesseract の `ocr` は撤去済）。"""
+    """ラスタ画像を今 MD化できるか（vision＝VLM 実効可のときのみ）。"""
     return _vision_image_ready(names)
 
 
@@ -296,36 +260,20 @@ def _pdf_escalation_available(names) -> bool:
     return _vision_pdf_ready(names)
 
 
-# ---- アーム構成 drift（旧 `.pdf_backend` を一般化した `.arms_sig` マーカー）----
-# 派生MD を作った時の「有効アーム構成の署名」を派生 dir に残し、構成が変わったら署名同一でも作り直す。
+# ---- アーム構成 drift（`.arms_sig` マーカー）----
+# 派生 MD を作った時の有効アーム構成の署名を派生 dir に残し、構成が変わったら署名同一でも作り直す。
 _ARMS_SIG_MARKER = ".arms_sig"                               # 派生MD を作った時の有効アーム構成を記録
-_OLD_PDF_MARKER = ".pdf_backend"                             # 旧マーカー（PDF バックエンド名のみ・後方互換の読み替え用）
 
 
 def _arms_sig(arm_names, backend: str | None, legacy: str | None = None,
               vlm: str | None = None) -> str:
-    """有効アーム構成の決定的署名（順序安定）: 有効アーム名（ソート）＋ PDF バックエンド＋ legacy 変換
-    バックエンド（W0）＋ VLM（vision）の**実効可用性**。
+    """有効アーム構成の決定的署名（順序安定）: 有効アーム名（ソート）＋ PDF バックエンド＋ legacy 変換バックエンド＋ VLM の実効可用性。
 
-    `vlm` は「アーム有効 かつ この環境で実際に使える」ときだけ非 "none"（未導入→後付け導入
-    や設定変更で署名が変わり drift 再ビルドが誘発される・soffice の `legacy_sig_value` と同じ扱い）。`vlm` は
-    provider/model／**クラウド許可（cloud_allowed）の切替でも変わる**（ローカル⇔クラウドで抽出源が変わるため
-    ＝`vision_arm.sig_value`）。エンジンのバージョンは含めない（版更新での不要な全リビルドを避ける・
-    provenance には残す）。既定値付き引数なので、後方互換の再構成呼び出し（旧 `.pdf_backend`/marker皆無の
-    A2/A3 前基準）は自動的に vlm=none になる。
-
-    **document-ir（DOC-IR-001）のスキーマ/抽出器版はここに含めない**（DOC-IR-001.5・修正3・契約修正 High#3）:
-    `es_index._arms_config_sig()`（es_index.py 内）が本関数（`_current_arms_sig()`）をそのまま ES の
-    `needs_reindex` drift 判定に使うため、IR 版をここに混ぜると IR 実装の版更新だけで**全 world の ES 再索引**
-    まで誘発してしまう（この `needs_reindex` 経路に限っては IR は無関係でよい）。IR 版の drift は独立した
-    マーカー（`_DOCUMENT_IR_SIG_MARKER`／`document_ir_sig_drift`）で判定し、対象を document_ir だけに
-    限定せず対象 OOXML 文書を全件再生成する`refresh_document_ir`が担う——ただし IR 単独では完結せず、
-    `worker._refresh_derived_representations` が IR 再生成後に evidence/rag（さらに RAG_ES 有効時は
-    ES 索引）まで連鎖再生成する契約（`worker.sync` 参照）。
-
-    **`;md=` と `;ocr=` 成分は含めない**（MarkItDown 不採用・`ocr` アーム不在のため）。
-    既存の派生 dir が持つ旧マーカー（`;md=...` / `;ocr=...` を含む形式）は新フォーマットと文字列が一致しなくなる
-    ため、次回 sync で `arms_sig_drift` が True になり**派生の再ビルドが1回だけ**走る（想定内・正しい挙動）。
+    `vlm` はアーム有効かつ実際に使えるときだけ非 "none"（provider/model/クラウド許可の切替でも変わる）。
+    エンジンのバージョンは含めない。
+    document-ir のスキーマ/抽出器版はここに含めない: `es_index._arms_config_sig()` がこの署名を ES の `needs_reindex` 判定に使うため、
+    IR 版を混ぜると全資料フォルダの ES 再索引を誘発する。IR 版の drift は別マーカー（`_DOCUMENT_IR_SIG_MARKER`／`document_ir_sig_drift`）で判定する。
+    `;md=`/`;ocr=` 成分は含めない。
     """
     return ("arms=" + ",".join(sorted(arm_names))
             + ";pdf=" + (backend or "none")
@@ -334,8 +282,7 @@ def _arms_sig(arm_names, backend: str | None, legacy: str | None = None,
 
 
 def _current_arms_sig() -> str:
-    """**今**の有効アーム構成（`SHERPA_ARMS`）＋各アームの実効可用性（PDF バックエンド／legacy／VLM）
-    の署名。document-ir 版は含まない（`_arms_sig` docstring 参照）。"""
+    """今の有効アーム構成＋各アームの実効可用性（PDF バックエンド／legacy／VLM）の署名。document-ir 版は含まない。"""
     from . import arms as _arms
     from .arms import legacy_convert, vision_arm
     names = set(_arms.enabled_arm_names())
@@ -353,18 +300,11 @@ def _write_arms_sig_marker(dr: Path):
 
 
 def arms_sig_drift(derived_md_dir) -> bool:
-    """派生MD を作った時と**今**でアーム構成（有効アーム＋PDF バックエンド）が変わったか。
+    """派生 MD を作った時と今でアーム構成（有効アーム＋PDF バックエンド）が変わったか。
 
-    True なら sync が署名同一でも派生を作り直すべき（アーム後付け導入で PDF/新形式を検索対象化／除去後の
-    残骸を一掃）。旧 `.pdf_backend` マーカーしか無い派生 dir は「既定アーム構成で書かれたもの」と
-    **読み替えて**比較する（後方互換）。マーカー皆無は既定アーム＋バックエンド無しを基準に判定する
-    （旧 `pdf_backend_drift` の recorded="none" 相当・marker 書込失敗時の無限ループを避ける）。
-
-    `.arms_sig` marker が**在る**が今の署名と不一致
-    （例: 旧 `;ocr=...` 付きフォーマットの marker が本撤去の署名フォーマット変更で不一致になるケース）でも、
-    dir が**書けない**場合は書込不能 probe（`_dir_writable`）で据え置く（no-marker ケースと同じ fail-safe）。
-    これが無いと、再ビルドで marker を更新できない dir は毎 sync で drift=True を返し続けフルリビルドの
-    ループになる（`build_derived` が rebuild しても `_write_arms_sig_marker` が書けず署名不一致のまま）。
+    True なら sync が署名同一でも派生を作り直すべき。マーカー皆無は既定アーム＋バックエンド無しを基準に判定する。
+    marker が在って不一致でも、dir が書けない場合は書込不能 probe（`_dir_writable`）で据え置く
+    （再ビルドで marker を更新できず毎 sync フルリビルドになるのを避ける）。
     """
     d = Path(derived_md_dir)
     cur = _current_arms_sig()
@@ -380,17 +320,7 @@ def arms_sig_drift(derived_md_dir) -> bool:
             return False
         return mismatched
     from . import arms as _arms
-    old = d / _OLD_PDF_MARKER
-    if old.is_file():                                        # 旧マーカーのみ＝既定アーム構成で書かれたと読み替え
-        try:
-            backend = old.read_text(encoding="utf-8").strip() or "none"
-        except OSError:
-            return True
-        return _arms_sig(_arms.DEFAULT_ARMS, backend, "none") != cur   # 旧マーカーは W0 前＝legacy=none 基準
-    # マーカー皆無＝既定構成・バックエンド無しを基準に判定（旧 pdf_backend_drift の recorded="none" 相当）。
-    # marker が**書けない** dir で True を返し続けると、再ビルドしても marker を
-    # 永続できず毎 sync フルリビルドのループになる。書込可否を probe し、書けない dir では
-    # 警告して据え置く（fail-safe＝dir を直せば次の sync で必要な再ビルドが走る）。
+    # マーカー皆無＝既定構成・バックエンド無しを基準に判定。marker が書けない dir は警告して据え置く（dir を直せば次の sync で再ビルドが走る）
     drift = _arms_sig(_arms.DEFAULT_ARMS, "none", "none") != cur
     if drift and not _dir_writable(d):
         _log.warning(
@@ -410,24 +340,18 @@ def _dir_writable(d: Path) -> bool:
         return False
 
 
-# ---- document-ir 版 drift（DOC-IR-001.5・修正3・契約修正 High#3）----
-# `.arms_sig`（MD 派生の構成署名）とは**別マーカー**にする（`_arms_sig` docstring の根拠参照＝es_index の
-# needs_reindex drift 判定を誤発火させ全 world の ES 再索引を誘発しないため）。IR 版の更新は
-# `document_ir_sig_drift`→`refresh_document_ir`の軽量経路（MD自体の全再ビルドはしない）で解決するが、
-# `worker.sync`（`_refresh_derived_representations`）がこれに続けて evidence/rag（さらに RAG_ES
-# 有効時は ES 索引）まで連鎖再生成する契約になっている＝IR 単独で完結する更新ではない。
+# ---- document-ir 版 drift ----
+# `.arms_sig` とは別マーカーにする（IR 版の更新で ES 再索引を誘発しないため）。IR 版の更新は
+# `document_ir_sig_drift`→`refresh_document_ir` の軽量経路で解決し、`worker.sync` がこれに続けて
+# evidence/rag（RAG_ES 有効時は ES 索引）まで連鎖再生成する。
 _DOCUMENT_IR_SIG_MARKER = ".document_ir_sig"
 
 
 def _current_document_ir_sig() -> str:
-    """**今**の document-ir 版（JSON 形式のスキーマ版＋DOCX/PPTX/XLSX 各抽出処理の版）の署名。
+    """今の document-ir 版（JSON 形式のスキーマ版＋DOCX/PPTX/XLSX 各抽出処理の版）の署名。
 
-    docx/pptx/xlsx を別々の成分（`docx=`/`pptx=`/`xlsx=`）として持つが、drift 判定
-    （`document_ir_sig_drift`）はこの署名文字列**全体**を1つのマーカーとして比較する（`.document_ir_sig`
-    は world 単位で1つしか持たない）。**どれか1つの抽出器だけを拡張しても、対象拡張子だけに
-    絞り込まれるわけではない**——`_refresh_derived_representations` の `refresh_document_ir` は
-    drift を検知したら world 内の全 OOXML 文書（docx/pptx/xlsx すべて）を対象に再生成する
-    （`worker.py::_refresh_derived_representations` docstring 参照）。
+    drift 判定（`document_ir_sig_drift`）はこの署名全体を 1 つのマーカーとして比較する。
+    どれか 1 つの抽出器だけの更新でも、`refresh_document_ir` は資料フォルダ内の全 OOXML 文書を再生成する。
     """
     from . import document_ir
     from .arms import ooxml_arm
@@ -445,24 +369,18 @@ def _write_document_ir_sig_marker(dr: Path):
 
 
 def write_document_ir_sig_marker(derived_md_dir) -> None:
-    """`.document_ir_sig` を現行値で確定する公開ヘルパ（`write_rag_sig_marker` と同型）。
+    """`.document_ir_sig` を現行値で確定する公開ヘルパ。
 
-    `refresh_document_ir` を `write_document_ir_sig_marker=False` で呼んだ場合、確定は
-    連鎖した evidence/rag（さらに RAG_ES 有効時は ES 反映）の成否を確認できる呼び出し元
-    （`worker`）へ委ねられる（マーカー保留方式）。呼び出し元は document_ir 自体の生成成功に
-    加え、連鎖先の成功も確認できた時だけこれを呼ぶ。
+    `refresh_document_ir` を `write_document_ir_sig_marker=False` で呼んだ場合、確定は連鎖した evidence/rag
+    （RAG_ES 有効時は ES 反映）の成否を確認できる呼び出し元（`worker`）が行う。
     """
     _write_document_ir_sig_marker(Path(derived_md_dir))
 
 
 def document_ir_sig_drift(derived_md_dir) -> bool:
-    """派生を作った時と**今**で document-ir 版が変わったか（マーカー無し/読めない/不一致で True）。
+    """派生を作った時と今で document-ir 版が変わったか（マーカー無し/読めない/不一致で True）。
 
-    `arms_sig_drift` と同型（マーカー方式・無し/不一致は drift）だが、書込不能 dir の据え置き probe
-    （`_dir_writable`）は行わない: `arms_sig_drift` がそれを持つのは drift=True が**派生MD 全再ビルド**を
-    誘発し、書けない dir で毎 sync ループするコストが高いため。一方こちらの drift は `refresh_document_ir`
-    （対象 OOXML 文書を全件再生成し、`worker.sync` 経由で evidence/rag へも連鎖する軽量経路）しか
-    誘発せず、書けない dir で据え置かない場合の実害（無駄な再走査）は小さい＝単純さを優先する。
+    `arms_sig_drift` と違い、書込不能 dir の据え置き probe は行わない。
     """
     sig_path = Path(derived_md_dir) / _DOCUMENT_IR_SIG_MARKER
     if not sig_path.is_file():
@@ -473,19 +391,13 @@ def document_ir_sig_drift(derived_md_dir) -> bool:
         return True
 
 
-# ---- 人間向け MD（human_md）版 drift（H2・単一 asset 版・正典 §10 裁定#1〜#4）----
-# `.document_ir_sig`（world 単位の1マーカーファイル）とは異なる設計にする: `{rel}.md` の版は
-# `_write_derived_sidecar_manifest` が rel ごとに `{rel}.derived.json` の `asset_versions.human_md` へ
-# 書く（RAG-KV の drift 連鎖と同じ「単一 asset だけの選択的再生成」）。world 単位のマーカーにすると
-# 1文書だけ再生成すればよい場面でも他の全 docx/xlsx を巻き込む全再構築を誘発してしまう。
+# ---- 人間向け MD（human_md）版 drift ----
+# `{rel}.md` の版は rel ごとに `{rel}.derived.json` の `asset_versions.human_md` へ書く
+# （1 文書だけの選択的再生成のため。資料フォルダ単位のマーカーにはしない）。
 
 
 def _current_human_md_sig() -> str:
-    """**今**の人間向け MD（`human_md`）の版。レンダラ自体の版に加え、レンダラが消費する
-    docx/xlsx 抽出器の版（`DOCX_EXTRACTOR_VERSION`/`XLSX_EXTRACTOR_VERSION`）も含める
-    （`_current_document_ir_sig` と同じ理由＝抽出器が変われば document-ir 経由の human_md 出力も
-    変わりうるため）。
-    """
+    """今の人間向け MD（`human_md`）の版。レンダラの版に加え、レンダラが消費する docx/xlsx 抽出器の版も含める。"""
     from . import human_md
     from .arms import ooxml_arm
     return (f"renderer={human_md.HUMAN_MD_RENDERER_VERSION};"
@@ -505,11 +417,10 @@ def _md_is_from_ooxml_arm(dr: Path, rel: str) -> bool:
 
 
 def _legacy_human_md_source(rp: Path, rel: str, dr: Path) -> Path | None:
-    """旧形式 `.doc`/`.xls` の人間向け MD を作り直すための、**キャッシュ済み**の変換後 OOXML を返す。
+    """旧形式 `.doc`/`.xls` の人間向け MD を作り直すための、キャッシュ済みの変換後 OOXML を返す。
 
-    変換（LibreOffice/COM）は再実行しない。原本が変わっていない変換キャッシュ（`legacy_convert.ensure_ooxml`
-    が残す `{rel}{ext}` と `.key`）が無ければ None＝その文書は次の通常取り込みが作り直すまで据え置く。
-    既存の `{rel}.md` が ooxml アーム由来でない（失敗の注記など）場合も None（注記を上書きしない）。
+    変換は再実行しない。変換キャッシュ（`legacy_convert.ensure_ooxml` の `{rel}{ext}` と `.key`）が無ければ None。
+    既存の `{rel}.md` が ooxml アーム由来でない場合も None。
     """
     from .arms import legacy_convert
 
@@ -529,25 +440,12 @@ def _legacy_human_md_source(rp: Path, rel: str, dr: Path) -> Path | None:
 
 
 def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
-    """素の docx/xlsx のうち、`{rel}.md`（human_md 生成）の版が現在の `_current_human_md_sig()` と
-    食い違う rel が1件でもあれば True。
+    """素の docx/xlsx のうち、`{rel}.md` の版が現在の `_current_human_md_sig()` と食い違う rel が 1 件でもあれば True。
 
-    `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先（`_archive_also_root`）も合流して評価する
-    ——省略時（`None`）は従来どおり `wd` だけを見る（既存呼び出し元は無変更）。
-
-    **`.md` sidecar の有無では絞り込まない**: 空の xlsx 等は `.md` を持たない
-    （`human_md.render_xlsx`／`render_docx` が None を返した）のが正当な結果でありうるが、それでも
-    `asset_versions.human_md` を評価対象にしないと、レンダラ版が上がった時にその rel だけが
-    永久に「未評価」のまま drift 検知から漏れる（`refresh_human_md`／`_write_derived_sidecar_manifest`
-    docstring 参照）。マニフェスト自体が読めない rel は「未評価」と同じ扱い（drift あり）にする
-    （`rag_sidecars_missing` 側が別途この rel を全再構築の対象にできる）。legacy `.doc`/`.xls`
-    （前段変換経由）は変換キャッシュが残っているものだけが対象（`_legacy_human_md_source`）。
-
-    **有効アーム（`SHERPA_ARMS`）に従う**: docx/xlsx を担当する `ooxml` アームが無効化されている
-    間はこの関数の対象から完全に外す（drift 評価そのものをしない）。`ooxml` 無効時は
-    `convertible_exts()` がこれらの拡張子を「未対応」のまま扱う契約であり、`.md` sidecar の
-    有無に依存しない今の判定方式のままだと、無効アームでも人間向け MD を新規生成してしまう
-    迂回になる。
+    - `world`（アーカイブ取り込み）を渡すと zip/tar 展開先（`_archive_also_root`）も評価する。
+    - `.md` sidecar の有無では絞り込まない（空の xlsx 等は `.md` を持たないのが正当だが、`asset_versions.human_md` は評価する）。
+      マニフェストが読めない rel は drift あり。legacy `.doc`/`.xls` は変換キャッシュが残っているものだけが対象。
+    - 有効アームに従う: `ooxml` アームが無効の間は対象から外す。
     """
     from . import arms as _arms
     from .. import scope_infer as si
@@ -555,7 +453,7 @@ def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
         return False
     wd = Path(wd).resolve()
     dr = Path(derived)
-    dr_ir = _sibling_layer_dir(dr, "ir")          # `.derived.json` マニフェストは ir 層（§8.1 三階層）
+    dr_ir = _sibling_layer_dir(dr, "ir")          # `.derived.json` マニフェストは ir 層
     current = _current_human_md_sig()
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         if rp.suffix.lower() not in (".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"):
@@ -565,9 +463,7 @@ def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
         if rp.suffix.lower() == ".pptx" and not _md_is_from_ooxml_arm(dr, rel):
             continue
         if _is_sensitive_original(rp, rp.suffix.lower()):
-            # 秘匿名は `{rel}.derived.json` マニフェストを一切持たない契約（`_is_sensitive_original`
-            # 参照）——ここで除外しないと `recorded` が常に None のため drift が恒常 True になり、
-            # 生成物を持たない rel の再構築が毎回反復する（台帳 #85〜#88）。
+            # 秘匿名は `{rel}.derived.json` マニフェストを持たない（`_is_sensitive_original` 参照）。除外しないと drift が恒常 True になる
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         versions = manifest.get("asset_versions") if isinstance(manifest, dict) else None
@@ -580,12 +476,9 @@ def human_md_sig_drift(wd, derived, *, world: str | None = None) -> bool:
 def _is_sensitive_original(rp: Path, ext: str) -> bool:
     """秘匿名（`text_kind.is_sensitive`）の原本かどうかを判定する唯一の入口。
 
-    変換ループ（`_build_derived_into_staging`）・欠落検知（`rag_sidecars_missing`）・軽量再生成
-    3本（`refresh_human_md`/`refresh_document_ir`/`refresh_evidence_ir`）は**全て**この関数経由で
-    同じ判定を使う——判定が分散すると、どこか1箇所だけ判定漏れが起きた時に秘匿本文が派生ツリーへ
-    平文で書き出される。秘匿名の原本は派生 MD/IR/Evidence/RAG を一切持たない
-    契約（`corpus_docs.classify_document` の秘匿名無条件対象外と同型）であり、派生マニフェスト
-    (`{rel}.derived.json`) も持たないため `rag_sidecars_missing` の欠落判定からも除外する。
+    変換ループ・欠落検知（`rag_sidecars_missing`）・軽量再生成（`refresh_human_md`/`refresh_document_ir`/`refresh_evidence_ir`）は
+    全てこの関数経由で判定する（判定が分散すると秘匿本文が派生ツリーへ平文で書き出される）。
+    秘匿名の原本は派生 MD/IR/Evidence/RAG もマニフェストも持たない。
     """
     return text_kind.is_sensitive(rp.name, ext)
 
@@ -600,36 +493,14 @@ def _render_human_md(ir, path: Path, ext: str) -> str | None:
 
 
 def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
-    """人間向け `{rel}.md` **だけ**の軽量再生成（H2・単一 asset・RAG-KV の drift 連鎖と
-    同じ考え方）。`human_md_sig_drift` が対象とする条件と同じ rel だけを選び、document-ir を作り
-    直して `human_md.render_docx`/`render_xlsx` へ渡し、`{rel}.md` だけを書き換える。
+    """人間向け `{rel}.md` だけの軽量再生成。
 
-    `world`（アーカイブ取り込み）: `human_md_sig_drift` と同じ（省略時は従来どおり `wd` だけ）。
-    `.document.json`/`.evidence.json`/`.rag.md`/`.rag_chunks.jsonl`・ES 索引には一切触れない
-    （`.rag_sig`/`.document_ir_sig` も変更しない＝RAG_ES 有効時でも ES を無駄に再索引させない）。
-
-    legacy `{rel}.md` の中身は ES の40行チャンク索引元になりうる（`docs/proposals/2026-08-28-
-    人間向けMDの刷新.md` §5/§6）——RAG_ES OFF の world では常に、RAG_ES ON の world でも
-    `rag_chunks` が無効/劣化した文書は legacy 縮退でこの経路を使うため、RAG_ES の設定だけでは
-    「ここでの `{rel}.md` 更新が ES に無関係」と言い切れない。ES 追随は `es_index.needs_reindex`
-    側が `asset_versions.human_md`/`.human_md_es_sig` マーカーを見て判断する（`es_index.py`
-    `_human_md_config_sig` 参照）。
-
-    legacy `.doc`/`.xls`: 変換キャッシュ（`legacy_convert.ensure_ooxml` が残す変換後 OOXML）が原本と一致して
-    残っているものだけ、そのキャッシュから作り直す（変換は再実行しない）。キャッシュが無い文書は据え置き、
-    次の通常取り込みが変換し直したときに現行版で書かれる。
-
-    **`.md` sidecar の有無では絞り込まない**: `human_md_sig_drift` と同じ理由で、空の
-    xlsx/docx（IR は構築できるが本文が無く `.md` を書かない rel）も評価対象にする——IR が構築でき
-    「今回の版で本文が無いことを確認できた」場合は失敗ではなく、`asset_versions.human_md` を現行版で
-    確定させて次回の再評価ループを止める（`.md` は書かない＝存在しない状態を維持する）。IR 構築
-    そのものが失敗した場合だけを `human_md_failed` へ計上する（fail-closed・次回 sync で再試行）。
-
-    失敗した rel は `human_md_failed`/`human_md_failures` へ計上し、マニフェストの
-    `asset_versions.human_md` を更新しない（次回 sync が再試行する＝fail-safe）。
-
-    **有効アーム（`SHERPA_ARMS`）に従う**: `human_md_sig_drift` と同じ理由で、`ooxml` アームが
-    無効化されている間は何もしない（対象拡張子を「未対応」のまま維持する）。
+    `human_md_sig_drift` が対象とする rel だけを選び、document-ir を作り直して `human_md.render_docx`/`render_xlsx` へ渡し、`{rel}.md` だけを書き換える
+    （`.document.json`/`.evidence.json`/`.rag.md`/`.rag_chunks.jsonl`・ES 索引・各 sig マーカーには触れない）。
+    - legacy `.doc`/`.xls`: 変換キャッシュが残っているものだけ、そのキャッシュから作り直す（無ければ据え置き）。
+    - IR が構築でき本文が無いと確認できた rel は `asset_versions.human_md` を現行版で確定し、`.md` は書かない。
+    - 失敗した rel は `human_md_failed`/`human_md_failures` へ計上し、`asset_versions.human_md` を更新しない（次回 sync が再試行する）。
+    - `world`・有効アームの扱いは `human_md_sig_drift` と同じ（`ooxml` アームが無効の間は何もしない）。
     """
     from . import arms as _arms
     from .. import scope_infer as si
@@ -640,7 +511,7 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     wd = Path(wd).resolve()
     dr = Path(derived)
     dr_rag = _sibling_layer_dir(dr, "rag")
-    dr_ir = _sibling_layer_dir(dr, "ir")          # `.derived.json` マニフェストは ir 層（§8.1 三階層）
+    dr_ir = _sibling_layer_dir(dr, "ir")          # `.derived.json` マニフェストは ir 層
     current = _current_human_md_sig()
     generated = failed = 0
     failures: list[dict] = []
@@ -658,8 +529,7 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
         elif ext == ".pptx" and not _md_is_from_ooxml_arm(dr, rel):
             continue
         if _is_sensitive_original(rp, rp.suffix.lower()):
-            # 秘匿名は human_md を一切持たない契約（`_is_sensitive_original` 参照）。除外しないと
-            # 秘匿本文が IR 経由で `{rel}.md` へ平文で書き出されうる。
+            # 秘匿名は human_md を持たない（`_is_sensitive_original` 参照）。除外しないと秘匿本文が `{rel}.md` へ平文で書き出される
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         versions = manifest.get("asset_versions") if isinstance(manifest, dict) else None
@@ -682,8 +552,7 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
             md = _pptx_md(source) if ext == ".pptx" else _render_human_md(ir, source, ext)
             if md is not None:
                 json_io.write_text_atomic(dr / (rel + ".md"), md)
-            # md is None（docx のみ実質発生・xlsx は human_md.render_xlsx が常に非 None を返す）は
-            # 失敗ではなく「今回の版で確認できた正当な空」＝.md は書かず manifest だけ確定させる。
+            # md is None（docx のみ）は失敗ではなく正当な空＝.md は書かず manifest だけ確定させる
         except OSError as e:
             failed += 1
             failures.append({"doc": rel, "reason": f"write_failed:{e.__class__.__name__}"})
@@ -702,11 +571,9 @@ def refresh_human_md(wd, derived, *, world: str | None = None) -> dict:
     return {"human_md_generated": generated, "human_md_failed": failed, "human_md_failures": failures}
 
 
-# ---- human_md の ES 反映 drift（世界単位・ホールドバック方式・`.rag_sig` と同型）----
-# `asset_versions.human_md`（rel 単位・render 済みかどうか）とは別物: こちらは「ES がこの版まで
-# 実際に索引反映できたか」を表す。`es_index.index_world` はクリーン再索引（delete→create→bulk）で、
-# 索引作成（`ensure_index`）は bulk の成否が判明する前に行われるため、bulk が部分失敗しても index
-# 自体は作られてしまう——bulk の成否を確認できる呼び出し元（`worker`）からしか確定できない。
+# ---- human_md の ES 反映 drift（資料フォルダ単位・ホールドバック方式・`.rag_sig` と同型）----
+# `asset_versions.human_md`（render 済みか）とは別物で、ES がこの版まで索引反映できたかを表す。
+# bulk の成否は `worker` しか確認できないため、マーカーの確定は `worker` が行う。
 _HUMAN_MD_ES_SIG_MARKER = ".human_md_es_sig"
 
 
@@ -723,15 +590,9 @@ def _write_human_md_es_sig_marker(dr: Path) -> bool:
 def confirm_human_md_es_sig(wd, derived, *, world: str | None = None) -> bool:
     """`.human_md_es_sig` を現行値で確定する（ES が bulk 成功でこの版まで追随できたと記録する）。
 
-    呼び出し元（`worker`）は `es_index.index_world()` の戻り値を検査し、失敗（`error` キー）が
-    無かった時だけこれを呼ぶ。ただし bulk 自体が成功していても、render 側（`human_md_sig_drift`）が
-    まだ現行版に追随できていない rel が残っている間は確定しない——その場合の bulk は古い
-    `{rel}.md` を含んだまま索引した可能性があり、「ES が現行版に追いついた」と言い切れないため。
-    確定できた（True）か、render 側の drift が残っていて確定を見送った・マーカーの書込自体が
-    失敗した（いずれも False）かを返す。呼び出し元は False の場合、失敗として扱う
-    （例: `ingest_runs` へ記録する）。
-
-    `world`（アーカイブ取り込み）: `human_md_sig_drift` へそのまま転送する（省略時は従来どおり）。
+    `worker` が `es_index.index_world()` の戻り値に失敗（`error` キー）が無いときだけ呼ぶ。
+    render 側（`human_md_sig_drift`）に未追随の rel が残る間は確定しない。
+    確定できたら True、見送り・書込失敗は False（呼び出し元は失敗として扱う）。`world` は `human_md_sig_drift` へ転送する。
     """
     wd = Path(wd).resolve()
     dr = Path(derived)
@@ -741,17 +602,10 @@ def confirm_human_md_es_sig(wd, derived, *, world: str | None = None) -> bool:
 
 
 def drop_human_md_es_sig_marker(derived_md_dir) -> bool:
-    """`.human_md_es_sig` を明示的に未確定へ戻す（`drop_rag_sig_marker` と同型・削除失敗を
-    検知できる版）。
+    """`.human_md_es_sig` を明示的に未確定へ戻す（`drop_rag_sig_marker` と同型）。
 
-    **再索引を始める前に必ず呼ぶ**（RAG-KV 提案書の `.rag_sig` と同じ順序）: 呼ばずに
-    `es_index.index_world()` を直接呼ぶと、以前の成功で既に確定済みのマーカーが残ったまま
-    今回の bulk が部分失敗しても、`_human_md_config_sig` は（pending でなくなっているため）
-    現行版を返してしまい、ES 自身の `_meta` には「成功して確定した版」のはずの値が
-    `ensure_index()`（bulk 実行**前**）の時点で書かれてしまう——bulk の成否と無関係に meta が
-    確定値になる「二段階更新の穴」になる。成功時 True、削除失敗（`OSError`）時は False
-    （呼び出し元は失敗をログに残しつつ、それでも再索引自体は続行してよい＝この失敗は
-    ベストエフォートの安全弁の劣化であって再索引を止める理由ではない）。
+    再索引を始める前に必ず呼ぶ（呼ばないと、確定済みマーカーが残ったまま bulk が部分失敗しても meta に確定値が書かれる）。
+    成功時 True、削除失敗（`OSError`）時は False（呼び出し元はログに残して再索引を続行してよい）。
     """
     try:
         (Path(derived_md_dir) / _HUMAN_MD_ES_SIG_MARKER).unlink(missing_ok=True)
@@ -774,9 +628,9 @@ def human_md_es_sig_drift(derived) -> bool:
         return True
 
 
-# ---- Canonical Evidence IR版 drift（E2a/E2b/E4・XLSX/DOCX/PPTX）----
-# 現行 document-ir-v2 は置換せず並行生成する。Evidence IR のschema/parser変更だけでMDや既存IRを
-# 作り直さないよう、独立マーカーと軽量refreshを持つ。
+# ---- Canonical Evidence IR 版 drift ----
+# Document IR は置換せず並行生成する。Evidence IR の schema/parser 変更だけで MD や既存 IR を作り直さないよう、
+# 独立マーカーと軽量 refresh を持つ。
 _EVIDENCE_IR_SIG_MARKER = ".evidence_ir_sig"
 
 
@@ -820,23 +674,16 @@ def evidence_ir_sig_drift(derived_md_dir) -> bool:
         return True
 
 
-# ---- Evidence IR由来のpipe-free RAG表現版 drift（E3）----
+# ---- Evidence IR 由来の pipe-free RAG 表現版 drift ----
 _RAG_SIG_MARKER = ".rag_sig"
 
 
 def _archive_also_root(world: str | None) -> Path | None:
-    """アーカイブ取り込み（zip/tar(.gz)/tgz）: `world` が分かれば、その展開先
-    （`worlds.archives_dir`・存在しなければ呼び出し側は何も変わらない）を返す——
-    `scope_infer.safe_files(wd, also=...)` へそのまま渡すための唯一の入口（office_md 内の
-    原本ツリー走査＝変換・drift 判定・軽量再生成の**全箇所**がこのヘルパーを共有する＝
-    「展開先を第2の原本の根として扱う」ロジックを1か所に集約し、呼び出し側ごとに
-    二重実装しない）。展開先の木は `<アーカイブの相対パス>/<中のパス>` という doc_id と
-    同じ相対パス構造を持つため、`wd` と `also` を合わせて歩いた結果の `rel` はそのまま
-    派生物（md/rag/ir）の置き場キーとして使える（原本ツリーへは一切書かない）。
+    """アーカイブ取り込み（zip/tar(.gz)/tgz）: `world` が分かれば、その展開先（`worlds.archives_dir`）を返す。
 
-    `world` 不明（省略されたテスト/軽量 API 呼び出し等）なら `None`——`scope_infer.safe_files`
-    は `also=None` を「合流なし」として扱うため、既存呼び出し元（`world` を渡さない）は
-    完全に無変更のまま。
+    `scope_infer.safe_files(wd, also=...)` へ渡すための唯一の入口で、原本ツリー走査（変換・drift 判定・軽量再生成）の全箇所が共有する。
+    展開先は doc_id と同じ相対パス構造を持つため、`wd` と合わせて歩いた `rel` は派生物の置き場キーにそのまま使える
+    （原本ツリーへは書かない）。`world` 不明なら None（合流なし）。
     """
     if not world:
         return None
@@ -847,10 +694,8 @@ def _archive_also_root(world: str | None) -> Path | None:
 def _resolve_ocr_observation_dir(world: str | None) -> Path | None:
     """`world` の公開中 OCR 観測ディレクトリ（無効/未指定/未公開は None）。
 
-    `worlds.observation_dir` は Canonical `derived_dir` と物理 root を分ける契約（隔離 OCR worker
-    への read-only 境界）のため、`world` 文字列でしか辿れない——`office_md.py` の他関数群は
-    Path のみで動く慣習だが、ここだけは `worlds` を遅延 import する（`worlds.py` 側の
-    `ingest.derived_generation`/`ingest.observation_render` import も遅延のため循環しない）。
+    `worlds.observation_dir` は `derived_dir` と物理 root を分ける（隔離 OCR worker への read-only 境界）ため、
+    `world` 文字列でしか辿れない。循環を避けて `worlds` を遅延 import する。
     """
     if not world or not ocr_enabled():
         return None
@@ -859,12 +704,7 @@ def _resolve_ocr_observation_dir(world: str | None) -> Path | None:
 
 
 def _ocr_observation_marker_for(obs_dir: Path | None) -> str | None:
-    """`obs_dir`（`_resolve_ocr_observation_dir` の戻り値）を `.rag_sig` 用の不透明な印にする。
-
-    OCR が新しい観測世代を公開するたび（＝この world の何らかの文書の OCR 完了）値が変わる
-    （`observation_render.active_observation_dir` は `{canonical_generation_id}/{observation_generation_id}`
-    を返すため）。観測なしは None＝`_current_rag_sig` は `"none"` として扱う。
-    """
+    """`obs_dir` を `.rag_sig` 用の不透明な印にする。観測世代が公開されるたび値が変わる。観測なしは None（`_current_rag_sig` は `"none"` として扱う）。"""
     return f"{obs_dir.parent.name}/{obs_dir.name}" if obs_dir is not None else None
 
 
@@ -874,14 +714,10 @@ def current_ocr_observation_marker(world: str | None) -> str | None:
 
 
 def _current_rag_sig(*, ocr_observation_marker: str | None = None) -> str:
-    """Evidence版を包含するRAG renderer/chunker署名。
+    """Evidence 版を包含する RAG renderer/chunker の署名。
 
-    `ocr_observation_marker`（O1）: 公開中 OCR 観測世代の印。rag.md の内容は
-    Evidence 自体が不変でも OCR 観測（非同期・後から届く）が新しく公開されると変わりうるため
-    （`evidence_render.render(observation_set=...)` へ VLM と合流して渡す・§8.1 一本化）、
-    この次元を含めることで OCR 完了後の次回 sync が `refresh_rag` を自然に誘発し、
-    既存の `.rag_sig`/holdback/`_reindex_after_rag_rewrite` 連鎖にそのまま乗る
-    （新しい再生成・再索引の仕組みは作らない）。
+    `ocr_observation_marker`: 公開中 OCR 観測世代の印。rag.md の内容は OCR 観測が公開されると変わりうるため、
+    この次元を含めて OCR 完了後の次回 sync に `refresh_rag` を誘発させる。
     """
     from . import ai_observation, context_ir, evidence_render, metafile_text
 
@@ -913,20 +749,14 @@ def _write_rag_sig_marker(dr: Path, *, ocr_observation_marker: str | None = None
 def write_rag_sig_marker(derived_md_dir, *, world: str | None = None) -> None:
     """`.rag_sig` を現行値で確定する公開ヘルパ。
 
-    `refresh_evidence_ir`/`refresh_rag` を `write_rag_sig_marker=False` で呼んだ場合、確定は
-    ES 反映の成否を確認できる呼び出し元（`worker`）へ委ねられる（マーカー保留方式）。呼び出し元は
-    ES 反映が成功した時だけこれを呼ぶ。`world` を渡すと OCR 観測次元（O1）も現行値で確定する
-    （渡さなければ「観測なし」として確定＝OCR 無効/世界不明な旧呼び出し元は挙動不変）。
+    `refresh_evidence_ir`/`refresh_rag` を `write_rag_sig_marker=False` で呼んだ場合、確定は ES 反映の成否を確認できる
+    呼び出し元（`worker`）が、成功時だけ行う。`world` を渡すと OCR 観測次元も現行値で確定する（渡さなければ「観測なし」）。
     """
     _write_rag_sig_marker(Path(derived_md_dir), ocr_observation_marker=current_ocr_observation_marker(world))
 
 
 def drop_rag_sig_marker(derived_md_dir) -> bool:
-    """`.rag_sig` を明示的に未確定へ戻す（削除失敗を検知できる版・`_remove_marker` は使わない）。
-
-    `_remove_marker` は `OSError` を握り潰すため、削除に失敗したまま先へ進むと保留方式の
-    前提（生成開始時点で必ず未確定）が壊れる。成功時 True、削除失敗（`OSError`）時は False。
-    """
+    """`.rag_sig` を明示的に未確定へ戻す。削除失敗を検知できる（`_remove_marker` は `OSError` を握り潰す）。成功時 True、削除失敗時は False。"""
     try:
         (Path(derived_md_dir) / _RAG_SIG_MARKER).unlink(missing_ok=True)
         return True
@@ -946,8 +776,7 @@ def rag_sig_drift(derived_md_dir, *, world: str | None = None) -> bool:
 
 
 def _remove_marker(dr: Path, name: str):
-    """失敗時に stale な版マーカーを消す: 現行値のマーカーが残っていると
-    drift=False になり、欠落した派生物（document.json 等）の修復フックが二度と走らない。best-effort。"""
+    """失敗時に stale な版マーカーを消す（現行値のマーカーが残ると drift=False になり修復フックが走らなくなる）。best-effort。"""
     try:
         (dr / name).unlink(missing_ok=True)
     except OSError:
@@ -1051,14 +880,11 @@ def _build_figure_texts(extracted_evidence, assets_dir: Path) -> dict[str, list[
 
 
 def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
-    """`vision` が有効かつ VLM 実効可のときだけ、canonical が読めない画像要素を補足観測する（L8）。
+    """`vision` が有効かつ VLM 実効可のときだけ、canonical が読めない画像要素を補足観測する。
 
-    既定（`vision` が有効アームに無い、または VLM が実効利用不可）は常に None＝コストゼロで
-    `evidence_render.render(observation_set=None)` と同じ挙動になる。候補選定は
-    `ocr_router.build_manifest`（OCR ルーティングと同じ規則＝picture/image_fill 等 OOXML が画素の
-    中身を持たない要素だけを selected とする）をこの場で再計算するだけで、`.ocr_route.json`
-    （`_write_ocr_routes`・世代全体をまとめて処理する非同期 OCR 経路向け）とは独立（二重採用ではなく
-    同じ決定規則の別呼び出し）。`asset_root` は呼び出し元が直前に抽出済みの `{rel}.assets/` を渡す。
+    既定（`vision` が有効アームに無い、または VLM が実効利用不可）は None＝`evidence_render.render(observation_set=None)` と同じ。
+    候補選定は `ocr_router.build_manifest` を呼び直すだけで、`.ocr_route.json` とは独立。
+    `asset_root` は直前に抽出済みの `{rel}.assets/`。
     """
     from . import arms as _arms
     from . import ocr_router
@@ -1085,23 +911,18 @@ def _build_vlm_observation_set(extracted_evidence, rel: str, assets_dir: Path):
         return vision_arm.build_asset_observations(
             extracted_evidence, decisions=decisions, asset_root=assets_dir)
     except Exception:
-        # 補足観測は任意（既定OFF）。VLM/Set構築の想定外失敗でCanonicalのrag.md生成を巻き添えにしない。
+        # 補足観測は任意。VLM/Set 構築の想定外失敗で Canonical の rag.md 生成を巻き添えにしない
         _log.warning(
             "VLM 補足観測の生成に失敗しました（Canonical の生成は継続）: %s", rel, exc_info=True)
         return None
 
 
 def _load_ocr_observation_sets(extracted_evidence, rel: str, obs_dir: Path | None) -> list:
-    """`obs_dir`（公開中 OCR 観測ディレクトリ）から、この `rel` 分の Observation Set 群を読む（O1）。
+    """`obs_dir`（公開中 OCR 観測ディレクトリ）から、この `rel` 分の Observation Set 群を読む。
 
-    OCR は隔離 worker が非同期に書く別成果物（`{rel}.ai_observations.jsonl`・
-    `observation_render.artifact_paths` と同じ命名）。1 文書に複数画像があれば複数 Set が
-    JSONL の行として並ぶ（`observation_render._StreamingObservationBundle.add` が1 job＝1行）。
-    ここで読む Set は `ai_observation.from_json_str(..., ir=extracted_evidence)` により
-    `source_content_hash` が**今の** Evidence と一致することを再検証する——世界の他文書だけが
-    変わって OCR 観測世代が古くなっていない場合でも、この文書自体が変わっていれば安全に弾かれる。
-    読めない/検証失敗は「この文書の OCR 観測なし」へ縮退する（VLM 単独と同じ fail-safe・
-    Canonical の rag.md 生成を巻き添えにしない）。
+    OCR は隔離 worker が非同期に書く別成果物（`{rel}.ai_observations.jsonl`・1 job＝1 行）。
+    各 Set は `ai_observation.from_json_str(..., ir=extracted_evidence)` で `source_content_hash` が今の Evidence と一致することを再検証し、
+    古い観測は弾く。読めない/検証失敗は「この文書の OCR 観測なし」へ縮退する。
     """
     if obs_dir is None:
         return []
@@ -1129,13 +950,9 @@ def _load_ocr_observation_sets(extracted_evidence, rel: str, obs_dir: Path | Non
 
 
 def _build_observation_set(extracted_evidence, rel: str, assets_dir: Path, *, obs_dir: Path | None = None):
-    """VLM（同期）と OCR（非同期・公開済み分）の観測 Set を合流し、`evidence_render.render` へ渡す
-    1つの Set にする（O1・§8.2 の器へ OCR も乗せる）。
+    """VLM（同期）と OCR（非同期・公開済み分）の観測 Set を合流し、`evidence_render.render` へ渡す 1 つの Set にする。
 
-    どちらも無ければ None（従来どおり）。片方だけなら合成 Set を作らずそのまま返す
-    （`ai_observation.merge_sets` の契約＝単一由来なら provider/model の本文表記を壊さない）。
-    両方あるときだけ `merge_sets` で1つへ畳む——合流自体が失敗した場合は VLM 単独へ縮退する
-    （OCR の想定外failure でCanonicalのrag.md生成を止めない・既存の fail-safe 方針を踏襲）。
+    どちらも無ければ None。片方だけなら合成せずそのまま返す。両方あるときだけ `merge_sets` で畳み、合流が失敗したら VLM 単独へ縮退する。
     """
     vlm_set = _build_vlm_observation_set(extracted_evidence, rel, assets_dir)
     ocr_sets = _load_ocr_observation_sets(extracted_evidence, rel, obs_dir)
@@ -1198,26 +1015,20 @@ def _build_source_failure_evidence(source_path: Path, *, detail: dict | None = N
     )
 
 
-# ---- 安全な差し替え（簡易版の世代公開） ----
-# 公開中の派生ディレクトリを**先に全消し**してから1件ずつ作り直すと、数十秒〜分かかる
-# 変換の間ずっと検索対象が欠け、途中で失敗するとその中途半端な状態が次の同期まで残る。
-# 別ディレクトリへ作り切ってから**改名2回で差し替える**（改名は一瞬）。失敗時はステージングを
-# 捨てるだけで公開中の内容は無傷のまま残る。
-# フル世代管理（世代ID・active ポインタ・世代マニフェスト・coverage台帳）は将来の課題として保留。
+# ---- 安全な差し替え（世代公開） ----
+# 公開中の派生ディレクトリを先に全消しせず、別ディレクトリへ作り切ってから改名 2 回で差し替える。
+# 失敗時はステージングを捨てるだけで公開中の内容は無傷。
 _STAGING_SUFFIX = ".staging"
 _RETIRED_SUFFIX = ".retired"
 
 
-# ---- フォルダ三分割（§8.1）----------------------------------------------------
-# 派生物は md（人間用）／rag（RAG 正本＋証跡）／ir（中間表現）の3層に物理分離する。呼び出し元
-# （worker.py 等）は従来どおり `derived_md_dir(world)` だけを渡し続け、rag/ir はここで**その兄弟**
-# （同じ derived root 配下）として導出する——呼び出し側のシグネチャを変えずに済む。
-# `.arms_sig`/`.document_ir_sig`/`.evidence_ir_sig`/`.rag_sig`/`.human_md_es_sig`/`.world_sig` 等
-# の world 単位マーカーは**現行位置のまま**（md 層に刻む・層に属さない world 単位の状態）。
+# ---- 派生物の 3 層（md／rag／ir）----
+# 派生物は md（人間用）／rag（RAG 正本＋証跡）／ir（中間表現）の 3 層に物理分離する。
+# 呼び出し元は `derived_md_dir(world)` だけを渡し、rag/ir はその兄弟として導出する。
+# `.arms_sig`/`.document_ir_sig`/`.evidence_ir_sig`/`.rag_sig`/`.human_md_es_sig`/`.world_sig` 等の資料フォルダ単位マーカーは md 層に置く。
 def _sibling_layer_dir(md_variant: Path, layer: str) -> Path:
-    """`md_variant`（公開中／ステージング／退避のいずれかの md 層パス）と同じ変種の
-    `layer`（'rag'|'ir'）兄弟ディレクトリを返す。md と同じ生成/公開サイクル（ステージング→
-    改名2回での差し替え）を共有するため、staging/retired サフィックスも一致させる。
+    """`md_variant`（公開中／ステージング／退避のいずれかの md 層パス）と同じ変種の `layer`（'rag'|'ir'）兄弟ディレクトリを返す。
+    staging/retired サフィックスも一致させる。
     """
     name = md_variant.name
     for suffix in (_STAGING_SUFFIX, _RETIRED_SUFFIX):
@@ -1227,18 +1038,17 @@ def _sibling_layer_dir(md_variant: Path, layer: str) -> Path:
 
 
 def _stamp_rule_only_rag_markdown(markdown: str) -> str:
-    """rag.md 書込直前に `生成手段: 規則` を刻む（L5・§8.3-1・rag.md は必ずこの申告を持つ契約）。
+    """rag.md 書込直前に `生成手段: 規則` を刻む（rag.md は必ずこの申告を持つ）。
 
-    sync 経路（ここ）は規則版を即時生成するだけで LLM は呼ばない——LLM 成形は取り込み後の
-    バックグラウンド後追い（`llm_render.run_world_pass`）が `生成手段: 規則` を目印に拾って行う。
+    sync 経路は規則版を即時生成するだけで LLM は呼ばない。LLM 成形は取り込み後のバックグラウンド
+    （`llm_render.run_world_pass`）が `生成手段: 規則` を目印に拾って行う。
     """
     from . import llm_render
     return llm_render.stamp_rule_only(markdown)
 
 
-# `.derived.json`（sidecar マニフェスト）が横断的に記録する5種の sidecar 種別（`_MANIFEST_SIDECAR_SUFFIXES`
-# 参照）が実際にどの層へ物理配置されるか。中間（ir）: document/evidence/derived/ocr_route の各 json。
-# RAG 正本（rag）: rag.md・rag_chunks.jsonl・assets/。人間用（md）: md・md.meta.json。
+# `.derived.json`（sidecar マニフェスト）が記録する 5 種の sidecar 種別（`_MANIFEST_SIDECAR_SUFFIXES`）がどの層へ置かれるか。
+# 中間（ir）: document/evidence/derived/ocr_route の各 json。RAG 正本（rag）: rag.md・rag_chunks.jsonl・assets/。人間用（md）: md・md.meta.json。
 _LAYER_FOR_SIDECAR_SUFFIX = {
     ".md": "md",
     ".md.meta.json": "md",
@@ -1249,19 +1059,15 @@ _LAYER_FOR_SIDECAR_SUFFIX = {
     ".rag.md": "rag",
     ".rag_chunks.jsonl": "rag",
 }
-# 公開中の派生物が「どの World 内容から作られたか」を刻む印。簡易版の世代公開では、この署名が
-# 上流のフル世代管理でいう generation ID の役割を果たす（`derived_generation` 参照）。
+# 公開中の派生物が「どの資料フォルダの内容から作られたか」を刻む印（`derived_generation` 参照）
 _WORLD_SIG_MARKER = ".world_sig"
 _OCR_ENABLED_ENV = "SHERPA_OCR_ENABLED"
 
 
 def ocr_enabled() -> bool:
-    """OCR 観測が有効か。**既定 ON**（「初期から組み込む」設計）。
+    """OCR 観測が有効か。既定 ON。
 
-    ここで有効なのは取り込み側の**ルート生成**（どのラスタを読むかを決めるだけ・実測4.1秒/52文書）。
-    読み取り本体は隔離ワーカーが行うため、ワーカーが動いていなければ指示が溜まるだけで、
-    取り込みも検索も従来どおり動く（＝既定 ON にしても壊れない）。
-
+    取り込み側で有効なのはルート生成（どのラスタを読むかを決めるだけ）。読み取り本体は隔離ワーカーが行う。
     `SHERPA_OCR_ENABLED=0` で止められる。
     """
     raw = os.environ.get(_OCR_ENABLED_ENV)
@@ -1271,8 +1077,7 @@ def ocr_enabled() -> bool:
 
 
 def write_ocr_route_sig_marker(dr) -> None:
-    """`.ocr_route_sig` を確定する。OCR refresh の enqueue が成功した後にだけ呼ぶこと
-    （先に確定すると enqueue 失敗時に次回 sync が再試行の入口を失う）。"""
+    """`.ocr_route_sig` を確定する。OCR refresh の enqueue が成功した後にだけ呼ぶこと（先に確定すると enqueue 失敗時に再試行の入口を失う）。"""
     dr = Path(dr)
     from . import ocr_router
     try:
@@ -1290,10 +1095,8 @@ def ocr_route_refresh_needed(derived) -> bool:
 def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
     """ルート版が古い／欠けている `.ocr_route.json` だけを、公開中の Evidence と assets から作り直す。
 
-    あわせて全ルートについて、「読めない画像形式」として対象外の入力に残っている過去の
-    queued/failed job を cancelled へ終端する（refresh run の進み具合に依存させない）。
-    Evidence・rag.md・ES には触れない（ルートの分類規則だけが変わった時の軽量経路）。
-    マーカー（`.ocr_route_sig`）はここでは確定しない（呼び出し元が全件成功を確認して確定）。
+    あわせて全ルートについて、「読めない画像形式」として対象外の入力に残っている過去の queued/failed job を cancelled へ終端する。
+    Evidence・rag.md・ES には触れない。マーカー（`.ocr_route_sig`）は呼び出し元が全件成功を確認して確定する。
     """
     from . import evidence_ir, metafile_text, ocr_router
     from ..store import ocr_jobs
@@ -1328,12 +1131,11 @@ def refresh_ocr_routes(derived, *, world: str, generation_id: str) -> dict:
 
 
 def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
-    """OCR 実行とは独立に、Evidence 内の全ラスタ候補を決定的に分類する（上流 38ffa52 の移植）。
+    """OCR 実行とは独立に、Evidence 内の全ラスタ候補を決定的に分類する。
 
-    ここは「読む/読まない」を決めるだけで、画像の意味は推定しないし OCR も走らせない。
-    `{rel}.evidence.json`/出力の `{rel}.ocr_route.json` はいずれも ir 層ステージング（`stage_ir`）、
-    asset inventory は rag 層ステージング（`stage_rag`）から読む（§8.1 三階層・`.assets/` は
-    `rag.md` と同じ層）。公開と同時に切り替わる。
+    「読む/読まない」を決めるだけで、画像の意味は推定せず OCR も走らせない。
+    `{rel}.evidence.json` と出力の `{rel}.ocr_route.json` は ir 層ステージング（`stage_ir`）、
+    asset inventory は rag 層ステージング（`stage_rag`）から読む。
     """
     from . import evidence_ir, ocr_router
 
@@ -1355,17 +1157,12 @@ def _write_ocr_routes(stage_ir: Path, stage_rag: Path) -> dict:
 
 
 def _recover_interrupted_swap(target: Path) -> None:
-    """改名2回の間で中断した場合（公開中が無く退避先だけがある）に、退避先を公開中へ戻す。
+    """改名 2 回の間で中断した場合（公開中が無く退避先だけがある）に、退避先を公開中へ戻す。
 
-    状態遷移（呼び出し元 `_build_derived_into_staging` の setup 段階から見た表）:
-      - target 有り                              → 中断なし。何もしない。
-      - target 無し・retired 無し                → 中断ではない（初回ビルド・まだ何も公開していない）。何もしない。
-      - target 無し・retired 有り→rename 成功    → 中断から復旧。target が旧内容で復活。
-      - target 無し・retired 有り→rename 失敗    → **二重障害**（前回の公開失敗時のロールバックに続き、
-        今回の復旧も失敗）。ここで例外を握り潰して続行すると、後続の `dr.mkdir`/`_publish_staging` へ
-        進んでしまい、`_publish_staging` 冒頭の `shutil.rmtree(retired, ...)` が唯一残った旧世代
-        （retired）ごと削除する——派生物が全消失する。retired を消さずに例外を送出し、呼び出し元
-        （`_build_derived_into_staging`）の `derived_setup_failed` として打ち切らせる（fail-loud）。
+    - target 有り: 何もしない。
+    - target 無し・retired 無し: 初回ビルドのため何もしない。
+    - target 無し・retired 有り: retired を target へ rename して復旧する。rename に失敗したら（二重障害）例外を送出する。
+      握り潰すと後続の `_publish_staging` が retired（唯一残った旧世代）を削除し、派生物が全消失する。
     """
     retired = target.with_name(target.name + _RETIRED_SUFFIX)
     if not target.exists() and retired.is_dir():
@@ -1383,14 +1180,8 @@ def _recover_interrupted_swap(target: Path) -> None:
 def _publish_staging(staging: Path, target: Path) -> None:
     """ステージングを公開中へ差し替える（旧公開分は削除）。同一ファイルシステム内の改名のみ。
 
-    後半の改名（staging→target）が失敗すると、target は既に retired へ退避済み＝target が
-    存在しない状態になる（派生 root ごと消え、Office 文書が grep 不能になる）。これを避けるため、
-    後半が失敗したら retired→target で即時ロールバックしてから例外を再送出する（呼び出し元は
-    「公開失敗」を記録するだけでよく、旧内容の復元まで意識しなくてよい）。ロールバック自体が
-    失敗した場合、旧内容そのものは失われない（retired へ退避したままレイアウト上は無傷で
-    残り続ける）が、target が不在のまま公開できない状態になる——その旨をログへ残す
-    （隠蔽しない・fail-loud）。旧内容自体の復旧は次回 build の `_recover_interrupted_swap`
-    が試みる（それも失敗した場合の扱いはそちらの docstring 参照）。
+    後半の改名（staging→target）が失敗したら、retired→target で即時ロールバックしてから例外を再送出する。
+    ロールバック自体が失敗した場合は旧内容が retired に残るため、その旨をログに残す（次回 build の `_recover_interrupted_swap` が復旧を試みる）。
     """
     retired = target.with_name(target.name + _RETIRED_SUFFIX)
     shutil.rmtree(retired, ignore_errors=True)
@@ -1413,8 +1204,7 @@ def _publish_staging(staging: Path, target: Path) -> None:
 
 
 def _proc_rss_gib() -> float | None:
-    """自プロセスの RSS（GiB）。/proc/self/status の VmRSS を読む（Linux 専用・読めなければ None）。
-    重い変換の前後で実メモリをログへ出すため（閉域実機の OOM 観測対応）。"""
+    """自プロセスの RSS（GiB）。/proc/self/status の VmRSS を読む（Linux 専用・読めなければ None）。重い変換の前後でログへ出す。"""
     try:
         with open("/proc/self/status", encoding="ascii", errors="replace") as f:
             for line in f:
@@ -1428,15 +1218,9 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
                   world_sig: str | None = None, world: str | None = None) -> dict:
     """公開中の派生物を壊さずに作り直す薄いラッパ。
 
-    実体は `_build_derived_into_staging`。途中で例外が起きてもステージングを残さない
-    （残骸が次回の `rmtree` まで容量を占めるのを避ける）。公開中の内容には触れないため、
-    例外がそのまま呼び出し元へ伝播しても検索は従来どおり動き続ける。
-
-    `world_sig` を渡すと、公開する派生物に**その中身を作った World 署名**を刻む
-    （`.world_sig`）。OCR のような後段の任意処理が「今公開されている派生物はどの内容から
-    作られたか」を、原本を再スキャンせずに確かめるために使う（`derived_generation` 参照）。
-
-    `world`（O1）は `_build_derived_into_staging` docstring 参照。
+    実体は `_build_derived_into_staging`。途中で例外が起きてもステージングを残さず、公開中の内容には触れない。
+    `world_sig` を渡すと、公開する派生物にその中身を作った資料フォルダ署名を刻む（`.world_sig`・`derived_generation` 参照）。
+    `world` は `_build_derived_into_staging` 参照。
     """
     published = Path(derived)
     published_rag = _sibling_layer_dir(published, "rag")
@@ -1455,9 +1239,8 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
         for s in all_staging:
             shutil.rmtree(s, ignore_errors=True)
         return rep
-    # OCR は任意観測（既定OFF）。有効時だけ、公開前のステージング上で**どのラスタを読むか**を
-    # 決定的に分類しておく（OCR 自体は実行しない＝隔離 worker の仕事）。ここで作れば、公開と
-    # 同時にルートも入れ替わり、Evidence とルートが食い違う瞬間が生まれない。
+    # OCR は任意観測。有効時だけ、公開前のステージング上でどのラスタを読むかを決定的に分類する（OCR 自体は隔離 worker の仕事）。
+    # 公開と同時にルートも入れ替わるため、Evidence とルートが食い違わない。
     if ocr_enabled():
         try:
             rep["ocr_routes"] = _write_ocr_routes(staging_ir, staging_rag)
@@ -1471,15 +1254,9 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
             json_io.write_text_atomic(staging / _WORLD_SIG_MARKER, world_sig + "\n")
         except OSError as e:                         # 署名が刻めなければ後段は「不明」として動かない
             rep["world_sig_error"] = f"{e.__class__.__name__}"
-    # 完了Gate: 「作り切れた」ときだけ公開中と差し替える。文書ごとの変換失敗は failed notice へ
-    # 縮退済みで正常系（S3の契約＝失敗も索引する）。ここで見るのは**縮退すらできなかった失敗**
-    # （`_generate_evidence` のコメント「notice自体のrenderに失敗した場合だけ…公開を止める」）。
-    # 止めた場合、公開中は旧内容のまま生き続ける（欠けた状態を見せない）。
-    # `document_ir_failed` はここに含めない: docx/xlsx の document-ir 構築失敗は
-    # `OoxmlArm.convert()` が必ず notes 付き ArmResult を返し、呼び出し元がそのまま
-    # evidence-notice（failed notice）へ縮退させる正常系（S3の契約と同じ）——`.document_ir_sig`
-    # マーカーを確定しない（次回 sync が再試行する）という形で drift 検知には残るが、
-    # 公開全体を止める理由にはならない（壊れた1文書のために案件全体の取り込みを失敗させない）。
+    # 完了 Gate: 「作り切れた」ときだけ公開中と差し替える。文書ごとの変換失敗は failed notice へ縮退済みの正常系で、
+    # ここで見るのは縮退すらできなかった失敗。止めた場合は公開中の旧内容が生き続ける。
+    # `document_ir_failed` はここに含めない（failed notice へ縮退する正常系。`.document_ir_sig` を確定せず次回 sync が再試行する）。
     blocking = {key: rep.get(key) or 0 for key in (
         "rag_failed", "evidence_ir_failed", "unhandled_failed") if rep.get(key)}
     if blocking:
@@ -1487,15 +1264,8 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
             shutil.rmtree(s, ignore_errors=True)
         rep["error"] = "derived_incomplete:" + ",".join(f"{k}={v}" for k, v in sorted(blocking.items()))
         return rep
-    # 3層それぞれ独立に改名2回で差し替える（§8.1・フォルダ分離）。跨ぎでの原子性は無い——
-    # 同一ファイルシステムの rename 自体は高信頼だが、途中で1層だけ失敗すると3層が食い違う
-    # 瞬間が生まれうる（次回 sync の drift 検知/全再構築が自己修復する・複数ディレクトリを
-    # 束ねるフル世代管理は将来課題として保留、`_STAGING_SUFFIX` 冒頭コメントと同じ判断）。
-    # **1層の失敗が他層の公開試行を止めない**（`try/except` を層ごとに独立させる）: 各層は
-    # 自分の staging/retired だけで完結する独立した差し替えであり、他層の障害の有無に関わらず
-    # 自分自身の公開を試みるのが「独立」の実質——1層目で例外を伝播させて残りを試みずに終えると、
-    # 障害と無関係な層まで（旧内容のまま／`_publish_staging` 自身の失敗時ロールバックも含め）
-    # 一律未実行になってしまう。
+    # 3 層それぞれ独立に改名 2 回で差し替える。跨ぎでの原子性は無く、1 層だけ失敗した場合は次回 sync の drift 検知/全再構築が自己修復する。
+    # 1 層の失敗が他層の公開試行を止めない（`try/except` を層ごとに独立させる）。
     publish_failures: list[str] = []
     for staging_dir, published_dir in (
         (staging_ir, published_ir), (staging_rag, published_rag), (staging, published),
@@ -1503,13 +1273,10 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
         try:
             _publish_staging(staging_dir, published_dir)
         except OSError as e:
-            # `_publish_staging` は後半 rename 失敗時に旧公開中（retired）を published へ自前で
-            # ロールバックを試みる。ロールバックが成功すれば published は旧内容のまま生き続けるが、
-            # ロールバック自体も失敗した場合は published が不在のまま（旧内容は retired 側に残る・
-            # `_publish_staging` の docstring／`_recover_interrupted_swap` 参照）。
+            # `_publish_staging` は後半 rename 失敗時に旧公開中（retired）を published へロールバックする。
+            # ロールバックも失敗した場合は published が不在のまま（旧内容は retired に残る・`_recover_interrupted_swap` 参照）。
             publish_failures.append(f"{published_dir.name}:{e.__class__.__name__}")
-    # 成功した層は staging が rename 済み（既に存在しない）ので no-op。失敗した層だけ、
-    # 公開できなかった中途半端な新内容がここで掃除される。
+    # 成功した層は staging が rename 済みで no-op。失敗した層だけ、公開できなかった新内容がここで掃除される。
     for s in all_staging:
         shutil.rmtree(s, ignore_errors=True)
     if publish_failures:
@@ -1518,22 +1285,13 @@ def build_derived(wd, derived, *, progress: Callable[[int, int], None] | None = 
 
 
 def _check_partial_extraction(rp: Path, md: str, rel: str, document, out: list[dict]) -> None:
-    """静かな部分抽出の疑いを検知する（ING-1・安価な整合チェックのみ・新パーサ/深いカバレッジ計算はしない）。
+    """静かな部分抽出の疑いを検知する（安価な整合チェックのみ）。
 
-    **失敗にはしない**（呼び出し元の変換は成功のまま継続する）。疑いがあれば `out` へ
-    `{"doc": rel, "basis": "size_ratio"|"xlsx_row_ratio", ...根拠の数値}` を1件だけ追記する
-    （両方の根拠が同時に成立しても1文書1件——`size_ratio` を先に見る＝拡張子を問わない粗い網）。
-    `document`（`ooxml_arm` が返す `DocumentIR | None`）の `sheet` 要素が持つ
-    `source_map["partial_extraction_suspected"]`（`_build_xlsx_ir` が cap 打切りと独立に判定済み・
-    H2 の自己申告打切りはそちらで除外済み）を読むだけで、ここで再判定はしない。
-
-    H2 の自己申告打切り（`sheet.source_map["truncated"]`）は**文書全体の `size_ratio` 判定だけ**
-    省略させる（サイズ比判定より先に確認する）。打切りがあるシートを含む文書は、生成MDが本来の
-    内容より小さいことが既に自己申告済み＝正常（打切り注記そのものが短い）なので、`size_ratio`
-    判定では「抽出不完全の疑い」にしない。ただし打切りは1シート単位の事情であり、**別のシート**が
-    （cap 打切りとは独立に）`partial_extraction_suspected` を立てていることはありうるため、
-    以降の xlsx_row_ratio 走査は打切りの有無に関わらず必ず実行する（1枚の自己申告打切りが
-    他シートの疑いまで消してしまうと最小入力の出力が空になっていた）。
+    失敗にはしない。疑いがあれば `out` へ `{"doc": rel, "basis": "size_ratio"|"xlsx_row_ratio", ...根拠の数値}` を
+    1 文書 1 件だけ追記する（`size_ratio` を先に見る）。
+    `document` の `sheet` 要素の `source_map["partial_extraction_suspected"]`（`_build_xlsx_ir` が判定済み）を読むだけで再判定しない。
+    自己申告の打切り（`sheet.source_map["truncated"]`）がある文書は `size_ratio` 判定だけ省略する（生成 MD が小さいのは自己申告済みで正常）。
+    xlsx_row_ratio 走査は打切りの有無に関わらず必ず実行する（他シートの疑いを消さないため）。
     """
     has_truncated_sheet = document is not None and any(
         e.type == "sheet" and isinstance(e.source_map, dict) and e.source_map.get("truncated")
@@ -1557,49 +1315,33 @@ def _check_partial_extraction(rp: Path, md: str, rel: str, document, out: list[d
                 return
 
 
-# ---- per-file 変換結果キャッシュ（実環境障害対応の最終柱）--------------------
-# 実環境（10,000ファイル・1件30秒級）では `_build_derived_into_staging` の途中死は再実行を毎回0から
-# 始めさせる（ステージングは全件成功時だけ公開する契約＝正しいが、途中死は進捗を全損する）。
-# 旧形式変換だけが持っていた「再ビルドを跨ぐキャッシュ」（`legacy_convert.cache_root_for`）と同じ型を
-# 変換本体（①アーム実行＋Evidence/RAG 生成）へ拡張する。キー＝(原本の resolved path・st_size・
-# st_mtime_ns・変換パイプライン署名)。ヒットしたら実変換（アーム実行・evidence 生成・LLM/VLM 呼び出し）
-# を丸ごとスキップし、キャッシュ済みの派生一式をステージングへコピーするだけで済ませる。
-# 失敗ファイル（notice へ縮退したもの）は対象外——次回 sync が必ず再試行する現行契約を維持する。
+# ---- per-file 変換結果キャッシュ ----
+# 途中死からの再実行で 0 から変換し直さないよう、変換本体（アーム実行＋Evidence/RAG 生成）の結果を再ビルドを跨いで保持する
+# （旧形式変換の `legacy_convert.cache_root_for` と同型）。キー＝(原本の resolved path・st_size・st_mtime_ns・変換パイプライン署名)。
+# ヒットしたら実変換を丸ごとスキップし、キャッシュ済みの派生一式をステージングへコピーする。
+# 失敗ファイル（notice へ縮退したもの）は対象外で、次回 sync が必ず再試行する。
 _CONV_CACHE_DIRNAME = "_conv_cache"
-_CONV_CACHE_MAX_BYTES_ENV = "SHERPA_CONV_CACHE_MAX_BYTES"
-# per-file キャッシュが実際にミラーする sidecar 種別。`_LAYER_FOR_SIDECAR_SUFFIX` の部分集合——
-# `.derived.json`（マニフェスト）はキャッシュせず、復元後に既存の `_write_derived_sidecar_manifest`
-# が実際に存在するファイルから毎回そのまま書き直す（人間 md の版は rep_delta 経由で運ぶ・下記）。
-# `.ocr_route.json` は `build_derived`（公開直前・ステージング全体を1回で走査）が世界単位で書くもので
-# per-file 変換の一部ではないため対象外（「毎回生成・安い」＝やらないこと節）。
+_CONV_CACHE_MAX_BYTES = 0  # 総量上限（バイト・0＝無制限）
+# per-file キャッシュがミラーする sidecar 種別（`_LAYER_FOR_SIDECAR_SUFFIX` の部分集合）。
+# `.derived.json` は復元後に `_write_derived_sidecar_manifest` が毎回書き直し、`.ocr_route.json` は `build_derived` が資料フォルダ単位で書くため対象外。
 _CONV_CACHE_SIDECAR_SUFFIXES = (
     ".md", ".md.meta.json", ".evidence.json", ".document.json", ".rag.md", ".rag_chunks.jsonl",
 )
-# rep_delta のうち「MD自体は成功したが一部書込が失敗した」ことを示すカウンタ（RV是正#5）。
-# いずれかが非ゼロの結果はキャッシュへ保存しない・既存キャッシュも復元時に拒否する——書込失敗は
-# 大抵一時的（ディスク逼迫等）で、キャッシュに焼き付けると次回 sync も同じ失敗を再生し続け、
-# 一時要因が解消しても自然に再試行されなくなる（キャッシュミスなら毎回フル実変換で再試行が効く）。
+# rep_delta のうち「MD 自体は成功したが一部書込が失敗した」ことを示すカウンタ。
+# いずれかが非ゼロの結果はキャッシュへ保存せず、既存キャッシュも復元時に拒否する（失敗を焼き付けず、次回 sync で再試行させる）。
 _CONV_CACHE_FAILED_DELTA_KEYS = ("document_ir_failed", "evidence_ir_failed", "rag_failed")
 
 
 def _conv_cache_root_for(derived_md_dir) -> Path:
-    """派生MD dir と同階層の per-file 変換結果キャッシュ dir（`legacy_convert.cache_root_for` と同型）。
-
-    `md`/`rag`/`ir` の兄弟に置くため公開/ステージングの改名2回の差し替えに巻き込まれず、
-    再ビルドを跨いで残る。world 削除時は `derived/{world}` 木ごと消える＝鏡と整合。
-    """
+    """派生 MD dir と同階層の per-file 変換結果キャッシュ dir。`md`/`rag`/`ir` の兄弟に置くため、改名 2 回の差し替えに巻き込まれず再ビルドを跨いで残る。"""
     return Path(derived_md_dir).parent / _CONV_CACHE_DIRNAME
 
 
 def _current_conv_cache_pipeline_sig(*, ocr_observation_marker: str | None) -> str:
     """per-file キャッシュのヒット判定に使う変換パイプライン全体の署名。
 
-    新しい版概念は発明せず、既存の各層版マーカー（`_current_arms_sig`／`_current_document_ir_sig`／
-    `_current_human_md_sig`／`_current_rag_sig`）をそのまま束ねるだけ。いずれか1つでも変われば
-    署名全体が変わり**全ファイル**キャッシュミスになる——現行の drift 全再ビルドと同じ挙動
-    （正しさ優先・部分的に古い版が混在する余地を作らない）。`ocr_observation_marker`（O1）は
-    `_current_rag_sig` 経由で含める＝OCR 観測が新しく公開されるとこの world の全キャッシュが
-    ミスになり、次回 sync の `refresh_rag` 相当が自然に効く（新しい再生成の仕組みは作らない）。
+    既存の各層版マーカー（`_current_arms_sig`／`_current_document_ir_sig`／`_current_human_md_sig`／`_current_rag_sig`）を束ねるだけ。
+    いずれかが変われば全ファイルがキャッシュミスになる。`ocr_observation_marker` は `_current_rag_sig` 経由で含める。
     """
     return (f"arms={_current_arms_sig()};"
             f"document_ir={_current_document_ir_sig()};"
@@ -1610,14 +1352,8 @@ def _current_conv_cache_pipeline_sig(*, ocr_observation_marker: str | None) -> s
 def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
     """キャッシュキー（原本の resolved path・st_size・st_mtime_ns・st_ctime_ns・パイプライン署名）。
 
-    `st_ctime_ns` も材料に含める（`ingest/worker.py::_scan_dir`/`_sig` の world 署名と同じ材料）。
-    size・mtime だけでは、同じ size・mtime を保持したまま中身を上書きされた原本（一部の
-    コピー/SMB 経路で起きうる）を旧成果物のまま確定してしまう穴がある。ctime は中身書き換えで
-    ほぼ必ず動くので、この穴を実用上塞ぐ。全ファイルハッシュ（SHA 等）までは踏み込まない
-    （10k ファイル級 × SMB 越しで走査コストが跳ねるため・世界署名も同じ判断で size/mtime/ctime 止まり）。
-
-    `rp.resolve()`/`rp.stat()` が失敗（消失・権限・race）したらキャッシュ対象外として None
-    （呼び出し元は通常の実変換へフォールバックする＝fail-safe）。
+    `st_ctime_ns` を含めるのは、同じ size・mtime のまま中身を上書きされた原本を検知するため（`ingest/worker.py` の資料フォルダ署名と同じ材料）。
+    全ファイルハッシュまでは取らない。`rp.resolve()`/`rp.stat()` が失敗したらキャッシュ対象外として None（実変換へフォールバック）。
     """
     try:
         resolved = str(rp.resolve())
@@ -1628,17 +1364,14 @@ def _conv_cache_source_key(rp: Path, pipeline_sig: str) -> str | None:
 
 
 def _conv_cache_slot(cache_root: Path, rel: str) -> tuple[Path, Path]:
-    """`rel` のキャッシュスロット（メタ JSON・内容ディレクトリ）。1 rel = 最新1件のみ保持
-    （`legacy_convert.ensure_ooxml` の `{rel}{ext}` + `.key` と同型）。"""
+    """`rel` のキャッシュスロット（メタ JSON・内容ディレクトリ）。1 rel につき最新 1 件のみ保持する。"""
     return cache_root / (rel + ".key.json"), cache_root / (rel + ".d")
 
 
 def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict, Path] | None:
     """キャッシュヒットなら `(rep_delta, content_dir)` を返す。ミス/壊れ/鍵不一致は None。
 
-    `rep_delta` に失敗カウンタ（`_CONV_CACHE_FAILED_DELTA_KEYS`）が非ゼロで残っている実体は
-    ミス扱いする（RV是正#5・防御的二重チェック——本来 `_conv_cache_store_if_eligible` が保存時点で
-    弾くが、それ以前の版で保存された古いキャッシュ実体が残っていても復元しない）。
+    `rep_delta` に失敗カウンタ（`_CONV_CACHE_FAILED_DELTA_KEYS`）が非ゼロで残っている実体はミス扱いにする。
     """
     meta_path, content_dir = _conv_cache_slot(cache_root, rel)
     meta = json_io.read_json(meta_path, default=None)
@@ -1653,11 +1386,7 @@ def _conv_cache_lookup(cache_root: Path, rel: str, want_key: str) -> tuple[dict,
 
 
 def _conv_cache_restore(content_dir: Path, rel: str, dr: Path, dr_rag: Path, dr_ir: Path) -> bool:
-    """キャッシュ内容一式を3層のステージングへコピーする（成功時 True）。
-
-    失敗（OSError）したら呼び出し元は実変換へフォールバックする——この rel について部分的に
-    コピー済みのファイルが残っていても、実変換が同名で上書きするため実害は限定的（fail-safe）。
-    """
+    """キャッシュ内容一式を 3 層のステージングへコピーする（成功時 True）。失敗（OSError）したら呼び出し元は実変換へフォールバックする。"""
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
     try:
         for suffix in _CONV_CACHE_SIDECAR_SUFFIXES:
@@ -1683,10 +1412,8 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
                       dr: Path, dr_rag: Path, dr_ir: Path) -> None:
     """この rel の変換結果一式（成功時のみ呼ばれる）をキャッシュへ保存する（best-effort）。
 
-    一時 dir へコピーしてから改名する（コピー中断で壊れたキャッシュを次回ヒット扱いしない）。
-    メタ JSON（鍵・rep_delta）は内容の改名が終わった**後**に書く——鍵一致だけがヒット判定の唯一の
-    根拠のため、内容が揃う前に鍵が読める状態を作らない。失敗しても取り込み自体は継続する
-    （次回も実変換するだけ＝キャッシュは最適化であり正しさの前提ではない）。
+    一時 dir へコピーしてから改名する。メタ JSON（鍵・rep_delta）は内容の改名が終わった後に書く（鍵一致だけがヒット判定の根拠のため）。
+    失敗しても取り込みは継続する。
     """
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
     meta_path, content_dir = _conv_cache_slot(cache_root, rel)
@@ -1720,12 +1447,7 @@ def _conv_cache_store(cache_root: Path, rel: str, key: str, rep_delta: dict,
 
 
 def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
-    """今回の原本一覧（`seen_rels`）に無い rel のキャッシュを削除する（鏡・非有界化しない）。
-
-    呼び出し元は per-file ループを最後まで走り切った（＝完走した）時だけこれを呼ぶ——途中死した
-    場合は呼ばれず、次回 sync がまだ生きている rel のキャッシュをそのまま再利用できる
-    （進捗を保持する・「完走しなかった場合は剪定しない」）。
-    """
+    """今回の原本一覧（`seen_rels`）に無い rel のキャッシュを削除する。per-file ループを完走したときだけ呼ぶ（途中死した場合は剪定しない）。"""
     if not cache_root.is_dir():
         return
     for meta_path in cache_root.rglob("*.key.json"):
@@ -1740,13 +1462,8 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
 
 
 def _conv_cache_enforce_cap(cache_root: Path) -> None:
-    """`SHERPA_CONV_CACHE_MAX_BYTES`（既定 0＝無制限）を超えたらキャッシュを古い順に削る。
-
-    実環境の派生物総量（3層×1原本あたり数KB〜数百KB）は原本自体と同オーダーで、原本を既に
-    保持できているディスクなら追加分も同オーダーに収まる想定のため既定は無制限——閉域環境で
-    ディスクが逼迫する場合だけ env で明示的に絞る安全弁。
-    """
-    cap = _env_int(_CONV_CACHE_MAX_BYTES_ENV, 0, 0, 1024 * 1024 * 1024 * 1024)
+    """`_CONV_CACHE_MAX_BYTES`（0＝無制限）を超えたらキャッシュを古い順に削る安全弁。"""
+    cap = _CONV_CACHE_MAX_BYTES
     if cap <= 0 or not cache_root.is_dir():
         return
     entries: list[tuple[int, Path, Path, int]] = []
@@ -1778,55 +1495,21 @@ def _conv_cache_enforce_cap(cache_root: Path) -> None:
 def _build_derived_into_staging(
     wd, derived, *, progress: Callable[[int, int], None] | None = None, world: str | None = None,
 ) -> dict:
-    """`wd` 配下の Office を MD化し `derived/{rel}.md` に書き出す（鏡＝毎回まるごと作り直す）。
+    """`wd` 配下の Office を MD 化して派生物を書き出す（毎回まるごと作り直す）。
 
-    `world`（O1）: 渡すと、直前まで公開中だった Canonical 世代に紐づく OCR 観測（隔離 worker が
-    非同期に公開した分）を VLM と合流して rag.md へ含める（`_build_observation_set` 参照）。
-    未指定/OCR 無効時は VLM のみ（従来どおり）。この関数はまだ**旧**公開世代（このビルドが
-    差し替えるはずの世代）を見ている——`build_derived` が改名2回で差し替える前なので、
-    観測は「今の原本から見て文書ごとに古くなっていないか」を `source_content_hash` で
-    個別に再検証してから使う（`_load_ocr_observation_sets` 参照）。
+    書き込み先は公開中ではなくステージング（`{derived}.staging`）で、作り切ってから改名 2 回で差し替える（`_publish_staging`）。
+    ソース（wd）には書かない。`world` を渡すと、旧公開世代に紐づく OCR 観測を VLM と合流して rag.md へ含める（`_build_observation_set`）。
+    per-file ループの各 rel は、原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば `_conv_cache_root_for(dr)` から復元して実変換をスキップする
+    （失敗＝notice へ縮退したものは対象外）。
 
-    書き込み先は公開中ではなく**ステージング**（`{derived}.staging`）で、作り切ってから
-    改名2回で差し替える（`_publish_staging`）。取り込み中も公開中の派生物が生き続け、失敗しても
-    壊れた状態が残らない。
-
-    per-file ループの各 rel は、原本 mtime/size と変換パイプライン署名が
-    前回成功時と一致すれば `_conv_cache_root_for(dr)` のキャッシュから復元するだけで済ませ、
-    実変換（①アーム実行・Evidence/RAG 生成）をスキップする。ステージング自体は毎回まるごと
-    作り直す（鏡モデルは不変）が、**per-file の変換結果はステージングの再作成を跨いで再利用**
-    することで、途中死からの再実行で0からやり直さずに済む（`_conv_cache_store`/`_conv_cache_lookup`
-    参照）。失敗（notice へ縮退したもの）はキャッシュ対象外——次回 sync が必ず再試行する現行契約を
-    保つ。
-
-    返値 `{converted, failed, unsupported, by_ext, legacy_converted, legacy_conversion_failures, document_ir_generated,
-    document_ir_failed, document_ir_failures, evidence_ir_generated, evidence_ir_failed,
-    evidence_ir_failures, rag_generated, rag_failed, rag_failures, error?}`
-    （status 表示用）。ソース（wd）には一切書かない。
-    `failed`＝変換失敗（壊れ等）、`unsupported`＝PDF/旧バイナリ（MVP 未対応）。`legacy_converted`＝
-    旧形式（.doc/.xls/.ppt）の前段変換（LibreOffice 等）自体が成功した件数（後続の MD 化成否とは
-    独立・失敗数は `len(legacy_conversion_failures)`）。`legacy_conversion_failures`
-    （`[{"doc": rel, "reason": "legacy_conversion_failed"}]`）＝`failed` のうち旧形式（.doc/.xls/.ppt）の
-    前段変換自体が失敗した rel（`document_ir_failures` 等と異なり、原因コードは常に固定文字列——
-    前段変換の失敗理由そのものは呼び出し元に返らないため）。**例外は投げない**（best-effort・fail-safe）:
-    派生先がソース配下と重なる/セットアップ失敗時は `error` を立てて何も書かずに返す（READ-ONLY source 保護）。
-    **1ファイル分の変換処理は try/except で包む**: PDF/VLM抽出由来の想定外例外で
-    1件が失敗しても他ファイルの変換は継続する（failed 計上のみ・全体を止めない）。
-
-    `document_ir_*`（DOC-IR-001.5・修正4）: document.json の書込失敗は握りつぶさず `document_ir_failed`／
-    `document_ir_failures`（`[{"doc": rel, "reason": "write_failed" | "build_failed:<Exc>"}]`）に計上する
-    （`converted`/`failed` とは独立のカウンタ＝MD 自体は成功しているため）。**`document_ir_failed == 0`
-    のときだけ** `.document_ir_sig` マーカーを書く（失敗が残れば次回 sync の `document_ir_sig_drift` が
-    True のままになり `refresh_document_ir` が再試行する）。
-
-    `evidence_ir_*`（E2b/E4）: 素のXLSX/DOCX/PPTXをOOXML armで変換できた場合に限り、既存IRと並行して
-    `derived/{rel}.evidence.json` を生成する。自然文や業務状態へ早期に畳まず、セル、DrawingML object、
-    locator、幾何関係、coverageを保持する。全件成功時だけ `.evidence_ir_sig` を書き、1件でも失敗した
-    generationは公開品質gateで拒否できるよう独立カウンタへ記録する。
-
-    `rag_*`（E3）: 成功したEvidence IRからpipe表を使わない`{rel}.rag.md`と、同じrecord集合に由来する
-    `{rel}.rag_chunks.jsonl`を同時生成する。画像assetは`{rel}.assets/`へcontent hash名で取り出す。
-    旧MDが空になる画像だけのXLSXでも、この新しいRAG表現は生成する。
+    返値（status 表示用）: `{converted, failed, unsupported, by_ext, legacy_converted, legacy_conversion_failures,
+    document_ir_generated, document_ir_failed, document_ir_failures, evidence_ir_generated, evidence_ir_failed,
+    evidence_ir_failures, rag_generated, rag_failed, rag_failures, error?}`。
+    - `failed`＝変換失敗、`unsupported`＝PDF/旧バイナリの未対応、`legacy_converted`＝旧形式の前段変換成功件数。
+    - `legacy_conversion_failures`・`*_failures` は `[{"doc": rel, "reason": ...}]`。
+    - 例外は投げない。派生先がソース配下と重なる/セットアップ失敗時は `error` を立てて何も書かずに返す（READ-ONLY source 保護）。
+      1 ファイル分の変換は try/except で包み、1 件の失敗で他ファイルを止めない。
+    - `document_ir_failed == 0` のときだけ `.document_ir_sig`、`evidence_ir_failed == 0` のときだけ `.evidence_ir_sig` を書く。
     """
     from .. import scope_infer as si
     # IRキーは早期 return（overlap/setup 失敗）でも同じ形で返す（レポート契約の一貫性）。
@@ -1874,7 +1557,7 @@ def _build_derived_into_staging(
     from .arms import legacy_convert
     from .arms import ooxml_arm
     converted = published_notice_count = failed = unsupported = unhandled_failed = 0
-    legacy_converted = 0   # STAT-3 S5: 旧形式（.doc/.xls/.ppt）の前段変換（LibreOffice 等）成功数
+    legacy_converted = 0   # 旧形式（.doc/.xls/.ppt）の前段変換成功数
     unhandled_failures: list[dict] = []
     legacy_conversion_failures: list[dict] = []
     conversion_failures: list[dict] = []
@@ -1887,16 +1570,16 @@ def _build_derived_into_staging(
     rag_failures: list[dict] = []
     office_display_requested = office_display_applied = office_display_fallback_docs = 0
     office_display_profiles: dict[str, dict] = {}
-    obs_dir = _resolve_ocr_observation_dir(world)         # 1回だけ解決（O1・文書ごとに解決し直さない）
+    obs_dir = _resolve_ocr_observation_dir(world)         # 1回だけ解決（文書ごとに解決し直さない）
     ocr_observation_marker = _ocr_observation_marker_for(obs_dir)
     by = Counter()
-    enabled = _arms.enabled_arms()                       # 有効アーム（既定 ooxml,pdf_text＝現行と同一）
+    enabled = _arms.enabled_arms()                       # 有効アーム
     conv = convertible_exts()                            # 有効アームが今 MD化できる拡張子集合
     # PNG/JPEGはOCRなしでも画像の存在・hashをEvidence化するため、常に候補に含む。
     candidate = OFFICE_EXT | RASTER_EVIDENCE_EXT | conv
     legacy_cache = legacy_convert.cache_root_for(dr)     # 旧→新変換のキャッシュ（md/ の兄弟・再ビルドをまたいで残す）
     source_failure_notices: set[str] = set()
-    conv_cache_root = _conv_cache_root_for(dr)           # per-file 変換結果キャッシュ（CONV-CACHE・md/ の兄弟）
+    conv_cache_root = _conv_cache_root_for(dr)           # per-file 変換結果キャッシュ（md/ の兄弟）
     conv_cache_pipeline_sig = _current_conv_cache_pipeline_sig(ocr_observation_marker=ocr_observation_marker)
     conv_cache_seen_rels: set[str] = set()               # 剪定用「今回の原本一覧」（成否問わず候補に入った rel）
 
@@ -1976,9 +1659,9 @@ def _build_derived_into_staging(
                 "pipe-free RAG表現の書込に失敗しました（次回 sync で再試行）: %s", rel)
             return None
         except Exception as e:
-            # Evidence抽出は成功しても、rendererのcoverage検証だけが文書固有の構造で失敗することがある。
-            # その1件をgeneration全体の失敗へ昇格させず、原本identityに拘束したsource-level failed
-            # noticeへ置き換える。notice自体のrenderに失敗した場合だけrag_failedとして公開を止める。
+            # Evidence 抽出は成功しても renderer の coverage 検証だけが文書固有の構造で失敗することがある。
+            # その 1 件を generation 全体の失敗にせず、原本 identity に拘束した source-level failed notice へ置き換える。
+            # notice 自体の render に失敗した場合だけ rag_failed として公開を止める。
             if prebuilt_evidence is not None or rel in source_failure_notices:
                 rag_failed += 1
                 rag_failures.append({"doc": rel, "reason": f"render_failed:{e.__class__.__name__}"})
@@ -2018,9 +1701,7 @@ def _build_derived_into_staging(
                 return None
 
     def _conv_cache_rep_snapshot() -> dict:
-        """このrel処理直前の rep カウンタ・リスト長のスナップショット（CONV-CACHE の差分計算用）。
-        `converted` 自体は含めない（キャッシュヒット/成功はどちらも常に+1固定のため呼び出し元が直接足す）。
-        """
+        """このrel処理直前の rep カウンタ・リスト長のスナップショット（キャッシュの差分計算用）。`converted` 自体は含めない。"""
         return {
             "document_ir_generated": document_ir_generated,
             "document_ir_failed": document_ir_failed,
@@ -2041,9 +1722,7 @@ def _build_derived_into_staging(
     def _conv_cache_rep_delta(before: dict) -> dict:
         """`_conv_cache_rep_snapshot()` からこの rel だけが動かした分の差分（キャッシュへ保存する値）。
 
-        IR/Evidence/RAG は「MD 自体は成功（`converted`）したが一部だけ書込失敗した」という縁の
-        カウンタ増分（OSError→`*_failed`＋`*_failures` 追記だけで `continue` しない経路）を持ちうる
-        ため、`converted` 以外の全カウンタ／リスト／dict の増分を丸ごと運ぶ（部分的な決め打ちをしない）。
+        MD 自体は成功したが一部だけ書込失敗した場合のカウンタ増分も運ぶため、`converted` 以外の全カウンタ／リスト／dict の増分を丸ごと運ぶ。
         """
         return {
             "document_ir_generated": document_ir_generated - before["document_ir_generated"],
@@ -2087,17 +1766,12 @@ def _build_derived_into_staging(
         office_display_profiles.update(delta["office_display_profiles"])
 
     def _conv_cache_store_if_eligible() -> None:
-        """直前に処理した rel（ループ変数 `rel`/`conv_cache_key`/`conv_cache_rep_before`/
-        `human_md_sig_for_rel` を閉包で参照）を CONV-CACHE へ保存する。両方の成功終着点
-        （raster／通常変換）から呼ぶ共通処理（DRY）——`conv_cache_key` が None（`ext not in conv`）
-        なら no-op。
+        """直前に処理した rel（ループ変数を閉包で参照）を per-file キャッシュへ保存する。
 
-        `converted` としてこの rel を計上した経路でも、Evidence/RAG/IR の一時書込（OSError）だけが
-        失敗して `*_failed` カウンタが増えている縁のケースがある（RV是正#5）。そのような「失敗を
-        含む成功」はキャッシュへ保存しない——保存すると次回 sync がキャッシュヒットで丸ごとスキップし、
-        一時的だったはずの書込失敗を無期限に再生し続けてしまう（原本が変わらない限り自然な再試行の
-        機会を失う）。キャッシュミスのままにしておけば毎回フル実変換が走り、書込が成功した回に
-        初めてキャッシュされる。"""
+        両方の成功終着点（raster／通常変換）から呼ぶ共通処理。`conv_cache_key` が None（`ext not in conv`）なら no-op。
+        `converted` として計上した経路でも、Evidence/RAG/IR の一時書込（OSError）だけが失敗して `*_failed` が増えている場合は
+        保存しない（保存すると次回 sync がキャッシュヒットで失敗を再生し続けるため）。
+        """
         if conv_cache_key is None or conv_cache_rep_before is None:
             return
         rep_delta = _conv_cache_rep_delta(conv_cache_rep_before)
@@ -2107,13 +1781,11 @@ def _build_derived_into_staging(
         _conv_cache_store(conv_cache_root, rel, conv_cache_key, rep_delta, dr, dr_rag, dr_ir)
 
     def _publish_failed_size_notice(rp: Path, rel: str, reason_code: str, detail: dict | None = None) -> None:
-        """変換前（openpyxl/pypdf 等のフルロード前）に諦めるサイズ/セル数系ガードの共通処理
-        （MEM-1 の `size_exceeded` と MEM-2 の `cell_count_exceeded`/`uncompressed_size_exceeded`）。
+        """変換前（フルロード前）に諦めるサイズ/セル数系ガード（`size_exceeded`/`cell_count_exceeded`/`uncompressed_size_exceeded`）の共通処理。
 
-        failed notice を発行し `failed`/`published_notice_count`/`conversion_failures` へ計上する
-        （呼び出し側はこの後 `continue` する）。`detail` は実測値（測定セル数/バイト数と上限）を
-        Evidence の `coverage.detail` へ載せる（`evidence_render._coverage_notice_records` が
-        利用者向けの平文メッセージへ実測値を埋め込む）。"""
+        failed notice を発行し `failed`/`published_notice_count`/`conversion_failures` へ計上する（呼び出し側はこの後 `continue` する）。
+        `detail` は実測値（測定セル数/バイト数と上限）で、Evidence の `coverage.detail` へ載せる。
+        """
         nonlocal failed, published_notice_count
         failed_evidence = legacy_provenance.build_unavailable_evidence(
             rp, status="failed", reason_code=reason_code, detail=detail)
@@ -2144,21 +1816,16 @@ def _build_derived_into_staging(
         if ext not in candidate:
             continue
         if _is_sensitive_original(rp, ext):
-            # 秘匿名: `corpus_docs.classify_document` は秘匿名を無条件で対象外に
-            # 倒すが、ここ（変換ループ）は拡張子だけの `candidate` 集合で候補を引くため別途塞ぐ
-            # （`ingest.world_graph.build_world` の Pass1 と同型の理由・派生 MD を一切作らない）。
+            # 秘匿名は拡張子だけの `candidate` 集合では除けないため、変換ループで別途塞ぐ（派生 MD を一切作らない）
             _log.warning("MD化をスキップします（秘匿名のため対象外・ext=%s）", ext)
             continue
         by[ext] += 1
         conv_cache_seen_rels.add(rel)        # 剪定用「今回の原本一覧」（成否問わず候補に入った rel すべて）
-        # belt-and-braces: `accepts()`/`convert()` は各アーム実装（PDF/vision の
-        # 抽出処理）由来の想定外例外を投げうる。ファイル1件の失敗が for ループ全体を止めて他ファイルの変換まで
-        # 巻き込むことがないよう、1ファイル分の処理をまるごと try/except で包む（fail-safe・failed 計上のみ）。
+        # `accepts()`/`convert()` は各アーム実装由来の想定外例外を投げうるため、1 ファイル分の処理をまるごと try/except で包む
+        # （1 件の失敗で他ファイルを止めない・failed 計上のみ）
         rel_unhandled = False               # 下の except（想定外の例外）で True にする
-        # この rel の `.md` が今回 human_md（`OoxmlArm`・docx/xlsx）で生成できたら
-        # `_current_human_md_sig()` を入れる。マニフェストの `asset_versions.human_md` として書き、
-        # レンダラ/抽出器の版だけが変わった時に **この asset だけ**を選択的に再生成できるようにする
-        # （RAG-KV の drift 連鎖と同じ単一 asset 版の考え方・全再構築は誘発しない）。
+        # この rel の `.md` が今回 human_md（`OoxmlArm`・docx/xlsx）で生成できたら `_current_human_md_sig()` を入れる。
+        # マニフェストの `asset_versions.human_md` として書き、レンダラ/抽出器の版だけが変わった時にこの asset だけを選択的に再生成できるようにする。
         human_md_sig_for_rel: str | None = None
         conv_cache_key: str | None = None    # 非None＝この rel はキャッシュ対象（`ext in conv`）
         conv_cache_rep_before: dict | None = None
@@ -2168,11 +1835,8 @@ def _build_derived_into_staging(
                   f"（RSS {_rss0:.1f}G）" if _rss0 is not None else "")
         _done_label = "完了"                     # finally の完了行用（キャッシュ復元なら差し替え）
         try:
-            # 入口ガード群（MEM-1 size_exceeded・MEM-2 cell_count_exceeded/uncompressed_size_exceeded）は
-            # CONV-CACHE のキャッシュ照合より**先**に評価する（RV是正#4）。旧キャッシュ（このガードが
-            # 存在しなかった版で成功済みの巨大ファイル）はパイプライン署名にガード自体を含まないため、
-            # 逆順だとキャッシュヒットで復元されるだけでガードが一切素通りしてしまう——原本が変わらない
-            # 限り毎回この穴を通り続けるのを防ぐ。キャッシュ照合はこの後の全ガード通過後にのみ行う。
+            # 入口ガード群（`size_exceeded`・`cell_count_exceeded`/`uncompressed_size_exceeded`）は per-file キャッシュ照合より先に評価する
+            # （逆順だとキャッシュヒットでガードが素通りする）。キャッシュ照合は全ガード通過後にのみ行う。
             if ext not in conv:                              # PDF(バックエンド無)/旧バイナリ/該当アーム無効は未対応
                 if ext in LEGACY_OFFICE_EXT:
                     unavailable_evidence = legacy_provenance.build_unavailable_evidence(
@@ -2193,15 +1857,13 @@ def _build_derived_into_staging(
                 unsupported += 1
                 continue
             if ext in OFFICE_EXT and _office_size_exceeded(rp, ext):
-                # 変換前に諦める＝openpyxl/pypdf 等のフルロードを一切発生させない（MEM-1）。
+                # 変換前に諦める＝openpyxl/pypdf 等のフルロードを一切発生させない
                 _publish_failed_size_notice(rp, rel, "size_exceeded")
                 continue
             if ext == ".xlsx":
-                # 圧縮爆弾ガード（MEM-2）: st_size は圧縮後サイズのため小さい xlsx でも展開後に
-                # 巨大化しうる。openpyxl を一切開かず zip 内 dimension だけ見てセル数を見積もる
-                # （速い棄却）。dimension は書き手の自己申告のため、欠落/不正な原本を fail-open で
-                # 素通りさせず `<c ` の実カウントへフォールバックする（RV是正#2・完全な fail-open
-                # を潰す）。壊れた zip 等の真に見積不能なケースだけ実カウント側も None＝fail-open。
+                # 圧縮爆弾ガード: st_size は圧縮後サイズのため、小さい xlsx でも展開後に巨大化しうる。
+                # openpyxl を開かず zip 内 dimension だけ見てセル数を見積もり、dimension が欠落/不正なら `<c ` の実カウントへフォールバックする。
+                # 壊れた zip 等で見積不能なら通す。
                 estimated_cells = _xlsx_estimated_cell_count(rp)
                 if estimated_cells is None:
                     estimated_cells = _xlsx_actual_cell_count(rp, _XLSX_CELL_CAP)
@@ -2211,19 +1873,16 @@ def _build_derived_into_staging(
                         detail={"measured_cells": estimated_cells, "cap_cells": _XLSX_CELL_CAP})
                     continue
             if ext in CONVERTIBLE_EXT:
-                # 非圧縮サイズガード（MEM-2）: docx/pptx にも同型の圧縮爆弾リスクがある（xlsx は
-                # 上のセル数ガードが本命・こちらは3形式共通の粗い網）。
+                # 非圧縮サイズガード: docx/pptx にも同型の圧縮爆弾リスクがあるため、3 形式共通の粗い網として適用する
                 uncompressed = _office_uncompressed_total_bytes(rp)
                 if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
                     _publish_failed_size_notice(
                         rp, rel, "uncompressed_size_exceeded",
                         detail={"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
                     continue
-            # CONV-CACHE（`ext in conv` はここまでの `ext not in conv` 早期 continue で確定済み）:
-            # 原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば、①アーム実行・Evidence
-            # 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピー
-            # するだけで済ませる。ミス（原本変化/署名変化/未キャッシュ）は下の通常経路へそのまま流れる
-            # ——キャッシュは最適化であり、正しさはここに依存しない。
+            # per-file キャッシュ（`ext in conv` は直前の早期 continue で確定済み）: 原本 mtime/size と変換パイプライン署名が前回成功時と一致すれば、
+            # アーム実行・Evidence 生成・LLM/VLM 呼び出しを丸ごとスキップし、キャッシュ済み派生一式をステージングへコピーする。
+            # ミスは下の通常経路へ流れる。
             conv_cache_key = _conv_cache_source_key(rp, conv_cache_pipeline_sig)
             if conv_cache_key is not None:
                 hit = _conv_cache_lookup(conv_cache_root, rel, conv_cache_key)
@@ -2259,14 +1918,11 @@ def _build_derived_into_staging(
 
             conv_path, extra_notes = rp, []
             legacy_conversion = None
-            if ext in legacy_convert.LEGACY_EXT_MAP:         # 旧形式＝先に OOXML へ前段変換（LibreOffice 等・W0）
+            if ext in legacy_convert.LEGACY_EXT_MAP:         # 旧形式＝先に OOXML へ前段変換（LibreOffice 等）
                 materialized = legacy_convert.ensure_ooxml(rp, rel, legacy_cache)
                 if materialized is None:
-                    # `backend_ready=False`（バックエンド未設定/未到達）は**未対応**（未来失敗ではない・
-                    # 軽量再生成パス`refresh_evidence_ir`等と同じ分類——「失敗」と「対象外」を混ぜない・
-                    # ING-1閉じた理由語彙）。`backend_ready=True` で実際に変換を試みて失敗した場合だけ
-                    # `failed` へ計上し、`take_conversion_failure_reason()` でタイムアウトかどうかを
-                    # 区別する（`_run_soffice` の subprocess タイムアウトのみ判別可・他は汎用失敗）。
+                    # `backend_ready=False`（バックエンド未設定/未到達）は失敗ではなく未対応（「失敗」と「対象外」を混ぜない）。
+                    # `backend_ready=True` で変換を試みて失敗した場合だけ `failed` へ計上し、`take_conversion_failure_reason()` でタイムアウトかどうかを区別する。
                     backend_ready = ext in legacy_convert.legacy_exts()
                     if backend_ready:
                         detail = legacy_convert.take_conversion_failure_reason()
@@ -2298,9 +1954,7 @@ def _build_derived_into_staging(
                 conv_path, extra_notes = materialized        # 以降は変換済み OOXML を①アームへ渡す
                 legacy_conversion = legacy_provenance.build(rp, conv_path, extra_notes)
                 legacy_converted += 1   # 前段変換（旧→新）自体は成功（後続の MD 化成否とは独立に数える）
-                # 非圧縮サイズガード（MEM-2）: 旧形式変換後の materialized OOXML にも同じ上限を適用
-                # する（原本 .doc/.xls/.ppt の入口サイズ判定は上の `_office_size_exceeded` が既に
-                # 通した後・小さい旧形式が展開後に巨大な OOXML へ変換されるケースへの備え）。
+                # 非圧縮サイズガード: 旧形式変換後の materialized OOXML にも同じ上限を適用する
                 uncompressed = _office_uncompressed_total_bytes(conv_path)
                 if uncompressed is not None and uncompressed > _OFFICE_UNCOMPRESSED_CAP_BYTES:
                     _publish_failed_size_notice(
@@ -2308,10 +1962,7 @@ def _build_derived_into_staging(
                         detail={"measured_bytes": uncompressed, "cap_bytes": _OFFICE_UNCOMPRESSED_CAP_BYTES})
                     continue
                 if conv_path.suffix.lower() == ".xlsx":
-                    # セル数ガード（RV是正#3）: 上のセル数ガード（`.xlsx` 原本向け）は旧形式
-                    # （.xls→.xlsx）の materialized 結果には適用されていなかった穴。原本 .xls 自体は
-                    # 圧縮率が高く小さくても、変換後の xlsx が巨大なセル数になりうるのは xlsx 原本と
-                    # 同じ理屈のため、同じガードをそのまま適用する。
+                    # セル数ガード: 旧形式（.xls→.xlsx）の変換後 xlsx にも、`.xlsx` 原本向けと同じガードを適用する
                     materialized_cells = _xlsx_estimated_cell_count(conv_path)
                     if materialized_cells is None:
                         materialized_cells = _xlsx_actual_cell_count(conv_path, _XLSX_CELL_CAP)
@@ -2320,12 +1971,10 @@ def _build_derived_into_staging(
                             rp, rel, "cell_count_exceeded",
                             detail={"measured_cells": materialized_cells, "cap_cells": _XLSX_CELL_CAP})
                         continue
-            arm_name, result = _convert_with_arms(conv_path, enabled)  # A1＝最初に受理したアーム1本
+            arm_name, result = _convert_with_arms(conv_path, enabled)  # 最初に受理したアーム 1 本
             if result is None or result.md is None:
-                # fail-closed: docx/xlsx は document-ir 構築失敗が直接 md=None を招く
-                # （`OoxmlArm.convert()`）。ここで見逃すと `document_ir_failed` が 0 のまま据え置かれ、
-                # `.document_ir_sig` 等の版マーカーが「全件成功」の嘘をついたまま確定してしまう
-                # （次回 sync の drift 検知が働かず再試行の契機を失う）。
+                # fail-closed: docx/xlsx は document-ir 構築失敗が直接 md=None を招く（`OoxmlArm.convert()`）。
+                # 見逃すと `document_ir_failed` が 0 のまま、版マーカーが「全件成功」として確定してしまう。
                 if (result is not None and result.document is None
                         and ext in ooxml_arm._IR_EXTS):
                     document_ir_failed += 1
@@ -2333,12 +1982,8 @@ def _build_derived_into_staging(
                         (n for n in result.notes if n.startswith("document_ir_failed:")),
                         "document_ir_failed:unknown")
                     document_ir_failures.append({"doc": rel, "reason": reason})
-                    # IR 構築の失敗はここで直接 failed notice を発行する（Evidence 側の独立な
-                    # 再抽出＝`_generate_evidence(rp, rel)` の素の呼び出しに成否を委ねない）。
-                    # 委ねると、構造がより緩い Evidence 抽出だけが「成功」してしまうことがあり
-                    # （例: 本文が空の docx）、その場合 notice が一切出ないまま `{rel}.md` が
-                    # 欠落し、文書が台帳・grep から消える——document_ir_failed を非 blocking に
-                    # した前提（「縮退した failed notice が必ず出る」）が崩れる。
+                    # IR 構築の失敗はここで直接 failed notice を発行する（Evidence 側の独立な再抽出に成否を委ねない）。
+                    # 委ねると、本文が空の docx などで notice が出ないまま `{rel}.md` が欠落し、文書が台帳・grep から消える。
                     if ext in EVIDENCE_EXT and _evidence_arm_selected(ext, arm_name):
                         error_class = reason.split(":", 1)[1] if ":" in reason else reason
                         failed_evidence = _build_source_failure_evidence(
@@ -2354,18 +1999,16 @@ def _build_derived_into_staging(
                                 confidence=1.0,
                                 notes=["coverage_status=failed", "reason_code=source_parse_failed"],
                             )
-                            # 変換arm名を付けるとquality Gateが通常のDocument IR chainまで要求してしまう。
-                            # これは変換成功物ではなく、source-level failed coverageを検索可能にするnoticeである。
+                            # 変換 arm 名を付けると quality Gate が通常の Document IR chain まで要求するため付けない
+                            # （変換成功物ではなく、source-level failed coverage を検索可能にする notice）
                             _write_provenance(dst, "evidence_notice", notice_result)
                             published_notice_count += 1
                     failed += 1
                     continue
                 if (result is not None and result.document is not None
                         and ext in (".docx", ".xlsx") and arm_name == "ooxml"):
-                    # IR は構築できたが本文が無く human_md が意図的に None を返した（実質 docx のみ・
-                    # xlsx は human_md.render_xlsx が常に非 None を返す）＝失敗ではない。今回の版で
-                    # 「空である」と確認できたことを記録し、次回 sync の human_md_sig_drift による
-                    # 無限再評価ループを止める（`.md` 自体は書かない＝存在しない状態を維持する）。
+                    # IR は構築できたが本文が無く human_md が意図的に None を返した（実質 docx のみ）＝失敗ではない。
+                    # 今回の版で「空である」と記録し、human_md_sig_drift の無限再評価ループを止める（`.md` は書かない）。
                     human_md_sig_for_rel = _current_human_md_sig()
                 # 画像だけのXLSXは旧rendererがNoneでもEvidence/RAGを先に残す。
                 if ext in EVIDENCE_EXT and _evidence_arm_selected(ext, arm_name):
@@ -2380,13 +2023,12 @@ def _build_derived_into_staging(
                             confidence=1.0,
                             notes=["coverage_status=failed", "reason_code=source_parse_failed"],
                         )
-                        # 変換arm名を付けるとquality Gateが通常のDocument IR chainまで要求してしまう。
-                        # これは変換成功物ではなく、source-level failed coverageを検索可能にするnoticeである。
+                        # 変換 arm 名を付けると quality Gate が通常の Document IR chain まで要求するため付けない
+                        # （変換成功物ではなく、source-level failed coverage を検索可能にする notice）
                         _write_provenance(dst, "evidence_notice", notice_result)
                         published_notice_count += 1
                 failed += 1
-                # IR を持たない拡張子（PDF/PPTX 等）の一般失敗も rel・理由を残す
-                # （件数だけ増えて一覧に載らない穴を塞ぐ）。PDF は暗号化を判別可能な範囲で明示する。
+                # IR を持たない拡張子（PDF/PPTX 等）の一般失敗も rel・理由を残す。PDF は暗号化を判別可能な範囲で明示する。
                 conversion_failures.append({
                     "doc": rel,
                     "reason": "password_protected" if (ext == ".pdf" and _pdf_is_encrypted(rp)) else "conversion_failed",
@@ -2402,19 +2044,14 @@ def _build_derived_into_staging(
                 human_md_sig_for_rel = _current_human_md_sig()
             _write_provenance(
                 dst, arm_name, result, legacy_conversion=legacy_conversion)  # 来歴サイドカーをESチャンクメタへ搬送
-            # IR は**原本が素の .docx/.pptx/.xlsx のときだけ**書く。旧 .doc/.ppt/.xls は前段変換
-            # （legacy_convert）で materialized .docx/.pptx/.xlsx になっており、OoxmlArm は渡された OOXML の
-            # suffix しか見ないため IR 自体は生成できてしまう。しかしそれを書き出すと doc_id/source.path=rel
-            # （例 "old.doc"）なのに file_type="docx"・content_hash=変換後キャッシュファイルの hash という
-            # **来歴汚染**が起きる（原本は .doc/.ppt/.xls であり、IR の由来は変換後の一時 OOXML）。
-            # DOC-IR-001/003/004 は素の DOCX/PPTX/XLSX のみをスコープとする（旧形式は原本 hash/file_type の
-            # 仕様を固めるフェーズ2以降）ため、legacy 経路（`ext` が原本の拡張子＝ループ先頭で確定した
-            # rp.suffix）では document.json を書かない。
-            if ext in ooxml_arm._IR_EXTS:                     # document-ir-v2 の並行生成（DOC-IR-001/003/004）
+            # IR は原本が素の .docx/.pptx/.xlsx のときだけ書く。旧 .doc/.ppt/.xls は前段変換後の一時 OOXML から IR を作れてしまうが、
+            # doc_id/source.path は原本 rel なのに file_type・content_hash が変換後ファイルの値になる（来歴汚染）ため、
+            # legacy 経路（`ext` が原本の拡張子）では document.json を書かない。
+            if ext in ooxml_arm._IR_EXTS:                     # document-ir-v2 の並行生成
                 if result.document is not None:
                     result.document.doc_id = rel
                     result.document.source.path = rel        # 絶対パス（環境依存値）を派生物に残さない＝決定的
-                    try:                                       # 修正4: 失敗を握りつぶさず計上する（write_text_atomic）
+                    try:                                       # 失敗を握りつぶさず計上する（write_text_atomic）
                         json_io.write_text_atomic(dr_ir / (rel + ".document.json"),
                                                   document_ir.to_json_str(result.document))
                         document_ir_generated += 1
@@ -2424,17 +2061,15 @@ def _build_derived_into_staging(
                         _log.warning(
                             "document.json の書込に失敗しました（次回 sync の drift 検知で再試行）: %s", rel)
                 else:
-                    # アーム側（ooxml_arm.convert）で IR 構築自体が例外で失敗した場合は notes に
-                    # `document_ir_failed:<ExcClassName>` が残る（fail-safe で md は継続）。md は成功でも
-                    # IR だけ握りつぶさず計上する（修正4）。
+                    # アーム側で IR 構築自体が例外で失敗した場合は notes に `document_ir_failed:<ExcClassName>` が残る（md は継続）。IR の失敗も握りつぶさず計上する。
                     boom = next((n for n in result.notes if n.startswith("document_ir_failed:")), None)
                     if boom is not None:
                         document_ir_failed += 1
                         document_ir_failures.append(
                             {"doc": rel, "reason": f"build_failed:{boom.split(':', 1)[1]}"})
             if (ext in EVIDENCE_EXT and _evidence_arm_selected(ext, arm_name)) or legacy_conversion is not None:
-                # 現行document.json/blocks/chunksを書き終えてから同じDocument IRをEvidenceへ移す。
-                # consume_legacyでtable cell listを順次空にし、密表で2組のcell objectを同時保持しない。
+                # 現行 document.json/blocks/chunks を書き終えてから同じ Document IR を Evidence へ移す
+                # （consume_legacy で table cell list を順次空にし、密表で 2 組の cell object を同時保持しない）
                 evidence_md = _generate_evidence(
                     rp,
                     rel,
@@ -2445,8 +2080,8 @@ def _build_derived_into_staging(
                 )
                 result.document = None
                 if rel in source_failure_notices and evidence_md is not None:
-                    # 通常MD/Document IRは失敗noticeの検索表現と混在させない。文書単位failedとして
-                    # notice chainだけを公開し、他文書は同じgenerationで継続する。
+                    # 通常 MD/Document IR は失敗 notice の検索表現と混在させない。文書単位 failed として notice chain だけを公開し、
+                    # 他文書は同じ generation で継続する。
                     artifact = dr_ir / (rel + ".document.json")
                     if artifact.exists():
                         artifact.unlink()
@@ -2480,13 +2115,11 @@ def _build_derived_into_staging(
             unhandled_failures.append({"doc": rel, "reason": f"unhandled_exception:{exc.__class__.__name__}"})
         finally:
             if rel_unhandled:
-                # 想定外の例外（belt-and-braces の except）で終わった rel は、sidecar が
-                # 不完全な途中状態のままになりうるため、その状態を「実測の正本」として
-                # マニフェスト化しない（マニフェスト欠落＝次回 sync が要再生成として拾う）。
+                # 想定外の例外で終わった rel は sidecar が不完全な途中状態になりうるため、マニフェスト化しない
+                # （マニフェスト欠落＝次回 sync が要再生成として拾う）
                 unhandled_failed += 1
             elif not _write_derived_sidecar_manifest(dr, dr_rag, dr_ir, rel, human_md_sig=human_md_sig_for_rel):
-                # マニフェスト自体の書込失敗も、不完全な世代を「成功」と偽らないよう
-                # unhandled_failed へ計上し公開Gate（build_derived）で止める。
+                # マニフェスト自体の書込失敗も unhandled_failed へ計上し、公開 Gate（build_derived）で止める（不完全な世代を「成功」と偽らない）
                 unhandled_failed += 1
                 unhandled_failures.append({"doc": rel, "reason": "manifest_write_failed"})
             _rss1 = _proc_rss_gib()
@@ -2496,13 +2129,12 @@ def _build_derived_into_staging(
             processed_candidates += 1
             if progress is not None:
                 progress(processed_candidates, candidate_total)
-    # per-file ループを最後まで走り切った（＝完走した）ときだけ剪定/上限適用する（`_conv_cache_prune`
-    # docstring 参照）。ここへ到達しない途中死（プロセス強制終了等）では呼ばれず、まだ生きている
-    # rel のキャッシュは次回 sync でそのまま再利用できる（進捗を保持する）。
+    # per-file ループを完走したときだけ剪定/上限適用する（`_conv_cache_prune` 参照）。
+    # 途中死では呼ばれず、生きている rel のキャッシュは次回 sync で再利用できる。
     _conv_cache_prune(conv_cache_root, conv_cache_seen_rels)
     _conv_cache_enforce_cap(conv_cache_root)
     _write_arms_sig_marker(dr)                           # この派生を作った時のアーム構成を刻む（後の drift 判定用）
-    if document_ir_failed == 0:                          # 全 IR が正常に書けた時だけ IR 版マーカーを刻む（修正3/4）
+    if document_ir_failed == 0:                          # 全 IR が正常に書けた時だけ IR 版マーカーを刻む
         _write_document_ir_sig_marker(dr)
     else:
         _remove_marker(dr, _DOCUMENT_IR_SIG_MARKER)      # 失敗を現行値マーカーで隠さない（次回 sync が必ず drift）
@@ -2535,35 +2167,17 @@ def _build_derived_into_staging(
 
 def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = True,
                         world: str | None = None) -> dict:
-    """**IR だけ**の軽量再生成（DOC-IR-001.5・修正3）。`build_derived` と違い derived を全消去しない
-    （MD／meta.json／`.arms_sig` には一切触れない＝IR 版だけの更新で全再ビルドを誘発しない）。
+    """IR だけの軽量再生成。`build_derived` と違い derived を全消去しない（MD／meta.json／`.arms_sig` には触れない）。
 
-    `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先（`_archive_also_root`）も合流して歩く
-    ——**ここを省くと、展開先の `.document.json` が下の stale 一掃ループに「原本が消えた」と
-    誤認されて毎回削除される**（アーカイブ自体は消えていないのに、軽量再生成のたびに展開先
-    由来の IR が消えては次の `_build_derived_into_staging` 全再構築で復活する往復になる）。
-    省略時（`None`）は従来どおり `wd` だけを見る（既存呼び出し元は無変更）。
-
-    `wd` を `scope_infer.safe_files` で歩き、原本が素の `.docx`/`.pptx`/`.xlsx`（B1 と同じ理由で旧形式は
-    対象外＝`build_derived` の B1 コメント参照）**かつ** 対応する `derived/{rel}.md` が既に在る文書だけを
-    拡張子に応じて `ooxml_arm._build_docx_ir`/`_build_pptx_ir`/`_build_xlsx_ir` で再構築し
-    `write_text_atomic` で原子書込する（MD 自体が無い＝未対応/未変換な文書は対象外）。対応する原本が無く
-    なった stale な
-    `*.document.json`（鏡＝原本が消えたら派生も消える）は削除する。**マーカー（`.document_ir_sig`）は
-    世界単位で1つ**＝docx/pptx/xlsx のどれか1つの抽出器版だけが上がった場合でも、対象拡張子だけに
-    限定せず対象の OOXML 文書を全件（この関数のスコープ内で）再生成する。
+    `wd` を `scope_infer.safe_files` で歩き、原本が素の `.docx`/`.pptx`/`.xlsx`（旧形式は対象外）かつ対応する `derived/{rel}.md` が既に在る文書だけを
+    `ooxml_arm._build_docx_ir`/`_build_pptx_ir`/`_build_xlsx_ir` で再構築して原子書込し、原本が無くなった stale な `*.document.json` は削除する。
+    `world` を渡すと zip/tar 展開先（`_archive_also_root`）も歩く（省くと展開先の `.document.json` が stale として削除される）。
+    マーカー `.document_ir_sig` は資料フォルダ単位で 1 つのため、対象の OOXML 文書は全件再生成する。
 
     返値 `{document_ir_generated, document_ir_failed, document_ir_failures:[{doc, reason}]}`。
-    **全件成功（`document_ir_failed == 0`）の時だけ** `.document_ir_sig` マーカーを更新する（失敗が残れば
-    次回 sync も drift のまま＝再試行される）。`write_document_ir_sig_marker=False`
-    （`worker.sync` の document_ir→evidence/rag 連鎖の契約・`refresh_evidence_ir` の
-    `write_rag_sig_marker` と同型）は、`document_ir_failed == 0` でもこの場では確定せず、
-    呼び出し元が連鎖した evidence/rag（さらに RAG_ES 有効時は ES 反映）の成功まで確認してから
-    `write_document_ir_sig_marker()` を呼んで確定する（先に確定すると、連鎖が失敗した時に
-    再試行の入口＝document_ir drift の検知そのものを失う）。
-    1文書ごとの想定内の失敗は本関数内で個別に捕捉し `document_ir_failed` 等へ計上する
-    （best-effort）が、それ以外の想定外の例外は捕捉せず呼び出し元（`worker.sync`）へ伝播する
-    （`worker.sync` 自身もこれを握り潰さない）。
+    全件成功のときだけ `.document_ir_sig` を更新する。`write_document_ir_sig_marker=False` のときは確定せず、
+    呼び出し元が連鎖した evidence/rag（RAG_ES 有効時は ES 反映）の成功を確認してから `write_document_ir_sig_marker()` で確定する。
+    1 文書ごとの想定内の失敗は個別に計上し、想定外の例外は呼び出し元（`worker.sync`）へ伝播する。
     """
     from .. import scope_infer as si
     from . import document_ir
@@ -2573,9 +2187,9 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
         dr = Path(derived).resolve()
     except OSError:
         dr = Path(derived)
-    dr_ir = _sibling_layer_dir(dr, "ir")           # `.document.json` は ir 層（§8.1 三階層）
-    # `build_derived` と同じ重なりガード: derived がソース配下と重なる/同一だと、ソース木への
-    # `.document.json` 書込と stale 一掃 unlink がそのまま READ-ONLY source の汚染・削除になる。書く前に拒否。
+    dr_ir = _sibling_layer_dir(dr, "ir")           # `.document.json` は ir 層
+    # `build_derived` と同じ重なりガード: derived がソース配下と重なる/同一だと、`.document.json` 書込と stale 一掃 unlink が
+    # READ-ONLY source の汚染・削除になる。書く前に拒否する。
     if _within(dr, wd) or _within(wd, dr) or _within(dr_ir, wd) or _within(wd, dr_ir):
         return {"document_ir_generated": 0, "document_ir_failed": 0, "document_ir_failures": [],
                 "error": "derived_overlaps_source"}
@@ -2587,9 +2201,7 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
         if ext not in ooxml_arm._IR_EXTS:
             continue
         if _is_sensitive_original(rp, ext):
-            # 秘匿名は document_ir を一切持たない契約（`_is_sensitive_original` 参照）。MD 自体が
-            # 無い時点で下の `md_path.is_file()` ガードにも自然に落ちるが、名前変更などで stale な
-            # 旧 `.md` が残っていた場合の再生成を確実に塞ぐため明示的に除外する。
+            # 秘匿名は document_ir を持たない（`_is_sensitive_original` 参照）。stale な旧 `.md` が残っていた場合の再生成を塞ぐため明示的に除外する。
             continue
         md_path = dr / (rel + ".md")
         if not md_path.is_file():                            # MD 自体が無い（未対応/未変換）は対象外
@@ -2634,15 +2246,10 @@ def refresh_document_ir(wd, derived, *, write_document_ir_sig_marker: bool = Tru
 
 
 _DERIVED_MANIFEST_SUFFIX = ".derived.json"
-# `{rel}.derived.json` は原本ごとに、検索 consumer 側の設定（例: ES への RAG 反映の有無）に
-# 関係なく常時生成する（=diskを消費する。無効化しても書かれなくなるものではない）。
-# マニフェスト形式のバージョン（`sidecars`/`assets` キーの構成が変わったら上げる）。現行値と
-# 一致しないマニフェスト（キー自体を持たない旧世代を含む）は `rag_sidecars_missing` が
-# 「欠落」として扱い、全再構築で書き直させる（形式移行の自己修復）。
-# 運用上の注意: このバージョンを上げた直後の最初の手動 sync は、原本1件ごとに旧マニフェストが
-# 「欠落」判定になるため、検索 consumer のフラグ（ES への RAG 反映の有無等）が OFF の world でも
-# 全原本分の全再構築（`run()`）が1回だけ走る＝所要時間は通常の差分更新でなく初回取り込み相当に
-# なる（1回で安定する・以後は従来どおり差分のみ）。
+# `{rel}.derived.json` は原本ごとに、検索 consumer 側の設定（ES への RAG 反映の有無等）に関係なく常時生成する。
+# マニフェスト形式のバージョン（`sidecars`/`assets` キーの構成が変わったら上げる）。現行値と一致しないマニフェスト
+# （キー自体を持たない旧世代を含む）は `rag_sidecars_missing` が「欠落」として扱い、全再構築で書き直させる。
+# このバージョンを上げた直後の最初の手動 sync は、全原本分の全再構築（`run()`）が 1 回だけ走る。
 _DERIVED_MANIFEST_SCHEMA_VERSION = "derived-sidecar-manifest-v1"
 # マニフェストが記録しうる sidecar 種別（この5種のうち実際に書かれたものだけを列挙する）。
 _MANIFEST_SIDECAR_SUFFIXES = (".md", ".md.meta.json", ".evidence.json", ".rag.md", ".rag_chunks.jsonl")
@@ -2652,39 +2259,13 @@ def _write_derived_sidecar_manifest(dr: Path, dr_rag: Path, dr_ir: Path, rel: st
                                     human_md_sig: str | None = None) -> bool:
     """`rel` について実際に生成された sidecar 集合を記録する（sidecar 欠落検知の唯一の正本）。
 
-    `dr`/`dr_rag`/`dr_ir`＝md/rag/ir 3層の物理ルート（§8.1 三階層）。マニフェスト自身は ir 層
-    （`{rel}.derived.json`）に書くが、対象の sidecar は3層に分散するため存在確認は
-    `_LAYER_FOR_SIDECAR_SUFFIX` で層を引いてから行う。
-
-    どの sidecar が書かれるかは実行時条件（空/image-only・有効 arm・legacy backend 到達性・
-    raster 等）で決定的に変わり、原本の拡張子だけから静的に導出できない。生成した側がその場で
-    「実際に何を書いたか」をそのまま書き残すことで、この不一致を構造的に無くす。候補
-    （`_MANIFEST_SIDECAR_SUFFIXES`）のうち現に存在するものだけを記録する（何も書かれなければ
-    空リスト＝「この原本には何も期待しない」という正当な記録になる）。`{rel}.assets/`
-    ディレクトリが存在する場合は中身のファイル名一覧も `assets` キーへ記録する（存在しなければ
-    キー自体を省略する＝assets を一度も持たない rel のマニフェストを変えない）。現行の
-    `_DERIVED_MANIFEST_SCHEMA_VERSION` も必ず書く（`rag_sidecars_missing` が形式移行を検知する
-    唯一の手がかり）。
-
-    `human_md_sig`: この rel の human_md（`OoxmlArm`・docx/xlsx）出力を**今回評価した**（`{rel}.md` を
-    実際に書いた、または IR は構築できたが本文が無く意図的に書かなかったのいずれかを含む）時だけ
-    呼び出し元が `_current_human_md_sig()` を渡す。`asset_versions.human_md` として書き、
-    `human_md_sig_drift`/`refresh_human_md` がこの asset **だけ**の選択的な差分再生成判定に使う
-    （`.rag.md`/`.evidence.json`/ES には一切触れない・RAG-KV の drift 連鎖と同じ単一 asset 版の
-    考え方）。**`.md` sidecar の有無とは独立に記録する**（`.md` が無いのは「空だから書かなかった」
-    正当な状態でもありうるため・`.md` が無い rel を `asset_versions` から除外すると、その rel は
-    レンダラ版が上がるたびに毎回「未評価」として拾われ続け、`human_md_sig_drift` が二度と False に
-    収束しなくなる）。省略時（None）はこの呼び出しが human_md を評価していない
-    （`refresh_evidence_ir`/`refresh_rag` 等）ことを意味し、**既存マニフェストの
-    `asset_versions.human_md` をそのまま引き継ぐ**（読めない/無ければ何も書かない＝キー自体を
-    増やさない）。
-
-    呼び出し元（`_build_derived_into_staging`/`refresh_evidence_ir`/`refresh_rag`）は、対象 rel
-    の処理が正常に完了した（想定外の例外で終わっていない）場合にだけこれを呼ぶ——想定外の失敗で
-    終わった rel は sidecar が不完全な途中状態のままになりうるため、その状態を正本として記録
-    しない。戻り値: 書込に成功したら True。失敗（OSError。`.assets/` の列挙中の失敗も含む）した
-    ら False——呼び出し元はこの rel を失敗として扱い公開を止める（書けなかったマニフェストを
-    「対象外」と取り違えて次回 sidecar 欠落検知から漏らさないため）。
+    `dr`/`dr_rag`/`dr_ir` は md/rag/ir 3 層の物理ルート。マニフェストは ir 層（`{rel}.derived.json`）に書き、sidecar の存在確認は
+    `_LAYER_FOR_SIDECAR_SUFFIX` で層を引いて行う。候補（`_MANIFEST_SIDECAR_SUFFIXES`）のうち存在するものだけを記録する（無ければ空リスト）。
+    `{rel}.assets/` があれば中身のファイル名一覧を `assets` キーへ、現行の `_DERIVED_MANIFEST_SCHEMA_VERSION` も必ず書く。
+    `human_md_sig`: human_md（`OoxmlArm`・docx/xlsx）出力を今回評価したときだけ `_current_human_md_sig()` を渡し、`asset_versions.human_md` として書く
+    （`.md` の有無とは独立）。None なら既存マニフェストの値を引き継ぐ。
+    呼び出し元は、対象 rel の処理が正常に完了した場合にだけ呼ぶ。戻り値は書込成功なら True、失敗（OSError）なら False
+    （呼び出し元はその rel を失敗として扱い公開を止める）。
     """
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
     present = [suffix for suffix in _MANIFEST_SIDECAR_SUFFIXES
@@ -2712,28 +2293,13 @@ def _write_derived_sidecar_manifest(dr: Path, dr_rag: Path, dr_ir: Path, rel: st
 
 
 def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
-    """原本ごとに生成時マニフェスト（`_write_derived_sidecar_manifest`）を読み、そこに列挙された
-    sidecar・asset が1つでも欠落していれば True。
+    """原本ごとの生成時マニフェスト（`_write_derived_sidecar_manifest`）を読み、そこに列挙された sidecar・asset が 1 つでも欠落していれば True。
 
-    `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先も合流して評価する——省くと展開先由来の
-    文書のマニフェストを一切確認せず、欠落があっても検知できない（省略時は従来どおり `wd` だけ）。
-
-    どの sidecar が生成されるかは実行時条件（空/image-only・有効 arm・legacy backend 到達性・
-    raster 等）で決定的に変わり、原本の拡張子だけからは静的に導出できない。ここでは生成した側
-    （`build_derived`/`refresh_evidence_ir`/`refresh_rag`）が実際に書いた sidecar の記録を
-    そのまま照合するだけにする。マニフェスト自体が無い（旧世代・未生成・書込失敗・想定外の
-    例外で処理が終わった）rel も欠落扱いとする——1回だけ `worker.sync()` の全再構築
-    フォールバックを誘発し、`build_derived` がその rel のマニフェストを新たに書く（自己修復）。
-
-    マニフェストの `schema` が現行の `_DERIVED_MANIFEST_SCHEMA_VERSION` と一致しない（キー自体が
-    無い旧世代を含む）場合も欠落扱いとする——マニフェスト形式そのものが変わった（例: `assets`
-    キーの追加）場合、旧形式のマニフェストは新しい検査基準に対して「揃っているかどうか判定
-    不能」なので、安全側に倒して1回だけ全再構築へ回し、現行形式で書き直させる。
-
-    残余リスク（受容）: 該当原本の Evidence 生成が恒久的に失敗し続ける場合、この検査は毎回
-    True を返し続け、sync のたびに全再構築（`run()`）へフォールバックし続ける。閉域LAN・
-    単一worker の非機能前提ではこれを受容する（該当原本自体の恒久失敗が要対応の異常であり、
-    sidecar 検査の欠陥ではない）。
+    - `world`（アーカイブ取り込み）: 渡すと zip/tar 展開先も合流して評価する（省略時は `wd` だけ）。
+    - 生成した側（`build_derived`/`refresh_evidence_ir`/`refresh_rag`）が実際に書いた sidecar の記録をそのまま照合する。
+      マニフェスト自体が無い rel も欠落扱いとして、1 回だけ `worker.sync()` の全再構築フォールバックを誘発する（自己修復）。
+    - マニフェストの `schema` が現行の `_DERIVED_MANIFEST_SCHEMA_VERSION` と一致しない場合も欠落扱いとして、現行形式で書き直させる。
+    Evidence 生成が恒久的に失敗し続ける原本があると毎回 True を返し、sync のたびに全再構築へフォールバックする。
     """
     from .. import scope_infer as si
 
@@ -2742,17 +2308,15 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
     dr_rag = _sibling_layer_dir(dr, "rag")
     dr_ir = _sibling_layer_dir(dr, "ir")
     roots = {"md": dr, "rag": dr_rag, "ir": dr_ir}
-    # build_derived が候補として実際に処理しうる拡張子とだけ突き合わせる（それ以外の原本＝
-    # 設計書/ソースコード等は最初からマニフェストを持たない対象外であり、無いことは欠落ではない）。
+    # build_derived が候補として処理しうる拡張子とだけ突き合わせる（それ以外の原本はマニフェストを持たない対象外）
     manifest_candidates = OFFICE_EXT | RASTER_EVIDENCE_EXT | convertible_exts()
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         ext = rp.suffix.lower()
         if ext not in manifest_candidates:
             continue
         if _is_sensitive_original(rp, ext):
-            # 秘匿名は変換ループ（`_build_derived_into_staging`）が最初から MD/派生を作らず
-            # マニフェストも書かない——「欠落」ではなく「対象外」（`_is_sensitive_original` 参照）。
-            # ここを塞がないと毎 sync で欠落判定→全再構築ループが無限に続く。
+            # 秘匿名は変換ループが MD/派生/マニフェストを作らない＝「欠落」ではなく「対象外」（`_is_sensitive_original` 参照）。
+            # 塞がないと毎 sync で欠落判定→全再構築ループが続く。
             continue
         manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
         if (not isinstance(manifest, dict)
@@ -2779,21 +2343,13 @@ def rag_sidecars_missing(wd, derived, *, world: str | None = None) -> bool:
 
 
 def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world: str | None = None) -> dict:
-    """XLSX/DOCX/PPTX/PDF Evidence IRをclone済みgeneration上で軽量再生成する（E2b/E4）。
+    """XLSX/DOCX/PPTX/PDF の Evidence IR を clone 済み generation 上で軽量再生成する。
 
-    原本が素の``.xlsx``/``.docx``で、既存MDのprovenanceが``ooxml``の文書だけを対象にする。旧形式から変換した
-    一時OOXML出力へ誤ったsource hashを付けない。対応原本が消えた、または担当armが
-    変わったstale ``*.evidence.json``は削除する。全件成功時だけ``.evidence_ir_sig``を更新する。
-
-    `write_rag_sig_marker=False`（RAG_ES 有効時の呼び出し契約）は「成功時に自ら `.rag_sig` を
-    確定しない」だけでなく、生成処理を始める**前**に既存 `.rag_sig` を明示的に未確定へ戻す
-    （マーカー保留方式・呼び出し元が ES 反映の成否を確認してから確定する）。削除に失敗したら
-    生成を開始せず `error` を返す。
-
-    `world`（O1）は `_build_derived_into_staging` docstring 参照——公開中の OCR 観測を VLM と
-    合流して rag.md へ含める。**併せて** zip/tar 展開先（`_archive_also_root`）も合流して歩く
-    ——これを省くと、展開先由来の evidence.json/rag.md/assets が下の stale 一掃ループに
-    「原本が消えた」と誤認されて削除される（`refresh_document_ir` と同じ理由）。
+    原本が素の ``.xlsx``/``.docx`` で既存 MD の provenance が ``ooxml`` の文書だけを対象にする（旧形式の一時 OOXML に誤った source hash を付けない）。
+    対応原本が消えた、または担当 arm が変わった stale ``*.evidence.json`` は削除し、全件成功時だけ ``.evidence_ir_sig`` を更新する。
+    `write_rag_sig_marker=False`（RAG_ES 有効時）は、生成を始める前に既存 `.rag_sig` を未確定へ戻し（削除に失敗したら `error` を返す）、
+    成功時にも確定しない（呼び出し元が ES 反映の成否を確認してから確定する）。
+    `world`: 公開中の OCR 観測を VLM と合流して rag.md へ含め、zip/tar 展開先（`_archive_also_root`）も歩く。
     """
     from .. import scope_infer as si
     from . import evidence_ir
@@ -2837,24 +2393,22 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
     rag_failures: list[dict] = []
     seen: set[str] = set()
     legacy_cache = legacy_convert.cache_root_for(dr)
-    obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決（O1）
+    obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決
     ocr_observation_marker = _ocr_observation_marker_for(obs_dir)
     for rp, rel in si.safe_files(wd, also=_archive_also_root(world)):
         if rp.suffix.lower() not in EVIDENCE_EXT:
             continue
         ext = rp.suffix.lower()
         if _is_sensitive_original(rp, ext):
-            # 秘匿名は evidence_ir/rag を一切持たない契約（`_is_sensitive_original` 参照）。PDF は
-            # image-only でも `.md` 欠落だけでは対象外にならない経路があるため、ここで明示的に
-            # 塞がないと秘匿本文が `.evidence.json`/`.rag.md` へ平文で書き出されうる。
+            # 秘匿名は evidence_ir/rag を持たない（`_is_sensitive_original` 参照）。PDF は image-only で `.md` 欠落だけでは対象外にならない経路があるため、
+            # 明示的に塞がないと秘匿本文が `.evidence.json`/`.rag.md` へ平文で書き出される。
             continue
         md_path = dr / (rel + ".md")
         meta = json_io.read_json(dr / (rel + ".md.meta.json"), default=None)
         source_failure_notice = _is_source_failure_notice(meta)
         if ext == ".pdf":
-            # image-only PDFは旧MDが空でもEvidence/RAGを正本画像と構造から再生成する。
-            # full generationでparse failure noticeへ縮退済みなら、backendの現在値に左右されず
-            # notice chainを現行schemaへ再生成する。
+            # image-only PDF は旧 MD が空でも Evidence/RAG を正本画像と構造から再生成する。
+            # full generation で parse failure notice へ縮退済みなら、backend の現在値に左右されず notice chain を現行 schema へ再生成する。
             if not source_failure_notice and not pdf_available():
                 continue
         elif ext in RASTER_EVIDENCE_EXT:
@@ -2867,10 +2421,8 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
             if not isinstance(meta, dict) or (meta.get("arm") != "ooxml" and not source_failure_notice):
                 continue
         else:
-            # 空/image-only な正常 OOXML は legacy `.md` を持たない正当なケースがある。`.md` の
-            # 有無だけで対象外と決めず、生成時マニフェストが以前 `.evidence.json` を記録して
-            # いれば regeneration 対象として扱う（`.md` が本当に無い＝未対応/未処理の場合だけ
-            # マニフェストにも `.evidence.json` が無く、正しく対象外のままになる）。
+            # 空/image-only な正常 OOXML は `.md` を持たない場合がある。`.md` の有無だけで対象外とせず、
+            # 生成時マニフェストが以前 `.evidence.json` を記録していれば regeneration 対象にする。
             prior_manifest = json_io.read_json(dr_ir / (rel + _DERIVED_MANIFEST_SUFFIX), default=None)
             prior_sidecars = prior_manifest.get("sidecars") if isinstance(prior_manifest, dict) else None
             if not (isinstance(prior_sidecars, list) and ".evidence.json" in prior_sidecars):
@@ -2931,9 +2483,8 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
                 rag_failed += 1
                 rag_failures.append({"doc": rel, "reason": f"render_failed:{exc.__class__.__name__}"})
                 rel_ok = False
-        # この rel の処理が正常に完了した時だけ、実際に書かれた sidecar をマニフェスト化する
-        # （途中で失敗した rel は不完全な途中状態を正本として記録しない）。マニフェスト自体の
-        # 書込に失敗した場合も rag_failed へ計上し、`.rag_sig` マーカーの確定を防ぐ。
+        # この rel の処理が正常に完了した時だけ、実際に書かれた sidecar をマニフェスト化する。
+        # マニフェスト自体の書込に失敗した場合も rag_failed へ計上し、`.rag_sig` マーカーの確定を防ぐ。
         if rel_ok and not _write_derived_sidecar_manifest(dr, dr_rag, dr_ir, rel):
             rag_failed += 1
             rag_failures.append({"doc": rel, "reason": "manifest_write_failed"})
@@ -2979,15 +2530,11 @@ def refresh_evidence_ir(wd, derived, *, write_rag_sig_marker: bool = True, world
 
 
 def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | None = None) -> dict:
-    """既存Evidence世代と同じ原本からpipe-free Markdown/chunk/assetsを再生成する（E3）。
+    """既存 Evidence 世代と同じ原本から pipe-free な Markdown/chunk/assets を再生成する。
 
-    `write_rag_sig_marker=False` の契約は `refresh_evidence_ir` と同じ（マーカー保留方式・
-    生成開始前に `.rag_sig` を明示的に未確定へ戻す）。
-
-    `world`（O1）は `_build_derived_into_staging` docstring 参照——OCR 完了後の「追いつき」
-    再生成はこの関数（`rag_sig_drift` の OCR 観測次元が誘発）が担う。**併せて** zip/tar 展開先
-    （`_archive_also_root`）も `sources` に合流する——これを省くと、下の `source_path is None`
-    判定が展開先由来の `rel` を「原本が消えた」として `failed` へ誤計上する。
+    `write_rag_sig_marker=False` の契約は `refresh_evidence_ir` と同じ。
+    `world`: OCR 完了後の再生成はこの関数（`rag_sig_drift` の OCR 観測次元が誘発）が担う。
+    zip/tar 展開先（`_archive_also_root`）も `sources` に合流する（省くと `source_path is None` 判定が展開先由来の `rel` を `failed` へ誤計上する）。
     """
     from .. import scope_infer as si
     from . import evidence_ir
@@ -3026,7 +2573,7 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
     failures: list[dict] = []
     seen: set[str] = set()
     legacy_cache = legacy_convert.cache_root_for(dr)
-    obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決（O1）
+    obs_dir = _resolve_ocr_observation_dir(world)          # 1回だけ解決
     ocr_observation_marker = _ocr_observation_marker_for(obs_dir)
     for evidence_path in sorted(dr_ir.rglob("*.evidence.json")):
         rel = evidence_path.relative_to(dr_ir).as_posix()[: -len(".evidence.json")]
@@ -3036,21 +2583,19 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             failures.append({"doc": rel, "reason": "source_missing"})
             continue
         if _is_sensitive_original(source_path, source_path.suffix.lower()):
-            # 秘匿名は rag を一切持たない契約（`_is_sensitive_original` 参照）——`seen` へ加えない
-            # ため、更新前に生成済みの `credentials.xlsx.evidence.json` から `.rag.md`/chunks を
-            # 再生成せず、下の cleanup ループで既存の生成物があれば削除される（台帳 #85〜#88）。
+            # 秘匿名は rag を持たない（`_is_sensitive_original` 参照）。`seen` へ加えず、下の cleanup ループで既存の生成物を削除させる。
             continue
         seen.add(rel)
         rel_ok = True
         try:
-            # 巨大Evidence JSONの全量read/json.loadsを避け、同じ原本と固定parserから再構築する。
-            # この経路はevidence_sigが一致する時だけworkerから呼ばれるため、既存Evidenceと決定的に等価。
+            # 巨大な Evidence JSON の全量 read/json.loads を避け、同じ原本と固定 parser から再構築する
+            # （`evidence_sig` が一致する時だけ worker から呼ばれるため、既存 Evidence と決定的に等価）。
             actual = source_path
             conversion = None
             meta = json_io.read_json(dr / (rel + ".md.meta.json"), default=None)
             if _is_source_failure_notice(meta):
-                # Evidence sigは一致済みでRAG rendererだけがdriftした経路。巨大な通常Evidenceは
-                # 原本から再構築する一方、このsource-level noticeは小さい既存IRを正本として読む。
+                # Evidence sig は一致済みで RAG renderer だけが drift した経路。巨大な通常 Evidence は原本から再構築し、
+                # この source-level notice は小さい既存 IR を正本として読む。
                 ir = evidence_ir.from_json_str(evidence_path.read_text(encoding="utf-8"))
             elif source_path.suffix.lower() in legacy_convert.LEGACY_EXT_MAP:
                 materialized = legacy_convert.ensure_ooxml(source_path, rel, legacy_cache)
@@ -3091,9 +2636,8 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
             failed += 1
             failures.append({"doc": rel, "reason": f"render_failed:{exc.__class__.__name__}"})
             rel_ok = False
-        # この rel の処理が正常に完了した時だけ、実際に書かれた sidecar をマニフェスト化する
-        # （途中で失敗した rel は不完全な途中状態を正本として記録しない）。マニフェスト自体の
-        # 書込に失敗した場合も failed へ計上し、`.rag_sig` マーカーの確定を防ぐ。
+        # この rel の処理が正常に完了した時だけ、実際に書かれた sidecar をマニフェスト化する。
+        # マニフェスト自体の書込に失敗した場合も failed へ計上し、`.rag_sig` マーカーの確定を防ぐ。
         if rel_ok and not _write_derived_sidecar_manifest(dr, dr_rag, dr_ir, rel):
             failed += 1
             failures.append({"doc": rel, "reason": "manifest_write_failed"})
@@ -3120,10 +2664,7 @@ def refresh_rag(wd, derived, *, write_rag_sig_marker: bool = True, world: str | 
 
 
 def _convert_with_arms(path, enabled):
-    """有効アームのうち**最初に受理したアーム1本**で変換（A1＝単一アーム選択）。
-
-    返値 `(arm_name, ArmResult|None)`。受理アームが無ければ `(None, None)`。
-    """
+    """有効アームのうち最初に受理したアーム 1 本で変換する。返値 `(arm_name, ArmResult|None)`。受理アームが無ければ `(None, None)`。"""
     for arm in enabled:
         if arm.accepts(path):
             return arm.name, arm.convert(path)
@@ -3139,8 +2680,7 @@ def _write_provenance(
 ) -> None:
     """変換来歴サイドカー `{md_path}.meta.json`（`{arm, method, confidence, notes}`）を書く（best-effort）。
 
-    **決定的**（タイムスタンプを含めない・キー順固定＝`sort_keys`）。derived 全消去→再作成の鏡動作に相乗り
-    （毎回作り直す）。es_index がこのサイドカーを読んでチャンクメタ（extraction_method/confidence）へ搬送する。
+    決定的（タイムスタンプなし・`sort_keys`）。es_index がこのサイドカーを読んでチャンクメタ（extraction_method/confidence）へ搬送する。
     """
     meta = {"arm": arm_name, "method": result.method,
             "confidence": result.confidence, "notes": list(result.notes)}
@@ -3224,12 +2764,7 @@ def _table_md(tbl_el) -> str:
 
 
 def _docx_md(p: Path) -> str | None:
-    """DOCX の人間向け MD（H2・`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.2）。
-
-    document-ir（`arms/ooxml_arm._build_docx_ir`）を共通土台にし、`human_md.render_docx` へ委譲する
-    （結合セル・ネスト表の展開は `_docx_table_walk` の解決結果をそのまま使う＝独自の簡易パーサは
-    持たない）。IR 構築に失敗すれば未対応（None・fail-safe）。
-    """
+    """DOCX の人間向け MD。document-ir（`arms/ooxml_arm._build_docx_ir`）を土台に `human_md.render_docx` へ委譲する。IR 構築に失敗すれば未対応（None）。"""
     from .arms import ooxml_arm
     ir = ooxml_arm._build_docx_ir(p)
     return _render_human_md(ir, p, ".docx") if ir is not None else None
@@ -3283,13 +2818,9 @@ def _pptx_md(p: Path) -> str | None:
     return "\n\n".join(out) if out else None
 
 
-# ---- A5: 幾何オクルージョン（覆い図形の座標判定・pptx v1・§5.5 の簡略版）----
-#
-# 現行契約 docs/11-Office変換.md §5.5。
-# 簡略版: 人手確認UI（A17）は作らず、覆い図形に隠されたテキストへ
-# MD本文に直接マーカー行を自動出力するだけ（メタタグ `status=hidden_candidate` 方式ではない・
-# D3=自動公開の原則と整合）。対象は .pptx のみ（座標が EMU で明確）。属性ベースの隠し
-# （w:vanish・veryHidden シート・非表示スライド等）は今回は対象外（未実装の残課題）。
+# ---- 幾何オクルージョン（覆い図形の座標判定・pptx）----
+# 覆い図形に隠されたテキストへ、MD 本文に直接マーカー行を自動出力する（対象は .pptx のみ・座標が EMU で明確）。
+# 属性ベースの隠し（w:vanish・veryHidden シート・非表示スライド等）は対象外。
 _HIDDEN_MARKER = "**［隠し候補：前面の図形に覆われた文字］**"
 _OCCLUSION_RATIO = 0.9                                        # 交差面積÷テキストshape面積のしきい値
 
@@ -3300,12 +2831,10 @@ def _figure_text_line(lines: list[str]) -> str:
 
 
 def _pptx_slide_texts(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
-    """1スライド分のテキスト行（shape 単位・文書順・A5 の隠し候補マーカー付き）。
+    """1 スライド分のテキスト行（shape 単位・文書順・隠し候補マーカー付き）。
 
-    shape 単位の歩行ロジックがどんな理由で失敗しても（未知の構造・想定外の要素等）、例外を握って
-    現行と全く同じフラット抽出（`root.iter(f"{_A}t")`）にフォールバックする（テキストの取りこぼし
-    を絶対に起こさない・保守的に倒す）。非隠しスライドは shape 単位歩行でも現行実装とバイト単位で
-    一致する（spTree の文書順走査は `root.iter` と同じ順序でテキストを拾うため）。
+    shape 単位の歩行が失敗したら例外を握って、フラット抽出（`root.iter(f"{_A}t")`）にフォールバックする（テキストの取りこぼしを起こさない）。
+    非隠しスライドは shape 単位でもフラット抽出とバイト単位で一致する。
     """
     try:
         return _pptx_slide_texts_by_shape(root, figures)
@@ -3378,9 +2907,8 @@ def _bbox_intersection_ratio(inner: tuple, outer: tuple) -> float:
 def _pptx_slide_texts_by_shape(root, figures: dict[int, list[list[str]]] | None = None) -> list[str]:
     """`p:cSld/p:spTree` 直下を文書順（=z順・背面→前面）で歩き、shape 単位でテキストを取る。
 
-    A5: 各テキスト shape について、それより後（前面）にある occluder 候補（無地塗りの空shape／画像）と
-    bbox の交差比が閾値以上なら「隠し候補」とマークし、直前に独立行のマーカーを出す。
-    `p:grpSp`（グループ）内は幾何判定せず、テキストのみ再帰抽出する。
+    各テキスト shape について、後（前面）にある occluder 候補（無地塗りの空 shape／画像）と bbox の交差比が閾値以上なら
+    「隠し候補」とマークし、直前に独立行のマーカーを出す。`p:grpSp`（グループ）内は幾何判定せず、テキストのみ再帰抽出する。
     """
     cSld = root.find(f"{_PR}cSld")
     if cSld is None:
@@ -3459,12 +2987,8 @@ def _pptx_group_texts(grp) -> list[str]:
 # ---- .xlsx（openpyxl・値ベース）----
 
 def _xlsx_md(p: Path) -> str | None:
-    """XLSX の人間向け MD（H2・`docs/archive/2026-08-28-人間向けMDの刷新.md` §3.1）。
-
-    document-ir（`arms/ooxml_arm._build_xlsx_ir`）を共通土台にし、`human_md.render_xlsx` へ委譲する
-    （シート丸ごと1枚の打切り付きパイプ表ではなく、`ooxml/excel.py::regions()` が検出する表候補
-    ごとに見出し＋パイプ表を出す＝独自の簡易パーサは持たない）。IR 構築に失敗すれば未対応
-    （None・fail-safe）。
+    """XLSX の人間向け MD。document-ir（`arms/ooxml_arm._build_xlsx_ir`）を土台に `human_md.render_xlsx` へ委譲し、
+    `ooxml/excel.py::regions()` が検出する表候補ごとに見出し＋パイプ表を出す。IR 構築に失敗すれば未対応（None）。
     """
     from .arms import ooxml_arm
     ir = ooxml_arm._build_xlsx_ir(p)
@@ -3511,10 +3035,8 @@ def _pdf_pages(p: Path) -> list[str]:
 def _pdf_is_encrypted(p: Path) -> bool:
     """PDF が暗号化されているか（空パスワードで復号できるかは問わない・`pypdf` で判定）。
 
-    `_pdf_pages` は暗号化 PDF も本文ゼロの `[]` へ丸めてしまい、呼び出し元
-    （`_build_derived_into_staging` の一般失敗分岐）が理由を失う。ここは判定専用の軽い呼び出しで、
-    バックエンドが `pdfminer`（暗号化判定 API を持たない）や未導入の場合は判定不能＝False
-    （fail-safe・「分からない」を「暗号化されている」と決め付けない）。
+    `_pdf_pages` は暗号化 PDF も `[]` に丸めるため、一般失敗分岐が理由を失う。
+    ここは判定専用で、バックエンドが `pdfminer` や未導入の場合は判定不能＝False。
     """
     if _pdf_backend() != "pypdf":
         return False
@@ -3539,29 +3061,12 @@ def _pdf_md(p: Path) -> str | None:
     return "\n\n".join(out) if out else None
 
 
-# ---- PDF ティア制（§5「PDF は一律解なし」）＝テキスト層の品質で担当アームを決定的に選ぶ ----
-_DEFAULT_PDF_TEXT_MIN_CHARS = 30                             # ページあたり平均抽出文字数のしきい値（保守的）
+# ---- PDF ティア制＝テキスト層の品質で担当アームを決定的に選ぶ ----
+_PDF_TEXT_MIN_CHARS = 30  # PDF テキスト層「十分」の判定しきい値（ページあたり平均抽出文字数）。診断用の good/sparse 分類に使い、テキストが存在する PDF は sparse でも決定的な pdf_text を継続する。0 以下は常に good
 
 
-def _pdf_text_min_chars() -> int:
-    """PDF テキスト層「十分」の判定しきい値（env `SHERPA_PDF_TEXT_MIN_CHARS`・ページあたり平均文字数）。
-
-    この値は診断用の good/sparse 分類に使う。テキストが存在するPDFは、sparseでも決定的なpdf_textを継続する。
-    不正/未設定は保守的な既定（30）。0 以下は常に good とみなす。
-    """
-    raw = os.environ.get("SHERPA_PDF_TEXT_MIN_CHARS")
-    if not raw:
-        return _DEFAULT_PDF_TEXT_MIN_CHARS
-    try:
-        return int(raw)
-    except ValueError:
-        return _DEFAULT_PDF_TEXT_MIN_CHARS
-
-
-# 品質判定のメモ化: `accepts()` は pdf_text/vision の複数アームから同一 PDF に
-# 対して繰り返し呼ばれる（`_convert_with_arms` が最初に受理したアームを探すため最大アーム数回呼ぶ）ため、抽出
-# （`_pdf_pages`）を毎回やり直すと PDF 1件あたり複数回の全文抽出が走ってしまう。`(resolved path,size,mtime_ns)`
-# キーでプロセス内メモ化し、1ファイル1回に抑える。上限超過は全消し（シンプルさ優先・LRU化はしない）。
+# 品質判定のメモ化: `accepts()` は pdf_text/vision の複数アームから同一 PDF に繰り返し呼ばれるため、
+# `(resolved path,size,mtime_ns)` キーでプロセス内メモ化し、1 ファイル 1 回の抽出に抑える。上限超過は全消し。
 _PDF_QUALITY_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
 _PDF_QUALITY_CACHE_MAX = 256
 
@@ -3577,11 +3082,9 @@ def _pdf_quality_cache_key(p: Path) -> tuple[str, int, int] | None:
 
 
 def _pdf_quality_and_avg(p) -> tuple[str, float]:
-    """PDF テキスト層の品質（good/sparse/empty）とページ平均抽出文字数を計算する（メモ化・fail-safe）。
+    """PDF テキスト層の品質（good/sparse/empty）とページ平均抽出文字数を計算する（メモ化）。
 
-    **fail-safe**: `_pdf_pages`（壊れた PDF 等で例外を投げうる）を例外安全に包み、失敗時は
-    `("empty", 0.0)` を返す。ここで例外を握らないと `accepts()` 経由で `build_derived` の1ファイルループ全体が
-    中断し、1件の壊れた PDF が他ファイルの変換まで巻き込んで取り込み全体を止めてしまう。
+    `_pdf_pages` の例外は握り、失敗時は `("empty", 0.0)` を返す（1 件の壊れた PDF が `build_derived` の 1 ファイルループ全体を止めないため）。
     """
     path = Path(p)
     key = _pdf_quality_cache_key(path)
@@ -3598,7 +3101,7 @@ def _pdf_quality_and_avg(p) -> tuple[str, float]:
             result = ("empty", 0.0)
         else:
             avg = round(total / (len(texts) or 1), 1)
-            min_chars = _pdf_text_min_chars()
+            min_chars = _PDF_TEXT_MIN_CHARS
             quality = "sparse" if (min_chars > 0 and avg < min_chars) else "good"
             result = (quality, avg)
     if key is not None:
@@ -3611,28 +3114,19 @@ def _pdf_quality_and_avg(p) -> tuple[str, float]:
 def pdf_text_quality(p) -> str:
     """PDF テキスト層の品質を決定的に判定: "good"（十分）/"sparse"（少ない）/"empty"（テキスト層ゼロ）。
 
-    バックエンド（pypdf/pdfminer）で全ページ抽出→整形後の総文字数とページ平均で分類する。ヒューリスティク
-    だが同一入力・同一バックエンドでは安定（決定的）。バックエンド未導入・**抽出例外（壊れた PDF 等）は測定
-    不能＝"empty" 扱い**（fail-safe・呼び出し側の `pdf_escalation_target` が上位アームへ委ねる）。
-    プロセス内メモ化（`_pdf_quality_and_avg`）を経由する。
+    全ページ抽出→整形後の総文字数とページ平均で分類する（`_pdf_quality_and_avg` でメモ化）。
+    バックエンド未導入・抽出例外は "empty" 扱い（`pdf_escalation_target` が上位アームへ委ねる）。
     """
     return _pdf_quality_and_avg(p)[0]
 
 
 def pdf_escalation_target(p) -> str | None:
-    """テキスト層ゼロの PDF を任意の vision に回すべきか。回すなら `"vision"`、それ以外は None を返す。
+    """テキスト層ゼロの PDF を vision に回すべきか。回すなら `"vision"`、それ以外は None。
 
-    決定的なティア判定を1箇所に集約し、各 PDF アームの `accepts` はこの結果を参照する（登録順に依存しない）:
-    - pdf_text.accepts → target is None
-    - vision.accepts（PDF 分岐）→ target == "vision"
-
-    判定表:
-    - good（十分）→ None（pdf_text 続投）
-    - sparse（少ないが有る）→ None（原本に存在するテキスト層を決定的に抽出し、AI解釈を足さない）
-    - empty（テキスト層ゼロまたは抽出不能）→ visionが実効利用可能なら `"vision"`、無ければ None
-
-    既定（`ooxml,pdf_text`）では vision が無効＝常に None を返す（＝pdf_text が全 PDF を担当）。
-    tesseract 直の `ocr` アームは存在しない（視覚読み取りは vision に一本化）。
+    ティア判定をここに集約し、各 PDF アームの `accepts` がこの結果を参照する（pdf_text.accepts → target is None、vision.accepts → target == "vision"）。
+    - good → None（pdf_text 続投）
+    - sparse → None（存在するテキスト層を決定的に抽出し、AI 解釈を足さない）
+    - empty → vision が実効利用可能なら `"vision"`、無ければ None
     """
     if Path(p).suffix.lower() != ".pdf":
         return None

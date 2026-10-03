@@ -1,18 +1,16 @@
 """system_settings の「1リクエスト1スナップショット」契約を検証する（`_public_settings`・
 `effective_agent`・`_select_provider` の3経路）。
 
-`keys.resolve_api_key`（3プロバイダ分）・`keys.selected_cloud_provider`・
-`agent_constructs.construct_id`（内部の A7 判定）・`agent_constructs.available_constructs`・
-`_effective_provider_for_field`（intent_model の auto 解決）・`_ollama_url_choice`（中央既定 URL）・
-`model_catalog.get_catalog()`（モデルカタログ本体）・`llm._allowlisted_hosts()`（Ollama 許可
-リスト）・`effective_agent()`（agent 未設定時の `default_agent()` 解決チェーン・A7 判定と警告
-ログ用のプロバイダ名解決）は、呼び出し側が既に読んだスナップショットを渡せばそれを使い、省略時
+`keys.resolve_api_key`・`keys.selected_cloud_provider`・
+`agent_constructs.construct_id`・`agent_constructs.available_constructs`・
+`_ollama_url_choice`（中央既定 URL）・`llm._allowlisted_hosts()`（Ollama 許可
+リスト）・`effective_agent()`（agent 未設定時の `default_agent()` 解決チェーン）は、呼び出し側が既に読んだスナップショットを渡せばそれを使い、省略時
 だけ自分で読む契約になっている。各経路の入口が1回だけ `store.get_system_settings()` を読み、
 以後の全ヘルパーへ同じオブジェクトを渡すことをここで固定する（個別に読み直すと、応答を
 組み立てている途中で admin 更新が挟まった場合に新旧の値が混ざった1レスポンスになりうる・
 再読込ヘルパーを丸ごと stub 化したテストではこの回帰を検出できない）。
 
-単一の flat リストへ全スパイを積んで `len(...) >= N` とだけ確認する方式は、`get_catalog` 単独で
+単一の flat リストへ全スパイを積んで `len(...) >= N` とだけ確認する方式は、同じヘルパー単独で
 何度も記録されるため、**別のヘルパー経路が消えても** `len` の閾値を割らず通ってしまう false
 green がある。ここではヘルパー名ごとに呼ばれたことを個別に assert する。
 
@@ -31,7 +29,6 @@ def _base_user_settings(agent: str | None = "openai") -> dict:
     return {
         "agent": agent, "codex_reasoning": "low", "codex_model": "gpt-5.5",
         "openai_model": "gpt-5.5", "ollama_url": "http://localhost:11434", "ollama_model": "qwen2.5",
-        "gemini_model": "gemini-2.5-flash", "bedrock_model": None,
     }
 
 
@@ -47,7 +44,7 @@ _KW_OR_POS0 = lambda a, kw: kw.get("system_settings", a[0] if a else None)   # n
 
 
 def test_public_settings_shares_one_system_settings_snapshot(monkeypatch):
-    """`agent="openai"`（保存済みの具体的クラウド系 agent・A7 判定が実際に発火する経路）で
+    """`agent="openai"`（旧・直結経路の保存値）で
     `_public_settings` を呼び、スコープ内の全ヘルパーが同じスナップショットを受け取り、
     `store.get_system_settings()` が1回だけ呼ばれることを固定する。"""
     sentinel = {"cloud_provider": "openai", "personal_api_keys_allowed": False}
@@ -60,9 +57,9 @@ def test_public_settings_shares_one_system_settings_snapshot(monkeypatch):
     monkeypatch.setattr("sherpa.store.get_system_settings", _spy_get_system_settings)
 
     # スコープ外のヘルパー（system_settings を扱わない箇所）は無い——`available_constructs`／
-    # `_effective_provider_for_field`／`_ollama_url_choice`／
-    # `construct_id`(→`effective_agent`→`agent_requires_unselected_cloud`)／
-    # `model_catalog.field_choice_info`（→`get_catalog`）／`llm._allowlisted_hosts`／
+    # `_ollama_url_choice`／
+    # `construct_id`(→`effective_agent`)／
+    # `llm._allowlisted_hosts`／
     # `_openai_endpoint_kind`／`_openai_base_url_host`／`_web_search_admin_allowed` は
     # stub せず実経路を通す（これらこそが「同じスナップショットを受け取るか」の検証対象）。
 
@@ -82,9 +79,6 @@ def test_public_settings_shares_one_system_settings_snapshot(monkeypatch):
         system_router.keys, "resolve_ollama_url",
         _spy("resolve_ollama_url", system_router.keys.resolve_ollama_url,
              lambda a, kw: kw.get("system_settings", a[1] if len(a) > 1 else None), seen_by_name))
-    monkeypatch.setattr(
-        system_router.model_catalog, "get_catalog",
-        _spy("get_catalog", system_router.model_catalog.get_catalog, _KW_OR_POS0, seen_by_name))
     monkeypatch.setattr(
         system_router.llm, "_allowlisted_hosts",
         _spy("_allowlisted_hosts", system_router.llm._allowlisted_hosts, _KW_OR_POS0, seen_by_name))
@@ -112,7 +106,7 @@ def test_public_settings_shares_one_system_settings_snapshot(monkeypatch):
     # `resolve_auto_provider` は Ollama へ倒す前に打ち切るため、intent_model の auto 解決は
     # `resolve_ollama_url` まで到達しない（呼ばれてもスナップショット一致は下の全件ループで確認する）。
     required = {"resolve_api_key", "selected_cloud_provider", "personal_keys_allowed",
-               "get_catalog", "_allowlisted_hosts",
+               "_allowlisted_hosts",
                "_openai_endpoint_kind", "_openai_base_url_host", "_web_search_admin_allowed"}
     missing = required - set(seen_by_name)
     assert not missing, f"呼ばれなかったヘルパー: {missing}"
@@ -177,7 +171,7 @@ def test_effective_agent_unset_reads_once_via_default_agent_chain(monkeypatch):
 
     read_calls = []
     # openai の実キーが無い環境を模す＝ codex CLI はあるが認証も無い（_codex_auth_available が
-    # False）→ 次点の openai キーも無い→ ollama へフォールバックする経路。
+    # False）→ simple へフォールバックする経路。
     sentinel = {"cloud_provider": "openai"}
 
     def _spy_get_system_settings():
@@ -199,7 +193,7 @@ def test_effective_agent_unset_reads_once_via_default_agent_chain(monkeypatch):
 
     result = agent_constructs.effective_agent(None)
 
-    assert result == "ollama", f"自動選択の結果が想定と異なる: {result!r}"
+    assert result == "simple", f"自動選択の結果が想定と異なる: {result!r}"
     assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
     assert len(auth_calls) == 1, (
         "_codex_auth_available の呼び出し回数が想定と異なる"
@@ -209,32 +203,8 @@ def test_effective_agent_unset_reads_once_via_default_agent_chain(monkeypatch):
         "_codex_auth_available が effective_agent と異なる system_settings オブジェクトを受け取った"
 
 
-def test_effective_agent_unset_with_explicit_env_agent_still_applies_a7(monkeypatch):
-    """`SHERPA_AGENT=openai`（明示 env）でも、選択中のクラウドプロバイダが一致しなければ
-    `ollama` へフォールバックすることを固定する。`default_agent()` は明示 env 値をそのまま
-    通すため（A7 を見ない）、その結果へ改めて A7 判定を適用する必要がある
-    （`store.get_system_settings()` は1回だけ）。"""
-    from sherpa import agent_constructs
-
-    read_calls = []
-    sentinel = {"cloud_provider": "gemini"}   # openai を選択中でない
-
-    def _spy_get_system_settings():
-        read_calls.append(1)
-        return sentinel
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", _spy_get_system_settings)
-    monkeypatch.setenv("SHERPA_AGENT", "openai")
-    agent_constructs._warned_unavailable_cloud_agent.clear()
-
-    result = agent_constructs.effective_agent(None)
-
-    assert result == "ollama"
-    assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
-
-
 def test_effective_agent_explicit_noncloud_agent_never_reads_system_settings(monkeypatch):
-    """明示的な非クラウド系 agent（codex/ollama）は A7 判定の対象外のため、`effective_agent` は
+    """明示的な agent（codex・旧・直結の保存値 ollama→simple）は system_settings を必要としないため、`effective_agent` は
     `store.get_system_settings()` を一切呼ばない（クラウド系 agent の未設定分岐だけが
     materialize する・非クラウド系はこの読取自体を経由しない最適化）。"""
     from sherpa import agent_constructs
@@ -248,44 +218,20 @@ def test_effective_agent_explicit_noncloud_agent_never_reads_system_settings(mon
     monkeypatch.setattr("sherpa.store.get_system_settings", _boom)
 
     assert agent_constructs.effective_agent({"agent": "codex"}) == "codex"
-    assert agent_constructs.effective_agent({"agent": "ollama"}) == "ollama"
+    assert agent_constructs.effective_agent({"agent": "ollama"}) == "simple"
     assert read_calls == []
-
-
-def test_effective_agent_materializes_snapshot_once_when_omitted(monkeypatch):
-    """`effective_agent(settings)`（`system_settings` 省略）が保存済みの**具体的クラウド系
-    agent**（A7 不一致）で ollama へフォールバックする際、`agent_requires_unselected_cloud` と
-    警告ログ用の `selected_cloud_provider` の両方が、関数内部で一度だけ materialize した同じ
-    スナップショットを使うことを固定する（`store.get_system_settings()` は1回だけ・別々に
-    読み直すと途中で admin 設定が変わった場合に「判定は旧値・警告表示は新値」という食い違いが
-    起こりうる）。"""
-    from sherpa import agent_constructs
-
-    read_calls = []
-    sentinel = {"cloud_provider": "gemini"}   # openai を選択中でない＝A7 不一致を発生させる
-
-    def _spy_get_system_settings():
-        read_calls.append(1)
-        return sentinel
-
-    monkeypatch.setattr("sherpa.store.get_system_settings", _spy_get_system_settings)
-    agent_constructs._warned_unavailable_cloud_agent.clear()   # プロセス内1回だけの警告抑制をリセット
-
-    result = agent_constructs.effective_agent({"agent": "openai"})
-
-    assert result == "ollama"   # A7 不一致＝ollama へフォールバック
-    assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
 
 
 def test_select_provider_execution_path_shares_one_snapshot(monkeypatch):
     """実行経路（`providers/__init__.py::_select_provider`）でも入口の `sys_s` が各分岐の
     モデル解決（`model_catalog.resolve_model`）・キー解決（`keys.resolve_api_key`）へ一貫して
-    渡ることを固定する（`store.get_system_settings()` は1回だけ）。openai 分岐（キー解決＋
-    モデル解決の両方を通る）で検証する。"""
+    渡ることを固定する（`store.get_system_settings()` は1回だけ）。simple 分岐（`_resolve_llm` が
+    キー解決＋モデル解決の両方を通る）で検証する。"""
     from sherpa.providers import _select_provider
 
     read_calls = []
-    sentinel = {"cloud_provider": "openai", "openai_api_key": "sk-central"}
+    sentinel = {"cloud_provider": "openai", "openai_api_key": "sk-central",
+                "research_default_provider": "openai"}
 
     def _spy_get_system_settings():
         read_calls.append(1)
@@ -305,11 +251,11 @@ def test_select_provider_execution_path_shares_one_snapshot(monkeypatch):
         _spy("resolve_model", _model_catalog_mod.resolve_model,
              lambda a, kw: kw.get("system_settings"), seen_by_name))
 
-    provider = _select_provider({"agent": "openai"})
+    provider = _select_provider({"agent": "simple"})
 
-    assert provider.__class__.__name__ in ("OpenAIProvider", "_UnwiredProvider")
+    assert provider.__class__.__name__ in ("SimpleProvider", "_UnwiredProvider")
     assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
-    required = {"resolve_api_key", "resolve_model"}
+    required = {"resolve_model"}
     missing = required - set(seen_by_name)
     assert not missing, f"呼ばれなかったヘルパー: {missing}"
     for name, snaps in seen_by_name.items():
@@ -363,7 +309,7 @@ def test_select_provider_codex_azure_branch_shares_one_snapshot(monkeypatch):
 
     assert provider is not None
     assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
-    required = {"resolve_api_key", "resolve_model"}
+    required = {"resolve_model"}
     missing = required - set(seen_by_name)
     assert not missing, f"呼ばれなかったヘルパー: {missing}"
     for name, snaps in seen_by_name.items():
@@ -414,7 +360,7 @@ def test_codex_openai_compat_block_reason_materializes_snapshot_once_when_omitte
 
     assert reason is None, f"想定外の拒否理由: {reason!r}"
     assert read_calls == [1], f"store.get_system_settings() が {len(read_calls)} 回呼ばれた（期待は1回）"
-    required = {"resolve_api_key", "resolve_model"}
+    required = {"resolve_model"}
     missing = required - set(seen_by_name)
     assert not missing, f"呼ばれなかったヘルパー: {missing}"
     for name, snaps in seen_by_name.items():

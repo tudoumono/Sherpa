@@ -449,53 +449,20 @@ def test_module_defaults_are_clamped_into_range():
     assert 100 <= ls._NEO4J_MAX_ROWS <= 1_000_000
 
 
-# ---- SHERPA_TROUBLESHOOT_GRAPH_DEPTH ----
-# import 時に一度だけ確定する定数は実プロセスを新規に起こして検証する（`_fresh_import`）。
+# ---- TROUBLESHOOT_GRAPH_DEPTH（コード既定・管理画面の基準値が未設定のときに使う） ----
 
-def _troubleshoot_graph_depth_env_script() -> str:
-    return (
+def test_troubleshoot_graph_depth_default_is_shared_by_signatures_and_ignores_env():
+    """既定は 4。`neo4j_related`/`_troubleshoot_cards`/`run_troubleshoot` の `depth` 既定が揃っていて、
+    環境変数 `SHERPA_TROUBLESHOOT_GRAPH_DEPTH` は実行時の値に影響しない（画面だけが正）。"""
+    script = (
         "import inspect, json\n"
         "import sherpa.lens_service as m\n"
-        "print(json.dumps({\n"
-        "    'troubleshoot_graph_depth': m.TROUBLESHOOT_GRAPH_DEPTH,\n"
-        "    'neo4j_related_depth': inspect.signature(m.neo4j_related).parameters['depth'].default,\n"
-        "    'troubleshoot_cards_depth':"
-        " inspect.signature(m._troubleshoot_cards).parameters['depth'].default,\n"
-        "    'run_troubleshoot_depth': inspect.signature(m.run_troubleshoot).parameters['depth'].default,\n"
-        "}))\n"
+        "print(json.dumps([m.TROUBLESHOOT_GRAPH_DEPTH] + [\n"
+        "    inspect.signature(f).parameters['depth'].default\n"
+        "    for f in (m.neo4j_related, m._troubleshoot_cards, m.run_troubleshoot)]))\n"
     )
-
-
-def test_troubleshoot_graph_depth_fresh_import_env_unset_is_default():
-    out = json.loads(FI.run_script(_troubleshoot_graph_depth_env_script(),
-                                   env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": None}))
-    assert out["troubleshoot_graph_depth"] == 3
-
-
-def test_troubleshoot_graph_depth_fresh_import_env_valid_value():
-    """正しい値が反映されることに加え、`neo4j_related`/`_troubleshoot_cards`/`run_troubleshoot` の
-    `depth` 既定値が `TROUBLESHOOT_GRAPH_DEPTH` に揃っていること（既定値どうしが偶然一致するだけの
-    「旧リテラル `depth=3` への退行」を検出できない自己言及を避けるため、既定と異なる値で確認）も
-    同じ fresh import でまとめて確認する。"""
-    out = json.loads(FI.run_script(_troubleshoot_graph_depth_env_script(),
-                                   env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "5"}))
-    assert out["troubleshoot_graph_depth"] == 5
-    assert out["neo4j_related_depth"] == 5
-    assert out["troubleshoot_cards_depth"] == 5
-    assert out["run_troubleshoot_depth"] == 5
-
-
-def test_troubleshoot_graph_depth_fresh_import_env_invalid_falls_back_to_default():
-    for bad in ("0", "17", "abc"):
-        out = json.loads(FI.run_script(_troubleshoot_graph_depth_env_script(),
-                                       env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": bad}))
-        assert out["troubleshoot_graph_depth"] == 3, bad
-
-
-def test_troubleshoot_graph_depth_env_change_after_import_has_no_effect(monkeypatch):
-    before = ls.TROUBLESHOOT_GRAPH_DEPTH
-    monkeypatch.setenv("SHERPA_TROUBLESHOOT_GRAPH_DEPTH", "10")
-    assert ls.TROUBLESHOOT_GRAPH_DEPTH == before == 3
+    out = json.loads(FI.run_script(script, env={"SHERPA_TROUBLESHOOT_GRAPH_DEPTH": "5"}))
+    assert out == [4, 4, 4, 4]
 
 
 # ===== run_qa の layer 転送（探す対象・調べ方ブロック §3.4） =====

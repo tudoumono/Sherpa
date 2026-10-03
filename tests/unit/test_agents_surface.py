@@ -69,14 +69,10 @@ _SURFACE_GOLDEN = pathlib.Path(__file__).resolve().parent / "goldens" / "agents_
 REQUIRED_NAMES = (
     # production: 外部（routers/health.py 等）・テストが参照する公開/私的名
     "AGENT_PROVIDERS", "Ctx", "get_provider", "provider_info",
-    "BedrockProvider", "BEDROCK_MODEL_CHOICES", "BEDROCK_MODEL_ID_RE",
-    "_BEDROCK_MODEL", "_bedrock_auth_available", "_bedrock_profile_label",
-    "_redact_bedrock_secret", "_web_search_admin_allowed",
-    "list_bedrock_inference_profiles", "_bedrock_region", "_bedrock_error_detail",
+    "_web_search_admin_allowed",
     "_codex_sandbox_enabled", "_kb_read_roots", "_write_codex_authoring_config",
     # テストが patch/直接参照する名前（urllib は ismodule 除外のため別テストで pin）
-    "_gather", "CodexProvider", "HeuristicProvider", "OpenAIProvider",
-    "OllamaProvider", "GeminiProvider", "_GenProvider", "_plain_run", "_facts",
+    "_gather", "CodexProvider", "SimpleProvider", "_plain_run", "_facts",
     "_kb_hint", "_mcp_env", "_mcp_config_args", "_mcp_neighbors_from",
     "_apply_codex_neighbors", "_codex_ask_question",
     "_codex_ask_capture", "_codex_mcp_enabled", "_marp_bin", "_detect_chrome_path",

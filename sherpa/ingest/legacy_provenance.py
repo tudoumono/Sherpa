@@ -53,13 +53,12 @@ def _stable_id(prefix: str, *parts: Any) -> str:
 
 
 def apply_to_evidence(ir: evidence_ir.EvidenceIR, provenance: dict[str, Any]) -> None:
-    """正本identityを原本へ戻し、変換済みlocatorであることを明示する。"""
+    """正本の identity を原本へ戻し、locator が変換後のものであることを明示する。"""
     ir.source = evidence_ir.EvidenceSource(
         file_type=provenance["original_file_type"],
         content_hash=provenance["original_content_hash"],
     )
-    # locator座標はnormalized OOXML上のもの。要素ID/coverage IDの算出後にlocatorを変更するとID契約が
-    # 崩れるため、basisは形式別element extensionとcoverage detailに加える。
+    # locator は変換後 OOXML 上の座標。ID 算出後に locator は変えず、basis は extension/detail に足す
     ir.elements = [replace(
         element,
         extension={**element.extension, "locator_basis": "normalized_artifact"},
@@ -110,12 +109,7 @@ def build_unavailable_evidence(
     object_id: str = "legacy-office-source",
     detail: dict[str, Any] | None = None,
 ) -> evidence_ir.EvidenceIR:
-    """内容抽出前で止まった原本をsource-level Evidenceとして残す。
-
-    内容を推測してelementへ展開せず、原本hash/typeと``source-file`` locator、binary_onlyのcoverageだけを
-    記録する。既定値は旧Office互換で、呼出側は壊れたOOXML/PDFにも固有kindを指定できる。
-    rendererはこのcoverageを検索可能なnoticeへ搬送する。
-    """
+    """内容抽出前に止まった原本を、原本 hash/type と binary_only の coverage だけの Evidence として残す。"""
     if status not in {"unsupported", "failed"}:
         raise ValueError("legacy unavailable Evidence status must be unsupported or failed")
     source = Path(original)

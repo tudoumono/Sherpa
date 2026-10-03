@@ -221,7 +221,7 @@ def test_sql_round_stats_equal_python_aggregation_on_edge_cases():
     assert new == old
 
 
-def test_usage_stats_and_depth_rounds_use_the_same_numbers():
+def test_usage_stats_rounds_equal_reference():
     if not _try_init():
         pytest.skip("DB down")
     _seed()
@@ -230,10 +230,6 @@ def test_usage_stats_and_depth_rounds_use_the_same_numbers():
         old = _reference(c, start, end)
     got = store.usage_stats(time_from=_FROM, time_to=_TO)["rounds"]
     assert got == old
-    tool = store.usage_depth_rounds(time_from=_FROM, time_to=_TO)
-    assert tool["unmatched_rounds"] == old["unmatched_rounds"]
-    assert tool["round_distribution"] == old["round_distribution"]
-    assert tool["reason_codes"] == old["reason_codes"]
 
 
 def test_round_stats_are_empty_when_no_rounds_in_period():

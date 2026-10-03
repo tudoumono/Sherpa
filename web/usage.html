@@ -11,8 +11,7 @@
 <script src="nav.js"></script>
 <style>
   .wrap2{max-width:none;margin:0}
-  /* UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時だけ、
-     自ページの共通トップバー/ナビを隠す（単独 URL 直開きは従来どおり・usage.js 冒頭が判定）。 */
+  /* システム管理のタブから iframe（?embed=1）で開かれた時だけ、共通トップバー/ナビを隠す（usage.js 冒頭が判定）。 */
   .embedded .topbar,.embedded nav{display:none}
   .embedded .wrap{padding-top:8px}
   /* 期間切替 */
@@ -72,10 +71,7 @@
   .chart-tooltip .v{font-weight:700;font-variant-numeric:tabular-nums}
   .chart-tooltip .d{color:var(--ink-3);font-size:var(--text-caption);margin-top:1px}
 
-  /* バッチ3（2026-07-03）: 利用の傾向セクション（ヒートマップ・横棒・凡例・定着率）。
-     色は dataviz skill 呼び出し済み: このアプリに専用カテゴリランプが無いため、既存の semantic token
-     （--accent/--ok/--warn/--danger/--ink-3）をカテゴリ色に転用し、常設の凡例＋直接ラベルで
-     secondary encoding を担保する（[[dataviz-skill-limited-palette]] と同じ折衷・lens ミニバーの流儀を踏襲）。 */
+  /* 利用の傾向セクション（ヒートマップ・横棒・凡例・定着率）。専用のカテゴリランプが無いため、既存の semantic token（--accent/--ok/--warn/--danger/--ink-3）をカテゴリ色に転用し、常設の凡例＋直接ラベルで色だけに頼らない。 */
   .info-dot{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;
     border-radius:50%;background:var(--surface-2);color:var(--ink-3);font-size:var(--text-caption);cursor:help;
     vertical-align:middle;margin-left:2px}
@@ -94,35 +90,12 @@
   .chart-total{font-size:var(--text-caption);font-weight:400;color:var(--ink-3);margin-left:4px;font-variant-numeric:tabular-nums}
   .zhr-cell{cursor:help}
 
-  /* （docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: 会話別上位の「用途別」列＝用途ごとの
-     回数・トークン・所要時間を1行ずつ積む小さな内訳リスト。 */
+  /* 会話別上位の「用途別」列＝用途ごとの回数・トークン・所要時間を1行ずつ積む小さな内訳リスト。 */
   .convkinds{margin:0;padding:0;list-style:none;font-size:var(--text-caption)}
   .convkinds li{white-space:nowrap}
   .convkinds li + li{margin-top:2px}
   .convkinds b{color:var(--ink-2)}
 
-  /* 利用統計チャット（自然言語で統計を質問する）。メッセージ本体は既存の .msg/.bubble-user/
-     .a-row/.a-avatar/.a-body/.headline をそのまま流用（app.css は編集しない）。 */
-  #usage-chat-messages{max-height:380px;overflow-y:auto;padding:2px}
-  #usage-chat-messages:empty{display:none}
-  #usage-chat-messages .msg{margin-bottom:14px;max-width:none}
-  #usage-chat-messages .msg:last-child{margin-bottom:0}
-  .uc-hint{font-size:var(--text-small);color:var(--ink-2);margin:2px 2px 12px}
-  .uc-send-notice{font-size:var(--text-small);color:var(--ink-3);margin:2px 2px 10px;padding:6px 8px;
-    border-radius:var(--radius);background:var(--surface-2)}
-  .uc-composer{display:flex;align-items:flex-end;gap:8px;border:1px solid var(--border);
-    border-radius:var(--radius);padding:8px 10px;margin-top:10px}
-  .uc-composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;
-    font-size:var(--text-body);max-height:120px;background:transparent;color:var(--ink);padding:6px 2px}
-  .uc-error{color:var(--danger)}
-  /* STAT-2: 「今回だけ」一時プロバイダ切替（保存しない・リクエスト単位）。 */
-  .uc-provider-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 2px 8px}
-  .uc-provider-row .uc-provider-label{font-size:var(--text-small);color:var(--ink-3)}
-  .uc-provider-btn{border:1px solid var(--border);background:var(--surface-2);color:var(--ink-3);
-    border-radius:999px;padding:3px 10px;font-size:var(--text-caption);cursor:pointer}
-  .uc-provider-btn[aria-pressed="true"]{background:var(--action-bg);color:var(--action-fg);border-color:var(--accent)}
-  .period-bar{flex-wrap:wrap}
-  .uc-provider-btn{min-height:36px}
 
   .usage-controls{display:grid;grid-template-columns:1fr;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)}
   .usage-controls .period-bar{margin:0}
@@ -208,7 +181,6 @@
 <button type="button" role="tab" id="usage-tab-users" aria-controls="usage-panel-users" aria-selected="false" tabindex="-1" data-usage-tab="users">利用者</button>
 <button type="button" role="tab" id="usage-tab-quality" aria-controls="usage-panel-quality" aria-selected="false" tabindex="-1" data-usage-tab="quality">品質</button>
 <button type="button" role="tab" id="usage-tab-tokens" aria-controls="usage-panel-tokens" aria-selected="false" tabindex="-1" data-usage-tab="tokens">トークン</button>
-<button type="button" role="tab" id="usage-tab-ask" aria-controls="usage-panel-ask" aria-selected="false" tabindex="-1" data-usage-tab="ask">AIに聞く</button>
 </div>
 <div id="usage-stat-panels" hidden>
 <section id="usage-panel-overview" role="tabpanel" aria-labelledby="usage-tab-overview" data-usage-panel="overview">
@@ -269,7 +241,7 @@
         </table>
       </div>
 
-      <!-- 利用の傾向（バッチ3・2026-07-03） -->
+      <!-- 利用の傾向 -->
       <div class="pagehead" style="margin-top:28px">
         <div><h2 style="font-size:var(--text-body);margin:0">利用の傾向</h2></div>
       </div>
@@ -335,8 +307,7 @@
 </section>
 <section id="usage-panel-quality" role="tabpanel" aria-labelledby="usage-tab-quality" data-usage-panel="quality" hidden>
       <div class="usage-section-heading"><h2>回答の状態と時間</h2><p class="hint">途中で終わった理由、回答時間、見直しの記録を確認できます。完了は正解を意味しません。</p></div>
-      <!-- ターンの傾向（docs/archive/2026-09-12-利用統計の拡充2.md §2）: 終了理由の分布・会話あたりの
-           やり取り回数と resume 率・回答時間の分布。 -->
+      <!-- ターンの傾向: 終了理由の分布・会話あたりのやり取り回数と resume 率・回答時間の分布。 -->
       <div class="pagehead" style="margin-top:28px">
         <div><h2 style="font-size:var(--text-body);margin:0">ターンの傾向</h2></div>
       </div>
@@ -387,7 +358,7 @@
 
       <div class="card" style="overflow-x:auto;margin-bottom:14px">
         <div class="chart-title">打ち切りの内訳
-          <span class="info-dot" tabindex="0" title="1回の調査〜回答で、内部の制限に実際に当たった回数です。Codexで数える列：結果切り詰め・累計上限到達・検索の打ち切り・自動継続・同じ条件の再検索を省略・調査の回数上限・全文検索/グラフが使えない・グラフ再取り込み待ち。API経路で数える列（OpenAI・Ollama・Gemini・Bedrock）：結果切り詰め・累計上限到達・履歴の整理・清書の打ち切り・自動で深く調べた・検索の打ち切り・自動継続・全文検索/グラフが使えない・グラフ再取り込み待ち。Codexの清書打ち切り・深さ引き上げ・文脈圧縮は未計測です。未知の経路も未計測です。右端3列は「そのターンで最初に気づいた回数」で、同じ不調が続いても1ターンにつき1回だけ数えます。制限そのものはここでは変えていません。">ⓘ</span>
+          <span class="info-dot" tabindex="0" title="1回の調査〜回答で、内部の制限に実際に当たった回数です。Codexで数える列：結果切り詰め・累計上限到達・検索の打ち切り・自動継続・同じ条件の再検索を省略・調査の回数上限・全文検索/グラフが使えない・グラフ再取り込み待ち。API経路で数える列（簡易チャットの OpenAI・Ollama。過去に Gemini・Bedrock で記録された行は過去の記録として含まれます）：結果切り詰め・累計上限到達・履歴の整理・清書の打ち切り・自動で深く調べた・検索の打ち切り・自動継続・全文検索/グラフが使えない・グラフ再取り込み待ち。Codexの清書打ち切り・深さ引き上げ・文脈圧縮は未計測です。未知の経路も未計測です。右端3列は「そのターンで最初に気づいた回数」で、同じ不調が続いても1ターンにつき1回だけ数えます。制限そのものはここでは変えていません。">ⓘ</span>
         </div>
         <table>
           <thead>
@@ -428,11 +399,10 @@
 </section>
 <section id="usage-panel-tokens" role="tabpanel" aria-labelledby="usage-tab-tokens" data-usage-panel="tokens" hidden>
       <div class="usage-section-heading"><h2>使用量の内訳</h2><p class="hint">チャットと補助AIの使用量を、モデル・用途・利用者別に調べられます。</p></div>
-      <!-- トークン（F3・2026-07-07／2026-07-08 金額表示は撤去） -->
+      <!-- トークン -->
       <div class="pagehead" style="margin-top:28px">
         <div><h2 style="font-size:var(--text-body);margin:0">トークン</h2>
-          <!-- S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 「用途別」カード追加に伴い
-               サブタイトルを是正（合計タイル・日別グラフは引き続きチャット限定）。 -->
+          <!-- 合計タイル・日別グラフはチャット限定（用途別の内訳は別カード）。 -->
           <div class="sub">チャットの入力・出力と、補助AIを含む用途別の内訳を確認できます。合計と日別グラフはチャット分です。</div>
         </div>
       </div>
@@ -476,9 +446,7 @@
           <tbody id="token-model-tbody"></tbody>
         </table>
       </div>
-      <!-- 用途別（S1・2026-07-15-LLMオーケストレーション実装計画.md §3）: チャット以外の LLM 呼び出し
-           （依頼の仕分け・ナレッジ抽出・検索の索引づくり・admin グラフ質問・画像の読み取り）も含む内訳。
-           tokens.by_kind が空/不在なら JS がカードごと隠す（旧 API 応答との前方互換）。 -->
+      <!-- 用途別: チャット以外の LLM 呼び出し（依頼の仕分け・ナレッジ抽出・検索の索引づくり・admin グラフ質問・画像の読み取り）も含む内訳。tokens.by_kind が空/不在なら JS がカードごと隠す。 -->
       <div class="card" id="token-kind-card" style="overflow-x:auto;margin-bottom:14px" hidden>
         <div class="chart-title">用途別</div>
         <table>
@@ -499,8 +467,7 @@
           <tbody id="token-kind-tbody"></tbody>
         </table>
       </div>
-      <!-- ユーザー別 × 用途別内訳（docs/archive/2026-09-12-利用統計の拡充2.md §2 (a)）。
-           tokens.by_user_kind が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
+      <!-- ユーザー別 × 用途別内訳。tokens.by_user_kind が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
       <div class="card" id="token-user-kind-card" style="overflow-x:auto;margin-bottom:14px" hidden>
         <div class="chart-title">ユーザー別×用途別</div>
         <table>
@@ -535,9 +502,8 @@
           <tbody id="token-user-tbody"></tbody>
         </table>
       </div>
-      <!-- 会話ごとの補助 AI 使用量（docs/archive/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
-           上位20件。タイトル・本文は表示しない＝会話 id はテキストのみ（リンクにしない）。
-           conversations_top が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
+      <!-- 会話ごとの補助 AI 使用量: トークン合計上位20件。タイトル・本文は表示しない＝会話 id はテキストのみ（リンクにしない）。 -->
+      <!-- conversations_top が空/不在なら JS がカードごと隠す（token-kind-card と同じ流儀）。 -->
       <div class="card" id="conversations-top-card" style="overflow-x:auto" hidden>
         <div class="chart-title">会話別上位20件（トークン合計）</div>
         <table>
@@ -556,37 +522,7 @@
       </div>      <p class="hint">「未計測」は値が報告されていない項目、「未取得」は集計応答に項目がない状態です。チャット集計では未記録の内訳を0として合算するため、0だけで消費なしとは判断できません。欠測件数は未集計です。用途別の時間は計測件数も確認してください。</p>
 </section>
 </div>
-<section id="usage-panel-ask" role="tabpanel" aria-labelledby="usage-tab-ask" data-usage-panel="ask" hidden>
-      <div class="usage-section-heading"><h2>統計について質問する</h2><p class="hint">一覧から分からないことをAIに質問できます。送信内容と送信先を確認してから送信してください。</p></div>
-      <!-- 統計チャット（自然言語で統計について質問する・admin のみ・本文はサーバに保存しない） -->
-      <div class="card" id="usage-chat-card">
-        <div class="chart-title">統計について質問する</div>
-        <div class="uc-send-notice">質問文に加え、この欄の直近のやり取り（履歴）と、利用統計の集計（利用者ID・表示名・ターン数・最終利用日時・個人ファイル参照件数・ログイン/ダウンロード/アップロード/共有件数・ユーザー別トークン内訳・資料フォルダの識別子など）、および改善ログの要約（フィードバック件数・タグの内訳・回答が途中で止まった理由の内訳・見つからないと正直に答えた割合・所要時間の分布・👎が付いた質問と一言コメントの先頭100字を最大20件ずつ）を送信します（<span id="usage-chat-provider-note">確認中…</span>）。この欄以外の会話本文は👎が付いた質問/一言の先頭100字を除き含まれません。</div>
-        <p class="hint">この質問欄は画面の期間選択と連動しません。調べたい期間は質問文で指定してください。</p>
-        <div class="uc-hint">例:「今月一番使っているユーザーは？」「先週とのトークン量の差は？」</div>
-        <div class="uc-provider-row" id="usage-chat-provider-toggle" role="group" aria-label="今回だけ使う AI">
-          <span class="uc-provider-label">今回だけ:</span>
-          <button type="button" class="uc-provider-btn" data-uc-provider="" aria-pressed="true">既定</button>
-          <button type="button" class="uc-provider-btn" data-uc-provider="openai" aria-pressed="false">OpenAI</button>
-          <button type="button" class="uc-provider-btn" data-uc-provider="ollama" aria-pressed="false">ローカル（Ollama）</button>
-        </div>
-        <!-- A7（cloud_provider）が openai 以外の間、「今回だけ OpenAI」を選んでも中央キーが
-             使えず 503 になる理由の注記（admin-settings.js の「OpenAI に固定」ラジオの注記と対）。 -->
-        <div class="uc-hint" id="usage-chat-openai-key-hint" hidden></div>
-        <!-- 「次の送信先」（上記トグルの現在の選択に基づく見込み・#usage-chat-provider-note）とは
-             別状態・別表示（送信中にトグルを変えた場合の食い違いを防ぐため混ぜない）。 -->
-        <div class="uc-hint" id="usage-chat-last-sent-note">前回の送信先: （まだ送信していません）</div>
-        <!-- 設定取得の失敗/不正の案内。「今回だけ」上書き中は #usage-chat-provider-note が
-             上書き先を表示するため、その状態でもこの案内が消えないよう別行で併記する。 -->
-        <div class="uc-hint uc-error" id="usage-chat-settings-error-note" hidden></div>
-        <div id="usage-chat-messages" aria-live="polite"></div>
-        <div class="uc-composer">
-          <textarea id="usage-chat-input" rows="1" placeholder="統計について質問する..." aria-label="統計についての質問"></textarea>
-          <button class="sendbtn" id="usage-chat-send" type="button" title="送信" disabled>➤</button>
-        </div>
-      </div>
 
-</section>
 
     </div>
   </div>

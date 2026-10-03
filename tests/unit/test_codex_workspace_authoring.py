@@ -124,7 +124,7 @@ def test_codex_clean_env_passes_proxy_and_ca_only_when_set(monkeypatch, tmp_path
 
 # ===== MCP ツール結果予算の env 化（1件あたりの上限は窓から切り離し済み・
 # `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`）=====
-# `_resolve_mcp_budget_env`/`_resolve_mcp_budget` は `agentic_search.resolve_tool_result_budgets`
+# `_resolve_mcp_budget_env`/`_resolve_mcp_budget` は `agentic_search.effective_tool_result_max_bytes`
 # の実効値（管理画面の基準値に深さの扱いを掛けたもの）と Codex 経路の固定天井（64KiB）の min() を
 # env dict にする。モデルの窓・その有無は一切見ない（旧 BUDGET-2 の窓連動は撤去済み）。
 
@@ -145,10 +145,10 @@ def test_resolve_mcp_budget_env_admin_setting_clipped_to_ceiling_and_smaller_pas
     実環境 0.11.0 で 256KiB 級の結果 15 件が文脈枠を使い切った（回答なし）ことへの是正。"""
     from sherpa.providers.codex.provider import _resolve_mcp_budget_env
 
-    huge_settings = {"agentic_budget_per_result": 8 * 1024 * 1024, "agentic_budget_total": 64 * 1024 * 1024}
+    huge_settings = {"agentic_budget_per_result": 8 * 1024 * 1024}
     env = _resolve_mcp_budget_env(huge_settings, "my-azure-deployment-xyz", None)
     assert env["SHERPA_MCP_TOOL_BUDGET_BYTES"] == str(64 * 1024)
-    small_settings = {"agentic_budget_per_result": 16 * 1024, "agentic_budget_total": 64 * 1024 * 1024}
+    small_settings = {"agentic_budget_per_result": 16 * 1024}
     env = _resolve_mcp_budget_env(small_settings, "my-azure-deployment-xyz", None)
     assert env["SHERPA_MCP_TOOL_BUDGET_BYTES"] == str(16 * 1024)
 
@@ -207,16 +207,6 @@ def test_resolve_mcp_budget_env_hits_and_window_respect_admin_base_settings():
 # バイト予算（`SHERPA_MCP_TOOL_BUDGET_TOTAL_BYTES`）とクイックの呼び出し回数上限
 # （`SHERPA_MCP_TOOL_MAX_CALLS`）は、到達すると「ここまでの結果でまとめてください」という
 # 調査打切りの信号になっていたため撤去した。深さに関わらずどちらの env キーも一切載らない。
-
-def test_resolve_mcp_budget_env_total_bytes_and_max_calls_absent_for_all_depths():
-    """撤去した累計バイト予算・呼び出し回数の上限は quick/standard/deep/max のどの深さでも
-    env に含まれない。"""
-    from sherpa.providers.codex.provider import _resolve_mcp_budget_env
-
-    for depth in (None, "quick", "standard", "deep", "max"):
-        env = _resolve_mcp_budget_env({}, None, None, depth)
-        assert "SHERPA_MCP_TOOL_BUDGET_TOTAL_BYTES" not in env, depth
-        assert "SHERPA_MCP_TOOL_MAX_CALLS" not in env, depth
 
 
 def test_write_codex_authoring_config_merges_extra_mcp_env():
@@ -2132,16 +2122,6 @@ def test_high1_personal_facts_injected_into_plain_prompt():
     assert "_PLAIN_PROMPT_WITH_PERSONAL" in src, "_plain_run に個人ヒット注入プロンプトが無い"
 
 
-def test_high1_personal_facts_injected_into_agentic_prompt():
-    """HIGH-1 fix: _agentic_run が personal_facts を ctx.message に前置してから loop に渡す（ソース検査）。"""
-    from sherpa import agents as A
-    import inspect
-    src = inspect.getsource(A._GenProvider._agentic_run)
-    assert "personal_facts" in src, "_agentic_run に personal_facts の参照が無い"
-    # dataclasses.replace で ctx.message を書き換える（または同等の注入）。
-    assert "replace" in src or "personal_facts" in src, "_agentic_run で message 注入が見当たらない"
-
-
 def test_blocker2_codex_cwd_is_authoring_not_files():
     """BLOCKER-2 fix: CodexProvider の cwd は workspace/authoring/run-*/（files/ を含まない）。"""
     from sherpa import agents as A
@@ -2482,11 +2462,11 @@ def test_investigate_skill_guidance_in_agents_md_and_direct_read_prompt():
 
 def test_answer_simplification_wording_contract_2026_09_10():
     """契約変更（2026-09-10・回答の簡素化対処・提案書 2026-09-10-Codex原本直読と調査スキル.md §2-4 前半）:
-    AGENTS.md／_prompt／_prompt_mcp／DEFAULT_SYSTEM_PROMPT から「簡潔に回答」「出典の列挙は不要」
+    AGENTS.md／_prompt／_prompt_mcp／ANSWER_POLICY から「簡潔に回答」「出典の列挙は不要」
     「推測しない」「結論・理由・補足」「不明は不明と」を撤去し、「推定」「全件」「省略しない」を含む
     （回答を絞らず・確定と推測を分けて答える方針への置換）。"""
     from sherpa import agents as A, codex_agents_md
-    from sherpa.store import settings as S
+    from sherpa.providers import prompts as S
     import pathlib, tempfile
 
     d = pathlib.Path(tempfile.mkdtemp())
@@ -2503,28 +2483,16 @@ def test_answer_simplification_wording_contract_2026_09_10():
     required = ("推定", "全件", "省略しない")
 
     for text, name in ((agents_md_txt, "AGENTS.md"), (fs_prompt, "_prompt"), (mcp_prompt, "_prompt_mcp"),
-                       (S.DEFAULT_SYSTEM_PROMPT, "DEFAULT_SYSTEM_PROMPT")):
+                       (S.ANSWER_POLICY, "ANSWER_POLICY")):
         for phrase in forbidden:
             assert phrase not in text, f"{name} に撤去したはずの文言が残っている: {phrase!r}"
 
     # 「推定」「全件」「省略しない」は AGENTS.md／_prompt_mcp（一覧・件数の指示を持つ側）で確認する。
-    # DEFAULT_SYSTEM_PROMPT は「推定」のみ（一覧の全件列挙は Codex 側の指示であり回答方針の既定文の役割外）。
+    # ANSWER_POLICY は「推定」のみ（一覧の全件列挙は Codex 側の指示であり回答方針の既定文の役割外）。
     for phrase in required:
         assert phrase in agents_md_txt, f"AGENTS.md に必須文言が無い: {phrase!r}"
         assert phrase in mcp_prompt, f"_prompt_mcp に必須文言が無い: {phrase!r}"
-    assert "推定" in S.DEFAULT_SYSTEM_PROMPT, "DEFAULT_SYSTEM_PROMPT に「推定」の明示が無い"
-
-
-def test_prompt_has_no_soft_layer_control():
-    """層フィルタが限定されたターンでの MCP 無効時の直接 grep 経路（`_prompt`）は
-    プロンプト指示による迂回可能なソフト制御ではなく、呼び出し元（`_run_authoring`）が実行自体を
-    拒否する構造的な制御に一本化した——`_prompt` 自体はもう `layer` を受け取らない。"""
-    from sherpa import agents as A
-    import inspect
-    p = A.CodexProvider()
-    assert "layer" not in inspect.signature(p._prompt).parameters
-    with pytest.raises(TypeError):
-        p._prompt("消費税率を変えたい", "qa", {"data": {}}, "v1", layer="docs")
+    assert "推定" in S.ANSWER_POLICY, "ANSWER_POLICY に「推定」の明示が無い"
 
 
 def test_run_authoring_layer_gated_to_qa_lens_only():
@@ -2661,18 +2629,6 @@ def test_codex_ollama_blocked_destination_is_not_launched():
     p = _select_provider({"agent": "codex", "codex_model_provider": "ollama",
                           "ollama_url": "http://198.51.100.7:11434"})
     assert isinstance(p, _UnwiredProvider)
-
-
-def test_default_system_prompt_matches_settings_js():
-    """「既定に戻す」ボタン（web/settings.js の DEFAULT_SYS）と DEFAULT_SYSTEM_PROMPT の同文契約。
-    実害: 片方だけ変えると、ボタンで戻した文と行が無いときの既定文が食い違う（2026-09-10 に踏んだ）。"""
-    import pathlib, re
-    from sherpa.store import settings as S
-    js = pathlib.Path(__file__).resolve().parents[2].joinpath("web", "settings.js").read_text(encoding="utf-8")
-    m = re.search(r"const DEFAULT_SYS = ((?:'[^']*'\s*\+?\s*)+);", js)
-    assert m, "web/settings.js に DEFAULT_SYS が無い"
-    js_default = "".join(re.findall(r"'([^']*)'", m.group(1)))
-    assert js_default == S.DEFAULT_SYSTEM_PROMPT
 
 
 def test_prompt_mcp_layer_guidance_only_when_restricted():
@@ -3618,14 +3574,13 @@ def test_non_authoring_turn_does_not_keep_files_codex_created(tmp_path, monkeypa
 
 
 def test_author_lens_keeps_its_own_reasoning_under_quick(tmp_path, monkeypatch):
-    """作成系（author）は専用の推論設定（`SHERPA_CODEX_REASONING_AUTHOR`）を持つ別軸＝クイックでも
+    """作成系（author）は専用の推論設定（`_REASONING_AUTHOR`）を持つ別軸＝クイックでも
     1段下げない（通常レンズだけが下がる）。"""
     import dataclasses
     from sherpa import agents as A
 
     bin_dir = tmp_path / "bin"; bin_dir.mkdir()
     _citation_setup(bin_dir, monkeypatch, tmp_path)
-    monkeypatch.setenv("SHERPA_CODEX_REASONING_AUTHOR", "medium")
     script = ("#!/usr/bin/env python3\n"
               "import sys, pathlib\n"
               "pathlib.Path('argv.txt').write_text(' '.join(sys.argv))\n"

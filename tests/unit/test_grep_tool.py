@@ -273,11 +273,6 @@ def test_grep_search_excludes_declined_registered_code_extension_not_solely_by_c
 
 # ===== 共有ヘルパー: rag 優先・legacy フォールバック =====
 
-def test_rag_grep_enabled_always_true_no_env_toggle():
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・常時 True（env に一切
-    左右されない）。"""
-    assert G.rag_grep_enabled() is True
-
 
 def test_strip_derived_suffix_priority_and_passthrough():
     """`.rag.md` と `.rag_observations.md` はどちらも `.md` で終わるため、より具体的な拡張を
@@ -287,22 +282,6 @@ def test_strip_derived_suffix_priority_and_passthrough():
     assert G.strip_derived_suffix("report.docx.md") == "report.docx"
     assert G.strip_derived_suffix("設計/資料.pdf.md") == "設計/資料.pdf"
     assert G.strip_derived_suffix("PROG.cbl") == "PROG.cbl"
-
-
-def test_preferred_derived_name_rag_priority_and_fallback(monkeypatch, tmp_path):
-    """rag が有効かつ実在すれば rag 版、無効または rag 版が無ければ legacy 版を返す。"""
-    _write(tmp_path, "report.docx.md", "legacy")
-    _write(tmp_path, "report.docx.rag.md", "rag")
-
-    assert G.preferred_derived_name(tmp_path, "report.docx") == "report.docx.rag.md"
-
-    # rag_grep_enabled() は常時 True（TOGGLE-RM）だが、`and` の右辺（実在チェック）は
-    # 今も生きたコードのため、内部シームとして直接差し替えて左辺 False の分岐も検証する。
-    monkeypatch.setattr(G, "rag_grep_enabled", lambda: False)
-    assert G.preferred_derived_name(tmp_path, "report.docx") == "report.docx.md"
-
-    monkeypatch.setattr(G, "rag_grep_enabled", lambda: True)
-    assert G.preferred_derived_name(tmp_path, "no-rag-doc.xlsx") == "no-rag-doc.xlsx.md"   # rag 版が無い文書は legacy へ（縮退吸収）
 
 
 def _isolate_derived_world(monkeypatch, world_root, derived_root, obs_root=None, rag_root=None):
@@ -363,26 +342,6 @@ def test_grep_search_falls_back_to_legacy_when_rag_missing_even_if_enabled(monke
     assert len(hits) == 1
     assert hits[0]["doc_id"] == "onlylegacy.xlsx"
     assert "legacy-only NEEDLE" in hits[0]["text"]
-
-
-def test_grep_search_ignores_rag_when_disabled_matches_current_behavior(monkeypatch, tmp_path):
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・env では OFF にできない。
-    `rag_grep_enabled` は今も `preferred_derived_name` の内部シーム（`and` の左辺）として生きて
-    いるため、直接差し替えて False 分岐（rag.md の実在に関わらず legacy 版だけがヒットする）を
-    引き続き検証する。"""
-    world_root = tmp_path / "world"
-    world_root.mkdir()
-    der = tmp_path / "derived" / "md"
-    der_rag = tmp_path / "derived" / "rag"
-    _write(der, "report.docx.md", "legacy NEEDLE body\n")
-    _write(der_rag, "report.docx.rag.md", "## 見出し\nrag NEEDLE body\n")
-    _isolate_derived_world(monkeypatch, world_root, der, rag_root=der_rag)
-    monkeypatch.setattr(G, "rag_grep_enabled", lambda: False)
-
-    hits = G.grep_search("NEEDLE", world="anyworld")
-    assert len(hits) == 1
-    assert hits[0]["doc_id"] == "report.docx"
-    assert "legacy NEEDLE" in hits[0]["text"] and "rag NEEDLE" not in hits[0]["text"]
 
 
 def test_grep_search_rag_legacy_and_observations_coexist(monkeypatch, tmp_path):
@@ -1150,7 +1109,6 @@ def test_grep_search_size_exclusion_single_source_of_truth_via_text_kind_max_byt
     monkeypatch.setattr("sherpa.ingest.text_kind.MAX_BYTES", size + 1)   # 以内＝再び検索対象
     hits = G.grep_search("NEEDLE", world="v1", roots=[tmp_path])
     assert len(hits) == 1
-
 
 
 def test_grep_search_bom_utf8_first_heading_recognized(tmp_path):

@@ -2,7 +2,7 @@
 
 tesseract 直の `ocr` アーム撤去（2026-07-08・視覚読み取りは vision に一本化）に伴い、
 `arms/ocr_arm.py` にあったラスタ化処理をこの共有モジュールへ移設した（唯一の呼び出し元は
-`vision_arm`）。env 名は互換のため据え置き: `SHERPA_OCR_MAX_PAGES`・`SHERPA_OCR_MAX_PIXELS`。
+`vision_arm`）。env 名は互換のため据え置き: `SHERPA_OCR_MAX_PAGES`。ピクセル上限は定数 `_MAX_PIXEL_SIDE`。
 
 pypdfium2 の到達性は偽モジュールで検証する。
 """
@@ -35,7 +35,6 @@ def test_pdf_rasterize_available_true_with_pdfium(monkeypatch):
 
 def test_rasterize_pixel_cap_for_huge_page(monkeypatch):
     """巨大 MediaBox のページはラスタ化前に縮小倍率をクランプする（メモリ暴走防止）。"""
-    monkeypatch.delenv("SHERPA_OCR_MAX_PIXELS", raising=False)        # 既定 4000px
     calls: list[float] = []
 
     class _HugePage:
@@ -54,7 +53,6 @@ def test_rasterize_pixel_cap_for_huge_page(monkeypatch):
 
 def test_rasterize_no_cap_for_normal_page(monkeypatch):
     """通常サイズのページは既定 dpi 相当の倍率のまま（クランプされない）。"""
-    monkeypatch.delenv("SHERPA_OCR_MAX_PIXELS", raising=False)
     calls: list[float] = []
 
     class _NormalPage:
@@ -70,9 +68,9 @@ def test_rasterize_no_cap_for_normal_page(monkeypatch):
     assert abs(calls[0] - expected_zoom) < 1e-9
 
 
-def test_rasterize_pixel_cap_env_override(monkeypatch):
-    """SHERPA_OCR_MAX_PIXELS でクランプしきい値を変更できる。"""
-    monkeypatch.setenv("SHERPA_OCR_MAX_PIXELS", "1000")
+def test_rasterize_pixel_cap_constant_override(monkeypatch):
+    """`_MAX_PIXEL_SIDE` を下げるとクランプしきい値が変わる。"""
+    monkeypatch.setattr(raster, "_MAX_PIXEL_SIDE", 1000)
     calls: list[float] = []
 
     class _Page:

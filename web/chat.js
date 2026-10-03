@@ -1,21 +1,13 @@
-// チャット主入口（M9・04-画面の原則.md §3）。SSE で「思考の流れ」を右ペインに流し、答え先頭カード＋出典（原本DL）を中央に描く。
+// チャット主入口。SSE で「思考の流れ」を右ペインに流し、答え先頭カード＋出典（原本DL）を中央に描く。
+// 設計: docs/design/chat.md「1ターンの流れ」
 // セキュリティ: server data は全て esc()。インライン handler にデータを載せず、委譲＋data-*（固定キー/esc済）で扱う。
 'use strict';
 
-// フェーズ6（リファクタリング計画）: module 化＋分割の最終形。共有状態/定数は web/chat/state.js、
-// 共有ダイアログは web/chat/share-dialog.js、回答カード・trace/turn stack・welcome・出典は
-// web/chat/render.js、会話履歴（一覧・open/new/rename/pin/delete・背景実行再購読）は
-// web/chat/history.js、SSE 購読・flow ライブ描画・停止フロー・送信中枢は web/chat/stream.js、
-// 範囲（スコープ）セレクタ・ナレッジ参照/個人ファイル参照トグルは web/chat/scope.js、
-// brain-menu・フォント・エクスポート・テーマは web/chat/menus.js へそれぞれ純移動済み（S1〜S8）。
-// このエントリに残るのは: state/全モジュールの import・init（deep-link `?conv=` と
-// `/world-options` の初期化順＝危険地雷6・文順を変えない）・input/send 中枢・#messages 委譲
-// リスナー・個人ファイルアップロード（送信欄の一部）・updateShareButtonState/toast/copyText
-// （どのドメインにも属さない横断ユーティリティ・実依存を grep で確認したうえでの意図的な据え置き）・
-// 3カラムレイアウト（目標構成のどのモジュールにも割り当てが無いドメイン）・
-// window.__sherpaChatTest テスト seam。scope.js/menus.js は toast/updateShareButtonState をこの
-// エントリファイルから相対 import する意図した循環 import（関数宣言＝hoisted のため実行時に呼ぶ限り
-// ESM で安全＝render.js の setRt・history.js の copyText と同じパターン）。
+// 分割構成: 共有状態/定数は web/chat/state.js、共有ダイアログは share-dialog.js、回答カード・trace/turn stack・welcome・出典は render.js、
+// 会話履歴は history.js、SSE 購読・flow ライブ描画・停止・送信中枢は stream.js、範囲セレクタ・参照トグルは scope.js、brain-menu・フォント・エクスポート・テーマは menus.js。
+// このエントリに残るのは: 全モジュールの import・init（deep-link `?conv=` と `/world-options` の初期化順＝文順を変えない）・input/send 中枢・#messages 委譲リスナー・
+// 個人ファイルアップロード・updateShareButtonState/toast/copyText・3カラムレイアウト・window.__sherpaChatTest テスト seam。
+// scope.js/menus.js は toast/updateShareButtonState をこのファイルから相対 import する（関数宣言＝hoisted のため、循環 import でも実行時に呼ぶ限り安全）。
 import { S, EXAMPLES } from './chat/state.js';
 import { openShareDialog } from './chat/share-dialog.js';
 import { welcome, initRefGraph } from './chat/render.js';
@@ -23,19 +15,18 @@ import {
   loadConversations, deleteConversation, togglePin, renameConversation,
   newConversation, openConversation, resumeRunningTurn, forkConversation, syncConvParam,
 } from './chat/history.js';
-// H2（左ペイン履歴検索）: 副作用のみの import（#hist-search の配線・#convlist 再描画の監視は
-// history-search.js 内で完結し、history.js には触れない＝束縛する名前は無い）。
+// 副作用のみの import（#hist-search の配線・#convlist 再描画の監視は history-search.js 内で完結する）。
 import './chat/history-search.js';
 import { send, sendOrStop, _closeOtherTurns, currentTurnGen } from './chat/stream.js';
 import { loadScopes, renderScopePanel, setScopeLabel, scopeChipLabel, setKb } from './chat/scope.js';
 import { setLayer, setDepthProfile, setTools, setToolsAvailability, resetInquiryForNewConversation, refreshInquirySummary, toolsExplicitForRestore } from './chat/inquiry.js';
 import { applyCachedBrain, loadConfig, exportMessages } from './chat/menus.js';
 
-const $ = Sherpa.$, esc = Sherpa.esc;   // 共通ユーティリティ（nav.js・RV DRY）
+const $ = Sherpa.$, esc = Sherpa.esc;   // 共通ユーティリティ（nav.js）
 
 // ===== 委譲 =====
-// #2: 影響一覧の行展開/折りたたみ（行全体が role=button・aria-expanded で開閉。max-height は app.css 側）
-// セレクタは .ilist 内の data-toggle に限定（refgraph-h は data-rg・別ハンドラ＝衝突させない）
+// 影響一覧の行展開/折りたたみ（行全体が role=button・aria-expanded で開閉）。
+// セレクタは .ilist 内の data-toggle に限定（refgraph-h の data-rg とは別ハンドラ）。
 $('messages').addEventListener('click', async (e) => {
   const tg = e.target.closest('.ilist [data-toggle]');
   if (tg) {
@@ -49,13 +40,11 @@ $('messages').addEventListener('click', async (e) => {
     const r = await fetch(dl.getAttribute('href'));
     if (!r.ok) { alert((await r.json().catch(() => ({}))).detail || '原本は未取り込みです'); return; }
     const blob = await r.blob();
-    // 保存名は doc_id（rel_path）末尾＝原本のファイル名（深い階層でも綺麗な名前に・サーバの Content-Disposition basename と一致）
+    // 保存名は doc_id（rel_path）末尾＝原本のファイル名（サーバの Content-Disposition basename と一致）
     const name = dl.textContent.replace(/^📄\s*/, '').split('/').filter(Boolean).pop() || 'download';
-    Sherpa.downloadBlob(blob, name);   // UI フィードバック3: revoke タイミング問題を共通ヘルパで回避
+    Sherpa.downloadBlob(blob, name);   // revoke のタイミング問題は共通ヘルパで回避
   }
-  // COD-18（調査台帳を回答ごとに残す）: href は renderInvestigationRecord では組み立てられない
-  // （answer 自体は会話id/メッセージidを持たない）ため、クリック時に .msg._messageId（feedback と
-  // 同じ置き場・appendAnswer/finalizeAnswer が設定）と S.cid から組み立てる。
+  // 調査台帳の href は、クリック時に .msg._messageId と S.cid から組み立てる（answer 自体は会話id/メッセージidを持たない）。
   const idl = e.target.closest('[data-investigation-dl]');
   if (idl) {
     e.preventDefault();
@@ -68,15 +57,14 @@ $('messages').addEventListener('click', async (e) => {
     Sherpa.downloadBlob(blob, 'investigation.md');
   }
 });
-// #2: 行トグル（role=button）のキーボード操作。実クリック処理へ委譲（ロジック一本化・セレクタは同様に .ilist 内に限定）
+// 行トグル（role=button）のキーボード操作。実クリック処理へ委譲（セレクタは .ilist 内に限定）。
 $('messages').addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
   const tg = e.target.closest('.ilist [data-toggle][role="button"]'); if (!tg) return;
   e.preventDefault(); tg.click();
 });
-// RV2 #1: chat_router._SLASH_LENS の逆写像（実効レンズ→スラッシュ語）。確認カードが
-// lens_source==="slash" のとき、再送本文の先頭へ元の接頭辞を復元して既存のスラッシュ解決経路
-// （サーバ側 _resolve_lens の extract_slash_lens）へそのまま乗せるために使う。
+// chat_router._SLASH_LENS の逆写像（実効レンズ→スラッシュ語）。確認カードが lens_source==="slash" のとき、
+// 再送本文の先頭へ元の接頭辞を復元して既存のスラッシュ解決経路（サーバ側 _resolve_lens）に乗せるために使う。
 const _SLASH_WORD_FOR_LENS = { impact: '影響', troubleshoot: '原因', qa: '内容', author: '作成' };
 // AI/tool からの確認カード: 選択内容を同じ会話の次メッセージとして送る
 $('messages').addEventListener('click', (e) => {
@@ -88,20 +76,15 @@ $('messages').addEventListener('click', (e) => {
   const free = freeEl ? freeEl.value.trim() : '';
   if (!picked.length && !free) { toast('選択してください'); return; }
   const lines = [`確認事項: ${q.prompt || ''}`];
-  if (q.interaction_id) lines.push(`確認ID: ${q.interaction_id}`);   // router clarify(ask-*)の識別＝再質問ループ防止（generic ask_user と区別）
+  if (q.interaction_id) lines.push(`確認ID: ${q.interaction_id}`);   // router clarify(ask-*) の識別（再質問ループ防止・generic ask_user と区別）
   if (picked.length) lines.push(`選択: ${picked.join('、')}`);
   if (free) lines.push(`補足: ${free}`);
   if (q.original_message) lines.push(`元の依頼: ${q.original_message}`);
   msg.querySelectorAll('input,textarea,button').forEach((x) => { x.disabled = true; });
-  // RV1 #3/RV2 #1/SC-6e: 「確認してから進めて」の確認カード（interaction_id が confirm-*）は、
-  // 確認が出た時点で解決済みだった調べ方・探す対象・範囲・検索経路トグルを payload に持つ
-  // （chat_router.confirm_first_question）。回答の再送は1回だけそれへ戻す（ブロックの継続設定
-  // S.lens/S.layer/S.scope/S.tools は変えない）。`lens_source==="slash"` は実効レンズ（q.lens）を
-  // ChatReq.lens として直接送ると「1回限り」契約が崩れる（次に会話を開き直すと explicit 扱いに
-  // なる）ため、既存のスラッシュ接頭辞（/影響 等）を再送本文の先頭へ復元し、送信 override の
-  // lens にはブロックの継続設定（q.lens_block）を渡して既存の _resolve_lens 経路へそのまま乗せる。
-  // lens 選択の確認カード（interaction_id が ask-*）は本文の「選択:」から chat_router 側で
-  // 解決するため対象外（通常どおり send() を呼ぶ）。
+  // 「確認してから進めて」の確認カード（interaction_id が confirm-*）は、確認が出た時点で解決済みだった調べ方・探す対象・範囲・検索経路トグルを payload に持つ（chat_router.confirm_first_question）。
+  // 回答の再送は1回だけそれへ戻す（ブロックの継続設定 S.lens/S.layer/S.scope/S.tools は変えない）。
+  // lens_source==="slash" は、既存のスラッシュ接頭辞（/影響 等）を再送本文の先頭へ復元し、送信 override の lens にはブロックの継続設定（q.lens_block）を渡す（lens を直接送ると「1回限り」契約が崩れる）。
+  // lens 選択の確認カード（interaction_id が ask-*）は本文の「選択:」から chat_router 側で解決するため対象外。
   const isConfirmFirst = typeof q.interaction_id === 'string' && q.interaction_id.startsWith('confirm-');
   let resendText = lines.join('\n');
   let overrideLens = q.lens;
@@ -112,8 +95,7 @@ $('messages').addEventListener('click', (e) => {
   $('input').value = resendText;
   send(isConfirmFirst ? { lens: overrideLens, layer: q.layer, scope_paths: q.scope_paths, tools: q.tools } : undefined);
 });
-// UIフィードバック（2026-07-03）: 過去ターンの「思考の流れ」ボタン → 右ペインの該当ターンを
-// 展開してスクロール（積み上げ表示に統合・別表示への切替はしない）。
+// 過去ターンの「思考の流れ」ボタン → 右ペインの該当ターンを展開してスクロール。
 $('messages').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-showtrace]'); if (!btn) return;
   const msg = btn.closest('.msg'); if (!msg || !msg._turnId) return;
@@ -128,7 +110,7 @@ $('messages').addEventListener('click', (e) => {
   $('input').focus();
   $('input').setSelectionRange(0, $('input').value.length);   // 置き換え対象を選択状態に
 });
-// UI フィードバック2: 引用（該当箇所）カードの折りたたみ（refgraph と同じ見出しボタン開閉パターン）。
+// 引用（該当箇所）カードの折りたたみ（refgraph と同じ見出しボタン開閉パターン）。
 $('messages').addEventListener('click', (e) => {
   const h = e.target.closest('[data-cites]'); if (!h) return;
   const body = h.parentNode.querySelector('.cites-body');
@@ -136,7 +118,7 @@ $('messages').addEventListener('click', (e) => {
   body.hidden = open; h.querySelector('.caret').textContent = open ? '▾' : '▴';
   h.setAttribute('aria-expanded', open ? 'false' : 'true');
 });
-// 参照したナレッジグラフの折りたたみ（#5・開いた時だけ cytoscape を遅延 init）
+// 参照したナレッジグラフの折りたたみ（開いた時だけ cytoscape を遅延 init）
 $('messages').addEventListener('click', (e) => {
   const rg = e.target.closest('[data-rg]'); if (!rg) return;
   const body = rg.parentNode.querySelector('.refgraph-body');
@@ -182,28 +164,19 @@ $('messages').addEventListener('click', (e) => {
   const comment = wrap.querySelector('.fbcomment').value.trim().slice(0, 500);
   _sendFeedback(wrap.querySelector('[data-fb="down"]'), 'down', tags, comment);
 });
-// SC-6d（出典0件時の再検索案内・調べ方ブロック §5）: 案内ボタンを押すと該当設定を広げ、
-// 直前の質問（この回答の1つ手前の user 発言）をそのまま同じ内容で再送する
-// （「言葉から推定しない」原則どおり、利用者が選んで1回クリックで再検索・依頼の設計）。
+// 出典0件時の再検索案内: 案内ボタンを押すと該当設定を広げ、直前の質問（この回答の1つ手前の user 発言）をそのまま再送する（言葉から推定せず、利用者が選んで1回クリックで再検索）。
 $('messages').addEventListener('click', (e) => {
   const btn = e.target.closest('.retry-hint-btn'); if (!btn) return;
   const msg = btn.closest('.msg'); if (!msg) return;
-  // RV1 #11: 壊れた data-retry-action を `{}` へ黙って縮退させない——解析失敗はここで例外にして
-  // 止める（「操作が成功したように見える」silent fallback を作らない）。
+  // 壊れた data-retry-action を `{}` へ黙って縮退させず、解析失敗はここで例外にして止める。
   const action = JSON.parse(btn.dataset.retryAction);
-  // Codex タイムアウト継続（続きを調べる注記のボタン）: 直前の質問を広げて再送する他の kind とは
-  // 別系統——scope 等は変えず固定文言をそのまま送るだけ（resume はサーバ側の codex_session_id
-  // 継続に委ねる・chat_service._finalize が付与する action.message をそのまま入力欄へ入れて送信）。
+  // Codex タイムアウト継続（続きを調べる注記のボタン）: scope 等は変えず固定文言をそのまま送るだけ（resume はサーバ側の codex_session_id 継続に委ねる）。
   if (btn.dataset.retryKind === 'resume') {
-    // action.message が無い/非文字列の壊れた data-retry-action を汎用（scope 拡大）経路へ
-    // フォールスルーさせない——scope_paths 等を持たない action なので誤って「範囲を全体に
-    // 広げて再送」と解釈されてしまう（黙って縮退させない・上の RV1 #11 と同じ精神）。
+    // action.message が無い/非文字列の壊れた data-retry-action を汎用（scope 拡大）経路へフォールスルーさせない（誤って「範囲を全体に広げて再送」と解釈されるため）。
     if (typeof action.message !== 'string') {
       throw new Error(`resume retry hint の action.message が文字列ではありません: ${JSON.stringify(action)}`);
     }
-    // 送信中/購読中に入力欄を上書きしない（他ターン進行中に書きかけの下書きを消さない）。
-    // send() 自体も同じ条件で二重送信を防ぐが、それより前に $('input').value を書き換えると
-    // 下書きが消えたまま何も送信されない事故になるため、代入前にここで弾く。
+    // 送信中/購読中に入力欄を上書きしない（send() も同条件で二重送信を防ぐが、代入前にここで弾かないと下書きが消えたまま何も送信されない）。
     if (S.es || S.sending) return;
     $('input').value = action.message;
     send();
@@ -213,16 +186,15 @@ $('messages').addEventListener('click', (e) => {
   while (prev && !prev.classList.contains('user')) prev = prev.previousElementSibling;
   const bubble = prev && prev.querySelector('.bubble-user');
   if (!bubble) return;
-  // RV1 #7: まず元回答（msg._answer.scope）の設定を基準にし、選択された1軸だけを広げて送信する
-  // （現在のブロック設定＝この回答の後に変わっているかもしれない値を直接広げない）。
+  // まず元回答（msg._answer.scope）の設定を基準にし、選択された1軸だけを広げて送信する。
   const origScope = (msg._answer && msg._answer.scope) || {};
   const scopePaths = Object.prototype.hasOwnProperty.call(action, 'scope_paths')
     ? (action.scope_paths || []) : (origScope.scope_paths || []);
   const layer = Object.prototype.hasOwnProperty.call(action, 'layer') ? action.layer : (origScope.layer || 'both');
-  // SC-6c: 調べる深さの軸（action.depth_profile）も範囲/探す対象と同型で反映する。
+  // 調べる深さの軸（action.depth_profile）も範囲/探す対象と同型で反映する。
   const depthProfile = Object.prototype.hasOwnProperty.call(action, 'depth_profile')
     ? action.depth_profile : (origScope.depth_profile || 'standard');
-  // SC-6e: 検索経路トグルの軸（action.tools）も同型で反映する（欠落=元回答の値・さらに無ければ全ON）。
+  // 検索経路トグルの軸（action.tools）も同型で反映する（欠落=元回答の値・無ければ全ON）。
   const tools = Object.prototype.hasOwnProperty.call(action, 'tools')
     ? action.tools : (origScope.tools || { grep: true, fulltext: true, graph: true });
   S.scope = scopePaths.slice();
@@ -234,7 +206,7 @@ $('messages').addEventListener('click', (e) => {
   $('input').value = bubble.textContent;
   send();
 });
-// A2: 思考ステップの detail 履歴を開閉（<button> なので Enter/Space はブラウザが click に変換＝キーボード対応）。
+// 思考ステップの detail 履歴を開閉（<button> なので Enter/Space は click に変換される）。
 $('flow').addEventListener('click', (e) => {
   const h = e.target.closest('.fhist'); if (!h) return;
   const step = h.closest('.fstep'); if (!step) return;
@@ -262,14 +234,13 @@ $('convlist').addEventListener('click', (e) => {
 $('conv-title').addEventListener('click', () => { if (S.cid) renameConversation(S.cid, $('conv-title').textContent); });
 $('conv-title').style.cursor = 'pointer'; $('conv-title').title = 'クリックで名前を変更';
 $('newbtn').addEventListener('click', newConversation);
-// 共有ボタン（ヘッダ）: 現在の会話があれば共有ダイアログを開く。
-// Feature C: 個人コンテンツを含む会話はボタン disabled＋ガードで拒否。
+// 共有ボタン（ヘッダ）: 現在の会話があれば共有ダイアログを開く。個人コンテンツを含む会話はボタン disabled＋ガードで拒否。
 $('sharebtn').addEventListener('click', () => {
   if (!S.cid) { toast('共有したい会話を開いてください'); return; }
   if (S.convHasPersonal) { toast('個人ファイルを参照した会話は共有できません'); return; }
   openShareDialog(S.cid, $('conv-title').textContent || '会話');
 });
-// SH-1（引き継いで質問）: 受領共有を開いている間だけ表示される（history.js::updateForkButtonState）。
+// 引き継いで質問: 受領共有を開いている間だけ表示される（history.js::updateForkButtonState）。
 $('forkbtn').addEventListener('click', () => {
   const wid = Number($('forkbtn').dataset.wid);
   if (!wid) return;
@@ -281,9 +252,7 @@ $('send').addEventListener('click', sendOrStop);
 $('input').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
 // コピー（メッセージ全体）。secure context 外では textarea フォールバック。
-// export: web/chat/share-dialog.js の共有URLコピーボタンから参照される
-// （toast() 依存があるため chat.js に留め置き・実依存を grep で確認したうえでの意図的な循環 import。
-// copyText は関数宣言＝hoisted のため、chat.js↔share-dialog.js の相互 import でも安全に解決できる）。
+// export: share-dialog.js の共有URLコピーボタンから参照される（toast() 依存があるため chat.js に置く。関数宣言＝hoisted のため相互 import でも安全）。
 export async function copyText(text) {
   try { await navigator.clipboard.writeText(text); }
   catch { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (e) { } ta.remove(); }
@@ -300,9 +269,7 @@ $('messages').addEventListener('click', (e) => {
   if (msg.classList.contains('user')) { copyText(msg.querySelector('.bubble-user').textContent); return; }
   const clone = cp.closest('.a-body').cloneNode(true);
   clone.querySelectorAll('.copybtn,.chips').forEach((el) => el.remove());
-  // UIフィードバック（AI回答のMarkdown表示）: .headline は mdLite() で HTML 整形して描画しているため、
-  // textContent 抽出だと **/`` 等の記法が失われる。コピーは生テキストのまま（変換しない）にするため、
-  // 見出し部分だけ元データ（_answer.headline）に差し替えてから抽出する。
+  // .headline は mdLite() で HTML 整形して描画しているため、コピーは生テキストのまま（変換しない）にする: 見出し部分だけ元データ（_answer.headline）に差し替えてから抽出する。
   if (msg._answer && typeof msg._answer.headline === 'string') {
     const h = clone.querySelector('.headline');
     if (h) h.textContent = msg._answer.headline;
@@ -310,8 +277,7 @@ $('messages').addEventListener('click', (e) => {
   copyText(clone.textContent.trim());
 });
 
-// Feature B/C: 個人ファイルのアップロード（送信欄の一部＝入力/送信中枢に同居。参照トグルの
-// setPersonal/setKb は範囲ドメイン＝web/chat/scope.js の担当）。
+// 個人ファイルのアップロード（送信欄の一部）。参照トグルの setPersonal/setKb は web/chat/scope.js の担当。
 async function uploadPersonalFilesFromChat(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
@@ -355,8 +321,7 @@ $('chat-file-input').addEventListener('change', (e) => {
   e.target.value = '';
 });
 
-// Feature C: 共有ボタンの enabled/disabled 状態を更新する（個人コンテンツ含む会話は共有不可）。
-// history.js（newConversation/openConversation）・stream.js（subscribeTurn）から呼ばれるため export。
+// 共有ボタンの enabled/disabled 状態を更新する（個人コンテンツ含む会話は共有不可）。history.js・stream.js から呼ばれるため export。
 export function updateShareButtonState() {
   const btn = $('sharebtn');
   const note = $('personal-blocked-note');
@@ -384,10 +349,7 @@ function _limits() {                                              // 最小=固�
   return { Lmin: 200, Lmax: Math.max(200, Math.min(460, Math.round(W * 0.34))),
     Rmin: 280, Rmax: Math.max(280, Math.min(480, Math.round(W * 0.34))), CMIN: 460 };
 }
-// RV1 #5: `preferRight`（チップから明示的に右ペインを開いた操作専用）は、狭幅で中央最小幅
-// （CMIN）を確保できない場合に既存の「右→左→右畳み→左畳み」の縮小順を「左を畳む→中央最小幅を
-// 残幅へクランプ」に変える——通常の開閉（ヘッダの開く/閉じるボタン・ドラッグ）はレイアウト計算が
-// 右トラックを 0 に戻す既存の挙動のまま（回帰させない）。
+// preferRight（チップから明示的に右ペインを開いた操作専用）は、狭幅で中央最小幅（CMIN）を確保できない場合に、縮小順を「左を畳む→中央最小幅を残幅へクランプ」に変える。通常の開閉・ドラッグは変えない。
 function updateLayout(opts) {              // 画面幅に合わせて3トラックを再計算（横スクロールを出さない）
   const preferRight = !!(opts && opts.preferRight);
   const W = innerWidth, lm = _limits();
@@ -399,8 +361,7 @@ function updateLayout(opts) {              // 画面幅に合わせて3トラッ
     if (need() > 0 && L > 0) L = Math.max(0, L - need());         // 右を優先し、まず左を畳む
     if (need() > 0) cmin = Math.max(240, cmin - need());          // 中央は入力が読める最小幅（240px）を死守する
     if (need() > 0) R = Math.max(lm.Rmin, R - need());            // 次に右を最小幅まで縮める
-    if (need() > 0) { R = 0; cmin = lm.CMIN; }                    // 極端な狭さでは右を諦める（中央が1文字幅まで潰れて
-                                                                  // 入力の吹き出しが縦書き状に崩れる実害の方が大きい）
+    if (need() > 0) { R = 0; cmin = lm.CMIN; }   // 極端な狭さでは右を諦める（中央が潰れて入力の吹き出しが縦書き状に崩れるため）
   } else {
     if (need() > 0 && R > 0) R = Math.max(lm.Rmin, R - need());   // まず右を最小まで縮める
     if (need() > 0 && L > 0) L = Math.max(lm.Lmin, L - need());   // 次に左を最小まで（中央優先）
@@ -426,9 +387,8 @@ function setupSplitter(el, side) {
   });
 }
 function setSidebar(open) { _sideOpen = open; try { localStorage.setItem('sherpa-sidebar', open ? '1' : '0'); } catch (e) { } updateLayout(); }
-// SC-6b: 調べ方ブロックの入力欄チップ（web/chat/inquiry.js）が「右ペインが閉じている/狭幅」でも
-// 必ずブロックへ到達できるよう export する（chat.js↔scope.js と同じ意図した循環 import）。
-// `opts`（省略可）は updateLayout() へそのまま渡す（`{preferRight:true}` は RV1 #5・チップ専用）。
+// 調べ方ブロックの入力欄チップ（web/chat/inquiry.js）が、右ペインが閉じている/狭幅でも必ずブロックへ到達できるよう export する。
+// opts は updateLayout() へそのまま渡す（{preferRight:true} はチップ専用）。
 export function setRight(open, opts) { _rightOpen = open; try { localStorage.setItem('sherpa-right', open ? '1' : '0'); } catch (e) { } updateLayout(opts); }
 (function initLayout() {
   try { const c = JSON.parse(localStorage.getItem('sherpa-cols') || 'null'); if (c) { _cols.L = c.L || _cols.L; _cols.R = c.R || _cols.R; } } catch (e) { }
@@ -451,11 +411,10 @@ $('messages').addEventListener('click', (e) => {
   else toast('この回答は書き出せません');
 });
 
-// ユーザー表示・ログアウトは全ページ共通の上部ナビ（nav.js の #topbar-user ドロップダウン）へ移動済み。
+// ユーザー表示・ログアウトは全ページ共通の上部ナビ（nav.js の #topbar-user）にある。
 
 applyCachedBrain();   // 前回のモデル/プロバイダを即反映（その後 loadConfig がサーバ値で確定）
-// トップバーの「⏳ 回答作成中」インジケータ（nav.js）から `chat.html?conv=<id>` で遷移してきた場合、
-// その会話を自動で開く（実行中ターンがあれば openConversation → resumeRunningTurn が自動再購読する）。
+// トップバーの「⏳ 回答作成中」インジケータ（nav.js）から chat.html?conv=<id> で遷移してきた場合、その会話を自動で開く（実行中ターンがあれば resumeRunningTurn が自動再購読する）。
 {
   const _convRaw = new URLSearchParams(location.search).get('conv');
   const _convParam = Number(_convRaw);
@@ -479,9 +438,7 @@ applyCachedBrain();   // 前回のモデル/プロバイダを即反映（その
 }
 loadConfig();
 
-// SC-6e: 検索経路トグルの実接続可用性（実行側と同じ判定関数・不達なら設定を待たず
-// チップ自体を出さない）。失敗時は楽観的な既定（全ON扱い）のまま据え置く（fail-open・
-// サーバ側の 422/graceful degrade が最終防衛線のため画面が固まることはない）。
+// 検索経路トグルの実接続可用性（実行側と同じ判定関数・不達ならチップ自体を出さない）。失敗時は楽観的な既定（全ON）のまま据え置く（サーバ側の 422/graceful degrade が最終防衛線）。
 fetch('/chat/tools-availability').then((r) => r.json()).then(setToolsAvailability).catch(() => { });
 
 // 取込ディレクトリ選択肢を /world-options（ログイン必須・admin 不要）から読む（/worlds は admin 専用のため）。
@@ -489,19 +446,15 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
   const names = d.worlds || [];
   const lbls = d.labels || {};
   S.verLabels = {}; names.forEach((n) => { S.verLabels[n] = lbls[n] || n; });
-  // 資料フォルダが1つも登録されていない環境では、資料参照を送っても 404（資料フォルダが無い）に
-  // なるだけ＝既定ON（決定2026-09-19）のままだと素の雑談まで壊れる。未登録なら明示OFFへ倒す
-  // （Codex構成の kbLocked は setKb 自身が常にONへ上書きするため、ここでは分岐しない）。
-  // S.kbForcedOff も立てる——newConversation() が「未確認（読込前/失敗）」と「空で確定」を
-  // 区別して、後者のときだけ新規会話も OFF のままにするため（RV是正・決定2026-09-19）。
+  // 資料フォルダが1つも登録されていない環境では、資料参照を送ると 404 になるため、未登録なら明示OFFへ倒す（Codex構成の kbLocked は setKb 自身が常にONへ上書きするため分岐しない）。
+  // S.kbForcedOff も立てる: newConversation() が「未確認（読込前/失敗）」と「空で確定」を区別して、後者のときだけ新規会話も OFF のままにするため。
   if (names.length === 0) { S.kbForcedOff = true; setKb(false); }
   const sel = $('version');
   if (sel) {
     sel.innerHTML = names.length
       ? names.map((n) => `<option value="${esc(n)}">${esc(lbls[n] || n)}</option>`).join('')
       : '<option value="">（資料フォルダ未登録）</option>';
-    // 資料フォルダは全体で1本（決定 2026-08-15）＝選ぶ余地が無いので選択UIは出さない。
-    // select 自体は送信 body（stream.js）と範囲ツリー（scope.js）が読む値として残す。
+    // 資料フォルダは全体で1本＝選ぶ余地が無いので選択UIは出さない。select 自体は送信 body（stream.js）と範囲ツリー（scope.js）が読む値として残す。
     const box = sel.closest('.verselect');
     if (box) box.style.display = names.length > 1 ? '' : 'none';
     try {                                                   // 復元の優先順: 会話の world（deep-link）＞ 前回の明示選択 ＞ 先頭
@@ -515,13 +468,12 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
       const sc = S.currentScopeMeta;
       if (sel.value === S.pendingConvWorld && sc && sc.world === S.pendingConvWorld) {
         S.scope = (sc.source === 'explicit') ? (sc.scope_paths || []).slice() : [];
-        // RV1 #4: 調べ方（lens）・探す対象（layer）も同じ後追い経路で復元する（scope.js の
-        // applyConversationScope が sc.lens_restore を計算済み・独立の sameDir 判定を増やさない）。
+        // 調べ方（lens）・探す対象（layer）も同じ後追い経路で復元する（scope.js の applyConversationScope が sc.lens_restore を計算済み）。
         S.lens = sc.lens_restore || 'auto';
         S.layer = sc.layer || 'both';
-        S.depthProfile = sc.depth_profile || 'standard';   // SC-6c: 同じ後追い経路で調べる深さも復元する
-        S.webSearch = !!sc.web_search;   // WEB-1: 同じ後追い経路で Web 検索希望も復元する
-        S.tools = sc.tools || { grep: true, fulltext: true, graph: true };   // SC-6e: 同じ後追い経路で検索経路トグルも復元する
+        S.depthProfile = sc.depth_profile || 'standard';   // 同じ後追い経路で調べる深さも復元する
+        S.webSearch = !!sc.web_search;   // 同じ後追い経路で Web 検索希望も復元する
+        S.tools = sc.tools || { grep: true, fulltext: true, graph: true };   // 同じ後追い経路で検索経路トグルも復元する
         S.toolsExplicit = toolsExplicitForRestore(S.tools, sc.tools_explicit);   // 触った軸だけ明示扱い（scope.js と同じ規則）
         refreshInquirySummary();
       }
@@ -531,9 +483,8 @@ fetch('/world-options').then((r) => r.json()).then((d) => {
   const v = document.querySelector('.verselect');
   if (v && names.length <= 1) v.style.display = 'none';   // 1つ（または未登録）ならセレクタは隠す
 }).catch(() => { }).finally(() => loadScopes());
-// 取込ディレクトリを切替えたら範囲をクリアして読み直す（別ディレクトリに古い範囲を送らない）。
-// 選択は端末ローカルに記憶（複数フォルダ運用で毎回選び直さない）。会話復元による自動切替（updateScopeHeader）は
-// change を発火しない＝ユーザーの明示選択だけを記憶する。
+// 取込ディレクトリを切替えたら範囲をクリアして読み直す（別ディレクトリに古い範囲を送らない）。選択は端末ローカルに記憶する。
+// 会話復元による自動切替（updateScopeHeader）は change を発火しないため、記憶されるのは利用者の明示選択だけ。
 $('version').addEventListener('change', () => {
   try { localStorage.setItem('sherpa-world', $('version').value); } catch (_) { /* no-op */ }
   S.scope = []; S.scopeTree = null; S.scopeLabels = {}; S.currentScopeMeta = null;
@@ -543,12 +494,8 @@ $('version').addEventListener('change', () => {
 const _ask = localStorage.getItem('sherpa-ask');
 if (_ask) { localStorage.removeItem('sherpa-ask'); $('input').value = _ask; $('input').focus(); }
 
-// ===== テスト専用 seam（リファクタリング計画フェーズ6 S1）=====
-// e2e（Playwright）はこれまで chat.js の内部変数・関数へ page.evaluate() で bare identifier
-// として直接触れていた（classic script のトップレベル let/function は同一 realm から素通しで
-// 見える）。chat.js の module 化（フェーズ6 S4）後は内部の let/function がモジュールスコープに
-// 閉じ、外側の実行コンテキストからは見えなくなるため、e2e の唯一の入口としてこの窓を先に用意する。
-// module 化後もここは window に明示公開したまま保つ（内部実装がどう分割されても同じ形で触れる）。
+// ===== テスト専用 seam =====
+// e2e（Playwright）が chat.js の内部変数・関数へ触れる唯一の入口。module スコープの内部は外から見えないため、window に明示公開する。
 window.__sherpaChatTest = {
   openConversation,
   resumeRunningTurn,

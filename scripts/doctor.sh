@@ -7,7 +7,7 @@
 # `make up` 直後の通常運用環境を検査する道具のため既定を `.env` にする）を読み込んでから実行する
 # だけの薄いラッパー（読み方は run-common.sh に一本化＝`sherpa_source_dotenv` を使う）。
 #
-# 課金の可能性がある実 API プローブ（OpenAI/Gemini/Bedrock。Ollama はローカルのため対象外）は
+# 課金の可能性がある実 API プローブ（OpenAI。Ollama はローカルのため対象外）は
 # 既定で無効。`make doctor PROBE_CLOUD=1` で有効化する（doctor_checks.py::probe_cloud_enabled）。
 set -euo pipefail
 

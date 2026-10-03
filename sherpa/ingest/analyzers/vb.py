@@ -1,90 +1,19 @@
-"""VB アナライザ（docs/archive/2026-09-05-アナライザ拡張.md §9 波3 レーン C・ユーザー裁定
-2026-09-06）。VB.NET（`.vb`）・VB6/VBA エクスポート（`.bas`/`.cls`/`.frm`/`.ctl`）・VBScript
-（`.vbs`）を1本のアナライザで扱う（1種別1本・方言差は `accepts` ではなく拡張子で内部分岐する）。
+"""VB アナライザ。VB.NET（`.vb`）・VB6/VBA エクスポート（`.bas`/`.cls`/`.frm`/`.ctl`）・VBScript（`.vbs`）を拡張子で内部分岐して1本で扱う。型を主体定義（`Module`）、`Sub`/`Function`/`Property` を children（`cid_key="<Type>.<Name>"`）として返す。
 
-**主体**: VB.NET は `Namespace X` 配下の `Class/Module/Structure/Interface/Enum`
-（public または最初のトップレベル型を primary・qualified `cid_key="Namespace.Type"`・他の型は
-children）。`Namespace` はネスト・複数出現に対応する（スタックで管理し、その時点で有効な
-namespace で各トップレベル型を修飾する——ファイル内に複数の独立した `Namespace` ブロックが
-あっても、後方のブロックの型が前方のブロックの namespace を引き継がない）。VB6/VBA は
-`Attribute VB_Name = "..."` の名前（`.frm` は無ければ `Begin VB.Form Name` の名前・どちらも
-無ければファイル名ステム）を primary（`Module`）とする——VB6/VBA には `Class`/`Module`
-キーワードのブロック構文自体が無い（ファイル自体が1個の型）。
+主体: VB.NET は `Namespace` 配下の `Class/Module/Structure/Interface/Enum`（public または最初のトップレベル型が primary・`cid_key="Namespace.Type"`・他の型は children）。`Namespace` はネスト・複数出現に対応する。VB6/VBA は `Attribute VB_Name`（`.frm` は `Begin VB.Form` の名前、無ければファイル名ステム）を primary とする。入れ子の型は `Dropped("vb_nested_type")` で申告し、中の手続きも children にしない。
+children: 同一 `(label, cid_key, c_kind)` の重複（overload・`Property Get/Let/Set`）は1件へ集約する。`extra["c_kind"]` は通常形が `"definition"`、`Declare ... Lib` が `"declaration"`。`Interface` メンバー・`MustOverride` は本体を持たない。`resolves_calls_by_simple_name = True`（C と同じ2段目の単純名解決）。
 
-**children**: `Sub`/`Function`/`Property`（自動実装の単一行プロパティは block を持たない・
-`Get` 行が直後に続く形、または VB6/VBA の `Property Get/Let/Set`（accessor 語の後が本来の名前・
-本体は必ず `End Property` まで続く）だけを block として扱う）は修飾名 `<Type>.<Name>`（VB6/VBA
-は `<primary名>.<Name>`）を `cid_key` に持つ children（C の `<ファイル名>.<関数名>` と同型）。
-`Interface` メンバー・`MustOverride` 修飾子付きメンバーは本体を持たない（`End Sub/Function` を
-待たない）ため frame を積まない——直後の別メンバー宣言が同じ手続きの内側に飲み込まれない。
-入れ子の型（VB.NET の `Class` の中の `Class` 等）は `Dropped("vb_nested_type", ...)` として
-申告するだけで、型自体はもちろんその中の手続きも children にはしない。同一 `(label, cid_key,
-c_kind)` の重複（overload・VB6 の `Property Get/Let/Set` 三つ組）は1件へ集約する（definition を
-declaration より優先）。`extra["c_kind"]` は本体を持つ通常形なら `"definition"`、`Declare
-Function/Sub ... Lib` なら `"declaration"`（宣言だけで実体を持たない・C のプロトタイプ宣言と
-同型）。`resolves_calls_by_simple_name = True` により、`via=call` の単純名参照は world_graph 側の
-2段目（`simple_name_defs`）で同一 top_scope 内の children へ解決される（§9・C と同じ仕組みを流用）。
+参照（`INVOKES`）:
+- `Inherits X`／`Implements X` → `via=extends`。`Imports` は参照にしない。
+- `New X(...)` → `via=call`。宣言型（`Dim x As T`・引数・戻り値）→ `via=field_type`（組み込み型は除く）。完全修飾トークンは `extra={"qualified": True}`。
+- 手続き呼び出し（`Call Foo(`・`Foo(`・括弧なしの `Foo arg1, arg2`）→ `via=call`。`:` 区切りの文単位と単一行 `If ... Then <文>` の実行部も走査する。`MsgBox`・`Debug.Print` 等の組み込み手続きは除外する。
+- `.frm`/`.ctl` のデザイナ部（`Begin ... End`）は読み飛ばす。
+- `CreateObject`/`GetObject` → `Dropped("vb_late_bound")`、`CallByName`/`Application.Run` → `Dropped("vb_dynamic_call")`。
+- SQL 文字列: 文字列リテラル（`&`／`_` 連結を含む・先頭が文字列リテラルの連鎖のみ）に `SELECT|INSERT|UPDATE|DELETE|MERGE` があれば、`_sql_scan` で `ACCESSES via="vba_sql"`（`Table`）を返す。テーブル名の途中が動的な候補は `Dropped("vba_sql_dynamic_table")`。
 
-**参照**: `Inherits X`／`Implements X` → `INVOKES via=extends`（C# と同じ統一・`implements` は
-使わない）。`Imports A.B` はヒントのみ（参照にしない）。`New X(...)`／`New X`（`Dim x As New X`
-を含む）→ `via=call`。宣言型（`Dim x As T`／引数／戻り値／`Private WithEvents x As T`）→
-`via=field_type`（組み込み型 `String/Integer/Long/Boolean/Object/Variant/Date/Double/Decimal/
-Byte/Char/Short/Single` は除外）。`.` を含む完全修飾トークン（base list／宣言型／`New`
-いずれも）は `extra={"qualified": True}` を付け、共通層の完全修飾名2段解決
-（cid_key 完全一致→無ければ単純名フォールバック）に渡す（C# の `_emit_type_ref` と同型）。
-手続き呼び出し `Call Foo(`／`Foo(`／`Foo arg1, arg2`（VB 固有の括弧なし呼び出し）→ `via=call`
-（単純名。2段目解決）。コメント除去済みの1論理行を `:` で区切った文単位で走査するため
-`Foo: Bar` の両方、および単一行 `If 条件 Then <文>` の実行部（`<文>`）も検出する。組み込み手続き
-（`MsgBox`／`Print`／`Input`／`Open`／`Close`／`Kill`／`Randomize`／`DoEvents`／`Beep`・
-`Debug.Print`／`Err.Raise`）は除外リストで参照にしない（実行時のI/O・診断ステートメントで
-呼び出し先が定義として存在しないため）。自ファイル内の手続き呼び出しも除外しない（primary と
-children の cid は常に異なるため自己ループにはならない・C と同じ理由）。
-
-`.frm`/`.ctl` のデザイナ部（`Begin ... End`・`BeginProperty ... EndProperty` を含む・入れ子可）は
-対応する Begin/End で丸ごと読み飛ばす（プロパティ値行 `Caption = "Main"` やネストした
-`BeginProperty Font` を誤って呼び出しと判定しない）——ファイル冒頭からトップレベルの `End` まで
-がデザイナ部、それ以降（`Attribute`・手続き本体）だけが通常の参照走査の対象になる。
-
-`CreateObject("ProgID")`／`GetObject(...)` → `Dropped("vb_late_bound", line, progid)`。
-`CallByName(...)`／`Application.Run "X"` → `Dropped("vb_dynamic_call", line, snippet)`
-（いずれも実行時にしか呼び出し先が決まらない動的呼び出しのため解決しない）。
-
-**SQL 文字列**（VBA/VB6 の ADO/DAO で頻出）: 文字列リテラル、または `&`（同一論理行）／`_`
-（行継続）で連結された文字列リテラルの並びに `SELECT|INSERT|UPDATE|DELETE|MERGE` が含まれる場合、
-連結後の文字列（変数/数値部分は `?` に置換）を `_sql_scan.sanitize`→`table_refs` にかけ
-`ACCESSES via="vba_sql"`（`Table`）を返す（`vba_sql` は `_base.KNOWN_VIA`/`VIA_PRIORITY` の既知
-via・波3 統合で追加）。連結の判定は**先頭が文字列リテラルの連鎖**
-（`"..."（& (文字列|識別子|数値)）*`）だけを対象にする——変数始まりの連結（`x & "SELECT..."`）は
-検出しない（安全側の限界）。テーブル識別子の途中に動的な置換（`?`）が隣接する候補（`"...FROM
-ORD" & suffix` → `"...FROM ORD?"`）は実際のテーブル名を復元できないため
-`Dropped("vba_sql_dynamic_table", line, snippet)` として申告するだけで解決しない（`"FROM " & tbl`
-のように識別子全体が `?` に置き換わる形は `table_refs` がそもそも候補として拾わないため、
-未解決のまま＝現状どおり）。
-
-大文字小文字は区別しない（`identifiers.normalize_code_name` で定義・参照とも大文字化・COBOL と
-同じ規則）。完全修飾名（`Namespace.Type`・`<Type>.<Name>`）も同じ関数で丸ごと大文字化する
-（内部の `.` はそのまま・`normalize_code_name` は前後空白/末尾ドット除去＋大文字化のみ）。VB は
-識別子を大文字化するため、C#/Java の**全大文字で定義された**型名（例 `API`）とは同世代なら
-一致し得る（表記が一致するものだけ）——「同一世代のパス最近傍・完全一致」の既存契約の範囲として
-許容する（言語ドメインで索引を分けない）。
-
-行継続 `_`（行末の空白+アンダースコア）は物理行を1つの論理行へ結合してから走査する
-（`_logical_lines`）——結合後の論理行1本につき「開始物理行番号」を1つだけ報告する（COBOL の
-論理行と同じ粒度・複数物理行にまたがる構文でも位置合わせのために文字オフセットまでは追わない）。
-コメント（`'`・文の先頭の `REM`（単語境界必須・`RemoveHandler` 等を誤認しない））・文字列リテラル
-（`"..."`・`""` エスケープ）は `_sanitize()`（構造走査用・コメント/文字列とも空白化）／
-`_sanitize_comments_only()`（SQL 文字列抽出用・コメントだけ空白化し文字列は残す）の2枚を使い分ける。
-`#If ... #End If`（条件コンパイル）は指令行自体を特別扱いせず、両分岐とも通常のコードとして
-読む（`#` 始まりの指令キーワードは本アナライザが認識するどの語彙とも一致しないため自然に無視
-される・条件自体は評価しない＝限界として明記）。
-
-**検出限界**: `Property` の自動実装／ブロック判定（VB.NET 形）は次行が `Get`（単独行）かどうかの
-1行先読みに依存する（複雑な属性行を挟む形は見逃す）。手続き呼び出しはパース対象の文に丸括弧が
-1つも無い場合だけ「括弧なし呼び出し」として扱う——式の途中に埋め込まれた戻り値呼び出し
-（`x = Foo(1)` のような代入式の中の呼び出しは丸括弧経路で拾うが、`x = Foo`（括弧なし・関数の
-戻り値を変数へ代入する形）は代入文と区別できないため検出しない。`With` ブロック内の暗黙メンバ
-アクセス（`.Foo`）・イベント配線（`Handles`／`AddHandler`）自体の解決・単一行の `Sub()...End Sub`
-形コロン区切り複文は対象外（安全側の見逃し）。
+大文字小文字は区別しない（`identifiers.normalize_code_name` で定義・参照とも大文字化）。行継続 `_` は `_logical_lines` で論理行へ結合し、開始物理行番号を報告する。コメント・文字列は `_sanitize()`（構造走査用）と `_sanitize_comments_only()`（SQL 文字列抽出用）で空白化する。`#If` は評価せず両分岐を読む。
+検出限界: `Property` のブロック判定は次行が単独の `Get` かの1行先読み。`x = Foo`（括弧なし）の戻り値代入・`With` 内の `.Foo`・イベント配線・単一行の `Sub()...End Sub` は対象外。
+設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
@@ -97,14 +26,13 @@ from ..identifiers import normalize_code_name as _norm
 
 VB_EXT = frozenset({".vb", ".bas", ".cls", ".frm", ".ctl", ".vbs"})
 
-# --- 継続行（` _` 行末）・コメント（`'`／文頭の `REM`）・文字列リテラル（`"..."`・`""` エスケープ）---
+# 継続行（` _` 行末）・コメント（`'`／文頭の `REM`）・文字列リテラル（`"..."`・`""` エスケープ）
 
 _CONTINUATION = re.compile(r'[ \t]_\s*$')
 
 
 def _sanitize_generic(text: str, *, blank_strings: bool) -> str:
-    """コメント（`'`・文の先頭の `REM`）を空白化し、`blank_strings` が真なら文字列リテラルの
-    中身（と引用符自体）も空白化する。同じ長さ・同じ改行位置を保つ（偽マッチ除外専用）。"""
+    """コメント（`'`・文の先頭の `REM`）を空白化し、`blank_strings` が真なら文字列リテラルの中身（と引用符）も空白化する。同じ長さ・同じ改行位置を保つ。"""
     out: list = []
     i, n = 0, len(text)
     stmt_start = True
@@ -205,7 +133,7 @@ def _logical_lines(sanitized: str, comments_blanked: str) -> list:
     return out
 
 
-# --- VB.NET: Namespace/Class/Module/Structure/Interface/Enum・Sub/Function/Property ---
+# VB.NET: Namespace/Class/Module/Structure/Interface/Enum・Sub/Function/Property
 
 _CONTAINER_OPEN = re.compile(
     r'^(?P<mods>(?:(?:Public|Private|Friend|Protected|MustInherit|NotInheritable|Partial)\s+)*)'
@@ -225,8 +153,7 @@ _MUSTOVERRIDE = re.compile(r'\bMustOverride\b', re.I)
 
 
 def _nearest_container(stack: list):
-    """最も近い囲みの型（`Namespace` を除く）を `(kind, name, nested)` で返す（無ければ
-    `None`）。`nested`＝そのコンテナ自身が入れ子（`vb_nested_type` として Dropped 済み）か。"""
+    """最も近い囲みの型（`Namespace` を除く）を `(kind, name, nested)` で返す（無ければ `None`）。`nested`＝そのコンテナ自身が入れ子（`vb_nested_type` として Dropped 済み）か。"""
     for frame in reversed(stack):
         if frame["frame"] == "container" and frame["kind"].lower() != "namespace":
             return frame["kind"], frame["name"], frame.get("nested", False)
@@ -234,15 +161,10 @@ def _nearest_container(stack: list):
 
 
 def _scan_structure(logical: list) -> tuple:
-    """`logical`（`_logical_lines` の戻り値）を状態機械で走査し、
-    `(top_types, nested_dropped, procedures)` を返す。
+    """`logical`（`_logical_lines` の戻り値）を状態機械で走査し、`(top_types, nested_dropped, procedures)` を返す。
 
-    `top_types`＝`[{"kind","name","line","is_public","namespace"}, ...]`（各時点で有効な
-    namespace スタックを結合した文字列|None を個別に持つ・トップレベル型のみ。VB6/VBA では
-    `Namespace`/`Class` キーワード自体が現れないため常に空）。
-    `procedures`＝`[{"kind","name","line","term","owner": (kind,name)|None}, ...]`
-    （`owner`＝最も近い囲みの型。VB6/VBA は常に `None`＝primary 直下という意味で扱う。
-    入れ子型の中の手続きはここに現れない——`owner_nested` の時点で除外する）。
+    `top_types`＝`[{"kind","name","line","is_public","namespace"}, ...]`（トップレベル型のみ。VB6/VBA では常に空）。
+    `procedures`＝`[{"kind","name","line","term","owner": (kind,name)|None}, ...]`（`owner`＝最も近い囲みの型。VB6/VBA は常に `None`。入れ子型の中の手続きは含まない）。
     """
     stack: list = []
     namespace_stack: list = []
@@ -260,7 +182,7 @@ def _scan_structure(logical: list) -> tuple:
             m_pclose = _PROC_CLOSE.match(stripped)
             if m_pclose and stack[-1]["kind"].lower() == m_pclose.group("kind").lower():
                 stack.pop()
-            continue                                      # 手続き本体内は container/procedure 検知しない
+            continue  # 手続き本体内は container/procedure を検知しない
 
         m_cclose = _CONTAINER_CLOSE.match(stripped)
         if m_cclose and stack and stack[-1]["frame"] == "container" \
@@ -273,7 +195,7 @@ def _scan_structure(logical: list) -> tuple:
         m_decl = _DECLARE.match(stripped)
         if m_decl:
             owner = _nearest_container(stack)
-            if not (owner and owner[2]):                  # 入れ子型内の宣言は children にしない
+            if not (owner and owner[2]):
                 owner_pair = (owner[0], owner[1]) if owner else None
                 procedures.append({"kind": m_decl.group("kind"), "name": m_decl.group("name"),
                                    "line": line_no, "term": "declaration", "owner": owner_pair})
@@ -311,9 +233,9 @@ def _scan_structure(logical: list) -> tuple:
             owner_pair = (owner[0], owner[1]) if owner else None
             no_body = bool(_MUSTOVERRIDE.search(mods)) or (owner is not None and owner[0].lower() == "interface")
             if kind.lower() == "property":
-                if accessor is not None:                  # VB6/VBA の `Property Get/Let/Set`
+                if accessor is not None:
                     push_frame = not no_body
-                else:                                      # VB.NET: 次行が単独の `Get` なら full block
+                else:
                     nxt = logical[idx + 1][1].strip() if idx + 1 < n else ""
                     push_frame = (not no_body) and bool(_GET_BARE.match(nxt))
                 if push_frame:
@@ -333,9 +255,7 @@ def _scan_structure(logical: list) -> tuple:
 
 
 def _dedupe_children(children: list) -> list:
-    """同一 `(label, cid_key)` の重複 child を1件に集約する（overload・VB6 の
-    `Property Get/Let/Set` 三つ組など）。`c_kind` は definition を declaration より優先する
-    （返却順は初出のまま保つ）。"""
+    """同一 `(label, cid_key)` の重複 child を1件に集約する（overload・`Property Get/Let/Set` 三つ組など）。`c_kind` は definition を declaration より優先する（返却順は初出のまま）。"""
     best: dict = {}
     order: list = []
     for child in children:
@@ -352,7 +272,7 @@ def _dedupe_children(children: list) -> list:
     return [best[k] for k in order]
 
 
-# --- VB6/VBA: primary 名（`Attribute VB_Name`／`Begin VB.Form`／ファイル名ステム）---
+# VB6/VBA: primary 名（`Attribute VB_Name`／`Begin VB.Form`／ファイル名ステム）
 
 _VB_NAME = re.compile(r'^\s*Attribute\s+VB_Name\s*=\s*"(?P<name>[^"]*)"', re.M | re.I)
 _BEGIN_FORM = re.compile(r'^\s*Begin\s+VB\.Form\s+(?P<name>\w+)', re.M | re.I)
@@ -368,13 +288,13 @@ def _vb6_primary_name(text: str, rel_path: str) -> str:
     return PurePosixPath(rel_path).stem
 
 
-# --- .frm/.ctl のデザイナ部（`Begin ... End`／`BeginProperty ... EndProperty`）の読み飛ばし ---
+# .frm/.ctl のデザイナ部（`Begin ... End`／`BeginProperty ... EndProperty`）の読み飛ばし
 
 _DESIGN_BEGIN = re.compile(r'^(?:Begin|BeginProperty)\b', re.I)
 _DESIGN_END = re.compile(r'^(?:End|EndProperty)\s*$', re.I)
 
 
-# --- 参照抽出: Inherits/Implements・New・宣言型（As Type）・呼び出し・late/dynamic call ---
+# 参照抽出: Inherits/Implements・New・宣言型（As Type）・呼び出し・late/dynamic call
 
 _INHERITS_OR_IMPLEMENTS = re.compile(
     r'^(?:Inherits|Implements)\s+(?P<name>[A-Za-z_][\w.]*)', re.I)
@@ -391,8 +311,7 @@ _BUILTIN_TYPES = frozenset({
 _LATE_BOUND_NAMES = frozenset({"CREATEOBJECT", "GETOBJECT"})
 _DYNAMIC_CALL_NAMES = frozenset({"CALLBYNAME"})
 
-# 実行時 I/O・診断用の組み込み手続き——呼び出し先が定義として存在しないため参照にしない。
-# 修飾形（`Debug.Print`/`Err.Raise`）は完全一致のみ除外し、無修飾の単語は最後のセグメントで判定する。
+# 実行時 I/O・診断用の組み込み手続き（呼び出し先が定義として存在しないため参照にしない）。修飾形は完全一致のみ、無修飾は最後のセグメントで判定する。
 _BUILTIN_PROC_QUALIFIED = frozenset({"DEBUG.PRINT", "ERR.RAISE"})
 _BUILTIN_PROC_BARE = frozenset({
     "MSGBOX", "PRINT", "INPUT", "OPEN", "CLOSE", "KILL", "RANDOMIZE", "DOEVENTS", "BEEP",
@@ -460,8 +379,7 @@ def _late_bound_progid(name_upper: str, cb_line: str, start: int) -> str:
 
 
 def _then_statement(segment: str) -> str:
-    """単一行 `If 条件 Then <文>` の実行部だけを取り出す（マッチしなければそのまま返す——複数行
-    If ブロックのヘッダ行はここでは変換されず、`_RESERVED_LEADERS` の `IF` 除外に任せる）。"""
+    """単一行 `If 条件 Then <文>` の実行部だけを取り出す（マッチしなければそのまま返す。複数行 If のヘッダ行は `_RESERVED_LEADERS` の `IF` 除外に任せる）。"""
     m = _SINGLE_LINE_IF_THEN.match(segment)
     return m.group("stmt").strip() if m else segment
 
@@ -477,14 +395,13 @@ def _scan_bareword_statement(stmt: str, cb_line: str, line_no: int, refs: list, 
         return
     rest = m.group("rest")
     if rest and rest.lstrip().startswith(("=", "<", ">")):
-        return                                              # 代入/比較文（宣言の一部）と誤認しない
+        return
     last_seg = name.rsplit(".", 1)[-1].upper()
     if name.upper() == "APPLICATION.RUN" or last_seg in _DYNAMIC_CALL_NAMES:
         dropped.append(Dropped("vb_dynamic_call", line_no, _dynamic_call_snippet(cb_line)))
         return
     if last_seg in _LATE_BOUND_NAMES:
-        # `CreateObject`/`GetObject` は戻り値を使う関数呼び出しのため括弧を伴わない形は実在しない
-        # ——万一現れても progid が取れないため通常の call にはせず黙って見逃す（検出限界）。
+        # `CreateObject`/`GetObject` は戻り値を使う関数呼び出しのため、括弧なしの形は通常の call にせず黙って見逃す（検出限界）。
         return
     if _is_builtin_proc(name):
         return
@@ -492,8 +409,7 @@ def _scan_bareword_statement(stmt: str, cb_line: str, line_no: int, refs: list, 
 
 
 def _scan_call_refs(san_line: str, cb_line: str, line_no: int, refs: list, dropped: list) -> None:
-    """1論理行分の呼び出し系参照（`New`／宣言型／`Inherits`/`Implements`／通常呼び出し／
-    括弧なし呼び出し／late-bound・dynamic call の Dropped 化）を抽出する。"""
+    """1論理行分の呼び出し系参照（`New`／宣言型／`Inherits`/`Implements`／通常呼び出し／括弧なし呼び出し／late-bound・dynamic call の Dropped 化）を抽出する。"""
     stripped = san_line.strip()
     if not stripped:
         return
@@ -514,12 +430,12 @@ def _scan_call_refs(san_line: str, cb_line: str, line_no: int, refs: list, dropp
         _emit_ref(refs, m.group("type"), line_no, "call")
 
     if _is_header_like(stripped):
-        return                                            # 定義ヘッダ自身は呼び出しとして扱わない
+        return
 
     for m in _CALL_PAREN.finditer(san_line):
         name = m.group("name")
         if m.start("name") in new_starts:
-            continue                                       # `New X(...)` の型名と二重計上しない
+            continue  # `New X(...)` の型名と二重計上しない
         last_seg = name.rsplit(".", 1)[-1].upper()
         first_seg = name.split(".", 1)[0].upper()
         if first_seg in _RESERVED_LEADERS or last_seg in _RESERVED_LEADERS:
@@ -535,8 +451,7 @@ def _scan_call_refs(san_line: str, cb_line: str, line_no: int, refs: list, dropp
             continue
         _emit_ref(refs, name, line_no, "call")
 
-    # 括弧なし呼び出し: コメント除去済みの文を `:` で区切り、文ごとに走査する（単一行
-    # `If 条件 Then <文>` の実行部も対象に含める）。
+    # 括弧なし呼び出し: コメント除去済みの文を `:` で区切り、文ごとに走査する（単一行 `If 条件 Then <文>` の実行部も含む）。
     for segment in stripped.split(":"):
         seg = segment.strip()
         if not seg:
@@ -547,7 +462,7 @@ def _scan_call_refs(san_line: str, cb_line: str, line_no: int, refs: list, dropp
         _scan_bareword_statement(stmt, cb_line, line_no, refs, dropped)
 
 
-# --- SQL 文字列（文字列リテラル、または `&`/`_` 継続で連結された文字列）---
+# SQL 文字列（文字列リテラル、または `&`/`_` 継続で連結された文字列）
 
 _SQL_KEYWORD = re.compile(r'\b(?:SELECT|INSERT|UPDATE|DELETE|MERGE)\b', re.I)
 _CONCAT_CHAIN = re.compile(
@@ -572,8 +487,7 @@ def _sql_refs_from_line(cb_line: str, line_no: int, dropped: list) -> list:
         for name, offset in _sql_scan.table_refs(sanitized_sql):
             end = offset + len(name)
             if end < len(combined) and combined[end] == "?":
-                # 識別子の途中に動的な置換（`?`）が隣接する候補（`ORD` & suffix → `"...ORD?"`）は
-                # 実テーブル名を復元できないため解決せず申告するだけにする。
+                # 識別子の途中に動的な置換（`?`）が隣接する候補は実テーブル名を復元できないため、解決せず申告するだけにする。
                 dropped.append(Dropped("vba_sql_dynamic_table", line_no, combined.strip()[:120]))
                 continue
             refs.append(RefCandidate("ACCESSES", "Table", name, line_no, extra={"via": "vba_sql"}))
@@ -581,8 +495,7 @@ def _sql_refs_from_line(cb_line: str, line_no: int, dropped: list) -> list:
 
 
 class VbAnalyzer(Analyzer):
-    """VB.NET（`.vb`）・VB6/VBA エクスポート（`.bas`/`.cls`/`.frm`/`.ctl`）・VBScript（`.vbs`）。
-    全件受理（方言差は拡張子で内部分岐・1種別1本）。"""
+    """VB.NET・VB6/VBA エクスポート・VBScript。全件受理（方言差は拡張子で内部分岐）。"""
 
     name = "vb"
     extensions = VB_EXT
@@ -647,7 +560,7 @@ class VbAnalyzer(Analyzer):
                     design_depth -= 1
                 elif _DESIGN_BEGIN.match(stripped):
                     design_depth += 1
-                continue                                  # デザイナ部の中は参照走査しない
+                continue
             if _DESIGN_BEGIN.match(stripped):
                 design_depth += 1
                 continue

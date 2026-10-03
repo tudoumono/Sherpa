@@ -574,3 +574,97 @@ def test_job_with_default_namespace_override_is_recognized():
     )
     res = A.collect_defs(text, "batch-context.xml")
     assert {c.name for c in res.children} == {"nightlyJob"}
+
+
+# --- TERASOLUNA 5.x 実測（eval/terasoluna/）で見つかった取りこぼし ---
+# 共通ライブラリのコードリスト等は `<bean parent="...">`（bean 定義継承）で抽象 bean を継承し、
+# 複数ファイルに分割した設定は `<import resource="...">` で束ねる——いずれも標準 Spring の記法だが
+# 既存の `_scan` は属性/要素とも一切見ていなかった（Dropped にも挙がらず完全に無検知）。
+
+def test_bean_parent_attribute_becomes_a_config_key_reference():
+    """`<bean parent="X">`（bean 定義継承）は `<property ref>`/`<constructor-arg ref>` と同じ
+    `Config -ACCESSES(via=config_key, key_kind="bean")-> Config` として返す（§4(b) 追補と同型）。"""
+    text = (
+        "<beans>\n"
+        '  <bean id="AbstractCodeList" class="jp.example.fw.JdbcCodeList" abstract="true"/>\n'
+        '  <bean id="CL_SAMPLE" parent="AbstractCodeList">\n'
+        '    <property name="querySql" value="SELECT code FROM sample_code"/>\n'
+        "  </bean>\n"
+        "</beans>\n"
+    )
+    ref_res = A.extract_refs(text, "spring/sample-codelist.xml")
+    config_refs = [r for r in ref_res.refs if r.extra.get("via") == "config_key"
+                   and r.name == "AbstractCodeList"]
+    assert len(config_refs) == 1
+    ref = config_refs[0]
+    assert (ref.edge_type, ref.kind) == ("ACCESSES", "Config")
+    assert ref.extra == {"via": "config_key", "key_kind": "bean"}
+    assert ref.line == 3
+    # `parent` 属性自体は children（キー単位の定義）を増やさない——あくまで参照
+    # （`<property>` は既存契約どおり `CL_SAMPLE.querySql` を1件生成する）
+    def_res = A.collect_defs(text, "spring/sample-codelist.xml")
+    assert {c.name for c in def_res.children} == {"AbstractCodeList", "CL_SAMPLE", "CL_SAMPLE.querySql"}
+
+
+def test_bean_parent_attribute_inside_comment_is_not_a_reference():
+    """コメント化された例示コード（TERASOLUNA tutorial-apps の実例で確認）は expat がそもそも
+    要素として見ないため、誤って参照を作らない。"""
+    text = (
+        "<beans>\n"
+        "  <!-- Example:\n"
+        '  <bean id="CL_SAMPLE" parent="AbstractCodeList"/>\n'
+        "  -->\n"
+        "</beans>\n"
+    )
+    ref_res = A.extract_refs(text, "spring/sample-codelist.xml")
+    assert ref_res.refs == []
+
+
+def test_import_resource_becomes_invokes_config_reference_by_path_suffix():
+    """`<import resource="classpath:/META-INF/spring/x-domain.xml">`（設定ファイル合成・
+    TERASOLUNA の `*.xml` が `*-domain.xml`/`*-env.xml` 等を束ねる構成）は既存の `include` via へ
+    相乗りする。宛先名は `classpath:`/`classpath*:`/`file:` プレフィックスを除いた**パスの形の
+    まま**（basename に縮めない——RV 是正: 同名の別ファイルとの誤接続防止）。`extra["path_suffix"]`
+    が立ち、実際の末尾一致解決は共通層（`world_graph._resolve_path_suffix`）が担う。"""
+    text = (
+        "<beans>\n"
+        '  <import resource="classpath:/META-INF/spring/sample-domain.xml"/>\n'
+        '  <import resource="sample-env.xml"/>\n'
+        "</beans>\n"
+    )
+    ref_res = A.extract_refs(text, "spring/sample.xml")
+    include_refs = [r for r in ref_res.refs if r.extra.get("via") == "include"]
+    assert {(r.kind, r.name, r.edge_type) for r in include_refs} == {
+        ("Config", "META-INF/spring/sample-domain.xml", "INVOKES"),
+        ("Config", "sample-env.xml", "INVOKES"),
+    }
+    assert all(r.extra.get("path_suffix") is True for r in include_refs)
+    assert ref_res.dropped == []
+
+
+def test_import_without_resource_attribute_is_reported_as_dropped_missing_resource():
+    """`resource` 属性の無い（または空の）`<import>` は推測せず
+    `Dropped("config_import_missing_resource", ...)` として申告する。"""
+    text = "<beans>\n  <import/>\n</beans>\n"
+    ref_res = A.extract_refs(text, "spring/sample.xml")
+    assert ref_res.refs == []
+    assert len(ref_res.dropped) == 1
+    dropped = ref_res.dropped[0]
+    assert (dropped.reason, dropped.line, dropped.snippet) == ("config_import_missing_resource", 2, "")
+
+
+def test_import_resource_with_wildcard_is_reported_as_dropped_not_guessed():
+    """Ant 風ワイルドカード（`classpath*:...**...*-codelist.xml` のような複数ファイル一括
+    import・TERASOLUNA 実測で確認）は宛先を一意に特定できないため、推測接続せず
+    `Dropped("config_import_wildcard", ...)` として申告する（黙って捨てない）。"""
+    text = (
+        "<beans>\n"
+        '  <import resource="classpath*:META-INF/spring/**/*-codelist.xml"/>\n'
+        "</beans>\n"
+    )
+    ref_res = A.extract_refs(text, "spring/sample.xml")
+    assert ref_res.refs == []
+    assert len(ref_res.dropped) == 1
+    dropped = ref_res.dropped[0]
+    assert dropped.reason == "config_import_wildcard"
+    assert dropped.snippet == "classpath*:META-INF/spring/**/*-codelist.xml"

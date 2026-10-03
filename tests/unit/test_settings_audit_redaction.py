@@ -35,10 +35,10 @@ def test_ollama_url_without_userinfo_is_reduced_to_host_port_in_audit_record(mon
 def test_api_keys_still_masked_as_set_cleared(monkeypatch):
     calls = []
     monkeypatch.setattr("sherpa.store.audit", lambda *a, **kw: calls.append(kw))
-    system_router._audit_settings_update("u1", {"openai_api_key": "sk-real-secret", "gemini_api_key": ""})
-    changed = calls[0]["detail"]["changes"]
-    assert changed["openai_api_key"] == "<set>"
-    assert changed["gemini_api_key"] == "<cleared>"
+    system_router._audit_settings_update("u1", {"openai_api_key": "sk-real-secret"})
+    system_router._audit_settings_update("u1", {"openai_api_key": ""})
+    assert calls[0]["detail"]["changes"]["openai_api_key"] == "<set>"
+    assert calls[1]["detail"]["changes"]["openai_api_key"] == "<cleared>"
 
 
 # ---- `sherpa.store.settings._redact_secret_settings`（admin `PUT /admin/settings`／env シードの
@@ -56,10 +56,7 @@ def test_openai_base_url_redacted_to_host_in_admin_audit():
 
 def test_ollama_url_redacted_to_host_in_admin_audit_settings_ledger():
     """`store.settings._redact_secret_settings`（`system_settings.updated`/`env_seeded` 監査）は
-    `ollama_url` も他の URL キーと同列に host 表現へ畳む。`catchup_ollama_allowlist_for_env_seeded_url_v2`
-    の tamper 検知は、この畳んだ表現ではなく専用の `ollama_url_fingerprint`（正規化 host:port・
-    `seed_system_settings_once` が別フィールドとして記録する）を比較する＝生 URL を監査に残す
-    必要がない（`_URL_SETTINGS_KEYS`／`llm.ollama_url_fingerprint` の docstring 参照）。"""
+    `ollama_url` も他の URL キーと同列に host 表現へ畳む（生 URL を監査に残さない）。"""
     out = store_settings._redact_secret_settings({"ollama_url": "http://10.0.0.5:11434/api"}, None)
     assert out["ollama_url"] == "10.0.0.5:11434"
 

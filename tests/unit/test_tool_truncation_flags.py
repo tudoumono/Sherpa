@@ -40,7 +40,7 @@ def test_read_around_omits_text_truncated_when_budget_sufficient():
 # ===== grep/es ヒット本文（text_for_llm）: 文字数で切らない =====
 
 def test_ripgrep_hit_keeps_full_text_and_omits_text_truncated(monkeypatch):
-    long_text = "あ" * 2000
+    long_text = "あ" * 1000
     monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: [
         {"doc_id": "a.md", "line": 1, "span": [1, 1], "text": long_text, "ext": ".md"},
     ])

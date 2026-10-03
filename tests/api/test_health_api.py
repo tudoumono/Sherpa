@@ -179,10 +179,10 @@ def test_admin_health_200_with_components_for_admin():
         _restore_components(original)
 
 
-def test_admin_health_merges_ai_snapshot_without_duplicates_and_includes_gemini():
-    """UI フィードバック4（2026-07-03）: /admin/health の openai/gemini/bedrock/ollama/codex は
+def test_admin_health_merges_ai_snapshot_without_duplicates():
+    """UI フィードバック4（2026-07-03）: /admin/health の openai/ollama/codex は
     health.ai_snapshot（管理者本人の設定での実接続確認）の結果に差し替わる（COMPONENTS 側の軽量
-    チェックと重複表示されない）。gemini も新たに含まれる（旧実装は含んでいなかった）。"""
+    チェックと重複表示されない）。閉じたプロバイダ（gemini/bedrock）の行は出ない。"""
     if not _try_init():
         pytest.skip("infra down")
     original = _patch_components()
@@ -197,8 +197,8 @@ def test_admin_health_merges_ai_snapshot_without_duplicates_and_includes_gemini(
         data = r.json()
         ids = [comp["id"] for comp in data["components"]]
         assert len(ids) == len(set(ids)), f"component id が重複している: {ids}"
-        assert "gemini" in ids, "gemini が components に含まれていない"
-        for expected in ("postgres", "neo4j", "elasticsearch", "openai", "bedrock", "ollama", "codex"):
+        assert "gemini" not in ids and "bedrock" not in ids, "閉じたプロバイダの行が出ている"
+        for expected in ("postgres", "neo4j", "elasticsearch", "openai", "ollama", "codex"):
             assert expected in ids, f"{expected} が components から消えている"
     finally:
         _restore_components(original)

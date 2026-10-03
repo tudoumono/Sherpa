@@ -325,6 +325,32 @@ def test_list_webhook_keys_for_world_excludes_expired_and_inactive_owner():
         store.upsert_user(uid, role="user", status="active")
 
 
+def test_get_api_key_webhook_none_for_revoked_cleared_or_inactive_owner():
+    """通知先の解決（Codex ジョブの受付・送信直前）は、失効・宛先削除・自己発行キーの所有者非 active で
+    None（認証と同じ規則）。"""
+    _try_init()
+    sfx = _sfx()
+    uid = f"whgowner-{sfx}"
+    from sherpa import auth
+    store.upsert_user(uid, email=f"{uid}@t.local", display_name=uid,
+                      password_hash=auth.hash_password("Passw0rd!"), role="user", status="active")
+    store.set_system_settings("admin", {"user_api_keys_allowed": True})
+    try:
+        k = store.insert_api_key(
+            f"hash-whg-{sfx}", f"pfxwhg{sfx}"[:12], "whg", uid, owner_uid=uid,
+            webhook_url="https://wh.example/hook", webhook_secret="s")
+        assert store.get_api_key_webhook(k["id"])["webhook_url"] == "https://wh.example/hook"
+        store.upsert_user(uid, role="user", status="disabled")
+        assert store.get_api_key_webhook(k["id"]) is None
+        store.upsert_user(uid, role="user", status="active")
+        assert store.get_api_key_webhook(k["id"]) is not None
+        store.revoke_api_key(k["id"], "admin")
+        assert store.get_api_key_webhook(k["id"]) is None
+    finally:
+        store.set_system_settings("admin", {"user_api_keys_allowed": None})
+        store.upsert_user(uid, role="user", status="active")
+
+
 def test_list_webhook_keys_for_world_scopes_by_allowed_worlds():
     """`allowed_worlds` が None（全 world 許可）または対象 world を含む場合のみ対象になる。"""
     _try_init()

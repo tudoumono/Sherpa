@@ -7,16 +7,15 @@ Sherpa のテストは依存の重さで分けています。
 - `integration/`: Neo4j/Postgres/Elasticsearch など実サービスを使う結合テスト、またはそれに近い受け入れテスト。
 - `contract/`: 鏡モデルなど、設計上の契約を固定するテスト。
 - `e2e/`: Playwright で実ブラウザを操作する UI テスト。DB/API はモックし、`web/` を静的配信して検証します。
-- `e2e_live/`: Playwright で実ブラウザを操作し、起動済み FastAPI/DB/個人 workspace を実際に叩く結合 UI テスト。
 
 共通の fixture/helper は `tests/_world_setup.py` に置き、カテゴリ配下のテストから参照します。
 ルートの `tests/conftest.py` が、リポジトリルートと `tests/` を `sys.path` に載せ、テストの所在
-ディレクトリ（`tests/unit/…` 等）に応じて `unit`/`api`/`contract`/`integration`/`e2e`/`e2e_live`
+ディレクトリ（`tests/unit/…` 等）に応じて `unit`/`api`/`contract`/`integration`/`e2e`
 マーカーを自動付与します（`-m unit` などの選別がファイル書き換えなしで効きます）。
 
 `tests/api/conftest.py` と `tests/integration/conftest.py` が、それぞれのディレクトリ配下の
 どの `test_*.py` よりも先に読み込まれる性質を使い、import 時にしか読まれない env
-（`sherpa.api._USERS_DIR` / `_WORKSPACE_TTL_DAYS` 等）をディレクトリ内で一度だけ確定します。
+（`sherpa.api._USERS_DIR` 等）をディレクトリ内で一度だけ確定します。
 ログイン不要の互換モード（`SHERPA_AUTH_DISABLED=1`）が要るテストは、`auth_disabled` fixture
 （`tests/api/conftest.py` 提供）か、ファイル内の `autouse` fixture で明示します
 （`auth.auth_disabled()` は呼び出し時に env を読むため、`monkeypatch` で足りテスト終了後に自動復元）。
@@ -45,7 +44,6 @@ make test-contract      # pytest tests/contract -m contract（外部サービス
 make test-api           # pytest tests/api -m api（Neo4j/Postgres を使うものを含む）
 make test-integration   # pytest tests/integration -m integration（実サービスを使う）
 make test-e2e           # pytest tests/e2e（ブラウザ・DB不要・API はモック）
-make test-e2e-live      # pytest tests/e2e_live（起動済み FastAPI/DB を実利用）
 make test               # unit + api + contract + integration
 ```
 
@@ -69,7 +67,7 @@ SHERPA_USE_FIXTURES=1 .venv/bin/python -m pytest tests/unit -m unit --cov=sherpa
 速い層のみを既定にする狙い）。`api`/`integration` はストアが要るため明示パス指定
 （`pytest tests/api` 等）で実行します。
 
-`e2e/`・`e2e_live/` は既定の収集から外してあります（ブラウザ/起動済みサーバが要るため）。
+`e2e/` は既定の収集から外してあります（ブラウザが要るため）。
 `python3 -m pytest tests/e2e` のように**明示指定**すれば従来どおり実行できます。
 
 E2E は初回だけブラウザの導入が必要です。
@@ -77,18 +75,6 @@ E2E は初回だけブラウザの導入が必要です。
 ```bash
 .venv/bin/python -m playwright install chromium
 ```
-
-Live E2E は、別ターミナルで認証有効の FastAPI を起動してから実行します。既定の接続先は `http://127.0.0.1:8000` です。
-
-```bash
-SHERPA_ADMIN_PASSWORD=admin-pass SHERPA_ENV=dev SHERPA_USE_FIXTURES=1 \
-  .venv/bin/python -m uvicorn sherpa.api:app --host 127.0.0.1 --port 8000
-
-SHERPA_E2E_LIVE_BASE_URL=http://127.0.0.1:8000 SHERPA_ADMIN_PASSWORD=admin-pass \
-  make test-e2e-live
-```
-
-`e2e_live/` は admin ログイン、ユーザー作成、権限拒否、workspace upload/search/delete、会話共有の受領までを実サービスで確認します。Codex/MCP の実 smoke は重いため既定では skip し、必要な環境が揃った時だけ `SHERPA_E2E_LIVE_MCP=1 make test-e2e-live` で走らせます。
 
 ## CI
 

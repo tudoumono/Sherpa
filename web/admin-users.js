@@ -1,10 +1,9 @@
-// 管理者: ユーザー管理画面（Slice3）。GET/POST /admin/users, PATCH /admin/users/{uid}。
+// 管理者: ユーザー管理画面。GET/POST /admin/users, POST /admin/users/import, PATCH /admin/users/{uid}。
+// 設計: docs/design/users.md「役割と管理者の権限」
 // セキュリティ: server data は全て esc()。data-* 委譲でインライン handler なし。
 'use strict';
 
-// UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時は、自ページの
-// 共通トップバー/ナビを隠す（CSS 側は .embedded 修飾・admin-users.html の <style>）。単独 URL 直開き
-// （?embed 無し）では何もしない＝この画面の機能・見た目は完全に不変。
+// システム管理のタブから iframe（?embed=1）で開かれた時は、共通トップバー/ナビを隠す（CSS は .embedded 修飾）。
 if (new URLSearchParams(location.search).has('embed')) {
   document.documentElement.classList.add('embedded');
 }
@@ -47,8 +46,7 @@ function roleLabel(r) {
     : '<span class="badge-user">ユーザー</span>';
 }
 function statusLabel(s) {
-  // DB契約は active/disabled/pending（session_user は active のみログイン可）。
-  // disabled 以外を無条件で「有効」扱いにすると pending が誤って有効表示になるため個別に分岐する。
+  // DB契約は active/disabled/pending。disabled 以外を無条件で「有効」にすると pending が誤表示されるため個別に分岐する。
   if (s === 'disabled') return '<span class="badge-disabled">無効</span>';
   if (s === 'pending') return '<span class="badge-pending">保留</span>';
   return '<span style="color:var(--ok);font-size:var(--text-small)">● 有効</span>';
@@ -92,15 +90,14 @@ function renderUsers(users, total) {
   }).join('');
 }
 
-// ===== 検索・状態フィルター（クライアント側・20人規模の想定で十分＝サーバに絞り込みを作らない） =====
+// ===== 検索・状態フィルター（クライアント側） =====
 let _allUsers = [];
 
 function applyFilters() {
   const q = ($('f-q').value || '').trim().toLowerCase();
   const statusFilter = $('f-status').value;
   let list = _allUsers;
-  // 「有効のみ」は status === 'active' に厳密一致（pending はログイン不可＝有効ではない）。
-  // pending は「すべて」でのみ見える（「無効のみ」にも含めない・別の畳み機構は作らない）。
+  // 「有効のみ」は status === 'active' に厳密一致。pending は「すべて」でのみ見える。
   if (statusFilter === 'active') list = list.filter((u) => u.status === 'active');
   else if (statusFilter === 'disabled') list = list.filter((u) => u.status === 'disabled');
   if (q) {
@@ -112,8 +109,7 @@ function applyFilters() {
   renderUsers(list, _allUsers.length);
 }
 
-// 読込中・読込失敗のままフィルター操作をすると、空のまま／古い _allUsers のまま誤描画する
-// ため、読込中に無効化し成功時だけ再有効化する（失敗表示のままでは無効のまま＝誤描画を防ぐ）。
+// 読込中はフィルターを無効化し、成功時だけ再有効化する（空のまま・古い _allUsers のまま誤描画しないため）。
 function setFiltersEnabled(enabled) {
   const q = $('f-q'), s = $('f-status');
   if (q) q.disabled = !enabled;
@@ -177,13 +173,42 @@ $('nu-submit').addEventListener('click', async () => {
   }
 });
 
+// ===== CSV で一括追加 =====
+$('csv-submit').addEventListener('click', async () => {
+  const errEl = $('csv-err');
+  errEl.textContent = '';
+  const f = $('csv-file').files[0];
+  if (!f) { errEl.textContent = 'CSV ファイルを選んでください'; return; }
+  const fd = new FormData();
+  fd.append('file', f, f.name);
+  setButtonLoading($('csv-submit'), true, '取り込む', '取り込み中...');
+  try {
+    const r = await fetch('/admin/users/import', { method: 'POST', body: fd });
+    let d = null;
+    try { d = await r.json(); } catch (_) {}
+    if (r.ok) {
+      $('csv-file').value = '';
+      toast(`${d.created} 人を追加しました`);
+      await loadUsers();
+    } else if (d && Array.isArray(d.errors)) {
+      errEl.innerHTML = '<div>次の行を直してください（誰も追加されていません）</div><ul>' +
+        d.errors.map((e) => `<li>${esc(String(e.line))} 行目${e.uid ? `（${esc(e.uid)}）` : ''}: ${esc(e.reason)}</li>`).join('') + '</ul>';
+    } else {
+      errEl.textContent = (d && (d.detail || d.message)) || `エラー (${r.status})`;
+    }
+  } catch (e) {
+    errEl.textContent = '通信に失敗しました: ' + String(e);
+  } finally {
+    setButtonLoading($('csv-submit'), false, '取り込む', '取り込み中...');
+  }
+});
+
 // ===== 編集ダイアログ =====
 function closeEditDialog() {
   $('edit-overlay').hidden = true;
 }
 
-// ダイアログを開いた時点の値（表示名は null も '' に正規化して保持）。保存時にここと比較し、
-// 実際に変わったキーだけを PATCH へ送る（無編集の再送を偽の変更として監査させないため）。
+// ダイアログを開いた時点の値。保存時にここと比較し、実際に変わったキーだけを PATCH へ送る。
 let _editOriginal = null;
 
 function openEditDialog(uid, role, status, displayName) {
@@ -192,9 +217,7 @@ function openEditDialog(uid, role, status, displayName) {
   $('edit-name').value = normName;
   $('edit-role').value = role;
   const statusSel = $('edit-status');
-  // 「保留（現状のまま）」は元状態が pending のユーザーだけに表示・選択可能にする（他の状態の
-  // ユーザーが誤って pending を選び 422（実 API は active/disabled のみ許可）になるのを防ぐ・
-  // 選択肢は編集ごとに openEditDialog が張り替えるので他ユーザーの編集に残留しない）。
+  // 「保留（現状のまま）」は元状態が pending のユーザーだけに表示・選択可能にする（実 API は active/disabled のみ許可）。
   let pendingOpt = statusSel.querySelector('option[value="pending"]');
   if (status === 'pending') {
     if (!pendingOpt) {
@@ -226,11 +249,7 @@ $('edit-submit').addEventListener('click', async () => {
     const charsetError = passwordCharsetError(password);
     if (charsetError) { errEl.textContent = charsetError; return; }
   }
-  // 実際に変わったキーだけを送る。表示名はまず raw（前後空白を保ったまま）で元値と比較し、
-  // 触っていなければ前後空白があっても「変更なし」にする（trim 後の値同士で比較すると、
-  // 前後空白付きの元値を無編集で保存しただけで trim 済みへの「変更」が誤発生する）。
-  // 実際に入力が変わっていた場合だけ、送る値は trim する（空文字への変更も含む＝
-  // サーバ契約で表示名を「消す」）。
+  // 実際に変わったキーだけを送る。表示名は raw（前後空白を保ったまま）で元値と比較し、変わっていた場合だけ trim して送る（空文字への変更はサーバ契約で表示名を「消す」）。
   const patch = {};
   if (_editOriginal) {
     if (displayNameRaw !== _editOriginal.display_name) patch.display_name = displayNameRaw.trim();
@@ -247,8 +266,7 @@ $('edit-submit').addEventListener('click', async () => {
   try {
     await api('PATCH', `/admin/users/${encodeURIComponent(uid)}`, patch);
     closeEditDialog();
-    // 無効化した行は既定フィルター（有効のみ）で一覧から消える＝削除と誤認されないよう明示する
-    // （フィルターは自動で切り替えない・利用者が「すべて」/「無効のみ」で自分で確認する）。
+    // 無効化した行は既定フィルターで一覧から消えるため、削除と誤認されないよう明示する（フィルターは自動で切り替えない）。
     toast(disabling ? '無効化しました。『すべて』または『無効のみ』で確認できます' : '変更しました');
     await loadUsers();
   } catch (e) {

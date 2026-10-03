@@ -1,11 +1,10 @@
-"""同時実行上限（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）の env 解析、および
+"""同時実行上限のコード既定（`chat_turns.MAX_TURNS_PER_USER`／`MAX_TURNS_GLOBAL`）、および
 管理画面（`system_settings`）が優先する実効値解決 `chat_turns.effective_limits()` の検証。
 
-範囲外・非整数は既定へ戻す（黙って無制限や 0 にしない）。定数は import 時に決まるため、
-解析関数 `_env_int` を直接検証する（`_ai_env_isolation` が両 env を隔離する前提）。
+範囲外・非整数の保存値は既定へ戻す（黙って無制限や 0 にしない）。
 `effective_limits()` は `store.get_system_settings()` を monkeypatch して DB 値あり／なし／不正／
 DB 不達／`None` 返り値の5パターンを検証する（`tests/unit/test_agentic_search.py` の BUDGET-1 段
-（settings > env）テストと同型）。加えて、`effective_limits()`（DB 読み取りを伴いうる）が
+（settings > コード既定）テストと同型）。加えて、`effective_limits()`（DB 読み取りを伴いうる）が
 `chat_turns.start_turn` の `_REGISTRY_LOCK` 取得前に解決されること（ロック保持中に DB を
 読まないこと）をスレッドで固定する。
 """
@@ -20,35 +19,11 @@ from sherpa import chat_turns as CT  # noqa: E402
 from sherpa import store  # noqa: E402
 
 
-def test_defaults_when_unset(monkeypatch):
-    monkeypatch.delenv("SHERPA_CHAT_MAX_TURNS_PER_USER", raising=False)
-    monkeypatch.delenv("SHERPA_CHAT_MAX_TURNS_GLOBAL", raising=False)
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_PER_USER", 2, 1, 16) == 2
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_GLOBAL", 8, 1, 64) == 8
+def test_module_constants_are_the_code_defaults():
+    assert (CT.MAX_TURNS_PER_USER, CT.MAX_TURNS_GLOBAL) == (2, 8)
 
 
-def test_valid_values_are_used(monkeypatch):
-    monkeypatch.setenv("SHERPA_CHAT_MAX_TURNS_PER_USER", "4")
-    monkeypatch.setenv("SHERPA_CHAT_MAX_TURNS_GLOBAL", "20")
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_PER_USER", 2, 1, 16) == 4
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_GLOBAL", 8, 1, 64) == 20
-
-
-def test_out_of_range_and_garbage_fall_back(monkeypatch):
-    monkeypatch.setenv("SHERPA_CHAT_MAX_TURNS_PER_USER", "0")       # 0＝受付不能は許さない
-    monkeypatch.setenv("SHERPA_CHAT_MAX_TURNS_GLOBAL", "abc")
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_PER_USER", 2, 1, 16) == 2
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_GLOBAL", 8, 1, 64) == 8
-    monkeypatch.setenv("SHERPA_CHAT_MAX_TURNS_GLOBAL", "999")       # 上限超過も既定へ
-    assert CT._env_int("SHERPA_CHAT_MAX_TURNS_GLOBAL", 8, 1, 64) == 8
-
-
-def test_module_constants_are_within_range():
-    assert 1 <= CT.MAX_TURNS_PER_USER <= 16
-    assert 1 <= CT.MAX_TURNS_GLOBAL <= 64
-
-
-# ===== effective_limits(): system_settings（管理画面）> env の2段解決 =====
+# ===== effective_limits(): system_settings（管理画面）> コード既定の2段解決 =====
 
 def test_effective_limits_falls_back_to_module_constants_when_settings_unset(monkeypatch):
     monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
@@ -64,7 +39,7 @@ def test_effective_limits_settings_overrides_module_constants(monkeypatch):
 
 
 def test_effective_limits_settings_out_of_range_falls_back(monkeypatch):
-    """範囲外（1〜16／1〜64 外）・非整数の保存値は「不正な保存値」として env 既定へ倒す
+    """範囲外（1〜16／1〜64 外）・非整数の保存値は「不正な保存値」として コード既定へ倒す
     （fail-safe・PUT 側の Field(ge,le) を通常はすり抜けないが、DB 直接編集等の破損値でも
     落ちないことを固定する）。"""
     monkeypatch.setattr(CT, "MAX_TURNS_PER_USER", 2)
@@ -90,7 +65,7 @@ def test_effective_limits_settings_read_failure_falls_back(monkeypatch):
 
 def test_effective_limits_settings_none_return_falls_back(monkeypatch):
     """`store.get_system_settings()` は契約上 `None` を返すこともあり得る（例外を送出せず
-    そのまま返る場合）——`sysset.get(...)` が `AttributeError` で落ちずに env 既定へ倒すことを
+    そのまま返る場合）——`sysset.get(...)` が `AttributeError` で落ちずに コード既定へ倒すことを
     固定する（`depth_profile.effective_base` の `(system_settings or {}).get(...)` と同じ
     fail-open）。"""
     monkeypatch.setattr(CT, "MAX_TURNS_PER_USER", 2)

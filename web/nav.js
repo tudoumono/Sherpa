@@ -15,26 +15,17 @@
   const USER_LINKS = [
     ['workspace.html', 'マイワークスペース'],
   ];
-  // admin 専用リンク（役割が admin のときのみ表示）。S1（2026-07-08-設定分離とUI整備.md）:
-  // 個別の管理系リンク（ユーザー管理/監査/利用統計/状態）は「システム管理」（admin-settings.html）に
-  // 入口を集約した。admin-settings.html 内の管理メニューから各画面へ遷移する（右上ナビは2項に整理）。
-  // 「資料」（W1・2026-09-03）: 資料フォルダの登録・更新・削除・グラフ生成に加え、下段の取り込み
-  // 状況（`/ingest/preview`）・全文検索（`/admin/es/search`）も含め、この画面の全データ取得が
-  // 既に admin 限定（`_require_admin`）——一般ユーザーには開いても何も表示できない。
-  // 「ナレッジグラフ」（CLEAN-1・2026-09-03・W1 の残・同型是正）: `/graph`・`/graph/facets`・
-  // `/graph/search`・`POST /graph/ask` は既に admin 限定（`_require_admin`）だが、画面は一般
-  // ユーザーへナビ表示され、開いても何も出ない不整合があった。ingest.html（W1）と同じ手当て。
+  // admin 専用リンク（役割が admin のときのみ表示）。個別の管理系リンク（ユーザー管理/監査/利用統計/状態）は「システム管理」（admin-settings.html）に入口を集約している（右上ナビは2項）。
+  // 「資料」「ナレッジグラフ」は画面の全データ取得が admin 限定 API のため、一般ユーザーにはナビ表示しない。
   const ADMIN_LINKS = [
     ['ingest.html', '資料'],
     ['graph.html', 'ナレッジグラフ'],
     ['admin-settings.html', 'システム管理'],
   ];
 
-  // バックエンド健全性の状態ドット用ポーリング間隔（ms）。非表示タブは Sherpa.visibilityInterval
-  // が自動で止める（性能台帳 QW4）ので、可視タブの定常負荷を下げるためここは長めにしてよい。
+  // バックエンド健全性の状態ドット用ポーリング間隔（ms）。非表示タブは Sherpa.visibilityInterval が自動で止めるため、ここは長めでよい。
   const HEALTH_POLL_MS = 45000;
-  // 背景実行チャットターン（覗き窓方式・docs/proposals/2026-07-03-チャット背景実行.md）の「実行中」表示の
-  // ポーリング間隔（ms）。非表示タブは止まる前提（同上）で 45〜60秒でも十分（proposal §4）。
+  // 背景実行チャットターンの「実行中」表示のポーリング間隔（ms）。非表示タブは止まるため 45〜60秒でも十分。
   const TURNS_POLL_MS = 45000;
   // connectedCallback が複数回走っても visibilityInterval（内部の setInterval・
   // visibilitychange リスナー）が重複しないよう、モジュールスコープで保持。
@@ -125,8 +116,7 @@
         + '<div class="um-note" id="um-note" hidden>認証は無効です（開発モード）</div>'
         + '</div></div>';
 
-      // ユーザードロップダウン（全ページ共通・UIフィードバック 2026-07-03）。
-      // 開閉は #topbar-user クリックでトグル、外側クリック／Escape で閉じる（.brainmenu と同じ流儀＋a11y追加）。
+      // ユーザードロップダウン（全ページ共通）。開閉は #topbar-user クリックでトグル、外側クリック／Escape で閉じる（.brainmenu と同じ流儀＋a11y追加）。
       const userBtn = document.getElementById('topbar-user');
       const userMenu = document.getElementById('usermenu');
       const closeUserMenu = () => {
@@ -156,10 +146,8 @@
         });
         navMenu.addEventListener('click', (e) => e.stopPropagation());
       }
-      // RV再検証 LOW: document への委譲リスナーは要素（#userwrap 等）の生死と無関係に残るため、
-      // connectedCallback が複数回走っても重複登録しないよう、ハンドラをインスタンスに保持して
-      // 使い回す（初回だけ生成・以降は remove→add で必ず1本にする）。ハンドラ本体は呼び出し時に
-      // 都度 document.getElementById する（closure で古い DOM 参照を握らない＝再構築後も正しく動く）。
+      // document への委譲リスナーは要素の生死と無関係に残るため、connectedCallback が複数回走っても重複しないよう、ハンドラをインスタンスに保持して使い回す（remove→add で必ず1本にする）。
+      // ハンドラ本体は呼び出し時に都度 document.getElementById する（古い DOM 参照を握らない）。
       if (!this._onDocClick) {
         this._onDocClick = (e) => {
           if (!e.target.closest('#userwrap')) closeUserMenu();
@@ -214,10 +202,8 @@
         } catch (_) { /* 既定の change-password.html のまま */ }
       }
 
-      // バックエンド健全性の状態ドット（即時＋定期ポーリング）。/auth/me の成否とは独立に開始する
-      // （Postgres 停止時は /auth/me 自体が失敗しうるため、それに依存すると一番赤にしたい場面で
-      // ドットが出なくなる）。401（未ログイン）だけソフトに無視（ドットは hidden のまま＝
-      // ログイン画面では出さない）。それ以外の非 2xx・fetch 失敗は down として表示する。
+      // バックエンド健全性の状態ドット（即時＋定期ポーリング）。/auth/me の成否とは独立に開始する（Postgres 停止時は /auth/me 自体が失敗しうるため）。
+      // 401（未ログイン）だけ無視する（ドットは hidden のまま）。それ以外の非 2xx・fetch 失敗は down として表示する。
       const dot = document.getElementById('healthdot');
       let pollHealth = null;
       if (dot) {
@@ -242,7 +228,7 @@
         pollHealth = () => {
           fetch('/health/summary')
             .then((r) => {
-              if (r.status === 401) return null;   // 未ログイン（従来どおり無視）
+              if (r.status === 401) return null;   // 未ログインは無視
               if (r.ok) return r.json();
               return { status: 'down' };            // 非 2xx（認証DB到達不可等）
             })
@@ -254,10 +240,8 @@
         _healthTimer = Sherpa.visibilityInterval(pollHealth, HEALTH_POLL_MS);
       }
 
-      // 背景実行チャットターン（覗き窓方式）の「実行中」表示（即時＋定期ポーリング・全ページ共通）。
-      // GET /chat/turns/running はログイン必須のため、未ログイン（401）・fetch 失敗はどちらも
-      // 「実行中なし」としてソフトに無視する（healthdot と異なりエラー状態を可視化する必要はない＝
-      // 単に「今は無い」でよい）。クリックで該当会話（先頭のターン）を開く。
+      // 背景実行チャットターンの「実行中」表示（即時＋定期ポーリング・全ページ共通）。GET /chat/turns/running はログイン必須のため、未ログイン（401）・fetch 失敗はどちらも「実行中なし」として無視する。
+      // クリックで該当会話（先頭のターン）を開く。
       const notice = document.getElementById('turnnotice');
       if (notice) {
         const applyTurns = (d) => {
@@ -345,7 +329,7 @@
         if (pollHealth) pollHealth();
       }).catch(() => { /* auth 無効・ネットワーク障害でも問題なし（ドットのポーリングは継続） */ });
     }
-    // RV再検証 LOW: 要素が DOM から外れたら document への委譲リスナーも解除する（残留防止）。
+    // 要素が DOM から外れたら document への委譲リスナーも解除する（残留防止）。
     disconnectedCallback() {
       if (this._onDocClick) document.removeEventListener('click', this._onDocClick);
       if (this._onDocKeydown) document.removeEventListener('keydown', this._onDocKeydown);

@@ -340,8 +340,12 @@ def pytest_sessionfinish(session, exitstatus):   # noqa: ARG001 (pytest hook シ
 
 _setup_test_pg_dsn()
 
+import _det_provider  # noqa: E402 (DSN 確定後に sherpa を import する)
+
+_det_provider.install()
+
 # tests/ 直下のサブディレクトリ名＝マーカー名。
-_MARKER_DIRS = {"unit", "api", "contract", "integration", "e2e", "e2e_live"}
+_MARKER_DIRS = {"unit", "api", "contract", "integration", "e2e"}
 
 
 def pytest_collection_modifyitems(config, items):

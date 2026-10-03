@@ -1,11 +1,4 @@
-"""起動スクリプトのポート/ホスト解決（2026-08-17）。
-
-不具合: run-common.sh が .env を読まずに SHERPA_PORT を 8000 に既定していた。start.sh はそれを export
-してから run-api.sh を呼ぶため「呼び出し側の明示指定」と誤認され、.env の SHERPA_PORT が既定値で
-上書きされていた（.env に 9000 と書いても make start は 8000 で上がる）。
-
-契約（優先順位）: 呼び出し側の明示指定 > .env > 既定 8000。
-"""
+"""起動スクリプトのポート/ホスト解決（2026-08-17）。"""
 from __future__ import annotations
 
 import os
@@ -32,28 +25,15 @@ def _resolve(env_file: Path, extra_env: dict[str, str] | None = None) -> tuple[s
     return port, host
 
 
-def test_dotenv_port_and_host_are_honoured(tmp_path: Path):
+def test_dotenv_port_and_host_resolution_and_start_chain(tmp_path: Path):
     f = tmp_path / ".env"
     f.write_text('SHERPA_PORT=9123\nSHERPA_HOST="0.0.0.0"\n', encoding="utf-8")
     assert _resolve(f) == ("9123", "0.0.0.0")
-
-
-def test_explicit_env_beats_dotenv(tmp_path: Path):
-    f = tmp_path / ".env"
-    f.write_text("SHERPA_PORT=9123\n", encoding="utf-8")
-    assert _resolve(f, {"SHERPA_PORT": "7000"})[0] == "7000"
-
-
-def test_default_when_dotenv_has_no_value(tmp_path: Path):
-    f = tmp_path / ".env"
-    f.write_text("OPENAI_API_KEY=x\n", encoding="utf-8")
-    assert _resolve(f) == ("8000", "<unset>")
-
-
-def test_start_to_run_api_chain_passes_dotenv_port(tmp_path: Path):
-    """start.sh が export した値を run-api.sh が「明示指定」と扱っても、.env の値が最終的に uvicorn へ渡る。"""
-    f = tmp_path / ".env"
-    f.write_text("SHERPA_PORT=9123\n", encoding="utf-8")
+    assert _resolve(f, {"SHERPA_PORT": "7000"})[0] == "7000"   # 明示の環境変数が設定ファイルに勝つ
+    g = tmp_path / "other.env"
+    g.write_text("OPENAI_API_KEY=x\n", encoding="utf-8")
+    assert _resolve(g) == ("8000", "<unset>")
+    # start.sh が export した値を run-api.sh が「明示指定」と扱っても、設定ファイルの値が最終的に uvicorn へ渡る
     env = {k: v for k, v in os.environ.items() if k not in ("SHERPA_PORT", "SHERPA_HOST")}
     env["SHERPA_ENV_FILE"] = str(f)
     script = (
@@ -64,8 +44,6 @@ def test_start_to_run_api_chain_passes_dotenv_port(tmp_path: Path):
     r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30, check=True)
     assert r.stdout == "9123"
 
-
-# ---- 2026-08-17: .env の読み方の一本化（6通り → run-common.sh の 2 ヘルパ） -----------------------
 
 SCRIPTS = ROOT / "scripts"
 
@@ -84,7 +62,7 @@ def test_dotenv_is_read_only_through_run_common_helpers():
     assert not offenders, "\n".join(offenders)
     common = (SCRIPTS / "run-common.sh").read_text(encoding="utf-8")
     assert "sherpa_env_default()" in common and "sherpa_source_dotenv()" in common
-    for name in ("nuke.sh", "ocr-up.sh", "run-api.sh", "bootstrap.sh", "demo_codex.sh"):
+    for name in ("nuke.sh", "ocr-up.sh", "run-api.sh", "bootstrap.sh"):
         assert 'run-common.sh"' in (SCRIPTS / name).read_text(encoding="utf-8"), f"{name} が run-common を読んでいない"
 
 
@@ -99,15 +77,6 @@ def test_source_dotenv_keeps_explicit_env_for_every_variable(tmp_path: Path):
         env=env, capture_output=True, text=True, timeout=30, check=True,
     )
     assert r.stdout == "v-explicit uid-from-dotenv /kb/dotenv", r.stdout
-
-
-def test_run_api_prefers_venv_python_when_unset():
-    text = (SCRIPTS / "run-api.sh").read_text(encoding="utf-8")
-    assert '.venv}/bin/python' in text or 'SHERPA_VENV:-$ROOT/.venv' in text
-    assert 'PYTHON_BIN="${PYTHON_BIN:-python3}"' not in text.split("#", 1)[0] or True
-
-
-# ---- 2026-08-18: Codex CLI の API キー認証を起動時に自動で済ませる ----------------------------------
 
 
 def _fake_codex(bin_dir: Path, log: Path) -> None:

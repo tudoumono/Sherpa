@@ -1,7 +1,8 @@
-"""隔離PaddleOCR workerの実行契約。
+"""隔離 PaddleOCR worker の実行契約。公開済み Canonical generation に紐づく DB job だけを処理する。
 
-Paddleはlazy importし、固定version・固定model hashがoffline cacheに揃わない限り起動しない。
-このmoduleは既存MD変換armから呼ばず、公開済みCanonical generationに紐づくDB jobだけを処理する。
+Paddle は lazy import し、固定 version・固定 model hash が offline cache に揃わない限り起動しない。
+既存の MD 変換 arm からは呼ばない。
+設計: docs/design/rag.md「OCR（非同期・隔離ワーカー）」
 """
 from __future__ import annotations
 
@@ -49,8 +50,7 @@ class PaddleCPUProfile:
     device: str = "cpu"
     enable_mkldnn: bool = False
     detection_model: str = "PP-OCRv6_medium_det"
-    # 2026-08-16 再ロック: 取得メタデータ（`.cache/`）を除いたmodel本体だけのtree hash。
-    # 旧値（e597…/1de1…）は`.cache/`込みで、再downloadのたびに変わるため再現しなかった。
+    # model 本体だけの tree hash（取得メタデータ `.cache/` は除く）
     detection_model_tree_sha256: str = "f74ebd70d463d5fe627dd1d0d235bc5097acda0ff1c05f527c363054bd6975ee"
     recognition_model: str = "PP-OCRv6_medium_rec"
     recognition_model_tree_sha256: str = "a0e6515f7e4c2745c07de72ffa867836f68a7aec988989754b8afb0d019bf3db"
@@ -88,9 +88,7 @@ def _default_cache_home() -> Path:
     return Path(configured) if configured else Path.home() / ".paddlex"
 
 
-# downloaderが書く取得メタデータ（取得時刻・etag・lock）。model本体ではなく取得のたびに変わるため、
-# 同一modelでもtree hashが一致しなくなる（2026-08-16実測: 同一modelで file_count=18・1バイト差・
-# 精度は完全一致なのにhash不一致で `model_hash_mismatch` 起動拒否）。hashはmodel本体だけを対象にする。
+# downloader が書く取得メタデータ（取得時刻・etag・lock）は取得のたびに変わるため、tree hash には含めず model 本体だけを対象にする
 _VOLATILE_CACHE_DIRS = frozenset({".cache"})
 
 
@@ -180,7 +178,7 @@ def _paddle_availability_cached(cache_home_value: str) -> OCRAvailability:
 
 
 def paddle_availability(cache_home: Path | None = None) -> OCRAvailability:
-    """依存versionとoffline model hashを検査する。modelをdownloadしない。"""
+    """依存 version と offline model hash を検査する（model は download しない）。"""
     selected = (cache_home or _default_cache_home()).expanduser().resolve()
     return _paddle_availability_cached(str(selected))
 
@@ -250,7 +248,7 @@ class OCRStoppingError(OCRWorkerError):
 
 
 class OCRLeaseLostError(RuntimeError):
-    """leaseを失った推論結果をcache/jobへ書かないための内部制御例外。"""
+    """lease を失った推論結果を cache/job へ書かないための内部制御例外。"""
 
 
 def _never_stop() -> bool:
@@ -270,9 +268,7 @@ def _paddle_bbox(box: Any) -> list[float]:
 
 
 
-# PaddleOCR は入力ファイルの**拡張子**で形式を判定する（対応外の拡張子は中身を見ずに拒否する）。
-# 一時ファイルの拡張子は media_type から Paddle が受理する拡張子へ写像し、未知（`application/octet-stream`
-# 等）は `.png` に倒す——Paddle は拡張子を通した後は中身を見て読むため、実体が対応形式なら処理できる。
+# PaddleOCR は入力ファイルの拡張子で形式を判定する。一時ファイルの拡張子は media_type から Paddle が受理するものへ写像し、未知は `.png` にする
 _PADDLE_SUFFIX_BY_MEDIA_TYPE = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/bmp": ".bmp", "image/x-ms-bmp": ".bmp",
     "image/webp": ".webp", "image/tiff": ".tiff", "image/x-portable-bitmap": ".pbm",
@@ -286,7 +282,7 @@ def _paddle_input_suffix(media_type: str) -> str:
 
 
 class PaddleOCREngine:
-    """offline cache検証後だけ初期化できる固定CPU PaddleOCR adapter。"""
+    """offline cache 検証後だけ初期化できる固定 CPU PaddleOCR adapter。"""
 
     engine_profile_hash = profile_hash()
     model_revision = profile_hash()
@@ -332,7 +328,7 @@ class PaddleOCREngine:
             raise ValueError("PaddleOCR result arrays differ in length")
         lines = []
         for index, (text, score, box) in enumerate(zip(texts, scores, boxes, strict=True)):
-            # 識別子や空白を勝手に直さず、engine出力の文字列をそのまま保存する。
+            # 識別子や空白を直さず、engine 出力の文字列をそのまま保存する
             raw_text = str(text)
             if not raw_text.strip():
                 continue
@@ -343,7 +339,7 @@ class PaddleOCREngine:
 
 
 def _paddle_inference_child(cache_home: str, request_queue: Any, response_queue: Any) -> None:
-    """Paddle runtimeをFastAPI/worker supervisorから隔離する永続child process。"""
+    """Paddle runtime を FastAPI/worker supervisor から隔離する永続 child process。"""
     try:
         engine = PaddleOCREngine(Path(cache_home))
     except BaseException as exc:
@@ -361,15 +357,14 @@ def _paddle_inference_child(cache_home: str, request_queue: Any, response_queue:
         except MemoryError:
             response_queue.put({"kind": "oom", "request_id": request_id})
         except BaseException as exc:
-            # 原本文字列やengine messageをIPC/error logへ搬送しない。分類に必要な型名だけを返す。
+            # 原本文字列や engine message を IPC/error log へ運ばず、分類に必要な型名だけを返す
             response_queue.put({"kind": "error", "request_id": request_id, "error_type": exc.__class__.__name__})
 
 
 class PaddleProcessSupervisor:
-    """Paddle推論を停止可能なchild processへ閉じ込める1-concurrency supervisor。
+    """Paddle 推論を停止可能な child process に閉じ込める1-concurrency supervisor。
 
-    childはmodelを一度だけloadして複数jobで再利用する。timeout、lease喪失、SIGTERM時はchildを
-    terminate/killし、hangしたnative runtimeをworker本体から切り離す。
+    child は model を一度だけ load して複数 job で再利用する。timeout・lease 喪失・SIGTERM 時は child を terminate/kill する。
     """
 
     engine_profile_hash = profile_hash()
@@ -410,7 +405,7 @@ class PaddleProcessSupervisor:
         if process.is_alive():
             process.terminate()
             process.join(timeout=3)
-        if process.is_alive():  # native runtimeがSIGTERMを握り潰した場合の最終境界
+        if process.is_alive():  # SIGTERM を握り潰した場合の最終境界
             process.kill()
             process.join(timeout=3)
 
@@ -427,8 +422,7 @@ class PaddleProcessSupervisor:
         for channel in (self._requests, self._responses):
             if channel is not None:
                 try:
-                    # timeoutでchildをkillした直後、巨大image bytesをpipeへflush中のfeeder threadを
-                    # joinすると停止処理自体がhangし得る。未送信IPCは破棄してsupervisorを優先する。
+                    # kill 直後は、未送信 IPC を破棄して supervisor を優先する（feeder thread の join で停止が hang しうる）
                     channel.cancel_join_thread()
                     channel.close()
                 except (AttributeError, ValueError):
@@ -479,13 +473,13 @@ class PaddleProcessSupervisor:
                     f"Paddle inference failed ({response.get('error_type', 'unknown')})"
                 )
         except BaseException:
-            # timeout/lease喪失/stopping時も、推論が裏で継続してCPUや原本bytesを保持しないよう必ず停止する。
+            # timeout/lease 喪失/stopping 時は推論を必ず止める（CPU や原本 bytes を保持し続けないため）
             self._terminate()
             self.close()
             raise
 
     def predict(self, image_bytes: bytes, *, media_type: str) -> OCRPrediction:
-        """Protocol互換。製品run_onceはpredict_monitoredを使う。"""
+        """Protocol 互換。製品の `run_once` は `predict_monitored` を使う。"""
         return self.predict_monitored(
             image_bytes,
             media_type=media_type,
@@ -543,7 +537,7 @@ def _source_hash(
     expected_hash: str | None = None,
     on_progress: Callable[[], None] | None = None,
 ) -> str:
-    """同じread-only原本をjobごとに全量再読しない、有界かつstat拘束済みhash。"""
+    """同じ read-only 原本を job ごとに全量再読しない、有界かつ stat 拘束済みの hash。"""
     resolved, identity = _source_identity(path)
     cache_key = (*identity, expected_hash or "")
     with _SOURCE_HASH_CACHE_LOCK:
@@ -569,7 +563,7 @@ def _source_hash(
 
 
 def _clear_source_hash_cache() -> None:
-    """test/process lifecycle用。通常workerではLRU evictionへ任せる。"""
+    """test/process lifecycle 用。通常の worker は LRU eviction に任せる。"""
     with _SOURCE_HASH_CACHE_LOCK:
         _SOURCE_HASH_CACHE.clear()
 
@@ -647,7 +641,7 @@ def _render_pdf_page(source_path: Path, render_profile: dict[str, Any]) -> bytes
     if not isinstance(page_number, int) or page_number <= 0:
         raise OCRBindingError("invalid PDF page number")
     resolved, identity = _source_identity(source_path)
-    # worker concurrency=1が既定だが、lock内でpage/bitmapまで閉じて将来の並行呼出しにも備える。
+    # lock 内で page/bitmap まで閉じる（並行呼出しにも備える）
     with _PDF_DOCUMENT_CACHE_LOCK:
         if _PDF_DOCUMENT_CACHE_KEY != identity:
             if _PDF_DOCUMENT_CACHE is not None:
@@ -686,7 +680,7 @@ def prepare_input(
     asset_root: Path,
     on_progress: Callable[[], None] | None = None,
 ) -> PreparedOCRInput:
-    """source/assetをread-onlyで再hashし、workerへ渡す画素bytesを固定する。"""
+    """source/asset を read-only で再 hash し、worker へ渡す画素 bytes を固定する。"""
     expected_source_hash = str(job["source_content_hash"])
     if _source_hash(
         source_path, expected_hash=expected_source_hash, on_progress=on_progress,
@@ -726,14 +720,9 @@ def build_observation_set(
     canonical_generation_id: str,
     engine: OCREngine,
 ) -> ai_observation.AIObservationSet:
-    """Paddle行をocr_textの検索可Observation Setへ固定する。
+    """Paddle の行を `ocr_text` の検索可能な Observation Set に固定する。
 
-    `use_for_answer`（O1）: 行ごとの実測 confidence が既存の使用可否ルール
-    （`ai_observation.MIN_ANSWER_CONFIDENCE`＝VLM も従う同じ閾値）以上なら True にする。
-    以前は常に False（rag.md へは出さず `observation_render` の検索専用成果物にだけ載せる設計）
-    だったが、OCR も rag.md の「AI観測」レコード（`evidence_render._ai_observation_records`）へ
-    統合する今は、この既存ルールを他アームと同じに適用しないと OCR 観測が rag.md に一切出ない
-    （新しい閾値は作らない・既存ルールをそのまま OCR にも適用するだけ）。
+    `use_for_answer` は、行ごとの実測 confidence が `ai_observation.MIN_ANSWER_CONFIDENCE`（VLM と同じ閾値）以上のとき True にする。
     """
     payload = prediction.to_payload()
     return ai_observation.build(
@@ -834,8 +823,7 @@ def _predict_with_monitor(
             timeout_seconds=timeout_seconds,
             on_tick=monitor.tick,
         )
-    # Fake/custom engines retain the original small synchronous protocol. Production Paddle always uses
-    # PaddleProcessSupervisor above, so the elapsed check is not its timeout boundary.
+    # Fake/custom engine は小さな同期 protocol のまま。本番の Paddle は常に `PaddleProcessSupervisor` を使う
     started = time.monotonic()
     prediction = engine.predict(prepared.image_bytes, media_type=prepared.media_type)
     if time.monotonic() - started > timeout_seconds:
@@ -871,7 +859,7 @@ def run_once(
     heartbeat: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] = _never_stop,
 ) -> WorkerResult:
-    """queueを1件処理する。Canonical生成・RAG登録の成功状態は変更しない。"""
+    """queue を1件処理する。Canonical 生成・RAG 登録の成功状態は変更しない。"""
     if inference_timeout_seconds <= 0 or lease_seconds <= 0:
         raise ValueError("inference timeout and lease TTL must be positive")
     if lease_renew_interval_seconds <= 0 or lease_renew_interval_seconds >= lease_seconds:
@@ -899,9 +887,7 @@ def run_once(
         decision = ocr_router.OCRRouteDecision(**job["route_input"])
         if decision.status != "selected":
             raise OCRBindingError("leased route is not selected")
-        # 更新前に投入された秘匿名ジョブを本文読み取り前に対象外化する（`load_ir`／`prepare_input`
-        # は本文を読む——`text_kind.is_sensitive_doc_id` 集約点・台帳 #92）。再試行せず、
-        # 失敗件数にも数えない。
+        # 更新前に投入された秘匿名ジョブは、本文を読む前に対象外にする（再試行せず失敗件数にも数えない）
         if text_kind.is_sensitive_doc_id(job["source_rel_path"]):
             _log.warning(
                 "ocr_worker: 秘匿名のためOCRジョブを対象外にしました（ext=%s）",
@@ -923,7 +909,7 @@ def run_once(
             prediction = _predict_with_monitor(
                 engine, prepared, timeout_seconds=inference_timeout_seconds, monitor=monitor,
             )
-            # Leaseを失ったworkerは共有cacheにも推論結果をcommitしない。
+            # lease を失った worker は共有 cache にも推論結果を commit しない
             monitor.tick(force=True)
             cached = ocr_jobs.put_cached_result_for_lease(
                 job_id,
@@ -955,7 +941,7 @@ def run_once(
         try:
             _publish_terminal_generation(completed, publish_observation, observation_set)
         except Exception:
-            # OCR結果はDBへ完了済み。別観測pointerの再構築はidle時に再試行できる。
+            # OCR 結果は DB へ完了済み。別観測 pointer の再構築は idle 時に再試行できる
             return WorkerResult(
                 status="publish_failed", job_id=job_id,
                 observation_set_hash=observation_set.observation_set_hash, error_code="artifact_publish_failed",
@@ -1038,7 +1024,7 @@ def _route_manifest_paths(
     after: str | None,
     on_directory: Callable[[], None],
 ):
-    """全pathをmemoryへ載せず、決定順でroute manifestをstreamする。"""
+    """全 path を memory へ載せず、決定順で route manifest を stream する。"""
     candidate_root = Path(generation_root)
     if candidate_root.is_symlink():
         raise OCRBindingError("Canonical generation root is invalid")
@@ -1074,7 +1060,7 @@ def run_refresh_once(
     heartbeat: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] = _never_stop,
 ) -> RefreshWorkerResult:
-    """1 refresh runをstream展開する。HTTP requestはこの走査を実行しない。"""
+    """1 refresh run を stream 展開する。HTTP request はこの走査を実行しない。"""
     if lease_seconds <= 0 or lease_renew_interval_seconds <= 0 or lease_renew_interval_seconds >= lease_seconds:
         raise ValueError("refresh lease interval must be shorter than the positive lease TTL")
     run = ocr_jobs.lease_refresh_run(worker_id, lease_seconds=lease_seconds)
@@ -1112,9 +1098,7 @@ def run_refresh_once(
             tick()
             source_rel_path = relative[: -len(".ocr_route.json")]
             if text_kind.is_sensitive_doc_id(source_rel_path):
-                # 更新前に投入された秘匿名の Evidence を読まずに除外する（`load_ir` 相当の
-                # 本文読み取り前・台帳 #92）。再投入しない——cursorは進めず、次回呼び出しでも
-                # 同じ判定で除外し続ける（安全側・害はない）。
+                # 更新前に投入された秘匿名の Evidence は、本文を読まずに除外する（再投入せず、次回も同じ判定で除外する）
                 _log.warning(
                     "ocr_worker: 秘匿名のためEvidenceを対象外にしました（ext=%s）",
                     Path(source_rel_path).suffix.lower(),
@@ -1203,7 +1187,7 @@ def garbage_collect_observation_generations(
     keep_current: int = 2,
     remove_noncurrent: bool = True,
 ) -> dict[str, int]:
-    """不変な観測generationを現行＋直前へ制限する。Canonical成果物には触れない。"""
+    """不変な観測 generation を現行＋直前に制限する。Canonical 成果物には触れない。"""
     if keep_current < 1:
         raise ValueError("at least one observation generation must be retained")
     active = active_canonical_generation_id.strip().lower()
@@ -1269,12 +1253,11 @@ def build_standard_publish_callback(
     load_ir: Callable[[dict[str, Any]], evidence_ir.EvidenceIR],
     on_published: Callable[[str, str], None] | None = None,
 ) -> Callable[[dict[str, Any], ai_observation.AIObservationSet | None], None]:
-    """全成功jobをsnapshot化して単一pointerへ公開し、任意の後処理を行うcallbackを返す。
+    """全成功 job を snapshot 化して単一 pointer へ公開し、任意の後処理を行う callback を返す。
 
-    ``on_published``はworld lock取得後にCanonical generationを再確認してから同じlock内で呼ぶ。
-    ESのdelete→create→bulkをrebind/Canonical公開と直列化し、待機中に世代が変わった旧callbackが
-    新索引を削除して旧状態を復活させないためである。失敗またはstale時はjobをartifact公開済みにしない。
-    snapshot/pointer自体は不変なため、現行世代ならidle時のself-repairが後処理を安全に再試行できる。
+    `on_published` は world lock 取得後に Canonical generation を再確認してから同じ lock 内で呼ぶ
+    （ES の delete→create→bulk を rebind/Canonical 公開と直列化し、旧 callback が新索引を壊さないため）。
+    失敗または stale のときは job を artifact 公開済みにしない。
     """
     def publish(job: dict[str, Any], _current_set: ai_observation.AIObservationSet | None) -> None:
         world = str(job["world"])
@@ -1288,8 +1271,7 @@ def build_standard_publish_callback(
                 world, canonical_generation_id, observation_render._relative_source_path,
             ):
                 source_rel = str(row["source_rel_path"])
-                # 更新前に成功した秘匿名ジョブ（credentials.png 等）の再公開経路。Evidence を読み直して
-                # 観測を保存しない（run_once の終端化を通らない succeeded 行はここでだけ除外できる）。
+                # 更新前に成功した秘匿名ジョブの再公開経路。Evidence を読み直さず観測を保存しない
                 if text_kind.is_sensitive_doc_id(source_rel):
                     _log.warning("ocr publish: 秘匿名のため再公開を対象外にしました（ext=%s）",
                                  Path(source_rel).suffix.lower())
@@ -1323,8 +1305,7 @@ def build_standard_publish_callback(
         )
         if result.get("status") == "published":
             with world_lock(world):
-                # observation pointer公開後、lock待ちの間にrebind/Canonical generation切替が完了し得る。
-                # stale callbackはESへ一切触れず、published markerも残さない。
+                # lock 待ちの間に rebind/Canonical generation 切替が完了しうる。stale callback は ES に触れず、published marker も残さない
                 if not canonical_is_current(world, canonical_generation_id):
                     return
                 if on_published is not None:
@@ -1361,13 +1342,12 @@ def _safe_world_file(root: Path, relative: str) -> Path:
 
 
 def _runtime_callbacks():
-    """製品worker CLI用のWorld/Canonical resolver。絶対pathをjob payloadへ保存しない。"""
+    """製品 worker CLI 用の World/Canonical resolver。絶対 path を job payload へ保存しない。"""
     from . import derived_generation
     from .. import worlds
 
-    # Direct CLI起動でもstart.shのmount検査に依存しない。DB障害を空registryへ縮退せず、
-    # writable observation rootがCanonicalまたは全登録World sourceと重なる場合、または明示した
-    # read-only source rootが全登録Worldを包含しない場合は起動を拒否する。
+    # Direct CLI 起動でも start.sh の mount 検査に依存しない。次のいずれかのときは起動を拒否する（DB 障害を空 registry に縮退しない）:
+    # writable observation root が Canonical または全登録 World source と重なる／明示した read-only source root が全登録 World を包含しない
     worlds.observation_dir("ocr-worker-validation", validate_registered=True)
     allowed_ocr_root = worlds.validate_ocr_registered_sources()
 
@@ -1387,7 +1367,7 @@ def _runtime_callbacks():
         return derived_generation.active_rag_dir(derived_root)
 
     def generation_root(world: str, generation_id: str) -> Path:
-        # `.ocr_route.json`/`.evidence.json` はいずれも ir 層（§8.1 三階層）に同居する。
+        # `.ocr_route.json`/`.evidence.json` はいずれも ir 層に置く
         derived_root = worlds.derived_dir(world)
         if derived_generation.active_generation_id(derived_root) != generation_id:
             raise OCRBindingError("Canonical generation is no longer active")
@@ -1401,7 +1381,7 @@ def _runtime_callbacks():
         root = worlds.world_dir(job["world"])
         if root is None:
             raise OCRBindingError("World source is unavailable")
-        # 起動後のregister/rebindやDB job改変に対しても、各jobの実読込直前に再検証する。
+        # 起動後の register/rebind や DB job 改変に備え、job の実読込の直前に再検証する
         try:
             worlds.validate_ocr_source_root(root, allowed_root=allowed_ocr_root)
         except ValueError as exc:
@@ -1412,18 +1392,11 @@ def _runtime_callbacks():
         return active_rag_root(job).joinpath(*Path(job["source_rel_path"] + ".assets").parts)
 
     def reindex_observations(world: str, canonical_generation_id: str) -> None:
-        # Canonical全再索引は行わない。世代の整合性だけを公開直後に再確認する。
+        # Canonical 全再索引は行わない。世代の整合性だけを公開直後に再確認する
         if not current(world, canonical_generation_id):
             raise OCRBindingError("Canonical generation changed before observation reindex")
-        # ocr_worker は ES・human_md マーカーの読み書きを一切行わない（隔離 profile では
-        # `/derived` が read-only・ES 自体も到達不可のネットワーク構成のため、ここで
-        # `es_index`/`.human_md_es_sig` に触れると通常の OCR 公開のたびに必ず失敗する）。
-        # O1（2026-09-03）以降、OCR 観測は VLM と合流して rag.md（正本）へ「AI観測」レコードとして
-        # 統合される（`office_md._build_observation_set`）——grep の観測専用ツリー直接走査は撤去済み
-        # （`grep_tool.grep_search` 参照）。この合流と ES 反映は、この隔離プロセスではなく通常の
-        # sync（`worker._refresh_derived_representations` の `.rag_sig` OCR 観測次元＝
-        # `office_md.rag_sig_drift`）が次回呼び出し時に「追いつき」として行う。ここでは Canonical
-        # 世代の整合性だけを公開直後に再確認し、それ以上は何もしない。
+        # ocr_worker は ES・human_md マーカーに触れない（隔離 profile では `/derived` が read-only で ES にも到達できない）。
+        # OCR 観測の rag.md への合流と ES 反映は、通常の sync（`worker._refresh_derived_representations` の `.rag_sig` OCR 観測次元）が行う
 
     publisher = build_standard_publish_callback(
         resolve_derived_root=lambda world: Path(worlds.observation_dir(world)),
@@ -1435,7 +1408,7 @@ def _runtime_callbacks():
 
 
 def main(argv: list[str] | None = None) -> int:
-    """隔離Compose profileから起動する1-concurrency worker loop。"""
+    """隔離 Compose profile から起動する1-concurrency worker loop。"""
     import argparse
 
     parser = argparse.ArgumentParser(description="Sherpa offline PaddleOCR observation worker")
@@ -1522,7 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if args.once:
                     return 0
-                # OCR自体は成功したがpointer公開だけ失敗した場合やworker再起動後も自己修復する。
+                # OCR 成功後に pointer 公開だけ失敗した場合や worker 再起動後も自己修復する
                 for candidate in ocr_jobs.list_unpublished_generations():
                     if current(candidate["world"], candidate["canonical_generation_id"]):
                         publisher(candidate, None)

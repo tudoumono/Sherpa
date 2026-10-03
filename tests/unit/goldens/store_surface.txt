@@ -1,6 +1,5 @@
 AnnouncementOrderError
 ClientOpIdConflictError
-DEFAULT_SYSTEM_PROMPT
 ForkNotAllowedError
 MAPPING_VERSION
 MESSAGE_FEEDBACK_COMMENT_MAX_LEN
@@ -17,7 +16,6 @@ UserApiKeysDisallowedError
 _ANNOUNCEMENT_FIELDS
 _AUDIT_CANON_FIELDS
 _AUDIT_CHAIN_LOCK
-_BEDROCK_VERIFIED_MODELS_MAX
 _JST
 _KB_ID
 _REDACTED_TEXT
@@ -36,7 +34,6 @@ _USAGE_TURN_CTE
 _audit_canonical
 _audit_entry_hash
 _audit_insert
-_bedrock_key_fingerprint
 _compute_conversation_turn_stats
 _compute_retention
 _connect
@@ -61,7 +58,6 @@ _usage_period_bounds
 _usage_tok
 _usage_token_sum_cols
 accept_share
-add_bedrock_verified_models
 add_ingest_run
 add_message
 add_usage_event
@@ -72,7 +68,6 @@ audit
 backfill_all
 backfill_doc_count
 backfill_manifest_and_doc_count
-catchup_ollama_allowlist_for_env_seeded_url_v2
 claim_workspace_file_expired
 conversation_has_personal_message
 conversation_is_personal_tainted
@@ -86,6 +81,7 @@ create_sanitized_snapshot
 create_session
 create_share
 create_user
+create_users_bulk
 delete_announcement
 delete_conversation
 delete_expired_announcements
@@ -104,6 +100,7 @@ finish_ingest_run_and_confirm_world
 finish_ingest_run_and_delete_world
 fork_received_share
 get_announcement
+get_api_key_webhook
 get_codex_usage_total
 get_conversation
 get_conversation_for_read
@@ -145,7 +142,6 @@ list_worlds_db
 live_workspace_rel_paths
 mark_workspace_file_expired
 metrics_from_answer
-migrate_marker_if_legacy_exists
 no_live_upload_for_path
 owns_assistant_message
 owns_conversation
@@ -169,6 +165,7 @@ revoke_unconfirmed_key_by_client_op_id
 schema_ready
 search_conversations
 seed_system_settings_once
+seed_user_agent_once
 session_user
 set_contains_personal_workspace
 set_last_login
@@ -190,15 +187,7 @@ upsert_best_effort
 upsert_message_feedback
 upsert_user
 upsert_world
-usage_by_user
-usage_conversation_detail
-usage_conversations
-usage_daily
-usage_depth_rounds
-usage_overview
-usage_response_time
 usage_stats
-usage_stop_kinds
 verify_audit_chain
 workspace_file_lock
 world_by_root

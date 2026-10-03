@@ -25,101 +25,6 @@ def test_graph_page_loads_and_filters(page, web_base_url):
     expect(page.locator("#gcount")).to_contain_text("一致なし")
 
 
-def test_graph_ai_question_posts_graph_ask(page, web_base_url):
-    from playwright.sync_api import expect
-
-    records = install_api_mocks(page)
-    page.goto(f"{web_base_url}/graph.html")
-
-    expect(page.locator("#gcount")).to_contain_text("ノード 4・関係 3")
-    page.locator("#gask").fill("TAX-RATE に関係するプログラムは？")
-    page.locator("#gaskbtn").click()
-
-    expect(page.locator("#ganswer")).to_contain_text("TAX-RATE は消費税率と TAXCALC に関係します。")
-    expect(page.locator("#ganswer")).to_contain_text("文書")
-    expect(page.locator("#ganswer")).to_contain_text("TAXCALC")
-    assert records["graph_ask"][-1] == {
-        "question": "TAX-RATE に関係するプログラムは？",
-        "world": "w1",
-        "scope_paths": [],
-    }
-
-
-def test_graph_ai_question_shows_llm_unavailable_as_error(page, web_base_url):
-    """status="llm_unavailable"（AI 未接続）は通常の回答と見分けが付かない表示にしない。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.route("**/graph/ask", lambda route: route.fulfill(
-        status=200, content_type="application/json",
-        body=json.dumps({
-            "status": "llm_unavailable", "world": "w1", "question": "TAX-RATE に関係するプログラムは？",
-            "answer": "AI に接続できないため、この質問には回答できません（中央の API キーが未設定です）。",
-            "cited_nodes": [], "docs": [], "summary": None,
-        }),
-    ))
-    page.goto(f"{web_base_url}/graph.html")
-
-    expect(page.locator("#gcount")).to_contain_text("ノード 4・関係 3")
-    page.locator("#gask").fill("TAX-RATE に関係するプログラムは？")
-    page.locator("#gaskbtn").click()
-
-    answer = page.locator("#ganswer .ganswer-text")
-    expect(answer).to_contain_text("AI に接続できないため")
-    expect(answer).to_have_css("color", "rgb(185, 28, 28)")
-
-
-def test_graph_ai_question_shows_failed_as_error(page, web_base_url):
-    """status="failed"（回答生成中の例外・graph_admin.py::ask_graph の except 分岐）も
-    llm_unavailable と同様にエラー表示にする（graph.js::renderAskResult は両方を isError 扱いに
-    している）。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.route("**/graph/ask", lambda route: route.fulfill(
-        status=200, content_type="application/json",
-        body=json.dumps({
-            "status": "failed", "world": "w1", "question": "TAX-RATE に関係するプログラムは？",
-            "answer": "回答の生成中にエラーが発生しました。時間をおいて再度お試しください。",
-            "cited_nodes": [], "docs": [], "summary": None,
-        }),
-    ))
-    page.goto(f"{web_base_url}/graph.html")
-
-    expect(page.locator("#gcount")).to_contain_text("ノード 4・関係 3")
-    page.locator("#gask").fill("TAX-RATE に関係するプログラムは？")
-    page.locator("#gaskbtn").click()
-
-    answer = page.locator("#ganswer .ganswer-text")
-    expect(answer).to_contain_text("回答の生成中にエラーが発生しました")
-    expect(answer).to_have_css("color", "rgb(185, 28, 28)")
-
-
-def test_graph_ai_question_no_evidence_is_not_shown_as_error(page, web_base_url):
-    """status="no_graph_evidence"（グラフに根拠が無かっただけ）は正常回答の見た目のまま
-    （danger色にしない）＝llm_unavailable/failed とだけ区別する回帰確認。"""
-    from playwright.sync_api import expect
-
-    install_api_mocks(page)
-    page.route("**/graph/ask", lambda route: route.fulfill(
-        status=200, content_type="application/json",
-        body=json.dumps({
-            "status": "no_graph_evidence", "world": "w1", "question": "NOEXIST の関連は？",
-            "answer": "グラフに根拠が見つかりませんでした（確証なし）。用語や範囲を変えて試してください。",
-            "cited_nodes": [], "docs": [], "summary": None,
-        }),
-    ))
-    page.goto(f"{web_base_url}/graph.html")
-
-    expect(page.locator("#gcount")).to_contain_text("ノード 4・関係 3")
-    page.locator("#gask").fill("NOEXIST の関連は？")
-    page.locator("#gaskbtn").click()
-
-    answer = page.locator("#ganswer .ganswer-text")
-    expect(answer).to_contain_text("グラフに根拠が見つかりませんでした")
-    expect(answer).not_to_have_css("color", "rgb(185, 28, 28)")
-
-
 def test_graph_show_all_reveals_full_graph(page, web_base_url):
     """②graph 軽量化: 初期は主要ノードのみ＋「すべて表示」で全件（専門用語ゼロの文言）。"""
     from playwright.sync_api import expect
@@ -351,6 +256,7 @@ def test_graph_controls_do_not_cover_canvas_and_sidebar_is_reachable(page, web_b
     assert bounds["width"] == bounds["viewport"]
     if size[0] <= 760:
         assert bounds["sidebarWidth"] == bounds["canvasWidth"]
-    page.locator("#gaskbtn").scroll_into_view_if_needed()
-    page.locator("#gaskbtn").focus()
-    expect(page.locator("#gaskbtn")).to_be_focused()
+    last_link = page.locator(".graphlegend .help-link")
+    last_link.scroll_into_view_if_needed()
+    last_link.focus()
+    expect(last_link).to_be_focused()

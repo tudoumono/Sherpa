@@ -1,10 +1,7 @@
-"""アプリの版（利用統計 `activity.app_version`・利用統計の刷新 提案書 §3.1）。
+"""アプリの版（利用統計 `activity.app_version`）。
 
-リポ直下 `VERSION` の内容＋取れた場合だけ git の短い SHA を `"+<SHA>"` で付ける
-（例: `"0.11.4+e87a6750"`）。git が無い/失敗/タイムアウト（2秒）した環境は VERSION のみ返す。
-`VERSION` 自体が読めない環境は `None`（プレースホルダ値で埋めない＝呼び出し側はキー自体を
-置かない契約）。起動後1回だけ計算しプロセス内にキャッシュする（毎ターン `git rev-parse` を
-起動しない）。
+リポ直下 `VERSION` の内容＋取れた場合だけ git の短い SHA を `"+<SHA>"` で付ける（例 `"0.11.4+e87a6750"`）。
+`VERSION` が読めなければ `None`。起動後1回だけ計算してキャッシュする。
 """
 from __future__ import annotations
 
@@ -14,8 +11,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _GIT_TIMEOUT_S = 2.0
 
-# `_cached is None` を「未計算」の目印に使えない（結果そのものが None になり得るため・
-# `_computed` で計算済みかどうかを別に持つ）。
+# 結果が None でも計算済みと区別するため `_computed` を別に持つ
 _cached: str | None = None
 _computed: bool = False
 
@@ -41,8 +37,7 @@ def _short_sha() -> str | None:
 
 
 def current() -> str | None:
-    """VERSION＋取れた場合だけ `"+<短いSHA>"`。`VERSION` が読めなければ `None`（推定で埋めない）。
-    プロセス内で1回だけ計算する。"""
+    """VERSION＋取れた場合だけ `"+<短いSHA>"`。`VERSION` が読めなければ `None`。"""
     global _cached, _computed
     if not _computed:
         version = _read_version()

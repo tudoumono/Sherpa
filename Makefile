@@ -1,16 +1,35 @@
 # Sherpa MVP — 起動・運用タスク
 #
 # `make` だけを打つと、下の一覧（help）が出ます。
-.PHONY: help hooks dev-setup start stop restart status check-ports up down ps logs bootstrap demo mirror install-docker ocr-models \
-        graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
-        test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
-        test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
-        test-db-reset screenshots backup restore usage-backfill trace graph-chain azure-smoke codex-compat doctor sandbox-check \
+.PHONY: help hooks dev-setup start stop restart status check-ports up down ps logs l bootstrap install-docker ocr-models \
+        api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
+        test test-unit test-api test-contract test-integration test-e2e \
+        test-db-reset screenshots backup restore usage-backfill trace azure-smoke codex-compat doctor sandbox-check \
         codex-install codex-version \
-        gate-slice gate-merge gate-release gate-ci test-inventory test-durations
+        gate-slice gate-merge gate-release gate-ci test-inventory test-durations doc-lint
 
 # 引数なしの `make` は一覧表示にする（いきなりサーバが起動すると事故になるため）。
 .DEFAULT_GOAL := help
+
+# make logs の後ろに並べた語（make logs convert embed / make l c e m / make logs help）は scripts/logs.sh の
+# 引数として渡す。残りの目標は何もしない目標にし、同名の実目標（help・api）は定義しない
+# （MAKECMDGOALS の慣用の書き方・GNU make 3.81 でも動く）。語は環境変数で渡し、シェル文字列に埋め込まない。
+# n=500 は make の変数代入として来るため $(n)／$(N) で受ける。
+ifneq ($(filter logs l,$(firstword $(MAKECMDGOALS))),)
+LOGS_WORDS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+# 後ろの語に help・api 以外の実在の目標名（start・nuke など）があれば、何も実行せず解析の段階で止める
+# （ダミーの定義が後ろの実定義に上書きされて実目標が走る事故を防ぐ）。
+LOGS_REAL := $(filter-out help api,$(shell sed -n 's/^\([a-zA-Z0-9_-][a-zA-Z0-9_-]*\):.*/\1/p' $(MAKEFILE_LIST)))
+LOGS_BAD := $(filter $(LOGS_REAL),$(LOGS_WORDS))
+ifneq ($(LOGS_BAD),)
+$(error make logs の後ろには logs.sh の名前・短縮・動作の語だけ書けます（指定できない語: $(LOGS_BAD)）。指定できる名前: make logs help で一覧。動作の語: help(h) mem(m) report(r) err n=数字)
+endif
+ifneq ($(LOGS_WORDS),)
+.PHONY: $(LOGS_WORDS)
+$(LOGS_WORDS):
+	@:
+endif
+endif
 
 # 配布物のバージョン: タグ上なら git tag（例 v0.1.0）、そうでなければ VERSION ファイル（v プレフィックス付与）。
 SHERPA_VERSION := $(shell git describe --tags --exact-match 2>/dev/null || printf 'v%s' "$$(cat VERSION 2>/dev/null || echo 0.0.0)")
@@ -33,6 +52,7 @@ hooks:            ## git フック（scripts/git-hooks）を有効化＝Agent wo
 dev-setup:         ## 新しい貢献者向け: venv＋開発依存＋git フック＋.env雛形を1コマンドで用意（何度実行しても安全。CONTRIBUTING.md 参照）
 	./scripts/dev-setup.sh
 
+ifeq ($(LOGS_WORDS),)
 help:             ## このコマンド一覧を表示
 	@echo "Sherpa — make の使い方"
 	@echo
@@ -41,6 +61,7 @@ help:             ## このコマンド一覧を表示
 		| awk -F'|' '{printf "  %-18s %s\n", $$1, $$2}'
 	@echo
 	@echo "  よく使う順: make start → make status → make stop"
+endif
 
 start:            ## 利用者向け: 依存/ストア/アプリを一括起動（LAN=1 で LAN 公開・MODE=dev で開発モード）
 	LAN="$(LAN)" ./scripts/start.sh $(MODE)
@@ -89,34 +110,31 @@ notice:            ## 帰属表示（NOTICE）・ライセンス全文・SBOM �
 notice-check:      ## 上記の生成物が最新かを検査（差分があれば失敗）
 	$(PY) scripts/gen_notice.py --check
 
+doc-lint:           ## docs/templates・docs/design・docs/proposals の文書規約を検査（front matter/ID/リンク/アンカー/契約ブロック）
+	$(PY) scripts/doc_lint.py
+
 down:              ## ストア停止（OCR ワーカーも止める）
 	$(COMPOSE_ALL) down
 
 ps:                ## 状態（OCR ワーカーを含む）
 	$(COMPOSE_ALL) ps
 
-logs:              ## 全ログを1画面で（アプリ+Docker合流・ARGS で絞り込み: convert embed postgres 等。-m でメモリ行・-r でレポート・-h でヘルプ）
+logs: export LOGS_WORDS := $(LOGS_WORDS)
+logs: export LOGS_NAME := $(NAME)
+logs: export LOGS_MEM := $(MEM)
+logs: export LOGS_REPORT := $(REPORT)
+logs: export LOGS_HELP := $(HELP)
+logs: export LOGS_N := $(if $(n),$(n),$(N))
+logs:              ## 全ログを1画面で（make l c e＝convert と embed・h で一覧・m でメモリ行・r で集計・err でエラーだけ・n=500 で末尾行数）
 	./scripts/logs.sh $(ARGS)
+
+l: logs            ## logs の短縮（make l c e m / make l h）
 
 bootstrap:         ## ローカル利用ディレクトリ作成＋.env 用意＋ストア待ち
 	./scripts/bootstrap.sh
 
-demo:              ## M0 demo: Codex が workspace で走り kb を read-only で読める
-	./scripts/demo_codex.sh
-
-mirror:            ## 鏡モデル契約テスト（docker 不要）
-	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/contract/test_mirror_contract.py -m contract
-
 install-docker:    ## Docker Engine を入れる（sudo パスワードを1回入力）
 	bash scripts/install-docker.sh
-
-graph-load:        ## v1 world を Neo4j に投入（鏡モデル・make up ＋ pip install -r requirements.txt 必要）
-	SHERPA_USE_FIXTURES=1 $(PY) -c "from sherpa import worlds; from sherpa.ingest import world_graph as g, world_neo4j as w; wd=worlds.world_dir('v1'); n,e,f=g.build_world(wd,'v1'); env=w._env(); print('loaded', w.load_world(n,e,'v1',env['uri'],env['user'],env['pw']),'flags',f)"
-
-graph-verify:      ## 実 Neo4j で v1 world の影響 golden を再現するか検証
-	SHERPA_USE_FIXTURES=1 $(PY) scripts/graph_verify.py
-
-graph: graph-load graph-verify  ## 投入＋検証
 
 test-unit:         ## 単体テスト（外部サービス不要・pytest -m unit）
 	SHERPA_USE_FIXTURES=1 $(PY) -m pytest tests/unit -m unit
@@ -133,25 +151,10 @@ test-integration:  ## 結合テスト（Neo4j/Postgres/ES など外部サービ�
 test-e2e:           ## ブラウザ UI テスト（Playwright・DB不要・APIはモック）
 	$(PY) -m pytest tests/e2e
 
-test-e2e-live:      ## ブラウザ結合 UI テスト（起動済み FastAPI/DB を実利用。SHERPA_AUTH_ENABLED=1 前提）
-	$(PY) -m pytest tests/e2e_live
-
-test-ui-automation: ## 独立UI自動化: 全機能・全env・全実サービス（実API課金あり）
-	$(PY) -m ui_automation run --suite full $(UI_AUTOMATION_ARGS)
-
-test-ui-automation-smoke: ## 独立UI自動化: 実stackの最小確認（全網羅の合格証明ではない）
-	$(PY) -m ui_automation run --suite smoke $(UI_AUTOMATION_ARGS)
-
-test-ui-automation-chat: ## 独立UI自動化: 実AIチャット＋構造化実行トレース（実API課金あり）
-	$(PY) -m ui_automation run --suite chat $(UI_AUTOMATION_ARGS)
-
-test-ui-automation-env: ## 独立UI自動化: 環境変数マトリクス（profileごとに実processを再起動）
-	$(PY) -m ui_automation run --suite env $(UI_AUTOMATION_ARGS)
-
 screenshots:        ## マニュアル用画像を再生成（モックAPI＋Playwright・docker不要。ARGS で --only 等を渡せる）
 	$(PY) scripts/capture_screenshots.py $(ARGS)
 
-test: test-unit test-api test-contract test-integration  ## 単体＋API＋契約＋結合（ブラウザ系は含まない→test-e2e / test-e2e-live）
+test: test-unit test-api test-contract test-integration  ## 単体＋API＋契約＋結合（ブラウザ系は含まない→test-e2e）
 
 # --- 開発ハーネスのゲート（段階表は docs/20-開発ハーネス.md §5） ------------------------------
 
@@ -205,8 +208,10 @@ test-durations:     ## 単体+契約を --durations=20 で実行し遅い20本�
 test-db-reset:      ## テスト専用 DB を作り直す（DROP→CREATE・既定は共有 sherpa_test。DBNAME=sherpa_test_template でひな型を作り直す）
 	$(PY) scripts/test_db_reset.py $(if $(DBNAME),--name $(DBNAME))
 
+ifeq ($(LOGS_WORDS),)
 api:               ## FastAPI 起動（dev 専用・fixtures フラグ ON＝架空 golden を grep 併用。本番では使わない→serve）
 	./scripts/run-api.sh dev
+endif
 
 serve:             ## FastAPI 起動（本番・fixtures 非参照。SHERPA_ENV=production で fixtures を指す設定があれば起動拒否＝継承フラグも遮断）
 	./scripts/run-api.sh serve
@@ -220,17 +225,27 @@ verify-kit:        ## オフラインキットの出荷ゲート（docker必須�
 verify-extension:  ## 拡張の契約検査（アナライザ／頭脳provider／変換アーム／MCPツール・docs/21-拡張の契約.md）
 	$(PY) scripts/verify_extension.py
 
-dist: notice       ## 配布物 tarball を生成（版名＋sha256＋NOTICE/SBOM・fixtures/tests/mockups 非同梱）
+dist: notice       ## 配布物 tarball を生成（版名＋sha256＋NOTICE/SBOM・fixtures/tests 非同梱）
 	@mkdir -p dist
 	# NOTICE/ライセンス全文/SBOM は生成物のため git archive には入らない。tar を素で作ってから
-	# 追記し、最後に圧縮する（帰属表示は配布物に同梱されていなければ意味がない）。
+	# 追記し、最後に圧縮する（帰属表示は配布物に同梱されていなければ意味がない）。GNU tar／sha256sum が
+	# あればそれを使い、無い環境（macOS の標準構成）だけ Python（tarfile／hashlib）で同じ中身にする。
 	git archive --format=tar --prefix=sherpa-$(SHERPA_VERSION)/ \
 		-o dist/sherpa-$(SHERPA_VERSION).tar HEAD
-	tar --append --file=dist/sherpa-$(SHERPA_VERSION).tar \
-		--transform 's,^dist/notice,sherpa-$(SHERPA_VERSION),' \
-		dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json
+	if tar --version 2>/dev/null | grep -q 'GNU tar'; then \
+		tar --append --file=dist/sherpa-$(SHERPA_VERSION).tar \
+			--transform 's,^dist/notice,sherpa-$(SHERPA_VERSION),' \
+			dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json; \
+	else \
+		$(PY) scripts/lib/portable_tools.py tar-append dist/sherpa-$(SHERPA_VERSION).tar sherpa-$(SHERPA_VERSION) \
+			dist/notice/NOTICE.md dist/notice/THIRD-PARTY-LICENSES.txt dist/notice/sbom.cdx.json; \
+	fi
 	gzip -f dist/sherpa-$(SHERPA_VERSION).tar
-	cd dist && sha256sum sherpa-$(SHERPA_VERSION).tar.gz > sherpa-$(SHERPA_VERSION).tar.gz.sha256
+	if command -v sha256sum >/dev/null 2>&1; then \
+		cd dist && sha256sum sherpa-$(SHERPA_VERSION).tar.gz > sherpa-$(SHERPA_VERSION).tar.gz.sha256; \
+	else \
+		$(PY) scripts/lib/portable_tools.py sha256 --basename dist/sherpa-$(SHERPA_VERSION).tar.gz > dist/sherpa-$(SHERPA_VERSION).tar.gz.sha256; \
+	fi
 	@echo "created: dist/sherpa-$(SHERPA_VERSION).tar.gz (+ .sha256)  展開すると sherpa-$(SHERPA_VERSION)/ フォルダ"
 
 backup:            ## データを退避（停止中のストア＋個人領域＋.env → data/backups/<日時>/。ARGS=--stop/--with-derived/--dry-run）
@@ -250,10 +265,6 @@ trace:             ## 会話の各ターンを段・道具の呼び出し（時�
 	if [ "$${MASK_MODELS:-}" = 1 ]; then set -- "$$@" --mask-models; fi; \
 	if [ -n "$${OUT:-}" ]; then set -- "$$@" --out "$${OUT}"; fi; \
 	./scripts/conversation-trace.sh "$$@"
-
-graph-chain:       ## 起点のファイルから呼び出し・コピー・DB アクセスを下り向きにたどり、届いたファイルと SQL の候補を表示（make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]・読み取り専用・本文は出さない）
-	@test -n "$${FROM:-}" || { echo "使い方: make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]"; exit 2; }
-	./scripts/graph-chain.sh --from "$${FROM}" $${WORLD:+--world "$${WORLD}"} $${DEPTH:+--depth "$${DEPTH}"}
 
 azure-smoke:        ## Azure OpenAI（等の OpenAI 互換接続先）への実疎通を確認（実 API 課金あり・確認プロンプト）。ARGS で --env-file/--dry-run 等を渡せる（例: ARGS="--env-file azure.env --yes"）
 	$(PY) scripts/azure_smoke.py $(ARGS)
@@ -276,5 +287,5 @@ codex-version:      ## 固定版と、tools/codex/・PATH 上に実際にある 
 diag:              ## 解析用のログ回収バンドルを作る（機密を含めない・dist/diag/）。ARGS で --days/--out 等を渡せる
 	./scripts/diag.sh $(ARGS)
 
-nuke:              ## 完全初期化（ストア＋派生物＋個人領域＋OCR観測を消去。資料フォルダと .env は残す。YES=1 で確認省略）
+nuke:              ## 完全初期化（ストア＋派生物＋個人領域＋OCR観測を消去。資料フォルダと .env は残す。確認は 2 回・端末必須。スクリプト用の省略は YES=I-UNDERSTAND-ALL-DATA-WILL-BE-DELETED・本番では不可）
 	YES="$(YES)" ./scripts/nuke.sh

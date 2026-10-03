@@ -1,7 +1,8 @@
-"""認証の純ヘルパ（パスワードハッシュ・セッショントークン）。FastAPI 依存は api.py 側。
+"""認証の純ヘルパ（パスワードハッシュ・セッショントークン）。
 
-- パスワードは pbkdf2_hmac(sha256) で hash（外部依存なし）。将来 Argon2id 等へ差し替え可。
-- セッションは opaque random token を cookie に入れ、DB には **token の SHA-256 hash だけ**を保存する。
+- パスワードは pbkdf2_hmac(sha256)。
+- セッションは不透明トークンを cookie に入れ、DB には token の SHA-256 hash だけを保存する。
+設計: docs/design/users.md「ログインとセッション」
 """
 from __future__ import annotations
 
@@ -14,9 +15,7 @@ _ALG = "pbkdf2_sha256"
 _ITER = 200_000
 DEFAULT_ADMIN_PASSWORD = "Sherpa2026!"
 
-# 存在しない uid のログイン試行でも pbkdf2 を実行してタイミングを揃えるためのダミーハッシュ
-# （監査台帳 LOW-4）。実在するパスワードとの対応は無い固定値（`hash_password()` で1回だけ生成した
-# ものをハードコード＝起動のたびに生成すると初回だけ遅くなり、対策の意味が薄れるためモジュール定数にする）。
+# 存在しない uid のログイン試行でも pbkdf2 を実行してタイミングを揃えるための固定ダミーハッシュ
 _DUMMY_PASSWORD_HASH = (
     "pbkdf2_sha256$200000$"
     "9c1a2e6f3b8d4507a1c2e3f4b5a6d7c8$"
@@ -58,21 +57,14 @@ def initial_admin_password() -> str:
 
 
 def auth_enabled() -> bool:
-    """認証はデフォルト有効。
-
-    互換・開発用に明示した `SHERPA_AUTH_DISABLED=1` の場合だけ無効化する。
-    """
+    """認証が有効か（既定で有効。`SHERPA_AUTH_DISABLED=1` の明示時だけ無効）。"""
     return not auth_disabled()
 
 
 def auth_disabled() -> bool:
     """開発・テスト互換モード。`SHERPA_AUTH_DISABLED=1` の明示時だけ合成 admin を返す。
 
-    本番プロファイル（`SHERPA_ENV` が `prod`/`production`・大小文字不問・他の `_warn_*` 起動検査
-    （`sherpa/api.py::_warn_fixtures` 等）と同じ判定）では `SHERPA_AUTH_DISABLED` を無視し常に False
-    を返す（誤設定で本番に合成 admin 互換モードが残る事故を防ぐ・fail-safe）。この関数はリクエスト毎に
-    呼ばれるためここではログを出さない——起動時1回だけの誤設定検知・ERROR ログは
-    `sherpa.api._warn_auth_disabled_in_production()` が別途行う（TOGGLE-RM・2026-09-03）。
+    本番プロファイル（`SHERPA_ENV` が prod/production）では常に False（毎リクエスト呼ばれるためログは出さない）。
     """
     env = os.environ.get("SHERPA_ENV", "").strip().lower()
     if env in ("prod", "production"):

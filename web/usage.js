@@ -1,11 +1,10 @@
 // 利用統計画面（admin 専用）。GET /admin/usage/stats?days=（または from/to）でユーザー別/全体の利用量を集計表示する。
+// 設計: docs/design/usage.md「管理画面が読む `GET /admin/usage/stats`」
 // 狙い＝よく使うユーザーを見つけてヒアリング候補にする（本文・タイトルは API 側で一切返さない）。
 // セキュリティ: server data は全て esc()。data-* 委譲でインライン handler なし。
 'use strict';
 
-// UI-TABS2（2026-09-04）: システム管理のタブから iframe（?embed=1）で開かれた時は、自ページの
-// 共通トップバー/ナビを隠す（CSS 側は .embedded 修飾・usage.html の <style>）。単独 URL 直開き
-// （?embed 無し）では何もしない＝この画面の機能・見た目は完全に不変。
+// システム管理のタブから iframe（?embed=1）で開かれた時は、共通トップバー/ナビを隠す（CSS は .embedded 修飾）。
 if (new URLSearchParams(location.search).has('embed')) {
   document.documentElement.classList.add('embedded');
 }
@@ -15,10 +14,8 @@ const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON, mdLite = Sherpa.
 const LENS_LABEL = { impact: '影響分析', qa: '仕様問い合わせ', troubleshoot: 'トラブルシュート', chat: '素の会話' };
 const LENS_ORDER = ['impact', 'qa', 'troubleshoot', 'chat'];
 
-// バッチ3（2026-07-03）: 頭脳別利用比率の表示名（brainmenu/chat.js の PROVIDERS と同じラベルに揃える）。
-// 色は dataviz skill 呼び出し済み: このアプリに専用カテゴリランプが無いため、既存の semantic token
-// （固定順・lens ミニバーと同じ折衷）をカテゴリ色に転用し、常設の凡例＋直接ラベルで色だけに頼らない
-// （[[dataviz-skill-limited-palette]] の判断を踏襲）。
+// 頭脳別利用比率の表示名（brainmenu/chat.js の PROVIDERS と同じラベルに揃える）。
+// 専用のカテゴリランプが無いため、既存の semantic token（固定順）をカテゴリ色に転用し、常設の凡例＋直接ラベルで色だけに頼らない。
 const PROVIDER_LABEL = {
   heuristic: '簡易（AIなし）', codex: 'Codex', openai: 'OpenAI API', gemini: 'Gemini',
   ollama: 'ローカルLLM (Ollama)', bedrock: 'AWS Bedrock (Claude)', unknown: '不明',
@@ -29,8 +26,7 @@ const PROVIDER_COLOR = {
   bedrock: 'var(--danger)', ollama: 'var(--accent-ink)', unknown: 'var(--border)',
 };
 
-// （docs/archive/2026-09-12-利用統計の拡充2.md §2 (c)）: ターンの終了理由（`sherpa/stop_kind.py` の
-// 閉じた8値＋'unknown'）の平文ラベル。未知の値は生の値をそのまま表示する（fail-safe・KIND_LABEL と同じ流儀）。
+// ターンの終了理由（`sherpa/stop_kind.py` の閉じた8値＋'unknown'）の平文ラベル。未知の値は生の値をそのまま表示する（KIND_LABEL と同じ流儀）。
 const STOP_KIND_LABEL = {
   completed: '完了', stopped_by_user: '利用者が停止', budget: '調査の上限', no_evidence: '根拠不足',
   transport_error: '通信エラー', timeout: 'タイムアウト', codex_silent: 'Codex 無応答',
@@ -42,7 +38,7 @@ function stopKindLabel(k) { return STOP_KIND_LABEL[k] || k; }
 
 let _stats = null;
 let _loadedAt = null;
-const USAGE_TABS = ['overview', 'users', 'quality', 'tokens', 'ask'];
+const USAGE_TABS = ['overview', 'users', 'quality', 'tokens'];
 // 期間は {days}（7/30/90）か {start, end}（JST 暦日・両日を含む）。URL の # に同じ形で持つ。
 const PERIOD_MAX_DAYS = 365;   // API の from/to の上限と同じ
 function dateSerial(s) {
@@ -69,9 +65,8 @@ function rangeError(start, end) {
 // p が null＝URL の期間指定が不正で未取得（タブ移動などは不正な指定をそのまま引き継ぐ）。
 let _invalidPeriodQuery = 'days=30';
 function periodQuery(p) { return !p ? _invalidPeriodQuery : p.start ? `start=${p.start}&end=${p.end}` : `days=${p.days}`; }
-// API へ渡す期間クエリ（URL の # とは別の組み立て＝開始日は JST の日初から、終了日の翌日の日初
-// まで・API は半開区間 [from, to)）。集計取得（load）と明細ZIP保存の両方がこれを使う——
-// 現在表示している期間と食い違う range を送らない。
+// API へ渡す期間クエリ（URL の # とは別の組み立て＝開始日は JST の日初から、終了日の翌日の日初まで・API は半開区間 [from, to)）。
+// 集計取得（load）と明細ZIP保存の両方がこれを使う（表示中の期間と食い違う range を送らない）。
 function periodApiQuery(period) {
   return period.start
     ? `from=${encodeURIComponent(`${period.start}T00:00:00+09:00`)}&to=${encodeURIComponent(`${nextDate(period.end)}T00:00:00+09:00`)}`
@@ -157,7 +152,7 @@ showUsageTab(usageView().tab);
 let _sortKey = 'turns';
 let _sortDir = 'desc';
 let _users = [];
-let _loadSeq = 0;   // 期間ボタン連打対策: 後着の古いレスポンスで表示が巻き戻らないようにする（RV ラウンド3 LOW）
+let _loadSeq = 0;   // 期間ボタン連打対策: 後着の古いレスポンスで表示が巻き戻らないようにする
 
 function toast(msg) {
   const t = $('toast'); if (!t) return;
@@ -201,10 +196,8 @@ function lensBarHTML(lens) {
 }
 
 // ===== トレンドグラフ（日別アクティブユーザー数・日別ターン数） =====
-// インライン SVG を素の JS で描画（vendor は cytoscape のみ＝新規チャートライブラリ追加禁止）。
-// dataviz skill 準拠: 単一系列の時系列＝line（面は薄いウォッシュ）／凡例なし（タイトルが系列を示す）／
-// クロスヘア＋ツールチップ＝ホバーとキーボードフォーカス両対応／軸・グリッドは recessive／
-// 0日・全ゼロは明示的な空状態表示。
+// インライン SVG を素の JS で描画（新規チャートライブラリは追加しない）。
+// 単一系列の時系列＝line（面は薄いウォッシュ）／凡例なし（タイトルが系列を示す）／クロスヘア＋ツールチップ＝ホバーとキーボードフォーカス両対応／軸・グリッドは控えめ／0日・全ゼロは明示的な空状態表示。
 
 const _SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -227,10 +220,8 @@ function _niceMax(n) {
   return nice * mag;
 }
 
-// period.start〜period.end（サーバ算出の JST 暦日範囲）で連続した日付配列へ穴埋めする（API は
-// 活動があった日しか返さないため、そのまま繋ぐと空白日が圧縮されて時系列が歪む＝穴埋めして初めて
-// 正しい折れ線になる）。「今日」をクライアント側で再計算しない＝API が返す日付範囲をそのまま使う
-// （RV ラウンド3 MEDIUM: サーバの集計境界とフロントの描画範囲がズレると表とグラフの合計が食い違う）。
+// period.start〜period.end（サーバ算出の JST 暦日範囲）で連続した日付配列へ穴埋めする（API は活動があった日しか返さないため、穴埋めしないと空白日が圧縮されて時系列が歪む）。
+// 「今日」をクライアント側で再計算しない（サーバの集計境界とズレると表とグラフの合計が食い違う）。
 function fillDailySeries(daily, periodStart, periodEnd) {
   const byDate = new Map((daily || []).map((d) => [d.date, d]));
   const out = [];
@@ -276,7 +267,7 @@ function renderTrendChart(svgEl, emptyEl, tipEl, wrapEl, points, opt) {
   const xAt = (i) => (n === 1 ? padL + plotW / 2 : padL + (plotW * i) / (n - 1));
   const yAt = (v) => padT + plotH - (plotH * v) / maxV;
 
-  // 横グリッド線（0・中間・最大の3本のみ＝recessive・hairline）＋ Y軸ラベル。
+  // 横グリッド線（0・中間・最大の3本のみ）＋ Y軸ラベル。
   [0, 0.5, 1].forEach((frac) => {
     const y = padT + plotH * (1 - frac);
     svgEl.appendChild(_svgEl('line', {
@@ -372,10 +363,9 @@ function renderCharts(daily, period) {
   );
 }
 
-// ===== バッチ3（2026-07-03）: 利用の傾向（ゼロヒット率・ヒートマップ・world/頭脳別・定着・DL数） =====
-// dataviz skill 呼び出し済み。ヒートマップ/world別は「magnitude」＝sequential 1色（--accent）。
-// 頭脳別は「identity」＝カテゴリ色（既存 semantic token の固定順流用＋常設凡例で secondary encoding）。
-// 週次アクティブ・DL日別は既存 renderTrendChart（1系列の折れ線）をそのまま再利用する。
+// ===== 利用の傾向（ゼロヒット率・ヒートマップ・world/頭脳別・定着・DL数） =====
+// ヒートマップ/world別は「magnitude」＝sequential 1色（--accent）。頭脳別は「identity」＝カテゴリ色（既存 semantic token の固定順＋常設凡例）。
+// 週次アクティブ・DL日別は既存 renderTrendChart をそのまま再利用する。
 
 function renderZeroHitTile(zeroHit) {
   const rate = zeroHit?.rate;
@@ -518,7 +508,7 @@ function renderBarChart(svgEl, emptyEl, tipEl, wrapEl, items, opt) {
         x: padL, y, width: barW, height: barH, rx: 4, fill: it.color || 'var(--accent)', class: 'bar',
       }));
     }
-    const valLabel = _svgEl('text', {   // 値はバーの先端に（skill 規約: bars→value at the tip）
+    const valLabel = _svgEl('text', {   // 値はバーの先端に（bars→value at the tip）
       x: padL + barW + 6, y: y + barH / 2 + 3.5, 'font-size': 10.5, fill: 'var(--ink)',
       'font-variant-numeric': 'tabular-nums',
     });
@@ -558,14 +548,13 @@ function renderProviderBar(providers) {
     }));
   renderBarChart($('chart-provider-svg'), $('chart-provider-empty'), $('chart-provider-tip'), $('chart-provider-wrap'),
     items, { unit: '件', title: '頭脳別利用比率' });
-  // 常設の凡例（色だけに頼らない・skill の secondary encoding 規約）。
+  // 常設の凡例（色だけに頼らない）。
   $('chart-provider-legend').innerHTML = items.map((it) =>
     `<span class="item"><span class="dot" style="background:${it.color}"></span>${esc(it.label)} ${it.value}件</span>`,
   ).join('');
 }
 
-// ターンの終了理由の分布（`sherpa/stop_kind.py` の閉じた語彙・単色バー＝各行が
-// 既に自分のラベルを持つため頭脳別のような凡例配色は要らない・フォルダ別利用量と同じ折衷）。
+// ターンの終了理由の分布（`sherpa/stop_kind.py` の閉じた語彙・単色バー＝各行が自分のラベルを持つため凡例配色は要らない）。
 // 停止数（`stopped_turns`）は回答を保存しないため分布には現れない別集計＝バッジで併記する。
 function renderStopKinds(stopKinds, stoppedTurns) {
   const byKind = new Map((stopKinds || []).map((r) => [r.stop_kind, r.turns || 0]));
@@ -738,16 +727,15 @@ function renderDownloadsChart(downloads, period) {
     filled.map((d) => ({ date: d.date, value: d.turns })),
     { color: 'var(--ok)', unit: '件', label: '原本ダウンロード数（日別）' },
   );
-  // RV LOW（2026-07-03再検証）: 見出し脇に期間合計を表示（日別グラフだけだと合計が読み取りにくい）。
+  // 見出し脇に期間合計を表示（日別グラフだけだと合計が読み取りにくい）。
   const total = (downloads && downloads.total) || 0;
   $('dl-total-badge').textContent = `期間合計 ${total.toLocaleString('ja-JP')}件`;
 }
 
-// ===== トークン（F3・2026-07-07／2026-07-08 金額表示は撤去＝入力/出力トークン数のみ） =====
+// ===== トークン（入力/出力トークン数のみ） =====
 function providerLabel(p) { return PROVIDER_LABEL[p] || p || '不明'; }
 
-// S1（2026-07-15-LLMオーケストレーション実装計画.md §3）: 用途別（kind）内訳の平文日本語ラベル。
-// 未知 kind は生の kind をそのまま表示（fail-safe）。
+// 用途別（kind）内訳の平文日本語ラベル。未知 kind は生の kind をそのまま表示する。
 const KIND_LABEL = {
   'chat-sub': '下調べ',
   research: '外部連携の調査',
@@ -755,12 +743,12 @@ const KIND_LABEL = {
   propose: '概念の候補づくり（旧機能）',
   chat: '会話', intent: '依頼の仕分け',
   embed: '検索の索引づくり', graph_ask: 'グラフへの質問', vlm: '画像の読み取り',
-  // S4-c（2026-07-15-LLMオーケストレーション実装計画.md §6.3）: 複数プロファイル自動選択の計画呼び出し。
+  // 複数プロファイル自動選択の計画呼び出し。
   'chat-plan': '進め方の計画',
   usage_chat: '利用統計チャット',
-  // EXT-2c: 清書前のメイン査読（根拠の十分性判定・限定ツール精読）。
+  // 清書前のメイン査読（根拠の十分性判定・限定ツール精読）。
   'chat-review': '根拠の査読',
-  // M1（§8.6-4）: 取り込み後にバックグラウンドで後追い実行する rag.md の LLM 成形。
+  // 取り込み後にバックグラウンドで後追い実行する rag.md の LLM 成形。
   rag_render: '検索用文書の整形',
 };
 function kindLabel(k) { return KIND_LABEL[k] || k; }
@@ -771,7 +759,7 @@ function renderTokenKindTable(rows) {
   const tb = $('token-kind-tbody');
   if (!tb) return;
   if (!rows || !rows.length) {
-    if (card) card.hidden = true;   // 空/不在＝旧 API 応答との前方互換でカードごと隠す
+    if (card) card.hidden = true;   // 空/不在ならカードごと隠す
     return;
   }
   if (card) card.hidden = false;
@@ -793,9 +781,8 @@ function renderTokenKindTable(rows) {
   }).join('');
 }
 
-// ユーザー別 × 用途別内訳（docs/archive/2026-09-12-利用統計の拡充2.md §2 (a)）。利用者に紐付かない
-// 呼び出しを含まないため、同一 kind の合計は token-kind-tbody の当該行以下になりうる。空/不在ならカードごと隠す
-// （token-kind-card と同じ流儀）。
+// ユーザー別 × 用途別内訳。利用者に紐付かない呼び出しを含まないため、同一 kind の合計は token-kind-tbody の当該行以下になりうる。
+// 空/不在ならカードごと隠す（token-kind-card と同じ流儀）。
 function renderTokenUserKindTable(rows) {
   const card = $('token-user-kind-card');
   const tb = $('token-user-kind-tbody');
@@ -875,10 +862,8 @@ function renderTokens(tokens, period) {
   renderTokenUserKindTable(t.by_user_kind || []);
 }
 
-// 会話ごとの補助 AI 使用量（docs/archive/2026-09-12-利用統計の拡充2.md §2 (b)）: トークン合計
-// 降順で上位20件・タイトル/本文は含まない。「用途別」列は用途ごとに回数・トークン・所要時間を1行ずつ
-// 積む（`UsageConversationKindRow` の null の意味は用途別テーブルと同じ）。会話 id はテキスト表示のみ
-// （リンクにしない）。
+// 会話ごとの補助 AI 使用量: トークン合計降順で上位20件・タイトル/本文は含まない。
+// 「用途別」列は用途ごとに回数・トークン・所要時間を1行ずつ積む（`UsageConversationKindRow` の null の意味は用途別テーブルと同じ）。会話 id はテキスト表示のみ（リンクにしない）。
 function conversationKindsSummaryHTML(kinds) {
   return `<ul class="convkinds">${(kinds || []).map((k) => {
     // 入力/出力のどちらかが null（報告不能マーカー・token-kind-tbody と同じ意味）なら合算しない。
@@ -1059,8 +1044,8 @@ async function load(period) {
 $('usage-export').addEventListener('click', () => {
   const payload = { retrieved_at: _loadedAt, timezone: 'Asia/Tokyo', period: _stats.period,
     definitions: $('usage-definitions').textContent.trim(), stats: _stats };
-  Sherpa.downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
-    `usage-${_stats.period.start}-${_stats.period.end}.json`);
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  Sherpa.downloadBlob(blob, `usage-${_stats.period.start}-${_stats.period.end}.json`);
 });
 
 $('usage-export-detail').addEventListener('click', async () => {
@@ -1142,358 +1127,7 @@ if (themebtn) {
 }
 applyThemeIcon();
 
-// ===== 統計チャット（POST /admin/usage/chat・本文はページ内メモリのみ・サーバに永続化しない） =====
-// サーバ側の会話履歴の上限（`sherpa/usage_chat.py::HISTORY_MAX_ITEMS`/`HISTORY_ITEM_MAX_LEN`）と
-// 合わせておく。1件の長さはサーバ側も超過分を切り詰めて受理する（拒否しない）が、ここでも
-// 送信前に切り詰める＝長い正常回答（AIの答え）がそのまま積まれて次のターン以降ずっと同じ
-// エラーを出し続ける、ということが起きないようにする（利用者の再読込に頼らない）。
-const UC_HISTORY_MAX = 20;
-const UC_HISTORY_ITEM_MAX_LEN = 4000;
-// サーバ（`usage_chat.py::_TRUNCATION_SUFFIX`）と同じ印。無言で末尾を落とさない。
-const UC_TRUNCATION_SUFFIX = '…（省略）';
-// `String.length`/`slice()` は UTF-16 コード単位（サロゲート対の絵文字等は2として数える）だが、
-// サーバ側（Python）の `len()`/スライスはコードポイント単位。単位が食い違うと同じ文字列でも
-// 双方で切り詰め位置がズレ、UTF-16 単位でのそのままの `slice` はサロゲート対の片割れだけを
-// 残して文字列を壊しうる。`Array.from(s)` はコードポイント単位で反復するため、ここで揃える。
-function ucClip(s) {
-  s = String(s == null ? '' : s);
-  const cps = Array.from(s);
-  if (cps.length <= UC_HISTORY_ITEM_MAX_LEN) return { text: s, clipped: false };
-  const text = cps.slice(0, UC_HISTORY_ITEM_MAX_LEN - UC_TRUNCATION_SUFFIX.length).join('') + UC_TRUNCATION_SUFFIX;
-  return { text, clipped: true };
-}
-let _ucHistory = [];
-let _ucSending = false;
-// STAT-2: 「次の送信先」（provider を省略して送った場合に使われる見込みの値）。GET
-// /admin/settings の usage_chat.effective・および既定送信の応答（provider_used）で更新する。
-// この画面から専用設定そのものを変更する導線は無い（変更は管理画面）が、「今回だけ」トグルに
-// よるリクエスト単位の一時切替は持つ（`_ucProviderOverride`・保存しない）。取得できるまで
-// （またはできなかった場合）'openai' 等の未確認の値を絶対に表示しない・送信もさせない
-// （`null`＝未確認）。
-let _ucDefaultProvider = null;
-// openai 接続先の種別（`openai_endpoint.effective.kind`＝"openai"|"azure"|"custom"）。
-// **GET /admin/settings でのみ更新する**（チャット応答の `endpoint_kind` では上書きしない）
-// ——応答の `endpoint_kind` は「その1回の送信で実際に使った接続先」（ollama 使用時は
-// 常に `null`）であり、既定 ollama の送信結果でこの値を書き換えると、その後「今回だけ
-// openai」を選んだ時に本来の openai 接続先種別（Azure/custom 等）が失われ「OpenAI」と
-// 誤表示する。openai が実際には Azure/その他 OpenAI 互換エンドポイントへ
-// 向いている場合、送信先表示を「OpenAI」のままにすると実態と異なる（Azure 等へ送っているのに
-// OpenAI 社へ送っていると誤解させる）ため区別する。
-let _ucOpenaiEndpointKind = null;
-// A7（`cloud_provider`）の現在値。GET /admin/settings でのみ更新する（`null`＝未確認）。
-// A7 が openai 以外だと、A7 の排他選択契約（非選択クラウドのキーは使わない）により
-// 「今回だけ OpenAI」は中央 OpenAI キーが使えず 503（未接続）になる——挙動自体は契約どおりだが、
-// 理由が分かるよう「今回だけ OpenAI」ボタンの近くに注記を出すために使う
-// （`ucUpdateOpenaiKeyHint` 参照）。
-let _ucCloudProvider = null;
-// A7 の値ラベル（admin-settings.js::CLOUD_PROVIDER_LABELS の簡略版・この画面専用）。
-const UC_CLOUD_PROVIDER_LABELS = { openai: 'OpenAI', gemini: 'Gemini（Google）', bedrock: 'AWS Bedrock (Claude)' };
-// 画面の「今回だけ」トグル（リクエスト単位の一時上書き・保存しない）。null＝上書きなし（既定に従う）。
-let _ucProviderOverride = null;
-// 直近の GET /admin/settings で usage_chat.effective が有効だったか（既定送信の可否を決める）。
-let _ucSettingsReady = false;
-// 直近の GET /admin/settings 自体が成功したか（usage_chat.effective の妥当性とは無関係）。
-// openai 接続先種別（`_ucOpenaiEndpointKind`）が最新かどうかの判定に使う——「今回だけ」上書き
-// 送信は usage_chat.effective の妥当性に左右されず、この値が true であることだけを要求する
-// （既定送信の可否＝`_ucSettingsReady` とは別の関門）。
-let _ucSettingsFetchOk = false;
-// 「次の送信先」欄に出す明示エラー文言（null＝正常）。取得失敗（ネットワーク/応答形式不正）と、
-// 「保存値は取得できたが不正（既定送信の送信先が確定できない）」を別の文言で区別する。
-// どちらも `_ucSettingsReady=false`（既定送信を止め「今回だけ」のみ許可）。「前回の送信先」
-// （`_ucLastSentProvider` 系・別要素）はこの状態と独立に保つ——直前に実際へ送った事実と、
-// 次に何が起きるかの見込みを混ぜない。
-let _ucNoticeError = null;
-// 「前回の送信先」（直近に完了した送信で実際に使われた provider/endpoint_kind）。「次の送信先」
-// （上記・現在の選択に基づく見込み）とは**別状態・別表示**にする——同じ1行に混ぜると、送信中に
-// トグルを変えた場合や既定送信の応答到着が遅れた場合に、画面がどちらの情報を出しているか
-// 予測できず、「表示は前回の送信先のままなのに、次に実際に送られる先は現在の選択」という
-// 食い違いが起き得る。`null`＝まだ送信していない。
-let _ucLastSentProvider = null;
-let _ucLastSentEndpointKind = null;
-
-// STAT-2: この画面専用のラベル（`PROVIDER_LABEL`＝頭脳別利用比率チャート用の全プロバイダ一覧とは
-// 別物・「ローカルLLM」のような専門寄りの表現を混ぜない・平文原則）。Azure/custom（OpenAI 互換の
-// 別エンドポイント）は「OpenAI」ではなく「クラウド（OpenAI 互換）」と表示し、実際の送信先の
-// 実態（OpenAI 社そのものではない）を隠さない。
-function ucProviderLabel(provider, endpointKind) {
-  if (provider === 'ollama') return 'ローカル（Ollama）';
-  if (provider === 'openai') {
-    return (endpointKind === 'azure' || endpointKind === 'custom') ? 'クラウド（OpenAI 互換）' : 'OpenAI';
-  }
-  return provider || '';
-}
-
-// 「次の送信先」（現在の選択＝上書き中ならその値・無ければ既定に基づく見込み）。上書き中は
-// 現在の選択を必ず優先する——設定取得の失敗/不正状態でも、明示した上書きは無視しない
-// （エラー案内は `ucUpdateSettingsErrorNote` の別行に併記し、消さない）。
-function ucUpdateProviderNote() {
-  const el = $('usage-chat-provider-note');
-  if (el) {
-    const provider = _ucProviderOverride || _ucDefaultProvider;
-    if (provider) {
-      el.classList.remove('uc-error');
-      el.textContent = '送信先: ' + ucProviderLabel(provider, _ucOpenaiEndpointKind);
-    } else if (_ucNoticeError) {
-      el.classList.add('uc-error');
-      el.textContent = _ucNoticeError;
-    } else {
-      el.classList.remove('uc-error');
-      el.textContent = '確認中…';   // 取得前は未確認の値を出さない
-    }
-  }
-  ucUpdateSettingsErrorNote();
-}
-
-// 設定取得エラーの別行案内。「次の送信先」（上記）が上書き選択中でエラー文言を表示できない
-// 間も、エラー自体は消さずに見える状態を保つ（上書きが無い時は「次の送信先」欄が既にエラーを
-// 表示しているため、二重に出さない）。
-function ucUpdateSettingsErrorNote() {
-  const el = $('usage-chat-settings-error-note');
-  if (!el) return;
-  const showHere = !!(_ucNoticeError && _ucProviderOverride);
-  el.hidden = !showHere;
-  el.textContent = showHere ? _ucNoticeError : '';
-}
-
-// A7（cloud_provider）が openai 以外の間、「今回だけ OpenAI」ボタンの近くに、中央 OpenAI
-// キーが使えない理由を注記する（A7 の排他選択契約＝非選択クラウドのキーは使わない・
-// `sherpa/usage_chat.py::_resolve_cfg` が honest failure（503）にする挙動と、
-// admin-settings.js の「OpenAI に固定」ラジオの注記に揃える）。A7 が未確認（`null`）の間は
-// 出さない（確認できていないことを誤って断定しない）。選択中かどうかに関わらず常に出す
-// （選ぶ前に理由が分かるようにするため）。
-function ucUpdateOpenaiKeyHint() {
-  const el = $('usage-chat-openai-key-hint');
-  if (!el) return;
-  const show = _ucCloudProvider != null && _ucCloudProvider !== 'openai';
-  el.hidden = !show;
-  el.textContent = show
-    ? `OpenAI のキーは頭脳の選択が OpenAI のときだけ使えます`
-      + `（現在: ${UC_CLOUD_PROVIDER_LABELS[_ucCloudProvider] || _ucCloudProvider}）。`
-    : '';
-}
-
-// 「前回の送信先」（直近に完了した送信の確定値・既定/「今回だけ」上書きのどちらの送信でも
-// 更新する）。`_ucNoticeError`（「次の送信先」欄の状態）は一切参照/変更しない——「次の送信先」が
-// 確認中/エラーであっても、直前に実際へ送った事実の表示は独立して正しく保つ。
-function ucUpdateLastSentNote() {
-  const el = $('usage-chat-last-sent-note');
-  if (!el) return;
-  el.textContent = (_ucLastSentProvider == null)
-    ? '前回の送信先: （まだ送信していません）'
-    : '前回の送信先: ' + ucProviderLabel(_ucLastSentProvider, _ucLastSentEndpointKind);
-}
-function ucRecordLastSentProvider(provider, endpointKind) {
-  _ucLastSentProvider = provider;
-  _ucLastSentEndpointKind = endpointKind;
-  ucUpdateLastSentNote();
-}
-
-// 送信可否＝「今回だけ」上書きが選ばれているか、管理設定の取得に成功しているかのどちらか
-// （どちらも無ければ送信先が分からないため送信させない）。送信中は常に無効。
-function ucUpdateSendAvailability() {
-  const btn = $('usage-chat-send');
-  if (btn) btn.disabled = _ucSending || (!_ucProviderOverride && !_ucSettingsReady);
-}
-
-// 初期読み込みと送信直前の再取得が並行して in-flight になり得る（例: ページ読み込み直後に
-// 即座に送信ボタンを押す）。`await` の間に呼び出しが重なると、後から開始した呼び出しの
-// 応答が先に返り、その後で古い呼び出しの応答が遅れて返って新しい状態を上書きしてしまう
-// レースがあり得る——世代番号で「自分より新しい呼び出しが既に始まっているか」を判定し、
-// 追い越された（自分より新しい世代が既に始まっている）応答は状態を変えずに捨てる。
-let _ucSettingsGeneration = 0;
-
-// GET /admin/settings を読み、「次の送信先」表示に使う usage_chat.effective/openai_endpoint
-// を更新する。初期化時と、送信の直前（既定/「今回だけ」上書きのどちらも・他セッションによる
-// 設定変更との食い違い防止）の両方から呼ぶ。
-async function ucLoadSettings() {
-  const myGen = ++_ucSettingsGeneration;
-  try {
-    const settingsView = await getJSON('/admin/settings');
-    if (myGen !== _ucSettingsGeneration) return;   // 追い越された＝この応答は捨てる
-    const uc = settingsView.usage_chat;
-    if (!uc || typeof uc.effective !== 'string' || !Array.isArray(uc.providers)) {
-      throw new Error('usage_chat が応答に含まれていないか形式が不正です');
-    }
-    // openai 接続先種別は usage_chat.effective の妥当性とは無関係な別設定
-    // （openai_endpoint_kind/openai_base_url 由来）——usage_chat.effective が不正な間も
-    // 「今回だけ openai」の送信では引き続き必要になるため、妥当性チェックより先に読む
-    // （後段で早期 return しても、この代入を素通りさせない）。
-    const oe = settingsView.openai_endpoint && settingsView.openai_endpoint.effective;
-    _ucOpenaiEndpointKind = (oe && oe.kind) || null;
-    // A7（cloud_provider）は usage_chat.effective の妥当性とは無関係な別設定——
-    // `_ucOpenaiEndpointKind` と同じ理由で妥当性チェックより先に読む。
-    _ucCloudProvider = (settingsView.cloud && settingsView.cloud.provider) || null;
-    _ucSettingsFetchOk = true;
-    if (!uc.providers.includes(uc.effective)) {
-      // 保存値は取得できたが不正（"(不正な保存値)" 等・選択肢に無い）＝既定送信の送信先が
-      // 確定できない。既定送信は止め、「今回だけ」の明示指定のみ許可する（黙って選択肢の
-      // どれかへ丸めたり、既定 openai として送信したりしない）。
-      _ucDefaultProvider = null;
-      _ucSettingsReady = false;
-      _ucNoticeError = '既定の AI 設定が不正です。「今回だけ」で AI を選んで送信してください。';
-      ucUpdateProviderNote();
-      ucUpdateSendAvailability();
-      ucUpdateOpenaiKeyHint();
-      return;
-    }
-    _ucDefaultProvider = uc.effective;
-    _ucSettingsReady = true;
-    _ucNoticeError = null;
-  } catch (e) {
-    if (myGen !== _ucSettingsGeneration) return;   // 追い越された＝この応答（エラー）は捨てる
-    // 初回取得の成功後に送信直前の再取得が失敗した場合、`_ucDefaultProvider` を残したままだと
-    // override なしの「次の送信先」欄が（エラーではなく）古い既定値をそのまま表示し続けて
-    // しまう——POST 自体は `_ucSettingsReady=false` で止まるが、表示は誤って「送信できる」
-    // ように見える。既定送信の表示状態は他の失敗経路（保存値不正）と同じく丸ごと破棄する。
-    _ucDefaultProvider = null;
-    _ucSettingsReady = false;
-    _ucSettingsFetchOk = false;
-    _ucOpenaiEndpointKind = null;
-    _ucCloudProvider = null;
-    _ucNoticeError = '送信先を取得できませんでした（再読み込みしてください）';
-  }
-  ucUpdateProviderNote();
-  ucUpdateSendAvailability();
-  ucUpdateOpenaiKeyHint();
-}
-
-function ucSetProviderOverride(p) {
-  _ucProviderOverride = p || null;
-  document.querySelectorAll('#usage-chat-provider-toggle .uc-provider-btn').forEach((b) => {
-    b.setAttribute('aria-pressed', String(b.dataset.ucProvider === (_ucProviderOverride || '')));
-  });
-  ucUpdateProviderNote();
-  ucUpdateSendAvailability();
-}
-
-function ucAppendUser(text) {
-  const wrap = $('usage-chat-messages'); if (!wrap) return;
-  const d = document.createElement('div'); d.className = 'msg user';
-  d.innerHTML = `<div style="display:flex;justify-content:flex-end">`
-    + `<div class="bubble-user" style="max-width:78%">${esc(text)}</div></div>`;
-  wrap.appendChild(d); wrap.scrollTop = wrap.scrollHeight;
-}
-function ucAppendAssistant(innerHtml) {
-  const wrap = $('usage-chat-messages'); if (!wrap) return null;
-  const d = document.createElement('div'); d.className = 'msg';
-  d.innerHTML = `<div class="a-row"><div class="a-avatar">S</div><div class="a-body">${innerHtml}</div></div>`;
-  wrap.appendChild(d); wrap.scrollTop = wrap.scrollHeight;
-  return d;
-}
-async function ucSend() {
-  const ta = $('usage-chat-input');
-  const q = (ta && ta.value || '').trim();
-  // 上書き選択が無いのに設定を取得できていない場合は送信させない（ボタンは無効化されている
-  // はずだが、Enter キー送信はボタンの disabled を経由しないため、ここでも防御する）。
-  if (!q || _ucSending || (!_ucProviderOverride && !_ucSettingsReady)) return;
-  // この送信で実際に使う一時上書き値をここで確定させる。以降このリクエストに関する判定
-  // （再取得の要否・body.provider・応答の反映先）は全てこの値を使う——可変な
-  // `_ucProviderOverride` を応答到着後に読み直すと、送信中にトグルを操作された場合に
-  // 「実際に送ったのとは違う値」を参照してしまう。
-  const overrideForThisSend = _ucProviderOverride;
-  ta.value = '';
-  ucAppendUser(q);
-  const placeholder = ucAppendAssistant(
-    '<span class="loading-inline"><span class="spinner spinner-sm"></span><span>考えています...</span></span>');
-  _ucSending = true;
-  ucUpdateSendAvailability();
-  try {
-    // STAT-2: 既定/「今回だけ」上書きのどちらの送信でも、送信直前に設定を再取得する。
-    // 既定送信は表示中の「送信先」が最新の管理設定と一致していることの再確認（ページ読み込み後に
-    // 他セッションが usage_chat_provider を変更している食い違いを防ぐ）。上書き送信も、openai
-    // 接続先種別（`_ucOpenaiEndpointKind`＝Azure/custom 等）を送信前に確定させるために必要
-    // （usage_chat.effective 自体の妥当性とは無関係な別設定のため、上書き送信の可否は
-    // `_ucSettingsFetchOk`＝再取得自体の成否だけで判定し、`_ucSettingsReady`＝既定の送信先が
-    // 有効かどうかは問わない）。
-    await ucLoadSettings();
-    if (!overrideForThisSend && !_ucSettingsReady) {
-      throw new Error('送信先の設定を確認できなかったため送信を中止しました。再読み込みしてください。');
-    }
-    if (overrideForThisSend && !_ucSettingsFetchOk) {
-      throw new Error('接続先の設定を確認できなかったため送信を中止しました。再読み込みしてください。');
-    }
-    const body = { question: q, history: _ucHistory };
-    if (overrideForThisSend) body.provider = overrideForThisSend;
-    const d = await api('POST', '/admin/usage/chat', body);
-    if (!overrideForThisSend) {
-      // provider を省略した送信だけ、応答の確定 provider で「次の送信先」用の既定値を
-      // 更新する——送信前の表示は「予定」であり、GET と POST の間に他セッションが専用設定を
-      // 変更した競合を、応答時点の確定値で吸収する。「今回だけ」上書きの送信は、上書き自体が
-      // その1回の送信先を確定させているため、ここで既定側の状態を書き換えない（上書き解除後の
-      // 「次の送信先」表示が直前の一時的な選択で汚染されるのを防ぐ）。openai 接続先の種別
-      // （`_ucOpenaiEndpointKind`）はここでは更新しない——GET /admin/settings 由来の別状態
-      // であり、この応答の `endpoint_kind`（ollama 使用時は常に `null`）で上書きすると
-      // 無関係な情報が混ざる。
-      _ucDefaultProvider = d.provider_used;
-      ucUpdateProviderNote();
-    }
-    // 「前回の送信先」は「次の送信先」とは別状態・別表示で、既定/「今回だけ」上書きのどちらの
-    // 送信でも独立して更新する。
-    ucRecordLastSentProvider(d.provider_used, d.endpoint_kind);
-    const qClip = ucClip(q), ansClip = ucClip(d.answer);
-    // 表示は切り詰めない（全文を見せる）。会話の記憶（次回送信する history）だけを切り詰める
-    // ため、それが起きたことは画面上にも一言添える（無言で記憶が欠けたように見せない）。
-    let noteHtml = ansClip.clipped
-      ? '<div class="uc-hint">（この回答は長いため、次の質問への引き継ぎでは一部だけ記憶します）</div>' : '';
-    // サーバ側の notes（例: 改善ログの要約を取得できなかった旨）も同じ枠でそのまま見せる
-    // （黙って回答だけ返すと、参照データが欠けていたことに利用者が気付けない）。
-    (d.notes || []).forEach((n) => { noteHtml += `<div class="uc-hint">（${esc(n)}）</div>`; });
-    // 実際に呼んだ調査ツール（名前と引数=数値/idのみ）を1行ずつ見せる
-    // （黙って裏で数値を取りに行くと、回答の根拠が画面のどの集計とも一致しない理由が分からない）。
-    (d.tool_calls || []).forEach((t) => {
-      const argsText = Object.entries(t.args || {}).map(([k, v]) => `${k}=${v}`).join(', ');
-      noteHtml += `<div class="uc-hint">（調べた内容: ${esc(t.name)}(${esc(argsText)})）</div>`;
-    });
-    if (placeholder) placeholder.querySelector('.a-body').innerHTML = `<div class="headline">${mdLite(d.answer)}</div>${noteHtml}`;
-    // 切り詰め済みの本文（省略印付き）をそのまま送る＝サーバ側も省略印の有無を切り詰めの
-    // 証拠として扱うため（4000字ちょうどに切った文字列は「超過」ではなくなり、サーバの
-    // 素朴な長さ比較だけでは切り詰めが起きた事実が監査に残らない・usage_chat.py 参照）。
-    _ucHistory.push({ role: 'user', content: qClip.text }, { role: 'assistant', content: ansClip.text });
-    if (_ucHistory.length > UC_HISTORY_MAX) _ucHistory = _ucHistory.slice(-UC_HISTORY_MAX);
-  } catch (e) {
-    // 502（実送信を試みたが失敗＝実際に使った送信先は確定している）だけ「前回の送信先」を
-    // 応答の provider_used/endpoint_kind で更新する。503（送信前に拒否・未送信）やその他の
-    // エラーでは更新しない——未送信なのに「前回の送信先」を書き換えると、実際には送って
-    // いないのに送信結果があったかのように見えてしまう（`common.js::api` が非2xx応答の
-    // JSON 本文を `err.status`/`err.body` として渡す契約を利用する）。
-    if (e && e.status === 502 && e.body && e.body.provider_used) {
-      ucRecordLastSentProvider(e.body.provider_used, e.body.endpoint_kind);
-    }
-    if (placeholder) {
-      placeholder.querySelector('.a-body').innerHTML =
-        `<div class="headline uc-error">${esc(String((e && e.message) || e))}</div>`;
-    }
-  } finally {
-    _ucSending = false;
-    ucUpdateSendAvailability();
-    if (ta) ta.focus();
-  }
-}
-const ucSendBtn = $('usage-chat-send');
-if (ucSendBtn) ucSendBtn.addEventListener('click', ucSend);
-const ucInput = $('usage-chat-input');
-if (ucInput) {
-  ucInput.addEventListener('keydown', (e) => {
-    // IME変換中の確定 Enter では送信しない（e.isComposing が使えないブラウザ/IME の組み合わせ
-    // に備え、変換確定イベントの伝統的な合図 keyCode===229 も合わせて見る）。
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ucSend(); }
-  });
-}
-const ucProviderToggle = $('usage-chat-provider-toggle');
-if (ucProviderToggle) {
-  ucProviderToggle.addEventListener('click', (e) => {
-    const btn = e.target.closest('.uc-provider-btn');
-    if (!btn) return;
-    ucSetProviderOverride(btn.dataset.ucProvider || null);
-  });
-}
-
 // ===== 初期化 =====
-ucUpdateProviderNote();       // 「確認中…」を即座に反映（'openai' 等の未確認の値は出さない）
-ucUpdateLastSentNote();       // 「（まだ送信していません）」を即座に反映
-ucUpdateSendAvailability();   // 設定取得前は送信不可
-ucUpdateOpenaiKeyHint();      // A7 未確認のうちは非表示
 (async () => {
   const isAdmin = await checkAdmin();
   if (!isAdmin) {
@@ -1506,5 +1140,5 @@ ucUpdateOpenaiKeyHint();      // A7 未確認のうちは非表示
   _adminReady = true;
   const view = usageView();
   if (view.periodError) showPeriodError(view);
-  await Promise.all([ucLoadSettings(), view.periodError ? null : load(view.period)]);
+  if (!view.periodError) await load(view.period);
 })();

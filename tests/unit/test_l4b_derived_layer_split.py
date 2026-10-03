@@ -105,22 +105,6 @@ def test_real_placement_three_layers_physically_separated(monkeypatch, tmp_path)
 
 # ---- 受け入れ条件2: grep（rag 優先／legacy フォールバックの両方）----
 
-def test_real_placement_grep_search_rag_priority_and_legacy_fallback(monkeypatch, tmp_path):
-    """grep_search は実配置（`worlds.derived_rag_dir`/`derived_md_dir` を monkeypatch しない）でも
-    rag 優先・legacy フォールバックのどちらでも正しく1件だけヒットする（legacy 側は
-    `grep_tool.rag_grep_enabled` を直接差し替えて模擬——TOGGLE-RM・2026-09-03 でグローバルな
-    系統切替トグルは撤去済みのため env では OFF にできない）。"""
-    world_id = "l4b-grep-world"
-    source = _real_world(monkeypatch, tmp_path, world_id)
-    _build(world_id, source)
-
-    hits = grep_tool.grep_search("XLSX_NEEDLE", world=world_id)
-    assert len(hits) == 1 and hits[0]["doc_id"] == "a.xlsx"
-
-    monkeypatch.setattr(grep_tool, "rag_grep_enabled", lambda: False)
-    hits_legacy = grep_tool.grep_search("XLSX_NEEDLE", world=world_id)
-    assert len(hits_legacy) == 1 and hits_legacy[0]["doc_id"] == "a.xlsx"
-
 
 # ---- 受け入れ条件3: read_doc/read_around（agentic_search）----
 

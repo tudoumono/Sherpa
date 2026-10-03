@@ -1,4 +1,4 @@
-"""影響一覧の Excel 出力（15-初期MVP詳細.md §5.1・R7）。openpyxl で workspace/outputs に生成。"""
+"""影響一覧の Excel 出力。openpyxl で workspace/outputs に生成。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,11 +12,7 @@ HEADERS = ["種別", "対象", "経路", "根拠文書", "根拠DL"]
 
 
 def build_xlsx(result: dict, path) -> Path:
-    """run_impact の結果 → .xlsx。各影響行に 経路・根拠文書・根拠DL を付ける。
-
-    K12（2026-09-04-グラフのソース正典化.md §4）: 「判定」（確実/要確認）「method」列は撤去
-    （全件同格・機構ごと撤去）。「△推定」（grep 共起の推定）だけは経路列に明示して別枠のまま残す。
-    """
+    """run_impact の結果 → .xlsx。各影響行に 経路・根拠文書・根拠DL を付ける（△推定は経路列に明示）。"""
     wb = Workbook()
     ws = wb.active
     ws.title = "影響一覧"
@@ -31,11 +27,11 @@ def build_xlsx(result: dict, path) -> Path:
         ws.append([
             item["category"],
             item["name"],
-            " → ".join(item.get("trace", [])),     # 経路＝ノード名列（鏡: item['trace']）
+            " → ".join(item.get("trace", [])),
             "; ".join(docs),
             _dl(docs),
         ])
-    # 構造的な影響が無いとき: 資料からの関連推定も出す（チャット/APIの二段回答と一致・RV Low）。
+    # 構造的な影響が無いとき: 資料からの関連推定も出す
     for p in (result.get("presumed") or []):
         docs = sorted({e["doc"] for e in p.get("evidence", []) if e.get("doc")})
         quote_txt = next((e.get("quote", "") for e in p.get("evidence", [])), "")

@@ -8,10 +8,10 @@
 # TestClient 生成が unit 実行に混入する）。api/integration はスライス2 の
 # pytest 化完了時にここへ追加する。明示パス指定（pytest tests/api 等）は従来どおり可。
 testpaths = ["tests/unit", "tests/contract"]
-# e2e/e2e_live は既定収集から外す（ブラウザ/起動済みサーバが要るため）。
+# e2e は既定収集から外す（ブラウザが要るため）。
 # 明示指定（例: `python3 -m pytest tests/e2e`）はコマンドライン引数が testpaths より
 # 優先されるため従来どおり動く（norecursedirs は再帰探索のみに効く）。
-norecursedirs = ["e2e", "e2e_live", ".*", ".venv", "build", "dist", "node_modules", "mockups", "*.egg"]
+norecursedirs = ["e2e", ".*", ".venv", "build", "dist", "node_modules", "*.egg"]
 addopts = "-ra"
 markers = [
     "unit: 外部サービス不要の単体テスト",
@@ -19,7 +19,6 @@ markers = [
     "contract: 設計上の契約を固定するテスト（鏡モデル等・外部サービス不要）",
     "integration: Neo4j/Postgres/Elasticsearch など実サービスを使う結合テスト",
     "e2e: Playwright による UI テスト（DB/API はモック・web を静的配信）",
-    "e2e_live: Playwright + 起動済み FastAPI/DB を実際に叩く結合 UI テスト",
 ]
 
 [tool.ruff]
@@ -28,7 +27,7 @@ target-version = "py312"
 # 強制はしない（厳格化はフェーズ進行で。refactoring-plan フェーズ0-5）。
 line-length = 140
 # 生成物・非 Python・vendor 相当は対象外。
-exclude = ["web", "docker", "mockups", "dist", "fixtures", "data", ".venv"]
+exclude = ["web", "docker", "dist", "fixtures", "data", ".venv"]
 
 [tool.ruff.lint]
 # 初期は「既存コードがそのまま通る」緩い設定（refactoring-plan フェーズ0-item5）。

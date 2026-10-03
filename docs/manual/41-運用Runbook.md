@@ -16,9 +16,9 @@
 | 3 | 一枚看板 | `make status` | ストア3つ・アプリ（healthz）・LAN/Caddy・URL |
 | 4 | 死活応答 | `curl -s http://127.0.0.1:8000/healthz` | `{"ok":true}` が返ればアプリ核は生きている |
 | 5 | アプリログ | `tail -n 100 data/run/api.log` | 例外・起動失敗の直接の手がかり |
-| 6 | 全ログ（アプリ＋ストア） | `make logs`（絞り込み例: `make logs ARGS="convert embed"`） | api/convert/embed/usage 等と PostgreSQL/Neo4j/Elasticsearch を1画面に合流して追う（`-l` で一覧、`-r` で集計レポート、`-h` でヘルプ） |
+| 6 | 全ログ（アプリ＋ストア） | `make logs`（絞り込み例: `make logs convert embed`・短縮 `make l c e`） | api/convert/embed/usage 等と PostgreSQL/Neo4j/Elasticsearch を1画面に合流して追う（`make logs help` で名前の一覧、`make logs report` で集計レポート） |
 
-> **してはいけないこと**: 復旧目的で `make nuke` を実行しない（ストアの**ボリュームごと削除**＝データ消去です）。
+> **してはいけないこと**: 復旧目的で `make nuke` を実行しない（ストアの**ボリュームごと削除**＝データ消去です。確認は 2 回・端末必須）。
 > 迷ったらまず `make up`（ストア再起動）と `make restart`（アプリ再起動）。どちらもデータは消しません。
 
 ## 障害シナリオ別の手順
@@ -274,7 +274,7 @@ ls /opt/sherpa/releases/                       # 旧版フォルダ名を確認�
 
 ### S8. OpenAI 系の応答が「接続先が未確定」で止まる（fail-closed）
 
-**症状**: チャット（OpenAI 直結／Codex(OpenAI) 構成）・埋め込み・検索用文書の整形（有効時）などが揃って失敗し、
+**症状**: チャット（Codex 調査（OpenAI）、または簡易で OpenAI を使うとき）・埋め込み・検索用文書の整形（有効時）などが揃って失敗し、
 理由に「OpenAI 接続先の設定が未確定のため停止しています（env の設定を修正して再起動してください）」
 が出る。管理画面の状態ページの「OpenAI API」行にも同じ理由が出る。
 
@@ -363,9 +363,9 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 | Caddy（LAN 公開時のみ） | `data/run/caddy.log` | リバースプロキシ/HTTPS のログ |
 | LibreOffice 変換 | `data/run/libreoffice.log` | 旧形式 Office（.doc/.xls/.ppt）変換の詳細（`legacy_backend`＝libreoffice／office_com 両方。`SHERPA_LOG_DIR` で変更可） |
 | MD 変換（取り込み） | `data/run/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
-| LLM 埋め込み | `data/run/embed.log` | ベクトル埋め込み生成（OpenAI/Gemini/Ollama）の詳細 |
+| LLM 埋め込み | `data/run/embed.log` | ベクトル埋め込み生成（OpenAI/Ollama）の詳細 |
 | AI 利用量 | `data/run/usage.log` | LLM 呼び出し1回ごとの kind/provider/model/トークン数/経過秒（`sherpa/metering.py::record`・チャット本回答含む・LOG-UX・2026-09-04） |
-| Codex 実行ログ | `make logs ARGS="codex"`（`data/run/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
+| Codex 実行ログ | `make logs codex`（`data/run/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
 | Codex 実行 | `data/run/codex.log` | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため・2026-09-20） |
 
 **WARNING 以上（障害の疑いがある事象）はサブシステム別ログだけでなく `data/run/api.log`（run ログ）にも残ります**——
@@ -375,12 +375,12 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 
 **まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`make logs` は data/run/*.log と
 Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に合流して追えます
-（`make logs ARGS="convert embed"` で絞り込み・`make logs ARGS="-r"` で追わずに集計レポート・
-`make logs ARGS="-h"` でヘルプ。本書冒頭「最初の5分（トリアージ）」表の6行目も参照）。
+（`make logs convert embed` で絞り込み・`make logs report` で追わずに集計レポート・
+`make logs help` でヘルプ。本書冒頭「最初の5分（トリアージ）」表の6行目も参照）。
 
 ### make logs のオプション早見
 
-`make logs ARGS="…"` の引数はそのまま `scripts/logs.sh` に渡ります。**名前**（何を見るか）と
+`make logs` の後ろに並べた語はそのまま `scripts/logs.sh` の引数になります（`make logs convert embed`）。`make l`（短縮）でも同じです。**名前**（何を見るか）と
 **オプション**（どう見るか）を組み合わせます。名前を1つでも指定すると、指定しなかった側
 （アプリ/Docker）は表示されません。
 
@@ -397,31 +397,39 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 | `postgres` / `neo4j` / `elasticsearch` / `ocr-worker` | Docker ストア側（別名: `pg`・`es`・`ocr`） |
 
 `api-20260904-193821` のような日時付きの名前は**退避された過去世代**です（下の「起動時の退避」参照）。
-その環境で指定できる名前の一覧は `make logs ARGS="-h"` が実物から生成して表示します。
+その環境で指定できる名前の一覧（各名前の説明・短縮つき）は `make logs help`（短縮 `make l h`）が実物から生成して表示します。知らない名前を指定したときも同じ一覧を出して止まります。
 
-**オプション（どう見るか）**
+**語・オプション（どう見るか）**
 
-| オプション | 意味 |
-|---|---|
-| `-n N` | 追う前に末尾 N 行を先に表示（既定 20） |
-| `-g PATTERN` | 正規表現に一致する行だけ表示 |
-| `-m [N]` | メモリ行（[mem]＝空きメモリと主要プロセスの使用量）を出す（N 秒おき・N を省くと 10 秒）。既定は出さない |
-| `-x 名前` | 指定した名前を除外（複数回可） |
-| `-l` | 追わずに、一覧と各ログの末尾だけ表示して終了 |
-| `-r` | 追わずに**集計レポート**（ファイル別の変換所要秒 Top10・埋め込みスループット・用途別トークン・エラーのまとめ） |
-| `-r -A` | 集計に退避された過去世代も連結（再起動をまたいだ全期間を見る） |
-| `-h` | ヘルプ（その環境で使える名前一覧＋下の用途別レシピ入り） |
+`make logs` の後ろには、名前のほかに次の語を同じ並びで書けます（`-` で始まるオプションは make 自身に取られるため、make 経由では語で書きます。`./scripts/logs.sh` を直接使うときはオプションも使えます）。
+
+| make での語（短縮） | オプション | 意味 |
+|---|---|---|
+| `n=500` | `-n N` | 追う前に末尾 N 行を先に表示（既定 20）。数字以外は一覧を出して止まる |
+| `err` | `-g PATTERN` | エラー・警告（`ERROR\|WARN\|失敗\|✗`）の行だけ表示（任意の正規表現は `-g`） |
+| `mem`（`m`） | `-m [N]` | メモリ行（[mem]＝空きメモリと主要プロセスの使用量）を出す（既定 10 秒おき） |
+| — | `-x 名前` | 指定した名前を除外（複数回可） |
+| — | `-l` | 追わずに、一覧と各ログの末尾だけ表示して終了 |
+| `report`（`r`） | `-r` | 追わずに**集計レポート**（ファイル別の変換所要秒 Top10・埋め込みスループット・用途別トークン・エラーのまとめ） |
+| — | `-r -A` | 集計に退避された過去世代も連結（再起動をまたいだ全期間を見る） |
+| `help`（`h`） | `-h` | ヘルプ（その環境で使える名前一覧と短縮＋下の用途別レシピ入り） |
+
+名前の短縮: `c`=convert・`e`=embed・`lo`=libreoffice・`u`=usage・`cx`=codex・`app`=api・`pg`=postgres・`es`=elasticsearch・`neo`=neo4j・`ocr`=ocr-worker。
 
 **用途別レシピ**
 
 ```bash
-make logs ARGS="convert embed libreoffice -m 5"   # 資料取り込みを監視（メモリ5秒間隔）
-make logs ARGS="-g 'ERROR|WARN|失敗|✗'"           # エラー・警告だけ拾う
-make logs ARGS="-x api"                            # アプリ全般から api のノイズを抜く
-make logs ARGS=""                                  # 全部（アプリ＋Docker。メモリも見るときは -m）
-make logs ARGS="-l"                                # いまの状況を一覧で（追わない）
-make logs ARGS="-r"                                # 取り込み後の振り返りレポート
+make logs convert embed libreoffice mem   # 資料取り込みを監視（メモリ行つき）
+make l c e m                               # 同じことの短縮
+make logs n=500 convert                    # 最初に末尾 500 行から
+make logs err                              # エラー・警告だけ拾う
+make logs help                             # 指定できる名前の一覧（短縮 make l h）
+make logs report                           # 取り込み後の振り返りレポート
+make logs ARGS="-x api"                    # アプリ全般から api のノイズを抜く（ARGS に詰める書き方も使える）
+make logs ARGS="-l"                        # いまの状況を一覧で（追わない）
 ```
+
+`NAME=convert,embed`・`MEM=1`・`REPORT=1`・`N=500` の書き方も使えますが、後ろに語を並べる書き方を基本にしてください。
 
 ### 起動時の退避（ローテーション）
 
@@ -431,26 +439,11 @@ make logs ARGS="-r"                                # 取り込み後の振り返
 （`ls -t data/run/api-*.log | head` で新しい順に一覧できます）。
 
 退避ファイルは無限には残りません。同じファイル（例: `api.log`）由来の退避ファイル数が
-`SHERPA_LOG_KEEP`（既定 10）を超えたら、最古のものから自動で削除します。ディスク逼迫時に
-保持数を減らしたい場合は `.env` の `SHERPA_LOG_KEEP` を小さくして `make restart`（既存の
-退避ファイルにも次回起動時のプルーニングで反映されます）。
+10 を超えたら、最古のものから自動で削除します。ディスク逼迫時は、古い退避ファイルを手で削除してください。
 
 実装: シェル起動経路（run/caddy ログ）は `scripts/run-common.sh::sherpa_rotate_log`、
 サブシステム別ログ（Python 側）は `sherpa/log_setup.py::rotate_and_prune`。命名規約・保持数の
 意味論は両者で揃えています。
-
-### 呼び出し先の鎖を見る（make graph-chain）
-
-起点のファイルから、呼び出し・コピー・DB アクセスのつながりを下り向きにたどり、届いたファイルと、それぞれの SQL の候補（`EXEC SQL` の行数・`SELECT`〜`FROM` の箇所数）を表示します。SQL の候補は字句で数えた目印で、コメントの中の語も数えます（中身は原本で確かめます）。読み取り専用で、資料の本文は出しません。
-
-```bash
-make graph-chain FROM=<ファイル名かパス>                    # 取込ディレクトリが 1 つならこれだけ
-make graph-chain FROM=<ファイル名かパス> WORLD=<取込ディレクトリ> DEPTH=10
-```
-
-- グラフにつながりが無い呼び出し（関数ポインタ・マクロ・解決できなかった呼び出し）はたどれません。届かなかったファイルが「呼ばれていない」とは限りません。
-- 段数（既定 8）かファイル数（300）の上限に達したら、その旨を表示します。
-- 起点の候補が 20 件を超えるときは止まります。ファイルのパスで指定してください。
 
 ### 会話の流れを時刻順に書き出す（make trace）
 

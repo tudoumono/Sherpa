@@ -32,8 +32,8 @@ from _test_users import register_test_uid
 from sherpa import auth, store
 from sherpa.api import app, _sweep_expired_workspace
 
-# 個人 workspace ルート・TTL（90 日）は conftest.py が tests/api のどの test_*.py よりも先に
-# 確定させている（sherpa.api._USERS_DIR / _WORKSPACE_TTL_DAYS は import 時定数）。
+# 個人 workspace ルートは conftest.py が tests/api のどの test_*.py よりも先に確定させている
+# （sherpa.api._USERS_DIR は import 時定数）。保持日数（既定 90 日）は管理画面の設定（未設定は既定）。
 client = TestClient(app, raise_server_exceptions=True)
 
 
@@ -787,3 +787,30 @@ def test_gc_orphan_parent_symlink_rejected():
     (udir / "workspace").symlink_to(outside)
     _gc_orphan_workspace_files()
     assert bait.exists(), "GC followed a workspace symlink and deleted external file (HIGH)"
+
+
+def test_w4_expired_unswept_file_is_not_downloadable():
+    """掃除が来る前でも、期限切れの行は台帳から返さない（ダウンロード不可）。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    uid, _pw = _mk_user(_sfx())
+    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    row = store.record_workspace_file(uid, "exp.txt", "/nonexistent/exp.txt", 1, "aa", expires_at=past)
+    assert store.get_workspace_file(uid, row["id"]) is None
+    store.delete_workspace_file(uid, row["id"])
+
+
+def test_expired_uploaded_row_is_hidden_from_list_and_live_paths():
+    """掃除前でも、期限切れの uploaded 行は一覧・台帳基準の検索対象（live_workspace_rel_paths）に出ない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    sfx = _sfx()
+    uid, _pw = _mk_user(sfx)
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    store.record_workspace_file(uid, f"old_{sfx}.txt", "/x/old", 1, "h1", expires_at=past)
+    store.record_workspace_file(uid, f"new_{sfx}.txt", "/x/new", 1, "h2", expires_at=future)
+    store.record_workspace_file(uid, f"forever_{sfx}.txt", "/x/forever", 1, "h3", expires_at=None)
+    expected = {f"new_{sfx}.txt", f"forever_{sfx}.txt"}
+    assert store.live_workspace_rel_paths(uid) == expected
+    assert {r["rel_path"] for r in store.list_workspace_files(uid)} == expected

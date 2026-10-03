@@ -397,7 +397,6 @@ def test_pure_code_world_unchanged_sync_does_not_loop_reindex_when_embeddings_co
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "delete_world", lambda w: True)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     ec = {"provider": "openai", "model": "text-embedding-3-small", "dim": 1536}
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: ec)
     monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
@@ -441,7 +440,6 @@ def test_true_embed_failure_does_not_record_features_and_retries(monkeypatch):
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "delete_world", lambda w: True)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     ec = {"provider": "openai", "model": "text-embedding-3-small", "dim": 1536}
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: ec)
     monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
@@ -595,7 +593,7 @@ def test_search_skips_system_settings_read_when_disable_embed_active(monkeypatch
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "_req", lambda *a, **k: {"hits": {"hits": []}})
     hits, reason = es_index.search("w", "query")
-    assert reason is None
+    assert reason == "embedding_not_configured"
     assert hits == []
 
 
@@ -880,7 +878,7 @@ def test_search_embedding_unresolved_keeps_existing_reason_not_mismatch(monkeypa
     assert reason == "embedding_cloud_unavailable"
     monkeypatch.setattr(es_index.embeddings, "cloud_selected_but_unavailable", lambda *a, **k: False)
     _, reason = es_index.search("w", "query")
-    assert reason is None
+    assert reason == "embedding_not_configured"
 
 
 def test_search_feature_mismatch_with_bm25_failure_prefers_es_query_failed(monkeypatch):
@@ -892,15 +890,15 @@ def test_search_feature_mismatch_with_bm25_failure_prefers_es_query_failed(monke
 
 
 def test_degrade_vocabulary_includes_vector_feature_mismatch():
-    from sherpa import search_service
-    assert "vector_feature_mismatch" in search_service.DEGRADE_REASONS
+    from sherpa.parts.read import fused_search
+    assert "vector_feature_mismatch" in fused_search.DEGRADE_REASONS
 
 
 def test_degrade_vocabulary_includes_hybrid_query_failed():
-    """RV3: `hybrid_query_failed` は `search_service.DEGRADE_REASONS` にも登録済み
+    """RV3: `hybrid_query_failed` は `fused_search.DEGRADE_REASONS` にも登録済み
     （増やすときは両方直す契約・`es_index.search()` docstring 参照）。"""
-    from sherpa import search_service
-    assert "hybrid_query_failed" in search_service.DEGRADE_REASONS
+    from sherpa.parts.read import fused_search
+    assert "hybrid_query_failed" in fused_search.DEGRADE_REASONS
 
 
 def test_search_shares_one_system_settings_snapshot(monkeypatch):
@@ -1013,10 +1011,9 @@ def test_needs_reindex_reacts_to_analyzer_config_drift(monkeypatch):
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A"})
+        "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A"})
     assert es_index.needs_reindex("w", "c1") is False           # 全一致＝不要
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-B")   # アナライザ構成が変わった
     assert es_index.needs_reindex("w", "c1") is True
@@ -1030,10 +1027,9 @@ def test_needs_reindex_old_index_without_analyzer_config_sig_field_forces_one_ti
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A"})   # 旧索引（フィールド無し）
+        "arms_sig": "sig-A"})   # 旧索引（フィールド無し）
     assert es_index.needs_reindex("w", "c1") is True
 
 
@@ -1068,13 +1064,11 @@ def test_stale_mapping_v4_index_triggers_reindex_once_then_stays_stable(monkeypa
     monkeypatch.setattr(es_index, "_embed_cached", lambda *a, **k: (None, 0, 0))
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     # `_analyzer_config_sig` は実関数のまま（mock しない・実際の repr 値で往復させる）。
     # `_restore_refresh_interval` が完走後に無条件で `_req` を呼ぶ（Codex RV 2巡目 sweep で検出）。
     monkeypatch.setattr(es_index, "_req", lambda *a, **kw: {})
 
-    store = {"content_sig": content_sig, "mapping_version": "4", "arms_sig": "sig-A",
-             "search_chunk_mode": "legacy"}   # 旧索引（v4・analyzer_config_sig フィールド自体が無い）
+    store = {"content_sig": content_sig, "mapping_version": "4", "arms_sig": "sig-A"}   # 旧索引（v4・analyzer_config_sig フィールド自体が無い）
     monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(store))
     # `content_sig` は全バッチ成功後に `_confirm_content_sig` が Put Mapping で後書きする
     # （途中でプロセスが落ちても中途半端な索引が居座らないため）。簡易ストアにもその往復を再現する。
@@ -1187,26 +1181,24 @@ def test_needs_reindex_reacts_to_human_md_drift_regardless_of_rag_es_setting(mon
     monkeypatch.setattr(office_md, "_current_human_md_sig", lambda: "human-md-vNEW")
 
     # legacy（旧世代索引）: 索引済みメタは旧版のまま＝ズレを検知して reindex 要。
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A", "human_md_sig": "human-md-vOLD"})
+        "arms_sig": "sig-A", "human_md_sig": "human-md-vOLD"})
     assert es_index.needs_reindex("w", "c1") is True
 
     # rag（RAG_ES 有効）でも human_md のレンダラ版だけを変えれば同様に reindex 要
     # （RAG_ES=ON でも rag_chunks 無効時の legacy 縮退経路に human_md 版が影響しうるため
     # 無条件には無視できない）。
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "rag")
     monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "rag", "arms_sig": "sig-A", "human_md_sig": "human-md-vOLD"})
+        "arms_sig": "sig-A", "human_md_sig": "human-md-vOLD"})
     assert es_index.needs_reindex("w", "c1") is True
 
     # 一致していれば（RAG_ES の設定に関わらず）reindex 不要。
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "rag", "arms_sig": "sig-A", "human_md_sig": "human-md-vNEW"})
+        "arms_sig": "sig-A", "human_md_sig": "human-md-vNEW"})
     assert es_index.needs_reindex("w", "c1") is False
 
 
@@ -1220,10 +1212,9 @@ def test_needs_reindex_reacts_to_arms_config_drift(monkeypatch):
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")   # アナライザ構成は不変に固定
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")   # 索引ソース方針は不変に固定
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A",
+        "arms_sig": "sig-A",
         "analyzer_config_sig": "acfg-A"})   # chunk_lines は既定時は書かない
     assert es_index.needs_reindex("w", "c1") is False           # 全一致＝不要
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-B")   # アーム構成が変わった
@@ -1239,11 +1230,10 @@ def test_needs_reindex_reacts_to_embed_algo_drift(monkeypatch):
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: {
         "provider": "openai", "model": "m", "dim": 3})
     base_meta = {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-                 "search_chunk_mode": "legacy", "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A",
+                 "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A",
                  "embed_provider": "openai", "embed_model": "m", "dim": 3}
     # 旧索引（embed_algo フィールド自体が無い）＝1回だけ reindex される。
     monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(base_meta))
@@ -1267,10 +1257,9 @@ def test_needs_reindex_reacts_to_mapping_version_drift(monkeypatch):
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
 
     def _meta(mapping_version):
-        return {"content_sig": "c1", "mapping_version": mapping_version, "search_chunk_mode": "legacy",
+        return {"content_sig": "c1", "mapping_version": mapping_version,
                 "arms_sig": "sig-A", "human_md_sig": None, "analyzer_config_sig": "acfg-A"}
 
     # 旧版の値ごとに固定: "1"（"2" 追加前）／"2"→"3"（rag_chunks 接続）／"3"→"4"（重要度スキーマ）／
@@ -1296,43 +1285,6 @@ def test_needs_reindex_old_index_without_arms_sig_field_forces_one_time_reindex(
     assert es_index.needs_reindex("w", "c1") is True
 
 
-# ---- needs_reindex: search_chunk_mode の反転検知（High是正・旧世代 legacy 索引からの
-# 一度きりの移行を取りこぼさない安全弁。TOGGLE-RM・2026-09-03 でグローバル切替トグルは撤去済みだが、
-# `rag_es_enabled()` は内部シームとして残るため直接差し替えて検証する）----
-
-def _pin_needs_reindex_signals(monkeypatch, *, arms_sig="sig-A"):
-    """content_sig/mapping_version/arms_sig/human_md_sig/analyzer_config_sig を固定し、
-    search_chunk_mode 系のズレだけを孤立させる。"""
-    monkeypatch.setattr(es_index, "available", lambda: True)
-    monkeypatch.setattr(es_index, "count", lambda w: 5)
-    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
-    monkeypatch.setattr(es_index, "_arms_config_sig", lambda: arms_sig)
-    monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
-    monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-
-
-def test_needs_reindex_reacts_to_search_chunk_mode_flip_off_to_on(monkeypatch):
-    """旧世代（legacy チャンクで索引された時代）の meta を持つ索引は、現行（常時 rag・
-    `rag_es_enabled` は内部シームとして残るが env での切替はもうできない）との不一致を検知して
-    reindex 要となる——一度きりの移行安全弁。"""
-    _pin_needs_reindex_signals(monkeypatch)
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A",
-        "search_chunk_mode": "legacy"})   # legacy で索引済み（chunk_lines は既定時省略）
-    assert es_index.needs_reindex("w", "c1") is True
-
-
-def test_needs_reindex_old_index_without_search_chunk_mode_field_forces_one_time_reindex(monkeypatch):
-    """本 RV 以前の索引（search_chunk_mode フィールド自体が無い）も1回だけ reindex される
-    （メタに無い＝None と現在値の不一致で自然に収束＝新しい特別扱いは不要）。"""
-    _pin_needs_reindex_signals(monkeypatch)
-    monkeypatch.setattr(es_index, "_index_meta", lambda w: {
-        "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION, "arms_sig": "sig-A",
-        "analyzer_config_sig": "acfg-A"})
-    assert es_index.needs_reindex("w", "c1") is True
-
-
 def test_confirm_human_md_meta_updates_field_and_converges_needs_reindex(monkeypatch, tmp_path):
     """`confirm_human_md_meta` は既存の `_meta`（`content_sig` 等）を保持したまま
     `human_md_sig` フィールドだけを現行署名へ書き直す。書き直す前は meta の human_md_sig
@@ -1353,11 +1305,10 @@ def test_confirm_human_md_meta_updates_field_and_converges_needs_reindex(monkeyp
     monkeypatch.setattr(es_index, "count", lambda w: 5)
     monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
 
     meta = {"content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-            "search_chunk_mode": "legacy", "arms_sig": "sig-A", "human_md_sig": None,
+            "arms_sig": "sig-A", "human_md_sig": None,
             "analyzer_config_sig": "acfg-A", "world_id": "w"}
     monkeypatch.setattr(es_index, "_index_meta", lambda w: dict(meta))
 
@@ -1449,32 +1400,7 @@ def test_wipe_after_bulk_failure_still_drops_content_sig_when_meta_get_fails(mon
     assert "content_sig" not in put_calls[0][2]["_meta"]
 
 
-def test_index_world_records_search_chunk_mode(monkeypatch):
-    """index_world は現在の索引ソース方針（常時 rag）を _meta に刻む（drift 検知の書き込み側）。"""
-    monkeypatch.setattr(es_index.corpus_docs, "world_documents", lambda w, include_rag=False: [])
-    monkeypatch.setattr(es_index, "available", lambda: True)
-    monkeypatch.setattr(es_index, "delete_world", lambda w: True)
-    monkeypatch.setattr(es_index, "_embed_cached", lambda *a, **k: (None, 0, 0))
-    monkeypatch.setattr(es_index.embeddings, "cfg", lambda settings=None, **kw: None)
-    # `_restore_refresh_interval` が完走後に無条件で `_req` を呼ぶ（Codex RV 2巡目 sweep で検出）。
-    monkeypatch.setattr(es_index, "_req", lambda *a, **kw: {})
-    captured = {}
-
-    def fake_ensure_index(w, dim=None, emeta=None):
-        captured.update(emeta or {})
-        return True
-
-    monkeypatch.setattr(es_index, "ensure_index", fake_ensure_index)
-    es_index.index_world("w")
-    assert captured["search_chunk_mode"] == "rag"
-
-
 # ---- rag_chunks 接続（ES 索引ソースの切替）----
-
-def test_rag_es_enabled_always_true_no_env_toggle():
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・常時 True（env に一切
-    左右されない）。"""
-    assert es_index.rag_es_enabled() is True
 
 
 def test_mapping_has_rag_chunk_fields():
@@ -2091,18 +2017,8 @@ def test_parse_hits_omits_context_neighbor_meta_when_absent():
         assert key not in hit
 
 
-# ---- SHERPA_ES_CHUNK_LINES / needs_reindex 連動 ----
-# import 時に一度だけ確定する定数は実プロセスを新規に起こして検証する（`_fresh_import`）。
-
-
-# ---- env 駆動の import-time 定数（3本へ集約・定数ごとの期待値は全て保持） ----
-# 以前は「1値=1プロセス」の粒度で個別テストに分かれていたが（chunk_lines/hybrid_weight/
-# es_search_k_max の fresh-import 系・es_search_size/es_search_k_ceiling・各 *_env_configurable
-# 系）、独立した env 変数は同じ subprocess の import 内で同時に検証できる（互いに干渉しない）ため
-# 「全部正しい値／全部不正値／全部未設定」の3カテゴリへ集約する。同じ env 変数へ複数の異なる値を
-# 割り当てる境界値（_HYBRID_WEIGHT の 0/0.8/1、_ES_SEARCH_K_MAX の 1/30/100 等）だけは1プロセスに
-# 同居できないため、カテゴリ内で複数回 subprocess を起こす（それでも元の subprocess 総数より
-# 大幅に少ない）。
+# ---- import-time 定数（実プロセスを新規に起こして検証する・`_fresh_import`） ----
+# `_ES_SEARCH_K_MAX` は `SHERPA_GREP_MAX_HITS` から import 時に一度だけ確定する。
 
 def _import_all_constants_script() -> str:
     """対象8定数を1回の import で読み、`search()` の size 系（既定 k のクランプ・k_ceiling 経由の
@@ -2136,12 +2052,7 @@ def _import_all_constants_script() -> str:
     )
 
 
-_ALL_ENV_UNSET = {
-    "SHERPA_ES_CHUNK_LINES": None, "SHERPA_ES_HYBRID_WEIGHT": None, "SHERPA_GREP_MAX_HITS": None,
-    "SHERPA_ES_RAG_CHUNKS_MAX_ROWS": None, "SHERPA_ES_RAG_CHUNKS_FILE_CAP_BYTES": None,
-    "SHERPA_ES_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS": None, "SHERPA_ES_BULK_BATCH_MAX_DOCS": None,
-    "SHERPA_ES_BULK_BATCH_MAX_BYTES": None,
-}
+_ALL_ENV_UNSET: dict = {}
 
 
 def _fetch_env_constants(env: dict) -> dict:
@@ -2151,7 +2062,7 @@ def _fetch_env_constants(env: dict) -> dict:
 
 
 def test_env_constants_fresh_import_all_unset_is_default():
-    """全部未設定: env を一切設定しないとき、import-time 定数は全て既定値になる——`search()` の
+    """未設定: env を設定しないとき、import-time 定数は全て既定値になる——`search()` の
     size 上限（既定 k のクランプ・k_ceiling 経由のバイパス/再クランプ）も同じ既定
     `_ES_SEARCH_K_MAX`（50）に基づくため、1プロセスでまとめて確認する。"""
     out = _fetch_env_constants(_ALL_ENV_UNSET)
@@ -2168,68 +2079,6 @@ def test_env_constants_fresh_import_all_unset_is_default():
     assert out["size_k67_ceiling1000"] == 67
     assert out["size_k90_ceiling1000"] == 90
     assert out["size_k2000_ceiling1000"] == 1000            # k_ceiling 自体はそこでクランプされる
-
-
-def test_env_constants_fresh_import_all_valid_values():
-    """全部正しい値: 8定数を1プロセスでまとめて確認する主ケース（GREP_MAX_HITS=100 は
-    `_ES_SEARCH_K_MAX` を100へ引き上げ、`search()` の size も100まで通ることを合わせて確認）。
-    `_HYBRID_WEIGHT`/`_ES_SEARCH_K_MAX` は同じ env 変数に対する複数の境界値
-    （hybrid=0/1・k_max の50未満側=1/30）も持つため、それらだけ追加の1値1プロセスで補う
-    （同じ env 変数へ複数の値を同時には設定できないため・値ごとの期待値は全て保持する）。"""
-    main_env = {
-        "SHERPA_ES_CHUNK_LINES": "80", "SHERPA_ES_HYBRID_WEIGHT": "0.8", "SHERPA_GREP_MAX_HITS": "100",
-        "SHERPA_ES_RAG_CHUNKS_MAX_ROWS": "500", "SHERPA_ES_RAG_CHUNKS_FILE_CAP_BYTES": "2048",
-        "SHERPA_ES_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS": "500", "SHERPA_ES_BULK_BATCH_MAX_DOCS": "10",
-        "SHERPA_ES_BULK_BATCH_MAX_BYTES": "131072",
-    }
-    out = _fetch_env_constants(main_env)
-    assert out["_CHUNK_LINES"] == 80
-    assert out["_HYBRID_WEIGHT"] == 0.8
-    assert out["_ES_SEARCH_K_MAX"] == 100                  # 50 超は引き上げられる
-    assert out["_RAG_CHUNKS_MAX_ROWS"] == 500
-    assert out["_RAG_CHUNKS_FILE_CAP_BYTES"] == 2048
-    assert out["_RAG_CHUNK_SEARCH_TEXT_MAX_CHARS"] == 500
-    assert out["_ES_BULK_BATCH_MAX_DOCS"] == 10
-    assert out["_ES_BULK_BATCH_MAX_BYTES"] == 131072
-    assert out["size_default_k"] == 100                    # search() の size 上限も一緒に引き上がる
-
-    # 境界値: _HYBRID_WEIGHT の 0/1（0.8 は上の主ケースで確認済み）。
-    assert FI.fresh_import_attr("sherpa.es_index", "_HYBRID_WEIGHT",
-                                env={"SHERPA_ES_HYBRID_WEIGHT": "0"}) == 0.0
-    assert FI.fresh_import_attr("sherpa.es_index", "_HYBRID_WEIGHT",
-                                env={"SHERPA_ES_HYBRID_WEIGHT": "1"}) == 1.0
-
-    # 境界値: _ES_SEARCH_K_MAX は50未満の値でも床(50)を割らない（100 は上の主ケースで確認済み）。
-    # 30 は grep 側の既定値でもある＝ search() の size も一緒に50で床打ちすることを確認する。
-    out30 = _fetch_env_constants({**_ALL_ENV_UNSET, "SHERPA_GREP_MAX_HITS": "30"})
-    assert out30["_ES_SEARCH_K_MAX"] == 50 and out30["size_default_k"] == 50
-    assert FI.fresh_import_attr("sherpa.es_index", "_ES_SEARCH_K_MAX",
-                                env={"SHERPA_GREP_MAX_HITS": "1"}) == 50
-
-
-def test_env_constants_fresh_import_all_invalid_values_fall_back_to_default():
-    """全部不正値: 不正値の受け入れ条件を持つのは `_CHUNK_LINES`/`_HYBRID_WEIGHT`/
-    `_ES_SEARCH_K_MAX` の3定数だけ（`_RAG_CHUNKS_*`/`_ES_BULK_BATCH_*` は元々 unset/valid の
-    2ケースのみ）。型不正（非数値）・下限未満・上限超過の3パターンを、それぞれ対象3定数へ
-    同時に与え、1プロセスずつ（パターンごと）で全部既定値へ落ちることを確認する。"""
-    for env, label in (
-        ({"SHERPA_ES_CHUNK_LINES": "abc", "SHERPA_ES_HYBRID_WEIGHT": "abc",
-          "SHERPA_GREP_MAX_HITS": "abc"}, "非数値"),
-        ({"SHERPA_ES_CHUNK_LINES": "5", "SHERPA_ES_HYBRID_WEIGHT": "-0.1",
-          "SHERPA_GREP_MAX_HITS": "0"}, "下限未満"),
-        ({"SHERPA_ES_CHUNK_LINES": "401", "SHERPA_ES_HYBRID_WEIGHT": "1.1",
-          "SHERPA_GREP_MAX_HITS": "1001"}, "上限超過"),
-    ):
-        out = _fetch_env_constants({**_ALL_ENV_UNSET, **env})
-        assert out["_CHUNK_LINES"] == 40, label
-        assert out["_HYBRID_WEIGHT"] == 0.5, label
-        assert out["_ES_SEARCH_K_MAX"] == 50, label
-
-
-def test_chunk_lines_env_change_after_import_has_no_effect(monkeypatch):
-    before = es_index._CHUNK_LINES
-    monkeypatch.setenv("SHERPA_ES_CHUNK_LINES", "300")
-    assert es_index._CHUNK_LINES == before == 40
 
 
 def test_index_world_omits_chunk_lines_at_default(monkeypatch):
@@ -2275,7 +2124,7 @@ def test_index_world_records_chunk_lines_when_non_default(monkeypatch):
 
 
 def test_needs_reindex_reacts_to_chunk_lines_drift(monkeypatch):
-    """`SHERPA_ES_CHUNK_LINES` を変えた（既存索引は旧粒度のまま）＝ content_sig 不変でも
+    """チャンク粒度（`_CHUNK_LINES`）を変えた（既存索引は旧粒度のまま）＝ content_sig 不変でも
     chunk_lines 不一致で reindex 要。"""
     monkeypatch.setattr(es_index, "available", lambda: True)
     monkeypatch.setattr(es_index, "count", lambda w: 5)
@@ -2283,10 +2132,9 @@ def test_needs_reindex_reacts_to_chunk_lines_drift(monkeypatch):
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A",
+        "arms_sig": "sig-A", "analyzer_config_sig": "acfg-A",
         "chunk_lines": 40})
     monkeypatch.setattr(es_index, "_CHUNK_LINES", 40)
     assert es_index.needs_reindex("w", "c1") is False           # 全一致＝不要
@@ -2303,11 +2151,10 @@ def test_needs_reindex_missing_chunk_lines_field_does_not_force_reindex_at_defau
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_CHUNK_LINES", 40)
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A",
+        "arms_sig": "sig-A",
         "analyzer_config_sig": "acfg-A"})   # 旧索引（フィールド無し）
     assert es_index.needs_reindex("w", "c1") is False
 
@@ -2321,27 +2168,18 @@ def test_needs_reindex_missing_chunk_lines_field_still_reacts_when_current_chang
     monkeypatch.setattr(es_index, "_arms_config_sig", lambda: "sig-A")
     monkeypatch.setattr(es_index, "_human_md_config_sig", lambda world: None)   # H2: この寸法は孤立させる
     monkeypatch.setattr(es_index, "_analyzer_config_sig", lambda: "acfg-A")
-    monkeypatch.setattr(es_index, "_search_chunk_mode", lambda: "legacy")
     monkeypatch.setattr(es_index, "_CHUNK_LINES", 80)   # 現在は既定と異なる
     monkeypatch.setattr(es_index, "_index_meta", lambda w: {
         "content_sig": "c1", "mapping_version": es_index.ES_MAPPING_VERSION,
-        "search_chunk_mode": "legacy", "arms_sig": "sig-A",
+        "arms_sig": "sig-A",
         "analyzer_config_sig": "acfg-A"})   # 旧索引（フィールド無し）
     assert es_index.needs_reindex("w", "c1") is True
 
 
-# ---- SHERPA_ES_HYBRID_WEIGHT（BM25/kNN 配分） ----
-
-def test_hybrid_weight_env_change_after_import_has_no_effect(monkeypatch):
-    """他5定数と同様 import 時に一度だけ確定する定数＝同一プロセス内で env を後から変えても
-    効かない。"""
-    before = es_index._HYBRID_WEIGHT
-    monkeypatch.setenv("SHERPA_ES_HYBRID_WEIGHT", "0.9")
-    assert es_index._HYBRID_WEIGHT == before == 0.5
-
+# ---- ES ハイブリッド検索の BM25/kNN 配分（`_HYBRID_WEIGHT`） ----
 
 def test_search_hybrid_query_omits_boost_at_default_weight_for_byte_identical_body(monkeypatch):
-    """既定配分（w=0.5）では boost キー自体を書かない（match 節が生の `{"match": {"text": q}}`
+    """既定配分（w=0.5）では boost キー自体を書かない（match 節が名前（`_name`）以外は素の `match`
     のまま・knn に "boost" が無い＝無指定と同じ本文になる）。
 
     RV是正（rv-i2-importance #4・2026-09）: hybrid（vector=True）は match/knn を同一 `bool.should`
@@ -2368,7 +2206,7 @@ def test_search_hybrid_query_omits_boost_at_default_weight_for_byte_identical_bo
     body = captured["body"]
     assert "knn" not in body   # top-level knn パラメータはもう使わない（query 節の中身へ移した）
     bool_q = body["query"]["function_score"]["query"]["bool"]
-    assert bool_q["should"][0] == {"match": {"text": "query"}}
+    assert bool_q["should"][0] == {"match": {"text": {"query": "query", "_name": es_index._KEYWORD_QUERY_NAME}}}
     assert "boost" not in bool_q["should"][1]["knn"]
 
 
@@ -2400,22 +2238,10 @@ def test_search_hybrid_query_weight_skews_boost_toward_keyword(monkeypatch):
     assert round(match_boost + knn_boost, 6) == 2.0
 
 
-# ---- SHERPA_GREP_MAX_HITS と ES 側 size 上限（_ES_SEARCH_K_MAX）の連動 ----
-# `.env.example` の `SHERPA_GREP_MAX_HITS` は grep 向けの既定値（30）をコメントアウトで示している
-# だけだが、bootstrap で丸ごと `.env` にコピーする運用や利用者が値だけ有効化する運用でも、
-# ES 側の既定上限（50）を後退させてはいけない＝`_ES_SEARCH_K_MAX` は 50 未満には下がらない。
-
-def test_es_search_k_max_env_change_after_import_has_no_effect(monkeypatch):
-    before = es_index._ES_SEARCH_K_MAX
-    monkeypatch.setenv("SHERPA_GREP_MAX_HITS", "999")
-    assert es_index._ES_SEARCH_K_MAX == before == 50
-
-
 # ---- k_ceiling で `_ES_SEARCH_K_MAX`（既定 50）の再クランプを迂回する ----
 # `agentic_search.run_tool` の es_search 分岐が、調べる深さ（depth_profile）で計算した実効値
 # （既定構成でも「最大」は 30×2=60 に達し、50 の床を超えうる）を渡すための経路。
-# `_ES_SEARCH_K_MAX`/`size` の値そのものの検証（unset=50・100へ引き上げ・30/1は50の床のまま・
-# k_ceiling によるバイパス/再クランプ）は上の `test_env_constants_fresh_import_all_*` へ統合済み。
+# `_ES_SEARCH_K_MAX`/`size` の値そのものの検証（50 固定・k_ceiling によるバイパス/再クランプ）は上の `test_env_constants_fresh_import_all_*` へ統合済み。
 
 
 # ---- bulk バッチ化（2026-09-02・本レーン）: `_bulk_batches` の境界 ----

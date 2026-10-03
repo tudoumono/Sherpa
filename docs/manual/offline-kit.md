@@ -8,12 +8,12 @@
 
 ## 前提（誇張しない・機能マトリクスは下記）
 
-外部 LLM（Codex／OpenAI API／Gemini／AWS Bedrock）は外部ネットワークへの HTTP 呼び出しを伴います
+外部 LLM（Codex／OpenAI API）は外部ネットワークへの HTTP 呼び出しを伴います
 （[08-実行権限と隔離.md §4](../08-実行権限と隔離.md)）。閉域の構成は2通りに分けて考えます。
 
-- **完全閉域（外へ一切出ない）**: 使える「頭脳」は **ローカルLLM（Ollama）** だけ（＋簡易/AIなし）。
+- **完全閉域（外へ一切出ない）**: 使える「頭脳」は、ローカルLLM（Ollama）を使うもの——**簡易**（管理画面の「簡易回答に使う AI」をローカル（Ollama）にする。既定）と、接続先を Ollama にした **Codex 調査（Ollama）**——だけです（AI を使わない定型応答はチャットでは廃止しました）。
 - **閉域＋OpenAI または Azure OpenAI へだけ穴あけ**（本製品の標準想定・既定は `api.openai.com` への到達だけを
-  許可）: 上に加えて **OpenAI 直結** と **Codex（OpenAI）** が使えます。**Azure OpenAI**（Private Link
+  許可）: 上に加えて、**簡易（OpenAI を選んだとき）** と **Codex 調査（OpenAI）** が使えます。**Azure OpenAI**（Private Link
   経由を含む）を使う場合は、到達先ホストが `<リソース名>.openai.azure.com` になるため、プロキシ/
   ファイアウォールの許可先をそちらに変えてください（`OPENAI_BASE_URL` の設定方法は
   「[24. システム管理](24-システム管理.md#接続先を-azure-openai-にする)」参照）。Codex CLI はキットが
@@ -442,34 +442,25 @@ sudo cp .env.example /etc/sherpa/sherpa.env
 sudo editor /etc/sherpa/sherpa.env   # まず冒頭「0. 本番チェックリスト」節を設定する
 ```
 
-`/etc/sherpa/sherpa.env` の頭脳（AI）の設定は、閉域での構成によって実際には3通りです（実機報告
-2026-08-18: 従来の案内は `SHERPA_AGENT=heuristic` だけを書かせていましたが、`SHERPA_EXTRA_AGENTS`
-の併記が無いと選択肢に無い値として無視され、常に Codex へ倒れて（Codex CLI が無ければ動かずに）
-いました。`SHERPA_AGENT` を**書かない**ときは自動選択になります。以前は Codex CLI の有無だけで
+`/etc/sherpa/sherpa.env` の頭脳（AI）の設定は、閉域での構成によって実際には2通りです
+（AI を使わない定型応答はチャットでは廃止しました）。頭脳は自動選択され、チャットで選び直せます（選べるのは `codex`／`simple`）。以前は Codex CLI の有無だけで
 判断していましたが、キットが Codex CLI を同梱するようになり「CLI はあるが認証は無い」ホストが
 現実的になったため、条件を「CLI があり、かつ使える認証（実 `OPENAI_API_KEY` か `codex login`
 済みの `~/.codex/auth.json`）がある」へ変更しました（2026-08-18 Codex RV 2巡目 指摘2）。満たさなければ
-`OPENAI_API_KEY` があれば OpenAI／どちらも無ければ Ollama、の順で選ばれます）。
+簡易が選ばれます。簡易が使う AI は管理画面の「簡易回答に使う AI」の設定で、未設定ならローカル（Ollama）です）。
 
 ```bash
 SHERPA_ENV=production
 
 # 1) OpenAI または Azure OpenAI へ穴あけがある（同梱の Codex CLI を使う）: OPENAI_API_KEY を
-#    設定する（Azure ならそのキー）。SHERPA_AGENT は書かなくてよい（未指定なら自動選択される）。
+#    設定する（Azure ならそのキー）。頭脳は自動選択される。
 OPENAI_API_KEY=
 # Azure OpenAI を使う場合だけ、加えて以下を設定する（モデル欄には Azure の「デプロイ名」を入れる）。
 # OPENAI_BASE_URL=https://<リソース名>.openai.azure.com/openai/v1/
 
-# 2) 外へ出られない・ローカルLLM（Ollama）がある: 以下2行を有効にする。
-# SHERPA_AGENT=ollama
+# 2) 外へ出られない・ローカルLLM（Ollama）がある: 以下を設定する（頭脳は簡易が選ばれる）。
 OLLAMA_URL=http://127.0.0.1:11434
 
-# 3) AI を一切使わない（定型文の簡易応答）: 以下2行を**両方**設定する（片方だけだと選べない値として
-#    無視され、既定（自動選択）に戻ってしまいます）。
-# SHERPA_EXTRA_AGENTS=heuristic
-# SHERPA_AGENT=heuristic
-
-# GEMINI_API_KEY / AWS_BEARER_TOKEN_BEDROCK は、上のどれを選んでも空のまま（未設定）にします。
 ```
 
 ストアの起動・以降のアプリ起動は通常の本番手順と同じです（[40-運用](40-運用.md) の「本番展開の標準手順」）。
@@ -528,8 +519,8 @@ SHERPA_ENV_FILE=/etc/sherpa/sherpa.env make start          # 既定＝社内 LAN
 - [ ] `curl -fsS http://127.0.0.1:8000/healthz` が成功する。
 - [ ] `/health/summary`（画面右上の状態ドット）で PostgreSQL / Neo4j / Elasticsearch が緑になる。
 - [ ] ログインでき、資料フォルダ（world）を登録・取り込みできる（[20-管理-取り込み](20-管理-取り込み.md)）。
-- [ ] チャットで「簡易（AIなし）」を選び、grep 検索の回答が返る。
-- [ ] チャットで「ローカルLLM (Ollama)」を選び、応答が返る（Ollama 同梱時）。
+- [ ] チャットで「簡易（検索して答える）」を選び（簡易回答に使う AI がローカル（Ollama））、検索した回答と出典が返る（Ollama 同梱時）。
+- [ ] チャットで「Codex 調査（Ollama）」を選び、応答が返る（Codex CLI と Ollama 同梱時）。
 - [ ] 影響分析（Neo4j）・全文検索（Elasticsearch）・利用統計・掲示板（トップ画面）が動く。
 - [ ] Marp スライドの HTML 出力ができる（Node.js/marp-cli 同梱時）。
 - [ ] Marp スライドの PDF/PPTX 出力ができ、日本語が文字化けしない（Playwright Chromium 本体＋
@@ -546,23 +537,21 @@ SHERPA_ENV_FILE=/etc/sherpa/sherpa.env make start          # 既定＝社内 LAN
 **外部到達が無いこと**
 
 サーバ env にも利用者の個人設定にも API キーが無い状態が、閉域での正しい状態です。この状態では
-OpenAI／Gemini／Bedrock は**そもそもネットワークへ出ません**（`sherpa/agents.py` の `_select_provider` が
+OpenAI は**そもそもネットワークへ出ません**（`sherpa/agents.py` の `_select_provider` が
 キー未解決を検出した時点で `_UnwiredProvider` に倒し、「未接続」の応答を即返す実装のため）。Codex だけは
 キー有無に関係なく Codex CLI を実際に起動するため、閉域では到達できずタイムアウト/接続エラーで失敗します。
 
-- [ ] チャットの頭脳選択で「OpenAI API」「Gemini」「AWS Bedrock (Claude)」を選んで質問すると、接続を試みず
+- [ ] 「簡易回答に使う AI」を OpenAI にした状態で、チャットの頭脳に「簡易」を選んで質問すると、接続を試みず
       即座に「（頭脳名）はまだ接続されていません」という**設定不足の応答**になること（＝キーが無ければ
       ネットワークに出ないことの確認。固定回答が「未接続」の正直な文言であり、嘘の正常回答でないことも確認）。
-- [ ] チャットの頭脳選択で「Codex」を選んで質問すると、成功はせず**タイムアウトまたは接続エラーで失敗する**こと
+- [ ] チャットの頭脳選択で「Codex 調査（OpenAI）」を選んで質問すると、成功はせず**タイムアウトまたは接続エラーで失敗する**こと
       （＝外部に出ようとして到達できず落ちる。Codex は key gate が無いため必ず接続を試みる）。
-- [ ] 利用者の個人設定（設定画面）に、移行前などに登録した古い OpenAI/Gemini/Bedrock の API キーが
+- [ ] 利用者の個人設定（設定画面）に、移行前などに登録した古い OpenAI の API キーが
       残っていないか確認する。**キーが残っていると「未接続」にならず実際に外部接続を試みてしまう**
       （タイムアウト/接続エラーにはなるが、無用な外向き通信の試行が発生する）。
 - [ ] 閉域環境のネットワーク監視（ファイアウォールログ／プロキシログ等、組織の監視手段）で、Sherpa プロセスから
       外部（80/443等）への送信が発生していないことを確認する。
-- [ ] `.env`（または `sherpa.env`）に `OPENAI_API_KEY` / `GEMINI_API_KEY` /
-      `AWS_BEARER_TOKEN_BEDROCK` / `ANTHROPIC_AWS_API_KEY` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-      が設定されていないことを確認する（サーバ側にキーがあると、その頭脳を選んだユーザー全員が
+- [ ] `.env`（または `sherpa.env`）に `OPENAI_API_KEY` が設定されていないことを確認する（サーバ側にキーがあると、その頭脳を選んだユーザー全員が
       外部呼び出しを試みる余地になるため。キー一覧は [90-リファレンス](90-リファレンス.md) の設定表）。
 - [ ] `pip install` 時に `--no-index` が使われ、PyPI へのアクセスが発生していないこと（オンライン側の
       収集手順どおりに wheel が揃っていれば、通常のネットワークアクセスなしで成功する）。
@@ -574,13 +563,13 @@ OpenAI／Gemini／Bedrock は**そもそもネットワークへ出ません**�
 | 検索（grep・全文/ES） | ○ | 外部ネットワーク不要 |
 | 取り込み（フォルダ登録・Office/PDF→MD） | ○ | Office COM ワーカーもローカル実行（[11-Office変換.md](../11-Office変換.md)） |
 | グラフ（Neo4j 影響分析） | ○ | 静的解析＋辞書突合（言及エッジ）だけで完結。AI は使いません |
-| 統計（管理者向け利用統計） | ○ | 画面表示はローカル集計のみ。利用統計チャット（管理者が明示的に質問した場合のみ・質問文とこの欄の履歴に加え、利用者ID・表示名・ターン数・最終利用日時・個人ファイル参照件数・ログイン/ダウンロード/アップロード/共有件数・ユーザー別トークン内訳・資料フォルダ ID 等の集計、および改善ログの要約〔フィードバック件数・タグの内訳・回答が途中で止まった理由の内訳・見つからないと正直に答えた割合・所要時間の分布・👎が付いた質問と一言コメントの先頭100字を最大20件ずつ〕を専用設定のAIへ送信・今回だけの切替あり）を除き外部送信なし |
+| 統計（管理者向け利用統計） | ○ | 画面表示はローカル集計のみ。外部送信なし |
 | 掲示板（トップ画面・お知らせ） | ○ | ローカル DB のみ |
-| チャット応答（簡易・AIなし） | ○ | テンプレート応答。自然文要約はしない |
-| チャット応答（ローカルLLM／Ollama） | △ | 動くがモデル次第で応答品質が変わる。事前にモデルを閉域へ搬入する必要あり |
-| Codex（調査・作成系） | △ | 完全閉域は ×。**OpenAI または Azure OpenAI へだけ穴あけ**した閉域なら ○（Codex CLI はキット同梱・認証は通信不要。Azure OpenAI 接続時は Web 検索は使えません） |
-| 外部頭脳（OpenAI API／Gemini／AWS Bedrock） | × | いずれも外部エンドポイントへの HTTP 呼び出しが必須（OpenAI API は Azure OpenAI 経由も含む・接続先設定は「[24. システム管理](24-システム管理.md#接続先を-azure-openai-にする)」） |
-| エージェント検索（agentic grep 反復） | △ | 仕組み自体はローカルで動くが、判断する頭脳が簡易/ローカルLLMに限られるため精度はその頭脳次第 |
+| チャット応答（簡易・ローカルLLM／Ollama） | △ | 動くがモデル次第で応答品質が変わる。事前にモデルを閉域へ搬入する必要あり |
+| チャット応答（Codex 調査（Ollama）） | △ | Codex CLI（同梱）が接続先の Ollama へつなぐ。モデル次第で応答品質が変わる。Ollama 0.13.3 以降が必要 |
+| Codex 調査（OpenAI）（調査・作成系） | △ | 完全閉域は ×（接続先を Ollama にした構成は上の行）。**OpenAI または Azure OpenAI へだけ穴あけ**した閉域なら ○（Codex CLI はキット同梱・認証は通信不要。Azure OpenAI 接続時は Web 検索は使えません） |
+| 外部頭脳（OpenAI を使う簡易） | × | 外部エンドポイントへの HTTP 呼び出しが必須（OpenAI API は Azure OpenAI 経由も含む・接続先設定は「[24. システム管理](24-システム管理.md#接続先を-azure-openai-にする)」） |
+| エージェント検索（agentic grep 反復） | △ | 仕組み自体はローカルで動くが、判断する頭脳がローカルLLMに限られるため精度はその頭脳次第 |
 | Marp スライド（HTML 出力） | ○ | Node.js＋marp-cli の同梱が必要。未同梱なら marp スキル自体が使えない |
 | Marp スライド（PDF/PPTX 出力） | △ | 上記に加え Playwright Chromium 本体＋システム依存 .deb（libnss3 等）と日本語フォントの同梱が必要。未同梱なら HTML のみへ縮退 |
 | LibreOffice（旧形式 Office 変換） | △ | 同梱＋`legacy_backend=libreoffice` 設定が必要。未設定は fail-safe で「変換できない」表示に倒れる |

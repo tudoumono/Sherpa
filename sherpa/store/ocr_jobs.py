@@ -1,4 +1,6 @@
-"""OCR補助観測worker用のPostgreSQL lease queueとWorld内結果cache。"""
+"""OCR補助観測worker用のPostgreSQL lease queueとWorld内結果cache。
+設計: docs/design/data.md「OCR（非同期・隔離ワーカー）」
+"""
 from __future__ import annotations
 
 import hashlib
@@ -709,21 +711,10 @@ def iter_succeeded_results(
     batch_size: int = 100,
 ) -> Iterator[dict[str, Any]]:
     """完了Setを、呼出側が渡す``sort_key``が決める順で有界に読む。
-
-    並び順はDBの照合順序やSQL側の正規化には頼らず、``sort_key``（呼出側は
-    ``observation_render._relative_source_path``——Observation renderer自身の検査と
-    同じ関数）だけで決める。検査側の正規化（区切り文字の置換に加え、連続する``/``の畳み込みや
-    ``.``除去等の``PurePosixPath``正規化）をSQLで再現すると、正規化が増えるたびに追随が
-    壊れるため、同じ関数を1回だけ両方に使う。
-
-    まず``id, source_rel_path, result_observation_set_hash``だけを全件読み（本体
-    ``result_payload``を含まないため、メモリは行数×短い文字列に収まる——World全体は保持
-    しないが、1世代の全succeeded行の軽量部分は保持する）。次に
-    ``(sort_key(source_rel_path), result_observation_set_hash, id)``順にPython側で並べ、
-    その順に``batch_size``件ずつ``id = ANY(%s)``で本体を取り出し、並べた順に戻してyieldする。
-    ``sort_key``が不正な``source_rel_path``（絶対パス・``..``等）でValueErrorを出す場合は
-    そのまま呼出側へ伝播する（検査と同じ失敗）。本体取得時点で条件を満たさなくなった
-    （状態が変わった・消えた）idは黙って飛ばす。
+    ① ``id, source_rel_path, result_observation_set_hash``だけを全件読む（本体``result_payload``は含まない）。
+    ② ``(sort_key(source_rel_path), result_observation_set_hash, id)``順にPython側で並べる。
+    ③ その順に``batch_size``件ずつ``id = ANY(%s)``で本体を取り出し、並べた順にyieldする。
+    並び順はDBの照合順序に頼らず``sort_key``だけで決める。``sort_key``のValueError（不正な``source_rel_path``）は呼出側へ伝播し、本体取得時点で条件を満たさなくなったidは飛ばす。
     """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)
@@ -810,9 +801,7 @@ def mark_snapshot_artifacts_published(
     snapshot: dict[str, int | None],
 ) -> int:
     """同じ完了Set集合のままなら、集合全体をID listなしで公開済みにする。
-
-    集合照合とUPDATEは1 SQL statementのsnapshotで行う。並行して新しい成功jobが見えた場合は
-    何もmarkせず、workerのself-repairに再公開を委ねる。
+    集合照合とUPDATEは1 SQL statementのsnapshotで行い、並行して新しい成功jobが見えた場合は何もmarkしない（workerのself-repairに任せる）。
     """
     selected_world = _world_id(world)
     generation = _generation_id(canonical_generation_id)

@@ -7,8 +7,7 @@
 このファイルは3つを検査する:
   (a) 主要 GET を `TestClient(sherpa.api.app)` + `auth_disabled` で実際に叩き、mock_api.py の
       対応する定数と形状（キー集合）を突合する。
-  (b) `mock_api.MOCKED`（機械可読レジストリ）の各 (method, path) が実ルート表 golden
-      （`tests/api/goldens/routes.txt`）に実在することを検査する（旧ルート撤去・改名の検知）。
+  (b) `mock_api.MOCKED`（機械可読レジストリ）の各 (method, path) が実ルート表に実在することを検査する（旧ルート撤去・改名の検知）。
   (c)（フェーズ7-1・response_model 実測）主要な mock 定数を `sherpa/schemas.py` の応答モデルで
       `TypeAdapter` 検証する。(a) の粒度（トップレベルのみ・ネスト1段の list は mock⊆実）より
       深い階層（nested dict の中身・2段目以降の list 要素）まで固定できるため、(a) では
@@ -26,12 +25,17 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import TypeAdapter
 
+from _authz_probe import _api_route_keys
+from _test_users import register_test_uid
+from sherpa import auth, store
 from sherpa import schemas as sc
 from sherpa.api import app
 
@@ -43,7 +47,6 @@ if str(_E2E_DIR) not in sys.path:
 
 import mock_api  # noqa: E402
 
-_GOLDEN_ROUTES = pathlib.Path(__file__).resolve().parent / "goldens" / "routes.txt"
 
 
 def _list_key_diff(mock_list, real_list, label: str) -> list[str]:
@@ -165,27 +168,12 @@ def test_conversations_list_and_detail_shape_matches_mock(client):
             store.delete_conversation(seeded_cid, user_id="admin")
 
 
-def _golden_route_keys() -> set[tuple[str, str]]:
-    keys: set[tuple[str, str]] = set()
-    for line in _GOLDEN_ROUTES.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        cols = line.split("\t")
-        methods, path = cols[0], cols[1]
-        for m in methods.split(","):
-            keys.add((m, path))
-    return keys
-
-
 def test_mocked_routes_exist_in_route_table():
-    """MOCKED（tests/e2e/mock_api.py）の各 (method, path) が実ルート表 golden に存在すること
+    """MOCKED（tests/e2e/mock_api.py）の各 (method, path) が実ルート表に存在すること
     （旧ルート撤去・改名で mock だけが偽装し続ける事態を検知する）。"""
-    golden = _golden_route_keys()
-    missing = [rp for rp in mock_api.MOCKED if rp not in golden]
-    assert not missing, (
-        "mock_api.MOCKED に実ルート表（tests/api/goldens/routes.txt）へ存在しない (method, path) がある: "
-        f"{missing}"
-    )
+    actual = _api_route_keys()
+    missing = [rp for rp in mock_api.MOCKED if rp not in actual]
+    assert not missing, f"mock_api.MOCKED に実ルートへ存在しない (method, path) がある: {missing}"
 
 
 # ===================================================================================
@@ -220,7 +208,6 @@ _MOCK_SCHEMA_CASES = [
      "workspace_delete_response"),
     (sc.WorkspaceSearchResponse, mock_api.workspace_search_response("消費税率"),
      "workspace_search_response"),
-    (sc.GraphAskResponse, mock_api.graph_ask_response("消費税率について"), "graph_ask_response"),
     (sc.GraphSearchResponse,
      mock_api.graph_search_response(
          [{**n, "em": "static", "phase": None, "category": None} for n in mock_api.GRAPH["nodes"][:2]],
@@ -247,32 +234,78 @@ def test_mock_constant_matches_schema(model, payload, name):
         pytest.fail(f"mock_api.{name} が sherpa.schemas と一致しません（mock drift）:\n{e}")
 
 
-def test_recompute_construct_id_normalizes_unselected_cloud_agent_like_real_server():
+def test_recompute_construct_id_normalizes_legacy_agents_like_real_server():
     """mock_api._recompute_construct_id は実サーバ `agent_constructs.construct_id`/`effective_agent`
-    と同じ A7 正規化を行う（選択中でないクラウド系 agent は ollama へ倒す）。"""
-    resp = {
-        "agent": "openai", "cloud_provider": "gemini", "codex_model_provider": "",
-        "constructs_available": mock_api.SETTINGS_RESP["constructs_available"],
-    }
-    assert mock_api._recompute_construct_id(resp) == "ollama_only"
+    と同じ正規化を行う（旧・直結の保存値 openai/ollama は simple・閉じた頭脳の保存値は生値のまま）。"""
+    base = {"cloud_provider": "openai", "codex_model_provider": "",
+            "constructs_available": mock_api.SETTINGS_RESP["constructs_available"]}
+    assert mock_api._recompute_construct_id({**base, "agent": "openai"}) == "simple"
+    assert mock_api._recompute_construct_id({**base, "agent": "ollama"}) == "simple"
+    assert mock_api._recompute_construct_id({**base, "agent": "bedrock"}) == "bedrock"
 
-    # 選択中のクラウドと一致すれば正規化しない。
-    resp2 = {**resp, "cloud_provider": "openai"}
-    assert mock_api._recompute_construct_id(resp2) == "openai_only"
 
-    # クラウド系以外（ollama/codex）は cloud_provider に関わらず対象外。
-    resp3 = {"agent": "ollama", "cloud_provider": "gemini",
-             "constructs_available": mock_api.SETTINGS_RESP["constructs_available"]}
-    assert mock_api._recompute_construct_id(resp3) == "ollama_only"
+# ===================================================================================
+# 応答の型（response_model 付与ルートの実応答）
+# ===================================================================================
 
-    # 有効化されていない agent（constructs_available に無い＝実サーバでは SHERPA_EXTRA_AGENTS
-    # 未指定）は、cloud_provider と不一致でも正規化しない＝生値のまま保持する
-    # （実サーバ `effective_agent()` は非有効な raw_agent を A7 判定に進めず素通りさせる）。
-    resp4 = {"agent": "bedrock", "cloud_provider": "openai",
-             "constructs_available": mock_api.SETTINGS_RESP["constructs_available"]}
-    assert mock_api._recompute_construct_id(resp4) == "bedrock"
+_UTC_OFFSET_SUFFIX = re.compile(r"\+00:00")
+_Z_SUFFIX = re.compile(r"\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\"")
 
-    # 有効化されている（constructs_available に含まれる）bedrock は、通常どおり A7 正規化の対象。
-    resp5 = {"agent": "bedrock", "cloud_provider": "openai",
-             "constructs_available": mock_api.SETTINGS_RESP_WITH_EXTRA_AGENTS["constructs_available"]}
-    assert mock_api._recompute_construct_id(resp5) == "ollama_only"
+
+def _assert_wire_datetime_preserved(raw_text: str, *, field_label: str) -> None:
+    """応答本文（生テキスト）の datetime が `+00:00` のままで `Z` に正規化されていないこと。"""
+    assert _UTC_OFFSET_SUFFIX.search(raw_text), f"{field_label}: '+00:00' 形式の datetime が無い: {raw_text[:500]}"
+    assert not _Z_SUFFIX.search(raw_text), f"{field_label}: datetime が 'Z' に正規化されている: {raw_text[:500]}"
+
+
+def test_datetime_wire_format_preserved_with_response_model(client):
+    """response_model 付与ルートでも datetime のワイヤー表現（`+00:00`）が変わらない（`sherpa.schemas.WireDateTime`）。
+    対象: AnnouncementOut・AuditRow・UserRow.last_login_at。"""
+    marker = f"schema-dt-{time.time_ns()}"
+    r = client.post("/admin/announcements", json={"title": marker, "body": "本文"})
+    assert r.status_code == 200, r.text
+    aid = r.json()["announcement"]["id"]
+    try:
+        _assert_wire_datetime_preserved(r.text, field_label="AnnouncementOut")
+        r = client.get("/admin/audit", params={"action": "announcement.created", "limit": 5})
+        assert r.status_code == 200, r.text
+        assert r.json()["rows"], "announcement.created の監査行が無い"
+        _assert_wire_datetime_preserved(r.text, field_label="AuditRow")
+    finally:
+        store.delete_announcement(aid)
+
+    uid = f"schema-dt-{time.time_ns()}"
+    pw = "Schema-Contract-Pw!9"
+    store.upsert_user(uid, email=f"{uid}@x.local", display_name=uid,
+                      password_hash=auth.hash_password(pw), role="user", status="active")
+    register_test_uid(uid)
+    assert client.post("/auth/login", json={"username": uid, "password": pw}).status_code == 200
+    r = client.get("/admin/users")
+    assert r.status_code == 200
+    assert f'"uid":"{uid}"' in r.text
+    _assert_wire_datetime_preserved(r.text, field_label="UserRow.last_login_at")
+
+
+def test_admin_usage_stats_limits_preserve_null_and_measured_zero(client, monkeypatch):
+    """GET /admin/usage/stats の応答モデルが未計測 null と計測済み 0 を区別して保持する。"""
+    import copy
+
+    stats = copy.deepcopy(mock_api.USAGE_STATS_DEFAULT)
+    codex_row, api_row = stats["limits"]["by_provider"][0], stats["limits"]["by_provider"][1]
+    codex_row["synthesis_truncated_turns"] = None
+    codex_row["context_compactions_turns"] = None
+    api_row["duplicate_tool_call_turns"] = None
+    api_row["context_compactions_turns"] = 0
+    api_row["context_compactions_total"] = 0
+    monkeypatch.setattr(store, "usage_stats", lambda **_kwargs: stats)
+    monkeypatch.setattr(store, "audit", lambda *_args, **_kwargs: None)
+
+    response = client.get("/admin/usage/stats")
+
+    assert response.status_code == 200, response.text
+    codex, api = response.json()["limits"]["by_provider"]
+    assert codex["synthesis_truncated_turns"] is None
+    assert codex["context_compactions_turns"] is None
+    assert api["duplicate_tool_call_turns"] is None
+    assert api["context_compactions_turns"] == 0
+    assert api["context_compactions_total"] == 0

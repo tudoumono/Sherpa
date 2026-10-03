@@ -4,6 +4,7 @@ AI も外部の道具も使わない（標準ライブラリ＋Pillow）。文�
 EXTTEXTOUTW/A・POLYTEXTOUTW/A、EMF+ の DrawString）に載っている文字列そのもの（原本の値）で、ANSI の文字列は
 選択中フォントの文字セットから符号化を決める。ビットマップ（DIB）は PNG へ変換し、既存の OCR 経路へ渡す。
 どんな入力でも例外を外へ出さない（失敗は ``reason`` に残す）。走査は記録数・バイト数・出力量で有界。
+設計: docs/design/rag.md「OCR（非同期・隔離ワーカー）」
 """
 from __future__ import annotations
 

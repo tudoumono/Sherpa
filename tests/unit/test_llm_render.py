@@ -111,7 +111,7 @@ def test_available_delegates_to_graph_extract(monkeypatch):
     monkeypatch.setattr(graph_extract, "available", _fake_available)
     cfg = llm_render.available({"x": 1})
     assert cfg == {"provider": "openai", "model": "gpt-5.5"}
-    assert calls == [({"x": 1}, False, "render")]
+    assert calls == [({"x": 1}, True, "render")]
 
 
 def test_available_returns_none_on_invalid_cloud_provider_config(monkeypatch):

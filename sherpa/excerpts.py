@@ -1,30 +1,13 @@
-"""H3（SC-4 接続）: 利用者向け引用の本文を、rag チャンクの locator/chunk_id から人間向け MD の
-該当節へ引き直す（表示専用の後処理）。
+"""利用者向け引用の本文を、rag チャンクの locator/chunk_id から人間向け MD の該当節へ引き直す（表示専用）。
+設計: docs/design/rag.md「人向け MD と RAG 正本の作り分け（マージの実際）」
 
-正典: `docs/archive/2026-08-22-検索接続切替.md` §9（SC-4 への追加要件・ユーザー裁定 2026-08-23）・
-`docs/archive/2026-08-28-人間向けMDの刷新.md` §7（H3）。
+検索・スコアリング・AI が読む本文（rag.md/rag_chunks.jsonl）は変えない（read-only）。
+手順:
+① chunk_id を特定する（ES ヒットは持っている／grep ヒットは rag.md の行範囲からアンカーを逆引き＝`_chunk_id_from_rag_md_span`）。
+② `{rel}.rag_chunks.jsonl` から該当 chunk の `region_context`（sheet/cell_range）を引く（`_region_for_chunk`）。
+③ 人間向け `{rel}.md` の `## シート「{sheet}」` 配下で `### {cell_range}` に一致する節を返す（`_find_human_md_section`）。
 
-契約（§9 原文）: 「該当箇所（利用者が読む抜粋）の本文は決定的 `{rel}.md`（再現優先）から出す。
-検索と AI が読むのは rag.md のままで、人に見せる抜粋だけ決定的 MD の該当節へ引き直す。対応が
-取れない例外だけ rag 文へフォールバックし、その旨を小さく表示する」。**検索・スコアリング・AI が
-読む本文（rag.md/rag_chunks.jsonl）は一切変えない**——本モジュールはそれらを読むだけ（read-only）。
-
-対応付けの手順（xlsx が本命・人間向けMD刷新提案書 §8「H3」）:
-1. chunk_id を特定する（ES ヒットは既に持つ／grep ヒットは rag.md の行範囲からアンカー
-   `<!-- chunk:{chunk_id} -->` を逆引きする＝`_chunk_id_from_rag_md_span`）。
-2. `{rel}.rag_chunks.jsonl` から該当 chunk_id の `region_context`（`sheet`/`cell_range`＝表の
-   範囲そのもの）を引く（`_region_for_chunk`）。cell 単位の citation.locator ではなく
-   region_context を使う理由: citation.locator は個々のセル座標（例 "B12"）で人間向け MD の
-   `### {表の範囲}` 見出しとは直接一致しない一方、region_context.cell_range は表そのものの範囲
-   （例 "A1:C4"）で人間向け MD の見出しと**文字列として完全一致**する（`evidence_render.py`
-   `_region_context`/`human_md.py::_render_xlsx_table` が同じ `openpyxl.utils.get_column_letter`
-   表現を使うため）——座標のコンテインメント判定を自前実装せずに済む。
-3. 人間向け `{rel}.md`（`derived_md_dir`・legacy/human_md 層）の `## シート「{sheet}」` 配下で
-   `### {cell_range}` に完全一致する節を返す（`_find_human_md_section`）。
-
-docx/pptx（`region_context.sheet` を持たない・H2 は xlsx/docx のみでpptxはそもそも人間MD未対応）は
-対象外——「無理な断定をしない」（正典どおり）。`resolve_human_excerpt` は対応が取れない入力に対し
-常に `None` を返す（呼び出し側は元の rag 文へフォールバックする）。
+xlsx のみ対象。対応が取れなければ `resolve_human_excerpt` は None を返し、呼び出し側は rag 文へフォールバックする。
 """
 from __future__ import annotations
 
@@ -34,12 +17,9 @@ from pathlib import Path
 
 from . import es_index, grep_tool, worlds
 
-# rag_chunks.jsonl（1文書分）の読み取り安全弁。`es_index._RAG_CHUNKS_FILE_CAP_BYTES`（生成側が
-# 1文書分でこの上限を超えたら索引自体を無効化する契約）と同じ値に揃える——表示側だけこれより
-# 緩い/厳しい上限を持つと、索引された/されないの境界と表示可否の境界がずれる。
+# rag_chunks.jsonl の読み取り安全弁。`es_index._RAG_CHUNKS_FILE_CAP_BYTES` と同じ値に揃える。
 _RAG_CHUNKS_SCAN_CAP_BYTES = es_index._RAG_CHUNKS_FILE_CAP_BYTES
-# rag.md（アンカー逆引き用）／人間向け MD の読み取り安全弁。`human_md._MAX_HUMAN_MD_BYTES`
-# （生成側の1ファイル出力上限＝8MiB）と揃える。
+# rag.md／人間向け MD の読み取り安全弁。`human_md._MAX_HUMAN_MD_BYTES` と揃える。
 _MD_SCAN_CAP_BYTES = 8 * 1024 * 1024
 
 _SHEET_HEADING_RE = re.compile(r"^##\s+シート「(.+?)」")
@@ -55,12 +35,7 @@ def _valid_doc_id(doc_id) -> bool:
 
 
 def _confined_path(root: Path, cand: Path) -> Path | None:
-    """`cand` が `root` 配下に閉じ込められているかを検証した実パス（symlink 脱出・traversal 拒否）。
-
-    `agentic_search._safe_doc_path` の「字面パスと resolve 済みパスの突き合わせ」ほど厳密ではない
-    （doc_id はここに至るまでに呼び出し側で既に検証済みの引用データという前提の上の防御的二重確認・
-    プライマリの読み取り専用境界は `agentic_search._safe_doc_path`／`grep_tool` が担う）。
-    """
+    """`cand` が `root` 配下に閉じ込められているかを検証した実パス（symlink 脱出・traversal は None）。"""
     try:
         rr = root.resolve()
         rp = cand.resolve()
@@ -109,8 +84,7 @@ def _rag_chunks_path(world: str, doc_id: str) -> Path | None:
 
 
 def _region_for_chunk(world: str, doc_id: str, chunk_id: str) -> dict | None:
-    """`{rel}.rag_chunks.jsonl` から `chunk_id` の `region_context`（sheet/cell_range 持ち）を引く。
-    best-effort（生成側フォーマット不整合・不在は None）。"""
+    """`{rel}.rag_chunks.jsonl` から `chunk_id` の `region_context`（sheet/cell_range）を引く。不在・不整合は None。"""
     if not isinstance(chunk_id, str) or not chunk_id:
         return None
     p = _rag_chunks_path(world, doc_id)
@@ -138,9 +112,7 @@ def _region_for_chunk(world: str, doc_id: str, chunk_id: str) -> dict | None:
 
 
 def _rag_md_path(world: str, doc_id: str) -> Path | None:
-    """grep がこの doc_id を検索した際に実際に読んだのが rag.md かどうかも確認する（`preferred_derived_name`
-    を grep_search と共有＝§3.5 の「同じ1ファイルを見る」規則をここでも守る）。legacy md しか無い/
-    rag 優先が無効なときは None（=呼び出し元は rag.md のアンカー逆引きを試みない）。"""
+    """grep が実際に読んだ rag.md のパス（`preferred_derived_name` を grep と共有）。rag 優先でなければ None。"""
     if not _valid_doc_id(doc_id):
         return None
     if not grep_tool.rag_grep_enabled():
@@ -156,16 +128,8 @@ def _rag_md_path(world: str, doc_id: str) -> Path | None:
 
 
 def _chunk_id_from_rag_md_span(world: str, doc_id: str, span) -> str | None:
-    """grep ヒットの span（rag.md の行範囲・1-based・両端含む）を、その節を生成した chunk_id へ
-    逆引きする。
-
-    `grep_tool.grep_search` の MD 節検出（`_emit_md_section`）は「#」で始まる行を境界にする——rag.md
-    のアンカー `<!-- chunk:{chunk_id} -->` は「#」で始まらないため境界にならず、**次の**レコードの
-    見出し直前に置かれたアンカーが今のレコードの節の末尾（`span[1]`）に含まれてしまう（`evidence_
-    render.py::_markdown` はアンカー→（同一section なら）見出し省略→次のレコード本文、の順で出す
-    ため、あるレコードの `span` の終端行は次のレコードのアンカー行と重なりうる）。したがって
-    「終端行までの最後のアンカー」ではなく、**節の開始行（`span[0]`＝見出し行自身）までの最後の
-    アンカー**を使う——アンカーは常にそのレコードの見出しより前に出るため、これが正しい対応になる。
+    """grep ヒットの span（rag.md の行範囲・1-based・両端含む）を、その節の chunk_id へ逆引きする。
+    アンカーはレコードの見出しより前に出るため、節の開始行（`span[0]`）までの最後のアンカーを使う。
     """
     if not (isinstance(span, (list, tuple)) and len(span) == 2):
         return None
@@ -199,8 +163,7 @@ def _resolve_human_md_path(world: str, doc_id: str) -> Path | None:
 
 
 def _find_human_md_section(markdown: str, sheet: str, cell_range: str) -> dict | None:
-    """人間向け MD の `## シート「{sheet}」` 配下で `### {cell_range}` に完全一致する節を1つ返す
-    （`{"heading": 表示用見出し, "text": 見出し込みの節本文}`）。見つからなければ None。"""
+    """人間向け MD の `## シート「{sheet}」` 配下で `### {cell_range}` に完全一致する節（`{"heading", "text"}`）。無ければ None。"""
     in_sheet = False
     heading: str | None = None
     buf: list[str] = []
@@ -238,8 +201,7 @@ def _find_human_md_section(markdown: str, sheet: str, cell_range: str) -> dict |
 
 def resolve_human_excerpt(world: str, doc_id: str, *, chunk_id: str | None = None, span=None,
                           locator=None, section_path=None) -> dict | None:
-    """成功時 `{"text": 節本文（見出し込み）, "hint": 位置ヒント文字列|None}`。対応が取れなければ
-    None（呼び出し側は元の rag 文へフォールバックする・§9 契約）。"""
+    """成功時 `{"text": 節本文（見出し込み）, "hint": 位置ヒント|None}`。対応が取れなければ None。"""
     if chunk_id is None:
         chunk_id = _chunk_id_from_rag_md_span(world, doc_id, span)
     if chunk_id is None:
@@ -264,14 +226,8 @@ def resolve_human_excerpt(world: str, doc_id: str, *, chunk_id: str | None = Non
 
 def display_quote(world: str, doc_id: str, fallback_quote: str, *, chunk_id: str | None = None,
                   span=None, locator=None, section_path=None) -> dict:
-    """利用者向け引用本文を解決する。返り値は必ず
-    `{"quote": str, "excerpt_source": "human_md"|"rag", "locator_hint": str|None}`。
-
-    人間MD該当節が引ければ quote をその節本文へ差し替え、excerpt_source="human_md"。引けなければ
-    quote は `fallback_quote`（rag.md/legacy 由来の元の本文）のまま、excerpt_source="rag"
-    （§9「対応が取れない例外だけ rag 文へフォールバック」）。locator_hint は SC-3 の位置ヒント
-    （`citations.locator_hint`）を、対応可否に関わらず可能な限り添える（sheet が locator/section_path
-    のどちらからも取れないときは None）。
+    """利用者向け引用本文を解決する。返り値は `{"quote", "excerpt_source": "human_md"|"rag", "locator_hint"}`。
+    人間 MD の該当節が引ければ quote を差し替え、引けなければ `fallback_quote` のまま "rag"。
     """
     section = resolve_human_excerpt(world, doc_id, chunk_id=chunk_id, span=span,
                                     locator=locator, section_path=section_path)

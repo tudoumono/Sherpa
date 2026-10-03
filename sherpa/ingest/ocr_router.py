@@ -1,8 +1,9 @@
-"""Canonical EvidenceからOCR対象だけを決定的に選ぶ純粋router。
+"""Canonical Evidence から OCR 対象だけを決定的に選ぶ純粋 router。
 
-RouterはOCRを実行せず、画像の意味も推定しない。Evidence上のラスタ要素と、hash照合済みasset
-inventoryだけを入力にして、全候補を``selected`` / ``excluded`` / ``failed_binding``へ分類する。
-PDF page renderは、利用可能な埋込画像も現行text layerも無いpageだけに限定する。
+OCR は実行せず、画像の意味も推定しない。Evidence 上のラスタ要素と hash 照合済み asset inventory だけを入力に、
+全候補を ``selected`` / ``excluded`` / ``failed_binding`` へ分類する。
+PDF の page render は、利用可能な埋込画像も現行 text layer も無い page だけに限る。
+設計: docs/design/rag.md「OCR（非同期・隔離ワーカー）」
 """
 from __future__ import annotations
 
@@ -47,10 +48,9 @@ _MAGIC_HEAD_BYTES = 64
 
 
 def raster_media_type(head: bytes) -> str | None:
-    """先頭バイトからOCR workerが読めるラスタ形式のmedia typeを返す。読めない形式はNone。
+    """先頭バイトから OCR worker が読めるラスタ形式の media type を返す。読めない形式は None。
 
-    拡張子やmimetypesの推測は使わない（WMF/EMFなどPillowが開けない形式を判別できない）。
-    OCRに回してよい形式の判定はここ1か所に置く。
+    拡張子の推測は使わない。OCR に回してよい形式の判定はここ 1 か所に置く。
     """
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -124,11 +124,9 @@ def _canonical(value: Any) -> str:
 
 
 def ocr_route_sig_value() -> str:
-    """OCR routeの決定規則をgenerationへ刻むcontent-addressed署名。
+    """OCR route の決定規則を generation へ刻む content-addressed 署名。
 
-    route schemaだけでは、同じEvidenceからどの画像を選ぶか、scan PDFをどの固定条件で
-    rasterizeするかの変更を検知できない。Router実装を変えた場合は``OCR_ROUTER_PROFILE``を
-    bumpし、page render条件は値そのものを署名へ含める。
+    Router 実装を変えたら ``OCR_ROUTER_PROFILE`` を更新し、page render 条件は値そのものを署名へ含める。
     """
     payload = {
         "schema_version": OCR_ROUTE_SCHEMA_VERSION,
@@ -187,11 +185,10 @@ def _child_parent_hash(relative: str) -> str | None:
 
 
 def inventory_assets(root: str | Path) -> list[AssetBinding]:
-    """asset directoryを読み、bytes hashを権威として安全なinventoryを返す。
+    """asset directory を読み、bytes hash を権威として安全な inventory を返す。
 
-    symlinkはsource/generation境界を越え得るため受理しない。同一hashが複数名で存在する場合は
-    辞書順で最初のpathだけを採用し、routerの出力を決定的にする。メタファイルから取り出した子PNGは
-    親ごとに別の資産として数える（同じ画像が別の図に入っていても、それぞれの図の結果になる）。
+    symlink は受理しない。同一 hash が複数名で存在する場合は辞書順で最初の path だけを採用する。
+    メタファイルから取り出した子 PNG は親ごとに別の資産として数える。
     """
     asset_root = Path(root)
     if not asset_root.is_dir() or asset_root.is_symlink():
@@ -256,11 +253,10 @@ def _has_current_text(ir: evidence_ir.EvidenceIR, page: int) -> bool:
 
 
 def _raster_candidates(element: evidence_ir.EvidenceElement) -> list[dict[str, Any]]:
-    """Evidence要素に拘束されたOCR対象ラスタを列挙する。
+    """Evidence 要素に拘束された OCR 対象ラスタを列挙する。
 
-    OOXMLの画像fillは要素typeを``shape``/``floating_object``のまま保持し、画素assetであることを
-    ``asset_role=shape_fill``で表す。typeだけで選別すると実原本の画像fillをsilent dropするため、
-    typeとroleを直交して判定する。複数blipを持つ要素も全assetを個別routeへ残す。
+    OOXML の画像 fill は要素 type を保ったまま ``asset_role=shape_fill`` で表すため、type と role を直交して判定する。
+    複数 blip を持つ要素も全 asset を個別 route へ残す。
     """
     extension = element.extension
     raw_candidates = extension.get("assets")
@@ -383,9 +379,8 @@ def build_manifest(
             if not binding.is_readable_raster():
                 embedded = [children[digest][key] for key in sorted(children.get(digest, {}))]
                 if embedded:
-                    # メタファイル（WMF/EMF）自体はOCRへ回さず、中のビットマップ（子PNG）を同じ図の位置の
-                    # 入力として選ぶ。親の分類は行き止まりではなく「展開済み」。
-                    # 全体描画が済んでいない（待ち・未対応・失敗）ときは、その状態を親の detail に残す。
+                    # メタファイル自体は OCR へ回さず、中のビットマップ（子 PNG）を入力に選ぶ（親は「展開済み」）。
+                    # 全体描画が済んでいない場合は、その状態を親の detail に残す。
                     _, render_extra = _render_outcome(binding)
                     decisions.append(OCRRouteDecision(
                         route_input_id=route_id, target_evidence_id=element.element_id, input_kind="asset",

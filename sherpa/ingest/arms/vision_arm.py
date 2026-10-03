@@ -1,40 +1,17 @@
-"""アーム＝vision（視覚読み取り・VLM）。画像・スキャン PDF を **AI（視覚モデル）が見て**文字/内容を読み取る。
+"""vision アーム（視覚読み取り・VLM）。画像・スキャン PDF を視覚モデルが見て文字/内容を読み取り、Markdown を返す。
 
-⑤アーム再定義の②。視覚読み取りは本アーム（VLM）に一本化されており、tesseract ベースの
-`ocr` アームは存在しない。エンジンは Vision-LLM（VLM）:
+- 既定はローカル（Ollama の視覚モデル・既定モデル `qwen2.5vl`・接続先は管理画面の中央の Ollama 接続先 `ollama_url` ＞ `http://localhost:11434`・許可リストの判定も同じ）。
+- クラウド（OpenAI）は管理者が `system_settings.vlm.cloud_allowed=true` にした場合のみ。false（既定）なら provider=openai が指定されていても画像を送らない。
+- Ollama の接続先は loopback か管理画面の Ollama 許可一覧にある宛先（IP・DNS 名とも）ならクラウド許可は不要。許可されていない宛先へは送らない（`_ollama_url_permitted`）。
 
-- **既定＝ローカル（Ollama の視覚モデル）**。既定モデルは `qwen2.5vl`（Qwen2.5-VL＝日本語を含む多言語の文書/OCR に
-  強く、Ollama で入手可・7B 既定でローカル実用的）。接続先は env `SHERPA_VLM_OLLAMA_URL`＞`http://localhost:11434`。
-- **クラウド（OpenAI）は管理者がシステム管理画面で明示許可（`system_settings.vlm.cloud_allowed=true`）した場合のみ**。
-  cloud_allowed が false（既定）なら provider=openai が指定されていても**絶対に画像を送らない**（fail-safe で
-  無効扱い＋warning ログ・INGEST-MD 決定3 の「既定ローカル・管理者オプトインでクラウド」に一致）。
-
-対象（accepts）:
-- (a) ラスタ画像（`office_md.IMAGE_EXT`）＝そのまま VLM へ。
-- (b) テキスト層ゼロの PDF（`office_md.pdf_escalation_target == "vision"`）＝officeCOM の忠実 PDF レンダは
-  「PDF 入力はそのまま」なので、ここでは PDFium でページ画像化してから VLM に渡す（ラスタ化ヘルパは `raster` を共用）。
-- (c) **Office → PDF レンダ → VLM の視覚照合はやらない**（スコープ肥大防止）: proposal ⑤ の主フローは PDF/画像の
-  視覚読み取りで、Office の視覚照合（`legacy_convert.render_pdf` 経由の A4 secondary 追加）は将来。今回は (a)(b) のみ
-  を単独担当する（Office の値は① OOXML を権威とし、視覚モデルによるOffice文書の解釈は追加しない）。
-
-出力（`ocr` と同じ非対称メタ）: 先頭に `> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]`・`method="vision"`・
-confidence 低め（0.4）・notes に `vlm_provider`/`vlm_model`/**`numeric_verified=false`**（VLM は数値をハルシネートし
-うる＝数値クリティカル文書で単独ソースにしない・INGEST-MD §5）。到達不可/失敗/未対応は None（正直表示・失敗計上）。
-
-fail-safe（決定3・スコープ）: 未導入/未設定/到達不可/例外は None。**クラウド遮断は二層**: (1) `resolve_vlm()`
-（convert() 開始時の1回きりの判定・provider=openai は cloud_allowed+キー必須／provider=ollama は cloud_allowed
-または接続先がローカル/私有アドレス帯（`_is_local_url`）必須）、(2) 送信直前（`_read_openai`/`_read_ollama`）で
-**`_cloud_allowed_now()`（system_settings を毎回読み直す・stale cfg 対策）**を再検査する（belt-and-braces）。
-長い PDF ページループの途中で管理者が許可を取り消しても、次ページの送信直前
-チェックで確実に止まる（cfg 引数に持ち回った古い cloud_allowed の値は信用しない）。
-
-**社内 LAN の Ollama を使う場合**: 接続先を IP アドレス（例 `192.168.1.50`）で指定すればクラウド許可は不要。
-**ドメイン名（`localhost` 以外のホスト名）は DNS で外部へ解決されうるため許可が必要**（`_is_local_url`）。
+対象（`accepts`）: (a) ラスタ画像（`office_md.IMAGE_EXT`）をそのまま VLM へ。(b) テキスト層ゼロの PDF（`office_md.pdf_escalation_target == "vision"`）を PDFium でページ画像化して VLM へ（`raster` を共用）。Office 文書は担当しない。
+出力: 先頭に `> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]`・`method="vision"`・confidence 0.4・notes に `vlm_provider`/`vlm_model`/`numeric_verified=false`（VLM は数値を誤りうる）。到達不可/失敗/未対応は None。
+クラウド遮断は二層: ① `resolve_vlm()`（`convert()` 開始時の1回の判定）、② 送信直前（`_read_openai`/`_read_ollama`）に `_cloud_allowed_now()` が system_settings を読み直して再検査する（長い PDF の途中で許可が取り消されても次ページで止まる）。
+設計: docs/design/rag.md「アーム一覧」
 """
 from __future__ import annotations
 
 import base64
-import ipaddress
 import json
 import logging
 import os
@@ -42,27 +19,19 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from . import ArmResult
 from .. import ai_observation, evidence_ir, ocr_router
 
 _log = logging.getLogger(__name__)
 
-_LABEL = "> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]"     # 出力 MD 先頭の出所ラベル（proposal 準拠）
+_LABEL = "> [OCR抽出（AI視覚読み取り）: 信頼度=低〜中]"  # 出力 MD 先頭の出所ラベル
 _DEFAULT_PROVIDER = "ollama"
-_DEFAULT_MODEL = "qwen2.5vl"                     # Qwen2.5-VL（日本語含む文書/OCR に強い・Ollama で入手可）
+_DEFAULT_MODEL = "qwen2.5vl"  # Qwen2.5-VL（日本語を含む文書/OCR に強い）
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _KNOWN_PROVIDERS = ("ollama", "openai")
-_DEFAULT_VLM_TIMEOUT_SEC = 180.0                 # 1 ファイル（画像1枚 or PDF 全ページ合計）あたりの VLM 総予算（既定）
-_DEFAULT_MAX_IMAGE_MB = 20.0                     # 1 画像あたりの base64 化サイズ上限（既定）
-
-# ローカル/私有アドレス帯（RFC1918）。ループバック（127.0.0.0/8・::1）は ipaddress.is_loopback で判定。
-_PRIVATE_V4_NETS = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-)
+_DEFAULT_VLM_TIMEOUT_SEC = 180.0  # 1 ファイル（画像1枚 or PDF 全ページ合計）あたりの VLM 総予算（既定）
+_DEFAULT_MAX_IMAGE_MB = 20.0  # 1 画像あたりの base64 化サイズ上限（既定）
 
 # 視覚読み取りの指示（決定的・数値をでっち上げないよう明示）。日本語資料前提。
 _VLM_PROMPT = ("この画像に写っている文字と内容を、見えるとおりに日本語で書き起こしてください。"
@@ -70,14 +39,10 @@ _VLM_PROMPT = ("この画像に写っている文字と内容を、見えると�
                "見えていない数値や文言を推測で補わないでください。説明や前置きは不要で、書き起こしのみを返してください。")
 
 
-# ---- VLM 設定の解決（system_settings > 既定・cloud はオプトイン・provider/model の env フォール
-#      バックは UI 昇格に伴い ENV-CLEAN で撤去済み。ollama_url は UI 項目が無いため env のまま）----
+# VLM 設定の解決（system_settings > 既定。ollama_url は中央の Ollama 接続先を使う）
 
 def _system_vlm() -> dict:
-    """全体設定 `vlm`（dict）を返す（読めない/未設定/不正型は空 dict＝既定へ・fail-safe）。
-
-    `arms._system_arms_enabled` と同じ fail-safe（store を読めない MCP サブプロセス等では例外を握って空 dict）。
-    """
+    """全体設定 `vlm`（dict）を返す。読めない/未設定/不正型は空 dict（既定へ）。store を読めない文脈（MCP サブプロセス等）では例外を握って空 dict。"""
     try:
         from sherpa import store
         val = store.get_system_settings().get("vlm")
@@ -87,41 +52,33 @@ def _system_vlm() -> dict:
 
 
 def vlm_config() -> dict:
-    """VLM の**実効設定**（provider/model/cloud_allowed/ollama_url）を解決する。
+    """VLM の実効設定（provider/model/cloud_allowed/ollama_url）を解決する。
 
-    provider＝system `vlm.provider` ＞ 既定 `ollama`（既知外は既定へ）。
-    model＝system `vlm.model` ＞ 既定 `qwen2.5vl`。
-    **cloud_allowed＝system `vlm.cloud_allowed`（bool）のみ・既定 false**（env フォールバックを持たせない＝
-    クラウド許可は管理者の明示操作でのみ true になる・INGEST-MD 決定3）。ollama_url＝env `SHERPA_VLM_OLLAMA_URL`
-    ＞ 既定 `http://localhost:11434`（UI 項目が無いため env のまま）。この関数は**遮断前の生の解決結果**
-    （openai×未許可でも provider=openai を返す）。
+    provider＝system `vlm.provider` ＞ 既定 `ollama`、model＝system `vlm.model` ＞ 既定 `qwen2.5vl`。cloud_allowed＝system `vlm.cloud_allowed`（bool）のみ・既定 false（env フォールバックなし＝管理者の明示操作でのみ true）。ollama_url＝system `ollama_url`（中央の Ollama 接続先）＞ 既定。遮断前の生の解決結果を返す（openai×未許可でも provider=openai を返す）。
     """
     sysv = _system_vlm()
     provider = str(sysv.get("provider") or _DEFAULT_PROVIDER).strip().lower()
     if provider not in _KNOWN_PROVIDERS:
         provider = _DEFAULT_PROVIDER
     model = str(sysv.get("model") or _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
-    cloud_allowed = bool(sysv.get("cloud_allowed"))       # system のみ・既定 false（env フォールバックなし）
-    ollama_url = (os.environ.get("SHERPA_VLM_OLLAMA_URL") or _DEFAULT_OLLAMA_URL).strip() or _DEFAULT_OLLAMA_URL
+    cloud_allowed = bool(sysv.get("cloud_allowed"))  # system のみ・既定 false（env フォールバックなし）
+    try:
+        from sherpa import keys
+        ollama_url = str(keys.resolve_ollama_url(None) or "").strip() or _DEFAULT_OLLAMA_URL
+    except Exception:  # 中央の接続先を読めないときは空にして送信させない（`resolve_vlm` が止める）
+        ollama_url = ""
     return {"provider": provider, "model": model, "cloud_allowed": cloud_allowed, "ollama_url": ollama_url}
 
 
 def env_default_vlm() -> dict:
-    """system_settings を無視した既定の実効設定（管理画面「未設定に戻すと何になるか」表示用・cloud は常に false・
-    provider/model の env フォールバックは撤去済み＝常にコード既定）。"""
+    """system_settings を無視した既定の実効設定（管理画面「未設定に戻すと何になるか」表示用・cloud は常に false）。"""
     return {"provider": _DEFAULT_PROVIDER, "model": _DEFAULT_MODEL, "cloud_allowed": False}
 
 
 def _openai_key(system_settings: dict | None = None) -> str | None:
-    """VLM（クラウド）用の OpenAI API キー（取り込みは全体処理＝**中央設定**・per-user 設定は使わない）。
+    """VLM（クラウド）用の OpenAI API キー（取り込みは全体処理なので中央設定を使い、per-user 設定は使わない）。
 
-    A7（クラウドプロバイダ排他選択）: `sherpa.keys.resolve_api_key` 経由＝選択中のクラウド
-    プロバイダが openai でなければ常に None（VLM のクラウド送信先も選択プロバイダのみに従う）。
-    env は読まない（`sherpa/keys.py` 参照・初回シードのみ）。
-
-    `system_settings`（省略可）: `_read_openai` が送信直前に1回だけ読んだスナップショットを渡す
-    （省略時はここで自分で読む）。診断の要否を区別したい呼び出し元は `_openai_key_with_reason`
-    を使う（本関数はそれの薄いラッパー・既存呼び出し元は挙動不変）。
+    `sherpa.keys.resolve_api_key` 経由で、選択中のクラウドプロバイダが openai でなければ常に None。env は読まない。`system_settings`（省略可）は `_read_openai` が送信直前に1回読んだスナップショット（省略時は自分で読む）。
     """
     key, _invalid = _openai_key_with_reason(system_settings)
     return key
@@ -130,37 +87,24 @@ def _openai_key(system_settings: dict | None = None) -> str | None:
 def _openai_key_with_reason(system_settings: dict | None = None) -> tuple[str | None, bool]:
     """`_openai_key` と同じキー解決＋「不正な cloud_provider が原因で無効化したか」を返す。
 
-    戻り値 `(key, invalid)`: `invalid=True` のときだけ、この呼び出しの中で診断ログ（下記）を
-    実際に残している。呼び出し元（`resolve_vlm`）はこの bit を見て「詳細は直前のログを参照」の
-    ような案内文言を、ログが実在する経路だけに限定する（未設定など他の理由で None になった
-    場合にまで「直前のログを参照」と案内すると、参照先が無い誤案内になるため）。
+    戻り値 `(key, invalid)`: `invalid=True` のときだけ診断ログを残している。呼び出し元（`resolve_vlm`）はこれを見て、ログが実在する経路だけ「詳細は直前のログを参照」と案内する。
     """
     from sherpa import keys
-    # 意図しない課金の是正: `cloud_provider`（A7）が非空の不正値のときは黙って既定（openai）へ
-    # 倒れたキーで画像を送信しない。既存契約（キー無し＝ None ＝送信 OFF）へ寄せる。
+    # `cloud_provider` が非空の不正値のときは、既定（openai）へ倒れたキーで画像を送信しない（キー無し＝ None＝送信 OFF へ寄せる）。
     try:
         key = (keys.resolve_api_key("openai", None, system_settings=system_settings, strict=True) or "").strip()
     except keys.InvalidCloudProviderConfigError as e:
-        # 利用者向けにはしない（既存契約どおり None＝送信 OFF へ静かに縮退）が、呼び出し元
-        # （`resolve_vlm`）の「OPENAI_API_KEY が未設定」という決め打ちの誤記録を避けるため、
-        # 実際の理由を診断できるログをここで残す（strict 例外の黙殺の是正）。
+        # 利用者向けには出さず None（送信 OFF）へ縮退するが、実際の理由を診断できるログを残す。
         _log.warning("VLM._openai_key: cloud_provider が不正なため無効化しました: %s", e)
         return None, True
     return (key or None), False
 
 
 def _cloud_allowed_now(system_settings: dict | None = None) -> bool:
-    """**送信直前**に system_settings から生の cloud_allowed を読み直す（stale cfg 回避）。
+    """送信直前に system_settings から生の cloud_allowed を読み直す（stale cfg 回避）。
 
-    `resolve_vlm()`（convert() 開始時の1回きりの判定）の結果を `cfg` として持ち回ると、長い PDF ページループの
-    処理中や `resolve_vlm()` を経由しない直接呼び出しで、管理者が cloud_allowed を取り消した後も古い許可のまま
-    送信し続けうる。送信直前に毎回この関数で読み直すことで、次の送信から確実に反映される。store には短TTL
-    （3秒）のプロセス内キャッシュがあるため I/O 負荷は無視できる。**store 到達不可/例外/型不正は False へ倒す**
-    （fail-closed＝「許可されていない」として扱う）。
-
-    `system_settings`（省略可）: 呼び出し側（`_read_openai`）が送信直前に1回だけ読んだスナップ
-    ショットを渡すと、それを使う（この1回の送信判断の中で cloud_allowed と接続先/鍵を別々の
-    読み直しで食い違わせない。省略時はここで自分で読む＝従来どおり）。
+    `resolve_vlm()` の結果を持ち回ると、長い PDF ループ中や直接呼び出しで、許可が取り消された後も古い許可のまま送信しうる。毎回読み直すことで次の送信から反映される（store には短TTLのキャッシュがある）。store 到達不可/例外/型不正は False（fail-closed）。
+    `system_settings`（省略可）: 呼び出し側が送信直前に1回読んだスナップショットを渡すと、それを使う（1回の送信判断の中で読みが食い違わない）。
     """
     try:
         if system_settings is not None:
@@ -175,46 +119,23 @@ def _cloud_allowed_now(system_settings: dict | None = None) -> bool:
     return bool(val.get("cloud_allowed"))
 
 
-def _is_local_url(url: str) -> bool:
-    """`url` のホストが**ループバック**（`localhost`／127.0.0.0/8／`::1`）または**私有アドレス帯**
-    （RFC1918: 10.0.0.0/8・172.16.0.0/12・192.168.0.0/16）の **IP リテラル** か判定する（決定的）。
-
-    社内 LAN の Ollama は IP 指定（例 `192.168.1.50`）なら許可（cloud_allowed 不要）。**`localhost` 以外の
-    ドメイン名/ホスト名は DNS で外部へ解決されうるため不許可**（cloud_allowed=true が必要）。URL パース
-    （`urllib.parse`）＋ `ipaddress` モジュールのみで判定し、ネットワーク I/O は行わない。URL 不正/ホスト欠落/
-    非 IP ホスト名は False（fail-safe）。
-    """
+def _ollama_url_permitted(url: str) -> bool:
+    """`url` が Ollama の接続許可ポリシー（loopback＋管理画面の許可一覧＝回答用の Ollama と同じ `llm.assert_ollama_url_allowed`）を満たすか。I/O なし。不許可・不正 URL は False。"""
+    from sherpa import llm
+    hp = llm._canonical_host_port(url)
+    if hp is not None and llm.is_loopback_host(hp[0]):
+        return True  # loopback は常に許可（許可一覧を読まない）
     try:
-        host = urlparse(url).hostname
+        llm.assert_ollama_url_allowed(url)
     except Exception:
         return False
-    if not host:
-        return False
-    if host == "localhost":
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False                                  # ホスト名（DNS 解決されうる）＝ローカル確証なし
-    if ip.is_loopback:                                 # 127.0.0.0/8・::1
-        return True
-    if isinstance(ip, ipaddress.IPv4Address):
-        return any(ip in net for net in _PRIVATE_V4_NETS)
-    return False                                       # IPv6 の非ループバックは対象外（RFC1918 相当の判定なし）
+    return True
 
 
 def _vlm_usable_override() -> bool | None:
     """MCP サブプロセス向けスナップショット（env `SHERPA_VLM_USABLE`・`agents._mcp_env` が設定）。
 
-    MCP サブプロセスは PG creds を持たない（`_MCP_PASSTHROUGH`
-    に非含）ため system_settings の `vlm`（cloud_allowed 等）を読めず、常に env/既定（ローカル ollama＝
-    usable）にフォールバックしてしまう。親が `provider=openai・cloud_allowed=false`（実際は unusable）でも
-    MCP 側は既定ローカルで usable と誤判定し、画像/PDF を convertible 扱いにする等の view 乖離が起きる。
-
-    親プロセス（API リクエスト時点）が計算した `resolve_vlm() is not None` の1bit スナップショットを
-    `SHERPA_VLM_USABLE`（`"1"`/`"0"`）として渡し、**設定されていれば最優先で信じる**（実際の provider/model/
-    キー等の secrets は渡さない・変換自体は MCP では実行されない読み取り専用の view 整合が目的）。
-    未設定/不正値は None（＝通常の system_settings/env 解決へフォールバック）。
+    MCP サブプロセスは PG creds を持たず `vlm` 設定を読めないため、親プロセスが計算した `resolve_vlm() is not None` の1bit（`"1"`/`"0"`）を渡し、設定されていれば最優先で信じる（secrets は渡さない）。未設定/不正値は None（通常の system_settings/env 解決へ）。
     """
     raw = (os.environ.get("SHERPA_VLM_USABLE") or "").strip()
     if raw == "1":
@@ -225,21 +146,12 @@ def _vlm_usable_override() -> bool | None:
 
 
 def resolve_vlm() -> dict | None:
-    """**実際に使える** VLM 設定（provider/model/cloud_allowed/ollama_url）を返す（使えない/遮断は None）。
+    """実際に使える VLM 設定（provider/model/cloud_allowed/ollama_url）を返す（使えない/遮断は None）。
 
-    - provider=openai → **cloud_allowed=true（管理者が明示許可）かつ OPENAI_API_KEY 有**のときだけ使える。
-      cloud_allowed=false なら None を返す（＝無効扱い・画像を絶対に送らない・warning ログ）。
-    - provider=ollama → **cloud_allowed=true、または接続先がローカル/私有アドレス帯**（`_is_local_url`）の
-      ときだけ使える。公開 IP・ドメイン名（`localhost` 以外）は DNS/経路で外部へ出うるため
-      cloud_allowed が要る。URL 判定はネットワーク I/O を伴わない（URL パース＋ ipaddress のみ）ためここで
-      判定してよい（接続そのものの実到達性は convert 時の fail-safe に委ねる）。
-
-    ここでの判定は convert() 開始時点のスナップショット。長い PDF ページループ中の許可取り消しは、送信直前の
-    `_cloud_allowed_now()` 再検査（`_read_openai`/`_read_ollama`）で別途拾う（belt-and-braces）。
-
-    **`SHERPA_VLM_USABLE` が設定されていれば最優先**（MCP サブプロセスの view 整合スナップショット・
-    `_vlm_usable_override`）: `"0"` は無条件で None、`"1"` は `vlm_config()` の生値をそのまま usable として返す
-    （MCP は変換を実行しないため provider 個別のクラウド遮断ロジックは通らなくてよい）。
+    - provider=openai → cloud_allowed=true かつ API キー有のときだけ使える。cloud_allowed=false なら None（画像を送らない・warning ログ）。
+    - provider=ollama → cloud_allowed=true、または接続先が Ollama の許可ポリシーを満たす（`_ollama_url_permitted`）ときだけ使える。判定はネットワーク I/O を伴わない。
+    ここでの判定は `convert()` 開始時のスナップショット。送信直前の再検査は `_cloud_allowed_now()`。
+    `SHERPA_VLM_USABLE` が設定されていれば最優先（`"0"` は無条件で None、`"1"` は `vlm_config()` の生値を返す）。
     """
     override = _vlm_usable_override()
     if override is not None:
@@ -252,9 +164,7 @@ def resolve_vlm() -> dict | None:
             return None
         _key, _key_invalid = _openai_key_with_reason()
         if not _key:
-            # 「詳細は直前のログを参照」は _openai_key_with_reason() が実際に診断ログを残した
-            # 経路（cloud_provider 不正）だけに限定する（未設定等の他の理由まで「直前のログを
-            # 参照」と案内すると、参照先が無い誤案内になるため）。
+            # 「詳細は直前のログを参照」は `_openai_key_with_reason()` が診断ログを残した経路（cloud_provider 不正）だけに限定する。
             if _key_invalid:
                 _log.warning("VLM: provider=openai・クラウド許可済みですが OpenAI キーを解決できないため"
                             "無効化します（詳細は直前のログを参照）。")
@@ -263,8 +173,11 @@ def resolve_vlm() -> dict | None:
                             "無効化します（画像はクラウドへ送信しません）。")
             return None
     elif cfg["provider"] == "ollama":
-        if not cfg["cloud_allowed"] and not _is_local_url(cfg["ollama_url"]):
-            _log.warning("VLM: provider=ollama の接続先（%s）がローカル/私有アドレスと確認できず、クラウド許可も"
+        if not cfg["ollama_url"]:
+            _log.warning("VLM: 中央の Ollama 接続先を読めないため無効化します（画像は送信しません）。")
+            return None
+        if not cfg["cloud_allowed"] and not _ollama_url_permitted(cfg["ollama_url"]):
+            _log.warning("VLM: provider=ollama の接続先（%s）が Ollama の許可先と確認できず、クラウド許可も"
                          "無いため無効化します（画像は送信しません）。", cfg["ollama_url"])
             return None
     return cfg
@@ -276,15 +189,9 @@ def vlm_usable() -> bool:
 
 
 def sig_value(names) -> str:
-    """arms_sig 用の VLM 署名値（**実効可用性**ベース・クラウド許可・provider/model の変化で
-    drift 再ビルドを誘発する）。
+    """arms_sig 用の VLM 署名値（実効可用性ベース）。
 
-    `vision` が有効アームに無い、または**実際に使えない構成**（`resolve_vlm()` が None を返す＝
-    openai でキー未設定・cloud_allowed 不足・ollama の接続先が非ローカルでクラウド許可も無い 等）→ `"none"`。
-    使える構成のときだけ `"<provider>:<model>:cloud=<on|off>"`（provider/model・cloud_allowed の変更に加え、
-    **OpenAI キーの追加/削除・Ollama 接続先の許可状態の変化でも drift を誘発する**＝生の `vlm_config()`
-    をそのまま使うと、キーだけ後から追加/削除しても署名が変わらず抽出源の変化を見逃す）。
-    エンジンの版は含めない（版更新での不要な全リビルドを避ける・ocr/legacy と同じ扱い）。
+    `vision` が有効アームに無い、または使えない構成（`resolve_vlm()` が None）なら `"none"`。使える構成のときだけ `"<provider>:<model>:cloud=<on|off>"`（キーの追加/削除・接続先の許可状態の変化でも変わる）。エンジンの版は含めない。
     """
     if "vision" not in set(names):
         return "none"
@@ -313,7 +220,7 @@ def _vlm_timeout_sec() -> float:
 
 
 class VisionArm:
-    """画像・スキャン PDF を VLM（視覚モデル）で読み取るアーム（既定ローカル Ollama・クラウドは管理者オプトイン）。"""
+    """画像・スキャン PDF を VLM で読み取るアーム（既定ローカル Ollama・クラウドは管理者オプトイン）。"""
     name = "vision"
 
     def available(self) -> bool:
@@ -323,7 +230,7 @@ class VisionArm:
         ext = Path(path).suffix.lower()
         from .. import office_md
         if ext in office_md.IMAGE_EXT:
-            return vlm_usable()                            # 画像は VLM だけで読める（ラスタ化不要）
+            return vlm_usable()  # 画像は VLM だけで読める（ラスタ化不要）
         if ext == ".pdf":
             return office_md.pdf_escalation_target(path) == "vision"
         return False
@@ -331,15 +238,13 @@ class VisionArm:
     def convert(self, path) -> ArmResult | None:
         cfg = resolve_vlm()
         if cfg is None:
-            return None                                    # 未設定/到達不可/クラウド遮断（fail-safe・warning は resolve 側）
+            return None  # 未設定/到達不可/クラウド遮断（warning は resolve 側）
         p = Path(path)
         ext = p.suffix.lower()
         from .. import office_md
         from sherpa import metering
         extra_notes: list[str] = []
-        # （2026-07-15-LLMオーケストレーション実装計画.md §3）: 読み取り〜返却全体を acc スコープで
-        # 囲み、`kind='vlm'` で1ファイル1行に集約（calls＝ページ/画像数）。user_id/world は付けない
-        # （システムレベルの取り込み・uid が無い・world は office_md 経由で配線されておらずスコープ外）。
+        # 読み取り〜返却全体を acc スコープで囲み、`kind='vlm'` で1ファイル1行に集約する（calls＝ページ/画像数）。user_id/world は付けない（システムレベルの取り込み）。
         metering.acc_begin()
         try:
             try:
@@ -349,16 +254,16 @@ class VisionArm:
                     text, pages, extra_notes = self._read_pdf(p, cfg)
                 else:
                     return None
-            except Exception:                              # 想定外は未対応に倒す（fail-safe）
+            except Exception:  # 想定外は未対応に倒す
                 _log.warning("VLM 視覚読み取りに失敗しました（%s）", p, exc_info=False)
                 return None
             if not text or not text.strip():
-                return None                                # 文字が取れない＝未対応（正直表示・失敗計上）
+                return None  # 文字が取れない＝未対応（失敗計上）
             md = _LABEL + "\n\n" + text.strip()
             notes = [f"vlm_provider={cfg['provider']}", f"vlm_model={cfg['model']}", "numeric_verified=false"]
             if ext == ".pdf":
                 notes.append(f"pages={pages}")
-            notes.extend(extra_notes)                      # タイムアウト予算切れの truncated 記録
+            notes.extend(extra_notes)  # タイムアウト予算切れの truncated 記録
             return ArmResult(md=md, method="vision", confidence=0.4, notes=notes)
         finally:
             tokens, n = metering.acc_end()
@@ -370,11 +275,9 @@ class VisionArm:
         return _vlm_read(image_path, cfg, _vlm_timeout_sec())
 
     def _read_pdf(self, pdf_path: Path, cfg: dict) -> tuple[str | None, int, list[str]]:
-        """テキスト層ゼロ PDF を PDFium でページ画像化→各ページ VLM 読み取り（ラスタ化は `raster` を共用）。
+        """テキスト層ゼロ PDF を PDFium でページ画像化し、各ページを VLM で読み取る（ラスタ化は `raster` を共用）。
 
-        返値 `(結合テキスト|None, 処理ページ数, 追加notes)`。**1 ファイル総予算**（`SHERPA_VLM_TIMEOUT`）: 各ページは
-        残り時間で実行し、予算切れは残ページを打ち切って `truncated=pages N/M` を notes に残す（それまでの結果は返す）。
-        ページ上限（`SHERPA_OCR_MAX_PAGES`）・ラスタ化ピクセル上限（`SHERPA_OCR_MAX_PIXELS`）は `raster` を共用。
+        返値 `(結合テキスト|None, 処理ページ数, 追加notes)`。1 ファイル総予算（`SHERPA_VLM_TIMEOUT`）の残り時間で各ページを実行し、予算切れは残ページを打ち切って `truncated=pages N/M` を notes に残す。ページ上限（`SHERPA_OCR_MAX_PAGES`）・ピクセル上限は `raster` を共用する。
         """
         import pypdfium2 as pdfium
 
@@ -439,11 +342,7 @@ def _max_image_mb() -> float:
 def _image_too_large(image_path: Path) -> bool:
     """画像ファイルサイズが上限を超えるか（暴走/コスト防止）。
 
-    stat 不可（存在しない等）は「超過ではない」扱い（呼び出し元の後続読み込みでどのみち失敗する・ここで
-    fail-safe 側に倒す必要はない）。ページ画像化（`_read_pdf`）は既存のピクセル上限クランプ（`raster.
-    _rasterize_page`）で通常この上限を超えないが、単独画像ファイル（accepts (a)）にはそのクランプが効かない
-    ため、送信前にファイルサイズで一律ガードする（単独画像の事後縮小再エンコードは行わない＝実装の単純さを
-    優先。上限超過は「未対応」として正直に表示する）。
+    stat 不可は「超過ではない」扱い（後続の読み込みで失敗する）。単独画像ファイルにはピクセル上限クランプが効かないため、送信前にファイルサイズで一律ガードする。上限超過は「未対応」として扱う。
     """
     try:
         size = Path(image_path).stat().st_size
@@ -453,7 +352,7 @@ def _image_too_large(image_path: Path) -> bool:
 
 
 def _vlm_read(image_path: Path, cfg: dict, timeout: float) -> str | None:
-    """1 枚の画像を VLM（provider 別）で読み取り、テキストを返す（失敗/到達不可は None・fail-safe）。"""
+    """1 枚の画像を VLM（provider 別）で読み取り、テキストを返す（失敗/到達不可は None）。"""
     if _image_too_large(image_path):
         _log.warning("VLM: 画像サイズが上限（%sMB）を超えるため読み取りをスキップします: %s",
                      _max_image_mb(), image_path)
@@ -471,26 +370,20 @@ def _vlm_read(image_path: Path, cfg: dict, timeout: float) -> str | None:
 
 
 def _read_ollama(image_path: Path, cfg: dict, timeout: float) -> str | None:
-    """Ollama `/api/chat`（stream=false・images に base64）で画像1枚を読み取る（本文テキストを返す）。
+    """Ollama `/api/chat`（stream=false・images に base64）で画像1枚を読み取り、本文テキストを返す。
 
-    **cloud_allowed=false のときは接続先がローカル/私有アドレス帯（`_is_local_url`）であることを送信直前に
-    毎回検証する**。cloud_allowed は**送信直前に再読み**（`_cloud_allowed_now`・
-    stale cfg 回避）＝`resolve_vlm()` は convert() 開始時の1回きりの判定のため、長い PDF ページループの途中で
-    管理者が許可を取り消しても、次ページの送信直前チェックで確実に止まる（cfg 引数の cloud_allowed は見ない）。
+    cloud_allowed=false のときは、接続先が Ollama の許可ポリシーを満たす（`_ollama_url_permitted`）ことを送信直前に毎回検証する。cloud_allowed は送信直前に読み直す（`_cloud_allowed_now`）。cfg 引数の cloud_allowed は見ない。
     """
     url = cfg["ollama_url"]
-    if not _cloud_allowed_now() and not _is_local_url(url):
-        _log.warning("VLM(ollama): 接続先（%s）がローカル/私有アドレスと確認できず、クラウド許可も無いため"
+    if not _cloud_allowed_now() and not _ollama_url_permitted(url):
+        _log.warning("VLM(ollama): 接続先（%s）が Ollama の許可先と確認できず、クラウド許可も無いため"
                      "送信しません（fail-safe）。", url)
         return None
     from sherpa import llm, metering
     body = {"model": cfg["model"], "stream": False,
             "messages": [{"role": "user", "content": _VLM_PROMPT, "images": [_read_image_b64(image_path)]}]}
-    # VLM 専用の接続先はこの呼び出しにだけ閉じて許可する（一般の Ollama 許可リスト
-    # `llm._allowlisted_hosts()` へは加算しない＝個人 ollama_url の権限へ流用させない）。
-    # 上の local/cloud_allowed チェックを既に通過済みの接続先なのでここでの追加許可は安全。
-    vlm_hp = llm._canonical_host_port(url)
-    resp = llm.post_json(llm.ollama_url(url, "/api/chat", extra_allowed={vlm_hp} if vlm_hp else None),
+    # 接続先は中央の Ollama 接続先と同じ許可リスト（loopback＋管理画面の許可一覧）で検証する。
+    resp = llm.post_json(llm.ollama_url(url, "/api/chat"),
                          llm.JSON_HEADERS, body, timeout=max(1, int(timeout)))
     metering.acc_add(metering.usage_from_ollama_chat(resp))
     return ((resp or {}).get("message") or {}).get("content")
@@ -499,15 +392,7 @@ def _read_ollama(image_path: Path, cfg: dict, timeout: float) -> str | None:
 def _read_openai(image_path: Path, cfg: dict, timeout: float) -> str | None:
     """OpenAI Chat Completions（image_url に base64 data URL）で画像1枚を読み取る。
 
-    **cloud_allowed を送信直前に system_settings から再読み**（`_cloud_allowed_now`）して許可
-    されていない送信を防ぐ（stale cfg 回避・belt-and-braces）: `resolve_vlm()` 迂回の直接呼び出しや、長い
-    PDF ページループの処理中に管理者が cloud_allowed を false へ戻したケースでも、次ページの送信直前チェック
-    で確実に止まる（**`cfg["cloud_allowed"]` の値は見ない**＝古い許可のまま送り続ける穴を塞ぐ）。
-
-    `system_settings` はこの関数の冒頭で1回だけ読み、cloud_allowed 判定・鍵解決・接続先
-    （`llm.openai_url`/`openai_headers`）まで同じスナップショットで揃える（「送信直前に読み直す」
-    という stale cfg 対策の意図は保ったまま＝`resolve_vlm()` の古い値を使い回すわけではない・1回の
-    送信判断の中で3箇所が別々の読みで食い違うのを防ぐだけ）。
+    cloud_allowed を送信直前に system_settings から読み直し（`_cloud_allowed_now`）、許可されていない送信を防ぐ（`cfg["cloud_allowed"]` は見ない）。`system_settings` は冒頭で1回だけ読み、cloud_allowed 判定・鍵解決・接続先（`llm.openai_url`/`openai_headers`）を同じスナップショットで揃える。
     """
     try:
         from sherpa import store
@@ -527,8 +412,7 @@ def _read_openai(image_path: Path, cfg: dict, timeout: float) -> str | None:
         {"type": "text", "text": _VLM_PROMPT},
         {"type": "image_url", "image_url": {"url": data_url}},
     ]}]}
-    # 送信は `llm.openai_post_json`（OpenAI 専用の送信直前ガード付き・`post_json` は Gemini/Ollama
-    # とも共用のため一律遮断しない）。
+    # 送信は `llm.openai_post_json`（OpenAI 専用の送信直前ガード付き）を使う。`post_json` は Ollama と共用のため一律遮断しない。
     resp = llm.openai_post_json(llm.openai_url("chat/completions", system_settings=sys_s),
                          llm.openai_headers(key, system_settings=sys_s), body, timeout=max(1, int(timeout)))
     metering.acc_add(metering.usage_from_openai_chat(resp))
@@ -538,18 +422,11 @@ def _read_openai(image_path: Path, cfg: dict, timeout: float) -> str | None:
     return (choices[0].get("message") or {}).get("content")
 
 
-# ---- 補足観測（L8・§8.2）: canonical が読めない画像要素だけを VLM で観測する ----------------------
-# ここまでの `VisionArm.convert()` は「文書/画像**全体**を vision が単独担当する」経路（① OOXML/
-# ④ pdf_text が使えない入力の全面代替）。ここから下は別の役割で、① OOXML が既に読めている文書の
-# **一部**（picture 等・OOXML は画素の中身を持たない＝coverage=metadata_only）だけを補足する。
-# 出力先も別（`ai_observation.AIObservationSet` として Canonical Evidence と分離保存・原値を
-# 上書きしない・office_md がこの Set を `evidence_render.render(observation_set=...)` へ渡す）。
+# 補足観測: canonical が読めない画像要素だけを VLM で観測する
+# `convert()` は文書/画像全体を vision が単独で担当する経路。ここから下は、① OOXML が既に読めている文書の一部（picture 等）だけを補足する別の役割で、出力は `ai_observation.AIObservationSet` として Canonical Evidence と分離して保存する（原値を上書きしない）。
 VISION_OBSERVATION_PROMPT_SCHEMA_VERSION = "vision-observation-image-v1"
 VISION_OBSERVATION_PREPROCESSING_PROFILE = "embedded-asset-original-v1"
-# 単独ソースの画像内容観測（canonicalに競合する値が無い＝上書きの懸念がない）に対する固定confidence。
-# `ai_observation.MIN_ANSWER_CONFIDENCE`（0.70）以上にして`use_for_answer=True`を許可し、rag.mdの
-# AI観測レコードとして出す（既存の使用可否ルールはそのまま・値だけ本用途向けに定義）。全体変換時の
-# `convert()` の confidence=0.4（他アームの代替という別文脈）とは意図的に別値。
+# 単独ソースの画像内容観測に対する固定 confidence。`ai_observation.MIN_ANSWER_CONFIDENCE`（0.70）以上にして `use_for_answer=True` を許可する。全体変換時の `convert()` の confidence=0.4 とは別値。
 VISION_OBSERVATION_CONFIDENCE = 0.75
 
 
@@ -559,19 +436,10 @@ def build_asset_observations(
     decisions: list[ocr_router.OCRRouteDecision],
     asset_root: Path,
 ) -> ai_observation.AIObservationSet | None:
-    """canonical が読み取れない画像要素（`metadata_only`/`image_content_uninterpreted` 等）を
-    VLM で補足観測する（第二アーム観測の一般化・OCR の Set 契約と同じ器に乗る）。
+    """canonical が読み取れない画像要素（`metadata_only`/`image_content_uninterpreted` 等）を VLM で補足観測する。
 
-    `decisions` は呼び出し側（`office_md`）が `ocr_router.build_manifest()` で選定済みの
-    ``status == "selected" かつ input_kind == "asset"`` の候補に限定して渡すこと——ここでは
-    再判定しない（router の決定＝「読む/読まない」を尊重し、二重の意味推定をしない）。
-    ``page_render``（PDF ページ全体のスキャン救済）は対象外のまま渡ってきても無視する
-    （PDF 全体の視覚読み取りは `VisionArm.convert()` 単独の担当・二重コストを避ける）。
-
-    VLM が実効利用不可（`resolve_vlm()` が None）なら None を返す（既定コストゼロ・呼び出し元は
-    `evidence_render.render(observation_set=None)` と同じ挙動になる）。1画像の読み取り失敗/空応答は
-    その画像だけ黙ってスキップする（1件の失敗が資料全体の観測生成を止めない・`convert()` の
-    fail-safe と同じ思想）。全候補が失敗/空なら None を返す。
+    `decisions` は呼び出し側（`office_md`）が `ocr_router.build_manifest()` で選定した `status == "selected" かつ input_kind == "asset"` の候補に限って渡すこと（ここでは再判定しない）。`page_render` は渡されても無視する（PDF 全体の読み取りは `VisionArm.convert()` が担当）。
+    VLM が使えない（`resolve_vlm()` が None）なら None。1画像の失敗/空応答はその画像だけスキップする。全候補が失敗/空なら None。
     """
     cfg = resolve_vlm()
     if cfg is None:

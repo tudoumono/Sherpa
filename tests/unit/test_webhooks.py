@@ -425,3 +425,34 @@ def test_process_queue_item_swallows_deliver_exceptions(monkeypatch):
 
     monkeypatch.setattr(webhooks, "_deliver", _boom)
     webhooks._process_queue_item((1, "https://example.com/hook", "sec", {}))   # 例外を投げなければ成功
+
+
+def test_codex_job_notice_rechecks_destination_before_each_attempt(monkeypatch):
+    """Codex ジョブの終了通知は積んだ後に宛先が無効になったら（失効・削除・所有者無効化）送らず、
+    再送も打ち切る。送信は外部境界（`_send_once`）だけ差し替える。"""
+    from sherpa import store
+    sent = []
+    dest = {"webhook_url": "http://h.example/x", "webhook_secret": "s"}
+    monkeypatch.setattr(webhooks, "assert_webhook_url_allowed", lambda url, **kw: None)
+    monkeypatch.setattr(webhooks.time, "sleep", lambda s: None)
+    monkeypatch.setattr(store, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(webhooks, "_send_once", lambda *a: sent.append(a))
+    payload = {"event": "codex_job.completed", "job_id": "j", "status": "completed", "finished_at": "t"}
+
+    monkeypatch.setattr(store, "get_api_key_webhook", lambda kid: None)   # 積んだ後に無効化
+    webhooks._deliver(1, "http://old.example/x", "", payload)
+    assert sent == []
+
+    calls = {"n": 0}
+
+    def _first_fail_then_revoked(kid):
+        calls["n"] += 1
+        return dest if calls["n"] == 1 else None
+    monkeypatch.setattr(store, "get_api_key_webhook", _first_fail_then_revoked)
+
+    def _fail(*a):
+        sent.append(a)
+        raise OSError("down")
+    monkeypatch.setattr(webhooks, "_send_once", _fail)
+    webhooks._deliver(1, "http://old.example/x", "", payload)
+    assert len(sent) == 1          # 1 回目だけ送り、再送の直前に失効を検知して打ち切る

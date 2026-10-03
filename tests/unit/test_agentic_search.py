@@ -1,12 +1,10 @@
 """エージェント検索（索引なし・LLM が grep ツールを反復）の単体テスト。LLM は stub（コスト0）。
 
 - run_tool: ripgrep_search / read_around / 範囲外拒否（v1 フィクスチャの filesystem grep・Neo4j 不要）。
-- openai_style / gemini ループ: _post を差し替え、tool 呼び出し→最終回答→docs 収集／ask_user 質問を検証。
-- プロバイダ統合: OpenAIProvider.run（knowledge ON・qa）が反復検索で _result(env: headline/sources) を返す。
+- openai_style ループ: _post を差し替え、tool 呼び出し→最終回答→docs 収集／ask_user 質問を検証。
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import pathlib
@@ -16,6 +14,7 @@ os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")   # es_search が実埋め込みを叩かない（BM25）
 import pytest  # noqa: E402
 from sherpa import agentic_search as A   # noqa: E402
+from sherpa.parts.read import tools as RT   # noqa: E402
 from sherpa import store   # noqa: E402   # BUDGET-1: system_settings > コード既定のテスト用
 import _corpus_expect as CE   # noqa: E402   # フィクスチャ実走査ベースの list_docs 期待値（フェーズ7 S1）
 import _fresh_import as FI   # noqa: E402   # import-time 固定 env 定数の実プロセス検証
@@ -130,142 +129,7 @@ def test_run_tool_es_search_surfaces_degrade_reason_in_result(monkeypatch):
     assert "degrade_reason" not in view2
 
 
-def test_degrade_result_node_known_reasons_only():
-    """RV2/RV3（境界回帰#2）: `_degrade_result_node()` は既知の縮退理由（BM25 継続時のみ・hits は
-    空でない・`embedding_cloud_unavailable`/`query_embed_failed`/`hybrid_query_failed`）だけを
-    ノード化する。`degrade_reason` が無い／未知／`es_search` 以外のツール結果（`degrade_reason`
-    キー自体を持たない）は None。`es_query_failed`（hits が空になる BM25 自体の失敗・RV3 で
-    `hybrid_query_failed` と分離）は対象外のまま。"""
-    node = A._degrade_result_node({"hits": [], "degrade_reason": "embedding_cloud_unavailable"})
-    assert node["type"] == "node" and node["kind"] == "tool"
-    node2 = A._degrade_result_node({"hits": [], "degrade_reason": "query_embed_failed"})
-    assert node2["label"] == node["label"]                  # 同じ「精度低下」ラベルで文言だけ違う
-    assert node2["detail"] != node["detail"]
-    node3 = A._degrade_result_node({"hits": [], "degrade_reason": "hybrid_query_failed"})
-    assert node3["label"] == node["label"]
-    assert node3["detail"] not in (node["detail"], node2["detail"])
-    node4 = A._degrade_result_node({"hits": [], "degrade_reason": "vector_feature_mismatch"})
-    assert node4["label"] == node["label"]                  # 索引素性ズレ（今すぐ更新待ち）も同ラベル
-    assert "今すぐ更新" in node4["detail"]                   # 一時障害ではなく今すぐ更新での解消を案内
-    assert A._degrade_result_node({"hits": []}) is None
-    assert A._degrade_result_node({"hits": [], "degrade_reason": "es_query_failed"}) is None
-    assert A._degrade_result_node({"count": 0, "docs": []}) is None   # list_docs 等の無関係な result
-
-
 # ===== `_hit_summary_node`/`_hit_summary_node_sub`: 「何を探して・いくつ当たったか」の追加ノード =====
-
-def test_hit_summary_node_ripgrep_includes_query_and_count():
-    node = A._hit_summary_node("ripgrep_search", {"query": "TAX-RATE"},
-                               {"hits": [{"doc_id": "a.md"}] * 12})
-    assert node["label"] != "資料を検索（語句そのまま）"          # `_tool_node` の label とは別ノード
-    assert "TAX-RATE" in node["detail"] and "12件" in node["detail"]
-
-
-def test_hit_summary_node_ripgrep_zero_hits_is_explicit():
-    node = A._hit_summary_node("ripgrep_search", {"query": "存在しない語"}, {"hits": []})
-    assert "0件" in node["detail"]
-
-
-def test_hit_summary_node_es_search_includes_mode_and_count():
-    """degrade_reason の有無で「実際に使われた検索方式」の文言が変わる（縮退表示自体は
-    `_degrade_result_node` が別ノードで担うので、ここでは重複しないことだけ見る）。"""
-    normal = A._hit_summary_node("es_search", {"query": "税率"}, {"hits": [{"doc_id": "a.md"}] * 3})
-    assert "税率" in normal["detail"] and "3件" in normal["detail"]
-    degraded = A._hit_summary_node("es_search", {"query": "税率"},
-                                   {"hits": [{"doc_id": "a.md"}],
-                                    "degrade_reason": "embedding_cloud_unavailable"})
-    assert "1件" in degraded["detail"]
-    assert degraded["detail"] != normal["detail"]   # 縮退時は方式の文言が変わる
-
-
-def test_hit_summary_node_es_search_unavailable_or_query_failed_omits_node():
-    """M-1是正: `es_unavailable`/`es_query_failed`（BM25 自体も失敗し hits が強制的に空になっている
-    ＝`_ES_DEGRADE_WORDING` の3語彙に含まれない）は「0件（キーワード一致のみ）」という、検索は
-    実行できたかのような誤表示を避けるため、追加ノード自体を出さない（メイン・サブ両経路とも）。
-    BM25 が継続して成立する既知語彙（`_ES_DEGRADE_WORDING`）は従来どおり件数を出す。"""
-    for reason in ("es_unavailable", "es_query_failed"):
-        result = {"hits": [], "degrade_reason": reason}
-        assert A._hit_summary_node("es_search", {"query": "税率"}, result) is None
-        assert A._hit_summary_node_sub("es_search", result) is None
-    for reason in ("embedding_cloud_unavailable", "query_embed_failed", "hybrid_query_failed",
-                   "vector_feature_mismatch"):
-        result = {"hits": [], "degrade_reason": reason}
-        assert A._hit_summary_node("es_search", {"query": "税率"}, result) is not None
-        assert A._hit_summary_node_sub("es_search", result) is not None
-
-
-def test_hit_summary_node_graph_neighbors_includes_term_and_count():
-    node = A._hit_summary_node("graph_neighbors", {"name": "請求"},
-                               {"neighbors": [{"name": "x"}, {"name": "y"}]})
-    assert "請求" in node["detail"] and "2件" in node["detail"]
-
-
-def test_hit_summary_node_graph_neighbors_zero_hits_is_explicit():
-    node = A._hit_summary_node("graph_neighbors", {"name": "存在しない語"}, {"neighbors": []})
-    assert "0件" in node["detail"]
-
-
-def test_hit_summary_node_list_docs_includes_target_and_count():
-    node = A._hit_summary_node("list_docs", {"path_prefix": "4期"}, {"count": 7, "docs": []})
-    assert "4期" in node["detail"] and "7件" in node["detail"]
-
-
-def test_hit_summary_node_read_around_includes_doc_and_line_count():
-    node = A._hit_summary_node("read_around", {"doc_id": "設計/資料.md"},
-                               {"doc_id": "設計/資料.md", "text": "1: a\n2: b\n3: c"})
-    assert "設計/資料.md" in node["detail"] and "3行" in node["detail"]
-
-
-def test_hit_summary_node_none_on_error_result():
-    """実行そのものが成立していない（error 応答）場合は「0件ヒット」と紛らわしいノードを出さない。"""
-    assert A._hit_summary_node("ripgrep_search", {"query": "x"}, {"error": "指定 doc_id は対象範囲外です"}) is None
-    assert A._hit_summary_node("list_docs", {}, {"error": "boom"}) is None
-
-
-def test_hit_summary_node_clips_long_query():
-    long_q = "あ" * 200
-    node = A._hit_summary_node("ripgrep_search", {"query": long_q}, {"hits": []})
-    assert long_q not in node["detail"]
-    assert ("あ" * 60) in node["detail"]
-
-
-def test_hit_summary_node_sub_omits_model_generated_args():
-    """secRV MED-2 と同じ理由（サブ経路はモデル生成の引数を思考ノードに出さない）で、件数のみの
-    固定文言にする——query/name/doc_id はどれも渡していないのに件数だけで組み立てられる。"""
-    node = A._hit_summary_node_sub("ripgrep_search", {"hits": [{"doc_id": "a.md"}] * 5})
-    assert node["label"] == A._hit_summary_node("ripgrep_search", {"query": "x"}, {"hits": []})["label"]
-    assert "5件" in node["detail"]
-    assert "資料を検索" not in node["detail"]   # `_tool_node_sub` の文言とは別の detail
-
-
-def test_hit_summary_node_sub_zero_hits_is_explicit():
-    node = A._hit_summary_node_sub("es_search", {"hits": []})
-    assert "0件" in node["detail"]
-
-
-def test_hit_summary_node_sub_read_around_uses_line_unit():
-    node = A._hit_summary_node_sub("read_around", {"doc_id": "a.md", "text": "1: a\n2: b"})
-    assert "2行" in node["detail"]
-
-
-def test_hit_summary_node_sub_unknown_tool_or_error_is_none():
-    assert A._hit_summary_node_sub("ask_user", {"hits": []}) is None
-    assert A._hit_summary_node_sub("ripgrep_search", {"error": "boom"}) is None
-
-
-def test_hit_summary_node_tags_event_type_tool_completed():
-    """M-2是正: `web/chat/render.js::_updateLaneStats` は event_type の無い kind:"tool" ノードを
-    「道具使用回数」として数える（`et === 'tool_started' || (e.kind === 'tool' && !et)`）ため、
-    追加ノードを無印のままにすると開始ノード（`_tool_node`/`_tool_node_sub`）と合わせて実行1回が
-    2回とカウントされる。`event_type="tool_completed"`（`exec_event.EVENT_TYPES` の既存語彙）を
-    付けてこの二重計上を避ける（メイン・サブ両経路とも）。"""
-    node = A._hit_summary_node("ripgrep_search", {"query": "TAX-RATE"}, {"hits": [{"doc_id": "a.md"}]})
-    assert node["event_type"] == "tool_completed"
-    node_sub = A._hit_summary_node_sub("ripgrep_search", {"hits": [{"doc_id": "a.md"}]})
-    assert node_sub["event_type"] == "tool_completed"
-    # v1 最小契約（id/kind/label/detail/status）は引き続き満たす（既存フロントの平坦描画が壊れない）。
-    assert all(k in node for k in ("id", "kind", "label", "detail", "status"))
-
 
 def test_run_tool_read_around_rejects_doc_outside_layer():
     """§8 裁定論点2: open ツール（read_around）は層外の doc_id を scope 外と同型で拒否する。"""
@@ -308,26 +172,6 @@ def test_run_tool_layer_both_or_omitted_unaffected():
     omitted, _, _, _ = A.run_tool("ripgrep_search", {"query": "TAX-RATE"}, "v1", None)
     both, _, _, _ = A.run_tool("ripgrep_search", {"query": "TAX-RATE"}, "v1", None, layer="both")
     assert {h["doc_id"] for h in omitted["hits"]} == {h["doc_id"] for h in both["hits"]}
-
-
-def test_openai_style_forwards_layer_to_run_tool(monkeypatch):
-    """`openai_style(layer=...)` は `scope_paths` と同じく `run_tool` へそのまま転送する。"""
-    captured = {}
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        captured["layer"] = kw.get("layer")
-        return ({"hits": []}, set(), [], [])
-
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-               {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]},
-           {"choices": [{"message": {"content": "回答"}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = (lambda url, headers, body, timeout=90: seq.pop(0)), fake_run_tool
-    try:
-        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None, layer="code"))
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-    assert captured.get("layer") == "code"
 
 
 # ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: run_tool の hits/window 上限オーバーライド =====
@@ -479,6 +323,7 @@ def test_run_tool_ripgrep_search_offset_near_ceiling_shrinks_page_without_rollin
     _isolate_world_kb(monkeypatch, tmp_path, world, {
         name: "NEEDLE 行\n" for name in ("a.md", "b.md", "c.md", "d.md", "e.md", "f.md", "g.md", "h.md")})
     monkeypatch.setattr(A, "MAX_HITS_ABS_MAX", 5)   # 母集団(8件) > 天井(5件) を小さく再現
+    monkeypatch.setattr(RT, "MAX_HITS_ABS_MAX", 5)
 
     p0, _docs, _cites, _cards = A.run_tool(
         "ripgrep_search", {"query": "NEEDLE", "offset": 0}, world, None, max_hits=3)
@@ -630,231 +475,6 @@ def test_run_tool_window_cap_raises_read_around_ceiling(monkeypatch, tmp_path):
 # world/scope_paths とは無関係（引数検証・dispatch・cards サイドカーだけを固定する・DB は monkeypatch
 # で切り離す＝本ファイルの他の run_tool テストと同じ「実埋め込み/実DBを叩かない」流儀）。
 
-def test_usage_openai_tools_and_gemini_tools_expose_exactly_eight_tools():
-    """裁定（2026-09-12・巡別記録の分布ツールで1つ追加）: ツールは8つのみ
-    （world別/モデル別は足さない）。"""
-    names = {"usage_overview", "usage_by_user", "usage_conversations", "usage_conversation_detail",
-            "usage_response_time", "usage_daily", "usage_stop_kinds", "usage_depth_rounds"}
-    openai_tools = A.usage_openai_tools()
-    assert {t["function"]["name"] for t in openai_tools} == names
-    assert all(t["type"] == "function" and t["function"]["parameters"] for t in openai_tools)
-    gemini_fns = A.usage_gemini_tools()[0]["functionDeclarations"]
-    assert {f["name"] for f in gemini_fns} == names
-
-
-@pytest.mark.parametrize("tool_name,store_fn,expected_args", [
-    ("usage_overview", "usage_overview", (30,)),
-    ("usage_response_time", "usage_response_time", (30,)),
-    ("usage_daily", "usage_daily", (30,)),
-    ("usage_stop_kinds", "usage_stop_kinds", (30,)),
-    ("usage_depth_rounds", "usage_depth_rounds", (30,)),
-])
-def test_run_tool_usage_dispatch_uses_default_days_when_omitted(monkeypatch, tool_name, store_fn,
-                                                                expected_args):
-    """days 省略時はツールごとの既定日数（overview/response_time/daily/stop_kinds は30日）で
-    対応する `store.usage_*` 関数へ委譲する。"""
-    captured = {}
-
-    def _fake(*a, **kw):
-        captured["args"], captured["kwargs"] = a, kw
-        return {"ok": True}
-
-    monkeypatch.setattr(store, store_fn, _fake)
-    result, docs, cites, cards = A.run_tool(tool_name, {}, "v1", None)
-    assert result == {"ok": True} and docs == set() and cites == []
-    assert captured["args"][0] == expected_args[0]
-    assert cards == [{"tool": tool_name, "args": {}}]   # 引数省略＝echo する既知キーも空
-
-
-_FROM_TO_TOOLS = ["usage_overview", "usage_by_user", "usage_conversations", "usage_stop_kinds",
-                  "usage_depth_rounds"]
-
-
-@pytest.mark.parametrize("tool_name", _FROM_TO_TOOLS)
-def test_run_tool_usage_forwards_from_to(monkeypatch, tool_name):
-    """期間を from/to で受けるツールは、値をそのまま `store.usage_*` へ渡す（日数へ丸めない）。
-    呼び出しカードにも from/to が echo される。"""
-    captured = {}
-
-    def _fake(*a, **kw):
-        captured["args"], captured["kwargs"] = a, kw
-        return {"ok": True}
-
-    monkeypatch.setattr(store, tool_name, _fake)
-    args = {"from": "2026-09-18T00:00:00+09:00", "to": "2026-09-19T00:00:00+09:00"}
-    result, _docs, _cites, cards = A.run_tool(tool_name, args, "v1", None)
-    assert result == {"ok": True}
-    assert captured["kwargs"]["time_from"] == args["from"]
-    assert captured["kwargs"]["time_to"] == args["to"]
-    assert cards == [{"tool": tool_name, "args": args}]
-
-
-@pytest.mark.parametrize("tool_name", _FROM_TO_TOOLS)
-def test_run_tool_usage_rejects_days_with_from_to(monkeypatch, tool_name):
-    """`days` と `from`/`to` の併用はエラー（どちらの期間で読んだのか曖昧な結果を返さない）。"""
-    called = []
-    monkeypatch.setattr(store, tool_name, lambda *a, **kw: called.append((a, kw)))
-    result, _docs, _cites, _cards = A.run_tool(
-        tool_name,
-        {"days": 7, "from": "2026-09-18T00:00:00+09:00", "to": "2026-09-19T00:00:00+09:00"},
-        "v1", None)
-    assert "error" in result and called == []
-
-
-@pytest.mark.parametrize("tool_name", _FROM_TO_TOOLS)
-def test_run_tool_usage_reports_period_rule_violation_as_error(monkeypatch, tool_name):
-    """期間規則違反（オフセットなし等）は例外ではなく error 辞書で返す（他のツール引数検証と同じ）。
-
-    判定は store 側（`_usage_period`）——ここは `UsagePeriodError` が error 辞書へ写ることを固定する。
-    """
-    def _raise(*a, **kw):
-        raise store.UsagePeriodError("from にはタイムゾーンオフセットが必要です")
-
-    monkeypatch.setattr(store, tool_name, _raise)
-    result, _docs, _cites, _cards = A.run_tool(
-        tool_name, {"from": "2026-09-18T00:00:00", "to": "2026-09-19T00:00:00"}, "v1", None)
-    assert "error" in result
-
-
-def test_run_tool_usage_by_user_default_days_is_seven_and_forwards_uid_kind(monkeypatch):
-    """`usage_by_user` の既定日数は7日（他は30日）・uid/kind をそのまま転送する。"""
-    captured = {}
-
-    def _fake(days, uid=None, kind=None):
-        captured.update(days=days, uid=uid, kind=kind)
-        return {"rows": []}
-
-    monkeypatch.setattr(store, "usage_by_user", _fake)
-    result, _, _, cards = A.run_tool("usage_by_user", {"uid": "alice"}, "v1", None)
-    assert result == {"rows": []}
-    assert captured == {"days": 7, "uid": "alice", "kind": None}
-    assert cards == [{"tool": "usage_by_user", "args": {"uid": "alice"}}]
-
-
-def test_run_tool_usage_by_user_forwards_days_and_kind(monkeypatch):
-    captured = {}
-
-    def _fake(days, uid=None, kind=None):
-        captured.update(days=days, uid=uid, kind=kind)
-        return {"rows": []}
-
-    monkeypatch.setattr(store, "usage_by_user", _fake)
-    A.run_tool("usage_by_user", {"days": 14, "kind": "intent"}, "v1", None)
-    assert captured == {"days": 14, "uid": None, "kind": "intent"}
-
-
-def test_run_tool_usage_conversations_forwards_uid_limit_sort(monkeypatch):
-    captured = {}
-
-    def _fake(days, uid=None, limit=20, sort="tokens"):
-        captured.update(days=days, uid=uid, limit=limit, sort=sort)
-        return {"conversations": []}
-
-    monkeypatch.setattr(store, "usage_conversations", _fake)
-    result, _, _, cards = A.run_tool(
-        "usage_conversations", {"days": 60, "uid": "bob", "limit": 100, "sort": "turns"}, "v1", None)
-    assert result == {"conversations": []}
-    assert captured == {"days": 60, "uid": "bob", "limit": 100, "sort": "turns"}
-    assert cards == [{"tool": "usage_conversations",
-                      "args": {"days": 60, "uid": "bob", "limit": 100, "sort": "turns"}}]
-
-
-def test_run_tool_usage_conversations_default_limit_and_sort(monkeypatch):
-    captured = {}
-
-    def _fake(days, uid=None, limit=20, sort="tokens"):
-        captured.update(days=days, uid=uid, limit=limit, sort=sort)
-        return {"conversations": []}
-
-    monkeypatch.setattr(store, "usage_conversations", _fake)
-    A.run_tool("usage_conversations", {}, "v1", None)
-    assert captured == {"days": 30, "uid": None, "limit": 20, "sort": "tokens"}
-
-
-def test_run_tool_usage_conversation_detail_forwards_conversation_id(monkeypatch):
-    captured = {}
-
-    def _fake(cid):
-        captured["cid"] = cid
-        return {"conversation_id": cid, "user_turns": 0, "kinds": [], "response_time_series": []}
-
-    monkeypatch.setattr(store, "usage_conversation_detail", _fake)
-    result, _, _, cards = A.run_tool("usage_conversation_detail", {"conversation_id": 501}, "v1", None)
-    assert captured["cid"] == 501
-    assert result["conversation_id"] == 501
-    assert cards == [{"tool": "usage_conversation_detail", "args": {"conversation_id": 501}}]
-
-
-def test_run_tool_usage_conversation_detail_passes_through_store_error(monkeypatch):
-    """`usage_conversation_detail` 自体の「存在しない会話」判定は `store` 側の責務
-    （`run_tool` は結果をそのまま通す）。"""
-    monkeypatch.setattr(store, "usage_conversation_detail",
-                        lambda cid: {"error": "指定した会話が見つかりません"})
-    result, _, _, _ = A.run_tool("usage_conversation_detail", {"conversation_id": 999999}, "v1", None)
-    assert result == {"error": "指定した会話が見つかりません"}
-    assert "answer" not in result and "title" not in result
-
-
-def test_run_tool_usage_response_time_forwards_provider(monkeypatch):
-    captured = {}
-
-    def _fake(days, provider=None):
-        captured.update(days=days, provider=provider)
-        return {"avg": None, "n": 0}
-
-    monkeypatch.setattr(store, "usage_response_time", _fake)
-    A.run_tool("usage_response_time", {"days": 90, "provider": "openai"}, "v1", None)
-    assert captured == {"days": 90, "provider": "openai"}
-
-
-@pytest.mark.parametrize("bad_days", [-1, 0, "not-a-number"])
-def test_run_tool_usage_tools_reject_negative_or_invalid_days(monkeypatch, bad_days):
-    """負/0/非数値の days はどの usage_* ツールでも error 辞書になり、`store` 側へは進まない。"""
-    def _must_not_call(*a, **kw):
-        raise AssertionError("不正な days なのに store 関数へ進んでしまった")
-
-    monkeypatch.setattr(store, "usage_overview", _must_not_call)
-    result, docs, cites, cards = A.run_tool("usage_overview", {"days": bad_days}, "v1", None)
-    assert "error" in result and docs == set() and cites == [] and cards == []
-
-
-def test_run_tool_usage_daily_rejects_invalid_metric(monkeypatch):
-    def _must_not_call(*a, **kw):
-        raise AssertionError("不正な metric なのに store 関数へ進んでしまった")
-
-    monkeypatch.setattr(store, "usage_daily", _must_not_call)
-    result, _, _, cards = A.run_tool("usage_daily", {"metric": "bogus"}, "v1", None)
-    assert "error" in result and cards == []
-
-
-def test_run_tool_usage_daily_accepts_each_known_metric(monkeypatch):
-    captured = []
-    monkeypatch.setattr(store, "usage_daily",
-                        lambda days, metric="turns": (captured.append(metric), {"series": []})[1])
-    for m in ("turns", "tokens", "response_time"):
-        result, _, _, _ = A.run_tool("usage_daily", {"metric": m}, "v1", None)
-        assert "error" not in result
-    assert captured == ["turns", "tokens", "response_time"]
-
-
-def test_run_tool_usage_conversations_rejects_invalid_sort(monkeypatch):
-    def _must_not_call(*a, **kw):
-        raise AssertionError("不正な sort なのに store 関数へ進んでしまった")
-
-    monkeypatch.setattr(store, "usage_conversations", _must_not_call)
-    result, _, _, cards = A.run_tool("usage_conversations", {"sort": "bogus"}, "v1", None)
-    assert "error" in result and cards == []
-
-
-def test_run_tool_usage_conversation_detail_bad_id_does_not_call_store(monkeypatch):
-    """`conversation_id` の型検証自体は `store.usage_conversation_detail` の責務——本テストは
-    `run_tool` が引数をそのまま転送するだけで、勝手に別のエラーへ丸めないことを確認する。"""
-    monkeypatch.setattr(store, "usage_conversation_detail",
-                        lambda cid: {"error": "conversation_id は整数で指定してください"})
-    result, _, _, _ = A.run_tool("usage_conversation_detail", {"conversation_id": "not-an-int"}, "v1", None)
-    assert result == {"error": "conversation_id は整数で指定してください"}
-
-
 # ===== STAT-4 U4 RV是正 #13: usage 系ツール結果もバイト予算内にクリップされる =====
 # `tool_result_max_bytes` は他ツール（read_around 等）と同じ `run_tool` の引数で、usage 分岐にも
 # `_fit_usage_result` 経由で効く（`usage_chat._compact_stats_context` と同じ段階縮小の流儀）。
@@ -865,23 +485,6 @@ def _big_usage_by_user_rows(n: int) -> dict:
                     "cached_input": 0, "output": i * 50, "reasoning_output": 0,
                     "elapsed_ms_total": None, "elapsed_ms_avg": None, "elapsed_n": 0}
                    for i in range(n)]}
-
-
-def test_run_tool_usage_by_user_shrinks_to_budget_and_marks_truncated(monkeypatch):
-    """予算（1024バイト）を超える大きな `rows` は間引かれ、`_result_byte_size <= 1024` かつ
-    `truncated: true` が付く。"""
-    monkeypatch.setattr(store, "usage_by_user", lambda *a, **kw: _big_usage_by_user_rows(500))
-    result, _, _, _ = A.run_tool("usage_by_user", {}, "v1", None, tool_result_max_bytes=1024)
-    assert A._result_byte_size(result) <= 1024
-    assert result.get("truncated") is True
-
-
-def test_run_tool_usage_by_user_not_truncated_when_budget_is_sufficient(monkeypatch):
-    """予算が十分なとき（既定の大きな予算）は間引かれず、`truncated` キーも付かない。"""
-    monkeypatch.setattr(store, "usage_by_user", lambda *a, **kw: _big_usage_by_user_rows(50))
-    result, _, _, _ = A.run_tool("usage_by_user", {}, "v1", None)
-    assert result["rows"] and len(result["rows"]) == 50
-    assert "truncated" not in result
 
 
 def _big_usage_overview() -> dict:
@@ -908,86 +511,10 @@ def _big_usage_overview() -> dict:
     }
 
 
-def test_run_tool_usage_overview_shrinks_to_budget_and_marks_truncated(monkeypatch):
-    """`usage_overview` も同じ予算・同じ間引きの流儀を通る（内訳リストが多いほど厳しい段まで
-    間引かれるが、最終的には `_usage_counts_only` に落ちてでも予算内へ収まる）。"""
-    monkeypatch.setattr(store, "usage_overview", lambda *a, **kw: _big_usage_overview())
-    result, _, _, _ = A.run_tool("usage_overview", {}, "v1", None, tool_result_max_bytes=1024)
-    assert A._result_byte_size(result) <= 1024
-    assert result.get("truncated") is True
-
-
-def test_run_tool_usage_overview_not_truncated_when_budget_is_sufficient(monkeypatch):
-    monkeypatch.setattr(store, "usage_overview", lambda *a, **kw: _big_usage_overview())
-    result, _, _, _ = A.run_tool("usage_overview", {}, "v1", None)
-    assert len(result["users"]) == 200
-    assert "truncated" not in result
-
-
-def test_fit_usage_result_never_returns_empty_final_at_extreme_budget():
-    """最小段でも収まらない極端な予算でも `_usage_counts_only` の要約（件数のみ）へ落ち、
-    空の dict にはならない（`period` 等のスカラーは残る）。"""
-    result = A._fit_usage_result(_big_usage_overview(), 32)
-    assert result != {} and result.get("truncated") is True
-    assert result["period"] == {"start": "2026-01-01", "end": "2026-02-01", "days": 30}
-    assert result["users"] == {"count": 200}
-
-
-def test_run_tool_usage_conversation_detail_error_result_is_not_shrunk(monkeypatch):
-    """`store.usage_conversation_detail` の error 辞書は `_fit_usage_result` を素通りする
-    （間引き対象の内訳リストが無い＝バイト予算判定自体が不要）。"""
-    monkeypatch.setattr(store, "usage_conversation_detail",
-                        lambda cid: {"error": "指定した会話が見つかりません"})
-    result, _, _, _ = A.run_tool(
-        "usage_conversation_detail", {"conversation_id": 1}, "v1", None, tool_result_max_bytes=1)
-    assert result == {"error": "指定した会話が見つかりません"}
-
-
 # ===== STAT-4 C3是正: 返却上限（50件）はバイト予算より先に適用する =====
 # `usage_daily` の `series` と `usage_conversation_detail` の `response_time_series` は
 # `store.py` 側に上限が無く、件数がバイト予算内に収まっていれば（RV 指摘: 60日分の
 # usage_daily 等）バイト超過時だけ効く段階縮小（上のテスト群）を素通りしていた。
-
-def test_run_tool_usage_daily_series_capped_to_50_even_when_under_byte_budget(monkeypatch):
-    """60日分の `series`（バイト予算には十分収まる小ささ）でも、返却上限50件で直近側（末尾）へ
-    間引かれ `truncated: true`・`omitted_count` が付く（バイト超過に依存しない）。"""
-    series = [{"date": f"day-{i:02d}", "value": i} for i in range(60)]
-    monkeypatch.setattr(store, "usage_daily",
-                        lambda *a, **kw: {"period": {"days": 60}, "metric": "turns", "series": series})
-    result, _, _, _ = A.run_tool("usage_daily", {"days": 60}, "v1", None)
-    assert len(result["series"]) == 50
-    assert [s["value"] for s in result["series"]] == list(range(10, 60)), (
-        "時系列の直近側（末尾50件）が残っていない"
-    )
-    assert result.get("truncated") is True
-    assert result.get("omitted_count") == 10
-
-
-def test_run_tool_usage_daily_series_not_truncated_when_50_or_fewer(monkeypatch):
-    """50件ちょうど（境界）は間引かれず `truncated` キーも付かない。"""
-    series = [{"date": f"day-{i:02d}", "value": i} for i in range(50)]
-    monkeypatch.setattr(store, "usage_daily",
-                        lambda *a, **kw: {"period": {"days": 50}, "metric": "turns", "series": series})
-    result, _, _, _ = A.run_tool("usage_daily", {"days": 50}, "v1", None)
-    assert len(result["series"]) == 50
-    assert "truncated" not in result and "omitted_count" not in result
-
-
-def test_run_tool_usage_conversation_detail_response_time_series_capped_to_50(monkeypatch):
-    """会話のターン数が多い（`response_time_series` が50件超）場合も、バイト予算とは無関係に
-    直近50ターンへ間引かれ `truncated: true` が付く。"""
-    series = [{"turn": i, "duration_ms": 100, "provider": "openai"} for i in range(1, 81)]
-    monkeypatch.setattr(
-        store, "usage_conversation_detail",
-        lambda cid: {"conversation_id": cid, "user_turns": 80, "kinds": [], "response_time_series": series})
-    result, _, _, _ = A.run_tool("usage_conversation_detail", {"conversation_id": 1}, "v1", None)
-    assert len(result["response_time_series"]) == 50
-    assert [t["turn"] for t in result["response_time_series"]] == list(range(31, 81)), (
-        "直近50ターンが残っていない"
-    )
-    assert result.get("truncated") is True
-    assert result.get("omitted_count") == 30
-
 
 def test_run_tool_read_around_default_window_scales_with_window_cap(monkeypatch, tmp_path):
     """LLM が `window` 引数を省略したときの既定値にも `window_cap`（調べる深さが計算した実効値）を
@@ -1005,75 +532,6 @@ def test_run_tool_read_around_default_window_scales_with_window_cap(monkeypatch,
         assert "error" not in res, res
         first = res["text"].splitlines()[0]
         assert first == f"{expected_first_line}: line {expected_first_line}", (window_cap, first)
-
-
-def test_openai_style_forwards_max_hits_and_window_cap_to_run_tool(monkeypatch):
-    """`openai_style(max_hits=, window_cap=)` は `layer` と同じく `run_tool` へそのまま転送する
-    （SC-6c §3.2・調べる深さが計算した実効値）。"""
-    captured = {}
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        captured["max_hits"] = kw.get("max_hits")
-        captured["window_cap"] = kw.get("window_cap")
-        return ({"hits": []}, set(), [], [])
-
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-               {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]},
-           {"choices": [{"message": {"content": "回答"}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = (lambda url, headers, body, timeout=90: seq.pop(0)), fake_run_tool
-    try:
-        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                            max_hits=99, window_cap=123))
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-    assert captured == {"max_hits": 99, "window_cap": 123}
-
-
-def test_anthropic_style_forwards_layer_to_run_tool():
-    """`anthropic_style(layer=...)` も `run_tool` へそのまま転送する。"""
-    captured = {}
-    orig_run_tool = A.run_tool
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        captured["layer"] = kw.get("layer")
-        return ({"hits": []}, set(), [], [])
-
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "回答")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    A.run_tool = fake_run_tool
-    try:
-        list(A.anthropic_style(client, "anthropic.claude-opus-4-8", A.SYSTEM, "質問", "v1", None,
-                               layer="docs"))
-    finally:
-        A.run_tool = orig_run_tool
-    assert captured.get("layer") == "docs"
-
-
-def test_gemini_forwards_layer_to_run_tool():
-    """`gemini(layer=...)` も `run_tool` へそのまま転送する。"""
-    captured = {}
-    orig_post, orig_run_tool = A._post, A.run_tool
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        captured["layer"] = kw.get("layer")
-        return ({"hits": []}, set(), [], [])
-
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "回答"}]}}]},
-    ]
-    A._post, A.run_tool = (lambda url, headers, body, timeout=90: seq.pop(0)), fake_run_tool
-    try:
-        list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None, layer="both"))
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-    assert captured.get("layer") == "both"
 
 
 def test_run_tool_forwards_deadline_to_grep_search_only_for_ripgrep(monkeypatch):
@@ -1179,55 +637,6 @@ def test_openai_style_text_empty_when_both_absent():
 
 def test_openai_style_text_strips_whitespace():
     assert A._openai_style_text({"content": "  本文  "}) == "本文"
-
-
-def test_openai_style_refusal_response_uses_refusal_text_as_final_answer():
-    """RV11 是正の固定: OpenAI の refusal（拒否）応答（`content=None`・`refusal="..."`・
-    `finish_reason="stop"`）を「空の自然完了」（実質的な合成失敗）に誤分類せず、拒否理由の文章を
-    そのまま最終回答として扱う——`synthesis_failed` は立たず、`final["final"]` が空文字列に
-    ならないことを固定する（chat/research 共通の `openai_style` 本体で修正しているため、両経路に
-    同時に効く）。"""
-    seq = [
-        {"choices": [{"message": {"content": None, "refusal": "この内容にはお答えできません。"},
-                     "finish_reason": "stop"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["final"] == "この内容にはお答えできません。"
-        assert final.get("synthesis_failed", False) is False
-        assert final["attribution_eligible"] is True
-    finally:
-        A._post = orig
-
-
-def test_openai_style_surfaces_vector_feature_mismatch_node_end_to_end(monkeypatch):
-    """`es_index.search()` が BM25 hits＋`vector_feature_mismatch` を返す → 実 `run_tool()` が
-    tool result に載せる → `openai_style()` のイベント列に精度低下ノードが現れる（受入条件(5)・
-    理由固有の搬送漏れを検出する）。内部語彙（索引/ベクトル等）は文言に出さない。"""
-    from sherpa import documents
-
-    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
-    monkeypatch.setattr(A.es_index, "search",
-                        lambda world, q, scope_paths=None, k=20, layer=None, **kw:
-                            ([{"doc_id": "a.md", "line": 1, "text": "x", "ext": ".md"}],
-                             "vector_feature_mismatch"))
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-               {"id": "c1", "function": {"name": "es_search", "arguments": '{"query":"x"}'}}]}}]},
-           {"choices": [{"message": {"content": "回答"}}]}]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
-    finally:
-        A._post = orig
-    expected = A._ES_DEGRADE_WORDING["vector_feature_mismatch"]
-    nodes = [ev["node"] for ev in events if isinstance(ev.get("node"), dict)
-             and ev["node"].get("label") == expected[0] and ev["node"].get("detail") == expected[1]]
-    assert len(nodes) == 1
-    assert "索引" not in expected[1] and "ベクトル" not in expected[1]
 
 
 def test_list_docs_path_prefix_and_doctype():
@@ -1512,6 +921,7 @@ def test_graph_neighbors_tool_returns_cards(monkeypatch):
     test_ext2_evidence.py の専用テスト。機械検証は常時実施＝TOGGLE-RM で明示 OFF の退避口を撤去済み）。
     """
     monkeypatch.setattr(A, "verify_doc_exists", lambda doc_id, world, scope_paths=None: True)
+    monkeypatch.setattr(RT, "verify_doc_exists", lambda doc_id, world, scope_paths=None: True)
     from sherpa import lens_service
     fake = [{"name": "BILLINGJOB", "label": "Module", "category": "プログラム", "role": "実装",
              "distance": 2, "path": ["請求画面", "請求処理", "BILLINGJOB"],
@@ -1536,6 +946,7 @@ def test_graph_neighbors_tool_view_includes_directed_edges(monkeypatch):
     返す `{type, from, to, doc}`）を素通しする。`doc` が無い辺は `doc` キー自体を省く（`_card_edges_view`
     は既知キーだけ・値がある物だけ写す）。edges が無い/空のカードでも `edges: []` で落ちない。"""
     monkeypatch.setattr(A, "verify_doc_exists", lambda doc_id, world, scope_paths=None: True)
+    monkeypatch.setattr(RT, "verify_doc_exists", lambda doc_id, world, scope_paths=None: True)
     from sherpa import lens_service
     fake = [
         {"name": "BILLINGJOB", "label": "Module", "category": "プログラム", "role": "実装",
@@ -1586,36 +997,6 @@ def test_run_tool_graph_neighbors_filters_invalid_cards_but_keeps_valid_ones(mon
         assert {n["name"] for n in res["neighbors"]} == {"valid", "no-claim"}   # ツール結果からも除外
     finally:
         lens_service.neighbor_cards = orig
-
-
-@pytest.mark.parametrize("cid,expected", [
-    (None, None),                       # cid キーが明示的に None（値としての None）
-    ("", None),                         # 空文字列は非一意な label:name フォールバックの引き金にしない
-    (0, None),                          # 数値（int）は cid の型契約外
-    (123, None),                        # 数値（int・truthy でも）は cid の型契約外
-    (12.5, None),                       # 数値（float）も同様
-    (True, None),                       # bool（int のサブクラス）も同様
-    ("module:v1:a/b#TAXCALC", "module:v1:a/b#TAXCALC"),   # 非空文字列はそのまま返す
-])
-def test_card_graph_node_id_only_accepts_non_empty_string_cid(cid, expected):
-    """`_card_graph_node_id` は `cid` が非空文字列のときだけそれを返し、それ以外（None／空文字列／
-    数値／bool）はすべて None にする——後続の `_card_graph_node_evidence` が「cid 無し」と同じ扱いで
-    昇格させない判断に使う契約。"""
-    card = {"name": "TAXCALC", "label": "Module", "cid": cid}
-    assert A._card_graph_node_id(card) == expected
-
-
-def test_card_graph_node_id_missing_key_is_none():
-    """`cid` キー自体が無い card（フィクスチャ未対応等）も None——`.get()` の既定 None と同じ扱い。"""
-    assert A._card_graph_node_id({"name": "TAXCALC", "label": "Module"}) is None
-
-
-def test_card_structural_evidence_does_not_promote_claimless_card_without_cid():
-    """機械検証は常時実施（TOGGLE-RM・2026-09-03 で明示 OFF の退避口・`label:name` への
-    フォールバックを撤去済み）: cid 欠落の claimless card は昇格しない。"""
-    card = {"name": "TAXCALC", "label": "Module", "role": "", "category": "", "path": [],
-           "evidence": {"edges": [], "grep": []}}   # cid 無し・裏付け doc も無し（claimless）
-    assert A._card_structural_evidence([card]) == []   # cid 無しは昇格しない
 
 
 def test_read_around_confinement_and_redaction():
@@ -1732,92 +1113,6 @@ def test_registered_extension_regression_still_reachable(monkeypatch, tmp_path):
 
 # ===== verify_citation: 実在するが本文が読めない doc は exists=True（変更C）=====
 
-def test_verify_citation_true_for_reachable_unregistered_ext(monkeypatch, tmp_path):
-    """`.zzz`（未登録拡張子・変更Bで到達可能）の引用は `_safe_doc_path` 経由で通常どおり検証できる
-    （`exists=True`・`method` は span 有無に応じた通常の値）。"""
-    world = "verify-citation-zzz"
-    _isolate_world_kb(monkeypatch, tmp_path, world, {"app.zzz": "line one\nline two\n"})
-    v = A.verify_citation({"doc_id": "app.zzz", "span": [1, 1], "quote": "line one"}, world)
-    assert v == {"exists": True, "method": "span_verified"}
-
-
-def test_verify_citation_exists_true_but_unreadable_for_real_binary(monkeypatch, tmp_path):
-    """`_safe_doc_path` が拒否しても（本文がバイナリで読めない）、`verify_doc_exists`（実在＋
-    doctype 分類の確定判定）が実在を認めれば `exists=True`（`method="exists_unreadable"`・span 照合は
-    スキップ）を返す——「本文を読めるか」と「文書として実在するか」は別の問い。"""
-    world = "verify-citation-binary"
-    # `.docx` は `_OFFICE_MD` 経由で常に派生MD側へ解決される——ここでは Office 変換が未完了
-    # （派生MDが存在しない）状態を、`verify_doc_exists` 経由でも実在確認できる最小の再現に使う。
-    _isolate_world_kb(monkeypatch, tmp_path, world, {"report.docx": b"PK\x03\x04fakezip"})
-    resolved = A._safe_doc_path(world, "report.docx")
-    assert resolved is None                             # 派生MD未生成＝read_around からは読めない
-    v = A.verify_citation({"doc_id": "report.docx", "span": [1, 1], "quote": "x"}, world)
-    assert v == {"exists": True, "method": "exists_unreadable"}
-
-
-def test_verify_citation_false_for_sensitive_doc_id(monkeypatch, tmp_path):
-    """秘匿ファイルは実在しても `exists=False` のまま（存在を漏らさない・変更C）。"""
-    world = "verify-citation-sensitive"
-    _isolate_world_kb(monkeypatch, tmp_path, world, {".env": "API_KEY=xyz\n"})
-    v = A.verify_citation({"doc_id": ".env", "span": [1, 1], "quote": "x"}, world)
-    assert v == {"exists": False, "method": "doc_missing"}
-
-
-
-@pytest.mark.parametrize("encoding", ["cp932", "utf-8-sig"])
-@pytest.mark.parametrize("newline", ["\r\n", "\f"])
-def test_cp932_source_searchable_readable_and_verifiable(monkeypatch, tmp_path, encoding, newline):
-    """CP932（Shift_JIS）の原本が ripgrep_search で当たり、その行番号で read_around/read_doc が
-    同じ行を正しい日本語で返し、verify_citation が `span_verified` になり、file_head も化けない
-    （架空の締め処理コメント・半角カナ・CRLF・波ダッシュを含む COBOL ソース）。"""
-    world = "cp932-source-t1"
-    lines = [
-        "       IDENTIFICATION DIVISION.",
-        "      * 架空の締め処理①の初期化",
-        "       ｱｲｳｴｵ 半角カナだけの行",
-        "       MOVE '～' TO WK-MARK.",
-    ]
-    text = newline.join(lines) + newline
-    raw = text.encode(encoding)
-    _isolate_world_kb(monkeypatch, tmp_path, world, {"BATCH01.cbl": raw})
-
-    # (1) ripgrep_search が日本語の語で当たる。
-    res, docs, cites, _ = A.run_tool("ripgrep_search", {"query": "締め処理"}, world, None)
-    assert res["hits"], res
-    hit = res["hits"][0]
-    assert hit["doc_id"] == "BATCH01.cbl"
-    assert "�" not in hit["text"]
-    hit_line = hit["line"]
-    assert lines[hit_line - 1] in hit["text"]
-
-    # (2) 同じ行番号で read_around/read_doc が正しい日本語を返す。
-    r_around, d_around, _, _ = A.run_tool(
-        "read_around", {"doc_id": "BATCH01.cbl", "line": hit_line}, world, None)
-    assert "error" not in r_around, r_around
-    assert "締め処理" in r_around["text"]
-    assert "�" not in r_around["text"]
-    assert "BATCH01.cbl" in d_around
-
-    r_doc, d_doc, _, _ = A.run_tool(
-        "read_doc", {"doc_id": "BATCH01.cbl", "start_line": 1}, world, None)
-    assert "error" not in r_doc, r_doc
-    assert "�" not in r_doc["text"]
-    for ln in lines:
-        assert ln in r_doc["text"]
-    assert "BATCH01.cbl" in d_doc
-
-    # (3) verify_citation が span_verified になる（span=その行・quote=その行）。
-    v = A.verify_citation(
-        {"doc_id": "BATCH01.cbl", "span": [hit_line, hit_line], "quote": lines[hit_line - 1]}, world)
-    assert v == {"exists": True, "method": "span_verified"}
-
-    # (4) file_head も化けない。
-    r_head, d_head, _, _ = A.run_tool("file_head", {"doc_id": "BATCH01.cbl"}, world, None)
-    assert "error" not in r_head, r_head
-    assert "締め処理" in r_head["text"]
-    assert "�" not in r_head["text"]
-    assert "BATCH01.cbl" in d_head
-
 
 def test_read_around_clips_output_for_huge_single_line_doc(monkeypatch, tmp_path):
     """secRV MED-B (a)(b): 単一行が巨大（200万文字）な文書でも、read_around の返却テキストは
@@ -1857,69 +1152,13 @@ def test_clip_utf8_bytes_does_not_break_multibyte_boundary():
 
 # ===== secRV MED-B (c)（2026-07-18）: 1 run 累計 tool-result バイト上限 =====
 
-def test_openai_style_cumulative_tool_result_bytes_cap_terminates_run(monkeypatch):
-    """1 run 累計の tool-result バイト量が上限を超えたら、固定エラーで run を打ち切る
-    （以降のターンへは進まない）。"""
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 10)   # 小さい上限で即座に発火させる
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "final answer (should not be reached)"}}]},
-    ]
-    post_calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        post_calls.append(1)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None))
-        assert len(post_calls) == 1   # 1回目のツール結果だけで上限超過＝2ターン目へは進まない
-        assert any(ev.get("node", {}).get("label") == "ツール結果の合計サイズ上限" for ev in events)
-        final = next(ev for ev in events if "final" in ev)
-        assert final["final"] == ""
-    finally:
-        A._post = orig
-
-
-def test_gemini_cumulative_tool_result_bytes_cap_terminates_run(monkeypatch):
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 10)
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "TAX-RATE"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "not reached"}]}}]},
-    ]
-    post_calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        post_calls.append(1)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "消費税率は?", "v1", None))
-        assert len(post_calls) == 1
-        final = next(ev for ev in events if "final" in ev)
-        assert final["final"] == ""
-    finally:
-        A._post = orig
-
-
 # ===== BUDGET-1（2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4・管理者設定への昇格） =====
-# コード既定は精度優先値（262144/4194304）。env フォールバックは撤去済み（ENV-CLEAN・2026-09-03）
+# コード既定は精度優先値（262144）。env フォールバックは撤去済み（ENV-CLEAN・2026-09-03）
 # ——このモジュール定数は固定値なので、値そのものを1回ピン留めするだけでよい（settings 段は
-# `effective_tool_result_max_bytes`/`effective_tool_result_max_total_bytes`/
-# `resolve_tool_result_budgets`（`store.get_system_settings` 経由）で固定する）。
+# `effective_tool_result_max_bytes`（`store.get_system_settings` 経由）で固定する）。
 
 def test_tool_result_max_bytes_code_default():
     assert A.TOOL_RESULT_MAX_BYTES == 262144
-
-
-def test_tool_result_max_total_bytes_code_default():
-    assert A.TOOL_RESULT_MAX_TOTAL_BYTES == 4194304
 
 
 # ---- settings > コード既定（2段）------------------------------------------------------------
@@ -1934,11 +1173,13 @@ def test_effective_tool_result_max_bytes_falls_back_to_module_constant_when_sett
     monkeypatch して確認する（`MAX_TOOLS_PER_TURN` 等、既存の run-level テストと同じ流儀）。"""
     monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 99000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 99000)
     assert A.effective_tool_result_max_bytes() == 99000
 
 
 def test_effective_tool_result_max_bytes_settings_overrides_env(monkeypatch):
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 99000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 99000)
     monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"agentic_budget_per_result": 5000})
     assert A.effective_tool_result_max_bytes() == 5000
 
@@ -1948,6 +1189,7 @@ def test_effective_tool_result_max_bytes_settings_out_of_range_falls_back(monkey
     （fail-safe・PUT 側の Field(ge,le) を通常はすり抜けないが、DB 直接編集等の破損値でも
     落ちないことを固定する）。"""
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 99000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 99000)
     for bad in (0, -1, 8 * 1024 * 1024 + 1, "not-an-int"):
         monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"agentic_budget_per_result": bad})
         assert A.effective_tool_result_max_bytes() == 99000, bad
@@ -1957,224 +1199,33 @@ def test_effective_tool_result_max_bytes_settings_read_failure_falls_back(monkey
     def _boom(**kw):
         raise RuntimeError("db down")
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 99000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 99000)
     monkeypatch.setattr(store, "get_system_settings", _boom)
     assert A.effective_tool_result_max_bytes() == 99000
 
 
-def test_effective_tool_result_max_total_bytes_code_default_when_settings_unset(monkeypatch):
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
-    assert A.effective_tool_result_max_total_bytes() == A.TOOL_RESULT_MAX_TOTAL_BYTES
-
-
-def test_effective_tool_result_max_total_bytes_settings_overrides_env(monkeypatch):
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 1_000_000)
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"agentic_budget_total": 20000})
-    assert A.effective_tool_result_max_total_bytes() == 20000
-
-
-def test_effective_tool_result_max_total_bytes_settings_out_of_range_falls_back(monkeypatch):
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 1_000_000)
-    for bad in (0, -1, 64 * 1024 * 1024 + 1, "not-an-int"):
-        monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"agentic_budget_total": bad})
-        assert A.effective_tool_result_max_total_bytes() == 1_000_000, bad
-
-
-def test_resolve_tool_result_budgets_returns_both_tiers_from_one_settings_read(monkeypatch):
-    """`resolve_tool_result_budgets()` は1回の `system_settings` 取得結果を両方の解決に使い回す
-    （`store.get_system_settings` の呼び出し回数を数えて固定する）。"""
-    calls = []
-
-    def _fake(**kw):
-        calls.append(1)
-        return {"agentic_budget_per_result": 5000, "agentic_budget_total": 20000}
-    monkeypatch.setattr(store, "get_system_settings", _fake)
-    per_result, total = A.resolve_tool_result_budgets()
-    assert (per_result, total) == (5000, 20000)
-    assert len(calls) == 1
-
-
 # ---- run 開始時に1回だけ解決するスナップショット契約 -----------------------------------------
-
-def test_openai_style_forwards_resolved_tool_result_budget_to_run_tool(monkeypatch):
-    """`openai_style` は run 開始時に解決した1件あたり予算を `run_tool` へそのまま転送する
-    （`max_hits`/`window_cap` と同じ転送契約）。"""
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {"agentic_budget_per_result": 12345})
-    captured = {}
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        captured["tool_result_max_bytes"] = kw.get("tool_result_max_bytes")
-        return ({"hits": []}, set(), [], [])
-
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-               {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]},
-           {"choices": [{"message": {"content": "回答"}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = (lambda url, headers, body, timeout=90: seq.pop(0)), fake_run_tool
-    try:
-        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-    assert captured.get("tool_result_max_bytes") == 12345
-
-
-def test_openai_style_budget_snapshotted_once_settings_change_mid_run_has_no_effect(monkeypatch):
-    """run 途中で admin が設定を変えても、run 開始時に1回だけ解決した予算がその run の間ずっと
-    使われる（`resolve_tool_result_budgets` を run の先頭で1回だけ呼ぶ契約・累計判定の整合性）。
-
-    1ターン目は小さい予算（下限 4096 byte・`agentic_budget_total` の有効最小値）を返す settings、
-    2ターン目以降は巨大な予算（10MB）を返す settings に「admin が変更した」体で差し替える——
-    snapshot が効いていれば1ターン目のツール結果（`run_tool` を固定サイズ約5000 byte の
-    ダミー結果へ差し替え、実フィクスチャの内容量に依存させない）だけで累計上限（4096 byte）を
-    超えて打ち切られ、2ターン目のリクエストへは進まない。
-    """
-    responses = [{"agentic_budget_total": 4096}, {"agentic_budget_total": 10_000_000}]
-
-    def _fake(**kw):
-        # 1回目の呼び出し（run 開始時の snapshot）は小さい予算・以降（もし再度呼ばれたら）は
-        # 巨大な予算——snapshot 契約が壊れていれば2ターン目の判定がこの巨大な予算を見てしまう。
-        return responses[0] if len(responses) == 1 else responses.pop(0)
-    monkeypatch.setattr(store, "get_system_settings", _fake)
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": [{"doc_id": "x.md", "line": 1, "text": "x" * 5000}]}, set(), [], [])
-
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "final answer (should not be reached)"}}]},
-    ]
-    post_calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        post_calls.append(1)
-        return seq.pop(0)
-
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = fake_post, fake_run_tool
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None))
-        assert len(post_calls) == 1   # snapshot が効いていれば1ターン目で打ち切り＝2ターン目へ進まない
-        assert any(ev.get("node", {}).get("label") == "ツール結果の合計サイズ上限" for ev in events)
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
 
 # ===== 窓連動の撤去（旧 BUDGET-2・2026-09-02-RAG表現の全形式展開と文脈保持.md §3.4 で導入・
 # `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md` で撤去）=====
-# `resolve_tool_result_budgets`/`effective_tool_result_max_bytes`/`effective_tool_result_max_total_bytes`
-# は `provider`/`model`/`ollama_base_url`/`anthropic_client` を受け取っても値の解決には使わない
+# `effective_tool_result_max_bytes` は `provider`/`model`/`ollama_base_url` を受け取っても値の解決には使わない
 # （利用者裁定「AI が持つ文脈窓を Sherpa が制限しない」）——渡す・渡さないで結果が変わらないことを
-# 固定する。呼び出し元（openai_style/anthropic_style/gemini）が引き続きこれらを渡す配線自体
+# 固定する。呼び出し元（openai_style）が引き続きこれらを渡す配線自体
 # （互換のためだけの引数）は下のセクションで固定する。
 
-def test_resolve_tool_result_budgets_ignores_provider_and_model():
+def test_effective_tool_result_max_bytes_ignores_provider_and_model():
     """`provider`/`model` を渡しても渡さなくても結果は同じ（コード既定/管理画面の基準値のみで
     決まる）——旧実装はシード表に載っている openai/gpt-4o-mini で窓由来の上限まで縮んでいた。"""
     assert A.effective_tool_result_max_bytes({}) == A.TOOL_RESULT_MAX_BYTES
-    assert A.effective_tool_result_max_total_bytes({}) == A.TOOL_RESULT_MAX_TOTAL_BYTES
-    assert A.resolve_tool_result_budgets({}) == (A.TOOL_RESULT_MAX_BYTES, A.TOOL_RESULT_MAX_TOTAL_BYTES)
-    assert A.resolve_tool_result_budgets(
-        {}, provider="openai", model="gpt-4o-mini") == (A.TOOL_RESULT_MAX_BYTES, A.TOOL_RESULT_MAX_TOTAL_BYTES)
+    assert A.effective_tool_result_max_bytes(
+        {}, provider="openai", model="gpt-4o-mini") == A.TOOL_RESULT_MAX_BYTES
 
 
-def test_resolve_tool_result_budgets_large_admin_setting_not_clipped_by_any_model():
-    """管理画面の基準値を大きく設定していれば、モデルが小窓（シード表の gpt-4o-mini・
-    128,000 tokens）であっても、そのまま使われる（旧実装の min() 方式は撤去済み）。"""
-    sysset = {"agentic_budget_per_result": 5_000_000, "agentic_budget_total": 8_000_000}
-    per_result, total = A.resolve_tool_result_budgets(sysset, provider="openai", model="gpt-4o-mini")
-    assert (per_result, total) == (5_000_000, 8_000_000)
-
-
-def test_openai_style_derives_ollama_provider_and_base_url_for_budget_resolution(monkeypatch):
-    """`openai_style(ollama=True, ...)` は `resolve_tool_result_budgets` へ
-    `provider="ollama"`・`model`・chat URL から逆算した `ollama_base_url` を渡す。"""
-    captured = {}
-    orig = A.resolve_tool_result_budgets
-
-    def spy(system_settings=None, **kw):
-        captured.update(kw)
-        return orig(system_settings, **kw)
-    monkeypatch.setattr(A, "resolve_tool_result_budgets", spy)
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
-
-    seq = [{"message": {"content": "回答"}}]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        list(A.openai_style("http://localhost:11434/api/chat", {}, "qwen2.5", A.SYSTEM, "質問", "v1",
-                            None, ollama=True, max_turns=1))
-    finally:
-        A._post = orig_post
-    assert captured.get("provider") == "ollama"
-    assert captured.get("model") == "qwen2.5"
-    assert captured.get("ollama_base_url") == "http://localhost:11434"
-
-
-def test_openai_style_derives_openai_provider_for_budget_resolution(monkeypatch):
-    """`openai_style(ollama=False, ...)`（既定）は `provider="openai"` を渡す・`ollama_base_url`
-    は None（Ollama 以外は窓のライブ照会対象外）。"""
-    captured = {}
-    orig = A.resolve_tool_result_budgets
-
-    def spy(system_settings=None, **kw):
-        captured.update(kw)
-        return orig(system_settings, **kw)
-    monkeypatch.setattr(A, "resolve_tool_result_budgets", spy)
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
-
-    seq = [{"choices": [{"message": {"content": "回答"}}]}]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None, max_turns=1))
-    finally:
-        A._post = orig_post
-    assert captured.get("provider") == "openai"
-    assert captured.get("model") == "gpt-5.5"
-    assert captured.get("ollama_base_url") is None
-
-
-def test_anthropic_style_derives_bedrock_provider_and_client_for_budget_resolution(monkeypatch):
-    """`anthropic_style(...)`（本アプリ唯一の呼び出し元は Bedrock）は `provider="bedrock"`・
-    `model`・`anthropic_client=client` を渡す。`_AClient`（テスト用スタブ）は `.models` を
-    持たない＝実 `AnthropicBedrock` と同じ形のため、窓のライブ照会は安全に no-op になる。"""
-    captured = {}
-    orig = A.resolve_tool_result_budgets
-
-    def spy(system_settings=None, **kw):
-        captured.update(kw)
-        return orig(system_settings, **kw)
-    monkeypatch.setattr(A, "resolve_tool_result_budgets", spy)
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
-
-    seq = [_AResp([_ABlock("text", "回答")], stop_reason="end_turn")]
-    client = _AClient(seq)
-    list(A.anthropic_style(client, "anthropic.claude-opus-4-8", A.SYSTEM, "質問", "v1", None))
-    assert captured.get("provider") == "bedrock"
-    assert captured.get("model") == "anthropic.claude-opus-4-8"
-    assert captured.get("anthropic_client") is client
-
-
-def test_gemini_derives_gemini_provider_for_budget_resolution(monkeypatch):
-    """`gemini(...)` は `provider="gemini"` を渡す。"""
-    captured = {}
-    orig = A.resolve_tool_result_budgets
-
-    def spy(system_settings=None, **kw):
-        captured.update(kw)
-        return orig(system_settings, **kw)
-    monkeypatch.setattr(A, "resolve_tool_result_budgets", spy)
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
-
-    seq = [{"candidates": [{"content": {"parts": [{"text": "回答"}]}}]}]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        list(A.gemini("key", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None))
-    finally:
-        A._post = orig_post
-    assert captured.get("provider") == "gemini"
-    assert captured.get("model") == "gemini-2.5-flash"
+def test_effective_tool_result_max_bytes_large_admin_setting_not_clipped_by_any_model():
+    """管理画面の基準値を大きく設定していれば、モデルが小窓であっても、そのまま使われる
+    （旧実装の min() 方式は撤去済み）。"""
+    sysset = {"agentic_budget_per_result": 5_000_000}
+    assert A.effective_tool_result_max_bytes(sysset, provider="openai", model="gpt-4o-mini") == 5_000_000
 
 
 def test_run_tool_explicit_tool_result_max_bytes_overrides_module_default(monkeypatch, tmp_path):
@@ -2183,6 +1234,7 @@ def test_run_tool_explicit_tool_result_max_bytes_overrides_module_default(monkey
     契約を固定する）。モジュール既定を大きく設定していても、明示指定の小さい値でクリップされる。"""
     world = "read-doc-explicit-budget-world"
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 10_000_000)   # 明示指定が勝つことを示すため大きく設定
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 10_000_000)
     _isolate_world_kb(monkeypatch, tmp_path, world, {"big.md": "x" * 5000})
     res, _, _, _ = A.run_tool("read_doc", {"doc_id": "big.md"}, world, None, tool_result_max_bytes=200)
     assert "error" not in res, res
@@ -2191,66 +1243,6 @@ def test_run_tool_explicit_tool_result_max_bytes_overrides_module_default(monkey
 
 
 # ===== secRV FIX-1（2026-07-19・拒否ツール結果のバイト迂回） =====
-
-def test_openai_style_rejected_tool_name_clipped_in_tool_message():
-    """(a): 許可外ツール拒否時の tool-result に埋める name（モデル生成・長さ無制限）は
-    固定長（`_REJECTED_TOOL_NAME_MAX_BYTES`）へクリップされる。"""
-    huge_name = "X" * 5000
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": huge_name, "arguments": "{}"}}]}}]},
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c2", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "LOCAL"}}]},
-    ]
-    captured = []
-    orig = A._post
-
-    def spy_post(url, headers, body, timeout=90):
-        captured.append(body)
-        return seq.pop(0)
-
-    A._post = spy_post
-    try:
-        list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                            allowed_tools=frozenset({"ripgrep_search"})))
-        # 2ターン目のリクエストに含まれる直前の tool message（拒否結果）を検査する。
-        msgs2 = captured[1]["messages"]
-        tool_msg = next(m for m in msgs2 if m.get("role") == "tool" and m.get("tool_call_id") == "c1")
-        assert len(tool_msg["name"].encode("utf-8")) <= A._REJECTED_TOOL_NAME_MAX_BYTES
-        assert huge_name not in tool_msg["name"]
-        assert huge_name not in tool_msg["content"]
-    finally:
-        A._post = orig
-
-
-def test_openai_style_rejected_tool_result_counted_in_cumulative_bytes(monkeypatch):
-    """(b): 拒否 tool-result も `total_tool_bytes` の累計へ計上され、1 run 累計バイト上限判定を
-    すり抜けない（以前はこの経路だけ計上されず、累計上限を無制限に迂回できた）。"""
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 10)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "some_disallowed_tool", "arguments": "{}"}}]}}]},
-        {"choices": [{"message": {"content": "final (should not be reached)"}}]},
-    ]
-    post_calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        post_calls.append(1)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                     allowed_tools=frozenset({"ripgrep_search"})))
-        assert len(post_calls) == 1   # 拒否ツール1件だけで累計上限超過＝2ターン目へは進まない
-        assert any(ev.get("node", {}).get("label") == "ツール結果の合計サイズ上限" for ev in events)
-        final = next(ev for ev in events if "final" in ev)
-        assert final["final"] == ""
-    finally:
-        A._post = orig
-
 
 # ===== secRV FIX-2（2026-07-19・cards サイドカーのバイト迂回） =====
 
@@ -2309,7 +1301,7 @@ def test_graph_neighbors_not_truncated_when_within_limit():
 
 
 def _graph_neighbors_count_script() -> str:
-    """`SHERPA_GREP_MAX_HITS`（`MAX_HITS`）を変えても `graph_neighbors` のカード件数上限
+    """`MAX_HITS` が何であっても `graph_neighbors` のカード件数上限
     （`_GRAPH_CARDS_MAX`）は 30 のまま動かないことを、実プロセスの `run_tool()` 越しに観測する。"""
     return (
         "import json, os\n"
@@ -2325,51 +1317,12 @@ def _graph_neighbors_count_script() -> str:
     )
 
 
-def test_graph_neighbors_count_unaffected_by_grep_max_hits_env_set_to_1():
+def test_graph_neighbors_count_is_fixed_and_grep_max_hits_env_is_ignored():
     out = json.loads(FI.run_script(_graph_neighbors_count_script(), env={"SHERPA_GREP_MAX_HITS": "1"}))
-    assert out["max_hits"] == 1                # grep/es 側は env どおり 1 に下がる
+    assert out["max_hits"] == 45               # grep/es 側のコード既定（env は読まない）
     assert out["graph_cards_max"] == 30        # graph_neighbors 側は無関係・従来の 30 のまま
     assert out["n_cards"] == 30
     assert out["n_view"] == 30
-
-
-def test_graph_neighbors_count_unaffected_by_grep_max_hits_env_set_to_100():
-    out = json.loads(FI.run_script(_graph_neighbors_count_script(), env={"SHERPA_GREP_MAX_HITS": "100"}))
-    assert out["max_hits"] == 100               # grep/es 側は env どおり 100 に上がる
-    assert out["graph_cards_max"] == 30         # graph_neighbors 側は無関係・従来の 30 のまま
-    assert out["n_cards"] == 30
-    assert out["n_view"] == 30
-
-
-def test_openai_style_cards_sidecar_bytes_counted_in_cumulative_cap(monkeypatch):
-    """FIX-2: cards サイドカーの直列化バイトも `total_tool_bytes` の累計へ計上される
-    （以前は計上されず、この経路だけ累計上限をすり抜けられた）。"""
-    from sherpa import lens_service
-    fake = [{"name": f"cand{i}", "role": "実装", "category": "プログラム", "distance": 1,
-            "path": [], "evidence": {}} for i in range(30)]
-    orig_cards = lens_service.neighbor_cards
-    lens_service.neighbor_cards = lambda world, term, sp=None: list(fake)
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 50)   # cards 30件分より確実に小さい
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"請求"}'}}]}}]},
-        {"choices": [{"message": {"content": "final (should not be reached)"}}]},
-    ]
-    post_calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        post_calls.append(1)
-        return seq.pop(0)
-
-    orig_post = A._post
-    A._post = fake_post
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "原因は?", "v1", None))
-        assert len(post_calls) == 1
-        assert any(ev.get("node", {}).get("label") == "ツール結果の合計サイズ上限" for ev in events)
-    finally:
-        A._post = orig_post
-        lens_service.neighbor_cards = orig_cards
 
 
 # ===== secRV FIX-3（2026-07-19・read_around の open symlink TOCTOU・軽量是正） =====
@@ -2397,6 +1350,7 @@ def test_read_around_rejects_symlink_at_open_time_toctou(monkeypatch, tmp_path):
     swapped.symlink_to(secret)
 
     monkeypatch.setattr(A, "_safe_doc_path", lambda w, doc_id, layer=None: (kb_world, "swapped_doc.md", swapped))
+    monkeypatch.setattr(RT, "_safe_doc_path", lambda w, doc_id, layer=None: (kb_world, "swapped_doc.md", swapped))
     res, docs, _, _ = A.run_tool("read_around", {"doc_id": "swapped_doc.md", "line": 1, "window": 5}, world, None)
     assert "error" in res
     assert "SECRET" not in str(res)
@@ -2426,6 +1380,7 @@ def test_read_around_rejects_ancestor_symlink_toctou(monkeypatch, tmp_path):
     swapped_target = kb_world / "sub" / "doc.md"   # 文字列としては world root 配下の通常パス
 
     monkeypatch.setattr(A, "_safe_doc_path", lambda w, doc_id, layer=None: (kb_world, "sub/doc.md", swapped_target))
+    monkeypatch.setattr(RT, "_safe_doc_path", lambda w, doc_id, layer=None: (kb_world, "sub/doc.md", swapped_target))
     res, docs, _, _ = A.run_tool("read_around", {"doc_id": "sub/doc.md", "line": 1, "window": 5}, world, None)
     assert "error" in res
     assert "SECRET" not in str(res)
@@ -2638,10 +1593,9 @@ def test_env_int_clamps_dynamic_default(monkeypatch):
     assert A._env_int("SHERPA_TEST_LIMIT", 1, 4096, hi) == 4096
 
 
-# ===== MAX_HITS / READ_WINDOW（コード内定数の env 化） =====
-# import 時に一度だけ確定する定数は、同一プロセス内の monkeypatch では「起動時の env」を
-# 再現できないため、実プロセスを新規に起こして検証する（`_fresh_import` 参照）。両定数を
-# 1回の fresh import でまとめて確認する（定数ごとに別プロセスへ分けない）。
+# ===== MAX_HITS / READ_WINDOW（コード既定・管理画面の基準値が未設定のときに使う） =====
+# 環境変数 `SHERPA_GREP_MAX_HITS`／`SHERPA_READ_WINDOW` は実行時に読まない（画面だけが正）。
+# import 時の値は実プロセスを新規に起こして観測する（`_fresh_import` 参照）。
 
 def _max_hits_read_window_env_script() -> str:
     return (
@@ -2651,39 +1605,12 @@ def _max_hits_read_window_env_script() -> str:
     )
 
 
-def test_max_hits_read_window_fresh_import_env_unset_is_default():
-    out = json.loads(FI.run_script(_max_hits_read_window_env_script(),
-                                   env={"SHERPA_GREP_MAX_HITS": None, "SHERPA_READ_WINDOW": None}))
-    assert out["max_hits"] == 30
-    assert out["read_window"] == 40
-
-
-def test_max_hits_read_window_fresh_import_env_valid_value():
-    out = json.loads(FI.run_script(_max_hits_read_window_env_script(),
-                                   env={"SHERPA_GREP_MAX_HITS": "100", "SHERPA_READ_WINDOW": "80"}))
-    assert out["max_hits"] == 100
-    assert out["read_window"] == 80
-
-
-def test_max_hits_read_window_fresh_import_env_invalid_falls_back_to_default():
-    for mh_bad, rw_bad in zip(("0", "1001", "abc"), ("5", "401", "abc")):
-        out = json.loads(FI.run_script(_max_hits_read_window_env_script(),
-                                       env={"SHERPA_GREP_MAX_HITS": mh_bad, "SHERPA_READ_WINDOW": rw_bad}))
-        assert out["max_hits"] == 30, mh_bad
-        assert out["read_window"] == 40, rw_bad
-
-
-def test_max_hits_env_change_after_import_has_no_effect(monkeypatch):
-    """import 済みの `MAX_HITS` は起動時に確定済み＝同一プロセス内で env を後から変えても効かない。"""
-    before = A.MAX_HITS
-    monkeypatch.setenv("SHERPA_GREP_MAX_HITS", "999")
-    assert A.MAX_HITS == before == 30
-
-
-def test_read_window_env_change_after_import_has_no_effect(monkeypatch):
-    before = A.READ_WINDOW
-    monkeypatch.setenv("SHERPA_READ_WINDOW", "300")
-    assert A.READ_WINDOW == before == 40
+def test_max_hits_read_window_are_code_defaults_and_ignore_env():
+    for env in ({"SHERPA_GREP_MAX_HITS": None, "SHERPA_READ_WINDOW": None},
+                {"SHERPA_GREP_MAX_HITS": "100", "SHERPA_READ_WINDOW": "80"}):
+        out = json.loads(FI.run_script(_max_hits_read_window_env_script(), env=env))
+        assert out["max_hits"] == 45
+        assert out["read_window"] == 60
 
 
 def _read_around_run_tool_script(doc_lines: int, center_line: int, window_arg: int | None = None) -> str:
@@ -2719,1576 +1646,35 @@ def _read_around_run_tool_script(doc_lines: int, center_line: int, window_arg: i
 
 
 def test_read_around_tool_description_matches_actual_default_window_behavior():
-    """`_PARAMS_READ` の window 説明文（モデルへの通知）は実際の `READ_WINDOW` を埋め込んでおり、
+    """`_PARAMS_READ` の window 説明文（モデルへの通知）は実際の `READ_WINDOW`（60）を埋め込んでおり、
     `window` 省略時の `run_tool("read_around", ...)` の実挙動（返却行数）とも一致する
-    （説明文とツールの実配線を `run_tool()` 越しに固定・同じ式を2箇所に書いて re-derive しない）。"""
+    （説明文とツールの実配線を `run_tool()` 越しに固定・同じ式を2箇所に書いて re-derive しない）。
+    環境変数 `SHERPA_READ_WINDOW` は影響しない。"""
     out = json.loads(FI.run_script(_read_around_run_tool_script(200, 100),
                                    env={"SHERPA_READ_WINDOW": "80"}))
-    assert out["read_window"] == 80
-    assert "80" in out["desc"]
-    assert out["n_lines"] == 2 * 80 + 1   # line=100・window=80 は境界に掛からない
+    assert out["read_window"] == 60
+    assert "60" in out["desc"]
+    assert out["n_lines"] == 2 * 60 + 1   # line=100・window=60 は境界に掛からない
 
 
-def test_read_around_tool_description_matches_default_when_env_unset():
-    out = json.loads(FI.run_script(_read_around_run_tool_script(200, 100),
-                                   env={"SHERPA_READ_WINDOW": None}))
-    assert out["read_window"] == 40
-    assert "40" in out["desc"]
-    assert out["n_lines"] == 2 * 40 + 1
-
-
-def test_read_around_window_ceiling_tracks_read_window_when_raised_above_200():
-    """read_around の LLM 入力窓ハード上限（200）は、明示 `window` 引数に対しても
-    `SHERPA_READ_WINDOW` を200超に上げたときだけ追随する（既定時は200のまま・後退しない）。
+def test_read_around_window_ceiling_is_200_for_explicit_window():
+    """read_around の LLM 入力窓ハード上限は 200（明示 `window` 引数が大きくても 200 で頭打ち）。
     `run_tool()` を実際に呼び、返却行数から上限を観測する（式を再計算しない）。"""
-    script = _read_around_run_tool_script(700, 350, window_arg=300)
-    out = json.loads(FI.run_script(script, env={"SHERPA_READ_WINDOW": "300"}))
-    assert out["read_window"] == 300
-    assert out["n_lines"] == 2 * 300 + 1   # 200 を後退させず、明示 window=300 がそのまま通る
-
-    out_default = json.loads(FI.run_script(script, env={"SHERPA_READ_WINDOW": None}))
-    assert out_default["read_window"] == 40
-    assert out_default["n_lines"] == 2 * 200 + 1   # 既定時は明示 window=300 でも 200 で頭打ち
+    out = json.loads(FI.run_script(_read_around_run_tool_script(700, 350, window_arg=300), env={}))
+    assert out["read_window"] == 60
+    assert out["n_lines"] == 2 * 200 + 1
 
 
 # ===== secRV FIX-H（2026-07-19・実行 allowlist の非対称）: メイン経路も offered_names で制限 =====
 
-def test_openai_style_main_path_rejects_tool_not_offered():
-    """メイン経路（`allowed_tools=None`・既定）でも、実際に提示していないツール名をモデルが
-    呼べば拒否され `run_tool` は実行されない（以前は提示外でも実行されうる非対称があった）。
-    提示済みツール（ripgrep_search）は従来どおり実行される＝正常系は不変。"""
-    restricted_toolset = [{"type": "function", "function": {
-        "name": "ripgrep_search", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"x"}'}}]}}]},
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c2", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "LOCAL"}}]},
-    ]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    called = []
-    orig_run_tool = A.run_tool
-
-    def spy_run_tool(name, *a, **kw):
-        called.append(name)
-        return orig_run_tool(name, *a, **kw)
-
-    A.run_tool = spy_run_tool
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                     toolset=restricted_toolset))
-        assert "graph_neighbors" not in called   # 提示外＝実行されない
-        assert "ripgrep_search" in called        # 提示内＝正常実行（正常系不変）
-        assert any(ev.get("node", {}).get("label") == "許可外のツール呼び出し" for ev in events)
-    finally:
-        A._post = orig_post
-        A.run_tool = orig_run_tool
-
-
-def test_gemini_main_path_rejects_tool_not_offered():
-    """gemini の実行 allowlist も `offered_names` で制限される（提示していない
-    graph_neighbors は拒否・提示済み ripgrep_search は実行）。"""
-    restricted_toolset = [{"functionDeclarations": [{"name": "ripgrep_search", "description": "d",
-                                                     "parameters": {"type": "object", "properties": {}}}]}]
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "graph_neighbors", "args": {"name": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "TAX-RATE"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "done"}]}}]},
-    ]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    called = []
-    orig_run_tool = A.run_tool
-
-    def spy_run_tool(name, *a, **kw):
-        called.append(name)
-        return orig_run_tool(name, *a, **kw)
-
-    A.run_tool = spy_run_tool
-    try:
-        events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
-                               toolset=restricted_toolset))
-        assert "graph_neighbors" not in called
-        assert "ripgrep_search" in called
-        assert any(ev.get("node", {}).get("label") == "許可外のツール呼び出し" for ev in events)
-    finally:
-        A._post = orig_post
-        A.run_tool = orig_run_tool
-
-
-def test_anthropic_style_main_path_rejects_tool_not_offered():
-    """anthropic_style の実行 allowlist も `offered_names` で制限される（提示していない
-    graph_neighbors は拒否・提示済み ripgrep_search は実行）。"""
-    restricted_toolset = [{"type": "function", "function": {
-        "name": "ripgrep_search", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
-    seq = [
-        _AResp([_ABlock("tool_use", name="graph_neighbors", input={"name": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu2")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "done")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    called = []
-    orig_run_tool = A.run_tool
-
-    def spy_run_tool(name, *a, **kw):
-        called.append(name)
-        return orig_run_tool(name, *a, **kw)
-
-    A.run_tool = spy_run_tool
-    try:
-        events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None,
-                                        toolset=restricted_toolset))
-        assert "graph_neighbors" not in called
-        assert "ripgrep_search" in called
-        assert any(ev.get("node", {}).get("label") == "許可外のツール呼び出し" for ev in events)
-    finally:
-        A.run_tool = orig_run_tool
-
-
-def test_openai_style_loop_stub():
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        nodes, final = [], None
-        for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None):
-            (nodes.append(ev["node"]) if "node" in ev else None)
-            if "final" in ev:
-                final = ev
-        assert final and "TAX-RATE" in final["final"] and final["docs"]
-        assert any("資料を検索" in n["label"] for n in nodes)
-    finally:
-        A._post = orig
-
-
 # ---- RV MEDIUM（2026-07-03再検証）: 途中停止（stop_event）は各ターン発行前に確認 ----
-
-def test_openai_style_stops_between_turns_when_stop_event_set_mid_flight():
-    """1ターン目の応答が返ってきた直後に停止要求が来たケース＝2ターン目のリクエストは発行しない
-    （「HTTP呼び出し自体の中断は不要＝次の境界で止まれば可」という設計どおり）。"""
-    import threading
-
-    stop_event = threading.Event()
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(1)
-        stop_event.set()   # 1ターン目のレスポンスが返った直後に停止ボタンが押された、を模す
-        return {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     stop_event=stop_event))
-        assert len(calls) == 1, "停止後も2ターン目のリクエストが発行されている"
-        assert not any("final" in ev for ev in events), "停止時に final を yield すべきでない"
-    finally:
-        A._post = orig
-
-
-def test_openai_style_returns_immediately_if_already_stopped():
-    """開始前から stop_event が立っていれば、1回も _post を呼ばない。"""
-    import threading
-
-    stop_event = threading.Event()
-    stop_event.set()
-    calls = []
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: calls.append(1)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     stop_event=stop_event))
-        assert events == []
-        assert calls == []
-    finally:
-        A._post = orig
-
-
-def test_openai_style_stop_event_set_during_final_synthesis_skips_attribution(monkeypatch):
-    """最終合成（turns_exhausted）の応答が返ってきた直後に停止要求が来た場合、帰属呼び出し
-    （`submit_attribution`）は発行しない——帰属**直前**の再確認で捕捉する（tail 冒頭のチェック
-    だけでは、その後の最終合成 `_post` の間に来た停止要求を捕まえられない）。"""
-    import threading
-    stop_event = threading.Event()
-    calls = []
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_REAL_DOC},
-               [{"doc_id": _REAL_DOC, "span": [1, 1], "quote": "x", "ext": ".md"}], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        if len(calls) == 1:   # 1ターン目: tool_calls を返し turns_exhausted（最終合成）へ向かわせる
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        stop_event.set()   # 2回目＝最終合成の応答が返った直後に停止要求が来た、を模す
-        return {"choices": [{"message": {"content": "最終回答"}}]}
-
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = fake_post, fake_run_tool
-    try:
-        final = None
-        for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                                 stop_event=stop_event, max_turns=1):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # tool turn + 最終合成の2回だけ（帰属の3回目は発行されない）
-        assert final["final"] == "最終回答"
-        assert final["stop_reason"] == "turns_exhausted"   # STOP-1: 到達可能経路の閉じた語彙を固定
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-@pytest.mark.parametrize("finish_reason,has_key,content", [
-    # `finish_reason=="length"`（打ち切り＝未完了）で終わった応答は、たとえ本文があっても
-    # 帰属呼び出しを発行しない（部分本文を確定回答として帰属しない）。
-    ("length", True, "途中で切れた回答"),
-    # `finish_reason=="content_filter"`（自然完了 allowlist に無い）も同様。main 3方言も
-    # plan/hybrid と同じ自然完了 allowlist へ揃える。
-    ("content_filter", True, "止められた回答"),
-    # `finish_reason` が欠落（キー自体が無い）した応答は、以前は「明示的に `length` のときだけ
-    # 未完了」という denylist 判定のもとで帰属が発行されていたが、自然完了 allowlist では
-    # 理由欠落もすべて未完了扱いになる——旧 denylist 期待（理由欠落でも帰属成功）を反転する固定。
-    (None, False, "理由欠落の回答"),
-    # `finish_reason` が文字列でない（壊れた upstream 応答が数値/dict 等を返した）場合、本文の
-    # 配信・`_result` の生成は落ちずに完走し（`TypeError` にならない）、帰属呼び出しも発行しない
-    # （`_openai_style_finish_reason` の非文字列→None 変換＋`_is_natural_completion` の
-    # isinstance ガード、両方の防御を経路として通す）。
-    ({"unexpected": "shape"}, True, "壊れた完了理由の回答"),
-])
-def test_openai_style_non_natural_completion_skips_attribution(monkeypatch, finish_reason, has_key, content):
-    calls = []
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, {_REAL_DOC},
-               [{"doc_id": _REAL_DOC, "span": [1, 1], "quote": "x", "ext": ".md"}], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        if len(calls) == 1:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        choice = {"message": {"content": content}}
-        if has_key:
-            choice["finish_reason"] = finish_reason
-        return {"choices": [choice]}
-
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post, A.run_tool = fake_post, fake_run_tool
-    try:
-        final = None
-        for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                                 max_turns=1):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 帰属は発行されない（3回目は無い）
-        assert final["final"] == content
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-def test_final_synthesis_exception_logs_masked_warning(monkeypatch, caplog):
-    """RV7 是正の固定: turns 上限到達時の最終合成（tools 無し）が例外で失敗した場合
-    （`_synthesis_failed=True` に畳んで空回答へ縮退させる契約は維持）、元例外の型とマスク済み
-    メッセージを WARNING ログへ残す——これまでは `except Exception:`（変数すら束縛しない）で
-    例外そのものを完全に握り潰しており、診断の手掛かりが一切残らなかった。"""
-    import logging
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, set(), [], [])
-
-    secret = "sk-shouldnotleak1234567890"
-
-    def fake_post(url, headers, body, timeout=90):
-        if "tools" in body:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        raise RuntimeError(f"simulated final synthesis failure: Bearer {secret}")
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    with caplog.at_level(logging.WARNING, logger="sherpa"):
-        final = None
-        for ev in A.openai_style("http://x", {"Authorization": f"Bearer {secret}"}, "gpt-5.5",
-                                 A.SYSTEM, "質問", "v1", None, max_turns=1):
-            if "final" in ev:
-                final = ev
-    assert final["synthesis_failed"] is True
-    logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "RuntimeError" in logged
-    assert secret not in logged
-
-
-def test_final_synthesis_connection_failure_tags_failure_kind_connection(monkeypatch):
-    """最終合成の HTTP 呼び出しが接続失敗（`_send` が付与する `_sherpa_llm_send_error` マーカー
-    付きで `_is_connection_failure` も真）で失敗した場合、`synthesis_failed=True` に加えて
-    `failure_kind="connection"` を payload に残す（生の例外は載せない安全な分類値・
-    `sherpa/research_service.py` が provider 付き専用文言へ倒す判別材料に使う）。"""
-    import urllib.error
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, set(), [], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        if "tools" in body:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    final = None
-    for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None, max_turns=1):
-        if "final" in ev:
-            final = ev
-    assert final["synthesis_failed"] is True
-    assert final["failure_kind"] == "connection"
-
-
-def test_final_synthesis_generic_exception_leaves_failure_kind_unset(monkeypatch):
-    """対照実験: 接続失敗ではない汎用例外（RuntimeError）は `failure_kind` を立てない
-    （既存の汎用「合成中に失敗」経路を維持する）。"""
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, set(), [], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        if "tools" in body:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    final = None
-    for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None, max_turns=1):
-        if "final" in ev:
-            final = ev
-    assert final["synthesis_failed"] is True
-    assert final.get("failure_kind") is None
-
-
-def test_final_synthesis_connection_error_without_send_marker_leaves_failure_kind_unset(monkeypatch):
-    """最終合成の try は `_send`（物理送信）だけでなく usage 加算・応答パースも同じ try で囲む。
-    `_send` を経由しない（`_sherpa_llm_send_error` マーカーの無い）`ConnectionError` がそこで
-    起きても `failure_kind="connection"` にはしない——型が `_is_connection_failure` と一致する
-    だけでは倒れない（マーカーと型判定の AND 条件を固定する）。"""
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, set(), [], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        if "tools" in body:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        return {"choices": [{"message": {"content": "最終回答"}, "finish_reason": "stop"}]}
-
-    real_acc_usage = A._acc_openai_usage
-    calls = []
-
-    def boom_acc_usage(acc, resp, ollama):
-        calls.append(1)
-        if len(calls) > 1:   # 1回目（tool-turn の usage 加算）は素通し・2回目（最終合成）だけ失敗させる
-            raise ConnectionError("not raised by _send")
-        return real_acc_usage(acc, resp, ollama)
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    monkeypatch.setattr(A, "_acc_openai_usage", boom_acc_usage)
-    final = None
-    for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None, max_turns=1):
-        if "final" in ev:
-            final = ev
-    assert final["synthesis_failed"] is True
-    assert final.get("failure_kind") is None
-
-
-def test_final_synthesis_skips_send_when_stop_event_fires_after_tool_execution(monkeypatch):
-    """RV8 是正の固定: turns 上限到達時、ツール実行完了直後（tail 冒頭の停止確認の直前）に
-    watchdog（stop_event）が発火した場合、最終合成を新規送信しない——「停止時は final を出さない」
-    契約どおり、final を一切 yield せずに終了する（旧実装は tail 冒頭で1回確認するだけで、
-    送信直前の再確認が無かったため、この窓で新規送信できてしまっていた）。
-
-    FB統合後: 呼び出し予算の消費・usage 加算は `_send`（`llm.begin_openai_send`/`_consume_call`）が
-    自分で行うため、`_consume_call` を直接スパイして発火タイミングを作る旧来の手法は使えない
-    （OpenAI 経路では `_consume_call` 自体が呼ばれなくなった）。`run_tool`（turn 0 のツール実行）
-    完了直後に stop_event を立てることで、同じ「ツール実行後・tail 開始前」の窓を模す。"""
-    import threading
-
-    stop_event = threading.Event()
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        stop_event.set()   # ツール実行完了直後（tail 開始前）に watchdog が発火した窓を模す
-        return ({"hits": []}, set(), [], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        if "tools" in body:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        raise AssertionError("stop_event 発火後に最終合成を送信してはいけない")
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                                 max_turns=1, stop_event=stop_event))
-    assert not any("final" in ev for ev in events)
-
-
-def test_final_synthesis_skips_send_when_stop_event_fires_during_node_yield(monkeypatch):
-    """RV9 是正の固定: 「ここまでに集めた資料で回答をまとめます」の node yield は呼び出し元へ
-    制御を戻す——再開までにかかる時間は呼び出し元次第（chat の UI 停止操作・PART-4 の watchdog
-    とも、この yield の間隔で stop_event が立ちうる）。yield 復帰直後（送信直前）で
-    stop_event を再確認せず、その前のチェックだけに頼っていると、通常チャットでも余分な
-    送信が1回発生し・停止時に final を出さない契約が破れる。"""
-    import threading
-
-    stop_event = threading.Event()
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        return ({"hits": []}, set(), [], [])
-
-    def fake_post(url, headers, body, timeout=90):
-        if "tools" in body:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-        raise AssertionError("stop_event 発火後に最終合成を送信してはいけない")
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    monkeypatch.setattr(A, "run_tool", fake_run_tool)
-
-    gen = A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                         max_turns=1, stop_event=stop_event)
-    events = []
-    for ev in gen:
-        events.append(ev)
-        if "node" in ev and ev["node"].get("detail") == "ここまでに集めた資料で回答をまとめます":
-            # ちょうどこの yield から戻ってくる直前（＝次の `next()` を呼ぶ前）に、呼び出し元側で
-            # 停止要求が来た窓を模す。
-            stop_event.set()
-    assert not any("final" in ev for ev in events)
-
-
-@pytest.mark.parametrize("finish_reason,content,stop_reason", [
-    # `finishReason=="SAFETY"`（自然完了 allowlist に無い）で終わった応答は、たとえ本文があっても
-    # 帰属呼び出しを発行しない。"no_tool_calls"（自然終了）と偽らない。
-    ("SAFETY", "止められた回答", "content_filtered"),
-    # `finishReason=="MAX_TOKENS"`（打ち切り＝未完了）も同様。
-    ("MAX_TOKENS", "途中で切れた回答", None),
-    # `finishReason` が文字列でない（壊れた upstream 応答が dict 等を返した）場合、`cand0.get(
-    # "finishReason")` はそのまま非文字列値を返す（openai_style と異なりラッパー関数を経由しない）が、
-    # `_is_natural_completion` の isinstance ガードで例外にならず、本文配信・`_result` 生成は完走し
-    # 帰属呼び出しも発行しない。非文字列は自然終了(no_tool_calls)へ丸めない。
-    ({"unexpected": "shape"}, "壊れた完了理由の回答", "unknown"),
-])
-def test_gemini_non_natural_completion_skips_attribution(monkeypatch, finish_reason, content, stop_reason):
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": content}]},
-                        "finishReason": finish_reason}]},
-    ]
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 帰属（3回目）は発行されない
-        assert final["final"] == content
-        assert final["attributed_ev_ids"] == set()
-        if stop_reason is not None:
-            assert final["stop_reason"] == stop_reason
-    finally:
-        A._post = orig
-
-
-def test_gemini_stops_between_turns_when_stop_event_set_mid_flight():
-    import threading
-
-    stop_event = threading.Event()
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(1)
-        stop_event.set()
-        return {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "TAX-RATE"}}}]}}]}
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "消費税率は?", "v1", None,
-                               stop_event=stop_event))
-        assert len(calls) == 1
-        assert not any("final" in ev for ev in events)
-    finally:
-        A._post = orig
-
-
-def test_openai_style_ask_user_stub():
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ask_user", "arguments": '{"prompt":"どの範囲で調べますか？","mode":"single","options":[{"id":"all","label":"全体"},{"id":"design","label":"設計書だけ"}]}'}}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None))
-        q = next(ev["question"] for ev in events if "question" in ev)
-        assert q["type"] == "question" and q["mode"] == "single"
-        assert [o["label"] for o in q["options"]] == ["全体", "設計書だけ"]
-        assert any(ev.get("node", {}).get("label") == "ユーザに確認" for ev in events)
-        assert not any("final" in ev for ev in events)
-    finally:
-        A._post = orig
-
-
-# ===== secRV MED-3（2026-07-18・DoS/コスト増幅）: 1応答あたりのツール実行数上限 =====
-
-@pytest.mark.parametrize("dialect", ["openai", "ollama", "gemini", "anthropic"])
-@pytest.mark.parametrize("parallel", [1, 3])
-def test_admin_tool_limit_applies_before_execution(monkeypatch, dialect, parallel):
-    """保存値で実際の実行を止める。実行途中の設定変更は次の調査から適用する。"""
-    configured = {"agentic_max_tools_per_turn": 2}
-    monkeypatch.setattr(store, "get_system_settings", lambda **kw: dict(configured))
-    monkeypatch.setattr(A, "SHERPA_TOOL_PARALLEL", parallel)
-    executed = []
-
-    def run_tool(name, args, *a, **kw):
-        executed.append(args["query"])
-        configured["agentic_max_tools_per_turn"] = 1
-        return {"hits": []}, set(), [], []
-
-    monkeypatch.setattr(A, "run_tool", run_tool)
-    if dialect in ("openai", "ollama"):
-        calls = [{"id": f"c{i}", "function": {
-            "name": "ripgrep_search", "arguments": json.dumps({"query": str(i)})}} for i in range(3)]
-        message = {"content": "", "tool_calls": calls}
-        response = {"message": message} if dialect == "ollama" else {"choices": [{"message": message}]}
-        monkeypatch.setattr(A, "_post", lambda *a, **kw: response)
-        events = list(A.openai_style("http://x", {}, "m", A.SYSTEM, "調べて", "v1", None,
-                                     ollama=dialect == "ollama"))
-    elif dialect == "gemini":
-        response = {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": str(i)}}} for i in range(3)]}}]}
-        monkeypatch.setattr(A, "_post", lambda *a, **kw: response)
-        events = list(A.gemini("key", "m", A.SYSTEM, "調べて", "v1", None))
-    else:
-        client = _AClient([_AResp([
-            _ABlock("tool_use", name="ripgrep_search", input={"query": str(i)}, id=f"t{i}")
-            for i in range(3)], stop_reason="tool_use")])
-        events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None))
-    assert sorted(executed) == ["0", "1"]
-    assert next(e for e in events if "final" in e)["stop_reason"] == "tools_per_turn_exceeded"
-
-
-def test_admin_tool_limit_unset_uses_environment_default(monkeypatch):
-    monkeypatch.setattr(A, "MAX_TOOLS_PER_TURN", 32)
-    assert A.effective_max_tools_per_turn({}) == 32
-    assert A.effective_max_tools_per_turn({"agentic_max_tools_per_turn": None}) == 32
-    assert A.effective_max_tools_per_turn({"agentic_max_tools_per_turn": 5}) == 5
-
-def test_openai_style_caps_tool_calls_per_turn():
-    """1応答に25個の tool_calls が積まれていても、`MAX_TOOLS_PER_TURN`（既定16）を超えた分は
-    `run_tool` を呼ばずに打ち切る（次のターンへは進まない・fail-closed）。
-
-    レビュー是正（LOW-D・secRV・2026-07-18 再検証）: 超過件数（25-16=9件）と同数の「上限」ノードを
-    生成すると、超過が極端な場合（例: 1応答10万件）に SSE/trace が肥大化する。是正後は超過があっても
-    固定ノードを**1件だけ**生成する。
-    """
-    calls = [{"id": f"c{i}", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}
-             for i in range(25)]
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls}}]}]
-    post_calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        post_calls.append(1)
-        return seq.pop(0)
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None))
-        assert len(post_calls) == 1   # 上限超過＝この応答で打ち切り・次のターンへは進まない
-        cap_nodes = [ev["node"] for ev in events
-                    if "node" in ev and ev["node"]["label"] == "ツール呼び出し上限"]
-        assert len(cap_nodes) == 1   # 超過件数に関わらず固定ノードは1件だけ（LOW-D）
-        executed_nodes = [ev["node"] for ev in events
-                          if "node" in ev and ev["node"]["label"] == "資料を検索（語句そのまま）"]
-        assert len(executed_nodes) == A.MAX_TOOLS_PER_TURN   # 実行されたのは上限まで
-        final = next(ev for ev in events if "final" in ev)
-        assert final["final"] == ""   # 打ち切り＝最終回答は空
-        assert final["stop_reason"] == "tools_per_turn_exceeded"   # STOP-1: 閉じた語彙を固定
-    finally:
-        A._post = orig
-
-
-def test_openai_style_extreme_excess_still_emits_single_cap_node():
-    """LOW-D の実害シナリオ: 1応答に10万件の tool_calls があっても、上限ノードは1件だけ
-    （超過件数分（99,984件）を生成しない）。"""
-    calls = [{"id": f"c{i}", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}
-             for i in range(100_000)]
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls}}]}]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None))
-        cap_nodes = [ev for ev in events if "node" in ev and ev["node"]["label"] == "ツール呼び出し上限"]
-        assert len(cap_nodes) == 1
-    finally:
-        A._post = orig
-
-
-def test_openai_style_stop_event_checked_before_each_tool_within_turn(monkeypatch):
-    """secRV MED-3 (b): stop_event は各ツール実行の直前にも確認する（1応答内に複数 tool_calls が
-    あっても、途中で停止要求が来たら即座に打ち切り、以降のツールは実行しない）。
-
-    D1（ツール並列）: この検証は「1件ずつ順に実行し、直前に stop_event を見る」という直列実行の
-    契約を固定するもの——`SHERPA_TOOL_PARALLEL` の既定（3）だとこの5本の応答は並列実行の対象に
-    なり、投入は各呼び出しの active ノード yield 直後の再確認でしか止まらない（並列時の停止契約は
-    `tests/unit/test_tool_parallel.py` 側で固定）。ここでは `SHERPA_TOOL_PARALLEL=1` を明示して
-    従来どおりの直列経路を強制する。"""
-    import threading
-
-    monkeypatch.setattr(A, "SHERPA_TOOL_PARALLEL", 1)
-    stop_event = threading.Event()
-    calls = [{"id": f"c{i}", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}
-             for i in range(5)]
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    run_tool_calls = []
-
-    def fake_run_tool(name, args, world, scope_paths, **kw):
-        run_tool_calls.append(1)
-        if len(run_tool_calls) == 2:
-            stop_event.set()   # 2回目のツール実行直後に停止要求が来た、を模す
-        return orig_run_tool(name, args, world, scope_paths)
-
-    A.run_tool = fake_run_tool
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     stop_event=stop_event))
-        assert len(run_tool_calls) == 2   # 3回目の直前チェックで停止＝以降は実行しない
-        assert not any("final" in ev for ev in events)   # 停止時は final を出さない
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
 
 # ===== secRV LOW-E（2026-07-18 再検証）: ノード yield 直後の stop_event 再確認 =====
 # generator は yield で呼び出し元へ制御を返す＝その間に停止要求が来ても、是正前は再開後に
 # run_tool（実 I/O）を無条件に1件実行してしまっていた。ノード yield 直後・ask_user 分岐/run_tool の
 # 直前にも再確認することで、この窓を塞ぐ（3 dialect 共通）。
 
-def test_openai_style_stop_event_set_during_node_yield_prevents_run_tool():
-    import threading
-
-    stop_event = threading.Event()
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    run_tool_calls = []
-
-    def fake_run_tool(*a, **kw):
-        run_tool_calls.append(1)
-        raise AssertionError("run_tool が呼ばれた＝ノード yield 後の stop_event 再確認が効いていない")
-
-    A.run_tool = fake_run_tool
-    try:
-        gen = A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                             stop_event=stop_event)
-        first = next(gen)                 # tool_node が yield される（run_tool はまだ呼ばれていない）
-        assert "node" in first
-        stop_event.set()                  # generator 一時停止中に停止要求が来た、を模す
-        events = list(gen)                # 再開: run_tool を呼ばず即終了するはず
-        assert events == []
-        assert run_tool_calls == []
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-def test_gemini_stop_event_set_during_node_yield_prevents_run_tool():
-    import threading
-
-    stop_event = threading.Event()
-    seq = [{"candidates": [{"content": {"parts": [
-        {"functionCall": {"name": "ripgrep_search", "args": {"query": "TAX-RATE"}}}]}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    run_tool_calls = []
-
-    def fake_run_tool(*a, **kw):
-        run_tool_calls.append(1)
-        raise AssertionError("run_tool が呼ばれた")
-
-    A.run_tool = fake_run_tool
-    try:
-        gen = A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "消費税率は?", "v1", None, stop_event=stop_event)
-        first = next(gen)
-        assert "node" in first
-        stop_event.set()
-        events = list(gen)
-        assert events == []
-        assert run_tool_calls == []
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-
-
-def test_anthropic_style_stop_event_set_during_node_yield_prevents_run_tool():
-    import threading
-
-    stop_event = threading.Event()
-    seq = [_AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu1")],
-                  stop_reason="tool_use")]
-    client = _AClient(seq)
-    orig_run_tool = A.run_tool
-    run_tool_calls = []
-
-    def fake_run_tool(*a, **kw):
-        run_tool_calls.append(1)
-        raise AssertionError("run_tool が呼ばれた")
-
-    A.run_tool = fake_run_tool
-    try:
-        gen = A.anthropic_style(client, "m", A.SYSTEM, "消費税率は?", "v1", None, stop_event=stop_event)
-        first = next(gen)
-        assert "node" in first
-        stop_event.set()
-        events = list(gen)
-        assert events == []
-        assert run_tool_calls == []
-    finally:
-        A.run_tool = orig_run_tool
-
-
 # ===== secRV MED-2（2026-07-18・ローカルサブの生成物が公式 UI/trace に露出）: サブ経路ノードの固定文言 =====
-
-def test_openai_style_main_path_tool_node_includes_args_regression():
-    """メイン経路（allowed_tools=None・既定）は引数を含む豊かなノード表示のまま（byte-identical）。"""
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"SENTINEL_MAIN_QUERY"}'}}]}}]},
-        {"choices": [{"message": {"content": "final"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None))
-        nodes = [ev["node"] for ev in events if "node" in ev]
-        assert any("SENTINEL_MAIN_QUERY" in n["detail"] for n in nodes)
-    finally:
-        A._post = orig
-
-
-def test_openai_style_sub_path_tool_node_omits_model_generated_args():
-    """secRV MED-2: サブ経路（`allowed_tools` が非 None＝`_sub_agentic_loop` の合図）の許可済みツール
-    ノードは、モデル生成の引数（query 等）を一切含まない固定文言になる（`_tool_node_sub` 参照）。"""
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"SENTINEL_SUB_QUERY"}'}}]}}]},
-        {"choices": [{"message": {"content": "final"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                     allowed_tools=frozenset({"ripgrep_search"})))
-        nodes = [ev["node"] for ev in events if "node" in ev]
-        assert not any("SENTINEL_SUB_QUERY" in str(n) for n in nodes)
-        assert any(n["label"] == "資料を検索（語句そのまま）" for n in nodes)   # ラベル自体は維持（固定文言の範囲内）
-    finally:
-        A._post = orig
-
-
-def test_openai_style_wires_hit_summary_node_after_ripgrep_search():
-    """L-3: run_tool 実行後に `_hit_summary_node` の結果ノードが実際に流れることを配線ごと固定する
-    （`_hit_summary_node` 単体テストだけでは、呼び出し箇所の配線を消しても緑のまま通ってしまう）。"""
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "final"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None))
-        nodes = [ev["node"] for ev in events if "node" in ev]
-        hit = next((n for n in nodes if n["label"] == A._HIT_SUMMARY_LABELS["ripgrep_search"]), None)
-        assert hit is not None, nodes
-        assert "TAX-RATE" in hit["detail"] and "件" in hit["detail"]
-    finally:
-        A._post = orig
-
-
-def test_gemini_loop_stub():
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "TAX-RATE"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "TAX-RATE です。"}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "消費税率は?", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert final and "TAX-RATE" in final["final"] and final["docs"]
-    finally:
-        A._post = orig
-
-
-def test_gemini_wires_hit_summary_node_after_ripgrep_search():
-    """L-3: openai_style と同じく、gemini でも run_tool 実行後に `_hit_summary_node` の結果ノードが
-    実際に流れることを配線ごと固定する。"""
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "TAX-RATE"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "TAX-RATE です。"}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "消費税率は?", "v1", None))
-        nodes = [ev["node"] for ev in events if "node" in ev]
-        hit = next((n for n in nodes if n["label"] == A._HIT_SUMMARY_LABELS["ripgrep_search"]), None)
-        assert hit is not None, nodes
-        assert "TAX-RATE" in hit["detail"] and "件" in hit["detail"]
-    finally:
-        A._post = orig
-
-
-def test_gemini_drops_nonexistent_doc_citation_via_commit_gate(monkeypatch):
-    """Gemini 経路も `openai_style` と同じ Committed Evidence 化ゲートを通る（機械検証で実在しない
-    doc の citation を落とす・全滅時は stop_reason が evidence_verification_failed になる）。"""
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {"ghost.md"}, [{"doc_id": "ghost.md", "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "回答です。"}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert final["cites"] == []
-        assert final["stop_reason"] == "evidence_verification_failed"
-    finally:
-        A._post = orig
-
-
-def test_gemini_attribution_call_marks_used_evidence_docs(monkeypatch):
-    """EV-0（拡張設計 §4.4・設計簡素化）: Gemini 経路は本文に根拠申告用の制御構文を一切書かせず、
-    確定した回答本文の完了後に別の非ストリーム呼び出し（`submit_attribution` の function-calling
-    強制・`tool_config.mode=ANY`）で帰属を判定する。本文は byte-identical のまま。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "回答です。"}]}, "finishReason": "STOP"}]},
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "submit_attribution", "args": {"used": ["ev-1"]}}}]}}]},
-    ]
-    calls = []
-    orig = A._post
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        return seq.pop(0)
-
-    A._post = fake_post
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert final["final"] == "回答です。"   # 本文は一切変更しない（byte-identical）
-        assert final["used_evidence_docs"] == {real_doc}
-        assert final["attributed_ev_ids"] == {"ev-1"}
-        attribution_body = calls[-1]
-        assert attribution_body["tool_config"]["function_calling_config"]["mode"] == "ANY"
-        text = attribution_body["contents"][0]["parts"][0]["text"]
-        assert "回答です。" in text and "ev-1" in text
-    finally:
-        A._post = orig
-
-
-def test_gemini_stop_event_set_after_final_response_skips_attribution(monkeypatch):
-    """最終応答（functionCall 無し）が返ってきた直後に停止要求が来た場合、帰属呼び出し
-    （`submit_attribution`）は発行しない——帰属**直前**の再確認で捕捉する。"""
-    import threading
-    stop_event = threading.Event()
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "回答です。"}]}}]},
-    ]
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        resp = seq.pop(0)
-        if len(calls) == 2:
-            stop_event.set()   # 最終応答が返った直後に停止要求が来た、を模す
-        return resp
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None,
-                           stop_event=stop_event):
-            if "final" in ev:
-                final = ev
-        assert len(calls) == 2   # 帰属（3回目）は発行されない
-        assert final["final"] == "回答です。"
-        assert final["attributed_ev_ids"] == set()
-    finally:
-        A._post = orig
-
-
-def test_gemini_mixed_valid_and_invalid_citations_resynthesizes_clean_body(monkeypatch):
-    """検証で一部 citation が落ちた（実在 doc 1件＋存在しない doc 1件の混在）場合、Gemini 経路も
-    `openai_style` と同じ「Committed Evidence だけからのクリーン再合成」を行う。落ちた doc に触れた
-    最初の draft 本文は使わず、再合成呼び出しは tools 無し・ツール結果履歴も含まない最小コンテキスト
-    （`history` 省略時は user パート1件だけ）で行う。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc, "ghost.md"},
-        [{"doc_id": real_doc, "span": [1, 1], "quote": "実在", "ext": ".md"},
-         {"doc_id": "ghost.md", "span": [1, 1], "quote": "存在しない", "ext": ".md"}], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ripgrep_search", "args": {"query": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "ghost.md にも記載があります（古い草稿）。"}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "確認できた根拠に基づく回答です。"}]},
-                        "finishReason": "STOP"}]},
-    ]
-    calls = []
-    orig = A._post
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        return seq.pop(0)
-
-    A._post = fake_post
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        # tool turn + no-tool draft + クリーン再合成 + 帰属呼び出し1回（citation が1件残るため
-        # digest が非空になり発火する・fake の seq 切れは attribute_gemini 側で安全に空集合へ縮退）。
-        assert len(calls) == 4
-        assert [c["doc_id"] for c in final["cites"]] == [real_doc]
-        assert final["final"] == "確認できた根拠に基づく回答です。"
-        assert "ghost.md" not in final["final"] and "古い草稿" not in final["final"]
-        resynth_body = calls[-2]
-        assert "tools" not in resynth_body       # これ以上ツールを呼ばせない
-        assert len(resynth_body["contents"]) == 1   # history 省略＝再合成用 user パート1件だけ
-        text = resynth_body["contents"][0]["parts"][0]["text"]
-        assert "ghost.md" not in text and real_doc in text
-    finally:
-        A._post = orig
-
-
-def test_gemini_empty_list_docs_is_still_one_aggregate_evidence(monkeypatch):
-    """`list_docs` が0件でも、呼び出し単位の集計 Evidence を1件持つ（`has_structural_evidence` を
-    立てる・拡張設計 §4.4・Gemini 経路）。"""
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"count": 0, "docs": []}, set(), [], []))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "list_docs", "args": {}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "0件でした。"}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None)
-                    if "final" in ev)
-        assert final["has_structural_evidence"] is True
-        assert len(final["structural_evidence_meta"]) == 1
-        m = final["structural_evidence_meta"][0]
-        assert m["doc_id"] is None and m["matched_doc_ids"] == [] and m["list_meta"]["count"] == 0
-    finally:
-        A._post = orig
-
-
-def test_anthropic_style_empty_list_docs_is_still_one_aggregate_evidence():
-    """`list_docs` が0件でも、呼び出し単位の集計 Evidence を1件持つ（`has_structural_evidence` を
-    立てる・拡張設計 §4.4）——「該当0件」という具体的な事実として根拠ゲート・帰属の対象になる
-    契約（Anthropic 経路）。"""
-    orig_run_tool = A.run_tool
-    A.run_tool = lambda name, args, world, scope_paths, **kw: ({"count": 0, "docs": []}, set(), [], [])
-    seq = [
-        _AResp([_ABlock("tool_use", name="list_docs", input={}, id="tu1")], stop_reason="tool_use"),
-        _AResp([_ABlock("text", "0件でした。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    try:
-        final = next(ev for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None)
-                    if "final" in ev)
-        assert final["has_structural_evidence"] is True
-        assert len(final["structural_evidence_meta"]) == 1
-        m = final["structural_evidence_meta"][0]
-        assert m["doc_id"] is None and m["matched_doc_ids"] == [] and m["list_meta"]["count"] == 0
-    finally:
-        A.run_tool = orig_run_tool
-
-
-def test_openai_style_empty_list_docs_is_still_one_aggregate_evidence(monkeypatch):
-    """`list_docs` が0件でも、呼び出し単位の集計 Evidence を1件持つ（`has_structural_evidence` を
-    立てる・拡張設計 §4.4・OpenAI/Ollama 経路）。"""
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"count": 0, "docs": []}, set(), [], []))
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "list_docs", "arguments": "{}"}}]}}]},
-        {"choices": [{"message": {"content": "0件でした。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["has_structural_evidence"] is True
-        assert len(final["structural_evidence_meta"]) == 1
-        m = final["structural_evidence_meta"][0]
-        assert m["doc_id"] is None and m["matched_doc_ids"] == [] and m["list_meta"]["count"] == 0
-    finally:
-        A._post = orig
-
-
-def test_gemini_graph_neighbors_requires_verified_backing_doc_for_structural_evidence(monkeypatch):
-    """Gemini 経路でも card の存在だけでは `has_structural_evidence` を立てない——裏付け doc
-    （`evidence.grep[].doc_id`）が world 内に実在するときだけ構造的根拠として数える。`run_tool`
-    がカード単位で検証済みの doc_id 集合を返す契約（`agentic_search.run_tool` の docs 戻り値）
-    なので、fake もその契約に合わせて検証済みの doc_id を返す。"""
-    real_doc = "4期/04_運用/障害記録.md"
-
-    def fake_run_tool_verified(name, args, world, scope_paths, **kw):
-        # 実 run_tool は裏付け doc を検証済みで card 自身に `_verified_doc_ids` として同梱してから
-        # 返す契約（`_card_structural_evidence` はこれを見る・自前で再検証しない）。
-        return ({"nodes": []}, {real_doc}, [],
-               [{"name": "n1", "label": "L1", "evidence": {"grep": [{"doc_id": real_doc}], "edges": []},
-                 "_verified_doc_ids": [real_doc]}])
-
-    def fake_run_tool_unverified(name, args, world, scope_paths, **kw):
-        # 実 run_tool は裏付け doc が1件も実在しない card を cards・docs の両方から除外して返す
-        # （呼び出し元は再検証しない契約）。
-        return ({"nodes": []}, set(), [], [])
-
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "graph_neighbors", "args": {"name": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "グラフから確認しました。"}]}}]},
-    ]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    A.run_tool = fake_run_tool_verified
-    try:
-        final = next(ev for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None)
-                    if "final" in ev)
-        assert final["has_structural_evidence"] is True
-        assert [m["matched_doc_ids"] for m in final["structural_evidence_meta"]] == [[real_doc]]
-        assert final["structural_evidence_meta"][0]["doc_id"] is None
-        assert final["structural_evidence_meta"][0]["verification_method"] == "graph_verified"
-    finally:
-        A._post = orig_post
-        A.run_tool = orig_run_tool
-
-    seq2 = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "graph_neighbors", "args": {"name": "x"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "グラフから確認しました。"}]}}]},
-    ]
-    A._post = lambda url, headers, body, timeout=90: seq2.pop(0)
-    A.run_tool = fake_run_tool_unverified
-    try:
-        final = next(ev for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None)
-                    if "final" in ev)
-        assert final["has_structural_evidence"] is False   # 裏付け doc が実在しない card は数えない
-        assert final["structural_evidence_meta"] == []
-    finally:
-        A._post = orig_post
-        A.run_tool = orig_run_tool
-
-
-def test_gemini_ask_user_stub():
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "ask_user", "args": {"prompt": "対象は？", "mode": "multiple",
-                                                             "options": [{"label": "設計"}, {"label": "ソース"}]}}}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None))
-        q = next(ev["question"] for ev in events if "question" in ev)
-        assert q["mode"] == "multiple" and [o["label"] for o in q["options"]] == ["設計", "ソース"]
-    finally:
-        A._post = orig
-
-
-# ===== 調べる深さ（調べ方ブロック §3.2・SC-6c）: OpenAIProvider._agentic_loop の倍率配線 =====
-
-@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
-def test_openai_provider_agentic_loop_scales_with_depth_profile(monkeypatch, profile):
-    """`_agentic_loop` が `openai_style` へ渡す `max_turns`/`max_hits`/`window_cap` に、
-    `ctx.scope_meta["depth_profile"]` の倍率が一度だけ効く。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-    from sherpa import depth_profile as D
-    captured = {}
-
-    def fake_openai_style(*a, **kw):
-        captured.update(kw)
-        return iter([])
-
-    monkeypatch.setattr(A, "openai_style", fake_openai_style)
-    p = OpenAIProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="質問", world="v1", knowledge=True,
-              route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-              dispatch=lambda lens, inp: {},
-              scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": profile},
-              make_sources=lambda docs: [])
-    list(p._agentic_loop(ctx))
-    assert captured.get("max_turns") == D.scaled_turns(A.MAX_TURNS, profile)
-    assert captured.get("max_hits") == D.scaled_ratio(A.MAX_HITS, profile)
-    assert captured.get("window_cap") == D.scaled_ratio(A.READ_WINDOW, profile)
-
-
-def test_openai_provider_agentic_loop_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（`self._system_settings`）が env 既定より優先される（実効基準値）＝
-    深さ（"deep"＝×2）の倍率はその実効基準値に掛かる。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-    captured = {}
-
-    def fake_openai_style(*a, **kw):
-        captured.update(kw)
-        return iter([])
-
-    monkeypatch.setattr(A, "openai_style", fake_openai_style)
-    p = OpenAIProvider("sk-dummy", "gpt-5.5", system_settings={"depth_base_max_turns": 5})
-    ctx = Ctx(message="質問", world="v1", knowledge=True,
-              route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-              dispatch=lambda lens, inp: {},
-              scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "deep"},
-              make_sources=lambda docs: [])
-    list(p._agentic_loop(ctx))
-    assert captured.get("max_turns") == 10   # 5（基準値上書き）× 2（深く）
-
-
-def test_openai_provider_agentic_loop_abs_max_clamps_admin_base_over_limit(monkeypatch):
-    """管理画面の基準値編集が既存の絶対上限を超える値（grep ヒット上限1500・読み取り窓600）＋
-    深さ「最大」（×2）でも、最終的に既存の絶対上限でクランプされる。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-    captured = {}
-
-    def fake_openai_style(*a, **kw):
-        captured.update(kw)
-        return iter([])
-
-    monkeypatch.setattr(A, "openai_style", fake_openai_style)
-    p = OpenAIProvider("sk-dummy", "gpt-5.5", system_settings={
-        "depth_base_grep_max_hits": 1500, "depth_base_read_window": 600})
-    ctx = Ctx(message="質問", world="v1", knowledge=True,
-              route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-              dispatch=lambda lens, inp: {},
-              scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "max"},
-              make_sources=lambda docs: [])
-    list(p._agentic_loop(ctx))
-    assert captured.get("max_hits") == A.MAX_HITS_ABS_MAX      # 1500 ではなく 1000（絶対上限）
-    assert captured.get("window_cap") == A.READ_WINDOW_ABS_MAX  # 600 ではなく 400（絶対上限）
-
-
-def test_ollama_provider_agentic_loop_scales_with_depth_profile(monkeypatch):
-    """`OllamaProvider._agentic_loop` も OpenAIProvider と同じ倍率を掛けて openai_style へ渡す。"""
-    from sherpa.agents import Ctx, OllamaProvider
-    from sherpa import depth_profile as D
-    captured = {}
-
-    def fake_openai_style(*a, **kw):
-        captured.update(kw)
-        return iter([])
-
-    monkeypatch.setattr(A, "openai_style", fake_openai_style)
-    p = OllamaProvider("http://localhost:11434", "qwen2.5")
-    ctx = Ctx(message="質問", world="v1", knowledge=True,
-              route=lambda m: {"lens": "qa", "input": m, "reason": "t"},
-              dispatch=lambda lens, inp: {},
-              scope_meta={"world": "v1", "scope_paths": [], "source": "all", "depth_profile": "max"},
-              make_sources=lambda docs: [])
-    list(p._agentic_loop(ctx))
-    assert captured.get("max_turns") == D.scaled_turns(A.MAX_TURNS, "max")
-    assert captured.get("max_hits") == D.scaled_ratio(A.MAX_HITS, "max")
-    assert captured.get("window_cap") == D.scaled_ratio(A.READ_WINDOW, "max")
-
-
-def test_provider_agentic_run_builds_env():
-    from sherpa.agents import Ctx, OpenAIProvider
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        p = OpenAIProvider("sk-dummy", "gpt-5.5")
-        ctx = Ctx(message="消費税率は?", world="v1", knowledge=True,
-                  route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-                  dispatch=lambda lens, inp: {},
-                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-                  make_sources=lambda docs: [{"doc_id": d} for d in docs])
-        result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-        env = result["env"]
-        assert env["lens"] == "qa" and "TAX-RATE" in env["headline"]
-        assert env["sources"] and result["decision"]["lens"] == "qa"
-        assert env["data"]["citations"] and "span" in env["data"]["citations"][0]   # qa UI 用に span/quote 付き
-    finally:
-        A._post = orig
-
-
-def test_provider_agentic_run_keeps_distinct_null_span_citations():
-    """SEARCH-CUT-3 RV MED-2 追加是正: `providers/base.py::_agentic_run` の citation 集約
-    （`citations.citation_dedupe_key` を共通で使う3箇所の1つ）が、同一 doc・span=[None, None]
-    （rag_chunks 由来で行番号を持たない）・異なる quote の2ヒットを集約後も両方残すことを、
-    citations.py 単体だけでなく base.py の実配線で固定する（重複実装せず共通鍵を使っている確認）。
-
-    doc_id は fixtures/corpus/v1 実在ファイル（EXT-2 機械検証が既定 ON のため、実在しない doc を
-    指す citation は Committed Evidence から落ちる＝この dedup 検証とは無関係な理由で落ちてしまう。
-    テストの関心は「span=null の2ヒットが別 citation として残るか」であり doc の実体とは無関係
-    なので、実在ファイルへ差し替えるだけで足りる）。
-    """
-    from sherpa import documents, es_index
-    from sherpa.agents import Ctx, OpenAIProvider
-    real_doc = "4期/04_運用/障害記録.md"
-    o_search, o_relset = es_index.search, documents.world_rel_set
-    es_index.search = lambda world, q, scope_paths=None, k=20, layer=None, **kw: ([
-        {"doc_id": real_doc, "line": None, "text": "単価100円", "ext": ".md"},
-        {"doc_id": real_doc, "line": None, "text": "数量5個", "ext": ".md"},
-    ], None)
-    documents.world_rel_set = lambda world, **kw: {real_doc}
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "es_search", "arguments": '{"query":"単価"}'}}]}}]},
-        {"choices": [{"message": {"content": "単価と数量です。"}}]},
-    ]
-    orig_post = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        p = OpenAIProvider("sk-dummy", "gpt-5.5")
-        ctx = Ctx(message="単価と数量は?", world="v1", knowledge=True,
-                  route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-                  dispatch=lambda lens, inp: {},
-                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-                  make_sources=lambda docs: [{"doc_id": d} for d in docs])
-        result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-        cites = result["env"]["data"]["citations"]
-        quotes = {c["quote"] for c in cites if c["doc_id"] == real_doc}
-        assert quotes == {"単価100円", "数量5個"}   # 2件とも残る（span 同一でも quote が違えば別 citation）
-    finally:
-        A._post = orig_post
-        es_index.search, documents.world_rel_set = o_search, o_relset
-
-
-def test_provider_run_stops_promptly_and_skips_fallback_when_stop_event_set_mid_agentic():
-    """RV MEDIUM（2026-07-03再検証）: OpenAIProvider.run(ctx)（agentic 経路・qa/troubleshoot）は
-    stop_event が立つと後続ターンを発行せず、単発 grep フォールバックも試みずに終了する
-    （＝停止 POST から stopped イベントまでの最大待ち時間が「1ターン分」で頭打ちになる裏付け。
-    fake の遅い provider として、応答が返るたびに stop_event を立てる _post を使う）。"""
-    import threading
-
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    stop_event = threading.Event()
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(1)
-        stop_event.set()   # 1ターン目の応答が返った直後に停止ボタンが押された、を模す
-        return {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        p = OpenAIProvider("sk-dummy", "gpt-5.5")
-        ctx = Ctx(message="消費税率は?", world="v1", knowledge=True,
-                  route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-                  dispatch=lambda lens, inp: {},
-                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-                  make_sources=lambda docs: [{"doc_id": d} for d in docs],
-                  stop_event=stop_event)
-        events = list(p.run(ctx))
-        assert len(calls) == 1, "停止後も2ターン目（以降）のリクエストが発行されている"
-        assert not any(e.get("type") == "_result" for e in events), \
-            "停止後にフォールバック経由で _result を作ってしまっている（無駄な追加処理）"
-    finally:
-        A._post = orig
-
-
-def test_provider_run_single_shot_stream_stops_between_chunks_when_stop_event_set():
-    """単発ストリーミング（lens=impact 等・非 agentic）は chunk を受信するたびにそのまま即時配信し
-    （保留しない）、配信直後に stop_event を確認する——停止検知後は `_stream` から**それ以上**次の
-    chunk を引き出さない。停止検知の直前に既に生成・配信済みの chunk は取り消さない
-    （headline と配信本文を一致させる）。"""
-    import threading
-
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    stop_event = threading.Event()
-    produced = []
-
-    class _FakeStreamProvider(OpenAIProvider):
-        def _stream(self, prompt):
-            for i in range(5):
-                produced.append(i)
-                if i == 1:
-                    stop_event.set()   # 2個目のチャンクが生成された直後に停止要求
-                yield f"chunk{i}"
-
-    p = _FakeStreamProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="影響は?", world="v1", knowledge=True,
-              route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
-              dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}},
-              make_sources=lambda docs: [],
-              stop_event=stop_event)
-    events = list(p.run(ctx))
-    deltas = [e for e in events if e.get("type") == "answer_delta"]
-    assert produced == [0, 1], f"停止後も _stream から次のチャンクを引き出し続けている: {produced}"
-    assert [d["text"] for d in deltas][-2:] == ["chunk0", "chunk1"], \
-        f"停止検知までに生成済みのチャンクは両方 yield されるはず: {deltas}"
-    result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"] == "".join(d["text"] for d in deltas)   # headline と配信本文が一致
-
-
-def test_provider_run_single_shot_headline_byte_identical_to_stream():
-    """設計簡素化（拡張設計 §4.4）: 単発ストリーミング（lens=impact 等・非 agentic）は本文中に
-    制御タグを一切書かせない・保留もしない——`env["headline"]` は配信した本文と byte-identical。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    class _FakeStreamProvider(OpenAIProvider):
-        def _stream(self, prompt):
-            yield "影響は3件です。"
-
-    p = _FakeStreamProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="影響は?", world="v1", knowledge=True,
-              route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
-              dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}},
-              make_sources=lambda docs: [])
-    events = list(p.run(ctx))
-    deltas = [e for e in events if e.get("type") == "answer_delta"]
-    result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"].endswith("影響は3件です。")
-    # 根拠の不足の告知も delta として配信される＝保存本文と配信本文は一致したまま。
-    assert result["env"]["headline"] == "".join(d["text"] for d in deltas)
-
-
-def test_provider_run_single_shot_stop_event_headline_is_partial_stream_so_far():
-    """停止契約（拡張設計 §4.4・設計簡素化）: provider 単体は「停止＝その時点までに配信した本文」
-    がそのまま headline になる（保留・確定処理は無い単純な契約）。"""
-    import threading
-
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    stop_event = threading.Event()
-
-    class _StopMidChunk(OpenAIProvider):
-        def _stream(self, prompt):
-            stop_event.set()
-            yield "回答本文"
-
-    p = _StopMidChunk("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="影響は?", world="v1", knowledge=True,
-              route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
-              dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}},
-              make_sources=lambda docs: [], stop_event=stop_event)
-    events = list(p.run(ctx))
-    deltas = [e for e in events if e.get("type") == "answer_delta"]
-    assert [d["text"] for d in deltas][-1:] == ["回答本文"]
-    result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"]["headline"] == "".join(d["text"] for d in deltas)
-
-
-def test_provider_run_single_shot_exception_mid_stream_discards_full_response():
-    """単発ストリーミングは例外発生時、既に flush 済みの本文も含めて全て破棄する
-    （`acc=""` のまま・plan/hybrid の「部分本文は採用」とは異なる本経路従来からの契約・
-    本経路従来からの契約）。held-back な断片も当然 finish() されず破棄される。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    class _MidFail(OpenAIProvider):
-        def _stream(self, prompt):
-            yield "回答"
-            raise RuntimeError("boom mid-stream")
-
-    p = _MidFail("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="影響は?", world="v1", knowledge=True,
-              route=lambda m: {"lens": "impact", "input": m, "reason": "test"},
-              dispatch=lambda lens, inp: {"summary": {"total": 0}, "data": {}},
-              make_sources=lambda docs: [])
-    events = list(p.run(ctx))
-    result = next(e for e in events if e.get("type") == "_result")
-    assert result["env"].get("headline") != "回答"   # 部分応答は headline に残らない（決定的回答へ切替）
-
-
-def test_plain_run_stream_stops_between_chunks_when_stop_event_set():
-    """RV MEDIUM（2026-07-03再検証）: ナレッジ参照オフ（素の会話・_plain_run）でも chunk 受信間で
-    stop_event を確認し、以降のチャンクを消費・yield しない。"""
-    import threading
-
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    stop_event = threading.Event()
-    produced = []
-
-    class _FakeStreamProvider(OpenAIProvider):
-        def _plain_stream(self, message):
-            for i in range(5):
-                produced.append(i)
-                if i == 1:
-                    stop_event.set()
-                yield f"chunk{i}"
-
-    p = _FakeStreamProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="こんにちは", world="v1", knowledge=False,
-              route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-              dispatch=lambda lens, inp: {}, stop_event=stop_event)
-    events = list(p.run(ctx))
-    deltas = [e for e in events if e.get("type") == "answer_delta"]
-    assert produced == [0, 1], f"停止後も _plain_stream から次のチャンクを引き出し続けている: {produced}"
-    assert deltas == [{"type": "answer_delta", "text": "chunk0"}]
-
-
-def test_provider_run_skips_stream_entirely_if_already_stopped_before_start():
-    """発行前チェック: knowledge=False の会話で開始前から stop_event が立っていれば
-    _plain_stream/_stream を1回も呼ばない（無駄な LLM 呼び出しをそもそも発行しない）。"""
-    import threading
-
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    stop_event = threading.Event()
-    stop_event.set()
-    calls = []
-
-    class _FakeStreamProvider(OpenAIProvider):
-        def _plain_stream(self, message):
-            calls.append(1)
-            yield "should not be called"
-
-    p = _FakeStreamProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="こんにちは", world="v1", knowledge=False,
-              route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-              dispatch=lambda lens, inp: {}, stop_event=stop_event)
-    list(p.run(ctx))
-    assert calls == [], "既に停止済みなのに _plain_stream を呼び出してしまっている"
-
-
-def test_provider_agentic_run_folds_personal_facts_into_prompt():
-    """S1確認: personal=True + knowledge=True（agentic/qa）でも個人ファイル内ヒットが LLM プロンプトに
-    折り込まれ、env["_personal_facts"] に残る（chat_service がここから personal_sources を統合する）。
-    HIGH-1 fix（_agentic_run の ctx.personal_facts 注入）の agentic 経路での回帰確認。
-    """
-    from sherpa.agents import Ctx, OpenAIProvider
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    # `body["messages"]` は openai_style 側でループ中に同一リストが破壊的更新されるため、参照を貯めずに
-    # 初回呼び出し時点の user メッセージだけをその場で複製して残す（rv: 参照保存は後続ターンで上書きされる）。
-    captured = {}
-    orig = A._post
-
-    def _capture(url, headers, body, timeout=90):
-        if "first_user_msg" not in captured:
-            captured["first_user_msg"] = str(body["messages"][1]["content"])
-        return seq.pop(0)
-    A._post = _capture
-    try:
-        p = OpenAIProvider("sk-dummy", "gpt-5.5")
-        ctx = Ctx(message="消費税率は?", world="v1", knowledge=True,
-                  route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-                  dispatch=lambda lens, inp: {},
-                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-                  make_sources=lambda docs: [{"doc_id": d} for d in docs],
-                  personal_facts="[個人ファイル: my_notes.txt 行3] 独自のメモ内容XYZ")
-        result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-        env = result["env"]
-        # 初回リクエストの user メッセージに個人ヒットが折り込まれている（LLM が根拠に使える）。
-        first_user_msg = captured["first_user_msg"]
-        assert "独自のメモ内容XYZ" in first_user_msg and "個人ファイル内ヒット" in first_user_msg
-        # chat_service.handle_message はここから personal_sources を統合する（agentic 経路でも欠落しない）。
-        assert env.get("_personal_facts") == "[個人ファイル: my_notes.txt 行3] 独自のメモ内容XYZ"
-    finally:
-        A._post = orig
-
-
-def test_provider_agentic_troubleshoot_cards():
-    """rv-full2 #3 解消: agentic 経路の troubleshoot が graph_neighbors 由来の candidates を env.data に載せる。"""
-    from sherpa import lens_service
-    from sherpa.agents import Ctx, OpenAIProvider
-    # cid（lens_service.neighbor_cards が付与する内部専用の Neo4j canonical_id）が無ければ
-    # 既定 ON の機械検証で構造 Evidence に昇格せず根拠ゲートを通らない（agentic_search.py 参照）。
-    fake = [{"name": "BILLINGJOB", "label": "Module", "category": "プログラム", "role": "実装",
-             "distance": 2, "path": ["請求画面", "BILLINGJOB"], "evidence": {"edges": [], "grep": []},
-             "cid": "module:v1:請求画面/billingjob.cob#BILLINGJOB"}]
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "graph_neighbors", "arguments": '{"name":"請求"}'}}]}}]},
-        {"choices": [{"message": {"content": "請求処理が関係している可能性があります。"}}]},
-    ]
-    o_post, o_nc = A._post, lens_service.neighbor_cards
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    lens_service.neighbor_cards = lambda world, term, sp=None: list(fake)
-    try:
-        p = OpenAIProvider("sk-dummy", "gpt-5.5")
-        ctx = Ctx(message="請求でエラー。原因は?", world="v1", knowledge=True,
-                  route=lambda m: {"lens": "troubleshoot", "input": m, "reason": "test"},
-                  dispatch=lambda lens, inp: {},
-                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-                  make_sources=lambda docs: [])
-        result = next(ev for ev in p.run(ctx) if ev["type"] == "_result")
-        env = result["env"]
-        assert env["lens"] == "troubleshoot"
-        cands = env["data"].get("candidates") or []
-        assert cands and cands[0]["name"] == "BILLINGJOB" and cands[0]["role"] == "実装"
-    finally:
-        A._post, lens_service.neighbor_cards = o_post, o_nc
-
 
 def test_codex_mcp_config_builder():
     """Phase2b: SHERPA_CODEX_MCP フラグ・codex への MCP 設定 -c 引数・MCP プロンプト（事実前渡し無し）を検証。"""
@@ -4317,15 +1703,15 @@ def test_codex_mcp_config_builder():
 def test_mcp_env_includes_effective_arms_and_legacy_backend_snapshot(monkeypatch):
     """W0 Med RV（2026-07-08）: MCP サブプロセスは PG creds を持たない（`_MCP_PASSTHROUGH` に非含）ため
     system_settings を読めず env フォールバックに落ちる。親（API リクエスト時点）の**実効値スナップショット**
-    を SHERPA_ARMS/SHERPA_LEGACY_BACKEND として渡すことで、サブプロセス側は env フォールバックだけで
+    を SHERPA_MCP_ARMS/SHERPA_MCP_LEGACY_BACKEND として渡すことで、サブプロセス側は env フォールバックだけで
     親と同じ実効値に一致する（list_docs の convertible 判定が grep とずれる、といった不一致を防ぐ）。
     SHERPA_TESSERACT_BIN の透過は tesseract の `ocr` アーム撤去（2026-07-08）に伴い削除した。"""
     from sherpa import agents, store
     monkeypatch.setattr(store, "get_system_settings",
                         lambda: {"arms_enabled": ["ooxml"], "legacy_backend": "libreoffice"})
     env = agents._mcp_env("v1", None)
-    assert env["SHERPA_ARMS"] == "ooxml"                       # 実効アーム（system_settings 反映済）
-    assert env["SHERPA_LEGACY_BACKEND"] == "libreoffice"       # 実効バックエンド（system_settings 反映済）
+    assert env["SHERPA_MCP_ARMS"] == "ooxml"                       # 実効アーム（system_settings 反映済）
+    assert env["SHERPA_MCP_LEGACY_BACKEND"] == "libreoffice"       # 実効バックエンド（system_settings 反映済）
     assert "SHERPA_TESSERACT_BIN" not in env                   # もう透過しない（撤去済み env）
 
 
@@ -4416,441 +1802,6 @@ def test_mcp_neighbors_from_stream_item():
     assert agents._mcp_neighbors_from({"result": {"content": [{"text": "{ broken"}]}}) == []   # 壊れ JSON
     assert agents._mcp_neighbors_from({"result": None}) == []                                   # 形が違う
     assert agents._mcp_neighbors_from({}) == []
-
-
-def test_provider_agentic_run_yields_question():
-    from sherpa.agents import Ctx, OpenAIProvider
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ask_user", "arguments": '{"prompt":"範囲を選んでください","mode":"single","options":[{"label":"全体"},{"label":"設計"}]}'}}]}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        p = OpenAIProvider("sk-dummy", "gpt-5.5")
-        ctx = Ctx(message="調べて", world="v1", knowledge=True,
-                  route=lambda m: {"lens": "qa", "input": m, "reason": "test"},
-                  dispatch=lambda lens, inp: {},
-                  scope_meta={"world": "v1", "scope_paths": [], "source": "all"},
-                  make_sources=lambda docs: [])
-        events = list(p.run(ctx))
-        q = next(e for e in events if e.get("type") == "question")
-        assert q["prompt"] == "範囲を選んでください"
-        assert not any(e.get("type") == "_result" for e in events)
-    finally:
-        A._post = orig
-
-
-# ---- anthropic_style（Bedrock/Claude の手動ツールループ・fake クライアント）----
-
-class _ABlock:
-    def __init__(self, type, text=None, name=None, input=None, id=None):
-        self.type, self.text, self.name, self.input, self.id = type, text, name, input, id
-
-
-class _AResp:
-    def __init__(self, content, stop_reason="end_turn"):
-        self.content, self.stop_reason = content, stop_reason
-
-
-class _AMessages:
-    def __init__(self, seq):
-        self._seq, self.calls = list(seq), []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._seq.pop(0)
-
-
-class _AClient:
-    def __init__(self, seq):
-        self.messages = _AMessages(seq)
-
-
-_BANNED = ("temperature", "top_p", "top_k", "thinking")
-
-
-def test_anthropic_tools_from_openai_conversion():
-    conv = A.anthropic_tools_from_openai(A.graph_openai_tools())
-    assert conv and conv[0]["name"] == "graph_neighbors"
-    assert conv[0]["input_schema"]["type"] == "object"              # parameters → input_schema（同形）
-    assert "parameters" not in conv[0] and "function" not in conv[0]
-
-
-def test_anthropic_style_tool_loop_two_turns():
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "TAX-RATE で管理しています。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    nodes, final = [], None
-    for ev in A.anthropic_style(client, "anthropic.claude-opus-4-8", A.SYSTEM, "消費税率は?", "v1", None):
-        (nodes.append(ev["node"]) if "node" in ev else None)
-        if "final" in ev:
-            final = ev
-    assert final and "TAX-RATE" in final["final"] and final["docs"] and final["searched"]
-    assert any("資料を検索" in n["label"] for n in nodes)
-    # tool_use → tool_result → end_turn の2周＋帰属呼び出し1回（citation が実在すれば digest が
-    # 非空になり発火する・fake の seq 切れは attribute_anthropic 側で安全に空集合へ縮退する）。
-    assert len(client.messages.calls) == 3
-    for kw in client.messages.calls[:2]:                            # temperature/top_p/top_k/thinking は送らない
-        assert all(b not in kw for b in _BANNED)
-        assert kw["max_tokens"]                                     # max_tokens 必須
-    msgs2 = client.messages.calls[1]["messages"]                    # 2回目: 末尾は tool_result を束ねた user
-    assert msgs2[-1]["role"] == "user"
-    assert all(b["type"] == "tool_result" for b in msgs2[-1]["content"])
-
-
-def test_anthropic_style_drops_nonexistent_doc_citation_via_commit_gate(monkeypatch):
-    """Anthropic 経路も `openai_style` と同じ Committed Evidence 化ゲートを通る（機械検証で実在しない
-    doc の citation を落とす・全滅時は stop_reason が evidence_verification_failed になる）。"""
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {"ghost.md"}, [{"doc_id": "ghost.md", "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "回答です。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    final = None
-    for ev in A.anthropic_style(client, "anthropic.claude-opus-4-8", A.SYSTEM, "質問", "v1", None):
-        if "final" in ev:
-            final = ev
-    assert final["cites"] == []
-    assert final["stop_reason"] == "evidence_verification_failed"
-
-
-def test_anthropic_style_mixed_valid_and_invalid_citations_resynthesizes_clean_body(monkeypatch):
-    """検証で一部 citation が落ちた（実在 doc 1件＋存在しない doc 1件の混在）場合、Anthropic 経路も
-    `openai_style` と同じ「Committed Evidence だけからのクリーン再合成」を行う。落ちた doc に触れた
-    最初の draft 本文は使わず、再合成呼び出しは tools 無し・ツール結果履歴も含まない最小コンテキスト
-    （`history` 省略時は user メッセージ1件だけ）で行う。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc, "ghost.md"},
-        [{"doc_id": real_doc, "span": [1, 1], "quote": "実在", "ext": ".md"},
-         {"doc_id": "ghost.md", "span": [1, 1], "quote": "存在しない", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "ghost.md にも記載があります（古い草稿）。")], stop_reason="end_turn"),
-        _AResp([_ABlock("text", "確認できた根拠に基づく回答です。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    final = None
-    for ev in A.anthropic_style(client, "anthropic.claude-opus-4-8", A.SYSTEM, "質問", "v1", None):
-        if "final" in ev:
-            final = ev
-    # tool turn + no-tool draft + クリーン再合成 + 帰属呼び出し1回（citation が1件残るため digest
-    # が非空になり発火する・fake の seq 切れは attribute_anthropic 側で安全に空集合へ縮退する）。
-    assert len(client.messages.calls) == 4
-    assert [c["doc_id"] for c in final["cites"]] == [real_doc]
-    assert final["final"] == "確認できた根拠に基づく回答です。"
-    assert "ghost.md" not in final["final"] and "古い草稿" not in final["final"]
-    resynth_call = client.messages.calls[-2]
-    assert "tools" not in resynth_call          # これ以上ツールを呼ばせない
-    assert len(resynth_call["messages"]) == 1   # history 省略＝再合成用 user メッセージ1件だけ
-    assert resynth_call["messages"][0]["role"] == "user"
-    assert "ghost.md" not in resynth_call["messages"][0]["content"]
-    assert real_doc in resynth_call["messages"][0]["content"]
-
-
-def test_anthropic_style_graph_neighbors_requires_verified_backing_doc_for_structural_evidence(monkeypatch):
-    """Anthropic 経路でも card の存在だけでは `has_structural_evidence` を立てない——裏付け doc
-    （`evidence.grep[].doc_id`）が world 内に実在するときだけ構造的根拠として数える。`run_tool`
-    がカード単位で検証済みの doc_id 集合を返す契約なので、fake もその契約に合わせる。"""
-    real_doc = "4期/04_運用/障害記録.md"
-
-    def fake_run_tool_verified(name, args, world, scope_paths, **kw):
-        # 実 run_tool は裏付け doc を検証済みで card 自身に `_verified_doc_ids` として同梱してから
-        # 返す契約（`_card_structural_evidence` はこれを見る・自前で再検証しない）。
-        return ({"nodes": []}, {real_doc}, [],
-               [{"name": "n1", "label": "L1", "evidence": {"grep": [{"doc_id": real_doc}], "edges": []},
-                 "_verified_doc_ids": [real_doc]}])
-
-    def fake_run_tool_unverified(name, args, world, scope_paths, **kw):
-        # 実 run_tool は裏付け doc が1件も実在しない card を cards・docs の両方から除外して返す。
-        return ({"nodes": []}, set(), [], [])
-
-    seq = [
-        _AResp([_ABlock("tool_use", name="graph_neighbors", input={"name": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "グラフから確認しました。")], stop_reason="end_turn"),
-    ]
-    orig_run_tool = A.run_tool
-    A.run_tool = fake_run_tool_verified
-    try:
-        client = _AClient(seq)
-        final = next(ev for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None)
-                    if "final" in ev)
-        assert final["has_structural_evidence"] is True
-        assert [m["matched_doc_ids"] for m in final["structural_evidence_meta"]] == [[real_doc]]
-        assert final["structural_evidence_meta"][0]["doc_id"] is None
-        assert final["structural_evidence_meta"][0]["verification_method"] == "graph_verified"
-    finally:
-        A.run_tool = orig_run_tool
-
-    seq2 = [
-        _AResp([_ABlock("tool_use", name="graph_neighbors", input={"name": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "グラフから確認しました。")], stop_reason="end_turn"),
-    ]
-    A.run_tool = fake_run_tool_unverified
-    try:
-        client = _AClient(seq2)
-        final = next(ev for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None)
-                    if "final" in ev)
-        assert final["has_structural_evidence"] is False   # 裏付け doc が実在しない card は数えない
-        assert final["structural_evidence_meta"] == []
-    finally:
-        A.run_tool = orig_run_tool
-
-
-def test_anthropic_style_attribution_call_marks_used_evidence_docs(monkeypatch):
-    """EV-0（拡張設計 §4.4・設計簡素化）: Anthropic 経路は本文に根拠申告用の制御構文を一切書かせず、
-    確定した回答本文の完了後に別の非ストリーム呼び出し（`submit_attribution` の tool 強制呼び出し）
-    で帰属を判定する。ストリーム/本文は byte-identical のまま・`used_evidence_docs` は帰属呼び出し
-    の結果を ev-N→doc_id 逆引きしたもの。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "回答です。")], stop_reason="end_turn"),
-        _AResp([_ABlock("tool_use", name="submit_attribution", input={"used": ["ev-1"]}, id="tu2")],
-               stop_reason="tool_use"),
-    ]
-    client = _AClient(seq)
-    final = None
-    for ev in A.anthropic_style(client, "anthropic.claude-opus-4-8", A.SYSTEM, "質問", "v1", None):
-        if "final" in ev:
-            final = ev
-    assert final["final"] == "回答です。"   # 本文は一切変更しない（byte-identical）
-    assert final["used_evidence_docs"] == {real_doc}
-    assert final["attributed_ev_ids"] == {"ev-1"}
-    attribution_call = client.messages.calls[-1]
-    assert attribution_call["tools"][0]["name"] == "submit_attribution"
-    assert attribution_call["tool_choice"] == {"type": "tool", "name": "submit_attribution"}
-    assert "回答です。" in attribution_call["messages"][0]["content"]   # 確定した回答本文を渡す
-    assert "ev-1" in attribution_call["messages"][0]["content"]        # Evidence digest も渡す
-
-
-def test_anthropic_style_stop_event_set_after_final_response_skips_attribution(monkeypatch):
-    """最終応答（end_turn）が返ってきた直後に停止要求が来た場合、帰属呼び出し
-    （`submit_attribution`）は発行しない——帰属**直前**の再確認で捕捉する。"""
-    import threading
-    stop_event = threading.Event()
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "回答です。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    orig_create = client.messages.create
-
-    def spying_create(**kwargs):
-        resp = orig_create(**kwargs)
-        if len(client.messages.calls) == 2:
-            stop_event.set()   # 最終応答が返った直後に停止要求が来た、を模す
-        return resp
-
-    client.messages.create = spying_create
-    final = None
-    for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None, stop_event=stop_event):
-        if "final" in ev:
-            final = ev
-    assert len(client.messages.calls) == 2   # 帰属（3回目）は発行されない
-    assert final["final"] == "回答です。"
-    assert final["attributed_ev_ids"] == set()
-
-
-@pytest.mark.parametrize("stop_reason,content", [
-    # `stop_reason=="max_tokens"`（打ち切り＝未完了）で終わった応答は、たとえ本文が
-    # あっても帰属呼び出しを発行しない。
-    ("max_tokens", "途中で切れた回答"),
-    # `stop_reason` が欠落（None）した応答は、自然完了 allowlist（"end_turn"/"stop_sequence"）に
-    # 無いためすべて未完了扱い——旧 denylist 期待（理由欠落でも帰属成功）を反転する固定。
-    (None, "理由欠落の回答"),
-    # `stop_reason` が文字列でない（壊れた SDK/upstream 応答が dict 等を返した）場合、
-    # `getattr(resp, "stop_reason", None)` はそのまま非文字列値を返す（ラッパー関数を経由しない）が、
-    # `_is_natural_completion` の isinstance ガードで例外にならず、本文配信・`_result` 生成は完走し
-    # 帰属呼び出しも発行しない。
-    ({"unexpected": "shape"}, "壊れた完了理由の回答"),
-])
-def test_anthropic_style_non_natural_completion_skips_attribution(monkeypatch, stop_reason, content):
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc}, [{"doc_id": real_doc, "span": [1, 1], "quote": "x", "ext": ".md"}], []))
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "x"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", content)], stop_reason=stop_reason),
-    ]
-    client = _AClient(seq)
-    final = None
-    for ev in A.anthropic_style(client, "m", A.SYSTEM, "質問", "v1", None):
-        if "final" in ev:
-            final = ev
-    assert len(client.messages.calls) == 2   # 帰属（3回目）は発行されない
-    assert final["final"] == content
-    assert final["attributed_ev_ids"] == set()
-
-
-def test_anthropic_style_stops_between_turns_when_stop_event_set_mid_flight():
-    """RV MEDIUM（2026-07-03再検証）: 1ターン目の応答が返ってきた直後に停止要求が来たケース＝
-    2ターン目のリクエストは発行しない（openai_style/gemini と同じ意味論）。"""
-    import threading
-
-    stop_event = threading.Event()
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "TAX-RATE で管理しています。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    orig_create = client.messages.create
-
-    def _create(**kwargs):
-        resp = orig_create(**kwargs)
-        stop_event.set()   # 1ターン目のレスポンスが返った直後に停止ボタンが押された、を模す
-        return resp
-
-    client.messages.create = _create
-    events = list(A.anthropic_style(client, "m", A.SYSTEM, "消費税率は?", "v1", None, stop_event=stop_event))
-    assert len(client.messages.calls) == 1, "停止後も2ターン目のリクエストが発行されている"
-    assert not any("final" in ev for ev in events), "停止時に final を yield すべきでない"
-
-
-def test_anthropic_style_returns_immediately_if_already_stopped():
-    """開始前から stop_event が立っていれば、1回も client.messages.create を呼ばない。"""
-    import threading
-
-    stop_event = threading.Event()
-    stop_event.set()
-    client = _AClient([])   # 空シーケンス＝呼ばれたら IndexError になるはず
-    events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None, stop_event=stop_event))
-    assert events == []
-    assert client.messages.calls == []
-
-
-def test_anthropic_style_cumulative_tool_result_bytes_cap_terminates_run(monkeypatch):
-    """secRV MED-B (c): 1 run 累計の tool-result バイト量が上限を超えたら、固定エラーで
-    run を打ち切る（3 dialect 共通の是正）。"""
-    monkeypatch.setattr(A, "TOOL_RESULT_MAX_TOTAL_BYTES", 10)
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "not reached")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    events = list(A.anthropic_style(client, "m", A.SYSTEM, "消費税率は?", "v1", None))
-    assert len(client.messages.calls) == 1   # 1回目のツール結果だけで上限超過＝2ターン目へは進まない
-    assert any(ev.get("node", {}).get("label") == "ツール結果の合計サイズ上限" for ev in events)
-    final = next(ev for ev in events if "final" in ev)
-    assert final["final"] == ""
-
-
-def test_anthropic_style_parallel_tool_results_single_user_message():
-    seq = [
-        _AResp([_ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu1"),
-                _ABlock("tool_use", name="ripgrep_search", input={"query": "税率"}, id="tu2")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "まとめました。")], stop_reason="end_turn"),
-    ]
-    client = _AClient(seq)
-    list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None))
-    msgs2 = client.messages.calls[1]["messages"]
-    tr = [m for m in msgs2 if m["role"] == "user" and isinstance(m["content"], list)
-          and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])]
-    assert len(tr) == 1 and len(tr[-1]["content"]) == 2             # 並列 tool_use は **1つの** user に束ねる
-    assert {b["tool_use_id"] for b in tr[-1]["content"]} == {"tu1", "tu2"}
-
-
-def test_anthropic_style_refusal_branch():
-    client = _AClient([_AResp([], stop_reason="refusal")])
-    evs = list(A.anthropic_style(client, "m", A.SYSTEM, "q", "v1", None))
-    final = next(e for e in evs if "final" in e)
-    assert final["searched"] is False and "控え" in final["final"]  # refusal は安全に終了（回答を控える）
-    assert final["stop_reason"] == "refusal"   # STOP-1: 到達可能経路の閉じた語彙を固定
-
-
-def test_anthropic_style_ask_user_stub():
-    seq = [_AResp([_ABlock("tool_use", name="ask_user", id="a1", input={
-        "prompt": "範囲は？", "mode": "single", "options": [{"label": "全体"}, {"label": "設計"}]})],
-        stop_reason="tool_use")]
-    client = _AClient(seq)
-    evs = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None))
-    q = next(e["question"] for e in evs if "question" in e)
-    assert q["mode"] == "single" and [o["label"] for o in q["options"]] == ["全体", "設計"]
-    assert not any("final" in e for e in evs)
-
-
-def test_anthropic_style_mixed_tool_use_and_ask_user_discards_prior_results():
-    """Codex RV major: 同一応答内で tool_use（先）＋ ask_user（後）が並列で返るケース。
-
-    意味論（コード内コメント参照・openai_style/gemini と同一・意図的）: ask_user は question 優先。
-    先に実行済みの ripgrep_search は run_tool までは呼ばれる（副作用として実行される）が、
-    その結果（docs/cites/cards）は呼び出し元に一切渡らない（`final` イベントを yield しない）
-    ＝次ターンは新規メッセージとしてフロントから再送され、検索し直す設計なので実害はない。
-    """
-    seq = [_AResp([
-        _ABlock("tool_use", name="ripgrep_search", input={"query": "TAX-RATE"}, id="tu1"),
-        _ABlock("tool_use", name="ask_user", id="tu2", input={
-            "prompt": "範囲は？", "mode": "single", "options": [{"label": "全体"}, {"label": "設計"}]}),
-    ], stop_reason="tool_use")]
-    client = _AClient(seq)
-    calls = []
-    orig_run_tool = A.run_tool
-    A.run_tool = lambda name, args, world, scope_paths, **kw: (
-        calls.append(name),
-        orig_run_tool(name, args, world, scope_paths))[1]
-    try:
-        evs = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None))
-    finally:
-        A.run_tool = orig_run_tool
-    assert calls == ["ripgrep_search"]                              # 先行ツールは実行される（副作用）
-    q = next(e["question"] for e in evs if "question" in e)
-    assert q["mode"] == "single" and [o["label"] for o in q["options"]] == ["全体", "設計"]
-    assert not any("final" in e for e in evs)                       # 実行済み結果は final に出ず破棄される
-    node_labels = [e["node"]["label"] for e in evs if "node" in e]
-    # run_tool 実行後に「検索結果（語句そのまま）」（ヒット件数の追加ノード）がもう1件挟まる
-    # （`_hit_summary_node` 参照）。
-    assert node_labels == ["資料を検索（語句そのまま）", "検索結果（語句そのまま）", "ユーザに確認"]   # 3ノードとも流れる（UI 表示用）
-
-
-def test_openai_style_mixed_tool_calls_and_ask_user_discards_prior_results():
-    """anthropic_style と同じ「question 優先・先行結果は破棄」意味論が openai_style にも一貫している検証。"""
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}},
-        {"id": "c2", "function": {"name": "ask_user", "arguments":
-         '{"prompt":"範囲は？","mode":"single","options":[{"label":"全体"},{"label":"設計"}]}'}},
-    ]}}]}]
-    orig_post, orig_run_tool = A._post, A.run_tool
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    calls = []
-    A.run_tool = lambda name, args, world, scope_paths, **kw: (
-        calls.append(name),
-        orig_run_tool(name, args, world, scope_paths))[1]
-    try:
-        evs = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None))
-    finally:
-        A._post, A.run_tool = orig_post, orig_run_tool
-    assert calls == ["ripgrep_search"]
-    q = next(e["question"] for e in evs if "question" in e)
-    assert q["mode"] == "single"
-    assert not any("final" in e for e in evs)                       # anthropic_style と同一の破棄意味論
-
-
-def test_anthropic_style_accepts_client_factory():
-    client = _AClient([_AResp([_ABlock("text", "直接回答。")], stop_reason="end_turn")])
-    final = next(e for e in A.anthropic_style(lambda: client, "m", A.SYSTEM, "q", "v1", None) if "final" in e)
-    assert final["final"] == "直接回答。" and final["searched"] is False   # factory（callable）でも動く
-    assert final["stop_reason"] == "no_tool_calls"   # STOP-1: 到達可能経路の閉じた語彙を固定
 
 
 def test_pdf_doc_id_resolves_to_derived_md():
@@ -4955,22 +1906,6 @@ def test_safe_doc_path_rejects_sensitive_office_original_name(monkeypatch, tmp_p
     resolved = A._safe_doc_path("w", "normal.docx")
     assert resolved is not None
     assert resolved[2].name == "normal.docx.md"
-
-
-def test_safe_doc_path_ignores_rag_when_disabled(monkeypatch, tmp_path):
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・env では OFF にできない。
-    `grep_tool.rag_grep_enabled` は今も内部シームとして残るため、直接差し替えて False 分岐
-    （rag.md の実在に関わらず legacy 版を開く）を引き続き検証する。"""
-    (tmp_path / "report.docx.md").write_text("legacy", encoding="utf-8")
-    (tmp_path / "report.docx.rag.md").write_text("rag", encoding="utf-8")
-    monkeypatch.setattr(A.worlds, "derived_md_dir", lambda w: tmp_path)
-    monkeypatch.setattr(A.grep_tool, "rag_grep_enabled", lambda: False)
-
-    resolved = A._safe_doc_path("w", "report.docx")
-    assert resolved is not None
-    root, lexical_rel, p = resolved
-    assert lexical_rel == "report.docx.md" and p.name == "report.docx.md"
-    assert p.read_text(encoding="utf-8") == "legacy"
 
 
 def test_safe_doc_path_none_when_neither_rag_nor_legacy_exist(monkeypatch, tmp_path):
@@ -5231,226 +2166,7 @@ def test_grep_and_read_around_agree_on_rag_priority_when_enabled(monkeypatch, tm
     assert "report.docx" in docs2
 
 
-def test_grep_and_read_around_agree_on_legacy_when_disabled(monkeypatch, tmp_path):
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・env では OFF にできない。
-    `grep_tool.rag_grep_enabled` は今も内部シームとして残るため、直接差し替えて False 分岐
-    （grep も read_around も従来どおり legacy だけを見る・回帰なし）を引き続き検証する。"""
-    world = "align-legacy-world"
-    world_root = tmp_path / "kb" / world
-    world_root.mkdir(parents=True)
-    der = tmp_path / "derived" / world / "md"
-    der.mkdir(parents=True)
-    (der / "report.docx.md").write_text("legacy 本文 TAX-RATE 旧版\n", encoding="utf-8")
-    (der / "report.docx.rag.md").write_text("## 概要\nrag 本文 TAX-RATE 新版\n", encoding="utf-8")
-    monkeypatch.setattr(A.worlds, "world_dir", lambda w: world_root)
-    monkeypatch.setattr(A.worlds, "derived_md_dir", lambda w: der)
-    monkeypatch.setattr(A.worlds, "observation_current_dir", lambda w: None)
-    monkeypatch.setattr(A.grep_tool, "rag_grep_enabled", lambda: False)
-
-    res, _, _, _ = A.run_tool("ripgrep_search", {"query": "TAX-RATE"}, world, None)
-    assert len(res["hits"]) == 1
-    hit = res["hits"][0]
-    assert hit["doc_id"] == "report.docx"
-
-    r2, _, _, _ = A.run_tool(
-        "read_around", {"doc_id": hit["doc_id"], "line": hit["line"], "window": 2}, world, None)
-    assert "error" not in r2
-    assert "legacy 本文" in r2["text"]
-    assert "rag 本文" not in r2["text"]
-
-
-def test_list_docs_registered_in_all_three_drivers_with_same_schema():
-    """RV LOW（S1）: list_docs が3ドライバ全てのツール定義に同一の説明/スキーマで含まれることを固定する。
-    特に Anthropic は openai_tools からの変換経路なので、provider toolset から落ちる回帰を検出する。"""
-    ot = A.openai_tools(with_es=True, with_graph=True)
-    o = next((t["function"] for t in ot if t["function"]["name"] == "list_docs"), None)
-    assert o is not None, "openai_tools に list_docs が無い"
-
-    gt = A.gemini_tools(with_es=True, with_graph=True)
-    g = next((f for f in gt[0]["functionDeclarations"] if f["name"] == "list_docs"), None)
-    assert g is not None, "gemini_tools に list_docs が無い"
-
-    at = A.anthropic_tools_from_openai(ot)
-    a = next((t for t in at if t["name"] == "list_docs"), None)
-    assert a is not None, "anthropic 変換後に list_docs が無い"
-
-    # 説明・スキーマが3経路で同一（単一の真実源 _DESC/_PARAMS からのブレを検出）。
-    assert o["description"] == g["description"] == a["description"]
-    assert o["parameters"] == g["parameters"] == a["input_schema"]
-
-
-def test_tools_omit_ask_user_when_cannot_ask():
-    """Med-1（RV・2026-07-07）: can_ask=False（依頼に「確認ID:」を含む回答再送）では ask_user ツール自体を
-    渡さない＝再質問ループを構造的に塞ぐ（3ドライバ）。既定（can_ask=True）は従来どおり ask_user を含む。"""
-    # OpenAI: can_ask=False で ask_user なし・True（既定）で含む。他ツールは残る（read_around 等）。
-    ot_no = A.openai_tools(with_es=True, with_graph=True, can_ask=False)
-    assert not any(t["function"]["name"] == "ask_user" for t in ot_no)
-    assert any(t["function"]["name"] == "read_around" for t in ot_no)
-    assert any(t["function"]["name"] == "ask_user" for t in A.openai_tools())
-
-    # Gemini: 同上。
-    gt_no = A.gemini_tools(with_es=True, with_graph=True, can_ask=False)
-    assert not any(f["name"] == "ask_user" for f in gt_no[0]["functionDeclarations"])
-    assert any(f["name"] == "ask_user" for f in A.gemini_tools()[0]["functionDeclarations"])
-
-    # Anthropic は openai_tools 変換経路＝can_ask=False の toolset を渡せば ask_user は落ちる。
-    at_no = A.anthropic_tools_from_openai(ot_no)
-    assert not any(t["name"] == "ask_user" for t in at_no)
-
-
 # ===== SC-6e: 検索経路トグル（grep/fulltext(ES)/graph）=====
-
-def test_openai_tools_with_grep_false_omits_ripgrep_but_keeps_base_tools():
-    """`with_grep=False`（既定 True）で ripgrep_search だけが落ち、
-    list_docs/doc_outline/read_doc/read_around/ask_user は残る。
-    SC-6e: 順序も含めて固定する（`insert_at` の計算違いを set 比較では検出できない）。"""
-    t = A.openai_tools(with_es=True, with_graph=True, with_grep=False)
-    names = [x["function"]["name"] for x in t]
-    assert names == ["list_docs", "folder_tree", "graph_neighbors", "es_search", "doc_outline", "read_doc",
-                     "read_around", "compare_documents", "xlsx_sheets", "xlsx_range", "docx_paragraphs",
-                     "pptx_slides", "pdf_pages", "file_head", "ask_user"]
-    # 既定（省略）は従来どおり grep（＋同居する glob_search）を含み、正準順（list_docs→
-    # folder_tree→ripgrep_search→glob_search→graph_neighbors→es_search→doc_outline→read_doc→
-    # read_around→compare_documents→原本読取ツール6本(S3b)→ask_user）のまま。
-    assert [x["function"]["name"] for x in A.openai_tools(with_es=True, with_graph=True)] == [
-        "list_docs", "folder_tree", "ripgrep_search", "glob_search", "graph_neighbors", "es_search",
-        "doc_outline", "read_doc", "read_around", "compare_documents", "xlsx_sheets", "xlsx_range",
-        "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head", "ask_user"]
-
-
-def test_gemini_tools_with_grep_false_omits_ripgrep_but_keeps_base_tools():
-    fns = A.gemini_tools(with_es=True, with_graph=True, with_grep=False)[0]["functionDeclarations"]
-    names = [f["name"] for f in fns]
-    assert names == ["list_docs", "folder_tree", "graph_neighbors", "es_search", "doc_outline", "read_doc",
-                     "read_around", "compare_documents", "xlsx_sheets", "xlsx_range", "docx_paragraphs",
-                     "pptx_slides", "pdf_pages", "file_head", "ask_user"]
-
-
-def test_openai_style_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
-    """`toolset` 省略時のデフォルト構築（`openai_tools(...)`）が `tools_pref` を反映する
-    （ES/Neo4j 到達可否ゲートとの AND・§3.6）。実際に `_post` へ送る body["tools"] を
-    順序付き list で検証する（SC-6e・set 化すると順序回帰を検出できない）。"""
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    captured = {}
-
-    def fake_post(url, headers, body, timeout=90):
-        captured["names"] = [t["function"]["name"] for t in body["tools"]]
-        return {"choices": [{"message": {"content": "回答", "finish_reason": "stop"}}]}
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None,
-                        tools_pref={"grep": False, "fulltext": True, "graph": True}))
-    assert captured["names"] == ["list_docs", "folder_tree", "graph_neighbors", "es_search", "doc_outline",
-                                 "read_doc", "read_around", "compare_documents", "xlsx_sheets", "xlsx_range",
-                                 "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head", "ask_user"]
-
-
-def test_openai_style_tools_pref_none_keeps_existing_default_behavior(monkeypatch):
-    """`tools_pref` 省略（None）は全ON＝既存呼び出し元と byte-identical（ES/Neo4j 到達可否のみで決まる）。
-    順序も基点（list_docs→folder_tree→ripgrep_search→glob_search→graph_neighbors→es_search→
-    doc_outline→read_doc→read_around→compare_documents→ask_user）と一致する。"""
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    captured = {}
-
-    def fake_post(url, headers, body, timeout=90):
-        captured["names"] = [t["function"]["name"] for t in body["tools"]]
-        return {"choices": [{"message": {"content": "回答", "finish_reason": "stop"}}]}
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None))
-    assert captured["names"] == ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "graph_neighbors",
-                                 "es_search", "doc_outline", "read_doc", "read_around",
-                                 "compare_documents", "xlsx_sheets", "xlsx_range", "docx_paragraphs",
-                                 "pptx_slides", "pdf_pages", "file_head", "ask_user"]
-
-
-def test_gemini_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    captured = {}
-
-    def fake_post(url, headers, body, timeout=90):
-        fns = body["tools"][0]["functionDeclarations"]
-        captured["names"] = [f["name"] for f in fns]
-        return {"candidates": [{"content": {"parts": [{"text": "回答"}]}, "finishReason": "STOP"}]}
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None,
-                  tools_pref={"grep": True, "fulltext": False, "graph": True}))
-    assert captured["names"] == ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "graph_neighbors",
-                                 "doc_outline", "read_doc", "read_around", "compare_documents",
-                                 "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
-                                 "pdf_pages", "file_head", "ask_user"]
-
-
-def test_anthropic_style_tools_pref_default_toolset_excludes_off_tools(monkeypatch):
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    captured = {}
-
-    class FakeResp:
-        stop_reason = "end_turn"
-        content = [type("Blk", (), {"type": "text", "text": "回答"})()]
-        usage = None
-
-    class FakeClient:
-        class messages:
-            @staticmethod
-            def create(**kwargs):
-                captured["names"] = [t["name"] for t in kwargs["tools"]]
-                return FakeResp()
-
-    list(A.anthropic_style(FakeClient(), "m", A.SYSTEM, "質問", "v1", None,
-                           tools_pref={"grep": True, "fulltext": True, "graph": False}))
-    assert captured["names"] == ["list_docs", "folder_tree", "ripgrep_search", "glob_search", "es_search",
-                                 "doc_outline", "read_doc", "read_around", "compare_documents",
-                                 "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
-                                 "pdf_pages", "file_head", "ask_user"]
-
-
-def test_openai_style_explicit_toolset_skips_availability_check(monkeypatch):
-    """SC-6e: `toolset` を明示指定した呼び出し（検索アシスタント等）は `tool_availability()`
-    （ひいては ES/Neo4j への実接続チェック）を一切呼ばない——`toolset` は既に確定済みのツール
-    定義配列のため、`tools_pref`/`tools_availability` のどちらを省略しても再確認は不要。"""
-    calls = _counting_probe(monkeypatch)
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: {
-        "choices": [{"message": {"content": "回答", "finish_reason": "stop"}}]})
-    fixed_toolset = [{"type": "function", "function": {
-        "name": "ripgrep_search", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
-    list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None, toolset=fixed_toolset))
-    assert calls == {"es": 0, "graph": 0}
-
-
-def test_gemini_explicit_toolset_skips_availability_check(monkeypatch):
-    calls = _counting_probe(monkeypatch)
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: {
-        "candidates": [{"content": {"parts": [{"text": "回答"}]}, "finishReason": "STOP"}]})
-    fixed_toolset = [{"functionDeclarations": [
-        {"name": "ripgrep_search", "description": "d", "parameters": {"type": "object", "properties": {}}}]}]
-    list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None, toolset=fixed_toolset))
-    assert calls == {"es": 0, "graph": 0}
-
-
-def test_anthropic_style_explicit_toolset_skips_availability_check(monkeypatch):
-    calls = _counting_probe(monkeypatch)
-
-    class FakeResp:
-        stop_reason = "end_turn"
-        content = [type("Blk", (), {"type": "text", "text": "回答"})()]
-        usage = None
-
-    class FakeClient:
-        class messages:
-            @staticmethod
-            def create(**kwargs):
-                return FakeResp()
-
-    fixed_toolset = [{"type": "function", "function": {
-        "name": "ripgrep_search", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
-    list(A.anthropic_style(FakeClient(), "m", A.SYSTEM, "質問", "v1", None, toolset=fixed_toolset))
-    assert calls == {"es": 0, "graph": 0}
 
 
 # ===== SC-6e: 可用性の実接続判定（UI/実行側の共有） =====
@@ -5526,17 +2242,6 @@ def test_tool_availability_ttl_expiry_triggers_recheck(monkeypatch):
     A._tools_availability_cache["at"] -= (A._TOOLS_AVAILABILITY_TTL + 1)
     refreshed = A.tool_availability()
     assert refreshed == {"grep": True, "fulltext": True, "graph": True}
-
-
-def test_tools_availability_ttl_env_rejects_invalid_values_at_import():
-    """TTL は正の有限値に限定し、不正値（0/負値/NaN/inf/非数値）は起動時（import時）に明示
-    エラーで落ちる——他の env 駆動チューニング値（`es_index._env_float` 等）のような黙った
-    クランプはしない。TTL がプローブ所要時間以下だと待機側が毎回「期限切れ」と誤判定し、
-    single-flight（同時 miss の集約）が静かに壊れるため、不正値は fail-closed にする。"""
-    for bad in ("0", "-1", "nan", "inf", "abc"):
-        stderr = FI.fresh_import_fails("sherpa.agentic_search",
-                                       env={"SHERPA_TOOLS_AVAILABILITY_TTL": bad})
-        assert "SHERPA_TOOLS_AVAILABILITY_TTL" in stderr, f"bad={bad!r} stderr={stderr}"
 
 
 def test_tool_availability_records_at_after_probe_completes(monkeypatch):
@@ -5701,152 +2406,7 @@ def test_dispatch_tools_for_lens_availability_omitted_means_fully_available():
     assert blocked is False
 
 
-# ===== SC-6e: 検索経路トグルに応じた SYSTEM/description の組み立て =====
-
-# SC-6e: `system_prompt()`/`_desc_es`/`_desc_graph` は全ON実装が「対応する定数をそのまま
-# 返す」だけ（`if grep and fulltext and graph: return SYSTEM` 等）のため、`is A.SYSTEM`/
-# `== A._DESC_ES` の自己参照比較は SYSTEM/_DESC_ES/_DESC_GRAPH の中身が何であっても必ず通る恒真式
-# になり、意図しない内容変化を検出できない。固定 byte 長＋SHA-256（独立の golden）で比較する。
-# `_SYSTEM_GOLDEN_*` は現在の SYSTEM の中身（glob_search の使いどころ・「語句そのまま検索」表記を
-# 含む）に対する固定値——中身を変えたらここも更新する（golden の意図は「意図しない変化を検知
-# する」ことであって、特定の過去の値に固定し続けることではない）。
-# 契約変更（2026-09-10・API 経路も絞らない方針へ）: 回答を「簡潔（2〜4文）」に絞る指示を撤去し、
-# 「長さは絞らない／一覧は全件パス付き／確定と推定を分けて推定を明示する」へ置換したため golden 更新。
-# 契約変更（COVERAGE-1・2026-09-11）: list_docs の offset 案内を truncated/next_offset に置換し、
-# 全件・一覧の完了条件と中断時の書き方を明記したため golden 更新。
-_SYSTEM_GOLDEN_BYTES = 5025
-_SYSTEM_GOLDEN_SHA256 = "53a8b3c61adef925e3cfea57a889996dd88d503563c6b69dc7f7ddac8c63cde1"
-# 契約変更（2026-09-21・全文(P3)段の撤去に伴い「返す本文は該当箇所の周辺まで（文書全体は返さない）
-# ——文書全体を確認したいときは doc_id を渡して read_doc で読む」を追記）したため golden 更新。
-# 契約変更（調査台帳を文脈の外に置く §2・es_search はページングを持たないため候補発見用に限定し、
-# 全件列挙は ripgrep_search/list_docs/原本読取へ誘導する一文を追記）したため golden 再更新。
-# 契約変更（COD-16・2026-09-29・台帳の項目のために探すときは item を付ける旨の一文を追記）
-# したため golden 再更新。
-_DESC_ES_GOLDEN_BYTES = 1123
-_DESC_ES_GOLDEN_SHA256 = "4a1893e34dd5113b313e9762944d10b085c2698738f39c0b47f999ec77b0966a"
-# 契約変更（S3c・裁定2026-09-11・graph_neighbors の近傍に辺ごとの種類と向きを追加したのに伴い
-# description へ「経路は辺ごとの種類と向き（from→to）付き」を追記）したため golden 更新。
-# 契約変更（COD-16・2026-09-29・台帳の項目のために探すときは item を付ける旨の一文を追記）
-# したため golden 再更新。
-_DESC_GRAPH_GOLDEN_BYTES = 1305
-_DESC_GRAPH_GOLDEN_SHA256 = "5e5e7639b19c1a2603cb4efc15f3582893b018a54224ef32d4e46a0f57ced4d5"
-
-
-def _sha256_utf8(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def test_system_prompt_full_on_matches_fixed_golden_hash():
-    """全ON（省略含む）は固定 golden（byte 長＋SHA-256）と一致する（自己参照の恒真式を廃止・SC-6e）。"""
-    for v in (A.system_prompt(), A.system_prompt(None),
-             A.system_prompt({"grep": True, "fulltext": True, "graph": True})):
-        assert len(v.encode("utf-8")) == _SYSTEM_GOLDEN_BYTES
-        assert _sha256_utf8(v) == _SYSTEM_GOLDEN_SHA256
-
-
-def test_system_prompt_grep_off_omits_ripgrep_mention():
-    text = A.system_prompt({"grep": False, "fulltext": True, "graph": True})
-    assert "ripgrep_search" not in text
-    assert "es_search" in text and "graph_neighbors" in text
-
-
-def test_system_prompt_fulltext_off_omits_es_search_mention():
-    text = A.system_prompt({"grep": True, "fulltext": False, "graph": True})
-    assert "es_search" not in text
-    assert "ripgrep_search" in text and "graph_neighbors" in text
-
-
-def test_system_prompt_graph_off_omits_graph_neighbors_mention():
-    text = A.system_prompt({"grep": True, "fulltext": True, "graph": False})
-    assert "graph_neighbors" not in text
-    assert "ripgrep_search" in text and "es_search" in text
-
-
-def test_system_prompt_grep_and_fulltext_off_omits_content_search_step_entirely():
-    """grep/fulltext とも OFF（graph のみ）: 本文検索の手順そのものを案内しない。"""
-    text = A.system_prompt({"grep": False, "fulltext": False, "graph": True})
-    assert "ripgrep_search" not in text
-    assert "es_search" not in text
-    assert "graph_neighbors" in text
-
-
-def test_system_prompt_grep_only_has_no_comparison_or_es_mention():
-    text = A.system_prompt({"grep": True, "fulltext": False, "graph": False})
-    assert "es_search" not in text
-    assert "graph_neighbors" not in text
-    assert "ripgrep_search" in text
-
-
-def test_system_prompt_grep_off_also_omits_glob_mention():
-    """glob_search は grep 軸に同居する——grep OFF/不達では ripgrep_search と同様に案内しない。"""
-    text = A.system_prompt({"grep": False, "fulltext": True, "graph": True})
-    assert "glob_search" not in text
-
-
-def test_system_prompt_grep_on_mentions_glob():
-    text = A.system_prompt({"grep": True, "fulltext": True, "graph": True})
-    assert "glob_search" in text
-
-
-def test_desc_es_and_desc_graph_omit_grep_mention_when_grep_off():
-    assert "ripgrep_search" not in A._desc_es(with_grep=False)
-    assert "grep" not in A._desc_graph(with_grep=False)
-
-
-def test_desc_es_and_desc_graph_full_on_match_fixed_golden_hash():
-    """`_desc_es`/`_desc_graph` の全ON（`with_grep=True`）値も自己参照でなく固定 golden と比較する
-    （`test_system_prompt_full_on_matches_fixed_golden_hash` と同じ理由・SC-6e）。"""
-    es = A._desc_es(with_grep=True)
-    graph = A._desc_graph(with_grep=True)
-    assert len(es.encode("utf-8")) == _DESC_ES_GOLDEN_BYTES
-    assert _sha256_utf8(es) == _DESC_ES_GOLDEN_SHA256
-    assert len(graph.encode("utf-8")) == _DESC_GRAPH_GOLDEN_BYTES
-    assert _sha256_utf8(graph) == _DESC_GRAPH_GOLDEN_SHA256
-
-
-def test_openai_tools_description_reflects_grep_off():
-    tools = A.openai_tools(with_es=True, with_graph=True, with_grep=False)
-    es_desc = next(t["function"]["description"] for t in tools if t["function"]["name"] == "es_search")
-    graph_desc = next(t["function"]["description"] for t in tools if t["function"]["name"] == "graph_neighbors")
-    assert "ripgrep_search" not in es_desc
-    assert "grep" not in graph_desc
-
-
 # ===== GLOB-1: glob_search（ファイル名/パスのグロブ検索）は grep 軸に同居 =====
-
-def test_openai_tools_glob_search_gated_by_with_grep():
-    """glob_search は with_grep=True のときだけ提示され、False では ripgrep_search と同様に消える。"""
-    on = A.openai_tools(with_grep=True)
-    off = A.openai_tools(with_grep=False)
-    assert any(t["function"]["name"] == "glob_search" for t in on)
-    assert not any(t["function"]["name"] == "glob_search" for t in off)
-    assert not any(t["function"]["name"] == "ripgrep_search" for t in off)
-
-
-def test_gemini_tools_glob_search_gated_by_with_grep():
-    on = A.gemini_tools(with_grep=True)[0]["functionDeclarations"]
-    off = A.gemini_tools(with_grep=False)[0]["functionDeclarations"]
-    assert any(f["name"] == "glob_search" for f in on)
-    assert not any(f["name"] == "glob_search" for f in off)
-
-
-def test_glob_search_registered_in_all_three_drivers_with_same_schema():
-    """list_docs と同じ固定（RV LOW・S1）を glob_search にも適用する（`test_list_docs_registered_
-    in_all_three_drivers_with_same_schema` と同じ理由）。"""
-    ot = A.openai_tools(with_grep=True)
-    o = next((t["function"] for t in ot if t["function"]["name"] == "glob_search"), None)
-    assert o is not None, "openai_tools に glob_search が無い"
-
-    gt = A.gemini_tools(with_grep=True)
-    g = next((f for f in gt[0]["functionDeclarations"] if f["name"] == "glob_search"), None)
-    assert g is not None, "gemini_tools に glob_search が無い"
-
-    at = A.anthropic_tools_from_openai(ot)
-    a = next((t for t in at if t["name"] == "glob_search"), None)
-    assert a is not None, "anthropic 変換後に glob_search が無い"
-
-    assert o["description"] == g["description"] == a["description"]
-    assert o["parameters"] == g["parameters"] == a["input_schema"]
 
 
 def test_glob_search_matches_basename_pattern_at_any_depth():
@@ -5928,117 +2488,12 @@ def test_glob_search_layer_code_and_docs_partition():
     assert res_docs["paths"] == []
 
 
-def test_agentic_loop_uses_tools_aware_system_prompt(monkeypatch):
-    """provider._agentic_loop が `ctx.scope_meta["tools"]` を `agentic_search.system_prompt` へ渡す
-    （openai/ollama/gemini/bedrock/検索アシスタント共通の配線・SC-6e）。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    monkeypatch.setattr(A.es_index, "available", lambda: True)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    captured = {}
-
-    def fake_post(url, headers, body, timeout=90):
-        captured["system"] = body["messages"][0]["content"]
-        return {"choices": [{"message": {"content": "回答", "finish_reason": "stop"}}]}
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    p = OpenAIProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="質問", world="v1", route=lambda m: {}, dispatch=lambda l, i: {},
-             scope_meta={"world": "v1", "scope_paths": [], "source": "all",
-                         "tools": {"grep": False, "fulltext": True, "graph": True}})
-    list(p._agentic_loop(ctx))
-    assert "ripgrep_search" not in captured["system"]
-    assert captured["system"] != A.SYSTEM
-
-
-def test_agentic_run_resolves_none_tools_availability_consistently_for_system_and_schema(monkeypatch):
-    """`ctx.tools_availability` が `None`（provider を直接呼ぶ経路・通常の chat 経路
-    （`chat_service.handle_message`/`stream_message`）は必ずターン先頭の snapshot を渡すため
-    到達しない）でも、SYSTEM とツール schema が同じ実効集合を見る。`_agentic_run` が入口で
-    1回だけ解決せず各所が個別に「省略時は都度チェック」へ倒れると、gate 判定・SYSTEM は
-    「省略=全て利用可能」の楽観的前提のまま通過するのに、schema だけが実接続の結果
-    （ここではグラフ不達）を反映してしまい、SYSTEM が実際には提示されないツールを推奨する
-    食い違いが起きる。impact レンズ（グラフ必須）で確認する——qa/author は grep が常に
-    available 固定で gate 判定に影響しないため解決の対象外（`_agentic_run` 参照・
-    provider の URL 構築＝SSRF チョークポイントより前に実接続チェックが走ってしまう回帰を
-    避けるため、影響のあるグラフ必須レンズだけに絞ってある）。"""
-    from sherpa.agents import Ctx, OpenAIProvider
-
-    # グラフは available のまま（impact の gate 判定はグラフのみを見るため blocked にしない）・
-    # 全文（fulltext/ES）だけ不達にして、gate 判定に影響しない軸で SYSTEM/schema の一致を見る。
-    monkeypatch.setattr(A.es_index, "available", lambda: False)
-    monkeypatch.setattr(A, "_graph_available", lambda: True)
-    captured = {}
-
-    def fake_post(url, headers, body, timeout=90):
-        captured["system"] = body["messages"][0]["content"]
-        captured["tool_names"] = [t["function"]["name"] for t in body["tools"]]
-        return {"choices": [{"message": {"content": "回答", "finish_reason": "stop"}}]}
-
-    monkeypatch.setattr(A, "_post", fake_post)
-    p = OpenAIProvider("sk-dummy", "gpt-5.5")
-    ctx = Ctx(message="質問", world="v1", knowledge=True,
-             route=lambda m: {"lens": "impact", "reason": "テスト", "input": m},
-             dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}},
-             make_sources=lambda docs: [],
-             scope_meta={"world": "v1", "scope_paths": [], "source": "all"})
-    # tools_availability は既定 None のまま渡す（provider 直呼び出し・通常経路は必ず渡す）。
-    list(p.run(ctx))
-    assert "es_search" not in captured["system"]
-    assert "es_search" not in captured["tool_names"]
-
-
 def test_can_ask_helper_detects_confirm_id_resend():
     """Med-1: `agents._can_ask` は依頼に「確認ID:」があれば False（回答再送＝再質問しない）。"""
     from sherpa import agents as AG
     assert AG._can_ask("税率を変えたら夜間バッチが落ちる？") is True
     assert AG._can_ask("選択: 対象範囲\n確認ID: confirm-abcd\n元の依頼: …") is False
     assert AG._can_ask("確認ID：ask-0011\n選択: 影響") is False   # 全角コロンも検出
-
-
-def test_impact_lens_uses_agentic_tool_loop():
-    """影響分析（impact）も反復ツール検索を通る（2026-08-15 決定）。
-
-    従来は `run()` の分岐が impact を除外しており、Neo4j を1回引くだけで終わっていた。
-    グラフが 0 件だと「根拠なし」で終わってしまい、自前 grep を続ける Codex と差が出ていた。
-    ここでは「impact でも `_agentic_loop` が呼ばれ、引用付きの envelope が返る」ことを固定する
-    （DEPTH-2 S2・§2.7: author も既定構成（検索アシスタント／計画なし）では同じ `_agentic_loop`
-    へ接続される——`write_output_file` ツールがこのループにだけ実装されているため）。
-
-    world/doc_id は fixtures/corpus/v1 実在ファイル（EXT-2 機械検証が既定 ON のため、実在しない
-    doc を指す citation は Committed Evidence から落ちる。テストの関心はルーティング＝
-    「impact が agentic ループを通るか」であり doc の実体とは無関係なので、実在ファイルへ
-    差し替えるだけで足りる）。
-    """
-    from sherpa.providers.base import Ctx, _GenProvider
-
-    real_doc = "4期/04_運用/障害記録.md"
-    seen = []
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _agentic_loop(self, ctx):
-            seen.append("agentic")
-            yield {"node": {"type": "node", "id": "n", "kind": "tool", "label": "資料を検索（語句そのまま）"}}
-            yield {"final": "税率変更は夜間バッチに影響します", "docs": {real_doc}, "searched": True,
-                   "cites": [{"doc_id": real_doc, "span": [1, 1], "quote": "# 障害記録"}], "cards": []}
-
-    def _ctx(lens):
-        return Ctx(message="税率を変えたら夜間バッチが落ちる？", world="v1", knowledge=True,
-                   route=lambda m: {"lens": lens, "reason": "テスト", "input": m},
-                   dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}},
-                   make_sources=lambda docs: [])
-
-    events = list(_P().run(_ctx("impact")))
-    assert seen == ["agentic"], "impact が反復ツール検索を通っていない"
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["lens"] == "impact"
-    assert len(env["data"]["citations"]) == 1     # グラフ 0 件でも根拠が残る
-
-    seen.clear()
-    list(_P().run(_ctx("author")))
-    assert seen == ["agentic"], "author も既定構成では反復ツール検索を通るはず（DEPTH-2 S2）"
 
 
 # ===== TOOLREAD: read_doc/doc_outline（土台系・新設） =====
@@ -6104,6 +2559,7 @@ def test_run_tool_read_doc_byte_budget_stops_before_page_end_and_reports_actual_
     # BUDGET-1（§3.4）でコード既定が 262144（256KiB）へ引き上げられたため、旧既定 64KiB を
     # 明示的に固定してテストの意図（境界での打切り）を保つ。
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 65536)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 65536)
     long_line = "x" * 4000   # 4KB級（パイプ表の1行を想定）
     total_lines = 30         # 30 * (4000+数バイト) は64KiBを優に超える
     _isolate_world_kb(monkeypatch, tmp_path, world,
@@ -6127,6 +2583,7 @@ def test_run_tool_read_doc_single_huge_line_is_clipped_with_text_truncated(monke
     # BUDGET-1（§3.4）でコード既定が 262144（256KiB）へ引き上げられたため、旧既定 64KiB を
     # 明示的に固定してテストの意図（単一行でも予算超過を検知する）を保つ。
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 65536)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 65536)
     huge_line = "A" * 200_000
     _isolate_world_kb(monkeypatch, tmp_path, world, {"big.md": huge_line})
     res, _, _, _ = A.run_tool("read_doc", {"doc_id": "big.md"}, world, None)
@@ -6155,6 +2612,7 @@ def test_run_tool_read_doc_file_cap_hit_sets_file_truncated(monkeypatch, tmp_pat
     （テストでは cap を小さい値に差し替えて到達を再現する）。"""
     world = "read-doc-filecap-world"
     monkeypatch.setattr(A, "_READ_AROUND_FILE_CAP_BYTES", 50)
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 50)
     content = "\n".join(f"line {i}" for i in range(1, 21))   # 50バイトを優に超える
     assert len(content.encode("utf-8")) > 50
     _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": content})
@@ -6300,6 +2758,7 @@ def test_run_tool_doc_outline_truncates_by_byte_budget_before_count_cap(monkeypa
     1結果が既定64KiBを超えるのを防ぐ・件数だけでは足りない）。"""
     world = "outline-bytebudget-world"
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 1000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 1000)
     content = "\n".join(f"# 長い見出しタイトルの例その{i}あいうえおかきくけこさしすせそ" for i in range(1, 21))
     _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": content})
     res, _, _, _ = A.run_tool("doc_outline", {"doc_id": "doc.md"}, world, None)
@@ -6324,6 +2783,7 @@ def test_run_tool_doc_outline_file_cap_hit_sets_file_truncated(monkeypatch, tmp_
     同じく file_truncated:true を付与する（見出し一覧が文書全体の見出しでない可能性の明示）。"""
     world = "outline-filecap-world"
     monkeypatch.setattr(A, "_READ_AROUND_FILE_CAP_BYTES", 50)
+    monkeypatch.setattr(RT, "_READ_AROUND_FILE_CAP_BYTES", 50)
     content = "\n".join(f"# h{i}" for i in range(1, 21))
     assert len(content.encode("utf-8")) > 50
     _isolate_world_kb(monkeypatch, tmp_path, world, {"doc.md": content})
@@ -6354,26 +2814,6 @@ def test_run_tool_unknown_tool_still_rejected_with_read_doc_and_doc_outline_regi
 
 # ---- 思考の流れ（`_tool_node`/`_tool_node_sub`/`_hit_summary_node`/`_hit_summary_node_sub`）----
 
-def test_tool_node_read_doc_includes_doc_id():
-    node = A._tool_node("read_doc", {"doc_id": "設計/資料.md", "start_line": 10})
-    assert node["label"] == "文書を通読"
-    assert "設計/資料.md" in node["detail"]
-
-
-def test_tool_node_doc_outline_includes_doc_id():
-    node = A._tool_node("doc_outline", {"doc_id": "設計/資料.md"})
-    assert node["label"] == "見出し構造を確認"
-    assert "設計/資料.md" in node["detail"]
-
-
-def test_tool_node_sub_read_doc_and_doc_outline_are_fixed_wording():
-    """secRV MED-2: サブ経路のツールノードは doc_id を一切含まない固定文言。"""
-    node = A._tool_node_sub("read_doc")
-    assert node["label"] == "文書を通読" and "SENTINEL" not in node["detail"]
-    node2 = A._tool_node_sub("doc_outline")
-    assert node2["label"] == "見出し構造を確認" and "SENTINEL" not in node2["detail"]
-
-
 def test_tool_hit_count_read_doc_counts_lines_returned_this_call():
     assert A._tool_hit_count("read_doc", {"start_line": 1, "end_line": 40, "total_lines": 120}) == 40
     assert A._tool_hit_count("read_doc", {"start_line": 41, "end_line": 41, "total_lines": 120}) == 1
@@ -6399,379 +2839,14 @@ def test_tool_hit_count_compare_documents_header_excluded_positionally():
     assert A._tool_hit_count("compare_documents", {"status": "comparable", "diff": tricky_diff}) == 2
 
 
-def test_hit_summary_node_read_doc_includes_doc_and_range():
-    node = A._hit_summary_node("read_doc", {"doc_id": "設計/資料.md"},
-                               {"doc_id": "設計/資料.md", "start_line": 1, "end_line": 40, "total_lines": 120})
-    assert "設計/資料.md" in node["detail"]
-    assert "1〜40行を読了" in node["detail"] and "全120行" in node["detail"]
-
-
-def test_hit_summary_node_doc_outline_includes_doc_and_count():
-    node = A._hit_summary_node("doc_outline", {"doc_id": "設計/資料.md"},
-                               {"doc_id": "設計/資料.md", "total_lines": 10, "count": 3,
-                                "headings": [{}] * 3, "truncated": False})
-    assert "設計/資料.md" in node["detail"] and "見出し3件" in node["detail"]
-
-
-def test_hit_summary_node_none_on_error_for_new_tools():
-    assert A._hit_summary_node("read_doc", {"doc_id": "a.md"}, {"error": "boom"}) is None
-    assert A._hit_summary_node("doc_outline", {"doc_id": "a.md"}, {"error": "boom"}) is None
-    assert A._hit_summary_node_sub("read_doc", {"error": "boom"}) is None
-    assert A._hit_summary_node_sub("doc_outline", {"error": "boom"}) is None
-
-
-def test_hit_summary_node_sub_read_doc_omits_doc_id_fixed_template():
-    """secRV MED-2: サブ経路は固定文言＋数値のみ（doc_id は含めない）。"""
-    node = A._hit_summary_node_sub(
-        "read_doc", {"doc_id": "SENTINEL_DOC.md", "start_line": 1, "end_line": 40, "total_lines": 120})
-    assert "SENTINEL_DOC.md" not in node["detail"]
-    assert node["detail"] == "1〜40行を読了（全120行）"
-
-
-def test_hit_summary_node_sub_doc_outline_omits_doc_id_fixed_template():
-    node = A._hit_summary_node_sub(
-        "doc_outline", {"doc_id": "SENTINEL_DOC.md", "count": 5, "headings": [{}] * 5, "total_lines": 50})
-    assert "SENTINEL_DOC.md" not in node["detail"]
-    assert node["detail"] == "見出し5件"
-
-
 # ---- EV-0（拡張設計 §4.4）: read_doc も read_around と同じく「精読済み」に載る ----
-
-def test_openai_style_final_event_tags_read_doc_docs_as_verified():
-    real_doc = "4期/04_運用/障害記録.md"
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "read_doc", "arguments": f'{{"doc_id":"{real_doc}"}}'}}]}}]},
-        {"choices": [{"message": {"content": "確認しました。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?",
-                                                 "v1", None) if "final" in ev)
-        assert final["verified_docs"] == {real_doc}, final["verified_docs"]
-        assert real_doc in final["docs"]
-    finally:
-        A._post = orig
-
-
-def test_openai_style_doc_outline_hit_is_not_verified():
-    """doc_outline は構造の当たり付けのみ（本文精読ではない）——read_around/read_doc と違い
-    `verified_docs` には入らない（出典候補 `docs` には従来どおり残る）。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "doc_outline", "arguments": f'{{"doc_id":"{real_doc}"}}'}}]}}]},
-        {"choices": [{"message": {"content": "確認しました。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?",
-                                                 "v1", None) if "final" in ev)
-        assert final["verified_docs"] == set()
-        assert real_doc in final["docs"]
-    finally:
-        A._post = orig
-
-
-# ===== SC-6e: agentic 経路（_agentic_run）のレンズ必須ツール判定 =====
-# 非agentic（chat_service._dispatch）と同じ dispatch_tools_for_lens をここでも通す——
-# 以前は agentic 経路がこの判定を一切見ずに直接 _agentic_loop/_sub_agentic_loop へ進んでいた
-# （impact/troubleshoot でもグラフ不達/OFF のまま反復ツール検索を試みてしまう非対称）。
-
-def _blocking_gate_ctx(lens, tools_availability, tools_pref=None):
-    """`_agentic_loop` が絶対に呼ばれてはいけないことを検証するための Ctx（_GenProvider._agentic_run
-    共通）。`tools_availability`/`scope_meta["tools"]` 以外は最小構成。"""
-    from sherpa.providers.base import Ctx
-    return Ctx(message="質問", world="v1", knowledge=True,
-              route=lambda m: {"lens": lens, "reason": "テスト", "input": m},
-              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}},
-              make_sources=lambda docs: [],
-              scope_meta={"world": "v1", "scope_paths": [], "source": "all", "tools": tools_pref},
-              tools_availability=tools_availability)
-
-
-class _NeverCallAgenticLoop:
-    """`_agentic_loop`/`_sub_agentic_loop` が呼ばれたら即座に検出できる mixin
-    （呼ばれずに honest-failure envelope だけが返るはず）。"""
-    label, model, provider_id = "T", "m", "openai"
-
-    def _agentic_loop(self, ctx):
-        raise AssertionError("blocked のはずの lens で _agentic_loop が呼ばれた")
-
-
-def _degraded_gate_provider(seen):
-    """入口ゲートで縮退したときに `_agentic_loop` が実際に呼ばれることを確かめる provider。"""
-    from sherpa.providers.base import _GenProvider
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _agentic_loop(self, ctx):
-            seen.append("agentic")
-            # has_structural_evidence=True で根拠ゲート（EXT-2）を素直に通す（下の陰性対照と同じ理由）。
-            yield {"final": "回答", "docs": set(), "searched": True, "cites": [], "cards": [],
-                  "has_structural_evidence": True}
-
-    return _P
-
-
-def test_agentic_run_impact_degrades_to_direct_search_when_graph_unavailable():
-    """S4: impact でグラフが不達でも `tools_blocked_env` で終わらせず、grep/原本直読の調査を
-    そのまま続ける（§0(c)）——回答の冒頭にグラフを使わなかった理由を平文で告知する。"""
-    seen = []
-    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
-    events = list(_degraded_gate_provider(seen)().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert seen == ["agentic"], "調査ループを一度も回さずに終わってはいけない"
-    assert env["lens"] == "impact"
-    assert env["headline"].endswith("回答")
-    # 実接続の不達＝「接続できなかった」側の文言（利用者 OFF の「使えない」とは分ける）。
-    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["graph_unavailable"])
-    assert "agentic_failure" not in env    # 実行できなかったターン扱いにしない
-
-
-def test_agentic_run_troubleshoot_degrades_when_graph_off_via_pref():
-    """troubleshoot も同じ——実接続は可用でも会話の検索経路トグルで明示 OFF なら、グラフ抜きで
-    調査を続ける（可用性とユーザー希望の AND・`effective_tools_pref` 参照）。"""
-    seen = []
-    ctx = _blocking_gate_ctx("troubleshoot", {"grep": True, "fulltext": True, "graph": True},
-                            tools_pref={"graph": False})
-    events = list(_degraded_gate_provider(seen)().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert seen == ["agentic"]
-    assert env["lens"] == "troubleshoot"
-    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["blocked"])
-
-
-def test_agentic_run_impact_still_blocked_when_no_search_tool_remains():
-    """縮退の条件は「資料を探す手段が残っていること」——grep も全文も使えなければ従来どおり
-    honest-failure envelope（`tools_blocked_env`）で終わる。"""
-    from sherpa.providers.base import _GenProvider
-
-    class _P(_NeverCallAgenticLoop, _GenProvider):
-        pass
-
-    ctx = _blocking_gate_ctx("impact", {"grep": False, "fulltext": False, "graph": False})
-    events = list(_P().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["lens"] == "impact"
-    assert env["data"] == {}
-    assert env["summary"]["total"] == 0
-
-
-def test_agentic_run_qa_blocked_when_grep_and_fulltext_both_unavailable():
-    """qa/author はグラフ必須ではなく grep か全文のどちらか一方で足りる——両方 OFF/不達のときだけ
-    blocked（グラフだけが available でも qa は救われない・§3.6 の非agentic 判定と同じ規則）。"""
-    from sherpa.providers.base import _GenProvider
-
-    class _P(_NeverCallAgenticLoop, _GenProvider):
-        pass
-
-    ctx = _blocking_gate_ctx("qa", {"grep": False, "fulltext": False, "graph": True})
-    events = list(_P().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["lens"] == "qa"
-    assert env["data"] == {}
-
-
-def test_agentic_run_qa_blocked_when_unresolved_availability_and_explicit_grep_off(monkeypatch):
-    """`ctx.tools_availability=None`（provider 直呼び出し・通常経路は必ず snapshot を渡す）でも、
-    明示的に grep を OFF にし、かつ実際に fulltext が不達なら qa は blocked になる——解決せず
-    `None=全て利用可能` の楽観的 gate をそのまま通すと、この組み合わせで本来 blocked のはずが
-    素通りしてしまう（`_agentic_run` が全 agentic レンズで snapshot を解決するようになった
-    ことの直接確認・qa/author を対象外にしていた旧実装ではこの回帰を検出できない）。"""
-    from sherpa.providers.base import _GenProvider
-
-    monkeypatch.setattr(A.es_index, "available", lambda: False)   # fulltext は実際に不達
-    monkeypatch.setattr(A, "_graph_available", lambda: True)      # qa の gate には無関係
-
-    class _P(_NeverCallAgenticLoop, _GenProvider):
-        pass
-
-    ctx = _blocking_gate_ctx("qa", None, tools_pref={"grep": False})
-    events = list(_P().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["lens"] == "qa"
-    assert env["data"] == {}
-
-
-def test_agentic_run_qa_not_blocked_when_grep_alone_available():
-    """qa は grep だけが available なら blocked にならず、通常どおり `_agentic_loop` を呼ぶ
-    （over-block しないことの陰性対照）。"""
-    from sherpa.providers.base import _GenProvider
-
-    seen = []
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _agentic_loop(self, ctx):
-            seen.append("agentic")
-            # has_structural_evidence=True で根拠ゲート（EXT-2）を素直に通す——空のままだと
-            # `_agentic_run` が「evidence below threshold」で例外を投げ、対象外の provider
-            # フォールバック（`ctx.dispatch` 経由の単発 grep）へ縮退してしまい、この陰性対照が
-            # 検証したい「blocked にならず agentic ループが正常完走する」ことを確認できない。
-            yield {"final": "回答", "docs": set(), "searched": True, "cites": [], "cards": [],
-                  "has_structural_evidence": True}
-
-    ctx = _blocking_gate_ctx("qa", {"grep": True, "fulltext": False, "graph": False})
-    events = list(_P().run(ctx))
-    assert seen == ["agentic"]
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["headline"] == "回答"   # 根拠ゲートで例外→フォールバックへ縮退していないことの確認
-
-
-def test_agentic_run_impact_not_blocked_when_graph_available():
-    """impact はグラフが available なら blocked にならない（over-block しないことの陰性対照）。"""
-    from sherpa.providers.base import _GenProvider
-
-    seen = []
-
-    class _P(_GenProvider):
-        label, model, provider_id = "T", "m", "openai"
-
-        def _agentic_loop(self, ctx):
-            seen.append("agentic")
-            # has_structural_evidence=True で根拠ゲート（EXT-2）を素直に通す（上の
-            # test_agentic_run_qa_not_blocked_when_grep_alone_available と同じ理由）。
-            yield {"final": "回答", "docs": set(), "searched": True, "cites": [], "cards": [],
-                  "has_structural_evidence": True}
-
-    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": True})
-    events = list(_P().run(ctx))
-    assert seen == ["agentic"]
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["headline"] == "回答"   # 根拠ゲートで例外→フォールバックへ縮退していないことの確認
-
-
-def test_openai_requests_omit_temperature():
-    """gpt-5.5 系は temperature の既定値(1)以外を拒否する（400 unsupported_value・2026-08-15 実測）。
-
-    送るとツールループが丸ごと失敗し、影響調査も仕様問い合わせも「根拠なし」で終わっていた。
-    OpenAI 宛ての本文には temperature を載せない（Ollama 側の options.temperature は据え置き）。
-    """
-    import json
-
-    from sherpa import agentic_search as A
-    from sherpa import llm
-
-    sent = {}
-
-    def _fake_post(url, headers, body, timeout=None):
-        sent["body"] = body
-        return {"choices": [{"message": {"role": "assistant", "content": "done"}}]}
-
-    orig = A._post
-    A._post = _fake_post
-    try:
-        list(A.openai_style(llm.OPENAI_CHAT_URL, {}, "gpt-5.5", "sys", "質問", "w", None, max_turns=1))
-    finally:
-        A._post = orig
-    assert "temperature" not in sent["body"], f"OpenAI へ temperature を送っている: {sent['body'].keys()}"
-
-    # 単発ストリーミング（_stream）も同様。
-    from sherpa.providers.openai import OpenAIProvider
-    captured = {}
-
-    class _P(OpenAIProvider):
-        pass
-
-    p = _P("sk-dummy", "gpt-5.5")
-    import urllib.request
-    orig_req = urllib.request.Request
-
-    def _fake_request(url, data=None, headers=None):
-        captured["body"] = json.loads(data.decode())
-        raise RuntimeError("stop-before-network")
-
-    urllib.request.Request = _fake_request
-    try:
-        list(p._stream("prompt"))
-    except RuntimeError:
-        pass
-    finally:
-        urllib.request.Request = orig_req
-    assert "temperature" not in captured["body"], f"_stream が temperature を送っている: {captured['body'].keys()}"
-
 
 # ==== EXT-2（拡張設計 §4.3）: 機械検証（verify_citation） ====
 
 _REAL_DOC = "4期/04_運用/障害記録.md"   # fixtures/corpus/v1 実在ファイル・1行目 "# 障害記録"
 
 
-def test_verify_citation_doc_missing_for_nonexistent_doc_id():
-    v = A.verify_citation({"doc_id": "no-such-file.md", "span": [1, 1], "quote": "x"}, "v1")
-    assert v == {"exists": False, "method": "doc_missing"}
-
-
-def test_verify_citation_exists_no_span_when_span_absent():
-    v = A.verify_citation({"doc_id": _REAL_DOC, "quote": "x"}, "v1")
-    assert v == {"exists": True, "method": "exists_no_span"}
-
-
-def test_verify_citation_span_verified_when_quote_matches_real_content():
-    v = A.verify_citation({"doc_id": _REAL_DOC, "span": [1, 1], "quote": "# 障害記録"}, "v1")
-    assert v == {"exists": True, "method": "span_verified"}
-
-
-def test_verify_citation_span_unmatched_when_quote_diverges_but_doc_exists():
-    v = A.verify_citation({"doc_id": _REAL_DOC, "span": [1, 1], "quote": "存在しない引用文言"}, "v1")
-    assert v == {"exists": True, "method": "span_unmatched"}
-
-
-def test_verify_citation_rejects_traversal_and_out_of_range_span():
-    assert A.verify_citation({"doc_id": "../etc/passwd", "span": [1, 1], "quote": "x"}, "v1") \
-        == {"exists": False, "method": "doc_missing"}
-    # span が全ファイル行数を超える＝不一致（存在チェック自体は通る）。
-    v = A.verify_citation({"doc_id": _REAL_DOC, "span": [999999, 999999], "quote": "x"}, "v1")
-    assert v == {"exists": True, "method": "span_unmatched"}
-
-
 # ==== EXT-2/EV-0: read_around を通した doc_id だけが "verified_docs" に載る ====
-
-def test_openai_style_final_event_tags_read_around_docs_as_verified():
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c2", "function": {"name": "read_around",
-             "arguments": f'{{"doc_id":"{_REAL_DOC}","line":1}}'}}]}}]},
-        {"choices": [{"message": {"content": "確認しました。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?",
-                                                 "v1", None) if "final" in ev)
-        assert final["verified_docs"] == {_REAL_DOC}, final["verified_docs"]
-        # 最終応答に finish_reason が無い（自然完了 allowlist に無い＝非自然完了）ため
-        # "unknown"（原因不明・自然終了とは偽らない）——本テストの主眼は verified_docs のため
-        # stop_reason はここでは詳細検証しない（細分化は test_incomplete_stop_reason_* が担当）。
-        assert final["stop_reason"] == "unknown"
-        assert _REAL_DOC in final["docs"]   # grep ヒットも従来どおり docs（＝出典候補）には残る
-    finally:
-        A._post = orig
-
-
-def test_openai_style_grep_only_hit_is_not_verified():
-    """grep ヒットのみ（read_around を呼んでいない）は verified_docs に入らない（EV-0 の「参考」相当）。"""
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?",
-                                                 "v1", None) if "final" in ev)
-        assert final["verified_docs"] == set()
-        assert final["docs"]   # 出典候補としては残る（EV-0 は除外しない＝recall 不変）
-    finally:
-        A._post = orig
-
 
 # ==== EXT-3（拡張設計 §3）: 評価フェーズ（Observation → Evaluation → Next Action） ====
 
@@ -6781,493 +2856,15 @@ def _eval_tool_call(call_id: str, status: str, next_action: str, reason: str = "
         {"id": call_id, "function": {"name": "submit_evaluation", "arguments": args}}]}}]}
 
 
-def test_openai_style_depth_light_never_triggers_evaluation_even_with_cycle_boundary(monkeypatch):
-    """既定 depth="light" は Research Cycle 境界（毎ターン）でも評価フェーズ（submit_evaluation 呼び
-    出し）を一切発動しない（既存呼び出し元は誰も depth を渡さない＝byte-identical の根拠）。
-
-    Committed Evidence 化ゲート（機械検証）自体は depth に関わらず常時動くが、`evidence_committed`
-    ノードの発行は根拠ゲート通過後に `providers/base.py` が行う（本関数はここでは検証しない）——
-    ここで固定するのは「評価フェーズ由来のノード（evaluation_*/replan_requested/
-    finalization_started）が出ないこと」に限る。
-    """
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None))
-        final = next(ev for ev in events if "final" in ev)
-        # 最終応答に finish_reason が無いため "unknown"（本テストの主眼は評価フェーズ非発動の
-        # 確認であり stop_reason の細分化ではない）。
-        assert final["stop_reason"] == "unknown"
-        assert not seq   # ちょうど2コールだけ消費（評価フェーズ用の3コール目が無い）
-        node_types = {ev["node"].get("event_type") for ev in events if "node" in ev}
-        assert not (node_types & {"evaluation_completed", "replan_requested", "finalization_started"})
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_sufficient_commits_evidence_and_ends_early(monkeypatch):
-    """`evidence_committed` ノード自体は `providers/base.py` が根拠ゲート通過後に発行する
-    （test_provider_agentic_run_emits_evidence_committed_node_after_gate 参照）。ここでは
-    openai_style 単体の契約（評価ノード・stop_reason・citation）だけを検証する。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分な根拠"),
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-        assert final["evaluation_next_action"] == "commit_evidence"
-        node_types = [ev["node"].get("event_type") for ev in events if "node" in ev]
-        assert "evaluation_completed" in node_types
-        assert not seq   # 評価→最終合成まで3コールすべて消費
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_blocked_ends_with_finalization_event(monkeypatch):
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "blocked", "stop", "行き詰まり"),
-        {"choices": [{"message": {"content": "確認できた範囲で回答します。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="deep"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_blocked"
-        node_types = [ev["node"].get("event_type") for ev in events if "node" in ev]
-        assert "finalization_started" in node_types
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_conflicting_emits_replan_and_continues(monkeypatch):
-    """conflicting は同一 Cycle 内で継続する縮退。no-tool 終了も評価境界として強制されるため、
-    次に模型が tool_calls 無しで止まってももう一度評価を挟む（ここでは sufficient で確定させる）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "conflicting", "delegate_more", "矛盾を検知"),
-        {"choices": [{"message": {"content": "調べ直した結果はこうです。"}}]},
-        _eval_tool_call("e2", "sufficient", "commit_evidence", "十分"),
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-        node_types = [ev["node"].get("event_type") for ev in events if "node" in ev]
-        assert "replan_requested" in node_types
-        assert not seq
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_insufficient_is_silent_and_continues(monkeypatch):
-    """§3.2 の表どおり insufficient はイベントを出さず同一 Research Cycle 内で継続する。no-tool
-    終了も評価境界として強制されるため、模型が次に tool_calls 無しで止まってももう一度評価を挟む
-    （ここでは sufficient で確定させる）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "insufficient", "continue_search", "まだ不足"),
-        {"choices": [{"message": {"content": "追加で確認しました。"}}]},
-        _eval_tool_call("e2", "sufficient", "commit_evidence", "十分"),
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-        node_types = [ev["node"].get("event_type") for ev in events if "node" in ev]
-        assert not any(t in node_types for t in
-                       ("replan_requested", "finalization_started"))
-        assert not seq
-    finally:
-        A._post = orig
-
-
-def test_openai_style_no_tool_call_exit_forces_evaluation_even_before_cycle_boundary(monkeypatch):
-    """`tool_calls==0` による即終了は、既定の Research Cycle 境界（3ターン）より前でも Medium/Deep
-    なら評価を回避できない（1ターン目でモデルが止まっても評価が必ず挟まる）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 3)   # 境界はまだ先（3ターン目）だが no-tool で強制
-    seq = [
-        {"choices": [{"message": {"content": "早期の回答です。"}}]},
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分"),
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-        assert not seq   # 評価コールが実際に発行された（境界前スキップを回避できていない証拠）
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_rejects_wrong_function_name_and_retries_once(monkeypatch):
-    """評価応答が `submit_evaluation` 以外の関数を呼んだ場合は拒否し、1回だけ厳格な再ナッジで再試行
-    する。再試行が正しければ採用する。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    wrong_call = {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "w1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]}
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        wrong_call,                                            # 1回目の評価: 関数名不一致で拒否
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分"),   # 2回目: 正しい応答
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-        assert not seq
-    finally:
-        A._post = orig
-
-
-def test_parse_eval_response_rejects_mixed_tool_calls():
-    """`submit_evaluation` に加えて他ツールも同時に呼んだ応答（tool_calls が2件以上）は、その唯一の
-    関数名が `submit_evaluation` であっても拒否する（存在チェックだけでなく件数チェックを先に行う）。"""
-    resp = {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "e1", "function": {"name": "submit_evaluation",
-         "arguments": '{"status":"sufficient","reason":"x","next_action":"commit_evidence"}'}},
-        {"id": "e2", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}},
-    ]}}]}
-    assert A._parse_eval_response(resp) is None
-
-
-def test_openai_style_evaluation_rejects_mixed_tool_calls_and_retries_once(monkeypatch):
-    """評価応答が `submit_evaluation` と他ツールを同時に呼んだ（tool_calls 2件以上）場合も、単体
-    呼び出しの関数名不一致と同様に拒否し、1回だけ厳格な再ナッジで再試行する。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    mixed_call = {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "e1", "function": {"name": "submit_evaluation",
-         "arguments": '{"status":"sufficient","reason":"x","next_action":"commit_evidence"}'}},
-        {"id": "e2", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}},
-    ]}}]}
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        mixed_call,                                            # 1回目の評価: 混在で拒否
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分"),   # 2回目: 正しい応答
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-        assert not seq
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_malformed_json_becomes_blocked_after_one_retry(monkeypatch):
-    """不正 JSON・status/next_action 不整合の応答は拒否し、1回再試行しても直らなければ `blocked`
-    として stop reason に評価失敗が残る（fail-open で insufficient に倒さない）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    inconsistent_call = {"choices": [{"message": {"content": "", "tool_calls": [
-        {"id": "e1", "function": {"name": "submit_evaluation",
-         "arguments": '{"status":"sufficient","reason":"x","next_action":"stop"}'}}]}}]}   # 整合しない組
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        inconsistent_call,
-        inconsistent_call,   # 再試行も不整合のまま
-        {"choices": [{"message": {"content": "最終回答です。"}}]},   # blocked 後の最終合成
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["stop_reason"] == "evaluation_blocked"
-        assert final["evaluation_status"] == "blocked"
-        assert not seq
-    finally:
-        A._post = orig
-
-
-def test_openai_style_evaluation_call_failure_retries_once_then_blocked(monkeypatch):
-    """評価呼び出し自体が2回とも通信例外で失敗したら `blocked`（stop reason に評価失敗が残る）へ倒す
-    （fail-open で insufficient に倒すと評価を強制する意味が失われるため採らない）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    calls = []
-
-    def fake_post(url, headers, body, timeout=90):
-        calls.append(body)
-        if len(calls) in (2, 3):
-            raise RuntimeError("network down")
-        if len(calls) == 1:
-            return {"choices": [{"message": {"content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]}
-        return {"choices": [{"message": {"content": "最終回答です。"}, "finish_reason": "stop"}]}
-
-    orig = A._post
-    A._post = fake_post
-    try:
-        events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                     depth="medium"))
-        final = next(ev for ev in events if "final" in ev)
-        assert final["final"] == "最終回答です。"
-        assert final["stop_reason"] == "evaluation_blocked"
-        # tool turn + 評価2回（両方失敗） + blocked 後の最終合成 + 帰属呼び出し1回（citation が
-        # 実在すれば digest が非空になり発火する・fake の calls 切れは attribute_openai_style 側で
-        # 安全に空集合へ縮退する）。
-        assert len(calls) == 5
-    finally:
-        A._post = orig
-
-
 # ==== stop_reason の細分化（出力上限打ち切り／内容フィルタ打ち切りを "no_tool_calls" と区別する） ====
 # 正典（拡張設計 §4.4）の EV-0 自然完了 allowlist は帰属呼び出しの可否だけでなく、UI の
 # 「終了理由」（stop_reason）にも同じ判別を反映する——ツール未呼び出しで応答が返っても、
 # 実際には出力上限／内容フィルタで打ち切られていたなら「自然終了」（no_tool_calls）と偽らない。
 
-def test_incomplete_stop_reason_maps_known_truncation_and_filter_tokens():
-    assert A._incomplete_stop_reason("length", truncated=A._OPENAI_STYLE_TRUNCATED,
-                                     content_filtered=A._OPENAI_STYLE_CONTENT_FILTERED) == "truncated"
-    assert A._incomplete_stop_reason("content_filter", truncated=A._OPENAI_STYLE_TRUNCATED,
-                                     content_filtered=A._OPENAI_STYLE_CONTENT_FILTERED) == "content_filtered"
-
-
-def test_incomplete_stop_reason_unknown_or_non_string_normalizes_to_unknown():
-    """理由欠落・非文字列（壊れた upstream 応答）・真の未知値（既知のどの集合にも無い将来の新しい
-    値を想定・例 'weird_reason'）は "no_tool_calls"（自然終了）へ丸めない——原因不明を自然完了と
-    偽ると、実際には出力上限/内容フィルタ等で打ち切られていたケースまで UI に「自然終了」と
-    表示してしまう（silent fallback）。新しい断定はせず、既存の「終了理由を確認できませんでした」
-    表示に載る専用の値 "unknown" へ正規化する。"""
-    for reason in (None, {"unexpected": "shape"}, "weird_reason"):
-        result = A._incomplete_stop_reason(reason, truncated=A._OPENAI_STYLE_TRUNCATED,
-                                           content_filtered=A._OPENAI_STYLE_CONTENT_FILTERED)
-        assert result == "unknown", f"{reason!r} が unknown へ正規化されていない: {result}"
-        assert result != "no_tool_calls", (
-            f"{reason!r} が自然終了(no_tool_calls)へ丸められている（silent fallback の再発）: {result}")
-
-
-def test_openai_style_length_finish_reason_sets_truncated_stop_reason():
-    """OpenAI/Ollama 方言: ツール未呼び出しで `finish_reason=="length"`（出力上限で打ち切り）は
-    従来「自然終了」と同じ `no_tool_calls` へ丸められていたが、`truncated` に分ける。"""
-    seq = [
-        {"choices": [{"message": {"content": "途中まで書きました"}, "finish_reason": "length"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?",
-                                                 "v1", None) if "final" in ev)
-        assert final["stop_reason"] == "truncated"
-    finally:
-        A._post = orig
-
-
-def test_openai_style_content_filter_finish_reason_sets_content_filtered_stop_reason():
-    """OpenAI/Ollama 方言: `finish_reason=="content_filter"` は `content_filtered` に分ける。"""
-    seq = [
-        {"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?",
-                                                 "v1", None) if "final" in ev)
-        assert final["stop_reason"] == "content_filtered"
-    finally:
-        A._post = orig
-
-
-def test_anthropic_style_max_tokens_sets_truncated_stop_reason():
-    """Anthropic 方言: ツール未呼び出しで `stop_reason=="max_tokens"` は `truncated` に分ける。"""
-    seq = [_AResp([_ABlock("text", "途中まで書きました")], stop_reason="max_tokens")]
-    client = _AClient(seq)
-    events = list(A.anthropic_style(client, "m", A.SYSTEM, "消費税率は?", "v1", None))
-    final = next(ev for ev in events if "final" in ev)
-    assert final["stop_reason"] == "truncated"
-
-
-def test_gemini_max_tokens_finish_reason_sets_truncated_stop_reason(monkeypatch):
-    """Gemini 方言: `finishReason=="MAX_TOKENS"` は `truncated` に分ける。"""
-    seq = [
-        {"candidates": [{"content": {"parts": [{"text": "途中まで書きました"}]},
-                        "finishReason": "MAX_TOKENS"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = None
-        for ev in A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "質問", "v1", None):
-            if "final" in ev:
-                final = ev
-        assert final["stop_reason"] == "truncated"
-    finally:
-        A._post = orig
-
-
 # ==== RV6是正: 最終本文を実際に生成した呼び出しの finish_reason で stop_reason を再分類する ====
 # 初回ドラフト時点で決めた stop_reason（no_tool_calls/evaluation_sufficient/evaluation_blocked/
 # turns_exhausted）は、直後の再合成（citation 検証で落ちた場合）や最終合成（turns_exhausted/
 # 評価早期終了向けの追加呼び出し）で finish_reason が変わりうることを反映していなかった。
-
-def test_openai_style_resynthesis_after_dropped_citations_reclassifies_truncated_stop_reason(monkeypatch):
-    """初回ドラフトは自然完了（finish_reason 無し＝"stop"相当）でも、citation 検証で一部が落ちて
-    クリーン再合成が走り、その再合成呼び出しの finish_reason が "length"（出力上限）なら、
-    最終的な stop_reason は "no_tool_calls"（自然終了）のままにせず "truncated" へ再分類する
-    （**表示する本文を実際に生成した呼び出し**の finish_reason を優先する）。"""
-    real_doc = "4期/04_運用/障害記録.md"
-    monkeypatch.setattr(A, "run_tool", lambda name, args, world, scope_paths, **kw: (
-        {"hits": []}, {real_doc, "ghost.md"},
-        [{"doc_id": real_doc, "span": [1, 1], "quote": "実在", "ext": ".md"},
-         {"doc_id": "ghost.md", "span": [1, 1], "quote": "存在しない", "ext": ".md"}], []))
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"x"}'}}]}}]},
-        {"choices": [{"message": {"content": "ghost.md にも記載があります（古い草稿）。"}}]},
-        {"choices": [{"message": {"content": "確認できた根拠に基づく回答です（途中"},
-                     "finish_reason": "length"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "質問", "v1", None)
-                     if "final" in ev)
-        assert [c["doc_id"] for c in final["cites"]] == [real_doc]
-        assert final["stop_reason"] == "truncated"
-    finally:
-        A._post = orig
-
-
-def test_openai_style_final_synthesis_after_evaluation_sufficient_reclassifies_truncated_stop_reason(monkeypatch):
-    """評価フェーズが sufficient と判定して早期終了しても、その後の最終合成呼び出し
-    （tools 無し・Committed Evidence を使ってまとめる）の finish_reason が "length" なら、
-    stop_reason は "evaluation_sufficient" ではなく "truncated" になる（PART-4 research 経路等・
-    Deep/Medium いずれの depth でも同じ最終合成コードパスを通るため同様に露出していた）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分な根拠"),
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています（途中"},
-                     "finish_reason": "length"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                                 depth="medium") if "final" in ev)
-        assert final["stop_reason"] == "truncated"
-        assert final["evaluation_next_action"] == "commit_evidence"   # 評価結果自体は失わない
-    finally:
-        A._post = orig
-
-
-def test_openai_style_final_synthesis_natural_completion_keeps_evaluation_stop_reason(monkeypatch):
-    """再分類は「打ち切りだと判別できたとき」だけ発生する——最終合成呼び出しが明示的に自然完了
-    （`finish_reason="stop"`）でも stop_reason は元の "evaluation_sufficient" のまま
-    （回帰防止・既存契約の固定）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分な根拠"),
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}, "finish_reason": "stop"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                                 depth="medium") if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-    finally:
-        A._post = orig
-
-
-def test_openai_style_final_synthesis_unknown_finish_reason_keeps_evaluation_stop_reason(monkeypatch):
-    """再分類は「truncated/content_filtered と判別できたとき」だけ発生する——最終合成呼び出しが
-    真に未知の finish_reason（`'weird_reason'`・将来の新しい値を想定）を返しても、内部的には
-    "unknown" に正規化されるだけで evaluation_* 等の情報を上書きしない（stop_reason は元の
-    "evaluation_sufficient" のまま保持する）。"""
-    monkeypatch.setattr(A, "RESEARCH_CYCLE_TURNS", 1)
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        _eval_tool_call("e1", "sufficient", "commit_evidence", "十分な根拠"),
-        {"choices": [{"message": {"content": "TAX-RATE で管理しています。"}, "finish_reason": "weird_reason"}]},
-    ]
-    orig = A._post
-    A._post = lambda url, headers, body, timeout=90: seq.pop(0)
-    try:
-        final = next(ev for ev in A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None,
-                                                 depth="medium") if "final" in ev)
-        assert final["stop_reason"] == "evaluation_sufficient"
-    finally:
-        A._post = orig
-
-
-def test_stop_reason_vocabulary_matches_render_js_display_table():
-    """`stop_reason` の閉じた語彙（`agentic_search.STOP_REASONS`・本モジュールの生成箇所から
-    実際に導出される定数集合）が、`web/chat/render.js::STOP_REASON_TOKEN_LABEL`（UI 表示側の
-    唯一の対応表）と過不足なく一致することを固定する。新しい stop_reason をサーバ側だけ追加して
-    表示側の対応表を更新し忘れる（＝「終了理由を確認できませんでした」に落ちる）、または表示側
-    だけ増やしてサーバが実際には出さない値が残る、の両方を防ぐ。`plan_completed`（複数下調べ役の
-    計画経路・退役済み `_run_sub_plan` のみが生成）は `STOP_REASONS` にも表示側にも含まれない
-    （本モジュールからは到達不能）。
-    """
-    import re
-
-    render_js = pathlib.Path(__file__).resolve().parents[2] / "web" / "chat" / "render.js"
-    src = render_js.read_text(encoding="utf-8")
-    m = re.search(r"const STOP_REASON_TOKEN_LABEL = Object\.assign\(Object\.create\(null\), \{(.*?)\}\);",
-                 src, re.S)
-    assert m, "STOP_REASON_TOKEN_LABEL が render.js に見つからない"
-    keys = set(re.findall(r"(\w+):\s*'", m.group(1)))
-    assert keys == A.STOP_REASONS, (
-        f"render.js の対応表と agentic_search.STOP_REASONS が食い違っている: {keys ^ A.STOP_REASONS}")
-
-
-def test_hit_summary_node_glob_search_reports_total_count():
-    """GLOB-1×TRACE-HITS 調停: glob にも件数ノード（打ち切り前の総件数・パターン付き）。"""
-    node = A._hit_summary_node("glob_search", {"pattern": "*.jcl"},
-                               {"count": 250, "paths": ["a.jcl"], "truncated": True})
-    assert node is not None
-    assert node["label"] == "検索結果（ファイル名）"
-    assert "「*.jcl」→ 250件" in node["detail"]
-    assert node.get("event_type") == "tool_completed"
-    sub = A._hit_summary_node_sub("glob_search", {"count": 0, "paths": [], "truncated": False})
-    assert sub is not None and "0件ヒットしました" in sub["detail"]
-
 
 def test_ripgrep_search_tool_result_reports_truncated_docs_with_zero_hits(monkeypatch):
     """ツール結果の `truncated_docs` は **ヒット0件の打切り文書**も LLM へ伝える（検収是正）。
@@ -7390,7 +2987,7 @@ def test_run_tool_read_doc_single_huge_line_bounded_memory_and_sets_file_truncat
 
 
 def test_run_tool_read_around_single_huge_line_beyond_line_max_bounded_memory(monkeypatch, tmp_path):
-    """read_around でも単一巨大行の安全弁が効く: `SHERPA_READ_LINE_MAX_BYTES`（既定2MiB）を超える
+    """read_around でも単一巨大行の安全弁が効く: `_READ_LINE_MAX_BYTES`（2MiB）を超える
     単一行（10MB）でも、ピーク割当は非比例のまま、最終的な返却テキストは従来どおり
     `TOOL_RESULT_MAX_BYTES` に収まる（`test_read_around_clips_output_for_huge_single_line_doc` は
     既定の行安全弁の閾値未満（200万文字）だったため、本テストは閾値を超える行で確認する）。"""
@@ -7438,41 +3035,6 @@ def test_run_tool_grep_hit_line_matches_read_around_for_special_separators(monke
 
 
 # ===== S2: `_truncated_docs_node`（UI「思考の流れ」への打切り表示） =====
-
-def test_truncated_docs_node_present_only_when_truncated_docs_nonempty():
-    """`_truncated_docs_node()` は `truncated_docs`（非空）があるときだけノード化する
-    （`_degrade_result_node` と同じ「run_tool 直後に result を見てもう1件 yield する」枠組み）。
-    文言は平文のみ（内部語彙＝doc_id は一切出さない・docs/04-画面の原則.md）。"""
-    node = A._truncated_docs_node({"hits": [], "truncated_docs": ["big.xlsx"]})
-    assert node["type"] == "node" and node["kind"] == "tool"
-    assert "big.xlsx" not in node["label"] and "big.xlsx" not in node["detail"]
-    assert A._truncated_docs_node({"hits": []}) is None
-    assert A._truncated_docs_node({"hits": [], "truncated_docs": []}) is None   # 空リストは None
-    assert A._truncated_docs_node({"count": 0, "docs": []}) is None   # list_docs 等の無関係な result
-
-
-def test_openai_style_yields_truncated_docs_node_when_ripgrep_search_reports_it(monkeypatch):
-    """S2: `ripgrep_search` が `truncated_docs` を申告したら、「思考の流れ」に打切りノードが乗る
-    （`degrade_reason` の既存の仕組みと完全に同型の枠組みに1種類足しただけ＝フロントは既存ノードの
-    kind/label/detail 契約のまま無改修で表示できる）。"""
-    seq = [
-        {"choices": [{"message": {"content": "", "tool_calls": [
-            {"id": "c1", "function": {"name": "ripgrep_search", "arguments": '{"query":"TAX-RATE"}'}}]}}]},
-        {"choices": [{"message": {"content": "確認しました。"}}]},
-    ]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-
-    def fake_grep(q, world, **kw):
-        td = kw.get("truncated_docs")
-        if td is not None:
-            td.append("big.xlsx")
-        return []
-
-    monkeypatch.setattr(A.grep_tool, "grep_search", fake_grep)
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "消費税率は?", "v1", None))
-    nodes = [e["node"] for e in events if "node" in e]
-    assert any(n["label"] == "検索が一部打ち切られています" for n in nodes)
-
 
 # ===== L4c: 親返し（検索は細かく・回答には文脈を・§3.3/§3.4）=====
 # es_search 限定・常時 ON（TOGGLE-RM・2026-09-03 でグローバル切替トグル `SHERPA_ES_PARENT_RETURN`
@@ -7533,6 +3095,7 @@ def test_parent_return_no_full_tier_region_or_chunk_by_size(monkeypatch, tmp_pat
 
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", fake_chunk_ids_for_parent)
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 1000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 1000)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
@@ -7570,6 +3133,7 @@ def test_parent_return_minimum_guarantee_lower_score_doc_survives(monkeypatch, t
     baseline_total = len("top-baseline".encode("utf-8")) + len("second-baseline".encode("utf-8"))
     delta_doc1 = len(doc1_md.encode("utf-8")) - len("top-baseline".encode("utf-8"))
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", baseline_total + delta_doc1)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", baseline_total + delta_doc1)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
@@ -7607,6 +3171,7 @@ def test_parent_return_deterministic(monkeypatch, tmp_path):
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"a.docx": md, "b.docx": md})
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 5000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 5000)
 
     res1, _, _, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     res2, _, _, _ = A.run_tool("es_search", {"query": "q"}, world, None)
@@ -7630,6 +3195,7 @@ def test_parent_return_citations_stay_at_chunk_grain(monkeypatch, tmp_path):
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"a.xlsx": md})
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 5000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 5000)
 
     res, _docs, cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     assert len(res["hits"]) == 1 and res["hits"][0]["doc_id"] == "a.xlsx"   # doc 単位に束ねられている
@@ -7653,6 +3219,7 @@ def test_parent_return_legacy_hits_pass_through_untouched(monkeypatch, tmp_path)
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"rag.docx": rag_md})
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 5000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 5000)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     legacy_entries = [h for h in res["hits"] if h["doc_id"] == "legacy.md"]
@@ -7670,6 +3237,7 @@ def test_parent_return_redacts_region_text(monkeypatch, tmp_path):
             "chunk_id": "c1", "parent_id": "p1", "score": 1.0}]
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"a.docx": md})
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 5000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 5000)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     assert res["hits"][0]["tier"] == "region"
@@ -7688,6 +3256,7 @@ def test_parent_return_never_returns_full_tier_even_with_huge_budget(monkeypatch
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"a.docx": md})
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: ["c1"])
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 1_000_000)     # 潤沢な予算（旧 P3 なら確実に採用）
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 1_000_000)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     assert res["hits"][0]["tier"] == "region"
@@ -7715,6 +3284,7 @@ def test_parent_return_per_doc_cap_stops_one_doc_eating_shared_budget(monkeypatc
                         lambda w, doc_id, parent_ids, limit=5000: (["c1"] if doc_id == "top.docx" else ["c2"]))
     # budget_for_rag=4000・doc 数2件 → per_doc_cap=2000（_HIT_TEXT_MIN_BYTES=512 の床より大きい）。
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 4000)
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 4000)
 
     res, _docs, _cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
     by_doc = {h["doc_id"]: h for h in res["hits"]}
@@ -7726,23 +3296,6 @@ def test_parent_return_per_doc_cap_stops_one_doc_eating_shared_budget(monkeypatc
     assert "text_truncated" not in by_doc["second.docx"]
     # `tool_result_clipped` 計測が拾う最上位フラグにも合流する（`_BYTE_CLIP_TOOLS` に es_search 含む）。
     assert res["text_truncated"] is True
-
-
-def test_parent_return_disabled_env_is_byte_identical_to_hit_per_chunk(monkeypatch, tmp_path):
-    """TOGGLE-RM（2026-09-03）: グローバルな系統切替トグルは撤去済み・env では OFF にできない。
-    `_parent_return_enabled` は今も内部シームとして残るため、直接差し替えて False 分岐
-    （従来のヒット単位・束ねない・`tier`/`chunks` 無し・rag.md が実在しても一切読みに行かない）を
-    byte-identical のまま引き続き検証する。"""
-    world = "parent-return-off-world"
-    md = "<!-- chunk:c1 -->\n" + "Z" * 100 + "\n"
-    hits = [{"doc_id": "a.docx", "text": "本文A", "ext": ".docx",
-            "chunk_id": "c1", "parent_id": "p1", "score": 1.0}]
-    _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"a.docx": md})
-    monkeypatch.setattr(A, "_parent_return_enabled", lambda: False)
-
-    res, docs, cites, _ = A.run_tool("es_search", {"query": "q"}, world, None)
-    assert res["hits"] == [{"doc_id": "a.docx", "line": None, "text": "本文A"}]
-    assert docs == {"a.docx"} and len(cites) == 1
 
 
 def test_parent_return_p2_region_bounded_memory_for_large_rag_md(monkeypatch, tmp_path):
@@ -7767,6 +3320,7 @@ def test_parent_return_p2_region_bounded_memory_for_large_rag_md(monkeypatch, tm
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent",
                         lambda w, doc_id, parent_ids, limit=5000: ["t1", "t2"])
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 2000)   # 全文(20MB超)は不可・領域(小)は入る
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 2000)
 
     tracemalloc.start()
     try:
@@ -7799,6 +3353,7 @@ def test_parent_return_chunk_degrade_bounded_memory_for_large_rag_md(monkeypatch
     monkeypatch.setattr(A.es_index, "chunk_ids_for_parent",
                         lambda w, doc_id, parent_ids, limit=5000: ["t1", "t2"])
     monkeypatch.setattr(A, "TOOL_RESULT_MAX_BYTES", 200)   # 領域(t1+t2)すら入らない予算
+    monkeypatch.setattr(RT, "TOOL_RESULT_MAX_BYTES", 200)
 
     tracemalloc.start()
     try:
@@ -7810,35 +3365,6 @@ def test_parent_return_chunk_degrade_bounded_memory_for_large_rag_md(monkeypatch
     assert res["hits"][0]["tier"] == "chunk"
     assert res["hits"][0]["text"] == "本文"
     assert peak < 10 * 1024 * 1024
-
-
-def test_graph_neighbors_view_marks_edges_backed_by_unverified_docs(monkeypatch):
-    """検証で落ちた文書（実在しない等）を裏付けとする辺は doc を落として unverified を立てる（辺を消すと
-    経路が繋がって見えて確定根拠に化ける）。doc を持たない辺と、検証済み doc の辺はそのまま。"""
-    monkeypatch.setattr(A, "verify_doc_exists", lambda doc_id, world, scope_paths=None: doc_id == "ok.cbl")
-    from sherpa import lens_service
-    fake = [{"name": "PGM", "label": "Module", "category": "プログラム", "role": "実装", "distance": 1,
-             "path": ["X", "PGM"], "cid": "m:PGM",
-             "evidence": {"edges": [{"type": "COPIES", "from": "X", "to": "PGM", "doc": "ok.cbl"},
-                                    {"type": "INVOKES", "from": "PGM", "to": "Y", "doc": "gone.cbl"},
-                                    {"type": "CONTAINS", "from": "PGM", "to": "Z"}], "grep": []}}]
-    orig = lens_service.neighbor_cards
-    lens_service.neighbor_cards = lambda world, term, sp=None: list(fake)
-    try:
-        res, docs, _, cards = A.run_tool("graph_neighbors", {"name": "X"}, "v1", None)
-        edges = res["neighbors"][0]["edges"]
-        assert edges == [{"type": "COPIES", "from": "X", "to": "PGM", "doc": "ok.cbl"},
-                         {"type": "INVOKES", "from": "PGM", "to": "Y", "unverified": True},
-                         {"type": "CONTAINS", "from": "PGM", "to": "Z"}]
-        assert docs == {"ok.cbl"}
-        # API 経路の構造 Evidence（card_meta）にも辺の向きと未確認の印が引き継がれ、逆向きと区別される
-        ev = A._card_structural_evidence(cards)
-        assert ev[0]["card_meta"]["edges"] == ["X →COPIES→ PGM", "PGM →INVOKES→ Y（未確認）", "PGM →CONTAINS→ Z"]
-        from sherpa.providers.base import _dedupe_structural_evidence
-        rev = {**ev[0], "card_meta": {**ev[0]["card_meta"], "edges": ["PGM →COPIES→ X"]}}
-        assert len(_dedupe_structural_evidence([ev[0], rev])) == 2   # 向き違いは別 Evidence
-    finally:
-        lens_service.neighbor_cards = orig
 
 
 # ===== S3b: 原本読取ツール（`docs/archive/2026-09-10-Codex原本直読と調査スキル.md` §2-9）=====
@@ -8047,6 +3573,7 @@ def test_run_tool_toctou_rejects_path_swapped_to_symlink_after_check(monkeypatch
     real_resolved = A._safe_original_path(world, "note.txt", None, kinds=A._FILE_HEAD_KINDS)
     assert real_resolved is not None
     monkeypatch.setattr(A, "_safe_original_path", lambda *a, **kw: real_resolved)
+    monkeypatch.setattr(RT, "_safe_original_path", lambda *a, **kw: real_resolved)
 
     # 検査「後」に実体を KB 外への symlink へ差し替える（TOCTOU の隙間を模す）。
     outside = tmp_path / "outside.txt"
@@ -8079,6 +3606,7 @@ def test_run_tool_ancestor_dir_symlink_swap_after_check_is_rejected(monkeypatch,
     real_resolved = A._safe_original_path(world, "sub/note.txt", None, kinds=A._FILE_HEAD_KINDS)
     assert real_resolved is not None
     monkeypatch.setattr(A, "_safe_original_path", lambda *a, **kw: real_resolved)
+    monkeypatch.setattr(RT, "_safe_original_path", lambda *a, **kw: real_resolved)
 
     # 検査「後」に祖先ディレクトリ（最終要素ではなく sub/ 自体）を KB 外への symlink に差し替える。
     # 差し替え先には元ファイルと同じ inode をハードリンクしておく（fstat 突合だけでは検出できない
@@ -8239,11 +3767,7 @@ def test_doc_reader_text_locator_pptx_includes_tables_and_notes():
 def test_doc_reader_text_locator_docx_table_row_paging_distinguishes_locator():
     """表だけを `table_row_start` を進めて呼び直した（行のページング）2回の
     結果は、段落の locator（`paragraphs[s-e]`）が同じでも表の行範囲が異なる——以前は段落側の
-    範囲だけを locator にしていたため2回とも同じ locator に潰れ、`InvestigationState` で
-    別読み取りとして区別できなかった（`_find` は kind="read"／span=None のとき locator も
-    鍵に含める）。"""
-    from sherpa.investigation_state import InvestigationState
-
+    範囲だけを locator にしていたため2回とも同じ locator に潰れた。"""
     def _page(row_start: int) -> dict:
         return {"paragraphs": [{"i": 0, "style": "Normal", "text": "見出し"}],
                 "tables": [{"i": 0, "row_start": row_start, "total_rows": 60,
@@ -8256,26 +3780,6 @@ def test_doc_reader_text_locator_docx_table_row_paging_distinguishes_locator():
     assert locator0 != locator50
     assert locator0 == "paragraphs[0-0];tables[0-0]rows[0-49]"
     assert locator50 == "paragraphs[0-0];tables[0-0]rows[50-99]"
-
-    state = InvestigationState(question="q", scope={})
-    for row_start, r in ((0, r0), (50, r50)):
-        text, locator = A._doc_reader_text_locator("docx_paragraphs", r)
-        synthetic = {**r, "doc_id": "big.docx", "text": text, "locator": locator}
-        state.add_tool_result("docx_paragraphs", {"doc_id": "big.docx", "table_row_start": row_start},
-                              synthetic, [], None)
-    reads = [e for e in state.evidence if e.kind == "read" and e.doc_id == "big.docx"]
-    assert len(reads) == 2
-
-
-def test_run_tool_original_read_tools_registered_in_openai_and_gemini_and_mcp():
-    from sherpa import mcp_server
-    names_openai = {t["function"]["name"] for t in A.openai_tools(with_es=True, with_graph=True)}
-    names_gemini = {f["name"] for f in A.gemini_tools(with_es=True, with_graph=True)[0]["functionDeclarations"]}
-    names_mcp = {d["name"] for d in mcp_server._tool_defs()}
-    for name in ("xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages", "file_head"):
-        assert name in names_openai, name
-        assert name in names_gemini, name
-        assert name in names_mcp, name
 
 
 def test_finish_docx_paragraphs_result_keeps_paragraphs_before_big_tables():
@@ -8331,38 +3835,6 @@ def test_finish_docx_paragraphs_result_rescue_secures_paragraph_before_big_table
     assert r["paragraphs"][0]["text"]                       # 空にはしない（以前は "" になっていた）
 
 
-def test_hit_summary_node_list_docs_shows_doctype_state_filters_not_whole():
-    node = A._hit_summary_node("list_docs", {"doctype": "Excel"}, {"count": 12, "docs": []})
-    assert "「全体」" not in node["detail"] and "種別=Excel" in node["detail"] and "12件" in node["detail"]
-    node = A._hit_summary_node("list_docs", {"path_prefix": "4期", "state": "ready"}, {"count": 3, "docs": []})
-    assert "4期（状態=ready）" in node["detail"]
-    assert A._tool_node("list_docs", {})["detail"] == "「全体」"
-
-
-def test_hit_summary_node_graph_neighbors_shows_truncation_and_total():
-    node = A._hit_summary_node("graph_neighbors", {"name": "TAXRATE"},
-                               {"neighbors": [{"name": "A"}] * 30, "truncated": True, "count": 500})
-    assert "30件" in node["detail"] and "全 500 件" in node["detail"]
-
-
-def test_hit_summary_node_sub_graph_neighbors_shows_truncation():
-    node = A._hit_summary_node_sub("graph_neighbors",
-                                   {"neighbors": [{"name": "A"}] * 30, "truncated": True, "count": 500})
-    assert "全 500 件" in node["detail"]
-
-
-def test_hit_summary_nodes_mark_compare_truncation():
-    res = {"status": "comparable", "diff": "--- a\n+++ b\n+a\n-b\n", "truncated": True}
-    assert "上限で打ち切り" in A._hit_summary_node("compare_documents", {"left_doc_id": "a", "right_doc_id": "b"}, res)["detail"]
-    assert "上限で打ち切り" in A._hit_summary_node_sub("compare_documents", res)["detail"]
-
-
-def test_hit_summary_nodes_mark_outline_file_truncation():
-    res = {"doc_id": "x.md", "count": 25, "headings": [], "truncated": False, "file_truncated": True}
-    assert "件数は過小" in A._hit_summary_node("doc_outline", {"doc_id": "x.md"}, res)["detail"]
-    assert "件数は過小" in A._hit_summary_node_sub("doc_outline", res)["detail"]
-
-
 def test_search_results_mark_truncated_when_hit_cap_reached(monkeypatch):
     from sherpa import grep_tool
     fake = [{"doc_id": f"d{i}.md", "line": 1, "text": "x", "span": [1, 1]} for i in range(3)]
@@ -8374,13 +3846,6 @@ def test_search_results_mark_truncated_when_hit_cap_reached(monkeypatch):
     assert "truncated" not in res
 
 
-def test_hit_summary_nodes_mark_search_hit_cap():
-    res = {"hits": [{"doc_id": "a.md"}] * 30, "truncated": True}
-    assert "上限で打ち切り" in A._hit_summary_node("ripgrep_search", {"query": "q"}, res)["detail"]
-    assert "上限で打ち切り" in A._hit_summary_node_sub("ripgrep_search", res)["detail"]
-    assert "上限で打ち切り" in A._hit_summary_node_sub("es_search", res)["detail"]
-
-
 def test_es_search_cap_is_judged_on_raw_hits_before_filtering(monkeypatch):
     from sherpa import es_index, documents
     raw = [{"doc_id": f"d{i}.md", "line": 1, "text": "x", "score": 1.0, "span": [1, 1]} for i in range(3)]
@@ -8390,174 +3855,8 @@ def test_es_search_cap_is_judged_on_raw_hits_before_filtering(monkeypatch):
     assert res.get("truncated") is True and len(res["hits"]) <= 2
 
 
-def test_usage_shrink_keeps_latest_for_date_series_and_heaviest_for_rows():
-    from sherpa import agentic_search as A
-    daily = [{"date": f"2026-08-{d:02d}", "turns": d} for d in range(1, 31)]
-    rows = [{"uid": f"u{i}", "input": 100 - i} for i in range(30)]
-    out = A._usage_shrink_lists({"daily": daily, "rows": rows}, 5)
-    assert [x["date"] for x in out["daily"]] == [f"2026-08-{d:02d}" for d in range(26, 31)]   # 直近側
-    assert [x["uid"] for x in out["rows"]] == ["u0", "u1", "u2", "u3", "u4"]                  # 重い側
-
-
-def test_usage_return_limit_keeps_heaviest_rows():
-    from sherpa import agentic_search as A
-    rows = [{"uid": f"u{i}", "kind": "chat", "input": 1000 - i, "output": 0} for i in range(60)]
-    out = A._usage_apply_return_limit({"rows": rows}, 50)
-    assert len(out["rows"]) == 50 and out["rows"][0]["uid"] == "u0" and out["truncated"] is True
-    assert out["omitted_count"] == 10
-
-
-def test_usage_return_limit_caps_nested_series_in_overview():
-    from sherpa import agentic_search as A
-    daily = [{"date": f"2026-07-{(d % 28) + 1:02d}", "turns": d} for d in range(60)]
-    out = A._usage_apply_return_limit({"daily": list(daily), "tokens": {"daily": list(daily)},
-                                       "users": [{"uid": "u", "turns": 1}]}, 50)
-    assert len(out["daily"]) == 50 and len(out["tokens"]["daily"]) == 50
-    assert out["daily"][-1] == daily[-1]            # 直近側を残す
-    assert out["users"] == [{"uid": "u", "turns": 1}]   # 系列でないリストは触らない
-    assert out["truncated"] is True and out["omitted_count"] == 20
-
-
-def test_render_existing_claims_for_prompt_keeps_all_ids_over_budget():
-    from sherpa import agentic_search as A
-    claims = [
-        {"id": "c1", "status": "confirmed", "text": "x" * 500},
-        {"id": "c2", "status": "inferred", "text": "後続の主張"},
-    ]
-    out = A._render_existing_claims_for_prompt(claims, max_bytes=200)
-    assert len(out.encode("utf-8")) <= 200
-    assert "[c1]" in out and "[c2]" in out                    # 全件の id を保持
-    assert "confirmed" in out and "inferred" in out            # 全件の status を保持
-    lines = out.split("\n")
-    assert any(line.startswith("[c2]") for line in lines)      # c2 行が丸ごと残る（途中で切れない）
-    for line in lines:
-        assert line.count("[") == 0 or "]" in line             # id が途中で切れていない
-
-
 # ===== S3: 障害種別の分類（`_is_recoverable_tool_exception`/`_tool_backend_kind`/
 # `_record_tool_exception`/`_record_tool_result_error_code`）=====
-
-def test_tool_backend_kind_classifies_by_closed_set():
-    assert A._tool_backend_kind("es_search") == "fulltext"
-    assert A._tool_backend_kind("graph_neighbors") == "graph"
-    assert A._tool_backend_kind("ripgrep_search") == "read_io"
-    assert A._tool_backend_kind("xlsx_sheets") == "read_io"
-    assert A._tool_backend_kind("some_unknown_tool") == "read_io"   # 未知名は read_io へ丸める
-
-
-def test_is_recoverable_tool_exception_covers_os_timeout_and_neo4j_client_errors():
-    """接続断・タイムアウト・読取I/O（ES/Neo4j クライアント例外・`OSError`/`TimeoutError` 系）は
-    回復可能——それ以外（プログラムの欠陥を示す例外）は回復不可。"""
-    from neo4j.exceptions import ServiceUnavailable
-
-    assert A._is_recoverable_tool_exception(OSError("boom")) is True
-    assert A._is_recoverable_tool_exception(TimeoutError("boom")) is True
-    assert A._is_recoverable_tool_exception(ConnectionError("boom")) is True   # OSError のサブクラス
-    assert A._is_recoverable_tool_exception(ServiceUnavailable("boom")) is True
-    assert A._is_recoverable_tool_exception(TypeError("boom")) is False
-    assert A._is_recoverable_tool_exception(KeyError("boom")) is False
-    assert A._is_recoverable_tool_exception(AssertionError("boom")) is False
-
-
-def test_is_recoverable_tool_exception_excludes_neo4j_client_errors():
-    """`Neo4jError` のうち `ClientError` 系（`CypherSyntaxError`/`ConfigurationError` 含む・クエリの
-    バグや設定ミス）は回復不可——`TransientError`（サーバ側の一時的な過負荷等）だけが回復可能。"""
-    from neo4j.exceptions import ConfigurationError, CypherSyntaxError, TransientError
-
-    assert A._is_recoverable_tool_exception(TransientError("boom")) is True
-    assert A._is_recoverable_tool_exception(CypherSyntaxError("boom")) is False
-    assert A._is_recoverable_tool_exception(ConfigurationError("boom")) is False
-
-
-def test_is_recoverable_tool_exception_classifies_http_error_by_status_before_oserror():
-    """`HTTPError` は `OSError` のサブクラスだが、一般 `OSError` 判定より先にステータスコードで
-    分類する——4xx（クライアント起因）は回復不可、5xx・429（一時的）は回復可能。"""
-    import io
-    import urllib.error
-
-    def _http_error(code: int) -> urllib.error.HTTPError:
-        return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(b""))
-
-    assert A._is_recoverable_tool_exception(_http_error(400)) is False
-    assert A._is_recoverable_tool_exception(_http_error(404)) is False
-    assert A._is_recoverable_tool_exception(_http_error(429)) is True
-    assert A._is_recoverable_tool_exception(_http_error(500)) is True
-    assert A._is_recoverable_tool_exception(_http_error(503)) is True
-
-
-def test_record_tool_exception_marks_backend_kind_for_recoverable_and_flag_for_non_recoverable():
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_exception(state, "es_search", OSError("boom"))
-    assert state.backend_failures == {"fulltext": True, "graph": False, "read_io": False}
-    assert state.non_recoverable_failure is False
-
-    state2 = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_exception(state2, "graph_neighbors", TypeError("boom"))
-    assert state2.backend_failures == {"fulltext": False, "graph": False, "read_io": False}
-    assert state2.non_recoverable_failure is True   # プログラムの欠陥は種別に関わらずこのフラグ
-
-
-def test_record_tool_exception_non_recoverable_persists_alongside_recoverable():
-    """同一ターンで回復可能（接続断）と回復不可（プログラム欠陥）が混在しても、回復不可の
-    フラグは戻らない（一度立てたら run 内で戻さない・単発フォールバック禁止の判定材料）。"""
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_exception(state, "ripgrep_search", OSError("boom"))
-    A._record_tool_exception(state, "es_search", TypeError("boom"))
-    assert state.backend_failures["read_io"] is True
-    assert state.non_recoverable_failure is True
-
-
-def test_record_tool_result_error_code_marks_read_io_only_for_known_code():
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(state, {"error": "読み取りに失敗しました", "error_code": "read_io_failed"})
-    assert state.backend_failures["read_io"] is True
-
-    state2 = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(state2, {"error": "範囲外です"})   # error_code 無し＝無反応
-    assert state2.backend_failures == {"fulltext": False, "graph": False, "read_io": False}
-
-
-def test_record_tool_result_error_code_marks_fulltext_for_es_hard_degrade():
-    """`es_search` の `degrade_reason` が `es_unavailable`/`es_query_failed`（BM25 自体も失敗した
-    既知値・`_ES_DEGRADE_WORDING` に含まれない）のとき `backend_failures["fulltext"]` を立てる——
-    BM25 継続時の縮退理由（`query_embed_failed` 等・`_ES_DEGRADE_WORDING` に含まれる既知値）は
-    検索自体は実行できているため対象外のまま。"""
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(
-        state, {"hits": [], "degrade_reason": "es_unavailable"}, "es_search")
-    assert state.backend_failures["fulltext"] is True
-
-    state2 = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(
-        state2, {"hits": [], "degrade_reason": "query_embed_failed"}, "es_search")
-    assert state2.backend_failures["fulltext"] is False
-
-
-def test_record_tool_result_error_code_marks_graph_for_neighbor_cards_failure():
-    """`graph_neighbors` の結果に `neighbor_cards` 由来の固定コード（`"graph_unavailable"`＝回復可能／
-    `"graph_internal_error"`＝回復不可）が付いていれば、対応するフラグへ反映する。"""
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(
-        state, {"neighbors": [], "error_code": "graph_unavailable"}, "graph_neighbors")
-    assert state.backend_failures["graph"] is True
-    assert state.non_recoverable_failure is False
-
-    state2 = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(
-        state2, {"neighbors": [], "error_code": "graph_internal_error"}, "graph_neighbors")
-    assert state2.backend_failures["graph"] is False
-    assert state2.non_recoverable_failure is True
-
 
 def test_open_doc_stream_open_failure_carries_read_io_error_code(monkeypatch, tmp_path):
     """`_open_doc_stream` の実際の open 失敗（`OSError`）が固定理由コード `read_io_failed` を
@@ -8568,37 +3867,13 @@ def test_open_doc_stream_open_failure_carries_read_io_error_code(monkeypatch, tm
         raise OSError("boom")
 
     monkeypatch.setattr(A, "_open_file_nofollow_walk", _boom)
+    monkeypatch.setattr(RT, "_open_file_nofollow_walk", _boom)
     monkeypatch.setattr(A, "_safe_doc_path", lambda world, doc_id, layer=None: (tmp_path, "x.txt", tmp_path / "x.txt"))
+    monkeypatch.setattr(RT, "_safe_doc_path", lambda world, doc_id, layer=None: (tmp_path, "x.txt", tmp_path / "x.txt"))
     monkeypatch.setattr(scope_mod, "in_scope", lambda doc_id, sp: True)
     f, err = A._open_doc_stream("v1", "x.txt", None, None)
     assert f is None
     assert err == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
-
-
-def test_finalize_payload_preserves_budget_exhausted_stop_reason_when_citations_all_dropped():
-    """予算到達（turns_exhausted 等）で打ち切られたターンで、集めた引用候補が機械検証で全滅
-    （`committed` 空・`dropped` 非空）しても、`stop_reason` は `evidence_verification_failed` へ
-    上書きされない——上書きされると `providers/base.py::run` の単発フォールバック除外判定
-    （予算到達を縮退対象から除外する規律）が実際の終了理由を読み取れなくなる回帰を防ぐ。"""
-    payload = A._build_final_payload(
-        "", set(), True,
-        [{"doc_id": "ghost-does-not-exist.md", "span": [1, 1], "quote": "x", "ext": ".md"}],
-        [], None, set(), "turns_exhausted", "v1")
-    assert payload["cites"] == []
-    assert payload["dropped_citations"], "citation が全滅していない前提が崩れている"
-    assert payload["stop_reason"] == "turns_exhausted"
-
-
-def test_finalize_payload_still_upgrades_to_evidence_verification_failed_when_not_budget():
-    """予算到達以外（通常の自然完了等）の stop_reason で引用が全滅した場合は、従来どおり
-    `evidence_verification_failed` へ上書きされる（予算到達専用の除外が過剰に広がっていないこと）。"""
-    payload = A._build_final_payload(
-        "", set(), True,
-        [{"doc_id": "ghost-does-not-exist.md", "span": [1, 1], "quote": "x", "ext": ".md"}],
-        [], None, set(), "no_tool_calls", "v1")
-    assert payload["cites"] == []
-    assert payload["dropped_citations"]
-    assert payload["stop_reason"] == "evidence_verification_failed"
 
 
 def test_es_index_search_classifies_http_400_as_rejected_and_5xx_as_failed(monkeypatch):
@@ -8626,67 +3901,23 @@ def test_es_index_search_classifies_http_400_as_rejected_and_5xx_as_failed(monke
     assert hits == [] and reason == "es_query_failed"
 
 
-def test_record_tool_result_error_code_es_query_rejected_marks_non_recoverable():
-    """`es_search` の `degrade_reason` が `es_query_rejected`（4xx＝プログラム/設定の欠陥）のときは
-    `backend_failures["fulltext"]` ではなく `non_recoverable_failure` を立てる——単発フォールバック
-    への縮退（回復可能な障害のみが対象）を誤って許さないため。"""
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(
-        state, {"hits": [], "degrade_reason": "es_query_rejected"}, "es_search")
-    assert state.backend_failures["fulltext"] is False
-    assert state.non_recoverable_failure is True
-
-
 def test_open_verified_original_open_failure_carries_read_io_error_code(monkeypatch, tmp_path):
     """`_open_verified_original`（xlsx_sheets 等・原本読取ツールが使う TOCTOU 再検証 open）の
-    失敗が固定理由コード `read_io_failed` を結果へ付ける——`_open_doc_stream` と同じ経路で
-    `InvestigationState.backend_failures["read_io"]` に届くようにする。"""
+    失敗が固定理由コード `read_io_failed` を結果へ付ける。"""
     def _boom(root, rel_parts):
         raise OSError("boom")
 
     monkeypatch.setattr(A, "_open_file_nofollow_walk", _boom)
+    monkeypatch.setattr(RT, "_open_file_nofollow_walk", _boom)
     f, err = A._open_verified_original(tmp_path, "x.txt", None)
     assert f is None
     assert err == {"error": "読み取りに失敗しました", "error_code": "read_io_failed"}
 
 
-def test_compare_documents_read_failure_carries_read_io_error_code(monkeypatch, tmp_path):
-    """`compare_docs.compare` の RAG 正本読み取り失敗（`_read_capped` の `OSError`）が固定理由コード
-    `read_io_failed` を結果へ付ける——`_record_tool_result_error_code` は名前非依存でこれを拾い、
-    原本読取（compare_documents）だけが I/O 失敗したターンでも `backend_failures["read_io"]` に届く。"""
-    from sherpa import compare_docs
-
-    left = tmp_path / "left.rag.md"
-    right = tmp_path / "right.rag.md"
-    left.write_text("left content", encoding="utf-8")
-    right.write_text("right content", encoding="utf-8")
-
-    monkeypatch.setattr(compare_docs, "_in_scope", lambda doc_id, sp: True)
-    monkeypatch.setattr(compare_docs, "_rag_md_path",
-                        lambda world, doc_id: left if doc_id == "left.md" else right)
-
-    def boom_read(path, cap_bytes):
-        if path == right:
-            return None, False           # 読み取り失敗（OSError 相当）
-        return "left content", False
-
-    monkeypatch.setattr(compare_docs, "_read_capped", boom_read)
-    result = compare_docs.compare("v1", {"left_doc_id": "left.md", "right_doc_id": "right.md"})
-    assert result["status"] == "unsupported"
-    assert result["error_code"] == "read_io_failed"
-
-    from sherpa import investigation_state
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(state, result, "compare_documents")
-    assert state.backend_failures["read_io"] is True
-
-
 def test_es_index_search_keeps_non_raising_contract_for_non_communication_exception(monkeypatch):
     """`es_index.search` の BM25 クエリで `JSONDecodeError`（非 JSON 応答・通信例外ではない）が
     発生しても、`search()` の「例外を投げず `(hits, degrade_reason)` を返す」契約は保たれる
-    （`routers/documents.py`・`search_service.py`・`ext_api.py` 等、`run_tool` 境界の型分類に
+    （`routers/documents.py`・`parts/read/fused_search.py`・`ext_api.py` 等、`run_tool` 境界の型分類に
     委ねられない非 agentic 経路も同じ関数を呼ぶため）——通信障害と区別し、回復不可の固定コード
     `es_query_rejected` を返す（`es_query_failed` として回復可能扱いにはしない）。"""
     import json
@@ -8701,30 +3932,6 @@ def test_es_index_search_keeps_non_raising_contract_for_non_communication_except
     monkeypatch.setattr(es_index, "_req", boom_bad_json)
     hits, reason = es_index.search("v1", "query", vector=False)
     assert hits == [] and reason == "es_query_rejected"
-
-
-def test_run_tool_es_search_non_communication_degrade_reason_marks_non_recoverable(monkeypatch):
-    """`run_tool("es_search", ...)` は BM25 クエリのプログラムの欠陥・想定外の応答形
-    （`es_query_rejected`）を tool result の `degrade_reason` として返す（例外を投げない）。
-    `_record_tool_result_error_code` へ渡すと `non_recoverable_failure` が立つ——`fulltext`
-    （回復可能）へ誤って丸めない。"""
-    from sherpa import documents, es_index, investigation_state
-
-    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: set())
-    monkeypatch.setattr(es_index, "available", lambda: True)
-
-    def boom_bug(method, path, body=None, ndjson=False, timeout=es_index._TIMEOUT):
-        raise TypeError("programming bug")
-
-    monkeypatch.setattr(es_index, "_req", boom_bug)
-
-    view, _docs, _cites, _cards = A.run_tool("es_search", {"query": "x"}, "v1", None)
-    assert view["degrade_reason"] == "es_query_rejected"
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(state, view, "es_search")
-    assert state.backend_failures["fulltext"] is False
-    assert state.non_recoverable_failure is True
 
 
 def test_es_index_search_treats_404_as_recoverable_index_not_yet_created(monkeypatch):
@@ -8745,40 +3952,6 @@ def test_es_index_search_treats_404_as_recoverable_index_not_yet_created(monkeyp
     assert hits == [] and reason == "es_query_failed"
 
 
-def test_record_tool_result_error_code_es_404_marks_recoverable_fulltext():
-    """404（索引未作成）由来の `degrade_reason: "es_query_failed"` は `backend_failures["fulltext"]`
-    （回復可能）を立てる——`non_recoverable_failure` は立たない（未取り込み world での grep 縮退を
-    塞がないための対照テスト）。"""
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(state, {"hits": [], "degrade_reason": "es_query_failed"}, "es_search")
-    assert state.backend_failures["fulltext"] is True
-    assert state.non_recoverable_failure is False
-
-
-def test_doc_readers_file_head_read_os_error_marks_backend_read_io(tmp_path):
-    """`doc_readers.file_head` の open 後 read 段 `OSError` が付ける `error_code: "read_io_failed"`
-    を `_record_tool_result_error_code` が拾い、`InvestigationState.backend_failures["read_io"]`
-    を立てる——xlsx/docx/pptx/pdf の TOCTOU 再検証 open 失敗（`_open_verified_original`）と同じ
-    経路に file_head 自身の read 失敗も合流する。"""
-    from sherpa import doc_readers, investigation_state
-
-    p = tmp_path / "note.txt"
-    p.write_text("hello\n", encoding="utf-8")
-    f = open(p, "rb")
-
-    def boom_read(n):
-        raise OSError("boom")
-
-    f.read = boom_read
-    result = doc_readers.file_head(f)
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(state, result, "file_head")
-    assert state.backend_failures["read_io"] is True
-
-
 def test_tool_hit_count_returns_none_for_graph_neighbors_error_code_result():
     """`graph_neighbors` が `error_code`（`graph_unavailable`/`graph_internal_error`）付きの結果
     （`{"neighbors": []}`・"error" キーは持たない）を返した場合、`_tool_hit_count` は 0 ではなく
@@ -8788,26 +3961,6 @@ def test_tool_hit_count_returns_none_for_graph_neighbors_error_code_result():
     assert A._tool_hit_count("graph_neighbors", {"neighbors": [], "error_code": "graph_internal_error"}) is None
     # error_code が無い通常の 0 件応答は従来どおり 0（回帰しないことの対照）。
     assert A._tool_hit_count("graph_neighbors", {"neighbors": []}) == 0
-
-
-def test_hit_summary_node_sub_suppressed_for_graph_neighbors_error_code():
-    """サブ経路の追加ノード（`_hit_summary_node_sub`）も graph_neighbors の障害結果では
-    ノードを出さない（`None`）——0件ヒットと誤表示しない。"""
-    assert A._hit_summary_node_sub(
-        "graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}) is None
-
-
-def test_investigation_state_add_tool_result_does_not_record_zero_hits_gap_for_graph_error_code():
-    """`InvestigationState.add_tool_result` は graph_neighbors の障害結果（`error_code` 付き・
-    "error" キーは持たない）を「0件」の gap として積まない——`_tool_hit_count` が None を返す
-    ため `hits == 0` 分岐に入らず、誤って「実行できなかった」を「0件ヒット」と記録しない。"""
-    from sherpa import investigation_state
-
-    state = investigation_state.InvestigationState(question="q", scope={})
-    state.add_tool_result("graph_neighbors", {"name": "TAX-RATE"},
-                          {"neighbors": [], "error_code": "graph_unavailable"}, [], [])
-    assert not any("0件" in g for g in state.gaps)
-    assert state.tool_log[-1].hits is None
 
 
 # ===== S4（縮退の可視化と計数）: グラフの3状態（空・世代不一致・接続断）を区別して調査を止めない =====
@@ -8898,157 +4051,51 @@ def test_run_tool_graph_neighbors_empty_graph_is_not_a_failure(monkeypatch):
     assert res == {"neighbors": []}
 
 
-def test_record_tool_result_error_code_marks_graph_states_separately():
-    """世代不一致・接続断は別々の状態／別々の統計項目（`answer.limits`）になる。"""
-    from sherpa.investigation_state import InvestigationState
-    st = InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(st, {"error": "graph_reingest_required", "world": "v1",
-                                          "stored_era": "old"}, "graph_neighbors")
-    assert st.graph_schema_era_mismatch is True
-    assert st.limits["graph_reingest_required"] is True
-    assert st.backend_failures["graph"] is False           # 接続断とは混同しない
-
-    st2 = InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(st2, {"neighbors": [], "error_code": "graph_unavailable"},
-                                    "graph_neighbors")
-    assert st2.backend_failures["graph"] is True and st2.limits["backend_unavailable_graph"] is True
-    assert st2.graph_schema_era_mismatch is False
-    assert "graph_reingest_required" not in st2.limits
-
-
-def test_es_unavailable_marks_backend_unavailable_fulltext_limit():
-    """全文検索の不調も同じ流儀で `answer.limits` のフラットな bool 項目になる。"""
-    from sherpa.investigation_state import InvestigationState
-    st = InvestigationState(question="q", scope={})
-    A._record_tool_result_error_code(st, {"hits": [], "degrade_reason": "es_unavailable"}, "es_search")
-    assert st.limits["backend_unavailable_fulltext"] is True
-
-
-def test_openai_style_continues_with_grep_after_graph_schema_era(monkeypatch):
-    """世代不一致を検知しても調査ループは止まらず、後続の grep 結果で回答し切る
-    （縮退の事実は `limits` に残る）。"""
-    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
-    calls1 = [{"id": "c0", "function": {"name": "graph_neighbors",
-                                        "arguments": json.dumps({"name": "請求"})}}]
-    calls2 = [{"id": "c1", "function": {"name": "ripgrep_search",
-                                        "arguments": json.dumps({"query": "TAX-RATE"})}}]
-    seq = [{"choices": [{"message": {"content": "", "tool_calls": calls1}}]},
-           {"choices": [{"message": {"content": "", "tool_calls": calls2}}]},
-           {"choices": [{"message": {"content": "税率は 10% です。"}}]}]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                 toolset=A.openai_tools(with_graph=True)))
-    final = next(e for e in events if "final" in e)
-    assert final["final"] == "税率は 10% です。"
-    assert final["docs"], "grep の出典が残る（グラフ不調でも回答を止めない）"
-    assert final["limits"]["graph_reingest_required"] is True
-
-
-# S4（RV3）: 世代不一致の記録は openai 方言だけでなく anthropic／gemini 方言でも行う
-# （`_record_tool_result_error_code` を呼ばないと縮退が無音化し、graph_admin の fail-loud も効かない）。
-
-def test_gemini_records_graph_reingest_required_in_limits(monkeypatch):
-    """gemini 方言でも `graph_neighbors` の世代不一致（結果化された障害）が limits に立つ。"""
-    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
-    seq = [
-        {"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "graph_neighbors", "args": {"name": "請求"}}}]}}]},
-        {"candidates": [{"content": {"parts": [{"text": "関係は確認できませんでした。"}]}}]},
-    ]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
-                           toolset=A.gemini_tools(with_graph=True)))
-    final = next(ev for ev in events if "final" in ev)
-    assert final["limits"]["graph_reingest_required"] is True
-
-
-def test_anthropic_style_records_graph_reingest_required_in_limits(monkeypatch):
-    """anthropic 方言（Bedrock）でも同じ（方言ごとに記録が抜けない）。"""
-    _patch_neo4j_driver(monkeypatch, _FakeSession("old-era"))
-    client = _AClient([
-        _AResp([_ABlock("tool_use", name="graph_neighbors", input={"name": "請求"}, id="tu1")],
-               stop_reason="tool_use"),
-        _AResp([_ABlock("text", "関係は確認できませんでした。")], stop_reason="end_turn"),
-    ])
-    events = list(A.anthropic_style(client, "m", A.SYSTEM, "調べて", "v1", None,
-                                    toolset=A.graph_openai_tools()))
-    final = next(ev for ev in events if "final" in ev)
-    assert final["limits"]["graph_reingest_required"] is True
-
-
 # S4（RV4）: 最初から不達で「ツール集合に入らなかった」バックエンドも縮退として計数する
 # （実行中に記録される機会が無いため）。利用者が自分で OFF にした場合は障害ではない＝計数しない。
 
-def test_openai_style_counts_fulltext_unavailable_when_es_unreachable(monkeypatch):
-    """ES が実接続で不達なら、es_search を1度も呼べなくても統計に縮退が残る。"""
-    seq = [{"choices": [{"message": {"content": "回答"}}]}]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                 tools_availability={"grep": True, "fulltext": False, "graph": True}))
-    final = next(e for e in events if "final" in e)
-    assert final["limits"]["backend_unavailable_fulltext"] is True
 
+def test_run_tool_es_search_mode_routing(monkeypatch):
+    """mode: 不正値は hybrid・keyword は vector=False・vector は knn のみ（埋め込み不可なら BM25 へ縮退し理由と mode_used を返す）。"""
+    from sherpa import documents
 
-def test_openai_style_does_not_count_fulltext_when_user_turned_it_off(monkeypatch):
-    """利用者が全文検索を OFF にしただけのターンは障害ではない（計数しない）。"""
-    seq = [{"choices": [{"message": {"content": "回答"}}]}]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                 tools_pref={"grep": True, "fulltext": False, "graph": True},
-                                 tools_availability={"grep": True, "fulltext": True, "graph": True}))
-    final = next(e for e in events if "final" in e)
-    assert "limits" not in final or "backend_unavailable_fulltext" not in final["limits"]
+    monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
+    h = [{"doc_id": "a.md", "line": 1, "text": "x", "ext": ".md"}]
+    calls = []
 
+    def fake_search(world, q, scope_paths=None, k=20, layer=None, vector=True, **kw):
+        calls.append(("search", vector))
+        return h, None
 
-def test_gemini_counts_fulltext_unavailable_when_es_unreachable(monkeypatch):
-    """他の方言でも同じ（判定はツール集合を組む1箇所に集約されている）。"""
-    seq = [{"candidates": [{"content": {"parts": [{"text": "回答"}]}}]}]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.gemini("k", "gemini-2.5-flash", A.SYSTEM, "調べて", "v1", None,
-                           tools_availability={"grep": True, "fulltext": False, "graph": True}))
-    final = next(e for e in events if "final" in e)
-    assert final["limits"]["backend_unavailable_fulltext"] is True
+    def fake_knn(world, q, scope_paths=None, k=20, layer=None, **kw):
+        calls.append(("knn", None))
+        return knn_result
 
+    monkeypatch.setattr(A.es_index, "search", fake_search)
+    monkeypatch.setattr(A.es_index, "search_knn_only", fake_knn)
+    knn_result = (h, None)
 
-def test_agentic_run_impact_entry_degrade_counts_graph_unavailable():
-    """入口でグラフが不達のまま縮退したターンも統計に残る（グラフツールは集合から外れるため
-    実行中の記録機会が無い）。"""
-    seen = []
-    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": False})
-    events = list(_degraded_gate_provider(seen)().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert env["limits"]["backend_unavailable_graph"] is True
-    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["graph_unavailable"])
+    def run(mode):
+        return A.run_tool("es_search", {"query": "x", "mode": mode}, "v1", None)[0]
 
+    assert run("bogus")["mode_used"] == "hybrid" and calls[-1] == ("search", True)
+    assert run("keyword")["mode_used"] == "keyword" and calls[-1] == ("search", False)
+    assert run("vector")["mode_used"] == "vector" and calls[-1] == ("knn", None)
+    knn_result = ([], "embedding_not_configured")
+    v = run("vector")
+    assert v["mode_used"] == "keyword" and v["degrade_reason"] == "embedding_not_configured"
+    assert calls[-2:] == [("knn", None), ("search", False)] and v["hits"]
 
-def test_agentic_run_impact_entry_degrade_user_off_is_not_counted():
-    """利用者がグラフを OFF にしただけのターンは障害ではない＝計数せず、文言も「使えない」側。"""
-    seen = []
-    ctx = _blocking_gate_ctx("impact", {"grep": True, "fulltext": True, "graph": True},
-                            tools_pref={"graph": False})
-    events = list(_degraded_gate_provider(seen)().run(ctx))
-    env = next(e["env"] for e in events if e.get("type") == "_result")
-    assert "backend_unavailable_graph" not in (env.get("limits") or {})
-    assert env["headline"].startswith(A.GRAPH_DEGRADED_NOTICES["blocked"])
+    # 埋め込み未設定の hybrid（既定）は BM25 だけで検索している＝mode_used は keyword・理由を返す
+    monkeypatch.setattr(A.es_index, "search", lambda *a, **kw: (h, "embedding_not_configured"))
+    v = A.run_tool("es_search", {"query": "x"}, "v1", None)[0]
+    assert v["mode_used"] == "keyword" and v["degrade_reason"] == "embedding_not_configured"
+    assert A._tool_hit_count("es_search", v) == 1
 
-
-def test_openai_style_counts_graph_unavailable_for_any_lens(monkeypatch):
-    """S4: グラフ不達はレンズに依らずツール集合を組む時点で1回だけ計上する（全文検索と対称）。"""
-    seq = [{"choices": [{"message": {"content": "回答"}}]}]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                 tools_availability={"grep": True, "fulltext": True, "graph": False}))
-    final = next(e for e in events if "final" in e)
-    assert final["limits"]["backend_unavailable_graph"] is True
-    assert "backend_unavailable_fulltext" not in final["limits"]   # 使えている側は立てない
-
-
-def test_openai_style_does_not_count_graph_when_user_turned_it_off(monkeypatch):
-    """利用者が OFF にした軸は不達でも障害ではない（計数しない）。"""
-    seq = [{"choices": [{"message": {"content": "回答"}}]}]
-    monkeypatch.setattr(A, "_post", lambda url, headers, body, timeout=90: seq.pop(0))
-    events = list(A.openai_style("http://x", {}, "gpt-5.5", A.SYSTEM, "調べて", "v1", None,
-                                 tools_pref={"grep": True, "fulltext": True, "graph": False},
-                                 tools_availability={"grep": True, "fulltext": True, "graph": False}))
-    final = next(e for e in events if "final" in e)
-    assert "limits" not in final or "backend_unavailable_graph" not in final["limits"]
+    # vector で ES のクエリ自体が失敗したときは BM25 へ倒さず、失敗をそのまま返す
+    calls.clear()
+    knn_result = ([], "es_query_failed")
+    monkeypatch.setattr(A.es_index, "search", fake_search)
+    v = run("vector")
+    assert calls == [("knn", None)] and v["hits"] == []
+    assert v["degrade_reason"] == "es_query_failed" and v["mode_used"] == "vector"

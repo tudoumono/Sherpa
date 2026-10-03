@@ -43,6 +43,7 @@
 #       --skip-libreoffice --skip-docker-engine --skip-python-system --skip-ocr
 #                                                      # marp/LibreOffice/Docker Engine 等を除外（サイズ削減）
 set -euo pipefail
+[ "$(uname -s)" = "Linux" ] || { echo "このスクリプトは Linux 専用です（閉域キットの収集は apt・dpkg・docker を使います）。macOS では使えません。" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -232,7 +233,7 @@ _validate_base_closure_packages "$BASE_CLOSURE_PACKAGES" || exit 1
 # 違うと正しい閉包にならない。docker のある機体での収集を引き続き推奨する・呼び出し側で警告表示する）。
 _apt_collect_base_closure_fallback() {  # $1=dest_dir（$OUT/base/debs）
   local dest_dir="$1" cache_dir
-  cache_dir="$(mktemp -d)"
+  cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   mkdir -p "$cache_dir/archives/partial" "$dest_dir"
   sudo apt-get update
   # shellcheck disable=SC2046
@@ -453,7 +454,7 @@ _pip_download_wheels() {
 # システムの /var/cache/apt/archives を汚さないよう Dir::Cache::Archives を一時ディレクトリへ差し替える。
 _apt_collect_debs_fallback() {
   local packages="$1" dest_dir="$2" cache_dir
-  cache_dir="$(mktemp -d)"
+  cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   mkdir -p "$cache_dir/archives/partial" "$dest_dir"
   if sudo apt-get -o "Dir::Cache::Archives=$cache_dir/archives" install --download-only -y $packages; then
     find "$cache_dir/archives" -maxdepth 1 -name '*.deb' -exec cp -f {} "$dest_dir/" \;
@@ -795,7 +796,7 @@ if [ "$FETCH" = 1 ] && [ "$SKIP_CHROMIUM" != 1 ]; then
   reset_dir "$OUT/chromium"
   # M1: Ubuntu 24.04 は PEP 668（externally-managed-environment）でシステム Python に直接
   # pip install できないため、使い捨ての一時 venv に playwright を入れる。
-  PW_VENV="$(mktemp -d)"
+  PW_VENV="$(mktemp -d "${TMPDIR:-/tmp}/sherpa.XXXXXX")"
   note "一時 venv に playwright を導入します: $PW_VENV"
   "$PY" -m venv "$PW_VENV"
   "$PW_VENV/bin/python" -m pip install --quiet --upgrade pip playwright

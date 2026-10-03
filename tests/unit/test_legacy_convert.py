@@ -73,7 +73,7 @@ def _install_fake_soffice(tmp_path: pathlib.Path, monkeypatch, *, sleep=None, ex
     tmpl = _make_template(tmp_path)
     counter = tmp_path / "counter.txt"
     monkeypatch.setenv("SHERPA_SOFFICE_BIN", str(script))
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "libreoffice")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "libreoffice")
     monkeypatch.setenv("FAKE_SOFFICE_DOCX", str(tmpl))
     monkeypatch.setenv("FAKE_SOFFICE_COUNTER", str(counter))
     if sleep is not None:
@@ -91,20 +91,20 @@ def _count(counter: pathlib.Path) -> int:
 # ---- バックエンド解決（system_settings > env > 既定）----
 
 def test_backend_default_none(monkeypatch):
-    monkeypatch.delenv("SHERPA_LEGACY_BACKEND", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_LEGACY_BACKEND", raising=False)
     assert legacy_convert.legacy_backend_name() == "none"
     assert legacy_convert.env_default_backend() == "none"
 
 
 def test_backend_env_over_default(monkeypatch):
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "libreoffice")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "libreoffice")
     assert legacy_convert.legacy_backend_name() == "libreoffice"
     assert legacy_convert.env_default_backend() == "libreoffice"
 
 
 def test_backend_system_over_env(monkeypatch):
     from sherpa import store
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "none")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "none")
     monkeypatch.setattr(store, "get_system_settings", lambda: {"legacy_backend": "libreoffice"})
     assert legacy_convert.legacy_backend_name() == "libreoffice"      # 全体設定が env に優先
     assert legacy_convert.env_default_backend() == "none"             # env_default は system を見ない
@@ -112,7 +112,7 @@ def test_backend_system_over_env(monkeypatch):
 
 def test_backend_unknown_value_failsafe_to_none(monkeypatch):
     monkeypatch.setattr(legacy_convert, "_warned_unknown_backend", set())
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "bogus_backend")      # 未知値＝none へ倒す（fail-safe）
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "bogus_backend")      # 未知値＝none へ倒す（fail-safe）
     assert legacy_convert.legacy_backend_name() == "none"
 
 
@@ -123,7 +123,7 @@ def test_backend_system_unreadable_failsafe_to_env(monkeypatch):
         raise RuntimeError("no PG creds (MCP subprocess)")
 
     monkeypatch.setattr(store, "get_system_settings", _boom)
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "libreoffice")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "libreoffice")
     assert legacy_convert.legacy_backend_name() == "libreoffice"      # 例外は握って env へ倒す
 
 
@@ -151,13 +151,13 @@ def test_soffice_non_executable_rejected(tmp_path, monkeypatch):
 # ---- legacy_exts / legacy_sig_value ----
 
 def test_legacy_exts_none_backend_empty(monkeypatch):
-    monkeypatch.delenv("SHERPA_LEGACY_BACKEND", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_LEGACY_BACKEND", raising=False)
     assert legacy_convert.legacy_exts() == set()
     assert legacy_convert.legacy_sig_value() == "none"
 
 
 def test_legacy_exts_libreoffice_without_soffice_empty(monkeypatch):
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "libreoffice")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "libreoffice")
     monkeypatch.setenv("SHERPA_SOFFICE_BIN", "/no/such/soffice")   # soffice 未検出
     assert legacy_convert.legacy_exts() == set()                  # backend 選択でも変換不可＝空
     assert legacy_convert.legacy_sig_value() == "none"            # 署名も none（現状どおり）
@@ -246,7 +246,7 @@ def test_convert_nonzero_exit_returns_none(tmp_path, monkeypatch):
 
 def test_convert_none_backend_returns_none(tmp_path, monkeypatch):
     _install_fake_soffice(tmp_path, monkeypatch)
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "none")           # backend none＝変換しない
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "none")           # backend none＝変換しない
     src = tmp_path / "旧資料.doc"
     src.write_bytes(b"x")
     assert legacy_convert.convert_to_ooxml(src, ".docx") is None
@@ -270,7 +270,7 @@ def test_convert_timeout_kills_process_group_including_descendants(tmp_path, mon
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("SHERPA_SOFFICE_BIN", str(script))
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "libreoffice")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "libreoffice")
     monkeypatch.setenv("FAKE_SOFFICE_CHILD_PID_FILE", str(child_pid_file))
     monkeypatch.setenv("SHERPA_LEGACY_TIMEOUT", "0.3")             # wrapper は30秒スリープ＝確実にタイムアウト
     legacy_convert._version_cache.clear()
@@ -366,13 +366,13 @@ def test_ensure_ooxml_unsupported_ext_returns_none(tmp_path, monkeypatch):
 # ---- arms_sig が legacy_backend に反応（office_md 経由）----
 
 def test_arms_sig_drift_reacts_to_legacy_backend(tmp_path, monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
     d = tmp_path / "derived"
     d.mkdir()
     o_b = office_md._pdf_backend
     try:
         office_md._pdf_backend = lambda: None
-        monkeypatch.delenv("SHERPA_LEGACY_BACKEND", raising=False)   # legacy=none で署名を書く
+        monkeypatch.delenv("SHERPA_MCP_LEGACY_BACKEND", raising=False)   # legacy=none で署名を書く
         office_md._write_arms_sig_marker(d)
         assert office_md.arms_sig_drift(d) is False                  # 同一（legacy=none）
         # backend を libreoffice にし soffice を検出させる → legacy 署名が変わる → drift。
@@ -385,7 +385,7 @@ def test_arms_sig_drift_reacts_to_legacy_backend(tmp_path, monkeypatch):
 # ---- build_derived 統合（旧形式 → OOXML → ①MD化 → provenance）----
 
 def test_build_derived_converts_legacy_via_backend(tmp_path, monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)                 # ooxml 有効（既定）
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)                 # ooxml 有効（既定）
     counter = _install_fake_soffice(tmp_path, monkeypatch)
     src = tmp_path / "src"
     src.mkdir()
@@ -455,8 +455,8 @@ def test_build_derived_legacy_conversion_failed_reason_for_nonzero_exit(tmp_path
 
 
 def test_build_derived_legacy_unsupported_when_backend_none(tmp_path, monkeypatch):
-    monkeypatch.delenv("SHERPA_ARMS", raising=False)
-    monkeypatch.delenv("SHERPA_LEGACY_BACKEND", raising=False)       # backend none（既定）
+    monkeypatch.delenv("SHERPA_MCP_ARMS", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_LEGACY_BACKEND", raising=False)       # backend none（既定）
     monkeypatch.delenv("SHERPA_SOFFICE_BIN", raising=False)
     src = tmp_path / "src"
     src.mkdir()
@@ -607,7 +607,7 @@ def _free_port() -> int:
 
 def _use_office_com(monkeypatch, url, *, token=None):
     legacy_convert._healthz_cache.clear()                # URL 毎 TTL キャッシュを掃除（テスト間の混線防止）
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "office_com")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "office_com")
     monkeypatch.setenv("SHERPA_OFFICE_COM_URL", url)
     if token is not None:
         monkeypatch.setenv("SHERPA_OFFICE_COM_TOKEN", token)
@@ -642,7 +642,7 @@ def test_wsl_to_windows_path_wsl_native_fallback(monkeypatch):
 
 def test_office_com_unset_url_unavailable(monkeypatch):
     # conftest が SHERPA_POWERSHELL_BIN を無効パスに固定＝URL 未設定かつ direct 未検出＝unavailable。
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "office_com")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "office_com")
     monkeypatch.delenv("SHERPA_OFFICE_COM_URL", raising=False)
     legacy_convert._healthz_cache.clear()
     assert legacy_convert.office_com_configured() is False
@@ -718,7 +718,7 @@ def test_legacy_exts_env_override_takes_priority_no_probe(monkeypatch):
     """SHERPA_LEGACY_EXTS が設定されていれば最優先で信じ、office_com への healthz probe を一切行わない
     （MCP サブプロセスは URL/TOKEN を持たない設計＝probe しようとすると必ず失敗するか secrets が要る）。
     ここでは office_com_healthz を呼んだら AssertionError になるようにして「呼ばれないこと」を証明する。"""
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "office_com")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "office_com")
     monkeypatch.setenv("SHERPA_OFFICE_COM_URL", "http://127.0.0.1:1")   # 到達不可（呼ばれたら分かるようにあえて設定）
     monkeypatch.delenv("SHERPA_OFFICE_COM_TOKEN", raising=False)
 
@@ -738,7 +738,7 @@ def test_legacy_exts_env_override_empty_string_means_none(monkeypatch):
 def test_legacy_exts_env_override_absent_falls_back_to_normal_resolution(monkeypatch):
     """env が**未設定**（キー自体が無い）なら通常解決（backend none）に落ちる＝override は「設定時のみ」有効。"""
     monkeypatch.delenv("SHERPA_LEGACY_EXTS", raising=False)
-    monkeypatch.delenv("SHERPA_LEGACY_BACKEND", raising=False)
+    monkeypatch.delenv("SHERPA_MCP_LEGACY_BACKEND", raising=False)
     assert legacy_convert.legacy_exts() == set()
 
 
@@ -1084,7 +1084,7 @@ def _install_fake_powershell(tmp_path: pathlib.Path, monkeypatch):
     monkeypatch.setenv("SHERPA_POWERSHELL_BIN", str(script))
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu-24.04")   # /tmp を \\wsl.localhost UNC へ変換可能に
     monkeypatch.delenv("SHERPA_OFFICE_COM_URL", raising=False)   # URL 未設定＝direct へ倒す
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "office_com")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "office_com")
     monkeypatch.setenv("FAKE_PS_DOCX", str(docx))
     monkeypatch.setenv("FAKE_PS_PDF", str(pdf))
     legacy_convert._direct_healthz_cache.clear()
@@ -1326,9 +1326,9 @@ def test_source_key_changes_with_office_com_mode(tmp_path, monkeypatch):
     assert key_direct != key_http                                # モードが変われば必ずキーも変わる
 
     # 他バックエンドはモード概念が無い（空欄のまま・libreoffice/none の間で形式が安定している）。
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "libreoffice")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "libreoffice")
     assert legacy_convert._source_key(src).startswith("libreoffice::")
-    monkeypatch.setenv("SHERPA_LEGACY_BACKEND", "none")
+    monkeypatch.setenv("SHERPA_MCP_LEGACY_BACKEND", "none")
     assert legacy_convert._source_key(src).startswith("none::")
 
 

@@ -117,7 +117,7 @@ def _figure_emf() -> bytes:
 
 
 def _build(monkeypatch, tmp_path: Path, emf: bytes | None = None):
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     wd = _docx_world(tmp_path, emf if emf is not None else _figure_emf())
     dmd = tmp_path / "derived" / "md"
     rep = office_md.build_derived(wd, dmd, world="metafile-world")
@@ -194,7 +194,7 @@ def _legacy_world(monkeypatch, tmp_path):
     converted.write_bytes(mb.docx_with_media("image1.emf", _figure_emf()))
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".doc"})
     monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (converted, []))
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     rep = office_md.build_derived(wd, dmd)
     assert not rep.get("error") and rep["rag_failed"] == 0, rep
     key = Path(str(converted) + ".key")
@@ -283,7 +283,7 @@ def test_already_ingested_legacy_ppt_gets_the_figure_text_from_the_cached_conver
     converted.write_bytes(mb.pptx_with_media("image1.emf", _figure_emf()))
     monkeypatch.setattr(legacy_convert, "legacy_exts", lambda: {".ppt"})
     monkeypatch.setattr(legacy_convert, "ensure_ooxml", lambda src, rel, cache_root: (converted, []))
-    monkeypatch.setenv("SHERPA_ARMS", "ooxml,pdf_text")
+    monkeypatch.setenv("SHERPA_MCP_ARMS", "ooxml,pdf_text")
     office_md.build_derived(wd, dmd)
     Path(str(converted) + ".key").write_text(legacy_convert._source_key(wd / "old.ppt"), encoding="utf-8")
     md_path = dmd / "old.ppt.md"

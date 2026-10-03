@@ -137,14 +137,6 @@ def test_admin_settings_get_shape():
     assert csr["configured"] is None
     assert csr["effective"] == 30
     assert csr["default"] == 30
-    # STAT-2: 利用統計チャット専用の AI 選択。未設定（configured=None）時の既定は A7
-    # （`cloud_provider`）連動——A7 が明示的に openai の時だけ openai・それ以外（この環境の
-    # ように A7 も未設定の場合を含む）は ollama。
-    uc = body["usage_chat"]
-    assert uc["configured"] is None
-    assert uc["effective"] == "ollama"
-    assert uc["default"] == "ollama"
-    assert uc["providers"] == ["openai", "ollama"]
     # FBK-1 RV1（2026-09-01・境界回帰#2）: cloud_provider を一度も PUT していない構成では
     # provider_raw が null（`provider` は既定込みの openai）。
     assert body["cloud"]["provider"] == "openai"
@@ -167,6 +159,24 @@ def test_admin_settings_cloud_provider_raw_persists_even_when_equal_to_default()
     assert r.json()["cloud"]["provider_raw"] == "openai"   # 既定と同値でも raw は残る
     after = admin.get("/admin/settings").json()
     assert after["cloud"]["provider_raw"] == "openai"
+
+
+def test_admin_settings_cloud_provider_rejects_retired_providers():
+    """Gemini/Bedrock は閉じた（CLI 調査エンジンとして戻す想定・API 経路では扱わない）＝管理画面の
+    PUT で選べない（422）。選べるのは openai だけ。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    admin, _ = _admin_client()
+    for value in ("gemini", "bedrock", "GEMINI", " bedrock "):
+        r = admin.put("/admin/settings", json={"cloud_provider": value})
+        assert r.status_code == 422, (value, r.text)
+    assert admin.put("/admin/settings", json={"cloud_provider": "not-a-real-provider"}).status_code == 422
+    # 閉じたプロバイダの API キーは受け取らない（未知フィールドとして無視され、保存されない）。
+    r = admin.put("/admin/settings", json={"gemini_api_key": "gk-ignored", "bedrock_api_key": "bk-ignored"})
+    assert r.status_code == 200, r.text
+    sysset = store.get_system_settings()
+    assert "gemini_api_key" not in sysset and "bedrock_api_key" not in sysset
+    assert "gemini_key_set" not in r.json()["cloud"] and "bedrock_key_set" not in r.json()["cloud"]
 
 
 # ===== 検証（422）=====
@@ -195,97 +205,18 @@ def test_admin_settings_validation_errors():
     assert admin.put("/admin/settings", json={"codex_session_retention_days": True}).status_code == 422
     assert admin.put("/admin/settings", json={"codex_session_retention_days": False}).status_code == 422
     assert admin.put("/admin/settings", json={"codex_session_retention_days": "14"}).status_code == 422
-    # STAT-2: usage_chat_provider は openai/ollama のみ（cloud_provider とは別の選択肢集合＝
-    # gemini/bedrock は本機能の対象外）。非文字列も 422。
-    assert admin.put("/admin/settings", json={"usage_chat_provider": "gemini"}).status_code == 422
-    assert admin.put("/admin/settings", json={"usage_chat_provider": "bedrock"}).status_code == 422
-    assert admin.put("/admin/settings", json={"usage_chat_provider": 123}).status_code == 422
-    # 空文字は「未設定へ戻す」として黙って受理しない（null のみ受理）。
-    assert admin.put("/admin/settings", json={"usage_chat_provider": ""}).status_code == 422
-    assert admin.put("/admin/settings", json={"usage_chat_provider": "   "}).status_code == 422
-
-
-def test_admin_settings_usage_chat_provider_round_trip():
-    """STAT-2: 保存（openai|ollama）→ GET 反映 → null で既定（A7 連動＝この環境は未設定なので
-    ollama）へ戻る、の一往復を固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-
-    r = admin.put("/admin/settings", json={"usage_chat_provider": "ollama"})
-    assert r.status_code == 200, r.text
-    assert r.json()["usage_chat"] == {
-        "configured": "ollama", "effective": "ollama", "default": "ollama",
-        "providers": ["openai", "ollama"]}
-
-    r_get = admin.get("/admin/settings")
-    assert r_get.json()["usage_chat"]["configured"] == "ollama"
-    assert r_get.json()["usage_chat"]["effective"] == "ollama"
-
-    r_reset = admin.put("/admin/settings", json={"usage_chat_provider": None})
-    assert r_reset.status_code == 200, r_reset.text
-    assert r_reset.json()["usage_chat"] == {
-        "configured": None, "effective": "ollama", "default": "ollama",
-        "providers": ["openai", "ollama"]}
-
-
-def test_admin_settings_usage_chat_provider_default_follows_a7_openai_selection():
-    """A7（`cloud_provider`）を明示的に openai へ保存すると、未設定の usage_chat_provider
-    の既定が openai になる。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-
-    r = admin.put("/admin/settings", json={"cloud_provider": "openai"})
-    assert r.status_code == 200, r.text
-    assert r.json()["usage_chat"] == {
-        "configured": None, "effective": "openai", "default": "openai",
-        "providers": ["openai", "ollama"]}
-
-
-def test_admin_settings_usage_chat_provider_invalid_configured_shown_as_corrupted(monkeypatch):
-    """`usage_chat_provider` が API の検証を経由せず不正な値になっている場合
-    （例: 旧データ・手動編集）、`effective` は既定へ黙って丸めず
-    `_INVALID_SAVED_VALUE_LABEL`（"(不正な保存値)"）を返す——正常な既定選択と見分けが付く。
-    `_validate_usage_chat_provider` を経由しない書込み経路を模すため `store.set_system_settings`
-    を直接呼ぶ（PUT 経由では常に検証されるため再現できない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import store
-    admin, admin_uid = _admin_client()
-
-    # 共有テーブル（system_settings）なので、元の値を GET で退避し try/finally で必ず元へ戻す
-    # （`store.set_system_settings` は検証を経由しないため、破損させたのと同じ経路で戻す＝
-    # PUT だと "gemini" 等の不正値は最初から書けないが、正常値へ戻すだけなので PUT でもよい
-    # ところ、対称性のため同じ関数を使う）。退避 GET・復元後の再読取のどちらも成否を明示 assert
-    # する（黙って読めた/戻せたと仮定すると、退避自体が失敗していた場合に別の値へ復元してしまう）。
-    r_orig = admin.get("/admin/settings")
-    assert r_orig.status_code == 200, r_orig.text
-    original = r_orig.json()["usage_chat"]["configured"]
-    store.set_system_settings(admin_uid, {"usage_chat_provider": "gemini"})
-    try:
-        r = admin.get("/admin/settings")
-        assert r.status_code == 200, r.text
-        uc = r.json()["usage_chat"]
-        assert uc["configured"] == "gemini"
-        assert uc["effective"] == "(不正な保存値)"
-    finally:
-        store.set_system_settings(admin_uid, {"usage_chat_provider": original})
-        r_restored = admin.get("/admin/settings")
-        assert r_restored.status_code == 200, r_restored.text
-        assert r_restored.json()["usage_chat"]["configured"] == original
 
 
 def test_admin_settings_secret_key_rejects_embedded_control_chars():
-    """RV6 是正の固定: 中央 API キー（openai/gemini/bedrock）に改行・制御文字が混入したまま
+    """RV6 是正の固定: 中央 API キー（openai）に改行・制御文字が混入したまま
     保存させない（422）。保存を許すと、以後の全リクエストで送信時に urllib/http.client が
     「ヘッダ値に不正な文字を含む」例外を投げ、その例外メッセージへキー値自体がエコーされて
-    漏洩しうる（`research_service.py` のマスク処理は最終防衛線であり、根本対策は保存時に弾く
-    こと・`sherpa/routers/system_extras.py::_validate_secret_key` 参照）。"""
+    漏洩しうる（`graph_extract._log_masked_exception` のマスク処理は最終防衛線であり、根本対策は
+    保存時に弾くこと・`sherpa/routers/system_extras.py::_validate_secret_key` 参照）。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
-    for field in ("openai_api_key", "gemini_api_key", "bedrock_api_key"):
+    for field in ("openai_api_key",):
         r_lf = admin.put("/admin/settings", json={field: "sk-good-prefix\nAuthorization: evil"})
         assert r_lf.status_code == 422, r_lf.text
         r_crlf = admin.put("/admin/settings", json={field: "sk-good-prefix\r\nX-Injected: 1"})
@@ -470,7 +401,7 @@ def test_put_codex_session_retention_days_reflects_and_resets():
 # ===== 使えるモデル（model_catalog） =====
 
 def test_admin_settings_model_catalog_shape_and_default():
-    """未設定なら configured は None・effective は組み込み既定（openai/gemini/ollama/codex）を含む。"""
+    """未設定なら configured は None・effective は組み込み既定（openai/ollama/codex）を含む。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
@@ -481,9 +412,9 @@ def test_admin_settings_model_catalog_shape_and_default():
     assert mc["effective"]["openai"]["chat"]["default"] == "gpt-5.5"
     assert mc["effective"]["ollama"]["chat"]["allowed"] == ["qwen2.5"]
     assert mc["effective"]["codex"]["codex"]["default"] == "gpt-5.5"
-    assert "bedrock" not in mc["effective"]   # 実在確認済みモデルの専用機構と重複させない（対象外）
-    assert set(mc["providers"]) == {"openai", "gemini", "bedrock", "ollama", "codex"}
-    assert set(mc["usages"]) == {"chat", "intent", "embed", "route", "subsearch", "codex", "render"}
+    assert "bedrock" not in mc["effective"] and "gemini" not in mc["effective"]   # 閉じたプロバイダは出さない
+    assert set(mc["providers"]) == {"openai", "ollama", "codex"}
+    assert set(mc["usages"]) == {"chat", "intent", "embed", "subsearch", "codex", "render"}
 
 
 def test_admin_settings_model_catalog_put_reflects_and_resets():
@@ -560,17 +491,6 @@ def test_admin_settings_model_catalog_default_auto_added_to_allowed():
     assert cell["default"] == "b" and "b" in cell["allowed"] and "a" in cell["allowed"]
 
 
-def test_admin_settings_model_catalog_rejects_bedrock_cell():
-    """重大バグ是正: 対象外のプロバイダ（bedrock）のセルは admin 直接 API 経由でも 422（実在確認済み
-    モデルの専用機構と二重の真実源になる隠れ設定を防ぐ）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r = admin.put("/admin/settings", json={
-        "model_catalog": {"bedrock": {"chat": {"allowed": ["x"], "default": "x"}}}})
-    assert r.status_code == 422, r.text
-
-
 def test_admin_settings_model_catalog_rejects_unknown_provider_and_usage():
     """重大バグ是正: タイプミス（未知 provider/usage）は 422（黙って保存すると UI にも実行にも
     効かない隠れ設定になる）。"""
@@ -587,7 +507,7 @@ def test_admin_settings_view_top_level_keys_match_schema():
     """重大バグ是正（スキーマ検証の偽陽性防止）: GET /admin/settings の実応答トップレベルキーが
     `AdminSettingsView` の宣言フィールドと完全一致することを固定する（pydantic は既定で余剰キーを
     無視するため、`model_catalog` のような新規フィールドがスキーマへ追加漏れしても
-    `test_response_schemas.py` の TypeAdapter 検証だけでは気付けなかった）。"""
+    TypeAdapter 検証だけでは気付けなかった）。"""
     if not _try_init():
         pytest.skip("DB down")
     from sherpa import schemas as sc
@@ -912,15 +832,6 @@ def test_admin_settings_openai_endpoint_kind_alone_succeeds_when_base_already_sa
     assert view["base_url"] == "https://res.openai.azure.com"   # 保存済み base はそのまま維持される
 
 
-def test_config_omits_token_pricing():
-    """金額系の撤去確認: /config はトークン単価表（token_pricing）を返さない。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    cfg = admin.get("/config").json()
-    assert "token_pricing" not in cfg
-
-
 def test_partial_update_leaves_other_keys_untouched(monkeypatch):
     if not _try_init():
         pytest.skip("DB down")
@@ -1076,59 +987,6 @@ def test_seed_system_settings_once_does_not_reinsert_key_deleted_after_marker_se
     assert store.get_system_settings().get("openai_api_key") is None   # 復活していない
 
 
-def test_migrate_marker_if_legacy_exists_migrates_without_touching_other_keys():
-    """実 DB での `store.migrate_marker_if_legacy_exists` の検証。旧共有マーカー
-    （`env_seed_version` 相当）が存在すれば、`guard_key` だけを確定して他のキーには一切触れない
-    （admin が削除した値を復活させない・legacy_key を持たない `seed_system_settings_once` と違う
-    独立した関数であることを実 DB で固定する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.set_system_settings("admin-uid", {"legacy-marker-test": 1})
-    migrated = store.migrate_marker_if_legacy_exists(
-        "new-guard-test", "legacy-marker-test", guard_value=1)
-    assert migrated is True
-    assert store.get_system_settings().get("new-guard-test") == 1
-    assert "ollama_url" not in store.get_system_settings()   # 触れていない
-
-
-def test_migrate_marker_if_legacy_exists_returns_false_when_legacy_absent():
-    """旧マーカーが無ければ何も書かず False を返す（新規導入環境の判定・呼び出し元は
-    通常どおりの候補構築・書込みへ進める）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    migrated = store.migrate_marker_if_legacy_exists(
-        "new-guard-test2", "legacy-marker-that-does-not-exist", guard_value=1)
-    assert migrated is False
-    assert store.get_system_settings().get("new-guard-test2") is None
-
-
-def test_migrate_marker_if_legacy_exists_is_idempotent_across_repeated_calls():
-    """複数回呼んでも guard_key は二重確定しない（`WHERE NOT EXISTS` の単体原子性）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.set_system_settings("admin-uid", {"legacy-marker-test3": 1})
-    assert store.migrate_marker_if_legacy_exists("new-guard-test3", "legacy-marker-test3", 1) is True
-    assert store.migrate_marker_if_legacy_exists("new-guard-test3", "legacy-marker-test3", 1) is True
-    assert store.get_system_settings().get("new-guard-test3") == 1
-
-
-def test_seed_ollama_url_from_env_does_not_revive_admin_deleted_url_after_legacy_upgrade(monkeypatch):
-    """旧統合シード済み環境（`env_seed_version` あり）で
-    admin が `ollama_url`／`ollama_allowlist` を削除済みの状態から、残存 `OLLAMA_URL` env のまま
-    `api._seed_ollama_url_from_env()` を呼んでも、削除済みの接続先は復活・再認可されない
-    （`sherpa.api` 経由・実 DB・モックなしの end-to-end 検証）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    from sherpa import api as api_mod
-    store.set_system_settings("admin-uid", {"env_seed_version": 1})   # 旧統合シード済み（admin 削除後）
-    monkeypatch.setenv("OLLAMA_URL", "http://revival-should-not-happen.internal:11434")
-    api_mod._seed_ollama_url_from_env()
-    current = store.get_system_settings()
-    assert "ollama_url" not in current
-    assert "ollama_allowlist" not in current
-    assert current.get(api_mod._OLLAMA_URL_SEED_MARKER_KEY) == api_mod._OLLAMA_URL_SEED_VERSION
-
-
 def test_seed_system_settings_once_ollama_allowlist_merge_when_url_newly_inserted():
     """重大バグ是正（RV 3巡目 #2）: `ollama_allowlist_merge` を渡すと、URL が実際に新規挿入できた
     場合だけ、既存の allowlist（他の admin 登録ホストを含む）へ host:port を追記する
@@ -1173,430 +1031,6 @@ def test_seed_system_settings_once_rejects_ollama_allowlist_in_updates_with_merg
             guard_key="env_seed_version", ollama_allowlist_merge=("ollama_url", "x:11434"))
 
 
-def _insert_raw_audit(action: str, after_state: dict, created_at: str | None = None) -> int:
-    """テスト専用: `system_settings.env_seeded`/`system_settings.updated` の監査行を、
-    `_audit_insert`（常に `now()`）を経由せず直接 INSERT する。`created_at`（トランザクション
-    開始時刻）と `id`（実行順・BIGSERIAL）の食い違いを意図的に作るための唯一の方法
-    （RV 5巡目 #2 のテスト：advisory lock 待ちで開始順と確定順が入れ替わるケースの再現）。"""
-    from psycopg.types.json import Json
-    with store._connect() as c:
-        if created_at is not None:
-            row = c.execute(
-                "INSERT INTO audit_log (actor_user_id, action, resource_type, after_state, created_at) "
-                "VALUES (%s, %s, 'system_settings', %s, %s) RETURNING id",
-                ("system", action, Json(after_state), created_at)).fetchone()
-        else:
-            row = c.execute(
-                "INSERT INTO audit_log (actor_user_id, action, resource_type, after_state) "
-                "VALUES (%s, %s, 'system_settings', %s) RETURNING id",
-                ("system", action, Json(after_state))).fetchone()
-    return row["id"]
-
-
-# ===== store.catchup_ollama_allowlist_for_env_seeded_url_v2（実 DB での意味論の固定・4巡目簡素化裁定） =====
-
-def test_catchup_v2_adds_when_env_seeded_audit_proves_no_tampering():
-    """`system_settings.env_seeded` 監査が `ollama_url` の挿入を証明し、以後 `ollama_url`／
-    `ollama_allowlist` への admin 操作が無い場合だけ、host:port を allowlist へ追記する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-1")
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-1")
-    assert reason == "added"
-    stored = store.get_system_settings()
-    assert "central.internal:11434" in stored["ollama_allowlist"]
-    assert stored["catchup-v2-test-1"] == 1
-
-
-def test_seed_system_settings_once_writes_ollama_url_fingerprint_and_redacted_url_in_audit():
-    """`system_settings.env_seeded` 監査の `after_state["ollama_url"]` は host 表現へ
-    畳まれ（生 URL を残さない）、tamper 検知専用の `ollama_url_fingerprint`（正規化 host:port）が
-    別フィールドとして残る。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-fp")
-    with store._connect() as c:
-        row = c.execute(
-            "SELECT after_state FROM audit_log WHERE action='system_settings.env_seeded' "
-            "ORDER BY id DESC LIMIT 1").fetchone()
-    after = row["after_state"]
-    assert after["ollama_url"] == "central.internal:11434"
-    assert after["ollama_url_fingerprint"] == "central.internal:11434"
-
-
-def test_catchup_v2_fails_closed_when_admin_touched_url_or_allowlist_after_seed():
-    """重大バグ是正（RV 4巡目 #2）: env シード後に admin が `ollama_url`／`ollama_allowlist` を
-    操作していれば（URL を変えていなくても・allowlist だけの操作でも）、値の一致だけを
-    provenance とみなさず fail-closed で何も追加しない（旧v1は値一致だけで判定しており、
-    admin が allowlist からそのhostだけ削除した操作を復活させ得た）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-2")
-    store.set_system_settings("admin-uid", {"ollama_allowlist": []})   # admin が明示的に空へ
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-2")
-    assert reason == "skipped_unproven"
-    assert store.get_system_settings().get("ollama_allowlist") in (None, [])
-
-
-def test_catchup_v2_fails_closed_when_no_provable_env_seed_evidence():
-    """env シードの監査証跡が無い（admin が直接 `ollama_url` を設定した・由来不明）場合は
-    fail-closed で何も追加しない。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.set_system_settings("admin-uid", {"ollama_url": "http://admin-set-directly:11434"})
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-3")
-    assert reason == "skipped_unproven"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-
-
-def test_catchup_v2_ignores_stale_v1_marker_and_evaluates_independently():
-    """重大バグ是正（RV 5巡目 #12）: 旧 v1 の完了マーカー（`ollama_allowlist_env_seed_catchup`・
-    値一致だけを provenance とみなしていた旧 guard_key）が既に存在する環境（v1 を一度でも踏んだ
-    展開）でも、v2 は別の guard_key（`_v2` サフィックス）で独立に評価する＝旧マーカーの存在に
-    引きずられて「証明済み」と誤認しない。旧マーカーが立っているだけで v2 が要求する監査証跡が
-    無ければ、通常どおり fail-closed のままであることを固定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.set_system_settings("admin-uid", {"ollama_url": "http://legacy-v1-deploy.internal:11434"})
-    with store._connect() as c:
-        c.execute(
-            "INSERT INTO system_settings (key, value, updated_by) VALUES "
-            "('ollama_allowlist_env_seed_catchup', '1'::jsonb, 'system') ON CONFLICT (key) DO NOTHING")
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-legacy-marker")
-    assert reason == "skipped_unproven"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-    # 旧マーカー自体は触れられていない（v2 は別キーで動くので削除も上書きもしない）。
-    assert store.get_system_settings().get("ollama_allowlist_env_seed_catchup") == 1
-
-
-def _set_raw_ollama_url(url: str) -> None:
-    """テスト専用: `system_settings.ollama_url` を監査を経由せず直接 upsert する（seed の
-    after_state と現在値を一致させ、URL 一致チェックを常に満たした状態で id 順の判定だけを
-    単独で検証するための下ごしらえ）。"""
-    from psycopg.types.json import Json
-    with store._connect() as c:
-        c.execute(
-            "INSERT INTO system_settings (key, value, updated_by) VALUES ('ollama_url', %s, 'test') "
-            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
-            (Json(url),))
-
-
-def test_catchup_v2_fails_closed_when_admin_update_has_same_created_at_as_seed():
-    """重大バグ是正（RV 5巡目 #2・6巡目 #12 で false green を是正）: `created_at` は解像度の
-    限界等で seed 監査と同一になり得る。`created_at > seed_ts` という厳密比較では「同一時刻＝
-    後ではない」と誤って見逃していた。id（実行順）が seed より後の `system_settings.updated`
-    は、created_at が同一でも改ざんとして検出する。
-
-    現在の `ollama_url` を seed 値と一致させておく（RV 6巡目 #12: 一致させていないと、
-    id 判定を旧 `created_at` 判定へ戻しても URL 不一致だけで skipped_unproven になり、
-    id 判定自体を検証できていない false green だった）。
-
-    seed 監査の判定は `ollama_url_fingerprint`（正規化 host:port）で行うため、生の
-    `ollama_url` フィールドと一緒にこの raw 監査へ含める（`seed_system_settings_once` が
-    書く実際の形を模す・欠けていると id 判定に到達する前に「証明できない」で早期に
-    skipped_unproven になり、この id 判定ロジック自体を検証できなくなる）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    same_ts = "2031-06-01T00:00:00+00:00"
-    _insert_raw_audit("system_settings.env_seeded",
-                      {"ollama_url": "central.internal:11434",
-                       "ollama_url_fingerprint": "central.internal:11434"}, created_at=same_ts)
-    _insert_raw_audit("system_settings.updated",
-                      {"ollama_url": "http://tampered.internal:11434"}, created_at=same_ts)
-    _set_raw_ollama_url("http://central.internal:11434")
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-sametime")
-    assert reason == "skipped_unproven"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-
-
-def test_catchup_v2_fails_closed_when_lock_order_reverses_created_at_order():
-    """重大バグ是正（RV 5巡目 #2・6巡目 #12 で false green を是正）: `created_at` はトランザク
-    ション**開始**時刻（advisory lock を待つ前）であって確定（commit）順ではない。先に開始した
-    が lock 待ちで後から commit した admin 更新は、created_at が seed より古いまま id（実行順）
-    だけが後になる。created_at 基準では「seed より前」と誤認して見逃すが、id 基準では正しく
-    「seed より後」と判定して fail-closed になることを固定する。
-
-    現在の `ollama_url` を seed 値と一致させておく（RV 6巡目 #12: URL 不一致だけで
-    skipped_unproven になる false green を避け、id 判定そのものを検証する）。
-
-    seed 監査の判定は `ollama_url_fingerprint`（正規化 host:port）で行うため raw
-    監査に含める（`test_catchup_v2_fails_closed_when_admin_update_has_same_created_at_as_seed`
-    と同じ理由）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    # seed の方を「開始が遅い」ように見せる（created_at を admin 更新より未来にする）。
-    # 実行順（id）は挿入順どおり＝seed が先・admin 更新が後。
-    _insert_raw_audit("system_settings.env_seeded",
-                      {"ollama_url": "central.internal:11434",
-                       "ollama_url_fingerprint": "central.internal:11434"},
-                      created_at="2031-01-01T00:00:00+00:00")
-    _insert_raw_audit("system_settings.updated",
-                      {"ollama_url": "http://tampered.internal:11434"},
-                      created_at="2000-01-01T00:00:00+00:00")
-    _set_raw_ollama_url("http://central.internal:11434")
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-lockorder")
-    assert reason == "skipped_unproven"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-
-
-def test_catchup_v2_fails_closed_when_current_url_does_not_match_seed_audit_value():
-    """重大バグ是正（RV 5巡目 #2）: 「以降に admin 更新が無い」ことを監査で証明できても、
-    現在の `ollama_url` の指紋（`llm.ollama_url_fingerprint`）が seed 監査に記録された
-    指紋と一致しなければ書かない（監査を経由しない書込み経路が将来増えた場合への二重の安全網）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _insert_raw_audit("system_settings.env_seeded",
-                      {"ollama_url": "central.internal:11434",
-                       "ollama_url_fingerprint": "central.internal:11434"})
-    _set_raw_ollama_url("http://different-from-seed.internal:11434")
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-urlmismatch")
-    assert reason == "skipped_unproven"
-    assert store.get_system_settings().get("ollama_allowlist") is None
-
-
-def test_catchup_v2_fails_closed_when_seed_audit_predates_fingerprint_field():
-    """`ollama_url_fingerprint` フィールドを持たない旧形式の env_seeded 監査は「証明できない」
-    として扱う（生 URL の文字列一致には戻さない・fail-closed）。
-
-    host は本ファイルの他の catchup_v2 テストと重ならない一意な値を使う（`audit_log` は
-    per-test で消去されない共有テーブル・seed 証拠のスキャンは guard_key で絞られない全件走査
-    のため、同じ host を使う他テストの `env_seeded` 行を誤って拾わないようにする）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    _insert_raw_audit("system_settings.env_seeded", {"ollama_url": "legacy-fp-missing.internal:11434"})
-    _set_raw_ollama_url("http://legacy-fp-missing.internal:11434")
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-legacy-format")
-    assert reason == "skipped_unproven"
-    assert "legacy-fp-missing.internal:11434" not in (store.get_system_settings().get("ollama_allowlist") or [])
-
-
-def test_catchup_v2_is_one_time_only_and_does_not_revive_admin_deletion():
-    """一度評価された後（marker が立った後）は、admin がそのホストを allowlist から削除しても
-    再評価・復活させない（版付き移行の一度きり性）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-4")
-    reason1 = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-4")
-    assert reason1 == "added"
-    store.set_system_settings("admin-uid", {"ollama_allowlist": []})   # admin が後で削除
-    reason2 = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-4")
-    assert reason2 == "already_present"   # marker 既存＝再評価しない
-    assert store.get_system_settings().get("ollama_allowlist") == []   # 復活しない
-
-
-def test_catchup_v2_records_reasoned_audit_before_marker():
-    """判定理由（`added`/`skipped_unproven`）を持つ監査が、marker 挿入の直前に必ず記録される。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-5")
-    store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-5")
-    rows = store.list_audit(action="system_settings.env_seed_catchup", limit=5)
-    assert rows and rows[0]["after_state"]["reason"] == "added"
-
-
-def test_catchup_v2_audit_insert_failure_rolls_back_marker_and_allowlist(monkeypatch):
-    """重大バグ是正（RV 4巡目 #3・#12b）: 監査 INSERT が失敗すると、同一トランザクションの
-    marker・allowlist 追記も一緒にロールバックされる（監査記録の無い marker/追記が確定しない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-7")
-
-    monkeypatch.setattr(store, "_audit_insert", _boom)
-    with pytest.raises(RuntimeError):
-        store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-7")
-    monkeypatch.undo()
-
-    store._invalidate_system_settings_cache()
-    stored = store.get_system_settings()
-    assert stored.get("catchup-v2-test-7") is None, "監査失敗時に marker が commit されている"
-    assert "central.internal:11434" not in (stored.get("ollama_allowlist") or []), \
-        "監査失敗時に allowlist への追記が commit されている"
-    # ロールバック後に再実行すれば通常どおり評価・追加できる（マーカーが残留していない証拠）。
-    reason = store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-7")
-    assert reason == "added"
-
-
-def test_catchup_v2_preserves_concurrent_admin_allowlist_row_via_insert_then_lock():
-    """重大バグ是正（RV 4巡目 #3）: `ollama_allowlist` 行を先に確保してから `FOR UPDATE` するため、
-    admin が catch-up の**直前**に allowlist を初期作成していても、その値を古い空配列で
-    上書きしない（行未作成のまま `FOR UPDATE` すると何もロックできず、後勝ちで消えていた旧穴）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-6")
-    store.set_system_settings("admin-uid", {"ollama_allowlist": ["10.9.9.9:11434"]})
-    # 上の set_system_settings が「admin 操作」として記録されるため、この後の catch-up は
-    # fail-closed で追加しない（#2 の証明契約どおり）が、admin が入れた値自体は消えない。
-    store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-6")
-    assert store.get_system_settings()["ollama_allowlist"] == ["10.9.9.9:11434"]
-
-
-def test_catchup_v2_blocks_on_shared_advisory_lock_held_by_concurrent_writer():
-    """重大バグ是正（RV 4巡目 #2・#12c）: catch-up と他の system_settings 複数行書き込み
-    （admin PUT・env シード）は同じ advisory lock（`_ENV_SEED_LOCK`）を共有するため、片方が
-    保持している間はもう片方が実際にロック待ちへ入る（別々の行ロック順序に依存しない・
-    デッドロックの芽を構造的に塞ぐ）ことを、真の並行スレッド＋`pg_blocking_pids` で観測して
-    固定する（値の一致や逐次実行の代理観測ではなく、実際のブロッキングを直接確認する）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-8")
-
-    holder_conn = store._connect()
-    monitor_conn = store._connect()
-    try:
-        holder_pid = holder_conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"]
-        # 他の system_settings 複数行書き込み（`set_system_settings`／`seed_system_settings_once`）が
-        # 使うのと同じ advisory lock を、テスト側が先に保持する。
-        holder_conn.execute("SELECT pg_advisory_xact_lock(%s)", (store.settings._ENV_SEED_LOCK,))
-
-        thread_done = threading.Event()
-        errors: list[Exception] = []
-        results: list[str] = []
-
-        def worker():
-            try:
-                results.append(
-                    store.catchup_ollama_allowlist_for_env_seeded_url_v2(guard_key="catchup-v2-test-8"))
-            except Exception as e:   # pragma: no cover - 診断用（assert で検出する）
-                errors.append(e)
-            finally:
-                thread_done.set()
-
-        t = threading.Thread(target=worker)
-        t.start()
-
-        deadline = time.monotonic() + 5.0
-        worker_pid = None
-        while time.monotonic() < deadline:
-            rows = monitor_conn.execute(
-                "SELECT pid FROM pg_stat_activity "
-                "WHERE wait_event_type='Lock' AND datname = current_database() "
-                "  AND %s = ANY(pg_blocking_pids(pid))",
-                (holder_pid,)).fetchall()
-            monitor_conn.rollback()
-            if len(rows) == 1:
-                worker_pid = rows[0]["pid"]
-                break
-            if len(rows) > 1:
-                raise AssertionError(
-                    f"holder（pid={holder_pid}）にブロックされているバックエンドが複数見つかった: "
-                    f"{[r['pid'] for r in rows]}")
-            time.sleep(0.05)
-
-        assert worker_pid is not None, \
-            "worker が advisory lock 待ちへ入ったことを観測できなかった（lock 共有が効いていない）"
-        assert not thread_done.is_set(), \
-            "ロック待ちを観測した直後にスレッドが完了扱いになっている（矛盾・診断ロジック不整合）"
-
-        holder_conn.commit()   # ここでロック解放＝worker が進める
-
-        assert thread_done.wait(timeout=5), "commit 後もスレッドが完了しなかった"
-        t.join(timeout=5)
-        assert not t.is_alive()
-        assert not errors, f"スレッドで例外: {errors}"
-        assert results == ["added"]
-    finally:
-        holder_conn.close()
-        monitor_conn.close()
-
-
-def test_catchup_v2_and_set_system_settings_concurrent_real_writers_preserve_values():
-    """重大バグ是正（RV 5巡目 #12・6巡目 #12 で false green を是正）: 最初の版はテスト自身が
-    advisory lock を直接保持する代理観測だった。次の版は実 writer を `threading.Barrier` だけで
-    「ほぼ同時」に走らせていたが、(a) 無関係な `sub_planner` だけを更新しており
-    （`ollama_url`／`ollama_allowlist` 行には一切触れない＝共有 lock を削除しても行ロック競合が
-    発生せず通る）、(b) `threading.Barrier` は開始タイミングを揃えるだけで、実際にロック待ちへ
-    入ったこと自体は保証しない＝スレッド起動の実行速度差で競合そのものが再現されないことがある
-    （`bedrock_verified_models` の並行テストが同じ理由で Barrier 方式から `pg_blocking_pids`
-    方式へ是正した教訓と同型・実行のたびに再現するとは限らない非決定的な false green の余地）、
-    "最終値の一致"も両者が無関係な値を書く以上は無意味だった。
-
-    ここでは catchup と**同じ2行を逆順**で触る admin 書込み（`set_system_settings` は
-    `ollama_allowlist`→`ollama_url` の順・catchup は `ollama_url`→`ollama_allowlist` の順・
-    `_ENV_SEED_LOCK` の定義コメント参照）を、テスト側が先に共有 lock を保持した状態で**両方とも**
-    実際に起動し、`pg_blocking_pids` で「実 writer 2つが両方ともこの1つの lock で本当に
-    ブロックされている」ことを直接観測してから解放する（値の一致や Barrier の代理観測ではない）。
-    解放後どちらが先に確定しても（`set_system_settings` の `ollama_allowlist` 更新は完全上書き・
-    catchup は seed 後の admin 更新を改ざんとして検知して何も書かない）最終値は admin の書込みに
-    収束する＝決定的に固定できる。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.seed_system_settings_once(
-        {"ollama_url": "http://central.internal:11434"}, guard_key="unused-marker-9")
-
-    holder_conn = store._connect()
-    monitor_conn = store._connect()
-    try:
-        holder_pid = holder_conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"]
-        holder_conn.execute("SELECT pg_advisory_xact_lock(%s)", (store.settings._ENV_SEED_LOCK,))
-
-        errors: list[Exception] = []
-        results: dict = {}
-
-        def writer():
-            try:
-                # ollama_allowlist→ollama_url の順（admin PUT と同じ・catchup とは逆順・
-                # `_ENV_SEED_LOCK` 定義コメント参照）。
-                store.set_system_settings("admin-uid", {
-                    "ollama_allowlist": ["10.9.9.9:11434"],
-                    "ollama_url": "http://writer-set.internal:11434",
-                })
-            except Exception as e:   # pragma: no cover - 診断用（assert で検出する）
-                errors.append(e)
-
-        def catcher():
-            try:
-                results["reason"] = store.catchup_ollama_allowlist_for_env_seeded_url_v2(
-                    guard_key="catchup-v2-test-9")
-            except Exception as e:   # pragma: no cover - 診断用（assert で検出する）
-                errors.append(e)
-
-        t1 = threading.Thread(target=writer)
-        t2 = threading.Thread(target=catcher)
-        t1.start()
-        t2.start()
-
-        deadline = time.monotonic() + 5.0
-        blocked_pids: set[int] = set()
-        while time.monotonic() < deadline and len(blocked_pids) < 2:
-            rows = monitor_conn.execute(
-                "SELECT pid FROM pg_stat_activity "
-                "WHERE wait_event_type='Lock' AND datname = current_database() "
-                "  AND %s = ANY(pg_blocking_pids(pid))",
-                (holder_pid,)).fetchall()
-            monitor_conn.rollback()
-            blocked_pids = {r["pid"] for r in rows}
-            if len(blocked_pids) < 2:
-                time.sleep(0.05)
-
-        assert len(blocked_pids) == 2, \
-            (f"実 writer 2つが holder（pid={holder_pid}）に両方ともブロックされていることを"
-             f"観測できなかった（観測できた分: {blocked_pids}・lock 共有が効いていない）")
-
-        holder_conn.commit()   # ここでロック解放＝2つの writer が進める
-
-        t1.join(timeout=10)
-        t2.join(timeout=10)
-        assert not t1.is_alive() and not t2.is_alive(), "解放後もスレッドが完了しなかった"
-        assert not errors, f"スレッドで例外: {errors}"
-        assert results.get("reason") in ("added", "skipped_unproven")
-        # admin の書込みは、どちらが先に確定してもここに残る（上記docstring参照）。値まで確認する
-        # （Barrier 版は allowlist の中身を一切見ていなかった）。
-        stored = store.get_system_settings()
-        assert stored.get("ollama_url") == "http://writer-set.internal:11434"
-        assert stored.get("ollama_allowlist") == ["10.9.9.9:11434"]
-    finally:
-        holder_conn.close()
-        monitor_conn.close()
-
-
 # ===== WEB-1: Codex の Web 検索を管理者が許可する（system_settings.web_search_allowed）=====
 
 def test_admin_settings_web_search_allowed_round_trip_and_gates():
@@ -1637,53 +1071,15 @@ def test_admin_settings_web_search_allowed_round_trip_and_gates():
     assert user.put("/admin/settings", json={"web_search_allowed": True}).status_code == 403
 
 
-# ===== OpenAI 直結を利用者の構成一覧に出すか（system_settings.openai_direct_visible）=====
-
-def test_admin_settings_openai_direct_visible_round_trip_and_gates():
-    """GET は既定 false・PUT で true/false を往復・null で既定へ戻る・StrictBool 検証・admin 限定。
-    決定 2026-09-20＝OpenAI 系は Codex(OpenAI) に一本化・直結は既定で利用者の一覧から外す。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    sfx = _sfx()
-    admin, _ = _admin_client()
-
-    r0 = admin.get("/admin/settings")
-    assert r0.status_code == 200, r0.text
-    assert r0.json()["cloud"]["openai_direct_visible"] is False   # 未設定＝既定 false
-
-    r1 = admin.put("/admin/settings", json={"openai_direct_visible": True})
-    assert r1.status_code == 200, r1.text
-    assert r1.json()["cloud"]["openai_direct_visible"] is True
-
-    r_get = admin.get("/admin/settings")
-    assert r_get.json()["cloud"]["openai_direct_visible"] is True
-
-    r2 = admin.put("/admin/settings", json={"openai_direct_visible": None})
-    assert r2.status_code == 200, r2.text
-    assert r2.json()["cloud"]["openai_direct_visible"] is False   # 未設定へ戻る（既定 false）
-
-    # StrictBool: 非 bool（文字列 "yes" 等）は pydantic 自身が 422 にする。
-    assert admin.put("/admin/settings", json={"openai_direct_visible": "yes"}).status_code == 422
-    assert admin.put("/admin/settings", json={"openai_direct_visible": 1}).status_code == 422
-    assert admin.put("/admin/settings", json={"openai_direct_visible": "true"}).status_code == 422
-
-    # 非 admin は 403（既存の _require_admin 契約）。未ログインは 401。
-    anon = TestClient(app, raise_server_exceptions=False)
-    assert anon.get("/admin/settings").status_code == 401
-    assert anon.put("/admin/settings", json={"openai_direct_visible": True}).status_code == 401
-    uid, pw = f"opnvisusr{sfx}", f"OpnVisUsr{sfx}"
-    _mk_user(uid, pw, role="user")
-    user = _login(uid, pw)
-    assert user.get("/admin/settings").status_code == 403
-    assert user.put("/admin/settings", json={"openai_direct_visible": True}).status_code == 403
+# ===== 撤去済みの管理設定（openai_direct_visible / depth_base_max_turns ほか）=====
 
 
 # ===== A6: personal_api_keys_allowed=false → 個人キーの一括削除 =====
 # OFF のとき個人キーは保存されない状態を保つ。
 
 def test_put_personal_keys_off_purges_all_users_and_audits_count():
-    """personal_api_keys_allowed を false で保存すると、全ユーザーの個人秘密キー（openai/gemini/
-    bedrock）が NULL になり、監査ログに削除件数が記録される。"""
+    """personal_api_keys_allowed を false で保存すると、全ユーザーの個人秘密キー（openai と、閉じた
+    プロバイダ gemini/bedrock の旧キー列）が NULL になり、監査ログに削除件数が記録される。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
@@ -1692,16 +1088,19 @@ def test_put_personal_keys_off_purges_all_users_and_audits_count():
     for uid in (u1, u2):
         _mk_user(uid, f"pw-{uid}")
     store.set_system_settings("admin-uid", {"personal_api_keys_allowed": True})
-    store.update_settings(u1, openai_api_key="sk-u1", gemini_api_key="gk-u1")
-    store.update_settings(u2, bedrock_api_key="bk-u2")
+    store.update_settings(u1, openai_api_key="sk-u1")
+    store.update_settings(u2, agent="simple")
+    with store._connect() as c:   # 閉じたプロバイダの旧キー列（アプリは書かない）を直接仕込む
+        c.execute("UPDATE user_settings SET bedrock_api_key=%s WHERE user_id=%s", ("bk-u2", u2))
     assert store.get_settings(u1)["openai_api_key"] == "sk-u1"
 
     r = admin.put("/admin/settings", json={"personal_api_keys_allowed": False})
     assert r.status_code == 200, r.text
 
     assert store.get_settings(u1)["openai_api_key"] is None
-    assert store.get_settings(u1)["gemini_api_key"] is None
-    assert store.get_settings(u2)["bedrock_api_key"] is None
+    with store._connect() as c:
+        legacy = c.execute("SELECT bedrock_api_key FROM user_settings WHERE user_id=%s", (u2,)).fetchone()
+    assert legacy["bedrock_api_key"] is None
 
     rows = store.list_audit(action="user_settings.personal_keys_purged", limit=5)
     assert rows, "監査行が記録されていない"
@@ -1906,7 +1305,7 @@ def test_put_settings_personal_key_race_returns_422_with_detail_via_real_http(mo
 
 
 def test_keyless_update_settings_does_not_resurrect_key_after_real_purge(monkeypatch):
-    """キーを一切含まない `store.update_settings`（例: `codex_reasoning` だけの保存）は、実行開始時に
+    """キーを一切含まない `store.update_settings`（例: `agent` だけの保存）は、実行開始時に
     読んだ現在値のスナップショット（`cur`）を全列 UPSERT で書き戻すのではなく、個人キー3列を SQL の
     SET から丸ごと除外する（部分更新・`update_settings` docstring 参照）。この呼び出しが古いキーを
     読んでから実際に書き込むまでの間に、管理者の本物の `store.purge_personal_api_keys()` が割り込んでも、
@@ -1943,7 +1342,7 @@ def test_keyless_update_settings_does_not_resurrect_key_after_real_purge(monkeyp
 
     def worker():
         try:
-            store.update_settings(u1, codex_reasoning="medium")
+            store.update_settings(u1, agent="codex")
         except Exception as e:   # pragma: no cover - 診断用（assert で検出する）
             errors.append(e)
 
@@ -1963,56 +1362,7 @@ def test_keyless_update_settings_does_not_resurrect_key_after_real_purge(monkeyp
     fetched = store.get_settings(u1)
     assert fetched["openai_api_key"] is None, \
         "キー無し保存が purge 後に古いキーを書き戻した（部分更新が効いていない）"
-    assert fetched["codex_reasoning"] == "medium", "本来の保存対象（codex_reasoning）が反映されていない"
-
-
-def _raw_key_columns(uid: str) -> dict:
-    """`user_settings` の個人キー3列を DB から直接読む（`get_settings()` の既定値マージを経由
-    しない・行そのものの実値を見る）。"""
-    with store._connect() as c:
-        return c.execute(
-            "SELECT openai_api_key, gemini_api_key, bedrock_api_key FROM user_settings WHERE user_id=%s",
-            (uid,)).fetchone()
-
-
-@pytest.mark.parametrize("target_field", ["openai_api_key", "gemini_api_key", "bedrock_api_key"])
-def test_update_settings_key_columns_partial_update_boundary(target_field):
-    """個人キー3列の部分更新の境界を DB 直接読取で固定する（`update_settings` docstring 参照）。
-    (1) 新規行（初回 INSERT・キーを一切指定しない保存）は3列とも NULL のまま。
-    (2) 3列とも実キーで埋めた後、対象1列だけを明示クリア（""）すると、その列だけ NULL になり、
-    他2列は SQL 上一切 SET されない＝無関係な保存で消えたり書き換わったりしない。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    store.set_system_settings("admin-uid", {"personal_api_keys_allowed": True})
-    sfx = _sfx()
-    u1 = f"pkboundary{target_field[:3]}{sfx}"
-    _mk_user(u1, f"pw-{u1}")
-
-    # (1) 新規行（キー一切未指定）は3列とも NULL。
-    store.update_settings(u1, codex_reasoning="medium")
-    row = _raw_key_columns(u1)
-    assert row is not None, "新規行が作成されなかった"
-    assert row["openai_api_key"] is None
-    assert row["gemini_api_key"] is None
-    assert row["bedrock_api_key"] is None
-
-    # 3列とも実キーで埋める。
-    expected = {"openai_api_key": "sk-o", "gemini_api_key": "sk-g", "bedrock_api_key": "sk-b"}
-    store.update_settings(u1, **expected)
-    row = _raw_key_columns(u1)
-    assert row["openai_api_key"] == "sk-o"
-    assert row["gemini_api_key"] == "sk-g"
-    assert row["bedrock_api_key"] == "sk-b"
-
-    # (2) target_field だけを明示クリア（""）→ その列だけ NULL、他2列は元の値と完全一致のまま
-    # （SQL 上一切 SET されない＝無関係な保存で消えたり書き換わったりしない）。
-    store.update_settings(u1, **{target_field: ""})
-    row = _raw_key_columns(u1)
-    other_fields = [f for f in ("openai_api_key", "gemini_api_key", "bedrock_api_key") if f != target_field]
-    assert row[target_field] is None, f"{target_field} が明示クリアされていない"
-    for f in other_fields:
-        assert row[f] == expected[f], \
-            f"{f} が無関係な保存で元の値（{expected[f]!r}）から変わってしまった: {row[f]!r}"
+    assert fetched["agent"] == "codex", "本来の保存対象（agent）が反映されていない"
 
 
 # ===== model_catalog.seed_catalog_once（実 DB での初回シードの意味論） =====
@@ -2051,10 +1401,9 @@ def test_seed_catalog_once_reads_openai_embed_model_env(monkeypatch):
 
 def test_settings_put_shares_one_system_settings_snapshot(monkeypatch):
     """`settings_put` は `sys_s = store.get_system_settings()` を入口で1回取得し、A6
-    （`personal_keys_allowed`）判定・A7（`agent_requires_unselected_cloud`→`selected_cloud_provider`）
-    判定・`ollama_url` の SSRF/allowlist 検証（`assert_ollama_url_allowed`→`_allowlisted_hosts`）
+    （`personal_keys_allowed`）判定・`ollama_url` の SSRF/allowlist 検証（`assert_ollama_url_allowed`→`_allowlisted_hosts`）
     へそれを渡す契約になっている（個別に読み直すと、1リクエストの検証中に admin 更新が挟まった
-    場合に判定が新旧混在しうる）。ここでは agent=openai（A7 経路）と ollama_url=loopback
+    場合に判定が新旧混在しうる）。ここでは agent=openai と ollama_url=loopback
     （SSRF/allowlist 経路）を同一 PUT に含め、両方が `settings_put` 自身の system_settings と
     同一オブジェクトで判定されることを固定する。
 
@@ -2083,6 +1432,7 @@ def test_settings_put_shares_one_system_settings_snapshot(monkeypatch):
         call_id["n"] += 1
         d = dict(real_get_system_settings())
         d["_call_id"] = call_id["n"]
+        d["cloud_provider"] = "openai"   # agent=openai を A7 一致で通す
         return d
 
     monkeypatch.setattr(store, "get_system_settings", _tagged_each_call)
@@ -2102,9 +1452,6 @@ def test_settings_put_shares_one_system_settings_snapshot(monkeypatch):
     monkeypatch.setattr(keys, "personal_keys_allowed", _spy(
         "personal_keys_allowed", keys.personal_keys_allowed,
         lambda a, kw: kw.get("system_settings", a[0] if a else None)))
-    monkeypatch.setattr(keys, "selected_cloud_provider", _spy(
-        "selected_cloud_provider", keys.selected_cloud_provider,
-        lambda a, kw: kw.get("system_settings", a[0] if a else None)))
     monkeypatch.setattr(llm, "_allowlisted_hosts", _spy(
         "_allowlisted_hosts", llm._allowlisted_hosts,
         lambda a, kw: kw.get("system_settings", a[0] if a else None)))
@@ -2112,7 +1459,7 @@ def test_settings_put_shares_one_system_settings_snapshot(monkeypatch):
     r = c.put("/settings", json={"agent": "openai", "ollama_url": "http://localhost:11434"})
     assert r.status_code == 200, r.text
 
-    required = {"personal_keys_allowed", "selected_cloud_provider", "_allowlisted_hosts"}
+    required = {"personal_keys_allowed", "_allowlisted_hosts"}
     missing = required - set(first_call_value)
     assert not missing, f"呼ばれなかったヘルパー: {missing}"
     for name, v in first_call_value.items():
@@ -2121,7 +1468,7 @@ def test_settings_put_shares_one_system_settings_snapshot(monkeypatch):
     assert len(ids) == 1, f"検証フェーズのヘルパーが異なる system_settings を受け取った: {first_call_value}"
 
 
-# ===== PART-4a: research_default_provider（外部連携タブ「AI 下調べ検索の既定 AI」）=====
+# ===== PART-4a: research_default_provider（管理画面「簡易回答に使う AI」）=====
 
 def test_admin_settings_research_default_provider_accepts_ollama_without_preflight():
     """ollama は実送信可能性の preflight を通す必要が無い——常に受理される。"""
@@ -2241,7 +1588,7 @@ def test_admin_settings_view_research_default_provider_shape():
 
 def test_admin_settings_view_depth_profile_shape_unset():
     """GET /admin/settings の depth_profile は7項目（整数6＋codex_reasoning）。未設定なら
-    configured=None・effective=default=各モジュールの env 既定値。"""
+    configured=None・effective=default=各モジュールのコード既定値。"""
     if not _try_init():
         pytest.skip("DB down")
     from sherpa import agentic_search, impact_service, lens_service, chat_service, depth_profile
@@ -2251,7 +1598,7 @@ def test_admin_settings_view_depth_profile_shape_unset():
     dp = r.json()["depth_profile"]
     assert set(dp.keys()) == set(depth_profile.BASE_SETTINGS_KEYS)
     for key, default in (
-        ("max_turns", agentic_search.MAX_TURNS), ("grep_max_hits", agentic_search.MAX_HITS),
+        ("grep_max_hits", agentic_search.MAX_HITS),
         ("qa_max_hits", chat_service.QA_MAX_HITS_DEFAULT), ("read_window", agentic_search.READ_WINDOW),
         ("impact_depth", impact_service.IMPACT_MAX_DEPTH),
         ("troubleshoot_depth", lens_service.TROUBLESHOOT_GRAPH_DEPTH),
@@ -2260,10 +1607,27 @@ def test_admin_settings_view_depth_profile_shape_unset():
     assert dp["codex_reasoning"]["configured"] is None
     assert dp["codex_reasoning"]["effective"] == dp["codex_reasoning"]["default"]
     assert set(dp["codex_reasoning"]["options"]) == set(depth_profile.CODEX_REASONING_LEVELS)
+    assert dp["codex_reasoning"]["default"] == "medium"
+
+    # 個人ファイルの上限・保持日数（未設定は既定・保存した値が実効値になる・範囲外は 422・null で既定へ戻る）。
+    ws = r.json()["workspace"]
+    assert ws["max_bytes"] == {"configured": None, "effective": 10 * 1024 * 1024, "default": 10 * 1024 * 1024}
+    assert ws["ttl_days"] == {"configured": None, "effective": 90, "default": 90}
+    r2 = admin.put("/admin/settings", json={"workspace_max_bytes": 2 * 1024 * 1024, "workspace_ttl_days": 0})
+    assert r2.status_code == 200, r2.text
+    ws2 = r2.json()["workspace"]
+    assert ws2["max_bytes"]["effective"] == 2 * 1024 * 1024 and ws2["ttl_days"]["effective"] == 0
+    for bad in ({"workspace_max_bytes": 1024}, {"workspace_max_bytes": 2 * 1024 ** 3},
+                {"workspace_ttl_days": -1}, {"workspace_ttl_days": 3651}):
+        assert admin.put("/admin/settings", json=bad).status_code == 422, bad
+    r3 = admin.put("/admin/settings", json={"workspace_max_bytes": None, "workspace_ttl_days": None})
+    assert r3.status_code == 200, r3.text
+    assert r3.json()["workspace"]["max_bytes"]["configured"] is None
+    assert r3.json()["workspace"]["ttl_days"]["effective"] == 90
 
 
 @pytest.mark.parametrize("field,value", [
-    ("depth_base_max_turns", 20), ("depth_base_grep_max_hits", 50), ("depth_base_qa_max_hits", 25),
+    ("depth_base_grep_max_hits", 50), ("depth_base_qa_max_hits", 25),
     ("depth_base_read_window", 80), ("depth_base_impact_depth", 12), ("depth_base_troubleshoot_depth", 6),
 ])
 def test_admin_settings_depth_base_int_put_and_get_roundtrip(field, value):
@@ -2272,7 +1636,7 @@ def test_admin_settings_depth_base_int_put_and_get_roundtrip(field, value):
     admin, _ = _admin_client()
     r = admin.put("/admin/settings", json={field: value})
     assert r.status_code == 200, r.text
-    key = {"depth_base_max_turns": "max_turns", "depth_base_grep_max_hits": "grep_max_hits",
+    key = {"depth_base_grep_max_hits": "grep_max_hits",
           "depth_base_qa_max_hits": "qa_max_hits", "depth_base_read_window": "read_window",
           "depth_base_impact_depth": "impact_depth",
           "depth_base_troubleshoot_depth": "troubleshoot_depth"}[field]
@@ -2285,35 +1649,8 @@ def test_admin_settings_depth_base_int_put_and_get_roundtrip(field, value):
     assert dp2["configured"] is None and dp2["effective"] == dp2["default"]
 
 
-def test_admin_settings_agentic_tool_limit_roundtrip():
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    response = admin.put("/admin/settings", json={"agentic_max_tools_per_turn": 7})
-    assert response.status_code == 200, response.text
-    assert response.json()["agentic_tool_limit"]["effective"] == 7
-    assert store.get_system_settings()["agentic_max_tools_per_turn"] == 7
-    # 他の項目の部分更新で保存値が消えない。
-    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
-    assert response.json()["agentic_tool_limit"]["configured"] == 7
-    response = admin.put("/admin/settings", json={"agentic_max_tools_per_turn": None})
-    assert response.status_code == 200, response.text
-    limit = response.json()["agentic_tool_limit"]
-    assert limit["configured"] is None and limit["effective"] == limit["default"]
-
-
-@pytest.mark.parametrize("bad", [0, -1, 257, True, "3", 1.5])
-def test_admin_settings_agentic_tool_limit_rejects_invalid_values(bad):
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    response = admin.put("/admin/settings", json={"agentic_max_tools_per_turn": bad})
-    assert response.status_code == 422, response.text
-    assert "agentic_max_tools_per_turn" not in store.get_system_settings()
-
-
 def test_admin_settings_embed_parallel_roundtrip():
-    """埋め込み HTTP の同時送信数（`agentic_tool_limit` と同型）。"""
+    """埋め込み HTTP の同時送信数。"""
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
@@ -2322,7 +1659,7 @@ def test_admin_settings_embed_parallel_roundtrip():
     assert response.json()["embed_parallel"]["effective"] == 8
     assert store.get_system_settings()["embed_parallel"] == 8
     # 他の項目の部分更新で保存値が消えない。
-    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
+    response = admin.put("/admin/settings", json={"depth_base_grep_max_hits": 20})
     assert response.json()["embed_parallel"]["configured"] == 8
     response = admin.put("/admin/settings", json={"embed_parallel": None})
     assert response.status_code == 200, response.text
@@ -2368,7 +1705,7 @@ def test_admin_settings_max_review_rounds_roundtrip():
     assert response.json()["max_review_rounds"]["effective"] == 3
     assert store.get_system_settings()["max_review_rounds"] == 3
     # 他の項目の部分更新で保存値が消えない。
-    response = admin.put("/admin/settings", json={"depth_base_max_turns": 20})
+    response = admin.put("/admin/settings", json={"depth_base_grep_max_hits": 20})
     assert response.json()["max_review_rounds"]["configured"] == 3
     response = admin.put("/admin/settings", json={"max_review_rounds": None})
     assert response.status_code == 200, response.text
@@ -2463,8 +1800,7 @@ def test_admin_settings_codex_mode_roundtrip_and_rejects_invalid():
 
 
 @pytest.mark.parametrize("field,bad", [
-    ("depth_base_max_turns", 0), ("depth_base_max_turns", 500),
-    ("depth_base_grep_max_hits", 0), ("depth_base_read_window", 5),
+    ("depth_base_grep_max_hits", 0), ("depth_base_grep_max_hits", 5000), ("depth_base_read_window", 5),
     ("depth_base_impact_depth", 100), ("depth_base_troubleshoot_depth", 0),
 ])
 def test_admin_settings_depth_base_int_rejects_out_of_range(field, bad):
@@ -2480,9 +1816,9 @@ def test_admin_settings_depth_base_int_rejects_non_integer():
     if not _try_init():
         pytest.skip("DB down")
     admin, _ = _admin_client()
-    r = admin.put("/admin/settings", json={"depth_base_max_turns": "twelve"})
+    r = admin.put("/admin/settings", json={"depth_base_grep_max_hits": "twelve"})
     assert r.status_code == 422, r.text
-    r2 = admin.put("/admin/settings", json={"depth_base_max_turns": True})   # StrictInt は bool を拒否
+    r2 = admin.put("/admin/settings", json={"depth_base_grep_max_hits": True})   # StrictInt は bool を拒否
     assert r2.status_code == 422, r2.text
 
 
@@ -2513,11 +1849,11 @@ def test_admin_settings_depth_base_audit_records_change():
     if not _try_init():
         pytest.skip("DB down")
     admin, admin_uid = _admin_client()
-    r = admin.put("/admin/settings", json={"depth_base_max_turns": 30})
+    r = admin.put("/admin/settings", json={"depth_base_grep_max_hits": 30})
     assert r.status_code == 200, r.text
     rows = store.list_audit(action="system_settings.updated", actor=admin_uid, limit=10)
     assert rows, "system_settings.updated が監査に残っていない"
-    assert rows[0]["after_state"].get("depth_base_max_turns") == 30
+    assert rows[0]["after_state"].get("depth_base_grep_max_hits") == 30
 
 
 # ===== チャット同時実行の上限（`sherpa/chat_turns.py::effective_limits`・
@@ -2609,7 +1945,7 @@ def test_admin_settings_chat_max_turns_effective_limits_prefers_db_value():
 
 def test_admin_settings_view_agentic_budget_shape_unset():
     """GET /admin/settings の agentic_budget は未設定なら configured=None・
-    effective=default=コード既定（精度優先・262144/4194304）。モデルの窓由来の上限との min()
+    effective=default=コード既定（精度優先・262144）。モデルの窓由来の上限との min()
     （旧 BUDGET-2・管理画面のモデル窓登録表）は撤去済み（利用者裁定「AI が持つ文脈窓を Sherpa が
     制限しない」）——`window`/`model_windows` キー自体が応答から消えている。"""
     if not _try_init():
@@ -2619,16 +1955,13 @@ def test_admin_settings_view_agentic_budget_shape_unset():
     r = admin.get("/admin/settings")
     assert r.status_code == 200, r.text
     ab = r.json()["agentic_budget"]
-    assert set(ab.keys()) == {"per_result", "total"}
+    assert set(ab.keys()) == {"per_result"}
     assert ab["per_result"] == {"configured": None, "effective": agentic_search.TOOL_RESULT_MAX_BYTES,
                                 "default": agentic_search.TOOL_RESULT_MAX_BYTES}
-    assert ab["total"] == {"configured": None, "effective": agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES,
-                           "default": agentic_search.TOOL_RESULT_MAX_TOTAL_BYTES}
 
 
 @pytest.mark.parametrize("field,key,value", [
     ("agentic_budget_per_result", "per_result", 100_000),
-    ("agentic_budget_total", "total", 2_000_000),
 ])
 def test_admin_settings_agentic_budget_put_and_get_roundtrip(field, key, value):
     if not _try_init():
@@ -2648,8 +1981,6 @@ def test_admin_settings_agentic_budget_put_and_get_roundtrip(field, key, value):
 @pytest.mark.parametrize("field,bad", [
     ("agentic_budget_per_result", 0), ("agentic_budget_per_result", -1),
     ("agentic_budget_per_result", 1023), ("agentic_budget_per_result", 8 * 1024 * 1024 + 1),
-    ("agentic_budget_total", 0), ("agentic_budget_total", -1),
-    ("agentic_budget_total", 4095), ("agentic_budget_total", 64 * 1024 * 1024 + 1),
 ])
 def test_admin_settings_agentic_budget_rejects_out_of_range(field, bad):
     """StrictInt+Field(ge,le) の範囲外（負値・過大値）は 422（保存もされない）——
@@ -2667,7 +1998,7 @@ def test_admin_settings_agentic_budget_rejects_non_integer():
     admin, _ = _admin_client()
     r = admin.put("/admin/settings", json={"agentic_budget_per_result": "big"})
     assert r.status_code == 422, r.text
-    r2 = admin.put("/admin/settings", json={"agentic_budget_total": True})   # StrictInt は bool を拒否
+    r2 = admin.put("/admin/settings", json={"agentic_budget_per_result": True})   # StrictInt は bool を拒否
     assert r2.status_code == 422, r2.text
 
 
@@ -2682,83 +2013,9 @@ def test_admin_settings_agentic_budget_audit_records_change():
     assert rows[0]["after_state"].get("agentic_budget_per_result") == 300_000
 
 
-# ===== BUDGET-1 相対検証（実装ベース探索の回復・根本原因対応D）=====
-# 累計（agentic_budget_total）は1件あたり（agentic_budget_per_result）以上でなければならない
-# ——範囲検証（StrictInt+Field）だけでは入れ替え保存（per_result=8MiB／total=4KiB）を防げず、
-# 実機で最初のツール呼び出しから即座に打ち切りになった。
-
-def test_admin_settings_agentic_budget_rejects_total_below_per_result_when_both_provided():
-    """両方同時指定で total < per_result（入れ替え保存）は422（平文メッセージ）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r = admin.put("/admin/settings", json={
-        "agentic_budget_per_result": 8 * 1024 * 1024, "agentic_budget_total": 4096})
-    assert r.status_code == 422, r.text
-    assert "合計は1件あたり以上にしてください" in r.text
-
-
-def test_admin_settings_agentic_budget_accepts_total_equal_to_per_result():
-    """total == per_result（境界）は保存できる（422 にしない）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r = admin.put("/admin/settings", json={
-        "agentic_budget_per_result": 100_000, "agentic_budget_total": 100_000})
-    assert r.status_code == 200, r.text
-    admin.put("/admin/settings", json={"agentic_budget_per_result": None, "agentic_budget_total": None})
-
-
-def test_admin_settings_agentic_budget_rejects_per_result_above_saved_total():
-    """片方（per_result）だけの指定でも、保存済みのもう片方（DB の現在値＝total）と突き合わせて
-    判定する——まず両方を整合させた基準値を保存してから、片方だけの更新を試す（デフォルト値や
-    他テストの残留状態に依存しない自己完結な検証）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r0 = admin.put("/admin/settings", json={
-        "agentic_budget_per_result": 2048, "agentic_budget_total": 4096})
-    assert r0.status_code == 200, r0.text
-    try:
-        r = admin.put("/admin/settings", json={"agentic_budget_per_result": 8192})   # 保存済み total(4096) を上回る
-        assert r.status_code == 422, r.text
-        assert "合計は1件あたり以上にしてください" in r.text
-    finally:
-        admin.put("/admin/settings", json={"agentic_budget_per_result": None, "agentic_budget_total": None})
-
-
-def test_admin_settings_agentic_budget_rejects_total_below_saved_per_result():
-    """逆方向: 片方（total）だけの指定でも、保存済みのもう片方（DB の現在値＝per_result）と
-    突き合わせて判定する。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r0 = admin.put("/admin/settings", json={
-        "agentic_budget_per_result": 500_000, "agentic_budget_total": 600_000})
-    assert r0.status_code == 200, r0.text
-    try:
-        r = admin.put("/admin/settings", json={"agentic_budget_total": 4096})   # 保存済み per_result(500000) を下回る
-        assert r.status_code == 422, r.text
-        assert "合計は1件あたり以上にしてください" in r.text
-    finally:
-        admin.put("/admin/settings", json={"agentic_budget_per_result": None, "agentic_budget_total": None})
-
-
 # ===== モデルの窓の管理者登録表（旧 BUDGET-2）は撤去済み =====
 # `docs/archive/2026-09-22-Codex経路の精度・網羅性と費用の改善.md`: 利用者裁定「AI が持つ文脈窓を
 # Sherpa が制限しない」により `model_context_windows` の受け付け・保存・返却ごと撤去した。
-
-def test_admin_settings_put_ignores_unknown_model_context_windows_key():
-    """撤去済みキーを送っても 422 にはならず（未知フィールドは無視）、応答に `model_windows`/
-    `window` は含まれない（DB に残っている旧値があっても読み返さない・fail-safe）。"""
-    if not _try_init():
-        pytest.skip("DB down")
-    admin, _ = _admin_client()
-    r = admin.put("/admin/settings", json={"model_context_windows": {"openai:m": 50_000}})
-    assert r.status_code == 200, r.text
-    ab = r.json()["agentic_budget"]
-    assert "model_windows" not in ab
-    assert "window" not in ab
 
 
 # ===== チャットの質問例（chat_examples） =====
@@ -2876,3 +2133,52 @@ def test_admin_settings_chat_examples_gates():
     _mk_user(uid, pw, role="user")
     user = _login(uid, pw)
     assert user.put("/admin/settings", json={"chat_examples": {"items": ["x"]}}).status_code == 403
+
+
+def test_seed_user_agent_from_env_fills_only_unselected_users(monkeypatch):
+    """`SHERPA_AGENT=ollama`（旧値）は簡易へ読み替えて、頭脳が未選択の既存利用者（設定行なしを含む）だけへ一度だけ保存する。選択済みは変えない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import api as api_mod
+    sfx = _sfx()
+    no_row, empty_row, chosen = f"agnone{sfx}", f"agempty{sfx}", f"agcodex{sfx}"
+    for uid in (no_row, empty_row, chosen):
+        _mk_user(uid, f"Pw{uid}")
+    store.update_settings(empty_row, ollama_url="")
+    store.update_settings(chosen, agent="codex")
+    with store._connect() as c:
+        before = {r["user_id"]: r["agent"] for r in c.execute("SELECT user_id, agent FROM user_settings").fetchall()}
+    try:
+        monkeypatch.setenv("SHERPA_AGENT", "ollama")
+        api_mod._seed_user_agent_from_env()
+        assert store.get_settings(no_row)["agent"] == "simple"
+        assert store.get_settings(empty_row)["agent"] == "simple"
+        assert store.get_settings(chosen)["agent"] == "codex"
+        assert store.get_system_settings().get(api_mod._USER_AGENT_SEED_MARKER_KEY) == 1
+        monkeypatch.setenv("SHERPA_AGENT", "codex")  # 印があれば再実行しても変えない
+        api_mod._seed_user_agent_from_env()
+        assert store.get_settings(no_row)["agent"] == "simple"
+    finally:
+        with store._connect() as c:
+            for r in c.execute("SELECT user_id FROM user_settings").fetchall():
+                if r["user_id"] not in before:
+                    c.execute("DELETE FROM user_settings WHERE user_id=%s", (r["user_id"],))
+                elif not before[r["user_id"]]:
+                    c.execute("UPDATE user_settings SET agent='' WHERE user_id=%s", (r["user_id"],))
+
+
+def test_seed_vlm_ollama_url_from_env_only_when_central_unset(monkeypatch):
+    """旧 `SHERPA_VLM_OLLAMA_URL` は、中央の `ollama_url` が未保存のときだけ中央の値（と許可一覧）へ取り込む。中央が既にあれば変えない。"""
+    if not _try_init():
+        pytest.skip("DB down")
+    from sherpa import api as api_mod
+    monkeypatch.setenv("SHERPA_VLM_OLLAMA_URL", "http://vlm-host.internal:11434")
+    api_mod._seed_vlm_ollama_url_from_env()
+    got = store.get_system_settings()
+    assert got["ollama_url"] == "http://vlm-host.internal:11434"
+    assert got["ollama_allowlist"] == ["vlm-host.internal:11434"]
+
+    _clear_system_settings()
+    store.set_system_settings("admin-uid", {"ollama_url": "http://central.internal:11434"})
+    api_mod._seed_vlm_ollama_url_from_env()
+    assert store.get_system_settings()["ollama_url"] == "http://central.internal:11434"

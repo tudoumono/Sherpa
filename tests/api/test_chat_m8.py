@@ -1,7 +1,7 @@
 """M8 受け入れ: チャット主入口（意図でレンズ振り分け＋会話DB永続＋答え先頭＋出典）。
 
 - router 単体は依存ゼロ（Neo4j/PG 不要）。
-- 会話フローは要 Neo4j（graph-load 済）＋ Postgres 起動。
+- 会話フローは要 Neo4j ＋ Postgres 起動。
 """
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ import pathlib
 import pytest
 from _world_setup import TEST_WORLD_ID, ensure_v1
 from sherpa.chat_router import route
-
-os.environ.setdefault("SHERPA_STREAM_PACE", "0")    # SSE は即時（テスト高速化）
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 V = TEST_WORLD_ID   # 旧固定 'v1' から移行（2026-07-03 インシデント対応 HIGH#2・_world_setup.py 参照）
@@ -428,11 +426,11 @@ def test_provider_seam_uniform(monkeypatch):
     """
     from sherpa import store
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    store.update_settings(agent="openai", openai_api_key="")   # キー無し＝未接続
+    store.update_settings(agent="gemini")   # 環境で有効化されていない頭脳＝使えない
     try:
         c = _client()
         nodes, ans = _stream(c, "何でもいい")
-        assert ans and "接続されていません" in ans["message"]["answer"]["headline"]  # 嘘の回答をしない
+        assert ans and "簡易" in ans["message"]["answer"]["headline"]  # 嘘の回答をしない
         assert nodes and ans["type"] == "answer"                                    # プロトコルは同一
     finally:
         store.update_settings(agent="heuristic")
@@ -506,22 +504,16 @@ def test_conversation_pin_and_delete():
     assert c.delete(f"/conversations/{cid}").status_code == 404   # 二重削除は 404
 
 
-def test_system_prompt_setting(monkeypatch):
-    """#2 システムプロンプト: 保存→GETで返る／provider が system メッセージに前置する。"""
+def test_answer_policy_is_fixed_for_every_user():
+    """回答方針はアプリ固定: 利用者が PUT しても保存されず、provider は常に ANSWER_POLICY を前置する。"""
     from sherpa import store
     from sherpa.agents import get_provider
-    # インラインの openai_api_key を実際に使わせるには personal_api_keys_allowed が要る
-    # （既定 false・`sherpa.keys.resolve_api_key`）。WEB-1: `get_provider()` の1ターン唯一の
-    # 読取点は `store._read_system_settings_fresh()`（共有キャッシュを介さない生の読取・
-    # TOCTOU 対策）——`get_system_settings` ではない。
-    monkeypatch.setattr("sherpa.store._read_system_settings_fresh", lambda: {"personal_api_keys_allowed": True})
+    from sherpa.providers.prompts import ANSWER_POLICY
     c = _client()
-    c.put("/settings", json={"system_prompt": "必ず簡潔に答えてください。"})
-    assert c.get("/settings").json()["system_prompt"] == "必ず簡潔に答えてください。"
-    p = get_provider({**store.get_settings(), "agent": "openai", "openai_api_key": "x"})
-    assert p.system_prompt == "必ず簡潔に答えてください。"
-    assert p._messages("Q")[0] == {"role": "system", "content": "必ず簡潔に答えてください。"}
-    store.update_settings(system_prompt=store.DEFAULT_SYSTEM_PROMPT)   # 後片付け（既定へ）
+    assert c.put("/settings", json={"system_prompt": "必ず簡潔に答えてください。"}).status_code == 200
+    assert "system_prompt" not in c.get("/settings").json()
+    p = get_provider({**store.get_settings(), "agent": "heuristic"})
+    assert p.system_prompt == ANSWER_POLICY
 
 
 def test_settings_web_search_available_flag_reflects_admin_setting():
@@ -540,41 +532,6 @@ def test_settings_web_search_available_flag_reflects_admin_setting():
         assert s2["web_search_available"] is True, "管理者許可時にフラグが立たない"
     finally:
         store.set_system_settings("admin-uid", {"web_search_allowed": None})   # 後片付け（既定へ）
-
-
-def test_settings_codex_web_search_saved_as_bool_and_kept_when_admin_off():
-    """codex_web_search は bool として保存/取得できる（不正型は422）。列は互換のため残すが、
-    WEB-1 以降この保存値は実行経路（Codex 実行時の config 生成）では読まない
-    （チャットごとの `ChatReq.web_search` のみを見る）——管理者許可が無くても保存値自体は消さない。"""
-    from sherpa import store
-    c = _client()
-    store.set_system_settings("admin-uid", {"web_search_allowed": None})   # 未設定（既定 false）のまま
-    try:
-        r = c.put("/settings", json={"codex_web_search": True})
-        assert r.status_code == 200, r.text
-        assert c.get("/settings").json()["codex_web_search"] is True, \
-            "管理者未許可でも保存値自体は残るはず（消さない契約）"
-
-        bad = c.put("/settings", json={"codex_web_search": "yes-please"})
-        assert bad.status_code == 422, bad.text
-    finally:
-        store.update_settings(codex_web_search=False)   # 後片付け（既定へ）
-
-
-def test_settings_codex_web_search_rejects_loosely_coercible_values():
-    """RV LOW 4: codex_web_search は StrictBool＝JSON の真偽値のみ許可する。ネット到達可否を
-    左右するフラグなので、pydantic 既定の緩い型強制（"true"/"1"/1/0 等の bool 化）を受理しない
-    （通常の bool フィールドなら通ってしまう値で 422 になることを確認する）。"""
-    from sherpa import store
-    c = _client()
-    try:
-        for loose in ("true", "false", "1", "0", "yes", "no", 1, 0):
-            r = c.put("/settings", json={"codex_web_search": loose})
-            assert r.status_code == 422, f"{loose!r} は緩い型強制で受理されるべきでない: {r.status_code}"
-        # 本物の JSON boolean は引き続き受理される。
-        assert c.put("/settings", json={"codex_web_search": True}).status_code == 200
-    finally:
-        store.update_settings(codex_web_search=False)   # 後片付け（既定へ）
 
 
 def test_guards_version_and_conversation():
@@ -633,16 +590,14 @@ def test_chat_turn_audit_normalizes_unknown_provider():
         store.update_settings(agent="heuristic")   # 以降のテストのベースラインへ戻す
 
 
-def test_chat_turn_audit_records_effective_provider_not_saved_when_a7_mismatches(monkeypatch):
-    """保存済み agent（openai）が選択中のクラウドプロバイダ（A7・gemini）と一致しない場合、
-    監査 detail の "provider"（実効値）は "ollama" を示し、保存値は "provider_saved" に
-    別途残す（実行は effective_agent() 経由で ollama にフォールバックするため、監査上も実行と
-    一致させる＝実際は ollama で答えたのに provider=openai と誤解される事故を防ぐ）。
+def test_chat_turn_audit_records_effective_provider_not_saved_for_legacy_agent(monkeypatch):
+    """保存済み agent が旧・直結経路（openai）の場合、監査 detail の "provider"（実効値）は
+    "simple" を示し、保存値は "provider_saved" に別途残す（実行は effective_agent() 経由で
+    簡易として動くため、監査上も実行と一致させる）。
 
     実行そのもの（実際に ollama へ繋ぐか）は本テストの対象外＝`_FakeProvider` に差し替えて
     hermetic にする（test_chat_trace_capture_is_provider_agnostic と同じ流儀）。"""
     from sherpa import chat_service, store
-    monkeypatch.setattr(store, "get_system_settings", lambda: {"cloud_provider": "gemini"})
     store.update_settings(agent="openai")
 
     class _FakeProvider:
@@ -665,7 +620,7 @@ def test_chat_turn_audit_records_effective_provider_not_saved_when_a7_mismatches
         rows = store.list_audit(action="chat.turn", resource_id=f"conv:{cid}", limit=5)
         assert rows, "chat.turn が記録されていない"
         d = rows[0]["detail"]
-        assert d["provider"] == "ollama"        # 実効値（A7 フォールバック後）
+        assert d["provider"] == "simple"        # 実効値（旧・直結の保存値は簡易）
         assert d["provider_saved"] == "openai"  # 保存値（ユーザーが選んだ構成のまま）
     finally:
         chat_service.get_provider = orig

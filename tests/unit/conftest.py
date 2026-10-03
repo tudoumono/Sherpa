@@ -40,7 +40,7 @@ def _hermetic_system_settings(monkeypatch):
     `personal_api_keys_allowed`（A6）は既定 `false`（production の既定と一致させる）。個人キーの
     解決を検証するテストは、本体で `monkeypatch.setattr(store, "get_system_settings", lambda: {
     "personal_api_keys_allowed": True, ...})` のように明示 opt-in する（`cloud_provider` も既定
-    "openai" のまま・gemini/bedrock を検証するテストは同様に明示する）。
+    "openai" のまま）。
 
     WEB-1: `providers.get_provider()`/`provider_info()` の1ターン唯一の読取点は共有キャッシュを
     介さない `store._read_system_settings_fresh()` を直接呼ぶため、`get_system_settings` だけを
@@ -52,35 +52,10 @@ def _hermetic_system_settings(monkeypatch):
     """
     from sherpa import store
     # `**kw` で受ける（`connect_timeout`/`statement_timeout_ms` を渡す呼び出し元・
-    # `sherpa/research_service.py` 等・があるため）——0引数のままだと TypeError になる。
+    # `sherpa/simple_chat.py` 等・があるため）——0引数のままだと TypeError になる。
     monkeypatch.setattr(store, "get_system_settings", lambda **kw: {})
     monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: {})
     monkeypatch.setenv("SHERPA_POWERSHELL_BIN", "/nonexistent/sherpa-no-powershell")
-
-
-@pytest.fixture(autouse=True)
-def _hermetic_model_window_queries(monkeypatch):
-    """BUDGET-2（§3.4）: `sherpa.model_windows` のプロバイダAPI照会（段2・Ollama `/api/show`・
-    Anthropic Models API）を既定で無効化する（常に None＝「不明」段へ fail-safe）。
-
-    `agentic_search.resolve_tool_result_budgets` は（`openai_style`/`anthropic_style`/`gemini` の
-    通常呼び出し経路として）run 開始時に毎回この照会を試みる。多数の既存テストが
-    `OllamaProvider`/`_SUB` 等で実在しうる Ollama の既定 URL（`http://localhost:11434`）をそのまま
-    使っているため（`model_windows.query_ollama_context_length` 自身は失敗を握りつぶす fail-safe
-    設計だが）、無対策だと「開発機で実際に Ollama が動いていればテスト実行中に本物の通信が発生する」
-    （unit テストの契約「外部サービス不要」に反する・`_hermetic_system_settings` と同じ理由）。
-
-    段2そのもの（照会結果の解釈・キャッシュ・fail-safe）を検証するテストは、本体で
-    `monkeypatch.setattr(model_windows, "query_ollama_context_length", ...)`（または
-    `query_anthropic_context_length`）を明示的に上書きする（autouse は本体実行より先に適用される
-    ため、本体内の明示的 monkeypatch が最後に効く＝確実に上書きされる・上の `_hermetic_system_
-    settings` と同じ流儀）。`query_anthropic_context_length` は `AnthropicBedrock` クライアントが
-    `.models` を持たないため元々ネットワーク I/O を発生させない（`sherpa/model_windows.py`
-    docstring 参照）が、対称性のためここでも固定する。
-    """
-    from sherpa import model_windows
-    monkeypatch.setattr(model_windows, "query_ollama_context_length", lambda *a, **kw: None)
-    monkeypatch.setattr(model_windows, "query_anthropic_context_length", lambda *a, **kw: None)
 
 
 @pytest.fixture(autouse=True)

@@ -1,5 +1,4 @@
-/* Sherpa UI — 共通デザイントークン（mockups 由来：teal・角丸・soft shadow・●/○ 符号化・tabular-nums）。
-   柔らかく親しみのあるトーン（austere に振らない）。ここを変えれば一括リスキン可能。 */
+/* 全画面共通のスタイル。冒頭の :root に配色・角丸・影などのデザイントークンを定義する。 */
 :root{
   --accent:#0d9488; --accent-weak:#ccfbf1; --accent-ink:#0f766e;
   --action-bg:#0f766e; --action-fg:#ffffff;
@@ -16,9 +15,7 @@
   --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
   --shadow-lg:0 10px 30px rgba(16,24,40,.18);
   --font:"Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI",Meiryo,system-ui,sans-serif;
-  /* 本文（--font-body）とコード（--font-code）のフォントは fonts.css の :root で固定定義する
-     （本文＝Noto Sans JP 起点／コード＝HackGen 起点）。各参照箇所は var(--font-code, <従来スタック>)
-     の形で書いており、fonts.css が読まれれば固定値、読まれなければ従来スタックにフォールバックする。 */
+  /* 本文・コードのフォント（--font-body / --font-code）は fonts.css で定義する。参照側は var(--font-code, <フォールバック>) の形で書く。 */
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -32,8 +29,7 @@ input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]),
 input[type=checkbox],input[type=radio]{accent-color:var(--accent-ink)}
 input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 
-/* トップバー＋ナビ。横幅に収まらないタブは nav.js（fitNav）が右端の「その他 ▾」へ畳む＝隠しスクロールで切らない。
-   .nav だけが余白を取る（flex:1）ので、タブの出し入れで .nav の幅は変わらない（ResizeObserver の自己再発火防止）。 */
+/* トップバー＋ナビ。収まらないタブは nav.js（fitNav）が「その他 ▾」へ畳む。.nav だけが余白を取る（flex:1）ので、タブの出し入れで .nav の幅は変わらない。 */
 .topbar{height:52px;display:flex;align-items:center;gap:16px;padding:0 16px;
   background:var(--surface);border-bottom:1px solid var(--border)}
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.02em;flex:none;white-space:nowrap}
@@ -52,8 +48,7 @@ input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 .navmenu[hidden]{display:none}
 .navmenu a{display:block;padding:8px 10px;border-radius:8px;font-size:var(--text-label);color:var(--ink-2);text-decoration:none}
 .navmenu a:hover{background:var(--surface-2)}
-/* トップバーの丸アバター＋ドロップダウン（全ページ共通・UIフィードバック 2026-07-03）。
-   `.msg.user`（チャットのユーザ行）に当たらないよう .topbar 配下に限定 */
+/* トップバーの丸アバター＋ドロップダウン。`.msg.user`（チャットのユーザ行）に当たらないよう .topbar 配下に限定する。 */
 .userwrap{position:relative}
 .topbar .user{width:30px;height:30px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);
   display:grid;place-items:center;color:var(--ink-2);font-size:var(--text-small);cursor:pointer;padding:0;font-family:inherit}
@@ -69,14 +64,13 @@ input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 .umitem[hidden]{display:none}                                   /* class の display:block が [hidden] を上書きしないように */
 .umitem:hover{background:var(--surface-2)}
 .um-note{padding:8px 10px 4px;color:var(--ink-3);font-size:var(--text-caption)}
-/* 背景実行チャットターンの「実行中」バッジ（全ページ共通・nav.js が付替え・
-   docs/proposals/2026-07-03-チャット背景実行.md）。クリックで該当会話（chat.html?conv=）へ。 */
+/* 背景実行中のチャットターンの「実行中」バッジ（nav.js が付け替える）。クリックで該当会話（chat.html?conv=）へ。 */
 .turnnotice{display:inline-flex;align-items:center;min-height:32px;padding:0 11px;border-radius:999px;
   background:var(--accent-weak);color:var(--accent-ink);font-size:var(--text-small);font-weight:600;
   text-decoration:none;white-space:nowrap;flex:none}
 .turnnotice:hover{background:var(--action-bg);color:var(--action-fg)}
 .turnnotice[hidden]{display:none}
-/* 状態ドット（バックエンド健全性・全ページ共通・nav.js が付替え） */
+/* 状態ドット（バックエンド健全性・nav.js が付け替える） */
 .healthdot{width:10px;height:10px;border-radius:50%;background:var(--border);flex:none;
   text-decoration:none;cursor:default}
 .healthdot[href]{cursor:pointer}
@@ -90,8 +84,7 @@ input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 .pagehead h1{font-size:var(--text-heading);margin:0;font-weight:700}
 .pagehead .sub{font-size:var(--text-small);color:var(--ink-3)}
 .pagehead .spacer{flex:1}
-/* 画面ヘッダの控えめなリンク（S3・見た目トーンは現行維持）。
-   .crumb=管理サブ画面から「システム管理」へ戻る小パンくず。.help-link=使い方の該当節へ。 */
+/* 画面ヘッダの控えめなリンク。.crumb=管理サブ画面から「システム管理」へ戻る小パンくず。.help-link=使い方の該当節へ。 */
 .crumb{display:inline-block;font-size:var(--text-small);color:var(--ink-3);text-decoration:none;margin-bottom:5px}
 .crumb:hover{color:var(--accent-ink);text-decoration:underline}
 .help-link{font-size:var(--text-small);color:var(--accent-ink);text-decoration:none;white-space:nowrap}
@@ -138,7 +131,7 @@ input::placeholder,textarea::placeholder{color:var(--ink-3);opacity:1}
 /* 補足文中の強調は色を1段だけ濃く固定（太字×薄グレーの継承で濃さがバラつくのを防ぐ） */
 .hint b{color:var(--ink-2)}
 
-/* 結果テーブル（影響一覧・R4/R5） */
+/* 結果テーブル（影響一覧） */
 .toolbar{display:flex;align-items:center;gap:8px;padding:10px 0;flex-wrap:wrap}
 .toolbar .lbl{font-size:var(--text-small);color:var(--ink-3)}
 .filterchip{height:28px;padding:0 11px;border-radius:999px;border:1px solid var(--border);background:var(--surface);
@@ -182,7 +175,7 @@ tr.hideRow{display:none}
 .loading-overlay[hidden]{display:none}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* 別レンズ probe（multi-lens） */
+/* 別の調べ方の試行結果 */
 .lenswrap{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .lens textarea{width:100%;min-height:52px;border:1px solid var(--border);border-radius:var(--radius-sm);
   padding:8px 10px;font-family:inherit;font-size:var(--text-label);resize:vertical;background:var(--surface)}
@@ -214,11 +207,11 @@ tr.hideRow{display:none}
 .status.fail{color:var(--danger)}
 @keyframes pulse{50%{opacity:.35}}
 .rowact{display:flex;gap:6px;justify-content:flex-end}
-/* 「どう読み取ったか」の来歴バッジ（S2・控えめ）。既存の状態チップと同じトーン＝目立ちすぎない。 */
+/* 「どう読み取ったか」の来歴バッジ（控えめ） */
 .provrow{display:flex;flex-wrap:wrap;gap:5px;margin-top:4px}
 .provbadge{font-size:var(--text-caption);padding:1px 7px;border-radius:6px;background:var(--surface-2);color:var(--ink-3);font-weight:500}
 .provbadge.warn{background:var(--warn-bg);color:var(--warn);cursor:help}
-/* 重要度バッジ（登録者による注記・_重要度.txt）。高=押し上げ／中=中立／低=後回し（表示濃淡のみ・専門用語ゼロ）。 */
+/* 重要度バッジ（登録者による注記）。高=押し上げ／中=中立／低=後回し */
 .impbadge{display:inline-block;font-size:var(--text-caption);padding:2px 8px;border-radius:999px;font-weight:600;cursor:help;white-space:nowrap}
 .impbadge.imp-high{background:var(--accent-weak);color:var(--accent-ink)}
 .impbadge.imp-mid{background:var(--surface-2);color:var(--ink-2)}
@@ -236,7 +229,7 @@ tr.hideRow{display:none}
 .eshit .doc{font-weight:700;color:var(--ink)}
 .eshit pre{white-space:pre-wrap;margin:0;font-size:var(--text-small);line-height:1.55;color:var(--ink);font-family:inherit}
 
-/* オーバーレイ（結果ビュー / A17 プレビュー） */
+/* オーバーレイ（結果ビュー・プレビュー） */
 .overlay{position:fixed;inset:0;background:rgba(16,24,40,.42);display:none;z-index:30}
 .overlay.open{display:block}
 .rv{position:absolute;inset:26px;background:var(--surface);border-radius:16px;box-shadow:var(--shadow-lg);
@@ -268,10 +261,8 @@ tr.hideRow{display:none}
 .rel .chain{font-family:var(--font-code,ui-monospace,Menlo,Consolas,monospace);font-size:var(--text-small)}
 .rel .meta{display:flex;align-items:center;gap:8px;margin-top:6px;font-size:var(--text-caption);color:var(--ink-3)}
 
-/* ===== チャット 3ペイン（M9・04-画面の原則.md §3.1） ===== */
-/* 3カラム＝CSS Grid。トラック幅は JS(updateLayout) が画面幅に合わせて設定する変数。
-   height:100dvh＋overflow:hidden で全画面/リサイズでも横スクロールを出さない。
-   中央は minmax(0,1fr)＝JS が左右に最小幅を確保するので中央が潰れない。 */
+/* ===== チャット 3ペイン ===== */
+/* 3カラム＝CSS Grid。トラック幅は JS(updateLayout) が設定する変数。中央は minmax(0,1fr)＝JS が左右の最小幅を確保するので潰れない。 */
 .app{display:grid;height:calc(100dvh - 52px);overflow:hidden;--chatmax:1120px;   /* 上部ナビ(52px)の下＝3カラム。共通基準幅 */
   grid-template-columns:var(--tL,264px) var(--tSL,5px) minmax(0,1fr) var(--tSR,5px) var(--tR,300px)}
 .splitter{cursor:col-resize;background:transparent;transition:background .15s;touch-action:none}
@@ -320,13 +311,13 @@ tr.hideRow{display:none}
 .cact:hover{background:var(--surface-2)}
 .cact.del{color:var(--danger);border-top:1px solid var(--border);border-radius:0 0 6px 6px}
 .cact.del:hover{background:var(--danger-bg)}
-/* #5 文字サイズはチャット欄のみ（--chatfont）／#4 本文幅は中央カラムに追従＋最大幅で可読性確保 */
+/* 文字サイズはチャット欄のみ（--chatfont）。本文幅は中央カラムに追従し、最大幅で可読性を保つ */
 .messages{flex:1;overflow:auto;padding:24px 18px 18px;font-size:var(--chatfont);line-height:1.8}
 .msg{width:100%;max-width:min(var(--chatmax,1040px),100%);margin:0 auto 18px}
 .messages .msg:first-child{margin-top:0}   /* 先頭メッセージは padding-top 分の余白で header と離す */
 .messages pre{overflow-x:auto}             /* コード/ログは横スクロールで広い領域を活かす */
 .msg.user{display:flex;justify-content:flex-end}
-.bubble-user{background:var(--action-bg);color:var(--action-fg);padding:10px 14px;border-radius:14px 14px 4px 14px;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere}   /* 入力した改行を保持（esc() は \n を <br> にしない）。幅の上限はラッパー側の1段だけ（%の二重掛けは shrink-to-fit と組むと早すぎる折り返しになる） */
+.bubble-user{background:var(--action-bg);color:var(--action-fg);padding:10px 14px;border-radius:14px 14px 4px 14px;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere}   /* 入力した改行を保持する。幅の上限はラッパー側の1段だけ（%の二重掛けは早すぎる折り返しになる） */
 .a-row{display:flex;gap:11px}
 .a-avatar{width:30px;height:30px;border-radius:8px;background:var(--accent-weak);color:var(--accent-ink);display:grid;place-items:center;font-size:var(--text-label);flex:0 0 auto;font-weight:700}
 .a-body{flex:1;min-width:0}
@@ -334,17 +325,17 @@ tr.hideRow{display:none}
 .composer .box{max-width:min(var(--chatmax,1040px),100%);margin:0 auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;display:flex;align-items:flex-end;gap:8px}
 .composer textarea{flex:1;border:none;outline:none;resize:none;font-family:inherit;font-size:var(--text-body);max-height:120px;background:transparent;color:var(--ink);padding:6px 2px}
 .sendbtn{width:44px;height:44px;border-radius:8px;border:none;background:var(--action-bg);color:var(--action-fg);display:grid;place-items:center;flex:0 0 auto;font-size:var(--text-body);cursor:pointer}
-.sendbtn.stopping{background:var(--warn);color:var(--action-fg);font-size:var(--text-label)}   /* UI フィードバック1: ストリーミング中は「■ 停止」に切替 */
+.sendbtn.stopping{background:var(--warn);color:var(--action-fg);font-size:var(--text-label)}   /* ストリーミング中は「■ 停止」に切り替える */
 .sendbtn.stopping:hover{filter:brightness(0.95)}
-.stopped-note{color:var(--ink-3);font-size:var(--text-label);font-style:italic}   /* UI フィードバック1: 途中停止の表示（.thinking と同トーン） */
+.stopped-note{color:var(--ink-3);font-size:var(--text-label);font-style:italic}   /* 途中停止の表示（.thinking と同トーン） */
 .verselect{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 10px;border:1px solid var(--border);border-radius:999px;background:var(--surface-2);font-size:var(--text-small);color:var(--ink-2)}
 .verselect select{border:none;background:transparent;font-family:inherit;font-size:var(--text-small);color:var(--ink);outline:none}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
 .chip{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border-radius:999px;font-size:var(--text-caption);border:1px solid var(--accent);background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
 
 /* 答えカード（答え先頭＋するべきこと＋出典） */
-.headline{font-weight:400;font-size:1em;line-height:1.8;margin:2px 0 8px;white-space:pre-wrap}   /* em＝文字サイズ設定に追従。pre-wrap＝ストリーミング中（textContent 段階）の改行保持・確定後の mdLite 出力は生改行を含まないため無害 */
-/* AI回答のMarkdown表示（2026-07-03・安全サブセットレンダラ Sherpa.mdLite）*/
+.headline{font-weight:400;font-size:1em;line-height:1.8;margin:2px 0 8px;white-space:pre-wrap}   /* em＝文字サイズ設定に追従。pre-wrap＝ストリーミング中の改行保持 */
+/* AI回答の Markdown 表示（Sherpa.mdLite の出力） */
 .headline p{margin:0 0 8px}
 .headline p:last-child{margin-bottom:0}
 .headline ul,.headline ol{margin:4px 0 8px;padding-left:22px}
@@ -368,18 +359,17 @@ tr.hideRow{display:none}
 .ilist li{padding:8px 2px;border-bottom:1px solid var(--border)}
 .ilist .top{display:flex;align-items:center;gap:8px}
 .ilist .nm{font-weight:600}.ilist .spacer{flex:1}
-/* #3 フィルタチップ（サマリ・旧 .todo を置き換え）＋件数バッジ */
+/* フィルタチップ（サマリ）＋件数バッジ */
 .ix-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:2px 0 10px}
 .ix-summary .filterchip .cnt{margin-left:5px;font-weight:700}
 .ix-shown{font-size:var(--text-caption);color:var(--ink-3);margin-left:2px}
 .ilist li.ix-hide{display:none}
-/* #2 影響行の展開/折りたたみ（height アニメ）＋経路チップのハイライト連動 */
+/* 影響行の展開/折りたたみ（height アニメ）＋経路チップのハイライト連動 */
 .ilist li .top[data-toggle]{cursor:pointer}
 .ilist li .top[data-toggle]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
 .ilist li .ixdetail{max-height:0;overflow:hidden;opacity:0;
   transition:max-height .2s ease,opacity .18s ease,margin .2s ease;margin-top:0}
-/* .path の既定 display:none（旧 tr.expanded 用）を .ilist 内で打ち消す。
-   items（.ixdetail 内）・presumed（li 直下・トグル無しで常時表示）の両方をカバー */
+/* .path の既定 display:none を .ilist 内で打ち消す（items＝.ixdetail 内・presumed＝li 直下で常時表示の両方） */
 .ilist li .path{display:block}
 .ilist li.open .ixdetail{max-height:280px;opacity:1;margin-top:9px}
 .ilist li.open{background:var(--surface-2);border-radius:8px}
@@ -400,7 +390,7 @@ tr.hideRow{display:none}
 .cite{padding:9px 11px;border:1px solid var(--border);border-radius:8px;margin:7px 0}
 .cite .doc{font-weight:600}.cite .sp{font-size:var(--text-caption);color:var(--ink-3);margin-left:6px}
 .cite pre{white-space:pre-wrap;font-size:var(--text-caption);color:var(--ink);background:var(--surface-2);border-radius:6px;padding:8px;margin:6px 0 0}
-/* UI フィードバック2: 引用（該当箇所）カードの折りたたみ見出し（.refgraph-h と同じトーン・アニメ無し）。 */
+/* 引用（該当箇所）カードの折りたたみ見出し（.refgraph-h と同じトーン） */
 .cites{margin-top:4px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .cites-h{width:100%;text-align:left;border:none;background:var(--surface-2);color:var(--ink-2);
   display:flex;align-items:center;gap:6px;padding:8px 11px;font-size:var(--text-small);cursor:pointer}
@@ -415,7 +405,7 @@ tr.hideRow{display:none}
 .sources .h{font-size:var(--text-caption);color:var(--ink-3);font-weight:700;letter-spacing:.04em;margin-bottom:6px}
 .sources a{display:inline-flex;align-items:center;gap:5px;font-size:var(--text-small);min-height:32px;overflow-wrap:anywhere;max-width:100%;margin:0 12px 6px 0;color:var(--accent-ink);text-decoration:underline;text-underline-offset:3px}
 .sources a:hover{text-decoration:underline}
-/* EV-0（拡張設計 §4.4）: 出典の2区分表示（根拠=精読済み／参考=ヒットのみ）。除外はしない＝表示の誠実化のみ。 */
+/* 出典の2区分表示（根拠=精読済み／参考=ヒットのみ） */
 .sources-group{margin-bottom:6px}
 .sources-group:last-child{margin-bottom:0}
 .sources-group-h{font-size:var(--text-caption);color:var(--ink-3);margin-bottom:3px}
@@ -445,11 +435,11 @@ tr.hideRow{display:none}
 .askfree:focus{outline:none;border-color:var(--accent)}
 .askactions{display:flex;justify-content:flex-end;margin-top:10px}
 .asksend:disabled,.askopt input:disabled+span{opacity:.6}
-/* S1（ask_user-improvements.md）: 履歴復元した回答済み確認カード（選択内容つき・操作不可） */
+/* 履歴復元した回答済み確認カード（選択内容つき・操作不可） */
 .askcard.answered{opacity:.72}
 .askanswered{margin-top:9px;font-size:var(--text-small);font-weight:600}
 
-/* ===== ThinkFlow 風レイアウト（M9 改）: 左ナビ＋右「思考の流れ」 ===== */
+/* ===== 左ナビ＋右「思考の流れ」のレイアウト ===== */
 .pane.left .pane-body{display:flex;flex-direction:column;padding:14px 12px}
 .lbrand{display:flex;align-items:center;gap:8px;padding:2px 4px 12px}
 .lbrand .ltitle{font-size:var(--text-label);font-weight:600;color:var(--ink-2)}
@@ -470,11 +460,10 @@ tr.hideRow{display:none}
 .rhead .rt .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
 .rhead .rt.live{background:var(--accent-weak);color:var(--accent-ink)} .rhead .rt.live .dot{animation:blink 1s infinite}
 @keyframes blink{50%{opacity:.25}}
-/* 上（思考の流れ）＝結果でスクロールする残り領域・下（調べ方ブロック）＝固定フッターで時間軸を
-   上下に揃える（調べ方ブロック §2.1）。*/
+/* 上（思考の流れ）＝スクロールする残り領域・下（調べ方ブロック）＝固定フッター */
 .flow{flex:1 1 auto;min-height:0;padding:18px 16px;overflow:auto}
 .flow .hint{color:var(--ink-3);font-size:var(--text-small)}
-/* 調べ方ブロック（右ペイン下部の固定フッター・調べ方ブロック §2.1〜§2.2）*/
+/* 調べ方ブロック（右ペイン下部の固定フッター） */
 .inquiry{flex:0 0 auto;border-top:1px solid var(--border);background:var(--surface)}
 .inquiry-head{display:flex;align-items:center;gap:8px;width:100%;padding:10px 16px;border:none;
   background:transparent;font-family:inherit;font-weight:700;font-size:var(--text-label);color:var(--ink);cursor:pointer;text-align:left}
@@ -496,7 +485,7 @@ tr.hideRow{display:none}
 .segbtn.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
 .segbtn[disabled]{opacity:.4;cursor:not-allowed;color:var(--ink-3)}
 .segbtn[disabled]:hover{background:transparent}
-/* 検索経路トグル（試せる場所・SC-6e）: 調べ方ブロックの中に既定閉の入れ子折りたたみを持つ */
+/* 検索経路トグル（調べ方ブロック内の既定閉の折りたたみ） */
 .inquiry-details{border-top:1px dashed var(--border);margin-top:2px;padding-top:8px}
 .inquiry-details-head{display:flex;align-items:center;gap:4px;padding:0;border:none;
   background:transparent;font-family:inherit;font-size:var(--text-caption);color:var(--ink-3);cursor:pointer}
@@ -505,13 +494,13 @@ tr.hideRow{display:none}
 .inquiry-details-head[aria-expanded="false"] .caret{transform:rotate(-90deg)}
 .inquiry-details-body{display:flex;flex-direction:column;gap:10px;padding-top:8px}
 .inquiry-details-body[hidden]{display:none}
-/* 入力欄の要約チップ（調べ方ブロック §2.3・押すと右ペインを開いてブロックへスクロール）*/
+/* 入力欄の要約チップ（押すと右ペインを開いて調べ方ブロックへスクロール） */
 .inquiry-chip{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border-radius:999px;
   border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:var(--text-small);
   font-family:inherit;cursor:pointer}
 .inquiry-chip:hover{background:var(--surface)}
 .inquiry-chip b{color:var(--accent-ink)}
-/* 積み上げ表示（ターン単位の折りたたみ・2026-07-03 UIフィードバック）*/
+/* 積み上げ表示（ターン単位の折りたたみ） */
 .fturn{margin-bottom:12px}
 .fturn:last-child{margin-bottom:0}
 .fturn-head{display:flex;align-items:baseline;gap:8px;cursor:pointer;padding:6px 4px;
@@ -532,17 +521,11 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fnode{width:28px;height:28px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;background:var(--surface);
   border:2px solid var(--border);color:#fff;font-size:var(--text-label);position:relative;z-index:1;transition:.3s}
 .fbody{flex:1;min-width:0;padding-top:2px}
-/* .flabel は .fhead（flex）の子。デフォルトの
-   flex-shrink:1 かつ CJK は語境界が無く任意の文字間で折返せるため、隣に幅固定のバッジ
-   （.provider-badge 等）が並ぶと flabel だけが極端に圧縮されて1文字ずつ縦積みになっていた。
-   flex:1 1 auto+min-width:0 で残り幅を使わせ、word-break:keep-all（CJK連は基本折返さない）＋
-   overflow-wrap:anywhere（それでも収まらない場合の最終手段）で語感を保った折返しにする。 */
+/* .flabel は残り幅を使い（flex:1 1 auto+min-width:0）、CJK は keep-all で折り返す（隣に幅固定のバッジが並んでも1文字ずつ縦積みにならない）。 */
 .flabel{font-weight:600;font-size:var(--text-label);line-height:1.6;color:var(--ink-3);transition:color .3s;
   flex:1 1 auto;min-width:0;white-space:normal;word-break:keep-all;overflow-wrap:anywhere}
 .fdetail{font-size:var(--text-caption);color:var(--ink-3);margin-top:2px}
-/* parent_id によるネスト（拡張設計 §2/§10）: 親ノードの直下に子ノードを畳み込む表示。
-   空（子が無い）ときは :empty で余白を出さない＝大多数のノード（子を持たない）の見た目は
-   変わらない。 */
+/* parent_id によるネスト。親ノードの直下に子ノードを畳み込む。子が無いときは :empty で余白を出さない。 */
 .fchildren:not(:empty){margin-top:10px;padding-left:16px;border-left:2px dotted var(--border)}
 .fstep.done .fnode{background:var(--ok);border-color:var(--ok);color:var(--action-fg)}
 .fstep.done .flabel{color:var(--ink)}
@@ -552,23 +535,21 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fstep.active .fnode::after{content:"";width:9px;height:9px;border-radius:50%;background:var(--accent);animation:corepulse 1.2s infinite}
 @keyframes glow{0%{box-shadow:0 0 0 0 rgba(13,148,136,.45)}70%{box-shadow:0 0 0 11px rgba(13,148,136,0)}100%{box-shadow:0 0 0 0 rgba(13,148,136,0)}}
 @keyframes corepulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.6);opacity:.6}}
-/* ツールノード（実ツール実行: Neo4j/grep）＝思考ノードと色で区別 */
+/* ツールノード（実ツール実行）＝思考ノードと色で区別 */
 .fstep.tool .fnode{border-color:var(--accent)}
 .fstep.tool.active .fnode{background:var(--accent-weak)}
 .fstep.tool.done .fnode{background:var(--accent);border-color:var(--accent)}
 .fstep.tool.done::before{background:var(--accent)}
 .fstep.tool .flabel::before{content:"🔧 ";font-size:var(--text-caption)}
-/* A1: 経過時間バッジ（右肩・小さく・tabular-nums）。done になった初回だけ表示され、ストリーム後も残す。 */
-/* 既定の nowrap だとラベル＋バッジが強制的に同じ行に押し込まれ、幅固定のバッジ
-   （.provider-badge 等）に押されて .flabel が極端に圧縮される。
-   flex-wrap:wrap で収まらないときはバッジ側を次の行へ回す（ラベルの圧縮を防ぐ）。 */
+/* 経過時間バッジ（右肩・tabular-nums） */
+/* flex-wrap:wrap で、収まらないバッジは次の行へ回す（ラベルを圧縮しない） */
 .fhead{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;min-width:0}
 .ftime{margin-left:auto;flex:none;font-size:var(--text-caption);color:var(--ink-3);font-variant-numeric:tabular-nums}
-/* A3: ツールのクエリチップ（.chip 系のミニ版）＋残りテキスト。 */
+/* ツールのクエリチップ（.chip 系のミニ版）＋残りテキスト */
 .fchip{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:999px;font-size:var(--text-caption);
   font-weight:600;border:1px solid var(--accent);background:var(--accent-weak);color:var(--accent-ink)}
 .frest{margin-left:6px;color:var(--ink-3)}
-/* A2: detail 履歴の開閉（.ilist の展開パターンと一貫：max-height アニメ・caret 回転）。 */
+/* detail 履歴の開閉（max-height アニメ・caret 回転） */
 .fhist{display:inline-flex;align-items:center;gap:4px;margin-top:6px;padding:2px 8px;border-radius:999px;
   border:1px solid var(--border);background:var(--surface);color:var(--ink-3);font-size:var(--text-caption);font-weight:600}
 .fhist:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -578,7 +559,7 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
   transition:max-height .2s ease,opacity .18s ease,margin .2s ease}
 .fstep.hist-open .fhist-list{max-height:320px;opacity:1;margin-top:6px}
 .fhist-item{font-size:var(--text-caption);color:var(--ink-3);padding-left:8px;border-left:2px solid var(--border)}
-/* A3: active ステップの柔らかいパルス（glow と同系の box-shadow・1.6s・done で停止）。 */
+/* active ステップの柔らかいパルス（done で停止） */
 .fstep.active{border-radius:10px;animation:fstep-pulse 1.6s ease-in-out infinite}
 @keyframes fstep-pulse{0%,100%{box-shadow:0 0 0 0 rgba(13,148,136,0)}50%{box-shadow:0 0 10px 0 rgba(13,148,136,.12)}}
 @media (prefers-reduced-motion: reduce){
@@ -586,8 +567,8 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
   .fhist-list,.fhist .caret{transition-duration:.001ms !important}
 }
 
-/* ===== EXT-4（拡張設計 §10・UI 階層表示）: trace_version=2 の階層描画 ===== */
-/* 新設 kind（agent/evidence/evaluation/hook）の葉ノード配色（.fstep.tool と同じ意匠を踏襲）。 */
+/* ===== trace_version=2 の階層描画 ===== */
+/* kind（agent/evidence/evaluation/hook）ごとの葉ノード配色（.fstep.tool と同じ意匠） */
 .fstep.agent .fnode{border-color:var(--accent-ink)}
 .fstep.agent.done .fnode{background:var(--accent-ink);border-color:var(--accent-ink)}
 .fstep.agent .flabel::before{content:"🧑‍💻 ";font-size:var(--text-caption)}
@@ -600,7 +581,7 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fstep.hook .fnode{border-color:var(--ink-3)}
 .fstep.hook.done .fnode{background:var(--ink-3);border-color:var(--ink-3)}
 .fstep.hook .flabel::before{content:"🪝 ";font-size:var(--text-caption)}
-/* 新設 status（failed/cancelled）。done/active と同じ「fnode を塗る」パターンを踏襲。 */
+/* status（failed/cancelled）。done/active と同じく fnode を塗る */
 .fstep.failed .fnode{background:var(--danger);border-color:var(--danger);color:var(--action-fg)}
 .fstep.failed .flabel{color:var(--danger)}
 .fstep.failed::before{background:var(--danger)}
@@ -608,10 +589,7 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fstep.cancelled .flabel{color:var(--ink-3)}
 .fstep.cancelled::before{background:var(--ink-3)}
 
-/* サブエージェント レーン（.fturn の入れ子パターンを流用した折りたたみ可能なカード）。
-   ネストが深いとインデントが積み重なり本文の幅を圧迫するため、1段あたりの字下げを
-   12px/12px 程度に抑える（ペイン既定幅 300px でも1行に収まりやすくする・.pane.right の
-   既定幅 300px は app.css の grid-template-columns 参照）。 */
+/* サブエージェントのレーン（折りたたみ可能なカード）。ネストでも本文幅を圧迫しないよう、1段の字下げを 12px 程度に抑える。 */
 .fagent{margin:4px 0 16px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);
   background:var(--surface-2);padding:2px 0}
 .fagent-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px;cursor:pointer;padding:8px 10px;
@@ -619,9 +597,7 @@ details.fturn[open]>.fturn-head::before{transform:rotate(90deg)}
 .fagent-head::-webkit-details-marker{display:none}
 .fagent-head::before{content:"▸";display:inline-block;color:var(--ink-3);font-size:var(--text-caption);flex:none;transition:transform .15s}
 details.fagent[open]>.fagent-head::before{transform:rotate(90deg)}
-/* 名前は CJK 文字間で任意折返しさせない（.flabel と同じ是正）＋残り幅を優先的に使う。
-   バッジ/状態/統計チップ群（役割・担当・状態・Cycle 等）は flex-shrink:0 で崩さず、
-   .fagent-head の flex-wrap:wrap で収まらなければ次の行へ回す。 */
+/* 名前は CJK 文字間で折り返さず残り幅を使う。バッジ・状態・統計チップは flex-shrink:0 とし、収まらなければ .fagent-head の flex-wrap で次の行へ回す。 */
 .fagent-name{font-weight:700;color:var(--ink);flex:1 1 auto;min-width:0;
   white-space:normal;word-break:keep-all;overflow-wrap:anywhere}
 .fagent-role{color:var(--ink-3);font-size:var(--text-caption);padding:1px 7px;border-radius:999px;
@@ -635,13 +611,12 @@ details.fagent[open]>.fagent-head::before{transform:rotate(90deg)}
 .fagent-status.done{background:var(--ok-bg);color:var(--ok)}
 .fagent-status.failed{background:var(--danger-bg);color:var(--danger)}
 .fagent-status.cancelled{background:var(--surface);color:var(--ink-3);border:1px solid var(--border)}
-/* 停止操作/期限/エラー/不明で打ち切られた実行中レーンの状態。
-   done（緑）と紛れないよう warn 系の配色にする（失敗ではないが完了でもない、という中間の意味）。 */
+/* 停止操作/期限/エラー/不明で打ち切られたレーンの状態。done（緑）と紛れないよう warn 系の配色にする。 */
 .fagent-status.aborted{background:var(--warn-bg);color:var(--warn)}
-/* 担当不明バッジ（is_local が判定不能・誤断定しない）。 */
+/* 担当不明バッジ（is_local が判定不能） */
 .provider-badge.unknown{background:var(--surface);color:var(--ink-3);border:1px solid var(--border)}
 
-/* 集約表示（同種操作を件数で畳む・展開すると個別ノード）。.fagent より軽量な折りたたみ意匠。 */
+/* 集約表示（同種操作を件数で畳み、展開すると個別ノード） */
 .fagg{margin:0 0 14px 0;border-left:2px dashed var(--border);padding-left:10px}
 .fagg-head{cursor:pointer;list-style:none;color:var(--ink-3);font-size:var(--text-small);font-weight:600;padding:2px 0}
 .fagg-head::-webkit-details-marker{display:none}
@@ -649,11 +624,7 @@ details.fagent[open]>.fagent-head::before{transform:rotate(90deg)}
 details.fagg[open]>.fagg-head::before{content:"▾ "}
 .fagg-body{padding-top:6px}
 
-/* 担当バッジ（ローカル/社内サーバ/クラウド AI・柔らかい3色分け・既存 .chip 系と揃えた高さ／角丸）。
-   幅固定＋nowrap のバッジは隣の .flabel/.fagent-name を圧縮する側なので flex-shrink:0
-   （自身は縮まない・.fhead/.fagent-head の flex-wrap で回避する側）。それでもペイン幅そのものより
-   長いモデル名が来た場合の保険として max-width+ellipsis を持たせ、切り詰められた全文は title 属性
-   （呼び出し側の providerBadgeHTML が付与）で確認できるようにする。 */
+/* 担当バッジ（ローカル/社内サーバ/クラウド AI の3色分け）。自身は縮まず（flex-shrink:0）、長いモデル名は max-width+ellipsis で切り詰める（全文は title 属性）。 */
 .provider-badge{display:inline-flex;align-items:center;height:19px;padding:0 8px;border-radius:999px;
   font-size:var(--text-caption);font-weight:600;white-space:nowrap;flex-shrink:0;max-width:100%;
   overflow:hidden;text-overflow:ellipsis}
@@ -661,25 +632,23 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .provider-badge.on_prem{background:var(--warn-bg);color:var(--warn)}
 .provider-badge.cloud{background:var(--accent-weak);color:var(--accent-ink)}
 
-/* 検証バッジ（Verification Method・EV-0 の最小版を出典リンクの右に添える）。 */
+/* 検証バッジ（出典リンクの右に添える） */
 .verif-badge{display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:999px;
   font-size:var(--text-caption);font-weight:600;margin-left:4px;vertical-align:middle}
 .verif-badge.ok{background:var(--ok-bg);color:var(--ok)}
 .verif-badge.warn{background:var(--warn-bg);color:var(--warn)}
 .verif-badge.unknown{background:var(--surface);color:var(--ink-3);border:1px solid var(--border)}
 
-/* 登録者重要度バッジ（`_重要度.txt`・I2・2026-09-05）: 出典リンクの右に添える。「高」は強調
-   （accent 色）・「低」は淡色（本文とのコントラストを落として控えめに見せる）・「中」/未設定は
-   `importanceBadgeHTML`（web/chat/render.js）が呼び出し自体をしない＝表示しない。 */
+/* 登録者重要度バッジ（出典リンクの右に添える）。「高」は強調・「低」は淡色。「中」・未設定は描かない。 */
 .importance-badge{display:inline-flex;align-items:center;min-height:24px;padding:0 7px;border-radius:999px;
   font-size:var(--text-caption);font-weight:600;margin-left:4px;vertical-align:middle}
 .importance-badge.high{background:var(--accent-weak);color:var(--accent-ink)}
 .importance-badge.low{background:var(--surface);color:var(--ink-3)}
 
-/* 実行の分担サマリ（ローカル/社内サーバ/クラウド AI の按分・回答カード末尾）。 */
+/* 実行の分担サマリ（回答カード末尾） */
 .provider-summary{font-size:var(--text-caption);margin-top:6px}
 
-/* 「考え中」ティック表示（待ち時間を止まって見せない・利用者決定 2026-08-28）＋終了理由。 */
+/* 「考え中」ティック表示＋終了理由 */
 .fthinking{font-size:var(--text-caption);color:var(--ink-3);padding:4px 4px 0;font-style:italic}
 .ftrace-stopreason{font-size:var(--text-caption);padding:6px 4px 0;color:var(--ink-3)}
 
@@ -700,7 +669,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .badge-brain{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:999px;
   border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:var(--text-small)}
 .badge-brain b{color:var(--ink)} .badge-brain small{color:var(--ink-3)}
-/* 範囲（スコープ）セレクタ（D）*/
+/* 範囲セレクタ */
 .scopesel{position:relative;display:inline-flex}
 .scopebtn{display:inline-flex;align-items:center;gap:5px;height:30px;padding:0 11px;border-radius:999px;
   border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:var(--text-small);font-family:inherit;cursor:pointer}
@@ -716,7 +685,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .scoperow .sk{width:14px;color:var(--ink-3)} .scoperow.on .sk{color:var(--accent-ink)}
 .scoperow .sc{margin-left:auto;font-size:var(--text-caption);color:var(--ink-3)}
 .scopenote{font-size:var(--text-caption);color:var(--ink-3);padding:4px 10px 6px;border-bottom:1px dashed var(--border);margin-bottom:4px}
-/* 折りたたみツリー化: トグル（開閉）は行本体（選択）と別クリック領域の兄弟要素にする */
+/* 折りたたみツリー: トグル（開閉）は行本体（選択）と別クリック領域の兄弟要素にする */
 .scoperow-wrap{display:flex;align-items:center}
 .scoperow-wrap .scoperow{flex:1;min-width:0}
 .sctoggle{flex:0 0 18px;width:18px;height:30px;border:none;background:transparent;color:var(--ink-3);
@@ -727,34 +696,30 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .scopefilter{display:block;width:100%;box-sizing:border-box;margin:2px 0 6px;padding:6px 9px;
   border:1px solid var(--border);border-radius:8px;font:inherit;font-size:var(--text-small);background:var(--surface-2);color:var(--ink)}
 .scopeempty{padding:8px 10px;color:var(--ink-3);font-size:var(--text-small)}
-/* 入力欄付近のコントロール（ナレッジ参照トグル＋範囲＋頭脳）*/
+/* 入力欄付近のコントロール（ナレッジ参照トグル＋範囲＋頭脳） */
 .cbar{display:flex;align-items:center;gap:8px;margin:0 auto 8px;max-width:min(var(--chatmax,1040px),100%);flex-wrap:wrap}
 .cbar .spacer{flex:1}
 .kbtoggle{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border-radius:999px;
   border:1px solid var(--border);background:var(--surface-2);color:var(--ink-2);font-size:var(--text-small);font-family:inherit;cursor:pointer}
-/* WEB-1: `.kbtoggle`（display:inline-flex）は `hidden` 属性の既定 display:none より詳細度が高い
-   ため、JS の `element.hidden = true` だけでは非表示にならない（#websearchtoggle 等）。
-   `.inquiry-row[hidden]` と同じ形で明示する。 */
+/* `.kbtoggle`（display:inline-flex）は hidden 属性の display:none に勝つため、`[hidden]` を明示する（`.inquiry-row[hidden]` と同形）。 */
 .kbtoggle[hidden]{display:none}
 .kbtoggle:hover{background:var(--surface)}
 .kbtoggle b{color:var(--ink-3);font-weight:600}
 .kbtoggle.on{background:var(--accent-weak);border-color:var(--accent);color:var(--accent-ink)}
 .kbtoggle.on b{color:var(--accent-ink)}
-/* Codex 構成は資料参照ON固定（決定 2026-08-15）: 押せないことを見た目でも示す（表示は残す＝
-   なぜ切り替えられないかが分かるよう title/aria-disabled と併用）。 */
+/* 資料参照ON固定の構成: 押せないことを見た目でも示す（title/aria-disabled と併用） */
 .kbtoggle.locked{cursor:not-allowed}
 .kbtoggle.locked:hover{background:var(--accent-weak)}
 .chip.ghost{background:var(--surface-2);color:var(--ink-3)}
-/* 出典0件時の再検索案内（調べ方ブロック §5・SC-6d）*/
+/* 出典0件時の再検索案内 */
 .retry-hints{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 10px}
 .retry-hint-btn{border:1px solid var(--accent);background:var(--accent-weak);color:var(--accent-ink);
   border-radius:999px;padding:6px 13px;font-size:var(--text-small);font-family:inherit;cursor:pointer}
 .retry-hint-btn:hover{background:var(--action-bg);color:var(--action-fg)}
-/* STOP-1: 調査予算到達（turns_exhausted/budget_exceeded/tools_per_turn_exceeded）の注記。
-   本文と分離した独立要素（サーバ側で本文へ連結しない契約）。.impdiag と同じ配色・寸法。 */
+/* 調査予算の到達（途中までの結果）の注記。本文と分離した独立要素で、.impdiag と同じ配色・寸法。 */
 .budget-note{font-size:var(--text-caption);color:var(--warn);background:var(--warn-bg);border-radius:8px;
   padding:8px 10px;margin:4px 0 10px;line-height:1.5}
-/* AI/実行環境のクイック切替メニュー（#1）*/
+/* AI・実行環境のクイック切替メニュー */
 .brainwrap{position:relative;display:inline-flex}
 .brainmenu{position:absolute;right:0;bottom:38px;z-index:30;width:264px;
   background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-lg);padding:6px}
@@ -769,7 +734,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .brainitem small{font-size:var(--text-caption);color:var(--ink-3)}
 .brainitem.cfg{border-top:1px solid var(--border);margin-top:4px;border-radius:0 0 8px 8px;color:var(--ink-2)}
 .brainitem.cfg b{display:none}
-/* チャット文字サイズの選択（#5）*/
+/* チャット文字サイズの選択 */
 .fontsel{position:relative;display:inline-flex}
 .fontmenu{position:absolute;right:0;top:38px;z-index:30;background:var(--surface);border:1px solid var(--border);
   border-radius:10px;box-shadow:var(--shadow-lg);padding:4px;min-width:128px}
@@ -778,9 +743,8 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   color:var(--ink-2);padding:7px 12px;border-radius:7px;cursor:pointer;text-align:left}
 .fontitem:hover{background:var(--surface-2)}
 .fontitem.on{background:var(--accent-weak);color:var(--accent-ink);font-weight:600}
-.exportsel{position:relative;display:inline-flex}   /* 書き出しメニュー（#6・.fontmenu を流用）*/
-/* 共有ダイアログの入力補完（バッチ2・5番・2026-07-03）: GET /users/suggest の候補ドロップダウン＋
-   確定済み招待ユーザーのチップ表示（.chip を流用・×ボタンだけ追加）。 */
+.exportsel{position:relative;display:inline-flex}   /* 書き出しメニュー（.fontmenu を流用） */
+/* 共有ダイアログの入力補完（GET /users/suggest の候補ドロップダウン）＋確定済み招待ユーザーのチップ（.chip を流用） */
 .invitee-chips{display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 8px}
 .invitee-chips:empty{display:none}
 .invitee-chip button{border:none;background:transparent;color:inherit;cursor:pointer;font-size:var(--text-label);
@@ -795,12 +759,10 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   font-size:var(--text-label);color:var(--ink-2);padding:7px 10px;border-radius:7px;cursor:pointer;text-align:left}
 .share-suggest-item:hover,.share-suggest-item.active{background:var(--surface-2)}
 .share-suggest-item small{display:block;color:var(--ink-3);font-size:var(--text-caption)}
-/* 範囲パネルは調べ方ブロック内（右ペイン・最小幅280px）に収まる幅へ縮める（入力欄内の旧配置から移設）。
-   RV1 #8: 下方向（top:36px）のままだと `.app`（overflow:hidden）の下端で欠けて操作不能になるため、
-   旧 `.composer .scopepanel` と同じ上向き展開（bottom）に戻す。 */
+/* 範囲パネルは調べ方ブロック内（右ペイン・最小幅280px）に収まる幅にし、`.app`（overflow:hidden）の下端で欠けないよう上向きに展開する（bottom）。 */
 .inquiry .scopepanel{left:0;right:auto;top:auto;bottom:36px;width:240px}
-/* 質問例カード（初期メッセージの下・クリックで入力欄へ）*/
-.examples{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}   /* 本文幅いっぱいに2列（狭い時は下のmediaで1列）*/
+/* 質問例カード（初期メッセージの下・クリックで入力欄へ） */
+.examples{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}   /* 本文幅いっぱいに2列（狭い時は下の media で1列） */
 .example{display:flex;align-items:center;gap:8px;text-align:left;border:1px solid var(--border);
   background:var(--surface);border-radius:10px;padding:10px 12px;font-family:inherit;font-size:var(--text-label);
   color:var(--ink-2);cursor:pointer;transition:border-color .15s,background .15s}
@@ -809,7 +771,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .example .exarrow{color:var(--ink-3);font-size:var(--text-small)}
 .example:hover .exarrow{color:var(--accent-ink)}
 @media(max-width:640px){.examples{grid-template-columns:1fr}}
-/* 回答の「参照したナレッジグラフ」折りたたみ（#5）*/
+/* 回答の「参照したナレッジグラフ」折りたたみ */
 .refgraph{margin-top:10px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .refgraph-h{width:100%;text-align:left;border:none;background:var(--surface-2);color:var(--ink-2);
   font-family:inherit;font-size:var(--text-small);padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:6px}
@@ -827,7 +789,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .copybtn:hover{color:var(--accent-ink);border-color:var(--accent)}
 .msg.user .copybtn{margin:6px 2px 0 auto;display:block}
 
-/* F3: トークン使用量（ターン末尾の小型表示・クリックで入力/出力の内訳） */
+/* トークン使用量（ターン末尾の小型表示・クリックで内訳） */
 .usage-meta{margin:8px 0 2px;font-size:var(--text-caption);color:var(--ink-3)}
 .usage-meta>summary{cursor:pointer;list-style:none;display:inline-flex;align-items:center;gap:4px;
   padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--surface-2);
@@ -837,7 +799,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .usage-meta[open]>summary{color:var(--ink-2)}
 .usage-detail{margin:6px 0 0 2px;line-height:1.7}
 
-/* 回答フィードバック（👍/👎＋定型タグ/一言）。 */
+/* 回答フィードバック（👍/👎＋定型タグ/一言） */
 .msg-feedback{margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 .fbbtn{height:28px;padding:0 11px;border-radius:999px;border:1px solid var(--border);background:var(--surface);
   color:var(--ink-3);font-size:var(--text-small);cursor:pointer;display:inline-flex;align-items:center;gap:4px}
@@ -875,7 +837,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--ink);color:var(--surface);
   padding:9px 16px;border-radius:999px;font-size:var(--text-small);opacity:0;visibility:hidden;
   transition:opacity .2s,visibility .2s;pointer-events:none;z-index:50}
-.toast.show{opacity:.95;visibility:visible}   /* 非表示時は visibility:hidden で合成レイヤごと消す（ゴースト防止）*/
+.toast.show{opacity:.95;visibility:visible}   /* 非表示時は visibility:hidden で合成レイヤごと消す */
 
 /* ===== ナレッジグラフ可視化 ===== */
 .graphwrap{height:calc(100dvh - 52px);display:flex;flex-direction:column;padding:20px 24px 24px;gap:16px}
@@ -918,15 +880,6 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .gresult:hover{background:var(--accent-weak)}
 .gresult small{display:block;font-size:var(--text-caption);color:var(--ink-3)}
 #gresults-count{color:var(--ink-3);font-size:var(--text-caption);font-weight:400}
-.gask{width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;
-  font-family:inherit;font-size:var(--text-label);resize:vertical;background:var(--surface);color:var(--ink)}
-.gask:focus{border-color:var(--accent)}
-.gaskbtn{width:100%;margin-top:8px;justify-content:center}
-.ganswer{margin-top:10px;font-size:var(--text-small);color:var(--ink-2)}
-.ganswer-text{border:1px solid var(--border);border-radius:8px;background:var(--surface-2);padding:9px 10px;color:var(--ink)}
-.ganswer-cites{margin-top:8px;display:flex;flex-direction:column;gap:6px}
-.gpath{border-left:3px solid var(--accent);padding-left:8px;line-height:1.45}
-.gpath span{display:block;color:var(--ink-3);font-size:var(--text-caption);margin-top:2px}
 .gempty{position:absolute;inset:0;display:grid;place-items:center;color:var(--ink-3);font-size:var(--text-label)}
 .nodecard{display:none;overflow-wrap:anywhere}
 .nodecard.show{display:block}
@@ -950,7 +903,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
   .graphhint{font-size:var(--text-caption)}
 }
 
-/* ===== 取り込み: フォルダツリー副導線（B・範囲の3層） ===== */
+/* ===== 取り込み: フォルダツリー副導線 ===== */
 .ingestwrap{display:flex;gap:18px;align-items:flex-start}
 .treeside{width:248px;flex:0 0 auto;border:1px solid var(--border);border-radius:12px;background:var(--surface);
   padding:10px 8px;position:sticky;top:16px;max-height:calc(100vh - 120px);overflow:auto;box-shadow:var(--shadow)}
@@ -1043,7 +996,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 
 .home-hero-note{font-size:var(--text-small);color:var(--ink-3);margin-top:6px}
 
-/* 取り込みのステッパー表示（2026-09-04）: 済✓/現在▶/残りを1行に。狭い画面では折り返す。 */
+/* 取り込みのステッパー表示（済✓/現在▶/残りを1行に・狭い画面では折り返す） */
 .ingest-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; font-size: var(--text-small); }
 .ingest-steps .step { white-space: nowrap; }
 .ingest-steps .step.done { color: var(--ok, #2e7d32); }
@@ -1051,7 +1004,7 @@ details.fagg[open]>.fagg-head::before{content:"▾ "}
 .ingest-steps .step.todo { opacity: .45; }
 .ingest-steps .step-arrow { opacity: .35; }
 
-/* 共通の操作状態とフォーカス。寸法と色を分け、無効化の条件は各画面の既存処理に従う。 */
+/* 共通の操作状態とフォーカス */
 :is(button,a,input,select,textarea,summary,[tabindex]):focus-visible{outline:2px solid var(--focus);outline-offset:3px}
 :is(.field,.composer .box,.uc-composer):focus-within{border-color:var(--focus);box-shadow:0 0 0 1px var(--focus)}
 :is(.btn-primary,.sendbtn):hover:not(:disabled){filter:brightness(.94)}

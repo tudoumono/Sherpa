@@ -185,7 +185,7 @@ def test_admin_vertical_tabs_manual_activation_and_hidden_items(page, web_base_u
     expect(tabs).to_have_attribute('aria-orientation', 'vertical')
     page.locator('[data-tab="provider"]').focus()
     page.keyboard.press('ArrowDown')
-    expect(page.locator('[data-tab="models"]')).to_be_focused()
+    expect(page.locator('[data-tab="research"]')).to_be_focused()
     expect(page.locator('[data-tab="provider"]')).to_have_attribute('aria-selected', 'true')
     expect(page.locator('#embed-frame-users')).not_to_have_attribute('src', re.compile('.+'))
     page.keyboard.press('End')
@@ -203,10 +203,6 @@ def test_admin_vertical_tabs_manual_activation_and_hidden_items(page, web_base_u
     page.keyboard.press('Home')
     page.keyboard.press('Enter')
     expect(page.locator('#tabpanel-provider')).to_be_visible()
-    page.locator('[data-tab="usage"]').click()
-    expect(page.locator('[data-tab="usage"]')).to_contain_text('利用統計の AI')
-    assert page.url.endswith('#usage')
-    expect(page.locator('#tabpanel-usage')).to_have_attribute('aria-labelledby', 'tab-btn-usage')
 
 
 @pytest.mark.parametrize('theme', ['light', 'dark'])
@@ -216,7 +212,7 @@ def test_admin_iframe_theme_and_low_viewport_do_not_overlap_save(page, web_base_
     page.add_init_script(f"localStorage.setItem('sherpa-theme', '{theme}')")
     page.set_viewport_size({'width': 640, 'height': height})
     page.goto(f"{web_base_url}/admin-settings.html")
-    page.locator('#depth-base-max-turns').fill('21')
+    page.locator('#chat-max-turns-per-user').fill('12')
     expect(page.locator('#unsaved-note')).to_be_visible()
     expect(page.locator('#admin-tabs')).to_have_css('position', 'static')
     nav, panel = page.locator('#admin-tabs').bounding_box(), page.locator('.admin-panels').bounding_box()
@@ -255,17 +251,23 @@ def test_admin_embed_keeps_standalone_breadcrumb_and_reaches_end(page, web_base_
     child = page.frame_locator('#embed-frame-' + key)
     expect(child.locator('h1')).to_be_visible()
     expect(child.locator('.crumb')).to_be_hidden()
+    if key == 'usage-page':
+        child.locator('[data-usage-tab="tokens"]').click()   # 表は既定では隠れたトークンのタブパネルにある
     rows = {'users': '#user-tbody tr', 'usage-page': '#token-user-tbody tr',
             'audit': '#audit-tbody tr', 'status': '#health-tbody tr'}
     expect(child.locator(rows[key]).first).to_be_visible()
     # 実際の末尾の操作をキーボードでフォーカスし、親子のスクロールと重なりを確認する。
-    last = child.locator('.wrap').locator(
-        'button:visible:enabled, a:visible, input:visible:enabled, select:visible:enabled, textarea:visible:enabled').last
-    last.focus()
-    expect(last).to_be_focused()
-    last.click(trial=True)
+    if key == 'usage-page':
+        # トークンのタブパネルは表だけで末尾に操作が無い。タブ列のキー操作と衝突しないよう本文へフォーカスを移す。
+        child.locator('h1').click()
+    else:
+        last = child.locator('.wrap').locator(
+            'button:visible:enabled, a:visible, input:visible:enabled, select:visible:enabled, textarea:visible:enabled').last
+        last.focus()
+        expect(last).to_be_focused()
+        last.click(trial=True)
     page.keyboard.press('Control+End')
-    page.frame(url=f'{web_base_url}/{filename}.html?embed=1').wait_for_function(
+    page.frame(url=re.compile(re.escape(f'{web_base_url}/{filename}.html?embed=1') + '(#.*)?$')).wait_for_function(
         'scrollY + innerHeight >= document.documentElement.scrollHeight - 1')
     box, save = frame.bounding_box(), page.locator('#save-bar').bounding_box()
     assert box['y'] + box['height'] <= save['y']
@@ -305,16 +307,16 @@ def test_admin_first_iframe_after_theme_switch_uses_current_theme(page, web_base
 def test_admin_dirty_state_survives_tabs_and_save_failure(page, web_base_url):
     records = install_api_mocks(page)
     page.goto(f"{web_base_url}/admin-settings.html")
-    page.locator('#depth-base-max-turns').fill('21')
+    page.locator('#chat-max-turns-per-user').fill('12')
     expect(page.locator('#tab-dot-provider')).to_be_visible()
     expect(page.locator('#unsaved-note')).to_be_visible()
     page.locator('[data-tab="ingest"]').click()
     page.locator('#arms-list input[data-arm="pdf_text"]').uncheck()
     expect(page.locator('#tab-dot-ingest')).to_be_visible()
     page.locator('[data-tab="provider"]').click()
-    page.locator('#depth-base-max-turns').fill('')
+    page.locator('#chat-max-turns-per-user').fill('')
     expect(page.locator('#tab-dot-provider')).to_be_hidden()
-    page.locator('#depth-base-max-turns').fill('21')
+    page.locator('#chat-max-turns-per-user').fill('12')
 
     def reject_save(route):
         assert route.request.method == 'PUT'
@@ -323,11 +325,11 @@ def test_admin_dirty_state_survives_tabs_and_save_failure(page, web_base_url):
     page.route('**/admin/settings', reject_save)
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存に失敗')
-    expect(page.locator('#depth-base-max-turns')).to_have_value('21')
+    expect(page.locator('#chat-max-turns-per-user')).to_have_value('12')
     expect(page.locator('#tab-dot-provider')).to_be_visible()
     expect(page.locator('#tab-dot-ingest')).to_be_visible()
     page.unroute('**/admin/settings', reject_save)
     page.locator('#save').click()
     expect(page.locator('#msg')).to_contain_text('保存しました')
-    assert records['admin_settings_put'][-1]['depth_base_max_turns'] == 21
+    assert records['admin_settings_put'][-1]['chat_max_turns_per_user'] == 12
     assert records['admin_settings_put'][-1]['arms_enabled'] == ['ooxml']

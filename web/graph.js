@@ -1,6 +1,6 @@
-// ナレッジグラフ可視化（cytoscape）。管理用の関係検索とグラフ質問を含む。
+// ナレッジグラフ可視化（cytoscape）。管理用の関係検索を含む（AI は使わない）。
 'use strict';
-const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;     // 共通ユーティリティ（nav.js・RV DRY）
+const $ = Sherpa.$, esc = Sherpa.esc, getJSON = Sherpa.getJSON;   // 共通ユーティリティ（nav.js）
 
 const COLOR = {
   Module: '#0d9488', Copybook: '#0891b2', DataItem: '#64748b',
@@ -71,9 +71,8 @@ function graphLayout() {
     concentric: (n) => n.degree(), levelWidth: () => 1, nodeDimensionsIncludeLabels: false };
 }
 
-// ── 段階読み込み＋ETag キャッシュ（②graph 軽量化 2026-07-08）──
-// 都度の全件転送を避ける: 初期は主要ノード（サーバ既定の limit）だけを取り、「すべて表示」で
-// limit=0（全件）を明示取得。内容が変わっていなければ ETag 一致で 304＝localStorage の JSON を再利用。
+// ── 段階読み込み＋ETag キャッシュ ──
+// 初期は主要ノード（サーバ既定の limit）だけを取り、「すべて表示」で limit=0（全件）を明示取得。内容が変わっていなければ ETag 一致で 304＝localStorage の JSON を再利用。
 const GRAPH_CACHE_KEY = 'sherpa-graph-cache';
 const GRAPH_CACHE_MAX = 3_000_000;   // localStorage 肥大防止（超過は保存せず 304 最適化のみ諦める）
 const graphToken = (limitParam) => (limitParam === 0 ? 'all' : 'default');
@@ -110,7 +109,7 @@ async function fetchGraph(limitParam) {
 }
 
 async function load() {
-  // 登録済みの資料フォルダを基準に表示（未登録なら空＝サンプル v1 を勝手に出さない）。
+  // 登録済みの資料フォルダを基準に表示（未登録なら空）。
   setGraphLoading(true, 'ナレッジグラフを読み込んでいます...');
   try {
     const wr = await fetch('/worlds');
@@ -400,46 +399,6 @@ function resetGraphSearch() {
   if (_fullGraph) renderGraph(_fullGraph);
 }
 
-function renderAskResult(res) {
-  const cited = res.cited_nodes || [];
-  const paths = cited.map((n) => {
-    const p = (n.path || []).join(' → ');
-    return `<div class="gpath"><b>${esc(n.name || '')}</b>${p ? `<span>${esc(p)}</span>` : ''}</div>`;
-  }).join('');
-  const s = res.summary || null;
-  const summary = s ? `<div class="ganswer-cites">
-      <div class="gpath"><b>対象</b><span>${esc(s.world || '')} / ${esc((s.scope_paths && s.scope_paths.length ? s.scope_paths.join(', ') : '全体'))}</span></div>
-      <div class="gpath"><b>件数</b><span>文書 ${esc(s.documents)} 件・ノード ${esc(s.graph_nodes)} 件・関係 ${esc(s.graph_edges)} 件</span></div>
-      <div class="gpath"><b>弱点候補</b><span>孤立ノード ${esc(s.isolated_node_count)} 件・関係が薄い文書 ${esc(s.weak_document_count)} 件</span></div>
-    </div>` : '';
-  // status="llm_unavailable"/"failed" は通常の回答ではなくエラー（AI未接続・生成失敗）＝danger色で明示する。
-  // "no_graph_evidence" はグラフに根拠が無かっただけの正常回答なので通常表示のまま。
-  const isError = res.status === 'llm_unavailable' || res.status === 'failed';
-  const answerStyle = isError ? ' style="color:var(--danger)"' : '';
-  $('ganswer').innerHTML = `<div class="ganswer-text"${answerStyle}>${esc(res.answer || '回答なし')}</div>`
-    + summary
-    + (paths ? `<div class="ganswer-cites">${paths}</div>` : '');
-}
-
-async function askGraph() {
-  const q = $('gask').value.trim();
-  if (!q || !_world) return;
-  $('gaskbtn').disabled = true;
-  $('ganswer').innerHTML = '<div class="loading-inline" role="status"><span class="spinner spinner-sm"></span><span>ナレッジ状況を確認しています...</span></div>';
-  try {
-    const r = await fetch('/graph/ask', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: q, world: _world, scope_paths: [] }),
-    });
-    if (!r.ok) throw new Error('graph ask failed');
-    renderAskResult(await r.json());
-  } catch (e) {
-    $('ganswer').innerHTML = '<div class="muted" style="color:var(--danger)">質問に失敗しました。AI接続とNeo4jの状態を確認して、もう一度お試しください。</div>';
-  } finally {
-    $('gaskbtn').disabled = false;
-  }
-}
-
 // グラフ→チャット連携：ノードからそのまま影響を質問
 $('nodecard').addEventListener('click', (e) => {
   const a = e.target.closest('[data-ask]');
@@ -464,8 +423,6 @@ $('gfilter').addEventListener('click', runGraphSearch);
 $('greset').addEventListener('click', resetGraphSearch);
 $('showall').addEventListener('click', showAllNodes);
 $('condvalue').addEventListener('keydown', (e) => { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') runGraphSearch(); });
-$('gaskbtn').addEventListener('click', askGraph);
-$('gask').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) askGraph(); });
 $('relayout').addEventListener('click', () => { if (cy) { clearSelection(); cy.layout(graphLayout()).run(); } });
 $('fit').addEventListener('click', () => { if (cy) { clearSelection(); cy.fit(cy.elements().not('.filtered'), 40); } });
 document.querySelector('.graphlegend').addEventListener('click', onLegendClick);
@@ -481,11 +438,8 @@ $('themebtn').addEventListener('click', () => {
 });
 applyThemeIcon();
 
-// ===== admin ガード（CLEAN-1・2026-09-03・W1 の残・同型是正）: `/graph`・`/graph/facets`・
-// `/graph/search`・`POST /graph/ask` は全て admin 限定 API。この画面は丸ごと admin 専用＝
-// ingest.js/admin-settings.js/audit.js と同じ自前 checkAdmin() パターン（nav.js の _isAdminUser は
-// カスタムエレメント内部の非公開状態のため外部から参照できない）。判定失敗時は fail-safe で
-// access-denied 側に倒す。
+// ===== admin ガード =====
+// /graph・/graph/facets・/graph/search は全て admin 限定 API。この画面は丸ごと admin 専用＝ingest.js/admin-settings.js/audit.js と同じ自前 checkAdmin() パターン。判定失敗時は access-denied 側に倒す。
 async function checkAdmin() {
   try {
     const u = await getJSON('/auth/me');
@@ -494,8 +448,7 @@ async function checkAdmin() {
   return false;
 }
 
-// 初期化（admin ガード）: 非 admin には access-denied だけを見せ、グラフデータ（/worlds・/graph・
-// /graph/facets）は取得しない（ingest.js と同じ「本体を読まずに弾く」パターン）。
+// 初期化（admin ガード）: 非 admin には access-denied だけを見せ、グラフデータ（/worlds・/graph・/graph/facets）は取得しない。
 (async () => {
   const isAdmin = await checkAdmin();
   if (!isAdmin) {

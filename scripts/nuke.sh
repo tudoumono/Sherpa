@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Sherpa を「入れたて」の状態へ戻す（完全初期化）。
 #
-#   make nuke            # 消す対象を一覧表示 → `yes` と入力すると実行
-#   make nuke YES=1      # 確認せず実行（スクリプト/CI 用）
+#   make nuke            # 消す対象を一覧表示 → yes → 表示された環境名を入力 → 5 秒の猶予 → 実行
+#   make nuke YES=I-UNDERSTAND-ALL-DATA-WILL-BE-DELETED
+#                        # 確認を省いて実行（スクリプト/CI 用・この文字列と完全一致のときだけ。本番では不可）
 #   make nuke KEEP_ENV=1 # .env は残す（既定でも .env は消さない。将来の拡張用の明示指定）
 #
 # 消すもの:
@@ -24,14 +25,43 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-YES="${YES:-0}"
+# 確認を省く指定は、長い決まった文字列と完全一致したときだけ（旧 YES=1 は廃止）。
+SKIP_TOKEN="I-UNDERSTAND-ALL-DATA-WILL-BE-DELETED"
+YES="${YES:-}"
+if [ "$YES" = "0" ]; then YES=""; fi
+if [ -n "$YES" ] && [ "$YES" != "$SKIP_TOKEN" ]; then
+  echo "この指定（YES=${YES}）は廃止しました。何も消していません。" >&2
+  echo "使い方: make nuke（対話で 2 回確認します）。スクリプト用に確認を省くときは YES=${SKIP_TOKEN}" >&2
+  exit 2
+fi
 
 # .env の設定（保存先の指定）を読む。読み方は scripts/run-common.sh に一本化してある
 # （呼び出し側の明示指定 ＞ .env ＞ 既定・SHERPA_ENV_FILE 対応）。ここは戻せない操作なので、
 # 「画面に出した対象」と「実際に消す対象」が必ず一致することを最優先にする。
+# 明示した環境変数ファイルが読めないときは、消す先も本番かどうかも決められないので中止する
+if [ -n "${SHERPA_ENV_FILE:-}" ] && { [ ! -f "$SHERPA_ENV_FILE" ] || [ ! -r "$SHERPA_ENV_FILE" ]; }; then
+  echo "✗ SHERPA_ENV_FILE で指定したファイルが読めません。何も消していません。" >&2
+  exit 1
+fi
 # shellcheck source=scripts/run-common.sh
 . "$ROOT/scripts/run-common.sh"
 sherpa_env_default SHERPA_DERIVED_DIR SHERPA_USERS_DIR SHERPA_OBSERVATION_DIR SHERPA_KB_DIR
+
+# 本番では確認を省く指定を受け付けず、必ず対話で確認する。環境変数に加えて環境変数ファイル
+# （SHERPA_ENV_FILE 指定を含む）の SHERPA_ENV も見る（どちらかが prod/production なら本番）。
+sherpa_env_default SHERPA_ENV
+FILE_SHERPA_ENV="$(unset SHERPA_ENV; sherpa_env_default SHERPA_ENV; printf '%s' "${SHERPA_ENV:-}")"
+PRODUCTION=0
+for _env_value in "${SHERPA_ENV:-}" "$FILE_SHERPA_ENV"; do
+  case "$(printf '%s' "$_env_value" | tr '[:upper:]' '[:lower:]')" in
+    prod|production) PRODUCTION=1 ;;
+  esac
+done
+if [ -n "$YES" ] && [ "$PRODUCTION" = 1 ]; then
+  echo "本番（SHERPA_ENV=production）では確認を省く指定は使えません。何も消していません。" >&2
+  echo "make nuke を対話端末で実行し、2 回の確認に答えてください。" >&2
+  exit 2
+fi
 
 # 相対指定は「リポジトリ基準」に揃える（アプリの規約は cwd 基準だが、make はここで実行される）。
 abspath() {  # $1=path
@@ -147,14 +177,49 @@ if [ "$WORLD_CHECK" = "skipped" ]; then
   echo "     上の消す先が資料フォルダと重なっていないか、目で確かめてください。"
 fi
 echo
-if [ "$YES" != "1" ]; then
-  printf 'この操作は元に戻せません。実行するなら yes と入力してください: '
-  read -r answer
+if [ -z "$YES" ]; then
+  # 確認は人が端末で答える前提。端末につながっていなければ確認できないので消さない。
+  if [ ! -t 0 ]; then
+    echo "標準入力が端末ではなく確認できないため中止しました（何も消していません）。" >&2
+    echo "スクリプトから実行するときは YES=${SKIP_TOKEN}（本番では不可）。" >&2
+    exit 1
+  fi
+  echo "すべて消えます。元に戻せません。"
+  printf '続けるなら yes と入力してください: '
+  read -r answer || answer=""
   if [ "$answer" != "yes" ]; then
     # 利用者が選んだ「やめる」は失敗ではない＝make がエラー表示しないよう 0 で終える。
     echo "中止しました（何も消していません）。"
     exit 0
   fi
+  CONFIRM_WORD="$(hostname -s 2>/dev/null || uname -n 2>/dev/null || true)"
+  CONFIRM_LABEL="この環境の名前"
+  if [ -z "$CONFIRM_WORD" ]; then
+    # 名前が取れないときは、その場で作る 6 桁の乱数を確認コードにする（固定値には倒さない）。
+    CONFIRM_WORD="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+    if ! [[ "$CONFIRM_WORD" =~ ^[0-9]+$ ]]; then
+      echo "確認用の名前も乱数も用意できないため中止しました（何も消していません）。" >&2
+      exit 1
+    fi
+    CONFIRM_WORD="$(printf '%06d' $((CONFIRM_WORD % 1000000)))"
+    CONFIRM_LABEL="確認コード"
+  fi
+  echo
+  echo "本当に実行しますか？ 確認のため、次の語を入力してください。"
+  echo "  ${CONFIRM_LABEL}: ${CONFIRM_WORD}"
+  printf '入力: '
+  read -r answer || answer=""
+  if [ "$answer" != "$CONFIRM_WORD" ]; then
+    echo "名前が一致しません。中止しました（何も消していません）。"
+    exit 0
+  fi
+  COUNTDOWN=5   # 猶予は固定（外から変えられない）
+  while [ "$COUNTDOWN" -gt 0 ]; do
+    printf '\r%s 秒後に消します（Ctrl+C で中止できます）  ' "$COUNTDOWN"
+    sleep 1
+    COUNTDOWN=$((COUNTDOWN - 1))
+  done
+  echo
 fi
 
 # --- 実行 -----------------------------------------------------------------

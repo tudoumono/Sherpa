@@ -7,7 +7,6 @@
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
 
 from sherpa import metering
 
@@ -32,35 +31,12 @@ def test_usage_from_openai_chat_full_and_broken():
     assert metering.usage_from_openai_chat({"usage": "not-a-dict"}) is None
 
 
-def test_usage_from_gemini_output_is_candidates_only():
-    """レビュー是正 major #3: output は candidatesTokenCount のみ（thoughts を混ぜない）。"""
-    data = {"usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20,
-                              "cachedContentTokenCount": 10, "thoughtsTokenCount": 5}}
-    assert metering.usage_from_gemini(data) == {
-        "input_tokens": 100, "cached_input_tokens": 10, "output_tokens": 20, "reasoning_output_tokens": 5}
-    assert metering.usage_from_gemini({}) is None
-    assert metering.usage_from_gemini(None) is None
-
-
 def test_usage_from_ollama_chat_full_and_broken():
     resp = {"message": {"content": "答え"}, "prompt_eval_count": 80, "eval_count": 12}
     assert metering.usage_from_ollama_chat(resp) == {
         "input_tokens": 80, "cached_input_tokens": None, "output_tokens": 12, "reasoning_output_tokens": None}
     assert metering.usage_from_ollama_chat({"message": {"content": "答え"}}) is None
     assert metering.usage_from_ollama_chat(None) is None
-
-
-def test_usage_from_anthropic_dict_and_sdk_object():
-    d = {"input_tokens": 50, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5,
-         "output_tokens": 20}
-    assert metering.usage_from_anthropic(d) == {
-        "input_tokens": 65, "cached_input_tokens": 10, "output_tokens": 20, "reasoning_output_tokens": 0}
-    # SDK オブジェクト（SimpleNamespace で属性アクセスを模す）も同じ式。
-    obj = SimpleNamespace(input_tokens=50, cache_read_input_tokens=10,
-                          cache_creation_input_tokens=5, output_tokens=20)
-    assert metering.usage_from_anthropic(obj) == {
-        "input_tokens": 65, "cached_input_tokens": 10, "output_tokens": 20, "reasoning_output_tokens": 0}
-    assert metering.usage_from_anthropic(None) is None
 
 
 def test_usage_from_openai_embed_and_ollama_embed():
@@ -74,15 +50,11 @@ def test_usage_from_openai_embed_and_ollama_embed():
 
 def test_parsers_never_raise_on_garbage():
     """壊れた/型不正なペイロードは None を返す（例外を出さない）。"""
-    for parser in (metering.usage_from_openai_chat, metering.usage_from_gemini,
+    for parser in (metering.usage_from_openai_chat,
                   metering.usage_from_ollama_chat, metering.usage_from_openai_embed,
                   metering.usage_from_ollama_embed):
         assert parser("not-a-dict") is None
         assert parser(123) is None
-    # usage_from_anthropic は dict でも SDK オブジェクトでもない値を渡されても例外を出さない
-    # （getattr の既定値 None → 属性なし=0 扱い・None そのものだけが None を返す）。
-    assert metering.usage_from_anthropic(object()) == {
-        "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
 
 
 # ---- record() ----

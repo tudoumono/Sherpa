@@ -103,9 +103,9 @@ def test_expired_workspace_files_excludes_live_paths_and_mark_expired_is_idempot
     assert expired["id"] in ids
     assert live["id"] not in ids
 
-    # live_workspace_rel_paths は status='uploaded' のみを見る（expires_at 非依存＝claim 前は含まれる）。
+    # live_workspace_rel_paths は期限切れ（claim 前でも）を含まない。
     paths_before_claim = store.live_workspace_rel_paths(uid)
-    assert {"live.txt", "gone.txt"} <= paths_before_claim
+    assert "live.txt" in paths_before_claim and "gone.txt" not in paths_before_claim
 
     store.claim_workspace_file_expired(expired["id"])   # sweep 相当で status='expired' に遷移
     paths_after_claim = store.live_workspace_rel_paths(uid)

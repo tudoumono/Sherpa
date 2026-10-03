@@ -61,7 +61,7 @@ if [ "${#ONLY_ARGS[@]}" -gt 0 ]; then
     [ "$_a" = "-q" ] && continue
     _FILTERED_ONLY_ARGS+=("$_a")
   done
-  ONLY_ARGS=("${_FILTERED_ONLY_ARGS[@]}")
+  ONLY_ARGS=(${_FILTERED_ONLY_ARGS[@]+"${_FILTERED_ONLY_ARGS[@]}"})
 fi
 
 # --only の境界（tests/unit・tests/contract・tests/api・tests/e2e 配下のみ・tests/integration や
@@ -97,7 +97,7 @@ fi
 
 # --- 同時実行数のスロット確保（上限2・gate-integration.sh と合計で共有・空くまでブロッキングで待つ） ---
 echo "=== レーン $LANE: スロット待ち ($(date +%H:%M:%S))"
-gate_acquire_lane_slot
+gate_acquire_lane_slot || exit 1
 echo "=== レーン $LANE: スロット ${GATE_SLOT_INDEX}/${#GATE_LANE_SLOT_LOCKS[@]} を確保 ($(date +%H:%M:%S))"
 GATE_HELD_FDS=("$GATE_NAMED_LOCK_FD" "$GATE_SLOT_FD")
 

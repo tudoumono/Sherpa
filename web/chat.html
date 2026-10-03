@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="fonts.css">
 <script>document.documentElement.dataset.theme = localStorage.getItem('sherpa-theme') || 'light';</script>
-<script src="vendor/cytoscape.min.js"></script>   <!-- 回答の「参照したナレッジグラフ」用（#5・遅延init） -->
+<script src="vendor/cytoscape.min.js"></script>   <!-- 回答の「参照したナレッジグラフ」用 -->
 <script src="common.js"></script>
 <script src="nav.js"></script>                      <!-- 共通の上部ナビ（コンポーネント）-->
 <style>
@@ -25,7 +25,7 @@
   .bm-tres{padding:0 12px 8px;font-size:var(--text-small)}
   .bm-tres.ok{color:var(--ok)} .bm-tres.danger{color:var(--danger)} .bm-tres.muted{color:var(--ink-3)}
 
-  /* 会話履歴: 検索欄（H2・×ボタンは値がある時だけ表示） */
+  /* 会話履歴: 検索欄（×ボタンは値がある時だけ表示） */
   .histsearch{position:relative;margin:0 0 8px}
   .histsearch input{width:100%;box-sizing:border-box;min-height:36px;padding:6px 30px 6px 10px;
     border:1px solid var(--control-border);border-radius:var(--radius-sm);font-family:inherit;
@@ -33,10 +33,9 @@
   .histsearch-clear{position:absolute;top:50%;right:4px;transform:translateY(-50%);width:26px;height:26px;
     border:none;background:transparent;color:var(--ink-3);font-size:var(--text-body);line-height:1;cursor:pointer;border-radius:6px}
   .histsearch-clear:hover{background:var(--surface-2);color:var(--ink)}
-  /* .conv は display:flex（author 指定）が UA の [hidden]{display:none} より優先されてしまうため、
-     絞り込みで隠す行に明示上書きが要る（.share-overlay[hidden] と同じ理由）。 */
+  /* [hidden] を効かせるため明示上書きする（.share-overlay[hidden] と同じ理由）。 */
   .conv[hidden]{display:none}
-  /* 本文一致の抜粋（.d の下にもう1行・history.js の行構造は変更しない） */
+  /* 本文一致の抜粋（.d の下にもう1行） */
   .hist-snippet{display:block;color:var(--ink-3);font-size:var(--text-caption)}
   /* 会話履歴: セクション見出し */
   .conv-section-head{font-size:var(--text-caption);font-weight:600;color:var(--ink-3);padding:8px 10px 3px;text-transform:uppercase;letter-spacing:.05em}
@@ -70,7 +69,7 @@
   .share-close-x{position:absolute;top:14px;right:16px;background:none;border:none;font-size:var(--text-section);
     color:var(--ink-3);cursor:pointer;padding:2px 6px;border-radius:6px}
   .share-close-x:hover{background:var(--surface-2)}
-  /* SH-2: 既存共有一覧（招待者・期限・状態・取消/更新）。 */
+  /* 既存共有一覧（招待者・期限・状態・取消/更新）。 */
   #share-existing{margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:12px}
   .share-existing-list{max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
   .share-existing-row{display:flex;align-items:center;justify-content:space-between;gap:8px;
@@ -87,7 +86,7 @@
 <sherpa-topbar></sherpa-topbar>
 
 <div class="app">
-  <!-- 左: ロゴ・チャット履歴・開閉（補助）。主要メニューは上部ナビへ移動 -->
+  <!-- 左: ロゴ・チャット履歴・開閉（補助）。主要メニューは上部ナビ -->
   <aside class="pane left">
     <div class="pane-body">
       <div class="lbrand">
@@ -102,7 +101,7 @@
       <div class="hist" id="convlist"></div>
       <div class="muted" id="hist-nohit" style="font-size:var(--text-small);padding:6px" hidden>見つかりません</div>
       <div class="muted" id="hist-search-error" style="font-size:var(--text-small);padding:6px" hidden>本文検索に失敗しました</div>
-      <!-- ユーザー情報・ログアウトは全ページ共通の上部ナビ（右上・sherpa-topbar）へ移動済み -->
+      <!-- ユーザー情報・ログアウトは全ページ共通の上部ナビ（sherpa-topbar）にある。 -->
     </div>
   </aside>
 
@@ -131,9 +130,8 @@
     </div>
     <div class="messages" id="messages"></div>
     <div class="composer">
-      <!-- 入力欄付近のコントロール: 調べ方ブロックの要約チップ＋個人ファイル追加＋頭脳（AI）。
-           調べ方（レンズ）・範囲・探す対象・参照する（社内資料/個人ファイル）は右ペイン下部の
-           固定フッター（#inquiry）へ集約した（SC-6b・docs/archive/2026-08-29-調べ方ブロック.md §2.3）。 -->
+      <!-- 入力欄付近のコントロール: 調べ方ブロックの要約チップ＋個人ファイル追加＋頭脳（AI）。 -->
+      <!-- 調べ方・範囲・探す対象・参照先は右ペイン下部の固定フッター（#inquiry）にある。 -->
       <div class="cbar">
         <button class="inquiry-chip" id="inquiry-chip" type="button" title="やりたいこと・調べる深さ・範囲・探す対象・参照先を設定する">🎯 <b id="inquiry-chip-label">自動 · 全体 · 資料＋コード · 標準</b></button>
         <button class="kbtoggle" id="chat-upload-btn" title="このファイルを本人だけの個人ワークスペースへ保存する">📎 個人ファイルを追加</button>
@@ -166,7 +164,8 @@
         <span class="caret" aria-hidden="true">▾</span>
       </button>
       <div class="inquiry-body" id="inquiry-body">
-        <div class="inquiry-row">
+        <div class="inquiry-note muted" id="simple-note" hidden>ⓘ 簡易は数回だけ検索して答えます。網羅・確証が要るときは Codex 調査へ</div>
+        <div class="inquiry-row" id="lens-row">
           <span class="inquiry-label">やりたいこと</span>
           <div class="seg" id="lens-seg">
             <button class="segbtn on" data-lens="auto" type="button">自動</button>
@@ -205,11 +204,11 @@
           <span class="inquiry-label">参照する</span>
           <button class="kbtoggle on" id="kbtoggle" aria-pressed="true" title="社内ナレッジ（資料）を参照する">📚 社内資料 <b>オン</b></button>
           <button class="kbtoggle" id="personaltoggle" aria-pressed="false" title="自分の個人ファイル（アップロード済み）を参照する">🗂 個人ファイル <b>オフ</b></button>
-          <!-- WEB-1: 管理者が許可し、かつ現在の頭脳が Codex（OpenAI直結）のときだけ表示する（既定は非表示）。 -->
+          <!-- 管理者が許可し、かつ現在の頭脳が Codex（OpenAI直結）のときだけ表示する（既定は非表示）。 -->
           <button class="kbtoggle" id="websearchtoggle" aria-pressed="false" hidden
                   title="Web も参照する（社内資料に加えて・Codex のみ）">🌐 Web 検索 <b>オフ</b></button>
         </div>
-        <!-- SC-6e: 検索経路トグル（試せる場所）。既定閉の「詳細」の中に置き、通常は目に入らないようにする。 -->
+        <!-- 検索経路トグル。既定閉の「詳細」の中に置く。 -->
         <div class="inquiry-details" id="tools-details">
           <button class="inquiry-details-head" id="tools-details-head" type="button" aria-expanded="false" aria-controls="tools-details-body">
             詳細 <span class="caret" aria-hidden="true">▾</span>
@@ -230,8 +229,7 @@
   </aside>
 </div>
 
-<!-- 設定（APIキー・モデル・抽出プロバイダ）は専用ページ settings.html へ集約。
-     チャットの AI/モデルは上部の頭脳バッジ（brainmenu）で完結。 -->
+<!-- 設定（APIキー・モデル・抽出プロバイダ）は専用ページ settings.html にある。チャットの AI/モデルは上部の頭脳バッジ（brainmenu）で完結。 -->
 <div class="toast" id="toast"></div>
 
 <!-- 共有ダイアログ（所有者が共有リンクを発行） -->
@@ -241,7 +239,7 @@
     <h2>会話を共有</h2>
     <div class="sub" id="share-dialog-title"></div>
 
-    <!-- SH-2（再共有）: 既存の共有一覧（招待者・期限・状態・サニタイズ有無・取消/更新）。 -->
+    <!-- 既存の共有一覧（招待者・期限・状態・サニタイズ有無・取消/更新）。 -->
     <div id="share-existing">
       <div class="sub" style="margin-bottom:6px">この会話の共有</div>
       <div id="share-existing-list" class="share-existing-list"></div>

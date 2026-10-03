@@ -1,9 +1,8 @@
 """アプリが頼る外部の道具（LibreOffice・OCR ワーカー等）の導入状況の一覧。
 
-検出は各機能が既に使っている関数を再利用する（ここで検出ロジックを複製しない）。管理画面
-（GET /admin/settings の `required_tools`）と `make doctor` が同じ結果を見る。
-検出はプロセス起動・DB 参照を伴うため結果は短時間キャッシュする（`snapshot(force=True)` で無効化）。
-Docker は見えないため OCR ワーカーのコードの版は扱わない（`make status` が表示する）。
+検出は各機能が使っている関数を再利用する。管理画面（GET /admin/settings の `required_tools`）と `make doctor` が同じ結果を見る。
+結果は短時間キャッシュする（`snapshot(force=True)` で無効化）。
+設計: docs/design/operations.md「起動・停止・状態」
 """
 from __future__ import annotations
 
@@ -90,7 +89,7 @@ def _chromium() -> dict:
                 "npx playwright install chromium（または環境変数 CHROME_PATH に実行ファイルを指定）")
 
 
-_NPM_TRIPLES = {   # scripts/lib/codex_pin.sh::codex_pin_path_codex_has_accessories と同じ対応
+_NPM_TRIPLES = {  # scripts/lib/codex_pin.sh::codex_pin_path_codex_has_accessories と同じ対応
     ("Linux", "x86_64"): "x86_64-unknown-linux-musl",
     ("Linux", "aarch64"): "aarch64-unknown-linux-musl",
     ("Darwin", "arm64"): "aarch64-apple-darwin",
@@ -104,8 +103,7 @@ def _codex_exe() -> str | None:
 
 
 def _codex_roots(exe: str) -> list[Path]:
-    """codex 実行ファイルから見た付属物のルート候補（`codex-resources/`・`codex-path/` を持つ親）。
-    Codex 自身が実行ファイル相対で探す配置と、npm 版（実体が .js）の同梱 vendor ディレクトリ。"""
+    """codex 実行ファイルから見た付属物のルート候補（`codex-resources/`・`codex-path/` を持つ親）。"""
     real = Path(os.path.realpath(exe))
     roots = [real.parent.parent]
     if real.suffix == ".js":
@@ -125,7 +123,7 @@ def _find_accessory(exe: str | None, rel: tuple[str, ...], path_name: str) -> st
 
 
 def codex_cli_missing() -> bool:
-    """Codex 調査に必須なのは codex 本体だけ（bwrap・rg は付属物＝見つからなくても構成は選べる）。"""
+    """Codex 調査に必須なのは codex 本体だけ（bwrap・rg は付属物）。"""
     return _codex_exe() is None
 
 

@@ -46,6 +46,15 @@ def _clean_ratelimit_state():
     ratelimit._reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _audit_writer_running():
+    """このファイルは lifespan 無しの TestClient を使う。先行テストが lifespan を閉じると監査 writer が
+    明示停止のまま残り監査行が書かれないため、各テストの前に起動し直す。"""
+    from sherpa import ext_api
+    ext_api._audit_writer.start()
+    yield
+
+
 # ===== ログイン失敗バックオフ =====
 
 def test_login_lockout_after_5_failures_then_correct_password_still_429():

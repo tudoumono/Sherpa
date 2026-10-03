@@ -103,7 +103,7 @@ def test_mention_edge_uses_full_token_and_does_not_link_to_unrelated_prefix(tmp_
 
 # ---- 長さ下限 --------------------------------------------------------------------------------
 
-def test_min_len_filters_short_names_env_adjustable(tmp_path, monkeypatch):
+def test_min_len_filters_short_names_by_constant(tmp_path, monkeypatch):
     wd = _world(tmp_path, {"g1/a.fk": "x", "g1/note.md": "この文書は ABC に言及する。"})
     defs = {"g1/a.fk": _def("Module", "ABC")}    # 3文字＝既定4文字未満
     monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
@@ -111,7 +111,7 @@ def test_min_len_filters_short_names_env_adjustable(tmp_path, monkeypatch):
     _, edges, _ = world_graph.build_world(wd, "w")
     assert _mention_edges(edges) == []
 
-    monkeypatch.setenv("SHERPA_MENTION_MIN_LEN", "3")
+    monkeypatch.setattr(world_graph, "_MENTION_MIN_LEN", 3)
     _, edges, _ = world_graph.build_world(wd, "w")
     doc_edges = _mention_edges(edges)
     assert len(doc_edges) == 1
@@ -267,7 +267,7 @@ def test_mention_overflow_caps_edges_and_flags_the_excess(tmp_path, monkeypatch)
     })
     defs = {"g1/a.fk": _def("Module", "NAME-ONE"), "g1/b.fk": _def("Module", "NAME-TWO")}
     monkeypatch.setattr(registry, "_ANALYZERS", (_FakeAnalyzer(defs),))
-    monkeypatch.setenv("SHERPA_MENTION_MAX_PER_DOC", "1")
+    monkeypatch.setattr(world_graph, "_MENTION_MAX_PER_DOC", 1)
 
     _, edges, flags = world_graph.build_world(wd, "w")
     doc_edges = _mention_edges(edges)
@@ -334,8 +334,8 @@ def test_mention_edge_is_documents_type_reachable_via_related_rel(tmp_path, monk
 # ---- 言及エッジの実効設定は world 署名の材料に含まれる（rv-s2-mention #2） ------------------------
 
 def test_world_signature_changes_with_mention_min_len_and_max_per_doc(monkeypatch, tmp_path):
-    """`SHERPA_MENTION_MIN_LEN`/`SHERPA_MENTION_MAX_PER_DOC` の実効値は `worker.world_signature`
-    （`worker._sig` の材料）に含まれる——env を変えると、ソースファイル自体が不変でも署名が
+    """言及エッジのしきい値（`_MENTION_MIN_LEN`/`_MENTION_MAX_PER_DOC`）の実効値は `worker.world_signature`
+    （`worker._sig` の材料）に含まれる——値を変えると、ソースファイル自体が不変でも署名が
     変わる。旧実装は `world_graph.MENTION_SCHEMA_VERSION`（仕様版）だけを材料にしており、
     設定変更後も既存 world の言及エッジが旧しきい値のまま素通りしていた。"""
     from sherpa.ingest import worker
@@ -345,14 +345,12 @@ def test_world_signature_changes_with_mention_min_len_and_max_per_doc(monkeypatc
 
     sig_default = worker.world_signature_of_root(wd)
 
-    monkeypatch.setenv("SHERPA_MENTION_MIN_LEN", "6")
-    sig_min_len = worker.world_signature_of_root(wd)
-    assert sig_min_len != sig_default
-    monkeypatch.delenv("SHERPA_MENTION_MIN_LEN", raising=False)
+    with monkeypatch.context() as m:
+        m.setattr(world_graph, "_MENTION_MIN_LEN", 6)
+        assert worker.world_signature_of_root(wd) != sig_default
     assert worker.world_signature_of_root(wd) == sig_default, "既定値へ戻せば署名も再現する"
 
-    monkeypatch.setenv("SHERPA_MENTION_MAX_PER_DOC", "50")
-    sig_max_per_doc = worker.world_signature_of_root(wd)
-    assert sig_max_per_doc != sig_default
-    monkeypatch.delenv("SHERPA_MENTION_MAX_PER_DOC", raising=False)
+    with monkeypatch.context() as m:
+        m.setattr(world_graph, "_MENTION_MAX_PER_DOC", 50)
+        assert worker.world_signature_of_root(wd) != sig_default
     assert worker.world_signature_of_root(wd) == sig_default

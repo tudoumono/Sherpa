@@ -1,27 +1,9 @@
-"""Excel（.xlsx）の生 OOXML 抽出層（DOC-IR-004・パッケージ docstring＝`sherpa/ingest/ooxml/__init__.py` 参照）。
+"""Excel（.xlsx）の生 OOXML 抽出層。`arms/ooxml_arm._build_xlsx_ir` が消費する純関数群で、MD が表示しない構造（非表示シート/行/列・名前付き範囲・コメント・ハイパーリンク・外部ブック参照・取り消し線・画像の存在）と連続領域 `regions()` を取り出す。`regions()` は `office_md._xlsx_md`（`human_md.render_xlsx` 経由）とも共有する。
 
-`arms/ooxml_arm._build_xlsx_ir` が消費する純関数群。H2（`docs/archive/2026-08-28-人間向けMDの刷新.md`）
-以降、`office_md._xlsx_md`（人間向け MD・`human_md.render_xlsx` 経由）も本モジュールの `regions()` を
-document-ir と共有する共通土台として消費する（旧・シート丸ごと1枚の打切り付きパイプ表は撤去済み）。
-
-すべて純関数・決定的（走査・辞書・リスト順を必ずソートで固定）・LLM 不使用。壊れた/欠落した OOXML パート
-（`xl/externalLinks/*` 等）は例外を投げず空へ縮退する（`ooxml/word.py`／`ooxml/powerpoint.py` と同じ
-fail-safe 方針）。
-
-**`load_two` の値用ロード（`wb_values`）は read_only=False（通常ロード）を使う**（設計判断）:
-`openpyxl` の read_only ワークシート（`ReadOnlyWorksheet`）は `merged_cells`／`row_dimensions`／
-`column_dimensions`／セル単位の `hyperlink`／`comment` を持たない（ストリーミング読み取りのため）。
-本モジュールは結合セル・非表示行列・ハイパーリンク・コメントをすべて抽出する必要があるため、
-値用だけは通常ロード（全セルをメモリに展開）を選ぶ。トレードオフ: 巨大シートでの通常ロードは
-`read_only=True` より重い。ここは `regions()`／`formulas()`／`cell_hyperlinks()`／`cell_comments()`
-側のcap（行・列上限と`DEFAULT_CAP_CELLS`の総セル予算）が上限を守る（詳細は各関数 docstring）。
-数式用ロード（`wb_formula`）は上記のリッチな属性を必要としないため `read_only=True`（軽量な
-ストリーミング読み込み）を使う（`load_two` docstring 参照）——openpyxl は同一ワークブックを
-「表示値（キャッシュ）」と「数式文字列」を同時に返す API を持たないため2回のロード自体は残るが、
-うち1回（値用）だけが「重い」通常ロードで足りる。
-
-**「表・連続領域・設定欄」の意味分類はしない**（孤立セルも小さな `Region` として出す）。意味分類（ヘッダ/
-データ/設定欄の判別）は検索用表現生成層（RAG-REP）の責務。
+決定的な純関数（走査・辞書・リスト順はソートで固定）。壊れた/欠落したパートは例外を投げず空へ縮退する。
+`load_two` の値用ロード（`wb_values`）は `read_only=False` を使う（結合セル・非表示行列・ハイパーリンク・コメントの取得に通常ロードが必要なため）。数式用ロード（`wb_formula`）は `read_only=True`。巨大シートは `regions()`／`formulas()`／`cell_hyperlinks()`／`cell_comments()` の行・列上限と `DEFAULT_CAP_CELLS`（総セル予算）で頭打ちにする。
+「表・連続領域・設定欄」の意味分類はしない（孤立セルも小さな `Region` として出す）。意味分類は検索用表現生成層の責務。
+設計: docs/design/rag.md「アーム一覧」
 """
 from __future__ import annotations
 
@@ -31,45 +13,28 @@ from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
 _RELS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
-# HM1（人間向けMDの画像存在注記）専用の最小限のネームスペース。`evidence_spike.py` の `_xlsx_objects`
-# （z_order・図形種別・アセット解決・覆い判定まで含むフル実装）とは目的が異なる——ここでは「シートに
-# 画像が何枚あるか」という存在だけの事実を得れば足りるため、独立の軽量スキャナとして持つ（意図的に
-# 二重実装を避けなかった＝完全な図形解析を人間向けMD側へ持ち込まない設計判断）。
+# シートに画像が何枚あるかの存在だけを得るための最小限のネームスペース（図形解析は `evidence_spike.py` の `_xlsx_objects` が担う）。
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _SML = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
 
-# 巨大シートの安全弁。行数だけを固定値へ縛ると狭い長大表を途中で失うため、Excel の実際の上限
-# （行 1,048,576・列 16,384＝XFD）に加えて総走査セル数 5,000,000 を安全弁として持つ（人間向け MD の
-# 「全量方針」＝正典 §10 裁定#1 の「セル数の安全弁付き」はこの `DEFAULT_CAP_CELLS` を指す）。
-# 列上限は Excel の実仕様値（16,384）を使う（独自の追加制限を持たず全量方針＝正典 §10 裁定#1と
-# 整合させる）。狭い表ほど多くの行を読める一方、列数が多いシートほど `effective_cap_rows` が行数側を
-# 絞ってセル数予算を守る。`regions()` は有効上限を呼び出し側から明示的に受け取る（テストで
-# 小さい値へ差し替えて truncated を固定しやすくするため）。`formulas`/`cell_hyperlinks`/`cell_comments` は
-# 同じ定数をモジュール属性として**呼び出し時に**参照する（関数のデフォルト引数値ではなく関数本体で
-# `DEFAULT_CAP_ROWS`/`DEFAULT_CAP_COLS` を直接読む）ため、`monkeypatch.setattr(excel, "DEFAULT_CAP_ROWS", …)`
-# 一箇所で全スキャン系関数の上限を差し替えられる（デフォルト引数値は def 時に束縛されて monkeypatch が
-# 効かない、という定石の罠を避けるための設計＝`_build_xlsx_ir` もこの2定数を都度モジュール属性として読む）。
+# 巨大シートの安全弁。行・列上限は Excel の実上限（行 1,048,576・列 16,384）で、加えて総走査セル数 `DEFAULT_CAP_CELLS`（5,000,000）で頭打ちにする（列数が多いシートほど `effective_cap_rows` が行数側を絞る）。`regions()` は有効上限を呼び出し側から受け取る。`formulas`/`cell_hyperlinks`/`cell_comments` は `DEFAULT_CAP_ROWS`/`DEFAULT_CAP_COLS` を呼び出し時にモジュール属性として読む（`monkeypatch.setattr(excel, ...)` で差し替えられる）。
 DEFAULT_CAP_ROWS = 1_048_576
 DEFAULT_CAP_COLS = 16_384
 DEFAULT_CAP_CELLS = 5_000_000
 
 
 def effective_cap_rows(sheet_max_column: int | None) -> int:
-    """列数に応じた行走査上限。総セル予算を超えず、固定10,000行による狭い長大表の欠落を避ける。"""
+    """列数に応じた行走査上限（総セル予算を超えない範囲で、狭い長大表を欠落させない）。"""
     columns = max(1, min(sheet_max_column or 1, DEFAULT_CAP_COLS))
     return max(1, min(DEFAULT_CAP_ROWS, DEFAULT_CAP_CELLS // columns))
 
 
 @dataclass
 class Region:
-    """連続領域（非空セルの4連結成分を、隣接表の癒着解消のため最大矩形へ分割したもの）の外接矩形
-    （`regions()` の戻り値要素）。
+    """連続領域（非空セルの4連結成分を、隣接表の癒着解消のため最大矩形へ分割したもの）の外接矩形（`regions()` の戻り値要素）。
 
-    `min_row`/`max_row`/`min_col`/`max_col` は1-based の絶対シート座標。`range` は Excel A1形式
-    （例 `"A1:C10"`）。`truncated` は cap（行/列の走査上限）に到達した領域だけ True（cap 超過の黙認防止・
-    「打切りの結果このサイズになった」ことを明示するフラグであり、それ以上続きがあるとは限定しないが
-    可能性を示す）。
+    `min_row`/`max_row`/`min_col`/`max_col` は1-based の絶対シート座標。`range` は A1形式（例 `"A1:C10"`）。`truncated` は cap（行/列の走査上限）に到達した領域だけ True。
     """
     min_row: int
     max_row: int
@@ -77,72 +42,38 @@ class Region:
     max_col: int
     range: str
     truncated: bool = False
-    # この領域が**実際に所有する**セル座標（外接矩形どうしが重なった時、他領域の非空セルを bbox 走査で
-    # 重複出力したり数式を誤った親へ紐付けたりしないための正本）。背景色付き・結合セルの継続セルなど
-    # 値を持たない座標も、連結性維持のために占有扱いされたものは含みうる（`value_cell_count` は値を
-    # 持つセルだけを数える）。
+    # この領域が実際に所有するセル座標（外接矩形どうしが重なっても重複出力しないための正本）。値を持たない占有セル（背景色付き・結合セルの継続セル）も含みうる（`value_cell_count` は値を持つセルだけを数える）。
     cells: frozenset = frozenset()
-    # 表候補スコア算出の元になった値セル数・密度（`_region_score` 参照）。抑制（表示/索引から外す）は
-    # 行わず、判断材料として保持するだけ＝閾値判断は消費側（renderer 等）の責務。
+    # 表候補スコアの元になった値セル数・密度（`_region_score`）。抑制はせず判断材料として保持する（閾値判断は消費側の責務）。
     value_cell_count: int = 0
     density: float = 0.0
     score: float = 0.0
-    # True の場合、この外接矩形は「範囲内は全セル占有」を保証するヒストグラム法の抽出結果ではなく、
-    # 面積上限（`_MAX_RECT_DECOMPOSE_CELLS`）・シート全体の反復回数/領域数予算（`_MAX_RECT_SPLITS_PER_SHEET`/
-    # `_MAX_REGIONS_PER_SHEET`）のいずれかに達したことで単純な外接矩形へ縮退した結果を示す。この場合
-    # bbox の内部に非占有セルを含みうる（`cells` だけが所有座標の正本＝重複出力防止のownership解決は
-    # 従来どおり `cells` を使えば安全）。消費側（human MD レンダラ・rag.md レンダラ等）が表の見た目の
-    # 精度（隣接表の癒着解消がどこまで効いたか）を判断する材料として利用する。
+    # True の場合、この外接矩形はヒストグラム法の抽出結果ではなく、面積上限（`_MAX_RECT_DECOMPOSE_CELLS`）またはシート全体の予算（`_MAX_RECT_SPLITS_PER_SHEET`/`_MAX_REGIONS_PER_SHEET`）に達して単純な外接矩形へ縮退したもの。bbox の内部に非占有セルを含みうる（所有座標の正本は `cells`）。
     split_budget_exhausted: bool = False
 
 
-# 表候補スコア（`score`）算出時、値セル数がこの件数に達するまでは密度を按分して割り引く（孤立した1〜数
-# セルが常に score=density の高評価になるのを防ぐ、緩やかな下駄＝ハード閾値ではなく連続的な補正）。
+# 表候補スコア算出時、値セル数がこの件数に達するまでは密度を按分して割り引く（孤立した1〜数セルが高評価にならないようにする緩やかな補正）。
 _SCORE_MIN_CELLS = 4
 
-# ヒストグラム法による最大矩形の反復抽出（`_split_component`）の計算量安全弁。連結成分の外接矩形面積が
-# これを超える場合は分割を行わず単一の外接矩形のまま返す（巨大な単一表を割っても得るものが無い一方、
-# 計算量だけが増えるため）。
-#
-# HM1（`docs/archive/2026-09-02-RAG表現の全形式展開と文脈保持.md` §8.4 の L1 実測での「excel2md に
-# 負けた」唯一の箇所）: 旧値 5,000 では JPX-021.xlsx の「統合設計」シートの2連結成分（A30:Z289＝面積
-# 6,760・A291:N654＝面積5,096）がどちらも分割されず単一外接矩形へ縮退していた。5,000→20,000へ引き上げ
-# （選択肢(a)。選択肢(b)＝上限超過成分を再帰的に半分割してから分割する案は「崖を無くせる」利点は
-# あるが、`_split_component`/`regions()` のシート全体予算（`_MAX_RECT_SPLITS_PER_SHEET`/
-# `_MAX_REGIONS_PER_SHEET`）との整合を再帰全体で保つ実装が重く、上限自体は今回も撤廃しない
-# （`split_budget_exhausted` の自己申告は残る）以上、値を上げるだけで実害のあるケースを解消できるなら
-# 複雑さに見合わないと判断した）。実測（JPX-021.xlsx 実データ・`_build_xlsx_ir`＋`human_md.render_xlsx`
-# フル実行）: 旧値5,000＝0.856秒（縮退2件）→ 新値20,000＝0.733秒（縮退0件・退行なし、僅かな高速化は
-# 縮退回避で巨大単一表の描画コストが減ったため）。新値は依然として崖を上へ動かしただけだが
-# （選択肢(a)の性質上残る既知の限界）、実務のExcelファイルで単一連結成分が20,000セルを超える
-# ケースは非常に稀という判断。合成の最悪ケース（櫛形パターン・連結成分が密ではなく細長い）で
-# 面積40,000・`_MAX_RECT_SPLITS_PER_SHEET`一杯の32回反復だと0.72秒程度（実測）——シート全体の
-# 反復予算（64回）で頭打ちになるため、1シートあたりの最悪コストは新値でも数秒以内に収まる。
+# ヒストグラム法による最大矩形の反復抽出（`_split_component`）の計算量安全弁。連結成分の外接矩形面積がこれを超える場合は分割せず単一の外接矩形のまま返す。
 _MAX_RECT_DECOMPOSE_CELLS = 20_000
-# 1連結成分あたりの最大分割反復回数。到達時点で残りのセルは4連結成分ごとの外接矩形へまとめて必ず出力する
-# （分割の粒度が粗くなるだけで、セルが失われることはない＝完全性は反復回数の上限とは独立に保たれる）。
+# 1連結成分あたりの最大分割反復回数。到達後の残りのセルは4連結成分ごとの外接矩形へまとめて出力する（セルは失われない）。
 _MAX_RECT_SPLITS = 32
 
-# シート全体での安全弁。`_MAX_RECT_DECOMPOSE_CELLS`/`_MAX_RECT_SPLITS` は連結成分1つあたりの上限のため、
-# 分割を要する連結成分（例: 櫛形の孤立成分）が同一シートに多数あると合計コストは頭打ちにならない。
-# `regions()` は連結成分を処理するたびにこの2つの予算を消費し、どちらかを使い切った時点以降の連結成分は
-# ヒストグラム分割を行わず単一の外接矩形にフォールバックする（セルが失われることはない＝完全性はシート
-# 全体の予算とも独立に保たれる）。
+# シート全体での安全弁（`_MAX_RECT_DECOMPOSE_CELLS`/`_MAX_RECT_SPLITS` は連結成分1つあたりの上限）。`regions()` は連結成分を処理するたびにこの2つの予算を消費し、使い切った以降の成分は分割せず単一の外接矩形にする（セルは失われない）。
 _MAX_RECT_SPLITS_PER_SHEET = 64
 _MAX_REGIONS_PER_SHEET = 256
 
 
 def _region_score(value_cell_count: int, area: int) -> tuple[float, float]:
-    """`(density, score)` を返す（`Region.density`/`Region.score` と `expand_regions_for_merges` の
-    再計算で共有する単一の算出ロジック）。"""
+    """`(density, score)` を返す（`Region` と `expand_regions_for_merges` の再計算で共有する算出ロジック）。"""
     density = value_cell_count / area if area else 0.0
     taper = min(1.0, value_cell_count / _SCORE_MIN_CELLS) if _SCORE_MIN_CELLS else 1.0
     return density, density * taper
 
 
 def _connected_subcomponents(cells: set[tuple[int, int]]) -> list[set[tuple[int, int]]]:
-    """`cells`（1-based 座標集合）を4連結成分（上下左右のみ）に分割する（`(min_row, min_col)` が
-    最小の座標から見つかる順・決定的）。"""
+    """`cells`（1-based 座標集合）を4連結成分（上下左右のみ）に分割する（`(min_row, min_col)` が最小の座標から見つかる順・決定的）。"""
     visited: set[tuple[int, int]] = set()
     out: list[set[tuple[int, int]]] = []
     for start in sorted(cells):
@@ -165,12 +96,9 @@ def _connected_subcomponents(cells: set[tuple[int, int]]) -> list[set[tuple[int,
 
 def _extract_max_rectangle(occ: set[tuple[int, int]], min_row: int, max_row: int,
                            min_col: int, max_col: int) -> tuple[int, int, int, int]:
-    """`occ` のうち `[min_row,max_row]×[min_col,max_col]` 範囲内で、全セルが `occ` に含まれる
-    最大面積の矩形を1つ `(top, left, bottom, right)` で返す（ヒストグラム法・モノトニックスタック・
-    O(範囲の行数×列数)）。`occ` はこの範囲内に必ず1セル以上を含む前提（空なら呼び出し側の誤り）。
+    """`occ` のうち `[min_row,max_row]×[min_col,max_col]` 範囲内で、全セルが `occ` に含まれる最大面積の矩形を1つ `(top, left, bottom, right)` で返す（ヒストグラム法・モノトニックスタック）。
 
-    同面積の解が複数あれば `(top, left)` が最小の物を選ぶ（決定的なタイブレーク・同じ入力に対し
-    常に同じ分割結果になることを保証する）。
+    同面積の解が複数あれば `(top, left)` が最小の物を選ぶ（決定的）。`occ` はこの範囲内に必ず1セル以上を含む前提。
     """
     n_cols = max_col - min_col + 1
     heights = [0] * n_cols
@@ -179,7 +107,7 @@ def _extract_max_rectangle(occ: set[tuple[int, int]], min_row: int, max_row: int
     for r in range(min_row, max_row + 1):
         for ci in range(n_cols):
             heights[ci] = heights[ci] + 1 if (r, min_col + ci) in occ else 0
-        stack: list[tuple[int, int]] = []          # (開始列index, 高さ)
+        stack: list[tuple[int, int]] = []  # (開始列index, 高さ)
         for ci in range(n_cols + 1):
             h = heights[ci] if ci < n_cols else 0
             start = ci
@@ -200,31 +128,11 @@ def _split_component(component: set[tuple[int, int]], min_row: int, max_row: int
                      min_col: int, max_col: int, *,
                      max_splits: int, max_regions: int
                      ) -> tuple[list[tuple[frozenset, int, int, int, int, bool]], int]:
-    """1つの4連結成分をヒストグラム法の最大矩形反復抽出で分割し、`([(所有セル集合, min_row, min_col,
-    max_row, max_col, split_budget_exhausted), ...], 実際に使った反復回数)` を返す（隣接する複数表の
-    癒着解消）。呼び出し側で `(min_row, min_col)` 順に並べ直すこと。
+    """1つの4連結成分をヒストグラム法の最大矩形反復抽出で分割し、`([(所有セル集合, min_row, min_col, max_row, max_col, split_budget_exhausted), ...], 実際に使った反復回数)` を返す。呼び出し側で `(min_row, min_col)` 順に並べ直すこと。
 
-    `max_splits`は呼び出し側が渡す**この呼び出し1回あたりの**反復回数上限、`max_regions`は
-    **この呼び出し1回が出力してよい領域数の上限**（いずれも `regions()` がシート全体の予算の残量を
-    計算して渡す・唯一の呼び出し元＝`regions()` が常に整数で渡すため両方必須引数）。
-
-    アルゴリズム: まず `max_splits` にだけ従って「自然な」分割（ヒストグラム抽出を反復し、打ち切った
-    残りは4連結成分ごとの断片に分ける）を最後まで計算する。この時点では `max_regions` を一切考慮
-    しない——**分割結果の件数を先に確定させてから予算と突き合わせる**（部分的に分割を進めてから
-    途中で日和ると、既に出力済みの件数＋残りをまとめた1件が `max_regions` を超えてしまう罠がある。
-    例: `max_regions=1` の3セルL字成分に対し「まず1回だけ抽出→まだ2セル残っている→それを1件に
-    まとめて追加」とすると合計2件になり予算を超える）。自然な分割の件数が `max_regions` に収まれば
-    そのまま採用する。収まらなければ**分割そのものを行わず**、成分全体を1つの外接矩形へ丸ごと畳む
-    （保証された1件だけを使う＝予算を超えることは絶対にない）。外接矩形面積が
-    `_MAX_RECT_DECOMPOSE_CELLS` を超える成分・`max_splits`/`max_regions` が0（呼び出し時点で予算切れ）
-    の場合も同様に単一の外接矩形のまま返す。
-
-    完全性（silent-drop ゼロ）はどちらの経路でも保たれる（採用する分割結果・畳んだ単一矩形のいずれも
-    `cells`（`Region.cells` 相当）の和集合は元の成分全体と一致する）。
-
-    `split_budget_exhausted`（各出力要素の6番目）は、その領域が「範囲内は全セル占有」を保証する
-    ヒストグラム抽出そのものではなく、上記いずれかの上限到達によるフォールバックで生成されたかを示す
-    （`Region.split_budget_exhausted` docstring 参照）。
+    `max_splits` は反復回数上限、`max_regions` はこの呼び出しが出力してよい領域数の上限（どちらも `regions()` がシート全体の予算の残量から渡す）。
+    ① `max_splits` に従って自然な分割（反復抽出し、打ち切った残りは4連結成分ごとの断片）を最後まで計算する。② その件数が `max_regions` に収まれば採用する。③ 収まらなければ分割せず、成分全体を1つの外接矩形に畳む（予算を超えない）。外接矩形面積が `_MAX_RECT_DECOMPOSE_CELLS` を超える成分、予算が0の場合も単一の外接矩形のまま返す。
+    どの経路でも `cells` の和集合は元の成分全体と一致する。`split_budget_exhausted` は上限到達のフォールバックで生成された領域かを示す。
     """
     area = (max_row - min_row + 1) * (max_col - min_col + 1)
     if area > _MAX_RECT_DECOMPOSE_CELLS or max_splits <= 0 or max_regions <= 0:
@@ -243,7 +151,7 @@ def _split_component(component: set[tuple[int, int]], min_row: int, max_row: int
         natural.append((rect_cells, top, left, bottom, right, False))
         remaining -= rect_cells
         splits += 1
-    if remaining:                                          # 反復回数上限で打ち切った残りを断片ごとに
+    if remaining:  # 反復回数上限で打ち切った残りを断片ごとに
         for sub in _connected_subcomponents(remaining):
             sr = [r for r, _ in sub]
             sc = [c for _, c in sub]
@@ -251,27 +159,14 @@ def _split_component(component: set[tuple[int, int]], min_row: int, max_row: int
 
     if len(natural) <= max_regions:
         return natural, splits
-    # 自然な分割結果が予算に収まらない: 部分的な結果を採用すると合計が max_regions を超えてしまうため、
-    # 分割そのものを諦めて成分全体を1つの外接矩形へ畳む（保証された1件のみ使用・完全性は cells で保つ）。
-    # 反復に使った splits（計算コスト）はシート全体の予算から差し引くため、そのまま正直に返す。
+    # 自然な分割結果が予算に収まらない: 成分全体を1つの外接矩形へ畳む（保証された1件のみ使用）。反復に使った splits はシート全体の予算から差し引くため、そのまま返す。
     return [(frozenset(component), min_row, min_col, max_row, max_col, True)], splits
 
 
 def load_two(p):
     """openpyxl で `p` を2回ロードする（`(wb_values, wb_formula)`）。
 
-    `wb_values`=`data_only=True`（表示=キャッシュ済み計算値）・`read_only=False`（モジュール docstring
-    の判断根拠を参照＝結合セル/非表示行列/ハイパーリンク/コメントの取得に通常ロードが必要）。
-
-    `wb_formula`=`data_only=False`（数式文字列）は `read_only=True`（ストリーミング）で読む:
-    消費側（`formulas()`）は `iter_rows()`/`.value`/`.row`/`.column`/`.coordinate` しか使わず、
-    `read_only` ワークシートが持たない `merged_cells`／`row_dimensions`／セル単位の `hyperlink`／
-    `comment` を必要としない（それらは全て `wb_values` 側から取る）。1ファイルにつき「重い」通常
-    ロードを2回払う必要は無く、数式抽出専用の軽量ストリーミング読み込み1回で足りる（openpyxl は
-    同一ワークブックを「表示値（キャッシュ）」と「数式文字列」を同時に返す API を持たないため
-    2回のロード自体は残るが、うち1回を大幅に軽くする＝`_build_xlsx_ir` docstring にも記載）。
-    呼び出し側は使用後に両方を `close()` すること（fail-safe な後始末は呼び出し側の責務＝
-    `_build_xlsx_ir` が `finally` で行う）。
+    `wb_values`＝`data_only=True`（キャッシュ済み計算値）・`read_only=False`（結合セル/非表示行列/ハイパーリンク/コメントの取得に通常ロードが必要）。`wb_formula`＝`data_only=False`（数式文字列）・`read_only=True`（ストリーミング。`formulas()` が `iter_rows()` 等しか使わないため）。呼び出し側は使用後に両方を `close()` すること。
     """
     import openpyxl
     wb_values = openpyxl.load_workbook(p, data_only=True, read_only=False)
@@ -280,9 +175,7 @@ def load_two(p):
 
 
 def sheet_states(wb) -> list[dict]:
-    """ワークブック内の全シートを**ブック内順**で `{"name": <タイトル>, "state": "visible"|"hidden"|"veryHidden"}`
-    のリストにする（`wb.worksheets` の順序＝ファイル内のシート順をそのまま使う＝決定的）。
-    """
+    """ワークブック内の全シートをブック内順で `{"name": <タイトル>, "state": "visible"|"hidden"|"veryHidden"}` のリストにする。"""
     return [{"name": ws.title, "state": ws.sheet_state} for ws in wb.worksheets]
 
 
@@ -294,63 +187,19 @@ def _range_str(min_r: int, min_c: int, max_r: int, max_c: int) -> str:
 def regions(ws_values: list[list], cap_rows: int, cap_cols: int, *,
            merged: dict[tuple[int, int], dict] | None = None,
            filled: set[tuple[int, int]] | None = None) -> list["Region"]:
-    """非空セルの4連結成分（上下左右のみ・斜めは繋がない）を、隣接する複数表の癒着を解消するため最大矩形へ
-    分割し、`Region` のリストで返す。
+    """非空セルの4連結成分（上下左右のみ）を、隣接する複数表の癒着を解消するため最大矩形へ分割し、`Region` のリストで返す。
 
-    `ws_values` は**既に呼び出し側が cap+1 まで有界化した**値グリッド（行のリストのリスト・
-    `None`＝空セル）: `_build_xlsx_ir` が `ws.max_row`/`ws.max_column`（実使用範囲）と `cap_rows+1`/
-    `cap_cols+1` の小さい方まで `iter_rows(values_only=True)` で読み取ったものを渡す契約（本関数自体は
-    渡された grid の総量を制限しない＝有界化は呼び出し側の責務。理由: openpyxl の通常ワークシートは
-    `max_row`/`max_col` を明示指定した `iter_rows` に対し、実データが疎でも指定範囲まるごとの空セルを
-    生成するため、**シートの実使用範囲を超えて**大きな cap をいきなり指定すると小さなシートでも遅くなる
-    ＝呼び出し側が実使用範囲と cap の小さい方で読むことで通常サイズのシートは高速なまま、cap は
-    「本当に巨大/巨大と自称するシート」だけを頭打ちにする安全弁として働く）。
+    `ws_values` は呼び出し側が cap+1 まで有界化した値グリッド（行のリストのリスト・`None`＝空セル）。`_build_xlsx_ir` が `ws.max_row`/`ws.max_column` と `cap_rows+1`/`cap_cols+1` の小さい方まで読んで渡す（本関数は grid の総量を制限しない）。
+    `merged`（`merged_map()` の戻り値）・`filled`（背景色付きセルの1-based座標集合・`filled_cells()`）は省略可。値を持たなくても占有として扱う:
+    - 背景色: `filled` の座標は占有マスにする。
+    - 結合セル: 結合範囲内のいずれかのセルが占有済みなら範囲の全セルを占有にする。範囲内が完全に空かつ無地なら占有にしない。
 
-    `merged`（`merged_map()` の戻り値と同じ形）・`filled`（背景色付きセルの1-based座標集合・
-    `filled_cells()` 参照）は**値を持たなくても占有として扱う**追加情報（いずれも省略可＝値のみの
-    占有判定にフォールバック）:
+    ① `ws_values` を `cap_rows`×`cap_cols` に切り詰めて占有マスを求める。② 行優先で未訪問の占有マスから BFS して4連結成分を確定する。③ 各成分を `_split_component` で分割する（1成分から複数の `Region` が生まれうる）。分割コストはシート全体で `_MAX_RECT_SPLITS_PER_SHEET`（反復回数）・`_MAX_REGIONS_PER_SHEET`（出力数）の予算を共有する。
 
-    - **背景色**: `filled` に含まれる座標は値の有無に関わらず占有マスにする（値が空でも塗り分け
-      レイアウトの区画を取りこぼさない）。「背景色」の定義自体（単色/縞模様/グラデーション塗り・
-      白／自動／テーマ背景1の除外・条件付き書式は対象外）は `filled_cells()`/`_fill_is_colored()`
-      docstring 参照（`regions()` 自体は `filled` の中身の妥当性を判定しない＝呼び出し側の責務）。
-    - **結合セル**: 1つの結合範囲内の**いずれかのセルが占有済み**（値がある、または背景色付き）なら、
-      その範囲の全セル（anchor・非anchor 継続セルとも）を占有にする。逆に範囲内が完全に空かつ無地なら
-      占有にしない（罫線・spacer 目的の空結合まで表候補化するのを避ける）。これにより、値の無い結合の
-      広がりだけで隣接する2つの値クラスタを繋いでいる特殊なレイアウトでも、正しく1つの連結成分として
-      検出できる。
-
-    アルゴリズム: `ws_values` を `cap_rows`×`cap_cols` に切り詰めた上で占有マス（非空セル＋上記の
-    背景色/結合による追加占有）を求め、行優先で未訪問の占有マスを見つけるたびに BFS で4連結成分を1つ
-    確定する。各連結成分は、そのままでは外接矩形が隣接する別の表を巻き込みうるため、ヒストグラム法に
-    よる最大矩形の反復抽出（`_split_component`）でさらに分割する（1連結成分から複数の `Region` が
-    生まれうる＝表が2つ癒着していたケースは通常2つの `Region` に分かれる）。分割コストはシート全体で
-    `_MAX_RECT_SPLITS_PER_SHEET`（反復回数）・`_MAX_REGIONS_PER_SHEET`（出力 `Region` 数）の2つの予算を
-    共有する（1シートに分割を要する連結成分が多数ある場合の合計コストを頭打ちにする安全弁）。
-
-    **`Region` 数の契約**: `len(regions(...)) <= max(連結成分数, _MAX_REGIONS_PER_SHEET)`。各連結成分は
-    silent-drop ゼロのため最低でも1つの `Region`（分割できなければ外接矩形1件）を出す＝連結成分数を
-    下回ることはできない（例: 市松模様のように孤立した1セル成分が500個あれば、`_MAX_REGIONS_PER_SHEET`
-    が256でも500件になる。これはバグではなく契約どおりの挙動）。逆に連結成分数が予算未満であれば、
-    合計は `_MAX_REGIONS_PER_SHEET` を超えない（1つの連結成分だけが予算を独占して他の成分の分まで
-    使い切ることはない＝各成分に「保証された1件」を割り当てた上で、余りの予算だけを早く処理された
-    成分から順に分け合う）。予算（保証枠を超えた追加の分割）を使い切った成分は単一の外接矩形へ
-    フォールバックし（`split_budget_exhausted=True`）、セルが失われることはない。
-
-    `Region.value_cell_count`/`density`/`score`: 各領域について、値を持つセル数（背景色/結合継続などの
-    占有専用セルを除く）・その密度（値セル数／矩形面積）・両者を合成した表候補スコアを付与する
-    （`_region_score` 参照）。**スコアによる抑制（表示/索引からの除外）はここでは行わない**＝閾値判断は
-    消費側（人間向け MD レンダラ・rag.md レンダラ等）の責務。
-
-    `truncated`: `ws_values` の行数が `cap_rows` を超えている（＝呼び出し側が cap+1 まで読み cap 超過を検知
-    できた）、または列数が `cap_cols` を超えている行がある場合に、その **cap 境界に接する領域だけ** True。
-    境界に接しない領域（cap よりずっと手前で完結している領域）は cap 超過の影響を受けていないため False。
-    領域どうしの外接矩形が（連結していない孤立セルを内包する形で）幾何的に重なる稀なケースがありうるが、
-    本関数は矩形を返すだけで重複排除はしない（呼び出し側がセル配列を組む際に同じ座標が複数の table 要素へ
-    空セルとして重複出力されうる＝実害の無い冗長性として許容する設計判断）。
-
-    戻り値は `(min_row, min_col)` 昇順（シート内の左上優先＝「領域順」）でソート済み。同じ入力に対し
-    常に同じ順序・同じ分割結果を返す（`_extract_max_rectangle` のタイブレークが決定的なため）。
+    `Region` 数の契約: `len(regions(...)) <= max(連結成分数, _MAX_REGIONS_PER_SHEET)`。各成分は最低1件の `Region` を出す（silent-drop ゼロ）ので連結成分数を下回らない。連結成分数が予算未満なら合計は予算を超えない。予算を使い切った成分は単一の外接矩形にし `split_budget_exhausted=True` にする。
+    `Region.value_cell_count`/`density`/`score` は値セル数・密度・表候補スコア（`_region_score`）。スコアによる抑制はしない。
+    `truncated`: `ws_values` の行数が `cap_rows` を超える、または列数が `cap_cols` を超える行がある場合に、cap 境界に接する領域だけ True。領域どうしの外接矩形が重なる稀なケースでも重複排除はしない。
+    戻り値は `(min_row, min_col)` 昇順。同じ入力に対し常に同じ順序・分割結果を返す。
     """
     total_rows = len(ws_values)
     row_trunc = total_rows > cap_rows
@@ -378,9 +227,7 @@ def regions(ws_values: list[list], cap_rows: int, cap_cols: int, *,
                 occupied.update(span_cells)
 
     components = list(_connected_subcomponents(occupied))
-    # 各連結成分に「保証された1件」を割り当てた上で、余りの予算（`_MAX_REGIONS_PER_SHEET` が連結成分数
-    # より大きい場合の差分）だけを早く処理された成分から順に分け合う（`Region` 数の契約は docstring
-    # 参照）。連結成分数自体が予算を超える場合は保証枠すら削れない＝合計は連結成分数のまま。
+    # 各連結成分に保証の1件を割り当て、余りの予算（`_MAX_REGIONS_PER_SHEET` と連結成分数の差分）だけを早く処理された成分から順に分け合う。連結成分数が予算を超える場合は合計は連結成分数のまま。
     extra_region_budget = max(0, _MAX_REGIONS_PER_SHEET - len(components))
 
     out: list[Region] = []
@@ -391,12 +238,12 @@ def regions(ws_values: list[list], cap_rows: int, cap_cols: int, *,
         comp_min_c = min(c for _, c in component)
         comp_max_c = max(c for _, c in component)
         effective_max_splits = min(_MAX_RECT_SPLITS, splits_budget) if splits_budget > 0 else 0
-        effective_max_regions = 1 + extra_region_budget          # 保証1件 + 残りの共有予算
+        effective_max_regions = 1 + extra_region_budget  # 保証1件 + 残りの共有予算
         sub_regions, used = _split_component(
             component, comp_min_r, comp_max_r, comp_min_c, comp_max_c,
             max_splits=effective_max_splits, max_regions=effective_max_regions)
         splits_budget -= used
-        extra_region_budget -= max(0, len(sub_regions) - 1)      # この成分が消費した「追加分」だけ減らす
+        extra_region_budget -= max(0, len(sub_regions) - 1)  # この成分が消費した「追加分」だけ減らす
         for cells, top, left, bottom, right, budget_exhausted in sub_regions:
             touches_cap = (row_trunc and bottom == cap_rows) or (col_trunc and right == cap_cols)
             value_count = len(cells & value_occupied)
@@ -412,15 +259,9 @@ def regions(ws_values: list[list], cap_rows: int, cap_cols: int, *,
 
 def sheet_truncated(ws_values: list[list], cap_rows: int, cap_cols: int,
                     sheet_max_row: int | None = None, sheet_max_col: int | None = None) -> bool:
-    """走査が**シート全域をカバーしていない**（＝cap で打ち切った）可能性を示すか（RV Med #2・RV2巡是正）。
+    """走査がシート全域をカバーしていない（cap で打ち切った）可能性があるかを返す。
 
-    厳密な「cap 外に非空セルが在るか」は cap を超えて全域走査しないと判定できず、cap の目的（巨大シートの
-    暴走防止）と矛盾する。そこで意味論を**保守的**に定義する: シートの申告範囲（openpyxl の
-    `max_row`/`max_column`＝dimension 由来）が cap を超えていれば「見ていない領域がある」として True
-    （申告範囲が過大で実は空だった場合の偽陽性は許容＝「走査していない」事実を正直に言うフラグ）。
-    加えて、読み込んだ番兵グリッド（cap+1 まで）内に実際の非空セルがあれば dimension が過小申告でも True
-    （精度向上の補助）。`regions()` の `truncated`（cap 境界に接した領域）と合わせ、cap の完全外側で完結する
-    領域（例 cap=3 で A8 のみ）が**無警告で消える**ことを防ぐ（黙認しない契約の残り半分）。
+    保守的に定義する: シートの申告範囲（`max_row`/`max_column`）が cap を超えていれば True（過大申告なら偽陽性を許容）。加えて、読み込んだ番兵グリッド（cap+1 まで）内に非空セルがあれば dimension が過小申告でも True。`regions()` の `truncated` と合わせ、cap の外側で完結する領域が無警告で消えないようにする。
     """
     if sheet_max_row is not None and sheet_max_row > cap_rows:
         return True
@@ -435,13 +276,9 @@ def sheet_truncated(ws_values: list[list], cap_rows: int, cap_cols: int,
 
 def expand_regions_for_merges(region_list: list["Region"], merged: dict[tuple[int, int], dict],
                               cap_rows: int, cap_cols: int) -> list["Region"]:
-    """各領域の外接矩形を、所有セル中の**結合 anchor の span** まで広げた Region リストを返す（RV Low #3）。
+    """各領域の外接矩形を、所有セル中の結合 anchor の span まで広げた Region リストを返す。
 
-    値を持つ anchor（例 A1 で `A1:C1` 結合）の継続セルは非占有のため bbox に入らず、`source_map.range` が
-    実セル範囲（span 含む）より狭くなる＝範囲スコープの hidden_columns 判定も漏れていた。拡張は cap で
-    クランプし、クランプが起きた領域は `truncated=True` にする（黙認しない）。所有セル集合（`cells`）は
-    変えない（継続セルは値を持たない＝出力対象でないため）。矩形拡張で面積が変わるため、`density`/`score`
-    は `value_cell_count`（不変）と新しい面積から再計算する（`regions()` と同じ `_region_score`）。
+    anchor の継続セルは非占有で bbox に入らず、`source_map.range` が実セル範囲より狭くなるのを防ぐ。拡張は cap でクランプし、クランプが起きた領域は `truncated=True` にする。`cells` は変えない。`density`/`score` は `value_cell_count` と新しい面積から再計算する。
     """
     out: list[Region] = []
     for rg in region_list:
@@ -472,20 +309,9 @@ def expand_regions_for_merges(region_list: list["Region"], merged: dict[tuple[in
 
 def _clip_merge_enumeration_bounds(min_row: int, min_col: int, max_row: int, max_col: int,
                                    cap_rows: int, cap_cols: int) -> tuple[int, int]:
-    """結合範囲 `[min_row,max_row]×[min_col,max_col]` を**座標展開する前に** `cap_rows`×`cap_cols`、かつ
-    総面積 `DEFAULT_CAP_CELLS` 以内へクリップした `(max_row, max_col)` を返す（`min_row`/`min_col` は
-    変えない）。
+    """結合範囲 `[min_row,max_row]×[min_col,max_col]` を座標展開する前に、`cap_rows`×`cap_cols`、かつ総面積 `DEFAULT_CAP_CELLS` 以内へクリップした `(max_row, max_col)` を返す（`min_row`/`min_col` は変えない）。
 
-    `w:mergeCell`（Excel の結合セル）は宣言上 Excel の絶対上限（A1:XFD1048576）まで指定できるため、
-    座標展開の**前**にこれを行わないと、1つの結合範囲だけで最大 `1,048,576 × 16,384 ≈ 172億` 座標を
-    辞書へ書き込もうとしてメモリ/時間が破綻する。`cap_rows`/`cap_cols` は呼び出し側が渡す既存の
-    走査上限をそのまま使い、さらに**両軸の積**（面積）を `DEFAULT_CAP_CELLS` 以内へ追加でクリップする
-    （`cap_rows`×`cap_cols` の単純な積では、例えば列幅の狭いシートに `cap_rows` が大きく振られた
-    状態で列側だけ巨大な結合があると、両軸クリップだけでは依然として億単位になりうるため）。
-    行方向を優先して削る（既存の cap 系関数が行優先で走査する方針と揃える）。
-    `row_span`/`column_span` 自体（`merged_map()` が返す値）はクリップしない——これは
-    `expand_regions_for_merges()` 側が cap と突き合わせて別途クランプする値であり、ここで削ると
-    その判定が狂う。
+    結合範囲は宣言上 Excel の絶対上限（A1:XFD1048576）まで指定できるため、展開前に行わないとメモリ/時間が破綻する。面積も追加でクリップし、行方向を優先して削る。`row_span`/`column_span` はクリップしない（`expand_regions_for_merges()` が cap と突き合わせて別途クランプする）。
     """
     max_row = min(max_row, cap_rows)
     max_col = min(max_col, cap_cols)
@@ -499,25 +325,9 @@ def _clip_merge_enumeration_bounds(min_row: int, min_col: int, max_row: int, max
 def merged_map(ws, cap_rows: int, cap_cols: int) -> dict[tuple[int, int], dict]:
     """結合セル範囲を座標展開した辞書 `{(row, col): {"anchor": (ar, ac), "row_span", "column_span"}}`。
 
-    範囲内の**全座標**（anchor 自身も含む）をキーにする。呼び出し側は座標を引いて: キーが無ければ通常
-    セル（span 1,1）、`info["anchor"] == (row, col)` なら anchor（span はそのまま使う）、それ以外なら
-    非anchor の継続セル（`cells` に出さない＝DOCX の `w:vMerge` 継続セルと同じ規約）と判定する。
-
-    **展開は `cap_rows`/`cap_cols` でクリップしてから行う**（`_clip_merge_enumeration_bounds` 参照）:
-    宣言上 Excel の絶対上限まで指定できる結合範囲（A1:XFD1048576 等）をそのまま座標展開すると
-    座標数が桁違いに膨れ上がるため。クリップは**座標展開の範囲だけ**に効き、辞書の値に入る
-    `row_span`/`column_span` は結合の宣言どおりの値のまま返す（`expand_regions_for_merges()` が
-    その値と cap を突き合わせて改めてクランプする設計のため）。
-
-    `ws.merged_cells.ranges` を `(min_row, min_col)` 順にソートしてから展開する（決定的な処理順・
-    正常な OOXML では結合範囲は重ならないため出力に実質的な影響は無いが、走査順を安定させる）。
-
-    **既知の限界（受容記録）**: 結合範囲の非anchorセルだけに値がある異常な OOXML（Excel の仕様上、
-    非anchorセルの値は無効・Excel 自体が UI 上そのような値を作らない）は、`load_two()` の通常ロードの
-    時点で openpyxl がその値を破棄する（実測済み＝raw XML で非anchorセルへ値を注入して保存→再読込しても
-    値は復元されない）。本モジュールより手前でデータが失われるため、`regions()`/`_build_xlsx_ir` 側では
-    修復しようがない。クラッシュはしない（`filled_cells()` が anchor の塗りを見るため、anchor 自体に
-    値または塗りがあれば結合範囲全体が占有として扱われる＝表候補としては維持される）。
+    範囲内の全座標（anchor 自身も含む）をキーにする。キーが無ければ通常セル、`info["anchor"] == (row, col)` なら anchor、それ以外は非anchor の継続セル（`cells` に出さない）。
+    展開は `cap_rows`/`cap_cols` でクリップしてから行う（`_clip_merge_enumeration_bounds`）。値の `row_span`/`column_span` は宣言どおりのまま返す。`ws.merged_cells.ranges` を `(min_row, min_col)` 順にソートして展開する（決定的）。
+    既知の限界: 結合範囲の非anchorセルだけに値がある異常な OOXML は、`load_two()` の通常ロードの時点で openpyxl が値を破棄する。クラッシュはしない。
     """
     out: dict[tuple[int, int], dict] = {}
     for mc in sorted(ws.merged_cells.ranges, key=lambda m: (m.min_row, m.min_col)):
@@ -540,13 +350,9 @@ _HEX8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
 
 
 def _is_white_hex(value) -> bool:
-    """`value`（RGB6桁または ARGB8桁の16進文字列を想定）が厳密に白（`FFFFFF`）と確認できるか。
+    """`value`（RGB6桁または ARGB8桁の16進文字列）が厳密に白（`FFFFFF`）と確認できるか。
 
-    文字列全体の形式を検証してから比較する（`str.endswith("FFFFFF")` だけの判定は
-    `"garbageFFFFFF"` のような、6桁 HEX として不正な値まで白として誤受理してしまう＝実際に
-    踏んだ回帰）。6桁（テーマ/`srgbClr`/`sysClr` の `lastClr` は無アルファの6桁）はそのまま比較、
-    8桁（`wb._colors`/`Color.rgb` の ARGB）はアルファ成分を除いた末尾6桁を比較する。どちらの形式にも
-    一致しない・16進以外の文字が混じる場合は白と断定せず False を返す（解決不能＝占有側の一部）。
+    文字列全体の形式を検証してから比較する（`endswith("FFFFFF")` だけでは `"garbageFFFFFF"` を白と誤受理する）。6桁はそのまま、8桁はアルファを除いた末尾6桁を比較する。どちらの形式でもない場合は False（占有側に倒す）。
     """
     if not isinstance(value, str):
         return False
@@ -558,11 +364,7 @@ def _is_white_hex(value) -> bool:
 
 
 def _resolve_indexed_rgb(wb, indexed: int) -> str | None:
-    """`wb`（openpyxl `Workbook`）のインデックスパレット（`wb._colors`）から `indexed` が指す実際の
-    RGB 文字列を取得する。`wb._colors` はブック固有のカスタム上書き（`<indexedColors>`）を反映済み
-    （openpyxl がロード時に読み、未カスタマイズなら標準64色パレットのまま）。`wb` が無い・パレットが
-    無い・インデックスが範囲外なら解決不能として `None` を返す（呼び出し側は安全側＝占有として扱う）。
-    """
+    """`wb`（openpyxl `Workbook`）のインデックスパレット（`wb._colors`）から `indexed` が指す RGB 文字列を取得する。`wb` が無い・パレットが無い・インデックスが範囲外なら `None`（呼び出し側は占有として扱う）。"""
     colors = getattr(wb, "_colors", None) if wb is not None else None
     if not colors or not (0 <= indexed < len(colors)):
         return None
@@ -570,15 +372,7 @@ def _resolve_indexed_rgb(wb, indexed: int) -> str | None:
 
 
 def _resolve_theme_lt1_rgb(wb) -> str | None:
-    """`wb.loaded_theme`（テーマ part の生 XML バイト列。実ファイルから読み込んだブックには
-    OOXML 仕様上必ず入っている）から背景1（`lt1`）の実際の RGB を取り出す。`xml.etree` で正規に
-    パースする（正規表現の部分一致だと、閉じタグを欠くなどの壊れた XML でもそれらしい断片にマッチして
-    誤って白を受理しうるため）。直接色（`a:srgbClr`）・システム色参照（`a:sysClr` の `lastClr`
-    フォールバック値）のどちらにも対応する。`wb` が無い・テーマ未ロード・パース失敗
-    （`ET.ParseError`）・`lt1` 要素が見つからない・色情報が想定外の構造の場合は解決不能として `None`
-    を返す（呼び出し側は安全側＝占有として扱う。実ファイル起点では通常発生しないが、保存前の
-    ワークブックを直接渡す経路や壊れたテーマ part では起こりうる＝受容記録）。
-    """
+    """`wb.loaded_theme`（テーマ part の生 XML バイト列）から背景1（`lt1`）の RGB を取り出す。`xml.etree` でパースする。直接色（`a:srgbClr`）・システム色（`a:sysClr` の `lastClr`）に対応する。`wb` が無い・テーマ未ロード・パース失敗・`lt1` が見つからない場合は `None`（呼び出し側は占有として扱う）。"""
     theme_bytes = getattr(wb, "loaded_theme", None) if wb is not None else None
     if not theme_bytes:
         return None
@@ -599,15 +393,9 @@ def _resolve_theme_lt1_rgb(wb) -> str | None:
 
 
 class ColorResolver:
-    """1ワークブック分の色解決コンテキスト。複数シートを横断して走査する呼び出し側（`_build_xlsx_ir`
-    等）はワークブックあたり1つだけ構築してシートごとの `filled_cells()` 呼び出しへ使い回すこと
-    （`filled_cells()` の `resolver` 引数省略時は自前で1つ構築するが、それは**呼び出しごと**に
-    新規構築される＝複数シートに渡って使い回したい場合は明示的に渡す必要がある）。
+    """1ワークブック分の色解決コンテキスト。複数シートを走査する呼び出し側はワークブックあたり1つだけ構築し、シートごとの `filled_cells()` に明示的に渡して使い回すこと（省略すると呼び出しごとに新規構築される）。
 
-    `wb.loaded_theme` の XML パース（`_resolve_theme_lt1_rgb`）は同一ブック内であれば何度呼んでも
-    結果が変わらないため、初回だけ実行してキャッシュする（テーマ色のセルが多数あっても、また
-    シートが複数あっても decode/パースは1ワークブックにつき1回きり）。インデックスパレット
-    （`_resolve_indexed_rgb`）は `wb._colors` の単純な添字参照でコストが無視できるためキャッシュしない。
+    `wb.loaded_theme` のパースは初回だけ実行してキャッシュする。インデックスパレットはコストが小さいためキャッシュしない。
     """
     def __init__(self, wb):
         self._wb = wb
@@ -625,30 +413,19 @@ class ColorResolver:
 
 
 def _is_white_color(color, resolver: "ColorResolver") -> bool:
-    """openpyxl の `Color`（`None` も許容）が「白／自動＝背景色として占有扱いしない色」とみなせるか。
-    `resolver`（`ColorResolver`）はインデックスパレット・テーマの実際の値を引くのに使う。
+    """openpyxl の `Color`（`None` も可）が「白／自動＝背景色として占有扱いしない色」とみなせるか。`resolver`（`ColorResolver`）でインデックスパレット・テーマの実際の値を引く。
 
-    判定順序（`auto` は tint 判定より**先に**白とみなす＝`auto` に tint が付いていても無視する。
-    Excel の「自動」色は具体的な基準色を持たないため tint で暗色化する対象がそもそも無い）:
-    1. 自動色（`auto`）→ 無条件に白。
-    2. tint が負（Excel の tint モデルで暗色化を意味する）→ 白ではない（RGB/indexed/テーマの
-       いずれの基準色にも一様に適用する。暗くグレー化した見た目はもはや「白」ではないため）。
-    3. RGB が白（`_is_white_hex` で厳密検証・アルファ成分は無視）。
-    4. インデックスパレット（`indexed`）が `resolver` 固有のパレットで白に解決する。
-    5. テーマの背景1（`theme == 0`）が `resolver` 固有のテーマ定義で白に解決する。
-
-    `color` が `None`、インデックス/テーマが `resolver` から解決できない（`None` を返す）、値の形式が
-    不正（`_is_white_hex` 参照）、または上記のどれにも一致しない場合は白と断定せず False を返す
-    （`filled_cells()` 全体の方針＝取りこぼし（表の分裂）を過検出より避ける側へ倒す：不明な色・
-    白と確認できない色は占有側に倒す）。
+    判定順序:
+    1. 自動色（`auto`）→ 無条件に白（tint より先に判定する）。
+    2. tint が負（暗色化）→ 白ではない。
+    3. RGB が白（`_is_white_hex`）。
+    4. インデックスパレット（`indexed`）が `resolver` のパレットで白に解決する。
+    5. テーマの背景1（`theme == 0`）が `resolver` のテーマ定義で白に解決する。
+    `None`・解決不能・形式不正・どれにも一致しない場合は False（白と断定せず占有側に倒す＝表の分裂を避ける）。
     """
     if color is None:
         return False
-    # openpyxl の `Color.auto`/`.theme`/`.indexed` は未設定だと（`None` ではなく）Typed 記述子オブジェクト
-    # 自身を返す実装上の癖があり、真偽値としての単純な truthy 判定（`if getattr(...):`）や `isinstance`
-    # を使わない同値比較は誤判定しうる（実測済みの罠）。`is True`/`isinstance(..., int)`/`== 値` で、
-    # 未設定時に記述子オブジェクトが紛れ込んでも誤判定しないようにする（`tint` は未設定時も実測で
-    # 通常の `float` 既定値 `0.0` を返すため同じ罠は無い）。
+    # openpyxl の `Color.auto`/`.theme`/`.indexed` は未設定だと `None` ではなく Typed 記述子オブジェクト自身を返す。truthy 判定や `isinstance` なしの同値比較は誤判定しうるので、`is True`/`isinstance(..., int)`/`== 値` で判定する（`tint` は未設定でも `float` の `0.0`）。
     if getattr(color, "auto", None) is True:
         return True
     tint = getattr(color, "tint", 0.0)
@@ -663,17 +440,11 @@ def _is_white_color(color, resolver: "ColorResolver") -> bool:
 
 
 def _fill_is_colored(fill, resolver: "ColorResolver") -> bool:
-    """`fill`（openpyxl の `PatternFill`/`GradientFill`、またはそれ以外の未知の型）が、R1 でいう
-    「値が無くても占有とみなすべき背景色」を持つか。`resolver` は `_is_white_color` の色解決に使う。
+    """`fill`（`PatternFill`/`GradientFill`/未知の型）が「値が無くても占有とみなすべき背景色」を持つか。`resolver` は `_is_white_color` の色解決に使う。
 
-    - 塗りなし（`patternType` が `None`/`"none"`）は対象外。単色塗り（`patternType == "solid"`）は
-      前景色（`fgColor`）が白なら対象外とする（`_is_white_color` 参照・既定の白背景と区別が付かない
-      過検出を避ける）。単色以外のパターン塗り（縞模様等）は色の組合せまで判別せず一律で占有対象とする。
-    - `GradientFill` は `patternType` 属性を持たない（`PatternFill` 専用の属性）ため `getattr` で
-      安全に判定する。各ストップの色がすべて白でない限り占有対象とする。
-    - 条件付き書式（セル自体の `fill` ではなくシート単位のルールで見た目だけ変わる着色）は対象外
-      （本関数はセル自身のスタイル定義しか見ない・静的な OOXML 直パースの方針＝docs/11-Office変換.md
-      と同じ「LLM/実行時評価はしない」原則に沿う）。
+    - 塗りなし（`patternType` が `None`/`"none"`）は対象外。単色塗り（`"solid"`）は前景色（`fgColor`）が白なら対象外。単色以外のパターン塗りは一律で占有対象とする。
+    - `GradientFill` は `patternType` を持たないため `getattr` で判定する。各ストップの色がすべて白でない限り占有対象とする。
+    - 条件付き書式は対象外（セル自身のスタイル定義だけを見る）。
     """
     if fill is None:
         return False
@@ -682,7 +453,7 @@ def _fill_is_colored(fill, resolver: "ColorResolver") -> bool:
         if pattern_type == "solid" and _is_white_color(getattr(fill, "fgColor", None), resolver):
             return False
         return True
-    stops = getattr(fill, "stop", None)                # GradientFill のみが持つ（PatternFill には無い）
+    stops = getattr(fill, "stop", None)  # GradientFill のみが持つ（PatternFill には無い）
     if stops:
         return any(not _is_white_color(getattr(stop, "color", None), resolver) for stop in stops)
     return False
@@ -690,25 +461,10 @@ def _fill_is_colored(fill, resolver: "ColorResolver") -> bool:
 
 def filled_cells(ws, cap_rows: int, cap_cols: int, *, resolver: "ColorResolver | None" = None
                  ) -> set[tuple[int, int]]:
-    """背景色（単色/縞模様パターン塗り・グラデーション塗り）が設定されているセルの1-based座標集合
-    （`regions()` の `filled` 引数用・`cap_rows`×`cap_cols` 以内・色の判定は `_fill_is_colored` 参照）。
-    白判定はセルが属するワークブック（`ws.parent`）固有のインデックスパレット・テーマ定義を、
-    `resolver`（`ColorResolver`）を使って行う。
+    """背景色（単色/縞模様パターン塗り・グラデーション塗り）が設定されているセルの1-based座標集合を返す（`regions()` の `filled` 引数用・`cap_rows`×`cap_cols` 以内・色の判定は `_fill_is_colored`）。白判定はセルが属するワークブック固有のパレット・テーマ定義を `resolver`（`ColorResolver`）で行う。
 
-    `resolver` を省略すると `ws.parent` から自前で1つ構築する（単一シートだけを走査する場合はこれで
-    十分）。**複数シートを持つワークブックを走査する呼び出し側**（`_build_xlsx_ir` 等）は、ワークブック
-    レベルの入口で `ColorResolver(wb)` を1つだけ構築し、シートごとの呼び出しに明示的に渡すこと
-    （省略した場合はシートの数だけ新規構築され、`wb.loaded_theme` の XML パースがシート数だけ
-    繰り返されてしまう＝実際に踏んだ非効率）。
-
-    結合範囲の非anchorセル（openpyxl の `MergedCell`）は、保存・再読込を経ても常に既定（塗りなし）の
-    `fill` しか持たない（openpyxl は anchor 以外へスタイルを伝播しない＝実測済みの挙動）。そのため
-    非anchorセルは自身の `fill` ではなく、結合範囲の anchor セルの `fill` を見る（Excel の見た目上、
-    結合範囲全体が anchor の書式で塗られることに対応）。
-
-    `anchor_of` の座標展開は `cap_rows`/`cap_cols` でクリップしてから行う（`merged_map()` と同じ
-    `_clip_merge_enumeration_bounds` を使う）: 宣言上 Excel の絶対上限まで指定できる結合範囲を
-    そのまま座標展開すると座標数が桁違いに膨れ上がるため。
+    複数シートのワークブックでは、呼び出し側が `ColorResolver(wb)` を1つだけ構築して全シートの呼び出しに渡すこと（省略するとシートの数だけテーマのパースが繰り返される）。
+    結合範囲の非anchorセル（`MergedCell`）は自身の `fill` を持たないため、anchor セルの `fill` を見る。`anchor_of` の座標展開は `merged_map()` と同じ `_clip_merge_enumeration_bounds` でクリップしてから行う。
     """
     from openpyxl.cell.cell import MergedCell
 
@@ -739,17 +495,12 @@ def filled_cells(ws, cap_rows: int, cap_cols: int, *, resolver: "ColorResolver |
 
 
 def hidden_rows(ws) -> list[int]:
-    """非表示行の1-based行番号（昇順）。`ws.row_dimensions` は明示的に設定された行だけを持つ辞書
-    （openpyxl は既定値の行は書き出さない）ため、`hidden` が真の行だけを抽出すれば足りる。"""
+    """非表示行の1-based行番号（昇順）。`ws.row_dimensions` は明示設定された行だけを持つため、`hidden` が真の行だけを抽出する。"""
     return sorted(r for r, dim in ws.row_dimensions.items() if dim.hidden)
 
 
 def hidden_cols(ws) -> list[str]:
-    """非表示列の列文字（例 `"D"`・列インデックス昇順）。`hidden_rows` の列版。
-
-    グループ化された非表示（`ColumnDimension` が `min..max` の範囲を1エントリで表す・例 `B:D`）は
-    範囲を**全列へ展開**する（RV Low #4: 辞書 key（先頭列）だけ返すと `["B"]` になり C/D が漏れる）。
-    """
+    """非表示列の列文字（例 `"D"`・列インデックス昇順）。グループ化された非表示（`B:D` のように範囲を1エントリで表す）は範囲を全列へ展開する。"""
     from openpyxl.utils import column_index_from_string, get_column_letter
     idxs: set[int] = set()
     for key, dim in ws.column_dimensions.items():
@@ -762,14 +513,9 @@ def hidden_cols(ws) -> list[str]:
 
 
 def formulas(ws_formula, ws_values) -> list[dict]:
-    """`ws_formula`（`data_only=False`）内の数式セル（`=` で始まる値）を走査し、`ws_values`
-    （`data_only=True`）の同座標を突き合わせて `{"cell", "row", "column", "formula", "has_cached"}` の
-    リストを返す（`(row, column)` 昇順）。
+    """`ws_formula`（`data_only=False`）内の数式セル（`=` で始まる値）を走査し、`ws_values`（`data_only=True`）の同座標と突き合わせて `{"cell", "row", "column", "formula", "has_cached"}` のリストを `(row, column)` 昇順で返す。
 
-    `has_cached`＝`ws_values` 側の同座標の値が `None` でないか（未計算式／キャッシュ破棄済みは `None` に
-    なる openpyxl の挙動を利用）。行・列上限と`DEFAULT_CAP_CELLS`の総セル予算（モジュール属性・呼び出し時に
-    読む＝テストで`monkeypatch.setattr(excel, "DEFAULT_CAP_ROWS", …)`すれば効く）で走査範囲を
-    `min(ws.max_row, effective_cap+1)`に有界化する（`regions()`と同じ理由＝疎な大きいシートでの暴走防止）。
+    `has_cached`＝`ws_values` 側の同座標の値が `None` でないか（未計算式／キャッシュ破棄済みは `None`）。走査範囲は行・列上限と `DEFAULT_CAP_CELLS` の総セル予算（呼び出し時にモジュール属性を読む）で `min(ws.max_row, effective_cap+1)` に有界化する。
     """
     max_row = min(ws_formula.max_row or 1, effective_cap_rows(ws_formula.max_column) + 1)
     max_col = min(ws_formula.max_column or 1, DEFAULT_CAP_COLS + 1)
@@ -786,12 +532,9 @@ def formulas(ws_formula, ws_values) -> list[dict]:
 
 
 def defined_names(wb) -> list[dict]:
-    """名前付き範囲（ブック全体＝global／シート限定＝local）を
-    `{"name", "value": <参照先文字列>, "scope": "workbook" | <シート名>}` のリストで返す。
+    """名前付き範囲（ブック全体＝global／シート限定＝local）を `{"name", "value": <参照先文字列>, "scope": "workbook" | <シート名>}` のリストで返す。
 
-    決定的な順序: まずブック全体スコープ（`wb.defined_names`）を名前昇順、続けてシート限定スコープを
-    **ブック内シート順**で辿り、各シート内は名前昇順（`defined_names(wb)` は `ws.defined_names` も
-    合わせて辿るため、シート単位の関数ではなく wb を受け取る設計にしている）。
+    順序: ブック全体スコープ（名前昇順）、続けてシート限定スコープをブック内シート順に、各シート内は名前昇順。
     """
     out: list[dict] = []
     for name in sorted(wb.defined_names):
@@ -805,15 +548,9 @@ def defined_names(wb) -> list[dict]:
 
 
 def cell_hyperlinks(ws) -> list[dict]:
-    """`ws` 内のセル単位ハイパーリンクを `{"cell", "row", "column", "target", "text"}` のリストで返す
-    （`(row, column)` 昇順）。
+    """`ws` 内のセル単位ハイパーリンクを `{"cell", "row", "column", "target", "text"}` のリストで `(row, column)` 昇順で返す。
 
-    **`ws` は `data_only=True` でロードした値ワークシートを渡すこと**（`text`＝セルの表示値＝キャッシュ済み
-    計算値を使うため。数式ワークシートを渡すと数式文字列が `text` に入ってしまう）。
-
-    `target` の解決順は `word.py hyperlinks()` と同じ考え方: 外部 URL（`Hyperlink.target`）優先、無ければ
-    文書内参照（`Hyperlink.location`・`"#" + location`）。どちらも無ければそのセルは結果から省略する
-    （遷移先の無いリンクはノイズという `word.py` と同じ判断）。走査範囲は `formulas()` と同じ cap 契約。
+    `ws` は `data_only=True` でロードした値ワークシートを渡すこと（`text` にキャッシュ済み計算値を使うため）。`target` は外部 URL（`Hyperlink.target`）優先、無ければ `"#" + location`。どちらも無ければ省略する。走査範囲は `formulas()` と同じ cap 契約。
     """
     max_row = min(ws.max_row or 1, effective_cap_rows(ws.max_column) + 1)
     max_col = min(ws.max_column or 1, DEFAULT_CAP_COLS + 1)
@@ -834,10 +571,7 @@ def cell_hyperlinks(ws) -> list[dict]:
 
 
 def cell_comments(ws) -> list[dict]:
-    """`ws` 内のセルコメントを `{"cell", "row", "column", "text", "author"}` のリストで返す
-    （`(row, column)` 昇順）。本文が空のコメントは出さない（`word.py comments()` と同じ方針）。走査範囲は
-    `formulas()` と同じ cap 契約。
-    """
+    """`ws` 内のセルコメントを `{"cell", "row", "column", "text", "author"}` のリストで `(row, column)` 昇順で返す。本文が空のコメントは出さない。走査範囲は `formulas()` と同じ cap 契約。"""
     max_row = min(ws.max_row or 1, effective_cap_rows(ws.max_column) + 1)
     max_col = min(ws.max_column or 1, DEFAULT_CAP_COLS + 1)
     out: list[dict] = []
@@ -856,14 +590,9 @@ def cell_comments(ws) -> list[dict]:
 
 
 def strike_cells(ws) -> list[dict]:
-    """取り消し線（`cell.font.strike`＝OOXML の `s:font/strike`）が設定されたセルを
-    `{"cell", "row", "column", "text"}` のリストで返す（`(row, column)` 昇順）。
+    """取り消し線（`cell.font.strike`）が設定されたセルを `{"cell", "row", "column", "text"}` のリストで `(row, column)` 昇順で返す。
 
-    値が無いセル（`cell.value is None`）は取り消し線があっても出さない（意味を持たない書式だけの
-    水増しを避ける・`cell_comments` と同じ方針）。結合範囲の非anchorセル（`MergedCell`）は
-    値を持たないため（`filled_cells` docstring 参照＝openpyxl は非anchorへスタイルを伝播しない）
-    この `value is None` チェックだけで自然に除外される（`filled_cells` のような anchor 逆引きは不要）。
-    走査範囲は `formulas()` と同じ cap 契約。
+    値が無いセル（`cell.value is None`）は出さない。結合範囲の非anchorセルは値を持たないので自然に除外される。走査範囲は `formulas()` と同じ cap 契約。
     """
     max_row = min(ws.max_row or 1, effective_cap_rows(ws.max_column) + 1)
     max_col = min(ws.max_column or 1, DEFAULT_CAP_COLS + 1)
@@ -885,11 +614,7 @@ _EXTERNAL_LINK_RELS_RE = re.compile(r"xl/externalLinks/_rels/[^/]+\.rels")
 
 
 def external_link_targets(zf: zipfile.ZipFile) -> list[str]:
-    """zip 内 `xl/externalLinks/_rels/*.rels` の `Target` 属性値一覧（ソート済み・重複も保持）。
-
-    外部ブック参照（他ファイルへのリンク）の存在を示す来歴情報。パート欠落（外部リンク無し）は空リスト。
-    壊れた rels パートは無視して続行する（fail-safe＝`word.py`/`powerpoint.py` と同じ方針）。
-    """
+    """zip 内 `xl/externalLinks/_rels/*.rels` の `Target` 属性値一覧（ソート済み・重複も保持）。外部ブック参照の存在を示す来歴情報。パート欠落は空リスト。壊れた rels は無視して続行する。"""
     out: list[str] = []
     names = sorted(n for n in zf.namelist() if _EXTERNAL_LINK_RELS_RE.fullmatch(n))
     for n in names:
@@ -905,11 +630,7 @@ def external_link_targets(zf: zipfile.ZipFile) -> list[str]:
 
 
 def _resolve_rel_target(part: str, target: str) -> str:
-    """rels の `Target` 属性値を zip 内の絶対パートパスへ解決する（`part` は Target を持つ側のパート
-    自身のパス）。先頭 `/` は zip ルートからの絶対パス、それ以外は `part` のディレクトリからの相対
-    パスという OOXML パッケージ関係の解決規則どおり（`evidence_spike._relationships` と同じロジック・
-    どちらも `xl/worksheets/_rels/sheet1.xml.rels` 等の実ファイルで先頭 `/` 形式が普通に使われるため
-    相対解決だけでは足りない）。"""
+    """rels の `Target` 属性値を zip 内の絶対パートパスへ解決する（`part` は Target を持つ側のパート自身のパス）。先頭 `/` は zip ルートからの絶対パス、それ以外は `part` のディレクトリからの相対パス（`evidence_spike._relationships` と同じ規則）。"""
     from posixpath import dirname, join, normpath
     if target.startswith("/"):
         return normpath(target.lstrip("/"))
@@ -917,9 +638,7 @@ def _resolve_rel_target(part: str, target: str) -> str:
 
 
 def _load_rels(zf: zipfile.ZipFile, part: str) -> dict[str, str]:
-    """`part` に対応する `_rels/*.rels` から `{Id: 解決済み絶対パートパス}` を返す（外部リンク
-    ＝`TargetMode="External"` は zip 内パートではないため除外）。パート・rels 欠落/破損は空 dict
-    （fail-safe＝`external_link_targets` と同じ方針）。"""
+    """`part` に対応する `_rels/*.rels` から `{Id: 解決済み絶対パートパス}` を返す（`TargetMode="External"` は除外）。パート・rels の欠落/破損は空 dict。"""
     from posixpath import basename, dirname, join
     rels_name = join(dirname(part), "_rels", basename(part) + ".rels")
     try:
@@ -937,11 +656,7 @@ def _load_rels(zf: zipfile.ZipFile, part: str) -> dict[str, str]:
 def picture_counts_by_sheet(zf: zipfile.ZipFile) -> dict[str, int]:
     """ブック内の各シート名 → そのシートの drawing part に含まれる画像（`xdr:pic`）の枚数。
 
-    画像が0枚のシートはキー自体を持たない（人間向けMDの注記は「画像がある」場合だけ出すため、
-    消費側は `.get(name)` で判定できれば十分）。壊れた/欠落したパート（workbook.xml・シート
-    パート・drawing パートのいずれか）はそのシート分だけ黙って除外する（fail-safe＝本モジュールの
-    他の関数と同じ方針・IR 構築自体を失敗させない）。図形（`xdr:sp`）やチャート・SmartArt は数えない
-    （「画像」に限定＝人間向け注記の文言と一致させる）。
+    画像が0枚のシートはキーを持たない。壊れた/欠落したパートはそのシート分だけ黙って除外する。図形（`xdr:sp`）・チャート・SmartArt は数えない。
     """
     try:
         wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
@@ -969,9 +684,7 @@ def picture_counts_by_sheet(zf: zipfile.ZipFile) -> dict[str, int]:
             drawing_root = ET.fromstring(zf.read(drawing_part))
         except (KeyError, ET.ParseError):
             continue
-        # `xdr:pic` は必ず anchor（`oneCellAnchor`/`twoCellAnchor`）の子孫（グループ化図形
-        # `xdr:grpSp` の中はさらに孫以下）で、drawing part 直下の子ではない——`.iter()` で深さに
-        # 関係なく木全体から数える（anchor/group の階層を自前でたどる再帰は不要）。
+        # `xdr:pic` は anchor（`oneCellAnchor`/`twoCellAnchor`）の子孫で、グループ化図形の中ではさらに深いため、`.iter()` で木全体から数える。
         count = sum(1 for _ in drawing_root.iter(f"{_XDR}pic"))
         if count:
             out[name] = count
