@@ -158,6 +158,78 @@ def validate_observation_registered_sources(*extra_source_roots: str | Path) -> 
         validate_observation_source_separation(root)
 
 
+def _fs_chain_ids(path: Path) -> set[tuple[int, int]]:
+    """path とその全祖先の (st_dev, st_ino)。大文字小文字を区別しない FS・symlink・bind でも同一性で比べる。
+    stat できないものがあれば OSError を送出する（呼出側は判定不能として拒否する）。"""
+    resolved = path.resolve()
+    return {(st.st_dev, st.st_ino) for st in (os.stat(p) for p in (resolved, *resolved.parents))}
+
+
+def _fs_overlap(first: Path, second: Path) -> bool:
+    """2つの path が同一、または祖先/子孫の関係かをファイルシステム上の同一性で判定する。
+    判定できないとき（stat 不能）は重なりありとして True を返す（fail-closed）。
+    ただし片方が存在しないときだけは、存在しない側は存在する側の祖先にも子孫にもなり得ないので、
+    大文字小文字を無視した解決後 path の包含で代わりに判定する。"""
+    try:
+        a_ids, b_ids = _fs_chain_ids(first), _fs_chain_ids(second)
+        a_self, b_self = os.stat(first.resolve()), os.stat(second.resolve())
+        return (a_self.st_dev, a_self.st_ino) in b_ids or (b_self.st_dev, b_self.st_ino) in a_ids
+    except FileNotFoundError:
+        try:
+            a = first.resolve().as_posix().casefold().rstrip("/") + "/"
+            b = second.resolve().as_posix().casefold().rstrip("/") + "/"
+        except OSError:
+            return True
+        return a.startswith(b) or b.startswith(a)
+    except OSError:
+        return True
+
+
+def observation_removal_target(world_id: str) -> Path | None:
+    """削除してよい観測の置き場（`observation_base_dir()/{world_id}`）。無ければ None。
+
+    **何かを消す前に呼ぶ**（検証失敗は ValueError＝呼出側は何も消さずに止まる・fail-closed）。
+    観測の置き場・対象が、登録済みの全 World 参照元（読み取り専用の原本）と祖先/子孫/同一で重ならないことを
+    ファイルシステム上の同一性（`_fs_overlap`）で確かめる。対象が symlink、置き場の厳密な配下でない、
+    派生物と重なる、registry を読めない、のいずれも拒否する。
+    """
+    from . import store
+
+    base = observation_base_dir()
+    target = base / world_id
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:                                 # 確かめられないときは消さない
+        raise ValueError(f"観測ディレクトリの有無を確かめられません: {exc.__class__.__name__}") from exc
+    observation_dir(world_id)                              # 派生物との分離
+    roots = []
+    for row in store.list_worlds_db():
+        root_path = row.get("root_path") if isinstance(row, dict) else None
+        if not isinstance(root_path, str) or not root_path:
+            raise ValueError("登録済みWorld参照元を安全に検証できません")
+        roots.append(Path(root_path))
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError("OCR観測領域が実ディレクトリでないため削除できません")
+    try:
+        resolved, base_resolved = target.resolve(), base.resolve()
+        if (os.stat(resolved).st_dev, os.stat(resolved).st_ino) in {
+            (st.st_dev, st.st_ino) for st in (os.stat(base_resolved),)
+        }:
+            raise ValueError("OCR観測領域が置き場そのものです")
+        if (os.stat(base_resolved).st_dev, os.stat(base_resolved).st_ino) not in {
+            (st.st_dev, st.st_ino) for st in (os.stat(p) for p in resolved.parents)
+        }:
+            raise ValueError("OCR観測領域が置き場の配下にありません")
+    except OSError as exc:
+        raise ValueError("OCR観測領域を安全に解決できません") from exc
+    for root in roots:
+        if _fs_overlap(base, root) or _fs_overlap(target, root):
+            raise ValueError("OCR観測領域がWorld参照元と重なるため削除できません")
+    return target
+
+
 def observation_current_dir(world_id: str) -> Path | None:
     """いま公開されている OCR 観測のディレクトリ（無ければ None）。
 

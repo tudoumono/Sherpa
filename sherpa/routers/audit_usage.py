@@ -310,7 +310,7 @@ def admin_usage_export(request: Request, days: int = Query(30, ge=1, le=365),
                        time_to: str | None = Query(None, alias="to")):
     """利用明細エクスポート（ZIP・管理者のみ）。画面が表示している期間の回答明細を1つの ZIP に
     まとめて返す——質問・回答の本文・会話タイトル・参照した資料・ツールの引数は含めない
-    （会話番号・回答番号で DB や `make turn-activity CONV=<会話番号>` と突き合わせる調査用途）。
+    （会話番号・回答番号で DB や `make trace CONV=<会話番号>` と突き合わせる調査用途）。
 
     期間の受け方は `GET /admin/usage/stats` と完全に同じ（`days` の明示指定と `from`/`to` の
     同時指定は422・`from`/`to` は両方必須・半開区間 `[from, to)`・最大365日）。閲覧と同じ流儀で

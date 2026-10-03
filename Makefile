@@ -5,7 +5,7 @@
         graph-load graph-verify graph api serve prod-check verify-kit verify-extension dist nuke notice notice-check \
         test test-unit test-api test-contract test-integration test-e2e test-e2e-live \
         test-ui-automation test-ui-automation-smoke test-ui-automation-chat test-ui-automation-env \
-        test-db-reset screenshots backup restore usage-backfill turn-activity graph-chain azure-smoke codex-compat doctor sandbox-check \
+        test-db-reset screenshots backup restore usage-backfill trace graph-chain azure-smoke codex-compat doctor sandbox-check \
         codex-install codex-version \
         gate-slice gate-merge gate-release gate-ci test-inventory test-durations
 
@@ -243,9 +243,13 @@ restore:           ## バックアップから戻す（make restore FROM=data/ba
 usage-backfill:    ## 既存のassistantメッセージをturn_metrics/turn_tool_statsへ一度だけ移す（冪等・複数回実行可）
 	./scripts/usage-backfill.sh
 
-turn-activity:     ## 1 つの会話の各ターンの活動記録（本体と下調べ役のトークン・往復・圧縮・ツール別の回数とバイト）を数字だけで表示（make turn-activity CONV=<会話番号>・本文は出さない）
-	@test -n "$${CONV:-}" || { echo "使い方: make turn-activity CONV=<会話番号>"; exit 2; }
-	./scripts/turn-activity.sh "$${CONV}"
+trace:             ## 会話の各ターンを段・道具の呼び出し（時刻・引数・件数・打ち切り）・トークン・調査台帳の流れで書き出す（make trace CONV=<会話番号>[,<会話番号>...] [MASK=1 [MASK_MODELS=1]] [OUT=<出力ファイル>]・読み取りだけ・MASK=1 で本文や資料名を伏せる・MASK_MODELS=1 でモデル名も伏せる）
+	@case "$${CONV:-}" in ""|*[!0-9,]*) echo "使い方: make trace CONV=<会話番号>[,<会話番号>...] [MASK=1] [OUT=<出力ファイル>]（会話番号は数字とカンマだけ）"; exit 2;; esac; \
+	set -- --conv "$${CONV}"; \
+	if [ "$${MASK:-}" = 1 ]; then set -- "$$@" --mask; fi; \
+	if [ "$${MASK_MODELS:-}" = 1 ]; then set -- "$$@" --mask-models; fi; \
+	if [ -n "$${OUT:-}" ]; then set -- "$$@" --out "$${OUT}"; fi; \
+	./scripts/conversation-trace.sh "$$@"
 
 graph-chain:       ## 起点のファイルから呼び出し・コピー・DB アクセスを下り向きにたどり、届いたファイルと SQL の候補を表示（make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]・読み取り専用・本文は出さない）
 	@test -n "$${FROM:-}" || { echo "使い方: make graph-chain FROM=<ファイル名かパス> [WORLD=<取込ディレクトリ>] [DEPTH=8]"; exit 2; }

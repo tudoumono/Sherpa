@@ -103,15 +103,19 @@ def enqueue_job(
     )
     _ensure()
     with _connect() as connection:
-        return connection.execute(
-            "INSERT INTO ocr_jobs (world, source_rel_path, canonical_generation_id, source_content_hash, "
-            "route_manifest_hash, route_input_id, route_input, engine_profile_hash, priority, max_attempts) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT (world, canonical_generation_id, route_input_id, engine_profile_hash) DO UPDATE SET "
-            "priority=GREATEST(ocr_jobs.priority, EXCLUDED.priority), updated_at=now() "
-            "RETURNING *",
-            (*values[:6], Json(values[6]), values[7], priority, max_attempts),
-        ).fetchone()
+        return _insert_job(connection, values, priority, max_attempts)
+
+
+def _insert_job(connection, values, priority: int, max_attempts: int) -> dict[str, Any]:
+    return connection.execute(
+        "INSERT INTO ocr_jobs (world, source_rel_path, canonical_generation_id, source_content_hash, "
+        "route_manifest_hash, route_input_id, route_input, engine_profile_hash, priority, max_attempts) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (world, canonical_generation_id, route_input_id, engine_profile_hash) DO UPDATE SET "
+        "priority=GREATEST(ocr_jobs.priority, EXCLUDED.priority), updated_at=now() "
+        "RETURNING *",
+        (*values[:6], Json(values[6]), values[7], priority, max_attempts),
+    ).fetchone()
 
 
 def unsupported_route_ids(manifest: Any) -> list[str]:
@@ -151,8 +155,13 @@ def enqueue_manifest_jobs(
     canonical_generation_id: str,
     engine_profile_hash: str,
     max_attempts: int = 3,
-) -> list[dict]:
+    refresh_run: tuple[int, str] | None = None,
+) -> list[dict] | None:
     """OCRRouteManifestのselected入力だけを冪等enqueueする。
+
+    `refresh_run`（run_id, lease_token）を渡すと、その refresh run が期限内の leased のまま存在することを
+    行ロック（FOR SHARE）で確かめた同一transactionでjobを積む。`purge_world` は先に run 行を
+    DELETE するため、削除と競合しても削除後にjobが残らない。run が無ければ何も積まず None を返す。
 
     読めない画像形式（``unsupported_image_format``）として対象外になった入力に、過去のルートで
     作られた queued/failed の job が残っていれば cancelled へ終端する（失敗として数え続けない）。
@@ -161,19 +170,28 @@ def enqueue_manifest_jobs(
     unsupported_ids = unsupported_route_ids(manifest)
     if unsupported_ids:
         cancel_unsupported_routes(world, canonical_generation_id, manifest.source_rel_path, unsupported_ids)
-    jobs = []
+    prepared = []
     for decision in manifest.decisions:
         if decision.status != "selected":
             continue
-        jobs.append(enqueue_job(
+        prepared.append((_job_values(
             world=world, source_rel_path=manifest.source_rel_path,
             canonical_generation_id=canonical_generation_id,
             source_content_hash=manifest.source_content_hash,
             route_manifest_hash=manifest.route_manifest_hash,
             route_input=asdict(decision), engine_profile_hash=engine_profile_hash,
-            priority=decision.priority, max_attempts=max_attempts,
-        ))
-    return jobs
+        ), decision.priority))
+    _ensure()
+    with _connect() as connection:
+        if refresh_run is not None:
+            held = connection.execute(
+                "SELECT id FROM ocr_refresh_runs WHERE id=%s AND world=%s AND status='leased' "
+                "AND lease_token=%s AND lease_expires_at>now() FOR SHARE",
+                (refresh_run[0], world, refresh_run[1]),
+            ).fetchone()
+            if held is None:
+                return None
+        return [_insert_job(connection, values, priority, max_attempts) for values, priority in prepared]
 
 
 def enqueue_refresh_run(
@@ -397,9 +415,11 @@ def complete_job(
     result_payload: dict[str, Any],
     cache_hit: bool = False,
     observation_count: int | None = None,
+    cache_input_fingerprint: str | None = None,
 ) -> dict | None:
-    """現在のlease token所有者だけが完了できる。"""
+    """現在のlease token所有者だけが完了できる。cache_input_fingerprint＝この job が使った推論cacheのキー。"""
     result_hash = _tagged_hash(observation_set_hash)
+    fingerprint = _tagged_hash(cache_input_fingerprint) if cache_input_fingerprint else None
     if observation_count is None:
         observations = result_payload.get("observations")
         observation_count = len(observations) if isinstance(observations, list) else 0
@@ -409,11 +429,11 @@ def complete_job(
     with _connect() as connection:
         return connection.execute(
             "UPDATE ocr_jobs SET status='succeeded', result_observation_set_hash=%s, result_payload=%s, "
-            "cache_hit=%s, observation_count=%s, "
+            "cache_hit=%s, observation_count=%s, cache_input_fingerprint=%s, "
             "lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, error_code=NULL, error_detail=NULL, "
             "updated_at=now(), finished_at=now() "
             "WHERE id=%s AND status='leased' AND lease_token=%s AND lease_expires_at>now() RETURNING *",
-            (result_hash, Json(result_payload), cache_hit, observation_count, job_id, lease_token),
+            (result_hash, Json(result_payload), cache_hit, observation_count, fingerprint, job_id, lease_token),
         ).fetchone()
 
 

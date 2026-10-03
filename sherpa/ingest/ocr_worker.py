@@ -948,6 +948,7 @@ def run_once(
             job_id, lease_token, observation_set_hash=observation_set.observation_set_hash,
             result_payload=json.loads(ai_observation.to_json_str(observation_set)),
             cache_hit=cache_hit, observation_count=len(observation_set.observations),
+            cache_input_fingerprint=prepared.asset_sha256,
         )
         if completed is None:
             return WorkerResult(status="lease_lost", job_id=job_id, cache_hit=cache_hit)
@@ -1132,7 +1133,10 @@ def run_refresh_once(
                 manifest,
                 canonical_generation_id=generation,
                 engine_profile_hash=engine_profile_hash,
+                refresh_run=(run_id, lease_token),
             )
+            if rows is None:
+                raise OCRLeaseLostError("OCR refresh run was removed or lost before enqueue")
             if not ocr_jobs.update_refresh_run_progress(
                 run_id,
                 lease_token,
