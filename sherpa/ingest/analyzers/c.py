@@ -1,6 +1,7 @@
 r"""C アナライザ。`.c`/`.h` を全件受理し、ファイル自体を主体定義（`Module`・拡張子込みのファイル名）、トップレベルの関数定義（`.c`）／プロトタイプ宣言（`.h`）を子定義（`<ファイル名>.<関数名>`・extra `c_kind`）として返す。
 
-参照: `#include "x.h"` は `via=include`（`include_path` は `\` を `/` に正規化）、関数呼び出しは `via=call`（他ファイルの関数 children を単純名で最近傍解決）。
+参照: `#include "x.h"` は `via=include`（`include_path` は `\` を `/` に正規化・始点はファイルの主体・パス区切りを含む相対パスは完全一致でしか解決せず、一致しなければ最近傍へ倒さず未解決＝`path_exact`）、関数呼び出しは `via=call`（他ファイルの関数 children を単純名で最近傍解決）。
+呼び出しの始点（`source_symbol_id`）は、その行を本体に含む関数定義（`{` 終端・`<ファイル名>.<関数名>`）。関数の外の呼び出しはファイルの主体。同じ行に複数の定義がかかる行の呼び出しは決められないので主体にし、`Dropped("ambiguous_source_symbol")` で申告する。
 シグネチャ判定は単一物理行・波括弧深度0に限る粗い判定（複数行は見逃す）。K&R 形式・マクロ関数呼び出し・`.h` 内の C++ 構文は `Dropped` で申告する。大文字小文字は区別する。
 設計: docs/design/rag.md「グラフ」
 """
@@ -184,6 +185,39 @@ def _scan_func_decls(sanitized: str, pp_lines: set) -> list:
     return out
 
 
+def _definition_ranges(sanitized: str, decls: list) -> list:
+    """`{` 終端の関数定義の本体範囲を `(name, start_line, end_line, clean)` で返す。
+
+    開き `{` のある行から、波括弧深度が 0 に戻る行まで（閉じなければ最終行）。`clean`＝閉じ `}` の後ろに同じ行のコードが続かない（`;` と空白だけ）。
+    続く（`int f(void){...} int g(void){...}`）場合は、その行の参照がどの定義のものか決められない。
+    """
+    lines = sanitized.split("\n")
+    depth_before: list = []
+    depth_after: list = []
+    depth = 0
+    for raw_line in lines:
+        depth_before.append(depth)
+        depth += raw_line.count("{") - raw_line.count("}")
+        depth_after.append(depth)
+    ranges: list = []
+    for name, line, _start, term in decls:
+        if term != "{":
+            continue
+        end, clean = len(depth_after), True
+        for j in range(line - 1, len(depth_after)):
+            if depth_after[j] <= 0:
+                end = j + 1
+                d = depth_before[j]
+                for k, ch in enumerate(lines[j]):
+                    d += (ch == "{") - (ch == "}")
+                    if d <= 0 and (ch == "}"):
+                        clean = lines[j][k + 1:].strip() in ("", ";")
+                        break
+                break
+        ranges.append((name, line, end, clean))
+    return ranges
+
+
 def _scan_knr_definitions(sanitized: str, pp_lines: set) -> list:
     """波括弧深度0の K&R 形式の関数定義ヘッダを `(name, line, name_start)` で返す。
 
@@ -238,6 +272,7 @@ class CAnalyzer(Analyzer):
     extensions = C_EXT
     resolves_calls_by_simple_name = True
     doctype = "c"
+    version = 3
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         filename = PurePosixPath(rel_path).name
@@ -283,7 +318,7 @@ class CAnalyzer(Analyzer):
             basename = PurePosixPath(local).name
             if basename:
                 refs.append(RefCandidate("INVOKES", "Module", basename, line,
-                                         extra={"via": "include", "include_path": local}))
+                                         extra={"via": "include", "include_path": local, "path_exact": True}))
 
         for m in _DYNAMIC_CALL.finditer(sanitized):
             line = _line_at(newline_offsets, m.start())
@@ -296,7 +331,27 @@ class CAnalyzer(Analyzer):
                                                             # 呼び出しではないので黙って見逃す（検出限界）。
             dropped.append(Dropped("c_dynamic_call", line, sanitized.splitlines()[line - 1].strip()[:120]))
 
-        decl_positions = {start for _name, _line, start, _term in _scan_func_decls(sanitized, pp_lines)}
+        filename = PurePosixPath(rel_path).name
+        decls = _scan_func_decls(sanitized, pp_lines)
+        ranges = _definition_ranges(sanitized, decls)
+
+        ambiguous_lines: set = set()
+
+        def owner_of(line: int):
+            """行を本体に含む関数定義の `source_symbol_id`（関数の外＝ファイル直下は `None`）。
+
+            同じ行に 2 つ以上の定義がかかる行・定義の閉じ `}` の後ろに同じ行のコードが続く行は決められないので主体（`None`）にし、`Dropped("ambiguous_source_symbol")` を 1 行 1 件残す。
+            """
+            hits = [name for name, start, end, _clean in ranges if start <= line <= end]
+            shared = len(hits) > 1 or any(end == line and not clean for _n, _s, end, clean in ranges)
+            if shared:
+                if line not in ambiguous_lines:
+                    ambiguous_lines.add(line)
+                    dropped.append(Dropped("ambiguous_source_symbol", line, ", ".join(f"{filename}.{n}" for n in hits)))
+                return None
+            return (rel_path, f"{filename}.{hits[0]}") if hits else None
+
+        decl_positions = {start for _name, _line, start, _term in decls}
         knr_defs = _scan_knr_definitions(sanitized, pp_lines)
         knr_positions = {start for _name, _line, start in knr_defs}
         for name, line, _start in knr_defs:
@@ -313,6 +368,7 @@ class CAnalyzer(Analyzer):
             if name in macro_names:
                 dropped.append(Dropped("c_macro_call", line, name))
                 continue
-            refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "call"}))
+            refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "call"},
+                                     source_symbol_id=owner_of(line)))
 
         return RefResult(refs=refs, dropped=dropped)

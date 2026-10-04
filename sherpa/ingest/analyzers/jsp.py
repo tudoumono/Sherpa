@@ -193,6 +193,7 @@ class JspAnalyzer(Analyzer):
     name = "jsp"
     extensions = JSP_EXT
     doctype = "jsp"
+    version = 2
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         filename = PurePosixPath(rel_path).name

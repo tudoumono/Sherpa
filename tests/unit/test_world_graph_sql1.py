@@ -111,9 +111,9 @@ def test_table_absent_from_ddl_yields_unresolved_flag_and_no_node():
     assert len(unresolved) == 1
 
 
-# --- DECLARE CURSOR（動的 SQL）は Dropped のみ・テーブル抽出はしない ---
+# --- DECLARE CURSOR: 準備済みの文の名前を指す形だけ動的（Dropped・テーブル抽出なし）。SELECT 直書きの静的カーソルは表を読む ---
 
-def test_declare_cursor_block_is_dropped_as_exec_sql_dynamic():
+def test_prepared_statement_cursor_is_dropped_as_exec_sql_dynamic_and_static_cursor_is_not():
     _nodes, _edges, flags = _build()
     dynamic = [f for f in flags if f.get("why") == "exec_sql_dynamic"]
     assert len(dynamic) == 1

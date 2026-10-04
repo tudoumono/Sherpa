@@ -82,7 +82,7 @@ def _mcp_env(world: str, scope_paths, ask_disabled: bool = False, layer=None) ->
 
 
 def _graph_schema_era_from_item(item: dict, world: str, lens: str | None):
-    """完了した `graph_neighbors` の mcp_tool_call item が構造化エラー（`graph_reingest_required`・`isError: true`）を運んでいれば `GraphSchemaEraError` を再構成する。
+    """完了した `graph_neighbors`・`graph_resolve`・`graph_impact` の mcp_tool_call item が構造化エラー（`graph_reingest_required`・`isError: true`）を運んでいれば `GraphSchemaEraError` を再構成する。
     それ以外（通常結果・壊れた形・対象外のツール）は None。
     """
     try:
@@ -108,6 +108,49 @@ def _mcp_neighbors_from(item: dict) -> list:
         return ns if isinstance(ns, list) else []
     except (KeyError, IndexError, TypeError, ValueError, AttributeError):
         return []
+
+
+# 結果の要約の上限。会話の保存が思考ノードの補足を切る長さ（`chat_service._MAX_TRACE_DETAIL_CHARS`）と同じ
+GRAPH_SUMMARY_MAX_CHARS = 200
+
+
+def _graph_tool_summary(tool: str, item: dict) -> str | None:
+    """完了した `graph_resolve`／`graph_impact` の mcp_tool_call item の結果を、思考ノードの補足（再表示でも残る）用の 1 文に要約する。
+    件数・調査の完了／未完了（`coverage.complete` と `limits[].kind`）・先頭の数件の識別子と所属パス。壊れた形・エラー結果は None。
+    結果はツールが範囲・秘匿の除外を通した後のものなので、ここでは再検査しない。
+    """
+    try:
+        data = json.loads(item["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return None
+    field, noun = ("candidates", "候補") if tool == "graph_resolve" else ("impact", "影響先")
+    rows = data.get(field) if isinstance(data, dict) else None
+    if not isinstance(rows, list) or data.get("error"):
+        return None
+    count = data.get("count")
+    cov = data.get("coverage") if isinstance(data.get("coverage"), dict) else {}
+    kinds = [str(x.get("kind")) for x in cov.get("limits") or [] if isinstance(x, dict)]
+    state = "調査は完了" if cov.get("complete", True) else "未完了（" + "・".join(kinds) + "）"
+    head = [f"{r.get('path')} ({r.get('canonical_id')})" for r in rows[:3] if isinstance(r, dict)]
+    text = f"{noun}{count if isinstance(count, int) else len(rows)}件{'以上' if count is None else ''}・{state}"
+    if tool == "graph_impact" and isinstance(data.get("start"), dict) and data["start"].get("path"):
+        text = f"起点 {data['start']['path']}・{text}"  # 検証を通った結果の起点だけ（引数の識別子は記録しない）
+    if head:
+        text += "：" + "、".join(head)
+    return text[:GRAPH_SUMMARY_MAX_CHARS]
+
+
+def _graph_tool_failure(item: dict) -> str | None:
+    """完了した `graph_resolve`／`graph_impact` の結果が失敗応答（`error`・`error_code`・旧世代）なら、思考ノードに残す固定の文言を返す。
+    起点が見つからない・範囲外・秘匿のときも識別子や理由の詳細は記録しない。成功・壊れた形は None。
+    """
+    try:
+        data = json.loads(item["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        data = None
+    if not isinstance(data, dict) or not (data.get("error") or data.get("error_code")):
+        return None
+    return "起点が見つかりませんでした" if data.get("error") == "graph_start_not_found" else "調べられませんでした"
 
 
 def _apply_codex_neighbors(env: dict, mcp_neighbors: list, lens) -> None:

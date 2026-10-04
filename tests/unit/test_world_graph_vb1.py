@@ -31,7 +31,7 @@ def _edge_tuples(nodes, edges):
     return {(e["type"], by_cid[e["src"]], by_cid[e["dst"]], e.get("via")) for e in edges}
 
 
-# --- VB.NET（net/）: Namespace/Class・Inherits（単純名・primary 同士）---
+# --- VB.NET（net/）: Namespace/Class・Inherits（完全修飾名・primary 同士）---
 
 def test_order_service_and_base_service_nodes_are_uppercase_normalized():
     nodes, _edges, _flags = _build()
@@ -64,7 +64,7 @@ def test_modmain_bare_call_resolves_to_moddata_loadorders_definition_child():
     `modData.bas` の `LoadOrders` 定義 child へ繋がる（§9・C と同じ仕組み）。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    modmain = ("Module", "MODMAIN", "vb6/modMain.bas")
+    modmain = ("Module", "MAIN", "vb6/modMain.bas")
     loadorders = ("Module", "LOADORDERS", "vb6/modData.bas")
     assert ("INVOKES", modmain, loadorders, "call") in tuples
 
@@ -73,7 +73,7 @@ def test_modmain_bare_call_without_call_keyword_resolves_within_same_file():
     """`LogMessage "starting"`（`Call` キーワード無し・括弧無し）も同じ機構で解決する。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    modmain = ("Module", "MODMAIN", "vb6/modMain.bas")
+    modmain = ("Module", "MAIN", "vb6/modMain.bas")
     logmessage = ("Module", "LOGMESSAGE", "vb6/modMain.bas")
     assert ("INVOKES", modmain, logmessage, "call") in tuples
 
@@ -82,7 +82,7 @@ def test_frmmain_qualified_call_resolves_to_moddata_loadorders():
     """`Call modData.LoadOrders(1)`（修飾・`.` 込み）は完全修飾名の cid_key 完全一致で解決する。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    frmmain = ("Module", "FRMMAIN", "vb6/frmMain.frm")
+    frmmain = ("Module", "CMDOK_CLICK", "vb6/frmMain.frm")
     loadorders = ("Module", "LOADORDERS", "vb6/modData.bas")
     assert ("INVOKES", frmmain, loadorders, "call") in tuples
 
@@ -93,7 +93,7 @@ def test_moddata_sql_string_concatenation_accesses_orders_table():
     """
     nodes, edges, flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    moddata = ("Module", "MODDATA", "vb6/modData.bas")
+    moddata = ("Module", "LOADORDERS", "vb6/modData.bas")
     orders = ("Table", "ORDERS", "vb6/schema.sql")
     assert ("ACCESSES", moddata, orders, "vba_sql") in tuples
     unknown_via = [f for f in flags if f.get("reason") == "unknown_via" and f.get("via") == "vba_sql"
@@ -116,7 +116,7 @@ def test_new_api_call_resolves_to_csharp_all_caps_class_in_same_generation():
     同世代内の最近傍解決で繋がる（言語ドメインで索引を分けない・既存契約の範囲内として許容）。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    apiclient = ("Module", "APICLIENT", "net/Api/ApiClient.vb")
+    apiclient = ("Module", "CONNECT", "net/Api/ApiClient.vb")
     api = ("Module", "API", "net/Api/Api.cs")
     assert ("INVOKES", apiclient, api, "call") in tuples
 
@@ -127,7 +127,7 @@ def test_qualified_name_case_mismatch_does_not_cross_resolve_to_csharp():
     （C# の同名ノードへは繋がらない・言語ドメインの索引を混ぜない安全側の帰結）。"""
     nodes, edges, _flags = _build()
     tuples = _edge_tuples(nodes, edges)
-    apiclient = ("Module", "APICLIENT", "net/Api/ApiClient.vb")
+    apiclient = ("Module", "LOAD", "net/Api/ApiClient.vb")
     vb_order_service = ("Module", "ORDERSERVICE", "net/Order/OrderService.vb")
     cs_order_service = ("Module", "OrderService", "net/Api/OrderService.cs")
     assert ("INVOKES", apiclient, vb_order_service, "call") in tuples

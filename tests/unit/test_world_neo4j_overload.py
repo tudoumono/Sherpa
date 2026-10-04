@@ -261,7 +261,7 @@ def test_run_world_impact_probes_schema_era_exactly_once():
 
     s = _SeqSession([])
     wn.run_world_impact(s, "TAX-RATE", "w1")
-    era_probe_calls = [c for c in s.calls if "SherpaMeta" in (c[0].text if hasattr(c[0], "text") else c[0])]
+    era_probe_calls = [c for c in s.calls if "m.schema_era" in (c[0].text if hasattr(c[0], "text") else c[0])]
     assert len(era_probe_calls) == 1
 
 

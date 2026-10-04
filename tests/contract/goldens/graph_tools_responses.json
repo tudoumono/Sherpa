@@ -1,0 +1,594 @@
+{
+ "impact_code_layer": {
+  "count": 1,
+  "coverage": {
+   "complete": true,
+   "depth": {
+    "requested": 5,
+    "truncated": false
+   },
+   "limits": [],
+   "omitted": 0
+  },
+  "impact": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
+    "distance": 1,
+    "evidence": [
+     {
+      "from": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
+      "line": 4,
+      "rule": "same_package",
+      "sources": [
+       {
+        "doc_id": "mention/src/Invoicer.java",
+        "file": "mention/src/Invoicer.java",
+        "from_def": {
+         "file": "mention/src/Invoicer.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "mention/src/Invoicer.java",
+        "file": "mention/src/Invoicer.java",
+        "from_def": {
+         "file": "mention/src/Invoicer.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "field_type"
+       }
+      ],
+      "sources_overflow_count": 0,
+      "to": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+      "via": "call"
+     }
+    ],
+    "evidence_available": true,
+    "kind": "Module",
+    "name": "Invoicer",
+    "path": "mention/src/Invoicer.java",
+    "route": [
+     {
+      "doc": "mention/src/Invoicer.java",
+      "from": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
+      "line": 4,
+      "to": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+      "type": "INVOKES"
+     }
+    ],
+    "trace": [
+     "Invoicer",
+     "Billing"
+    ]
+   }
+  ],
+  "start": {
+   "canonical_id": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+   "kind": "Module",
+   "name": "Billing",
+   "path": "mention/src/Billing.java",
+   "qualified_name": "src.Billing"
+  },
+  "unresolved": {
+   "available": true,
+   "items": [],
+   "omitted": 0
+  }
+ },
+ "impact_depth_truncated": {
+  "count": 1,
+  "coverage": {
+   "complete": false,
+   "depth": {
+    "requested": 1,
+    "truncated": true
+   },
+   "limits": [
+    {
+     "kind": "depth",
+     "stage": "impact"
+    }
+   ],
+   "omitted": null
+  },
+  "impact": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:chain/Link2.java#Link2",
+    "distance": 1,
+    "evidence": [
+     {
+      "from": "module:ana_s6_gt_test:chain/Link2.java#Link2",
+      "line": 4,
+      "rule": "same_package",
+      "sources": [
+       {
+        "doc_id": "chain/Link2.java",
+        "file": "chain/Link2.java",
+        "from_def": {
+         "file": "chain/Link2.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "chain/Link2.java",
+        "file": "chain/Link2.java",
+        "from_def": {
+         "file": "chain/Link2.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "field_type"
+       }
+      ],
+      "sources_overflow_count": 0,
+      "to": "module:ana_s6_gt_test:chain/Link3.java#Link3",
+      "via": "call"
+     }
+    ],
+    "evidence_available": true,
+    "kind": "Module",
+    "name": "Link2",
+    "path": "chain/Link2.java",
+    "route": [
+     {
+      "doc": "chain/Link2.java",
+      "from": "module:ana_s6_gt_test:chain/Link2.java#Link2",
+      "line": 4,
+      "to": "module:ana_s6_gt_test:chain/Link3.java#Link3",
+      "type": "INVOKES"
+     }
+    ],
+    "trace": [
+     "Link2",
+     "Link3"
+    ]
+   }
+  ],
+  "related_documents": [],
+  "start": {
+   "canonical_id": "module:ana_s6_gt_test:chain/Link3.java#Link3",
+   "kind": "Module",
+   "name": "Link3",
+   "path": "chain/Link3.java",
+   "qualified_name": "chain.Link3"
+  },
+  "truncated": true,
+  "unresolved": {
+   "available": true,
+   "items": [],
+   "omitted": 0
+  }
+ },
+ "impact_edge_sources_filtered": {
+  "count": 1,
+  "coverage": {
+   "complete": true,
+   "depth": {
+    "requested": 5,
+    "truncated": false
+   },
+   "limits": [],
+   "omitted": 0
+  },
+  "impact": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:mention/src/Sec2.java#Sec2",
+    "distance": 1,
+    "evidence": [
+     {
+      "from": "module:ana_s6_gt_test:mention/src/Sec2.java#Sec2",
+      "line": 3,
+      "rule": "same_package",
+      "sources": [
+       {
+        "doc_id": "mention/src/Sec2.java",
+        "file": "mention/src/Sec2.java",
+        "line": 3,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "other/Out.java",
+        "file": "other/Out.java",
+        "line": 1,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "mention/src/Last.java",
+        "file": "mention/src/Last.java",
+        "line": 7,
+        "rule": "same_package",
+        "via": "call"
+       }
+      ],
+      "sources_overflow_count": 2,
+      "to": "module:ana_s6_gt_test:mention/src/Tgt.java#Tgt",
+      "via": "call"
+     }
+    ],
+    "evidence_available": true,
+    "kind": "Module",
+    "name": "Sec2",
+    "path": "mention/src/Sec2.java",
+    "route": [
+     {
+      "doc": "mention/src/Sec2.java",
+      "from": "module:ana_s6_gt_test:mention/src/Sec2.java#Sec2",
+      "line": 3,
+      "to": "module:ana_s6_gt_test:mention/src/Tgt.java#Tgt",
+      "type": "INVOKES"
+     }
+    ],
+    "trace": [
+     "Sec2",
+     "Tgt"
+    ]
+   }
+  ],
+  "related_documents": [],
+  "start": {
+   "canonical_id": "module:ana_s6_gt_test:mention/src/Tgt.java#Tgt",
+   "kind": "Module",
+   "name": "Tgt",
+   "path": "mention/src/Tgt.java"
+  },
+  "unresolved": {
+   "available": true,
+   "items": [],
+   "omitted": 0
+  }
+ },
+ "impact_result_cap": {
+  "count": 5,
+  "coverage": {
+   "complete": false,
+   "depth": {
+    "requested": 5,
+    "truncated": false
+   },
+   "limits": [
+    {
+     "kind": "result_cap",
+     "stage": "impact"
+    }
+   ],
+   "omitted": 3
+  },
+  "impact": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:cap/User1.java#User1",
+    "distance": 1,
+    "evidence": [
+     {
+      "from": "module:ana_s6_gt_test:cap/User1.java#User1",
+      "line": 4,
+      "rule": "same_package",
+      "sources": [
+       {
+        "doc_id": "cap/User1.java",
+        "file": "cap/User1.java",
+        "from_def": {
+         "file": "cap/User1.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "cap/User1.java",
+        "file": "cap/User1.java",
+        "from_def": {
+         "file": "cap/User1.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "field_type"
+       }
+      ],
+      "sources_overflow_count": 0,
+      "to": "module:ana_s6_gt_test:cap/Hub.java#Hub",
+      "via": "call"
+     }
+    ],
+    "evidence_available": true,
+    "kind": "Module",
+    "name": "User1",
+    "path": "cap/User1.java",
+    "route": [
+     {
+      "doc": "cap/User1.java",
+      "from": "module:ana_s6_gt_test:cap/User1.java#User1",
+      "line": 4,
+      "to": "module:ana_s6_gt_test:cap/Hub.java#Hub",
+      "type": "INVOKES"
+     }
+    ],
+    "trace": [
+     "User1",
+     "Hub"
+    ]
+   },
+   {
+    "canonical_id": "module:ana_s6_gt_test:cap/User2.java#User2",
+    "distance": 1,
+    "evidence": [
+     {
+      "from": "module:ana_s6_gt_test:cap/User2.java#User2",
+      "line": 4,
+      "rule": "same_package",
+      "sources": [
+       {
+        "doc_id": "cap/User2.java",
+        "file": "cap/User2.java",
+        "from_def": {
+         "file": "cap/User2.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "cap/User2.java",
+        "file": "cap/User2.java",
+        "from_def": {
+         "file": "cap/User2.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "field_type"
+       }
+      ],
+      "sources_overflow_count": 0,
+      "to": "module:ana_s6_gt_test:cap/Hub.java#Hub",
+      "via": "call"
+     }
+    ],
+    "evidence_available": true,
+    "kind": "Module",
+    "name": "User2",
+    "path": "cap/User2.java",
+    "route": [
+     {
+      "doc": "cap/User2.java",
+      "from": "module:ana_s6_gt_test:cap/User2.java#User2",
+      "line": 4,
+      "to": "module:ana_s6_gt_test:cap/Hub.java#Hub",
+      "type": "INVOKES"
+     }
+    ],
+    "trace": [
+     "User2",
+     "Hub"
+    ]
+   }
+  ],
+  "related_documents": [],
+  "start": {
+   "canonical_id": "module:ana_s6_gt_test:cap/Hub.java#Hub",
+   "kind": "Module",
+   "name": "Hub",
+   "path": "cap/Hub.java",
+   "qualified_name": "cap.Hub"
+  },
+  "truncated": true,
+  "unresolved": {
+   "available": true,
+   "items": [],
+   "omitted": 0
+  }
+ },
+ "impact_unresolved": {
+  "count": 0,
+  "coverage": {
+   "complete": true,
+   "depth": {
+    "requested": 5,
+    "truncated": false
+   },
+   "limits": [],
+   "omitted": 0
+  },
+  "impact": [],
+  "related_documents": [],
+  "start": {
+   "canonical_id": "module:ana_s6_gt_test:amb/x/Helper.java#Helper",
+   "kind": "Module",
+   "name": "Helper",
+   "path": "amb/x/Helper.java"
+  },
+  "unresolved": {
+   "available": true,
+   "items": [
+    {
+     "candidates": 2,
+     "from_def": {
+      "file": "amb/Main.java",
+      "key": null
+     },
+     "kind": "Module",
+     "line": 2,
+     "name": "Helper",
+     "path": "amb/Main.java",
+     "reason": "ambiguous",
+     "via": "call"
+    }
+   ],
+   "omitted": 0
+  }
+ },
+ "impact_with_related_documents": {
+  "count": 1,
+  "coverage": {
+   "complete": true,
+   "depth": {
+    "requested": 5,
+    "truncated": false
+   },
+   "limits": [],
+   "omitted": 0
+  },
+  "impact": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
+    "distance": 1,
+    "evidence": [
+     {
+      "from": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
+      "line": 4,
+      "rule": "same_package",
+      "sources": [
+       {
+        "doc_id": "mention/src/Invoicer.java",
+        "file": "mention/src/Invoicer.java",
+        "from_def": {
+         "file": "mention/src/Invoicer.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "call"
+       },
+       {
+        "doc_id": "mention/src/Invoicer.java",
+        "file": "mention/src/Invoicer.java",
+        "from_def": {
+         "file": "mention/src/Invoicer.java",
+         "key": null
+        },
+        "line": 4,
+        "rule": "same_package",
+        "via": "field_type"
+       }
+      ],
+      "sources_overflow_count": 0,
+      "to": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+      "via": "call"
+     }
+    ],
+    "evidence_available": true,
+    "kind": "Module",
+    "name": "Invoicer",
+    "path": "mention/src/Invoicer.java",
+    "route": [
+     {
+      "doc": "mention/src/Invoicer.java",
+      "from": "module:ana_s6_gt_test:mention/src/Invoicer.java#Invoicer",
+      "line": 4,
+      "to": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+      "type": "INVOKES"
+     }
+    ],
+    "trace": [
+     "Invoicer",
+     "Billing"
+    ]
+   }
+  ],
+  "related_documents": [
+   {
+    "canonical_id": "document:ana_s6_gt_test:mention/docs/spec.md",
+    "line": 0,
+    "name": "mention/docs/spec.md",
+    "path": "mention/docs/spec.md",
+    "target": {
+     "canonical_id": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+     "name": "Billing"
+    },
+    "via": "mention"
+   }
+  ],
+  "start": {
+   "canonical_id": "module:ana_s6_gt_test:mention/src/Billing.java#Billing",
+   "kind": "Module",
+   "name": "Billing",
+   "path": "mention/src/Billing.java",
+   "qualified_name": "src.Billing"
+  },
+  "unresolved": {
+   "available": true,
+   "items": [],
+   "omitted": 0
+  }
+ },
+ "invalid_args": {
+  "error": "graph_invalid_args",
+  "message": "canonical_id（graph_resolve の candidates[].canonical_id）を指定してください"
+ },
+ "resolve_capped": {
+  "candidates": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:cap/User1.java#User1",
+    "kind": "Module",
+    "match": "partial",
+    "name": "User1",
+    "path": "cap/User1.java",
+    "qualified_name": "cap.User1"
+   },
+   {
+    "canonical_id": "module:ana_s6_gt_test:cap/User2.java#User2",
+    "kind": "Module",
+    "match": "partial",
+    "name": "User2",
+    "path": "cap/User2.java",
+    "qualified_name": "cap.User2"
+   }
+  ],
+  "count": null,
+  "coverage": {
+   "complete": false,
+   "limits": [
+    {
+     "kind": "result_cap",
+     "stage": "anchor"
+    }
+   ],
+   "omitted": null
+  },
+  "truncated": true
+ },
+ "resolve_same_name": {
+  "candidates": [
+   {
+    "canonical_id": "module:ana_s6_gt_test:dup/a/Account.java#Account",
+    "kind": "Module",
+    "match": "exact",
+    "name": "Account",
+    "path": "dup/a/Account.java",
+    "qualified_name": "a.Account"
+   },
+   {
+    "canonical_id": "module:ana_s6_gt_test:dup/b/Account.java#Account",
+    "kind": "Module",
+    "match": "exact",
+    "name": "Account",
+    "path": "dup/b/Account.java",
+    "qualified_name": "b.Account"
+   }
+  ],
+  "count": 2,
+  "coverage": {
+   "complete": true,
+   "limits": [],
+   "omitted": 0
+  }
+ },
+ "start_not_found": {
+  "canonical_id": "module:nope:x#X",
+  "error": "graph_start_not_found",
+  "message": "この資料フォルダ・範囲に該当する識別子がありません（graph_resolve で確かめてください）"
+ }
+}

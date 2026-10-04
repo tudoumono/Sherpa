@@ -12,6 +12,7 @@ LLM は使わない。言語ごとの抽出はアナライザ側、本モジュ�
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import os
 import posixpath
@@ -23,6 +24,7 @@ from pathlib import Path, PurePosixPath
 from .. import corpus_docs, doc_text, scope_infer, text_encoding, worlds
 from . import importance, text_kind
 from .analyzers import registry as analyzer_registry
+from .analyzers._base import FileContext
 
 
 def _scope_meta(rel: str) -> dict:
@@ -75,12 +77,45 @@ def _resolve_nearest(defs, kind, name, ref_rel):
     return ranked[0], ""
 
 
+def _resolve_table(table_defs, name, ref_rel):
+    """`Table` 参照の解決。`name` は `NAME` か、schema を書いた `SCHEMA.NAME`。
+
+    `name` は `_sql_scan.TableName`（`schema`・`simple` を持つ）か単純名の文字列。
+    `table_defs[NAME]`（`[(rel, cid_key, schema|None), ...]`）を同一 top_scope に絞る。schema を書いた参照 `S.NAME` は、
+    schema=S の定義があればそれだけ、無ければ schema の記載が無い定義だけを候補にして修飾なしと同じ規則（最近傍・同距離の複数は ambiguous）。
+    schema を明示した別の schema の定義へは張らない（候補が無ければ未解決）。書いていない参照は、同名が複数 schema にあれば
+    `'ambiguous'`（任意選択しない）、1 つなら最近傍。戻りは `(rel|None, cid_key|None, status)`。`status` は `''` / `'ambiguous'` / `'cross_scope'` / `'unresolved'`。
+    """
+    if not getattr(name, "supported", True):    # 4 部以上の名前は表として解決しない
+        return None, None, "unresolved"
+    # 引用符内の `.` と区別するため、文字列を再分解せず scanner が持たせた schema・名前を読む。
+    schema, simple = getattr(name, "schema", None), getattr(name, "simple", name)
+    cands = table_defs.get(simple)
+    if not cands:
+        return None, None, "unresolved"
+    same = [c for c in cands if _top(c[0]) == _top(ref_rel)]
+    if not same:
+        return None, None, "cross_scope"
+    if schema is not None:
+        exact = [c for c in same if c[2] == schema]
+        same = exact or [c for c in same if c[2] is None]
+        if not same:
+            return None, None, "unresolved"
+    elif len({c[2] for c in same}) > 1:
+        return None, None, "ambiguous"
+    ranked = sorted(same, key=lambda c: _tree_distance(ref_rel, c[0]))
+    best = _tree_distance(ref_rel, ranked[0][0])
+    if sum(1 for c in same if _tree_distance(ref_rel, c[0]) == best) > 1:
+        return None, None, "ambiguous"
+    return ranked[0][0], ranked[0][1], ""
+
+
 def _resolve_qualified(qualified_defs, kind, name, ref_rel):
     """完全修飾名の解決: `qualified_defs[(kind,name)]`（`[(rel,実名), ...]`）を同一 top_scope に絞り、パス距離で最近傍を選ぶ。
 
-    最短距離が複数なら任意選択せず `'ambiguous'`。戻りは `(rel|None, 実名|None, status)`。
-    `status` は `''` / `'ambiguous'` / `'cross_scope'` / `'unresolved'`（`unresolved`/`cross_scope` は呼び出し側が
-    単純名フォールバックへ倒して qualified_fallback を flags に記録し、`ambiguous` はそのまま flags へ記録する）。
+    同じ完全修飾名の候補が複数あるときだけ、パス距離で並べ替える（別の名前を選ぶ根拠にはしない）。最短距離が複数なら任意選択せず `'ambiguous'`。
+    戻りは `(rel|None, 実名|None, status)`。`status` は `''` / `'ambiguous'` / `'cross_scope'` / `'unresolved'`。
+    見つからなくても単純名へは倒さない（呼び出し側が未解決として `flags` に申告する）。
     """
     cands = qualified_defs.get((kind, name))
     if not cands:
@@ -94,6 +129,106 @@ def _resolve_qualified(qualified_defs, kind, name, ref_rel):
         return None, None, "ambiguous"
     rel, actual_name = ranked[0]
     return rel, actual_name, ""
+
+
+def _namespace_chain(package, parents: bool) -> list:
+    """参照元の名前空間から、型名を探す順の修飾子の列を返す（内側→外側・最後は名前空間なし＝グローバル）。
+
+    `parents` が偽（Java）は宣言された package だけ。真（C#・VB.NET）は親の名前空間もさかのぼる。
+    """
+    if not package:
+        return [None]
+    if not parents:
+        return [package]
+    parts = package.split(".")
+    return [".".join(parts[:i]) for i in range(len(parts), 0, -1)] + [None]
+
+
+def _join_fqn(prefix, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+def _resolve_wildcards(qualified_defs, kind, name, ref_rel, file_context):
+    """ワイルドカード import（`import p.*`・C# の `using N;`・VB の `Imports N`）の中で `name` が一意に決まるかを返す。
+
+    `static` の import は型名を持ち込まないので使わない。同じ型が複数の import 先で一致したら任意選択せず `'ambiguous'`。
+    戻りは `(rel|None, 実名|None, status)`（`status` は `''` / `'ambiguous'` / `'unresolved'`）。
+    """
+    hits: set = set()
+    for imp in file_context.imports:
+        if imp.kind != "wildcard" or imp.static:
+            continue
+        rel, actual, status = _resolve_qualified(qualified_defs, kind, _join_fqn(imp.name, name), ref_rel)
+        if status == "ambiguous":
+            return None, None, "ambiguous"
+        if not status:
+            hits.add((rel, actual))
+    if len(hits) == 1:
+        rel, actual = next(iter(hits))
+        return rel, actual, ""
+    return (None, None, "ambiguous") if hits else (None, None, "unresolved")
+
+
+def _resolve_type_name(qualified_defs, defs, kind, name, ref_rel, file_context, parents: bool, package,
+                       rule_out: list | None = None):
+    """修飾なしの型名 `name` を、参照元ファイルの `file_context`（package／namespace・import／using）の規則で解決する。
+
+    順序: ① 別名（`using A = …`・`Imports A = …`）→ ② 単一型 import（Java）→ ③ 同じ package／enclosing namespace（C#・VB は親→グローバルの順）
+    → ④ ワイルドカード import。どれにも一致しなければ、近くに同名の別 package・別 namespace の定義があっても張らない。
+    `parents`＝名前空間が親へさかのぼる言語。戻りは `(rel|None, 実名|None, status, 申告の名前)`。
+    解決できたとき、決めた規則の名前（`alias`／`single_import`／`same_package`／`wildcard`）を `rule_out`（省略可）へ 1 件足す。
+    `status` は `''` / `'ambiguous'` / `'cross_scope'` / `'unresolved'` / `'unresolved_qualifier'`（明示した修飾に一致する定義が無い＝申告の名前は修飾名）。
+    """
+    for imp in file_context.imports:
+        if imp.static or imp.kind == "wildcard":
+            continue
+        hit = (imp.kind == "alias" and imp.alias == name) or (
+            imp.kind == "single" and imp.name.rsplit(".", 1)[-1] == name)
+        if not hit:
+            continue
+        rel, actual, status = _resolve_qualified(qualified_defs, kind, imp.name, ref_rel)
+        if status == "unresolved":
+            status = "unresolved_qualifier"
+        if rule_out is not None:
+            rule_out.append("alias" if imp.kind == "alias" else "single_import")
+        return rel, actual, status, imp.name
+    for prefix in _namespace_chain(package, parents):
+        rel, actual, status = _resolve_qualified(qualified_defs, kind, _join_fqn(prefix, name), ref_rel)
+        if status in ("", "ambiguous"):
+            if rule_out is not None:
+                rule_out.append("same_package")
+            return rel, actual, status, name
+    rel, actual, status = _resolve_wildcards(qualified_defs, kind, name, ref_rel, file_context)
+    if status in ("", "ambiguous"):
+        if rule_out is not None:
+            rule_out.append("wildcard")
+        return rel, actual, status, name
+    others = defs.get((kind, name))
+    return None, None, ("cross_scope" if others and not any(_top(r) == _top(ref_rel) for r in others)
+                        else "unresolved"), name
+
+
+def _resolve_dotted_type_name(qualified_defs, kind, name, ref_rel, file_context, parents: bool, package,
+                              absolute: bool = False):
+    """C#・VB.NET の修飾付きの型名（`A.B.Type`・`Outer.Inner`）の解決。入れ子の型は外側の型へ寄せる。
+
+    名前の長い接頭辞から順に、参照元の enclosing namespace（内側→グローバル）の下で完全修飾名として探す。戻りは `_resolve_qualified` と同じ。
+    """
+    segs = name.split(".")
+    chain = [None] if absolute else _namespace_chain(package, parents)   # `absolute`＝`global::` の指定（今の namespace の下は探さない）
+    if file_context is not None and not absolute:                          # 先頭の要素が別名なら展開し、完全修飾名として解決する（今の namespace の下は探さない）
+        for imp in file_context.imports:
+            if imp.kind == "alias" and imp.alias == segs[0]:
+                segs = imp.name.split(".") + segs[1:]
+                chain = [None]
+                break
+    for n in range(len(segs), 0, -1):
+        prefix = ".".join(segs[:n])
+        for ns in chain:
+            rel, actual, status = _resolve_qualified(qualified_defs, kind, _join_fqn(ns, prefix), ref_rel)
+            if status in ("", "ambiguous"):
+                return rel, actual, status
+    return None, None, "unresolved"
 
 
 def _resolve_nearest_keyed(index, analyzer_name, kind, name, ref_rel):
@@ -122,6 +257,24 @@ def _resolve_nearest_keyed(index, analyzer_name, kind, name, ref_rel):
 
 
 
+def _analyzer_by_name(analyzer_name):
+    for a in analyzer_registry.known_analyzers():
+        if a.name == analyzer_name:
+            return a
+    return None
+
+
+def _analyzer_parents(analyzer_name):
+    """型名の解決で名前空間が親へさかのぼる言語か。未登録名は `None`。"""
+    a = _analyzer_by_name(analyzer_name)
+    return None if a is None else bool(a.resolves_parent_namespaces)
+
+
+def _analyzer_requires_context(analyzer_name) -> bool:
+    a = _analyzer_by_name(analyzer_name)
+    return bool(a is not None and a.requires_file_context)
+
+
 def _simple_name_calls(analyzer_name) -> bool:
     """`analyzer_name` のアナライザが単純名の呼び出し解決（children への 2 段目）を要求するか。未登録名は False。"""
     for a in analyzer_registry.known_analyzers():
@@ -133,7 +286,7 @@ def _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name):
     """C の `#include "path"` の 1 段目解決: パス区切りを含む `include_path` を参照元 `ref_rel` からの相対パスとして解決する。
 
     その rel_path が実際に `name`（拡張子込みファイル名）の主体であれば一意に採用し、距離計算・曖昧判定は経由しない。
-    同一 top_scope を跨ぐ解決はしない。見つからなければ `None`（呼び出し側が basename の最近傍へフォールバックする）。
+    同一 top_scope を跨ぐ解決はしない。見つからなければ `None`（`path_exact` の参照は未解決として申告する。それ以外は呼び出し側が basename の最近傍へ倒す）。
     区切りは `normpath` の前に `\\`→`/` へ直す。
     """
     base_dir = ref_rel.rsplit("/", 1)[0] if "/" in ref_rel else ""
@@ -174,23 +327,96 @@ def _resolve_path_suffix(suffix_index, kind, suffix, ref_rel):
     return matches[0], ""
 
 
-def _aggregate_pass2_edges(raw_edges: list) -> list:
-    """同一 `(src, type, dst)` の複数候補を 1 本へ集約する。
+EDGE_SOURCES_MAX = 20     # 1 本の辺の `sources`（根拠）の上限。超過は `sources_overflow_count`
 
-    `analyzer_registry.via_priority_rank`（FW 固有 via を汎用 via より優先）で採用する候補を選び、
-    同順位は初出を採用する。line/via は採用した候補から丸ごと引き継ぐ。`(src,type,dst)` の初出順を保って返す。
+# 辺の根拠 `sources[].rule`（接続を決めた解決規則の名前）の閉じた一覧。解決器（`_link`）と言及の突合がここの名前だけを付ける。
+EDGE_RULES = frozenset({
+    "alias",                 # 別名（`using A = …`・`Imports A = …`）
+    "single_import",         # 単一型の import
+    "same_package",          # 同じ package／enclosing namespace
+    "wildcard",              # ワイルドカード import（`using N;`・`Imports N`）
+    "qualified_name",        # 完全修飾名の一致
+    "path_exact",            # `#include "相対パス"` の相対パスの完全一致
+    "path_suffix",           # classpath 相対のパス末尾の一致
+    "config_key_all",        # 同名の設定キー全件
+    "schema_exact",          # schema を書いた参照が同じ schema の表に一致
+    "schema_unqualified",    # schema を書いた参照が schema の記載が無い定義に一致
+    "table_name",            # schema を書かない参照の表名の一致
+    "nearest_name",          # 同じ最上位フォルダの最近傍の同名
+    "dictionary_match",      # 資料の本文と定義名の辞書突合（言及）
+})
+
+
+def _edge_source(e: dict) -> dict:
+    """Pass 2 の候補 1 件 → 辺の根拠 1 件（`{via?, doc_id, file, line, rule?, from_def?}`）。辺が `via` を持たない（COBOL の COPY など）ときは `via` も持たない。"""
+    src = {"doc_id": e["doc"], "file": e["doc"], "line": e["line"]}
+    if e.get("via"):
+        src = {"via": e["via"], **src}
+    if e.get("_rule"):
+        src["rule"] = e["_rule"]
+    if e.get("_from_def") is not None:
+        src["from_def"] = e["_from_def"]
+    return src
+
+
+def _source_dedupe_key(src: dict) -> tuple:
+    fd = src.get("from_def")
+    return (src["doc_id"], src["line"], src.get("via"), src.get("rule"),
+            (fd["file"], fd["key"]) if fd else None, src.get("locator"))
+
+
+def _source_sort_key(src: dict) -> tuple:
+    fd = src.get("from_def")
+    return (analyzer_registry.via_priority_rank(src.get("via")), src["doc_id"], src["line"],
+            src.get("rule") or "", (fd["file"], fd["key"] or "") if fd else ("", ""), src.get("locator") or "")
+
+
+def cap_sources(sources: list, first: dict | None = None) -> tuple:
+    """根拠を重複排除 `(doc_id, line, via, rule, from_def, locator)` し、`via` の優先順位→文書→行で並べて上限で切る。戻りは `(根拠, 超過件数)`。
+    `first`（省略可）は辺の代表の根拠で、並びの先頭に置く（残りだけを並べる）。
     """
-    best: dict = {}
+    seen: set = set()
+    uniq = []
+    for src in sources:
+        k = _source_dedupe_key(src)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(src)
+    uniq.sort(key=_source_sort_key)
+    if first is not None:
+        fk = _source_dedupe_key(first)
+        uniq = [u for u in uniq if _source_dedupe_key(u) == fk] + [u for u in uniq if _source_dedupe_key(u) != fk]
+    return uniq[:EDGE_SOURCES_MAX], max(0, len(uniq) - EDGE_SOURCES_MAX)
+
+
+def _aggregate_pass2_edges(raw_edges: list) -> list:
+    """同一 `(src, type, dst)` の複数候補を 1 本へ集約し、候補の根拠を `sources` に並べる。
+
+    代表（`doc`・`line`・`via` と `include_path` などの追加属性の持ち主）は、`via_priority_rank` が最小の候補（同順位は先着）。
+    `sources` の先頭の件が代表の根拠で、残りは `cap_sources`（重複排除・並び・上限 20 件）。`(src,type,dst)` の初出順を保って返す。
+    """
+    groups: dict = {}
     order: list = []
     for e in raw_edges:
         key = (e["src"], e["type"], e["dst"])
-        if key not in best:
-            best[key] = e
+        if key not in groups:
+            groups[key] = []
             order.append(key)
-            continue
-        if analyzer_registry.via_priority_rank(e.get("via")) < analyzer_registry.via_priority_rank(best[key].get("via")):
-            best[key] = e
-    return [best[k] for k in order]
+        groups[key].append(e)
+    out = []
+    for key in order:
+        cands = groups[key]
+        rep = cands[0]
+        for e in cands[1:]:
+            if analyzer_registry.via_priority_rank(e.get("via")) < analyzer_registry.via_priority_rank(rep.get("via")):
+                rep = e
+        sources, overflow = cap_sources([_edge_source(e) for e in cands], first=_edge_source(rep))
+        edge = {k: v for k, v in rep.items() if not k.startswith("_")}
+        edge["sources"] = sources
+        if overflow:
+            edge["sources_overflow_count"] = overflow
+        out.append(edge)
+    return out
 
 
 def _document_cid(world_id: str, rel: str) -> str:
@@ -301,18 +527,52 @@ def _ensure_mention_document(nodes: dict, world_id: str, rel: str) -> str:
     return cid
 
 
+def _mention_locators(text: str, names: set) -> dict:
+    """文書本文のうち `names`（辞書に一致したトークン）が現れる位置を `{名前: ([位置の表記, ...最大 EDGE_SOURCES_MAX 件], 位置の総数)}` で返す。
+
+    位置は本文（派生 MD または原本のテキスト）の行で、直前の見出しがあれば添える。同じ行に何度現れても 1 件。
+    """
+    nl = [m.start() for m in re.finditer("\n", text)]
+    head_lines: list = []                            # 見出しの行番号（昇順）
+    head_texts: list = []
+    for lineno, ln in enumerate(text.split("\n"), start=1):
+        if ln.startswith("#"):
+            h = ln.lstrip("#").strip()
+            if h:
+                head_lines.append(lineno)
+                head_texts.append(h)
+    seen: dict = {}
+    for m in _MENTION_TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if tok not in names:
+            continue
+        lineno = bisect.bisect_left(nl, m.start()) + 1
+        locs, total, last = seen.setdefault(tok, ([], 0, None))
+        if last == lineno:
+            continue
+        hi = bisect.bisect_right(head_lines, lineno) - 1
+        head = head_texts[hi] if hi >= 0 else None
+        label = f"本文 {lineno} 行目" if head is None else f"{head}・本文 {lineno} 行目"
+        if len(locs) < EDGE_SOURCES_MAX + 1:
+            locs.append(label)
+        seen[tok] = (locs, total + 1, lineno)
+    return {t: (locs, total) for t, (locs, total, _l) in seen.items()}
+
+
 def _mention_edges_for_doc(rel: str, text: str, mdict: dict, min_len: int, max_per_doc: int,
                            world_id: str, nodes: dict, edges: list, flags: list) -> None:
     """1 文書分の言及突合: トークン化→辞書突合→`Document -DOCUMENTS(via=mention)-> コード` を張る。
 
     1 文書あたりの上限（`max_per_doc`）を超えた分は張らず、件数を `flags`（`mention_overflow`）へ申告する。
     上限は 1 トークンが複数世代へ展開される場合もエッジ単位で数える。
-    dst の cid は `targets` の `key`（修飾名を含み得る）で組み立てる。同一 `(doc, dst)` は 1 本にまとめる。
+    dst の cid は `targets` の `key`（修飾名を含み得る）で組み立てる。同一 `(doc, dst)` は 1 本にまとめ、文書内の言及の位置を
+    根拠 `sources[].locator` に並べる（`doc` は言及元の文書・`line` は 0）。
     """
     added = 0
     overflow = 0
     doc_cid = None
     seen_dst: set = set()
+    pending: list = []                               # (tok, edge)
     for tok in _mention_tokenize(text):
         if len(tok) < min_len:
             continue
@@ -328,11 +588,26 @@ def _mention_edges_for_doc(rel: str, text: str, mdict: dict, min_len: int, max_p
                 continue
             if doc_cid is None:
                 doc_cid = _ensure_mention_document(nodes, world_id, rel)
-            edges.append({"type": "DOCUMENTS", "src": doc_cid, "dst": dst_cid,
-                         "doc": rel, "line": 0, "status": "active",
-                         "via": "mention"})
+            edge = {"type": "DOCUMENTS", "src": doc_cid, "dst": dst_cid,
+                    "doc": rel, "line": 0, "status": "active",
+                    "via": "mention"}
+            edges.append(edge)
+            pending.append((tok, edge))
             seen_dst.add(dst_cid)
             added += 1
+    if pending:
+        located = _mention_locators(text, {t for t, _e in pending})
+        for tok, edge in pending:
+            locs, total = located.get(tok, ([], 0))
+            sources = [{"via": "mention", "doc_id": rel, "file": rel, "line": 0, "rule": "dictionary_match",
+                        "locator": loc} for loc in locs]
+            if not sources:                           # 位置を特定できなかった（本文の再走査で見つからない）＝位置なしの根拠 1 件
+                sources = [{"via": "mention", "doc_id": rel, "file": rel, "line": 0, "rule": "dictionary_match"}]
+                total = 1
+            capped, over = cap_sources(sources)
+            edge["sources"] = capped
+            if total > len(capped):
+                edge["sources_overflow_count"] = total - len(capped)
     if overflow:
         flags.append({"reason": "mention_overflow", "doc": rel, "count": overflow})
 
@@ -367,6 +642,82 @@ def _mention_pass(world_dir, world_id: str, defs: dict, aliases: dict, files, no
             _mention_edges_for_doc(rel, text, mdict, min_len, max_per_doc, world_id, nodes, edges, flags)
 
 
+UNRESOLVED_PER_FILE_MAX = 50       # 1 ファイルの未解決の申告を Neo4j のノードへ保存する上限（超過は `unresolved_overflow_count`）
+NO_PRIMARY_LINES_MAX = 20          # `no_primary_definition` の `lines` の上限（超過は `lines_omitted`）
+
+
+def _count_nearest(rels, ref_rel) -> int:
+    """同一 top_scope の候補 rel のうち、`ref_rel` から最短距離にある数（`_resolve_*` が曖昧にした候補数と同じ数え方）。"""
+    same = [r for r in rels if _top(r) == _top(ref_rel)]
+    if not same:
+        return 0
+    best = min(_tree_distance(ref_rel, r) for r in same)
+    return sum(1 for r in same if _tree_distance(ref_rel, r) == best)
+
+
+def _is_unresolved_flag(f: dict, ref_rel: str) -> bool:
+    """`_link` が積んだ未解決系の申告（理由を列挙せず形で判定する＝`from`・`kind`・`name`・`line` を持つ）。"""
+    return f.get("from") == ref_rel and "kind" in f and "name" in f and "line" in f
+
+
+def _find_copy_cycles(nodes: dict, edges: list) -> list:
+    """COPIES の辺（ファイル単位に畳む）から循環（強連結成分・2 パス以上）を検出し、含まれるパスの昇順の列を返す。"""
+    graph: dict = defaultdict(set)
+    for e in edges:
+        if e.get("type") != "COPIES":
+            continue
+        a, b = nodes.get(e["src"]), nodes.get(e["dst"])
+        if a is None or b is None or a["path"] == b["path"]:
+            continue
+        graph[a["path"]].add(b["path"])
+        graph.setdefault(b["path"], set())
+    index: dict = {}
+    low: dict = {}
+    on_stack: set = set()
+    stack: list = []
+    out: list = []
+    counter = 0
+    for root in sorted(graph):
+        if root in index:
+            continue
+        work = [(root, iter(sorted(graph[root])))]
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            v, it = work[-1]
+            advanced = False
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = counter
+                    counter += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(sorted(graph[w]))))
+                    advanced = True
+                    break
+                if w in on_stack:
+                    low[v] = min(low[v], index[w])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[v])
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                if len(comp) > 1:
+                    out.append(sorted(comp))
+    return sorted(out)
+
+
 def build_world(world_dir, world_id: str, *, files=None):
     """資料フォルダ（登録ディレクトリ）を `(nodes, edges, flags)` にする。パス同一性＋同 top_scope 内の最近傍解決。
 
@@ -385,6 +736,7 @@ def build_world(world_dir, world_id: str, *, files=None):
     defs: dict = {}            # (label, NAME) -> [rel, ...]
     qualified_defs: dict = {}  # (label, cid_key) -> [(rel, 実名), ...]（cid_key が付く定義は常時登録）
     rel_name: dict = {}        # rel -> (label, NAME)  ＝ファイルの主体名
+    symbol_cids: dict = {}     # (rel, cid_key) -> 定義ノード（children）の cid  ＝`RefCandidate.source_symbol_id` の解決先
     texts: dict = {}           # rel -> (text, analyzer)
     nodes: dict = {}           # cid -> node
     edges: list = []
@@ -397,10 +749,13 @@ def build_world(world_dir, world_id: str, *, files=None):
     # children は `defs` に cid_key（修飾名）でしか登録されないため、`_link` が通常解決で unresolved のときだけ
     # 2 段目として参照する。索引キーに analyzer_name を含め、他言語の同名と誤接続しない。
     simple_name_defs: dict = {}
+    # `Table` 参照の解決専用: NAME -> [(rel, cid_key, schema|None), ...]（同名の表が複数 schema にある場合を区別する）。
+    table_defs: dict = {}
     # `via=config_key` 専用の索引: (label, key_kind, 裸キー) -> [(rel, cid_key), ...]。
     # 設定ファイルのキー child（`label=="Config"` かつ `cid_key` が `"key:"` 接頭辞）だけを登録し、primary（`defs`）候補を混ぜない。
     # `key_kind`（"property"/"bean"/"action"/"mapper"/"url"/"env"）を索引キーに含め、同じ裸キーの別種別を同一視しない。
     config_key_index: dict = {}
+    global_imports: dict = {}  # (アナライザ名, 最上位フォルダ) -> [ImportItem, ...]（`global using` など世代内の同じ言語の全ファイルへ効く import）
 
     def _def(label, name, rel):
         defs.setdefault((label, name), []).append(rel)
@@ -416,7 +771,7 @@ def build_world(world_dir, world_id: str, *, files=None):
     def _index_qualified(label, cid_key, rel, actual_name):
         """完全修飾名を解決索引（`defs` とは別枠）へ追加登録する。
 
-        `cid_key` が付いているものは条件なしで登録する（children は cid が `cid_key` で組み立てられるため、
+        `cid_key`（または `DefItem.qualified`）が付いているものは条件なしで登録する（children は cid が `cid_key` で組み立てられるため、
         skip すると完全修飾名参照が登録漏れになる）。
         """
         if cid_key is not None:
@@ -454,7 +809,8 @@ def build_world(world_dir, world_id: str, *, files=None):
                                            child_base.keys(), child.extra)
             nodes[child_cid] = {**child_base, **child_extra}
             _index_def(child.label, child.key, rel)   # children も解決対象にする
-            _index_qualified(child.label, child.cid_key, rel, child.key)
+            symbol_cids[(rel, child.key)] = child_cid
+            _index_qualified(child.label, child.resolve_key, rel, child.key)
             if child.key != child.name:                # 修飾名≠表示名＝言及辞書に単純名でも登録
                 mention_aliases.setdefault((child.label, child.name), []).append((rel, child.key))
                 if _simple_name_calls(analyzer_name):
@@ -508,6 +864,8 @@ def build_world(world_dir, world_id: str, *, files=None):
         # 受理済み（拡張子一致＋accepts 通過）なら主体の有無に関わらず Pass2 を通す（主体なしファイルも dropped_syntax 検知の対象）。
         texts[rel] = (rp, analyzer, hashlib.sha1(raw).hexdigest())   # 本文は保持しない（Pass2 で読み直す＝メモリを有界化）・指紋で同一性を照合
         defres = analyzer.collect_defs(text, rel)
+        for imp in analyzer.global_imports(text, rel):
+            global_imports.setdefault((analyzer.name, _top(rel)), []).append(imp)
         _flag_dropped(analyzer.name, rel, defres.dropped)
         if defres.primary is None:                        # 構文にマッチせず主体を持たない
             continue
@@ -516,13 +874,16 @@ def build_world(world_dir, world_id: str, *, files=None):
                           "label": defres.primary.label, "from": rel})
             continue
         _def(defres.primary.label, defres.primary.name, rel)
-        _index_qualified(defres.primary.label, defres.primary.cid_key, rel, defres.primary.name)
+        _index_qualified(defres.primary.label, defres.primary.resolve_key, rel, defres.primary.name)
         prim_cid = _cid(defres.primary.label, world_id, rel, defres.primary.name)
         prim_base = {**_node(defres.primary.label, world_id, rel, defres.primary.name,
                              value=defres.primary.value), "analyzer": analyzer.name}
         prim_extra = _sanitized_extra(analyzer.name, rel, defres.primary.label, defres.primary.name,
                                       prim_base.keys(), defres.primary.extra)
         nodes[prim_cid] = {**prim_base, **prim_extra}
+        if defres.primary.label == "Table":
+            table_defs.setdefault(defres.primary.name, []).append(
+                (rel, defres.primary.key, prim_extra.get("schema")))
         _register_children(prim_cid, defres.children, rel, analyzer.name)
 
         # 同一ファイル内の主体以外のトップレベル定義（DDL の 2 件目以降の `CREATE TABLE` 等）。
@@ -534,15 +895,17 @@ def build_world(world_dir, world_id: str, *, files=None):
                               "label": item.label, "from": rel})
                 continue
             _index_def(item.label, item.name, rel)
-            _index_qualified(item.label, item.cid_key, rel, item.name)
-            extra_cid = _cid(item.label, world_id, rel, item.name)
+            _index_qualified(item.label, item.resolve_key, rel, item.name)
+            extra_cid = _cid(item.label, world_id, rel, item.key)
             extra_base = {**_node(item.label, world_id, rel, item.name, value=item.value),
-                          "line": item.line, "analyzer": analyzer.name}
+                          "cid": extra_cid, "line": item.line, "analyzer": analyzer.name}
             extra_props = _sanitized_extra(analyzer.name, rel, item.label, item.name,
                                            extra_base.keys(), item.extra)
             nodes[extra_cid] = {**extra_base, **extra_props}
             if item.key != item.name:                  # 修飾名≠表示名＝言及辞書に単純名でも登録
                 mention_aliases.setdefault((item.label, item.name), []).append((rel, item.key))
+            if item.label == "Table":
+                table_defs.setdefault(item.name, []).append((rel, item.key, extra_props.get("schema")))
             _register_children(extra_cid, group.children, rel, analyzer.name)
 
     # --- Pass 2: 参照解決（同 top_scope 内 最近傍）＋構造エッジ ---
@@ -565,7 +928,7 @@ def build_world(world_dir, world_id: str, *, files=None):
         else:
             edge.update(extra)
 
-    def _link_config_key_all(etype, src_cid, kind, name, ref_rel, line, analyzer_name, extra, reverse):
+    def _link_config_key_all(etype, src_cid, kind, name, ref_rel, line, analyzer_name, extra, reverse, from_def):
         """`via=config_key` の参照だけ、同一 top_scope 内の同名 `Config` キー全件へ 1 本ずつエッジを張る特例。
 
         通常の最近傍/ambiguous 判定を迂回する（環境別設定ファイルが同名キーを持つ場合に両方へ張るため）。
@@ -585,21 +948,39 @@ def build_world(world_dir, world_id: str, *, files=None):
             edge = {"type": etype, "src": edge_src, "dst": edge_dst,
                    "doc": ref_rel, "line": line, "status": "active"}
             _apply_extra(edge, etype, ref_rel, analyzer_name, dict(extra))
+            edge["_rule"], edge["_from_def"] = "config_key_all", from_def
             link_edges.append(edge)
 
-    def _link(etype, src_cid, kind, name, ref_rel, line, analyzer_name=None, extra=None, reverse=False):
+    def _link(etype, src_cid, kind, name, ref_rel, line, analyzer_name=None, extra=None, reverse=False,
+              file_context=None, from_def=None):
+        """参照 1 件を解決して構造エッジを積む。`file_context` はその参照を含むファイルの解析の文脈（解決器が読む入力）。
+        `from_def` は参照元の定義 `{file, key}`。積む候補に、接続を決めた解決規則（`_rule`）と `_from_def` を付ける（集約が根拠 `sources` にする）。
+        """
         extra = dict(extra) if extra else {}
+        if file_context is not None:                      # その参照の行から見える package／namespace と import だけを解決器へ渡す
+            file_context = file_context.at(line)
         # `qualified` は解決の指示であってエッジの事実ではないため、共通層が消費して取り除く
-        qualified = bool(extra.pop("qualified", False)) and "." in name
+        absolute = bool(extra.pop("absolute", False))
+        qualified = (bool(extra.pop("qualified", False)) and "." in name) or absolute
+        type_ref = bool(extra.pop("type_ref", False))
+        chain_parents = _analyzer_parents(analyzer_name) if type_ref else None
+        requires_context = _analyzer_requires_context(analyzer_name) if type_ref else False
 
         if extra.get("via") == "config_key":              # A9: 通常解決の前に特例へ分岐
-            _link_config_key_all(etype, src_cid, kind, name, ref_rel, line, analyzer_name, extra, reverse)
+            _link_config_key_all(etype, src_cid, kind, name, ref_rel, line, analyzer_name, extra, reverse, from_def)
             return
 
         resolved_name = name
+        rule = "nearest_name"                             # 接続を決めた解決規則（分岐ごとに上書きする）
         # 同様に pop する（残すと `_apply_extra` が edge のプロパティへ透過する）
         path_suffix = bool(extra.pop("path_suffix", False)) if extra.get("via") == "include" else False
+        path_exact = bool(extra.pop("path_exact", False)) if extra.get("via") == "include" else False
         include_path = extra.get("include_path") if extra.get("via") == "include" else None
+
+        def _flag(reason, flag_name):
+            flags.append({"reason": reason, "from": ref_rel, "kind": kind, "name": flag_name,
+                          "line": line, "via": extra.get("via")})
+
         if path_suffix:
             # Spring `<import resource>` 等の classpath 相対パス参照: 資料フォルダ内の実ファイルの rel_path が末尾一致する形でしか解決しない。
             # 一意に決まらなければ接続しない。
@@ -611,32 +992,60 @@ def build_world(world_dir, world_id: str, *, files=None):
                              "via": extra.get("via")})
                 return
             resolved_name = rel_name[rel][1]
+            rule = "path_suffix"
         elif include_path and "/" in include_path:
-            # C の `#include` の 1 段目: 相対パス完全一致（同一 top_scope 内）。見つからなければ 2 段目（拡張子込み basename の最近傍）へ。
+            # `#include "path"` の 1 段目: 相対パス完全一致（同一 top_scope 内）。`path_exact` の参照は、一致しなければ未解決として申告する
+            # （basename の最近傍へ倒さない）。それ以外は 2 段目（拡張子込み basename の最近傍）へ。
             rel = _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name)
             if rel is None:
+                if path_exact:
+                    _flag("unresolved_qualifier", include_path)
+                    return
                 rel, status = _resolve_nearest(defs, kind, name, ref_rel)
                 if status:
-                    flags.append({"reason": status, "from": ref_rel, "kind": kind, "name": name,
-                                 "line": line, "via": extra.get("via")})
+                    _flag(status, name)
                     return
-        elif qualified:
-            rel, actual_name, status = _resolve_qualified(qualified_defs, kind, name, ref_rel)
-            if status == "ambiguous":                     # 同距離複数＝任意選択しない（単純名へも倒さない）
-                flags.append({"reason": "ambiguous", "from": ref_rel, "kind": kind, "name": name,
+            else:
+                rule = "path_exact"
+        elif kind == "Table":
+            schema_name, simple_name = getattr(name, "schema", None), getattr(name, "simple", name)
+            rel, actual_name, status = _resolve_table(table_defs, name, ref_rel)
+            if status:                                    # schema 違い・同名の複数 schema は任意選択しない
+                flags.append({"reason": status, "from": ref_rel, "kind": kind, "name": name,
                              "line": line, "via": extra.get("via")})
                 return
-            if status:                                    # 完全一致なし（unresolved/cross_scope）＝単純名へフォールバック
-                simple = name.rsplit(".", 1)[-1]
-                rel, status = _resolve_nearest(defs, kind, simple, ref_rel)
-                if status:
-                    flags.append({"reason": status, "from": ref_rel, "kind": kind, "name": simple,
-                                 "line": line, "via": extra.get("via")})
-                    return
-                resolved_name = simple
-                flags.append({"reason": "qualified_fallback", "from": ref_rel, "kind": kind, "name": name})
+            resolved_name = actual_name
+            if schema_name is None:
+                rule = "table_name"
             else:
-                resolved_name = actual_name
+                chosen = next((c for c in table_defs.get(simple_name, []) if c[0] == rel and c[1] == actual_name), None)
+                rule = "schema_exact" if chosen is not None and chosen[2] == schema_name else "schema_unqualified"
+        elif qualified:
+            # 完全修飾名の解決: 一致する定義が無ければ、短名へ倒さず未解決として申告する。
+            if type_ref and chain_parents:
+                rel, actual_name, status = _resolve_dotted_type_name(
+                    qualified_defs, kind, name, ref_rel, file_context, chain_parents,
+                    file_context.package_at(line) if file_context is not None else None, absolute)
+            else:
+                rel, actual_name, status = _resolve_qualified(qualified_defs, kind, name, ref_rel)
+            if status:                                    # ambiguous／cross_scope／unresolved
+                _flag("unresolved_qualifier" if status == "unresolved" else status, name)
+                return
+            resolved_name = actual_name
+            rule = "qualified_name"
+        elif type_ref and (file_context is not None or requires_context):
+            if file_context is None:                      # 必須の文脈が届かなかった（`file_context_missing` を別に申告済み）
+                _flag("unresolved", name)
+                return
+            rule_out: list = []
+            rel, actual_name, status, shown = _resolve_type_name(
+                qualified_defs, defs, kind, name, ref_rel, file_context, bool(chain_parents), file_context.package_at(line),
+                rule_out=rule_out)
+            if status:
+                _flag(status, shown)
+                return
+            resolved_name = actual_name
+            rule = rule_out[0] if rule_out else "nearest_name"
         else:
             rel, status = _resolve_nearest(defs, kind, name, ref_rel)
             if status == "unresolved" and _simple_name_calls(analyzer_name) and extra.get("via") == "call":
@@ -650,8 +1059,7 @@ def build_world(world_dir, world_id: str, *, files=None):
                 else:
                     rel, resolved_name, status = alt_rel, alt_key, ""
             if status:                                    # ''=解決／ambiguous/cross_scope/unresolved は flag
-                flags.append({"reason": status, "from": ref_rel, "kind": kind, "name": name,
-                             "line": line, "via": extra.get("via")})
+                _flag(status, name)
                 return
 
         dst_cid = _cid(kind, world_id, rel, resolved_name)
@@ -659,10 +1067,38 @@ def build_world(world_dir, world_id: str, *, files=None):
         edge = {"type": etype, "src": edge_src, "dst": edge_dst,
                "doc": ref_rel, "line": line, "status": "active"}
         _apply_extra(edge, etype, ref_rel, analyzer_name, extra)
+        edge["_rule"], edge["_from_def"] = rule, from_def
         link_edges.append(edge)
 
     # Pass1 完了直後（`rel_name` 確定後）に 1 回だけ構築し、`_link` が閉包で参照する
     path_suffix_index = _build_path_suffix_index(rel_name)
+
+    def _ambiguous_count(f, ref_rel, analyzer_name):
+        """曖昧にした候補の数（`flags` の `candidates`）。判定した索引（修飾名・単純名・表・手続き型の単純名・パス末尾）を引き直して数える。"""
+        kind, name = f["kind"], f["name"]
+        if f.get("reason") == "config_import_ambiguous":
+            return len(path_suffix_index.get((kind, _top(ref_rel), name), []))
+        if kind == "Table":
+            same = [c for c in table_defs.get(getattr(name, "simple", name), []) if _top(c[0]) == _top(ref_rel)]
+            schema = getattr(name, "schema", None)
+            if schema is not None:
+                same = [c for c in same if c[2] == schema] or [c for c in same if c[2] is None]
+            elif len({c[2] for c in same}) > 1:
+                return len(same)
+            return _count_nearest([c[0] for c in same], ref_rel)
+        pools = [[r for r, _n in qualified_defs.get((kind, name), [])],
+                 list(defs.get((kind, name), []))]
+        keyed = [(r, ck) for r, _k, ck in simple_name_defs.get((analyzer_name, kind, name), [])
+                 if _top(r) == _top(ref_rel)]
+        pools.append([r for r, ck in keyed if ck == "definition"] or [r for r, _ck in keyed])
+        for pool in pools:
+            n = _count_nearest(pool, ref_rel)
+            if n > 1:
+                return n
+        return None
+
+    unresolved_by_rel: dict = {}   # rel -> 未解決の申告（ファイルの主体ノードへ保存する）
+    unresolved_subject: dict = {}  # rel -> 主体ノードの cid
 
     for rel, (rp, analyzer, raw_sha1) in texts.items():
         # Pass1 は本文を保持しない（コード総量に比例したメモリを持たない）。Pass2 で 1 回読み直し、失敗時は Pass1 と同じ
@@ -682,11 +1118,26 @@ def build_world(world_dir, world_id: str, *, files=None):
             continue
         ref_result = analyzer.extract_refs(text, rel)
         _flag_dropped(analyzer.name, rel, ref_result.dropped)
-        name_pair = rel_name.get(rel)                     # 主体を持たないファイル（例: JOB の無い JCL PROC）は src が無い
-        if name_pair is None:                             # dropped は既に記録済み・参照エッジは張れない
+        file_context = ref_result.file_context
+        if file_context is not None and global_imports.get((analyzer.name, _top(rel))):
+            seen = {(i.kind, i.name, i.alias, i.static) for i in file_context.imports}
+            extra_imports = [i for i in global_imports[(analyzer.name, _top(rel))] if (i.kind, i.name, i.alias, i.static) not in seen]
+            file_context = FileContext(package=file_context.package, imports=file_context.imports + extra_imports,
+                                       namespaces=file_context.namespaces)
+        if file_context is None and getattr(analyzer, "requires_file_context", False):
+            flags.append({"reason": "file_context_missing", "analyzer": analyzer.name, "from": rel})
+        name_pair = rel_name.get(rel)                     # 主体を持たないファイルは src が無い
+        if name_pair is None:                             # dropped は既に記録済み・参照エッジは張れない＝読まなかったこと自体を申告する
+            if ref_result.refs:
+                lines = sorted(r.line for r in ref_result.refs)
+                nopd = {"reason": "no_primary_definition", "analyzer": analyzer.name, "from": rel,
+                        "count": len(lines), "line": lines[0], "lines": lines[:NO_PRIMARY_LINES_MAX]}
+                if len(lines) > NO_PRIMARY_LINES_MAX:
+                    nopd["lines_omitted"] = len(lines) - NO_PRIMARY_LINES_MAX
+                flags.append(nopd)
             continue
         label, name = name_pair
-        src = _cid(label, world_id, rel, name)
+        file_src = _cid(label, world_id, rel, name)
         for ref in ref_result.refs:
             if ref.edge_type not in analyzer_registry.EDGE_TYPES:
                 flags.append({"reason": "unknown_edge_type", "analyzer": analyzer.name,
@@ -696,11 +1147,49 @@ def build_world(world_dir, world_id: str, *, files=None):
                 flags.append({"reason": "unknown_label", "analyzer": analyzer.name,
                               "from": rel, "label": ref.kind})
                 continue
+            src = file_src                                # 既定の始点＝ファイルの主体
+            from_def = {"file": rel, "key": None}         # 申告の `from_def`＝参照元の定義（主体は key=None）
+            if ref.source_symbol_id is not None:
+                src = symbol_cids.get(ref.source_symbol_id) if ref.source_symbol_id[0] == rel else None
+                if src is None:                           # 自ファイルに無い定義を指した＝主体へ倒し、申告する
+                    flags.append({"reason": "unknown_source_symbol", "analyzer": analyzer.name, "from": rel,
+                                  "key": ref.source_symbol_id[1], "line": ref.line})
+                    src = file_src
+                else:
+                    from_def = {"file": rel, "key": ref.source_symbol_id[1]}
+            n_flags = len(flags)
             _link(ref.edge_type, src, ref.kind, ref.name, rel, ref.line,
-                 analyzer_name=analyzer.name, extra=ref.extra, reverse=ref.reverse)
+                 analyzer_name=analyzer.name, extra=ref.extra, reverse=ref.reverse,
+                 file_context=file_context, from_def=from_def)
+            for f in flags[n_flags:]:
+                if not _is_unresolved_flag(f, rel):
+                    continue
+                f["from_def"] = from_def
+                if f["reason"] in ("ambiguous", "config_import_ambiguous"):
+                    f["candidates"] = _ambiguous_count(f, rel, analyzer.name) or None   # None＝数えられなかった（0 ではない）
+                item = {"line": f["line"], "reason": f["reason"], "kind": f["kind"], "name": str(f["name"]),
+                        "via": f.get("via"), "from_def": from_def}
+                if "candidates" in f:
+                    item["candidates"] = f["candidates"]
+                unresolved_by_rel.setdefault(rel, []).append(item)
+                unresolved_subject[rel] = file_src
 
     # 同一 (src,type,dst) の複数候補を 1 本へ集約してから確定する（全 Pass2 エッジに適用・nodes/flags は不変）
     edges.extend(_aggregate_pass2_edges(link_edges))
+
+    # COPY のファイルをまたぐ循環（辺は残す）。取り込み記録（flags）だけに出す＝保存先のノードが 1 つに決まらない
+    for cycle in _find_copy_cycles(nodes, edges):
+        flags.append({"reason": "copy_cycle", "paths": cycle})
+
+    # 未解決の申告を、参照を書いたファイルの主体ノードへ載せる（`world_neo4j.load_world` が同じ tx で保存する）
+    for rel, items in unresolved_by_rel.items():
+        items.sort(key=lambda it: (it["line"], it["reason"], it["kind"], it["name"]))
+        node = nodes[unresolved_subject[rel]]
+        node["unresolved"] = items[:UNRESOLVED_PER_FILE_MAX]
+        node["unresolved_names"] = sorted({nm for it in items
+                                           for nm in (it["name"], it["name"].rsplit(".", 1)[-1])})
+        if len(items) > UNRESOLVED_PER_FILE_MAX:
+            node["unresolved_overflow_count"] = len(items) - UNRESOLVED_PER_FILE_MAX
 
     # Pass2 完了直後にコード本文を解放する（Pass3 は資料文書の本文を別経路で読み直す）
     texts.clear()

@@ -34,7 +34,7 @@ CASES = {
     "quoted_identifiers_preserve_case": (
         'CREATE TABLE "OrderLines" (\n    "LineNo" INT,\n    qty INT\n);\n', "OrderLines", None,
         [DI("LineNo", "OrderLines.LineNo"), DI("QTY", "OrderLines.QTY")], None, None),
-    "schema_dropped_into_extra": ("CREATE TABLE billing.orders (id INT);\n", "ORDERS", {"schema": "BILLING"}, None, None, None),
+    "schema_dropped_into_extra": ("CREATE TABLE billing.orders (id INT);\n", "ORDERS", {"schema": "BILLING", "qualified_name": "BILLING.ORDERS"}, None, None, None),
     "if_not_exists": ("CREATE TABLE IF NOT EXISTS orders (id INT);\n", "ORDERS", None, None, None, None),
     "multiple_create_table_rest_are_extras": (
         "CREATE TABLE orders (id INT);\nCREATE TABLE order_lines (order_id INT);\nCREATE TABLE customers (id INT);\n",
@@ -68,10 +68,10 @@ CASES = {
     # 引用識別子の内側の `--` はコメントと誤解釈しない
     "double_quoted_identifier_with_comment_marker": ('CREATE TABLE "a--b" (id INT);\n', "a--b", None, None, None, []),
     "bracket_quoted_identifier_with_comment_marker": ("CREATE TABLE [a--b] (id INT);\n", "a--b", None, None, None, []),
-    # schema 除去後の同名 Table は cid が衝突するため2件目以降を Dropped
-    "schema_qualified_name_collision": (
-        "CREATE TABLE a.orders (id INT);\nCREATE TABLE b.orders (id INT, extra INT);\n",
-        "ORDERS", {"schema": "A"}, None, [], ["table_name_collision"]),
+    # 同じ schema＋名前の重複は 2件目を Dropped
+    "same_schema_name_collision": (
+        "CREATE TABLE a.orders (id INT);\nCREATE TABLE a.orders (id INT, extra INT);\n",
+        "ORDERS", {"schema": "A", "qualified_name": "A.ORDERS"}, [DI("ID", "ORDERS.ID")], [], ["table_name_collision"]),
     # 方言
     "global_temporary_table": ("CREATE GLOBAL TEMPORARY TABLE staging (id INT);\n", "STAGING", None, [DI("ID", "STAGING.ID")], None, []),
     "local_temporary_table": ("CREATE LOCAL TEMPORARY TABLE staging (id INT);\n", "STAGING", None, None, None, None),
@@ -102,9 +102,16 @@ def test_extras_carry_their_own_columns():
     assert [[c.name for c in g.children] for g in res.extras] == [["ORDER_ID"], ["ID"]]
 
 
-def test_collision_snippet_names_the_second_table():
+def test_same_name_in_another_schema_is_a_separate_table_with_its_own_key():
     res = A.collect_defs("CREATE TABLE a.orders (id INT);\nCREATE TABLE b.orders (id INT);\n", "schema.sql")
-    assert res.dropped[0].snippet == "b.orders"
+    assert res.dropped == []
+    assert (res.primary.key, res.extras[0].primary.key) == ("ORDERS", "B.ORDERS")
+    assert res.extras[0].children[0].cid_key == "B.ORDERS.ID"
+
+
+def test_collision_snippet_names_the_second_table():
+    res = A.collect_defs("CREATE TABLE a.orders (id INT);\nCREATE TABLE a.orders (id INT);\n", "schema.sql")
+    assert res.dropped[0].snippet == "a.orders"
 
 
 def test_extract_refs_is_always_empty():

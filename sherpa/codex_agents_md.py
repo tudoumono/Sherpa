@@ -166,7 +166,7 @@ _STRUCTURED_RESPONSE_PARAGRAPH_V2 = f"""\
   `evidence_kinds` は、この主張の根拠として**実際に開いて確認した**資料の種別を列挙する配列
   （`source`／`spec_doc`／`definition`／`log_config`／`callgraph` の閉集合・複数可・無ければ
   空配列）。`source` は `src/` のコード本文を実際に読んだときだけ入れる（一覧・件数だけの取得は
-  含めない）。`callgraph` はグラフ照会（graph_neighbors 等）で確認したとき、グラフが使えなければ
+  含めない）。`callgraph` はグラフ照会（graph_neighbors・graph_impact 等）で確認したとき、グラフが使えなければ
   ripgrep 等の呼出し検索で代替確認したときに入れる。`confirmed` にするのは、この質問の型が必要と
   する根拠種別（仕様問い合わせ＝ソース＋設計書／影響調査＝ソース＋呼出関係／トラブルシュート＝
   ソース＋ログ・設定／作成系＝ソース＋設計書。登録範囲に無い種別は対象外）が `evidence_kinds` に
@@ -239,7 +239,7 @@ def _investigation_ledger_paragraph(direct_read: bool = True, layer: str | None 
   worker を使わない場合は親が全 item を登録・更新する（`owner: "parent"`）。同じ id を2つの
   プロセスが同時に更新しない。`error` が返ったら `problems` を読み、入力を直して再呼び出しする。
 - 台帳の項目のために探す・読むとき（ripgrep_search／es_search／read_doc／read_around／file_head／
-  graph_neighbors）は、その項目の item id を `item` 引数に付ける。
+  graph_neighbors／graph_resolve／graph_impact）は、その項目の item id を `item` 引数に付ける。
 - item の欄は `id`／`kind`／`subject`／`required_checks`／`evidence`／`status`／`reason`／`owner`
   の8キーちょうど（余分なキーは書かない）。`id` は英数字・ハイフン・アンダースコアのみ。`subject`・
   `reason` は2,000文字まで。`evidence` は `kind`（`source`／`spec_doc`／`definition`／

@@ -481,7 +481,7 @@ def _answer_impact(result, world):
     elif presumed:  # 構造的な影響は無いが資料から関連を辿れた＝0 で突き放さない
         names = "、".join(dict.fromkeys(p["name"] for p in presumed[:3]))
         headline = (f"「{start}」に構造的な依存は見つかりませんでしたが、資料から"
-                    f"**関連の可能性**が {len(presumed)}件（推定・要確認）: {names} など。")
+                    f"見つけた関連が {len(presumed)}件あります: {names} など。")
     else:
         headline = f"「{start}」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
     if code_silent:  # 次の一手＝検索へ素直に誘導（フォルダ起因と断定しない）

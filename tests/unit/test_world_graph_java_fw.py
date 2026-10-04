@@ -74,7 +74,7 @@ def test_bean_class_resolves_to_qualified_package_and_does_not_connect_to_same_n
     foo_b = ("Module", "Foo", "spring/com/acme/b/Foo.java")
     assert ("INVOKES", config, foo_a, "bean_class") in ek
     assert ("INVOKES", config, foo_b, "bean_class") not in ek
-    assert not [f for f in flags if f.get("reason") in ("ambiguous", "qualified_fallback")
+    assert not [f for f in flags if f.get("reason") in ("ambiguous", "unresolved_qualifier")
                 and f.get("from") == "spring/applicationContext.xml"]
 
 

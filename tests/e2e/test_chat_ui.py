@@ -152,6 +152,33 @@ def test_chat_streams_answer_with_explicit_scope(page, web_base_url):
     assert records["turn_starts"][-1]["personal"] is True
 
 
+def test_impact_detail_explains_why_connected_in_plain_words(page, web_base_url):
+    """影響の詳細を開くと「なぜつながっているか」が平文で出る（参照元の文書と行が複数・内部の値と確からしさの語は出ない）。"""
+    _open(page, web_base_url)
+    _ask(page)
+    row = page.locator("#messages .ilist li").nth(0)
+    row.locator(".top").click()
+    why = row.locator(".why")
+    expect(why).to_contain_text("なぜつながっているか")
+    expect(why).to_contain_text("TAXCALC は TAX-RATE を COPY で取り込んでいます")
+    expect(why).to_contain_text("参照元: 4期/03_開発/01_ソース/TAXCALC.cbl〔行 12〕 / 4期/03_開発/01_ソース/TAXCALC.cbl〔行 40〕 ほか 2 件")
+    text = page.locator("#messages").inner_text()
+    for word in ("確実", "要確認", "推定", "nearest_name", "via", "rule"):
+        assert word not in text, word
+
+
+def test_presumed_only_impact_uses_plain_words_without_grades(page, web_base_url):
+    """構造の影響が無く資料から見つけた関連だけのとき、見出しと別枠に確からしさの語（確実・推定・要確認）が出ない。"""
+    answer = {**IMPACT_ANSWER, "headline": "「税率」に構造的な依存は見つかりませんでしたが、資料から見つけた関連が 1件あります: TAXCALC など。",
+              "data": {"items": [], "presumed": [{"category": "ソース", "name": "TAXCALC", "evidence": [{"doc": "d.md", "quote": "税率"}]}]}}
+    _open(page, web_base_url, stream_events=_answer_events(answer))
+    _ask(page)
+    expect(page.locator("#messages")).to_contain_text("資料から見つけた関連")
+    text = page.locator("#messages").inner_text()
+    for word in ("確実", "要確認", "推定"):
+        assert word not in text, word
+
+
 def test_scope_panel_tree_toggle_and_filter(page, web_base_url):
     _open(page, web_base_url)
     page.locator("#scopebtn").click()

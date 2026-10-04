@@ -13,13 +13,16 @@ Sherpa 管理のベーススキル（自作）。型は「変更対象を特定�
 
 1. 変更対象（例: 税率・項目名・プログラム名）を `ripgrep_search(query=...)` か `es_search(query=...)` で
    特定する。名前が1つでも判明したら、以降は grep を反復するより関係グラフで辿るほうが早い。
-2. 判明した名前を起点に `graph_neighbors(name=...)` で**関連部品を最優先に**辿る（コピー・呼び出し・
-   参照・関連文書（言及）の近傍を、つながりの経路つきで返す）。
-3. 経路の先（影響先候補）が資料か文書かで、もう一段 `graph_neighbors` を繰り返して波及範囲を広げる。
+2. 判明した名前を起点に、**2 段**で影響先を求める。①`graph_resolve(name=..., path=..., kind=...)` で起点の候補を並べ
+   （同名の別ノードは別の候補＝`path` と `qualified_name` で見分ける）、正しい 1 件の `canonical_id` を選ぶ。②その
+   `canonical_id` を `graph_impact(canonical_id=...)` へ渡すと、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES）だけを
+   矢印の逆向きにたどった影響先が、段数（`distance`）・経路（`trace`・`route`）つきで返る。言及（DOCUMENTS）は影響に数えず
+   `related_documents`（関連資料）に分かれる。候補が複数で選べないときは `ask_user` で確認してよい。
+3. 影響を求める用途は `graph_impact` を使い、`graph_neighbors`（無向・言及を含む近傍）は関連部品を広く見たいときに補う。
 
 手順の骨格: ①変更対象に依存する部品・記述を特定 → ②影響先候補（例: 夜間バッチ＝JCL/ジョブ）を特定 →
-③両者の接続（COPIES／INVOKES／ACCESSES／CONTAINS＝構造的な依存の経路）を `graph_neighbors` で
-当たる。**`graph_neighbors` は近傍ごとに辺の種類と向き（from→to）が返る**。COPIES／INVOKES／ACCESSES／
+③両者の接続（COPIES／INVOKES／ACCESSES／CONTAINS＝構造的な依存の経路）を `graph_impact`（補助に
+`graph_neighbors`）で当たる。**`graph_impact` の `route` と `graph_neighbors` の近傍は、辺の種類と向き（from→to）が返る**。COPIES／INVOKES／ACCESSES／
 CONTAINS だけで構成された経路は影響の根拠にしてよい。**向きの読み方: 影響は矢印をさかのぼる。`A →COPIES→ B` は A が B を取り込んでいる＝**B を変えると A が影響を受ける**（変更対象から出ていく矢印の先は影響先ではない）。経路に DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）の辺や、`unverified` の辺（裏付け原本が実在確認できない）が 1 本でも含まれる近傍は構造的な依存ではない＝候補どまり（原本で確認する）。**
 経路の先の実際の記述を引用したいときだけ原本を開く。
 
@@ -55,6 +58,9 @@ Excel/Word/PowerPoint/PDF の設計書側に影響先の記述があるときは
 
 ## 3. 完了条件と中断
 
+- `graph_impact` の `coverage.complete` が `false` のときは、影響先が空でも「影響なし」とは言えない＝未確認。理由は
+  `coverage.limits[].kind`（`depth`＝深さの先に影響先が残る→`depth` を上げて呼び直す／`result_cap`＝`limit` で切った→
+  `limit` を上げる・`path` で起点を変えて絞る／`timeout`・`row_cap`＝範囲を絞る）。未確認の範囲を回答に明示する。
 - `graph_neighbors` の各近傍は辺ごとの種類と向き（from→to）が返る。COPIES／INVOKES／ACCESSES／CONTAINS
   だけで構成された経路は影響の根拠にしてよい（影響は矢印をさかのぼる＝変更対象へ矢印が向いている側が
   影響を受ける）。経路に DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）の辺や `unverified` の辺（裏付け原本が

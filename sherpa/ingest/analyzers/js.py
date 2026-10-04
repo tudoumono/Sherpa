@@ -1,6 +1,7 @@
 """JS アナライザ。`.js`/`.mjs` を全件受理し（`.ts` は対象外）、ファイル自体を主体定義（`Module`・拡張子込みファイル名）とする（children なし）。
 
-参照抽出（コメントは空白化し、文字列/テンプレートリテラルの中身は残す）:
+参照抽出（コメントは空白化する。文字列/テンプレートリテラルの中身は、API の引数の位置にあるものだけ残し、それ以外は空白化する）:
+- 残す文字列＝`import("…")`・`import … from "…"`・`require("…")`・`importScripts("…")`・`fetch("…")`・`axios.<method>("…")`・`.open("<METHOD>", "…")`・`url: "…"`・`location.href = "…"`・`.action = "…"` の引数。テンプレートの `${ … }` の中はコードとして走査し直す。説明文やテンプレートの文字列の中に書かれたコードの断片（`"import x from './b.js'; fetch('/api/z')"`）は読まず、`Dropped("js_string_code")` を 1 件申告する。
 - `import ... from "./y.js"`／`require("./y")`／`importScripts("…")` → `INVOKES(via=include)`（拡張子なしは `.js` を補う・C アナライザと同じ2段解決）。`import`/`require` は `.` 始まりのパスに限る（裸のパッケージ名は除く）。外部参照スキームは `Dropped("web_external_ref")`、`/` 始まりは top scope へ連結して相対パス化、`?`/`#` 以降は除去する。
 - 文字列リテラルの URL（`fetch`・`$.ajax({url})`・`axios.*`・`XMLHttpRequest.open`・`location.href =`・`.action =`）→ `ACCESSES(via=config_key)`（`/` 始まりは URL キー、`.action` は Struts action キー）。呼び出し元の型は検証しない粗い判定。
 - 動的連結（`"/orders/" + id`）は `Dropped("js_dynamic_url")`（一致区間単位で除外する）。
@@ -98,6 +99,95 @@ def _sanitize_comments_only(text: str) -> str:
     return "".join(out)
 
 
+# 文字列リテラルの直前の並び（API の引数の位置）。`.open(` は第 1・第 2 引数の両方を残す。
+_ARG_POSITION_PREFIX = re.compile(
+    r'(?:\b(?:import|require|importScripts|fetch)\s*\(\s*'
+    r'|\baxios\s*\.\s*[A-Za-z]+\s*\(\s*'
+    r'|\.\s*open\s*\(\s*(?:[^,()]*,\s*)?'
+    r'|\b(?:import|export)\b[^"\'`;()]*?\bfrom\s*'
+    r'|\bimport\s*'
+    r'|\burl\s*:\s*'
+    r'|\blocation\s*\.\s*href\s*=\s*'
+    r'|\.\s*action\s*=\s*)$')
+_PREFIX_WINDOW = 400
+
+
+def _mask_non_api_strings(sanitized: str) -> tuple:
+    """API の引数の位置にない文字列/テンプレートリテラルの中身を、長さと改行を保ったまま空白化する。テンプレートの `${ … }` の中はコードとして走査し直す（入れ子の文字列・テンプレートも同じ規則）。API の引数の位置のテンプレートは、`${}` が無ければ区切りを `"` に置き換えて文字列と同じに読み、`${}` を含むものは動的な連結として位置を返す。戻り値は `(空白化後の文字列, 中身がコードの形だった空白化区間の開始位置の列, 動的なテンプレートの開始位置の列)`。"""
+    out = list(sanitized)
+    code_like: list = []
+    dynamic_templates: list = []
+    n = len(sanitized)
+
+    def blank(start: int, end: int) -> None:
+        body = sanitized[start:end]
+        if body.strip():
+            if any(p.search(body) for p in (_IMPORT_FROM, _EXPORT_FROM, _REQUIRE, _IMPORT_SCRIPTS, _URL_CALL_SITES)):
+                code_like.append(start)
+            for k in range(start, end):
+                if out[k] != "\n":
+                    out[k] = " "
+
+    def string(i: int) -> int:
+        quote = sanitized[i]
+        start = j = i + 1
+        while j < n and sanitized[j] != quote:
+            j += 2 if sanitized[j] == "\\" and j + 1 < n else 1
+        end = min(j, n)
+        prefix = sanitized[max(0, i - _PREFIX_WINDOW):i]
+        if not _ARG_POSITION_PREFIX.search(prefix):
+            blank(start, end)
+        return j + 1
+
+    def template(i: int) -> int:
+        api = bool(_ARG_POSITION_PREFIX.search(sanitized[max(0, i - _PREFIX_WINDOW):i]))
+        j = seg = i + 1
+        dynamic = False
+        while j < n and sanitized[j] != "`":
+            if sanitized[j] == "\\":
+                j += 2
+            elif sanitized[j] == "$" and sanitized[j + 1:j + 2] == "{":
+                dynamic = True
+                if not api:
+                    blank(seg, min(j, n))
+                else:
+                    blank(seg, j)  # 動的な連結は静的な部分も読まない（申告する）
+                j = code(j + 2, True) + 1
+                seg = j
+            else:
+                j += 1
+        end = min(j, n)
+        if api and not dynamic and j < n:
+            out[i] = out[j] = '"'  # 静的なテンプレートは文字列と同じに読む
+        else:
+            blank(seg, end)
+            if api and dynamic:
+                dynamic_templates.append(i)
+        return j + 1
+
+    def code(i: int, in_expr: bool) -> int:
+        depth = 0
+        while i < n:
+            ch = sanitized[i]
+            if in_expr and ch == "{":
+                depth += 1
+            elif in_expr and ch == "}":
+                if depth == 0:
+                    return i
+                depth -= 1
+            elif ch in ('"', "'"):
+                i = string(i)
+                continue
+            elif ch == "`":
+                i = template(i)
+                continue
+            i += 1
+        return i
+
+    code(0, False)
+    return "".join(out), code_like, dynamic_templates
+
+
 def _newline_offsets(text: str) -> list:
     return [i for i, ch in enumerate(text) if ch == "\n"]
 
@@ -107,19 +197,23 @@ def _line_at(newline_offsets: list, pos: int) -> int:
 
 
 # `import ... from "./x"`（side-effect の `import "./x"` も含む）。単一物理行内に限る。
-_IMPORT_FROM = re.compile(r'\bimport\b[^"\'\n]*?["\'](?P<path>\.\.?/[^"\']+)["\']')
+_FROM_CLAUSE = r'[^"\'`;()]*?\bfrom\b'
+_IMPORT_FROM = re.compile(
+    r'\bimport\b(?:' + _FROM_CLAUSE + r')?\s*\(?\s*["\'](?P<path>\.\.?/[^"\']+)["\']')
+# `export … from "./x"`（複数行も 1 文として読む）。
+_EXPORT_FROM = re.compile(r'\bexport\b' + _FROM_CLAUSE + r'\s*["\'](?P<path>\.\.?/[^"\']+)["\']')
 # `require("./x")`。
-_REQUIRE = re.compile(r'\brequire\(\s*["\'](?P<path>\.\.?/[^"\']+)["\']\s*\)')
+_REQUIRE = re.compile(r'\brequire\s*\(\s*["\'](?P<path>\.\.?/[^"\']+)["\']\s*\)')
 # `importScripts("x")`。
-_IMPORT_SCRIPTS = re.compile(r'\bimportScripts\(\s*["\'](?P<path>[^"\']+)["\']')
+_IMPORT_SCRIPTS = re.compile(r'\bimportScripts\s*\(\s*["\'](?P<path>[^"\']+)["\']')
 
 _DYNAMIC_URL_HINT = re.compile(r'["\'](?P<path>/[^"\']*)["\']\s*\+')
 
 # URL/パス文字列リテラルを引数に取る呼び出し（`fetch`/`axios.*`/`.open(method, url)`/`url:`／`location.href =`／`.action =`）。
 _URL_CALL_SITES = re.compile(
-    r'\bfetch\(\s*["\'](?P<path_fetch>/[^"\']*)["\']'
-    r'|\baxios\.[a-zA-Z]+\(\s*["\'](?P<path_axios>/[^"\']*)["\']'
-    r'|\.open\(\s*["\'][A-Za-z]+["\']\s*,\s*["\'](?P<path_xhr>/[^"\']*)["\']'
+    r'\bfetch\s*\(\s*["\'](?P<path_fetch>/[^"\']*)["\']'
+    r'|\baxios\s*\.\s*[a-zA-Z]+\s*\(\s*["\'](?P<path_axios>/[^"\']*)["\']'
+    r'|\.\s*open\s*\(\s*[^,()]*,\s*["\'](?P<path_xhr>/[^"\']*)["\']'
     r'|\burl\s*:\s*["\'](?P<path_url_key>/[^"\']*)["\']'
     r'|location\.href\s*=\s*["\'](?P<path_href>/[^"\']*)["\']'
     r'|\.action\s*=\s*["\'](?P<path_action>[^"\']*)["\']'
@@ -164,6 +258,7 @@ class JsAnalyzer(Analyzer):
     name = "js"
     extensions = JS_EXT
     doctype = "js"
+    version = 2
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         filename = PurePosixPath(rel_path).name
@@ -178,13 +273,21 @@ class JsAnalyzer(Analyzer):
         refs: list = []
         dropped: list = []
 
-        for pattern in (_IMPORT_FROM, _REQUIRE, _IMPORT_SCRIPTS):
-            for m in pattern.finditer(sanitized):
+        # 行配列は1回だけ作る（ループ内で毎回分割すると二次時間になる）。
+        sanitized_lines = sanitized.splitlines()
+        masked, code_like, dynamic_templates = _mask_non_api_strings(sanitized)
+        for start in dynamic_templates:
+            line = _line_at(newline_offsets, start)
+            dropped.append(Dropped("js_dynamic_url", line, sanitized_lines[line - 1].strip()[:120]))
+        for start in code_like:
+            line = _line_at(newline_offsets, start)
+            dropped.append(Dropped("js_string_code", line, sanitized_lines[line - 1].strip()[:120]))
+
+        for pattern in (_IMPORT_FROM, _EXPORT_FROM, _REQUIRE, _IMPORT_SCRIPTS):
+            for m in pattern.finditer(masked):
                 line = _line_at(newline_offsets, m.start())
                 _emit_include(m.group("path"), line, rel_path, refs, dropped)
 
-        # 行配列は1回だけ作る（ループ内で毎回分割すると二次時間になる）。
-        sanitized_lines = sanitized.splitlines()
         dynamic_spans = [m.span() for m in _DYNAMIC_URL_HINT.finditer(sanitized)]
         seen_lines: set = set()
         for start, end in dynamic_spans:
@@ -197,7 +300,7 @@ class JsAnalyzer(Analyzer):
 
         # `_URL_CALL_SITES` と `dynamic_spans` はともに位置昇順なので、単調ポインタで1回だけ突合する。
         dyn_idx, n_dyn = 0, len(dynamic_spans)
-        for m in _URL_CALL_SITES.finditer(sanitized):
+        for m in _URL_CALL_SITES.finditer(masked):
             u_start, u_end = m.start(), m.end()
             while dyn_idx < n_dyn and dynamic_spans[dyn_idx][1] <= u_start:
                 dyn_idx += 1

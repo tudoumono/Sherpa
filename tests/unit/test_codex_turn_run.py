@@ -375,6 +375,54 @@ def test_tool_labels_for_folder_tree_compare_and_ledger_tools(tmp_path, monkeypa
     assert not any("秘密の本文" in json.dumps(e, ensure_ascii=False) for e in events)
 
 
+def test_graph_impact_and_resolve_have_their_own_labels_and_are_counted_in_improvement_log(tmp_path, monkeypatch):
+    """影響の道具 2 つは「その他の処理」に丸めず専用ラベルで出し、改善ログの「ツール呼び出し」集計の対象にも入る。"""
+    from sherpa import improvement_log
+    body = (_tool_item("graph_resolve", {"name": "Account"}, "r1")
+            + _tool_item("graph_impact", {"canonical_id": "module:v1:a#A"}, "r2")
+            + H._msg("確認しました。"))
+    events, _, _ = _run(tmp_path, monkeypatch, body, "labels-impact-u1")
+    assert (_nodes(events, "cx-r1")[-1]["label"], _nodes(events, "cx-r1")[-1]["detail"]) == ("影響調査の起点を探す", "「Account」")
+    assert _nodes(events, "cx-r2")[-1]["label"] == "影響先をたどる"
+    assert {"影響調査の起点を探す", "影響先をたどる"} <= improvement_log._TOOL_CALL_LABELS
+
+
+def test_graph_impact_normal_result_is_recorded_as_a_finished_node_without_losing_the_call(tmp_path, monkeypatch):
+    """通常の結果（影響先あり）でも呼び出しのノード（ラベル・引数の識別子）が完了で残り、旧世代の縮退の印は付かない。"""
+    ok = {"content": [{"type": "text", "text": json.dumps(
+        {"start": {"canonical_id": "c1", "path": "a/A.java"}, "impact": [{"canonical_id": "c2", "name": "B", "path": "a/B.java"}], "count": 1,
+         "coverage": {"complete": True, "limits": [], "omitted": 0}})}]}
+    body = _tool_item("graph_impact", {"canonical_id": "c1"}, "ok1", result=ok) + H._msg("確認しました。")
+    events, env, _ = _run(tmp_path, monkeypatch, body, "impact-ok-u1")
+    node = _nodes(events, "cx-ok1")[-1]
+    # 結果の要約（件数・完了／未完了・先頭の識別子とパス）が思考ノードの補足として残る＝会話の再表示でも戻る
+    assert (node["label"], node["status"]) == ("影響先をたどる", "done")
+    assert node["detail"] == "起点 a/A.java・影響先1件・調査は完了：a/B.java (c2)"  # 引数の識別子ではなく結果の起点（パス）
+    assert "graph_degraded" not in env
+
+
+def test_failed_graph_impact_does_not_record_the_requested_identifier(tmp_path, monkeypatch):
+    """起点が見つからない（範囲外・秘匿を含む）・入力の誤りの失敗応答では、引数の識別子を思考ノードに残さず固定の文言にする。"""
+    secret = "module:v1:secret/credentials.py#X"
+    for iid, err, expect in (("f1", {"error": "graph_start_not_found", "canonical_id": secret}, "起点が見つかりませんでした"),
+                             ("f2", {"error": "graph_invalid_args", "message": "m"}, "調べられませんでした"),
+                             ("f3", {"impact": [], "error_code": "graph_unavailable"}, "調べられませんでした")):
+        res = {"isError": bool(err.get("error")), "content": [{"type": "text", "text": json.dumps(err)}]}
+        body = _tool_item("graph_impact", {"canonical_id": secret}, iid, result=res) + H._msg("確認しました。")
+        (tmp_path / iid).mkdir()
+        events, _, _ = _run(tmp_path / iid, monkeypatch, body, f"impact-{iid}-u1")
+        assert [n["detail"] for n in _nodes(events, f"cx-{iid}")][-1] == expect
+        assert "credentials" not in json.dumps(events, ensure_ascii=False)
+
+
+def test_graph_impact_era_error_degrades_like_graph_neighbors(tmp_path, monkeypatch):
+    era = {"isError": True, "content": [{"type": "text", "text": json.dumps(
+        {"error": "graph_reingest_required", "stored_era": "old"})}]}
+    body = _tool_item("graph_impact", {"canonical_id": "x"}, "g1", result=era) + H._msg("原本を直接読んで調べました。")
+    _, env, _ = _run(tmp_path, monkeypatch, body, "era-impact-u1")
+    assert env["graph_degraded"] == "graph_reingest_required"
+
+
 def test_ledger_tool_details_are_closed_vocabulary_and_labels_are_counted_in_improvement_log():
     """台帳ツールの補足は件数と状態語彙だけ（不正な型・語彙外は空）。表示ラベルは改善ログの集計対象にも入っている。"""
     from sherpa import improvement_log

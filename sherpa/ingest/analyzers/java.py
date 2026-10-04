@@ -1,9 +1,10 @@
 """Java アナライザ。`public class/interface/enum/record`（ファイル主体）を主体定義（`Module`）とし、同一ファイル内の非 public 型を子定義（`CONTAINS`）として返す。
 
 参照（`INVOKES`・細分は `extra["via"]`）:
-- `new X(...)`・`X.method(...)`（大文字始まりの修飾子＝クラス名とみなす）→ `call`、`extends`/`implements`。
+- `new X(...)`・`X.method(...)`（大文字始まりの修飾子＝クラス名とみなす）→ `call`、`extends`/`implements`。型名は縮めない: `a.b.X` のような package 付きは完全修飾名（`qualified`）、全ての型参照に `type_ref`（共通層が `file_context` の package・import で解決する）を付ける。入れ子の型（`Outer.Inner`）は外側の型 `Outer` へ寄せる。
 - フィールド/コンストラクタ引数/メソッド引数の宣言型 → `field_type`（アノテーションに依らず常に抽出。直前が `@Autowired`/`@Inject`/`@Resource` なら `inject` に格上げ）。トップレベル型の直下（brace 深度1）・単一行のものに限る。
-- `import` はエッジにせず、主体の `extra["imports"]` へヒントとして積む。
+- `import` はエッジにせず、`RefResult.file_context`（`package`・`imports`）として共通層へ渡す。
+- 参照の始点（`source_symbol_id`）は、その行を本体に含む型。主体以外の型（同一ファイルの非 public 型）は `(rel_path, 型名)`、主体の型・型の外は省略（ファイルの主体）。
 
 設定キー参照（`ACCESSES`→`Config`・`via=config_key`）: `@Value("${k}")`（`${k:default}` の default は捨てる・複数あれば全部）・`getProperty("k")`・`getString("k")` は `key_kind="property"`、`getBean("k")`・`@Qualifier`・`@Named`・`@Resource(name=...)` は `"bean"`。キーは識別子形のみ。同じ `(key, key_kind)` は最初の出現行にまとめる。SpEL・`@ConfigurationProperties(prefix)`・非リテラル引数は `Dropped`（`config_spel`/`config_prefix`/`config_nonliteral`）で申告する。
 URL キー定義: クラスレベル `@RequestMapping` の prefix（配列は直積）とメソッドレベルのマッピング注釈を連結し、primary の children（`Config`・`cid_key="key:url:"+パス`・`key_kind="url"`）として返す。注釈は単一行で完結するものだけ検出する。
@@ -16,21 +17,22 @@ from __future__ import annotations
 import bisect
 import re
 
-from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
+from ._base import (Analyzer, DefItem, DefResult, Dropped, FileContext, ImportItem, RefCandidate, RefResult,
+                    body_end_line)
 
 # 拡張子は本ファイルに閉じて持つ（`static_analysis.py` は COBOL/JCL/コピーブック用）。
 JAVA_EXT = frozenset({".java"})
 
 _PACKAGE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
-_IMPORT = re.compile(r"^\s*import\s+(?:static\s+)?([\w.*]+)\s*;", re.M)
+_IMPORT = re.compile(r"^\s*import\s+(static\s+)?([\w.*]+)\s*;", re.M)
 _TYPE_DECL = re.compile(r"\b(?:class|interface|enum|record)\s+([A-Za-z_$][\w$]*)")
 _PUBLIC_MODIFIER = re.compile(r"\bpublic\b")
 _EXTENDS_CLAUSE = re.compile(r"\bextends\s+(.+?)(?:\bimplements\b|$)", re.S)
 _IMPLEMENTS_CLAUSE = re.compile(r"\bimplements\s+(.+)$", re.S)
-# `new X(...)`／`X.method(...)`（大文字始まりの修飾子＝クラス名とみなすヒューリスティック。誤りは共通層が unresolved flag に倒す）。
+# `new X(...)`／`X.method(...)`（大文字始まりの修飾子＝クラス名とみなすヒューリスティック。小文字始まりの修飾子の連なりは package 名として型名に含める。誤りは共通層が未解決に倒す）。
 _CALL_LIKE = re.compile(
     r"\bnew\s+(?P<new_type>[A-Za-z_$][\w$.]*)(?:\s*<[^>{};]*>)?\s*\("
-    r"|\b(?P<static_type>[A-Z][\w$]*)\.(?P<static_method>[A-Za-z_$][\w$]*)\s*\("
+    r"|\b(?P<static_type>(?:[a-z_$][\w$]*\.)*[A-Z][\w$]*(?:\.[A-Z][\w$]*)*)\.(?P<static_method>[A-Za-z_$][\w$]*)\s*\("
 )
 # extends/implements のヘッダをボディ開始 `{` まで前方探索する上限。
 _HEADER_SCAN_LIMIT = 4000
@@ -446,13 +448,35 @@ def _strip_generics(s: str) -> str:
     return "".join(out)
 
 
+def _type_ref_name(token: str) -> tuple:
+    """型トークン（`a.b.Outer.Inner`・`Outer.Inner`・`Type`）から `(名前, 完全修飾か)` を返す。
+
+    最初の大文字始まりの要素までが、その型を宣言するトップレベルの型（入れ子の型は外側の型へ寄せる）。
+    それより前に要素があれば package 修飾付きの完全修飾名として保持する（縮めない）。大文字始まりが無ければ全体を完全修飾名とみなす。
+    """
+    segs = token.split(".")
+    for i, seg in enumerate(segs):
+        if seg[:1].isupper():
+            return ".".join(segs[:i + 1]), i > 0
+    return token, "." in token
+
+
+def _type_ref(name_token: str, line: int, via: str) -> RefCandidate:
+    """型名の参照 1 件。完全修飾名は `qualified`、いずれも `type_ref`（参照元ファイルの package・import に従って解決する）。"""
+    name, qualified = _type_ref_name(name_token)
+    extra = {"via": via, "type_ref": True}
+    if qualified:
+        extra["qualified"] = True
+    return RefCandidate("INVOKES", "Module", name, line, extra=extra)
+
+
 def _split_type_list(raw: str) -> list:
-    """`extends`/`implements` 節の型リストを単純名のリストへ（ジェネリクス・パッケージ修飾を落とす）。"""
+    """`extends`/`implements` 節の型リストを型トークンのリストへ（ジェネリクスだけ落とし、package 修飾は保持する）。"""
     names = []
     for part in _strip_generics(raw).split(","):
-        simple = re.sub(r"[^\w$.]", "", part).rsplit(".", 1)[-1]
-        if simple:
-            names.append(simple)
+        token = re.sub(r"[^\w$.]", "", part).strip(".")
+        if token:
+            names.append(token)
     return names
 
 
@@ -503,20 +527,20 @@ def _emit_declared_type_refs(refs: list, type_token: str, generics_token: str | 
 
     JDK 頻出型・小文字始まり（プリミティブ/変数名紛れ）は候補にしない。ジェネリクスは1段まで（`_strip_generics`）。
     """
-    simple = type_token.rsplit(".", 1)[-1]
+    simple = _type_ref_name(type_token)[0].rsplit(".", 1)[-1]
     if simple[:1].isupper() and simple not in _JDK_COMMON_TYPES:
-        refs.append(RefCandidate("INVOKES", "Module", simple, line, extra={"via": via}))
+        refs.append(_type_ref(type_token, line, via))
     if not generics_token:
         return
     inner = generics_token.strip("<>")
     for arg in _split_top_level_commas(inner):
         arg = _strip_generics(arg).strip()
         arg = re.sub(r"\[\]\s*$", "", arg).strip()
-        simple_arg = arg.rsplit(".", 1)[-1]
+        simple_arg = _type_ref_name(arg)[0].rsplit(".", 1)[-1]
         if (simple_arg[:1].isupper() and simple_arg not in _JDK_COMMON_TYPES
-                and re.fullmatch(r"[A-Za-z_$][\w$]*", simple_arg)):
+                and re.fullmatch(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*", arg)):
             # ジェネリクス型引数は常に field_type（inject 格上げは宣言型本体のみ）。
-            refs.append(RefCandidate("INVOKES", "Module", simple_arg, line, extra={"via": "field_type"}))
+            refs.append(_type_ref(arg, line, "field_type"))
 
 
 def _collect_declared_type_refs(sanitized: str) -> list:
@@ -580,6 +604,11 @@ def _iter_top_level_type_decls(sanitized: str):
     return top, nested
 
 
+def _primary_index(top: list) -> int:
+    """トップレベル型のうちファイルの主体にする型の添字（最初の public 型・無ければ先頭）。`collect_defs` と `extract_refs` で共有する。"""
+    return next((i for i, (_m, _l, pub) in enumerate(top) if pub), 0)
+
+
 def _header_of(sanitized: str, decl_end: int) -> str:
     """型宣言の直後からボディ開始 `{` 直前までのヘッダ文字列（`extends`/`implements` 節を含み得る・複数行可・上限あり）。"""
     window_end = min(len(sanitized), decl_end + _HEADER_SCAN_LIMIT)
@@ -595,6 +624,8 @@ class JavaAnalyzer(Analyzer):
     name = "java"
     extensions = JAVA_EXT
     doctype = "java"
+    requires_file_context = True
+    version = 3
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         sanitized = _sanitize(text)
@@ -607,23 +638,22 @@ class JavaAnalyzer(Analyzer):
             return DefResult(dropped=dropped)
 
         # primary＝最初の public 型。public が無ければ最初の型宣言を primary にする（ノードを黙って消さない）。
-        primary_idx = next((i for i, (_m, _l, pub) in enumerate(top) if pub), 0)
+        primary_idx = _primary_index(top)
         primary_m, primary_line, _pub = top[primary_idx]
         primary_name = primary_m.group(1)
 
         pm = _PACKAGE.search(sanitized)
         package = pm.group(1) if pm else None
         qualified = f"{package}.{primary_name}" if package else primary_name
-        imports = [m.group(1) for m in _IMPORT.finditer(sanitized)]
 
         extra = {}
         if package:
-            extra["qualified_name"] = qualified  # cid_key は現行 world_graph では
-        if imports:  # primary に対し未消費
-            extra["imports"] = imports
+            extra["qualified_name"] = qualified  # ノードの属性（cid_key と同じ値）
         primary = DefItem(label="Module", name=primary_name, cid_key=qualified, extra=extra)
 
-        children = [DefItem(label="Module", name=m.group(1), line=line)
+        # 非 public 型は cid を変えず、解決用の完全修飾名（`qualified`）だけを持つ（同じ package からの参照を完全修飾名で引くため）。
+        children = [DefItem(label="Module", name=m.group(1), line=line,
+                            qualified=f"{package}.{m.group(1)}" if package else m.group(1))
                     for i, (m, line, _pub) in enumerate(top) if i != primary_idx]
 
         # URL キー定義側: クラスレベル @RequestMapping の prefix とメソッドレベルのマッピング注釈を連結し、`Config` children として返す。
@@ -639,24 +669,21 @@ class JavaAnalyzer(Analyzer):
 
         top, _nested = _iter_top_level_type_decls(sanitized)
         for m, line, _pub in top:
-            header = _header_of(sanitized, m.end())
+            header = _strip_generics(_header_of(sanitized, m.end()))   # 型パラメータの境界（`<T extends X>`）をクラスの extends と取り違えない
             em = _EXTENDS_CLAUSE.search(header)
             if em:
                 for name in _split_type_list(em.group(1)):
-                    refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "extends"}))
+                    refs.append(_type_ref(name, line, "extends"))
             im = _IMPLEMENTS_CLAUSE.search(header)
             if im:
                 for name in _split_type_list(im.group(1)):
-                    refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "implements"}))
+                    refs.append(_type_ref(name, line, "implements"))
 
         for m in _CALL_LIKE.finditer(sanitized):
             line = _line_at(sanitized, m.start())
-            if m.group("new_type"):
-                name = _strip_generics(m.group("new_type")).rsplit(".", 1)[-1]
-            else:
-                name = m.group("static_type")
+            name = (_strip_generics(m.group("new_type")) if m.group("new_type") else m.group("static_type")).strip(".")
             if name:
-                refs.append(RefCandidate("INVOKES", "Module", name, line, extra={"via": "call"}))
+                refs.append(_type_ref(name, line, "call"))
 
         # 宣言型参照（フィールド/コンストラクタ引数/メソッド引数）。
         refs.extend(_collect_declared_type_refs(sanitized))
@@ -665,5 +692,28 @@ class JavaAnalyzer(Analyzer):
         config_refs, config_dropped = _collect_config_key_refs(text)
         refs.extend(config_refs)
 
+        # 始点＝その行を本体に含む型（主体以外の型だけ。主体・型の外は省略＝ファイルの主体）。
+        # 同じ行に 2 つ以上の型がかかる行は決められないので主体にし、`Dropped("ambiguous_source_symbol")` を 1 行 1 件残す。
+        primary_idx = _primary_index(top)
+        spans = [(i, m.group(1), line, body_end_line(sanitized, m.end())) for i, (m, line, _pub) in enumerate(top)]
+        ambiguous_dropped: list = []
+        ambiguous_lines: set = set()
+        for ref in refs:
+            hits = [(i, name) for i, name, start, end in spans if start <= ref.line <= end]
+            if len(hits) > 1:
+                if ref.line not in ambiguous_lines:
+                    ambiguous_lines.add(ref.line)
+                    ambiguous_dropped.append(Dropped("ambiguous_source_symbol", ref.line,
+                                                     ", ".join(n for _i, n in hits)))
+            elif hits and hits[0][0] != primary_idx:
+                ref.source_symbol_id = (rel_path, hits[0][1])
+
+        pm = _PACKAGE.search(sanitized)
+        imports = [ImportItem(kind="wildcard" if m.group(2).endswith(".*") else "single",
+                              name=m.group(2)[:-2] if m.group(2).endswith(".*") else m.group(2),
+                              static=bool(m.group(1)), line=_line_at(sanitized, m.start(2)))
+                   for m in _IMPORT.finditer(sanitized)]
+        file_context = FileContext(package=pm.group(1) if pm else None, imports=imports)
+
         # nested type は collect_defs 側で記録済み（二重記録しない）。
-        return RefResult(refs=refs, dropped=config_dropped)
+        return RefResult(refs=refs, dropped=config_dropped + ambiguous_dropped, file_context=file_context)

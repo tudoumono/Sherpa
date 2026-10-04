@@ -468,6 +468,12 @@ def _assert_deny_audit_for_invalid_base_url(row: dict) -> None:
     assert row["detail"]["host"] == _FIXED_LABEL
 
 
+def _max_audit_id() -> int:
+    with store._connect() as c:
+        r = c.execute("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log").fetchone()
+    return r["m"]
+
+
 _BAD_INHERITED_BASE_URLS = (
     # kind=azure（接続先の整合検査まで進む）: 文字列だが不正・非文字列・falsy な非文字列
     [("azure", "https://host.example\\internal\\secret")]
@@ -489,17 +495,20 @@ def test_admin_openai_endpoint_test_rejects_invalid_inherited_saved_base_url(
     _patch_sys_settings(monkeypatch, saved)
     monkeypatch.setattr(graph_extract, "complete_json", _forbid("不正な保存値なのに complete_json が呼ばれた"))
 
-    before_rows = store.list_audit(action="openai_endpoint.tested", limit=1)
-    before_id = before_rows[0]["id"] if before_rows else None
+    before_id = _max_audit_id()
 
     r = admin_client.post(_EP_TEST, json={"provider": "openai"})
     assert r.status_code == 422, f"kind={saved_kind!r} base={bad_value!r}: {r.text}"
 
-    rows = store.list_audit(action="openai_endpoint.tested", limit=5)
-    assert rows, "接続テストの監査行が記録されていない（fail-closed で probe 前に記録する契約）"
-    assert rows[0]["id"] != before_id, "新しい監査行が書かれていない（stale row）"
-    assert "internal" not in rows[0]["detail"]["host"] and "secret" not in rows[0]["detail"]["host"]
-    _assert_deny_audit_for_invalid_base_url(rows[0])
+    # 一覧（created_at の降順）は他のテストが残した時刻の行に押し出されうるので、連番の id で新しい行だけを引く
+    with store._connect() as c:
+        new_rows = c.execute(
+            "SELECT id, outcome, reason, severity, detail FROM audit_log "
+            "WHERE action = 'openai_endpoint.tested' AND id > %s ORDER BY id", (before_id,)).fetchall()
+    assert new_rows, "接続テストの監査行が記録されていない（fail-closed で probe 前に記録する契約）"
+    row = dict(new_rows[-1])
+    assert "internal" not in row["detail"]["host"] and "secret" not in row["detail"]["host"]
+    _assert_deny_audit_for_invalid_base_url(row)
 
 
 @pytest.mark.parametrize("bad_value", [{}, [], 0, False, ["https://host.example"]])

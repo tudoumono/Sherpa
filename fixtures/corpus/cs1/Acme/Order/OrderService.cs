@@ -1,5 +1,5 @@
 namespace Acme.Order;
-
+using Acme.Core;
 using Acme.Data;
 
 public class OrderService : BaseService, IOrderService

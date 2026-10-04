@@ -144,7 +144,7 @@ def test_cobol_jcl_copybook_graph_is_unaffected_by_the_extra_transparency_mechan
     nodes, edges, flags = world_graph.build_world(wd, "v1_regress_test")
     assert edges, "COBOL/JCL コーパスなら少なくとも1本はエッジが立つはず"
     by_cid = {n["cid"]: n for n in nodes}
-    base_edge_keys = {"type", "src", "dst", "doc", "line", "status"}
+    base_edge_keys = {"type", "src", "dst", "doc", "line", "status", "sources", "sources_overflow_count"}   # 根拠（ANA-14 S7）は全辺が持つ
     for e in edges:
         src_node = by_cid.get(e["src"])
         if src_node and src_node.get("analyzer") in ("cobol", "jcl", "copybook"):

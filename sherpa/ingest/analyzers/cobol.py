@@ -1,7 +1,7 @@
 """標準 COBOL アナライザ。`PROGRAM-ID` を主体定義（`Module`）とし、`COPY`/`CALL`/`EXEC SQL`/`EXEC CICS` を参照候補として返す。
 
-- `COPY` → `Copybook` 参照、`CALL 'X'` → `Module` 参照（INVOKES）、動的 CALL は `Dropped`。
-- `EXEC SQL ... END-EXEC`（複数物理行にまたがる）は、`FROM`/`JOIN`/`INSERT INTO`/`MERGE INTO`/`UPDATE`/`DELETE FROM` 直後のテーブル名を `ACCESSES`→`Table`（`via=exec_sql`）で返す。サニタイズ・テーブル名抽出は `_sql_scan` と共通。動的 SQL（`DECLARE ... CURSOR`／`EXECUTE IMMEDIATE`）は `Dropped("exec_sql_dynamic")`。
+- `COPY` → `Copybook` 参照、`CALL 'X'` → `Module` 参照（INVOKES）、動的 CALL は `Dropped`。`CALL` の語が文字列リテラルの内側にあるもの（`DISPLAY "CALL 'X'"`）は呼び出しにしない（`CALL` 文のオペランドの引用符つきプログラム名は残す）。
+- `EXEC SQL ... END-EXEC`（複数物理行にまたがる）は、`FROM`/`JOIN`/`INSERT INTO`/`MERGE INTO`/`UPDATE`/`DELETE FROM` 直後のテーブル名を `ACCESSES`→`Table`（`via=exec_sql`）で返す。サニタイズ・テーブル名抽出は `_sql_scan` と共通。`DECLARE ... CURSOR FOR SELECT ...`（静的カーソル）は表への参照にし、準備済みの文の名前を指すカーソル（`CURSOR FOR STMT1`）と `EXECUTE IMMEDIATE` は `Dropped("exec_sql_dynamic")`。
 - `EXEC CICS` は `XCTL`/`LINK` の `PROGRAM('X')` を `INVOKES`（`via=cics_xctl`/`cics_link`）で返す。識別子（動的）は `Dropped("cics_dynamic")`、他コマンドはブロックごとに `Dropped("cics_other")` 1件。
 - 文字列リテラル中の語を拾わないため、開始検索は引用文字列を空白化した文字列で行う。`END-EXEC` は `_find_end_exec` が文字列・コメントの外だけで認識する。継続行結合した論理行でも `--` コメントは物理行境界を越えない。
 設計: docs/design/rag.md「グラフ」
@@ -13,7 +13,7 @@ import re
 
 from ..identifiers import normalize_code_name as _norm
 from ..static_analysis import (COBOL_EXT, _CALL, _COPY, _DYNAMIC_CALL,
-                               _PROGRAM_ID, _is_comment, _is_free_format,
+                               _PROGRAM_ID, _blank_pseudo_text, _is_comment, _is_free_format,
                                _normalize_logical_lines, _split_statements,
                                _strip_inline_comment, _strip_quoted)
 from . import _sql_scan
@@ -22,7 +22,13 @@ from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResul
 # EXEC SQL/EXEC CICS: ブロック境界・動的 SQL 検知の正規表現。`EXEC SQL`/`EXEC CICS` を1つの正規表現で拾い、種別で分岐する。
 _EXEC_BLOCK_START = re.compile(r"\bEXEC\s+(SQL|CICS)\b", re.IGNORECASE)
 _END_EXEC = re.compile(r"\bEND-EXEC\b", re.IGNORECASE)
-_DECLARE_CURSOR = re.compile(r"\bDECLARE\s+\S+\s+CURSOR\b", re.IGNORECASE)
+# カーソル名の後・`CURSOR` の前に属性（`SCROLL`・`NO SCROLL`・`ASENSITIVE` など）を置ける。
+_DECLARE_HEAD = r"\bDECLARE\s+\S+\s+(?:[A-Za-z]+\s+){0,4}?CURSOR\b"
+_DECLARE_CURSOR = re.compile(_DECLARE_HEAD, re.IGNORECASE)
+# `DECLARE c CURSOR [WITH HOLD …] FOR <対象>` の対象の先頭語。SELECT/WITH/VALUES/`(` なら静的、それ以外（準備済みの文の名前・ホスト変数）は動的。
+_DECLARE_CURSOR_FOR = re.compile(
+    _DECLARE_HEAD + r"[^;]*?\bFOR\s+\(*\s*(?P<target>[A-Za-z_:][\w-]*)", re.IGNORECASE)
+_STATIC_CURSOR_TARGETS = frozenset({"SELECT", "WITH", "VALUES"})
 _EXECUTE_IMMEDIATE = re.compile(r"\bEXECUTE\s+IMMEDIATE\b", re.IGNORECASE)
 
 
@@ -53,6 +59,15 @@ def _blank_cobol_strings(s: str) -> str:
         buf.append(" ")
         i += 1
     return "".join(buf)
+
+
+def _has_dynamic_cursor(sanitized: str) -> bool:
+    """`DECLARE ... CURSOR` のうち、`FOR` の対象が SELECT/WITH/VALUES でないもの（準備済みの文の名前など）があるか。`FOR` が読めない宣言も動的として扱う。"""
+    for dm in _DECLARE_CURSOR.finditer(sanitized):
+        fm = _DECLARE_CURSOR_FOR.match(sanitized, dm.start())
+        if fm is None or fm.group("target").upper() not in _STATIC_CURSOR_TARGETS:
+            return True
+    return False
 
 
 def _sanitize_cics_span(text: str, state: str | None) -> tuple:
@@ -135,11 +150,11 @@ def _sanitize_exec_sql_fragments(block_frags: list) -> str:
 def _exec_sql_block_refs(block_frags: list, start_line: int) -> tuple:
     """1つの `EXEC SQL ... END-EXEC` ブロックから `ACCESSES`→`Table` 候補を抽出する。戻り値は `(refs, dropped)`。
 
-    `DECLARE ... CURSOR`／`EXECUTE IMMEDIATE` を含むブロックはテーブル抽出をせず `Dropped("exec_sql_dynamic")` で申告する（判定はサニタイズ済み本文に対して行う）。テーブル名抽出は `_sql_scan.table_refs`。
+    準備済みの文の名前を指す `DECLARE ... CURSOR`／`EXECUTE IMMEDIATE` を含むブロックはテーブル抽出をせず `Dropped("exec_sql_dynamic")` で申告する（判定はサニタイズ済み本文に対して行う）。`CURSOR FOR SELECT ...` の静的カーソルは通常の SQL と同じくテーブル名を抽出する。テーブル名抽出は `_sql_scan.table_refs`。
     """
     combined = " ".join(t for _ln, t, _b in block_frags)
     sanitized = _sanitize_exec_sql_fragments(block_frags)
-    if _DECLARE_CURSOR.search(sanitized) or _EXECUTE_IMMEDIATE.search(sanitized):
+    if _has_dynamic_cursor(sanitized) or _EXECUTE_IMMEDIATE.search(sanitized):
         return [], [Dropped("exec_sql_dynamic", start_line, combined.strip()[:120])]
 
     offset_starts: list = []
@@ -220,6 +235,7 @@ class CobolAnalyzer(Analyzer):
     name = "cobol"
     extensions = frozenset(COBOL_EXT)
     doctype = "cobol"
+    version = 3
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         free_format = _is_free_format(text)
@@ -236,14 +252,17 @@ class CobolAnalyzer(Analyzer):
     def _process_normal_segment(code_part: str, logical_part: str, i: int,
                                  refs: list, dropped: list) -> None:
         """EXEC SQL ブロックの外側の1区間（COPY/CALL/動的 CALL 検知）。`code_part`/`logical_part` は同一物理行の一部分のことがあり、同じ開始位置を共有する（動的 CALL 検知だけは行末コメント切り捨て前の `logical_part` を使う）。"""
+        code_part, logical_part = _blank_pseudo_text(code_part), _blank_pseudo_text(logical_part)  # REPLACING の pseudo-text は読まない
         # COPY 抽出だけは引用文字列の中身も除去する（CALL は引用符内のプログラム名を読むため適用しない）。
         for cb in _COPY.findall(_strip_quoted(code_part)):
             refs.append(RefCandidate("COPIES", "Copybook", _norm(cb), i))
-        # CALL は文単位（ピリオド／END-CALL 区切り）で判定し、同一行の複数 CALL を取りこぼさない。引用文字列の中身は動的呼び出し判定の対象外。
-        for stmt in _split_statements(code_part):
-            for callee in _CALL.findall(stmt):
-                refs.append(RefCandidate("INVOKES", "Module", _norm(callee), i,
-                                          extra={"via": "call"}))
+        # CALL 文のオペランド（引用符つきプログラム名）だけを呼び出しにする。`CALL` の語そのものが文字列リテラルの内側にあるもの（`DISPLAY "CALL 'X'"`）は除く（リテラル内は `_blank_cobol_strings` で空白になる）。
+        blanked = _blank_cobol_strings(code_part)
+        for cm in _CALL.finditer(code_part):
+            if blanked[cm.start()] == " ":
+                continue
+            refs.append(RefCandidate("INVOKES", "Module", _norm(cm.group(1)), i,
+                                      extra={"via": "call"}))
         # 動的 CALL の検知は、インラインコメント切り捨て前の論理行に対して行う。
         for stmt in _split_statements(logical_part):
             # `_strip_quoted` が文字列リテラルの中身を空にするため、残る `CALL` はすべて動的呼び出し。出現ごとに個別判定する。

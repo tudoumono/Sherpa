@@ -354,6 +354,9 @@ def test_tools_list_by_layer(monkeypatch, layer):
     names = _tool_names()
     assert {"list_docs", "ripgrep_search", "read_around", "file_head"} <= names
     assert ("graph_neighbors" in names) is (layer in (None, "both"))
+    # 影響の道具（構造の辺だけ）は資料のみの層でだけ外す＝ソース限定でも出す
+    assert ({"graph_resolve", "graph_impact"} <= names) is (layer != "docs")
+    assert not (layer == "docs" and {"graph_resolve", "graph_impact"} & names)
     office = {"xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides", "pdf_pages"}
     assert (office <= names) is (layer != "code")
     assert not (layer == "code" and office & names)
@@ -365,7 +368,7 @@ def test_toolset_plain_exposes_only_three_and_rejects_others(monkeypatch):
     monkeypatch.setattr(M.es_index, "available", lambda: True)
     monkeypatch.setenv("SHERPA_MCP_TOOLSET", "plain")
     resp = _rpc("tools/list")
-    assert _tool_names(resp) == {"graph_neighbors", "ask_user"}
+    assert _tool_names(resp) == {"graph_neighbors", "ask_user"}  # graph_resolve・graph_impact は plain に出さない
     descs = " ".join(t["description"] for t in resp["result"]["tools"])
     assert not any(n in descs for n in ("ripgrep_search", "read_doc", "read_around", "list_docs"))
     graph = next(t for t in resp["result"]["tools"] if t["name"] == "graph_neighbors")
@@ -465,6 +468,60 @@ def test_graph_schema_era_error_is_structured_tool_error_with_sidecar_code_and_c
     assert entries[0]["kind"] == "error" and entries[0]["code"] == "graph_reingest_required"
     assert entries[0]["tool"] == "graph_neighbors"
     assert IL.load_coverage(directory) == {"e": ("error",)}
+
+
+def test_tools_call_graph_impact_and_resolve_stubbed(tmp_path, monkeypatch):
+    """通常の呼び出しが成功し、結果が item の台帳記録（打ち切りは limit）まで届く。層の限定中でも graph_impact は通る。"""
+    from sherpa import graph_tools
+    directory = tmp_path / "investigation"
+    monkeypatch.setenv("SHERPA_MCP_LEDGER_DIR", str(directory))
+    seen = []
+
+    def fake_run(name, args, world, sp, layer=None):
+        seen.append((name, layer))
+        if name == "graph_resolve":
+            return {"candidates": [{"canonical_id": "c1", "name": "A"}], "count": 1,
+                    "coverage": {"complete": True, "limits": [], "omitted": 0}}
+        return {"start": {"canonical_id": "c1"}, "impact": [], "count": 0, "truncated": True,
+                "coverage": {"complete": False, "limits": [{"kind": "depth", "stage": "impact"}], "omitted": None,
+                             "depth": {"requested": 5, "truncated": True}}}
+
+    monkeypatch.setattr(graph_tools, "run", fake_run)
+    monkeypatch.setenv("SHERPA_MCP_LAYER", "code")
+    assert _body(_call("graph_resolve", {"name": "A", "item": "r"}))["candidates"][0]["canonical_id"] == "c1"
+    resp = _call("graph_impact", {"canonical_id": "c1", "item": "i"})
+    assert not resp["result"]["isError"] and _body(resp)["coverage"]["complete"] is False
+    assert seen == [("graph_resolve", "code"), ("graph_impact", "code")]
+    assert IL.load_coverage(directory) == {"r": ("hit",), "i": ("limit",)}
+
+
+def test_graph_impact_rejected_when_layer_is_docs_and_era_error_is_structured(tmp_path, monkeypatch):
+    from sherpa import graph_tools
+    monkeypatch.setattr(graph_tools, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("層 docs で実行された")))
+    monkeypatch.setenv("SHERPA_MCP_LAYER", "docs")
+    resp = _call("graph_impact", {"canonical_id": "c1"})
+    assert resp["result"]["isError"] is True and "error" in _body(resp)
+    sidecar = tmp_path / "sidecar.jsonl"
+    monkeypatch.setenv("SHERPA_MCP_SIDECAR", str(sidecar))
+    monkeypatch.delenv("SHERPA_MCP_LAYER")
+    monkeypatch.setattr(graph_tools, "run", lambda *a, **k: (_ for _ in ()).throw(M.GraphSchemaEraError("v1", "old-era")))
+    resp = _call("graph_resolve", {"name": "A"})
+    assert resp["result"]["isError"] is True
+    assert _body(resp) == {"error": "graph_reingest_required", "world": "v1", "stored_era": "old-era"}
+    assert _entries(sidecar)[0]["code"] == "graph_reingest_required"
+
+
+def test_graph_impact_result_over_budget_keeps_coverage_and_start(monkeypatch):
+    """最終防衛線のクリップは影響先の末尾から削り、start・coverage を残して result_cap を足す。"""
+    big = {"start": {"canonical_id": "c1"}, "count": 40,
+           "impact": [{"canonical_id": f"c{i}", "name": "N" * 100} for i in range(40)],
+           "coverage": {"complete": True, "limits": [], "omitted": 0}}
+    monkeypatch.setenv("SHERPA_MCP_TOOL_BUDGET_BYTES", "2000")
+    clipped, was_clipped = M._clip_tool_result(big, name="graph_impact", args={"canonical_id": "c1"})
+    assert was_clipped and _final_bytes(clipped) <= 2000 and clipped["start"] == {"canonical_id": "c1"}
+    assert clipped["truncated"] is True and clipped["count"] == 40
+    assert {"kind": "result_cap", "stage": "impact"} in clipped["coverage"]["limits"]
+    assert clipped["coverage"]["omitted"] == 40 - len(clipped["impact"])
 
 
 def test_tool_error_without_known_code_writes_no_sidecar_entry(tmp_path, monkeypatch):
@@ -800,7 +857,8 @@ def test_clip_tool_result_under_budget_is_byte_identical(monkeypatch):
 
 # ===== COD-16: 項目ごとの未確認（item → coverage.jsonl）=====
 
-_ITEM_TOOLS = ("ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors")
+_ITEM_TOOLS = ("ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors",
+               "graph_resolve", "graph_impact")
 
 
 def test_item_param_present_optional_on_all_six_tools():
@@ -866,6 +924,13 @@ def test_item_coverage_read_doc_outcomes(tmp_path, monkeypatch):
     ("graph_neighbors", {"neighbors": [{"name": "X"}], "truncated": True, "count": 5}, False, "limit"),
     ("graph_neighbors", {"neighbors": [{"name": "X"}]}, False, "hit"),
     ("graph_neighbors", {"neighbors": [], "error_code": "graph_unavailable"}, False, "error"),
+    ("graph_impact", {"impact": [], "coverage": {"complete": True, "limits": [], "omitted": 0}}, False, "no_hits"),
+    ("graph_impact", {"impact": [], "coverage": {"complete": False, "limits": [{"kind": "depth"}], "omitted": None}},
+     False, "limit"),
+    ("graph_impact", {"impact": [{"name": "X"}], "coverage": {"complete": True, "limits": [], "omitted": 0}}, False, "hit"),
+    ("graph_impact", {"impact": [], "error_code": "graph_unavailable"}, False, "error"),
+    ("graph_resolve", {"candidates": [{"name": "X"}], "truncated": True}, False, "limit"),
+    ("graph_resolve", {"candidates": [{"name": "X"}]}, False, "hit"),
     # es_search の degrade_reason／truncated／truncated_docs は 0 件判定より前に見る
     ("es_search", {"hits": [], "degrade_reason": "es_unavailable"}, False, "error"),
     ("es_search", {"hits": [{"doc_id": "a", "text": "x"}], "degrade_reason": "es_query_failed"}, False, "error"),

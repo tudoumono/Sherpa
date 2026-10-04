@@ -12,7 +12,7 @@ import re
 import stat
 from pathlib import Path
 
-from ... import citations, es_index, grep_tool, redact_keys, worlds
+from ... import citations, es_index, graph_coverage, grep_tool, redact_keys, worlds
 from ...env_int import env_int
 from ... import layer as layer_mod
 from ... import scope as scope_mod
@@ -1067,6 +1067,23 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             view = _build_view(per_hit)
             attempts += 1
         return (view, docs, cites, cards)
+    if name in ("graph_resolve", "graph_impact"):
+        # 起点の候補（graph_resolve）→ 識別子からの影響のたどり（graph_impact）。構造の辺だけをたどり、層 code でも使える（資料は返さない）。層 docs は拒否する
+        from ... import graph_tools  # 遅延 import（循環回避）
+        from ...ingest.world_neo4j import GraphSchemaEraError  # 遅延 import（循環回避）
+        if layer == "docs":
+            return ({"error": graph_tools.LAYER_REJECT_MESSAGE}, docs, cites, cards)
+        try:
+            result = graph_tools.run(name, args, world, sp, layer=layer)
+        except GraphSchemaEraError as e:
+            return ({"error": GRAPH_REINGEST_ERROR_CODE, "world": e.world, "stored_era": e.stored_era},
+                    docs, cites, cards)
+        fitted = graph_tools.fit_to_bytes(result, tr_max_bytes)
+        if fitted is not None:
+            result = fitted[0]
+        elif graph_tools.json_bytes(result) > tr_max_bytes:
+            result = {"error": "tool_result_budget_too_small"}
+        return (result, docs, cites, cards)
     if name == "graph_neighbors":
         if layer not in (None, "both"):
             # 層が限定されている間は `graph_neighbors` 自体を拒否する（グラフ traversal は層フィルタ非適用のため、層外の名前・経路・doc_id が漏れる迂回路になる）
@@ -1105,12 +1122,30 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             cards.append(c)
         view = [{"name": c["name"], "role": c.get("role", ""), "category": c.get("category", ""),
                  "path": c.get("path", []), "distance": c.get("distance"),
-                 "edges": _card_edges_view(c)} for c in cards]
+                 "edges": _card_edges_view(c, world, sp)} for c in cards]
         result = {"neighbors": view}
+        # 打ち切りの申告（`coverage`）: 取得時の時間切れ・行数の天井・文書探索の打ち切り（`raw_cards.coverage`）に、カード数の上限を足す。
+        # 空・部分結果を「近傍なし」「近傍の全部」と区別させる（`complete:false` のとき `limits[].kind` が理由）。
+        coverage = getattr(raw_cards, "coverage", None)
+        coverage = coverage.copy() if coverage is not None else graph_coverage.Coverage()
+        omitted = None
         if len(clipped) < len(raw_cards):
             # 件数／バイト上限で捨てた分がある＝返した近傍は部分集合。打ち切りの事実と総数を返す（モデルが「すべて」と断定しないように）
+            partial = coverage.has(graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP)
             result["truncated"] = True
-            result["count"] = len(raw_cards)
+            # 取得自体が部分結果（時間切れ・行数の天井）なら総数・省略件数は確定できない
+            result["count"] = None if partial else len(raw_cards)
+            coverage.add(graph_coverage.KIND_CARD_CAP, graph_coverage.STAGE_CARDS)
+            omitted = None if partial else len(raw_cards) - len(clipped)
+        elif coverage.has(graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP):
+            result["truncated"] = True  # 時間切れの空・天井の部分結果も「一部しか調べていない」＝続きは取れない（総数は不明）
+        if _graph_error_code == graph_coverage.KIND_GRAPH_UNAVAILABLE:
+            coverage.add(graph_coverage.KIND_GRAPH_UNAVAILABLE)
+        if _graph_error_code in (None, graph_coverage.KIND_GRAPH_UNAVAILABLE):
+            result["coverage"] = coverage.as_dict(omitted=omitted)  # `graph_internal_error` は `error_code` だけ（`kind` に対応する語が無い）
+            unresolved = getattr(raw_cards, "unresolved", None)
+            if unresolved is not None:
+                result["unresolved"] = unresolved             # 起点の名前に一致する未解決の参照（保存が無い旧グラフは available:false）
         if _graph_error_code:
             # `neighbor_cards` が捕捉した障害コード（`"graph_unavailable"`／`"graph_internal_error"`）を返す（`run_tool` 境界が `backend_failures["graph"]` へ反映する）
             result["error_code"] = _graph_error_code
@@ -1373,15 +1408,39 @@ def verify_doc_exists(doc_id: str, world: str, scope_paths=None) -> bool:
     except Exception:
         return False
 
-def _card_edges_view(card: dict) -> list:
+def _card_source_ok(doc, world: str, sp, cache: dict) -> bool:
+    """辺の根拠が指す資料が、実在・範囲内・非秘匿か（辺の `doc` と同じ検証。同じ資料は 1 度だけ調べる）。"""
+    if not doc or text_kind.is_sensitive_doc_id(str(doc)):
+        return False
+    if doc not in cache:
+        cache[doc] = verify_doc_exists(doc, world, sp)
+    return cache[doc]
+
+
+def _card_sources_view(sources: list, world: str, sp, cache: dict, limit: int = 3) -> tuple:
+    """辺の根拠（`sources`）を LLM 向けに写す。資料（`doc_id`・`file`・`from_def.file`）が検証を通らない根拠は除く（伏せた件数は数えない）。"""
+    from ... import graph_tools  # 遅延 import（循環回避）
+    views = (graph_tools.source_view(s, lambda d: _card_source_ok(d, world, sp, cache)) for s in sources or [])
+    out = [v for v in views if v is not None]
+    # 検証で除いた後に先頭 `limit` 件へ切る（先に切ると有効な根拠が検証で落ちた根拠に押し出される）。切った分は戻り値の 2 つ目
+    return out[:limit], max(0, len(out) - limit)
+
+
+def _card_edges_view(card: dict, world: str | None = None, sp=None) -> list:
     """1 件の `graph_neighbors` card が持つ代表経路の辺（`evidence.edges`）を、LLM 向け `view` 用に既知キーだけ写して返す。`doc` は検証済み集合にある KB 内 rel_path だけ出す。壊れた・古い形の辺があっても落とさず、あるキーだけ拾う。"""
     ev = card.get("evidence", {}) or {}
     verified = card.get("_verified_doc_ids")
     out = []
+    cache: dict = {}
     for e in ev.get("edges", []) or []:
         if not isinstance(e, dict):
             continue
-        item = {k: e[k] for k in ("type", "from", "to", "doc") if e.get(k)}
+        item = {k: e[k] for k in ("type", "from", "to", "doc", "via", "rule") if e.get(k)}
+        if "line" in e and e["line"] is not None:
+            item["line"] = e["line"]
+        if world is not None and e.get("sources"):
+            item["sources"], cut = _card_sources_view(e["sources"], world, sp, cache)
+            item["sources_overflow_count"] = int(e.get("sources_overflow_count") or 0) + cut
         # 検証済み集合に無い doc を持つ辺は、doc を落として `unverified` を立てる（辺ごと消すと経路が繋がって見えて確定根拠に化ける。実在しない原本は名指しさせない）
         if item.get("doc") and verified is not None and item["doc"] not in set(verified):
             item.pop("doc", None)

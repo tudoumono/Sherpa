@@ -13,7 +13,10 @@ from dataclasses import dataclass, field
 class DefItem:
     """1件の定義候補（ノード化前）。`label` は docs/05-グラフ語彙.md のノードラベルのみ。
 
-    `cid_key` は canonical_id の識別子部分（省略時は `name`）。`extra` はノードへ足す追加プロパティ。
+    `cid_key` は `children` のノードの canonical_id の識別子部分（省略時は `name`）。主体（`primary`）と `extras` のノードの cid は `name` で組み、
+    `cid_key` は使わない。`extra` はノードへ足す追加プロパティ。
+    `qualified` は名前解決だけに使う完全修飾名（package／namespace 込み）。ノードの cid・表示名には関与しない。
+    共通層は `qualified`（無ければ `cid_key`）を、完全修飾名の参照（`RefCandidate.extra["qualified"]`・`type_ref`）が引く索引へ登録する（どちらも無ければ登録しない）。
     """
 
     label: str
@@ -22,11 +25,17 @@ class DefItem:
     value: str | None = None
     line: int | None = None
     extra: dict = field(default_factory=dict)
+    qualified: str | None = None
 
     @property
     def key(self) -> str:
         """canonical_id に使う識別子（`cid_key` 省略時は `name`）。"""
         return self.name if self.cid_key is None else self.cid_key
+
+    @property
+    def resolve_key(self) -> str | None:
+        """完全修飾名の索引に登録する名前（`qualified`、無ければ `cid_key`）。"""
+        return self.qualified if self.qualified is not None else self.cid_key
 
 
 @dataclass
@@ -54,7 +63,7 @@ class DefGroup:
 class DefResult:
     """`Analyzer.collect_defs` の戻り値（1ファイル分）。
 
-    `primary`＝ファイルの主体定義（無ければ `None`）。参照の起点になる。
+    `primary`＝ファイルの主体定義（無ければ `None`）。参照の既定の始点になる（`RefCandidate.source_symbol_id` が省略されたとき）。
     `children`＝主体に含まれる子定義（`primary -CONTAINS-> child`）。
     `extras`＝主体以外のトップレベル定義。参照の起点にはならない。
     `dropped`＝解析せず落とした構文。
@@ -98,8 +107,13 @@ class RefCandidate:
 
     共通層が `kind`/`name` を同一 top_scope 内最近傍で解決し、解決できたときだけ `edge_type` のエッジを張る（曖昧・未解決は `flags` に記録）。
     `extra` はエッジのプロパティへ加算される追加属性。細分は `extra["via"]`（`KNOWN_VIA` のみ）。
-    `extra["qualified"]`＝`name` を完全修飾名として解決する指示（エッジには残らない）。
-    `reverse`＝True なら「解決先→primary」の向きで張る。
+    `extra["qualified"]`＝`name` を完全修飾名として解決する指示（エッジには残らない）。完全修飾名が資料フォルダに無ければ辺は張らず未解決（`unresolved_qualifier`）。
+    `extra["type_ref"]`＝`name` が型名であり、参照元ファイルの `file_context`（package／namespace・import／using）に従って解決する指示（エッジには残らない）。
+    `extra["path_exact"]`＝`via=include` の `include_path` が相対パスの完全一致でしか解決しない指示（一致しなければ basename の最近傍へ倒さず未解決・エッジには残らない）。
+    `reverse`＝True なら「解決先→始点」の向きで張る。
+    `source_symbol_id`＝参照元の定義キー `(rel_path, cid_key)`（`cid_key` は定義ノードの cid を組む `DefItem.key` と同じ値）。
+    始点をその定義ノードにする。`None`（省略）はファイルの主体（`rel_path` の主体定義）。`collect_defs` が `children` として返した定義だけを指せる
+    （定義ノードの無い言語は常に省略）。
     """
 
     edge_type: str
@@ -108,14 +122,85 @@ class RefCandidate:
     line: int
     extra: dict = field(default_factory=dict)
     reverse: bool = False
+    source_symbol_id: tuple | None = None
+
+
+@dataclass
+class ImportItem:
+    """`FileContext.imports` の1件。
+
+    `kind`＝`"single"`（`import a.b.C;`・型名の import）／`"wildcard"`（`import a.b.*;`・C# の `using A.B;`・VB の `Imports A.B`・`name` は修飾部のみ）／`"alias"`（`using A = a.b.C;`・`alias` が `A`）。
+    `name` は完全修飾名。`static`＝`static` import／`using static`（型の名前を持ち込まないので型名の解決には使わない）。`line` は宣言の行。`scope`＝namespace ブロックの中で宣言された import の有効範囲 `(開始行, 終了行)`（`None` はファイル全体）。
+    """
+
+    kind: str
+    name: str
+    alias: str | None = None
+    static: bool = False
+    line: int = 0
+    is_global: bool = False
+    scope: tuple | None = None
+
+
+@dataclass
+class FileContext:
+    """1ファイル分の名前解決の文脈（`RefResult.file_context`）。`package`＝宣言された package／namespace（無ければ `None`）、`imports`＝`ImportItem` の宣言順の一覧。
+
+    `namespaces`＝1 ファイルに namespace が複数あるときの `(開始行, 終了行, 名前)` の一覧（型の本体の範囲）。参照の行を含む範囲の名前がその参照の namespace
+    （`package_at`）。範囲に入らない行は `package`。
+    """
+
+    package: str | None = None
+    imports: list = field(default_factory=list)
+    namespaces: list = field(default_factory=list)
+
+    def at(self, line: int) -> "FileContext":
+        """`line` の参照から見える文脈（その行の package／namespace と、有効範囲に `line` を含む import）。"""
+        visible = [i for i in self.imports if i.scope is None or i.scope[0] <= line <= i.scope[1]]
+        return FileContext(package=self.package_at(line), imports=visible)
+
+    def package_at(self, line: int) -> str | None:
+        """`line` の参照の package／namespace（最も狭い範囲・無ければ `package`）。"""
+        best = None
+        for start, end, name in self.namespaces:
+            if start <= line <= end and (best is None or end - start < best[1] - best[0]):
+                best = (start, end, name)
+        return self.package if best is None else best[2]
 
 
 @dataclass
 class RefResult:
-    """`Analyzer.extract_refs` の戻り値。`refs`＝参照候補、`dropped`＝解析せず落とした構文。"""
+    """`Analyzer.extract_refs` の戻り値。`refs`＝参照候補、`dropped`＝解析せず落とした構文。
+
+    `file_context`＝ファイル単位の解析の文脈（共通層が Pass 2 の解決器へ渡す）。`requires_file_context` を持つアナライザは常に返す。
+    """
 
     refs: list = field(default_factory=list)
     dropped: list = field(default_factory=list)
+    file_context: FileContext | None = None
+
+
+def body_end_line(sanitized: str, decl_end: int, scan_limit: int = 4000) -> int:
+    """型宣言の本体 `{ ... }` の閉じ括弧の行（1 始まり）を返す。
+
+    `sanitized` はコメント・文字列を空白化した本文。`decl_end` 以降 `scan_limit` 文字の内で最初の `{` を本体の開きとし、対応する `}` の行を返す。
+    開きの前に `;` がある（本体の無い宣言）・開きが見つからない場合は宣言行、閉じない場合は最終行を返す。
+    """
+    window_end = min(len(sanitized), decl_end + scan_limit)
+    brace = sanitized.find("{", decl_end, window_end)
+    semi = sanitized.find(";", decl_end, window_end)
+    if brace == -1 or (semi != -1 and semi < brace):
+        return sanitized.count("\n", 0, decl_end) + 1
+    depth = 0
+    for i in range(brace, len(sanitized)):
+        ch = sanitized[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return sanitized.count("\n", 0, i) + 1
+    return sanitized.count("\n") + 1
 
 
 class Analyzer:
@@ -125,6 +210,12 @@ class Analyzer:
     extensions: frozenset = frozenset()
     # 台帳・原本 API の表示用 doctype 文字列。
     doctype: str = ""
+    # True のアナライザは、名前空間が親へさかのぼって見える言語（C#・VB.NET）。型名の解決で、参照元の namespace の外側（親→グローバル）も順に探す。
+    resolves_parent_namespaces: bool = False
+
+    # True のアナライザは `extract_refs` が常に `file_context` を返す（欠けたら共通層が `file_context_missing` を `flags` へ申告する）。
+    requires_file_context: bool = False
+
     # 手続き型言語向け: 関数/手続きを children（`<ファイル>.<名前>`・extra `c_kind`）として返し、`via=call` の単純名参照を children へ解決させる。
     resolves_calls_by_simple_name: bool = False
 
@@ -146,6 +237,10 @@ class Analyzer:
         拡張子だけで決まるなら既定（常に真）のまま。同じ拡張子を複数が要求するときだけ、決定的な内容判定で上書きする。
         """
         return True
+
+    def global_imports(self, text: str, rel_path: str) -> list:
+        """同じ最上位フォルダ（世代）の全ファイルへ効く import（C# の `global using`）の `ImportItem` の一覧。共通層が Pass 1 で集め、同じ世代の各ファイルの `file_context.imports` へ足す。"""
+        return []
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         """定義候補の抽出（1パス目）。名前解決・ノード化・来歴付与・語彙検証は共通層が行う。"""

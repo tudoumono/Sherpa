@@ -19,7 +19,7 @@ class CodexTurnState:
         "_wall_clock_limit_s", "_wall_clock_state", "_resume_fallback_happened", "_sidecar_init_ok",
         "_graph_schema_era_error", "_mcp_error_codes", "_mcp_tool_result_clipped", "_mcp_total_budget_hit",
         "_mcp_duplicate_tool_call", "_mcp_search_truncated", "_mcp_tool_calls_exhausted", "_ask_disabled",
-        "mcp_neighbors", "_mcp_read_docs", "_mcp_listed_docs", "_mcp_calls", "_event_type_counts",
+        "mcp_neighbors", "mcp_graph_results", "_mcp_read_docs", "_mcp_listed_docs", "_mcp_calls", "_event_type_counts",
         "_child_thread_ids", "_all_parent_thread_ids", "_child_usage_totals", "_child_usage_found",
         "_child_usage_missing", "_child_usage_detected", "codex_created_files",
         "_created_file_rows", "_created_files_failed",
@@ -76,7 +76,7 @@ class CodexTurnState:
         self._resume_fallback_happened = False
         # サイドカーの吸収を許可してよいかの唯一のゲート。sandbox 有効時は事前 unlink・設定生成が両方成功した時、非サンドボックス経路は env 配線が済んだ時点で立てる（`_absorb_mcp_sidecar` 参照）。
         self._sidecar_init_ok = False
-        # `graph_neighbors` の mcp_tool_call item が旧世代グラフの構造化エラー（`_graph_schema_era_from_item`）を運んできたら捕まえる。調査は止めない（Codex は grep/原本読取ツールを使える）。「縮退した」という印として、終了後の env に冒頭告知と統計フラグを載せる。
+        # `graph_neighbors`・`graph_resolve`・`graph_impact` の mcp_tool_call item が旧世代グラフの構造化エラー（`_graph_schema_era_from_item`）を運んできたら捕まえる。調査は止めない（Codex は grep/原本読取ツールを使える）。「縮退した」という印として、終了後の env に冒頭告知と統計フラグを載せる。
         self._graph_schema_era_error = None
         # 子（worker/evaluator）がサイドカー経由で報告した障害コード（`mcp_server._SIDECAR_ERROR_CODES`）。
         self._mcp_error_codes: list = []
@@ -92,6 +92,7 @@ class CodexTurnState:
         # 確認ID 付き再送（前の質問への回答）では ask_user を無視する（再質問ループ防止）。
         self._ask_disabled = bool(re.search(r"確認ID[:：]", ctx.message or ""))
         self.mcp_neighbors: list = []  # Codex が graph_neighbors で引いた近傍（UI カードに反映）
+        self.mcp_graph_results: list = []  # graph_resolve／graph_impact の結果の要約（`mcp._graph_tool_summary`・思考ノードの補足と同じ文）
         # MCP の read 系ツール（read_doc/read_around/doc_outline/compare_documents）の引数から集めた doc_id。attempt をまたいで合算し、最終 answer の「参照した資料:」の解析結果に合流させ、機械検証してから env["sources"] へ足す。
         self._mcp_read_docs: list = []
         # `xlsx_sheets`（シート一覧のみ）は上と分けて集める。sources には合流させるが、根拠ゲート（sources_verified）には数えない。

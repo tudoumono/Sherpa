@@ -4,7 +4,7 @@
 FW はルート要素のローカル名で判定する（namespace URI は問わない）。Spring Batch の要素だけは namespace URI で判定する。
 
 参照:
-- `beans`: `<bean class>` → `Config -INVOKES(via=bean_class, qualified)-> Module`。`<bean parent>`・`<property ref>`・`<constructor-arg ref>` → `Config -ACCESSES(via=config_key, key_kind="bean")-> Config`。`<context:property-placeholder location>` は `Dropped("config_placeholder_location")`。
+- `beans`: `<bean class>` → `Config -INVOKES(via=bean_class, qualified)-> Module`（完全修飾名が資料フォルダに無ければ辺を張らず未解決）。`<bean parent>`・`<property ref>`・`<constructor-arg ref>` → `Config -ACCESSES(via=config_key, key_kind="bean")-> Config`。`<context:property-placeholder location>` は `Dropped("config_placeholder_location")`。
 - `<import resource>`（`<beans>` 直下）→ `Config -INVOKES(via=include)-> Config`。宛先は `classpath:` 等のプレフィックスを除いたパスの形のまま（`extra["path_suffix"]`）で、共通層（`world_graph._resolve_path_suffix`）が同一 top_scope 内の末尾一致が1件のときだけ接続する（0件は `config_import_unresolved`、複数件は `config_import_ambiguous` の flag）。`resource` が無い場合は `Dropped("config_import_missing_resource")`、ワイルドカード（`*`/`?`）は `Dropped("config_import_wildcard")`。
 - `mapper`: ルートの `namespace` → `Module -INVOKES(via=mapper_namespace, qualified, reverse)-> Config`。`resultType`/`parameterType` の完全修飾名 → `via=mapper_type`、組み込み別名など完全修飾名でない値は `Dropped("mapper_type_alias")`。`<select|insert|update|delete|sql>` の本文のテキストノードを連結し、`_sql_scan` で抽出したテーブル名を `Config -ACCESSES(via=mapper_sql)-> Table`（文ごとに同じテーブルは1回）。`<include refid>` は展開せず `Dropped("mapper_include")`。
 - `struts`: `<action class>` → `Config -INVOKES(via=action_class, qualified)-> Module`。
@@ -252,7 +252,7 @@ class XmlConfigAnalyzer(Analyzer):
     extensions = XML_CONFIG_EXT
     doctype = "xml_config"
     # 解析結果が変わる変更をしたときに上げる（`registry.config_signature()` の材料。上げると既存 world が全再構築される）。
-    version = 2
+    version = 3
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         scan = _scan(text)
@@ -368,6 +368,10 @@ class XmlConfigAnalyzer(Analyzer):
                 combined = "".join(frag_text for _ln, frag_text in body_frags)
                 # MyBatis は `#` 行コメントも有効（DDL/EXEC SQL の DB2/COBOL 方言とは切り分ける）。`#{...}` は動的プレースホルダのため除外する。
                 sanitized = _sql_scan.sanitize(combined, hash_line_comments=True)
+                for offset in _sql_scan.dynamic_table_offsets(sanitized):
+                    # `${...}` を含む表名は実行時に決まる＝解決せず申告する。
+                    dropped.append(Dropped("mapper_sql_dynamic_table", _line_for_offset(body_frags, offset),
+                                           sanitized[offset:offset + 80].strip()))
                 seen_names: set = set()
                 for name, offset in _sql_scan.table_refs(sanitized):
                     if name in seen_names:  # 同一文中の同じ Table は1回だけ申告する

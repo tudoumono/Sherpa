@@ -1550,3 +1550,8 @@ def test_coverage_hint_for_quick_even_when_results_exist(message, shown):
         assert hints[0]["action"] == {"depth_profile": "standard"}
     else:
         assert not hints
+
+
+def test_impact_headline_without_structural_items_has_no_grading_words():
+    h = CS._answer_impact({"items": [], "start": "税率", "presumed": [{"name": "TAXCALC", "evidence": []}]}, "w")["headline"]
+    assert "見つけた関連" in h and not any(w in h for w in ("確実", "推定", "要確認"))

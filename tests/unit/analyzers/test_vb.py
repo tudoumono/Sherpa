@@ -71,11 +71,11 @@ CHILDREN_CASES = {
     "vbnet_sibling_type_qualified": (
         _ns("    Public Class OrderService\n    End Class\n\n    Friend Class InternalHelper\n    End Class\n"),
         "Order/OrderService.vb", {"INTERNALHELPER": ("ACME.ORDER.INTERNALHELPER", ANY)}, None),
-    "vbnet_sub_and_function_qualified_with_type": (
+    "vbnet_sub_and_function_qualified_with_namespace_and_type": (
         _ns("    Public Class OrderService\n        Public Sub DoWork()\n        End Sub\n\n"
             "        Public Function Calc() As Integer\n        End Function\n    End Class\n"),
         "Order/OrderService.vb",
-        {"DOWORK": ("ORDERSERVICE.DOWORK", "definition"), "CALC": ("ORDERSERVICE.CALC", ANY)}, None),
+        {"DOWORK": ("ACME.ORDER.ORDERSERVICE.DOWORK", "definition"), "CALC": ("ACME.ORDER.ORDERSERVICE.CALC", ANY)}, None),
     "vbnet_auto_property_single_line_not_a_block": (
         _ns("    Public Class OrderService\n        Public Property Total As Integer\n"
             "        Public Sub Next1()\n        End Sub\n    End Class\n"),
@@ -187,6 +187,9 @@ REFS_CASES = {
     # SQL 文字列（文字列リテラル／連結＋行継続）→ ACCESSES via=vba_sql
     "sql_string_literal": ('Function Load()\n    sql = "SELECT * FROM ORDERS"\nEnd Function\n', "m.bas",
                            "ACCESSES", ["ORDERS"], {"ORDERS": {"via": "vba_sql"}}),
+    "sql_schema_qualified": (
+        'Function Load()\n    sql = "SELECT * FROM B.ORDERS"\nEnd Function\n', "m.bas",
+        "ACCESSES", ["B.ORDERS"], {"B.ORDERS": {"via": "vba_sql"}}),
     "sql_concatenated_with_variable": (
         'Function Load(id)\n    sql = "SELECT * FROM ORDERS WHERE ID = " & id\nEnd Function\n', "m.bas",
         "ACCESSES", ["ORDERS"], None),
@@ -248,3 +251,9 @@ def test_sql_table_adjacent_placeholder_dropped_as_dynamic_table_but_fully_repla
     assert len([d for d in adjacent.dropped if d.reason == "vba_sql_dynamic_table"]) == 1
     full = A.extract_refs('Function Load(tbl)\n    sql = "SELECT * FROM " & tbl\nEnd Function\n', "m.bas")
     assert [d for d in full.dropped if d.reason == "vba_sql_dynamic_table"] == []
+
+
+def test_vba_sql_schema_is_carried_as_attributes_not_reparsed_from_the_string():
+    text = 'Function Load()\n    sql = "SELECT * FROM B.ORDERS"\nEnd Function\n'
+    names = [r.name for r in A.extract_refs(text, "m.bas").refs if r.edge_type == "ACCESSES"]
+    assert [(n.schema, n.simple) for n in names] == [("B", "ORDERS")]

@@ -12,7 +12,23 @@
       "phase": "acme",
       "category": null,
       "analyzer": "java",
-      "qualified_name": "com.acme.Main"
+      "qualified_name": "com.acme.Main",
+      "unresolved": [
+        {
+          "line": 9,
+          "reason": "unresolved",
+          "kind": "Module",
+          "name": "Helper",
+          "via": "call",
+          "from_def": {
+            "file": "com/acme/Main.java",
+            "key": null
+          }
+        }
+      ],
+      "unresolved_names": [
+        "Helper"
+      ]
     },
     {
       "cid": "module:java1_test:com/acme/billing/InvoiceService.java#InvoiceService",
@@ -26,10 +42,7 @@
       "phase": "acme",
       "category": "billing",
       "analyzer": "java",
-      "qualified_name": "com.acme.billing.InvoiceService",
-      "imports": [
-        "com.acme.tax.TaxCalculator"
-      ]
+      "qualified_name": "com.acme.billing.InvoiceService"
     },
     {
       "cid": "module:java1_test:com/acme/billing/util/Helper.java#Helper",
@@ -85,7 +98,23 @@
       "phase": "acme",
       "category": "tax",
       "analyzer": "java",
-      "qualified_name": "com.acme.tax.TaxCalculator"
+      "qualified_name": "com.acme.tax.TaxCalculator",
+      "unresolved": [
+        {
+          "line": 29,
+          "reason": "unresolved",
+          "kind": "Module",
+          "name": "Math",
+          "via": "call",
+          "from_def": {
+            "file": "com/acme/tax/TaxCalculator.java",
+            "key": "RoundingHelper"
+          }
+        }
+      ],
+      "unresolved_names": [
+        "Math"
+      ]
     },
     {
       "cid": "module:java1_test:com/acme/tax/Taxable.java#Taxable",
@@ -155,10 +184,7 @@
       "phase": null,
       "category": null,
       "analyzer": "java",
-      "qualified_name": "com.acme.declrefs.Worker",
-      "imports": [
-        "java.util.List"
-      ]
+      "qualified_name": "com.acme.declrefs.Worker"
     },
     {
       "cid": "module:java1_test:plain_di/com/acme/di/Engine.java#Engine",
@@ -233,7 +259,31 @@
       "doc": "com/acme/billing/InvoiceService.java",
       "line": 9,
       "status": "active",
-      "via": "call"
+      "via": "call",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "com/acme/billing/InvoiceService.java",
+          "file": "com/acme/billing/InvoiceService.java",
+          "line": 9,
+          "rule": "single_import",
+          "from_def": {
+            "file": "com/acme/billing/InvoiceService.java",
+            "key": null
+          }
+        },
+        {
+          "via": "call",
+          "doc_id": "com/acme/billing/InvoiceService.java",
+          "file": "com/acme/billing/InvoiceService.java",
+          "line": 10,
+          "rule": "single_import",
+          "from_def": {
+            "file": "com/acme/billing/InvoiceService.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -242,7 +292,20 @@
       "doc": "com/acme/tax/TaxCalculator.java",
       "line": 7,
       "status": "active",
-      "via": "extends"
+      "via": "extends",
+      "sources": [
+        {
+          "via": "extends",
+          "doc_id": "com/acme/tax/TaxCalculator.java",
+          "file": "com/acme/tax/TaxCalculator.java",
+          "line": 7,
+          "rule": "same_package",
+          "from_def": {
+            "file": "com/acme/tax/TaxCalculator.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -251,7 +314,31 @@
       "doc": "com/acme/tax/TaxCalculator.java",
       "line": 9,
       "status": "active",
-      "via": "call"
+      "via": "call",
+      "sources": [
+        {
+          "via": "call",
+          "doc_id": "com/acme/tax/TaxCalculator.java",
+          "file": "com/acme/tax/TaxCalculator.java",
+          "line": 9,
+          "rule": "same_package",
+          "from_def": {
+            "file": "com/acme/tax/TaxCalculator.java",
+            "key": null
+          }
+        },
+        {
+          "via": "field_type",
+          "doc_id": "com/acme/tax/TaxCalculator.java",
+          "file": "com/acme/tax/TaxCalculator.java",
+          "line": 9,
+          "rule": "same_package",
+          "from_def": {
+            "file": "com/acme/tax/TaxCalculator.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -260,7 +347,20 @@
       "doc": "com/acme/tax/TaxCalculator.java",
       "line": 7,
       "status": "active",
-      "via": "implements"
+      "via": "implements",
+      "sources": [
+        {
+          "via": "implements",
+          "doc_id": "com/acme/tax/TaxCalculator.java",
+          "file": "com/acme/tax/TaxCalculator.java",
+          "line": 7,
+          "rule": "same_package",
+          "from_def": {
+            "file": "com/acme/tax/TaxCalculator.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -269,7 +369,31 @@
       "doc": "declrefs/Worker.java",
       "line": 11,
       "status": "active",
-      "via": "field_type"
+      "via": "field_type",
+      "sources": [
+        {
+          "via": "field_type",
+          "doc_id": "declrefs/Worker.java",
+          "file": "declrefs/Worker.java",
+          "line": 11,
+          "rule": "same_package",
+          "from_def": {
+            "file": "declrefs/Worker.java",
+            "key": null
+          }
+        },
+        {
+          "via": "field_type",
+          "doc_id": "declrefs/Worker.java",
+          "file": "declrefs/Worker.java",
+          "line": 15,
+          "rule": "same_package",
+          "from_def": {
+            "file": "declrefs/Worker.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -278,7 +402,31 @@
       "doc": "declrefs/Worker.java",
       "line": 13,
       "status": "active",
-      "via": "field_type"
+      "via": "field_type",
+      "sources": [
+        {
+          "via": "field_type",
+          "doc_id": "declrefs/Worker.java",
+          "file": "declrefs/Worker.java",
+          "line": 13,
+          "rule": "same_package",
+          "from_def": {
+            "file": "declrefs/Worker.java",
+            "key": null
+          }
+        },
+        {
+          "via": "field_type",
+          "doc_id": "declrefs/Worker.java",
+          "file": "declrefs/Worker.java",
+          "line": 19,
+          "rule": "same_package",
+          "from_def": {
+            "file": "declrefs/Worker.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -287,7 +435,20 @@
       "doc": "plain_di/com/acme/di/Service.java",
       "line": 10,
       "status": "active",
-      "via": "field_type"
+      "via": "field_type",
+      "sources": [
+        {
+          "via": "field_type",
+          "doc_id": "plain_di/com/acme/di/Service.java",
+          "file": "plain_di/com/acme/di/Service.java",
+          "line": 10,
+          "rule": "same_package",
+          "from_def": {
+            "file": "plain_di/com/acme/di/Service.java",
+            "key": null
+          }
+        }
+      ]
     },
     {
       "type": "INVOKES",
@@ -296,17 +457,34 @@
       "doc": "spring_di/com/acme/di/Service.java",
       "line": 11,
       "status": "active",
-      "via": "inject"
+      "via": "inject",
+      "sources": [
+        {
+          "via": "inject",
+          "doc_id": "spring_di/com/acme/di/Service.java",
+          "file": "spring_di/com/acme/di/Service.java",
+          "line": 11,
+          "rule": "same_package",
+          "from_def": {
+            "file": "spring_di/com/acme/di/Service.java",
+            "key": null
+          }
+        }
+      ]
     }
   ],
   "flags": [
     {
-      "reason": "ambiguous",
+      "reason": "unresolved",
       "from": "com/acme/Main.java",
       "kind": "Module",
       "name": "Helper",
       "line": 9,
-      "via": "call"
+      "via": "call",
+      "from_def": {
+        "file": "com/acme/Main.java",
+        "key": null
+      }
     },
     {
       "reason": "unresolved",
@@ -314,7 +492,11 @@
       "kind": "Module",
       "name": "Math",
       "line": 29,
-      "via": "call"
+      "via": "call",
+      "from_def": {
+        "file": "com/acme/tax/TaxCalculator.java",
+        "key": "RoundingHelper"
+      }
     }
   ]
 }

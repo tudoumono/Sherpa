@@ -236,6 +236,7 @@ _TROUBLESHOOT_GOLDEN = {
         "distance": 1, "path": ["ROOT", "TAXCALC"], "source": "graph",
         "evidence": {"edges": [{"type": "USES", "doc": "a.md"}], "grep": []},
     }],
+    "coverage": {"complete": True, "limits": [], "omitted": 0},
 }
 
 
@@ -253,7 +254,8 @@ def test_neighbor_cards_agentic_path_preserves_cid(monkeypatch):
                    "category": "プログラム", "role": "実装", "distance": 1, "path": [],
                    "source": "graph", "evidence": {"edges": [], "grep": []}}]
     monkeypatch.setattr(ls, "_troubleshoot_cards",
-                        lambda session, term, world, scope_paths=None: ({"TAXCALC"}, fake_cards, []))
+                        lambda session, term, world, scope_paths=None, **kw: ({"TAXCALC"}, ls._Cards(fake_cards, ls.Coverage()), []))
+    monkeypatch.setattr(ls, "read_unresolved", lambda *a, **k: {"available": False, "items": [], "omitted": 0})
     _patch_driver(monkeypatch, object())
     cards = ls.neighbor_cards("w1", "TAXCALC の ABEND")
     assert cards and cards[0]["cid"] == "module:w1:a/b#TAXCALC"

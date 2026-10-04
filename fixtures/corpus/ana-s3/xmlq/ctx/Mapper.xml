@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mapper namespace="com.acme.Svc">
+  <select id="one" resultType="com.missing.Ghost">select 1 from dual</select>
+</mapper>

@@ -448,6 +448,139 @@ def test_search_audit_written():
     assert row["detail"]["engines"] == ["keyword"]
 
 
+# ===== search: coverage（未完了・打ち切りの申告）・graph_origin・degraded.detail・include_presumed =====
+
+def _stub_engines(monkeypatch, graph_result, keyword_docs=()):
+    """keyword は固定ヒット、graph は `run_impact` 相当の結果を実の `_graph_hits` で変換する（ES/Neo4j は使わない）。"""
+    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+    monkeypatch.setattr(fused_search, "_search_keyword",
+                        lambda world, query, sp, k, settings, layer=None: ([
+                            {"key": d, "doc_id": d, "path": d, "line": 1, "snippet": "s",
+                             "engine_score": 1.0, "judgement": None, "paths": None} for d in keyword_docs], None))
+    seen = []
+
+    def _graph(world, query, sp, k, depth=10, **kw):
+        seen.append(kw)
+        return fused_search._graph_hits(graph_result, k), None
+
+    monkeypatch.setattr(fused_search, "_search_graph", _graph)
+    return seen
+
+
+class _AllDocs:
+    def __contains__(self, item):
+        return True
+
+
+_GRAPH_RESULT = {
+    "items": [{"name": f"S{i}", "label": "Module", "category": "ソース", "path": f"s{i}.cbl",
+               "trace": [], "evidence": []} for i in range(3)],
+    "presumed": [],
+    "coverage": {"complete": False, "limits": [{"kind": "depth", "stage": "impact"}], "omitted": None,
+                 "depth": {"requested": 4, "truncated": True}},
+}
+
+
+def test_search_coverage_shape_and_graph_origin(monkeypatch):
+    _stub_engines(monkeypatch, _GRAPH_RESULT, keyword_docs=["s0.cbl", "k.md"])
+    r = _search({"world": "v1", "query": "x", "engines": ["keyword", "graph"], "k": 2}, _key("cov")["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["coverage"] == {
+        "keyword": {"complete": True, "requested_k": 2, "returned": 2, "omitted": None, "limits": []},
+        "graph": {"complete": False, "requested_k": 2, "returned": 2, "omitted": 1,
+                  "limits": [{"kind": "depth"}, {"kind": "result_cap"}],
+                  "depth": {"requested": 4, "truncated": True}, "structural_count": 3, "presumed_count": 0},
+        "fused": {"requested_k": 2, "returned": 2, "omitted_by_cut": 1},
+    }
+    by = {h["doc_id"]: h for h in body["hits"]}
+    assert by["s0.cbl"]["graph_origin"] == ["structure"] and set(by["s0.cbl"]["sources"]) == {"keyword", "graph"}
+    assert "graph_origin" not in by["k.md"]
+    assert all("detail" not in d for d in body["degraded"])
+
+
+def test_search_overload_is_degraded_detail_without_coverage(monkeypatch):
+    from sherpa.ingest.world_neo4j import GraphQueryOverloadError
+
+    monkeypatch.setattr(documents, "world_rel_set", lambda world=None, root=None, strict=False, **kw: _AllDocs())
+
+    @contextmanager
+    def _session():
+        yield object()
+
+    monkeypatch.setattr(fused_search, "_neo4j_session", _session)
+    monkeypatch.setattr(fused_search, "run_impact", _raise(GraphQueryOverloadError("timeout", world="v1")))
+    r = _search({"world": "v1", "query": "x", "engines": ["graph"]}, _key("ovl")["key"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["degraded"] == [{"engine": "graph", "reason": "graph_query_failed", "detail": "timeout"}]
+    assert "graph" not in body["coverage"] and body["engines_used"] == []
+
+
+def test_search_include_presumed_default_unchanged_and_false_audited(monkeypatch):
+    seen = _stub_engines(monkeypatch, {"items": [], "presumed": []})
+    key = _key("presumed")["key"]
+    rid = f"probe-presumed-default-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"]}, key, rid).status_code == 200
+    assert seen == [{}]  # 既定は今までの呼び方のまま
+    detail = _audit_one(rid, "detail")["detail"]
+    assert {"world", "query", "engines", "k", "depth", "layer", "prefix", "result_count", "degraded"} <= set(detail)
+    assert "include_presumed" not in detail and "coverage_complete" not in detail  # 既定の要求の詳細は今と同じ
+
+    rid = f"probe-presumed-false-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"], "include_presumed": False},
+                   key, rid).status_code == 200
+    assert seen[-1] == {"include_presumed": False}
+    assert _audit_one(rid, "detail")["detail"]["include_presumed"] is False
+
+
+def test_search_audit_keeps_coverage_complete_only_when_incomplete(monkeypatch):
+    _stub_engines(monkeypatch, _GRAPH_RESULT)
+    rid = f"probe-cov-audit-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"]}, _key("covaudit")["key"], rid).status_code == 200
+    assert _audit_one(rid, "detail")["detail"]["coverage_complete"] == {"graph": False}
+
+
+_SRC = {"doc_id": "s0.cbl", "file": "s0.cbl", "via": "call", "from_def": {"file": "s0.cbl", "key": None}}
+
+
+def test_search_graph_edges_carry_via_rule_sources_and_paths_omitted(monkeypatch):
+    """経路の辺に `via`・`rule`・`sources`・`sources_omitted`、5 本で切った経路に `paths_omitted`（根拠のない辺は今の形のまま）。"""
+    edge = {"type": "INVOKES", "doc": "s0.cbl", "line": 3, "via": "call", "rule": "single_import",
+            "sources": [{**_SRC, "line": 3, "rule": "single_import"}, {**_SRC, "line": 8, "rule": "single_import"}],
+            "sources_overflow_count": 5}
+    plain = {"type": "COPIES", "doc": "s0.cbl", "line": 1}
+    result = {"items": [{"name": "S", "label": "Module", "category": "ソース", "path": "s0.cbl",
+                         "trace": ["A", "B", "C"], "evidence": [edge, plain]} for _ in range(7)]
+              + [{"name": "T", "label": "Module", "category": "ソース", "path": "t.cbl", "trace": [], "evidence": []}],
+              "presumed": []}
+    _stub_engines(monkeypatch, result)
+    r = _search({"world": "v1", "query": "x", "engines": ["graph"], "k": 10}, _key("edges")["key"])
+    assert r.status_code == 200, r.text
+    by = {h["doc_id"]: h for h in r.json()["hits"]}
+    assert len(by["s0.cbl"]["paths"]) == 5 and by["s0.cbl"]["paths_omitted"] == 2
+    e0, e1 = by["s0.cbl"]["paths"][0]["edges"]
+    assert e0 == {"type": "INVOKES", "doc": "s0.cbl", "line": 3, "via": "call", "rule": "single_import",
+                  "sources": [{**_SRC, "line": 3, "rule": "single_import"}, {**_SRC, "line": 8, "rule": "single_import"}],
+                  "sources_omitted": 5}
+    assert e1 == plain
+    assert "paths_omitted" not in by["t.cbl"]
+
+
+def test_search_evidence_limit_range_passthrough_and_audit(monkeypatch):
+    seen = _stub_engines(monkeypatch, {"items": [], "presumed": []})
+    key = _key("evlimit")["key"]
+    for bad in (-1, 11):
+        assert _search({"world": "v1", "query": "x", "engines": ["graph"], "evidence_limit": bad}, key).status_code == 422
+    rid = f"probe-evlimit-default-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"]}, key, rid).status_code == 200
+    assert seen == [{}] and "evidence_limit" not in _audit_one(rid, "detail")["detail"]  # 既定の要求は今と同じ
+    rid = f"probe-evlimit-7-{_sfx()}"
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"], "evidence_limit": 7}, key, rid).status_code == 200
+    assert seen[-1] == {"evidence_limit": 7} and _audit_one(rid, "detail")["detail"]["evidence_limit"] == 7
+    assert _search({"world": "v1", "query": "x", "engines": ["graph"], "evidence_limit": 0}, key).status_code == 200
+
+
 def test_ext_openapi_subset():
     r = client.get("/ext/v1/openapi.json", headers=_h(_key("openapi")["key"]))
     assert r.status_code == 200, r.text

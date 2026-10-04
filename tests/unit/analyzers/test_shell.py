@@ -139,6 +139,37 @@ REFS_CASES = {
     "heredoc_dash_variant": ("cat <<-EOF\n  $INSIDE\nEOF\n", SH, [], [D("shell_heredoc")]),
     "heredoc_in_comment_not_start": ("echo hi # <<EOF\necho next\n", SH, None, []),
     "heredoc_in_double_quotes_not_start": ('echo "literal <<EOF"\necho next\n', SH, None, []),
+    # 終端語が引用符つき／その他の形でも本文は読まない（終端語ごとに Dropped 1 件・本文のコマンドは辺にしない）
+    "heredoc_single_quoted_delim": ("cat <<'EOF'\nbash other.sh\nEOF\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_double_quoted_delim": ('cat <<"END"\nbash other.sh\nEND\n', SH, [], [D("shell_heredoc", "END")]),
+    "heredoc_quoted_with_redirect": ("cat > out.txt <<'EOF'\nbash other.sh\nEOF\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_quoted_piped_to_sh": ("sh <<'EOF'\nbash other.sh\nEOF\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_quoted_then_real_command": (
+        "cat <<'EOF'\nbash other.sh\nEOF\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)],
+        [D("shell_heredoc", "EOF")]),
+    "heredoc_quoted_in_function": ("f() {\n  cat <<'EOF'\nbash other.sh\nEOF\n}\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_quoted_dash_variant": ("cat <<-'EOF'\n\tbash other.sh\n\tEOF\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_quoted_unterminated_reads_to_eof": ("cat <<'EOF'\nbash other.sh\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_two_on_one_line": (
+        "cat <<A <<B\nbash a.sh\nA\nbash b.sh\nB\n", SH, [], [D("shell_heredoc", "A"), D("shell_heredoc", "B")]),
+    "heredoc_same_line_command_after_start_is_real": (
+        "cat <<EOF; bash real.sh\nbash other.sh\nEOF\n", SH, [("INVOKES", "Batch", "real.sh", None)],
+        [D("shell_heredoc", "EOF")]),
+    "heredoc_indented_terminator_does_not_end_plain_form": (
+        "cat <<EOF\n  EOF\nbash other.sh\nEOF\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)],
+        [D("shell_heredoc", "EOF")]),
+    "heredoc_space_indented_terminator_does_not_end_dash_form": (
+        "cat <<-EOF\n  EOF\nbash other.sh\n\tEOF\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)],
+        [D("shell_heredoc", "EOF")]),
+    "heredoc_after_parameter_expansion_hash": (
+        "echo ${x#foo} <<EOF\nbash other.sh\nEOF\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_after_escaped_quote": ("printf \\'x <<EOF\nbash other.sh\nEOF\n", SH, [], [D("shell_heredoc", "EOF")]),
+    "heredoc_quoted_delimiter_with_metachar": ("cat <<'END)'\nbash other.sh\nEND)\n", SH, [], [D("shell_heredoc", "END)")]),
+    "heredoc_delimiter_with_hyphens": (
+        "cat <<END-OF-FILE\nbash other.sh\nEND-OF-FILE\n", SH, [], [D("shell_heredoc", "END-OF-FILE")]),
+    "shift_in_arithmetic_is_not_heredoc": ("echo $((1<<2))\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)], []),
+    "shift_in_string_is_not_heredoc": ('echo "a<<b"\nbash real.sh\n', SH, [("INVOKES", "Batch", "real.sh", None)], []),
+    "here_string_is_not_heredoc": ("cat <<<'x'\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)], []),
     # コマンド位置の分割・ラッパー
     "after_and_and": ("true && java -cp a.jar:b.jar com.x.Main\n", SH, [M("com.x.Main", **QJ)], None),
     "after_pipe": ("echo ok | node x.js\n", SH, [("INVOKES", "Module", "x.js", None)], None),
@@ -161,10 +192,10 @@ def test_extract_refs(text, path, refs, dropped):
         assert [(r.edge_type, r.kind, r.name) for r in res.refs] == [(e, k, n) for e, k, n, _x in refs]
         for r, (_e, _k, _n, extra) in zip(res.refs, refs):
             assert extra is None or r.extra == extra
-    if dropped is not None:
-        assert len(res.dropped) == len(dropped)
-        for d, (reason, snippet) in zip(res.dropped, dropped):
-            assert d.reason == reason and (snippet is None or d.snippet == snippet)
+    expected = dropped or []  # None は「申告なし」の期待
+    assert len(res.dropped) == len(expected)
+    for d, (reason, snippet) in zip(res.dropped, expected):
+        assert d.reason == reason and (snippet is None or d.snippet == snippet)
 
 
 def test_dot_source_reference_line():

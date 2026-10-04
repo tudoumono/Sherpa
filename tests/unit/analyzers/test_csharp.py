@@ -88,11 +88,11 @@ REFS_CASES = {
     "new_expression_call": (
         _cls("    public OrderService()\n    {\n        var repo = new OrderRepo();\n    }\n"), [X("OrderRepo", "call")]),
     "using_directive_not_a_reference": (NS + "using Acme.Data;\n\npublic class OrderService\n{\n}\n", []),
-    "using_alias_new_resolves_to_qualified": (
+    "using_alias_new_keeps_the_alias_for_the_resolver": (
         NS + "using Alias = Other.Real;\n\npublic class OrderService\n{\n"
-        "    public OrderService()\n    {\n        var x = new Alias();\n    }\n}\n", [X("Other.Real", "call", True)]),
-    "using_alias_base_list_resolves_to_qualified": (
-        NS + "using Alias = Other.Real;\n\npublic class OrderService : Alias\n{\n}\n", [X("Other.Real", "extends", True)]),
+        "    public OrderService()\n    {\n        var x = new Alias();\n    }\n}\n", [X("Alias", "call", None)]),
+    "using_alias_base_list_keeps_the_alias_for_the_resolver": (
+        NS + "using Alias = Other.Real;\n\npublic class OrderService : Alias\n{\n}\n", [X("Alias", "extends", None)]),
     "plain_using_import_not_alias": (
         NS + "using Acme.Data;\n\npublic class OrderService\n{\n"
         "    public OrderService()\n    {\n        var x = new Data();\n    }\n}\n", [X("Data", "call", None)]),

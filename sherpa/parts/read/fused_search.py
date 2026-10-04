@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from ... import documents, es_index, rag_parent_return
+from ... import documents, es_index, graph_coverage, rag_parent_return
 from ... import scope as scope_mod
 from ...impact_service import IMPACT_MAX_DEPTH, run_impact
 from ...ingest import text_kind
@@ -30,12 +30,39 @@ DEGRADE_REASONS = frozenset({
 })
 
 
+class DegradeReason(str):
+    """エンジンの失敗理由（閉じた `DEGRADE_REASONS` の値そのもの）。`detail` に打ち切りの種類（`graph_coverage` の `kind`）を持つ。"""
+
+    detail: str | None
+
+    def __new__(cls, reason: str, detail: str | None = None):
+        obj = super().__new__(cls, reason)
+        obj.detail = detail
+        return obj
+
+
+class GraphHits(list):
+    """`_graph_hits` が返すヒットの `list`。融合前の件数と、`run_impact` の `coverage` を持つ。"""
+
+    total: int = 0                  # `k` で切る前の件数（同じ key を統合した後）
+    structural_count: int = 0       # うち構造の辺をたどって見つかった件数
+    presumed_count: int = 0         # うち構造の結果が無いときの推定の件数
+    run_coverage: dict | None = None  # `run_impact` 結果の `coverage`（深さ・推定 grep の打ち切り）
+    all_hits: list = []             # `k` で切る前の全ヒット（実在フィルタの後に数え直すため）
+
+
 def search(world: str, query: str, engines=None, k: int = 10,
            scope_paths=None, weights=None, settings: dict | None = None, depth: int = IMPACT_MAX_DEPTH,
-           root=None, strict: bool = False, layer=None) -> dict:
-    """公開エントリ。返値 `{hits, engines_used, degraded: [{engine, reason}]}`。
+           root=None, strict: bool = False, layer=None, include_presumed: bool = True,
+           evidence_limit: int | None = None) -> dict:
+    """公開エントリ。返値 `{hits, engines_used, degraded: [{engine, reason, detail?}], coverage}`。
     - engines: ENGINES の部分集合（None→DEFAULT_ENGINES）。順序・重複は正規化する。
     - depth: graph エンジンの影響たどりの深さ（`run_impact` へ渡す。keyword／vector は無視）。
+    - include_presumed: 真（既定）なら、構造の結果が無いときに grep 由来の推定を graph の結果へ足す。偽なら足さない。
+    - evidence_limit: graph の各経路の辺ごとに返す根拠（`sources`）の最大件数（省略時 3・0〜10）。切った分は辺の `sources_omitted`。経路の数には効かない。
+    - coverage: 成功したエンジンだけに `{complete, requested_k, returned, omitted, limits, ...}`、融合に `fused`。
+      失敗したエンジンは `coverage` を持たず、`degraded[].detail`（`timeout`・`row_cap` など）で理由を伝える。
+      keyword／vector は ES の上位 `k` 件で、`k` を超える一致の件数が ES から返らないため `omitted` は null。
     - layer（`"docs"|"code"|"both"`・既定 both）: keyword／vector にのみ適用する。graph は言及エッジが木を跨ぐため非適用。
     - root: 呼び出し側が解決済みの資料フォルダ root を渡すと、実在フィルタ（`documents.world_rel_set`）が再解決しない。
     - strict: `root` 指定時のみ有効。`safe_files` の OSError を re-raise する（呼び出し側が 503 にする）。
@@ -50,22 +77,61 @@ def search(world: str, query: str, engines=None, k: int = 10,
     w = {e: float((weights or {}).get(e, 1.0)) for e in sel}
     valid = (documents.world_rel_set(world, root=root, strict=strict) if root is not None
              else documents.world_rel_set(world))
-    per_engine, degraded = {}, []
+    per_engine, degraded, coverage = {}, [], {}
     runners = {"keyword": _search_keyword, "vector": _search_vector, "graph": _search_graph}
     for e in sel:
-        # graph だけ depth を渡し、keyword／vector は layer を渡す
+        # graph だけ depth（と、既定と違うときの include_presumed）を渡し、keyword／vector は layer を渡す
         if e == "graph":
-            hits, reason = runners[e](world, query, sp, k, depth)
+            extra = {} if include_presumed else {"include_presumed": False}
+            if evidence_limit is not None:
+                extra["evidence_limit"] = evidence_limit
+            hits, reason = runners[e](world, query, sp, k, depth, **extra)
         else:
             hits, reason = runners[e](world, query, sp, k, settings, layer)
         if reason:
-            degraded.append({"engine": e, "reason": reason})
+            entry = {"engine": e, "reason": str(reason)}
+            if getattr(reason, "detail", None):
+                entry["detail"] = reason.detail
+            degraded.append(entry)
         else:
-            hits = _filter_existing(hits, valid)
+            graph_info = hits if isinstance(hits, GraphHits) else None
+            if graph_info is not None:
+                # 実在フィルタの後の件数で数える（今の資料に無いヒットは省略件数・由来の件数に含めない）
+                hits = _filter_existing(graph_info.all_hits or list(hits), valid)
+                hits = _dedupe_by_key(hits)
+                graph_info.total = len(hits)
+                graph_info.structural_count = sum(1 for h in hits if "structure" in h.get("graph_origin", []))
+                graph_info.presumed_count = sum(1 for h in hits if "presumed" in h.get("graph_origin", []))
+            else:
+                hits = _filter_existing(hits, valid)
             per_engine[e] = _dedupe_by_key(hits)[:k]  # エンジン内は doc キーで先勝ち dedupe
+            coverage[e] = _engine_coverage(e, k, len(per_engine[e]), graph_info, depth)
     fused = fuse_rrf(per_engine, w, k)
+    distinct = len({h["key"] for hs in per_engine.values() for h in hs})
+    coverage["fused"] = {"requested_k": k, "returned": len(fused), "omitted_by_cut": max(0, distinct - len(fused))}
     return {"hits": fused, "engines_used": sorted(per_engine.keys(), key=ENGINES.index),
-            "degraded": degraded}
+            "degraded": degraded, "coverage": coverage}
+
+
+def _engine_coverage(engine: str, k: int, returned: int, graph_info: "GraphHits | None", depth: int) -> dict:
+    """成功したエンジン 1 つの `coverage`。外部 API の `limits[].kind` は結果が返った上での打ち切り（`depth`・`result_cap`・`doc_search_truncated`）だけ。"""
+    out: dict = {"complete": True, "requested_k": k, "returned": returned, "omitted": None, "limits": []}
+    if engine != "graph" or graph_info is None:
+        return out
+    run = graph_info.run_coverage or {}
+    limits = [{"kind": lim["kind"]} for lim in run.get("limits", [])
+              if lim["kind"] in (graph_coverage.KIND_DEPTH, graph_coverage.KIND_DOC_SEARCH_TRUNCATED,
+                                   graph_coverage.KIND_TIMEOUT, graph_coverage.KIND_ROW_CAP,
+                                   graph_coverage.KIND_GRAPH_UNAVAILABLE, graph_coverage.KIND_RESULT_CAP)]
+    cut = max(0, graph_info.total - k)
+    if cut and {"kind": graph_coverage.KIND_RESULT_CAP} not in limits:
+        limits.append({"kind": graph_coverage.KIND_RESULT_CAP})
+    out.update(complete=not limits, omitted=cut, limits=limits)
+    if run.get("depth"):
+        out["depth"] = dict(run["depth"])
+    out["structural_count"] = graph_info.structural_count
+    out["presumed_count"] = graph_info.presumed_count
+    return out
 
 
 def _filter_existing(hits: list, valid: set) -> list:
@@ -147,19 +213,26 @@ def _neo4j_session():
         drv.close()
 
 
-def _search_graph(world, query, sp, k, depth=IMPACT_MAX_DEPTH):
-    """語→ノード照合→近傍展開→文書＋経路。`run_impact`（構造たどり＋presumed フォールバック）をそのまま使い、読むだけ。depth は影響たどりの深さ。"""
+def _search_graph(world, query, sp, k, depth=IMPACT_MAX_DEPTH, include_presumed=True, evidence_limit=None):
+    """語→ノード照合→近傍展開→文書＋経路。`run_impact`（構造たどり＋presumed フォールバック）をそのまま使い、読むだけ。depth は影響たどりの深さ。
+    失敗理由は `DegradeReason`（`detail`: 過負荷なら `timeout`／`row_cap`・接続不可なら `graph_unavailable`・旧世代なら `graph_reingest_required`）。
+    """
     from neo4j.exceptions import AuthError, ServiceUnavailable
 
-    from ...ingest.world_neo4j import GraphSchemaEraError
+    from ...ingest.world_neo4j import GraphQueryOverloadError, GraphSchemaEraError
+    kw = {} if include_presumed else {"include_presumed": False}
+    if evidence_limit is not None:
+        kw["evidence_limit"] = evidence_limit
     try:
         with _neo4j_session() as s:
-            result = run_impact(s, query, world, scope_prefixes=(sp or None), depth=depth)
+            result = run_impact(s, query, world, scope_prefixes=(sp or None), depth=depth, **kw)
     except (ServiceUnavailable, AuthError, OSError):
-        return [], "neo4j_unavailable"
+        return [], DegradeReason("neo4j_unavailable", graph_coverage.KIND_GRAPH_UNAVAILABLE)
     except GraphSchemaEraError:
         # 旧世代グラフは generic な理由に丸めず、再取り込み案内用の閉じた理由を返す
-        return [], "graph_reingest_required"
+        return [], DegradeReason("graph_reingest_required", graph_coverage.KIND_GRAPH_REINGEST_REQUIRED)
+    except GraphQueryOverloadError as e:
+        return [], DegradeReason("graph_query_failed", graph_coverage.kind_of_overload(e.reason))
     except Exception:
         return [], "graph_query_failed"
     return _graph_hits(result, k), None
@@ -167,13 +240,21 @@ def _search_graph(world, query, sp, k, depth=IMPACT_MAX_DEPTH):
 
 # ==== graph の run_impact 結果 → ヒット形のマッピング ====
 
+def _ext_edge(e: dict) -> dict:
+    """経路の辺（`world_neo4j.edge_view` の形）→ 外部 API の辺。切った根拠の件数 `sources_overflow_count` は `sources_omitted` の名前で返す。"""
+    out = {k: v for k, v in e.items() if k != "sources_overflow_count"}
+    if "sources" in e:
+        out["sources_omitted"] = int(e.get("sources_overflow_count") or 0)
+    return out
+
+
 def _graph_item_hit(item: dict) -> dict:
     """items[]（構造的な影響・全件同格）を共通ヒット形へ。"""
     name = item.get("name")
     label = item.get("label")
     category = item.get("category") or label
     path = item.get("path")
-    evidence = item.get("evidence") or []
+    evidence = [_ext_edge(e) for e in (item.get("evidence") or [])]
     doc_id = path or (evidence[0].get("doc") if evidence else None)
     key = doc_id if doc_id else f"graph:{label}:{name}"
     trace = item.get("trace") or []
@@ -182,6 +263,7 @@ def _graph_item_hit(item: dict) -> dict:
         snippet += " 経路: " + " → ".join(trace)
     return {"key": key, "doc_id": doc_id, "path": path, "line": None,
             "snippet": snippet[:_SNIPPET_LEN], "engine_score": None, "judgement": None,
+            "graph_origin": ["structure"],
             "paths": [{"nodes": trace or [], "edges": evidence or [], "judgement": None}]}
 
 
@@ -199,20 +281,31 @@ def _presumed_item_hit(item: dict) -> dict:
     snippet = f"{category}「{name}」（判定: 推定）資料根拠: {quote}"
     return {"key": key, "doc_id": doc_id, "path": path, "line": None,
             "snippet": snippet[:_SNIPPET_LEN], "engine_score": None, "judgement": "presumed",
+            "graph_origin": ["presumed"],
             "paths": [{"nodes": [name], "edges": [{"type": "PRESUMED", "doc": ev0.get("doc"),
                                                     "line": ev0.get("line")}],
                       "judgement": "presumed"}]}
 
 
+def _union_origin(a, b) -> list:
+    """由来（`structure`／`presumed`）の和集合（固定順）。"""
+    got = set(a or []) | set(b or [])
+    return [o for o in ("structure", "presumed") if o in got]
+
+
 def _merge_graph_item(merged: dict, order: list, h: dict) -> None:
-    """同一 key に複数 item が落ちる場合: 先勝ちで 1 ヒットに統合し、後続の paths を追記（上限 5 経路）。judgement は最良（sure > review > presumed）。"""
+    """同一 key に複数 item が落ちる場合: 先勝ちで 1 ヒットに統合し、後続の paths を追記（上限 5 経路・切った本数は `paths_omitted`）。judgement は最良（sure > review > presumed）。"""
     key = h["key"]
     if key not in merged:
         merged[key] = h
         order.append(key)
         return
     m = merged[key]
-    m["paths"] = ((m["paths"] or []) + (h.get("paths") or []))[:_MAX_PATHS_PER_HIT]
+    combined = (m["paths"] or []) + (h.get("paths") or [])
+    if len(combined) > _MAX_PATHS_PER_HIT:
+        m["paths_omitted"] = int(m.get("paths_omitted") or 0) + len(combined) - _MAX_PATHS_PER_HIT
+    m["paths"] = combined[:_MAX_PATHS_PER_HIT]
+    m["graph_origin"] = _union_origin(m.get("graph_origin"), h.get("graph_origin"))
     if _JUDGE_RANK.get(h.get("judgement"), 9) < _JUDGE_RANK.get(m.get("judgement"), 9):
         m["judgement"] = h["judgement"]
 
@@ -225,7 +318,14 @@ def _graph_hits(result: dict, k: int) -> list:
         _merge_graph_item(merged, order, _graph_item_hit(item))
     for item in result.get("presumed") or []:
         _merge_graph_item(merged, order, _presumed_item_hit(item))
-    return [merged[key] for key in order][:k]
+    out = GraphHits(merged[key] for key in order)
+    out.total = len(out)
+    out.structural_count = sum(1 for h in out if "structure" in h["graph_origin"])
+    out.presumed_count = sum(1 for h in out if "presumed" in h["graph_origin"])
+    out.run_coverage = result.get("coverage")
+    out.all_hits = list(out)
+    del out[k:]
+    return out
 
 
 # ==== RRF 融合 ====
@@ -252,6 +352,10 @@ def fuse_rrf(per_engine: dict, weights: dict, k: int) -> list:
                 m["snippet"], m["line"] = h["snippet"], h.get("line")
             if e == "graph":
                 m["paths"] = (m["paths"] or []) + (h.get("paths") or [])
+                if h.get("paths_omitted"):
+                    m["paths_omitted"] = h["paths_omitted"]
                 m["judgement"] = m["judgement"] or h.get("judgement")
+                if h.get("graph_origin"):
+                    m["graph_origin"] = _union_origin(m.get("graph_origin"), h["graph_origin"])
     out = sorted(merged.items(), key=lambda kv: (-kv[1]["score"], kv[0]))
     return [v for _, v in out[:k]]

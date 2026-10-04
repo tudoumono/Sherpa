@@ -371,7 +371,11 @@ tr.hideRow{display:none}
   transition:max-height .2s ease,opacity .18s ease,margin .2s ease;margin-top:0}
 /* .path の既定 display:none を .ilist 内で打ち消す（items＝.ixdetail 内・presumed＝li 直下で常時表示の両方） */
 .ilist li .path{display:block}
-.ilist li.open .ixdetail{max-height:280px;opacity:1;margin-top:9px}
+.ilist li.open .ixdetail{max-height:560px;opacity:1;margin-top:9px}
+.ilist li .why{margin-top:8px}
+.ilist li .why-h{font-size:var(--text-caption);color:var(--ink-3);margin-bottom:4px}
+.ilist li .why-item{margin:0 0 6px}
+.ilist li .why .why-rule{color:var(--ink-3);font-size:var(--text-caption)}
 .ilist li.open{background:var(--surface-2);border-radius:8px}
 .pathbtn .caret{display:inline-block;transition:transform .18s ease}
 .ilist li.open .pathbtn .caret{transform:rotate(180deg)}

@@ -62,11 +62,34 @@ def test_collect_defs_returns_no_primary_when_file_has_no_type_declaration():
     assert res.primary is None and res.children == [] and res.dropped == []
 
 
-def test_collect_defs_records_imports_on_primary_extra():
-    text = ("package com.acme.billing;\n\nimport com.acme.tax.TaxCalculator;\nimport java.util.List;\n\n"
-            "public class InvoiceService {\n}\n")
-    res = A.collect_defs(text, "com/acme/billing/InvoiceService.java")
-    assert res.primary.extra["imports"] == ["com.acme.tax.TaxCalculator", "java.util.List"]
+def test_extract_refs_returns_file_context_with_package_and_imports():
+    """`package`・`import`（単一型・ワイルドカード・static）が `RefResult.file_context` として届く（primary の extra には積まない）。"""
+    text = ("package com.acme.billing;\n\nimport com.acme.tax.TaxCalculator;\nimport java.util.*;\n"
+            "import static com.acme.Util.helper;\n\npublic class InvoiceService {\n}\n")
+    path = "com/acme/billing/InvoiceService.java"
+    assert "imports" not in A.collect_defs(text, path).primary.extra
+    ctx = A.extract_refs(text, path).file_context
+    assert ctx.package == "com.acme.billing"
+    assert [(i.kind, i.name, i.static, i.line) for i in ctx.imports] == [
+        ("single", "com.acme.tax.TaxCalculator", False, 3),
+        ("wildcard", "java.util", False, 4),
+        ("single", "com.acme.Util.helper", True, 5),
+    ]
+
+
+def test_type_refs_keep_the_package_qualifier_and_point_nested_types_at_the_outer_type():
+    """package 付きの型名は縮めず `qualified`、全ての型参照に `type_ref`。入れ子の型 `Outer.Inner` は外側の型へ寄せる（修飾なし）。"""
+    text = ("public class A {\n    private lib.Box held;\n"
+            "    void m() { new approved.Helper(); approved.Helper.go(); new Outer.Inner(); lib.Outer.Inner.make(); Plain.x(); }\n}\n")
+    got = [(r.name, bool(r.extra.get("qualified")), bool(r.extra.get("type_ref")))
+           for r in A.extract_refs(text, "A.java").refs]
+    assert got == [("approved.Helper", True, True), ("approved.Helper", True, True), ("Outer", False, True),
+                   ("lib.Outer", True, True), ("Plain", False, True), ("lib.Box", True, True)]
+
+
+def test_extract_refs_returns_empty_file_context_without_package_or_imports():
+    ctx = A.extract_refs("public class Plain {\n}\n", "Plain.java").file_context
+    assert ctx.package is None and ctx.imports == []
 
 
 # ---- collect_defs: URL キー（Spring MVC マッピング注釈 → Config children） ----
@@ -134,8 +157,8 @@ def _body(s):
 REFS_CASES = {
     "new_call": (_body("    void m() { Object x = new Helper(); }"), [R("Helper", "call")], None),
     "new_strips_generics": (_body("    void m() { Object x = new ArrayList<String>(); }"), [R("ArrayList", "call")], None),
-    "new_strips_package": (_body("    void m() { Object x = new com.acme.tax.TaxCalculator(); }"),
-                           [R("TaxCalculator", "call")], None),
+    "new_keeps_package_qualifier": (_body("    void m() { Object x = new com.acme.tax.TaxCalculator(); }"),
+                                    [R("com.acme.tax.TaxCalculator", "call")], None),
     "static_call_uppercase_qualifier": (_body("    void m() { double r = TaxCalculator.staticRate(); }"),
                                         [R("TaxCalculator", "call")], None),
     "lowercase_qualifier_not_static_call": (_body("    void m() { calc.hashCode(); }"), [], None),

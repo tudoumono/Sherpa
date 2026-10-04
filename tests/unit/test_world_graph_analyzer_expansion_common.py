@@ -53,6 +53,11 @@ class _FakeAnalyzer(Analyzer):
         return self._refs.get(rel_path, RefResult())
 
 
+def _core(flags):
+    """未解決系の申告から、新しく足した欄（`from_def`・`candidates`）を除いた形（既存の欄の契約だけを確かめる）。"""
+    return [{k: v for k, v in f.items() if k not in ("from_def", "candidates")} for f in flags]
+
+
 def _build(tmp_path, monkeypatch, defs, refs=None, *, analyzers=None):
     """defs/refs のキー（rel_path）のファイルを持つ world を作り、フェイクで build_world する。
     戻り値は (cid→node, edges, flags)。"""
@@ -148,20 +153,20 @@ def test_qualified_reference_resolves_by_exact_name_then_nearest(tmp_path, monke
     e = next(e for e in edges if e["type"] == "INVOKES")
     assert e["dst"] == _cid(by_cid, **target)
     assert "qualified" not in e                        # 解決の指示であってエッジの事実ではない
-    assert not _reasons(flags, "unresolved", "qualified_fallback", "ambiguous")
+    assert not _reasons(flags, "unresolved", "unresolved_qualifier", "ambiguous")
 
 
-def test_qualified_miss_falls_back_to_simple_name_and_flags_qualified_fallback(tmp_path, monkeypatch):
-    """完全一致が無ければ単純名の通常の最近傍へフォールバックし、`qualified_fallback` を記録する
-    （黙って倒さない）。"""
-    by_cid, edges, flags = _build(
+def test_qualified_miss_does_not_fall_back_to_the_simple_name_and_is_reported_unresolved(tmp_path, monkeypatch):
+    """完全修飾名に一致する定義が無ければ、同名の短名の定義（近くの別 package）へ倒さず、辺を張らずに
+    `unresolved_qualifier` を申告する。"""
+    _by_cid, edges, flags = _build(
         tmp_path, monkeypatch,
         {"pkg/x/Foo.fk": _module("Foo"), "pkg/cfg/beans.fk": _config("beans.xml")},   # cid_key 無し＝未登録
         {"pkg/cfg/beans.fk": _qualified_ref("com.unknown.Foo")})
-    e = next(e for e in edges if e["type"] == "INVOKES")
-    assert e["dst"] == _cid(by_cid, path="pkg/x/Foo.fk")
-    assert {"reason": "qualified_fallback", "from": "pkg/cfg/beans.fk",
-            "kind": "Module", "name": "com.unknown.Foo"} in flags
+    assert not [e for e in edges if e["type"] == "INVOKES"]
+    assert {"reason": "unresolved_qualifier", "from": "pkg/cfg/beans.fk", "kind": "Module",
+            "name": "com.unknown.Foo", "line": 1, "via": "bean_class"} in _core(flags)
+    assert not _reasons(flags, "qualified_fallback")
 
 
 def test_qualified_equidistant_candidates_are_flagged_ambiguous_not_arbitrarily_resolved(tmp_path, monkeypatch):
@@ -174,7 +179,7 @@ def test_qualified_equidistant_candidates_are_flagged_ambiguous_not_arbitrarily_
         {"gen/cfg/beans.fk": _qualified_ref("com.x.Foo")})
     assert not [e for e in edges if e["type"] == "INVOKES"]
     assert {"reason": "ambiguous", "from": "gen/cfg/beans.fk", "kind": "Module", "name": "com.x.Foo",
-            "line": 1, "via": "bean_class"} in flags
+            "line": 1, "via": "bean_class"} in _core(flags)
     assert not _reasons(flags, "qualified_fallback")
 
 
@@ -232,7 +237,7 @@ def test_config_key_unresolved_when_no_config_matches_in_scope(tmp_path, monkeyp
                                    {"pkg/App.fk": _config_ref("db.url")})
     assert not [e for e in edges if e["type"] == "ACCESSES"]
     assert {"reason": "unresolved", "from": "pkg/App.fk", "kind": "Config", "name": "db.url",
-            "line": 1, "via": "config_key"} in flags
+            "line": 1, "via": "config_key"} in _core(flags)
 
 
 def test_config_key_dst_cid_uses_child_cid_key_not_bare_name_when_it_collides_with_a_primary(
@@ -295,7 +300,7 @@ def test_c_simple_name_resolution_index_does_not_leak_into_other_languages(tmp_p
     worker_cid = _cid(by_cid, path="gen/worker.c", name="Worker")
     assert not any(e["type"] == "INVOKES" and e["dst"] == worker_cid for e in edges)
     assert {"reason": "unresolved", "from": "gen/Caller.java", "kind": "Module", "name": "Worker",
-            "line": 3, "via": "call"} in flags
+            "line": 3, "via": "call"} in _core(flags)
 
 
 def test_simple_name_resolution_index_is_scoped_per_analyzer_not_shared_across_languages(
@@ -321,7 +326,7 @@ def test_simple_name_resolution_index_is_scoped_per_analyzer_not_shared_across_l
     foo_cid = _cid(by_cid, path="gen/worker.c", name="FOO")
     assert not any(e["type"] == "INVOKES" and e["dst"] == foo_cid for e in edges)
     assert {"reason": "unresolved", "from": "gen/main.bas", "kind": "Module", "name": "FOO",
-            "line": 1, "via": "call"} in flags
+            "line": 1, "via": "call"} in _core(flags)
 
 
 # --- 既存 fixtures 不変（COBOL/JCL/コピーブック・java1） ---
@@ -403,3 +408,17 @@ def test_java1_edge_aggregation_preserves_the_src_type_dst_set(monkeypatch):
     dup_keys = {k for k, n in Counter(before_keys).items() if n > 1}
     assert len(dup_keys) == 4
     assert dup_keys == set(after_keys) & dup_keys, "畳まれた組は集約後の集合にもそのまま残っている"
+
+
+PRE_S7_REPRESENTATIVES = GOLDEN_DIR / "world_graph_pre_s7_edge_representatives.json"
+
+
+@pytest.mark.parametrize("name,world_id", [("v1", V1_WORLD_ID), ("java1", JAVA1_WORLD_ID)])
+def test_edge_representatives_are_unchanged_by_the_sources_change(name, world_id):
+    """辺の根拠（S7）を足しても、辺の代表 `(src, type, dst, via, line)` は S7 の前の出力と同じ（基準は S7 の前の `build_world` の出力）。"""
+    _n, edges, _f = world_graph.build_world(ROOT / "fixtures" / "corpus" / name, world_id)
+    actual = sorted([e["src"], e["type"], e["dst"], e.get("via"), e["line"]] for e in edges)
+    assert actual == _load_golden(PRE_S7_REPRESENTATIVES)[name]
+    for e in edges:
+        if e.get("sources"):
+            assert (e["doc"], e["line"], e.get("via")) == (e["sources"][0]["doc_id"], e["sources"][0]["line"], e["sources"][0].get("via"))

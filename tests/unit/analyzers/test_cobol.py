@@ -106,6 +106,14 @@ COPY_CALL_CASES = {
     "copy_in_string_literal": (P + "           DISPLAY 'COPY FAKECPY'.\n", [], []),
     "copy_after_inline_comment": (
         P + "      *> COPY X\n           MOVE 1 TO Y. *> COPY FAKE\n", [], []),
+    "call_inside_display_literal_is_not_a_call": (
+        P + "           DISPLAY \"CALL 'GHOST'\".\n", [], []),
+    "fake_call_literal_beside_real_call_operand": (
+        P + "           DISPLAY \"CALL 'GHOST'\". CALL 'REALPG'.\n", [CL("REALPG")], []),
+    "call_operand_on_continuation_line": (P + "           CALL\n      -    'REAL'.\n", [CL("REAL")], []),
+    "copy_operand_on_continuation_line": (P + "           COPY\n      -    REALCPY.\n", [CP("REALCPY")], []),
+    "copy_replacing_pseudo_text_hides_fake_call_and_copy": (
+        P + "           COPY REALCPY REPLACING ==CALL 'FAKE'== BY ==COPY FAKE2==.\n", [CP("REALCPY")], []),
     "double_quoted_call": (P + '           CALL "REALPGM".\n', [CL("REALPGM")], []),
     # 継続行
     "continuation_non_literal": (
@@ -289,14 +297,27 @@ SQL_CASES = {
         "           EXEC SQL\n               SELECT O.ID, C.NAME\n                 FROM ORDERS O\n"
         "                 JOIN CUSTOMERS C\n                   ON O.CUST_ID = C.ID\n           END-EXEC.\n",
         [TB("ORDERS"), TB("CUSTOMERS")], []),
-    "declare_cursor_dropped_dynamic": (
-        "           EXEC SQL\n               DECLARE CUR1 CURSOR FOR\n               SELECT * FROM ORDERS\n"
-        "           END-EXEC.\n", [], ["exec_sql_dynamic"]),
+    "declare_cursor_static_select_reads_table": (
+        "           EXEC SQL\n               DECLARE CUR1 CURSOR FOR\n               SELECT ID FROM CUSTOMER\n"
+        "           END-EXEC.\n", [TB("CUSTOMER")], []),
+    "declare_cursor_with_hold_static_select": (
+        "           EXEC SQL DECLARE CUR1 CURSOR WITH HOLD FOR\n               SELECT ID FROM CUSTOMER END-EXEC.\n",
+        [TB("CUSTOMER")], []),
+    "declare_scroll_cursor_prepared_name_dynamic": (
+        "           EXEC SQL DECLARE CUR1 SCROLL CURSOR FOR STMT1 END-EXEC.\n", [], ["exec_sql_dynamic"]),
+    "declare_insensitive_scroll_cursor_static": (
+        "           EXEC SQL DECLARE CUR1 INSENSITIVE SCROLL CURSOR\n               FOR SELECT ID FROM CUSTOMER END-EXEC.\n",
+        [TB("CUSTOMER")], []),
+    "declare_cursor_prepared_statement_name_dynamic": (
+        "           EXEC SQL DECLARE CUR1 CURSOR FOR STMT1 END-EXEC.\n", [], ["exec_sql_dynamic"]),
+    "extract_from_column_is_not_a_table": (
+        "           EXEC SQL SELECT EXTRACT(YEAR FROM CREATED_AT) INTO :WS-Y\n               FROM ORDERS END-EXEC.\n",
+        [TB("ORDERS")], []),
     "execute_immediate_dropped_dynamic": (
         "           EXEC SQL\n               EXECUTE IMMEDIATE :WS-DYNAMIC-SQL\n           END-EXEC.\n",
         [], ["exec_sql_dynamic"]),
-    "schema_qualified_drops_schema": (
-        "           EXEC SQL\n               SELECT * FROM BILLING.ORDERS\n           END-EXEC.\n", [TB("ORDERS")], None),
+    "schema_qualified_keeps_schema": (
+        "           EXEC SQL\n               SELECT * FROM BILLING.ORDERS\n           END-EXEC.\n", [TB("BILLING.ORDERS")], None),
     "comma_separated_from": (
         "           EXEC SQL\n               SELECT * FROM ORDERS, CUSTOMERS\n           END-EXEC.\n",
         [TB("ORDERS"), TB("CUSTOMERS")], None),

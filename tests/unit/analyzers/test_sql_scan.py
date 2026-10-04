@@ -77,6 +77,19 @@ def test_unquote_or_norm_ident_upcases_unquoted_and_preserves_quoted_case():
 
 # ---- table_refs（COBOL EXEC SQL 本文と同じ入力を含む）----
 NAMES_CASES = {
+    "extract_from_column_is_not_a_table": ("SELECT EXTRACT(YEAR FROM CREATED_AT) FROM ORDERS", ["ORDERS"]),
+    "substring_and_trim_from_are_not_tables": (
+        "SELECT SUBSTRING(A FROM 2), TRIM(BOTH   FROM B) FROM ORDERS", ["ORDERS"]),
+    "quoted_function_name_from_is_not_a_table": ('SELECT "EXTRACT"(YEAR FROM CREATED_AT) FROM ORDERS', ["ORDERS"]),
+    "nested_function_from_is_not_a_table": ("SELECT FOO(BAR(A FROM B)) FROM T", ["T"]),
+    "overlay_and_unlisted_function_from_are_not_tables": (
+        "SELECT OVERLAY(A PLACING B FROM 2), FOO(X FROM Y) FROM T", ["T"]),
+    "subquery_inside_function_args_is_still_a_table": (
+        "SELECT FOO((SELECT X FROM T2)) FROM T", ["T2", "T"]),
+    "subquery_as_extract_source_is_still_a_table": (
+        "SELECT EXTRACT(YEAR FROM (SELECT D FROM T3)) FROM T", ["T3", "T"]),
+    "subquery_from_inside_parens_is_still_a_table": (
+        "SELECT * FROM (SELECT A FROM T1) X WHERE A IN (SELECT B FROM T2)", ["T1", "T2"]),
     "from": ("SELECT * FROM ORDERS", ["ORDERS"]),
     "join_discarding_aliases": ("SELECT * FROM ORDERS O JOIN CUSTOMERS C ON O.ID = C.ID", ["ORDERS", "CUSTOMERS"]),
     "insert_into_ignores_column_list": ("INSERT INTO ORDER_LINES (ORDER_ID, QTY) VALUES (1, 2)", ["ORDER_LINES"]),
@@ -84,7 +97,7 @@ NAMES_CASES = {
     "delete_from": ("DELETE FROM ORDERS WHERE ID = 1", ["ORDERS"]),
     "merge_into": ("MERGE INTO ORDERS USING SRC ON (ORDERS.ID = SRC.ID) WHEN MATCHED THEN UPDATE SET X = 1", ["ORDERS"]),
     "comma_separated": ("SELECT * FROM ORDERS, CUSTOMERS", ["ORDERS", "CUSTOMERS"]),
-    "schema_qualified_drops_schema": ("SELECT * FROM BILLING.ORDERS", ["ORDERS"]),
+    "schema_qualified_keeps_schema": ("SELECT * FROM BILLING.ORDERS", ["BILLING.ORDERS"]),
     "host_variable_excluded": ("SELECT * FROM :HOST-TABLE", []),
     "subquery_excluded": ("SELECT * FROM (SELECT 1) X", []),
     "mybatis_hash_placeholder_excluded": ("SELECT * FROM #{tbl}", []),
@@ -111,7 +124,7 @@ NAMES_CASES = {
     "with_recursive": ("WITH RECURSIVE x AS (SELECT * FROM a) SELECT * FROM x", ["A"]),
     "with_recursive_multiple_with_column_list": (
         "WITH RECURSIVE x (c1, c2) AS (SELECT * FROM a), y AS (SELECT * FROM b) SELECT * FROM x, y", ["A", "B"]),
-    "schema_qualified_cte_name_not_excluded": ("WITH x AS (SELECT * FROM a) SELECT * FROM schema.x", ["A", "X"]),
+    "schema_qualified_cte_name_not_excluded": ("WITH x AS (SELECT * FROM a) SELECT * FROM schema.x", ["A", "SCHEMA.X"]),
     "cte_scope_limited_to_own_statement": (
         "WITH recent AS (SELECT * FROM source) SELECT * FROM recent; SELECT * FROM recent;", ["SOURCE", "RECENT"]),
     "quoted_cte_name_excluded_case_preserved": (

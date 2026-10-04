@@ -12,7 +12,7 @@
 - `sqlplus @x.sql`／`psql -f`／`mysql <` → `Dropped("shell_sql_script")`。`python`/`perl` → `Dropped("shell_unsupported_runtime")`。`node x.js` → `INVOKES(via=call, include_path=<元のパス>)`。
 - 変数参照（`$KEY`・`${KEY...}`・bat の `%KEY%`）→ `ACCESSES(via=config_key, key_kind="env")`。大文字＋アンダースコア（＋数字）のみを設定キーとみなし、`\\$KEY` は拾わない。同一ファイル内で `KEY=` を定義している変数は自己参照なので張らない。
 
-サニタイズ: `#`（POSIX・未引用）／`REM`・`::`（bat・行頭）はコメントとして無視し、シングルクォートの中身は空白化する（ダブルクォートは中身を保持）。ヒアドキュメント本文は読み飛ばし、1件ずつ `Dropped("shell_heredoc")` を申告する。
+サニタイズ: `#`（POSIX・未引用）／`REM`・`::`（bat・行頭）はコメントとして無視し、シングルクォートの中身は空白化する（ダブルクォートは中身を保持）。ヒアドキュメント本文は（終端語が引用符つき `<<'EOF'`・`<<"END"` の形も含め）読み飛ばし、終端語ごとに `Dropped("shell_heredoc")` を申告する。
 検出限界: 行継続（バックスラッシュ改行）は結合しない。
 設計: docs/design/rag.md「グラフ」
 """
@@ -94,7 +94,7 @@ _VAR_PERCENT = re.compile(r"%([A-Z][A-Z0-9_]*)%")
 _BAT_REM = re.compile(r"^rem(\s|$)", re.IGNORECASE)
 
 # ヒアドキュメント開始（`<<EOF`／`<<-EOF`／引用符付き終端識別子）
-_HEREDOC_START = re.compile(r"<<-?\s*([\'\"]?)(\w+)\1")
+_HEREDOC_START = re.compile(r"""<<(-?)[ \t]*(?:'([^']+)'|"([^"]+)"|([^\s'"<>;|&()\\]+))""")
 
 
 def _sanitize_line(line: str, is_bat: bool) -> str:
@@ -122,26 +122,59 @@ def _sanitize_line(line: str, is_bat: bool) -> str:
     return "".join(out)
 
 
-def _heredoc_probe(line: str) -> str:
-    """ヒアドキュメント開始判定用のマスク済み行を返す。未引用の `#` 以降を切り捨て、引用符の中身を空白化する（コメント・文字列内の `<<EOF` を演算子と誤認しないため）。"""
+def _heredoc_delims(line: str) -> list:
+    """1 行の中のヒアドキュメント開始を `(終端語, `<<-` か)` の列で出現順に返す（`<<EOF`・`<<-EOF`・`<<'EOF'`・`<<"END"`）。
+
+    引用符・未引用の `#` 以降のコメント・算術式 `$((…))`/`((…))` の中の `<<`、ヒア文字列 `<<<` は開始としない。引用形（`<<'END)'`）は引用符の中を終端語とし、引用なしは空白・メタ文字以外の連続（`END-OF-FILE` など）を終端語とする。`#` は語頭のものだけがコメント。`${…}`・バックスラッシュでエスケープした文字は読み飛ばす。
+    """
     out: list = []
+    stack: list = []  # 開き括弧の種別: "A"＝算術 `((`、"P"＝通常
     in_s = in_d = False
-    for ch in line:
-        if not in_s and not in_d and ch == "#":
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if in_s:
+            in_s = ch != "'"
+        elif in_d:
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                in_d = False
+        elif ch == "\\":
+            i += 1  # エスケープされた 1 文字（`\'`・`\"`・`\#` など）は構文として読まない
+        elif ch == "$" and line[i + 1:i + 2] == "{":
+            end = line.find("}", i + 2)  # パラメータ展開 `${x#foo}` の中は読まない
+            i = n if end < 0 else end
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t;|&("):
             break
-        if ch == "'" and not in_d:
-            in_s = not in_s
-            out.append(" ")
+        elif ch == "'":
+            in_s = True
+        elif ch == '"':
+            in_d = True
+        elif ch == "(":
+            if line[i + 1:i + 2] == "(":
+                stack.append("A")
+                i += 1
+            else:
+                stack.append("P")
+        elif ch == ")":
+            if stack:
+                if stack[-1] == "A" and line[i + 1:i + 2] == ")":
+                    i += 1
+                stack.pop()
+        elif ch == "<" and line[i:i + 2] == "<<" and "A" not in stack:
+            if line[i + 2:i + 3] == "<":  # ヒア文字列
+                i += 3
+                continue
+            m = _HEREDOC_START.match(line, i)
+            if m:
+                out.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
+                i = m.end()
+                continue
+            i += 2
             continue
-        if ch == '"' and not in_s:
-            in_d = not in_d
-            out.append(" ")
-            continue
-        if in_s or in_d:
-            out.append(" ")
-        else:
-            out.append(ch)
-    return "".join(out)
+        i += 1
+    return out
 
 
 def _unquote(value: str) -> str:
@@ -153,24 +186,26 @@ def _unquote(value: str) -> str:
 
 
 def _heredoc_skip_lines(lines: list) -> tuple:
-    """ヒアドキュメント本文（開始行の次行〜終端行）の行番号集合と、`Dropped` 候補（開始行ごとに1件）を返す（POSIX のみ。bat では呼ばない）。"""
+    """ヒアドキュメント本文（開始行の次行〜終端行）の行番号集合と、`Dropped` 候補（終端語ごとに1件）を返す（POSIX のみ。bat では呼ばない）。"""
     skip: set = set()
     dropped: list = []
     i, n = 0, len(lines)
     while i < n:
-        m = _HEREDOC_START.search(_heredoc_probe(lines[i]))
-        if m:
-            delim = m.group(2)
+        delims = _heredoc_delims(lines[i])
+        if not delims:
+            i += 1
+            continue
+        j = i + 1
+        for delim, strip_tabs in delims:  # 1 行に複数あれば本文は順に続く
             dropped.append(Dropped("shell_heredoc", i + 1, delim))
-            j = i + 1
-            while j < n and lines[j].strip() != delim:
+            # 終端行は終端語と完全一致。`<<-` だけは行頭のタブを許す。
+            while j < n and (lines[j].lstrip("\t") if strip_tabs else lines[j]) != delim:
                 skip.add(j + 1)
                 j += 1
             if j < n:
                 skip.add(j + 1)  # 終端行自体も本文の走査対象にしない
-            i = j + 1
-            continue
-        i += 1
+                j += 1
+        i = j
     return skip, dropped
 
 
@@ -347,6 +382,7 @@ class ShellBatchAnalyzer(Analyzer):
     name = "shell"
     extensions = SHELL_BATCH_EXT
     doctype = "shell"
+    version = 2
 
     @staticmethod
     def _is_bat(rel_path: str) -> bool:

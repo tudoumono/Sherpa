@@ -186,6 +186,14 @@ def _split_statements(line: str) -> list:
     return stmts
 
 
+_PSEUDO_TEXT_RE = re.compile(r"==.*?==")
+
+
+def _blank_pseudo_text(s: str) -> str:
+    """`COPY … REPLACING ==…== BY ==…==` の pseudo-text を同じ長さの空白へ置換する（中の `CALL`／`COPY` を構文と誤認しないため）。"""
+    return _PSEUDO_TEXT_RE.sub(lambda m: " " * len(m.group(0)), s)
+
+
 def _strip_quoted(s: str) -> str:
     """引用符（`'...'`／`"..."`）の中身を除去する（文字列リテラル中の語を構文と誤認しないための前処理）。
     `CALL '...'` 自体のリテラル抽出（`_CALL`）には使わない。"""
@@ -213,12 +221,15 @@ def _scan_quote_state(s: str, state: str | None) -> str | None:
     return state
 
 
+_ENDS_WITH_KEYWORD_BEFORE_OPERAND = re.compile(r"(?<![A-Z0-9#@$-])(?:CALL|COPY)$", re.I)
+
+
 def _build_fixed_column_logical(physical_lines: list, include_debug: bool) -> tuple:
     """固定列ファイルの物理行から論理行を組み立てる（`_normalize_logical_lines` の下請け・継続結合の状態機械）。
 
     `include_debug=False`: 7 桁目 `D`/`d`（デバッグ行）を状態機械から除いて `debug_lines` へ積む。
     `include_debug=True`: D 行も通常行として組み込む。
-    7 桁目 `-` の行は直前の論理行へ連結する（リテラル継続は列位置を維持し、それ以外は空白なしで直結）。
+    7 桁目 `-` の行は直前の論理行へ連結する（リテラル継続は列位置を維持し、それ以外は空白なしで直結。ただし直前が `CALL`／`COPY` の語で終わるときは空白 1 つで区切る）。
     コメント行と 7〜72 桁が空白だけの行は除く。
     戻り値は `(logical, debug_lines)`。`logical` は `(text, first_physical_line, segment_starts)` の列で、
     `segment_starts` は `text` 中の物理行境界オフセット（昇順・先頭 0）。
@@ -266,6 +277,8 @@ def _build_fixed_column_logical(physical_lines: list, include_debug: bool) -> tu
                 # 非リテラル継続: 直前断片の末尾空白と継続行の先頭空白を除いて直結する
                 old_len = len(frags[-1])
                 frags[-1] = frags[-1].rstrip()
+                if _ENDS_WITH_KEYWORD_BEFORE_OPERAND.search(frags[-1]):
+                    frags[-1] += " "                 # `CALL`／`COPY` の直後の継続は語の区切り（オペランドと連結しない）
                 frag_len -= old_len - len(frags[-1])
                 cont = cont_area.lstrip()
             frag_segments.append(frag_len)

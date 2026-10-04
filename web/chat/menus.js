@@ -215,7 +215,7 @@ function _answerLines(ans, md) {
     || (ans.lens === 'impact' && !impactHasGraph)
     || (ans.lens === 'troubleshoot' && !troubleHasCandidates));
   if (ans.lens === 'impact') (d.items || []).forEach((it) => L.push(`${md ? '- ' : '・'}${it.category}｜${it.name}`));
-  if (ans.lens === 'impact') (d.presumed || []).forEach((p) => L.push(`${md ? '- ' : '・'}推定｜${p.category}｜${p.name}`));
+  if (ans.lens === 'impact') (d.presumed || []).forEach((p) => L.push(`${md ? '- ' : '・'}資料から見つけた関連｜${p.category}｜${p.name}`));
   if (ans.lens === 'troubleshoot') (d.candidates || []).slice(0, 8).forEach((c) => L.push(`${md ? '- ' : '・'}${c.name}（${c.role || ''}）`));
   if (showCitations) (d.citations || []).forEach((c) => L.push(`${md ? '> ' : ''}${c.doc_id}（行${(c.span || [])[0]}-${(c.span || [])[1]}）: ${c.quote || ''}`));
   if ((ans.sources || []).length) {

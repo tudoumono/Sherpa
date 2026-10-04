@@ -2119,7 +2119,8 @@ def test_run_tool_graph_neighbors_three_graph_states(monkeypatch):
     assert res["neighbors"] == [] and res["error_code"] == "graph_unavailable" and "error" not in res
     _patch_neo4j_driver(monkeypatch, _FakeSession(None, count=0))
     res, *_ = TD.run_tool("graph_neighbors", {"name": "請求"}, "v1", None)
-    assert res == {"neighbors": []}
+    assert res == {"neighbors": [], "coverage": {"complete": True, "limits": [], "omitted": 0},
+                   "unresolved": {"available": False, "items": [], "omitted": 0}}
 
 
 # ===== es_search の mode 経路 =====

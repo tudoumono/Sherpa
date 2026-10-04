@@ -4,10 +4,11 @@
 children: 同一 `(label, cid_key, c_kind)` の重複（overload・`Property Get/Let/Set`）は1件へ集約する。`extra["c_kind"]` は通常形が `"definition"`、`Declare ... Lib` が `"declaration"`。`Interface` メンバー・`MustOverride` は本体を持たない。`resolves_calls_by_simple_name = True`（C と同じ2段目の単純名解決）。
 
 参照（`INVOKES`）:
-- `Inherits X`／`Implements X` → `via=extends`。`Imports` は参照にしない。
-- `New X(...)` → `via=call`。宣言型（`Dim x As T`・引数・戻り値）→ `via=field_type`（組み込み型は除く）。完全修飾トークンは `extra={"qualified": True}`。
+- `Inherits X`／`Implements X` → `via=extends`。`Imports` は参照にせず、`.vb` の `RefResult.file_context`（`package`＝主体の `Namespace`・`imports`＝`Imports` の宣言順。名前空間の import は `wildcard`・`Imports A = N.T` は `alias`）として共通層へ渡す。VB6/VBA/VBScript は `file_context` を返さない。
+- `New X(...)` → `via=call`。宣言型（`Dim x As T`・引数・戻り値）→ `via=field_type`（組み込み型は除く）。完全修飾トークンは `extra={"qualified": True}`。型名の参照（`Inherits`/`Implements`・`New`・`As`）には `type_ref` を付け、`.vb` では共通層が `file_context` の Namespace・`Imports` で解決する（親の Namespace→グローバル→`Imports` の順）。
 - 手続き呼び出し（`Call Foo(`・`Foo(`・括弧なしの `Foo arg1, arg2`）→ `via=call`。`:` 区切りの文単位と単一行 `If ... Then <文>` の実行部も走査する。`MsgBox`・`Debug.Print` 等の組み込み手続きは除外する。
 - `.frm`/`.ctl` のデザイナ部（`Begin ... End`）は読み飛ばす。
+- 参照の始点（`source_symbol_id`）は、その行を含む最も内側の定義: `Sub`/`Function`/`Property`（`Declare` は宣言の行だけ）→ 主体以外のトップレベル型（`.vb`）の順。主体の型の直下・型の外はファイルの主体（省略）。キーは children の `cid_key`。
 - `CreateObject`/`GetObject` → `Dropped("vb_late_bound")`、`CallByName`/`Application.Run` → `Dropped("vb_dynamic_call")`。
 - SQL 文字列: 文字列リテラル（`&`／`_` 連結を含む・先頭が文字列リテラルの連鎖のみ）に `SELECT|INSERT|UPDATE|DELETE|MERGE` があれば、`_sql_scan` で `ACCESSES via="vba_sql"`（`Table`）を返す。テーブル名の途中が動的な候補は `Dropped("vba_sql_dynamic_table")`。
 
@@ -21,7 +22,7 @@ import re
 from pathlib import PurePosixPath
 
 from . import _sql_scan
-from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
+from ._base import Analyzer, DefItem, DefResult, Dropped, FileContext, ImportItem, RefCandidate, RefResult
 from ..identifiers import normalize_code_name as _norm
 
 VB_EXT = frozenset({".vb", ".bas", ".cls", ".frm", ".ctl", ".vbs"})
@@ -148,7 +149,7 @@ _PROC_CLOSE = re.compile(r'^End\s+(?P<kind>Sub|Function|Property)\s*$', re.I)
 _DECLARE = re.compile(
     r'^(?:(?:Public|Private|Friend)\s+)?Declare\s+(?:PtrSafe\s+)?(?P<kind>Sub|Function)\s+'
     r'(?P<name>[A-Za-z_]\w*)\s+Lib\b', re.I)
-_GET_BARE = re.compile(r'^(?:(?:Public|Private|Friend|Protected)\s+)?Get\s*$', re.I)
+_ACCESSOR_BARE = re.compile(r'^(?:(?:Public|Private|Friend|Protected)\s+)?(?:Get\s*|Set\b.*)$', re.I)
 _MUSTOVERRIDE = re.compile(r'\bMustOverride\b', re.I)
 
 
@@ -163,8 +164,8 @@ def _nearest_container(stack: list):
 def _scan_structure(logical: list) -> tuple:
     """`logical`（`_logical_lines` の戻り値）を状態機械で走査し、`(top_types, nested_dropped, procedures)` を返す。
 
-    `top_types`＝`[{"kind","name","line","is_public","namespace"}, ...]`（トップレベル型のみ。VB6/VBA では常に空）。
-    `procedures`＝`[{"kind","name","line","term","owner": (kind,name)|None}, ...]`（`owner`＝最も近い囲みの型。VB6/VBA は常に `None`。入れ子型の中の手続きは含まない）。
+    `top_types`＝`[{"kind","name","line","end","is_public","namespace"}, ...]`（トップレベル型のみ。VB6/VBA では常に空。`end`＝`End <型>` の行・閉じなければ最終行）。
+    `procedures`＝`[{"kind","name","line","end","term","owner": (kind,name)|None, "namespace": 囲む Namespace|None}, ...]`（`owner`＝最も近い囲みの型。VB6/VBA は常に `None`。入れ子型の中の手続きは含まない。`end`＝`End Sub` 等の行・本体の無いものは `line`）。
     """
     stack: list = []
     namespace_stack: list = []
@@ -181,7 +182,9 @@ def _scan_structure(logical: list) -> tuple:
         if stack and stack[-1]["frame"] == "procedure":
             m_pclose = _PROC_CLOSE.match(stripped)
             if m_pclose and stack[-1]["kind"].lower() == m_pclose.group("kind").lower():
-                stack.pop()
+                popped = stack.pop()
+                if popped["rec"] is not None:
+                    popped["rec"]["end"] = line_no
             continue  # 手続き本体内は container/procedure を検知しない
 
         m_cclose = _CONTAINER_CLOSE.match(stripped)
@@ -190,6 +193,8 @@ def _scan_structure(logical: list) -> tuple:
             popped = stack.pop()
             if popped["kind"].lower() == "namespace":
                 namespace_stack.pop()
+            elif popped["rec"] is not None:
+                popped["rec"]["end"] = line_no
             continue
 
         m_decl = _DECLARE.match(stripped)
@@ -198,7 +203,8 @@ def _scan_structure(logical: list) -> tuple:
             if not (owner and owner[2]):
                 owner_pair = (owner[0], owner[1]) if owner else None
                 procedures.append({"kind": m_decl.group("kind"), "name": m_decl.group("name"),
-                                   "line": line_no, "term": "declaration", "owner": owner_pair})
+                                   "line": line_no, "end": line_no, "term": "declaration", "owner": owner_pair,
+                                   "namespace": _join_ns(namespace_stack)})
             continue
 
         m_copen = _CONTAINER_OPEN.match(stripped)
@@ -206,20 +212,22 @@ def _scan_structure(logical: list) -> tuple:
             kind = m_copen.group("kind")
             name = m_copen.group("name")
             if kind.lower() == "namespace":
-                namespace_stack.append(name)
+                namespace_stack.append(_drop_global(name))
                 stack.append({"frame": "container", "kind": "Namespace", "name": name,
-                              "nested": False})
+                              "nested": False, "rec": None})
                 continue
             depth = sum(1 for f in stack if f["frame"] == "container" and f["kind"].lower() != "namespace")
             is_public = bool(re.search(r'\bPublic\b', m_copen.group("mods"), re.I))
             is_nested = depth > 0
-            ns = ".".join(namespace_stack) if namespace_stack else None
+            ns = _join_ns(namespace_stack)
+            rec = None
             if not is_nested:
-                top_types.append({"kind": kind, "name": name, "line": line_no, "is_public": is_public,
-                                  "namespace": ns})
+                rec = {"kind": kind, "name": name, "line": line_no, "end": None, "is_public": is_public,
+                       "namespace": ns}
+                top_types.append(rec)
             else:
                 nested_dropped.append(Dropped("vb_nested_type", line_no, name))
-            stack.append({"frame": "container", "kind": kind, "name": name, "nested": is_nested})
+            stack.append({"frame": "container", "kind": kind, "name": name, "nested": is_nested, "rec": rec})
             continue
 
         m_popen = _PROC_OPEN.match(stripped)
@@ -232,25 +240,32 @@ def _scan_structure(logical: list) -> tuple:
             owner_nested = bool(owner and owner[2])
             owner_pair = (owner[0], owner[1]) if owner else None
             no_body = bool(_MUSTOVERRIDE.search(mods)) or (owner is not None and owner[0].lower() == "interface")
+            rec = None
+            if not owner_nested:
+                rec = {"kind": "Property" if kind.lower() == "property" else kind, "name": name,
+                       "line": line_no, "end": line_no, "term": "definition", "owner": owner_pair,
+                       "namespace": _join_ns(namespace_stack)}
+                procedures.append(rec)
             if kind.lower() == "property":
                 if accessor is not None:
                     push_frame = not no_body
                 else:
                     nxt = logical[idx + 1][1].strip() if idx + 1 < n else ""
-                    push_frame = (not no_body) and bool(_GET_BARE.match(nxt))
+                    push_frame = (not no_body) and bool(_ACCESSOR_BARE.match(nxt))
                 if push_frame:
-                    stack.append({"frame": "procedure", "kind": "Property", "name": name})
-                if not owner_nested:
-                    procedures.append({"kind": "Property", "name": name, "line": line_no,
-                                       "term": "definition", "owner": owner_pair})
+                    stack.append({"frame": "procedure", "kind": "Property", "name": name, "rec": rec})
                 continue
             if not no_body:
-                stack.append({"frame": "procedure", "kind": kind, "name": name})
-            if not owner_nested:
-                procedures.append({"kind": kind, "name": name, "line": line_no,
-                                   "term": "definition", "owner": owner_pair})
+                stack.append({"frame": "procedure", "kind": kind, "name": name, "rec": rec})
             continue
 
+    last_line = logical[-1][0] if logical else 0
+    for t in top_types:
+        if t["end"] is None:                              # 閉じない型は最終行まで
+            t["end"] = last_line
+    for frame in stack:
+        if frame["frame"] == "procedure" and frame["rec"] is not None:
+            frame["rec"]["end"] = last_line               # 閉じない手続きは最終行まで
     return top_types, nested_dropped, procedures
 
 
@@ -301,6 +316,8 @@ _INHERITS_OR_IMPLEMENTS = re.compile(
 _NEW_EXPR = re.compile(r'\bNew\s+(?P<type>[A-Za-z_][\w.]*)', re.I)
 _AS_TYPE = re.compile(r'\bAs\s+(?P<type>[A-Za-z_][\w.]*)', re.I)
 _CALL_PAREN = re.compile(r'\b(?P<name>[A-Za-z_][\w.]*)\s*\(', re.I)
+# `Imports N`／`Imports Alias = N.T`（`Imports <xmlns=...>` は識別子で始まらないので対象外）。
+_IMPORTS = re.compile(r'^Imports\s+(?:(?P<alias>[A-Za-z_]\w*)\s*=\s*)?(?P<name>[A-Za-z_][\w.]*)\s*$', re.I)
 _SINGLE_LINE_IF_THEN = re.compile(r'^If\b.*?\bThen\b\s*(?P<stmt>\S.*)$', re.I)
 
 _BUILTIN_TYPES = frozenset({
@@ -350,9 +367,26 @@ def _is_header_like(stripped: str) -> bool:
     return any(p.match(stripped) for p in _HEADER_LIKE)
 
 
-def _emit_ref(refs: list, name: str, line: int, via: str) -> None:
+def _drop_global(name: str) -> str:
+    """名前の先頭の `Global.`（ルート名前空間の指定）を外す。`Global` だけならルート＝空文字。"""
+    if name.upper() == "GLOBAL":
+        return ""
+    return name[7:] if name.upper().startswith("GLOBAL.") else name
+
+
+def _join_ns(stack: list):
+    """Namespace の入れ子（`Global` は外してある）を `A.B` へつなぐ。ルートだけなら `None`。"""
+    return ".".join(s for s in stack if s) or None
+
+
+def _emit_ref(refs: list, name: str, line: int, via: str, type_ref: bool = False) -> None:
+    name = _drop_global(name)
+    if not name:
+        return
     normalized = _norm(name)
     extra = {"via": via}
+    if type_ref:
+        extra["type_ref"] = True
     if "." in name:
         extra["qualified"] = True
     refs.append(RefCandidate("INVOKES", "Module", normalized, line, extra=extra))
@@ -415,19 +449,19 @@ def _scan_call_refs(san_line: str, cb_line: str, line_no: int, refs: list, dropp
         return
 
     for m in _INHERITS_OR_IMPLEMENTS.finditer(stripped):
-        _emit_ref(refs, m.group("name"), line_no, "extends")
+        _emit_ref(refs, m.group("name"), line_no, "extends", type_ref=True)
 
     for m in _AS_TYPE.finditer(san_line):
         type_token = m.group("type")
         simple = type_token.rsplit(".", 1)[-1].upper()
         if simple in _BUILTIN_TYPES:
             continue
-        _emit_ref(refs, type_token, line_no, "field_type")
+        _emit_ref(refs, type_token, line_no, "field_type", type_ref=True)
 
     new_starts = set()
     for m in _NEW_EXPR.finditer(san_line):
         new_starts.add(m.start("type"))
-        _emit_ref(refs, m.group("type"), line_no, "call")
+        _emit_ref(refs, m.group("type"), line_no, "call", type_ref=True)
 
     if _is_header_like(stripped):
         return
@@ -494,13 +528,55 @@ def _sql_refs_from_line(cb_line: str, line_no: int, dropped: list) -> list:
     return refs
 
 
+def _type_key(t: dict) -> str:
+    """トップレベル型の定義キー（`DefItem.key`＝cid の材料）。namespace があれば `Namespace.Type`。"""
+    return _norm(f"{t['namespace']}.{t['name']}") if t["namespace"] else _norm(t["name"])
+
+
+def _procedure_key(p: dict, default_owner_raw: str) -> str:
+    """手続きの定義キー（`<囲みの型>.<手続き名>`）。囲みの型が無ければ `default_owner_raw`（主体名）。"""
+    owner_name = p["owner"][1] if p["owner"] else default_owner_raw
+    ns = p.get("namespace")
+    return _norm(f"{ns}.{owner_name}.{p['name']}" if ns else f"{owner_name}.{p['name']}")
+
+
+def _owner_ranges(ext: str, text: str, rel_path: str, top_types: list, procedures: list) -> list:
+    """参照の始点を決める範囲の一覧 `(start_line, end_line, key)`。
+
+    手続き（`Sub`/`Function`/`Property`・`Declare`）と、主体以外のトップレベル型（`.vb` のみ）。主体の型・手続きと型の外は範囲に入れない（＝ファイルの主体）。
+    キーは `collect_defs` が返す children の `cid_key` と同じ（`_type_key`・`_procedure_key`）。
+    """
+    if ext == ".vb":
+        if not top_types:
+            return []
+        primary_idx = next((i for i, t in enumerate(top_types) if t["is_public"]), 0)
+        default_owner_raw = top_types[primary_idx]["name"]
+        ranges = [(t["line"], t["end"], _type_key(t)) for i, t in enumerate(top_types) if i != primary_idx]
+    else:
+        default_owner_raw = _vb6_primary_name(text, rel_path)
+        ranges = []
+    ranges.extend((p["line"], p["end"], _procedure_key(p, default_owner_raw)) for p in procedures)
+    return ranges
+
+
+def _innermost_owner(ranges: list, line: int):
+    """`line` を含む範囲のうち最も内側（開始行が最大・同じなら終了行が最小）のキー。無ければ `None`。"""
+    best = None
+    for start, end, key in ranges:
+        if start <= line <= end and (best is None or (start, -end) > (best[0], -best[1])):
+            best = (start, end, key)
+    return None if best is None else best[2]
+
+
 class VbAnalyzer(Analyzer):
     """VB.NET・VB6/VBA エクスポート・VBScript。全件受理（方言差は拡張子で内部分岐）。"""
 
     name = "vb"
     extensions = VB_EXT
     resolves_calls_by_simple_name = True
+    resolves_parent_namespaces = True
     doctype = "vb"
+    version = 3
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         ext = PurePosixPath(rel_path).suffix.lower()
@@ -518,18 +594,17 @@ class VbAnalyzer(Analyzer):
             primary_name = _norm(primary_t["name"])
             primary_cid_key = (_norm(f"{primary_t['namespace']}.{primary_t['name']}")
                                if primary_t["namespace"] else None)
-            primary = DefItem(label="Module", name=primary_name, cid_key=primary_cid_key)
+            primary = DefItem(label="Module", name=primary_name, cid_key=primary_cid_key,
+                              qualified=_type_key(primary_t))
             children: list = []
             for i, t in enumerate(top_types):
                 if i == primary_idx:
                     continue
-                nm = _norm(t["name"])
-                qk = _norm(f"{t['namespace']}.{t['name']}") if t["namespace"] else nm
-                children.append(DefItem(label="Module", name=nm, cid_key=qk, line=t["line"]))
+                children.append(DefItem(label="Module", name=_norm(t["name"]), cid_key=_type_key(t),
+                                        line=t["line"]))
             for p in procedures:
-                owner_name = p["owner"][1] if p["owner"] else primary_t["name"]
                 pname = _norm(p["name"])
-                cid_key = _norm(f"{owner_name}.{p['name']}")
+                cid_key = _procedure_key(p, primary_t["name"])
                 children.append(DefItem(label="Module", name=pname, cid_key=cid_key, line=p["line"],
                                         extra={"c_kind": p["term"]}))
             return DefResult(primary=primary, children=_dedupe_children(children), dropped=dropped)
@@ -537,11 +612,11 @@ class VbAnalyzer(Analyzer):
         # VB6/VBA/VBScript: ファイル自体が primary（Namespace/Class ブロック構文が無い）。
         primary_name_raw = _vb6_primary_name(text, rel_path)
         primary_name = _norm(primary_name_raw)
-        primary = DefItem(label="Module", name=primary_name)
+        primary = DefItem(label="Module", name=primary_name, qualified=primary_name)   # VB6 の型はグローバル名前空間
         children = []
         for p in procedures:
             pname = _norm(p["name"])
-            cid_key = _norm(f"{primary_name_raw}.{p['name']}")
+            cid_key = _procedure_key(p, primary_name_raw)
             children.append(DefItem(label="Module", name=pname, cid_key=cid_key, line=p["line"],
                                     extra={"c_kind": p["term"]}))
         return DefResult(primary=primary, children=_dedupe_children(children), dropped=dropped)
@@ -550,6 +625,8 @@ class VbAnalyzer(Analyzer):
         sanitized = _sanitize(text)
         comments_blanked = _sanitize_comments_only(text)
         logical = _logical_lines(sanitized, comments_blanked)
+        top_types, _nested, procedures = _scan_structure(logical)
+        ranges = _owner_ranges(PurePosixPath(rel_path).suffix.lower(), text, rel_path, top_types, procedures)
         refs: list = []
         dropped: list = []
         design_depth = 0
@@ -566,4 +643,24 @@ class VbAnalyzer(Analyzer):
                 continue
             _scan_call_refs(san, cb, line_no, refs, dropped)
             refs.extend(_sql_refs_from_line(cb, line_no, dropped))
-        return RefResult(refs=refs, dropped=dropped)
+        for ref in refs:
+            key = _innermost_owner(ranges, ref.line)
+            if key is not None:
+                ref.source_symbol_id = (rel_path, key)
+        file_context = None
+        if PurePosixPath(rel_path).suffix.lower() == ".vb":
+            imports = []
+            for line_no, san, _cb in logical:
+                m = _IMPORTS.match(san.strip())
+                if m and _drop_global(m.group("name")):
+                    imports.append(ImportItem(kind="alias" if m.group("alias") else "wildcard",
+                                              name=_norm(_drop_global(m.group("name"))),
+                                              alias=_norm(m.group("alias")) if m.group("alias") else None,
+                                              line=line_no))
+            primary_ns = None
+            if top_types:
+                primary_t = top_types[next((i for i, t in enumerate(top_types) if t["is_public"]), 0)]
+                primary_ns = _norm(primary_t["namespace"]) if primary_t["namespace"] else None
+            namespaces = [(t["line"], t["end"], _norm(t["namespace"]) if t["namespace"] else None) for t in top_types]
+            file_context = FileContext(package=primary_ns, imports=imports, namespaces=namespaces)
+        return RefResult(refs=refs, dropped=dropped, file_context=file_context)

@@ -13,7 +13,9 @@ from ...mcp_server import COMPARE_DOC_ID_ARGS, LISTED_DOC_TOOLS, READ_DOC_TOOLS
 from ..base import _log, _node
 from . import process
 from .ledger_gate import _LEDGER_TOOL_DETAILS
-from .mcp import _codex_ask_capture, _graph_schema_era_from_item, _mcp_neighbors_from
+from .mcp import (
+    GRAPH_SUMMARY_MAX_CHARS, _codex_ask_capture, _graph_schema_era_from_item, _graph_tool_failure, _graph_tool_summary, _mcp_neighbors_from,
+)
 from .process import (
     _classify_turn_failure,
     _humanize_cmd,
@@ -235,7 +237,8 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                         break
                     continue
                 # folder_tree/compare_documents は MCP 経由で Codex にも公開済み（`mcp_server.py::_tool_defs`）のため、表示用ラベル辞書にも対応を持たせる。
-                tlabel = {"graph_neighbors": "関係グラフをたどる", "ripgrep_search": "資料を検索（語句そのまま）",
+                tlabel = {"graph_neighbors": "関係グラフをたどる", "graph_resolve": "影響調査の起点を探す",
+                          "graph_impact": "影響先をたどる", "ripgrep_search": "資料を検索（語句そのまま）",
                           "es_search": "資料を検索（全文）", "read_around": "該当箇所を精読",
                           "list_docs": "資料の一覧を確認", "folder_tree": "フォルダ構成を確認",
                           "compare_documents": "世代間の差分を比較",
@@ -255,18 +258,29 @@ def _attempt(self, ctx, st, decision, use_resume: bool, prompt_text: str | None 
                               tool, "その他の処理")
                 if tool in _LEDGER_TOOL_DETAILS:
                     detail = _LEDGER_TOOL_DETAILS[tool](a)
+                elif tool == "graph_impact":
+                    detail = ""  # 起点の識別子は検証を通った結果の起点（パス）だけを、完了時に記録する
                 else:
                     detail = "「" + str(a.get("name") or a.get("query") or a.get("doc_id")
                                         or a.get("path_prefix") or a.get("name_pattern")
                                         or a.get("pattern") or "") + "」"
-                if done and tool == "graph_neighbors" and item.get("status") == "completed":
+                if done and tool in ("graph_neighbors", "graph_resolve", "graph_impact") and item.get("status") == "completed":
                     # 旧世代グラフの構造化エラー（`mcp_server.py::handle` が isError で返す）を先に見る。検知したら `_mcp_neighbors_from` は呼ばない。
                     _era_err = _graph_schema_era_from_item(
                         item, ctx.world, decision.get("lens") if decision else None)
                     if _era_err is not None:
                         st._graph_schema_era_error = _era_err
-                    else:
+                        if tool != "graph_neighbors":
+                            detail = "調べられませんでした"
+                    elif tool == "graph_neighbors":
                         mcp_neighbors.extend(_mcp_neighbors_from(item))
+                    elif _graph_tool_failure(item):
+                        detail = _graph_tool_failure(item)  # 失敗応答では起点の識別子などの引数を記録しない
+                    else:
+                        _summary = _graph_tool_summary(tool, item)
+                        if _summary:
+                            st.mcp_graph_results.append({"tool": tool, "summary": _summary})
+                            detail = f"{detail} {_summary}".strip()[:GRAPH_SUMMARY_MAX_CHARS]
                 yield _node(f"cx-{iid}", "tool", tlabel, detail, "done" if done else "active")
             elif (it == "collab_tool_call" and e.get("type") == "item.completed"
                   and item.get("tool") == "spawn_agent"):

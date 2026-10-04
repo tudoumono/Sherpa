@@ -20,7 +20,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import agentic_search, es_index, investigation_ledger, tool_dispatch
+from . import agentic_search, es_index, graph_coverage, graph_tools, investigation_ledger, tool_dispatch
 from .ingest.world_neo4j import GraphSchemaEraError
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -208,6 +208,8 @@ _DESC_GRAPH_PLAIN = (
     "A →COPIES→ B は B を変えると A が影響を受ける）。DOCUMENTS（言及）・CORRESPONDS_TO（同名の対応）や "
     "`unverified` の辺を含む経路は候補＝原本で確認する。名前は完全一致で引く（シェルで正確な名前を見つけてから"
     "渡す）。近傍が上限で切られたときは truncated:true と count（総数）が付く＝その範囲は未確認として扱う。"
+    "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
+    "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
 )
 # plain は台帳を持たないため `item` を除いたコピーを使う（`name` の schema/説明は共有する）。
 _PARAMS_GRAPH_PLAIN = {**agentic_search._PARAMS_GRAPH,
@@ -219,6 +221,7 @@ def _tool_defs() -> list:
     """公開ツール定義（schema は agentic_search と共通）。ES はインデックスがある時だけ公開し、`read_doc`/`doc_outline`/`glob_search` は常に公開する。
     並びは「構造を掴む→通読→精読」（ripgrep_search の直後に glob_search、read_around の直前に doc_outline・read_doc）。
     `SHERPA_MCP_ASK_DISABLED=1` の実行では ask_user を外す。探す対象（層）が限定されている間は `graph_neighbors` を外す（`run_tool` の拒否と多層防御）。
+    `graph_resolve`・`graph_impact` は層が資料のみ（docs）のときだけ外す（ソース限定の層では出す）。plain には出さない。
     `_toolset()` が `"plain"` のときは `_PLAIN_TOOLSET`（graph_neighbors・ask_user）だけを返す（出す条件は同じ）。`handle()` 側も同じ集合だけを許可する。
     """
     if _toolset() == "plain":
@@ -267,6 +270,12 @@ def _tool_defs() -> list:
     if _layer() in (None, "both"):
         defs.append({"name": "graph_neighbors", "description": agentic_search._DESC_GRAPH,
                      "inputSchema": agentic_search._PARAMS_GRAPH})
+    if _layer() != "docs":
+        # 影響の調査（起点の候補 → 識別子から構造の辺だけを逆向きにたどる）。言及の辺を使わないので、ソース限定の層でも出す（資料のみの層では外す）。
+        defs.append({"name": "graph_resolve", "description": agentic_search._DESC_GRAPH_RESOLVE,
+                     "inputSchema": agentic_search._PARAMS_GRAPH_RESOLVE})
+        defs.append({"name": "graph_impact", "description": agentic_search._DESC_GRAPH_IMPACT,
+                     "inputSchema": agentic_search._PARAMS_GRAPH_IMPACT})
     if not _ask_disabled():
         # ask_user を Codex にも公開する（description・schema は agentic と共通）。
         defs.append({"name": "ask_user", "description": agentic_search._DESC_ASK,
@@ -375,7 +384,8 @@ def _sidecar_error_code(name, result) -> None:
 # 項目ごとの未確認の記録。検索・読取ツール 6 本（任意引数 `item`＝台帳の項目 id・`agentic_search._ITEM_PARAM_SCHEMA`）の呼出結果を
 # `investigation_ledger.append_coverage_atomic` で台帳の置き場（coverage.jsonl）へ記録する。親と子は同じ `SHERPA_MCP_LEDGER_DIR` を共有する。
 _ITEM_PARAM_TOOLS = frozenset({
-    "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors"})
+    "ripgrep_search", "es_search", "read_doc", "read_around", "file_head", "graph_neighbors",
+    "graph_resolve", "graph_impact"})
 _ITEM_HITS_TOOLS = frozenset({"ripgrep_search", "es_search"})  # `hits` 配列を持つ形
 _ITEM_READ_TOOLS = frozenset({"read_doc", "read_around", "file_head"})  # 単一文書読取の形
 # 単一文書読取の error は「その doc_id を読めなかった」とみなす。検索・グラフ系の error は、`error_code` が既知の「読めない」系コードのときだけ unreadable にする。
@@ -415,9 +425,24 @@ def _coverage_outcome(name: str, result, is_error: bool) -> str | None:
                 for h in hits):
             return "truncated"
         return "hit"
+    if name in ("graph_resolve", "graph_impact"):
+        if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
+            return "error"
+        coverage = result.get("coverage")
+        if isinstance(coverage, dict) and coverage.get("complete") is False:
+            return "limit"  # 時間切れ・天井・深さの先・件数の上限は、空でも「該当なし・影響なし」（確認済みの 0 件）にしない
+        if result.get("truncated"):
+            return "limit"
+        items = result.get("candidates" if name == "graph_resolve" else "impact")
+        if isinstance(items, list) and len(items) == 0:
+            return "no_hits"
+        return "hit"
     if name == "graph_neighbors":
         if result.get("error_code"):  # `graph_unavailable`/`graph_internal_error`（isError ではない縮退）
             return "error"
+        coverage = result.get("coverage")
+        if isinstance(coverage, dict) and coverage.get("complete") is False:
+            return "limit"  # 時間切れの空・天井の部分結果を「近傍なし」（確認済みの 0 件）にしない
         neighbors = result.get("neighbors")
         if isinstance(neighbors, list) and len(neighbors) == 0:
             return "no_hits"
@@ -656,6 +681,50 @@ def _clip_read_doc_field(result: dict, max_bytes: int):
 _CLIP_FALLBACK_NOTE = "結果が大きすぎるため先頭のみ。範囲を絞って再実行してください"
 
 
+def _clip_graph_neighbors(result: dict, max_bytes: int):
+    """`graph_neighbors` の結果を、`coverage`・`error_code` などの固定欄を残したまま `neighbors` の末尾から削って収める。
+    削った件数は `coverage` に `card_cap`（`omitted` へ加算）として足す。0 件まで削っても収まらなければ `None`。
+    """
+    neighbors = result.get("neighbors")
+    if not isinstance(neighbors, list):
+        return None
+    kept = list(neighbors)
+    up = result.get("coverage") or {}
+    unknown = not up.get("complete", True) and up.get("omitted") is None  # 上流が部分結果で総数が不明
+
+    def _cov(dropped: int) -> dict:
+        cov = {"complete": False, "limits": [dict(x) for x in up.get("limits", [])],
+               "omitted": None if unknown else (0 if up.get("complete", True) else up["omitted"]) + dropped}
+        if "depth" in up:
+            cov["depth"] = dict(up["depth"])
+        if {"kind": graph_coverage.KIND_CARD_CAP, "stage": graph_coverage.STAGE_CARDS} not in cov["limits"]:
+            cov["limits"].append({"kind": graph_coverage.KIND_CARD_CAP, "stage": graph_coverage.STAGE_CARDS})
+        return cov
+
+    count = None if unknown else result.get("count", len(neighbors))
+    while True:
+        dropped = len(neighbors) - len(kept)
+        r = dict(result)
+        r["neighbors"] = kept
+        if dropped:
+            r["coverage"] = _cov(dropped)
+            r["truncated"] = True
+            r["count"] = count
+        if _json_bytes(r) <= max_bytes:
+            return r, True
+        if not kept:
+            break
+        kept.pop()
+    # 近傍を 0 件にしても収まらない: 固定欄だけの最小形、それも入らなければ明示のエラー（`hit` に分類させない）
+    minimal = {"neighbors": [], "truncated": True, "count": count, "coverage": _cov(len(neighbors))}
+    if result.get("error_code"):
+        minimal["error_code"] = result["error_code"]
+    if _json_bytes(minimal) <= max_bytes:
+        return minimal, True
+    err = {"error": "tool_result_budget_too_small"}
+    return (err, True) if _json_bytes(err) <= max_bytes else None
+
+
 def _clip_tool_result(result, name: str | None = None, args: dict | None = None):
     """1 件あたりのバイト予算を超えた結果を切り詰める（`SHERPA_MCP_TOOL_BUDGET_BYTES` 優先・無ければ `effective_tool_result_max_bytes`）。
     `run_tool` 自身が収まりを保証するため、ここに来るのは通常その保証が効かない極端なケースだけの最終防衛線。
@@ -675,6 +744,10 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
 
     structured = _clip_hits_field(result, max_bytes, offset=_offset_arg(args),
                                   allow_next_offset=(name == "ripgrep_search"))
+    if structured is None and name in graph_tools.TOOL_NAMES:
+        structured = graph_tools.fit_to_bytes(result, max_bytes)
+    if structured is None and name == "graph_neighbors":
+        structured = _clip_graph_neighbors(result, max_bytes)
     if structured is None:
         structured = _clip_read_doc_field(result, max_bytes)
     if structured is not None:

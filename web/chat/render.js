@@ -993,7 +993,45 @@ function impactRouteChipsHTML(trace) {
     return arr + `<span class="chip${i === trace.length - 1 ? ' origin' : ''}">${esc(n)}</span>`;
   }).join('');
 }
-// 影響範囲の回答本文（影響一覧。実影響が無いときは資料からの関連を推定として出す）。
+// 影響の詳細「なぜつながっているか」の平文。関係の種類（via・辺の型）と解決の規則は内部の値を出さず、ここの対応表の文言に直す。
+const _WHY_VIA = {
+  call: 'を呼び出しています', extends: 'を継承しています', implements: 'を実装しています', field_type: 'を型として使っています',
+  inject: 'を注入して使っています', include: 'を取り込んでいます', import: 'を取り込んでいます', copy: 'を COPY で取り込んでいます',
+  bean_class: 'を設定でクラスとして指定しています', mapper_type: 'を設定で指定しています', mapper_namespace: 'を設定で指定しています',
+  action_class: 'を設定で指定しています', config_value: 'を設定の値として参照しています', config_key: 'を設定のキーとして参照しています',
+  exec_sql: 'の表を SQL で参照しています', exec_proc: 'を呼び出しています', include_member: 'を取り込んでいます',
+  cics_xctl: 'を呼び出しています', cics_link: 'を呼び出しています', mapper_sql: 'の表を SQL で参照しています', vba_sql: 'の表を SQL で参照しています',
+};
+const _WHY_TYPE = { INVOKES: 'を呼び出しています', COPIES: 'を取り込んでいます', ACCESSES: 'を参照しています', CONTAINS: 'を含んでいます' };
+const _WHY_RULE = {
+  alias: '別名の指定で決まりました', single_import: 'import で指定された型に一致しました', same_package: '同じ package（名前空間）の名前に一致しました',
+  wildcard: 'import（まとめて指定）の範囲で一致しました', qualified_name: '完全な名前で一致しました', path_exact: '書かれたパスのとおりに一致しました',
+  path_suffix: 'パスの末尾で一致しました', config_key_all: '同じ名前の設定キーすべてに一致しました', schema_exact: 'スキーマ名まで一致しました',
+  schema_unqualified: '名前が一致しました（定義側にスキーマ名なし）', table_name: '表の名前で一致しました', nearest_name: '一番近い場所の同じ名前に一致しました',
+};
+// 辺 1 本の「参照元」の平文（文書と行を複数・切った分は「ほか N 件」）。根拠（sources）のある辺だけ出す。
+function _whySourcesText(e) {
+  const srcs = Array.isArray(e.sources) ? e.sources : [];
+  const one = (doc, line, loc) => esc(doc) + (loc ? `〔${esc(loc)}〕` : (line ? `〔行 ${esc(line)}〕` : ''));
+  if (!srcs.length) return '';
+  const list = srcs.filter((x) => x.doc_id).map((x) => one(x.doc_id, x.line, x.locator));
+  if (!list.length) return '';
+  const more = Number(e.sources_overflow_count) > 0 ? ` ほか ${esc(e.sources_overflow_count)} 件` : '';
+  return `参照元: ${list.join(' / ')}${more}`;
+}
+function _whyListHTML(trace, evidence) {
+  const edges = evidence || [];
+  if (!edges.length) return '';
+  const lis = edges.map((e, i) => {
+    const verb = _WHY_VIA[e.via] || _WHY_TYPE[e.type] || 'とつながっています';
+    const head = (trace[i] && trace[i + 1]) ? `<b>${esc(trace[i])}</b> は <b>${esc(trace[i + 1])}</b> ${esc(verb)}` : esc(verb.replace(/^を/, ''));
+    const rule = _WHY_RULE[e.rule] ? `<div class="why-rule">${esc(_WHY_RULE[e.rule])}</div>` : '';
+    const src = _whySourcesText(e);
+    return `<div class="why-item"><div>${head}</div>${rule}${src ? `<div class="ev">${src}</div>` : ''}</div>`;
+  }).join('');
+  return `<div class="why"><div class="why-h">なぜつながっているか</div>${lis}</div>`;
+}
+// 影響範囲の回答本文（影響一覧。構造の依存が見つからなかったときは資料から見つけた関連を別枠で出す）。
 function renderImpact(a) {
   const items = (a.data && a.data.items) || [];
   const presumed = (a.data && a.data.presumed) || [];
@@ -1001,14 +1039,13 @@ function renderImpact(a) {
   const lis = items.map((it) => {
     const trace = it.trace || [];                      // 影響の経路（ノード名列）
     const chain = trace.join(' ← ');
-    // evidence は {doc, line}（quote は presumed のみが持つ）
-    const evText = (it.evidence || []).filter((e) => e.doc)
-      .map((e) => esc(e.doc) + (e.line ? `〔行 ${esc(e.line)}〕` : '')).join(' / ');
-    const hasDetail = !!(chain || evText);
-    // 詳細（経路チップ＋根拠）は行データにあるものだけで構成する。トグルは行全体（キーボード操作は chat.js の委譲側）
+    // evidence は代表経路の辺ごとの {type, doc, line, via?, rule?, sources?, sources_overflow_count?}（quote は presumed のみが持つ）
+    const why = _whyListHTML(trace, (it.evidence || []).filter((e) => e.doc));
+    const hasDetail = !!(chain || why);
+    // 詳細（経路チップ＋なぜつながっているか）は行データにあるものだけで構成する。トグルは行全体（キーボード操作は chat.js の委譲側）
     const detail = hasDetail
       ? `<div class="ixdetail">${trace.length ? `<div class="ix-route">${impactRouteChipsHTML(trace)}</div>` : ''}`
-        + `<div class="path"><div class="chain">${esc(chain)}</div>${evText ? `<div class="ev">根拠: ${evText}</div>` : ''}</div></div>`
+        + `<div class="path"><div class="chain">${esc(chain)}</div>${why}</div></div>`
       : '';
     const topAttrs = hasDetail ? ' role="button" tabindex="0" aria-expanded="false" data-toggle' : '';
     const toggle = hasDetail ? '<span class="pathbtn" aria-hidden="true">経路 <span class="caret">▾</span></span>' : '';
@@ -1020,14 +1057,13 @@ function renderImpact(a) {
   }).join('');
   const ilist = items.length ? `<ul class="ilist">${lis}</ul>` : '';
   let pres = '';
-  if (presumed.length) {                              // 実影響が無いとき、資料から辿った関連を推定として出す
+  if (presumed.length) {                              // 構造の依存が見つからなかったとき、資料から見つけた関連を別枠で出す
     const pl = presumed.map((p) => {
       const e0 = (p.evidence || [])[0] || {};
       const q = e0.quote ? `<div class="path"><div class="ev">根拠: ${esc(e0.quote)}${e0.doc ? `〔${esc(e0.doc)}〕` : ''}</div></div>` : '';
-      return `<li><div class="top"><span class="conf warn"><span class="d"></span>推定</span>`
-        + `<span class="kind">${esc(p.category)}</span><span class="nm">${esc(p.name)}</span></div>${q}</li>`;
+      return `<li><div class="top"><span class="kind">${esc(p.category)}</span><span class="nm">${esc(p.name)}</span></div>${q}</li>`;
     }).join('');
-    pres = '<div class="muted" style="margin:6px 0 2px">実影響は登録されていません。資料からの関連（推定）:</div>'
+    pres = '<div class="muted" style="margin:6px 0 2px">構造の依存は見つかりませんでした。資料から見つけた関連:</div>'
       + `<ul class="ilist">${pl}</ul>`;
   }
   return ilist + pres;

@@ -1607,8 +1607,66 @@
         "title": "ExtCodexJobUnconfirmedItem",
         "type": "object"
       },
+      "ExtCoverage": {
+        "description": "使ったエンジンだけがキーになる。",
+        "properties": {
+          "fused": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtFusedCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "graph": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtEngineCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "keyword": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtEngineCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vector": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtEngineCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "ExtCoverage",
+        "type": "object"
+      },
       "ExtDegraded": {
         "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
           "engine": {
             "enum": [
               "keyword",
@@ -1630,12 +1688,321 @@
         "title": "ExtDegraded",
         "type": "object"
       },
+      "ExtDepth": {
+        "properties": {
+          "requested": {
+            "title": "Requested",
+            "type": "integer"
+          },
+          "truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truncated"
+          }
+        },
+        "required": [
+          "requested",
+          "truncated"
+        ],
+        "title": "ExtDepth",
+        "type": "object"
+      },
+      "ExtEdgeSource": {
+        "description": "辺（つながり）の根拠 1 件。参照元の文書・行・関係の種類・接続を決めた解決規則。言及の辺は `locator`（文書内の位置）を持つ。",
+        "properties": {
+          "doc_id": {
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "evidence_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Text"
+          },
+          "file": {
+            "title": "File",
+            "type": "string"
+          },
+          "from_def": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtFromDef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "line": {
+            "title": "Line",
+            "type": "integer"
+          },
+          "locator": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Locator"
+          },
+          "rule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule"
+          },
+          "via": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Via"
+          }
+        },
+        "required": [
+          "doc_id",
+          "file",
+          "line"
+        ],
+        "title": "ExtEdgeSource",
+        "type": "object"
+      },
+      "ExtEngineCoverage": {
+        "description": "成功したエンジン 1 つの調べ切れ具合。失敗したエンジンは持たない（`degraded` が伝える）。",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtDepth"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limits": {
+            "items": {
+              "$ref": "#/components/schemas/ExtLimit"
+            },
+            "title": "Limits",
+            "type": "array"
+          },
+          "omitted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Omitted"
+          },
+          "presumed_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Presumed Count"
+          },
+          "requested_k": {
+            "title": "Requested K",
+            "type": "integer"
+          },
+          "returned": {
+            "title": "Returned",
+            "type": "integer"
+          },
+          "structural_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Structural Count"
+          }
+        },
+        "required": [
+          "complete",
+          "requested_k",
+          "returned",
+          "limits"
+        ],
+        "title": "ExtEngineCoverage",
+        "type": "object"
+      },
+      "ExtFromDef": {
+        "description": "参照元の定義。`key` は定義のキー（`null` はそのファイルの主体）。",
+        "properties": {
+          "file": {
+            "title": "File",
+            "type": "string"
+          },
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          }
+        },
+        "required": [
+          "file",
+          "key"
+        ],
+        "title": "ExtFromDef",
+        "type": "object"
+      },
+      "ExtFusedCoverage": {
+        "properties": {
+          "omitted_by_cut": {
+            "title": "Omitted By Cut",
+            "type": "integer"
+          },
+          "requested_k": {
+            "title": "Requested K",
+            "type": "integer"
+          },
+          "returned": {
+            "title": "Returned",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requested_k",
+          "returned",
+          "omitted_by_cut"
+        ],
+        "title": "ExtFusedCoverage",
+        "type": "object"
+      },
+      "ExtGraphEdge": {
+        "description": "経路の辺 1 本。`via` は関係の種類・`rule` は代表の根拠の解決規則・`sources` は根拠（先頭 `evidence_limit` 件）・\n`sources_omitted` は返さなかった根拠の件数（保存の上限を超えた分を含む）。根拠のある辺だけが `rule`・`sources`・`sources_omitted` を持つ。",
+        "properties": {
+          "doc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc"
+          },
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "rule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ExtEdgeSource"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources"
+          },
+          "sources_omitted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources Omitted"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "via": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Via"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "ExtGraphEdge",
+        "type": "object"
+      },
       "ExtGraphPath": {
         "properties": {
           "edges": {
             "items": {
-              "additionalProperties": true,
-              "type": "object"
+              "$ref": "#/components/schemas/ExtGraphEdge"
             },
             "title": "Edges",
             "type": "array"
@@ -1667,6 +2034,24 @@
               }
             ],
             "title": "Doc Id"
+          },
+          "graph_origin": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "structure",
+                    "presumed"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Graph Origin"
           },
           "line": {
             "anyOf": [
@@ -1703,6 +2088,17 @@
               }
             ],
             "title": "Paths"
+          },
+          "paths_omitted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paths Omitted"
           },
           "score": {
             "title": "Score",
@@ -2219,6 +2615,30 @@
         "title": "ExtKeyRevokeResponse",
         "type": "object"
       },
+      "ExtLimit": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "timeout",
+              "row_cap",
+              "depth",
+              "result_cap",
+              "doc_search_truncated",
+              "card_cap",
+              "graph_unavailable",
+              "graph_reingest_required",
+              "plugin_failed"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ExtLimit",
+        "type": "object"
+      },
       "ExtSearchReq": {
         "properties": {
           "depth": {
@@ -2246,6 +2666,18 @@
               }
             ],
             "title": "Engines"
+          },
+          "evidence_limit": {
+            "default": 3,
+            "maximum": 10.0,
+            "minimum": 0.0,
+            "title": "Evidence Limit",
+            "type": "integer"
+          },
+          "include_presumed": {
+            "default": true,
+            "title": "Include Presumed",
+            "type": "boolean"
           },
           "k": {
             "default": 10,
@@ -2314,6 +2746,16 @@
       },
       "ExtSearchRes": {
         "properties": {
+          "coverage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "degraded": {
             "items": {
               "$ref": "#/components/schemas/ExtDegraded"

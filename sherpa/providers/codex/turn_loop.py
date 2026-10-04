@@ -49,6 +49,7 @@ def _resume_fallback(self, ctx, st, decision):
         _agent_msgs.clear()
         st._agent_partial, st._stream_error = "", False
         mcp_neighbors.clear()
+        st.mcp_graph_results.clear()
         st.codex_usage, st.ran, st.codex_question, st.thread_id = None, False, None, None
         # 失敗した resume attempt の構造化状態（`_latest_structured`・`_structured_answers`）は新規セッションへ持ち越さない。
         _structured_answers.clear()

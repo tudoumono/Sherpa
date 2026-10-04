@@ -1,0 +1,3 @@
+CREATE TABLE A.LEDGER (
+    ID INT
+);

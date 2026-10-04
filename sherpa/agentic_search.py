@@ -191,11 +191,54 @@ _DESC_GRAPH = ("関係グラフから、ある名前（プログラム/コピー
                "名前が一つでも判明したら、その関連の広がりは grep を反復するより先にこれで辿るほうが早い。"
                "原因の手がかり集め（トラブルシュート）に有効。grep で正確な名前を見つけてから渡すと精度が上がる。"
                "近傍が上限で切られたときは truncated:true と count（総数）が付く＝続きは取れないので、その範囲は未確認として扱う。"
+               "coverage.complete が false のとき（時間切れ・件数の上限・文書探索の打ち切り・カード数の上限）は、近傍が空でも"
+               "「近傍なし」とは言えない＝未確認（理由は coverage.limits[].kind）。"
+               "unresolved は、この名前を参照しているのに接続先を決められなかった箇所（曖昧・未解決）の一覧＝"
+               "接続が確認できていない参照として原本で確かめる（available が false なら申告を保存していない旧グラフ。candidates が null は 0 ではなく候補数を数えられなかった）。"
+               "これは関連の近傍用（無向・言及を含む）。**変更の影響先を調べるときは graph_resolve で起点を選び graph_impact を使う**"
+               "（構造の依存だけを矢印の逆向きにたどり、同名の別ノードを混ぜない）。"
                f"{_ITEM_PARAM_NOTE}")
 _PARAMS_GRAPH = {"type": "object", "properties": {
     "name": {"type": "string", "description": "関連をたどる起点の名前（プログラム名/データ項目名など・具体名）"},
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["name"]}
+_DESC_GRAPH_RESOLVE = ("関係グラフから、名前（の一部）・種別・所属パス（の一部）に合う**起点の候補**を並べる。"
+                       "同名の別ノード（別フォルダ・別 package の同名のクラスなど）はまとめず別々の候補として返し、"
+                       "各候補は canonical_id・kind（種別）・path（所属パス）・name（表示名）・qualified_name（修飾名がある場合だけ）・"
+                       "match（exact＝名前が一致／partial＝部分一致）を持つ。"
+                       "影響を調べる前に、候補の path などから正しい起点を選び、その canonical_id を graph_impact へ渡す"
+                       "（候補が複数あって選べないときは、ユーザーに ask_user で確認してよい）。"
+                       "候補が limit より多いときは count（総数）と coverage（complete:false・limits[].kind=result_cap・omitted）が付く"
+                       "＝path や kind で絞って呼び直す。coverage.complete が false のとき、候補が空でも「該当なし」とは言えない"
+                       "（理由は coverage.limits[].kind）。"
+                       f"{_ITEM_PARAM_NOTE}")
+_PARAMS_GRAPH_RESOLVE = {"type": "object", "properties": {
+    "name": {"type": "string", "description": "名前の一部（大文字小文字を区別しない・修飾名も対象）。name と path のどちらかは必須"},
+    "kind": {"type": "string", "description": "種別で絞る（Module／Copybook／Batch／DataItem／Table／Document／Config）"},
+    "path": {"type": "string", "description": "所属パスの一部で絞る（例: 'billing/'）"},
+    "limit": {"type": "integer", "description": "返す候補の最大数（既定 20・最大 50）"},
+    "item": _ITEM_PARAM_SCHEMA}}
+_DESC_GRAPH_IMPACT = ("**起点の canonical_id**（graph_resolve で選んだもの）から、構造の依存（COPIES／CONTAINS／INVOKES／ACCESSES）だけを"
+                      "矢印の逆向きにたどり、起点を変えたときに影響を受ける部品（影響先）を返す。名前は受け取らない"
+                      "（同名の別ノードを混ぜないため）。各影響先は canonical_id・kind・path・distance（起点からの段数）・"
+                      "trace（影響先から起点までのノード名）・route（辺ごとの種類 type と向き from→to・参照元の資料 doc と行 line）を持つ。"
+                      "DOCUMENTS（言及）は影響に数えず、related_documents（起点と影響先を言及する資料・層の限定がないときだけ）として別に返す"
+                      "＝影響先ではなく関連資料。evidence は route と同じ並びで辺ごとの根拠（via＝関係の種類・line・rule＝接続を決めた解決規則・"
+                      "sources＝参照元の資料 doc_id と行の先頭 evidence_limit 件・sources_overflow_count＝返さなかった件数）を持つ"
+                      "＝確かめるときは原本のその行を開く。unresolved は起点の名前に一致する「解決できなかった参照」"
+                      "（available:false なら未解決の情報が保存されていない旧いグラフ）で、ある場合は影響先が欠けている可能性＝未確認として扱う。"
+                      "depth（既定 5・最大 10）と limit（既定 50・最大 200）で範囲を決める。"
+                      "coverage.complete が false のとき（時間切れ・件数の天井・depth の先に影響先が残る・limit で切った）は、"
+                      "影響先が空でも「影響なし」とは言えない＝未確認（理由は coverage.limits[].kind・depth の先が残るときは "
+                      "coverage.depth.truncated が true）。depth や limit を上げて呼び直すか、範囲を未確認と明記する。"
+                      f"{_ITEM_PARAM_NOTE}")
+_PARAMS_GRAPH_IMPACT = {"type": "object", "properties": {
+    "canonical_id": {"type": "string", "description": "起点の識別子（graph_resolve の candidates[].canonical_id）"},
+    "depth": {"type": "integer", "description": "たどる深さの上限（既定 5・最大 10）"},
+    "limit": {"type": "integer", "description": "返す影響先の最大数（既定 50・最大 200）"},
+    "evidence_limit": {"type": "integer", "description": "辺ごとに返す根拠（sources）の最大件数（既定 3・0〜10）"},
+    "item": _ITEM_PARAM_SCHEMA},
+    "required": ["canonical_id"]}
 _PARAMS_GLOB = {"type": "object", "properties": {
     "pattern": {"type": "string",
                "description": ("ファイル名/パスのワイルドカードパターン。`*`/`?`/`[seq]` は1階層内のみ・"
@@ -342,7 +385,8 @@ def _question_from_args(args: dict) -> dict:
 
 # search_truncated（利用統計「打ち切りの内訳」対象）: 検索系ツールが母集団の一部しか返さなかった呼び出し。`result["truncated"]` をそのまま数える（計測のみ・制限は変えない）。
 _SEARCH_TRUNCATED_TOOLS = frozenset({
-    "ripgrep_search", "es_search", "glob_search", "graph_neighbors", "list_docs", "doc_outline"})
+    "ripgrep_search", "es_search", "glob_search", "graph_neighbors", "graph_resolve", "graph_impact",
+    "list_docs", "doc_outline"})
 # tool_result_clipped（同）: 1 件あたりのバイト予算で本文が切り詰められた呼び出し。判定キーは `text_truncated`（read_around/read_doc の逐次クリップ・ripgrep_search/es_search のヒット単位クリップ）と `byte_clipped`（`_finish_reader_result` の原本読取ツール・compare_documents の diff）。読取ツールの `truncated` は行数/ページ数の上限でも立つため使わない。
 # ripgrep_search/es_search は `search_truncated` と `tool_result_clipped` が独立に起こりうる。doc_outline/graph_neighbors/list_docs/glob_search は `search_truncated` のみで数える。
 _BYTE_CLIP_TOOLS = frozenset({

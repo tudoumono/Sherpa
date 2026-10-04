@@ -44,7 +44,7 @@ CASES = {
     "bare_package_import_not_local": ('import React from "react";\n', "app.js", [], None),
     "require_relative": ('const x = require("./util");\n', "app.js", [("INVOKES", "Module", "util.js", None)], None),
     "import_scripts_relative": ('importScripts("helpers.js");\n', "app.js", [("INVOKES", "Module", "helpers.js", None)], None),
-    "import_scripts_absolute_url_excluded": ('importScripts("https://cdn.example.com/lib.js");\n', "app.js", [], None),
+    "import_scripts_absolute_url_excluded": ('importScripts("https://cdn.example.com/lib.js");\n', "app.js", [], [(EXT, None)]),
     "import_scripts_data_uri_dropped": ('importScripts("data:text/javascript,void(0)");\n', "app.js", [], [(EXT, None)]),
     "absolute_import_scripts_relative_to_referrer": ('importScripts("/static/helpers.js");\n', "gen1/static/worker.js",
                                                      [Inc("helpers.js", "helpers.js")], None),
@@ -68,6 +68,31 @@ CASES = {
     "line_comment_not_scanned": ('// fetch("/api/orders");\n', "app.js", [], None),
     "block_comment_not_scanned": ('/* fetch("/api/orders"); */\n', "app.js", [], None),
     "url_in_string_survives_comment_removal": ('// note\nfetch("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    # 文字列の中のコードの断片は読まない（Dropped で申告）。API の引数の位置の文字列は読む
+    "code_in_description_string_not_scanned": (
+        'var msg = "import x from \'./b.js\'; fetch(\'/api/z\')";\n', "app.js", [], [("js_string_code", 1)]),
+    "code_in_template_string_not_scanned": ('var t = `require("./b.js")`;\n', "app.js", [], [("js_string_code", 1)]),
+    "api_arguments_kept_beside_description_string": (
+        'var msg = "import x from \'./b.js\'; fetch(\'/api/z\')";\nconst b = require("./b.js");\n'
+        'import("./c.js");\nfetch("/api/z");\n', "app.js",
+        [Inc("c.js", "./c.js"), Inc("b.js", "./b.js"), Key("/api/z")], [("js_string_code", 1)]),
+    "dynamic_import_with_comment_before_arg": ('import(/* chunk */ "./c.js");\n', "app.js", [Inc("c.js", "./c.js")], None),
+    "template_expression_code_is_scanned": (
+        'var t = `x ${require("./b.js")} ${`n ${fetch("/api/q")}`} import z from "./no.js"`;\n', "app.js",
+        [Inc("b.js", "./b.js"), Key("/api/q")], [("js_string_code", 1)]),
+    "api_argument_static_template_is_read": ('fetch(`/api/orders`);\n', "app.js", [Key("/api/orders")], None),
+    "api_argument_static_template_import": ('import(`./b.js`);\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "api_argument_dynamic_template_reported": ('fetch(`/api/${id}`);\n', "app.js", [], [(DYN, 1)]),
+    "xhr_open_variable_method_second_arg_is_url": ('xhr.open(method, "/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    # 関数名と括弧の間の空白・改行、複数行の import/export … from
+    "require_space_before_paren": ('const x = require ("./util");\n', "app.js", [("INVOKES", "Module", "util.js", None)], None),
+    "import_scripts_space_before_paren": ('importScripts ("helpers.js");\n', "app.js", [("INVOKES", "Module", "helpers.js", None)], None),
+    "fetch_newline_before_paren": ('fetch\n("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "axios_spaced_call": ('axios . get ("/api/orders");\n', "app.js", [Key("/api/orders")], None),
+    "multiline_named_import": ('import {x,\n  y} from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "multiline_export_from": ('export {\n  a,\n  b\n} from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "multiline_import_does_not_swallow_next_statement": (
+        'import {x,\n  y} from "react";\nconst s = "./not-a-dep.js";\n', "app.js", [], None),
     # minified
     "min_js_filename_dropped": ('fetch("/api/orders");', "app.min.js", [], [("js_minified", 1)]),
     "long_single_line_dropped": ("var x=1;" * 1000, "bundle.js", [], [("js_minified", 1)]),
@@ -80,6 +105,6 @@ def test_extract_refs(text, path, refs, dropped):
     assert [(r.edge_type, r.kind, r.name) for r in res.refs] == [e[:3] for e in refs]
     for r, e in zip(res.refs, refs):
         assert e[3] is None or all(r.extra.get(k) == v for k, v in e[3].items())
-    if dropped is not None:
-        assert [(d.reason, d.line if line is not None else None) for d, (_r, line) in zip(res.dropped, dropped)] == dropped
-        assert len(res.dropped) == len(dropped)
+    expected = dropped or []  # None は「申告なし」の期待
+    assert [(d.reason, d.line if line is not None else None) for d, (_r, line) in zip(res.dropped, expected)] == expected
+    assert len(res.dropped) == len(expected)
