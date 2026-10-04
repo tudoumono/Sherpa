@@ -93,6 +93,14 @@ CASES = {
     "multiline_export_from": ('export {\n  a,\n  b\n} from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
     "multiline_import_does_not_swallow_next_statement": (
         'import {x,\n  y} from "react";\nconst s = "./not-a-dep.js";\n', "app.js", [], None),
+    # 木で読むことで直った読み違い
+    "directory_import_is_not_a_file": ('import x from "../";\nrequire("./");\n', "app.js", [], None),
+    "regex_literal_quote_does_not_hide_next_call": ('var re = /"/g; fetch("/after-regex");\n', "app.js", [Key("/after-regex")], None),
+    "export_from_after_long_specifier_list": (
+        "export { " + ", ".join(f"a{i} as b{i}" for i in range(80)) + ' } from "./b.js";\n', "app.js", [Inc("b.js", "./b.js")], None),
+    "dynamic_import_and_require_are_reported": ('import(p);\nrequire(q);\nimport("./ok.js");\n', "app.js", [Inc("ok.js", "./ok.js")],
+                                                [("js_dynamic_import", 1), ("js_dynamic_import", 2)]),
+    "dynamic_template_import_is_dynamic_import": ("import(`./${p}`);\nrequire(`./${q}`);\n", "app.js", [], [("js_dynamic_import", 1), ("js_dynamic_import", 2)]),
     # minified
     "min_js_filename_dropped": ('fetch("/api/orders");', "app.min.js", [], [("js_minified", 1)]),
     "long_single_line_dropped": ("var x=1;" * 1000, "bundle.js", [], [("js_minified", 1)]),
@@ -108,3 +116,16 @@ def test_extract_refs(text, path, refs, dropped):
     expected = dropped or []  # None は「申告なし」の期待
     assert [(d.reason, d.line if line is not None else None) for d, (_r, line) in zip(res.dropped, expected)] == expected
     assert len(res.dropped) == len(expected)
+
+
+def test_syntax_error_is_reported_and_the_rest_is_still_read():
+    res = A.extract_refs('var broken = {;\nfetch("/after-error");\nimport z from "./z.js";\n', "app.js")
+    assert [r.name for r in res.refs] == ["z.js", "/after-error"]
+    assert [d.reason for d in res.dropped] == ["syntax_error"]
+
+
+def test_inner_literal_parse_is_bounded_but_api_refs_are_still_read():
+    prose = "".join(f'var m{i} = "see url {i}";\n' for i in range(500))
+    res = A.extract_refs(prose + 'fetch("/api/z");\nimport x from "./b.js";\n', "bundle.js")
+    assert [r.name for r in res.refs] == ["b.js", "/api/z"]
+    assert [(d.reason, d.snippet) for d in res.dropped] == [("js_string_code_limit", "300 件")]

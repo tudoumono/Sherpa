@@ -6,16 +6,18 @@
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import scripts.verify_extension as verify_extension
 import pytest
 
 from sherpa.ingest.analyzers import registry
 from sherpa.ingest.analyzers._base import Analyzer
+from sherpa.ingest.analyzers.java import JavaAnalyzer
 
 
 _OMIT = object()
@@ -332,3 +334,419 @@ def test_build_world_skips_sensitive_named_files_even_if_an_analyzer_claims_the_
     blob = repr(nodes) + repr(edges) + repr(flags)
     assert "SHOULD_NOT_APPEAR" not in blob and ".env.yaml" not in blob
     assert "app.yaml" in blob
+
+
+# ---- FW プラグイン（本体のアナライザの後に複数を重ねて適用する仕組み・ANA-15 P1） ----
+
+from sherpa import graph_coverage  # noqa: E402
+from sherpa.ingest import world_graph, world_neo4j  # noqa: E402
+from sherpa.ingest.analyzers._base import (  # noqa: E402
+    DefItem, DefResult, Dropped, FwPlugin, PluginAmbiguity, PluginDefs, PluginRefs, RefCandidate, RefResult)
+
+
+class _Lang(Analyzer):
+    """架空の言語。`CFG-A`／`CFG-B` で始まる本文は設定の種別 A／B。"""
+    name = "tfw:lang"
+    doctype = "ext-test"
+    extensions = frozenset({".tfw"})
+    version = 1
+
+    def config_kind(self, text, rel_path):
+        return {"CFG-A": "A", "CFG-B": "B"}.get(text[:5])
+
+    def collect_defs(self, text, rel_path):
+        return DefResult(primary=DefItem("Module", PurePosixPath(rel_path).name),
+                         children=[DefItem("DataItem", "BASEFIELD", line=1)])
+
+    def extract_refs(self, text, rel_path):
+        return RefResult(refs=[RefCandidate("INVOKES", "Module", "target.tfw", 2, {"via": "call"})])
+
+
+def _plugin(name, *, order=100, kinds=(), languages=("tfw:lang",), version=1, target="other.tfw", calls=None,
+            child=None, boom=None):
+    class _P(FwPlugin):
+        pass
+    _P.name, _P.order, _P.version = name, order, version
+    _P.languages, _P.config_kinds = frozenset(languages), frozenset(kinds)
+
+    def collect_defs(self, text, rel_path, base):
+        if calls is not None:
+            calls.append(name)
+        if boom == "defs":
+            raise RuntimeError("defs boom")
+        return PluginDefs(children=[DefItem("DataItem", child, line=3)] if child else [])
+
+    def extract_refs(self, text, rel_path, base_defs, base_refs, types):
+        if boom == "refs":
+            raise RuntimeError("refs boom")
+        return PluginRefs(refs=[RefCandidate("INVOKES", "Module", target, 3, {"via": "call"})],
+                          dropped=[Dropped("unsupported", 3, "x")])
+    _P.collect_defs, _P.extract_refs = collect_defs, extract_refs
+    return _P()
+
+
+def _build(tmp_path, monkeypatch, plugins, texts=None):
+    monkeypatch.setattr(registry, "_ANALYZERS", registry._UPSTREAM_ANALYZERS + (_Lang(),))
+    monkeypatch.setattr(registry, "FW_PLUGINS", tuple(plugins))
+    (tmp_path / "src").mkdir(exist_ok=True)
+    files = []
+    for fn in ("main.tfw", "target.tfw", "other.tfw"):
+        (tmp_path / "src" / fn).write_text((texts or {}).get(fn, "CFG-A\n"), encoding="utf-8")
+        files.append((tmp_path / "src" / fn, f"src/{fn}"))
+    nodes, edges, flags = world_graph.build_world(tmp_path, "w", files=files)
+    ekeys = {(e["src"].rsplit("#", 1)[-1], e["type"], e["dst"].rsplit("#", 1)[-1], e.get("via")) for e in edges}
+    return {n["cid"] for n in nodes}, ekeys, flags
+
+
+def test_plugin_off_keeps_base_result_and_plugin_only_adds(tmp_path, monkeypatch):
+    # 契約テスト①: 無効（登録なし）でも本体の結果は同じで、有効にすると足すだけ（本体の出力は 1 つも消えない）
+    n0, e0, f0 = _build(tmp_path, monkeypatch, [])
+    n1, e1, f1 = _build(tmp_path, monkeypatch, [_plugin("p:one", child="PFIELD")])
+    assert e0 and n0 <= n1 and e0 <= e1
+    assert ("main.tfw", "INVOKES", "other.tfw", "call") in e1 - e0 and not any(k[2] == "other.tfw" for k in e0)
+    assert len(n1 - n0) == 3                                       # 3 ファイルへ PFIELD を 1 つずつ
+    assert [f for f in f0 if f["reason"] == "plugin_failed"] == []
+    assert any(f["reason"] == "dropped_syntax" and f["why"] == "p:one: unsupported" for f in f1)
+
+
+def test_two_plugins_apply_together_in_deterministic_order_and_duplicates_collapse(tmp_path, monkeypatch):
+    # 契約テスト②: (order, 登録名) の昇順・両方の追加分が入り・同じ参照は 1 件
+    calls: list = []
+    a = _plugin("a:fw", order=2, calls=calls, target="other.tfw")
+    b = _plugin("z:fw", order=1, calls=calls, target="other.tfw", child="ZFIELD")
+    c = _plugin("m:fw", order=2, calls=calls, target="target.tfw")  # 本体と同じ (INVOKES, 名前, via) でも行が違えば別の参照
+    _n, e_ab, _f = _build(tmp_path, monkeypatch, [a, b, c])
+    assert calls[:3] == ["z:fw", "a:fw", "m:fw"] and [p.name for p in registry.fw_plugins()] == ["z:fw", "a:fw", "m:fw"]
+    _n, e_ba, _f = _build(tmp_path, monkeypatch, [c, b, a])
+    assert e_ab == e_ba                                           # 登録順に依らない
+    assert ("main.tfw", "INVOKES", "other.tfw", "call") in e_ab and ("main.tfw", "INVOKES", "target.tfw", "call") in e_ab
+    base_defs, base_refs = DefResult(), RefResult()
+    merged, fails, ambs = registry.apply_fw_refs([a, b, c], "", "main.tfw", base_defs, base_refs)
+    assert fails == [] and ambs == [] and [(r.name, r.line) for r in merged.refs] == [("other.tfw", 3), ("target.tfw", 3)]  # a と z の同じ参照は 1 件
+
+
+def test_plugin_exception_keeps_base_and_reports_failure_in_flags_coverage_and_degraded(tmp_path, monkeypatch):
+    # 契約テスト③: 例外で本体の結果は残り、取り込みの記録（flags）・coverage・degraded に失敗が出る
+    _n, e0, _f = _build(tmp_path, monkeypatch, [])
+    _n, e1, flags = _build(tmp_path, monkeypatch, [_plugin("p:bad", boom="refs"), _plugin("p:ok", child="OKF")])
+    assert e0 <= e1
+    failed = [f for f in flags if f["reason"] == "plugin_failed"]
+    assert [(f["plugin"], f["action"], f["files"]) for f in failed] == [("p:bad", "warn", 3)]
+    assert "refs boom" in failed[0]["why"]
+    failures = world_graph.plugin_failures_from_flags(flags)
+    assert [x["plugin"] for x in failures] == ["p:bad"]
+
+    class _Rec:
+        def __init__(self, d): self._d = d
+        def data(self): return self._d
+
+    class _Session:
+        def run(self, query, **params):
+            return iter([_Rec({"pf": json.dumps(failures)})])
+    assert world_neo4j.read_plugin_failures(_Session(), "w") == failures
+    cov = graph_coverage.Coverage()
+    graph_coverage.add_plugin_failures(cov, failures, graph_coverage.STAGE_IMPACT)
+    assert cov.as_dict()["limits"] == [{"kind": "plugin_failed", "stage": "impact", "plugin": "p:bad"}]
+    from sherpa.graph_tools import _attach_plugin_failures
+    res = {"coverage": graph_coverage.Coverage().as_dict()}
+    _attach_plugin_failures(_Session(), "w", res, graph_coverage.STAGE_IMPACT)
+    assert res["coverage"]["complete"] is False and res["coverage"]["limits"][0]["plugin"] == "p:bad"
+
+    from sherpa.impact_service import plugin_failed_note
+    assert "p:bad" in plugin_failed_note(res["coverage"])
+    from sherpa.parts.read import fused_search
+    gh = fused_search.GraphHits()
+    gh.run_coverage = res["coverage"]
+    monkeypatch.setattr(fused_search, "_search_graph", lambda *a, **k: (gh, None))
+    monkeypatch.setattr(fused_search.documents, "world_rel_set", lambda *a, **k: set())
+    out = fused_search.search("w", "q", engines=["graph"])
+    assert out["degraded"] == []                                   # 結果が返るので degraded には入れない（従来どおり失敗して結果なしだけ）
+    assert out["engines_used"] == ["graph"] and {"kind": "plugin_failed"} in out["coverage"]["graph"]["limits"]
+    assert out["coverage"]["graph"]["complete"] is False
+
+
+def test_plugin_version_bump_changes_only_that_plugin_signature(monkeypatch):
+    p1, p2 = _plugin("p:one", order=1, kinds=("A",)), _plugin("p:two", order=2)
+    monkeypatch.setattr(registry, "FW_PLUGINS", (p1, p2))
+    monkeypatch.setattr(registry, "_ANALYZERS", registry._UPSTREAM_ANALYZERS + (_Lang(),))
+    before = registry.config_signature()
+    monkeypatch.setattr(p1, "version", 2)
+    after = registry.config_signature()
+    assert after[0] == before[0] and after[1] == before[1] and after[2][1] == before[2][1]
+    assert after[2][0] != before[2][0] and after[2][0] == ("p:one", 2, ("tfw:lang",), ("A",), 1)
+    monkeypatch.setattr(p1, "config_kinds", frozenset({"B"}))   # 適用条件の変更も署名に出る
+    assert registry.config_signature()[2][0][3] == ("B",)
+
+
+def test_plugin_applies_only_to_matching_language_and_config_kind(monkeypatch):
+    # 契約テスト⑤: 肯定・否定（別の設定の種別・別のアナライザ・種別を判定できないファイルには適用しない）
+    pa, pb = _plugin("p:a", kinds=("A",)), _plugin("p:b", kinds=("B",))
+    px, pany = _plugin("p:x", languages=("java",)), _plugin("p:any")
+    monkeypatch.setattr(registry, "FW_PLUGINS", (pa, pb, px, pany))
+    lang = _Lang()
+    names = lambda text: [p.name for p in registry.applicable_fw_plugins(lang, text, "a.tfw")]  # noqa: E731
+    assert names("CFG-A\n") == ["p:a", "p:any"]
+    assert names("CFG-B\n") == ["p:any", "p:b"]            # 同じ order は登録名の昇順
+    assert names("plain\n") == ["p:any"]                          # 種別なし＝種別で絞るプラグインには適用しない
+    assert [p.name for p in registry.applicable_fw_plugins(JavaAnalyzer(), "", "A.java")] == ["p:x"]
+
+
+def _java_world(tmp_path, monkeypatch, impls, plugin):
+    """Java の世代（インタフェース 1・実装 `impls` 個・注入側 1）に `plugin` を適用してグラフを作る。"""
+    monkeypatch.setattr(registry, "FW_PLUGINS", (plugin,))
+    src = tmp_path / "app"
+    src.mkdir(exist_ok=True)
+    texts = {"Svc.java": "package app;\npublic interface Svc {}\n",
+             "Ctl.java": "package app;\npublic class Ctl {\n  Svc svc;\n}\n"}
+    texts.update({f"{n}.java": f"package app;\npublic class {n} implements Svc {{}}\n" for n in impls})
+    files = []
+    for fn, text in texts.items():
+        (src / fn).write_text(text, encoding="utf-8")
+        files.append((src / fn, f"app/{fn}"))
+    return world_graph.build_world(tmp_path, "w", files=files)
+
+
+def test_spring_java_plugin_off_loses_only_the_framework_part_and_keeps_the_base(tmp_path, monkeypatch):
+    # 実プラグイン（`spring:java`）で契約テスト①: 無効にすると注入・URL キー・設定キーだけが消え、本体の型の参照は残る
+    from sherpa.ingest.analyzers.spring_java import SpringJavaPlugin
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "Svc.java").write_text("package app;\npublic interface Svc {}\n", encoding="utf-8")
+    (src / "Base.java").write_text("package app;\npublic class Base {}\n", encoding="utf-8")
+    (src / "Ctl.java").write_text(
+        'package app;\n@RequestMapping("/o")\npublic class Ctl extends Base {\n  @Autowired\n  Svc svc;\n'
+        '  @Value("${k.v}")\n  String v;\n  @GetMapping("/x")\n  void m() {}\n}\n', encoding="utf-8")
+    (src / "a.properties").write_text("k.v=1\n", encoding="utf-8")
+    files = [(src / n, f"app/{n}") for n in ("Svc.java", "Base.java", "Ctl.java", "a.properties")]
+
+    def build(plugins):
+        monkeypatch.setattr(registry, "FW_PLUGINS", tuple(plugins))
+        nodes, edges, flags = world_graph.build_world(tmp_path, "w", files=files)
+        return ({(n["label"], n["name"]) for n in nodes},
+                {(e["src"].rsplit("#", 1)[-1], e["type"], e["dst"].rsplit("#", 1)[-1], e.get("via")) for e in edges}, flags)
+
+    n0, e0, f0 = build([])
+    n1, e1, f1 = build([SpringJavaPlugin()])
+    assert ("Ctl", "INVOKES", "Base", "extends") in e0 and ("Ctl", "INVOKES", "Svc", "field_type") in e0
+    assert not any(k[3] in ("inject", "config_key") for k in e0) and ("Config", "/o/x") not in n0
+    assert ("Ctl", "INVOKES", "Svc", "inject") in e1 and ("Ctl", "INVOKES", "Base", "extends") in e1
+    assert ("Config", "/o/x") in n1 and any(k[3] == "config_key" for k in e1)
+    assert n0 <= n1 and not [f for f in f1 if f["reason"] == "plugin_failed"]
+
+
+def _di_plugin(seen):
+    """注入側（`Ctl.java`）の `Svc` の実装を型の関係から引く。1 つに決まれば辺の候補・決まらなければ申告（任意に選ばない）。"""
+    class _Di(FwPlugin):
+        name, languages, version, order, uses_type_relations = "p:di", frozenset({"java"}), 1, 10, True
+
+        def extract_refs(self, text, rel_path, base_defs, base_refs, types):
+            if not rel_path.endswith("Ctl.java"):
+                return PluginRefs()
+            lookup = types.subtypes("Svc", rel_path, base_refs.file_context)
+            seen.append(lookup)
+            if len(lookup.subtypes) == 1:
+                return PluginRefs(refs=[RefCandidate("INVOKES", "Module", lookup.subtypes[0].qualified, 3,
+                                                     {"via": "inject", "qualified": True})])
+            return PluginRefs(ambiguous=[PluginAmbiguity("Module", "Svc", 3, list(lookup.subtypes), via="inject")])
+    return _Di()
+
+
+def test_type_relations_return_every_candidate_and_one_implementer_links_by_qualified_name(tmp_path, monkeypatch):
+    seen: list = []
+    nodes, edges, flags = _java_world(tmp_path, monkeypatch, ["ImplA"], _di_plugin(seen))
+    assert [(c.path, c.qualified, c.exact) for c in seen[0].subtypes] == [("app/ImplA.java", "app.ImplA", True)]
+    assert seen[0].status == "resolved" and [t.qualified for t in seen[0].targets] == ["app.Svc"]
+    assert any(e["type"] == "INVOKES" and e.get("via") == "inject" and e["src"].endswith("Ctl.java#Ctl")
+               and e["dst"].endswith("ImplA.java#ImplA") for e in edges)
+    assert not any(f["reason"] == "plugin_failed" for f in flags)
+
+
+def test_ambiguous_implementers_are_reported_with_candidates_and_no_edge_is_chosen(tmp_path, monkeypatch):
+    seen: list = []
+    nodes, edges, flags = _java_world(tmp_path, monkeypatch, ["ImplA", "ImplB"], _di_plugin(seen))
+    assert [c.qualified for c in seen[0].subtypes] == ["app.ImplA", "app.ImplB"]      # 複数のまま返る
+    assert not any(e.get("via") == "inject" for e in edges)                              # 任意に選ばない
+    amb = [f for f in flags if f["reason"] == "ambiguous" and f.get("via") == "inject"]
+    assert [(f["from"], f["name"], f["candidates"]) for f in amb] == [("app/Ctl.java", "Svc", 2)]
+    ctl = next(n for n in nodes if n["path"] == "app/Ctl.java" and n["label"] == "Module")
+    item = next(u for u in ctl["unresolved"] if u["via"] == "inject")                    # S1b の未解決の申告（保存済みの形）
+    assert (item["reason"], item["candidates"], item["candidate_paths"]) == (
+        "ambiguous", 2, ["app/ImplA.java", "app/ImplB.java"])
+
+
+def test_type_relations_are_unavailable_unless_the_plugin_declares_them(tmp_path, monkeypatch):
+    class _NoDecl(FwPlugin):
+        name, languages, version, order = "p:nodecl", frozenset({"java"}), 1, 1
+
+        def extract_refs(self, text, rel_path, base_defs, base_refs, types):
+            types.subtypes("Svc", rel_path)
+            return PluginRefs()
+    _n, _e, flags = _java_world(tmp_path, monkeypatch, ["ImplA"], _NoDecl())
+    failed = [f for f in flags if f["reason"] == "plugin_failed"]
+    assert [f["plugin"] for f in failed] == ["p:nodecl"] and "uses_type_relations" in failed[0]["why"]
+
+
+_PLUGIN_SRC = (
+    "from sherpa.ingest.analyzers._base import FwPlugin\n\n"
+    "class _P(FwPlugin):\n{body}\n\nFW_PLUGINS = [_P()]\n"
+)
+
+
+def _plugin_src(name="'myfw:spring'", languages="frozenset({'java'})", version="1", order="10",
+                config_kinds="frozenset()") -> str:
+    body = "".join(f"    {k} = {v}\n" for k, v in (("name", name), ("languages", languages), ("version", version),
+                                                  ("order", order), ("config_kinds", config_kinds)) if v is not _OMIT)
+    return _PLUGIN_SRC.format(body=body.rstrip("\n"))
+
+
+def test_discover_fw_plugins_registers_in_apply_order(tmp_path):
+    _write(tmp_path, {"zz_a.py": _plugin_src(name="'zz:a'", order="5"),
+                      "aa_b.py": _plugin_src(name="'aa:b'", order="5"),
+                      "mm_c.py": _plugin_src(name="'mm:c'", order="1", config_kinds="frozenset({'x'})"),
+                      "mm_none.py": "VALUE = 1\n"})
+    assert [p.name for p in registry.discover_fw_plugins(tmp_path)] == ["mm:c", "aa:b", "zz:a"]
+
+
+@pytest.mark.parametrize("files,needle", [
+    ({"myfw_x.py": _plugin_src(languages="frozenset({'nosuchlang'})")}, "未登録のアナライザ名"),
+    ({"myfw_x.py": _plugin_src(name="'java:spring'")}, "予約名"),
+    ({"other_x.py": _plugin_src()}, "ファイル名と一致"),
+    ({"myfw_x.py": _plugin_src(name="'myfw_nocolon'")}, "<prefix>:<fw>"),
+    ({"myfw_x.py": _plugin_src(version="0")}, "version"),
+    ({"myfw_x.py": _plugin_src(version=_OMIT)}, "拡張自身のクラス"),
+    ({"myfw_x.py": _plugin_src(order="'1'")}, "order"),
+    ({"myfw_x.py": _plugin_src(languages="frozenset()")}, "languages"),
+    ({"myfw_a.py": _plugin_src(), "myfw_b.py": _plugin_src()}, "重複"),
+    ({"myfw_x.py": "FW_PLUGINS = [object()]\n"}, "FwPlugin のインスタンス"),
+    ({"myfw_x.py": "FW_PLUGINS = [\n"}, "モジュールを読み込めません"),   # import・構文の失敗は黙って読み飛ばさず FwPluginError
+])
+def test_discover_fw_plugins_contract_violations_fail_loudly(tmp_path, files, needle):
+    _write(tmp_path, files)
+    with pytest.raises(registry.FwPluginError) as ei:
+        registry.discover_fw_plugins(tmp_path)
+    assert needle in str(ei.value)
+
+
+def test_verify_extension_has_fw_plugin_surface_and_fails_on_collisions(monkeypatch, capsys):
+    assert verify_extension.main([]) == 0
+    assert "## FW プラグイン" in capsys.readouterr().out
+    monkeypatch.setattr(registry, "FW_PLUGINS", (_plugin("p:dup", languages=("java",)), _plugin("p:dup", languages=("nosuch",))))
+    assert verify_extension.main([]) != 0
+    out = capsys.readouterr().out
+    assert "重複" in out and "未登録のアナライザ名" in out
+
+
+def test_verify_extension_reports_ng_for_a_broken_plugin_module_and_for_bad_registered_attributes(tmp_path, monkeypatch, capsys):
+    repo_root = Path(__file__).resolve().parents[2]
+    work = tmp_path / "repo"
+    shutil.copytree(repo_root / "sherpa", work / "sherpa", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(repo_root / "scripts", work / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    (work / "sherpa" / "ingest" / "analyzers" / "myfw_broken.py").write_text("FW_PLUGINS = [\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(work / "scripts" / "verify_extension.py")], cwd=work,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "NG:" in r.stdout and "Traceback" not in r.stdout
+    bad = _plugin("p:bad")
+    bad.order = "1"
+    monkeypatch.setattr(registry, "FW_PLUGINS", (bad,))
+    assert verify_extension.main([]) != 0
+    assert "order" in capsys.readouterr().out
+
+
+def test_type_relations_resolve_a_qualified_name_without_file_context_by_the_qualified_index(tmp_path, monkeypatch):
+    seen: list = []
+    _java_world(tmp_path, monkeypatch, ["ImplA"], _di_plugin(seen))
+    from sherpa.ingest.analyzers._base import TypeRelations  # noqa: F401
+    qd = {("Module", "app.Svc"): [("app/Svc.java", "Svc")], ("Module", "other.Svc"): [("app/O.java", "Svc")]}
+    defs = {("Module", "Svc"): ["app/Svc.java", "app/O.java"]}
+    cands, status = world_graph._type_candidates(qd, defs, "Module", "app.Svc", "app/Ctl.java", None, False)
+    assert (cands, status) == ([("app/Svc.java", "Svc", "app.Svc")], "")
+    assert world_graph._type_candidates(qd, defs, "Module", "no.Svc", "app/Ctl.java", None, False)[1] == "unresolved"
+
+
+def test_invalid_item_after_valid_one_discards_the_whole_plugin_output_and_keeps_base(tmp_path, monkeypatch):
+    class _Bad(FwPlugin):
+        name, languages, version, order = "p:badfields", frozenset({"tfw:lang"}), 1, 1
+
+        def collect_defs(self, text, rel_path, base):
+            return PluginDefs(children=[DefItem("DataItem", "GOOD", line=5), DefItem(label=[], name="BAD")])
+
+        def extract_refs(self, text, rel_path, base_defs, base_refs, types):
+            return PluginRefs(refs=[RefCandidate("INVOKES", "Module", "other.tfw", 4, {"via": "call"}),
+                                    RefCandidate("INVOKES", "Module", "x", 6, source_symbol_id=[])])
+    n0, e0, _f = _build(tmp_path, monkeypatch, [])
+    n1, e1, flags = _build(tmp_path, monkeypatch, [_Bad()])
+    assert (n1, e1) == (n0, e0)                                    # 本体の結果は同じ・プラグインの出力は 0 件
+    assert [f["plugin"] for f in flags if f["reason"] == "plugin_failed"] == ["p:badfields"]
+
+
+def test_type_relations_resolve_a_dotted_name_with_file_context_by_the_qualified_entry():
+    from sherpa.ingest.analyzers._base import FileContext
+    qd = {("Module", "lib.Base"): [("app/B.java", "Base")], ("Module", "app.lib.Base"): [("app/X.java", "Base")]}
+    ctx = FileContext(package="app")
+    rel = "app/Ctl.java"
+    # 修飾名は単純名の規則（同じ package の lib.Base→app.lib.Base）ではなく、完全修飾名の完全一致で引く
+    cands, status = world_graph._type_candidates(qd, {}, "Module", "lib.Base", rel, ctx, False, qualified=True)
+    assert (cands, status) == ([("app/B.java", "Base", "lib.Base")], "")
+
+
+def test_type_relations_stage_blocks_when_a_file_cannot_be_read_again(tmp_path, monkeypatch):
+    import collections
+    from sherpa.ingest import world_graph as wg
+    real, calls = wg.corpus_docs.read_full_text_and_raw, collections.Counter()
+
+    def flaky(path):
+        calls[str(path)] += 1
+        if calls[str(path)] == 2 and str(path).endswith("ImplA.java"):   # 2 回目＝型の関係を集める段
+            raise OSError("gone")
+        return real(path)
+    monkeypatch.setattr(wg.corpus_docs, "read_full_text_and_raw", flaky)
+    _n, _e, flags = _java_world(tmp_path, monkeypatch, ["ImplA"], _di_plugin([]))
+    assert {"doc": "app/ImplA.java", "reason": "unreadable_code_file", "action": "blocked"} in flags
+
+
+def test_plugin_and_type_relations_see_global_using_imports(tmp_path, monkeypatch):
+    seen: list = []
+
+    class _P(FwPlugin):
+        name, languages, version, order, uses_type_relations = "p:cs", frozenset({"csharp"}), 1, 1, True
+
+        def extract_refs(self, text, rel_path, base_defs, base_refs, types):
+            if rel_path.endswith("Ctl.cs"):
+                seen.append((sorted(i.name for i in base_refs.file_context.imports),
+                             types.subtypes("Base", rel_path, base_refs.file_context, 3)))
+            return PluginRefs()
+    monkeypatch.setattr(registry, "FW_PLUGINS", (_P(),))
+    texts = {"Globals.cs": "global using Lib;\n",
+             "Base.cs": "namespace Lib { public class Base { } }\n",
+             "Impl.cs": "namespace App { public class Impl : Base { } }\n",
+             "Ctl.cs": "namespace App {\n public class Ctl {\n }\n}\n"}
+    files = []
+    for fn, text in texts.items():
+        (tmp_path / fn).write_text(text, encoding="utf-8")
+        files.append((tmp_path / fn, fn))
+    _n, _e, flags = world_graph.build_world(tmp_path, "w", files=files)
+    assert not any(f["reason"] == "plugin_failed" for f in flags)
+    imports, lookup = seen[0]
+    assert "Lib" in imports and [c.path for c in lookup.subtypes] == ["Impl.cs"]
+
+
+def test_type_relations_keep_each_qualified_name_for_same_named_types_in_one_file(tmp_path, monkeypatch):
+    seen: list = []
+
+    class _P(FwPlugin):
+        name, languages, version, order, uses_type_relations = "p:cs2", frozenset({"csharp"}), 1, 1, True
+
+        def extract_refs(self, text, rel_path, base_defs, base_refs, types):
+            if rel_path == "Ctl.cs":
+                seen.append(types.subtypes("Lib.Base", rel_path, base_refs.file_context))
+            return PluginRefs()
+    monkeypatch.setattr(registry, "FW_PLUGINS", (_P(),))
+    texts = {"Base.cs": "namespace Lib { public class Base { } }\n",
+             "Both.cs": "namespace A { public class Impl : Lib.Base { } }\nnamespace B { public class Impl : Lib.Base { } }\n",
+             "Ctl.cs": "namespace App { public class Ctl { } }\n"}
+    files = []
+    for fn, text in texts.items():
+        (tmp_path / fn).write_text(text, encoding="utf-8")
+        files.append((tmp_path / fn, fn))
+    world_graph.build_world(tmp_path, "w", files=files)
+    assert sorted(c.qualified for c in seen[0].subtypes) == ["A.Impl", "B.Impl"]

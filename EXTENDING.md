@@ -16,6 +16,9 @@ source-available で改変可・上流への還流は任意（義務ではない
 
 - サンプル拡張: `sherpa/ingest/analyzers/sample_ext_dummy.py`（`<prefix>_*.py` 規約に沿った最小のアナライザ実例。
   常駐・既定で有効）。
+- コードを書かずに足す: 単純な抽出（注釈・設定の要素の属性）は TOML のルールファイル `sherpa/ingest/analyzers/rules_<名前>.toml`。
+  ルールファイルの追加・変更・削除は worker の再起動で反映されます（署名は起動時に読む）。
+  書き方・できること・できないこと＝[docs/21-拡張の契約.md](docs/21-拡張の契約.md) §3c、例＝`fixtures/analyzer_rules/rules_acme.toml`。
 - 契約検査: `make verify-extension`（拡張面ごとに「確認した契約」または「未確認」を表示。違反は非ゼロ終了）。
 
 ## レビュアーの選び方

@@ -17,7 +17,7 @@ import contextlib
 import pytest
 
 from sherpa import corpus_docs, es_index, reconcile, store
-from sherpa.ingest import world_neo4j, worker
+from sherpa.ingest import resolve_settings, world_neo4j, worker
 from sherpa.routers import worlds as worlds_router
 
 
@@ -85,13 +85,14 @@ def _stub_pipeline(monkeypatch):
     （他の DB/Neo4j/ES 呼び出しは従来どおりスタブして DB 不要を保つ）。
     """
     monkeypatch.setattr(worker, "world_state", lambda world, progress=None: ("sig", {"a": [1, 2, 3]}))
+    monkeypatch.setattr(resolve_settings, "load", lambda world: resolve_settings.empty())   # 設定の読み込みは DB（get_world）を使う
     monkeypatch.setattr(worker, "build_world_graph", lambda world: ([], [], []))
     monkeypatch.setattr(worker, "_build_derived",
                         lambda world, **_kw: {"converted": 1, "failed": 0, "unsupported": 0, "by_ext": {}})
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
@@ -117,7 +118,7 @@ def _stub_pipeline(monkeypatch):
     # 新しい関数呼び出しから集める。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         if sig is not None:
             calls["set_world_sig"].append({"world": world, "sig": sig, "doc_count": doc_count,
                                            "scan_report": scan_report})
@@ -217,7 +218,7 @@ def test_run_locked_success_records_stage_timings_and_counts(monkeypatch, _stub_
 
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         captured["extraction_snapshot"] = extraction_snapshot
         return {"id": run_id, "status": status}
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
@@ -308,7 +309,7 @@ def test_run_locked_sig_confirm_write_failure_propagates(monkeypatch, _stub_pipe
     （`finish_ingest_run_and_confirm_world`）——その書込自体が失敗すれば（PG断等）例外がそのまま
     伝播する（MED-1 と同じ契約：次回 sync が再試行する）。"""
     def _boom(run_id, world, *, status, extraction_snapshot=None, published_snapshot=None,
-             source_doc_ids=None, sig=None, manifest=None, doc_count=None, scan_report=None):
+             source_doc_ids=None, sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         raise RuntimeError("db down")
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _boom)
     with pytest.raises(RuntimeError, match="db down"):

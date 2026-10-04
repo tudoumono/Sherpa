@@ -455,7 +455,7 @@ def test_register_cleanup_compensates_neo4j_documents_es_when_replace_documents_
 
     neo4j_load_calls = []
     monkeypatch.setattr(world_neo4j, "load_world",
-                        lambda nodes, edges, w, uri, user, pw: neo4j_load_calls.append(w) or (0, 0))
+                        lambda nodes, edges, w, uri, user, pw, plugin_failures=None: neo4j_load_calls.append(w) or (0, 0))
     neo4j_delete_calls = []
     monkeypatch.setattr(world_neo4j, "delete_world",
                         lambda w, uri, user, pw: neo4j_delete_calls.append(w))

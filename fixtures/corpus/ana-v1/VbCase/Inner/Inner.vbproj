@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Acme</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Shop\Basket.vb" />
+  </ItemGroup>
+</Project>

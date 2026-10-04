@@ -37,10 +37,12 @@ async function loadList() {
     const w = ws[0] || null;
     $('regcard').hidden = !!w;                          // 登録済みなら登録フォームは出さない
     $('currentcard').hidden = !w;
+    $('resolvecard').hidden = !w;
     if (!w) {
       $('list').innerHTML = '';
       return;
     }
+    loadResolveSettings(w.world_id);
     $('list').innerHTML = `<div class="row" data-wid="${esc(w.world_id)}" data-path="${esc(w.root_path)}">`
       + `<div class="rowmain"><span class="nm">${esc(w.label || w.world_id)}</span>`
       + `<span class="pth" title="${esc(w.root_path)}">${esc(w.root_path)}</span>`
@@ -56,6 +58,48 @@ async function loadList() {
     $('list').setAttribute('aria-busy', 'false');
   }
 }
+
+// ---- 資料の探し方の設定（COPY の取り込み元の場所・パスの別名）----
+let _resolveWid = null;
+function resolveMsg(html) { $('rs-msg').innerHTML = html; }
+async function loadResolveSettings(wid) {
+  _resolveWid = wid;
+  try {
+    const d = await api('GET', `/worlds/${encodeURIComponent(wid)}/resolve-settings`);
+    $('rs-copy').value = (d.copy_paths || []).join('\n');
+    $('rs-alias').value = Object.entries(d.path_aliases || {}).map(([k, v]) => `${k} = ${v}`).join('\n');
+    resolveMsg(resolveWarnings(d));
+  } catch (e) {
+    resolveMsg(`<span class="danger">設定を取得できません: ${esc(e.message)}</span>`);
+  }
+}
+function resolveWarnings(d) {
+  return (d.warnings || []).map((w) => `<div class="danger">※ ${esc(w)}</div>`).join('');
+}
+async function saveResolveSettings() {
+  if (!_resolveWid) return;
+  const copy_paths = $('rs-copy').value.split('\n').map((l) => l.trim()).filter(Boolean);
+  const path_aliases = {};
+  for (const line of $('rs-alias').value.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const i = line.indexOf('=');
+    if (i < 0) { resolveMsg(`<span class="danger">別名は「別名 = 場所」の形で書いてください: ${esc(line)}</span>`); return; }
+    path_aliases[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  if (!confirm('保存すると資料フォルダ全体を取り込み直します（時間がかかります）。保存しますか？')) return;
+  $('rs-save').disabled = true;
+  try {
+    const d = await api('PUT', `/worlds/${encodeURIComponent(_resolveWid)}/resolve-settings`, { copy_paths, path_aliases });
+    $('rs-copy').value = d.copy_paths.join('\n');
+    $('rs-alias').value = Object.entries(d.path_aliases).map(([k, v]) => `${k} = ${v}`).join('\n');
+    resolveMsg(`${d.changed && !d.refresh_started ? '⏳' : '✓'} ${esc(d.note)}${resolveWarnings(d)}`);
+    if (d.refresh_started) loadStat(_resolveWid);
+  } catch (e) {
+    resolveMsg(`<span class="danger">保存できません: ${esc(e.message)}</span>`);
+  } finally {
+    $('rs-save').disabled = false;
+  }
+}
+$('rs-save').addEventListener('click', saveResolveSettings);
 
 // ---- 追加 ----
 let _chosen = null;            // 追加フォーム用に選んだフォルダ path
@@ -305,6 +349,9 @@ function summaryNote(s, wid) {
   }
   const warns = s.last_run_warnings || [];
   const dangers = [];
+  if (s.resolve_settings_pending) {
+    dangers.push('資料の探し方の設定がまだ反映されていません（更新が必要です。「更新」を押すと資料を取り込み直します）');
+  }
   if (s.last_run_status === 'failed') {
     // `failed` は派生物の公開後（グラフ反映・台帳更新等）の失敗も含みうるため、「検索は前回成功時点のまま」とは断定しない。
     dangers.push('前回の取り込みは失敗しました（次回の取り込みで自動的に再試行されます）');
@@ -317,6 +364,10 @@ function summaryNote(s, wid) {
   }
   if (warns.some(w => typeof w === 'string' && w.startsWith('office_md:'))) {
     dangers.push('前回の取り込みでOffice文書のテキスト化処理自体に問題がありました（次回の取り込みで再試行されます）');
+  }
+  if (warns.some(w => w === 'plugin_failed')) {
+    dangers.push('前回の取り込みで、フレームワーク固有の解析に失敗した部分があります。関係グラフの結果が一部欠けているため、'
+      + '関連が無いとは言えません（原因を直して取り込み直すまで残ります）');
   }
   // `office_md_blocked:{doc}\t{reason}`（区切りはタブ・doc/reasonとも`:`を含みうるため`:`では分割しない）。
   const blockedDocs = warns
@@ -541,6 +592,7 @@ const REASON_JA = {
   read_failed: 'ファイルを読み取れませんでした',
   unreadable_code_file: 'コードを読み取れなかったため取り込みを止めました',
   encoding_undetermined: '文字コードを判別できないため読み取れません（UTF-8/CP932どちらも文字化けします）',
+  plugin_failed: 'フレームワーク固有の解析に失敗しました（関係グラフの結果が一部欠けています）',
 };
 // Office 変換失敗の内側の理由（`office_md_blocked:{doc}\t{innerReason}` の innerReason 部）→ 平文。例外クラス名（`:` 以降）はそのまま出さない。
 const OFFICE_INNER_REASON_JA = { manifest_write_failed: '記録の書き込みに失敗しました' };

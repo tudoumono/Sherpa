@@ -146,6 +146,7 @@ def test_run_world_impact_sort_key_prioritizes_importance(monkeypatch):
 
     monkeypatch.setattr(wn, "resolve_world_entity", lambda *a, **k: [])
     monkeypatch.setattr(wn, "read_unresolved", lambda *a, **k: {"available": False, "items": [], "omitted": 0})
+    monkeypatch.setattr(wn, "read_plugin_failures", lambda *a, **k: [])
     monkeypatch.setattr(wn, "world_impact", _stub_world_impact)
     monkeypatch.setattr(wn.worlds, "world_dir", lambda w: "/tmp/x")
     monkeypatch.setattr(wn.importance, "resolve_for_world", lambda w, root=None: {"b.md": _res("高")})
@@ -167,6 +168,7 @@ def test_run_world_impact_sort_key_matches_legacy_order_without_control_file(mon
 
     monkeypatch.setattr(wn, "resolve_world_entity", lambda *a, **k: [])
     monkeypatch.setattr(wn, "read_unresolved", lambda *a, **k: {"available": False, "items": [], "omitted": 0})
+    monkeypatch.setattr(wn, "read_plugin_failures", lambda *a, **k: [])
     monkeypatch.setattr(wn, "world_impact", _stub_world_impact)
     monkeypatch.setattr(wn.worlds, "world_dir", lambda w: None)   # 未登録＝無 world
 

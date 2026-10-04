@@ -16,10 +16,10 @@ from . import citations, graph_coverage, scope
 from .env_int import env_int
 from .graph_coverage import Coverage
 from .grep_tool import grep_search
-from .impact_service import CATEGORY
+from .impact_service import CATEGORY, plugin_failed_note
 from .ingest.world_neo4j import (
     EDGE_SOURCE_FIELDS, EDGE_SOURCES_RETURN_DEFAULT, EDGE_SOURCES_RETURN_MAX, GraphQueryOverloadError, GraphSchemaEraError, _scope_pred,
-    check_schema_era, edge_view, limit_edge_sources, read_unresolved)
+    check_schema_era, edge_view, limit_edge_sources, read_plugin_failures, read_unresolved)
 
 _log = logging.getLogger("sherpa")
 
@@ -150,8 +150,14 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
     主クエリの後に `check_schema_era` を呼ぶ（旧世代の実データは `GraphSchemaEraError`）。`anchors` が空でも呼ぶ。
     時間切れ・行数の天井は `coverage`（省略可）へ申告する。深さの上限の先は判定しない（固定深さの近傍探索）。
     """
+    def _plugin_failures():
+        if coverage is not None:
+            graph_coverage.attach_plugin_failures(
+                coverage, lambda: read_plugin_failures(session, world), graph_coverage.STAGE_NEIGHBORS)
+
     if not anchors:
         check_schema_era(session, world, lens="troubleshoot")
+        _plugin_failures()
         return []
     cy = (
         "MATCH (a:Entity) WHERE a.canonical_id IN $anchors "
@@ -174,6 +180,7 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
                        prefixes=list(scope_prefixes or []), incl=include_deprecated,
                        coverage=coverage, stage=graph_coverage.STAGE_NEIGHBORS)
     check_schema_era(session, world, lens="troubleshoot")
+    _plugin_failures()
     for r in rows:
         out.append({
             "cid": r["cid"], "name": r["name"], "label": r["label"],
@@ -267,9 +274,11 @@ _GRAPH_LIMIT_NOTES = {
 
 
 def graph_limit_notes(coverage: Coverage) -> list[str]:
-    """`coverage` の `timeout`／`row_cap` → 利用者向け平文の注記（段階ごとに 1 件）。文書探索の打ち切りは `_truncated_search_note` が別に出す。"""
-    return [_GRAPH_LIMIT_NOTES[(lim["kind"], lim.get("stage"))] for lim in coverage.limits
-            if (lim["kind"], lim.get("stage")) in _GRAPH_LIMIT_NOTES]
+    """`coverage` の `timeout`／`row_cap`／`plugin_failed` → 利用者向け平文の注記（段階ごとに 1 件・`plugin_failed` は全プラグインで 1 件）。文書探索の打ち切りは `_truncated_search_note` が別に出す。"""
+    notes = [_GRAPH_LIMIT_NOTES[(lim["kind"], lim.get("stage"))] for lim in coverage.limits
+             if (lim["kind"], lim.get("stage")) in _GRAPH_LIMIT_NOTES]
+    plugin_note = plugin_failed_note({"limits": coverage.limits})
+    return notes + [plugin_note] if plugin_note else notes
 
 
 def run_troubleshoot(session, symptom, world, depth=TROUBLESHOOT_GRAPH_DEPTH, include_deprecated=False, scope_paths=None):

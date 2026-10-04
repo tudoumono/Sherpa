@@ -88,6 +88,12 @@ CASES = {
     "absolute_include_unaffected_by_base_href": (
         '<base href="/app/">\n<jsp:include page="/WEB-INF/shared/header.jspf" />\n', "gen1/WEB-INF/jsp/page.jsp",
         [("INVOKES", "Module", "header.jspf", None)], None),
+    # 埋め込みの中の文字列は読まない・属性値の中の式は空白に置き換える
+    "tag_text_inside_scriptlet_string_not_scanned": ('<% String s = "<a href=\'/in-java\'>"; %>\n<a href="/real">x</a>\n', "x.jsp",
+                                                    [Key("/real", "url")], None),
+    "jsp_comment_may_contain_close_marker": ('<%-- a %> <a href="/in-comment"> --%>\n<a href="/real">x</a>\n', "x.jsp",
+                                             [Key("/real", "url")], None),
+    "expression_in_href_is_blanked": ('<a href="<%= ctx %>/x.action">x</a>\n', "x.jsp", [Key("x", "action")], None),
     # スクリプトレット
     "directive_and_expression_not_scriptlets": ('<%@ page import="a.b.C" %>\n<%= 1 + 1 %>\n', "x.jsp", [], []),
     "multiple_script_bodies_interleaved_with_real_tags": (
@@ -121,3 +127,15 @@ def test_unclosed_html_comment_sanitization_is_linear_time():
     start = time.perf_counter()
     A.extract_refs("<!--" * 20000, "x.jsp")
     assert time.perf_counter() - start < 1.0
+
+
+def test_broken_scriptlet_java_and_broken_template_are_reported_and_the_rest_is_read():
+    res = A.extract_refs('<% int x = ; %>\n<a href="/ok">z</a>\n<% if (a) { %>\n<a href="/in-if">y</a>\n<%\n', "x.jsp")
+    errors = [d.line for d in res.dropped if d.reason == "syntax_error"]
+    assert 1 in errors and len(errors) >= 2
+    assert [r.name for r in res.refs] == ["/ok", "/in-if"]
+
+
+def test_valid_scriptlets_split_across_html_are_not_syntax_errors():
+    text = '<% if (a) { %>\n<p>x</p>\n<% } else { %>\n<p>y</p>\n<% } %>\n<%! int n; %>\n<%= n %>\n'
+    assert [d for d in A.extract_refs(text, "x.jsp").dropped if d.reason == "syntax_error"] == []

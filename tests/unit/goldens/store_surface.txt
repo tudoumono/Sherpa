@@ -151,6 +151,7 @@ set_contains_personal_workspace
 set_last_login
 set_message_personal
 set_pinned
+set_resolve_settings
 set_scan_report
 set_scan_report_if_unchanged
 set_session_id

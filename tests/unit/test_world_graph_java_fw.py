@@ -113,7 +113,7 @@ def test_mapper_include_refid_is_recorded_as_dropped_not_silently_lost():
     （旧 `Dropped("mapper_sql", ...)`＝文数だけの申告は S4' の `Table` 抽出に置き換わり撤去済み）。"""
     _nodes, _edges, flags = _build()
     mapper_include = [f for f in flags if f.get("reason") == "dropped_syntax"
-                       and f.get("why") == "mapper_include" and f.get("from") == "mybatis/OrderMapper.xml"]
+                       and f.get("why") == "xml:mybatis: mapper_include" and f.get("from") == "mybatis/OrderMapper.xml"]
     assert len(mapper_include) == 1
     assert mapper_include[0]["snippet"] == "cols"
 

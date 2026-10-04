@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -375,6 +376,7 @@ def test_usage_backfill_wrapper_reads_env_file(tmp_path):
            if k not in ("SHERPA_PG_DSN", "DATABASE_URL", "PGHOST", "PGPORT", "PGUSER",
                         "PGPASSWORD", "POSTGRES_PASSWORD", "SHERPA_ENV_FILE")}
     env["SHERPA_ENV_FILE"] = str(fake_env)
+    env["PYTHON_BIN"] = sys.executable   # 作業場所に .venv が無いと素の python3（依存なし）へ倒れるので、テストと同じ実行系を使う
     proc = subprocess.run(
         [str(repo_root / "scripts" / "usage-backfill.sh")],
         cwd=repo_root, env=env, capture_output=True, text=True, timeout=30,

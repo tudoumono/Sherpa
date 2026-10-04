@@ -111,6 +111,22 @@
       <div class="note" id="listmsg"></div>
       <div class="diffout" id="rowdiff"></div>
     </div>
+
+    <!-- 資料の探し方の設定（登録済みのときだけ表示） -->
+    <div class="card" id="resolvecard" style="margin-top:16px" hidden>
+      <div class="card-head">資料の探し方の設定</div>
+      <div class="muted" style="font-size:var(--text-small);margin-bottom:8px">
+        COPY で取り込む部品が、いちばん近い場所で 1 つに決まらないとき、ここに書いた場所を上から順に探します。
+        場所は資料フォルダの中の場所（例: SystemA/COPYLIB）で、資料フォルダの中の一番上のフォルダの下だけ指定できます（別の一番上のフォルダをまたぐ指定はできません）。</div>
+      <label for="rs-copy" style="display:block;font-weight:600">COPY で取り込む部品の置き場所（1 行に 1 つ・上が優先）</label>
+      <textarea id="rs-copy" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: SystemA/COPYLIB"></textarea>
+      <label for="rs-alias" style="display:block;font-weight:600;margin-top:10px">場所の別名（1 行に 1 つ・「別名 = 場所」の形）</label>
+      <textarea id="rs-alias" rows="3" style="width:100%;box-sizing:border-box" placeholder="例: inc = SystemA/include"></textarea>
+      <div style="margin-top:8px"><button class="btn-primary mini" id="rs-save">設定を保存</button></div>
+      <div class="note" id="rs-msg" role="status"></div>
+      <div class="muted" style="font-size:var(--text-small);margin-top:8px">
+        ※ 保存すると資料フォルダを取り込み直します（時間がかかります）。</div>
+    </div>
   </div>
 
   <!-- ===== 下: 取り込み状況（文書一覧・全文検索） ===== -->

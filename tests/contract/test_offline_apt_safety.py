@@ -327,3 +327,60 @@ def test_verify_kit_gate_static_contracts():
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     assert "verify_offline_kit_apt.sh" in re.search(r"^verify-kit:.*\n(?:\t.*\n?)+", makefile, re.M).group(0)
     assert "verify-kit" in makefile.split(".PHONY:", 1)[1].split("\n\n", 1)[0]
+
+
+def test_offline_install_records_requirements_hash_with_start_sh_formula(tmp_path: Path):
+    """閉域の導入成功後に start.sh と同じ式のハッシュを書く（無いと start.sh が PyPI へ出て止まる）。"""
+    import hashlib
+    start = (ROOT / "scripts" / "start.sh").read_text(encoding="utf-8")
+    inst = INSTALL.read_text(encoding="utf-8")
+    assert "lib/req_hash.sh" in start and "lib/req_hash.sh" in inst
+    ok_pos = inst.index('ok "Python 依存を --no-index でインストールしました')
+    assert ok_pos < inst.index(".requirements.sha256") and 'req_hash "$VENV/bin/python"' in inst[ok_pos:ok_pos + 600]
+    (tmp_path / "requirements.txt").write_bytes(b"a\n")
+    (tmp_path / "constraints.txt").write_bytes(b"b\n")
+    out = subprocess.run(["bash", "-c", f'. "{ROOT}/scripts/lib/req_hash.sh"; req_hash python3'],
+                         cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
+    assert out == hashlib.sha256(b"a\nb\n").hexdigest()
+
+
+def test_kit_checks_tree_sitter_wheels_and_rejects_sdist(tmp_path: Path):
+    """Tree-sitter 8 パッケージはホイールだけ（対象タグで全部揃い・sdist なし）。"""
+    src = MAKE.read_text(encoding="utf-8")
+    assert src.count('pip download --disable-pip-version-check --only-binary') + src.count('-m pip download --only-binary') == 2 and "--only-binary :all:" not in src
+    pk = re.search(r'^TS_PACKAGES="(.*)"', src, re.M).group(1).split()
+    assert len(pk) == 8
+    body = _fn(src, "_check_ts_wheels")
+    harness = ('fail(){ echo "$@" >&2; }; ok(){ :; }\n' + f'TS_PACKAGES="{" ".join(pk)}"\n' + body +
+               '\n_check_ts_wheels "$1" "$2"')
+    cons = tmp_path / "constraints.txt"
+    cons.write_text("".join(f"{p}==1.0.0\n" for p in pk))
+    d = tmp_path / "w"
+    d.mkdir()
+    (d / "COLLECTED-WITH-PYTHON-VERSION.txt").write_text("Python 3.12.3\n")
+    for p in pk:
+        n = p.replace("-", "_")
+        tagpart = "cp312-cp312" if p == "tree-sitter" else "cp310-abi3"
+        (d / f"{n}-1.0.0-{tagpart}-manylinux_2_28_x86_64.whl").write_text("")
+
+    def run():
+        return subprocess.run(["bash", "-c", harness, "x", str(d), str(cons)], capture_output=True, text=True).returncode
+    assert run() == 0
+    (d / "tree-sitter-css-1.0.0.tar.gz").write_text("")
+    assert run() != 0
+    (d / "tree-sitter-css-1.0.0.tar.gz").unlink()
+    (d / "tree_sitter_c-1.0.0-cp310-abi3-manylinux_2_28_x86_64.whl").unlink()
+    assert run() != 0
+    (d / "tree_sitter_c-1.0.0-cp310-abi3-manylinux_2_28_x86_64.whl").write_text("")
+    assert run() == 0
+    (d / "tree_sitter_c-1.0.0-cp310-abi3-manylinux_2_28_x86_64.whl").rename(
+        d / "tree_sitter_c-0.9.0-cp310-abi3-manylinux_2_28_x86_64.whl")
+    assert run() != 0   # 固定版と違うホイール
+
+
+def test_offline_install_stops_when_wheels_are_missing():
+    """wheels が無いまま成功させない（ハッシュも書かれず次の start.sh が PyPI へ出るため）。"""
+    inst = INSTALL.read_text(encoding="utf-8")
+    tail = inst[inst.index('ok "Python 依存を --no-index でインストールしました'):]
+    branch = tail[tail.index("\nelse\n"):tail.index("\nfi\n")]
+    assert "wheel 一式が見つかりません" in branch and "exit 1" in branch and "warn" not in branch

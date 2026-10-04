@@ -122,8 +122,11 @@ def run(name: str, args: dict, world: str, scope_paths, layer=None) -> dict:
         driver = _open_driver()
         with driver.session() as s:
             if name == "graph_resolve":
-                return _resolve(s, world, sp, code_only, **parsed)
-            return _impact(s, world, sp, code_only, layer in (None, "both"), **parsed)
+                result = _resolve(s, world, sp, code_only, **parsed)
+            else:
+                result = _impact(s, world, sp, code_only, layer in (None, "both"), **parsed)
+            _attach_plugin_failures(s, world, result, _FIELD_STAGE[field])
+            return result
     except GraphSchemaEraError:
         raise
     except Exception as exc:
@@ -138,6 +141,14 @@ def run(name: str, args: dict, world: str, scope_paths, layer=None) -> dict:
                 driver.close()
             except Exception:
                 pass
+
+
+def _attach_plugin_failures(session, world: str, result: dict, stage: str) -> None:
+    """取り込み時に失敗した FW プラグインを `coverage.limits`（`plugin_failed`・プラグイン名つき）へ足す。`coverage` を持たない失敗応答には付けない。"""
+    from .ingest import world_neo4j
+    cov = result.get("coverage")
+    if isinstance(cov, dict):
+        graph_coverage.attach_plugin_failures(cov, lambda: world_neo4j.read_plugin_failures(session, world), stage)
 
 
 # ---- graph_resolve ----

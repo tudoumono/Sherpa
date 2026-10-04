@@ -1,15 +1,42 @@
-"""`XmlConfigAnalyzer` の単体テスト（Spring/MyBatis/Struts/Spring Batch の XML 設定）。
+"""`XmlConfigAnalyzer`（本体）と XML 設定の FW プラグイン（Spring/MyBatis/Struts/Spring Batch）の単体テスト。
 
-入力 XML → (定義・children / 参照 / Dropped の理由) の表で確かめる。
+入力 XML → (定義・children / 参照 / Dropped の理由) の表で確かめる。FW の定義・参照は本体の結果へ適用できるプラグイン
+（`registry.applicable_fw_plugins`）を重ねた結果で見る（Dropped の理由はプラグインの前置 `xml:<fw>: ` を除いて比べる）。
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from sherpa.ingest.analyzers._base import Analyzer
+from sherpa.ingest.analyzers import registry
+from sherpa.ingest.analyzers._base import Analyzer, DefResult, Dropped, RefResult
 from sherpa.ingest.analyzers.xml_config import XmlConfigAnalyzer
 
 A = XmlConfigAnalyzer()
+
+
+def _unprefix(dropped):
+    return [Dropped(re.sub(r"^xml:\w+: ", "", d.reason), d.line, d.snippet) for d in dropped]
+
+
+def _defs(text, path, plugins=None) -> DefResult:
+    """本体の `collect_defs` に適用できる FW プラグイン（`plugins` 省略時は登録済みのうち適用条件に合うもの）を重ねた結果。"""
+    base = A.collect_defs(text, path)
+    plugs = registry.applicable_fw_plugins(A, text, path) if plugins is None else plugins
+    out, failures = registry.apply_fw_defs(plugs, text, path, base)
+    assert failures == []
+    return DefResult(primary=out.primary, children=out.children, extras=out.extras, dropped=_unprefix(out.dropped))
+
+
+def _refs(text, path, plugins=None) -> RefResult:
+    base_defs = A.collect_defs(text, path)
+    base = A.extract_refs(text, path)
+    plugs = registry.applicable_fw_plugins(A, text, path) if plugins is None else plugins
+    out, failures, _amb = registry.apply_fw_refs(plugs, text, path, base_defs, base)
+    assert failures == []
+    return RefResult(refs=out.refs, dropped=_unprefix(out.dropped), file_context=out.file_context)
+
 
 SPRING = "spring/applicationContext.xml"
 MAPPER = "mybatis/OrderMapper.xml"
@@ -39,7 +66,7 @@ def test_accepts_all_xml_files_without_content_inspection():
     ("<struts></struts>", "struts/struts.xml", "struts.xml"),
 ], ids=["spring", "spring_namespaced", "mybatis", "struts"])
 def test_config_root_becomes_config_primary(text, path, name):
-    res = A.collect_defs(text, path)
+    res = _defs(text, path)
     assert res.primary is not None
     assert res.primary.label == "Config" and res.primary.name == name
 
@@ -54,7 +81,7 @@ def test_config_root_becomes_config_primary(text, path, name):
      '<beans><bean class="&xxe;"/></beans>', "xxe/attempt.xml", ("xml_parse_error", None, None)),
 ], ids=["not_config", "malformed", "external_entity_rejected"])
 def test_unusable_xml_yields_no_primary_and_one_dropped(text, path, dropped):
-    res = A.collect_defs(text, path)
+    res = _defs(text, path)
     assert res.primary is None and res.children == []
     assert len(res.dropped) == 1
     d = res.dropped[0]
@@ -69,7 +96,7 @@ def test_unusable_xml_yields_no_primary_and_one_dropped(text, path, dropped):
     ('<beans>\n  <bean class="com.acme.a.Foo">\n</beans>\n', "broken/broken.xml"),
 ], ids=["not_config", "malformed"])
 def test_unusable_xml_extract_refs_returns_nothing(text, path):
-    res = A.extract_refs(text, path)
+    res = _refs(text, path)
     assert res.refs == [] and res.dropped == []
 
 
@@ -204,7 +231,7 @@ def _refs_match(got, exp):
 
 @pytest.mark.parametrize("text,path,via,refs,dropped", REFS_CASES.values(), ids=REFS_CASES)
 def test_extract_refs(text, path, via, refs, dropped):
-    res = A.extract_refs(text, path)
+    res = _refs(text, path)
     got = [r for r in res.refs if via is None or r.extra.get("via") == via]
     assert len(got) == len(refs)
     for g, e in zip(got, refs):
@@ -219,7 +246,7 @@ def test_extract_refs(text, path, via, refs, dropped):
 
 def test_mybatis_type_alias_values_are_reported_as_dropped_mapper_type_alias():
     """`map`/`string` 等の別名（完全修飾でない値）は推測接続せず `mapper_type_alias` で申告する。"""
-    res = A.extract_refs(
+    res = _refs(
         _mapper('  <select id="selectAll" resultType="map" parameterType="string">SELECT 1</select>\n'), MAPPER)
     alias_dropped = [d for d in res.dropped if d.reason == "mapper_type_alias"]
     assert {d.snippet for d in alias_dropped} == {"map", "string"}
@@ -228,7 +255,7 @@ def test_mybatis_type_alias_values_are_reported_as_dropped_mapper_type_alias():
 
 
 def test_mybatis_include_refid_is_reported_as_dropped_mapper_include():
-    res = A.extract_refs(
+    res = _refs(
         _mapper('  <sql id="cols">o.id, o.status</sql>\n'
                 '  <select id="selectOrder"><include refid="cols"/> FROM orders o</select>\n'), MAPPER)
     include_dropped = [d for d in res.dropped if d.reason == "mapper_include"]
@@ -241,7 +268,7 @@ def test_mybatis_large_mapper_gets_distinct_increasing_lines():
     lines = ['<mapper namespace="com.acme.mybatis.OrderMapper">']
     lines += [f'  <select id="s{i}">SELECT {i} FROM T{i}</select>' for i in range(n)]
     lines.append("</mapper>")
-    res = A.extract_refs("\n".join(lines) + "\n", MAPPER)
+    res = _refs("\n".join(lines) + "\n", MAPPER)
     table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
     assert [r.name for r in table_refs] == [f"T{i}" for i in range(n)]
     got_lines = [r.line for r in table_refs]
@@ -320,7 +347,7 @@ CHILDREN_CASES = {
 
 @pytest.mark.parametrize("text,path,children,dropped", CHILDREN_CASES.values(), ids=CHILDREN_CASES)
 def test_collect_defs_config_children(text, path, children, dropped):
-    res = A.collect_defs(text, path)
+    res = _defs(text, path)
     assert {c.name for c in res.children} == set(children)
     for c in res.children:
         want = children[c.name]
@@ -331,13 +358,70 @@ def test_collect_defs_config_children(text, path, children, dropped):
 
 def test_duplicate_bare_key_across_key_kinds_keeps_both_with_distinct_cids():
     """`seen` は `(key_kind, 裸キー)` の組で判定する——同じ `login` でも property と action は別名前空間。"""
-    res = A.collect_defs(STRUTS_SAME_KEY, "struts/struts.xml")
+    res = _defs(STRUTS_SAME_KEY, "struts/struts.xml")
     assert {(c.name, c.extra["key_kind"]) for c in res.children} == {("login", "property"), ("login", "action")}
     assert {c.cid_key for c in res.children} == {"key:property:login", "key:action:login"}
     assert res.dropped == []
 
 
+# ---- 本体と FW プラグインの境界（ANA-15 P3） ----
+
+KIND_CASES = [
+    ('<beans><bean class="com.acme.Foo"/></beans>', "spring_beans"),
+    ('<beans xmlns="http://www.springframework.org/schema/beans"/>', "spring_beans"),   # namespace に依らずルートのローカル名
+    ('<mapper namespace="a.M"/>', "mybatis_mapper"),
+    ('<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "mybatis-3-mapper.dtd"><mapper namespace="a.M"/>',
+     "mybatis_mapper"),                                                                  # 外部 DTD は読まない
+    ("<struts/>", "struts"),
+    ("<project><modelVersion>4.0.0</modelVersion></project>", None),                   # pom.xml
+    ("<web-app/>", None),
+    ("<configuration><appender/></configuration>", None),                                # 一般の設定ファイル
+    ('<beans>\n  <bean class="a.B">\n</beans>\n', None),                              # 壊れた XML
+    ("", None),
+]
+
+
+@pytest.mark.parametrize("text,kind", KIND_CASES)
+def test_config_kind(text, kind):
+    assert A.config_kind(text, "x.xml") == kind
+
+
+def test_config_kinds_are_a_closed_set_of_the_plugins():
+    """プラグインの `config_kinds` は本体が返し得る種別の閉じた集合の部分集合（名前の食い違いで黙って適用されないのを防ぐ）。"""
+    from sherpa.ingest.analyzers.xml_config import CONFIG_KINDS
+    from sherpa.ingest.analyzers.xml_config_fw import FW_PLUGINS
+    assert CONFIG_KINDS == {"spring_beans", "mybatis_mapper", "struts"}
+    assert {k for p in FW_PLUGINS for k in p.config_kinds} == CONFIG_KINDS
+
+
+APPLY_CASES = [
+    ('<beans><bean id="a" class="a.B"/></beans>', ["xml:spring"]),
+    ('<mapper namespace="a.M"><select id="s">SELECT 1</select></mapper>', ["xml:mybatis"]),
+    ('<struts><action name="a" class="a.A"/></struts>', ["xml:struts"]),
+    ("<project><modelVersion>4.0.0</modelVersion></project>", []),                      # pom.xml
+    ("<configuration><appender/></configuration>", []),                                  # FW と無関係の XML（MyBatis の設定でもない）
+    ('<beans>\n  <bean class="a.B">\n</beans>\n', []),                                # 壊れた XML
+]
+
+
+@pytest.mark.parametrize("text,applied", APPLY_CASES)
+def test_only_the_plugin_of_the_matching_kind_applies(text, applied):
+    """Spring の設定には Spring のプラグインだけ・MyBatis／Struts も自分の種別だけ・FW と無関係の XML には何も適用されない。"""
+    assert [p.name for p in registry.applicable_fw_plugins(A, text, "x.xml")] == applied
+
+
+def test_disabling_plugins_keeps_only_the_body_result():
+    """プラグインを外すと FW の分（キー・参照）だけが消え、本体の結果（`Config` の主体）は残る。"""
+    text = _beans('  <bean id="svc" class="com.acme.Foo"><property name="p" ref="other"/></bean>\n')
+    with_fw = _defs(text, SPRING)
+    without = _defs(text, SPRING, plugins=())
+    assert without.primary == with_fw.primary and without.primary is not None
+    assert without.children == [] and [c.name for c in with_fw.children] == ["svc"]
+    assert _refs(text, SPRING, plugins=()).refs == []
+    assert {r.name for r in _refs(text, SPRING).refs} == {"com.acme.Foo", "other"}
+
+
 def test_spring_bean_id_cid_key():
-    res = A.collect_defs(
+    res = _defs(
         _beans('  <bean id="orderService" class="com.acme.Foo"/>\n'), SPRING)
     assert [c.cid_key for c in res.children] == ["key:bean:orderService"]

@@ -18,8 +18,8 @@ SQL_EXT = frozenset({".sql"})
 
 _IDENT_TOKEN = _sql_scan.IDENT_TOKEN
 
-# `CREATE [GLOBAL|LOCAL] TEMPORARY TABLE`（方言）も受理する共通プレフィックス。
-_CREATE_TABLE_PREFIX = r"\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+TEMPORARY\s+)?TABLE\s+"
+# `CREATE [GLOBAL|LOCAL] TEMPORARY|TEMP|UNLOGGED TABLE`（方言）も受理する共通プレフィックス。
+_CREATE_TABLE_PREFIX = r"\bCREATE\s+(?:(?:(?:GLOBAL|LOCAL)\s+)?TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE\s+"
 
 _CREATE_TABLE = re.compile(
     _CREATE_TABLE_PREFIX + r"(?:IF\s+NOT\s+EXISTS\s+)?"
@@ -28,11 +28,11 @@ _CREATE_TABLE = re.compile(
     re.IGNORECASE,
 )
 
-# `CREATE TABLE NAME AS SELECT ...`（CTAS・列リストなし）。
+# `CREATE TABLE NAME AS [(] SELECT|WITH ...`（CTAS・列リストなし）。
 _CREATE_TABLE_AS_SELECT = re.compile(
     _CREATE_TABLE_PREFIX + r"(?:IF\s+NOT\s+EXISTS\s+)?"
     r"(?P<name>" + _IDENT_TOKEN + r"(?:\s*\.\s*" + _IDENT_TOKEN + r")*)"
-    r"\s+AS\s+SELECT\b",
+    r"\s+AS\s+(?:\(\s*)*(?:SELECT|WITH)\b",
     re.IGNORECASE,
 )
 
@@ -115,7 +115,7 @@ class SqlDdlAnalyzer(Analyzer):
     name = "sql"
     extensions = SQL_EXT
     doctype = "sql"
-    version = 3
+    version = 4
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         sanitized = _sanitize(text)

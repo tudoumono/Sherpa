@@ -92,8 +92,13 @@ _SCHEMA = [
         last_doc_count INTEGER,                    -- 成功確定した取り込みが最後に数えた doctype 対応原本の件数（`worker._run_locked` の成功パスのみ更新・`/ext/v1/capabilities` が走査せず返す）。NULL＝未確定
         last_scan_report JSONB,                    -- 取り込み集計（`corpus_docs.scan_report()`）のキャッシュ（`GET /worlds/{wid}/status` がフォルダを歩かない）。直近の run が失敗でも直前に成功した集計を保つ。NULL＝未集計
         last_scan_report_at TIMESTAMPTZ,
+        resolve_applied_sig TEXT,                  -- 最後に確定したグラフが使った解決範囲の設定のハッシュ（`resolve_settings.signature_material`・NULL/空＝設定なしで作った）。現在の設定と違えば「設定が未反映」
+        resolve_settings JSONB,                    -- 解決範囲の設定（`{copy_paths:[prefix…], path_aliases:{別名:prefix}}`・`ingest/resolve_settings.py`）。NULL＝設定なし
         PRIMARY KEY (kb_id, world_id)
     )""",
+    # 既存 DB 向け。
+    "ALTER TABLE worlds ADD COLUMN IF NOT EXISTS resolve_settings JSONB",
+    "ALTER TABLE worlds ADD COLUMN IF NOT EXISTS resolve_applied_sig TEXT",
     # 1 world = 1 参照元（双方向 1:1）。同じ root を別 world に二重登録させない。
     "CREATE UNIQUE INDEX IF NOT EXISTS worlds_root ON worlds(kb_id, root_path)",
     # 取り込み・抽出の run 記録（ingest_runs）。グラフ反映境界を run 単位で持つ。version は documents.version と同じ自由文字列。共通 run は version=NULL＋layer=common。

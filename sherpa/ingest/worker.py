@@ -15,7 +15,16 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .. import corpus_docs, es_index, scope_infer, store, webhooks, worlds
-from . import archive_extract, failure_reasons, importance, office_md, world_graph, world_graph_service, world_neo4j
+from . import (
+    archive_extract,
+    failure_reasons,
+    importance,
+    office_md,
+    resolve_settings,
+    world_graph,
+    world_graph_service,
+    world_neo4j,
+)
 from .analyzers import registry as analyzer_registry
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる（`sherpa/log_setup.py`・office_md.py と同じ系統）
@@ -69,7 +78,8 @@ def _reflect_graph_after_rag_rewrite(world: str) -> None:
         reasons = sorted({str(f.get("reason")) for f in blocked})
         raise RuntimeError(f"graph reflect blocked: {','.join(reasons)}")
     env = world_neo4j._env()
-    world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
+    world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
+                           plugin_failures=world_graph.plugin_failures_from_flags(flags))
 
 
 # `office_md.build_derived()` の per-file 失敗リスト（`[{"doc": rel, "reason": str}]`）のキー。末尾の `_failures` を落とした残りを stage 名にする
@@ -203,9 +213,15 @@ def run(world, *, reflect=True, created_by="admin",
                            scan_root=scan_root, run_id=run_id, on_run_id=on_run_id, op=op)
 
 
-def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
-                op: str = "sync",
-                finalize: bool = True) -> dict:
+def _run_locked(world, **kwargs) -> dict:
+    """取り込み 1 回の本体。解決範囲の設定は始めに 1 回だけ読んで固定する（署名・グラフ・確定の記録が同じ設定を使う）。"""
+    with resolve_settings.pinned(world):
+        return _run_locked_body(world, **kwargs)
+
+
+def _run_locked_body(world, *, reflect, created_by, scan_root, run_id=None, on_run_id=None,
+                     op: str = "sync",
+                     finalize: bool = True) -> dict:
     # lock 保持下で呼ぶ版。`worlds.rebind` はここを直接呼ぶ（`run` 経由だと同じ advisory lock を再入できず自己デッドロックする）。
     # last_sig はこの run の中で完結させる（他に書くのは `_wipe_locked` の pre-invalidate・`sync` の lock 内バックフィル・rebind 復旧の `restore_bind_invalidate_sig`）:
     #  - world 未解決（`sig is None`）は last_sig に触れず即 failed にする（`_record` の監査記録だけ書く）
@@ -252,6 +268,9 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
 
     _progress("scanning")
     # ① 走査（走査済み件数を逐次報告する。総数は走査完了まで不明）
+    # このグラフが使う設定のハッシュ（署名より先に読む＝保存が割り込んでも「未反映」側へ倒れる）
+    # 設定は取り込みの始めに 1 回だけ読んだスナップショット（`run_locked` の `resolve_settings.pinned`）で、署名・グラフの構築・確定の記録が同じ値を使う
+    applied_resolve_sig = resolve_settings.signature_of(world)
     sig, manifest = world_state(world, progress=lambda n: _progress("scanning", done=n, total=None))
 
     nodes, edges, flags, rows = [], [], [], []              # 台帳行は派生 MD の作成後に確定する
@@ -283,7 +302,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         pending = {"status": status, "extraction_snapshot": snap, "published_snapshot": reflected,
                   "source_doc_ids": [r["name"] for r in rows], "confirm_sig": confirm_sig,
                   "confirm_manifest": confirm_manifest, "confirm_doc_count": confirm_doc_count,
-                  "confirm_scan_report": confirm_scan_report}
+                  "confirm_scan_report": confirm_scan_report, "confirm_resolve_sig": applied_resolve_sig}
         if not finalize:
             # `finalize=False`: この行の DB 確定は呼び出し元に委ねる
             return {"world": world, "status": status, "ledger": ledger,
@@ -296,7 +315,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
                 run_id, world, status=status, extraction_snapshot=snap,
                 published_snapshot=reflected, source_doc_ids=pending["source_doc_ids"],
                 sig=confirm_sig, manifest=confirm_manifest, doc_count=confirm_doc_count,
-                scan_report=confirm_scan_report)
+                scan_report=confirm_scan_report, resolve_sig=applied_resolve_sig)
         else:
             rec = store.finish_ingest_run(run_id, status=status, extraction_snapshot=snap,
                                           published_snapshot=reflected,
@@ -365,7 +384,8 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
     neo4j_t0 = time.monotonic()
     try:
         env = world_neo4j._env()
-        n, m = world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"])
+        n, m = world_neo4j.load_world(nodes, edges, world, env["uri"], env["user"], env["pw"],
+                                      plugin_failures=world_graph.plugin_failures_from_flags(flags))
     except Exception as e:
         # 失敗理由に接続先（ホスト:ポート）を含める（認証情報は含めない）。失敗した段も stage summary に所要時間とエラーを残す
         return _record("failed", extra_flags=[{"doc": None, "action": "blocked",
@@ -575,12 +595,16 @@ def _scan_dir(wd, progress=None) -> list:
     return parts
 
 
-def _sig(parts) -> str:
+def _sig(parts, resolve_sig: str = "") -> str:
     # 重要度のスキーマ版・アナライザの有効構成・言及エッジの仕様版と実効値（`world_graph._mention_min_len`/`_mention_max_per_doc`）を材料に含める。
-    # これらが変わると、ソースが不変でも署名が変わり全再構築される
-    return hashlib.sha1(repr((importance.IMPORTANCE_SCHEMA_VERSION, analyzer_registry.config_signature(),
-                             world_graph.MENTION_SCHEMA_VERSION, world_graph._mention_min_len(),
-                             world_graph._mention_max_per_doc(), parts)).encode("utf-8")).hexdigest()
+    # これらが変わると、ソースが不変でも署名が変わり全再構築される。
+    # 資料フォルダの解決範囲の設定（`resolve_settings.signature_material`）があるときはそのハッシュも材料にする（設定が無ければ材料に足さない）
+    material = (importance.IMPORTANCE_SCHEMA_VERSION, analyzer_registry.config_signature(),
+                world_graph.MENTION_SCHEMA_VERSION, world_graph._mention_min_len(),
+                world_graph._mention_max_per_doc(), parts)
+    if resolve_sig:
+        material += (("resolve_settings", resolve_sig),)
+    return hashlib.sha1(repr(material).encode("utf-8")).hexdigest()
 
 
 def _manifest(parts) -> dict:
@@ -588,18 +612,18 @@ def _manifest(parts) -> dict:
     return {rel: [m, c, s] for (rel, m, c, s) in parts}
 
 
-def world_signature_of_root(wd) -> str:
+def world_signature_of_root(wd, resolve_sig: str = "") -> str:
     """解決済みの root（`Path`）から署名を計算する（`worlds.world_dir()` を再度呼ばない）。
 
     root 取得済みの呼び出し元はこちらを使う（再解決の間に rebind が起きると、古い root のスキャン結果を新しい root の署名で扱ってしまう）。
     """
-    return _sig(_scan_dir(wd))
+    return _sig(_scan_dir(wd), resolve_sig)
 
 
 def world_signature(world) -> str | None:
     """資料フォルダの安価な署名（各ファイルの rel/mtime/ctime/size の集約＋重要度スキーマ版＋アナライザ構成署名の SHA1・`_sig()`）。変更検知の基準。不在は None。"""
     wd = worlds.world_dir(world)
-    return world_signature_of_root(wd) if wd else None
+    return world_signature_of_root(wd, resolve_settings.signature_of(world)) if wd else None
 
 
 def world_state(world, progress=None):
@@ -608,10 +632,10 @@ def world_state(world, progress=None):
     if not wd:
         return None, None
     parts = _scan_dir(wd, progress=progress)
-    return _sig(parts), _manifest(parts)
+    return _sig(parts, resolve_settings.signature_of(world)), _manifest(parts)
 
 
-def diff_dir(wd, prev_manifest, prev_sig=None) -> dict:
+def diff_dir(wd, prev_manifest, prev_sig=None, resolve_sig: str = "") -> dict:
     """フォルダ現状と取り込み済み明細の差分を返す（read-only・グラフ/台帳/ES には書かない）。
 
     返値は `added`/`removed`/`changed`（rel のリスト）と `total`（現在のファイル数）・`indexed`（前回取込のファイル数）。
@@ -620,7 +644,7 @@ def diff_dir(wd, prev_manifest, prev_sig=None) -> dict:
     parts = _scan_dir(wd)
     cur = _manifest(parts)
     prev = prev_manifest or {}
-    if not prev and prev_sig is not None and _sig(parts) == prev_sig:
+    if not prev and prev_sig is not None and _sig(parts, resolve_sig) == prev_sig:
         return {"added": [], "removed": [], "changed": [], "total": len(cur), "indexed": len(cur)}
     added = sorted(r for r in cur if r not in prev)
     removed = sorted(r for r in prev if r not in cur)
@@ -853,7 +877,8 @@ def sync(world, *, reflect=True, force=False, run_id=None, on_run_id=None, op: s
     資料フォルダが解決できなかった（`status="unavailable"`）場合と、`SHERPA_TEST_DB_ISOLATED`（pytest 実行中に立つ内部フラグ）が立っている間は起動しない。
     背景起動の失敗は best-effort で、`sync()` の戻り値・例外には影響させない。
     """
-    result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
+    with resolve_settings.pinned(world):        # 変更なしの分岐（グラフの自己修復）も含め、1 回の sync は同じ設定を使う
+        result = _sync_impl(world, reflect=reflect, force=force, run_id=run_id, on_run_id=on_run_id, op=op)
     if result.get("status") != "unavailable" and not os.environ.get("SHERPA_TEST_DB_ISOLATED"):
         try:
             from . import llm_render
@@ -1110,7 +1135,12 @@ def _reindex_after_rag_rewrite(world: str) -> bool:
         return False
     dmd = worlds.derived_md_dir(world)
     with store.world_lock(world):
-        _reflect_graph_after_rag_rewrite(world)
+        # 解決範囲の設定がまだ反映されていない（保存後の全件の取り込み待ち）なら、グラフだけを今の設定で作り直さない
+        # （署名・台帳・ES は旧い設定のまま＝グラフだけが先に進むと食い違う）。全件の取り込みに任せる。
+        if resolve_settings.pending(store.get_world(world)):
+            _log.info("解決範囲の設定が未反映のため、LLM 成形後のグラフの反映を見送ります（次の取り込みで反映）: world=%s", world)
+        else:
+            _reflect_graph_after_rag_rewrite(world)
         if not office_md.drop_rag_sig_marker(dmd):
             _log.warning(
                 "LLM 成形反映後、`.rag_sig` の無効化に失敗しました（ES 再索引を見送ります）: world=%s",

@@ -130,7 +130,7 @@ def _apply_world_monkeypatches(monkeypatch, wd, dmd) -> list:
     # （`test_llm_rag_rewrite_reflects_mention_edges_in_graph` が言及エッジの中身を検証するため
     # `build_world_graph` は実際に走らせる必要がある）——最後の送信先だけ差し替える。
     # グラフの中身を見るテスト（同上）は `load_world` を自前でさらに上書きする。
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (len(nodes), len(edges)))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, **_kw: (len(nodes), len(edges)))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
@@ -274,7 +274,7 @@ def test_llm_rag_rewrite_reflects_mention_edges_in_graph(_world, monkeypatch):
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
     load_calls = []
 
-    def _fake_load_world(nodes, edges, world, uri, user, pw):
+    def _fake_load_world(nodes, edges, world, uri, user, pw, **_kw):
         load_calls.append((nodes, edges))
         return (len(nodes), len(edges))
     monkeypatch.setattr(world_neo4j, "load_world", _fake_load_world)
@@ -459,7 +459,7 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
     monkeypatch.setattr(world_neo4j, "check_graph_counts", lambda *a, **kw: None)
     # evidence drift の軽量再生成も `_reflect_graph_after_rag_rewrite` 経由で `world_neo4j.load_world`
     # へ実 Neo4j 接続する（Codex RV 2巡目是正・sweep で検出・§ _apply_world_monkeypatches 参照）。
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (len(nodes), len(edges)))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, **_kw: (len(nodes), len(edges)))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):

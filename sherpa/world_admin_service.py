@@ -15,6 +15,7 @@ from typing import Any
 from sherpa import store, worlds
 from sherpa.deps import _USERS_DIR, _browse_roots, _under_roots
 from sherpa.grep_tool import valid_world
+from sherpa.ingest import resolve_settings
 from sherpa.ingest import worker as ingest_worker
 from sherpa.ingest.source_paths import windows_to_wsl_path
 
@@ -218,6 +219,7 @@ def _diff_payload(root: str, existing: dict[str, Any] | None) -> dict[str, Any]:
             Path(root),
             (full or {}).get("last_manifest"),
             prev_sig=(full or {}).get("last_sig"),
+            resolve_sig=resolve_settings.signature_material((full or {}).get("resolve_settings")),
         )
     except Exception as exc:
         raise WorldAdminUnavailableError(f"差分を取得できません: {exc.__class__.__name__}") from exc

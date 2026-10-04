@@ -219,9 +219,8 @@ def test_c_line_shared_by_two_definitions_is_ambiguous_and_goes_to_the_primary()
             "int k(void) {\n"
             "    return h();\n"
             "}\n")
-    assert _owners(CAnalyzer(), text, "g/a.c") == {("g", "call", 1): None, ("h", "call", 1): None,
-                                                   ("h", "call", 3): ("g/a.c", "a.c.k")}
-    assert _ambiguous(CAnalyzer(), text, "g/a.c") == [(1, "a.c.f")]
+    assert _owners(CAnalyzer(), text, "g/a.c") == {("h", "call", 1): None, ("h", "call", 3): ("g/a.c", "a.c.k")}
+    assert _ambiguous(CAnalyzer(), text, "g/a.c") == [(1, "a.c.f, a.c.g")]
 
 
 def test_java_and_csharp_line_shared_by_two_types_is_ambiguous_and_goes_to_the_primary():

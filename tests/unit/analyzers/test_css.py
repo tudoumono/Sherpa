@@ -40,6 +40,8 @@ CASES = {
     "query_string_stripped": ('@import url("base.css?v=1");\n', "style.css", [("base.css", "base.css")], []),
     "selectors_and_property_values_not_extracted": ('.icon { background: url("icon.png"); }\n', "style.css", [], []),
     "block_comment_not_scanned": ('/* @import url("commented.css"); */\n', "style.css", [], []),
+    "import_inside_string_not_read": ('.a { content: "@import \'str.css\';" }\n@import "real.css";\n', "style.css",
+                                      [("real.css", "real.css")], []),
     "external_import_dropped": ('@import url("https://cdn.example.com/base.css");\n', "style.css", [],
                                 [("web_external_ref", 1)]),
     "protocol_relative_import_dropped": ('@import url("//cdn.example.com/base.css");\n', "style.css", [],
@@ -55,3 +57,9 @@ def test_extract_refs(text, path, refs, dropped):
     assert len(res.dropped) == len(dropped)
     for d, (reason, line) in zip(res.dropped, dropped):
         assert d.reason == reason and (line is None or d.line == line)
+
+
+def test_syntax_error_is_reported_and_the_rest_is_still_read():
+    res = A.extract_refs('@import "a.css";\n.x { color: ; \n@import "b.css";\n', "style.css")
+    assert "syntax_error" in [d.reason for d in res.dropped]
+    assert [r.name for r in res.refs][0] == "a.css"

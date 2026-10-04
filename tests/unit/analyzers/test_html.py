@@ -99,3 +99,10 @@ def test_unclosed_html_comment_sanitization_is_linear_time():
     start = time.perf_counter()
     A.extract_refs("<!--" * 20000, "index.html")
     assert time.perf_counter() - start < 1.0
+
+
+def test_iframe_src_is_an_include_and_marks_the_file_as_app_screen():
+    text = '<iframe src="frame/inner.html"></iframe>\n'
+    assert A.accepts("x.html", text) is True
+    res = A.extract_refs(text, "x.html")
+    assert [(r.name, r.extra["include_path"]) for r in res.refs] == [("inner.html", "frame/inner.html")]

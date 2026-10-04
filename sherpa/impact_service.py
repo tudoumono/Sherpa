@@ -27,7 +27,8 @@ _STOP = {"DATA", "CODE", "RATE", "TOTAL", "INPUT", "OUTPUT", "FILE", "DATE", "TI
          "API", "SQL", "CSV", "PDF", "URL", "HTTP", "JSON", "XML", "COBOL", "JCL", "REC", "SUM", "AMT"}
 
 
-from .graph_coverage import KIND_DOC_SEARCH_TRUNCATED, KIND_GRAPH_UNAVAILABLE, KIND_RESULT_CAP, STAGE_PRESUMED, add_limit
+from .graph_coverage import (KIND_DOC_SEARCH_TRUNCATED, KIND_GRAPH_UNAVAILABLE, KIND_PLUGIN_FAILED, KIND_RESULT_CAP,
+                             STAGE_PRESUMED, add_limit)
 from .ingest.identifiers import normalize_code_name as _norm
 
 
@@ -120,6 +121,16 @@ _DEPTH_UNKNOWN_NOTE = ("深さの上限の先に影響が残っているかを�
                        "（ここに示した影響は確認できた分です）。範囲（フォルダ）を絞って再実行してください。")
 
 
+def plugin_failed_note(coverage: dict | None) -> str | None:
+    """`coverage.limits` の `plugin_failed`（FW プラグインの失敗）→ 利用者向け平文の注記。無ければ `None`。"""
+    names = sorted({lim["plugin"] for lim in (coverage or {}).get("limits", [])
+                    if lim.get("kind") == KIND_PLUGIN_FAILED and lim.get("plugin")})
+    if not names:
+        return None
+    return (f"取り込み時に FW（フレームワーク）の解析（{'・'.join(names)}）が失敗したため、関係グラフにその分の関連が欠けています"
+            "（関連が無いとは言えません）。原因を直して取り込み直すまで残ります。")
+
+
 def _depth_note(depth: int) -> str:
     return (f"影響をたどる深さの上限（{depth}段）で止めたため、さらに先に影響が残っている可能性があります。"
             "調べる深さを増やして再実行してください。")
@@ -149,6 +160,9 @@ def run_impact(session, term, world, scope_prefixes=None,
         result["notes"] = [_depth_note(coverage["depth"]["requested"])]
     elif coverage and "depth" in coverage and coverage["depth"]["truncated"] is None:
         result["notes"] = [_DEPTH_UNKNOWN_NOTE]
+    plugin_note = plugin_failed_note(coverage)
+    if plugin_note:
+        result.setdefault("notes", []).append(plugin_note)
     if include_presumed and not result.get("items"):
         truncated_docs: list = []
         try:

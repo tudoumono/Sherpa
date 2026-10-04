@@ -110,3 +110,68 @@ REFS_CASES = {
 def test_extract_refs(text, refs):
     got = [(r.name, r.extra["via"], r.extra.get("qualified")) for r in A.extract_refs(text, "Order/OrderService.cs").refs]
     assert got == refs
+
+
+# ---- Tree-sitter の木で読むようになった形 ----
+def test_multiline_signatures_nested_generics_and_type_parameters():
+    text = ("public class Svc<TItem>\n{\n"
+            "    public Svc(\n        IRepo repo,\n        Logger<Svc<Dep>> log) { }\n"
+            "    public TItem Pick<TOut>(TItem a, TOut b, Other c) { return new TOut(); }\n"
+            "    private Dictionary<string, List<Leaf>> map;\n"
+            "    private (First a, Second b) pair;\n}\n")
+    got = [(r.name, r.line) for r in A.extract_refs(text, "Svc.cs").refs]
+    assert got == [("IRepo", 4), ("Logger", 5), ("Svc", 5), ("Dep", 5), ("Other", 6), ("Leaf", 7), ("First", 8), ("Second", 8)]
+
+
+def test_same_line_type_bodies_are_read():
+    refs = A.extract_refs("namespace One { class A1 { Foo f; } }\n", "A1.cs").refs
+    assert [(r.name, r.line) for r in refs] == [("Foo", 1)]
+
+
+def test_preprocessor_branch_around_a_class_header_reads_both_base_lists():
+    text = "#if NET6\npublic class A : B1\n#else\npublic class A : B2\n#endif\n{\n    private Dep d;\n}\n"
+    res = A.extract_refs(text, "A.cs")
+    assert [(r.name, r.extra["via"]) for r in res.refs] == [("B1", "extends"), ("B2", "extends"), ("Dep", "field_type")]
+    assert any(d.reason == "syntax_error" for d in A.collect_defs(text, "A.cs").dropped)
+
+
+def test_syntax_error_is_reported_and_the_rest_of_the_file_is_still_read():
+    text = ("public class Broken : Base\n{\n    private Dep2 d2;\n    public void M( { }\n}\n"
+            "class AfterBroken : Base3\n{\n    private Dep3 d3;\n}\n")
+    defs = A.collect_defs(text, "Broken.cs")
+    assert [d.reason for d in defs.dropped] == ["syntax_error"] and defs.dropped[0].line == 4
+    assert defs.primary.name == "Broken" and [c.name for c in defs.children] == ["AfterBroken"]
+    refs = A.extract_refs(text, "Broken.cs").refs
+    assert [(r.name, r.source_symbol_id) for r in refs if r.name in ("Dep2", "Dep3")] == [
+        ("Dep2", None), ("Dep3", ("Broken.cs", "AfterBroken"))]
+
+
+def test_return_types_property_event_indexer_and_primary_constructor_types_are_read():
+    text = ("public record Money(Currency C, int V);\n"
+            "public class Svc<T>\n{\n"
+            "    public Result Run(Req r) { return null; }\n"
+            "    public T Echo(T t) { return t; }\n"
+            "    public Task<Item> LoadAsync() { return null; }\n"
+            "    public static explicit operator Wrapped(Svc<T> s) => null;\n"
+            "    public event Handler<Ev> Changed;\n"
+            "    public Foo this[Bar idx] { get { return null; } }\n"
+            "    public Mapped Mapping { get; }\n"
+            "    void Body() { Local x = null; }\n}\n")
+    got = [(r.name, r.line) for r in A.extract_refs(text, "Svc.cs").refs]
+    assert got == [("Currency", 1), ("Result", 4), ("Req", 4), ("Item", 6), ("Wrapped", 7), ("Svc", 7), ("Handler", 8),
+                   ("Ev", 8), ("Foo", 9), ("Bar", 9), ("Mapped", 10)]
+
+
+def test_nested_type_arguments_in_base_list_new_and_casts_are_read():
+    text = ("public class C : I<A<B>>\n{\n    void M(object o)\n    {\n        var f = new Factory<X<Y>>();\n"
+            "        var c = (Cast<Z>)o;\n    }\n}\n")
+    got = [(r.name, r.extra["via"]) for r in A.extract_refs(text, "C.cs").refs]
+    assert got == [("I", "extends"), ("A", "field_type"), ("B", "field_type"), ("Factory", "call"),
+                   ("X", "field_type"), ("Y", "field_type"), ("Cast", "field_type"), ("Z", "field_type")]
+
+
+def test_typeof_in_an_attribute_belongs_to_the_type_it_decorates():
+    text = ("namespace N;\npublic class First\n{\n}\n"
+            "[Uses(typeof(Dep))]\nclass Second\n{\n}\n")
+    refs = A.extract_refs(text, "T.cs")
+    assert [(r.name, r.source_symbol_id) for r in refs.refs] == [("Dep", ("T.cs", "N.Second"))]

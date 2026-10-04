@@ -6,9 +6,44 @@ from __future__ import annotations
 
 import pytest
 
+from sherpa.ingest.analyzers import registry
+from sherpa.ingest.analyzers._base import TypeLookup, TypeRelations
 from sherpa.ingest.analyzers.java import JavaAnalyzer
 
 A = JavaAnalyzer()
+
+
+def _defs_with_fw(text, path):
+    """本体の `collect_defs` に、適用できる FW プラグイン（Spring の注釈）の追加分を重ねた結果。"""
+    base = A.collect_defs(text, path)
+    res, fails = registry.apply_fw_defs(registry.applicable_fw_plugins(A, text, path), text, path, base)
+    assert not fails
+    return res
+
+
+class _NoTypes(TypeRelations):
+    """継承・実装の関係が空の世界（注入先の実装は引けない）。"""
+
+    def subtypes(self, type_name, from_rel, file_context=None, line=None, *, kind="Module"):
+        return TypeLookup(status="unresolved")
+
+
+def _refs_with_fw(text, path):
+    """本体の `extract_refs` に FW プラグインの追加分を重ねた結果（本体の定義も渡す）。"""
+    plugins = registry.applicable_fw_plugins(A, text, path)
+    res, fails, _amb = registry.apply_fw_refs(plugins, text, path, A.collect_defs(text, path), A.extract_refs(text, path),
+                                              _NoTypes())
+    assert not fails
+    return res
+
+
+def test_base_analyzer_alone_is_framework_agnostic():
+    """本体は注釈の意味を知らない: DI 注釈は `field_type` のまま・URL キーも設定キー（`@Value`／`getBean`）も出ない。"""
+    text = ('@RequestMapping("/o")\npublic class A {\n    @Autowired\n    private Engine engine;\n'
+            '    @Value("${k}")\n    private String v;\n    @GetMapping("/x")\n    void m() { getBean("b"); getProperty("p"); }\n}\n')
+    assert A.collect_defs(text, "A.java").children == []
+    got = [(r.kind, r.name, r.extra.get("via")) for r in A.extract_refs(text, "A.java").refs]
+    assert got == [("Module", "Engine", "field_type"), ("Config", "p", "config_key")]
 
 
 def test_extensions_and_name():
@@ -124,6 +159,9 @@ URL_CASES = {
         '    @DeleteMapping("/remove")\n    public void remove() {}\n\n'
         '    @PatchMapping("/patch")\n    public void patch() {}\n}\n',
         [U("/orders/remove"), U("/orders/patch")]),
+    "annotation_on_the_same_line_as_the_method": (
+        '@RequestMapping("/orders")\npublic class OrderController {\n'
+        '    @GetMapping("/inline") public String inline() { return "x"; }\n}\n', [U("/orders/inline")]),
     "class_mapping_only_yields_none": (
         '@RequestMapping("/orders")\npublic class OrderController {\n    public void helper() {}\n}\n', []),
 }
@@ -131,7 +169,7 @@ URL_CASES = {
 
 @pytest.mark.parametrize("text,children", URL_CASES.values(), ids=URL_CASES)
 def test_collect_defs_url_config_children(text, children):
-    res = A.collect_defs(text, "OrderController.java")
+    res = _defs_with_fw(text, "OrderController.java")
     assert [(c.label, c.name, c.cid_key, c.extra.get("key_kind")) for c in res.children] == children
 
 
@@ -185,13 +223,23 @@ REFS_CASES = {
         "    public void process(TaxCalc calc, String note) {\n    }\n}\n",
         [R("Engine", "field_type"), R("TaxCalc", "field_type")], None),
     "generic_argument_one_level": (_body("    private List<TaxCalc> calcs;"), [R("TaxCalc", "field_type")], None),
-    "nested_generic_not_extracted": (_body("    private Map<String, List<TaxCalc>> byKey;"), [], None),
-    "autowired_is_inject": (_body("    @Autowired\n    private Engine engine;"), [R("Engine", "inject")], None),
-    "inject_annotation": (_body("    @Inject\n    private Engine engine;"), [R("Engine", "inject")], None),
-    "resource_annotation": (_body("    @Resource\n    private Engine engine;"), [R("Engine", "inject")], []),
+    "nested_generic_argument_all_levels": (_body("    private Map<String, List<TaxCalc>> byKey;"), [R("TaxCalc", "field_type")], None),
+    "return_throws_wildcard_array_and_type_parameter": (
+        _body("    <T> Result<T> run(List<? extends Dto> a, Set<? super Form> b, Item[] c) throws PayError {}"),
+        [R("Result", "field_type"), R("Dto", "field_type"), R("Form", "field_type"), R("Item", "field_type"),
+         R("PayError", "field_type")], None),
+    "record_components": ("public record P(Dto d, Map<String, Form> m) {}\n",
+                          [R("Dto", "field_type"), R("Form", "field_type")], None),
+    "autowired_is_inject": (_body("    @Autowired\n    private Engine engine;"), [R("Engine", "inject"), R("Engine", "field_type")], None),
+    "inject_annotation": (_body("    @Inject\n    private Engine engine;"), [R("Engine", "inject"), R("Engine", "field_type")], None),
+    "resource_annotation": (_body("    @Resource\n    private Engine engine;"), [R("Engine", "inject"), R("Engine", "field_type")], []),
+    "autowired_on_the_same_line_is_inject": (_body("    @Autowired private Engine engine;"), [R("Engine", "inject"), R("Engine", "field_type")], None),
+    "multiple_declarators_and_multiline_params": (
+        _body("    @Inject\n    protected Engine a, b;\n    void m(Dto d,\n           Form f) {}"),
+        [R("Engine", "inject"), R("Engine", "field_type"), R("Dto", "field_type"), R("Form", "field_type")], None),
     "inject_does_not_leak_to_next_field": (
         _body("    @Autowired\n    private Engine engine;\n    private TaxCalc calc;"),
-        [R("Engine", "inject"), R("TaxCalc", "field_type")], None),
+        [R("Engine", "inject"), R("Engine", "field_type"), R("TaxCalc", "field_type")], None),
     # 設定キー
     "value_annotation": (_body('    @Value("${tax.rate}")\n    private String rate;'), [C("tax.rate")], None),
     "value_default_discarded": (_body('    @Value("${tax.rate:0.1}")\n    private String rate;'), [C("tax.rate")], None),
@@ -200,13 +248,16 @@ REFS_CASES = {
     "get_property_with_and_without_receiver": (
         _body('    void m() {\n        System.getProperty("db.url");\n        env.getProperty("db.user");\n'
               '        getProperty("db.pass");\n    }'), [C("db.url"), C("db.user"), C("db.pass"), R("System", "call")], None),
+    "get_property_with_default_keeps_the_literal_key": (
+        _body('    void m() { env.getProperty("app.name", "dflt"); props.getProperty(KEY, "dflt"); }'),
+        [C("app.name")], [D("config_nonliteral", 'KEY, "dflt"')]),
     "get_string": (_body('    void m() { bundle.getString("app.title"); }'), [C("app.title")], None),
     "configuration_properties_prefix_dropped": (
-        '@ConfigurationProperties(prefix="myapp")\npublic class A {\n}\n', [], [D("config_prefix", "myapp")]),
+        '@ConfigurationProperties(prefix="myapp")\npublic class A {\n}\n', [], [D("spring:java: config_prefix", "myapp")]),
     "config_key_in_comment_ignored": (_body('    // @Value("${should.not.match}")\n    void m() {}'), [], None),
     "value_spel_dropped": (
         _body('    @Value("#{someBean.someProperty}")\n    private String v;'), [],
-        [D("config_spel", "someBean.someProperty")]),
+        [D("spring:java: config_spel", "someBean.someProperty")]),
     "get_property_nonliteral_dropped": (
         _body("    void m() {\n        System.getProperty(KEY_CONST);\n    }"), [R("System", "call")], [D("config_nonliteral", "KEY_CONST")]),
     "get_string_nonliteral_dropped": (
@@ -236,7 +287,7 @@ REFS_CASES = {
     "get_bean": (_body('    Object m() { return getBean("orderService"); }'), [C("orderService", "bean")], None),
     "get_bean_receiver_and_nonliteral": (
         _body('    void m() {\n        ctx.getBean("orderService");\n        ctx.getBean(SERVICE_NAME);\n    }'),
-        [C("orderService", "bean")], [D("config_nonliteral", "SERVICE_NAME")]),
+        [C("orderService", "bean")], [D("spring:java: config_nonliteral", "SERVICE_NAME")]),
     "qualifier": (_body('    @Qualifier("orderService")\n    private String hint;'), [C("orderService", "bean")], None),
     "named": (_body('    @Named("orderService")\n    private String hint;'), [C("orderService", "bean")], None),
     "qualifier_value_attribute": (_body('    @Qualifier(value = "orderService")\n    private String hint;'),
@@ -246,7 +297,7 @@ REFS_CASES = {
     "resource_name_attribute": (_body('    @Resource(name = "mailer")\n    private String mailer;'),
                                 [C("mailer", "bean")], None),
     "autowired_alone_has_no_config_key": (_body("    @Autowired\n    private Engine engine;"),
-                                          [R("Engine", "inject")], None),
+                                          [R("Engine", "inject"), R("Engine", "field_type")], None),
     "qualifier_nonliteral_silently_not_extracted": (
         _body("    @Qualifier(BeanNames.ORDER_SERVICE)\n    private String hint;"), [], []),
     "key_kind_mix": (
@@ -268,7 +319,7 @@ REFS_CASES = {
 
 @pytest.mark.parametrize("text,refs,dropped", REFS_CASES.values(), ids=REFS_CASES)
 def test_extract_refs(text, refs, dropped):
-    res = A.extract_refs(text, "A.java")
+    res = _refs_with_fw(text, "A.java")
     got = [(r.edge_type, r.kind, r.name, r.extra.get("via"), r.extra.get("key_kind")) for r in res.refs]
     assert sorted(got, key=str) == sorted(refs, key=str)
     if dropped is not None:
@@ -283,5 +334,56 @@ def test_extract_refs_line_numbers_are_one_based_and_match_source():
 def test_extract_refs_same_config_key_appearing_twice_yields_one_reference_at_first_line():
     text = ('public class A {\n    @Value("${tax.rate}")\n    private String a;\n'
             '    @Value("${tax.rate}")\n    private String b;\n}\n')
-    matches = [r for r in A.extract_refs(text, "A.java").refs if r.extra.get("via") == "config_key"]
+    matches = [r for r in _refs_with_fw(text, "A.java").refs if r.extra.get("via") == "config_key"]
     assert len(matches) == 1 and matches[0].line == 2
+
+
+# ---- 構文エラー ----
+
+def test_syntax_error_is_reported_and_definitions_and_refs_outside_the_error_are_still_read():
+    text = ("package a;\nimport lib.Thing;\npublic class Good {\n  private Svc s;\n  void bad( { int x = ; }\n"
+            "  Dto z = new Dto();\n}\nclass After { Other o; }\n")
+    defs = A.collect_defs(text, "a/Good.java")
+    assert [(d.reason, d.line) for d in defs.dropped] == [("syntax_error", 5)]
+    assert defs.primary.cid_key == "a.Good" and [c.name for c in defs.children] == ["After"]
+    refs = A.extract_refs(text, "a/Good.java")
+    assert {(r.name, r.line) for r in refs.refs} == {("Svc", 4), ("Dto", 6), ("Other", 8)}
+    assert [(i.name, i.line) for i in refs.file_context.imports] == [("lib.Thing", 2)]
+    assert not [d for d in refs.dropped if d.reason == "syntax_error"]       # 二重に申告しない
+
+
+# ---- RV 1 巡目の是正 ----
+
+def test_package_and_import_names_are_built_from_identifiers_not_comments():
+    text = "package com.acme /*x*/ .billing;\nimport a.b /* y */ .C;\nimport d./*z*/e.*;\npublic class X {}\n"
+    ctx = A.extract_refs(text, "X.java").file_context
+    assert ctx.package == "com.acme.billing"
+    assert [(i.kind, i.name) for i in ctx.imports] == [("single", "a.b.C"), ("wildcard", "d.e")]
+    assert A.collect_defs(text, "X.java").primary.cid_key == "com.acme.billing.X"
+
+
+def test_jdk_types_known_by_import_or_qualified_name_are_not_references():
+    text = ("import java.io.IOException;\nimport com.acme.Mine;\npublic class X {\n"
+            "    java.time.LocalDate when() throws IOException { return null; }\n"
+            "    Mine keep(javax.sql.DataSource ds) throws Other { return null; }\n}\n")
+    got = {r.name for r in A.extract_refs(text, "X.java").refs}
+    assert got == {"Mine", "Other"}
+
+
+def test_type_use_annotation_does_not_hide_inner_type_arguments():
+    refs = A.extract_refs("public class X {\n    Map<@Nonnull List<Dto>> value;\n    @Nonnull List<Form>[] arr;\n}\n",
+                          "X.java").refs
+    assert {r.name for r in refs} == {"Dto", "Form"}
+
+
+def test_common_type_names_are_kept_when_they_are_project_types():
+    imported = A.extract_refs("import com.acme.List;\nclass Use {\n    List x;\n    Date d;\n}\n", "Use.java").refs
+    assert {r.name for r in imported} == {"List"}                      # 単一 import が JDK 以外 → 頻出名でも拾う
+    same_file = A.extract_refs("class Date {}\nclass Use {\n    Date d;\n    List l;\n}\n", "Use.java").refs
+    assert {r.name for r in same_file} == {"Date"}                     # 同じファイルで定義した型
+
+
+def test_reference_after_a_long_comment_does_not_crash():
+    text = "public class X {\n" + "    // c\n" * 300 + "    Helper h;\n}\n"
+    refs = A.extract_refs(text, "X.java").refs
+    assert [(r.name, r.line) for r in refs] == [("Helper", 302)]

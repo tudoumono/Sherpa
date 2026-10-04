@@ -118,6 +118,7 @@ from .worlds import (
     get_world_status_row,
     list_worlds_db,
     restore_bind_invalidate_sig,
+    set_resolve_settings,
     set_scan_report,
     set_scan_report_if_unchanged,
     set_world_sig,

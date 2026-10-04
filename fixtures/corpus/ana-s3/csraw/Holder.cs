@@ -6,7 +6,7 @@ public class Holder
     private const string S = """
         "quoted" { class Fake {} }
         """;
-    private string t = $"""x {1} " class Fake2 { """;
+    private string t = $$"""x {{1}} " class Fake2 { """;
     private Dep d;
 }
 #endregion

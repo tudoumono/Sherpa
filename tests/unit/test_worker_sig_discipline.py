@@ -38,7 +38,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (0, 0))
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 0, "chunks": 0})
     monkeypatch.setattr(reconcile, "reconcile_derivatives", lambda reflect=True: None)
@@ -84,7 +84,7 @@ def _stub_pipeline(monkeypatch):
     # 記録先（`captured["set_world_sig_calls"]`）は両方の呼び出し元から同じ形で集める。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         if sig is not None:
             captured["set_world_sig_calls"].append(sig)
             captured["set_world_sig_doc_counts"].append(doc_count)
@@ -149,7 +149,7 @@ def test_pg_replace_failure_marks_exception_as_already_recorded(monkeypatch, _st
     `get_latest_published_run_summary` が返す「今実際に Neo4j にある内容」を、この run が新世代の
     まま止めてしまわないようにする。
     """
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (4, 6))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (4, 6))
 
     def _boom_replace(world, rows):
         raise RuntimeError("pg_replace fault")
@@ -245,7 +245,7 @@ def test_build_derived_error_then_next_sync_retries(monkeypatch, _stub_pipeline)
     # pre-invalidate 専用に残る）——ここでも db_row への反映を模擬する。
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         if sig is not None:
             _stub_pipeline["set_world_sig_calls"].append(sig)
             db_row["last_sig"] = sig
@@ -294,7 +294,7 @@ def test_build_derived_publish_rename_failure_leaves_sig_unconfirmed_and_retries
 
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         if sig is not None:
             _stub_pipeline["set_world_sig_calls"].append(sig)
             db_row["last_sig"] = sig

@@ -143,6 +143,8 @@ POLICY: dict[tuple[str, str], str] = {
     ("POST", "/worlds/{wid}/refresh"): "admin",
     ("POST", "/worlds/{wid}/reconvert"): "admin",
     ("POST", "/worlds/{wid}/rag_regenerate_rules"): "admin",
+    ("GET", "/worlds/{wid}/resolve-settings"): "admin",
+    ("PUT", "/worlds/{wid}/resolve-settings"): "admin",
     ("DELETE", "/worlds/{wid}"): "admin",
     ("POST", "/ext/v1/admin/keys"): "admin",
     ("GET", "/ext/v1/admin/keys"): "admin",
@@ -345,7 +347,8 @@ def test_policy_covers_all_routes():
     # admin=利用統計の AI チャット（/admin/usage/chat）とグラフの AI 質問の撤去で40。
     # admin=ユーザーの CSV 一括追加（POST /admin/users/import）1件追加で41。
     # admin=GET /worlds/{wid}/diff の撤去で40。
-    assert len(ADMIN_ROUTES) == 40
+    # admin=資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）2件追加で42。
+    assert len(ADMIN_ROUTES) == 42
     # ext_key=旧6＋Codex ジョブ API 4本（受付・状態・結果・取消・`C-EXT-CODEXJOB-*`）で10。
     assert len(EXT_KEY_ROUTES) == 10
     assert len(SPECIAL_ROUTES) == 7

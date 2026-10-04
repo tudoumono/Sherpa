@@ -78,7 +78,7 @@ class DefResult:
 # `INVOKES`/`CONTAINS`/`DOCUMENTS` エッジ属性 `via` の既知値。未知の値は共通層が `unknown_via` として `flags` に記録し、`via` だけを落とす（エッジは張る）。
 # `mention` は資料とコード定義名の完全一致から張る `DOCUMENTS`。名前解決はいずれも既定（同一 top_scope 内最近傍）。
 KNOWN_VIA = frozenset({
-    "call", "extends", "implements", "field_type", "inject", "include", "import", "copy",
+    "call", "extends", "implements", "inject", "field_type", "include", "import", "copy",
     "mention",
     "bean_class", "mapper_type", "mapper_namespace", "action_class", "config_value", "config_key",
     "exec_sql", "exec_proc", "include_member", "cics_xctl", "cics_link", "mapper_sql", "vba_sql",
@@ -88,7 +88,7 @@ KNOWN_VIA = frozenset({
 VIA_PRIORITY = (
     "bean_class", "mapper_type", "mapper_namespace", "action_class", "config_key", "config_value",
     "cics_xctl", "cics_link",
-    "call", "extends", "implements", "field_type", "inject", "include", "import", "copy", "exec_sql",
+    "call", "extends", "implements", "inject", "field_type", "include", "import", "copy", "exec_sql",
     "vba_sql", "mapper_sql", "exec_proc", "include_member",
 )
 
@@ -109,6 +109,7 @@ class RefCandidate:
     `extra` はエッジのプロパティへ加算される追加属性。細分は `extra["via"]`（`KNOWN_VIA` のみ）。
     `extra["qualified"]`＝`name` を完全修飾名として解決する指示（エッジには残らない）。完全修飾名が資料フォルダに無ければ辺は張らず未解決（`unresolved_qualifier`）。
     `extra["type_ref"]`＝`name` が型名であり、参照元ファイルの `file_context`（package／namespace・import／using）に従って解決する指示（エッジには残らない）。
+    `extra["resolution_rule"]`＝FW プラグインが解決の根拠として付ける規則名（`world_graph.EDGE_RULES` の名前だけ・辺の根拠の `rule` になる・未知の名前は `unknown_rule` を `flags` に出す・エッジには残らない）。
     `extra["path_exact"]`＝`via=include` の `include_path` が相対パスの完全一致でしか解決しない指示（一致しなければ basename の最近傍へ倒さず未解決・エッジには残らない）。
     `reverse`＝True なら「解決先→始点」の向きで張る。
     `source_symbol_id`＝参照元の定義キー `(rel_path, cid_key)`（`cid_key` は定義ノードの cid を組む `DefItem.key` と同じ値）。
@@ -238,6 +239,10 @@ class Analyzer:
         """
         return True
 
+    def config_kind(self, text: str, rel_path: str) -> str | None:
+        """設定ファイルの種別（XML のルート要素・名前空間など。FW プラグインの適用条件 `FwPlugin.config_kinds` が照合する）。判定しないアナライザは `None`。"""
+        return None
+
     def global_imports(self, text: str, rel_path: str) -> list:
         """同じ最上位フォルダ（世代）の全ファイルへ効く import（C# の `global using`）の `ImportItem` の一覧。共通層が Pass 1 で集め、同じ世代の各ファイルの `file_context.imports` へ足す。"""
         return []
@@ -249,3 +254,115 @@ class Analyzer:
     def extract_refs(self, text: str, rel_path: str) -> RefResult:
         """参照候補の抽出（2パス目）。名前解決・エッジ化・`dropped` の記録は共通層が行う。"""
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class TypeCandidate:
+    """型の定義の候補 1 件。`path`＝所属ファイル・`name`＝定義の識別子（canonical_id を組む名前）・`qualified`＝完全修飾名（`RefCandidate.name` に `extra["qualified"]` を付けると、この定義へ一意に解決される）。
+
+    `exact`＝この候補を指した参照が他の候補と区別できていたか（`TypeLookup.subtypes` の要素で、継承・実装の宣言自体の解決が曖昧だったときは False）。
+    """
+
+    path: str
+    name: str
+    qualified: str
+    exact: bool = True
+
+
+@dataclass(frozen=True)
+class TypeLookup:
+    """`TypeRelations.subtypes` の結果。`status`＝`resolved`（型が 1 つに決まった）／`ambiguous`（複数の候補）／`unresolved`／`cross_scope`。
+
+    `targets`＝問い合わせた型名の定義の候補（`ambiguous` は複数のまま）。`subtypes`＝`targets` のどれかを継承・実装する型の候補の列（パス・名前の昇順・複数あれば複数のまま）。
+    """
+
+    status: str
+    targets: tuple = ()
+    subtypes: tuple = ()
+
+
+class TypeRelations:
+    """共通の層が引く「型の継承・実装の関係」の読み取り専用の口（`FwPlugin.extract_refs` の `types`）。
+
+    同じ資料フォルダ・同じ世代（最上位フォルダ）の中だけを引き、型名の解決は共通層の規則（package／namespace・import／using・最近傍）と同じ。
+    プラグインは名前を自分で解決しない。定義の収集（1 パス目）が終わった後でないと引けないため、`FwPlugin.uses_type_relations = True` のプラグインにだけ 2 パス目で渡す。
+    """
+
+    def subtypes(self, type_name: str, from_rel: str, file_context=None, line: int | None = None, *,
+                 kind: str = "Module") -> TypeLookup:
+        """`from_rel` のファイルから見た型名 `type_name`（`file_context`・`line` はその参照の文脈）を継承・実装する型の候補を返す。"""
+        raise RuntimeError("型の関係は使えません（FwPlugin.uses_type_relations = True を宣言したプラグインの 2 パス目でだけ使えます）")
+
+
+@dataclass
+class PluginAmbiguity:
+    """プラグインが「複数の候補から 1 つに決まらなかった」ことを申告する 1 件（任意に選ばない）。
+
+    共通層が取り込みの記録（`flags`）と未解決の申告（`unresolved`・`reason=ambiguous`・`candidates`＝候補の数・`candidate_paths`＝候補のパス）に載せる。辺は張らない。
+    `kind`・`name`・`line`・`via` は決めたかった参照のもの、`source_symbol_id` は `RefCandidate` と同じ（省略＝ファイルの主体）。
+    `why`＝決められなかった理由の短い名前（任意・あれば `flags` と未解決の申告に `why` として載る）。
+    """
+
+    kind: str
+    name: str
+    line: int
+    candidates: list = field(default_factory=list)
+    via: str | None = None
+    source_symbol_id: tuple | None = None
+    why: str = ""
+
+
+@dataclass
+class PluginDefs:
+    """`FwPlugin.collect_defs` の戻り値。本体の `DefResult` へ足す定義だけ（`children`＝主体の子・`extras`＝主体以外のトップレベル）と `dropped`。"""
+
+    children: list = field(default_factory=list)
+    extras: list = field(default_factory=list)
+    dropped: list = field(default_factory=list)
+
+
+@dataclass
+class PluginRefs:
+    """`FwPlugin.extract_refs` の戻り値。本体の `RefResult` へ足す参照候補・決まらなかった申告（`PluginAmbiguity`）・`dropped`。"""
+
+    refs: list = field(default_factory=list)
+    dropped: list = field(default_factory=list)
+    ambiguous: list = field(default_factory=list)
+
+
+class FwPlugin:
+    """FW プラグインの基底（言語アナライザの結果へ FW 固有の定義・参照を足す部品）。
+
+    実装は 3 層: ①構文を拾う（本体のアナライザ）②名前・型の解決（共通層・`world_graph`）③FW の意味（プラグイン）。プラグインは名前を自分で解決せず、参照の候補
+    （名前・種別・via・行・`type_ref` などの解決の指示）を返すだけ。型の継承・実装の関係が要るときは `types`（`TypeRelations`）を引き、候補が複数なら複数のまま扱う
+    （1 つに決められなければ `PluginRefs.ambiguous` で申告し、任意に選ばない）。
+
+    登録名 `"<prefix>:<fw>"`・`languages`（対象のアナライザ名）・適用条件（`languages` ＋ `config_kinds`）・`version`・`order` を持つ。
+    入力は本体が返した `DefResult`／`RefResult`（コピー）とファイルの本文・パス。出力は追加の定義・参照と `Dropped` だけで、本体の出力を消せず、
+    他のプラグインの出力も見ない。グラフへは直接書かない。契約: docs/21-拡張の契約.md §3a。
+    """
+
+    name: str = ""
+    # 対象のアナライザ名（`Analyzer.name`）。
+    languages: frozenset = frozenset()
+    # 空＝設定の種別で絞らない。非空なら対象アナライザの `config_kind()` がこの集合に入るファイルにだけ適用する。
+    config_kinds: frozenset = frozenset()
+    version: int = 1
+    # 小さいほど先に適用する（同値は登録名の昇順）。
+    order: int = 100
+    # True のプラグインは `extract_refs` で `types`（型の継承・実装の関係）を引ける。宣言があると共通層が 2 パス目の前に全ファイルの継承・実装の宣言を集める追加の段を走らせる。
+    uses_type_relations: bool = False
+    # 空でなければ `config_signature()` のこのプラグインのタプルの末尾に足す署名の材料（宣言的なルールファイルの内容のハッシュ・ルール ID と版）。
+    signature_extra: tuple = ()
+    # True のプラグインは `collect_defs`／`extract_refs` が `ctx`（取り込み 1 回ごとに作られる dict・そのプラグイン専用）を受け取り、1 パス目の事実を 2 パス目へ渡せる。
+    # 共有のインスタンスに資料フォルダの事実を持たせない（並行・連続の取り込みで混ざる）ための口。
+    uses_build_context: bool = False
+
+    def collect_defs(self, text: str, rel_path: str, base: DefResult) -> PluginDefs:
+        """追加の定義候補（1パス目・型の関係はまだ引けない）。"""
+        return PluginDefs()
+
+    def extract_refs(self, text: str, rel_path: str, base_defs: DefResult, base_refs: RefResult,
+                     types: TypeRelations) -> PluginRefs:
+        """追加の参照候補（2パス目）。`base_defs` は本体の定義（プラグインの追加分を含まない）。"""
+        return PluginRefs()

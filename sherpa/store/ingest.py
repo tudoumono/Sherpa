@@ -72,8 +72,9 @@ def fail_close_if_extracting(run_id, *, reason: str) -> bool:
 def finish_ingest_run_and_confirm_world(run_id, world, *, status, extraction_snapshot=None,
                                         published_snapshot=None, source_doc_ids=None,
                                         sig=None, manifest=None, doc_count=None,
-                                        scan_report=None) -> dict:
+                                        scan_report=None, resolve_sig=None) -> dict:
     """run の完了確定と world 側の署名/manifest/doc_count/scan_report 確定を同一トランザクションで行う。
+    `resolve_sig`＝このグラフが使った解決範囲の設定のハッシュ（`worlds.resolve_applied_sig` へ書く・None なら更新しない）。
     `sig` が None なら world 側の UPDATE は行わない。scan_report 等の計算は呼び出し前に済ませておくこと（トランザクション内は軽量な UPDATE 2本のみ）。
     """
     _ensure()
@@ -101,6 +102,9 @@ def finish_ingest_run_and_confirm_world(run_id, world, *, status, extraction_sna
                 sets.append("last_scan_report=%s")
                 sets.append("last_scan_report_at=now()")
                 params.append(Json(scan_report))
+            if resolve_sig is not None:
+                sets.append("resolve_applied_sig=%s")
+                params.append(resolve_sig)
             params += [_KB_ID, world]
             c.execute(f"UPDATE worlds SET {', '.join(sets)} WHERE kb_id=%s AND world_id=%s", params)
         return rec

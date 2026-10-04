@@ -1,6 +1,6 @@
 """資料フォルダ(World)管理エンドポイント。3 つの router から成る:
 - `ingest_preview_router`: `GET /ingest/preview`
-- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`DELETE /worlds/{wid}`
+- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`GET`/`PUT /worlds/{wid}/resolve-settings`・`DELETE /worlds/{wid}`
 - `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`
 api.py が元の位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。`_browse_roots`/`_under_roots` は `sherpa.deps` にある。
 モジュール名が `sherpa/worlds.py` と衝突するため、api.py 側は `from sherpa.routers import worlds as worlds_routes` と別名で import する。
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import psycopg
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from sherpa import corpus_docs, doc_ledger, store, webhooks, world_admin_service, worlds
 from sherpa.deps import (
@@ -29,7 +29,7 @@ from sherpa.deps import (
     _under_roots,
 )
 from sherpa.grep_tool import valid_world
-from sherpa.ingest import background, failure_reasons
+from sherpa.ingest import background, failure_reasons, resolve_settings
 from sherpa.ingest import worker as ingest_worker
 from sherpa.preview_service import build_preview
 from sherpa.routers.graph import _GRAPH_UNAVAILABLE_MESSAGE  # /ingest/preview も同じ固定文言で 503 にする。
@@ -40,6 +40,7 @@ from sherpa.schemas import (
     WorldOptionsResponse,
     WorldRecountResponse,
     WorldReconvertResponse,
+    WorldResolveSettingsResponse,
     WorldsListResponse,
     WorldStatusResponse,
 )
@@ -154,6 +155,12 @@ class RebindReq(BaseModel):
     label: str | None = None
 
 
+class ResolveSettingsReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    copy_paths: list[str] = []
+    path_aliases: dict[str, str] = {}
+
+
 class DiffReq(BaseModel):
     path: str  # 差分チェック対象フォルダ（登録しない・読み取り専用）。
 
@@ -251,6 +258,9 @@ def _ingest_summary(wid: str, row: dict) -> dict:
     flags = flags_all[:_STATUS_FLAGS_LIMIT]
     warns = [f.get("reason") for f in flags
              if isinstance(f, dict) and f.get("action") in ("warn", "blocked") and f.get("reason")]
+    if "plugin_failed" not in warns and any(isinstance(f, dict) and f.get("reason") == "plugin_failed"
+                                            for f in flags_all):
+        warns.append("plugin_failed")   # 切り詰めの外にあっても取り込み画面の注意に必ず出す
     blocked = [{"doc": f.get("doc"), "reason": f.get("reason")} for f in flags
                if isinstance(f, dict) and f.get("action") == "blocked"
                and isinstance(f.get("doc"), str) and f.get("reason")]
@@ -400,6 +410,7 @@ def world_status(wid: str, request: Request):
         raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
     return {"ok": True, "world_id": wid, "label": row.get("label"), "root_path": row.get("root_path"),
             "last_synced_at": str(row["last_synced_at"]) if row.get("last_synced_at") else None,
+            "resolve_settings_pending": resolve_settings.pending(row),
             **summary}
 
 
@@ -514,6 +525,101 @@ def world_diff_path(req: DiffReq, request: Request):
         return {"ok": True, **world_admin_service.diff_path(req.path)}
     except world_admin_service.WorldAdminError as exc:
         raise _world_admin_http_error(exc) from exc
+
+
+def _resolve_settings_payload(wid: str, settings: dict, *, changed: bool, note: str) -> dict:
+    """設定の応答。実在しない場所の警告は、資料フォルダの root とアーカイブ展開先を見て作る（読み取りのみ）。"""
+    root = worlds.world_dir(wid)
+    warnings = (resolve_settings.warnings_for(settings, root, worlds.archives_dir(wid)) if root
+                else ["資料フォルダに接続できないため、場所が実在するかは確認できません"])
+    return {"ok": True, "world_id": wid, **settings, "warnings": warnings, "changed": changed,
+            "refresh_started": False, "note": note}
+
+
+@worlds_router.get("/worlds/{wid}/resolve-settings", tags=["資料フォルダ(World)管理"],
+                   response_model=WorldResolveSettingsResponse)
+def world_resolve_settings_get(wid: str, request: Request):
+    """資料フォルダの解決範囲の設定（COPY の取り込み元の場所・パスの別名）を返す（管理者のみ・読み取り専用）。"""
+    _require_admin(_current_user(request))
+    if not valid_world(wid):
+        raise HTTPException(422, "不正な識別子")
+    try:
+        row = store.get_world(wid)
+    except Exception as e:
+        raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
+    if not row:
+        raise HTTPException(404, "資料フォルダが見つかりません")
+    saved = resolve_settings.load(wid)
+    return _resolve_settings_payload(wid, saved, changed=False, note="")
+
+
+@worlds_router.put("/worlds/{wid}/resolve-settings", tags=["資料フォルダ(World)管理"],
+                   response_model=WorldResolveSettingsResponse)
+def world_resolve_settings_put(wid: str, req: ResolveSettingsReq, request: Request):
+    """資料フォルダの解決範囲の設定を保存する（管理者のみ・監査対象）。内容は正規化して検証し、不正（空・「..」・別名の循環）は 422。
+    実在しない場所は警告（`warnings`）として返し保存する。内容が変わったときは「今すぐ更新」と同じ経路で資料フォルダ全体の取り込み直しを起こす（別の処理が実行中なら `refresh_started=false`・更新待ち）。監査が書けなければ保存を取り消して 503。
+    """
+    u = _current_user(request)
+    _require_admin(u)
+    if not valid_world(wid):
+        raise HTTPException(422, "不正な識別子")
+    try:
+        new = resolve_settings.normalize(req.model_dump())
+    except resolve_settings.ResolveSettingsError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        if not store.get_world(wid):
+            raise HTTPException(404, "資料フォルダが見つかりません")
+        old = resolve_settings.load(wid)
+        changed = resolve_settings.signature_material(old) != resolve_settings.signature_material(new)
+        if changed and not store.set_resolve_settings(wid, None if resolve_settings.is_empty(new) else new):
+            raise HTTPException(404, "資料フォルダが見つかりません")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
+    refresh_started = False
+    if changed:
+        def _restore() -> None:
+            try:
+                store.set_resolve_settings(wid, None if resolve_settings.is_empty(old) else old)
+            except Exception:
+                _log.critical("resolve_settings restore failed world=%s", wid, exc_info=True)
+
+        # ① 監査（書けなければ保存を取り消して失敗を返す＝他の管理操作と同じ fail-closed・取り込みは起動しない）
+        try:
+            store.audit(u["uid"] if u else None, "world.resolve_settings_updated", "world", f"world:{wid}",
+                        detail={"world": wid, "before": old, "after": new}, outcome="success")
+        except Exception as e:
+            _log.critical("audit write failed for world.resolve_settings_updated – restoring settings world=%s",
+                          wid, exc_info=True)
+            _restore()
+            raise HTTPException(503, _INGEST_UNAVAILABLE_MESSAGE) from e
+        # ② 「今すぐ更新」と同じ経路・同じ排他で取り込み直しを起こす。待機扱いは別の処理が実行中（409）だけ。
+        # それ以外の失敗（受付停止の 503 など）は保存を取り消し、戻したことを監査に残して同じ状態コードを返す
+        try:
+            _run_id, joined = _dispatch(wid, "refresh", _fingerprint({}),
+                                        lambda run_id: world_admin_service.refresh(wid, run_id=run_id))
+            refresh_started = not joined
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                _restore()
+                try:
+                    store.audit(u["uid"] if u else None, "world.resolve_settings_reverted", "world", f"world:{wid}",
+                                detail={"world": wid, "restored": old, "reason": exc.status_code}, outcome="failure")
+                except Exception:
+                    _log.critical("audit write failed for world.resolve_settings_reverted world=%s", wid, exc_info=True)
+                raise
+    if not changed:
+        note = "変更はありません。"
+    elif refresh_started:
+        note = "保存しました。資料フォルダを取り込み直しています（時間がかかります）。終わるまで検索の結果が古い設定のままの場合があります。"
+    else:
+        note = ("保存しました。別の処理が実行中のため、更新が必要な状態です。"
+                "その処理が終わったら「更新」を押して取り込み直してください。")
+    payload = _resolve_settings_payload(wid, new, changed=changed, note=note)
+    payload["refresh_started"] = refresh_started
+    return payload
 
 
 @worlds_router.post("/worlds/{wid}/rebind", tags=["資料フォルダ(World)管理"],

@@ -170,6 +170,21 @@ REFS_CASES = {
     "shift_in_arithmetic_is_not_heredoc": ("echo $((1<<2))\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)], []),
     "shift_in_string_is_not_heredoc": ('echo "a<<b"\nbash real.sh\n', SH, [("INVOKES", "Batch", "real.sh", None)], []),
     "here_string_is_not_heredoc": ("cat <<<'x'\nbash real.sh\n", SH, [("INVOKES", "Batch", "real.sh", None)], []),
+    # 木で読むことで直った読み違い（複数行の文字列・コマンド置換の中のヒアドキュメント・入れ子の展開）
+    "multiline_double_quoted_string_is_not_commands": ('echo "a\n./in-string.sh\n$STR_VAR"\n./after.sh\n', SH,
+                                                       [V("STR_VAR"), ("INVOKES", "Batch", "after.sh", None)], None),
+    "multiline_single_quoted_string_is_not_commands": ("echo 'a\n./in-string.sh\n$STR_VAR'\n./after.sh\n", SH,
+                                                       [("INVOKES", "Batch", "after.sh", None)], None),
+    "heredoc_inside_quoted_command_substitution": (
+        'ANS="$(cat <<\'PY\'\n./in-body.sh\nPY\n)"\n', SH, [], [D("shell_heredoc", "PY")]),
+    "nested_expansion_default": ('echo "${A_B:-${C_D:-x}}"\n', SH, [V("A_B"), V("C_D")], None),
+    "command_in_if_condition_and_substitution": ('if ./check.sh; then echo "$(./sub.sh)"; fi\n', SH,
+                                                 [("INVOKES", "Batch", "check.sh", None), ("INVOKES", "Batch", "sub.sh", None)], None),
+    "heredoc_start_line_continuation_is_not_body": (
+        "cat <<EOF \\\n| bash other.sh\nbody\nEOF\n", SH, [("INVOKES", "Batch", "other.sh", None)],
+        [D("shell_heredoc", "EOF")]),
+    "heredoc_marker_inside_multiline_quote_is_not_a_start": (
+        "echo '\n<<EOF\nliteral\n'\n./after.sh\n", SH, [("INVOKES", "Batch", "after.sh", None)], []),
     # コマンド位置の分割・ラッパー
     "after_and_and": ("true && java -cp a.jar:b.jar com.x.Main\n", SH, [M("com.x.Main", **QJ)], None),
     "after_pipe": ("echo ok | node x.js\n", SH, [("INVOKES", "Module", "x.js", None)], None),
@@ -211,3 +226,15 @@ def test_heredoc_dropped_line_and_no_refs_inside_body():
 def test_leading_assignment_before_command_is_config_child_and_command_is_parsed():
     res = A.collect_defs("VAR=1 ./run.sh\n", SH)
     assert [(c.name, c.extra["config_value"]) for c in res.children] == [("VAR", "1")]
+
+
+def test_assignment_value_is_whole_and_array_subscript_defines_the_array():
+    res = A.collect_defs('MSG=$(echo "a b")\nALLOWED[env]=1\nARGS=(a b)\n', SH)
+    assert {c.name: c.extra["config_value"] for c in res.children} == {
+        "MSG": '$(echo "a b")', "ALLOWED": "1", "ARGS": "(a b)"}
+
+
+def test_syntax_error_is_reported_and_the_rest_is_still_read():
+    res = A.extract_refs('./a.sh\n)\n./real.sh\n', SH)
+    assert [d.reason for d in res.dropped if d.reason == "syntax_error"]
+    assert [r.name for r in res.refs] == ["a.sh", "real.sh"]

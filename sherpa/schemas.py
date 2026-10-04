@@ -1161,6 +1161,7 @@ class WorldStatusResponse(IngestSummaryFields):
     label: str | None
     root_path: str | None
     last_synced_at: str | None
+    resolve_settings_pending: bool   # 資料の探し方の設定が、最後に作ったグラフにまだ反映されていない（「更新」で取り込み直す）
 
 
 class WorldDiffResponse(BaseModel):
@@ -1175,6 +1176,23 @@ class WorldDiffResponse(BaseModel):
     changed: list[str]
     total: int
     indexed: int
+
+
+class WorldResolveSettingsResponse(BaseModel):
+    """資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）。
+
+    `copy_paths`＝COPY の取り込み元の場所（優先順・資料フォルダの root からの相対パス）。`path_aliases`＝パスの別名 → 場所。
+    `warnings` は資料フォルダの中に見つからない場所（保存は止めない）。`changed` は PUT で内容が変わったか
+    （変わると資料フォルダ全体を取り込み直す）。`refresh_started` は PUT でその取り込み直しを起こせたか（false で changed なら別の処理が実行中＝更新待ち）。GET では常に false。
+    """
+    ok: bool
+    world_id: str
+    copy_paths: list[str]
+    path_aliases: dict[str, str]
+    warnings: list[str]
+    changed: bool
+    refresh_started: bool
+    note: str
 
 
 class WorldIngestAcceptedResponse(BaseModel):

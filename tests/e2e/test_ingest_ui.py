@@ -537,3 +537,22 @@ def test_pickbtn_recovers_after_transient_status_failure_during_polling(page, we
 
     page.clock.fast_forward(3500)   # 3回目のポーリング＝復旧して running_progress が無くなる
     expect(pickbtn).to_be_enabled()
+
+
+def test_resolve_settings_save_confirms_and_shows_warning(page, web_base_url):
+    """資料の探し方の設定: 保存は確認してから送り、取り込み直しの案内と見つからない場所の警告を出す。"""
+    records = _open(page, web_base_url)
+    expect(page.locator("#resolvecard")).to_be_visible()
+    page.wait_for_load_state("networkidle")              # 設定の読み込み（GET）が終わってから入力する
+    page.once("dialog", lambda d: d.accept())
+    page.locator("#rs-copy").fill("SystemA/COPYLIB")
+    page.locator("#rs-save").click()
+    expect(page.locator("#rs-msg")).to_contain_text("取り込み直しています")
+    expect(page.locator("#rs-msg")).to_contain_text("SystemA/COPYLIB")
+    assert records["resolve_settings_put"] == [{"copy_paths": ["SystemA/COPYLIB"], "path_aliases": {}}]
+
+
+def test_unreflected_resolve_settings_stay_visible_after_reload(page, web_base_url):
+    """未反映の設定は、状況の API が返す限り画面を開き直しても「更新が必要」と出続ける。"""
+    _open(page, web_base_url, status={"resolve_settings_pending": True})
+    expect(page.locator("#list")).to_contain_text("更新が必要です")

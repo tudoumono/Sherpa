@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <RootNamespace>$(X)</RootNamespace>
+  </PropertyGroup>
+</Project>

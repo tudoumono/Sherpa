@@ -4,7 +4,7 @@
 提案書 §9「拡張面の契約表」の順（アナライザ／頭脳 provider／変換アーム／MCP ツール）で、
 行ごとに「確認した契約」または「未確認」を出力する。**アナライザ**だけは本スライスの実装対象
 （発見規約・接頭辞・拡張子衝突・版・`accepts/collect_defs/extract_refs` の戻り値型・
-`config_signature()` への反映）を実際に検査し、違反があれば非ゼロで終了する。頭脳 provider／
+`config_signature()` への反映）と**FW プラグイン**（発見・登録順・適用順・名前と対象言語の衝突・署名への載り方）を実際に検査し、違反があれば非ゼロで終了する。頭脳 provider／
 変換アーム／MCP ツールは**登録簿の実在と件数の表示だけ**を行い「未確認」と明示する（保証済みと
 言わない——契約テストは既存の seams/surface/office_md/mcp テストが担う・§9 参照）。
 """
@@ -97,6 +97,86 @@ def _report_analyzers(registry, base) -> tuple[list[str], list[str]]:
     return confirmed, violations
 
 
+def _check_fw_plugins(registry, base) -> list[str]:
+    """FW プラグイン面の契約検査（発見・登録順・適用順・名前と対象言語の衝突・署名への載り方・戻り値の型）。違反メッセージの一覧（空＝違反なし）。"""
+    violations: list[str] = []
+    try:
+        rediscovered = registry.discover_fw_plugins()
+    except registry.ExtensionAnalyzerError as e:
+        violations.append(f"FW プラグインの発見時契約違反: {e}")
+        rediscovered = ()
+    registered = registry.FW_PLUGINS
+    upstream = {p.name for p in registry._UPSTREAM_FW_PLUGINS}
+    if [p.name for p in rediscovered] != [p.name for p in registered if p.name not in upstream]:
+        violations.append(
+            "discover_fw_plugins() の結果が FW_PLUGINS の拡張プラグイン構成と一致しません"
+            f"（発見: {[p.name for p in rediscovered]}・登録済み: {[p.name for p in registered if p.name not in upstream]}）")
+
+    names = [p.name for p in registered]
+    for n in sorted({n for n in names if names.count(n) > 1}):
+        violations.append(f"FW プラグインの登録名 {n!r} が重複しています")
+    analyzer_names = {a.name for a in registry.known_analyzers()}
+    for p in registered:
+        try:   # 登録のときと同じ検証を、登録済みの全プラグインへ当てる（属性の型・値）
+            registry._validate_fw_plugin(
+                p, "upstream" if p.name in upstream else f"{p.name.partition(':')[0]}_registered", analyzer_names,
+                upstream=p.name in upstream)
+        except registry.ExtensionAnalyzerError as e:
+            violations.append(f"{p.name}: {e}")
+        if p.name in analyzer_names:
+            violations.append(f"FW プラグインの登録名 {p.name!r} がアナライザの登録名と衝突しています")
+        unknown = sorted(set(p.languages) - analyzer_names)
+        if unknown:
+            violations.append(f"{p.name}: languages に未登録のアナライザ名があります: {unknown}")
+
+    ordered = registry.fw_plugins()
+    if [p.name for p in ordered] != [p.name for p in sorted(registered, key=lambda p: (p.order, p.name))] \
+            or [p.name for p in ordered] != [p.name for p in registry.fw_plugins()]:
+        violations.append("適用順が (order, 登録名) の昇順で決定的になっていません")
+
+    sig_items = {item[0]: item for item in registry.config_signature()[2]}
+    for p in registered:
+        expect = (p.name, p.version, tuple(sorted(p.languages)), tuple(sorted(p.config_kinds)), p.order) \
+            + ((p.signature_extra,) if p.signature_extra else ())
+        if sig_items.get(p.name) != expect:
+            violations.append(f"config_signature() に FW プラグイン {p.name} の (登録名, version, languages, 適用条件, order) が載っていません")
+
+    class _EmptyTypes(base.TypeRelations):
+        def subtypes(self, type_name, from_rel, file_context=None, line=None, *, kind="Module"):
+            return base.TypeLookup(status="unresolved")
+
+    for p in registered:
+        try:
+            dr = p.collect_defs("", "x", base.DefResult())
+        except Exception as e:
+            violations.append(f"{p.name}: collect_defs() が例外を送出しました（{e!r}）")
+        else:
+            if not isinstance(dr, base.PluginDefs):
+                violations.append(f"{p.name}: collect_defs() が PluginDefs を返しませんでした（{type(dr)!r}）")
+        try:
+            rr = p.extract_refs("", "x", base.DefResult(), base.RefResult(), _EmptyTypes())
+        except Exception as e:
+            violations.append(f"{p.name}: extract_refs() が例外を送出しました（{e!r}）")
+        else:
+            if not isinstance(rr, base.PluginRefs):
+                violations.append(f"{p.name}: extract_refs() が PluginRefs を返しませんでした（{type(rr)!r}）")
+    return violations
+
+
+def _report_fw_plugins(registry, base) -> tuple[list[str], list[str]]:
+    """`(確認した契約の説明一覧, 違反一覧)`。"""
+    violations = _check_fw_plugins(registry, base)
+    ordered = registry.fw_plugins()
+    listed = "・".join(f"{p.name}(order={p.order})" for p in ordered) or "なし"
+    confirmed = [
+        f"発見・登録（`FW_PLUGINS`・登録名 '<prefix>:<fw>'・languages・version・order）・適用順 (order, 登録名) の昇順: "
+        f"登録済み FW プラグイン {len(ordered)} 件（{listed}）",
+        "登録名・対象言語（languages）の衝突なし／config_signature() に (登録名, version, languages, 適用条件, order) が載る／"
+        f"collect_defs・extract_refs が PluginDefs・PluginRefs を返す: 登録済み全 {len(ordered)} 件で確認",
+    ]
+    return confirmed, violations
+
+
 def _report_providers() -> list[str]:
     from sherpa.providers import AGENT_PROVIDERS
     return [f"登録簿の実在: `AGENT_PROVIDERS` {len(AGENT_PROVIDERS)} 件"
@@ -133,13 +213,22 @@ def main(argv: list[str] | None = None) -> int:
         from sherpa.ingest.analyzers import registry
         from sherpa.ingest.analyzers import _base as base
     except Exception as e:
-        if type(e).__name__ != "ExtensionAnalyzerError":
+        if "ExtensionAnalyzerError" not in {c.__name__ for c in type(e).__mro__}:  # FwPluginError を含む
             raise
         exit_code = 1
         discovery_ok = False
         print(f"NG: 拡張アナライザの発見時契約違反: {e}")
     else:
         confirmed, violations = _report_analyzers(registry, base)
+        for line in confirmed:
+            print(f"確認した契約: {line}")
+        if violations:
+            exit_code = 1
+            for v in violations:
+                print(f"NG: {v}")
+        print()
+        print("## FW プラグイン")
+        confirmed, violations = _report_fw_plugins(registry, base)
         for line in confirmed:
             print(f"確認した契約: {line}")
         if violations:
@@ -167,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
             print("未確認（アナライザ面の違反により未評価）")
         print()
 
-    print("NG（アナライザ面に契約違反あり）" if exit_code else "OK（アナライザ面は契約違反なし）")
+    print("NG（アナライザ面・FW プラグイン面に契約違反あり）" if exit_code else "OK（アナライザ面・FW プラグイン面は契約違反なし）")
     return exit_code
 
 

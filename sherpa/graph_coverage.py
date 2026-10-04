@@ -16,7 +16,7 @@ KIND_DOC_SEARCH_TRUNCATED = "doc_search_truncated"  # 文書側の探索（grep�
 KIND_CARD_CAP = "card_cap"                        # 近傍カードの件数・バイトの上限で切った
 KIND_GRAPH_UNAVAILABLE = "graph_unavailable"
 KIND_GRAPH_REINGEST_REQUIRED = "graph_reingest_required"
-KIND_PLUGIN_FAILED = "plugin_failed"              # FW プラグインの失敗（段階 2 から使う語）
+KIND_PLUGIN_FAILED = "plugin_failed"              # FW プラグインの失敗（`limits[].plugin` にプラグイン名。欠けはそのプラグインを直して取り込み直すまで残る）
 
 LIMIT_KINDS = (
     KIND_TIMEOUT, KIND_ROW_CAP, KIND_DEPTH, KIND_RESULT_CAP, KIND_DOC_SEARCH_TRUNCATED, KIND_CARD_CAP,
@@ -39,16 +39,49 @@ def kind_of_overload(reason: str) -> str:
     return _OVERLOAD_KIND.get(reason, KIND_ROW_CAP)
 
 
+def add_plugin_failures(coverage, failures, stage: str | None) -> None:
+    """`world_neo4j.read_plugin_failures` の結果を `plugin_failed`（プラグイン名つき）として `coverage`（`Coverage` または `as_dict` 済みの辞書）へ足す。"""
+    for f in failures:
+        if isinstance(coverage, Coverage):
+            coverage.add(KIND_PLUGIN_FAILED, stage, plugin=f["plugin"])
+        else:
+            add_limit(coverage, KIND_PLUGIN_FAILED, stage, plugin=f["plugin"])
+
+
+def _has_overload(coverage) -> bool:
+    limits = coverage.limits if isinstance(coverage, Coverage) else coverage["limits"]
+    return any(lim["kind"] in (KIND_TIMEOUT, KIND_ROW_CAP) for lim in limits)
+
+
+def attach_plugin_failures(coverage, read, stage: str | None) -> None:
+    """取り込み時に失敗した FW プラグイン（`read()`＝`world_neo4j.read_plugin_failures` の結果）を `coverage` へ足す。
+
+    すでに時間切れ・件数の天井で不完全なときは読まない。この読み取り自体の時間切れ・天井は、その理由で申告する（失敗にしない）。
+    """
+    from .ingest.world_neo4j import GraphQueryOverloadError  # 遅延 import（このモジュールは他を import しない約束）
+    if _has_overload(coverage):
+        return
+    try:
+        add_plugin_failures(coverage, read(), stage)
+    except GraphQueryOverloadError as e:
+        if isinstance(coverage, Coverage):
+            coverage.add(kind_of_overload(e.reason), stage)
+        else:
+            add_limit(coverage, kind_of_overload(e.reason), stage)
+
+
 class Coverage:
     """読み取りの途中で見つかった打ち切りを集める入れ物。同じ `(kind, stage)` は 1 件にまとめる。"""
 
     def __init__(self) -> None:
         self.limits: list[dict] = []
 
-    def add(self, kind: str, stage: str | None = None) -> None:
+    def add(self, kind: str, stage: str | None = None, plugin: str | None = None) -> None:
         if kind not in LIMIT_KINDS:
             raise ValueError(f"unknown coverage kind: {kind}")
         item = {"kind": kind} if stage is None else {"kind": kind, "stage": stage}
+        if plugin is not None:
+            item["plugin"] = plugin
         if item not in self.limits:
             self.limits.append(item)
 
@@ -70,11 +103,13 @@ class Coverage:
         return out
 
 
-def add_limit(coverage: dict, kind: str, stage: str | None = None) -> None:
-    """`Coverage.as_dict` 済みの辞書へ打ち切りを 1 件足し、`complete` を落とす（`omitted` は分からないので null にする）。"""
+def add_limit(coverage: dict, kind: str, stage: str | None = None, plugin: str | None = None) -> None:
+    """`Coverage.as_dict` 済みの辞書へ打ち切りを 1 件足し、`complete` を落とす（`omitted` は分からないので null にする）。`plugin`＝`plugin_failed` の FW プラグイン名。"""
     if kind not in LIMIT_KINDS:
         raise ValueError(f"unknown coverage kind: {kind}")
     item = {"kind": kind} if stage is None else {"kind": kind, "stage": stage}
+    if plugin is not None:
+        item["plugin"] = plugin
     if item not in coverage["limits"]:
         coverage["limits"].append(item)
     coverage["complete"] = False

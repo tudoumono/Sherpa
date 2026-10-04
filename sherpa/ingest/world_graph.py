@@ -22,9 +22,10 @@ from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
 from .. import corpus_docs, doc_text, scope_infer, text_encoding, worlds
-from . import importance, text_kind
+from . import importance, resolve_settings, text_kind
 from .analyzers import registry as analyzer_registry
-from .analyzers._base import FileContext
+from .analyzers import _vb_project as vb_project
+from .analyzers._base import FileContext, RefResult, TypeCandidate, TypeLookup, TypeRelations
 
 
 def _scope_meta(rel: str) -> dict:
@@ -110,6 +111,12 @@ def _resolve_table(table_defs, name, ref_rel):
     return ranked[0][0], ranked[0][1], ""
 
 
+class _QualifiedIndex(dict):
+    """完全修飾名の索引。`project_of`（ソース rel → 属する VB.NET プロジェクト）を持ち、同じ完全修飾名の候補が複数あるとき参照元と同じプロジェクトの候補を先にする。"""
+
+    project_of: dict = {}
+
+
 def _resolve_qualified(qualified_defs, kind, name, ref_rel):
     """完全修飾名の解決: `qualified_defs[(kind,name)]`（`[(rel,実名), ...]`）を同一 top_scope に絞り、パス距離で最近傍を選ぶ。
 
@@ -123,6 +130,11 @@ def _resolve_qualified(qualified_defs, kind, name, ref_rel):
     same = [(r, nm) for r, nm in cands if _top(r) == _top(ref_rel)]
     if not same:
         return None, None, "cross_scope"
+    owner = getattr(qualified_defs, "project_of", None)
+    mine = owner.get(ref_rel) if owner else None
+    if mine is not None and len(same) > 1:           # 同じ完全修飾名が複数のプロジェクトにあれば、参照元と同じプロジェクトの定義を先にする
+        own = [pair for pair in same if owner.get(pair[0]) == mine]
+        same = own or same
     ranked = sorted(same, key=lambda pair: _tree_distance(ref_rel, pair[0]))
     best = _tree_distance(ref_rel, ranked[0][0])
     if sum(1 for r, _ in same if _tree_distance(ref_rel, r) == best) > 1:
@@ -231,6 +243,113 @@ def _resolve_dotted_type_name(qualified_defs, kind, name, ref_rel, file_context,
     return None, None, "unresolved"
 
 
+def _qualified_all(qualified_defs, kind, name, ref_rel) -> list:
+    """`_resolve_qualified` が曖昧にした候補も含めて返す（同一 top_scope で最短距離の `(rel, 実名, 完全修飾名)` 全部・昇順）。"""
+    same = [(r, nm) for r, nm in qualified_defs.get((kind, name), []) if _top(r) == _top(ref_rel)]
+    if not same:
+        return []
+    best = min(_tree_distance(ref_rel, r) for r, _ in same)
+    return sorted({(r, nm, name) for r, nm in same if _tree_distance(ref_rel, r) == best})
+
+
+def _dotted_all(qualified_defs, kind, name, ref_rel, file_context, parents: bool) -> list:
+    """`_resolve_dotted_type_name` と同じ探し方で、曖昧にした候補も含めて返す。"""
+    segs = name.split(".")
+    chain = _namespace_chain(file_context.package, parents)
+    for imp in file_context.imports:
+        if imp.kind == "alias" and imp.alias == segs[0]:
+            segs = imp.name.split(".") + segs[1:]
+            chain = [None]
+            break
+    for n in range(len(segs), 0, -1):
+        prefix = ".".join(segs[:n])
+        for ns in chain:
+            cands = _qualified_all(qualified_defs, kind, _join_fqn(ns, prefix), ref_rel)
+            if cands:
+                return cands
+    return []
+
+
+def _type_candidates(qualified_defs, defs, kind, name, ref_rel, file_context, parents: bool, *, qualified: bool = False):
+    """型名 `name` の解決先の候補を、`_resolve_type_name` と同じ順序・規則で全部返す（曖昧なら複数のまま）。戻りは `([(rel, 実名, 完全修飾名)], status)`。
+
+    `status` は `''`（1 件に決まった）／`'ambiguous'`／`'cross_scope'`／`'unresolved'`。`file_context` が無いときは同名の最近傍（`_resolve_nearest` と同じ）。
+    """
+    def done(cands):
+        return cands, ("" if len(cands) == 1 else "ambiguous")
+
+    if "." in name and (qualified or file_context is None):   # 修飾のある名前は `_link` の完全修飾の入口と同じ規則（単純名へ倒さない）
+        if parents and file_context is not None:              # C#・VB.NET＝入れ子の型・別名を `_resolve_dotted_type_name` と同じに
+            cands = _dotted_all(qualified_defs, kind, name, ref_rel, file_context, parents)
+        else:
+            cands = _qualified_all(qualified_defs, kind, name, ref_rel)
+        return (cands, "" if len(cands) == 1 else "ambiguous") if cands else ([], "unresolved")
+    if file_context is None:
+        same = [r for r in defs.get((kind, name), []) if _top(r) == _top(ref_rel)]
+        if not same:
+            return [], ("cross_scope" if defs.get((kind, name)) else "unresolved")
+        best = min(_tree_distance(ref_rel, r) for r in same)
+        return done(sorted({(r, name, name) for r in same if _tree_distance(ref_rel, r) == best}))
+    for imp in file_context.imports:
+        if imp.static or imp.kind == "wildcard":
+            continue
+        if (imp.kind == "alias" and imp.alias == name) or (imp.kind == "single" and imp.name.rsplit(".", 1)[-1] == name):
+            cands = _qualified_all(qualified_defs, kind, imp.name, ref_rel)
+            return done(cands) if cands else ([], "unresolved")
+    for prefix in _namespace_chain(file_context.package, parents):
+        cands = _qualified_all(qualified_defs, kind, _join_fqn(prefix, name), ref_rel)
+        if cands:
+            return done(cands)
+    hits: set = set()
+    for imp in file_context.imports:
+        if imp.kind == "wildcard" and not imp.static:
+            hits.update(_qualified_all(qualified_defs, kind, _join_fqn(imp.name, name), ref_rel))
+    if hits:
+        return done(sorted(hits))
+    others = defs.get((kind, name))
+    return [], ("cross_scope" if others and not any(_top(r) == _top(ref_rel) for r in others) else "unresolved")
+
+
+class _TypeRelationsImpl(TypeRelations):
+    """`TypeRelations` の実装。`records`＝全ファイルの継承・実装の宣言（本体のアナライザの参照のうち `via` が `extends`／`implements`）。
+
+    宣言ごとの継承元の解決は `_type_candidates`（共通層の規則）で行い、引くたびに計算せず最初の問い合わせで索引にする。
+    """
+
+    def __init__(self, qualified_defs, defs, records, parents_of):
+        self._qd, self._defs, self._records, self._parents_of = qualified_defs, defs, records, parents_of
+        self._by_target: dict | None = None
+
+    @staticmethod
+    def _candidate(rel, actual, qkey, exact=True) -> TypeCandidate:
+        return TypeCandidate(path=rel, name=actual, qualified=qkey or actual, exact=exact)
+
+    def _index(self) -> dict:
+        if self._by_target is None:
+            idx: dict = {}
+            for r in self._records:
+                targets, _status = _type_candidates(self._qd, self._defs, r["kind"], r["name"], r["rel"], r["ctx"],
+                                                    self._parents_of(r["rel"]), qualified=r["qualified"])
+                for t in targets:
+                    idx.setdefault((r["kind"], *t), []).append((r, len(targets) == 1))
+            self._by_target = idx
+        return self._by_target
+
+    def subtypes(self, type_name, from_rel, file_context=None, line=None, *, kind="Module") -> TypeLookup:
+        ctx = file_context.at(line) if (file_context is not None and line is not None) else file_context
+        targets, status = _type_candidates(self._qd, self._defs, kind, type_name, from_rel, ctx, self._parents_of(from_rel),
+                                           qualified="." in type_name)
+        subs: dict = {}   # (rel, 実名, 完全修飾名) -> 宣言の解決が曖昧でなかったか
+        for t in targets:
+            for rec, exact in self._index().get((kind, *t), []):
+                key = (rec["rel"], rec["actual"], rec["qkey"] or "")
+                subs[key] = exact and subs.get(key, True)
+        return TypeLookup(
+            status="resolved" if status == "" else status,
+            targets=tuple(self._candidate(*t) for t in targets),
+            subtypes=tuple(self._candidate(k[0], k[1], k[2], subs[k]) for k in sorted(subs)))
+
+
 def _resolve_nearest_keyed(index, analyzer_name, kind, name, ref_rel):
     """単純名での children 解決（手続き型言語の関数呼び出し解決共通）。
 
@@ -297,6 +416,34 @@ def _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name):
     return candidate if rel_name.get(candidate) == (kind, name) else None
 
 
+def _resolve_by_copy_paths(defs, kind, name, ref_rel, copy_paths):
+    """最近傍で決まらない COPY を、設定の `copy_paths` を先頭から試して決める。最初に一意に決まった prefix を採用する。
+
+    参照元と同じ最上位フォルダ（世代）の prefix の下にある定義だけを候補にする。1 つの prefix の下に複数あれば、その prefix は決まらない扱いで次へ進む。
+    戻りは `rel | None`。
+    """
+    cands = sorted(set(defs.get((kind, name), [])))
+    top = _top(ref_rel)
+    for prefix in copy_paths:
+        if prefix.split("/", 1)[0] != top:
+            continue
+        hits = [r for r in cands if r.startswith(prefix + "/") and _top(r) == top]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def _resolve_include_alias(rel_name, aliases, include_path, ref_rel, kind, name):
+    """`include_path` の先頭が設定の別名なら prefix に置き換え、同じ最上位フォルダの実在の定義に一致するときだけ `rel` を返す。"""
+    expanded = resolve_settings.expand_alias(include_path, aliases)
+    if expanded is None:
+        return None
+    candidate = posixpath.normpath(expanded)
+    if _top(candidate) != _top(ref_rel):
+        return None
+    return candidate if rel_name.get(candidate) == (kind, name) else None
+
+
 def _build_path_suffix_index(rel_name):
     """`_resolve_path_suffix` 用の事前索引 `(label, top_scope, 末尾パス) -> [rel, ...]` を Pass1 完了直後に 1 回だけ構築する。
 
@@ -343,6 +490,11 @@ EDGE_RULES = frozenset({
     "schema_unqualified",    # schema を書いた参照が schema の記載が無い定義に一致
     "table_name",            # schema を書かない参照の表名の一致
     "nearest_name",          # 同じ最上位フォルダの最近傍の同名
+    "di_qualifier",          # DI の注入先の実装: 名前の指定（`@Qualifier`／`@Named`／`@Resource(name=)`）が bean 名に一致
+    "di_primary",            # DI の注入先の実装: `@Primary` の付いた実装
+    "di_single_impl",        # DI の注入先の実装: 実装が 1 つだけ
+    "copy_path_setting",     # 最近傍で決まらない COPY を、資料フォルダの設定の `copy_paths` の先頭から試して一意に決めた
+    "path_alias_setting",    # 資料フォルダの設定の `path_aliases` で別名を prefix に置き換えた実在の相対パスに一致
     "dictionary_match",      # 資料の本文と定義名の辞書突合（言及）
 })
 
@@ -365,6 +517,12 @@ def _source_dedupe_key(src: dict) -> tuple:
             (fd["file"], fd["key"]) if fd else None, src.get("locator"))
 
 
+def _source_place_key(src: dict) -> tuple:
+    """根拠の位置（`via` を除く）。"""
+    fd = src.get("from_def")
+    return (src["doc_id"], src["line"], src.get("rule"), (fd["file"], fd["key"]) if fd else None, src.get("locator"))
+
+
 def _source_sort_key(src: dict) -> tuple:
     fd = src.get("from_def")
     return (analyzer_registry.via_priority_rank(src.get("via")), src["doc_id"], src["line"],
@@ -382,6 +540,10 @@ def cap_sources(sources: list, first: dict | None = None) -> tuple:
         if k not in seen:
             seen.add(k)
             uniq.append(src)
+    # 注入（`inject`）は同じ位置の宣言型（`field_type`）の格上げ: 同じ位置に `inject` の根拠があれば `field_type` の根拠は畳む。
+    injected = {_source_place_key(u) for u in uniq if u.get("via") == "inject"}
+    if injected:
+        uniq = [u for u in uniq if not (u.get("via") == "field_type" and _source_place_key(u) in injected)]
     uniq.sort(key=_source_sort_key)
     if first is not None:
         fk = _source_dedupe_key(first)
@@ -718,13 +880,26 @@ def _find_copy_cycles(nodes: dict, edges: list) -> list:
     return sorted(out)
 
 
-def build_world(world_dir, world_id: str, *, files=None):
+def plugin_failures_from_flags(flags) -> list:
+    """`build_world` の `flags` から FW プラグインの失敗（`[{plugin, files, why}]`・プラグイン名順）を取り出す（`world_neo4j.load_world` が同じ世代で保存する）。"""
+    return sorted(({"plugin": f["plugin"], "files": f.get("files"), "why": f.get("why")}
+                   for f in flags if f.get("reason") == "plugin_failed" and f.get("plugin")),
+                  key=lambda x: x["plugin"])
+
+
+def build_world(world_dir, world_id: str, *, files=None, resolve_config=None):
     """資料フォルダ（登録ディレクトリ）を `(nodes, edges, flags)` にする。パス同一性＋同 top_scope 内の最近傍解決。
 
     骨格（Pass1/Pass2＝COPIES/CONTAINS/INVOKES/ACCESSES）と言及エッジ（Pass3）だけを決定的に構築する。
     `files`（省略可）: 呼び出し側が `scope_infer.safe_files(world_dir)` を materialize 済みなら渡す（再度歩かない）。
     `_重要度.txt` はここで除外する。
+    `resolve_config`（省略可）: 資料フォルダの解決範囲の設定 `{copy_paths, path_aliases}`（`resolve_settings` で正規化済み）。
+    最近傍で決まらない COPY を `copy_paths` で、`#include` の別名を `path_aliases` で解く。無ければ今までの解決だけ。
     """
+    from .analyzers import _ts
+    _ts.require()   # Tree-sitter の本体と文法が読めなければ、ここで取り込みを失敗させる（ファイルごとの失敗に散らさない）
+    copy_paths = list((resolve_config or {}).get("copy_paths") or [])
+    path_aliases = dict((resolve_config or {}).get("path_aliases") or {})
     entries = files if files is not None else scope_infer.safe_files(
         world_dir, also=worlds.archives_dir(world_id))
     # 秘匿ファイル（環境変数ファイル系・秘密鍵系・credentials 等）はグラフ取り込みでも読まない。
@@ -734,14 +909,18 @@ def build_world(world_dir, world_id: str, *, files=None):
              and not text_kind.is_sensitive(PurePosixPath(rel).name, PurePosixPath(rel).suffix.lower())]
 
     defs: dict = {}            # (label, NAME) -> [rel, ...]
-    qualified_defs: dict = {}  # (label, cid_key) -> [(rel, 実名), ...]（cid_key が付く定義は常時登録）
+    qualified_defs = _QualifiedIndex()  # (label, cid_key) -> [(rel, 実名), ...]（cid_key が付く定義は常時登録）
     rel_name: dict = {}        # rel -> (label, NAME)  ＝ファイルの主体名
+    def_qkey: dict = {}        # (rel, 子の識別子|None=主体) -> 完全修飾名（型の関係の候補が持つ）
     symbol_cids: dict = {}     # (rel, cid_key) -> 定義ノード（children）の cid  ＝`RefCandidate.source_symbol_id` の解決先
     texts: dict = {}           # rel -> (text, analyzer)
     nodes: dict = {}           # cid -> node
     edges: list = []
     link_edges: list = []      # Pass2 の解決済みエッジ（集約前のステージング）
     flags: list = []
+    fw_build_ctx: dict = {}    # FW プラグイン名 -> その取り込み 1 回だけの作業領域（`uses_build_context`）
+    fw_ctx: dict = {}          # rel -> ([適用する FW プラグイン], 本体の DefResult)（Pass2 でも同じ本体の定義を渡す）
+    plugin_failed: dict = {}   # FW プラグイン名 -> {"files": {rel}, "from": 最初の rel, "why": 理由}
     # 言及突合の単純名エイリアス: (label, DefItem.name) -> [(rel, DefItem.key), ...]。
     # `key`（cid_key）が `name`（表示名）と異なる子定義（コピーブックの `GROUP.ITEM` 等）だけを登録する。
     mention_aliases: dict = {}
@@ -756,6 +935,46 @@ def build_world(world_dir, world_id: str, *, files=None):
     # `key_kind`（"property"/"bean"/"action"/"mapper"/"url"/"env"）を索引キーに含め、同じ裸キーの別種別を同一視しない。
     config_key_index: dict = {}
     global_imports: dict = {}  # (アナライザ名, 最上位フォルダ) -> [ImportItem, ...]（`global using` など世代内の同じ言語の全ファイルへ効く import）
+    # VB.NET のプロジェクト設定（`.vbproj`・`Directory.Build.props`）。ソース rel -> 当てたプロジェクト。
+    # 当てたプロジェクトのソースの型・手続きは、完全修飾名の索引に本当の名前（`<RootNamespace>.…`）だけで載せる（ノードの識別子は変えない）。
+    vb_bound: dict = {}
+    qualified_defs.project_of = vb_bound
+    vb_projects: list = []
+    vb_props: dict = {}
+
+    def _vb_flag(rel, why, snippet):
+        flags.append({"reason": "dropped_syntax", "analyzer": "vb", "from": rel, "why": why, "line": 1, "snippet": snippet[:200]})
+
+    vb_proj_dirs = {str(PurePosixPath(rel).parent) if "/" in rel else ""
+                    for _rp, rel in files if rel.lower().endswith(vb_project.VBPROJ_EXT)}
+    for rp, rel in files:
+        low = rel.lower()
+        is_proj, is_props = low.endswith(vb_project.VBPROJ_EXT), low.rsplit("/", 1)[-1] == vb_project.PROPS_NAME
+        if not (is_proj or is_props):
+            continue
+        if is_props:                                      # 当てはめる `.vbproj` の祖先（自分のフォルダを含む）にあたる props だけ読む
+            pdir = str(PurePosixPath(rel).parent) if "/" in rel else ""
+            if not any(pdir == "" or d == pdir or d.startswith(pdir + "/") for d in vb_proj_dirs):
+                continue
+        try:
+            if rp.stat().st_size > text_kind.MAX_BYTES:
+                raise ValueError("size_exceeded")
+            vb_text = vb_project.decode_xml(rp.read_bytes())
+            parsed = vb_project.parse_vbproj(rel, vb_text) if is_proj else vb_project.parse_props(rel, vb_text)
+        except (OSError, ValueError, RecursionError) as e:   # 読めない設定は当てはめの「止め」にして申告する（外側の設定へは倒さない）
+            _vb_flag(rel, "vbproj_unreadable", str(e) if isinstance(e, ValueError) else type(e).__name__)
+            parsed = vb_project.broken_project(rel) if is_proj else vb_project.PropsRoot(declared=True)
+        if is_proj:
+            vb_projects.append(parsed)
+        else:
+            vb_props[str(PurePosixPath(rel).parent) if "/" in rel else ""] = parsed
+        for v in parsed.unevaluated:
+            _vb_flag(rel, "vbproj_unevaluated", v)
+        for v in getattr(parsed, "outside", ()):
+            _vb_flag(rel, "vbproj_include_outside", v)
+        for v in getattr(parsed, "dropped_imports", ()):
+            _vb_flag(rel, "vbproj_import_alias", v)
+    vb_index = vb_project.ProjectIndex([vb_project.resolve_root(p, vb_props) for p in vb_projects])
 
     def _def(label, name, rel):
         defs.setdefault((label, name), []).append(rel)
@@ -775,6 +994,9 @@ def build_world(world_dir, world_id: str, *, files=None):
         skip すると完全修飾名参照が登録漏れになる）。
         """
         if cid_key is not None:
+            proj = vb_bound.get(rel)
+            if proj is not None and proj.root_namespace:      # VB.NET のプロジェクトのソースは本当の完全修飾名（Root Namespace つき）だけ
+                cid_key = f"{proj.root_namespace}.{cid_key}"
             qualified_defs.setdefault((label, cid_key), []).append((rel, actual_name))
 
     def _sanitized_extra(analyzer_name, rel, label, name, base_keys, extra):
@@ -788,6 +1010,12 @@ def build_world(world_dir, world_id: str, *, files=None):
         flags.append({"reason": "reserved_key_in_extra", "analyzer": analyzer_name, "from": rel,
                       "label": label, "name": name, "keys": sorted(bad)})
         return {}
+
+    def _note_plugin_failures(rel, failures):
+        """適用時に例外を出した FW プラグインを集計する（最後に 1 プラグイン 1 件の `plugin_failed` として `flags` へ出す）。"""
+        for f in failures:
+            rec = plugin_failed.setdefault(f.plugin, {"files": set(), "from": rel, "why": f"{f.phase}: {f.why}"})
+            rec["files"].add(rel)
 
     def _flag_dropped(analyzer_name, rel, dropped):
         """`Dropped`（解析せず落とした構文）を `flags` へ記録する（黙って消さない）。"""
@@ -810,6 +1038,7 @@ def build_world(world_dir, world_id: str, *, files=None):
             nodes[child_cid] = {**child_base, **child_extra}
             _index_def(child.label, child.key, rel)   # children も解決対象にする
             symbol_cids[(rel, child.key)] = child_cid
+            def_qkey[(rel, child.key)] = child.resolve_key
             _index_qualified(child.label, child.resolve_key, rel, child.key)
             if child.key != child.name:                # 修飾名≠表示名＝言及辞書に単純名でも登録
                 mention_aliases.setdefault((child.label, child.name), []).append((rel, child.key))
@@ -863,7 +1092,21 @@ def build_world(world_dir, world_id: str, *, files=None):
             continue
         # 受理済み（拡張子一致＋accepts 通過）なら主体の有無に関わらず Pass2 を通す（主体なしファイルも dropped_syntax 検知の対象）。
         texts[rel] = (rp, analyzer, hashlib.sha1(raw).hexdigest())   # 本文は保持しない（Pass2 で読み直す＝メモリを有界化）・指紋で同一性を照合
+        if analyzer.name == "vb" and rel.lower().endswith(".vb") and vb_index:
+            proj, ambiguous = vb_index.project_for(rel)
+            if proj is not None:
+                vb_bound[rel] = proj
+            elif ambiguous:                               # 同じフォルダに当たり得る .vbproj が複数＝当てずに申告する
+                flags.append({"reason": "dropped_syntax", "analyzer": "vb", "from": rel,
+                              "why": "vbproj_ambiguous", "line": 1, "snippet": ", ".join(ambiguous)[:200]})
         defres = analyzer.collect_defs(text, rel)
+        fw_here = analyzer_registry.applicable_fw_plugins(analyzer, text, rel)
+        if fw_here:                                       # FW プラグイン: 本体の定義へ追加分を足す（失敗は本体の結果を残して申告）
+            base_defres = defres
+            defres, pfails = analyzer_registry.apply_fw_defs(fw_here, text, rel, base_defres, fw_build_ctx)
+            _note_plugin_failures(rel, pfails)
+            fw_failed = {f.plugin for f in pfails}
+            fw_ctx[rel] = ([p for p in fw_here if p.name not in fw_failed], base_defres)
         for imp in analyzer.global_imports(text, rel):
             global_imports.setdefault((analyzer.name, _top(rel)), []).append(imp)
         _flag_dropped(analyzer.name, rel, defres.dropped)
@@ -875,6 +1118,7 @@ def build_world(world_dir, world_id: str, *, files=None):
             continue
         _def(defres.primary.label, defres.primary.name, rel)
         _index_qualified(defres.primary.label, defres.primary.resolve_key, rel, defres.primary.name)
+        def_qkey[(rel, None)] = defres.primary.resolve_key
         prim_cid = _cid(defres.primary.label, world_id, rel, defres.primary.name)
         prim_base = {**_node(defres.primary.label, world_id, rel, defres.primary.name,
                              value=defres.primary.value), "analyzer": analyzer.name}
@@ -963,6 +1207,7 @@ def build_world(world_dir, world_id: str, *, files=None):
         absolute = bool(extra.pop("absolute", False))
         qualified = (bool(extra.pop("qualified", False)) and "." in name) or absolute
         type_ref = bool(extra.pop("type_ref", False))
+        rule_hint = extra.pop("resolution_rule", None)    # FW プラグインが解決の根拠として付ける規則名（`EDGE_RULES` の名前だけ）
         chain_parents = _analyzer_parents(analyzer_name) if type_ref else None
         requires_context = _analyzer_requires_context(analyzer_name) if type_ref else False
 
@@ -997,6 +1242,10 @@ def build_world(world_dir, world_id: str, *, files=None):
             # `#include "path"` の 1 段目: 相対パス完全一致（同一 top_scope 内）。`path_exact` の参照は、一致しなければ未解決として申告する
             # （basename の最近傍へ倒さない）。それ以外は 2 段目（拡張子込み basename の最近傍）へ。
             rel = _resolve_include_relpath(rel_name, ref_rel, include_path, kind, name)
+            if rel is None and path_aliases:
+                rel = _resolve_include_alias(rel_name, path_aliases, include_path, ref_rel, kind, name)
+                if rel is not None:
+                    rule = "path_alias_setting"
             if rel is None:
                 if path_exact:
                     _flag("unresolved_qualifier", include_path)
@@ -1005,7 +1254,7 @@ def build_world(world_dir, world_id: str, *, files=None):
                 if status:
                     _flag(status, name)
                     return
-            else:
+            elif rule != "path_alias_setting":
                 rule = "path_exact"
         elif kind == "Table":
             schema_name, simple_name = getattr(name, "schema", None), getattr(name, "simple", name)
@@ -1058,6 +1307,11 @@ def build_world(world_dir, world_id: str, *, files=None):
                     status = alt_status
                 else:
                     rel, resolved_name, status = alt_rel, alt_key, ""
+            if status and etype == "COPIES" and copy_paths:
+                # 最近傍で決まらない COPY: 設定の `copy_paths` を先頭から試す。決まらなければ元の状態（未解決・曖昧）のまま申告する
+                alt_rel = _resolve_by_copy_paths(defs, kind, name, ref_rel, copy_paths)
+                if alt_rel is not None:
+                    rel, status, rule = alt_rel, "", "copy_path_setting"
             if status:                                    # ''=解決／ambiguous/cross_scope/unresolved は flag
                 _flag(status, name)
                 return
@@ -1067,6 +1321,11 @@ def build_world(world_dir, world_id: str, *, files=None):
         edge = {"type": etype, "src": edge_src, "dst": edge_dst,
                "doc": ref_rel, "line": line, "status": "active"}
         _apply_extra(edge, etype, ref_rel, analyzer_name, extra)
+        if rule_hint is not None:
+            if rule_hint in EDGE_RULES:
+                rule = rule_hint
+            else:
+                flags.append({"reason": "unknown_rule", "analyzer": analyzer_name, "from": ref_rel, "rule": str(rule_hint)})
         edge["_rule"], edge["_from_def"] = rule, from_def
         link_edges.append(edge)
 
@@ -1100,6 +1359,61 @@ def build_world(world_dir, world_id: str, *, files=None):
     unresolved_by_rel: dict = {}   # rel -> 未解決の申告（ファイルの主体ノードへ保存する）
     unresolved_subject: dict = {}  # rel -> 主体ノードの cid
 
+    def _with_global_imports(analyzer, rel, file_context):
+        """`file_context` へ、同じ世代・同じ言語の全ファイルへ効く import（`global using` など）と、VB.NET のプロジェクト設定
+        （`.vbproj` の Import・Root Namespace）を足す。本体の解決・FW プラグイン・型の関係の段が同じ文脈を使う。"""
+        if file_context is None:
+            return file_context
+        if global_imports.get((analyzer.name, _top(rel))):
+            def _key(i):
+                return (i.kind, i.name, i.alias, i.static, i.scope, i.is_global)   # 有効範囲が違う同名の import は別物（namespace 内の `using` と `global using`）
+            seen = {_key(i) for i in file_context.imports}
+            extra_imports = [i for i in global_imports[(analyzer.name, _top(rel))] if _key(i) not in seen]
+            file_context = FileContext(package=file_context.package, imports=file_context.imports + extra_imports,
+                                       namespaces=file_context.namespaces)
+        proj = vb_bound.get(rel)
+        if proj is not None:
+            file_context = vb_project.apply_project(file_context, proj)
+        return file_context
+
+    # Pass 2 の前の段: 型の継承・実装の関係を使う FW プラグインがあるときだけ、全ファイルの継承・実装の宣言（本体の参照のうち `via` が `extends`／`implements`）を
+    # 集めて、プラグインへ渡す読み取り専用の口（`TypeRelations`）にする。宣言の継承元の解決は `_type_candidates`（`_link` と同じ規則）。
+    type_relations = None
+    type_langs = {lang for plugins, _base in fw_ctx.values() for p in plugins if p.uses_type_relations for lang in p.languages}
+    if type_langs:   # 継承・実装は同じ言語の中で引く前提＝型の関係を使うプラグインの `languages` のアナライザのファイルだけ集める
+        type_records: list = []
+        for t_rel, (t_rp, t_analyzer, t_sha) in texts.items():
+            if t_analyzer.name not in type_langs:
+                continue
+            try:
+                if t_rp.stat().st_size > text_kind.MAX_BYTES:
+                    flags.append({"doc": t_rel, "reason": "changed_between_passes", "action": "blocked"})
+                    continue
+                t_text, t_raw = corpus_docs.read_full_text_and_raw(t_rp)
+            except OSError:
+                flags.append({"doc": t_rel, "reason": "unreadable_code_file", "action": "blocked"})   # 型の候補が欠けたグラフを確定させない
+                continue
+            if hashlib.sha1(t_raw).hexdigest() != t_sha:
+                flags.append({"doc": t_rel, "reason": "changed_between_passes", "action": "blocked"})
+                continue
+            if t_rel not in rel_name:
+                continue
+            t_res = t_analyzer.extract_refs(t_text, t_rel)
+            t_ctx = _with_global_imports(t_analyzer, t_rel, t_res.file_context)
+            for r in t_res.refs:
+                ex = r.extra or {}
+                if ex.get("via") not in ("extends", "implements") or r.reverse:
+                    continue
+                sub_actual, sub_qkey = rel_name[t_rel][1], def_qkey.get((t_rel, None))
+                if r.source_symbol_id is not None and r.source_symbol_id[0] == t_rel and r.source_symbol_id in symbol_cids:
+                    sub_actual, sub_qkey = r.source_symbol_id[1], def_qkey.get(r.source_symbol_id)
+                type_records.append({
+                    "rel": t_rel, "qkey": sub_qkey, "actual": sub_actual, "kind": r.kind, "name": r.name,
+                    "ctx": t_ctx.at(r.line) if t_ctx is not None else None, "qualified": bool(ex.get("qualified"))})
+        type_relations = _TypeRelationsImpl(
+            qualified_defs, defs, type_records,
+            lambda rel: bool(texts[rel][1].resolves_parent_namespaces) if rel in texts else False)
+
     for rel, (rp, analyzer, raw_sha1) in texts.items():
         # Pass1 は本文を保持しない（コード総量に比例したメモリを持たない）。Pass2 で 1 回読み直し、失敗時は Pass1 と同じ
         # fail-closed（blocked flag・部分グラフを確定しない）で扱う。
@@ -1117,13 +1431,16 @@ def build_world(world_dir, world_id: str, *, files=None):
             flags.append({"doc": rel, "reason": "changed_between_passes", "action": "blocked"})
             continue
         ref_result = analyzer.extract_refs(text, rel)
+        plugin_ambiguities: list = []
+        if rel in fw_ctx and fw_ctx[rel][0]:
+            # プラグインへ渡す `file_context` は、世代内の全ファイルへ効く import（`global using` など）を足した後のもの
+            ref_result = RefResult(refs=ref_result.refs, dropped=ref_result.dropped,
+                                   file_context=_with_global_imports(analyzer, rel, ref_result.file_context))              # FW プラグイン: 本体の参照へ追加分を足す（失敗は本体の結果を残して申告）
+            ref_result, pfails, plugin_ambiguities = analyzer_registry.apply_fw_refs(
+                fw_ctx[rel][0], text, rel, fw_ctx[rel][1], ref_result, type_relations, fw_build_ctx)
+            _note_plugin_failures(rel, pfails)
         _flag_dropped(analyzer.name, rel, ref_result.dropped)
-        file_context = ref_result.file_context
-        if file_context is not None and global_imports.get((analyzer.name, _top(rel))):
-            seen = {(i.kind, i.name, i.alias, i.static) for i in file_context.imports}
-            extra_imports = [i for i in global_imports[(analyzer.name, _top(rel))] if (i.kind, i.name, i.alias, i.static) not in seen]
-            file_context = FileContext(package=file_context.package, imports=file_context.imports + extra_imports,
-                                       namespaces=file_context.namespaces)
+        file_context = _with_global_imports(analyzer, rel, ref_result.file_context)
         if file_context is None and getattr(analyzer, "requires_file_context", False):
             flags.append({"reason": "file_context_missing", "analyzer": analyzer.name, "from": rel})
         name_pair = rel_name.get(rel)                     # 主体を持たないファイルは src が無い
@@ -1138,6 +1455,18 @@ def build_world(world_dir, world_id: str, *, files=None):
             continue
         label, name = name_pair
         file_src = _cid(label, world_id, rel, name)
+        for amb in plugin_ambiguities:                    # FW プラグインが 1 つに決められなかった参照（任意に選ばず、辺を張らずに申告する）
+            amb_def = {"file": rel, "key": None}
+            if amb.source_symbol_id is not None and amb.source_symbol_id[0] == rel and amb.source_symbol_id in symbol_cids:
+                amb_def["key"] = amb.source_symbol_id[1]
+            amb_why = {"why": amb.why} if amb.why else {}
+            flags.append({"reason": "ambiguous", "from": rel, "kind": amb.kind, "name": amb.name, "line": amb.line,
+                          "via": amb.via, "candidates": len(amb.candidates), **amb_why})
+            unresolved_by_rel.setdefault(rel, []).append({
+                "line": amb.line, "reason": "ambiguous", "kind": amb.kind, "name": str(amb.name), "via": amb.via,
+                "from_def": amb_def, "candidates": len(amb.candidates),
+                "candidate_paths": sorted({c.path for c in amb.candidates})[:5], **amb_why})
+            unresolved_subject[rel] = file_src
         for ref in ref_result.refs:
             if ref.edge_type not in analyzer_registry.EDGE_TYPES:
                 flags.append({"reason": "unknown_edge_type", "analyzer": analyzer.name,
@@ -1181,11 +1510,19 @@ def build_world(world_dir, world_id: str, *, files=None):
     for cycle in _find_copy_cycles(nodes, edges):
         flags.append({"reason": "copy_cycle", "paths": cycle})
 
+    for pname in sorted(plugin_failed):                   # FW プラグインの失敗（グラフはそのプラグインの分だけ欠ける）
+        rec = plugin_failed[pname]
+        flags.append({"reason": "plugin_failed", "action": "warn", "plugin": pname, "from": rec["from"],
+                      "files": len(rec["files"]), "why": rec["why"]})
+
     # 未解決の申告を、参照を書いたファイルの主体ノードへ載せる（`world_neo4j.load_world` が同じ tx で保存する）
     for rel, items in unresolved_by_rel.items():
         items.sort(key=lambda it: (it["line"], it["reason"], it["kind"], it["name"]))
         node = nodes[unresolved_subject[rel]]
-        node["unresolved"] = items[:UNRESOLVED_PER_FILE_MAX]
+        # 上限で切るとき、プロジェクトの中に候補がありうる理由（ambiguous・cross_scope・unresolved_qualifier ほか）を先に残し、素の unresolved を後にする
+        kept = (sorted(items, key=lambda it: (it["reason"] == "unresolved", it["reason"], it["line"], it["kind"], it["name"]))
+                [:UNRESOLVED_PER_FILE_MAX] if len(items) > UNRESOLVED_PER_FILE_MAX else items)
+        node["unresolved"] = sorted(kept, key=lambda it: (it["line"], it["reason"], it["kind"], it["name"]))
         node["unresolved_names"] = sorted({nm for it in items
                                            for nm in (it["name"], it["name"].rsplit(".", 1)[-1])})
         if len(items) > UNRESOLVED_PER_FILE_MAX:

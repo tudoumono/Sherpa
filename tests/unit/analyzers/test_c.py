@@ -56,6 +56,14 @@ CHILD_CASES = {
         "// int fake(int a);\nint real(int a) {\n    return a;\n}\n", "real.c", [("real", None, None)]),
     "signature_in_block_comment_ignored": (
         "/* int fake(int a); */\nint real(int a) {\n    return a;\n}\n", "real.c", [("real", None, None)]),
+    "allman_style_and_multiline_signature": (
+        "static int\nmulti(int a,\n      int b)\n{\n    return a;\n}\n", "m.c", [("multi", "m.c.multi", "definition")]),
+    "knr_definition_is_a_definition": (
+        "int f(a, b)\n    int a;\n    int b;\n{\n    return a + b;\n}\n", "f.c", [("f", "f.c.f", "definition")]),
+    "function_pointer_parameter_and_extern_c_block": (
+        '#ifdef __cplusplus\nextern "C" {\n#endif\nvoid reg(void (*cb)(int));\n#ifdef __cplusplus\n}\n#endif\n',
+        "reg.h", [("reg", "reg.h.reg", "declaration")]),
+    "function_pointer_variable_and_typedef_not_child": ("int (*fp)(int);\ntypedef void cbfn(int);\n", "t.h", []),
     "uppercase_h_extension_is_header": ("void upper_proto(void);\n", "UTIL.H",
                                         [("upper_proto", "UTIL.H.upper_proto", "declaration")]),
 }
@@ -99,8 +107,12 @@ REFS_CASES = {
     "function_like_macro_call_dropped": (
         "#define MAX(a, b) ((a) > (b) ? (a) : (b))\n\nint f(int x, int y) {\n    return MAX(x, y);\n}\n", "f.c",
         [], ["c_macro_call"]),
-    "knr_definition_header_dropped": (
-        "int f(a, b)\n    int a;\n    int b;\n{\n    return a + b;\n}\n", "f.c", [], ["c_knr_definition"]),
+    "knr_definition_header_is_not_a_call": (
+        "int f(a, b)\n    int a;\n    int b;\n{\n    return a + b;\n}\n", "f.c", [], []),
+    "member_and_subscript_calls_dropped": (
+        "int f(void) {\n    s->cb(1);\n    tbl[0](2);\n    return 0;\n}\n", "f.c", [],
+        ["c_dynamic_call", "c_dynamic_call"]),
+    "call_in_preprocessor_condition_ignored": ("#if CHECK(1)\nint x;\n#endif\n", "f.c", [], []),
     "dynamic_call_via_return": ("int f(void) {\n    return (*fp)(1);\n}\n", "f.c", [], ["c_dynamic_call"]),
     "dynamic_call_via_assignment": ("int f(void) {\n    int x;\n    x = (*fp)(1);\n}\n", "f.c", [], ["c_dynamic_call"]),
 }
@@ -123,3 +135,61 @@ def test_cxx_only_header_syntax_dropped_only_for_h_files(path, dropped):
     res = A.collect_defs("namespace N {\n    class Widget {};\n}\n", path)
     assert [d.reason for d in res.dropped] == dropped
     assert res.primary is not None and res.primary.name == path
+
+
+# ---- Tree-sitter の木で読むようになった形 ----
+def test_calls_inside_a_definition_belong_to_it_for_allman_and_kr_styles():
+    text = "int f(a)\n    int a;\n{\n    return g(a);\n}\nstatic int\nh(int x)\n{\n    return k(x);\n}\n"
+    got = [(r.name, r.source_symbol_id) for r in A.extract_refs(text, "d/x.c").refs]
+    assert got == [("g", ("d/x.c", "x.c.f")), ("k", ("d/x.c", "x.c.h"))]
+
+
+def test_extern_c_guard_is_not_a_syntax_error_and_prototypes_inside_are_children():
+    text = '#ifdef __cplusplus\nextern "C" {\n#endif\nint proto(int x);\n#ifdef __cplusplus\n}\n#endif\n'
+    res = A.collect_defs(text, "p.h")
+    assert [c.name for c in res.children] == ["proto"] and res.dropped == []
+
+
+def test_syntax_error_is_reported_and_the_rest_of_the_file_is_still_read():
+    text = "int before(void) {\n    return one();\n}\n\nint bad(int a {\n    return 0;\n}\n\nint after(void) {\n    return two();\n}\n"
+    defs = A.collect_defs(text, "e.c")
+    assert [d.reason for d in defs.dropped] == ["syntax_error"]
+    assert {"before", "after"} <= {c.name for c in defs.children}
+    refs = A.extract_refs(text, "e.c").refs
+    assert [(r.name, r.source_symbol_id) for r in refs] == [("one", ("e.c", "e.c.before")), ("two", ("e.c", "e.c.after"))]
+
+
+def test_export_macros_before_a_declaration_do_not_hide_the_definition():
+    text = ("#define API\ntypedef int myint;\nAPI int f(void);\nEXPORT_X void g(int a);\nAPI_Y myint h(void);\n"
+            "API void k(void) {\n    return;\n}\n")
+    res = A.collect_defs(text, "m.h")
+    assert [c.name for c in res.children] == ["f", "g", "h", "k"] and res.dropped == []
+    assert [c.line for c in res.children] == [3, 4, 5, 6]
+
+
+def test_macro_noise_blanking_is_limited_to_the_declaration_head_after_the_define():
+    # `#define` より前の同名の定義・識別子は消さない
+    text = "int API(void) {\n    return 1;\n}\n#define API\nAPI void g(void);\n"
+    assert [c.name for c in A.collect_defs(text, "m.h").children] == ["API", "g"]
+    enum = "enum { API, B };\n#define API\nint x = API;\n"
+    assert A.collect_defs(enum, "e.c").dropped == []
+    cont = "#define M(x) \\\n    EXPORT int x(void);\\\n    ok\nint f(void);\n"
+    assert [c.name for c in A.collect_defs(cont, "c.h").children] == ["f"]
+
+
+def test_only_the_extern_c_idiom_suppresses_missing_endif():
+    idiom = '#ifdef __cplusplus\nextern "C" {\n#endif\nint a(void);\n#ifdef __cplusplus\n}\n#endif\n'
+    assert A.collect_defs(idiom, "i.h").dropped == []
+    unclosed = "#ifdef FOO\nint a(void);\n"
+    assert [d.snippet for d in A.collect_defs(unclosed, "u.h").dropped] == ["missing #endif"]
+
+
+def test_cxx_qualified_method_is_not_a_c_function_and_reports_cxx_header():
+    res = A.collect_defs("inline void Widget::run(int x) {\n    go();\n}\n", "w.h")
+    assert res.children == [] and "cxx_header" in [d.reason for d in res.dropped]
+
+
+def test_bare_macro_call_without_semicolon_does_not_swallow_the_next_declaration():
+    text = "int z;\nDECLARE_X(Foo)\nint f(void);\nint g(void) {\n    return 0;\n}\n"
+    res = A.collect_defs(text, "m.h")
+    assert [(c.name, c.line) for c in res.children] == [("f", 3), ("g", 4)] and res.dropped == []

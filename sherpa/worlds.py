@@ -729,7 +729,8 @@ def _finalize_pending_run(run_id, world_id: str, pending: dict, *, status: str |
             published_snapshot=pending.get("published_snapshot"),
             source_doc_ids=pending.get("source_doc_ids"),
             sig=pending["confirm_sig"], manifest=pending.get("confirm_manifest"),
-            doc_count=pending.get("confirm_doc_count"), scan_report=pending.get("confirm_scan_report"))
+            doc_count=pending.get("confirm_doc_count"), scan_report=pending.get("confirm_scan_report"),
+            resolve_sig=pending.get("confirm_resolve_sig"))
     else:
         rec = store.finish_ingest_run(
             run_id, status=st, extraction_snapshot=snap,

@@ -1275,7 +1275,7 @@ _FAILURE_REASON_CATALOG_MOCK = {
 _PARTIAL_EXTRACTION_ADVICE_MOCK = "本文の一部しか読み取れていない可能性があります。開いて確認し、必要なら保存し直すか再変換してください。"
 
 WORLD_STATUS_RESP = {"ok": True, "world_id": "w1", "label": "4期更改", "root_path": "/mnt/c/ProjectA",
-                     "last_synced_at": "2026-07-03T09:00:00+00:00",
+                     "last_synced_at": "2026-07-03T09:00:00+00:00", "resolve_settings_pending": False,
                      "scanned": 3, "indexed": 3, "by_doctype": {"設計書": 1, "ソース": 2},
                      "office_md": 1, "skipped_office": 0, "office_failed": 0,
                      "skipped_other": 0, "skipped_ext": {}, "analyzer_declined": 0,
@@ -1585,6 +1585,7 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         "world_diff": [],
         "world_register": [],
         "world_refresh": [],
+        "resolve_settings_put": [],
         "auth_login": [],
         "auth_logout": [],
         "share_create": [],
@@ -2611,6 +2612,18 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             body = _post_json(request)
             records["world_register"].append(body)
             return _json(route, world_ingest_accepted_response(WORLD["world_id"]))
+        if method == "GET" and path == "/worlds/w1/resolve-settings":
+            return _json(route, {"ok": True, "world_id": "w1", "copy_paths": [], "path_aliases": {},
+                                 "warnings": [], "changed": False, "refresh_started": False, "note": ""})
+        if method == "PUT" and path == "/worlds/w1/resolve-settings":
+            body = _post_json(request)
+            records["resolve_settings_put"].append(body)
+            return _json(route, {"ok": True, "world_id": "w1", "copy_paths": body.get("copy_paths", []),
+                                 "path_aliases": body.get("path_aliases", {}),
+                                 "warnings": [f"COPY の取り込み元の場所「{p}」は資料フォルダの中に見つかりません"
+                                              for p in body.get("copy_paths", [])],
+                                 "changed": True, "refresh_started": True,
+                                 "note": "保存しました。資料を取り込み直しています（時間がかかります）。"})
         if method == "POST" and path == "/worlds/w1/refresh":
             records["world_refresh"].append(True)
             return _json(route, world_ingest_accepted_response("w1"))
@@ -2859,6 +2872,8 @@ MOCKED: list[tuple[str, str]] = [
     ("POST", "/worlds/diff"),
     ("POST", "/worlds"),
     ("POST", "/worlds/{wid}/refresh"),
+    ("GET", "/worlds/{wid}/resolve-settings"),
+    ("PUT", "/worlds/{wid}/resolve-settings"),
     ("POST", "/chat/turns"),
     ("GET", "/chat/turns/{turn_id}/stream"),
     ("POST", "/chat/turns/{turn_id}/stop"),

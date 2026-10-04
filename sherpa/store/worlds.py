@@ -78,8 +78,19 @@ def get_world(world_id, *, connect_timeout: float | None = None,
             c.execute(f"SET LOCAL statement_timeout = '{remaining_ms}ms'")
         return c.execute(
             "SELECT world_id, root_path, label, storage_mode, last_sig, last_synced_at, "
-            "last_manifest, last_doc_count, last_scan_report, last_scan_report_at, created_at, updated_at "
+            "last_manifest, last_doc_count, last_scan_report, last_scan_report_at, resolve_settings, resolve_applied_sig, "
+            "created_at, updated_at "
             "FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).fetchone()
+
+
+def set_resolve_settings(world_id, settings) -> bool:
+    """解決範囲の設定（正規化済みの dict。空は NULL）を保存する。資料フォルダが無ければ False。署名は `worker._sig` が設定のハッシュを材料にするため、次回の更新で全件の取り込みになる。"""
+    _ensure()
+    with _connect() as c:
+        row = c.execute(
+            "UPDATE worlds SET resolve_settings=%s, updated_at=now() WHERE kb_id=%s AND world_id=%s RETURNING 1",
+            (Json(settings) if settings else None, _KB_ID, world_id)).fetchone()
+    return row is not None
 
 
 def get_world_status_row(world_id, *, connect_timeout: float | None = None,
@@ -103,7 +114,8 @@ def get_world_status_row(world_id, *, connect_timeout: float | None = None,
             c.execute(f"SET LOCAL statement_timeout = '{remaining_ms}ms'")
         return c.execute(
             "SELECT world_id, root_path, label, last_sig, last_synced_at, last_scan_report, "
-            "last_scan_report_at FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).fetchone()
+            "last_scan_report_at, resolve_settings, resolve_applied_sig "
+            "FROM worlds WHERE kb_id=%s AND world_id=%s", (_KB_ID, world_id)).fetchone()
 
 
 def world_by_root(root_path) -> dict | None:

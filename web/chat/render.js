@@ -1008,6 +1008,8 @@ const _WHY_RULE = {
   wildcard: 'import（まとめて指定）の範囲で一致しました', qualified_name: '完全な名前で一致しました', path_exact: '書かれたパスのとおりに一致しました',
   path_suffix: 'パスの末尾で一致しました', config_key_all: '同じ名前の設定キーすべてに一致しました', schema_exact: 'スキーマ名まで一致しました',
   schema_unqualified: '名前が一致しました（定義側にスキーマ名なし）', table_name: '表の名前で一致しました', nearest_name: '一番近い場所の同じ名前に一致しました',
+  di_qualifier: '注入で指定された名前が実装の名前に一致しました', di_primary: '実装のうち優先の指定が付いたものに決まりました',
+  di_single_impl: '実装が 1 つだけでした',
 };
 // 辺 1 本の「参照元」の平文（文書と行を複数・切った分は「ほか N 件」）。根拠（sources）のある辺だけ出す。
 function _whySourcesText(e) {

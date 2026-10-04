@@ -380,8 +380,8 @@ def test_v1_fixture_graph_matches_golden_snapshot():
 
 
 def test_java1_fixture_graph_matches_golden_snapshot_with_9_aggregated_edges():
-    """java1 の nodes/edges/flags を golden で丸ごとピン留めする——エッジ集約後は 13本の Pass2 候補が
-    9本（4組の重複が1本ずつに畳まれる）になる。"""
+    """java1 の nodes/edges/flags を golden で丸ごとピン留めする——エッジ集約後は 14本の Pass2 候補が
+    9本（5組の重複が1本ずつに畳まれる）になる。"""
     actual = _snapshot(ROOT / "fixtures" / "corpus" / "java1", JAVA1_WORLD_ID)
     golden = _load_golden(JAVA1_GOLDEN)
     assert len(actual["edges"]) == 9
@@ -390,7 +390,7 @@ def test_java1_fixture_graph_matches_golden_snapshot_with_9_aggregated_edges():
 
 def test_java1_edge_aggregation_preserves_the_src_type_dst_set(monkeypatch):
     """集約規則（`_aggregate_pass2_edges`）を無効化した「集約前」の生エッジと golden（集約後）を比べ、
-    (1) 集約前13本・集約後9本（4組が重複）、(2) 残る `(src,type,dst)` の集合は集約前と完全一致
+    (1) 集約前14本・集約後9本（5組が重複）、(2) 残る `(src,type,dst)` の集合は集約前と完全一致
     （集約は重複を畳むだけで新しい組を作らず既存の組を消さない）ことを検証する。"""
     monkeypatch.setattr(world_graph, "_aggregate_pass2_edges", lambda raw: raw)
     _nodes, before_edges, _flags = world_graph.build_world(
@@ -398,7 +398,7 @@ def test_java1_edge_aggregation_preserves_the_src_type_dst_set(monkeypatch):
     monkeypatch.undo()
 
     after_edges = _load_golden(JAVA1_GOLDEN)["edges"]
-    assert len(before_edges) == 13
+    assert len(before_edges) == 14
     assert len(after_edges) == 9
 
     before_keys = [(e["type"], e["src"], e["dst"]) for e in before_edges]
@@ -406,7 +406,7 @@ def test_java1_edge_aggregation_preserves_the_src_type_dst_set(monkeypatch):
     assert set(before_keys) == set(after_keys), "集約は (src,type,dst) の集合を変えない"
 
     dup_keys = {k for k, n in Counter(before_keys).items() if n > 1}
-    assert len(dup_keys) == 4
+    assert len(dup_keys) == 5
     assert dup_keys == set(after_keys) & dup_keys, "畳まれた組は集約後の集合にもそのまま残っている"
 
 

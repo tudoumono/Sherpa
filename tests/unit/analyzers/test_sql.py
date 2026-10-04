@@ -75,6 +75,12 @@ CASES = {
     # 方言
     "global_temporary_table": ("CREATE GLOBAL TEMPORARY TABLE staging (id INT);\n", "STAGING", None, [DI("ID", "STAGING.ID")], None, []),
     "local_temporary_table": ("CREATE LOCAL TEMPORARY TABLE staging (id INT);\n", "STAGING", None, None, None, None),
+    "unlogged_and_temp_tables": (
+        "CREATE UNLOGGED TABLE a (id INT);\nCREATE TEMP TABLE b (id INT);\nCREATE TEMPORARY TABLE IF NOT EXISTS c (id INT);\n",
+        "A", None, [DI("ID", "A.ID")], ["B", "C"], []),
+    "ctas_parenthesized_and_with": (
+        "CREATE TABLE a AS (SELECT 1 AS x FROM dual);\nCREATE TABLE b AS WITH c AS (SELECT 1) SELECT * FROM c;\n",
+        "A", None, [], ["B"], []),
     "create_table_as_select_has_no_columns": (
         "CREATE TABLE recent_orders AS SELECT * FROM orders WHERE status = 'NEW';\n", "RECENT_ORDERS", None, [], None, []),
 }

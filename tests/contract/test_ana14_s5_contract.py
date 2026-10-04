@@ -72,7 +72,7 @@ def test_missing_schema_is_unresolved_and_unqualified_name_with_two_schemas_is_a
     assert reported == sorted([
         ("ambiguous", "g/cobol/MIXPG.cbl", "M", None),   # schema 無し 1 件＋schema 付き 1 件
         ("ambiguous", "g/cobol/PLAINPG.cbl", "CUSTOMER", None),
-        ("dropped_syntax", "g/mybatis/DynMapper.xml", None, "mapper_sql_dynamic_table"),   # `${schema}.CUSTOMER`
+        ("dropped_syntax", "g/mybatis/DynMapper.xml", None, "xml:mybatis: mapper_sql_dynamic_table"),   # `${schema}.CUSTOMER`
         ("dropped_syntax", "g/sql/three.sql", None, "table_name_unsupported"),   # 4 部名の DDL
         ("unresolved", "g/cobol/FOURPG.cbl", "A.B.C.D", None),   # 4 部名の参照
         ("unresolved_qualifier", "g/mybatis/DynMapper.xml", "demo.DynMapper", None),   # mapper の namespace の Java 型が無い（S3）

@@ -54,6 +54,7 @@ CONTAINS = {
            ("CONTAINS", "vb/Lib/Target.vb#TARGET", "vb/Lib/Target.vb#LIB.DUP", None, 6),
            ("CONTAINS", "vb/Multi/Two.vb#FIRST", "vb/Multi/Two.vb#NS2.SECOND", None, 11)},
     "cinc": {("CONTAINS", "cinc/a/inc/there.h#there.h", "cinc/a/inc/there.h#there.h.there", None, 1),
+             ("CONTAINS", "cinc/a/main.c#main.c", "cinc/a/main.c#main.c.main", None, 6),
              ("CONTAINS", "cinc/b/missing.h#missing.h", "cinc/b/missing.h#missing.h.missing", None, 1),
              ("CONTAINS", "cinc/b/plain.h#plain.h", "cinc/b/plain.h#plain.h.plain", None, 1)},
     "xmlq": {("CONTAINS", "xmlq/ctx/Mapper.xml#Mapper.xml", "xmlq/ctx/Mapper.xml#key:mapper:com.acme.Svc.one", None, 3),
@@ -141,8 +142,7 @@ def test_c_include_with_a_relative_path_is_exact_or_unresolved(built):
         ("cinc/a/main.c#main.c", "cinc/a/inc/there.h#there.h", "include", 2),
         ("cinc/a/main.c#main.c", "cinc/b/plain.h#plain.h", "include", 3),
     }) | CONTAINS["cinc"]
-    assert flags == {("unresolved_qualifier", "cinc/a/main.c", "inc/missing.h", 1),
-                     ("unresolved", "cinc/a/main.c", "main", 6)}      # 後者は `int main(void)` の宣言行を呼び出しと読む既存の挙動
+    assert flags == {("unresolved_qualifier", "cinc/a/main.c", "inc/missing.h", 1)}      # `{` が次の行にある `int main(void)` は定義（子定義 main）で、呼び出しではない
 
 
 def test_explicit_import_target_does_not_change_when_same_named_classes_are_added_or_moved(tmp_path):
@@ -254,7 +254,6 @@ FLAGS = {
     ],
     "cinc": [
         {"reason": "unresolved_qualifier", "from": "cinc/a/main.c", "kind": "Module", "name": "inc/missing.h", "line": 1, "via": "include", "from_def": {"file": "cinc/a/main.c", "key": None}},
-        {"reason": "unresolved", "from": "cinc/a/main.c", "kind": "Module", "name": "main", "line": 6, "via": "call", "from_def": {"file": "cinc/a/main.c", "key": None}},
     ],
     "xmlq": [
         {"reason": "unresolved_qualifier", "from": "xmlq/bin/run.sh", "kind": "Module", "name": "com.missing.Ghost", "line": 3, "via": "call", "from_def": {"file": "xmlq/bin/run.sh", "key": None}},
@@ -282,7 +281,7 @@ NODES = {
     "csgl": ["csgl/G.cs#B", "csgl/G.cs#UseB"],
     "vb": ["vb/Acme/Main.vb#MAIN", "vb/Acme/Sibling.vb#SIBLING", "vb/Alias/Use.vb#USE", "vb/AliasNs.vb#ALIASNS.USE", "vb/AliasNs.vb#TARGET", "vb/Elsewhere/Hidden.vb#HIDDEN", "vb/Lib/Target.vb#LIB.DUP", "vb/Lib/Target.vb#TARGET", "vb/Lib2/Dup.vb#DUP", "vb/Multi/Two.vb#FIRST", "vb/Multi/Two.vb#NS2.SECOND", "vb/Ns1/Shared.vb#SHARED", "vb/Ns2/Shared.vb#SHARED"],
     "vbgl": ["vbgl/G.vb#B", "vbgl/G.vb#USEB"],
-    "cinc": ["cinc/a/inc/there.h#there.h", "cinc/a/inc/there.h#there.h.there", "cinc/a/main.c#main.c", "cinc/b/missing.h#missing.h", "cinc/b/missing.h#missing.h.missing", "cinc/b/plain.h#plain.h", "cinc/b/plain.h#plain.h.plain"],
+    "cinc": ["cinc/a/inc/there.h#there.h", "cinc/a/inc/there.h#there.h.there", "cinc/a/main.c#main.c", "cinc/a/main.c#main.c.main", "cinc/b/missing.h#missing.h", "cinc/b/missing.h#missing.h.missing", "cinc/b/plain.h#plain.h", "cinc/b/plain.h#plain.h.plain"],
     "xmlq": ["xmlq/bin/run.sh#run.sh", "xmlq/ctx/Mapper.xml#Mapper.xml", "xmlq/ctx/Mapper.xml#key:mapper:com.acme.Svc.one", "xmlq/ctx/beans.xml#beans.xml", "xmlq/ctx/beans.xml#key:bean:ghost", "xmlq/ctx/beans.xml#key:bean:svc", "xmlq/other/Ghost.java#Ghost", "xmlq/src/Svc.java#Svc", "xmlq/web/page.jsp#page.jsp"],
 }
 

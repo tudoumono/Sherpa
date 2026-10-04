@@ -5,6 +5,7 @@ children: 同一 `(label, cid_key, c_kind)` の重複（overload・`Property Get
 
 参照（`INVOKES`）:
 - `Inherits X`／`Implements X` → `via=extends`。`Imports` は参照にせず、`.vb` の `RefResult.file_context`（`package`＝主体の `Namespace`・`imports`＝`Imports` の宣言順。名前空間の import は `wildcard`・`Imports A = N.T` は `alias`）として共通層へ渡す。VB6/VBA/VBScript は `file_context` を返さない。
+- `.vbproj`（`RootNamespace`・プロジェクト全体の `Import`）は `_vb_project` が読み、共通層（`world_graph`）が当てはめる: Root Namespace は名前の照合のときだけ型・手続きの完全修飾名の頭に足し（ノードの識別子は変えない）、プロジェクトの Import は `file_context.imports` へ足す。VB6/VBA/VBScript には当てない。
 - `New X(...)` → `via=call`。宣言型（`Dim x As T`・引数・戻り値）→ `via=field_type`（組み込み型は除く）。完全修飾トークンは `extra={"qualified": True}`。型名の参照（`Inherits`/`Implements`・`New`・`As`）には `type_ref` を付け、`.vb` では共通層が `file_context` の Namespace・`Imports` で解決する（親の Namespace→グローバル→`Imports` の順）。
 - 手続き呼び出し（`Call Foo(`・`Foo(`・括弧なしの `Foo arg1, arg2`）→ `via=call`。`:` 区切りの文単位と単一行 `If ... Then <文>` の実行部も走査する。`MsgBox`・`Debug.Print` 等の組み込み手続きは除外する。
 - `.frm`/`.ctl` のデザイナ部（`Begin ... End`）は読み飛ばす。
@@ -576,7 +577,7 @@ class VbAnalyzer(Analyzer):
     resolves_calls_by_simple_name = True
     resolves_parent_namespaces = True
     doctype = "vb"
-    version = 3
+    version = 4
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         ext = PurePosixPath(rel_path).suffix.lower()

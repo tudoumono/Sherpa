@@ -1,23 +1,26 @@
 """JSP アナライザ。`.jsp`/`.jspx`/`.jspf`/`.tag`/`.tagx` を全件受理し、ファイル自体を主体定義（`Module`・拡張子込みファイル名）とする（children なし）。
 
-コメント（`<%-- --%>`／`<!-- -->`）は線形スキャナで空白化し、タグ走査は開始タグだけの字句解析（属性順不同・引用符省略・大文字タグ名可）で行う。`<script>`/`<style>` の本文は走査対象外。
+読み取りは 2 段。① Tree-sitter（tree-sitter-embedded-template）でテンプレート本文と `<% … %>` の埋め込みに分ける。JSP コメント `<%-- … --%>`（`--%>` までがコメント）と埋め込みは空白に置き換える（行番号は変えない）。② 残ったテンプレート本文は標準の `html.parser` で開始タグだけを読む（属性順不同・引用符省略・大文字タグ名可・`<script>`/`<style>` の本文と HTML コメントの中は読まない）。埋め込みの Java（`<% %>`・`<%= %>`・`<%! %>`）は tree-sitter-java で構文だけ確かめる（行は JSP の行に揃える）。`<%@ … %>` の指令は属性だけ読む。
 参照抽出:
 - `<%@ include file>`／`<jsp:include page>`／`<c:import url>`／`<jsp:directive.include file>`／`<script src>`／`<link href>` → `INVOKES(via=include)`（C アナライザと同じ2段解決）。外部参照スキームは `Dropped("web_external_ref")`。`/` 始まりは top scope へ連結して参照元からの相対パスにする。`<base href>` があるファイルの相対 include は `Dropped("web_relative_under_base")`、`<base href>` 自体も `Dropped("web_base_href")` を1件申告する。`?`/`#` 以降は除去する。
 - `action=`/`href=` 属性値 → `ACCESSES(via=config_key)`。裸名・`.action` 拡張子＝Struts action キー、拡張子なしの `/` 始まり＝URL キー。判定は属性値の形だけで行う粗い判定。
 - `<jsp:useBean class="FQCN">` → `INVOKES(via=bean_class, qualified=True)`。`id` 属性・EL 式は対象外。
 - `<%@ page import>`・`<%@ taglib tagdir>` はエッジ化しない。
-- スクリプトレット内の Java は解析せず、ファイルにつき `Dropped("jsp_scriptlet")` を1件申告する。
+- スクリプトレット内の Java から参照は取らず、ファイルにつき `Dropped("jsp_scriptlet")` を1件申告する。構文エラーの領域（JSP の埋め込みの分割・埋め込みの Java）は `Dropped("syntax_error")` で申告し、エラーの外は読み続ける。
+HTML コメント `<!-- -->` の中の `<%@ include %>` も JSP の仕様どおり処理されるので拾う。
 大文字小文字は区別しない（タグ名・属性名は小文字化して判定する）。
 設計: docs/design/rag.md「グラフ」
 """
 from __future__ import annotations
 
-import bisect
 import posixpath
 import re
+from html.parser import HTMLParser
 from pathlib import PurePosixPath
 
+from . import _ts
 from ._base import Analyzer, DefItem, DefResult, Dropped, RefCandidate, RefResult
+
 
 JSP_EXT = frozenset({".jsp", ".jspx", ".jspf", ".tag", ".tagx"})
 
@@ -48,46 +51,6 @@ def _scope_relative_include_path(ref_rel: str, raw_path: str) -> str:
     target = f"{top_scope}/{stripped}"
     base_dir = ref_rel.rsplit("/", 1)[0]
     return posixpath.relpath(target, start=base_dir)
-
-
-# JSP コメント／HTML コメントの開始マーカー（線形スキャナで空白化する）。
-_COMMENT_MARKER_RE = re.compile(r'<%--|<!--')
-
-
-def _sanitize_comments(text: str) -> str:
-    """`<%-- ... --%>`／`<!-- ... -->` を線形1パスで空白化する（改行は保持。閉じていないコメントは末尾まで）。"""
-    out: list = []
-    i, n = 0, len(text)
-    while i < n:
-        m = _COMMENT_MARKER_RE.search(text, i)
-        if not m:
-            out.append(text[i:])
-            break
-        out.append(text[i:m.start()])
-        if m.group(0) == "<%--":
-            end = text.find("--%>", m.end())
-            close_len = 4
-        else:
-            end = text.find("-->", m.end())
-            close_len = 3
-        j = end + close_len if end != -1 else n
-        out.append("".join("\n" if c == "\n" else " " for c in text[m.start():j]))
-        i = j
-    return "".join(out)
-
-
-_INCLUDE_DIRECTIVE = re.compile(r'<%@\s*include\s+file\s*=\s*["\'](?P<path>[^"\']+)["\']')
-
-# スクリプトレット（`<%@`/`<%=`/`<%--` を除く `<% ... %>`）。
-_SCRIPTLET = re.compile(r'<%(?!@|=|--)(?P<body>.*?)%>', re.S)
-
-
-def _newline_offsets(text: str) -> list:
-    return [i for i, ch in enumerate(text) if ch == "\n"]
-
-
-def _line_at(newline_offsets: list, pos: int) -> int:
-    return bisect.bisect_left(newline_offsets, pos) + 1
 
 
 _BARE_ACTION_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
@@ -139,52 +102,100 @@ def _emit_include(raw_path: str, line: int, ref_rel: str, refs: list, dropped: l
                                  extra={"via": "include", "include_path": path}))
 
 
-# 開始タグの字句解析（属性順不同・引用符省略・大文字タグ名を許容）
+class _TagCollector(HTMLParser):
+    """開始タグ（自己終了タグ含む）を `(行, タグ名, 属性の辞書)` の列で集める。タグ名・属性名は小文字・値なしの属性は含めない。"""
 
-# 開始/終了タグ本体（属性文字列は「引用符区間 or `>`/引用符以外の1文字」の繰り返しとして消費する）。
-_TAG_RE = re.compile(
-    r'<(?P<slash>/?)(?P<name>[A-Za-z][A-Za-z0-9:._-]*)(?P<attrs>(?:"[^"]*"|\'[^\']*\'|[^>"\'])*)>'
-)
-_ATTR_RE = re.compile(
-    r'([A-Za-z_:][A-Za-z0-9_:.-]*)'
-    r'(?:\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+)))?'
-)
-_SCRIPT_STYLE_OPEN_RE = re.compile(
-    r'<(script|style)\b(?:"[^"]*"|\'[^\']*\'|[^>"\'])*>', re.I
-)
-_SCRIPT_CLOSE_RE = re.compile(r'</script\s*>', re.I)
-_STYLE_CLOSE_RE = re.compile(r'</style\s*>', re.I)
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.tags: list = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append((self.getpos()[0], tag.lower(),
+                          {k.lower(): v.strip() for k, v in attrs if v is not None}))
 
 
-def _parse_attrs(attrs_str: str) -> dict:
-    out: dict = {}
-    for m in _ATTR_RE.finditer(attrs_str):
-        value = m.group(2)
-        if value is None:
-            value = m.group(3)
-        if value is None:
-            value = m.group(4)
-        if value is not None:
-            out[m.group(1).lower()] = value
-    return out
+def _collect_tags(text: str) -> list:
+    parser = _TagCollector()
+    parser.feed(text)
+    parser.close()
+    return parser.tags
 
 
-def _script_style_body_spans(text: str) -> list:
-    """`<script>`/`<style>` の本文区間（開始タグ直後〜終了タグ直前）。属性走査の対象から外す。終了タグ検索は `text[body_start:]` を切り出さず、`search(text, pos)` に位置を渡す（二次時間を避ける）。"""
-    spans: list = []
-    pos, n = 0, len(text)
-    while pos < n:
-        m = _SCRIPT_STYLE_OPEN_RE.search(text, pos)
-        if not m:
-            break
-        tag = m.group(1).lower()
-        body_start = m.end()
-        close_re = _SCRIPT_CLOSE_RE if tag == "script" else _STYLE_CLOSE_RE
-        close_m = close_re.search(text, body_start)
-        body_end = close_m.start() if close_m else n
-        spans.append((body_start, body_end))
-        pos = body_end
-    return spans
+# 埋め込み・コメントの区間を、改行だけ残して空白にする変換表。
+_MASK_TABLE = bytes(10 if i == 10 else 32 for i in range(256))
+
+_DIRECTIVE_NODES = ("directive", "output_directive", "comment_directive", "ERROR")
+
+
+def _split_template(parsed: _ts.Parsed) -> tuple:
+    """テンプレートを `(埋め込みを空白にしたテキスト, 指令, コードの塊)` に分ける。
+
+    指令＝`<%@ … %>` の `(行, 名前, 属性の辞書)`。コードの塊＝埋め込みの Java の `(種別, 行, コード)`（種別は宣言 `decl`・スクリプトレット `scriptlet`・式 `expr`）。
+    JSP コメント `<%-- … --%>` は次の `--%>` まで（途中の `%>` で終わらない）。
+    """
+    src = parsed.src
+    buf = bytearray(src)
+    directives: list = []
+    code_blocks: list = []  # (種別 "decl"|"scriptlet"|"expr", 開始行, コード)
+    comment_end = 0
+
+    def mask(lo: int, hi: int) -> None:
+        buf[lo:hi] = src[lo:hi].translate(_MASK_TABLE)
+
+    for node in parsed.root.children:
+        if node.end_byte <= comment_end:
+            mask(node.start_byte, node.end_byte)
+            continue
+        if node.type == "content":
+            if node.start_byte < comment_end:
+                mask(node.start_byte, comment_end)
+            continue
+        text = parsed.text(node)
+        if text.startswith("<%--"):
+            close = src.find(b"--%>", node.start_byte + 4)
+            comment_end = len(src) if close < 0 else close + 4
+            mask(node.start_byte, comment_end)
+            continue
+        mask(node.start_byte, node.end_byte)
+        code = next((c for c in node.children if c.type in ("code", "comment")), None)
+        if node.type == "ERROR" or code is None or node.type == "comment_directive":
+            continue
+        body = parsed.text(code)
+        row = _ts.start_line(code)
+        stripped = body.lstrip()
+        if stripped.startswith("@"):
+            parts = stripped[1:].split(None, 1)
+            if parts:
+                attrs = {k.lower(): v for _l, _t, a in _collect_tags("<x " + (parts[1] if len(parts) > 1 else "") + ">")
+                         for k, v in a.items()}
+                directives.append((_ts.start_line(node), parts[0].lower(), attrs))
+        elif node.type == "output_directive":
+            code_blocks.append(("expr", row, body))
+        elif stripped.startswith("!"):
+            code_blocks.append(("decl", row, body.replace("!", " ", 1)))
+        else:
+            code_blocks.append(("scriptlet", row, body))
+    return buf.decode("utf-8", errors="replace"), directives, code_blocks
+
+
+def _java_syntax_errors(code_blocks: list, sink: _ts.SyntaxErrorSink) -> None:
+    """埋め込みの Java を、宣言（クラスの本体）とスクリプトレット・式（メソッドの本体）に分けて 1 つの Java にして構文だけ確かめる。コードは JSP と同じ行に置く。"""
+    for wrapper_open, kinds in (("class _J { ", ("decl",)), ("class _J { void _m() { ", ("scriptlet", "expr"))):
+        blocks = [b for b in code_blocks if b[0] in kinds]
+        if not blocks:
+            continue
+        last_row = max(row + body.count("\n") for _k, row, body in blocks)
+        rows: list = [""] * (last_row + 1)
+        for kind, row, body in blocks:
+            pieces = body.replace("\r", "").split("\n")
+            if kind == "expr":
+                pieces[0] = "out.print(" + pieces[0]
+                pieces[-1] += ");"
+            for k, piece in enumerate(pieces):
+                rows[row - 1 + k] += " " + piece
+        rows[0] = wrapper_open + rows[0]
+        rows[-1] += " }" if kinds == ("decl",) else " } }"
+        _ts.collect_syntax_errors(_ts.parse("java", "\n".join(rows)), sink)
 
 
 class JspAnalyzer(Analyzer):
@@ -193,45 +204,31 @@ class JspAnalyzer(Analyzer):
     name = "jsp"
     extensions = JSP_EXT
     doctype = "jsp"
-    version = 2
+    version = 3
 
     def collect_defs(self, text: str, rel_path: str) -> DefResult:
         filename = PurePosixPath(rel_path).name
         return DefResult(primary=DefItem(label="Module", name=filename))
 
     def extract_refs(self, text: str, rel_path: str) -> RefResult:
-        sanitized = _sanitize_comments(text)
-        newline_offsets = _newline_offsets(text)
+        parsed = _ts.parse("embedded_template", text)
+        masked, directives, code_blocks = _split_template(parsed)
         refs: list = []
         dropped: list = []
 
-        exclude_spans = _script_style_body_spans(sanitized)
-        # `_TAG_RE.finditer` と `exclude_spans` はともに位置昇順なので、単調ポインタで1回だけ突合する。
-        tag_matches = []
-        excl_idx, n_excl = 0, len(exclude_spans)
-        for m in _TAG_RE.finditer(sanitized):
-            pos = m.start()
-            while excl_idx < n_excl and exclude_spans[excl_idx][1] <= pos:
-                excl_idx += 1
-            in_excluded = excl_idx < n_excl and exclude_spans[excl_idx][0] <= pos
-            if m.group("slash") or in_excluded:
-                continue
-            tag_matches.append((pos, m.group("name").lower(), _parse_attrs(m.group("attrs"))))
-
-        has_base = any(tag == "base" and "href" in attrs for _pos, tag, attrs in tag_matches)
+        tags = _collect_tags(masked)
+        base_line = next((line for line, tag, attrs in tags if tag == "base" and "href" in attrs), None)
+        has_base = base_line is not None
         if has_base:
-            base_pos = next(pos for pos, tag, attrs in tag_matches
-                           if tag == "base" and "href" in attrs)
-            dropped.append(Dropped("web_base_href", _line_at(newline_offsets, base_pos), ""))
+            dropped.append(Dropped("web_base_href", base_line, ""))
 
-        for m in _INCLUDE_DIRECTIVE.finditer(sanitized):
-            line = _line_at(newline_offsets, m.start())
-            _emit_include(m.group("path"), line, rel_path, refs, dropped, has_base)
+        for line, name, attrs in directives:
+            if name == "include" and attrs.get("file"):
+                _emit_include(attrs["file"], line, rel_path, refs, dropped, has_base)
 
-        for pos, tag, attrs in tag_matches:
+        for line, tag, attrs in tags:
             if tag == "base":
                 continue
-            line = _line_at(newline_offsets, pos)
             if tag == "script" and attrs.get("src"):
                 _emit_include(attrs["src"], line, rel_path, refs, dropped, has_base)
             elif tag == "link" and attrs.get("href"):
@@ -254,11 +251,15 @@ class JspAnalyzer(Analyzer):
                         refs.append(RefCandidate("ACCESSES", "Config", key, line,
                                                  extra={"via": "config_key", "key_kind": kind}))
 
-        first_scriptlet = _SCRIPTLET.search(sanitized)
+        first_scriptlet = next((b for b in code_blocks if b[0] in ("scriptlet", "decl")), None)
         if first_scriptlet:
-            line = _line_at(newline_offsets, first_scriptlet.start())
+            line = first_scriptlet[1]
             lines = text.splitlines()
             snippet = lines[line - 1].strip()[:120] if line - 1 < len(lines) else ""
             dropped.append(Dropped("jsp_scriptlet", line, snippet))
 
+        sink = _ts.SyntaxErrorSink()
+        _ts.collect_syntax_errors(parsed, sink)
+        _java_syntax_errors(code_blocks, sink)
+        dropped.extend(sink.result())
         return RefResult(refs=refs, dropped=dropped)

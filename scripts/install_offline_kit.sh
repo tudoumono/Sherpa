@@ -713,16 +713,24 @@ if [ -f "$OUT/wheels/SHA256SUMS" ] || { [ -d "$OUT/wheels" ] && [ -n "$(find "$O
   else
     note "既存の venv を再利用します: $VENV"
   fi
+  # Tree-sitter（本体＋文法）はホイールだけを入れる（sdist が混じっていたら閉域でビルドへ進まず止める）。
   if "$VENV/bin/python" -m pip install --no-index --find-links "$OUT/wheels" \
+      --only-binary tree-sitter,tree-sitter-java,tree-sitter-c-sharp,tree-sitter-c,tree-sitter-javascript,tree-sitter-bash,tree-sitter-css,tree-sitter-embedded-template \
       -r "$INSTALL_DIR/requirements.txt" -c "$INSTALL_DIR/constraints.txt"; then
     ok "Python 依存を --no-index でインストールしました: $VENV"
+    # start.sh が「依存は最新」と判断できるよう、同じ式でハッシュを記録する（無いと閉域で PyPI へ出て止まる）。
+    # shellcheck source=scripts/lib/req_hash.sh
+    . "$ROOT/scripts/lib/req_hash.sh"
+    (cd "$INSTALL_DIR" && req_hash "$VENV/bin/python") > "$VENV/.requirements.sha256"
   else
     fail "pip install --no-index に失敗しました。wheel 一式（$OUT/wheels/）とこの機体の Python バージョンが"
     fail "一致しているか確認してください（$OUT/wheels/COLLECTED-WITH-PYTHON-VERSION.txt を参照）。"
     exit 1
   fi
 else
-  warn "wheel 一式が見つかりません（$OUT/wheels/）。オンライン側で収集していないためスキップします。"
+  fail "wheel 一式が見つかりません（$OUT/wheels/）。Python 依存を導入できないため中止します。"
+  fail "  対処: オンライン側で make_offline_kit.sh --fetch を実行して wheels を収集したキットを搬入してください。"
+  exit 1
 fi
 echo ""
 

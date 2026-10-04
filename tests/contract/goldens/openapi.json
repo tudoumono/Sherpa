@@ -4009,6 +4009,29 @@
         "title": "RerunReq",
         "type": "object"
       },
+      "ResolveSettingsReq": {
+        "additionalProperties": false,
+        "properties": {
+          "copy_paths": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Copy Paths",
+            "type": "array"
+          },
+          "path_aliases": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Path Aliases",
+            "type": "object"
+          }
+        },
+        "title": "ResolveSettingsReq",
+        "type": "object"
+      },
       "RunProgress": {
         "description": "実行中 run の逐次進捗。`stage_label` は内部段キー（`stage`）に対応する利用者向けの平文。`done`/`total` はファイル単位の進捗（件数を持たない段では両方 `None`）。",
         "properties": {
@@ -7847,6 +7870,64 @@
         "title": "WorldReq",
         "type": "object"
       },
+      "WorldResolveSettingsResponse": {
+        "description": "資料フォルダの解決範囲の設定（GET/PUT /worlds/{wid}/resolve-settings）。\n\n`copy_paths`＝COPY の取り込み元の場所（優先順・資料フォルダの root からの相対パス）。`path_aliases`＝パスの別名 → 場所。\n`warnings` は資料フォルダの中に見つからない場所（保存は止めない）。`changed` は PUT で内容が変わったか\n（変わると資料フォルダ全体を取り込み直す）。`refresh_started` は PUT でその取り込み直しを起こせたか（false で changed なら別の処理が実行中＝更新待ち）。GET では常に false。",
+        "properties": {
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "copy_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Copy Paths",
+            "type": "array"
+          },
+          "note": {
+            "title": "Note",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path_aliases": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Path Aliases",
+            "type": "object"
+          },
+          "refresh_started": {
+            "title": "Refresh Started",
+            "type": "boolean"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          },
+          "world_id": {
+            "title": "World Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "world_id",
+          "copy_paths",
+          "path_aliases",
+          "warnings",
+          "changed",
+          "refresh_started",
+          "note"
+        ],
+        "title": "WorldResolveSettingsResponse",
+        "type": "object"
+      },
       "WorldStatusResponse": {
         "description": "資料フォルダの状況（GET /worlds/{wid}/status）。取り込み状況の全キーをフラットに展開する。`last_synced_at` は文字列。",
         "properties": {
@@ -8052,6 +8133,10 @@
             ],
             "title": "Partial Extraction Suspected"
           },
+          "resolve_settings_pending": {
+            "title": "Resolve Settings Pending",
+            "type": "boolean"
+          },
           "root_path": {
             "anyOf": [
               {
@@ -8175,7 +8260,8 @@
           "world_id",
           "label",
           "root_path",
-          "last_synced_at"
+          "last_synced_at",
+          "resolve_settings_pending"
         ],
         "title": "WorldStatusResponse",
         "type": "object"
@@ -14014,6 +14100,100 @@
           }
         },
         "summary": "World Refresh",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      }
+    },
+    "/worlds/{wid}/resolve-settings": {
+      "get": {
+        "description": "資料フォルダの解決範囲の設定（COPY の取り込み元の場所・パスの別名）を返す（管理者のみ・読み取り専用）。",
+        "operationId": "world_resolve_settings_get_worlds__wid__resolve_settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "title": "Wid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorldResolveSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "World Resolve Settings Get",
+        "tags": [
+          "資料フォルダ(World)管理"
+        ]
+      },
+      "put": {
+        "description": "資料フォルダの解決範囲の設定を保存する（管理者のみ・監査対象）。内容は正規化して検証し、不正（空・「..」・別名の循環）は 422。\n実在しない場所は警告（`warnings`）として返し保存する。内容が変わったときは「今すぐ更新」と同じ経路で資料フォルダ全体の取り込み直しを起こす（別の処理が実行中なら `refresh_started=false`・更新待ち）。監査が書けなければ保存を取り消して 503。",
+        "operationId": "world_resolve_settings_put_worlds__wid__resolve_settings_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "wid",
+            "required": true,
+            "schema": {
+              "title": "Wid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveSettingsReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorldResolveSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "World Resolve Settings Put",
         "tags": [
           "資料フォルダ(World)管理"
         ]

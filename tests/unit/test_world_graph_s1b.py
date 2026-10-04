@@ -129,3 +129,15 @@ def test_graph_storage_version_is_part_of_the_schema_era(monkeypatch):
     base = world_neo4j._compute_graph_schema_era()
     monkeypatch.setattr(world_neo4j, "GRAPH_STORAGE_VERSION", world_neo4j.GRAPH_STORAGE_VERSION + 1)
     assert world_neo4j._compute_graph_schema_era() != base
+
+
+def test_cap_keeps_reasons_with_project_candidates_before_plain_unresolved(tmp_path):
+    """上限で切るとき、ambiguous などプロジェクトの中に候補がありうる理由が、素の unresolved に押し出されない。"""
+    body = "".join(f" new Q{i:03d}();\n" for i in range(60)) + " new Helper();\n"
+    nodes, _e, _f = _world(tmp_path, {
+        "g/x/Helper.java": "class Helper {}\n", "g/y/Helper.java": "class Helper {}\n",
+        "g/Many.java": "class Many {\n void m() {\n" + body + " }\n}\n"})
+    n = _unresolved_of(nodes, "g/Many.java")
+    assert len(n["unresolved"]) == 50 and n["unresolved_overflow_count"] == 11
+    assert [it["line"] for it in n["unresolved"]] == sorted(it["line"] for it in n["unresolved"])
+    assert sum(it["reason"] == "ambiguous" for it in n["unresolved"]) == 1

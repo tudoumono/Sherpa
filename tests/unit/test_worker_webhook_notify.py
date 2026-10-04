@@ -27,7 +27,7 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(worker, "_ledger_rows", lambda world, *, sig: [])
     monkeypatch.setattr(worker, "world_signature", lambda world: "sig")
     monkeypatch.setattr(world_neo4j, "_env", lambda: {"uri": "bolt://x", "user": "u", "pw": "p"})
-    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw: (0, 0))
+    monkeypatch.setattr(world_neo4j, "load_world", lambda nodes, edges, world, uri, user, pw, plugin_failures=None: (0, 0))
 
     @contextlib.contextmanager
     def _noop_lock(world_id):
@@ -54,7 +54,7 @@ def _stub_pipeline(monkeypatch):
 
     def _fake_finish_and_confirm(run_id, world, *, status, extraction_snapshot=None,
                                  published_snapshot=None, source_doc_ids=None,
-                                 sig=None, manifest=None, doc_count=None, scan_report=None):
+                                 sig=None, manifest=None, doc_count=None, scan_report=None, resolve_sig=None):
         return {"id": run_id, "status": status}
     monkeypatch.setattr(store, "finish_ingest_run_and_confirm_world", _fake_finish_and_confirm)
 
