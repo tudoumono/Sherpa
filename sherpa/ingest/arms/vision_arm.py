@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -351,6 +353,21 @@ def _image_too_large(image_path: Path) -> bool:
     return size > _max_image_mb() * 1024 * 1024
 
 
+# MD 化の 1 ファイルの間に VLM を呼んだ回数（`<provider>/<model>` → 回数）。`count_calls()` の区間だけ数える。
+_CALLS: contextvars.ContextVar = contextvars.ContextVar("vlm_calls", default=None)
+
+
+@contextlib.contextmanager
+def count_calls():
+    """この区間の VLM の呼び出しの回数（`<provider>/<model>` ごと・失敗も 1 回）を数えた辞書を返す。MD 化の完了のログに使う。"""
+    tally: dict = {}
+    token = _CALLS.set(tally)
+    try:
+        yield tally
+    finally:
+        _CALLS.reset(token)
+
+
 def _vlm_read(image_path: Path, cfg: dict, timeout: float) -> str | None:
     """1 枚の画像を VLM（provider 別）で読み取り、テキストを返す（失敗/到達不可は None）。"""
     if _image_too_large(image_path):
@@ -358,6 +375,10 @@ def _vlm_read(image_path: Path, cfg: dict, timeout: float) -> str | None:
                      _max_image_mb(), image_path)
         return None
     provider = cfg["provider"]
+    tally = _CALLS.get()
+    if tally is not None:
+        key = f"{provider}/{cfg.get('model') or '-'}"
+        tally[key] = tally.get(key, 0) + 1
     try:
         if provider == "ollama":
             return _read_ollama(image_path, cfg, timeout)

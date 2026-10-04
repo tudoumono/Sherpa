@@ -301,3 +301,18 @@ def test_llm_render_skips_observation_record_from_real_generated_rag_md(monkeypa
     assert "手書きで「テスト観測」と書かれている" in result.markdown
     assert "AI画像観測（原本確定値ではない）\n観測内容: 手書きで「テスト観測」と書かれている\n（成形済み）" not in result.markdown
     assert result.llm_count >= 1   # 少なくとも canonical 側のどれかは成形されている
+
+
+def test_count_calls_tallies_vlm_reads_per_provider_and_model(tmp_path, monkeypatch):
+    """MD 化の完了のログに出す VLM の呼び出しの回数は、`count_calls()` の区間だけ `<provider>/<model>` ごとに数える（失敗も 1 回）。"""
+    from sherpa.ingest.arms import vision_arm
+    img = tmp_path / "a.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(vision_arm, "_read_openai", lambda *a, **k: "text")
+    monkeypatch.setattr(vision_arm, "_read_ollama", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    vision_arm._vlm_read(img, {"provider": "openai", "model": "m1"}, 1.0)   # 区間の外は数えない
+    with vision_arm.count_calls() as tally:
+        vision_arm._vlm_read(img, {"provider": "openai", "model": "m1"}, 1.0)
+        vision_arm._vlm_read(img, {"provider": "openai", "model": "m1"}, 1.0)
+        vision_arm._vlm_read(img, {"provider": "ollama", "model": "m2"}, 1.0)
+    assert tally == {"openai/m1": 2, "ollama/m2": 1}

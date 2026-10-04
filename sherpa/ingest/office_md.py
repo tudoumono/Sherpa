@@ -1790,6 +1790,9 @@ def _build_derived_into_staging(
         _log.info("MD化を開始します: %s%s", rel,
                   f"（RSS {_rss0:.1f}G）" if _rss0 is not None else "")
         _done_label = "完了"                     # finally の完了行用（キャッシュ復元なら差し替え）
+        from .arms import vision_arm as _vision_arm
+        _vlm_calls = _vision_arm.count_calls()   # このファイルの間の VLM の呼び出しの回数（完了行に出す）
+        _vlm_tally = _vlm_calls.__enter__()
         try:
             # 入口ガード群（`size_exceeded`・`cell_count_exceeded`/`uncompressed_size_exceeded`）は per-file キャッシュ照合より先に評価する
             # （逆順だとキャッシュヒットでガードが素通りする）。キャッシュ照合は全ガード通過後にのみ行う。
@@ -2070,6 +2073,7 @@ def _build_derived_into_staging(
             rel_unhandled = True
             unhandled_failures.append({"doc": rel, "reason": f"unhandled_exception:{exc.__class__.__name__}"})
         finally:
+            _vlm_calls.__exit__(None, None, None)   # 区間は先に閉じる（後のマニフェスト処理が例外でも、次のファイルの数に混ざらない）
             if rel_unhandled:
                 # 想定外の例外で終わった rel は sidecar が不完全な途中状態になりうるため、マニフェスト化しない
                 # （マニフェスト欠落＝次回 sync が要再生成として拾う）
@@ -2079,8 +2083,10 @@ def _build_derived_into_staging(
                 unhandled_failed += 1
                 unhandled_failures.append({"doc": rel, "reason": "manifest_write_failed"})
             _rss1 = _proc_rss_gib()
-            _log.info("MD化が%sしました: %s（%.1f秒%s）",
-                      "失敗" if rel_unhandled else _done_label, rel, time.monotonic() - _t0,
+            _model_note = ("・画像の読み取り " + "・".join(f"{n} 回〔{k}〕" for k, n in sorted(_vlm_tally.items()))
+                           if _vlm_tally else "・モデル呼び出しなし")
+            _log.info("MD化が%sしました: %s（%.1f秒%s%s）",
+                      "失敗" if rel_unhandled else _done_label, rel, time.monotonic() - _t0, _model_note,
                       f"・RSS {_rss0:.1f}G→{_rss1:.1f}G" if _rss0 is not None and _rss1 is not None else "")
             processed_candidates += 1
             if progress is not None:
