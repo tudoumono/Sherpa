@@ -31,9 +31,6 @@ PHASES = frozenset({"gather", "plan", "delegate", "evaluate", "finalize"})
 # 描画クラス分岐用の `kind`（`build_event` は検証せず、`kind_for_event_type` の戻り値としてのみ閉じる）
 KINDS = frozenset({"think", "tool", "agent", "evidence", "evaluation", "hook"})
 
-# v1 最小契約のキー（欠けると描画が壊れる）
-V1_FIELDS = ("id", "kind", "label", "detail", "status")
-
 _KIND_EXACT = {"evidence_committed": "evidence", "replan_requested": "evaluation"}
 _KIND_PREFIXES = (
     ("agent_", "agent"), ("tool_", "tool"), ("candidate_", "evidence"),

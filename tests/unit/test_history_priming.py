@@ -5,7 +5,7 @@
 構築する直前ターンの (user, assistant) 完全対・二重キャップ済み）が agentic ループ（openai_style）と
 Codex の実送信 body/messages/contents/プロンプトへ実際に注入されることを、外部 HTTP を実際に
 叩かずに検証する。seam: agentic ループ（openai_style）は
-`agentic_search._post` 差し替え、Codex は `_prompt`/`_prompt_mcp` を
+`agentic_search._post` 差し替え、Codex は `_prompt_mcp` を
 直接呼ぶ（プロセス起動なし）。
 
 `chat_service._history_pairs` 自体の単体テスト（完全対抽出・二重キャップ・確認ID 回帰等）は
@@ -43,26 +43,7 @@ def test_codex_run_sets_history_attribute_before_knowledge_off_branch():
 
 # ---- provider 経由の end-to-end 配線（_agentic_loop から agentic_search への history 伝搬） ----
 
-# ---- Codex: _prompt/_prompt_mcp に履歴ブロックが挿入される（プロセス起動なし） ----
-
-def test_codex_prompt_includes_history_block_before_question():
-    p = A.CodexProvider()
-    p._history = list(_HISTORY)
-    prompt = p._prompt("続きを教えて", "qa", {"headline": "h", "data": {}, "summary": {}}, "v1")
-    assert "【直前の会話（参考・新しいものが下）】" in prompt
-    assert prompt.index("前回の回答です") < prompt.index("【質問】")
-    assert "【質問】続きを教えて" in prompt
-
-
-def test_codex_prompt_history_empty_matches_legacy_output_exactly():
-    env = {"headline": "h", "data": {}, "summary": {}}
-    p_empty = A.CodexProvider()             # 既定 _history=[]（run() 未実行）
-    p_explicit = A.CodexProvider()
-    p_explicit._history = []
-    out_empty = p_empty._prompt("質問", "qa", env, "v1")
-    assert out_empty == p_explicit._prompt("質問", "qa", env, "v1")
-    assert "【直前の会話" not in out_empty
-
+# ---- Codex: _prompt_mcp に履歴ブロックが挿入される（プロセス起動なし） ----
 
 def test_codex_prompt_mcp_includes_history_block_before_question():
     p = A.CodexProvider()

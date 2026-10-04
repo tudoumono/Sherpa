@@ -13,7 +13,6 @@ LLM は使わない。言語ごとの抽出はアナライザ側、本モジュ�
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import posixpath
 import re
@@ -21,10 +20,9 @@ import stat as stat_mod
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
-from .. import corpus_docs, doc_text, grep_tool, scope_infer, text_encoding, worlds
+from .. import corpus_docs, doc_text, scope_infer, text_encoding, worlds
 from . import importance, text_kind
 from .analyzers import registry as analyzer_registry
-from .identifiers import normalize_code_name as _norm
 
 
 def _scope_meta(rel: str) -> dict:
@@ -51,7 +49,7 @@ def _cid(label: str, world: str, rel: str, name: str) -> str:
 def _node(label, world, rel, name, value=None):
     return {"cid": _cid(label, world, rel, name), "label": label, "name": name,
             "world_id": world, "path": rel, "value": value,
-            "extraction_method": "static", "status": "active", **_scope_meta(rel)}
+            "status": "active", **_scope_meta(rel)}
 
 
 def _top(rel: str):
@@ -299,7 +297,7 @@ def _ensure_mention_document(nodes: dict, world_id: str, rel: str) -> str:
     nodes[cid] = {"cid": cid, "label": "Document", "name": rel, "world_id": world_id,
                  "top_scope": _top(rel), "phase": meta.get("phase"), "category": meta.get("category"),
                  "path": rel, "scope_path": "/".join(rel.split("/")[:-1]),
-                 "value": None, "extraction_method": "static", "status": "active"}
+                 "value": None, "status": "active"}
     return cid
 
 
@@ -331,7 +329,7 @@ def _mention_edges_for_doc(rel: str, text: str, mdict: dict, min_len: int, max_p
             if doc_cid is None:
                 doc_cid = _ensure_mention_document(nodes, world_id, rel)
             edges.append({"type": "DOCUMENTS", "src": doc_cid, "dst": dst_cid,
-                         "doc": rel, "line": 0, "extraction_method": "static", "status": "active",
+                         "doc": rel, "line": 0, "status": "active",
                          "via": "mention"})
             seen_dst.add(dst_cid)
             added += 1
@@ -356,7 +354,7 @@ def _mention_pass(world_dir, world_id: str, defs: dict, aliases: dict, files, no
     if not mdict:
         return
     with worlds.pin_world_root(world_id, world_dir):
-        docs = corpus_docs.iter_world_documents(world_id, include_rag=grep_tool.rag_grep_enabled(),
+        docs = corpus_docs.iter_world_documents(world_id, include_rag=True,
                                                 root=world_dir, files=files)
         for d in docs:
             if d.get("branch") != "office" or d.get("state") != "ready":
@@ -470,7 +468,7 @@ def build_world(world_dir, world_id: str, *, files=None):
                 config_key_index.setdefault(
                     (child.label, child.extra.get("key_kind"), child.name), []).append((rel, child.key))
             edges.append({"type": "CONTAINS", "src": parent_cid, "dst": child_cid, "doc": rel,
-                          "line": child.line, "extraction_method": "static", "status": "active"})
+                          "line": child.line, "status": "active"})
 
     # --- Pass 1: 定義収集＋ノード（拡張子→アナライザを引いて collect_defs を呼ぶ汎用ループ）---
     for rp, rel in files:
@@ -585,7 +583,7 @@ def build_world(world_dir, world_id: str, *, files=None):
             dst_cid = _cid(kind, world_id, rel, key)
             edge_src, edge_dst = (dst_cid, src_cid) if reverse else (src_cid, dst_cid)
             edge = {"type": etype, "src": edge_src, "dst": edge_dst,
-                   "doc": ref_rel, "line": line, "extraction_method": "static", "status": "active"}
+                   "doc": ref_rel, "line": line, "status": "active"}
             _apply_extra(edge, etype, ref_rel, analyzer_name, dict(extra))
             link_edges.append(edge)
 
@@ -659,7 +657,7 @@ def build_world(world_dir, world_id: str, *, files=None):
         dst_cid = _cid(kind, world_id, rel, resolved_name)
         edge_src, edge_dst = (dst_cid, src_cid) if reverse else (src_cid, dst_cid)
         edge = {"type": etype, "src": edge_src, "dst": edge_dst,
-               "doc": ref_rel, "line": line, "extraction_method": "static", "status": "active"}
+               "doc": ref_rel, "line": line, "status": "active"}
         _apply_extra(edge, etype, ref_rel, analyzer_name, extra)
         link_edges.append(edge)
 
@@ -711,30 +709,6 @@ def build_world(world_dir, world_id: str, *, files=None):
     _mention_pass(world_dir, world_id, defs, mention_aliases, files, nodes, edges, flags)
 
     return list(nodes.values()), edges, flags
-
-
-def subgraph(nodes, edges, prefix: str | None = None):
-    """範囲フィルタ: `path` prefix（どの階層でも）で部分グラフに絞る。
-
-    `prefix=None`/`''` は全体。両端点が範囲内のエッジだけ残す。
-    """
-    if not prefix:
-        return list(nodes), list(edges)
-    pref_top = prefix.split("/", 1)[0]
-
-    def _in(n):
-        p = n.get("path")
-        if p:                                            # ファイル由来＝path prefix
-            return p == prefix or p.startswith(prefix + "/")
-        sp = n.get("scope_path")
-        if sp:                                           # 概念（定義 doc あり）＝scope_path prefix（深い階層でも正しい）
-            return sp == prefix or sp.startswith(prefix + "/")
-        return n.get("top_scope") == pref_top            # doc 無し概念＝世代で所属
-
-    keep = [n for n in nodes if _in(n)]
-    cids = {n["cid"] for n in keep}
-    sub_edges = [e for e in edges if e["src"] in cids and e["dst"] in cids]
-    return keep, sub_edges
 
 
 def _lstat_kind(p) -> str | None:

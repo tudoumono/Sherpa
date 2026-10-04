@@ -50,8 +50,8 @@ _PATH_PLACEHOLDER_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
 # 型さえ満たせば内容は任意。ここに無いルートは全フィールドが optional（既定 `{}` で
 # validation を通る）か、body 自体が無いため既定の空 `{}` のままで良い。
 # 対応する Pydantic モデルは sherpa/api.py・sherpa/routers/*.py（ExtSearchReq のみ sherpa/ext_api.py）参照:
-#   PasswordChangeReq / UserCreateReq / ShareCreateReq / ImpactReq / ChatReq / ChatStreamStopReq /
-#   TestReq / RenameReq / TroubleshootReq / QaReq / WorldReq / DiffReq /
+#   PasswordChangeReq / UserCreateReq / ShareCreateReq / ChatReq /
+#   TestReq / RenameReq / WorldReq / DiffReq /
 #   DisableReq / RebindReq / ReconvertReq / AnnouncementCreateReq
 # （`POST /chat/{conversation_id}/messages/{message_id}/feedback` は
 #   body の型を固定しない自前パース（`routers/chat.py::chat_message_feedback`）のため対象外・下の最小 body は認証チェックへ
@@ -63,17 +63,10 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
     ("POST", "/admin/announcements"): {"title": "x", "body": "x"},
     ("POST", "/conversations/{cid}/shares"): {
         "invitee_user_ids": ["x"], "expires_at": "2999-01-01T00:00:00+00:00"},
-    ("POST", "/impact/run"): {"start": "x"},
-    ("POST", "/chat"): {"message": "x", "stream_id": "x1234567"},
-    # RV MEDIUM（2026-07-03再検証）: stream_id は UUID相当の形式制約（最短8文字）を持つため、
-    # 1文字の "x" では body validation（422）で止まってしまい認証チェックまで届かない。
-    ("POST", "/chat/stream/stop"): {"stream_id": "x1234567"},
     ("POST", "/chat/turns"): {"message": "x"},   # ChatReq と同一モデル（背景実行版チャット送信）
     ("POST", "/chat/{conversation_id}/messages/{message_id}/feedback"): {"rating": "up"},
     ("POST", "/settings/test"): {"provider": "openai"},
     ("PATCH", "/conversations/{cid}"): {"title": "x"},
-    ("POST", "/troubleshoot/run"): {"symptom": "x"},
-    ("POST", "/qa/run"): {"question": "x"},
     ("POST", "/worlds"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/diff"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
     ("POST", "/worlds/{wid}/rebind"): {"path": "/tmp/sherpa-auth-snapshot-probe"},
@@ -91,7 +84,6 @@ _JSON_BODY: dict[tuple[str, str], dict] = {
 
 # GET の追加必須 query（共通ダミー `query`/`q`/`rel` だけでは満たせないルート専用）。
 _EXTRA_QUERY: dict[tuple[str, str], dict] = {
-    ("GET", "/chat/stream"): {"message": "x", "stream_id": "x1234567"},
     ("GET", "/ext/v1/doc"): {"world": "x", "path": "x"},
 }
 

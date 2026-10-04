@@ -1,30 +1,28 @@
 """FastAPI アプリの入口。各 router を include し、起動時処理（lifespan が呼ぶ `_warn_*`・シード・孤児掃除・TTL 掃除）と `/ui` 配信を持つ。
 
-API パラメータの資料フォルダ指定は `world` のみ。結果（`/impact` の解析結果）は in-memory（単一 worker 前提）。
+API パラメータの資料フォルダ指定は `world` のみ。
 設計: docs/design/architecture.md「コンポーネント図（主要コンテナごと）」
 """
 from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
     swagger_ui_default_parameters,
 )
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from sherpa import auth, ext_api, store, worlds
 # テストが `api.scope_mod` を属性参照するため import を維持する
 from sherpa import scope as scope_mod
 from sherpa.deps import (
-    _DEFAULT_WORLD,
     _USERS_DIR,
     _browse_roots,
     _ensure_initial_admin,
@@ -58,18 +56,13 @@ from sherpa.routers.workspace import (  # noqa: F401
     workspace_file_download,
     workspace_search,
 )
-# 同上（`_analyses` 等は router と同一オブジェクトを共有する）
-from sherpa.routers.impact import _ANALYSES_TTL_SECONDS, _analyses, _analyses_lock, _seq  # noqa: F401
 # 同上
 from sherpa.routers.worlds import _ingest_summary, _subdirs  # noqa: F401
-# 同上（`ChatReq`・`_STREAM_STOP_EVENTS`/`_STREAM_STOP_LOCK`・`_persist_turn_crash` をテストが `sherpa.api` 経由で参照する）
+# 同上（`ChatReq`・`_persist_turn_crash` をテストが `sherpa.api` 経由で参照する）
 from sherpa.routers.chat import (  # noqa: F401
     ChatReq,
-    _STREAM_STOP_EVENTS,
-    _STREAM_STOP_LOCK,
     _persist_turn_crash,
 )
-from sherpa.ingest import worker as ingest_worker
 from sherpa.lifespan import lifespan
 
 _log = logging.getLogger("sherpa")
@@ -84,15 +77,13 @@ _TAGS_METADATA = [
     {"name": "運営掲示板", "description": "トップ画面のお知らせ（メンテナンス・活用事例・お知らせ）の閲覧・投稿・編集・削除。"},
     {"name": "会話共有", "description": "会話の共有リンク発行・受領・取消。"},
     {"name": "個人ワークスペース", "description": "個人ファイルのアップロード・一覧・削除・grep検索（共有KBには索引化しない）。"},
-    {"name": "影響分析", "description": "ナレッジグラフを起点とした影響範囲分析の実行・取得・Excel出力。"},
     {"name": "範囲", "description": "検索・分析対象をフォルダ単位で絞り込むスコープツリー。"},
-    {"name": "チャット", "description": "チャット（同期・SSEストリーミング）。"},
+    {"name": "チャット", "description": "チャットのターンの開始・SSE での受け取り・停止。"},
     {"name": "設定", "description": "AIプロバイダ・モデル・system_prompt等の設定取得/更新/接続テスト。"},
     {"name": "会話管理", "description": "会話履歴の一覧・取得・削除・ピン留め・改名。"},
-    {"name": "トラブルシュート・QA", "description": "症状からの原因調査、仕様問い合わせ（QA）レンズ。"},
     {"name": "文書", "description": "文書台帳の参照と原本ダウンロード。"},
-    {"name": "資料フォルダ(World)管理", "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択、業務語対応の下案/承認/無効化。"},
-    {"name": "ナレッジグラフ", "description": "ナレッジグラフの可視化データ・検索・自然言語質問。"},
+    {"name": "資料フォルダ(World)管理", "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択。"},
+    {"name": "ナレッジグラフ", "description": "ナレッジグラフの可視化データ・検索。"},
     {"name": "システム", "description": "ヘルスチェック・ルート・静的UI配信。"},
     {"name": "管理者:外部APIキー", "description": "外部連携 API（/ext/v1）のキー発行・一覧・失効（管理者のみ）。"},
 ]
@@ -178,9 +169,6 @@ app.include_router(system.settings_router)
 
 
 app.include_router(conversations.router)
-
-
-app.include_router(impact.lens_router)
 
 
 app.include_router(documents_routes.download_router)
@@ -338,7 +326,6 @@ def _warn_default_admin_password():
     （初回ログインでパスワード変更が強制されるため）。
     """
     import logging
-    from sherpa import auth
     env = os.environ.get("SHERPA_ENV", "").strip().lower()
     is_prod = env in ("prod", "production")
     configured = os.environ.get("SHERPA_ADMIN_PASSWORD")
@@ -746,8 +733,6 @@ def _seed_user_agent_from_env():
     if sysset.get(_USER_AGENT_SEED_MARKER_KEY) is not None:
         return
     raw = (os.environ.get("SHERPA_AGENT") or "").strip().lower()
-    if raw in agent_constructs.LEGACY_AGENTS:
-        raw = "simple"
     try:
         if raw in agent_constructs.STANDARD_AGENTS:
             n = store.seed_user_agent_once(raw, _USER_AGENT_SEED_MARKER_KEY, _USER_AGENT_SEED_VERSION)

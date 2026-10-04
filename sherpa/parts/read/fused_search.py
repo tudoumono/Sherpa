@@ -55,7 +55,7 @@ def search(world: str, query: str, engines=None, k: int = 10,
     for e in sel:
         # graph だけ depth を渡し、keyword／vector は layer を渡す
         if e == "graph":
-            hits, reason = runners[e](world, query, sp, k, settings, depth)
+            hits, reason = runners[e](world, query, sp, k, depth)
         else:
             hits, reason = runners[e](world, query, sp, k, settings, layer)
         if reason:
@@ -147,7 +147,7 @@ def _neo4j_session():
         drv.close()
 
 
-def _search_graph(world, query, sp, k, settings, depth=IMPACT_MAX_DEPTH):
+def _search_graph(world, query, sp, k, depth=IMPACT_MAX_DEPTH):
     """語→ノード照合→近傍展開→文書＋経路。`run_impact`（構造たどり＋presumed フォールバック）をそのまま使い、読むだけ。depth は影響たどりの深さ。"""
     from neo4j.exceptions import AuthError, ServiceUnavailable
 

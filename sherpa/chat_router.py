@@ -74,7 +74,7 @@ def _resume_lens(message: str):
     return lens, original
 
 
-def route(message: str, world: str = "v1", known_terms=None) -> dict:
+def route(message: str, known_terms=None) -> dict:
     """メッセージ → {lens, input, reason, confident}。`confident=False` は曖昧（chat_service が LLM/clarify へ進む）。
     ① clarify の回答（`確認ID: ask-*` 付き）を最初に解決する。
     ② 強い cue（障害/影響/作成）が 2 カテゴリ以上同居するときだけ曖昧にする。
@@ -96,11 +96,6 @@ def route(message: str, world: str = "v1", known_terms=None) -> dict:
     if _has(msg, _QA):
         return _decision("qa", msg, known_terms, "問い合わせの語", confident=True)
     return _decision("qa", msg, known_terms, "既定（検索）", confident=True)  # cue 無し＝素の検索
-
-
-def looks_like_author(message: str) -> bool:
-    """作成系の語を含むか（ヒューリスティックのみ・LLM 呼び出しなし）。ナレッジ参照オフの経路から使う公開ラッパー。"""
-    return _has((message or "").strip(), _AUTHOR)
 
 
 def decision_for(lens: str, message: str, known_terms=None, reason: str = "AI判定") -> dict:

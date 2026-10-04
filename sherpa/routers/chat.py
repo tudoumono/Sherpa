@@ -1,5 +1,5 @@
-"""チャット系エンドポイント。`chat_router` は `GET /chat/tools-availability`・`POST /chat`・`GET /chat/stream`・`POST /chat/stream/stop`・`POST /chat/turns`・`GET /chat/turns/{turn_id}/stream`・`GET /chat/turns/running`・`POST /chat/turns/{turn_id}/stop` の 8 ルート。
-途中停止レジストリ `_STREAM_STOP_LOCK`/`_STREAM_STOP_EVENTS`/`_STREAM_ID_PATTERN` と、背景実行のヘルパ `_persist_turn_crash`/`_turn_run_fn` もここに置き、api.py が再エクスポートする（tests が `api._STREAM_STOP_EVENTS[...]`/`api._persist_turn_crash(...)` を参照する）。
+"""チャット系エンドポイント。`chat_router` は `GET /chat/tools-availability`・`POST /chat/turns`・`GET /chat/turns/{turn_id}/stream`・`GET /chat/turns/running`・`POST /chat/turns/{turn_id}/stop` の 5 ルート。
+背景実行のヘルパ `_persist_turn_crash`/`_turn_run_fn` もここに置き、api.py が再エクスポートする（tests が `api._persist_turn_crash(...)` を参照する）。
 `sherpa.api` を import しない。
 設計: docs/design/chat.md「1ターンの流れ」
 """
@@ -20,17 +20,14 @@ from sherpa import stop_kind as stop_kind_mod
 from sherpa import tools_pref as tools_pref_mod
 from sherpa.agents import get_provider
 from sherpa.chat_router import extract_slash_lens as _extract_slash_lens
-from sherpa.chat_service import _ensure_conversation, handle_message, stream_message
-from sherpa.deps import _USERS_DIR, _WORLD_PATTERN, _WorldField, _current_user, _resolve_world, neo4j_session, validated_scope
+from sherpa.chat_service import _ensure_conversation, stream_message
+from sherpa.deps import _USERS_DIR, _WorldField, _current_user, _resolve_world, neo4j_session, validated_scope
 from sherpa.schemas import ChatTurnsRunningResponse, ChatTurnStartResponse, ChatTurnStopResponse
 
 _log = logging.getLogger("sherpa")
 
 # router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。
 chat_router = APIRouter()
-
-
-_STREAM_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$"
 
 
 class ChatReq(BaseModel):
@@ -50,7 +47,7 @@ class ChatReq(BaseModel):
     # Codex の Web 検索をこのチャットで希望するか（既定OFF）。管理者許可と、頭脳が Codex であることが揃わなければサーバ側で常に無効化される（`sherpa/providers/codex/sandbox.py::_web_search_disabled_value` が唯一の判定点）。
     web_search: bool = False
     # 検索経路トグル。既定/省略/null は全 ON。対象は grep/fulltext（ES・全文＋ベクトル）/graph の 3 経路のみ（list_docs/read_around/ask_user は常時ON）で、3 つとも false は 422。
-    # キーを `Literal["grep","fulltext","graph"]`・値を `StrictBool` にする（素の `dict[str, bool]` は非 bool 値を静かに bool へ変換するため）。未知キーも型で 422 になる。`GET /chat/stream` は手組み dict でこの型強制を経ないため、`normalize_tools_pref` の検査も必要。
+    # キーを `Literal["grep","fulltext","graph"]`・値を `StrictBool` にする（素の `dict[str, bool]` は非 bool 値を静かに bool へ変換するため）。未知キーも型で 422 になる。
     tools: dict[Literal["grep", "fulltext", "graph"], StrictBool] | None = None
     # 利用者が実際に切り替えた軸（画面のチップ操作履歴）。会話メタ（`answer.scope.tools_explicit`）へそのまま残す復元専用の記録で、実行にも 422 判定にも使わない。省略（`None`）は記録なし。
     tools_explicit: list[Literal["grep", "fulltext", "graph"]] | None = None
@@ -62,11 +59,6 @@ class ChatReq(BaseModel):
         if v is not None:
             tools_pref_mod.normalize_tools_pref(v)
         return v
-
-
-class ChatSyncReq(ChatReq):
-    """同期 `POST /chat` の本文。途中停止用の相関ID（`/chat/stream/stop` で使う）が必須。"""
-    stream_id: str = Field(pattern=_STREAM_ID_PATTERN)
 
 
 def _knowledge_for_settings(settings: dict, requested: bool) -> bool:
@@ -118,11 +110,11 @@ def _validate_tools_availability(tools: dict | None, availability: dict | None =
 
 
 def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: bool):
-    """3 つの実 HTTP 入口（`/chat`・`/chat/stream`・`/chat/turns`）が共有する準備手順。
+    """`/chat/turns` の準備手順。
     ① ユーザ設定を一度だけ読み、knowledge の実効値（`_knowledge_for_settings`）と Provider 構築の両方へ同じスナップショットを渡す。
     ② 同一のスナップショットから Provider を一度だけ組み立てる。
     ③ `_agentic_target_check`（接続先の I/O-free allowlist 検証）→ `tool_availability`（ES/Neo4j への実接続チェック）の順で呼ぶ（不許可の接続先へ通信する前に拒否するため）。
-    返り値 `(knowledge, provider, settings, sys_settings, tools_availability)`。`knowledge` は各エンドポイントの分岐へ、残り 3 つは実行本体（`handle_message`/`stream_message`/`_turn_run_fn`）へそのまま渡す。
+    返り値 `(knowledge, provider, settings, sys_settings, tools_availability)`。`knowledge` は各エンドポイントの分岐へ、残り 3 つは実行本体（`_turn_run_fn`）へそのまま渡す。
     `store.get_settings` の失敗は捕捉せず伝播させる（500 で停止）。knowledge の実効値が False のときは Provider を準備せず `(False, None, None, None, None)` を返す。
     `_agentic_target_check` が `llm.PreflightRejected`（`SsrfBlocked` を含む）を送出した場合は捕捉し、固定文言の `HTTPException(422)` に変換する（例外の生文言は応答に含めない）。それ以外の例外は伝播して 500 のままにする。
     """
@@ -130,7 +122,7 @@ def _prepare_agentic_snapshot(uid: str, requested_knowledge: bool, web_search: b
     knowledge = _knowledge_for_settings(settings, requested_knowledge)
     if not knowledge:
         return False, None, None, None, None
-    # `handle_message`/`stream_message` と同じ上書き（実行時にも同じ値で冪等に上書きされる）。
+    # `stream_message` と同じ上書き（実行時にも同じ値で冪等に上書きされる）。
     settings = {**settings, "codex_web_search": bool(web_search)}
     sys_settings = store._read_system_settings_fresh()
     provider = get_provider(settings, system_settings=sys_settings)
@@ -149,156 +141,7 @@ def chat_tools_availability(request: Request):
     return agentic_search.tool_availability()
 
 
-@chat_router.post("/chat", tags=["チャット"])
-def chat(req: ChatSyncReq, request: Request):
-    """同期チャット。knowledge=true でナレッジグラフ／検索を使う回答、false は素の対話。"""
-    u = _current_user(request)
-    _check_chat_write(u, req.conversation_id)
-    uid = u["uid"]
-    w = _resolve_world(req.world)
-    # settings を一度だけ読み、knowledge の実効値と Provider を同じスナップショットから準備する。接続先検証→可用性チェックの順で行い、受付（422判定）と実行本体（handle_message）へ同じ Provider/settings/snapshot を渡す。
-    knowledge, provider, settings, sys_settings, tools_availability = _prepare_agentic_snapshot(
-        uid, req.knowledge, req.web_search)
-    if knowledge:
-        validated_scope(w, req.scope_paths)  # ナレッジ参照は実在 world のみ＋scope 検証（正規化は handle_message 側）。
-        _validate_tools_availability(req.tools, availability=tools_availability)  # 明示ON指定の不達ツールは 422（ツール名つき）。
-    stop_event = threading.Event()
-    with _STREAM_STOP_LOCK:
-        if req.stream_id in _STREAM_STOP_EVENTS:
-            raise HTTPException(409, "この stream_id は既に使用中です")
-        _STREAM_STOP_EVENTS[req.stream_id] = (uid, stop_event)
-    try:
-        if not knowledge:
-            return handle_message(None, req.message, w,
-                                  conversation_id=req.conversation_id, knowledge=False,
-                                  user_id=uid, personal=req.personal,
-                                  users_dir=str(_USERS_DIR), web_search=req.web_search,
-                                  tools_availability=tools_availability,
-                                  provider=provider, settings=settings, sys_settings=sys_settings,
-                                  stop_event=stop_event)
-        with neo4j_session() as s:
-            return handle_message(s, req.message, w,
-                                  conversation_id=req.conversation_id,
-                                  scope_paths=req.scope_paths, layer=req.layer, lens=req.lens, knowledge=True,
-                                  user_id=uid, personal=req.personal,
-                                  users_dir=str(_USERS_DIR), web_search=req.web_search,
-                                  depth_profile=req.depth_profile, tools=req.tools,
-                                  tools_explicit=req.tools_explicit,
-                                  tools_availability=tools_availability,
-                                  provider=provider, settings=settings, sys_settings=sys_settings,
-                                  stop_event=stop_event)
-    finally:
-        with _STREAM_STOP_LOCK:
-            _STREAM_STOP_EVENTS.pop(req.stream_id, None)
-
-
-# 途中停止: stream_id ごとの threading.Event を登録し、`/chat/stream/stop` から明示的に set する。EventSource.close() だけではサーバ側の generator が次のチャンク送信まで切断に気づけず、Codex はサブプロセスの stdout をブロッキング read しているため、set を検知して即 `_killpg` する（agents.py）。
-_STREAM_STOP_LOCK = threading.Lock()
-_STREAM_STOP_EVENTS: dict[str, tuple[str, threading.Event]] = {}  # stream_id -> (uid, Event)。
-# stream_id はクライアント生成の相関IDのため、UUID相当（十分なエントロピー・ログ/URLに安全な文字集合）に形式を制約する。`crypto.randomUUID()` 由来（36桁）と、chat.js のフォールバック（`${Date.now()}-${random.toString(36)}`）の両方を通す。
-
-
-@chat_router.get("/chat/stream", tags=["チャット"])
-def chat_stream(request: Request, message: str = Query(...),
-                world: str | None = Query(None, pattern=_WORLD_PATTERN),
-                conversation_id: int | None = None, knowledge: bool = True,
-                personal: bool = False,  # 個人ファイル参照トグル。
-                scope_paths: list[str] = Query(default_factory=list),
-                # 探す対象。既定 both＝フィルタなし。
-                layer: Literal["docs", "code", "both"] = "both",
-                # 調べ方の明示指定。既定 None（省略）＝自動（"auto" は受理しない）。
-                lens: Literal["impact", "troubleshoot", "qa", "author"] | None = Query(None),
-                # 調べる深さ。既定 "standard"＝見直し 2 回。
-                depth_profile: Literal["quick", "standard", "deep", "max"] = "standard",
-                # Codex の Web 検索をこのチャットで希望するか（既定OFF・`ChatReq.web_search` と同じ）。
-                web_search: bool = False,
-                # 検索経路トグル。`ChatReq.tools` の各キーを個別の query param に分解したもの（既定 None＝省略＝全ON）。`bool | None = None` にして「省略」と「明示的に true」を区別する（可用性 422 判定が省略キーまで対象にしないため）。
-                tools_grep: bool | None = None, tools_fulltext: bool | None = None,
-                tools_graph: bool | None = None,
-                # 利用者が実際に切り替えた軸（`ChatReq.tools_explicit` と同じ・復元専用）。同名の繰り返しクエリで受け、空＝省略。
-                tools_explicit: list[Literal["grep", "fulltext", "graph"]] = Query(default_factory=list),
-                # 途中停止用の相関ID（クライアント生成・UUID相当に形式制約）。
-                stream_id: str = Query(..., pattern=_STREAM_ID_PATTERN)):
-    """チャットの SSE ストリーミング版（`/chat` と同じ意味論・逐次イベントで返す）。"""
-    u = _current_user(request)
-    # 実行を経過時間で打ち切らないため、途中停止の導線（`/chat/stream/stop`）を持たないストリームは受け付けない。
-    _check_chat_write(u, conversation_id)
-    w = _resolve_world(world)
-    uid = u["uid"]
-    # 明示指定されたキーだけを残す（欠落キーを埋めない）。
-    tools_raw = {k: v for k, v in
-                {"grep": tools_grep, "fulltext": tools_fulltext, "graph": tools_graph}.items()
-                if v is not None} or None
-    try:
-        tools_pref_mod.normalize_tools_pref(tools_raw)  # 構造検証のみ（3 つとも false 等）。戻り値は使わない。
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-    # settings を一度だけ読み、knowledge の実効値と Provider を同じスナップショットから準備する。接続先検証→可用性チェックの順で行い、受付（422判定）と実行本体（stream_message・SSE closure）へ同じ Provider/settings/snapshot を渡す。
-    knowledge, provider, settings, sys_settings, tools_availability = _prepare_agentic_snapshot(
-        uid, knowledge, web_search)
-    if knowledge:
-        validated_scope(w, scope_paths)  # 実在 world のみ＋scope 検証（response 作成前に弾く）。
-        _validate_tools_availability(tools_raw, availability=tools_availability)  # 明示ON指定の不達ツールは 422（ツール名つき）。
-    stop_event = threading.Event()
-    with _STREAM_STOP_LOCK:
-        # 同じ stream_id が使用中なら上書きせず 409 で拒否する（上書きすると先のストリームの Event 参照が失われ止められなくなる）。
-        if stream_id in _STREAM_STOP_EVENTS:
-            raise HTTPException(409, "この stream_id は既に使用中です")
-        _STREAM_STOP_EVENTS[stream_id] = (uid, stop_event)
-
-    def gen():
-        try:
-            if not knowledge:
-                for evt in stream_message(None, message, w,
-                                          conversation_id=conversation_id, knowledge=False,
-                                          user_id=uid, personal=personal,
-                                          users_dir=str(_USERS_DIR), stop_event=stop_event,
-                                          web_search=web_search, tools_availability=tools_availability,
-                                          provider=provider, settings=settings, sys_settings=sys_settings):
-                    yield f"data: {json.dumps(evt, ensure_ascii=False, default=str)}\n\n"
-                return
-            with neo4j_session() as s:  # session は generator の内側で開き、streaming 中は開いたままにする。
-                for evt in stream_message(s, message, w,
-                                          conversation_id=conversation_id,
-                                          scope_paths=scope_paths, layer=layer, lens=lens, knowledge=True,
-                                          user_id=uid, personal=personal,
-                                          users_dir=str(_USERS_DIR), stop_event=stop_event,
-                                          web_search=web_search, depth_profile=depth_profile,
-                                          tools=tools_raw, tools_explicit=tools_explicit or None,
-                                          tools_availability=tools_availability,
-                                          provider=provider, settings=settings, sys_settings=sys_settings):
-                    yield f"data: {json.dumps(evt, ensure_ascii=False, default=str)}\n\n"
-        finally:
-            with _STREAM_STOP_LOCK:
-                # 登録されている Event が自分が作ったものと同一オブジェクト（`is`）の場合のみ pop する（他者の登録を巻き添えにしない）。
-                entry = _STREAM_STOP_EVENTS.get(stream_id)
-                if entry is not None and entry[1] is stop_event:
-                    _STREAM_STOP_EVENTS.pop(stream_id, None)
-
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-class ChatStreamStopReq(BaseModel):
-    stream_id: str = Field(pattern=_STREAM_ID_PATTERN)
-
-
-@chat_router.post("/chat/stream/stop", tags=["チャット"])
-def chat_stream_stop(req: ChatStreamStopReq, request: Request):
-    """ストリーミング中のチャットを途中停止する（本人のストリームのみ）。対応する `stream_id` が無い/完了済み/他人のストリームの場合も `{"ok": false}` を返すだけでエラーにしない（存在有無を教えない）。"""
-    u = _current_user(request)
-    with _STREAM_STOP_LOCK:
-        entry = _STREAM_STOP_EVENTS.get(req.stream_id)
-    if entry is None:
-        return {"ok": False}
-    owner_uid, event = entry
-    if owner_uid != u["uid"]:
-        return {"ok": False}
-    event.set()
-    return {"ok": True}
-
-
-# チャットターンのバックグラウンド実行。送信するとサーバ側の background thread としてターンを起動し、HTTP 接続（SSE 購読）の有無と無関係に完走・DB 永続する。`/chat`・`/chat/stream`（＋`/chat/stream/stop`）は後方互換のため残す。
+# チャットターンのバックグラウンド実行。送信するとサーバ側の background thread としてターンを起動し、HTTP 接続（SSE 購読）の有無と無関係に完走・DB 永続する。
 # 設計: docs/design/chat.md「停止と同時実行」
 
 
@@ -370,7 +213,7 @@ def _turn_run_fn(message: str, world: str, uid: str,
                  tools_explicit: list | None = None,
                  tools_availability: dict | None = None,
                  provider=None, settings: dict | None = None, sys_settings: dict | None = None):
-    """バックグラウンド実行本体を作る（conversation_id 確定後に呼ばれるファクトリで、`chat_turns.start_turn` の `run_fn_factory` として渡す）。`/chat/stream` の `gen()` と同じ呼び分け（knowledge の有無で neo4j_session の要否が変わる）。
+    """バックグラウンド実行本体を作る（conversation_id 確定後に呼ばれるファクトリで、`chat_turns.start_turn` の `run_fn_factory` として渡す）。knowledge の有無で neo4j_session の要否が変わる。
     `web_search`・`depth_profile`・`tools`・`tools_explicit` は `ChatReq` の値をそのまま転送する。
     `tools_availability`・`provider`/`settings`/`sys_settings`（既定 `None`）: 受付時（`chat_turns_start`）に組み立てた同一のスナップショットをそのまま `stream_message` へ転送する（背景実行は応答後に時間が空きうるため、ここで再取得して受付時と判定が食い違わないようにする）。
     """

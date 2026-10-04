@@ -171,19 +171,6 @@ def test_is_query_timeout_matches_known_code_shapes():
     assert not wn._is_query_timeout(_other_error())
 
 
-# ---- env 検証（_env_int・agentic_search/lens_service と同一セマンティクス） --
-
-def test_env_int_falls_back_on_invalid_values(monkeypatch):
-    monkeypatch.setenv("SHERPA_TEST_LIMIT", "-1")
-    assert wn._env_int("SHERPA_TEST_LIMIT", 30, 1, 600) == 30
-    monkeypatch.setenv("SHERPA_TEST_LIMIT", "abc")
-    assert wn._env_int("SHERPA_TEST_LIMIT", 30, 1, 600) == 30
-    monkeypatch.setenv("SHERPA_TEST_LIMIT", "60")
-    assert wn._env_int("SHERPA_TEST_LIMIT", 30, 1, 600) == 60
-    monkeypatch.delenv("SHERPA_TEST_LIMIT", raising=False)
-    assert wn._env_int("SHERPA_TEST_LIMIT", 30, 1, 600) == 30
-
-
 def test_module_defaults_are_clamped_into_range():
     assert 1 <= wn._NEO4J_QUERY_TIMEOUT_S <= 600
     assert 100 <= wn._NEO4J_MAX_ROWS <= 1_000_000

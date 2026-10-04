@@ -1,6 +1,6 @@
 """資料フォルダ(World)管理エンドポイント。3 つの router から成る:
 - `ingest_preview_router`: `GET /ingest/preview`
-- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`GET /worlds/{wid}/diff`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`DELETE /worlds/{wid}`
+- `worlds_router`: `GET /world-options`・`GET /fs/list`・`GET /worlds`・`GET /worlds/{wid}/status`・`POST /worlds/{wid}/recount`・`POST /worlds`・`POST /worlds/diff`・`POST /worlds/{wid}/rebind`・`POST /worlds/{wid}/refresh`・`POST /worlds/{wid}/reconvert`・`POST /worlds/{wid}/rag_regenerate_rules`・`DELETE /worlds/{wid}`
 - `ingest_runs_router`: `POST /ingest/rerun`・`GET /ingest/runs`
 api.py が元の位置にそれぞれ `app.include_router(...)` する（ルート表 golden の定義順を保つため）。`_browse_roots`/`_under_roots` は `sherpa.deps` にある。
 モジュール名が `sherpa/worlds.py` と衝突するため、api.py 側は `from sherpa.routers import worlds as worlds_routes` と別名で import する。
@@ -512,16 +512,6 @@ def world_diff_path(req: DiffReq, request: Request):
     _require_admin(_current_user(request))
     try:
         return {"ok": True, **world_admin_service.diff_path(req.path)}
-    except world_admin_service.WorldAdminError as exc:
-        raise _world_admin_http_error(exc) from exc
-
-
-@worlds_router.get("/worlds/{wid}/diff", tags=["資料フォルダ(World)管理"], response_model=WorldDiffResponse)
-def world_diff_id(wid: str, request: Request):
-    """登録済み資料フォルダの差分チェック（読み取り専用）。今のフォルダ内容と取り込み済みの差を返す（「今すぐ更新」前の確認用）。"""
-    _require_admin(_current_user(request))
-    try:
-        return {"ok": True, **world_admin_service.diff_world(wid)}
     except world_admin_service.WorldAdminError as exc:
         raise _world_admin_http_error(exc) from exc
 

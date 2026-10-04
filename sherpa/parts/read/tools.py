@@ -1,7 +1,6 @@
 """読み取り部品（KB 検索・グラフ探索・原本取得）。
 `run_tool(name, args, world, scope_paths, ...)` が道具ディスパッチの正本。MCP（`mcp_server.py`）・チャットの回答ループ・簡易チャット（`/ext/v1/answer`）が `sherpa.tool_dispatch.run_tool` 経由で共有する。
 権限（資料フォルダ・scope_paths・layer・personal 除外）は呼び出し側が確定済みの値を渡す契約で、本モジュール自身は権限を持たず、書き込みも行わない。
-`write_output_file`／`usage_*` の振り分けは `sherpa/tool_dispatch.py` が本モジュールの手前で行う。
 設計: docs/design/interfaces.md「読み取り部品（境界としての切り出し済み・手順②）」、docs/design/codex.md「MCP の道具」
 """
 from __future__ import annotations
@@ -14,6 +13,7 @@ import stat
 from pathlib import Path
 
 from ... import citations, es_index, grep_tool, redact_keys, worlds
+from ...env_int import env_int
 from ... import layer as layer_mod
 from ... import scope as scope_mod
 from ... import text_encoding
@@ -24,18 +24,6 @@ from ...safe_open import open_file_nofollow_walk as _open_file_nofollow_walk  # 
 
 # `simple_chat.py`／`ext_api.py` 等と同じ共有ロガー
 _log = logging.getLogger("sherpa")
-
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析。範囲 [lo, hi] 外・非整数は既定値へ戻す（負値がスライス上限として反転して上限が無効になるのを防ぐ）。既定値自体も [lo, hi] にクランプする。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
 
 # grep／es_search 1 回あたりのヒット数の既定（管理画面の基準値が未設定のときに使う）
 MAX_HITS = 45
@@ -87,7 +75,7 @@ def _redact_deep(obj):
 TOOL_RESULT_MAX_BYTES = 262144
 
 # read_around／read_doc／doc_outline／verify_citation がディスクから読む生バイト数の上限。`grep_tool._GREP_FILE_CAP_BYTES` と揃える（揃えないと grep が cap より後ろでヒットを見つけても read 側が読めない）
-_READ_AROUND_FILE_CAP_BYTES = _env_int(
+_READ_AROUND_FILE_CAP_BYTES = env_int(
     "SHERPA_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
 
 # read 側の単一巨大行への安全弁（`grep_tool._GREP_LINE_MAX_BYTES` と同じ役割）
@@ -108,10 +96,6 @@ _ES_VECTOR_FALLBACK_REASONS = frozenset({
 # 親返し: es_search のヒットを doc_id で束ね、予算内なら rag.md の領域（P2）を返す（常時 ON）。
 # P2 の対象チャンク集合を ES から引く 1 クエリあたりの取得上限（`es_index.chunk_ids_for_parent` の `limit`）。env 化しない
 _PARENT_RETURN_REGION_CHUNKS_MAX = 5000
-
-def _parent_return_enabled() -> bool:
-    """常時 True（`run_tool` の `parent_return_on` 判定の呼び出し形を保つために関数として残す）。"""
-    return True
 
 def _clip_utf8_bytes(s: str, max_bytes: int) -> str:
     """UTF-8 エンコード後のバイト数が `max_bytes` を超えないよう `s` を切り詰める（マルチバイト文字の境界で壊れた文字が残らないよう `errors="ignore"` で再デコードする）。"""
@@ -825,10 +809,9 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             deadline: float | None = None, layer=None,
             max_hits: int | None = None, window_cap: int | None = None,
             tool_result_max_bytes: int | None = None,
-            uid: str | None = None, graph_only: bool = False) -> tuple[dict, set, list, list]:
+            graph_only: bool = False) -> tuple[dict, set, list, list]:
     """ツールを実行し `(結果, 触れた doc_id 集合, 引用候補, 候補カード)` を返す。範囲外・未解決・秘匿は安全に error にする。tool result の本文は秘密を伏せて返す。
     引用候補＝`{doc_id, span, quote, ext}`（grep／ES ヒット由来）。候補カード＝`graph_neighbors` 由来の原因候補（troubleshoot の UI／エクスポート用）。
-    - `uid`（省略可）: `write_output_file` の書き先ユーザー id。`None` ならこのツールは実行せず「作成者が特定できません」の error を返す。
     - `layer`（省略可・`"docs"|"code"|"both"`・既定 both）: `scope_paths` と同じ会話ターン全体の硬いフィルタ。`ripgrep_search`／`glob_search`／`es_search`／`list_docs` の対象を絞り、`read_around`／`read_doc`／`doc_outline` は層外の doc_id を範囲外と同じく拒否する。`graph_neighbors` は層で結果を絞れない（言及エッジが木を跨ぐ）ため、層が限定されている間はツール自体を拒否する（層外の名前・経路が漏れる迂回路になるため）。
     - `max_hits`（省略可）: 調べる深さが計算した grep／ES のヒット上限の実効値（`grep_search` の `max_hits`／`es_index.search` の `k` へ渡す）。
     - `window_cap`（省略可）: `read_around` の読み取り窓の既定値と `max(200, READ_WINDOW)` クランプの `READ_WINDOW` 部分を置き換える（200 の下限は維持）。`read_doc` の 1 ページ幅にも `max(200, window_cap or READ_WINDOW)` を使う。read_doc は 1 行ずつバイト予算を累積し、超える直前の行で止めてそこを `end_line` にする（超過時は `text_truncated: true`）。`doc_outline` は見出し件数（`_OUTLINE_MAX_HEADINGS`）とタイトルの累積バイト数の両方で打ち切る（`truncated`）。読み込みが `_READ_AROUND_FILE_CAP_BYTES` に達したら `file_truncated: true` を返す。`ripgrep_search` も `_GREP_FILE_CAP_BYTES` で打ち切ったファイル由来のヒットに `hits[i].file_truncated: true` を付ける。
@@ -984,7 +967,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
         # ① 引用（cites）・doc 収集・rag_groups の組み立て（1 回だけ）
         # ヒットはスコア降順のまま渡ってくる。`template`（出力順のプレースホルダ列）で各 doc の最初に出現したヒットの位置を予約し、legacy ヒットはその場で確定させる（検索結果全体のスコア降順を保つ）。
         # legacy ヒットの `text` はここではクリップしない（② が per_hit ごとに再構築するため、redaction・引用・rag_groups は 1 回で済ませる）
-        parent_return_on = name == "es_search" and _parent_return_enabled()
+        parent_return_on = name == "es_search"
         template: list = []  # [("legacy", hit_view_dict) | ("rag", doc_id), ...]（出力順）
         rag_groups: dict = {}
         rag_slot_index: dict[str, int] = {}  # doc_id -> template 内の予約位置（代表ヒットの位置）
@@ -1027,7 +1010,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             template.append(("legacy", hit_view))
 
         # ② per_hit を割り当てて `view` を組み立て、直列化後の実バイト数で収まりを保証する
-        def _build_view(per_hit: int) -> tuple[dict, bool]:
+        def _build_view(per_hit: int) -> dict:
             out = []
             any_clipped = False
             legacy_bytes = 0
@@ -1070,10 +1053,10 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
             if any_clipped:
                 # ヒット単位のクリップを最上位にも申告する（`tool_result_clipped` 計測は最上位キーしか見ない）
                 view["text_truncated"] = True
-            return view, any_clipped
+            return view
 
         per_hit = max(_HIT_TEXT_MIN_BYTES, tr_max_bytes // max(1, used_max_hits))
-        view, _any_clipped = _build_view(per_hit)
+        view = _build_view(per_hit)
         # `per_hit` は text だけの割当てで、付帯情報と JSON 構造分を数えていない。直列化後の実バイト数が `tr_max_bytes` を超えたら、`per_hit` を詰めて再構築する（最大 4 回・下限 `_HIT_TEXT_MIN_BYTES`）。
         # 超過のまま外側の `mcp_server._clip_tool_result` に任せると `next_offset` 等の構造が失われるため。それでも収まらない極端なケースだけ外側のクリップ（fail-open）に委ねる
         attempts = 1
@@ -1081,7 +1064,7 @@ def run_tool(name: str, args: dict, world: str, scope_paths,
               and len(json.dumps(view, ensure_ascii=False).encode("utf-8")) > tr_max_bytes
               and attempts < 4):
             per_hit = max(_HIT_TEXT_MIN_BYTES, int(per_hit * 0.75))
-            view, _any_clipped = _build_view(per_hit)
+            view = _build_view(per_hit)
             attempts += 1
         return (view, docs, cites, cards)
     if name == "graph_neighbors":

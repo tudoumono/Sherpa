@@ -575,33 +575,12 @@ def _citation(piece: dict) -> dict:
     return citation
 
 
-def _coverage_reason(item: evidence_ir.CoverageItem) -> str | None:
-    """v1alpha1/v1alpha2のcoverage理由をrenderer内で一意に扱う。"""
-    value = getattr(item, "reason_code", None)
-    if isinstance(value, str) and value:
-        return value
-    legacy = getattr(item, "reason", None)
-    return legacy if isinstance(legacy, str) and legacy else None
-
-
-def _coverage_basis(item: evidence_ir.CoverageItem) -> str:
-    value = getattr(item, "content_basis", None)
-    if isinstance(value, str) and value:
-        return value
-    reason = _coverage_reason(item)
-    if reason in {"image_content_uninterpreted", "binary_asset_content_uninterpreted"}:
-        return "pixel_only"
-    if item.status == "intentionally_ignored":
-        return "none"
-    return "structured"
-
-
 def _coverage_payload(item: evidence_ir.CoverageItem) -> dict:
     return {
         "coverage_id": item.coverage_id,
         "coverage_status": item.status,
-        "content_basis": _coverage_basis(item),
-        "reason_code": _coverage_reason(item),
+        "content_basis": item.content_basis,
+        "reason_code": item.reason_code,
     }
 
 
@@ -628,10 +607,10 @@ def _coverage_notice_records(ir: evidence_ir.EvidenceIR, source_name: str) -> li
     for index, item in enumerate(ir.coverage, start=1):
         if item.status not in {"unsupported", "failed"}:
             continue
-        basis = _coverage_basis(item)
+        basis = item.content_basis
         if basis == "none":
             continue
-        reason = _coverage_reason(item) or "unspecified"
+        reason = item.reason_code or "unspecified"
         detected_kind = getattr(item, "detected_kind", None) or item.scope
         locator = _compact_locator(item.locator)
         location = json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -713,12 +692,11 @@ def _coverage_notice_records(ir: evidence_ir.EvidenceIR, source_name: str) -> li
 
 
 def _alias_citation(element: evidence_ir.EvidenceElement) -> dict:
-    citation = {
+    return {
         "evidence_id": element.element_id,
         "locator": _compact_locator(element.locator),
         "evidence_state": {"visibility": element.visibility, "lifecycle": element.lifecycle},
     }
-    return citation
 
 
 def _document_context(ctx: context_ir.ContextIR, region: context_ir.ContextRegion) -> dict:
@@ -2009,7 +1987,7 @@ def validation_errors(ir: evidence_ir.EvidenceIR, result: RenderedEvidence) -> l
     unresolved_coverage_ids = {
         item.coverage_id
         for item in ir.coverage
-        if item.status in {"unsupported", "failed"} and _coverage_basis(item) != "none"
+        if item.status in {"unsupported", "failed"} and item.content_basis != "none"
     }
     missing_notices = unresolved_coverage_ids - cited_coverage_ids
     if missing_notices:
@@ -2053,7 +2031,7 @@ def render(
         raise ValueError("invalid Evidence IR: " + ",".join(ir_errors))
     incomplete_scans = [
         item for item in ir.coverage
-        if item.status == "unsupported" and _coverage_reason(item) == "scan_cap_reached"
+        if item.status == "unsupported" and item.reason_code == "scan_cap_reached"
     ]
     if incomplete_scans:
         raise ValueError(f"incomplete source scan: {len(incomplete_scans)}")

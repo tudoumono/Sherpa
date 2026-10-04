@@ -1019,163 +1019,6 @@
         "title": "ChatReq",
         "type": "object"
       },
-      "ChatStreamStopReq": {
-        "properties": {
-          "stream_id": {
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$",
-            "title": "Stream Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "stream_id"
-        ],
-        "title": "ChatStreamStopReq",
-        "type": "object"
-      },
-      "ChatSyncReq": {
-        "description": "同期 `POST /chat` の本文。途中停止用の相関ID（`/chat/stream/stop` で使う）が必須。",
-        "properties": {
-          "conversation_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Conversation Id"
-          },
-          "depth_profile": {
-            "default": "standard",
-            "enum": [
-              "quick",
-              "standard",
-              "deep",
-              "max"
-            ],
-            "title": "Depth Profile",
-            "type": "string"
-          },
-          "knowledge": {
-            "default": true,
-            "title": "Knowledge",
-            "type": "boolean"
-          },
-          "layer": {
-            "default": "both",
-            "enum": [
-              "docs",
-              "code",
-              "both"
-            ],
-            "title": "Layer",
-            "type": "string"
-          },
-          "lens": {
-            "anyOf": [
-              {
-                "enum": [
-                  "impact",
-                  "troubleshoot",
-                  "qa",
-                  "author"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lens"
-          },
-          "message": {
-            "title": "Message",
-            "type": "string"
-          },
-          "personal": {
-            "default": false,
-            "title": "Personal",
-            "type": "boolean"
-          },
-          "scope_paths": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Scope Paths",
-            "type": "array"
-          },
-          "stream_id": {
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$",
-            "title": "Stream Id",
-            "type": "string"
-          },
-          "tools": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "boolean"
-                },
-                "propertyNames": {
-                  "enum": [
-                    "grep",
-                    "fulltext",
-                    "graph"
-                  ]
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Tools"
-          },
-          "tools_explicit": {
-            "anyOf": [
-              {
-                "items": {
-                  "enum": [
-                    "grep",
-                    "fulltext",
-                    "graph"
-                  ],
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Tools Explicit"
-          },
-          "web_search": {
-            "default": false,
-            "title": "Web Search",
-            "type": "boolean"
-          },
-          "world": {
-            "anyOf": [
-              {
-                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "World"
-          }
-        },
-        "required": [
-          "message",
-          "stream_id"
-        ],
-        "title": "ChatSyncReq",
-        "type": "object"
-      },
       "ChatTurnRunning": {
         "description": "`GET /chat/turns/running` の1要素。`started_at` は文字列。",
         "properties": {
@@ -2720,10 +2563,6 @@
             "title": "Entities",
             "type": "integer"
           },
-          "entities_static": {
-            "title": "Entities Static",
-            "type": "integer"
-          },
           "hidden": {
             "title": "Hidden",
             "type": "integer"
@@ -2731,17 +2570,11 @@
           "relations": {
             "title": "Relations",
             "type": "integer"
-          },
-          "relations_static": {
-            "title": "Relations Static",
-            "type": "integer"
           }
         },
         "required": [
           "entities",
-          "entities_static",
           "relations",
-          "relations_static",
           "deprecated",
           "hidden",
           "documents"
@@ -2984,10 +2817,6 @@
             ],
             "title": "Category"
           },
-          "em": {
-            "title": "Em",
-            "type": "string"
-          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3071,7 +2900,6 @@
           "name",
           "type",
           "type_ja",
-          "em",
           "status",
           "value",
           "top_scope",
@@ -3146,43 +2974,6 @@
           "checked_at"
         ],
         "title": "HealthSummaryResponse",
-        "type": "object"
-      },
-      "ImpactReq": {
-        "properties": {
-          "include_deprecated": {
-            "default": false,
-            "title": "Include Deprecated",
-            "type": "boolean"
-          },
-          "scope_paths": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Scope Paths",
-            "type": "array"
-          },
-          "start": {
-            "title": "Start",
-            "type": "string"
-          },
-          "world": {
-            "anyOf": [
-              {
-                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "World"
-          }
-        },
-        "required": [
-          "start"
-        ],
-        "title": "ImpactReq",
         "type": "object"
       },
       "IngestBlockedDoc": {
@@ -3706,38 +3497,6 @@
           "storage_mode"
         ],
         "title": "PublicWorld",
-        "type": "object"
-      },
-      "QaReq": {
-        "properties": {
-          "question": {
-            "title": "Question",
-            "type": "string"
-          },
-          "scope_paths": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Scope Paths",
-            "type": "array"
-          },
-          "world": {
-            "anyOf": [
-              {
-                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "World"
-          }
-        },
-        "required": [
-          "question"
-        ],
-        "title": "QaReq",
         "type": "object"
       },
       "RebindReq": {
@@ -4790,38 +4549,6 @@
           "provider"
         ],
         "title": "TestReq",
-        "type": "object"
-      },
-      "TroubleshootReq": {
-        "properties": {
-          "scope_paths": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Scope Paths",
-            "type": "array"
-          },
-          "symptom": {
-            "title": "Symptom",
-            "type": "string"
-          },
-          "world": {
-            "anyOf": [
-              {
-                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "World"
-          }
-        },
-        "required": [
-          "symptom"
-        ],
-        "title": "TroubleshootReq",
         "type": "object"
       },
       "UsageConversationKindRow": {
@@ -7145,7 +6872,7 @@
         "type": "object"
       },
       "WorldDiffResponse": {
-        "description": "差分プレビュー（POST /worlds/diff・GET /worlds/{wid}/diff）。全キー常時存在。",
+        "description": "差分プレビュー（POST /worlds/diff）。全キー常時存在。",
         "properties": {
           "added": {
             "items": {
@@ -9459,330 +9186,6 @@
         "summary": "Auth Me",
         "tags": [
           "認証"
-        ]
-      }
-    },
-    "/chat": {
-      "post": {
-        "description": "同期チャット。knowledge=true でナレッジグラフ／検索を使う回答、false は素の対話。",
-        "operationId": "chat_chat_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ChatSyncReq"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Chat",
-        "tags": [
-          "チャット"
-        ]
-      }
-    },
-    "/chat/stream": {
-      "get": {
-        "description": "チャットの SSE ストリーミング版（`/chat` と同じ意味論・逐次イベントで返す）。",
-        "operationId": "chat_stream_chat_stream_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "message",
-            "required": true,
-            "schema": {
-              "title": "Message",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "world",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "World"
-            }
-          },
-          {
-            "in": "query",
-            "name": "conversation_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Conversation Id"
-            }
-          },
-          {
-            "in": "query",
-            "name": "knowledge",
-            "required": false,
-            "schema": {
-              "default": true,
-              "title": "Knowledge",
-              "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "personal",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Personal",
-              "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "scope_paths",
-            "required": false,
-            "schema": {
-              "items": {
-                "type": "string"
-              },
-              "title": "Scope Paths",
-              "type": "array"
-            }
-          },
-          {
-            "in": "query",
-            "name": "layer",
-            "required": false,
-            "schema": {
-              "default": "both",
-              "enum": [
-                "docs",
-                "code",
-                "both"
-              ],
-              "title": "Layer",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "lens",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "impact",
-                    "troubleshoot",
-                    "qa",
-                    "author"
-                  ],
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Lens"
-            }
-          },
-          {
-            "in": "query",
-            "name": "depth_profile",
-            "required": false,
-            "schema": {
-              "default": "standard",
-              "enum": [
-                "quick",
-                "standard",
-                "deep",
-                "max"
-              ],
-              "title": "Depth Profile",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "web_search",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Web Search",
-              "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
-            "name": "tools_grep",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Tools Grep"
-            }
-          },
-          {
-            "in": "query",
-            "name": "tools_fulltext",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Tools Fulltext"
-            }
-          },
-          {
-            "in": "query",
-            "name": "tools_graph",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Tools Graph"
-            }
-          },
-          {
-            "in": "query",
-            "name": "tools_explicit",
-            "required": false,
-            "schema": {
-              "items": {
-                "enum": [
-                  "grep",
-                  "fulltext",
-                  "graph"
-                ],
-                "type": "string"
-              },
-              "title": "Tools Explicit",
-              "type": "array"
-            }
-          },
-          {
-            "in": "query",
-            "name": "stream_id",
-            "required": true,
-            "schema": {
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$",
-              "title": "Stream Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Chat Stream",
-        "tags": [
-          "チャット"
-        ]
-      }
-    },
-    "/chat/stream/stop": {
-      "post": {
-        "description": "ストリーミング中のチャットを途中停止する（本人のストリームのみ）。対応する `stream_id` が無い/完了済み/他人のストリームの場合も `{\"ok\": false}` を返すだけでエラーにしない（存在有無を教えない）。",
-        "operationId": "chat_stream_stop_chat_stream_stop_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ChatStreamStopReq"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Chat Stream Stop",
-        "tags": [
-          "チャット"
         ]
       }
     },
@@ -13181,128 +12584,6 @@
         ]
       }
     },
-    "/impact/run": {
-      "post": {
-        "description": "指定ノード（start）を起点に影響分析を実行し analysis_id を返す（結果はサーバのメモリに保持され再起動で消える）。",
-        "operationId": "impact_run_impact_run_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ImpactReq"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Impact Run",
-        "tags": [
-          "影響分析"
-        ]
-      }
-    },
-    "/impact/{aid}": {
-      "get": {
-        "description": "analysis_id で影響分析結果を取得する（サーバのメモリ上・再起動で消える・本人の実行分のみ）。",
-        "operationId": "impact_get_impact__aid__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "aid",
-            "required": true,
-            "schema": {
-              "title": "Aid",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Impact Get",
-        "tags": [
-          "影響分析"
-        ]
-      }
-    },
-    "/impact/{aid}/export.xlsx": {
-      "get": {
-        "description": "影響分析結果を Excel（xlsx）で出力し、利用者の個人 workspace/outputs 配下に保存してダウンロードを返す。",
-        "operationId": "impact_export_impact__aid__export_xlsx_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "aid",
-            "required": true,
-            "schema": {
-              "title": "Aid",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Impact Export",
-        "tags": [
-          "影響分析"
-        ]
-      }
-    },
     "/ingest/preview": {
       "get": {
         "description": "取り込み・抽出プレビュー（読み取り専用）。world グラフの抽出内容を返す。world 世代の確認に失敗した場合は、握り潰さずログ付き 503 にする（`/graph` と同じ固定文言）。",
@@ -13459,46 +12740,6 @@
         "summary": "Notifications List",
         "tags": [
           "システム"
-        ]
-      }
-    },
-    "/qa/run": {
-      "post": {
-        "description": "仕様問い合わせ（QA）レンズ。grep/ES のみで根拠付き回答を返す（Neo4j は開かない）。",
-        "operationId": "qa_run_qa_run_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/QaReq"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Qa Run",
-        "tags": [
-          "トラブルシュート・QA"
         ]
       }
     },
@@ -13695,46 +12936,6 @@
         "summary": "Share Click",
         "tags": [
           "会話共有"
-        ]
-      }
-    },
-    "/troubleshoot/run": {
-      "post": {
-        "description": "症状（symptom）からナレッジグラフを辿って原因候補を調査するトラブルシュートレンズ。",
-        "operationId": "troubleshoot_run_troubleshoot_run_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TroubleshootReq"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Troubleshoot Run",
-        "tags": [
-          "トラブルシュート・QA"
         ]
       }
     },
@@ -14141,49 +13342,6 @@
         ]
       }
     },
-    "/worlds/{wid}/diff": {
-      "get": {
-        "description": "登録済み資料フォルダの差分チェック（読み取り専用）。今のフォルダ内容と取り込み済みの差を返す（「今すぐ更新」前の確認用）。",
-        "operationId": "world_diff_id_worlds__wid__diff_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "wid",
-            "required": true,
-            "schema": {
-              "title": "Wid",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorldDiffResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "World Diff Id",
-        "tags": [
-          "資料フォルダ(World)管理"
-        ]
-      }
-    },
     "/worlds/{wid}/rag_regenerate_rules": {
       "post": {
         "description": "rag.md の LLM 成形を一掃し規則版へ作り直すことを即受付する（管理者の明示操作・背景実行）。監査要件等で LLM 出力を今すぐ一掃したいときに使う。\nLLM 成形の既定トグル（`rag_llm_render`）自体は変えない（トグルが ON のままなら次回の後追いパスが再び LLM 成形を試みうる。恒久的に止めるにはトグルも OFF にする）。",
@@ -14493,15 +13651,11 @@
       "name": "個人ワークスペース"
     },
     {
-      "description": "ナレッジグラフを起点とした影響範囲分析の実行・取得・Excel出力。",
-      "name": "影響分析"
-    },
-    {
       "description": "検索・分析対象をフォルダ単位で絞り込むスコープツリー。",
       "name": "範囲"
     },
     {
-      "description": "チャット（同期・SSEストリーミング）。",
+      "description": "チャットのターンの開始・SSE での受け取り・停止。",
       "name": "チャット"
     },
     {
@@ -14513,19 +13667,15 @@
       "name": "会話管理"
     },
     {
-      "description": "症状からの原因調査、仕様問い合わせ（QA）レンズ。",
-      "name": "トラブルシュート・QA"
-    },
-    {
       "description": "文書台帳の参照と原本ダウンロード。",
       "name": "文書"
     },
     {
-      "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択、業務語対応の下案/承認/無効化。",
+      "description": "登録ディレクトリ（world）の登録・状態確認・差分・再取込・削除、フォルダ選択。",
       "name": "資料フォルダ(World)管理"
     },
     {
-      "description": "ナレッジグラフの可視化データ・検索・自然言語質問。",
+      "description": "ナレッジグラフの可視化データ・検索。",
       "name": "ナレッジグラフ"
     },
     {

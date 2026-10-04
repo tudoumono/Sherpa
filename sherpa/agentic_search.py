@@ -7,50 +7,17 @@ LLM に検索ツールを渡し、ripgrep_search で当たり → read_around �
 """
 from __future__ import annotations
 
-import errno
-import json
 import logging
-import math
-import os
-import re
-import socket
-import stat
 import threading
 import time
-import urllib.error
-from pathlib import Path
 
-from . import citations, es_index, exec_event, grep_tool, investigation_state, llm, redact_keys, stop_kind, worlds
-from . import layer as layer_mod
-from . import scope as scope_mod
-from . import text_encoding
+from . import es_index, llm, stop_kind
 from . import tools_pref as tools_pref_mod
-from .ingest import importance, text_kind
-from .ingest.analyzers import registry as _analyzer_registry
-from .safe_open import open_file_nofollow_walk as _open_file_nofollow_walk  # TOCTOU 耐性のファイル open（実装は safe_open.py・ext_api.py と共用）
-
-# 読み取り部品・書き込み部品（個人 workspace への成果物保存）・道具ディスパッチは部品側が正本。ここでの再 import は既存呼び出し元（`agentic_search.MAX_HITS` 等）の後方互換のため（部品→本モジュールへの import は無い）。
-from .parts.read.tools import (
+# 呼び出し元（`agentic_search.MAX_HITS` 等）が参照する読み取り部品の名前。
+from .parts.read.tools import (  # noqa: F401 -- 再公開（api・chat_service・mcp_server・providers が `agentic_search.X` で参照）
     MAX_HITS, MAX_HITS_ABS_MAX, READ_WINDOW, TOOL_RESULT_MAX_BYTES,
-    _env_int, _OFFICE_MD, _READABLE_EXT, _SECRET_RE, _KV_SECRET_RE,
-    _redact, _walk_redact, _redact_deep,
-    _READ_AROUND_FILE_CAP_BYTES, _READ_LINE_MAX_BYTES, _TRUNCATED_DOCS_MAX,
-    _HIT_TEXT_MIN_BYTES, _PARENT_RETURN_REGION_CHUNKS_MAX, _parent_return_enabled,
-    _clip_utf8_bytes, _UNMEASURABLE_SIZE, _result_byte_size,
-    _GRAPH_CARDS_MAX, _clip_cards, _GLOB_MAX_RESULTS, _GLOB_PATTERN_MAX_LEN,
-    _HEADING_RE, _OUTLINE_MAX_HEADINGS, _OUTLINE_TITLE_MAX_CHARS,
-    _validate_glob_pattern, _glob_match_pattern, _safe_doc_path,
-    _XLSX_KINDS, _DOCX_KINDS, _PPTX_KINDS, _PDF_KINDS, _FILE_HEAD_KINDS,
-    _safe_original_path, _open_verified_original, _close_quiet_local,
-    _open_doc_stream, _stream_doc_lines, _rag_md_region_text, _resolve_parent_return,
-    _READER_CLIP_FIELD, _row_start_from_a1_range, _doc_reader_text_locator,
-    _shrink_xlsx_range_field, _SINGLE_ITEM_TEXT_FIELDS, _shrink_single_item_result,
-    _BYTE_CLIP_MARK_BYTES, _finish_docx_paragraphs_result, _finish_reader_result,
-    GRAPH_REINGEST_ERROR_CODE, _READ_INVALID_ARGS_ERROR_CODE,
-    verify_doc_exists, _card_edges_view, _card_claimed_doc_ids, _card_verified_doc_ids,
+    _redact, _clip_utf8_bytes, GRAPH_REINGEST_ERROR_CODE, _READ_INVALID_ARGS_ERROR_CODE, verify_doc_exists,
 )
-from .output_files import _run_write_output_file, _SAFE_OUTPUT_FILENAME_RE
-from .tool_dispatch import run_tool
 
 # 共有ロガー（`simple_chat.py`/`ext_api.py` 等と同じ）。
 _log = logging.getLogger("sherpa")
@@ -75,10 +42,8 @@ def _clamped_setting_int(raw, lo: int, hi: int) -> int | None:
     return iv if lo <= iv <= hi else None
 
 
-def effective_tool_result_max_bytes(system_settings: dict | None = None, *, provider: str | None = None,
-                                    model: str | None = None, ollama_base_url: str | None = None) -> int:
-    """ツール結果 1 件あたりのバイト予算の実効値（system_settings > コード既定）。`system_settings` 省略時は `store.get_system_settings()` を呼び、読めない/未設定はコード既定 `TOOL_RESULT_MAX_BYTES` へ倒す（fail-safe）。
-    `provider`/`model`/`ollama_base_url` は呼び出し元との互換のため残すが、解決には使わない（AI の文脈窓を Sherpa が制限しない）。
+def effective_tool_result_max_bytes(system_settings: dict | None = None) -> int:
+    """ツール結果 1 件あたりのバイト予算の実効値（system_settings > コード既定）。`system_settings` 省略時は `store.get_system_settings()` を呼び、読めない/未設定はコード既定 `TOOL_RESULT_MAX_BYTES` へ倒す（fail-safe）。AI の文脈窓は Sherpa が制限しない（モデル・接続先では変えない）。
     """
     sysset = system_settings
     if sysset is None:
@@ -316,25 +281,6 @@ _PARAMS_FILE_HEAD = {"type": "object", "properties": {
     "item": _ITEM_PARAM_SCHEMA},
     "required": ["doc_id"]}
 
-# 作成系（author）の成果物ファイル。個人 workspace（本人のみ・grep 対象・RAG には索引化しない）へ保存し、Codex と同じ台帳（`personal_workspace_files`）に登録して同じ成果物カード（`env["created_files"]`）で見せる。共有 KB とは無関係。
-_DESC_WRITE_OUTPUT_FILE = (
-    "作成した文書を個人の作業スペースに保存し、ダウンロードできるようにする"
-    "（作成系の依頼でファイルを納品するときに使う。調査・質問の回答には使わない）。"
-    "filename（拡張子つきの単純なファイル名・フォルダ区切り不可）と content（保存する内容の全文）を渡す。"
-    "同名ファイルが既にあれば自動的に別名で保存する（上書きしない）。"
-    "Markdown を marp のスライド形式（先頭に `---\\nmarp: true\\n---` のfront-matter）で書いたときは"
-    "marp:true も渡すと PDF/PowerPoint も自動生成される（それ以外の拡張子・marp 形式でない Markdown では無視）。"
-    "保存できたら rel_path と download_url を返す——最終回答の最後に作成したファイル名と内容の要約を書くこと。"
-    "保存できなかったときは error に理由が入る（内容は保存されていない）。")
-_PARAMS_WRITE_OUTPUT_FILE = {"type": "object", "properties": {
-    "filename": {"type": "string",
-                "description": "保存するファイル名（拡張子つき・フォルダ区切り不可・例 '消費税率一覧.md'）"},
-    "content": {"type": "string", "description": "保存する内容（テキスト全文）"},
-    "marp": {"type": "boolean",
-            "description": "true のとき、この Markdown を marp スライドとして PDF/PowerPoint も生成する（既定false）"}},
-    "required": ["filename", "content"]}
-
-
 # `graph_neighbors`（`lens_service.neighbor_cards`）が内部で捕捉した障害の固定コード（本文・例外メッセージは持たない）。`_record_tool_result_error_code` が拾って `InvestigationState` へ反映する。
 _GRAPH_NEIGHBORS_RECOVERABLE_ERROR_CODE = "graph_unavailable"
 # グラフが使えないまま調べ続けたターンの通知（平文・専門用語ゼロ・資料名や本文を含まない）。
@@ -369,10 +315,6 @@ def _nid() -> str:
     return f"as-{_seq[0]}"
 
 
-def _node(label: str, detail: str) -> dict:
-    return {"type": "node", "id": _nid(), "kind": "tool", "label": label, "detail": detail, "status": "done"}
-
-
 def _clip(s, n: int) -> str:
     return str(s or "").strip()[:n]
 
@@ -398,64 +340,6 @@ def _question_from_args(args: dict) -> dict:
             "options": options, "allow_free_text": bool(args.get("allow_free_text"))}
 
 
-# `es_search` の `degrade_reason` → 固定文言。BM25 の結果は使い続けつつ、精度が一部落ちていることを「思考の流れ」に表示する。語彙は BM25 の結果を使えている場合（hits が空でない）だけが対象で、BM25 自体の失敗（`es_query_failed`）は含まない。
-_ES_DEGRADE_WORDING = {
-    "embedding_cloud_unavailable": ("検索の精度が一部低下しています",
-                                    "選択中の AI での意味検索が使えないため、キーワード一致のみで探しています"),
-    "query_embed_failed": ("検索の精度が一部低下しています",
-                           "検索語の変換が一時的に失敗したため、キーワード一致のみで探しています"),
-    # hybrid クエリ自体の失敗で BM25 のみへ降格した場合。`query_embed_failed` とは別原因だが、利用者向けの案内文は同じ。
-    "hybrid_query_failed": ("検索の精度が一部低下しています",
-                           "意味検索の問い合わせが一時的に失敗したため、キーワード一致のみで探しています"),
-    # 索引の埋め込み素性と現在の AI 設定が合わない（設定変更後の更新待ち）。解消まで続く状態なので、案内文で直し方まで示す。
-    # 埋め込みが未設定の環境（hybrid／vector でも BM25 だけで検索した）
-    "embedding_not_configured": ("検索の精度が一部低下しています",
-                                 "埋め込みが未設定のため語の一致だけで検索しました"),
-    "vector_feature_mismatch": ("検索の精度が一部低下しています",
-                                "取り込んだ資料が現在の AI 設定では意味検索に使えないため、キーワード一致のみで探しています"
-                                "（管理者に『今すぐ更新』を依頼してください）"),
-}
-
-
-def _tool_hit_count(name: str, result: dict) -> int | None:
-    """`run_tool()` の結果から「ヒット件数」を数える（対象外のツール／エラー応答は None）。メイン経路・サブ経路の追加ノードが共通で使う。
-    `es_search` は `degrade_reason` が既知の BM25 自体の失敗（`es_unavailable`/`es_query_failed`）のときも None（検索していないのに「0 件」と表示しない）。固定理由コード（`error_code`）が付いた結果も None（`graph_neighbors` が障害を握りつぶして `{"neighbors": []}` を返す場合など）。
-    """
-    if not isinstance(result, dict) or "error" in result or result.get("error_code"):
-        return None
-    if name == "ripgrep_search":
-        return len(result.get("hits") or [])
-    if name == "glob_search":
-        return result.get("count", 0)  # list_docs と同じく打ち切り前の総件数（正確な母数を出す）
-    if name == "es_search":
-        reason = result.get("degrade_reason")
-        if reason and reason not in _ES_DEGRADE_WORDING:
-            return None
-        return len(result.get("hits") or [])
-    if name == "graph_neighbors":
-        return len(result.get("neighbors") or [])
-    if name == "list_docs":
-        return result.get("count", 0)
-    if name == "folder_tree":
-        return result.get("count", 0)  # list_docs と同じく打ち切り前の総フォルダ数
-    if name == "read_around":
-        text = result.get("text") or ""
-        return text.count("\n") + 1 if text else 0
-    if name == "read_doc":
-        return max(0, result.get("end_line", 0) - result.get("start_line", 1) + 1)
-    if name == "doc_outline":
-        return result.get("count", 0)  # list_docs/glob_search と同じく打ち切り前の総件数
-    if name == "compare_documents":
-        # 対応文書が決まらない/rag.md が無い run は「比較できた」件数として数えない（実行できなかったことを 0 件と混同しない）。
-        if result.get("status") != "comparable":
-            return None
-        diff_lines = (result.get("diff") or "").splitlines()
-        # 先頭 2 行（`--- fromfile`/`+++ tofile`）だけを位置でヘッダーとして除外する（内容が "+++"/"---" で始まる変更行は除外しない）。
-        body_lines = diff_lines[2:] if len(diff_lines) >= 2 else []
-        return sum(1 for ln in body_lines if ln.startswith("+") or ln.startswith("-"))
-    return None
-
-
 # search_truncated（利用統計「打ち切りの内訳」対象）: 検索系ツールが母集団の一部しか返さなかった呼び出し。`result["truncated"]` をそのまま数える（計測のみ・制限は変えない）。
 _SEARCH_TRUNCATED_TOOLS = frozenset({
     "ripgrep_search", "es_search", "glob_search", "graph_neighbors", "list_docs", "doc_outline"})
@@ -464,44 +348,6 @@ _SEARCH_TRUNCATED_TOOLS = frozenset({
 _BYTE_CLIP_TOOLS = frozenset({
     "read_around", "read_doc", "xlsx_sheets", "xlsx_range", "docx_paragraphs", "pptx_slides",
     "pdf_pages", "file_head", "compare_documents", "ripgrep_search", "es_search"})
-
-
-def _safe_json(s):
-    try:
-        return json.loads(s) if isinstance(s, str) else (s or {})
-    except (ValueError, TypeError):
-        return {}
-
-
-_RETRY_AFTER_CAP_SEC = 10.0  # Retry-After ヘッダを尊重する上限（暴走待ちを防ぐ）
-def _is_timeout_error(exc: Exception) -> bool:
-    """応答タイムアウトか（判定は `stop_kind.is_timeout_exc`）。タイムアウトは上流で処理/課金が進んでいる可能性があり、再試行すると二重送信・二重課金になり得るため非リトライとする（`_retryable_post_error`・`_run_evaluation` が共用）。"""
-    return stop_kind.is_timeout_exc(exc)
-
-
-def _retry_after_seconds(exc: Exception) -> float | None:
-    """429 の `Retry-After` ヘッダを秒数で返す（数値／HTTP-date・`_RETRY_AFTER_CAP_SEC` で上限）。ヘッダが無い/解釈できなければ None（指数バックオフへ）。"""
-    headers = getattr(exc, "headers", None)
-    value = headers.get("Retry-After") if headers else None
-    if not value:
-        return None
-    try:
-        secs = float(value)
-        # `float()` は "nan"/"inf" も受理するため、有限の非負値だけを受理する（それ以外は None）。
-        if not math.isfinite(secs) or secs < 0:
-            return None
-    except (TypeError, ValueError):
-        try:
-            import datetime
-            from email.utils import parsedate_to_datetime
-            dt = parsedate_to_datetime(value)
-            secs = (dt - datetime.datetime.now(dt.tzinfo)).total_seconds()
-            if not math.isfinite(secs):
-                return None
-            secs = max(0.0, secs)  # HTTP-date が既に過去＝今すぐ再試行してよい
-        except Exception:
-            return None
-    return min(secs, _RETRY_AFTER_CAP_SEC)
 
 
 def _post(url: str, headers: dict, body: dict, timeout: int = 90) -> dict:
@@ -645,22 +491,6 @@ def dispatch_tools_for_lens(lens: str, tools_pref: dict | None, availability: di
         blocked = not (effective["grep"] or effective["fulltext"])
     return effective, blocked
 
-
-# digest／帰属用テキストの共通整形（`investigation_state` が使う）。ツール結果と同じ露出（生 doc_id・実パス・graph の対象名/経路/裏付け doc をそのまま載せる）で組み、適用するのは制御文字除去→`_redact`（既知の秘密パターンのみ）だけ（`_digest_clean`）。
-
-_ATTRIBUTION_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u0085\u2028\u2029]")
-
-
-def _digest_clean(text: str) -> str:
-    """digest 1 行分のテキストから制御文字・改行を除去し、`_redact` を通す（制御文字除去→redact の順・切り詰めは呼び出し元がこの後で行う。逆順だと切断境界をまたぐ秘密が漏れうる）。quote・条件・graph の対象名/経路・doc_id・実パス・CID 等、digest に載るテキストは全てここを通す。
-    C0・DEL に加え C1（`\x80-\x9f`）・Unicode 行区切り（NEL・LINE/PARAGRAPH SEPARATOR）も空白化する（1 件の quote が複数「行」に割れ、偽装した `ev-N:` 風の文字列が別の Evidence 行として帰属モデルへ渡るのを防ぐ）。
-    """
-    cleaned = _ATTRIBUTION_CONTROL_CHARS_RE.sub(" ", text or "").strip()
-    return _redact(cleaned)
-
-
-# 複数項目の列挙区切り（末尾に半角空白を含める）。`build_evidence_digest`/`build_synthesis_digest` は列挙済みの 1 行を埋め込んでから `_digest_clean` を再適用するため、空白が無いと `_KV_SECRET_RE` が区切り記号ごと次の項目まで飲み込む（`investigation_state._LIST_SEP` と同じ理由）。
-_LIST_SEP = "、 "
 
 # 調査予算（ターン数／呼び出し予算／1 応答あたりの調べる操作の回数）到達で打ち切られた 3 値。`providers/base.py::_agentic_run` が一般的な失敗から分離し、固定文言の headline と既存 Evidence Packet を最終 envelope に載せる根拠にする。値は `stop_kind._BUDGET_STOP_REASONS` が唯一の真実源（`web/chat/render.js::BUDGET_EXHAUSTED_STOP_REASONS` は表示側の別実装）。
 _BUDGET_EXHAUSTED_STOP_REASONS = stop_kind._BUDGET_STOP_REASONS

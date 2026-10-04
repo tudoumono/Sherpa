@@ -2,7 +2,6 @@
 設計: docs/design/settings.md「使えるモデル」
 
 解決順: 利用者の選択（カタログ内）→ カタログ既定 → 組み込み既定（このモジュールの値）。
-閉じたプロバイダ（gemini）と退役した用途（`route`）のセルは、保存済みの値があっても読み捨て、保存時も黙って捨てる（`_RETIRED_CATALOG_PROVIDERS`・`_RETIRED_USAGES`）。
 """
 from __future__ import annotations
 
@@ -14,9 +13,7 @@ import re
 _log = logging.getLogger("sherpa")
 
 PROVIDERS = ("openai", "ollama", "codex")
-_RETIRED_CATALOG_PROVIDERS = frozenset({"gemini"})
 USAGES = ("chat", "intent", "embed", "subsearch", "codex", "render")
-_RETIRED_USAGES = frozenset({"route"})
 
 # `render`（rag.md の LLM 成形）が未設定なら、`resolve_model` は旧 `extract` セルの解決結果を読む（読み取りのみの後方互換）。
 # `_DEFAULT_CATALOG` の `extract` キーは静的値を置かない。
@@ -90,11 +87,11 @@ def get_catalog(system_settings: dict | None = None) -> dict:
     if not isinstance(configured, dict):
         return base
     for provider, usages in configured.items():
-        if not isinstance(usages, dict) or provider in _RETIRED_CATALOG_PROVIDERS:
+        if not isinstance(usages, dict):
             continue
         base.setdefault(provider, {})
         for usage, cell in usages.items():
-            if not isinstance(cell, dict) or usage in _RETIRED_USAGES:
+            if not isinstance(cell, dict):
                 continue
             base[provider][usage] = {
                 "allowed": [str(m) for m in (cell.get("allowed") or []) if isinstance(m, str)],
@@ -133,8 +130,7 @@ def is_valid_model(provider: str, usage: str, value: str, system_settings: dict 
 
 def validate_catalog(value) -> dict | None:
     """管理画面からの `model_catalog` 保存値を検証する（`None` は未設定へ戻す）。
-    形式: `{provider: {usage: {"allowed": [str,...], "default": str}}}`。未知の provider/usage は拒否し、
-    閉じた gemini は黙って捨てる。`default` は非空なら allowed の先頭へ足す。不正な形は `ValueError`。
+    形式: `{provider: {usage: {"allowed": [str,...], "default": str}}}`。未知の provider/usage は拒否する。`default` は非空なら allowed の先頭へ足す。不正な形は `ValueError`。
     """
     if value is None:
         return None
@@ -144,8 +140,6 @@ def validate_catalog(value) -> dict | None:
     for provider, usages in value.items():
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("model_catalog のプロバイダ名は空でない文字列で指定してください")
-        if provider in _RETIRED_CATALOG_PROVIDERS:
-            continue
         if provider not in PROVIDERS:
             raise ValueError(
                 f"model_catalog の未知/対象外のプロバイダです: {provider}"
@@ -156,8 +150,6 @@ def validate_catalog(value) -> dict | None:
         for usage, cell in usages.items():
             if not isinstance(usage, str) or not usage.strip():
                 raise ValueError("model_catalog の用途名は空でない文字列で指定してください")
-            if usage in _RETIRED_USAGES:
-                continue
             if usage not in USAGES and usage != "extract":
                 # `extract` は既存 DB のセルを UI が読み込んで PUT し返すため受け入れる（中身の検証は他用途と同じ・管理画面には出ない）。
                 raise ValueError(f"model_catalog[{provider}] の未知の用途です: {usage}"

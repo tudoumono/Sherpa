@@ -84,19 +84,6 @@ def expired_workspace_files() -> list:
         ).fetchall()
 
 
-def mark_workspace_file_expired(file_id: int) -> bool:
-    """台帳行を status='expired' に強制更新する（テスト/管理用・競合チェックなし）。掃除では `claim_workspace_file_expired` を使う。"""
-    _ensure()
-    with _connect() as c:
-        n = c.execute(
-            "UPDATE personal_workspace_files "
-            "SET status='expired', deleted_at=now() "
-            "WHERE id=%s AND status='uploaded'",
-            (file_id,),
-        ).rowcount
-    return n > 0
-
-
 def claim_workspace_file_expired(file_id: int) -> dict | None:
     """台帳行を status='expired' に条件付き UPDATE し、成功行（id + rel_path + user_id）を返す。
     条件（uploaded かつ未削除・期限切れ・所有者が無効化されていない）を同一文で再検証し、不成立なら None（物理削除禁止）。

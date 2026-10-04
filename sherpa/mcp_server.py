@@ -464,7 +464,7 @@ _BUDGET_EXEMPT_TOOLS = frozenset({"list_docs", "folder_tree"}) | _LEDGER_TOOLS
 
 
 def _env_int_override(var_name: str) -> int | None:
-    """`SHERPA_MCP_TOOL_BUDGET_BYTES`/`_MAX_HITS`/`_WINDOW_CAP`（親の `CodexProvider` が調べる深さ連動込みで解決した実効値・`provider.py::_resolve_mcp_budget_env`）を優先して読む。
+    """`SHERPA_MCP_TOOL_BUDGET_BYTES`/`_MAX_HITS`/`_WINDOW_CAP`（親の `CodexProvider` が調べる深さ連動込みで解決した実効値・`providers/codex/usage.py::_resolve_mcp_budget`）を優先して読む。
     未設定/不正値（0 以下・数値でない）は None を返し、呼び出し元はモジュール既定へ戻る。
     """
     raw = os.environ.get(var_name, "").strip()
@@ -668,7 +668,7 @@ def _clip_tool_result(result, name: str | None = None, args: dict | None = None)
     if not isinstance(result, dict):
         return result, False
     max_bytes = _env_int_override("SHERPA_MCP_TOOL_BUDGET_BYTES") \
-        or agentic_search.effective_tool_result_max_bytes(provider="codex")
+        or agentic_search.effective_tool_result_max_bytes()
     size = _json_bytes(result)
     if size <= max_bytes:
         return result, False

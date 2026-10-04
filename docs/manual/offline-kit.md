@@ -29,7 +29,7 @@ Marp（スライド PDF/PPTX 出力）と LibreOffice（旧形式 Office 変換�
 同梱しなければ次のように機能が縮退します（誇張しない）。
 
 - **Marp**: HTML 出力は Node.js＋marp-cli さえ同梱すれば常に可能。**PDF/PPTX 出力は Playwright Chromium も
-  同梱した場合のみ**動きます（[sherpa/agents.py](../../sherpa/agents.py) の `_detect_chrome_path()` が
+  同梱した場合のみ**動きます（[sherpa/providers/codex/sandbox.py](../../sherpa/providers/codex/sandbox.py) の `_detect_chrome_path()` が
   自動検出）。同梱しなければ HTML のみのフォールバックになります（marp スキルの仕様どおり）。
 - **LibreOffice**: 旧形式 Office（`.doc`/`.xls`/`.ppt`）→ 新形式変換の**選択肢の一つ**
   （[sherpa/ingest/arms/legacy_convert.py](../../sherpa/ingest/arms/legacy_convert.py)）。同梱して
@@ -223,7 +223,7 @@ cd Sherpa   # 移送してきたチェックアウトのルート（dist/offline
 ```
 
 `root` で直接実行するとエラーで止まります。Chromium/Ollama 等が `/root` 配下に展開されてしまい、
-`sherpa/agents.py` の自動検出（実行ユーザーの `$HOME` を見る）から見えなくなるためです。必要な操作
+`sherpa/providers/codex/sandbox.py` の自動検出（実行ユーザーの `$HOME` を見る）から見えなくなるためです。必要な操作
 （パッケージ導入・`systemctl`・`usermod` 等）はスクリプト内部が個別に `sudo` を使います。スクリプト冒頭で
 `sudo -v` によりパスワードを一度だけ聞かれ、以降は長時間の手順（.deb 導入・`docker load` 等）の途中で
 sudo 認証が失効しないよう、バックグラウンドで自動延命されます。
@@ -410,7 +410,7 @@ python3 -m venv .venv
 mkdir -p tools/node
 tar -xJf dist/offline-kit/node/node-v*.tar.xz -C tools/node --strip-components=1
 
-# 7) marp-cli（tools/marp/node_modules へ展開・sherpa/agents.py の _marp_bin が自動検出）
+# 7) marp-cli（tools/marp/node_modules へ展開・sherpa/providers/codex/sandbox.py の _marp_bin が自動検出）
 mkdir -p tools/marp
 tar -xzf dist/offline-kit/marp/tools-marp-node_modules.tar.gz -C tools/marp
 
@@ -537,7 +537,7 @@ SHERPA_ENV_FILE=/etc/sherpa/sherpa.env make start          # 既定＝社内 LAN
 **外部到達が無いこと**
 
 サーバ env にも利用者の個人設定にも API キーが無い状態が、閉域での正しい状態です。この状態では
-OpenAI は**そもそもネットワークへ出ません**（`sherpa/agents.py` の `_select_provider` が
+OpenAI は**そもそもネットワークへ出ません**（`sherpa/providers/__init__.py` の `_select_provider` が
 キー未解決を検出した時点で `_UnwiredProvider` に倒し、「未接続」の応答を即返す実装のため）。Codex だけは
 キー有無に関係なく Codex CLI を実際に起動するため、閉域では到達できずタイムアウト/接続エラーで失敗します。
 

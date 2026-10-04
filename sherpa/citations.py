@@ -114,33 +114,6 @@ def citation_dedupe_key(c: Mapping) -> tuple:
     return (c.get("doc_id"), span) if any(span) else (c.get("doc_id"), span, c.get("quote"))
 
 
-def build_evidence_packet(*, task_id: str, investigation_status: str, summary: str = "",
-                          claims: list | None = None, evidence: list[dict] | None = None,
-                          remaining_gaps: list | None = None, conflicts: list | None = None,
-                          candidates_seen: int = 0, candidates_inspected: int = 0,
-                          evidence_selected: int | None = None, stop_reason: str = "",
-                          next_action: str = "") -> dict:
-    """Evidence Packet を整形する（整形だけ・何を Candidate/Verified/Committed とするかは呼び出し側）。
-    `evidence` は Committed Evidence 1 件ごとの `{evidence_id, source_type, source_path, source_span, verification_method}` list。
-    `next_action` は評価が行われなかった経路では空文字。
-    """
-    evidence = evidence or []
-    return {
-        "task_id": task_id,
-        "investigation_status": investigation_status,
-        "summary": summary,
-        "claims": claims or [],
-        "evidence": evidence,
-        "remaining_gaps": remaining_gaps or [],
-        "conflicts": conflicts or [],
-        "candidates_seen": candidates_seen,
-        "candidates_inspected": candidates_inspected,
-        "evidence_selected": evidence_selected if evidence_selected is not None else len(evidence),
-        "stop_reason": stop_reason,
-        "next_action": next_action,
-    }
-
-
 def dedupe_round_robin_by_doc_span(*groups: Iterable[Mapping]) -> list:
     """複数 citation 群を渡した順に round-robin で並べ、`citation_dedupe_key` で重複排除する。doc_id 無しは捨てる。"""
     gs = [list(g) for g in groups]

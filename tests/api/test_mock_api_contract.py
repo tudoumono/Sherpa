@@ -210,7 +210,7 @@ _MOCK_SCHEMA_CASES = [
      "workspace_search_response"),
     (sc.GraphSearchResponse,
      mock_api.graph_search_response(
-         [{**n, "em": "static", "phase": None, "category": None} for n in mock_api.GRAPH["nodes"][:2]],
+         [{**n, "phase": None, "category": None} for n in mock_api.GRAPH["nodes"][:2]],
          mock_api.GRAPH["edges"][:1], {"nodes": 2, "edges": 1}),
      "graph_search_response"),
     (sc.WorldDiffResponse, mock_api.world_diff_response("/mnt/c/ProjectA"), "world_diff_response(未登録)"),
@@ -234,13 +234,13 @@ def test_mock_constant_matches_schema(model, payload, name):
         pytest.fail(f"mock_api.{name} が sherpa.schemas と一致しません（mock drift）:\n{e}")
 
 
-def test_recompute_construct_id_normalizes_legacy_agents_like_real_server():
+def test_recompute_construct_id_keeps_unselectable_agents_like_real_server():
     """mock_api._recompute_construct_id は実サーバ `agent_constructs.construct_id`/`effective_agent`
-    と同じ正規化を行う（旧・直結の保存値 openai/ollama は simple・閉じた頭脳の保存値は生値のまま）。"""
+    と同じく、選べない保存値（openai/ollama/bedrock）を読み替えず生値のまま返す。"""
     base = {"cloud_provider": "openai", "codex_model_provider": "",
             "constructs_available": mock_api.SETTINGS_RESP["constructs_available"]}
-    assert mock_api._recompute_construct_id({**base, "agent": "openai"}) == "simple"
-    assert mock_api._recompute_construct_id({**base, "agent": "ollama"}) == "simple"
+    assert mock_api._recompute_construct_id({**base, "agent": "openai"}) == "openai"
+    assert mock_api._recompute_construct_id({**base, "agent": "ollama"}) == "ollama"
     assert mock_api._recompute_construct_id({**base, "agent": "bedrock"}) == "bedrock"
 
 

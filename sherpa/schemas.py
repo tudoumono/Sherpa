@@ -56,25 +56,6 @@ class HealthSummaryResponse(BaseModel):
     checked_at: str
 
 
-class HealthComponent(BaseModel):
-    """`GET /admin/health` の `components[]` 要素。`hint` は `ok=False` のときだけ付く。"""
-    id: str
-    label: str
-    impact: str
-    ok: bool
-    detail: str | None
-    latency_ms: int
-    hint: str | None = None
-
-
-class AdminHealthResponse(BaseModel):
-    """全コンポーネントの健全性（GET /admin/health）。"""
-    status: str
-    checked_at: str
-    ttl_seconds: float
-    components: list[HealthComponent]
-
-
 class ConfigResponse(BaseModel):
     """現在の実行構成（GET /config）。"""
     agent: str
@@ -1083,9 +1064,7 @@ class IngestPreviewRelation(BaseModel):
 
 class IngestPreviewCounts(BaseModel):
     entities: int
-    entities_static: int
     relations: int
-    relations_static: int
     deprecated: int
     hidden: int
     documents: int
@@ -1185,7 +1164,7 @@ class WorldStatusResponse(IngestSummaryFields):
 
 
 class WorldDiffResponse(BaseModel):
-    """差分プレビュー（POST /worlds/diff・GET /worlds/{wid}/diff）。全キー常時存在。"""
+    """差分プレビュー（POST /worlds/diff）。全キー常時存在。"""
     ok: bool
     registered: bool
     world_id: str | None
@@ -1256,9 +1235,7 @@ class GraphEdge(BaseModel):
 class GraphCounts(BaseModel):
     """グラフの件数。"""
     entities: int
-    entities_static: int
     relations: int
-    relations_static: int
     deprecated: int
     hidden: int
     documents: int
@@ -1289,7 +1266,6 @@ class GraphSearchNode(BaseModel):
     name: str | None
     type: str | None
     type_ja: str | None
-    em: str
     status: str
     value: Any
     top_scope: str | None
@@ -1360,47 +1336,6 @@ class ConversationSummary(BaseModel):
     share_expires_at: WireDateTime | None = None  # 受領共有の実効期限（それ以外は None）
     forked_from: ForkedFromInfo | None = None
     match: ConversationSearchMatch | None = None
-
-
-class ConversationDetailConv(BaseModel):
-    """`GET /conversations/{cid}` の `conversation`。無効な受領共有分岐でも同じ列を返す。"""
-    id: int
-    user_id: str
-    version: str
-    title: str | None
-    codex_session_id: str | None
-    origin: str
-    source_conversation_id: int | None
-    share_id: int | None
-    shared_by_user_id: str | None
-    read_only: bool
-    contains_personal_workspace: bool
-    forked_from_share_id: int | None
-    forked_from_user_id: str | None
-    forked_at: WireDateTime | None
-    created_at: WireDateTime
-    updated_at: WireDateTime
-
-
-class ConversationMessage(BaseModel):
-    """`messages[]` の1件。受領共有は `route`/`trace` を `None` に伏せる（キーは残る）。`answer` はレンズごとに中身が異なるため `Any`。
-    `feedback` は読者本人のフィードバック（{rating,tags,comment}・無ければ `None`。受領共有の閲覧者には常に `None`）。"""
-    id: int
-    role: str
-    content: str
-    lens: str | None
-    route: Any
-    trace: Any
-    answer: Any
-    feedback: Any = None
-    created_at: WireDateTime
-
-
-class ConversationDetailResponse(BaseModel):
-    """会話の詳細（GET /conversations/{cid}）。response_model は付与しない（`share_status` が無効/個人ブロックの受領共有のときだけ付く条件付きキーのため）。"""
-    conversation: ConversationDetailConv
-    messages: list[ConversationMessage]
-    share_status: str | None = None
 
 
 class UserSuggestItem(BaseModel):
@@ -1483,24 +1418,3 @@ class ChatTurnRunning(BaseModel):
 class ChatTurnsRunningResponse(BaseModel):
     turns: list[ChatTurnRunning]
 
-
-# ===== 文書（sherpa/routers/documents.py） =====
-
-class EsSearchHit(BaseModel):
-    """`GET /admin/es/search` の hits[] 要素。`extraction_method`/`confidence`/`has_conflicts` は値があるときだけキーが付く。"""
-    doc_id: str
-    line: Any
-    snippet: str
-    score: Any
-    ext: Any
-    extraction_method: Any = None
-    confidence: Any = None
-    has_conflicts: Any = None
-
-
-class EsSearchResponse(BaseModel):
-    """ES 検索（GET /admin/es/search）。response_model は付与しない（hits[] のキーが条件付きのため）。"""
-    world: str
-    query: str
-    scope_paths: list[str]
-    hits: list[EsSearchHit]

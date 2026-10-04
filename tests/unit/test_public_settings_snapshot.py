@@ -204,7 +204,7 @@ def test_effective_agent_unset_reads_once_via_default_agent_chain(monkeypatch):
 
 
 def test_effective_agent_explicit_noncloud_agent_never_reads_system_settings(monkeypatch):
-    """明示的な agent（codex・旧・直結の保存値 ollama→simple）は system_settings を必要としないため、`effective_agent` は
+    """明示的な agent（codex・simple）は system_settings を必要としないため、`effective_agent` は
     `store.get_system_settings()` を一切呼ばない（クラウド系 agent の未設定分岐だけが
     materialize する・非クラウド系はこの読取自体を経由しない最適化）。"""
     from sherpa import agent_constructs
@@ -218,7 +218,7 @@ def test_effective_agent_explicit_noncloud_agent_never_reads_system_settings(mon
     monkeypatch.setattr("sherpa.store.get_system_settings", _boom)
 
     assert agent_constructs.effective_agent({"agent": "codex"}) == "codex"
-    assert agent_constructs.effective_agent({"agent": "ollama"}) == "simple"
+    assert agent_constructs.effective_agent({"agent": "simple"}) == "simple"
     assert read_calls == []
 
 

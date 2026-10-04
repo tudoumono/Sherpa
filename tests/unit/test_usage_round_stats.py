@@ -8,6 +8,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
+import _usage_reference as _usage_ref
 from sherpa.store import usage as _usage_store
 
 
@@ -19,7 +20,7 @@ def _round_row(*, ts=None, provider="openai", input_tokens=10, output_tokens=5,
 
 
 def test_compute_round_stats_empty_input():
-    out = _usage_store._compute_round_stats([])
+    out = _usage_ref._compute_round_stats([])
     assert out == {"by_depth_provider": [], "by_round": [], "round_distribution": [],
                   "unmatched_rounds": 0}
 
@@ -35,7 +36,7 @@ def test_compute_round_stats_aggregates_by_depth_provider():
                                    "reason_codes": {}}},
                   input_tokens=20, output_tokens=10, elapsed_ms=200, turn_message_id=1),
     ]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["unmatched_rounds"] == 0
     row = out["by_depth_provider"][0]
     assert row["depth_profile"] == "deep" and row["provider"] == "openai"
@@ -55,7 +56,7 @@ def test_compute_round_stats_unmatched_turn_message_id_counts_separately():
     """対応する assistant 返信が見つからない行（`turn_message_id=None`）は `unmatched_rounds` に
     数えるだけで `round_distribution` には出さない（活動量の by_depth_provider には出る）。"""
     rows = [_round_row(meta={"round": 1}, turn_message_id=None)]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["unmatched_rounds"] == 1
     assert out["round_distribution"] == []
     assert out["by_depth_provider"][0]["rounds"] == 1
@@ -63,7 +64,7 @@ def test_compute_round_stats_unmatched_turn_message_id_counts_separately():
 
 def test_compute_round_stats_missing_depth_and_provider_fold_to_unknown():
     rows = [_round_row(provider=None, depth_profile=None, meta={"round": 1})]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["depth_profile"] == "unknown"
     assert out["by_depth_provider"][0]["provider"] == "unknown"
 
@@ -73,7 +74,7 @@ def test_compute_round_stats_ignores_malformed_meta_values():
     例外にも0への誤変換にもしない（他の usage.py 集計と同じ「非数値/欠落は無視」防御）。"""
     rows = [_round_row(meta={"round": "not-an-int", "citations_delta": "nope",
                              "claims": {"confirmed": True, "reason_codes": {"x": "nope"}}})]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     row = out["by_depth_provider"][0]
     assert row["citations_delta_total"] == 0
     assert row["claims"] == {"confirmed": 0, "inferred": 0, "unknown": 0}   # bool は int 扱いしない
@@ -98,7 +99,7 @@ def test_compute_round_stats_aggregates_limits_verdicts_stops_and_by_round():
                          "claims": {"confirmed": 1, "inferred": 0, "unknown": 0, "reason_codes": {}}},
                   turn_message_id=1),
     ]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
 
     dp_row = out["by_depth_provider"][0]
     assert dp_row["limits"] == {"tool_result_clipped": 3, "auto_continues": 1, "total_budget_hit": 1}
@@ -123,7 +124,7 @@ def test_compute_round_stats_aggregates_duplicate_tool_call_limit():
     """`duplicate_tool_call`（同一クエリの重複実行の抑止・件数）も他の limits 増分と同じ経路で
     巡内合算される（`_USAGE_LIMIT_INT_FIELDS`/`_ROUND_LIMIT_KEYS` への追加を確認する回帰）。"""
     rows = [_round_row(meta={"round": 1, "limits": {"duplicate_tool_call": 2}}, turn_message_id=1)]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["limits"] == {"duplicate_tool_call": 2}
 
 
@@ -144,7 +145,7 @@ def test_compute_round_stats_aggregates_missing_codes_without_free_text():
                          "claims": {"confirmed": 0, "inferred": 0, "unknown": 0, "reason_codes": {}}},
                   turn_message_id=1),
     ]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
 
     dp_row = out["by_depth_provider"][0]
     assert dp_row["missing_codes"] == {"unexplored": 2, "insufficient": 1}
@@ -162,7 +163,7 @@ def test_compute_round_stats_by_round_folds_missing_round_no_to_none():
     """`meta.round` が取れない（非 int/欠落）行は `round_no=None` の別バケットへ畳み込む
     （型不正で例外にしない・他の欠落フィールドと同じ「unknown」畳み込み思想）。"""
     rows = [_round_row(meta={"round": "not-an-int"})]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert len(out["by_round"]) == 1
     assert out["by_round"][0]["round_no"] is None
 
@@ -172,7 +173,7 @@ def test_compute_round_stats_limits_ignores_unknown_keys_and_malformed_values():
     rows = [_round_row(meta={"round": 1, "limits": {"not_a_real_limit": 5,
                                                     "tool_result_clipped": "nope",
                                                     "synthesis_truncated": False}})]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["limits"] == {}
 
 
@@ -184,7 +185,7 @@ def _claims_row(*, provider="openai", depth_profile="max", unknown_reasons):
 def test_compute_final_reason_codes_sums_unknown_reasons_across_turns():
     rows = [_claims_row(unknown_reasons={"budget": 2, "conflict": 1}),
             _claims_row(unknown_reasons={"budget": 1})]
-    out = _usage_store._compute_final_reason_codes(rows)
+    out = _usage_ref._compute_final_reason_codes(rows)
     assert {"depth_profile": "max", "provider": "openai", "reason_code": "budget", "claims": 3} in out
     assert {"depth_profile": "max", "provider": "openai", "reason_code": "conflict", "claims": 1} in out
     assert len(out) == 2
@@ -192,11 +193,11 @@ def test_compute_final_reason_codes_sums_unknown_reasons_across_turns():
 
 def test_compute_final_reason_codes_turn_without_unknown_claims_adds_nothing():
     rows = [_claims_row(unknown_reasons={}), _claims_row(unknown_reasons=None)]
-    assert _usage_store._compute_final_reason_codes(rows) == []
+    assert _usage_ref._compute_final_reason_codes(rows) == []
 
 
 def test_compute_final_reason_codes_empty_input():
-    assert _usage_store._compute_final_reason_codes([]) == []
+    assert _usage_ref._compute_final_reason_codes([]) == []
 
 
 # ===== S1b: `_compute_final_missing_codes`/`_merge_final_missing_codes`（Codex 経路の
@@ -210,7 +211,7 @@ def _gate_row(*, provider="codex", depth_profile="standard", gate_missing_codes)
 def test_compute_final_missing_codes_counts_by_depth_provider():
     rows = [_gate_row(gate_missing_codes={"spec_missing": 2}),
             _gate_row(gate_missing_codes={"log_missing": 1})]
-    out = _usage_store._compute_final_missing_codes(rows)
+    out = _usage_ref._compute_final_missing_codes(rows)
     assert out == {("standard", "codex"): {"spec_missing": 2, "log_missing": 1}}
 
 
@@ -218,16 +219,16 @@ def test_compute_final_missing_codes_skips_null_or_api_rows():
     """API 経路の行にはこのキー自体が無い（NULL）——静かにスキップする。"""
     rows = [_gate_row(gate_missing_codes=None), {"provider": "openai", "depth_profile": "deep",
                                                  "unknown_reasons": {}, "gate_missing_codes": None}]
-    assert _usage_store._compute_final_missing_codes(rows) == {}
+    assert _usage_ref._compute_final_missing_codes(rows) == {}
 
 
 def test_merge_final_missing_codes_adds_new_bucket_for_codex_only_depth():
     """Codex は `chat-round` を発生させないため、既存の巡別集計に対応する（深さ, "codex"）組が
     無い——新規バケットとして `by_depth_provider` へ追加し、既存の表示（`missing_codes` 列）に
     経路別で載る。巡別指標（`rounds` 等）は0のまま。"""
-    rounds_stats = _usage_store._compute_round_stats([])
+    rounds_stats = _usage_ref._compute_round_stats([])
     rows = [_gate_row(depth_profile="standard", gate_missing_codes={"callgraph_missing": 1})]
-    _usage_store._merge_final_missing_codes(rounds_stats, rows)
+    _usage_ref._merge_final_missing_codes(rounds_stats, rows)
     bucket = next(b for b in rounds_stats["by_depth_provider"]
                  if (b["depth_profile"], b["provider"]) == ("standard", "codex"))
     assert bucket["missing_codes"] == {"callgraph_missing": 1}
@@ -239,9 +240,9 @@ def test_merge_final_missing_codes_merges_into_existing_bucket():
     """既存バケット（同じ深さ×経路の巡別記録が既にある）には加算する（上書きしない）。"""
     round_rows = [_round_row(provider="codex", depth_profile="standard",
                              meta={"round": 1, "missing_codes": ["spec_missing"]})]
-    rounds_stats = _usage_store._compute_round_stats(round_rows)
+    rounds_stats = _usage_ref._compute_round_stats(round_rows)
     rows = [_gate_row(depth_profile="standard", gate_missing_codes={"spec_missing": 1})]
-    _usage_store._merge_final_missing_codes(rounds_stats, rows)
+    _usage_ref._merge_final_missing_codes(rounds_stats, rows)
     bucket = next(b for b in rounds_stats["by_depth_provider"]
                  if (b["depth_profile"], b["provider"]) == ("standard", "codex"))
     assert bucket["missing_codes"] == {"spec_missing": 2}
@@ -332,7 +333,7 @@ def test_round_stats_aggregate_evidence_kind_missing_codes_and_drop_free_text():
                              "claims": {"confirmed": 0, "inferred": 0, "unknown": 0,
                                         "reason_codes": {}}},
                       turn_message_id=1)]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["missing_codes"] == dict.fromkeys(codes, 1)
 
 
@@ -352,7 +353,7 @@ def test_compute_round_stats_counts_backend_degrade_limits():
                          "claims": {"confirmed": 0, "inferred": 0, "unknown": 0, "reason_codes": {}}},
                   turn_message_id=1),
     ]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["limits"] == {
         "backend_unavailable_graph": 1, "graph_reingest_required": 1,
         "backend_unavailable_fulltext": 1}
@@ -365,7 +366,7 @@ def test_compute_round_stats_counts_depth_escalated_rounds():
         _round_row(meta={"round": 0, "limits": {}}, turn_message_id=1),
         _round_row(meta={"round": 1, "limits": {"depth_escalated": True}}, turn_message_id=1),
     ]
-    out = _usage_store._compute_round_stats(rows)
+    out = _usage_ref._compute_round_stats(rows)
     assert out["by_depth_provider"][0]["limits"] == {"depth_escalated": 1}
     by_round = {r["round_no"]: r for r in out["by_round"]}
     assert by_round[0]["limits"] == {} and by_round[1]["limits"] == {"depth_escalated": 1}

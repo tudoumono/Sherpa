@@ -576,7 +576,7 @@ def _chat_or_codex_consumes(selected: str, sys_s: dict, rows: list[dict] | None)
         ないのに `codex_model_provider` の残存値**だけ**で消費扱いにしない（実際には使われていない
         過去の設定の残骸を誤検出しない）。
       - `effective_agent()` が閉じた頭脳（gemini/bedrock）を返しても、`agent_constructs.
-        runtime_blocked()` が真なら実行時は `_DisabledProvider` に差し替わり、キーは一切参照
+        runtime_blocked()` が真なら実行時は `_UnwiredProvider`（選び直しの案内）で止まり、キーは一切参照
         されない（`sherpa/providers/__init__.py::_select_provider` 参照）。この構成は「保存されて
         いるが無効」であって「selected を消費している」わけではない（無効な理由は
         `_disabled_agent_configs` が別途 NG として報告する）。
@@ -799,8 +799,8 @@ def _disabled_agent_configs(sys_s: dict | None, rows: list[dict] | None) -> Chec
     チャットで閉じていて無効（`agent_constructs.runtime_blocked()`
     が真）な件数を報告する。
 
-    `_select_provider`（`sherpa/providers/__init__.py`）はキー解決より先に `runtime_blocked` を
-    見て `_DisabledProvider` に差し替えるため、この構成は「キーが無くて動かない」のではなく
+    `_select_provider`（`sherpa/providers/__init__.py`）は（キー解決より先に）
+    `effective_agent(strict=True)` の例外で `_UnwiredProvider` が止めるため、この構成は「キーが無くて動かない」のではなく
     「そもそも実行時に無効化されている」＝原因が異なる。キー消費の判定（`_cloud_provider_consumed`）
     からは除外した上で、ここで独立の NG として理由を明示する（実行時のエラー表示と一致させ、
     キーを設定しても解決しないことを利用者が誤解しないようにする）。
@@ -850,8 +850,8 @@ def _agent_actually_used(target_agent: str, sys_s: dict, rows: list[dict] | None
     """`target_agent`（`agent_constructs.effective_agent()` が返す値の1つ・"openai"／"codex"／
     "ollama"）が、システム既定または有効な利用者のいずれかで**実際に**
     実効頭脳として使われているか。`agent_constructs.runtime_blocked()` で無効化されている構成は
-    「使われている」に数えない（`_select_provider` がキー解決より先に `_DisabledProvider` へ
-    差し替えるため）。読み取り不能（`rows is None`）・判定不能な例外は fail-closed（使われている
+    「使われている」に数えない（`_select_provider` がキー解決より先に `_UnwiredProvider` で
+    止めるため）。読み取り不能（`rows is None`）・判定不能な例外は fail-closed（使われている
     扱い）にする。
 
     `_cloud_provider_consumed`（A7 の `cloud_provider` 選択が消費されるか）とは別物: こちらは
@@ -1929,7 +1929,7 @@ def check_codex_sandbox(codex_required: bool) -> CheckResult:
             codex_sandbox._write_codex_authoring_config(
                 home, [str(kb)], "medium", False, "doctor-check", None,
                 direct_read_roots=[str(kb)], system_settings={}, link_auth=False)
-            sandbox_env = codex_sandbox._codex_clean_env(home, run, run)
+            sandbox_env = codex_sandbox._codex_clean_env(home, run)
             r = subprocess.run(
                 ["codex", "sandbox", "-P", "sherpa-authoring", "-C", str(run), "--",
                  "/bin/sh", "-c", _CODEX_SANDBOX_PROBE_SCRIPT, "sh", str(kb)],
@@ -1989,6 +1989,8 @@ def check_required_tools() -> list[CheckResult]:
         if r["installed"]:
             ver = f" {r['version']}" if r.get("version") else ""
             out.append(CheckResult(f"tool_{r['id']}", label, "ok", f"入っています{ver}（{uses}）"))
+        elif r.get("unknown"):
+            out.append(CheckResult(f"tool_{r['id']}", label, "skip", f"確認できません（{r['detail']}）"))
         else:
             extra = f"［{r['detail']}］" if r.get("detail") else ""
             # Codex の付属物（bwrap・rg）は欠けても Codex 調査自体は選べる＝警告だけで「使えません」と断定しない。

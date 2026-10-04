@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 
-from .identifiers import normalize_code_name as _norm
 
 # COBOL の COPY/CALL/EXEC PGM・PROGRAM-ID・項目・JOB を拾う構文
 _PROGRAM_ID = re.compile(r"PROGRAM-ID\s*\.\s*([A-Z0-9#@$-]+)", re.I)

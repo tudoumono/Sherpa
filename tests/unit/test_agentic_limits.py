@@ -11,7 +11,7 @@ import os
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
 
-from sherpa import agentic_search as A  # noqa: E402
+from sherpa.parts.read import tools as RT  # noqa: E402
 from sherpa import store  # noqa: E402
 
 
@@ -19,29 +19,30 @@ def _final_events(events: list) -> list:
     return [ev for ev in events if "final" in ev]
 
 
-def test_codex_provider_without_cli_does_not_reference_unbound_counter(monkeypatch):
-    """Codex CLI が無い（起動しない）経路でも run() が UnboundLocalError にならない。"""
+def test_codex_provider_without_cli_does_not_reference_unbound_counter(tmp_path, monkeypatch):
+    """Codex CLI が無い（起動しない）経路でも run() が UnboundLocalError にならず、結果を 1 件返す。"""
     import shutil
-    from sherpa.providers.codex import provider as P
+    import test_codex_auto_continue as helper
+    from sherpa import agents
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    src = open(P.__file__, encoding="utf-8").read()
-    # 初期化が起動条件（shutil.which の結果 `_codex_bin`）より前にあることを固定する（起動しない経路の参照安全）。
-    assert src.index("_auto_continue_count = 0") < src.index("if _codex_bin and ws_authoring")
+    monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
+    events = helper._run(agents.CodexProvider(), helper._ctx("no-cli", 41001))
+    assert helper._result_env(events)
 
 
 def test_reader_finisher_marks_byte_clip_distinct_from_row_cap():
     """`_finish_reader_result` がバイト予算で切ったときだけ `byte_clipped` が立つ（行数上限だけでは立たない）。"""
     long_rows = [{"row": i, "cells": ["x" * 50]} for i in range(40)]
-    out = A._finish_reader_result("xlsx_range", {"rows": long_rows, "truncated": True}, "a.xlsx", 400)
+    out = RT._finish_reader_result("xlsx_range", {"rows": long_rows, "truncated": True}, "a.xlsx", 400)
     assert out.get("byte_clipped") is True
-    small = A._finish_reader_result("xlsx_range", {"rows": long_rows[:2], "truncated": True}, "a.xlsx", 100000)
+    small = RT._finish_reader_result("xlsx_range", {"rows": long_rows[:2], "truncated": True}, "a.xlsx", 100000)
     assert not small.get("byte_clipped")
 
 
 def test_docx_paragraph_shrink_marks_byte_clip():
     """docx の段落削減（表の救済ではない経路）でも byte_clipped が立つ。"""
     paras = [{"index": i, "text": "x" * 100} for i in range(20)]
-    out = A._finish_docx_paragraphs_result({"paragraphs": paras, "tables": []}, "a.docx", 1024)
+    out = RT._finish_docx_paragraphs_result({"paragraphs": paras, "tables": []}, "a.docx", 1024)
     assert out.get("truncated") is True and out.get("byte_clipped") is True
 
 

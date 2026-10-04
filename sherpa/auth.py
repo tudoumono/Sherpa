@@ -56,11 +56,6 @@ def initial_admin_password() -> str:
     return os.environ.get("SHERPA_ADMIN_PASSWORD") or DEFAULT_ADMIN_PASSWORD
 
 
-def auth_enabled() -> bool:
-    """認証が有効か（既定で有効。`SHERPA_AUTH_DISABLED=1` の明示時だけ無効）。"""
-    return not auth_disabled()
-
-
 def auth_disabled() -> bool:
     """開発・テスト互換モード。`SHERPA_AUTH_DISABLED=1` の明示時だけ合成 admin を返す。
 

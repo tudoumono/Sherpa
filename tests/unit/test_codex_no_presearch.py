@@ -27,12 +27,11 @@ print(json.dumps({"type": "turn.completed", "usage": {
 '''
 
 
-@pytest.mark.parametrize("lens, mcp_on, expect_dispatch", [
-    ("qa", True, False),        # 省く（Codex が MCP ツールで自分で調べる）
-    ("impact", True, True),     # 省かない（影響一覧を回答と並べて表示する）
-    ("qa", False, True),        # MCP 無効は下調べの結果をプロンプトへ渡すので省かない
+@pytest.mark.parametrize("lens, expect_dispatch", [
+    ("qa", False),        # 省く（Codex が MCP ツールで自分で調べる）
+    ("impact", True),     # 省かない（影響一覧を回答と並べて表示する）
 ])
-def test_codex_presearch_skipped_only_for_mcp_non_impact(tmp_path, monkeypatch, lens, mcp_on, expect_dispatch):
+def test_codex_presearch_skipped_only_for_non_impact(tmp_path, monkeypatch, lens, expect_dispatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "codex"
@@ -41,7 +40,6 @@ def test_codex_presearch_skipped_only_for_mcp_non_impact(tmp_path, monkeypatch, 
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("SHERPA_USERS_DIR", str(tmp_path / "users"))
     monkeypatch.setenv("SHERPA_CODEX_OUTPUT_SCHEMA", "0")
-    monkeypatch.setenv("SHERPA_CODEX_MCP", "1" if mcp_on else "0")
     calls: list = []
 
     def _dispatch(lens_, inp):

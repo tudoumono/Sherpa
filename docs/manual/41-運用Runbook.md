@@ -16,7 +16,7 @@
 | 3 | 一枚看板 | `make status` | ストア3つ・アプリ（healthz）・LAN/Caddy・URL |
 | 4 | 死活応答 | `curl -s http://127.0.0.1:8000/healthz` | `{"ok":true}` が返ればアプリ核は生きている |
 | 5 | アプリログ | `tail -n 100 data/run/api.log` | 例外・起動失敗の直接の手がかり |
-| 6 | 全ログ（アプリ＋ストア） | `make logs`（絞り込み例: `make logs convert embed`・短縮 `make l c e`） | api/convert/embed/usage 等と PostgreSQL/Neo4j/Elasticsearch を1画面に合流して追う（`make logs help` で名前の一覧、`make logs report` で集計レポート） |
+| 6 | 全ログ（アプリ＋ストア） | `./sherpactl logs`（絞り込み例: `./sherpactl logs convert embed`・短縮 `./sherpactl logs c e`） | api/convert/embed/usage 等と PostgreSQL/Neo4j/Elasticsearch を1画面に合流して追う（`./sherpactl logs -h` で名前の一覧、`./sherpactl logs -r` で集計レポート） |
 
 > **してはいけないこと**: 復旧目的で `make nuke` を実行しない（ストアの**ボリュームごと削除**＝データ消去です。確認は 2 回・端末必須）。
 > 迷ったらまず `make up`（ストア再起動）と `make restart`（アプリ再起動）。どちらもデータは消しません。
@@ -330,10 +330,10 @@ set_openai_endpoint_seed_blocked`）で OpenAI 系 I/O 全体を止める設計�
   （＝資料フォルダを直接読めないまま）別の経路で応答を作っている。`codex.log` の終了行に
   `sandbox_failed` が1以上、または `api.log` に「Codex のサンドボックスでコマンドが失敗して
   います」という警告が出ていれば、この原因である可能性が高いです。
-- **確認**: `make doctor` を実行し、「Codex のサンドボックス」項目を確認してください。
+- **確認**: `./sherpactl doctor` を実行し、「Codex のサンドボックス」項目を確認してください。
 - **復旧**: `sudo bash scripts/setup-codex-sandbox.sh apply` で AppArmor のユーザー名前空間制限を
   緩和します（[40-運用.md](40-運用.md) の「Codex のサンドボックス」節を参照）。
-- **復旧確認**: `make doctor` の「Codex のサンドボックス」項目が OK になり、同じ質問をもう一度
+- **復旧確認**: `./sherpactl doctor` の「Codex のサンドボックス」項目が OK になり、同じ質問をもう一度
   投げて資料を踏まえた回答が返ること。
 
 ### S11. Codex CLI の版を上げる前に
@@ -365,7 +365,7 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 | MD 変換（取り込み） | `data/run/convert.log` | 取り込み（資料フォルダスキャン→MD化→索引）の進行ログの詳細 |
 | LLM 埋め込み | `data/run/embed.log` | ベクトル埋め込み生成（OpenAI/Ollama）の詳細 |
 | AI 利用量 | `data/run/usage.log` | LLM 呼び出し1回ごとの kind/provider/model/トークン数/経過秒（`sherpa/metering.py::record`・チャット本回答含む・LOG-UX・2026-09-04） |
-| Codex 実行ログ | `make logs codex`（`data/run/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
+| Codex 実行ログ | `./sherpactl logs codex`（`data/run/codex.log`） | Codex CLI 実行1回ごとの開始（構成種別/multi_agent/深さ/見直し回数/出力スキーマ段/モデル）・終了（returncode/イベント種類別件数/MCP呼出数/spawn_agent 子数/usage合計/エラーcode・message/経過秒/stderr末尾）サマリ。文脈枠超過（`context_window_exceeded`）等の原因切り分けに使う |
 | Codex 実行 | `data/run/codex.log` | Codex CLI 実行1回ごとの開始/終了サマリ（構成・深さ・イベント種別件数・MCP 呼出数・子スレッド数・使用トークン・エラーコード・所要時間。**stderr と失敗本文は保存しない**＝資料名・本文・環境変数値が残るため・2026-09-20） |
 
 **WARNING 以上（障害の疑いがある事象）はサブシステム別ログだけでなく `data/run/api.log`（run ログ）にも残ります**——
@@ -373,14 +373,14 @@ Sherpa が使う Codex CLI の版は `scripts/codex-version.env` で固定して
 （LOG-2・裁定 2026-09-03）。障害調査でまず見るのは run ログ、原因が変換/埋め込み系だと分かった後に該当の専用ログを
 掘り下げる、という順で使います。
 
-**まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`make logs` は data/run/*.log と
+**まとめて見る/集計する**: 上記は個別に `tail`/`cat` してもよいですが、`./sherpactl logs` は data/run/*.log と
 Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に合流して追えます
-（`make logs convert embed` で絞り込み・`make logs report` で追わずに集計レポート・
-`make logs help` でヘルプ。本書冒頭「最初の5分（トリアージ）」表の6行目も参照）。
+（`./sherpactl logs convert embed` で絞り込み・`./sherpactl logs -r` で追わずに集計レポート・
+`./sherpactl logs -h` でヘルプ。本書冒頭「最初の5分（トリアージ）」表の6行目も参照）。
 
-### make logs のオプション早見
+### ./sherpactl logs のオプション早見
 
-`make logs` の後ろに並べた語はそのまま `scripts/logs.sh` の引数になります（`make logs convert embed`）。`make l`（短縮）でも同じです。**名前**（何を見るか）と
+`./sherpactl logs` の後ろに並べた語・オプションはそのまま `scripts/logs.sh` の引数になります（`./sherpactl logs convert embed -n 100`）。`make logs` / `make l` も同じ入口を呼ぶ別名で、従来の書き方（`make logs convert embed`）も使えます。**名前**（何を見るか）と
 **オプション**（どう見るか）を組み合わせます。名前を1つでも指定すると、指定しなかった側
 （アプリ/Docker）は表示されません。
 
@@ -397,13 +397,13 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 | `postgres` / `neo4j` / `elasticsearch` / `ocr-worker` | Docker ストア側（別名: `pg`・`es`・`ocr`） |
 
 `api-20260904-193821` のような日時付きの名前は**退避された過去世代**です（下の「起動時の退避」参照）。
-その環境で指定できる名前の一覧（各名前の説明・短縮つき）は `make logs help`（短縮 `make l h`）が実物から生成して表示します。知らない名前を指定したときも同じ一覧を出して止まります。
+その環境で指定できる名前の一覧（各名前の説明・短縮つき）は `./sherpactl logs -h` が実物から生成して表示します。知らない名前を指定したときも同じ一覧を出して止まります。
 
 **語・オプション（どう見るか）**
 
-`make logs` の後ろには、名前のほかに次の語を同じ並びで書けます（`-` で始まるオプションは make 自身に取られるため、make 経由では語で書きます。`./scripts/logs.sh` を直接使うときはオプションも使えます）。
+`./sherpactl logs` の後ろには、名前のほかに次の語・オプションを同じ並びで書けます（`-` で始まるオプションは make 自身に取られるため、`make logs` では語で書きます。`./sherpactl logs` ならオプションをそのまま書けます）。
 
-| make での語（短縮） | オプション | 意味 |
+| 語（短縮） | オプション | 意味 |
 |---|---|---|
 | `n=500` | `-n N` | 追う前に末尾 N 行を先に表示（既定 20）。数字以外は一覧を出して止まる |
 | `err` | `-g PATTERN` | エラー・警告（`ERROR\|WARN\|失敗\|✗`）の行だけ表示（任意の正規表現は `-g`） |
@@ -419,17 +419,17 @@ Docker ストア（PostgreSQL/Neo4j/Elasticsearch/OCR）のログを1画面に�
 **用途別レシピ**
 
 ```bash
-make logs convert embed libreoffice mem   # 資料取り込みを監視（メモリ行つき）
-make l c e m                               # 同じことの短縮
-make logs n=500 convert                    # 最初に末尾 500 行から
-make logs err                              # エラー・警告だけ拾う
-make logs help                             # 指定できる名前の一覧（短縮 make l h）
-make logs report                           # 取り込み後の振り返りレポート
-make logs ARGS="-x api"                    # アプリ全般から api のノイズを抜く（ARGS に詰める書き方も使える）
-make logs ARGS="-l"                        # いまの状況を一覧で（追わない）
+./sherpactl logs convert embed libreoffice -m   # 資料取り込みを監視（メモリ行つき）
+./sherpactl logs c e m                          # 同じことの短縮
+./sherpactl logs -n 500 convert                 # 最初に末尾 500 行から
+./sherpactl logs err                            # エラー・警告だけ拾う
+./sherpactl logs -h                             # 指定できる名前の一覧
+./sherpactl logs -r                             # 取り込み後の振り返りレポート
+./sherpactl logs -x api                         # アプリ全般から api のノイズを抜く
+./sherpactl logs -l                             # いまの状況を一覧で（追わない）
 ```
 
-`NAME=convert,embed`・`MEM=1`・`REPORT=1`・`N=500` の書き方も使えますが、後ろに語を並べる書き方を基本にしてください。
+make の書き方（`make logs convert embed`・`make l c e m`・`NAME=convert,embed`・`MEM=1`・`REPORT=1`・`N=500`）も使えます。
 
 ### 起動時の退避（ローテーション）
 
@@ -445,24 +445,26 @@ make logs ARGS="-l"                        # いまの状況を一覧で（追�
 サブシステム別ログ（Python 側）は `sherpa/log_setup.py::rotate_and_prune`。命名規約・保持数の
 意味論は両者で揃えています。
 
-### 会話の流れを時刻順に書き出す（make trace）
+### 会話の流れを時刻順に書き出す（./sherpactl trace）
 
 1 つ以上の会話について、各回答が「どの段で・どの道具を・どんな引数で・何件ヒットして・どれだけトークンを使ったか」を時刻順の 1 本のテキストに書き出します。調べ方の良し悪しを後から追うとき、回答が遅い・「調べる範囲が広すぎて…」で止まったときに文脈を何が埋めたかを確かめるとき、開発者へ渡して調べてもらうときに使います。
 
 ```
-make trace CONV=136                       # 画面（標準出力）に出す
-make trace CONV=136,137 MASK=1 OUT=trace.txt   # 伏せ字にしてファイルへ
-make trace CONV=136 MASK=1 MASK_MODELS=1 OUT=trace.txt   # モデル名も伏せる（社外に渡すとき）
+./sherpactl trace 136                       # 画面（標準出力）に出す
+./sherpactl trace 136,137 --mask -o trace.txt   # 伏せ字にしてファイルへ
+./sherpactl trace 136 --mask --mask-models -o trace.txt   # モデル名も伏せる（社外に渡すとき）
 ```
 
-- **会話番号**は `make logs ARGS="codex"` の `conv=…` と同じ番号です。
+make の書き方（`make trace CONV=136 MASK=1 MASK_MODELS=1 OUT=trace.txt`）も使えます。
+
+- **会話番号**は `./sherpactl logs codex` の `conv=…` と同じ番号です。
 - **分かること**（回答ごと）: 開始・終了・所要（準備・Codex・後処理の内訳）／終了理由とエラー／頭脳とモデル・推論の強さ・調べる深さ・範囲／実際に効いた設定とアプリの版／質問と回答の先頭／段の区切り（本体・自動の続き・台帳の続き・見直し・下調べ役）と段ごとのトークン／道具の呼び出し（時刻・段・道具・引数の要旨・所要・結果の大きさ・ヒット件数・打ち切り）／往復ごとのトークンの増分と累計（回答の記録と食い違えば注記）／調査台帳（完了したか・継続の回数・状態ごとの件数・書き換えの流れ・最終形とダウンロードの窓口）／道具ごとの集計（本体と下調べ役それぞれの入力（うちキャッシュ）・出力・推論・往復の回数・1 往復の最大入力・圧縮した回数と位置、道具ごとの呼び出し回数・結果の合計量・最大・かかった時間の合計・切り詰めや失敗の回数）。
-- **伏せ字（MASK=1）**: アプリが知っている語（道具名・状態・終了理由など）と、モデル名・時刻・件数・トークン・よく使う拡張子だけをそのまま出し、それ以外（質問・回答の本文、資料名・パス、検索語、範囲の名前、利用者、見慣れないエラー名や拡張子、知らない引数）はすべて「資料#1a2b3c4d.cbl」「語#…」「モデル#…」のような記号にするか、件数だけにします。同じ値は同じ記号になるので、同じ資料を何度読んだかは追えます（記号は実行のたびに変わります）。書き出す前に伏せ残りが無いかを確かめ、見つかったら書き出さずに止まります。
-- **モデル名**: コストの計算に使うため、伏せ字（MASK=1）でもそのまま出します。Azure のデプロイ名は環境を作った人が付けた名前なので、社外に渡すときは `MASK_MODELS=1` を付けてください（公開されているモデル名以外を記号にします）。Azure の回答では、実際に動いたモデル（デプロイの元のモデル）は記録に残っていないため「実際のモデル: 記録なし」と出ます。
+- **伏せ字（--mask）**: アプリが知っている語（道具名・状態・終了理由など）と、モデル名・時刻・件数・トークン・よく使う拡張子だけをそのまま出し、それ以外（質問・回答の本文、資料名・パス、検索語、範囲の名前、利用者、見慣れないエラー名や拡張子、知らない引数）はすべて「資料#1a2b3c4d.cbl」「語#…」「モデル#…」のような記号にするか、件数だけにします。同じ値は同じ記号になるので、同じ資料を何度読んだかは追えます（記号は実行のたびに変わります）。書き出す前に伏せ残りが無いかを確かめ、見つかったら書き出さずに止まります。
+- **モデル名**: コストの計算に使うため、伏せ字（--mask）でもそのまま出します。Azure のデプロイ名は環境を作った人が付けた名前なので、社外に渡すときは `--mask-models` を付けてください（公開されているモデル名以外を記号にします）。Azure の回答では、実際に動いたモデル（デプロイの元のモデル）は記録に残っていないため「実際のモデル: 記録なし」と出ます。
 - **出さないもの**: 道具の結果の本文・シェルの出力・推論の中身は伏せ字の有無にかかわらず出しません。秘匿ファイル（鍵や認証情報のファイル）の名前も出さず、秘匿ファイルを出典に持つ回答は本文を出しません。個人の資料を参照したターンは出しません。会話番号は数字とカンマだけを受け付けます。
 - **記録が無いとき**: Codex のセッション記録は最後の更新から 30 日（管理画面の保持日数）で消えます。消えた会話や Codex 以外の経路では、データベースにある分（所要・終了理由・トークンの合計・思考の流れの並び・台帳の最終形）だけを出し、何が出せないかを「記録の欠け」に書きます。試験の後に調べるときは早めに書き出してください。
-- **影響**: 読むだけで、データベースにもアプリの動作にも影響しません（書くのは OUT に指定したファイルだけ）。再起動も不要です。
-- **置き場所**: 実環境のアプリのディレクトリで最新を取り込んで（`git pull`）から実行するのが簡単です。別の場所に取得したリポジトリから見るときは、そのリポジトリで Python の依存を入れたうえで、`SHERPA_ENV_FILE=<実環境の設定ファイルのパス> make trace CONV=136` のように実環境の設定ファイルを指定します（設定ファイルの中身は表示しません）。
+- **影響**: 読むだけで、データベースにもアプリの動作にも影響しません（書くのは `-o` に指定したファイルだけ）。再起動も不要です。
+- **置き場所**: 実環境のアプリのディレクトリで最新を取り込んで（`git pull`）から実行するのが簡単です。別の場所に取得したリポジトリから見るときは、そのリポジトリで Python の依存を入れたうえで、`SHERPA_ENV_FILE=<実環境の設定ファイルのパス> ./sherpactl trace 136` のように実環境の設定ファイルを指定します（設定ファイルの中身は表示しません）。
 
 ## バックアップ / リストア
 

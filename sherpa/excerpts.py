@@ -15,7 +15,7 @@ import json
 import re
 from pathlib import Path
 
-from . import es_index, grep_tool, worlds
+from . import es_index, worlds
 
 # rag_chunks.jsonl の読み取り安全弁。`es_index._RAG_CHUNKS_FILE_CAP_BYTES` と同じ値に揃える。
 _RAG_CHUNKS_SCAN_CAP_BYTES = es_index._RAG_CHUNKS_FILE_CAP_BYTES
@@ -111,22 +111,6 @@ def _region_for_chunk(world: str, doc_id: str, chunk_id: str) -> dict | None:
     return None
 
 
-def _rag_md_path(world: str, doc_id: str) -> Path | None:
-    """grep が実際に読んだ rag.md のパス（`preferred_derived_name` を grep と共有）。rag 優先でなければ None。"""
-    if not _valid_doc_id(doc_id):
-        return None
-    if not grep_tool.rag_grep_enabled():
-        return None
-    rag_root = worlds.derived_rag_dir(world)
-    if not rag_root:
-        return None
-    rag_root = Path(rag_root)
-    preferred = grep_tool.preferred_derived_name(rag_root, doc_id)
-    if not preferred.endswith(grep_tool._RAG_SUFFIX):
-        return None
-    return _confined_path(rag_root, rag_root / preferred)
-
-
 def _chunk_id_from_rag_md_span(world: str, doc_id: str, span) -> str | None:
     """grep ヒットの span（rag.md の行範囲・1-based・両端含む）を、その節の chunk_id へ逆引きする。
     アンカーはレコードの見出しより前に出るため、節の開始行（`span[0]`）までの最後のアンカーを使う。
@@ -136,7 +120,7 @@ def _chunk_id_from_rag_md_span(world: str, doc_id: str, span) -> str | None:
     s, _e = span
     if not isinstance(s, int) or isinstance(s, bool) or s < 1:
         return None
-    rag_md_path = _rag_md_path(world, doc_id)
+    rag_md_path = worlds.rag_md_path(world, doc_id)
     if rag_md_path is None:
         return None
     text = _read_capped(rag_md_path, _MD_SCAN_CAP_BYTES)
@@ -199,8 +183,7 @@ def _find_human_md_section(markdown: str, sheet: str, cell_range: str) -> dict |
     return result
 
 
-def resolve_human_excerpt(world: str, doc_id: str, *, chunk_id: str | None = None, span=None,
-                          locator=None, section_path=None) -> dict | None:
+def resolve_human_excerpt(world: str, doc_id: str, *, chunk_id: str | None = None, span=None) -> dict | None:
     """成功時 `{"text": 節本文（見出し込み）, "hint": 位置ヒント|None}`。対応が取れなければ None。"""
     if chunk_id is None:
         chunk_id = _chunk_id_from_rag_md_span(world, doc_id, span)
@@ -229,8 +212,7 @@ def display_quote(world: str, doc_id: str, fallback_quote: str, *, chunk_id: str
     """利用者向け引用本文を解決する。返り値は `{"quote", "excerpt_source": "human_md"|"rag", "locator_hint"}`。
     人間 MD の該当節が引ければ quote を差し替え、引けなければ `fallback_quote` のまま "rag"。
     """
-    section = resolve_human_excerpt(world, doc_id, chunk_id=chunk_id, span=span,
-                                    locator=locator, section_path=section_path)
+    section = resolve_human_excerpt(world, doc_id, chunk_id=chunk_id, span=span)
     if section is not None:
         return {"quote": section["text"], "excerpt_source": "human_md", "locator_hint": section.get("hint")}
     from . import citations

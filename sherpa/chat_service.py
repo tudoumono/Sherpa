@@ -369,7 +369,7 @@ def _build_router(known, world, settings, can_ask, user_id=None, explicit_lens=N
             d = _decision_for(explicit_lens, message, known, reason="明示指定")
             cache[message] = d
             return d
-        d = _heuristic_route(message, world, known_terms=known)
+        d = _heuristic_route(message, known_terms=known)
         if not d.get("confident") and _is_simple_agent():
             # 簡易は管理者設定の AI（`simple_chat._resolve_llm`）以外へ送らないため、意図分類の LLM は呼ばず、曖昧な入力は確認も挟まず qa に固定する。
             d = _decision_for("qa", message, known, reason="曖昧なため既定（検索）")
@@ -675,7 +675,7 @@ def _dispatch(session, lens, payload, world, scope_meta=None, system_settings=No
     """レンズ実行（＋範囲フィルタ）。範囲は world グラフ traversal(Cypher)＋grep/ES/根拠に効かせる。
     - 層フィルタ（探す対象）は qa（author も qa 分岐）にのみ適用する。impact／troubleshoot は言及エッジ（DOCUMENTS via=mention）が木を跨いで繋ぐため適用せず、`env["scope"]["layer_applied"]` で明示する。
     - 調べる深さ（`depth_profile`）: `run_impact`/`run_troubleshoot` の `depth`・`run_qa` の `max_hits` へ、実効基準値（`system_settings` → env → コード既定）に倍率を掛けた値を渡す。
-      `system_settings`（省略可）は呼び出し元（`handle_message`/`stream_message`）が読んだスナップショットで、ここでは DB を読まない。`None` は基準値の上書きなし。`abs_max` は倍率適用後に一度だけ縛る絶対上限。
+      `system_settings`（省略可）は呼び出し元（`stream_message`）が読んだスナップショットで、ここでは DB を読まない。`None` は基準値の上書きなし。`abs_max` は倍率適用後に一度だけ縛る絶対上限。
     - 検索経路トグル（`scope_meta["tools"]`）: `agentic_search.dispatch_tools_for_lens` で実効ツール集合と実行可否を判定する。必須ツールが全て OFF/不達なら、OFF のツールへ黙ってフォールバックせず `agentic_search.tools_blocked_env` の明示エラーを返す。
       qa/author は grep（`run_qa`）と fulltext（ES 補完）のどちらか一方でも実行し、troubleshoot はグラフ必須で fulltext 補完のみを追加で切り替える。
       `tools_availability`（省略可）は呼び出し元がターンにつき 1 回計算した `agentic_search.tool_availability()` の結果で、ここでは計算しない。
@@ -972,18 +972,16 @@ def _fixed_lens_result(lens: str, headline: str, reason: str, message: str, worl
     return {"env": env, "decision": decision}
 
 
-def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None, provider=None):
-    """provider.run() のイテレーション中に `GraphQueryOverloadError`／`GraphSchemaEraError` が飛んだら、固定文言の `_result` イベントへ差し替えて終端する（handle_message/stream_message の共通ラッパー）。
+def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None):
+    """provider.run() のイテレーション中に `GraphQueryOverloadError`／`GraphSchemaEraError` が飛んだら、固定文言の `_result` イベントへ差し替えて終端する（stream_message のラッパー）。
     `GraphSchemaEraError` は調査結果が届いた後の保険で、通常は検知時点で調査を止めない（`_dispatch` は grep 相当の下地へ縮退し、`agentic_search.run_tool` の `graph_neighbors` 分岐と Codex の MCP 経路は機械可読コードのツール結果へ変換する）。
     例外は `providers/base.py::_gather` 内の `ctx.dispatch(...)` から上がり、`_gather` の呼び出し側はラップしていないため、捕まえた時点で LLM 事実合成は一度も実行されていない。
-    `provider` を渡すと、例外前に `write_output_file` が台帳登録に成功していた場合（`provider._last_created_files`）、固定文言の env にも `wrote_files`/`created_files` を補う（個人由来判定が env のフィールドだけを見るため）。
     """
     try:
         yield from gen
     except GraphQueryOverloadError as e:
         _log.warning("impact 経路が Neo4j 安全弁で縮退（fail-loud・reason=%s・world=%s）", e.reason, world)
         result = _impact_overload_result(message, world, scope_meta)
-        _carry_created_files(result["env"], provider)
         yield {"type": "_result", **result}
     except GraphSchemaEraError as e:
         lens = e.lens or "impact"
@@ -992,18 +990,7 @@ def _degrade_overload(gen, message: str, world: str, scope_meta: dict | None, pr
         result = _fixed_lens_result(
             lens, GRAPH_SCHEMA_ERA_USER_MESSAGE, "グラフのスキーマ世代不一致（今すぐ更新で解消）",
             message, world, scope_meta)
-        _carry_created_files(result["env"], provider)
         yield {"type": "_result", **result}
-
-
-def _carry_created_files(env: dict, provider) -> None:
-    """`provider._last_created_files`（このターンで `write_output_file` が台帳登録した成果物）が非空なら、固定文言 env にも `created_files`/`wrote_files` を補う（`_degrade_overload` 専用）。"""
-    created = getattr(provider, "_last_created_files", None) or []
-    if not created:
-        return
-    env["created_files"] = [{"name": f.get("rel_path"), "download_url": f.get("download_url")}
-                            for f in created if f.get("rel_path")]
-    env["wrote_files"] = [f.get("rel_path") for f in created if f.get("rel_path")] or True
 
 
 def _clip_history_msg(text: str) -> str:
@@ -1166,7 +1153,7 @@ def _personal_citations(hits: list[dict]) -> list[dict]:
 
 def _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes, ev,
                           user_msg_id, personal, world, scope_meta, t0) -> dict:
-    """確認カード（provider が yield する `question` イベント）を assistant メッセージとして永続化する（handle_message／stream_message 共通。両経路とも `_result` に至らず generator を終えるため、ここ 1 箇所の保存で両方に効く）。ページを離れて開き直しても後から答えられる。
+    """確認カード（provider が yield する `question` イベント）を assistant メッセージとして永続化する（`_result` に至らず generator を終える経路の保存）。ページを離れて開き直しても後から答えられる。
     content=prompt／answer に question payload／trace はここまでに溜めた思考ノード。
     personal トグル ON のターンは、質問 prompt に個人ヒットの断片が混ざり得るため個人扱いで保存する（会話フラグ `set_contains_personal_workspace`／`_user_msg` の personal 保存は呼び出し側がターン先頭で済ませている）。
     """
@@ -1174,10 +1161,6 @@ def _save_clarify_message(conversation_id, user_id, settings, message, trace_nod
     if ev.pop("_personal_rounds", False):
         personal = True
     # 会話が既に個人由来（過去ターンに個人行がある）なら、このターンが personal=False でも確認カードと質問行を個人扱いにする（履歴/resume 経由で個人内容が混ざり得るため）。追加読取に失敗したら個人扱いへ倒す（fail-closed）。
-    # `write_output_file` が ask_user 直前に台帳登録済みの成果物（`ev.get("created_files")`）を運んで来た場合も、本回答の `env["wrote_files"]` と同じ扱いで個人由来にする（成果物カードが共有相手に見えないように）。
-    _created_files_q = ev.get("created_files") or []
-    if _created_files_q:
-        personal = True
     if not personal:
         try:
             personal = bool(store.conversation_is_personal_tainted(conversation_id))
@@ -1186,18 +1169,12 @@ def _save_clarify_message(conversation_id, user_id, settings, message, trace_nod
     if personal:
         store.set_contains_personal_workspace(conversation_id)
         store.set_message_personal(user_msg_id)
-    question_payload = {k: v for k, v in ev.items() if k not in ("type", "created_files", "activity")}
+    question_payload = {k: v for k, v in ev.items() if k not in ("type", "activity")}
     question_payload.setdefault("original_message", message)  # 再送フォーマット（元の依頼）に使う
     q_answer = {"lens": "clarify", "question": question_payload, "trace_version": 2}
     # provider が question イベント経由で運んだ activity（`answer["activity"]` と同じ置き場）。`_finalize_activity_phases` が「provider が作った」経路として扱う（無ければ source:"none" で作り直す）。
     if ev.get("activity") is not None:
         q_answer["activity"] = ev["activity"]
-    if _created_files_q:
-        # Codex/通常回答の `env["created_files"]`/`env["wrote_files"]` と同じ形で載せる（ダウンロード導線カード・sanitized share の taint 判定）。
-        q_answer["created_files"] = [
-            {"name": f.get("rel_path"), "download_url": f.get("download_url")}
-            for f in _created_files_q if f.get("rel_path")]
-        q_answer["wrote_files"] = [f.get("rel_path") for f in _created_files_q if f.get("rel_path")] or True
     q_answer["duration_ms"] = round((time.monotonic() - t0) * 1000)
     _finalize_activity_phases(q_answer, q_answer["duration_ms"])
     q_msg = store.add_message(conversation_id, "assistant", ev.get("prompt") or "",
@@ -1212,56 +1189,9 @@ def _save_clarify_message(conversation_id, user_id, settings, message, trace_nod
     return q_msg
 
 
-def handle_message(session, message, world="v1",
-                   conversation_id=None, user_id="admin", scope_paths=None, layer=None, lens=None,
-                   knowledge=False, personal=False, users_dir="data/users", web_search=False,
-                   depth_profile=None, tools=None, tools_explicit=None, tools_availability=None,
-                   provider=None, settings=None, sys_settings=None, stop_event=None) -> dict:
-    """1 ターン処理（非ストリーミング）: 会話を用意→保存→振り分け→実行→答えを保存して返す。
-    - `stop_event`（省略可）: 利用者の途中停止（`/chat/stream/stop`）を provider へ通す Event。HTTP 入口は必ず渡す（Codex の子プロセスを止める唯一の導線）。
-    - `knowledge=False`（既定）: 検索せず素の会話。`True` で社内資料を参照する（レンズ＋出典）。
-    - `scope_paths`: 検索/分析をその範囲に絞る（knowledge 時のみ）。`layer`（既定 `None`＝`"both"`）: 探す対象。`lens`（既定 `None`＝自動）: 調べ方の明示指定で、メッセージ先頭のスラッシュ接頭辞が優先する（`_resolve_lens`）。
-    - `personal=True`: 共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
-    - `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか。保存済みの個人設定 `codex_web_search` は実行には使わず、この値で上書きしてから provider を選ぶ。
-    - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
-    - `tools`（既定 `None`＝全 ON）: 検索経路トグル。agentic 探索が提示する grep/es_search/graph_neighbors を絞る（Codex は対象外）。
-    - `tools_availability`（既定 `None`＝自分で計算）: 呼び出し元（`routers/chat.py`）が受付時の 422 判定と同時に計算した可用性 snapshot。渡されたらそれを使う（受付時と実行時で可用性が食い違わないように）。
-    - `provider`/`settings`/`sys_settings`（既定 `None`＝自分で用意）: 呼び出し元が受付段階で組み立てた同一の Provider／ユーザ設定／システム設定を実行本体まで渡す。別々に読み直すと、受付時の接続先検証と実行時の provider が別世代の設定を使い得る。
-    """
-    _t0 = time.monotonic()  # 1 ターンの所要時間の起点（answer.duration_ms へ埋め込む）。
-    explicit_lens, lens_source, lens_block, message = _resolve_lens(lens, message)
-    conversation_id = _ensure_conversation(conversation_id, message, world, user_id)
-    # 履歴は現在の質問を保存する前に取得する（in-flight の質問を履歴に含めない）。
-    history = _history_pairs(conversation_id)
-    # Codex ネイティブ resume: 直近ターンで捕捉済みの codex_session_id があれば CodexProvider に渡す（他 provider は無視）。history と同じく質問保存より前に読む。
-    codex_session_id = store.get_session_id(conversation_id)
-    # 直近 assistant メッセージが記録した Codex 累計 usage（resume ターンの usage をターン差分にするための前ターン値・CodexProvider だけが消費する）。
-    codex_usage_prev_total = store.get_codex_usage_total(conversation_id)
-    # トグル ON のターンは、保存時点で質問を個人扱いにし、provider 実行前に会話も個人扱いにする（in-flight で共有されても質問が漏れない／clarify で `_result` に至らなくても未マークにならない）。
-    _user_msg = store.add_message(conversation_id, "user", message, personal=personal)
-    if personal:
-        store.set_contains_personal_workspace(conversation_id)
-    known = _known_terms(session, world) if knowledge else []  # オフ時は Neo4j も触らない
-    scope_meta = (_resolve_scope(message, world, scope_paths, layer, lens_source, lens_block, web_search,
-                                 depth_profile, tools, tools_explicit)
-                 if knowledge else None)  # 明示 ＞ 全体
-    # settings/sys_settings は呼び出し元が受付段階で読んだスナップショットを使う（省略時のみここで読む）。
-    settings = settings if settings is not None else store.get_settings(user_id)
-    # 実行に使う web_search は保存済み個人設定でなくこのチャットの希望のみ（ローカル複製だけを上書きし、DB へは書き戻さない）。
-    settings = {**settings, "codex_web_search": bool(web_search)}
-    # `get_provider` と同じ fresh snapshot を `_dispatch`（調べる深さ）へも共有する（決定的レンズと agentic 経路が別世代の system_settings を見ないように）。読み取り失敗は例外として伝播し、このターンを fail-closed にする。
-    sys_settings = sys_settings if sys_settings is not None else store._read_system_settings_fresh()
-    # 非 agentic 経路が使う実効ツール判定用の可用性スナップショット。引数で渡されていればそれを使い、無ければここで 1 回だけ計算する。knowledge オフは不要。
-    if tools_availability is None:
-        tools_availability = agentic_search.tool_availability() if knowledge else None
-
-    # 個人ファイルを grep して事実テキスト/citation を準備する（ON かつファイルが存在する場合）。grep は本人 uid の workspace 配下のみで、ES/Neo4j には書かない。
-    personal_hits: list[dict] = []
-    if personal:
-        personal_hits = _personal_grep_hits(user_id, message, users_dir)
-
+def _make_dispatch_with_personal(session, world, scope_meta, sys_settings, tools_availability, personal_hits):
+    """共有 KB dispatch の結果に個人ヒットを注入する dispatch を返す。"""
     def _dispatch_with_personal(lens, inp):
-        """共有 KB dispatch の結果に個人ヒットを注入する。"""
         env = _dispatch(session, lens, inp, world, scope_meta, sys_settings, tools_availability)
         if personal_hits:
             # 個人ヒットを facts に追記（AI への入力のみ・非永続化）。
@@ -1269,116 +1199,7 @@ def handle_message(session, message, world="v1",
             # 個人 citation を別枠で追加（共有 KB citation とは分離）。
             env.setdefault("personal_sources", []).extend(_personal_citations(personal_hits))
         return env
-
-    ctx = Ctx(message=message, world=world, pace=0, knowledge=knowledge,  # 非ストリーミングは間を置かない
-              stop_event=stop_event,
-              route=_build_router(known, world, settings, can_ask=False, user_id=user_id,
-                                  explicit_lens=explicit_lens, scope_meta=scope_meta,
-                                  conversation_id=conversation_id),  # 非対話＝clarify 不可→qa fallback
-              dispatch=_dispatch_with_personal if personal else
-                       (lambda lens, inp: _dispatch(session, lens, inp, world, scope_meta, sys_settings,
-                                                    tools_availability)),
-              scope_meta=scope_meta,
-              make_sources=((lambda docs: _sources(docs, world)) if knowledge else None),
-              uid=user_id,
-              # agentic/plain 経路にも個人ヒットを伝搬する（`_dispatch_with_personal` が呼ばれない経路用）。
-              personal_facts=_personal_facts(personal_hits, message) if personal_hits else "",
-              # 直前ターンの (user, assistant) 対（message には混ぜない・別チャネル）。conversation_id/codex_session_id は CodexProvider の resume 判定に使う。
-              history=history, conversation_id=conversation_id, codex_session_id=codex_session_id,
-              codex_usage_prev_total=codex_usage_prev_total,
-              # ターン先頭で 1 回だけ計算した可用性 snapshot を provider まで渡す。
-              tools_availability=tools_availability,
-              # activity.phases_ms.prepare の起点。provider 呼出し前の処理（意図判定・履歴取得・user 行保存等）も prepare に含める。
-              turn_started_mono=_t0)
-    # stream_message と同じく node を id で dedup 蓄積し、trace として保存する。
-    trace_nodes: dict = {}
-    result = None
-    # 呼び出し元が既に組み立てた Provider（受付段階の `_agentic_target_check`→`tool_availability` と同一インスタンス）があればそれを使う（改めて `get_provider()` すると別世代の設定から別の Provider を構築しうる）。
-    _provider = provider if provider is not None else get_provider(settings, system_settings=sys_settings)
-    for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta, provider=_provider):
-        if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
-            # 停止後に provider が返すもの（`_result` 含む）は保存しない。assistant は永続せず、停止を clarify と同格に監査へ残す（`stream_message` と同じ契約）。例外は巡ループの停止終端（`_is_stopped_terminal`）で、未完了回答を保存する。停止終端は途中のイベントの後に続くため、ここで打ち切らず捨てながら受け取り続け、終端が来なければ下の `result is None` 分岐が同じ停止監査を 1 回だけ行う。
-            continue
-        if ev["type"] == "_result":
-            result = ev
-            break
-        if ev.get("type") == "question":
-            # provider が question を yield して generator を終える（clarify 相当）場合は、ストリーミング側（`stream_message`）と同じ保存・監査を行い、確認カードを正常応答として返す（result=None 分岐の RuntimeError に落とさない）。
-            q_msg = _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes,
-                                          ev, _user_msg["id"], personal, world, scope_meta, _t0)
-            return {"conversation_id": conversation_id, "message": q_msg}
-        if ev.get("type") == "node" and ev.get("id"):
-            trace_nodes[ev["id"]] = ev
-    if result is None:
-        # provider が停止要求を事前ガードで検知し、イベントを一切 yield せず generator を終える経路（例: `providers/base.py::_agentic_run` の `ctx.stop_event.is_set()` 早期 return）でも、同じ停止監査・停止応答を返す（result=None の添字参照で 500 にしない）。
-        if stop_event is not None and stop_event.is_set():
-            _audit_chat_turn(user_id, conversation_id, settings, lens="stopped",
-                             user_msg_id=_user_msg["id"], assistant_msg_id=None, world=world,
-                             scope_paths=(scope_meta or {}).get("scope_paths"), personal=personal,
-                             stopped=True)
-            return {"type": "stopped", "conversation_id": conversation_id}
-        raise RuntimeError("provider did not yield a _result event")
-    env = _finalize(result["env"], result["decision"], message)
-    _pop_evidence_committed(env, trace_nodes)  # `_result` のサイドカーを trace へ折り込む（孤児イベント防止）
-    env.pop("_synthesis_digest", None)  # 清書専用の合成入力（`_answer_prompt` 用）は公開 answer に残さない
-    env.pop("_claims_digest", None)  # 主張構造の清書専用ビューは公開 answer に残さない（data.claims は残す）
-    env.pop("_evidence_note", None)  # 根拠種別の不足注記（清書専用）。告知は headline 側に載る
-    # 終端 4 種の印と巡の個人由来累積（内部キー・保存・共有へは残さない）。
-    _terminal = env.pop("_terminal", None)
-    _round_personal = _pop_round_personal(env)
-    env["trace_version"] = 2
-    # CodexProvider が捕捉/更新した session id を会話に永続化する（次ターンの resume 用）。fail-open（保存に失敗しても本ターンの回答は成立させ、次回は resume せず priming に委ねる）。
-    _codex_sid = env.get("codex_session_id")
-    if _codex_sid:
-        try:
-            store.set_session_id(conversation_id, _codex_sid)
-        except Exception as e:
-            _log.warning("codex session id 保存に失敗（fail-open・次回は resume 不可で priming 継続）: %s", e)
-
-    # 個人 citation を answer envelope に統合する（「個人ファイル内ヒット」ラベル付き）。busy 応答（Codex 直列化で実行しなかったターン）には添付しない（実行していない回答に個人ファイル抜粋を永続・表示しない）。
-    _used_personal = False
-    if personal_hits and not env.get("busy"):
-        env["personal_sources"] = _personal_citations(personal_hits)
-        _used_personal = True
-
-    # Codex がファイルを書いた場合も contains_personal_workspace を立てる。
-    if env.get("codex_wrote_files"):
-        _used_personal = True
-    # 巡ループが全巡で累積した個人由来／書込と、API/Ollama の `write_output_file` も同じ扱いにする（個人 workspace への書込みがあったターンは sanitized share で本文を伏せる）。最終巡だけから算出すると前巡の書込が共有で落ちるため、累積側を先に見る。
-    if _round_personal or env.get("wrote_files"):
-        _used_personal = True
-    # 個人参照トグル ON のターンは、hit が無くても質問にファイル名等が残り得るため個人扱いにする（sanitized で伏字＋通常共有をブロック）。
-    if personal:
-        _used_personal = True
-    # 会話が既に個人由来（会話フラグ・個人行・旧形式マーカーのいずれか）なら、今回 personal=False でも個人扱いにする。`history` に過去の個人ターンの回答が含まれ得るため、一度個人由来になった会話は以後も保守的に個人扱いにし続ける（非個人扱いで保存すると sanitized share の伏字対象から漏れる）。
-    if not _used_personal:
-        try:
-            _used_personal = bool(store.conversation_is_personal_tainted(conversation_id))
-        except Exception:
-            _used_personal = True  # 判定できなければ個人扱いへ倒す（fail-closed）
-
-    # 個人コンテンツを使った場合は assistant message 保存の前にフラグを立てる。書き込みに失敗したら再 raise し（fail-closed）、個人内容を含む回答を保存しない。
-    if _used_personal:
-        store.set_contains_personal_workspace(conversation_id)
-        store.set_message_personal(_user_msg["id"])  # sanitized share: このターンの質問も個人扱い
-
-    env["duration_ms"] = round((time.monotonic() - _t0) * 1000)
-    _finalize_activity_phases(env, env["duration_ms"])
-    _investigation_record = result.get("investigation_record")
-    _mark_investigation_recorded(env, _investigation_record)
-    msg = store.add_message(conversation_id, "assistant", env["headline"],
-                            lens=result["decision"]["lens"], route=env["route"], answer=env,
-                            trace=_cap_trace_v2(trace_nodes),
-                            personal=_used_personal)
-    _save_investigation_record(_investigation_record, msg["id"], conversation_id)
-    # 停止終端は監査も停止として残す。assistant は保存済みなので `assistant_msg_id` を渡す。
-    _audit_chat_turn(user_id, conversation_id, settings,
-                     lens=("stopped" if _terminal == "stopped" else result["decision"]["lens"]),
-                     user_msg_id=_user_msg["id"], assistant_msg_id=msg["id"], world=world,
-                     scope_paths=(scope_meta or {}).get("scope_paths"), personal=_used_personal,
-                     stopped=(_terminal == "stopped"))
-
-    return {"conversation_id": conversation_id, "message": msg}
+    return _dispatch_with_personal
 
 
 def stream_message(session, message, world="v1",
@@ -1389,7 +1210,14 @@ def stream_message(session, message, world="v1",
                    sys_settings=None):
     """思考イベントを逐次 yield する（SSE）。頭脳は provider（差し替え可能）で、UI/プロトコルは不変。
     provider が `node`（動的に何個でも）を流し、最後に内部 `_result` を返す。本関数は会話の用意・永続だけを担い、`_result` を `answer` イベントに変換して返す。
-    `knowledge`/`scope_paths`/`layer`/`lens`/`personal`/`web_search`/`depth_profile`/`tools`/`tools_availability`/`provider`/`settings`/`sys_settings` の契約は `handle_message` と同じ。
+    - `knowledge=False`（既定）: 検索せず素の会話（資料参照オフ）。`True` で社内資料を参照する（レンズ＋出典）。
+    - `scope_paths`: 検索/分析をその範囲に絞る（knowledge 時のみ）。`layer`（既定 `None`＝`"both"`）: 探す対象。`lens`（既定 `None`＝自動）: 調べ方の明示指定で、メッセージ先頭のスラッシュ接頭辞が優先する（`_resolve_lens`）。
+    - `personal=True`: 共有 KB に加え本人の個人ファイルも grep して事実+引用に含める。個人ファイルは ES/Neo4j に入れず、本人のみ参照可。
+    - `web_search=False`（既定）: このチャットで Codex の Web 検索を希望するか。保存済みの個人設定 `codex_web_search` は実行には使わず、この値で上書きしてから provider を選ぶ。
+    - `depth_profile`（既定 `None`＝`"standard"`）: 調べる深さ。`_dispatch()`/agentic 探索の反復・ヒット上限・探索深さ・Codex 推論に倍率で効く（evaluator の巡数は `depth_profile.review_rounds_for`）。
+    - `tools`（既定 `None`＝全 ON）: 検索経路トグル。agentic 探索が提示する grep/es_search/graph_neighbors を絞る（Codex は対象外）。
+    - `tools_availability`（既定 `None`＝自分で計算）: 呼び出し元（`routers/chat.py`）が受付時の 422 判定と同時に計算した可用性 snapshot。渡されたらそれを使う（受付時と実行時で可用性が食い違わないように）。
+    - `provider`/`settings`/`sys_settings`（既定 `None`＝自分で用意）: 呼び出し元が受付段階で組み立てた同一の Provider／ユーザ設定／システム設定を実行本体まで渡す。別々に読み直すと、受付時の接続先検証と実行時の provider が別世代の設定を使い得る。
     - `stop_event`: セットされたら頭脳の停止の終端を待つ。終端が返ればその assistant メッセージと所要時間を通常の完了と同じく保存・配信し、終端が無いまま終われば `{"type":"stopped"}` を返して assistant は保存しない（user メッセージは冒頭で保存済みで、次の質問はそのまま会話を続けられる）。
     - `on_user_saved(message_id, personal)`（省略可）: このターンの user 行を保存した直後に同期で 1 回呼ぶ。呼び出し元が「どの user 行が自分のターンか」を本文一致で推測せずに済む（同文の並走ターンを取り違えない・`routers/chat.py::_persist_turn_crash`）。yield イベントとは別チャネル。
     """
@@ -1422,7 +1250,7 @@ def stream_message(session, message, world="v1",
     settings = {**settings, "codex_web_search": bool(web_search)}
     # `get_provider` と同じ fresh snapshot を `_dispatch`（調べる深さ）へも共有する（決定的レンズと agentic 経路が別世代の system_settings を見ないように）。読み取り失敗は例外として伝播し、このターンを fail-closed にする。
     sys_settings = sys_settings if sys_settings is not None else store._read_system_settings_fresh()
-    # 非 agentic 経路が使う実効ツール判定用の可用性スナップショット（`handle_message` と同じ契約）。
+    # 非 agentic 経路が使う実効ツール判定用の可用性スナップショット。
     if tools_availability is None:
         tools_availability = agentic_search.tool_availability() if knowledge else None
 
@@ -1431,13 +1259,8 @@ def stream_message(session, message, world="v1",
     if personal:
         personal_hits = _personal_grep_hits(user_id, message, users_dir)
 
-    def _dispatch_with_personal(lens, inp):
-        """共有 KB dispatch の結果に個人ヒットを注入する。"""
-        env = _dispatch(session, lens, inp, world, scope_meta, sys_settings, tools_availability)
-        if personal_hits:
-            env["_personal_facts"] = _personal_facts(personal_hits, inp)
-            env.setdefault("personal_sources", []).extend(_personal_citations(personal_hits))
-        return env
+    _dispatch_with_personal = _make_dispatch_with_personal(
+        session, world, scope_meta, sys_settings, tools_availability, personal_hits)
 
     ctx = Ctx(
         message=message, world=world, pace=emit_pace(), knowledge=knowledge,
@@ -1465,9 +1288,9 @@ def stream_message(session, message, world="v1",
     trace_nodes: dict = {}
     # 停止を検知したが停止終端（未完了回答）をまだ受け取っていない状態。
     _stopped_pending = False
-    # 呼び出し元が既に組み立てた Provider があればそれを使う（`handle_message` と同じ理由）。
+    # 呼び出し元が既に組み立てた Provider があればそれを使う。
     _provider = provider if provider is not None else get_provider(settings, system_settings=sys_settings)
-    for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta, provider=_provider):
+    for ev in _degrade_overload(_provider.run(ctx), message, world, scope_meta):
         if stop_event is not None and stop_event.is_set() and not _is_stopped_terminal(ev):
             # provider が停止要求を受けて何らかのイベント（`_result` 含む）を返してきても保存しない（assistant は永続しない）。例外は巡ループの停止終端（`_is_stopped_terminal`）で、未完了回答を保存する。停止終端は途中のイベントの後に続くため、捨てながら受け取り続け、終端が来なければループを抜けた後に停止監査・停止応答を 1 回だけ返す。
             _stopped_pending = True
@@ -1477,9 +1300,6 @@ def stream_message(session, message, world="v1",
             env = _finalize(ev["env"], ev["decision"], message)
             # `_result` のサイドカーを trace へ折り込む（孤児イベント防止・永続化後にライブ配信もする）。
             _ev_committed_node = _pop_evidence_committed(env, trace_nodes)
-            env.pop("_synthesis_digest", None)  # 清書専用の合成入力は公開 answer に残さない
-            env.pop("_claims_digest", None)  # 主張構造の清書専用ビューは公開 answer に残さない（data.claims は残す）
-            env.pop("_evidence_note", None)  # 根拠種別の不足注記（清書専用）。告知は headline 側に載る
             # 終端 4 種の印と巡の個人由来累積（内部キー・保存・共有へは残さない）。
             _terminal = env.pop("_terminal", None)
             _round_personal = _pop_round_personal(env)
@@ -1492,7 +1312,7 @@ def stream_message(session, message, world="v1",
                 except Exception as e:
                     _log.warning("codex session id 保存に失敗（fail-open・次回は resume 不可で priming 継続）: %s", e)
 
-            # 個人 citation を answer envelope に統合する。busy 応答には添付しない（`handle_message` と同じ）。
+            # 個人 citation を answer envelope に統合する。busy 応答には添付しない。
             _used_personal = False
             if personal_hits and not env.get("busy"):
                 env["personal_sources"] = _personal_citations(personal_hits)
@@ -1501,13 +1321,13 @@ def stream_message(session, message, world="v1",
             # Codex がファイルを書いた場合も contains_personal_workspace を立てる。
             if env.get("codex_wrote_files"):
                 _used_personal = True
-            # 巡ループの累積と `write_output_file` の書込を個人由来として扱う（`handle_message` と同じ）。
+            # 巡ループの累積と書込を個人由来として扱う。
             if _round_personal or env.get("wrote_files"):
                 _used_personal = True
             # 個人参照トグル ON のターンは hit が無くても質問にファイル名等が残り得るため個人扱い。
             if personal:
                 _used_personal = True
-            # 会話が既に個人由来なら今回 personal=False でも個人扱いにし続ける（`handle_message` と同じ理由）。
+            # 会話が既に個人由来なら今回 personal=False でも個人扱いにし続ける。
             if not _used_personal:
                 try:
                     _used_personal = bool(store.conversation_is_personal_tainted(conversation_id))
@@ -1540,7 +1360,7 @@ def stream_message(session, message, world="v1",
                 yield _ev_committed_node
             yield {"type": "answer", "conversation_id": conversation_id, "message": msg}
         elif ev["type"] == "question":
-            # 確認カードを assistant メッセージとして永続化する（`_save_clarify_message`・`handle_message` と共有）。通常 /chat/stream と背景 /chat/turns の両経路が本関数を通るため、ここ 1 箇所の保存で両方に効く。
+            # 確認カードを assistant メッセージとして永続化する。
             _save_clarify_message(conversation_id, user_id, settings, message, trace_nodes,
                                   ev, _user_msg["id"], personal, world, scope_meta, _t0)
             yield {**ev, "conversation_id": conversation_id, "original_message": message}

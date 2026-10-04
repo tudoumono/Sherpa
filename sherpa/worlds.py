@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .grep_tool import valid_world  # 識別子の許容文字（パストラバーサル防止）
+from .ingest import text_kind
 
 
 def semantic_dir(world_id: str) -> Path:
@@ -51,6 +52,36 @@ def derived_md_dir(world_id: str) -> Path:
 def derived_rag_dir(world_id: str) -> Path:
     """RAG 正本＋証跡の置き場（`{rel}.rag.md`／`{rel}.rag_chunks.jsonl`／`{rel}.assets/`）。grep・ES・グラフが読む。"""
     return derived_dir(world_id) / "rag"
+
+
+def rag_md_path(world_id: str, doc_id: str) -> Path | None:
+    """`doc_id` の `{rel}.rag.md`（RAG 正本）の実パス。無効な doc_id・秘匿名・範囲外・不在・経路上の symlink は None。
+    ツール引数を直接受けるため、字面パスと `resolve()` の一致で symlink を検知する（厳格側に統一）。
+    """
+    if not isinstance(doc_id, str) or not doc_id or doc_id.startswith("/") or "\\" in doc_id or "\x00" in doc_id:
+        return None
+    parts = doc_id.split("/")
+    if ".." in parts or "" in parts:
+        return None
+    if text_kind.is_sensitive_doc_id(doc_id):
+        return None  # 秘匿名は rag.md を持たない契約。残っていても読ませない
+    root = derived_rag_dir(world_id)
+    if not root:
+        return None
+    root = Path(root)
+    lexical_rel = doc_id + ".rag.md"
+    try:
+        rr = root.resolve()
+        rp = (root / lexical_rel).resolve()
+        if not (rp == rr or rp.is_relative_to(rr)):
+            return None
+        if rp != rr / lexical_rel:  # 字面パスと不一致＝経路上に symlink がある
+            return None
+        if not rp.is_file():
+            return None
+    except OSError:
+        return None
+    return rp
 
 
 def derived_ir_dir(world_id: str) -> Path:

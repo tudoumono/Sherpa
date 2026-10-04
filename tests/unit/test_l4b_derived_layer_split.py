@@ -17,8 +17,9 @@ from pathlib import Path
 
 import openpyxl
 
-from sherpa import agentic_search, corpus_docs, es_index, grep_tool, worlds
+from sherpa import corpus_docs, es_index, grep_tool, tool_dispatch, worlds
 from sherpa.ingest import office_md
+from sherpa.parts.read import tools as read_tools
 
 _DOCX_XML = """<?xml version="1.0"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -109,7 +110,7 @@ def test_real_placement_three_layers_physically_separated(monkeypatch, tmp_path)
 # ---- 受け入れ条件3: read_doc/read_around（agentic_search）----
 
 def test_real_placement_read_around_resolves_through_new_layout(monkeypatch, tmp_path):
-    """`agentic_search.run_tool("read_around", ...)` が実配置（rag/md 別ディレクトリ）でも
+    """`tool_dispatch.run_tool("read_around", ...)` が実配置（rag/md 別ディレクトリ）でも
     grep のヒットと同じ文書を精読できる。"""
     world_id = "l4b-read-around-world"
     source = _real_world(monkeypatch, tmp_path, world_id)
@@ -119,7 +120,7 @@ def test_real_placement_read_around_resolves_through_new_layout(monkeypatch, tmp
     assert len(hits) == 1
     hit = hits[0]
 
-    res, docs, _, _ = agentic_search.run_tool(
+    res, docs, _, _ = tool_dispatch.run_tool(
         "read_around", {"doc_id": hit["doc_id"], "line": hit["line"], "window": 2}, world_id, None)
     assert "error" not in res, res
     assert "DOCX_NEEDLE" in res["text"]
@@ -184,7 +185,7 @@ def test_old_layout_residue_does_not_crash_new_code(monkeypatch, tmp_path):
     assert hits[0]["doc_id"] == "old.docx"
     assert "legacy content" in hits[0]["text"]
 
-    resolved = agentic_search._safe_doc_path(world_id, "old.docx")
+    resolved = read_tools._safe_doc_path(world_id, "old.docx")
     assert resolved is not None
     _root, lexical_rel, _rp = resolved
     assert lexical_rel == "old.docx.md"

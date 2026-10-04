@@ -29,11 +29,9 @@ def _build(world: str, *, files=None):
 
 def _counts(nodes, edges, world, *, doc_count: int | None = None) -> dict:
     """件数サマリ。`doc_count` を渡すと文書一覧の再走査をしない。"""
-    def _em(items, val):
-        return sum(1 for x in items if x.get("extraction_method", "static") == val)
     return {
-        "entities": len(nodes), "entities_static": _em(nodes, "static"),
-        "relations": len(edges), "relations_static": _em(edges, "static"),
+        "entities": len(nodes),
+        "relations": len(edges),
         "deprecated": sum(1 for n in nodes if n.get("status", "active") == "deprecated"),
         "hidden": sum(1 for n in nodes if n.get("status", "active") == "hidden_candidate"),
         "documents": doc_count if doc_count is not None else len(doc_ledger.documents_for(world)),

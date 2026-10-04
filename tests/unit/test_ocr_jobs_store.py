@@ -42,7 +42,7 @@ class _Connection:
 
 def test_job_validation_rejects_absolute_paths_before_database_access():
     with pytest.raises(ValueError, match="relative"):
-        ocr_jobs.enqueue_job(
+        ocr_jobs._job_values(
             world="world", source_rel_path="/customer/design.xlsx", canonical_generation_id="a" * 64,
             source_content_hash="sha256:" + "b" * 64, route_manifest_hash="sha256:" + "c" * 64,
             route_input={
@@ -153,43 +153,6 @@ def test_purge_world_deletes_all_ocr_text_in_one_connection(monkeypatch):
     ]
 
 
-def test_cancel_superseded_generation_covers_jobs_and_refresh_runs(monkeypatch):
-    connection = _Connection([
-        _Cursor(rowcount=1),
-        _Cursor(rowcount=1),
-    ])
-    monkeypatch.setattr(ocr_jobs, "_ensure", lambda: None)
-    monkeypatch.setattr(ocr_jobs, "_connect", lambda: connection)
-
-    result = ocr_jobs.cancel_superseded_generations("world", "a" * 64)
-
-    assert result == {"jobs_cancelled": 1, "refresh_runs_cancelled": 1}
-    assert all("canonical_generation_id<>%s" in sql for sql, _params in connection.calls)
-    assert all("RETURNING" not in sql for sql, _params in connection.calls)
-
-
-@pytest.mark.parametrize(
-    ("operation", "rowcounts", "expected"),
-    [
-        (lambda: ocr_jobs.cancel_generation("world", "a" * 64), [700_000], 700_000),
-        (lambda: ocr_jobs.purge_generation("world", "a" * 64), [4, 700_000], {"jobs": 700_000, "refresh_runs": 4}),
-        (lambda: ocr_jobs.purge_superseded_generations("world", "a" * 64), [3, 600_000], {
-            "jobs": 600_000, "refresh_runs": 3,
-        }),
-        (lambda: ocr_jobs.requeue_failed("world", "a" * 64), [500_000], 500_000),
-    ],
-)
-def test_bulk_lifecycle_operations_use_rowcount_without_materializing_ids(
-    monkeypatch, operation, rowcounts, expected,
-):
-    connection = _Connection([_Cursor(rowcount=value) for value in rowcounts])
-    monkeypatch.setattr(ocr_jobs, "_ensure", lambda: None)
-    monkeypatch.setattr(ocr_jobs, "_connect", lambda: connection)
-
-    assert operation() == expected
-    assert all("RETURNING" not in sql for sql, _params in connection.calls)
-
-
 def test_cache_commit_is_refused_when_job_lease_is_lost(monkeypatch):
     connection = _Connection([_Cursor(one=None)])
     monkeypatch.setattr(ocr_jobs, "_ensure", lambda: None)
@@ -270,7 +233,7 @@ def _try_init_real_postgres() -> None:
 def _insert_succeeded_row(
     *, world: str, source_rel_path: str, canonical_generation_id: str, route_input_id: str,
 ) -> None:
-    """`enqueue_job`（`_relative_path`が`\\`→`/`を正規化する）を経由せず、DBへ直接succeeded行を
+    """`_job_values`（`_relative_path`が`\\`→`/`を正規化する）を経由せず、DBへ直接succeeded行を
     作る。正規化済みの経路からは`\\`を含む値を作れないため、既存の未正規化行を模すにはこれが要る。"""
     observation_set_hash = "sha256:" + hashlib.sha256(
         (source_rel_path + route_input_id).encode("utf-8")

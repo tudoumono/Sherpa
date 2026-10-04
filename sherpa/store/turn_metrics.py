@@ -187,7 +187,7 @@ def _claim_counts(data) -> dict:
 
 
 def _claims_unknown_reasons(data) -> dict | None:
-    """status='unknown' の主張を reason_code 別に数える（`usage.py::_compute_final_reason_codes` と同じ規則: 空なら 'unknown'、文字列でなければ飛ばす）。data.claims が配列でなければ None。"""
+    """status='unknown' の主張を reason_code 別に数える（`tests/_usage_reference.py` の参照実装と同じ規則: 空なら 'unknown'、文字列でなければ飛ばす）。data.claims が配列でなければ None。"""
     claims = data.get("claims") if isinstance(data, dict) else None
     if not isinstance(claims, list):
         return None
@@ -203,7 +203,7 @@ def _claims_unknown_reasons(data) -> dict | None:
 
 
 def _gate_missing_codes(data) -> dict | None:
-    """`answer["data"]["evidence_gate"]["missing_codes"]` を件数化する（`usage.py::_compute_final_missing_codes` と同じ規則: 空でない文字列だけを数える）。配列でなければ None。"""
+    """`answer["data"]["evidence_gate"]["missing_codes"]` を件数化する（`tests/_usage_reference.py` の参照実装と同じ規則: 空でない文字列だけを数える）。配列でなければ None。"""
     gate = data.get("evidence_gate") if isinstance(data, dict) else None
     codes = gate.get("missing_codes") if isinstance(gate, dict) else None
     if not isinstance(codes, list):

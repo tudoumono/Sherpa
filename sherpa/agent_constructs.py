@@ -6,8 +6,7 @@
     codex_openai  Codex CLI が段取りとツール実行を行い、実行モデルが OpenAI
     codex_ollama  同上で実行モデルが Ollama
 
-保存値 `agent` が `openai`/`ollama` の利用者は読み取り時に `simple` として扱う（DB 行は書き換えない・`effective_agent`）。
-`gemini` / `bedrock` / `heuristic` はチャットで閉じており、選べない（`_select_provider` が選び直しを案内する）。
+`codex` / `simple` 以外の保存値（`openai`/`ollama`/`gemini`/`bedrock`/`heuristic` など）はチャットで選べない（`_select_provider` が選び直しを案内する）。
 Codex 構成だけが `codex_model_provider` を持ち、Codex CLI の接続先モデルを決める。
 """
 from __future__ import annotations
@@ -32,19 +31,10 @@ CONSTRUCTS: tuple[dict[str, Any], ...] = (
 
 # 標準構成が使う頭脳（env に関わらず常に有効）。
 STANDARD_AGENTS = frozenset({"codex", "simple"})
-# 旧・直結経路の保存値/env 値。読み取り時に `simple` へ読み替える（DB は書き換えない）。
-LEGACY_AGENTS = frozenset({"openai", "ollama"})
-# 標準構成に加えて選べる追加頭脳（現在は空）。
-EXTRA_AGENTS: frozenset[str] = frozenset()
-
-# 追加頭脳を選んだときの表示（設定画面・チャットの頭脳バッジ共通）。
-_EXTRA_LABELS: dict[str, tuple[str, str]] = {}
 
 # Codex 構成が接続できるモデル提供元。
 CODEX_MODEL_PROVIDERS = frozenset({"openai", "ollama"})
 
-# 何も設定されていないときの構成（既定は Codex(OpenAI)）。既定の唯一の真実源。
-DEFAULT_CONSTRUCT_ID = "codex_openai"
 DEFAULT_AGENT = "codex"
 
 
@@ -94,18 +84,9 @@ def default_agent(system_settings: dict | None = None) -> str:
     return value if value in enabled_agents() else DEFAULT_AGENT
 
 
-def enabled_extra_agents() -> frozenset[str]:
-    """選べる追加頭脳（現在は空）。"""
-    return EXTRA_AGENTS
-
-
 def enabled_agents() -> frozenset[str]:
-    """現在の環境で選べる頭脳（標準 2 ＋有効化した追加分）。"""
-    return STANDARD_AGENTS | enabled_extra_agents()
-
-
-def agent_enabled(agent: str | None) -> bool:
-    return bool(agent) and agent in enabled_agents()
+    """現在の環境で選べる頭脳（標準 2）。"""
+    return STANDARD_AGENTS
 
 
 # 実行時に遮断する頭脳（チャットで閉じている外部 AI）。
@@ -115,13 +96,13 @@ _RUNTIME_BLOCKABLE = frozenset({"gemini", "bedrock"})
 def runtime_blocked(agent: str | None) -> bool:
     """この環境では実行させない頭脳か。"""
     name = (agent or "").lower()
-    return name in _RUNTIME_BLOCKABLE and name not in enabled_extra_agents()
+    return name in _RUNTIME_BLOCKABLE
 
 
 def effective_agent(settings: dict | None, *, system_settings: dict | None = None,
                     strict: bool = False) -> str:
     """実行（`_select_provider`）と表示（`construct_id`）が共通で経由する実効の頭脳。
-    保存済み `agent` が旧・直結経路の値なら `simple` へ読み替える。`codex` は対象外。閉じた頭脳はそのまま返す。
+    保存済み `agent` の値はそのまま返す（読み替えない）。
     `system_settings` を渡すと agent 未設定時の既定選択に使う。
     `strict=True` は保存済み `agent`／`cloud_provider` の非空の不正値で例外
     （`InvalidAgentConfigError`／`keys.InvalidCloudProviderConfigError`）を送出する。実行の入口だけが使い、表示/監査は既定 False。
@@ -134,35 +115,30 @@ def effective_agent(settings: dict | None, *, system_settings: dict | None = Non
         if strict:
             raise InvalidAgentConfigError(
                 f"agent の値が不正です（{raw!r}）。"
-                f"選べる値: {', '.join(sorted(STANDARD_AGENTS | EXTRA_AGENTS))}。"
+                f"選べる値: {', '.join(sorted(STANDARD_AGENTS))}。"
                 "設定画面で選び直してください。")
         raw = ""
     raw_agent = str(raw or "").strip().lower()
-    if raw_agent in LEGACY_AGENTS:
-        return "simple"
     if not raw_agent:
         sys_s = system_settings if system_settings is not None else store.get_system_settings()
         return default_agent(sys_s)
     else:
         # 既知の頭脳名なら有効化していないだけの正当な経路としてそのまま返す。既知でない非空の値は strict 時だけ例外にする。
-        if strict and raw_agent not in (STANDARD_AGENTS | EXTRA_AGENTS):
+        if strict and raw_agent not in STANDARD_AGENTS:
             raise InvalidAgentConfigError(
                 f"agent の値が不正です（{raw_agent!r}）。"
-                f"選べる値: {', '.join(sorted(STANDARD_AGENTS | EXTRA_AGENTS))}。"
+                f"選べる値: {', '.join(sorted(STANDARD_AGENTS))}。"
                 "設定画面で選び直してください。")
         return raw_agent
 
 
 def available_constructs(system_settings: dict | None = None) -> list[dict[str, Any]]:
-    """画面に出す実行構成の一覧（標準 3 ＋有効化した追加頭脳）。追加頭脳は `codex_model_provider=None` の 1 件として並べる。
+    """画面に出す実行構成の一覧（標準 3）。
     保存済みの構成が一覧から消えても `construct_id()` は値を返す。`system_settings` は署名互換のため受け取る（未使用）。
     """
     from sherpa import required_tools
     codex_ready = not required_tools.codex_cli_missing()  # codex 本体が無ければ選ばせない
     out = [dict(c) for c in CONSTRUCTS if not (c["agent"] == "codex" and not codex_ready)]
-    for name in sorted(enabled_extra_agents()):
-        label, hint = _EXTRA_LABELS[name]
-        out.append({"id": name, "agent": name, "codex_model_provider": None, "label": label, "hint": hint})
     return out
 
 

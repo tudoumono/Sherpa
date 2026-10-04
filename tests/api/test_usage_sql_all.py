@@ -19,6 +19,7 @@ import pytest
 
 from _common import _sfx, _try_init
 from sherpa import store
+import _usage_reference as R
 from sherpa.store import usage as U
 
 _JST = timezone(timedelta(hours=9))
@@ -117,16 +118,16 @@ def test_response_time_and_conversation_distribution_match_reference_definitions
     got = store.usage_stats(time_from=_FROM, time_to=_TO)
     all_d = [1000, 2000, 3000, 10000, 500, 700]
     by_p = {"codex": [1000, 2000, 3000, 10000], "openai": [500, 700]}
-    ref = U._compute_response_time_stats(all_d)
+    ref = R._compute_response_time_stats(all_d)
     assert {k: got["response_time"]["overall"][k] for k in ("avg", "median", "max", "p90", "n")} == ref
     assert got["response_time"]["overall"]["provider"] is None
     assert got["response_time"]["overall"]["median"] == 1500.0 and got["response_time"]["overall"]["p90"] == 10000.0
     rows = got["response_time"]["by_provider"]
     assert [r["provider"] for r in rows] == ["codex", "openai"]   # 件数の多い順
     for r in rows:
-        assert {k: r[k] for k in ("avg", "median", "max", "p90", "n")} == U._compute_response_time_stats(by_p[r["provider"]])
+        assert {k: r[k] for k in ("avg", "median", "max", "p90", "n")} == R._compute_response_time_stats(by_p[r["provider"]])
     # 会話あたり user ターン数: 会話 1=4・会話 2=2・会話 3=1
-    turns, resume = U._compute_conversation_turn_stats(
+    turns, resume = R._compute_conversation_turn_stats(
         [{"user_turns": 4, "codex_session_id": "x"}, {"user_turns": 2, "codex_session_id": None},
          {"user_turns": 1, "codex_session_id": None}])
     assert got["conversation_turns"] == turns and got["resume_rate"] == resume == 0.5
@@ -296,7 +297,7 @@ def test_retention_sql_matches_reference(seed):
     got = store.usage_stats(time_from="2004-03-24T00:00:00+09:00", time_to="2004-05-01T00:00:00+09:00")["retention"]
     d0 = date(2004, 3, 5) + timedelta(days=20)
     base = d0 - timedelta(days=d0.weekday())
-    ref = U._compute_retention([
+    ref = R._compute_retention([
         {"uid": ua, "week_start": base}, {"uid": ua, "week_start": base + timedelta(days=7)},
         {"uid": ub, "week_start": base + timedelta(days=7)}, {"uid": ub, "week_start": base + timedelta(days=21)}])
     assert got == ref

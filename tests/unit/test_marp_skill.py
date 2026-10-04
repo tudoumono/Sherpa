@@ -15,6 +15,7 @@ import tempfile
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 from sherpa import agents as A          # noqa: E402
+from sherpa.providers.codex import sandbox as SB  # noqa: E402
 from sherpa import codex_skills as S    # noqa: E402
 from sherpa import codex_agents_md as M  # noqa: E402
 
@@ -136,7 +137,7 @@ def test_marp_bin_override_executable(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         exe = _make_exec(pathlib.Path(td) / "marp")
         monkeypatch.setenv("SHERPA_MARP_BIN", str(exe))
-        assert A._marp_bin() == str(exe)
+        assert SB._marp_bin() == str(exe)
 
 
 def test_marp_bin_override_nonexecutable_is_none(monkeypatch):
@@ -144,18 +145,18 @@ def test_marp_bin_override_nonexecutable_is_none(monkeypatch):
         plain = pathlib.Path(td) / "marp"
         plain.write_text("x", encoding="utf-8")          # 実行ビット無し
         monkeypatch.setenv("SHERPA_MARP_BIN", str(plain))
-        assert A._marp_bin() is None
+        assert SB._marp_bin() is None
 
 
 def test_marp_bin_override_missing_is_none(monkeypatch):
     monkeypatch.setenv("SHERPA_MARP_BIN", "/nonexistent/marp")
-    assert A._marp_bin() is None
+    assert SB._marp_bin() is None
 
 
 def test_marp_bin_autodetect_repo_or_none(monkeypatch):
     """override 無し: リポジトリの tools/marp があればそれ、無ければ None（環境非依存に頑健化）。"""
     monkeypatch.delenv("SHERPA_MARP_BIN", raising=False)
-    r = A._marp_bin()
+    r = SB._marp_bin()
     assert r is None or r.endswith("tools/marp/node_modules/.bin/marp")
 
 
@@ -167,7 +168,7 @@ def test_chrome_path_env_honored(monkeypatch):
         chrome.write_text("x", encoding="utf-8")
         chrome.chmod(0o755)                                       # RV Med: 実行ビット必須
         monkeypatch.setenv("CHROME_PATH", str(chrome))
-        assert A._detect_chrome_path() == str(chrome)
+        assert SB._detect_chrome_path() == str(chrome)
 
 
 def test_chromium_path_env_honored_when_chrome_unset(monkeypatch):
@@ -177,7 +178,7 @@ def test_chromium_path_env_honored_when_chrome_unset(monkeypatch):
         chrome.chmod(0o755)
         monkeypatch.delenv("CHROME_PATH", raising=False)
         monkeypatch.setenv("CHROMIUM_PATH", str(chrome))
-        assert A._detect_chrome_path() == str(chrome)
+        assert SB._detect_chrome_path() == str(chrome)
 
 
 def test_chrome_path_non_executable_rejected(monkeypatch):
@@ -188,7 +189,7 @@ def test_chrome_path_non_executable_rejected(monkeypatch):
         chrome.chmod(0o644)                                       # 実行不可
         monkeypatch.setenv("CHROME_PATH", str(chrome))
         monkeypatch.setenv("HOME", td)                            # playwright 自動検出も無効化
-        assert A._detect_chrome_path() is None
+        assert SB._detect_chrome_path() is None
 
 
 def test_marp_bin_override_relative_path_absolutized(monkeypatch):
@@ -199,7 +200,7 @@ def test_marp_bin_override_relative_path_absolutized(monkeypatch):
         marp.chmod(0o755)
         monkeypatch.chdir(td)
         monkeypatch.setenv("SHERPA_MARP_BIN", "marp")             # 相対指定
-        r = A._marp_bin()
+        r = SB._marp_bin()
         assert r is not None and pathlib.Path(r).is_absolute()
         assert pathlib.Path(r).samefile(marp)
 
@@ -214,7 +215,7 @@ def test_chrome_path_autodetect_picks_latest_playwright(monkeypatch):
         for ver in ("chromium-999", "chromium-1300"):
             d = _mk(home / ".cache" / "ms-playwright" / ver / "chrome-linux64")
             _make_exec(d / "chrome")
-        got = A._detect_chrome_path()
+        got = SB._detect_chrome_path()
         assert got is not None and got.endswith("chromium-1300/chrome-linux64/chrome")
 
 
@@ -223,5 +224,5 @@ def test_chrome_path_none_when_nothing(monkeypatch):
         monkeypatch.delenv("CHROME_PATH", raising=False)
         monkeypatch.delenv("CHROMIUM_PATH", raising=False)
         monkeypatch.setenv("HOME", str(td))              # 空 HOME＝Playwright chromium 無し
-        assert A._detect_chrome_path() is None
+        assert SB._detect_chrome_path() is None
 

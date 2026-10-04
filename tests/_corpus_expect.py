@@ -6,8 +6,8 @@ test_agentic_search.py / test_mcp_server.py の list_docs テストが依存し�
 期待件数/期待集合を算出し、fixtures が変わっても自動追随させる（fixtures を直接見に行くだけで
 `sherpa.doc_ledger.documents_for` 等は呼ばない＝独立したオラクル）。
 
-「数える対象」は `sherpa.corpus_docs` の `_DOCTYPE`（台帳が対象にする拡張子＝ソース/設計書/テキスト・
-唯一の真実源）をそのまま再利用し、対象拡張子の二重管理を避ける。fixtures/corpus/v1 には
+「数える対象」は台帳が対象にする拡張子（アナライザ登録簿の拡張子＋`corpus_docs._NONCODE_DOCTYPE`＝設計書/テキスト）を
+再利用し、対象拡張子の二重管理を避ける。fixtures/corpus/v1 には
 Office/画像文書が無いため、その枝（変換要否の判定）は対象外＝将来 Office fixtures を足す場合は
 このヘルパも合わせて拡張が必要。
 """
@@ -16,7 +16,11 @@ from __future__ import annotations
 import fnmatch
 import pathlib
 
-from sherpa.corpus_docs import _DOCTYPE   # 拡張子→doctype（台帳の唯一の真実源を再利用）
+from sherpa.corpus_docs import _NONCODE_DOCTYPE
+from sherpa.ingest.analyzers import registry as _registry
+
+# 台帳が対象にする拡張子（コード分はアナライザ登録簿・非コード分は固定表）
+_DOCTYPE = {*(ext for a in _registry.known_analyzers() for ext in a.extensions), *_NONCODE_DOCTYPE}
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS_V1 = ROOT / "fixtures" / "corpus" / "v1"

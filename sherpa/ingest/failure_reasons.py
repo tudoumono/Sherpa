@@ -78,10 +78,6 @@ REASON_CATALOG: dict[str, dict[str, str]] = {
 PARTIAL_EXTRACTION_LABEL = "抽出不完全の疑い（要確認）"
 PARTIAL_EXTRACTION_ADVICE = "本文の一部しか読み取れていない可能性があります。開いて確認し、必要なら保存し直すか再変換してください。"
 
-# 一部が化けている（失敗ではない別枠）。置換文字が `text_encoding.UNDETERMINED_RATIO` 以下のファイルに付く
-ENCODING_PARTIAL_LABEL = "一部が化けている（要確認）"
-ENCODING_PARTIAL_ADVICE = "文字コードの判別が不確実で、一部の文字が正しく読み取れていない可能性があります。開いて確認し、必要なら文字コードを直して保存し直してください。"
-
 # `document_ir_failed:<detail>` の detail のうち、そのまま理由コードになるもの
 _DOCUMENT_IR_KNOWN_DETAILS = frozenset({"malformed_structure", "password_protected", "size_exceeded"})
 

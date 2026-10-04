@@ -336,7 +336,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
     def _office_progress(done, total):
         # `_PROGRESS_FILE_INTERVAL` 件ごとに間引く（先頭・末尾は必ず書く）
         last = _last_office_progress_done[0]
-        if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
+        if done in (0, total) or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_office_progress_done[0] = done
             _progress("office_md", done=done, total=total)
 
@@ -429,7 +429,7 @@ def _run_locked(world, *, reflect, created_by, scan_root, run_id=None, on_run_id
         # 直前と同じ done は書かない
         if last == done:
             return
-        if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
+        if done in (0, total) or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_es_progress_done[0] = done
             _progress("es_index", done=done, total=total)
 
@@ -794,13 +794,12 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
                 "document_ir の軽量再生成で一部の文書が失敗しました（マーカーは world 単位のため"
                 "全 OOXML 文書を対象に次回 sync も再実行されます・今回分の evidence/rag への"
                 "連鎖は継続します）: world=%s detail=%s", world, doc_result)
-    defer = es_index.rag_es_enabled()                    # RAG_ES 有効時だけマーカー保留方式（ES の成否込みで確定）
     if document_ir_drift or evidence_drift:
-        result = office_md.refresh_evidence_ir(wd, dmd, write_rag_sig_marker=not defer, world=world)
+        result = office_md.refresh_evidence_ir(wd, dmd, write_rag_sig_marker=False, world=world)
         ok = not result.get("error") and result.get("evidence_ir_failed", 0) == 0 \
             and result.get("rag_failed", 0) == 0
     else:
-        result = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=not defer, world=world)
+        result = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=False, world=world)
         ok = not result.get("error") and result.get("rag_failed", 0) == 0
     if not ok:
         _log.warning(
@@ -812,37 +811,34 @@ def _refresh_derived_representations(world, sig) -> tuple[str | None, dict | Non
         return "rag_failed", None, reason
     # rag.md が書き換わったので、ES 反映の成否に関わらずグラフ（言及エッジ）を追いつかせる（`store.world_lock` 保持中の呼び出し元から lock-free ヘルパーを呼ぶ）
     _reflect_graph_after_rag_rewrite(world)
-    es_ok = True                                         # holdback 対象外（defer=False）なら確定済み扱い
-    es_refresh_info = None                                # ES 再索引を実行した場合だけ呼び出し元へ返す
-    if defer:
-        # human_md は RAG_ES の設定に関わらず ES の索引内容に影響しうるため、共通ヘルパが `.human_md_es_sig` の無効化/確定/失敗記録まで面倒を見る
-        _es_t0 = time.monotonic()
-        _es_started_at = datetime.now(timezone.utc).isoformat()
-        esr = index_world_with_human_md_holdback(world, content_sig=sig)
-        _es_finished_at = datetime.now(timezone.utc).isoformat()
-        es_ok = esr.get("available") is True and not esr.get("error")
-        # 呼び出し元の明示 ES 自己修復と同形（呼び出し元が `counts`/`stage_timings` へ畳み込む）
-        es_refresh_info = {
-            "summary": {
-                "available": esr.get("available") if isinstance(esr, dict) else None,
-                "error": esr.get("error") if isinstance(esr, dict) else None,
-                "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
-                "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
-                "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
-                "reused": esr.get("reused") if isinstance(esr, dict) else None,
-                "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None,
-            },
-            "stage_timing": {
-                "started_at": _es_started_at,
-                "finished_at": _es_finished_at,
-                "elapsed_ms": round((time.monotonic() - _es_t0) * 1000),
-            },
-        }
-        if es_ok:
-            office_md.write_rag_sig_marker(dmd, world=world)
-        else:
-            _log.warning(
-                "RAG refresh後のES再索引が失敗しました（次回 sync で再試行）: world=%s", world)
+    # human_md は RAG_ES の設定に関わらず ES の索引内容に影響しうるため、共通ヘルパが `.human_md_es_sig` の無効化/確定/失敗記録まで面倒を見る
+    _es_t0 = time.monotonic()
+    _es_started_at = datetime.now(timezone.utc).isoformat()
+    esr = index_world_with_human_md_holdback(world, content_sig=sig)
+    _es_finished_at = datetime.now(timezone.utc).isoformat()
+    es_ok = esr.get("available") is True and not esr.get("error")
+    # 呼び出し元の明示 ES 自己修復と同形（呼び出し元が `counts`/`stage_timings` へ畳み込む）
+    es_refresh_info = {
+        "summary": {
+            "available": esr.get("available") if isinstance(esr, dict) else None,
+            "error": esr.get("error") if isinstance(esr, dict) else None,
+            "chunks": esr.get("chunks") if isinstance(esr, dict) else None,
+            "indexed": esr.get("indexed") if isinstance(esr, dict) else None,
+            "embedded": esr.get("embedded") if isinstance(esr, dict) else None,
+            "reused": esr.get("reused") if isinstance(esr, dict) else None,
+            "embed_elapsed_ms": esr.get("embed_elapsed_ms") if isinstance(esr, dict) else None,
+        },
+        "stage_timing": {
+            "started_at": _es_started_at,
+            "finished_at": _es_finished_at,
+            "elapsed_ms": round((time.monotonic() - _es_t0) * 1000),
+        },
+    }
+    if es_ok:
+        office_md.write_rag_sig_marker(dmd, world=world)
+    else:
+        _log.warning(
+            "RAG refresh後のES再索引が失敗しました（次回 sync で再試行）: world=%s", world)
     # document_ir マーカーは、document_ir 自体が全件成功し、連鎖した evidence/rag（と該当すれば ES 反映）も成功してから確定する
     if document_ir_drift and document_ir_ok and es_ok:
         office_md.write_document_ir_sig_marker(dmd)
@@ -935,7 +931,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
         last = _last_unchanged_es_progress_done[0]
         if last == done:              # 同値は書かない
             return
-        if done == 0 or done == total or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
+        if done in (0, total) or last is None or done - last >= _PROGRESS_FILE_INTERVAL:
             _last_unchanged_es_progress_done[0] = done
             _progress("es_index", done=done, total=total)
 
@@ -972,7 +968,7 @@ def _sync_impl(world, *, reflect=True, force=False, run_id=None, on_run_id=None,
                 # 欠落検知→全再構築→`.rag_sig` 削除を同一 lock 区間で行う。`run()` は非再入 lock を取り直すので、lock-free 版の `_run_locked` を直接呼ぶ
                 res = _run_locked(world, reflect=reflect, created_by="admin", scan_root=None,
                                   run_id=run_id, on_run_id=on_run_id, op=op)
-                if es_index.rag_es_enabled() and not office_md.drop_rag_sig_marker(worlds.derived_md_dir(world)):
+                if not office_md.drop_rag_sig_marker(worlds.derived_md_dir(world)):
                     _log.warning(
                         "sidecar欠落からの全再構築後、`.rag_sig`の削除に失敗しました"
                         "（ES再索引の再試行契機を逃す可能性）: world=%s", world)
@@ -1115,8 +1111,6 @@ def _reindex_after_rag_rewrite(world: str) -> bool:
     dmd = worlds.derived_md_dir(world)
     with store.world_lock(world):
         _reflect_graph_after_rag_rewrite(world)
-        if not es_index.rag_es_enabled():
-            return True
         if not office_md.drop_rag_sig_marker(dmd):
             _log.warning(
                 "LLM 成形反映後、`.rag_sig` の無効化に失敗しました（ES 再索引を見送ります）: world=%s",
@@ -1157,9 +1151,8 @@ def regenerate_rag_rule_only(world: str) -> dict:
     if not wd or not dmd.exists():
         return {"status": "unavailable"}
     llm_render.clear_cache(world)
-    defer = es_index.rag_es_enabled()          # RAG_ES 有効時はマーカー保留方式（ES の成否込みで確定・`sync()` と同じ）
     with store.world_lock(world):
-        result = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=not defer, world=world)
+        result = office_md.refresh_rag(wd, dmd, write_rag_sig_marker=False, world=world)
     if result.get("error") or result.get("rag_failed", 0):
         _log.warning(
             "規則版への再生成が一部失敗しました: world=%s detail=%s", world, result)

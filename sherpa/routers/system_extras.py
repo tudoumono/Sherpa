@@ -671,7 +671,7 @@ def _admin_settings_view() -> dict:
                 "options": list(depth_profile.CODEX_REASONING_LEVELS),
             },
         },
-        # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_provider_batches` を並列送信する本数）。
+        # 埋め込み HTTP の同時送信数（`embeddings.embed()` が `_window_batches` を並列送信する本数）。
         "embed_provider": {
             "configured": sysset.get("embed_provider"),
             "effective": embeddings.effective_embed_provider(sysset),

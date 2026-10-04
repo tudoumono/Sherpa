@@ -21,6 +21,7 @@ from psycopg.types.json import Jsonb
 
 from _common import _sfx, _try_init
 from sherpa import store
+import _usage_reference as R
 from sherpa.store import usage as U
 
 _JST = timezone(timedelta(hours=9))
@@ -195,11 +196,11 @@ def _sql_round_stats(c, start, end) -> dict:
 def _reference(c, start, end) -> dict:
     """旧実装: 巡の行を Python へ引き、Python 側で集計する。"""
     rows = c.execute(_OLD_ROUND_ROWS_SQL, (start, start, end)).fetchall()
-    out = U._compute_round_stats(rows)
+    out = R._compute_round_stats(rows)
     U._build_usage_turns(c, start, end)
     final_rows = c.execute(_OLD_FINAL_ROWS_SQL).fetchall()
-    out["reason_codes"] = U._round_reason_codes(out, U._compute_final_reason_codes(final_rows))
-    U._merge_final_missing_codes(out, final_rows)
+    out["reason_codes"] = U._round_reason_codes(out, R._compute_final_reason_codes(final_rows))
+    R._merge_final_missing_codes(out, final_rows)
     return out
 
 
@@ -240,7 +241,7 @@ def test_round_stats_are_empty_when_no_rounds_in_period():
         U._build_usage_turns(c, start, end, with_next=True)
         U._build_usage_rounds(c, start)
         new = U._round_stats_from_sql(c)
-    assert new == U._compute_round_stats([])
+    assert new == R._compute_round_stats([])
 
 
 def test_round_stats_time_does_not_grow_with_round_count():

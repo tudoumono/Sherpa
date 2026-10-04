@@ -141,20 +141,6 @@ def parse_referenced_doc_lines(answer: str) -> tuple[str, list[list[list[str]]]]
     return "\n".join(body_lines), line_groups
 
 
-def parse_referenced_docs(answer: str) -> tuple[str, list[str]]:
-    """`parse_referenced_doc_lines` の平坦版（候補の列挙用）。そのまま `verified_referenced_docs` に渡さない。"""
-    body, line_groups = parse_referenced_doc_lines(answer)
-    refs: list[str] = []
-    seen: set[str] = set()
-    for groups in line_groups:
-        for group in groups:
-            for c in group:
-                if c not in seen:
-                    seen.add(c)
-                    refs.append(c)
-    return body, refs
-
-
 def _clean_rel(rel: str) -> str | None:
     """相対パス文字列の最終防御（`..`／先頭 `/`／NUL を含むものは None）。"""
     rel = rel.strip()

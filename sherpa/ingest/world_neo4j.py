@@ -18,6 +18,7 @@ from neo4j import Query
 from neo4j.exceptions import Neo4jError
 
 from .. import worlds                                # 資料フォルダの root 解決（重要度の解決に使う）
+from ..env_int import env_int
 from ..impact_service import CATEGORY                # 種別→結果カテゴリ
 from . import importance                             # 文書の重要度（`_重要度.txt`）
 from .model import EDGE_TYPES, NODE_LABELS           # 閉じた語彙（Cypher 直埋めの allowlist）
@@ -151,24 +152,8 @@ def world_graph_is_empty(session, world: str) -> bool:
     return not (row and row.get("c"))
 
 
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`lens_service._env_int`/`agentic_search._env_int` と同じ意味）。
-
-    循環 import を避けるためここにも置く。負値・非整数・範囲 [lo, hi] 外は既定へ戻す（既定値も範囲へクランプ）。
-    """
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
-
-
 # per-query タイムアウト（秒）。既定30・[1,600]。`lens_service` と同じ env 変数を共用する
-_NEO4J_QUERY_TIMEOUT_S = _env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
+_NEO4J_QUERY_TIMEOUT_S = env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 # ストリーム反復の緊急天井（行数）
 _NEO4J_MAX_ROWS = 10000
 # 影響たどり（`world_impact`）の既定深さ。`impact_service.run_impact`／`fused_search._search_graph` の既定でもある
@@ -240,7 +225,7 @@ def _node_row(n: dict) -> dict:
         "cid": n["cid"], "name": n["name"],
         "top": n.get("top_scope"), "phase": n.get("phase"), "cat": n.get("category"),
         "path": n.get("path"), "sp": n.get("scope_path"), "value": n.get("value"),
-        "em": n.get("extraction_method", "static"), "status": n.get("status", "active"),
+        "status": n.get("status", "active"),
         "analyzer": n.get("analyzer"),
         "sources": _sources_json(n.get("sources")),
         "sources_overflow": n.get("sources_overflow_count", 0),
@@ -252,7 +237,7 @@ def _edge_row(e: dict) -> dict:
     """1エッジ分の UNWIND 行。`via` は `RefCandidate.extra["via"]` 由来。"""
     return {
         "src": e["src"], "dst": e["dst"], "doc": e.get("doc", ""),
-        "line": e.get("line", 0), "em": e.get("extraction_method", "static"),
+        "line": e.get("line", 0),
         "status": e.get("status", "active"),
         "source": e.get("source"), "evidence": e.get("evidence"), "rule": e.get("rule"),
         "sources": _sources_json(e.get("sources")),
@@ -300,7 +285,7 @@ def load_world(nodes, edges, world_id, uri, user, password):
                         f"MERGE (x:Entity {{canonical_id: row.cid}}) "
                         f"SET x:`{label}`, x.name=row.name, x.world_id=$world, "
                         f"x.top_scope=row.top, x.phase=row.phase, x.category=row.cat, x.path=row.path, "
-                        f"x.scope_path=row.sp, x.value=row.value, x.extraction_method=row.em, "
+                        f"x.scope_path=row.sp, x.value=row.value, "
                         f"x.status=row.status, x.analyzer=row.analyzer, x.sources=row.sources, "
                         f"x.sources_overflow_count=row.sources_overflow, x.jcl_kind=row.jcl_kind"
                     )
@@ -313,7 +298,7 @@ def load_world(nodes, edges, world_id, uri, user, password):
                         "MATCH (a:Entity {canonical_id: row.src}), (b:Entity {canonical_id: row.dst}) "
                         f"MERGE (a)-[r:`{etype}`]->(b) "
                         "SET r.world_id=$world, r.doc=row.doc, r.line=row.line, "
-                        "r.extraction_method=row.em, r.status=row.status, "
+                        "r.status=row.status, "
                         "r.source=row.source, r.evidence=row.evidence, r.rule=row.rule, "
                         "r.sources=row.sources, r.sources_overflow_count=row.sources_overflow, "
                         "r.via=row.via"

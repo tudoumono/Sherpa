@@ -85,36 +85,3 @@ class DocumentIR:
 def to_json_str(ir: DocumentIR) -> str:
     """決定的に JSON 化する（キー順固定・タイムスタンプ無し）。"""
     return json.dumps(asdict(ir), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-
-
-def from_json_str(s: str) -> DocumentIR:
-    """`to_json_str` の逆変換（round-trip 用）。"""
-    return _document_ir_from_dict(json.loads(s))
-
-
-def _document_ir_from_dict(d: dict) -> DocumentIR:
-    source_d = d.get("source") or {}
-    source = Source(path=source_d.get("path", ""), content_hash=source_d.get("content_hash", ""),
-                     file_type=source_d.get("file_type", ""))
-    elements = [_element_from_dict(e) for e in d.get("elements", [])]
-    return DocumentIR(schema_version=d.get("schema_version", DOCUMENT_IR_SCHEMA_VERSION),
-                       doc_id=d.get("doc_id", ""), source=source, elements=elements,
-                       picture_count=d.get("picture_count", 0))
-
-
-def _element_from_dict(d: dict) -> Element:
-    ext_d = d.get("extraction") or {}
-    extraction = Extraction(method=ext_d.get("method", ""), confidence=ext_d.get("confidence", 0.0))
-    cells_d = d.get("cells")
-    cells = [_cell_from_dict(c) for c in cells_d] if cells_d is not None else None
-    return Element(element_id=d["element_id"], type=d["type"], parent_id=d.get("parent_id"),
-                   order=d.get("order", 0), visibility=d.get("visibility", "visible"),
-                   status=d.get("status", "active"), text=d.get("text"), cells=cells,
-                   source_map=d.get("source_map") or {}, extraction=extraction,
-                   visibility_reason=d.get("visibility_reason"))
-
-
-def _cell_from_dict(d: dict) -> Cell:
-    return Cell(row=d["row"], column=d["column"], text=d.get("text", ""),
-                row_span=d.get("row_span", 1), column_span=d.get("column_span", 1),
-                role=d.get("role", "unknown"))

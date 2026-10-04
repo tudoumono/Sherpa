@@ -162,9 +162,8 @@ def _scan(text: str) -> _ScanResult:
                 if job_stack and job_stack[-1][0] == depth - 1:
                     if step_id:
                         result.batch_steps.append((job_stack[-1][1], step_id, line))
-                elif depth == 2:  # job 外のトップレベル step（`<beans>` 直下）
-                    if step_id:
-                        result.batch_top_level_steps.append((step_id, line))
+                elif depth == 2 and step_id:  # job 外のトップレベル step（`<beans>` 直下）
+                    result.batch_top_level_steps.append((step_id, line))
             elif is_batch and local == "tasklet":
                 tasklet_ref = attrs.get("ref")
                 if tasklet_ref:

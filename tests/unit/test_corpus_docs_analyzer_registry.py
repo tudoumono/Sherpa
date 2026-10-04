@@ -56,14 +56,10 @@ class _DummyLangAnalyzer(Analyzer):
 
 
 def test_new_analyzer_registration_is_picked_up_by_doctype_map_without_code_changes(monkeypatch):
-    """レジストリにアナライザを足すだけで `_doctype_map()`（後方互換の `_DOCTYPE` 属性・§2.4）
-    と `status_document_doctype` に反映される（拡張子・doctype とも固定 dict の手動更新が要らない）。
+    """レジストリにアナライザを足すだけで `status_document_doctype` に反映される（拡張子・doctype とも固定 dict の手動更新が要らない）。
     `.dummy` は既定 accepts のみ＝`read_head` は呼ばれないので世界名はダミーで安全。"""
     monkeypatch.setattr(registry, "_ANALYZERS", (*registry.known_analyzers(), _DummyLangAnalyzer()))
-    assert corpus_docs._doctype_map()[".dummy"] == "ダミー言語"
     assert corpus_docs.status_document_doctype("x.dummy", "w") == "ダミー言語"
-    # 後方互換の `_DOCTYPE` 属性アクセスも新規言語を含む（__getattr__ 経由）。
-    assert corpus_docs._DOCTYPE[".dummy"] == "ダミー言語"
 
 
 def test_new_analyzer_registration_appears_in_world_documents_and_scan_report(monkeypatch, tmp_path):

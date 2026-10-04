@@ -74,9 +74,6 @@ _LOGIN_REQUIRED_ROUTES = [
     ("GET",  "/scopes",               {}),
     ("GET",  "/documents",            {}),
     ("GET",  "/world-options",        {}),
-    # POST routes — body が空でも 422 ではなく認証が先に刺さることを確認
-    ("POST", "/troubleshoot/run",     {"json": {"symptom": "test", "world": "v1"}}),
-    ("POST", "/qa/run",               {"json": {"question": "test", "world": "v1"}}),
 ]
 
 # admin 必須ルート

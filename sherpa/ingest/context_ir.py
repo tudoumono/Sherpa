@@ -146,9 +146,6 @@ class ContextIR:
     element_sections: dict[str, tuple[str, ...]] = field(default_factory=dict)
     element_identifier_mentions: dict[str, tuple[IdentifierMention, ...]] = field(default_factory=dict)
 
-    def records_by_region_row(self) -> dict[tuple[str, int], ContextRecord]:
-        return {(record.region_id, record.row): record for record in self.records}
-
 
 def _stable_id(prefix: str, *parts: Any) -> str:
     raw = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -423,12 +420,10 @@ def _pdf_titles(ir: evidence_ir.EvidenceIR) -> dict[str, str]:
 
 
 def _region_specs(
-    table_id: str,
     cells: list[evidence_ir.EvidenceElement],
 ) -> list[tuple[int, int, int | None, str | None]]:
     positions = [(_row_column(cell), cell) for cell in cells if _row_column(cell)[0] is not None]
     min_row = min(position[0] for position, _ in positions)
-    max_row = max(position[0] for position, _ in positions)
     min_column = min(position[1] for position, _ in positions)
     max_column = max(position[1] + _span(cell, "column_span") - 1 for position, cell in positions)
     width = max_column - min_column + 1
@@ -762,7 +757,7 @@ def build(ir: evidence_ir.EvidenceIR, *, source_name: str) -> ContextIR:
         if not rows:
             continue
         min_row, max_row = min(rows), max(rows)
-        for start_column, end_column, title_row, title in _region_specs(table_id, table_cells):
+        for start_column, end_column, title_row, title in _region_specs(table_cells):
             if source_type in {"pptx", "pdf"} and title is None and table is not None:
                 title = _text(table.extension.get("name")) or None
             region_cells = _cells_in_region(table_cells, start_column, end_column)

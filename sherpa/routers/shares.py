@@ -35,10 +35,6 @@ class ShareCreateReq(BaseModel):
     sanitize: bool = False  # 個人 workspace 参照会話を、個人部分を伏せた snapshot として共有する。
 
 
-class ShareRevokeReq(BaseModel):
-    pass
-
-
 class ShareExtendReq(BaseModel):
     days: int = Field(SHARE_DEFAULT_EXPIRY_DAYS, ge=1, le=SHARE_DEFAULT_EXPIRY_DAYS)  # 今から最大 30 日。
 

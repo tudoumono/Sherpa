@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from _store_helpers import get_conversation
 from sherpa import store
 from sherpa.store import turn_metrics
 
@@ -284,7 +285,7 @@ def test_turn_metrics_write_failure_does_not_fail_message_save(monkeypatch):
                             answer={"usage": {"provider": "codex", "model": "m", "input_tokens": 1,
                                              "cached_input_tokens": 0, "output_tokens": 1,
                                              "reasoning_output_tokens": 0}})
-    conv = store.get_conversation(cid)
+    conv = get_conversation(cid)
     assert any(m["id"] == msg["id"] for m in conv["messages"])   # 本体は保存されている
     assert _fetch_turn_metrics(msg["id"]) is None   # savepoint で巻き戻り、行だけが無い
 

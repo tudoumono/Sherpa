@@ -145,20 +145,23 @@ def test_popen_not_reached_when_seed_blocked_becomes_true_after_config_written(t
     calls: list = []
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: (calls.append((a, kw)), _FakeProc())[-1])
 
-    import sherpa.providers.codex.provider as _provider_mod
-    real_write = _provider_mod._write_codex_authoring_config
+    import sherpa.providers.codex.sandbox as _sandbox_mod
+    real_write = _sandbox_mod._write_codex_authoring_config
+    write_calls: list = []
 
     def _write_then_block(*a, **kw):
         result = real_write(*a, **kw)   # 未ブロックのまま実行＝config 作成そのものは成功させる。
+        write_calls.append(1)
         llm.set_openai_endpoint_seed_blocked("test: config 作成後に block が成立")
         return result
 
-    monkeypatch.setattr(_provider_mod, "_write_codex_authoring_config", _write_then_block)
+    monkeypatch.setattr(_sandbox_mod, "_write_codex_authoring_config", _write_then_block)
 
     prov = A.CodexProvider()
     assert prov._ollama_base_url is None
     _drive(prov, _ctx("seedblocked-openai-configorder"))
 
+    assert write_calls == [1], "config 作成の差し替えが効いていない（block を config 作成後に立てられていない）"
     assert calls == [], f"config 作成後に block が成立したのに Popen が呼ばれた: {calls!r}"
 
 

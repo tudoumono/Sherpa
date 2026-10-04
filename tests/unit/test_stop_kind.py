@@ -164,7 +164,7 @@ def test_resolve_agentic_failure_typed_transport_values_pass_through():
     assert stop_kind.resolve({"agentic_failure": "transport_error"}) == "transport_error"
 
 
-# ===== `_plain_run`（素の会話）が定型文へ落ちたターンに印を付ける =====
+# ===== `_plain_run`（素の会話）が定型文を返したターンに印を付ける =====
 
 def _plain_ctx():
     from sherpa.providers.base import Ctx
@@ -176,21 +176,8 @@ class _EmptyPlain:
     label = "test"
     _last_usage = None
 
-    def _plain_stream(self, message):
-        return iter(())
-
     def _plain_text(self, message=""):
         return "まだ接続されていません"
-
-
-class _RaisingPlain(_EmptyPlain):
-    def _plain_stream(self, message):
-        raise TimeoutError("timed out")
-
-
-class _OkPlain(_EmptyPlain):
-    def _plain_stream(self, message):
-        yield "本文"
 
 
 def _plain_env(provider):
@@ -199,22 +186,10 @@ def _plain_env(provider):
     return res[0]["env"]
 
 
-def test_plain_run_marks_empty_stream_as_failure():
+def test_plain_run_marks_fixed_text_turn_as_failure():
     env = _plain_env(_EmptyPlain())
     assert env["agentic_failure"] == "error"
     assert stop_kind.resolve(env) is None
-
-
-def test_plain_run_marks_timeout_stream_exception_as_timeout():
-    env = _plain_env(_RaisingPlain())
-    assert env["agentic_failure"] == "timeout"
-    assert stop_kind.resolve(env) == "timeout"
-
-
-def test_plain_run_leaves_successful_turn_unmarked():
-    env = _plain_env(_OkPlain())
-    assert "agentic_failure" not in env
-    assert stop_kind.resolve(env) == "completed"
 
 
 def test_from_exception_http_error_response_is_not_transport_error():

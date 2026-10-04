@@ -1,6 +1,6 @@
 """既定の頭脳の自動選択と Codex CLI 不在時の正直な「未接続」（閉域実機の是正・2026-08-18）。
 
-不具合: `DEFAULT_CONSTRUCT_ID=codex_openai` のため、設定を忘れると既定＝Codex になり、Codex CLI が無い
+不具合: 既定が codex_openai のため、設定を忘れると既定＝Codex になり、Codex CLI が無い
 閉域ホストでは provider.py の `shutil.which("codex")` 分岐が外れて決定的回答（定型文）だけが返っていた。
 
 契約:
@@ -120,36 +120,21 @@ def test_unwired_provider_run_includes_scope_in_env(_clean_env, monkeypatch):
     assert result["env"]["scope"] == {**narrow_scope, "layer_applied": True}
 
 
-def test_disabled_provider_run_includes_scope_in_env(monkeypatch):
-    """`_DisabledProvider` も `_UnwiredProvider` と同じ honest failure 経路＝scope を含める。"""
+def test_unwired_provider_preserves_requested_layer_value():
+    """layer_applied だけでなく、要求された layer の値自体も欠落させない
+    （UI が「探す対象」の直前選択を再表示できるように）。"""
     from sherpa.providers.base import Ctx
-    from sherpa.providers import _DisabledProvider
+    from sherpa.providers import _UnwiredProvider
 
-    p = _DisabledProvider("gemini")
-    narrow_scope = {"world": "v1", "scope_paths": ["4期/"], "source": "scope"}
-    ctx = Ctx(message="質問", world="v1", knowledge=True, scope_meta=narrow_scope,
+    scope_meta = {"world": "v1", "scope_paths": [], "source": "all", "layer": "code"}
+    p = _UnwiredProvider("Codex", "案内文")
+    ctx = Ctx(message="質問", world="v1", knowledge=True, scope_meta=scope_meta,
              route=lambda m: {"lens": "qa", "reason": "t", "input": m},
              dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
              make_sources=lambda docs: [{"doc_id": d} for d in docs])
     result = next(e for e in p.run(ctx) if e.get("type") == "_result")
-    assert result["env"]["scope"] == {**narrow_scope, "layer_applied": True}
-
-
-def test_unwired_and_disabled_provider_preserve_requested_layer_value():
-    """layer_applied だけでなく、要求された layer の値自体も欠落させない
-    （UI が「探す対象」の直前選択を再表示できるように）。"""
-    from sherpa.providers.base import Ctx
-    from sherpa.providers import _DisabledProvider, _UnwiredProvider
-
-    scope_meta = {"world": "v1", "scope_paths": [], "source": "all", "layer": "code"}
-    for p in (_UnwiredProvider("Codex", "案内文"), _DisabledProvider("gemini")):
-        ctx = Ctx(message="質問", world="v1", knowledge=True, scope_meta=scope_meta,
-                 route=lambda m: {"lens": "qa", "reason": "t", "input": m},
-                 dispatch=lambda l, i: {"summary": {"total": 0}, "data": {}, "sources": []},
-                 make_sources=lambda docs: [{"doc_id": d} for d in docs])
-        result = next(e for e in p.run(ctx) if e.get("type") == "_result")
-        assert result["env"]["scope"]["layer"] == "code"
-        assert result["env"]["scope"]["layer_applied"] is True
+    assert result["env"]["scope"]["layer"] == "code"
+    assert result["env"]["scope"]["layer_applied"] is True
 
 
 def test_select_provider_codex_with_cli_builds_codex_provider(_clean_env, monkeypatch):

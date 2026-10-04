@@ -1,7 +1,6 @@
 """PUT /settings の agent allowlist（FastAPI TestClient・要 Postgres）。
 
-- allowlist 外・チャットで閉じた頭脳（heuristic/gemini/bedrock）は 422。
-- 閉じていない頭脳（AGENT_PROVIDERS の残り）は全て保存できる（allowlist 追加時の取りこぼし防止）。
+- allowlist 外・チャットで閉じた頭脳（heuristic/gemini/bedrock/openai/ollama）は 422。
 DB 不可は graceful SKIP（test_health_api.py の流儀）。
 """
 from __future__ import annotations

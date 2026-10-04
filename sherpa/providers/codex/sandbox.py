@@ -141,10 +141,10 @@ def _kb_read_roots(world: str) -> list:
     return roots
 
 
-def _direct_read_roots(world: str, scope_paths=None) -> list:
+def _direct_read_roots(world: str) -> list:
     """原本直読で permission profile に read を許す絶対パスの一覧＝KB root（`_kb_read_roots`）＋存在する派生ルート（`derived_md_dir`／`derived_rag_dir`／`archives_dir`）。
     このリストに無い派生サブディレクトリは読めない。
-    範囲（scope）は read root を狭めずに、`_scope_deny_entries` が経路上にない兄弟を個別 deny して表す（親フォルダの deny が子の read に勝つため）。`scope_paths` は互換のため受けるが使わない。
+    範囲（scope）は read root を狭めずに、`_scope_deny_entries` が経路上にない兄弟を個別 deny して表す（親フォルダの deny が子の read に勝つため）。
     """
     from ... import worlds
 
@@ -327,8 +327,7 @@ def _tool_home(tmpdir: Path) -> Path:
     return home
 
 
-def _codex_clean_env(codex_home: Path, authoring: Path, tmpdir: Path,
-                     openai_api_key: str | None = None) -> dict:
+def _codex_clean_env(codex_home: Path, tmpdir: Path, openai_api_key: str | None = None) -> dict:
     """codex exec 用の最小 env（env -i 相当）。DB/ES/KB creds を渡さない（PATH 等ランタイムのみ）。
     creds が要る MCP サブプロセスへは config ファイル(mcp_servers.sherpa.env)経由で渡す。プロキシ/CA の経路設定（`_CODEX_PASSTHROUGH_ENV`）だけ、親環境にあるときそのまま渡す。
     `openai_api_key`: 既定 None＝渡さない。Codex(OpenAI) 構成で接続先を Azure 等のカスタム provider（`env_key = "OPENAI_API_KEY"`）へ差し替えたときだけ渡す。

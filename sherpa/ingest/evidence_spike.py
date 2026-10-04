@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
-import posixpath
 import zipfile
 from dataclasses import asdict, dataclass, replace as _dataclass_replace
 from pathlib import Path, PurePosixPath
@@ -17,9 +16,10 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from . import document_ir, evidence_ir
+from .metafile_text import child_png_size
+from .ooxml.rels import load_relationships, resolve_target
 
 
-_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -270,7 +270,7 @@ def _adapt_document_ir(
     legacy: document_ir.DocumentIR | None,
     *,
     consume_legacy: bool = False,
-) -> dict[str, str]:
+) -> None:
     """現行 IR を共通 core へ写す。cell は独立 element とし、parent_id で table 所属を明示する。
 
     ``consume_legacy`` は通常取り込みの巨大 XLSX 用。既存 IR 成果物と chunk を書き終えた後に限って使い、
@@ -279,7 +279,7 @@ def _adapt_document_ir(
     cell 自身の `visibility`/`extension["visibility_reason"]` へ直接反映する。
     """
     if legacy is None:
-        return {}
+        return
     file_type = legacy.source.file_type
     slide_parts = {
         element.source_map["slide"]: element.source_map["part"]
@@ -389,7 +389,6 @@ def _adapt_document_ir(
             # 30万cell級でrelation/coverageを二重に持つメモリ増幅を避ける。
         if consume_legacy and element.cells:
             element.cells.clear()
-    return ids
 
 
 def _a1(row: int, column: int) -> str:
@@ -397,77 +396,39 @@ def _a1(row: int, column: int) -> str:
     return f"{get_column_letter(column)}{row}"
 
 
-def _rels_name(part: str) -> str:
-    path = PurePosixPath(part)
-    return str(path.parent / "_rels" / f"{path.name}.rels")
-
-
 def _relationships(entries: dict[str, bytes], part: str) -> dict[str, str]:
-    try:
-        root = ET.fromstring(entries[_rels_name(part)])
-    except (KeyError, ET.ParseError):
-        return {}
-    out: dict[str, str] = {}
-    for rel in root.findall(f"{_REL}Relationship"):
-        rel_id = rel.get("Id")
-        target = rel.get("Target")
-        if not rel_id or not target or rel.get("TargetMode") == "External":
-            continue
-        out[rel_id] = (
-            posixpath.normpath(target.lstrip("/"))
-            if target.startswith("/")
-            else posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
-        )
-    return out
+    return {
+        rel.id: resolve_target(part, rel.target)
+        for rel in load_relationships(entries.__getitem__, part)
+        if rel.id and rel.target and rel.mode != "External"
+    }
 
 
 def _relationship_records(entries: dict[str, bytes], part: str) -> dict[str, dict[str, str]]:
     """relationshipのtargetだけでなくtypeも失わずに返す。外部targetは原本内assetとして扱わない。"""
-    try:
-        root = ET.fromstring(entries[_rels_name(part)])
-    except (KeyError, ET.ParseError):
-        return {}
-    records: dict[str, dict[str, str]] = {}
-    for relation in root.findall(f"{_REL}Relationship"):
-        rel_id = relation.get("Id")
-        target = relation.get("Target")
-        if not rel_id or not target or relation.get("TargetMode") == "External":
-            continue
-        resolved = (
-            posixpath.normpath(target.lstrip("/"))
-            if target.startswith("/")
-            else posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
-        )
-        records[rel_id] = {"target": resolved, "type": relation.get("Type", "")}
-    return records
+    return {
+        rel.id: {"target": resolve_target(part, rel.target), "type": rel.type or ""}
+        for rel in load_relationships(entries.__getitem__, part)
+        if rel.id and rel.target and rel.mode != "External"
+    }
 
 
 def _image_relationship_records(entries: dict[str, bytes], part: str) -> dict[str, dict[str, str]]:
     """画像relationshipを、外部targetの生値を保持せずに列挙する。"""
-    try:
-        root = ET.fromstring(entries[_rels_name(part)])
-    except (KeyError, ET.ParseError):
-        return {}
     records: dict[str, dict[str, str]] = {}
-    for relation in root.findall(f"{_REL}Relationship"):
-        relationship_id = relation.get("Id")
-        target = relation.get("Target")
-        if not relationship_id or not target:
+    for rel in load_relationships(entries.__getitem__, part):
+        if not rel.id or not rel.target:
             continue
-        target_mode = relation.get("TargetMode", "Internal")
+        target_mode = rel.mode if rel.mode is not None else "Internal"
         record = {
-            "relationship_type": relation.get("Type", ""),
+            "relationship_type": rel.type or "",
             "target_mode": target_mode,
         }
         if target_mode.casefold() == "external":
-            record["external_target_sha256"] = "sha256:" + hashlib.sha256(target.encode("utf-8")).hexdigest()
+            record["external_target_sha256"] = "sha256:" + hashlib.sha256(rel.target.encode("utf-8")).hexdigest()
         else:
-            record["media_part"] = (
-                posixpath.normpath(target.lstrip("/"))
-                if target.startswith("/")
-                else posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
-            )
-        records[relationship_id] = record
+            record["media_part"] = resolve_target(part, rel.target)
+        records[rel.id] = record
     return records
 
 
@@ -1183,8 +1144,8 @@ def _integer(value: str | None) -> int | None:
 
 def _image_pixel_size(data: bytes) -> list[int] | None:
     """任意ライブラリに依存せず、OOXMLで頻出するPNG/GIF/JPEGのピクセル寸法を読む。"""
-    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return [int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")]
+    if (png_size := child_png_size(data)) is not None:
+        return png_size
     if len(data) >= 10 and data[:6] in {b"GIF87a", b"GIF89a"}:
         return [int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")]
     if len(data) >= 4 and data[:2] == b"\xff\xd8":
@@ -1485,7 +1446,7 @@ def _prst_geom(node: ET.Element, prefix: str, kind: str) -> str | None:
     return geom.get("prst") if geom is not None else None
 
 
-def _xlsx_objects(builder: _Builder, entries: dict[str, bytes], legacy_ids: dict[str, str]) -> set[str]:
+def _xlsx_objects(builder: _Builder, entries: dict[str, bytes]) -> set[str]:
     content_parts = {"xl/workbook.xml"}
     content_parts.update(part for part in ("xl/sharedStrings.xml", "xl/styles.xml") if part in entries)
     sheet_ids = {
@@ -3402,12 +3363,12 @@ def extract(
     if suffix == ".pdf":
         _pdf_objects(builder, source_path)
     else:
-        legacy_ids = _adapt_document_ir(
+        _adapt_document_ir(
             builder, legacy_ir if legacy_ir is not None else _legacy_ir(source_path), consume_legacy=consume_legacy)
         entries = _package_entries(source_path)
         package_metadata = _package_metadata(entries)
         if suffix == ".xlsx":
-            content_parts = _xlsx_objects(builder, entries, legacy_ids)
+            content_parts = _xlsx_objects(builder, entries)
         elif suffix == ".docx":
             content_parts = _docx_objects(builder, entries)
         else:

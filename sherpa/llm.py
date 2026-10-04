@@ -24,7 +24,6 @@ import contextvars
 import ipaddress
 import json
 import os
-import re
 import threading
 import urllib.request
 from urllib.parse import quote, urlparse, urlunparse

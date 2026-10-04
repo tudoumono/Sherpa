@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import json
 
-from sherpa import agentic_search as A
+from sherpa import tool_dispatch
 from sherpa import corpus_docs, es_index, grep_tool, layer as layer_mod, worlds
 from sherpa.ingest import text_kind
 from sherpa.ingest.failure_reasons import REASON_CATALOG
@@ -52,7 +52,6 @@ def test_stage1_code_extension_is_branch_source(monkeypatch, tmp_path):
     assert rep["analyzer_declined"] == 0 and rep["skipped_other"] == 0
 
     assert corpus_docs.status_document_doctype("app.py", "w") == text_kind.CODE_DOCTYPE_LABEL
-    assert corpus_docs.status_document_requires_coverage("app.py", "w") is False
 
 
 # ---- 第1段（拡張子マップ）: 資料側 ----
@@ -73,7 +72,6 @@ def test_stage1_document_extension_is_branch_office(monkeypatch, tmp_path):
     assert rep["by_doctype"] == {text_kind.DOCUMENT_DOCTYPE_LABEL: 1} and rep["indexed"] == 1
 
     assert corpus_docs.status_document_doctype("data.csv", "w") == text_kind.DOCUMENT_DOCTYPE_LABEL
-    assert corpus_docs.status_document_requires_coverage("data.csv", "w") is False
 
 
 def test_log_extension_is_not_noise_and_is_indexed(monkeypatch, tmp_path):
@@ -218,8 +216,6 @@ def test_sensitive_office_original_name_is_not_reclassified_as_office(monkeypatc
 
     assert corpus_docs.status_document_doctype("credentials.xlsx", "w") is None
     assert corpus_docs.status_document_doctype("id_rsa.docx", "w") is None
-    assert corpus_docs.status_document_requires_coverage("credentials.xlsx", "w") is False
-    assert corpus_docs.status_document_requires_coverage("id_rsa.docx", "w") is False
 
     rep = corpus_docs.scan_report("w")
     assert rep["by_doctype"] == {"Word": 1}                # normal.docx のみ（Excel は0件）
@@ -396,10 +392,10 @@ def test_read_around_can_read_generic_text_files(monkeypatch, tmp_path):
     (wd / "app.py").write_text("line1\nTARGETWORD line2\nline3\n", encoding="utf-8")
     (wd / "data.csv").write_text("line1\nTARGETWORD,line2\nline3\n", encoding="utf-8")
 
-    res_code = A.run_tool("read_around", {"doc_id": "app.py", "line": 2, "window": 1}, "w", None)[0]
+    res_code = tool_dispatch.run_tool("read_around", {"doc_id": "app.py", "line": 2, "window": 1}, "w", None)[0]
     assert "error" not in res_code and "TARGETWORD" in res_code["text"]
 
-    res_doc = A.run_tool("read_around", {"doc_id": "data.csv", "line": 2, "window": 1}, "w", None)[0]
+    res_doc = tool_dispatch.run_tool("read_around", {"doc_id": "data.csv", "line": 2, "window": 1}, "w", None)[0]
     assert "error" not in res_doc and "TARGETWORD" in res_doc["text"]
 
 
@@ -408,5 +404,5 @@ def test_read_around_still_rejects_sensitive_extension(monkeypatch, tmp_path):
     wd, _der = _world(monkeypatch, tmp_path)
     (wd / ".env").write_text("SECRET=1\n", encoding="utf-8")
 
-    res = A.run_tool("read_around", {"doc_id": ".env", "line": 1, "window": 1}, "w", None)[0]
+    res = tool_dispatch.run_tool("read_around", {"doc_id": ".env", "line": 1, "window": 1}, "w", None)[0]
     assert "error" in res

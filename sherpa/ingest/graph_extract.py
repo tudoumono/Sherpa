@@ -1,6 +1,6 @@
 """取り込みパイプライン向けの LLM 呼び出しの共通配管（プロバイダ選択・送信・秘密マスク）。
 
-`available()`/`complete_json()`/`_call`/`_probe` と、エラー詳細を外へ出す前のマスク
+`available()`/`complete_json()`/`_probe` と、エラー詳細を外へ出す前のマスク
 （`_mask_secrets`/`_redact_reflected_urls`/`_safe_detail`/`_log_masked_exception`）を持つ。
 `intent_llm.py`・`ingest/llm_render.py`・`health.py`・`routers/system.py`・`providers/base.py`・`ext_api.py`・
 `agentic_search.py`・`metering.py`・`doctor_checks.py` が共用する。
@@ -11,7 +11,6 @@ from __future__ import annotations
 import bisect
 import json
 import re
-import time
 import urllib.error
 from urllib.parse import quote, quote_plus
 
@@ -33,7 +32,6 @@ def available(settings: dict | None = None, *, system_settings: dict | None = No
     `strict` は `llm.select_provider(strict=...)` へ転送する（送信する呼び出し元は True）。
     `usage` は `model_catalog.resolve_model` のカタログ用途キー（`llm_render.py` は `"render"` を渡す）。
     """
-    s = settings or {}
     from .. import model_catalog, store as _store
     sys_s = system_settings if system_settings is not None else _store.get_system_settings()
 
@@ -108,26 +106,11 @@ def _http_detail(e: urllib.error.HTTPError,
     return detail, hint
 
 
-def _error_detail(e: Exception, *, secret: str | None = None) -> str:
+def _error_detail(e: Exception) -> str:
     """`urllib.error.HTTPError` 以外の例外を、型名＋メッセージの短い理由文にする（未マスク・未切断・呼び出し元は `_safe_detail` を経由する）。
 
-    メッセージは `_HTTP_ERROR_BODY_MAX_BYTES` で切り詰める。`secret` は呼び出し側の署名互換のために受け取る。"""
+    メッセージは `_HTTP_ERROR_BODY_MAX_BYTES` で切り詰める。"""
     return f"{type(e).__name__}: {str(e)[:_HTTP_ERROR_BODY_MAX_BYTES]}"
-
-
-def _call(system: str, user: str, cfg: dict, attempts: int = 3) -> str:
-    """`complete_json` を 429（レート/クォータ）だけ指数バックオフで再試行する。"""
-    delay = 2.0
-    for i in range(attempts):
-        try:
-            return complete_json(system, user, cfg)
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and i < attempts - 1:
-                ra = e.headers.get("Retry-After") if e.headers else None
-                time.sleep(min(float(ra) if (ra and str(ra).isdigit()) else delay, 30))
-                delay *= 2
-                continue
-            raise
 
 
 # Bearer/api-key の値は区切り（空白・カンマ・セミコロン・引用符）で止める
@@ -575,7 +558,7 @@ def _safe_detail(e: Exception, *, secret: str | None = None,
             reserved = max(_DETAIL_MAX_LEN_HTTP - len(hint), 0)
             return (base[:reserved] + hint)[:_DETAIL_MAX_LEN_HTTP]
         return base[:_DETAIL_MAX_LEN_HTTP]
-    text = _error_detail(e, secret=secret)
+    text = _error_detail(e)
     text = _mask_secrets(text, secret)
     text = _redact_reflected_urls(text, base_url)
     return text[:_DETAIL_MAX_LEN_GENERIC]

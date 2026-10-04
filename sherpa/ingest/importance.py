@@ -176,12 +176,6 @@ def _parse_line_full(line: str):
     return (pattern, value, reason), None, None
 
 
-def _parse_line(line: str) -> tuple[str, str, str | None] | None:
-    """1行を `(pattern, value, reason)` に解析する。空行・コメント行・構文エラーは `None`。"""
-    parsed, _code, _message = _parse_line_full(line)
-    return parsed
-
-
 def _read_control_bytes(path: Path, cfg: str) -> tuple[bytes | None, Diagnostic | None]:
     """`_重要度.txt` を安全に読む（stat で事前判定し、読み取り自体も上限＋1バイトに制限して再検査する）。
 
@@ -296,22 +290,6 @@ def _resolve_rel(rel: str, control_by_folder: dict[str, tuple[list[Rule], list[D
         return Resolution(value=winner.value, reason=winner.reason,
                           config_path=config_path, rule_line=winner.line)
     return None
-
-
-def resolve_one(world_dir: Path, rel: str, control_paths: list) -> Resolution | None:
-    """`rel` 1件だけを、既知の `_重要度.txt` パス集合から解決する（小規模呼び出し・テスト用）。"""
-    wd = Path(world_dir).resolve()
-    control_by_folder: dict[str, tuple[list[Rule], list[Diagnostic]]] = {}
-    for cp in control_paths:
-        cp = Path(cp)
-        try:
-            crel = cp.resolve().relative_to(wd).as_posix()
-        except (OSError, ValueError):
-            continue
-        if not is_importance_control_path(crel):
-            continue
-        control_by_folder[_parent_rel(crel)] = parse_control_file(cp, config_rel=crel)
-    return _resolve_rel(rel, control_by_folder)
 
 
 def _compute_for_world(wd: Path, control_contents: dict[str, bytes] | None = None,

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 
-from .impact_service import CATEGORY
 from .ingest.model import NODE_LABELS
 from .ingest.world_neo4j import (
     WORLD_EDGE_TYPES,
@@ -23,8 +22,6 @@ _COND_FIELDS = {
     "top_scope": lambda v: f"{v}.top_scope",
     "path": lambda v: f"{v}.path",
     "status": lambda v: f"coalesce({v}.status,'active')",
-    "extraction_method": lambda v: f"coalesce({v}.extraction_method,'static')",
-    "em": lambda v: f"coalesce({v}.extraction_method,'static')",
     "type": lambda v: f"[l IN labels({v}) WHERE l<>'Entity'][0]",
     "label": lambda v: f"[l IN labels({v}) WHERE l<>'Entity'][0]",
     # グラフ内に role プロパティはないため、管理検索ではノード種別を role として扱う
@@ -68,7 +65,6 @@ def _node(row: dict, prefix: str) -> dict | None:
     label = row.get(prefix + "label")
     return {"id": cid, "name": row.get(prefix + "name"), "type": label,
             "type_ja": _TYPE_JA.get(label, label),
-            "em": row.get(prefix + "em") or "static",
             "status": row.get(prefix + "status") or "active",
             "value": row.get(prefix + "value"),
             "top_scope": row.get(prefix + "top_scope"),
@@ -89,7 +85,7 @@ def _rows_to_graph(rows: list[dict], world: str, counts: dict | None = None) -> 
             if key not in seen_e:
                 seen_e.add(key)
                 edges.append({"source": r["source_id"], "target": r["target_id"],
-                              "type": r["edge_type"], "em": r.get("edge_em") or "static",
+                              "type": r["edge_type"],
                               "status": r.get("edge_status") or "active"})
     out_nodes = sorted(nodes.values(), key=lambda n: ((n.get("type_ja") or ""), (n.get("name") or "")))
     return {"world": world, "nodes": out_nodes, "edges": edges,
@@ -100,7 +96,6 @@ def _ret(prefix: str, var: str) -> str:
     return (
         f"{var}.canonical_id AS {prefix}id, {var}.name AS {prefix}name, "
         f"[l IN labels({var}) WHERE l<>'Entity'][0] AS {prefix}label, "
-        f"coalesce({var}.extraction_method,'static') AS {prefix}em, "
         f"coalesce({var}.status,'active') AS {prefix}status, {var}.value AS {prefix}value, "
         f"{var}.top_scope AS {prefix}top_scope, {var}.phase AS {prefix}phase, "
         f"{var}.category AS {prefix}category, {var}.path AS {prefix}path"
@@ -138,7 +133,7 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
             f"MATCH (a:Entity)-[r:{rel_clause}]->(b:Entity) "
             "WHERE " + " AND ".join(where) + " "
             "RETURN " + _ret("source_", "a") + ", " + _ret("target_", "b") + ", "
-            "type(r) AS edge_type, coalesce(r.extraction_method,'static') AS edge_em, "
+            "type(r) AS edge_type, "
             "coalesce(r.status,'active') AS edge_status "
             "ORDER BY edge_type, source_name, target_name LIMIT $limit"
         )
@@ -159,7 +154,7 @@ def graph_search(session, world: str, relationship_types=None, field: str | None
         f"WHERE {_scope_pred('m')} AND {cond_m} "
         "  AND ($incl OR (coalesce(m.status,'active')='active' AND coalesce(r.status,'active')='active')) "
         "RETURN " + _ret("source_", "n") + ", " + _ret("target_", "m") + ", "
-        "type(r) AS edge_type, coalesce(r.extraction_method,'static') AS edge_em, "
+        "type(r) AS edge_type, "
         "coalesce(r.status,'active') AS edge_status "
         "ORDER BY source_name, edge_type, target_name"
     )

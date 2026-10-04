@@ -3,7 +3,7 @@
 正典: `docs/archive/2026-09-04-グラフのソース正典化.md` §3 K6・§4b S1。木の集計本体
 （`sherpa/folder_tree.py`）は `doc_ledger.documents_for()` を monkeypatch した合成データで
 精密に固定する（深さクランプ・per-フォルダ打切り・列挙件数の安全弁は fixtures の実木では
-境界条件を作りにくいため）。配線（`agentic_search.run_tool`/
+境界条件を作りにくいため）。配線（`tool_dispatch.run_tool`/
 `mcp_server._tool_defs`）は実 fixtures（`v1`）で最小限の統合テストを添える。
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ import os
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 
-from sherpa import agentic_search, folder_tree, mcp_server  # noqa: E402
+from sherpa import folder_tree, mcp_server, tool_dispatch  # noqa: E402
 
 
 def _rows(*names_and_branch):
@@ -135,7 +135,7 @@ def test_run_tool_forwards_tool_result_max_bytes_to_folder_tree(monkeypatch):
     build` へ転送する（他ツール＝doc_outline 等と同じ配線）。"""
     rows = _rows(*[f"f{i}/x.md" for i in range(5)])
     _patch(monkeypatch, rows)
-    result, _docs, _cites, _cards = agentic_search.run_tool(
+    result, _docs, _cites, _cards = tool_dispatch.run_tool(
         "folder_tree", {}, "v1", None, tool_result_max_bytes=6)
     assert result["count"] == 5
     assert len(result["folders"]) == 3
@@ -164,7 +164,7 @@ def test_build_layer_docs_excludes_source_branch_files(monkeypatch):
 
 def test_run_tool_dispatches_and_does_not_add_folders_to_citation_docs(monkeypatch):
     _patch(monkeypatch, _SAMPLE)
-    result, docs, cites, cards = agentic_search.run_tool("folder_tree", {}, "v1", None)
+    result, docs, cites, cards = tool_dispatch.run_tool("folder_tree", {}, "v1", None)
     assert result["count"] == 5
     assert docs == set() and cites == [] and cards == []       # フォルダは doc_id ではない
 
@@ -172,7 +172,7 @@ def test_run_tool_dispatches_and_does_not_add_folders_to_citation_docs(monkeypat
 def test_run_tool_forwards_layer_to_folder_tree(monkeypatch):
     rows = _rows(("top/a/doc.md", "docs"), ("top/a/prog.cbl", "source"))
     _patch(monkeypatch, rows)
-    result, _docs, _cites, _cards = agentic_search.run_tool("folder_tree", {}, "v1", None, layer="code")
+    result, _docs, _cites, _cards = tool_dispatch.run_tool("folder_tree", {}, "v1", None, layer="code")
     by_path = {f["path"]: f for f in result["folders"]}
     assert by_path["top/a"]["total_files"] == 1
 

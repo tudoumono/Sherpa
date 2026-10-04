@@ -41,8 +41,6 @@ from .db import _inited, dict_row  # noqa: F401
 
 # announcements・api_keys の全名（私的名含む）を re-export する。
 from .announcements import (
-    _ANNOUNCEMENT_FIELDS,
-    _UNSET,
     AnnouncementOrderError,
     create_announcement,
     delete_announcement,
@@ -73,18 +71,12 @@ from .api_keys import (
     touch_api_key,
 )  # noqa: F401
 
-# usage の全名（私的名含む）を re-export する（tests は `store._compute_retention` を monkeypatch する）。
+# usage の全名（私的名含む）を re-export する。
 from .usage import (
     _JST,
-    QUALITY_RUN_CONDITIONS,
     UsagePeriodError,
-    _USAGE_AUDIT_ACTIONS,
-    _USAGE_KNOWN_PROVIDERS,
     _USAGE_TOKEN_WHERE,
     _USAGE_TURN_CTE,
-    _compute_conversation_turn_stats,
-    _compute_retention,
-    _percentile,
     _usage_period_bounds,
     _usage_tok,
     _usage_token_sum_cols,
@@ -136,7 +128,6 @@ from .worlds import (
 # audit（監査ログ・チェーン一式）の全名（私的名含む）を re-export する（tests が `store._audit_insert` を monkeypatch する）。
 from .audit import (
     _AUDIT_CANON_FIELDS,
-    _AUDIT_CHAIN_LOCK,
     _REDACT_KEYS,
     _audit_canonical,
     _audit_entry_hash,
@@ -152,15 +143,11 @@ from .audit import (
 from .settings import (
     OpenAIEndpointSettingsConflict,
     PersonalKeysDisallowedError,
-    _SETTINGS_DEFAULT,
     _SETTINGS_FIELDS,
-    _SYSTEM_SETTINGS_CACHE_TTL,
     _invalidate_system_settings_cache,
     _read_system_settings_fresh,
-    _system_settings_apply,
     _system_settings_cache,
     _system_settings_cache_ts,
-    _system_settings_snapshot,
     count_users_with_personal_keys,
     get_settings,
     get_system_settings,
@@ -195,7 +182,6 @@ from .workspace_files import (
     get_workspace_file,
     list_workspace_files,
     live_workspace_rel_paths,
-    mark_workspace_file_expired,
     no_live_upload_for_path,
     record_workspace_file,
 )  # noqa: F401
@@ -207,7 +193,6 @@ from .conversations import (
     create_conversation,
     delete_conversation,
     get_codex_usage_total,
-    get_conversation,
     get_session_id,
     is_personal_tainted,
     conversation_is_personal_tainted,
@@ -234,18 +219,13 @@ from .feedback import (
 )  # noqa: F401
 # turn_metrics（集計専用の細い写像表）の公開関数を re-export する。
 from .turn_metrics import (
-    MAPPING_VERSION,
     backfill_all,
-    ensure_rows,
-    metrics_from_answer,
     upsert,
     upsert_best_effort,
 )  # noqa: F401
 from .shares import (
     _REDACTED_TEXT,
     _SANITIZED_TITLE,
-    _SHARE_SAFE_LENS,
-    _create_sanitized_snapshot_tx,
     _safe_evidence_item,
     _safe_evidence_packet,
     _safe_locator,

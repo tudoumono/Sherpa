@@ -52,13 +52,12 @@ def test_regenerate_rag_rule_only_success_path(monkeypatch, tmp_path):
     assert result["rag_generated"] == 3
 
 
-def test_regenerate_rag_rule_only_defers_marker_when_rag_es_enabled(monkeypatch, tmp_path):
+def test_regenerate_rag_rule_only_defers_marker(monkeypatch, tmp_path):
     dmd = tmp_path / "derived" / "md"
     dmd.mkdir(parents=True)
     monkeypatch.setattr(worlds, "world_dir", lambda world: tmp_path / "world")
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(llm_render, "clear_cache", lambda world: None)
 
     refresh_calls = []
@@ -93,7 +92,6 @@ def test_regenerate_rag_rule_only_es_reindex_failed(monkeypatch, tmp_path):
     monkeypatch.setattr(worlds, "world_dir", lambda world: tmp_path / "world")
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(llm_render, "clear_cache", lambda world: None)
     monkeypatch.setattr(office_md, "refresh_rag",
                         lambda wd, derived, **kw: {"rag_generated": 1, "rag_failed": 0, "rag_failures": []})
@@ -111,7 +109,6 @@ def test_reindex_after_rag_rewrite_returns_false_when_sig_missing(monkeypatch):
 
 def test_reindex_after_rag_rewrite_marker_drop_failure(monkeypatch):
     monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": "sig"})
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: "dmd")
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: None)
@@ -125,7 +122,6 @@ def test_reindex_after_rag_rewrite_marker_drop_failure(monkeypatch):
 
 def test_reindex_after_rag_rewrite_success_writes_marker(monkeypatch):
     monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": "sig"})
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: "dmd")
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: None)
@@ -140,7 +136,6 @@ def test_reindex_after_rag_rewrite_success_writes_marker(monkeypatch):
 
 def test_reindex_after_rag_rewrite_es_failure_does_not_write_marker(monkeypatch):
     monkeypatch.setattr(store, "get_world", lambda world: {"last_sig": "sig"})
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(store, "world_lock", _noop_lock)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: "dmd")
     monkeypatch.setattr(worker, "_reflect_graph_after_rag_rewrite", lambda world: None)

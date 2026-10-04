@@ -48,7 +48,7 @@ def test_graph_search_relationship_query_and_shape():
     assert kw["world"] == "w" and kw["prefixes"] == ["4期"] and kw["limit"] == 50
     assert {n["name"] for n in g["nodes"]} == {"TAXCALC", "TAX-CPY"}
     assert g["edges"] == [{"source": "module:w:src", "target": "copybook:w:dst",
-                           "type": "COPIES", "em": "static", "status": "active"}]
+                           "type": "COPIES", "status": "active"}]
 
 
 def test_graph_search_condition_uses_allowlisted_field():

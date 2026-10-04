@@ -233,9 +233,9 @@ def content_hash(manifest: OCRRouteManifest) -> str:
 def _priority(element: evidence_ir.EvidenceElement) -> int:
     priority = 100
     size = element.extension.get("pixel_size")
-    if isinstance(size, list) and len(size) == 2 and all(isinstance(value, int) for value in size):
-        if min(size) < 32:
-            priority -= 30
+    if isinstance(size, list) and len(size) == 2 and all(isinstance(value, int) for value in size) \
+            and min(size) < 32:
+        priority -= 30
     if element.visibility == "hidden":
         priority -= 20
     return max(1, priority)
@@ -500,9 +500,9 @@ def validation_errors(manifest: OCRRouteManifest, *, ir: evidence_ir.EvidenceIR 
                 _safe_relative(item.asset_rel_path or "")
             except ValueError:
                 errors.append(f"asset_binding:{item.route_input_id}")
-        if item.status == "selected" and item.input_kind == "page_render":
-            if item.page_render is None or item.page_render.get("profile") != PAGE_RENDER_PROFILE["profile"]:
-                errors.append(f"page_render:{item.route_input_id}")
+        if item.status == "selected" and item.input_kind == "page_render" and (
+                item.page_render is None or item.page_render.get("profile") != PAGE_RENDER_PROFILE["profile"]):
+            errors.append(f"page_render:{item.route_input_id}")
         if item.priority < 0:
             errors.append(f"priority:{item.route_input_id}")
     if _SHA256_RE.fullmatch(manifest.route_manifest_hash) is None:

@@ -11,15 +11,15 @@ import os
 
 os.environ.setdefault("SHERPA_USE_FIXTURES", "1")
 os.environ.setdefault("SHERPA_DISABLE_EMBED", "1")
-from sherpa import agentic_search as A   # noqa: E402
+from sherpa import es_index, grep_tool, tool_dispatch, worlds   # noqa: E402
 
 
 # ===== read_around: バイト上限での切り詰め =====
 
 def test_read_around_sets_text_truncated_when_clipped_by_small_budget():
-    res, _, _, _ = A.run_tool("ripgrep_search", {"query": "TAX-RATE"}, "v1", None)
+    res, _, _, _ = tool_dispatch.run_tool("ripgrep_search", {"query": "TAX-RATE"}, "v1", None)
     h = res["hits"][0]
-    r, docs, _, _ = A.run_tool(
+    r, docs, _, _ = tool_dispatch.run_tool(
         "read_around", {"doc_id": h["doc_id"], "line": h["line"], "window": 2}, "v1", None,
         tool_result_max_bytes=5)
     assert "error" not in r, r
@@ -29,9 +29,9 @@ def test_read_around_sets_text_truncated_when_clipped_by_small_budget():
 
 
 def test_read_around_omits_text_truncated_when_budget_sufficient():
-    res, _, _, _ = A.run_tool("ripgrep_search", {"query": "TAX-RATE"}, "v1", None)
+    res, _, _, _ = tool_dispatch.run_tool("ripgrep_search", {"query": "TAX-RATE"}, "v1", None)
     h = res["hits"][0]
-    r, _, _, _ = A.run_tool(
+    r, _, _, _ = tool_dispatch.run_tool(
         "read_around", {"doc_id": h["doc_id"], "line": h["line"], "window": 2}, "v1", None)
     assert "error" not in r, r
     assert "text_truncated" not in r
@@ -41,10 +41,10 @@ def test_read_around_omits_text_truncated_when_budget_sufficient():
 
 def test_ripgrep_hit_keeps_full_text_and_omits_text_truncated(monkeypatch):
     long_text = "あ" * 1000
-    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: [
+    monkeypatch.setattr(grep_tool, "grep_search", lambda *a, **kw: [
         {"doc_id": "a.md", "line": 1, "span": [1, 1], "text": long_text, "ext": ".md"},
     ])
-    res, _, cites, _ = A.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
+    res, _, cites, _ = tool_dispatch.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
     h = res["hits"][0]
     assert "text_truncated" not in h
     assert h["text"] == long_text
@@ -53,10 +53,10 @@ def test_ripgrep_hit_keeps_full_text_and_omits_text_truncated(monkeypatch):
 
 
 def test_ripgrep_hit_omits_text_truncated_for_short_text(monkeypatch):
-    monkeypatch.setattr(A.grep_tool, "grep_search", lambda *a, **kw: [
+    monkeypatch.setattr(grep_tool, "grep_search", lambda *a, **kw: [
         {"doc_id": "a.md", "line": 1, "span": [1, 1], "text": "短いヒット本文", "ext": ".md"},
     ])
-    res, _, _, _ = A.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
+    res, _, _, _ = tool_dispatch.run_tool("ripgrep_search", {"query": "x"}, "v1", None)
     h = res["hits"][0]
     assert "text_truncated" not in h
 
@@ -68,7 +68,7 @@ def test_es_search_legacy_hit_keeps_full_text(monkeypatch):
     monkeypatch.setattr(es_index, "search", lambda world, q, scope_paths=None, k=20, layer=None, **kw: (
         [{"doc_id": "a.md", "line": 3, "text": long_text, "ext": ".md"}], None))
     monkeypatch.setattr(documents, "world_rel_set", lambda world, **kw: {"a.md"})
-    res, _, cites, _ = A.run_tool("es_search", {"query": "q"}, "v1", None)
+    res, _, cites, _ = tool_dispatch.run_tool("es_search", {"query": "q"}, "v1", None)
     h = res["hits"][0]
     assert "text_truncated" not in h
     assert h["text"] == long_text
@@ -85,9 +85,9 @@ def _setup_parent_return_world(monkeypatch, tmp_path, world: str, hits: list, ra
     der_rag.mkdir(parents=True, exist_ok=True)
     for doc_id, content in rag_files.items():
         (der_rag / (doc_id + ".rag.md")).write_text(content, encoding="utf-8")
-    monkeypatch.setattr(A.worlds, "derived_rag_dir", lambda w: der_rag)
-    monkeypatch.setattr(A.worlds, "derived_md_dir", lambda w: tmp_path / "md")   # legacy 無し
-    monkeypatch.setattr(A.es_index, "search",
+    monkeypatch.setattr(worlds, "derived_rag_dir", lambda w: der_rag)
+    monkeypatch.setattr(worlds, "derived_md_dir", lambda w: tmp_path / "md")   # legacy 無し
+    monkeypatch.setattr(es_index, "search",
                         lambda w, q, scope_paths=None, k=20, layer=None, **kw: (list(hits), None))
     monkeypatch.setattr(documents, "world_rel_set", lambda w, **kw: {h["doc_id"] for h in hits})
 
@@ -100,8 +100,8 @@ def test_es_search_parent_return_chunk_tier_keeps_full_chunk_text(monkeypatch, t
     hits = [{"doc_id": "b.docx", "text": long_text, "ext": ".docx",
             "chunk_id": "c1", "parent_id": "p1", "score": 1.0}]
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {})   # rag.md 無し＝展開不能
-    monkeypatch.setattr(A.es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
-    res, _, _, _ = A.run_tool("es_search", {"query": "q"}, world, None)
+    monkeypatch.setattr(es_index, "chunk_ids_for_parent", lambda w, doc_id, parent_ids, limit=5000: [])
+    res, _, _, _ = tool_dispatch.run_tool("es_search", {"query": "q"}, world, None)
     h = res["hits"][0]
     assert h["tier"] == "chunk"
     assert "text_truncated" not in h
@@ -117,7 +117,7 @@ def test_es_search_parent_return_region_tier_omits_text_truncated(monkeypatch, t
     hits = [{"doc_id": "full.docx", "text": long_text, "ext": ".docx",
             "chunk_id": "cf1", "parent_id": "pf", "score": 1.0}]
     _setup_parent_return_world(monkeypatch, tmp_path, world, hits, {"full.docx": full_md})
-    res, _, _, _ = A.run_tool("es_search", {"query": "q"}, world, None)
+    res, _, _, _ = tool_dispatch.run_tool("es_search", {"query": "q"}, world, None)
     h = res["hits"][0]
     assert h["tier"] == "region"
     assert "text_truncated" not in h

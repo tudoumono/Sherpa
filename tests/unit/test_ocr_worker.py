@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "fixtures/eval/excel_ja/inputs/JPX-015.xlsx"
 PDF_SOURCE = ROOT / "fixtures/eval/office_ja/inputs/OJA-PDF-MEDIUM.pdf"
 GENERATION_ID = "c" * 64
+EMPTY_SNAPSHOT = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
 
 
 class FakeEngine:
@@ -62,6 +63,40 @@ def _picture_route(tmp_path):
     return ir, asset_root, decision, job
 
 
+def _patch_lease(monkeypatch, job, *, renew=True, cached=None):
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: renew)
+    if cached != "unset":
+        monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: cached)
+
+
+def _run_once(ir, asset_root, engine=None, *, current=True, **kwargs):
+    return ocr_worker.run_once(
+        "worker-1", engine=engine or FakeEngine(), canonical_is_current=lambda world, generation: current,
+        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
+        resolve_asset_root=lambda leased: asset_root, **kwargs,
+    )
+
+
+def _run_once_unreadable(engine=None, *, current):
+    """`load_ir` へ到達したら失敗する run_once（本文を読む前に終端すべき経路用）。"""
+    return ocr_worker.run_once(
+        "worker-1", engine=engine or FakeEngine(), canonical_is_current=lambda world, generation: current,
+        load_ir=lambda leased: (_ for _ in ()).throw(AssertionError("must not load")),
+        resolve_source=lambda leased: Path("unreachable"), resolve_asset_root=lambda leased: Path("unreachable"),
+    )
+
+
+def _build_result(ir, decision, prepared, engine):
+    prediction = engine.predict(prepared.image_bytes, media_type=prepared.media_type)
+    return ocr_worker.build_observation_set(
+        ir=ir, decision=decision, prepared=prepared, prediction=prediction,
+        canonical_generation_id=GENERATION_ID, engine=engine,
+    )
+
+
+# ===== profile / model pin =====
+
 def test_paddle_availability_requires_pinned_versions_and_model_hashes(monkeypatch, tmp_path):
     model_root = tmp_path / "official_models"
     for name in (ocr_worker.PADDLE_CPU_PROFILE.detection_model, ocr_worker.PADDLE_CPU_PROFILE.recognition_model):
@@ -94,29 +129,23 @@ def test_paddle_availability_requires_pinned_versions_and_model_hashes(monkeypat
 
 
 def test_model_tree_digest_ignores_downloader_cache_metadata(tmp_path):
-    """model本体が同じなら、再download由来のメタデータ差でhashを変えない（2026-08-16実測の是正）。
-
-    downloaderは `.cache/huggingface/` へ取得時刻・etag・lockを書くため、同一modelを取り直すだけで
-    tree hashが変わり `model_hash_mismatch` で起動できなくなっていた（精度は一致していたのに拒否された）。
-    """
+    # downloader が `.cache/huggingface/` へ書く取得メタデータの差で hash を変えない（変えると同一 model が
+    # `model_hash_mismatch` で起動拒否される）。model 本体が変われば必ず変わる。
     model = tmp_path / "PP-OCRv6_medium_det"
     (model / ".cache" / "huggingface" / "download").mkdir(parents=True)
     (model / "inference.pdiparams").write_bytes(b"weights")
     (model / "inference.yml").write_text("pinned", encoding="utf-8")
     baseline = ocr_worker._tree_digest(model)
 
-    # 取得メタデータだけが変わった状態（＝2回目のdownload）
     (model / ".cache" / "huggingface" / "download" / "inference.pdiparams.metadata").write_text(
         "etag-and-timestamp", encoding="utf-8")
     assert ocr_worker._tree_digest(model) == baseline
 
-    # model本体が変われば必ず変わる（除外が検知を緩めていないこと）
     (model / "inference.pdiparams").write_bytes(b"weights-v2")
     assert ocr_worker._tree_digest(model) != baseline
 
 
 def test_pinned_model_hashes_match_the_distributed_lock_file():
-    """profileのpinとオフライン配布用lockが同じmodelを指す（片方だけ更新して食い違わせない）。"""
     lock = json.loads((ROOT / "docker/ocr-models.lock.json").read_text(encoding="utf-8"))
     locked = {item["name"]: item["tree_sha256"] for item in lock["models"]}
     assert locked[ocr_worker.PADDLE_CPU_PROFILE.detection_model] == \
@@ -127,55 +156,48 @@ def test_pinned_model_hashes_match_the_distributed_lock_file():
     assert ".cache" in lock["tree_hash_excludes"]
 
 
-def test_asset_preparation_rehashes_source_and_asset_and_builds_ocr_only_set(tmp_path):
+@pytest.mark.parametrize("media_type, expected", [
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/bmp", ".bmp"),
+    ("image/webp", ".webp"),
+    ("image/tiff", ".tiff"),
+    ("IMAGE/PNG; charset=binary", ".png"),
+    ("application/octet-stream", ".png"),
+    ("", ".png"),
+    ("image/gif", ".png"),   # Paddle 非対応形式は png 扱いで中身判定に委ねる
+])
+def test_paddle_input_suffix_maps_media_types_to_supported_extensions(media_type, expected):
+    assert ocr_worker._paddle_input_suffix(media_type) == expected
+
+
+# ===== 入力準備・観測集合 =====
+
+@pytest.mark.parametrize("confidence, text, answer_eligible", [
+    pytest.param(0.92, "  A_01  ", True, id="confident-line-answer-eligible"),
+    # 既存の使用可否ルール（MIN_ANSWER_CONFIDENCE）未満は検索可のまま回答材料にしない
+    pytest.param(0.5, "判読不可気味", False, id="low-confidence-not-answer-eligible"),
+])
+def test_asset_preparation_builds_ocr_only_set_with_confidence_rule(tmp_path, confidence, text, answer_eligible):
     ir, asset_root, decision, job = _picture_route(tmp_path)
-    prepared = ocr_worker.prepare_input(
-        job, decision, source_path=SOURCE, asset_root=asset_root,
-    )
-    engine = FakeEngine()
-    prediction = engine.predict(prepared.image_bytes, media_type=prepared.media_type)
-    result = ocr_worker.build_observation_set(
-        ir=ir, decision=decision, prepared=prepared, prediction=prediction,
-        canonical_generation_id=GENERATION_ID, engine=engine,
-    )
+    prepared = ocr_worker.prepare_input(job, decision, source_path=SOURCE, asset_root=asset_root)
 
-    assert ai_observation.validation_errors(result, ir=ir) == []
-    assert result.canonical_generation_id == GENERATION_ID
-    assert result.observations[0].kind == "ocr_text"
-    assert result.observations[0].text == "  A_01  "
-    assert result.observations[0].searchable is True
-    # O1: use_for_answer は行の実測confidence（0.92）を既存の使用可否ルール
-    # （ai_observation.MIN_ANSWER_CONFIDENCE=0.70）と比べて決める。VLM と同じ既存ルールを
-    # 適用しているだけ＝OCR専用の新しい閾値は無い。
-    assert result.observations[0].confidence == 0.92
-    assert result.observations[0].use_for_answer is True
-
-
-def test_low_confidence_ocr_line_is_not_answer_eligible(tmp_path):
-    """O1: confidence が既存の使用可否ルール未満の行は use_for_answer=False のまま
-    （rag.md の「AI観測」レコードには出ない＝検索可のままだが回答材料にはしない）。"""
-    ir, asset_root, decision, job = _picture_route(tmp_path)
-    prepared = ocr_worker.prepare_input(
-        job, decision, source_path=SOURCE, asset_root=asset_root,
-    )
-
-    class LowConfidenceEngine(FakeEngine):
+    class _Engine(FakeEngine):
         def predict(self, image_bytes, *, media_type):
             self.calls += 1
             return ocr_worker.OCRPrediction([
-                ocr_worker.EngineLine(text="判読不可気味", confidence=0.5, bbox=[1, 2, 30, 40], line_id="0"),
-            ])
+                ocr_worker.EngineLine(text=text, confidence=confidence, bbox=[1, 2, 30, 40], line_id="0")])
 
-    engine = LowConfidenceEngine()
-    prediction = engine.predict(prepared.image_bytes, media_type=prepared.media_type)
-    result = ocr_worker.build_observation_set(
-        ir=ir, decision=decision, prepared=prepared, prediction=prediction,
-        canonical_generation_id=GENERATION_ID, engine=engine,
-    )
+    result = _build_result(ir, decision, prepared, _Engine())
+
     assert ai_observation.validation_errors(result, ir=ir) == []
-    assert result.observations[0].confidence == 0.5
-    assert result.observations[0].searchable is True
-    assert result.observations[0].use_for_answer is False
+    assert result.canonical_generation_id == GENERATION_ID
+    obs = result.observations[0]
+    assert obs.kind == "ocr_text"
+    assert obs.text == text
+    assert obs.searchable is True
+    assert obs.confidence == confidence
+    assert obs.use_for_answer is answer_eligible
 
 
 def test_source_hash_is_reused_for_same_stat_and_recomputed_after_change(monkeypatch, tmp_path):
@@ -220,12 +242,8 @@ def test_fixed_page_render_contract_outputs_hash_bound_png(monkeypatch, tmp_path
     ocr_worker._clear_pdf_document_cache()
     monkeypatch.setattr(ocr_worker, "_open_pdf_document", counted_open)
     try:
-        prepared = ocr_worker.prepare_input(
-            job, decision, source_path=PDF_SOURCE, asset_root=tmp_path,
-        )
-        repeated = ocr_worker.prepare_input(
-            job, decision, source_path=PDF_SOURCE, asset_root=tmp_path,
-        )
+        prepared = ocr_worker.prepare_input(job, decision, source_path=PDF_SOURCE, asset_root=tmp_path)
+        repeated = ocr_worker.prepare_input(job, decision, source_path=PDF_SOURCE, asset_root=tmp_path)
     finally:
         ocr_worker._clear_pdf_document_cache()
     assert prepared.image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
@@ -236,6 +254,8 @@ def test_fixed_page_render_contract_outputs_hash_bound_png(monkeypatch, tmp_path
     assert len(opens) == 1
 
 
+# ===== run_once（lease・世代・秘匿・失敗の契約） =====
+
 def test_worker_uses_cache_contract_and_completes_without_changing_canonical(monkeypatch, tmp_path):
     ir, asset_root, decision, job = _picture_route(tmp_path)
     engine = FakeEngine()
@@ -243,20 +263,12 @@ def test_worker_uses_cache_contract_and_completes_without_changing_canonical(mon
     prediction = ocr_worker.OCRPrediction([
         ocr_worker.EngineLine(text="CACHE_01", confidence=0.88, bbox=[1, 1, 20, 20], line_id="cached"),
     ])
+    _patch_lease(monkeypatch, job, cached={"result_payload": prediction.to_payload()})
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "put_cached_result_for_lease", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_job",
+                        lambda job_id, token, **kwargs: completed.update(kwargs) or job)
 
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: {
-        "result_payload": prediction.to_payload(),
-    })
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "put_cached_result", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_job", lambda job_id, token, **kwargs: completed.update(kwargs) or job)
-
-    result = ocr_worker.run_once(
-        "worker-1", engine=engine, canonical_is_current=lambda world, generation: generation == GENERATION_ID,
-        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
-        resolve_asset_root=lambda leased: asset_root,
-    )
+    result = _run_once(ir, asset_root, engine, current=True)
 
     assert result.status == "succeeded"
     assert result.cache_hit is True
@@ -268,36 +280,24 @@ def test_worker_uses_cache_contract_and_completes_without_changing_canonical(mon
 def test_worker_marks_job_stale_before_reading_source(monkeypatch):
     job = {"id": 9, "world": "world-a", "canonical_generation_id": GENERATION_ID, "lease_token": "token"}
     calls = []
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
+    _patch_lease(monkeypatch, job, cached="unset")
     monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_stale", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    result = ocr_worker.run_once(
-        "worker-1", engine=FakeEngine(), canonical_is_current=lambda world, generation: False,
-        load_ir=lambda leased: (_ for _ in ()).throw(AssertionError("must not load")),
-        resolve_source=lambda leased: Path("unreachable"), resolve_asset_root=lambda leased: Path("unreachable"),
-    )
+    result = _run_once_unreadable(current=False)
     assert result.status == "stale"
     assert calls and calls[0][0] == (9, "token")
 
 
 def test_worker_excludes_sensitive_source_before_reading_body(monkeypatch, tmp_path):
-    """更新前に投入された秘匿名（`credentials.png` 等）ジョブは `load_ir`（本文＝画像読み取り）へ
-    到達する前に対象外化する（`text_kind.is_sensitive_doc_id`・台帳 #92）。再試行させない
-    （`mark_stale` で終端化）・失敗件数に数えない（`status="excluded_sensitive"`≠failed）。"""
-    ir, asset_root, _decision, job = _picture_route(tmp_path)
-    del ir, asset_root
+    # 更新前に投入された秘匿名ジョブは `load_ir`（本文＝画像読み取り）へ到達する前に対象外化する。
+    # 再試行させない（mark_stale で終端）・失敗件数に数えない（excluded_sensitive≠failed）。
+    _ir, _asset_root, _decision, job = _picture_route(tmp_path)
     job = {**job, "source_rel_path": "credentials.png"}
     calls = []
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
+    _patch_lease(monkeypatch, job, cached="unset")
     monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_stale", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    result = ocr_worker.run_once(
-        "worker-1", engine=FakeEngine(), canonical_is_current=lambda world, generation: True,
-        load_ir=lambda leased: (_ for _ in ()).throw(AssertionError("must not load sensitive body")),
-        resolve_source=lambda leased: Path("unreachable"), resolve_asset_root=lambda leased: Path("unreachable"),
-    )
+    result = _run_once_unreadable(current=True)
     assert result.status == "excluded_sensitive"
     assert calls and calls[0][0] == (job["id"], job["lease_token"])
 
@@ -306,23 +306,13 @@ def test_fake_engine_protocol_still_supports_successful_non_cached_unit_run(monk
     ir, asset_root, _decision, job = _picture_route(tmp_path)
     engine = FakeEngine()
     commits = []
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: None)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "put_cached_result_for_lease",
-        lambda *args, **kwargs: {"result_payload": args[-1]},
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "complete_job",
-        lambda job_id, token, **kwargs: commits.append(kwargs) or {**job, "status": "succeeded"},
-    )
+    _patch_lease(monkeypatch, job, cached=None)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "put_cached_result_for_lease",
+                        lambda *args, **kwargs: {"result_payload": args[-1]})
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_job",
+                        lambda job_id, token, **kwargs: commits.append(kwargs) or {**job, "status": "succeeded"})
 
-    result = ocr_worker.run_once(
-        "worker-1", engine=engine, canonical_is_current=lambda world, generation: True,
-        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
-        resolve_asset_root=lambda leased: asset_root,
-    )
+    result = _run_once(ir, asset_root, engine)
 
     assert result.status == "succeeded" and result.cache_hit is False
     assert engine.calls == 1
@@ -336,110 +326,128 @@ def test_failed_ocr_run_keeps_canonical_artifacts_byte_identical(monkeypatch, tm
     (canonical / "design.evidence.json").write_text(evidence_ir.to_json_str(ir), encoding="utf-8")
     (canonical / "design.rag.md").write_text("原値はCANONICAL_01。\n", encoding="utf-8")
     (canonical / "design.rag_chunks.jsonl").write_text('{"search_text":"CANONICAL_01"}\n', encoding="utf-8")
-    before = {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in canonical.iterdir() if path.is_file()
-    }
+
+    def _digests():
+        return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in canonical.iterdir() if path.is_file()}
+
+    before = _digests()
 
     class FailingEngine(FakeEngine):
         def predict(self, image_bytes: bytes, *, media_type: str) -> ocr_worker.OCRPrediction:
             raise RuntimeError("synthetic OCR failure")
 
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: None)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "fail_job",
-        lambda *args, **kwargs: {**job, "status": "queued"},
-    )
+    _patch_lease(monkeypatch, job, cached=None)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "fail_job", lambda *args, **kwargs: {**job, "status": "queued"})
 
-    result = ocr_worker.run_once(
-        "worker-1", engine=FailingEngine(), canonical_is_current=lambda world, generation: True,
-        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
-        resolve_asset_root=lambda leased: asset_root,
-    )
+    result = _run_once(ir, asset_root, FailingEngine())
 
-    after = {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in canonical.iterdir() if path.is_file()
-    }
     assert result.status == "failed" and result.error_code == "engine_failure"
-    assert after == before
+    assert _digests() == before
 
 
-def test_standard_publisher_runs_post_publish_before_marking_jobs(monkeypatch, tmp_path):
+def test_lease_loss_during_monitored_inference_never_commits_cache_or_job(monkeypatch, tmp_path):
+    ir, asset_root, _decision, job = _picture_route(tmp_path)
+    renewals = iter([True, True, False])
+    writes = []
+
+    class MonitoredFake(FakeEngine):
+        def predict_monitored(self, image_bytes, *, media_type, timeout_seconds, on_tick):
+            time.sleep(0.01)
+            on_tick()
+            raise AssertionError("lease loss must interrupt before a prediction is returned")
+
+    _patch_lease(monkeypatch, job, cached=None)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: next(renewals))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "put_cached_result_for_lease",
+                        lambda *args, **kwargs: writes.append("cache"))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_job", lambda *args, **kwargs: writes.append("complete"))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "fail_job", lambda *args, **kwargs: writes.append("failed"))
+
+    result = _run_once(ir, asset_root, MonitoredFake(), lease_renew_interval_seconds=0.001)
+
+    assert result.status == "lease_lost"
+    assert writes == []
+
+
+def test_unreadable_image_is_cancelled_once_without_retry(monkeypatch, tmp_path):
+    ir, asset_root, decision, job = _picture_route(tmp_path)
+    wmf = b"\xd7\xcd\xc6\x9a" + b"\x00" * 32
+    (asset_root / decision.asset_rel_path).write_bytes(wmf)
+    decision = ocr_router.OCRRouteDecision(
+        **{**asdict(decision), "asset_sha256": "sha256:" + hashlib.sha256(wmf).hexdigest(),
+           "pixel_size": None},
+    )
+    job = {**job, "route_input": asdict(decision)}
+    failures = []
+    cancels = []
+    _patch_lease(monkeypatch, job, cached=None)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "fail_job",
+                        lambda *args, **kwargs: failures.append(kwargs) or {**job, "status": "failed"})
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "cancel_unsupported_image_job",
+                        lambda *args: cancels.append(args) or {**job, "status": "cancelled"})
+
+    result = _run_once(ir, asset_root)
+
+    assert result.status == "cancelled" and result.error_code == "unsupported_image_format"
+    assert failures == []                                   # 失敗には数えない
+    assert cancels == [(job["id"], job["lease_token"])]
+
+
+# ===== 標準 publisher（世代確認・world_lock・公開後フック） =====
+
+def _patch_snapshot(monkeypatch, *, snapshot=EMPTY_SNAPSHOT, rows=(), publish=None):
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(rows))
+    monkeypatch.setattr(ocr_worker.observation_render, "publish_snapshot_stream",
+                        publish or (lambda *args, **kwargs: {"status": "published"}))
+
+
+def _no_ir(row):
+    raise AssertionError("no rows")
+
+
+def _publish_job():
+    return {"world": "world-a", "canonical_generation_id": GENERATION_ID}
+
+
+@pytest.mark.parametrize("post_publish_fails", [False, True], ids=["success", "post-publish-fails"])
+def test_standard_publisher_runs_post_publish_before_marking_jobs(monkeypatch, tmp_path, post_publish_fails):
+    # 公開後フック（再索引）が先・成功した時だけ job を公開済みにする。失敗は握り潰さず伝播し、job は未公開のまま。
     events = []
-    snapshot = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(()))
-    monkeypatch.setattr(
-        ocr_worker.observation_render,
-        "publish_snapshot_stream",
-        lambda *args, **kwargs: {"status": "published"},
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs,
-        "mark_snapshot_artifacts_published",
-        lambda world, generation, selected: events.append(("marked", world, generation, selected)),
-    )
+    _patch_snapshot(monkeypatch)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
+                        lambda world, generation, selected: events.append(("marked", world, generation, selected)))
     monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
+
+    def _reindex(world, generation):
+        if post_publish_fails:
+            raise RuntimeError("index unavailable")
+        events.append(("reindexed", world, generation))
+
     publisher = ocr_worker.build_standard_publish_callback(
         resolve_derived_root=lambda world: tmp_path,
         canonical_is_current=lambda world, generation: True,
-        load_ir=lambda row: (_ for _ in ()).throw(AssertionError("no rows")),
-        on_published=lambda world, generation: events.append(("reindexed", world, generation)),
+        load_ir=_no_ir,
+        on_published=_reindex,
     )
 
-    publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
-
-    assert events == [
-        ("reindexed", "world-a", GENERATION_ID),
-        ("marked", "world-a", GENERATION_ID, snapshot),
-    ]
-
-
-def test_standard_publisher_keeps_jobs_unpublished_when_post_publish_fails(monkeypatch, tmp_path):
-    marked = []
-    snapshot = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(()))
-    monkeypatch.setattr(
-        ocr_worker.observation_render,
-        "publish_snapshot_stream",
-        lambda *args, **kwargs: {"status": "published"},
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
-        lambda *args: marked.append(args),
-    )
-    monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
-    publisher = ocr_worker.build_standard_publish_callback(
-        resolve_derived_root=lambda world: tmp_path,
-        canonical_is_current=lambda world, generation: True,
-        load_ir=lambda row: (_ for _ in ()).throw(AssertionError("no rows")),
-        on_published=lambda world, generation: (_ for _ in ()).throw(RuntimeError("index unavailable")),
-    )
-
-    try:
-        publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
-    except RuntimeError as exc:
-        assert str(exc) == "index unavailable"
+    if post_publish_fails:
+        with pytest.raises(RuntimeError, match="^index unavailable$"):
+            publisher(_publish_job(), None)
+        assert events == []
     else:
-        raise AssertionError("post-publish failure must propagate")
-
-    assert marked == []
+        publisher(_publish_job(), None)
+        assert events == [
+            ("reindexed", "world-a", GENERATION_ID),
+            ("marked", "world-a", GENERATION_ID, EMPTY_SNAPSHOT),
+        ]
 
 
 def test_standard_publisher_rechecks_generation_and_reindexes_inside_world_lock(monkeypatch, tmp_path):
     events = []
     lock_depth = 0
-    snapshot = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(()))
-    monkeypatch.setattr(
-        ocr_worker.observation_render, "publish_snapshot_stream",
-        lambda *args, **kwargs: {"status": "published"},
-    )
+    _patch_snapshot(monkeypatch)
 
     @contextmanager
     def locked(world):
@@ -452,136 +460,127 @@ def test_standard_publisher_rechecks_generation_and_reindexes_inside_world_lock(
             lock_depth -= 1
             events.append(("lock_exit", world))
 
-    def current(world, generation):
-        assert lock_depth == 1
-        events.append(("current", world, generation))
-        return True
-
-    def reindex(world, generation):
-        assert lock_depth == 1
-        events.append(("reindex", world, generation))
-
-    def collect(root, *, active_canonical_generation_id):
-        assert lock_depth == 1
-        events.append(("gc", root, active_canonical_generation_id))
-
-    def mark(world, generation, selected):
-        assert lock_depth == 1
-        events.append(("mark", world, generation, selected))
+    def inside_lock(name):
+        def _record(*args, **kwargs):
+            assert lock_depth == 1
+            events.append((name, *args))
+            return True
+        return _record
 
     monkeypatch.setattr(ocr_worker, "world_lock", locked)
-    monkeypatch.setattr(ocr_worker, "garbage_collect_observation_generations", collect)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published", mark)
+    monkeypatch.setattr(ocr_worker, "garbage_collect_observation_generations",
+                        lambda root, *, active_canonical_generation_id: inside_lock("gc")(root))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published", inside_lock("mark"))
     publisher = ocr_worker.build_standard_publish_callback(
         resolve_derived_root=lambda _world: tmp_path,
-        canonical_is_current=current,
-        load_ir=lambda row: (_ for _ in ()).throw(AssertionError("no rows")),
-        on_published=reindex,
+        canonical_is_current=inside_lock("current"),
+        load_ir=_no_ir,
+        on_published=inside_lock("reindex"),
     )
 
-    publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
+    publisher(_publish_job(), None)
 
     assert [event[0] for event in events] == ["lock_enter", "current", "reindex", "gc", "mark", "lock_exit"]
 
 
 def test_standard_publisher_stale_after_pointer_publish_never_reindexes_or_marks(monkeypatch, tmp_path):
     events = []
-    snapshot = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(()))
-    monkeypatch.setattr(
-        ocr_worker.observation_render, "publish_snapshot_stream",
-        lambda *args, **kwargs: {"status": "published"},
-    )
+    _patch_snapshot(monkeypatch)
     monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
-    monkeypatch.setattr(
-        ocr_worker, "garbage_collect_observation_generations",
-        lambda *args, **kwargs: events.append("gc"),
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
-        lambda *args, **kwargs: events.append("mark"),
-    )
+    monkeypatch.setattr(ocr_worker, "garbage_collect_observation_generations",
+                        lambda *args, **kwargs: events.append("gc"))
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
+                        lambda *args, **kwargs: events.append("mark"))
     publisher = ocr_worker.build_standard_publish_callback(
         resolve_derived_root=lambda _world: tmp_path,
         canonical_is_current=lambda world, generation: False,
-        load_ir=lambda row: (_ for _ in ()).throw(AssertionError("no rows")),
+        load_ir=_no_ir,
         on_published=lambda world, generation: events.append("reindex"),
     )
 
-    publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
+    publisher(_publish_job(), None)
 
     assert events == []
 
 
-def test_runtime_reindex_defensively_rechecks_generation_before_es_delete(monkeypatch, tmp_path):
-    from sherpa import es_index, worlds
+def test_standard_publisher_skips_sensitive_succeeded_rows_without_loading_ir(monkeypatch, tmp_path):
+    # 更新前に成功した秘匿名ジョブは再公開経路でも Evidence を読み直さず、records にも出さない。
+    loaded = []
+    captured = {}
+    rows = [{"source_rel_path": "img/credentials.png", "result_payload": {}, "result_observation_set_hash": "x"}]
+
+    def fake_publish_snapshot_stream(*args, **kwargs):
+        captured["n"] = sum(1 for _ in kwargs["records"])
+        return {"status": "published"}
+
+    _patch_snapshot(monkeypatch, snapshot={"row_count": 1, "min_id": 1, "max_id": 1, "id_sum": 1},
+                    rows=rows, publish=fake_publish_snapshot_stream)
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published", lambda *a: None)
+    monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
+    publisher = ocr_worker.build_standard_publish_callback(
+        resolve_derived_root=lambda world: tmp_path,
+        canonical_is_current=lambda world, generation: True,
+        load_ir=lambda row: loaded.append(row) or object(),
+        on_published=lambda world, generation: None,
+    )
+    publisher(_publish_job(), None)
+    assert loaded == []
+    assert captured.get("n") == 0
+
+
+def _patch_runtime_worlds(monkeypatch, tmp_path, *, active=GENERATION_ID):
+    from sherpa import worlds
     from sherpa.ingest import derived_generation
 
-    active_generations = iter([GENERATION_ID, "d" * 64])
-    indexed = []
-    marked = []
-    snapshot = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
-    monkeypatch.setattr(derived_generation, "active_generation_id", lambda _root: next(active_generations))
+    monkeypatch.setattr(derived_generation, "active_generation_id",
+                        active if callable(active) else (lambda _root: active))
     monkeypatch.setattr(worlds, "derived_dir", lambda _world: tmp_path / "canonical")
     monkeypatch.setattr(worlds, "observation_dir", lambda _world, **_kwargs: tmp_path / "observations")
     monkeypatch.setattr(worlds, "validate_ocr_registered_sources", lambda: tmp_path)
     monkeypatch.setattr(worlds, "validate_ocr_source_root", lambda root, **_kwargs: Path(root))
     monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(()))
-    monkeypatch.setattr(
-        ocr_worker.observation_render, "publish_snapshot_stream",
-        lambda *args, **kwargs: {"status": "published"},
-    )
+    _patch_snapshot(monkeypatch)
+
+
+def test_runtime_reindex_defensively_rechecks_generation_before_es_delete(monkeypatch, tmp_path):
+    from sherpa import es_index
+
+    active_generations = iter([GENERATION_ID, "d" * 64])
+    indexed = []
+    marked = []
+    _patch_runtime_worlds(monkeypatch, tmp_path, active=lambda _root: next(active_generations))
     monkeypatch.setattr(es_index, "index_world", lambda *args, **kwargs: indexed.append((args, kwargs)))
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
-        lambda *args, **kwargs: marked.append((args, kwargs)),
-    )
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
+                        lambda *args, **kwargs: marked.append((args, kwargs)))
     publisher = ocr_worker._runtime_callbacks()[-1]
 
     with pytest.raises(ocr_worker.OCRBindingError, match="changed before observation reindex"):
-        publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
+        publisher(_publish_job(), None)
 
     assert indexed == []
     assert marked == []
 
 
 def test_runtime_reindex_observations_never_touches_es_or_human_md_marker(monkeypatch, tmp_path):
-    """`reindex_observations`（OCR観測の公開直後フック）は ES・`.human_md_es_sig` マーカーへ
-    一切触れない（裁定: ocr_worker は隔離 profile で `/derived` read-only・ES 到達不可のため、
-    ここで触れると通常の OCR 公開のたびに必ず失敗する）。ES（legacy チャンク/kNN）は観測
-    チャンクを読まないため、OCR 公開後の ES 反映自体が不要（grep 経路のみで足りる）。"""
-    from sherpa import es_index, worlds
-    from sherpa.ingest import derived_generation, office_md, worker as ingest_worker
+    # ocr_worker は隔離 profile（`/derived` read-only・ES 到達不可）のため、観測公開後フックが ES や
+    # `.human_md_es_sig` へ触れると通常の公開のたびに必ず失敗する（ES は観測チャンクを読まず grep 経路で足りる）。
+    from sherpa import es_index
+    from sherpa.ingest import office_md, worker as ingest_worker
 
-    monkeypatch.setattr(derived_generation, "active_generation_id", lambda _root: GENERATION_ID)
-    monkeypatch.setattr(worlds, "derived_dir", lambda _world: tmp_path / "canonical")
-    monkeypatch.setattr(worlds, "observation_dir", lambda _world, **_kwargs: tmp_path / "observations")
-    monkeypatch.setattr(worlds, "validate_ocr_registered_sources", lambda: tmp_path)
-    monkeypatch.setattr(worlds, "validate_ocr_source_root", lambda root, **_kwargs: Path(root))
-    monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
-    snapshot = {"row_count": 0, "min_id": None, "max_id": None, "id_sum": 0}
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(()))
-    monkeypatch.setattr(
-        ocr_worker.observation_render, "publish_snapshot_stream",
-        lambda *args, **kwargs: {"status": "published"},
-    )
+    _patch_runtime_worlds(monkeypatch, tmp_path)
     monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published", lambda *args, **kwargs: None)
 
     def _must_not_call(name):
         def _boom(*a, **kw):
             raise AssertionError(f"reindex_observations は {name} を呼んではいけない（隔離 profile では必ず失敗する）")
         return _boom
-    monkeypatch.setattr(ingest_worker, "index_world_with_human_md_holdback", _must_not_call("index_world_with_human_md_holdback"))
+    monkeypatch.setattr(ingest_worker, "index_world_with_human_md_holdback",
+                        _must_not_call("index_world_with_human_md_holdback"))
     monkeypatch.setattr(es_index, "index_world", _must_not_call("es_index.index_world"))
     monkeypatch.setattr(office_md, "drop_human_md_es_sig_marker", _must_not_call("drop_human_md_es_sig_marker"))
     monkeypatch.setattr(office_md, "confirm_human_md_es_sig", _must_not_call("confirm_human_md_es_sig"))
 
-    publisher = ocr_worker._runtime_callbacks()[-1]
-    publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)  # 例外が飛べば失敗
+    ocr_worker._runtime_callbacks()[-1](_publish_job(), None)   # 例外が飛べば失敗
 
 
 def test_runtime_callbacks_fail_closed_before_worker_loop_when_ocr_root_is_invalid(monkeypatch, tmp_path):
@@ -617,6 +616,8 @@ def test_runtime_source_resolver_rechecks_ocr_root_for_each_job(monkeypatch, tmp
         resolve_source({"world": "new-world", "source_rel_path": "image.png"})
 
 
+# ===== supervisor・世代 GC・シグナル =====
+
 def test_paddle_supervisor_enforces_wall_clock_timeout_and_kills_hung_child(tmp_path):
     supervisor = ocr_worker.PaddleProcessSupervisor(
         tmp_path, start_method="fork", process_target=_hanging_inference_child,
@@ -633,42 +634,10 @@ def test_paddle_supervisor_enforces_wall_clock_timeout_and_kills_hung_child(tmp_
     assert supervisor._process is None
 
 
-def test_lease_loss_during_monitored_inference_never_commits_cache_or_job(monkeypatch, tmp_path):
-    ir, asset_root, _decision, job = _picture_route(tmp_path)
-    renewals = iter([True, True, False])
-    writes = []
-
-    class MonitoredFake(FakeEngine):
-        def predict_monitored(self, image_bytes, *, media_type, timeout_seconds, on_tick):
-            time.sleep(0.01)
-            on_tick()
-            raise AssertionError("lease loss must interrupt before a prediction is returned")
-
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: next(renewals))
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: None)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "put_cached_result_for_lease", lambda *args, **kwargs: writes.append("cache"),
-    )
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_job", lambda *args, **kwargs: writes.append("complete"))
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "fail_job", lambda *args, **kwargs: writes.append("failed"))
-
-    result = ocr_worker.run_once(
-        "worker-1", engine=MonitoredFake(), canonical_is_current=lambda world, generation: True,
-        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
-        resolve_asset_root=lambda leased: asset_root, lease_renew_interval_seconds=0.001,
-    )
-
-    assert result.status == "lease_lost"
-    assert writes == []
-
-
 def test_snapshot_callback_runs_only_when_generation_becomes_terminal(monkeypatch):
     readiness = iter([False, True])
     published = []
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "generation_ready_for_publication", lambda *args: next(readiness),
-    )
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "generation_ready_for_publication", lambda *args: next(readiness))
 
     def callback(job, observation):
         published.append((job["id"], observation))
@@ -681,38 +650,47 @@ def test_snapshot_callback_runs_only_when_generation_becomes_terminal(monkeypatc
     assert published == [(2, None)]
 
 
-def test_refresh_worker_streams_manifests_and_persists_cursor(monkeypatch, tmp_path):
-    ir, asset_root, _decision, job = _picture_route(tmp_path)
-    del asset_root
+def _refresh_world(tmp_path, source_rel, refresh_id):
+    ir, _asset_root, _decision, _job = _picture_route(tmp_path)
     generation_root = tmp_path / "canonical"
-    route_path = generation_root / f"{job['source_rel_path']}.ocr_route.json"
-    evidence_path = generation_root / f"{job['source_rel_path']}.evidence.json"
+    route_path = generation_root / f"{source_rel}.ocr_route.json"
     route_path.parent.mkdir(parents=True)
-    source_manifest = ocr_router.build_manifest(ir, source_rel_path=job["source_rel_path"], assets=[])
-    route_path.write_text(ocr_router.to_json_str(source_manifest), encoding="utf-8")
-    evidence_path.write_text(evidence_ir.to_json_str(ir), encoding="utf-8")
+    route_path.write_text(
+        ocr_router.to_json_str(ocr_router.build_manifest(ir, source_rel_path=source_rel, assets=[])),
+        encoding="utf-8")
+    (generation_root / f"{source_rel}.evidence.json").write_text(evidence_ir.to_json_str(ir), encoding="utf-8")
     refresh = {
-        "id": 7, "world": "world-a", "canonical_generation_id": GENERATION_ID,
+        "id": refresh_id, "world": "world-a", "canonical_generation_id": GENERATION_ID,
         "engine_profile_hash": ocr_worker.profile_hash(), "lease_token": "refresh-token",
         "cursor_rel_path": None,
     }
-    progress = []
+    return generation_root, refresh
+
+
+def _patch_refresh(monkeypatch, refresh, enqueue_calls, progress):
     monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_refresh_run", lambda *args, **kwargs: refresh)
     monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_refresh_run", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "enqueue_manifest_jobs", lambda *args, **kwargs: [{"id": 1}],
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "update_refresh_run_progress",
-        lambda *args, **kwargs: progress.append(kwargs) or True,
-    )
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "enqueue_manifest_jobs",
+                        lambda *args, **kwargs: enqueue_calls.append(args) or [{"id": 1}])
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "update_refresh_run_progress",
+                        lambda *args, **kwargs: progress.append(kwargs) or True)
     monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_refresh_run", lambda *args, **kwargs: refresh)
 
-    result = ocr_worker.run_refresh_once(
+
+def _run_refresh(generation_root):
+    return ocr_worker.run_refresh_once(
         "worker-1", engine_profile_hash=ocr_worker.profile_hash(),
         canonical_is_current=lambda world, generation: True,
         resolve_generation_root=lambda world, generation: generation_root,
     )
+
+
+def test_refresh_worker_streams_manifests_and_persists_cursor(monkeypatch, tmp_path):
+    generation_root, refresh = _refresh_world(tmp_path, "excel/JPX-015.xlsx", 7)
+    enqueue_calls, progress = [], []
+    _patch_refresh(monkeypatch, refresh, enqueue_calls, progress)
+
+    result = _run_refresh(generation_root)
 
     assert result.status == "refresh_completed"
     assert result.manifests_processed == 1 and result.jobs_enqueued == 1
@@ -720,47 +698,14 @@ def test_refresh_worker_streams_manifests_and_persists_cursor(monkeypatch, tmp_p
 
 
 def test_refresh_worker_excludes_sensitive_evidence_and_does_not_reenqueue(monkeypatch, tmp_path):
-    """`run_refresh_once` は秘匿名（`credentials.png` 等）の Evidence を読まずに除外し、
-    再投入しない（`text_kind.is_sensitive_doc_id`・台帳 #92）——`evidence_ir.from_json_str` へ
-    到達させない・`enqueue_manifest_jobs` を呼ばない。"""
-    ir, asset_root, _decision, _job = _picture_route(tmp_path)
-    del asset_root
-    generation_root = tmp_path / "canonical"
-    sensitive_rel = "credentials.png"
-    route_path = generation_root / f"{sensitive_rel}.ocr_route.json"
-    evidence_path = generation_root / f"{sensitive_rel}.evidence.json"
-    route_path.parent.mkdir(parents=True)
-    source_manifest = ocr_router.build_manifest(ir, source_rel_path=sensitive_rel, assets=[])
-    route_path.write_text(ocr_router.to_json_str(source_manifest), encoding="utf-8")
-    evidence_path.write_text(evidence_ir.to_json_str(ir), encoding="utf-8")
-    refresh = {
-        "id": 8, "world": "world-a", "canonical_generation_id": GENERATION_ID,
-        "engine_profile_hash": ocr_worker.profile_hash(), "lease_token": "refresh-token",
-        "cursor_rel_path": None,
-    }
-    enqueue_calls = []
-    progress = []
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_refresh_run", lambda *args, **kwargs: refresh)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_refresh_run", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "enqueue_manifest_jobs",
-        lambda *args, **kwargs: enqueue_calls.append(args) or [{"id": 1}],
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "update_refresh_run_progress",
-        lambda *args, **kwargs: progress.append(kwargs) or True,
-    )
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "complete_refresh_run", lambda *args, **kwargs: refresh)
-    monkeypatch.setattr(
-        ocr_worker.evidence_ir, "from_json_str",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not read sensitive evidence")),
-    )
+    # 秘匿名の Evidence は読まず（`from_json_str` へ到達させない）、再投入もしない。
+    generation_root, refresh = _refresh_world(tmp_path, "credentials.png", 8)
+    enqueue_calls, progress = [], []
+    _patch_refresh(monkeypatch, refresh, enqueue_calls, progress)
+    monkeypatch.setattr(ocr_worker.evidence_ir, "from_json_str",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not read sensitive evidence")))
 
-    result = ocr_worker.run_refresh_once(
-        "worker-1", engine_profile_hash=ocr_worker.profile_hash(),
-        canonical_is_current=lambda world, generation: True,
-        resolve_generation_root=lambda world, generation: generation_root,
-    )
+    result = _run_refresh(generation_root)
 
     assert result.status == "refresh_completed"
     assert result.manifests_processed == 0 and result.jobs_enqueued == 0
@@ -784,9 +729,7 @@ def test_observation_generation_gc_keeps_pointer_current_and_previous(tmp_path):
         "previous_observation_generation_id": previous,
     }), encoding="utf-8")
 
-    result = ocr_worker.garbage_collect_observation_generations(
-        tmp_path, active_canonical_generation_id=active,
-    )
+    result = ocr_worker.garbage_collect_observation_generations(tmp_path, active_canonical_generation_id=active)
 
     assert {path.name for path in (base / active).iterdir()} == {current, previous, ".staging-concurrent"}
     assert not (base / old_canonical).exists()
@@ -833,89 +776,8 @@ def test_sigterm_sets_stop_flag_and_records_stopping_heartbeat(monkeypatch, tmp_
         ),
     )
     monkeypatch.setattr(ocr_worker, "run_once", fake_run_once)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "record_worker_heartbeat",
-        lambda *args, **kwargs: heartbeat_statuses.append(kwargs["status"]) or {},
-    )
+    monkeypatch.setattr(ocr_worker.ocr_jobs, "record_worker_heartbeat",
+                        lambda *args, **kwargs: heartbeat_statuses.append(kwargs["status"]) or {})
 
     assert ocr_worker.main(["--worker-id", "test-worker", "--poll-seconds", "0.01"]) == 0
     assert heartbeat_statuses[-1] == "stopping"
-
-
-def test_standard_publisher_skips_sensitive_succeeded_rows_without_loading_ir(monkeypatch, tmp_path):
-    """更新前に成功した秘匿名ジョブ（credentials.png）は再公開経路でも Evidence を読み直さない。"""
-    events = []
-    loaded = []
-    snapshot = {"row_count": 1, "min_id": 1, "max_id": 1, "id_sum": 1}
-    rows = [{"source_rel_path": "img/credentials.png", "result_payload": {}, "result_observation_set_hash": "x"}]
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "succeeded_results_snapshot", lambda *args: snapshot)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "iter_succeeded_results", lambda *args: iter(rows))
-    captured = {}
-
-    def fake_publish_snapshot_stream(*args, **kwargs):
-        # records（generator）を消費して、秘匿行が yield されない（＝load_ir も呼ばれない）ことを確かめる
-        captured["n"] = sum(1 for _ in kwargs["records"])
-        return {"status": "published"}
-
-    monkeypatch.setattr(ocr_worker.observation_render, "publish_snapshot_stream", fake_publish_snapshot_stream)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "mark_snapshot_artifacts_published",
-                        lambda world, generation, selected: events.append("marked"))
-    monkeypatch.setattr(ocr_worker, "world_lock", lambda world: nullcontext())
-    publisher = ocr_worker.build_standard_publish_callback(
-        resolve_derived_root=lambda world: tmp_path,
-        canonical_is_current=lambda world, generation: True,
-        load_ir=lambda row: loaded.append(row) or object(),
-        on_published=lambda world, generation: events.append("reindexed"),
-    )
-    publisher({"world": "world-a", "canonical_generation_id": GENERATION_ID}, None)
-    assert loaded == []                 # 秘匿行では load_ir を呼ばない
-    assert captured.get("n") == 0       # 秘匿行は records から出ない
-
-
-
-def test_paddle_input_suffix_maps_media_types_to_supported_extensions():
-    """PaddleOCR は拡張子で入力形式を判定する——PNG/JPEG 以外（BMP・WebP・TIFF・未知）を `.img` の
-    ような対応外の拡張子で渡すと中身を見ずに拒否され、ジョブが必ず失敗する。未知は `.png` に倒す。"""
-    assert ocr_worker._paddle_input_suffix("image/png") == ".png"
-    assert ocr_worker._paddle_input_suffix("image/jpeg") == ".jpg"
-    assert ocr_worker._paddle_input_suffix("image/bmp") == ".bmp"
-    assert ocr_worker._paddle_input_suffix("image/webp") == ".webp"
-    assert ocr_worker._paddle_input_suffix("image/tiff") == ".tiff"
-    assert ocr_worker._paddle_input_suffix("IMAGE/PNG; charset=binary") == ".png"
-    assert ocr_worker._paddle_input_suffix("application/octet-stream") == ".png"
-    assert ocr_worker._paddle_input_suffix("") == ".png"
-    assert ocr_worker._paddle_input_suffix("image/gif") == ".png"   # Paddle 非対応形式は png 扱いで中身判定に委ねる
-
-
-def test_unreadable_image_is_cancelled_once_without_retry(monkeypatch, tmp_path):
-    ir, asset_root, decision, job = _picture_route(tmp_path)
-    wmf = b"\xd7\xcd\xc6\x9a" + b"\x00" * 32
-    (asset_root / decision.asset_rel_path).write_bytes(wmf)
-    decision = ocr_router.OCRRouteDecision(
-        **{**asdict(decision), "asset_sha256": "sha256:" + hashlib.sha256(wmf).hexdigest(),
-           "pixel_size": None},
-    )
-    job = {**job, "route_input": asdict(decision)}
-    failures = []
-    cancels = []
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "lease_next", lambda worker_id, lease_seconds: job)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "renew_lease", lambda *args, **kwargs: True)
-    monkeypatch.setattr(ocr_worker.ocr_jobs, "get_cached_result", lambda *args: None)
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "fail_job",
-        lambda *args, **kwargs: failures.append(kwargs) or {**job, "status": "failed"},
-    )
-    monkeypatch.setattr(
-        ocr_worker.ocr_jobs, "cancel_unsupported_image_job",
-        lambda *args: cancels.append(args) or {**job, "status": "cancelled"},
-    )
-
-    result = ocr_worker.run_once(
-        "worker-1", engine=FakeEngine(), canonical_is_current=lambda world, generation: True,
-        load_ir=lambda leased: ir, resolve_source=lambda leased: SOURCE,
-        resolve_asset_root=lambda leased: asset_root,
-    )
-
-    assert result.status == "cancelled" and result.error_code == "unsupported_image_format"
-    assert failures == []                                   # 失敗には数えない
-    assert cancels == [(job["id"], job["lease_token"])]

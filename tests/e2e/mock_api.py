@@ -69,9 +69,8 @@ GRAPH = {
         {"source": "batch:w1:billing", "target": "module:w1:TAXCALC", "type": "INVOKES",
          "status": "active"},
     ],
-    # GraphCounts と IngestPreviewCounts は同一の `preview_service.py::_counts()` が作る同一形
-    # （K12・entities_static/relations_static は残置＝全件 static なので値は entities/relations と一致）。
-    "counts": {"entities": 4, "entities_static": 4, "relations": 3, "relations_static": 3,
+    # GraphCounts と IngestPreviewCounts は同一の `preview_service.py::_counts()` が作る同一形。
+    "counts": {"entities": 4, "relations": 3,
               "deprecated": 0, "hidden": 0, "documents": 3},
     # ②graph 軽量化（段階読み込み）: 4 ノードは既定 limit に収まる＝非truncated（実 API と同じ応答形）。
     "total_nodes": 4, "total_edges": 3, "truncated": False,
@@ -85,10 +84,7 @@ PREVIEW = {
     # 実 API（doc_ledger.control_diagnostics 経由）は importance_diagnostics も常に持つ
     # （`_重要度.txt` の構文診断・無ければ空リスト）。
     "world": "w1", "label": "4期更改", "issues": [], "importance_diagnostics": [],
-    # ソース正典化（K12・実 schemas.py::IngestPreviewCounts で確認済み）: entities_llm/entities_both/
-    # relations_llm/relations_both は撤去済み（全件 static のため無意味）。entities_static/
-    # relations_static 自体は残る（値は entities/relations と常に一致）。
-    "counts": {"entities": 4, "entities_static": 4, "relations": 3, "relations_static": 3,
+    "counts": {"entities": 4, "relations": 3,
                "deprecated": 0, "hidden": 0, "documents": 3},
     # フェーズ7-1: 実 doc（doc_ledger.py::preview_documents）は phase/category/label/reason も常に持つ
     # （旧モックは欠落＝実ドリフト是正。reason は失敗時のみ非 None・他は None）。
@@ -172,7 +168,7 @@ IMPACT_ANSWER = {
     ],
 }
 
-# 送信の既定 SSE 応答（GET /chat/turns/{turn_id}/stream・後方互換の GET /chat/stream 共通）。
+# 送信の既定 SSE 応答（GET /chat/turns/{turn_id}/stream）。
 # 個別テストは `install_api_mocks(page, stream_events=[...])` で丸ごと上書きできる。
 _DEFAULT_STREAM_EVENTS = [
     {"type": "node", "id": "understand", "kind": "thought", "status": "done",
@@ -583,10 +579,9 @@ def world_diff_response(path: str | None, world_id: str | None = None, label: st
                         registered: bool = False, added: list | None = None,
                         changed: list | None = None, removed: list | None = None,
                         total: int = 2, indexed: int = 0) -> dict:
-    """POST /worlds/diff・GET /worlds/{wid}/diff の mock 応答（実形状＝worlds.py::_diff_payload と
-    同キー＝ "world_id" も常に持つ）。既定値は未登録フォルダ（POST /worlds/diff の代表例＝
-    追加2件・未取込）を表す。登録済みで変更なしの例（GET /worlds/{wid}/diff）は呼び出し側で
-    `added=[]`・`total=indexed` を渡す。"""
+    """POST /worlds/diff の mock 応答（実形状＝worlds.py::_diff_payload と同キー＝ "world_id" も
+    常に持つ）。既定値は未登録フォルダ（追加2件・未取込）を表す。登録済みで変更なしの例は
+    呼び出し側で `added=[]`・`total=indexed` を渡す。"""
     return {"ok": True, "registered": registered, "world_id": world_id, "label": label,
             "root_path": path,
             "added": added if added is not None else ["4期/税計算仕様書.md", "4期/TAXCALC.cbl"],
@@ -1180,7 +1175,7 @@ _CONFIG_AGENT_LABELS = {
 
 
 # チャットで閉じた頭脳（実サーバ `sherpa/routers/system.py::_CLOSED_CHAT_AGENTS`・保存させない）。
-_CLOSED_CHAT_AGENTS = ("heuristic", "gemini", "bedrock")
+_CLOSED_CHAT_AGENTS = ("heuristic", "gemini", "bedrock", "openai", "ollama")
 # codex_model_provider の allowlist（実サーバ `agent_constructs.CODEX_MODEL_PROVIDERS`）。
 _CODEX_MODEL_PROVIDERS = ("openai", "ollama")
 
@@ -1194,10 +1189,8 @@ def _recompute_construct_id(resp: dict) -> str:
     codex_openai へ丸めない＝画面に実際と異なる構成が動いているという食い違いを見せない・
     `str(x or "")` 単独の truthiness 判定は falsy な非文字列を「未設定」に化けさせるため使わない）。
     それ以外は `constructs_available`（標準3）から agent が一致する id を探し、見つからなければ
-    agent 名そのものを返す（閉じた頭脳の保存値は生値のまま保つ）。"""
+    agent 名そのものを返す（選べない保存値は生値のまま保つ）。"""
     agent = resp.get("agent") or ""
-    if agent in ("openai", "ollama"):   # 旧・直結経路の保存値は簡易として読み替える
-        agent = "simple"
     if agent == "codex":
         raw = resp.get("codex_model_provider")
         if raw is None or raw == "":
@@ -1575,7 +1568,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
     tools_availability_resp = tools_availability if tools_availability is not None else {
         "grep": True, "fulltext": True, "graph": True}
     records = {
-        "stream_urls": [],
         "turn_starts": [],
         "turn_stream_urls": [],
         "turn_stops": [],
@@ -2572,12 +2564,10 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
         if method == "GET" and path == "/graph/facets":
             return _json(route, GRAPH_FACETS_RESP)
         if method == "GET" and path == "/graph/search":
-            # GET /graph/search の nodes[] は GET /graph（graph_view）と別形＝ phase/category に加え
-            # em も持つ（graph_admin.py::_node は em を返し続ける・GraphNode と違い GraphSearchNode は
-            # S3 でも em を撤去していない＝graph_admin の管理検索専用ビューは対象外）。
+            # GET /graph/search の nodes[] は GET /graph（graph_view）と別形＝ phase/category を持つ。
             # GRAPH["nodes"] を直接使い回さず個別に足してから graph_search_response へ渡す。
             rel = (query.get("relationship") or [""])[0]
-            search_nodes = [{**n, "em": "static", "phase": None, "category": None} for n in GRAPH["nodes"]]
+            search_nodes = [{**n, "phase": None, "category": None} for n in GRAPH["nodes"]]
             if rel:
                 return _json(route, graph_search_response(
                     search_nodes[:2], GRAPH["edges"][:1], {"nodes": 2, "edges": 1}))
@@ -2615,18 +2605,9 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
             body = _post_json(request)
             records["world_register"].append(body)
             return _json(route, world_ingest_accepted_response(WORLD["world_id"]))
-        if method == "GET" and path == "/worlds/w1/diff":
-            return _json(route, world_diff_response(
-                "/mnt/c/ProjectA", world_id="w1", label="4期更改", registered=True,
-                added=[], total=3, indexed=3))
         if method == "POST" and path == "/worlds/w1/refresh":
             records["world_refresh"].append(True)
             return _json(route, world_ingest_accepted_response("w1"))
-        if method == "GET" and path == "/chat/stream":
-            # 旧エンドポイント（後方互換のため実サーバ側は残置・chat.js はもう呼ばない）。
-            # デフォルトモックとしては維持するが、既定の送信フローは /chat/turns 系を使う。
-            records["stream_urls"].append(request.url)
-            return _sse(route, stream_events if stream_events is not None else _DEFAULT_STREAM_EVENTS)
         if method == "POST" and path == "/chat/turns":
             # 背景実行（覗き窓方式・docs/proposals/2026-07-03-チャット背景実行.md）: 送信の既定フロー。
             # turn_id は固定値（"turn-101"）＝個別テストが `**/chat/turns/*/stream**` のような
@@ -2823,8 +2804,6 @@ def install_api_mocks(page, *, auth_status: int = 200, user: dict | None = None,
 # 一覧（path は FastAPI ルート表記＝OpenAPI と同じ `{param}` テンプレート）。
 # `tests/api/test_mock_api_contract.py` がこれを実ルート表と突合し、実 API に無いルートを
 # 偽装したままにしていないかを検査する（旧ルート撤去・改名の検知）。
-# `GET /chat/stream` は chat.js からはもう呼ばれないが、実サーバ側は後方互換のため意図的に残置
-# （sherpa/routers/chat.py 参照）＝実ルート表にも存在する現役ルートであり除外不要。
 MOCKED: list[tuple[str, str]] = [
     ("GET", "/auth/me"),
     ("GET", "/health/summary"),
@@ -2873,9 +2852,7 @@ MOCKED: list[tuple[str, str]] = [
     ("GET", "/worlds/{wid}/status"),
     ("POST", "/worlds/diff"),
     ("POST", "/worlds"),
-    ("GET", "/worlds/{wid}/diff"),
     ("POST", "/worlds/{wid}/refresh"),
-    ("GET", "/chat/stream"),                   # 後方互換の意図的残置（上のコメント参照）
     ("POST", "/chat/turns"),
     ("GET", "/chat/turns/{turn_id}/stream"),
     ("POST", "/chat/turns/{turn_id}/stop"),

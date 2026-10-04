@@ -135,11 +135,6 @@ def _clip_with_flag(text, limit: int = _TEXT_EXPORT_MAX_LEN) -> tuple[str | None
     return text[:limit], True
 
 
-def _clip(text, limit: int = _TEXT_EXPORT_MAX_LEN) -> str | None:
-    head, _truncated = _clip_with_flag(text, limit)
-    return head
-
-
 # plan 集約経路（`providers/base.py`）が `f"{profile_id}:{stop_reason}"` を `+` で連結した複合値、または固定文言 `"plan_completed"` を保存することがある
 _PLAN_COMPLETED_TOKEN = "plan_completed"
 

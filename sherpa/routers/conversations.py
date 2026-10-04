@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from sherpa import investigation_record_render, store
 from sherpa.deps import _current_user, _delete_codex_sessions_for_conversation
-from sherpa.providers.codex.provider import _conversation_lock
+from sherpa.providers.codex.turn_prepare import _conversation_lock
 from sherpa.store import investigation_records as store_investigation
 
 # router に tags を持たせない（各デコレータの tags と二重になりルート表 golden が一致しなくなる）。

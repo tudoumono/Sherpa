@@ -112,7 +112,7 @@ def test_graph_engine_impact():
     _neo4j_or_skip()
     from _world_setup import ensure_v1
     ensure_v1()
-    hits, reason = fused_search._search_graph(TEST_WORLD_ID, "消費税率", None, 10, None)
+    hits, reason = fused_search._search_graph(TEST_WORLD_ID, "消費税率", None, 10)
     assert reason is None
     assert hits, "影響たどりの結果が空（fixture の起点語が変わっていないか確認）"
     assert all(h["key"] for h in hits)

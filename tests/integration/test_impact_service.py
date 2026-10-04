@@ -65,7 +65,7 @@ def test_code_silent_steers_to_search():
 
 
 def test_scope_bounds_impact():
-    """範囲（フォルダ prefix）で絞ると影響は増えない（鏡＝subgraph・共通の自動合流はしない）。
+    """範囲（フォルダ prefix）で絞ると影響は増えない（鏡＝フォルダ prefix・共通の自動合流はしない）。
     起点（TAX-RATE＝`4期/00_共通/標準コピーブック`）を含まない範囲は起点ごと引けず0件。
     起点を含む世代全体まで広げれば unscoped と一致する（世代内で完結・過不足なし）。
     """

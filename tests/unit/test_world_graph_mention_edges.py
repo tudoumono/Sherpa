@@ -253,7 +253,7 @@ def test_different_generation_same_name_links_to_all_generations(tmp_path, monke
     for e in doc_edges:
         assert e["src"] == src_cid
         assert e["via"] == "mention"
-        assert e["extraction_method"] == "static"
+        assert "extraction_method" not in e
         assert e["status"] == "active"
         assert e["doc"] == "g1/note.md"
 

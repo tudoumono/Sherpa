@@ -1,8 +1,7 @@
 """実行構成（3構成）の契約（`sherpa/agent_constructs.py`）。
 
-標準が見せるのは 簡易 / Codex 調査(OpenAI) / Codex 調査(Ollama) の3つだけ。保存値が旧・直結経路
-（openai/ollama）の利用者は簡易として扱う。
-gemini/bedrock/heuristic はチャットで閉じており、設定に残っていても実行時に遮断する
+標準が見せるのは 簡易 / Codex 調査(OpenAI) / Codex 調査(Ollama) の3つだけ。
+`codex`/`simple` 以外の保存値（openai/ollama/gemini/bedrock/heuristic）は読み替えず、実行時に選び直しを案内して止める
 （黙って別の AI が答える状態を作らない）。
 """
 from __future__ import annotations
@@ -28,13 +27,14 @@ def test_default_shows_exactly_three_constructs():
     assert labels["codex_ollama"] == "Codex 調査（Ollama）"
 
 
-def test_legacy_openai_ollama_agent_resolves_to_simple(monkeypatch):
-    """保存値が旧・直結経路（openai/ollama）なら簡易として扱う（DB は書き換えない）。
-    strict でも拒否しない。"""
-    for legacy in ("openai", "ollama", " OpenAI "):
-        assert AC.effective_agent({"agent": legacy}, system_settings={}) == "simple"
-        assert AC.effective_agent({"agent": legacy}, system_settings={}, strict=True) == "simple"
-        assert AC.construct_id({"agent": legacy}, system_settings={}) == "simple"
+def test_unselectable_saved_agent_is_not_remapped_and_strict_asks_to_reselect():
+    """選べない保存値（openai/ollama 等）は読み替えず、実行の入口（strict）が選び直しを案内する例外にする。
+    表示側（非 strict）は例外にしない（画面が開けなくならない）。"""
+    for legacy in ("openai", "ollama", "gemini", "heuristic"):
+        assert AC.effective_agent({"agent": legacy}, system_settings={}) == legacy
+        assert AC.construct_id({"agent": legacy}, system_settings={}) == legacy
+        with pytest.raises(AC.InvalidAgentConfigError, match="選び直して"):
+            AC.effective_agent({"agent": legacy}, system_settings={}, strict=True)
 
 
 def test_auto_default_falls_back_to_simple_not_the_old_path(monkeypatch):
@@ -58,7 +58,6 @@ def test_is_real_api_key_returns_false_for_non_string_without_raising():
 def test_closed_agents_are_never_selectable_blocked_or_defaulted(monkeypatch):
     """AI なし（heuristic）・Gemini・AWS Bedrock はチャットで閉じている: 有効化されず、選択肢にも出ない。
     実行時は常に遮断（保存値が残っていてもチャットで選び直しを案内する）。"""
-    assert AC.EXTRA_AGENTS == frozenset()
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"cloud_provider": "gemini"})
     assert AC.enabled_agents() == AC.STANDARD_AGENTS
     assert [c["id"] for c in AC.available_constructs()] == ["codex_openai", "codex_ollama", "simple"]
@@ -116,7 +115,7 @@ def test_construct_id_returns_out_of_list_id_for_invalid_codex_model_provider():
 
 def test_effective_agent_strict_raises_for_unknown_saved_agent_value(monkeypatch):
     """保存済み `agent`（PUT /settings のallowlist検証を経ていない旧データ等）が既知の頭脳名
-    （STANDARD_AGENTS|EXTRA_AGENTS）のどれでもない非空の不正値のとき、`strict=True` は黙って
+    （STANDARD_AGENTS）のどれでもない非空の不正値のとき、`strict=True` は黙って
     そのまま返さない＝`_select_provider` がどの分岐にも一致せず HeuristicProvider（別の頭脳）へ
     縮退することを防ぐ。`strict=False`（既定）は従来どおり生値を返す（表示/監査を壊さない）。"""
     monkeypatch.delenv("SHERPA_AGENT", raising=False)
@@ -158,8 +157,6 @@ def test_codex_construct_forces_knowledge_on(monkeypatch):
     saved.clear(); saved.update({"agent": "simple"})
     assert _knowledge_for("u", False) is True          # 簡易も資料参照ON固定（検索・出典確認が本体）
 
-    saved.clear(); saved.update({"agent": "openai"})
-    assert _knowledge_for("u", False) is True          # 旧・直結の保存値は簡易として扱う
 
     # 設定が読めない時は要求どおり（可用性優先＝チャット自体を止めない）
     def _boom(uid):
@@ -177,7 +174,7 @@ def test_default_construct_is_selectable_from_the_screen(monkeypatch):
     「簡易（AIなし）」のまま AI が動かず、しかもその選択肢が一覧に無いので状況が分からなかった。
 
     Codex CLI・認証は自動選択（`_auto_default_agent`）の判定材料になるため、開発機の実際の状態に
-    関わらず決定的になるよう明示的に揃える（CLI あり・実キーありで既定 `DEFAULT_CONSTRUCT_ID`
+    関わらず決定的になるよう明示的に揃える（CLI あり・実キーありで既定
     ＝codex_openai と一致する構成にする）。実キーは中央設定（system_settings）で用意する
     （`_codex_auth_available`/`_auto_default_agent` はもう env を読まず `sherpa.keys.resolve_api_key`
     経由で解決するため）。
@@ -188,9 +185,9 @@ def test_default_construct_is_selectable_from_the_screen(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
     monkeypatch.setattr("sherpa.store.get_system_settings", lambda: {"openai_api_key": "sk-x"})
     ids = {c["id"] for c in AC.available_constructs()}
-    assert AC.DEFAULT_CONSTRUCT_ID in ids
-    assert AC.construct_id({}) == AC.DEFAULT_CONSTRUCT_ID
-    assert AC.construct_id(None) == AC.DEFAULT_CONSTRUCT_ID
+    assert "codex_openai" in ids
+    assert AC.construct_id({}) == "codex_openai"
+    assert AC.construct_id(None) == "codex_openai"
     assert AC.default_agent() in AC.enabled_agents()
 
 
@@ -265,7 +262,6 @@ def test_stored_agent_default_matches_the_code_default():
 
     ddl = "\n".join(db._SCHEMA)
     assert f"agent TEXT NOT NULL DEFAULT '{AC.DEFAULT_AGENT}'" in ddl
-    assert f"ALTER TABLE user_settings ALTER COLUMN agent SET DEFAULT '{AC.DEFAULT_AGENT}'" in ddl
 
 
 def test_update_settings_without_agent_field_leaves_it_unset_not_baked(monkeypatch):

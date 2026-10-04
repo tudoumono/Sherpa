@@ -1,10 +1,21 @@
-"""`XmlConfigAnalyzer` の単体テスト（アナライザ拡張 S3・A2/A7/A8＝Spring/MyBatis/Struts の XML 設定）。"""
+"""`XmlConfigAnalyzer` の単体テスト（Spring/MyBatis/Struts/Spring Batch の XML 設定）。
+
+入力 XML → (定義・children / 参照 / Dropped の理由) の表で確かめる。
+"""
 from __future__ import annotations
+
+import pytest
 
 from sherpa.ingest.analyzers._base import Analyzer
 from sherpa.ingest.analyzers.xml_config import XmlConfigAnalyzer
 
 A = XmlConfigAnalyzer()
+
+SPRING = "spring/applicationContext.xml"
+MAPPER = "mybatis/OrderMapper.xml"
+BATCH = "batch-context.xml"
+NS = '<mapper namespace="com.acme.mybatis.OrderMapper">\n'
+BATCH_XMLNS = 'xmlns:batch="http://www.springframework.org/schema/batch"'
 
 
 def test_extensions_and_name():
@@ -14,657 +25,319 @@ def test_extensions_and_name():
 
 
 def test_accepts_all_xml_files_without_content_inspection():
-    """§6: 設定 XML アナライザは拡張子内を全件受理する——`accepts()` は既定のまま
-    オーバーライドしていない（未確定ファイルは primary なし＋Dropped で通す）。"""
+    """設定 XML アナライザは拡張子内を全件受理する（`accepts()` を上書きしない）。"""
     assert XmlConfigAnalyzer.accepts is Analyzer.accepts
 
 
-# --- Spring（Bean 定義）---
+# ---- primary（設定ルート）----
 
-def test_spring_beans_root_becomes_config_primary():
-    text = "<beans><bean class=\"com.acme.Foo\"/></beans>\n"
-    res = A.collect_defs(text, "spring/applicationContext.xml")
+@pytest.mark.parametrize("text,path,name", [
+    ('<beans><bean class="com.acme.Foo"/></beans>\n', SPRING, "applicationContext.xml"),
+    ('<beans xmlns="http://www.springframework.org/schema/beans"><bean class="com.acme.Foo"/></beans>',
+     "applicationContext.xml", "applicationContext.xml"),          # namespace 付きでもローカル名で判定
+    ('<mapper namespace="com.acme.mybatis.OrderMapper"></mapper>', MAPPER, "OrderMapper.xml"),
+    ("<struts></struts>", "struts/struts.xml", "struts.xml"),
+], ids=["spring", "spring_namespaced", "mybatis", "struts"])
+def test_config_root_becomes_config_primary(text, path, name):
+    res = A.collect_defs(text, path)
     assert res.primary is not None
-    assert res.primary.label == "Config" and res.primary.name == "applicationContext.xml"
-    assert res.children == [] and res.dropped == []
+    assert res.primary.label == "Config" and res.primary.name == name
 
 
-def test_spring_bean_class_becomes_invokes_module_candidate():
-    text = "<beans>\n  <bean class=\"com.acme.Foo\"/>\n</beans>\n"
-    res = A.extract_refs(text, "spring/applicationContext.xml")
-    assert len(res.refs) == 1
-    ref = res.refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("INVOKES", "Module", "com.acme.Foo")
-    assert ref.extra == {"via": "bean_class", "qualified": True}
-    assert ref.reverse is False
-    assert ref.line == 2
+# 設定でない XML・壊れた XML・外部実体（XXE）は primary なし＋Dropped（全件受理・§6）
+@pytest.mark.parametrize("text,path,dropped", [
+    ("<project><modelVersion>4.0.0</modelVersion></project>", "nonconfig/pom.xml",
+     ("xml_not_config", 1, "project")),
+    ('<beans>\n  <bean class="com.acme.a.Foo">\n</beans>\n', "broken/broken.xml",          # bean が閉じていない
+     ("xml_parse_error", None, None)),
+    ('<?xml version="1.0"?><!DOCTYPE beans [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+     '<beans><bean class="&xxe;"/></beans>', "xxe/attempt.xml", ("xml_parse_error", None, None)),
+], ids=["not_config", "malformed", "external_entity_rejected"])
+def test_unusable_xml_yields_no_primary_and_one_dropped(text, path, dropped):
+    res = A.collect_defs(text, path)
+    assert res.primary is None and res.children == []
+    assert len(res.dropped) == 1
+    d = res.dropped[0]
+    reason, line, snippet = dropped
+    assert d.reason == reason
+    assert line is None or d.line == line
+    assert snippet is None or d.snippet == snippet
 
 
-def test_spring_duplicate_bean_class_yields_one_candidate_per_occurrence():
-    """同じ class を指す複数 `<bean>` はそれぞれ候補として返す——重複排除は共通層の
-    §4(f) エッジ集約が担う（アナライザは黙って落とさない）。"""
-    text = "<beans>\n  <bean class=\"com.acme.Foo\"/>\n  <bean class=\"com.acme.Foo\"/>\n</beans>\n"
-    res = A.extract_refs(text, "spring/applicationContext.xml")
-    assert len(res.refs) == 2
-    assert [r.line for r in res.refs] == [2, 3]
+@pytest.mark.parametrize("text,path", [
+    ("<web-app><display-name>Demo</display-name></web-app>", "nonconfig/web.xml"),
+    ('<beans>\n  <bean class="com.acme.a.Foo">\n</beans>\n', "broken/broken.xml"),
+], ids=["not_config", "malformed"])
+def test_unusable_xml_extract_refs_returns_nothing(text, path):
+    res = A.extract_refs(text, path)
+    assert res.refs == [] and res.dropped == []
 
 
-def test_spring_bean_inside_comment_does_not_confuse_the_real_beans_line_number():
-    """コメント内の同名タグ（`<bean class="wrong.X"/>`）に惑わされず、実要素の行番号が正しく
-    取れる——1パスの `expat` は要素ツリーもコメントも自身で正しく判定するため、生テキストを
-    別途検索して行番号を後付けする経路が持っていた「コメント内の出現に前へ進んでしまう」不具合
-    （旧 `_TagCursor`）が構造的に起こらない。"""
-    text = (
-        "<beans>\n"
-        "  <!-- <bean class=\"wrong.X\"/> -->\n"
-        "  <bean class=\"com.acme.Real\"/>\n"
-        "</beans>\n"
-    )
-    res = A.extract_refs(text, "spring/applicationContext.xml")
-    assert len(res.refs) == 1
-    ref = res.refs[0]
-    assert ref.name == "com.acme.Real"
-    assert ref.line == 3                     # コメント（2行目）ではなく実要素の行
+# ---- extract_refs ----
+# 参照の期待値: (edge, kind, name, extra, reverse, line)。extra/reverse/line は None なら検査しない。
+
+def R(edge, kind, name, extra=None, reverse=None, line=None):
+    return (edge, kind, name, extra, reverse, line)
 
 
-def test_mybatis_cdata_containing_fake_tag_text_does_not_shift_the_next_statement_line():
-    """CDATA 本文中に `<select>` に似たテキストが含まれていても、後続の実要素の行番号がずれない
-    （旧 `_TagCursor` は生テキスト検索のため CDATA 内の偽出現に前進してしまい得た）。行の正しさは
-    2件目の `ACCESSES(via=mapper_sql)` の line で確認する（1件目は CDATA に SQL 句が無く無関係）。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"first\"><![CDATA[ fake <select> looks like a tag ]]></select>\n"
-        "  <select id=\"second\" resultType=\"com.acme.mybatis.Order\">SELECT * FROM second_table</select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert len(table_refs) == 1
-    assert table_refs[0].name == "SECOND_TABLE"
-    assert table_refs[0].line == 3
+def Q(name, line=None):
+    """Spring/MyBatis の `config_key`（bean 参照）。"""
+    return R("ACCESSES", "Config", name, {"via": "config_key", "key_kind": "bean"}, None, line)
 
 
-def test_mybatis_large_mapper_with_many_select_statements_gets_distinct_increasing_lines():
-    """多数（8,000件）の `<select>` を持つ Mapper XML でも各要素が正しい行に対応する——改行を
-    毎回先頭から数え直す経路（旧 `_TagCursor`）を持たないため、要素数に対して二次的にならない
-    （時間の目安ではなく、行番号の正しさ・単調増加で計算量の構造を担保する）。"""
-    n = 8000
-    lines = ["<mapper namespace=\"com.acme.mybatis.OrderMapper\">"]
-    lines += [f'  <select id="s{i}">SELECT {i} FROM T{i}</select>' for i in range(n)]
-    lines.append("</mapper>")
-    text = "\n".join(lines) + "\n"
-
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert len(table_refs) == n
-    assert [r.name for r in table_refs] == [f"T{i}" for i in range(n)]
-    got_lines = [r.line for r in table_refs]
-    assert got_lines == sorted(got_lines) and len(set(got_lines)) == n   # 単調増加＝正しく1件ずつ対応
+def T(name, line=None):
+    return R("ACCESSES", "Table", name, {"via": "mapper_sql"}, None, line)
 
 
-def test_spring_namespaced_beans_root_is_recognized_by_local_name():
-    """namespace URI が付いていてもローカル名（`beans`）だけで判定する。"""
-    text = ('<beans xmlns="http://www.springframework.org/schema/beans">'
-            '<bean class="com.acme.Foo"/></beans>')
-    res = A.collect_defs(text, "applicationContext.xml")
-    assert res.primary is not None and res.primary.label == "Config"
-    refs = A.extract_refs(text, "applicationContext.xml").refs
-    assert refs[0].name == "com.acme.Foo"
+def D(reason, line=None, snippet=None):
+    return (reason, line, snippet)
 
 
-# --- MyBatis（Mapper XML）---
-
-def test_mybatis_mapper_namespace_becomes_reverse_invokes_candidate():
-    text = "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n</mapper>\n"
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    ns_refs = [r for r in res.refs if r.extra.get("via") == "mapper_namespace"]
-    assert len(ns_refs) == 1
-    ref = ns_refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("INVOKES", "Module", "com.acme.mybatis.OrderMapper")
-    assert ref.extra == {"via": "mapper_namespace", "qualified": True}
-    assert ref.reverse is True
+def _beans(body):
+    return f"<beans>\n{body}</beans>\n"
 
 
-def test_mybatis_result_type_and_parameter_type_become_normal_invokes_candidates():
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"selectOrder\" resultType=\"com.acme.mybatis.Order\" parameterType=\"int\">\n"
-        "    SELECT * FROM orders WHERE id = #{id}\n"
-        "  </select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    type_refs = [r for r in res.refs if r.extra.get("via") == "mapper_type"]
-    assert len(type_refs) == 1                              # parameterType="int" は無視（別名・§4(c)）
-    ref = type_refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("INVOKES", "Module", "com.acme.mybatis.Order")
-    assert ref.extra == {"via": "mapper_type", "qualified": True}
-    assert ref.reverse is False
+def _mapper(body):
+    return NS + body + "</mapper>\n"
 
 
-def test_mybatis_type_alias_values_without_dot_are_reported_as_dropped_mapper_type_alias():
-    """`int`/`string`/`map` 等の別名（非空だが完全修飾名でない値）は推測接続せず、
-    `Dropped("mapper_type_alias", ...)` として申告する（黙って捨てない・§4(c)）。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"selectAll\" resultType=\"map\" parameterType=\"string\">SELECT 1</select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    assert [r for r in res.refs if r.extra.get("via") == "mapper_type"] == []
+# (入力, path, via フィルタ（None=全件）, 参照, Dropped（None=検査しない）)
+REFS_CASES = {
+    "spring_bean_class": (
+        _beans('  <bean class="com.acme.Foo"/>\n'), SPRING, None,
+        [R("INVOKES", "Module", "com.acme.Foo", {"via": "bean_class", "qualified": True}, False, 2)], []),
+    "spring_duplicate_bean_class_one_per_occurrence": (
+        _beans('  <bean class="com.acme.Foo"/>\n  <bean class="com.acme.Foo"/>\n'), SPRING, None,
+        [R("INVOKES", "Module", "com.acme.Foo", None, None, 2), R("INVOKES", "Module", "com.acme.Foo", None, None, 3)],
+        None),
+    "spring_bean_in_comment_does_not_shift_line": (
+        _beans('  <!-- <bean class="wrong.X"/> -->\n  <bean class="com.acme.Real"/>\n'), SPRING, None,
+        [R("INVOKES", "Module", "com.acme.Real", None, None, 3)], None),
+    "mybatis_cdata_fake_tag_does_not_shift_line": (
+        _mapper('  <select id="first"><![CDATA[ fake <select> looks like a tag ]]></select>\n'
+                '  <select id="second" resultType="com.acme.mybatis.Order">SELECT * FROM second_table</select>\n'),
+        MAPPER, "mapper_sql", [T("SECOND_TABLE", 3)], None),
+    "mybatis_namespace_reverse_invokes": (
+        _mapper(""), MAPPER, "mapper_namespace",
+        [R("INVOKES", "Module", "com.acme.mybatis.OrderMapper", {"via": "mapper_namespace", "qualified": True}, True)],
+        None),
+    "mybatis_result_type_normal_invokes_parameter_type_alias_ignored": (
+        _mapper('  <select id="selectOrder" resultType="com.acme.mybatis.Order" parameterType="int">\n'
+                "    SELECT * FROM orders WHERE id = #{id}\n  </select>\n"),
+        MAPPER, "mapper_type",
+        [R("INVOKES", "Module", "com.acme.mybatis.Order", {"via": "mapper_type", "qualified": True}, False)], None),
+    "mybatis_sql_body_yields_accesses_table": (
+        _mapper('  <select id="selectOrder" resultType="com.acme.mybatis.Order">SELECT 1</select>\n'
+                "  <insert id=\"insertOrder\">INSERT INTO orders VALUES (1)</insert>\n"),
+        MAPPER, "mapper_sql", [T("ORDERS", 3)], None),
+    "mybatis_include_refid_dropped": (
+        _mapper('  <sql id="cols">o.id, o.status</sql>\n'
+                '  <select id="selectOrder"><include refid="cols"/> FROM orders o</select>\n'),
+        MAPPER, "mapper_sql", [T("ORDERS")], None),
+    "mybatis_dynamic_tags_not_expanded_text_concatenated": (
+        _mapper('  <select id="selectOrder">\n    SELECT * FROM orders\n    <where>\n'
+                '      <if test="id != null">AND id = #{id}</if>\n    </where>\n  </select>\n'),
+        MAPPER, "mapper_sql", [T("ORDERS")], None),
+    "mybatis_dynamic_placeholder_table_excluded": (
+        _mapper('  <select id="dyn">SELECT * FROM ${tableName}</select>\n'), MAPPER, "mapper_sql", [], None),
+    "mybatis_hash_line_comment_ignored": (
+        _mapper('  <select id="selectOrder">\n    # FROM fake\n    SELECT * FROM orders\n  </select>\n'),
+        MAPPER, "mapper_sql", [T("ORDERS")], None),
+    "mybatis_placeholder_in_values_not_table": (
+        _mapper('  <insert id="insertOrder">INSERT INTO orders (id, status) VALUES (#{id}, #{status})</insert>\n'),
+        MAPPER, "mapper_sql", [T("ORDERS")], None),
+    "struts_action_class": (
+        '<struts>\n  <package name="default">\n    <action name="order" class="com.acme.struts.OrderAction"/>\n'
+        "  </package>\n</struts>\n", "struts/struts.xml", None,
+        [R("INVOKES", "Module", "com.acme.struts.OrderAction", {"via": "action_class", "qualified": True})], None),
+    # bean 参照（children にはせず ACCESSES(via=config_key, key_kind=bean)）
+    "property_ref_attribute": (
+        _beans('  <bean id="orderService" class="com.acme.Foo">\n    <property name="repo" ref="orderRepository"/>\n'
+               "  </bean>\n"), SPRING, "config_key", [Q("orderRepository", 3)], None),
+    "constructor_arg_ref_attribute": (
+        _beans('  <bean id="orderService" class="com.acme.Foo">\n    <constructor-arg ref="orderRepository"/>\n'
+               "  </bean>\n"), SPRING, "config_key", [Q("orderRepository")], None),
+    "batch_tasklet_chunk_job_listener_refs": (
+        f"<beans {BATCH_XMLNS}>\n  <batch:job id=\"nightlyJob\">\n    <batch:step id=\"loadStep\">\n"
+        '      <batch:tasklet ref="loadTasklet"/>\n    </batch:step>\n    <batch:step id="payrollStep">\n'
+        '      <batch:chunk reader="payrollReader" processor="payrollProcessor" writer="payrollWriter"/>\n'
+        '    </batch:step>\n    <batch:job-listener ref="auditListener"/>\n  </batch:job>\n</beans>\n',
+        BATCH, "config_key",
+        [Q("loadTasklet"), Q("payrollReader"), Q("payrollProcessor"), Q("payrollWriter"), Q("auditListener")], None),
+    # bean 定義継承（TERASOLUNA 実測の取りこぼし）
+    "bean_parent_attribute": (
+        _beans('  <bean id="AbstractCodeList" class="jp.example.fw.JdbcCodeList" abstract="true"/>\n'
+               '  <bean id="CL_SAMPLE" parent="AbstractCodeList">\n'
+               '    <property name="querySql" value="SELECT code FROM sample_code"/>\n  </bean>\n'),
+        "spring/sample-codelist.xml", "config_key", [Q("AbstractCodeList", 3)], None),
+    "bean_parent_in_comment_not_reference": (
+        _beans('  <!-- Example:\n  <bean id="CL_SAMPLE" parent="AbstractCodeList"/>\n  -->\n'),
+        "spring/sample-codelist.xml", None, [], None),
+    # <import resource>（設定ファイル合成）
+    "import_resource_by_path_suffix": (
+        _beans('  <import resource="classpath:/META-INF/spring/sample-domain.xml"/>\n'
+               '  <import resource="sample-env.xml"/>\n'),
+        "spring/sample.xml", "include",
+        [R("INVOKES", "Config", "META-INF/spring/sample-domain.xml", {"via": "include", "path_suffix": True}),
+         R("INVOKES", "Config", "sample-env.xml", {"via": "include", "path_suffix": True})], []),
+    "import_without_resource_dropped": (
+        "<beans>\n  <import/>\n</beans>\n", "spring/sample.xml", None, [],
+        [D("config_import_missing_resource", 2, "")]),
+    "import_wildcard_dropped_not_guessed": (
+        _beans('  <import resource="classpath*:META-INF/spring/**/*-codelist.xml"/>\n'),
+        "spring/sample.xml", None, [],
+        [D("config_import_wildcard", None, "classpath*:META-INF/spring/**/*-codelist.xml")]),
+    # MyBatis の型別名は推測接続せず Dropped
+    "mybatis_type_alias_dropped": (
+        _mapper('  <select id="selectAll" resultType="map" parameterType="string">SELECT 1</select>\n'),
+        MAPPER, "mapper_type", [], None),
+}
+
+
+def _refs_match(got, exp):
+    e_edge, e_kind, e_name, e_extra, e_rev, e_line = exp
+    return ((got.edge_type, got.kind, got.name) == (e_edge, e_kind, e_name)
+            and (e_extra is None or got.extra == e_extra)
+            and (e_rev is None or got.reverse is e_rev)
+            and (e_line is None or got.line == e_line))
+
+
+@pytest.mark.parametrize("text,path,via,refs,dropped", REFS_CASES.values(), ids=REFS_CASES)
+def test_extract_refs(text, path, via, refs, dropped):
+    res = A.extract_refs(text, path)
+    got = [r for r in res.refs if via is None or r.extra.get("via") == via]
+    assert len(got) == len(refs)
+    for g, e in zip(got, refs):
+        assert _refs_match(g, e), (g, e)
+    if dropped is not None:
+        assert len(res.dropped) == len(dropped)
+        for d, (reason, line, snippet) in zip(res.dropped, dropped):
+            assert d.reason == reason
+            assert line is None or d.line == line
+            assert snippet is None or d.snippet == snippet
+
+
+def test_mybatis_type_alias_values_are_reported_as_dropped_mapper_type_alias():
+    """`map`/`string` 等の別名（完全修飾でない値）は推測接続せず `mapper_type_alias` で申告する。"""
+    res = A.extract_refs(
+        _mapper('  <select id="selectAll" resultType="map" parameterType="string">SELECT 1</select>\n'), MAPPER)
     alias_dropped = [d for d in res.dropped if d.reason == "mapper_type_alias"]
     assert {d.snippet for d in alias_dropped} == {"map", "string"}
     assert all(d.line == 2 for d in alias_dropped)
-
-
-def test_mybatis_sql_body_yields_accesses_table_not_dropped_mapper_sql():
-    """本文の SQL から `Table` へ `ACCESSES(via=mapper_sql)` を抽出する（S4'）——旧
-    `Dropped("mapper_sql", ...)`＝文数だけの申告は本抽出に置き換わり撤去済み。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"selectOrder\" resultType=\"com.acme.mybatis.Order\">SELECT 1</select>\n"
-        "  <insert id=\"insertOrder\">INSERT INTO orders VALUES (1)</insert>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    assert [d for d in res.dropped if d.reason == "mapper_sql"] == []
-    table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert len(table_refs) == 1
-    ref = table_refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("ACCESSES", "Table", "ORDERS")
-    assert ref.line == 3                                  # <insert> の本文の行
+    assert [d for d in res.dropped if d.reason == "mapper_sql"] == []        # 文数だけの旧申告は撤去済み
 
 
 def test_mybatis_include_refid_is_reported_as_dropped_mapper_include():
-    """`<include refid="...">` は実体展開せず `Dropped("mapper_include", ...)` として申告する。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <sql id=\"cols\">o.id, o.status</sql>\n"
-        "  <select id=\"selectOrder\"><include refid=\"cols\"/> FROM orders o</select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
+    res = A.extract_refs(
+        _mapper('  <sql id="cols">o.id, o.status</sql>\n'
+                '  <select id="selectOrder"><include refid="cols"/> FROM orders o</select>\n'), MAPPER)
     include_dropped = [d for d in res.dropped if d.reason == "mapper_include"]
     assert len(include_dropped) == 1 and include_dropped[0].snippet == "cols"
+
+
+def test_mybatis_large_mapper_gets_distinct_increasing_lines():
+    """8,000 件の `<select>` でも各要素が正しい行に対応する（行番号の正しさ・単調増加で構造を担保）。"""
+    n = 8000
+    lines = ['<mapper namespace="com.acme.mybatis.OrderMapper">']
+    lines += [f'  <select id="s{i}">SELECT {i} FROM T{i}</select>' for i in range(n)]
+    lines.append("</mapper>")
+    res = A.extract_refs("\n".join(lines) + "\n", MAPPER)
     table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert [r.name for r in table_refs] == ["ORDERS"]
+    assert [r.name for r in table_refs] == [f"T{i}" for i in range(n)]
+    got_lines = [r.line for r in table_refs]
+    assert got_lines == sorted(got_lines) and len(set(got_lines)) == n
 
 
-def test_mybatis_dynamic_sql_child_tags_are_not_expanded_but_text_is_concatenated():
-    """`<if>`/`<where>` 等は展開（条件評価）しないが、その配下のテキストノードは連結して読む。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"selectOrder\">\n"
-        "    SELECT * FROM orders\n"
-        "    <where>\n"
-        "      <if test=\"id != null\">AND id = #{id}</if>\n"
-        "    </where>\n"
-        "  </select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert [r.name for r in table_refs] == ["ORDERS"]
+# ---- collect_defs: キー単位 Config children ----
+# 期待値: {name: extra の部分集合}・Dropped は (reason, snippet) 列（None=検査しない）
 
+STRUTS_SAME_KEY = (
+    '<struts>\n  <constant name="login" value="loginPage"/>\n  <package name="default">\n'
+    '    <action name="login" class="com.acme.struts.LoginAction"/>\n  </package>\n</struts>\n')
 
-def test_mybatis_dynamic_placeholder_table_name_is_excluded_not_misread():
-    """`${tableName}` のような動的テーブル名プレースホルダをテーブル候補として読み始めない。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"dyn\">SELECT * FROM ${tableName}</select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    assert [r for r in res.refs if r.extra.get("via") == "mapper_sql"] == []
-
-
-def test_mybatis_hash_line_comment_in_sql_body_is_ignored():
-    """MyBatis（MySQL 方言）は `#` 行コメントも有効——DDL/EXEC SQL の DB2/COBOL 方言（`#` が
-    識別子文字）とは切り分けて `hash_line_comments=True` で呼ぶ（`#{...}` は動的プレースホルダの
-    ため除外のまま）。"""
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <select id=\"selectOrder\">\n"
-        "    # FROM fake\n"
-        "    SELECT * FROM orders\n"
-        "  </select>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert [r.name for r in table_refs] == ["ORDERS"]
-
-
-def test_mybatis_placeholder_in_values_list_is_not_captured_as_table_name():
-    text = (
-        "<mapper namespace=\"com.acme.mybatis.OrderMapper\">\n"
-        "  <insert id=\"insertOrder\">INSERT INTO orders (id, status) VALUES (#{id}, #{status})</insert>\n"
-        "</mapper>\n"
-    )
-    res = A.extract_refs(text, "mybatis/OrderMapper.xml")
-    table_refs = [r for r in res.refs if r.extra.get("via") == "mapper_sql"]
-    assert [r.name for r in table_refs] == ["ORDERS"]
-
-
-def test_mybatis_root_becomes_config_primary():
-    text = "<mapper namespace=\"com.acme.mybatis.OrderMapper\"></mapper>"
-    res = A.collect_defs(text, "mybatis/OrderMapper.xml")
-    assert res.primary is not None
-    assert res.primary.label == "Config" and res.primary.name == "OrderMapper.xml"
-
-
-# --- Struts ---
-
-def test_struts_action_class_becomes_invokes_module_candidate():
-    text = (
-        "<struts>\n"
-        "  <package name=\"default\">\n"
-        "    <action name=\"order\" class=\"com.acme.struts.OrderAction\"/>\n"
-        "  </package>\n"
-        "</struts>\n"
-    )
-    res = A.extract_refs(text, "struts/struts.xml")
-    assert len(res.refs) == 1
-    ref = res.refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("INVOKES", "Module", "com.acme.struts.OrderAction")
-    assert ref.extra == {"via": "action_class", "qualified": True}
-
-
-def test_struts_root_becomes_config_primary():
-    res = A.collect_defs("<struts></struts>", "struts/struts.xml")
-    assert res.primary is not None
-    assert res.primary.label == "Config" and res.primary.name == "struts.xml"
-
-
-# --- 設定でない XML（全件受理・§6）---
-
-def test_non_config_root_yields_no_primary_and_xml_not_config_dropped():
-    text = "<project><modelVersion>4.0.0</modelVersion></project>"
-    res = A.collect_defs(text, "nonconfig/pom.xml")
-    assert res.primary is None and res.children == []
-    assert len(res.dropped) == 1
-    assert res.dropped[0].reason == "xml_not_config"
-    assert res.dropped[0].line == 1
-    assert res.dropped[0].snippet == "project"
-
-
-def test_non_config_xml_extract_refs_returns_nothing():
-    text = "<web-app><display-name>Demo</display-name></web-app>"
-    res = A.extract_refs(text, "nonconfig/web.xml")
-    assert res.refs == [] and res.dropped == []
-
-
-# --- 壊れた XML ---
-
-def test_malformed_xml_yields_no_primary_and_xml_parse_error_dropped():
-    text = "<beans>\n  <bean class=\"com.acme.a.Foo\">\n</beans>\n"     # bean が閉じていない
-    res = A.collect_defs(text, "broken/broken.xml")
-    assert res.primary is None and res.children == []
-    assert len(res.dropped) == 1
-    assert res.dropped[0].reason == "xml_parse_error"
-
-
-def test_malformed_xml_extract_refs_returns_nothing():
-    text = "<beans>\n  <bean class=\"com.acme.a.Foo\">\n</beans>\n"
-    res = A.extract_refs(text, "broken/broken.xml")
-    assert res.refs == [] and res.dropped == []
-
-
-# --- 外部実体（XXE）は展開しない ---
-
-def test_external_entity_reference_is_rejected_not_resolved():
-    """DTD の外部実体参照は展開せず（`SetParamEntityParsing`＋`ExternalEntityRefHandler` が拒否）、
-    パースエラーとして `Dropped("xml_parse_error", ...)` に落とす——外部ファイルの内容が
-    ノードの値/名前に紛れ込まない（旧 `ElementTree.iterparse` と同水準の安全性）。"""
-    text = (
-        '<?xml version="1.0"?>'
-        '<!DOCTYPE beans [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
-        '<beans><bean class="&xxe;"/></beans>'
-    )
-    res = A.collect_defs(text, "xxe/attempt.xml")
-    assert res.primary is None
-    assert len(res.dropped) == 1 and res.dropped[0].reason == "xml_parse_error"
-
-
-# --- キー単位 Config children（S3'・A7 案B）---
-
-def test_spring_bean_id_and_name_become_config_children():
-    text = (
-        "<beans>\n"
-        '  <bean id="orderService" name="orderSvc, orderServiceAlias" class="com.acme.Foo">\n'
-        '    <property name="timeout" value="30"/>\n'
-        "  </bean>\n"
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "spring/applicationContext.xml")
-    by_name = {c.name: c for c in res.children}
-    assert set(by_name) == {"orderService", "orderSvc", "orderServiceAlias", "orderService.timeout"}
-    assert by_name["orderService"].cid_key == "key:bean:orderService"
-    assert by_name["orderService"].extra == {"config_value": "com.acme.Foo", "key_kind": "bean"}
-    assert by_name["orderService.timeout"].extra == {"config_value": "30", "key_kind": "property"}
-    assert res.dropped == []
-
-
-def test_spring_property_outside_any_named_bean_is_not_a_child():
-    """id/name の無い匿名 bean 配下の `<property>` は接頭辞になる識別子が無いため children にしない。"""
-    text = (
-        "<beans>\n"
-        '  <bean class="com.acme.Foo">\n'
-        '    <property name="timeout" value="30"/>\n'
-        "  </bean>\n"
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "spring/applicationContext.xml")
-    assert res.children == []
-
-
-def test_spring_property_placeholder_location_is_reported_as_dropped():
-    text = (
+CHILDREN_CASES = {
+    "spring_bean_id_name_property": (
+        _beans('  <bean id="orderService" name="orderSvc, orderServiceAlias" class="com.acme.Foo">\n'
+               '    <property name="timeout" value="30"/>\n  </bean>\n'), SPRING,
+        {"orderService": {"config_value": "com.acme.Foo", "key_kind": "bean"},
+         "orderSvc": None, "orderServiceAlias": None,
+         "orderService.timeout": {"config_value": "30", "key_kind": "property"}}, []),
+    "spring_anonymous_bean_property_not_child": (
+        _beans('  <bean class="com.acme.Foo">\n    <property name="timeout" value="30"/>\n  </bean>\n'),
+        SPRING, {}, None),
+    "spring_property_placeholder_location_dropped": (
         '<beans xmlns:context="http://www.springframework.org/schema/context">\n'
-        '  <context:property-placeholder location="classpath:app.properties"/>\n'
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "spring/applicationContext.xml")
-    assert res.children == []
-    assert [(d.reason, d.snippet) for d in res.dropped] == [
-        ("config_placeholder_location", "classpath:app.properties")]
+        '  <context:property-placeholder location="classpath:app.properties"/>\n</beans>\n', SPRING, {},
+        [("config_placeholder_location", "classpath:app.properties")]),
+    "spring_alias": (
+        _beans('  <alias name="orderService" alias="orderServiceAlias"/>\n'), SPRING,
+        {"orderServiceAlias": {"config_value": "orderService", "key_kind": "bean"}}, None),
+    "spring_duplicate_key_first_wins": (
+        _beans('  <bean id="svc" class="com.acme.A"/>\n  <bean id="svc" class="com.acme.B"/>\n'), SPRING,
+        {"svc": {"config_value": "com.acme.A"}}, [("config_duplicate_key", "svc")]),
+    "struts_same_bare_key_different_kinds_not_duplicate": (
+        STRUTS_SAME_KEY, "struts/struts.xml", {"login": None}, []),       # 個別に検証（下の専用テスト）
+    "mybatis_statement_and_result_map_ids": (
+        _mapper('  <resultMap id="OrderResult"/>\n  <select id="selectOrder">SELECT 1</select>\n'), MAPPER,
+        {"com.acme.mybatis.OrderMapper.OrderResult": {"key_kind": "mapper"},
+         "com.acme.mybatis.OrderMapper.selectOrder": {"key_kind": "mapper"}}, None),
+    "mybatis_without_namespace_no_children": (
+        '<mapper>\n  <select id="selectOrder">SELECT 1</select>\n</mapper>\n', MAPPER, {}, None),
+    "struts_action_and_constant": (
+        '<struts>\n  <constant name="struts.i18n.encoding" value="UTF-8"/>\n  <package name="default">\n'
+        '    <action name="order" class="com.acme.struts.OrderAction"/>\n  </package>\n</struts>\n',
+        "struts/struts.xml",
+        {"order": {"config_value": "com.acme.struts.OrderAction", "key_kind": "action"},
+         "struts.i18n.encoding": {"config_value": "UTF-8", "key_kind": "property"}}, None),
+    "struts_package_name_not_child": ('<struts>\n  <package name="default"/>\n</struts>\n', "struts/struts.xml", {}, None),
+    "property_ref_not_a_child": (
+        _beans('  <bean id="orderService" class="com.acme.Foo">\n    <property name="repo" ref="orderRepository"/>\n'
+               "  </bean>\n"), SPRING, {"orderService": None}, None),
+    "constructor_arg_ref_not_a_child": (
+        _beans('  <bean id="orderService" class="com.acme.Foo">\n    <constructor-arg ref="orderRepository"/>\n'
+               "  </bean>\n"), SPRING, {"orderService": None}, None),
+    "bean_parent_is_reference_only": (
+        _beans('  <bean id="AbstractCodeList" class="jp.example.fw.JdbcCodeList" abstract="true"/>\n'
+               '  <bean id="CL_SAMPLE" parent="AbstractCodeList">\n'
+               '    <property name="querySql" value="SELECT code FROM sample_code"/>\n  </bean>\n'),
+        "spring/sample-codelist.xml", {"AbstractCodeList": None, "CL_SAMPLE": None, "CL_SAMPLE.querySql": None}, None),
+    # Spring Batch
+    "batch_job_and_step_keyed_by_job_id": (
+        f'<beans {BATCH_XMLNS}>\n  <batch:job id="nightlyJob">\n    <batch:step id="loadStep"/>\n  </batch:job>\n</beans>\n',
+        BATCH, {"nightlyJob": {"key_kind": "bean"}, "nightlyJob.loadStep": {"key_kind": "bean"}}, None),
+    "batch_step_outside_job_is_bare_child": (
+        f'<beans {BATCH_XMLNS}>\n  <batch:step id="orphanStep"/>\n</beans>\n', BATCH,
+        {"orphanStep": {"key_kind": "bean"}}, None),
+    "batch_unnamespaced_job_not_batch": ('<beans><job id="notBatch"/></beans>\n', BATCH, {}, None),
+    "batch_alternate_prefix_bound_to_batch_uri": (
+        '<beans xmlns:b="http://www.springframework.org/schema/batch">\n  <b:job id="nightlyJob"/>\n</beans>\n',
+        BATCH, {"nightlyJob": None}, None),
+    "batch_default_namespace_override": (
+        '<beans>\n  <job xmlns="http://www.springframework.org/schema/batch" id="nightlyJob"/>\n</beans>\n',
+        BATCH, {"nightlyJob": None}, None),
+}
 
 
-def test_spring_alias_becomes_config_child_keyed_by_alias_name():
-    text = '<beans>\n  <alias name="orderService" alias="orderServiceAlias"/>\n</beans>\n'
-    res = A.collect_defs(text, "spring/applicationContext.xml")
-    assert len(res.children) == 1
-    child = res.children[0]
-    assert child.name == "orderServiceAlias"
-    assert child.extra == {"config_value": "orderService", "key_kind": "bean"}
+@pytest.mark.parametrize("text,path,children,dropped", CHILDREN_CASES.values(), ids=CHILDREN_CASES)
+def test_collect_defs_config_children(text, path, children, dropped):
+    res = A.collect_defs(text, path)
+    assert {c.name for c in res.children} == set(children)
+    for c in res.children:
+        want = children[c.name]
+        assert want is None or all(c.extra.get(k) == v for k, v in want.items()), c
+    if dropped is not None:
+        assert [(d.reason, d.snippet) for d in res.dropped] == dropped
 
 
-def test_spring_duplicate_config_key_is_reported_as_dropped_and_first_wins():
-    text = (
-        "<beans>\n"
-        '  <bean id="svc" class="com.acme.A"/>\n'
-        '  <bean id="svc" class="com.acme.B"/>\n'
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "spring/applicationContext.xml")
-    assert [c.extra["config_value"] for c in res.children if c.name == "svc"] == ["com.acme.A"]
-    assert [(d.reason, d.snippet) for d in res.dropped] == [("config_duplicate_key", "svc")]
-
-
-def test_duplicate_bare_key_across_different_key_kinds_is_not_treated_as_duplicate():
-    """`seen` は `(key_kind, 裸キー)` の組で判定する——同じ裸キー `login` でも
-    `key_kind` が違えば（`constant`＝property と `action`）別名前空間なので、どちらも
-    `config_duplicate_key` として落とされず両方 children に残る。"""
-    text = (
-        "<struts>\n"
-        '  <constant name="login" value="loginPage"/>\n'
-        '  <package name="default">\n'
-        '    <action name="login" class="com.acme.struts.LoginAction"/>\n'
-        "  </package>\n"
-        "</struts>\n"
-    )
-    res = A.collect_defs(text, "struts/struts.xml")
-    by_kind = {(c.name, c.extra["key_kind"]) for c in res.children}
-    assert by_kind == {("login", "property"), ("login", "action")}
+def test_duplicate_bare_key_across_key_kinds_keeps_both_with_distinct_cids():
+    """`seen` は `(key_kind, 裸キー)` の組で判定する——同じ `login` でも property と action は別名前空間。"""
+    res = A.collect_defs(STRUTS_SAME_KEY, "struts/struts.xml")
+    assert {(c.name, c.extra["key_kind"]) for c in res.children} == {("login", "property"), ("login", "action")}
+    assert {c.cid_key for c in res.children} == {"key:property:login", "key:action:login"}
     assert res.dropped == []
-    cid_keys = {c.cid_key for c in res.children}              # cid も key_kind で分離される
-    assert cid_keys == {"key:property:login", "key:action:login"}
 
 
-def test_mybatis_statement_and_result_map_ids_become_config_children_keyed_by_namespace():
-    text = (
-        '<mapper namespace="com.acme.mybatis.OrderMapper">\n'
-        '  <resultMap id="OrderResult"/>\n'
-        '  <select id="selectOrder">SELECT 1</select>\n'
-        "</mapper>\n"
-    )
-    res = A.collect_defs(text, "mybatis/OrderMapper.xml")
-    names = {c.name for c in res.children}
-    assert names == {"com.acme.mybatis.OrderMapper.OrderResult",
-                      "com.acme.mybatis.OrderMapper.selectOrder"}
-    assert {c.extra["key_kind"] for c in res.children} == {"mapper"}
-
-
-def test_mybatis_without_namespace_yields_no_config_children():
-    text = '<mapper>\n  <select id="selectOrder">SELECT 1</select>\n</mapper>\n'
-    res = A.collect_defs(text, "mybatis/OrderMapper.xml")
-    assert res.children == []
-
-
-def test_struts_action_and_constant_become_config_children():
-    text = (
-        "<struts>\n"
-        '  <constant name="struts.i18n.encoding" value="UTF-8"/>\n'
-        '  <package name="default">\n'
-        '    <action name="order" class="com.acme.struts.OrderAction"/>\n'
-        "  </package>\n"
-        "</struts>\n"
-    )
-    res = A.collect_defs(text, "struts/struts.xml")
-    by_name = {c.name: c.extra["config_value"] for c in res.children}
-    assert by_name == {"order": "com.acme.struts.OrderAction", "struts.i18n.encoding": "UTF-8"}
-    by_kind = {c.name: c.extra["key_kind"] for c in res.children}
-    assert by_kind == {"order": "action", "struts.i18n.encoding": "property"}
-
-
-def test_struts_package_name_is_not_a_config_child():
-    text = '<struts>\n  <package name="default"/>\n</struts>\n'
-    res = A.collect_defs(text, "struts/struts.xml")
-    assert res.children == []
-
-
-# --- bean 参照（`ref` 属性形・children にはせず ACCESSES(via=config_key, key_kind="bean")） ---
-
-def test_property_ref_attribute_is_not_a_child_but_a_config_key_reference():
-    text = (
-        "<beans>\n"
-        '  <bean id="orderService" class="com.acme.Foo">\n'
-        '    <property name="repo" ref="orderRepository"/>\n'
-        "  </bean>\n"
-        "</beans>\n"
-    )
-    def_res = A.collect_defs(text, "spring/applicationContext.xml")
-    assert {c.name for c in def_res.children} == {"orderService"}    # `repo` は children にしない
-    ref_res = A.extract_refs(text, "spring/applicationContext.xml")
-    config_refs = [r for r in ref_res.refs if r.extra.get("via") == "config_key"]
-    assert len(config_refs) == 1
-    ref = config_refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("ACCESSES", "Config", "orderRepository")
-    assert ref.extra == {"via": "config_key", "key_kind": "bean"}
-    assert ref.line == 3
-
-
-def test_constructor_arg_ref_attribute_becomes_a_config_key_reference():
-    text = (
-        "<beans>\n"
-        '  <bean id="orderService" class="com.acme.Foo">\n'
-        '    <constructor-arg ref="orderRepository"/>\n'
-        "  </bean>\n"
-        "</beans>\n"
-    )
-    def_res = A.collect_defs(text, "spring/applicationContext.xml")
-    assert {c.name for c in def_res.children} == {"orderService"}
-    ref_res = A.extract_refs(text, "spring/applicationContext.xml")
-    config_refs = [r for r in ref_res.refs if r.extra.get("via") == "config_key"]
-    assert len(config_refs) == 1
-    ref = config_refs[0]
-    assert (ref.edge_type, ref.kind, ref.name) == ("ACCESSES", "Config", "orderRepository")
-    assert ref.extra == {"via": "config_key", "key_kind": "bean"}
-
-
-# --- Spring Batch（アナライザ拡張 波3 レーン B）---
-
-_BATCH_XMLNS = 'xmlns:batch="http://www.springframework.org/schema/batch"'
-
-
-def test_batch_job_and_step_become_config_children_keyed_by_job_id():
-    text = (
-        f"<beans {_BATCH_XMLNS}>\n"
-        '  <batch:job id="nightlyJob">\n'
-        '    <batch:step id="loadStep"/>\n'
-        "  </batch:job>\n"
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "batch-context.xml")
-    by_name = {c.name: c for c in res.children}
-    assert set(by_name) == {"nightlyJob", "nightlyJob.loadStep"}
-    assert by_name["nightlyJob"].extra["key_kind"] == "bean"
-    assert by_name["nightlyJob.loadStep"].extra["key_kind"] == "bean"
-
-
-def test_batch_step_outside_any_job_becomes_bare_config_child():
-    """job の外（`<beans>` 直下）の `<batch:step>` は裸キーとして登録する（RV 是正——旧実装は
-    黙って無視していた）。"""
-    text = f'<beans {_BATCH_XMLNS}>\n  <batch:step id="orphanStep"/>\n</beans>\n'
-    res = A.collect_defs(text, "batch-context.xml")
-    assert len(res.children) == 1
-    assert res.children[0].name == "orphanStep"
-    assert res.children[0].extra["key_kind"] == "bean"
-
-
-def test_batch_tasklet_chunk_and_job_listener_refs_become_config_key_references():
-    text = (
-        f"<beans {_BATCH_XMLNS}>\n"
-        '  <batch:job id="nightlyJob">\n'
-        '    <batch:step id="loadStep">\n'
-        '      <batch:tasklet ref="loadTasklet"/>\n'
-        "    </batch:step>\n"
-        '    <batch:step id="payrollStep">\n'
-        '      <batch:chunk reader="payrollReader" processor="payrollProcessor" writer="payrollWriter"/>\n'
-        "    </batch:step>\n"
-        '    <batch:job-listener ref="auditListener"/>\n'
-        "  </batch:job>\n"
-        "</beans>\n"
-    )
-    res = A.extract_refs(text, "batch-context.xml")
-    config_refs = {r.name for r in res.refs if r.extra.get("via") == "config_key"}
-    assert config_refs == {"loadTasklet", "payrollReader", "payrollProcessor", "payrollWriter",
-                            "auditListener"}
-    assert all(r.extra == {"via": "config_key", "key_kind": "bean"}
-              for r in res.refs if r.extra.get("via") == "config_key")
-
-
-# --- Spring Batch の namespace URI 判定（§4(c) RV 是正）---
-
-def test_unnamespaced_job_element_is_not_treated_as_spring_batch():
-    """`batch:`/`b:` プレフィックスも default namespace も無い `<job>` は Spring Batch 扱いにしない
-    （ローカル名だけの誤判定を防ぐ）。"""
-    text = '<beans><job id="notBatch"/></beans>\n'
-    res = A.collect_defs(text, "batch-context.xml")
-    assert res.children == []
-
-
-def test_job_with_alternate_prefix_bound_to_batch_namespace_is_recognized():
-    """prefix の綴りは `batch:` でなくても、URI が Spring Batch のものなら認識する。"""
-    text = (
-        '<beans xmlns:b="http://www.springframework.org/schema/batch">\n'
-        '  <b:job id="nightlyJob"/>\n'
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "batch-context.xml")
-    assert {c.name for c in res.children} == {"nightlyJob"}
-
-
-def test_job_with_default_namespace_override_is_recognized():
-    """要素だけに `xmlns="…/batch"`（default namespace の上書き）を付けた形でも認識する。"""
-    text = (
-        "<beans>\n"
-        '  <job xmlns="http://www.springframework.org/schema/batch" id="nightlyJob"/>\n'
-        "</beans>\n"
-    )
-    res = A.collect_defs(text, "batch-context.xml")
-    assert {c.name for c in res.children} == {"nightlyJob"}
-
-
-# --- TERASOLUNA 5.x 実測（eval/terasoluna/）で見つかった取りこぼし ---
-# 共通ライブラリのコードリスト等は `<bean parent="...">`（bean 定義継承）で抽象 bean を継承し、
-# 複数ファイルに分割した設定は `<import resource="...">` で束ねる——いずれも標準 Spring の記法だが
-# 既存の `_scan` は属性/要素とも一切見ていなかった（Dropped にも挙がらず完全に無検知）。
-
-def test_bean_parent_attribute_becomes_a_config_key_reference():
-    """`<bean parent="X">`（bean 定義継承）は `<property ref>`/`<constructor-arg ref>` と同じ
-    `Config -ACCESSES(via=config_key, key_kind="bean")-> Config` として返す（§4(b) 追補と同型）。"""
-    text = (
-        "<beans>\n"
-        '  <bean id="AbstractCodeList" class="jp.example.fw.JdbcCodeList" abstract="true"/>\n'
-        '  <bean id="CL_SAMPLE" parent="AbstractCodeList">\n'
-        '    <property name="querySql" value="SELECT code FROM sample_code"/>\n'
-        "  </bean>\n"
-        "</beans>\n"
-    )
-    ref_res = A.extract_refs(text, "spring/sample-codelist.xml")
-    config_refs = [r for r in ref_res.refs if r.extra.get("via") == "config_key"
-                   and r.name == "AbstractCodeList"]
-    assert len(config_refs) == 1
-    ref = config_refs[0]
-    assert (ref.edge_type, ref.kind) == ("ACCESSES", "Config")
-    assert ref.extra == {"via": "config_key", "key_kind": "bean"}
-    assert ref.line == 3
-    # `parent` 属性自体は children（キー単位の定義）を増やさない——あくまで参照
-    # （`<property>` は既存契約どおり `CL_SAMPLE.querySql` を1件生成する）
-    def_res = A.collect_defs(text, "spring/sample-codelist.xml")
-    assert {c.name for c in def_res.children} == {"AbstractCodeList", "CL_SAMPLE", "CL_SAMPLE.querySql"}
-
-
-def test_bean_parent_attribute_inside_comment_is_not_a_reference():
-    """コメント化された例示コード（TERASOLUNA tutorial-apps の実例で確認）は expat がそもそも
-    要素として見ないため、誤って参照を作らない。"""
-    text = (
-        "<beans>\n"
-        "  <!-- Example:\n"
-        '  <bean id="CL_SAMPLE" parent="AbstractCodeList"/>\n'
-        "  -->\n"
-        "</beans>\n"
-    )
-    ref_res = A.extract_refs(text, "spring/sample-codelist.xml")
-    assert ref_res.refs == []
-
-
-def test_import_resource_becomes_invokes_config_reference_by_path_suffix():
-    """`<import resource="classpath:/META-INF/spring/x-domain.xml">`（設定ファイル合成・
-    TERASOLUNA の `*.xml` が `*-domain.xml`/`*-env.xml` 等を束ねる構成）は既存の `include` via へ
-    相乗りする。宛先名は `classpath:`/`classpath*:`/`file:` プレフィックスを除いた**パスの形の
-    まま**（basename に縮めない——RV 是正: 同名の別ファイルとの誤接続防止）。`extra["path_suffix"]`
-    が立ち、実際の末尾一致解決は共通層（`world_graph._resolve_path_suffix`）が担う。"""
-    text = (
-        "<beans>\n"
-        '  <import resource="classpath:/META-INF/spring/sample-domain.xml"/>\n'
-        '  <import resource="sample-env.xml"/>\n'
-        "</beans>\n"
-    )
-    ref_res = A.extract_refs(text, "spring/sample.xml")
-    include_refs = [r for r in ref_res.refs if r.extra.get("via") == "include"]
-    assert {(r.kind, r.name, r.edge_type) for r in include_refs} == {
-        ("Config", "META-INF/spring/sample-domain.xml", "INVOKES"),
-        ("Config", "sample-env.xml", "INVOKES"),
-    }
-    assert all(r.extra.get("path_suffix") is True for r in include_refs)
-    assert ref_res.dropped == []
-
-
-def test_import_without_resource_attribute_is_reported_as_dropped_missing_resource():
-    """`resource` 属性の無い（または空の）`<import>` は推測せず
-    `Dropped("config_import_missing_resource", ...)` として申告する。"""
-    text = "<beans>\n  <import/>\n</beans>\n"
-    ref_res = A.extract_refs(text, "spring/sample.xml")
-    assert ref_res.refs == []
-    assert len(ref_res.dropped) == 1
-    dropped = ref_res.dropped[0]
-    assert (dropped.reason, dropped.line, dropped.snippet) == ("config_import_missing_resource", 2, "")
-
-
-def test_import_resource_with_wildcard_is_reported_as_dropped_not_guessed():
-    """Ant 風ワイルドカード（`classpath*:...**...*-codelist.xml` のような複数ファイル一括
-    import・TERASOLUNA 実測で確認）は宛先を一意に特定できないため、推測接続せず
-    `Dropped("config_import_wildcard", ...)` として申告する（黙って捨てない）。"""
-    text = (
-        "<beans>\n"
-        '  <import resource="classpath*:META-INF/spring/**/*-codelist.xml"/>\n'
-        "</beans>\n"
-    )
-    ref_res = A.extract_refs(text, "spring/sample.xml")
-    assert ref_res.refs == []
-    assert len(ref_res.dropped) == 1
-    dropped = ref_res.dropped[0]
-    assert dropped.reason == "config_import_wildcard"
-    assert dropped.snippet == "classpath*:META-INF/spring/**/*-codelist.xml"
+def test_spring_bean_id_cid_key():
+    res = A.collect_defs(
+        _beans('  <bean id="orderService" class="com.acme.Foo"/>\n'), SPRING)
+    assert [c.cid_key for c in res.children] == ["key:bean:orderService"]

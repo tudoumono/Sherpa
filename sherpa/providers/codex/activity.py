@@ -247,7 +247,7 @@ def _summarize_session_file(path: Path, *, min_epoch: float | None) -> dict | No
     """1セッション JSONL（親 or 子の1体分）を要約する。先頭行が `session_meta` として読めなければ None。以降は行ごとに fail-open（読めない行は `unparsed["invalid_json"]`）。
     `min_epoch`（省略時=フィルタしない）より前の `timestamp` の行は数えない。timestamp が読めない行は `unparsed["timestamp"]` に計上して飛ばす。
     """
-    tokens = {k: 0 for k in _CHILD_USAGE_KEYS}
+    tokens = dict.fromkeys(_CHILD_USAGE_KEYS, 0)
     rounds: list = []
     compactions: list = []
     tools: dict = {}
@@ -392,7 +392,7 @@ def _merge_parent_pieces(pieces: list) -> dict:
     if len(pieces) == 1:
         pieces[0].pop("_round_count", None)
         return pieces[0]
-    merged_tokens = {k: 0 for k in _CHILD_USAGE_KEYS}
+    merged_tokens = dict.fromkeys(_CHILD_USAGE_KEYS, 0)
     merged_rounds: list = []
     merged_compactions: list = []
     merged_tools: dict = {}

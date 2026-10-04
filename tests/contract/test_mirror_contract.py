@@ -96,21 +96,6 @@ def test_link_resolves_within_generation_only():
         assert not any(other in d for d in copies + calls)
 
 
-def test_subtree_filter_yields_single_generation_subgraph():
-    """トップ/工程フォルダで絞ると、その部分木だけの subgraph になる（path prefix フィルタ＝§3）。"""
-    from sherpa.ingest import world_graph
-    nodes, edges, _ = _build()
-    n4, e4 = world_graph.subgraph(nodes, edges, "4期更改")
-    assert n4 and all(n["top_scope"] == "4期更改" for n in n4)        # 4期だけ
-    assert not any("5期更改" in (e["src"] + e["dst"]) for e in e4)      # 5期へは出ない
-    # さらに工程で絞れる（どの階層でも）
-    n4dev, _ = world_graph.subgraph(nodes, edges, "4期更改/03_開発")
-    assert n4dev and all(n["path"].startswith("4期更改/03_開発/") for n in n4dev)
-    # 全体は両世代を含む（横断が見える）
-    full_n, _ = world_graph.subgraph(nodes, edges, None)
-    assert {n["top_scope"] for n in full_n} >= {"4期更改", "5期更改"}
-
-
 def test_original_download_is_path_based_not_basename():
     """原本DL はパス基準＝同名2ファイルを取り違えない（4期 ORDER-MAIN と 5期 ORDER-MAIN を区別）。"""
     from sherpa.ingest import world_graph

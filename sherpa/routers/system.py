@@ -33,7 +33,7 @@ settings_router = APIRouter()
 
 
 # チャットで閉じた頭脳（保存させない。保存済みの値はチャット時に選び直しを案内する）。
-_CLOSED_CHAT_AGENTS = frozenset({"heuristic", "gemini", "bedrock"})
+_CLOSED_CHAT_AGENTS = frozenset({"heuristic", "gemini", "bedrock", "openai", "ollama"})
 
 
 class SettingsReq(BaseModel):
@@ -134,8 +134,6 @@ def _public_settings(s: dict) -> dict:
     sys_s = store.get_system_settings()
     openai_key = keys.resolve_api_key("openai", s, system_settings=sys_s)
     saved_agent = s["agent"]
-    if saved_agent in agent_constructs.LEGACY_AGENTS:  # 旧・直結経路の保存値は簡易として返す（DB は不変）。
-        saved_agent = "simple"
     return {"agent": saved_agent or agent_constructs.default_agent(sys_s),
             # web_search の管理者許可は `system_settings.web_search_allowed`（管理画面「プロバイダ＋接続先」タブ）が唯一の真実源で、ここでは調べ方ブロックの Web 検索行の表示条件（web/chat/menus.js）にだけ使う。実行に使うかどうかは `ChatReq.web_search` だけで決まる。
             "web_search_available": _web_search_admin_allowed(sys_s),
@@ -212,10 +210,6 @@ def settings_put(req: SettingsReq, request: Request):
         for _k in ("openai_api_key",):
             if getattr(req, _k) is not None:
                 raise HTTPException(422, "個人 API キーは無効化されています（管理者が中央設定でキーを管理します）")
-    # 現在保存中の値（pending の土台）を一度だけ取得する。
-    cur = store.get_settings(uid)
-    # このリクエストを重ねた「保存後に成立する設定」を一度だけ作る（`is not None` の送られてきたフィールドだけ重ねる・明示的な "" も重なる）。
-    pending = {**cur, **{k: v for k, v in req.model_dump().items() if v is not None}}
     if req.agent and (req.agent not in AGENT_PROVIDERS or req.agent in _CLOSED_CHAT_AGENTS):
         raise HTTPException(422, "agent は codex / simple のいずれか"
                                  "（Gemini・AWS Bedrock・AI なしの定型応答はチャットでは廃止しました）")

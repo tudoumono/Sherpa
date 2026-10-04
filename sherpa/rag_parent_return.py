@@ -7,8 +7,6 @@ ES のヒットを doc_id で束ね、返す本文を P3（全文）/P2（領域
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 from . import es_index, worlds
 
 # 非agentic 側専用の予算（チャット/外部検索APIの1呼び出し用。agentic 側の予算とは別）
@@ -19,43 +17,14 @@ _READ_CAP_BYTES = 8 * 1024 * 1024
 _REGION_CHUNKS_MAX = 5000
 
 
-def parent_return_enabled() -> bool:
-    """常時 True（系統切替トグルは無い。呼び出し形を変えないために関数だけ残す）。"""
-    return True
-
-
 def excerpt_budget_bytes() -> int:
     """非agentic の親返しに使う予算（バイト・256KiB）。"""
     return DEFAULT_BUDGET_BYTES
 
 
-def _rag_md_path(world: str, doc_id: str) -> Path | None:
-    """`doc_id` の `{rel}.rag.md`（RAG 正本）の実パス。封じ込め・symlink 拒否込み（無効/不在は None）。"""
-    if not isinstance(doc_id, str) or not doc_id or doc_id.startswith("/") or "\\" in doc_id or "\x00" in doc_id:
-        return None
-    parts = doc_id.split("/")
-    if ".." in parts or "" in parts:
-        return None
-    root = worlds.derived_rag_dir(world)
-    if not root:
-        return None
-    root = Path(root)
-    cand = root / (doc_id + ".rag.md")
-    try:
-        rr = root.resolve()
-        rp = cand.resolve()
-        if not (rp == rr or rp.is_relative_to(rr)):
-            return None
-        if not rp.is_file() or rp.is_symlink():
-            return None
-    except OSError:
-        return None
-    return rp
-
-
 def rag_md_size(world: str, doc_id: str) -> int | None:
     """親返しの P3/P2 判定用: `doc_id` の rag.md バイトサイズを `stat` で見る（読む前に見る）。"""
-    p = _rag_md_path(world, doc_id)
+    p = worlds.rag_md_path(world, doc_id)
     if p is None:
         return None
     try:
@@ -66,7 +35,7 @@ def rag_md_size(world: str, doc_id: str) -> int | None:
 
 def rag_md_read_full(world: str, doc_id: str) -> str | None:
     """親返し P3: rag.md 全文を読む。`rag_md_size` で予算内と確認済みの doc にのみ呼ぶ（`_READ_CAP_BYTES` はサイズ変化への保険）。"""
-    p = _rag_md_path(world, doc_id)
+    p = worlds.rag_md_path(world, doc_id)
     if p is None:
         return None
     try:
@@ -84,7 +53,7 @@ def rag_md_region_text(world: str, doc_id: str, target_chunk_ids, byte_cap: int)
     """
     if not target_chunk_ids:
         return None
-    p = _rag_md_path(world, doc_id)
+    p = worlds.rag_md_path(world, doc_id)
     if p is None:
         return None
     remaining = set(target_chunk_ids)
@@ -189,8 +158,6 @@ def apply_to_hits(world: str, hits: list) -> list:
     集約結果は代表ヒットが元あった位置へ戻す（スコア降順を保つ）。代表以外のメンバーは出力しない。
     `fused_search.py`/`chat_service.py` の共有部品。
     """
-    if not parent_return_enabled():
-        return hits
     rag_hits = [h for h in hits if h.get("chunk_id")]
     if not rag_hits:
         return hits

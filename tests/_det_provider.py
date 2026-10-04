@@ -3,8 +3,8 @@
 チャットの頭脳は Codex 調査と簡易だけで、AI なしの定型回答は閉じている。ただし /chat・SSE・保存・
 監査の配線テストは LLM を起動せずに「取得は本物（Neo4j/grep）・生成はテンプレ」の回答を要るため、
 保存済み agent が `heuristic`（テストの既定・`tests/_world_setup.py`）のときだけ、`tests/conftest.py` が
-`sherpa.providers._DisabledProvider("heuristic")` をこの頭脳へ差し替える。閉じた頭脳の案内そのものを
-検証するテストは `sherpa.providers._DisabledProvider_real` を使う。
+`sherpa.providers.get_provider` をこの頭脳を返すものへ差し替える。差し替え前の実体は
+`sherpa.providers._get_provider_real`。
 """
 from __future__ import annotations
 
@@ -41,17 +41,20 @@ class DeterministicTestProvider(Provider):
 
 
 def install() -> None:
-    """閉じた頭脳 `heuristic` の案内 provider（`_DisabledProvider("heuristic")`）をテスト頭脳へ差し替える。"""
+    """保存済み agent が `heuristic` のときだけ `get_provider` をテスト頭脳を返すものへ差し替える。"""
     import sherpa.providers as P
-    if getattr(P, "_DisabledProvider_real", None) is not None:
+    if getattr(P, "_get_provider_real", None) is not None:
         return
-    real = P._DisabledProvider
-    P._DisabledProvider_real = real
+    real = P.get_provider
+    P._get_provider_real = real
 
-    class _TestDisabledProvider(real):
-        def __new__(cls, agent: str):
-            if agent == "heuristic":
-                return DeterministicTestProvider()
-            return super().__new__(cls)
+    def get_provider(settings: dict | None = None, system_settings: dict | None = None):
+        saved = (settings or {}).get("agent")
+        if isinstance(saved, str) and saved.strip().lower() == "heuristic":
+            from sherpa.providers.prompts import ANSWER_POLICY
+            p = DeterministicTestProvider()
+            p.system_prompt = ANSWER_POLICY
+            return p
+        return real(settings, system_settings)
 
-    P._DisabledProvider = _TestDisabledProvider
+    P.get_provider = get_provider

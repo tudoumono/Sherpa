@@ -12,9 +12,10 @@ import re
 import zipfile
 from xml.etree import ElementTree as ET
 
+from .rels import load_relationships
+
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-_RELS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
 # footnote/endnote の区切り線・継続区切り線（本文ではない・IR には出さない）。
 _NOTE_SEPARATOR_TYPES = {"separator", "continuationSeparator"}
@@ -101,13 +102,7 @@ def deleted_runs(p_el) -> list[str]:
 
 def load_rels(zf: zipfile.ZipFile, part_name: str) -> dict[str, str]:
     """`part_name`（例 `"word/document.xml"`）に対応する `_rels/*.rels` から `{Id: Target}` を返す。パート・rels が無い/壊れている場合は空 dict。"""
-    from posixpath import basename, dirname, join
-    rels_name = join(dirname(part_name), "_rels", basename(part_name) + ".rels")
-    try:
-        root = ET.fromstring(zf.read(rels_name))
-    except (KeyError, ET.ParseError):
-        return {}
-    return {r.get("Id"): r.get("Target") for r in root.iter(f"{_RELS}Relationship") if r.get("Id")}
+    return {rel.id: rel.target for rel in load_relationships(zf.read, part_name) if rel.id}
 
 
 def hyperlinks(p_el, rels: dict[str, str]) -> list[dict]:

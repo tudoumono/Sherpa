@@ -25,7 +25,6 @@ def test_auth_is_enabled_by_default():
     old_enabled = _setenv("SHERPA_AUTH_ENABLED", None)
     old_disabled = _setenv("SHERPA_AUTH_DISABLED", None)
     try:
-        assert auth.auth_enabled() is True
         assert auth.auth_disabled() is False
     finally:
         _restore("SHERPA_AUTH_ENABLED", old_enabled)
@@ -36,7 +35,6 @@ def test_auth_disabled_requires_explicit_env():
     old_enabled = _setenv("SHERPA_AUTH_ENABLED", None)
     old_disabled = _setenv("SHERPA_AUTH_DISABLED", "1")
     try:
-        assert auth.auth_enabled() is False
         assert auth.auth_disabled() is True
     finally:
         _restore("SHERPA_AUTH_ENABLED", old_enabled)
@@ -50,7 +48,6 @@ def test_auth_disabled_ignored_in_production():
     old_disabled = _setenv("SHERPA_AUTH_DISABLED", "1")
     try:
         assert auth.auth_disabled() is False
-        assert auth.auth_enabled() is True
     finally:
         _restore("SHERPA_ENV", old_env)
         _restore("SHERPA_AUTH_DISABLED", old_disabled)

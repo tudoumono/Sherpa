@@ -86,7 +86,7 @@ def test_legacy_world_first_sync_clears_control_file_from_ledger_and_neo4j():
         world_neo4j.load_world(
             [{"cid": FAKE_RULE_CID, "label": "Document", "name": "偽ルール", "world_id": wid,
              "top_scope": "4期", "phase": None, "category": None, "path": None, "scope_path": None,
-             "value": None, "extraction_method": "llm", "status": "active"}],
+             "value": None, "status": "active"}],
             [], wid, env["uri"], env["user"], env["pw"])
 
         res = worker.sync(wid)

@@ -1,40 +1,14 @@
 """chat_service の単体テスト。
 
-- _cap_trace_v2: EXT-1（Execution Event v2・`docs/archive/2026-08-22-拡張設計.md` §2）。
-  TOGGLE-RM（2026-09-03）で v1（旧 `_cap_trace`・トグル `SHERPA_EXEC_EVENT_V2`）を撤去し常時
-  v2 固定＝`answer.trace_version` は常に2が付く。二段上限（RV是正・needs-work全6件採用）:
-  ①ソフト上限（親は必ず残し末端だけ `(parent_id, kind, agent_run_id)` 単位で集約ノードへ畳む・
-  集約ノード自体も予算に数える）→②ハード上限（件数・バイト双方。ソフト対応後もなお超過なら
-  最も古いサブツリー単位で丸ごと畳む・orphan は構造的に発生しない）→③それでも超過なら
-  `budget_limit_reached` マーカーで honest failure、の順に決定的に適用することを固定する。
-  集約ノードの evidence_ids は上限K件＋omitted_evidence_count。集約IDは null 明示区別の正規JSON
-  を sha1 の全40桁（旧・文字列連結プレースホルダの衝突バグ是正／旧12桁切り詰めの是正）。
-  不正 parent_id は親なしへ正規化して**出力ノード自身の parent_id も書き換える**（件数に関わらず
-  必ず実行・高速経路でも素通りしない）。`_assert_no_orphans`（既定で orphan を検出・
-  `budget_limit_reached` の内容スニッフィングによる自動免除は廃止＝呼び出し側が明示する
-  `allow_truncated=True` でのみ免除）／`_assert_dict_ids_match_keys` を全 cap テストへ適用する。
-  `_trace_bytes` は実保存（psycopg `Json` 既定＝`ensure_ascii=True`）と同じ測り方（旧 SSE 側基準の
-  過小測定を是正）。honest failure（`_budget_limit_truncate`）は件数を合わせた後もバイト上限を
-  満たすまで保持ノードを追加削減する収束ループを持つ。`build_event` は集約/マーカー専用の予約
-  id（`trace-omitted:`/`trace-subtree:`/`trace-budget-limit-reached`）を拒否し、`_build_reserved_event`
-  （集約/マーカー生成専用の内部関数）はその逆を強制する。
-  3保存サイト（handle_message／stream_message の answer・clarify）は store をフェイク差し替えして
-  PG 不要で検証（`test_*_mock_store_*`）。`handle_message` 経由の実 DB end-to-end は補助として残す
-  （DB down は skip）。
-- _history_pairs / _clip_history_msg: R1a（会話継続・履歴 priming）。完全対のみ抽出・N対＋文字予算の
-  二重キャップ・メッセージ単体切り詰め（要 Postgres・DB down は skip）。
-- 確認ID 回帰: 履歴に確認ID マーカーを含む過去ターンがあっても、現在ターンの判定（_can_ask/
-  chat_router._resume_lens）は message（別チャネル）だけを見るため影響を受けない（PG/Neo4j 不要）。
-- _degrade_overload/_impact_overload_result: secRV 範囲外是正（2026-07-19・影響分析の Neo4j 安全弁）。
-  impact レンズが `GraphQueryOverloadError` で失敗した際、LLM 合成を経由させず固定文言の `_result`
-  へ差し替えることを純関数（DB/Neo4j 不要・フェイク provider ジェネレータ）で固定する。
-- _known_terms: secRV 範囲外是正 追補（2026-07-19・RV指摘 HIGH-2）。以前は `.data()` で無制限に
-  全件展開しており、knowledge=true の全チャット（impact/troubleshoot/qa）が安全弁を迂回していた。
-  `lens_service._run_capped` 経由になったことで、timeout→空リスト／天井到達→部分リストへソフト
-  縮退し、例外を出さないこと・返却形（name 文字列のリスト）が不変であることを固定する。
+- `_cap_trace_v2`: 実行イベント v2 の二段上限（ソフト→ハード→honest failure）。決定的・orphan 無し・
+  不正 parent_id は親なしへ正規化。`_trace_bytes` は実保存（`ensure_ascii=True`）と同じ測り方。
+- 保存サイト（stream_message の answer・clarify）は store をフェイク差し替えして PG 不要で検証。
+- 履歴 priming（`_history_pairs`/`_clip_history_msg`）・調べ方/深さ/検索経路の `_dispatch` 配線・
+  `_resolve_scope`/`_resolve_lens`・`_retry_hints`/`_finalize`・グラフ縮退（S4）・個人由来の引き継ぎ。
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 
@@ -47,11 +21,8 @@ from sherpa import store
 
 @pytest.fixture(autouse=True)
 def _default_world_graph_not_empty(monkeypatch):
-    """`_dispatch` の impact/troubleshoot 分岐は0件ヒット時に `world_graph_is_empty` を呼ぶ
-    （S4・グラフ未構築の縮退）——このモジュールの大半のテストは `session=None` で
-    `run_impact`/`run_troubleshoot` を直接差し替えるだけなので、既定は「実データがある」側に
-    倒す（従来どおり判定不能ケースの回答を検証できるようにする）。グラフ未構築の挙動を
-    検証するテストはこのデフォルトを個別に上書きする。"""
+    """`_dispatch` の impact/troubleshoot 分岐は 0 件時に `world_graph_is_empty` を呼ぶ。既定は
+    「実データがある」側に倒す（未構築の挙動を検証するテストが個別に上書きする）。"""
     monkeypatch.setattr(CS, "world_graph_is_empty", lambda session, world: False)
 
 
@@ -67,37 +38,24 @@ def _new_conv():
     return store.create_conversation(user_id="admin", world="v1", title="history test")["id"]
 
 
-def _node(i, detail="d"):
-    return {"type": "node", "id": f"n{i}", "kind": "tool", "label": f"label{i}",
-            "detail": detail, "status": "done"}
+_NODE = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
+         "detail": "内容を把握しました", "status": "done"}
 
 
-def test_sources_excludes_importance_control_file():
-    """`_重要度.txt`（文書の重要度設定ファイル自体）は回答出典に出さない
-    （§5・独立入口として `chat_service._sources` 自身も判定する）。"""
-    out = CS._sources(["a.md", "_重要度.txt", "4期/_重要度.txt"], "v1")
-    doc_ids = {s["doc_id"] for s in out}
-    assert doc_ids == {"a.md"}
-
-
-def test_sources_attaches_importance_when_resolved(monkeypatch):
-    """I2（2026-09-05）: world root が解決でき、`resolve_many` が値を返せば出典へ
-    `importance`/`importance_reason` を条件付きで足す。`importance_source` は出さない（J4）。
-    解決が無い doc はキー自体を持たない（§2 truth table）。"""
+def test_sources_importance_and_control_file(monkeypatch):
     from sherpa.ingest import importance as imp
+    # `_重要度.txt`（設定ファイル自体）は出典に出さない
+    assert {s["doc_id"] for s in CS._sources(["a.md", "_重要度.txt", "4期/_重要度.txt"], "v1")} == {"a.md"}
+    # 解決できれば importance/importance_reason を足す（importance_source は出さない）・解決の無い doc は持たない
     monkeypatch.setattr(CS.worlds, "world_dir", lambda w: "/tmp/x")
     res = imp.Resolution(value="高", reason="契約書", config_path="_重要度.txt", rule_line=1)
     monkeypatch.setattr(CS.importance, "resolve_many", lambda w, rels, root=None, sig=None: {"a.md": res})
     out = {s["doc_id"]: s for s in CS._sources(["a.md", "b.md"], "v1")}
     assert out["a.md"]["importance"] == "高" and out["a.md"]["importance_reason"] == "契約書"
-    assert "importance_source" not in out["a.md"]
-    assert "importance" not in out["b.md"]
+    assert "importance_source" not in out["a.md"] and "importance" not in out["b.md"]
 
 
 def test_sources_unregistered_world_skips_resolve_call_and_stays_two_keys(monkeypatch):
-    """未登録 world（`worlds.world_dir` が None）は `resolve_many` 自体を呼ばない——出典は
-    従来どおり2キー（`doc_id`/`download_url`）のまま（受け入れ条件＝重要度制御ファイルの無い
-    world で出典の出力完全不変）。"""
     called = {"n": 0}
 
     def _boom(*a, **k):
@@ -107,36 +65,19 @@ def test_sources_unregistered_world_skips_resolve_call_and_stays_two_keys(monkey
     monkeypatch.setattr(CS.worlds, "world_dir", lambda w: None)
     monkeypatch.setattr(CS.importance, "resolve_many", _boom)
     out = CS._sources(["a.md"], "v1")
-    assert called["n"] == 0
-    assert set(out[0]) == {"doc_id", "download_url"}
+    assert called["n"] == 0 and set(out[0]) == {"doc_id", "download_url"}
 
 
-# ---- EXT-1: _cap_trace_v2 の二段上限（純関数・DB 不要） ----
-# RV是正（needs-work・指摘6件・全件採用）: ①ソフト上限だけでは実効上限にならない例（保護対象＝
-# 「他ノードの親」自体が多い／全末端が別 agent_run_id で集約が効かない）があるため、ソフト
-# （_MAX_TRACE_NODES）→ハード（_MAX_TRACE_NODES_HARD・件数とバイト）→honest failure マーカーの
-# 三段構成に精緻化。②集約ノードの evidence_ids は上限K件＋omitted_evidence_count。③集約IDは
-# (parent_id, kind, agent_run_id) を null 明示区別の正規 JSON にして sha1（文字列連結プレースホルダ
-# 'root'/'main' は agent_run_id='main' 等の実値と衝突しうるため廃止）。④不正 parent_id は
-# 親なしへ正規化（クラッシュさせない）。⑤⑥は下記ヘルパ・テスト側の是正。
+# ---- _cap_trace_v2 の二段上限（純関数・DB 不要） ----
 
 def _assert_dict_ids_match_keys(nodes: dict) -> None:
-    """fixture 構築ミス検出用（実際に一度踏んだ間違い＝dict のキーとノード自身の id がずれる）。
-    dict のキーは必ずそのノード自身の `id` と一致すること。"""
     for k, v in nodes.items():
         assert v["id"] == k, f"dict key {k!r} != node id {v['id']!r}"
 
 
 def _assert_no_orphans(trace: list, *, allow_truncated: bool = False) -> None:
-    """trace 内の各ノードについて、`parent_id` が非 null ならその親も同じ trace 内に存在すること
-    （全 cap テストへ適用する汎用ヘルパ）。
-
-    RV是正（needs-work再検証・点(f)）: 以前は `budget_limit_reached`（honest failure・
-    `_budget_limit_truncate`）型のノードが trace 内に1件でもあれば検査全体を自動 skip していたが、
-    これは「内容を見て検査を緩める」内容スニッフィングであり、truncate 経路以外に紛れ込んだ
-    orphan バグを隠しうる。呼び出し側が truncate 経路を検証しているテストだけ、明示的に
-    `allow_truncated=True` を渡して免除する（既定は検査を必ず行う）。
-    """
+    """各ノードの `parent_id` の親が同じ trace 内にあること。honest failure 経路を検証するテストだけ
+    `allow_truncated=True` で明示的に免除する（内容を見て検査を緩めない）。"""
     if allow_truncated:
         return
     ids = {n["id"] for n in trace}
@@ -150,389 +91,213 @@ def _v2_node(i, *, parent_id=None, kind="tool", agent_run_id=None, evidence_ids=
                           parent_id=parent_id, agent_run_id=agent_run_id, evidence_ids=evidence_ids)
 
 
+def _parent_child_nodes(n_pairs: int) -> dict:
+    nodes = {}
+    for i in range(n_pairs):
+        nodes[f"p{i}"] = EE.build_event(f"p{i}", "agent", f"parent{i}", "d", "done")
+        nodes[f"c{i}"] = EE.build_event(f"c{i}", "tool", f"child{i}", "d", "done", parent_id=f"p{i}")
+    return nodes
+
+
 def test_trace_bytes_matches_real_storage_serialization_not_sse():
-    """RV是正（needs-work再検証・点(a)）: `_trace_bytes` は実保存（psycopg の `Json` 既定＝
-    `ensure_ascii` 未指定＝True）と同じ測り方でなければならない。日本語主体の detail/label では
-    `ensure_ascii=True` の方が `ensure_ascii=False` より大きくなる（非ASCIIがエスケープ列になるため）
-    ことも合わせて固定する（過小測定だとバイト上限が実際の保存サイズを守れない）。"""
-    import json as _json
     node = EE.build_event("n1", "tool", "検索テスト", "詳細な日本語のテキストです", "done")
-    expected = len(_json.dumps([node], ensure_ascii=True, default=str).encode("utf-8"))
-    smaller_if_wrong = len(_json.dumps([node], ensure_ascii=False, default=str).encode("utf-8"))
+    expected = len(json.dumps([node], ensure_ascii=True, default=str).encode("utf-8"))
+    smaller_if_wrong = len(json.dumps([node], ensure_ascii=False, default=str).encode("utf-8"))
     assert CS._trace_bytes([node]) == expected
-    assert expected > smaller_if_wrong                                 # 日本語は ensure_ascii=True の方が大きい
+    assert expected > smaller_if_wrong
 
 
-def test_cap_trace_v2_empty_is_none():
+def test_cap_trace_v2_empty_passthrough_and_detail_truncation():
     assert CS._cap_trace_v2({}) is None
-
-
-def test_cap_trace_v2_under_limit_passthrough_order_preserved():
     nodes = {f"n{i}": _v2_node(i) for i in range(5)}
     _assert_dict_ids_match_keys(nodes)
     out = CS._cap_trace_v2(nodes)
     assert [n["id"] for n in out] == [f"n{i}" for i in range(5)]
     _assert_no_orphans(out)
-
-
-def test_cap_trace_v2_truncates_long_detail():
-    nodes = {"n1": {**_v2_node(1), "detail": "x" * 500}}
-    out = CS._cap_trace_v2(nodes)
+    out = CS._cap_trace_v2({"n1": {**_v2_node(1), "detail": "x" * 500}})
     assert len(out[0]["detail"]) == CS._MAX_TRACE_DETAIL_CHARS
 
 
 def test_cap_trace_v2_soft_cap_reserves_budget_for_the_aggregate_itself():
-    """RV是正①: 集約ノード自体もソフト上限（120）の予算に数える＝v1 のような
-    「120件＋要約1件＝121件」ではなく、合計がちょうど120件に収まる（実測: 30件超過の入力で
-    集約1件＋古い方1件分を追加で畳んだ計31件省略になる）。
-    """
     n = CS._MAX_TRACE_NODES + 30
     nodes = {f"n{i}": _v2_node(i, kind="tool") for i in range(n)}
     _assert_dict_ids_match_keys(nodes)
     out = CS._cap_trace_v2(nodes)
-    assert len(out) == CS._MAX_TRACE_NODES                            # 集約ノードも込みでちょうど上限
+    assert len(out) == CS._MAX_TRACE_NODES                    # 集約ノードも込みでちょうど上限
     summary = out[0]
-    assert summary["id"].startswith("trace-omitted:")
-    assert summary["kind"] == "tool"                                  # 集約元と同じ kind（v1 は固定 think）
+    assert summary["id"].startswith("trace-omitted:") and summary["kind"] == "tool"
     assert summary["metrics"]["omitted_count"] == 31
-    kept_ids = [x["id"] for x in out[1:]]
-    assert kept_ids == [f"n{i}" for i in range(31, n)]                # 末尾（最新）優先
+    assert [x["id"] for x in out[1:]] == [f"n{i}" for i in range(31, n)]    # 末尾（最新）優先
     _assert_no_orphans(out)
+    with pytest.raises(ValueError):                           # 集約 id は通常イベントとしては使えない
+        EE.build_event(summary["id"], "tool", "l", "d", "done")
 
 
 def test_cap_trace_v2_soft_cap_mixed_kind_aggregates_per_group():
-    """dropped 対象が think/tool 混在なら、集約ノードも kind ごとに分かれる（集約2件分も予算に数える
-    ため、単一 kind のケースより1件多く古い方が dropped 対象になる＝実測 think6/tool6）。
-    """
     n = CS._MAX_TRACE_NODES + 10
-    nodes = {}
-    for i in range(n):
-        kind = "think" if i % 2 == 0 else "tool"
-        nodes[f"n{i}"] = _v2_node(i, kind=kind)
-    _assert_dict_ids_match_keys(nodes)
+    nodes = {f"n{i}": _v2_node(i, kind="think" if i % 2 == 0 else "tool") for i in range(n)}
     out = CS._cap_trace_v2(nodes)
     summaries = [x for x in out if x["id"].startswith("trace-omitted:")]
     assert len(summaries) == 2
     by_kind = {s["kind"]: s for s in summaries}
-    assert by_kind["think"]["metrics"]["omitted_count"] == 6
-    assert by_kind["tool"]["metrics"]["omitted_count"] == 6
-    assert len(out) == CS._MAX_TRACE_NODES                            # 集約2件込みでちょうど上限
+    assert by_kind["think"]["metrics"]["omitted_count"] == 6 and by_kind["tool"]["metrics"]["omitted_count"] == 6
+    assert len(out) == CS._MAX_TRACE_NODES
     _assert_no_orphans(out)
 
 
-def test_cap_trace_v2_evidence_ids_capped_with_omitted_count():
-    """RV是正②: 完全な和集合ではなく上限K件（既定20）。K 未満なら omitted_evidence_count は立たない。"""
-    n = CS._MAX_TRACE_NODES + 3                                       # 実測 dropped=4（集約自体の分含む）
-    nodes = {f"n{i}": _v2_node(i, evidence_ids=[f"ev-{i:03d}"]) for i in range(n)}
-    _assert_dict_ids_match_keys(nodes)
-    out = CS._cap_trace_v2(nodes)
-    summary = next(x for x in out if x["id"].startswith("trace-omitted:"))
-    assert summary["metrics"]["omitted_count"] == 4
-    assert len(summary["evidence_ids"]) == 4 <= CS._MAX_TRACE_AGGREGATE_EVIDENCE_IDS
-    assert "omitted_evidence_count" not in summary["metrics"]
-    _assert_no_orphans(out)
-
-
-def test_cap_trace_v2_evidence_ids_over_k_sets_omitted_evidence_count():
-    """dropped 件数が K（20）を超える場合、evidence_ids は K 件で切られ omitted_evidence_count が立つ
-    （実測: dropped=26件・evidence20件保持・6件を omitted_evidence_count で計数）。
-    """
-    n = CS._MAX_TRACE_NODES + 25
+@pytest.mark.parametrize("extra,omitted,kept_evidence,omitted_evidence", [
+    (3, 4, 4, None),                                          # K 未満なら omitted_evidence_count は立たない
+    (25, 26, CS._MAX_TRACE_AGGREGATE_EVIDENCE_IDS, 6),
+])
+def test_cap_trace_v2_evidence_ids_capped_with_omitted_count(extra, omitted, kept_evidence, omitted_evidence):
+    n = CS._MAX_TRACE_NODES + extra
     nodes = {f"n{i}": _v2_node(i, evidence_ids=[f"ev-{i:03d}"]) for i in range(n)}
     out = CS._cap_trace_v2(nodes)
     summary = next(x for x in out if x["id"].startswith("trace-omitted:"))
-    assert summary["metrics"]["omitted_count"] == 26
-    assert len(summary["evidence_ids"]) == CS._MAX_TRACE_AGGREGATE_EVIDENCE_IDS
-    assert summary["metrics"]["omitted_evidence_count"] == 6
+    assert summary["metrics"]["omitted_count"] == omitted
+    assert len(summary["evidence_ids"]) == kept_evidence
+    assert summary["metrics"].get("omitted_evidence_count") == omitted_evidence
     _assert_no_orphans(out)
 
 
 def test_cap_trace_v2_soft_cap_keeps_all_parents_up_to_hard_cap():
-    """親（他ノードの `parent_id` になっているノード）は、ソフト上限（120）を超えていてもハード上限
-    （400）以内なら全件残る（追加裁定「親は子が残る限り削除しない」の実効版）。末端（子）側だけが
-    集約ノードへ畳まれる（親子リンクは切れない＝集約ノードが子側の代わりに親を指し続ける）。
-    """
-    n_parents = CS._MAX_TRACE_NODES + 5                                # 125（親だけでソフト上限は超えるがハード上限400未満）
-    nodes = {}
-    for i in range(n_parents):
-        pid = f"p{i}"
-        nodes[pid] = EE.build_event(pid, "agent", f"parent{i}", "d", "done")
-        nodes[f"c{i}"] = EE.build_event(f"c{i}", "tool", f"child{i}", "d", "done", parent_id=pid)
+    n_parents = CS._MAX_TRACE_NODES + 5
+    nodes = _parent_child_nodes(n_parents)
     _assert_dict_ids_match_keys(nodes)
     out = CS._cap_trace_v2(nodes)
     out_ids = {x["id"] for x in out}
-    for i in range(n_parents):
-        assert f"p{i}" in out_ids                                      # 親は全件生き残る
+    assert all(f"p{i}" in out_ids for i in range(n_parents))                # 親は全件生き残る
     summaries = [x for x in out if x["id"].startswith("trace-omitted:")]
-    assert len(summaries) == n_parents                                 # 子は親ごとに別集約（agent_run_id等が違えば別グループ）
+    assert len(summaries) == n_parents
     assert {s["parent_id"] for s in summaries} == {f"p{i}" for i in range(n_parents)}
-    assert len(out) == n_parents + len(summaries)                      # 250（ハード上限400未満なので②は発動しない）
+    assert len(out) == n_parents + len(summaries)
     _assert_no_orphans(out)
 
 
 def test_cap_trace_v2_hard_cap_collapses_oldest_subtrees_no_orphans():
-    """RV是正①(二段目): ソフト上限だけでは削減できないケース（親だけで大量）がハード上限を超えたら、
-    最も古いサブツリーから丸ごと1個の集約ノードへ畳む（新しいものを優先保持）。実測: 250組の
-    親子ペア（計500件）→ 500-400=100 ペア分を畳んで丁度ハード上限（400）に収まり、
-    最も古い（インデックスの小さい）親から畳まれ、新しい親が残る。
-    """
-    n_pairs = 250
-    nodes = {}
-    for i in range(n_pairs):
-        pid = f"p{i}"
-        nodes[pid] = EE.build_event(pid, "agent", f"parent{i}", "d", "done")
-        nodes[f"c{i}"] = EE.build_event(f"c{i}", "tool", f"child{i}", "d", "done", parent_id=pid)
-    _assert_dict_ids_match_keys(nodes)
+    nodes = _parent_child_nodes(250)
     out = CS._cap_trace_v2(nodes)
-    assert len(out) == CS._MAX_TRACE_NODES_HARD                        # ちょうどハード上限に収まる
-    subtree_markers = [n for n in out if n["id"].startswith("trace-subtree:")]
-    assert len(subtree_markers) == 100
-    assert not any(n.get("event_type") == "budget_limit_reached" for n in out)  # ③（honest failure）までは行かない
-    # c0/c249（子ノード自身の id）は、ソフト上限段階で全末端が1件ずつ別集約グループになった時点で
-    # 既に集約ノード（ハッシュ id）へ置き換わっている（子側の個別 id 自体はソフト段階で消える）ため、
-    # 「親が生きているか」と「その親を指す子側の集約がまだ個別に残っているか」で検証する。
+    assert len(out) == CS._MAX_TRACE_NODES_HARD
+    assert len([n for n in out if n["id"].startswith("trace-subtree:")]) == 100
+    assert not any(n.get("event_type") == "budget_limit_reached" for n in out)
     out_ids = {n["id"] for n in out}
-    assert "p0" not in out_ids                                         # 最古の親は畳まれる
-    assert not any(n.get("parent_id") == "p0" for n in out)            # 子側の集約もサブツリーごと畳まれ個別には残らない
-    assert "p249" in out_ids                                           # 最新の親は個別に残る
-    assert any(n.get("parent_id") == "p249" for n in out)              # 子側の集約は畳まれず個別に残る
+    assert "p0" not in out_ids and not any(n.get("parent_id") == "p0" for n in out)    # 最古は畳まれる
+    assert "p249" in out_ids and any(n.get("parent_id") == "p249" for n in out)        # 最新は残る
     _assert_no_orphans(out)
+    assert [n["id"] for n in out] == [n["id"] for n in CS._cap_trace_v2(dict(nodes))]   # 決定的
 
 
 def test_cap_trace_v2_byte_cap_collapses_even_singleton_subtrees():
-    """RV是正②(バイト上限): ノード数は少なくても metrics 等が肥大化してシリアライズ後バイト数が
-    上限を超えるケースは、件数だけなら畳んでも無意味な単独サブツリーでもバイト削減のために畳む。
-    """
     nodes = {}
     for i in range(5):
         n = EE.build_event(f"b{i}", "tool", f"label{i}", "d", "done")
-        n["metrics"] = {"blob": "x" * 300_000}                         # 1件あたり約300KB
+        n["metrics"] = {"blob": "x" * 300_000}
         nodes[f"b{i}"] = n
-    _assert_dict_ids_match_keys(nodes)
     out = CS._cap_trace_v2(nodes)
     assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES
-    assert len(out) == 5                                                # 件数は減らない（畳んでも1対1）
-    collapsed = [n for n in out if n["id"].startswith("trace-subtree:")]
-    assert len(collapsed) >= 1                                          # 少なくとも1件は畳まれてバイトが縮む
+    assert len(out) == 5
+    assert [n for n in out if n["id"].startswith("trace-subtree:")]
     _assert_no_orphans(out)
 
 
 def test_cap_trace_v2_budget_limit_reached_marker_when_hard_cap_unresolvable():
-    """RV是正①(honest failure): 全末端が別 agent_run_id（集約しても1件=1グループで件数が減らない）
-    かつ親子関係が無い（サブツリーが全て単独＝畳んでも件数が減らない）病的ケースは、
-    ②でも解決できずマーカー1件を先頭に置いて機械的に切り詰める。
-    """
     n = 500
     nodes = {f"n{i}": EE.build_event(f"n{i}", "tool", f"label{i}", "d", "done", agent_run_id=f"run-{i}")
              for i in range(n)}
-    _assert_dict_ids_match_keys(nodes)
     out = CS._cap_trace_v2(nodes)
-    assert len(out) == CS._MAX_TRACE_NODES_HARD                        # マーカー1件＋残りでハード上限ぴったり
-    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID
-    assert out[0]["event_type"] == "budget_limit_reached"
+    assert len(out) == CS._MAX_TRACE_NODES_HARD
+    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID and out[0]["event_type"] == "budget_limit_reached"
     assert out[0]["metrics"]["omitted_count"] == n - (CS._MAX_TRACE_NODES_HARD - 1)
     assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES
-    # このケースは honest failure（③）経路そのもの＝orphan 不変条件を意図的に緩める対象だと
-    # 呼び出し側が明示する（RV是正・点(f)：内容スニッフィングではなく明示引数で免除）。
-    _assert_no_orphans(out, allow_truncated=True)
+    _assert_no_orphans(out, allow_truncated=True)             # honest failure 経路そのもの
 
 
 def test_budget_limit_truncate_converges_bytes_even_when_count_truncation_is_not_enough():
-    """RV是正(a): `_budget_limit_truncate` を直接呼び、件数だけの切り詰めでは巨大ノードが残り
-    バイト上限を超えうるケースでも収束することを保証する（フルパイプライン経由だと②ハード上限が
-    バイト超過ノードを事前に集約ノードへ圧縮してしまい、③がバイト過多な実ノードを受け取る
-    状況を再現しにくいため、③自身の契約として単体で固定する）。
-    """
     nodes = {}
     for i in range(450):
         n = EE.build_event(f"n{i}", "tool", f"label{i}", "d", "done")
-        if i >= 50:                                                    # 新しい400件は巨大な metrics を持つ
+        if i >= 50:
             n["metrics"] = {"blob": "x" * 5000}
         nodes[f"n{i}"] = n
     age = {nid: i for i, nid in enumerate(nodes)}
-
-    # 素朴な「件数だけ」の切り詰めだとバイト上限を超えることを先に確認しておく（このテストの前提）。
-    ordered = CS._order_by_age(nodes, age)
-    naive_kept = ordered[-(CS._MAX_TRACE_NODES_HARD - 1):]
+    naive_kept = CS._order_by_age(nodes, age)[-(CS._MAX_TRACE_NODES_HARD - 1):]
     naive_out = [CS._budget_limit_marker(450 - len(naive_kept), 450)] + naive_kept
-    assert CS._trace_bytes(naive_out) > CS._MAX_TRACE_BYTES             # 前提: 件数だけでは収まらない
-
+    assert CS._trace_bytes(naive_out) > CS._MAX_TRACE_BYTES        # 前提: 件数だけでは収まらない
     out = CS._budget_limit_truncate(nodes, age, original_total=450)
-    assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES                  # 実際の出力はバイト上限に収束する
-    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID
-    assert len(out) <= CS._MAX_TRACE_NODES_HARD
-    assert out[0]["metrics"]["omitted_count"] == 450 - (len(out) - 1)   # マーカーの件数が実際の kept 数と整合
+    assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES
+    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID and len(out) <= CS._MAX_TRACE_NODES_HARD
+    assert out[0]["metrics"]["omitted_count"] == 450 - (len(out) - 1)
 
 
 def test_budget_limit_truncate_converges_to_minimal_kept_set_under_extreme_bloat():
-    """既定のバイト上限（100万バイト）に対して、巨大ノード（1件50KB）ばかりでも収束は必ずバイト
-    上限内で止まる（極端な入力でも kept を大幅に削って収束する挙動そのものを固定する）。
-    このケースは既定の上限では marker 単独までは到達しない（19件が生き残る＝実測・開始件数を
-    450→60 に減らしても収束後の残存件数はバイト上限のみで決まるため変わらない――
-    `_budget_limit_truncate` は1件ずつ削るループのため、開始件数を大きくしても検証する収束の
-    仕組み自体は変わらず、450件は単に毎ノード50KBの JSON 再シリアライズを余計な回数繰り返して
-    実行時間だけを押し上げていた）。marker 単独への到達自体は
-    `test_budget_limit_truncate_falls_back_to_marker_alone_when_byte_budget_is_extremely_tight` で
-    バイト上限を絞って別途固定する。
-    """
     nodes = {f"n{i}": EE.build_event(f"n{i}", "tool", f"l{i}", "d", "done", metrics={"blob": "x" * 50_000})
              for i in range(60)}
     age = {nid: i for i, nid in enumerate(nodes)}
     out = CS._budget_limit_truncate(nodes, age, original_total=60)
     assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES
-    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID
-    assert len(out) > 1                                              # marker 単独ではなく複数ノード残しで収束する
+    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID and len(out) > 1
 
 
 def test_budget_limit_truncate_falls_back_to_marker_alone_when_byte_budget_is_extremely_tight(monkeypatch):
-    """RV是正（最終確認・残1件）: 上のテストは marker 単独まで到達していなかった（名前と実態の不一致）。
-    `_MAX_TRACE_BYTES` を「marker 単独ならぎりぎり収まるが、kept を1件でも足すと必ず超える」水準まで
-    monkeypatch で絞り、実際に marker 単独（`len(out) == 1`）へ到達することを検証する。
-
-    `_budget_limit_truncate`/`_trace_bytes`/`_within_hard_limits` はいずれも `_MAX_TRACE_BYTES` を
-    関数本体でモジュール属性として都度読む（デフォルト引数の値として束縛していない）ため、
-    monkeypatch が効く（`docs/17-開発の教訓.md`「デフォルト引数は def 時に束縛され、monkeypatch が
-    効かない」の逆＝この関数群は最初からその罠を踏んでいない設計だが、念のためここで実証する）。
-    """
     nodes = {f"n{i}": EE.build_event(f"n{i}", "tool", f"l{i}", "d", "done") for i in range(450)}
     age = {nid: i for i, nid in enumerate(nodes)}
-
-    # marker 単独（omitted=全450件）の実サイズを測り、それよりわずかに大きいだけの上限に絞る。
     marker_alone_bytes = CS._trace_bytes([CS._budget_limit_marker(450, 450)])
     monkeypatch.setattr(CS, "_MAX_TRACE_BYTES", marker_alone_bytes + 50)
-
     out = CS._budget_limit_truncate(nodes, age, original_total=450)
-    assert len(out) == 1                                              # marker 単独まで実際に到達している
-    assert out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID
-    assert out[0]["metrics"]["omitted_count"] == 450                  # 保持ノードは1件も残らない
+    assert len(out) == 1 and out[0]["id"] == EE.BUDGET_LIMIT_REACHED_ID
+    assert out[0]["metrics"]["omitted_count"] == 450
     assert CS._trace_bytes(out) <= CS._MAX_TRACE_BYTES
 
 
-def test_cap_trace_v2_dangling_parent_id_normalized_not_crash(caplog):
-    """RV是正④: 非 null の parent_id が現集合内に無い場合は親なしへ正規化し、クラッシュしない
-    （warning ログで可視化）。"""
+def test_cap_trace_v2_dangling_parent_id_is_normalized(caplog):
     n = CS._MAX_TRACE_NODES + 30
     nodes = {f"n{i}": _v2_node(i) for i in range(n)}
     nodes["n5"]["parent_id"] = "does-not-exist-in-this-set"
     with caplog.at_level(logging.WARNING, logger="sherpa"):
-        out = CS._cap_trace_v2(nodes)                                   # 例外を出さないこと自体が主張
+        out = CS._cap_trace_v2(nodes)                                   # クラッシュしない
     assert any("親なしへ正規化" in r.getMessage() for r in caplog.records)
     _assert_no_orphans(out)
 
-
-def test_cap_trace_v2_dangling_parent_id_rewritten_in_surviving_output_node():
-    """RV是正（needs-work再検証・点(b)）: 正規化は内部計算だけでなく、生き残った実ノード自身の
-    `parent_id` フィールドも書き換える。dangling な親を持つノードを「保護対象」（他ノードの親）に
-    仕立てて個別に生き残らせ、その出力ノード自身の `parent_id` が None になっていることを直接確認する
-    （集約に紛れて検証できてしまう leaf を使わない＝旧実装のバグはこのケースでのみ再現した）。
-    """
+    # 生き残った実ノード自身の parent_id も書き換わる（保護対象＝他ノードの親のケース）
     victim = "ghost-parent-victim"
     nodes = {victim: EE.build_event(victim, "tool", "l", "d", "done", parent_id="does-not-exist"),
-            "child-of-victim": EE.build_event("child-of-victim", "tool", "l2", "d", "done", parent_id=victim)}
+             "child-of-victim": EE.build_event("child-of-victim", "tool", "l2", "d", "done", parent_id=victim)}
     out = CS._cap_trace_v2(nodes)
-    by_id = {n["id"]: n for n in out}
-    assert by_id[victim]["parent_id"] is None                           # 内部計算だけでなく出力自身が書き換わっている
+    assert {n["id"]: n for n in out}[victim]["parent_id"] is None
     _assert_no_orphans(out)
 
-
-def test_cap_trace_v2_dangling_parent_normalized_even_under_soft_cap_fast_path():
-    """RV是正（needs-work再検証・点(b)）: 120件以下（ソフト上限未満）の高速経路でも正規化は必ず通る
-    （旧実装はこの経路で正規化自体を素通りしていた）。"""
-    nodes = {"only-one": EE.build_event("only-one", "tool", "l", "d", "done", parent_id="ghost")}
-    out = CS._cap_trace_v2(nodes)
-    assert len(out) == 1
-    assert out[0]["parent_id"] is None
+    # ソフト上限未満の高速経路でも正規化は必ず通る
+    out = CS._cap_trace_v2({"only-one": EE.build_event("only-one", "tool", "l", "d", "done", parent_id="ghost")})
+    assert len(out) == 1 and out[0]["parent_id"] is None
 
 
-def test_group_id_distinguishes_none_from_string_placeholders():
-    """RV是正③: (parent_id, kind, agent_run_id) の None と実際の文字列値（'root'/'main' 等）が
-    衝突しない（旧実装は文字列連結プレースホルダのため `(None,"tool","main")` と
-    `("root","tool",None)` が同じ id になっていた＝レビュア指摘の具体例）。全40桁 sha1（RV是正・
-    needs-work再検証: 実用上の単射性のため12桁への切り詰めをやめた）。"""
-    g1 = CS._group_id(None, "tool", "main")
-    g2 = CS._group_id("root", "tool", None)
-    assert g1 != g2
-    assert g1.startswith("trace-omitted:") and g2.startswith("trace-omitted:")
+def test_group_and_subtree_ids_are_full_sha1_and_distinguish_none():
+    g1, g2 = CS._group_id(None, "tool", "main"), CS._group_id("root", "tool", None)
+    assert g1 != g2 and g1.startswith("trace-omitted:") and g2.startswith("trace-omitted:")
     assert len(g1.split(":", 1)[1]) == 40 and len(g2.split(":", 1)[1]) == 40
-    # 同じ入力は同じ id（安定・決定的）。
     assert CS._group_id(None, "tool", "main") == g1
-
-
-def test_subtree_id_full_40_hex():
     sid = CS._subtree_id("some-root-id")
-    assert sid.startswith("trace-subtree:")
-    assert len(sid.split(":", 1)[1]) == 40
+    assert sid.startswith("trace-subtree:") and len(sid.split(":", 1)[1]) == 40
 
 
-def test_build_event_rejects_reserved_id_prefixes_and_exact_marker_id():
-    """RV是正（needs-work再検証・点(c)）: 通常イベント（`build_event`）は集約/マーカー専用の予約
-    名前空間を名乗れない（衝突事故を構造的に防ぐ）。"""
+def test_reserved_id_namespaces_are_enforced():
     for bad_id in ("trace-omitted:" + "0" * 40, "trace-subtree:" + "0" * 40, EE.BUDGET_LIMIT_REACHED_ID):
         with pytest.raises(ValueError):
             EE.build_event(bad_id, "tool", "l", "d", "done")
-
-
-def test_build_reserved_event_rejects_non_reserved_id():
-    """`_build_reserved_event`（集約/マーカー生成専用の内部関数）は `build_event` の逆＝予約名前空間
-    以外の id を渡すと ValueError（呼び出し側のハッシュ化忘れ等の実装ミスを検出する）。"""
     with pytest.raises(ValueError):
         EE._build_reserved_event("not-a-reserved-id", "tool", "l", "d", "done")
 
 
-def test_aggregate_and_marker_ids_are_actually_reserved():
-    """集約/マーカー生成が実際に予約名前空間を使っていること自体を固定する（点(c)是正の効果が
-    _cap_trace_v2 の実出力にも及んでいることの確認）。"""
-    n = CS._MAX_TRACE_NODES + 30
-    nodes = {f"n{i}": _v2_node(i) for i in range(n)}
-    out = CS._cap_trace_v2(nodes)
-    summary_id = out[0]["id"]
-    assert summary_id.startswith("trace-omitted:")
-    with pytest.raises(ValueError):
-        EE.build_event(summary_id, "tool", "l", "d", "done")            # 通常イベントとしては使えない
-
-
-def test_assert_no_orphans_helper_actually_detects_orphans_by_default():
-    """RV是正（needs-work再検証・点(f)）: `_assert_no_orphans` は既定（`allow_truncated=False`）で
-    実際に orphan を検出すること自体をテストする（メタテスト＝内容スニッフィングで検査が
-    無効化されていないことの直接証拠）。"""
+def test_assert_no_orphans_helper_detects_orphans_unless_explicitly_allowed():
     broken = [{"id": "a", "parent_id": "does-not-exist"}]
     with pytest.raises(AssertionError):
         _assert_no_orphans(broken)
+    _assert_no_orphans(broken, allow_truncated=True)
 
 
-def test_assert_no_orphans_helper_allow_truncated_explicitly_skips():
-    """同じ壊れた入力でも `allow_truncated=True` を明示すれば免除される（呼び出し側の明示責任）。"""
-    broken = [{"id": "a", "parent_id": "does-not-exist"}]
-    _assert_no_orphans(broken, allow_truncated=True)                    # 例外を出さないこと自体が主張
-
-
-def test_cap_trace_v2_is_deterministic_across_repeated_calls():
-    """全段（ソフト→ハード→honest failure）とも決定的＝同じ入力なら常に同じ出力。"""
-    nodes = {}
-    for i in range(250):
-        pid = f"p{i}"
-        nodes[pid] = EE.build_event(pid, "agent", f"parent{i}", "d", "done")
-        nodes[f"c{i}"] = EE.build_event(f"c{i}", "tool", f"child{i}", "d", "done", parent_id=pid)
-    out1 = CS._cap_trace_v2(dict(nodes))
-    out2 = CS._cap_trace_v2(dict(nodes))
-    assert [n["id"] for n in out1] == [n["id"] for n in out2]
-
-
-def test_cap_trace_v2_summary_node_uses_hashed_id_and_real_data():
-    n = CS._MAX_TRACE_NODES + 5
-    nodes = {f"n{i}": _v2_node(i, kind="tool") for i in range(n)}
-    out = CS._cap_trace_v2(nodes)
-    assert out[0]["kind"] == "tool"                                  # 実データ由来
-    assert out[0]["id"].startswith("trace-omitted:")                 # ハッシュ化 id（③是正後）
-
-
-# ---- EXT-1: 3保存サイト（handle_message／stream_message の answer・clarify）----
-# フェイク provider に加え store.* もフェイクへ差し替え、PG 起動なしで検証する（RV是正⑥）。
-# `_new_conv()` を使う DB 版（下段）は実 DB 到達時のみ動く end-to-end 確認として残す。
+# ---- 保存サイト（stream_message の answer・clarify） ----
 
 class _FakeExecEventProvider:
-    """`get_provider(settings)` の代わりに使うフェイク（固定イベント列を yield するだけ）。"""
-
     def __init__(self, events):
         self._events = events
 
@@ -548,16 +313,12 @@ def _fixed_result(headline):
 
 
 def _fixed_result_with_investigation(headline, investigation_record):
-    """COD-18 §1 用: provider が `_result` の別項目として渡す `investigation_record`
-    （`None`＝台帳ゲートが走らなかったターン）付きの `_result`。`env["investigation"]` は provider が
-    実際に組み立てる要約（`complete`/`counts` 等）の最小形を模す——`chat_service._mark_
-    investigation_recorded` はこの dict に `recorded` を足すだけで、台帳の中身自体は混ぜない。"""
+    """provider が `_result` の別項目として渡す `investigation_record`（None＝台帳ゲートが走らなかった）付き。"""
     env = {"headline": headline, "summary": {}, "data": {}, "sources": [],
-          "scope": {"world": "v1", "scope_paths": [], "source": "all"}}
+           "scope": {"world": "v1", "scope_paths": [], "source": "all"}}
     if investigation_record is not None:
         env["investigation"] = {"complete": investigation_record["complete"], "counts": {}}
-    return {"type": "_result", "env": env,
-            "decision": {"lens": "qa", "input": "q", "reason": "t"},
+    return {"type": "_result", "env": env, "decision": {"lens": "qa", "input": "q", "reason": "t"},
             "investigation_record": investigation_record}
 
 
@@ -565,13 +326,12 @@ def _fixed_question():
     return {"type": "question", "interaction_id": "q1", "mode": "single",
             "prompt": "確認したいことがあります。",
             "options": [{"id": "yes", "label": "はい", "description": ""},
-                       {"id": "no", "label": "いいえ", "description": ""}],
+                        {"id": "no", "label": "いいえ", "description": ""}],
             "allow_free_text": False}
 
 
 def _mock_store_no_db(monkeypatch):
-    """`store.*` を DB 不要のフェイクへ差し替える（handle/stream 双方が呼ぶ範囲を一通りカバー）。
-    戻り値は `store.add_message` に渡された行を挿入順に保持するリスト。"""
+    """`store.*` を DB 不要のフェイクへ差し替える。戻り値は `add_message` に渡された行（挿入順）。"""
     saved: list = []
     counter = [0]
 
@@ -583,24 +343,18 @@ def _mock_store_no_db(monkeypatch):
         saved.append(row)
         return row
 
+    def fake_set_message_personal(message_id):
+        for row in saved:
+            if row["id"] == message_id:
+                row["personal"] = True
+
     monkeypatch.setattr(store, "add_message", fake_add_message)
     monkeypatch.setattr(store, "recent_messages", lambda conversation_id, limit: [])
     monkeypatch.setattr(store, "get_session_id", lambda conversation_id: None)
     monkeypatch.setattr(store, "get_codex_usage_total", lambda conversation_id: None)
     monkeypatch.setattr(store, "get_settings", lambda user_id: {})
-    # get_provider() と共有する WEB-1 唯一の読取点（fresh・非キャッシュ）。handle_message/
-    # stream_message は knowledge の有無に関わらず必ずこれを呼ぶため、get_system_settings
-    # （キャッシュ経由）ではなくこちらを差し替える。
-    monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: {})
+    monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: {})   # get_provider と共有する唯一の読取点
     monkeypatch.setattr(store, "set_contains_personal_workspace", lambda *a, **k: None)
-
-    def fake_set_message_personal(message_id):
-        # 実 DB では UPDATE messages SET personal=TRUE（`_mock_store_no_db` は fake_add_message が
-        # 返した行をそのまま `saved` に保持しているだけなので、ここでその行を書き換えて模す）。
-        for row in saved:
-            if row["id"] == message_id:
-                row["personal"] = True
-
     monkeypatch.setattr(store, "set_message_personal", fake_set_message_personal)
     monkeypatch.setattr(store, "set_session_id", lambda *a, **k: None)
     monkeypatch.setattr(store, "audit", lambda *a, **k: None)
@@ -608,43 +362,48 @@ def _mock_store_no_db(monkeypatch):
     return saved
 
 
-def test_handle_message_mock_store_answer_trace_version(monkeypatch):
-    """保存サイト1/3（handle_message・非ストリーミング）。PG 不要（store をフェイク差し替え）。
-    trace_version は常に2（TOGGLE-RM・2026-09-03 で v1 退避トグルを撤去）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    events = [node, _fixed_result("mock 回答")]
+def _use(monkeypatch, events):
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
 
-    out = CS.handle_message(None, "mock store テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False)
-    assert out["message"] is saved[-1]
-    assert saved[-1]["answer"]["trace_version"] == 2
-    assert [n["id"] for n in saved[-1]["trace"]] == ["understand"]
+
+def _turn(message="質問", session=None, **kw):
+    """stream_message を最後まで回し、配信イベント列を返す。"""
+    kw = {"world": "v1", "conversation_id": 999, "user_id": "admin", "knowledge": False, **kw}
+    return list(CS.stream_message(session, message, **kw))
 
 
-def test_stream_message_mock_store_answer_trace_version(monkeypatch):
-    """保存サイト2/3（stream_message の `_result`→answer 保存）。PG 不要。
-    trace_version は常に2（TOGGLE-RM・2026-09-03 で v1 退避トグルを撤去）。"""
+def _answer_message(events):
+    """配信イベント列から保存済み assistant メッセージ（answer イベントの message）を取り出す。"""
+    return next(e for e in events if e.get("type") == "answer")["message"]
+
+
+def _audits(monkeypatch) -> list:
+    audits: list = []
+    monkeypatch.setattr(store, "audit", lambda uid, action, *a, detail=None, **kw: audits.append(detail))
+    return audits
+
+
+def _rows(saved, role):
+    return [r for r in saved if r["role"] == role]
+
+
+@pytest.mark.parametrize("site", ["answer", "clarify"])
+def test_mock_store_saves_trace_version_2(monkeypatch, site):
+    """trace_version は常に 2（保存サイト共通）。"""
     saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    events = [node, _fixed_result("mock stream 回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    list(CS.stream_message(None, "mock store ストリームテスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False))
-    assert saved[-1]["role"] == "assistant"
+    _use(monkeypatch, [_NODE, _fixed_question() if site == "clarify" else _fixed_result("mock 回答")])
+    _turn()
+    if site == "clarify":
+        assert saved[-1]["lens"] == "clarify"
+    else:
+        assert saved[-1]["role"] == "assistant"
+        assert [n["id"] for n in saved[-1]["trace"]] == ["understand"]
     assert saved[-1]["answer"]["trace_version"] == 2
 
 
-def test_handle_message_saves_investigation_record_when_present(monkeypatch):
-    """COD-18 §1: provider が `_result` の別項目として渡した調査台帳は、assistant message 保存の
-    **直後**にその message id で `investigation_records` へ保存を試みる（complete/incomplete の
-    両方＝「調べ終わった・途中の両方」）。`env["investigation"]["recorded"]` は保存前（＝
-    `messages.answer` として一緒に永続化される側）に立つ。台帳の中身（manifest/items/coverage）は
-    `env`（＝`messages.answer`／`messages.trace`）には一切現れない——別項目として渡されるだけ。"""
+def test_stream_message_saves_investigation_record_when_present(monkeypatch):
+    """台帳は assistant message 保存の直後にその message id で保存を試みる（complete/incomplete の両方）。
+    台帳の中身（manifest/items/coverage）は `messages.answer`／`messages.trace` に一切現れない。"""
     saved_records: list = []
     monkeypatch.setattr(CS.store_investigation, "save_investigation_record",
                         lambda message_id, conversation_id, **kw: saved_records.append(
@@ -654,593 +413,214 @@ def test_handle_message_saves_investigation_record_when_present(monkeypatch):
                                 "manifest": {"question_kind": "qa", "created_at": "t", "items": ["i1"]},
                                 "items": {"i1": {"id": "i1", "subject": "本文っぽい何か"}},
                                 "coverage": {"i1": ["hit"]}}
-        events = [_fixed_result_with_investigation(f"回答(complete={complete})", investigation_record)]
-        monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
+        _use(monkeypatch, [_fixed_result_with_investigation(f"回答(complete={complete})", investigation_record)])
         saved = _mock_store_no_db(monkeypatch)
-
-        out = CS.handle_message(None, "台帳つきテスト", world="v1", conversation_id=999,
-                                user_id="admin", knowledge=False)
-        msg = out["message"]
+        msg = _answer_message(_turn("台帳つきテスト"))
         assert msg["answer"]["investigation"]["recorded"] is True
-        assert "manifest" not in msg["answer"]["investigation"]   # 本文/台帳の中身は env に混ぜない
+        assert "manifest" not in msg["answer"]["investigation"]
         assert "本文っぽい何か" not in str(msg["answer"])
         for node in (msg["trace"] or []):
-            assert "manifest" not in node and "items" not in node   # trace にも中身が入らない
+            assert "manifest" not in node and "items" not in node
         assert saved[-1] is msg
-
     assert [r["complete"] for r in saved_records] == [True, False]
-    assert all(r["conversation_id"] == 999 for r in saved_records)
-    assert all(r["manifest"]["question_kind"] == "qa" for r in saved_records)
+    assert all(r["conversation_id"] == 999 and r["manifest"]["question_kind"] == "qa" for r in saved_records)
     assert all(r["items"]["i1"]["subject"] == "本文っぽい何か" for r in saved_records)
 
 
-def test_handle_message_skips_investigation_save_when_no_ledger(monkeypatch):
-    """`investigation_record is None`（台帳ゲートが走らなかったターン・台帳を使わない構成）は
-    DB 保存を試みず、`env["investigation"]` も（provider が元々キー自体を置かないため）持たない。"""
-    saved = _mock_store_no_db(monkeypatch)
+def test_stream_message_skips_investigation_save_when_no_ledger(monkeypatch):
+    _mock_store_no_db(monkeypatch)
     save_calls: list = []
     monkeypatch.setattr(CS.store_investigation, "save_investigation_record",
                         lambda *a, **k: save_calls.append((a, k)))
-    events = [_fixed_result("台帳なし回答")]   # investigation_record キー自体を持たない（.get→None）
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    out = CS.handle_message(None, "台帳なしテスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False)
-    assert "investigation" not in out["message"]["answer"]
-    assert save_calls == []
+    _use(monkeypatch, [_fixed_result("台帳なし回答")])
+    msg = _answer_message(_turn("台帳なしテスト"))
+    assert "investigation" not in msg["answer"] and save_calls == []
 
 
-# ===== A1: 一度個人由来になった会話は、以後 personal=False のターンも個人扱いを維持する =====
+# ---- 個人由来の引き継ぎ ----
 
-def test_handle_message_taints_turn_personal_when_conversation_already_personal(monkeypatch):
-    """個人参照 ON のターンの後、次のターンを personal=False で実行しても、会話が既に
-    個人由来（`store.conversation_is_personal_tainted`＝過去ターンで personal ON）なら、
-    このターンの user/assistant 行も `personal=True` で保存する（history 経由で過去の個人
-    回答がモデルへ渡り得るため保守的に個人扱い・sanitized share の伏字漏れを防ぐ）。"""
+@pytest.mark.parametrize("tainted", [True, False])
+def test_turn_inherits_conversation_personal_taint(monkeypatch, tainted):
+    """会話が既に個人由来なら personal=False のターンの user/assistant 行も personal=True で保存する。"""
     saved = _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
-    events = [_fixed_result("非個人のはずの回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    CS.handle_message(None, "2ターン目の質問", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False, personal=False)
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is True
-    assert assistant_row["personal"] is True
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: tainted)
+    _use(monkeypatch, [_fixed_result("回答")])
+    _turn("2ターン目の質問", personal=False)
+    assert _rows(saved, "user")[0]["personal"] is tainted
+    assert _rows(saved, "assistant")[0]["personal"] is tainted
 
 
-def test_handle_message_stays_non_personal_when_conversation_never_personal(monkeypatch):
-    """対照: 会話が一度も個人由来になっていなければ、personal=False のターンは従来どおり
-    非個人のまま保存する（A1 是正が保守化しすぎて常に個人扱いにしていないことの確認）。"""
-    saved = _mock_store_no_db(monkeypatch)   # 既定で conversation_is_personal_tainted=False
-    events = [_fixed_result("非個人の回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    CS.handle_message(None, "質問", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False, personal=False)
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is False
-    assert assistant_row["personal"] is False
-
-
-def test_stream_message_taints_turn_personal_when_conversation_already_personal(monkeypatch):
-    """handle_message と同じ保守化を確認する。"""
-    saved = _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
-    events = [_fixed_result("非個人のはずの回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    list(CS.stream_message(None, "2ターン目の質問", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False, personal=False))
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is True
-    assert assistant_row["personal"] is True
-
-
-# ===== DEPTH-2 S2（§2.7）: API/Ollama の write_output_file が書込みを発生させたターンも
-# Codex の codex_wrote_files と同じく個人由来として扱う（`env["wrote_files"]`）=====
-
-def test_handle_message_marks_personal_when_env_has_wrote_files(monkeypatch):
-    """`write_output_file` が台帳登録に成功したターン（`env["wrote_files"]` が立つ）は、
-    Codex の created files ターンと同じく質問・回答の両行を personal=True で保存する
-    （sanitized share で本文を伏せる判定に含める・§2.7 の (d)）。"""
+@pytest.mark.parametrize("wrote_files,expected", [(["一覧.md"], True), (None, False), (True, True)])
+def test_turn_marks_personal_when_env_has_wrote_files(monkeypatch, wrote_files, expected):
+    """書込みを発生させたターン（`env["wrote_files"]`）は個人由来（作成物カードの有無では判定しない）。"""
     saved = _mock_store_no_db(monkeypatch)
     env = {"headline": "一覧.md を作成しました。", "summary": {}, "data": {}, "sources": [],
-          "scope": {"world": "v1", "scope_paths": [], "source": "all"},
-          "wrote_files": ["一覧.md"],
-          "created_files": [{"name": "一覧.md", "download_url": "/workspace/files/1/download"}]}
-    events = [{"type": "_result", "env": env, "decision": {"lens": "author", "input": "q", "reason": "t"}}]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    CS.handle_message(None, "消費税率の一覧をExcelにまとめて", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False, personal=False)
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is True
-    assert assistant_row["personal"] is True
+           "scope": {"world": "v1", "scope_paths": [], "source": "all"}}
+    if wrote_files:
+        env["wrote_files"] = wrote_files
+    if isinstance(wrote_files, list):
+        env["created_files"] = [{"name": "一覧.md", "download_url": "/workspace/files/1/download"}]
+    _use(monkeypatch, [{"type": "_result", "env": env, "decision": {"lens": "author", "input": "q", "reason": "t"}}])
+    _turn("消費税率の一覧をExcelにまとめて", personal=False)
+    assert _rows(saved, "user")[0]["personal"] is expected
+    assert _rows(saved, "assistant")[0]["personal"] is expected
 
 
-def test_handle_message_stays_non_personal_without_wrote_files(monkeypatch):
-    """対照: `wrote_files` が立たない通常ターンは従来どおり非個人のまま
-    （書込みの有無だけを判定に使っていることの確認・作成物カードの有無自体は判定に使わない）。"""
+def test_stream_message_saves_clarify_card(monkeypatch):
     saved = _mock_store_no_db(monkeypatch)
-    events = [_fixed_result("検索結果です（ファイルは作成していません）")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    CS.handle_message(None, "税率を教えて", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False, personal=False)
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is False
-    assert assistant_row["personal"] is False
-
-
-def test_stream_message_marks_personal_when_env_has_wrote_files(monkeypatch):
-    """handle_message と同じ判定を stream_message（保存サイト2/3）でも確認する。"""
-    saved = _mock_store_no_db(monkeypatch)
-    env = {"headline": "一覧.md を作成しました。", "summary": {}, "data": {}, "sources": [],
-          "scope": {"world": "v1", "scope_paths": [], "source": "all"},
-          "wrote_files": True}
-    events = [{"type": "_result", "env": env, "decision": {"lens": "author", "input": "q", "reason": "t"}}]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    list(CS.stream_message(None, "消費税率の一覧をExcelにまとめて", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False, personal=False))
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is True
-    assert assistant_row["personal"] is True
-
-
-# ===== C40/#46: GraphSchemaEraError の固定文言失敗保存も、直前の write_output_file 成功を
-# 個人由来として引き継ぐ =====
-
-class _FakeGraphSchemaEraProvider:
-    """`_last_created_files`（このターンで `write_output_file` が既に台帳登録した成果物）を
-    持ったまま、イテレーション途中で `GraphSchemaEraError` を送出するフェイク。"""
-
-    def __init__(self, created_files):
-        self._last_created_files = created_files
-
-    def run(self, ctx):
-        from sherpa.ingest.world_neo4j import GraphSchemaEraError
-
-        def _gen():
-            yield {"type": "node", "id": "tool-graph"}
-            raise GraphSchemaEraError("v1", "v0", lens="qa")
-        return _gen()
-
-
-def test_handle_message_graph_schema_era_failure_after_write_stays_personal(monkeypatch):
-    """C40/#46 是正: `write_output_file` の書込みが既に成功した直後に `GraphSchemaEraError` で
-    固定文言へ縮退しても（`_degrade_overload`）、書込みは実在する以上そのターンは個人由来のまま
-    保存する——是正前は固定文言 env に wrote_files/created_files が無く、personal=False のまま
-    保存されていた。"""
-    saved = _mock_store_no_db(monkeypatch)
-    created = [{"rel_path": "一覧.md", "download_url": "/workspace/files/1/download"}]
-    monkeypatch.setattr(CS, "get_provider",
-                        lambda settings, **kw: _FakeGraphSchemaEraProvider(created))
-
-    CS.handle_message(None, "資料の影響範囲を教えて", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False, personal=False)
-    user_row = next(r for r in saved if r["role"] == "user")
-    assistant_row = next(r for r in saved if r["role"] == "assistant")
-    assert user_row["personal"] is True
-    assert assistant_row["personal"] is True
-
-
-def test_degrade_overload_carries_created_files_into_fixed_lens_result():
-    """`_degrade_overload` 単体: `provider._last_created_files` が非空なら、固定文言 env にも
-    `wrote_files`/`created_files` を補う（C40/#46）。"""
-    created = [{"rel_path": "一覧.md", "download_url": "/workspace/files/1/download"}]
-    provider = _FakeGraphSchemaEraProvider(created)
-    out = list(CS._degrade_overload(provider.run(None), "m", "w1", None, provider=provider))
-    result = next(e for e in out if e["type"] == "_result")
-    assert result["env"].get("wrote_files")
-    assert result["env"].get("created_files") == [
-        {"name": "一覧.md", "download_url": "/workspace/files/1/download"}]
-
-
-# ===== A3: 非ストリーミング /chat が確認カード（question）で 500 にならない =====
-
-def test_handle_message_saves_clarify_and_returns_instead_of_500(monkeypatch):
-    """provider が question を yield して `_result` を出さずに generator を終える経路
-    （確認カード＝ask_user）で、handle_message は `RuntimeError("provider did not yield a
-    _result event")` を投げていた（500）。stream_message の question 処理と同じ保存・監査
-    （`_save_clarify_message` 共有）を行い、clarify メッセージを正常応答として返す。"""
-    saved = _mock_store_no_db(monkeypatch)
-    events = [_fixed_question()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    out = CS.handle_message(None, "確認が要る質問", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False)
-    assert out["conversation_id"] == 999
-    assert out["message"] is saved[-1]
-    assert saved[-1]["role"] == "assistant"
-    assert saved[-1]["lens"] == "clarify"
+    _use(monkeypatch, [_fixed_question()])
+    events = _turn("確認が要る質問")
+    assert next(e for e in events if e.get("type") == "question")["conversation_id"] == 999
+    assert saved[-1]["role"] == "assistant" and saved[-1]["lens"] == "clarify"
     assert saved[-1]["answer"]["question"]["interaction_id"] == "q1"
 
 
-# ===== system_settings は1ターン1回の fresh read を _dispatch/get_provider で共有する =====
-
-def test_handle_message_shares_one_system_settings_snapshot_with_get_provider(monkeypatch):
-    """決定的レンズ（`_dispatch` の調べる深さ計算）と agentic 経路（`get_provider` の provider 選択）
-    が同じ fresh snapshot を受け取る（別世代の system_settings を見ない・WEB-1 契約と統合）。"""
-    _mock_store_no_db(monkeypatch)
-    sentinel = {"depth_base_grep_max_hits": 42}
-    monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: sentinel)
-    captured = {}
-
-    def fake_get_provider(settings, system_settings=None):
-        captured["system_settings"] = system_settings
-        return _FakeExecEventProvider([_fixed_result("mock 回答")])
-
-    monkeypatch.setattr(CS, "get_provider", fake_get_provider)
-    CS.handle_message(None, "mock store テスト", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False)
-    assert captured["system_settings"] is sentinel
-
-
-def test_stream_message_shares_one_system_settings_snapshot_with_get_provider(monkeypatch):
-    _mock_store_no_db(monkeypatch)
-    sentinel = {"depth_base_grep_max_hits": 42}
-    monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: sentinel)
-    captured = {}
-
-    def fake_get_provider(settings, system_settings=None):
-        captured["system_settings"] = system_settings
-        return _FakeExecEventProvider([_fixed_result("mock stream 回答")])
-
-    monkeypatch.setattr(CS, "get_provider", fake_get_provider)
-    list(CS.stream_message(None, "mock store ストリームテスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False))
-    assert captured["system_settings"] is sentinel
-
-
-def test_handle_message_fails_closed_when_system_settings_read_fails(monkeypatch):
-    """system_settings の fresh read が失敗（DB 不達）したら、調べる深さを env 既定へ縮退させて
-    ターンを続けるのではなく、ターン全体を fail-closed にする（WEB-1 の既存契約と同じ）。"""
-    _mock_store_no_db(monkeypatch)
-
-    def _boom(**kw):
-        raise RuntimeError("db down")
-
-    monkeypatch.setattr(store, "_read_system_settings_fresh", _boom)
-    monkeypatch.setattr(CS, "get_provider",
-                        lambda settings, **kw: _FakeExecEventProvider([_fixed_result("x")]))
-    with pytest.raises(RuntimeError):
-        CS.handle_message(None, "mock store テスト", world="v1", conversation_id=999,
-                          user_id="admin", knowledge=False)
-
-
-def test_stream_message_fails_closed_when_system_settings_read_fails(monkeypatch):
-    _mock_store_no_db(monkeypatch)
-
-    def _boom(**kw):
-        raise RuntimeError("db down")
-
-    monkeypatch.setattr(store, "_read_system_settings_fresh", _boom)
-    monkeypatch.setattr(CS, "get_provider",
-                        lambda settings, **kw: _FakeExecEventProvider([_fixed_result("x")]))
-    with pytest.raises(RuntimeError):
-        list(CS.stream_message(None, "mock store ストリームテスト", world="v1", conversation_id=999,
-                               user_id="admin", knowledge=False))
-
-
-# ===== WEB-1: 実行に使う codex_web_search はチャットごとの引数のみ（保存済み個人設定は無視） =====
-# `_select_provider`（providers/__init__.py）は settings["codex_web_search"] を読んで
-# CodexProvider を組み立てる。handle_message/stream_message は `get_provider(settings)` に渡す
-# ローカル複製だけをこの引数で上書きする（DB へは書き戻さない）契約をここで固定する。
-
-@pytest.mark.parametrize("stored,requested", [(True, False), (False, True), (False, False), (True, True)])
-def test_handle_message_web_search_param_overrides_stored_codex_web_search(monkeypatch, stored, requested):
-    _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(store, "get_settings", lambda user_id: {"codex_web_search": stored})
-    captured = {}
-
-    def _fake_get_provider(settings, **kw):
-        captured["settings"] = settings
-        return _FakeExecEventProvider([_fixed_result("mock 回答")])
-    monkeypatch.setattr(CS, "get_provider", _fake_get_provider)
-
-    CS.handle_message(None, "web_search override テスト", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False, web_search=requested)
-    assert captured["settings"]["codex_web_search"] is requested, (
-        f"保存済み codex_web_search={stored} が実行に混ざっている"
-        "（チャットごとの希望のみを見る契約に違反）")
-
-
-@pytest.mark.parametrize("stored,requested", [(True, False), (False, True), (False, False), (True, True)])
-def test_stream_message_web_search_param_overrides_stored_codex_web_search(monkeypatch, stored, requested):
-    _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(store, "get_settings", lambda user_id: {"codex_web_search": stored})
-    captured = {}
-
-    def _fake_get_provider(settings, **kw):
-        captured["settings"] = settings
-        return _FakeExecEventProvider([_fixed_result("mock stream 回答")])
-    monkeypatch.setattr(CS, "get_provider", _fake_get_provider)
-
-    list(CS.stream_message(None, "web_search override ストリームテスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False, web_search=requested))
-    assert captured["settings"]["codex_web_search"] is requested, (
-        f"保存済み codex_web_search={stored} が実行に混ざっている"
-        "（チャットごとの希望のみを見る契約に違反）")
-
-
-def test_stream_message_mock_store_clarify_trace_version(monkeypatch):
-    """保存サイト3/3（stream_message の `question`→clarify 保存）。PG 不要。
-    trace_version は常に2（TOGGLE-RM・2026-09-03 で v1 退避トグルを撤去）。"""
+def test_stream_message_clarify_inherits_conversation_personal_taint(monkeypatch):
     saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    events = [node, _fixed_question()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    list(CS.stream_message(None, "mock store clarify テスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False))   # knowledge=True は Neo4j session が要るため fake provider では使わない
-    q_row = saved[-1]
-    assert q_row["lens"] == "clarify"
-    assert q_row["answer"]["trace_version"] == 2
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
+    marked: list = []
+    monkeypatch.setattr(store, "set_message_personal", lambda mid: marked.append(mid))
+    _use(monkeypatch, [_fixed_question()])
+    _turn("確認が要る質問", personal=False)
+    assert saved[-1]["lens"] == "clarify" and saved[-1].get("personal") is True
+    assert marked
 
 
-# ---- 1ターンの所要時間（answer.duration_ms）。3保存サイトいずれも、会話準備の開始
-# （関数入口）〜assistant/clarify 保存直前までの経過時間を埋め込む。`time.monotonic` を決定的な
-# 2値の列（開始・保存直前）に差し替えて、実時間のブレに依存しない形で固定する。----
+def test_stream_message_personal_check_failure_falls_closed(monkeypatch):
+    saved = _mock_store_no_db(monkeypatch)
 
-def _fake_monotonic(monkeypatch, *values):
-    it = iter(values)
+    def _boom(conversation_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(store, "conversation_is_personal_tainted", _boom)
+    _use(monkeypatch, [_fixed_result("回答")])
+    _turn(personal=False)
+    assert saved[-1]["role"] == "assistant" and saved[-1].get("personal") is True
+
+
+# ---- system_settings は 1 ターン 1 回の fresh read を共有する ----
+
+def test_turn_shares_one_system_settings_snapshot_with_get_provider(monkeypatch):
+    _mock_store_no_db(monkeypatch)
+    sentinel = {"depth_base_grep_max_hits": 42}
+    monkeypatch.setattr(store, "_read_system_settings_fresh", lambda **kw: sentinel)
+    captured = {}
+
+    def fake_get_provider(settings, system_settings=None):
+        captured["system_settings"] = system_settings
+        return _FakeExecEventProvider([_fixed_result("mock 回答")])
+
+    monkeypatch.setattr(CS, "get_provider", fake_get_provider)
+    _turn()
+    assert captured["system_settings"] is sentinel
+
+
+def test_turn_fails_closed_when_system_settings_read_fails(monkeypatch):
+    _mock_store_no_db(monkeypatch)
+
+    def _boom(**kw):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(store, "_read_system_settings_fresh", _boom)
+    _use(monkeypatch, [_fixed_result("x")])
+    with pytest.raises(RuntimeError):
+        _turn()
+
+
+@pytest.mark.parametrize("stored,requested", [(True, False), (False, True), (False, False), (True, True)])
+def test_turn_web_search_param_overrides_stored_codex_web_search(monkeypatch, stored, requested):
+    """実行に使う codex_web_search はチャットごとの引数のみ（保存済み個人設定は無視）。"""
+    _mock_store_no_db(monkeypatch)
+    monkeypatch.setattr(store, "get_settings", lambda user_id: {"codex_web_search": stored})
+    captured = {}
+
+    def _fake_get_provider(settings, **kw):
+        captured["settings"] = settings
+        return _FakeExecEventProvider([_fixed_result("mock 回答")])
+
+    monkeypatch.setattr(CS, "get_provider", _fake_get_provider)
+    _turn(web_search=requested)
+    assert captured["settings"]["codex_web_search"] is requested
+
+
+# ---- 1 ターンの所要時間（answer.duration_ms）・停止 ----
+
+@pytest.mark.parametrize("events,t0,t1,expected", [
+    ([_fixed_result("mock stream 回答")], 200.0, 200.5, 500),
+    ([_fixed_question()], 300.0, 300.1, 100),
+], ids=["answer", "clarify"])
+def test_turn_saves_duration_ms(monkeypatch, events, t0, t1, expected):
+    saved = _mock_store_no_db(monkeypatch)
+    it = iter((t0, t1))
     monkeypatch.setattr(CS.time, "monotonic", lambda: next(it))
+    _use(monkeypatch, events)
+    _turn()
+    assert saved[-1]["role"] == "assistant" and saved[-1]["answer"]["duration_ms"] == expected
 
-
-def test_handle_message_saves_duration_ms(monkeypatch):
-    """保存サイト1/3（handle_message）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    _fake_monotonic(monkeypatch, 100.0, 100.25)
-    events = [_fixed_result("mock 回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    CS.handle_message(None, "duration テスト", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=False)
-    assert saved[-1]["answer"]["duration_ms"] == 250
-
-
-def test_stream_message_answer_saves_duration_ms(monkeypatch):
-    """保存サイト2/3（stream_message の `_result`→answer 保存）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    _fake_monotonic(monkeypatch, 200.0, 200.5)
-    events = [_fixed_result("mock stream 回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    list(CS.stream_message(None, "duration ストリームテスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False))
-    assert saved[-1]["role"] == "assistant"
-    assert saved[-1]["answer"]["duration_ms"] == 500
-
-
-def test_stream_message_clarify_saves_duration_ms(monkeypatch):
-    """保存サイト3/3（stream_message の `question`→clarify 保存）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    _fake_monotonic(monkeypatch, 300.0, 300.1)
-    events = [_fixed_question()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    list(CS.stream_message(None, "duration clarify テスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False))
-    q_row = saved[-1]
-    assert q_row["lens"] == "clarify"
-    assert q_row["answer"]["duration_ms"] == 100
-
-
-def test_stream_message_stopped_before_result_saves_no_duration(monkeypatch):
-    """途中停止（stop_event）ターンは assistant/clarify を保存しない＝duration_ms も存在しない
-    （計測対象外になることの確認）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    events = [node, _fixed_result("到達しないはずの回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    stop_event = threading.Event()
-    stop_event.set()   # 最初の yield から停止扱いにする
-    list(CS.stream_message(None, "duration stop テスト", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=False, stop_event=stop_event))
-    # user メッセージのみ保存（assistant は保存されない＝duration_ms を持つ行が無い）。
-    assert all(r["role"] != "assistant" for r in saved)
-
-
-def test_handle_message_stopped_saves_no_assistant_and_returns_stopped(monkeypatch):
-    """同期経路（POST /chat）も停止時は stream_message と同じ契約: assistant を保存せず
-    `{"type": "stopped"}` を返す（停止後に provider が返す _result を回答として永続化しない）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    events = [node, _fixed_result("到達しないはずの回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = CS.handle_message(None, "sync stop テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, stop_event=stop_event)
-    assert out == {"type": "stopped", "conversation_id": 999}
-    assert all(r["role"] != "assistant" for r in saved)
-
-
-def test_handle_message_stopped_with_no_events_returns_stopped_not_500(monkeypatch):
-    """C2 是正: provider が停止要求を事前ガードで検知し、追加イベントを一切 yield せずに
-    generator を終える経路がある（`providers/base.py::_agentic_run` の
-    `if ctx.stop_event is not None and ctx.stop_event.is_set(): return` と同型）。この場合
-    for ループ本体が一度も走らないため、ループ内の停止判定を経由せず `result=None` のまま
-    ループを抜ける——是正前は次行 `result["env"]` の添字参照で 500 になり、停止監査も残らな
-    かった。ループ終了後にも停止判定を行い、`stream_message`/従来の途中停止と同じ
-    `{"type": "stopped"}` 応答＋停止監査（`chat.turn` detail の `stopped=true`）を返す契約を
-    固定する。"""
-    saved = _mock_store_no_db(monkeypatch)
-    audits = []
-    monkeypatch.setattr(store, "audit",
-                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([]))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = CS.handle_message(None, "sync stop 追加イベント無し テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, stop_event=stop_event)
-    assert out == {"type": "stopped", "conversation_id": 999}   # 500 にならず stopped 応答
-    assert all(r["role"] != "assistant" for r in saved)          # assistant は保存しない
-    assert audits and audits[-1]["stopped"] is True              # 停止監査が残る
-
-
-# ---- DEPTH-2 S5: 巡ループの終端 4 種と consumer（§2.4・providers/base.py::TERMINALS）----
 
 def _stopped_terminal_result(headline="1巡目で打ち切りました（利用者の操作で停止したため）。"):
-    """巡ループの停止終端（`_terminal="stopped"`）の `_result`＝追加の LLM 呼び出しをせず
-    コードで組んだ未完了回答。"""
     ev = _fixed_result(headline)
     ev["env"]["_terminal"] = "stopped"
     ev["env"]["stopped_by_user"] = True
     return ev
 
 
-def test_stream_message_stopped_terminal_saves_incomplete_answer_and_audits_stopped(monkeypatch):
-    """停止終端だけは保存する（従来の「停止後の `_result` は捨てる」の例外）。監査も
-    assistant を保存した形＝`stopped=true` で一致させる。"""
+def _stopped():
+    ev = threading.Event()
+    ev.set()
+    return ev
+
+
+def test_stop_before_result_saves_no_assistant_and_audits_stop_once(monkeypatch):
+    """停止後に届く通常の `_result` は保存しない（duration_ms も存在しない）。stopped 応答＋停止監査は 1 回。"""
     saved = _mock_store_no_db(monkeypatch)
-    audits = []
-    monkeypatch.setattr(store, "audit",
-                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
-    events = [_stopped_terminal_result()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = list(CS.stream_message(None, "停止終端 テスト", world="v1", conversation_id=999,
-                                 user_id="admin", knowledge=False, stop_event=stop_event))
-    assistant = [r for r in saved if r["role"] == "assistant"]
-    assert len(assistant) == 1
-    assert "打ち切りました" in assistant[0]["content"]
-    assert assistant[0]["answer"]["stop_kind"] == "stopped_by_user"   # 完了として数えない
-    assert "_terminal" not in assistant[0]["answer"]                  # 内部キーは保存しない
-    assert audits[-1]["stopped"] is True and audits[-1]["lens"] == "stopped"
-    assert audits[-1]["message_id_assistant"] == assistant[0]["id"]   # 監査と保存が一致
-    assert any(e.get("type") == "answer" for e in out)
-
-
-def test_handle_message_stopped_terminal_saves_incomplete_answer(monkeypatch):
-    """同期経路（POST /chat）も同じ契約＝停止終端は保存し、監査も停止として残す。"""
-    saved = _mock_store_no_db(monkeypatch)
-    audits = []
-    monkeypatch.setattr(store, "audit",
-                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
-    monkeypatch.setattr(CS, "get_provider",
-                        lambda settings, **kw: _FakeExecEventProvider([_stopped_terminal_result()]))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = CS.handle_message(None, "停止終端 同期 テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, stop_event=stop_event)
-    assert out["message"]["role"] == "assistant"
-    assert [r["role"] for r in saved].count("assistant") == 1
-    assert audits[-1]["stopped"] is True and audits[-1]["lens"] == "stopped"
-
-
-def test_stopped_terminal_is_the_only_saved_result_after_stop(monkeypatch):
-    """停止後に provider が返す**通常**の `_result` は従来どおり保存しない（例外は停止終端だけ）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(CS, "get_provider",
-                        lambda settings, **kw: _FakeExecEventProvider([_fixed_result("通常の回答")]))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = CS.handle_message(None, "停止後の通常 result テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, stop_event=stop_event)
-    assert out == {"type": "stopped", "conversation_id": 999}
-    assert all(r["role"] != "assistant" for r in saved)
-
-
-def test_stream_message_keeps_draining_until_stopped_terminal(monkeypatch):
-    """停止検知後に provider がノードを先に返しても、停止終端まで受け取って未完了回答を保存する
-    （最初のイベントで打ち切ると終端が保存されない）。途中イベントは配信も保存もしない。"""
-    saved = _mock_store_no_db(monkeypatch)
-    audits = []
-    monkeypatch.setattr(store, "audit",
-                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
-    events = [{"type": "node", "id": "main-review-r1", "kind": "think", "label": "査読",
-               "detail": "読んでいます", "status": "done"},
-              _stopped_terminal_result()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = list(CS.stream_message(None, "停止終端 ノード先行 テスト", world="v1", conversation_id=999,
-                                 user_id="admin", knowledge=False, stop_event=stop_event))
-    assistant = [r for r in saved if r["role"] == "assistant"]
-    assert len(assistant) == 1 and "打ち切りました" in assistant[0]["content"]
-    assert [d["stopped"] for d in audits] == [True]           # 停止監査は1回だけ
-    assert not [e for e in out if e.get("type") == "node"]    # 停止後の途中ノードは配信しない
-    assert not [e for e in out if e.get("type") == "stopped"]
-
-
-def test_handle_message_keeps_draining_until_stopped_terminal(monkeypatch):
-    """同期経路も同じ＝停止後のノードを捨てつつ停止終端まで受け取り、未完了回答を保存する。"""
-    saved = _mock_store_no_db(monkeypatch)
-    audits = []
-    monkeypatch.setattr(store, "audit",
-                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
-    events = [{"type": "node", "id": "main-review-r1", "kind": "think", "label": "査読",
-               "detail": "読んでいます", "status": "done"},
-              _stopped_terminal_result()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = CS.handle_message(None, "停止終端 同期 ノード先行 テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, stop_event=stop_event)
-    assert out["message"]["role"] == "assistant"
-    assert [r["role"] for r in saved].count("assistant") == 1
-    assert [d["stopped"] for d in audits] == [True]
-
-
-def test_stream_message_without_stopped_terminal_still_audits_stop_once(monkeypatch):
-    """停止終端が来ないまま provider が終えた従来経路は、assistant を保存せず停止監査と
-    `stopped` 応答を1回だけ返す。"""
-    saved = _mock_store_no_db(monkeypatch)
-    audits = []
-    monkeypatch.setattr(store, "audit",
-                        lambda uid, action, *a, detail=None, **kw: audits.append(detail))
-    events = [{"type": "node", "id": "n1", "kind": "think", "label": "x", "detail": "y",
-               "status": "done"},
-              _fixed_result("通常の回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-    stop_event = threading.Event()
-    stop_event.set()
-    out = list(CS.stream_message(None, "停止 未保存 テスト", world="v1", conversation_id=999,
-                                 user_id="admin", knowledge=False, stop_event=stop_event))
-    assert all(r["role"] != "assistant" for r in saved)
+    audits = _audits(monkeypatch)
+    _use(monkeypatch, [_NODE, _fixed_result("到達しないはずの回答")])
+    out = _turn(stop_event=_stopped())
+    assert _rows(saved, "assistant") == []
     assert [e.get("type") for e in out].count("stopped") == 1
     assert [d["stopped"] for d in audits] == [True]
 
-def test_round_personal_flag_marks_answer_personal_and_is_not_saved(monkeypatch):
-    """§2.7: 巡ループが全巡で累積した個人由来／書込フラグ（`_personal_rounds`）は、
-    最終巡に無くても回答を個人扱いにする。内部キー自体は保存しない。"""
+
+@pytest.mark.parametrize("with_node", [False, True])
+def test_stopped_terminal_is_saved_as_incomplete_answer(monkeypatch, with_node):
+    """停止終端だけは保存する（停止後も終端まで読み切る・途中ノードは配信も保存もしない・監査は 1 回）。"""
     saved = _mock_store_no_db(monkeypatch)
+    audits = _audits(monkeypatch)
+    node = {"type": "node", "id": "main-review-r1", "kind": "think", "label": "査読",
+            "detail": "読んでいます", "status": "done"}
+    _use(monkeypatch, ([node] if with_node else []) + [_stopped_terminal_result()])
+    out = _turn("停止終端 テスト", stop_event=_stopped())
+    assistant = _rows(saved, "assistant")
+    assert len(assistant) == 1 and "打ち切りました" in assistant[0]["content"]
+    assert assistant[0]["answer"]["stop_kind"] == "stopped_by_user"      # 完了として数えない
+    assert "_terminal" not in assistant[0]["answer"]                     # 内部キーは保存しない
+    assert [d["stopped"] for d in audits] == [True] and audits[-1]["lens"] == "stopped"
+    assert audits[-1]["message_id_assistant"] == assistant[0]["id"]
+    assert any(e.get("type") == "answer" for e in out)
+    assert not [e for e in out if e.get("type") in ("node", "stopped")]
+
+
+def test_round_personal_flag_marks_answer_personal_and_is_not_saved(monkeypatch):
+    """巡ループが全巡で累積した個人由来フラグは最終巡に無くても回答を個人扱いにし、内部キーは保存しない。"""
+    _mock_store_no_db(monkeypatch)
     ev = _fixed_result("巡の途中で個人 workspace へ書いた回答")
     ev["env"]["_personal_rounds"] = True
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([ev]))
-    out = CS.handle_message(None, "個人由来 累積 テスト", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, personal=False)
-    assert out["message"]["personal"] is True
-    assert "_personal_rounds" not in out["message"]["answer"]
+    _use(monkeypatch, [ev])
+    msg = _answer_message(_turn(personal=False))
+    assert msg["personal"] is True and "_personal_rounds" not in msg["answer"]
 
 
 def test_round_personal_flag_marks_clarify_card_personal_and_is_not_saved(monkeypatch):
-    """確認カード終端（`TERMINALS` の "question"）にも同じ累積を渡す＝個人扱いで一度だけ保存し、
-    内部キーは question payload・配信イベントのどちらにも残さない。"""
     saved = _mock_store_no_db(monkeypatch)
-    q = {**_fixed_question(), "_personal_rounds": True}
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([q]))
-    out = list(CS.stream_message(None, "確認カード 個人由来 テスト", world="v1", conversation_id=999,
-                                 user_id="admin", knowledge=False))
-    clarify = [r for r in saved if r["role"] == "assistant"]
+    _use(monkeypatch, [{**_fixed_question(), "_personal_rounds": True}])
+    out = _turn()
+    clarify = _rows(saved, "assistant")
     assert len(clarify) == 1 and clarify[0]["personal"] is True
-    assert "_personal_rounds" not in clarify[0]["answer"]
-    assert all("_personal_rounds" not in e for e in out)
+    assert "_personal_rounds" not in clarify[0]["answer"] and all("_personal_rounds" not in e for e in out)
 
 
-# ---- EXT-2: evidence_committed は `_result.env` のサイドカー（独立イベントとして yield しない）----
-# providers/base.py が `_result` へ同梱し、chat_service._pop_evidence_committed が永続化と同じ
-# 呼び出しの中で trace へ折り込む契約（孤児イベント防止）を PG 不要（store フェイク）で固定する。
+# ---- evidence_committed は `_result.env` のサイドカー（独立イベントとして yield しない） ----
 
 def _evidence_committed_sidecar():
     return {"type": "node", "id": "evidence-committed", "kind": "evidence", "label": "根拠を確定",
@@ -1249,120 +629,66 @@ def _evidence_committed_sidecar():
 
 
 def test_stream_message_evidence_committed_sidecar_persisted_and_streamed_after_result(monkeypatch):
-    """正常系: `_result.env["_evidence_committed"]` は (a) 公開 answer には残らない（pop 済み）・
-    (b) 永続化する trace へ折り込まれる・(c) ライブ配信でも `answer` イベントより前にノードとして
-    流れる（永続化成功後に配信＝孤児化しない順序）。"""
     saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
     result = _fixed_result("evidence 付き回答")
     result["env"]["_evidence_committed"] = _evidence_committed_sidecar()
-    events_in = [node, result]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events_in))
-
-    out_events = list(CS.stream_message(None, "evidence sidecar テスト", world="v1",
-                                        conversation_id=999, user_id="admin", knowledge=False))
-    assert "_evidence_committed" not in saved[-1]["answer"]   # 公開 answer には残らない
-    trace_ids = [n["id"] for n in saved[-1]["trace"]]
-    assert "evidence-committed" in trace_ids                  # 永続化する trace には折り込まれる
-
+    _use(monkeypatch, [_NODE, result])
+    out_events = _turn()
+    assert "_evidence_committed" not in saved[-1]["answer"]
+    assert "evidence-committed" in [n["id"] for n in saved[-1]["trace"]]
     idx_node = next(i for i, e in enumerate(out_events)
                     if e.get("type") == "node" and e.get("id") == "evidence-committed")
     idx_answer = next(i for i, e in enumerate(out_events) if e.get("type") == "answer")
-    assert idx_node < idx_answer   # ライブ配信でも answer より前（永続化成功後に配信）
-
-
-def test_stream_message_synthesis_digest_not_persisted_in_public_answer(monkeypatch):
-    """`_result.env["_synthesis_digest"]`（`_answer_prompt` 専用の合成入力・`_personal_facts` と
-    同じ「合成専用の非公開キー」の流儀）は永続化する answer に残らない——`_evidence_committed` と
-    違い trace へ折り込む先も無いため、`_finalize` 直後に黙って pop するだけの契約。"""
-    saved = _mock_store_no_db(monkeypatch)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    result = _fixed_result("digest 付き回答")
-    result["env"]["_synthesis_digest"] = "ev-1: 4期/a.md 行 1-1「本文」"
-    events_in = [node, result]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events_in))
-
-    list(CS.stream_message(None, "synthesis digest テスト", world="v1",
-                           conversation_id=999, user_id="admin", knowledge=False))
-    assert "_synthesis_digest" not in saved[-1]["answer"]
+    assert idx_node < idx_answer                                  # 永続化成功後に配信（孤児化しない順序）
 
 
 def _stoppable_provider(stop_event, env):
-    """ノード yield 直後（`_result` を返す直前）に stop_event をセットする（consumer 側の停止判定が
-    `_result` を discard するタイミングを再現する）。"""
     class _P:
         def run(self, ctx):
-            yield {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-                  "detail": "内容を把握しました", "status": "done"}
-            stop_event.set()   # ここで停止要求が来た、を模す
-            yield {"type": "_result", "env": env,
-                  "decision": {"lens": "qa", "input": "q", "reason": "t"}}
+            yield dict(_NODE)
+            stop_event.set()
+            yield {"type": "_result", "env": env, "decision": {"lens": "qa", "input": "q", "reason": "t"}}
     return _P()
 
 
 def test_stream_message_stop_before_result_discards_evidence_committed_sidecar_atomically(monkeypatch):
-    """停止要求が `_result`（evidence_committed サイドカー同梱）の直前に来た場合、consumer の
-    停止判定が `_result` ごと discard する——サイドカーが `_result` と切り離されて先に処理・孤児化
-    することはない（embedded サイドカーは常に `_result` と不可分）。assistant メッセージも
-    保存されない。"""
     saved = _mock_store_no_db(monkeypatch)
     stop_event = threading.Event()
     env = {"headline": "回答", "summary": {}, "data": {}, "sources": [],
            "scope": {"world": "v1", "scope_paths": [], "source": "all"},
            "_evidence_committed": _evidence_committed_sidecar()}
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _stoppable_provider(stop_event, env))
-
-    out_events = list(CS.stream_message(None, "stop test", world="v1", conversation_id=999,
-                                        user_id="admin", knowledge=False, stop_event=stop_event))
-    assert all(row["role"] != "assistant" for row in saved)   # assistant は保存されない（user 質問のみ保存済み）
+    out_events = _turn("stop test", stop_event=stop_event)
+    assert _rows(saved, "assistant") == []
     assert any(e.get("type") == "stopped" for e in out_events)
-    assert not any(e.get("event_type") == "evidence_committed" for e in out_events)   # 孤児として出ない
+    assert not any(e.get("event_type") == "evidence_committed" for e in out_events)
 
 
-def _partial_stream_then_stop_provider(stop_event, partial_text):
-    """`answer_delta` を数回ライブ配信してから停止要求を受け、`_result` の headline に
-    それまでの累積本文（provider 単体の契約＝拡張設計 §4.4「停止＝その時点までの配信本文」）を
-    そのまま載せて返す（帰属呼び出しは行わない＝provider 側の実挙動を模す）。"""
+def test_stream_message_stop_mid_stream_forwards_partial_deltas_but_persists_no_assistant(monkeypatch):
+    """停止時は配信済みの部分本文を client は受け取るが、`_result` は discard され履歴には残らない。"""
+    saved = _mock_store_no_db(monkeypatch)
+    stop_event = threading.Event()
+    partial_text = "調査した結果、"
+
     class _P:
         def run(self, ctx):
             for ch in partial_text:
                 yield {"type": "answer_delta", "text": ch}
-            stop_event.set()   # ストリーム途中で停止要求が来た、を模す
+            stop_event.set()
             yield {"type": "_result",
-                  "env": {"headline": partial_text, "summary": {}, "data": {}, "sources": [],
-                         "scope": {"world": "v1", "scope_paths": [], "source": "all"}},
-                  "decision": {"lens": "qa", "input": "q", "reason": "t"}}
-    return _P()
+                   "env": {"headline": partial_text, "summary": {}, "data": {}, "sources": [],
+                           "scope": {"world": "v1", "scope_paths": [], "source": "all"}},
+                   "decision": {"lens": "qa", "input": "q", "reason": "t"}}
 
-
-def test_stream_message_stop_mid_stream_forwards_partial_deltas_but_persists_no_assistant(monkeypatch):
-    """停止契約の統合固定（拡張設計 §4.4）: provider 単体は「停止＝その時点までの
-    配信本文」を `_result.env["headline"]` に積んで返す（ここでは `answer_delta` を経由してクライアント
-    へライブ配信済みの本文と同じもの）。しかし chat_service 統合では、その `_result` は stop_event が
-    立った後に届くため discard され——**assistant メッセージは保存されない＝会話履歴に本文は残らない**
-    （client は SSE で部分本文を見たが、次に会話を開いても・次ターンの履歴 priming にも一切現れない）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    stop_event = threading.Event()
-    partial_text = "調査した結果、"
-    monkeypatch.setattr(CS, "get_provider",
-                        lambda settings, **kw: _partial_stream_then_stop_provider(stop_event, partial_text))
-
-    out_events = list(CS.stream_message(None, "mid-stream stop test", world="v1", conversation_id=999,
-                                        user_id="admin", knowledge=False, stop_event=stop_event))
-    deltas = [e["text"] for e in out_events if e.get("type") == "answer_delta"]
-    assert "".join(deltas) == partial_text                    # client はストリーム中の部分本文を受け取った
+    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _P())
+    out_events = _turn("mid-stream stop test", stop_event=stop_event)
+    assert "".join(e["text"] for e in out_events if e.get("type") == "answer_delta") == partial_text
     assert any(e.get("type") == "stopped" for e in out_events)
-    assert not any(e.get("type") == "answer" for e in out_events)   # 確定 answer イベントは出ない
-    assert all(row["role"] != "assistant" for row in saved)   # 履歴には一切残らない（user 質問のみ保存済み）
+    assert not any(e.get("type") == "answer" for e in out_events)
+    assert _rows(saved, "assistant") == []
 
 
 def test_stream_message_persistence_failure_prevents_sidecar_live_delivery(monkeypatch):
-    """`_result` サイドカー（evidence_committed）の永続化（assistant メッセージの `store.add_message`）
-    が失敗すると、その後段のライブ配信（evidence_committed ノード・answer イベント）は一切発行され
-    ない——サイドカーは `store.add_message` の成功と不可分（例外境界の確認、コード変更ではなく
-    既存の非 try/except 構造がこの契約を満たすことをテストで固定する）。"""
     _mock_store_no_db(monkeypatch)
 
     def failing_add_message(conversation_id, role, content="", **k):
@@ -1371,13 +697,9 @@ def test_stream_message_persistence_failure_prevents_sidecar_live_delivery(monke
         return {"id": 1, "conversation_id": conversation_id, "role": role, "content": content, **k}
 
     monkeypatch.setattr(store, "add_message", failing_add_message)
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
     result = _fixed_result("evidence 付き回答")
     result["env"]["_evidence_committed"] = _evidence_committed_sidecar()
-    events_in = [node, result]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events_in))
-
+    _use(monkeypatch, [_NODE, result])
     collected = []
     with pytest.raises(RuntimeError, match="db write failed"):
         for ev in CS.stream_message(None, "persist fail test", world="v1", conversation_id=999,
@@ -1387,25 +709,9 @@ def test_stream_message_persistence_failure_prevents_sidecar_live_delivery(monke
     assert not any(e.get("type") == "answer" for e in collected)
 
 
-# ---- EXT-1: handle_message end-to-end（要 Postgres・DB down は skip） ----
+# ---- stream_message end-to-end（要 Postgres・DB down は skip） ----
 
-def test_handle_message_saves_trace_version_always(monkeypatch):
-    """TOGGLE-RM（2026-09-03）: trace_version は常に2で保存される（v1 退避トグルは撤去済み）。"""
-    conv_id = _new_conv()
-    node = {"type": "node", "id": "understand", "kind": "think", "label": "質問を理解",
-            "detail": "内容を把握しました", "status": "done"}
-    events = [node, _fixed_result("v2 既定回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    out = CS.handle_message(None, "EXT-1 trace_version テスト", world="v1", conversation_id=conv_id,
-                            user_id="admin", knowledge=False)
-    msg = out["message"]
-    assert msg["answer"]["trace_version"] == 2
-
-
-def test_handle_message_saves_trace_version_and_hierarchy(monkeypatch):
-    """受け入れ条件(b): trace_version=2 のターンで parent_id/agent_run_id を持つイベントが
-    保存される（`docs/archive/2026-08-22-拡張設計.md` §11.3①）。"""
+def test_stream_message_saves_trace_version_and_hierarchy(monkeypatch):
     conv_id = _new_conv()
     parent = EE.build_event("agent-1", "agent", "サブ開始", "worker1 を起動", "done",
                             event_type="agent_started", agent_run_id="sub:worker1:1",
@@ -1413,41 +719,37 @@ def test_handle_message_saves_trace_version_and_hierarchy(monkeypatch):
     child = EE.build_event("tool-1", "tool", "資料を検索", "「消費税」", "done",
                            event_type="tool_started", parent_id="agent-1",
                            agent_run_id="sub:worker1:1", run_id="run-abc", phase="gather", seq=1)
-    events = [parent, child, _fixed_result("v2 テスト回答")]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    out = CS.handle_message(None, "EXT-1 flag on テスト", world="v1", conversation_id=conv_id,
-                            user_id="admin", knowledge=False)
-    msg = out["message"]
+    _use(monkeypatch, [parent, child, _fixed_result("v2 テスト回答")])
+    msg = _answer_message(list(CS.stream_message(None, "EXT-1 flag on テスト", world="v1", conversation_id=conv_id,
+                                                 user_id="admin", knowledge=False)))
     assert msg["answer"]["trace_version"] == 2
     by_id = {n["id"]: n for n in msg["trace"]}
     assert by_id["agent-1"]["agent_run_id"] == "sub:worker1:1"
     assert by_id["agent-1"]["event_type"] == "agent_started"
-    assert by_id["tool-1"]["parent_id"] == "agent-1"
-    assert by_id["tool-1"]["agent_run_id"] == "sub:worker1:1"
+    assert by_id["tool-1"]["parent_id"] == "agent-1" and by_id["tool-1"]["agent_run_id"] == "sub:worker1:1"
     assert by_id["tool-1"]["phase"] == "gather"
 
 
-# ---- R1a: _clip_history_msg（純関数・DB 不要） ----
+# ---- 履歴 priming（`_clip_history_msg` 純関数・`_history_pairs` は要 Postgres） ----
 
-def test_clip_history_msg_short_text_unchanged():
+def test_clip_history_msg():
     assert CS._clip_history_msg("短い文") == "短い文"
-
-
-def test_clip_history_msg_empty_and_none_are_empty_string():
-    assert CS._clip_history_msg("") == ""
-    assert CS._clip_history_msg(None) == ""
-
-
-def test_clip_history_msg_truncates_long_text_keeps_head_appends_marker():
-    long = "あ" * (CS._HISTORY_MSG_CHARS + 50)
-    out = CS._clip_history_msg(long)
-    assert out.startswith("あ" * 10)
-    assert out.endswith("…（省略）")
+    assert CS._clip_history_msg("") == "" and CS._clip_history_msg(None) == ""
+    out = CS._clip_history_msg("あ" * (CS._HISTORY_MSG_CHARS + 50))
+    assert out.startswith("あ" * 10) and out.endswith("…（省略）")
     assert len(out) == CS._HISTORY_MSG_CHARS + len("…（省略）")
 
 
-# ---- R1a: _history_pairs（要 Postgres・DB down は skip） ----
+def _add_pairs(cid, *pairs):
+    for q, a in pairs:
+        store.add_message(cid, "user", q)
+        if a is not None:
+            store.add_message(cid, "assistant", a)
+
+
+def _pair_msgs(*pairs):
+    return [m for q, a in pairs for m in ({"role": "user", "content": q}, {"role": "assistant", "content": a})]
+
 
 def test_history_pairs_none_conversation_id_returns_empty():
     assert CS._history_pairs(None) == []
@@ -1455,546 +757,289 @@ def test_history_pairs_none_conversation_id_returns_empty():
 
 def test_history_pairs_only_complete_pairs_in_chronological_order():
     cid = _new_conv()
-    store.add_message(cid, "user", "質問1")
-    store.add_message(cid, "assistant", "回答1")
-    store.add_message(cid, "user", "質問2")
-    store.add_message(cid, "assistant", "回答2")
-    assert CS._history_pairs(cid) == [
-        {"role": "user", "content": "質問1"}, {"role": "assistant", "content": "回答1"},
-        {"role": "user", "content": "質問2"}, {"role": "assistant", "content": "回答2"},
-    ]
+    _add_pairs(cid, ("質問1", "回答1"), ("質問2", "回答2"))
+    assert CS._history_pairs(cid) == _pair_msgs(("質問1", "回答1"), ("質問2", "回答2"))
 
 
 def test_history_pairs_drops_unpaired_user_row_from_stopped_turn():
-    """途中停止（UI フィードバック1）で assistant 未保存のまま残る不対 user 行は、対にならないため
-    履歴から落ちる（anthropic の交互制約・gemini の role 制約に対して安全）。"""
+    """途中停止で assistant 未保存のまま残る不対 user 行は履歴から落ちる（交互制約に対して安全）。"""
     cid = _new_conv()
-    store.add_message(cid, "user", "質問1")
-    store.add_message(cid, "assistant", "回答1")
-    store.add_message(cid, "user", "止められた質問")   # stopped＝assistant 保存なし（chat_service 仕様）
-    store.add_message(cid, "user", "質問2")            # 次のターンの user（前の不対 user と連続）
-    store.add_message(cid, "assistant", "回答2")
+    _add_pairs(cid, ("質問1", "回答1"), ("止められた質問", None), ("質問2", "回答2"))
     hist = CS._history_pairs(cid)
-    assert hist == [
-        {"role": "user", "content": "質問1"}, {"role": "assistant", "content": "回答1"},
-        {"role": "user", "content": "質問2"}, {"role": "assistant", "content": "回答2"},
-    ]
+    assert hist == _pair_msgs(("質問1", "回答1"), ("質問2", "回答2"))
     assert "止められた質問" not in [m["content"] for m in hist]
 
 
 def test_history_pairs_caps_to_recent_n_pairs():
     cid = _new_conv()
     n = CS._HISTORY_TURNS + 2
-    for i in range(n):
-        store.add_message(cid, "user", f"質問{i}")
-        store.add_message(cid, "assistant", f"回答{i}")
+    _add_pairs(cid, *[(f"質問{i}", f"回答{i}") for i in range(n)])
     hist = CS._history_pairs(cid)
-    assert len(hist) == CS._HISTORY_TURNS * 2                          # N 対（対数キャップ）だけ残る
-    kept_users = [m["content"] for m in hist if m["role"] == "user"]
-    assert kept_users == [f"質問{i}" for i in range(n - CS._HISTORY_TURNS, n)]   # 直近 N 対（新しい方）
+    assert len(hist) == CS._HISTORY_TURNS * 2
+    assert [m["content"] for m in hist if m["role"] == "user"] == [f"質問{i}" for i in range(n - CS._HISTORY_TURNS, n)]
 
 
 def test_history_pairs_respects_char_budget_dropping_oldest_pairs_first():
     cid = _new_conv()
-    big = "x" * 1000                                    # 1対 ≈ 2000+ 文字（budget=6000 を超える対数を作る）
-    for i in range(5):
-        store.add_message(cid, "user", f"{big}-u{i}")
-        store.add_message(cid, "assistant", f"{big}-a{i}")
+    big = "x" * 1000
+    _add_pairs(cid, *[(f"{big}-u{i}", f"{big}-a{i}") for i in range(5)])
     hist = CS._history_pairs(cid)
-    total_chars = sum(len(m["content"]) for m in hist)
-    assert total_chars <= CS._HISTORY_CHAR_BUDGET                      # 文字予算を超えない
+    assert sum(len(m["content"]) for m in hist) <= CS._HISTORY_CHAR_BUDGET
     kept_users = [m["content"] for m in hist if m["role"] == "user"]
-    assert kept_users[-1] == f"{big}-u4"                                # 最新の対は必ず残る
-    assert f"{big}-u0" not in kept_users                                 # 最も古い対は文字予算で捨てられる
+    assert kept_users[-1] == f"{big}-u4" and f"{big}-u0" not in kept_users
 
 
 def test_history_pairs_clips_individual_message_over_char_limit():
     cid = _new_conv()
-    long_answer = "あ" * (CS._HISTORY_MSG_CHARS + 100)
-    store.add_message(cid, "user", "質問1")
-    store.add_message(cid, "assistant", long_answer)
-    hist = CS._history_pairs(cid)
-    a = next(m for m in hist if m["role"] == "assistant")
-    assert len(a["content"]) == CS._HISTORY_MSG_CHARS + len("…（省略）")
-    assert a["content"].endswith("…（省略）")
+    _add_pairs(cid, ("質問1", "あ" * (CS._HISTORY_MSG_CHARS + 100)))
+    a = next(m for m in CS._history_pairs(cid) if m["role"] == "assistant")
+    assert len(a["content"]) == CS._HISTORY_MSG_CHARS + len("…（省略）") and a["content"].endswith("…（省略）")
 
 
 def test_history_pairs_degrades_to_empty_on_read_failure(monkeypatch):
-    """履歴の取得に失敗しても本回答は止めない（fail-open・warn ログのみ）。"""
     def _boom(conversation_id, limit):
         raise RuntimeError("boom")
     monkeypatch.setattr(store, "recent_messages", _boom)
     assert CS._history_pairs(123) == []
 
 
-# ---- R1a RV: 固定窓の劣化対策・N=0 無効化・512 行上限（Codex RV 指摘 2 件・2026-07-14） ----
-
 def test_history_pairs_survives_unpaired_row_pileup_pushing_window():
-    """MEDIUM: 固定窓（limit=_HISTORY_TURNS*2+8）のまま不対行（途中停止相当）が9件以上積まれると、
-    古い完全対が窓の外に押し出され「直近 N 完全対」を返せない（N 対未満に劣化する）。段階的な窓拡大で
-    防ぐ。"""
+    """固定窓のまま不対行が積まれても古い完全対が押し出されない（段階的な窓拡大）。"""
     cid = _new_conv()
     n = CS._HISTORY_TURNS
-    for i in range(n):
-        store.add_message(cid, "user", f"質問{i}")
-        store.add_message(cid, "assistant", f"回答{i}")
-    for i in range(10):                                     # stopped 相当の不対 user 行を10件積む
-        store.add_message(cid, "user", f"止められた質問{i}")
-    hist = CS._history_pairs(cid)
-    kept_users = [m["content"] for m in hist if m["role"] == "user"]
-    assert len(kept_users) == n                              # 直近 N 対（対数キャップ通り）を維持
-    assert kept_users == [f"質問{i}" for i in range(n)]       # N 対すべて（一番古い対も）残る
+    _add_pairs(cid, *[(f"質問{i}", f"回答{i}") for i in range(n)])
+    _add_pairs(cid, *[(f"止められた質問{i}", None) for i in range(10)])
+    kept_users = [m["content"] for m in CS._history_pairs(cid) if m["role"] == "user"]
+    assert kept_users == [f"質問{i}" for i in range(n)]
 
 
 def test_history_pairs_zero_turns_disables_priming(monkeypatch):
-    """LOW: `_HISTORY_TURNS<=0` は `pairs[-0:]`（全対）ではなく履歴 priming 無効化＝`[]` を意味する。"""
     cid = _new_conv()
-    store.add_message(cid, "user", "質問1")
-    store.add_message(cid, "assistant", "回答1")
+    _add_pairs(cid, ("質問1", "回答1"))
     monkeypatch.setattr(CS, "_HISTORY_TURNS", 0)
     assert CS._history_pairs(cid) == []
 
 
 def test_history_pairs_window_expansion_capped_at_512_rows(monkeypatch):
-    """不対行だらけ（完全対が一つもできない）でも、窓拡大は 512 行で打ち切られ、例外や無限ループなく
-    `[]` に degrade する（priming は best-effort・全履歴走査はしない）。"""
     calls = []
 
     def _fake_recent_messages(conversation_id, limit):
         calls.append(limit)
-        return [{"id": i, "role": "user", "content": f"u{i}"} for i in range(limit)]  # 常に不対な user 行
+        return [{"id": i, "role": "user", "content": f"u{i}"} for i in range(limit)]   # 常に不対な user 行
 
     monkeypatch.setattr(store, "recent_messages", _fake_recent_messages)
     assert CS._history_pairs(999) == []
-    assert calls[-1] == 512                                  # 最終的に 512 行まで広げて打ち切り
-    assert calls == sorted(calls)                             # 単調増加（段階拡大）
+    assert calls[-1] == 512 and calls == sorted(calls)
 
 
-# ---- R1a: 確認ID 回帰（message は別チャネル・履歴に混ざらない・PG/Neo4j 不要） ----
+# ---- 固定文言の縮退（Neo4j 安全弁） ----
 
-
-# ---- secRV 範囲外是正（2026-07-19）: impact レンズの Neo4j 安全弁 → チャット縮退（純関数・DB/Neo4j不要） ----
-
-def test_impact_overload_result_shape_is_fixed_and_no_llm_synthesis_hook():
-    """固定文言のエンベロープ（LLM合成を経由しない・summary.total=0で偽陰性を誘発する事実を持たない）。"""
-    env, decision = (r := CS._impact_overload_result("消費税率を変えたら", "w1", None))["env"], r["decision"]
-    assert env["lens"] == "impact"
-    assert env["headline"] == CS.GRAPH_OVERLOAD_USER_MESSAGE
-    assert env["summary"] == {"total": 0}
-    assert env["data"] == {}
-    assert env["sources"] == []
-    # layer/layer_applied が既定・非適用（impact は層フィルタを受け取っても適用しない）で足される。
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all",
-                            "layer": "both", "layer_applied": False}
+def test_impact_overload_result_shape_is_fixed_and_preserves_scope_meta():
+    r = CS._impact_overload_result("消費税率を変えたら", "w1", None)
+    env, decision = r["env"], r["decision"]
+    assert env["lens"] == "impact" and env["headline"] == CS.GRAPH_OVERLOAD_USER_MESSAGE
+    assert env["summary"] == {"total": 0} and env["data"] == {} and env["sources"] == []
+    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": "both", "layer_applied": False}
     assert decision["lens"] == "impact" and decision["input"] == "消費税率を変えたら"
-
-
-def test_impact_overload_result_preserves_scope_meta_when_given():
     sm = {"world": "w1", "scope_paths": ["4期/設計"], "source": "explicit"}
-    r = CS._impact_overload_result("m", "w1", sm)
-    # 既存の scope_meta の中身はそのまま残り、impact は非適用なので layer_applied=False が足される。
-    assert r["env"]["scope"] == {**sm, "layer_applied": False}
+    assert CS._impact_overload_result("m", "w1", sm)["env"]["scope"] == {**sm, "layer_applied": False}
 
 
-# ===== _dispatch の layer 配線（探す対象・調べ方ブロック §3.4/§3.5） =====
+# ---- _dispatch の配線（layer・調べる深さ・検索経路） ----
 
-def test_dispatch_qa_forwards_layer_and_marks_applied(monkeypatch):
-    """qa（author も qa 分岐に落ちる）は layer を run_qa/ES 補完へ転送し、layer_applied=True。"""
-    captured = {}
+def _patch_runners(monkeypatch) -> dict:
+    """run_qa/run_impact/run_troubleshoot と ES 補完を差し替え、渡された引数を捕捉する。
+    impact/troubleshoot の固定シグネチャは layer を受け取らない（渡されたら TypeError で検出）。"""
+    cap: dict = {}
 
-    def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
-        captured["run_qa_layer"] = layer
+    def run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
+        cap.update(run_qa_layer=layer, max_hits=max_hits)
         return {"type": "qa", "question": payload, "answered": True, "citations": []}
 
-    def fake_merge(result, world, query, sp, layer=None):
-        captured["merge_layer"] = layer
+    def merge_qa(result, world, query, sp, layer=None):
+        cap["merge_layer"] = layer
         return result
 
-    monkeypatch.setattr(CS, "run_qa", fake_run_qa)
-    monkeypatch.setattr(CS, "_merge_qa_with_es", fake_merge)
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1",
-                       {"world": "w1", "scope_paths": [], "source": "all", "layer": "code"})
-    assert captured == {"run_qa_layer": "code", "merge_layer": "code"}
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": "code",
-                            "layer_applied": True}
-
-
-def test_dispatch_impact_receives_layer_meta_but_does_not_apply_it(monkeypatch):
-    """impact は layer を run_impact へ渡さず（Cypher に触れない）、`layer_applied=False` を明示する。
-    `fake_run_impact` は `layer` を受け取らない固定シグネチャ＝渡されたら TypeError で検出する。"""
-    def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
+    def run_impact(session, payload, world, scope_prefixes=None, depth=None):
+        cap["impact_depth"] = depth
         return {"items": [], "presumed": [], "start": payload, "starts": []}
 
-    monkeypatch.setattr(CS, "run_impact", fake_run_impact)
-    env = CS._dispatch(None, "impact", "消費税率", "w1",
-                       {"world": "w1", "scope_paths": [], "source": "all", "layer": "code"})
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": "code",
-                            "layer_applied": False}
+    def run_ts(session, symptom, world, scope_paths=None, depth=None):
+        cap["ts_depth"] = depth
+        return {"type": "troubleshoot", "world": world, "symptom": symptom, "anchors": [], "candidates": []}
 
-
-def test_dispatch_troubleshoot_receives_layer_meta_but_does_not_apply_it(monkeypatch):
-    """troubleshoot は layer を run_troubleshoot/ES 補完へ渡さず、`layer_applied=False` を明示する
-    （§3.5・裁定1: グラフ traversal だけでなく ES 補完・運用手順 grep も含め全体を非適用）。"""
-    def fake_run_troubleshoot(session, symptom, world, scope_paths=None, depth=None):
-        return {"type": "troubleshoot", "world": world, "symptom": symptom,
-               "anchors": [], "candidates": []}
-
-    monkeypatch.setattr(CS, "run_troubleshoot", fake_run_troubleshoot)
+    monkeypatch.setattr(CS, "run_qa", run_qa)
+    monkeypatch.setattr(CS, "_merge_qa_with_es", merge_qa)
+    monkeypatch.setattr(CS, "run_impact", run_impact)
+    monkeypatch.setattr(CS, "run_troubleshoot", run_ts)
     monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", lambda result, world, query, sp: result)
-    env = CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1",
-                       {"world": "w1", "scope_paths": [], "source": "all", "layer": "docs"})
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": "docs",
-                            "layer_applied": False}
+    return cap
 
-
-def test_dispatch_no_scope_meta_defaults_to_both_and_qa_applies(monkeypatch):
-    """scope_meta 省略（knowledge オフ相当・呼び出し互換）でも既定 both・qa は layer_applied=True。"""
-    monkeypatch.setattr(CS, "run_qa", lambda payload, world, scope_paths=None, layer=None, max_hits=None:
-                        {"type": "qa", "question": payload, "answered": False, "citations": []})
-    monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", None)
-    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all",
-                            "layer": "both", "layer_applied": True}
-
-
-# ===== _dispatch の調べる深さ配線（§3.2・SC-6c）=====
 
 def _sm(depth_profile=None, **extra):
     return {"world": "w1", "scope_paths": [], "source": "all", "layer": "both",
-           "depth_profile": depth_profile, **extra}
+            "depth_profile": depth_profile, **extra}
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 10), ("standard", 10), ("deep", 12), ("max", 14)])
-def test_dispatch_impact_depth_scales_with_profile(monkeypatch, profile, expected_depth):
-    """影響たどりの深さ（既定 8）に深さの加算（標準+0／深く+2／最大+4）が載る。"""
-    captured = {}
-
-    def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
-        captured["depth"] = depth
-        return {"items": [], "presumed": [], "start": payload, "starts": []}
-
-    monkeypatch.setattr(CS, "run_impact", fake_run_impact)
-    CS._dispatch(None, "impact", "消費税率", "w1", _sm(profile))
-    assert captured["depth"] == expected_depth
+_PAYLOADS = {"qa": "消費税率とは", "impact": "消費税率", "troubleshoot": "夜間バッチ停止"}
 
 
-@pytest.mark.parametrize("profile,expected_depth", [(None, 4), ("standard", 4), ("deep", 6), ("max", 8)])
-def test_dispatch_troubleshoot_depth_scales_with_profile(monkeypatch, profile, expected_depth):
-    """トラブルシュート近傍の深さ（既定 3）にも同じ加算が載る。"""
-    captured = {}
-
-    def fake_run_troubleshoot(session, symptom, world, scope_paths=None, depth=None):
-        captured["depth"] = depth
-        return {"type": "troubleshoot", "world": world, "symptom": symptom,
-               "anchors": [], "candidates": []}
-
-    monkeypatch.setattr(CS, "run_troubleshoot", fake_run_troubleshoot)
-    monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", lambda result, world, query, sp: result)
-    CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", _sm(profile))
-    assert captured["depth"] == expected_depth
+@pytest.mark.parametrize("lens,layer,applied", [("qa", "code", True), ("impact", "code", False),
+                                                ("troubleshoot", "docs", False)])
+def test_dispatch_layer_wiring(monkeypatch, lens, layer, applied):
+    cap = _patch_runners(monkeypatch)
+    env = CS._dispatch(None, lens, _PAYLOADS[lens], "w1",
+                       {"world": "w1", "scope_paths": [], "source": "all", "layer": layer})
+    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": layer,
+                            "layer_applied": applied}
+    if lens == "qa":
+        assert (cap["run_qa_layer"], cap["merge_layer"]) == (layer, layer)
 
 
-@pytest.mark.parametrize("profile,expected_hits", [(None, 20), ("standard", 20), ("deep", 30), ("max", 40)])
-def test_dispatch_qa_max_hits_scales_with_profile(monkeypatch, profile, expected_hits):
-    """run_qa の max_hits（既定 20）に深さの倍率（×1／×1.5／×2）が載る。"""
-    captured = {}
-
-    def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
-        captured["max_hits"] = max_hits
-        return {"type": "qa", "question": payload, "answered": True, "citations": []}
-
-    monkeypatch.setattr(CS, "run_qa", fake_run_qa)
-    monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
-    CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(profile))
-    assert captured["max_hits"] == expected_hits
+def test_dispatch_no_scope_meta_defaults_to_both_and_qa_applies(monkeypatch):
+    _patch_runners(monkeypatch)
+    env = CS._dispatch(None, "qa", "消費税率とは", "w1", None)
+    assert env["scope"] == {"world": "w1", "scope_paths": [], "source": "all", "layer": "both", "layer_applied": True}
 
 
-def test_dispatch_depth_profile_honors_system_settings_base_override(monkeypatch):
-    """管理画面の基準値編集（system_settings）が env 既定より優先される（実効基準値）＝
-    深さ（"deep"＝+2）の加算はその実効基準値に載る。"""
-    captured = {}
+@pytest.mark.parametrize("lens,profile,settings,key,expected", [
+    ("impact", None, None, "impact_depth", 10), ("impact", "standard", None, "impact_depth", 10),
+    ("impact", "deep", None, "impact_depth", 12), ("impact", "max", None, "impact_depth", 14),
+    ("troubleshoot", None, None, "ts_depth", 4), ("troubleshoot", "standard", None, "ts_depth", 4),
+    ("troubleshoot", "deep", None, "ts_depth", 6), ("troubleshoot", "max", None, "ts_depth", 8),
+    ("qa", None, None, "max_hits", 20), ("qa", "standard", None, "max_hits", 20),
+    ("qa", "deep", None, "max_hits", 30), ("qa", "max", None, "max_hits", 40),
+    # 管理画面の基準値編集が env 既定より優先され、加算・倍率はその実効基準値に載る
+    ("impact", "deep", {"depth_base_impact_depth": 20}, "impact_depth", 22),
+    # 倍率・加算の適用後に絶対上限でクランプされる
+    ("impact", "max", {"depth_base_impact_depth": 68}, "impact_depth", 64),
+    ("troubleshoot", "max", {"depth_base_troubleshoot_depth": 20}, "ts_depth", 16),
+    ("qa", "max", {"depth_base_qa_max_hits": 2000}, "max_hits", 1000),
+])
+def test_dispatch_depth_profile_scales_base_and_clamps_at_abs_max(monkeypatch, lens, profile, settings, key, expected):
+    cap = _patch_runners(monkeypatch)
+    CS._dispatch(None, lens, _PAYLOADS[lens], "w1", _sm(profile), system_settings=settings)
+    assert cap[key] == expected
 
-    def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
-        captured["depth"] = depth
-        return {"items": [], "presumed": [], "start": payload, "starts": []}
-
-    monkeypatch.setattr(CS, "run_impact", fake_run_impact)
-    CS._dispatch(None, "impact", "消費税率", "w1", _sm("deep"),
-                system_settings={"depth_base_impact_depth": 20})
-    assert captured["depth"] == 22   # 20（基準値上書き）+ 2（深く）
-
-
-def test_dispatch_depth_profile_system_settings_none_uses_env_default(monkeypatch):
-    """`system_settings=None`（呼び出し元省略・後方互換）は env 既定値を基準に倍率だけが載る。"""
-    captured = {}
-
-    def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
-        captured["max_hits"] = max_hits
-        return {"type": "qa", "question": payload, "answered": True, "citations": []}
-
-    monkeypatch.setattr(CS, "run_qa", fake_run_qa)
-    monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
-    CS._dispatch(None, "qa", "消費税率とは", "w1", _sm("max"), system_settings=None)
-    assert captured["max_hits"] == 40   # QA_MAX_HITS_DEFAULT(20) × 2（最大）
-
-
-# ===== _dispatch の絶対上限（SC-6c §8）=====
-# 管理画面の基準値編集が各モジュールの env-parse hi 引数（＝既存の絶対上限）を超える値を
-# 許しても、倍率・加算の適用後に最終的にその絶対上限でクランプされる（安全弁）。
-
-def test_dispatch_impact_depth_abs_max_clamps_admin_base_over_limit(monkeypatch):
-    """admin が impact_depth の基準値を絶対上限超え（68）に設定していても、
-    `IMPACT_MAX_DEPTH_ABS_MAX`（64）でクランプされる。"""
-    captured = {}
-
-    def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
-        captured["depth"] = depth
-        return {"items": [], "presumed": [], "start": payload, "starts": []}
-
-    monkeypatch.setattr(CS, "run_impact", fake_run_impact)
-    CS._dispatch(None, "impact", "消費税率", "w1", _sm("max"),
-                system_settings={"depth_base_impact_depth": 68})
-    assert captured["depth"] == 64   # 68 ではなく 64（絶対上限）
-
-
-def test_dispatch_troubleshoot_depth_abs_max_clamps_admin_base_over_limit(monkeypatch):
-    """troubleshoot_depth も同様（基準値20が絶対上限16でクランプ）。"""
-    captured = {}
-
-    def fake_run_troubleshoot(session, symptom, world, scope_paths=None, depth=None):
-        captured["depth"] = depth
-        return {"type": "troubleshoot", "world": world, "symptom": symptom,
-               "anchors": [], "candidates": []}
-
-    monkeypatch.setattr(CS, "run_troubleshoot", fake_run_troubleshoot)
-    monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", lambda result, world, query, sp: result)
-    CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", _sm("max"),
-                system_settings={"depth_base_troubleshoot_depth": 20})
-    assert captured["depth"] == 16   # 20 ではなく 16（絶対上限）
-
-
-def test_dispatch_qa_max_hits_abs_max_clamps_admin_base_over_limit(monkeypatch):
-    """qa の max_hits も同様（基準値2000が絶対上限1000でクランプ）。"""
-    captured = {}
-
-    def fake_run_qa(payload, world, scope_paths=None, layer=None, max_hits=None):
-        captured["max_hits"] = max_hits
-        return {"type": "qa", "question": payload, "answered": True, "citations": []}
-
-    monkeypatch.setattr(CS, "run_qa", fake_run_qa)
-    monkeypatch.setattr(CS, "_merge_qa_with_es", lambda result, world, query, sp, layer=None: result)
-    CS._dispatch(None, "qa", "消費税率とは", "w1", _sm("max"),
-                system_settings={"depth_base_qa_max_hits": 2000})
-    assert captured["max_hits"] == 1000   # 2000 ではなく 1000（絶対上限）
-
-
-# ===== _dispatch の検索経路トグル（調べ方ブロック §3.6・SC-6e）=====
 
 def _raise_if_called(*_a, **_kw):
     raise AssertionError("OFF/不達のツールが呼ばれてしまった（迂回封鎖のはずが実行された）")
 
 
-def test_dispatch_impact_degrades_when_graph_off_but_search_remains(monkeypatch):
-    """S4: impact はグラフ必須だが、OFF/不達でも grep か全文が残っていれば明示エラーで終わらせず
-    qa 相当の下地へ縮退する（run_impact は呼ばない・縮退の印を envelope に残す）。"""
-    monkeypatch.setattr(CS, "run_impact", _raise_if_called)
-    sm = _sm(tools={"grep": True, "fulltext": True, "graph": False})
-    env = CS._dispatch(None, "impact", "消費税率", "w1", sm)
-    assert env["graph_degraded"] == "blocked"
-    assert env["data"]["type"] == "qa"
-
-
-def test_dispatch_troubleshoot_degrades_when_graph_off_but_search_remains(monkeypatch):
-    monkeypatch.setattr(CS, "run_troubleshoot", _raise_if_called)
-    sm = _sm(tools={"grep": True, "fulltext": True, "graph": False})
-    env = CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", sm)
-    assert env["graph_degraded"] == "blocked"
-    assert env["data"]["type"] == "qa"
+@pytest.mark.parametrize("lens,runner", [("impact", "run_impact"), ("troubleshoot", "run_troubleshoot")])
+def test_dispatch_graph_lens_degrades_when_graph_off_but_search_remains(monkeypatch, lens, runner):
+    """グラフ OFF/不達でも grep か全文が残っていれば明示エラーで終わらせず qa 相当の下地へ縮退する。"""
+    monkeypatch.setattr(CS, runner, _raise_if_called)
+    env = CS._dispatch(None, lens, _PAYLOADS[lens], "w1", _sm(tools={"grep": True, "fulltext": True, "graph": False}))
+    assert env["graph_degraded"] == "blocked" and env["data"]["type"] == "qa"
 
 
 def test_dispatch_impact_blocked_when_no_search_tool_remains(monkeypatch):
-    """縮退の条件は「資料を探す手段が残っていること」——grep も全文も無ければ従来どおり明示エラー。"""
-    monkeypatch.setattr(CS, "run_impact", _raise_if_called)
-    monkeypatch.setattr(CS, "run_qa", _raise_if_called)
-    monkeypatch.setattr(CS, "_es_citations", _raise_if_called)
-    sm = _sm()   # 希望は全ON・実接続が全て不達（3軸 OFF の希望自体は 422 で入口を通らない）
-    env = CS._dispatch(None, "impact", "消費税率", "w1", sm,
-                      tools_availability={"grep": False, "fulltext": False, "graph": False})
-    assert env["data"] == {}
-    assert env["sources"] == []
-    assert "グラフ" in env["headline"]
+    for name in ("run_impact", "run_qa", "_es_citations"):
+        monkeypatch.setattr(CS, name, _raise_if_called)
+    env = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
+                       tools_availability={"grep": False, "fulltext": False, "graph": False})
+    assert env["data"] == {} and env["sources"] == [] and "グラフ" in env["headline"]
 
 
 def test_dispatch_qa_blocked_when_grep_and_fulltext_off_returns_honest_failure(monkeypatch):
     monkeypatch.setattr(CS, "run_qa", _raise_if_called)
     monkeypatch.setattr(CS, "_es_citations", _raise_if_called)
-    sm = _sm(tools={"grep": False, "fulltext": False, "graph": True})
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", sm)
-    assert env["data"] == {}
-    assert env["sources"] == []
+    env = CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(tools={"grep": False, "fulltext": False, "graph": True}))
+    assert env["data"] == {} and env["sources"] == []
 
 
 def test_dispatch_qa_skips_es_merge_when_fulltext_off(monkeypatch):
-    """grep ON・fulltext OFF: run_qa は呼ぶが ES 補完（_merge_qa_with_es）は呼ばない。"""
     monkeypatch.setattr(CS, "run_qa", lambda payload, world, scope_paths=None, layer=None, max_hits=None:
                         {"type": "qa", "question": payload, "answered": True,
                          "citations": [{"doc_id": "a.md", "quote": "x", "span": [1, 1]}]})
     monkeypatch.setattr(CS, "_merge_qa_with_es", _raise_if_called)
-    sm = _sm(tools={"fulltext": False})
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", sm)
-    assert env["summary"]["total"] == 1
+    assert CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(tools={"fulltext": False}))["summary"]["total"] == 1
 
 
 def test_dispatch_qa_uses_es_only_when_grep_off(monkeypatch):
-    """grep OFF・fulltext ON: run_qa は呼ばず ES 検索のみで citations を組み立てる。"""
     monkeypatch.setattr(CS, "run_qa", _raise_if_called)
     monkeypatch.setattr(CS, "_es_citations", lambda world, query, sp, layer=None:
                         [{"doc_id": "b.md", "quote": "y", "span": [2, 2]}])
-    sm = _sm(tools={"grep": False})
-    env = CS._dispatch(None, "qa", "消費税率とは", "w1", sm)
-    assert env["summary"]["total"] == 1
-    assert env["data"]["citations"][0]["doc_id"] == "b.md"
+    env = CS._dispatch(None, "qa", "消費税率とは", "w1", _sm(tools={"grep": False}))
+    assert env["summary"]["total"] == 1 and env["data"]["citations"][0]["doc_id"] == "b.md"
 
 
 def test_dispatch_troubleshoot_skips_es_merge_when_fulltext_off(monkeypatch):
     monkeypatch.setattr(CS, "run_troubleshoot", lambda session, symptom, world, scope_paths=None, depth=None:
-                        {"type": "troubleshoot", "world": world, "symptom": symptom,
-                         "anchors": [], "candidates": [{"name": "X", "label": "Program",
-                                                        "category": "コード", "role": "近傍",
-                                                        "distance": 1, "path": [], "evidence": {}}]})
+                        {"type": "troubleshoot", "world": world, "symptom": symptom, "anchors": [],
+                         "candidates": [{"name": "X", "label": "Program", "category": "コード", "role": "近傍",
+                                         "distance": 1, "path": [], "evidence": {}}]})
     monkeypatch.setattr(CS, "_merge_troubleshoot_with_es", _raise_if_called)
-    sm = _sm(tools={"fulltext": False})
-    env = CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", sm)
-    assert env["summary"]["total"] == 1
+    assert CS._dispatch(None, "troubleshoot", "夜間バッチ停止", "w1", _sm(tools={"fulltext": False}))["summary"]["total"] == 1
 
 
-def test_dispatch_tools_availability_param_blocks_even_when_pref_is_full_on(monkeypatch):
-    """`tools_availability`（呼び出し元がターンに1回だけ計算した実接続結果）だけで判定が変わる——
-    `tools_pref` 省略（全ON希望）でも、グラフが不達なら impact は run_impact へ進まない
-    （S4 以降は明示エラーではなく grep 相当の下地への縮退・印は `graph_degraded`）。"""
+def test_dispatch_tools_availability_param_decides_regardless_of_pref(monkeypatch):
     monkeypatch.setattr(CS, "run_impact", _raise_if_called)
-    sm = _sm()   # tools 省略＝全ON希望
-    env = CS._dispatch(None, "impact", "消費税率", "w1", sm,
-                      tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env["graph_degraded"] == "graph_unavailable"   # 実接続の不達＝統計に残す側のコード
-
-
-def test_dispatch_tools_availability_omitted_defaults_to_fully_available(monkeypatch):
-    """`tools_availability` 省略（既定 None）は全て利用可能扱い＝既存呼び出し元・単体テストは
-    byte-identical（`_dispatch` 自体は DB/ネットワーク非依存のまま）。"""
-    captured = {}
-
-    def fake_run_impact(session, payload, world, scope_prefixes=None, depth=None):
-        captured["called"] = True
-        return {"items": [], "presumed": [], "start": payload, "starts": []}
-
-    monkeypatch.setattr(CS, "run_impact", fake_run_impact)
+    env = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
+                       tools_availability={"grep": True, "fulltext": True, "graph": False})
+    assert env["graph_degraded"] == "graph_unavailable"          # 実接続の不達＝統計に残す側のコード
+    cap = _patch_runners(monkeypatch)                             # 省略時は全て利用可能扱い
     CS._dispatch(None, "impact", "消費税率", "w1", _sm())
-    assert captured.get("called") is True
+    assert cap["impact_depth"] is not None
 
 
-# ===== _resolve_scope の layer 正規化（§8 裁定論点3/4） =====
+# ---- _resolve_scope / _resolve_lens ----
 
-def test_resolve_scope_layer_omitted_defaults_to_both():
-    sm = CS._resolve_scope("質問", "w1", [])
-    assert sm == {"world": "w1", "scope_paths": [], "source": "all", "layer": "both",
-                 "lens_source": "auto", "lens_block": None, "web_search": False,
-                 "depth_profile": "standard",
-                 "tools": {"grep": True, "fulltext": True, "graph": True}}
+_TOOLS_ALL = {"grep": True, "fulltext": True, "graph": True}
+_DEFAULT_SCOPE = {"world": "w1", "scope_paths": [], "source": "all", "layer": "both", "lens_source": "auto",
+                  "lens_block": None, "web_search": False, "depth_profile": "standard", "tools": _TOOLS_ALL}
 
 
-def test_resolve_scope_layer_valid_value_passthrough():
-    sm = CS._resolve_scope("質問", "w1", ["4期/設計"], "code")
-    assert sm == {"world": "w1", "scope_paths": ["4期/設計"], "source": "explicit", "layer": "code",
-                 "lens_source": "auto", "lens_block": None, "web_search": False,
-                 "depth_profile": "standard",
-                 "tools": {"grep": True, "fulltext": True, "graph": True}}
+def test_resolve_scope_defaults_and_valid_layer_passthrough():
+    assert CS._resolve_scope("質問", "w1", []) == _DEFAULT_SCOPE
+    assert CS._resolve_scope("質問", "w1", ["4期/設計"], "code") == {
+        **_DEFAULT_SCOPE, "scope_paths": ["4期/設計"], "source": "explicit", "layer": "code"}
 
 
-def test_resolve_scope_layer_invalid_value_raises():
-    """省略（None）だけが both・内部の不正値は ValueError（fail-loud）。
-    HTTP 入口は pydantic Literal が防ぐため、ここに届く不正値は呼び出し側のバグを示す。"""
-    import pytest
+@pytest.mark.parametrize("kwargs,key,expected", [
+    ({"lens_source": "explicit"}, "lens_source", "explicit"),
+    ({"lens_source": "slash"}, "lens_source", "slash"),
+    ({"lens_source": "slash", "lens_block": "qa"}, "lens_block", "qa"),    # スラッシュでもブロックの継続設定を保持
+    ({"web_search": True}, "web_search", True),
+    ({"depth_profile": "standard"}, "depth_profile", "standard"),
+    ({"depth_profile": "deep"}, "depth_profile", "deep"),
+    ({"depth_profile": "max"}, "depth_profile", "max"),
+    ({"tools": {"grep": False, "fulltext": True, "graph": True}}, "tools",
+     {"grep": False, "fulltext": True, "graph": True}),
+])
+def test_resolve_scope_passthrough(kwargs, key, expected):
+    assert CS._resolve_scope("質問", "w1", [], **kwargs)[key] == expected
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"layer": "bogus"}, {"depth_profile": "bogus"}, {"tools": {"grep": False, "fulltext": False, "graph": False}},
+], ids=["layer", "depth_profile", "tools_all_off"])
+def test_resolve_scope_invalid_value_raises(kwargs):
+    """省略（None）だけが既定・内部の不正値は ValueError（fail-loud）。"""
+    args = ("質問", "w1", [], kwargs.pop("layer")) if "layer" in kwargs else ("質問", "w1", [])
     with pytest.raises(ValueError):
-        CS._resolve_scope("質問", "w1", [], "bogus")
+        CS._resolve_scope(*args, **kwargs)
 
 
-# ===== _resolve_scope の lens_source/lens_block（調べ方の明示指定元・SC-6b §3.1・RV1 #2）=====
-
-def test_resolve_scope_lens_source_explicit_passthrough():
-    sm = CS._resolve_scope("質問", "w1", [], lens_source="explicit")
-    assert sm["lens_source"] == "explicit"
-
-
-def test_resolve_scope_lens_source_slash_passthrough():
-    sm = CS._resolve_scope("質問", "w1", [], lens_source="slash")
-    assert sm["lens_source"] == "slash"
-
-
-def test_resolve_scope_lens_block_passthrough():
-    """スラッシュ実行時でも、ブロックの継続設定（`lens_block`）は別途保持する（RV1 #2）。"""
-    sm = CS._resolve_scope("質問", "w1", [], lens_source="slash", lens_block="qa")
-    assert sm["lens_block"] == "qa" and sm["lens_source"] == "slash"
+@pytest.mark.parametrize("lens_in,message,expected", [
+    (None, "消費税率を変えたい", (None, "auto", None, "消費税率を変えたい")),
+    ("auto", "消費税率を変えたい", (None, "auto", None, "消費税率を変えたい")),
+    ("impact", "消費税率を変えたい", ("impact", "explicit", "impact", "消費税率を変えたい")),
+    # スラッシュ接頭辞は ChatReq.lens より優先し本文から除く・ブロックの継続設定は lens_block に残す
+    ("qa", "/影響 消費税率を変えたい", ("impact", "slash", "qa", "消費税率を変えたい")),
+    (None, "/原因 x", ("troubleshoot", "slash", None, "x")),
+    (None, "/内容 x", ("qa", "slash", None, "x")),
+    (None, "/作成 x", ("author", "slash", None, "x")),
+    (None, "これは /影響 ではない", (None, "auto", None, "これは /影響 ではない")),
+])
+def test_resolve_lens(lens_in, message, expected):
+    assert CS._resolve_lens(lens_in, message) == expected
 
 
-def test_resolve_scope_lens_block_defaults_to_none():
-    sm = CS._resolve_scope("質問", "w1", [])
-    assert sm["lens_block"] is None
-
-
-# ===== _resolve_scope の web_search（WEB-1・チャットごとの Web 検索希望・復元用の記録のみ）=====
-
-def test_resolve_scope_web_search_omitted_defaults_to_false():
-    sm = CS._resolve_scope("質問", "w1", [])
-    assert sm["web_search"] is False
-
-
-def test_resolve_scope_web_search_true_passthrough():
-    sm = CS._resolve_scope("質問", "w1", [], web_search=True)
-    assert sm["web_search"] is True
-
-
-# ===== _resolve_scope の depth_profile（調べる深さ・調べ方ブロック §3.2・SC-6c）=====
-
-def test_resolve_scope_depth_profile_omitted_defaults_to_standard():
-    sm = CS._resolve_scope("質問", "w1", [])
-    assert sm["depth_profile"] == "standard"
-
-
-@pytest.mark.parametrize("profile", ["standard", "deep", "max"])
-def test_resolve_scope_depth_profile_valid_value_passthrough(profile):
-    sm = CS._resolve_scope("質問", "w1", [], depth_profile=profile)
-    assert sm["depth_profile"] == profile
-
-
-def test_resolve_scope_depth_profile_invalid_value_raises():
-    """省略（None）だけが standard・内部の不正値は ValueError（fail-loud・layer と同じ契約）。"""
-    with pytest.raises(ValueError):
-        CS._resolve_scope("質問", "w1", [], depth_profile="bogus")
-
-
-# ===== _resolve_scope の tools（検索経路トグル・調べ方ブロック §3.6・SC-6e）=====
-
-def test_resolve_scope_tools_omitted_defaults_to_all_on():
-    sm = CS._resolve_scope("質問", "w1", [])
-    assert sm["tools"] == {"grep": True, "fulltext": True, "graph": True}
-
-
-def test_resolve_scope_tools_valid_value_passthrough():
-    sm = CS._resolve_scope("質問", "w1", [], tools={"grep": False, "fulltext": True, "graph": True})
-    assert sm["tools"] == {"grep": False, "fulltext": True, "graph": True}
-
-
-def test_resolve_scope_tools_all_off_raises():
-    """省略（None）だけが全ON・3つとも false は ValueError（fail-loud・layer/depth_profile と同じ契約）。"""
-    with pytest.raises(ValueError):
-        CS._resolve_scope("質問", "w1", [], tools={"grep": False, "fulltext": False, "graph": False})
-
+# ---- 巡の縮退・履歴の混入・_known_terms ----
 
 def _fake_provider_gen(events):
-    """`get_provider(settings).run(ctx)` の代わりに使うフェイクジェネレータ（イベント列を yield し、
-    末尾が例外なら最後に raise する）。
-    """
     def _gen():
         for ev in events:
             if isinstance(ev, BaseException):
@@ -2003,57 +1048,31 @@ def _fake_provider_gen(events):
     return _gen()
 
 
-def test_degrade_overload_passthrough_when_no_exception():
-    """例外が起きなければ、元のイベント列をそのまま素通しする（副作用なし）。"""
-    events = [{"type": "node", "id": "n1"}, {"type": "_result", "env": {"headline": "ok"}, "decision": {}}]
-    out = list(CS._degrade_overload(_fake_provider_gen(events), "m", "w1", None))
-    assert out == events
-
-
-def test_degrade_overload_converts_overload_error_to_fixed_result(caplog):
-    """`GraphQueryOverloadError` がイテレーション中に飛ぶと、以降のイベントは出さず固定文言の
-    `_result` 1個に差し替わる（LLM 合成（`_answer_prompt`）を一度も経由しない＝偽陰性の温床を断つ）。
-    """
+def test_degrade_overload_passthrough_converts_overload_and_does_not_swallow_others(caplog):
     from sherpa.ingest.world_neo4j import GraphQueryOverloadError
-    events = [{"type": "node", "id": "tool-graph"},
-              GraphQueryOverloadError("timeout", world="w1")]
+    events = [{"type": "node", "id": "n1"}, {"type": "_result", "env": {"headline": "ok"}, "decision": {}}]
+    assert list(CS._degrade_overload(_fake_provider_gen(events), "m", "w1", None)) == events
+
+    events = [{"type": "node", "id": "tool-graph"}, GraphQueryOverloadError("timeout", world="w1")]
     with caplog.at_level(logging.WARNING, logger="sherpa"):
         out = list(CS._degrade_overload(_fake_provider_gen(events), "消費税率", "w1", None))
-    assert len(out) == 2                                   # 先行の node イベント + 差し替えた _result
-    assert out[0] == {"type": "node", "id": "tool-graph"}
-    assert out[1]["type"] == "_result"
-    assert out[1]["env"]["headline"] == CS.GRAPH_OVERLOAD_USER_MESSAGE
+    assert len(out) == 2 and out[0] == {"type": "node", "id": "tool-graph"}
+    assert out[1]["type"] == "_result" and out[1]["env"]["headline"] == CS.GRAPH_OVERLOAD_USER_MESSAGE
     assert out[1]["decision"]["lens"] == "impact"
     assert any("安全弁で縮退" in r.getMessage() and "w1" in r.getMessage() for r in caplog.records)
 
-
-def test_degrade_overload_does_not_swallow_other_exceptions():
-    """`GraphQueryOverloadError` 以外の例外は握り潰さず、そのまま呼び出し元へ伝播する。"""
-    events = [RuntimeError("boom")]
     with pytest.raises(RuntimeError):
-        list(CS._degrade_overload(_fake_provider_gen(events), "m", "w1", None))
+        list(CS._degrade_overload(_fake_provider_gen([RuntimeError("boom")]), "m", "w1", None))
 
 
 def test_history_does_not_leak_into_message_for_confirm_id_or_routing():
-    """履歴に確認ID マーカーを含む過去ターンがあっても、現在ターンの `ctx.message`（別チャネル）は
-    汚染されず、`_can_ask`/`chat_router._resume_lens` の判定に影響しない。"""
     from sherpa import chat_router
-    from sherpa.providers.base import _can_ask
+    history = [{"role": "user", "content": "選択: 影響を調べる\n確認ID: ask-0011\n元の依頼: 消費税率を変えたい"},
+               {"role": "assistant", "content": "影響分析の結果です。"}]
+    assert "確認ID" in history[0]["content"]
+    current_message = "追加で教えて"
+    assert chat_router._resume_lens(current_message) == (None, None)
 
-    history = [
-        {"role": "user", "content": "選択: 影響を調べる\n確認ID: ask-0011\n元の依頼: 消費税率を変えたい"},
-        {"role": "assistant", "content": "影響分析の結果です。"},
-    ]
-    assert "確認ID" in history[0]["content"]                          # 前提: 履歴側には確かにマーカーがある
-    current_message = "追加で教えて"                                   # 確認ID を含まないクリーンな現在の質問
-    assert _can_ask(current_message) is True                          # 履歴に確認ID があっても ask_user は有効
-    lens, original = chat_router._resume_lens(current_message)
-    assert lens is None and original is None                          # resume 判定も発火しない（message のみ見る）
-
-
-# ---- _known_terms: HIGH-2（secRV 範囲外是正 追補・2026-07-19） -------------------------------
-# `lens_service._run_capped` 経由になったことで安全弁（timeout/緊急天井）を迂回しなくなったことを、
-# 実 Neo4j を使わないフェイク session（`tests/unit/test_lens_service.py` と同じパターン）で固定する。
 
 class _CSFakeRecord:
     def __init__(self, d):
@@ -2071,515 +1090,230 @@ class _CSFakeResult:
         return iter(_CSFakeRecord(r) for r in self._rows)
 
     def consume(self):
-        pass   # `_run_capped`（HIGH-1是正後）が天井到達時に呼ぶ。ここでは呼ばれること自体は検証しない。
+        pass
 
 
 class _CSFakeSession:
     def __init__(self, rows=None, raise_exc=None):
         self._rows = rows or []
         self._raise_exc = raise_exc
-        self.calls: list[tuple] = []
 
     def run(self, query, **params):
-        self.calls.append((query, params))
         if self._raise_exc is not None:
             raise self._raise_exc
         return _CSFakeResult(self._rows)
 
 
-def test_known_terms_degrades_to_empty_on_timeout(caplog):
-    """クエリがタイムアウトしても例外を出さず空リストへソフト縮退する（黙殺ではなく warning 付き）。"""
+def test_known_terms_degrades_softly_and_keeps_shape(caplog):
     from neo4j.exceptions import Neo4jError
+    from sherpa import lens_service as LS
     exc = Neo4jError._hydrate_neo4j(
         code="Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration", message="timed out")
-    s = _CSFakeSession(raise_exc=exc)
     with caplog.at_level(logging.WARNING, logger="sherpa"):
-        out = CS._known_terms(s, "w1")
-    assert out == []
+        assert CS._known_terms(_CSFakeSession(raise_exc=exc), "w1") == []
     assert any("タイムアウト" in r.getMessage() for r in caplog.records)
-
-
-def test_known_terms_degrades_to_partial_list_on_row_cap(caplog):
-    """天井到達時は例外を出さず、cap 件までの部分リストへ縮退する（黙って削らず warning は出す）。"""
-    from sherpa import lens_service as LS
-    over = LS._NEO4J_MAX_ROWS + 5
-    rows = [{"name": f"NODE{i}"} for i in range(over)]
-    s = _CSFakeSession(rows=rows)
+    caplog.clear()
+    rows = [{"name": f"NODE{i}"} for i in range(LS._NEO4J_MAX_ROWS + 5)]
     with caplog.at_level(logging.WARNING, logger="sherpa"):
-        out = CS._known_terms(s, "w1")
-    assert len(out) == LS._NEO4J_MAX_ROWS
+        assert len(CS._known_terms(_CSFakeSession(rows=rows), "w1")) == LS._NEO4J_MAX_ROWS
     assert any("緊急天井" in r.getMessage() for r in caplog.records)
+    assert CS._known_terms(_CSFakeSession(rows=[{"name": "TAXCALC"}, {"name": None}, {"name": "TAX-RATE"}]),
+                           "w1") == ["TAXCALC", "TAX-RATE"]
 
 
-def test_known_terms_shape_unchanged_on_normal_result():
-    """正常系: 返却形（name 文字列のリスト・None は除外）は変わらない。"""
-    rows = [{"name": "TAXCALC"}, {"name": None}, {"name": "TAX-RATE"}]
-    s = _CSFakeSession(rows=rows)
-    out = CS._known_terms(s, "w1")
-    assert out == ["TAXCALC", "TAX-RATE"]
+# ---- _build_router ----
 
+_CONFIRM_FIRST = "税率の一覧を Excel にまとめて。確認してから進めて。"
 
-# ===== _resolve_lens（調べ方の明示指定・SC-6b §3.1）=====
-
-def test_resolve_lens_no_input_is_auto():
-    explicit, source, block, msg = CS._resolve_lens(None, "消費税率を変えたい")
-    assert explicit is None and source == "auto" and block is None and msg == "消費税率を変えたい"
-
-
-def test_resolve_lens_auto_literal_is_auto():
-    """ブロックの「自動」を明示送信しても None と同じ扱い（§4.2 の Literal に "auto" を含む理由）。"""
-    explicit, source, block, msg = CS._resolve_lens("auto", "消費税率を変えたい")
-    assert explicit is None and source == "auto" and block is None
-
-
-def test_resolve_lens_chatreq_lens_is_explicit():
-    explicit, source, block, msg = CS._resolve_lens("impact", "消費税率を変えたい")
-    assert explicit == "impact" and source == "explicit" and block == "impact" and msg == "消費税率を変えたい"
-
-
-def test_resolve_lens_slash_prefix_strips_and_wins_over_explicit():
-    """スラッシュ接頭辞は1回限りの明示＝ChatReq.lens（ブロックの明示選択）より優先し、本文から除く。"""
-    explicit, source, block, msg = CS._resolve_lens("qa", "/影響 消費税率を変えたい")
-    assert explicit == "impact" and source == "slash" and msg == "消費税率を変えたい"
-
-
-def test_resolve_lens_slash_prefix_keeps_block_continuing_setting():
-    """RV1 #2: スラッシュで実効レンズが上書きされても、ブロックの継続設定（qa）は `lens_block` に残る。"""
-    explicit, source, block, msg = CS._resolve_lens("qa", "/影響 消費税率を変えたい")
-    assert block == "qa"
-
-
-def test_resolve_lens_slash_prefix_all_four_words():
-    assert CS._resolve_lens(None, "/影響 x")[:2] == ("impact", "slash")
-    assert CS._resolve_lens(None, "/原因 x")[:2] == ("troubleshoot", "slash")
-    assert CS._resolve_lens(None, "/内容 x")[:2] == ("qa", "slash")
-    assert CS._resolve_lens(None, "/作成 x")[:2] == ("author", "slash")
-
-
-def test_resolve_lens_no_slash_when_not_prefix():
-    """先頭以外・語彙外・空白なしは通常文として扱う（誤検出しない）。"""
-    explicit, source, block, msg = CS._resolve_lens(None, "これは /影響 ではない")
-    assert explicit is None and source == "auto" and block is None and msg == "これは /影響 ではない"
-
-
-# ===== _build_router の明示指定バイパス（SC-6b §3.1・裁定10）=====
 
 def test_build_router_explicit_lens_bypasses_heuristic_and_llm(monkeypatch):
-    """explicit_lens 指定時は heuristic/LLM を一切呼ばず decision_for() で直接確定する。"""
     calls = []
     monkeypatch.setattr(CS.intent_llm, "classify", lambda m, s, **kw: calls.append(m) or None)
     d = CS._build_router([], "w1", {}, can_ask=True, explicit_lens="impact")("消費税の仕様は？")
     assert d["lens"] == "impact" and d["reason"] == "明示指定" and calls == []
 
 
-def test_build_router_confirm_first_overrides_explicit_lens():
-    """「確認してから進めて」は明示指定より優先する例外（裁定10）。"""
-    d = CS._build_router([], "w1", {}, can_ask=True, explicit_lens="impact")(
-        "税率の一覧を Excel にまとめて。確認してから進めて。")
-    assert d["lens"] == "clarify"
-
-
-def test_build_router_explicit_lens_ignored_when_cannot_ask_for_confirm():
-    """can_ask=False では確認カードを出せないため、明示指定がそのまま適用される。"""
-    d = CS._build_router([], "w1", {}, can_ask=False, explicit_lens="impact")(
-        "税率の一覧を Excel にまとめて。確認してから進めて。")
-    assert d["lens"] == "impact"
+@pytest.mark.parametrize("can_ask,expected", [(True, "clarify"), (False, "impact")])
+def test_build_router_confirm_first_overrides_explicit_lens_only_when_can_ask(can_ask, expected):
+    """「確認してから進めて」は明示指定より優先する（確認カードを出せないときは明示指定がそのまま適用）。"""
+    assert CS._build_router([], "w1", {}, can_ask=can_ask, explicit_lens="impact")(_CONFIRM_FIRST)["lens"] == expected
 
 
 def test_build_router_confirm_first_embeds_scope_meta_tools():
-    """SC-6e: 確認カードの payload に `scope_meta["tools"]` を載せる——無いと再送時に
-    全ONへ復元されてしまう（グラフのみで確認カードを出して別会話へ移動して戻る事故）。"""
+    """確認カードに `scope_meta["tools"]` を載せる（無いと再送時に全 ON へ復元される）。"""
     sm = {"world": "w1", "scope_paths": [], "source": "all", "layer": "both",
-         "tools": {"grep": False, "fulltext": False, "graph": True}}
-    d = CS._build_router([], "w1", {}, can_ask=True, scope_meta=sm)(
-        "税率の一覧を Excel にまとめて。確認してから進めて。")
-    assert d["lens"] == "clarify"
-    assert d["question"]["tools"] == {"grep": False, "fulltext": False, "graph": True}
-
-
-def test_build_router_confirm_first_tools_omitted_when_scope_meta_none():
-    """knowledge オフ相当（scope_meta=None）でも例外にならず tools は None のまま。"""
-    d = CS._build_router([], "w1", {}, can_ask=True, scope_meta=None)(
-        "税率の一覧を Excel にまとめて。確認してから進めて。")
+          "tools": {"grep": False, "fulltext": False, "graph": True}}
+    d = CS._build_router([], "w1", {}, can_ask=True, scope_meta=sm)(_CONFIRM_FIRST)
+    assert d["lens"] == "clarify" and d["question"]["tools"] == sm["tools"]
+    d = CS._build_router([], "w1", {}, can_ask=True, scope_meta=None)(_CONFIRM_FIRST)
     assert d["question"]["tools"] is None
 
 
-# ===== _no_genuine_results / _retry_hints（出典0件時の案内・SC-6d §5・裁定5・RV1 #6/#9）=====
+# ---- _no_genuine_results / _retry_hints / _finalize ----
 
 def _env(sources, scope, data=None):
-    """`data` 省略時は「通常の検索結果 envelope」を模す非空 dict（キーの中身自体は問わない）。
-    明示エラー（未接続/busy/下調べ失敗等）は `data={}` を渡す（RV1 #6）。"""
+    """`data` 省略時は通常の検索結果 envelope を模す非空 dict。明示エラーは `data={}` を渡す。"""
     return {"sources": sources, "scope": scope, "data": data if data is not None else {"type": "qa"}}
 
 
-def test_no_genuine_results_true_when_sources_empty_and_data_present():
+def _scope(scope_paths=(), layer="both", applied=True, **extra):
+    return {"scope_paths": list(scope_paths), "layer": layer, "layer_applied": applied, **extra}
+
+
+def test_no_genuine_results():
     assert CS._no_genuine_results(_env([], {})) is True
-
-
-def test_no_genuine_results_false_when_sources_present():
     assert CS._no_genuine_results(_env(["doc1"], {})) is False
+    assert CS._no_genuine_results(_env([], {"scope_paths": ["4期/"]}, data={})) is False   # 明示エラーは data={}
 
-
-def test_no_genuine_results_false_when_data_is_empty_dict():
-    """未接続/busy/下調べ設定不正/下調べ失敗/層強制不可/Neo4j安全弁はいずれも `data={}`（RV1 #6）。"""
-    assert CS._no_genuine_results(_env([], {"scope_paths": ["4期/"]}, data={})) is False
-
-
-def test_retry_hints_scope_only_when_scope_narrowed_and_layer_both():
-    env = _env([], {"scope_paths": ["4期/設計"], "layer": "both", "layer_applied": True})
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "scope", "label": "範囲を全体に広げる", "action": {"scope_paths": []}}]
-
-
-def test_retry_hints_layer_only_when_layer_narrowed_and_scope_all():
-    env = _env([], {"scope_paths": [], "layer": "docs", "layer_applied": True})
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "layer", "label": "コードも含めて探す（今は資料のみ）",
-                      "action": {"layer": "both"}}]
-
-
-def test_retry_hints_code_only_label():
-    env = _env([], {"scope_paths": [], "layer": "code", "layer_applied": True})
-    hints = CS._retry_hints(env)
-    assert hints[0]["label"] == "資料も含めて探す（今はコードのみ）"
-
-
-def test_retry_hints_order_scope_then_layer():
-    env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": True})
-    hints = CS._retry_hints(env)
-    assert [h["kind"] for h in hints] == ["scope", "layer"]
-
-
-def test_retry_hints_empty_when_already_loosest():
-    """範囲=全体・探す対象=両方（最も緩い）なら、案内するものが無い。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True})
-    assert CS._retry_hints(env) == []
-
-
-def test_retry_hints_layer_not_suggested_when_not_applied():
-    """impact/troubleshoot は layer_applied=False＝層を広げても結果は変わらないため案内に出さない。"""
-    env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": False})
-    hints = CS._retry_hints(env)
-    assert [h["kind"] for h in hints] == ["scope"]
-
-
-# ===== _retry_hints の調べる深さの軸（SC-6c・§3.2・§8 裁定5・DEPTH-2 §2.3）=====
-# 深さは下調べ役あり構成（`evidence_packet.task_id` が "sub:"/"plan:" 接頭）か、Codex(OpenAI 系)
-# 構成（`usage.provider == "codex"` かつ `env["codex_multi_agent"]` が真・S6）でだけ実際に効くため、
-# 深さ hint を検証するテストは task_id か usage.provider/env["codex_multi_agent"] を明示する（§2.3）。
 
 _SUB_TASK_DATA = {"evidence_packet": {"task_id": "sub:profile-1"}}
+_SCOPE_HINT = {"kind": "scope", "label": "範囲を全体に広げる", "action": {"scope_paths": []}}
 
 
-def test_retry_hints_depth_standard_suggests_max():
-    """標準/深くは既に最も緩い（max）ではないため案内に含める。1回で「最大」へ広げる（下調べ役あり）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は標準）",
-                      "action": {"depth_profile": "max"}}]
+def _depth_hint(label, to="max"):
+    return {"kind": "depth", "label": label, "action": {"depth_profile": to}}
 
 
-def test_retry_hints_depth_deep_suggests_max():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "deep"},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は深く）",
-                      "action": {"depth_profile": "max"}}]
+_COVERAGE_LABEL = "網羅性を求める質問です。『標準』以上で調べ直すと抜けが減ります"
 
 
-def test_retry_hints_depth_max_not_suggested():
-    """調べる深さが既に「最大」なら案内に含めない（絞られていない軸は見せない・下調べ役あり）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "max"},
-              data=_SUB_TASK_DATA)
-    assert CS._retry_hints(env) == []
+@pytest.mark.parametrize("scope,data,message,expected", [
+    (_scope(["4期/設計"]), None, "", [_SCOPE_HINT]),
+    (_scope(layer="docs"), None, "", [{"kind": "layer", "label": "コードも含めて探す（今は資料のみ）",
+                                       "action": {"layer": "both"}}]),
+    (_scope(layer="code"), None, "", "資料も含めて探す（今はコードのみ）"),
+    (_scope(["4期/"], layer="docs", applied=False), None, "", [_SCOPE_HINT]),     # layer 非適用の層は案内しない
+    (_scope(), None, "", []),                                                      # 最も緩い
+    # 調べる深さ（下調べ役あり構成）
+    (_scope(depth_profile="standard"), _SUB_TASK_DATA, "", [_depth_hint("調べる深さを上げて探す（今は標準）")]),
+    (_scope(depth_profile="deep"), _SUB_TASK_DATA, "", [_depth_hint("調べる深さを上げて探す（今は深く）")]),
+    (_scope(depth_profile="max"), _SUB_TASK_DATA, "", []),
+    (_scope(depth_profile="quick"), _SUB_TASK_DATA, "区分ごとに起動方式を教えて",
+     [_depth_hint(_COVERAGE_LABEL, "standard")]),                                   # クイック＋網羅要求は専用案内
+    (_scope(depth_profile="quick"), _SUB_TASK_DATA, "これは何ですか",
+     [_depth_hint("調べる深さを上げて探す（今はクイック）")]),
+    (_scope(depth_profile="quick"), _SUB_TASK_DATA, "", [_depth_hint("調べる深さを上げて探す（今はクイック）")]),
+    (_scope(depth_profile="standard"), _SUB_TASK_DATA, "各画面の入力項目を教えて",
+     [_depth_hint("調べる深さを上げて探す（今は標準）")]),                          # 専用文言はクイックだけ
+    (_scope(depth_profile="standard"), {"evidence_packet": {"task_id": "main"}}, "", []),   # 下調べ役なし
+    (_scope(depth_profile="deep"), None, "", []),                                          # evidence_packet 無し
+    # 検索経路トグル
+    (_scope(tools={"grep": False, "fulltext": False, "graph": True}), None, "",
+     [{"kind": "tools", "label": "OFF にした検索を戻す", "action": {"tools": _TOOLS_ALL}}]),
+    (_scope(tools=_TOOLS_ALL), None, "", []),
+    (_scope(), None, "", []),
+], ids=["scope", "layer_docs", "layer_code", "layer_not_applied", "loosest", "depth_standard", "depth_deep",
+        "depth_max", "quick_coverage", "quick_plain", "quick_no_message", "standard_coverage", "no_helper",
+        "no_packet", "tools_off", "tools_all_on", "tools_missing"])
+def test_retry_hints(scope, data, message, expected):
+    env = _env([], scope, data=data)
+    hints = CS._retry_hints(env, message) if message else CS._retry_hints(env)
+    if isinstance(expected, str):
+        assert hints[0]["label"] == expected
+    else:
+        assert hints == expected
 
 
-# ===== クイックを本当に速くする（変更D④）: クイック＋網羅要求の専用案内 =====
-
-def test_retry_hints_depth_quick_with_coverage_requested_suggests_standard():
-    """クイックかつ質問文が網羅要求（`investigation_state.coverage_requested`）を含むときは、
-    通常の「最大」への案内ではなく、網羅性専用の文言で「標準」への案内を出す
-    （網羅要求は1段広げれば足りるため）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "quick"},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env, "区分ごとに起動方式を教えて")
-    assert hints == [{"kind": "depth",
-                      "label": "網羅性を求める質問です。『標準』以上で調べ直すと抜けが減ります",
-                      "action": {"depth_profile": "standard"}}]
+@pytest.mark.parametrize("scope,data,kinds", [
+    (_scope(["4期/"], layer="docs"), None, ["scope", "layer"]),
+    (_scope(["4期/"], layer="docs", depth_profile="deep"), _SUB_TASK_DATA, ["scope", "layer", "depth"]),
+    (_scope(["4期/"], layer="docs", depth_profile="deep", tools={"grep": False, "fulltext": True, "graph": True}),
+     _SUB_TASK_DATA, ["scope", "layer", "depth", "tools"]),
+])
+def test_retry_hints_order(scope, data, kinds):
+    assert [h["kind"] for h in CS._retry_hints(_env([], scope, data=data))] == kinds
 
 
-def test_retry_hints_depth_quick_without_coverage_requested_suggests_max():
-    """クイックでも網羅要求の語彙が無ければ、従来どおり「最大」への通常案内のまま。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "quick"},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env, "これは何ですか")
-    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今はクイック）",
-                      "action": {"depth_profile": "max"}}]
+@pytest.mark.parametrize("usage,multi,expected", [
+    ({"provider": "codex", "is_local": "cloud"}, True, True),      # 既定 OpenAI＋サンドボックス有効
+    ({"provider": "codex", "is_local": "local"}, False, False),    # Ollama
+    ({"provider": "codex", "is_local": "cloud"}, False, False),    # Azure/独自（multi_agent 自動無効）
+])
+def test_depth_hint_follows_codex_multi_agent(usage, multi, expected):
+    assert CS._depth_actually_helps({"usage": usage, "codex_multi_agent": multi}) is expected
+    env = _env([], _scope(depth_profile="standard"))
+    env["usage"], env["codex_multi_agent"] = usage, multi
+    assert CS._retry_hints(env) == ([_depth_hint("調べる深さを上げて探す（今は標準）")] if expected else [])
 
 
-def test_retry_hints_depth_quick_message_omitted_defaults_to_max():
-    """`message` 省略（既定 `""`）は網羅要求を検知しない＝既存呼び出し元は無変更のまま従来どおり。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "quick"},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今はクイック）",
-                      "action": {"depth_profile": "max"}}]
-
-
-def test_retry_hints_coverage_requested_only_special_cased_for_quick():
-    """網羅要求があっても標準/深くは通常どおり「最大」への案内のまま
-    （専用文言はクイックだけの特例）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env, "各画面の入力項目を教えて")
-    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は標準）",
-                      "action": {"depth_profile": "max"}}]
+def test_finalize_attaches_and_omits_retry_hints():
+    out = CS._finalize(_env([], _scope(["4期/"])), {"lens": "qa", "reason": "既定（検索）"})
+    assert out["retry_hints"] == [_SCOPE_HINT]
+    assert "retry_hints" not in CS._finalize(_env(["doc1"], _scope()), {"lens": "qa", "reason": "既定（検索）"})
 
 
 def test_finalize_passes_message_to_retry_hints_for_coverage_guidance():
-    """`_finalize` は受け取った `message` をそのまま `_retry_hints` へ渡す
-    （`handle_message`/`stream_message` の同名引数を渡す契約）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "quick"},
-              data=_SUB_TASK_DATA)
+    env = _env([], _scope(depth_profile="quick"), data=_SUB_TASK_DATA)
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"}, "各画面の項目を教えて")
-    assert out["retry_hints"] == [{"kind": "depth",
-                                   "label": "網羅性を求める質問です。『標準』以上で調べ直すと抜けが減ります",
-                                   "action": {"depth_profile": "standard"}}]
-
-
-def test_retry_hints_order_scope_then_layer_then_depth():
-    """§8 裁定5: 範囲→探す対象→調べる深さの順（下調べ役あり）。"""
-    env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": True,
-                    "depth_profile": "deep"}, data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env)
-    assert [h["kind"] for h in hints] == ["scope", "layer", "depth"]
-
-
-def test_retry_hints_depth_not_suggested_without_search_helper():
-    """下調べ役なし（`provider._sub is None`）構成では深さの設定を変えても evaluator 巡数が
-    発生しないため、深さ hint を出さない（`task_id` が "main"＝通常の OpenAI 単独経路）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"},
-              data={"evidence_packet": {"task_id": "main"}})
-    assert CS._retry_hints(env) == []
-
-
-def test_retry_hints_depth_not_suggested_when_no_evidence_packet():
-    """`evidence_packet` も `usage.provider` も無い経路（Ollama 頭脳の下調べ役なし構成等）は
-    深さ hint を出さない。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "deep"})
-    assert CS._retry_hints(env) == []
-
-
-def test_depth_actually_helps_true_for_codex_openai_backing():
-    """既定 OpenAI 接続＋サンドボックス有効（`codex_multi_agent_enabled` が真）なら深さが実際に効く。"""
-    assert CS._depth_actually_helps(
-        {"usage": {"provider": "codex", "is_local": "cloud"}, "codex_multi_agent": True}) is True
-
-
-def test_depth_actually_helps_false_for_codex_ollama_backing():
-    """`codex_multi_agent` が偽のときは構成（ここでは `is_local == "local"`）に関わらず深さは効かない。"""
-    assert CS._depth_actually_helps(
-        {"usage": {"provider": "codex", "is_local": "local"}, "codex_multi_agent": False}) is False
-
-
-def test_depth_actually_helps_false_for_codex_azure_backing():
-    """Azure/独自エンドポイント（本番側で multi_agent を自動無効化）は `is_local` が既定 OpenAI と
-    同じ `"cloud"` でも `codex_multi_agent` が偽なら深さは効かない。"""
-    assert CS._depth_actually_helps(
-        {"usage": {"provider": "codex", "is_local": "cloud"}, "codex_multi_agent": False}) is False
-
-
-def test_retry_hints_depth_suggested_for_codex_openai_backing():
-    """既定 OpenAI 接続＋サンドボックス有効（`env["codex_multi_agent"]` が真）なら、
-    `evidence_packet` を持たなくても深さ hint を出す。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
-    env["usage"] = {"provider": "codex", "is_local": "cloud"}
-    env["codex_multi_agent"] = True
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "depth", "label": "調べる深さを上げて探す（今は標準）",
-                      "action": {"depth_profile": "max"}}]
-
-
-def test_retry_hints_depth_not_suggested_for_codex_ollama_backing():
-    """`codex_multi_agent` が偽のときは構成（ここでは `is_local == "local"`）に関わらず
-    深さ hint を出さない。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
-    env["usage"] = {"provider": "codex", "is_local": "local"}
-    env["codex_multi_agent"] = False
-    assert CS._retry_hints(env) == []
-
-
-def test_retry_hints_depth_not_suggested_for_codex_azure_backing():
-    """Azure/独自エンドポイント（本番側で multi_agent を自動無効化）は `usage.is_local` が既定
-    OpenAI と同じ `"cloud"` でも `codex_multi_agent` が偽なら深さ hint を出さない。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True, "depth_profile": "standard"})
-    env["usage"] = {"provider": "codex", "is_local": "cloud"}
-    env["codex_multi_agent"] = False
-    assert CS._retry_hints(env) == []
-
-
-# ===== _retry_hints の検索経路トグルの軸（SC-6e・調べ方ブロック §3.6）=====
-
-def test_retry_hints_tools_non_default_suggests_reset():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True,
-                    "tools": {"grep": False, "fulltext": False, "graph": True}})
-    hints = CS._retry_hints(env)
-    assert hints == [{"kind": "tools", "label": "OFF にした検索を戻す",
-                      "action": {"tools": {"grep": True, "fulltext": True, "graph": True}}}]
-
-
-def test_retry_hints_tools_all_on_not_suggested():
-    """全ON（既定）なら案内に含めない。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True,
-                    "tools": {"grep": True, "fulltext": True, "graph": True}})
-    assert CS._retry_hints(env) == []
-
-
-def test_retry_hints_tools_missing_key_not_suggested():
-    """`scope.tools` 自体が無い（SC-6e 導入前の旧回答）＝全ON扱いで案内に含めない。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True})
-    assert CS._retry_hints(env) == []
-
-
-def test_retry_hints_order_scope_then_layer_then_depth_then_tools():
-    """範囲→探す対象→調べる深さ→ツールの順（末尾・下調べ役あり）。"""
-    env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": True,
-                    "depth_profile": "deep", "tools": {"grep": False, "fulltext": True, "graph": True}},
-              data=_SUB_TASK_DATA)
-    hints = CS._retry_hints(env)
-    assert [h["kind"] for h in hints] == ["scope", "layer", "depth", "tools"]
-
-
-def test_finalize_attaches_retry_hints_to_env():
-    env = _env([], {"scope_paths": ["4期/"], "layer": "both", "layer_applied": True})
-    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert out["retry_hints"] == [{"kind": "scope", "label": "範囲を全体に広げる",
-                                   "action": {"scope_paths": []}}]
-
-
-def test_finalize_omits_retry_hints_key_when_no_hints():
-    env = _env(["doc1"], {"scope_paths": [], "layer": "both", "layer_applied": True})
-    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert "retry_hints" not in out
+    assert out["retry_hints"] == [_depth_hint(_COVERAGE_LABEL, "standard")]
 
 
 def test_finalize_no_retry_hints_for_explicit_error_envelope():
-    """明示エラー（`data={}`）は範囲が絞られていても案内を出さない（RV1 #6・退行テスト）。"""
-    env = _env([], {"scope_paths": ["4期/"], "layer": "docs", "layer_applied": True}, data={})
+    env = _env([], _scope(["4期/"], layer="docs"), data={})
     env["headline"] = "下調べAIでの調査がうまくいきませんでした。設定を確認するか、下調べ機能をOFFにしてください。"
     out = CS._finalize(env, {"lens": "qa", "reason": "下調べ設定の不正"})
-    assert "retry_hints" not in out
-    assert out["headline"] != CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE   # 確定文言への置換も対象外
+    assert "retry_hints" not in out and out["headline"] != CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
 
 
 def test_finalize_replaces_headline_when_loosest_and_no_hints_qa():
-    """全軸が最も緩い設定でなお0件（qa/author）は §5 確定文言へ置換する（RV1 #9）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True})
+    env = _env([], _scope())
     env["headline"] = "該当する記述は見つかりませんでした（確証なし）。検索語を変えて試してください。"
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert "retry_hints" not in out
-    assert out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+    assert "retry_hints" not in out and out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
 
 
-def test_finalize_keeps_budget_headline_for_main_task_id():
-    """STOP-1: `providers/base.py::_agentic_run`（`self._sub is None`）が既に据えた固定 headline
-    （予算到達・出典0件）は、`_NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE` で上書きしない
-    （`task_id == "main"` かつ予算系 stop_reason の場合だけの例外）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True},
-              data={"evidence_packet": {"task_id": "main", "stop_reason": "turns_exhausted"}})
+@pytest.mark.parametrize("task_id,replaced", [("main", False), ("sub:worker", True)])
+def test_finalize_budget_headline_kept_only_for_main_task_id(task_id, replaced):
+    """予算到達の固定 headline は task_id=="main" のときだけ守る（ハイブリッド sub: は従来どおり置換）。"""
+    env = _env([], _scope(), data={"evidence_packet": {"task_id": task_id, "stop_reason": "turns_exhausted"}})
     env["headline"] = "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
     assert "retry_hints" not in out
-    assert out["headline"] == "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"
-
-
-def test_finalize_replaces_headline_for_hybrid_sub_task_id_even_with_budget_stop_reason():
-    """STOP-1: ハイブリッド（`task_id == "sub:{profile_id}"`）は provider 側の budget_exhausted
-    ガード自体が `self._sub is None` に限定され固定 headline を据えていないため、`_finalize` の
-    例外対象にも含めない——0件時は従来どおり `_NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE` へ置換する
-    （`_is_budget_exhausted` を `stop_reason` だけで判定すると、この従来挙動が変わってしまう回帰）。
-    """
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True},
-              data={"evidence_packet": {"task_id": "sub:worker", "stop_reason": "turns_exhausted"}})
-    env["headline"] = "サブエージェントの合成本文（このテストでは中身を問わない）"
-    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert "retry_hints" not in out
-    assert out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
+    assert (out["headline"] == CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE) is replaced
 
 
 def test_finalize_keeps_partial_headline_when_codex_stopped_early_even_with_zero_sources():
-    """TIMEOUT-1: Codex が自動継続を尽くしてもなお結論に届かなかった途中結果
-    （`codex_stopped_early`）は、出典0件・全軸最も緩い設定でも「見つからなかった」確定文言
-    （`_NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE`）へ置換しない（STOP-1 と同型の保護）。resume 案内も
-    0件案内の hints とは独立に必ず付く（`test_codex_auto_continue.py` が provider 側で立てる
-    `codex_stopped_early` の実測込みで resume hint 付与を確認する・こちらは `_finalize` 単体の
-    契約として最小限を固定する）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={"citations": []})
+    env = _env([], _scope(), data={"citations": []})
     env["headline"] = "続いて関連ファイルを確認します。"
     env["codex_stopped_early"] = True
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
     assert out["headline"] == "続いて関連ファイルを確認します。"
-    assert out["headline"] != CS._NO_RESULTS_EVEN_AT_LOOSEST_HEADLINE
     assert any(h["kind"] == "resume" for h in out["retry_hints"])
 
 
 def test_finalize_does_not_replace_headline_for_impact_even_when_loosest():
-    """impact/troubleshoot には層の概念が無く既存 headline が十分具体的なため対象外（RV1 #9）。"""
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": False})
+    env = _env([], _scope(applied=False))
     env["headline"] = "「税率」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
     out = CS._finalize(env, {"lens": "impact", "reason": "変更・影響の語"})
     assert "retry_hints" not in out
     assert out["headline"] == "「税率」の影響先は見つかりませんでした（表記ゆれ、または影響なし）。"
 
 
-# ===== STAT-3 T3: `_finalize` が `env["stop_kind"]` を立てる（`sherpa.stop_kind.resolve` の薄い配線
-# 確認・各値の導出ロジック自体は tests/unit/test_stop_kind.py が固定する）=====
+# `_finalize` が `env["stop_kind"]` を立てる配線（各値の導出は test_stop_kind.py が固定する）
+_BUDGET_PACKET = {"evidence_packet": {"task_id": "main", "stop_reason": "turns_exhausted"}}
 
-def test_finalize_sets_stop_kind_completed_by_default():
-    env = _env(["doc1"], {"scope_paths": [], "layer": "both", "layer_applied": True})
+
+@pytest.mark.parametrize("sources,data,extra,expected", [
+    (["doc1"], None, {}, "completed"),
+    ([], _BUDGET_PACKET, {"headline": "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"}, "budget"),
+    ([], {"evidence_packet": {"task_id": "main", "stop_reason": "evaluation_blocked"}}, {}, "no_evidence"),
+    ([], {"citations": []}, {"headline": "続いて関連ファイルを確認します。", "codex_stopped_early": True},
+     "codex_partial"),
+    ([], {}, {"headline": "Codex に接続できませんでした。", "codex_silent_failure": True}, "codex_silent"),
+    ([], {}, {"headline": "同じ会話で別の依頼を実行中です。", "busy": True}, None),
+    ([], {}, {"headline": "下調べAIでの調査がうまくいきませんでした。", "agentic_failure": "error"}, None),
+])
+def test_finalize_sets_stop_kind(sources, data, extra, expected):
+    env = {**_env(sources, _scope(), data=data), **extra}
     out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert out["stop_kind"] == "completed"
+    assert out.get("stop_kind") == expected
+    if expected is None:
+        assert "stop_kind" not in out
 
 
-def test_finalize_sets_stop_kind_budget_for_budget_exhausted_stop_reason():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True},
-              data={"evidence_packet": {"task_id": "main", "stop_reason": "turns_exhausted"}})
-    env["headline"] = "調査が上限に達したため、ここまでに確認できた内容のみをお伝えします。"
-    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert out["stop_kind"] == "budget"
-
-
-def test_finalize_sets_stop_kind_no_evidence_for_evaluation_blocked():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True},
-              data={"evidence_packet": {"task_id": "main", "stop_reason": "evaluation_blocked"}})
-    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert out["stop_kind"] == "no_evidence"
-
-
-def test_finalize_sets_stop_kind_codex_partial_for_codex_stopped_early():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={"citations": []})
-    env["headline"] = "続いて関連ファイルを確認します。"
-    env["codex_stopped_early"] = True
-    out = CS._finalize(env, {"lens": "qa", "reason": "既定（検索）"})
-    assert out["stop_kind"] == "codex_partial"
-
-
-def test_finalize_sets_stop_kind_codex_silent_for_codex_silent_failure():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={})
-    env["headline"] = "Codex に接続できませんでした（Codex CLI が応答を返す前に終了しました）。"
-    env["codex_silent_failure"] = True
-    out = CS._finalize(env, {"lens": "qa", "reason": "Codex 未接続"})
-    assert out["stop_kind"] == "codex_silent"
-
-
-# ===== handle_message/stream_message の lens 配線（SC-6b・end-to-end but DB 不要）=====
+# ---- stream_message の lens 配線（DB 不要） ----
 
 class _FakeCtxCaptureProvider:
-    """`get_provider(settings)` の代わり。実プロバイダの `_gather`（agentic 反復検索）は経由せず、
-    渡された `ctx`（route/scope_meta の配線を検証する対象）を捕捉したうえで固定 `_result` を返す。
-    """
-
     def __init__(self, captured):
         self._captured = captured
 
@@ -2588,205 +1322,51 @@ class _FakeCtxCaptureProvider:
         return iter([_fixed_result("mock 回答")])
 
 
-def test_handle_message_explicit_lens_wires_into_ctx_route(monkeypatch):
+@pytest.mark.parametrize("message,lens,source,route_lens,saved_content", [
+    ("消費税率を変えたい", "impact", "explicit", "impact", "消費税率を変えたい"),
+    ("/影響 消費税率を変えたい", "qa", "slash", "impact", "消費税率を変えたい"),     # スラッシュが勝つ
+    ("消費税率を変えたい", None, "auto", None, None),
+    ("夜間バッチが心配", "troubleshoot", "explicit", "troubleshoot", None),
+])
+def test_turn_lens_wires_into_ctx_route(monkeypatch, message, lens, source, route_lens, saved_content):
     saved = _mock_store_no_db(monkeypatch)
     captured: dict = {}
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeCtxCaptureProvider(captured))
     monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
-    CS.handle_message(None, "消費税率を変えたい", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=True, lens="impact")
+    _turn(message, knowledge=True, lens=lens)
     ctx = captured["ctx"]
-    assert ctx.scope_meta["lens_source"] == "explicit"
-    d = ctx.route("消費税率を変えたい")
-    assert d["lens"] == "impact" and d["reason"] == "明示指定"
-    user_row = next(r for r in saved if r["role"] == "user")
-    assert user_row["content"] == "消費税率を変えたい"   # 通常の明示（スラッシュではない）は本文を変えない
+    assert ctx.scope_meta["lens_source"] == source
+    if route_lens:
+        d = ctx.route(message.removeprefix("/影響 "))
+        assert d["lens"] == route_lens
+        if source == "explicit":
+            assert d["reason"] == "明示指定"
+    if saved_content:
+        assert _rows(saved, "user")[0]["content"] == saved_content   # 接頭辞は保存された質問からも除かれる
 
 
-def test_handle_message_slash_prefix_strips_message_and_wins_over_chatreq_lens(monkeypatch):
-    saved = _mock_store_no_db(monkeypatch)
-    captured: dict = {}
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeCtxCaptureProvider(captured))
-    monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
-    CS.handle_message(None, "/影響 消費税率を変えたい", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=True, lens="qa")   # ブロックは qa でもスラッシュが勝つ
-    ctx = captured["ctx"]
-    assert ctx.scope_meta["lens_source"] == "slash"
-    d = ctx.route("消費税率を変えたい")
-    assert d["lens"] == "impact"
-    user_row = next(r for r in saved if r["role"] == "user")
-    assert user_row["content"] == "消費税率を変えたい"   # 保存された質問からも接頭辞が除かれる
-
-
-def test_handle_message_lens_omitted_defaults_to_auto(monkeypatch):
-    saved = _mock_store_no_db(monkeypatch)
-    captured: dict = {}
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeCtxCaptureProvider(captured))
-    monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
-    CS.handle_message(None, "消費税率を変えたい", world="v1", conversation_id=999,
-                      user_id="admin", knowledge=True)
-    assert captured["ctx"].scope_meta["lens_source"] == "auto"
-
-
-def test_stream_message_explicit_lens_wires_into_ctx_route(monkeypatch):
-    _mock_store_no_db(monkeypatch)
-    captured: dict = {}
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeCtxCaptureProvider(captured))
-    monkeypatch.setattr(CS, "_known_terms", lambda session, world: [])
-    list(CS.stream_message(None, "夜間バッチが心配", world="v1", conversation_id=999,
-                           user_id="admin", knowledge=True, lens="troubleshoot"))
-    ctx = captured["ctx"]
-    assert ctx.scope_meta["lens_source"] == "explicit"
-    assert ctx.route("夜間バッチが心配")["lens"] == "troubleshoot"
-
-
-# ===== 打切り申告がチャットの headline へ出る（検収是正） =====
+# ---- 打切り申告・秘匿名・清書プロンプトの事実 ----
 
 def test_qa_headline_carries_truncation_note_on_zero_hits():
-    """ヒット0件の headline は「見つかりませんでした」と断定するため、**探せていないだけ**の
-    ときにそれを言うのは誤り。チャットが主入口なので、ここに出ないと利用者は気づけない。"""
-    result = {"citations": [], "notes": ["「大規模一覧.xlsx」は大きすぎて全体を検索できていません（先頭部分のみ）。"]}
-    env = CS._answer_qa(result, "w")
-    assert "見つかりませんでした" in env["headline"]
-    assert "大きすぎて全体を検索できていません" in env["headline"]
-
-
-def test_qa_headline_unchanged_without_notes():
-    """打切りが無ければ headline は完全に不変（加算的変更）。"""
-    base = CS._answer_qa({"citations": []}, "w")["headline"]
-    assert base == CS._answer_qa({"citations": [], "notes": []}, "w")["headline"]
-    assert "⚠" not in base
-
-
-def test_troubleshoot_and_impact_headlines_carry_truncation_note():
     note = "「大規模一覧.xlsx」は大きすぎて全体を検索できていません（先頭部分のみ）。"
-    ts = CS._answer_troubleshoot({"candidates": [], "notes": [note]}, "w")
-    assert note in ts["headline"]
-    im = CS._answer_impact({"items": [], "start": "契約", "notes": [note]}, "w")
-    assert note in im["headline"]
+    env = CS._answer_qa({"citations": [], "notes": [note]}, "w")
+    assert "見つかりませんでした" in env["headline"] and "大きすぎて全体を検索できていません" in env["headline"]
+    base = CS._answer_qa({"citations": []}, "w")["headline"]       # 打切りが無ければ headline は不変
+    assert base == CS._answer_qa({"citations": [], "notes": []}, "w")["headline"] and "⚠" not in base
+    assert note in CS._answer_troubleshoot({"candidates": [], "notes": [note]}, "w")["headline"]
+    assert note in CS._answer_impact({"items": [], "start": "契約", "notes": [note]}, "w")["headline"]
 
-
-# ===== 秘匿名（更新前に索引化された credentials.xlsx 等）は facts へ出さない（台帳 #85〜#88） =====
 
 def test_es_hits_excludes_sensitive_doc_ids(monkeypatch):
     from sherpa import documents as documents_mod
     from sherpa import es_index as es_index_mod
-
-    monkeypatch.setattr(documents_mod, "world_rel_set",
-                        lambda world: {"a/credentials.xlsx", "a/report.xlsx"})
-    monkeypatch.setattr(es_index_mod, "search", lambda world, query, scope_paths=None, k=8,
-                        vector=False, layer=None: (
-                            [{"doc_id": "a/credentials.xlsx", "text": "secret"},
-                             {"doc_id": "a/report.xlsx", "text": "ok"}], None))
-    out = CS._es_hits("w", "q", None)
-    doc_ids = [h["doc_id"] for h in out]
-    assert "a/credentials.xlsx" not in doc_ids
-    assert doc_ids == ["a/report.xlsx"]
+    monkeypatch.setattr(documents_mod, "world_rel_set", lambda world: {"a/credentials.xlsx", "a/report.xlsx"})
+    monkeypatch.setattr(es_index_mod, "search", lambda world, query, scope_paths=None, k=8, vector=False, layer=None: (
+        [{"doc_id": "a/credentials.xlsx", "text": "secret"}, {"doc_id": "a/report.xlsx", "text": "ok"}], None))
+    assert [h["doc_id"] for h in CS._es_hits("w", "q", None)] == ["a/report.xlsx"]
 
 
-def test_facts_troubleshoot_carries_limits_and_candidate_overflow_note():
-    from sherpa.providers.prompts import _facts
-    cs = [{"name": f"P{i}", "role": "prog", "evidence": {}} for i in range(12)]
-    env = {"data": {"candidates": cs},
-           "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: x.md「本文」"}
-    out = _facts("troubleshoot", env)
-    assert "残り 4 件は未提示" in out and "調査の限界: 調査を上限到達で中断" in out and "ev-1" not in out
-
-
-def test_facts_troubleshoot_carries_claims_digest():
-    """RV C3: troubleshoot は `_facts` の早期 return（レンズ別分岐）のため主張構造
-    （`_claims_digest`）が清書プロンプトに入らなかった——レンズに関わらず必ず付加する。"""
-    from sherpa.providers.prompts import _facts
-    env = {"data": {"candidates": []},
-           "_synthesis_digest": "調査の限界: なし",
-           "_claims_digest": "[c1] 確定: 障害の原因はXです。（根拠: ev-1）"}
-    out = _facts("troubleshoot", env)
-    assert "【主張の構造（確定/推定/不明）】" in out and "[c1] 確定: 障害の原因はXです。" in out
-
-
-def test_facts_impact_carries_claims_digest():
-    """troubleshoot と同じ理由で impact も早期 return する分岐——同様に主張構造を落とさない。"""
-    from sherpa.providers.prompts import _facts
-    env = {"data": {"items": [{"name": "X", "category": "program"}]}, "summary": {"total": 1},
-           "_claims_digest": "[c1] 不明: 影響範囲は資料からは確認できません。（理由コード: unexplored）"}
-    out = _facts("impact", env)
-    assert "【主張の構造（確定/推定/不明）】" in out and "unexplored" in out
-
-
-def test_facts_impact_zero_items_uses_synthesis_digest_not_zero_count():
-    """C1 是正: items/presumed が無くても `_synthesis_digest`（グラフ確認済みの構造的根拠を含む
-    全件ダイジェスト）があれば、それをそのまま清書入力として使う——「計0件」に丸めて digest
-    （グラフ確認済みの影響先）を捨てない。"""
-    from sherpa.providers.prompts import _facts
-    env = {"data": {"citations": [], "items": []},
-           "_synthesis_digest": "調査の限界: 調査を上限到達で中断（未確認の範囲あり）\nev-1: [graph] X"}
-    out = _facts("impact", env)
-    assert "計0件" not in out
-    assert "調査の限界: 調査を上限到達で中断" in out and "[graph] X" in out
-
-
-def test_answer_prompt_list_docs_completion_uses_set_match_not_sum():
-    """C3 是正: list_docs の全件確認の完了条件を「列挙件数の単純合計」ではなく「同条件で取得した
-    パスの重複除去した集合の件数と総数の照合」に変える（提案書
-    docs/archive/2026-09-11-全件調査の完了条件と中断時の回答.md の C4「件数一致だけで、欠落と
-    重複が相殺された状態を合格にしない」が正典）。重複ページの列挙件数が単純合計されると、
-    実際には一部ページが欠落していても合計値だけは総数と一致し得る——集合照合ならその欠落を
-    見逃さない。"""
-    from sherpa.providers.prompts import _answer_prompt
-    text = _answer_prompt("一覧を確認して", "qa", {"data": {}})
-    assert "列挙の合計" not in text and "列挙件数の単純合計" in text   # 単純合計はしない、とだけ言い切る
-    assert "重複除去した集合の件数と総数を照合" in text
-
-
-def test_finalize_leaves_stop_kind_unset_for_busy_envelope():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={})
-    env["headline"] = "同じ会話で別の依頼を実行中です。"
-    env["busy"] = True
-    out = CS._finalize(env, {"lens": "qa", "reason": "Codex 実行中"})
-    assert "stop_kind" not in out
-
-
-def test_finalize_leaves_stop_kind_unset_for_agentic_failure_envelope():
-    env = _env([], {"scope_paths": [], "layer": "both", "layer_applied": True}, data={})
-    env["headline"] = "下調べAIでの調査がうまくいきませんでした。"
-    env["agentic_failure"] = "error"
-    out = CS._finalize(env, {"lens": "qa", "reason": "下調べAIの失敗"})
-    assert "stop_kind" not in out
-
-
-def test_handle_message_clarify_inherits_conversation_personal_taint(monkeypatch):
-    """会話に個人行がある状態で personal=False のターンが確認カードになったとき、確認カードと
-    質問行は個人扱いで保存される（非個人行として伏字共有から漏れない）。"""
-    saved = _mock_store_no_db(monkeypatch)
-    monkeypatch.setattr(store, "conversation_is_personal_tainted", lambda conversation_id: True)
-    marked: list = []
-    monkeypatch.setattr(store, "set_message_personal", lambda mid: marked.append(mid))
-    monkeypatch.setattr(store, "set_contains_personal_workspace", lambda cid: None)
-    events = [_fixed_question()]
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider(events))
-
-    out = CS.handle_message(None, "確認が要る質問", world="v1", conversation_id=999,
-                            user_id="admin", knowledge=False, personal=False)
-    assert out["message"]["lens"] == "clarify"
-    assert out["message"].get("personal") is True
-    assert marked, "質問行が個人扱いに更新されていない"
-
-
-def test_handle_message_personal_check_failure_falls_closed(monkeypatch):
-    """個人行の有無が読めない（DB 例外）ときは非個人へ倒さず個人扱いで保存する。"""
-    saved = _mock_store_no_db(monkeypatch)
-
-    def _boom(conversation_id):
-        raise RuntimeError("db down")
-    monkeypatch.setattr(store, "conversation_is_personal_tainted", _boom)
-    monkeypatch.setattr(store, "set_message_personal", lambda mid: None)
-    monkeypatch.setattr(store, "set_contains_personal_workspace", lambda cid: None)
-    monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _FakeExecEventProvider([_fixed_result("回答")]))
-    CS.handle_message(None, "質問", world="v1", conversation_id=999, user_id="admin", knowledge=False, personal=False)
-    assert saved[-1]["role"] == "assistant" and saved[-1].get("personal") is True
-
-
-# ===== S4（縮退の可視化と計数）: 事前検索（グラフ）が不調でも調査を止めない =====
+# ---- S4（縮退の可視化と計数）: 事前検索（グラフ）が不調でも調査を止めない ----
 # モックは外部境界（Neo4j セッション）だけ——`run_impact`/`run_troubleshoot` は差し替えない。
 
 _DEGRADE_SCOPE_META = {"world": "v1", "scope_paths": [], "source": "all"}
@@ -2794,8 +1374,6 @@ _DEGRADE_TOOLS = {"grep": True, "fulltext": False, "graph": True}
 
 
 class _BoomSession:
-    """全クエリで指定の例外を送出する fake Neo4j セッション（外部境界の注入）。"""
-
     def __init__(self, exc):
         self.exc = exc
 
@@ -2803,53 +1381,50 @@ class _BoomSession:
         raise self.exc
 
 
-def test_dispatch_impact_degrades_to_grep_when_graph_connection_fails():
-    """接続断（`ServiceUnavailable`）で事前検索が落ちても例外を伝播させず、grep 相当の下地と
-    縮退コードを返す（Codex 本体・清書がソースを直接調べる下地になる）。"""
+def test_dispatch_degrades_to_grep_on_recoverable_graph_failures():
     from neo4j.exceptions import ServiceUnavailable
+    from sherpa.ingest.world_neo4j import GraphSchemaEraError
     env = CS._dispatch(_BoomSession(ServiceUnavailable("down")), "impact", "消費税率を変えたい", "v1",
                        scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert env["graph_degraded"] == "graph_unavailable"
-    assert env["data"]["type"] == "qa"   # 例外で終わらず qa 相当の下地（grep／全文）へ委譲している
-
-
-def test_dispatch_troubleshoot_degrades_on_graph_schema_era():
-    """世代不一致も同じく縮退する（接続断とは別のコード）。"""
-    from sherpa.ingest.world_neo4j import GraphSchemaEraError
+    assert env["graph_degraded"] == "graph_unavailable" and env["data"]["type"] == "qa"
     env = CS._dispatch(_BoomSession(GraphSchemaEraError("v1", "old-era", lens="troubleshoot")),
                        "troubleshoot", "請求の不具合", "v1",
                        scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
     assert env["graph_degraded"] == "graph_reingest_required"
 
 
+@pytest.mark.parametrize("exc_name,lens,message", [
+    ("ClientError", "impact", "消費税率を変えたい"),             # Cypher のバグ等は握り潰さない
+    ("ConfigurationError", "troubleshoot", "請求の不具合"),     # 非一時的な設定不備＝回復不可
+])
+def test_dispatch_does_not_degrade_on_non_recoverable_graph_error(exc_name, lens, message):
+    import neo4j.exceptions as ne
+    exc = getattr(ne, exc_name)("bad")
+    with pytest.raises(getattr(ne, exc_name)):
+        CS._dispatch(_BoomSession(exc), lens, message, "v1", scope_meta=_DEGRADE_SCOPE_META,
+                     tools_availability=_DEGRADE_TOOLS)
+
+
 def test_finalize_turns_graph_degraded_into_notice_and_limit():
-    """縮退コードは利用者向けの冒頭告知（平文）と統計フラグになり、公開 answer には残らない。"""
     env = {"headline": "該当箇所が 3件見つかりました。", "summary": {"total": 3},
-           "data": {"citations": [{"doc_id": "a.md"}]}, "sources": [],
-           "graph_degraded": "graph_reingest_required"}
+           "data": {"citations": [{"doc_id": "a.md"}]}, "sources": [], "graph_degraded": "graph_reingest_required"}
     out = CS._finalize(env, {"lens": "troubleshoot", "reason": "テスト"})
-    assert "graph_degraded" not in out                       # 閉じたコードは公開しない
+    assert "graph_degraded" not in out                        # 閉じたコードは公開しない
     assert out["headline"].startswith("関係のつながりの情報が古いため")
     assert out["headline"].endswith("該当箇所が 3件見つかりました。")
     assert out["limits"]["graph_reingest_required"] is True
 
-
-def test_finalize_graph_degraded_notice_differs_by_state():
-    """3状態のうち接続断は「再取り込み待ち」と別の文言・別の統計項目になる。"""
     env = {"headline": "本文", "summary": {"total": 0}, "data": {"citations": []}, "sources": [],
            "graph_degraded": "graph_unavailable"}
     out = CS._finalize(env, {"lens": "impact", "reason": "テスト"})
-    assert "接続できなかった" in out["headline"]
-    assert out["limits"] == {"backend_unavailable_graph": True}
+    assert "接続できなかった" in out["headline"] and out["limits"] == {"backend_unavailable_graph": True}
 
 
 def test_finalize_graph_degraded_notice_survives_no_results_headline():
-    """S4: 0 件案内は headline を**全置換**する——縮退の告知をその前に付けると消えるため、
-    案内の後に前置する（グラフを使わずに調べた事実は 0 件でも利用者に伝える）。"""
+    """0 件案内は headline を全置換する——縮退の告知は案内の前に付く（0 件でも伝える）。"""
     env = {"headline": "該当する記述は見つかりませんでした。", "summary": {"total": 0},
            "data": {"citations": []}, "sources": [],
-           "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both",
-                     "depth_profile": "max"},   # 全軸が最も緩い＝再検索案内（retry_hints）は出ない
+           "scope": {"world": "w1", "scope_paths": [], "source": "all", "layer": "both", "depth_profile": "max"},
            "graph_degraded": "graph_unavailable"}
     out = CS._finalize(env, {"lens": "qa", "reason": "テスト"})
     assert out["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
@@ -2857,65 +1432,40 @@ def test_finalize_graph_degraded_notice_survives_no_results_headline():
     assert out["limits"]["backend_unavailable_graph"] is True
 
 
-def test_dispatch_does_not_degrade_on_non_recoverable_graph_error():
-    """S4: 縮退してよいのは回復可能な障害だけ——`ClientError`（Cypher のバグ等）は握り潰さず
-    そのまま送出し、従来の honest failure（`_degrade_overload` 等）へ委ねる。"""
-    from neo4j.exceptions import ClientError
-    with pytest.raises(ClientError):
-        CS._dispatch(_BoomSession(ClientError("bad cypher")), "impact", "消費税率を変えたい", "v1",
-                     scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-
-
-def test_dispatch_does_not_degrade_on_neo4j_configuration_error():
-    """`ConfigurationError` はクラス階層上は `DriverError` の派生だが、意味は非一時的な設定不備＝
-    回復不可（`lens_service.neighbor_cards` と同じ分類）——縮退しない。"""
-    from neo4j.exceptions import ConfigurationError
-    with pytest.raises(ConfigurationError):
-        CS._dispatch(_BoomSession(ConfigurationError("bad config")), "troubleshoot", "請求の不具合", "v1",
-                     scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-
-
 def test_dispatch_entry_degrade_counts_graph_unavailable_only_when_unreachable():
-    """S4: 入口でグラフが**実接続で不達**なら統計に残るコード（`graph_unavailable`）で縮退する。
-    利用者が自分で OFF にしただけなら障害ではない＝計数しないコード（`blocked`）。"""
+    """入口の縮退は実接続の不達だけを統計に残す。利用者が自分で OFF にしただけなら計数しない。"""
     sm_off = _sm(tools={"grep": True, "fulltext": True, "graph": False})
     env_off = CS._dispatch(None, "impact", "消費税率", "w1", sm_off,
                            tools_availability={"grep": True, "fulltext": True, "graph": True})
-    assert env_off["graph_degraded"] == "blocked"
-    assert CS._GRAPH_DEGRADED_LIMIT_FIELD.get("blocked") is None   # 計数しない
+    assert env_off["graph_degraded"] == "blocked" and CS._GRAPH_DEGRADED_LIMIT_FIELD.get("blocked") is None
+    env_both = CS._dispatch(None, "impact", "消費税率", "w1", sm_off,
+                            tools_availability={"grep": True, "fulltext": True, "graph": False})
+    assert env_both["graph_degraded"] == "blocked"
+    assert "backend_unavailable_graph" not in (CS._finalize(env_both, {"lens": "impact", "reason": "テスト"}).get("limits") or {})
 
-    env_unreachable = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
-                                   tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env_unreachable["graph_degraded"] == "graph_unavailable"
-    out = CS._finalize(env_unreachable, {"lens": "impact", "reason": "テスト"})
-    assert out["limits"]["backend_unavailable_graph"] is True
+    env = CS._dispatch(None, "impact", "消費税率", "w1", _sm(),
+                       tools_availability={"grep": True, "fulltext": True, "graph": False})
+    assert env["graph_degraded"] == "graph_unavailable"
+    assert CS._finalize(env, {"lens": "impact", "reason": "テスト"})["limits"]["backend_unavailable_graph"] is True
 
 
 def test_dispatch_graph_failure_without_any_search_tool_stays_blocked():
-    """S4: 事前検索がグラフ不調で落ちても、grep も全文も使えないなら**一度も検索していない**——
-    0 件の検索結果（「見つかりませんでした」）として完了扱いにせず、入口ゲートと同じ明示エラーで
-    終える（`graph_degraded` も付けない＝縮退ではなく実行不能）。"""
     from neo4j.exceptions import ServiceUnavailable
     env = CS._dispatch(_BoomSession(ServiceUnavailable("down")), "impact", "消費税率を変えたい", "v1",
                        scope_meta=_DEGRADE_SCOPE_META,
                        tools_availability={"grep": False, "fulltext": False, "graph": True})
-    assert env["data"] == {}                 # 0 件の qa 結果ではない（honest failure の形）
-    assert "graph_degraded" not in env
-    assert env["agentic_failure"] == "error"
+    assert env["data"] == {} and "graph_degraded" not in env and env["agentic_failure"] == "error"
 
 
-# ===== 空グラフ（未構築）を「影響なし」と誤読させない =====
+# ---- 空グラフ（未構築）を「影響なし」と誤読させない ----
 
 def _use_real_graph_empty_check(monkeypatch):
-    """モジュール既定の autouse フィクスチャ（`world_graph_is_empty` を「実データあり」に固定）を
-    外し、実物の判定関数を fake セッション（外部境界）越しに通す。"""
     from sherpa.ingest import world_neo4j
     monkeypatch.setattr(CS, "world_graph_is_empty", world_neo4j.world_graph_is_empty)
 
 
 class _CountSession:
-    """`:Entity{world_id}` の存在確認クエリに `count(n)` を返す fake Neo4j セッション（外部境界の
-    注入）。空グラフ判定（`world_graph_is_empty`）そのものは差し替えず実際に通す。"""
+    """`:Entity{world_id}` の存在確認クエリに `count(n)` を返す fake セッション。"""
 
     def __init__(self, count: int):
         self.count = count
@@ -2932,49 +1482,33 @@ class _CountSession:
         return _R()
 
 
-def test_dispatch_impact_degrades_when_world_graph_is_empty(monkeypatch):
-    """構造的な影響も推定も0件で、かつ world に実データが無い（未構築）なら「影響先は
-    見つかりませんでした」と断定せず、grep 相当の下地＋縮退コード（`graph_empty`）へ切り替える。"""
+def _empty_graph_runners(monkeypatch):
     monkeypatch.setattr(CS, "run_impact", lambda session, payload, world, scope_prefixes=None, depth=None:
                         {"items": [], "presumed": [], "start": payload, "starts": []})
-    _use_real_graph_empty_check(monkeypatch)
-    session = _CountSession(0)
-    env = CS._dispatch(session, "impact", "消費税率を変えたい", "v1",
-                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert any("Entity" in q for q in session.queries)   # 空グラフ判定が実際に境界へ問い合わせている
-    assert env["graph_degraded"] == "graph_empty"
-    assert env["data"]["type"] == "qa"        # qa 相当の下地（例外送出時の縮退と同じ形）
-
-
-def test_dispatch_troubleshoot_degrades_when_world_graph_is_empty(monkeypatch):
     monkeypatch.setattr(CS, "run_troubleshoot", lambda session, symptom, world, scope_paths=None, depth=None:
-                        {"type": "troubleshoot", "world": world, "symptom": symptom,
-                         "anchors": [], "candidates": []})
+                        {"type": "troubleshoot", "world": world, "symptom": symptom, "anchors": [], "candidates": []})
     _use_real_graph_empty_check(monkeypatch)
-    env = CS._dispatch(_CountSession(0), "troubleshoot", "夜間バッチ停止", "v1",
-                       scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert env["graph_degraded"] == "graph_empty"
-    assert env["data"]["type"] == "qa"
+
+
+@pytest.mark.parametrize("lens,message", [("impact", "消費税率を変えたい"), ("troubleshoot", "夜間バッチ停止")])
+def test_dispatch_degrades_when_world_graph_is_empty(monkeypatch, lens, message):
+    _empty_graph_runners(monkeypatch)
+    session = _CountSession(0)
+    env = CS._dispatch(session, lens, message, "v1", scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
+    assert any("Entity" in q for q in session.queries)
+    assert env["graph_degraded"] == "graph_empty" and env["data"]["type"] == "qa"
 
 
 def test_dispatch_impact_stays_no_results_when_graph_has_data(monkeypatch):
-    """グラフに実データがあり、単に0件ヒットのケースは従来どおり「影響先は見つかりませんでした」
-    のまま（`graph_degraded` は付かない）——空グラフ判定は「実データが無い」場合だけに限る。"""
-    monkeypatch.setattr(CS, "run_impact", lambda session, payload, world, scope_prefixes=None, depth=None:
-                        {"items": [], "presumed": [], "start": payload, "starts": []})
-    _use_real_graph_empty_check(monkeypatch)
+    _empty_graph_runners(monkeypatch)
     env = CS._dispatch(_CountSession(1), "impact", "消費税率を変えたい", "v1",
                        scope_meta=_DEGRADE_SCOPE_META, tools_availability=_DEGRADE_TOOLS)
-    assert "graph_degraded" not in env
-    assert "影響先は見つかりませんでした" in env["headline"]
+    assert "graph_degraded" not in env and "影響先は見つかりませんでした" in env["headline"]
 
 
 def test_finalize_graph_empty_notice_has_no_limit_field():
-    """`graph_empty` は障害ではない——通知文言は冒頭に付くが、`answer.limits` の bool フラグは
-    立てない（利用者が自分で取り込み前の world を触っただけで統計の縮退計数を汚さない）。"""
     env = {"headline": "該当箇所が 3件見つかりました。", "summary": {"total": 3},
-           "data": {"citations": [{"doc_id": "a.md"}]}, "sources": [],
-           "graph_degraded": "graph_empty"}
+           "data": {"citations": [{"doc_id": "a.md"}]}, "sources": [], "graph_degraded": "graph_empty"}
     out = CS._finalize(env, {"lens": "troubleshoot", "reason": "テスト"})
     assert "graph_degraded" not in out
     assert out["headline"].startswith("関係のつながりの情報がまだ作られていない")
@@ -2982,125 +1516,37 @@ def test_finalize_graph_empty_notice_has_no_limit_field():
     assert "limits" not in out or not out["limits"]
 
 
-# ===== S4（RV6）: グラフ接続断でターン全体が 500 にならず縮退へ進む =====
+# ---- グラフ接続断でターン全体が 500 にならず縮退へ進む ----
 
 class _DispatchingProvider:
-    """`providers/base.py::_gather` と同じく `ctx.dispatch` の結果を `_result` にする最小の頭脳。"""
-
     def run(self, ctx):
         env = ctx.dispatch("impact", ctx.message)
         env.setdefault("headline", "回答")
-        yield {"type": "_result", "env": env,
-               "decision": {"lens": "impact", "input": ctx.message, "reason": "テスト"}}
+        yield {"type": "_result", "env": env, "decision": {"lens": "impact", "input": ctx.message, "reason": "テスト"}}
 
 
-def _graph_down_turn(monkeypatch, *, stream: bool):
-    """グラフが接続断の状態で knowledge=True の1ターンを通す（起点語ヒント→事前検索の両方が落ちる）。"""
+def test_turn_degrades_instead_of_crashing_when_graph_connection_is_down(monkeypatch):
     from neo4j.exceptions import ServiceUnavailable
     saved = _mock_store_no_db(monkeypatch)
     monkeypatch.setattr(CS, "get_provider", lambda settings, **kw: _DispatchingProvider())
-    session = _BoomSession(ServiceUnavailable("down"))
-    if stream:
-        list(CS.stream_message(session, "消費税率の影響は？", world="v1", conversation_id=999,
-                               user_id="admin", knowledge=True))
-    else:
-        CS.handle_message(session, "消費税率の影響は？", world="v1", conversation_id=999,
-                          user_id="admin", knowledge=True)
-    return saved[-1]
-
-
-def test_handle_message_degrades_instead_of_crashing_when_graph_connection_is_down(monkeypatch):
-    """`_known_terms`（起点語ヒント）はグラフ接続断でも空で続ける——ここで例外を上げると
-    ターンが 500 で終わり、S4 の縮退（grep/原本直読で答える）へ一度も到達できない。"""
-    row = _graph_down_turn(monkeypatch, stream=False)
+    _turn("消費税率の影響は？", session=_BoomSession(ServiceUnavailable("down")), knowledge=True)
+    row = saved[-1]
     assert row["role"] == "assistant"
     assert row["answer"]["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
     assert row["answer"]["limits"]["backend_unavailable_graph"] is True
 
 
-def test_stream_message_degrades_instead_of_crashing_when_graph_connection_is_down(monkeypatch):
-    """ストリーム経路（背景ターン）も同じ（保存される回答に縮退の告知と計数が残る）。"""
-    row = _graph_down_turn(monkeypatch, stream=True)
-    assert row["role"] == "assistant"
-    assert row["answer"]["headline"].startswith("関係のつながりをたどる検索に接続できなかったため")
-    assert row["answer"]["limits"]["backend_unavailable_graph"] is True
-
-
-def test_dispatch_entry_degrade_does_not_count_graph_when_user_turned_it_off():
-    """S4: 利用者がグラフを OFF にしたターンは、実接続も不達（同じ状態）でも障害として計上しない
-    ——計数するのは「使いたかったのに使えなかった」場合だけ（全文検索側と同じ規則）。"""
-    sm = _sm(tools={"grep": True, "fulltext": True, "graph": False})
-    env = CS._dispatch(None, "impact", "消費税率", "w1", sm,
-                       tools_availability={"grep": True, "fulltext": True, "graph": False})
-    assert env["graph_degraded"] == "blocked"       # 通知はするが計数しないコード
-    out = CS._finalize(env, {"lens": "impact", "reason": "テスト"})
-    assert "backend_unavailable_graph" not in (out.get("limits") or {})
-
-
-def test_facts_troubleshoot_degraded_uses_citations_not_no_candidates():
-    """S4: グラフ縮退の troubleshoot（原因候補が無く citations だけの下地）は、impact と同型で
-    引用ベースの整形へ倒す——「原因候補なし」に潰すと grep で拾った該当箇所が清書へ渡らない。"""
-    from sherpa.providers.prompts import _facts
-    env = {"lens": "troubleshoot", "graph_degraded": "graph_unavailable",
-           "data": {"type": "qa", "citations": [
-               {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [10, 12],
-                "quote": "ABEND-CODE 0C7"}]}}
-    out = _facts("troubleshoot", env)
-    assert "原因候補なし" not in out
-    assert "TAXCALC.cbl" in out and "ABEND-CODE 0C7" in out
-
-
-def test_facts_impact_degraded_does_not_assert_no_impact():
-    """S4: 関係グラフを引けていないターンの0件は「影響が無い」ではなく「確認できていない」——
-    断定文・誘導文をどちらも不明側へ差し替える（縮退でないターンは従来どおり）。"""
-    from sherpa.providers.prompts import _facts
-    env = {"lens": "impact", "graph_degraded": "graph_unavailable",
-           "data": {"items": [], "presumed": [], "start": "消費税率"}, "summary": {"total": 0}}
-    out = _facts("impact", env)
-    assert "計0件（該当なし）" not in out
-    assert "構造的なコードの波及は無い" not in out
-    assert "構造的な影響の有無は不明" in out
-
-    normal = _facts("impact", {"lens": "impact",
-                               "data": {"items": [], "presumed": [], "start": "消費税率"},
-                               "summary": {"total": 0}})
-    assert "計0件（該当なし）" in normal   # 縮退していないターンの文面は変えない
-
-
-def test_facts_impact_degraded_with_citations_still_gets_no_assertion_steer():
-    """S4: 該当箇所（citations）を持つ縮退 impact は引用ベースの整形（qa と同じ）へ倒れる——
-    そのままでは「影響は無いと断定しない」指示が清書へ渡らないため、倒した後も同じ一文を足す。"""
-    from sherpa.providers.prompts import _facts
-    env = {"lens": "impact", "graph_degraded": "graph_unavailable",
-           "data": {"items": [], "presumed": [], "citations": [
-               {"doc_id": "4期/03_開発/01_ソース/TAXCALC.cbl", "span": [1, 2], "quote": "TAX-RATE"}]}}
-    out = _facts("impact", env)
-    assert "TAXCALC.cbl" in out                      # 引用ベースの整形へ倒れている
-    assert "構造的な影響の有無は不明" in out          # それでも断定しない指示は渡る
-
-    normal = _facts("impact", {"lens": "impact",
-                               "data": {"items": [], "presumed": [], "citations": [
-                                   {"doc_id": "a.md", "span": [1, 2], "quote": "x"}]}})
-    assert "構造的な影響の有無は不明" not in normal   # 縮退していないターンには足さない
-
-
-def test_coverage_hint_shown_for_quick_even_when_results_exist(monkeypatch):
-    """網羅性を求める質問をクイックで実行したときは、結果が0件でなくても『標準以上で調べ直す』案内を
-    出す——列挙の抜け（親項目・子項目の欠落）は結果が有るときにこそ起きるため、0件時だけの
-    再検索案内とは出す条件が違う。"""
-    env = {"headline": "処理1〜5について説明します。", "sources": [{"doc_id": "a.md"}],
-           "data": {"type": "qa"}, "usage": {"provider": "codex"}, "codex_multi_agent": True,
+@pytest.mark.parametrize("message,shown", [("処理ごとの抽出条件を教えて", True), ("標準税率は何%ですか", False)])
+def test_coverage_hint_for_quick_even_when_results_exist(message, shown):
+    """網羅性を求める質問をクイックで実行したときは、結果が有っても『標準以上で調べ直す』案内を出す
+    （列挙の抜けは結果が有るときにこそ起きる）。網羅要求のない質問では深さの案内を出さない。"""
+    env = {"headline": "回答", "sources": [{"doc_id": "a.md"}], "data": {"type": "qa"},
+           "usage": {"provider": "codex"}, "codex_multi_agent": True,
            "scope": {"scope_paths": [], "depth_profile": "quick", "layer": "both"}}
-    CS._finalize(env, {"lens": "qa", "reason": "test"}, message="処理ごとの抽出条件を教えて")
+    CS._finalize(env, {"lens": "qa", "reason": "test"}, message=message)
     hints = env.get("retry_hints") or []
-    assert [h for h in hints if h["kind"] == "depth" and "網羅性" in h["label"]]
-    assert hints[0]["action"] == {"depth_profile": "standard"}
-
-
-def test_coverage_hint_not_shown_without_coverage_request(monkeypatch):
-    """網羅要求のない通常の質問では、結果が有るときに深さの案内を出さない（従来どおり）。"""
-    env = {"headline": "標準税率は10%です。", "sources": [{"doc_id": "a.md"}],
-           "data": {"type": "qa"}, "usage": {"provider": "codex"}, "codex_multi_agent": True,
-           "scope": {"scope_paths": [], "depth_profile": "quick", "layer": "both"}}
-    CS._finalize(env, {"lens": "qa", "reason": "test"}, message="標準税率は何%ですか")
-    assert not (env.get("retry_hints") or [])
+    if shown:
+        assert [h for h in hints if h["kind"] == "depth" and "網羅性" in h["label"]]
+        assert hints[0]["action"] == {"depth_profile": "standard"}
+    else:
+        assert not hints

@@ -12,6 +12,8 @@ import zipfile
 from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
+from .rels import load_relationships, resolve_target
+
 _RELS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 # シートに画像が何枚あるかの存在だけを得るための最小限のネームスペース（図形解析は `evidence_spike.py` の `_xlsx_objects` が担う）。
 _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -629,28 +631,13 @@ def external_link_targets(zf: zipfile.ZipFile) -> list[str]:
     return sorted(out)
 
 
-def _resolve_rel_target(part: str, target: str) -> str:
-    """rels の `Target` 属性値を zip 内の絶対パートパスへ解決する（`part` は Target を持つ側のパート自身のパス）。先頭 `/` は zip ルートからの絶対パス、それ以外は `part` のディレクトリからの相対パス（`evidence_spike._relationships` と同じ規則）。"""
-    from posixpath import dirname, join, normpath
-    if target.startswith("/"):
-        return normpath(target.lstrip("/"))
-    return normpath(join(dirname(part), target))
-
-
 def _load_rels(zf: zipfile.ZipFile, part: str) -> dict[str, str]:
     """`part` に対応する `_rels/*.rels` から `{Id: 解決済み絶対パートパス}` を返す（`TargetMode="External"` は除外）。パート・rels の欠落/破損は空 dict。"""
-    from posixpath import basename, dirname, join
-    rels_name = join(dirname(part), "_rels", basename(part) + ".rels")
-    try:
-        root = ET.fromstring(zf.read(rels_name))
-    except (KeyError, ET.ParseError):
-        return {}
-    out: dict[str, str] = {}
-    for rel in root.iter(f"{_RELS}Relationship"):
-        rel_id, target = rel.get("Id"), rel.get("Target")
-        if rel_id and target and rel.get("TargetMode") != "External":
-            out[rel_id] = _resolve_rel_target(part, target)
-    return out
+    return {
+        rel.id: resolve_target(part, rel.target)
+        for rel in load_relationships(zf.read, part)
+        if rel.id and rel.target and rel.mode != "External"
+    }
 
 
 def picture_counts_by_sheet(zf: zipfile.ZipFile) -> dict[str, int]:

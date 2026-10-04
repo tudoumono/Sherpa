@@ -1,7 +1,7 @@
 """Elasticsearch 連携（共有 KB のみ・資料フォルダ単位のインデックス・日本語 BM25＝kuromoji）。
 ベクトル＋BM25 を REST（urllib）で扱う。ES 未起動でも落ちない（best-effort）。個人文書は共有 index に書かない。
 索引対象は `corpus_docs.world_documents` の文書（設計書／テキスト／ソース＋Office 派生 MD）。doc_id＝rel_path、`scopes`（祖先フォルダ prefix 群）で範囲フィルタする。
-Office／PDF は `{rel}.rag.md`（RAG 正本）をアンカー分割した本文を索引ソースにする（`{rel}.rag_chunks.jsonl` は citation／locator を運ぶ証跡。`rag_es_enabled`／`index_world`／`_validate_rag_chunks` 参照）。
+Office／PDF は `{rel}.rag.md`（RAG 正本）をアンカー分割した本文を索引ソースにする（`{rel}.rag_chunks.jsonl` は citation／locator を運ぶ証跡。`index_world`／`_validate_rag_chunks` 参照）。
 設計: docs/design/rag.md「ES 索引の構成」
 """
 from __future__ import annotations
@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sqlite3
 import time
 import urllib.error
@@ -22,23 +21,11 @@ from pathlib import Path
 from . import corpus_docs, doc_text, embeddings, json_io, scope_infer, worlds
 from . import layer as layer_mod
 from . import scope as scope_mod
+from .env_int import env_int
 from .ingest import importance, text_kind
 from .ingest.analyzers import registry as analyzer_registry
 
 _log = logging.getLogger("sherpa")
-
-
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`agentic_search._env_int` と同じ意味。循環 import を避けて独立実装）。範囲外・非整数・負値は既定へ、既定値自体も [lo, hi] にクランプする。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
 
 
 # チャンク粒度（行・read_around と整合）。legacy チャンク経路のみ効く。値を変えると索引の中身が変わるため、`needs_reindex` が `_meta` の `chunk_lines` で drift を検知する
@@ -67,11 +54,6 @@ _embed_log = logging.getLogger("sherpa.embed")  # 埋め込み進捗はここへ
 # 重要度スコアブースト: `高`／`低` の function_score 係数。`中`／未設定は等倍で、重要度制御ファイルの無い資料フォルダはスコア不変
 _ES_IMPORTANCE_BOOST_HIGH = 1.2
 _ES_IMPORTANCE_BOOST_LOW = 0.85
-
-
-def rag_es_enabled() -> bool:
-    """ES 索引ソースが rag チャンク（`{rel}.rag_chunks.jsonl`）を使うか。常時 True。rag_chunks 破損時の per-file legacy 縮退は別契約。"""
-    return True
 
 
 # `search()` のハイブリッドにおける BM25(keyword) 対 kNN(vector) の配分（0.0＝vector 寄り〜1.0＝keyword 寄り・0.5＝boost キーを書かない）
@@ -347,8 +329,6 @@ def list_kb_indices() -> list:
     try:
         rows = _req("GET", "/_cat/indices/sherpa-kb-*?format=json&h=index")
         return [r["index"] for r in (rows or []) if r.get("index")]
-    except urllib.error.HTTPError as e:
-        return [] if e.code == 404 else []  # 該当なし=404 も空
     except Exception:
         return []
 
@@ -1020,10 +1000,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # 削除より前に打ち切る（既存索引を BM25 のみで上書きしない）
         return {"available": True, "indexed": 0, "chunks": 0, "error": "embedding_cloud_unavailable"}
 
-    use_rag = rag_es_enabled()
-    derived = worlds.derived_rag_dir(world) if use_rag else None  # RAG 正本層
-    rag_exts = _rag_chunk_source_exts() if use_rag else frozenset()
-    docs = corpus_docs.world_documents(world, include_rag=True) if use_rag else corpus_docs.world_documents(world)
+    derived = worlds.derived_rag_dir(world)  # RAG 正本層
+    rag_exts = _rag_chunk_source_exts()
+    docs = corpus_docs.world_documents(world, include_rag=True)
     total_docs = len(docs)  # 進捗表示の total（materialize 済みの一覧の長さ）
     # 重要度は資料フォルダ全体を 1 回だけ解決し（`res_map`）、各文書のチャンク組み立てへ使い回す
     wd = worlds.world_dir(world)
@@ -1172,11 +1151,9 @@ def index_world(world: str, settings: dict | None = None, content_sig: str | Non
         # 末尾の leftover が 0 件でも最終呼び出し（`done == total`）を必ず 1 回行う
         progress(docs_done, total_docs)
 
-    rag_report = {}
-    if use_rag:  # OFF はキー自体を返さない
-        rag_report["rag_degraded"] = rag_degraded
-        if rag_degraded_docs:
-            rag_report["rag_degraded_docs"] = rag_degraded_docs
+    rag_report = {"rag_degraded": rag_degraded}
+    if rag_degraded_docs:
+        rag_report["rag_degraded_docs"] = rag_degraded_docs
 
     if sender.failed or not sender.finish():
         # 途中バッチの失敗は資料フォルダを空へ戻す（全部か無しか）

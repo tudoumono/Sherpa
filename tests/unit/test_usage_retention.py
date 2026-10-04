@@ -1,4 +1,4 @@
-"""バッチ3（2026-07-03）: 利用統計「定着指標」の純粋関数 `store._compute_retention` の単体テスト。
+"""バッチ3（2026-07-03）: 利用統計「定着指標」の純粋関数 `_usage_ref._compute_retention` の単体テスト。
 
 `usage_stats()` 本体は共有 dev DB の既存データ（残骸含む）に集計が引きずられ、再訪率の期待値を
 精密に検証しづらいため、週次アクティブユーザー集合→再訪率の計算ロジックはここで DB 無しに固定する
@@ -9,23 +9,23 @@ from __future__ import annotations
 
 from datetime import date
 
-from sherpa import store
+import _usage_reference as _usage_ref
 
 
 def _rows(*pairs):
-    """(uid, week_start) のタプル列 → store._compute_retention に渡す行リストへ変換。"""
+    """(uid, week_start) のタプル列 → _usage_ref._compute_retention に渡す行リストへ変換。"""
     return [{"uid": uid, "week_start": week_start} for uid, week_start in pairs]
 
 
 def test_retention_empty_input_returns_empty_weekly_and_none_revisit_rate():
-    out = store._compute_retention([])
+    out = _usage_ref._compute_retention([])
     assert out == {"weekly": [], "revisit_rate": None}
 
 
 def test_retention_single_week_has_no_revisit_rate():
     """週が1つしか無い（比較できる「前週」が無い）と revisit_rate は None。"""
     rows = _rows(("a", date(2026, 6, 22)), ("b", date(2026, 6, 22)))
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert out["weekly"] == [{"week_start": "2026-06-22", "active_users": 2}]
     assert out["revisit_rate"] is None
 
@@ -36,7 +36,7 @@ def test_retention_two_consecutive_weeks_computes_revisit_rate():
         ("a", date(2026, 6, 22)), ("b", date(2026, 6, 22)),
         ("a", date(2026, 6, 29)), ("c", date(2026, 6, 29)),
     )
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert out["weekly"] == [
         {"week_start": "2026-06-22", "active_users": 2},
         {"week_start": "2026-06-29", "active_users": 2},
@@ -49,7 +49,7 @@ def test_retention_all_users_revisit_gives_rate_one():
         ("a", date(2026, 6, 22)), ("b", date(2026, 6, 22)),
         ("a", date(2026, 6, 29)), ("b", date(2026, 6, 29)),
     )
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert out["revisit_rate"] == 1.0
 
 
@@ -58,7 +58,7 @@ def test_retention_no_overlap_gives_rate_zero():
         ("a", date(2026, 6, 22)), ("b", date(2026, 6, 22)),
         ("c", date(2026, 6, 29)), ("d", date(2026, 6, 29)),
     )
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert out["revisit_rate"] == 0.0
 
 
@@ -70,7 +70,7 @@ def test_retention_gap_week_is_not_treated_as_previous_week():
         ("b", date(2026, 6, 29)),   # 6/15 の2週間後＝連続でない
         ("a", date(2026, 7, 13)),   # 6/29 の2週間後＝連続でない
     )
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert len(out["weekly"]) == 3
     assert out["revisit_rate"] is None, "非連続の週ペアが再訪率計算に混入した"
 
@@ -85,11 +85,11 @@ def test_retention_pools_multiple_consecutive_pairs_not_averages_per_pair_rate()
         ("a", date(2026, 6, 8)),
         ("a", date(2026, 6, 15)), ("b", date(2026, 6, 15)),
     )
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert out["revisit_rate"] == 0.4, f"プール方式の再訪率になっていない: {out['revisit_rate']}"
 
 
 def test_retention_weekly_sorted_ascending_by_week_start():
     rows = _rows(("a", date(2026, 6, 29)), ("b", date(2026, 6, 15)), ("c", date(2026, 6, 22)))
-    out = store._compute_retention(rows)
+    out = _usage_ref._compute_retention(rows)
     assert [w["week_start"] for w in out["weekly"]] == ["2026-06-15", "2026-06-22", "2026-06-29"]

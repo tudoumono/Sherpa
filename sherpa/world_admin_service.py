@@ -90,13 +90,6 @@ def public_world(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_registered() -> list[dict[str, Any]]:
-    try:
-        return [public_world(row) for row in store.list_worlds_db()]
-    except Exception as exc:
-        raise WorldAdminUnavailableError("資料フォルダの登録情報を取得できません") from exc
-
-
 def generate_world_id(label: str, root: str) -> str:
     """表示名/フォルダ名から内部IDを生成する（UIには見せない）。登録可否の原子的判定は `worlds.register` が行う。"""
     base = (label or Path(root).name or "folder").strip()
@@ -243,17 +236,6 @@ def diff_path(path: str) -> dict[str, Any]:
     return _diff_payload(root, store.world_by_root(root))
 
 
-def diff_world(world_id: str) -> dict[str, Any]:
-    """登録済みWorldの差分（今のフォルダ内容と取り込み済みの差）。"""
-    row = _registered_row(world_id)
-    world_dir = worlds.world_dir(world_id)
-    if not world_dir:
-        raise WorldAdminUnavailableError("参照元フォルダにアクセスできません")
-    payload = _diff_payload(str(world_dir), row)
-    payload["root_path"] = row.get("root_path")
-    return payload
-
-
 def refresh(world_id: str, *, run_id=None, on_run_id=None) -> dict[str, Any]:
     """「今すぐ取り込み直す」。変更があった時だけ再取り込みする。`run_id` は受付時に確保済みの run 行（`unchanged` でも terminal 化される）。`on_run_id` は確保された run_id が判明した時点で呼ばれるコールバック。"""
     _registered_row(world_id)
@@ -287,14 +269,6 @@ def rebind(world_id: str, path: str, *, label: str | None = None, run_id=None, o
         "ledger": result.get("ledger", 0),
         "flags": result.get("flags", []),
     }
-
-
-def status_row(world_id: str) -> dict[str, Any]:
-    """状況表示の土台（登録行＋参照元の到達確認）。件数集計はrouter側の要約と合成する。"""
-    row = _registered_row(world_id)
-    if not worlds.world_dir(world_id):
-        raise WorldAdminUnavailableError("参照元フォルダにアクセスできません")
-    return row
 
 
 def delete(world_id: str, *, run_id=None) -> bool:

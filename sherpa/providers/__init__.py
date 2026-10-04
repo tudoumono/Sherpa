@@ -38,43 +38,9 @@ class _UnwiredProvider(Provider):
 
 
 # 有効な agent（頭脳）値の allowlist（PUT /settings の検証・chat.turn 監査の正規化で共有する）。
-# `heuristic`/`gemini`/`bedrock` は閉じた保存値で、履歴が自分の名前で残るよう置く（PUT では選べない）。
-# ここに無い非空の値は実行側（`_select_provider`）では `_UnwiredProvider`、監査 detail では "unknown" にする。
+# `heuristic`/`gemini`/`bedrock`/`openai`/`ollama` は選べない値で、履歴が自分の名前で残るよう置く（PUT では選べない）。
+# 実行側（`_select_provider`）は `codex`/`simple` 以外を `_UnwiredProvider`（選び直しの案内）にし、監査 detail ではここに無い非空の値を "unknown" にする。
 AGENT_PROVIDERS = frozenset({"heuristic", "codex", "simple", "openai", "ollama", "gemini", "bedrock"})
-
-
-# チャットでは閉じた頭脳。保存済みの値が残っていても別の AI へ黙って切り替えず、この文言で選び直しを案内する。
-_CLOSED_AGENTS = {"gemini": "Gemini", "bedrock": "AWS Bedrock (Claude)", "heuristic": "簡易（AIなし）"}
-
-
-class _DisabledProvider(Provider):
-    """この環境では無効化されている頭脳（チャットで閉じた gemini/bedrock/heuristic）。
-    黙って別の頭脳へ倒さず明示的に伝える。
-    """
-
-    def __init__(self, agent: str):
-        self.label, self.model = "利用できないAI", ""
-        self._agent = agent
-        if agent in _CLOSED_AGENTS:
-            self.howto = (f"{_CLOSED_AGENTS[agent]} はチャットでは利用できなくなりました。"
-                          "設定画面で「簡易」または「Codex 調査」を選び直してください。")
-        else:
-            self.howto = ("この AI はこの環境では利用できません。設定画面で利用できる AI を選び直してください"
-                          "（管理者が環境変数で有効化することもできます）。")
-
-    def _plain_text(self, message: str = "") -> str:
-        return self.howto
-
-    def run(self, ctx: Ctx) -> Iterator[dict]:
-        if not ctx.knowledge:
-            yield from _plain_run(self, ctx); return
-        env = {"lens": "qa", "headline": self.howto, "summary": {"total": 0}, "data": {}, "sources": [],
-              "agentic_failure": "error",  # 終了理由の分布で完了扱いにしない
-              "scope": layer_mod.scope_with_layer(ctx.scope_meta, world=ctx.world, lens="qa")}
-        yield _node("disabled", "think", "利用できないAI", "設定を確認してください", "done")
-        yield {"type": "answer_delta", "text": env["headline"]}
-        yield {"type": "_result", "env": env,
-               "decision": {"lens": "qa", "input": ctx.message, "reason": "選択中のAIは無効"}}
 
 
 def _codex_openai_compat_block_reason(s: dict, *, explicit_openai_api_key: str | None = None,
@@ -175,17 +141,10 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
     # この呼び出し内の system_settings 依存の解決はすべて同じスナップショットで行う（省略時のみここで読む）。
     sys_s = system_settings if system_settings is not None else _store.get_system_settings()
     # `effective_agent()` を経由する（表示と実行が食い違わない）。`strict=True` で非空の不正値は honest failure にする。
-    # 保存済みの閉じた頭脳（gemini/bedrock/heuristic）は ollama 縮退より前に止める。
-    saved = s.get("agent")
-    if isinstance(saved, str) and saved.strip().lower() in _CLOSED_AGENTS:
-        return _DisabledProvider(saved.strip().lower())
     try:
         agent = agent_constructs.effective_agent(s, system_settings=sys_s, strict=True)
     except (agent_constructs.InvalidAgentConfigError, _keys.InvalidCloudProviderConfigError) as e:
         return _facade._UnwiredProvider("AI の選択", str(e))
-    # 未設定環境の既定が閉じた頭脳に落ちた場合も同じ案内で止める。
-    if agent in _CLOSED_AGENTS or agent_constructs.runtime_blocked(agent):
-        return _DisabledProvider(agent)
     if agent == "codex":
         # Codex CLI 不在は未接続として正直に返す。
         if not shutil.which("codex"):
@@ -253,16 +212,13 @@ def _select_provider(s: dict, system_settings: dict | None = None) -> Provider:
             return _facade._UnwiredProvider("Codex", f"モデル名が不正です（{e}）")
     if agent == "simple":
         return _select_simple(sys_s)
-    if agent in ("openai", "ollama"):
-        # 保存済みの openai/ollama は簡易へ寄せる。
-        return _select_simple(sys_s)
     return _facade._UnwiredProvider(
         "AI の選択", "選べる AI は「簡易」か「Codex 調査」です。設定画面で選び直してください。")
 
 
 def get_provider(settings: dict | None = None, system_settings: dict | None = None) -> Provider:
     """利用者設定と管理者の全体設定（DB）で頭脳を選ぶ。固定の回答方針（`prompts.ANSWER_POLICY`）を provider に載せる。
-    チャットの頭脳は codex / simple のみ。保存済みの openai/ollama は simple へ寄せ、gemini/bedrock/heuristic は `_DisabledProvider` で止める。
+    チャットの頭脳は codex / simple のみ。それ以外の保存値は `_UnwiredProvider` で止め、設定画面での選び直しを案内する。
     1ターンの唯一の入口＝`system_settings` をここで `store._read_system_settings_fresh()`（共有キャッシュを使わない生の DB 読取）により1回だけ読み、`_select_provider` まで同じスナップショットを渡す。
     読取失敗は呼び出し元へ伝播する（fail-closed）。
     `system_settings`（省略可）: 渡した fresh スナップショットを使う。

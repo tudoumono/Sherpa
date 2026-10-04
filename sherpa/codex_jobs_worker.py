@@ -2,7 +2,7 @@
 設計: docs/design/codex.md「Codex ジョブ API（外部 API）」／docs/design/interfaces.md「Codex ジョブ・受付」
 
 - Codex の起動方法は新設せず、チャットと同じ実行経路（`agents.get_provider`→`CodexProvider.run(ctx)`）・サンドボックス・壁時計上限を使う。
-  会話を DB に永続する `handle_message`/`stream_message` は呼ばず、`chat_service` の `_resolve_scope`/`_finalize`/`_sources`/`_is_stopped_terminal` だけ借りる。
+  会話を DB に永続する `stream_message` は呼ばず、`chat_service` の `_resolve_scope`/`_finalize`/`_sources`/`_is_stopped_terminal` だけ借りる。
 - `Ctx.route` は常に `lens="qa"`。`Ctx.dispatch` は通常構成では呼ばれず、MCP 無効の構成でだけツール遮断の envelope を返す保険。
 - uid は実在ユーザーと衝突しない技術 uid（`_CODEX_JOB_UID`）を常に渡す。Codex が作ったファイルは
   `data/users/{_CODEX_JOB_UID}/workspace/` に隔離される。

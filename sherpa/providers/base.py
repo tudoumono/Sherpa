@@ -1,6 +1,6 @@
 """思考プロバイダの共通基盤。
 
-`Ctx`（プロバイダへ渡す文脈）・`_node`/`_can_ask`/`_gather`（共通の前段＝理解→意図→実ツール取得）・`_plain_run`（ナレッジ参照オフの素の会話）・
+`Ctx`（プロバイダへ渡す文脈）・`_node`/`_gather`（共通の前段＝理解→意図→実ツール取得）・`_plain_run`（ナレッジ参照オフの素の会話）・
 `_usage_meta`（usage メタの標準形）・`Provider`（頭脳の抽象基底）・`_TOOLS`/`_LENS_INTENT`・`_log` と、
 Codex 経路が使う証拠種別の判定（`_scope_evidence_kinds` 等）を集約する。
 `_gather` は `from sherpa import agents as _facade` で実行時解決して呼ぶ（`sherpa.agents` の差し替えを効かせるため）。
@@ -9,15 +9,13 @@ Codex 経路が使う証拠種別の判定（`_scope_evidence_kinds` 等）を�
 from __future__ import annotations
 
 import logging
-import re
 import threading  # noqa: F401 -- Ctx.stop_event の型注釈（文字列 forward-ref）で参照（元コードのまま）
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
 from .. import layer as layer_mod
-from .. import stop_kind as stop_kind_mod
-from .prompts import (_PLAIN_PROMPT_WITH_PERSONAL, _NO_PRESEARCH_HEADLINE)
+from .prompts import _NO_PRESEARCH_HEADLINE
 
 _log = logging.getLogger("sherpa")
 # Codex CLI 実行の専用ログ（`data/run/codex.log`）。実行1回につき開始/終了2行だけを INFO で書く（本文・資料名は書かない）。
@@ -47,7 +45,7 @@ class Ctx:
     make_sources: Callable[[list], list] | None = None  # doc_id[] -> sources[]（agentic 結果に出典を付与）
     uid: str = "admin"  # 現在ユーザー uid（互換モードは 'admin'）
     personal_facts: str = ""  # 個人ファイルのヒット（ナレッジオフ/agentic 経路にも注入）
-    stop_event: "threading.Event | None" = None  # 途中停止（/chat/stream/stop が set する）
+    stop_event: "threading.Event | None" = None  # 途中停止（/chat/turns/{turn_id}/stop が set する）
     # 直前ターンの (user, assistant) 完全対（時系列順・件数と文字予算は chat_service で制限済み）。
     # 例: [{"role":"user","content":"…"},{"role":"assistant","content":"…"}, ...]。
     # message 文字列には混ぜない（grep クエリや確認ID の判定を汚さないため別チャネル）。
@@ -71,11 +69,6 @@ def _node(id, kind, label, detail, status):
 
             # 今回の呼び出しが不正なら `set_claims` は state.claims を変更しない（既存分を維持）。
     # `_remapped` が空でも既存分を維持する。
-
-
-def _can_ask(message: str) -> bool:
-    """依頼に「確認ID:」（前の質問への回答の再送）が無いときだけ ask_user を許す（再質問ループを塞ぐ）。"""
-    return not re.search(r"確認ID[:：]", message or "")
 
 
 def _gather(ctx: Ctx, *, skip_presearch_lenses: frozenset = frozenset()):
@@ -124,48 +117,21 @@ def _gather(ctx: Ctx, *, skip_presearch_lenses: frozenset = frozenset()):
 
 
 def _plain_run(provider: "Provider", ctx: Ctx) -> Iterator[dict]:
-    """ナレッジ参照オフ＝検索せず、モデルだけで素の会話を返す。
-    envelope は `lens="chat"`・`sources=[]`・`scope.source="off"`。個人ファイルの事実があればプロンプトに注入する。
+    """ナレッジ参照オフ＝検索せず、定型文（`_plain_text`）を返す。
+    envelope は `lens="chat"`・`sources=[]`・`scope.source="off"`。個人ファイルの事実があれば env に載せる。
     """
     yield _node("understand", "think", "質問を理解", "内容を把握しました", "done")
     yield _node("brain", "think", f"考える（{provider.label}）", "一般知識で回答中（ナレッジ参照オフ）", "active")
-    acc = ""
-    t0 = time.monotonic()  # この単発ストリーミング呼び出し1回分の経過秒
-    # 途中停止は発行前チェックと chunk ごとのチェックで反応する。
+    # 途中停止済みのターンは定型文を返しても失敗として数えない。
     already_stopped = ctx.stop_event is not None and ctx.stop_event.is_set()
-    _stream_failure = None  # ストリーム例外の型から導いた終了理由（timeout/transport_error/None）
-    if not already_stopped:
-        try:
-            if ctx.personal_facts and hasattr(provider, "_stream"):
-                # 個人ヒットをプロンプトに組み込んで LLM に渡す。
-                personal_prompt = _PLAIN_PROMPT_WITH_PERSONAL.format(
-                    personal=ctx.personal_facts, q=ctx.message)
-                stream = provider._stream(personal_prompt)  # type: ignore[attr-defined]
-            else:
-                stream = provider._plain_stream(ctx.message)
-            for chunk in stream:
-                if ctx.stop_event is not None and ctx.stop_event.is_set():
-                    break
-                if chunk:
-                    acc += chunk
-                    yield {"type": "answer_delta", "text": chunk}
-        except Exception as e:
-            acc = ""
-            _stream_failure = stop_kind_mod.from_exception(e)
-    headline = acc or provider._plain_text(ctx.message)
-    if not acc:
-        yield {"type": "answer_delta", "text": headline}  # フォールバックも一度は流す
-    yield _node("brain", "think", f"考える（{provider.label}）", "回答しました" if acc else "（応答なし）", "done")
+    headline = provider._plain_text(ctx.message)
+    yield {"type": "answer_delta", "text": headline}
+    yield _node("brain", "think", f"考える（{provider.label}）", "（応答なし）", "done")
     env = {"lens": "chat", "headline": headline, "summary": {"total": 0}, "data": {},
            "sources": [], "scope": {"world": ctx.world, "scope_paths": [], "source": "off"}}
-    if not acc and not already_stopped:
-        # 定型文へ落ちたターンは終了理由の分布で完了として数えない（`stop_kind.resolve`）。
-        env["agentic_failure"] = _stream_failure or "error"
-    # 素の会話でも usage を answer メタに乗せる。
-    _u = getattr(provider, "_last_usage", None)
-    if _u:
-        env["usage"] = _u
-        _log_chat_usage(_u, time.monotonic() - t0, ctx.world)
+    if not already_stopped:
+        # 定型文を返したターンは終了理由の分布で完了として数えない（`stop_kind.resolve`）。
+        env["agentic_failure"] = "error"
     # personal_facts を env に乗せる。
     if ctx.personal_facts:
         env["_personal_facts"] = ctx.personal_facts
@@ -240,9 +206,6 @@ class Provider:
     def run(self, ctx: Ctx) -> Iterator[dict]:
         raise NotImplementedError
 
-    def _plain_stream(self, message: str) -> Iterator[str]:
-        return iter(())  # 既定: ストリームしない（_plain_text を使う）
-
     def _plain_text(self, message: str = "") -> str:
         # message は既定未使用（作成意図で分岐する頭脳のみ利用）。
         return ("ナレッジ参照はオフです。社内資料は参照していません。資料に基づく回答が必要なら、"
@@ -252,7 +215,6 @@ class Provider:
         """`tool_availability` より前に呼ぶ、接続先の I/O-free 許可判定（SSRF チョークポイント）。
         既定は no-op。接続先が設定依存の provider はオーバーライドし、不許可の宛先なら例外で fail-closed に止める。
         """
-        return None
 
 
 def _evidence_gate_note(missing_kinds, unavailable_kinds) -> str:

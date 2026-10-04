@@ -33,7 +33,7 @@
 	# （443/80 自体が既存サービスと衝突する場合は、この Caddyfile の待受アドレス行を
 	#   例えば `:8443` のように変更する）
 	reverse_proxy 127.0.0.1:8000 {
-		# SSE（GET /chat/stream の text/event-stream）はそのまま流れる。
+		# SSE（GET /chat/turns/{turn_id}/stream の text/event-stream）はそのまま流れる。
 		# Caddy は既定でレスポンスをバッファせずストリーミングするため、通常この設定は不要。
 		# もし環境依存でチャットのストリーミングが詰まる場合だけ、次のフラッシュ即時化を有効にする:
 		# flush_interval -1

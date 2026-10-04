@@ -130,7 +130,7 @@ def test_logs_words_aliases_help_and_unknown_names(tmp_path):
     for goals in (["logs", "convert", "embed"], ["l", "c", "e"], ["logs", "help"], ["l", "n=500", "c"]):
         m = subprocess.run(["make", "-n", *goals], cwd=root, capture_output=True, text=True, timeout=60)
         assert m.returncode == 0 and "warning" not in m.stderr, m.stderr
-        assert m.stdout.count("./scripts/logs.sh") == 1 and "Sherpa — make の使い方" not in m.stdout
+        assert m.stdout.count("./sherpactl logs") == 1 and "Sherpa — make の使い方" not in m.stdout
     # 後ろに実在の目標名があれば、何も実行せず非 0 で止まる（実目標が走らない）
     for goals in (["logs", "help", "nuke"], ["l", "start"], ["logs", "c", "stop"]):
         m = subprocess.run(["make", "-n", *goals], cwd=root, capture_output=True, text=True, timeout=60)

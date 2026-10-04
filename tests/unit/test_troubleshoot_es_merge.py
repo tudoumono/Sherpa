@@ -71,16 +71,6 @@ def test_troubleshoot_es_duplicate_doc_span_is_deduped():
         _restore(saved)
 
 
-def test_troubleshoot_facts_redacts_base_grep_secret():
-    """LLM へ渡す facts では base(grep) 根拠本文の秘匿値も伏せる（ES だけでなく grep も・RV High）。"""
-    from sherpa import agents
-    env = {"data": {"candidates": [{
-        "name": "NIGHTLY", "role": "ジョブ",
-        "evidence": {"edges": [], "grep": [{"doc_id": "src/x.jcl", "line": 2, "span": [2, 2],
-                                            "text": "password=topsecretvalue123 を使う", "match": "x"}]},
-    }]}}
-    facts = agents._facts("troubleshoot", env)
-    assert "topsecretvalue123" not in facts and "password=[REDACTED]" in facts
 
 
 def test_es_troubleshoot_cards_tolerate_es_hit_without_line():

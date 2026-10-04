@@ -1,6 +1,6 @@
 """言語アナライザの登録簿（拡張子→アナライザ解決の単一の真実源）。
 
-既知アナライザの列挙順＝優先順（同じ拡張子を複数が要求したら上位が担当）。`registered_extensions()` が「コード」と見なす拡張子集合の単一の真実源で、`doc_kinds.CODE_EXT`・`corpus_docs._doctype_map()`・`scope._CONTENT_EXT`・`agentic_search._READABLE_EXT`・`ext_api` はこれを参照する。`resolve_lazy()` は拡張子に加えて `accepts()` の内容判定まで見て担当を確定する。
+既知アナライザの列挙順＝優先順（同じ拡張子を複数が要求したら上位が担当）。`registered_extensions()` が「コード」と見なす拡張子集合の単一の真実源で、`doc_kinds.CODE_EXT`・`scope._CONTENT_EXT`・`agentic_search._READABLE_EXT`・`ext_api` はこれを参照する。`resolve_lazy()` は拡張子に加えて `accepts()` の内容判定まで見て担当を確定する。
 `_ANALYZERS` ＝ `_UPSTREAM_ANALYZERS`（本体の固定リスト）＋ `discover_extension_analyzers()`（フォーク側の `<prefix>_*.py` を名前順で末尾に足す）。
 設計: docs/design/rag.md「グラフ」
 """

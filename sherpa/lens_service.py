@@ -7,13 +7,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 
 from neo4j import Query
 from neo4j.exceptions import Neo4jError
 
 from . import citations, scope
+from .env_int import env_int
 from .grep_tool import grep_search
 from .impact_service import CATEGORY
 from .ingest.world_neo4j import GraphSchemaEraError, _scope_pred, check_schema_era
@@ -28,21 +28,8 @@ _ROLE_RANK = {"Document": 1, "Batch": 2, "Module": 3}
 
 
 # Neo4j の安全弁は timeout と緊急天井。Cypher に LIMIT は入れない（網羅性優先）。
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`agentic_search._env_int` と同じ意味・層の逆転を避けるため複製）。範囲外・非整数は既定へ。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
-
-
 # per-query タイムアウト（秒）。既定 30・[1,600]。
-_NEO4J_QUERY_TIMEOUT_S = _env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
+_NEO4J_QUERY_TIMEOUT_S = env_int("SHERPA_NEO4J_QUERY_TIMEOUT_S", 30, 1, 600)
 # ストリーム反復の緊急天井（行数）。
 _NEO4J_MAX_ROWS = 10000
 # トラブルシュート/近傍探索（neo4j_related）の既定深さ（管理画面の基準値が未設定のときに使う）。
@@ -164,7 +151,6 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
         "WITH nb, head(collect(p)) AS path "
         "RETURN nb.canonical_id AS cid, nb.name AS name, "
         "  [l IN labels(nb) WHERE l<>'Entity'][0] AS label, "
-        "  coalesce(nb.extraction_method,'static') AS em, "
         "  coalesce(nb.status,'active') AS status, "
         "  [n IN nodes(path) | n.name] AS path_names, "
         "  [e IN relationships(path) | {type:type(e), from:startNode(e).name, to:endNode(e).name, doc:e.doc}] AS edges, "
@@ -178,7 +164,7 @@ def neo4j_related(session, anchors, world, scope_prefixes=None, depth=TROUBLESHO
         out.append({
             "cid": r["cid"], "name": r["name"], "label": r["label"],
             "category": CATEGORY.get(r["label"], r["label"]),
-            "extraction_method": r["em"], "status": r["status"],
+            "status": r["status"],
             "path": r["path_names"], "distance": r["dist"], "edges": list(r["edges"]),
         })
     return out

@@ -225,31 +225,6 @@ def test_deploy_skills_dest_root_symlink_is_rejected_not_followed():
         assert not (evil_target / "xlsx").exists(), "symlink の指す先（authoring 外）に書き込んでしまった"
 
 
-# ===== CodexProvider.run(): 配備呼び出し＋台帳スナップショット除外（ソース検査） =====
-
-def test_codex_run_deploys_skills_before_subprocess_spawn():
-    """R1b で Popen 呼出は `_attempt()`（ネスト関数）に切り出された。`inspect.getsource` は
-    ネスト関数の**定義**を try の外（テキスト上手前）に出すため、`subprocess.Popen` の文字列位置は
-    もう「実行順」を表さない（定義位置と呼出位置がズレる）。`_attempt(` の**呼出**
-    （`yield from _attempt(`）と比較する。"""
-    from sherpa import agents as A
-    import inspect
-    src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    assert "codex_skills.deploy_skills" in src, "run() が codex_skills.deploy_skills を呼んでいない"
-    i_deploy = src.index("codex_skills.deploy_skills")
-    i_call = src.index("yield from _attempt(")
-    assert i_deploy < i_call, "スキル配備が Popen 実行（_attempt 呼出）より後に呼ばれている（実行前に配備されていない）"
-
-
-def test_ledger_snapshot_excludes_agents_dir():
-    """新規ファイル検出（台帳登録スキャン）が .tmp と同様に .agents 配下も除外している（ソース検査）。"""
-    from sherpa import agents as A
-    import inspect
-    src = inspect.getsource(A.CodexProvider.run) + inspect.getsource(A.CodexProvider._run_authoring)
-    assert src.count('{".tmp", ".agents"}') >= 2, \
-        "before/after 両方のスナップショットで .agents 除外が入っていない"
-
-
 def test_deploy_skills_rejects_symlinked_agents_parent():
     """RV HIGH（Phase1）: 親 `.agents` 自体が symlink（Codex は authoring に書ける＝前回実行で
     残せる）だと、旧実装は symlink 先の実ディレクトリを rmtree/copytree で破壊した。

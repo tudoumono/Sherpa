@@ -6,7 +6,7 @@ DB/Neo4j には接続しない（`store.get_world`/`store.world_lock`/`worker.wo
 `worker._derived_stale`/`worker.run`/`worker._run_locked`／`world_neo4j.check_graph_counts`/
 `world_neo4j.load_world` を monkeypatch——rag/evidence/document_ir いずれの drift も
 `_reflect_graph_after_rag_rewrite` 経由で `load_world` へ実 Neo4j 接続するため）。ES は
-`es_index.rag_es_enabled`/`index_world` を monkeypatch し、実 ES には接続しない
+`index_world` を monkeypatch し、実 ES には接続しない
 （`index_world` を短絡しても bulk 成功後の `confirm_human_md_meta` は別経路で `_req` へ
 GET/PUT する——通信の境界である `es_index._req` 自体もフェイクへ差し替える・
 `_fake_es_meta_req` 参照）。
@@ -103,7 +103,6 @@ def _fake_es_meta_req(calls: list):
 def _apply_world_monkeypatches(monkeypatch, wd, dmd) -> list:
     monkeypatch.setattr(worlds, "world_dir", lambda world: wd)
     monkeypatch.setattr(worlds, "derived_md_dir", lambda world: dmd)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)   # 本番の値（常時 rag）で走らせる
     # 本番の値（True）だと `_refresh_derived_representations`/`_reindex_after_rag_rewrite` が
     # `index_world_with_human_md_holdback` 経由で ES へ触れにいく——本ファイルの docstring が
     # 明言する「実 ES には接続しない」前提を保つため、既定で成功を返すダミーへ差し替える
@@ -216,7 +215,6 @@ def test_rag_refresh_regenerates_once_then_noop(_world_with_asset, monkeypatch):
 def test_rag_refresh_indexes_es_once_with_content_sig(_world, monkeypatch):
     dmd = _world["dmd"]
     _force_rag_drift(dmd)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     calls = []
 
     def _index_world(world, content_sig=None, **kw):
@@ -233,7 +231,6 @@ def test_rag_refresh_indexes_es_once_with_content_sig(_world, monkeypatch):
 def test_rag_refresh_es_failure_leaves_marker_for_retry(_world, monkeypatch):
     dmd = _world["dmd"]
     _force_rag_drift(dmd)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)
     monkeypatch.setattr(es_index, "index_world", lambda world, content_sig=None, **kw:
                          {"available": True, "indexed": 0, "chunks": 0, "error": "bulk_failed"})
 
@@ -468,7 +465,6 @@ def test_empty_ooxml_evidence_survives_refresh_evidence_ir_across_two_syncs(tmp_
     def _noop_lock(world_id):
         yield
     monkeypatch.setattr(store, "world_lock", _noop_lock)
-    monkeypatch.setattr(es_index, "rag_es_enabled", lambda: True)   # 本番の値（常時 rag）で走らせる
     # 本ファイルの docstring が明言する「実 ES には接続しない」前提を保つ（§ _apply_world_monkeypatches 参照）。
     monkeypatch.setattr(es_index, "index_world",
                         lambda world, content_sig=None, **kw: {"available": True, "indexed": 1, "chunks": 1})

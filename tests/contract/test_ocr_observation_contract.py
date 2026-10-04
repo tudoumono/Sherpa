@@ -58,9 +58,9 @@ def _psycopg_related_lines(text: str) -> str:
 # （requirements.txt の「関連行だけ抜き出す」方式の関数/DDL 単位版）。
 #   - `world_lock`（`ocr_worker.py` が import）・`_connect`/`_ensure`（`ocr_jobs.py` が import）と、
 #     それぞれが直接使う補助（`_dsn`/`_world_lock_key`/PG プール一式/`init_schema`）を
-#     `inspect.getsource()` で個別に抜き出す——`init_schema` 自体は他テーブルの移行処理
-#     （`_migrate_client_op_id_unique_index`/`_ensure_messages_created_at_index_background`）を
-#     **呼び出す**が、それらの**中身**は関数呼び出し1行としてしか現れないため、その中身が変わっても
+#     `inspect.getsource()` で個別に抜き出す——`init_schema` 自体は他テーブルの処理
+#     （`_ensure_messages_created_at_index_background`）を**呼び出す**が、その中身は関数呼び出し1行としてしか
+#     現れないため、その中身が変わっても
 #     ここでは検知しない（意図的な妥協＝会話/監査系の変更を無関係のまま保つのが目的）。
 #   - `_ensure`→`init_schema` が実行する `_SCHEMA`（DB 全表の DDL リスト）は丸ごとではなく、
 #     OCR 関連テーブル名を含む要素だけを抜き出す（`_DB_OCR_SCHEMA_MARKERS`）。
@@ -255,14 +255,7 @@ def test_route_manifest_does_not_create_generation_id_digest_cycle():
     assert "source_rel_path" in fields
 
 
-def test_observation_artifact_names_are_separate_from_canonical_rag(tmp_path):
-    paths = observation_render.artifact_paths(
-        tmp_path, canonical_generation_id="a" * 64, observation_generation_id="b" * 64,
-        source_rel_path="sub/design.xlsx",
-    )
-    assert paths.observation_sets_jsonl.name == "design.xlsx.ai_observations.jsonl"
-    assert "/md-generations/" not in paths.observation_sets_jsonl.as_posix()
-    assert f"/{observation_render.OBSERVATION_GENERATIONS_NAME}/" in paths.observation_sets_jsonl.as_posix()
+def test_observation_artifact_names_are_separate_from_canonical_rag():
     assert observation_render.OBSERVATION_POINTER_NAME == "md-observations.current.json"
     assert observation_render.OBSERVATION_POINTER_SCHEMA == "sherpa-observation-pointer-v1"
 

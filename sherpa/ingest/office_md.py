@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
 from .. import json_io
+from ..env_int import env_int
 from . import text_kind
 
 # MD 変換（取り込み進行ログ）は専用ログ（sherpa.ingest.convert）へまとめる
@@ -43,24 +44,11 @@ IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
 OFFICE_EXT = CONVERTIBLE_EXT | PDF_EXT | set(LEGACY_OFFICE_EXT)   # Office/PDF 一括（未対応含む）
 
 
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`grep_tool._env_int` と同型・独立実装）。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
-
-
 # Office/PDF 取り込みの入口サイズガード。openpyxl は全ブックをオブジェクトツリーに展開するため、
 # ピークメモリが原本サイズの数倍〜数十倍になりうる。変換を試みる前に諦める安全弁。
-_OFFICE_FILE_CAP_BYTES = _env_int(
+_OFFICE_FILE_CAP_BYTES = env_int(
     "SHERPA_OFFICE_FILE_CAP_BYTES", 100 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
-_PDF_FILE_CAP_BYTES = _env_int(
+_PDF_FILE_CAP_BYTES = env_int(
     "SHERPA_PDF_FILE_CAP_BYTES", 100 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024)
 
 
@@ -75,11 +63,11 @@ def _office_size_exceeded(rp: Path, ext: str) -> bool:
 
 # xlsx セル数ガード: 圧縮後サイズ（`SHERPA_OFFICE_FILE_CAP_BYTES`）は圧縮率の高い xlsx を素通りさせるため、
 # openpyxl を開く前にセル数の上限で止める。
-_XLSX_CELL_CAP = _env_int("SHERPA_XLSX_CELL_CAP", 2_000_000, 1_000, 100_000_000)
+_XLSX_CELL_CAP = env_int("SHERPA_XLSX_CELL_CAP", 2_000_000, 1_000, 100_000_000)
 
 # Office 非圧縮サイズガード: zip の非圧縮サイズ合計（セントラルディレクトリの `ZipInfo.file_size` の和・本体は読まない）の上限。
 # 素の docx/xlsx/pptx と、旧形式を OOXML へ前段変換した後のファイルの両方に適用する。
-_OFFICE_UNCOMPRESSED_CAP_BYTES = _env_int(
+_OFFICE_UNCOMPRESSED_CAP_BYTES = env_int(
     "SHERPA_OFFICE_UNCOMPRESSED_CAP_BYTES", 500 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024)
 
 _XLSX_DIMENSION_RE = re.compile(rb'<dimension\s+ref="([^"]*)"')
@@ -1321,7 +1309,6 @@ def _check_partial_extraction(rp: Path, md: str, rel: str, document, out: list[d
 # ヒットしたら実変換を丸ごとスキップし、キャッシュ済みの派生一式をステージングへコピーする。
 # 失敗ファイル（notice へ縮退したもの）は対象外で、次回 sync が必ず再試行する。
 _CONV_CACHE_DIRNAME = "_conv_cache"
-_CONV_CACHE_MAX_BYTES = 0  # 総量上限（バイト・0＝無制限）
 # per-file キャッシュがミラーする sidecar 種別（`_LAYER_FOR_SIDECAR_SUFFIX` の部分集合）。
 # `.derived.json` は復元後に `_write_derived_sidecar_manifest` が毎回書き直し、`.ocr_route.json` は `build_derived` が資料フォルダ単位で書くため対象外。
 _CONV_CACHE_SIDECAR_SUFFIXES = (
@@ -1459,37 +1446,6 @@ def _conv_cache_prune(cache_root: Path, seen_rels: set) -> None:
             shutil.rmtree(cache_root / (rel + ".d"), ignore_errors=True)
         except OSError:
             pass
-
-
-def _conv_cache_enforce_cap(cache_root: Path) -> None:
-    """`_CONV_CACHE_MAX_BYTES`（0＝無制限）を超えたらキャッシュを古い順に削る安全弁。"""
-    cap = _CONV_CACHE_MAX_BYTES
-    if cap <= 0 or not cache_root.is_dir():
-        return
-    entries: list[tuple[int, Path, Path, int]] = []
-    total = 0
-    for meta_path in cache_root.rglob("*.key.json"):
-        rel = meta_path.relative_to(cache_root).as_posix()[: -len(".key.json")]
-        content_dir = cache_root / (rel + ".d")
-        try:
-            size = sum(p.stat().st_size for p in content_dir.rglob("*") if p.is_file())
-            mtime = meta_path.stat().st_mtime_ns
-        except OSError:
-            continue
-        entries.append((mtime, meta_path, content_dir, size))
-        total += size
-    if total <= cap:
-        return
-    entries.sort(key=lambda e: e[0])          # 古い順（作成/更新が最も昔のものから削る）
-    for _mtime, meta_path, content_dir, size in entries:
-        if total <= cap:
-            break
-        try:
-            meta_path.unlink(missing_ok=True)
-            shutil.rmtree(content_dir, ignore_errors=True)
-        except OSError:
-            continue
-        total -= size
 
 
 def _build_derived_into_staging(
@@ -2129,10 +2085,9 @@ def _build_derived_into_staging(
             processed_candidates += 1
             if progress is not None:
                 progress(processed_candidates, candidate_total)
-    # per-file ループを完走したときだけ剪定/上限適用する（`_conv_cache_prune` 参照）。
+    # per-file ループを完走したときだけ剪定する（`_conv_cache_prune` 参照）。
     # 途中死では呼ばれず、生きている rel のキャッシュは次回 sync で再利用できる。
     _conv_cache_prune(conv_cache_root, conv_cache_seen_rels)
-    _conv_cache_enforce_cap(conv_cache_root)
     _write_arms_sig_marker(dr)                           # この派生を作った時のアーム構成を刻む（後の drift 判定用）
     if document_ir_failed == 0:                          # 全 IR が正常に書けた時だけ IR 版マーカーを刻む
         _write_document_ir_sig_marker(dr)

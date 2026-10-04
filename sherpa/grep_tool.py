@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import heapq
 import logging
-import os
 import re
 import time
 from collections import deque
@@ -15,6 +14,7 @@ from pathlib import Path
 from . import layer as layer_mod
 from . import text_encoding
 from .doc_kinds import CODE_EXT
+from .env_int import env_int
 from .ingest import text_kind
 
 _log = logging.getLogger("sherpa")
@@ -34,22 +34,9 @@ _TEXT_EXT = _MD_EXT | CODE_EXT | {".txt"} | text_kind.CODE_EXT | text_kind.DOCUM
 _WORLD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # fullmatch 専用
 
 
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """security-limit 系 env の整数解析（`agentic_search._env_int` と同じ意味・循環 import を避けて独立実装）。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
-
-
 # 1 ファイルの走査上限（バイト）。`_CappedStreamReader` が bounded chunk でストリーミング走査するため、メモリはこの値にもファイル実サイズにも比例しない。
 # 走査コスト・時間の安全弁。
-_GREP_FILE_CAP_BYTES = _env_int("SHERPA_GREP_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
+_GREP_FILE_CAP_BYTES = env_int("SHERPA_GREP_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
 # MD の見出し節引用は節全体になり得るため、ヒット 1 件あたりの引用テキストを UTF-8 バイト上限でクリップする。
 _GREP_HIT_TEXT_MAX_BYTES = 64 * 1024
 
@@ -144,13 +131,6 @@ def valid_world(v: str) -> bool:
     return bool(_WORLD_RE.fullmatch(v or ""))
 
 
-def rag_grep_enabled() -> bool:
-    """grep の検索対象・read_around の精読対象が rag 表現（`{rel}.rag.md`）を優先するか。常時 True。
-    rag ファイルが実在しない文書は per-file で legacy（`{rel}.md`）へ縮退する（`preferred_derived_name`）。
-    """
-    return True
-
-
 def strip_derived_suffix(name: str) -> str:
     """派生ファイルの物理名（rel）→ 原本 rel。`.rag.md` → `.rag_observations.md` → 一般の `.md` の順に、最初に一致した 1 つだけを剥がす。"""
     if name.endswith(_RAG_SUFFIX):
@@ -165,9 +145,9 @@ def strip_derived_suffix(name: str) -> str:
 def preferred_derived_name(rag_root: Path, rel: str) -> str:
     """原本 rel（拡張子込み）→ 検索/精読対象の派生ファイル名。`{rel}.rag.md` が `rag_root` に実在すればそちら、無ければ `{rel}.md`（legacy 側の実在確認は呼び出し元）。
     返す名前が `.rag.md` で終わるかで、呼び出し元は物理ルート（`rag_root` か md 層）を判別する。
-    `grep_search` と `agentic_search._safe_doc_path` が共有し、常に同じ 1 ファイルを見る。
+    `grep_search` と `parts/read/tools._safe_doc_path` が共有し、常に同じ 1 ファイルを見る。
     """
-    if rag_grep_enabled() and (rag_root / (rel + _RAG_SUFFIX)).is_file():
+    if (rag_root / (rel + _RAG_SUFFIX)).is_file():
         return rel + _RAG_SUFFIX
     return rel + ".md"
 

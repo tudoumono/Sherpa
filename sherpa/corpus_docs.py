@@ -19,7 +19,7 @@ from .ingest.analyzers import registry as _analyzer_registry
 
 _log = logging.getLogger("sherpa")
 
-# 拡張子 → doctype（表示用・非コード分の固定表）。コード分はアナライザ登録簿から `_doctype_map()` で毎回導出する
+# 拡張子 → doctype（表示用・非コード分の固定表）。コード分はアナライザ登録簿（`registry.candidates`／`resolve_lazy`）で決まる
 _NONCODE_DOCTYPE = {".md": "設計書", ".markdown": "設計書", ".txt": "テキスト"}
 _MD_EXT = {".md", ".markdown", ".txt"}
 # Office／PDF（決定的 MD 化の対象）
@@ -62,27 +62,6 @@ def _archive_row(rel: str, world: str) -> dict:
 
 class _HeadUnreadable(Exception):
     """`_read_head` が実ファイルを読めなかった（OSError）ことを示す内部シグナル。`classify_document()` が捕まえて `kind="unreadable"` で判定を打ち切る。"""
-
-
-def _code_doctype() -> dict:
-    """コード分の拡張子→doctype（拡張子衝突時はレジストリの優先順で先勝ち）。毎回アナライザ登録簿から導出する。"""
-    out: dict = {}
-    for a in _analyzer_registry.known_analyzers():
-        for ext in a.extensions:
-            out.setdefault(ext, a.doctype)
-    return out
-
-
-def _doctype_map() -> dict:
-    """表示用 doctype の合成表（非コード分の固定表＋コード分のレジストリ導出）。後方互換の `_DOCTYPE` 属性アクセス専用。衝突時は非コード分を優先する。"""
-    return {**_code_doctype(), **_NONCODE_DOCTYPE}
-
-
-def __getattr__(name: str):
-    """後方互換: `_DOCTYPE` への属性アクセスを `_doctype_map()` へ委譲する。"""
-    if name == "_DOCTYPE":
-        return _doctype_map()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def classify_document(rel_path: str, ext: str, read_head, *, allow_content_sniff: bool = True,
@@ -388,22 +367,6 @@ def manifest_doctype_count_from_root(manifest: dict, root) -> int:
         if _doctype_for_count(result, ext) is not None:
             count += 1
     return count
-
-
-def status_document_requires_coverage(rel_path: str, world: str) -> bool:
-    """文書状態の根拠として Canonical coverage を要求する形式か（Office／PDF／画像のみ True）。`allow_content_sniff=False` で判定する（`status_document_doctype` と同じ理由）。"""
-    ext = Path(rel_path).suffix.lower()
-    result = classify_document(
-        rel_path, ext, lambda size=4096: _read_head_for_status(world, rel_path, size),
-        allow_content_sniff=False)
-    if result.get("sensitive"):  # 秘匿名は Office／画像へ再採用しない
-        return False
-    if result["kind"] in ("code", "unreadable") or result["doctype"] is not None:
-        return False
-    if ext in _OFFICE_DOCTYPE:
-        return True
-    from .ingest import office_md
-    return ext in office_md.IMAGE_EXT
 
 
 def last_run_flags(world: str, *, deadline: float | None = None) -> list | None:

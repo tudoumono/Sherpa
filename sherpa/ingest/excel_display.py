@@ -8,7 +8,6 @@ OOXML の ``<v>`` を原値の権威、openpyxl の型変換結果を型付き�
 from __future__ import annotations
 
 import gc
-import json
 import posixpath
 import re
 import zipfile
@@ -484,8 +483,3 @@ def enrich_evidence(ir, path: str | Path) -> None:
     }
     for element, coordinate in elements:
         element.extension.update(metadata.get((element.locator.sheet, coordinate), missing))
-
-
-def metadata_json(metadata: dict[str, Any]) -> str:
-    """テスト・診断向けの決定的直列化。"""
-    return json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

@@ -72,6 +72,10 @@ def _ocr_worker() -> dict:
     if summary.get("available"):
         return _row("ocr_worker", "OCR ワーカー", True, uses, how)
     reason = summary.get("unavailable_reason") or "worker_not_seen"
+    if reason == "schema_not_ready":
+        row = _row("ocr_worker", "OCR ワーカー", False, uses, how, detail="DB が未初期化のため確認できません")
+        row["unknown"] = True
+        return row
     return _row("ocr_worker", "OCR ワーカー", False, uses, how, detail=f"理由: {reason}")
 
 

@@ -126,7 +126,7 @@ logs: export LOGS_REPORT := $(REPORT)
 logs: export LOGS_HELP := $(HELP)
 logs: export LOGS_N := $(if $(n),$(n),$(N))
 logs:              ## 全ログを1画面で（make l c e＝convert と embed・h で一覧・m でメモリ行・r で集計・err でエラーだけ・n=500 で末尾行数）
-	./scripts/logs.sh $(ARGS)
+	./sherpactl logs $(ARGS)
 
 l: logs            ## logs の短縮（make l c e m / make l h）
 
@@ -260,11 +260,11 @@ usage-backfill:    ## 既存のassistantメッセージをturn_metrics/turn_tool
 
 trace:             ## 会話の各ターンを段・道具の呼び出し（時刻・引数・件数・打ち切り）・トークン・調査台帳の流れで書き出す（make trace CONV=<会話番号>[,<会話番号>...] [MASK=1 [MASK_MODELS=1]] [OUT=<出力ファイル>]・読み取りだけ・MASK=1 で本文や資料名を伏せる・MASK_MODELS=1 でモデル名も伏せる）
 	@case "$${CONV:-}" in ""|*[!0-9,]*) echo "使い方: make trace CONV=<会話番号>[,<会話番号>...] [MASK=1] [OUT=<出力ファイル>]（会話番号は数字とカンマだけ）"; exit 2;; esac; \
-	set -- --conv "$${CONV}"; \
+	set -- "$${CONV}"; \
 	if [ "$${MASK:-}" = 1 ]; then set -- "$$@" --mask; fi; \
 	if [ "$${MASK_MODELS:-}" = 1 ]; then set -- "$$@" --mask-models; fi; \
 	if [ -n "$${OUT:-}" ]; then set -- "$$@" --out "$${OUT}"; fi; \
-	./scripts/conversation-trace.sh "$$@"
+	./sherpactl trace "$$@"
 
 azure-smoke:        ## Azure OpenAI（等の OpenAI 互換接続先）への実疎通を確認（実 API 課金あり・確認プロンプト）。ARGS で --env-file/--dry-run 等を渡せる（例: ARGS="--env-file azure.env --yes"）
 	$(PY) scripts/azure_smoke.py $(ARGS)
@@ -273,7 +273,7 @@ codex-compat:      ## Codex CLI を新しい版へ上げる前の互換の通し
 	SHERPA_USE_FIXTURES=1 $(PY) scripts/codex_compat.py
 
 doctor:            ## 導入先の統合セットアップ検査（ストア疎通/ES版+kuromoji/設定/LLM最小プローブ/Codex経路・読み取り専用）。PROBE_CLOUD=1 で課金プロバイダの実接続も確認
-	PROBE_CLOUD="$(PROBE_CLOUD)" ./scripts/doctor.sh
+	PROBE_CLOUD="$(PROBE_CLOUD)" ./sherpactl doctor
 
 sandbox-check:     ## Codex のサンドボックス（bubblewrap）の前提を確認（Ubuntu 23.10+ の AppArmor ユーザー名前空間制限・root不要）。直すには sudo bash scripts/setup-codex-sandbox.sh apply
 	./scripts/setup-codex-sandbox.sh check
@@ -285,7 +285,7 @@ codex-version:      ## 固定版と、tools/codex/・PATH 上に実際にある 
 	./scripts/codex_install.sh --check
 
 diag:              ## 解析用のログ回収バンドルを作る（機密を含めない・dist/diag/）。ARGS で --days/--out 等を渡せる
-	./scripts/diag.sh $(ARGS)
+	./sherpactl diag $(ARGS)
 
 nuke:              ## 完全初期化（ストア＋派生物＋個人領域＋OCR観測を消去。資料フォルダと .env は残す。確認は 2 回・端末必須。スクリプト用の省略は YES=I-UNDERSTAND-ALL-DATA-WILL-BE-DELETED・本番では不可）
 	YES="$(YES)" ./scripts/nuke.sh

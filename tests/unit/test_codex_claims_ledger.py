@@ -12,7 +12,7 @@ confirmed 主張は裏付けの実在を確認できないとして推定（infe
 from __future__ import annotations
 
 from sherpa import investigation_ledger as IL
-from sherpa.providers.codex import provider as PV
+from sherpa.providers.codex import structured as STRUCT
 
 
 def _snapshot(items: dict | None = None, *, has_manifest: bool = True,
@@ -52,7 +52,7 @@ def test_manifest_file_absent_leaves_claims_unchanged():
     `claims` を無変更で返す（正典§3）。"""
     claims = [_claim(evidence_refs=["src/a.py:12"])]
     snap = _snapshot(has_manifest=False)
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=False)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=False)
     assert out is claims   # 無変更＝同じリストをそのまま返す
     assert summary == {"ledger": False, "manifest_state": "absent"}
 
@@ -65,7 +65,7 @@ def test_manifest_file_exists_but_invalid_downgrades_all_confirmed():
     （実在する evidence を挙げていても）全て inferred へ格下げする。"""
     claims = [_claim(evidence_refs=["src/a.py:12"])]   # 実在しそうな参照でも登録集合が空なら不一致
     snap = IL.LedgerSnapshot(manifest=None, items={}, invalid_ids=())
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "inferred"
     assert summary["ledger"] is True
     assert summary["manifest_state"] == "invalid"
@@ -77,7 +77,7 @@ def test_manifest_file_exists_but_invalid_downgrades_all_confirmed():
 def test_confirmed_all_refs_match_ledger_stays_confirmed():
     claims = [_claim(evidence_refs=["src/a.py:12"])]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "confirmed"
     assert out[0]["reason"] == ""
     assert summary == {"ledger": True, "checked": 1, "downgraded": 0, "unmatched_refs": 0,
@@ -87,7 +87,7 @@ def test_confirmed_all_refs_match_ledger_stays_confirmed():
 def test_confirmed_no_ref_matches_downgrades_to_inferred():
     claims = [_claim(evidence_refs=["src/other.py:5"])]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "inferred"
     assert out[0]["reason_code"] == ""
     assert "根拠が調査台帳に無い" in out[0]["reason"]
@@ -98,7 +98,7 @@ def test_confirmed_no_ref_matches_downgrades_to_inferred():
 def test_confirmed_partial_ref_match_stays_confirmed():
     claims = [_claim(evidence_refs=["src/a.py:12", "src/other.py:5"])]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "confirmed"
     # 一致しなかった側の参照は unmatched_refs に数える（維持されても集計はする）。
     assert summary == {"ledger": True, "checked": 1, "downgraded": 0, "unmatched_refs": 1,
@@ -116,7 +116,7 @@ def test_confirmed_ref_to_unregistered_item_evidence_is_not_trusted():
     }
     snap = _snapshot(items, manifest_ids=["a"])   # b は未登録
     claims = [_claim(evidence_refs=["src/b.py:12"])]
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "inferred"
     assert summary["downgraded"] == 1
 
@@ -129,7 +129,7 @@ def test_confirmed_ref_to_registered_item_evidence_still_matches():
     }
     snap = _snapshot(items, manifest_ids=["a", "b"])   # 両方登録
     claims = [_claim(evidence_refs=["src/b.py:12"])]
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "confirmed"
     assert summary["downgraded"] == 0
 
@@ -140,7 +140,7 @@ def test_manifest_with_empty_items_trusts_no_evidence():
     items = {"a": _ledger_item("a", _EVIDENCE_A)}
     snap = _snapshot(items, manifest_ids=[])
     claims = [_claim(evidence_refs=["src/a.py:12"])]
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "inferred"
     assert summary["downgraded"] == 1
 
@@ -150,7 +150,7 @@ def test_confirmed_empty_evidence_refs_downgrades():
     自体は防御的に「refs 空＝一致ゼロ」として扱う。"""
     claims = [_claim(evidence_refs=[])]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "inferred"
     assert summary["downgraded"] == 1
     assert summary["unmatched_refs"] == 0   # 参照が1件も無いので延べ件数は0
@@ -162,7 +162,7 @@ def test_inferred_and_unknown_claims_are_untouched():
         _claim("c2", status="unknown", evidence_refs=[], reason_code="unexplored"),
     ]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out == claims
     assert summary == {"ledger": True, "checked": 0, "downgraded": 0, "unmatched_refs": 0,
                        "manifest_state": "valid"}
@@ -171,7 +171,7 @@ def test_inferred_and_unknown_claims_are_untouched():
 def test_reason_prefix_preserves_original_reason_text():
     claims = [_claim(evidence_refs=["src/other.py:5"], reason="既存の理由")]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, _ = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, _ = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["reason"].startswith("根拠が調査台帳に無い")
     assert "既存の理由" in out[0]["reason"]
 
@@ -181,7 +181,7 @@ def test_reason_prefix_preserves_original_reason_text():
 def test_leading_dot_slash_path_matches_bare_path():
     claims = [_claim(evidence_refs=["./src/a.py:12"])]
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "confirmed"
     assert summary["downgraded"] == 0
 
@@ -191,7 +191,7 @@ def test_line_number_as_string_matches_int_line():
     `_parse_evidence_ref` が int へ変換してから突き合わせるため一致する。"""
     snap = _snapshot({"i1": _ledger_item("i1", [{"kind": "source", "path": "src/a.py", "line": 12}])})
     claims = [_claim(evidence_refs=["src/a.py:12"])]
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "confirmed"
     assert summary["downgraded"] == 0
 
@@ -199,7 +199,7 @@ def test_line_number_as_string_matches_int_line():
 def test_malformed_ref_without_line_number_does_not_match():
     claims = [_claim(evidence_refs=["src/a.py"])]   # コロン無し＝行番号を持たない
     snap = _snapshot({"i1": _ledger_item("i1", _EVIDENCE_A)})
-    out, summary = PV._claims_vs_ledger(claims, snap, manifest_file_exists=True)
+    out, summary = STRUCT._claims_vs_ledger(claims, snap, manifest_file_exists=True)
     assert out[0]["status"] == "inferred"
     assert summary["unmatched_refs"] == 1
 
@@ -207,15 +207,15 @@ def test_malformed_ref_without_line_number_does_not_match():
 # ===== 補助関数の直接固定 =====
 
 def test_parse_evidence_ref_splits_on_last_colon():
-    assert PV._parse_evidence_ref("src/a.py:12") == ("src/a.py", 12)
-    assert PV._parse_evidence_ref("./src/a.py:12") == ("src/a.py", 12)
-    assert PV._parse_evidence_ref("no-colon-here") is None
-    assert PV._parse_evidence_ref("src/a.py:not-a-number") is None
-    assert PV._parse_evidence_ref("") is None
-    assert PV._parse_evidence_ref(None) is None
+    assert STRUCT._parse_evidence_ref("src/a.py:12") == ("src/a.py", 12)
+    assert STRUCT._parse_evidence_ref("./src/a.py:12") == ("src/a.py", 12)
+    assert STRUCT._parse_evidence_ref("no-colon-here") is None
+    assert STRUCT._parse_evidence_ref("src/a.py:not-a-number") is None
+    assert STRUCT._parse_evidence_ref("") is None
+    assert STRUCT._parse_evidence_ref(None) is None
 
 
 def test_normalize_evidence_path_strips_leading_dot_slash_and_backslashes():
-    assert PV._normalize_evidence_path("./src/a.py") == "src/a.py"
-    assert PV._normalize_evidence_path("src/a.py") == "src/a.py"
-    assert PV._normalize_evidence_path(".\\src\\a.py") == "src/a.py"
+    assert STRUCT._normalize_evidence_path("./src/a.py") == "src/a.py"
+    assert STRUCT._normalize_evidence_path("src/a.py") == "src/a.py"
+    assert STRUCT._normalize_evidence_path(".\\src\\a.py") == "src/a.py"

@@ -68,22 +68,6 @@ def set_message_personal(message_id) -> None:
         c.execute("UPDATE messages SET personal=TRUE WHERE id=%s", (message_id,))
 
 
-def get_conversation(conversation_id) -> dict | None:
-    _ensure()
-    with _connect() as c:
-        conv = c.execute(
-            "SELECT id, user_id, version, title, codex_session_id, created_at, updated_at "
-            "FROM conversations WHERE id=%s", (conversation_id,),
-        ).fetchone()
-        if not conv:
-            return None
-        msgs = c.execute(
-            "SELECT id, role, content, lens, route, trace, answer, personal, created_at "
-            "FROM messages WHERE conversation_id=%s ORDER BY id", (conversation_id,),
-        ).fetchall()
-        return {"conversation": conv, "messages": msgs}
-
-
 _DEFAULT_LIST_LIMIT = 50
 
 

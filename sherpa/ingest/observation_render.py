@@ -53,42 +53,6 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def observation_generation_id(observation_sets: list[ai_observation.AIObservationSet]) -> str:
-    """文書単位の観測 generation ID。Set が増えると別 directory になり既存成果物は変わらない。"""
-    if not observation_sets:
-        raise ValueError("at least one AI Observation Set is required")
-    payload = {
-        "renderer": OBSERVATION_RENDERER_VERSION,
-        "canonical_generation_id": observation_sets[0].canonical_generation_id,
-        "observation_set_hashes": sorted(item.observation_set_hash for item in observation_sets),
-    }
-    if any(item.canonical_generation_id != payload["canonical_generation_id"] for item in observation_sets):
-        raise ValueError("mixed Canonical generations")
-    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
-
-
-def artifact_paths(
-    derived_root: str | Path,
-    *,
-    canonical_generation_id: str,
-    observation_generation_id: str,
-    source_rel_path: str,
-) -> ObservationArtifactPaths:
-    """Canonical 外の不変な観測 generation に置く Observation Set 本体の path を返す。"""
-    for value in (canonical_generation_id, observation_generation_id):
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-            raise ValueError("invalid generation id")
-    rel = PurePosixPath(source_rel_path.replace("\\", "/"))
-    if rel.is_absolute() or not rel.parts or any(part in {"", ".", ".."} for part in rel.parts):
-        raise ValueError("source_rel_path must be relative")
-    generation_root = Path(derived_root) / OBSERVATION_GENERATIONS_NAME / canonical_generation_id / observation_generation_id
-    base = generation_root.joinpath(*rel.parts)
-    return ObservationArtifactPaths(
-        generation_root=generation_root,
-        observation_sets_jsonl=Path(str(base) + ".ai_observations.jsonl"),
-    )
-
-
 def _write_atomic(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")

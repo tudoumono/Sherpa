@@ -15,8 +15,6 @@ from typing import Any
 
 from . import evidence_ir
 
-MERMAID_RENDERER_VERSION = "mermaid-flowchart-v1alpha1"
-
 # ラベル中の形状デリミタは HTML 実体参照へ変換する（ラベルは常に "..." で囲む）
 _LABEL_ESCAPES = {
     "[": "&#91;", "]": "&#93;",
@@ -81,7 +79,6 @@ def _fallback_slug(element_id: str) -> str:
 
 def _nearby_cell_label(
     element_id: str,
-    node_ids: set[str],
     overlaps: Sequence[evidence_ir.EvidenceRelation],
     pool: Mapping[str, evidence_ir.EvidenceElement],
 ) -> str:
@@ -123,7 +120,6 @@ def render_flowchart(
         for endpoint in (relation.source_id, relation.target_id)
         if endpoint in pool
     ))
-    node_id_set = set(node_ids)
     ordered_nodes = sorted(node_ids, key=lambda eid: (pool[eid].order, eid))
 
     used_slugs: set[str] = set()
@@ -134,7 +130,7 @@ def render_flowchart(
         element = pool[element_id]
         label = (
             _text(element.value)
-            or _nearby_cell_label(element_id, node_id_set, overlaps, pool)
+            or _nearby_cell_label(element_id, overlaps, pool)
             or _text(element.extension.get("name"))
             or element.type
         )

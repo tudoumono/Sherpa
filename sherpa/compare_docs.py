@@ -1,35 +1,21 @@
 """`compare_documents` ツール本体: 2文書の RAG 正本（`.rag.md`）を突き合わせる素朴な決定的 diff。
 
 レコード同定・業務キー対応付け・要約は行わない。対応文書が曖昧なときは候補一覧を返すだけで、確認は会話側が行う。
-パス封じ込め（doc_id 検証→resolve+is_relative_to→字面パスと resolve() の一致で symlink 検知）は `agentic_search._safe_doc_path` と
-同じ流儀を独立に実装する（登録元が本モジュールを import する側のため循環回避）。
+パス封じ込め（doc_id 検証→resolve+is_relative_to→字面パスと resolve() の一致で symlink 検知）は `worlds.rag_md_path` が行う。
 """
 from __future__ import annotations
 
 import difflib
-import os
 import re
 from pathlib import Path
 
 from . import corpus_docs, doc_ledger, documents, scope as scope_mod, worlds
-from .ingest import evidence_render, text_kind
-
-
-def _env_int(name: str, default: int, lo: int, hi: int) -> int:
-    """`grep_tool._env_int`/`agentic_search._env_int` と同型（循環 import 回避のため独立実装）。"""
-    default = max(lo, min(default, hi))
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        v = int(raw)
-    except ValueError:
-        return default
-    return v if lo <= v <= hi else default
+from .env_int import env_int
+from .ingest import evidence_render
 
 
 # rag.md 1件あたりの読み取り上限（バイト）。`agentic_search._READ_AROUND_FILE_CAP_BYTES` と同じ env 名・既定値
-_RAG_MD_READ_CAP_BYTES = _env_int("SHERPA_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
+_RAG_MD_READ_CAP_BYTES = env_int("SHERPA_READ_AROUND_FILE_CAP_BYTES", 64 * 1024 * 1024, 65536, 64 * 1024 * 1024)
 
 # 対応文書候補列挙（basename 類似度）の上限件数
 _CANDIDATES_MAX = 10
@@ -38,36 +24,6 @@ _CANDIDATES_MAX = 10
 _HEADER_SHA_RE = re.compile(r"^原本SHA-256:\s*(\S+)")
 _HEADER_PROFILE_RE = re.compile(r"^変換プロファイル:\s*(\S+)\s*/\s*(\S+)\s*$")
 _HEADER_SCAN_LINES = 20  # ヘッダの走査上限
-
-
-def _rag_md_path(world: str, doc_id: str) -> Path | None:
-    """doc_id（rel_path）→ `{rel}.rag.md` の実パス（無効/範囲外/不在/symlink は None）。ツール引数を直接受けるため厳格に検証する。"""
-    if not isinstance(doc_id, str) or not doc_id or doc_id.startswith("/") or "\\" in doc_id or "\x00" in doc_id:
-        return None
-    parts = doc_id.split("/")
-    if ".." in parts or "" in parts:
-        return None
-    if text_kind.is_sensitive_doc_id(doc_id):
-        # 秘匿名は rag.md を持たない契約。残っていても diff 材料として使わない
-        return None
-    root = worlds.derived_rag_dir(world)
-    if not root:
-        return None
-    root = Path(root)
-    lexical_rel = doc_id + ".rag.md"
-    cand = root / lexical_rel
-    try:
-        rr = root.resolve()
-        rp = cand.resolve()
-        if not (rp == rr or rp.is_relative_to(rr)):
-            return None
-        if rp != rr / lexical_rel:  # 字面パスと不一致＝経路上に symlink がある
-            return None
-        if not rp.is_file():
-            return None
-    except OSError:
-        return None
-    return rp
 
 
 def _doc_exists(doc_id: str, world: str) -> bool:
@@ -211,8 +167,8 @@ def compare(world: str, args: dict, *, scope_paths=None, deadline: float | None 
     if not _in_scope(left_doc_id, scope_paths) or not _in_scope(right_doc_id, scope_paths):
         return {"error": "指定 doc_id は対象範囲外です"}
 
-    left_path = _rag_md_path(world, left_doc_id)
-    right_path = _rag_md_path(world, right_doc_id)
+    left_path = worlds.rag_md_path(world, left_doc_id)
+    right_path = worlds.rag_md_path(world, right_doc_id)
     if left_path is None or right_path is None:
         return {"status": "unsupported", "left_doc_id": left_doc_id, "right_doc_id": right_doc_id,
                 "reason": "片方以上に RAG 正本（.rag.md）が無い文書です（コード原文等・比較材料が無い）"}

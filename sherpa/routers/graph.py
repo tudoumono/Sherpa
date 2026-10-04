@@ -7,7 +7,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sherpa import graph_admin
-from sherpa.deps import _WORLD_PATTERN, _WorldField, _current_user, _require_admin, _resolve_world, neo4j_session, validated_scope
+from sherpa.deps import _WORLD_PATTERN, _current_user, _require_admin, _resolve_world, neo4j_session, validated_scope
 from sherpa.ingest.world_neo4j import GRAPH_SCHEMA_ERA_USER_MESSAGE, GraphSchemaEraError
 from sherpa.preview_service import graph_view
 from sherpa.schemas import GraphFacetsResponse, GraphResponse, GraphSearchResponse

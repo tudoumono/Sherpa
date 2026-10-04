@@ -613,7 +613,7 @@ def _check_codex(cfg: dict, model: str, api_key: str) -> tuple[bool, str]:
             else:
                 os.environ["CODEX_HOME"] = saved_codex_home
 
-        popen_env = codex_sandbox._codex_clean_env(codex_home, authoring, tmpdir, openai_api_key=api_key)
+        popen_env = codex_sandbox._codex_clean_env(codex_home, tmpdir, openai_api_key=api_key)
         argv = ["codex", "exec", "--json", "--strict-config", "--skip-git-repo-check", "--ephemeral",
                 "-o", str(last_message_path), "-C", str(authoring), "-m", model,
                 "-c", "model_reasoning_effort=low",

@@ -67,17 +67,9 @@ def _ping_codex() -> None:
 def _ping_openai() -> None:
     # 判定は `agent_constructs.is_real_api_key` に揃え、キーは `sherpa.keys.resolve_api_key`（中央設定）経由で読む
     from . import agent_constructs, keys
-    try:
-        key = keys.resolve_api_key("openai", None, strict=True)
-    except keys.InvalidCloudProviderConfigError as e:
-        # 廃止済み・不正な cloud_provider の保存値: 実行時は未接続なので健全と表示しない
-        raise _CloudSelectionRetired() from e
+    key = keys.resolve_api_key("openai", None, strict=True)
     if not agent_constructs.is_real_api_key(key):
         raise RuntimeError("OpenAI の API キーが未設定です（管理画面で設定してください）")
-
-
-class _CloudSelectionRetired(RuntimeError):
-    """廃止済み・不正な `cloud_provider` が保存されている（実行時は未接続）。`_classify()` が案内文を返す。"""
 
 
 class _NotApplicable(RuntimeError):
@@ -163,8 +155,6 @@ def _classify(e: BaseException) -> str:
     if isinstance(e, _OllamaEmbedModelMissing):
         return (f"埋め込みモデル {e.model} が Ollama にありません（ollama pull {e.model}）。"
                 "このままではベクトル検索が使えずキーワード検索だけになります")
-    if isinstance(e, _CloudSelectionRetired):
-        return "管理者が選び直すまで未接続（保存されているクラウドの選択は廃止されました）"
     for c in (e, getattr(e, "__cause__", None), getattr(e, "reason", None)):
         if c is None:
             continue
@@ -313,11 +303,7 @@ def _ai_check_codex(settings: dict, system_settings: dict | None = None) -> None
         return
     # Azure/互換接続先の Codex(OpenAI) 構成は ChatGPT ログインでなく `OPENAI_API_KEY`（`keys.resolve_api_key("openai")`）で認証するため、チャットと同じ材料で判定する
     from . import llm as _llm
-    try:
-        keys.selected_cloud_provider(system_settings, strict=True)
-    except keys.InvalidCloudProviderConfigError as e:
-        # 廃止済み・不正な cloud_provider の保存値: Codex(OpenAI) は実行時に未接続
-        raise _CloudSelectionRetired() from e
+    keys.selected_cloud_provider(system_settings, strict=True)
     if _llm.openai_endpoint_kind(system_settings) != "openai":
         if keys.resolve_api_key("openai", settings, system_settings=system_settings):
             return  # CLI 導入済み＋キー解決可＝チャットの Codex 実行と同じ材料が揃っている

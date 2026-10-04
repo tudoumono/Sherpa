@@ -1,9 +1,8 @@
 """`sherpa.routers.chat` の薄い単体テスト（DB/Neo4j 不要・依存を monkeypatch で差し替える）。
 
 RV1 #10: `/chat/turns` は `chat_turns.start_turn` が枠を予約した直後に会話を作る
-（`_make_conversation`）ため、`/chat`・`/chat/stream`（`stream_message`/`handle_message` 内の
-`_resolve_lens` が既にスラッシュ接頭辞を除去した本文でタイトルを作る）と異なり、会話タイトル生成
-だけ raw な `req.message` を使っていた（`/影響 ...` がそのままタイトルに残る）。
+（`_make_conversation`）ため、`stream_message` 内の `_resolve_lens` が既にスラッシュ接頭辞を除去した本文でタイトルを作るのと異なり、
+会話タイトル生成だけ raw な `req.message` を使っていた（`/影響 ...` がそのままタイトルに残る）。
 """
 from __future__ import annotations
 

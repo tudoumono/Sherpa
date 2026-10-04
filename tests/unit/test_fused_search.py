@@ -59,7 +59,7 @@ def test_engine_normalization(monkeypatch):
     monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([_hit("a")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([_hit("b")], None))
-    monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, s, d=8: ([_hit("c", judgement="sure")], None))
+    monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, d=8: ([_hit("c", judgement="sure")], None))
     res = ss.search("w", "q", engines=["graph", "keyword", "keyword", "vector"])
     assert res["engines_used"] == ["keyword", "vector", "graph"]
 
@@ -69,7 +69,7 @@ def test_seven_combinations(monkeypatch):
     monkeypatch.setattr(documents, "world_rel_set", lambda world=None, **kw: _ALL_DOCS)
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([_hit("k")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([_hit("k")], None))
-    monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, s, d=8: ([_hit("k", judgement="sure")], None))
+    monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, d=8: ([_hit("k", judgement="sure")], None))
     all_subsets = [c for n in range(1, 4) for c in itertools.combinations(ss.ENGINES, n)]
     assert len(all_subsets) == 7
     for combo in all_subsets:
@@ -99,7 +99,7 @@ def test_search_calls_world_rel_set_once(monkeypatch):
                         lambda world=None, **kw: (calls.append(world) or _ALL_DOCS))
     monkeypatch.setattr(ss, "_search_keyword", lambda w, q, sp, k, s, layer=None: ([_hit("a")], None))
     monkeypatch.setattr(ss, "_search_vector", lambda w, q, sp, k, s, layer=None: ([_hit("b")], None))
-    monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, s, d=8: ([_hit("c", judgement="sure")], None))
+    monkeypatch.setattr(ss, "_search_graph", lambda w, q, sp, k, d=8: ([_hit("c", judgement="sure")], None))
     ss.search("world-x", "q", engines=["keyword", "vector", "graph"])
     assert calls == ["world-x"]
 
@@ -121,7 +121,7 @@ def test_search_forwards_layer_to_keyword_and_vector_but_not_graph(monkeypatch):
         captured["vector_layer"] = layer
         return [_hit("b")], None
 
-    def g_spy(w, q, sp, k, s, d=8):   # layer 引数なし＝渡されたら TypeError
+    def g_spy(w, q, sp, k, d=8):   # layer 引数なし＝渡されたら TypeError
         captured["graph_called"] = True
         return [_hit("c", judgement="sure")], None
 
@@ -286,7 +286,7 @@ def test_search_graph_neo4j_unavailable(monkeypatch):
         raise ServiceUnavailable("down")
 
     monkeypatch.setattr(ss, "_neo4j_session", lambda: _CtxRaise(_raise_session))
-    hits, reason = ss._search_graph("w", "q", [], 10, None)
+    hits, reason = ss._search_graph("w", "q", [], 10)
     assert hits == [] and reason == "neo4j_unavailable"
 
 
@@ -295,7 +295,7 @@ def test_search_graph_generic_error_is_query_failed(monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(ss, "_neo4j_session", lambda: _CtxRaise(_raise_session))
-    hits, reason = ss._search_graph("w", "q", [], 10, None)
+    hits, reason = ss._search_graph("w", "q", [], 10)
     assert hits == [] and reason == "graph_query_failed"
 
 
@@ -316,7 +316,7 @@ def test_search_graph_schema_era_error_is_reingest_required(monkeypatch):
         raise GraphSchemaEraError("w", "old-era")
     monkeypatch.setattr(ss, "run_impact", _boom)
 
-    hits, reason = ss._search_graph("w", "q", [], 10, None)
+    hits, reason = ss._search_graph("w", "q", [], 10)
     assert hits == [] and reason == "graph_reingest_required"
 
 

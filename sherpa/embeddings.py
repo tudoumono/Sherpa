@@ -33,7 +33,6 @@ _RETRY_BACKOFF_SCHEDULE = (1, 2, 4, 8, 16)
 _RETRY_MAX_TOTAL_SECONDS = 300
 _RETRY_AFTER_MAX_SECONDS = 60
 # 検索本文契約: provider に依存しない同じ window／pooling を適用する。cache／index の互換性は algorithm ID で管理する
-EMBEDDING_PREPROCESSING_PROFILE = "evidence-search-text-v1"
 EMBEDDING_INPUT_ALGORITHM_ID = "utf8-window-mean-l2-v2"
 # プロバイダ → (埋め込みモデル, 次元)
 _MODELS = {"openai": ("text-embedding-3-small", 1536),
@@ -266,16 +265,6 @@ def _window_batches(texts: list[str]):
         yield origins, batch
 
 
-def _provider_batches(texts: list[str], provider: str):
-    """RAG v2 の providers へ同じ決定的 byte window 契約を適用する。"""
-    if provider in {"openai", "ollama"}:
-        yield from _window_batches(texts)
-        return
-    for offset in range(0, len(texts), _BATCH):
-        batch = texts[offset:offset + _BATCH]
-        yield list(range(offset, offset + len(batch))), batch
-
-
 def is_valid_vector(vector: object, dimension: int) -> bool:
     """dense vector として安全な、有限・非 zero の数値 list だけを受理する。"""
     if not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0:
@@ -328,7 +317,6 @@ def _embed_batch_once(texts: list, c: dict, timeout: int = _TIMEOUT) -> list | N
                               {"model": c["model"], "input": texts}, timeout)
         metering.acc_add(metering.usage_from_ollama_embed(r))
         return r.get("embeddings") if isinstance(r, dict) else None
-    return None
 
 
 def _parse_openai_embeddings(r, n: int) -> list | None:
@@ -463,7 +451,7 @@ def embed(texts: list, c: dict, *, user_id: str | None = None, world: str | None
     try:
         grouped: list[list[list]] = [[] for _text in texts]
         try:
-            batches = list(_provider_batches(texts, provider))
+            batches = list(_window_batches(texts))
         except (TypeError, UnicodeError, ValueError):
             return None
         parallel = c.get("parallel")

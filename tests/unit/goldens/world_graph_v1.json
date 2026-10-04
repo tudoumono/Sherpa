@@ -7,7 +7,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/MONTHLY.jcl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -22,7 +21,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/NIGHTLY.jcl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -37,7 +35,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -51,7 +48,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -65,7 +61,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -79,7 +74,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -93,7 +87,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -107,7 +100,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -123,7 +115,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -139,7 +130,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "value": "0.030",
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -155,7 +145,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -171,7 +160,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -187,7 +175,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "value": "0.100",
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "00_共通",
@@ -203,7 +190,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -219,7 +205,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -235,7 +220,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -251,7 +235,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -267,7 +250,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -283,7 +265,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -299,7 +280,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -315,7 +295,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -331,7 +310,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -351,7 +329,6 @@
       "path": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "scope_path": "4期/02_保守/03_運用手順",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -365,7 +342,6 @@
       "path": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "scope_path": "4期/02_保守/03_運用手順",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -379,7 +355,6 @@
       "path": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -393,7 +368,6 @@
       "path": "4期/02_設計/01_基本設計/売上計上機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -407,7 +381,6 @@
       "path": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -421,7 +394,6 @@
       "path": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -435,7 +407,6 @@
       "path": "4期/02_設計/01_基本設計/請求機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -449,7 +420,6 @@
       "path": "4期/02_設計/01_基本設計/顧客マスタ機能設計書.md",
       "scope_path": "4期/02_設計/01_基本設計",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -463,7 +433,6 @@
       "path": "4期/04_運用/手数料改定障害記録.md",
       "scope_path": "4期/04_運用",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -477,7 +446,6 @@
       "path": "4期/04_運用/障害記録.md",
       "scope_path": "4期/04_運用",
       "value": null,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -487,7 +455,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/AGENTPAY.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -501,7 +468,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -515,7 +481,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -529,7 +494,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/CUSTMNT.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -543,7 +507,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/FEECALC.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -557,7 +520,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/SALESUP.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -571,7 +533,6 @@
       "world_id": "v1_s3a_regress_test",
       "path": "4期/03_開発/01_ソース/TAXCALC.cbl",
       "value": null,
-      "extraction_method": "static",
       "status": "active",
       "top_scope": "4期",
       "phase": "03_開発",
@@ -586,7 +547,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA",
       "doc": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -595,7 +555,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-AMOUNT",
       "doc": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -604,7 +563,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
       "doc": "4期/00_共通/標準コピーブック/FEE-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -613,7 +571,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA",
       "doc": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -622,7 +579,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-AMOUNT",
       "doc": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -631,7 +587,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
       "doc": "4期/00_共通/標準コピーブック/TAX-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -640,7 +595,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC",
       "doc": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -649,7 +603,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-CODE",
       "doc": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -658,7 +611,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-REC.AGENT-NAME",
       "doc": "4期/03_開発/01_ソース/AGENT-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -667,7 +619,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC",
       "doc": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -676,7 +627,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-CODE",
       "doc": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -685,7 +635,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-REC.CUST-NAME",
       "doc": "4期/03_開発/01_ソース/CUSTOMER-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -694,7 +643,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC",
       "doc": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -703,7 +651,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-AMOUNT",
       "doc": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "line": 4,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -712,7 +659,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-REC.INV-NO",
       "doc": "4期/03_開発/01_ソース/INVOICE-CPY.cpy",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -721,7 +667,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "line": 6,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -730,7 +675,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
       "doc": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "line": 5,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -739,7 +683,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "line": 5,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -748,7 +691,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENT-CPY.cpy#AGENT-CPY",
       "doc": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "line": 6,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -757,7 +699,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTOMER-CPY.cpy#CUSTOMER-CPY",
       "doc": "4期/03_開発/01_ソース/CUSTMNT.cbl",
       "line": 5,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -766,7 +707,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/03_開発/01_ソース/FEECALC.cbl",
       "line": 5,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -775,7 +715,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/03_開発/01_ソース/INVOICE-CPY.cpy#INVOICE-CPY",
       "doc": "4期/03_開発/01_ソース/SALESUP.cbl",
       "line": 5,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -784,7 +723,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/03_開発/01_ソース/TAXCALC.cbl",
       "line": 5,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -793,7 +731,6 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -803,7 +740,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -813,7 +749,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -823,7 +758,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -833,7 +767,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -843,7 +776,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/02_保守/03_運用手順/月次手数料バッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -853,7 +785,6 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/NIGHTLY.jcl#NIGHTLY",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -863,7 +794,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -873,7 +803,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -883,7 +812,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -893,7 +821,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -903,7 +830,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/02_保守/03_運用手順/締めバッチ運用手順.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -913,7 +839,6 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "doc": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -923,7 +848,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -933,7 +857,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/02_設計/01_基本設計/代理店手数料機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -943,7 +866,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
       "doc": "4期/02_設計/01_基本設計/売上計上機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -953,7 +875,6 @@
       "dst": "batch:v1_s3a_regress_test:4期/03_開発/01_ソース/MONTHLY.jcl#MONTHLY",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -963,7 +884,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-CPY",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -973,7 +893,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/FEE-CPY.cpy#FEE-AREA.FEE-RATE",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -983,7 +902,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -993,7 +911,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1003,7 +920,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/02_設計/01_基本設計/手数料計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1013,7 +929,6 @@
       "dst": "copybook:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-CPY",
       "doc": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1023,7 +938,6 @@
       "dst": "dataitem:v1_s3a_regress_test:4期/00_共通/標準コピーブック/TAX-CPY.cpy#TAX-AREA.TAX-RATE",
       "doc": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1033,7 +947,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/02_設計/01_基本設計/税計算仕様書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1043,7 +956,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
       "doc": "4期/02_設計/01_基本設計/請求機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1053,7 +965,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/CUSTMNT.cbl#CUSTMNT",
       "doc": "4期/02_設計/01_基本設計/顧客マスタ機能設計書.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1063,7 +974,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/04_運用/手数料改定障害記録.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1073,7 +983,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/04_運用/障害記録.md",
       "line": 0,
-      "extraction_method": "static",
       "status": "active",
       "via": "mention"
     },
@@ -1083,7 +992,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/AGENTPAY.cbl#AGENTPAY",
       "doc": "4期/03_開発/01_ソース/MONTHLY.jcl",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -1092,7 +1000,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/03_開発/01_ソース/MONTHLY.jcl",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -1101,7 +1008,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/BILLGEN.cbl#BILLGEN",
       "doc": "4期/03_開発/01_ソース/NIGHTLY.jcl",
       "line": 2,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -1110,7 +1016,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/SALESUP.cbl#SALESUP",
       "doc": "4期/03_開発/01_ソース/NIGHTLY.jcl",
       "line": 3,
-      "extraction_method": "static",
       "status": "active"
     },
     {
@@ -1119,7 +1024,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/COMMISUP.cbl#COMMISUP",
       "doc": "4期/03_開発/01_ソース/AGENTPAY.cbl",
       "line": 6,
-      "extraction_method": "static",
       "status": "active",
       "via": "call"
     },
@@ -1129,7 +1033,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/03_開発/01_ソース/BILLGEN.cbl",
       "line": 8,
-      "extraction_method": "static",
       "status": "active",
       "via": "call"
     },
@@ -1139,7 +1042,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/FEECALC.cbl#FEECALC",
       "doc": "4期/03_開発/01_ソース/COMMISUP.cbl",
       "line": 8,
-      "extraction_method": "static",
       "status": "active",
       "via": "call"
     },
@@ -1149,7 +1051,6 @@
       "dst": "module:v1_s3a_regress_test:4期/03_開発/01_ソース/TAXCALC.cbl#TAXCALC",
       "doc": "4期/03_開発/01_ソース/SALESUP.cbl",
       "line": 7,
-      "extraction_method": "static",
       "status": "active",
       "via": "call"
     }
