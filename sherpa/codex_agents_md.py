@@ -348,7 +348,8 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
   できる範囲で答える。{rounds_note}
   evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。観点の分け方はあなた自身の
   判断でよい。最後に全体を統合し、指定された出力形式で最終回答を返す（成果物は各巡では作らず、
-  最後に一度だけ作る）。
+  最後に一度だけ作る）。最終回答は利用者の元の質問への回答だけを書き、worker・evaluator・点検・
+  答え直しの経緯は本文に書かない。
 """
     if direct_read:
         how = "`src/` の原本を開いて"
@@ -368,7 +369,8 @@ def _multi_agent_role_paragraph(review_rounds: int, direct_read: bool = True,
   グラフ・ES が空・不調・未構築のときも、それを理由に止めず{graph_fallback}{rounds_note}
   evaluator の指摘は send_input で worker へ戻し、次の一次判断を待つ。観点の分け方はあなた自身の
   判断でよい。最後に全体を統合し、指定された出力形式で最終回答を返す（成果物は各巡では作らず、
-  最後に一度だけ作る）。
+  最後に一度だけ作る）。最終回答は利用者の元の質問への回答だけを書き、worker・evaluator・点検・
+  答え直しの経緯は本文に書かない。
 """
 
 

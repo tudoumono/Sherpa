@@ -12,17 +12,27 @@ from ..base import _log, _scope_evidence_kinds
 from .sandbox import _remove_dir_best_effort
 
 
+# 続きを頼んだ後の最終回答の書き方（点検・続きの指示への返事を、利用者への回答に混ぜない）。
+_FINAL_ANSWER_VOICE = (
+    "最終回答はそのまま利用者に見せます。利用者の元の質問への回答として最初から書き、"
+    "点検・台帳・目録・前回の回答・答え直したこと・追加で調べたことの経緯には触れないでください"
+    "（「点検の結果」「答え直します」のような前置きを書かない）。"
+)
+
+
 # 調査台帳ゲート: `status=final` をそのまま信じず、台帳（`run_dir/.tmp/investigation/`）が完了しているかを確認してから受理する。
 # 既存の自動継続（`SHERPA_CODEX_AUTO_CONTINUE`）とは独立の上限。
 _LEDGER_CONTINUE_CAP = 10
 _LEDGER_MANIFEST_MISSING_PROMPT = (
     "調査台帳を ledger_manifest_set と ledger_item_put で登録してから続けてください。"
     "ファイルを直接書かないでください。"
+    + _FINAL_ANSWER_VOICE
 )
 # manifest.json が存在するが内容が規約に合わない（必須キー欠落・`items` が空等）場合は「未作成」と区別し、通常の台帳継続と同じ枠（`_LEDGER_CONTINUE_CAP`）で修復を促す（壊れた台帳から final を生成しない）。
 _LEDGER_MANIFEST_INVALID_PROMPT = (
     "manifest.json が規約に合いません。ledger_manifest_set に question_kind と全 id の items を"
     "渡して修復してください（items は空にしない）。ファイルを直接書かないでください。"
+    + _FINAL_ANSWER_VOICE
 )
 
 
@@ -75,6 +85,7 @@ def _ledger_continue_prompt(verdict: investigation_ledger.Verdict) -> str:
         f"未充足: {unsatisfied}。"
         f"{_review_note}"
         "これらを終端状態にしてから最終回答を返してください。台帳に無い新しい主張は書かないこと。"
+        + _FINAL_ANSWER_VOICE
     )
 
 
@@ -90,6 +101,7 @@ _LEDGER_REVIEW_PROMPT = (
     "それから答え直してください。当てはまるものが無ければ答え直さなくてかまいません。"
     "答え直すときは、質問の形に合わせ（一覧なら一覧・範囲なら範囲）、分類名や参照で止めず"
     "具体的な値まで展開し、台帳と根拠にある事実以外は新たに足さないでください。"
+    + _FINAL_ANSWER_VOICE
 )
 # 見直しを頼む回数の上限（2回まで）。台帳継続の上限（`_LEDGER_CONTINUE_CAP`）とは別枠。目録を増やさずに台帳を未完了へ戻した見直しも1回に数える。
 _LEDGER_REVIEW_CAP = 2

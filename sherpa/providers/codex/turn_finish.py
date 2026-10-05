@@ -16,7 +16,7 @@ from .mcp import _apply_codex_neighbors
 from .continuation import _pick_codex_headline
 from .process import _CONTEXT_WINDOW_EXCEEDED_CODE, _masked_run_dir_path, _read_last_message_fallback
 from .sandbox import _detect_chrome_path, _marp_bin
-from .structured import _DEMOTED_CLAIMS_NOTE, _apply_codex_evidence_gate, _claims_vs_ledger
+from .structured import _DEMOTED_CLAIMS_NOTE, strip_review_preamble, _apply_codex_evidence_gate, _claims_vs_ledger
 from .turn_candidates import _continuation_pending, _pick_structured_claims, _pick_structured_headline
 from .turn_consts import _CREATED_FILES_FAILURE_NOTE, _MCP_SIDECAR_NAME, _SKILLS_BASE, _WALL_CLOCK_LIMIT_NOTE
 
@@ -106,6 +106,8 @@ def close_session(self, ctx, st, decision, env):
             st.answer = _read_last_message_fallback(_last_message_path) or _picked
         else:
             st.answer = _picked or _read_last_message_fallback(_last_message_path)
+    if st.answer:
+        st.answer = strip_review_preamble(st.answer)
     try:
         _last_message_path.unlink(missing_ok=True)
     except Exception:

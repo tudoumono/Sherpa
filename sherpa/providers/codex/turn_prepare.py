@@ -13,6 +13,7 @@ from ..base import _log, _node
 from .codex_cli import build_launch, log_turn_start, resolve_reasoning
 from . import sandbox
 from .ledger_gate import (
+    _FINAL_ANSWER_VOICE,
     _investigation_tree_has_symlink,
     _ledger_source_required_extra,
     _restore_investigation_ledger,
@@ -224,7 +225,7 @@ def prepare_run(self, ctx, st, decision):
                 _continuation_review_note = (
                     f"前回の見直しで追加に調べられるとした観点: {_extras_text}。"
                     "これを新しい調査項目として ledger_manifest_set に足してから調べて"
-                    "ください。")
+                    "ください。" + _FINAL_ANSWER_VOICE)
     # personal_facts を注入したプロンプトを組む。
     _codex_msg = ctx.message
     if ctx.personal_facts:

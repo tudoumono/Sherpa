@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from ... import investigation_ledger
 from ... import investigation_state
@@ -257,3 +258,34 @@ def _claims_vs_ledger(claims: list[dict], snapshot: investigation_ledger.LedgerS
 
 # 格下げは起きたがターン全体では種別が揃っている（不足の注記が出ない）ときの前置文（本文は書き換えない）。
 _DEMOTED_CLAIMS_NOTE = "一部の内容は必要な根拠の種別が揃っていないため、確定ではなく推定として扱っています。"
+
+
+# 最終回答の先頭段落が「点検・答え直しの経緯」だけの前置きのとき、その段落を取り除く（指示文での抑止が破れたときの決定的な守り）。
+_PREAMBLE_MARKERS = ("答え直し", "前回の回答", "前回回答")
+_PREAMBLE_MAX_CHARS = 400
+_PREAMBLE_STRUCTURE = re.compile(
+    r"^\s*(?:[-*・•]\s|\d+[.)）]\s|\|)|```|参照した資料|\S:\d+", re.MULTILINE)
+
+
+def _is_review_preamble(paragraph: str) -> bool:
+    """点検で始まり、答え直し・前回の回答の語を含む短い 1 段落で、表・箇条書き・コード・ファイル:行・参照資料の記載を含まないときだけ真。"""
+    text = paragraph.strip()
+    if not text or len(text) > _PREAMBLE_MAX_CHARS or not text.startswith("点検"):
+        return False
+    if _PREAMBLE_STRUCTURE.search(text):
+        return False
+    return any(m in text for m in _PREAMBLE_MARKERS)
+
+
+def strip_review_preamble(answer: str) -> str:
+    """回答の先頭 1 段落（最初の空行まで）が点検の前置きで、取り除いても本文が残るときだけ除く。それ以外・判断できないときは原文のまま。"""
+    if not isinstance(answer, str):
+        return answer
+    head, sep, rest = answer.lstrip().partition("\n\n")
+    if not sep or not _is_review_preamble(head):
+        return answer
+    # 残りが「参照した資料」のブロックだけ（実際の本文が空）なら除かない。
+    if not rest.split("参照した資料", 1)[0].strip():
+        return answer
+    _log.info("codex answer: leading review preamble removed chars=%d", len(answer) - len(rest.lstrip()))
+    return rest.lstrip("\n")

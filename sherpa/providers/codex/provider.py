@@ -48,6 +48,11 @@ _BOTH_SIDES_SENTENCE = (
     "どれかを明記し、一部のソースだけで全体を判断しない（確かめられなかった点はそう書く）。"
 )
 # 作成の依頼（lens=author）以外のターンはファイルを作らせない。作っても成果物に登録せず、作業フォルダごと消す（`_run_authoring`）。
+# 履歴は参考であり、最終回答はこの形を真似ず、今回の依頼への回答として書く。
+_HISTORY_VOICE_NOTE = (
+    "（上の会話は参考。最終回答は今回の依頼への回答として最初から書き、"
+    "点検・台帳・前回の回答・答え直したことの経緯には触れない。）"
+)
 _NO_FILES_SENTENCE = (
     "この依頼ではファイルを作らない（作業用のファイルは `.tmp/` の下に作る・終われば消える）。"
     "ファイルでほしいと頼まれたら、内容は本文に書き、『資料を作成』を選んで依頼し直すよう案内する。"
@@ -89,7 +94,8 @@ class CodexProvider(Provider):
             return ""
         lines = [f"{'ユーザー' if h.get('role') == 'user' else 'アシスタント'}: {h.get('content', '')}"
                 for h in self._history]
-        return "【直前の会話（参考・新しいものが下）】\n" + "\n".join(lines) + "\n\n"
+        return ("【直前の会話（参考・新しいものが下）】\n" + "\n".join(lines) + "\n"
+                + _HISTORY_VOICE_NOTE + "\n\n")
 
     def _prompt_mcp(self, message, lens, world, direct_read: bool = True, layer=None):
         """MCP 版プロンプト。事実を前渡しせず、Codex に MCP ツールで自律調査させる。MCP ツール固有の使い分けと、containment/grounding の短縮形を置く（共通ルールは AGENTS.md）。
